@@ -33,6 +33,9 @@
 //!   come from that program, on any device that builds it.
 //! - `tensor16_relaxed`, `tensor32_relaxed`: the same with the op's relaxed
 //!   precision on (MLX's and llama.cpp's setting; the engine keeps it off).
+//! - `tensorh16`: the tensor-op GEMM over half activation rows, the form the
+//!   batched prefill's projections run on that path after the cast, which is
+//!   done once before the timed region.
 //! - `mlx16`, `mlx32`: MLX's `qmm_t` for 4-bit group-64 weights, A4 only
 //!   (`probe_mlx_qmm.metal`, its own library), reading MLX's layout; its
 //!   output is checked against a CPU product.
@@ -213,6 +216,8 @@ enum Arm {
     /// The tensor-op GEMM, through `Kernels::gemm`; the op's relaxed
     /// precision on when the flag is.
     Tensor(Operand, bool),
+    /// The tensor-op GEMM over half activation rows (`GemmX::F16`).
+    TensorHalf,
     /// MLX's `qmm_t`, A4 only.
     Mlx(Operand),
     /// The shipped source with a variant's edits.
@@ -284,6 +289,7 @@ impl Arm {
         match self {
             Self::Engine(o) => operand_name(o).to_string(),
             Self::Half => "h16".to_string(),
+            Self::TensorHalf => "tensorh16".to_string(),
             Self::Tensor(o, relaxed) => format!(
                 "tensor{}{}",
                 &operand_name(o)[1..],
@@ -317,6 +323,7 @@ impl Arm {
             "f16" => return Ok(Self::Engine(Operand::F16)),
             "f32" => return Ok(Self::Engine(Operand::F32)),
             "h16" => return Ok(Self::Half),
+            "tensorh16" => return Ok(Self::TensorHalf),
             "tensor16" => return Ok(Self::Tensor(Operand::F16, false)),
             "tensor32" => return Ok(Self::Tensor(Operand::F32, false)),
             "tensor16_relaxed" => return Ok(Self::Tensor(Operand::F16, true)),
@@ -337,7 +344,7 @@ impl Arm {
             .map(|v| v.name.to_string())
             .collect();
         Err(format!(
-            "no arm named {name}: f16, f32, h16, tensor16, tensor32, tensor16_relaxed, tensor32_relaxed, mlx16, mlx32, or <variant>_f16 / _f32 of {}",
+            "no arm named {name}: f16, f32, h16, tensor16, tensor32, tensor16_relaxed, tensor32_relaxed, tensorh16, mlx16, mlx32, or <variant>_f16 / _f32 of {}",
             known.join(", ")
         ))
     }
@@ -682,6 +689,10 @@ fn pipelines(device: &MetalDevice, libs: &mut Libs, arms: &[Arm]) -> Result<(), 
             let (library, name): (&Library, String) = match arm {
                 Arm::Engine(o) => (device.library(), engine_kernel(quant, o)),
                 Arm::Half => (device.library(), format!("gemm_{}_store_h16", quant.name())),
+                Arm::TensorHalf => (
+                    &libs.tensor(device, false)?.0,
+                    format!("gemm_{}_store_h16", quant.name()),
+                ),
                 Arm::Tensor(o, relaxed) => {
                     (&libs.tensor(device, relaxed)?.0, engine_kernel(quant, o))
                 }
@@ -879,7 +890,7 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
     };
     // The half arm's activation rows: the f16 values the cast kernel writes, uploaded once.
     let x_h16 = match arm {
-        Arm::Half | Arm::SourceHalf(_) => {
+        Arm::Half | Arm::TensorHalf | Arm::SourceHalf(_) => {
             let halves: Vec<u16> = x_values
                 .iter()
                 .map(|&v| gguf::quant::f32_to_f16_bits(v))
@@ -899,16 +910,17 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
     let fault = ctx.device.fault_word();
 
     let timed = match arm {
-        Arm::Engine(_) | Arm::Tensor(_, _) | Arm::Half => {
+        Arm::Engine(_) | Arm::Tensor(_, _) | Arm::Half | Arm::TensorHalf => {
             let (kernels, operand) = match arm {
                 Arm::Engine(o) => (ctx.kernels, o),
                 Arm::Tensor(o, relaxed) => (&libs.tensor(ctx.device, relaxed)?.1, o),
                 Arm::Half => (ctx.kernels, Operand::F16),
+                Arm::TensorHalf => (&libs.tensor(ctx.device, false)?.1, Operand::F16),
                 _ => unreachable!("the arm runs through Kernels::gemm"),
             };
             time_dispatches(ctx, pool.copies, dispatches, |encoder, copy| {
                 let x = match arm {
-                    Arm::Half => GemmX::F16 {
+                    Arm::Half | Arm::TensorHalf => GemmX::F16 {
                         x: x_h16
                             .as_ref()
                             .expect("the half arm's activation rows")
@@ -1073,7 +1085,7 @@ fn one(ctx: &Ctx<'_>, libs: &mut Libs, arm: Arm, cfg: &Config) -> Result<(), Str
     // once per weight-tile threadgroup, the output once.
     let (tile, elem) = match arm {
         Arm::Mlx(operand) => (MLX_TILE, mlx::elem_bytes(operand)),
-        Arm::Half => (GEMM_ROWS, 2),
+        Arm::Half | Arm::TensorHalf => (GEMM_ROWS, 2),
         Arm::Variant(v, _) => (v.rows, 4),
         Arm::Source(s, _) => (s.rows, 4),
         Arm::SourceHalf(s) => (s.rows, 2),

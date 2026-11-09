@@ -694,6 +694,7 @@ struct Names {
     grouped: &'static str,
     tensor_gemm: &'static str,
     tensor_gemm_seg: &'static str,
+    tensor_gemm_half_rows: &'static str,
     tensor_grouped: &'static str,
 }
 
@@ -717,6 +718,7 @@ macro_rules! names {
             grouped: concat!("grouped_", $p),
             tensor_gemm: concat!("tensor_gemm_", $p),
             tensor_gemm_seg: concat!("tensor_gemm_", $p, "_seg"),
+            tensor_gemm_half_rows: concat!("tensor_gemm_", $p, "_half_rows"),
             tensor_grouped: concat!("tensor_grouped_", $p),
         }
     };
@@ -791,7 +793,8 @@ fn tensor_gemm(h: &Harness<'_>, fix: &Fixture, quant: Quant) -> Clause {
 }
 
 /// The requantized clauses on the tensor-op kernels: the dense and segmented
-/// GEMMs and the grouped GEMM, on `tensor` (or why this device has none).
+/// GEMMs, the half-row entries and the grouped GEMM, on `tensor` (or why this
+/// device has none).
 pub fn tensor_table<'a>(
     tensor: &'a Result<Harness<'a>, String>,
     mlx: &'a Result<Fixture, String>,
@@ -812,6 +815,7 @@ pub fn tensor_table<'a>(
             [
                 (n.tensor_gemm, dense(tensor_gemm)),
                 (n.tensor_gemm_seg, dense(gemm_seg)),
+                (n.tensor_gemm_half_rows, dense(gemm_half_rows)),
                 (
                     n.tensor_grouped,
                     Box::new(move || match tensor {

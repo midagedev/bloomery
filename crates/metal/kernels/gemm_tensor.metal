@@ -3,7 +3,7 @@
 // entry points, under the host names of the simdgroup kernels they stand in
 // for (one library or the other is the GEMMs' library; `Library` picks):
 //
-//   gemm_{q4k,q6k,a4,a8,a4h,a8h,q8_0,q5k}_{store,resid}[_seg]_{f16,f32}     gemm.metal's
+//   gemm_{q4k,q6k,a4,a8,a4h,a8h,q8_0,q5k}_{store,resid}[_seg]_{f16,f32,h16} gemm.metal's
 //   gemm_routed_{q4k,q6k,a4,a8,a4h,a8h,q8_0,q5k}_{pair,plain}_{f16,f32}     gemm_routed.metal's
 //
 // Same arguments, buffers, grid and meanings as those (their headers hold
@@ -23,10 +23,12 @@
 //       execution_simdgroup scope, the weight operand [n][k] (transposed)
 // What differs from MLX:
 //   - the activations are staged too, in the simdgroup kernels' layout (the
-//     same K step of 32 and pitch): an f32 activation is cast to half with
-//     the range check that raises the activation quantizer's site, which
-//     needs the value in hand; MLX loads its already-half activations from
-//     device memory straight into registers. MLX's K step is 64 with only
+//     same K step of 32 and pitch): the f16 entry casts an f32 activation to
+//     half with the range check that raises the activation quantizer's site,
+//     which needs the value in hand, and the h16 entry stages the half rows
+//     gemm_cast_rows already cast and checked once; MLX loads its
+//     already-half activations from device memory straight into registers.
+//     MLX's K step is 64 with only
 //     the weights staged (9 KB); ours is 32 with both (10 KB for f16), the
 //     same threadgroup bytes, so as many tiles sit on a core;
 //   - the op's operands are tensors over the staged rows and its
@@ -52,8 +54,9 @@
 // weights at the top, the activations under them). SIMD group g owns the
 // activation rows 32 (g >> 1) on by the weight rows 32 (g & 1) on: one
 // matmul2d a K step, accumulating into its cooperative tensor. A thread
-// stages one 16-value chunk of each side a K step (one `dequant16`, one
-// checked float4 run); rows past the tile's last live row stage that row's
+// stages one 16-value chunk of each side a K step (one `dequant16`, and one
+// checked float4 run or, over half rows, four half4 loads); rows past the
+// tile's last live row stage that row's
 // values (a defined access) and are not stored. The store is per element,
 // under each element's own row and column bound. A SIMD group whose
 // activation rows are all past the tile's live rows runs no op and stores
@@ -151,10 +154,10 @@ inline void tensor_zero(thread C & ct) {
 // One threadgroup's tile of the dense GEMM: the K loop and the store,
 // shared by the plain and the segmented entries (gemm.metal's gemm_tile's
 // place: `r0` the first weight row, `r1` the first activation row).
-template <typename Q, typename T, bool RESID>
+template <typename Q, typename T, typename X, bool RESID>
 inline void tensor_tile(threadgroup char        * shmem,
                         device const typename Q::Block * W,
-                        device const float      * x,
+                        device const X          * x,
                         device float            * y,
                         int rows,
                         int cols,
@@ -185,7 +188,7 @@ inline void tensor_tile(threadgroup char        * shmem,
     const short koff = (short)((tiitg % 2) * 16);
     device const typename Q::Block * a_src = W + (ulong)(r0 + min(row, (short)(nr0 - 1))) * nb;
     threadgroup vec<T, 4> * a_dst = (threadgroup vec<T, 4> *)(sa + row * LDA + koff);
-    device const float * b_src = x + (ulong)(r1 + min(row, (short)(nr1 - 1))) * x_stride + koff;
+    device const X * b_src = x + (ulong)(r1 + min(row, (short)(nr1 - 1))) * x_stride + koff;
     threadgroup vec<T, 4> * b_dst = (threadgroup vec<T, 4> *)(sb + row * LDA + koff);
 
     // The SIMD group's block: activation rows tm on, weight rows tn on.
@@ -232,9 +235,9 @@ inline void tensor_tile(threadgroup char        * shmem,
 }
 
 // The plain GEMM, storing or adding into the output.
-template <typename Q, typename T, bool RESID>
+template <typename Q, typename T, typename X, bool RESID>
 kernel void tensor_gemm_kernel(device const typename Q::Block * W [[buffer(0)]],
-                               device const float      * x [[buffer(1)]],
+                               device const X          * x [[buffer(1)]],
                                device float            * y [[buffer(2)]],
                                constant GemmArgs       & args [[buffer(3)]],
                                device atomic_uint      * faults [[buffer(4)]],
@@ -242,16 +245,16 @@ kernel void tensor_gemm_kernel(device const typename Q::Block * W [[buffer(0)]],
                                ushort tiitg [[thread_index_in_threadgroup]],
                                ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     threadgroup char shmem[gemm_shmem_bytes<T>()];
-    tensor_tile<Q, T, RESID>(shmem, W, x, y, (int)args.rows, (int)args.cols, (int)args.acts,
-                             args.x_stride, args.y_stride, args.layer, faults,
-                             (int)tgpig.y * GEMM_ROWS, (int)tgpig.x * GEMM_ACTS, tiitg, sgitg);
+    tensor_tile<Q, T, X, RESID>(shmem, W, x, y, (int)args.rows, (int)args.cols, (int)args.acts,
+                                args.x_stride, args.y_stride, args.layer, faults,
+                                (int)tgpig.y * GEMM_ROWS, (int)tgpig.x * GEMM_ACTS, tiitg, sgitg);
 }
 
 // The weight rows of up to four tensors of one type and one width
 // (gemm.metal's gemm_seg_kernel's table and meaning).
-template <typename Q, typename T, bool RESID>
+template <typename Q, typename T, typename X, bool RESID>
 kernel void tensor_gemm_seg_kernel(device const typename Q::Block * W [[buffer(0)]],
-                                   device const float      * x [[buffer(1)]],
+                                   device const X          * x [[buffer(1)]],
                                    device float            * y [[buffer(2)]],
                                    constant GemmSegArgs    & args [[buffer(3)]],
                                    device atomic_uint      * faults [[buffer(4)]],
@@ -267,10 +270,10 @@ kernel void tensor_gemm_seg_kernel(device const typename Q::Block * W [[buffer(0
         }
     }
     const uint local = tgpig.y - args.segs[s].first_group;
-    tensor_tile<Q, T, RESID>(shmem, W + (ulong)args.segs[s].wblocks, x, y + args.segs[s].out,
-                             (int)args.segs[s].rows, (int)args.cols, (int)args.acts,
-                             args.x_stride, args.y_stride, args.layer, faults,
-                             (int)local * GEMM_ROWS, (int)tgpig.x * GEMM_ACTS, tiitg, sgitg);
+    tensor_tile<Q, T, X, RESID>(shmem, W + (ulong)args.segs[s].wblocks, x, y + args.segs[s].out,
+                                (int)args.segs[s].rows, (int)args.cols, (int)args.acts,
+                                args.x_stride, args.y_stride, args.layer, faults,
+                                (int)local * GEMM_ROWS, (int)tgpig.x * GEMM_ACTS, tiitg, sgitg);
 }
 
 // The pair's store of one block of places from `m0` on: element i of the
@@ -458,12 +461,13 @@ kernel void tensor_routed_kernel(device const typename Q::Block * W [[buffer(0)]
     }
 }
 
-// The entries, under the simdgroup kernels' host names.
+// The entries, under the simdgroup kernels' host names: both operands over
+// f32 rows and the f16 operand over half rows (h16).
 
-#define TENSOR_GEMM_ENTRY(SUFFIX, Q, T, RESID, SEG, ARGS)                             \
-    template [[host_name("gemm_" #SUFFIX)]] kernel void SEG<Q, T, RESID>(             \
+#define TENSOR_GEMM_ENTRY(SUFFIX, Q, T, X, RESID, SEG, ARGS)                          \
+    template [[host_name("gemm_" #SUFFIX)]] kernel void SEG<Q, T, X, RESID>(          \
         device const Q::Block * W [[buffer(0)]],                                     \
-        device const float    * x [[buffer(1)]],                                     \
+        device const X        * x [[buffer(1)]],                                     \
         device float          * y [[buffer(2)]],                                     \
         constant ARGS         & args [[buffer(3)]],                                  \
         device atomic_uint    * faults [[buffer(4)]],                                \
@@ -471,15 +475,19 @@ kernel void tensor_routed_kernel(device const typename Q::Block * W [[buffer(0)]
         ushort tiitg [[thread_index_in_threadgroup]],                                \
         ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
-#define TENSOR_GEMM_FAMILY(STEM, Q)                                                                   \
-    TENSOR_GEMM_ENTRY(STEM##_store_f16, Q, half, false, tensor_gemm_kernel, GemmArgs)                 \
-    TENSOR_GEMM_ENTRY(STEM##_store_f32, Q, float, false, tensor_gemm_kernel, GemmArgs)                \
-    TENSOR_GEMM_ENTRY(STEM##_resid_f16, Q, half, true, tensor_gemm_kernel, GemmArgs)                  \
-    TENSOR_GEMM_ENTRY(STEM##_resid_f32, Q, float, true, tensor_gemm_kernel, GemmArgs)                 \
-    TENSOR_GEMM_ENTRY(STEM##_seg_store_f16, Q, half, false, tensor_gemm_seg_kernel, GemmSegArgs)      \
-    TENSOR_GEMM_ENTRY(STEM##_seg_store_f32, Q, float, false, tensor_gemm_seg_kernel, GemmSegArgs)     \
-    TENSOR_GEMM_ENTRY(STEM##_seg_resid_f16, Q, half, true, tensor_gemm_seg_kernel, GemmSegArgs)       \
-    TENSOR_GEMM_ENTRY(STEM##_seg_resid_f32, Q, float, true, tensor_gemm_seg_kernel, GemmSegArgs)
+#define TENSOR_GEMM_FAMILY(STEM, Q)                                                                        \
+    TENSOR_GEMM_ENTRY(STEM##_store_f16, Q, half, float, false, tensor_gemm_kernel, GemmArgs)               \
+    TENSOR_GEMM_ENTRY(STEM##_store_f32, Q, float, float, false, tensor_gemm_kernel, GemmArgs)              \
+    TENSOR_GEMM_ENTRY(STEM##_store_h16, Q, half, half, false, tensor_gemm_kernel, GemmArgs)                \
+    TENSOR_GEMM_ENTRY(STEM##_resid_f16, Q, half, float, true, tensor_gemm_kernel, GemmArgs)                \
+    TENSOR_GEMM_ENTRY(STEM##_resid_f32, Q, float, float, true, tensor_gemm_kernel, GemmArgs)               \
+    TENSOR_GEMM_ENTRY(STEM##_resid_h16, Q, half, half, true, tensor_gemm_kernel, GemmArgs)                 \
+    TENSOR_GEMM_ENTRY(STEM##_seg_store_f16, Q, half, float, false, tensor_gemm_seg_kernel, GemmSegArgs)    \
+    TENSOR_GEMM_ENTRY(STEM##_seg_store_f32, Q, float, float, false, tensor_gemm_seg_kernel, GemmSegArgs)   \
+    TENSOR_GEMM_ENTRY(STEM##_seg_store_h16, Q, half, half, false, tensor_gemm_seg_kernel, GemmSegArgs)     \
+    TENSOR_GEMM_ENTRY(STEM##_seg_resid_f16, Q, half, float, true, tensor_gemm_seg_kernel, GemmSegArgs)     \
+    TENSOR_GEMM_ENTRY(STEM##_seg_resid_f32, Q, float, float, true, tensor_gemm_seg_kernel, GemmSegArgs)    \
+    TENSOR_GEMM_ENTRY(STEM##_seg_resid_h16, Q, half, half, true, tensor_gemm_seg_kernel, GemmSegArgs)
 
 TENSOR_GEMM_FAMILY(q4k, Q4K)
 TENSOR_GEMM_FAMILY(q6k, Q6K)
