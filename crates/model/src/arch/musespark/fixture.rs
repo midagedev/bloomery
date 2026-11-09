@@ -140,6 +140,30 @@ pub fn spec() -> FixtureSpec {
     }
 }
 
+/// The full-shape cut's file is `<FULL_STEM>-0000i-of-0000N.gguf`.
+pub const FULL_STEM: &str = "musespark-full-fixture";
+
+/// Fixture layer `f` of the full-shape cut holds source layer `FULL_LAYER_MAP[f]`: the first
+/// sliding and the first full layer, the two kinds of the real file's layer.
+pub const FULL_LAYER_MAP: [usize; 2] = [0, 1];
+
+/// The most tensor data a shard of the full-shape cut holds.
+pub const FULL_SHARD_BYTES: u64 = 4 << 30;
+
+/// The Muse Spark full-shape cut: [`FULL_LAYER_MAP`] at the real file's widths and counts (the
+/// hidden, heads, latent, experts and expert width), so every dispatch class the real header
+/// decides is one the fixture runs (`coverage::reach`, `tools/kcover/unreached.tsv`); the mini's
+/// window, default source and fixed card budget; split at [`FULL_SHARD_BYTES`].
+pub fn full_spec() -> FixtureSpec {
+    FixtureSpec {
+        stem: FULL_STEM,
+        layers: FULL_LAYER_MAP.to_vec(),
+        shard_bytes: FULL_SHARD_BYTES,
+        family: &Full,
+        ..spec()
+    }
+}
+
 fn default_source() -> String {
     DEFAULT_MODEL.to_string()
 }
@@ -215,21 +239,32 @@ pub fn spread_value(leaf: &str) -> Option<f32> {
     }
 }
 
-/// The pattern the map must read from the source's own array, layer by layer: sliding, full,
-/// sliding, sliding — the real file's first four entries, never reconstructed from a rule.
-fn check_pattern(hp: &Hparams, layers: &[usize]) -> Result<(), FixtureError> {
-    const WANT: [bool; 4] = [true, false, true, true];
-    if layers.len() != WANT.len() {
+/// The mini's pattern: sliding, full, sliding, sliding — the real file's first four entries.
+const MINI_PATTERN: [bool; 4] = [true, false, true, true];
+
+/// The full-shape cut's pattern: sliding, full — the real file's first two entries.
+const FULL_PATTERN: [bool; 2] = [true, false];
+
+/// The pattern `want` the map must read from the source's own array, layer by layer (`true`
+/// sliding), never reconstructed from a rule.
+fn check_pattern(hp: &Hparams, layers: &[usize], want: &[bool]) -> Result<(), FixtureError> {
+    let word = |sliding: bool| if sliding { "sliding" } else { "full" };
+    if layers.len() != want.len() {
         return Err(FixtureError::Mismatch {
             what: "the layer map".into(),
             detail: format!(
-                "holds {} layers, the fixture is built for the four of the pattern [sliding, \
-                 full, sliding, sliding]",
-                layers.len()
+                "holds {} layers, the fixture is built for the {} of the pattern [{}]",
+                layers.len(),
+                match want.len() {
+                    2 => "two".to_string(),
+                    4 => "four".to_string(),
+                    n => n.to_string(),
+                },
+                want.iter().map(|&w| word(w)).collect::<Vec<_>>().join(", ")
             ),
         });
     }
-    for (f, (&l, want)) in layers.iter().zip(WANT).enumerate() {
+    for (f, (&l, &want)) in layers.iter().zip(want).enumerate() {
         let got = hp.sliding[l];
         if got != want {
             return Err(FixtureError::Mismatch {
@@ -366,7 +401,7 @@ impl Family for Mini {
     /// moves with the map.
     fn tables(&self, source: &Split, spec: &FixtureSpec) -> Result<Box<dyn Tables>, FixtureError> {
         let hp = Hparams::read(source)?;
-        check_pattern(&hp, &spec.layers)?;
+        check_pattern(&hp, &spec.layers, &MINI_PATTERN)?;
         Ok(Box::new(Mini))
     }
 
@@ -377,6 +412,71 @@ impl Family for Mini {
         source: &Split,
     ) -> Result<(), FixtureError> {
         check_kinds(spec, fixture, source).map(|_| ())
+    }
+}
+
+/// Every tensor at the source's own dims: the full-shape cut's table. A name the mini's table does
+/// not hold is refused as the mini refuses it.
+struct Full;
+
+impl Tables for Full {
+    fn dims(
+        &self,
+        name: &str,
+        _layer: Option<usize>,
+        leaf: &str,
+        _dims: &[u64],
+    ) -> Result<Option<Vec<u64>>, FixtureError> {
+        let global = [token_embd(), output(), output_norm()];
+        if Mini::stem_dims(leaf).is_some() || global.iter().any(|g| g.as_str() == leaf) {
+            return Ok(None);
+        }
+        Err(FixtureError::Tensor {
+            name: name.to_string(),
+            detail: "is no tensor of the cut's table: the reader names every tensor of a \
+                     muse-spark file, so this one is new"
+                .into(),
+        })
+    }
+
+    fn lines(&self) -> Vec<String> {
+        vec![
+            "musespark full-shape cut: every tensor at the source's dims, the real vocabulary"
+                .into(),
+        ]
+    }
+}
+
+impl Family for Full {
+    fn key_rule(&self, suffix: &str) -> Option<KeyRule> {
+        match key_rule(suffix) {
+            Some(KeyRule::Set(_)) => Some(KeyRule::Copy),
+            rule => rule,
+        }
+    }
+
+    fn const_value(&self, leaf: &str) -> Option<f32> {
+        const_value(leaf)
+    }
+
+    fn spread_value(&self, leaf: &str) -> Option<f32> {
+        spread_value(leaf)
+    }
+
+    /// The source must read as a `muse-spark` file whose map layers spell [`FULL_PATTERN`].
+    fn tables(&self, source: &Split, spec: &FixtureSpec) -> Result<Box<dyn Tables>, FixtureError> {
+        let hp = Hparams::read(source)?;
+        check_pattern(&hp, &spec.layers, &FULL_PATTERN)?;
+        Ok(Box::new(Full))
+    }
+
+    fn check_kinds(
+        &self,
+        spec: &FixtureSpec,
+        fixture: &Split,
+        source: &Split,
+    ) -> Result<(), FixtureError> {
+        check_full_kinds(spec, fixture, source).map(|_| ())
     }
 }
 
@@ -391,9 +491,30 @@ pub fn check_kinds(
     fixture: &Split,
     source: &Split,
 ) -> Result<Hparams, FixtureError> {
+    check_cut(spec, fixture, source, false)
+}
+
+/// [`check_kinds`] for the full-shape cut ([`full_spec`]): the pattern [`FULL_PATTERN`], and the
+/// hidden, heads, latent and expert field the source's own.
+pub fn check_full_kinds(
+    spec: &FixtureSpec,
+    fixture: &Split,
+    source: &Split,
+) -> Result<Hparams, FixtureError> {
+    check_cut(spec, fixture, source, true)
+}
+
+/// What [`check_kinds`] (`full` false) and [`check_full_kinds`] check.
+fn check_cut(
+    spec: &FixtureSpec,
+    fixture: &Split,
+    source: &Split,
+    full: bool,
+) -> Result<Hparams, FixtureError> {
     let fx = Hparams::read(fixture)?;
     let src = Hparams::read(source)?;
-    check_pattern(&src, &spec.layers)?;
+    let pattern: &[bool] = if full { &FULL_PATTERN } else { &MINI_PATTERN };
+    check_pattern(&src, &spec.layers, pattern)?;
     let bad = |what: String, detail: String| FixtureError::Mismatch { what, detail };
     if fx.n_layer != spec.layers.len() {
         return Err(bad(
@@ -413,20 +534,47 @@ pub fn check_kinds(
             ));
         }
     }
+    let first_ff = |hp: &Hparams| hp.expert_ff.first().copied().unwrap_or(0) as u64;
+    let field = |mini: u64, src: usize| if full { src as u64 } else { mini };
     for (key, a, b) in [
-        ("embedding_length", fx.n_embd as u64, HIDDEN),
-        ("attention.head_count", fx.n_head as u64, HEADS),
-        ("attention.head_count_kv", fx.n_head_kv as u64, KV_HEADS),
-        ("moe_latent_size", fx.latent as u64, LATENT),
-        ("expert_count", fx.n_expert as u64, EXPERTS),
+        (
+            "embedding_length",
+            fx.n_embd as u64,
+            field(HIDDEN, src.n_embd),
+        ),
+        (
+            "attention.head_count",
+            fx.n_head as u64,
+            field(HEADS, src.n_head),
+        ),
+        (
+            "attention.head_count_kv",
+            fx.n_head_kv as u64,
+            field(KV_HEADS, src.n_head_kv),
+        ),
+        (
+            "moe_latent_size",
+            fx.latent as u64,
+            field(LATENT, src.latent),
+        ),
+        (
+            "expert_count",
+            fx.n_expert as u64,
+            field(EXPERTS, src.n_expert),
+        ),
         (
             "expert_feed_forward_length",
-            fx.expert_ff.first().copied().unwrap_or(0) as u64,
-            FF,
+            first_ff(&fx),
+            if full { first_ff(&src) } else { FF },
         ),
     ] {
         if a != b {
-            return Err(bad(key.into(), format!("{a}, the mini writes {b}")));
+            let writer = if full {
+                "the source's"
+            } else {
+                "the mini writes"
+            };
+            return Err(bad(key.into(), format!("{a}, {writer} {b}")));
         }
     }
     for (key, a, b) in [

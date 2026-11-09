@@ -1,0 +1,16 @@
+# kcover26 mutant profile-dir
+# clause: a profile fixture's family is its profile's tools/fixture-dirs.tsv directory (a_profile_fixture_is_its_profiles_directory)
+# site: the K3 profile fixture names another directory
+# run: cargo test -p bloomery-model --lib a_profile_fixture_is_its_profiles_directory
+# red (rc=101): assertion `left == right` failed: kimi-k3-full: tools/fixture-dirs.tsv gives the profile another directory
+--- a/crates/model/src/arch/registry.rs
++++ b/crates/model/src/arch/registry.rs
+@@ -477,7 +477,7 @@
+         // file's (`tools/kcover/unreached.tsv`), the full-shape cut's are.
+         profile: "kimi-k3-full",
+         arch: "kimi-k3",
+-        family: "kimik3full",
++        family: "kimik3-full",
+         spec: kimi_k3::fixture::full_spec,
+     },
+     ProfileFixture {

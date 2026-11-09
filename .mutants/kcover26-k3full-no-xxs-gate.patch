@@ -1,0 +1,25 @@
+# kcover26 mutant k3full-no-xxs-gate
+# clause: the full-shape K3 cut reaches every class of the real header (no kimik3full row)
+# site: FULL_LAYER_MAP's routed delta layer L46 (IQ2_XXS gate and up) replaced by L84 (IQ1_S on all three), its kind row with it
+# run: cargo test -p bloomery-model --test kcover kcover_table_holds_the_checked_in_headers
+# red (rc=101): the run finds a row the table does not hold: kimik3full	tests/kimi_k3	real	pin	ffn_gate_exps iq2_xxs	cut
+--- a/crates/model/src/arch/kimi_k3/fixture.rs
++++ b/crates/model/src/arch/kimi_k3/fixture.rs
+@@ -162,7 +162,7 @@
+ /// The full-shape cut's fixture layer `f` holds source layer `FULL_LAYER_MAP[f]`: the dense lead,
+ /// a routed delta layer with IQ2_XXS gate and up over an IQ1_S down, and a routed latent layer
+ /// with IQ1_S gate and up over an IQ2_XXS down, every width the real file's.
+-pub const FULL_LAYER_MAP: [usize; 3] = [0, 46, 83];
++pub const FULL_LAYER_MAP: [usize; 3] = [0, 84, 83];
+ 
+ /// The kinds of [`FULL_LAYER_MAP`], layer by layer: [`KINDS`]' first three.
+ const FULL_KINDS: [Layer; 3] = [
+@@ -175,7 +175,7 @@
+     Layer {
+         kda: true,
+         dense: false,
+-        gate_up: Some(GgmlType::IQ2_XXS),
++        gate_up: Some(GgmlType::IQ1_S),
+         down: Some(GgmlType::IQ1_S),
+     },
+     Layer {

@@ -159,6 +159,36 @@ const KINDS: [Layer; 4] = [
     },
 ];
 
+/// The full-shape cut's fixture layer `f` holds source layer `FULL_LAYER_MAP[f]`: the dense lead,
+/// a routed delta layer with IQ2_XXS gate and up over an IQ1_S down, and a routed latent layer
+/// with IQ1_S gate and up over an IQ2_XXS down, every width the real file's.
+pub const FULL_LAYER_MAP: [usize; 3] = [0, 46, 83];
+
+/// The kinds of [`FULL_LAYER_MAP`], layer by layer: [`KINDS`]' first three.
+const FULL_KINDS: [Layer; 3] = [
+    Layer {
+        kda: true,
+        dense: true,
+        gate_up: None,
+        down: None,
+    },
+    Layer {
+        kda: true,
+        dense: false,
+        gate_up: Some(GgmlType::IQ2_XXS),
+        down: Some(GgmlType::IQ1_S),
+    },
+    Layer {
+        kda: false,
+        dense: false,
+        gate_up: Some(GgmlType::IQ1_S),
+        down: Some(GgmlType::IQ2_XXS),
+    },
+];
+
+/// The full-shape cut's file is `<FULL_STEM>-0000i-of-0000N.gguf`.
+pub const FULL_STEM: &str = "kimi-k3-full-fixture";
+
 /// The Kimi K3 fixture: [`LAYER_MAP`], the window [[`D_MIN`], [`D_MAX`]], the profile's file as the
 /// default source, no ff override (the mini's expert width is a header key, not an ff axis), no
 /// draft and a fixed card budget.
@@ -175,9 +205,28 @@ pub fn spec() -> FixtureSpec {
         default_source,
         draft: None,
         sidecar: None,
-        family: &Mini,
+        family: &Cut::Mini,
     }
 }
+
+/// The Kimi K3 full-shape cut: [`FULL_LAYER_MAP`] at the real file's widths and counts (the
+/// hidden, heads, experts and pick count, the expert, dense and latent widths, the bank interval),
+/// so every dispatch class the real header decides is one the fixture runs
+/// (`coverage::reach`, `tools/kcover/unreached.tsv`); the mini's window, default source and fixed
+/// card budget; split at [`FULL_SHARD_BYTES`] so a routed layer lies across a shard boundary as
+/// the real file's do.
+pub fn full_spec() -> FixtureSpec {
+    FixtureSpec {
+        stem: FULL_STEM,
+        layers: FULL_LAYER_MAP.to_vec(),
+        shard_bytes: FULL_SHARD_BYTES,
+        family: &Cut::Full,
+        ..spec()
+    }
+}
+
+/// The most tensor data a shard of the full-shape cut holds.
+pub const FULL_SHARD_BYTES: u64 = 4 << 30;
 
 fn default_source() -> String {
     DEFAULT_MODEL.to_string()
@@ -260,22 +309,27 @@ pub fn spread_value(leaf: &str) -> Option<f32> {
     }
 }
 
-/// The map's layers must read as [`KINDS`] in `src`, layer by layer from the source's own
+/// The map's layers must read as `kinds` ([`KINDS`], [`FULL_KINDS`]) in `src`, layer by layer from the source's own
 /// array and tensor types, and the dense lead must be the first of them alone. A source that
 /// differs is refused by name, so a rule of the model that moved cannot hide behind a map that
 /// still has the right layer numbers.
-fn check_map(src: &Hparams, source: &Split, layers: &[usize]) -> Result<(), FixtureError> {
-    if layers.len() != KINDS.len() {
+fn check_map(
+    src: &Hparams,
+    source: &Split,
+    layers: &[usize],
+    kinds: &[Layer],
+) -> Result<(), FixtureError> {
+    if layers.len() != kinds.len() {
         return Err(FixtureError::Mismatch {
             what: "the layer map".into(),
             detail: format!(
                 "holds {} layers, the fixture is built for the {} of the kinds above",
                 layers.len(),
-                KINDS.len()
+                kinds.len()
             ),
         });
     }
-    for (f, (&l, kind)) in layers.iter().zip(&KINDS).enumerate() {
+    for (f, (&l, kind)) in layers.iter().zip(kinds).enumerate() {
         if l >= src.n_layer {
             return Err(FixtureError::NoSourceLayer {
                 layer: l,
@@ -345,25 +399,49 @@ fn resized(src: &Hparams) -> Hparams {
     }
 }
 
-/// The hyperparameters the fixture must read as: [`resized`] and the per-layer kinds at the
-/// map's layers.
-fn cut_of(src: &Hparams, layers: &[usize]) -> Hparams {
+/// The hyperparameters the fixture must read as: the cut's widths ([`Cut::widths`]) and the
+/// per-layer kinds at the map's layers.
+fn cut_of(src: &Hparams, layers: &[usize], cut: Cut) -> Hparams {
     Hparams {
         n_layer: layers.len(),
         kinds: layers.iter().map(|&l| src.kinds[l]).collect(),
-        ..resized(src)
+        ..cut.widths(src)
     }
 }
 
-/// The mini geometry the plan writes every tensor at: [`resized`] of the source, asked layer by
-/// layer. A name the reader does not hold is refused: every tensor of a file the reader accepts
-/// is one of its stems, so the refusal names one the reader has not met.
-struct Mini;
+/// Which of the two cuts a spec writes: the mini of [`LAYER_MAP`] at [`resized`] widths, or the
+/// full-shape cut of [`FULL_LAYER_MAP`] at the source's own. Each plan writes every tensor at the
+/// cut's geometry, asked of the reader layer by layer. A name the reader does not hold is refused:
+/// every tensor of a file the reader accepts is one of its stems, so the refusal names one the
+/// reader has not met.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cut {
+    Mini,
+    Full,
+}
 
-/// The tables of one plan: the source's hyperparameters at the mini's widths.
-struct MiniTables(Hparams);
+impl Cut {
+    /// The layer kinds the cut's map is held to.
+    fn kinds(self) -> &'static [Layer] {
+        match self {
+            Cut::Mini => &KINDS,
+            Cut::Full => &FULL_KINDS,
+        }
+    }
 
-impl Tables for MiniTables {
+    /// The source's hyperparameters at the cut's widths, its layers still the source's numbers.
+    fn widths(self, src: &Hparams) -> Hparams {
+        match self {
+            Cut::Mini => resized(src),
+            Cut::Full => src.clone(),
+        }
+    }
+}
+
+/// The tables of one plan: the source's hyperparameters at the cut's widths.
+struct CutTables(Hparams, Cut);
+
+impl Tables for CutTables {
     fn dims(
         &self,
         name: &str,
@@ -392,10 +470,10 @@ impl Tables for MiniTables {
                     "has dims {dims:?}; the globals are the hidden over the vocabulary"
                 )));
             };
-            return Ok(Some(vec![HIDDEN, *vocab]));
+            return Ok(Some(vec![self.0.n_embd as u64, *vocab]));
         }
         if name == output_norm() || name == OUTPUT_RES_SCORE {
-            return Ok(Some(vec![HIDDEN]));
+            return Ok(Some(vec![self.0.n_embd as u64]));
         }
         Err(bad(
             "is no tensor of the mini table: the reader names every tensor outside the layers of a kimi-k3 file, so this one is new".into(),
@@ -403,23 +481,39 @@ impl Tables for MiniTables {
     }
 
     fn lines(&self) -> Vec<String> {
+        let h = &self.0;
         vec![format!(
-            "kimi-k3 mini: hidden {HIDDEN}, {HEADS} heads of {} (delta state {HEADS} x {} x {}), \
-             latent attention {} + {} rope, query latent {Q_LORA}, {EXPERTS} experts of width {FF} \
-             in a latent of {LATENT}, dense lead {DENSE_FF}, a bank every {BLOCK} layers, the real \
-             vocabulary",
-            self.0.kda.head_dim,
-            self.0.kda.head_dim,
-            self.0.kda.head_dim,
-            self.0.mla.kv_lora,
-            self.0.mla.pe
+            "kimi-k3 {}: hidden {}, {} heads of {} (delta state {} x {} x {}), latent attention \
+             {} + {} rope, query latent {}, {} experts of width {} in a latent of {}, dense lead \
+             {}, a bank every {} layers, the real vocabulary",
+            match self.1 {
+                Cut::Mini => "mini",
+                Cut::Full => "full-shape cut",
+            },
+            h.n_embd,
+            h.n_head,
+            h.kda.head_dim,
+            h.n_head,
+            h.kda.head_dim,
+            h.kda.head_dim,
+            h.mla.kv_lora,
+            h.mla.pe,
+            h.mla.q_lora,
+            h.experts.n_expert,
+            h.experts.ff,
+            h.latent,
+            h.dense_ff,
+            h.attn_res_block
         )]
     }
 }
 
-impl Family for Mini {
+impl Family for Cut {
     fn key_rule(&self, suffix: &str) -> Option<KeyRule> {
-        key_rule(suffix)
+        match (self, key_rule(suffix)) {
+            (Cut::Full, Some(KeyRule::Set(_))) => Some(KeyRule::Copy),
+            (_, rule) => rule,
+        }
     }
 
     fn const_value(&self, leaf: &str) -> Option<f32> {
@@ -430,8 +524,12 @@ impl Family for Mini {
         spread_value(leaf)
     }
 
-    /// Every key a [`KeyRule::Set`] rewrites, which the plan only walks if the source has it.
+    /// Every key a [`KeyRule::Set`] of the mini rewrites, which the plan only walks if the source
+    /// has it; the full-shape cut copies them all.
     fn required_keys(&self) -> &'static [&'static str] {
+        if *self == Cut::Full {
+            return &[];
+        }
         &[
             "embedding_length",
             "feed_forward_length",
@@ -445,12 +543,13 @@ impl Family for Mini {
         ]
     }
 
-    /// The source must read as a `kimi-k3` file whose map layers are the kinds of [`KINDS`];
-    /// every dim of the mini is the reader's own for the source layer's kind.
+    /// The source must read as a `kimi-k3` file whose map layers are the cut's kinds
+    /// ([`Cut::kinds`]); every dim is the reader's own for the source layer's kind at the cut's
+    /// widths.
     fn tables(&self, source: &Split, spec: &FixtureSpec) -> Result<Box<dyn Tables>, FixtureError> {
         let src = Hparams::read(source)?;
-        check_map(&src, source, &spec.layers)?;
-        Ok(Box::new(MiniTables(resized(&src))))
+        check_map(&src, source, &spec.layers, self.kinds())?;
+        Ok(Box::new(CutTables(self.widths(&src), *self)))
     }
 
     fn check_kinds(
@@ -459,7 +558,7 @@ impl Family for Mini {
         fixture: &Split,
         source: &Split,
     ) -> Result<(), FixtureError> {
-        check_kinds(spec, fixture, source).map(|_| ())
+        check_cut(spec, fixture, source, *self).map(|_| ())
     }
 }
 
@@ -486,10 +585,30 @@ pub fn check_kinds(
     fixture: &Split,
     source: &Split,
 ) -> Result<Hparams, FixtureError> {
+    check_cut(spec, fixture, source, Cut::Mini)
+}
+
+/// [`check_kinds`] for the full-shape cut ([`full_spec`]): the same facts at the source's own
+/// widths and [`FULL_KINDS`].
+pub fn check_full_kinds(
+    spec: &FixtureSpec,
+    fixture: &Split,
+    source: &Split,
+) -> Result<Hparams, FixtureError> {
+    check_cut(spec, fixture, source, Cut::Full)
+}
+
+/// What [`check_kinds`] and [`check_full_kinds`] check, for `which` cut.
+fn check_cut(
+    spec: &FixtureSpec,
+    fixture: &Split,
+    source: &Split,
+    which: Cut,
+) -> Result<Hparams, FixtureError> {
     let fx = Hparams::read(fixture)?;
     let src = Hparams::read(source)?;
-    check_map(&src, source, &spec.layers)?;
-    let cut = cut_of(&src, &spec.layers);
+    check_map(&src, source, &spec.layers, which.kinds())?;
+    let cut = cut_of(&src, &spec.layers, which);
     same("block_count", &fx.n_layer, &cut.n_layer)?;
     same("attention.head_count_kv", &fx.kinds, &cut.kinds)?;
     same("embedding_length", &fx.n_embd, &cut.n_embd)?;

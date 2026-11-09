@@ -1,0 +1,16 @@
+# kcover26 mutant reason-source
+# clause: a class the fixture's source lacks is `source` (the table's mix256 pin rows)
+# site: Reach::gaps reads every real-side class as the cut's
+# run: cargo test -p bloomery-model --test kcover kcover_table_holds_the_checked_in_headers
+# red (rc=101): the table holds a row the run does not find: mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	attn_output q4_K	source
+--- a/crates/model/src/arch/coverage/reach.rs
++++ b/crates/model/src/arch/coverage/reach.rs
+@@ -341,7 +341,7 @@
+         };
+         let mut out = Vec::new();
+         for c in d.real.into_iter().filter(|c| !by_variant(c)) {
+-            let reason = if !self.source.contains(&c) {
++            let reason = if false {
+                 Reason::Source
+             } else if self.wide.as_ref().is_some_and(|w| w.contains(&c)) {
+                 Reason::Ff

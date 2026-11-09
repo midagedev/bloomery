@@ -1,0 +1,25 @@
+# kcover26 mutant mimo2-no-window-layer
+# clause: the MiMo fixture's map keeps every (stem, type) pair of the RL header (check_map, before the diff)
+# site: LAYER_MAP's window layer L1 replaced by the full routed L5, KEPT with it
+# run: cargo test -p bloomery-model --test kcover kcover_table_holds_the_checked_in_headers
+# red (rc=101): mimo2: the fixture's plan: the fixture's layer map: [0, 5] holds no attn_sinks.weight of type f32, which source layer 1 does
+--- a/crates/model/src/arch/mimo2/fixture.rs
++++ b/crates/model/src/arch/mimo2/fixture.rs
+@@ -37,7 +37,7 @@
+ };
+ 
+ /// Fixture layer `f` holds source layer `LAYER_MAP[f]` (the table above).
+-pub const LAYER_MAP: [usize; 2] = [0, 1];
++pub const LAYER_MAP: [usize; 2] = [0, 5];
+ 
+ /// The d window, [2^-14, 2^-4]: normal f16 values every block type's scale fits at every K the
+ /// fixture holds (2,048 for the down stacks to 16,384 for the dense down).
+@@ -149,7 +149,7 @@
+ type LayerKind = (Kind, bool);
+ 
+ /// The kinds the map keeps one of each: the dense full layer and a routed window layer.
+-const KEPT: [LayerKind; 2] = [(Kind::Full, false), (Kind::Swa, true)];
++const KEPT: [LayerKind; 2] = [(Kind::Full, false), (Kind::Full, true)];
+ 
+ /// Every source trunk layer's kind; a layer routes when it holds the router's matrix.
+ fn kinds(src: &Hparams, source: &Split) -> Vec<LayerKind> {

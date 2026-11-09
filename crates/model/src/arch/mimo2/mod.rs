@@ -2,7 +2,8 @@
 //! role (`roles`), the typed description (`spec`), the tensor names the
 //! program reads (`names`), the host tier's view of a routed layer (`host`),
 //! the file planned onto a machine (`place`), the facts of the program that
-//! runs it (`program`) and the MTP sidecar read against its target (`mtp`);
+//! runs it (`program`), the MTP sidecar read against its target (`mtp`) and the gate fixture's
+//! spec (`fixture`);
 //! the body that runs the file is `crates/gpu-mimo2`.
 //!
 //! Every block is a GQA layer over two head widths — a key head wider than
@@ -13,6 +14,7 @@
 //! router over MXFP4 expert stacks. The dialect's authority is llama.cpp's
 //! `src/models/mimo2.cpp`.
 
+pub mod fixture;
 pub mod host;
 pub mod hparams;
 pub mod mtp;

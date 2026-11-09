@@ -1,0 +1,16 @@
+# kcover26 mutant table-twice
+# clause: the table has one row per class, a row named twice refused by line (the_table_reader_refuses_by_line)
+# site: parse_table's duplicate check never fires
+# run: cargo test -p bloomery-model --lib the_table_reader_refuses_by_line
+# red (rc=101): a row twice is read
+--- a/crates/model/src/arch/coverage/reach.rs
++++ b/crates/model/src/arch/coverage/reach.rs
+@@ -452,7 +452,7 @@
+                 reason,
+             },
+         };
+-        if rows.iter().any(|r| {
++        if false && rows.iter().any(|r| {
+             r.gap.side == side
+                 && r.gap.class == row.gap.class
+                 && r.fixture == row.fixture

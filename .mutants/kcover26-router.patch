@@ -1,0 +1,16 @@
+# kcover26 mutant router
+# clause: the diff names a router row on each side
+# site: classes() records no Router
+# run: cargo test -p bloomery-model --test kcover kcover_diff_names_each_kind
+# red (rc=101): a router edit: real side {Need}, fixture side {Need}, want {Need, Router} on each
+--- a/crates/model/src/arch/coverage/reach.rs
++++ b/crates/model/src/arch/coverage/reach.rs
+@@ -123,7 +123,7 @@
+                 ),
+                 Err(e) => format!("refused: {e}"),
+             };
+-            add(ClassKind::Router, name);
++            let _ = name;
+         }
+     }
+     out

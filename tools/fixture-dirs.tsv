@@ -11,10 +11,12 @@
 #          tools/fixture-cuts/<dir>.json), its first shard the `*-00001-of-*.safetensors` beside the index; any other holds GGUF shards
 #          (`fixture generate`).
 #          A row no registry row names (a gate profile, not an architecture string) is a profile's cut, listed in `PROFILE_CUTS`
-#          of crates/model/src/arch/registry.rs; only the gate clauses that name that cut read it.
+#          of crates/model/src/arch/registry.rs, or a profile's GGUF fixture, listed in its `PROFILE_FIXTURES` (`fixture generate
+#          --profile`); only the gate clauses that name that profile read it.
 qwen4exp	qwen38
 deepseek41	v41
 glm5next	glm5next
+mimo2	mimo2
 nemotron_h	nemotron
 nemotron_h_moe	nemotron-bolt
 qwen35moe	qwen35moe
@@ -31,3 +33,5 @@ muse-spark	musespark
 minimax-m3	minimaxm31
 mistral-large4	mistrallarge4-e128
 kimi-k3	kimik3
+kimi-k3-full	kimik3full
+muse-spark-full	musesparkfull

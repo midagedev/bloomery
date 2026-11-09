@@ -1,0 +1,228 @@
+# What each fixture cannot reach of a real file, and what it runs that the file never does: the dispatch classes a header
+# decides (crates/model/src/arch/coverage/reach.rs, the one reader: `parse_table`, by column name), each fixture planned from
+# its source's header and compared with a real file's header. A (fixture, real) pair with no row is reached whole. Held by
+# crates/model/tests/kcover.rs (the `tests/` reals: header tables checked in beside it) and by `fixture reach --check` (the
+# `census/` reals: the stubs of tools/census/stubs.tsv, where the stub root is).
+# fixture<TAB>real<TAB>side<TAB>kind<TAB>class<TAB>reason
+#   fixture  the fixture's directory (tools/fixture-dirs.tsv)
+#   real     `tests/<stem>`: crates/model/tests/<stem>_hdr.kv.json and <stem>_tensors.tsv; `census/<org>/<repo>/<set>`: a stub set
+#   side     `real`: the file holds the class and the fixture does not, so the fixture tier never runs it; `fixture`: the
+#            fixture holds it and the file does not, so the fixture tier runs an entry the file never does
+#   kind     `need` (a models::Need, by its text), `pin` (a tensor stem and its stored type), `width` (a matrix stem and its
+#            first two dims), `router` (models::shape::select_router's instance for a mixture, or its refusal)
+#   class    the class's text
+#   reason   `cut`: the fixture's source agrees with the file, the cut (its layer map, its mini widths and counts) does not;
+#            `ff`: the cut's narrowed routed ff alone (a plan at the source's ff agrees); `source`: the fixture's source
+#            disagrees with the file (another quant mix or shape of the family). A type pin a fixture-variants row retypes
+#            the fixture to is reached by that variant and is no row.
+fixture	real	side	kind	class	reason
+kimik3	tests/kimi_k3	real	need	cross-layer residual attention: every 12th layer banks its input, each sublayer and the head read the softmax mix of the banks and the running sum	cut
+kimik3	tests/kimi_k3	real	need	delta rule KDA with a full-width output gate: d 128, 96 heads, conv 4, sigmoid gate bounded below by -5	cut
+kimik3	tests/kimi_k3	real	need	dense situ layer: ff 33792	cut
+kimik3	tests/kimi_k3	real	need	routed experts in a 3584-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+kimik3	tests/kimi_k3	real	need	router: sigmoid, 896 experts, top 16, with a selection bias	cut
+kimik3	tests/kimi_k3	real	need	shared expert, ff 6144	cut
+kimik3	tests/kimi_k3	real	width	attn_gate 7168x12288	cut
+kimik3	tests/kimi_k3	real	width	attn_k 7168x12288	cut
+kimik3	tests/kimi_k3	real	width	attn_kv_a_mqa 7168x576	cut
+kimik3	tests/kimi_k3	real	width	attn_output 12288x7168	cut
+kimik3	tests/kimi_k3	real	width	attn_q 7168x12288	cut
+kimik3	tests/kimi_k3	real	width	attn_q_a 7168x1536	cut
+kimik3	tests/kimi_k3	real	width	attn_q_b 1536x18432	cut
+kimik3	tests/kimi_k3	real	width	attn_v 7168x12288	cut
+kimik3	tests/kimi_k3	real	width	ffn_down 33792x7168	cut
+kimik3	tests/kimi_k3	real	width	ffn_down_exps 3072x3584	cut
+kimik3	tests/kimi_k3	real	width	ffn_down_shexp 6144x7168	cut
+kimik3	tests/kimi_k3	real	width	ffn_gate 7168x33792	cut
+kimik3	tests/kimi_k3	real	width	ffn_gate_exps 3584x3072	cut
+kimik3	tests/kimi_k3	real	width	ffn_gate_inp 7168x896	cut
+kimik3	tests/kimi_k3	real	width	ffn_gate_shexp 7168x6144	cut
+kimik3	tests/kimi_k3	real	width	ffn_routed_down 7168x3584	cut
+kimik3	tests/kimi_k3	real	width	ffn_routed_up 3584x7168	cut
+kimik3	tests/kimi_k3	real	width	ffn_up 7168x33792	cut
+kimik3	tests/kimi_k3	real	width	ffn_up_exps 3584x3072	cut
+kimik3	tests/kimi_k3	real	width	ffn_up_shexp 7168x6144	cut
+kimik3	tests/kimi_k3	real	width	output 7168x163840	cut
+kimik3	tests/kimi_k3	real	width	ssm_beta 7168x96	cut
+kimik3	tests/kimi_k3	real	width	ssm_f_a 7168x128	cut
+kimik3	tests/kimi_k3	real	width	ssm_f_b 128x12288	cut
+kimik3	tests/kimi_k3	real	width	ssm_g 7168x12288	cut
+kimik3	tests/kimi_k3	real	width	token_embd 7168x163840	cut
+kimik3	tests/kimi_k3	real	router	BiasedSigmoid over 896 experts, top 16..=16	cut
+kimik3	tests/kimi_k3	fixture	need	cross-layer residual attention: every 2th layer banks its input, each sublayer and the head read the softmax mix of the banks and the running sum	cut
+kimik3	tests/kimi_k3	fixture	need	delta rule KDA with a full-width output gate: d 128, 2 heads, conv 4, sigmoid gate bounded below by -5	cut
+kimik3	tests/kimi_k3	fixture	need	dense situ layer: ff 1024	cut
+kimik3	tests/kimi_k3	fixture	need	routed experts in a 256-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+kimik3	tests/kimi_k3	fixture	need	router: sigmoid, 8 experts, top 2, with a selection bias	cut
+kimik3	tests/kimi_k3	fixture	need	shared expert, ff 512	cut
+kimik3	tests/kimi_k3	fixture	width	attn_gate 512x256	cut
+kimik3	tests/kimi_k3	fixture	width	attn_k 512x256	cut
+kimik3	tests/kimi_k3	fixture	width	attn_kv_a_mqa 512x576	cut
+kimik3	tests/kimi_k3	fixture	width	attn_output 256x512	cut
+kimik3	tests/kimi_k3	fixture	width	attn_q 512x256	cut
+kimik3	tests/kimi_k3	fixture	width	attn_q_a 512x256	cut
+kimik3	tests/kimi_k3	fixture	width	attn_q_b 256x384	cut
+kimik3	tests/kimi_k3	fixture	width	attn_v 512x256	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_down 1024x512	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_down_exps 256x256	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_down_shexp 512x512	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_gate 512x1024	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_gate_exps 256x256	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_gate_inp 512x8	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_gate_shexp 512x512	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_routed_down 512x256	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_routed_up 256x512	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_up 512x1024	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_up_exps 256x256	cut
+kimik3	tests/kimi_k3	fixture	width	ffn_up_shexp 512x512	cut
+kimik3	tests/kimi_k3	fixture	width	output 512x163840	cut
+kimik3	tests/kimi_k3	fixture	width	ssm_beta 512x2	cut
+kimik3	tests/kimi_k3	fixture	width	ssm_f_a 512x128	cut
+kimik3	tests/kimi_k3	fixture	width	ssm_f_b 128x256	cut
+kimik3	tests/kimi_k3	fixture	width	ssm_g 512x256	cut
+kimik3	tests/kimi_k3	fixture	width	token_embd 512x163840	cut
+kimik3	tests/kimi_k3	fixture	router	BiasedSigmoid over 8 experts, top 2..=2	cut
+musespark	tests/musespark	real	need	routed experts in a 4096-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+musespark	tests/musespark	real	need	router: sigmoid, 256 experts, top 8, with a selection bias	cut
+musespark	tests/musespark	real	width	attn_gate 8192x8192	cut
+musespark	tests/musespark	real	width	attn_k 8192x1024	cut
+musespark	tests/musespark	real	width	attn_output 8192x8192	cut
+musespark	tests/musespark	real	width	attn_q 8192x8192	cut
+musespark	tests/musespark	real	width	attn_v 8192x1024	cut
+musespark	tests/musespark	real	width	ffn_down_exps 4096x4096	cut
+musespark	tests/musespark	real	width	ffn_gate_exps 4096x4096	cut
+musespark	tests/musespark	real	width	ffn_gate_inp 8192x256	cut
+musespark	tests/musespark	real	width	ffn_latent_down 8192x4096	cut
+musespark	tests/musespark	real	width	ffn_latent_up 4096x8192	cut
+musespark	tests/musespark	real	width	ffn_up_exps 4096x4096	cut
+musespark	tests/musespark	real	width	output 8192x202048	cut
+musespark	tests/musespark	real	width	token_embd 8192x202048	cut
+musespark	tests/musespark	real	router	BiasedSigmoid over 256 experts, top 8..=8	cut
+musespark	tests/musespark	fixture	need	routed experts in a 512-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+musespark	tests/musespark	fixture	need	router: sigmoid, 16 experts, top 8, with a selection bias	cut
+musespark	tests/musespark	fixture	width	attn_gate 1024x1024	cut
+musespark	tests/musespark	fixture	width	attn_k 1024x128	cut
+musespark	tests/musespark	fixture	width	attn_output 1024x1024	cut
+musespark	tests/musespark	fixture	width	attn_q 1024x1024	cut
+musespark	tests/musespark	fixture	width	attn_v 1024x128	cut
+musespark	tests/musespark	fixture	width	ffn_down_exps 256x512	cut
+musespark	tests/musespark	fixture	width	ffn_gate_exps 512x256	cut
+musespark	tests/musespark	fixture	width	ffn_gate_inp 1024x16	cut
+musespark	tests/musespark	fixture	width	ffn_latent_down 1024x512	cut
+musespark	tests/musespark	fixture	width	ffn_latent_up 512x1024	cut
+musespark	tests/musespark	fixture	width	ffn_up_exps 512x256	cut
+musespark	tests/musespark	fixture	width	output 1024x202048	cut
+musespark	tests/musespark	fixture	width	token_embd 1024x202048	cut
+musespark	tests/musespark	fixture	router	BiasedSigmoid over 16 experts, top 8..=8	cut
+mistrallarge4-e128	tests/mistrallarge4	real	need	dense SwiGLU layer: ff 24576	cut
+mistrallarge4-e128	tests/mistrallarge4	real	need	shared expert, ff 6144	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	attn_kv_a_mqa 6144x512	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	attn_kv_a_mqa 6144x576	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	attn_output 8192x6144	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	attn_q 6144x8192	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_down 24576x6144	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_down_exps 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_down_shexp 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_gate 6144x24576	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_gate_exps 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_gate_inp 6144x128	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_gate_shexp 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_up 6144x24576	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_up_exps 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	ffn_up_shexp 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	indexer.attn_k 6144x128	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	indexer.attn_q_b 6144x4096	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	indexer.proj 6144x32	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	output 6144x204800	cut
+mistrallarge4-e128	tests/mistrallarge4	real	width	token_embd 6144x204800	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	need	dense SwiGLU layer: ff 4096	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	need	shared expert, ff 256	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	attn_kv_a_mqa 1024x512	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	attn_kv_a_mqa 1024x576	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	attn_output 2048x1024	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	attn_q 1024x2048	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_down 4096x1024	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_down_exps 256x1024	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_down_shexp 256x1024	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_gate 1024x4096	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_gate_exps 1024x256	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_gate_inp 1024x128	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_gate_shexp 1024x256	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_up 1024x4096	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_up_exps 1024x256	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	ffn_up_shexp 1024x256	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	indexer.attn_k 1024x128	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	indexer.attn_q_b 1024x4096	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	indexer.proj 1024x32	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	output 1024x204800	cut
+mistrallarge4-e128	tests/mistrallarge4	fixture	width	token_embd 1024x204800	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	need	dense SwiGLU layer: ff 24576	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	need	shared expert, ff 6144	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	attn_output q4_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	attn_q iq4_xs	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	attn_v_b q5_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_down q5_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_down_exps iq1_m	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_down_exps iq2_xs	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_down_shexp q4_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_gate q5_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_gate_exps iq1_m	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_gate_shexp q4_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_up q5_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_up_exps iq1_m	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	ffn_up_shexp iq4_xs	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	indexer.attn_q_b iq4_xs	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	output q5_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	pin	token_embd q3_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	attn_kv_a_mqa 6144x512	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	attn_kv_a_mqa 6144x576	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	attn_output 8192x6144	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	attn_q 6144x8192	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_down 24576x6144	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_down_exps 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_down_shexp 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_gate 6144x24576	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_gate_exps 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_gate_inp 6144x128	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_gate_shexp 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_up 6144x24576	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_up_exps 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	ffn_up_shexp 6144x6144	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	indexer.attn_k 6144x128	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	indexer.attn_q_b 6144x4096	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	indexer.proj 6144x32	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	output 6144x204800	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	real	width	token_embd 6144x204800	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	need	dense SwiGLU layer: ff 4096	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	need	shared expert, ff 256	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	attn_output q6_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	attn_q q6_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	attn_v_b q8_0	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	ffn_down q8_0	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	ffn_down_shexp q8_0	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	ffn_gate q8_0	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	ffn_gate_shexp q8_0	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	ffn_up q8_0	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	ffn_up_shexp q8_0	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	indexer.attn_q_b q6_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	output q6_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	pin	token_embd q6_K	source
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	attn_kv_a_mqa 1024x512	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	attn_kv_a_mqa 1024x576	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	attn_output 2048x1024	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	attn_q 1024x2048	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_down 4096x1024	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_down_exps 256x1024	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_down_shexp 256x1024	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_gate 1024x4096	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_gate_exps 1024x256	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_gate_inp 1024x128	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_gate_shexp 1024x256	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_up 1024x4096	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_up_exps 1024x256	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	ffn_up_shexp 1024x256	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	indexer.attn_k 1024x128	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	indexer.attn_q_b 1024x4096	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	indexer.proj 1024x32	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	output 1024x204800	cut
+mistrallarge4-e128	tests/mistrallarge4_mix256	fixture	width	token_embd 1024x204800	cut

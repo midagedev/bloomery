@@ -1,0 +1,25 @@
+# kcover26 mutant musefull-no-full-layer
+# clause: the full-shape Muse Spark cut reaches every class of the real header (no musesparkfull row)
+# site: FULL_LAYER_MAP's full layer L1 replaced by the sliding L2, the pattern with it
+# run: cargo test -p bloomery-model --test kcover kcover_table_holds_the_checked_in_headers
+# red (rc=101): the run finds a row the table does not hold: musesparkfull	tests/musespark	real	need	GQA flash, head 64, group 8	cut
+--- a/crates/model/src/arch/musespark/fixture.rs
++++ b/crates/model/src/arch/musespark/fixture.rs
+@@ -145,7 +145,7 @@
+ 
+ /// Fixture layer `f` of the full-shape cut holds source layer `FULL_LAYER_MAP[f]`: the first
+ /// sliding and the first full layer, the two kinds of the real file's layer.
+-pub const FULL_LAYER_MAP: [usize; 2] = [0, 1];
++pub const FULL_LAYER_MAP: [usize; 2] = [0, 2];
+ 
+ /// The most tensor data a shard of the full-shape cut holds.
+ pub const FULL_SHARD_BYTES: u64 = 4 << 30;
+@@ -243,7 +243,7 @@
+ const MINI_PATTERN: [bool; 4] = [true, false, true, true];
+ 
+ /// The full-shape cut's pattern: sliding, full — the real file's first two entries.
+-const FULL_PATTERN: [bool; 2] = [true, false];
++const FULL_PATTERN: [bool; 2] = [true, true];
+ 
+ /// The pattern `want` the map must read from the source's own array, layer by layer (`true`
+ /// sliding), never reconstructed from a rule.

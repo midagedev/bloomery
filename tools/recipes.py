@@ -13017,7 +13017,7 @@ def key_self_test(expect, pieces: tuple[str, ...]) -> None:
             rows, default = fixture_table(sa.tree.read(FIXTURE_DIRS), sa.tree.read(REF_PATHS))
             expect(default == DEFAULT_PROFILE, f"ref-paths.sh's default profile {default} is not DEFAULT_PROFILE {DEFAULT_PROFILE}")
             expect([rows.get(f) for f in ("qwen4exp", "deepseek41", "glm5next", "qwen35moe", "deepseek2")] == ["qwen38", "v41", "glm5next", "qwen35moe", "self"]
-                   and "mimo2" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
+                   and "raon1" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
             fam = {
                 "q4": "gate-gpu-qwen4exp-e2e",  # BLOOMERY_MODEL=qwen4exp: qwen38
                 "glm": "gate-gpu-glm-sel",  # glm5next: glm5next
@@ -13776,7 +13776,7 @@ def ref_paths_self_test(expect) -> None:
         for f in ("ref-paths.sh", "dspark-path.sh", "gguf-ranges.py"):
             shutil.copyfile(os.path.join(src, f), os.path.join(tmp, "tools/ref", f))
         shutil.copyfile(os.path.join(ROOT, FIXTURE_DIRS), os.path.join(tmp, FIXTURE_DIRS))
-        for fam in ("qwen4exp", "deepseek2", "glm5next", "mimo2", "newfam"):
+        for fam in ("qwen4exp", "deepseek2", "glm5next", "raon1", "newfam"):
             with open(os.path.join(tmp, f"tools/ref/models/{fam}.sh"), "w", encoding="utf-8") as fh:
                 fh.write(f"MODEL_NAME={fam}\nMODEL=${{BLOOMERY_REF_MODEL:-/models/real/{fam}.gguf}}\n")
         root = os.path.join(tmp, "fixtures")
@@ -13813,7 +13813,7 @@ def ref_paths_self_test(expect) -> None:
         expect(rc == 0 and out.strip() == f"/x/own.gguf|{first}", f"ref-paths: a caller's own file does not win, or the fixture is not named: {rc} {out!r}")
         rc, out, err = run("deepseek2", f"{show}; fixture_budget; echo budget-rc=$?", BLOOMERY_TIER="fixture")
         expect(rc == 0 and out.split() == ["/models/real/deepseek2.gguf|", "budget-rc=0"], f"ref-paths: a small family does not stand: {rc} {out!r} {err!r}")
-        for fam in ("mimo2", "newfam"):
+        for fam in ("raon1", "newfam"):
             rc, out, err = run(fam, show, BLOOMERY_TIER="fixture")
             expect(rc == 66 and out == "" and f"the family '{fam}' has no fixture yet" in err and "exit 66" in err, f"ref-paths: {fam} has no fixture: {rc} {out!r} {err!r}")
         rc, out, err = run("qwen4exp", show, BLOOMERY_TIER="both")

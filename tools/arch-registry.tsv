@@ -10,7 +10,7 @@ llama	-	yes	no	-
 qwen3	-	yes	no	-
 lfm3	-	yes	no	-
 glm5next,glm5-next	Glm5next	yes	no	glm5next
-mimo2	Mimo2	yes	yes	-
+mimo2	Mimo2	yes	yes	mimo2
 minimax-m3	MiniMaxM3	yes	no	minimaxm31
 raon1	Raon1	yes	no	-
 solar-open2	SolarOpen2	yes	no	solar2
