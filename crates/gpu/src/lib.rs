@@ -36,6 +36,7 @@ pub mod autotune;
 pub mod best;
 pub mod cand;
 pub mod capsync;
+pub mod card_bytes;
 pub mod card_experts;
 pub mod card_leg;
 pub mod card_slots;
@@ -2523,6 +2524,11 @@ pub struct Gpu {
     fault: Arc<DeviceBuffer<u32>>,
     /// [`row_prefetch`] of this context's device, for the decode gemvs.
     row_prefetch: bool,
+    /// The device's free bytes read on this context once it opened, before
+    /// its first allocation (the fault word): what the card-byte invariant
+    /// takes the bytes a run made from ([`card_bytes`]). `None` on an
+    /// integrated device, whose reading is the host's room.
+    opened_free: Option<u64>,
 }
 
 /// The sink over a `Gpu`'s fault allocation ([`Gpu::fault_word`]), for
@@ -2903,6 +2909,17 @@ impl Gpu {
     /// Load-time only.
     pub(crate) fn with_device(device: usize) -> Result<Gpu, GpuError> {
         let (ctx, stream) = capsync::fresh_handle(device, StreamRole::Engine)?;
+        // Before the first allocation: the made bytes are counted from here.
+        let opened_free = if raw_device_integrated(ctx.cu_device())? {
+            None
+        } else {
+            ctx.bind_to_thread()?;
+            let free = current_mem_info()?.0;
+            Some(
+                u64::try_from(free)
+                    .map_err(|_| GpuError::shape("Gpu::with_device", "free bytes past u64"))?,
+            )
+        };
         // First: the modules below that raise are given it at load.
         let fault = Arc::new(DeviceBuffer::from_host(&stream, &clean_fault_words())?);
         // SAFETY: this package owns the embedded device bundle produced for
@@ -2923,7 +2940,15 @@ impl Gpu {
             ctx,
             stream,
             module,
+            opened_free,
         })
+    }
+
+    /// The device's free bytes when this context opened, before its first
+    /// allocation; `None` on an integrated device.
+    #[must_use]
+    pub fn opened_free(&self) -> Option<u64> {
+        self.opened_free
     }
 
     /// The sink a launch of `layer` raises into: this context's fault word.

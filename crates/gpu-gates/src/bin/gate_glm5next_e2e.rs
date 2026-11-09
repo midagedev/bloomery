@@ -708,6 +708,12 @@ mod gate {
         fn prompt_buffers(&mut self, _m: &Glm5nextModel) -> Result<(), SessionError> {
             Ok(())
         }
+
+        /// The card-byte invariant's readings, printed and refused as this process's
+        /// card hold says ([`bloomery_gpu_gates::card_bytes::watch`]).
+        fn card_watch(&mut self) -> Result<Box<dyn app::CardWatch>, SessionError> {
+            bloomery_gpu_gates::card_bytes::watch()
+        }
     }
 
     /// What the open decided besides the session: the step's captured nodes,

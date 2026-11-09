@@ -41,6 +41,7 @@ use slots::{ParkedSlot, PoisonWhy, SlotFault, SlotGraphs, SlotSet};
 
 use crate::autotune;
 use crate::best::{self, Best};
+use crate::card_bytes::{PlanCard, card_reading};
 use crate::fault::Fault;
 use crate::graph::MappedHost;
 use crate::head::{Head, HeadNorm, HostHead};
@@ -62,6 +63,7 @@ use gguf::Split;
 use gguf::shard_dirs::{shard_dirs, sidecar_path};
 use model::arch::Arch;
 use model::moe::HostLayer;
+use model::placement::card_made::{CardPhase, CardReading};
 use model::placement::churn::ChurnPool;
 use model::placement::need_hook;
 use model::placement::workstation::{self, ArenaGrant, HostNeed};
@@ -540,6 +542,8 @@ struct PlacedPre {
     ctx_max: usize,
     /// The prelude's phases; the body and the head are timed after it.
     times: LoadTimes,
+    /// The plan's side of the card the load opened ([`PlanCard`]).
+    plan_card: PlanCard,
 }
 
 /// The wall of each phase of a placed load ([`GpuModel::load_placed`],
@@ -650,6 +654,10 @@ pub struct GpuModel<B: ChainBody> {
     /// The load's phases, when its load timed them ([`LoadTimes`]); `None`
     /// on a load that timed none.
     load_times: Option<LoadTimes>,
+    /// The plan's side of the card a placed load opened ([`PlanCard`]),
+    /// what the card-byte invariant reads against; `None` on a load by no
+    /// plan of this crate's placed path.
+    plan_card: Option<PlanCard>,
     /// The step and pass readbacks begun ([`GpuModel::reads`]): the stamp
     /// every residency boundary carries ([`BoundaryAt`]).
     reads: u64,
@@ -710,6 +718,7 @@ impl<B: ChainBody> GpuModel<B> {
             ahead: None,
             poisoned: None,
             load_times: None,
+            plan_card: None,
             reads: 0,
             watch,
             watchdog,
@@ -1042,6 +1051,22 @@ impl<B: ChainBody> GpuModel<B> {
     /// The card this model runs on.
     pub fn gpu(&self) -> &Gpu {
         &self.gpu
+    }
+
+    /// The plan's side of the card a placed load opened ([`PlanCard`]);
+    /// `None` on a load by no plan of the placed path.
+    #[must_use]
+    pub fn plan_card(&self) -> Option<&PlanCard> {
+        self.plan_card.as_ref()
+    }
+
+    /// The card-byte invariant's reading of this model's card at `phase`
+    /// ([`card_reading`]); `None` on a load by no plan of the placed path.
+    pub fn card_reading(&self, phase: CardPhase) -> Result<Option<CardReading>, GpuError> {
+        self.plan_card
+            .as_ref()
+            .map(|on| card_reading(&self.gpu, on, phase))
+            .transpose()
     }
 
     /// The model's resident weights.
@@ -2743,6 +2768,7 @@ fn placed_pre(
         .filter(|&c| c > 0)
         .ok_or_else(|| GpuError::shape(what, format!("the plan's ctx_max {}", plan.ctx_max)))?;
     let layers = spec.layers.clone();
+    let plan_card = PlanCard::of(plan, card)?;
     // Refused before the card opens or a byte is read: a plan with no head card that does not
     // leave the head tensors on the host has no head for any body to build.
     let head = plan.head_site(card).map_err(|e| GpuError::plan(what, e))?;
@@ -2832,6 +2858,7 @@ fn placed_pre(
                 head: Duration::ZERO,
                 parts,
             },
+            plan_card,
         },
         residency,
     ))
@@ -2972,6 +2999,7 @@ fn placed_done<B: ChainBody>(
         head,
         ctx_max,
         mut times,
+        plan_card,
     } = p;
     let t = Instant::now();
     let head = match head {
@@ -2999,6 +3027,7 @@ fn placed_done<B: ChainBody>(
         ctx_max,
     });
     model.load_times = Some(times);
+    model.plan_card = Some(plan_card);
     Ok(model)
 }
 

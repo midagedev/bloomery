@@ -278,7 +278,9 @@ impl MiniMax {
         set_prefill_group(&mut model, a.group)?;
         let ctx_u32 = u32::try_from(plan.ctx_max)
             .map_err(|_| format!("the plan's ctx_max {} passes u32", plan.ctx_max))?;
-        let mut s = Session::from_model(model, ctx_u32);
+        // Held to its plan's card bytes from here (`card_bytes::watch`).
+        let mut s =
+            Session::from_model(model, ctx_u32).watched(bloomery_gpu_gates::card_bytes::watch()?)?;
         if a.slots.get() > 1 {
             s.add_slots(a.slots.get())?;
         }
@@ -349,13 +351,18 @@ impl Seat for MiniMax {
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
         self.census.steps(Some(self.s.model().body(NAME)?.hybrid()));
         let next = <Body as Prompt>::prompt(self.s.model_mut(), ids)?;
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         self.census
             .prompt(Some(self.s.model().body(NAME)?.hybrid()));
         Ok(next)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
-        Ok(self.s.model_mut().step(&[last])?)
+        let next = self.s.model_mut().step(&[last])?;
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstStep)?;
+        Ok(next)
     }
 
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {

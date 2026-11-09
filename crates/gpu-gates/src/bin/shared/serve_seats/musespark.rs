@@ -265,7 +265,9 @@ impl Muse {
         let nodes = model.capture_step()?;
         let ctx_u32 = u32::try_from(plan.ctx_max)
             .map_err(|_| format!("the plan's ctx_max {} passes u32", plan.ctx_max))?;
-        let mut s = Session::from_model(model, ctx_u32);
+        // Held to its plan's card bytes from here (`card_bytes::watch`).
+        let mut s =
+            Session::from_model(model, ctx_u32).watched(bloomery_gpu_gates::card_bytes::watch()?)?;
         // The lane before the expert stream: a started ring takes the card's free bytes past its
         // keep, so every buffer the open makes comes first.
         let lane = match a.cache_ram {
@@ -323,13 +325,18 @@ impl Seat for Muse {
         let placed = self.s.model().body(NAME)?.placed();
         self.census.steps(placed.map(|p| p.hybrid()));
         let next = <Body as Prompt>::prompt(self.s.model_mut(), ids)?;
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         let placed = self.s.model().body(NAME)?.placed();
         self.census.prompt(placed.map(|p| p.hybrid()));
         Ok(next)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
-        Ok(self.s.model_mut().step(&[last])?)
+        let next = self.s.model_mut().step(&[last])?;
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstStep)?;
+        Ok(next)
     }
 
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {

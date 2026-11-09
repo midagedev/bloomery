@@ -1,0 +1,11 @@
+--- a/crates/placement/src/placement/card_made.rs
++++ b/crates/placement/src/placement/card_made.rs
+@@ -92,7 +92,7 @@
+             before,
+             now,
+             terms: totals.terms(),
+-            in_reading: totals.context_bytes.min(CONTEXT_SELF),
++            in_reading: totals.context_bytes,
+         }
+     }
+ 

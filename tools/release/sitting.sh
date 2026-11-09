@@ -693,6 +693,8 @@ run_cell() {
     "BLOOMERY_MODEL=$CF_PROFILE" BLOOMERY_AB_ROUNDS=1 "DEPTH_SERVE_MEM_BASELINE=$MEMBASE" "DEPTH_SERVE_FOLD=$CF_FOLD"
     "TMPDIR=$dir/tmp")
   [ -z "$CF_PATH" ] || envv+=("BLOOMERY_REF_MODEL=$CF_PATH")
+  # The sitting holds the card: the server's card-byte invariant refuses a reading past its plan.
+  envv+=(BLOOMERY_CARD_HELD=1)
   [ "$CF_PLACE" = - ] || envv+=("DEPTH_SERVE_PLACE=$CF_PLACE")
   [ -z "$CF_CTX" ] || envv+=("DEPTH_SERVE_CTX=$CF_CTX")
   [ "$STAGE" != portable ] || envv+=("DEPTH_SERVE_TARBALL=$TARBALL")

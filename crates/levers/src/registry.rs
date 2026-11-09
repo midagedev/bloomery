@@ -2511,6 +2511,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          `any`.",
     ),
     runner(
+        "BLOOMERY_CARD_HELD",
+        Some("gpu-gate.sh"),
+        "`1`: the run holds its card, so a card-byte invariant reading past the plan's count, or \
+         one that cannot be measured, ends the run by name (`crates/gpu-gates/src/card_bytes.rs`); \
+         `tools/gpu-gate.sh` exports it once it holds the gate lock, and the release sitting for \
+         the server it times. Unset, each reading is a record line only.",
+    ),
+    runner(
         "BLOOMERY_GATE_V41_LOAD",
         Some("gpu-gate.sh"),
         "`1`: the run loads the whole V4.1 model, so it also takes the box-wide V4.1 load lock, \

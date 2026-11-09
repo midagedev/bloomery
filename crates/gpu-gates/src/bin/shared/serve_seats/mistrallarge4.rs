@@ -389,7 +389,9 @@ impl MistralLarge4 {
         set_prefill_group(&mut model, a.group)?;
         let ctx_u32 = u32::try_from(plan.ctx_max)
             .map_err(|_| format!("the plan's ctx_max {} passes u32", plan.ctx_max))?;
-        let mut s = Session::from_model(model, ctx_u32);
+        // Held to its plan's card bytes from here (`card_bytes::watch`).
+        let mut s =
+            Session::from_model(model, ctx_u32).watched(bloomery_gpu_gates::card_bytes::watch()?)?;
         // The draft after the step's capture, its verify pass captured on the live sequence, and
         // before the other resident slots are made (each captures on its first use).
         let draft = match (a.draft, spark) {
@@ -499,6 +501,8 @@ impl Seat for MistralLarge4 {
         let next = self.draft.prefill(&mut self.s, ids, |s| {
             Ok(<Body as Prompt>::prompt(s.model_mut(), ids)?)
         })?;
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         self.census
             .prompt(Some(self.s.model().body(NAME)?.hybrid()));
         Ok(next)
@@ -538,6 +542,7 @@ impl Seat for MistralLarge4 {
             )?;
             encoded.prompt::<Body, _>(s, ids, |rows| rows.media_spans())
         })?;
+        s.card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         census.prompt(Some(s.model().body(NAME)?.hybrid()));
         Ok(next)
     }
@@ -546,6 +551,8 @@ impl Seat for MistralLarge4 {
     /// gains the position, the DSpark draft appends the step's feature row).
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
         let next = self.s.model_mut().step(&[last])?;
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstStep)?;
         self.draft.stepped(&mut self.s, last, next)?;
         Ok(next)
     }

@@ -189,6 +189,39 @@ pub static PLAN: Kind = Kind {
     ],
 };
 
+/// What a run made on its card against what its plan counts there.
+pub static CARD_BYTES: Kind = Kind {
+    name: "card_bytes",
+    head: "card bytes",
+    doc: "The card-byte invariant at one phase of a run (load, first-prompt or first-step): the device bytes the run made on its plan's card (card, the plan's index) since the card's context opened (made: the free reading at the open, before, less the one now), the bytes the plan counts there (planned: every term, terms as name=bytes, less in_reading, the context's own creation cost the opening reading already carries), the excess (past, 0 within the plan), within or past (verdict), and whether the run holds the card (held: refuse, where a past or unmeasured reading ends the run; record, where it is only this line).",
+    parts: &[
+        key("phase", Word, ""),
+        key("card", U64, ""),
+        key("held", Word, ""),
+        key("verdict", Word, ""),
+        key("made", U64, "B"),
+        key("planned", U64, "B"),
+        key("past", U64, "B"),
+        key("before", U64, "B"),
+        key("now", U64, "B"),
+        key("in_reading", U64, "B"),
+        key("terms", Csv, "name=B"),
+    ],
+};
+
+/// A card the card-byte invariant could not measure, and why.
+pub static CARD_UNMEASURED: Kind = Kind {
+    name: "card_unmeasured",
+    head: "card unmeasured",
+    doc: "A phase of a run (load, first-prompt or first-step) whose plan card (card, the plan's index) the card-byte invariant does not measure, because the device's free reading is not this run's alone: an integrated device, whose reading is the host's room, or a card other processes held at plan time (why, last); whether the run holds the card (held: refuse, where this ends the run; record, where it is only this line).",
+    parts: &[
+        key("phase", Word, ""),
+        key("card", U64, ""),
+        key("held", Word, ""),
+        key("why", Text, ""),
+    ],
+};
+
 /// One rank of a tensor-parallel plan.
 pub static TP_RANK: Kind = Kind {
     name: "tp_rank",
@@ -3000,6 +3033,14 @@ pub mod groups {
         pub const LEVER: &[&Kind] = &[&RESIDENCY_LEVER];
     }
 
+    /// `card_bytes.rs`.
+    pub mod card_bytes {
+        use crate::record::{CARD_BYTES, CARD_UNMEASURED, Kind};
+
+        /// A session's card-byte readings (`card_bytes::watch`).
+        pub const WATCH: &[&Kind] = &[&CARD_BYTES, &CARD_UNMEASURED];
+    }
+
     /// `record/host_tier.rs`.
     pub mod host_tier {
         use crate::record::{Kind, NVTIER, TIER_CENSUS};
@@ -3191,6 +3232,8 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &LANE,
     &LOAD,
     &LOAD_PHASES,
+    &CARD_BYTES,
+    &CARD_UNMEASURED,
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
@@ -3298,6 +3341,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = kinds![
     ],
     groups::drafted::WIDTH,
     groups::bind::SLOTS,
+    groups::card_bytes::WATCH,
 ];
 
 /// What `bloomery-serve-qwen38` prints, all on stderr; the `hf` lines are a
@@ -3362,6 +3406,7 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
     groups::drafted::PROMPT,
     groups::drafted::WIDTH,
     groups::ds41_draft::LOAD,
+    groups::card_bytes::WATCH,
 ];
 
 /// What the MiMo seat of `bloomery-serve` prints, all on stderr: the
@@ -3380,6 +3425,7 @@ pub static BLOOMERY_SERVE_MIMO2: &[&Kind] = kinds![
     groups::fetch::SET,
     &[&LANE, &LOAD_MIMO2, &LOAD_PHASES, &LISTENING_MIMO2],
     groups::bind::CACHE,
+    groups::card_bytes::WATCH,
 ];
 
 /// What the Solar seat of `bloomery-serve` prints, all on stderr: the
@@ -3401,6 +3447,7 @@ pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
     groups::host_tier::ARENA,
     groups::host_tier::CENSUS,
     groups::bind::CACHE,
+    groups::card_bytes::WATCH,
 ];
 
 /// The common hybrid seat's placement, residency, load, NVMe tier and tier census, address
@@ -3418,6 +3465,7 @@ pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
     groups::host_tier::ARENA,
     groups::host_tier::CENSUS,
     groups::bind::CACHE,
+    groups::card_bytes::WATCH,
 ];
 
 /// What the MiniMax-M3 seat of `bloomery-serve` prints, all on stderr: the
@@ -3439,6 +3487,7 @@ pub static BLOOMERY_SERVE_MINIMAXM3: &[&Kind] = kinds![
     groups::host_tier::ARENA,
     groups::host_tier::CENSUS,
     groups::bind::CACHE,
+    groups::card_bytes::WATCH,
 ];
 
 /// What the Muse Spark seat of `bloomery-serve` prints, all on stderr: the
@@ -3459,6 +3508,7 @@ pub static BLOOMERY_SERVE_MUSESPARK: &[&Kind] = kinds![
     groups::host_tier::ARENA,
     groups::host_tier::CENSUS,
     groups::bind::CACHE,
+    groups::card_bytes::WATCH,
 ];
 
 /// What the Mistral Large 4 seat of `bloomery-serve` prints, all on stderr: the
@@ -3491,6 +3541,7 @@ pub static BLOOMERY_SERVE_MISTRALLARGE4: &[&Kind] = kinds![
     groups::drafted::PROMPT,
     groups::drafted::WIDTH,
     groups::ds41_draft::LOAD,
+    groups::card_bytes::WATCH,
 ];
 
 /// What the nemotron_h seat of `bloomery-serve` prints, all on stderr: the
@@ -3534,6 +3585,7 @@ pub static BLOOMERY_SERVE_RAON1: &[&Kind] = kinds![
     &[&LOAD_RAON1, &LOAD_PHASES, &LOAD_DRAFT, &LISTENING_RAON1],
     groups::bind::CACHE,
     groups::drafted::WIDTH,
+    groups::card_bytes::WATCH,
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the
@@ -3574,6 +3626,7 @@ pub static BLOOMERY_SERVE_GLM: &[&Kind] = kinds![
     &[&RESIDENCY_PASS, &RESIDENCY_RESET, &RESIDENCY_LEAK],
     groups::bind::SLOTS,
     groups::drafted::WIDTH,
+    groups::card_bytes::WATCH,
 ];
 
 /// What the decision-model seat of `bloomery-serve` prints, all on stderr: the
@@ -3610,6 +3663,8 @@ pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &LANE,
     &LOAD_GENERATOR,
     &LOAD_PHASES,
+    &CARD_BYTES,
+    &CARD_UNMEASURED,
     &HOST_POPULATE,
     &HOST_POPULATE_OFF,
     &HOST_LOCK,
@@ -3813,6 +3868,7 @@ pub static GATE_NVTIER: &[&Kind] = kinds![
         &NVTIER_SITTING,
     ],
     groups::nvtier_family::ARM,
+    groups::card_bytes::WATCH,
 ];
 
 /// The printed plan's host-only causes under its actual expert rule.
