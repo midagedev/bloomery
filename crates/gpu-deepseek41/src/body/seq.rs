@@ -41,7 +41,7 @@ use cuda_core::CudaStream;
 use model::arch::deepseek41::hparams::Hparams;
 
 use super::ced::Ced;
-use super::{Body, BodyLevers, Holds, LayerKv, PAIR_ROWS, Shadows, layer_kv};
+use super::{Body, BodyLevers, Holds, KvRooms, LayerKv, PAIR_ROWS, Shadows, layer_kv};
 
 /// [`Body::call_hole`]'s rule over the walk and the levers it reads: the
 /// call's batch starts come from the levers' cut, since a latent start
@@ -168,7 +168,7 @@ impl History {
 pub struct Seq {
     /// Per layer of the body's layers, in order.
     pub(super) kv: Vec<LayerKv>,
-    /// Every layer's ring shadow, in page-locked host memory.
+    /// Every layer's ring shadow, in host memory.
     pub(super) shadows: Shadows,
     /// The tokens decoded so far: `ctx_max` reserved.
     pub(super) history: History,
@@ -202,13 +202,13 @@ impl Seq {
         hp: &Hparams,
         layers: Range<usize>,
         ctx_max: usize,
-        ratios: &[u32],
+        (ratios, rooms): (&[u32], &KvRooms),
     ) -> Result<Seq, GpuError> {
         gpu.context().bind_to_thread()?;
-        let stream = gpu.stream();
+        let stream = gpu.stream_handle();
         let kv = layers
             .clone()
-            .map(|l| layer_kv(stream, hp, l, ctx_max))
+            .map(|l| layer_kv(&stream, hp, l, ctx_max, rooms))
             .collect::<Result<Vec<_>, _>>()?;
         let shadows = Shadows::new(gpu, layers.len(), ctx_max, hp.head_dim)?;
         let ring_rows = kv.first().map_or(0, |k| k.ring.rows());
@@ -237,19 +237,37 @@ impl Seq {
             .sum()
     }
 
-    /// Page-locked host bytes: every layer's ring shadow.
+    /// Host bytes of address range: every layer's ring shadow.
     pub(super) fn shadow_bytes(&self) -> usize {
-        self.shadows.host.num_bytes()
+        self.shadows.bytes()
     }
 
-    /// Back to the state the load leaves, on `stream`: every cache zeroed in
-    /// place (a captured chain keeps their addresses), the history emptied,
-    /// the record of a known empty state. The shadows keep their rows: a cut
-    /// reads only rows a step since wrote.
+    /// Every room of the sequence backed through the first `positions` positions, and the pages
+    /// a write from `pos` on reaches its own ([`LayerKv::fit`]).
+    pub(super) fn fit(&mut self, pos: usize, positions: usize) -> Result<(), GpuError> {
+        self.kv.iter_mut().try_for_each(|l| l.fit(pos, positions))?;
+        self.shadows.fit(positions)
+    }
+
+    /// The bytes of new card pages a fit through `positions` positions still asks, every card
+    /// room's: the shadows are host rooms, which freed card bytes cannot back.
+    pub(super) fn asks(&self, positions: usize) -> usize {
+        self.kv.iter().map(|l| l.asks(positions)).sum()
+    }
+
+    /// Back to the state the load leaves, on `stream`: the fixed buffers (rings, compressor
+    /// states) zeroed in place (a captured chain keeps their addresses), the rooms' pages
+    /// past the rows the sequence reached given back, the history emptied, the record of a
+    /// known empty state. The shadows' pages past the rows reached are given back like the
+    /// rooms': a cut reads only rows a step since wrote.
     pub(super) fn clear(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         for layer in &mut self.kv {
             layer.zero(stream)?;
         }
+        for layer in &mut self.kv {
+            layer.settle()?;
+        }
+        self.shadows.settle()?;
         self.history.clear();
         self.holds.known(0);
         self.shadow_from = 0;
@@ -328,7 +346,7 @@ impl Slots for Body {
             &self.hp,
             self.layers.clone(),
             self.positions(),
-            self.planner.stream_ratios(),
+            (self.planner.stream_ratios(), &self.kv_rooms),
         )?;
         self.slots_made += 1;
         Ok(seq)
@@ -352,7 +370,7 @@ impl Slots for Body {
     }
 
     /// The live sequence's device bytes ([`Seq`]'s caches and compressor
-    /// states); its ring shadows are page-locked host memory
+    /// states); its ring shadows are host memory
     /// ([`Body::seq_shadow_bytes`]).
     fn seq_bytes(&self) -> usize {
         self.seq.device_bytes()
@@ -360,7 +378,7 @@ impl Slots for Body {
 }
 
 impl Body {
-    /// Page-locked host bytes one sequence holds: its ring shadows, which
+    /// Host bytes of address range one sequence holds: its ring shadows, which
     /// the plan counts on the host (`KvBytes::shadow_bytes`) and
     /// [`Slots::seq_bytes`] leaves out.
     #[must_use]

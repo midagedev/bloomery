@@ -19,6 +19,10 @@
 //! starts from a clear (the residency back to its seed), streaming on, and
 //! names its mutant:
 //!
+//! - `kvgrow` (the stores grow past the card's free bytes; runs first, in both modes): a call, then
+//!   the same call on a card squeezed until it refuses a page — the body frees expert bytes for the
+//!   first fit and the ids and logits are the free call's (mutant:
+//!   `.mutants/kvc-ds41-fit-rooms-removed.patch`, the squeezed call ends in `NoRoom`).
 //! - `s2` (DEMOTE: a streamed expert gives the bits a card-resident one
 //!   does): call A, [`S2_P`] prose ids in one batch, streams — its pick
 //!   admits experts in place of pool residents, their slots are read by the
@@ -104,6 +108,10 @@ fn main() -> std::process::ExitCode {
 mod ds41_open;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/kv_squeeze.rs"]
+mod kv_squeeze;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/quiet.rs"]
 mod quiet;
 
@@ -167,6 +175,10 @@ mod gate {
     };
     /// Batches a prompt group holds.
     const GROUP: usize = 2;
+    /// `kvgrow`'s prompt: one batch.
+    const KVGROW_P: usize = 512;
+    /// Greedy steps after `kvgrow`'s calls.
+    const KVGROW_STEPS: usize = 8;
     /// `s2`'s prompt: one batch, one group, one pick a layer.
     const S2_P: usize = 512;
     /// Half of `s1`'s prompt: prose ids, then as many code ids. A lone last
@@ -362,6 +374,39 @@ mod gate {
     fn set_stream(s: &mut Session<Body>, on: bool) -> Result<(), GateError> {
         s.model_mut().body_parts(NAME)?.2.set_hoststream(on)?;
         Ok(())
+    }
+
+    /// `kvgrow`: the stores grow past the card's free bytes. The call of [`KVGROW_P`] prose ids
+    /// and [`KVGROW_STEPS`] steps with streaming off, then the same call after a reset on a card
+    /// squeezed until it refuses a page: the rooms' first fit finds no page, the body frees
+    /// expert bytes for it (`fit_rooms`) and fits once more. The squeezed call's ids and logits
+    /// equal the free call's, and card experts were given up. Mutant:
+    /// `.mutants/kvc-ds41-fit-rooms-removed.patch` (the squeezed call ends in `NoRoom`).
+    fn kvgrow(s: &mut Session<Body>) -> Result<bool, GateError> {
+        set_stream(s, false)?;
+        let ids = corpus("prose", 0, KVGROW_P)?;
+        s.clear()?;
+        let free = call(s, &ids, KVGROW_STEPS)?;
+        s.clear()?;
+        let seed = card_sets(s)?;
+        let held = crate::kv_squeeze::squeeze(s.model().gpu())?;
+        let buffers = held.len();
+        let squeezed = call(s, &ids, KVGROW_STEPS);
+        drop(held);
+        let squeezed = squeezed?;
+        let experts = |sets: &[Vec<u32>]| sets.iter().map(Vec::len).sum::<usize>();
+        let given = experts(&seed).saturating_sub(experts(&card_sets(s)?));
+        let same = free.out == squeezed.out;
+        let ok = same && given > 0;
+        println!(
+            "kvgrow: the card squeezed by {buffers} buffers, the call of {} ids and {KVGROW_STEPS} \
+             steps gave up {given} card experts and its ids and logits are the free call's: \
+             {same}: {}",
+            ids.len(),
+            verdict(ok)
+        );
+        s.clear()?;
+        Ok(ok)
     }
 
     /// `s2`: a call that streams, then the same call on the placement it
@@ -759,6 +804,10 @@ mod gate {
         let clauses = |s: &mut Session<Body>| -> Result<(bool, Option<StaticProbe>), GateError> {
             let (residency_ok, probe) = watched("residency", || residency::clauses(s, &flags, at))?;
             let mut pass = refused && residency_ok;
+            crate::ds41_tier::sc(
+                "kvgrow: a squeezed card grows the stores by freeing expert bytes, same ids",
+            )?;
+            pass &= watched("kvgrow", || kvgrow(s))?;
             if only_residency {
                 return Ok((pass, probe));
             }

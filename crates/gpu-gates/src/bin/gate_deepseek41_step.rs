@@ -629,7 +629,8 @@ mod gate {
     /// A file whose batch-read tensors are all Q3_K is fed by the batch with no
     /// refusal. Any other loads, feeds steps and names the tensor that decided
     /// it (`Body::batch_refusal`), and its prompt call is the same ids stepped
-    /// one by one: the same last token and the same snapshot.
+    /// one by one: the same last token and the same snapshot. Then the K/V rooms' clauses
+    /// ([`feed_rooms`]).
     fn feed_run(
         path: &str,
         split: &Split,
@@ -657,7 +658,7 @@ mod gate {
                  and none: {}",
                 verdict(ok)
             );
-            return Ok(ok);
+            return Ok(ok && feed_rooms(&mut m, hp)?);
         };
         let named = why
             .as_deref()
@@ -692,7 +693,116 @@ mod gate {
             walked.1,
             verdict(same)
         );
-        Ok(steps && same)
+        let rooms = feed_rooms(&mut m, hp)?;
+        Ok(steps && same && rooms)
+    }
+
+    /// Positions of the `room` and `reset` clauses' prompt: past one 2 MiB page of the widest
+    /// room (a ratio-2 stream's 512 B rows fill a page at 4,096 positions, a ratio-1 stream's
+    /// 1,024 B rows at 2,048), inside the gate's `CTX_MAX`.
+    const ROOM_WALK: usize = 4_224;
+
+    /// The K/V rooms' clauses of `--feed` on the load `m` holds: `room`, `reset` and `shadow`.
+    fn feed_rooms(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+        const WHAT: &str = "gate_deepseek41_step feed rooms";
+        let vocab = u64::try_from(hp.n_vocab)?;
+        let ids: Vec<u32> = (0..ROOM_WALK as u64)
+            .map(|i| u32::try_from((i * 7_919 + 13) % vocab))
+            .collect::<Result<_, _>>()?;
+        m.reset()?;
+        <Body as Prompt>::prompt(m, &ids)?;
+        // The rooms hold the rows the call reached on backed pages, and the shadows the rows of
+        // every position the call wrote; a reset keeps the pages of the sequence it ends, the
+        // next one (here empty) gives every page past its own reach back.
+        let (held, shadow_held, roomed) = {
+            let b = m.body(WHAT)?;
+            (
+                b.rooms_mapped(ids.len()),
+                b.shadow_mapped(),
+                b.shadow_host().roomed,
+            )
+        };
+        let backed = held.card + held.host >= held.reached && held.reached > 0;
+        m.reset()?;
+        m.reset()?;
+        let (ended, shadow_ended) = {
+            let b = m.body(WHAT)?;
+            (b.rooms_mapped(0), b.shadow_mapped())
+        };
+        let empty = ended.card + ended.host == 0 && (!roomed || shadow_ended == 0);
+        println!(
+            "feed: the rooms back {} B (card {} B, host {} B) for the {} B of {} ids' rows, the \
+             ring shadows {shadow_held} B (rooms: {roomed}); after a reset of an empty sequence \
+             {} B and {shadow_ended} B: {}",
+            held.card + held.host,
+            held.card,
+            held.host,
+            held.reached,
+            ids.len(),
+            ended.card + ended.host,
+            verdict(backed && empty)
+        );
+        Ok(backed && empty && feed_shadow(m, hp)?)
+    }
+
+    /// `shadow`: a walk of steps past two windows, then a cut a few positions back that restores
+    /// ring rows from the shadows: the same ids and the same snapshot as the run that was not
+    /// cut, and, when the shadows are host rooms, rooms backed for every position walked and for
+    /// fewer than the context's rows.
+    fn feed_shadow(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+        const WHAT: &str = "gate_deepseek41_step feed shadow";
+        const BACK: usize = 8;
+        let n = 2 * hp.window + 2 * BACK;
+        m.reset()?;
+        let mut t = 0;
+        for id in SLOT_PROMPTS[0].iter().cycle().take(n) {
+            t = m.step(std::slice::from_ref(id))?;
+        }
+        let (ids, cut, held, roomed, full) = {
+            let b = m.body(WHAT)?;
+            let host = b.shadow_host();
+            (
+                b.history().to_vec(),
+                b.keep_point(n - BACK),
+                b.shadow_mapped(),
+                host.roomed,
+                host.bytes,
+            )
+        };
+        if cut < hp.window || cut + 2 > n {
+            return Err(format!(
+                "the walk of {n} cuts back to {cut}: the clause needs a cut at or past the window \
+                 of {} rows and two positions behind the end",
+                hp.window
+            )
+            .into());
+        }
+        let before = snap_hash(m)?;
+        m.rollback(u32::try_from(cut)?)?;
+        let mut out = Vec::with_capacity(n - cut);
+        for id in &ids[cut..n] {
+            out.push(m.step(std::slice::from_ref(id))?);
+        }
+        let want: Vec<u32> = ids[cut + 1..n].iter().copied().chain([t]).collect();
+        let (fed, same) = (out == want, snap_hash(m)? == before);
+        let reached = n * hp.n_layer * hp.head_dim * size_of::<u16>();
+        let lazy = !roomed || (held >= reached && held < full);
+        println!(
+            "feed: after {n} steps (ring window {}), a cut to {cut} restores ring rows from the \
+             shadows; the {} ids stepped again answer {}, the snapshot {} the uncut run's; \
+             shadows {} {held} B of {full} B for the {reached} B of {n} positions: {}",
+            hp.window,
+            n - cut,
+            if fed { "the run's ids" } else { "other ids" },
+            if same { "is" } else { "is not" },
+            if roomed {
+                "rooms back"
+            } else {
+                "are page-locked, all"
+            },
+            verdict(fed && same && lazy)
+        );
+        Ok(fed && same && lazy)
     }
 
     /// A digest of the model's snapshot, every part a save copies.
@@ -1710,7 +1820,7 @@ mod gate {
             let (gpu, _, body) = m.body_parts(WHAT)?;
             let stream = gpu.stream();
             let ring = body
-                .state_mut(0)
+                .state_mut(0)?
                 .ok_or("the body does not run layer 0")?
                 .ring;
             let (width, at) = (
@@ -1843,7 +1953,7 @@ mod gate {
             let (gpu, _, body) = m.body_parts(WHAT)?;
             let stream = gpu.stream();
             let ring = body
-                .state_mut(0)
+                .state_mut(0)?
                 .ok_or("the body does not run layer 0")?
                 .ring;
             let width = ring.cols();
@@ -2235,7 +2345,7 @@ mod gate {
                 let (gpu, _, body) = m.body_parts(WHAT)?;
                 let stream = gpu.stream();
                 let ring = body
-                    .state_mut(RECOVER_LAYER)
+                    .state_mut(RECOVER_LAYER)?
                     .ok_or("the body does not run the recovery layer")?
                     .ring;
                 let width = ring.cols();
@@ -2663,7 +2773,7 @@ mod gate {
         body.reset(gpu)?;
         for (l, s) in state.iter().enumerate() {
             let b = body
-                .state_mut(l)
+                .state_mut(l)?
                 .ok_or_else(|| format!("the body does not run layer {l}"))?;
             b.ring.buf_mut().copy_from_host(stream, &s.ring)?;
             match (&s.rows, b.rows) {
@@ -2732,7 +2842,7 @@ mod gate {
         let mut comp = Vec::new();
         for l in 0..layers {
             let b = body
-                .state_mut(l)
+                .state_mut(l)?
                 .ok_or_else(|| format!("the body does not run layer {l}"))?;
             state.push(b.ring.buf().to_host_vec(stream)?);
             for t in [b.rows, b.keys].into_iter().flatten() {

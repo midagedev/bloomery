@@ -1,0 +1,14 @@
+--- a/crates/gpu-deepseek41/src/body/seq.rs
++++ b/crates/gpu-deepseek41/src/body/seq.rs
+@@ -263,11 +263,7 @@
+     pub(super) fn clear(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+         for layer in &mut self.kv {
+             layer.zero(stream)?;
+-        }
+-        for layer in &mut self.kv {
+-            layer.settle()?;
+         }
+-        self.shadows.settle()?;
+         self.history.clear();
+         self.holds.known(0);
+         self.shadow_from = 0;

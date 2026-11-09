@@ -6,10 +6,12 @@
 //!
 //! - per layer, the raw window ring: `min(ctx_max, window)` latent rows in
 //!   f16, the row of cell `c` in slot `c % window`;
-//! - the rings' shadows, in page-locked host memory the card writes at its
-//!   host address ([`Shadows`]): per layer `ctx_max` rows of the same f16
-//!   bits, the row of cell `c` in row `c`, written by the same append and
-//!   read only when a cut restores the ring ([`Body::rollback`]);
+//! - the rings' shadows, in host memory the card writes ([`Shadows`]: a host
+//!   room per layer, backed as far as the positions reached, or on a device
+//!   that cannot back a host page one page-locked allocation): per layer
+//!   `ctx_max` rows of the same f16 bits, the row of cell `c` in row `c`,
+//!   written by the same append and read only when a cut restores the ring
+//!   ([`Body::rollback`]);
 //! - per layer that owns a compressor, its compressed rows (`⌈ctx_max /
 //!   ratio⌉` latent rows in f16) and, above ratio 1, its state: the `ratio`
 //!   latest latent projections in f32, values and scores (a ratio-1 group is
@@ -90,13 +92,17 @@ use bloomery_gpu::hybrid::{
 };
 use bloomery_gpu::model::{ChainBody, HostServed, Resident, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, PartedBuffer, capturing, window};
-use bloomery_levers::{ChurnHosting, HostCfg, ResidencyAt};
+use bloomery_gpu::{
+    DeviceTensor, FreedBytes, Gpu, GpuError, GpuModel, KvBacking, KvRoomBody, PartedBuffer,
+    RoomTensor, capturing, fit_rooms, kv_backing, window,
+};
+use bloomery_levers::{ChurnHosting, HostCfg, KvHost, ResidencyAt};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
+use model::arch::deepseek41::kv::{KEYS, KvLayout, ROWS};
 use model::arch::deepseek41::place::PlanInputs;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
 use model::arch::deepseek41::roles;
@@ -104,7 +110,10 @@ use model::arch::deepseek41::tp::{self, TpUnits};
 use model::moe::UNION_MAX_COLS;
 use model::part::{Source, StoredRows, Take};
 use model::placement::accepts::{self, Program};
-use model::placement::{CardFormat, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role};
+use model::placement::{
+    CardFormat, KvBytes, KvDefault, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role,
+};
+use runtime::stores::{Access, PosBuf, PosLayout};
 
 use crate::chain::attn::{
     AttnChain, AttnIo, AttnTaps, Compressed, Selection, SourceIo, join_projections,
@@ -299,6 +308,19 @@ impl OpenCfg {
             body,
             place: PlanLevers::from_levers(levers).map_err(|e| GpuError::plan(WHAT, e))?,
         })
+    }
+
+    /// `self` with the K/V levers `levers` leaves unset taken from a server's `default`
+    /// ([`PlanLevers::resolve_kv`]): the floor the experts are spread at and the backing of the
+    /// selected rows. The load's rooms take the backing from the plan, so the plan and the
+    /// body read one word.
+    #[must_use]
+    pub fn with_kv_default(self, levers: &bloomery_levers::Levers, default: KvDefault) -> OpenCfg {
+        let host = levers.kv_host_set().and_then(KvHost::parse);
+        OpenCfg {
+            place: self.place.resolve_kv(levers.kv_floor_set(), host, default),
+            ..self
+        }
     }
 }
 
@@ -511,6 +533,8 @@ pub fn open_rank<S: Source + Sync>(
     let file = Arc::new(file);
     let host = crate::chain::ffn::host_run(Arc::clone(&file), &hp, layers.end..layers.end, false)?;
     let map = SlotMap::prefix(layers.clone(), hp.experts.n_expert, hp.experts.n_expert)?;
+    let kv = KvLayout::from_file(&file, &hp)
+        .map_err(|e| GpuError::plan("deepseek41 Body::load_rank", e))?;
     let meta = BodyMeta { hp, levers };
     let at = Assembly {
         layers,
@@ -519,6 +543,7 @@ pub fn open_rank<S: Source + Sync>(
         cols,
         join: sums,
         stored,
+        kv: (kv, KvHost::Off, 0),
     };
     let mut body = Body::assemble(
         &gpu,
@@ -602,10 +627,11 @@ pub fn attach_features(m: &mut Deepseek41Model, layers: &[usize]) -> Result<(), 
 struct LayerKv {
     /// The raw window ring.
     ring: DeviceTensor<u16>,
-    /// The compressed rows of the stream the layer's compressor writes.
-    rows: Option<DeviceTensor<u16>>,
-    /// The index keys the layer owns.
-    keys: Option<DeviceTensor<u16>>,
+    /// The compressed rows of the stream the layer's compressor writes, a room: its pages are
+    /// backed as far as the positions a step or a call reached.
+    rows: Option<RoomTensor<u16>>,
+    /// The index keys the layer owns, a room.
+    keys: Option<RoomTensor<u16>>,
     /// The compressor's state above ratio 1: its stream's latest
     /// projections, values and scores.
     values: Option<DeviceTensor<f32>>,
@@ -623,22 +649,354 @@ impl LayerKv {
     fn buffers(&self) -> [(&'static str, usize); 5] {
         [
             ("window ring", self.ring.buf().num_bytes()),
-            ("compressed rows", bytes_of(self.rows.as_ref())),
-            ("index keys", bytes_of(self.keys.as_ref())),
+            ("compressed rows", bytes_of(self.rows.as_deref())),
+            ("index keys", bytes_of(self.keys.as_deref())),
             ("state values", bytes_of(self.values.as_ref())),
             ("state scores", bytes_of(self.scores.as_ref())),
         ]
     }
 
+    /// The fixed buffers zeroed in place: the ring and the compressor's state. The rooms'
+    /// pages are not zeroed: a sequence's end gives back every page it did not reach
+    /// ([`LayerKv::settle`]), and a row is written by the step that completes it before any
+    /// step reads it.
     fn zero(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         self.ring.buf_mut().zero_async(stream)?;
-        for t in [&mut self.rows, &mut self.keys].into_iter().flatten() {
-            t.buf_mut().zero_async(stream)?;
-        }
         for t in [&mut self.values, &mut self.scores].into_iter().flatten() {
             t.buf_mut().zero_async(stream)?;
         }
         Ok(())
+    }
+}
+
+impl LayerKv {
+    /// Both rooms backed through the first `positions` positions, and every page a write from
+    /// `pos` on reaches this sequence's own ([`RoomTensor::fit`], [`RoomTensor::own_from`]).
+    /// Never inside a capture.
+    fn fit(&mut self, pos: usize, positions: usize) -> Result<(), GpuError> {
+        for t in [&mut self.rows, &mut self.keys].into_iter().flatten() {
+            t.fit(positions)?;
+            t.own_from(pos)?;
+        }
+        Ok(())
+    }
+
+    /// The bytes of new pages a fit through `positions` positions still asks.
+    fn asks(&self, positions: usize) -> usize {
+        [&self.rows, &self.keys]
+            .into_iter()
+            .flatten()
+            .map(|t| t.asks(positions))
+            .sum()
+    }
+
+    /// The end of a sequence: every page past the rows it reached given back.
+    fn settle(&mut self) -> Result<(), GpuError> {
+        for t in [&mut self.rows, &mut self.keys].into_iter().flatten() {
+            t.settle()?;
+        }
+        Ok(())
+    }
+}
+
+/// Where a sequence's by-position stores come from: the declaration the plan read
+/// ([`KvBytes::rooms`]), the backing `BLOOMERY_KV_HOST` gives the selected rows, and the free
+/// bytes of the card a spill room keeps ([`kv_backing`]).
+#[derive(Clone, Debug)]
+pub(super) struct KvRooms {
+    layout: PosLayout,
+    word: KvHost,
+    margin: u64,
+}
+
+impl KvRooms {
+    /// The rooms of the file's layout `kv` under the lever word `word` and the card's `margin`.
+    fn new(kv: &KvLayout, word: KvHost, margin: u64) -> Result<KvRooms, GpuError> {
+        let layout = kv.rooms().cloned().ok_or(GpuError::State {
+            what: "deepseek41 Body::load_placed",
+            missing: "the layout's rooms",
+        })?;
+        Ok(KvRooms {
+            layout,
+            word,
+            margin,
+        })
+    }
+
+    /// Layer `l`'s buffer `what` (the layout's name for it) as a room-backed tensor of `ctx`
+    /// positions on `stream`, `None` for a layer that declares none; `width` is the row width
+    /// the body reads it at, which the declaration must agree with.
+    fn tensor(
+        &self,
+        stream: &Arc<CudaStream>,
+        l: usize,
+        (what, name): (&str, &'static str),
+        (ctx, width): (usize, usize),
+    ) -> Result<Option<RoomTensor<u16>>, GpuError> {
+        let Some(buf) = self.layout.buffers(l).iter().find(|b| b.what == what) else {
+            return Ok(None);
+        };
+        let backing = kv_backing(self.word, buf.access, self.margin);
+        let t = RoomTensor::<u16>::new(stream, buf, ctx, name, backing)?;
+        if t.cols() != width {
+            return Err(GpuError::Shape {
+                what: "deepseek41 Body::load_placed",
+                detail: format!(
+                    "layer {l}'s {what} are {} values wide in the layout, {width} in the body",
+                    t.cols()
+                ),
+            });
+        }
+        Ok(Some(t))
+    }
+}
+
+/// The card's `CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING`.
+fn unified_addressing(gpu: &Gpu) -> Result<i32, GpuError> {
+    let mut unified_addressing = 0;
+    // SAFETY: the call writes the live local `unified_addressing`; the
+    // device is the context's own.
+    let rc = unsafe {
+        sys::cuDeviceGetAttribute(
+            &mut unified_addressing,
+            sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING,
+            gpu.context().cu_device(),
+        )
+    };
+    rc.result().map_err(|source| GpuError::Driver {
+        op: Some("cuDeviceGetAttribute(UNIFIED_ADDRESSING)"),
+        source,
+    })?;
+    Ok(unified_addressing)
+}
+
+/// One sequence's ring shadows, per layer `rows` rows of the ring's width in
+/// f16, the row of position `p` in its row `p`: the append writes them at
+/// its host address and a cut copies the rows it needs back into the ring.
+enum Shadows {
+    /// A host room per layer ([`KvBacking::Host`]): the pages are backed as
+    /// far as the positions a step or a call reached, and the card reaches
+    /// them through the room's range like any store.
+    Room(RoomShadows),
+    /// One page-locked host allocation of every layer's `ctx_max` rows
+    /// ([`PinnedShadows`]): where the device cannot back a host page.
+    Pinned(PinnedShadows),
+}
+
+/// The ring shadows as host rooms, one per layer ([`Shadows::Room`]): the
+/// append writes a layer's room as it writes any tensor, a restore copies
+/// device to device ([`RoomShadows::restore`]), and the host reads and
+/// writes rows through an explicit copy ([`Shadows::read_rows`]).
+struct RoomShadows {
+    layers: Vec<RoomTensor<u16>>,
+    rows: usize,
+    width: usize,
+    /// The card's `CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING`, as the load read it.
+    unified_addressing: i32,
+}
+
+impl RoomShadows {
+    /// `layers` rooms of `rows` rows of `width`, no row backed until a fit
+    /// reaches it.
+    fn new(gpu: &Gpu, layers: usize, rows: usize, width: usize) -> Result<RoomShadows, GpuError> {
+        let stream = gpu.stream_handle();
+        let buf = PosBuf {
+            what: "ring shadow",
+            row: (width * size_of::<u16>()) as u64,
+            per: 1,
+            runs: 1,
+            access: Access::Select { rows: 1 },
+        };
+        let layers = (0..layers)
+            .map(|_| RoomTensor::<u16>::new(&stream, &buf, rows, "ring shadow", KvBacking::Host))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RoomShadows {
+            layers,
+            rows,
+            width,
+            unified_addressing: unified_addressing(gpu)?,
+        })
+    }
+
+    /// Copy layer `i`'s shadow rows of `positions` into their slots of
+    /// `ring`, device to device on `stream`: at most two copies (one where
+    /// the slots wrap). `positions` ends at most at the shadow's rows and
+    /// spans at most the ring's. Both sides are device-accessible; the copy
+    /// runs in stream order after every append enqueued before it.
+    fn restore(
+        &self,
+        i: usize,
+        ring: &DeviceTensor<u16>,
+        stream: &CudaStream,
+        positions: Range<usize>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "deepseek41 Body::rollback";
+        let (slots, width) = (ring.rows(), ring.cols());
+        let shadow = self
+            .layers
+            .get(i)
+            .filter(|_| {
+                width == self.width
+                    && width > 0
+                    && positions.end <= self.rows
+                    && positions.len() <= slots
+            })
+            .ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "a restore of positions {positions:?} into shadow {i}: shadows of {} rows of \
+                     {}, {} of them; a ring of {slots} rows of {width}",
+                    self.rows,
+                    self.width,
+                    self.layers.len()
+                ),
+            })?;
+        let row = width * size_of::<u16>();
+        let mut q = positions.start;
+        while q < positions.end {
+            let slot = q % slots;
+            let n = (positions.end - q).min(slots - slot);
+            let dst = ring.buf().cu_deviceptr() + (slot * row) as u64;
+            let src = shadow.buf().cu_deviceptr() + (q * row) as u64;
+            // SAFETY: both ranges are `n · row` bytes inside their buffers
+            // (n <= slots − slot; q + n <= positions.end <= rows), the ring
+            // and the shadow are different buffers, and both outlive the
+            // copy: the ring is the layer's own, and the shadow's room
+            // synchronizes the context before it unmaps.
+            unsafe {
+                cuda_core::simt::memory::memcpy_dtod_async(dst, src, n * row, stream.cu_stream())
+            }
+            .map_err(|source| GpuError::Driver {
+                op: Some("cuMemcpyDtoDAsync (the ring restore)"),
+                source,
+            })?;
+            q += n;
+        }
+        Ok(())
+    }
+}
+
+impl Shadows {
+    /// `layers` zeroed shadows of `rows` rows of `width` for `gpu`'s card:
+    /// host rooms, or, on a device that cannot back a host page, the
+    /// page-locked allocation of the whole `rows` (named once on stderr: the
+    /// old path is correct, only larger).
+    fn new(gpu: &Gpu, layers: usize, rows: usize, width: usize) -> Result<Shadows, GpuError> {
+        static NAMED: std::sync::Once = std::sync::Once::new();
+        match bloomery_gpu::host_page(gpu.context().ordinal()) {
+            Ok(_) => RoomShadows::new(gpu, layers, rows, width).map(Shadows::Room),
+            Err(why) => {
+                NAMED.call_once(|| {
+                    eprintln!(
+                        "deepseek41 ring shadows: the card cannot back a host page ({why}); the \
+                         shadows are page-locked host memory of the whole {rows} positions, not a \
+                         host room"
+                    );
+                });
+                PinnedShadows::new(gpu, layers, rows, width).map(Shadows::Pinned)
+            }
+        }
+    }
+
+    /// Rows of each layer's shadow.
+    fn rows(&self) -> usize {
+        match self {
+            Shadows::Room(r) => r.rows,
+            Shadows::Pinned(p) => p.rows,
+        }
+    }
+
+    /// Values of each row.
+    fn width(&self) -> usize {
+        match self {
+            Shadows::Room(r) => r.width,
+            Shadows::Pinned(p) => p.width,
+        }
+    }
+
+    /// The card's unified addressing, as the load read it.
+    fn unified_addressing(&self) -> i32 {
+        match self {
+            Shadows::Room(r) => r.unified_addressing,
+            Shadows::Pinned(p) => p.unified_addressing,
+        }
+    }
+
+    /// Whether the shadows are host rooms.
+    fn roomed(&self) -> bool {
+        matches!(self, Shadows::Room(_))
+    }
+
+    /// Every layer's shadow, in bytes of address range: the figure the plan
+    /// counts at the cap (a room backs pages only as far as a fit reached).
+    fn bytes(&self) -> usize {
+        match self {
+            Shadows::Room(r) => r.layers.len() * r.rows * r.width * size_of::<u16>(),
+            Shadows::Pinned(p) => p.host.num_bytes(),
+        }
+    }
+
+    /// Bytes of one layer's shadow.
+    fn layer_bytes(&self) -> usize {
+        self.rows() * self.width() * size_of::<u16>()
+    }
+
+    /// Layer `i`'s shadow, the tensor the append writes.
+    fn layer_mut(&mut self, i: usize) -> Option<&mut DeviceTensor<u16>> {
+        match self {
+            Shadows::Room(r) => r.layers.get_mut(i).map(|t| &mut **t),
+            Shadows::Pinned(p) => p.layer_mut(i),
+        }
+    }
+
+    /// Every room backed through the first `positions` positions; a refusal
+    /// is a host room's, so a fit that ran out of memory cannot be mended by
+    /// freeing card bytes ([`GpuError::NoRoom::spill`] says so). Never inside
+    /// a capture.
+    fn fit(&mut self, positions: usize) -> Result<(), GpuError> {
+        let Shadows::Room(r) = self else {
+            return Ok(());
+        };
+        r.layers.iter_mut().try_for_each(|t| {
+            t.fit(positions).map_err(|mut e| {
+                if let GpuError::NoRoom { spill, .. } = &mut e {
+                    *spill = true;
+                }
+                e
+            })
+        })
+    }
+
+    /// The end of a sequence: every page past the rows reached given back.
+    fn settle(&mut self) -> Result<(), GpuError> {
+        match self {
+            Shadows::Room(r) => r.layers.iter_mut().try_for_each(RoomTensor::settle),
+            Shadows::Pinned(_) => Ok(()),
+        }
+    }
+
+    /// Bytes of host memory the shadows' rooms back with pages of their own.
+    fn host_mapped(&self) -> usize {
+        match self {
+            Shadows::Room(r) => r.layers.iter().map(|t| t.mapped().1).sum(),
+            Shadows::Pinned(p) => p.host.num_bytes(),
+        }
+    }
+
+    /// Copy layer `i`'s shadow rows of `positions` into their slots of
+    /// `ring` on `stream` ([`PinnedShadows::restore`], host to device;
+    /// [`RoomShadows::restore`], device to device).
+    fn restore(
+        &self,
+        i: usize,
+        ring: &mut DeviceTensor<u16>,
+        stream: &CudaStream,
+        positions: Range<usize>,
+    ) -> Result<(), GpuError> {
+        match self {
+            Shadows::Room(r) => r.restore(i, ring, stream, positions),
+            Shadows::Pinned(p) => p.restore(i, ring, stream, positions),
+        }
     }
 }
 
@@ -648,10 +1006,10 @@ impl LayerKv {
 /// card reaches page-locked host memory at its host address under unified
 /// addressing, which the load checks and without which it refuses — the
 /// shadows never move to card memory instead — so the append writes a
-/// layer's rows through a window over them ([`Shadows::layer_mut`]) and no
+/// layer's rows through a window over them ([`PinnedShadows::layer_mut`]) and no
 /// card memory holds them. A cut copies the rows it needs back into the ring,
-/// host to device ([`Shadows::restore`]).
-struct Shadows {
+/// host to device ([`PinnedShadows::restore`]).
+struct PinnedShadows {
     /// Per layer, a window over its rows of `host`: they free nothing, and
     /// the drop gives them back.
     windows: Vec<ManuallyDrop<DeviceTensor<u16>>>,
@@ -662,38 +1020,28 @@ struct Shadows {
     unified_addressing: i32,
 }
 
-/// Where the ring shadows live ([`Body::shadow_host`]): one page-locked host
-/// allocation the card reaches at its host address.
+/// Where the ring shadows live ([`Body::shadow_host`]): host rooms the card
+/// reaches through their ranges, or, on a device that cannot back a host page,
+/// one page-locked host allocation it reaches at its host address.
 #[derive(Clone, Copy, Debug)]
 pub struct ShadowHost {
-    /// Every layer's shadow, in bytes.
+    /// Every layer's shadow, in bytes of the full `ctx_max` rows (the room's
+    /// address range, the allocation).
     pub bytes: usize,
-    /// The card's `CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING` at load: 1, or the
-    /// load was refused.
+    /// The card's `CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING` at load.
     pub unified_addressing: i32,
+    /// The shadows are host rooms, not the page-locked fallback.
+    pub roomed: bool,
 }
 
-impl Shadows {
+impl PinnedShadows {
     /// `layers` zeroed shadows of `rows` rows of `width` for `gpu`'s card, or
     /// the refusal: a card without unified addressing, or an allocation the
     /// card reaches at an address other than its host address.
-    fn new(gpu: &Gpu, layers: usize, rows: usize, width: usize) -> Result<Shadows, GpuError> {
+    fn new(gpu: &Gpu, layers: usize, rows: usize, width: usize) -> Result<PinnedShadows, GpuError> {
         const WHAT: &str = "deepseek41 Body::load_placed";
         let ctx = gpu.context();
-        let mut unified_addressing = 0;
-        // SAFETY: the call writes the live local `unified_addressing`; the
-        // device is the context's own.
-        let rc = unsafe {
-            sys::cuDeviceGetAttribute(
-                &mut unified_addressing,
-                sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING,
-                ctx.cu_device(),
-            )
-        };
-        rc.result().map_err(|source| GpuError::Driver {
-            op: Some("cuDeviceGetAttribute(UNIFIED_ADDRESSING)"),
-            source,
-        })?;
+        let unified_addressing = unified_addressing(gpu)?;
         if unified_addressing != 1 {
             return Err(GpuError::State {
                 what: WHAT,
@@ -741,7 +1089,7 @@ impl Shadows {
             // the allocation.
             .map(|at| unsafe { DeviceTensor::window(base + at, rows, width, ctx) })
             .collect();
-        Ok(Shadows {
+        Ok(PinnedShadows {
             windows,
             host,
             rows,
@@ -753,11 +1101,6 @@ impl Shadows {
     /// Layer `i`'s shadow, the tensor the append writes.
     fn layer_mut(&mut self, i: usize) -> Option<&mut DeviceTensor<u16>> {
         self.windows.get_mut(i).map(|w| &mut **w)
-    }
-
-    /// Bytes of one layer's shadow.
-    fn layer_bytes(&self) -> usize {
-        self.rows * self.width * size_of::<u16>()
     }
 
     /// Copy layer `i`'s shadow rows of `positions` into their slots of
@@ -826,7 +1169,7 @@ impl Shadows {
     }
 }
 
-impl Drop for Shadows {
+impl Drop for PinnedShadows {
     fn drop(&mut self) {
         // The appends write the allocation and a restore reads it, both in
         // stream order: the context finishes that work before `host` frees
@@ -884,6 +1227,17 @@ pub struct StateMut<'a> {
     pub keys: Option<&'a mut DeviceTensor<u16>>,
     pub values: Option<&'a mut DeviceTensor<f32>>,
     pub scores: Option<&'a mut DeviceTensor<f32>>,
+}
+
+/// Bytes the live sequence's rooms back ([`Body::rooms_mapped`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RoomsMapped {
+    /// Backed by card memory.
+    pub card: usize,
+    /// Backed by host memory.
+    pub host: usize,
+    /// The exact bytes of the rows the asked positions reach.
+    pub reached: usize,
 }
 
 /// The compressed rows a layer's attention reads.
@@ -1015,6 +1369,11 @@ pub struct Body {
     /// history and the host's record of them ([`Seq`]). A resident slot past
     /// the first holds its own, exchanged with this one ([`Slots`]).
     seq: Seq,
+    /// Where every sequence's by-position stores come from ([`KvRooms`]).
+    kv_rooms: KvRooms,
+    /// The engine stream as a shared handle: the stream the residency machine frees expert
+    /// bytes on for a fit that ran out of card bytes ([`Body::fit_on`]).
+    engine: Arc<CudaStream>,
     /// The resident sequences the load's plan counts, and the ones made so
     /// far, the live one included ([`Slots::new_seq`]).
     slots_planned: usize,
@@ -1139,22 +1498,67 @@ impl Body {
     #[must_use]
     pub fn shadow_host(&self) -> ShadowHost {
         ShadowHost {
-            bytes: self.seq.shadows.host.num_bytes(),
-            unified_addressing: self.seq.shadows.unified_addressing,
+            bytes: self.seq.shadows.bytes(),
+            unified_addressing: self.seq.shadows.unified_addressing(),
+            roomed: self.seq.shadows.roomed(),
         }
     }
 
     /// Layer `layer`'s cache and compressor buffers, for a caller that writes
-    /// a state into them itself; `None` for a layer this card does not run.
-    pub fn state_mut(&mut self, layer: usize) -> Option<StateMut<'_>> {
-        let i = layer.checked_sub(self.layers.start)?;
-        self.seq.kv.get_mut(i).map(|k| StateMut {
+    /// a state into them itself; `None` for a layer this card does not run. A caller may write
+    /// any row, so the layer's rooms are backed through every position first
+    /// ([`Body::fit_on`]).
+    pub fn state_mut(&mut self, layer: usize) -> Result<Option<StateMut<'_>>, GpuError> {
+        let Some(i) = layer
+            .checked_sub(self.layers.start)
+            .filter(|&i| i < self.seq.kv.len())
+        else {
+            return Ok(None);
+        };
+        let positions = self.positions();
+        self.seq.kv[i].fit(0, positions)?;
+        let k = &mut self.seq.kv[i];
+        Ok(Some(StateMut {
             ring: &mut k.ring,
-            rows: k.rows.as_mut(),
-            keys: k.keys.as_mut(),
+            rows: k.rows.as_deref_mut(),
+            keys: k.keys.as_deref_mut(),
             values: k.values.as_mut(),
             scores: k.scores.as_mut(),
-        })
+        }))
+    }
+
+    /// Bytes of host memory the live sequence's ring shadows back with pages of their own (the
+    /// whole allocation under the page-locked fallback).
+    #[must_use]
+    pub fn shadow_mapped(&self) -> usize {
+        self.seq.shadows.host_mapped()
+    }
+
+    /// What the live sequence's rooms (compressed rows, index keys) hold: the bytes backed on
+    /// the card and on the host, and the bytes the first `positions` positions' rows come to.
+    #[must_use]
+    pub fn rooms_mapped(&self, positions: usize) -> RoomsMapped {
+        let (mut card, mut host) = (0, 0);
+        for t in self
+            .seq
+            .kv
+            .iter()
+            .flat_map(|l| [&l.rows, &l.keys])
+            .flatten()
+        {
+            let (c, h) = t.mapped();
+            (card, host) = (card + c, host + h);
+        }
+        let reached = self
+            .layers
+            .clone()
+            .map(|l| self.kv_rooms.layout.bytes(l, positions as u64))
+            .sum::<u64>();
+        RoomsMapped {
+            card,
+            host,
+            reached: usize::try_from(reached).unwrap_or(usize::MAX),
+        }
     }
 
     /// The buffers besides the layers' caches, by name, with their device
@@ -1484,7 +1888,7 @@ impl Body {
     /// stream has finished every append enqueued before this call (a
     /// synchronize): the row of position `p` at `p · width`. `None` for a
     /// layer this card does not run.
-    pub fn shadow_rows(&self, gpu: &Gpu, layer: usize) -> Result<Option<&[u16]>, GpuError> {
+    pub fn shadow_rows(&self, gpu: &Gpu, layer: usize) -> Result<Option<Vec<u16>>, GpuError> {
         gpu.stream().synchronize()?;
         let Some(i) = layer
             .checked_sub(self.layers.start)
@@ -1492,8 +1896,10 @@ impl Body {
         else {
             return Ok(None);
         };
-        let n = self.seq.shadows.rows * self.seq.shadows.width;
-        Ok(self.seq.shadows.host.get(i * n..(i + 1) * n))
+        let mut out = Vec::new();
+        let rows = self.seq.shadows.rows();
+        self.seq.shadows.read_rows_into(gpu, i, 0..rows, &mut out)?;
+        Ok(Some(out))
     }
 
     /// [`attach_features`] on the body: refused once a step has run, and
@@ -1852,13 +2258,25 @@ impl Body {
     fn decode_on(
         &mut self,
         what: &'static str,
-        seq: Option<&mut Seq>,
+        mut seq: Option<&mut Seq>,
         token: u32,
         pos: u32,
     ) -> Result<(), GpuError> {
         self.arrive()?;
         self.rows.finish()?;
         let positions = self.positions();
+        let held = seq.as_deref().unwrap_or(&self.seq).history.len();
+        if held != pos as usize || held >= positions {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "a step at position {pos} after {held} tokens, in caches of {positions} positions"
+                ),
+            });
+        }
+        // The step's rows land on pages of this sequence's own before the step is planned,
+        // outside any capture.
+        self.fit_on(seq.as_deref_mut(), pos as usize, 1)?;
         let Body {
             seq: live,
             planner,
@@ -1869,15 +2287,6 @@ impl Body {
             ..
         } = self;
         let seq = seq.unwrap_or(live);
-        if seq.history.len() != pos as usize || seq.history.len() >= positions {
-            return Err(GpuError::Shape {
-                what,
-                detail: format!(
-                    "a step at position {pos} after {} tokens, in caches of {positions} positions",
-                    seq.history.len()
-                ),
-            });
-        }
         planner
             .plan_dead_into(&[token], pos, seq.history.ids(), seq.history.media(), plan)
             .map_err(|e| GpuError::plan(what, e))?;
@@ -1887,6 +2296,16 @@ impl Body {
         image.build(plan, rows.embd(), rows.engram())?;
         seq.history.push(token);
         Ok(())
+    }
+
+    /// The rooms of `seq` (the live sequence when `None`) backed through `pos + rows` positions
+    /// and every page a write from `pos` on reaches its own: a fit that runs out of card bytes
+    /// asks the residency machine for the shortfall and fits once more
+    /// ([`fit_rooms`]). Before the step or the call stages its rows, outside any capture and
+    /// any open prompt call.
+    fn fit_on(&mut self, seq: Option<&mut Seq>, pos: usize, rows: usize) -> Result<(), GpuError> {
+        let through = (pos + rows).min(self.positions());
+        fit_rooms(&mut FitOn { body: self, seq }, pos, through - pos)
     }
 
     /// The body's buffers a row's launches borrow, apart from the host half,
@@ -1938,6 +2357,44 @@ impl Body {
             },
             hybrid,
         ))
+    }
+}
+
+/// One sequence's rooms as [`fit_rooms`] fits them: the live sequence's, or a parked slot's.
+struct FitOn<'a> {
+    body: &'a mut Body,
+    seq: Option<&'a mut Seq>,
+}
+
+impl KvRoomBody for FitOn<'_> {
+    const WHAT: &'static str = "deepseek41 Body::fit_on";
+
+    fn fit_each(&mut self, pos: usize, through: usize) -> Result<(), GpuError> {
+        let seq = match self.seq.as_deref_mut() {
+            Some(seq) => seq,
+            None => &mut self.body.seq,
+        };
+        seq.fit(pos, through)
+    }
+
+    fn asks(&self, through: usize) -> usize {
+        self.seq.as_deref().unwrap_or(&self.body.seq).asks(through)
+    }
+
+    fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {
+        let engine = Arc::clone(&self.body.engine);
+        let Some(ResidencyParts { glue, hybrid, .. }) = self.body.residency_parts() else {
+            return Err(GpuError::State {
+                what: Self::WHAT,
+                missing: "a residency machine to free expert bytes for the stores",
+            });
+        };
+        let freed = glue.free_bytes(hybrid, &engine, want)?;
+        Ok(FreedBytes {
+            bytes: freed.bytes,
+            slots: freed.k,
+            layers: freed.layers.len(),
+        })
     }
 }
 
@@ -2302,7 +2759,7 @@ fn layer_io<'a>(
                 .map(|k| {
                     before
                         .get(k)
-                        .and_then(|b| b.keys.as_ref())
+                        .and_then(|b| b.keys.as_deref())
                         .ok_or(refuse("the key source layer's index keys"))
                 })
                 .transpose()?,
@@ -2324,13 +2781,13 @@ fn layer_io<'a>(
         RowsOf::Reads(src) => {
             let rows = before
                 .get(src)
-                .and_then(|k| k.rows.as_ref())
+                .and_then(|k| k.rows.as_deref())
                 .ok_or(refuse("the source layer's compressed rows"))?;
             Compressed::Read(rows)
         }
         RowsOf::Source => {
             let rows = rows
-                .as_mut()
+                .as_deref_mut()
                 .ok_or(refuse("the layer's own compressed rows"))?;
             let state = match (values.as_mut(), scores.as_mut()) {
                 (Some(v), Some(sc)) => Some((v, sc)),
@@ -2338,7 +2795,7 @@ fn layer_io<'a>(
             };
             Compressed::Source(SourceIo {
                 rows,
-                keys: keys.as_mut(),
+                keys: keys.as_deref_mut(),
                 ring: state,
             })
         }
@@ -2732,6 +3189,11 @@ impl Body {
             cols: 0..hp.engram()?.rows_per_token(),
             join: None,
             stored: None,
+            kv: (
+                KvLayout::from_file(file, hp).map_err(|e| GpuError::plan(WHAT, e))?,
+                plan.kv_host,
+                plan.machine.cards[card].margin_bytes,
+            ),
         };
         Body::assemble(
             gpu,
@@ -2789,11 +3251,19 @@ impl Body {
             cols,
             join,
             stored,
+            kv: (kv, word, margin),
         } = at;
         let stream = gpu.stream();
         let planner =
             Planner::from_file(file, hp, ctx_max as u64).map_err(|e| GpuError::plan(WHAT, e))?;
-        let seq = Seq::new(gpu, hp, layers.clone(), ctx_max, planner.stream_ratios())?;
+        let kv_rooms = KvRooms::new(&kv, word, margin)?;
+        let seq = Seq::new(
+            gpu,
+            hp,
+            layers.clone(),
+            ctx_max,
+            (planner.stream_ratios(), &kv_rooms),
+        )?;
         let row_bytes = engram_row_bytes(file, hp)?;
         let n_cols = cols.len();
         let rows = StepRows::open(file, hp, STEP_TOKENS, cfg.rows, cols, stored)?;
@@ -2859,6 +3329,8 @@ impl Body {
         let mut body = Body {
             layers,
             seq,
+            kv_rooms,
+            engine: gpu.stream_handle(),
             slots_planned: planned,
             slots_made: 1,
             steps,
@@ -2911,6 +3383,9 @@ struct Assembly<'a> {
     join: Option<Sums>,
     /// A checkpoint folder's stored row tables ([`RankFrom::stored`]).
     stored: Option<&'a BTreeMap<String, StoredRows>>,
+    /// The file's K/V layout, the plan's `BLOOMERY_KV_HOST` word and the card's margin: what the
+    /// sequences' rooms are built from ([`KvRooms`]).
+    kv: (KvLayout, KvHost, u64),
 }
 
 /// Where a placed load lands besides its plan ([`Body::load_placed`]): the
@@ -3343,10 +3818,11 @@ fn layer_steps(
 /// `indexer.head_dim`; `KvLayout` reads both widths off the tensors instead,
 /// and the load gate holds the two readings to one byte count.
 fn layer_kv(
-    stream: &CudaStream,
+    stream: &Arc<CudaStream>,
     hp: &Hparams,
     l: usize,
     ctx_max: usize,
+    rooms: &KvRooms,
 ) -> Result<LayerKv, GpuError> {
     let kind = &hp.layers[l];
     let latent = hp.head_dim;
@@ -3359,6 +3835,14 @@ fn layer_kv(
             })
     };
     let ring = DeviceTensor::zeroed(stream, ctx_max.min(hp.window), latent)?;
+    let room = |what, name, width| {
+        rooms
+            .tensor(stream, l, (what, name), (ctx_max, width))?
+            .ok_or_else(|| GpuError::Shape {
+                what: "deepseek41 Body::load_placed",
+                detail: format!("layer {l} holds {what} and the layout declares none"),
+            })
+    };
     let (rows, values, scores) = match kind.compressor {
         Some(_) => {
             let r = ratio()?;
@@ -3368,7 +3852,7 @@ fn layer_kv(
                     .transpose()
             };
             (
-                Some(DeviceTensor::zeroed(stream, ctx_max.div_ceil(r), latent)?),
+                Some(room(ROWS, "a V4.1 layer's compressed rows", latent)?),
                 state()?,
                 state()?,
             )
@@ -3376,9 +3860,9 @@ fn layer_kv(
         None => (None, None, None),
     };
     let keys = if kind.index_keys {
-        Some(DeviceTensor::zeroed(
-            stream,
-            ctx_max.div_ceil(ratio()?),
+        Some(room(
+            KEYS,
+            "a V4.1 layer's index keys",
             hp.indexer.head_dim,
         )?)
     } else {

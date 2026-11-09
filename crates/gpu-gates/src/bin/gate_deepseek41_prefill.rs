@@ -3013,7 +3013,7 @@ mod gate {
         let mut s = Snap::default();
         for l in b.layers() {
             let st = b
-                .state_mut(l)
+                .state_mut(l)?
                 .ok_or_else(|| format!("{NAME}: no state for layer {l}"))?;
             s.ring.push(md5_of(stream, st.ring, None)?);
             s.state.push(match (st.values, st.scores) {
@@ -3044,7 +3044,7 @@ mod gate {
         let (mut rows, mut keys) = (Vec::new(), Vec::new());
         for l in b.layers() {
             let st = b
-                .state_mut(l)
+                .state_mut(l)?
                 .ok_or_else(|| format!("{NAME}: no state for layer {l}"))?;
             let n = if st.rows.is_some() || st.keys.is_some() {
                 let kind = hp.layers.get(l).ok_or_else(|| {

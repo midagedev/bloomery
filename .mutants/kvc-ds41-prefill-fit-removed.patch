@@ -1,0 +1,10 @@
+--- a/crates/gpu-deepseek41/src/body/prefill.rs
++++ b/crates/gpu-deepseek41/src/body/prefill.rs
+@@ -1977,7 +1977,6 @@
+             });
+         }
+         // The call's rows land on pages of this sequence's own, backed before the call opens.
+-        self.fit_on(None, first, end - first)?;
+         let after: Option<Vec<bool>> = match (window, self.tap.as_ref()) {
+             (None, _) => None,
+             (Some(_), None) => {

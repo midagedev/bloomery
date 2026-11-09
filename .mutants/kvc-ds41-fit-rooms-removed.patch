@@ -1,0 +1,11 @@
+--- a/crates/gpu-deepseek41/src/body.rs
++++ b/crates/gpu-deepseek41/src/body.rs
+@@ -2317,7 +2317,7 @@
+     /// any open prompt call.
+     fn fit_on(&mut self, seq: Option<&mut Seq>, pos: usize, rows: usize) -> Result<(), GpuError> {
+         let through = (pos + rows).min(self.positions());
+-        fit_rooms(&mut FitOn { body: self, seq }, pos, through - pos)
++        FitOn { body: self, seq }.fit_each(pos, through)
+     }
+ 
+     /// The body's buffers a row's launches borrow, apart from the host half,

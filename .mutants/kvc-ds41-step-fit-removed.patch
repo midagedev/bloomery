@@ -1,0 +1,10 @@
+--- a/crates/gpu-deepseek41/src/body.rs
++++ b/crates/gpu-deepseek41/src/body.rs
+@@ -2030,7 +2030,6 @@
+         }
+         // The step's rows land on pages of this sequence's own before the step is planned,
+         // outside any capture.
+-        self.fit_on(seq.as_deref_mut(), pos as usize, 1)?;
+         let Body {
+             seq: live,
+             planner,

@@ -1976,6 +1976,8 @@ impl Body {
                 missing: "a card that runs every layer",
             });
         }
+        // The call's rows land on pages of this sequence's own, backed before the call opens.
+        self.fit_on(None, first, end - first)?;
         let after: Option<Vec<bool>> = match (window, self.tap.as_ref()) {
             (None, _) => None,
             (Some(_), None) => {

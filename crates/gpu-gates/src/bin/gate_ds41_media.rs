@@ -652,7 +652,7 @@ mod gate {
         };
         for l in b.layers() {
             let st = b
-                .state_mut(l)
+                .state_mut(l)?
                 .ok_or_else(|| format!("{NAME}: no state for layer {l}"))?;
             d.ring.push(u16s(st.ring, st.ring.rows())?);
             d.state.push(match (st.values, st.scores) {

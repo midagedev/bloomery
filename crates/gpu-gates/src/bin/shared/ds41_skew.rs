@@ -484,7 +484,7 @@ fn inject(gpu: &Gpu, body: &mut Body, set: &Set, state: &[LayerState]) -> Result
     body.reset(gpu)?;
     for (l, s) in state.iter().enumerate() {
         let b = body
-            .state_mut(l)
+            .state_mut(l)?
             .ok_or_else(|| format!("the body does not run layer {l}"))?;
         b.ring.buf_mut().copy_from_host(stream, &s.ring)?;
         match (&s.rows, b.rows) {
@@ -569,7 +569,7 @@ fn caches(gpu: &Gpu, body: &mut Body, layers: usize) -> Result<Caches, GateError
     let mut comp = Vec::new();
     for l in 0..layers {
         let b = body
-            .state_mut(l)
+            .state_mut(l)?
             .ok_or_else(|| format!("the body does not run layer {l}"))?;
         state.push(b.ring.buf().to_host_vec(stream)?);
         for t in [b.rows, b.keys].into_iter().flatten() {

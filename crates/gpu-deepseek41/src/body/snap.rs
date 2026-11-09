@@ -51,7 +51,7 @@ use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{DeviceBuffer, DeviceCopy};
 
 use super::seq::{History, keep_rule};
-use super::{Body, Deepseek41Model, Holds, PAIR_ROWS};
+use super::{Body, Deepseek41Model, Holds, PAIR_ROWS, Shadows};
 use crate::span::{span, span_mut};
 
 const WHAT: &str = "deepseek41 sequence state";
@@ -702,6 +702,103 @@ fn write<T: DeviceCopy>(gpu: &Gpu, buf: &mut DeviceBuffer<T>, vals: &[T]) -> Res
     Ok(())
 }
 
+impl Shadows {
+    /// Layer `i`'s shadow rows `rows` appended to `out`, after the stream
+    /// finished every append (the caller synchronized): a copy from the host
+    /// allocation, or a blocking device-to-host copy of the room's rows.
+    pub(super) fn read_rows_into(
+        &self,
+        gpu: &Gpu,
+        i: usize,
+        rows: Range<usize>,
+        out: &mut Vec<u16>,
+    ) -> Result<(), GpuError> {
+        let (width, per) = (self.width(), self.rows());
+        let refuse = || GpuError::Shape {
+            what: WHAT,
+            detail: format!("shadow {i} rows {rows:?} of shadows of {per} rows of {width}"),
+        };
+        if rows.end > per || rows.start > rows.end {
+            return Err(refuse());
+        }
+        if rows.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Shadows::Pinned(p) => {
+                let at = (i * per + rows.start) * width;
+                let src = p.host.get(at..at + rows.len() * width).ok_or_else(refuse)?;
+                out.extend_from_slice(src);
+            }
+            Shadows::Room(r) => {
+                let t = r.layers.get(i).ok_or_else(refuse)?;
+                out.extend_from_slice(&read_vec(
+                    gpu,
+                    t.buf(),
+                    rows.start * width,
+                    rows.len() * width,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    /// `vals` into layer `i`'s shadow from row `row` on, the stream idle
+    /// (the caller synchronized): a copy into the host allocation, or a
+    /// blocking host-to-device copy into the room, whose rows the caller
+    /// fitted.
+    pub(super) fn write_rows(
+        &mut self,
+        gpu: &Gpu,
+        i: usize,
+        row: usize,
+        vals: &[u16],
+    ) -> Result<(), GpuError> {
+        let (width, per) = (self.width(), self.rows());
+        let refuse = || GpuError::Shape {
+            what: WHAT,
+            detail: format!(
+                "shadow {i} from row {row}, {} values, of shadows of {per} rows of {width}",
+                vals.len()
+            ),
+        };
+        if vals.is_empty() {
+            return Ok(());
+        }
+        if row * width + vals.len() > per * width {
+            return Err(refuse());
+        }
+        match self {
+            Shadows::Pinned(p) => {
+                let at = (i * per + row) * width;
+                p.host
+                    .as_mut_slice()
+                    .get_mut(at..at + vals.len())
+                    .ok_or_else(refuse)?
+                    .copy_from_slice(vals);
+            }
+            Shadows::Room(r) => {
+                let t = r.layers.get_mut(i).ok_or_else(refuse)?;
+                span_mut(WHAT, t.buf_mut(), row * width, vals.len())?
+                    .copy_from_host(gpu.stream(), vals)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `len` values of `buf` from value `off`, device to host (a blocking copy).
+fn read_vec<T: DeviceCopy + Clone + Default>(
+    gpu: &Gpu,
+    buf: &DeviceBuffer<T>,
+    off: usize,
+    len: usize,
+) -> Result<Vec<T>, GpuError> {
+    let mut v = host_vec(len)?;
+    span(WHAT, buf, off, len)?.copy_to_host(gpu.stream(), &mut v)?;
+    Ok(v)
+}
+
 impl Body {
     /// What a state of this body's sequences belongs to: the model file's
     /// first shard, the stage card, a slot's positions.
@@ -732,8 +829,8 @@ impl Body {
                 let whole = |t: Option<&DeviceTensor<f32>>| t.map_or(0, |t| t.buf().len());
                 Ok([
                     l.ring.buf().len(),
-                    l.rows.as_ref().map_or(Ok(0), held)?,
-                    l.keys.as_ref().map_or(Ok(0), held)?,
+                    l.rows.as_deref().map_or(Ok(0), held)?,
+                    l.keys.as_deref().map_or(Ok(0), held)?,
                     whole(l.values.as_ref()),
                     whole(l.scores.as_ref()),
                 ])
@@ -742,7 +839,7 @@ impl Body {
         Ok(Shape {
             layers: self.layers.clone(),
             kv,
-            width: self.seq.shadows.width,
+            width: self.seq.shadows.width(),
             ring: self.seq.ring_rows(),
             ratios: self.seq.holds.states.iter().map(|&(r, _)| r).collect(),
         })
@@ -773,14 +870,14 @@ impl Body {
         for (l, &[ring, rows, keys, values, scores]) in self.seq.kv.iter().zip(&shape.kv) {
             kv.push(LayerSaved {
                 ring: read(gpu, l.ring.buf(), ring)?,
-                rows: read_held(gpu, l.rows.as_ref(), rows)?,
-                keys: read_held(gpu, l.keys.as_ref(), keys)?,
+                rows: read_held(gpu, l.rows.as_deref(), rows)?,
+                keys: read_held(gpu, l.keys.as_deref(), keys)?,
                 values: read_held(gpu, l.values.as_ref(), values)?,
                 scores: read_held(gpu, l.scores.as_ref(), scores)?,
             });
         }
         let runs = kept_runs(self.seq.shadow_from, n, &self.seq.holes);
-        let (width, per) = (self.seq.shadows.width, self.seq.shadows.rows);
+        let width = self.seq.shadows.width();
         let layers = self.seq.kv.len();
         let total = runs.iter().map(|r| r.len()).sum::<usize>() * layers * width;
         let mut shadow: Vec<u16> = Vec::new();
@@ -790,11 +887,11 @@ impl Body {
                 what: WHAT,
                 detail: format!("{total} shadow values of host memory for a snapshot: {e}"),
             })?;
-        let host = self.seq.shadows.host.as_slice();
         for r in &runs {
             for i in 0..layers {
-                let at = (i * per + r.start) * width;
-                shadow.extend_from_slice(&host[at..at + r.len() * width]);
+                self.seq
+                    .shadows
+                    .read_rows_into(gpu, i, r.clone(), &mut shadow)?;
             }
         }
         Ok(SeqSnapshot {
@@ -819,6 +916,9 @@ impl Body {
     /// record set to the state's.
     fn load(&mut self, gpu: &Gpu, s: &SeqSnapshot) -> Result<(), GpuError> {
         self.check_state(gpu, &s.header())?;
+        // The saved rows land on pages of this sequence's own: the held positions' rooms are
+        // backed before the copies, outside any capture.
+        self.fit_on(None, 0, s.history.len())?;
         for (l, saved) in self.seq.kv.iter_mut().zip(&s.kv) {
             write(gpu, l.ring.buf_mut(), &saved.ring)?;
             if let Some(t) = l.rows.as_mut() {
@@ -836,18 +936,14 @@ impl Body {
         }
         // No step in flight writes a shadow row while the host does.
         gpu.stream().synchronize()?;
-        let (width, per, layers) = (
-            self.seq.shadows.width,
-            self.seq.shadows.rows,
-            self.seq.kv.len(),
-        );
-        let host = self.seq.shadows.host.as_mut_slice();
+        let (width, layers) = (self.seq.shadows.width(), self.seq.kv.len());
         let mut from = 0;
         for r in &s.runs {
             for i in 0..layers {
-                let at = (i * per + r.start) * width;
                 let len = r.len() * width;
-                host[at..at + len].copy_from_slice(&s.shadow[from..from + len]);
+                self.seq
+                    .shadows
+                    .write_rows(gpu, i, r.start, &s.shadow[from..from + len])?;
                 from += len;
             }
         }
@@ -919,7 +1015,7 @@ pub fn snapshot_size(m: &mut Deepseek41Model) -> Result<u64, GpuError> {
         .iter()
         .try_fold(0usize, |v, r| v.checked_add(r.len()))
         .and_then(|v| v.checked_mul(b.seq.kv.len()))
-        .and_then(|v| v.checked_mul(b.seq.shadows.width));
+        .and_then(|v| v.checked_mul(b.seq.shadows.width()));
     shadow
         .and_then(|shadow| state_bytes(shape.kv, shadow, n))
         .map(|bytes| bytes as u64)

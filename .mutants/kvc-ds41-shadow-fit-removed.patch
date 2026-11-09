@@ -1,0 +1,11 @@
+--- a/crates/gpu-deepseek41/src/body/seq.rs
++++ b/crates/gpu-deepseek41/src/body/seq.rs
+@@ -246,7 +246,7 @@
+     /// a write from `pos` on reaches its own ([`LayerKv::fit`]).
+     pub(super) fn fit(&mut self, pos: usize, positions: usize) -> Result<(), GpuError> {
+         self.kv.iter_mut().try_for_each(|l| l.fit(pos, positions))?;
+-        self.shadows.fit(positions)
++        Ok(())
+     }
+ 
+     /// The bytes of new card pages a fit through `positions` positions still asks, every card
