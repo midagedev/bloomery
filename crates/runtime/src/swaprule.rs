@@ -2501,6 +2501,37 @@ mod tests {
         );
     }
 
+    /// A fill past the seed's own experts needs the seed list to rank them: a layer of 8
+    /// experts whose card set is 3 grows by 5 when the list names all 8 (the machine's
+    /// reserve for an elastic load, `seed_tail`), the reset returns to the grown seed, and a
+    /// list that names only the 3 refuses the same growth.
+    ///
+    /// FAIL-first: a rule that took the 3-expert list's growth would pass the second half; a
+    /// seed that did not carry the tail would make the first `give` fail.
+    #[test]
+    fn a_seed_list_that_ranks_the_reserve_lets_the_card_set_grow_past_it() {
+        let p = params(1, 4, 1.5, 2.0, 0.5);
+        let shape = Shape {
+            experts: 8,
+            top_k: 2,
+            max_rows: 4,
+        };
+        let mut wide = SwapRule::new(p, shape, &[&[0, 1, 2, 3, 4, 5, 6, 7]], &[3]).expect("rule");
+        wide.give(0, 5).expect("the reserve ranked");
+        assert_eq!(wide.seed(0).expect("a layer"), [0, 1, 2, 3, 4, 5, 6, 7]);
+        wide.reset();
+        assert_eq!(
+            wide.live(0).expect("a layer").collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            "the reset returns to the grown seed"
+        );
+        let mut narrow = SwapRule::new(p, shape, &[&[0, 1, 2]], &[3]).expect("rule");
+        assert!(
+            narrow.give(0, 1).is_err(),
+            "a seed that ranks only the live experts has nothing to grow into"
+        );
+    }
+
     /// An away expert is never admitted, however hot, and never in the card
     /// set: the opening relayout and a planning pass take the next candidate,
     /// a reset keeps it away, and the seed and pinned accessors read the
