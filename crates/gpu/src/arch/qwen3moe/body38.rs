@@ -186,7 +186,7 @@ use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
 use model::part::StoredRows;
 use model::placement::{Device, Plan};
-use runtime::prompt::{CallEnd, call_units, chunks, fold_units};
+use runtime::prompt::{CallEnd, call_units, chunks, fold_units, heat_call};
 use runtime::seqstate::{Kept, Price, Take};
 use runtime::swaprule::KeptRows;
 use std::ops::Range;
@@ -4664,27 +4664,27 @@ impl GpuModel<Body38> {
         // than leave the decode to churn back at the flip cap. A call that
         // starts a sequence (position 0) has no decode of its own: the heat
         // is cleared and its placement stays, the gain it was run for
-        // ([`crate::host::HostTier::call_history`]). Read once, here: the
-        // call keeps no row, so it does not move until the end, and the walk
+        // ([`crate::host::HostTier::call_history`], [`heat_call`]); the walk
         // returns each layer in the call's last unit on it.
         let start = self.pos();
         let history = self.body_parts(WHAT_P)?.2.hybrid.call_history(start);
-        let r = self
-            .stream_begin(resolved, tokens.len(), history)
-            .and_then(|()| self.feed_marked(tokens, resolved, sink, head));
-        // The call's own error first: an end refused after a failed call is
-        // its echo. A failed call's streaming ends with each layer back at
-        // the set it started with too.
-        let ended = self.stream_end(r.is_ok() && !history);
-        if r.is_err() {
-            // A unit that failed past its launch recorded rows its walk did
-            // not finish: no record from the model's position on stands.
-            let pos = self.pos();
-            self.body_parts(WHAT_P)?.2.wrote.cut(pos);
-        }
-        let next = r?;
-        ended?;
-        Ok(next)
+        heat_call(
+            self,
+            history,
+            |m, returns| m.stream_begin(resolved, tokens.len(), returns),
+            |m| m.feed_marked(tokens, resolved, sink, head),
+            |m, kept, ok| {
+                let ended = m.stream_end(kept);
+                if !ok {
+                    // A unit that failed past its launch recorded rows its
+                    // walk did not finish: no record from the model's
+                    // position on stands.
+                    let pos = m.pos();
+                    m.body_parts(WHAT_P)?.2.wrote.cut(pos);
+                }
+                ended
+            },
+        )
     }
 
     /// Open the prompt call's streaming ([`PromptStream::begin`]) with the

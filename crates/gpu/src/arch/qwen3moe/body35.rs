@@ -143,7 +143,7 @@ use model::arch::models::shape::MoeShape;
 use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft, OutGate};
 pub(super) use model::arch::names::blk;
 use model::placement::{CardFormat, Plan, WholeLoad};
-use runtime::prompt::{CallEnd, fold_marks};
+use runtime::prompt::{CallEnd, fold_marks, heat_call};
 use runtime::seqstate::{Kept, Price};
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -2499,8 +2499,7 @@ impl GpuModel<Body35> {
         // A call that continues a sequence holding decode heat ends with each
         // layer back at the set it started with; a call at position 0 clears
         // that heat and its placement stays
-        // ([`crate::host::HostTier::call_history`]). Read once, here: the
-        // call keeps no row.
+        // ([`crate::host::HostTier::call_history`], [`heat_call`]).
         let start = self.pos();
         let history = self
             .body_parts(WHAT_P)?
@@ -2508,16 +2507,13 @@ impl GpuModel<Body35> {
             .placed
             .as_mut()
             .is_some_and(|p| p.hybrid.call_history(start));
-        let r = self
-            .stream_begin(path, tokens.len(), history)
-            .and_then(|()| self.feed_marks(tokens, path, (&marks, keep, fold), unit, end.head()));
-        // The call's own error first: an end refused after a failed call is
-        // its echo. A failed call's streaming ends with each layer back at
-        // the set it started with too.
-        let ended = self.stream_end(r.is_ok() && !history);
-        let next = r?;
-        ended?;
-        Ok(next)
+        heat_call(
+            self,
+            history,
+            |m, returns| m.stream_begin(path, tokens.len(), returns),
+            |m| m.feed_marks(tokens, path, (&marks, keep, fold), unit, end.head()),
+            |m, kept, _| m.stream_end(kept),
+        )
     }
 
     /// [`GpuModel::prefill_call`]'s runs between its `marks` from where the
