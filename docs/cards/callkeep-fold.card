@@ -24,3 +24,10 @@ decide-below: the mechanism is not the whole story: read each later call's end r
   stderr before any other change
 decide-above: more than the derivation's +14 %: main's shared rows lost more than the carried pool (read the fold audit's
   first rows of both arms for a second term) before the landing claims the number
+# OUTCOME (2026-11-09, A6000, one lease, 4 rounds; ~/repo/bloomery = main f304995c6's bloomery-serve against
+# ~/repo/bloomery-callkeep): DECIDE-IN. [shared] D 4,096 tg: main 60.19 / 60.49 / 60.05 (r1 r2 r4; r3 was its first row,
+# 67.78), callkeep 64.97 / 67.04 / 67.22 / 66.83 -> +10.4 % on the means (r2..r4 alone 67.0, within 1.2 % of main's first
+# D 4,096 row); pp 2,118..2,221 against 2,512..2,613 (+18 %). First rows (D 6): main 59.59 / 60.71, callkeep 58.93..60.57
+# (within the ruler). The witness named nfsd and kswapd busy (the Spark's NFS mount) at io avg10 12; rows held steady.
+# gate-gpu-qwen38-residency on the A6000: every clause green (newseq: kept true, restored 0, admitted 693); with
+# .mutants/callkeep-history-ignores-pos.patch only newseq red (kept false, restored 693).
