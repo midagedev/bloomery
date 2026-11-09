@@ -164,6 +164,15 @@ impl CardTotals {
         self.kv_bytes += bytes;
         self.headroom_bytes -= i128::from(bytes);
     }
+
+    /// `bytes` more in the card's reserves, out of its headroom: a draft's
+    /// card bytes planned beside the target's totals (the MTP plan's draft term
+    /// is the reserve the expert rule spread within, never a row of the
+    /// target's totals), so the card-byte invariant's count holds both.
+    pub fn grow_reserve(&mut self, bytes: u64) {
+        self.reserve_bytes += bytes;
+        self.headroom_bytes -= i128::from(bytes);
+    }
 }
 
 /// The host's side of the plan.

@@ -62,7 +62,6 @@ impl Hold {
 }
 
 /// `reading`'s record line under `hold`.
-#[must_use]
 pub fn line(reading: &CardReading, hold: Hold) -> Record {
     match reading {
         CardReading::Made(m) => Record::new(&CARD_BYTES)

@@ -173,7 +173,7 @@ impl CardReading {
     pub fn check(&self) -> Result<(), CardRefusal> {
         match self {
             CardReading::Made(m) if m.past().is_none() => Ok(()),
-            CardReading::Made(m) => Err(CardRefusal::Past(m.clone())),
+            CardReading::Made(m) => Err(CardRefusal::Past(Box::new(m.clone()))),
             CardReading::Unmeasured(u) => Err(CardRefusal::Unmeasured(u.clone())),
         }
     }
@@ -192,7 +192,7 @@ impl CardReading {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CardRefusal {
     /// The card made bytes past its plan.
-    Past(CardMade),
+    Past(Box<CardMade>),
     /// The card could not be measured.
     Unmeasured(CardUnmeasured),
 }
@@ -393,7 +393,7 @@ mod tests {
         assert!(held.contains("pid 7 (977 MiB)"), "{held}");
         let r = CardReading::Unmeasured(super::CardUnmeasured {
             card: 1,
-            name: card.name.clone(),
+            name: card.name,
             phase: CardPhase::Load,
             why: held,
         });
@@ -401,5 +401,34 @@ mod tests {
             panic!("an unmeasured card passed");
         };
         assert!(e.to_string().contains("card 1 (3090) at load"), "{e}");
+    }
+
+    /// A draft's card bytes planned beside the target's totals are a reserve
+    /// grown after them ([`CardTotals::grow_reserve`]): the count holds them,
+    /// the headroom gives them up, and a run that made them passes where it
+    /// is refused without them.
+    #[test]
+    fn a_draft_grown_into_the_reserves_is_counted_in_full() {
+        let base = full();
+        let draft = 2_700 * MIB;
+        let mut grown = base.clone();
+        grown.grow_reserve(draft);
+        assert_eq!(grown.reserve_bytes, base.reserve_bytes + draft);
+        assert_eq!(
+            grown.headroom_bytes,
+            base.headroom_bytes - i128::from(draft)
+        );
+        let made_bytes = base.bytes() - CONTEXT_SELF + draft;
+        assert_eq!(
+            made(&base, made_bytes).past(),
+            Some(draft),
+            "the target's totals alone refuse the draft's bytes"
+        );
+        assert_eq!(made(&grown, made_bytes).past(), None, "grown, they count");
+        assert_eq!(
+            made(&grown, made_bytes + 1).past(),
+            Some(1),
+            "one byte past the grown count"
+        );
     }
 }

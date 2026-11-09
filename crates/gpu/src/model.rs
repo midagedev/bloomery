@@ -1060,6 +1060,21 @@ impl<B: ChainBody> GpuModel<B> {
         self.plan_card.as_ref()
     }
 
+    /// `bytes` more in the plan's side of this model's card, as reserves: what
+    /// a body planned beside the target's totals and then loaded on the same
+    /// card (an MTP draft's card bytes and arena). Refused by name on a load by
+    /// no plan of the placed path, which has no count to grow.
+    pub fn grow_plan_reserve(&mut self, bytes: u64) -> Result<(), GpuError> {
+        let on = self.plan_card.as_mut().ok_or_else(|| {
+            GpuError::shape(
+                "GpuModel::grow_plan_reserve",
+                "a load by no plan of the placed path has no card count to grow",
+            )
+        })?;
+        on.totals.grow_reserve(bytes);
+        Ok(())
+    }
+
     /// The card-byte invariant's reading of this model's card at `phase`
     /// ([`card_reading`]); `None` on a load by no plan of the placed path.
     pub fn card_reading(&self, phase: CardPhase) -> Result<Option<CardReading>, GpuError> {

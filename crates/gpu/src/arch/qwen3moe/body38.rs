@@ -1688,7 +1688,7 @@ impl Body38 {
             max_rows: PASS_ROWS,
             stacks: Arc::new(swap38::stacks(&inputs.model, plan)?),
         };
-        GpuModel::load_placed_from(
+        let mut model = GpuModel::load_placed_from(
             file,
             bytes,
             plan,
@@ -1733,7 +1733,13 @@ impl Body38 {
                 }
                 Ok(body)
             },
-        )
+        )?;
+        // The draft's term is the reserve the plan's expert rule spread within, outside the
+        // target's totals: the card-byte count holds both.
+        if let Some((_, _, p)) = mtp {
+            model.grow_plan_reserve(p.draft_card_bytes() + p.arena_bytes)?;
+        }
+        Ok(model)
     }
 
     /// The joins: each delta layer's β and α into one F32 stack (β's rows
