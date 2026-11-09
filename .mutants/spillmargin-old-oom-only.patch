@@ -1,0 +1,13 @@
+--- a/crates/gpu/src/room/mod.rs	2026-11-09 15:05:50
++++ b/crates/gpu/src/room/mod.rs	2026-11-09 15:05:50
+@@ -304,9 +304,7 @@
+                 let host = || -> Result<Owned, GpuError> {
+                     Ok(Owned::Host(Arc::new(HostPage::new(device, self.page)?)))
+                 };
+-                if !self.keeps_margin(margin)? {
+-                    return host();
+-                }
++                let _ = margin;
+                 match PhysicalAllocation::new(device, self.page) {
+                     Ok(card) => Ok(Owned::Card(Arc::new(card))),
+                     Err(source) if is_out_of_memory(&source) => host(),

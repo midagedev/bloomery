@@ -1812,9 +1812,11 @@ impl Body38 {
         let stream = gpu.stream();
         let d = dims(router_dims, ctx);
         // The plan's cache format is the one the stores take, and its
-        // `kv_host` word where the planes' pages back.
+        // `kv_host` word where the planes' pages back, a spill keeping the
+        // stage card's margin free.
         let kv = KvQ8::of(inputs.kv.is_q8());
-        let kv_backing = backing_of(plan.kv_host);
+        let margin = plan.machine.cards.first().map_or(0, |c| c.margin_bytes);
+        let kv_backing = backing_of(plan.kv_host, margin);
         let handle = gpu.stream_handle();
         let stores = kinds
             .iter()
@@ -3886,7 +3888,7 @@ impl Body38 {
         };
         // A spilled fit of the planes that ran out of host bytes: the
         // machine frees card bytes, which cannot make host memory.
-        if self.kv_backing == Backing::Spill
+        if matches!(self.kv_backing, Backing::Spill { .. })
             && let GpuError::NoRoom { what, .. } = &first
             && *what == KV_PLANES
         {

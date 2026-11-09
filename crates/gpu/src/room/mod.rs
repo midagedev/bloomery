@@ -39,7 +39,8 @@
 //! a card page and zeroed on the room's stream, so every kernel and capture
 //! over the store stays as it is; [`Room::mapped`] keeps naming the card
 //! bytes and [`Room::host_mapped`] names the host bytes. A [`Backing::Spill`]
-//! room backs a page on the host when the card cannot make its memory for
+//! room backs a page on the host when the card's free bytes would fall below
+//! its margin by the page, or when the card cannot make the page's memory for
 //! lack of free bytes.
 //!
 //! Every writer calls `fit` and `own_from` first, outside capture, for all
@@ -119,10 +120,11 @@ pub(crate) enum Backing {
     /// Host memory on the NUMA node the device names, mapped into the range
     /// and reached over the device's link ([`host::HostPage`]).
     Host,
-    /// The card's memory first; a page whose card memory the driver cannot
-    /// make for lack of free bytes is backed on the host instead. Any other
-    /// driver refusal stays the named refusal it is.
-    Spill,
+    /// The card's memory first, keeping `margin` bytes of the card free: a
+    /// page whose card memory would leave fewer free bytes than that, or
+    /// that the driver cannot make for lack of free bytes, is backed on the
+    /// host instead. Any other driver refusal stays the named refusal it is.
+    Spill { margin: u64 },
 }
 
 /// The memory a page backs: the device's own, or host memory the device
@@ -285,9 +287,10 @@ impl Room {
     }
 
     /// Memory of its own for one page, where the room's backing says
-    /// ([`Backing`]), the context bound to the thread. A `Spill` room whose
-    /// card memory the driver cannot make for lack of free bytes backs the
-    /// page on the host; any other driver refusal stays the refusal it is.
+    /// ([`Backing`]), the context bound to the thread. A `Spill` room backs
+    /// the page on the host when the card's free bytes are under its margin
+    /// plus the page, or when the driver cannot make the card memory for
+    /// lack of free bytes; any other driver refusal stays the refusal it is.
     fn new_page(&self) -> Result<Owned, GpuError> {
         let ctx = self.stream.context();
         ctx.bind_to_thread()?;
@@ -297,22 +300,31 @@ impl Room {
                 PhysicalAllocation::new(device, self.page).map_err(driver("cuMemCreate"))?,
             ))),
             Backing::Host => Ok(Owned::Host(Arc::new(HostPage::new(device, self.page)?))),
-            Backing::Spill => match PhysicalAllocation::new(device, self.page) {
-                Ok(card) => Ok(Owned::Card(Arc::new(card))),
-                Err(source) if is_out_of_memory(&source) => {
+            Backing::Spill { margin } => {
+                let host = || -> Result<Owned, GpuError> {
                     Ok(Owned::Host(Arc::new(HostPage::new(device, self.page)?)))
+                };
+                if !self.keeps_margin(margin)? {
+                    return host();
                 }
-                Err(source) => Err(GpuError::Driver {
-                    op: Some("cuMemCreate"),
-                    source,
-                }),
-            },
+                match PhysicalAllocation::new(device, self.page) {
+                    Ok(card) => Ok(Owned::Card(Arc::new(card))),
+                    Err(source) if is_out_of_memory(&source) => host(),
+                    Err(source) => Err(driver("cuMemCreate")(source)),
+                }
+            }
         }
     }
 
+    /// Whether a card page leaves the device at least `margin` bytes free,
+    /// the context bound to the thread.
+    fn keeps_margin(&self, margin: u64) -> Result<bool, GpuError> {
+        Ok(self.free_bytes()? as u64 >= margin.saturating_add(self.page as u64))
+    }
+
     /// The device's free bytes on this room's context, which the calling
-    /// fit has bound to the thread, for its named refusal; the reading's
-    /// own failure is that refusal's to name.
+    /// fit has bound to the thread, for a spill's margin and a fit's named
+    /// refusal; the reading's own failure is that refusal's to name.
     fn free_bytes(&self) -> Result<usize, GpuError> {
         // The room's context is current on this thread: the fit's `new_page`
         // bound it before the refusal this reading names.
@@ -805,7 +817,7 @@ impl<V: Views> Roomed<V> {
         ctx.bind_to_thread()?;
         let page = match backing {
             Backing::Card => crate::allocation_granularity(ctx.ordinal())?,
-            Backing::Host | Backing::Spill => host::page_for(ctx.ordinal())?,
+            Backing::Host | Backing::Spill { .. } => host::page_for(ctx.ordinal())?,
         };
         let stride = vmm::align_size(bytes.max(1), page);
         let reserve =
@@ -1670,7 +1682,7 @@ mod tests {
             rows * words,
             &runs,
             "the tests' spill planes",
-            Backing::Spill,
+            Backing::Spill { margin: 0 },
             |b| b,
         )
         .expect("a spill room");
@@ -1708,6 +1720,72 @@ mod tests {
         }
         drop(squeeze);
         drop(bulk);
+        stream.synchronize().expect("the room's work finished");
+    }
+
+    /// A `Backing::Spill` room of twelve pages with a margin of six pages
+    /// under the card's free bytes keeps that margin: after the fit of every
+    /// row the device's free bytes are at least the margin, the pages past
+    /// the margin sit on the host (`host_mapped()` holds pages, `mapped()`
+    /// no more than the six the margin leaves) and every page is backed.
+    /// Runs alone (`hw_held_`): the free bytes are the device's, which a
+    /// parallel test's allocation moves. FAIL-first: a spill that waits for
+    /// the driver's refusal takes all twelve pages from the card.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_a_spill_room_keeps_the_cards_margin() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        ctx.bind_to_thread().expect("the context binds");
+        let page = vmm::allocation_granularity(ctx.cu_device()).expect("the granularity");
+        let (row, rows) = (page, 12);
+        let words = row / size_of::<u32>();
+        let runs = [Run {
+            at: 0,
+            row,
+            per: 1,
+            rows,
+        }];
+        let free = || {
+            crate::capsync::ctx_sync(&ctx, "the spill room's check").expect("the context syncs");
+            crate::current_mem_info()
+                .expect("the device's free bytes")
+                .0
+        };
+        // Seven pages over the margin: the room's spare page (made at
+        // construction) and six pages of the room's own.
+        let margin = free().saturating_sub(7 * page);
+        let mut r: Roomed<[DeviceBuffer<u32>; 1]> = Roomed::with_backing(
+            Arc::clone(&stream),
+            rows * words,
+            &runs,
+            "the tests' spill planes",
+            Backing::Spill {
+                margin: margin as u64,
+            },
+            |b| b,
+        )
+        .expect("a spill room with a margin");
+        assert_eq!((r.mapped(), r.host_mapped()), (0, 0), "no page backed yet");
+        r.fit(rows).expect("a fit of every row");
+        let after = free();
+        assert!(
+            after >= margin,
+            "the fit left {after} B free, under the margin of {margin} B"
+        );
+        assert!(
+            r.host_mapped() > 0,
+            "the pages past the margin are on the host"
+        );
+        assert!(
+            r.mapped() <= 6 * page,
+            "the card holds {} B of pages, the margin leaves room for six",
+            r.mapped()
+        );
+        assert_eq!(
+            r.mapped() + r.host_mapped(),
+            rows * page,
+            "every page is backed, on the card or the host"
+        );
         stream.synchronize().expect("the room's work finished");
     }
 

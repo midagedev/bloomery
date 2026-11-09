@@ -93,11 +93,12 @@ pub(super) const KV_PLANES: &str = "a Qwen3.8 slot's K/V planes";
 
 /// The room backing the `BLOOMERY_KV_HOST` lever names for the K/V planes:
 /// the store's own mapping of the lever's typed word, one owner with the
-/// lever row.
-pub(super) fn backing_of(kv: bloomery_levers::KvHost) -> Backing {
+/// lever row. `margin` is the plan's card margin (`Card::margin_bytes`), the
+/// free bytes a `spill` room keeps on the card.
+pub(super) fn backing_of(kv: bloomery_levers::KvHost, margin: u64) -> Backing {
     match kv {
         bloomery_levers::KvHost::Off => Backing::Card,
-        bloomery_levers::KvHost::Spill => Backing::Spill,
+        bloomery_levers::KvHost::Spill => Backing::Spill { margin },
         bloomery_levers::KvHost::All => Backing::Host,
     }
 }

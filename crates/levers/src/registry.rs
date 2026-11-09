@@ -1202,12 +1202,15 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "Qwen3.8's K/V planes' backing (`generate_qwen3moe`, `bloomery-serve-qwen38` and \
               `bloomery-serve --model qwen38`): where a selecting store's room backs \
               the pages its K/V planes hold. `off` is the card's own memory, \
-              today's plan. `spill` backs a page on the host only when the \
-              driver cannot make the card's for lack of free bytes — the plan \
-              is `off`'s, and a fit that runs out of host bytes names them \
-              (`GpuError::NoRoom`); a host page is cheaper than the residency \
-              machine freeing expert stacks for it, so under `spill` the \
-              machine's demote-for-bytes never runs for the planes. `all` \
+              today's plan. `spill` backs a page on the host once the card's \
+              free bytes would fall below the plan's card margin by the page \
+              (or the driver cannot make the card's for lack of free bytes) — \
+              the plan is `off`'s, growth past the floor is host pages once \
+              the margin is reached, and a fit that runs out of host bytes \
+              names them (`GpuError::NoRoom`); a host page is cheaper than the \
+              residency machine freeing expert stacks for it, so under \
+              `spill` the machine's demote-for-bytes never runs for the \
+              planes. `all` \
               holds every plane page on the host: the plan counts the planes \
               at no card position, so the expert spread gets their bytes as \
               `BLOOMERY_KV_FLOOR`'s floor does (the pooled keys and the raw \
