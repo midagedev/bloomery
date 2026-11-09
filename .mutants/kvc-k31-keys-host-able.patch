@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/hparams.rs	2026-11-09 18:37:36
++++ b/crates/model/src/arch/kimi_k3/hparams.rs	2026-11-09 18:37:36
+@@ -280,7 +280,7 @@
+                 row: ix.d as u64 * F16_BYTES,
+                 per: 1,
+                 runs: 1,
+-                access: Access::Scan,
++                access: Access::Select { rows: 1 },
+             });
+         }
+         bufs

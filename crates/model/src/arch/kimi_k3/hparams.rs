@@ -24,6 +24,13 @@ use crate::arch::{
     per_layer_bool, positive, unread_keys_of,
 };
 use crate::placement::PlacementError;
+use runtime::stores::{Access, F16_BYTES, PosBuf, PosLayout};
+
+/// The name of a latent layer's cached rows in a room's refusal and the plan's lines.
+pub const CACHE_ROWS: &str = "a K3 latent layer's cached rows";
+
+/// The name of a K3.1 latent layer's index key rows.
+pub const INDEX_KEY_ROWS: &str = "a K3.1 layer's index key rows";
 
 /// What a layer mixes with, from `attention.head_count_kv`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -241,6 +248,48 @@ impl Hparams {
     #[must_use]
     pub fn dsa(&self, l: usize) -> bool {
         self.indexer.as_ref().is_some_and(|ix| ix.layers[l])
+    }
+
+    /// The by-position buffers layer `l` holds, the one declaration the plan's floor and padding
+    /// terms and the card body's room constructors read: a latent layer's cached row (the latent
+    /// and the unrotated key values, f16) and, where the layer runs the indexer, its index key
+    /// row. A K3.1 file's step reads the cached rows its indexer picks ([`Access::Select`], at
+    /// most `top_k` of them) but scores every key row ([`Access::Scan`]); a K3 file has no
+    /// indexer and attends every cached row ([`Access::Scan`]). A delta layer holds none.
+    #[must_use]
+    pub fn pos_bufs(&self, l: usize) -> Vec<PosBuf> {
+        if self.kind(l) != Kind::Mla {
+            return Vec::new();
+        }
+        let cache = match &self.indexer {
+            Some(ix) => Access::Select {
+                rows: ix.top_k as u64,
+            },
+            None => Access::Scan,
+        };
+        let mut bufs = vec![PosBuf {
+            what: CACHE_ROWS,
+            row: (self.mla.kv_lora + self.mla.pe) as u64 * F16_BYTES,
+            per: 1,
+            runs: 1,
+            access: cache,
+        }];
+        if let Some(ix) = self.indexer.as_ref().filter(|ix| ix.layers[l]) {
+            bufs.push(PosBuf {
+                what: INDEX_KEY_ROWS,
+                row: ix.d as u64 * F16_BYTES,
+                per: 1,
+                runs: 1,
+                access: Access::Scan,
+            });
+        }
+        bufs
+    }
+
+    /// Every layer's [`Hparams::pos_bufs`], one sequence's.
+    #[must_use]
+    pub fn pos_layout(&self) -> PosLayout {
+        PosLayout::new((0..self.n_layer).map(|l| self.pos_bufs(l)).collect())
     }
 
     /// A context of `ctx` positions the engine runs: every context the plan holds, of a K3 file and

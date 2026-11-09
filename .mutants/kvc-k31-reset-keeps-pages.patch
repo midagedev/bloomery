@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/arch/kimi_k3/body.rs	2026-11-09 18:37:22
++++ b/crates/gpu/src/arch/kimi_k3/body.rs	2026-11-09 18:37:22
+@@ -1823,9 +1823,6 @@
+                 state::clear_store(stream, store)?;
+             }
+         }
+-        for room in self.rooms_mut() {
+-            room.settle()?;
+-        }
+         if let Some(p) = self.placed.as_mut() {
+             p.reset(stream)?;
+         }

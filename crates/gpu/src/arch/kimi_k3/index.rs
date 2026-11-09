@@ -38,6 +38,7 @@
 //! words ([`pass_words`]). A row reads only the key and cache rows below its own live count, so
 //! the pass's later rows are never read and each row is the step's launches at its position.
 
+use super::state::KvBackings;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::arch::rows_kit::{RowsKit, project_rows};
 use crate::index_key::{IndexKeyInputArgs, IndexKeyKernels};
@@ -46,10 +47,11 @@ use crate::latent_gated::{AttendIn, AttnBufs, MlaDims, MlaKernels, Selection, at
 use crate::site::{self, SiteTy};
 use crate::tensor::{Window, WindowMut};
 use crate::weights::Weights;
-use crate::{DeviceTensor, FaultSink, Gpu, GpuError};
+use crate::{DeviceTensor, FaultSink, Gpu, GpuError, RoomTensor};
 use cuda_core::{CudaStream, DeviceBuffer};
-use model::arch::kimi_k3::hparams::{Hparams, INDEX_DIM, INDEX_HEADS, Indexer};
+use model::arch::kimi_k3::hparams::{Hparams, INDEX_DIM, INDEX_HEADS, INDEX_KEY_ROWS, Indexer};
 use model::arch::kimi_k3::names;
+use std::sync::Arc;
 
 /// What the refusals of this file name.
 const WHAT: &str = "kimi_k3 indexer";
@@ -185,30 +187,60 @@ impl Sites {
     }
 }
 
-/// A K3.1 latent layer's indexer: its sites, its key norm's ε and its key rows, `[ctx][d]` f16.
+/// A K3.1 latent layer's indexer: its sites, its key norm's ε and its key rows, `[ctx][d]` f16, in
+/// a room whose pages are backed as far as the sequence's positions reach.
 pub(super) struct Index {
     sites: Sites,
     eps: f32,
-    keys: DeviceTensor<u16>,
+    keys: RoomTensor<u16>,
 }
 
 impl Index {
-    /// Layer `l`'s indexer at `ctx` positions, `None` where the layer runs none ([`width`]).
+    /// Layer `l`'s indexer at `ctx` positions, `None` where the layer runs none ([`width`]); its
+    /// key rows are the buffer the plan declares ([`Hparams::pos_bufs`]), backed as `kv` says.
     /// Load-time only.
     pub(super) fn load(
-        stream: &CudaStream,
+        stream: &Arc<CudaStream>,
         w: &Weights,
         hp: &Hparams,
         (l, ctx): (usize, usize),
+        kv: KvBackings,
     ) -> Result<Option<Box<Index>>, GpuError> {
         let (Some(d), Some(ix)) = (width(hp, l), hp.indexer.as_ref()) else {
             return Ok(None);
         };
+        let buf = hp
+            .pos_bufs(l)
+            .into_iter()
+            .find(|b| b.what == INDEX_KEY_ROWS)
+            .ok_or_else(|| {
+                GpuError::state(WHAT, "an index key buffer in the plan's declaration")
+            })?;
+        if buf.row != (d * size_of::<u16>()) as u64 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the plan's key row is {} B; the indexer's {d} f16 values are {}",
+                    buf.row,
+                    d * size_of::<u16>()
+                ),
+            ));
+        }
         Ok(Some(Box::new(Index {
             sites: Sites::load(w, hp, ix, l)?,
             eps: ix.norm_eps,
-            keys: DeviceTensor::zeroed(stream, ctx, d)?,
+            keys: RoomTensor::new(stream, &buf, ctx, INDEX_KEY_ROWS, kv.of(buf.access))?,
         })))
+    }
+
+    /// The key rows' room.
+    pub(super) fn room_mut(&mut self) -> &mut RoomTensor<u16> {
+        &mut self.keys
+    }
+
+    /// The key rows' room, read.
+    pub(super) fn room(&self) -> &RoomTensor<u16> {
+        &self.keys
     }
 
     /// Every site the indexer launches, for the load's activation forms.
@@ -802,6 +834,16 @@ mod tests {
                     CTX * f16 * rows,
                     "indexer {indexer}: latent layer {l}"
                 );
+            }
+            // The rooms the body builds are the buffers the plan declares, layer by layer.
+            let rooms = hp.pos_layout();
+            for l in 0..hp.n_layer {
+                let held = if hp.kind(l) == Kind::Mla {
+                    kv.layer_bytes(l, CTX)
+                } else {
+                    0
+                };
+                assert_eq!(rooms.bytes(l, CTX), held, "indexer {indexer}: layer {l}");
             }
         }
     }

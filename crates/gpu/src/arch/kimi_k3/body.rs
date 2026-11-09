@@ -26,7 +26,7 @@
 
 use super::kda::{self, KdaSites};
 use super::moe::{MoeDims, routed_of};
-use super::state::{self, Lane, StepIn};
+use super::state::{self, KvBackings, Lane, StepIn};
 use crate::arch::gated_mla::{self as mla, MlaBufs, MlaSites};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::arch::routed_ffn::{self as ffn, Ffn, FfnKernels, FfnScratch, Glu};
@@ -38,6 +38,7 @@ use crate::head::{Head, HostHead};
 use crate::host::StepLeg;
 use crate::host::handoff::HandoffSlots;
 use crate::host::run::HostRun;
+use crate::host::served::{ResidencyParts, TierBody};
 use crate::host::swap::Residency;
 use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec, hosted_stacks};
 use crate::host::tier::TierOpen;
@@ -56,12 +57,12 @@ use crate::routed_block::RouterEntry;
 use crate::site::{KGemvKernels, SiteTy};
 use crate::tensor::{WindowMut, copy_row};
 use crate::weights::{DevWeight, Weights};
-use crate::{DeviceTensor, Gpu, GpuError, LAYER_HEAD};
+use crate::{FreedBytes, Gpu, GpuError, KvRoomBody, LAYER_HEAD, RoomTensor, fit_rooms};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::kimi_k3::hparams::{Hparams, Kind};
+use model::arch::kimi_k3::hparams::{CACHE_ROWS, Hparams, Kind};
 use model::arch::kimi_k3::names;
 use model::arch::kimi_k3::place::PlanInputs;
 use model::placement::Plan;
@@ -96,10 +97,11 @@ enum Mixer {
         store: RecStore,
     },
     /// The latent cache, `[ctx][row]` f16, and a K3.1 layer's indexer with its key rows
-    /// ([`index::Index`]; `None` in a K3 file).
+    /// ([`index::Index`]; `None` in a K3 file), each a room backed as far as the positions fitted
+    /// reach ([`fit_rooms`]).
     Mla {
         sites: Box<MlaSites>,
-        cache: DeviceTensor<u16>,
+        cache: RoomTensor<u16>,
         index: Option<Box<index::Index>>,
     },
 }
@@ -647,6 +649,9 @@ impl Taps {
 }
 
 pub struct Body {
+    /// The engine stream as a shared handle: the rooms' constructors and the residency machine's
+    /// release of expert stacks for a fit run on it.
+    stream: Arc<CudaStream>,
     hp: Hparams,
     kda: KdaDims,
     mla: MlaDims,
@@ -996,6 +1001,24 @@ impl Body {
                 ),
             ));
         }
+        let handle = gpu.stream_handle();
+        // The plan's `kv_host` word where the rooms' pages back, a spill keeping the stage card's
+        // margin free; a load with no plan backs every page on the card.
+        let kv = placed.as_ref().map_or(
+            KvBackings {
+                word: bloomery_levers::KvHost::Off,
+                margin: 0,
+            },
+            |(open, card)| KvBackings {
+                word: open.plan.kv_host,
+                margin: open
+                    .plan
+                    .machine
+                    .cards
+                    .get(*card)
+                    .map_or(0, |c| c.margin_bytes),
+            },
+        );
         let kd = kda::dims(&hp)?;
         let md = mla_dims(&hp);
         if md.row() != hp.mla.row() {
@@ -1024,8 +1047,8 @@ impl Body {
                 },
                 Kind::Mla => Mixer::Mla {
                     sites: Box::new(MlaSites::load(file, w, &md, l)?),
-                    cache: DeviceTensor::zeroed(stream, ctx, md.row())?,
-                    index: index::Index::load(stream, w, &hp, (l, ctx))?,
+                    cache: latent_cache(&handle, &hp, (l, ctx), kv)?,
+                    index: index::Index::load(&handle, w, &hp, (l, ctx), kv)?,
                 },
             };
             let (ffn, ffn_norm) = if hp.dense(l) {
@@ -1084,6 +1107,7 @@ impl Body {
             .then(|| index::Sel::new(stream, &hp, md.row(), ctx))
             .transpose()?;
         Ok(Body {
+            stream: handle,
             placed,
             host_head: None,
             out_score,
@@ -1616,6 +1640,117 @@ impl Walk<'_> {
     }
 }
 
+/// Layer `l`'s latent cache over `ctx` positions: the buffer the plan declares
+/// ([`Hparams::pos_bufs`]), backed as `kv` says.
+fn latent_cache(
+    stream: &Arc<CudaStream>,
+    hp: &Hparams,
+    (l, ctx): (usize, usize),
+    kv: KvBackings,
+) -> Result<RoomTensor<u16>, GpuError> {
+    let buf = hp
+        .pos_bufs(l)
+        .into_iter()
+        .find(|b| b.what == CACHE_ROWS)
+        .ok_or_else(|| GpuError::state(WHAT, "a cached-row buffer in the plan's declaration"))?;
+    RoomTensor::new(stream, &buf, ctx, CACHE_ROWS, kv.of(buf.access))
+}
+
+impl Body {
+    /// Every room of the stores: each latent layer's cache and, where it runs the indexer, its
+    /// key rows.
+    fn rooms_mut(&mut self) -> impl Iterator<Item = &mut RoomTensor<u16>> {
+        self.layers
+            .iter_mut()
+            .flat_map(|layer| match &mut layer.mixer {
+                Mixer::Kda { .. } => [None, None],
+                Mixer::Mla { cache, index, .. } => {
+                    [Some(cache), index.as_mut().map(|ix| ix.room_mut())]
+                }
+            })
+            .flatten()
+    }
+
+    /// Bytes of the pages on the card and on the host the stores' rooms back with memory of
+    /// their own: what the sequence's positions reach, nothing after a reset.
+    #[must_use]
+    pub fn room_mapped(&self) -> (usize, usize) {
+        self.layers
+            .iter()
+            .flat_map(|layer| match &layer.mixer {
+                Mixer::Kda { .. } => [None, None],
+                Mixer::Mla { cache, index, .. } => {
+                    [Some(cache), index.as_ref().map(|ix| ix.room())]
+                }
+            })
+            .flatten()
+            .map(RoomTensor::mapped)
+            .fold((0, 0), |(c, h), (rc, rh)| (c + rc, h + rh))
+    }
+
+    /// The rooms fitted through `pos + rows` positions before a launch writes row `pos` on:
+    /// [`fit_rooms`], the residency machine freeing expert bytes for a card that ran out (a load
+    /// with none refuses by name). Never inside a capture.
+    fn fit(&mut self, pos: usize, rows: usize) -> Result<(), GpuError> {
+        fit_rooms(self, pos, rows)
+    }
+
+    /// [`Body::fit`] for a pass of `m` rows at `pos`, run before the pass's own checks: a pass
+    /// those checks refuse (no row, past the caches, not where the stores stand) fits nothing
+    /// and is refused by them.
+    pub(super) fn fit_pass(&mut self, pos: u32, m: usize) -> Result<(), GpuError> {
+        let (at, end) = (pos as usize, pos as usize + m);
+        if m == 0 || end > self.ctx || pos != self.held {
+            return Ok(());
+        }
+        self.fit(at, m)
+    }
+}
+
+/// The rooms [`fit_rooms`] runs: every latent layer's, the residency machine the one that frees
+/// expert bytes for them.
+impl KvRoomBody for Body {
+    const WHAT: &'static str = WHAT;
+
+    fn fit_each(&mut self, pos: usize, through: usize) -> Result<(), GpuError> {
+        for room in self.rooms_mut() {
+            room.fit(through)?;
+            room.own_from(pos)?;
+        }
+        Ok(())
+    }
+
+    fn asks(&self, through: usize) -> usize {
+        self.layers
+            .iter()
+            .map(|layer| match &layer.mixer {
+                Mixer::Kda { .. } => 0,
+                Mixer::Mla { cache, index, .. } => {
+                    cache.asks(through) + index.as_ref().map_or(0, |ix| ix.room().asks(through))
+                }
+            })
+            .sum()
+    }
+
+    fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {
+        let stream = Arc::clone(&self.stream);
+        let Some(ResidencyParts { glue, hybrid, .. }) =
+            self.placed.as_mut().and_then(TierBody::residency_parts)
+        else {
+            return Err(GpuError::state(
+                WHAT,
+                "a residency machine to free expert bytes for the stores",
+            ));
+        };
+        let freed = glue.free_bytes(hybrid, &stream, want)?;
+        Ok(FreedBytes {
+            bytes: freed.bytes,
+            slots: freed.k,
+            layers: freed.layers.len(),
+        })
+    }
+}
+
 impl ChainBody for Body {
     type Input = DecodeInput;
     type Host = Placed;
@@ -1637,8 +1772,9 @@ impl ChainBody for Body {
     }
 
     /// The token and the position: two copies, and on a load that selects the count words of the
-    /// position ([`index::Sel::words`]), one more. Refused by name, before any, off the position the
-    /// stores stand at.
+    /// position ([`index::Sel::words`]), one more, after the rooms are fitted through the
+    /// position ([`Body::fit`]). Refused by name, before any, off the position the stores stand
+    /// at.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         if input.pos != self.held {
             return Err(GpuError::shape(
@@ -1650,6 +1786,7 @@ impl ChainBody for Body {
                 ),
             ));
         }
+        self.fit(input.pos as usize, 1)?;
         match self.placed.as_mut() {
             None => {
                 self.step_in.ids.copy_from_host(stream, &[input.token])?;
@@ -1678,14 +1815,18 @@ impl ChainBody for Body {
     }
 
     /// Every delta store back to a fresh one in place (a captured chain keeps their addresses,
-    /// [`state::clear_store`]). The latent caches need nothing: no row at or past the live count
-    /// is read, and every row below it is written by its own step first.
+    /// [`state::clear_store`]), and every room's pages given back (the addresses stay). The
+    /// latent caches' contents need nothing: no row at or past the live count is read, and every
+    /// row below it is written by its own step first.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         for layer in &mut self.layers {
             if let Mixer::Kda { store, .. } = &mut layer.mixer {
                 state::clear_store(stream, store)?;
             }
+        }
+        for room in self.rooms_mut() {
+            room.settle()?;
         }
         if let Some(p) = self.placed.as_mut() {
             p.reset(stream)?;

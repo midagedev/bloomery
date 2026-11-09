@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/arch/kimi_k3/body.rs	2026-11-09 18:37:22
++++ b/crates/gpu/src/arch/kimi_k3/body.rs	2026-11-09 18:37:23
+@@ -1688,7 +1688,8 @@
+     /// [`fit_rooms`], the residency machine freeing expert bytes for a card that ran out (a load
+     /// with none refuses by name). Never inside a capture.
+     fn fit(&mut self, pos: usize, rows: usize) -> Result<(), GpuError> {
+-        fit_rooms(self, pos, rows)
++        let _ = (pos, rows);
++        Ok(())
+     }
+ 
+     /// [`Body::fit`] for a pass of `m` rows at `pos`, run before the pass's own checks: a pass

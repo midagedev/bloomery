@@ -1096,6 +1096,7 @@ impl super::Body {
         tail: PassTail<'_>,
     ) -> Result<(), GpuError> {
         let m = ids.len();
+        self.fit_pass(pos, m)?;
         let Some(placed) = self.placed.as_mut() else {
             return Err(GpuError::shape(
                 PASS,
