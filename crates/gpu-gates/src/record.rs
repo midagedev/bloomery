@@ -657,8 +657,10 @@ pub static ELASTIC_GIVE_BACK: Kind = Kind {
 pub static ELASTIC_FILL: Kind = Kind {
     name: "elastic_fill",
     head: "elastic fill",
-    doc: "Withdrawn expert slots filled from the card's free bytes above its margin after a settle: the free bytes read, the margin kept, the slots a layer, the layers and the device bytes backed.",
+    doc: "Withdrawn expert slots filled from the card's free bytes above its margin by the settle at `site` (warm: after the open; quiet: at a sequence's end after a give-back's hold) at quiet boundary `boundary`: the free bytes read, the margin kept, the slots a layer, the layers and the device bytes backed.",
     parts: &[
+        key("site", Word, ""),
+        key("boundary", U64, ""),
         key("free", U64, "B"),
         key("margin", U64, "B"),
         key("slots", U64, "slots"),
@@ -667,12 +669,29 @@ pub static ELASTIC_FILL: Kind = Kind {
     ],
 };
 
+/// The warm-up's worst-case prompt pass and the reading the settle after it takes
+/// ([`bloomery_gpu::settle_to_margin`] at site `warm`).
+pub static ELASTIC_WARM: Kind = Kind {
+    name: "elastic_warm",
+    head: "elastic warm",
+    doc: "The elastic warm-up before the first settle: one prompt of `ids` ids (the `ubatch`, clipped to the `ctx` less the positions its step and window need), one step or verify and, with several slots, one pass of all of them, then the sequences reset and the residency back to its seed. `pass_bytes` is the card bytes that pass left taken (the free bytes before it less the free bytes after the reset: its lazily made buffers and module images, net of the K/V pages the reset gave back; 0 when it freed more), `free_before` and `free` the two readings, `free` the one the settle takes, `margin` the one it keeps.",
+    parts: &[
+        key("ids", U64, "ids"),
+        key("ubatch", U64, "ids"),
+        key("ctx", U64, "positions"),
+        key("pass_bytes", U64, "B"),
+        key("free_before", U64, "B"),
+        key("free", U64, "B"),
+        key("margin", U64, "B"),
+    ],
+};
+
 /// A settle that moved nothing, and why ([`bloomery_gpu::Elastic::Held`]).
 pub static ELASTIC_HELD: Kind = Kind {
     name: "elastic_held",
     head: "elastic held",
-    doc: "A settle of the elastic expert tenant that moved nothing: why.",
-    parts: &[key("why", Text, "")],
+    doc: "A settle of the elastic expert tenant at `site` that moved nothing: why.",
+    parts: &[key("site", Word, ""), key("why", Text, "")],
 };
 
 /// The elastic expert tenant's counters since the load
@@ -681,12 +700,13 @@ pub static ELASTIC_HELD: Kind = Kind {
 pub static STAT_ELASTIC: Kind = Kind {
     name: "stat_elastic",
     head: "stat elastic",
-    doc: "The elastic expert tenant's moves since the load: give-backs and their bytes, fills and their bytes.",
+    doc: "The elastic expert tenant's moves since the load: give-backs and their bytes, fills and their bytes, and the quiet boundaries (sequence ends) so far, the clock its fill hold counts in.",
     parts: &[
         key("give_backs", U64, ""),
         key("give_back_bytes", U64, "B"),
         key("fills", U64, ""),
         key("fill_bytes", U64, "B"),
+        key("boundary", U64, ""),
     ],
 };
 
@@ -3043,14 +3063,18 @@ pub mod groups {
     /// `room::elastic` (the elastic expert tenant), printed by any seat with a
     /// residency machine.
     pub mod elastic {
-        use crate::record::{ELASTIC_FILL, ELASTIC_GIVE_BACK, ELASTIC_HELD, Kind, STAT_ELASTIC};
+        use crate::record::{
+            ELASTIC_FILL, ELASTIC_GIVE_BACK, ELASTIC_HELD, ELASTIC_WARM, Kind, STAT_ELASTIC,
+        };
 
-        /// A settle's move and the tenant's counters (`shared/elastic.rs`:
-        /// `elastic::settle`, `elastic::stat`).
+        /// A settle's move, the warm-up's reading before it and the tenant's
+        /// counters (`shared/elastic.rs`: `elastic::settle`, `elastic::warm`,
+        /// `elastic::stat`).
         pub const GROUP: &[&Kind] = &[
             &ELASTIC_GIVE_BACK,
             &ELASTIC_FILL,
             &ELASTIC_HELD,
+            &ELASTIC_WARM,
             &STAT_ELASTIC,
         ];
     }
