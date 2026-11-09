@@ -105,7 +105,7 @@ use bloomery_gpu::draft::Held;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
-use bloomery_gpu::host::served::{prompt_pass, read_fault};
+use bloomery_gpu::host::served::{self, prompt_pass, read_fault};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::kpool;
 use bloomery_gpu::kquant::act::swiglu_clamp;
@@ -137,7 +137,7 @@ use model::placement::kernels::DownForms;
 use runtime::layer::{FfnKind, MixerKind};
 pub use runtime::prompt::PrefillMode;
 use runtime::prompt::{
-    CallEnd, GROUP_LEVER, call_end, check_group, chunks, end_of, group_sets, groups,
+    CallEnd, GROUP_LEVER, call_end, call_groups, check_group, chunks, end_of, group_sets,
     refuse_dense_after_routed,
 };
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
@@ -1505,7 +1505,7 @@ fn prefill_units(
         }
         body.prompt.in_call = true;
     }
-    let r = call_groups(m, ids, from, to, sink, media, head);
+    let r = run_groups(m, ids, from, to, sink, media, head);
     if let Ok(body) = m.body_parts(WHAT).map(|(_, _, b)| b) {
         body.prompt.in_call = false;
         let (from, to) = (from as usize, to as usize);
@@ -1531,7 +1531,7 @@ fn prefill_units(
 /// its open takes and takes the call back. The last group runs the head
 /// when `head` asks for it: the argmax after the call; else it reads the
 /// fault word alone and the call returns `None`.
-fn call_groups(
+fn run_groups(
     m: &mut Glm5nextModel,
     ids: &[u32],
     from: u32,
@@ -1548,14 +1548,13 @@ fn call_groups(
         body.timed_checkpoint(gpu, from)?;
     }
     let mut argmax = None;
-    for gr in groups(batches.len(), group) {
-        let runs = &batches[gr];
-        let (Some(first), Some(end)) = (runs.first(), runs.last()) else {
+    for gr in call_groups(&batches, from, to, group) {
+        let runs = &batches[gr.units];
+        let Some(end) = runs.last().map(|r| r.end) else {
             continue;
         };
-        let (start, end) = (first.start, end.end);
-        let seg = &ids[(start - from) as usize..(end - from) as usize];
-        let last = end == to;
+        let seg = &ids[gr.ids];
+        let last = gr.last;
         let mut takes = match open_takes(m, runs, &marks) {
             Ok(t) => t,
             Err(e) => return Err(take_back(m, from, e)),
@@ -1688,23 +1687,8 @@ fn abandon_takes(m: &mut Glm5nextModel, takes: &mut [Option<Pending>]) {
 /// A fault poisons the model and is returned as it came: nothing runs on it
 /// until a reset.
 fn take_back(m: &mut Glm5nextModel, from: u32, e: GpuError) -> GpuError {
-    if matches!(e, GpuError::Fault { .. }) || m.poisoned().is_some() {
-        return e;
-    }
-    let kept = match m.body(WHAT) {
-        Ok(body) => body.keep_point(from, m.pos()),
-        Err(b) => return b,
-    };
-    match m.rollback(kept) {
-        Ok(()) if kept == from => e,
-        Ok(()) => shape(format!(
-            "a prompt call from position {from} failed ({e}); its positions are taken back and \
-             the model stands at {kept}, the cut the checkpoints grant"
-        )),
-        Err(r) => shape(format!(
-            "a prompt call from position {from} failed ({e}), and taking it back failed too ({r})"
-        )),
-    }
+    let keep = |m: &mut Glm5nextModel| Ok(m.body(WHAT)?.keep_point(from, m.pos()));
+    served::take_back(m, from, e, keep, "checkpoints", shape)
 }
 
 /// One store's bits as a digest ([`store_digests`]).

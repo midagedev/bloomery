@@ -1,0 +1,15 @@
+# promptlift mutant group-last-off-by-one
+# clause: unit test call_groups_slice_the_ids_and_head_the_last
+# site: runtime::prompt::call_groups, the head on a group ending one short of the call's end too
+# expected red: "call_groups_slice_the_ids_and_head_the_last ... FAILED" (two groups headed)
+--- a/crates/runtime/src/prompt.rs
++++ b/crates/runtime/src/prompt.rs
+@@ -273,7 +273,7 @@
+             let end = units.get(g.end.checked_sub(1)?)?;
+             Some(CallGroup {
+                 ids: (first.start - from) as usize..(end.end - from) as usize,
+-                last: end.end == to,
++                last: end.end + 1 >= to,
+                 units: g,
+             })
+         })

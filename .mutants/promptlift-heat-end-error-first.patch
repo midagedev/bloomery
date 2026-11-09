@@ -1,0 +1,16 @@
+# promptlift mutant heat-end-error-first
+# clause: unit test heat_call_keeps_only_a_fresh_sequence
+# site: runtime::prompt::heat_call, the end's error returned before the call's own
+# expected red: "heat_call_keeps_only_a_fresh_sequence ... FAILED" (Err("end") where Err("run"))
+--- a/crates/runtime/src/prompt.rs
++++ b/crates/runtime/src/prompt.rs
+@@ -298,8 +298,8 @@
+     let r = begin(s, history).and_then(|()| run(s));
+     let ok = r.is_ok();
+     let ended = end(s, ok && !history, ok);
+-    let v = r?;
+     ended?;
++    let v = r?;
+     Ok(v)
+ }
+ 

@@ -1,0 +1,15 @@
+# promptlift mutant group-ids-offset
+# clause: unit test call_groups_slice_the_ids_and_head_the_last
+# site: runtime::prompt::call_groups, a group's ids ending at its length instead of its offset
+# expected red: "call_groups_slice_the_ids_and_head_the_last ... FAILED" (ids 4..3)
+--- a/crates/runtime/src/prompt.rs
++++ b/crates/runtime/src/prompt.rs
+@@ -272,7 +272,7 @@
+             let first = units.get(g.start)?;
+             let end = units.get(g.end.checked_sub(1)?)?;
+             Some(CallGroup {
+-                ids: (first.start - from) as usize..(end.end - from) as usize,
++                ids: (first.start - from) as usize..(end.end - first.start) as usize,
+                 last: end.end == to,
+                 units: g,
+             })

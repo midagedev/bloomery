@@ -84,7 +84,7 @@ use bloomery_gpu::host::leg_tier::{self, Hang, LegOpen};
 use bloomery_gpu::host::nvtier::NvTier;
 use bloomery_gpu::host::refuse_tier_count;
 use bloomery_gpu::host::run::{HostRun, HostWidths};
-use bloomery_gpu::host::served::{ResidencyParts, TierBody};
+use bloomery_gpu::host::served::{ResidencyParts, TierBody, refuse_steps_feed};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::{PassReport, Residency};
 use bloomery_gpu::host::swap_source::{FileSwap, ResidencyGlue, ResidencySpec};
@@ -2764,16 +2764,7 @@ impl Drop for Body {
 /// call keeps 0 rows (V4.1's rule, `gpu_deepseek41::body`'s
 /// `refuse_steps_under_residency`, at its load there).
 pub(crate) fn refuse_steps_under_residency(m: &Glm5nextModel) -> Result<(), GpuError> {
-    if m.body(WHAT)?.residency != Residency::Off {
-        return Err(GpuError::Shape {
-            what: "BLOOMERY_PREFILL",
-            detail: "steps beside BLOOMERY_RESIDENCY: each prompt id would end a decode pass \
-                     the residency rule counts, where the prompt call keeps 0 rows; use \
-                     BLOOMERY_PREFILL=batch or BLOOMERY_RESIDENCY=off"
-                .to_string(),
-        });
-    }
-    Ok(())
+    refuse_steps_feed(m.body(WHAT)?.residency)
 }
 
 #[cfg(test)]
