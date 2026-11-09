@@ -1,0 +1,17 @@
+# kcover mutant r5-globs-trigger
+# clause: R5, a held gate (a real-tier gate of an other family with a fixture) is owed by its family's own files, never by a
+#   common file's change (tools/rotation.py OwnChange)
+# site: tools/rotation.py OwnChange.__call__, any changed file read as the family's own
+# expected red: "rotation self-test FAIL: OwnChange: a common file's change owes no held gate" from
+#   `python3 tools/rotation.py --self-test` (rc 1)
+--- a/tools/rotation.py
++++ b/tools/rotation.py
+@@ -295,7 +295,7 @@
+             return f"its last real-tier green's commit {rec.commit} cannot be told against this tree ({files})"
+         fam = self.tables.families.get(g.scope.family)
+         globs = fam.globs if fam is not None else ()
+-        hit = next((f for f in files if any(recipes.class_glob(x).match(f) for x in globs)), None)
++        hit = next(iter(files), None)
+         if hit is not None:
+             return f"its family {g.scope.family}'s own file {hit} changed since its last real-tier green ({rec.commit})"
+         if "justfile" in files:

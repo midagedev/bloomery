@@ -1,0 +1,21 @@
+# kcover mutant r1-lib-tests
+# clause: R1, a lib's own tests or doctests are no launch of the lib's kernel files (tools/gate_class.py OWN_KINDS)
+# site: tools/gate_class.py read_kernel_reach, a libtest or doctest target's lib module tree read as the gate's own: gate-gpu-lib
+#   and gate-gpu-rope-writers then pass every kernel file of crates/gpu, q6k_heads.rs among them
+# expected red: "gate_class self-test FAIL: read_kernel_reach: crates/gpu/src/q6k_heads.rs is launched by the gates of
+#   ['kimi-k3', 'raon1'] alone: ['kimi-k3', 'raon1'], own ['gate-gpu-lib', 'gate-gpu-rope-writers']" from
+#   `python3 tools/gate_class.py --self-test` (rc 1)
+--- a/tools/gate_class.py
++++ b/tools/gate_class.py
+@@ -417,9 +417,9 @@
+     gates = sorted(n for n in side.recipes if n.startswith(GATE_PREFIX))
+     for n in gates:
+         for pname, kind, tname, _ in graph.inputs(n).targets:
+-            if kind not in OWN_KINDS:
++            if kind not in OWN_KINDS + ("libtest", "doctest"):
+                 continue
+-            t = tree.packages[pname].find(kind, tname or "")
++            t = tree.packages[pname].lib() if kind in ("libtest", "doctest") else tree.packages[pname].find(kind, tname or "")
+             if t is None:
+                 continue
+             for f in tree.tree_of(t.src, True)[0]:

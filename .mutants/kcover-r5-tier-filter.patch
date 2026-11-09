@@ -1,0 +1,16 @@
+# kcover mutant r5-tier-filter
+# clause: R5, an other family with a fixture rotates by its fixture-tier green rows alone (tools/rotation.py last_green)
+# site: tools/rotation.py last_green, the tier filter dropped: a real-tier green counts for the fixture tier
+# expected red: "rotation self-test FAIL: last_green: the fixture tier's rows alone" and "due --tier fixture: the F gate whose
+#   fixture-tier green is 31 d old is due" from `python3 tools/rotation.py --self-test` (rc 1)
+--- a/tools/rotation.py
++++ b/tools/rotation.py
+@@ -226,8 +226,6 @@
+             d = parse_date(rec.date)
+         except ValueError:
+             bad += 1
+-            continue
+-        if tier and ledger.tier_of(rec.key) != tier:
+             continue
+         if rec.recipe not in last or d > last[rec.recipe]:
+             last[rec.recipe] = d

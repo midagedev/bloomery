@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The rotation: the gates no landing runs, scheduled (Mac, reads the lead's green ledger).
 
-    tools/rotation.py due   [--days N] [--ledger PATH] [--tier real] [--classes FILE] [--with-weekly] [--out FILE]
+    tools/rotation.py due   [--days N] [--ledger PATH] [--tier real|fixture] [--real NAME]… [--classes FILE] [--with-weekly] [--out FILE]
     tools/rotation.py check [--days N] [--ledger PATH] [--classes FILE]
     tools/rotation.py follow-list [--base REV] [--ledger PATH] [--classes FILE] [--out FILE]
     tools/rotation.py --self-test
@@ -15,6 +15,13 @@ daily pass run the gates of the main families (families.tsv tier), of the famili
 main family's gates every 7 days and any other family's every 30. A gate of an F family is grouped under its class-table family
 (`<family> (F family)`), every other gate under the family of its recipe's BLOOMERY_MODEL.
 
+An `other` family with a fixture (families.tsv tier `other`, fixture yes; gate_class.GateScope.fixture_tier) is held to the fixture
+tier: its F-family gates rotate by their fixture-tier green rows (`due --tier fixture`; a row's tier is its parts',
+recipes.Ledger.tier_of, and a row whose parts were not kept is in no tier), and its real-tier gates (the deferred kinds, `held`) have
+no date and no moved key that owes them: only a change of the family's own files (its globs) or of the recipe's text since their last
+real-tier green, or a request by name (`--real GATE|FAMILY`). A common file's change never owes them. A main family, and an other
+family with no fixture, keep the date and key rules below.
+
   due    the rotation's gates with no green ledger row at their current input key (tools/recipes.py key, as gate-batch.sh --ledger
          computes it) and whose last green row, of any key, is as old as their family's rotation (families.tsv `rotation_days`: 7 days for a
          main family, 30 for any other; a common or a tooling gate 7; `--days N` sets one number for every gate) or missing; and, whatever
@@ -27,11 +34,15 @@ main family's gates every 7 days and any other family's every 30. A gate of an F
          never hides a gate that nothing can run unattended. --with-weekly puts every `weekly-*` recipe first, then every CUDA
          gate on a GGUF input (`mac_gguf_cuda`, the set a mac landing defers) that the list does not already name, then the due
          gates that are not weekly (`just weekly`): one batch, one ledger read, one sitting.
-         The key status comes from one `tools/gate-batch.sh --ledger --dry-run` over the gates stale by date and the deferred-kind gates
-         fresh by date: it reads the box once (the manifest, through tools/box.sh). When it cannot, every gate stale by date is listed as
+         `--tier real` (the default) leaves out the fixture-tier gates above and lists a held gate only when its family's own change
+         or `--real` owes it (with the reason; one asked by name even when green at its key), naming the held gates it leaves out in
+         a `# held:` comment block; `--tier fixture` lists only the fixture-tier gates, by their fixture-tier greens.
+         The key status comes from one `tools/gate-batch.sh --ledger --dry-run` over the gates stale by date, the deferred-kind gates
+         fresh by date and the held gates owed: it reads the box once (the manifest, through tools/box.sh). When it cannot, every gate stale by date is listed as
          due with `key unknown` and the reason on stderr (the batch's own ledger check skips any that is green at its key), and no gate
          fresh by date is listed.
-  check  rc 1 naming each family whose gates (the same set) have no green ledger row newer than their rotation (as `due`). tools/release/publish.sh
+  check  rc 1 naming each family whose gates (the same set, but the held ones) have no green ledger row newer than their rotation (as
+         `due`); for an other family with a fixture, no fixture-tier green row. tools/release/publish.sh
          runs it before a release is published and stops on rc 1. A family of needs-env gates alone is printed `env` and not counted: it
          runs only on a machine that sets its variable, which this ledger's batches defer by name.
   follow-list  the real tier a daily pass (the follower) runs on the lead's ledger: the list the release batch runs (tools/recipes.py
@@ -107,6 +118,17 @@ class Gate:
     def days(self) -> int:
         return self.scope.days
 
+    @property
+    def fixture_tier(self) -> bool:
+        """An F-family gate of an `other` family with a fixture: the rotation runs it on the fixture tier, by its fixture-tier greens."""
+        return self.scope.fixture_tier and self.kind == F_KIND
+
+    @property
+    def held(self) -> bool:
+        """A real-tier gate (a deferred kind) of an `other` family with a fixture: no date owes it, only its family's own change
+        since its last real-tier green or a request by name (`--real`)."""
+        return self.scope.fixture_tier and self.kind in DEFERRED_KINDS
+
 
 @dataclasses.dataclass
 class Entry:
@@ -118,6 +140,7 @@ class Entry:
     status: str  # a status of the batch's ledger plan (run, never, error, deferred), or key-unknown
     detail: str
     owed: bool = False  # a deferred-kind gate green before at another key: a change moved a file its clauses read (listed first)
+    why: str = ""  # a held gate's reason the real tier owes it (OwnChange, or a request by name)
 
 
 # ---------------------------------------------------------------------------------------------- the classifier
@@ -193,9 +216,9 @@ def parse_date(s: str) -> dt.datetime:
     return dt.datetime.strptime(s, DATE_FMT)
 
 
-def last_green(ledger: recipes.Ledger) -> tuple[dict[str, dt.datetime], int]:
+def last_green(ledger: recipes.Ledger, tier: str = "") -> tuple[dict[str, dt.datetime], int]:
     """The newest green row of each recipe, of any key (an item with env or ARGS counts for its recipe), and the rows whose date
-    does not parse."""
+    does not parse. With `tier`, only the rows that ran in it (recipes.Ledger.tier_of; a row whose parts were not kept is in no tier)."""
     last: dict[str, dt.datetime] = {}
     bad = 0
     for rec in ledger.by_key.values():
@@ -204,9 +227,86 @@ def last_green(ledger: recipes.Ledger) -> tuple[dict[str, dt.datetime], int]:
         except ValueError:
             bad += 1
             continue
+        if tier and ledger.tier_of(rec.key) != tier:
+            continue
         if rec.recipe not in last or d > last[rec.recipe]:
             last[rec.recipe] = d
     return last, bad
+
+
+def last_real_rows(ledger: recipes.Ledger) -> dict[str, recipes.LedgerRecord]:
+    """The newest real-tier green row of each recipe: the commit its family's own change is told against."""
+    out: dict[str, tuple[dt.datetime, recipes.LedgerRecord]] = {}
+    for rec in ledger.by_key.values():
+        try:
+            d = parse_date(rec.date)
+        except ValueError:
+            continue
+        if ledger.tier_of(rec.key) != recipes.REAL_TIER:
+            continue
+        if rec.recipe not in out or d > out[rec.recipe][0]:
+            out[rec.recipe] = (d, rec)
+    return {n: r for n, (_, r) in out.items()}
+
+
+def unknown_tier(ledger: recipes.Ledger) -> int:
+    """The green rows whose parts were not kept: no tier can be told, so they hold no fixture-tier family and owe nothing."""
+    return sum(1 for rec in ledger.by_key.values() if not ledger.tier_of(rec.key))
+
+
+# ---------------------------------------------------------------------------------------------- the real tier of a fixture family
+
+
+class OwnChange:
+    """Whether a held gate's family changed since its last real-tier green: a file the family's globs match (git diff of that row's
+    commit against the working tree), or the recipe's own text (the justfile at that commit against this one). One git call a commit."""
+
+    def __init__(self, tables: gate_class.Tables, rs: dict[str, recipes.Recipe], root: str = ROOT):
+        self.tables, self.rs, self.root = tables, rs, root
+        self._files: dict[str, list[str] | str] = {}
+        self._recipes: dict[str, dict[str, recipes.Recipe]] = {}
+
+    def files(self, commit: str) -> list[str] | str:
+        """The files changed since `commit`, or the reason they cannot be told."""
+        if commit not in self._files:
+            proc = subprocess.run(["git", "diff", "--name-only", commit, "--"], capture_output=True, text=True, cwd=self.root)
+            self._files[commit] = proc.stdout.split() if proc.returncode == 0 else f"`git diff {commit}` failed: {proc.stderr.strip()[-160:]}"
+        return self._files[commit]
+
+    def old_recipes(self, commit: str) -> dict[str, recipes.Recipe]:
+        if commit not in self._recipes:
+            proc = subprocess.run(["git", "show", f"{commit}:justfile"], capture_output=True, text=True, cwd=self.root)
+            if proc.returncode != 0:
+                raise RotationError(f"`git show {commit}:justfile` failed: {proc.stderr.strip()[-160:]}", 70)
+            with tempfile.TemporaryDirectory(prefix="rotation-just-") as d:
+                path = os.path.join(d, "justfile")
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(proc.stdout)
+                self._recipes[commit] = recipes.load_justfile(path)
+        return self._recipes[commit]
+
+    def __call__(self, g: "Gate", rec: recipes.LedgerRecord | None, untiered: bool = False) -> str:
+        """Why the real tier owes held gate `g` a run, or '' when it does not. `untiered`: the gate has green rows whose parts were not
+        kept, so whether one ran on the real tier cannot be told."""
+        if rec is None and untiered:
+            return "its green rows' parts were not kept, so no real-tier green can be told: owed until one runs and keeps its parts"
+        if rec is None:
+            return "no real-tier green row: it never ran on the real tier"
+        commit = rec.commit.removesuffix("-dirty")
+        files = self.files(commit)
+        if isinstance(files, str):
+            return f"its last real-tier green's commit {rec.commit} cannot be told against this tree ({files})"
+        fam = self.tables.families.get(g.scope.family)
+        globs = fam.globs if fam is not None else ()
+        hit = next((f for f in files if any(recipes.class_glob(x).match(f) for x in globs)), None)
+        if hit is not None:
+            return f"its family {g.scope.family}'s own file {hit} changed since its last real-tier green ({rec.commit})"
+        if "justfile" in files:
+            old = self.old_recipes(commit).get(g.name)
+            now = self.rs.get(g.name)
+            if old is None or now is None or old.text != now.text:
+                return f"its recipe's text changed since its last real-tier green ({rec.commit})"
+        return ""
 
 
 def read_times(path: str) -> tuple[dict[str, list[int]], int]:
@@ -285,6 +385,9 @@ def batch_keys(names: list[str], tier: str, ledger_path: str) -> dict[str, tuple
 # ---------------------------------------------------------------------------------------------- due
 
 
+Owe = Callable[[Gate], tuple[str, bool]]  # a held gate -> (why the real tier owes it, '' for not owed; whether it was asked by name)
+
+
 def due_entries(
     gates: list[Gate],
     last: dict[str, dt.datetime],
@@ -292,26 +395,36 @@ def due_entries(
     now: dt.datetime,
     days: float | None,
     key_of: Callable[[list[str]], dict[str, tuple[str, str]]],
+    owe: Owe | None = None,
 ) -> tuple[list[Entry], str]:
     """The gates due, and the reason their key status is unknown ('' when it is known). Stale by date: no green row of any key, or
     the newest as old as the gate's rotation (its family's days, or `days` for every gate when given). Owed: a gate of a kind the
     fixture tier defers (DEFERRED_KINDS) that was green before and has no green row at its current key, whatever its date — a change
-    moved a file its clauses read, and no landing runs it (`tools/recipes.py affected` names it under `real-tier owed:`). The key
-    status is asked of the stale gates and of every deferred-kind gate fresh by date; a gate green at its current key is not due."""
+    moved a file its clauses read, and no landing runs it (`tools/recipes.py affected` names it under `real-tier owed:`). A held gate
+    (Gate.held: a real-tier gate of an other family with a fixture) has no date and no moved key that owes it: only `owe`, its
+    family's own change or a request by name, and one asked by name is listed even when green at its current key. The key status is
+    asked of the stale gates, of every deferred-kind gate fresh by date and of the held gates `owe` names; a gate green at its current
+    key is not due."""
     stale = []
     fresh = []
+    held = []
     for g in gates:
         lg = last.get(g.name)
         age = None if lg is None else now - lg
+        if g.held:
+            why, named = owe(g) if owe is not None else ("", False)
+            if why:
+                held.append((g, lg, age, why, named))
+            continue
         if age is None or age >= window(g, days):
             stale.append((g, lg, age))
         elif g.kind in DEFERRED_KINDS:
             fresh.append((g, lg, age))
     keys: dict[str, tuple[str, str]] = {}
     unknown = ""
-    if stale or fresh:
+    if stale or fresh or held:
         try:
-            keys = key_of([g.name for g, _, _ in stale + fresh])
+            keys = key_of([g.name for g, _, _ in stale + fresh] + [h[0].name for h in held])
         except RotationError as e:
             unknown = str(e)
     out = []
@@ -330,6 +443,14 @@ def due_entries(
             continue
         wall, src = expected(times, g.name)
         out.append(Entry(g, lg, age, wall, src, "run", keys[g.name][1], owed=True))
+    for g, lg, age, why, named in held:
+        status, detail = ("key-unknown", unknown) if unknown else keys[g.name]
+        if status == "skip":
+            if not named:
+                continue
+            status, why = "run", f"{why}; green at its current key, so the batch skips it unless --rerun"
+        wall, src = expected(times, g.name)
+        out.append(Entry(g, lg, age, wall, src, status, detail, owed=True, why=why))
     return out, unknown
 
 
@@ -364,6 +485,8 @@ def age_text(e: Entry) -> str:
 def reason(e: Entry) -> str:
     """Why the gate is due, from the batch's ledger status: run (no green row at the key), never (a recipe the batch never skips),
     error (no key), deferred (the batch defers it), or key-unknown (ours: the status could not be read)."""
+    if e.why:
+        return f"owed to the real tier: {e.why}"
     if e.status == "deferred":
         return f"needs {e.gate.env}: the batch defers it unless the variable is set" if e.gate.env else f"the batch defers it ({e.detail})"
     if e.status == "key-unknown":
@@ -387,6 +510,7 @@ def format_list(
     times_path: str,
     unknown: str,
     mac: list[str] | None = None,
+    notes: list[str] | None = None,
 ) -> str:
     runs = [e for e in entries if e.status != "deferred"]
     total = sum(e.wall for e in runs)
@@ -394,7 +518,7 @@ def format_list(
     defaults = [e.gate.name for e in runs if e.wall_src == "default"]
     out = [
         f"# rotation due: tier {tier}, no green row at the current key and none newer than {days_text(days)}, or owed (a deferred gate whose key"
-        f" moved since its last green row), {now.strftime(DATE_FMT)}",
+        f" moved since its last green row, or a held gate its family's own change or a request by name owes), {now.strftime(DATE_FMT)}",
         f"# ledger {ledger_path}; times {times_path}",
         f"# {len(entries)} gate(s) due: {len(runs)} run, predicted {total} s (gate-times medians, {DEFAULT_S} s where a gate has no row"
         + (f": {len(defaults)} so)" if defaults else ")")
@@ -402,6 +526,7 @@ def format_list(
     ]
     if unknown:
         out.append(f"# key status unknown ({unknown}): every gate stale by date is listed; the batch's ledger check skips any green at its key")
+    out += [f"# {n}" for n in notes or []]
     mac = list(mac or [])
     owed = [e for e in entries if e.owed and not (weekly and e.gate.weekly)]
     if owed:
@@ -460,34 +585,92 @@ def load_gates(args: argparse.Namespace, rs: dict[str, recipes.Recipe] | None = 
     return rotation_gates(rows, lambda n: family_of(rs, n), f_gates, recipes.gate_scope_of(tables, rs))
 
 
-def load_ledger(path: str) -> tuple[dict[str, dt.datetime], int]:
+def load_ledger(path: str, tier: str = "") -> tuple[dict[str, dt.datetime], int]:
     if not os.path.exists(path):
         print(f"rotation.py: {path} does not exist: no gate has a green row", file=sys.stderr)
     led = recipes.Ledger(path)
     if led.bad:
         print(f"rotation.py: {path}: {led.bad} malformed line(s) ignored", file=sys.stderr)
-    last, bad = last_green(led)
+    last, bad = last_green(led, tier)
     if bad:
         print(f"rotation.py: {path}: {bad} row(s) with a date that does not parse ignored", file=sys.stderr)
+    if tier:
+        n = unknown_tier(led)
+        if n:
+            print(f"rotation.py: {path}: {n} green row(s) whose parts were not kept hold no {tier}-tier family", file=sys.stderr)
     return last, bad
 
 
+def by_name(gates: list[Gate], names: list[str]) -> dict[str, str]:
+    """The held gates `--real NAME…` asks for (a held gate's name, or its class-table family), gate -> the name that asked. A name that
+    is neither a held gate nor the family of one is a named error: a request by name never lists nothing silently."""
+    out: dict[str, str] = {}
+    for name in names:
+        hit = [g for g in gates if g.held and name in (g.name, g.scope.family)]
+        if not hit:
+            raise RotationError(f"--real {name}: no real-tier gate of an other family with a fixture is named so, and no such family is "
+                                "(a main family's, or a family's with no fixture, is due by its date)")
+        for g in hit:
+            out.setdefault(g.name, name)
+    return out
+
+
+def held_notes(gates: list[Gate], entries: list[Entry]) -> list[str]:
+    """The held gates the list leaves out, by family: their family is owed on the fixture tier (`due --tier fixture`)."""
+    listed = {e.gate.name for e in entries}
+    fams: dict[str, list[str]] = {}
+    for g in gates:
+        if g.held and g.name not in listed:
+            fams.setdefault(g.scope.family, []).append(g.name)
+    if not fams:
+        return []
+    out = [f"held: {sum(len(v) for v in fams.values())} real-tier gate(s) of {len(fams)} other family(ies) with a fixture, owed only on their "
+           "family's own change since their last real-tier green or by name (--real NAME); `due --tier fixture` holds the family to its rotation"]
+    out += [f"  {f}: {' '.join(sorted(ns))}" for f, ns in sorted(fams.items())]
+    return out
+
+
 def cmd_due(args: argparse.Namespace, now: dt.datetime | None = None, key_of: Callable | None = None, rs: dict | None = None,
-            f_gates: dict[str, str] | None = None, tables: gate_class.Tables | None = None) -> int:
+            f_gates: dict[str, str] | None = None, tables: gate_class.Tables | None = None, own_change: Callable | None = None) -> int:
     now = now or dt.datetime.now().astimezone()
     if rs is None:
         rs = recipes.load_justfile(os.path.join(recipes.ROOT, "justfile"))
-    gates = load_gates(args, rs, f_gates, tables)
+    if tables is None:
+        tables = recipes.class_tables(ROOT)
+    every = load_gates(args, rs, f_gates, tables)
+    fixture = args.tier == recipes.FIXTURE_TIER
+    real_names = list(getattr(args, "real", None) or [])
+    if fixture and real_names:
+        raise RotationError("--real names real-tier gates: it goes with --tier real")
+    if fixture and args.with_weekly:
+        raise RotationError("--with-weekly is the real tier's list (`just weekly`): the weekly recipes run on the real files")
+    gates = [g for g in every if g.fixture_tier == fixture]
     ledger_path = ledger_path_of(args.ledger)
     times_path = times_path_of()
-    last, _ = load_ledger(ledger_path)
+    last, _ = load_ledger(ledger_path, recipes.FIXTURE_TIER if fixture else "")
     times, bad = read_times(times_path)
     if bad:
         print(f"rotation.py: {times_path}: {bad} malformed row(s) ignored (tools/gate-batch.sh refuses them by name)", file=sys.stderr)
     if not os.path.exists(times_path):
         print(f"rotation.py: {times_path} does not exist: every gate is predicted at {DEFAULT_S} s", file=sys.stderr)
     key_of = key_of or (lambda names: batch_keys(names, args.tier, ledger_path))
-    entries, unknown = due_entries(gates, last, times, now, args.days, key_of)
+    owe: Owe | None = None
+    if not fixture:
+        asked = by_name(gates, real_names)
+        led = recipes.Ledger(ledger_path)
+        rows = last_real_rows(led)
+        untiered = {rec.recipe for rec in led.by_key.values() if not led.tier_of(rec.key)}
+        if any(g.held and g.name not in rows and g.name in untiered for g in gates):
+            print(f"rotation.py: {ledger_path}: {len(untiered)} recipe(s) have green rows whose parts were not kept; a held gate with no "
+                  "real-tier green of its own among them is owed, named so", file=sys.stderr)
+        change = own_change or OwnChange(tables, rs)
+
+        def owe(g: Gate) -> tuple[str, bool]:
+            if g.name in asked:
+                return f"asked by name (--real {asked[g.name]})", True
+            return change(g, rows.get(g.name), g.name in untiered), False
+
+    entries, unknown = due_entries(gates, last, times, now, args.days, key_of, owe)
     if unknown:
         print(f"rotation.py: key status unknown, every gate stale by date is listed: {unknown}", file=sys.stderr)
     weekly = [g for g in gates if g.weekly] if args.with_weekly else []
@@ -495,7 +678,9 @@ def cmd_due(args: argparse.Namespace, now: dt.datetime | None = None, key_of: Ca
     # on it (a weekly recipe, or a gate the rotation already lists) is not written twice.
     present = {g.name for g in weekly} | {e.gate.name for e in entries}
     mac = [n for n, _ in recipes.mac_gguf_cuda(rs, recipes.ROOT) if n not in present] if args.with_weekly else []
-    text = format_list(entries, weekly, args.days, args.tier, now, ledger_path, times_path, unknown, mac)
+    notes = held_notes(gates, entries) if not fixture else [
+        f"fixture tier: the F-family gates of the other families with a fixture, by their fixture-tier green rows ({len(gates)} gate(s))"]
+    text = format_list(entries, weekly, args.days, args.tier, now, ledger_path, times_path, unknown, mac, notes)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as fh:
             fh.write(text)
@@ -529,11 +714,17 @@ def env_only(gates: list[Gate]) -> bool:
 def cmd_check(args: argparse.Namespace, now: dt.datetime | None = None, rs: dict | None = None, f_gates: dict[str, str] | None = None,
               tables: gate_class.Tables | None = None) -> int:
     now = now or dt.datetime.now().astimezone()
-    gates = load_gates(args, rs, f_gates, tables)
-    last, _ = load_ledger(ledger_path_of(args.ledger))
+    every = load_gates(args, rs, f_gates, tables)
+    gates = [g for g in every if not g.held]
+    path = ledger_path_of(args.ledger)
+    last, _ = load_ledger(path)
+    if any(g.fixture_tier for g in gates):
+        last_fx, _ = load_ledger(path, recipes.FIXTURE_TIER)
+        last = {g.name: d for g in gates if (d := (last_fx if g.fixture_tier else last).get(g.name)) is not None}
     red = 0
     for fam, gs, newest, ok in check_families(gates, last, now, args.days):
-        when = "no green row" if newest is None else f"newest green row {int((now - newest).total_seconds() // 86400)} d ago"
+        tier = " fixture-tier" if all(g.fixture_tier for g in gs) else ""
+        when = f"no{tier} green row" if newest is None else f"newest{tier} green row {int((now - newest).total_seconds() // 86400)} d ago"
         if ok:
             print(f"ok   {fam}: {len(gs)} gate(s), {when}")
         elif env_only(gs):
@@ -544,6 +735,11 @@ def cmd_check(args: argparse.Namespace, now: dt.datetime | None = None, rs: dict
             red += 1
             print(f"RED  {fam}: {len(gs)} gate(s), {when}; none is newer than {days_text(args.days) if args.days is not None else f'{min(g.days for g in gs)} d'}: "
                   f"{' '.join(g.name for g in gs[:8])}" + (" …" if len(gs) > 8 else ""))
+    counted = {fam for fam, _, _, _ in check_families(gates, last, now, args.days)}
+    for fam, gs, _, _ in check_families([g for g in every if g.held], {}, now, args.days):
+        if fam not in counted:
+            print(f"held {fam}: {len(gs)} gate(s), each a real-tier gate of an other family with a fixture, owed only on its family's own "
+                  f"change or by name (`due --real`), so no date holds it: {' '.join(g.name for g in gs[:8])}" + (" …" if len(gs) > 8 else ""))
     print(f"rotation check: {red} family(ies) with no green row newer than {days_text(args.days)}")
     return 1 if red else 0
 
@@ -602,6 +798,116 @@ def cmd_follow_list(args: argparse.Namespace, now: dt.datetime | None = None, rs
 
 
 # ---------------------------------------------------------------------------------------------- the self-test
+
+
+def fixture_tier_self_test(expect: Callable[[bool, str], None], tmp: str, now: dt.datetime, rec: Callable, keys: Callable) -> None:
+    """The other families with a fixture: their F-family gates rotate on the fixture tier by fixture-tier greens alone, their real
+    gates are held (owed only by their family's own change or by name, never by a moved key), and `check` reads fixture-tier greens
+    for them. An other family with no fixture and a main family keep the date and key rules."""
+    fam = lambda n, tier, fx: gate_class.FamilyRow(n, "F", tier, (f"crates/{n}/**",), gate_class.TIER_DAYS[tier], fx)  # noqa: E731
+    fams = {"fo": fam("fo", "other", True), "fn": fam("fn", "other", False), "fm": fam("fm", "main", True), "fh": fam("fh", "other", True)}
+    rows_t = {n: gate_class.GateRow(n, "family", f, "e2e", ()) for n, f in
+              (("gate-fo", "fo"), ("gate-fo-real", "fo"), ("gate-fn-real", "fn"), ("gate-fm-real", "fm"), ("gate-fh-real", "fh"))}
+    tabs = gate_class.Tables(gates=rows_t, families=fams, owners={})
+    classes = "\n".join("\t".join(r) for r in [
+        ("gate-fo", "F", "balanced", "3090,a6000", "x"), ("gate-fo-real", "D", "real-only", "-", "x"),
+        ("gate-fn-real", "D", "real-only", "-", "x"), ("gate-fm-real", "D", "real-only", "-", "x"), ("gate-fh-real", "D", "real-only", "-", "x")]) + "\n"
+    cls_path = os.path.join(tmp, "fx-classes.tsv")
+    with open(cls_path, "w", encoding="utf-8") as fh:
+        fh.write(classes)
+    rs = {n: rec(n, "true") for n in rows_t}
+    gates = rotation_gates(parse_classes(classes), lambda n: "profile", recipes.f_family_gates(tabs), recipes.gate_scope_of(tabs, rs))
+    by = {g.name: g for g in gates}
+    expect(by["gate-fo"].fixture_tier and not by["gate-fo"].held and by["gate-fo-real"].held
+           and not any(by[n].held or by[n].fixture_tier for n in ("gate-fn-real", "gate-fm-real")),
+           "fixture tier: an other family with a fixture rotates its F gate on the fixture tier and holds its real gate; no other family does")
+
+    # The ledger: gate-fo green on the fixture tier 31 d ago and on the real tier 1 d ago; every real gate green 3 d ago at an old key.
+    led = os.path.join(tmp, "fx-ledger.tsv")
+    os.makedirs(led + ".parts", exist_ok=True)
+    rows_l = [("1", "gate-fo", 31, "fixture"), ("2", "gate-fo", 1, "real"), ("3", "gate-fo-real", 3, "real"), ("4", "gate-fn-real", 3, "real"),
+              ("5", "gate-fm-real", 3, "real")]
+    with open(led, "w", encoding="utf-8") as fh:
+        for key, name, d, tier in rows_l:
+            fh.write(f"{key * 64}\t{name}\t{name}\tabc123456789\t{(now - dt.timedelta(days=d)).strftime(DATE_FMT)}\t/x\n")
+            env = "BLOOMERY_GATE_CARD=3090" + (" BLOOMERY_TIER=fixture" if tier == "fixture" else "")
+            with open(os.path.join(led + ".parts", key * 64 + ".parts"), "w", encoding="utf-8") as ph:
+                ph.write(f"item\tboxenv\t{env}\n")
+    ledger = recipes.Ledger(led)
+    fx, _ = last_green(ledger, recipes.FIXTURE_TIER)
+    expect(fx == {"gate-fo": now - dt.timedelta(days=31)}, f"last_green: the fixture tier's rows alone: {fx}")
+    expect(set(last_real_rows(ledger)) == {"gate-fo", "gate-fo-real", "gate-fn-real", "gate-fm-real"}, "last_real_rows: the real tier's newest row of each")
+
+    def due(tier: str, change: Callable, real: list[str] | None = None) -> tuple[list[str], str]:
+        out = os.path.join(tmp, f"fx-due-{tier}.list")
+        args = argparse.Namespace(days=None, ledger=led, tier=tier, classes=cls_path, with_weekly=False, out=out, real=real)
+        with contextlib.redirect_stderr(io.StringIO()):
+            cmd_due(args, now, keys({}), rs, recipes.f_family_gates(tabs), tabs, change)
+        text = open(out, encoding="utf-8").read()
+        return [ln for ln in text.splitlines() if ln and not ln.startswith("#")], text
+
+    nothing = lambda g, r, u=False: ""  # noqa: E731
+    items, _ = due(recipes.FIXTURE_TIER, nothing)
+    expect(items == ["gate-fo"], f"due --tier fixture: the F gate whose fixture-tier green is 31 d old is due, its 1 d real green notwithstanding: {items}")
+    items, text = due(recipes.REAL_TIER, nothing)
+    expect(sorted(items) == ["gate-fm-real", "gate-fn-real"] and "#   fo: gate-fo-real" in text,
+           f"due --tier real: a moved key owes a main family's and a fixture-less family's real gate, not a held one, which is named: {items}")
+    items, text = due(recipes.REAL_TIER, lambda g, r, u=False: "its family fo's own file crates/fo/a.rs changed since its last real-tier green (abc)")
+    expect("gate-fo-real" in items and "owed to the real tier: its family fo's own file crates/fo/a.rs changed" in text,
+           f"due --tier real: its family's own change owes a held gate, with the reason: {items}")
+    items, text = due(recipes.REAL_TIER, nothing, ["fo"])
+    expect("gate-fo-real" in items and "asked by name (--real fo)" in text, f"due --real FAMILY: a held gate asked by name is listed: {items}")
+    try:
+        due(recipes.REAL_TIER, nothing, ["nobody"])
+        expect(False, "due --real: a name that holds no gate was accepted")
+    except RotationError as e:
+        expect("--real nobody" in str(e), f"due --real: an unknown name is a named error: {e}")
+
+    # check: the fixture family is red on a 31 d fixture-tier green though its real green is 1 d old, and its held gate is not counted.
+    args = argparse.Namespace(days=None, ledger=led, classes=cls_path)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+        rc = cmd_check(args, now, rs, recipes.f_family_gates(tabs), tabs)
+    out = buf.getvalue()
+    expect(rc == 1 and "RED  fo (F family): 1 gate(s), newest fixture-tier green row 31 d ago" in out and "ok   fn (F family)" in out,
+           f"check: an other family with a fixture is held to its fixture-tier greens, its held gate not counted: {rc} {out}")
+    expect("held fh (F family): 1 gate(s)" in out and "gate-fh-real" in out and "RED  fh" not in out,
+           f"check: a family whose gates are all held is named, not dropped: {out}")
+
+    # OwnChange on a repository of its own: a common file is no change of the family, its own file and its recipe's text are.
+    repo = os.path.join(tmp, "fx-repo")
+    os.makedirs(os.path.join(repo, "crates", "fo"))
+    os.makedirs(os.path.join(repo, "crates", "common"))
+
+    def git(*a: str) -> str:
+        return subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t", *a], cwd=repo, capture_output=True, text=True, check=True).stdout
+
+    def put(rel: str, text: str) -> None:
+        with open(os.path.join(repo, rel), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    put("justfile", "gate-fo-real:\n    echo a\n")
+    put("crates/fo/a.rs", "// a\n")
+    put("crates/common/x.rs", "// x\n")
+    git("init", "-q")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    head = git("rev-parse", "HEAD").strip()[:12]
+    base = recipes.LedgerRecord("k", "gate-fo-real", "gate-fo-real", head, "d", "/x")
+    jf = os.path.join(repo, "justfile")
+    oc = lambda: OwnChange(tabs, recipes.load_justfile(jf), repo)  # noqa: E731
+    put("crates/common/x.rs", "// x2\n")
+    expect(oc()(by["gate-fo-real"], base) == "", "OwnChange: a common file's change owes no held gate")
+    put("crates/fo/a.rs", "// a2\n")
+    expect("own file crates/fo/a.rs changed" in oc()(by["gate-fo-real"], base), "OwnChange: its family's own file owes it")
+    put("crates/fo/a.rs", "// a\n")
+    put("justfile", "gate-fo-real:\n    echo b\n")
+    expect("recipe's text changed" in oc()(by["gate-fo-real"], base), "OwnChange: its recipe's text owes it")
+    expect("never ran on the real tier" in oc()(by["gate-fo-real"], None), "OwnChange: a held gate with no real-tier green is owed")
+    expect("parts were not kept" in oc()(by["gate-fo-real"], None, True),
+           "OwnChange: a held gate whose only green rows kept no parts is owed, and named so, not as never run")
+    gone = recipes.LedgerRecord("k", "gate-fo-real", "gate-fo-real", "0123456789ab", "d", "/x")
+    expect("cannot be told" in oc()(by["gate-fo-real"], gone), "OwnChange: a commit the repository lacks owes it, named")
 
 
 def self_test() -> int:
@@ -988,6 +1294,7 @@ def self_test() -> int:
             fl_items = bare(open(argsl.out, encoding="utf-8").read())
             expect(fl_items == ["gate-c", "gate-m", "gate-o8", "weekly-m", "weekly-o"],
                    f"follow-list: a family new in the release is in whatever its tier, the other family stays out: {fl_items}")
+            fixture_tier_self_test(expect, tmp, now, rec, keys)
         finally:
             if old_times is None:
                 os.environ.pop("BLOOMERY_GATE_TIMES", None)
@@ -1008,13 +1315,17 @@ def main(argv: list[str]) -> int:
         return self_test()
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name, helptext in (("due", "the list for one real-tier batch"), ("check", "rc 1 naming each family with no green row newer than its rotation")):
+    for name, helptext in (("due", "the list for one batch: the real tier, or with --tier fixture the fixture tier"), ("check", "rc 1 naming each family with no green row newer than its rotation")):
         p = sub.add_parser(name, help=helptext)
         p.add_argument("--days", type=float, default=None, help="the age at which a last run is stale, for every gate (default: its family's rotation_days, 7 for a main family and 30 for any other)")
         p.add_argument("--ledger", help="the green ledger (default BLOOMERY_GATE_LEDGER, else ~/.cache/bloomery/gate-ledger.tsv)")
         p.add_argument("--classes", help="a saved `tools/gate-batch.sh --tier fixture --classes` (default: run it)")
         if name == "due":
-            p.add_argument("--tier", choices=["real"], default="real", help="the tier the list runs in: the real tier, which runs what the fixture tier defers")
+            p.add_argument("--tier", choices=[recipes.REAL_TIER, recipes.FIXTURE_TIER], default=recipes.REAL_TIER,
+                           help="the tier the list runs in: real (what the fixture tier defers, every family but the other ones with a fixture, "
+                                "and their held gates their own change or --real owes) or fixture (the F-family gates of the other families with a fixture)")
+            p.add_argument("--real", action="append", metavar="NAME", help="a held gate, or the family of held gates, the real tier owes by name "
+                           "(a user report, a release that names the family); repeatable, --tier real only")
             p.add_argument("--with-weekly", action="store_true", help="every weekly-* recipe first, then every CUDA gate on a GGUF input the list does not already name, then the due gates that are not weekly (`just weekly`)")
             p.add_argument("--out", help="write the list to FILE (its first lines to stderr) instead of stdout")
     fl = sub.add_parser("follow-list", help="the real tier a daily pass runs: main families, families new since the last release tag, common and tooling gates; every other family left out by name")

@@ -1,0 +1,16 @@
+# kcover mutant r5-check-tier
+# clause: R5, `rotation.py check` holds an other family with a fixture to its fixture-tier green rows (tools/rotation.py cmd_check)
+# site: tools/rotation.py cmd_check, the fixture-tier ledger read dropped: every green of any tier counts
+# expected red: "rotation self-test FAIL: check: an other family with a fixture is held to its fixture-tier greens" from
+#   `python3 tools/rotation.py --self-test` (rc 1)
+--- a/tools/rotation.py
++++ b/tools/rotation.py
+@@ -709,7 +709,7 @@
+     gates = [g for g in load_gates(args, rs, f_gates, tables) if not g.held]
+     path = ledger_path_of(args.ledger)
+     last, _ = load_ledger(path)
+-    if any(g.fixture_tier for g in gates):
++    if False:
+         last_fx, _ = load_ledger(path, recipes.FIXTURE_TIER)
+         last = {g.name: d for g in gates if (d := (last_fx if g.fixture_tier else last).get(g.name)) is not None}
+     red = 0

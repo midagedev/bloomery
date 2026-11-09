@@ -2829,14 +2829,17 @@ smoke *ARGS:
 # changes), then every gate the fixture tier defers (real-only, real-file, no-fixture, needs-env) that has no green row
 # at its current key and none newer than its family's rotation (7 days for a main family and for a common or tooling gate, 30 for any other
 # family: tools/families.tsv; tools/rotation.py due), and every gate of an F family likewise, in one sitting through
-# tools/gate-batch.sh, on the lead's ledger. `just affected` never selects the rotation.
+# tools/gate-batch.sh, on the lead's ledger. An other family with a fixture is the exception: its F-family gates rotate
+# on the fixture tier (`just rotation-due --tier fixture`, then `tools/gate-batch.sh --tier fixture --ledger --list`),
+# and its real-tier gates are listed here only when its own files or recipe changed since their last real green, or
+# by name (`just rotation-due --real FAMILY`). `just affected` never selects the rotation.
 # ARGS go to the batch (--dry-run, --out DIR, --rerun).
 weekly *ARGS:
     mkdir -p target && python3 tools/rotation.py due --with-weekly --out target/weekly.list && ./tools/gate-batch.sh --ledger --list target/weekly.list {{ARGS}}
 
 # The rotation's due list alone, as a `--list` file for tools/gate-batch.sh: the gates no landing runs and those of an F family, stalest
 # family first, each with its predicted wall. It reads the box once, for the keys.
-# ARGS go to tools/rotation.py due (--days N, --classes FILE).
+# ARGS go to tools/rotation.py due (--days N, --classes FILE, --tier fixture, --real NAME).
 rotation-due *ARGS:
     python3 tools/rotation.py due {{ARGS}}
 

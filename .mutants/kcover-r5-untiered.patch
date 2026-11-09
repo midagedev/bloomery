@@ -1,0 +1,16 @@
+# kcover mutant r5-untiered
+# clause: R5, a held gate whose green rows kept no parts is owed and named so, not as a gate that never ran (tools/rotation.py OwnChange)
+# site: tools/rotation.py OwnChange.__call__, the parts-not-kept branch dropped
+# expected red: "rotation self-test FAIL: OwnChange: a held gate whose only green rows kept no parts is owed, and named so" from
+#   `python3 tools/rotation.py --self-test` (rc 1)
+--- a/tools/rotation.py
++++ b/tools/rotation.py
+@@ -288,7 +288,7 @@
+     def __call__(self, g: "Gate", rec: recipes.LedgerRecord | None, untiered: bool = False) -> str:
+         """Why the real tier owes held gate `g` a run, or '' when it does not. `untiered`: the gate has green rows whose parts were not
+         kept, so whether one ran on the real tier cannot be told."""
+-        if rec is None and untiered:
++        if False:
+             return "its green rows' parts were not kept, so no real-tier green can be told: owed until one runs and keeps its parts"
+         if rec is None:
+             return "no real-tier green row: it never ran on the real tier"
