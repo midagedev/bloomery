@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 
 mod registry;
 use registry::REGISTRY;
-pub use registry::{AUTOTUNE, PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
+pub use registry::{AUTOTUNE, ELASTIC, PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_MARGIN, CED, CHECK_FINITE, DRAFT, ENGRAM_HELPER, EXPERT_RANK,
     FORCE_IDS, GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES, HOST_LANES_DEFAULT, HOST_LOCK, HOST_POPULATE,
@@ -1526,6 +1526,13 @@ impl Levers {
     #[must_use]
     pub fn xstream(&self) -> Option<&'static str> {
         self.word(XSTREAM)
+    }
+
+    /// `BLOOMERY_ELASTIC`: a Qwen3.8 load's expert stacks reserved past the
+    /// plan and settled to the margin after the open.
+    #[must_use]
+    pub fn elastic(&self) -> bool {
+        self.flag(ELASTIC)
     }
 
     /// `BLOOMERY_SPLIT_WALK`: a Qwen3.8 prompt walks a ubatch the width rule

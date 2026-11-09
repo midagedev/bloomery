@@ -547,9 +547,9 @@ impl Tier38 {
             stacks,
             |l| {
                 if run.contains(&l) {
-                    set.on_tier(l)
+                    set.on_tier(l).map(|n| (n, n))
                 } else {
-                    Ok(0)
+                    Ok((0, 0))
                 }
             },
             layers,

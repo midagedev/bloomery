@@ -785,12 +785,72 @@ impl CardFormat {
             .into_iter()
             .try_fold(0u64, u64::checked_add)
     }
+
+    /// The device bytes of an expert stack of `capacity_rows` rows reserved
+    /// and `backed_rows` of them backed ([`StackBytes`]): both are
+    /// [`CardFormat::resident_bytes`], the one owner of a row count's bytes,
+    /// read at the reserved rows and at the backed ones. `None` where that
+    /// has no size, and where `backed_rows` passes `capacity_rows`.
+    #[must_use]
+    pub fn stack_bytes(
+        self,
+        ty: GgmlType,
+        k: u64,
+        capacity_rows: u64,
+        backed_rows: u64,
+    ) -> Option<StackBytes> {
+        if backed_rows > capacity_rows {
+            return None;
+        }
+        Some(StackBytes {
+            reserved: self.resident_bytes(ty, k, capacity_rows)?,
+            backed: self.resident_bytes(ty, k, backed_rows)?,
+        })
+    }
+}
+
+/// What an expert stack held as a room counts in device bytes: the address
+/// range reserved for its capacity, which the buffer's length is, and the
+/// bytes of the rows the plan backed, which the plan sums. They are equal for
+/// a stack with no unbacked tail.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StackBytes {
+    /// Bytes of the stack's capacity rows: the reserved range.
+    pub reserved: u64,
+    /// Bytes of the rows backed at load: the plan's live rows.
+    pub backed: u64,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CardFormat;
+    use super::{CardFormat, StackBytes};
     use crate::quant::GgmlType;
+
+    /// A stack reserved for 117 slots of 2560 rows and backed for the plan's 94 counts the
+    /// reserved range at the capacity rows and the plan's bytes at the backed rows: the
+    /// upload's buffer length is the first and never the second (143769600 against 115507200,
+    /// the elastic load's refusal).
+    ///
+    /// FAIL-first: a `stack_bytes` that reads `backed` at the capacity rows (or `reserved` at
+    /// the backed ones) goes red on the first assertion.
+    #[test]
+    fn a_capacity_stack_counts_reserved_and_backed_bytes() {
+        let (ty, k, per) = (GgmlType::Q4_K, 768u64, 2560u64);
+        let row = CardFormat::KQuant.resident_bytes(ty, k, 1).unwrap();
+        let (cap, live) = (117 * per, 94 * per);
+        let got = CardFormat::KQuant.stack_bytes(ty, k, cap, live).unwrap();
+        assert_eq!(
+            got,
+            StackBytes {
+                reserved: cap * row,
+                backed: live * row
+            }
+        );
+        assert_ne!(got.reserved, got.backed);
+        let whole = CardFormat::KQuant.stack_bytes(ty, k, live, live).unwrap();
+        assert_eq!(whole.reserved, whole.backed);
+        assert_eq!(CardFormat::KQuant.stack_bytes(ty, k, live, cap), None);
+    }
 
     /// NVFP4's planes hold a code nibble a value and a UE4M3 scale a 16 values, whichever NVFP4
     /// file type they were made from: NVFP4's 64-value blocks and NVFP4_ROWS' 16-value groups

@@ -596,6 +596,29 @@ impl SlotMap {
         self.count(&self.cap_card, layer, "SlotMap::capacity")
     }
 
+    /// Layer `layer`'s stage card reserved for `capacity` slots: the stacks
+    /// were made that many rows long ([`crate::room::StackRoom::with_backed`]),
+    /// the plan's experts in the first [`SlotMap::on_card`] of them and the
+    /// rest withdrawn until a fill. Refused by name for a layer the map has no
+    /// row for, a capacity below the layer's live count and one past the
+    /// model's experts a layer.
+    pub fn reserve_card(&mut self, layer: usize, capacity: usize) -> Result<(), GpuError> {
+        const WHAT: &str = "SlotMap::reserve_card";
+        let live = self.count(&self.on_card, layer, WHAT)?;
+        if capacity < live || capacity > self.n_expert {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer}: a capacity of {capacity} slots: at least its {live} live \
+                     experts, at most the model's {}",
+                    self.n_expert
+                ),
+            ));
+        }
+        self.cap_card[layer - self.layers.start] = capacity;
+        Ok(())
+    }
+
     /// Tier card `tier`'s slots in layer `layer`, at least
     /// [`SlotMap::on_tier_of`]; a layer the map has no row for, and a tier it
     /// does not name, are refused by name.

@@ -19,6 +19,7 @@ use crate::q8f32::{E4m3Scales, E4m3Weight};
 use crate::room::StackRoom;
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
+use ::model::placement::elastic;
 use ::model::placement::host_lock::PageDrop;
 use ::model::placement::read_ahead::{self, Ranges};
 use ::model::placement::{
@@ -425,18 +426,37 @@ impl Drop for Weights {
 }
 
 /// The stacks of a placed load held as rooms ([`StackRoom`]): the file tensors whose card
-/// upload is reserved whole, every page backed at load, and the stream the rooms reserve on.
-/// A tensor not named here, or not uploaded as file blocks ([`CardFormat::KQuant`]), is a
-/// plain buffer.
+/// upload is reserved whole, every page the plan's rows lie on backed at load, and the stream
+/// the rooms reserve on. A stack named in `capacity` is reserved for that many slots, the
+/// plan's rows backed and the rest left for the residency machine's fill
+/// ([`StackRoom::with_backed`]); one not named there is reserved for its rows alone. A tensor
+/// not named here, or not uploaded as file blocks ([`CardFormat::KQuant`]), is a plain buffer.
 pub(crate) struct StackRooms {
     names: BTreeSet<String>,
     stream: Arc<CudaStream>,
+    capacity: BTreeMap<String, usize>,
 }
 
 impl StackRooms {
-    /// The tensors `names` held as rooms on `stream`'s device.
+    /// The tensors `names` held as rooms on `stream`'s device, each reserved for its rows.
     pub(crate) fn new(names: BTreeSet<String>, stream: Arc<CudaStream>) -> StackRooms {
-        StackRooms { names, stream }
+        StackRooms {
+            names,
+            stream,
+            capacity: BTreeMap::new(),
+        }
+    }
+
+    /// [`StackRooms::new`] with the stacks `capacity` names reserved for that many slots: a
+    /// capacity below a stack's uploaded rows is refused by name at the upload.
+    pub(crate) fn with_capacity(mut self, capacity: BTreeMap<String, usize>) -> StackRooms {
+        self.capacity = capacity;
+        self
+    }
+
+    /// The slots stack `name` is reserved for, when the capacity names it.
+    fn capacity_of(&self, name: &str) -> Option<usize> {
+        self.capacity.get(name).copied()
     }
 }
 
@@ -1524,7 +1544,7 @@ fn upload_segment(
         Some(list) if info.dims.len() == 3 => list.ids().iter().map(|&e| all[e as usize]).collect(),
         _ => all,
     });
-    let (dw, room) = upload_rows_in(
+    let (dw, room, backed) = upload_rows_in(
         stream,
         ring,
         (PLACED, format, rooms),
@@ -1533,13 +1553,13 @@ fn upload_segment(
         &src,
         scale,
     )?;
-    if u64::try_from(dw.resident_bytes()).ok() != Some(seg.resident_bytes) {
+    // The plan sums the rows it places: a stack's backed rows, not the capacity it reserves.
+    if backed != seg.resident_bytes {
         // The upload's copies may still be running into the buffers this
         // error is about to drop; drain before they do.
         let _ = stream.synchronize();
         let detail = format!(
-            "uploaded {} device bytes, the plan has {}",
-            dw.resident_bytes(),
+            "uploaded {backed} device bytes of backed rows, the plan has {}",
             seg.resident_bytes
         );
         if room.is_some() {
@@ -1653,7 +1673,7 @@ fn upload_rows_in(
     rows: usize,
     src: &[&[u8]],
     scale: Option<Vec<f32>>,
-) -> Result<(DevWeight, Option<StackRoom>), GpuError> {
+) -> Result<(DevWeight, Option<StackRoom>, u64), GpuError> {
     let (what, format, rooms) = at;
     let mut made = None;
     let name = t.name.as_str();
@@ -1662,7 +1682,7 @@ fn upload_rows_in(
         .then(|| format.resident_bytes(t.ty, t.dims[0], rows as u64))
         .flatten()
         .zip(usize::try_from(t.dims[0]).ok());
-    let Some((size, k)) = layout else {
+    let Some((_, k)) = layout else {
         let detail = format!(
             "tensor {name}: {rows} of its {all_rows} rows of {} {} values have no {format:?} layout",
             t.dims[0], t.ty
@@ -1676,6 +1696,41 @@ fn upload_rows_in(
         let detail = format!("tensor {name} holds {held} bytes, {rows} rows need {need}");
         return Err(GpuError::shape(what, detail));
     };
+    if let Some(slots) = rooms.and_then(|r| r.capacity_of(name))
+        && format != CardFormat::KQuant
+    {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "tensor {name}: a capacity of {slots} slots on a {format:?} stack: only a stack \
+                 uploaded as file blocks is a room the residency machine fills"
+            ),
+        ));
+    }
+    // A capacity counts expert slots, an upload counts rows: a slot is the stack's `dims[1]`
+    // rows. A stack no capacity names is reserved for its uploaded rows alone.
+    let capacity = match rooms
+        .filter(|r| r.names.contains(name))
+        .and_then(|r| r.capacity_of(name))
+    {
+        Some(slots) => {
+            let per = usize::try_from(t.dims.get(1).copied().unwrap_or(1))
+                .map_err(|_| GpuError::shape(what, format!("tensor {name}: rows pass usize")))?;
+            elastic::stack_rows(slots, per).ok_or_else(|| {
+                GpuError::shape(
+                    what,
+                    format!("tensor {name}: {slots} slots of {per} rows pass usize"),
+                )
+            })?
+        }
+        None => rows,
+    };
+    if capacity < rows {
+        return Err(GpuError::shape(
+            what,
+            format!("tensor {name}: a capacity of {capacity} rows below its {rows} uploaded rows"),
+        ));
+    }
     let dw = match format {
         // The gates' packing verbatim (gate_p1/gate_p9): the whole row span as
         // one word stream, so the kernels' byte-offset row addressing sees
@@ -1693,7 +1748,13 @@ fn upload_rows_in(
             let cols = words / rows;
             let (w, room) = match rooms.filter(|r| r.names.contains(name)) {
                 Some(r) => {
-                    let (w, room) = StackRoom::tensor(Arc::clone(&r.stream), rows, cols, what)?;
+                    let (w, room) = StackRoom::tensor_backed(
+                        Arc::clone(&r.stream),
+                        capacity,
+                        cols,
+                        rows,
+                        what,
+                    )?;
                     (w, Some(room))
                 }
                 None => (DeviceTensor::<u32>::zeroed(stream, rows, cols)?, None),
@@ -1846,21 +1907,34 @@ fn upload_rows_in(
         }
     };
     // An nvfp4 tensor's scales sit beside its planes, one f32 an expert (a
-    // dense tensor's one): the planner's third buffer of it.
-    let size = match &dw {
+    // dense tensor's one): the planner's third buffer of it. A stack held as a room
+    // reserves its capacity rows ([`CardFormat::stack_bytes`]): the buffer's length is the
+    // reserved bytes, the plan's the backed ones.
+    let scales = match &dw {
         DevWeight::Nvfp4 { scales, .. } | DevWeight::Nvfp4Stack { scales, .. } => {
-            size + 4 * scales.rows() as u64
+            4 * scales.rows() as u64
         }
-        _ => size,
+        _ => 0,
     };
-    if u64::try_from(dw.resident_bytes()).ok() != Some(size) {
+    let bytes = format
+        .stack_bytes(t.ty, t.dims[0], capacity as u64, rows as u64)
+        .map(|b| (b.reserved + scales, b.backed + scales));
+    let Some((reserved, backed)) = bytes else {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "tensor {name}: {capacity} rows reserved, {rows} backed have no {format:?} layout"
+            ),
+        ));
+    };
+    if u64::try_from(dw.resident_bytes()).ok() != Some(reserved) {
         // The upload's copies may still be running into the buffers this
         // error is about to drop; drain before they do.
         let _ = stream.synchronize();
         let err = GpuError::shape(
             what,
             format!(
-                "tensor {name}: {format:?} upload holds {} device bytes, its layout {size}",
+                "tensor {name}: {format:?} upload holds {} device bytes, its layout {reserved}",
                 dw.resident_bytes()
             ),
         );
@@ -1869,7 +1943,7 @@ fn upload_rows_in(
         }
         return Err(err);
     }
-    Ok((dw, made))
+    Ok((dw, made, backed))
 }
 
 /// [`upload_rows_in`] with every stack a plain buffer, the weight alone.
@@ -1887,7 +1961,7 @@ fn upload_rows(
     src: &[&[u8]],
     scale: Option<Vec<f32>>,
 ) -> Result<DevWeight, GpuError> {
-    let (dw, _) = upload_rows_in(stream, ring, (what, format, None), t, rows, src, scale)?;
+    let (dw, _, _) = upload_rows_in(stream, ring, (what, format, None), t, rows, src, scale)?;
     Ok(dw)
 }
 

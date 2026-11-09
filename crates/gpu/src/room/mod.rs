@@ -60,6 +60,7 @@ use cuda_core::{CudaStream, DeviceBuffer, DriverError};
 use crate::GpuError;
 use crate::tensor::DeviceTensor;
 
+pub(crate) mod elastic;
 pub(crate) mod host;
 pub(crate) mod kv;
 
@@ -520,6 +521,16 @@ impl Room {
         };
         self.reach = 0;
         Ok(())
+    }
+
+    /// The device bytes [`Room::restore`]`(from, to)` would back: the pages
+    /// that hold a byte of `[from, to)` and map the spare.
+    pub(crate) fn unbacked_bytes(&self, from: usize, to: usize) -> u64 {
+        let end = to.div_ceil(self.page).min(self.pages.len());
+        let pages = (from / self.page..end)
+            .filter(|&i| self.own(i).is_none())
+            .count();
+        (pages * self.page) as u64
     }
 
     /// The device bytes of the pages wholly at or past byte `byte` of the
@@ -1023,11 +1034,13 @@ impl<V: Views> Drop for Roomed<V> {
 }
 
 /// One routed expert stack held as a room: its buffer is reserved whole and
-/// every page of it backed at load, so with nothing released its address,
-/// length and bytes are a plain buffer's. A residency machine gives back the
-/// pages wholly at or past a slot of the stack ([`StackRoom::release_from`]) and
-/// backs them again ([`StackRoom::restore`]); the range stays reserved, and
-/// the pages given back map the device's spare page. The buffer
+/// its pages backed at load, every one ([`StackRoom::new`]) or a prefix of them
+/// ([`StackRoom::with_backed`]: the slots a plan filled, the rest reserved for a
+/// fill), so with nothing released its address, length and bytes are a plain
+/// buffer's. A residency machine gives back the pages wholly at or past a slot
+/// of the stack ([`StackRoom::release_from`]) and backs them again
+/// ([`StackRoom::restore`]); the range stays reserved, and the pages given back
+/// or never backed map the device's spare page. The buffer
 /// [`StackRoom::new`] returns is a view over the room's range: its holder
 /// takes it apart without a free (`DeviceBuffer::into_raw_parts`) before the
 /// room drops, as [`Views::dissolve`] does for a store's.
@@ -1048,6 +1061,27 @@ impl StackRoom {
         words: usize,
         what: &'static str,
     ) -> Result<(DeviceBuffer<u32>, StackRoom), GpuError> {
+        StackRoom::with_backed(stream, words, words, what)
+    }
+
+    /// [`StackRoom::new`] over `words` words with only the pages that hold a
+    /// byte of the first `backed` words backed and zeroed: the rest of the
+    /// range is reserved and maps the spare until a restore backs it
+    /// ([`StackRoom::restore`], the machine's fill), and counts as released
+    /// ([`StackRoom::released`]) from the start. `backed` past `words` is
+    /// refused by name.
+    pub fn with_backed(
+        stream: Arc<CudaStream>,
+        words: usize,
+        backed: usize,
+        what: &'static str,
+    ) -> Result<(DeviceBuffer<u32>, StackRoom), GpuError> {
+        if backed > words {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{what}: {backed} words backed of a stack of {words}"),
+            ));
+        }
         let bytes = words
             .checked_mul(size_of::<u32>())
             .ok_or_else(|| GpuError::shape(WHAT, format!("{words} words pass usize")))?;
@@ -1058,14 +1092,23 @@ impl StackRoom {
             rows: 1,
         }];
         let mut roomed = Roomed::<DeviceBuffer<u32>>::with_backing(
-            stream,
+            Arc::clone(&stream),
             words,
             &whole,
             what,
             Backing::Card,
             |[b]| b,
         )?;
-        roomed.fill()?;
+        let unbacked = if backed == words {
+            roomed.fill()?;
+            0
+        } else {
+            let [room] = roomed.rooms_mut() else {
+                return Err(GpuError::state(WHAT, "a stack room holds one room"));
+            };
+            room.restore(0, backed * size_of::<u32>(), &stream)?;
+            room.whole().saturating_sub(room.mapped()) as u64
+        };
         let mut view = None;
         let room = roomed.map(|b| view = Some(b));
         let view = view.ok_or_else(|| GpuError::state(WHAT, "the stack's buffer"))?;
@@ -1073,26 +1116,28 @@ impl StackRoom {
             view,
             StackRoom {
                 room: Mutex::new(room),
-                released: AtomicU64::new(0),
+                released: AtomicU64::new(unbacked),
             },
         ))
     }
 
-    /// A `rows × cols` tensor of words held as a room: [`StackRoom::new`]
-    /// over `rows · cols` words, the buffer owned by the tensor. The tensor
-    /// is a view over the room's range; its holder takes it apart without a
-    /// free (`DeviceTensor::into_buf`, then `DeviceBuffer::into_raw_parts`)
-    /// before the room drops.
-    pub(crate) fn tensor(
+    /// A `rows × cols` tensor of words held as a room ([`StackRoom::with_backed`]
+    /// over `rows · cols` words, the pages of the first `backed` rows backed: a
+    /// stack of `rows` slots a plan filled `backed` of), the buffer owned by the
+    /// tensor. The tensor is a view over the room's range; its holder takes it
+    /// apart without a free (`DeviceTensor::into_buf`, then
+    /// `DeviceBuffer::into_raw_parts`) before the room drops.
+    pub(crate) fn tensor_backed(
         stream: Arc<CudaStream>,
         rows: usize,
         cols: usize,
+        backed: usize,
         what: &'static str,
     ) -> Result<(DeviceTensor<u32>, StackRoom), GpuError> {
         let words = rows
             .checked_mul(cols)
             .ok_or_else(|| GpuError::shape(WHAT, format!("{rows} × {cols} words pass usize")))?;
-        let (buf, room) = StackRoom::new(stream, words, what)?;
+        let (buf, room) = StackRoom::with_backed(stream, words, backed * cols, what)?;
         // The buffer holds exactly `rows · cols` words, so the tensor takes it whole.
         let w = DeviceTensor::from_buf(buf, rows, cols)?;
         Ok((w, room))
@@ -1126,6 +1171,12 @@ impl StackRoom {
         })
     }
 
+    /// The device bytes [`StackRoom::restore`]`(from, to)` would back: the
+    /// pages holding a byte of `[from, to)` that map the spare.
+    pub fn unbacked(&self, from: usize, to: usize) -> Result<u64, GpuError> {
+        self.with(|r| Ok(r.unbacked_bytes(from, to)))
+    }
+
     /// Fresh memory, zeroed on `stream` in stream order, for every page that
     /// holds a byte of `[from, to)` and maps the spare: the device bytes
     /// backed ([`Room::restore`]).
@@ -1145,7 +1196,8 @@ impl StackRoom {
         self.restore(from, usize::MAX, stream)
     }
 
-    /// Device bytes of the pages given back and not backed again.
+    /// Device bytes of the pages given back or never backed and not backed
+    /// since.
     pub fn released(&self) -> u64 {
         self.released.load(Ordering::Relaxed)
     }

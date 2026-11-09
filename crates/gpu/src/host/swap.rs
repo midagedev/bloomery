@@ -524,6 +524,15 @@ pub trait SwapSource: Send + Sync {
         Ok(0)
     }
 
+    /// The device bytes [`SwapSource::restore_stacks`]`(layer, from, to)`
+    /// would back: the pages of layer `layer`'s stacks that hold a byte of
+    /// slots `from..to` and gave their memory back or never had it. 0 by
+    /// default, and for a source whose stacks are plain buffers.
+    fn restore_stack_bytes(&self, layer: usize, from: usize, to: usize) -> Result<u64, GpuError> {
+        let _ = (layer, from, to);
+        Ok(0)
+    }
+
     /// Back again, zeroed on `stream` in stream order, every page of layer
     /// `layer`'s stacks that holds a byte of slots `from..to` and gave its
     /// memory back: the device bytes backed. Nothing by default.
@@ -1722,6 +1731,15 @@ pub struct Freed {
     pub layers: Vec<(usize, Released)>,
 }
 
+/// What [`SwapMachine::fill_bytes`] restored: `k` slots a layer, the device
+/// bytes their pages took, and per layer the bytes backed there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filled {
+    pub k: usize,
+    pub bytes: u64,
+    pub layers: Vec<(usize, u64)>,
+}
+
 /// What a prompt call asks of the machine ([`SwapMachine::begin_call`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallCfg {
@@ -1938,6 +1956,9 @@ struct Layout {
     tier: Vec<Vec<u32>>,
     pinned: Vec<usize>,
     freed: Vec<(usize, u32)>,
+    /// Per layer, the slots past the live experts the stacks are reserved
+    /// for: withdrawn until a fill restores them.
+    withdrawn: Vec<usize>,
 }
 
 /// A flip live at a boundary as the ledger holds it.
@@ -2044,8 +2065,11 @@ impl SwapMachine {
     /// slot takes no part. `view` and the stacks stay allocated and in place
     /// until the machine is dropped and its copy stream has drained.
     ///
-    /// Refused by name: a layer whose stage card capacity is not its live
-    /// count, a layer with card slots fewer than `pinned + spares + 1`, a
+    /// A layer whose stage card capacity passes its live count has its slots
+    /// past the live ones withdrawn from the start (`SlotMap::reserve_card`:
+    /// the stacks reserved for a fill, [`SwapMachine::fill_bytes`]).
+    /// Refused by name: a layer whose live experts are not its first slots,
+    /// a layer with live card slots fewer than `pinned + spares + 1`, a
     /// delay of 0, a pinned list of another length, a view of another
     /// length, a `top_k` of 0 or past [`TALLY_TOP_K`], and a part not a
     /// whole number of words. A freed expert the host does not serve from
@@ -2155,7 +2179,12 @@ impl SwapMachine {
         let events = (0..layers.len() * cfg.params.spares)
             .map(|_| ctx.new_event(None))
             .collect::<Result<Vec<_>, _>>()?;
-        let ledger = SlotLedger::of_map(slots)?;
+        let mut ledger = SlotLedger::of_map(slots)?;
+        for (l, &reserved) in layers.clone().zip(&layout.withdrawn) {
+            let row = ledger.row_mut(l);
+            let at = row.len() - reserved;
+            row[at..].fill(SlotState::Withdrawn);
+        }
         let copy = crate::role_stream(ctx, crate::StreamRole::Background)?;
         let boundary_event = ctx.new_event(None)?;
         let call_landed = (0..layers.len())
@@ -2241,17 +2270,18 @@ impl SwapMachine {
             tier: Vec::with_capacity(layers.len()),
             pinned: Vec::with_capacity(layers.len()),
             freed: Vec::new(),
+            withdrawn: Vec::with_capacity(layers.len()),
         };
         for (i, l) in layers.enumerate() {
             let (cap, live) = (slots.capacity(l)?, slots.on_card(l)?);
-            if cap != live {
+            if cap < live {
                 return Err(GpuError::shape(
                     WHAT,
-                    format!(
-                        "layer {l}: {live} live experts in {cap} slots; the load's map is full"
-                    ),
+                    format!("layer {l}: {live} live experts in {cap} slots"),
                 ));
             }
+            // The live experts fill the slots from 0 (`SlotMap::of_plan`); the
+            // slots past them are the reserve a fill restores, and hold no expert.
             let mut order = vec![HOST; cap];
             let mut tier = Vec::new();
             for id in 0..n_expert as u32 {
@@ -2261,24 +2291,35 @@ impl SwapMachine {
                     Some(Slot::Host) | None => {}
                 }
             }
+            if order[..live].contains(&HOST) || order[live..].iter().any(|&id| id != HOST) {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "layer {l}: {live} live experts in {cap} slots are not its first {live}; \
+                         the load's map holds a gap"
+                    ),
+                ));
+            }
+            order.truncate(live);
             out.tier.push(tier);
-            if cap == 0 {
+            out.withdrawn.push(cap - live);
+            if live == 0 {
                 out.order.push(Vec::new());
                 out.pinned.push(0);
                 continue;
             }
-            if cap < pinned[i] + spares + 1 {
+            if live < pinned[i] + spares + 1 {
                 return Err(GpuError::shape(
                     WHAT,
                     format!(
-                        "layer {l}: {cap} card slots for {} pinned, {spares} spare and one that \
+                        "layer {l}: {live} card slots for {} pinned, {spares} spare and one that \
                          moves",
                         pinned[i]
                     ),
                 ));
             }
             out.freed
-                .extend(order[cap - spares..].iter().map(|&id| (l, id)));
+                .extend(order[live - spares..].iter().map(|&id| (l, id)));
             out.order.push(order);
             out.pinned.push(pinned[i]);
         }
@@ -3772,14 +3813,7 @@ impl SwapMachine {
             return Err(GpuError::shape(WHAT, "0 bytes: name the bytes to free"));
         }
         let source = Arc::clone(&self.shared.source);
-        let held: Vec<usize> = self
-            .layers
-            .clone()
-            .filter(|&l| {
-                !source.part_bytes(l).is_empty()
-                    && self.ledger.row(l).is_some_and(|r| !r.is_empty())
-            })
-            .collect();
+        let held = self.held_layers();
         if held.is_empty() {
             return Err(GpuError::shape(
                 WHAT,
@@ -3832,6 +3866,131 @@ impl SwapMachine {
         Ok(out)
     }
 
+    /// The layers whose stage stacks the machine holds: those the source
+    /// names expert parts for and the ledger has a row of.
+    fn held_layers(&self) -> Vec<usize> {
+        let source = &self.shared.source;
+        self.layers
+            .clone()
+            .filter(|&l| {
+                !source.part_bytes(l).is_empty()
+                    && self.ledger.row(l).is_some_and(|r| !r.is_empty())
+            })
+            .collect()
+    }
+
+    /// The elastic quantum's terms: the layers the machine holds stage stacks
+    /// of and the bytes one slot takes, the ring's slot (the widest layer's
+    /// parts). `None` when it holds none.
+    #[must_use]
+    pub fn quantum(&self) -> Option<(u64, u64)> {
+        let layers = self.held_layers().len();
+        (layers > 0).then(|| (layers as u64, self.shared.ring.slot_bytes() as u64))
+    }
+
+    /// The withdrawn slots the card's free bytes can take back: the same
+    /// lowest `k` withdrawn slots restored on every layer of the machine that
+    /// holds stage stacks ([`SwapMachine::restore_tail`] on each), the largest
+    /// `k` within every layer's withdrawn count whose pages
+    /// ([`SwapSource::restore_stack_bytes`] over each layer's slots from its
+    /// capacity through `k` more) back at most `bytes` device bytes: the
+    /// other half of [`SwapMachine::free_bytes`], what a fill after a
+    /// measurement of the card asks for. `Ok` with `k` of 0 when no layer has
+    /// a withdrawn slot, or the first slot's pages pass `bytes`. Refused by
+    /// name, the machine unchanged: a broken machine, `bytes` of 0, a machine
+    /// with no layer of stacks, and every refusal the restore of a layer
+    /// makes at that `k`, all checked before the first layer restores. An
+    /// error while the layers restore leaves the layers restored before it
+    /// restored.
+    pub fn fill_bytes(&mut self, bytes: u64) -> Result<Filled, GpuError> {
+        const WHAT: &str = "SwapMachine::fill_bytes";
+        self.refuse_if_broken(WHAT)?;
+        if bytes == 0 {
+            return Err(GpuError::shape(WHAT, "0 bytes: name the bytes to fill"));
+        }
+        let source = Arc::clone(&self.shared.source);
+        let held = self.held_layers();
+        if held.is_empty() {
+            return Err(GpuError::shape(
+                WHAT,
+                "no layer of the machine holds stage stacks",
+            ));
+        }
+        let most = held
+            .iter()
+            .map(|&l| self.ledger.withdrawn(l))
+            .min()
+            .unwrap_or(0);
+        let mut found = 0;
+        let mut backing = 0u64;
+        for k in 1..=most {
+            let mut sum = 0u64;
+            for &l in &held {
+                let len = self.ledger.row(l).map_or(0, <[SlotState]>::len);
+                let at = len - self.ledger.withdrawn(l);
+                sum += source.restore_stack_bytes(l, at, at + k)?;
+            }
+            if sum > bytes {
+                break;
+            }
+            found = k;
+            backing = sum;
+        }
+        let mut out = Filled {
+            k: found,
+            bytes: backing,
+            layers: Vec::new(),
+        };
+        if found == 0 {
+            return Ok(out);
+        }
+        for &l in &held {
+            self.restore_checked(l, found, WHAT)?;
+        }
+        for &l in &held {
+            let backed = self.restore_tail_backed(l, found)?;
+            out.layers.push((l, backed));
+        }
+        Ok(out)
+    }
+
+    /// [`SwapMachine::restore_tail`]'s refusals, checked without a change.
+    fn restore_checked(&self, layer: usize, k: usize, what: &'static str) -> Result<(), GpuError> {
+        if self.call.is_some() {
+            return Err(GpuError::state(
+                what,
+                "a prompt call is open: retry at the next boundary, after end_call",
+            ));
+        }
+        self.rule_layer(layer, what)?;
+        let row = self.ledger.row(layer).unwrap_or(&[]);
+        if self.shared.source.part_bytes(layer).is_empty() || row.is_empty() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "layer {layer}: the machine takes no part in it (no expert parts or no card \
+                     slot)"
+                ),
+            ));
+        }
+        if k == 0 {
+            return Err(GpuError::shape(what, "a k of 0: name the slots to restore"));
+        }
+        let withdrawn = self.ledger.withdrawn(layer);
+        let at = row.len() - withdrawn;
+        if withdrawn < k || row[at..].iter().any(|s| !matches!(s, SlotState::Withdrawn)) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "layer {layer}: {k} slots to restore over {withdrawn} withdrawn, the \
+                     withdrawn tail {:?}",
+                    &row[at..]
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// The lowest `k` withdrawn slots of layer `layer` — the ones nearest
     /// its live slots, what an unmapped tail remaps first — back to `Spare`
     /// ([`SwapMachine::release_tail`]'s other half), so the withdrawn stay
@@ -3846,51 +4005,29 @@ impl SwapMachine {
     /// stream ([`SwapSource::restore_stacks`]): a failure to back them leaves
     /// the rule and the ledger as they were, the pages backed so far backed.
     pub fn restore_tail(&mut self, layer: usize, k: usize) -> Result<(), GpuError> {
+        self.restore_tail_backed(layer, k).map(|_| ())
+    }
+
+    /// [`SwapMachine::restore_tail`], returning the device bytes the pages
+    /// backed again took.
+    fn restore_tail_backed(&mut self, layer: usize, k: usize) -> Result<u64, GpuError> {
         const WHAT: &str = "SwapMachine::restore_tail";
         self.refuse_if_broken(WHAT)?;
-        if self.call.is_some() {
-            return Err(GpuError::state(
-                WHAT,
-                "a prompt call is open: retry at the next boundary, after end_call",
-            ));
-        }
+        self.restore_checked(layer, k, WHAT)?;
         let l = self.rule_layer(layer, WHAT)?;
-        let row = self.ledger.row(layer).unwrap_or(&[]);
-        if self.shared.source.part_bytes(layer).is_empty() || row.is_empty() {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "layer {layer}: the machine takes no part in it (no expert parts or no card \
-                     slot)"
-                ),
-            ));
-        }
-        if k == 0 {
-            return Err(GpuError::shape(WHAT, "a k of 0: name the slots to restore"));
-        }
-        let len = row.len();
-        let withdrawn = self.ledger.withdrawn(layer);
-        let at = len - withdrawn;
-        if withdrawn < k || row[at..].iter().any(|s| !matches!(s, SlotState::Withdrawn)) {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "layer {layer}: {k} slots to restore over {withdrawn} withdrawn, the \
-                     withdrawn tail {:?}",
-                    &row[at..]
-                ),
-            ));
-        }
+        let len = self.ledger.row(layer).map_or(0, <[SlotState]>::len);
+        let at = len - self.ledger.withdrawn(layer);
         // The pages first, zeroed on the copy stream ahead of any fill of the slots: a
         // refusal to back them leaves the rule and the ledger as they were.
-        self.shared
+        let backed = self
+            .shared
             .source
             .restore_stacks(layer, at, at + k, &self.copy)?;
         self.rule.give(l, k).map_err(|e| rule_err(WHAT, e))?;
         for st in &mut self.ledger.row_mut(layer)[at..at + k] {
             *st = SlotState::Spare;
         }
-        Ok(())
+        Ok(backed)
     }
 
     /// Open a prompt call on the engine stream `stream`, inside the pass the
