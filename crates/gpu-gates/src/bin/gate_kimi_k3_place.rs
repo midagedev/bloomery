@@ -97,8 +97,10 @@
 //! - `room`: the stores' rooms of that whole-card K3.1 body (a latent layer's cached rows and
 //!   index key rows, the buffers `Hparams::pos_bufs` declares) map no page on a fresh load, the
 //!   pages of the rows the prompt and the steps reached on the card alone (`room_mapped`: some,
-//!   none on the host), and none after a reset. Mutants (`.mutants/kvc-k31-*.patch`): `reset`
-//!   leaves the pages mapped, the passes and the step fit no row (the pages never map, the rows
+//!   none on the host), the same pages after a first reset (a settle keeps the pages the
+//!   sequence it ends reached, `Room::settle`; V4.1's `Seq::clear` and Qwen3.8's reset are the
+//!   same call), and none after a second reset (it ends an empty sequence). Mutants
+//!   (`.mutants/kvc-k31-*.patch`): `reset` leaves the pages mapped (the second reset keeps them), the passes and the step fit no row (the pages never map, the rows
 //!   read the spare).
 //!
 //! - `kvspill`: the plan of the K3.1 fixture under `BLOOMERY_KV_HOST=spill` with a floor counts
@@ -1548,19 +1550,21 @@ mod gate {
     /// Clause `room` (the module doc): the stores' rooms of the whole-card K3.1 body back no
     /// page before a row is written (`fresh`), the pages of the rows a prompt and its steps
     /// reached on the card alone after them (`used`: some, none on the host, the load having no
-    /// spill), and none again after a reset (`settled`).
+    /// spill), the same pages after a reset (`kept`: a settle keeps the pages the sequence it ends
+    /// reached), and none after a second reset (`settled`, which ends an empty sequence).
     fn room_line(
         fresh: (usize, usize),
         used: (usize, usize),
+        kept: (usize, usize),
         settled: (usize, usize),
     ) -> Result<bool, GateError> {
         tier::sc("room: the stores' pages are backed as far as the positions written reach")?;
         Ok(line(
-            fresh == (0, 0) && used.0 > 0 && used.1 == 0 && settled == (0, 0),
+            fresh == (0, 0) && used.0 > 0 && used.1 == 0 && kept == used && settled == (0, 0),
             "room",
             &format!(
                 "mapped (card, host) bytes: fresh {fresh:?}, after the prompt and {STEPS} steps \
-                 {used:?}, after a reset {settled:?}"
+                 {used:?}, after a reset {kept:?}, after a second reset {settled:?}"
             ),
         ))
     }
@@ -1636,13 +1640,15 @@ mod gate {
         let got = greedy_from(&mut m, first)?;
         let used = m.body(NAME)?.room_mapped();
         m.reset()?;
+        let kept = m.body(NAME)?.room_mapped();
+        m.reset()?;
         let settled = m.body(NAME)?.room_mapped();
         let first = m.step(&prompt)?;
         let want_pos = m.pos();
         let want = greedy_from(&mut m, first)?;
         drop((m, rows));
         pass &= past_top_k_line("whole card", on, (&got, got_pos), (&want, want_pos))?;
-        pass &= room_line(fresh, used, settled)?;
+        pass &= room_line(fresh, used, kept, settled)?;
         pass &= kv_spill(&inputs31)?;
 
         let table = split_table(&inputs31, &bp_machine(&inputs31)?, DSA_CTX as u64, header)?;
