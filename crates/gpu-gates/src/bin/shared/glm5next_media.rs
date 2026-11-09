@@ -199,6 +199,7 @@ pub mod seat {
 
     use app::Session;
     use bloomery_gpu::media::MediaSpan;
+    use bloomery_gpu_gates::beside;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::vision_seat::{
         self, Flags, Image, Opened, PleImage, Resident, TextFacts,
@@ -281,6 +282,32 @@ pub mod seat {
         .ok_or_else(|| "--mmproj opened no encoder".into())
     }
 
+    /// The gate's tower, read before the session opens (host only: the file's header and tensor
+    /// table): the plan of that session reserves [`Opened::card`]'s total on the stage card as the
+    /// image encoder ([`beside::Beside`]), and [`clauses`] loads the tower against that reserve.
+    ///
+    /// # Errors
+    /// The file's refusal, or a seat that is not a stage reserve: the gate's census is one card, on
+    /// which the tower is the plan's reserve, never off it.
+    pub fn tower(
+        mmproj: &Path,
+        n_embd: usize,
+        vocab: &dyn Fn(u32) -> Option<String>,
+    ) -> Result<Opened, GateError> {
+        let at = opened(mmproj, CAP, n_embd, vocab)?;
+        if at.seat.reserve != Some(at.card.total()) {
+            return Err(format!(
+                "(sm) the tower sits {} on {} and the gate plans one card: its {} B must be the stage \
+                 card's image-encoder reserve",
+                at.seat.word(),
+                at.seat.name,
+                at.card.total()
+            )
+            .into());
+        }
+        Ok(at)
+    }
+
     /// The call's ids: text, then each image as the server expands its placeholder (`<|begin_of_image|>`,
     /// `span_len` image tokens, `<|end_of_image|>`) with text after it; and each span's first position.
     fn call(images: &[Prepared]) -> (Vec<u32>, Vec<usize>) {
@@ -318,8 +345,28 @@ pub mod seat {
         mmproj: &Path,
         n_embd: usize,
         vocab: &dyn Fn(u32) -> Option<String>,
+        at: &Opened,
     ) -> Result<bool, GateError> {
-        let at = opened(mmproj, CAP, n_embd, vocab)?;
+        // The session was planned with the tower's bytes as the stage card's image-encoder
+        // reserve ([`tower`]); a plan without them would make the tower's bytes unplanned.
+        let held = s
+            .model()
+            .plan_card()
+            .and_then(|p| {
+                p.card
+                    .reserves
+                    .iter()
+                    .find(|(n, _)| n == beside::IMAGE_ENCODER)
+            })
+            .map(|&(_, bytes)| bytes);
+        if held != Some(at.card.total()) {
+            return Err(format!(
+                "(sm) the session's plan holds {held:?} B as the image encoder's reserve, the tower \
+                 needs {} B",
+                at.card.total()
+            )
+            .into());
+        }
         println!(
             "(sm) encoder file {}: seat {} on {}, cap {} tokens, card figure {} B",
             at.path.display(),
@@ -337,7 +384,7 @@ pub mod seat {
             ),
         )?;
         let ctx = s.model().gpu().context().clone();
-        let mut tower = Resident::open(&ctx, &at)?;
+        let mut tower = Resident::open(&ctx, at)?;
         let images: Vec<Prepared> = SIZES
             .iter()
             .enumerate()

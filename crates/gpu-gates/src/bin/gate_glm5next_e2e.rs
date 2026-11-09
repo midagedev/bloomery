@@ -489,6 +489,7 @@ mod gate {
     use bloomery_gpu::site::{Form, SiteTy};
     use bloomery_gpu::weights::DevWeight;
     use bloomery_gpu_gates::act_rule::Arm;
+    use bloomery_gpu_gates::beside::{self, Beside};
     use bloomery_gpu_gates::flip::{self, Flip, tie_allowed};
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
@@ -736,9 +737,24 @@ mod gate {
         prefill: PrefillMode,
         lanes: KdaLanes,
     ) -> Result<(Session<Body>, Opened), GateError> {
+        open_beside(levers, ctx, prefill, lanes, Beside::default())
+    }
+
+    /// [`open`] with `beside`'s reserves on the stage card ([`beside::reserve_on`]) and, in the
+    /// fixture tier, the same bytes added to the header's budget so the experts stay the
+    /// fixture's: a model the gate loads on the card after the open (the image encoder's tower)
+    /// is a named term of the plan the reading counts.
+    fn open_beside(
+        levers: &bloomery_levers::Levers,
+        ctx: usize,
+        prefill: PrefillMode,
+        lanes: KdaLanes,
+        beside: Beside,
+    ) -> Result<(Session<Body>, Opened), GateError> {
         let file = glm5next_tier::open()?;
+        let held: u64 = beside.named().map(|(_, bytes)| bytes).sum();
         let cfg = GlmCfg {
-            place: glm5next_tier::plan_levers(levers, 0)?,
+            place: glm5next_tier::plan_levers(levers, held)?,
             host: levers.host(),
             prefill,
             group: 1,
@@ -753,7 +769,7 @@ mod gate {
         };
         let args = OpenArgs {
             place: "gate",
-            machine: crate::gate_card::plan_gate,
+            machine: beside::with_reserve(crate::gate_card::plan_gate, beside),
             ctx,
             mode: StepMode::Graph,
             cfg,
@@ -5785,9 +5801,16 @@ mod gate {
         let tok = tokenizer::Tokenizer::from_gguf(&path)?;
         let vocab = |id| tok.text(id).map(str::to_owned);
         let t = Instant::now();
-        let (mut s, _) = open(levers, CTX, PrefillMode::Batch, KdaLanes::One)?;
         let mmproj = PathBuf::from(refset::arch::glm5next::vis::PROFILE.mmproj);
-        let ok = crate::glm5next_media::seat::clauses(&mut s, &mmproj, n_embd, &vocab)?;
+        // The tower's card figure is read before the load: the plan reserves it on the stage card
+        // as the image encoder, so the first prompt's reading counts the tower the clause loads.
+        let tower = crate::glm5next_media::seat::tower(&mmproj, n_embd, &vocab)?;
+        let beside = Beside {
+            image: Some(tower.card.total()),
+            embedding: None,
+        };
+        let (mut s, _) = open_beside(levers, CTX, PrefillMode::Batch, KdaLanes::One, beside)?;
+        let ok = crate::glm5next_media::seat::clauses(&mut s, &mmproj, n_embd, &vocab, &tower)?;
         elapsed("(sm)", &t);
         Ok(ok)
     }
