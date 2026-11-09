@@ -212,12 +212,14 @@ def self_test():
         # 6 (1); window 6 (3), 7 (2), 5 (2) -> 5, 6, 7 at 2, 3, 2.
         nw, host, card = g1[2]
         assert nw == 2 and host == [[3 + 2, 2 + 3, 1 + 2]], (nw, host)
-        # PIN(2026-10-04): the plan rides the census free reading at records-refresh
+        # PIN(2026-11-10): the plan rides the census free reading at records-refresh
         # time (memguard); the plan's cap adds the context's own creation cost back to
         # it (workstation CONTEXT_SELF), so an idle card plans as its usable bytes and
-        # the context counts once. A refresh beside a held card moves card_experts and
-        # n_l — regenerate the .rec and move this pin with the card_free term it names.
-        assert plan_n_l(40)[:3] == [0, 0, 71] and sum(plan_n_l(40)) == 2668, plan_n_l(40)
+        # the context counts once. The re-dump at main 2f560a70a (the planner's moves
+        # since the last dump; the A6000's card term 49867153408 B) spreads 2662 card
+        # experts over all 40 layers, 66..67 each. A refresh beside a held card moves
+        # card_experts and n_l — regenerate the .rec and move this pin with that term.
+        assert plan_n_l(40)[:3] == [67, 67, 67] and sum(plan_n_l(40)) == 2662, plan_n_l(40)
         assert spread(5, [2, 3]) == {2: 3, 3: 2}
         try:
             build_set(rc.read_manifest(wu._fake_set(root, "nochunk", {0: rows}, 8, 2)), [2], (1,), batch=2)
