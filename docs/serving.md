@@ -86,6 +86,14 @@ the card (or the host, or the unified pool of a DGX Spark), the slot takes the l
 holds, a multiple of 1,024 down to 4,096. The `ctx` line names the rule: `set`, `target` or `fitted`. A context you
 set is never cut: one that does not fit is refused by name, with the largest one that does.
 
+**The K/V of the context (Qwen3.8).** The Qwen3.8 seat does not hold the whole context's K/V on the card up front: with the
+levers unset it spreads its routed experts at a floor of 8,192 positions (`BLOOMERY_KV_FLOOR`; a context of 8,192 or fewer
+has none) and backs a K/V page on the host once the card's free bytes would fall below the plan's margin
+(`BLOOMERY_KV_HOST=spill`). The rest of the card holds experts, and a sequence that grows past the floor pays host
+pages instead of an expert's room. `BLOOMERY_KV_FLOOR=off` and `BLOOMERY_KV_HOST=off` give the plan of the whole
+context on the card's own memory; `BLOOMERY_KV_HOST=all` (every plane page on the host) is opt-in. The `plan` line
+prints `kv_floor=` and `kv_host=`.
+
 **`--slot-ctx S`** names one request's context apart from the slot count: `--parallel 4 --slot-ctx 32768` is the same
 load as `--parallel 4 --ctx-size 131072`. Alone it serves one slot of `S`. Beside `--ctx-size` it is refused, since
 one names the total and the other a slot's share. Every seat that takes `--parallel` takes it.

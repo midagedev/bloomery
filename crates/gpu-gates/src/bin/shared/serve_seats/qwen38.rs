@@ -105,7 +105,12 @@
 //! context's KV would have displaced come back until a sequence grows past
 //! the floor (the room fit's named refusal then, until the residency
 //! machine frees bytes for it); the `plan` line prints `kv_floor=` beside
-//! `ctx_max=`, unset the plan of the context alone. An unset MTP draft
+//! `ctx_max=`. Unset the floor is 8,192 positions (none where the context is
+//! no more) and `BLOOMERY_KV_HOST` is `spill`, so the K/V grows past the floor
+//! on the host once the card's margin is reached; `BLOOMERY_KV_FLOOR=off` and
+//! `BLOOMERY_KV_HOST=off` give the plan of the context alone (a device that cannot
+//! back a host page takes `off` for an unset `BLOOMERY_KV_HOST`, with a stderr line
+//! saying so). An unset MTP draft
 //! yields to the
 //! context:
 //! when the drafted plan fits a context at most half the one the plain plan
@@ -490,7 +495,7 @@ use bloomery_gpu_gates::residency38::{
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, side_seat, vision_seat};
 use bloomery_levers::{
-    ChurnHosting, Draft38At, Draft38Off, Paged, Residency38At, ResidencyPick, ResidencyWhy,
+    ChurnHosting, Draft38At, Draft38Off, KvHost, Paged, Residency38At, ResidencyPick, ResidencyWhy,
     draft38_unset, residency_word_least_fewest, residency38_least_fewest, residency38_off,
     residency38_unset,
 };
@@ -1837,8 +1842,24 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
     // The page a host-capable room takes on the stage card, read once under
     // `BLOOMERY_KV_HOST`: every plan and reserve below rounds the planes at it.
-    if levers.kv_host() != bloomery_levers::KvHost::Off {
-        inputs.kv_host_page = Some(stage_host_page(stage)?);
+    // Unset, the backing is the server's default (`qwen38_levers::KV_DEFAULT`);
+    // where the device cannot stage a host page, that default is `off` by
+    // name, and a set `spill` or `all` is the refusal itself.
+    let mut kv_default = qwen38_levers::KV_DEFAULT;
+    let kv_host_set = levers.kv_host_set().and_then(KvHost::parse);
+    if kv_host_set.unwrap_or(kv_default.host) != KvHost::Off {
+        match stage_host_page(stage) {
+            Ok(page) => inputs.kv_host_page = Some(page),
+            Err(e) if kv_host_set.is_none() => {
+                eprintln!(
+                    "bloomery-serve-qwen38: BLOOMERY_KV_HOST is unset and {} cannot back a K/V \
+                     page on the host ({e}); the planes stay on the card (kv_host=off)",
+                    stage.name
+                );
+                kv_default.host = KvHost::Off;
+            }
+            Err(e) => return Err(e),
+        }
     }
     // The slot count first: it shapes the draft's window condition, the
     // context choice itself, and every plan the seat asks for, each counting
@@ -1893,7 +1914,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let lookup = levers.draft() == Some("lookup");
     let width = WidthMode::of(levers.mtp_width())?;
     let experts = experts38(&levers)?;
-    let plan_levers = PlanLevers::from_levers(&levers)?;
+    let plan_levers = PlanLevers::from_levers_with(&levers, kv_default)?;
     let tok = match folder_tok {
         Some(tok) => tok,
         None => Tokenizer::from_gguf(&path)?,

@@ -94,6 +94,12 @@ pub(crate) enum Kind {
     Words(&'static [&'static str]),
     /// A whole number from `min` to `max`.
     Count { min: u64, max: u64, trim: bool },
+    /// A whole number from `min` to `max`, or the one `word`.
+    CountOr {
+        min: u64,
+        max: u64,
+        word: &'static str,
+    },
     /// A positive whole multiple of `of`.
     Multiple { of: u64 },
     /// A byte count ([`parse_bytes`]).
@@ -181,6 +187,8 @@ impl Kind {
                 let digits = if trim { v.trim() } else { v };
                 number(whole(digits), &|n| (min..=max).contains(&n))
             }
+            Kind::CountOr { word, .. } if v == word => Ok(Value::Word(word)),
+            Kind::CountOr { min, max, .. } => number(whole(v), &|n| (min..=max).contains(&n)),
             Kind::Multiple { of } => number(whole(v), &|n| n > 0 && n.is_multiple_of(of)),
             Kind::Bytes => parse_bytes(v).map(Value::Bytes).map_err(|e| match e {
                 BytesError::NotBytes(_) => refused(None),
@@ -275,6 +283,13 @@ impl Kind {
                     format!("{range}, spaces around it ignored")
                 } else {
                     range
+                }
+            }
+            Kind::CountOr { min, max, word } => {
+                if max == u64::MAX {
+                    format!("{word}, or a whole number from {min} up ({DIGITS})")
+                } else {
+                    format!("{word}, or a whole number from {min} to {max} ({DIGITS})")
                 }
             }
             Kind::Multiple { of } => format!("a positive multiple of {of} ({DIGITS})"),
@@ -515,9 +530,9 @@ pub enum MtpHead<'a> {
 pub(crate) enum Value {
     /// A [`Kind::Flag`] or [`Kind::OnOff`].
     Flag(bool),
-    /// A [`Kind::Words`] or [`Kind::PathOr`] word.
+    /// A [`Kind::Words`] or [`Kind::PathOr`] word, or a [`Kind::CountOr`]'s.
     Word(&'static str),
-    /// A [`Kind::Count`] or [`Kind::Multiple`] number.
+    /// A [`Kind::Count`], [`Kind::CountOr`] or [`Kind::Multiple`] number.
     Count(u64),
     /// A [`Kind::Bytes`] count.
     Bytes(u64),
@@ -1336,18 +1351,35 @@ impl Levers {
         self.word(QWEN3_KV)
     }
 
+    /// `BLOOMERY_KV_FLOOR` as set: [`KvFloor::At`] its positions,
+    /// [`KvFloor::Off`] for `off`, [`KvFloor::Unset`] unset and in a reading
+    /// that did not parse the lever (a binary that leaves it out refuses it
+    /// by name when set, so for it the lever is unset).
+    #[must_use]
+    pub fn kv_floor_set(&self) -> KvFloor {
+        match self.entry(KV_FLOOR).value {
+            None => KvFloor::Unset,
+            Some(Value::Word(_)) => KvFloor::Off,
+            Some(Value::Count(n)) => KvFloor::At(n),
+            ref v => panic!("{KV_FLOOR} holds {v:?}, not a count or a word"),
+        }
+    }
+
     /// `BLOOMERY_KV_FLOOR`: the positions a plan spreads its routed experts
-    /// at; `None` unset (the spread at the whole context) and in a reading
-    /// that did not parse the lever: a binary that leaves it out refuses it
-    /// by name when set, so for it the lever is unset.
+    /// at when the lever names them; `None` unset and `off`. A load whose
+    /// own rule fills in an unset lever reads [`Levers::kv_floor_set`].
     #[must_use]
     pub fn kv_floor(&self) -> Option<u64> {
-        self.count(KV_FLOOR)
+        match self.kv_floor_set() {
+            KvFloor::At(n) => Some(n),
+            KvFloor::Unset | KvFloor::Off => None,
+        }
     }
 
     /// `BLOOMERY_KV_HOST` as set: the K/V planes' backing word, `off`,
     /// `spill` or `all`; `None` unset, which a load reads as `off`
-    /// ([`Levers::kv_host`]).
+    /// ([`Levers::kv_host`]); a load with its own default for the unset
+    /// lever reads this and [`KvHost::parse`].
     #[must_use]
     pub fn kv_host_set(&self) -> Option<&'static str> {
         self.word(KV_HOST)
@@ -3015,17 +3047,28 @@ pub enum HostLanes {
     Ccd,
 }
 
+/// What [`KV_FLOOR`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvFloor {
+    /// Not set: the load's own default.
+    Unset,
+    /// `off`: the spread runs at the whole context.
+    Off,
+    /// This many positions.
+    At(u64),
+}
+
 /// Where a load's room-backed K/V planes back their pages ([`KV_HOST`]): the
 /// typed word a binary hands its plan and its stores, one value a load. The
-/// default ([`KvHost::Off`]) is the card's own memory.
+/// type's default ([`KvHost::Off`]) is the card's own memory.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KvHost {
     /// The card's own memory only, the plan and the stores before the lever.
     #[default]
     Off,
-    /// The card's memory first; a page whose card memory the driver cannot
-    /// make for lack of free bytes is backed on the host. The plan is
-    /// [`KvHost::Off`]'s.
+    /// The card's memory first; a page is backed on the host once the card's
+    /// free bytes would fall below the plan's margin (or the driver cannot
+    /// make the card's for lack of free bytes). The plan is [`KvHost::Off`]'s.
     Spill,
     /// Every plane page on the host: the plan counts the planes at no card
     /// position and against its host room instead.

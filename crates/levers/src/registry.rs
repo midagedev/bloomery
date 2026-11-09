@@ -1163,30 +1163,36 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     LeverSpec {
         name: KV_FLOOR,
         class: Class::A,
-        kind: Kind::Count {
+        kind: Kind::CountOr {
             min: 1,
             max: u32::MAX as u64,
-            trim: false,
+            word: "off",
         },
         default: Unset::Means(
-            "the whole context: the spread and every other plan term at `ctx_max`",
+            "the load's own default: the Qwen3.8 server 8,192 positions, or none where the \
+             context is no more; `generate_qwen3moe` the whole context, the spread and every \
+             other plan term at `ctx_max`",
         ),
         doc: "Placement (Qwen3.8, `generate_qwen3moe`, `bloomery-serve-qwen38` and \
               `bloomery-serve --model qwen38`): the positions a plan spreads its routed experts \
-              at, `BLOOMERY_KV_FLOOR=<positions>`. The plan's every other term stays at the \
-              context it is made at (`ctx_max`, the `--ctx` choice): the rooms' reserved range \
-              and its page rounding, the stage rows, the scratch. Unset, the spread runs at \
-              `ctx_max` itself — today's plan. Only a load whose stores hold their rows in \
-              rooms reads it: every other family's binary and file refuses it by name. A floor \
-              above the context of a plan made under it is refused by name, and nothing clamps \
-              it. A sequence that grows past the floor's bytes with a residency machine \
-              running (`BLOOMERY_RESIDENCY`) frees card bytes: the machine releases the same \
-              top slots of every layer's expert stacks, the fewest that cover the shortfall \
-              and one page within the floor of pinned + 1 live a layer, and the fit runs once \
-              more. A load with no machine, or a floor the machine cannot free enough under, \
+              at, `BLOOMERY_KV_FLOOR=<positions>`, or `off` for the whole context. The plan's \
+              every other term stays at the context it is made at (`ctx_max`, the `--ctx` \
+              choice): the rooms' reserved range and its page rounding, the stage rows, the \
+              scratch. Unset, the Qwen3.8 server spreads at 8,192 positions (a plan whose \
+              context is no more has no floor, and a set `BLOOMERY_KV_HOST=all` takes none, \
+              which plans at a zero floor itself); unset in `generate_qwen3moe`, and `off` in \
+              both, the spread runs at `ctx_max` itself. Only a load whose stores hold their \
+              rows in rooms reads it: every other family's binary and file refuses it by name, \
+              `off` too. A floor above the context of a plan made under it is refused by \
+              name, and nothing clamps it. A sequence that grows past the floor's bytes with a \
+              residency machine running (`BLOOMERY_RESIDENCY`) frees card bytes: the machine \
+              releases the same top slots of every layer's expert stacks, the fewest that cover \
+              the shortfall and one page within the floor of pinned + 1 live a layer, and the \
+              fit runs once more; under `BLOOMERY_KV_HOST=spill` the growth is host pages \
+              first. A load with no machine, or a floor the machine cannot free enough under, \
               ends in the room fit's named refusal (the store, the bytes the fit asked, the \
               device's free bytes, and the bytes the machine freed). The `plan` line prints \
-              `kv_floor=` beside `ctx_max=`.",
+              `kv_floor=` beside `ctx_max=` when a floor is in force.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
@@ -1197,37 +1203,34 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         class: Class::A,
         kind: Kind::Words(&["off", "spill", "all"]),
         default: Unset::Means(
-            "off, the card's own memory; a family whose stores are not rooms reads it unset",
+            "the load's own default: the Qwen3.8 server spill; `generate_qwen3moe` off, the \
+             card's own memory; a family whose stores are not rooms reads it unset",
         ),
         doc: "Qwen3.8's K/V planes' backing (`generate_qwen3moe`, `bloomery-serve-qwen38` and \
               `bloomery-serve --model qwen38`): where a selecting store's room backs \
-              the pages its K/V planes hold. `off` is the card's own memory, \
-              today's plan. `spill` backs a page on the host once the card's \
-              free bytes would fall below the plan's card margin by the page \
-              (or the driver cannot make the card's for lack of free bytes) — \
-              the plan is `off`'s, growth past the floor is host pages once \
-              the margin is reached, and a fit that runs out of host bytes \
-              names them (`GpuError::NoRoom`); a host page is cheaper than the \
-              residency machine freeing expert stacks for it, so under \
-              `spill` the machine's demote-for-bytes never runs for the \
-              planes. `all` \
-              holds every plane page on the host: the plan counts the planes \
-              at no card position, so the expert spread gets their bytes as \
-              `BLOOMERY_KV_FLOOR`'s floor does (the pooled keys and the raw \
-              key ring keep their card bytes, and so does the MTP draft's \
-              store), and the planes' whole bytes, page-rounded at the page a \
-              host-capable room takes, are counted against the plan's host \
-              room, refused by name past it. The planes' rows reach the device \
-              through the same pointer whatever the backing, so every run's \
-              bits are `off`'s. The pooled keys and the ring stay on the card \
-              in every setting (the indexer scans the pooled keys every \
-              step). Set with `BLOOMERY_KV_FLOOR`, `all` is refused by name \
-              (it already plans at a zero floor; two levers saying where the \
-              spread runs is ambiguous), and every family whose stores are \
-              not rooms refuses the lever set, by name, where it refuses \
-              `BLOOMERY_KV_FLOOR`. The `plan` line prints `kv_host=` beside \
-              `kv_floor=`, and the seat's `kv room` line names the host bytes \
-              the planes hold (`kv_host_bytes`).",
+              the pages its K/V planes hold. `off` is the card's own memory. `spill` backs a \
+              page on the host once the card's free bytes would fall below the plan's card \
+              margin by the page (or the driver cannot make the card's for lack of free bytes) \
+              — the plan is `off`'s, growth past the floor is host pages once the margin is \
+              reached, and a fit that runs out of host bytes names them \
+              (`GpuError::NoRoom`); a host page is cheaper than the residency machine freeing \
+              expert stacks for it, so under `spill` the machine's demote-for-bytes never \
+              runs for the planes. Unset, the Qwen3.8 server takes `spill` and \
+              `generate_qwen3moe` takes `off`. `all` is opt-in: it holds every plane page on \
+              the host: the plan counts the planes at no card position, so the expert spread \
+              gets their bytes as `BLOOMERY_KV_FLOOR`'s floor does (the pooled keys and the \
+              raw key ring keep their card bytes, and so does the MTP draft's store), and the \
+              planes' whole bytes, page-rounded at the page a host-capable room takes, are \
+              counted against the plan's host room, refused by name past it. The planes' rows \
+              reach the device through the same pointer whatever the backing, so every run's \
+              bits are `off`'s. The pooled keys and the ring stay on the card in every setting \
+              (the indexer scans the pooled keys every step). Set with a numeric \
+              `BLOOMERY_KV_FLOOR`, `all` is refused by name (it already plans at a zero floor; \
+              two levers saying where the spread runs is ambiguous), and every family whose \
+              stores are not rooms refuses the lever set, by name, where it refuses \
+              `BLOOMERY_KV_FLOOR`. The `plan` line prints `kv_host=` beside `kv_floor=`, and \
+              the seat's `kv room` line names the host bytes the planes hold \
+              (`kv_host_bytes`).",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

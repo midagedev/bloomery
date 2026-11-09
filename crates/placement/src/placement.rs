@@ -67,7 +67,7 @@ pub use machine::{
 };
 pub use models::{Role, Unimplemented};
 pub use planner::{
-    PlanLevers, plan, plan_host_routed, plan_host_routed_reserving, plan_routed,
+    KvDefault, PlanLevers, plan, plan_host_routed, plan_host_routed_reserving, plan_routed,
     plan_routed_reserving, plan_with,
 };
 pub use pool::{PoolNeed, plan_in_pool};

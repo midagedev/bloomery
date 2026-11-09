@@ -1777,7 +1777,7 @@ mod cli {
                         .into(),
                 );
             }
-            if levers.kv_floor().is_some() {
+            if levers.kv_floor_set() != bloomery_levers::KvFloor::Unset {
                 return Err(
                     "BLOOMERY_KV_FLOOR spreads a qwen4exp plan's experts at a KV floor; \
                      --dump-taps runs a qwen3moe file"
@@ -2090,7 +2090,7 @@ mod cli {
             )
             .into());
         }
-        if family != Family::Qwen38 && levers.kv_floor().is_some() {
+        if family != Family::Qwen38 && levers.kv_floor_set() != bloomery_levers::KvFloor::Unset {
             return Err(format!(
                 "BLOOMERY_KV_FLOOR spreads a qwen4exp plan's experts at a KV floor; a {} file's \
                  cache is plain device tensors, not rooms whose pages a fit backs",

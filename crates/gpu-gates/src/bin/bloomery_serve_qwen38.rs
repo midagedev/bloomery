@@ -391,7 +391,7 @@ mod tests {
             ],
         ),
         ("host_lanes", &[bloomery_levers::HOST_LANES]),
-        ("kv_host", &[bloomery_levers::KV_HOST]),
+        ("kv_host_set", &[bloomery_levers::KV_HOST]),
         ("mtp_draft", &[bloomery_levers::MTP_DRAFT]),
         ("mtp_head_rows", &[bloomery_levers::MTP_HEAD_ROWS]),
         ("mtp_width", &[bloomery_levers::MTP_WIDTH]),
@@ -407,7 +407,7 @@ mod tests {
         ("xstream", &[bloomery_levers::XSTREAM]),
     ];
 
-    /// The lever `PlanLevers::from_levers` reads for the seat's plans.
+    /// The levers `PlanLevers::from_levers_with` reads for the seat's plans.
     const PLAN_READS: &[&str] = &[bloomery_levers::CARD_BUDGET, bloomery_levers::KV_FLOOR];
 
     /// Each call of the seat that reads a Direct lever in place, with the lever.

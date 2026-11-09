@@ -11,7 +11,7 @@ use super::rule::{
 };
 use super::table::{Plan, Row};
 use super::{CardFormat, Role};
-use bloomery_levers::KvHost;
+use bloomery_levers::{KvFloor, KvHost};
 use std::sync::Arc;
 
 /// The placement's levers, which a binary parses once
@@ -37,17 +37,21 @@ pub struct PlanLevers {
     pub expert_rank: Option<Arc<ExpertRank>>,
     /// The KV floor `BLOOMERY_KV_FLOOR` sets, in positions: the context the
     /// expert spread is planned at, the plan's every other term at its own
-    /// `ctx_max`. Unset (`None`), the spread at `ctx_max` itself — the plan
-    /// made before the lever. A floor above the plan's `ctx_max` is refused
+    /// `ctx_max`. `None` with no [`PlanLevers::kv_floor_default`], the spread
+    /// at `ctx_max` itself — the plan made before the lever. A floor above the plan's `ctx_max` is refused
     /// by name ([`PlacementError::KvFloor`]). A binary whose loads hold
     /// their stores in rooms alone parses the lever; a plan handed one here
     /// is every plan that binary makes.
     pub kv_floor: Option<u64>,
+    /// The floor a plan takes when `kv_floor` is `None` and its context is
+    /// above it: [`PlanLevers::resolve_kv`] sets it from a load's default. A context no more than it plans no floor,
+    /// where a `kv_floor` above the context is refused by name.
+    pub kv_floor_default: Option<u64>,
     /// The K/V planes' backing `BLOOMERY_KV_HOST` names: `all` plans the
     /// planes ([`KvBytes::plane_bytes`]) at no card position, so the expert
     /// spread gets their bytes, and counts them against the plan's host room
     /// instead; `spill` and `off` leave the plan's card terms as they are.
-    /// Unset is [`KvHost::Off`]. `all` beside a `kv_floor` is refused by name
+    /// The type's default is [`KvHost::Off`]. `all` beside a `kv_floor` is refused by name
     /// ([`PlacementError::KvHostFloor`]): it already plans the spread at a
     /// zero card position.
     pub kv_host: KvHost,
@@ -64,9 +68,57 @@ impl PlanLevers {
                 .map(|path| ExpertRank::read(path).map(Arc::new))
                 .transpose()?,
             kv_floor: levers.kv_floor(),
+            kv_floor_default: None,
             kv_host: levers.kv_host(),
         })
     }
+
+    /// [`PlanLevers::from_levers`] for a load with its own defaults for the
+    /// K/V levers it leaves unset ([`PlanLevers::resolve_kv`]).
+    pub fn from_levers_with(
+        levers: &bloomery_levers::Levers,
+        default: KvDefault,
+    ) -> Result<PlanLevers, PlacementError> {
+        let host = levers.kv_host_set().and_then(KvHost::parse);
+        Ok(PlanLevers::from_levers(levers)?.resolve_kv(levers.kv_floor_set(), host, default))
+    }
+
+    /// `self` with the K/V levers resolved against a load's `default`: a set
+    /// `host` is its own, else `default.host`; a set floor is its own and
+    /// `off` the whole context, else `default.floor` unless the host is `all`
+    /// (a floor beside it is refused, and it plans at a zero floor itself).
+    #[must_use]
+    pub fn resolve_kv(
+        self,
+        floor: KvFloor,
+        host: Option<KvHost>,
+        default: KvDefault,
+    ) -> PlanLevers {
+        let host = host.unwrap_or(default.host);
+        let (kv_floor, kv_floor_default) = match floor {
+            KvFloor::At(n) => (Some(n), None),
+            KvFloor::Off => (None, None),
+            KvFloor::Unset if host == KvHost::All => (None, None),
+            KvFloor::Unset => (None, Some(default.floor)),
+        };
+        PlanLevers {
+            kv_floor,
+            kv_floor_default,
+            kv_host: host,
+            ..self
+        }
+    }
+}
+
+/// What a load takes for the K/V levers it leaves unset: the floor a plan
+/// spreads its experts at (a context no more than it has none) and the
+/// planes' backing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvDefault {
+    /// The positions of an unset `BLOOMERY_KV_FLOOR`.
+    pub floor: u64,
+    /// The backing of an unset `BLOOMERY_KV_HOST`.
+    pub host: KvHost,
 }
 
 /// [`plan_with`] under `levers`: the card budget, or none.
@@ -244,19 +296,22 @@ fn plan_rule<'a>(
     reserve: u64,
 ) -> Result<Plan<'a>, PlacementError> {
     // The positions the expert spread's KV term is read at: the floor the
-    // levers name, or the cap itself, so unset every term of the plan is
-    // read at `ctx_max` exactly as it was before the lever. A floor above
-    // the cap is refused by name: the spread never runs past the context
-    // the rooms' range and rows are reserved at.
-    let kv_at = match levers.kv_floor {
+    // levers name, else the default floor where the context is above it,
+    // else the cap itself, so with neither every term of the plan is read at
+    // `ctx_max` exactly as it was before the lever. A named floor above the
+    // cap is refused by name: the spread never runs past the context the
+    // rooms' range and rows are reserved at.
+    let floor_in_force = match levers.kv_floor {
         Some(floor) if floor > ctx_max => {
             return Err(PlacementError::KvFloor {
                 floor,
                 cap: ctx_max,
             });
         }
-        floor => floor.unwrap_or(ctx_max),
+        Some(floor) => Some(floor),
+        None => levers.kv_floor_default.filter(|&floor| floor < ctx_max),
     };
+    let kv_at = floor_in_force.unwrap_or(ctx_max);
     // `all` is a floor-0 plan for the planes and nothing may say another
     // floor: the two levers name where the spread runs.
     if levers.kv_host == KvHost::All
@@ -446,7 +501,7 @@ fn plan_rule<'a>(
     }
     plan.reserve_beside(reserve)?;
     plan.expert_rank = levers.expert_rank.clone();
-    plan.kv_floor = levers.kv_floor;
+    plan.kv_floor = floor_in_force;
     plan.kv_host = levers.kv_host;
     Ok(plan)
 }

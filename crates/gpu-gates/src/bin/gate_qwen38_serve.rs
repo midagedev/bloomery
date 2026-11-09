@@ -938,7 +938,8 @@ mod gate {
         };
         let (card_bytes, host_bytes, kv, draft_bytes) = match mtp {
             false => {
-                let levers_plan = PlanLevers::from_levers(levers)?;
+                let levers_plan =
+                    PlanLevers::from_levers_with(levers, crate::qwen38_levers::KV_DEFAULT)?;
                 let plan = inputs.plan_with(
                     &machine,
                     (u64::try_from(CTX)?, u64::try_from(ub)?),
@@ -3683,7 +3684,7 @@ mod gate {
         then(inputs.plan_with_slots(
             &machine,
             (u64::try_from(ctx)?, ub),
-            &PlanLevers::from_levers(levers)?,
+            &PlanLevers::from_levers_with(levers, crate::qwen38_levers::KV_DEFAULT)?,
             experts,
             slots,
         ))

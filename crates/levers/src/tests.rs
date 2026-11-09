@@ -88,7 +88,7 @@ fn sample(kind: Kind) -> String {
         Kind::Flag => "1".into(),
         Kind::OnOff => "on".into(),
         Kind::Words(words) => words[0].into(),
-        Kind::Count { min, .. } => min.to_string(),
+        Kind::Count { min, .. } | Kind::CountOr { min, .. } => min.to_string(),
         Kind::Multiple { of } => of.to_string(),
         Kind::Bytes => "38G".into(),
         Kind::CardBytes => "CUDA0=38G,cuda1=20G".into(),
@@ -138,6 +138,27 @@ fn garbage(kind: Kind) -> Vec<String> {
             }
             if !trim {
                 g.extend([format!(" {v}"), format!("{v} ")]);
+            }
+        }
+        Kind::CountOr { min, max, word } => {
+            let v = min.max(1);
+            g.extend([
+                "-1".to_string(),
+                format!("+{v}"),
+                format!("0{v}"),
+                "two".into(),
+                PAST_U64.into(),
+                word.to_uppercase(),
+                format!(" {word}"),
+                format!("{word} "),
+                format!(" {v}"),
+                format!("{v} "),
+            ]);
+            if min > 0 {
+                g.push((min - 1).to_string());
+            }
+            if max < u64::MAX {
+                g.push((max + 1).to_string());
             }
         }
         Kind::Multiple { of } => g.extend([
@@ -390,6 +411,9 @@ fn rows_are_well_formed() {
                 assert!(!words.is_empty() && w.len() == words.len(), "{}", r.name);
             }
             Kind::Count { min, max, .. } => assert!(min <= max, "{}", r.name),
+            Kind::CountOr { min, max, word } => {
+                assert!(min <= max && !word.is_empty(), "{}", r.name);
+            }
             Kind::Multiple { of } => assert!(of > 0, "{}", r.name),
             _ => {}
         }
@@ -769,14 +793,20 @@ fn expert_rank_takes_a_path_and_a_binary_that_leaves_it_out_refuses_it() {
     assert_eq!(left_out.expert_rank(), None);
 }
 
-/// `BLOOMERY_KV_FLOOR` takes a whole number of positions from 1 to u32::MAX,
-/// unset is no floor, a value the kind does not take names the lever, and a
+/// `BLOOMERY_KV_FLOOR` takes a whole number of positions from 1 to u32::MAX
+/// or `off`, unset is [`KvFloor::Unset`] (the load's own default, which no
+/// accessor fills in here), a value the kind does not take names the lever, and a
 /// binary that leaves the lever out refuses it set — the refusal every other
 /// family's load gives it.
 #[test]
 fn kv_floor_takes_positions_and_a_binary_that_leaves_it_out_refuses_it() {
     let floor = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.kv_floor());
     assert_eq!(floor(&[]).unwrap(), None);
+    assert_eq!(floor(&[(KV_FLOOR, "off")]).unwrap(), None);
+    let set = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).unwrap().kv_floor_set();
+    assert_eq!(set(&[]), KvFloor::Unset);
+    assert_eq!(set(&[(KV_FLOOR, "off")]), KvFloor::Off);
+    assert_eq!(set(&[(KV_FLOOR, "4096")]), KvFloor::At(4096));
     assert_eq!(floor(&[(KV_FLOOR, "4096")]).unwrap(), Some(4096));
     assert_eq!(floor(&[(KV_FLOOR, "1")]).unwrap(), Some(1));
     assert_eq!(
@@ -794,6 +824,8 @@ fn kv_floor_takes_positions_and_a_binary_that_leaves_it_out_refuses_it() {
         "04096",
         "4294967296",
         "",
+        "OFF",
+        " off",
     ] {
         let Err(e) = floor(&[(KV_FLOOR, bad)]) else {
             panic!("{bad:?} is not a position count and must be refused");
@@ -821,13 +853,21 @@ fn kv_floor_takes_positions_and_a_binary_that_leaves_it_out_refuses_it() {
 }
 
 /// `BLOOMERY_KV_HOST` takes one of `off`, `spill` and `all`, unset is `off`
-/// (the card's own memory, the plan before the lever), a value the kind does
+/// for a load that takes no default of its own ([`Levers::kv_host`]), a value the kind does
 /// not take names the lever, and a binary that leaves the lever out refuses
 /// it set — the refusal every family whose stores are not rooms gives it.
 #[test]
 fn kv_host_takes_a_backing_word_and_a_binary_that_leaves_it_out_refuses_it() {
     let host = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.kv_host());
     assert_eq!(host(&[]).unwrap(), KvHost::Off);
+    let set = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).unwrap().kv_host_set();
+    assert_eq!(
+        set(&[]),
+        None,
+        "unset is not a word: a load's default fills it"
+    );
+    assert_eq!(set(&[(KV_HOST, "off")]), Some("off"));
+    assert_eq!(set(&[(KV_HOST, "all")]), Some("all"));
     // Unset is not set: every family whose stores are not rooms refuses the
     // lever only when it is set.
     let unset = read(&[], Scope::Every).expect("nothing is set");
