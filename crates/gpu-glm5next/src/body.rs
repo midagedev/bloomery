@@ -833,6 +833,10 @@ pub struct Body {
     /// (`place::dense_positions`): a prompt chunk within them attends every
     /// position, one past them through the selector.
     dense: usize,
+    /// The card bytes the plan reserves for a prompt chunk's latent attention
+    /// buffers (`place::prompt_attn_bytes`), which the batch feed's are
+    /// held to before it makes them.
+    attn_planned: u64,
     /// The KDA layers' stores on the host at chosen positions.
     ckpt: Checkpoints,
     /// How a prompt is fed, and the batch feed's buffers.
@@ -1751,6 +1755,16 @@ impl Body {
             .map_err(|_| shape(format!("dense positions {}", place::dense_positions(hp))))?;
         let run = host_run(&spec.layers, nextn.map(|(_, n)| n.index))?;
         let dims = dims_of(inputs)?;
+        // The plan's one bound on the keys a prompt chunk attends is the dense
+        // positions; the card's buffers are sized by a selector list's width.
+        if dense != list_width(dims.kept) {
+            return Err(shape(format!(
+                "the dense positions {dense} are not a selector list's width {}: a prompt \
+                 chunk's attention buffers are sized by the list",
+                list_width(dims.kept)
+            )));
+        }
+        let attn_planned = place::prompt_attn_bytes(inputs.attn_shape(), plan.ctx_max);
         let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
         let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), N_EXPERT)?;
         let plans = trunk_plans(file, inputs)?;
@@ -1924,6 +1938,7 @@ impl Body {
             lanes,
             wrote: nextn::Wrote::default(),
             dense,
+            attn_planned,
             ckpt,
             prompt: prefill::PromptState::new(),
             nvme_tier,

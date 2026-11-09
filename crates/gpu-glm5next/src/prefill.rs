@@ -165,6 +165,9 @@ pub const T_MAX: usize = UNION_MAX_COLS;
 /// token group.
 pub const CHUNK: usize = COL_GROUP;
 const _: () = assert!(CHUNK == HC_MAX_TOKENS);
+// The plan counts a chunk's attention buffers (`place::prompt_attn_bytes`)
+// by this chunk and the attention's segment.
+const _: () = assert!(CHUNK == place::PROMPT_CHUNK && attn::SEG_KEYS == place::ATTN_SEG_KEYS);
 
 /// The fewest tokens a batch runs its GEMM projections over
 /// ([`GemmFront`]: a KDA mixer's input and output projections but its decay
@@ -821,6 +824,39 @@ fn unit_bytes(n: usize, cap: usize, tiered: bool) -> usize {
 // The feed-forward mix `place::unit_bytes` counts is the hyper-connection's.
 const _: () = assert!(HC_MIX == (2 + HC_STREAMS) * HC_STREAMS);
 
+/// The lengths of a prompt chunk's latent attention buffers over stores of
+/// `ctx` positions: each query row's partials over the segments of the most
+/// keys a token attends — a selector list's width ([`list_width`], the step's
+/// bound), which is every position a chunk within the dense positions sees
+/// (the body refuses a load where the two differ) — and the selector's
+/// scores, a pool of the store each, and lists. Pure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AttnLens {
+    part_v: usize,
+    part_ms: usize,
+    scores: usize,
+    list: usize,
+}
+
+impl AttnLens {
+    fn of(d: &Dims, ctx: usize) -> AttnLens {
+        let rows = CHUNK * d.heads;
+        let segs = attn::segments(0, list_width(d.kept));
+        AttnLens {
+            part_v: attn::partials_v_len(rows, segs),
+            part_ms: attn::partials_ms_len(rows, segs),
+            scores: CHUNK * pools_for(ctx),
+            list: CHUNK * list_width(d.kept),
+        }
+    }
+
+    /// Their card bytes, the plan's count of them (`place::prompt_attn_bytes`).
+    fn bytes(self) -> u64 {
+        let f = (self.part_v + self.part_ms + self.scores) * size_of::<f32>();
+        (f + self.list * size_of::<u32>()) as u64
+    }
+}
+
 /// Every buffer a group's units share besides the stores, for up to `cap`
 /// tokens where a launch takes the batch whole and [`CHUNK`] where it takes
 /// a chunk: each is written and read inside one part of one item, or by an
@@ -886,18 +922,16 @@ impl Bufs {
     /// `ff` the widest dense or shared-expert width, `dense_ff` the widest
     /// dense block's (0 for none) with the `forms` its sites read and the
     /// `mixer` inputs a K-quant site reads,
-    /// `expert_ff` a routed expert's, over stores of `ctx` positions. The attention's partials
-    /// cover `ctx` keys: a chunk selects only on stores past the dense
-    /// positions, which are a list's width, so they cover a list too. The
-    /// card experts' scratch holds the card leg's buffers in the forms
-    /// `card_leg` names, when it names any.
+    /// `expert_ff` a routed expert's, the latent attention's of the lengths
+    /// `attn` names ([`AttnLens`]). The card experts' scratch holds the card
+    /// leg's buffers in the forms `card_leg` names, when it names any.
     /// Load-time or first-prompt only.
     fn new(
         gpu: &Gpu,
         d: &Dims,
         [ff, dense_ff, expert_ff]: [usize; 3],
         (forms, mixer): (DenseForms, MixerForms),
-        ctx: usize,
+        attn: AttnLens,
         cap: usize,
         card_leg: DownForms,
     ) -> Result<Bufs, GpuError> {
@@ -912,7 +946,6 @@ impl Bufs {
         );
         let head = bloomery_gpu::linear::HEAD;
         let rows = CHUNK * d.heads;
-        let segs = attn::segments(0, ctx);
         let groups = cap.div_ceil(CHUNK);
         Ok(Bufs {
             cap,
@@ -938,12 +971,12 @@ impl Bufs {
             qr: z(cap * d.q_lora)?,
             qabs: z(rows * LATENT)?,
             att: z(rows * LATENT)?,
-            part_v: z(attn::partials_v_len(rows, segs))?,
-            part_ms: z(attn::partials_ms_len(rows, segs))?,
+            part_v: z(attn.part_v)?,
+            part_ms: z(attn.part_ms)?,
             qi: z(CHUNK * kpool::HEADS * kpool::DIM)?,
             wi: z(CHUNK * kpool::HEADS)?,
-            scores: z(CHUNK * pools_for(ctx))?,
-            list: zu(CHUNK * list_width(d.kept))?,
+            scores: z(attn.scores)?,
+            list: zu(attn.list)?,
             h: z(CHUNK * ff)?,
             normed: z(cap * n)?,
             sh_y: z(cap * n)?,
@@ -1886,12 +1919,15 @@ impl Body {
         let cap = T_MAX.min(self.ctx);
         let tiered = self.card.tier().is_some();
         let forms = dense_forms(&self.cfg);
+        let attn = AttnLens::of(&self.dims, self.ctx);
+        place::check_attn_bytes(attn.bytes(), self.attn_planned)
+            .map_err(|e| shape(e.to_string()))?;
         let bufs = Bufs::new(
             gpu,
             &self.dims,
             [ff, dense_ff, expert_ff],
             (forms, self.mixer),
-            self.ctx,
+            attn,
             cap,
             self.card.prompt_leg(),
         )?;
@@ -2727,6 +2763,11 @@ impl PromptProgram<'_> {
         }
         let (qs_kb, d_kb) = q8(w, &nm.k_b)?;
         let (qs_vb, d_vb) = q8(w, &nm.v_b)?;
+        // A chunk within the dense positions attends the store's first rows
+        // only, so its launch's segments are those of the dense positions, not
+        // of the whole store ([`AttnLens`]).
+        let dense_rows =
+            DeviceTensor::<u16>::window_of(latent.buf(), 0, self.dense.min(latent.rows()), LATENT)?;
         // SAFETY: a view of no rows at the address of the layer's own latent
         // cache, a live allocation aligned for u16 that outlives the view; the
         // attention reads no window row through it, and the view is released
@@ -2799,7 +2840,11 @@ impl PromptProgram<'_> {
                     AttnArgs {
                         q: &b.qabs,
                         window: &window,
-                        compressed: Some(&*latent),
+                        compressed: Some(if keys == Keys::Selected {
+                            &*latent
+                        } else {
+                            &*dense_rows
+                        }),
                         selected: (keys == Keys::Selected).then_some(SelectedRows {
                             rows: &b.list,
                             stride: list_width(kept),
@@ -3303,5 +3348,58 @@ impl<'a> LayerProgram for PromptProgram<'a> {
         })();
         port.part_end(at, enq);
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bloomery_gpu::linear::{KHeadMap, LinearShape};
+    use model::arch::glm5next::place::{self, AttnShape};
+
+    use super::{AttnLens, Dims};
+
+    /// GLM-5.3-Flash's widths: 64 heads, 512 pools kept.
+    fn dims() -> Dims {
+        Dims {
+            embd: 4096,
+            heads: 64,
+            kda: LinearShape {
+                n_k: 64,
+                n_v: 64,
+                map: KHeadMap::Tiled,
+            },
+            q_lora: 1536,
+            head_k: 192,
+            head_v: 128,
+            index_d: 128,
+            rms_eps: 1e-6,
+            norm_eps: 1e-6,
+            kept: 512,
+            hc_eps: 1e-6,
+            hc_iters: 20,
+            lb: 0.0,
+            scale: 1.0,
+        }
+    }
+
+    /// The batch feed's latent attention buffers take the bytes the plan
+    /// reserves for them (`place::prompt_attn_bytes` at GLM-5.3-Flash's
+    /// shape, 2,051 keys a token) at 1,536, 16,384 and 262,144 positions.
+    /// Mutant: the partials over every position of the store.
+    #[test]
+    fn attn_buffers_take_the_planned_bytes() {
+        let shape = AttnShape {
+            heads: 64,
+            latent: 512,
+            keys: 2051,
+            kpool: 4,
+        };
+        for ctx in [1536usize, 16_384, 262_144] {
+            assert_eq!(
+                AttnLens::of(&dims(), ctx).bytes(),
+                place::prompt_attn_bytes(shape, ctx as u64),
+                "ctx {ctx}"
+            );
+        }
     }
 }

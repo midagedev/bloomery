@@ -1,0 +1,18 @@
+# glm256fix mutant reserve-without-attn: the plan's prompt reserve leaves the latent attention's buffers out
+# clause: the_prompt_reserve_holds_the_attention_buffers (crates/model/src/arch/glm5next/place.rs tests::slots)
+# site: crates/model/src/arch/glm5next/place.rs prompt_reserve_bytes — the `prompt_attn_bytes` term dropped, so
+#   the buffers the card body makes come out of the card's margin again
+# expected red (pure, any host): "ctx 1536" — left 0, right 34,816,096 (the reserve less the others vs the
+#   attention's bytes); `cargo test -p bloomery-model --lib glm5next::place`
+# base green first; applied alone, test run, reversed (tree clean after).
+diff --git a/crates/model/src/arch/glm5next/place.rs b/crates/model/src/arch/glm5next/place.rs
+--- a/crates/model/src/arch/glm5next/place.rs
++++ b/crates/model/src/arch/glm5next/place.rs
+@@ -459,7 +459,6 @@
+             card_leg_forms(&inputs.model),
+         );
+     prompt_front_bytes(inputs, ctx_max)
+-        + prompt_attn_bytes(inputs.attn_shape(), ctx_max)
+         + (tiles + (group_sets(PROMPT_GROUP) - 1) * unit) as u64
+ }
+ 

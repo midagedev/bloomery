@@ -1,0 +1,21 @@
+# glm256fix mutant partials-by-ctx: the prompt chunk's attention partials sized by the store's positions again
+# clause: attn_buffers_take_the_planned_bytes (crates/gpu-glm5next/src/prefill.rs tests, host-side, `--lib`;
+#   gate-gpu-glm5next-media runs the lib) and the batch feed's refusal before Bufs::new (prefill.rs make_batch)
+# site: crates/gpu-glm5next/src/prefill.rs AttnLens::of — the partials' segments over `ctx` keys, not a
+#   selector list's width: 4,311,744,512 B of partials at 262,144 positions where the plan reserves 34,738,176
+# expected red (lib): "attn_buffers_take_the_planned_bytes ... ctx 1536" (left 25,342,048, right 34,816,096);
+#   on a card, any GLM batch prompt (gate-gpu-glm5next-e2e): "a prompt chunk's attention buffers take
+#   <made> B; the plan reserves <planned> B for them (place::prompt_attn_bytes)" — a named error, no driver OOM
+# not run on the Mac (a device crate); base green first; applied alone, gate run, reversed (tree clean after).
+diff --git a/crates/gpu-glm5next/src/prefill.rs b/crates/gpu-glm5next/src/prefill.rs
+--- a/crates/gpu-glm5next/src/prefill.rs
++++ b/crates/gpu-glm5next/src/prefill.rs
+@@ -841,7 +841,7 @@
+ impl AttnLens {
+     fn of(d: &Dims, ctx: usize) -> AttnLens {
+         let rows = CHUNK * d.heads;
+-        let segs = attn::segments(0, list_width(d.kept));
++        let segs = attn::segments(0, ctx);
+         AttnLens {
+             part_v: attn::partials_v_len(rows, segs),
+             part_ms: attn::partials_ms_len(rows, segs),

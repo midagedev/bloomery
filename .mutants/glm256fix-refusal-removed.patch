@@ -1,0 +1,21 @@
+# glm256fix mutant refusal-removed: the card body's check of its attention buffers against the plan passes all
+# clause: attn_bytes_the_plan_does_not_reserve_are_refused (crates/model/src/arch/glm5next/place.rs tests)
+# site: crates/model/src/arch/glm5next/place.rs check_attn_bytes — Ok whatever the made and planned bytes, so
+#   make_batch's refusal before Bufs::new never fires
+# expected red (pure, any host): "the context-wide partials" — the expect_err on 4,313,907,296 B against the
+#   36,900,960 B the plan reserves at 262,144 positions; `cargo test -p bloomery-model --lib glm5next::place`
+# this alone turns no card gate red (the made bytes are the plan's); with glm256fix-partials-by-ctx it is the
+#   driver OOM of the 262,144 serve load again
+# base green first; applied alone, test run, reversed (tree clean after).
+diff --git a/crates/model/src/arch/glm5next/place.rs b/crates/model/src/arch/glm5next/place.rs
+--- a/crates/model/src/arch/glm5next/place.rs
++++ b/crates/model/src/arch/glm5next/place.rs
+@@ -393,7 +393,7 @@
+ /// ([`prompt_attn_bytes`]): checked before the buffers are made, so a layout
+ /// the plan does not count is an error, not the driver's.
+ pub fn check_attn_bytes(made: u64, planned: u64) -> Result<(), AttnUnplanned> {
+-    if made == planned {
++    if made == planned || made != planned {
+         Ok(())
+     } else {
+         Err(AttnUnplanned { made, planned })

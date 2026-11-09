@@ -443,7 +443,17 @@ mod gate {
     const RESIDENCY_WORD: &str = "mid-p0-s1";
     /// The experts the seat's plan of `bp` puts on this box's 3090 at the
     /// seat's defaults, a band for the free bytes each census reads.
-    const BP_TIER_EXPERTS: std::ops::RangeInclusive<u64> = 1490..=1515;
+    // PIN(2026-11-09): the seat's default context is 262,144 now, and the
+    // plan's prompt reserve holds the latent attention's buffers
+    // (`place::prompt_attn_bytes`, 36,900,960 B there), which the planner
+    // keeps off every card's expert budget, the tier's too. At the census of
+    // A6000 48,793,452,816 / 3090 23,190,643,712 B free the plan without them
+    // put 1,460 experts (22,388,736,000 B, 15,334,751 B each on average) on
+    // the 3090; 36,900,960 B is 2.41 of them, so 1,457 or 1,458 by the slack
+    // left under one expert [derived]. The band keeps its 25 experts about
+    // that count, about 190 MB of census drift each way. Was 1490..=1515 at
+    // the 16,384 default.
+    const BP_TIER_EXPERTS: std::ops::RangeInclusive<u64> = 1445..=1470;
     /// The GLM family's rule as the seat names it: the tier count the unset
     /// rule keeps the tier card at (glm_place::TIER_RULE's, the card file
     /// its `basis`).
