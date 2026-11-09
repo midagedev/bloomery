@@ -73,9 +73,33 @@ pub fn capacity(live: u64, reclaimable: u64, quantum: u64, n_expert: u64) -> u64
     live.saturating_add(extra).min(n_expert)
 }
 
+/// The rows of an expert stack reserved for `slots` experts, each expert
+/// holding `rows_per_expert` rows (`dims[1]` of the stack tensor): a slot is
+/// that many rows, and an upload counts rows. `None` when the product passes
+/// `usize`.
+#[must_use]
+pub fn stack_rows(slots: usize, rows_per_expert: usize) -> Option<usize> {
+    slots.checked_mul(rows_per_expert)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capacity is counted in slots and an upload in rows: 117 slots of a
+    /// 2560-row expert are 299 520 rows, which hold the 240 640 rows of 94
+    /// live experts; read as rows, 117 is below them.
+    ///
+    /// FAIL-first: a `stack_rows` that returns `slots` goes red on the first
+    /// assertion, and the second shows the unit slip the load refused by.
+    #[test]
+    fn a_capacity_in_slots_is_rows_per_expert_times_slots() {
+        let (per, live, slots) = (2560, 94, 117);
+        assert_eq!(stack_rows(slots, per), Some(299_520));
+        assert!(stack_rows(slots, per).unwrap() >= live * per);
+        assert!(slots < live * per);
+        assert_eq!(stack_rows(usize::MAX, 2), None);
+    }
 
     /// The fill keeps the margin and two quanta: with 10 quanta of free bytes
     /// above a margin, 8 slots fill, never 9.

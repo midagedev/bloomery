@@ -19,6 +19,7 @@ use crate::q8f32::{E4m3Scales, E4m3Weight};
 use crate::room::StackRoom;
 use crate::tensor::{DeviceTensor, window};
 use crate::upload::{Stage, UploadRing, bytes_of};
+use ::model::placement::elastic;
 use ::model::placement::host_lock::PageDrop;
 use ::model::placement::read_ahead::{self, Ranges};
 use ::model::placement::{
@@ -1723,18 +1724,41 @@ fn upload_rows_in(
             let cols = words / rows;
             let (w, room) = match rooms.filter(|r| r.names.contains(name)) {
                 Some(r) => {
-                    let slots = r.capacity_of(name).unwrap_or(rows);
-                    if slots < rows {
+                    // A capacity counts expert slots, an upload counts rows: a slot is
+                    // the stack's `dims[1]` rows.
+                    let capacity = match r.capacity_of(name) {
+                        Some(slots) => {
+                            let per = usize::try_from(t.dims.get(1).copied().unwrap_or(1))
+                                .map_err(|_| {
+                                    GpuError::shape(what, format!("tensor {name}: rows pass usize"))
+                                })?;
+                            elastic::stack_rows(slots, per).ok_or_else(|| {
+                                GpuError::shape(
+                                    what,
+                                    format!(
+                                        "tensor {name}: {slots} slots of {per} rows pass usize"
+                                    ),
+                                )
+                            })?
+                        }
+                        None => rows,
+                    };
+                    if capacity < rows {
                         return Err(GpuError::shape(
                             what,
                             format!(
-                                "tensor {name}: a capacity of {slots} slots below its {rows} \
+                                "tensor {name}: a capacity of {capacity} rows below its {rows} \
                                  uploaded rows"
                             ),
                         ));
                     }
-                    let (w, room) =
-                        StackRoom::tensor_backed(Arc::clone(&r.stream), slots, cols, rows, what)?;
+                    let (w, room) = StackRoom::tensor_backed(
+                        Arc::clone(&r.stream),
+                        capacity,
+                        cols,
+                        rows,
+                        what,
+                    )?;
                     (w, Some(room))
                 }
                 None => (DeviceTensor::<u32>::zeroed(stream, rows, cols)?, None),
