@@ -746,17 +746,20 @@ mod gate {
     }
 
     /// `shadow`: a walk of steps past two windows, then a cut a few positions back that restores
-    /// ring rows from the shadows: the same ids and the same snapshot as the run that was not
-    /// cut, and, when the shadows are host rooms, rooms backed for every position walked and for
+    /// ring rows from the shadows: the same answers (each step's, as the first walk gave it) and
+    /// the same snapshot as the run that was not cut, and, when the shadows are host rooms, rooms backed for every position walked and for
     /// fewer than the context's rows.
     fn feed_shadow(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
         const WHAT: &str = "gate_deepseek41_step feed shadow";
         const BACK: usize = 8;
         let n = 2 * hp.window + 2 * BACK;
         m.reset()?;
-        let mut t = 0;
+        // Each step's answer, in order: the walk feeds a fixed cycle of ids, not its own
+        // answers, so the steps after a cut are held to what the same steps answered the first
+        // time.
+        let mut first = Vec::with_capacity(n);
         for id in SLOT_PROMPTS[0].iter().cycle().take(n) {
-            t = m.step(std::slice::from_ref(id))?;
+            first.push(m.step(std::slice::from_ref(id))?);
         }
         let (ids, cut, held, roomed, full) = {
             let b = m.body(WHAT)?;
@@ -783,8 +786,7 @@ mod gate {
         for id in &ids[cut..n] {
             out.push(m.step(std::slice::from_ref(id))?);
         }
-        let want: Vec<u32> = ids[cut + 1..n].iter().copied().chain([t]).collect();
-        let (fed, same) = (out == want, snap_hash(m)? == before);
+        let (fed, same) = (out == first[cut..n], snap_hash(m)? == before);
         let reached = n * hp.n_layer * hp.head_dim * size_of::<u16>();
         let lazy = !roomed || (held >= reached && held < full);
         println!(

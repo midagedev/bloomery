@@ -387,7 +387,16 @@ mod gate {
         let ids = corpus("prose", 0, KVGROW_P)?;
         s.clear()?;
         let free = call(s, &ids, KVGROW_STEPS)?;
+        // A clear keeps the pages of the sequence it ends (`Seq::clear` settles at the reach
+        // the sequence had); the next one, ending an empty sequence, gives them back. The
+        // squeezed call must start with no page of its own, or its fits find them backed and the
+        // squeeze asks the card for nothing.
         s.clear()?;
+        s.clear()?;
+        let backed = {
+            let m = s.model().body(NAME)?.rooms_mapped(0);
+            m.card + m.host
+        };
         let seed = card_sets(s)?;
         let held = crate::kv_squeeze::squeeze(s.model().gpu())?;
         let buffers = held.len();
@@ -397,11 +406,11 @@ mod gate {
         let experts = |sets: &[Vec<u32>]| sets.iter().map(Vec::len).sum::<usize>();
         let given = experts(&seed).saturating_sub(experts(&card_sets(s)?));
         let same = free.out == squeezed.out;
-        let ok = same && given > 0;
+        let ok = same && given > 0 && backed == 0;
         println!(
-            "kvgrow: the card squeezed by {buffers} buffers, the call of {} ids and {KVGROW_STEPS} \
-             steps gave up {given} card experts and its ids and logits are the free call's: \
-             {same}: {}",
+            "kvgrow: the card squeezed by {buffers} buffers over rooms backing {backed} B, the \
+             call of {} ids and {KVGROW_STEPS} steps gave up {given} card experts and its ids \
+             and logits are the free call's: {same}: {}",
             ids.len(),
             verdict(ok)
         );
