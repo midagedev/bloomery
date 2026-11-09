@@ -261,6 +261,7 @@ use bloomery_gpu_gates::bind::{
     eprint_noted, model_props, note_line, parallel_line, placement_of, put_back, slots_given,
     verifies_slots,
 };
+use bloomery_gpu_gates::capture::{self, Out};
 use bloomery_gpu_gates::generate::{
     DraftYield, Lane, Place, draft_yield, lane_at, mode_name, with_cards,
 };
@@ -1458,11 +1459,8 @@ const WHOSE: &str = "a glm5next body's";
 struct PairCapture;
 
 impl RowsLog for PairCapture {
-    fn capture_rows(&mut self, _rows: usize, nodes: usize) -> Result<(), SessionError> {
-        Record::new(&record::CAPTURE_PAIR)
-            .u("pair_graph_nodes", nodes)
-            .eprint();
-        Ok(())
+    fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), SessionError> {
+        capture::pair(rows, VERIFY_ROWS, nodes, Out::Stderr).map_err(SessionError::Refused)
     }
 }
 
@@ -1560,13 +1558,7 @@ impl OpenLog<Body> for Log {
     }
 
     fn capture(&mut self, nodes: usize) -> Result<(), app::SessionError> {
-        Record::new(&record::CAPTURE)
-            .u("graph_nodes", nodes)
-            .eprint();
-        Ok(())
-    }
-
-    fn prompt_buffers(&mut self, _m: &Glm5nextModel) -> Result<(), app::SessionError> {
+        capture::step(nodes, Out::Stderr);
         Ok(())
     }
 }

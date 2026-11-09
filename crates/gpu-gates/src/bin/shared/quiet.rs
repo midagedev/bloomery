@@ -27,10 +27,6 @@ impl<B: Open> OpenLog<B> for Quiet {
     fn capture(&mut self, _: usize) -> Result<(), SessionError> {
         Ok(())
     }
-
-    fn prompt_buffers(&mut self, _: &GpuModel<B>) -> Result<(), SessionError> {
-        Ok(())
-    }
 }
 
 impl RowsLog for Quiet {

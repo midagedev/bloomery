@@ -244,6 +244,7 @@ mod cli {
     use bloomery_gpu::host::route_trace::{RouteTrace, TraceHeader};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu_gates::capture::{self, Out};
     use bloomery_gpu_gates::generate::{
         Diag, Known, Lane, NoEog, Place, Residence, ServeFeed, TopRows, before_path, card_table,
         dump_table, lane_at, place_table, read_table, refuse_unknown, repeat_runs, seed_path,
@@ -450,9 +451,7 @@ mod cli {
         }
 
         fn capture(&mut self, nodes: usize) -> Result<(), SessionError> {
-            Record::new(&record::CAPTURE)
-                .u("graph_nodes", nodes)
-                .print();
+            capture::step(nodes, Out::Stdout);
             Ok(())
         }
 
@@ -1296,11 +1295,8 @@ mod cli {
     struct PairCapture;
 
     impl RowsLog for PairCapture {
-        fn capture_rows(&mut self, _rows: usize, nodes: usize) -> Result<(), SessionError> {
-            Record::new(&record::CAPTURE_PAIR)
-                .u("pair_graph_nodes", nodes)
-                .print();
-            Ok(())
+        fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), SessionError> {
+            capture::pair(rows, VERIFY_ROWS, nodes, Out::Stdout).map_err(SessionError::Refused)
         }
     }
 

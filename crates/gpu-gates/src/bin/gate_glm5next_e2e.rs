@@ -704,10 +704,6 @@ mod gate {
             self.nodes = Some(nodes);
             Ok(())
         }
-
-        fn prompt_buffers(&mut self, _m: &Glm5nextModel) -> Result<(), SessionError> {
-            Ok(())
-        }
     }
 
     /// What the open decided besides the session: the step's captured nodes,
