@@ -122,8 +122,13 @@ pub struct CardTotals {
     /// The selected reserves; a tier leg's descriptor bound is replaced by
     /// its actual resident layers' scratch.
     pub reserve_bytes: u64,
+    /// The card bytes the model's first prompt pass makes beyond the load's
+    /// uploads (its batch buffers at the largest call), reserved out of the
+    /// expert budget by the model's plan ([`CardTotals::grow_prompt`]); 0 for
+    /// a plan that counts none.
+    pub prompt_bytes: u64,
     /// usable − dense − experts − rounding − KV − stage rows − scratch −
-    /// context − reserves, usable capped by the plan's card budget; the
+    /// context − reserves − prompt, usable capped by the plan's card budget; the
     /// margin is inside it.
     pub headroom_bytes: i128,
 }
@@ -143,7 +148,7 @@ impl CardTotals {
     /// refusals give it: the one list both the sum and a message naming the
     /// terms read ([`super::card_made`]).
     #[must_use]
-    pub fn terms(&self) -> [(&'static str, u64); 8] {
+    pub fn terms(&self) -> [(&'static str, u64); 9] {
         [
             ("dense", self.dense_bytes),
             ("experts", self.expert_bytes),
@@ -153,6 +158,7 @@ impl CardTotals {
             ("scratch", self.scratch_bytes),
             ("context", self.context_bytes),
             ("reserves", self.reserve_bytes),
+            ("prompt", self.prompt_bytes),
         ]
     }
 
@@ -171,6 +177,15 @@ impl CardTotals {
     /// target's totals), so the card-byte invariant's count holds both.
     pub fn grow_reserve(&mut self, bytes: u64) {
         self.reserve_bytes += bytes;
+        self.headroom_bytes -= i128::from(bytes);
+    }
+
+    /// `bytes` more in the card's prompt term, out of its headroom: the card
+    /// bytes the first prompt pass makes (the model's one formula of them,
+    /// reserved out of the expert budget before the experts fill), so the
+    /// card-byte invariant's count at the first prompt holds them.
+    pub fn grow_prompt(&mut self, bytes: u64) {
+        self.prompt_bytes += bytes;
         self.headroom_bytes -= i128::from(bytes);
     }
 }

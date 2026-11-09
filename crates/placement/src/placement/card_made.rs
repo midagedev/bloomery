@@ -69,7 +69,7 @@ pub struct CardMade {
     /// The device's free bytes at `phase`.
     pub now: u64,
     /// The plan's terms for the card ([`CardTotals::terms`]).
-    pub terms: [(&'static str, u64); 8],
+    pub terms: [(&'static str, u64); 9],
     /// The part of the context term the opening reading already carried.
     pub in_reading: u64,
 }
@@ -245,6 +245,7 @@ mod tests {
             scratch_bytes: 0,
             context_bytes: 0,
             reserve_bytes: 0,
+            prompt_bytes: 0,
             headroom_bytes: 0,
         }
     }
@@ -261,6 +262,7 @@ mod tests {
             scratch_bytes: 64 * MIB,
             context_bytes: 512 * MIB,
             reserve_bytes: 70 * MIB,
+            prompt_bytes: 90 * MIB,
             headroom_bytes: 1,
         }
     }
@@ -314,7 +316,8 @@ mod tests {
                 5 => t.scratch_bytes = bytes,
                 6 => t.context_bytes = bytes,
                 7 => t.reserve_bytes = bytes,
-                _ => unreachable!("eight terms"),
+                8 => t.prompt_bytes = bytes,
+                _ => unreachable!("nine terms"),
             }
             let count = if name == "context" {
                 bytes - CONTEXT_SELF
@@ -328,6 +331,27 @@ mod tests {
                 "{name} alone, one byte past"
             );
         }
+    }
+
+    /// A prompt pass's card bytes grown into the totals are a named term of
+    /// the count and come out of the headroom, so the first prompt's reading
+    /// holds them: without the term the pass's bytes read past the plan.
+    #[test]
+    fn a_prompt_pass_grown_into_the_totals_is_counted_by_name() {
+        let mut t = zero();
+        t.headroom_bytes = 1000 * MIB as i128;
+        let load = 300 * MIB;
+        let pass = 200 * MIB;
+        assert_eq!(made(&t, load + pass).past(), Some(load + pass));
+        t.grow_prompt(load + pass);
+        assert_eq!(t.prompt_bytes, load + pass);
+        assert_eq!(t.headroom_bytes, 500 * MIB as i128);
+        assert_eq!(made(&t, load + pass).past(), None);
+        assert!(
+            made(&t, load + pass)
+                .terms_text()
+                .ends_with(&format!("prompt={}", load + pass))
+        );
     }
 
     /// A context term under the creation cost counts nothing past the
