@@ -642,10 +642,14 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // stage a host page, that default is `off` by name, and a set `spill` or `all` is the
     // refusal itself.
     let mut kv_default = crate::serve_levers::KV_DEFAULT;
+    let mut kv_page = None;
     let kv_host_set = levers.kv_host_set().and_then(KvHost::parse);
     if kv_host_set.unwrap_or(kv_default.host) != KvHost::Off {
         match stage_host_page(a.place.card_specs()?[0]) {
-            Ok(page) => inputs.kv_host_page = Some(page),
+            Ok(page) => {
+                inputs.kv_host_page = Some(page);
+                kv_page = Some(page);
+            }
             Err(e) if kv_host_set.is_none() => {
                 eprintln!(
                     "bloomery-serve-ds41: BLOOMERY_KV_HOST is unset and the stage card cannot \
@@ -656,7 +660,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             Err(e) => return Err(e),
         }
     }
-    let cfg = cfg.with_kv_default(&levers, kv_default);
+    let cfg = cfg
+        .with_kv_default(&levers, kv_default)
+        .with_kv_host_page(kv_page);
     // A V4.1 model file is served with DeepSeek's official V4.1 prompt
     // encoding, which spells V4.1's tags, unless the client gave a template
     // of its own. A V4 file, and any file with a client template, keeps the
@@ -838,7 +844,8 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         a.cache_ram,
     )?;
     let cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?
-        .with_kv_default(&levers, kv_default);
+        .with_kv_default(&levers, kv_default)
+        .with_kv_host_page(kv_page);
     // The record's `headroom` is the room the budget came from: what
     // `MemAvailable` leaves past the plan's host need and the churn pool.
     Record::new(&record::CACHE_CONFIG)

@@ -257,6 +257,10 @@ pub struct OpenCfg {
     pub body: BodyLevers,
     /// The placement's levers the plan is made under.
     pub place: PlanLevers,
+    /// The page a host-capable room takes ([`PlanInputs::kv_host_page`]), when the binary read
+    /// it already; none, and a plan under `spill` or `all` reads it from the stage card
+    /// ([`OpenCfg::page_inputs`]).
+    pub kv_host_page: Option<u64>,
 }
 
 impl OpenCfg {
@@ -307,6 +311,7 @@ impl OpenCfg {
         Ok(OpenCfg {
             body,
             place: PlanLevers::from_levers(levers).map_err(|e| GpuError::plan(WHAT, e))?,
+            kv_host_page: None,
         })
     }
 
@@ -321,6 +326,41 @@ impl OpenCfg {
             place: self.place.resolve_kv(levers.kv_floor_set(), host, default),
             ..self
         }
+    }
+
+    /// `self` with the host-capable room's page a binary read once
+    /// ([`PlanInputs::kv_host_page`]), for every plan the load makes.
+    #[must_use]
+    pub fn with_kv_host_page(self, page: Option<u64>) -> OpenCfg {
+        OpenCfg {
+            kv_host_page: page,
+            ..self
+        }
+    }
+
+    /// Give `inputs` the page a plan under `spill` or `all` rounds the host-able rows at: the
+    /// one the binary read, else the stage card's (`machine`'s first card) host page. Under
+    /// `off` the plan reads none and `inputs` is left as it is.
+    pub fn page_inputs(&self, inputs: &mut PlanInputs, machine: &Machine) -> Result<(), GpuError> {
+        if self.place.kv_host == KvHost::Off || inputs.kv_host_page.is_some() {
+            return Ok(());
+        }
+        let page = match self.kv_host_page {
+            Some(page) => page,
+            None => {
+                let stage = machine.cards.first().ok_or(GpuError::State {
+                    what: "BLOOMERY_KV_HOST",
+                    missing: "a stage card to read the host page from",
+                })?;
+                let ordinal = Gpu::resolve_card(&stage.name, stage.device)?;
+                u64::try_from(bloomery_gpu::host_page(ordinal)?).map_err(|_| GpuError::State {
+                    what: "BLOOMERY_KV_HOST",
+                    missing: "a host page that fits u64",
+                })?
+            }
+        };
+        inputs.kv_host_page = Some(page);
+        Ok(())
     }
 }
 
@@ -347,8 +387,9 @@ pub fn open(
     cfg: &OpenCfg,
 ) -> Result<Deepseek41Model, GpuError> {
     const WHAT: &str = "deepseek41 body::open";
-    let inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+    let mut inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
     let machine = machine(inputs.model.layers);
+    cfg.page_inputs(&mut inputs, &machine)?;
     refuse_cards(WHAT, &machine)?;
     refuse_expert_tiers(WHAT, &machine)?;
     let plan = inputs
@@ -375,8 +416,9 @@ pub fn open_slots(
     slots: NonZeroUsize,
 ) -> Result<Deepseek41Model, GpuError> {
     const WHAT: &str = "deepseek41 body::open_slots";
-    let inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+    let mut inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
     let machine = machine(inputs.model.layers);
+    cfg.page_inputs(&mut inputs, &machine)?;
     refuse_cards(WHAT, &machine)?;
     let plan = inputs
         .plan_with_slots(&machine, ctx_max as u64, &cfg.place, slots)

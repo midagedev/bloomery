@@ -45,6 +45,13 @@ impl Open for Body {
         PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))
     }
 
+    /// The page the binary read for the host-capable room, when it read one; a plan under
+    /// `spill` or `all` without it refuses by name (`PlanInputs::kv_host_bytes`).
+    fn configure_inputs(inputs: &mut PlanInputs, cfg: &Ds41Cfg) -> Result<(), GpuError> {
+        inputs.kv_host_page = inputs.kv_host_page.or(cfg.open.kv_host_page);
+        Ok(())
+    }
+
     fn layer_count(inputs: &PlanInputs) -> usize {
         inputs.model.layers
     }

@@ -411,7 +411,7 @@ mod drive {
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{Machine, Plan, PlanLevers, workstation};
+    use model::placement::{Machine, Plan, workstation};
     use runtime::width::{Choosing, Chosen, Mode as WidthMode, Rule, Wall};
     use runtime::{
         Advance, Committed, GenOutcome, Lookup, PassSink, Pick, Picked, RowLogits, Speculative,
@@ -979,7 +979,7 @@ mod drive {
         // that is `off` (refused below otherwise): no pre-plan there.
         let (plan_n_l, residency) = match &a.diag.card_table {
             Some(_) => (None, residency),
-            None => pre_plan(&file, &a, &cfg.place, machine, slots, residency)?,
+            None => pre_plan(&file, &a, &cfg, machine, slots, residency)?,
         };
         record::residency_lever(residency).print();
         if let Some(d) = residency.why.detail() {
@@ -1380,14 +1380,16 @@ mod drive {
     fn pre_plan(
         file: &Split,
         a: &Args,
-        place_levers: &PlanLevers,
+        open: &body::OpenCfg,
         machine: impl Fn(usize) -> Machine,
         slots: usize,
         pick: ResidencyPick,
     ) -> Result<(Option<Vec<u64>>, ResidencyPick), GateError> {
         const WHAT: &str = "generate_ds41 residency pre-plan";
-        let inputs = PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let mut inputs = PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
         let machine = machine(inputs.model.layers);
+        open.page_inputs(&mut inputs, &machine)?;
+        let place_levers = &open.place;
         let ctx = u64::try_from(a.ctx)
             .map_err(|_| format!("{WHAT}: a context of {} positions passes u64", a.ctx))?;
         let plan = match NonZeroUsize::new(slots).filter(|n| n.get() > 1) {
@@ -1417,8 +1419,9 @@ mod drive {
         log: &mut Log<'_>,
     ) -> Result<Option<Loaded<Body>>, GateError> {
         const WHAT: &str = "generate_ds41 open_slots";
-        let inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let mut inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
         let machine = (args.machine)(inputs.model.layers);
+        args.cfg.open.page_inputs(&mut inputs, &machine)?;
         let plan = inputs
             .plan_with_slots(
                 &machine,
