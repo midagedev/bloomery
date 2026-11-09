@@ -1,0 +1,26 @@
+# callkeep: a server's later requests read as fast as its first once a pos-0 prompt call keeps its pick. Written
+# 2026-11-09 on the Mac before any box run. Two binaries, one lease, the A6000: `bloomery` (main f304995c6, the tree the
+# ctxplace sitting ran) and `bloomery-callkeep` (main + e27f351c1). DEPTH_SERVE_FOLD=depths, so each server answers
+# D 6, 512, 4,096 in turn and every row after a server's first is [shared].
+# DECOMPOSITION [derived, ~/.cache/bloomery/specs/laterreq/report.md]: main's later rows decode on the previous request's
+# pool (measured folded.log: off D 4,096 shared 59.5..60.8 tg vs 67.45 first; pp 2,137..2,227 vs 2,561..2,578); with the
+# fix a later request's call keeps its own pick as a first request's does: tg +11..12 %, pp +14 % on the D 4,096 shared
+# rows; a D 512 row after a D 4,096 row may lose ~2 % (the better pool it inherited). First rows: identical (0 ± ruler).
+kind: ab
+question: on a server's later requests (fold rows [shared], D 4,096, prose ids, ctx 262,144, A6000 alone), how much faster is
+  the callkeep binary than main in decode
+term: tg tok/s of bloomery-callkeep against bloomery on the [shared] D 4,096 rows, the mean over the same rounds, tok/s @
+  n=128, depth 4,096, ctx 262,144, --place a, MTP draft off, A6000
+unit: %
+predict: 6..14
+rounds: 4
+sd: 0.6 % AGENTS.md 「Know the ruler」 same-binary SD (the fold's shared rows scatter more: read the fold audit)
+condition: depth-serve.sh under one lease on the A6000 (BLOOMERY_MODEL=qwen4exp, DEPTH_SERVE_PLACE=a, DEPTH_SERVE_CTX=262144,
+  DEPTH_SERVE_N=128, DEPTH_SERVE_FOLD=depths, BLOOMERY_AB_ROUNDS=4), arms env=BLOOMERY_DRAFT=off:<tree>:<D> for both trees at
+  D 6 512 4096; every lever else unset; no row [cold], [cpu-busy] or [other-busy]; no Xid and no NoRoom in any server log
+decide-in: land callkeep IF its [shared] D 4,096 tg is above main's (paired lower bound > 3 %), its first rows equal main's
+  within the ruler, and its [shared] rows read within 2 % of its own first rows at the same D
+decide-below: the mechanism is not the whole story: read each later call's end record (kept, restored) in the server
+  stderr before any other change
+decide-above: more than the derivation's +14 %: main's shared rows lost more than the carried pool (read the fold audit's
+  first rows of both arms for a second term) before the landing claims the number
