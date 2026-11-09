@@ -19,7 +19,7 @@ use crate::host::PassKind;
 use crate::host::swap::{BoundaryAt, ResetReport, Residency};
 use crate::host::swap_source::ResidencyGlue;
 use crate::hybrid::{Chain, HostResidency, Hybrid, Refusal};
-use crate::model::{ChainBody, GpuModel, HostServed};
+use crate::model::{ChainBody, GpuModel, HostServed, Rollback};
 use crate::tensor::DeviceTensor;
 
 /// A body whose host tier is a [`Hybrid`]: what the shared [`HostServed`]
@@ -212,6 +212,40 @@ pub fn prompt_pass<B: ChainBody, T>(
     let v = r?;
     kept?;
     Ok(v)
+}
+
+/// A prompt call from `from` that failed with `e`, its positions taken back:
+/// to `from` when the body's stores grant it, else to the cut `keep` names
+/// (the family's keep rule, run on the failed model), which the error then
+/// names as the cut the `grant` grant. A fault poisons the model and is
+/// returned as it came, as is any error of a poisoned model: nothing runs on
+/// it until a reset. `shape` is the family's own error for the two named
+/// outcomes, so each engine's error text stays its own.
+pub fn take_back<B: Rollback>(
+    m: &mut GpuModel<B>,
+    from: u32,
+    e: GpuError,
+    keep: impl FnOnce(&mut GpuModel<B>) -> Result<u32, GpuError>,
+    grant: &str,
+    shape: impl FnOnce(String) -> GpuError,
+) -> GpuError {
+    if matches!(e, GpuError::Fault { .. }) || m.poisoned().is_some() {
+        return e;
+    }
+    let kept = match keep(m) {
+        Ok(kept) => kept,
+        Err(b) => return b,
+    };
+    match m.rollback(kept) {
+        Ok(()) if kept == from => e,
+        Ok(()) => shape(format!(
+            "a prompt call from position {from} failed ({e}); its positions are taken back and \
+             the model stands at {kept}, the cut the {grant} grant"
+        )),
+        Err(r) => shape(format!(
+            "a prompt call from position {from} failed ({e}), and taking it back failed too ({r})"
+        )),
+    }
 }
 
 /// The steps feed of a prompt call under `residency`, refused by name when a

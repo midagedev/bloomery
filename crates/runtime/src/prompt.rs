@@ -3,8 +3,9 @@
 //! ([`PrefillMode`]), what a call's last row is for ([`CallEnd`]), how a
 //! call is cut into batches ([`batches`], [`call_batches`]), units
 //! ([`call_units`], [`fold_units`], [`fold_marks`]) and chunks ([`chunks`]), how a call's batches are walked together ([`group_sets`], [`groups`],
-//! [`check_group`], [`refuse_dense_after_routed`]) and the call's end
-//! ([`end_of`], [`call_end`]).
+//! [`check_group`], [`refuse_dense_after_routed`]), the order a call's groups
+//! run in ([`call_groups`]), the call's end ([`end_of`], [`call_end`]) and its
+//! host streaming's frame by the residency rule's heat ([`heat_call`]).
 //!
 //! Host only, and no device error type: a refusal comes back as a
 //! [`Refusal`], whose detail the engine crate puts in its own error beside
@@ -246,6 +247,62 @@ pub fn groups(k: usize, g: usize) -> Vec<Range<usize>> {
     out
 }
 
+/// One group of a prompt call's units ([`call_groups`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallGroup {
+    /// The group's units, as indices into the call's units.
+    pub units: Range<usize>,
+    /// The ids the group runs, as offsets into the call's ids.
+    pub ids: Range<usize>,
+    /// Whether the group holds the call's last position: the group whose
+    /// walk runs the head.
+    pub last: bool,
+}
+
+/// The groups of a call from `from` to `to` cut into `units` (consecutive,
+/// the first starting at `from`), under a group lever of `group`
+/// ([`groups`]): each group's units, the ids it runs, and whether it holds
+/// the call's last position. The one walk order every group-walking prompt
+/// call runs its units in.
+#[must_use]
+pub fn call_groups(units: &[Range<u32>], from: u32, to: u32, group: usize) -> Vec<CallGroup> {
+    groups(units.len(), group)
+        .into_iter()
+        .filter_map(|g| {
+            let first = units.get(g.start)?;
+            let end = units.get(g.end.checked_sub(1)?)?;
+            Some(CallGroup {
+                ids: (first.start - from) as usize..(end.end - from) as usize,
+                last: end.end == to,
+                units: g,
+            })
+        })
+        .collect()
+}
+
+/// A prompt call `run` inside its host streaming, by the residency rule's
+/// heat: `history` is whether the call continues a sequence holding decode
+/// heat, read once before the call (the call keeps no row, so it does not
+/// move until the end). `begin` opens the streaming, returning each layer to
+/// the set it started with when `history`; `run` runs only when it opened.
+/// `end` runs whatever happened, told whether the call's placement is kept
+/// (it succeeded and starts a sequence) and whether it succeeded. The call's
+/// own error comes first: an end refused after a failed call is its echo.
+pub fn heat_call<S, T, E>(
+    s: &mut S,
+    history: bool,
+    begin: impl FnOnce(&mut S, bool) -> Result<(), E>,
+    run: impl FnOnce(&mut S) -> Result<T, E>,
+    end: impl FnOnce(&mut S, bool, bool) -> Result<(), E>,
+) -> Result<T, E> {
+    let r = begin(s, history).and_then(|()| run(s));
+    let ok = r.is_ok();
+    let ended = end(s, ok && !history, ok);
+    let v = r?;
+    ended?;
+    Ok(v)
+}
+
 /// Refused by name for a group of 2 or more on a load with a dense layer
 /// past a routed one: a dense front writes the shared buffers the previous
 /// routed item's back still reads (the shared-buffer rule holds only for a
@@ -443,6 +500,81 @@ mod tests {
         assert!(e.starts_with("a prompt group of 2 batches on a load whose dense layer 2 "));
         assert!(refuse_dense_after_routed([true, true], 3).is_ok());
         assert!(refuse_dense_after_routed([false, false], 3).is_ok());
+    }
+
+    /// A call's groups: each group's units and the ids they run, laid end to
+    /// end from the call's first id, and the head on the group holding the
+    /// call's last position alone.
+    #[test]
+    fn call_groups_slice_the_ids_and_head_the_last() {
+        let units = call_batches(10, 17, &[17], 2);
+        assert_eq!(units, vec![10..12, 12..14, 14..16, 16..17]);
+        let g = call_groups(&units, 10, 17, 2);
+        assert_eq!(
+            g,
+            vec![
+                CallGroup {
+                    units: 0..2,
+                    ids: 0..4,
+                    last: false
+                },
+                CallGroup {
+                    units: 2..4,
+                    ids: 4..7,
+                    last: true
+                },
+            ]
+        );
+        let one = call_groups(&units, 10, 17, 1);
+        assert_eq!(one.len(), 4);
+        assert_eq!(one[1].ids, 2..4);
+        assert_eq!(one.iter().filter(|g| g.last).count(), 1);
+        assert!(one[3].last);
+        assert_eq!(call_groups(&[], 10, 10, 2), Vec::<CallGroup>::new());
+    }
+
+    /// The heat frame: the run only after an opened streaming, the end
+    /// always, the placement kept only by a call that succeeded and starts a
+    /// sequence, and the call's error before the end's.
+    #[test]
+    fn heat_call_keeps_only_a_fresh_sequence() {
+        type Log = Vec<String>;
+        let call = |history: bool, begin_ok: bool, run_ok: bool, end_ok: bool| {
+            let mut log: Log = Vec::new();
+            let r = heat_call(
+                &mut log,
+                history,
+                |l: &mut Log, returns| {
+                    l.push(format!("begin returns={returns}"));
+                    if begin_ok { Ok(()) } else { Err("begin") }
+                },
+                |l: &mut Log| {
+                    l.push("run".to_string());
+                    if run_ok { Ok(7) } else { Err("run") }
+                },
+                |l: &mut Log, kept, ok| {
+                    l.push(format!("end kept={kept} ok={ok}"));
+                    if end_ok { Ok(()) } else { Err("end") }
+                },
+            );
+            (r, log)
+        };
+        let (r, log) = call(false, true, true, true);
+        assert_eq!(r, Ok(7));
+        assert_eq!(log, ["begin returns=false", "run", "end kept=true ok=true"]);
+        let (r, log) = call(true, true, true, true);
+        assert_eq!(r, Ok(7));
+        assert_eq!(log, ["begin returns=true", "run", "end kept=false ok=true"]);
+        let (r, log) = call(false, false, true, true);
+        assert_eq!(r, Err("begin"));
+        assert_eq!(log, ["begin returns=false", "end kept=false ok=false"]);
+        let (r, log) = call(false, true, false, false);
+        assert_eq!(r, Err("run"));
+        assert_eq!(
+            log,
+            ["begin returns=false", "run", "end kept=false ok=false"]
+        );
+        assert_eq!(call(false, true, true, false).0, Err("end"));
     }
 
     /// The feed's two words round-trip, and no other word is a mode.

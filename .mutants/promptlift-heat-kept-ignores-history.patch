@@ -1,0 +1,15 @@
+# promptlift mutant heat-kept-ignores-history
+# clause: unit test heat_call_keeps_only_a_fresh_sequence (crates/runtime/src/prompt.rs)
+# site: runtime::prompt::heat_call, the callkeep rule's !history gone (a call continuing a heated sequence keeps its pick)
+# expected red: "heat_call_keeps_only_a_fresh_sequence ... FAILED" (end kept=true on history)
+--- a/crates/runtime/src/prompt.rs
++++ b/crates/runtime/src/prompt.rs
+@@ -297,7 +297,7 @@
+ ) -> Result<T, E> {
+     let r = begin(s, history).and_then(|()| run(s));
+     let ok = r.is_ok();
+-    let ended = end(s, ok && !history, ok);
++    let ended = end(s, ok, ok);
+     let v = r?;
+     ended?;
+     Ok(v)
