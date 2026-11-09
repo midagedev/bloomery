@@ -148,7 +148,7 @@ for l in "$base"/.lock-*; do
   [ -d "$l" ] || continue
   rp=$(cat "$l/run-pid" 2> /dev/null || true)
   alive=0; [ -n "$rp" ] && kill -0 "$rp" 2> /dev/null && alive=1
-  echo "LOCK=${l##*/.lock-} $(cat "$l/owner" 2> /dev/null || echo ?/0) $alive $(( $(date +%s) - $(cat "$l/heartbeat" 2> /dev/null || stat -f %m "$l" 2> /dev/null || date +%s) ))"
+  echo "LOCK=${l##*/.lock-} $(cat "$l/owner" 2> /dev/null || echo ?/0) $alive $(( $(date +%s) - $(cat "$l/heartbeat" 2> /dev/null || stat -c %Y "$l" 2> /dev/null || stat -f %m "$l" 2> /dev/null || date +%s) ))"
 done
 exit 0
 }'
@@ -246,7 +246,7 @@ pool_pick() {
 }
 
 # The remote scripts' one mtime: a path's modification time in seconds, GNU or BSD stat, or now when neither reads it.
-RMTIME='mtime() { stat -f %m "$1" 2> /dev/null || stat -c %Y "$1" 2> /dev/null || echo "$now"; }'
+RMTIME='mtime() { stat -c %Y "$1" 2> /dev/null || stat -f %m "$1" 2> /dev/null || echo "$now"; }'
 
 # --locks [--clean]: every Mac's slots and track locks (the pool's, or the one Mac of ~/.config/bloomery/mac-remote),
 # each lock `live` (its run goes, or its heartbeat is younger than LOCK_DEAD) or `dead`; --clean removes the dead ones.
@@ -522,7 +522,7 @@ if [ "$steal" = 1 ]; then
   if [ -n "$rp" ] && kill -0 "$rp" 2> /dev/null; then echo "RUNNING=$rp"; exit 75; fi
   rm -rf "$lock"
 fi
-mtime() { stat -f %m "$1" 2> /dev/null || stat -c %Y "$1" 2> /dev/null || date +%s; }
+mtime() { stat -c %Y "$1" 2> /dev/null || stat -f %m "$1" 2> /dev/null || date +%s; }
 if [ -d "$lock" ]; then
   rp=$(cat "$lock/run-pid" 2> /dev/null || true)
   if [ -z "$rp" ] || ! kill -0 "$rp" 2> /dev/null; then
