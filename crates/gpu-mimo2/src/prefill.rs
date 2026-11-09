@@ -65,7 +65,7 @@ use bloomery_gpu::flash_gqa::{GqaK192Args, HEAD, HEAD_K192, window_segments};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
-use bloomery_gpu::host::served::{prompt_pass, read_fault, refuse_steps_feed};
+use bloomery_gpu::host::served::{self, prompt_pass, read_fault, refuse_steps_feed};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::model::refuse_reserve_past;
@@ -84,7 +84,7 @@ use model::moe::UNION_MAX_COLS;
 use runtime::layer::FfnKind;
 pub use runtime::prompt::PrefillMode;
 use runtime::prompt::{
-    GROUP_LEVER, call_batches, call_end, check_group, chunks, group_sets, groups,
+    GROUP_LEVER, call_batches, call_end, call_groups, check_group, chunks, group_sets,
     refuse_dense_after_routed,
 };
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
@@ -408,7 +408,7 @@ pub fn set_prefill(m: &mut Mimo2Model, mode: PrefillMode) -> Result<bool, GpuErr
 }
 
 /// The batches a prompt group of `m` runs layer by layer: `g` consecutive
-/// batches of a call walked as one group ([`groups`]: a lone last batch joins
+/// batches of a call walked as one group ([`runtime::prompt::groups`]: a lone last batch joins
 /// the group before it), each layer-batch's front enqueued ahead of the
 /// previous one's host serve; 1 runs each batch alone, and every `g` writes
 /// the same bits. Refused by name inside a call, for a `g` outside 1 to the
@@ -484,7 +484,7 @@ pub fn prefill(m: &mut Mimo2Model, ids: &[u32]) -> Result<u32, GpuError> {
         body.make_batch(gpu)?;
         body.prompt.in_call = true;
     }
-    let r = call_groups(m, ids, from, to);
+    let r = run_groups(m, ids, from, to);
     if let Ok((_, _, body)) = m.body_parts(WHAT) {
         body.prompt.in_call = false;
     }
@@ -493,17 +493,14 @@ pub fn prefill(m: &mut Mimo2Model, ids: &[u32]) -> Result<u32, GpuError> {
 
 /// [`prefill`]'s groups: per group its walk ([`Body::enqueue_group`]) through
 /// the model's pass. A group that fails takes the call back.
-fn call_groups(m: &mut Mimo2Model, ids: &[u32], from: u32, to: u32) -> Result<u32, GpuError> {
+fn run_groups(m: &mut Mimo2Model, ids: &[u32], from: u32, to: u32) -> Result<u32, GpuError> {
     let batches = call_batches(from, to, &[to], T_MAX);
     let group = m.body(WHAT)?.prompt.group;
     let mut argmax = None;
-    for gr in groups(batches.len(), group) {
-        let runs = &batches[gr];
-        let (Some(first), Some(end)) = (runs.first(), runs.last()) else {
-            continue;
-        };
-        let seg = &ids[(first.start - from) as usize..(end.end - from) as usize];
-        let last = end.end == to;
+    for gr in call_groups(&batches, from, to, group) {
+        let runs = &batches[gr.units];
+        let seg = &ids[gr.ids];
+        let last = gr.last;
         let ran = m.run_rows(seg.len(), WHAT, |gpu, w, body, head, pos| {
             body.enqueue_group(gpu, w, head, seg, pos, runs, last)
         });
@@ -522,19 +519,14 @@ fn call_groups(m: &mut Mimo2Model, ids: &[u32], from: u32, to: u32) -> Result<u3
 /// model stands where the call found it. A fault poisons the model and is
 /// returned as it came: nothing runs on it until a reset.
 fn take_back(m: &mut Mimo2Model, from: u32, e: GpuError) -> GpuError {
-    if matches!(e, GpuError::Fault { .. }) || m.poisoned().is_some() {
-        return e;
-    }
-    let pos = m.pos();
-    if let Ok((_, _, body)) = m.body_parts(WHAT) {
-        body.stand_for_cut(pos);
-    }
-    match m.rollback(from) {
-        Ok(()) => e,
-        Err(r) => shape(format!(
-            "a prompt call from position {from} failed ({e}), and taking it back failed too ({r})"
-        )),
-    }
+    let keep = |m: &mut Mimo2Model| {
+        let pos = m.pos();
+        if let Ok((_, _, body)) = m.body_parts(WHAT) {
+            body.stand_for_cut(pos);
+        }
+        Ok(from)
+    };
+    served::take_back(m, from, e, keep, "stores", shape)
 }
 
 impl Body {
