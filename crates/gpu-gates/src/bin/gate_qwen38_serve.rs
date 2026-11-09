@@ -271,6 +271,14 @@
 //!   `Body38::open_placed` runs no residency machine whatever the rule — no
 //!   `residency host` record and no `residency pass`, and the reset is the
 //!   server's 501; a draft run with no chooser prints no `mtp width` record.
+//! - the elastic clause ([`elastic_settles`], a server of its own under
+//!   the residency word, `BLOOMERY_DRAFT=off` and `BLOOMERY_ELASTIC=on`):
+//!   the seat reserves its expert stacks past the plan, settles the card's
+//!   free bytes to the margin after its open and prints the one settle
+//!   record and `stat elastic`; the clause holds the record's terms to each
+//!   other and the counts to the record, and the load serves after it. The
+//!   fixture's card decides which record (fill, give-back or held) — the
+//!   clause prints it as the reading;
 //! - the width chooser's clause ([`width_cost`], a server of its own under
 //!   `BLOOMERY_DRAFT=mtp`, `BLOOMERY_RESIDENCY=off` and
 //!   `BLOOMERY_MTP_WIDTH=cost`): the prompt's steps (one token a request),
@@ -719,6 +727,11 @@ mod gate {
     const UNRESIDENT_REFUSED: &str = "is not host-resident after its pages were read in again";
     /// The word that asks the load to keep P 0 with the churn pool unhosted.
     const CHURN_WORD: &str = "mid-p0-s1-unhosted";
+    /// The elastic clause's checks, one line each.
+    const ELASTIC_SETTLED: &str = "elastic_settle_prints_one_record";
+    const ELASTIC_AGREES: &str = "elastic_settle_agrees_with_its_reading";
+    const ELASTIC_STAT: &str = "elastic_stat_counts_the_settle";
+    const ELASTIC_SERVES: &str = "elastic_load_serves_after_the_settle";
     /// The unhosted-pool clause's checks, one line each, and the unset
     /// word's one beside them.
     const CHURN_WHY: &str = "churn_unhosted_lever_record_names_the_asked_word";
@@ -2808,6 +2821,118 @@ mod gate {
             headroom: host.i64("headroom")?,
             churn,
         }))
+    }
+
+    /// The elastic clause (the module header): a server of [`CHURN_ARGS`]
+    /// under [`RESIDENCY_WORD`], the draft off and `BLOOMERY_ELASTIC=on`
+    /// reserves its expert stacks past the plan and, after its open, settles
+    /// the card's free bytes to the plan's margin. It prints exactly one
+    /// settle record — `elastic fill` (slots ≥ 1 a layer, bytes within the
+    /// free bytes past the margin), `elastic give-back` (freed ≥ asked) or
+    /// `elastic held` (why) — and a `stat elastic` whose counts are that
+    /// record's; then it answers a greedy request. Which record the fixture's
+    /// card prints is the reading, not a pin: the clause prints it for the
+    /// log. FAIL-first (`.mutants/elastic-qwen38-warm-drop.patch`, the settle
+    /// call removed from the seat): no settle record and no `stat elastic`,
+    /// red on the first and third checks alone.
+    fn elastic_settles(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
+        let mut ok = true;
+        let own = dir.join("elastic");
+        std::fs::create_dir_all(&own)?;
+        let err_log = own.join("server.err");
+        let mut cmd = Command::new(Served38::exe()?);
+        cmd.env(bloomery_levers::RESIDENCY, RESIDENCY_WORD)
+            .env(bloomery_levers::ELASTIC, "on")
+            .env(bloomery_levers::DRAFT, "off")
+            .env_remove(bloomery_levers::NVTIER_BYTES)
+            .env_remove(bloomery_levers::MTP_HEAD_ROWS)
+            .env_remove(bloomery_levers::MTP_DRAFT)
+            .env_remove(bloomery_levers::MTP_WIDTH);
+        gate_card_budget(&mut cmd, levers)?;
+        let mut served = Served38::spawn_with(&CHURN_ARGS, &own, &mut cmd)?;
+        println!("elastic server pid {}", served.child.id());
+        let served_ok = match served.address(&err_log, POLLS, POLL) {
+            Ok(addr) => {
+                let url = |p: &str| format!("http://{addr}{p}");
+                let ids = rendered(&url, json!([{ "role": "user", "content": TURN_A }]))?;
+                let body = json!({
+                    "prompt": ids, "n_predict": CHURN_PREDICT, "temperature": 0,
+                    "return_tokens": true, "cache_prompt": false,
+                });
+                let (st, reply) = curl(&url("/completion"), Some(&body), false)?;
+                let tokens = match st {
+                    200 => ids_of(&json_of("/completion", st, &reply)?["tokens"])?,
+                    _ => Vec::new(),
+                };
+                println!("elastic: the request: HTTP {st}, {} ids", tokens.len());
+                st == 200 && tokens.len() >= CHURN_MIN_TOKENS
+            }
+            Err(e) => {
+                println!(
+                    "elastic: the server never listened: {e}; it said: {}",
+                    std::fs::read_to_string(&err_log).unwrap_or_default()
+                );
+                false
+            }
+        };
+        if served.child.try_wait()?.is_none() {
+            println!("elastic server stopped: {}", served.stop()?);
+        }
+        let log = seat_log(&err_log)?;
+        let fills = log.all(&record::ELASTIC_FILL)?;
+        let give_backs = log.all(&record::ELASTIC_GIVE_BACK)?;
+        let helds = log.all(&record::ELASTIC_HELD)?;
+        let settles = fills.len() + give_backs.len() + helds.len();
+        for line in [
+            record_line(&err_log, "elastic fill")?,
+            record_line(&err_log, "elastic give-back")?,
+            record_line(&err_log, "elastic held")?,
+            record_line(&err_log, "stat elastic")?,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            println!("elastic: {line}");
+        }
+        check(&mut ok, ELASTIC_SETTLED, settles == 1);
+        let agrees = match (fills.first(), give_backs.first(), helds.first()) {
+            (Some(f), None, None) => {
+                let (free, margin) = (f.u64("free")?, f.u64("margin")?);
+                f.u64("slots")? >= 1
+                    && f.u64("layers")? >= 1
+                    && free >= margin
+                    && f.u64("bytes")? <= free - margin
+            }
+            (None, Some(g), None) => {
+                g.word("site")? == "warm"
+                    && g.u64("asked")? >= 1
+                    && g.u64("freed")? >= g.u64("asked")?
+            }
+            (None, None, Some(h)) => !h.text("why")?.is_empty(),
+            _ => false,
+        };
+        check(&mut ok, ELASTIC_AGREES, agrees);
+        let stat = log.first(&record::STAT_ELASTIC)?;
+        let counted = match &stat {
+            Some(st) => {
+                st.u64("fills")? == fills.len() as u64
+                    && st.u64("give_backs")? == give_backs.len() as u64
+                    && st.u64("fill_bytes")?
+                        == fills
+                            .iter()
+                            .map(|f| f.u64("bytes"))
+                            .sum::<Result<u64, _>>()?
+                    && st.u64("give_back_bytes")?
+                        == give_backs
+                            .iter()
+                            .map(|g| g.u64("freed"))
+                            .sum::<Result<u64, _>>()?
+            }
+            None => false,
+        };
+        check(&mut ok, ELASTIC_STAT, counted);
+        check(&mut ok, ELASTIC_SERVES, served_ok);
+        Ok(ok)
     }
 
     /// The unhosted-pool clause (the module header), both tiers: a plan-only
@@ -5338,6 +5463,9 @@ mod gate {
         // keeps its P and runs the pool from the file (the module header):
         // its own two servers.
         ok &= churn_unhosted(dir, levers)?;
+        // The elastic expert stacks (the module header): its own server
+        // under the residency word and `BLOOMERY_ELASTIC=on`.
+        ok &= elastic_settles(dir, levers)?;
         // The width chooser's server (the module header): the draft on, the
         // residency off, `BLOOMERY_MTP_WIDTH=cost`.
         ok &= width_cost(dir, prompt)?;

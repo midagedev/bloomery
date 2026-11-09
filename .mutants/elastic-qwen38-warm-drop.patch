@@ -1,0 +1,13 @@
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
+@@ -3111,9 +3111,7 @@
+         eprintln!("{line}");
+         // The settle after every card buffer the open makes, the ring included: what the card
+         // has free now is what serving leaves it.
+-        if let Some(terms) = elastic {
+-            settle_elastic(gpu, body, terms)?;
+-        }
++        let _ = elastic;
+         let mut census = record::host_tier::CensusSpan::default();
+         {
+             let b = s.model().body(WHAT)?;
