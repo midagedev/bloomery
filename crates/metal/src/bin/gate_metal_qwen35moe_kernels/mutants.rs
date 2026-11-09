@@ -157,6 +157,7 @@ pub const Q30_KEPT: &[&str] = &[
     "gemm_weight_edge",
     "tensor_resid_stores",
     "tensor_seg_out",
+    "tensor_h16_stage",
     "tensor_routed_block_rows",
     "tensor_tile_no_raise",
 ];
@@ -3396,6 +3397,16 @@ pub const TENSOR_MUTANTS: &[Mutant] = &[
         clause: "tensor_gemm_a4",
         why: "the residual epilogue stores the product over the output instead of adding to it",
         edits: &[("*p = RESID ? *p + ct[i] : ct[i];", "*p = ct[i];", 1)],
+    },
+    Mutant {
+        name: "tensor_h16_stage",
+        clause: "tensor_gemm_half_rows",
+        why: "the tensor-op tile stages a half row's chunk with its four runs pairwise swapped",
+        edits: &[(
+            "        dst[g] = *(device const half4 *)(xr + 4 * g);",
+            "        dst[g] = *(device const half4 *)(xr + 4 * (g ^ 1));",
+            1,
+        )],
     },
     Mutant {
         name: "tensor_seg_out",

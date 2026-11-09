@@ -180,29 +180,24 @@ pub struct GemmSegParams<'w> {
 }
 
 /// The GEMM pipelines of one weight type: every epilogue and operand, plain
-/// and segmented, and the f16 operand's over half rows where the path has
-/// them.
+/// and segmented, and the f16 operand's over half rows.
 pub(crate) struct GemmPipelines {
     plain: [[Pipeline; 2]; 2],
     seg: [[Pipeline; 2]; 2],
-    /// `[plain, segmented][epilogue]` over half rows: the simdgroup path's
-    /// (the tensor-op library has no half-row entry).
-    half: Option<[[Pipeline; 2]; 2]>,
+    /// `[plain, segmented][epilogue]` over half rows.
+    half: [[Pipeline; 2]; 2],
 }
 
 impl GemmPipelines {
     /// The pipelines of `stem`'s family — `gemm_{q4k,q6k,a4}` — suffixed by
-    /// the epilogue, the operand and the segmented form, from the library of
-    /// the GEMM path `path`.
-    pub(crate) fn new(library: &Library, stem: &str, path: GemmPath) -> Result<Self, DeviceError> {
+    /// the epilogue, the operand and the segmented form, from the GEMMs'
+    /// library (either path's: both hold every entry).
+    pub(crate) fn new(library: &Library, stem: &str) -> Result<Self, DeviceError> {
         let one = |suffix: &str| library.pipeline(&format!("{stem}{suffix}"));
-        let half = match path {
-            GemmPath::Simdgroup => Some([
-                [one("_store_h16")?, one("_resid_h16")?],
-                [one("_seg_store_h16")?, one("_seg_resid_h16")?],
-            ]),
-            GemmPath::TensorOps => None,
-        };
+        let half = [
+            [one("_store_h16")?, one("_resid_h16")?],
+            [one("_seg_store_h16")?, one("_seg_resid_h16")?],
+        ];
         Ok(Self {
             plain: [
                 [one("_store_f16")?, one("_store_f32")?],
@@ -218,8 +213,7 @@ impl GemmPipelines {
 
     /// The pipeline of one launch: `[epilogue][operand]` over f32 rows, the
     /// f16 operand's half-row entry over half rows, segmented or not. Half
-    /// rows under the f32 operand, or on a path without their entries, are
-    /// refused by name.
+    /// rows under the f32 operand are refused by name.
     fn of(
         &self,
         seg: bool,
@@ -238,19 +232,9 @@ impl GemmPipelines {
                         "half activation rows under the {operand:?} operand: only the f16 operand reads them"
                     )));
                 }
-                let half = self.half.as_ref().ok_or_else(|| {
-                    refuse(
-                        "half activation rows on the tensor-op path, which has no half-row entry",
-                    )
-                })?;
-                Ok(&half[usize::from(seg)][mode.at()])
+                Ok(&self.half[usize::from(seg)][mode.at()])
             }
         }
-    }
-
-    /// Whether the path has the half-row entries.
-    fn takes_half(&self) -> bool {
-        self.half.is_some()
     }
 }
 
@@ -548,16 +532,9 @@ struct GemmDispatch<'a> {
 }
 
 impl Kernels {
-    /// Whether the f16 operand's GEMMs read half rows on this path: the
-    /// simdgroup path's do, the tensor-op path has no half-row entry.
-    #[must_use]
-    pub fn gemm_takes_half(&self) -> bool {
-        self.a4_gemm.takes_half()
-    }
-
     /// The activations of the GEMMs that read `p.x`. Where they read half
-    /// rows (the f16 operand on a path that takes them), the rows are cast
-    /// once into `p.half` — the staging's own checked cast, which the f32
+    /// rows (the f16 operand's, on either path), the rows are cast once
+    /// into `p.half` — the staging's own checked cast, which the f32
     /// entries run over every value once per weight tile — and a barrier
     /// orders the cast before the GEMMs; every other launch reads `p.x` as
     /// it is and nothing is encoded. A window that is not the shape's is
@@ -594,7 +571,7 @@ impl Kernels {
                 )
             })?;
         check_window_len(WHAT_X, "x", p.x.len(), x_end)?;
-        if p.operand != Operand::F16 || !self.gemm_takes_half() {
+        if p.operand != Operand::F16 {
             return Ok(GemmX::F32 {
                 x: p.x,
                 stride: p.x_stride,
