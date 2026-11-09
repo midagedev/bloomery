@@ -1,0 +1,11 @@
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen38.rs
+@@ -3214,7 +3214,7 @@
+             card_free(gpu, terms)?
+         };
+         self.warming = true;
+-        let ids = self.warm_pass(ub);
++        let ids: Result<usize, GateError> = Ok(0);
+         self.warming = false;
+         let ids = ids?;
+         let (gpu, _, body) = self.s.model_mut().body_parts(WHAT)?;

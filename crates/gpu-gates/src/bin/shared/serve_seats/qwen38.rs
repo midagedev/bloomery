@@ -1764,23 +1764,61 @@ struct ElasticTerms {
     budget: Option<u64>,
 }
 
-/// The elastic settle (`bloomery_gpu::settle_to_margin`, site `warm`): the engine stream
-/// drained, the card's free bytes read — under a budget, the budget's remainder when that is
-/// less — and settled to the margin; each move its `elastic` record, then `stat elastic`.
-fn settle_elastic(gpu: &Gpu, body: &mut Body38, terms: ElasticTerms) -> Result<(), GateError> {
+/// The card's free bytes now, the engine stream drained first — under a budget, the budget's
+/// remainder when that is less.
+fn card_free(gpu: &Gpu, terms: ElasticTerms) -> Result<u64, GateError> {
     gpu.stream().synchronize()?;
     let (free, total) = gpu.mem_info()?;
     let (free, total) = (free as u64, total as u64);
-    let free = match terms.budget {
+    Ok(match terms.budget {
         Some(budget) => free.min(budget.saturating_sub(total.saturating_sub(free))),
         None => free,
-    };
-    bloomery_gpu::settle_to_margin(body, "warm", free, terms.margin, 0, |e| {
-        super::elastic::settle(&e).eprint();
-    })?;
+    })
+}
+
+/// One move of a settle as its record. A settle at a quiet boundary says nothing when the card
+/// is simply full enough ([`bloomery_gpu::HELD_NO_QUANTUM`]); every other hold, refusal and move
+/// is printed at any site.
+fn print_move(e: &bloomery_gpu::Elastic) {
+    if let bloomery_gpu::Elastic::Held { site, why } = e
+        && *site != "warm"
+        && why == bloomery_gpu::HELD_NO_QUANTUM
+    {
+        return;
+    }
+    super::elastic::settle(e).eprint();
+}
+
+/// The elastic settle (`bloomery_gpu::settle_to_margin`) at `site` on the reading `free`: each
+/// move its `elastic` record, then `stat elastic`.
+fn settle_elastic(
+    body: &mut Body38,
+    terms: ElasticTerms,
+    site: &'static str,
+    free: u64,
+) -> Result<(), GateError> {
+    bloomery_gpu::settle_to_margin(body, site, free, terms.margin, |e| print_move(&e))?;
     super::elastic::stat(body.elastic_stats()).eprint();
     Ok(())
 }
+
+/// The ids of the warm-up's prompt: `n` ids spread over the vocabulary's first hundred
+/// thousand, so the router sees many distinct tokens and the union touches many experts.
+fn warm_ids(n: usize) -> Vec<u32> {
+    (0..n as u64)
+        .map(|i| ((i * 7919 + 13) % WARM_VOCAB) as u32)
+        .collect()
+}
+
+/// The vocabulary range the warm-up's ids are drawn from (below every Qwen3.8 vocabulary).
+const WARM_VOCAB: u64 = 100_000;
+
+/// Positions the warm-up leaves free in a slot for its step, its verify window and the slots
+/// pass after the prompt.
+const WARM_TAIL: usize = 16;
+
+/// Ids the warm-up's prompt gives each slot past the first, which the slots pass steps on.
+const WARM_SLOT_IDS: usize = 8;
 
 /// The rows a slot's window verifies in one pass: the MTP draft's verify
 /// rows, the lookup's [`LOOKUP_ROWS`], or `None` for a load that drafts
@@ -2844,6 +2882,12 @@ struct Q38 {
     vision: Option<vision_seat::Resident>,
     /// The load's kernel picks, `/props`' `engine.autotune`.
     autotune: AutotuneProps,
+    /// The elastic warm-up's pass is running: its calls print no census, room or residency
+    /// record (they are drained), so the log and the counters carry only requests.
+    warming: bool,
+    /// An elastic load's settle terms, set once the warm-up settled: the quiet boundary
+    /// ([`Q38::quiet_boundary`]) fills again with them.
+    elastic: Option<ElasticTerms>,
 }
 
 impl Q38 {
@@ -3109,21 +3153,11 @@ impl Q38 {
         let (gpu, _, body) = s.model_mut().body_parts(WHAT)?;
         let line = xstream_rule(gpu, body, a.xstream, a.place.stage38(), a.residency)?;
         eprintln!("{line}");
-        // The settle after every card buffer the open makes, the ring included: what the card
-        // has free now is what serving leaves it.
-        if let Some(terms) = elastic {
-            settle_elastic(gpu, body, terms)?;
-        }
-        let mut census = record::host_tier::CensusSpan::default();
-        {
-            let b = s.model().body(WHAT)?;
-            census.mark("call", record::census_of(b.hybrid()));
-        }
         let lane = match a.cache_ram {
             0 => None,
             ram => Some(s.model_mut().seq_lane(ram)?),
         };
-        Ok(Q38 {
+        let mut q = Q38 {
             s,
             drafts,
             ctx: a.ctx,
@@ -3136,7 +3170,7 @@ impl Q38 {
             step_pass: pass_of_slots,
             reads_ahead: a.pass == Pass::One,
             stats: a.stats,
-            census,
+            census: record::host_tier::CensusSpan::default(),
             branch: std::cell::RefCell::new(vec![None; a.slots]),
             cut_line: vec![None; a.slots],
             room: vec![(0, 0); a.slots],
@@ -3145,7 +3179,143 @@ impl Q38 {
             #[cfg(feature = "vision")]
             vision,
             autotune,
-        })
+            warming: false,
+            elastic: None,
+        };
+        // The warm-up and the settle after every card buffer the open makes, the ring
+        // included, and after the worst-case pass the ring and the buffers serve: what the card
+        // has free then is what serving leaves it. The pass runs after the ring so it takes
+        // the path serving takes; its allocations draw on what the ring left.
+        if let Some(terms) = elastic {
+            q.warm_settle(terms, a.ubatch.min(a.ctx))?;
+            q.elastic = Some(terms);
+        }
+        // The census span starts after the warm-up, which carries none of its picks.
+        let mut census = record::host_tier::CensusSpan::default();
+        {
+            let b = q.s.model().body(WHAT)?;
+            census.mark("call", record::census_of(b.hybrid()));
+        }
+        q.census = census;
+        Ok(q)
+    }
+
+    /// The elastic warm-up (design §3.1 steps 6–8): the worst-case pass of the serving
+    /// path — one prompt of `ub` ids (clipped to the context), one step or verify, and with
+    /// several slots one pass of them all — then every slot reset and the residency back to
+    /// its seed, so the lazily made buffers and module images are in the card reading and the
+    /// pass's K/V pages and heat are not; then the reading, its record, and the settle at
+    /// site `warm`. A give-back the pass itself made (a K/V fit short of bytes) is printed
+    /// before the settle's record.
+    fn warm_settle(&mut self, terms: ElasticTerms, ub: usize) -> Result<(), GateError> {
+        const WHAT: &str = "bloomery-serve-qwen38";
+        let before = {
+            let (gpu, _, _) = self.s.model_mut().body_parts(WHAT)?;
+            card_free(gpu, terms)?
+        };
+        self.warming = true;
+        let ids = self.warm_pass(ub);
+        self.warming = false;
+        let ids = ids?;
+        let (gpu, _, body) = self.s.model_mut().body_parts(WHAT)?;
+        let free = card_free(gpu, terms)?;
+        super::elastic::warm(
+            (ids, ub, self.ctx),
+            before.saturating_sub(free),
+            (before, free),
+            terms.margin,
+        )
+        .eprint();
+        for e in body.take_moves() {
+            print_move(&e);
+        }
+        let fills = body.elastic_stats().fills;
+        settle_elastic(body, terms, "warm", free)?;
+        // The slots a fill backed hold nothing until an expert lands in them: the residency
+        // back to its seed, which the fill grew, puts the seed's next experts there, so the
+        // first request finds the card filled.
+        let filled = self.s.model_mut().body_parts(WHAT)?.2.elastic_stats().fills > fills;
+        if filled {
+            Seat::residency_reset(self)?;
+        }
+        Ok(())
+    }
+
+    /// The warm-up's pass ([`Q38::warm_settle`]); the ids of its prompt.
+    fn warm_pass(&mut self, ub: usize) -> Result<usize, GateError> {
+        let n = ub.min(self.ctx.saturating_sub(WARM_TAIL)).max(1);
+        let ids = warm_ids(n);
+        let slots = self.slots();
+        let mut nexts = Vec::with_capacity(slots);
+        self.select(0)?;
+        let next = self.prefill(&ids)?;
+        nexts.push(next);
+        // One step, or one verify under the draft: the pass the slot's next request runs.
+        let mut out = Vec::new();
+        self.pass(next, &mut out)?;
+        for slot in 1..slots {
+            self.select(slot)?;
+            nexts.push(self.prefill(&ids[..ids.len().min(WARM_SLOT_IDS)])?);
+        }
+        if slots > 1 {
+            let mut rows: Vec<SlotStep> = nexts
+                .iter()
+                .enumerate()
+                .map(|(slot, &last)| SlotStep {
+                    slot,
+                    last,
+                    logits: None,
+                    next: 0,
+                })
+                .collect();
+            self.step_slots(&mut rows)?;
+        }
+        for slot in (0..slots).rev() {
+            self.select(slot)?;
+            self.reset_slot()?;
+        }
+        Seat::residency_reset(self)?;
+        Ok(n)
+    }
+
+    /// A quiet boundary of an elastic load, a sequence's end (the session's reset, after the
+    /// K/V rooms gave their pages past the floor back): the boundary clock ticks, the
+    /// give-backs K/V fits made since are printed, and when a fill could run
+    /// ([`model::placement::elastic::ElasticStats::fill_due`]: something withdrawn, the hold after
+    /// the last give-back over, the card not read within the look) the card is read and settled
+    /// at site `quiet`. A refused settle is printed as a hold and the server serves on.
+    fn quiet_boundary(&mut self) -> Result<(), GateError> {
+        const WHAT: &str = "bloomery-serve-qwen38";
+        let Some(terms) = self.elastic else {
+            return Ok(());
+        };
+        let (gpu, _, body) = self.s.model_mut().body_parts(WHAT)?;
+        body.elastic_stats().tick();
+        let moved = body.take_moves();
+        for e in &moved {
+            print_move(e);
+        }
+        let withdrawn = body.withdrawn_slots();
+        if body.elastic_stats().fill_due(withdrawn) {
+            let free = card_free(gpu, terms)?;
+            match settle_elastic(body, terms, "quiet", free) {
+                Ok(()) => {}
+                Err(e) => print_move(&bloomery_gpu::Elastic::Held {
+                    site: "quiet",
+                    why: format!("the settle was refused: {e}"),
+                }),
+            }
+        } else if !moved.is_empty() {
+            super::elastic::stat(body.elastic_stats()).eprint();
+        }
+        Ok(())
+    }
+
+    /// The selected slot reset, its draft on again ([`Seat::reset`] without the elastic
+    /// tenant's quiet boundary).
+    fn reset_slot(&mut self) -> Result<(), GateError> {
+        let sel = self.s.selected();
+        self.drafts.reset(&mut self.s, sel)
     }
 
     /// A sequence that holds an image is kept out of the prompt cache: its rotation table
@@ -3289,6 +3459,9 @@ impl Q38 {
     /// of the boundaries since, on stderr, nothing of them without the
     /// residency.
     fn print_passes(&mut self) -> Result<(), GateError> {
+        if self.warming {
+            return self.drain_passes();
+        }
         self.print_census()?;
         self.print_room()?;
         if !self.residency {
@@ -3324,6 +3497,19 @@ impl Q38 {
         {
             record::residency_pass_of(kind, &r).eprint();
         }
+        Ok(())
+    }
+
+    /// What [`Q38::print_passes`] would print, taken and dropped: the elastic warm-up's calls
+    /// leave no record behind.
+    fn drain_passes(&mut self) -> Result<(), GateError> {
+        if !self.residency {
+            return Ok(());
+        }
+        let body = self.s.model_mut().body_parts("bloomery-serve-qwen38")?.2;
+        drop(body.take_stream_records());
+        drop(body.take_xstream_records());
+        drop(body.take_residency_passes());
         Ok(())
     }
 
@@ -3649,8 +3835,8 @@ impl Seat for Q38 {
     /// residency stays where use has taken it (only [`Seat::residency_reset`]
     /// moves it back), and the other slots' drafts stand as they are.
     fn reset(&mut self) -> Result<(), GateError> {
-        let sel = self.s.selected();
-        self.drafts.reset(&mut self.s, sel)
+        self.reset_slot()?;
+        self.quiet_boundary()
     }
 
     /// [`app::Session::residency_reset`], its `residency reset` record on

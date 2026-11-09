@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/arch/qwen3moe/card38.rs
++++ b/crates/gpu/src/arch/qwen3moe/card38.rs
+@@ -400,7 +400,7 @@
+         per.push(Some(LegLayer {
+             n_card,
+             slots,
+-            reach: bound,
++            reach: n_card + 0 * bound,
+             gate,
+             up,
+             down,
