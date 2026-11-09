@@ -76,9 +76,9 @@ pub fn card_reading(gpu: &Gpu, on: &PlanCard, phase: CardPhase) -> Result<CardRe
     host::await_done(WHAT, || gpu.stream().query())?;
     let now = u64::try_from(gpu.mem_info()?.0)
         .map_err(|_| GpuError::shape(WHAT, "free bytes past u64"))?;
-    Ok(CardReading::Made(CardMade::of(
+    Ok(CardReading::Made(Box::new(CardMade::of(
         on.index, &on.card, &on.totals, phase, before, now,
-    )))
+    ))))
 }
 
 /// [`card_reading`], refused by name where the card is held: bytes made

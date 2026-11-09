@@ -162,7 +162,7 @@ pub fn unmeasured_why(spec: &Card, integrated: bool) -> Option<String> {
 /// could not be measured.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CardReading {
-    Made(CardMade),
+    Made(Box<CardMade>),
     Unmeasured(CardUnmeasured),
 }
 
@@ -173,7 +173,7 @@ impl CardReading {
     pub fn check(&self) -> Result<(), CardRefusal> {
         match self {
             CardReading::Made(m) if m.past().is_none() => Ok(()),
-            CardReading::Made(m) => Err(CardRefusal::Past(Box::new(m.clone()))),
+            CardReading::Made(m) => Err(CardRefusal::Past(m.clone())),
             CardReading::Unmeasured(u) => Err(CardRefusal::Unmeasured(u.clone())),
         }
     }
@@ -373,7 +373,7 @@ mod tests {
         let m = CardMade::of(0, &holder_card(RTX_3090), &t, CardPhase::FirstStep, 10, 20);
         assert_eq!(m.made(), 0);
         assert_eq!((m.before, m.now), (10, 20));
-        assert_eq!(CardReading::Made(m).check(), Ok(()));
+        assert_eq!(CardReading::Made(Box::new(m)).check(), Ok(()));
     }
 
     /// The refusal names the card, the phase, the made bytes, both readings,
@@ -384,7 +384,7 @@ mod tests {
         let count = t.bytes() - CONTEXT_SELF;
         let mut m = made(&t, count + 3);
         m.phase = CardPhase::FirstPrompt;
-        let Err(e) = CardReading::Made(m).check() else {
+        let Err(e) = CardReading::Made(Box::new(m)).check() else {
             panic!("three bytes past the count passed");
         };
         let text = e.to_string();
