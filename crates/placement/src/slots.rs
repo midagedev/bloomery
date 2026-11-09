@@ -246,6 +246,34 @@ pub fn room_padding(
     })
 }
 
+/// The card bytes one card holding `layers` of `rooms` holds beside their exact rows at
+/// `positions` positions over `slots` slots: each of its layers' rounding ([`layer_padding`]) on
+/// every slot, and the spare pages ([`room_spare`]) once. `beside` is the per-slot rounding of a
+/// store outside the layout that this card also holds (a draft's planes), `None` where it holds
+/// none. A card with no room layer and no such store pays nothing. `None` past u64, or as
+/// [`layer_padding`].
+#[must_use]
+pub fn card_padding(
+    rooms: &PosLayout,
+    layers: std::ops::Range<usize>,
+    (positions, slots): (u64, u64),
+    pages: (u64, Option<u64>),
+    host: KvHost,
+    beside: Option<u64>,
+) -> Option<u64> {
+    let mut held = layers.start..layers.end.min(rooms.layers());
+    let holds = held.clone().any(|l| !rooms.buffers(l).is_empty());
+    if !holds && beside.is_none() {
+        return Some(0);
+    }
+    let per_slot = held.try_fold(beside.unwrap_or(0), |sum, layer| {
+        sum.checked_add(layer_padding(rooms, layer, positions, pages, host)?)
+    })?;
+    per_slot
+        .checked_mul(slots)?
+        .checked_add(room_spare(pages, host)?)
+}
+
 /// Why `total` positions do not split across `slots` slots ([`split_ctx`]),
 /// with every term of the split, so a caller names it in its own words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
