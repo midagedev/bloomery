@@ -1,0 +1,12 @@
+--- a/crates/model/src/arch/place_hybrid.rs	2026-11-09 18:37:56
++++ b/crates/model/src/arch/place_hybrid.rs	2026-11-09 18:37:56
+@@ -966,9 +966,6 @@
+         }
+     }
+ 
+-    fn rooms(&self) -> Option<&PosLayout> {
+-        self.rooms.as_ref()
+-    }
+ 
+     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+         (self.rope_row + self.sink_row + self.scratch_row) * ctx_max

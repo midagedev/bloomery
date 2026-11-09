@@ -125,7 +125,9 @@ impl PlanInputs {
             .iter()
             .try_for_each(kernels::check_q8_act_width)?;
         let tier = tier_places_bytes(&hp);
+        let rooms = hp.pos_layout();
         Ok(PlanInputs::new(ENGINE, hp, read.tensors, read.spec)?
+            .with_rooms(rooms)
             .with_tier_reserve(tier)
             .with_nvme_tier())
     }
@@ -462,6 +464,215 @@ mod tests {
             assert_eq!(held, 3 * 164_868 + ctx * 1_408, "ctx {ctx}");
             assert_eq!(held, kv.bytes(0..4, ctx), "ctx {ctx}");
         }
+    }
+
+    /// The by-position buffers a K3.1 latent layer declares are its stores' rows [derived from the
+    /// header's widths, apart from the reader]: the cached row (512 + 64 f16 values, 1,152 B) a
+    /// step reads through the indexer's picks, so a `Select` of the indexer's `top_k` rows, and
+    /// the index key row (128 f16 values, 256 B) the indexer scores whole, a `Scan`; a delta layer
+    /// declares none. Their bytes are the layer's own at every context, 1,408 B a position, which
+    /// at the released file's 24 latent layers are 33,792 B a position. A K3 file has no
+    /// indexer: its one buffer is the cached row, a `Scan` (card-only). Mutants: the key row
+    /// declared `Select` (the host-able bytes move), the cached row of a K3 file declared `Select`,
+    /// the key row left out of the declaration.
+    #[test]
+    fn the_declared_rooms_are_the_positional_rows() {
+        use runtime::stores::Access;
+        const RELEASED_LATENT_LAYERS: u64 = 24;
+        let inputs = PlanInputs::describe(&opened31("kimi-k31-place-rooms"))
+            .expect("the synthetic K3.1 header describes");
+        let rooms = inputs.kv.rooms().expect("a K3.1 file declares its rooms");
+        for l in [0, 1, 3, 4] {
+            assert!(rooms.buffers(l).is_empty(), "layer {l}");
+        }
+        let [cache, keys] = rooms.buffers(2) else {
+            panic!(
+                "{:?}: the cached row and the index key row",
+                rooms.buffers(2)
+            );
+        };
+        assert_eq!((cache.row, cache.per, cache.runs), (1_152, 1, 1));
+        assert_eq!(cache.access, Access::Select { rows: TOP_K });
+        assert_eq!((keys.row, keys.per, keys.runs), (256, 1, 1));
+        assert_eq!(keys.access, Access::Scan);
+        for ctx in [1, 64, 262_144] {
+            for l in 0..5 {
+                let layer = KvBytes::layer_bytes(&inputs.kv, l, ctx);
+                let held = if l == 2 { layer } else { 0 };
+                assert_eq!(rooms.bytes(l, ctx), held, "layer {l} at {ctx}");
+            }
+        }
+        assert_eq!(rooms.bytes(2, 1), 1_408);
+        assert_eq!(RELEASED_LATENT_LAYERS * 1_408, 33_792);
+        assert_eq!(
+            rooms.host_able(2, 64),
+            64 * 1_152,
+            "the cached row is host-able alone"
+        );
+
+        let k3 = described("kimi-k3-place-rooms");
+        let rooms = k3.kv.rooms().expect("a K3 file declares its rooms");
+        let [cache] = rooms.buffers(2) else {
+            panic!("{:?}: the cached row alone", rooms.buffers(2));
+        };
+        assert_eq!((cache.row, cache.access), (1_152, Access::Scan));
+        assert_eq!(
+            rooms.host_able(2, 64),
+            0,
+            "a K3 file has nothing a host page may hold"
+        );
+        assert_eq!(rooms.bytes(2, 64), KvBytes::layer_bytes(&k3.kv, 2, 64));
+    }
+
+    /// The plan reads the declaration end to end: with no floor every term is at the cap (the
+    /// card's kv class is `a_k31_context_past_top_k_plans_its_stores`'), and with a floor of 8,192
+    /// positions at a context of 262,144 the latent layer's rooms count 8,192 x 1,408 =
+    /// 11,534,336 B [derived], the delta layers' states and every byte past the rooms staying at
+    /// the cap; under `BLOOMERY_KV_HOST=all` the cached row leaves the card (8,192 x 256 B stay),
+    /// and a K3 file under `all` has no host-able room, so its bytes stay. Mutants: the rooms left
+    /// out of the layout (the floor changes nothing), `rooms()` not forwarded by the wrapper.
+    #[test]
+    fn a_k31_plan_counts_its_rooms_at_the_floor() {
+        use bloomery_levers::KvHost;
+        const CTX: u64 = 262_144;
+        const FLOOR: u64 = 8_192;
+        const PAGE: u64 = 2 << 20;
+        let machine = workstation::plan_gate(4);
+        let held = |inputs: &PlanInputs, levers: &PlanLevers| -> u64 {
+            let plan = inputs
+                .plan(&machine, CTX, levers)
+                .unwrap_or_else(|e| panic!("the gate machine plans {CTX}: {e}"));
+            plan.cards.iter().map(|c| c.kv_bytes).sum()
+        };
+        let fixed = 3 * 164_868;
+        let mut k31 = PlanInputs::describe(&opened31("kimi-k31-place-floor"))
+            .expect("the synthetic K3.1 header describes");
+        k31.kv_host_page = Some(PAGE);
+        let at_floor = PlanLevers {
+            kv_floor: Some(FLOOR),
+            ..PlanLevers::default()
+        };
+        assert_eq!(held(&k31, &PlanLevers::default()), fixed + CTX * 1_408);
+        assert_eq!(held(&k31, &at_floor), fixed + FLOOR * 1_408);
+        let all = PlanLevers {
+            kv_host: KvHost::All,
+            ..PlanLevers::default()
+        };
+        assert_eq!(held(&k31, &all), fixed + CTX * 256);
+        let mut k3 = described("kimi-k3-place-floor");
+        k3.kv_host_page = Some(PAGE);
+        let k3_cap = fixed + CTX * 1_152;
+        assert_eq!(held(&k3, &PlanLevers::default()), k3_cap);
+        assert_eq!(
+            held(&k3, &all),
+            k3_cap,
+            "a scanned buffer never leaves the card"
+        );
+        assert_eq!(held(&k3, &at_floor), fixed + FLOOR * 1_152);
+    }
+
+    /// A K3.1 plan under `BLOOMERY_KV_HOST` counts the host-able cached row's pages against its
+    /// host room [derived by hand, the fixture's one latent layer, page 2 MiB]: at 262,144
+    /// positions the cached run is 144 whole pages (301,989,888 B), at a floor of 8,192 it is 5
+    /// pages (10,485,760 B), so `spill` sends 291,504,128 B to the host and `all` 301,989,888 B,
+    /// the key run never; `off` and a plan with no floor count none. A host backing with no page
+    /// is refused by name before any term is read, and a plan with the page set adds the rooms'
+    /// page rounding and the device's spare page to card 0's stage rows: at 100,000 positions
+    /// the cached run is 143,360 B and the key run 1,662,976 B past their rows, and the spare
+    /// page 2,097,152 B. Mutants: the host count left out of `plan_with_slots`, the floor's pages
+    /// not taken off, the padding left out of the stage rows.
+    #[test]
+    fn a_k31_plan_counts_its_host_pages_and_padding() {
+        use bloomery_levers::KvHost;
+        const PAGE: u64 = 2 << 20;
+        const CTX: u64 = 262_144;
+        let machine = workstation::plan_gate(4);
+        let mut inputs = PlanInputs::describe(&opened31("kimi-k31-place-host"))
+            .expect("the synthetic K3.1 header describes");
+        let levers = |host, floor| PlanLevers {
+            kv_host: host,
+            kv_floor: floor,
+            ..PlanLevers::default()
+        };
+        let host_bytes = |inputs: &PlanInputs, levers: &PlanLevers, ctx| -> u64 {
+            inputs
+                .plan(&machine, ctx, levers)
+                .unwrap_or_else(|e| panic!("the gate machine plans {ctx}: {e}"))
+                .host
+                .kv_host_bytes
+        };
+        inputs.kv_host_page = Some(PAGE);
+        assert_eq!(
+            host_bytes(&inputs, &levers(KvHost::Spill, Some(8_192)), CTX),
+            291_504_128
+        );
+        assert_eq!(
+            host_bytes(&inputs, &levers(KvHost::All, None), CTX),
+            301_989_888
+        );
+        assert_eq!(host_bytes(&inputs, &levers(KvHost::Spill, None), CTX), 0);
+        assert_eq!(
+            host_bytes(&inputs, &levers(KvHost::Off, Some(8_192)), CTX),
+            0
+        );
+
+        inputs.kv_host_page = None;
+        let refused = inputs
+            .plan(&machine, CTX, &levers(KvHost::Spill, Some(8_192)))
+            .expect_err("a host backing with no page is refused");
+        assert!(
+            refused.to_string().contains("BLOOMERY_KV_HOST"),
+            "{refused}"
+        );
+
+        let kv = |inputs: &PlanInputs| -> u64 {
+            let plan = inputs
+                .plan(&machine, 100_000, &levers(KvHost::Off, Some(8_192)))
+                .expect("the gate machine plans 100,000");
+            plan.cards[0].kv_bytes
+        };
+        let bare = kv(&inputs);
+        inputs.room_page = Some(PAGE);
+        assert_eq!(kv(&inputs) - bare, 143_360 + 1_662_976 + PAGE);
+    }
+
+    /// The rounding lands on the card that holds the room's layer, with that card's spare page,
+    /// and on no other [derived by hand, page 2 MiB, 100,000 positions]: the fixture's one latent
+    /// layer (layer 2) on the second of two stage cards (layers 0..2 and 2..4) adds 143,360 B +
+    /// 1,662,976 B + the spare page 2,097,152 B to card 1's cache term and nothing to card 0's,
+    /// which holds no room. Mutant: the rounding counted on card 0 only (`kvc-k31-padding-card-0`).
+    #[test]
+    fn a_k31_plan_counts_each_cards_room_padding() {
+        use bloomery_levers::KvHost;
+        const PAGE: u64 = 2 << 20;
+        let mut machine = workstation::plan_gate(4);
+        let mut second = workstation::plan_on(A6000, 4).cards.remove(0);
+        second.head = false;
+        second.token_embedding = false;
+        second.layers = 2..4;
+        machine.cards[0].layers = 0..2;
+        machine.cards.push(second);
+        let mut inputs = PlanInputs::describe(&opened31("kimi-k31-place-cards"))
+            .expect("the synthetic K3.1 header describes");
+        let levers = PlanLevers {
+            kv_floor: Some(8_192),
+            kv_host: KvHost::Off,
+            ..PlanLevers::default()
+        };
+        let kv = |inputs: &PlanInputs| -> Vec<u64> {
+            inputs
+                .plan(&machine, 100_000, &levers)
+                .unwrap_or_else(|e| panic!("the two-card machine plans 100,000: {e}"))
+                .cards
+                .iter()
+                .map(|c| c.kv_bytes)
+                .collect()
+        };
+        let bare = kv(&inputs);
+        inputs.room_page = Some(PAGE);
+        let padded = kv(&inputs);
+        assert_eq!(padded[0] - bare[0], 0, "card 0 holds no room");
+        assert_eq!(padded[1] - bare[1], 143_360 + 1_662_976 + PAGE);
     }
 
     /// A driver that opens a K3.1 file with a context reads it by `read_without_chat_for`: at the

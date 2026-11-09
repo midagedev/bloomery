@@ -1,0 +1,12 @@
+--- a/crates/model/src/arch/place_hybrid.rs
++++ b/crates/model/src/arch/place_hybrid.rs
+@@ -729,6 +729,9 @@
+         let Some((pages, rooms)) = self.pages.zip(self.kv.rooms()) else {
+             return 0;
+         };
++        if layer < usize::MAX {
++            return 0;
++        }
+         let spare = if self.spare_on.contains(&layer) {
+             room_spare(pages, self.host)
+         } else {

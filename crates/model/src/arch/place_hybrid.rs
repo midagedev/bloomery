@@ -22,9 +22,10 @@
 use std::num::NonZeroUsize;
 use std::ops::Range;
 
-use bloomery_placement::slots::{SeqTerms, Stores};
+use bloomery_levers::KvHost;
+use bloomery_placement::slots::{SeqTerms, Stores, kv_host_room, layer_padding, room_spare};
 use models::{DeltaRule, Gqa, IndexKeys, Latent, Mixer, ModelSpec, RopeMode, Selector, Source};
-use runtime::stores::{self, Rows};
+use runtime::stores::{self, PosLayout, Rows};
 
 use crate::arch::coverage;
 use crate::placement::accepts::{program_of, routed_rule};
@@ -291,6 +292,16 @@ pub struct PlanInputs<H> {
     pass_arena: bool,
     /// The engine the refusals that name one name.
     engine: &'static str,
+    /// The page a host-capable room takes on the stage card (`gpu`'s `host_page`): what a plan
+    /// under `BLOOMERY_KV_HOST` `spill` or `all` counts the host-able rooms' pages at
+    /// ([`kv_host_room`]) and rounds them at ([`room_padding`]); a plan under either with none
+    /// is refused by name. `None` unset and under `off`: a binary that plans under the lever
+    /// reads it once and sets it, as a gate sets [`PlanInputs::room`].
+    pub kv_host_page: Option<u64>,
+    /// The stage card's allocation granularity (`gpu-gates`' `stage_page`), the page a card room
+    /// backs its rows by: set, the plan counts the rooms' page rounding and the device's spare
+    /// page on card 0 ([`room_padding`]) beside the stores; `None`, it counts neither.
+    pub room_page: Option<u64>,
 }
 
 /// Why a plan was refused.
@@ -417,6 +428,8 @@ impl<H> PlanInputs<H> {
             nvme_tier: false,
             pass_arena: false,
             engine,
+            kv_host_page: None,
+            room_page: None,
         })
     }
 
@@ -474,6 +487,16 @@ impl<H> PlanInputs<H> {
     pub fn with_pass_arena(self) -> PlanInputs<H> {
         PlanInputs {
             pass_arena: true,
+            ..self
+        }
+    }
+
+    /// `self` with the by-position buffers `rooms` the body holds in rooms
+    /// ([`KvLayout::with_rooms`]).
+    #[must_use]
+    pub fn with_rooms(self, rooms: PosLayout) -> PlanInputs<H> {
+        PlanInputs {
+            kv: self.kv.with_rooms(rooms),
             ..self
         }
     }
@@ -571,6 +594,18 @@ impl<H> PlanInputs<H> {
         let program = program_of(self.spec.arch)
             .ok_or_else(|| PlacementError::Unimplemented(self.unimplemented()))?;
         let kv = self.seq_terms().slots_of(slots.get() as u64);
+        // A load whose rooms the lever backs on the host reads its page: refused by name before
+        // any plan term is read.
+        let kv_page = match (levers.kv_host, kv.rooms()) {
+            (KvHost::Off, _) | (_, None) => None,
+            _ => Some(self.kv_host_page_of()?),
+        };
+        let kv = RoomPadded::new(
+            &kv,
+            machine,
+            self.room_page.map(|card| (card, self.kv_host_page)),
+            levers.kv_host,
+        );
         let mut plan = placement::plan_routed_reserving(
             &self.model,
             machine,
@@ -580,6 +615,14 @@ impl<H> PlanInputs<H> {
             routed_rule(program),
             reserve,
         )?;
+        // The host-backed rooms' pages the plan sends to the host (`spill`: those past the floor,
+        // `all`: every page) count against the host room before the NVMe tier's split reads it.
+        if plan.kv_host != KvHost::Off
+            && let Some((rooms, page)) = kv.rooms().zip(kv_page)
+        {
+            let bytes = kv_host_room(rooms, ctx_max, plan.kv_floor, plan.kv_host, page);
+            plan.kv_host_planes(bytes)?;
+        }
         let need = HostNeed::of(&plan, 0).bytes();
         let room = plan.plan_at(&self.room);
         match self.arena {
@@ -613,10 +656,108 @@ impl<H> PlanInputs<H> {
         Ok(plan)
     }
 
+    /// The by-position buffers the body holds in rooms, `None` for a layout that declares none
+    /// ([`KvBytes::rooms`]).
+    #[must_use]
+    pub fn rooms(&self) -> Option<&PosLayout> {
+        self.kv.rooms()
+    }
+
+    /// The engine the refusals that name one name.
+    #[must_use]
+    pub fn engine(&self) -> &'static str {
+        self.engine
+    }
+
+    /// The page a host-capable room takes, refused by name where a plan under `spill` or `all`
+    /// has none ([`PlanInputs::kv_host_page`]).
+    fn kv_host_page_of(&self) -> Result<u64, PlacementError> {
+        self.kv_host_page.ok_or_else(|| PlacementError::Metadata {
+            key: "BLOOMERY_KV_HOST".to_owned(),
+            detail: "the page a host-capable room takes was not read; a binary that plans under \
+                     the lever reads it once (gpu's host_page) and sets PlanInputs::kv_host_page"
+                .to_owned(),
+        })
+    }
+
     /// What one resident sequence of a load of the file holds on its card ([`SeqTerms`]).
     #[must_use]
     pub fn seq_terms(&self) -> SeqTerms<'_> {
         self.kv.seq_terms()
+    }
+}
+
+/// `kv` with the page rounding of its rooms counted on the card that holds each layer: a layer's
+/// buffers rounded to whole pages ([`room_padding`] over that layer, at the cap) join its bytes,
+/// and the device's spare page(s) join the first room-holding layer of each stage card, so every
+/// card holding a room counts its own rounding and one spare. `pages` is `(card page, host
+/// page)`; `None`, nothing is added and the plan reads `kv` as it is.
+struct RoomPadded<'a> {
+    kv: &'a dyn KvBytes,
+    pages: Option<(u64, Option<u64>)>,
+    host: KvHost,
+    /// The layers that carry their card's spare pages: each stage card's first layer whose
+    /// rooms hold a buffer.
+    spare_on: Vec<usize>,
+}
+
+impl<'a> RoomPadded<'a> {
+    fn new(
+        kv: &'a dyn KvBytes,
+        machine: &Machine,
+        pages: Option<(u64, Option<u64>)>,
+        host: KvHost,
+    ) -> RoomPadded<'a> {
+        let spare_on = kv.rooms().map_or_else(Vec::new, |rooms| {
+            machine
+                .cards
+                .iter()
+                .filter_map(|c| c.layers.clone().find(|&l| !rooms.buffers(l).is_empty()))
+                .collect()
+        });
+        RoomPadded {
+            kv,
+            pages,
+            host,
+            spare_on,
+        }
+    }
+
+    /// `layer`'s rounding at `ctx_max` positions, with its card's spare pages where it carries
+    /// them; `u64::MAX` past u64 (a term no card holds).
+    fn padding(&self, layer: usize, ctx_max: u64) -> u64 {
+        let Some((pages, rooms)) = self.pages.zip(self.kv.rooms()) else {
+            return 0;
+        };
+        let spare = if self.spare_on.contains(&layer) {
+            room_spare(pages, self.host)
+        } else {
+            Some(0)
+        };
+        layer_padding(rooms, layer, ctx_max, pages, self.host)
+            .zip(spare)
+            .and_then(|(own, spare)| own.checked_add(spare))
+            .unwrap_or(u64::MAX)
+    }
+}
+
+impl KvBytes for RoomPadded<'_> {
+    fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        self.kv
+            .layer_bytes(layer, ctx_max)
+            .saturating_add(self.padding(layer, ctx_max))
+    }
+
+    fn rooms(&self) -> Option<&PosLayout> {
+        self.kv.rooms()
+    }
+
+    fn shadow_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+        self.kv.shadow_bytes(layer, ctx_max)
+    }
+
+    fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+        self.kv.stage_position_bytes(ctx_max)
     }
 }
 
@@ -721,6 +862,9 @@ pub struct KvLayout {
     /// body's scratch sized by the context, one copy whatever the resident sequences
     /// ([`KvLayout::with_position_scratch`]); 0 for a body whose scratch holds none.
     scratch_row: u64,
+    /// The by-position buffers the body holds in rooms ([`KvLayout::with_rooms`]); none for a body
+    /// whose stores are plain buffers.
+    rooms: Option<PosLayout>,
     /// The lanes of a delta-rule layer's state.
     lanes: NonZeroUsize,
 }
@@ -797,6 +941,7 @@ impl KvLayout {
                 .sum(),
             sink_row,
             scratch_row: 0,
+            rooms: None,
             lanes: NonZeroUsize::MIN,
         })
     }
@@ -818,6 +963,18 @@ impl KvLayout {
     pub fn with_position_scratch(self, row: u64) -> KvLayout {
         KvLayout {
             scratch_row: row,
+            ..self
+        }
+    }
+
+    /// The same layout with the by-position buffers `rooms` the body holds in rooms: the part of
+    /// each layer's bytes the plan reads at the expert spread's floor
+    /// ([`KvBytes::rooms`]). The family that builds the rooms owns the declaration and its
+    /// bytes equal the layers' own ([`KvLayout::layer_bytes`]) wherever it names a buffer.
+    #[must_use]
+    pub fn with_rooms(self, rooms: PosLayout) -> KvLayout {
+        KvLayout {
+            rooms: Some(rooms),
             ..self
         }
     }
@@ -938,6 +1095,10 @@ impl KvBytes for KvLayout {
             }
             Some(Hold::Nothing) | None => 0,
         }
+    }
+
+    fn rooms(&self) -> Option<&PosLayout> {
+        self.rooms.as_ref()
     }
 
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {

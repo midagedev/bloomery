@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/kimi_k3/hparams.rs	2026-11-09 18:38:21
++++ b/crates/model/src/arch/kimi_k3/hparams.rs	2026-11-09 18:38:21
+@@ -274,7 +274,7 @@
+             runs: 1,
+             access: cache,
+         }];
+-        if let Some(ix) = self.indexer.as_ref().filter(|ix| ix.layers[l]) {
++        if let Some(ix) = self.indexer.as_ref().filter(|_| false) {
+             bufs.push(PosBuf {
+                 what: INDEX_KEY_ROWS,
+                 row: ix.d as u64 * F16_BYTES,

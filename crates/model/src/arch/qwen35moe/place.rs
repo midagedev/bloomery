@@ -42,7 +42,7 @@
 //! ([`StoreRows`]), chosen by the plan from its room.
 
 use bloomery_levers::KvHost;
-use bloomery_placement::slots::{SeqTerms, Stores};
+use bloomery_placement::slots::{self, SeqTerms, Stores};
 use gguf::{GgmlType, Split};
 use models::headpick::{HeadRowsError, HeadSet, vocab_sha256};
 use models::{
@@ -71,7 +71,7 @@ use crate::placement::{
 use gguf::digest::hex;
 
 use runtime::stores::{
-    Access, Class, DELTA_VERIFY_ROWS, F16_BYTES, F32_BYTES, PosBuf, PosLayout, delta_carry_bytes,
+    Access, DELTA_VERIFY_ROWS, F16_BYTES, F32_BYTES, PosBuf, PosLayout, delta_carry_bytes,
     delta_lane_bytes, delta_record_bytes, index_ring_bytes, kv_plane_bytes, ple_ring_bytes,
     recurrent_bytes, selecting_rows_bytes,
 };
@@ -392,22 +392,37 @@ impl PlanInputs {
         })
     }
 
-    /// Bytes beyond the positional rows that room-backed stores can hold:
-    /// every buffer rounded independently on every resident slot, and the
-    /// device's shared spare pages. `page` is read when the stage card opens.
-    /// `kv` is the K/V planes' backing (`BLOOMERY_KV_HOST`): under `spill` the
-    /// planes round at the page a host-capable room takes
-    /// ([`PlanInputs::kv_host_page`]), not the card's own granularity, and
-    /// the device holds that room's spare page beside the card rooms'; under
-    /// `all` the planes hold no card bytes, so they add no card padding and
-    /// their whole bytes sit on the host ([`PlanInputs::kv_host_bytes`]),
-    /// their room's spare page still on the card. A layout that declares no
-    /// rooms (a file without the selector: plain buffers, counted whole in
-    /// the layer's bytes) pads nothing.
+    /// Bytes beyond the positional rows that room-backed stores can hold on a stage card
+    /// holding every layer ([`PlanInputs::card_room_padding`] over `0..layers`, the draft's
+    /// planes on it): every buffer rounded independently on every resident slot, and the
+    /// device's shared spare pages. `page` is read when the stage card opens. `kv` is the K/V
+    /// planes' backing (`BLOOMERY_KV_HOST`): under `spill` the planes round at the page a
+    /// host-capable room takes ([`PlanInputs::kv_host_page`]), not the card's own granularity,
+    /// and the device holds that room's spare page beside the card rooms'; under `all` the
+    /// planes hold no card bytes, so they add no card padding and their whole bytes sit on the
+    /// host ([`PlanInputs::kv_host_bytes`]), their room's spare page still on the card. A layout
+    /// that declares no rooms (a file without the selector: plain buffers, counted whole in the
+    /// layer's bytes) pads nothing.
     pub fn room_padding(
         &self,
         ctx: u64,
         slots: u64,
+        drafts: bool,
+        page: u64,
+        kv: KvHost,
+    ) -> Result<u64, PlacementError> {
+        let layers = self.kv.rooms().map_or(0, PosLayout::layers);
+        self.card_room_padding(0..layers, (ctx, slots), drafts, page, kv)
+    }
+
+    /// The bytes beyond the positional rows that the room-backed stores of the card holding
+    /// `layers` can hold ([`slots::card_padding`]): each of its layers' buffers rounded on every
+    /// slot and the spare pages once, a card with no room layer paying none. `drafts` puts the
+    /// draft's planes on this card.
+    fn card_room_padding(
+        &self,
+        layers: std::ops::Range<usize>,
+        (ctx, slots): (u64, u64),
         drafts: bool,
         page: u64,
         kv: KvHost,
@@ -420,50 +435,22 @@ impl PlanInputs {
             KvHost::Off => None,
             KvHost::Spill | KvHost::All => Some(self.kv_host_page_of()?),
         };
-        // A host-class room rounds at the page its backing takes — the card's own under `off`, a
-        // host-capable room's under `spill`, none under `all` (it holds no card bytes); a
-        // card-class room, the pooled keys and the draft's store, at the card's page.
-        let pages = |class: Class| match class {
-            Class::Card => Some(page),
-            Class::Host => match kv {
-                KvHost::Off => Some(page),
-                KvHost::Spill => host_page,
-                KvHost::All => None,
-            },
-        };
-        // The card rooms' shared spare page, and a host-capable room's own
-        // beside it where the two pages differ.
-        let spare = page
-            + match host_page {
-                Some(at) if kv != KvHost::Off && at != page => at,
-                _ => 0,
-            };
         let rooms = self.rooms_declared()?;
         let past = || PlacementError::CardBytesPastU64 {
             card: "room-backed stores".to_owned(),
         };
-        let mut extra = 0u64;
-        for layer in 0..rooms.layers() {
-            extra = rooms
-                .padding(layer, ctx, pages)
-                .and_then(|p| extra.checked_add(p))
-                .ok_or_else(past)?;
-        }
-        if drafts {
+        let draft = if drafts {
             let g = self.spec.gqa().ok_or_else(past)?;
             let draft = PosLayout::new(vec![plane_bufs(
                 (g.kv_heads as usize, g.head_dim as usize),
                 self.kv.is_q8(),
                 Access::Scan,
             )]);
-            extra = draft
-                .padding(0, ctx, |_| Some(page))
-                .and_then(|p| extra.checked_add(p))
-                .ok_or_else(past)?;
-        }
-        extra
-            .checked_mul(slots)
-            .and_then(|e| e.checked_add(spare))
+            Some(draft.padding(0, ctx, |_| Some(page)).ok_or_else(past)?)
+        } else {
+            None
+        };
+        slots::card_padding(rooms, layers, (ctx, slots), (page, host_page), kv, draft)
             .ok_or_else(past)
     }
 
@@ -502,9 +489,10 @@ impl PlanInputs {
         whole.checked_mul(slots).ok_or_else(past)
     }
 
-    /// `machine`'s stage card with the page rounding of room-backed stores
-    /// ([`PlanInputs::room_padding`]) reserved: what every plan of a load
-    /// that backs its stores by room counts before admission. `kv` is the
+    /// `machine`'s cards with the page rounding of room-backed stores reserved, each card its own
+    /// ([`PlanInputs::card_room_padding`] over the layers it holds; the draft's planes on the
+    /// first): what every plan of a load that backs its stores by room counts before admission.
+    /// `kv` is the
     /// K/V planes' backing ([`BLOOMERY_KV_HOST`]), as the plan's levers hold
     /// it.
     pub fn reserve_room(
@@ -514,10 +502,17 @@ impl PlanInputs {
         page: u64,
         kv: KvHost,
     ) -> Result<(), PlacementError> {
-        let padding = self.room_padding(ctx, slots, drafts, page, kv)?;
-        machine.cards[0]
-            .reserves
-            .push(("store page rounding".to_owned(), padding));
+        for (i, card) in machine.cards.iter_mut().enumerate() {
+            let padding = self.card_room_padding(
+                card.layers.clone(),
+                (ctx, slots),
+                drafts && i == 0,
+                page,
+                kv,
+            )?;
+            card.reserves
+                .push(("store page rounding".to_owned(), padding));
+        }
         Ok(())
     }
 
@@ -5269,6 +5264,76 @@ mod tests {
                 assert!(
                     matches!(e, PlacementError::CardBytesPastU64 { ref card } if card == "room-backed stores")
                 );
+            }
+        }
+
+        /// One stage card reserves exactly [`PlanInputs::room_padding`]; with the stage split over
+        /// two cards each card reserves its own layers' rounding and its own spare page, the
+        /// draft's planes on the first. The attention layer (3) is the only room layer, so the
+        /// card that holds it pays the rooms and the other pays none.
+        #[test]
+        fn each_card_that_holds_rooms_reserves_its_own_padding() {
+            let (ctx, slots, page) = (4096u64, 4u64, 2u64 << 20);
+            let reserved = |m: &Machine| -> Vec<u64> {
+                m.cards
+                    .iter()
+                    .map(|c| c.reserves.iter().map(|r| r.1).sum())
+                    .collect()
+            };
+            let two = |cut: usize| {
+                let mut m = machine();
+                let mut second = m.cards[0].clone();
+                m.cards[0].layers = 0..cut;
+                m.cards[0].head = false;
+                second.layers = cut..LAYERS;
+                m.cards.push(second);
+                m
+            };
+            for q8 in [false, true] {
+                let mut inputs = inputs();
+                inputs.kv = inputs.kv.in_q8_if(q8);
+                for drafts in [false, true] {
+                    let mut one = machine();
+                    inputs
+                        .reserve_room(&mut one, (ctx, slots, drafts), page, KvHost::Off)
+                        .expect("one card");
+                    let whole = inputs
+                        .room_padding(ctx, slots, drafts, page, KvHost::Off)
+                        .expect("padding");
+                    assert_eq!(
+                        reserved(&one),
+                        vec![whole],
+                        "one card, q8 {q8}, drafts {drafts}"
+                    );
+
+                    // The room layer on the second card: the first holds the draft only.
+                    let mut split = two(LAYERS - 1);
+                    inputs
+                        .reserve_room(&mut split, (ctx, slots, drafts), page, KvHost::Off)
+                        .expect("two cards");
+                    let got = reserved(&split);
+                    let rooms = inputs.kv.rooms().expect("rooms");
+                    let layer = slots
+                        * bloomery_placement::slots::layer_padding(
+                            rooms,
+                            3,
+                            ctx,
+                            (page, None),
+                            KvHost::Off,
+                        )
+                        .expect("layer");
+                    assert_eq!(
+                        got[1],
+                        layer + page,
+                        "second card, q8 {q8}, drafts {drafts}"
+                    );
+                    let draft = whole - layer - page;
+                    assert_eq!(
+                        got[0],
+                        if drafts { draft + page } else { 0 },
+                        "first card, q8 {q8}, drafts {drafts}"
+                    );
+                }
             }
         }
 

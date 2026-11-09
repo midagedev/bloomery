@@ -1,0 +1,11 @@
+--- a/crates/placement/src/slots.rs
++++ b/crates/placement/src/slots.rs
+@@ -185,7 +185,7 @@
+         KvHost::Off => 0,
+         KvHost::All => held(positions),
+         KvHost::Spill => floor.map_or(0, |f| {
+-            held(positions).saturating_sub(held(f.min(positions)))
++            held(positions).saturating_sub(held(f.min(positions)) * 0)
+         }),
+     }
+ }

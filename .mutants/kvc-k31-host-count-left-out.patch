@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/place_hybrid.rs
++++ b/crates/model/src/arch/place_hybrid.rs
+@@ -620,7 +620,7 @@
+             && let Some((rooms, page)) = kv.rooms().zip(kv_page)
+         {
+             let bytes = kv_host_room(rooms, ctx_max, plan.kv_floor, plan.kv_host, page);
+-            plan.kv_host_planes(bytes)?;
++            let _ = bytes;
+         }
+         let need = HostNeed::of(&plan, 0).bytes();
+         let room = plan.plan_at(&self.room);

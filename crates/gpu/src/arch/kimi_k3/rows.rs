@@ -448,6 +448,7 @@ impl Body {
         tail: Tail<'_>,
     ) -> Result<(), GpuError> {
         let m = ids.len();
+        self.fit_pass(pos, m)?;
         if !(1..=PASS_ROWS).contains(&m) {
             return Err(GpuError::shape(
                 ROWS,

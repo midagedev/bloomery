@@ -1,0 +1,23 @@
+--- a/crates/model/src/arch/place_hybrid.rs
++++ b/crates/model/src/arch/place_hybrid.rs
+@@ -721,6 +721,10 @@
+             host,
+             spare_on,
+         }
++    }
++
++    fn card_zero_only(&self, layer: usize) -> bool {
++        layer >= 2
+     }
+ 
+     /// `layer`'s rounding at `ctx_max` positions, with its card's spare pages where it carries
+@@ -729,6 +733,9 @@
+         let Some((pages, rooms)) = self.pages.zip(self.kv.rooms()) else {
+             return 0;
+         };
++        if self.card_zero_only(layer) {
++            return 0;
++        }
+         let spare = if self.spare_on.contains(&layer) {
+             room_spare(pages, self.host)
+         } else {

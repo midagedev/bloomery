@@ -35,7 +35,9 @@ use bloomery_gpu_gates::bind::{
     CacheRam, ChatSurface, Pass, Seat, SeatEngine, SeatFlags, SlotsFrom, Vocab, arm_screen,
     eprint_noted, model_props, parallel_line, placement_of, slots_given, slots_of,
 };
-use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, TierRule, choose_ctx, lane_at};
+use bloomery_gpu_gates::generate::{
+    DraftSeat, Lane, Place, TierRule, choose_ctx, lane_at, stage_host_page, stage_page,
+};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::residency;
@@ -46,7 +48,7 @@ use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::vision_seat::{self, Cost, Opened, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
 use bloomery_levers::{
-    ChurnHosting, HostCfg, Levers, ResidencyAt, ResidencyPick, ResidencyWhy, UnhostedPool,
+    ChurnHosting, HostCfg, KvHost, Levers, ResidencyAt, ResidencyPick, ResidencyWhy, UnhostedPool,
 };
 use gguf::Split;
 use model::arch::Arch;
@@ -55,7 +57,7 @@ use model::arch::models::ReasoningFormat;
 use model::arch::place_hybrid::{PlaceError, PlanInputs, reserve_room};
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::{self, HostNeed, TierBatchBytes};
-use model::placement::{Machine, PlacementError, Plan, PlanLevers};
+use model::placement::{KvDefault, Machine, PlacementError, Plan, PlanLevers};
 use runtime::width::Mode as WidthMode;
 use serve::reasoning::{ResponseTags, ThinkTags};
 use serve::{EngineProps, ServeError};
@@ -266,7 +268,7 @@ impl<H> Walk<H> {
 /// the plan keeps on the card and on the host: what its family owns, and the load that opens it.
 pub trait Tiered: Seat + Sized + 'static {
     /// The family's hyperparameters: what its plan inputs are read for.
-    type H;
+    type H: Clone;
     /// The flags this seat takes beside the common ones ([`SeatFlags`]).
     type Flags: Default + Send;
 
@@ -338,6 +340,12 @@ pub trait Tiered: Seat + Sized + 'static {
     /// `fixed_place`), and a set word other than `off` is refused by name before the model is
     /// fetched and before the plan ([`refuse_fixed_slot_map`]). The default runs the machine.
     const SLOT_MAP_FIXED: bool = false;
+
+    /// What the load takes for the K/V levers it leaves unset ([`PlanLevers::from_levers_with`]):
+    /// the floor its plan spreads the experts at and the planes' backing. `None`, an unset lever
+    /// plans as the type's default does ([`PlanLevers::from_levers`]); the levers still act where
+    /// the family's [`Tiered::ACTS_ON`] names them and its stores declare rooms.
+    const KV_DEFAULT: Option<KvDefault> = None;
 
     /// How the load runs a prompt, for a body that has a prompt pass: asked once the context
     /// (`ctx`) and the step's plan are chosen, with the run's machine at a tier batch of the
@@ -612,6 +620,44 @@ pub fn settle_pick(plan: &Plan<'_>, pick: ResidencyPick) -> Result<(Residency, u
     ))
 }
 
+/// The pages a load whose stores declare rooms plans by, read once from `place`'s stage card where
+/// a K/V lever acts (a floor, set or a default, or a `BLOOMERY_KV_HOST` backing other than `off`):
+/// the card's allocation granularity for the rooms' page rounding ([`PlanInputs::room_page`]) and,
+/// under a host backing, the page a host-capable room takes ([`PlanInputs::kv_host_page`]). A
+/// host backing the device cannot page is the refusal when the lever is set, and for an unset
+/// lever (the family's default) the planes stay on the card (`kv_host=off`), named on stderr.
+/// With no lever acting the plan counts no rounding and reads as it did before the levers.
+fn room_pages<H>(
+    inputs: &mut PlanInputs<H>,
+    plan: &mut PlanLevers,
+    place: Place,
+    set: &Levers,
+) -> Result<(), GateError> {
+    let acts =
+        plan.kv_floor.is_some() || plan.kv_floor_default.is_some() || plan.kv_host != KvHost::Off;
+    if inputs.rooms().is_none() || !acts {
+        return Ok(());
+    }
+    let stage = place.card_specs()?[0];
+    inputs.room_page = Some(stage_page(stage)?);
+    if plan.kv_host != KvHost::Off {
+        match stage_host_page(stage) {
+            Ok(page) => inputs.kv_host_page = Some(page),
+            Err(e) if set.kv_host_set().is_none() => {
+                eprintln!(
+                    "{}: BLOOMERY_KV_HOST is unset and {} cannot back a K/V page on the host \
+                     ({e}); the planes stay on the card (kv_host=off)",
+                    inputs.engine(),
+                    stage.name
+                );
+                plan.kv_host = KvHost::Off;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// The routed experts `offer`'s plan holds on its expert tier cards, which the common unset rule
 /// weighs ([`Place::choose`] by [`Tiered::TIER_RULE`]): one slot's plan at the asked context, or
 /// at one position unset — a tier card holds no store, so its experts do not move with the
@@ -620,6 +666,7 @@ fn tier_experts<S: Tiered>(
     offer: Place,
     inputs: &PlanInputs<S::H>,
     levers: &PlanLevers,
+    set: &Levers,
     ctx: Option<usize>,
     spark: Option<&DraftCardBytes>,
 ) -> Result<u64, GateError> {
@@ -631,7 +678,9 @@ fn tier_experts<S: Tiered>(
         inputs.model.layers,
     )?;
     let ctx = ctx.map_or(Ok(1), u64::try_from)?;
-    let plan = inputs.plan(&machine, ctx, levers)?;
+    let (mut inputs, mut levers) = (PlanInputs::clone(inputs), levers.clone());
+    room_pages(&mut inputs, &mut levers, offer, set)?;
+    let plan = inputs.plan(&machine, ctx, &levers)?;
     Ok(plan.tier_n_l.iter().flatten().sum())
 }
 
@@ -848,7 +897,10 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         S::check_ctx(&inputs, ctx)?;
     }
     let think = S::think(&inputs)?;
-    let plan_levers = PlanLevers::from_levers(&levers)?;
+    let mut plan_levers = match S::KV_DEFAULT {
+        Some(default) => PlanLevers::from_levers_with(&levers, default)?,
+        None => PlanLevers::from_levers(&levers)?,
+    };
     // The slot count and what named it (`from` on the `parallel` line); a seat of one sequence
     // reads `--parallel` as the one slot it holds, with no note about a count it cannot offer.
     let draft = if S::DRAFTS {
@@ -881,19 +933,24 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     } else {
         Place::choose(a.place, &census, S::TIER_RULE, |offer| {
             refuse_tier_slots::<S>(offer, slots)?;
-            tier_experts::<S>(offer, &inputs, &plan_levers, a.ctx, spark.as_ref())
+            tier_experts::<S>(offer, &inputs, &plan_levers, &levers, a.ctx, spark.as_ref())
         })?
     };
     refuse_tier_slots::<S>(chosen.place, slots)?;
     chosen.record().eprint();
     let place = chosen.place;
+    // The pages the K/V levers plan by, on the placement's stage card: every plan below counts
+    // them, and the ring's inputs read next take them too.
+    room_pages(&mut inputs, &mut plan_levers, place, &levers)?;
     // The plan's inputs on this placement where the seat streams, read again from the headers and
     // priced for the prompt group as `inputs` are (the ring's bytes join the group's reserve): the
     // stream's ring out of the expert budget. Whether the load keeps them is settled below.
     let ring_inputs = if S::ring(&levers, place) {
         let mut read = S::read(&split)?;
         S::configure(&mut read, levers.prefill_group())?;
-        Some(S::with_ring(read)?)
+        let mut read = S::with_ring(read)?;
+        room_pages(&mut read, &mut plan_levers.clone(), place, &levers)?;
+        Some(read)
     } else {
         None
     };
