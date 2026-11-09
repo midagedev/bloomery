@@ -135,7 +135,16 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
+    reason = "the shared runner serves several gates; each takes the helpers it reads"
+)]
+#[path = "shared/e2e.rs"]
+mod e2e;
+
+#[cfg(feature = "gpu")]
 mod gate {
+    use crate::e2e::rel;
     use bloomery_gpu::arch::qwen3moe::experts::{CombineArgs, ExpertKernels, GateUpArgs};
     use bloomery_gpu::arch::qwen3moe::router::gated::{
         ROW, ROW_WIDE, RouterKernels, RouterOut, RouterWeight,
@@ -2701,15 +2710,6 @@ mod gate {
             }
         }
         y
-    }
-
-    fn rel(a: &[f32], b: &[f32]) -> f64 {
-        let (mut num, mut den) = (0.0f64, 0.0f64);
-        for (x, y) in a.iter().zip(b) {
-            num += (f64::from(*x) - f64::from(*y)).powi(2);
-            den += f64::from(*y).powi(2);
-        }
-        (num / den.max(f64::MIN_POSITIVE)).sqrt()
     }
 
     fn ffn_case(c: &Ctx, ly: &Layer) -> Result<bool, GateError> {
