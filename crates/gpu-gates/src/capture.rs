@@ -19,6 +19,7 @@ impl Out {
 
 /// The one-token step's `capture` record: its graph's `nodes`.
 pub fn step(nodes: usize, out: Out) {
+    record::require(record::groups::capture::STEP, "capture::step");
     Record::new(&record::CAPTURE)
         .u("graph_nodes", nodes)
         .emit(out.err());
@@ -40,6 +41,7 @@ pub fn check_pair(rows: usize, expect: usize) -> Result<(), String> {
 /// capture is of `expect` rows ([`check_pair`]).
 pub fn pair(rows: usize, expect: usize, nodes: usize, out: Out) -> Result<(), String> {
     check_pair(rows, expect)?;
+    record::require(record::groups::capture::PAIR, "capture::pair");
     Record::new(&record::CAPTURE_PAIR)
         .u("pair_graph_nodes", nodes)
         .emit(out.err());

@@ -3127,6 +3127,17 @@ pub mod groups {
         pub const LEVER: &[&Kind] = &[&RESIDENCY_LEVER];
     }
 
+    /// `capture.rs`.
+    pub mod capture {
+        use crate::record::{CAPTURE, CAPTURE_PAIR, Kind};
+
+        /// The one-token step's capture (`capture::step`).
+        pub const STEP: &[&Kind] = &[&CAPTURE];
+
+        /// The pair pass's verify capture (`capture::pair`).
+        pub const PAIR: &[&Kind] = &[&CAPTURE_PAIR];
+    }
+
     /// `card_bytes.rs`.
     pub mod card_bytes {
         use crate::record::{CARD_BYTES, CARD_UNMEASURED, Kind};
