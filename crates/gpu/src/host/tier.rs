@@ -10,6 +10,16 @@
 //! tier:  wait tier go, −1 → copy x, places in → [gate·up → h q8_1 → down] → copy rows out → barrier → cnt +1, prog +1
 //! ```
 //!
+//! A tier on a node runs the tier's line a layer at a time, on frames the
+//! host sends as it reads each service's picks ([`TierCard::send_layer`]):
+//! the stage card's chain adds no go of a node's tier and the host adds it
+//! itself for the layers it sends, so a layer whose picks name no slot of the
+//! node's sends it nothing — no go, so no image crosses, and the host adds
+//! the layer's unit to the tier's counter itself once the tier is caught up
+//! ([`TierPage::add_unit`]), which the stage card's wait of that layer takes
+//! back as the tier's own signal's. The stage card's wait keeps its one fixed
+//! target on every step; only the tier's work behind it varies.
+//!
 //! The tiers' words live in one page ([`TierPage`], laid out by
 //! [`TierLayout`]) the host tier owns, which the stage card, each tier card
 //! and the host reach over its link (the `link` module). Per tier it holds
@@ -945,9 +955,12 @@ impl TierPage {
     /// Enqueue on the stage card's `stream` the wait of row `row` for a
     /// tier layer whose experts the tiers `tiers` hold: until the host's
     /// counter and each of those tiers' counters are at least one, then minus
-    /// one from each. The settle rule: a tier graph serves each of its layers
-    /// every step, its go count fixed when it was captured, so layer `l`'s
-    /// wait waits for every tier `t` with `kₜ(l) > 0` and for no other. One
+    /// one from each. The settle rule: a tier of this process serves each of
+    /// its layers every step, its go count fixed when it was captured, and a
+    /// tier on a node signals every layer the stage card waits of it — its
+    /// own for the layers the host sent it, the host's added unit for the
+    /// rest — so layer `l`'s wait waits for every tier `t` with `kₜ(l) > 0`
+    /// and for no other. One
     /// batch, whatever the tier count; an empty `tiers` is refused by name.
     pub(super) fn enqueue_back_of(
         &self,
@@ -980,6 +993,46 @@ impl TierPage {
                 "cuStreamBatchMemOp_v2 (hybrid wait, tier)",
             )
         }
+    }
+
+    /// Add one to tier `tier`'s go counter of row `row`, from the host
+    /// thread, for a tier on a node the host just read the picks of: the
+    /// stage card's chain adds no go of a node's tier
+    /// ([`TierPage::enqueue_go_of`] names the tiers it serves), so the host's
+    /// add is the word's only write, and the link carries the row's image
+    /// across with it. Refused by name for a row or a tier the page does not
+    /// carry.
+    pub(super) fn add_go(&self, tier: usize, row: usize) -> Result<(), GpuError> {
+        const WHAT: &str = "TierPage::add_go";
+        self.check_row(row, WHAT)?;
+        if tier >= self.layout.tiers {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("tier {tier} of a tier page of {} tiers", self.layout.tiers),
+            ));
+        }
+        self.link.add(self.layout.word_off(tier, TWord::Go(row)), 1);
+        Ok(())
+    }
+
+    /// Add one to tier `tier`'s counter of row `row`, from the host thread,
+    /// for a layer the host skipped on a node's tier: the stage card's wait
+    /// of that layer takes the unit back as the tier's own signal's. The
+    /// caller adds it only once the tier is caught up, so no unit of a
+    /// service still in flight is taken for a layer the card is waiting on.
+    /// Refused by name for a row or a tier the page does not carry.
+    pub(super) fn add_unit(&self, tier: usize, row: usize) -> Result<(), GpuError> {
+        const WHAT: &str = "TierPage::add_unit";
+        self.check_row(row, WHAT)?;
+        if tier >= self.layout.tiers {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("tier {tier} of a tier page of {} tiers", self.layout.tiers),
+            ));
+        }
+        self.link
+            .add(self.layout.word_off(tier, TWord::Cnt(row)), 1);
+        Ok(())
     }
 
     /// The count of `tiers`, each a tier of the page, ascending, at least
@@ -2167,7 +2220,9 @@ impl TierCard {
     /// ([`Pass::Feed`]), then captures the graph once it has settled
     /// ([`TierCard::capture`]): an instantiation may wait for the card, and
     /// the stage card's launched chain waits for the host, so none is made
-    /// while that chain runs.
+    /// while that chain runs. A tier on a node never holds one: which of its
+    /// layers a step sends the node depends on the token's picks, so the
+    /// graph's fixed layer list cannot serve it ([`TierCard::send_layer`]).
     pub(super) fn replay(
         &mut self,
         chain: Chain,
@@ -2178,7 +2233,10 @@ impl TierCard {
         if list.is_empty() {
             return Ok(Pass::Graph);
         }
-        if self.graph_nodes_at(i).is_none() || self.captured[i] != list {
+        if matches!(self.side, TierSide::Node(_))
+            || self.graph_nodes_at(i).is_none()
+            || self.captured[i] != list
+        {
             self.stats.feeds += 1;
             return Ok(Pass::Feed);
         }
@@ -2194,7 +2252,8 @@ impl TierCard {
 
     /// Capture `chain`'s tier graph for `list`, replacing the one held,
     /// after a fed pass has settled: the stage card's chain waits on neither
-    /// the host nor the tier any more. Nothing is launched.
+    /// the host nor the tier any more. Nothing is launched. A tier on a node
+    /// captures none ([`TierCard::replay`]).
     pub(super) fn capture(
         &mut self,
         chain: Chain,
@@ -2203,6 +2262,9 @@ impl TierCard {
         let i = chain_slot(chain)?;
         let cols = self.chain_cols(chain)?;
         self.captured[i].clear();
+        if matches!(self.side, TierSide::Node(_)) {
+            return Ok(());
+        }
         match &mut self.side {
             TierSide::Here(w) => w.capture(chain, cols, list)?,
             TierSide::Node(n) => n.capture(chain, cols, list)?,
@@ -2213,6 +2275,55 @@ impl TierCard {
         self.captured[i] = list.to_vec();
         self.stats.captures += 1;
         self.rebind_stage()
+    }
+
+    /// Send the node this tier's service of layer `layer` of row `row` of
+    /// `chain`, one frame naming the layer ([`TierNode::send_enqueue`]),
+    /// without waiting for its reply; the host then expects one layer more of
+    /// the tier. `picks` is the count of the service's routing that named a
+    /// slot of this tier's: none leaves the node nothing to compute, so
+    /// nothing is sent and the layer is the host's alone — `false` back. The
+    /// caller has raised the layer's go on the page
+    /// ([`TierPage::add_go`]) and the frame is sent after the picks were
+    /// read, so the node's copy of the row's image is the one the go
+    /// published. A tier of this process is refused by name: its layer is
+    /// enqueued on its own stream ([`TierCard::enqueue_eager`]).
+    pub(super) fn send_layer(
+        &mut self,
+        chain: Chain,
+        layer: usize,
+        row: usize,
+        picks: u64,
+    ) -> Result<bool, GpuError> {
+        if picks <= 1 {
+            // Nothing of the layer's is the node's to compute: the node is
+            // sent no frame, so no round trip, and the host signals the
+            // layer's unit itself ([`TierPage::add_unit`]).
+            return Ok(false);
+        }
+        let cols = self.chain_cols(chain)?;
+        match &mut self.side {
+            TierSide::Node(n) => n.send_enqueue(layer, row, cols),
+            TierSide::Here(_) => Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier {}: a node layer of a card of this process",
+                    self.name
+                ),
+            )),
+        }?;
+        self.issue(1);
+        self.rebind_stage()?;
+        Ok(true)
+    }
+
+    /// The replies of the layer frames [`TierCard::send_layer`] sent, read by
+    /// `deadline`; a tier of this process has none to read.
+    pub(super) fn drain_layers(&mut self, deadline: Instant) -> Result<(), GpuError> {
+        match &mut self.side {
+            TierSide::Node(n) => n.drain_enqueues(deadline),
+            TierSide::Here(_) => Ok(()),
+        }
     }
 
     /// Enqueue layer `layer` of row `row` of `chain` on the tier's stream

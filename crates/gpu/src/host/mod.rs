@@ -344,6 +344,12 @@ pub struct HybridStats {
     /// to a tier's batch leg of its layer-batch, summed: the tiers' share,
     /// which the host did not compute.
     pub batch_tier_slots: u64,
+    /// Layers the host sent no node tier, since load: a step service's picks
+    /// named no slot of the node's, or a prompt batch's union named none, so
+    /// the node was sent nothing for the layer and the host signalled its
+    /// counter itself ([`HostTier::serve`], [`BatchPort::serve_tiered`]).
+    /// Zero without a tier on a node.
+    pub node_skipped: u64,
     /// Services, step or batch, that met input the card should already have
     /// refused ([`HostTier::refusal`] names the first).
     pub refusals: u64,
@@ -982,6 +988,9 @@ pub struct HostTier<H> {
     /// Per tier, the tier layers the host has served since load (wrapping):
     /// a tier whose progress is behind it holds the stage card at a wait.
     tier_goes: Vec<u32>,
+    /// Layers the host sent no node tier, since load
+    /// ([`HybridStats::node_skipped`]).
+    node_skipped: u64,
     /// Per tier, a replay's tier layers in go order: the service's scratch.
     tier_lists: Vec<Vec<(usize, usize)>>,
     /// The residency machine over the stage card's slots, once started
@@ -1145,6 +1154,7 @@ impl<H: HostExperts> HostTier<H> {
             tiers: Vec::new(),
             tier_page: None,
             tier_goes: Vec::new(),
+            node_skipped: 0,
             tier_lists: Vec::new(),
             swap: None,
             swap_kept: None,
@@ -2367,7 +2377,11 @@ impl<H: HostExperts> HostTier<H> {
     /// Enqueue a tier layer's go of layer `layer`, row `row`, on the stage
     /// card's `stream`: one go batch with a go for each tier that holds
     /// experts of the layer ([`TierPage::enqueue_go_of`]); refused without a
-    /// tier, and for a layer no tier holds an expert of.
+    /// tier, and for a layer no tier holds an expert of. A tier on a node
+    /// gets no go of the chain: which of its layers a step sends the node
+    /// depends on the token's picks, so the host adds the go itself for the
+    /// layers it sends ([`TierPage::add_go`]) and the chain enqueues the
+    /// plain boundary go.
     pub fn enqueue_tier_go(
         &self,
         stream: &CudaStream,
@@ -2375,10 +2389,26 @@ impl<H: HostExperts> HostTier<H> {
         row: usize,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::enqueue_tier_go";
+        if self.node_mask(layer)? != 0 {
+            return self.step.boundary.enqueue_go_of(stream, layer, row);
+        }
         let mut tiers = [0; MAX_TIERS];
         let k = tiers_of(self.tier_mask(layer)?, &mut tiers);
         self.page_ref(WHAT)?
             .enqueue_go_of(stream, &self.step.boundary, layer, row, &tiers[..k])
+    }
+
+    /// The tiers on a node that hold experts of layer `layer`, one bit a
+    /// tier; 0 without one. A layer the slot map has no row for is refused
+    /// by name.
+    fn node_mask(&self, layer: usize) -> Result<u32, GpuError> {
+        let mut mask = 0;
+        for (t, card) in self.tiers.iter().enumerate() {
+            if card.node().is_some() && self.slots.on_tier_of(t, layer)? > 0 {
+                mask |= 1 << t;
+            }
+        }
+        Ok(mask)
     }
 
     /// Enqueue a tier layer's wait of layer `layer`, row `row`, on the stage
@@ -2961,6 +2991,7 @@ impl<H: HostExperts> HostTier<H> {
             batch_ns: b.batch_ns,
             batch_excluded_slots: b.batch_excluded_slots,
             batch_tier_slots: b.batch_tier_slots,
+            node_skipped: self.node_skipped,
             refusals: t.refusals,
             resets: t.resets,
             last_poison: t.last_poison,
@@ -3151,7 +3182,10 @@ impl<H: HostExperts> HostTier<H> {
 
     /// Enqueue tier layer `layer` of row `row` of `chain` on the streams of
     /// the tiers whose bits `mask` sets now, for an eager chain or a fed
-    /// pass; a failure poisons the tier and releases every card's waits.
+    /// pass: a tier of this process, which the picks cannot surprise; a tier
+    /// on a node is served inside the service itself, from its picks
+    /// ([`HostTier::serve`]). A failure poisons the tier and releases every
+    /// card's waits.
     fn feed_tiers(
         &mut self,
         layer: usize,
@@ -3163,6 +3197,9 @@ impl<H: HostExperts> HostTier<H> {
             return Ok(());
         }
         for t in (0..self.tiers.len()).filter(|t| mask >> t & 1 == 1) {
+            if self.tiers[t].node().is_some() {
+                continue;
+            }
             if let Err(e) = self.tiers[t].enqueue_eager(chain, layer, row) {
                 return Err(self.fail_tier(SERVE, layer, t, e));
             }
@@ -3235,6 +3272,11 @@ impl<H: HostExperts> HostTier<H> {
         };
         let t0 = Instant::now();
         for (t, card) in self.tiers.iter_mut().enumerate() {
+            if mask >> t & 1 == 1 {
+                if let Err(e) = card.drain_layers(t0 + GO_DEADLINE) {
+                    return Err(self.fail_tier(SERVE, layer, t, e));
+                }
+            }
             if mask >> t & 1 == 1 && !card.wait_caught_up(page, t0 + GO_DEADLINE) {
                 let behind = self.behind_mask(mask) | 1 << t;
                 return Err(self.lose_tiers(SERVE, layer, behind, t0.elapsed()));
@@ -3426,8 +3468,58 @@ impl<H: HostExperts> HostTier<H> {
         if let Some(detail) = self.planted.take() {
             return Err(self.refuse_planted(layer, detail));
         }
-        let (step, experts, health) = (&mut self.step, &mut self.experts, &mut self.health);
+        let nodes = self.node_mask(layer)?;
+        let (step, experts, health, tiers, page, skipped) = (
+            &mut self.step,
+            &mut self.experts,
+            &mut self.health,
+            &mut self.tiers,
+            self.tier_page.as_ref(),
+            &mut self.node_skipped,
+        );
         let slots = &self.slots;
+        // The node tiers' share of this layer: sent at the picks, the skipped
+        // layers' units added at the signal. A layer no node tier holds
+        // experts of serves none here ([`HostTier::feed_tiers`] feeds a card
+        // of this process before the serve).
+        let mut skip = 0u32;
+        let mut serve_nodes = |point: step::NodePoint, picks: &[u64; MAX_TIERS]| {
+            use step::NodePoint;
+            let page = page.ok_or(GpuError::state(SERVE, "an expert tier (the node hook)"))?;
+            match point {
+                NodePoint::Picks => {
+                    for t in (0..tiers.len()).filter(|t| nodes >> t & 1 == 1) {
+                        if tiers[t].send_layer(chain, layer, row, picks[t])? {
+                            page.add_go(t, row)?;
+                        } else {
+                            skip |= 1 << t;
+                        }
+                    }
+                }
+                NodePoint::Signaled => {
+                    for t in (0..tiers.len()).filter(|t| skip >> t & 1 == 1) {
+                        // The tier is caught up first: a unit added beside a
+                        // done still in flight could be taken for a layer the
+                        // card is waiting on.
+                        let deadline = Instant::now() + GO_DEADLINE;
+                        if !tiers[t].wait_caught_up(page, deadline) {
+                            return Err(GpuError::link(
+                                SERVE,
+                                format!(
+                                    "the skipped layer {layer}'s node tier did not catch up in \
+                                     {GO_DEADLINE:?}"
+                                ),
+                            ));
+                        }
+                        page.add_unit(t, row)?;
+                    }
+                    if skip != 0 {
+                        *skipped += 1;
+                    }
+                }
+            }
+            Ok(())
+        };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             step.serve_one(
                 experts,
@@ -3437,6 +3529,7 @@ impl<H: HostExperts> HostTier<H> {
                 row,
                 opens_replay,
                 chain,
+                &mut serve_nodes,
             )
         }));
         match r {
