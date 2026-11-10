@@ -2295,7 +2295,7 @@ impl TierCard {
         row: usize,
         picks: u64,
     ) -> Result<bool, GpuError> {
-        if picks <= 1 {
+        if picks == 0 {
             // Nothing of the layer's is the node's to compute: the node is
             // sent no frame, so no round trip, and the host signals the
             // layer's unit itself ([`TierPage::add_unit`]).
