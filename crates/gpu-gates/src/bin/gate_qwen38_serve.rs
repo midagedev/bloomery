@@ -3208,8 +3208,11 @@ mod gate {
             );
             room_cap = Some(cap);
             fill_dir = "elastic-fill-room";
+            // The stream's ring grows last into what the experts leave, so a capped split plan
+            // hands the freed bytes to the ring and its staging: the room arms admit instead.
             let mut cmd = elastic_cmd(levers, true)?;
-            cmd.env(bloomery_levers::CARD_EXPERTS_CAP, cap.to_string());
+            cmd.env(bloomery_levers::CARD_EXPERTS_CAP, cap.to_string())
+                .env(bloomery_levers::XSTREAM, "admit");
             e = fill_run(dir, fill_dir, cmd)?;
             fill = warm_fill(&e.log)?;
         }
@@ -3220,7 +3223,9 @@ mod gate {
         };
         let mut static_cmd = elastic_cmd(levers, false)?;
         if let Some(cap) = room_cap {
-            static_cmd.env(bloomery_levers::CARD_EXPERTS_CAP, cap.to_string());
+            static_cmd
+                .env(bloomery_levers::CARD_EXPERTS_CAP, cap.to_string())
+                .env(bloomery_levers::XSTREAM, "admit");
         }
         let st = fill_run(dir, static_name, static_cmd)?;
         let Some(fill) = fill else {
@@ -3262,6 +3267,9 @@ mod gate {
         let widened = card_budget_of(&wide, levers)?.saturating_add(fill.u64("bytes")?);
         wide.env(bloomery_levers::CARD_BUDGET, widened.to_string())
             .env(bloomery_levers::CARD_EXPERTS_CAP, want.to_string());
+        if room_cap.is_some() {
+            wide.env(bloomery_levers::XSTREAM, "admit");
+        }
         let t = fill_run(dir, "elastic-fill-wide", wide)?;
         let have = plan_card_experts(&t.log)?;
         println!(
