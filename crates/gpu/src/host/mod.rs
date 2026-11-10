@@ -3272,10 +3272,10 @@ impl<H: HostExperts> HostTier<H> {
         };
         let t0 = Instant::now();
         for (t, card) in self.tiers.iter_mut().enumerate() {
-            if mask >> t & 1 == 1 {
-                if let Err(e) = card.drain_layers(t0 + GO_DEADLINE) {
-                    return Err(self.fail_tier(SERVE, layer, t, e));
-                }
+            if mask >> t & 1 == 1
+                && let Err(e) = card.drain_layers(t0 + GO_DEADLINE)
+            {
+                return Err(self.fail_tier(SERVE, layer, t, e));
             }
             if mask >> t & 1 == 1 && !card.wait_caught_up(page, t0 + GO_DEADLINE) {
                 let behind = self.behind_mask(mask) | 1 << t;
