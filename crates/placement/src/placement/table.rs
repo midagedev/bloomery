@@ -129,9 +129,10 @@ pub struct CardTotals {
     pub prompt_bytes: u64,
     /// The card bytes the expert stream's ring takes when a prompt call streams
     /// its host experts (`BLOOMERY_XSTREAM=split`): the ring's two halves of
-    /// [`CardTotals::ring_half`] slots and the buffers of the ring's pass, planned
-    /// last from what every other term leaves ([`CardTotals::grow_ring`]); 0 for
-    /// a plan that counts none.
+    /// [`CardTotals::ring_half`] slots and the buffers of the ring's pass: a floor
+    /// the model's plan reserved out of the expert budget, grown last from what
+    /// every other term leaves ([`CardTotals::grow_ring`]); 0 for a plan that
+    /// counts none.
     pub ring_bytes: u64,
     /// The slots of each half of the ring [`CardTotals::ring_bytes`] counts; 0
     /// with it.
@@ -200,9 +201,10 @@ impl CardTotals {
     }
 
     /// The expert stream's ring of `half` slots a half, `bytes` of card in all, as a named
-    /// term out of the headroom: planned last, after every other term, so the experts the
-    /// plan places are those of a plan without the ring. Counted once: a second ring is
-    /// refused by name.
+    /// term out of the headroom: counted last, after every other term, so the experts the
+    /// plan places are those of a plan with the ring's floor reserved beside its own terms
+    /// (the floor's bytes still in the headroom) and the ring takes the rest from what they
+    /// left. Counted once: a second ring is refused by name.
     ///
     /// # Panics
     ///

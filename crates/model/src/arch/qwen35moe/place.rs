@@ -723,38 +723,102 @@ impl PlanInputs {
         place_hybrid::stream_slot_bytes(&self.model, routed_stacks, self.model.experts)
     }
 
-    /// The expert stream's ring, planned last on the stage card of `plan` when its load streams
-    /// ([`plan_rings`]): after every other term, the largest half of at most the most host experts
-    /// a routed layer leaves whose ring ([`ring_bytes_at`]) fits the headroom less the margin and
-    /// `beside`, the card bytes the caller counts past the plan's totals (an MTP draft's
-    /// reserve). The expert count is the plan's without the ring: the ring takes only what the
-    /// experts left. A plan with no such room counts no ring (the body then refuses a split by
-    /// name: [`ring_cap_bytes`] is 0). Counted as the card's ring term ([`CardTotals::grow_ring`]).
-    fn grow_ring(&self, plan: &mut Plan<'_>, ubatch: u64, beside: u64) -> Result<(), PlaceError> {
+    /// The expert stream's ring on the stage card of `plan` when its load streams
+    /// ([`plan_rings`]), by the one ring rule ([`place_hybrid::plan_ring_last`]): `floor` slots a
+    /// half the plan reserved before its experts ([`PlanInputs::ringed`]), grown last to the largest
+    /// half of at most the most host experts a routed layer leaves ([`PlanInputs::ring_cap`]) whose
+    /// ring ([`ring_bytes_at`]) fits the headroom less the margin and `beside`, the card bytes the
+    /// caller counts past the plan's totals (an MTP draft's reserve). A plan of floor 0 with no such
+    /// room counts no ring (the body then refuses a split by name: [`ring_cap_bytes`] is 0). Counted
+    /// as the card's ring term ([`CardTotals::grow_ring`]).
+    fn grow_ring(
+        &self,
+        plan: &mut Plan<'_>,
+        ubatch: u64,
+        beside: u64,
+        floor: u64,
+    ) -> Result<(), PlaceError> {
         if !plan_rings(plan) {
             return Ok(());
         }
         let card = &plan.machine.cards[0];
-        let slots = self.ring_slots(card, ubatch)?;
-        let slot = place_hybrid::ring_slot_bytes(&self.model, routed_stacks, self.model.experts)?;
-        let mut max_half = 0;
+        let (slot, slots) = self.ring_shape(card, ubatch)?;
+        let cap = self.ring_cap(plan)?;
+        let room =
+            plan.cards[0].headroom_bytes - i128::from(beside) - i128::from(card.margin_bytes);
+        let room = u64::try_from(room).unwrap_or(0);
+        if let Some((half, bytes)) =
+            place_hybrid::plan_ring_last(room, (floor, cap), |h| ring_bytes_at(slot, slots, h))
+        {
+            plan.cards[0].grow_ring(bytes, half);
+        }
+        Ok(())
+    }
+
+    /// The most host experts a routed layer of `plan` leaves: the most a half of the ring can take.
+    fn ring_cap(&self, plan: &Plan<'_>) -> Result<u64, PlaceError> {
+        let mut cap = 0;
         for l in 0..self.model.layers {
             let routed = routed_stacks(l)
                 .iter()
                 .any(|n| self.model.tensors.iter().any(|t| &t.name == n));
             if routed {
-                max_half = max_half.max(plan.host_experts(l)?);
+                cap = cap.max(plan.host_experts(l)?);
             }
         }
-        let room =
-            plan.cards[0].headroom_bytes - i128::from(beside) - i128::from(card.margin_bytes);
-        let room = u64::try_from(room).unwrap_or(0);
-        if let Some((half, bytes)) =
-            place_hybrid::plan_ring_last(room, (0, max_half), |h| ring_bytes_at(slot, slots, h))
-        {
-            plan.cards[0].grow_ring(bytes, half);
+        Ok(cap)
+    }
+
+    /// A ring slot's bytes ([`place_hybrid::ring_slot_bytes`]) and the routed slots of its pass's
+    /// route on `card` ([`PlanInputs::ring_slots`]): what [`ring_bytes_at`] reads.
+    fn ring_shape(&self, card: &Card, ubatch: u64) -> Result<(u64, u64), PlaceError> {
+        let slot = place_hybrid::ring_slot_bytes(&self.model, routed_stacks, self.model.experts)?;
+        Ok((slot, self.ring_slots(card, ubatch)?))
+    }
+
+    /// The ring's floor a load of `plan`'s shape reserves before its experts: its program's
+    /// slots a half ([`RING_FLOOR_HALF`] for the Qwen3.8 body, whose router it is derived from;
+    /// none for the Qwen3.5 body), no more than the most host experts a routed layer of `plan`
+    /// leaves (a half past them holds nothing), and the ring's bytes at it ([`ring_bytes_at`]).
+    /// `None` for a floor of 0, a plan whose load does not stream ([`plan_rings`]) and one that
+    /// holds no routed expert on its card (its load runs no residency, so no stream starts).
+    fn ring_floor(&self, plan: &Plan<'_>, ubatch: u64) -> Result<Option<(u64, u64)>, PlaceError> {
+        let half = match program_of(self.spec.arch) {
+            Some(Program::Qwen38Body) => RING_FLOOR_HALF,
+            _ => 0,
+        };
+        if half == 0 || !plan_rings(plan) || plan.cards[0].experts == 0 {
+            return Ok(None);
         }
-        Ok(())
+        let (slot, slots) = self.ring_shape(&plan.machine.cards[0], ubatch)?;
+        let floor = half.min(self.ring_cap(plan)?);
+        Ok((floor > 0).then(|| (floor, ring_bytes_at(slot, slots, floor))))
+    }
+
+    /// The target `make` plans, with the expert stream's ring by the one ring rule: when the plan
+    /// of no reserve streams ([`PlanInputs::ring_floor`]), the plan of the ring's floor reserved
+    /// before its experts, the ring grown last from that floor ([`PlanInputs::grow_ring`]); else,
+    /// or when the floor leaves the card no routed expert or no plan, the plan of no reserve with
+    /// its ring grown from what its experts left. `make(r)` is the caller's target with `r` bytes
+    /// more set aside beside its own reserve; `beside` the card bytes the caller counts past the
+    /// plan's totals.
+    fn ringed<'a>(
+        &self,
+        ubatch: u64,
+        beside: u64,
+        make: impl Fn(u64) -> Result<Plan<'a>, PlaceError>,
+    ) -> Result<Plan<'a>, PlaceError> {
+        let plain = make(0)?;
+        if let Some((floor, bytes)) = self.ring_floor(&plain, ubatch)?
+            && let Ok(mut plan) = make(bytes)
+            && plan.cards[0].experts > 0
+        {
+            self.grow_ring(&mut plan, ubatch, beside, floor)?;
+            return Ok(plan);
+        }
+        let mut plan = plain;
+        self.grow_ring(&mut plan, ubatch, beside, 0)?;
+        Ok(plan)
     }
 
     /// The routed slots of a ring pass's route on `card`: the walk's run
@@ -801,8 +865,15 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         check_shape(ctx_max, ubatch)?;
         check_draft_reserve(machine, None)?;
-        let mut plan = self.target(machine, (ctx_max, ubatch), levers, experts, Beside::none())?;
-        self.grow_ring(&mut plan, ubatch, 0)?;
+        let plan = self.ringed(ubatch, 0, |ring| {
+            self.target(
+                machine,
+                (ctx_max, ubatch),
+                levers,
+                experts,
+                Beside::reserve(ring),
+            )
+        })?;
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -873,22 +944,24 @@ impl PlanInputs {
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
         let heads = self.pass_heads_bytes(machine, slots, false)?;
-        let mut plan = self.target_of(
-            machine,
-            (ctx_max, ubatch),
-            levers,
-            experts,
-            Beside::reserve(rows + heads).slots(slots),
-            &kv,
-        )?;
-        // The bytes a sequence holds beside its stores ride the card's kv
-        // class, and the passes' heads its prompt term, out of the budget
-        // reserved above, so [`Plan::violations`] holds the card's bound
-        // against them.
-        plan.cards[0].grow_kv(rows);
-        plan.cards[0].grow_prompt(heads);
-        Self::refuse_heads(&plan, heads)?;
-        self.grow_ring(&mut plan, ubatch, 0)?;
+        let plan = self.ringed(ubatch, 0, |ring| {
+            let mut plan = self.target_of(
+                machine,
+                (ctx_max, ubatch),
+                levers,
+                experts,
+                Beside::reserve(rows + heads + ring).slots(slots),
+                &kv,
+            )?;
+            // The bytes a sequence holds beside its stores ride the card's kv
+            // class, and the passes' heads its prompt term, out of the budget
+            // reserved above, so [`Plan::violations`] holds the card's bound
+            // against them.
+            plan.cards[0].grow_kv(rows);
+            plan.cards[0].grow_prompt(heads);
+            Self::refuse_heads(&plan, heads)?;
+            Ok(plan)
+        })?;
         checked_beside(plan, heads).map_err(PlaceError::Broken)
     }
 
@@ -1262,15 +1335,17 @@ impl PlanInputs {
             });
         }
         check_draft_reserve(machine, None)?;
-        let mut plan = self.target(
-            machine,
-            (ctx_max, ubatch),
-            levers,
-            experts,
-            Beside::draft(reserve + heads, mtp),
-        )?;
-        plan.cards[0].grow_prompt(heads);
-        self.grow_ring(&mut plan, ubatch, reserve)?;
+        let plan = self.ringed(ubatch, reserve, |ring| {
+            let mut plan = self.target(
+                machine,
+                (ctx_max, ubatch),
+                levers,
+                experts,
+                Beside::draft(reserve + heads + ring, mtp),
+            )?;
+            plan.cards[0].grow_prompt(heads);
+            Ok(plan)
+        })?;
         let t = &plan.cards[0];
         // The draft's term is the reserve the expert rule spread within, so
         // the bound and the budget count one number. The stage rope rows are
@@ -1405,17 +1480,19 @@ impl PlanInputs {
             });
         }
         check_draft_reserve(machine, None)?;
-        let mut plan = self.target_of(
-            machine,
-            (ctx_max, ubatch),
-            levers,
-            experts,
-            Beside::draft(reserve + rows + heads, mtp).slots(slots),
-            &kv,
-        )?;
-        plan.cards[0].grow_kv(rows);
-        plan.cards[0].grow_prompt(heads);
-        self.grow_ring(&mut plan, ubatch, reserve)?;
+        let plan = self.ringed(ubatch, reserve, |ring| {
+            let mut plan = self.target_of(
+                machine,
+                (ctx_max, ubatch),
+                levers,
+                experts,
+                Beside::draft(reserve + rows + heads + ring, mtp).slots(slots),
+                &kv,
+            )?;
+            plan.cards[0].grow_kv(rows);
+            plan.cards[0].grow_prompt(heads);
+            Ok(plan)
+        })?;
         let t = &plan.cards[0];
         // As in [`PlanInputs::plan_mtp_with`]: the draft's term is the
         // reserve the expert rule spread within, and the stage rope rows are
@@ -1477,6 +1554,12 @@ impl PlanInputs {
         }
     }
 }
+
+/// The slots a half of the expert stream's ring a Qwen3.8 load that streams reserves before its
+/// experts ([`place_hybrid::plan_ring_last`]'s floor). It holds the most host experts the stream
+/// rule takes a layer of a full ubatch at the balance cut over 512 routed experts at top-10, with
+/// room to spare: a larger half streams no more, a smaller one leaves them in the host union.
+pub const RING_FLOOR_HALF: u64 = 64;
 
 /// Whether a load of `plan` runs the expert stream's ring (`BLOOMERY_XSTREAM=split`) on its stage
 /// card: its machine sets the lane's staging aside ([`workstation::reserve_stream_staging`], which a
@@ -3613,15 +3696,20 @@ mod tests {
         let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
         let path = header_typed("q4x-ring", "qwen4exp", &keys(), &pre, &typed);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
-        super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given)).expect("describes")
+        let inputs =
+            super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given)).expect("describes");
+        let _ = std::fs::remove_file(&path);
+        inputs
     }
 
-    /// The expert stream's ring is the plan's last term, out of what every other term left: a
-    /// load that streams (its machine sets the lane's staging aside) plans the very experts of the
-    /// same load without the ring, counts a ring of the largest half whose bytes fit the headroom
-    /// less the margin (`ring_bytes_at`, one more slot's ring does not fit) and no more host experts
-    /// than a layer leaves, takes it out of the headroom, and holds the stream's ring buffers to
-    /// the term's halves (`ring_cap_bytes`). A load that does not stream counts none.
+    /// Where the ring's floor leaves the card no routed expert (every plan of these 8-expert
+    /// stacks, the card experts' own under [`super::Experts::Host`]), the expert stream's ring is
+    /// the plan's last term, out of what every other term left: a load that streams (its machine
+    /// sets the lane's staging aside) plans the very experts of the same load without the ring,
+    /// counts a ring of the largest half whose bytes fit the headroom less the margin
+    /// (`ring_bytes_at`, one more slot's ring does not fit) and no more host experts than a layer
+    /// leaves, takes it out of the headroom, and holds the stream's ring buffers to the term's
+    /// halves (`ring_cap_bytes`). A load that does not stream counts none.
     ///
     /// FAIL-first: a plan with no ring term has `ring_bytes` 0 and leaves the stream's ring the
     /// card's whole margin, which is the 1.85–2.15 GB a Qwen3.8 first prompt made past its plan.
@@ -3756,6 +3844,172 @@ mod tests {
             plan.cards[0].ring_half, 8,
             "every host expert of a layer fits a half"
         );
+    }
+
+    /// The inputs of a qwen4exp header of Qwen3.8's router and widest routed expert: 512 experts,
+    /// 10 a token, a gate and an up of 2,560 × 640 Q4_K and a down of 640 × 2,560 Q8_0
+    /// (921,600 + 921,600 + 1,740,800 B, the file's ring slot).
+    fn ring_floor_inputs() -> super::PlanInputs {
+        use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
+        use crate::arch::synthetic::{Ty, V, header_typed};
+        use crate::placement::workstation::HostRead;
+
+        let typed: Vec<_> = tensors()
+            .into_iter()
+            .map(|(n, d)| {
+                if n.ends_with(".ffn_down_exps.weight") {
+                    (n, vec![640, 2560, 512], Ty::Q8_0)
+                } else if n.contains(".ffn_") && n.ends_with("_exps.weight") {
+                    (n, vec![2560, 640, 512], Ty::Q4K)
+                } else if n.ends_with(".attn_q.weight") {
+                    (n, vec![64, 128], Ty::F32)
+                } else if n == "output.weight" {
+                    // A head of the embedding's width, so a two-slot plan's pass heads
+                    // (`placement::heads`) have a form to size.
+                    (n, vec![64, 1024], Ty::Q8_0)
+                } else {
+                    (n, d, Ty::F32)
+                }
+            })
+            .collect();
+        let kv: Vec<_> = keys()
+            .into_iter()
+            .map(|(k, v)| match k {
+                "expert_count" => (k, V::U32(512)),
+                "expert_used_count" => (k, V::U32(10)),
+                _ => (k, v),
+            })
+            .collect();
+        let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
+        let path = header_typed("q4x-ring-floor", "qwen4exp", &kv, &pre, &typed);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let inputs =
+            super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given)).expect("describes");
+        let _ = std::fs::remove_file(&path);
+        inputs
+    }
+
+    /// A Qwen3.8 load that streams reserves the ring's floor before its experts, by the one ring
+    /// rule: on the 3090 at a full ubatch with host experts left, the plan counts a ring of
+    /// [`RING_FLOOR_HALF`] slots a half, its term the ring's bytes there (`ring_bytes_at`), and
+    /// places the experts of the same load with those bytes reserved beside its own: the plan
+    /// without the ring less the experts the floor displaced. The greedy expert fit leaves less
+    /// than the next slot's ring, so the ring is the floor. A plan that holds every expert on the
+    /// card streams nothing and is the same plan on a machine that does not stream.
+    ///
+    /// FAIL-first: a floor of 0 plans the ring last from what a greedy expert fit leaves, a half of
+    /// 0, and the load loses `split`.
+    #[test]
+    fn the_ring_floor_is_reserved_before_the_experts() {
+        use crate::arch::names::routed_stacks;
+        use crate::arch::place_hybrid::{ring_route_bytes, ring_slot_bytes};
+        use crate::placement::PlanLevers;
+        use crate::placement::workstation::{self, RTX_3090};
+
+        let inputs = ring_floor_inputs();
+        let (ctx, ub) = (8192, 4096);
+        let slot = ring_slot_bytes(&inputs.model, routed_stacks, inputs.model.experts).unwrap();
+        assert_eq!(slot, 921_600 + 921_600 + 1_740_800, "the file's ring slot");
+        let levers = PlanLevers {
+            card_budget_bytes: bloomery_levers::CardBudget::default(),
+            ..PlanLevers::default()
+        };
+        let plain = super::machine_for_experts(
+            RTX_3090,
+            super::Stack::q8_blocks32(inputs.model.layers),
+            ub,
+            super::Experts::Card,
+        );
+        let mut streaming = plain.clone();
+        workstation::reserve_stream_staging(&mut streaming, slot);
+        let slots = inputs.ring_slots(&streaming.cards[0], ub).unwrap();
+        let plan = |m| inputs.plan_with(m, (ctx, ub), &levers, super::Experts::Card);
+
+        // The card holds every expert: nothing streams, the same plan as a load that does not.
+        let (a, b) = (plan(&plain).unwrap(), plan(&streaming).unwrap());
+        assert_eq!(b.host.experts, 0, "a 3090 holds this file's every expert");
+        assert_eq!(format!("{:?}", a.cards), format!("{:?}", b.cards));
+        assert_eq!(a.n_l, b.n_l);
+
+        // A card of room for about a quarter of the experts past every other term.
+        let rest = a.cards[0].bytes() - a.cards[0].expert_bytes;
+        let usable = rest + plain.cards[0].margin_bytes + (2 << 30);
+        let (mut plain, mut streaming) = (plain.clone(), streaming.clone());
+        plain.cards[0].usable_bytes = usable;
+        streaming.cards[0].usable_bytes = usable;
+        let (a, b) = (plan(&plain).unwrap(), plan(&streaming).unwrap());
+        assert!(
+            a.cards[0].experts > 0 && a.host.experts > 0,
+            "card and host experts"
+        );
+        assert_eq!((a.cards[0].ring_bytes, a.cards[0].ring_half), (0, 0));
+        let cap = (0..inputs.model.layers)
+            .map(|l| a.host_experts(l).unwrap())
+            .max()
+            .unwrap();
+        assert!(cap > super::RING_FLOOR_HALF, "{cap} host experts a layer");
+
+        let floor = super::ring_bytes_at(slot, slots, super::RING_FLOOR_HALF);
+        assert_eq!(
+            floor,
+            2 * super::RING_FLOOR_HALF * slot
+                + ring_route_bytes(slots as usize, super::RING_FLOOR_HALF as usize)
+        );
+        let t = &b.cards[0];
+        assert_eq!(t.ring_half, super::RING_FLOOR_HALF, "the ring is the floor");
+        assert_eq!(
+            t.ring_bytes, floor,
+            "the term is the ring's bytes at the floor"
+        );
+        assert_eq!(
+            super::ring_cap_bytes(&b, ub, &inputs),
+            Some(2 * super::RING_FLOOR_HALF * slot),
+            "the stream's ring buffers are held to the floor's halves"
+        );
+        // The experts are the plan's with the floor's bytes reserved beside its own.
+        let reserved = inputs
+            .target(
+                &streaming,
+                (ctx, ub),
+                &levers,
+                super::Experts::Card,
+                super::Beside::reserve(floor),
+            )
+            .unwrap();
+        assert_eq!(b.n_l, reserved.n_l, "the experts a layer");
+        assert_eq!(t.experts, reserved.cards[0].experts);
+        assert_eq!(t.expert_bytes, reserved.cards[0].expert_bytes);
+        assert_eq!(b.host.experts, reserved.host.experts);
+        assert_eq!(
+            t.headroom_bytes,
+            reserved.cards[0].headroom_bytes - i128::from(floor),
+            "out of the headroom the reserve kept"
+        );
+        // The floor came out of the card's experts, not the slack the greedy fit leaves.
+        let displaced = a.cards[0].expert_bytes - t.expert_bytes;
+        let slack =
+            u64::try_from(a.cards[0].headroom_bytes - i128::from(plain.cards[0].margin_bytes))
+                .unwrap();
+        assert!(
+            slack < floor,
+            "the greedy fit leaves {slack} B, under the floor"
+        );
+        assert!(
+            displaced >= floor - slack,
+            "{displaced} B of experts make way for {floor} B of ring"
+        );
+        assert_eq!(
+            a.host.experts + a.cards[0].experts,
+            b.host.experts + t.experts
+        );
+        assert!(t.bytes() <= usable - plain.cards[0].margin_bytes);
+
+        // Every plan path that streams counts the same floor: two resident sequences.
+        let two = inputs
+            .plan_with_slots(&streaming, (ctx, ub), &levers, super::Experts::Card, 2)
+            .unwrap();
+        assert_eq!(two.cards[0].ring_half, super::RING_FLOOR_HALF);
+        assert_eq!(two.cards[0].ring_bytes, floor);
     }
 
     /// A qwen4exp file whose PLE table is F8 rows and whose layer 2 routed
