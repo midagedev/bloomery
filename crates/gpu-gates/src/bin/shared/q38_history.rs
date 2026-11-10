@@ -164,6 +164,9 @@ pub fn tier_layers(plan: &Plan<'_>) -> Vec<usize> {
 /// ([`TierCard::word_side`]) and the fault copy. Every history chain is fed
 /// and captured once.
 pub fn tier_graphs_and_chains(tier: &TierCard, layers: usize) -> bool {
+    if tier.node().is_some() {
+        return node_tier_feeds(tier);
+    }
     let paged = tier.resident_bytes() == 0;
     let Some(side) = tier.word_side() else {
         println!(
@@ -208,4 +211,33 @@ pub fn tier_graphs_and_chains(tier: &TierCard, layers: usize) -> bool {
         verdict(replays)
     );
     graphs_ok && replays
+}
+
+/// A tier on a node after the history, one line a check: it holds no graph
+/// of any chain, since which of its layers a step sends the node depends on
+/// the token's picks ([`TierCard::send_layer`]), so every pass of the
+/// history is fed and none is captured or replayed.
+fn node_tier_feeds(tier: &TierCard) -> bool {
+    let graphs: Vec<Option<usize>> = [Chain::Step, Chain::Cols(2), Chain::Cols(3), Chain::Cols(4)]
+        .iter()
+        .map(|&c| tier.graph_nodes(c))
+        .collect();
+    let graphs_ok = graphs.iter().all(Option::is_none);
+    println!(
+        "structure: the node tier's graphs of the step and the 2, 3, 4-column verifies are \
+         {graphs:?}, none held (its layers go as enqueue frames): {}",
+        verdict(graphs_ok)
+    );
+    let st = tier.stats();
+    let passes = (PROMPT + 2 * STEPS + WINDOWS.len()) as u64;
+    let feeds = (st.feeds, st.captures, st.replays) == (passes, 0, 0);
+    println!(
+        "structure: the node tier's passes fed {} times, captured {}, replayed {}; each of the \
+         history's {passes} passes fed, none captured or replayed: {}",
+        st.feeds,
+        st.captures,
+        st.replays,
+        verdict(feeds)
+    );
+    graphs_ok && feeds
 }

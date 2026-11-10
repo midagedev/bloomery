@@ -2471,8 +2471,12 @@ impl TierCard {
     /// The loss of the tier as an error's detail: how far it got, and how
     /// long the host `waited` for it.
     pub(super) fn lost_detail(&self, page: &TierPage, waited: Duration) -> String {
+        let at = match &self.side {
+            TierSide::Node(n) => format!(" (the node at {})", n.addr()),
+            TierSide::Here(_) => String::new(),
+        };
         format!(
-            "the expert tier on {} served {} of the {} layers asked of it and signalled nothing more in {waited:.1?}: the card is lost{}",
+            "the expert tier on {}{at} served {} of the {} layers asked of it and signalled nothing more in {waited:.1?}: the card is lost{}",
             self.name,
             self.progress(page),
             self.issued,
