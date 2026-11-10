@@ -1,0 +1,38 @@
+# Round ringfloor: Qwen3.8 reserves its xstream ring's floor (RING_FLOOR_HALF = 64 slots a half) before the experts,
+# so a 3090 load with host experts streams again. Three arms in one lease, one card per arm build:
+#   base     train2 HEAD (2db3a093b's ring, floor 0): a greedy expert fit leaves headroom ~ margin, the ring is 0 and a
+#            set split is refused (XSTREAM_ROOM), so the arm runs BLOOMERY_XSTREAM=admit, what its unset rule falls to
+#   changed  this tree, BLOOMERY_XSTREAM=split: 147 card experts (2 x 64 x 3,584,000 B over the mean 3,133,867 B) make
+#            way for the ring
+#   main     main, BLOOMERY_XSTREAM=split: the ring past the plan (no expert displaced; the card's free bytes), read beside
+# The derivation (tools/flow/q38_step.py, box-3090, mtp=0, card experts 4,756 = the real file's 14,905,794,560 B of gate
+# card experts at ctx 4096 over the mean expert, hit from the hit_mid rows; base pick=3 ring=0, split pick=2) [derived]:
+#   term                       base       changed (H 64)        main
+#   pp tok/s @ P 4096          930.9      1,241.0 / 1,148.4     1,241.0 / 1,153.8   (model rows / the engine's logged costs)
+#   pp tok/s @ P 512           721.3      728.1 / 689.6         734.0 / 695.0       (no stream: 512 < m_min 2,751-3,358)
+#   decode tok/s @ depth 6     62.53      62.36 (-0.27 %)       62.53
+# P 512 and decode are not this card's term: a P 512 walk is under m_min, so no arm streams and the arms differ by the
+# pick rule (split's walk pick against admit's floor-32 pick: +0.9 % or -4.4 % by the cost row, a band that holds 0) and
+# by the floor's displaced experts (-0.8 % at P 512, -0.27 % at decode against main), all inside or at the ruler.
+# The ring's half past ~51 streams no more at P 4096 (the balance cut; 34 at the logged costs): 64 is past both.
+kind: ab
+question: does Qwen3.8's reserved ring floor give a 3090 load with host experts its split prompt back?
+term: pp tok/s @ P=4096 (one ubatch walk of 4096 rows), depth 0, RTX 3090, --place gate with
+  BLOOMERY_RESIDENCY=mid-p0-s1, MTP draft off: (changed - base) / base, changed = this tree under
+  BLOOMERY_XSTREAM=split, base = train2 HEAD under BLOOMERY_XSTREAM=admit
+unit: %
+predict: +15..+40
+rounds: 4
+condition: one lease, arms rotated every round, main split as a third arm read beside; the changed arm's load
+  line prints xstream=split xstream_half=64 (more only if the fit left two slots past the floor) with
+  xstream_m_min at most 4096 and the plan's terms ring=459249160 (459000840 when the card route runs
+  2048 rows), the base's xstream=admit; every arm's first-prompt card bytes line reads verdict=within
+  except main's (past); the changed arm's xstream records stream at P 4096 and none at P 512;
+  no [cpu-busy] or [other-busy] row
+decide-in: land the floor; run the P 512 and decode rows of the same sitting beside it as read-only
+  (no claim under the ruler) and file the Qwen3.5/3.6 floor as its own round
+decide-below: read the changed arm's xstream records: fewer streamed experts a layer than the model's 34-51
+  means the union or lane costs moved the balance cut; re-derive the cut from the records' costs
+  before any floor change
+decide-above: read the base arm's admits and union walls: a base slower than 930 tok/s means the admit
+  arm, not the ring, moved; re-run q38_step.py with the measured union costs before landing
