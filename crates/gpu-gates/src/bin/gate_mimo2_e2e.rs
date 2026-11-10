@@ -206,7 +206,6 @@ mod gate {
     use crate::e2e::{elapsed, ik_last, layer_rels, layer_table, same_bits, set_open, word_after};
     use crate::mimo2_open::{N_VOCAB, Opened, last_argmax, open};
     use std::num::NonZeroUsize;
-    use std::path::Path;
     use std::time::Instant;
 
     use app::Session;
@@ -219,7 +218,10 @@ mod gate {
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::residency;
     use bloomery_gpu_gates::slots_gate::{self, Derived, Launches, PassAdapter, SlotsAdapter};
-    use bloomery_gpu_gates::{Fnv1a64, GateError, RefManifest, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::tier::{self, Tag};
+    use bloomery_gpu_gates::{
+        Fnv1a64, GateError, RefManifest, checks_failed, data_dir, ref_model_path, verdict,
+    };
     use bloomery_gpu_mimo2::{
         Body, Mimo2Model, PrefillMode, T_MAX, feed, prefill, prefill_group, prompt_bytes,
         set_prefill, set_prefill_group, set_taps,
@@ -232,7 +234,7 @@ mod gate {
     use model::arch::models::Mixer;
     use model::placement::PlanLevers;
     use model::placement::workstation::{HostRead, PLAN_ROOM};
-    use refset::arch::mimo2::{BATCH, D1K, D4096, IK, MODEL, STEP4, STEP4_EVERY_NODE};
+    use refset::arch::mimo2::{BATCH, D1K, D4096, IK, STEP4, STEP4_EVERY_NODE};
     use refset::family::Family;
     use runtime::layer::FfnKind;
     use runtime::prompt::{call_batches, group_sets, groups};
@@ -320,6 +322,20 @@ mod gate {
         }
     }
 
+    /// The file every clause opens: the tier's model (`ref_model_path`, a whole fixture under the
+    /// fixture tier), read as the real file's name in the real tier.
+    fn model() -> Result<std::path::PathBuf, GateError> {
+        ref_model_path()
+    }
+
+    /// The plan's levers over the tier's file: the real tier's are the caller's, the fixture
+    /// tier's the budget its header records ([`tier::plan_levers`]), so a plan holds the card
+    /// experts the fixture's own plan chose and never a budget below its floor.
+    fn place(levers: &bloomery_levers::Levers) -> Result<PlanLevers, GateError> {
+        let file = Split::open(model()?).map_err(|e| format!("open the model: {e}"))?;
+        tier::plan_levers(&file, levers, 0)
+    }
+
     /// [`PlanInputs::read`] of `file` at this workstation's plan room with
     /// nothing loaded ([`PLAN_ROOM`], read [`HostRead::Given`]): no reading of
     /// the box's available bytes enters a plan this gate holds to a pin, and
@@ -346,20 +362,27 @@ mod gate {
     }
 
     fn structure(m: &Mimo2Model, o: &Opened) -> Result<bool, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = Split::open(model()?).map_err(|e| format!("open the model: {e}"))?;
         let inputs = read_inputs(&file)?;
         drop(file);
         let body = m.body("structure")?;
         let kinds = body.kinds();
+        // The pins below are the real file's (48 layers, its stores and node counts); the fixture
+        // tier holds the structure its own header derives, and prints the real file's beside it.
+        let pins = tier::run_clause(
+            "(s) the real file's layer, store and node pins",
+            Tag::FileBound,
+        )?;
+        let layers = kinds.len();
+
         let dense: Vec<usize> = (0..kinds.len())
             .filter(|&l| kinds[l].ffn == FfnKind::Dense)
             .collect();
         let (stores, want_stores) = (body.store_bytes(), KV_BYTES_AT_CTX);
-        let ok = kinds.len() == N_LAYER
+        let ok = (!pins || (layers == N_LAYER && stores == want_stores))
             && dense == [0]
-            && body.host_run() == (1..N_LAYER)
-            && body.ctx() == CTX
-            && stores == want_stores;
+            && body.host_run() == (1..layers)
+            && body.ctx() == CTX;
         println!(
             "structure layers={} dense at {dense:?} host run {:?}; ctx {} (want {CTX}); store \
              bytes {stores} (want {want_stores}, derived) {}",
@@ -396,11 +419,11 @@ mod gate {
         // Each layer's attention arguments: the program's against the
         // description's and against the file's pins.
         let args = body.attn_args();
-        let mut args_ok = args.len() == N_LAYER;
+        let mut args_ok = args.len() == layers && (!pins || layers == N_LAYER);
         let mut first_off = None;
         for (l, got) in args.iter().enumerate() {
             let want = described(&inputs, l)?;
-            if *got != want || *got != pinned(l) {
+            if *got != want || (pins && *got != pinned(l)) {
                 args_ok = false;
                 first_off.get_or_insert((l, *got, want, pinned(l)));
             }
@@ -422,27 +445,36 @@ mod gate {
         let card_layers = blocks.iter().filter(|(_, card)| *card).count();
         // The pins are the q8_0 dense block's; a K-quant block's extra launches are the plan's.
         let block_extra: usize = body.block_plans().iter().map(|p| p.extra_launches()).sum();
-        let want = NODES_DECODE + block_extra;
         let counted = step_launches(&blocks) + block_extra;
+        // Each routed layer's go and wait are two memory operations ([`MEMOPS`] is 2 · 47); the
+        // pinned node count is the real file's, the fixture's is the program's count.
+        let routed = layers - 1;
+        let memops = 2 * routed;
+        let ok_names = tier::witness("MEMOPS", memops, MEMOPS);
+        let want = if pins {
+            NODES_DECODE + block_extra
+        } else {
+            counted
+        };
         let kernel = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_KERNEL;
         let memop = sys::CUgraphNodeType_enum_CU_GRAPH_NODE_TYPE_BATCH_MEM_OP;
         let ([k, b], other) = count_kinds(&m.step_graph_nodes()?, [kernel, memop]);
         let nodes = k + b + other;
         let derived = NODES_HOST + block_extra + CARD_LAUNCHES * card_layers;
         let pass = nodes == want
-            && derived == want
+            && (!pins || derived == want)
             && counted == want
-            && b == MEMOPS
-            && k == want - MEMOPS
+            && b == memops
+            && k == want - memops
             && other == 0;
         println!(
             "structure decode graph_nodes={nodes} (want {want} = {NODES_HOST} + {block_extra} \
              block launches + {CARD_LAUNCHES} · {card_layers} layers with card experts; the \
-             program counts {counted}) kernel={k} batch_mem_op={b} (want {MEMOPS}) \
+             program counts {counted}) kernel={k} batch_mem_op={b} (want {memops}) \
              other={other} {}",
             verdict(pass)
         );
-        Ok(ok && card_ok && args_ok && pass)
+        Ok(ok_names && ok && card_ok && args_ok && pass)
     }
 
     /// PIN(2026-10-10): the ceiling of the batch set's worst layer-output
@@ -1004,7 +1036,7 @@ mod gate {
             machine: &'p model::placement::Machine,
             slots: NonZeroUsize,
         ) -> Result<model::placement::Plan<'p>, GateError> {
-            let place = PlanLevers::from_levers(self.levers)?;
+            let place = place(self.levers)?;
             Ok(self
                 .inputs
                 .plan_with_slots(machine, SLOT_CTX as u64, &place, slots)?)
@@ -1019,7 +1051,7 @@ mod gate {
 
         fn open(&self, slots: usize) -> Result<Mimo2Model, GateError> {
             let n = NonZeroUsize::new(slots).ok_or("(slots) a load of no slot")?;
-            let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+            let file = Split::open(model()?).map_err(|e| format!("open the model: {e}"))?;
             let machine = crate::gate_card::plan_gate(self.inputs.model.layers);
             let plan = self.plan(&machine, n)?;
             let t = Instant::now();
@@ -1240,7 +1272,7 @@ mod gate {
     /// (sp)'s load of a plan that counts one sequence as a load of two: the
     /// plan's kv class is another count's, refused by name at the load.
     fn slots_other_plan(a: &MimoSlots<'_>) -> Result<bool, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = Split::open(model()?).map_err(|e| format!("open the model: {e}"))?;
         let machine = crate::gate_card::plan_gate(a.inputs.model.layers);
         let plan = a.plan(&machine, NonZeroUsize::MIN)?;
         let two = NonZeroUsize::new(slots_gate::STREAMS).ok_or("no slots")?;
@@ -1265,7 +1297,7 @@ mod gate {
     /// The (slots) clauses: the harness's contracts and (sp), each on a load
     /// at [`SLOT_CTX`] positions of its own, the main load dropped first.
     fn slots(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = Split::open(model()?).map_err(|e| format!("open the model: {e}"))?;
         let inputs = read_inputs(&file)?;
         drop(file);
         // Two streams of distinct ids and lengths: the batch set's five
@@ -1403,7 +1435,7 @@ mod gate {
     ) -> Result<(Residency, bool), GateError> {
         let machine = crate::gate_card::plan_gate(inputs.model.layers);
         let plan = inputs
-            .plan(&machine, CTX as u64, &PlanLevers::from_levers(levers)?)
+            .plan(&machine, CTX as u64, &place(levers)?)
             .map_err(|e| format!("(r) the plan: {e}"))?;
         let at = |serving_place, prefill_steps| {
             levers.residency_at(ResidencyAt {
@@ -1462,7 +1494,14 @@ mod gate {
         man: &RefManifest,
         toks: &[u32],
     ) -> Result<bool, GateError> {
-        let (mut s, _) = open_with(Path::new(MODEL), levers, CTX, PrefillMode::Batch, residency)?;
+        let (mut s, _) = open_with(
+            &model()?,
+            levers,
+            place(levers)?,
+            CTX,
+            PrefillMode::Batch,
+            residency,
+        )?;
         s.model_mut().body_parts("(r) on")?.2.log_residency(0);
         let mut ok = true;
         {
@@ -1627,7 +1666,7 @@ mod gate {
         levers: &bloomery_levers::Levers,
         word: Residency,
     ) -> Result<bool, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = Split::open(model()?).map_err(|e| format!("open the model: {e}"))?;
         let inputs = read_inputs(&file)?;
         drop(file);
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
@@ -1714,7 +1753,7 @@ mod gate {
     /// (r) on its own loads: the unset word on the gate placement's plan, then
     /// a load at it ([`residency_on`]).
     fn residency_arm(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let file = Split::open(model()?).map_err(|e| format!("open the model: {e}"))?;
         let inputs = read_inputs(&file)?;
         drop(file);
         let (word, mut ok) = residency_unset(levers, &inputs)?;
@@ -1846,32 +1885,51 @@ mod gate {
                 );
             }
             let t = Instant::now();
-            let ok = crate::mimo2_twocard::run(Path::new(MODEL), &levers)?;
+            let ok = crate::mimo2_twocard::run(&model()?, &levers)?;
             elapsed("(two-card)", &t);
             return if ok { Ok(()) } else { Err(checks_failed()) };
         }
         crate::gate_card::init()?;
         let only = only()?;
         let sets = step_sets(only)?;
+        // Every clause past (s) reads ik's sets of the real file (token ids and layer outputs); the
+        // fixture tier has no mimo2 set, so it leaves them to the real tier, by name.
+        let from_ik = |name: &str| tier::run_clause(name, Tag::Oracle);
         if only == Only::Slots {
+            if !from_ik("(slots) the streams' ids from ik's sets")? {
+                return Ok(());
+            }
             let t = Instant::now();
             let ok = slots(&levers)?;
             elapsed("(slots)", &t);
             return if ok { Ok(()) } else { Err(checks_failed()) };
         }
         if only == Only::Residency {
+            if !from_ik("(r) the history's ids from ik's sets")? {
+                return Ok(());
+            }
             let t = Instant::now();
             let ok = residency_arm(&levers)?;
             elapsed("(r)", &t);
             return if ok { Ok(()) } else { Err(checks_failed()) };
         }
-        let (mut s, opened) = open(Path::new(MODEL), &levers, CTX)?;
+        let (mut s, opened) = open(&model()?, &levers, place(&levers)?, CTX)?;
         let m = s.model_mut();
         let mut ok = true;
         if matches!(only, Only::All | Only::S) {
             let t = Instant::now();
             ok &= structure(m, &opened)?;
             elapsed("(s)", &t);
+        }
+        if !from_ik("(p) (o) (c) (t) (b) the batch set's ids and ik's outputs")? {
+            // No set to read: the clauses that need none run, and the loads of (slots) and (r),
+            // which feed ik's ids, are left to the real tier.
+            if only == Only::All {
+                ok &= residency_off(s.model())?;
+                from_ik("(slots) the streams' ids from ik's sets")?;
+                from_ik("(r) the history's ids from ik's sets")?;
+            }
+            return if ok { Ok(()) } else { Err(checks_failed()) };
         }
         let man = RefManifest::open(&data_dir().join(BATCH), &IK)?;
         let (_, toks, _) = man.step()?;

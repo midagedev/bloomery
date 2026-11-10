@@ -1631,7 +1631,7 @@ mod gate {
         ok: &mut bool,
     ) -> Result<(), GateError> {
         crate::gate_card::init()?;
-        let (mut session, opened) = open(file, levers, CTX)?;
+        let (mut session, opened) = open(file, levers, PlanLevers::from_levers(levers)?, CTX)?;
         let m = session.model_mut();
         // The session's gate plan splits the experts as the one-slot server's
         // plan record does: a split the ids are not held to is no comparison.

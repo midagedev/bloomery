@@ -86,28 +86,33 @@ impl OpenLog<Body> for Log {
 
 /// The session of `file` at `ctx` positions on the gate placement
 /// (`crate::gate_card::plan_gate`), its prompts fed one step an id, no
-/// residency machine, the prompt group `levers` gives (`prefill_group`).
+/// residency machine, the plan levers `levers` give and the prompt group
+/// (`prefill_group`).
 pub fn open(
     file: &Path,
     levers: &bloomery_levers::Levers,
+    place: PlanLevers,
     ctx: usize,
 ) -> Result<(Session<Body>, Opened), GateError> {
-    open_with(file, levers, ctx, PrefillMode::Steps, Residency::Off)
+    open_with(file, levers, place, ctx, PrefillMode::Steps, Residency::Off)
 }
 
 /// [`open`] with its prompts fed as `prefill` says, under `residency`: the
-/// steps feed is refused by name beside a machine. The load runs the prompt
-/// group of `levers.prefill_group()`, as the seat does.
+/// steps feed is refused by name beside a machine. The plan runs under `place`
+/// (a gate in the fixture tier passes `tier::plan_levers`: the header's
+/// recorded budget), the load the prompt group of `levers.prefill_group()`, as
+/// the seat does.
 pub fn open_with(
     file: &Path,
     levers: &bloomery_levers::Levers,
+    place: PlanLevers,
     ctx: usize,
     prefill: PrefillMode,
     residency: Residency,
 ) -> Result<(Session<Body>, Opened), GateError> {
     let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
     let cfg = Mimo2Cfg {
-        place: PlanLevers::from_levers(levers)?,
+        place,
         host: levers.host(),
         prefill,
         residency,
