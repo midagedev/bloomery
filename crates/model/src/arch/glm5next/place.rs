@@ -131,12 +131,31 @@ fn carded_layers(model: &ModelTensors) -> impl Iterator<Item = (usize, [GgmlType
 /// stacks the grouped tiles do not ([`card_tiles_run`]); none when every card
 /// layer is a tile layer, and the plan then reserves no leg buffers beside the
 /// tiles' scratch ([`card_leg_bytes`]).
-fn card_leg_forms(model: &ModelTensors) -> DownForms {
+pub fn card_leg_forms(model: &ModelTensors) -> DownForms {
     down_forms(
         carded_layers(model)
             .filter(|&(_, [g, _, d], _)| !card_tiles_run(g, d))
             .map(|(_, [_, _, d], k)| (d, k)),
     )
+}
+
+/// The down forms the card body makes its prompt leg buffers in, given the
+/// forms the plan reserved (`planned`, [`card_leg_forms`]) and the forms its
+/// resident card layers read (`resident`). The plan reserves before it places
+/// experts, so a layer the placement puts wholly on the tier is counted in
+/// `planned` but has no resident stacks; the body makes the planned forms,
+/// not the resident ones, so its made bytes are the reserve's. `Err` holds
+/// the forms a resident layer reads that the plan did not reserve.
+pub fn prompt_leg_forms(planned: DownForms, resident: DownForms) -> Result<DownForms, DownForms> {
+    let missing = [DownAct::Q8Act, DownAct::Q8Blocks32]
+        .into_iter()
+        .filter(|&a| resident.holds(a) && !planned.holds(a))
+        .fold(DownForms::NONE, DownForms::with);
+    if missing == DownForms::NONE {
+        Ok(planned)
+    } else {
+        Err(missing)
+    }
 }
 
 /// The activation forms the down stacks of types and row widths `downs` read
@@ -1835,8 +1854,8 @@ mod tests {
         use super::super::{
             DenseForms, KdaLanes, Kind, KvLayout, MixerForms, NextnInputs, NextnKv, PROMPT_GROUP,
             PlaceError, PlanInputs, card_leg_bytes, card_leg_forms, card_tile_bytes,
-            check_prompt_bytes, group_sets, prompt_attn_bytes, prompt_front_bytes,
-            prompt_reserve_bytes, prompt_shared_bytes, row_bytes, unit_bytes,
+            check_prompt_bytes, group_sets, prompt_attn_bytes, prompt_cols, prompt_front_bytes,
+            prompt_leg_forms, prompt_reserve_bytes, prompt_shared_bytes, row_bytes, unit_bytes,
         };
         use crate::placement::churn::ChurnPool;
         use crate::placement::workstation::{HostNeed, HostRead};
@@ -2401,6 +2420,46 @@ mod tests {
                     "{layers:?}"
                 );
             }
+        }
+
+        /// The tiered shape's prompt batch makes the reserved leg: a load whose
+        /// every routed layer sits on the tier has no resident card layer, and
+        /// the body still makes the leg buffers in the forms the plan reserved
+        /// ([`prompt_leg_forms`]), so its made bytes are the reserve's. The
+        /// nvtier fixture's red (box log
+        /// `specs/kcover/batch2/g-gate-gpu-glm5next-nvtier.log`: made
+        /// 630,623,672 B, planned 632,042,936 B) differs by 1,419,264 B, the
+        /// leg's Q8Act form at n 4096, ff 512, 8 slots a token, a chunk of 8:
+        /// the gate·up rows 8·8·4·512 = 131,072, the down rows 8·8·4·4096 =
+        /// 1,048,576 and the q8 columns 239,616 (all from [`card_leg_bytes`]).
+        /// Mutant: the made forms the resident ones (the red, 0 B made).
+        #[test]
+        fn the_tiered_shape_makes_the_reserved_leg() {
+            use crate::placement::kernels::{DownAct, DownForms};
+            use GgmlType::{Q4_K, Q5_K, Q6_K};
+            let i = routed_types(&[[Q4_K, Q4_K, Q5_K], [Q5_K, Q5_K, Q6_K]]);
+            let planned = card_leg_forms(&i.model);
+            assert_eq!(planned, DownForms::of(DownAct::Q8Act));
+            // Every routed layer on the tier: no resident card layer.
+            let made = prompt_leg_forms(planned, DownForms::NONE).expect("planned forms");
+            let (n, ff, used) = (4096, 512, 8);
+            let leg = |f| card_leg_bytes(n, ff, used, f);
+            assert_eq!(leg(planned), 131_072 + 1_048_576 + 239_616);
+            assert_eq!(leg(made), leg(planned), "made leg bytes are the reserve's");
+            // A resident layer's forms inside the plan's are made as planned.
+            assert_eq!(prompt_leg_forms(planned, planned), Ok(planned));
+            // The plan's reserve counts that leg beside the units, tier places included.
+            let hp = &i.hp;
+            let cols = prompt_cols(CTX);
+            let unit = |t| unit_bytes(hp.n_embd, cols, hp.hc.streams, hp.n_used, t);
+            assert_eq!(
+                prompt_reserve_bytes(&i, CTX, true) - prompt_reserve_bytes(&i, CTX, false),
+                (group_sets(PROMPT_GROUP) * (unit(true) - unit(false))) as u64,
+                "tiered adds only the tier places"
+            );
+            // A resident form the plan did not reserve is refused by name.
+            let b32 = DownForms::of(DownAct::Q8Blocks32);
+            assert_eq!(prompt_leg_forms(DownForms::NONE, b32), Err(b32));
         }
 
         /// A Q5_K gate and up with a Q6_K down takes every expert on a card

@@ -68,7 +68,9 @@ use bloomery_gpu_deepseek41::chain::ffn::{
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
-use model::arch::glm5next::place::{TIER_CHUNK, card_leg_bytes, card_tile_bytes, card_tiles_run};
+use model::arch::glm5next::place::{
+    TIER_CHUNK, card_leg_bytes, card_tile_bytes, card_tiles_run, prompt_leg_forms,
+};
 use model::arch::names::routed_stacks;
 use model::placement::accepts::{self, Program};
 use model::placement::kernels::{self, DownAct, DownEntry, DownForms, GateUpEntry};
@@ -135,9 +137,10 @@ pub(crate) struct CardExperts {
     /// Per layer of the description, `None` without card experts.
     layers: Vec<Option<CardLayer>>,
     keep_host: bool,
-    /// The down forms of the card layers whose stacks are not
-    /// [`card_tiles_run`]'s: a prompt batch runs those on the card leg, whose
-    /// buffers [`CardTiles`] then holds in these forms.
+    /// The down forms the plan reserved for the card layers whose stacks are
+    /// not [`card_tiles_run`]'s ([`place::card_leg_forms`]): a prompt batch
+    /// runs those on the card leg, whose buffers [`CardTiles`] then holds in
+    /// these forms.
     prompt_leg: DownForms,
     /// Routed expert width: a gate·up slot's rows.
     ff: usize,
@@ -190,10 +193,10 @@ impl CardExperts {
         map: &SlotMap,
         n_embd: usize,
         ff: usize,
-        (rows, keep_host): (usize, bool),
+        (rows, keep_host, planned_leg): (usize, bool, DownForms),
     ) -> Result<CardExperts, GpuError> {
         let mut per = Vec::with_capacity(layers.len());
-        let (mut downs, mut prompt_leg) = (DownForms::NONE, DownForms::NONE);
+        let (mut downs, mut resident_leg) = (DownForms::NONE, DownForms::NONE);
         for (l, spec) in layers.iter().enumerate() {
             // A dense block is outside the host run and has no row: no card
             // experts, which the resident-rows check below holds it to. A
@@ -231,10 +234,20 @@ impl CardExperts {
             let form = down_form(&st)?;
             downs = downs.with(form);
             if !card_tiles_run(st.gate_up_ty(), st.down_ty()) {
-                prompt_leg = prompt_leg.with(form);
+                resident_leg = resident_leg.with(form);
             }
             per.push(Some(layer));
         }
+        // The plan reserved the leg's forms before it placed the experts: the
+        // buffers are made in those, a layer wholly on the tier included.
+        let prompt_leg =
+            prompt_leg_forms(planned_leg, resident_leg).map_err(|missing| GpuError::Shape {
+                what: CARD,
+                detail: format!(
+                    "a card layer's down reads the forms {missing:?} the plan reserved no prompt \
+                     leg buffers in (place::card_leg_forms {planned_leg:?})"
+                ),
+            })?;
         let stream = gpu.stream();
         Ok(CardExperts {
             leg: CardLeg::load(gpu)?,

@@ -1853,7 +1853,11 @@ impl Body {
             &map,
             dims.embd,
             hp.expert_ff,
-            (LOAD_ROWS, machine || host.route_trace),
+            (
+                LOAD_ROWS,
+                machine || host.route_trace,
+                place::card_leg_forms(&inputs.model),
+            ),
         )?;
         let boundary = Boundary::with_rows(
             gpu.context(),
