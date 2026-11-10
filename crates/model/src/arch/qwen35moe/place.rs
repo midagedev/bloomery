@@ -59,6 +59,7 @@ use crate::placement::accepts::{
 };
 use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::graphs::{CaptureRule, GraphNodes};
 use crate::placement::heads::{HeadLayout, model_row_heads};
 use crate::placement::parts::Parts;
 use crate::placement::workstation::{
@@ -220,7 +221,24 @@ pub struct PlanInputs {
     /// the lever reads it once and sets it, as a gate sets
     /// [`PlanInputs::room`].
     pub kv_host_page: Option<u64>,
+    /// The rule of what a load of these inputs captures past its load reading (its drafts and
+    /// rounds): every plan derives its captures from its own slots, draft and context
+    /// ([`CaptureRule::of`]) and counts their graphs as the stage card's graphs term, reserved
+    /// before the experts ([`PlanInputs::graphs_bytes`]); `None` captures nothing. The seat sets
+    /// it once, before its first plan, and its capture calls read the same rule.
+    pub captures: Option<CaptureRule>,
 }
+
+/// The nodes a layer of a captured Qwen3.8 pass holds, at most: [derived] from the verify pass
+/// of 2 rows the two-slot gate load captured (1,381 nodes over 48 layers, 28.8 a layer), rounded
+/// up past a round's second slot's sequence launches (its embedding, its PLE conv and each
+/// selecting layer's three over a q8_0 cache).
+pub const PASS_LAYER_NODES: u64 = 30;
+
+/// The nodes of a captured Qwen3.8 MTP draft walk, at most: the device program's count at its
+/// widest walk of 4 rows with a Q6_K head (the draft's input pack's 2 + 2, its attention site's
+/// 11, its feed-forward site's 15, its head site's 5 with the quantize, and the two copies).
+pub const WALK_NODES: u64 = 38;
 
 /// Why a plan was refused.
 #[derive(Debug, thiserror::Error)]
@@ -336,6 +354,23 @@ pub enum PlaceError {
         left: u64,
         short: u64,
     },
+    /// The graphs a load captures past its reading do not fit beside the stage card's other
+    /// terms.
+    #[error(
+        "card {card}: the graphs the load captures past its reading take {graphs} B and {left} B \
+         are left beside the plan's other terms ({short} B short)"
+    )]
+    GraphsOver {
+        card: String,
+        graphs: u64,
+        left: u64,
+        short: u64,
+    },
+    /// Captures set on inputs whose program has no count of a captured graph's nodes.
+    #[error(
+        "the {program} program counts no captured graph's nodes: its load captures nothing past its reading"
+    )]
+    GraphNodes { program: &'static str },
     /// A target matrix an MTP draft file borrows ([`PlanInputs::mtp_borrows`])
     /// absent, or in another format than the one the draft's program reads.
     #[error(
@@ -617,6 +652,7 @@ impl PlanInputs {
             },
             arena,
             kv_host_page: None,
+            captures: None,
         })
     }
 
@@ -865,16 +901,19 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         check_shape(ctx_max, ubatch)?;
         check_draft_reserve(machine, None)?;
+        let graphs = self.graphs_bytes(machine, (1, false), ctx_max)?;
         let plan = self.ringed(ubatch, 0, |ring| {
-            self.target(
+            let mut plan = self.target(
                 machine,
                 (ctx_max, ubatch),
                 levers,
                 experts,
-                Beside::reserve(ring),
-            )
+                Beside::reserve(graphs + ring),
+            )?;
+            Self::grow_graphs(&mut plan, graphs)?;
+            Ok(plan)
         })?;
-        checked(plan).map_err(PlaceError::Broken)
+        checked_beside(plan, graphs).map_err(PlaceError::Broken)
     }
 
     /// A node assignment lowered into the loaded map. Counts are global id
@@ -944,25 +983,27 @@ impl PlanInputs {
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
         let heads = self.pass_heads_bytes(machine, slots, false)?;
+        let graphs = self.graphs_bytes(machine, (slots, false), ctx_max)?;
         let plan = self.ringed(ubatch, 0, |ring| {
             let mut plan = self.target_of(
                 machine,
                 (ctx_max, ubatch),
                 levers,
                 experts,
-                Beside::reserve(rows + heads + ring).slots(slots),
+                Beside::reserve(rows + heads + graphs + ring).slots(slots),
                 &kv,
             )?;
             // The bytes a sequence holds beside its stores ride the card's kv
-            // class, and the passes' heads its prompt term, out of the budget
-            // reserved above, so [`Plan::violations`] holds the card's bound
-            // against them.
+            // class, the passes' heads its prompt term and the load's graphs its
+            // graphs term, out of the budget reserved above, so
+            // [`Plan::violations`] holds the card's bound against them.
             plan.cards[0].grow_kv(rows);
             plan.cards[0].grow_prompt(heads);
             Self::refuse_heads(&plan, heads)?;
+            Self::grow_graphs(&mut plan, graphs)?;
             Ok(plan)
         })?;
-        checked_beside(plan, heads).map_err(PlaceError::Broken)
+        checked_beside(plan, heads + graphs).map_err(PlaceError::Broken)
     }
 
     /// The heads a load of `slots` resident sequences makes after it opened, `drafted` when it
@@ -1013,6 +1054,71 @@ impl PlanInputs {
             |card, heads, left, short| PlaceError::PassHeadsOver {
                 card,
                 heads,
+                left,
+                short,
+            },
+        )
+    }
+
+    /// The device bytes the graphs a load of `slots` slots of `ctx` positions, `drafted` or not,
+    /// captures under [`PlanInputs::captures`] keep on `machine`'s stage card
+    /// ([`LoadCaptures::card_bytes`](crate::placement::graphs::LoadCaptures::card_bytes) at the
+    /// program's nodes a graph): the term the plan of that shape reserves before the experts and
+    /// counts in the card's graphs term. 0 for a load that captures nothing past its reading, and
+    /// on a machine of no card.
+    ///
+    /// # Errors
+    ///
+    /// [`PlaceError::GraphNodes`] for captures of a program with no count of its graphs' nodes;
+    /// the rounds' refusal ([`PlacementError::Rounds`]).
+    pub fn graphs_bytes(
+        &self,
+        machine: &Machine,
+        (slots, drafted): (usize, bool),
+        ctx: u64,
+    ) -> Result<u64, PlaceError> {
+        let (Some(card), Some(rule)) = (machine.cards.first(), self.captures) else {
+            return Ok(0);
+        };
+        let captures = rule.of(slots, drafted, usize::try_from(ctx).unwrap_or(usize::MAX));
+        if captures.captures_none()? {
+            return Ok(0);
+        }
+        let nodes = match program_of(self.spec.arch) {
+            Some(Program::Qwen38Body) => GraphNodes {
+                pass: PASS_LAYER_NODES * self.spec.layers.len() as u64,
+                walk: WALK_NODES,
+            },
+            other => {
+                return Err(PlaceError::GraphNodes {
+                    program: other.map_or("unknown", Program::name),
+                });
+            }
+        };
+        Ok(captures.card_bytes(nodes, card.granule_bytes)?)
+    }
+
+    /// `graphs` bytes ([`PlanInputs::graphs_bytes`]) grown into `plan`'s stage card's graphs term,
+    /// refused by name ([`PlaceError::GraphsOver`]) when they do not fit beside its other terms
+    /// under its usable bytes less its margin. Nothing for no bytes, so a plan whose load captures
+    /// nothing is the plan without the term.
+    fn grow_graphs(plan: &mut Plan<'_>, graphs: u64) -> Result<(), PlaceError> {
+        if graphs == 0 {
+            return Ok(());
+        }
+        let (Some(card), Some(t)) = (plan.machine.cards.first(), plan.cards.first_mut()) else {
+            return Ok(());
+        };
+        t.grow_graphs(graphs);
+        let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
+        place_hybrid::refuse_reserve(
+            card,
+            plan.cards[0].bytes() - graphs,
+            limit,
+            graphs,
+            |card, graphs, left, short| PlaceError::GraphsOver {
+                card,
+                graphs,
                 left,
                 short,
             },
@@ -1305,6 +1411,7 @@ impl PlanInputs {
         let (draft, reserve) = mtp.draft_plan_at(ctx_max, store)?;
         let arena = mtp.arena_bytes_at(store);
         let heads = self.pass_heads_bytes(machine, 1, true)?;
+        let graphs = self.graphs_bytes(machine, (1, true), ctx_max)?;
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let mut plan = self.target(
@@ -1312,12 +1419,13 @@ impl PlanInputs {
                 (ctx_max, ubatch),
                 levers,
                 experts,
-                Beside::draft(heads, mtp),
+                Beside::draft(heads + graphs, mtp),
             )?;
             plan.cards[0].grow_prompt(heads);
             Self::refuse_heads(&plan, heads)?;
+            Self::grow_graphs(&mut plan, graphs)?;
             let broken: Vec<Violation> = plan
-                .violations_beside(heads)
+                .violations_beside(heads + graphs)
                 .into_iter()
                 .chain(draft.violations())
                 .collect();
@@ -1341,9 +1449,10 @@ impl PlanInputs {
                 (ctx_max, ubatch),
                 levers,
                 experts,
-                Beside::draft(reserve + heads + ring, mtp),
+                Beside::draft(reserve + heads + graphs + ring, mtp),
             )?;
             plan.cards[0].grow_prompt(heads);
+            Self::grow_graphs(&mut plan, graphs)?;
             Ok(plan)
         })?;
         let t = &plan.cards[0];
@@ -1359,7 +1468,7 @@ impl PlanInputs {
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
-            .violations_beside(reserve + heads)
+            .violations_beside(reserve + heads + graphs)
             .into_iter()
             .filter(|v| !matches!(v, Violation::CardOver { .. }))
             .chain(draft.violations())
@@ -1448,6 +1557,7 @@ impl PlanInputs {
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
         let heads = self.pass_heads_bytes(machine, slots, true)?;
+        let graphs = self.graphs_bytes(machine, (slots, true), ctx_max)?;
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let mut plan = self.target_of(
@@ -1455,14 +1565,15 @@ impl PlanInputs {
                 (ctx_max, ubatch),
                 levers,
                 experts,
-                Beside::draft(rows + heads, mtp).slots(slots),
+                Beside::draft(rows + heads + graphs, mtp).slots(slots),
                 &kv,
             )?;
             plan.cards[0].grow_kv(rows);
             plan.cards[0].grow_prompt(heads);
             Self::refuse_heads(&plan, heads)?;
+            Self::grow_graphs(&mut plan, graphs)?;
             let broken: Vec<Violation> = plan
-                .violations_beside(heads)
+                .violations_beside(heads + graphs)
                 .into_iter()
                 .chain(draft.violations())
                 .collect();
@@ -1486,11 +1597,12 @@ impl PlanInputs {
                 (ctx_max, ubatch),
                 levers,
                 experts,
-                Beside::draft(reserve + rows + heads + ring, mtp).slots(slots),
+                Beside::draft(reserve + rows + heads + graphs + ring, mtp).slots(slots),
                 &kv,
             )?;
             plan.cards[0].grow_kv(rows);
             plan.cards[0].grow_prompt(heads);
+            Self::grow_graphs(&mut plan, graphs)?;
             Ok(plan)
         })?;
         let t = &plan.cards[0];
@@ -1506,7 +1618,7 @@ impl PlanInputs {
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
-            .violations_beside(reserve + heads)
+            .violations_beside(reserve + heads + graphs)
             .into_iter()
             .filter(|v| !matches!(v, Violation::CardOver { .. }))
             .chain(draft.violations())
@@ -4012,6 +4124,151 @@ mod tests {
         assert_eq!(two.cards[0].ring_bytes, floor);
     }
 
+    /// The graphs a load captures past its load reading are a term of its plan, reserved before
+    /// the experts, derived from the plan's own slots ([`CaptureRule::of`]): two slots of a lookup
+    /// draft (verify passes of 2 rows, no walk) that capture their rounds (2 rows a slot in passes
+    /// of 8 rows) count [`LoadCaptures::card_bytes`] at the program's nodes in the stage card's
+    /// graphs term, the card's experts making way, and a reading that made every planned term holds
+    /// within the plan's count; one slot of it counts its verify pass alone; one plain slot counts
+    /// none, its plan the plan of no rule byte for byte. The drafted plans' term is
+    /// `slots::the_drafted_slots_graphs_are_a_term`.
+    ///
+    /// FAIL-first: without the term, the reading after the captures (the plan's every term made,
+    /// and the graphs) is past the plan's count by the graphs' bytes, the red of the two-slot gate
+    /// load's first prompt.
+    #[test]
+    fn the_graphs_past_the_load_reading_are_planned() {
+        use crate::placement::PlanLevers;
+        use crate::placement::card_made::{CardMade, CardPhase};
+        use crate::placement::graphs::{
+            CaptureArm, CaptureRule, DraftCaptures, GraphNodes, LoadCaptures, graph_bytes,
+        };
+        use crate::placement::workstation::{CONTEXT_SELF, RTX_3090};
+        use crate::placement::{CardTotals, Machine};
+
+        let mut inputs = ring_floor_inputs();
+        let ub = 4096;
+        let levers = PlanLevers {
+            card_budget_bytes: bloomery_levers::CardBudget::default(),
+            ..PlanLevers::default()
+        };
+        let mut machine = super::machine_for_experts(
+            RTX_3090,
+            super::Stack::q8_blocks32(inputs.model.layers),
+            ub,
+            super::Experts::Card,
+        );
+        fn plan<'a>(
+            inputs: &'a super::PlanInputs,
+            m: &'a Machine,
+            levers: &PlanLevers,
+            slots: usize,
+        ) -> crate::placement::Plan<'a> {
+            inputs
+                .plan_with_slots(m, (8192, 4096), levers, super::Experts::Card, slots)
+                .unwrap()
+        }
+        // A card of room for part of the experts past every other term, so the term moves them.
+        let full = plan(&inputs, &machine, &levers, 2);
+        let rest = full.cards[0].bytes() - full.cards[0].expert_bytes;
+        machine.cards[0].usable_bytes = rest + machine.cards[0].margin_bytes + (2 << 30);
+        let none = plan(&inputs, &machine, &levers, 2);
+        assert!(none.cards[0].experts > 0 && none.host.experts > 0);
+        assert_eq!(none.cards[0].graph_bytes, 0, "no captures, no term");
+        let (none_t, none_all) = (
+            none.cards[0].clone(),
+            none.host.experts + none.cards[0].experts,
+        );
+
+        const LOOKUP: CaptureArm = CaptureArm {
+            draft: Some(DraftCaptures {
+                verify_rows: 2,
+                walks: 0,
+            }),
+            rows: 2,
+            one_pass: true,
+        };
+        let rule = CaptureRule {
+            drafted: LOOKUP,
+            undrafted: LOOKUP,
+            limits: (8, 8),
+        };
+        let nodes = GraphNodes {
+            pass: super::PASS_LAYER_NODES * inputs.spec.layers.len() as u64,
+            walk: super::WALK_NODES,
+        };
+        let granule = machine.cards[0].granule_bytes;
+        inputs.captures = Some(rule);
+        let want = rule.of(2, false, 8192).card_bytes(nodes, granule).unwrap();
+        assert_eq!(
+            want,
+            ((2 + 8 + 1) * graph_bytes(nodes.pass)).next_multiple_of(granule.get()),
+            "2 verify passes, 8 round passes and slot 1's step"
+        );
+        let two = plan(&inputs, &machine, &levers, 2);
+        let t = &two.cards[0];
+        assert_eq!(t.graph_bytes, want, "the term is the captures' bytes");
+        assert_eq!(
+            t.prompt_bytes, none_t.prompt_bytes,
+            "the heads stay the prompt term"
+        );
+        assert!(t.expert_bytes < none_t.expert_bytes, "the experts make way");
+        assert_eq!(two.host.experts + t.experts, none_all);
+        assert!(t.bytes() <= machine.cards[0].usable_bytes - machine.cards[0].margin_bytes);
+
+        // The reading after the captures: every planned term made, and the graphs.
+        let free = 24_000 << 20;
+        let after = |planned: &CardTotals, extra: u64| {
+            let made = planned.bytes() - CONTEXT_SELF + extra;
+            CardMade::of(
+                0,
+                &machine.cards[0],
+                planned,
+                CardPhase::FirstPrompt,
+                free,
+                free - made,
+            )
+        };
+        assert_eq!(
+            after(t, 0).past(),
+            None,
+            "the plan counts the graphs it made"
+        );
+        assert_eq!(
+            after(&none_t, want).past(),
+            Some(want),
+            "a plan without the term is past its count by the graphs"
+        );
+
+        // One slot of the draft: its verify pass alone, through the plan of one slot.
+        let one = plan(&inputs, &machine, &levers, 1);
+        assert_eq!(
+            one.cards[0].graph_bytes,
+            graph_bytes(nodes.pass).next_multiple_of(granule.get())
+        );
+
+        // One plain slot captures nothing: the plan of no captures, byte for byte.
+        inputs.captures = None;
+        let plain = plan(&inputs, &machine, &levers, 1);
+        let (cards, n_l) = (format!("{:?}", plain.cards), plain.n_l);
+        inputs.captures = Some(CaptureRule {
+            undrafted: CaptureArm {
+                draft: None,
+                rows: 1,
+                one_pass: true,
+            },
+            ..rule
+        });
+        assert_eq!(
+            rule.of(1, false, 8192),
+            LoadCaptures::of(1, LOOKUP.draft, false, (2, (8, 8)))
+        );
+        let plain_set = plan(&inputs, &machine, &levers, 1);
+        assert_eq!(plain_set.cards[0].graph_bytes, 0);
+        assert_eq!(cards, format!("{:?}", plain_set.cards));
+        assert_eq!(n_l, plain_set.n_l);
+    }
+
     /// A qwen4exp file whose PLE table is F8 rows and whose layer 2 routed
     /// stacks are NVFP4 with an expert scale each describes with every scale
     /// beside its tensor (the shared walk's rule, no row of the family's
@@ -5738,6 +5995,7 @@ mod tests {
                 row_source: placement::RowTableSource::Split,
                 arena: None,
                 kv_host_page: None,
+                captures: None,
             }
         }
 
@@ -6464,6 +6722,84 @@ mod tests {
             assert_eq!(new.cards[0].bytes() - old.cards[0].bytes(), 40 * MIB);
             old.cards[0].grow_prompt(40 * MIB);
             assert_eq!(view(&old), view(&new));
+        }
+
+        /// The graphs a drafted load captures past its reading are a term of every drafted
+        /// plan, derived from the plan's own slots under the seat's rule (Qwen3.8's MTP shape:
+        /// verify passes of 2 to 4 rows and five walks a slot, rounds of 4 rows a slot in passes
+        /// of 8 rows and 8 slots): two drafted slots count 6 verify passes, 24 round passes,
+        /// slot 1's step and 10 walks in the stage card's graphs term, the plan of no rule plus
+        /// that term; one drafted slot its 3 verify passes and 5 walks; one plain slot nothing,
+        /// its plan the plan of no rule byte for byte.
+        ///
+        /// FAIL-first: a drafted plan that counts no graph (the two-slot gate load's first
+        /// prompt past its plan) is the plan of no rule.
+        #[test]
+        fn the_drafted_slots_graphs_are_a_term() {
+            use crate::placement::graphs::{
+                CaptureArm, CaptureRule, DraftCaptures, GraphNodes, graph_bytes,
+            };
+
+            let mut inputs = inputs();
+            let machine = machine();
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            let shape = (CTX, UBATCH_PLANNED.min(CTX));
+            let rule = CaptureRule {
+                drafted: CaptureArm {
+                    draft: Some(DraftCaptures {
+                        verify_rows: 4,
+                        walks: 5,
+                    }),
+                    rows: 4,
+                    one_pass: true,
+                },
+                undrafted: CaptureArm {
+                    draft: None,
+                    rows: 1,
+                    one_pass: true,
+                },
+                limits: (8, 8),
+            };
+            let nodes = GraphNodes {
+                pass: super::super::PASS_LAYER_NODES * LAYERS as u64,
+                walk: super::super::WALK_NODES,
+            };
+            let granule = machine.cards[0].granule_bytes.get();
+            let bytes = |passes: u64, walks: u64| {
+                (passes * graph_bytes(nodes.pass) + graph_bytes(walks * nodes.walk))
+                    .next_multiple_of(granule)
+            };
+            let drafted = |i: &PlanInputs, n| {
+                let p = i
+                    .plan_mtp_with_slots(&machine, shape, &levers, &mtp, Experts::Host, n)
+                    .expect("the drafted plan");
+                (view(&p.plan), p.plan.cards[0].clone())
+            };
+            let plain = |i: &PlanInputs| {
+                let p = i
+                    .plan_with_slots(&machine, shape, &levers, Experts::Host, 1)
+                    .expect("the plain plan");
+                view(&p)
+            };
+            let (none_two, none_one, none_plain) =
+                (drafted(&inputs, 2).1, drafted(&inputs, 1).1, plain(&inputs));
+            assert_eq!(none_two.graph_bytes, 0, "no rule, no term");
+            inputs.captures = Some(rule);
+            let (_, two) = drafted(&inputs, 2);
+            assert_eq!(two.graph_bytes, bytes(6 + 24 + 1, 10), "two drafted slots");
+            let mut want = none_two;
+            want.grow_graphs(two.graph_bytes);
+            assert_eq!(
+                format!("{two:?}"),
+                format!("{want:?}"),
+                "the plan of no rule plus the term"
+            );
+            let (_, one) = drafted(&inputs, 1);
+            assert_eq!(one.graph_bytes, bytes(3, 5), "one drafted slot");
+            assert_eq!(one.bytes() - none_one.bytes(), one.graph_bytes);
+            assert_eq!(plain(&inputs), none_plain, "one plain slot");
         }
 
         /// The stage card's headroom past the bytes a plan of several slots

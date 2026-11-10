@@ -150,6 +150,39 @@ pub fn round_passes(
     Ok(())
 }
 
+/// The passes the rounds of slots `0..slots` run when each busy slot holds
+/// 1 to `rows` rows: each set of busy slots in slot order and each row count,
+/// cut by [`round_passes`] within `limits`, each pass's key (its slots and row
+/// counts) once. The one count of the passes a load captures for its rounds,
+/// which its capture and its plan both read. No rows is no pass; refused as
+/// [`round_passes`] refuses.
+pub fn round_keys(
+    slots: usize,
+    rows: usize,
+    limits: (usize, usize),
+) -> Result<std::collections::BTreeSet<Vec<(usize, usize)>>, RoundError> {
+    let mut keys = std::collections::BTreeSet::new();
+    if rows == 0 {
+        return Ok(keys);
+    }
+    let mut cuts = Vec::new();
+    for busy in 1..1usize << slots {
+        let on: Vec<usize> = (0..slots).filter(|s| busy >> s & 1 == 1).collect();
+        let mut counts = vec![1; on.len()];
+        loop {
+            let round: Vec<(usize, usize)> = on.iter().copied().zip(counts.clone()).collect();
+            round_passes(round.iter().copied(), limits, &mut cuts)?;
+            keys.extend(cuts.iter().map(|cut| round[cut.clone()].to_vec()));
+            let Some(at) = counts.iter().position(|&n| n < rows) else {
+                break;
+            };
+            counts[..at].fill(1);
+            counts[at] += 1;
+        }
+    }
+    Ok(keys)
+}
+
 /// What a call of the target reads back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Want {
@@ -412,7 +445,7 @@ pub(crate) mod mock;
 
 #[cfg(test)]
 mod tests {
-    use super::{RoundError, round_passes};
+    use super::{RoundError, round_keys, round_passes};
 
     /// Passes hold whole windows within both bounds, rows and sequences,
     /// the pass that holds slot 0 last and the others in order; bad bounds
@@ -473,5 +506,35 @@ mod tests {
             );
             assert_eq!(cuts, [0..1, 1..2], "a refusal preserves the previous plan");
         }
+    }
+
+    /// The passes two slots' rounds of one to four rows run: each slot
+    /// alone at each count, and the two together in slot order at each pair
+    /// of counts when a pass holds them (16 of them at eight rows a pass),
+    /// cut into the slots alone when it does not (the pairs past four rows
+    /// at GLM's four rows a pass). No rows is no pass.
+    #[test]
+    fn round_keys_are_every_pass_a_round_runs() {
+        let alone: Vec<Vec<(usize, usize)>> = (0..2)
+            .flat_map(|s| (1..=4).map(move |n| vec![(s, n)]))
+            .collect();
+        let together = |fit: usize| -> Vec<Vec<(usize, usize)>> {
+            (1..=4)
+                .flat_map(|a| (1..=4).map(move |b| vec![(0, a), (1, b)]))
+                .filter(|k| k.iter().map(|&(_, n)| n).sum::<usize>() <= fit)
+                .collect()
+        };
+        for (limits, fit) in [((8, 8), 8), ((4, 2), 4)] {
+            let mut want = alone.clone();
+            want.extend(together(fit));
+            want.sort();
+            let got: Vec<_> = round_keys(2, 4, limits)
+                .expect("keys")
+                .into_iter()
+                .collect();
+            assert_eq!(got, want, "limits {limits:?}");
+        }
+        assert_eq!(round_keys(2, 4, (8, 8)).expect("keys").len(), 24);
+        assert!(round_keys(2, 0, (8, 8)).expect("keys").is_empty());
     }
 }

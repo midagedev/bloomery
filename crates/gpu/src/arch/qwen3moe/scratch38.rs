@@ -879,6 +879,7 @@ mod tests {
             row_source: RowTableSource::Split,
             arena: None,
             kv_host_page: None,
+            captures: None,
         };
         let router = RouterDims::of(MoeShape {
             rule: rules::SOFTMAX_NORM_GATED,

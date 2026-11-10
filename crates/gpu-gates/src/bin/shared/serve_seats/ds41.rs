@@ -1808,7 +1808,12 @@ impl OpenLog<Body> for Log<'_> {
 }
 
 impl RowsLog for Log<'_> {
-    fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), SessionError> {
+    fn capture_rows(
+        &mut self,
+        rows: usize,
+        nodes: usize,
+        _: app::PhaseBytes,
+    ) -> Result<(), SessionError> {
         if rows != PAIR_ROWS {
             return Err(SessionError::Refused(format!(
                 "a verify capture of {rows} rows; the pair pass runs {PAIR_ROWS}"

@@ -68,6 +68,10 @@ pub enum PlacementError {
          the heads its passes make have no planned bytes"
     )]
     PassHeads,
+    /// A load's captured rounds ([`super::graphs::LoadCaptures`]) whose pass bounds cannot cut
+    /// them: the rounds' own named refusal.
+    #[error("the rounds a load captures: {0}")]
+    Rounds(#[from] runtime::RoundError),
     /// A host set, a walk or a page release met an r8 sidecar it cannot take
     /// beside its pair: the sidecar's own named refusal.
     #[error(transparent)]

@@ -538,6 +538,12 @@ fn main() -> std::process::ExitCode {
 #[path = "shared/qwen38_levers.rs"]
 mod qwen38_levers;
 
+// What a load captures past its card reading: the seat's rule, which every plan here that
+// restates a server's counts as the server's plans do.
+#[cfg(feature = "gpu")]
+#[path = "shared/qwen38_captures.rs"]
+mod qwen38_captures;
+
 // The `/v1/systemone` clause the generative serve gates share.
 #[cfg(feature = "gpu")]
 #[path = "shared/systemone_clause.rs"]
@@ -930,6 +936,14 @@ mod gate {
         *ok &= pass;
     }
 
+    /// The captures rule of the servers whose plans this gate restates
+    /// ([`super::qwen38_captures::capture_rule38`]): each loads on one card
+    /// with no expert tier card beside it, its draft off or the MTP draft's,
+    /// never the lookup's.
+    fn server_captures() -> model::placement::graphs::CaptureRule {
+        super::qwen38_captures::capture_rule38(true, None)
+    }
+
     /// `/props`' `engine` object (the module header) against the plan of the
     /// file the server opens, made here from its headers the way the server
     /// makes it, under the levers the server inherits; `mtp` the arm's main
@@ -954,7 +968,8 @@ mod gate {
         // unified card's pool is the free bytes, and the room places the
         // row-gathered tables.
         let (stage, plan_room) = server_stage(err_log)?;
-        let inputs = PlanInputs::describe_in(&split, (plan_room, HostRead::Given))?;
+        let mut inputs = PlanInputs::describe_in(&split, (plan_room, HostRead::Given))?;
+        inputs.captures = Some(server_captures());
         let experts = experts38(levers)?;
         let ub = ubatch_for(CTX)?;
         let machine = route_machine(
@@ -4273,6 +4288,7 @@ mod gate {
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let mut inputs = PlanInputs::describe(&split)?;
         inputs.room = (room, HostRead::Given);
+        inputs.captures = Some(server_captures());
         let experts = experts38(levers)?;
         let ub = u64::try_from(ubatch_for(ctx)?)?;
         let mut machine = route_machine(
@@ -5779,7 +5795,8 @@ mod gate {
         const MIB: u64 = 1 << 20;
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::describe(&split)?;
+        let mut inputs = PlanInputs::describe(&split)?;
+        inputs.captures = Some(server_captures());
         let experts = experts38(levers)?;
         let (draft_path, from) = draft_file(None, &path);
         let draft = Split::open(&draft_path).map_err(|e| {

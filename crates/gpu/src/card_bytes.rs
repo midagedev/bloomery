@@ -73,12 +73,69 @@ pub fn card_reading(gpu: &Gpu, on: &PlanCard, phase: CardPhase) -> Result<CardRe
     if let Some(why) = unmeasured_why(&on.card, false) {
         return Ok(unmeasured(why));
     }
-    host::await_done(WHAT, || gpu.stream().query())?;
-    let now = u64::try_from(gpu.mem_info()?.0)
-        .map_err(|_| GpuError::shape(WHAT, "free bytes past u64"))?;
+    let now = free_now(gpu, WHAT)?;
     Ok(CardReading::Made(Box::new(CardMade::of(
         on.index, &on.card, &on.totals, phase, before, now,
     ))))
+}
+
+/// The device's free bytes on `gpu` once the engine stream is done
+/// ([`host::ENGINE_BOUND`]): the one reading [`card_reading`] and
+/// [`card_free`] take, so a stream-ordered allocation or free enqueued before
+/// the call is in it.
+fn free_now(gpu: &Gpu, what: &'static str) -> Result<u64, GpuError> {
+    host::await_done(what, || gpu.stream().query())?;
+    u64::try_from(gpu.mem_info()?.0).map_err(|_| GpuError::shape(what, "free bytes past u64"))
+}
+
+/// Card `on`'s free bytes now, read on `gpu` as [`card_reading`] reads them;
+/// `None` where [`card_reading`] measures nothing (an integrated device, a
+/// card another process held at plan time).
+pub fn card_free(gpu: &Gpu, on: &PlanCard) -> Result<Option<u64>, GpuError> {
+    if gpu.opened_free().is_none() || unmeasured_why(&on.card, false).is_some() {
+        return Ok(None);
+    }
+    free_now(gpu, "card_free").map(Some)
+}
+
+/// The card bytes a load-time phase made: the free bytes before it less the
+/// free bytes after it ([`card_free`] at each end), negative where the phase
+/// freed more than it made; [`PhaseBytes::Unmeasured`] where either end was
+/// not measured. Printed as the phase line's `bytes=` field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseBytes {
+    Made(i128),
+    Unmeasured,
+}
+
+impl PhaseBytes {
+    /// The bytes made between a reading of `before` free bytes and one of
+    /// `after`.
+    #[must_use]
+    pub fn between(before: Option<u64>, after: Option<u64>) -> PhaseBytes {
+        match (before, after) {
+            (Some(b), Some(a)) => PhaseBytes::Made(i128::from(b) - i128::from(a)),
+            _ => PhaseBytes::Unmeasured,
+        }
+    }
+
+    /// The sum of two phases' bytes: unmeasured when either is.
+    #[must_use]
+    pub fn plus(self, other: PhaseBytes) -> PhaseBytes {
+        match (self, other) {
+            (PhaseBytes::Made(a), PhaseBytes::Made(b)) => PhaseBytes::Made(a + b),
+            _ => PhaseBytes::Unmeasured,
+        }
+    }
+}
+
+impl std::fmt::Display for PhaseBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PhaseBytes::Made(b) => write!(f, "{b}"),
+            PhaseBytes::Unmeasured => f.write_str("unmeasured"),
+        }
+    }
 }
 
 /// [`card_reading`], refused by name where the card is held: bytes made

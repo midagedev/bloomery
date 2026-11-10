@@ -509,6 +509,7 @@ use model::arch::qwen35moe::place::{
 };
 use model::placement::churn::ChurnPool;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, Rule, card_experts_floor};
+use model::placement::graphs::CaptureRule;
 use model::placement::workstation::{
     self, CardSpec, HostNeed, HostRead, POINT_ROWS_RESERVE, host_available_read,
 };
@@ -531,6 +532,8 @@ use super::drafted::{LOOKUP_ROWS, ParkedDraft, SlotDrafts, lookup_props};
 
 #[path = "../qwen38_place.rs"]
 mod q38place;
+#[path = "../qwen38_captures.rs"]
+mod qwen38_captures;
 #[path = "../qwen38_levers.rs"]
 mod qwen38_levers;
 pub(crate) use qwen38_levers::ACTS_ON;
@@ -2111,6 +2114,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         reads: 0,
         stream: 0,
     };
+    // What the load captures past its card reading, ruled once the placement's kind is: every
+    // plan below derives its graphs term from its own slots and draft, and the open captures by
+    // the same rule (`SeatArgs::captures`).
+    inputs.captures = Some(qwen38_captures::capture_rule38(
+        !a.place.tiered(),
+        lookup.then_some(LOOKUP_ROWS),
+    ));
     // A load whose prompt calls stream pins the lane's staging for its life: every machine below
     // reserves it, so the NVMe expert tier's split leaves it room and the need counts it pinned,
     // unless its plan holds every expert on the card ([`Place38::machine_read`]). A residency
@@ -2527,6 +2537,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let open = SeatArgs {
         kv,
         kv_host_page: inputs.kv_host_page,
+        captures: inputs.captures,
         place: a.place,
         lane: lane.expect("a serving run probed the lane before the plan"),
         ctx,
@@ -2750,6 +2761,11 @@ struct SeatArgs {
     /// ([`PlanInputs::kv_host_page`]): the engine thread plans from it, as
     /// the main thread's plans did.
     kv_host_page: Option<u64>,
+    /// The rule of what the load captures past its card reading
+    /// ([`qwen38_captures::capture_rule38`]): the engine thread plans its
+    /// graphs by it, as the main thread's plans did, and the open captures by
+    /// it.
+    captures: Option<CaptureRule>,
     /// The plan the main thread's rules and records read, which the load's
     /// plan is held to.
     plan: PlanKey,
@@ -2923,6 +2939,7 @@ impl Q38 {
         inputs.room = a.room.clone();
         inputs.kv = inputs.kv.in_q8_if(a.kv == KvQ8::Q8);
         inputs.kv_host_page = a.kv_host_page;
+        inputs.captures = a.captures;
         let cap = serve_ctx(u64::try_from(a.ctx)?, &inputs.spec)?;
         let ub = a.ubatch.min(a.ctx);
         let ctx_ub = (u64::try_from(a.ctx)?, u64::try_from(ub)?);
@@ -3092,8 +3109,10 @@ impl Q38 {
         }
         // The resident sequences, parked after the captures: the live slot's
         // step and verify chains stay with it, each parked slot capturing on
-        // its first use, or below with the rounds.
-        s.add_slots(a.slots)?;
+        // its first use, or below with the rounds. Each phase past the card's
+        // reading prints the card bytes it made (`bytes=`).
+        let ((), bytes) = s.made_by(|s| s.add_slots(a.slots))?;
+        eprintln!("slots add slots={} bytes={bytes}", a.slots);
         if let Some(t) = a.trace {
             s.model_mut()
                 .body_parts(WHAT)?
@@ -3105,22 +3124,35 @@ impl Q38 {
         // draft reachable in one round with no select between.
         struct Captures;
         impl app::RowsLog for Captures {
-            fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), app::SessionError> {
-                eprintln!("capture verify rows={rows} nodes={nodes}");
+            fn capture_rows(
+                &mut self,
+                rows: usize,
+                nodes: usize,
+                bytes: app::PhaseBytes,
+            ) -> Result<(), app::SessionError> {
+                eprintln!("capture verify rows={rows} nodes={nodes} bytes={bytes}");
                 Ok(())
             }
         }
-        let drafts = match (a.mtp, a.lookup) {
-            (true, _) => SlotDrafts::open(&mut s, a.slots, a.width, &mut Captures, |m| {
-                app::mtp::open_draft(m, Prompt38::Auto, StepMode::Graph)
-            })?,
+        let (drafts, bytes) = s.made_by(|s| -> Result<_, GateError> {
+            Ok(match (a.mtp, a.lookup) {
+                (true, _) => SlotDrafts::open(s, a.slots, a.width, &mut Captures, |m| {
+                    app::mtp::open_draft(m, Prompt38::Auto, StepMode::Graph)
+                })?,
+                (false, true) => SlotDrafts::lookup(s, a.slots, a.width, &mut Captures)?,
+                (false, false) => SlotDrafts::none(),
+            })
+        })?;
+        match (a.mtp, a.lookup) {
+            (true, _) => eprintln!("capture drafts draft=mtp slots={} bytes={bytes}", a.slots),
             (false, true) => {
-                let drafts = SlotDrafts::lookup(&mut s, a.slots, a.width, &mut Captures)?;
-                eprintln!("load draft=lookup slots={} (no weights)", a.slots);
-                drafts
+                eprintln!(
+                    "load draft=lookup slots={} (no weights) bytes={bytes}",
+                    a.slots
+                );
             }
-            (false, false) => SlotDrafts::none(),
-        };
+            (false, false) => {}
+        }
         // The rounds of several slots, decided once (`SeatArgs::pass`): one
         // pass of the busy rows where the body runs one, the drafted rounds
         // on a drafted load and the plain rounds on a plain one.
@@ -3129,14 +3161,14 @@ impl Q38 {
         // drafted rounds of up to a window's rows a slot, the plain ones of a
         // row, and each slot's step and draft walks a round of one busy slot
         // replays, a window cut to a slot's context (a lookup window that
-        // does not fit steps instead). The rounds grow as (rows + 1)^slots,
-        // so more slots keep capturing a pass on its first use.
-        if pass_of_slots && a.slots <= 2 {
-            let rows = window_rows(a.mtp, a.lookup).unwrap_or(1).min(a.ctx);
-            let (passes, own) = s.capture_rounds(a.slots, rows)?;
+        // does not fit steps instead): the rounds the plan counted
+        // ([`qwen38_captures::capture_rule38`]).
+        let rounds = a.captures.and_then(|r| r.of(a.slots, a.mtp, a.ctx).rounds);
+        if let Some(rounds) = rounds {
+            let (r, bytes) = s.made_by(|s| s.capture_rounds(a.slots, rounds.rows))?;
             eprintln!(
-                "capture rounds slots={} rows={rows} passes={passes} slot_graphs={own}",
-                a.slots
+                "capture rounds slots={} rows={} passes={} nodes={} slot_graphs={} bytes={bytes}",
+                a.slots, rounds.rows, r.passes, r.nodes, r.slot_graphs
             );
         }
         if a.pass == Pass::Turns {
@@ -4499,6 +4531,7 @@ mod tests {
             row_source: RowTableSource::Parts,
             arena: None,
             kv_host_page: None,
+            captures: None,
         };
         let card = DeviceInfo {
             ordinal: 0,

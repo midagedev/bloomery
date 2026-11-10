@@ -2245,7 +2245,12 @@ mod drive {
 
     impl RowsLog for Log<'_> {
         /// The pair pass's capture: the one verify this body runs.
-        fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), SessionError> {
+        fn capture_rows(
+            &mut self,
+            rows: usize,
+            nodes: usize,
+            _: app::PhaseBytes,
+        ) -> Result<(), SessionError> {
             if rows != PAIR_ROWS {
                 return Err(SessionError::Refused(format!(
                     "a verify capture of {rows} rows; the pair pass runs {PAIR_ROWS}"

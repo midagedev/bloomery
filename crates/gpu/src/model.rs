@@ -1094,6 +1094,16 @@ impl<B: ChainBody> GpuModel<B> {
             .transpose()
     }
 
+    /// The card's free bytes now, as the card-byte invariant reads them
+    /// ([`crate::card_bytes::card_free`]); `None` on a load by no plan of the
+    /// placed path or a card it does not measure.
+    pub fn card_free(&self) -> Result<Option<u64>, GpuError> {
+        match &self.plan_card {
+            Some(on) => crate::card_bytes::card_free(&self.gpu, on),
+            None => Ok(None),
+        }
+    }
+
     /// The model's resident weights.
     pub fn weights(&self) -> &Weights {
         &self.weights

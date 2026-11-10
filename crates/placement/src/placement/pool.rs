@@ -200,6 +200,7 @@ pub(super) fn totals<'a>(
                 prompt_bytes: 0,
                 ring_bytes: 0,
                 ring_half: 0,
+                graph_bytes: 0,
                 headroom_bytes: i128::from(capped(card, card_budget::of(&card_budget, card)))
                     - i128::from(used),
             })

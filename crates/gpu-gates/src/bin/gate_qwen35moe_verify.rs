@@ -198,7 +198,12 @@ mod gate {
     struct Log;
 
     impl RowsLog for Log {
-        fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), SessionError> {
+        fn capture_rows(
+            &mut self,
+            rows: usize,
+            nodes: usize,
+            _: app::PhaseBytes,
+        ) -> Result<(), SessionError> {
             println!("lookup verify pass of {rows} rows captured: {nodes} nodes");
             Ok(())
         }

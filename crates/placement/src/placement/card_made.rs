@@ -69,7 +69,7 @@ pub struct CardMade {
     /// The device's free bytes at `phase`.
     pub now: u64,
     /// The plan's terms for the card ([`CardTotals::terms`]).
-    pub terms: [(&'static str, u64); 10],
+    pub terms: [(&'static str, u64); 11],
     /// The part of the context term the opening reading already carried.
     pub in_reading: u64,
 }
@@ -248,6 +248,7 @@ mod tests {
             prompt_bytes: 0,
             ring_bytes: 0,
             ring_half: 0,
+            graph_bytes: 0,
             headroom_bytes: 0,
         }
     }
@@ -267,6 +268,7 @@ mod tests {
             prompt_bytes: 90 * MIB,
             ring_bytes: 110 * MIB,
             ring_half: 4,
+            graph_bytes: 120 * MIB,
             headroom_bytes: 1,
         }
     }
@@ -322,7 +324,8 @@ mod tests {
                 7 => t.reserve_bytes = bytes,
                 8 => t.prompt_bytes = bytes,
                 9 => t.ring_bytes = bytes,
-                _ => unreachable!("ten terms"),
+                10 => t.graph_bytes = bytes,
+                _ => unreachable!("eleven terms"),
             }
             let count = if name == "context" {
                 bytes - CONTEXT_SELF
@@ -378,10 +381,38 @@ mod tests {
         assert!(
             made(&t, load + ring)
                 .terms_text()
-                .ends_with(&format!("ring={ring}"))
+                .ends_with(&format!("ring={ring},graphs=0"))
         );
         let again = std::panic::catch_unwind(move || t.grow_ring(1, 1));
         assert!(again.is_err(), "a card counts one ring");
+    }
+
+    /// The graphs a load captures past its reading are their own named term,
+    /// the last, counted whole and out of the headroom: a reading after the
+    /// captures holds their bytes, and the prompt and ring terms stay as they were.
+    #[test]
+    fn the_graphs_grown_into_the_totals_are_counted_by_name() {
+        let mut t = zero();
+        let load = 300 * MIB;
+        t.expert_bytes = load;
+        t.headroom_bytes = 1000 * MIB as i128;
+        let graphs = 220 * MIB;
+        assert_eq!(made(&t, load + graphs).past(), Some(graphs));
+        t.grow_graphs(graphs);
+        assert_eq!(t.graph_bytes, graphs);
+        assert_eq!((t.prompt_bytes, t.ring_bytes), (0, 0));
+        assert_eq!(t.headroom_bytes, 780 * MIB as i128, "out of the headroom");
+        assert_eq!(
+            t.bytes_beside_prompt(),
+            load + graphs,
+            "beside a prompt's reserve"
+        );
+        assert_eq!(made(&t, load + graphs).past(), None);
+        assert!(
+            made(&t, load + graphs)
+                .terms_text()
+                .ends_with(&format!("graphs={graphs}"))
+        );
     }
 
     /// A context term under the creation cost counts nothing past the

@@ -1459,7 +1459,12 @@ const WHOSE: &str = "a glm5next body's";
 struct PairCapture;
 
 impl RowsLog for PairCapture {
-    fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), SessionError> {
+    fn capture_rows(
+        &mut self,
+        rows: usize,
+        nodes: usize,
+        _: app::PhaseBytes,
+    ) -> Result<(), SessionError> {
         capture::pair(rows, VERIFY_ROWS, nodes, Out::Stderr).map_err(SessionError::Refused)
     }
 }

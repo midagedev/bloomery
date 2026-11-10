@@ -3399,8 +3399,13 @@ mod cli {
     struct VerifyCaptures;
 
     impl app::RowsLog for VerifyCaptures {
-        fn capture_rows(&mut self, rows: usize, nodes: usize) -> Result<(), app::SessionError> {
-            println!("capture verify rows={rows} nodes={nodes}");
+        fn capture_rows(
+            &mut self,
+            rows: usize,
+            nodes: usize,
+            bytes: app::PhaseBytes,
+        ) -> Result<(), app::SessionError> {
+            println!("capture verify rows={rows} nodes={nodes} bytes={bytes}");
             Ok(())
         }
     }

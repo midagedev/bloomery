@@ -38,7 +38,7 @@ impl<B: Open> OpenLog<B> for Quiet {
 }
 
 impl RowsLog for Quiet {
-    fn capture_rows(&mut self, _: usize, _: usize) -> Result<(), SessionError> {
+    fn capture_rows(&mut self, _: usize, _: usize, _: app::PhaseBytes) -> Result<(), SessionError> {
         Ok(())
     }
 }

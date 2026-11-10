@@ -518,6 +518,7 @@ fn qwen36_inputs() -> q35::PlanInputs {
         row_source: model::placement::RowTableSource::Split,
         arena: None,
         kv_host_page: None,
+        captures: None,
     }
 }
 

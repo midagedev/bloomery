@@ -270,6 +270,7 @@ mod tests {
             prompt_bytes: 0,
             ring_bytes: 0,
             ring_half: 0,
+            graph_bytes: 0,
             headroom_bytes: headroom,
         };
         assert_eq!(reclaimable(&totals(700), 400), 900);

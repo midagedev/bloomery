@@ -137,8 +137,14 @@ pub struct CardTotals {
     /// The slots of each half of the ring [`CardTotals::ring_bytes`] counts; 0
     /// with it.
     pub ring_half: u64,
+    /// The device bytes the driver keeps for the graphs the load captures past
+    /// its load reading (its drafts' verify passes and walks, its rounds'
+    /// passes: [`super::graphs::LoadCaptures`]), reserved out of the expert
+    /// budget by the model's plan ([`CardTotals::grow_graphs`]); 0 for a plan
+    /// whose load captures nothing past its reading.
+    pub graph_bytes: u64,
     /// usable − dense − experts − rounding − KV − stage rows − scratch −
-    /// context − reserves − prompt − ring, usable capped by the plan's card budget; the
+    /// context − reserves − prompt − ring − graphs, usable capped by the plan's card budget; the
     /// margin is inside it.
     pub headroom_bytes: i128,
 }
@@ -173,7 +179,7 @@ impl CardTotals {
     /// refusals give it: the one list both the sum and a message naming the
     /// terms read ([`super::card_made`]).
     #[must_use]
-    pub fn terms(&self) -> [(&'static str, u64); 10] {
+    pub fn terms(&self) -> [(&'static str, u64); 11] {
         [
             ("dense", self.dense_bytes),
             ("experts", self.expert_bytes),
@@ -185,6 +191,7 @@ impl CardTotals {
             ("reserves", self.reserve_bytes),
             ("prompt", self.prompt_bytes),
             ("ring", self.ring_bytes),
+            ("graphs", self.graph_bytes),
         ]
     }
 
@@ -212,6 +219,16 @@ impl CardTotals {
     /// card-byte invariant's count at the first prompt holds them.
     pub fn grow_prompt(&mut self, bytes: u64) {
         self.prompt_bytes += bytes;
+        self.headroom_bytes -= i128::from(bytes);
+    }
+
+    /// `bytes` more in the card's graphs term, out of its headroom: the device
+    /// bytes the graphs the load captures past its load reading keep
+    /// ([`super::graphs::LoadCaptures::card_bytes`], reserved out of the expert
+    /// budget before the experts fill), so the card-byte invariant's count
+    /// after the load's captures holds them.
+    pub fn grow_graphs(&mut self, bytes: u64) {
+        self.graph_bytes += bytes;
         self.headroom_bytes -= i128::from(bytes);
     }
 
