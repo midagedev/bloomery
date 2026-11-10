@@ -69,7 +69,7 @@ pub struct CardMade {
     /// The device's free bytes at `phase`.
     pub now: u64,
     /// The plan's terms for the card ([`CardTotals::terms`]).
-    pub terms: [(&'static str, u64); 9],
+    pub terms: [(&'static str, u64); 10],
     /// The part of the context term the opening reading already carried.
     pub in_reading: u64,
 }
@@ -246,6 +246,8 @@ mod tests {
             context_bytes: 0,
             reserve_bytes: 0,
             prompt_bytes: 0,
+            ring_bytes: 0,
+            ring_half: 0,
             headroom_bytes: 0,
         }
     }
@@ -263,6 +265,8 @@ mod tests {
             context_bytes: 512 * MIB,
             reserve_bytes: 70 * MIB,
             prompt_bytes: 90 * MIB,
+            ring_bytes: 110 * MIB,
+            ring_half: 4,
             headroom_bytes: 1,
         }
     }
@@ -317,7 +321,8 @@ mod tests {
                 6 => t.context_bytes = bytes,
                 7 => t.reserve_bytes = bytes,
                 8 => t.prompt_bytes = bytes,
-                _ => unreachable!("nine terms"),
+                9 => t.ring_bytes = bytes,
+                _ => unreachable!("ten terms"),
             }
             let count = if name == "context" {
                 bytes - CONTEXT_SELF
@@ -350,8 +355,33 @@ mod tests {
         assert!(
             made(&t, load + pass)
                 .terms_text()
-                .ends_with(&format!("prompt={}", load + pass))
+                .contains(&format!("prompt={}", load + pass))
         );
+    }
+
+    /// The ring grown into the totals is its own named term, counted whole and out of
+    /// the headroom: the first prompt's reading holds the ring's bytes, and a second
+    /// ring on one card is refused by name.
+    #[test]
+    fn a_ring_grown_into_the_totals_is_counted_by_name() {
+        let mut t = zero();
+        let load = 300 * MIB;
+        t.expert_bytes = load;
+        t.headroom_bytes = 1000 * MIB as i128;
+        let ring = 250 * MIB;
+        assert_eq!(made(&t, load + ring).past(), Some(ring));
+        t.grow_ring(ring, 7);
+        assert_eq!((t.ring_bytes, t.ring_half), (ring, 7));
+        assert_eq!(t.prompt_bytes, 0, "the ring is not the prompt term");
+        assert_eq!(t.headroom_bytes, 750 * MIB as i128, "out of the headroom");
+        assert_eq!(made(&t, load + ring).past(), None);
+        assert!(
+            made(&t, load + ring)
+                .terms_text()
+                .ends_with(&format!("ring={ring}"))
+        );
+        let again = std::panic::catch_unwind(move || t.grow_ring(1, 1));
+        assert!(again.is_err(), "a card counts one ring");
     }
 
     /// A context term under the creation cost counts nothing past the

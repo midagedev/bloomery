@@ -194,7 +194,71 @@ pub fn stream_ring_bytes(
     (n_expert, half): (u64, u64),
     beside: u64,
 ) -> Result<u64, PlacementError> {
-    Ok(2 * half * stream_slot_bytes(model, stacks, n_expert)? + beside)
+    Ok(ring_halves_bytes(stream_slot_bytes(model, stacks, n_expert)?, half) + beside)
+}
+
+/// The ring's two halves of `half` slots of `slot` bytes: the part of every family's ring bytes
+/// ([`stream_ring_bytes`], a planned-last ring's term) that the stream's ring buffers take. The one
+/// formula of it.
+#[must_use]
+pub const fn ring_halves_bytes(slot: u64, half: u64) -> u64 {
+    2 * half * slot
+}
+
+/// The ring planned last, the one rule of every family whose plan counts the ring after its other
+/// terms: the largest half of at most `max_half` slots (the most host experts a layer leaves) whose
+/// ring `bytes_of(half)` fits `room`, the headroom less the margin and what the caller counts past
+/// the totals. `Some((half, bytes))`, `None` when not even one slot's ring fits. The caller counts
+/// the bytes as the card's ring term ([`CardTotals::grow_ring`](crate::placement::CardTotals::grow_ring)).
+#[must_use]
+pub fn plan_ring_last(
+    room: u64,
+    max_half: u64,
+    bytes_of: impl Fn(u64) -> u64,
+) -> Option<(u64, u64)> {
+    match largest_half(room, max_half, &bytes_of) {
+        0 => None,
+        half => Some((half, bytes_of(half))),
+    }
+}
+
+/// The card bytes the stream's ring buffers may take under a ring term of `term` bytes whose ring
+/// pass makes `pass` of them: the cap every family gives its ring (`XCfg::room_cap`), so the ring
+/// made never passes the term.
+#[must_use]
+pub const fn ring_room_cap(term: u64, pass: u64) -> u64 {
+    term.saturating_sub(pass)
+}
+
+/// Card bytes of the ring pass's route of a Qwen3.8-style walk over a half of `half` slots: the
+/// GEMM route's table of `slots` slots ([`ring_pass_bytes_in`]'s route terms, the one form of
+/// them) and the two selection lists of `slots` four-byte words the walk's card route keeps beside
+/// it (`wide38`'s `arm_ring`). The ring a body of that walk makes holds these beside its two
+/// halves ([`stream_ring_bytes`] with this as `beside`).
+#[must_use]
+pub const fn ring_route_bytes(slots: usize, half: usize) -> u64 {
+    let routed = if half < slots { half } else { slots };
+    let zeros = if half == 1 { slots } else { 0 };
+    let table = 4 * (slots + 2 * (slots / GEMM_TILE_COLS + routed) + 2 + zeros);
+    (table + 2 * 4 * slots) as u64
+}
+
+/// The largest half of at most `max_half` slots whose ring `bytes_of(half)` fits `room`; 0 when
+/// not even one slot's ring fits. `bytes_of` should not shrink as the half grows; the one point it
+/// does is a half of one slot, whose route holds the all-zero ids ([`ring_route_bytes`]), so a
+/// search may pass over a half of one the room holds. The half returned always fits `room`.
+#[must_use]
+pub fn largest_half(room: u64, max_half: u64, bytes_of: impl Fn(u64) -> u64) -> u64 {
+    let (mut lo, mut hi) = (0, max_half);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if bytes_of(mid) <= room {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
 }
 
 /// A slot of the expert stream: the widest layer's expert at its routed stacks' file bytes per
@@ -233,6 +297,33 @@ pub fn stream_slot_bytes(
         slot = slot.max(expert);
     }
     Ok(slot)
+}
+
+/// A slot of the expert stream's ring as `XStream::new` makes it: each routed stack's widest
+/// expert over the layers (`stacks(l)`, the gate, up and down of layer `l`; the four-byte f32
+/// tensor scale an expert of a stack in [`CardFormat::Nvfp4Planes`] carries beside its planes
+/// counted in it), rounded to the GEMMs' 16-byte stack alignment, summed. At least
+/// [`stream_slot_bytes`], which sums the widest layer's unrounded stacks. Refused as it refuses.
+pub fn ring_slot_bytes(
+    model: &ModelTensors,
+    stacks: impl Fn(usize) -> [String; 3],
+    n_expert: u64,
+) -> Result<u64, PlacementError> {
+    stream_slot_bytes(model, &stacks, n_expert)?;
+    let mut widest = [0u64; 3];
+    for l in 0..model.layers {
+        for (w, name) in widest.iter_mut().zip(stacks(l)) {
+            let Some(t) = model.tensors.iter().find(|t| t.name == name) else {
+                continue;
+            };
+            let mut expert = placement::per_expert(t, n_expert)?.1;
+            if CardFormat::of_routed(t.ty) == Some(CardFormat::Nvfp4Planes) {
+                expert += 4;
+            }
+            *w = (*w).max(expert);
+        }
+    }
+    Ok(widest.iter().map(|w| w.next_multiple_of(16)).sum())
 }
 
 /// The card bytes a tiered load makes beside the prompt batch's reserve: per routed slot of the
@@ -1147,6 +1238,22 @@ impl KvBytes for KvLayout {
 
 #[cfg(test)]
 mod tests {
+    /// The common ring owner: the largest half that fits, none when not one slot does, the cap
+    /// the term less the pass.
+    #[test]
+    fn the_ring_is_planned_by_one_rule() {
+        let bytes = |h: u64| ring_halves_bytes(10, h) + ring_route_bytes(64, h as usize);
+        assert_eq!(plan_ring_last(bytes(5), 8, bytes), Some((5, bytes(5))));
+        assert_eq!(plan_ring_last(bytes(5) - 1, 8, bytes), Some((4, bytes(4))));
+        assert_eq!(plan_ring_last(u64::MAX, 8, bytes), Some((8, bytes(8))));
+        assert_eq!(plan_ring_last(0, 8, bytes), None);
+        assert_eq!(plan_ring_last(u64::MAX, 0, bytes), None);
+        assert_eq!(
+            ring_room_cap(bytes(5), ring_route_bytes(64, 5)),
+            ring_halves_bytes(10, 5)
+        );
+    }
+
     use gguf::GgmlType;
     use models::{
         Candidates, Compress, Compressor, DeltaKind, Gqa, IndexKeys, KdaGate, Latent, LatentOut,

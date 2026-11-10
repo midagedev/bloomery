@@ -127,8 +127,17 @@ pub struct CardTotals {
     /// expert budget by the model's plan ([`CardTotals::grow_prompt`]); 0 for
     /// a plan that counts none.
     pub prompt_bytes: u64,
+    /// The card bytes the expert stream's ring takes when a prompt call streams
+    /// its host experts (`BLOOMERY_XSTREAM=split`): the ring's two halves of
+    /// [`CardTotals::ring_half`] slots and the buffers of the ring's pass, planned
+    /// last from what every other term leaves ([`CardTotals::grow_ring`]); 0 for
+    /// a plan that counts none.
+    pub ring_bytes: u64,
+    /// The slots of each half of the ring [`CardTotals::ring_bytes`] counts; 0
+    /// with it.
+    pub ring_half: u64,
     /// usable − dense − experts − rounding − KV − stage rows − scratch −
-    /// context − reserves − prompt, usable capped by the plan's card budget; the
+    /// context − reserves − prompt − ring, usable capped by the plan's card budget; the
     /// margin is inside it.
     pub headroom_bytes: i128,
 }
@@ -148,7 +157,7 @@ impl CardTotals {
     /// refusals give it: the one list both the sum and a message naming the
     /// terms read ([`super::card_made`]).
     #[must_use]
-    pub fn terms(&self) -> [(&'static str, u64); 9] {
+    pub fn terms(&self) -> [(&'static str, u64); 10] {
         [
             ("dense", self.dense_bytes),
             ("experts", self.expert_bytes),
@@ -159,6 +168,7 @@ impl CardTotals {
             ("context", self.context_bytes),
             ("reserves", self.reserve_bytes),
             ("prompt", self.prompt_bytes),
+            ("ring", self.ring_bytes),
         ]
     }
 
@@ -186,6 +196,24 @@ impl CardTotals {
     /// card-byte invariant's count at the first prompt holds them.
     pub fn grow_prompt(&mut self, bytes: u64) {
         self.prompt_bytes += bytes;
+        self.headroom_bytes -= i128::from(bytes);
+    }
+
+    /// The expert stream's ring of `half` slots a half, `bytes` of card in all, as a named
+    /// term out of the headroom: planned last, after every other term, so the experts the
+    /// plan places are those of a plan without the ring. Counted once: a second ring is
+    /// refused by name.
+    ///
+    /// # Panics
+    ///
+    /// When the card already counts a ring.
+    pub fn grow_ring(&mut self, bytes: u64, half: u64) {
+        assert!(
+            self.ring_bytes == 0 && self.ring_half == 0,
+            "CardTotals::grow_ring: a card counts one ring"
+        );
+        self.ring_bytes = bytes;
+        self.ring_half = half;
         self.headroom_bytes -= i128::from(bytes);
     }
 }

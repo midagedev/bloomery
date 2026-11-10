@@ -684,6 +684,28 @@ mod tests {
         hi
     }
 
+    /// Muse Spark's ring bytes are the common owner's: `stream_ring_bytes` is the ring's two halves
+    /// of [`STREAM_HALF_SLOTS`] slots of the widest layer's expert
+    /// ([`place_hybrid::ring_halves_bytes`]) and nothing beside them, the value the plan reserved
+    /// before the common owner took the formula (2 · 128 · slot, derived from the formula, not
+    /// measured).
+    #[test]
+    fn the_ring_bytes_are_the_common_owners() {
+        let hp = hparams(2048, 1024, 1024, 64);
+        let model = tensors(&hp);
+        use super::{STREAM_HALF_SLOTS, stream_ring_bytes, stream_slot_bytes};
+        use crate::arch::place_hybrid;
+        let slot = stream_slot_bytes(&hp, &model).expect("the slot");
+        assert_eq!(
+            stream_ring_bytes(&hp, &model).expect("the ring"),
+            2 * STREAM_HALF_SLOTS * slot
+        );
+        assert_eq!(
+            stream_ring_bytes(&hp, &model).expect("the ring"),
+            place_hybrid::ring_halves_bytes(slot, STREAM_HALF_SLOTS)
+        );
+    }
+
     /// The plan's reserve for the prompt pass is the load's formula over the file's shape at the
     /// most rows a pass takes, and the experts it leaves on the card are the ones the rest of the
     /// card holds. The file has 4 layers of 64 experts of 1,024 rows over a 1,024-value latent: an
