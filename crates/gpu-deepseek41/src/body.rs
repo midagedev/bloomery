@@ -93,8 +93,8 @@ use bloomery_gpu::hybrid::{
 use bloomery_gpu::model::{ChainBody, HostServed, Resident, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{
-    DeviceTensor, FreedBytes, Gpu, GpuError, GpuModel, KvBacking, KvRoomBody, PartedBuffer,
-    RoomTensor, capturing, fit_rooms, kv_backing, window,
+    CardKeep, DeviceTensor, FreedBytes, Gpu, GpuError, GpuModel, KvBacking, KvRoomBody,
+    PartedBuffer, RoomTensor, capturing, fit_rooms, kv_backing, window,
 };
 use bloomery_levers::{ChurnHosting, HostCfg, KvHost, ResidencyAt};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
@@ -585,7 +585,7 @@ pub fn open_rank<S: Source + Sync>(
         cols,
         join: sums,
         stored,
-        kv: (kv, KvHost::Off, 0),
+        kv: (kv, KvHost::Off, CardKeep::default()),
     };
     let mut body = Body::assemble(
         &gpu,
@@ -742,27 +742,23 @@ impl LayerKv {
 }
 
 /// Where a sequence's by-position stores come from: the declaration the plan read
-/// ([`KvBytes::rooms`]), the backing `BLOOMERY_KV_HOST` gives the selected rows, and the free
-/// bytes of the card a spill room keeps ([`kv_backing`]).
+/// ([`KvBytes::rooms`]), the backing `BLOOMERY_KV_HOST` gives the selected rows, and what a
+/// spill room keeps free of the card ([`CardKeep`], [`kv_backing`]).
 #[derive(Clone, Debug)]
 pub(super) struct KvRooms {
     layout: PosLayout,
     word: KvHost,
-    margin: u64,
+    keep: CardKeep,
 }
 
 impl KvRooms {
-    /// The rooms of the file's layout `kv` under the lever word `word` and the card's `margin`.
-    fn new(kv: &KvLayout, word: KvHost, margin: u64) -> Result<KvRooms, GpuError> {
+    /// The rooms of the file's layout `kv` under the lever word `word` and the card's `keep`.
+    fn new(kv: &KvLayout, word: KvHost, keep: CardKeep) -> Result<KvRooms, GpuError> {
         let layout = kv.rooms().cloned().ok_or(GpuError::State {
             what: "deepseek41 Body::load_placed",
             missing: "the layout's rooms",
         })?;
-        Ok(KvRooms {
-            layout,
-            word,
-            margin,
-        })
+        Ok(KvRooms { layout, word, keep })
     }
 
     /// Layer `l`'s buffer `what` (the layout's name for it) as a room-backed tensor of `ctx`
@@ -778,7 +774,7 @@ impl KvRooms {
         let Some(buf) = self.layout.buffers(l).iter().find(|b| b.what == what) else {
             return Ok(None);
         };
-        let backing = kv_backing(self.word, buf.access, self.margin);
+        let backing = kv_backing(self.word, buf.access, self.keep);
         let t = RoomTensor::<u16>::new(stream, buf, ctx, name, backing)?;
         if t.cols() != width {
             return Err(GpuError::Shape {
@@ -3234,7 +3230,7 @@ impl Body {
             kv: (
                 KvLayout::from_file(file, hp).map_err(|e| GpuError::plan(WHAT, e))?,
                 plan.kv_host,
-                plan.machine.cards[card].margin_bytes,
+                CardKeep::of(plan, &plan.machine.cards[card]),
             ),
         };
         Body::assemble(
@@ -3293,12 +3289,12 @@ impl Body {
             cols,
             join,
             stored,
-            kv: (kv, word, margin),
+            kv: (kv, word, keep),
         } = at;
         let stream = gpu.stream();
         let planner =
             Planner::from_file(file, hp, ctx_max as u64).map_err(|e| GpuError::plan(WHAT, e))?;
-        let kv_rooms = KvRooms::new(&kv, word, margin)?;
+        let kv_rooms = KvRooms::new(&kv, word, keep)?;
         let seq = Seq::new(
             gpu,
             hp,
@@ -3425,9 +3421,9 @@ struct Assembly<'a> {
     join: Option<Sums>,
     /// A checkpoint folder's stored row tables ([`RankFrom::stored`]).
     stored: Option<&'a BTreeMap<String, StoredRows>>,
-    /// The file's K/V layout, the plan's `BLOOMERY_KV_HOST` word and the card's margin: what the
-    /// sequences' rooms are built from ([`KvRooms`]).
-    kv: (KvLayout, KvHost, u64),
+    /// The file's K/V layout, the plan's `BLOOMERY_KV_HOST` word and what the card keeps free:
+    /// what the sequences' rooms are built from ([`KvRooms`]).
+    kv: (KvLayout, KvHost, CardKeep),
 }
 
 /// Where a placed load lands besides its plan ([`Body::load_placed`]): the

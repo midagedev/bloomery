@@ -57,7 +57,7 @@ use crate::routed_block::RouterEntry;
 use crate::site::{KGemvKernels, SiteTy};
 use crate::tensor::{WindowMut, copy_row};
 use crate::weights::{DevWeight, Weights};
-use crate::{FreedBytes, Gpu, GpuError, KvRoomBody, LAYER_HEAD, RoomTensor, fit_rooms};
+use crate::{CardKeep, FreedBytes, Gpu, GpuError, KvRoomBody, LAYER_HEAD, RoomTensor, fit_rooms};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -1003,20 +1003,20 @@ impl Body {
         }
         let handle = gpu.stream_handle();
         // The plan's `kv_host` word where the rooms' pages back, a spill keeping the stage card's
-        // margin free; a load with no plan backs every page on the card.
+        // margin free under its budget; a load with no plan backs every page on the card.
         let kv = placed.as_ref().map_or(
             KvBackings {
                 word: bloomery_levers::KvHost::Off,
-                margin: 0,
+                keep: CardKeep::default(),
             },
             |(open, card)| KvBackings {
                 word: open.plan.kv_host,
-                margin: open
+                keep: open
                     .plan
                     .machine
                     .cards
                     .get(*card)
-                    .map_or(0, |c| c.margin_bytes),
+                    .map_or_else(CardKeep::default, |c| CardKeep::of(open.plan, c)),
             },
         );
         let kd = kda::dims(&hp)?;

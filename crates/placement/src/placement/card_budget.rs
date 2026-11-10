@@ -197,6 +197,26 @@ pub fn split(cards: &[ShareCard], experts: u64) -> Vec<u64> {
         .collect()
 }
 
+/// The free bytes a card holds for this process under its plan's `budget`
+/// ([`of`]): the driver's `free` of the card's `total`, or, under a budget, the
+/// budget less what the card already holds (`total − free`) when that is less.
+/// A budget plans a card as if it had only those bytes, so every reading a
+/// margin is kept against reads this figure, never the driver's alone.
+#[must_use]
+pub fn free_under(free: u64, total: u64, budget: Option<u64>) -> u64 {
+    budget.map_or(free, |b| {
+        free.min(b.saturating_sub(total.saturating_sub(free)))
+    })
+}
+
+/// Whether one more `page` of the card would leave fewer than `margin` of
+/// the free bytes [`free_under`] reads: a spill room's page past this goes to
+/// the host.
+#[must_use]
+pub fn past_margin(free: u64, total: u64, budget: Option<u64>, margin: u64, page: u64) -> bool {
+    free_under(free, total, budget) < margin.saturating_add(page)
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
@@ -423,6 +443,33 @@ mod tests {
             split(&[card(huge, huge), card(huge, huge)], huge),
             [huge / 2, huge / 2]
         );
+    }
+
+    /// The free bytes under a budget are the budget's remainder, so a margin is kept against
+    /// the budget and not the driver's reading. The numbers are the fixture serve gate's
+    /// elastic refill on a 3090 of 24 GiB under the gate budget of its usable bytes (24,176
+    /// MiB) [derived from that log's settle line, the device total assumed]: 1,122,893,824 B
+    /// free to the budget is 1,542,324,224 B to the driver, so 30 K/V pages of 2 MiB past the
+    /// settle leave the budget under its 1 GiB margin while the driver still reads 387 MiB
+    /// above it.
+    ///
+    /// FAIL-first: a `free_under` that returns `free` (the driver's reading) reds the first
+    /// assertion and lets the page stay on the card in the last.
+    #[test]
+    fn a_margin_is_kept_against_the_budget_and_not_the_driver() {
+        const MIB: u64 = 1 << 20;
+        let (total, budget, margin, page) = (24_576 * MIB, 24_176 * MIB, 1 << 30, 2 * MIB);
+        let settled = 1_122_893_824;
+        let driver = settled + (total - budget);
+        assert_eq!(free_under(driver, total, Some(budget)), settled);
+        assert_eq!(free_under(driver, total, None), driver);
+        assert_eq!(free_under(driver, total, Some(total * 2)), driver);
+        assert_eq!(free_under(0, total, Some(budget)), 0);
+        assert_eq!(free_under(driver, total, Some(0)), 0);
+        assert!(!past_margin(driver, total, Some(budget), margin, page));
+        let grown = driver - 30 * page;
+        assert!(!past_margin(grown, total, None, margin, page));
+        assert!(past_margin(grown, total, Some(budget), margin, page));
     }
 
     /// A budget reads in bytes in a line: `unset`, or the value and `B`.

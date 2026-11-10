@@ -135,7 +135,10 @@ pub use model::{GpuModel, Slots};
 pub use room::elastic::{
     Elastic, ElasticBody, ElasticStats, FilledBytes, HELD_NO_QUANTUM, settle_to_margin, with_room,
 };
-pub use room::kv::{FreedBytes, KvBacking, KvRoomBody, RoomTensor, fit_rooms, kv_backing};
+pub use room::kv::{
+    CardKeep, FillHeld, FreedBytes, KvBacking, KvRoomBody, RoomTensor, fit_rooms, kv_backing,
+    take_fill_first,
+};
 pub use room::{SharedPages, StackRoom};
 pub use watchdog::Busy as EngineBusy;
 /// The engine over the DeepSeek-V2-Lite chain — what `GpuModel` alone named

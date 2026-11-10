@@ -25,7 +25,7 @@ use crate::kv_format::KvQ8;
 use crate::linear::{self, LinearShape};
 use crate::ple;
 use crate::qsa::{self, QsaScratch};
-use crate::room::kv::kv_backing;
+use crate::room::kv::{CardKeep, kv_backing};
 use crate::room::{Backing, Room, Roomed, Run, SharedPages};
 use crate::route_softmax::{RouterDims, RouterOut};
 use crate::site::ByName;
@@ -96,19 +96,20 @@ pub(super) const KV_PLANES: &str = "a Qwen3.8 slot's K/V planes";
 /// may sit on the host.
 pub(super) const PLANES_ACCESS: Access = Access::Select { rows: 2_048 };
 
-/// The `BLOOMERY_KV_HOST` lever's typed word and the plan's card margin
-/// (`Card::margin_bytes`), what [`KvLevers::backing`] maps to a room's backing for a buffer: one
-/// map of the lever word (`kv_backing`), the class rule for each buffer's access.
+/// The `BLOOMERY_KV_HOST` lever's typed word and what the plan's stage card keeps free
+/// ([`CardKeep`]: its margin under its budget), what [`KvLevers::backing`] maps to a room's
+/// backing for a buffer: one map of the lever word (`kv_backing`), the class rule for each
+/// buffer's access.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct KvLevers {
     pub(super) word: bloomery_levers::KvHost,
-    pub(super) margin: u64,
+    pub(super) keep: CardKeep,
 }
 
 impl KvLevers {
     /// The backing a buffer read as `access` takes under the lever.
     pub(super) fn backing(self, access: Access) -> Backing {
-        kv_backing(self.word, access, self.margin).into()
+        kv_backing(self.word, access, self.keep).into()
     }
 }
 
@@ -896,7 +897,7 @@ mod tests {
                             kv,
                             KvLevers {
                                 word: bloomery_levers::KvHost::Off,
-                                margin: 0,
+                                keep: crate::CardKeep::default(),
                             },
                         )
                         .expect("a selecting store")

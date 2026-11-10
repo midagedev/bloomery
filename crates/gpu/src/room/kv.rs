@@ -1,15 +1,19 @@
 //! The K/V rooms' common owner for every body: the class rule that says where a by-position
 //! buffer's pages may live ([`kv_backing`]), the constructor of a room-backed `[rows][width]`
-//! tensor ([`RoomTensor`]) and the fit → free expert bytes → fit once more loop a body runs
-//! before it stages rows ([`fit_rooms`]). A family declares its buffers as data
+//! tensor ([`RoomTensor`]), the free bytes a card keeps against its budget ([`CardKeep`]) and
+//! the fill first → fit → free expert bytes → fit once more loop a body runs before it stages
+//! rows ([`fit_rooms`]). A family declares its buffers as data
 //! (`runtime::stores::PosLayout`, which the plan reads too) and attaches through these; nothing
 //! here names a model.
 
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
+use ::model::placement::Plan;
+use ::model::placement::card_budget;
+use ::model::placement::elastic::fill_first;
 use bloomery_levers::KvHost;
-use cuda_core::{CudaStream, DeviceCopy};
+use cuda_core::{CudaContext, CudaStream, DeviceCopy};
 use runtime::stores::{Access, Class, PosBuf};
 
 use super::{Backing, Roomed, Run, Views};
@@ -24,8 +28,8 @@ pub enum KvBacking {
     Card,
     /// Host memory on the device's NUMA node, reached over its link.
     Host,
-    /// The card first, keeping `margin` bytes of it free; a page past that goes to the host.
-    Spill { margin: u64 },
+    /// The card first, keeping `keep` of its free bytes; a page past that goes to the host.
+    Spill { keep: CardKeep },
 }
 
 impl From<KvBacking> for Backing {
@@ -33,20 +37,81 @@ impl From<KvBacking> for Backing {
         match b {
             KvBacking::Card => Backing::Card,
             KvBacking::Host => Backing::Host,
-            KvBacking::Spill { margin } => Backing::Spill { margin },
+            KvBacking::Spill { keep } => Backing::Spill { keep },
         }
+    }
+}
+
+/// What a load keeps free of its stage card: the plan's `margin` (`Card::margin_bytes`) of the
+/// free bytes the card's `budget` leaves it (`card_budget::of`, `None` for the card's own
+/// bytes). A spill room's page and the fill's take-back ([`fit_rooms`]) read the card through
+/// it, so under `BLOOMERY_CARD_BUDGET` the margin is kept against the budget, as the plan and
+/// the elastic settle keep it, and never against the driver's free bytes alone. A budget the
+/// plan lowered itself on a unified machine (`Plan::budget_from_pool`) is no keep: the card and
+/// the host there are one pool, so a page moved to the host frees none of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CardKeep {
+    pub margin: u64,
+    pub budget: Option<u64>,
+}
+
+impl CardKeep {
+    /// The keep of `plan`'s `card`: its margin, under the budget the plan's caller gave.
+    #[must_use]
+    pub fn of(plan: &Plan<'_>, card: &::model::placement::Card) -> CardKeep {
+        CardKeep {
+            margin: card.margin_bytes,
+            budget: if plan.budget_from_pool {
+                None
+            } else {
+                card_budget::of(&plan.card_budget, card)
+            },
+        }
+    }
+
+    /// The card's free bytes under the budget (`card_budget::free_under`), read on `ctx`.
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal to bind the context or read the device's memory.
+    pub fn free(self, ctx: &CudaContext) -> Result<u64, GpuError> {
+        ctx.bind_to_thread()?;
+        self.free_bound()
+    }
+
+    /// [`CardKeep::free`] on the context already bound to the thread.
+    pub(crate) fn free_bound(self) -> Result<u64, GpuError> {
+        let (free, total) = crate::current_mem_info()?;
+        Ok(card_budget::free_under(
+            free as u64,
+            total as u64,
+            self.budget,
+        ))
+    }
+
+    /// Whether one more card page of `page` bytes would leave the card under the margin
+    /// (`card_budget::past_margin`), on the context already bound to the thread.
+    pub(crate) fn past_margin(self, page: u64) -> Result<bool, GpuError> {
+        let (free, total) = crate::current_mem_info()?;
+        Ok(card_budget::past_margin(
+            free as u64,
+            total as u64,
+            self.budget,
+            self.margin,
+            page,
+        ))
     }
 }
 
 /// The backing the `BLOOMERY_KV_HOST` lever's `word` gives a buffer read as `access`, the one
 /// map of the lever word. A scanned buffer is read whole every step, so it is card-only
-/// whatever the word; a selected buffer follows the word. `margin` is the plan's card margin
-/// (`Card::margin_bytes`), the free bytes a `spill` room keeps on the card.
+/// whatever the word; a selected buffer follows the word. `keep` is what a `spill` room keeps
+/// free of the card ([`CardKeep`]).
 #[must_use]
-pub fn kv_backing(word: KvHost, access: Access, margin: u64) -> KvBacking {
+pub fn kv_backing(word: KvHost, access: Access, keep: CardKeep) -> KvBacking {
     match (access.class(), word) {
         (Class::Card, _) | (Class::Host, KvHost::Off) => KvBacking::Card,
-        (Class::Host, KvHost::Spill) => KvBacking::Spill { margin },
+        (Class::Host, KvHost::Spill) => KvBacking::Spill { keep },
         (Class::Host, KvHost::All) => KvBacking::Host,
     }
 }
@@ -185,6 +250,16 @@ pub struct FreedBytes {
     pub layers: usize,
 }
 
+/// What an elastic load's fill holds of the stage card for [`fit_rooms`]'s fill-first step:
+/// the `held` bytes the fill backed above the plan and not yet given back, what the card keeps
+/// ([`CardKeep`]) and the `page` the take-back adds past the shortfall.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FillHeld {
+    pub held: u64,
+    pub keep: CardKeep,
+    pub page: u64,
+}
+
 /// A body whose stores are rooms: what [`fit_rooms`] needs of it.
 pub trait KvRoomBody {
     /// The body's name for a refusal.
@@ -212,19 +287,52 @@ pub trait KvRoomBody {
     /// (`freed`): the body counts it and keeps it for its caller's record. Nothing by
     /// default, for a body that tallies no moves.
     fn gave_back(&mut self, _asked: u64, _freed: &FreedBytes) {}
+
+    /// The fill this load holds above its plan ([`FillHeld`]); `None` by default, for a load
+    /// that is not elastic.
+    fn fill_held(&self) -> Option<FillHeld> {
+        None
+    }
+
+    /// The stage card's free bytes under `keep` ([`CardKeep::free`]), read only for a fit that
+    /// asks new pages on a load whose [`KvRoomBody::fill_held`] holds bytes.
+    ///
+    /// # Errors
+    ///
+    /// The driver's refusal; by default a body with no card to read.
+    fn card_free(&self, _keep: CardKeep) -> Result<u64, GpuError> {
+        Err(GpuError::state(
+            Self::WHAT,
+            "a stage card to read the free bytes of",
+        ))
+    }
+
+    /// The fill-first take-back of `asked` bytes that the machine refused (`why`): the fit runs
+    /// as it would have without one, and the body keeps the refusal for its caller's record.
+    /// Nothing by default.
+    fn fill_refused(&mut self, _asked: u64, _why: &GpuError) {}
 }
 
-/// The rooms of `body` fitted through `pos + rows` positions. A fit that runs out of card bytes
-/// asks the body's residency machine for the shortfall plus a page ([`KvRoomBody::free_expert_bytes`])
-/// and fits once more; a room that ran out on host pages (a spill room's) returns at once, since
-/// freed card bytes cannot make host memory. A second refusal, a refusing machine or none is the
-/// named [`GpuError::NoRoom`] with what was freed. Never inside a capture.
+/// The rooms of `body` fitted through `pos + rows` positions.
+///
+/// Fill first: on a load whose fill holds card bytes above the plan ([`KvRoomBody::fill_held`]),
+/// a fit whose new pages would leave the card under its margin first takes back the shortfall
+/// plus a page, at most what the fill holds (`placement::elastic::fill_first`), through the
+/// machine ([`KvRoomBody::free_expert_bytes`], recorded by [`KvRoomBody::gave_back`]); a planned
+/// expert is never asked for here. A refused take-back is kept by the body
+/// ([`KvRoomBody::fill_refused`]) and the fit runs on. A fit that asks no new page reads nothing.
+///
+/// Then the fit: one that runs out of card bytes asks the body's residency machine for the
+/// shortfall plus a page and fits once more; a room that ran out on host pages (a spill room's)
+/// returns at once, since freed card bytes cannot make host memory. A second refusal, a refusing
+/// machine or none is the named [`GpuError::NoRoom`] with what was freed. Never inside a capture.
 ///
 /// # Errors
 ///
-/// As above.
+/// As above, and the card's free bytes unreadable for the fill-first step.
 pub fn fit_rooms<B: KvRoomBody>(body: &mut B, pos: usize, rows: usize) -> Result<(), GpuError> {
     let through = pos + rows;
+    take_fill_first(body, through)?;
     let first = match body.fit_each(pos, through) {
         Ok(()) => return Ok(()),
         Err(e) => e,
@@ -266,6 +374,36 @@ pub fn fit_rooms<B: KvRoomBody>(body: &mut B, pos: usize, rows: usize) -> Result
     })
 }
 
+/// [`fit_rooms`]'s fill-first step for a fit through `through` positions: nothing on a load with
+/// no fill held, or for a fit that asks no new page; else the card read under its keep and the
+/// take-back `fill_first` names asked of the machine. A body that opens a span in which the
+/// machine refuses give-backs (a prompt call) runs this for the span's last position before it
+/// opens, so the span's fits find the fill already taken back.
+///
+/// # Errors
+///
+/// The card's free bytes unreadable.
+pub fn take_fill_first<B: KvRoomBody>(body: &mut B, through: usize) -> Result<(), GpuError> {
+    let ask = match body.fill_held() {
+        Some(h) if h.held > 0 => {
+            let asks = body.asks(through) as u64;
+            if asks == 0 {
+                return Ok(());
+            }
+            fill_first(asks, body.card_free(h.keep)?, h.keep.margin, h.page, h.held)
+        }
+        _ => return Ok(()),
+    };
+    if ask == 0 {
+        return Ok(());
+    }
+    match body.free_expert_bytes(ask) {
+        Ok(freed) => body.gave_back(ask, &freed),
+        Err(e) => body.fill_refused(ask, &e),
+    }
+    Ok(())
+}
+
 impl<T: DeviceCopy> Views for DeviceTensor<T> {
     fn dissolve(self) {
         self.into_buf().dissolve();
@@ -282,7 +420,9 @@ impl<V: Views> Views for Option<V> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FreedBytes, GpuError, KvBacking, KvRoomBody, fit_rooms, kv_backing};
+    use super::{
+        CardKeep, FillHeld, FreedBytes, GpuError, KvBacking, KvRoomBody, fit_rooms, kv_backing,
+    };
     use bloomery_levers::KvHost;
     use runtime::stores::Access;
 
@@ -295,19 +435,23 @@ mod tests {
     /// to the host and the first row goes red.
     #[test]
     fn a_scanned_buffer_is_card_only_and_a_selected_one_follows_the_word() {
+        let keep = CardKeep {
+            margin: 7,
+            budget: Some(9),
+        };
         for word in [KvHost::Off, KvHost::Spill, KvHost::All] {
             assert_eq!(
-                kv_backing(word, Access::Scan, 7),
+                kv_backing(word, Access::Scan, keep),
                 KvBacking::Card,
                 "{word:?}"
             );
         }
-        assert_eq!(kv_backing(KvHost::Off, SELECT, 7), KvBacking::Card);
+        assert_eq!(kv_backing(KvHost::Off, SELECT, keep), KvBacking::Card);
         assert_eq!(
-            kv_backing(KvHost::Spill, SELECT, 7),
-            KvBacking::Spill { margin: 7 }
+            kv_backing(KvHost::Spill, SELECT, keep),
+            KvBacking::Spill { keep }
         );
-        assert_eq!(kv_backing(KvHost::All, SELECT, 7), KvBacking::Host);
+        assert_eq!(kv_backing(KvHost::All, SELECT, keep), KvBacking::Host);
     }
 
     /// A body of rooms that runs out until `freed` expert bytes were asked for.
@@ -317,6 +461,11 @@ mod tests {
         refuse: usize,
         spill: bool,
         machine: bool,
+        /// What an elastic load's fill holds, and the card's free bytes a read returns.
+        fill: Option<FillHeld>,
+        free: u64,
+        asks: usize,
+        reads: std::cell::Cell<usize>,
     }
 
     fn no_room(spill: bool) -> GpuError {
@@ -344,7 +493,7 @@ mod tests {
         }
 
         fn asks(&self, _through: usize) -> usize {
-            10
+            self.asks
         }
 
         fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {
@@ -358,6 +507,24 @@ mod tests {
                 layers: 3,
             })
         }
+
+        fn gave_back(&mut self, asked: u64, _freed: &FreedBytes) {
+            self.calls.push(format!("gave {asked}"));
+        }
+
+        fn fill_held(&self) -> Option<FillHeld> {
+            self.fill
+        }
+
+        fn card_free(&self, keep: CardKeep) -> Result<u64, GpuError> {
+            assert_eq!(keep.margin, 50, "the fill's own keep is read");
+            self.reads.set(self.reads.get() + 1);
+            Ok(self.free)
+        }
+
+        fn fill_refused(&mut self, asked: u64, _why: &GpuError) {
+            self.calls.push(format!("refused {asked}"));
+        }
     }
 
     fn body(refuse: usize, spill: bool, machine: bool) -> Body {
@@ -366,6 +533,67 @@ mod tests {
             refuse,
             spill,
             machine,
+            fill: None,
+            free: 0,
+            asks: 10,
+            reads: std::cell::Cell::new(0),
+        }
+    }
+
+    /// A body of an elastic load whose fill holds `held` bytes over a margin of 50, a 4-byte
+    /// page, with `free` card bytes and every fit holding.
+    fn filled(held: u64, free: u64, machine: bool) -> Body {
+        Body {
+            fill: Some(FillHeld {
+                held,
+                keep: CardKeep {
+                    margin: 50,
+                    budget: None,
+                },
+                page: 4,
+            }),
+            free,
+            ..body(0, true, machine)
+        }
+    }
+
+    /// Fill first: a fit of 10 new bytes on 55 free over a margin of 50 takes back the 5 it
+    /// falls short plus a page from the fill, recorded, before it fits; one within the slack
+    /// reads the card and takes nothing; a refused take-back is kept and the fit runs on.
+    ///
+    /// FAIL-first: a `fit_rooms` without the step ends with `["fit 5..7"]` on the first case; one
+    /// that fails the fit on a refused take-back reds the last.
+    #[test]
+    fn a_fit_past_the_margin_takes_back_the_fill_before_it_fits() {
+        let mut b = filled(100, 55, true);
+        fit_rooms(&mut b, 5, 2).expect("the fit holds");
+        assert_eq!(b.calls, ["free 9", "gave 9", "fit 5..7"]);
+        let mut b = filled(100, 60, true);
+        fit_rooms(&mut b, 0, 1).expect("the fit holds");
+        assert_eq!(
+            (b.calls.as_slice(), b.reads.get()),
+            (&["fit 0..1".to_owned()][..], 1)
+        );
+        let mut b = filled(100, 55, false);
+        fit_rooms(&mut b, 0, 1).expect("a refused take-back still fits");
+        assert_eq!(b.calls, ["free 9", "refused 9", "fit 0..1"]);
+    }
+
+    /// A load with no fill, a fill that holds nothing and a fit that asks no page (a decode
+    /// step within its backed pages) never read the card and never ask the machine.
+    ///
+    /// FAIL-first: a step that reads the card before it checks the asks reds the third case
+    /// (one read).
+    #[test]
+    fn a_fit_with_nothing_held_or_asked_reads_nothing() {
+        let mut unasked = filled(100, 0, true);
+        unasked.asks = 0;
+        for mut b in [body(0, true, true), filled(0, 0, true), unasked] {
+            fit_rooms(&mut b, 0, 1).expect("the fit holds");
+            assert_eq!(
+                (b.calls.as_slice(), b.reads.get()),
+                (&["fit 0..1".to_owned()][..], 0)
+            );
         }
     }
 
@@ -378,7 +606,7 @@ mod tests {
     fn a_refused_fit_asks_the_machine_once_and_fits_again() {
         let mut b = body(1, false, true);
         fit_rooms(&mut b, 5, 2).expect("the second fit holds");
-        assert_eq!(b.calls, ["fit 5..7", "free 11", "fit 5..7"]);
+        assert_eq!(b.calls, ["fit 5..7", "free 11", "gave 11", "fit 5..7"]);
     }
 
     /// A spill room's refusal is host memory, which freed card bytes cannot make: the machine is

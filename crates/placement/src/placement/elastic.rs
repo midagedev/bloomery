@@ -10,7 +10,9 @@
 //! the last [`FILL_KEEP_QUANTA`] quanta above the margin, so a request's page
 //! growth within them never evicts what was just filled, and a fill waits
 //! [`FILL_HOLD`] quiet boundaries (a sequence's end) after a give-back before it runs, so a card that
-//! oscillates between the two settles instead of thrashing.
+//! oscillates between the two settles instead of thrashing. A K/V fit that
+//! would leave the card under its margin takes back what the fill holds first
+//! ([`fill_first`]), never a planned expert.
 
 /// Quanta of free bytes above the margin a fill leaves untouched.
 pub const FILL_KEEP_QUANTA: u64 = 2;
@@ -140,6 +142,27 @@ pub fn fill_slots(free: u64, margin: u64, layers: u64, slot_bytes: u64, withdraw
     usize::try_from(room / q).map_or(withdrawn, |k| k.min(withdrawn))
 }
 
+/// The bytes a K/V fit takes back from the fill before it backs its pages
+/// (fill first): 0 while the `asks` bytes of new pages leave the card `margin`
+/// of its `free` bytes, else the shortfall below the margin plus a `page`,
+/// at most the `held` bytes the fill holds above the plan. The fill is bytes
+/// the plan never counted, taken from the room past the margin the K/V would
+/// otherwise grow into, so the K/V takes it back first; a planned expert is
+/// never asked for (past `held` the fit spills or refuses as its room does).
+/// A card already under its margin counts that deficit in the shortfall; a
+/// fit that asks no page takes nothing back.
+#[must_use]
+pub fn fill_first(asks: u64, free: u64, margin: u64, page: u64, held: u64) -> u64 {
+    if asks == 0 || held == 0 {
+        return 0;
+    }
+    let need = asks.saturating_add(margin);
+    if free >= need {
+        return 0;
+    }
+    (need - free).saturating_add(page).min(held)
+}
+
 /// Whether a fill may run at boundary `boundary`: no give-back yet, or the
 /// last one ([`Some`]`(at)`) at least [`FILL_HOLD`] boundaries ago.
 #[must_use]
@@ -255,6 +278,39 @@ mod tests {
         assert_eq!(capacity(4, 900, 400, 16), 6);
         assert_eq!(capacity(4, 900, 0, 16), 4);
         assert_eq!(capacity(10, 900, 400, 11), 11);
+    }
+
+    /// Fill first, on the fixture serve gate's elastic refill [the log's numbers; the take-back
+    /// derived]: the settle left 1,122,893,824 B free over a 1 GiB margin with 230,686,720 B
+    /// filled (17 slots on 4 layers), and the long prompt asked 117,440,512 B of new pages. It
+    /// takes back the 68,288,512 B it falls under the margin plus a 2 MiB page; a fit within the
+    /// 49,152,000 B of slack takes nothing; a fit past everything the fill holds takes the fill
+    /// and no more; a card under its margin counts the deficit; a fit asking no page takes
+    /// nothing whatever the card reads.
+    ///
+    /// FAIL-first: a `fill_first` that drops the margin term (`asks > free`) returns 0 on the
+    /// first assertion; one that drops the `held` cap returns 2,100,428,800 B on the fourth,
+    /// which only demoting planned experts could make.
+    #[test]
+    fn a_kv_fit_takes_back_the_fill_past_the_margin_and_never_more() {
+        const MIB: u64 = 1 << 20;
+        let (free, margin, page, held) = (1_122_893_824, 1 << 30, 2 * MIB, 230_686_720);
+        assert_eq!(
+            fill_first(117_440_512, free, margin, page, held),
+            70_385_664
+        );
+        assert_eq!(fill_first(49_152_000, free, margin, page, held), 0);
+        assert_eq!(
+            fill_first(49_152_000 + 1, free, margin, page, held),
+            1 + page
+        );
+        assert_eq!(fill_first(2 << 30, free, margin, page, held), held);
+        assert_eq!(
+            fill_first(page, margin - 10, margin, page, held),
+            page + 10 + page
+        );
+        assert_eq!(fill_first(0, margin - 10, margin, page, held), 0);
+        assert_eq!(fill_first(117_440_512, free, margin, page, 0), 0);
     }
 
     /// A fill waits `FILL_HOLD` boundaries after a give-back.

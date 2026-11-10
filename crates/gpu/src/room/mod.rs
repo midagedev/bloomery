@@ -39,9 +39,9 @@
 //! a card page and zeroed on the room's stream, so every kernel and capture
 //! over the store stays as it is; [`Room::mapped`] keeps naming the card
 //! bytes and [`Room::host_mapped`] names the host bytes. A [`Backing::Spill`]
-//! room backs a page on the host when the card's free bytes would fall below
-//! its margin by the page, or when the card cannot make the page's memory for
-//! lack of free bytes.
+//! room backs a page on the host when the card's free bytes under the load's
+//! card budget ([`kv::CardKeep`]) would fall below its margin by the page, or
+//! when the card cannot make the page's memory for lack of free bytes.
 //!
 //! Every writer calls `fit` and `own_from` first, outside capture, for all
 //! positions it can write. An unbacked page aliases the spare: a missed fit
@@ -65,6 +65,7 @@ pub(crate) mod host;
 pub(crate) mod kv;
 
 use self::host::{HostPage, RawMap};
+use self::kv::CardKeep;
 
 const WHAT: &str = "room";
 
@@ -122,11 +123,12 @@ pub(crate) enum Backing {
     /// Host memory on the NUMA node the device names, mapped into the range
     /// and reached over the device's link ([`host::HostPage`]).
     Host,
-    /// The card's memory first, keeping `margin` bytes of the card free: a
-    /// page whose card memory would leave fewer free bytes than that, or
-    /// that the driver cannot make for lack of free bytes, is backed on the
-    /// host instead. Any other driver refusal stays the named refusal it is.
-    Spill { margin: u64 },
+    /// The card's memory first, keeping `keep`'s margin of the card's free
+    /// bytes under its budget: a page whose card memory would leave fewer
+    /// free bytes than that, or that the driver cannot make for lack of free
+    /// bytes, is backed on the host instead. Any other driver refusal stays
+    /// the named refusal it is.
+    Spill { keep: CardKeep },
 }
 
 /// The memory a page backs: the device's own, or host memory the device
@@ -290,9 +292,10 @@ impl Room {
 
     /// Memory of its own for one page, where the room's backing says
     /// ([`Backing`]), the context bound to the thread. A `Spill` room backs
-    /// the page on the host when the card's free bytes are under its margin
-    /// plus the page, or when the driver cannot make the card memory for
-    /// lack of free bytes; any other driver refusal stays the refusal it is.
+    /// the page on the host when the card's free bytes under its budget are
+    /// under its margin plus the page ([`CardKeep::past_margin`]), or when
+    /// the driver cannot make the card memory for lack of free bytes; any
+    /// other driver refusal stays the refusal it is.
     fn new_page(&self) -> Result<Owned, GpuError> {
         let ctx = self.stream.context();
         ctx.bind_to_thread()?;
@@ -302,11 +305,11 @@ impl Room {
                 PhysicalAllocation::new(device, self.page).map_err(driver("cuMemCreate"))?,
             ))),
             Backing::Host => Ok(Owned::Host(Arc::new(HostPage::new(device, self.page)?))),
-            Backing::Spill { margin } => {
+            Backing::Spill { keep } => {
                 let host = || -> Result<Owned, GpuError> {
                     Ok(Owned::Host(Arc::new(HostPage::new(device, self.page)?)))
                 };
-                if !self.keeps_margin(margin)? {
+                if keep.past_margin(self.page as u64)? {
                     return host();
                 }
                 match PhysicalAllocation::new(device, self.page) {
@@ -318,24 +321,29 @@ impl Room {
         }
     }
 
-    /// Whether a card page leaves the device at least `margin` bytes free,
-    /// the context bound to the thread.
-    fn keeps_margin(&self, margin: u64) -> Result<bool, GpuError> {
-        Ok(self.free_bytes()? as u64 >= margin.saturating_add(self.page as u64))
-    }
-
     /// The device's free bytes on this room's context, which the calling
-    /// fit has bound to the thread, for a spill's margin and a fit's named
-    /// refusal; the reading's own failure is that refusal's to name.
+    /// fit has bound to the thread, for a fit's named refusal: a spill
+    /// room's under the load's card budget ([`CardKeep::free_bound`]), the
+    /// figure its margin is kept against; the reading's own failure is that
+    /// refusal's to name.
     fn free_bytes(&self) -> Result<usize, GpuError> {
         // The room's context is current on this thread: the fit's `new_page`
         // bound it before the refusal this reading names.
-        Ok(crate::current_mem_info()?.0)
+        match self.backing {
+            Backing::Spill { keep } => {
+                Ok(usize::try_from(keep.free_bound()?).unwrap_or(usize::MAX))
+            }
+            Backing::Card | Backing::Host => Ok(crate::current_mem_info()?.0),
+        }
     }
 
     /// The bytes of new pages a fit of `positions` positions still asks: the
-    /// pages its rows lie on that map no memory of their own.
+    /// pages its rows lie on that map no memory of their own; none, read
+    /// without a scan, within the positions already fitted (a decode step's).
     pub(crate) fn asks(&self, positions: usize) -> usize {
+        if positions <= self.fitted {
+            return 0;
+        }
         self.wanted(positions)
             .iter()
             .enumerate()
@@ -1735,7 +1743,9 @@ mod tests {
             rows * words,
             &runs,
             "the tests' spill planes",
-            Backing::Spill { margin: 0 },
+            Backing::Spill {
+                keep: CardKeep::default(),
+            },
             |b| b,
         )
         .expect("a spill room");
@@ -1813,7 +1823,10 @@ mod tests {
             &runs,
             "the tests' spill planes",
             Backing::Spill {
-                margin: margin as u64,
+                keep: CardKeep {
+                    margin: margin as u64,
+                    budget: None,
+                },
             },
             |b| b,
         )

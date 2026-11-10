@@ -1767,15 +1767,16 @@ struct ElasticTerms {
 }
 
 /// The card's free bytes now, the engine stream drained first — under a budget, the budget's
-/// remainder when that is less.
+/// remainder when that is less (`card_budget::free_under`, the figure the K/V rooms keep the
+/// margin against too).
 fn card_free(gpu: &Gpu, terms: ElasticTerms) -> Result<u64, GateError> {
     gpu.stream().synchronize()?;
     let (free, total) = gpu.mem_info()?;
-    let (free, total) = (free as u64, total as u64);
-    Ok(match terms.budget {
-        Some(budget) => free.min(budget.saturating_sub(total.saturating_sub(free))),
-        None => free,
-    })
+    Ok(model::placement::card_budget::free_under(
+        free as u64,
+        total as u64,
+        terms.budget,
+    ))
 }
 
 /// One move of a settle as its record. A settle at a quiet boundary says nothing when the card

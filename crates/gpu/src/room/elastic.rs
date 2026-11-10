@@ -5,8 +5,9 @@
 //! machine for the shortfall on a refusal and runs it once more; and
 //! [`settle_to_margin`] is the move a load makes after its warm-up, once
 //! every buffer serving uses exists: give back what the card holds past its
-//! margin, or fill what it has free. [`super::kv::fit_rooms`] is the same
-//! loop over the K/V rooms and stays its own entry for the bodies on it.
+//! margin, or fill what it has free. [`super::kv::fit_rooms`] is the K/V
+//! rooms' own entry: it takes back what the fill holds before a fit would
+//! leave the card under its margin, then runs the same retry loop.
 //!
 //! Every give-back and every fill is counted ([`ElasticStats`]) and reported
 //! to the caller ([`Elastic`]) so a binary prints it as a record line; a gate's

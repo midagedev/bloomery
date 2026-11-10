@@ -25,26 +25,26 @@ use crate::GpuError;
 use crate::linear::LinearShape;
 use crate::linear::mixer_kda::KdaState;
 use crate::recur::RecStore;
-use crate::{KvBacking, kv_backing};
+use crate::{CardKeep, KvBacking, kv_backing};
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::stores::Access;
 
 /// What the refusals of this file name.
 const WHAT: &str = "kimi_k3 state";
 
-/// The `BLOOMERY_KV_HOST` lever's typed word and the plan's card margin
-/// (`Card::margin_bytes`): what maps to a room's backing for a buffer ([`kv_backing`], the class
-/// rule for the buffer's access). A load with no plan backs every page on the card.
+/// The `BLOOMERY_KV_HOST` lever's typed word and what the plan's card keeps free ([`CardKeep`]:
+/// its margin under its budget): what maps to a room's backing for a buffer ([`kv_backing`], the
+/// class rule for the buffer's access). A load with no plan backs every page on the card.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct KvBackings {
     pub(super) word: bloomery_levers::KvHost,
-    pub(super) margin: u64,
+    pub(super) keep: CardKeep,
 }
 
 impl KvBackings {
     /// The backing a buffer read as `access` takes under the lever.
     pub(super) fn of(self, access: Access) -> KvBacking {
-        kv_backing(self.word, access, self.margin)
+        kv_backing(self.word, access, self.keep)
     }
 }
 

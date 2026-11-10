@@ -178,7 +178,10 @@ use crate::site::ByName;
 use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, SharedPages, StagedRows, launch_u32, ple, qsa};
-use crate::{Elastic, ElasticBody, ElasticStats, FilledBytes, FreedBytes, KvRoomBody, fit_rooms};
+use crate::{
+    CardKeep, Elastic, ElasticBody, ElasticStats, FillHeld, FilledBytes, FreedBytes, KvRoomBody,
+    fit_rooms, take_fill_first,
+};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
 use engram::Hash;
@@ -1352,6 +1355,9 @@ pub struct Body38 {
     /// [`Slots::new_seq`]'s take it, the planes following the word, the
     /// pooled keys (scanned) and the raw key ring staying on the card.
     kv_levers: KvLevers,
+    /// The stage card's allocation granule (`Card::granule_bytes`): the page a K/V fit's
+    /// fill-first take-back adds past its shortfall ([`KvRoomBody::fill_held`]).
+    card_page: u64,
     /// A pass of several slots' input records, on a load planned for more
     /// than one sequence.
     slot_in: Option<SlotIn>,
@@ -1946,13 +1952,14 @@ impl Body38 {
         let d = dims(router_dims, ctx);
         // The plan's cache format is the one the stores take, and its
         // `kv_host` word where the planes' pages back, a spill keeping the
-        // stage card's margin free.
+        // stage card's margin free under its budget.
         let kv = KvQ8::of(inputs.kv.is_q8());
-        let margin = plan.machine.cards.first().map_or(0, |c| c.margin_bytes);
+        let stage = plan.machine.cards.first();
         let kv_levers = KvLevers {
             word: plan.kv_host,
-            margin,
+            keep: stage.map_or_else(CardKeep::default, |c| CardKeep::of(plan, c)),
         };
+        let card_page = stage.map_or(0, |c| c.granule_bytes.get());
         let handle = gpu.stream_handle();
         let stores = kinds
             .iter()
@@ -2255,6 +2262,7 @@ impl Body38 {
                 half: plan.cards[0].ring_half,
             }),
             kv_levers,
+            card_page,
             slot_in: (planned > 1).then(|| SlotIn::new(stream)).transpose()?,
             last_walk: TargetRows::Step,
             wrote: Wrote38::default(),
@@ -4021,21 +4029,26 @@ impl Body38 {
 
     /// The stores' rows of a call of `rows` from `pos` backed, and the pages
     /// it writes from `pos` on this sequence's alone ([`Store38::fit`],
-    /// [`Store38::own_from`]). A card with no room for the pages the fit asks
-    /// ([`GpuError::NoRoom`]) is given expert bytes once: the residency
-    /// machine releases the same top slots of every layer's stacks, enough
-    /// bytes to cover what the stores still ask beyond the card's free bytes
-    /// and one page ([`ResidencyGlue::free_bytes`]), and the fit runs once
-    /// more. A second refusal, a machine that refuses to free and a load with
-    /// no machine are the refusal, naming what the machine freed or why it
-    /// freed nothing. The ordering under `BLOOMERY_KV_HOST=spill` is the
-    /// rule: the planes' pages back on the card first and spill to the host
-    /// on the card's own refusal, before any expert stack is freed for them
-    /// — a host page is cheaper than a demotion, whose experts the decode
-    /// steps keep hitting — so the machine's demote-for-bytes never runs for
-    /// the planes under `spill` (a fit of them that still runs out names the
-    /// host bytes, which no freed card bytes can make; the pooled keys, on
-    /// the card in every setting, keep the retry `off` runs).
+    /// [`Store38::own_from`]), through the common loop ([`fit_rooms`]).
+    ///
+    /// The order is the rule. On an elastic load, a fit whose new pages
+    /// would leave the stage card under its margin (its free bytes under
+    /// the card budget) first takes back what the fill holds above the plan:
+    /// the shortfall plus a page, at most the fill (`fill_first`), the give-
+    /// back recorded at site `fit` and stamping the fill's hold. Then the
+    /// planes back on the card while it keeps its margin and, under
+    /// `BLOOMERY_KV_HOST=spill`, spill to the host past it; a planned expert
+    /// is never demoted for them, the order every family keeps by default
+    /// (host past the margin). A card that still runs out of its own bytes
+    /// (a card room's, under `off`, and the pooled keys, on the card in
+    /// every setting) is given expert bytes once: the residency machine
+    /// releases the same top slots of every layer's stacks, enough to cover
+    /// what the stores still ask beyond the card's free bytes and one page
+    /// ([`ResidencyGlue::free_bytes`]), and the fit runs once more. A second
+    /// refusal, a machine that refuses to free and a load with no machine
+    /// are the refusal, naming what the machine freed or why it freed
+    /// nothing; a spill fit that runs out names the host bytes, which no
+    /// freed card bytes can make.
     fn fit_stores(&mut self, pos: usize, rows: usize) -> Result<(), GpuError> {
         fit_rooms(self, pos, rows)
     }
@@ -4844,12 +4857,15 @@ impl GpuModel<Body38> {
     /// is the ubatch walk's, the pick's no-probe floor ([`STREAM_FLOOR`]),
     /// the card's tail rate a card pick (the stream's priced card column) and
     /// the map's layers. A pass runs at most [`PASS_ROWS`] rows, under
-    /// the floor, so no pass-fed call opens one.
+    /// the floor, so no pass-fed call opens one. The fill's take-back for
+    /// the stores through the call's end runs first ([`take_fill_first`]):
+    /// the machine refuses a give-back while the call is open.
     fn stream_begin(&mut self, path: Prompt38, n: usize, returns: bool) -> Result<(), GpuError> {
         const _: () = assert!(PASS_ROWS < STREAM_FLOOR as usize);
         const WHAT_B: &str = "qwen4exp prompt streaming";
         let end = self.pos() as usize + n;
         let (gpu, _, body) = self.body_parts(WHAT_B)?;
+        take_fill_first(body, end)?;
         // The card route's tail past a layer's last copy a card pick: a card
         // column's cost as the stream prices it on this device, none before
         // the stream started (no walk balances then).
@@ -5784,6 +5800,34 @@ impl KvRoomBody for Body38 {
                 site: "fit",
                 asked,
                 freed: *freed,
+            });
+        }
+    }
+
+    /// On an elastic load, the bytes its fills backed past what every give-back returned: what
+    /// the fill holds above the plan, the stage card's keep and its granule.
+    fn fill_held(&self) -> Option<FillHeld> {
+        self.elastic_moves.as_ref()?;
+        Some(FillHeld {
+            held: self
+                .elastic
+                .fill_bytes
+                .saturating_sub(self.elastic.give_back_bytes),
+            keep: self.kv_levers.keep,
+            page: self.card_page,
+        })
+    }
+
+    fn card_free(&self, keep: CardKeep) -> Result<u64, GpuError> {
+        keep.free(self.engine.context())
+    }
+
+    /// A refused fill-first take-back is kept for the seat's record as a hold at site `fit`.
+    fn fill_refused(&mut self, asked: u64, why: &GpuError) {
+        if let Some(moves) = self.elastic_moves.as_mut() {
+            moves.push(Elastic::Held {
+                site: "fit",
+                why: format!("the fill's take-back of {asked} B was refused: {why}"),
             });
         }
     }
