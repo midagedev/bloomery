@@ -366,6 +366,10 @@ pub struct BatchBufs {
     /// The head's logit softcap, as the family's data ([`BatchBufs::set_softcap`]); `None` puts no
     /// launch between the projection and the argmax.
     softcap: Option<f32>,
+    /// The card bytes the stream's ring buffers may take, the plan's ring term less its pass
+    /// ([`BatchBufs::set_ring_cap`]); `None` leaves the ring what the card's margin has past the
+    /// keep-free.
+    ring_cap: Option<u64>,
     /// The media rows of the next call ([`BatchBufs::set_media`]); the call takes them.
     media: Option<CallMedia>,
 }
@@ -399,6 +403,7 @@ impl BatchBufs {
             facts: None,
             timing: None,
             softcap: None,
+            ring_cap: None,
             media: None,
         };
         if buffers.bytes() != expected {
@@ -442,7 +447,7 @@ impl BatchBufs {
                     top_k: R::N_USED,
                     units: self.group,
                 };
-                XCfg::new(shape, R::N_EXPERT, split.deadline, None)
+                XCfg::new(shape, R::N_EXPERT, split.deadline, self.ring_cap)
             })?;
             if let Some(half) = started {
                 ffn.arm_ring(gpu, half)?;
@@ -451,6 +456,13 @@ impl BatchBufs {
         self.stream.set_mode(mode);
         self.facts = Some(facts);
         Ok(())
+    }
+
+    /// The card bytes the expert stream's ring buffers may take (`XCfg::room_cap`): the plan's ring
+    /// term less its pass, for a family whose plan counts a ring. `None` leaves the ring what the
+    /// card's margin has past the keep-free.
+    pub fn set_ring_cap(&mut self, cap: Option<u64>) {
+        self.ring_cap = cap;
     }
 
     /// The head's logit softcap: `cap · tanh(logit / cap)` over the last row's logits between the

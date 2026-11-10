@@ -79,7 +79,7 @@ use model::arch::musespark::names::{
     FFN_LATENT_DOWN, FFN_LATENT_UP, FFN_NORM, FFN_POST_EXP_NORM, FFN_PRE_EXP_NORM, FFN_RESID_ALPHA,
     FFN_RESID_BETA, FFN_UP_EXPS, POST_FFW_NORM,
 };
-use model::arch::musespark::place::stream_ring_bytes;
+use model::arch::musespark::place::stream_room_cap;
 use model::arch::names::{blk, token_embd};
 use model::placement::Plan;
 use std::ops::Range;
@@ -648,7 +648,8 @@ impl GpuModel<Body> {
             .ok_or_else(|| GpuError::shape(WHAT, format!("the plan's ctx_max {}", plan.ctx_max)))?;
         let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
         let n_used = hp.n_used;
-        let ring_room = stream_ring_bytes(&hp, plan.model).map_err(|e| GpuError::plan(WHAT, e))?;
+        let ring_room =
+            stream_room_cap(plan, &hp, plan.model).map_err(|e| GpuError::plan(WHAT, e))?;
         let spec = ResidencySpec {
             lever: residency,
             pool: ChurnHosting::Hosted,

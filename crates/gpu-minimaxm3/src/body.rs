@@ -601,7 +601,8 @@ impl Body {
         )?;
         let sites: Vec<&Site> = stores.iter().flat_map(Store::sites).collect();
         let batch = crate::prefill::Batch::new(gpu, (&dims, &msa), crate::prefill::T_MAX, &sites)?;
-        let units = BatchBufs::new(gpu, dims.embd, crate::prefill::T_MAX, 1)?;
+        let mut units = BatchBufs::new(gpu, dims.embd, crate::prefill::T_MAX, 1)?;
+        units.set_ring_cap(model::arch::minimaxm3::place::stream_room_cap(plan, inputs));
         let mut body = Body {
             shell: TierShell::new(hybrid, glue, dims.embd, WHAT),
             cfg,

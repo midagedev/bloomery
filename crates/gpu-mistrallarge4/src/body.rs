@@ -753,6 +753,9 @@ impl Body {
         let pass_rows = rows::RowSet::new(stream, &sh, &stores)?;
         let mut units = BatchBufs::new(gpu, sh.hidden, T_MAX, 1)?;
         units.set_softcap(sh.softcap)?;
+        units.set_ring_cap(model::arch::mistrallarge4::stream::stream_room_cap(
+            plan, inputs,
+        ));
         let mut body = Body {
             layers,
             cfg,

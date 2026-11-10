@@ -503,9 +503,8 @@ impl Tiered for Muse {
     /// buffers out of the expert budget ([`PlanInputs::streaming`] by
     /// [`place::stream_bytes`], a slot [`place::stream_slot_bytes`]).
     fn with_ring(inputs: PlanInputs<Self::H>) -> Result<PlanInputs<Self::H>, GateError> {
-        let bytes = place::stream_bytes(&inputs.hp, &inputs.model)?;
-        let slot = place::stream_slot_bytes(&inputs.hp, &inputs.model)?;
-        Ok(inputs.streaming(bytes, slot))
+        let ring = place::stream_ring(&inputs.hp, &inputs.model)?;
+        Ok(inputs.streaming(ring))
     }
 
     fn register(args: &[String]) {

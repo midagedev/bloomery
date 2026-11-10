@@ -21,14 +21,14 @@ use super::{roles, spec};
 use crate::arch::chat_of;
 use crate::arch::names::routed_stacks;
 use crate::arch::place_hybrid::{
-    self, ring_forms_planned, ring_pass_bytes_in, route_bytes, stream_ring_bytes,
-    stream_slot_bytes, tier_places_bytes, wide_bytes,
+    self, RingPass, StreamRing, ring_forms_planned, route_bytes, stream_slot_bytes,
+    tier_places_bytes, wide_bytes,
 };
-use crate::placement::PlacementError;
 use crate::placement::accepts::{self, Program};
 use crate::placement::kernels::{self, DownAct, DownForms};
 use crate::placement::parts::{Part, Parts};
 use crate::placement::workstation::{self, TierBatchBytes};
+use crate::placement::{PlacementError, Plan};
 
 pub use place_hybrid::{KvLayout, PlaceError};
 
@@ -195,26 +195,37 @@ pub fn tier_batch(inputs: &PlanInputs, cols: u64) -> Result<TierBatchBytes, Plac
 pub const STREAM_HALF_SLOTS: u64 = 32;
 
 /// The card bytes the prompt calls' expert stream takes on an M3 load (`BLOOMERY_XSTREAM=split`):
-/// the common rule ([`stream_ring_bytes`]) over the routed layers' three stacks at
-/// [`STREAM_HALF_SLOTS`] a half, beside the ring pass's GEMM buffers at [`PROMPT_ROWS`] rows in the
-/// forms the routed stacks read ([`ring_pass_bytes_in`], [`ring_forms_planned`]). Refused by name as the rule refuses.
+/// the ring at its floor, [`STREAM_HALF_SLOTS`] a half ([`StreamRing::bytes`] of [`stream_ring`]).
+/// Refused by name as the rule refuses.
 pub fn stream_bytes(inputs: &PlanInputs) -> Result<u64, PlacementError> {
+    let ring = stream_ring(inputs)?;
+    Ok(ring.bytes(ring.floor))
+}
+
+/// The facts the one ring rule takes ([`StreamRing`]): the floor [`STREAM_HALF_SLOTS`], a slot the
+/// widest routed layer's expert ([`stream_slot_bytes`]) and the ring pass's GEMM buffers at
+/// [`PROMPT_ROWS`] rows in the forms the routed stacks read ([`ring_forms_planned`]). Refused by
+/// name as the rule refuses.
+pub fn stream_ring(inputs: &PlanInputs) -> Result<StreamRing, PlacementError> {
     let hp = &inputs.hp;
-    let half = STREAM_HALF_SLOTS;
-    let pass = ring_pass_bytes_in(
-        PROMPT_ROWS,
-        hp.experts.n_used,
-        hp.n_embd,
-        hp.experts.ff,
-        half as usize,
-        ring_forms_planned(&inputs.model, routed_stacks),
-    ) as u64;
-    stream_ring_bytes(
-        &inputs.model,
-        routed_stacks,
-        (hp.experts.n_expert as u64, half),
-        pass,
-    )
+    Ok(StreamRing {
+        floor: STREAM_HALF_SLOTS,
+        slot: stream_slot_bytes(&inputs.model, routed_stacks, hp.experts.n_expert as u64)?,
+        pass: RingPass {
+            rows: PROMPT_ROWS,
+            n_used: hp.experts.n_used,
+            n: hp.n_embd,
+            ff: hp.experts.ff,
+            forms: ring_forms_planned(&inputs.model, routed_stacks),
+        },
+    })
+}
+
+/// The card bytes the stream's ring buffers may take on `plan`'s stage card
+/// ([`place_hybrid::planned_room_cap`]), the cap the body gives the ring.
+#[must_use]
+pub fn stream_room_cap(plan: &Plan<'_>, inputs: &PlanInputs) -> Option<u64> {
+    place_hybrid::planned_room_cap(plan, inputs)
 }
 
 impl PlanInputs {
@@ -224,9 +235,8 @@ impl PlanInputs {
     /// is the widest routed layer's expert ([`stream_slot_bytes`]). Refused by name as
     /// [`stream_bytes`] refuses.
     pub fn with_stream(self) -> Result<PlanInputs, PlacementError> {
-        let ring = stream_bytes(&self)?;
-        let slot = stream_slot_bytes(&self.model, routed_stacks, self.hp.experts.n_expert as u64)?;
-        Ok(self.streaming(ring, slot))
+        let ring = stream_ring(&self)?;
+        Ok(self.streaming(ring))
     }
 
     /// [`PlanInputs::describe`], then the file refused with every feature the engine does not run
@@ -269,9 +279,9 @@ mod tests {
     use super::super::hparams::{Attn, FfnKind, Kind};
     use super::{
         INDEX_SCORES, PROMPT_ROWS, PlaceError, PlanInputs, TIER_CHUNK, index_scores_block_bytes,
-        index_scores_bytes, scores_parts, stream_bytes, tier_batch,
+        index_scores_bytes, scores_parts, stream_bytes, stream_ring, tier_batch,
     };
-    use crate::arch::place_hybrid::ring_pass_bytes;
+    use crate::arch::place_hybrid::{assert_ring_cap, assert_ring_grows, ring_pass_bytes};
     use crate::arch::synthetic::{V, header_shaped, host_run_experts};
     use crate::placement::{KvBytes, PlacementError, PlanLevers, workstation};
 
@@ -409,8 +419,10 @@ mod tests {
         let plain = runnable("mm3-place-plain");
         let ring = stream_bytes(&plain).expect("the routed stacks");
         assert_eq!(ring, 348_160 + 162_120);
-        let probe = runnable("mm3-place-probe").streaming(ring, 0);
-        let open = runnable("mm3-place-open").streaming(ring, 0);
+        let probe =
+            runnable("mm3-place-probe").streaming(stream_ring(&plain).expect("the routed stacks"));
+        let open =
+            runnable("mm3-place-open").streaming(stream_ring(&plain).expect("the routed stacks"));
         let room = |inputs: &PlanInputs| {
             inputs
                 .prompt_batch_bytes(&machine)
@@ -429,6 +441,26 @@ mod tests {
         assert_eq!(probe_plan.ctx_max, open_plan.ctx_max);
         assert_eq!(probe_plan.cards[0].experts, open_plan.cards[0].experts);
         assert_eq!(probe_plan.host.experts, open_plan.host.experts);
+    }
+
+    /// The stream's ring is the stage card's ring term under the one rule: a floor of
+    /// [`STREAM_HALF_SLOTS`] slots counted before the experts (the experts, expert bytes and prompt
+    /// term are those of the plan that holds the floor's 510,280 B in its prompt reserve), grown
+    /// last from the headroom. Mutants: the ring counted as prompt (ring term 0), the floor left
+    /// out of the reserve before the experts (the experts differ), the cap held at the floor (the
+    /// grown pin below reddens).
+    #[test]
+    fn the_stream_ring_is_the_cards_ring_term() {
+        let machine = workstation::plan_gate(LAYERS);
+        let plain = runnable("mm3-place-ringterm");
+        let ring = stream_ring(&plain).expect("the routed stacks");
+        assert_eq!(ring.bytes(ring.floor), 348_160 + 162_120);
+        let (stage, _) = assert_ring_cap(&plain, ring, &machine, 64);
+        assert!(stage.ring_half >= 32);
+        // Where the experts leave headroom (a floor and slot a 16th of the family's), the half grows past
+        // the floor, last. Mutant: the cap held at the floor.
+        let grown = assert_ring_grows(&plain, ring, 16, &machine, (0, 40, 1_000), 64);
+        eprintln!("minimax grown half {grown}");
     }
 
     /// The card's kv class is the layers' stores [derived from the header's widths, apart from the

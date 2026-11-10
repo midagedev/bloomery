@@ -1,6 +1,6 @@
 //! The card bytes a Mistral Large 4 load keeps for its prompt calls' expert stream
-//! (`BLOOMERY_XSTREAM=split`): the common rule ([`place_hybrid::stream_ring_bytes`]) over the
-//! file's routed stacks at [`STREAM_HALF_SLOTS`] slots a half, beside the ring pass's route GEMM
+//! (`BLOOMERY_XSTREAM=split`): the common rule ([`place_hybrid::plan_ring_last`]) over the
+//! file's routed stacks from [`STREAM_HALF_SLOTS`] slots a half, beside the ring pass's route GEMM
 //! buffers at [`PROMPT_ROWS`] rows in the forms the stacks read. The body sizes its ring from the
 //! card bytes the plan leaves free, so a plan that streams reserves them
 //! ([`PlanInputs::with_stream`]) and a plan that does not leaves the ring what the card's margin
@@ -9,9 +9,9 @@
 use super::place::{PROMPT_ROWS, PlanInputs};
 use crate::arch::names::routed_stacks;
 use crate::arch::place_hybrid::{
-    ring_forms_planned, ring_pass_bytes_in, stream_ring_bytes, stream_slot_bytes,
+    self, RingPass, StreamRing, ring_forms_planned, stream_slot_bytes,
 };
-use crate::placement::PlacementError;
+use crate::placement::{PlacementError, Plan};
 
 /// The slots of each half of the expert stream's ring a streaming plan keeps room for
 /// [derived: a host expert at the default group's columns an expert takes the host one to two
@@ -27,22 +27,34 @@ pub const STREAM_HALF_SLOTS: u64 = 96;
 /// ([`ring_pass_bytes_in`], in the forms [`ring_forms_planned`] reads off the routed stacks).
 /// Refused by name as the rule refuses.
 pub fn stream_bytes(inputs: &PlanInputs) -> Result<u64, PlacementError> {
+    let ring = stream_ring(inputs)?;
+    Ok(ring.bytes(ring.floor))
+}
+
+/// The facts the one ring rule takes ([`StreamRing`]): the floor [`STREAM_HALF_SLOTS`], a slot the
+/// widest layer's three stacks per expert ([`stream_slot_bytes`]) and the ring pass's route GEMM
+/// buffers at [`PROMPT_ROWS`] rows in the forms [`ring_forms_planned`] reads off the routed stacks.
+/// Refused by name as the rule refuses.
+pub fn stream_ring(inputs: &PlanInputs) -> Result<StreamRing, PlacementError> {
     let hp = &inputs.hp;
-    let half = STREAM_HALF_SLOTS;
-    let pass = ring_pass_bytes_in(
-        PROMPT_ROWS,
-        hp.n_used,
-        hp.n_embd,
-        hp.expert_ff,
-        half as usize,
-        ring_forms_planned(&inputs.model, routed_stacks),
-    ) as u64;
-    stream_ring_bytes(
-        &inputs.model,
-        routed_stacks,
-        (hp.n_expert as u64, half),
-        pass,
-    )
+    Ok(StreamRing {
+        floor: STREAM_HALF_SLOTS,
+        slot: stream_slot_bytes(&inputs.model, routed_stacks, hp.n_expert as u64)?,
+        pass: RingPass {
+            rows: PROMPT_ROWS,
+            n_used: hp.n_used,
+            n: hp.n_embd,
+            ff: hp.expert_ff,
+            forms: ring_forms_planned(&inputs.model, routed_stacks),
+        },
+    })
+}
+
+/// The card bytes the stream's ring buffers may take on `plan`'s stage card
+/// ([`place_hybrid::planned_room_cap`]), the cap the body gives the ring.
+#[must_use]
+pub fn stream_room_cap(plan: &Plan<'_>, inputs: &PlanInputs) -> Option<u64> {
+    place_hybrid::planned_room_cap(plan, inputs)
 }
 
 impl PlanInputs {
@@ -51,8 +63,7 @@ impl PlanInputs {
     /// its room on a card the plan otherwise fills with experts, and a slot is the widest routed
     /// layer's expert ([`stream_slot_bytes`]). Refused by name as [`stream_bytes`] refuses.
     pub fn with_stream(self) -> Result<PlanInputs, PlacementError> {
-        let ring = stream_bytes(&self)?;
-        let slot = stream_slot_bytes(&self.model, routed_stacks, self.hp.n_expert as u64)?;
-        Ok(self.streaming(ring, slot))
+        let ring = stream_ring(&self)?;
+        Ok(self.streaming(ring))
     }
 }

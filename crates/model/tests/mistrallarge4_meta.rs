@@ -1285,7 +1285,7 @@ fn mistrallarge4_plan_mix256() {
 #[test]
 fn mistrallarge4_stream_plan_ud_iq1_s() {
     use model::arch::mistrallarge4::place::{PROMPT_ROWS, PlanInputs};
-    use model::arch::mistrallarge4::stream::{STREAM_HALF_SLOTS, stream_bytes};
+    use model::arch::mistrallarge4::stream::{STREAM_HALF_SLOTS, stream_bytes, stream_ring};
     use model::arch::place_hybrid::{RingForms, ring_pass_bytes_in};
     use model::placement::PlanLevers;
     use model::placement::workstation::{self, HostRead};
@@ -1364,6 +1364,81 @@ fn mistrallarge4_stream_plan_ud_iq1_s() {
     let with = streamed
         .plan(&machine, PLAN_CTX, &levers)
         .unwrap_or_else(|e| panic!("ud-iq1_s: plan a with the ring: {e}"));
+    // The ring is the stage card's ring term of 96 slots a half, a floor counted before the
+    // experts: the experts, totals and headroom are those of a plan that holds the same bytes in
+    // its prompt reserve, and the prompt term is the plain plan's.
+    let in_reserve = inputs
+        .clone()
+        .with_prompt_reserve(inputs.prompt_reserve + ring);
+    let held = in_reserve
+        .plan(&machine, PLAN_CTX, &levers)
+        .unwrap_or_else(|e| panic!("ud-iq1_s: plan a, the ring in the reserve: {e}"));
+    let (t, h) = (&with.cards[0], &held.cards[0]);
+    let facts = stream_ring(&inputs).unwrap_or_else(|e| panic!("ud-iq1_s: stream_ring: {e}"));
+    // The ring is the last term: a half of at least the floor whose bytes the headroom the floor's
+    // plan leaves (less the margin) holds, the most host experts a layer leaves its cap.
+    let room = h.headroom_bytes + i128::from(ring) - i128::from(machine.cards[0].margin_bytes);
+    let cap = (0..with.model.layers)
+        .filter(|&l| with.model.layer_experts(l) > 0)
+        .map(|l| with.host_experts(l).expect("a routed layer"))
+        .max()
+        .unwrap_or(0);
+    let want = (HALF..=cap.max(HALF))
+        .take_while(|&half| half == HALF || i128::from(facts.bytes(half)) <= room)
+        .last()
+        .unwrap_or(HALF);
+    println!(
+        "ud-iq1_s plan a @ ctx {PLAN_CTX}: planned half {} (floor {HALF}, cap {cap})",
+        t.ring_half
+    );
+    if (t.ring_bytes, t.ring_half) != (facts.bytes(want), want)
+        || facts.bytes(HALF) != ring
+        || t.prompt_bytes != plain.cards[0].prompt_bytes
+        || with.n_l != held.n_l
+        || t.expert_bytes != h.expert_bytes
+    {
+        bad.push(format!(
+            "plan a: ring term {} B over {} slots (wanted {} B over {want}), prompt {} B (plain {} \
+             B), experts {} B ({} B with the floor in the reserve)",
+            t.ring_bytes,
+            t.ring_half,
+            facts.bytes(want),
+            t.prompt_bytes,
+            plain.cards[0].prompt_bytes,
+            t.expert_bytes,
+            h.expert_bytes
+        ));
+    }
+    // Where the experts leave headroom (a floor and slot a 32nd of the family's), the half grows
+    // past the floor on some card of the plan's usable bytes and a few MB more; every grown ring
+    // fits what the floor left. Mutant: the cap held at the floor.
+    let small = model::arch::place_hybrid::StreamRing {
+        floor: HALF / 32,
+        slot: facts.slot / 32,
+        ..facts
+    };
+    let small_in = inputs.clone().streaming(small);
+    let mut grown = 0;
+    for k in 0..48u64 {
+        let mut m = workstation::plan_a(72);
+        m.cards[0].usable_bytes += k * 1_000_000;
+        let Ok(p) = small_in.plan(&m, PLAN_CTX, &levers) else {
+            continue;
+        };
+        let st = &p.cards[0];
+        assert_eq!(st.ring_bytes, small.bytes(st.ring_half));
+        grown = grown.max(st.ring_half);
+    }
+    println!(
+        "ud-iq1_s plan a, a ring of a 32nd of the floor and slot: largest planned half {grown} (floor {})",
+        small.floor
+    );
+    if grown <= small.floor {
+        bad.push(format!(
+            "no card grew the half past the floor of {}",
+            small.floor
+        ));
+    }
     let (a, b) = (plain.cards[0].expert_bytes, with.cards[0].expert_bytes);
     let gave = a.saturating_sub(b);
     println!(

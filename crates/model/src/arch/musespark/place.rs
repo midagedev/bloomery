@@ -40,11 +40,11 @@ use super::names::{
 };
 use super::spec;
 use crate::arch::names::{blk, routed_stacks};
-use crate::arch::place_hybrid::{self, RingForms, ring_pass_bytes_in};
+use crate::arch::place_hybrid::{self, RingForms, RingPass, StreamRing};
 use crate::moe::UNION_TAIL_MAX_COLS;
 use crate::placement::kernels::{self, SiteAct, q8_act_bytes};
 use crate::placement::workstation::{self, TierBatchBytes};
-use crate::placement::{Machine, ModelTensors, PlacementError};
+use crate::placement::{Machine, ModelTensors, PlacementError, Plan};
 
 pub use place_hybrid::{KvLayout, PlaceError};
 pub use runtime::stores::Rows;
@@ -353,12 +353,19 @@ pub fn stream_slot_bytes(hp: &Hparams, model: &ModelTensors) -> Result<u64, Plac
 }
 
 /// The card bytes a streaming plan keeps out of the expert budget (`BLOOMERY_XSTREAM=split`): the
-/// ring ([`stream_ring_bytes`]) beside the ring pass's route GEMM buffers at [`pass_rows_max`] rows
-/// over a half of [`STREAM_HALF_SLOTS`] ([`ring_pass_bytes_in`], in the forms the file's routed
-/// stacks read, [`RingForms::of`]). Refused by name: as [`stream_ring_bytes`] refuses, a model with
+/// ring at its floor ([`stream_ring`]): [`STREAM_HALF_SLOTS`] slots a half beside the ring pass's
+/// route GEMM buffers at [`pass_rows_max`] rows (in the forms the file's routed stacks read,
+/// [`RingForms::of`]). Refused by name: as [`stream_ring_bytes`] refuses, a model with
 /// no expert width, and routed stacks of a type no route GEMM reads.
 pub fn stream_bytes(hp: &Hparams, model: &ModelTensors) -> Result<u64, PlacementError> {
-    let ring = stream_ring_bytes(hp, model)?;
+    let ring = stream_ring(hp, model)?;
+    Ok(ring.bytes(ring.floor))
+}
+
+/// The facts the one ring rule takes ([`StreamRing`]): the floor [`STREAM_HALF_SLOTS`], a slot of
+/// [`stream_slot_bytes`] and the ring pass's route GEMM buffers at [`pass_rows_max`] rows in the
+/// forms the file's routed stacks read. Refused as [`stream_bytes`] refuses.
+pub fn stream_ring(hp: &Hparams, model: &ModelTensors) -> Result<StreamRing, PlacementError> {
     let ff = hp
         .expert_ff
         .first()
@@ -384,15 +391,36 @@ pub fn stream_bytes(hp: &Hparams, model: &ModelTensors) -> Result<u64, Placement
         name: blk(0, FFN_GATE_EXPS),
         detail: format!("is {gate:?} beside a {down:?} down: no route GEMM reads the pair"),
     })?;
-    let pass = ring_pass_bytes_in(
-        pass_rows_max(hp.n_used),
-        hp.n_used,
-        hp.latent,
-        ff,
-        STREAM_HALF_SLOTS as usize,
-        forms,
-    );
-    Ok(ring + pass as u64)
+    Ok(StreamRing {
+        floor: STREAM_HALF_SLOTS,
+        slot: stream_slot_bytes(hp, model)?,
+        pass: RingPass {
+            rows: pass_rows_max(hp.n_used),
+            n_used: hp.n_used,
+            n: hp.latent,
+            ff,
+            forms,
+        },
+    })
+}
+
+/// The card bytes the stream's ring buffers may take on `plan`'s stage card: its ring term less
+/// the pass over the planned half, the cap the body gives the ring; the ring's two halves at the
+/// floor ([`stream_ring_bytes`]) for a plan that counts no ring term. Refused as
+/// [`stream_bytes`] refuses.
+pub fn stream_room_cap(
+    plan: &Plan<'_>,
+    hp: &Hparams,
+    model: &ModelTensors,
+) -> Result<u64, PlacementError> {
+    let Some(stage) = plan.cards.first().filter(|c| c.ring_half > 0) else {
+        return stream_ring_bytes(hp, model);
+    };
+    let ring = stream_ring(hp, model)?;
+    Ok(place_hybrid::ring_room_cap(
+        stage.ring_bytes,
+        ring.pass_bytes(stage.ring_half),
+    ))
 }
 
 impl PlanInputs {
@@ -453,6 +481,7 @@ mod tests {
         prompt_reserve_bytes, stage_placed,
     };
     use crate::arch::names::blk;
+    use crate::arch::place_hybrid;
     use crate::placement::workstation::HostRead;
     use crate::placement::{
         Card, Host, Machine, ModelTensor, ModelTensors, Node, PlacementError, PlanLevers, Role,
@@ -774,6 +803,45 @@ mod tests {
         let expected = (held * e + e / 2 - reserve) / e;
         assert!(expected < held);
         assert_eq!(on_card(&inputs, usable), Some(expected));
+    }
+
+    /// The stream's ring is the stage card's ring term, a floor of [`STREAM_HALF_SLOTS`] slots
+    /// counted before the experts: the streaming inputs ([`stream_bytes`]) plan the experts, the
+    /// totals and the headroom of the plan that holds the ring in its prompt reserve, name the
+    /// ring's bytes in the ring term of 128 slots a half and leave them out of the prompt term.
+    /// Mutants: the ring counted as prompt (the ring term is 0), the floor left out of the
+    /// reserve before the experts (the experts differ).
+    #[test]
+    fn the_stream_ring_is_the_cards_ring_term() {
+        let hp = hparams(2048, 1024, 1024, 64);
+        let model = tensors(&hp);
+        let ring = super::stream_ring(&hp, &model).expect("the ring");
+        let spec = spec_of(
+            &hp,
+            ChatSpec {
+                pre: String::new(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        )
+        .expect("the description");
+        let mut plain = inputs_of(hp, model, spec).expect("the inputs");
+        plain.room = (u64::MAX, HostRead::Given);
+        plain.arena = None;
+        let usable = card_for(&plain, 100) + ring.bytes(ring.floor);
+        let (stage, n_l) = place_hybrid::assert_ring_cap(&plain, ring, &machine(usable), CTX);
+        assert_eq!(stage.ring_half, 128);
+        assert!(
+            n_l.iter().sum::<u64>() < 252,
+            "the ring takes experts' room"
+        );
+        // Where the experts leave headroom (a slot a 64th of the family's, a card's leftover under
+        // one expert holds several), the half grows past the floor, last. Mutant: the cap held
+        // at the floor.
+        let grown =
+            place_hybrid::assert_ring_grows(&plain, ring, 64, &machine(0), (100, 40, 50_000), CTX);
+        eprintln!("musespark grown half {grown}");
     }
 
     /// A machine with no stage card is refused by name where the placed load's embedding would
