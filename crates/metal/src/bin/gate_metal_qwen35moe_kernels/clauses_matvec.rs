@@ -2,8 +2,6 @@
 //! row tails, the library comparison, the host's refusals, the block shape
 //! and the SIMD-group geometry.
 
-use std::process::Command;
-
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::{Buffer, Device, Elems};
 use bloomery_metal::device::MetalDevice;
@@ -139,70 +137,6 @@ pub fn row_tail(h: &Harness<'_>, fixture: &Fixture) -> Clause {
     )))
 }
 
-/// What a child run of the gate under Metal's shader validation said on
-/// stderr.
-struct Validated {
-    /// Whether the validation layer announced itself.
-    started: bool,
-    /// How many accesses it reported.
-    reports: usize,
-    /// The first report's lines, for a clause that fails on it.
-    first: String,
-    /// The child's own verdict and last words.
-    exit: Result<(), String>,
-}
-
-/// The gate's own binary, run as `--child row_tail` with Metal's shader
-/// validation on (its reports go to stderr), beside the gate's own `--fixture`
-/// and a `--mutant` when one is named.
-fn row_tail_under_validation(args: &[String], mutant: Option<&str>) -> Result<Validated, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("the gate's own path: {e}"))?;
-    let mut child = Command::new(exe);
-    child.args(["--child", "row_tail"]);
-    if let Some(path) = flag(args, "--fixture") {
-        child.args(["--fixture", path]);
-    }
-    if let Some(name) = mutant {
-        child.args(["--mutant", name]);
-    }
-    child
-        .env("MTL_SHADER_VALIDATION", "1")
-        .env("MTL_SHADER_VALIDATION_GLOBAL_MEMORY", "1")
-        .env("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1")
-        .env("MTL_SHADER_VALIDATION_ENABLE_VERBOSE_LOGGING", "1");
-    let out = child
-        .output()
-        .map_err(|e| format!("the child gate did not start: {e}"))?;
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let first = stderr
-        .split("=====")
-        .find(|block| block.contains("Invalid Metal usage"))
-        .map(|block| {
-            block
-                .lines()
-                .filter(|l| !l.is_empty())
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(" / ")
-        })
-        .unwrap_or_default();
-    Ok(Validated {
-        started: stderr.contains("Metal GPU Validation Enabled"),
-        reports: stderr.matches("Invalid Metal usage").count(),
-        first,
-        exit: if out.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "the child exited {}: {}",
-                out.status,
-                stdout.lines().last().unwrap_or("no output")
-            ))
-        },
-    })
-}
-
 /// No launch of `row_tail` reads outside its weights' buffer. The reads of the
 /// rows past the last are never stored, so no output shows them; only Metal's
 /// shader validation reports an access outside a buffer, and it must be on
@@ -214,32 +148,13 @@ fn row_tail_under_validation(args: &[String], mutant: Option<&str>) -> Result<Va
 /// rows, must be reported; a layer that reports nothing there checked nothing,
 /// and the clause is red, not green.
 pub fn row_tail_reads(args: &[String]) -> Clause {
-    let control = row_tail_under_validation(args, Some("tail_read"))?;
-    if !control.started || control.reports == 0 {
-        return Err(format!(
-            "shader validation {} for the control, a kernel that reads past its weights: nothing \
-             was checked",
-            if control.started {
-                "reported nothing"
-            } else {
-                "did not start"
-            }
-        ));
+    let mut child = vec!["--child", "row_tail"];
+    if let Some(path) = flag(args, "--fixture") {
+        child.extend(["--fixture", path]);
     }
-    let own = row_tail_under_validation(args, flag(args, "--mutant"))?;
-    if !own.started {
-        return Err("shader validation did not start: nothing was checked".to_string());
-    }
-    if own.reports > 0 {
-        return Err(format!(
-            "{} accesses outside a buffer reported, the first: {}",
-            own.reports, own.first
-        ));
-    }
-    own.exit?;
+    let control = common::reads_inside(&child, args, "tail_read", "row-tail launches")?;
     Ok(Verdict::Noted(format!(
-        "no report in the row-tail launches, {} for the control",
-        control.reports
+        "no report in the row-tail launches, {control} for the control"
     )))
 }
 

@@ -3,6 +3,8 @@
 //! loop. A clause file owns its kernel's launches and its case table; this
 //! module owns what would otherwise be a copy per file.
 
+use std::process::Command;
+
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elem};
@@ -12,7 +14,7 @@ use bloomery_metal::kernels::Quant;
 
 use super::fixture::Fixture;
 use super::oracle::{self, Kind};
-use super::{Harness, Launch, ModeSpec, SENTINEL_BITS};
+use super::{Harness, Launch, ModeSpec, SENTINEL_BITS, flag};
 
 /// The layer the clauses launch in: a model layer, so a raise is told apart
 /// from a launch that names none. Nothing reads the number; every clause
@@ -375,4 +377,159 @@ pub fn moved<T: Elem + Default>(
         .read(h.stream, buffer.whole().map_err(why)?, &mut back)
         .map_err(why)?;
     Ok(back.iter().any(keep))
+}
+
+/// What a child run of the gate under Metal's shader validation said on
+/// stderr.
+struct Validated {
+    /// Whether the validation layer announced itself.
+    started: bool,
+    /// How many accesses it reported.
+    reports: usize,
+    /// The first report's lines, for a clause that fails on it.
+    first: String,
+    /// The child's own verdict and last words.
+    exit: Result<(), String>,
+}
+
+/// The gate's own binary, run with `child` and a `--mutant` when one is named,
+/// with Metal's shader validation on (its reports go to stderr).
+fn under_validation(child: &[&str], mutant: Option<&str>) -> Result<Validated, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("the gate's own path: {e}"))?;
+    let mut run = Command::new(exe);
+    run.args(child);
+    if let Some(name) = mutant {
+        run.args(["--mutant", name]);
+    }
+    run.env("MTL_SHADER_VALIDATION", "1")
+        .env("MTL_SHADER_VALIDATION_GLOBAL_MEMORY", "1")
+        .env("MTL_SHADER_VALIDATION_REPORT_TO_STDERR", "1")
+        .env("MTL_SHADER_VALIDATION_ENABLE_VERBOSE_LOGGING", "1");
+    let out = run
+        .output()
+        .map_err(|e| format!("the child gate did not start: {e}"))?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let (reports, first) = validation_reports(&stderr);
+    Ok(Validated {
+        started: stderr.contains("Metal GPU Validation Enabled"),
+        reports,
+        first,
+        exit: if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the child exited {}: {}",
+                out.status,
+                stdout.lines().last().unwrap_or("no output")
+            ))
+        },
+    })
+}
+
+/// The accesses outside a buffer that a shader validation stderr reports, and
+/// the first report's first two lines. The layer writes a report in one of two
+/// forms: a block between `=====` lines that names "Invalid Metal usage", or,
+/// where it writes no such block (macOS 26.5), a paragraph its line
+/// "Invalid device load …" or "Invalid device store …" opens.
+fn validation_reports(stderr: &str) -> (usize, String) {
+    let two = |lines: &mut dyn Iterator<Item = &str>| {
+        lines
+            .filter(|l| !l.trim().is_empty())
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
+    let blocks: Vec<&str> = stderr
+        .split("=====")
+        .filter(|block| block.contains("Invalid Metal usage"))
+        .collect();
+    if let Some(block) = blocks.first() {
+        return (blocks.len(), two(&mut block.lines()));
+    }
+    let lines: Vec<&str> = stderr.lines().collect();
+    let opens: Vec<usize> = (0..lines.len())
+        .filter(|&i| lines[i].starts_with("Invalid device "))
+        .collect();
+    let first = opens
+        .first()
+        .map(|&i| two(&mut lines[i..].iter().copied()))
+        .unwrap_or_default();
+    (opens.len(), first)
+}
+
+/// The launches the gate's `child` run makes read nothing outside their
+/// buffers. Only Metal's shader validation reports such a read, and it must be
+/// on when the process starts, so the launches run in child gates. The
+/// control, the child with the `control` mutant (one that reads past its
+/// weights), must be reported, or the validation checked nothing and the
+/// clause is red; then the child with the parent's own `--mutant`, if any,
+/// must report nothing and exit clean. `launches` names them in the verdict.
+/// Returns the control's report count.
+pub fn reads_inside(
+    child: &[&str],
+    args: &[String],
+    control: &str,
+    launches: &str,
+) -> Result<usize, String> {
+    let checked = under_validation(child, Some(control))?;
+    if !checked.started || checked.reports == 0 {
+        return Err(format!(
+            "shader validation {} for the control, a kernel that reads past its weights: nothing \
+             was checked",
+            if checked.started {
+                "reported nothing"
+            } else {
+                "did not start"
+            }
+        ));
+    }
+    let own = under_validation(child, flag(args, "--mutant"))?;
+    if !own.started {
+        return Err("shader validation did not start: nothing was checked".to_string());
+    }
+    if own.reports > 0 {
+        return Err(format!(
+            "{} accesses outside a buffer reported in the {launches}, the first: {}",
+            own.reports, own.first
+        ));
+    }
+    own.exit?;
+    Ok(checked.reports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validation_reports;
+
+    /// Both forms of the layer's report are counted, the first named by its
+    /// two opening lines, and a stderr that reports nothing counts none.
+    #[test]
+    fn validation_reports_reads_both_forms() {
+        let blocks = "Metal GPU Validation Enabled\n=====\nInvalid Metal usage\nread past a \
+                      buffer\n=====\n=====\nInvalid Metal usage\nanother\n=====\n";
+        assert_eq!(
+            validation_reports(blocks),
+            (2, "Invalid Metal usage / read past a buffer".to_string())
+        );
+        let paragraphs = "2026-11-03 21:23:39.864 gate[4899:51860] Metal GPU Validation \
+                          Enabled\nInvalid device load at offset 4678, executing kernel \
+                          function: \"q4k_matvec\" \nbuffer: <unnamed>, length:1476, \
+                          resident:Read Write\n\t* frame #0: k4_scale_words()\n\n\nInvalid \
+                          device store at offset 64, executing kernel function: \"x\" \n\
+                          buffer: <unnamed>, length:8, resident:Read Write\n";
+        assert_eq!(
+            validation_reports(paragraphs),
+            (
+                2,
+                "Invalid device load at offset 4678, executing kernel function: \
+                 \"q4k_matvec\"  / buffer: <unnamed>, length:1476, resident:Read Write"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            validation_reports("Metal GPU Validation Enabled\nclause row_tail: PASS\n"),
+            (0, String::new())
+        );
+    }
 }

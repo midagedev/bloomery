@@ -273,7 +273,7 @@ fn musespark_model() -> Result<String, RefError> {
 }
 
 fn mistrallarge4_model() -> Result<String, RefError> {
-    Ok(super::mistrallarge4::MODEL.to_string())
+    Ok(super::mistrallarge4::VOCABULARY.to_string())
 }
 
 fn nanbeige43_model() -> Result<String, RefError> {
@@ -317,6 +317,31 @@ mod tests {
         match pin.split_once('+') {
             Some((commit, patch)) => (commit, Some(patch)),
             None => (pin, None),
+        }
+    }
+
+    /// A model moved off `/models` is named by its full path, never by a symlink spelling: the tokenizer gates open the
+    /// Mistral Large 4 and Kimi K3 vocabulary files by these constants, and the family runs the first.
+    /// FAIL-first: with either constant back under `/models/` (or the family's `runs` back on the node-dump `MODEL`) it reds.
+    #[test]
+    fn moved_vocabulary_files_are_named_by_their_full_path() {
+        assert_eq!(
+            MISTRALLARGE4.runs().expect("the family names its file"),
+            crate::arch::mistrallarge4::VOCABULARY,
+            "the tokenizer family opens the vocabulary constant, not the node-dump identity"
+        );
+        for path in [
+            crate::arch::mistrallarge4::VOCABULARY,
+            crate::arch::kimi_k3::VOCABULARY,
+        ] {
+            assert!(
+                !path.starts_with("/models/"),
+                "{path}: /models holds no symlink to a moved file"
+            );
+            assert!(
+                path.ends_with("-00001-of-00006.gguf") || path.ends_with("-00001-of-00014.gguf"),
+                "{path}: the first shard"
+            );
         }
     }
 

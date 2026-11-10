@@ -56,6 +56,12 @@ pub const COMMIT: &str = "78feec062";
 pub const MODEL: &str =
     "/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf";
 
+/// The first shard the tokenizer gate and its oracle set read, where the file is today (the root drive's
+/// `/home/user/models`; `/models` holds no symlink to it). One line moves it, with
+/// `SHARD` of `crates/tokenizer/tools/oracle.sh`, and the set is re-dumped (`just dump-ref-tokenizer mistrallarge4`).
+/// [`MODEL`] stays the identity of the node-dump sets.
+pub const VOCABULARY: &str = "/home/user/models/Mistral-Large-4-1T-A52B-UD-IQ1_S/Mistral-Large-4-1T-A52B-UD-IQ1_S-00001-of-00006.gguf";
+
 /// The first shard of the Mix-256G split set (233 GB in six shards, the second real file of the
 /// architecture) every `ref_mistrallarge4_mix256g_*` set is dumped from: the identity its
 /// `# model` line states, the spelling of `just dump-ref-mistrallarge4-mix256g`.
