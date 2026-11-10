@@ -1842,7 +1842,7 @@ pub static TOKENS: Kind = Kind {
 pub static STAT_STEP: Kind = Kind {
     name: "stat_step",
     head: "stat step",
-    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults, free device bytes and engram rows; the step's go waits (the card's time from the host's signal to the next go, one per service: least, lower median, most) and the host time in its synchronous parameter copy.",
+    doc: "BLOOMERY_STEP_STATS: one generated step's host-tier counters, page faults, free device bytes and engram rows; the step's go waits (the card's time from the host's signal to the next go, one per service: least, lower median, most), the host time in its synchronous parameter copy and the layers it sent no node tier (their picks named no slot of the node's).",
     parts: &[
         lit(" "),
         pos("i", U64, ""),
@@ -1870,6 +1870,7 @@ pub static STAT_STEP: Kind = Kind {
         key("gap_p50_us", F64(1), "us"),
         key("gap_max_us", F64(1), "us"),
         key("params_us", F64(1), "us"),
+        key("node_skipped", U64, ""),
     ],
 };
 

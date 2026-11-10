@@ -218,6 +218,10 @@ pub struct TierBatchStats {
     pub settles: u64,
     pub settle_early: u64,
     pub settle_ns: u64,
+    /// Layer-batches the host left a node's leg unissued for: their union
+    /// named no slot of the node's, so it was sent nothing
+    /// ([`BatchPort::serve_tiered`]).
+    pub skipped: u64,
 }
 
 /// The two sets, and the set the next download, serve and upload take: each
@@ -806,6 +810,17 @@ impl BatchPort {
             match l.leg {
                 Leg::Idle => {}
                 Leg::Routed(k) if k == key => {
+                    // A node's leg the batch's union leaves no slot is sent
+                    // nothing: the host serves the layer's experts and the
+                    // leg settles with no rows, which the join of a layer
+                    // whose places are all the host's reads none of.
+                    if matches!(side, PortSide::Node(_))
+                        && !l.tsel[at * s..u * s].iter().any(|&p| p != HOST)
+                    {
+                        l.leg = Leg::Settled(key);
+                        stats.skipped += 1;
+                        continue;
+                    }
                     let side = match (side, &l.done) {
                         (PortSide::Card(staging), Some(done)) => ServeSide::Card { staging, done },
                         (PortSide::Node(_), None) => ServeSide::Node { planes: l.planes },

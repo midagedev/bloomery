@@ -800,7 +800,10 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    then the generation into an inbox word on the reader's page. The inbox, the staged generation a post sends and the
    staged progress a reset sends sit in a tail past the tier page's own bytes, so the shared page keeps its layout.
 2. **The counters cross as generations; the cards keep their operations.** A row's go counter is added to by the stage
-   and taken back by the tier, and its done counter the other way: two writers, at different times. A mirrored absolute
+   and taken back by the tier, and its done counter the other way: two writers, at different times. For a tier on a
+   node the host adds the go itself, from the picks it just read (`TierPage::add_go`), so a layer whose picks name no
+   slot of the node's adds none and the node is sent nothing; the host adds that layer's done unit itself once the
+   tier is caught up (`TierPage::add_unit`), so the stage card's captured wait keeps its one fixed target. A mirrored absolute
    write would erase the remote take back. A captured wait also keeps its value fixed on every replay
    (`crates/gpu/src/graph.rs`, `HostFlags`), so a wait for a target that rises each replay cannot be captured. So the
    counter is split across the two pages. On the writer's page only the writing card adds one to it, and that value is a
@@ -877,7 +880,9 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    the tier card (`spec_of_device` of the row node 1 sent) before anything loads. Node 1 refuses an open whose rows are
    not the tier's set, then loads the rows of node 0's plan from its own copy of the file, each tensor checked against
    node 0's description and each row's bytes against their sha256 in node 0's file (both nodes hash the tier's rows, not
-   the whole file), captures its graphs from the go order it is sent, and launches a replay on a launch message.
+   the whole file) captures its graphs from the go order it is sent and launches a replay on a launch message — for
+   the step's per-layer work, not a node tier's, whose layers arrive as one enqueue frame each, named by layer, from
+   the host's own reading of the picks, and never as a captured graph.
    `TierCard` keeps the stage side, and its tier side is either a card of this process or a node (`TierWork` is the part
    both run). A shared bind on loopback maps one `/dev/shm` file, created mode 0600 and removed once both ends hold
    it (`Link::across`, `MappedHost::shared_file`). An RDMA bind allocates one page per process and exchanges each

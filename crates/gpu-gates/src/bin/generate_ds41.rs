@@ -2988,6 +2988,7 @@ mod drive {
                 .f("gap_p50_us", w[1].gap.p50_ns as f64 / 1e3)
                 .f("gap_max_us", w[1].gap.max_ns as f64 / 1e3)
                 .f("params_us", (w[1].params_ns - w[0].params_ns) as f64 / 1e3)
+                .u("node_skipped", q.node_skipped - p.node_skipped)
                 .print();
             if i > warm {
                 waits.push(wait_us);

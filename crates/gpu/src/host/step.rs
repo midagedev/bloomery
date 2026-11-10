@@ -38,6 +38,18 @@ const DEADLINE_POLL: u32 = 1 << 12;
 /// The name every step service's errors and refusals carry.
 pub(super) const SERVE: &str = "Hybrid::serve";
 
+/// Where a step service tells its host tier what the picks it read named
+/// ([`StepPort::serve_one`]), for the tiers the host itself serves: a tier
+/// on a node is sent the layer only when a pick named one of its slots.
+pub(super) enum NodePoint {
+    /// The service read its picks, before its host experts run: the moment
+    /// to send the node the layer, so its service overlaps the host's own.
+    Picks,
+    /// The service signalled the card: the moment a skipped layer's unit
+    /// reaches the tier's counter, once the tier is caught up.
+    Signaled,
+}
+
 /// Flag word `w` of the page, as an atomic.
 pub(super) fn word(page: &MappedHost, w: Word) -> &AtomicU32 {
     page.atomic_u32(w.offset())
@@ -1032,10 +1044,13 @@ impl StepPort {
     /// Serve layer `layer` of row `row` in `chain` with `experts`, recording
     /// a refusal in `health`: wait for the go, check it, build the host list
     /// from `slots`, run the experts into the row's sum and signal. A `Cols`
-    /// chain is [`StepPort::serve_cols`]'s.
+    /// chain is [`StepPort::serve_cols`]'s. `nodes` is told the picks the
+    /// service read, at [`NodePoint::Picks`] before the host experts run and
+    /// at [`NodePoint::Signaled`] after the signal, for the tiers the host
+    /// itself serves ([`super::HostTier::serve`]).
     #[allow(
         clippy::too_many_arguments,
-        reason = "the tier's three parts the service reads, the go it serves and its chain"
+        reason = "the tier's three parts the service reads, the go it serves, its chain and the node hook"
     )]
     pub(super) fn serve_one<H: HostExperts>(
         &mut self,
@@ -1046,10 +1061,11 @@ impl StepPort {
         row: usize,
         opens_replay: bool,
         chain: Chain,
+        nodes: &mut dyn FnMut(NodePoint, &[u64; MAX_TIERS]) -> Result<(), GpuError>,
     ) -> Result<(), GpuError> {
         let what = SERVE;
         if let Chain::Cols(_) = chain {
-            return self.serve_cols(experts, health, slots, layer, opens_replay, chain);
+            return self.serve_cols(experts, health, slots, layer, opens_replay, chain, nodes);
         }
         let go = self.take_go(layer, row, opens_replay, chain)?;
         self.holds[row] = None;
@@ -1110,6 +1126,7 @@ impl StepPort {
             }
         }
         self.tier_slots = tier_slots;
+        nodes(NodePoint::Picks, &tier_slots)?;
         if !payload_f32_into(page, image_off, h.x, words, &mut self.x.data) {
             return Err(GpuError::shape(
                 what,
@@ -1198,6 +1215,7 @@ impl StepPort {
             None => false,
         };
         self.signal(row, go);
+        nodes(NodePoint::Signaled, &tier_slots)?;
         if whole && let Some(t) = self.trace.as_mut() {
             t.write_row()?;
         }
@@ -1217,7 +1235,13 @@ impl StepPort {
     /// ([`HostExperts::experts_step_union_into`]), each column's sum bit for bit
     /// what a one-column service writes for it, into the row's sum; then
     /// signal. A column the card should already have refused runs nothing:
-    /// every column's sum is NaN and the service fails by name.
+    /// every column's sum is NaN and the service fails by name. `nodes` is
+    /// the service's node hook ([`StepPort::serve_one`]); the picks it is
+    /// told are the union over the row's columns.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the tier's parts the service reads, the go it serves, its chain and the node hook"
+    )]
     fn serve_cols<H: HostExperts>(
         &mut self,
         experts: &mut H,
@@ -1226,6 +1250,7 @@ impl StepPort {
         layer: usize,
         opens_replay: bool,
         chain: Chain,
+        nodes: &mut dyn FnMut(NodePoint, &[u64; MAX_TIERS]) -> Result<(), GpuError>,
     ) -> Result<(), GpuError> {
         let what = SERVE;
         let m = chain.cols();
@@ -1255,6 +1280,7 @@ impl StepPort {
             ));
         }
         let (mut w2_host, mut w2_all, mut host_slots) = (0.0f64, 0.0f64, 0u64);
+        let mut tier_slots = [0u64; MAX_TIERS];
         let mut refused = None;
         for j in 0..m {
             let list = &mut self.lists[j * n..][..n];
@@ -1275,13 +1301,16 @@ impl StepPort {
                         len += 1;
                         w2_host += f64::from(w) * f64::from(w);
                     }
-                    Some(Slot::Card(_) | Slot::Tier { .. }) => {}
+                    Some(Slot::Card(_)) => {}
+                    Some(Slot::Tier { tier, .. }) => tier_slots[tier] += 1,
                     None => refused = refused.or(Some((j, unknown_id(s, id, slots.n_expert())))),
                 }
             }
             self.lens[j] = len;
             host_slots += len as u64;
         }
+        self.tier_slots = tier_slots;
+        nodes(NodePoint::Picks, &tier_slots)?;
         let xs = &mut self.xs[..m * h.hidden];
         if !payload_f32_into(page, go.image_off, h.x, words, xs) {
             return Err(GpuError::shape(
@@ -1316,6 +1345,7 @@ impl StepPort {
         self.slices = reuse_slices(lists);
         r?;
         self.signal(0, go);
+        nodes(NodePoint::Signaled, &tier_slots)?;
         let s = &mut self.stats;
         s.host_slots += host_slots;
         s.host_w2 += if w2_all > 0.0 { w2_host / w2_all } else { 0.0 };

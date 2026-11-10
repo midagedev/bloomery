@@ -54,6 +54,7 @@ pub fn sent_between(before: Option<Sent>, after: Option<Sent>) -> Option<Sent> {
             settles: a.stats.settles - b.stats.settles,
             settle_early: a.stats.settle_early - b.stats.settle_early,
             settle_ns: a.stats.settle_ns - b.stats.settle_ns,
+            skipped: a.stats.skipped - b.stats.skipped,
         },
     })
 }
@@ -69,6 +70,7 @@ pub fn plus(a: Option<Sent>, b: Option<Sent>) -> Option<Sent> {
             settles: a.stats.settles + b.stats.settles,
             settle_early: a.stats.settle_early + b.stats.settle_early,
             settle_ns: a.stats.settle_ns + b.stats.settle_ns,
+            skipped: a.stats.skipped + b.stats.skipped,
         },
     })
 }

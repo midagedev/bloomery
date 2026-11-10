@@ -1192,6 +1192,8 @@ pub struct TierNode {
     /// A block request sent whose reply is unread: its slots and the tier
     /// slots it sent.
     pending: Option<(usize, usize)>,
+    /// Enqueues sent whose replies are unread ([`TierNode::send_enqueue`]).
+    pending_enqueues: u32,
     control_round_trips: u64,
     lost: Option<String>,
 }
@@ -1262,6 +1264,7 @@ impl TierNode {
             words: None,
             block: None,
             pending: None,
+            pending_enqueues: 0,
             control_round_trips: 0,
             lost: None,
         };
@@ -1318,9 +1321,9 @@ impl TierNode {
     }
 
     /// Refuse a request `what` to a lost node by name; with a block's reply
-    /// unread, read it first and set it aside, whatever it carries, so the
-    /// request's reply is the next frame. A channel that fails loses the
-    /// node.
+    /// or an enqueue's unread, read it first and set it aside, whatever it
+    /// carries, so the request's reply is the next frame. A channel that
+    /// fails loses the node.
     fn ready(&mut self, what: &str) -> Result<(), GpuError> {
         if let Some(why) = &self.lost {
             return Err(GpuError::link(
@@ -1331,6 +1334,7 @@ impl TierNode {
                 ),
             ));
         }
+        self.drain_enqueues(Instant::now() + REPLY)?;
         if self.pending.take().is_some() {
             match self.ch.recv(Instant::now() + REPLY) {
                 Ok(Tag::Ok | Tag::Err) => self.control_round_trips += 1,
@@ -1423,6 +1427,59 @@ impl TierNode {
         self.call(tag, within, what)?;
         let end = In::new(self.ch.body()).end();
         end.map_err(|e| self.lose_now(what, e))
+    }
+
+    /// [`TierWork::enqueue`] on the node, sent without its reply: one layer a
+    /// node tier serves on the host's own reading of the picks, whose frame
+    /// names its layer, so a layer the host skips is simply never sent. The
+    /// replies are read by [`TierNode::drain_enqueues`], in the order the
+    /// frames were sent; a refusal surfaces there.
+    pub(super) fn send_enqueue(
+        &mut self,
+        layer: usize,
+        row: usize,
+        cols: usize,
+    ) -> Result<(), GpuError> {
+        self.ready("enqueue")?;
+        self.req.clear().len(layer).len(row).len(cols);
+        let written = self
+            .ch
+            .send(Tag::Enqueue, self.req.done(), Instant::now() + REPLY);
+        written.map_err(|e| self.lose_now("enqueue", e.to_string()))?;
+        self.pending_enqueues += 1;
+        Ok(())
+    }
+
+    /// The replies of the enqueues [`TierNode::send_enqueue`] sent, read by
+    /// `deadline`: each an empty acknowledgement, or the server's refusal of
+    /// the frame it belongs to. A channel that fails loses the node.
+    pub(super) fn drain_enqueues(&mut self, deadline: Instant) -> Result<(), GpuError> {
+        while self.pending_enqueues > 0 {
+            match self.ch.recv(deadline) {
+                Ok(Tag::Ok) => {
+                    let end = In::new(self.ch.body()).end();
+                    self.control_round_trips += 1;
+                    self.pending_enqueues -= 1;
+                    if let Err(why) = end {
+                        return Err(self.lose_now("enqueue", why));
+                    }
+                }
+                Ok(Tag::Err) => {
+                    self.control_round_trips += 1;
+                    self.pending_enqueues -= 1;
+                    return match read_err(self.addr, "enqueue", self.ch.body()) {
+                        Ok(e) => Err(e),
+                        Err(why) => Err(self.lose_now("enqueue", why)),
+                    };
+                }
+                Ok(t) => {
+                    let why = format!("a {t:?} frame where an enqueue's reply belongs");
+                    return Err(self.lose_now("enqueue", why));
+                }
+                Err(e) => return Err(self.lose_now("enqueue", e.to_string())),
+            }
+        }
+        Ok(())
     }
 
     /// Bind the tier to the page shared through the file at `path`, `bytes`
@@ -2564,6 +2621,66 @@ pub(super) mod tests {
         std::fs::remove_file(path).expect("remove the fixture");
     }
 
+    /// A node refuses, by name, a service of a layer its set holds no expert
+    /// of: the frames a step sends name layers the routing picked, and a
+    /// layer the node does not hold is not one of them
+    /// ([`TierCard::send_layer`]'s skip keeps the node's stream in step).
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_node_refuses_a_layer_it_holds_none_of() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        let (path, file) = empty_file("node-refuse-layer");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let work = super::super::tier::tests::remote_work(&file, Arc::clone(&dropped), true);
+        let set = TierSet::new(0..2, 4, vec![vec![0], vec![]]).expect("a set with an empty layer");
+        let mut session = Session {
+            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            reset_phase: 0,
+            file: &file,
+            families: &[],
+            opened: Some(super::Opened {
+                work,
+                name: "test tier".into(),
+                set: set.clone(),
+                cols: 1,
+                block: None,
+            }),
+            asked: 0,
+            seen: (0, Instant::now()),
+            listed: Vec::new(),
+            reply: Out::default(),
+            on_open: &mut |_| {},
+        };
+        let mut req = Out::default();
+        req.len(1).len(0).len(1);
+        match session.handle(Tag::Enqueue, req.done()) {
+            Err(Failed::Refused(e)) => assert!(
+                e.to_string()
+                    .contains("the tier holds 0 experts of that layer"),
+                "{e}"
+            ),
+            Err(_) => panic!("an enqueue of an empty layer must be refused, not failed"),
+            Ok(()) => panic!("an enqueue of an empty layer must be refused"),
+        }
+        let mut req = Out::default();
+        req.len(0).len(0).len(1);
+        assert!(
+            session.handle(Tag::Enqueue, req.done()).is_ok(),
+            "a layer the set holds an expert of is served"
+        );
+        // The served layer's stream parks on its go (never raised here), so
+        // the load ends as a lost node's does, releasing the words.
+        let _ = session.end_lost(
+            "127.0.0.1:7340".parse().expect("a peer"),
+            "the test's service parks on its go",
+        );
+        assert!(session.opened.is_none());
+        drop(session);
+        drop(file);
+        std::fs::remove_file(path).expect("remove the fixture");
+    }
+
     fn gb10(uuid: u8) -> DeviceInfo {
         DeviceInfo {
             ordinal: 0,
@@ -2621,6 +2738,7 @@ pub(super) mod tests {
             words: None,
             block: None,
             pending: None,
+            pending_enqueues: 0,
             control_round_trips: 0,
             lost: None,
         };
@@ -2635,6 +2753,90 @@ pub(super) mod tests {
             peer.join().expect("the peer"),
             [(Tag::Close, 0)],
             "the frames the node got"
+        );
+    }
+
+    /// Over loopback, with no card: the frames a node tier's layers produce.
+    /// A layer whose picks name a slot of the node's is sent its frame, which
+    /// names its layer; a layer whose picks name none is sent nothing — no
+    /// frame, so no round trip — and the layer after it still names its own.
+    #[test]
+    fn a_node_free_layer_sends_no_frame() {
+        use super::wire::Channel;
+        use super::{Chain, TIER_CHAINS, TierCard, TierNode, TierSet};
+        use std::net::{TcpListener, TcpStream};
+
+        let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = l.local_addr().expect("its address");
+        let peer = std::thread::spawn(move || {
+            let mut ch = Channel::new(l.accept().expect("an accept").0).expect("a channel");
+            let mut frames = Vec::new();
+            while let Ok(tag) = ch.recv(Instant::now() + Duration::from_secs(10)) {
+                frames.push((tag, ch.body().to_vec()));
+                ch.send(Tag::Ok, &[], Instant::now() + Duration::from_secs(10))
+                    .expect("a reply");
+            }
+            frames
+        });
+        let node = TierNode {
+            addr,
+            ch: Channel::new(TcpStream::connect(addr).expect("a connect")).expect("a channel"),
+            req: Out::default(),
+            device: gb10(1),
+            shape: TierShape {
+                hidden: 2,
+                n_used: 1,
+                rows: 1,
+                act: TierAct::F32,
+                reply: ReplyRows::Whole,
+            },
+            cols: 1,
+            planes: (0, 0),
+            resident_bytes: 0,
+            device_bytes: 0,
+            graphs: [None; TIER_CHAINS],
+            words: None,
+            block: None,
+            pending: None,
+            pending_enqueues: 0,
+            control_round_trips: 0,
+            lost: None,
+        };
+        let mut card = TierCard::on_node(
+            node,
+            "test tier".into(),
+            TierSet::new(0..3, 4, vec![vec![0], vec![], vec![1]]).expect("a set"),
+        );
+        // The hook's calls for one step: layer 5 holds two of the node's
+        // slots, layer 6 none (skipped), layer 7 one.
+        assert!(
+            card.send_layer(Chain::Step, 5, 0, 2)
+                .expect("layer 5's decision"),
+            "layer 5's picks name slots: sent"
+        );
+        assert!(
+            !card
+                .send_layer(Chain::Step, 6, 0, 0)
+                .expect("layer 6's decision"),
+            "layer 6 names no slot of the node's: skipped"
+        );
+        assert!(
+            card.send_layer(Chain::Step, 7, 0, 1)
+                .expect("layer 7's decision"),
+            "layer 7's pick names a slot: sent"
+        );
+        let mut want = Vec::new();
+        for layer in [5, 7] {
+            let mut o = Out::default();
+            o.len(layer).len(0).len(1);
+            want.push((Tag::Enqueue, o.done().to_vec()));
+        }
+        drop(card);
+        let got = peer.join().expect("the peer");
+        assert_eq!(
+            got,
+            vec![want[0].clone(), want[1].clone(), (Tag::Close, Vec::new()),],
+            "the frames the node got: layer 6 (no node pick) must send none"
         );
     }
 
