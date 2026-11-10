@@ -38,3 +38,11 @@ decide-below: read the changed arm's xstream records: fewer streamed experts a l
   before any floor change
 decide-above: read the base arm's admits and union walls: a base slower than 930 tok/s means the admit
   arm, not the ring, moved; re-run q38_step.py with the measured union costs before landing
+# Result, 2026-11-10 (sitting from witness pre 03:53:12Z; the card ran as sha256 0ce867b3…; A6000 300 W, generate_qwen3moe
+# sha256 343c592f7fd3, plan a under BLOOMERY_CARD_BUDGET=24176M, 4 rounds rotated, no cpu-busy/other-busy/cold) [measured]:
+#   pp tok/s @ prose:4096   split 1678.27 [1669.80..1685.43]   admit 1251.62 [1185.35..1277.77]
+#   paired by round +41.8 / +31.0 / +31.2 / +32.9 %: +34.2 % ± 8.2 (t 3.182, df 3), inside the predicted +15..+40
+#   pp tok/s @ prose:512    split 791.04   admit 783.15 (read beside: no claim)
+#   the split arm's load line: xstream=split xstream_half=64; the admit arm's: xstream=admit.
+#   The base (admit) runs above the card's 930.9, the 3090's: the A6000 is the faster card, not a moved admit arm.
+#   The card bytes verdict is not in generate's log; the qwen38-serve gates read it.
