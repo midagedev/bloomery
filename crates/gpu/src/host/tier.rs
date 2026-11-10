@@ -2286,8 +2286,9 @@ impl TierCard {
     /// caller has raised the layer's go on the page
     /// ([`TierPage::add_go`]) and the frame is sent after the picks were
     /// read, so the node's copy of the row's image is the one the go
-    /// published. A tier of this process is refused by name: its layer is
-    /// enqueued on its own stream ([`TierCard::enqueue_eager`]).
+    /// published. A frame sent opens the node's pass until the host ends it
+    /// ([`TierCard::end_pass`]). A tier of this process is refused by name:
+    /// its layer is enqueued on its own stream ([`TierCard::enqueue_eager`]).
     pub(super) fn send_layer(
         &mut self,
         chain: Chain,
@@ -2317,12 +2318,33 @@ impl TierCard {
         Ok(true)
     }
 
-    /// The replies of the layer frames [`TierCard::send_layer`] sent, read by
-    /// `deadline`; a tier of this process has none to read.
+    /// The replies of the frames [`TierCard::send_layer`] and
+    /// [`TierCard::end_pass`] sent, read by `deadline`; a tier of this
+    /// process has none to read.
     pub(super) fn drain_layers(&mut self, deadline: Instant) -> Result<(), GpuError> {
         match &mut self.side {
-            TierSide::Node(n) => n.drain_enqueues(deadline),
+            TierSide::Node(n) => n.drain_pass(deadline),
             TierSide::Here(_) => Ok(()),
+        }
+    }
+
+    /// End the pass a tier on a node holds open, once the host is done with
+    /// it — settled, or failed with the card not named lost — so the node is
+    /// idle, not stalled ([`TierNode::send_end`]). Nothing when the pass sent
+    /// the node no layer, and nothing for a tier of this process.
+    pub(super) fn end_pass(&mut self) -> Result<(), GpuError> {
+        match &mut self.side {
+            TierSide::Node(n) => n.send_end(),
+            TierSide::Here(_) => Ok(()),
+        }
+    }
+
+    /// Leave the pass a tier on a node holds open unended: the host named the
+    /// tier's card lost ([`TierNode::leave_pass_open`]). Nothing for a tier
+    /// of this process.
+    pub(super) fn leave_pass_open(&mut self) {
+        if let TierSide::Node(n) = &mut self.side {
+            n.leave_pass_open();
         }
     }
 

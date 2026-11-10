@@ -1,0 +1,16 @@
+# nodeskip-loss-end-always: node 0 sends an end frame whether or not a pass is open
+# (TierNode::send_end no longer reads frames.open). Red:
+# a_pass_that_sent_the_node_a_layer_ends_with_one_end_frame (end frames after the second
+# end, the skipped pass and the pass left open); on a load node 1 refuses the second end by
+# name ("no pass is open") at the next pass's first frame.
+--- a/crates/gpu/src/host/node.rs
++++ b/crates/gpu/src/host/node.rs
+@@ -1480,7 +1480,7 @@
+     /// over and it is idle, not stalled. Nothing is sent when no enqueue went
+     /// out since the last end, nor to a lost node.
+     pub(super) fn send_end(&mut self) -> Result<(), GpuError> {
+-        if !std::mem::take(&mut self.frames.open) || self.lost.is_some() {
++        if self.lost.is_some() {
+             return Ok(());
+         }
+         self.ready("end")?;

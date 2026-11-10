@@ -882,7 +882,8 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    node 0's description and each row's bytes against their sha256 in node 0's file (both nodes hash the tier's rows, not
    the whole file) captures its graphs from the go order it is sent and launches a replay on a launch message — for
    the step's per-layer work, not a node tier's, whose layers arrive as one enqueue frame each, named by layer, from
-   the host's own reading of the picks, and never as a captured graph.
+   the host's own reading of the picks, and never as a captured graph. A pass that sent the node a layer ends with one
+   end frame once node 0 has settled it, or released its waits on a failure that did not name the node's card lost.
    `TierCard` keeps the stage side, and its tier side is either a card of this process or a node (`TierWork` is the part
    both run). A shared bind on loopback maps one `/dev/shm` file, created mode 0600 and removed once both ends hold
    it (`Link::across`, `MappedHost::shared_file`). An RDMA bind allocates one page per process and exchanges each
@@ -909,13 +910,18 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    capture/replay counts, and applies the same loss and drain clauses.
 6. **Loss.** Node 0 names a lost node as a lost card: a request that fails or passes its deadline marks the node lost
    and ends its channel, and the step fails with the tier `CardLost`. The go deadline still covers a node that answers
-   but stops computing. Node 1 has two ends of its own: the channel closing without a close, and work asked of it with
-   no progress past the go deadline and its grace (node 0 stopped). On either it writes `RELEASE` to its own counters
-   and go words, drains its stream within the drain deadline and exits with the loss named. A node 1 that was stopped
-   and runs again ends this way while node 0 still holds the failed load, since node 0 ended the channel when it
-   marked the node lost.
-   A stopped node 0 that runs again finds its counters released when it settles the step, and fails the step with the
-   tier lost instead of reading the rows node 1 served after the release.
+   but stops computing. Node 1 has two ends of its own: the channel closing without a close, and outstanding work with
+   neither a frame nor progress past the go deadline and its grace (node 0 stopped). Work is outstanding while a layer
+   asked of it is unserved, or while a pass node 0 opened with an enqueue frame has had no end frame: a layer whose
+   picks name no slot of the node's is sent nothing, so only the end frame tells node 1 that node 0 finished the pass,
+   and a node between passes stays idle for any time. On either end it writes `RELEASE` to its own counters and go
+   words, drains its stream within the drain deadline and exits with the loss named. Node 0 sends no end for a pass
+   whose card it named lost, so a node 1 that was stopped and runs again takes that pass's enqueue and ends by the
+   pass rule while node 0 still holds the failed load. The end costs one frame each way per pass that sent the node a
+   layer, sent after the settle and its reply read with the next pass's first frame, so no round trip waits on it.
+   A stopped node 0 that runs again finds its counters released, at its settle or at the first failure the dead
+   channel gives it, and fails the step with the tier lost, named by the release, instead of reading the rows node 1
+   served after it.
 7. **Faults and sequence.** The tier's fault-word copy rides before its signal (`crates/gpu/src/host/tier.rs:42-44` at `e7180ea9`). A doubled image is
    refused by the relay's step rule (item 2): a repeated generation delivers nothing, and a step above one stops the end
    by name. A stale image, bytes their generation overtook, is what item 4's order prevents, and `link_probe` counts it

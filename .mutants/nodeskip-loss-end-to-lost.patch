@@ -1,0 +1,15 @@
+# nodeskip-loss-end-to-lost: node 0 tells a node whose card it named lost that its pass
+# ended (HostTier::lose_tiers_as leaves the pass open no more). Red: gate-gpu-qwen38-nodes'
+# stopped node 1: the release's end waits a reply deadline on the stopped node, loses it and
+# ends the channel, so node 0's step fails a deadline later and node 1, continued, ends at
+# the channel's end, not by the pass rule ("as the pass node 0 did not end false").
+--- a/crates/gpu/src/host/mod.rs
++++ b/crates/gpu/src/host/mod.rs
+@@ -3367,7 +3367,6 @@
+         }
+         for (t, card) in self.tiers.iter_mut().enumerate() {
+             if behind >> t & 1 == 1 {
+-                card.leave_pass_open();
+             }
+         }
+         let (name, detail) = (self.tier_names(behind), details.join("; "));

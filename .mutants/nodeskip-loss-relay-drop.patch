@@ -1,0 +1,16 @@
+# nodeskip-loss-relay-drop: the relay drops the held frame when node 0 is killed, ending
+# node 1's side before it, so node 0 is killed between passes as node 1 sees it. Red:
+# gate-gpu-qwen38-nodes' lost node 0 (killed) precondition ("0 of them in a pass node 0 had
+# not ended, when node 0 was killed: FAIL").
+--- a/crates/gpu-gates/src/bin/gate_qwen38_nodes.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen38_nodes.rs
+@@ -1247,7 +1247,8 @@
+                     .recv()
+                     .unwrap_or(true);
+             }
+-            if up
++            if close && up.shutdown(Shutdown::Write).is_ok()
++                || up
+                 .write_all(&len)
+                 .and_then(|()| up.write_all(&frame))
+                 .is_err()
