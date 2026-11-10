@@ -9,7 +9,8 @@
 //! in their planes; its prompt-batch bytes are [`tier_batch`]. The prompt batch's card buffers are
 //! the plan's reserve ([`prompt_reserve_bytes`]) and a tiered load's copies of the tier places
 //! beside them the tier reserve ([`tier_places_bytes`]); the stage card's own tier places sit in
-//! the scratch term the load holds its made bytes to. The family's own is the reading
+//! the scratch term the load holds its made bytes to; the selection's block scores, which grow
+//! with the context, are the stage's position rows ([`index_scores_bytes`]). The family's own is the reading
 //! ([`PlanInputs::describe`]) and the engine's name in the refusals.
 
 use gguf::Split;
@@ -56,6 +57,31 @@ pub const FLASH_SEGMENTS: usize = 80;
 
 const _: () = assert!(FLASH_ROWS <= PROMPT_ROWS && PROMPT_ROWS <= crate::moe::UNION_MAX_COLS);
 
+/// Rows of block scores the step's selection scratch holds (one token).
+pub const STEP_SCORE_ROWS: u64 = 1;
+
+/// Bytes of one block score, an f32.
+const SCORE_BYTES: u64 = 4;
+
+/// The bytes of block scores a block of the context takes on the card: one f32 for each index head
+/// in each row of the two scores buffers the body makes over the context, [`STEP_SCORE_ROWS`] rows
+/// on the step's and [`PROMPT_ROWS`] on the prompt batch's (`MsaScratch::scores`, `[rows][heads]
+/// [blocks]`). A row holds `ceil(ctx / block)` blocks, so the bytes are not a whole number a
+/// position ([`index_scores_bytes`]).
+#[must_use]
+pub fn index_scores_block_bytes(hp: &Hparams) -> u64 {
+    (STEP_SCORE_ROWS + PROMPT_ROWS as u64) * hp.msa.heads as u64 * SCORE_BYTES
+}
+
+/// The block scores' bytes at a context of `ctx` positions: [`index_scores_block_bytes`] for each
+/// of its `ceil(ctx / block)` blocks. The plan counts them with the stage's position rows
+/// ([`place_hybrid::PlanInputs::with_block_scratch`]), one copy whatever the slots; the body holds
+/// its scores buffers equal to them at its load.
+#[must_use]
+pub fn index_scores_bytes(hp: &Hparams, ctx: u64) -> u64 {
+    index_scores_block_bytes(hp).saturating_mul(ctx.div_ceil((hp.msa.block as u64).max(1)))
+}
+
 /// The card bytes the body's prompt batch makes beside the plan's scratch term for a file described
 /// by `hp`, at [`PROMPT_ROWS`] rows. The plan keeps them out of the expert budget
 /// ([`place_hybrid::PlanInputs::prompt_reserve`]) and the body holds its made bytes to the same
@@ -70,7 +96,7 @@ const _: () = assert!(FLASH_ROWS <= PROMPT_ROWS && PROMPT_ROWS <= crate::moe::UN
 ///   flash cuts a row into fewer segments than the dense layers' decode flash, so the dense
 ///   layers' size every launch;
 /// - the selection's block ids (`msa.heads · top_k`) and key count; the block scores are the
-///   scratch term's, as they grow with the context;
+///   stage's position rows ([`index_scores_bytes`]), as they grow with the context;
 /// - the unit's buffers of the walk's first group set (the rows `x` and `x1`, the positions and key
 ///   counts) and the host sums (`embd`); the sets a larger prompt group adds are made out of the
 ///   card's margin;
@@ -208,7 +234,9 @@ impl PlanInputs {
         let spec = spec::spec_of(&hp, chat_of(split, None, None)?)?;
         let reserve = prompt_reserve_bytes(&hp);
         let tier = tier_places_bytes(PROMPT_ROWS, hp.experts.n_used);
+        let scores = (index_scores_block_bytes(&hp), hp.msa.block as u64);
         Ok(PlanInputs::new(ENGINE, hp, model, spec)?
+            .with_block_scratch(scores.0, scores.1)
             .with_prompt_reserve(reserve)
             .with_tier_reserve(tier)
             .with_nvme_tier())
@@ -225,10 +253,13 @@ mod tests {
         IDX_D, LAYERS, LEAD, keys, keys_shaped, tensors, tensors_shaped,
     };
     use super::super::hparams::{Attn, FfnKind, Kind};
-    use super::{PROMPT_ROWS, PlaceError, PlanInputs, TIER_CHUNK, stream_bytes, tier_batch};
+    use super::{
+        PROMPT_ROWS, PlaceError, PlanInputs, TIER_CHUNK, index_scores_block_bytes,
+        index_scores_bytes, stream_bytes, tier_batch,
+    };
     use crate::arch::place_hybrid::ring_pass_bytes;
     use crate::arch::synthetic::{V, header_shaped, host_run_experts};
-    use crate::placement::{PlacementError, PlanLevers, workstation};
+    use crate::placement::{KvBytes, PlacementError, PlanLevers, workstation};
 
     /// The small header's global keys: the pre-tokenizer and a template the description reads.
     fn global() -> [(&'static str, V); 2] {
@@ -391,8 +422,9 @@ mod tests {
     /// layers (2, 3 and 4) 16 f16 index-key values = 32 B more; at 64 positions the 2 dense layers
     /// are 8,192 B each and the 3 sparse 10,240 B each, 47,104 B, a slot each time. The stage keeps
     /// one table of the 8 rotated values in f32 (32 B) a position, 2,048 B at 64, whatever the
-    /// slots. A context of no position is refused by name. Mutant: the index keys left out of the
-    /// layout (the card holds 40,960 B), or the stage rows counted a slot.
+    /// slots, and the block scores beside them (257 rows × 2 heads × 4 B = 2,056 B a block of the header's
+    /// 4-position blocks, 16 blocks at 64: 32,896 B, one copy). A context of no position is refused by name. Mutant: the
+    /// index keys left out of the layout (the card holds 40,960 B), or the stage rows counted a slot.
     #[test]
     fn the_cards_kv_class_is_the_layers_stores() {
         let inputs = runnable("mm3-place-kv");
@@ -407,9 +439,14 @@ mod tests {
             let want = n as u64 * 47_104;
             assert_eq!(plan.cards[0].kv_bytes, want, "{n} slots");
             assert_eq!(want, n as u64 * inputs.kv.bytes(0..LAYERS, 64), "{n} slots");
-            // The rope table and the index selector's sink row, a position each.
+            // The rope table and the index selector's sink row, a position each, and the block
+            // scores of the selection scratch, one copy ([`index_scores_bytes`]).
             let rows = 8 * 4 + IDX_D * 2;
-            assert_eq!(plan.cards[0].stage_rows_bytes, rows * 64, "{n} slots");
+            assert_eq!(
+                plan.cards[0].stage_rows_bytes,
+                rows * 64 + index_scores_bytes(&inputs.hp, 64),
+                "{n} slots"
+            );
         }
         assert!(matches!(
             inputs.plan(&machine, 0, &levers),
@@ -500,5 +537,53 @@ mod tests {
             split_plan.cards[0].kv_bytes,
             coupled_plan.cards[0].kv_bytes + (LEAD as u64) * index * 64
         );
+    }
+
+    /// The selection's block scores are a plan term: `(1 + 256)` rows of `heads` f32 for each of
+    /// `ceil(ctx / block)` blocks [derived from `MsaScratch::new`: the step's one row and the
+    /// batch's `T_MAX` = [`PROMPT_ROWS`] rows, `rows · HEADS · nblk` values]. The header's 2 heads
+    /// are 257 × 2 × 4 = 2,056 B a block; the released shape (4 heads, 128-position blocks) is
+    /// 257 × 4 × 4 = 4,112 B a block, 8,192 blocks and 33,685,504 B at 2^20 positions, which the
+    /// flat scratch term held in the logged first-prompt reading
+    /// (`g-gate-gpu-minimaxm3-serve.log:85`, the 9,437,184 B past) and the stage's position rows
+    /// now count. The plan's prompt term is the batch's reserve
+    /// ([`PlanInputs::prompt_batch_bytes`]) on the stage card alone. Mutant: `describe` without the
+    /// block scratch counts none of the block scores; without `grow_prompt` the card's prompt term
+    /// reads 0, as the logs' `terms` do.
+    #[test]
+    fn the_block_scores_and_the_prompt_batch_are_plan_terms() {
+        let inputs = runnable("mm3-place-scores");
+        let (heads, block) = (inputs.hp.msa.heads as u64, inputs.hp.msa.block as u64);
+        assert_eq!((heads, block), (2, 4));
+        assert_eq!(index_scores_block_bytes(&inputs.hp), 257 * 2 * 4);
+        let mut released = inputs.hp.clone();
+        released.msa.heads = 4;
+        released.msa.block = 128;
+        assert_eq!(index_scores_block_bytes(&released), 4_112);
+        assert_eq!(index_scores_bytes(&released, 1 << 20), 33_685_504);
+        assert_eq!(index_scores_bytes(&released, 1 << 19), 16_842_752);
+        let bare = inputs.kv.clone().with_block_scratch(0, 1);
+        for ctx in [1, 127, 128, 129, 4096, 1 << 20] {
+            assert_eq!(
+                inputs.kv.stage_position_bytes(ctx) - bare.stage_position_bytes(ctx),
+                index_scores_bytes(&inputs.hp, ctx),
+                "ctx {ctx}"
+            );
+            assert_eq!(
+                index_scores_bytes(&inputs.hp, ctx),
+                257 * heads * 4 * ctx.div_ceil(block),
+                "ctx {ctx}"
+            );
+        }
+        let machine = workstation::plan_gate(LAYERS);
+        let plan = inputs
+            .plan(&machine, 64, &PlanLevers::default())
+            .expect("the small header plans");
+        assert_eq!(
+            plan.cards[0].prompt_bytes,
+            inputs.prompt_batch_bytes(&machine).expect("no tier card")
+        );
+        assert!(plan.cards[0].prompt_bytes > 0);
+        assert!(plan.cards[1..].iter().all(|c| c.prompt_bytes == 0));
     }
 }

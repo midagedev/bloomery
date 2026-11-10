@@ -52,8 +52,8 @@ use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::minimaxm3::host as minimax_host;
-use model::arch::minimaxm3::hparams::Attn;
-use model::arch::minimaxm3::place::PlanInputs;
+use model::arch::minimaxm3::hparams::{Attn, Hparams};
+use model::arch::minimaxm3::place::{PlanInputs, index_scores_bytes};
 use model::arch::names;
 use model::embed::EmbedTable;
 use model::placement::Plan;
@@ -65,6 +65,27 @@ use crate::ffn::{CARD, Routed, RoutedDims};
 use crate::step::Kernels;
 use crate::tier;
 use bloomery_gpu_deepseek41::prompt_walk::BatchBufs;
+
+/// Refused by name when the selection's block scores the load made, `made` device bytes, are not
+/// the bytes the plan counts for them at the context, `ctx` positions ([`index_scores_bytes`]):
+/// the plan's flat scratch term holds none of them, so a buffer that grows with the context and is
+/// not in the formula, or a formula that is not the buffers, ends the load here.
+fn refuse_scores_apart(hp: &Hparams, ctx: usize, made: usize) -> Result<(), GpuError> {
+    let counted = index_scores_bytes(hp, ctx as u64);
+    if made as u64 != counted {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "the load's block scores hold {made} device bytes (f32 for each index head over \
+                 the blocks of {ctx} positions, one row on the step's scratch and {} on the \
+                 prompt batch's); the plan counts {counted} \
+                 (`place::index_scores_bytes`)",
+                crate::prefill::T_MAX
+            ),
+        ));
+    }
+    Ok(())
+}
 
 /// What the body's refusals name.
 pub(crate) const WHAT: &str = "minimaxm3 Body";
@@ -614,6 +635,7 @@ impl Body {
             slots_planned: seqs.get(),
             slots_made: 1,
         };
+        refuse_scores_apart(hp, body.dims.ctx, body.scores_bytes())?;
         refuse_scratch_past(
             WHAT,
             plan,
@@ -711,6 +733,14 @@ impl Body {
             + self.rope.table.num_bytes()
             + self.shell.hybrid.boundary().device_bytes()
             + self.slots.buf().num_bytes()
+    }
+
+    /// Device bytes of the selection's block scores, the step's and the prompt batch's: the part of
+    /// the scratch that grows with the context, which the plan counts with the stage's position
+    /// rows ([`index_scores_bytes`]).
+    #[must_use]
+    pub fn scores_bytes(&self) -> usize {
+        self.s.msa.scores.num_bytes() + self.batch.scores_bytes()
     }
 
     /// Device bytes of the prompt batch's buffers beside the scratch term: the rows, the flash's partials

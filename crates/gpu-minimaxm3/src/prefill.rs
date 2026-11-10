@@ -199,8 +199,9 @@ impl Batch {
         })
     }
 
-    /// Device bytes of the selection's block scores: they grow with the context, so the plan's scratch
-    /// term holds them; the rest of the batch is the plan's prompt reserve
+    /// Device bytes of the selection's block scores: they grow with the context, so the plan counts them
+    /// with the stage's position rows ([`place::index_scores_bytes`]); the rest of the batch is the plan's
+    /// prompt reserve
     /// ([`place::prompt_reserve_bytes`]).
     #[must_use]
     pub fn scores_bytes(&self) -> usize {
