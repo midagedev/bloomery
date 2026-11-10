@@ -1826,6 +1826,7 @@ mod tests {
                 keep: CardKeep {
                     margin: margin as u64,
                     budget: None,
+                    opened: None,
                 },
             },
             |b| b,

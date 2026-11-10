@@ -198,14 +198,17 @@ pub fn split(cards: &[ShareCard], experts: u64) -> Vec<u64> {
 }
 
 /// The free bytes a card holds for this process under its plan's `budget`
-/// ([`of`]): the driver's `free` of the card's `total`, or, under a budget, the
-/// budget less what the card already holds (`total − free`) when that is less.
-/// A budget plans a card as if it had only those bytes, so every reading a
-/// margin is kept against reads this figure, never the driver's alone.
+/// ([`of`]): the driver's `free`, or, under a budget, the budget less what this load has
+/// made since its open (`before − free`, `before` the driver's free bytes when the load
+/// opened, the card reading's `before=`) when that is less. What the card held before the
+/// load (the context, other processes) is not the load's to count against the budget, so
+/// the figure is the refusal check's own `budget − made`. A budget plans a card as if it
+/// had only those bytes, so every reading a margin is kept against reads this figure,
+/// never the driver's alone.
 #[must_use]
-pub fn free_under(free: u64, total: u64, budget: Option<u64>) -> u64 {
+pub fn free_under(free: u64, before: u64, budget: Option<u64>) -> u64 {
     budget.map_or(free, |b| {
-        free.min(b.saturating_sub(total.saturating_sub(free)))
+        free.min(b.saturating_sub(before.saturating_sub(free)))
     })
 }
 
@@ -213,8 +216,8 @@ pub fn free_under(free: u64, total: u64, budget: Option<u64>) -> u64 {
 /// the free bytes [`free_under`] reads: a spill room's page past this goes to
 /// the host.
 #[must_use]
-pub fn past_margin(free: u64, total: u64, budget: Option<u64>, margin: u64, page: u64) -> bool {
-    free_under(free, total, budget) < margin.saturating_add(page)
+pub fn past_margin(free: u64, before: u64, budget: Option<u64>, margin: u64, page: u64) -> bool {
+    free_under(free, before, budget) < margin.saturating_add(page)
 }
 
 #[cfg(test)]
@@ -445,31 +448,64 @@ mod tests {
         );
     }
 
-    /// The free bytes under a budget are the budget's remainder, so a margin is kept against
-    /// the budget and not the driver's reading. The numbers are the fixture serve gate's
-    /// elastic refill on a 3090 of 24 GiB under the gate budget of its usable bytes (24,176
-    /// MiB) [derived from that log's settle line, the device total assumed]: 1,122,893,824 B
-    /// free to the budget is 1,542,324,224 B to the driver, so 30 K/V pages of 2 MiB past the
-    /// settle leave the budget under its 1 GiB margin while the driver still reads 387 MiB
-    /// above it.
+    /// Under a budget the free bytes are the budget less what the load made since its open
+    /// (`before − now`), so a margin is kept against the budget and not the driver's reading,
+    /// and what the card held before the load (the context, other processes) is not counted.
+    /// The numbers are the real elastic-fill server on the 3090 (total 25,769,803,776 B, gate
+    /// budget 24,176 MiB = 25,350,373,376 B): `card bytes ... before=25069158400`, and the
+    /// warm settle's `free=1431175168 margin=1073741824`. The load made 23,637,983,232 B, the
+    /// budget leaves 1,712,390,144 B, the driver's 1,431,175,168 B is the lesser, 357,433,344
+    /// B above the margin. The old figure, `budget − (total − free)`, read 1,011,744,768 B, short
+    /// by `total − before` = 700,645,376 B and under the margin: no fill.
     ///
-    /// FAIL-first: a `free_under` that returns `free` (the driver's reading) reds the first
-    /// assertion and lets the page stay on the card in the last.
+    /// FAIL-first: the old formula (`total` in `before`'s place) reads 1,011,744,768 B for the
+    /// first assertion and holds the margin's `!past_margin` false; it reds both.
     #[test]
     fn a_margin_is_kept_against_the_budget_and_not_the_driver() {
         const MIB: u64 = 1 << 20;
-        let (total, budget, margin, page) = (24_576 * MIB, 24_176 * MIB, 1 << 30, 2 * MIB);
-        let settled = 1_122_893_824;
-        let driver = settled + (total - budget);
-        assert_eq!(free_under(driver, total, Some(budget)), settled);
-        assert_eq!(free_under(driver, total, None), driver);
-        assert_eq!(free_under(driver, total, Some(total * 2)), driver);
-        assert_eq!(free_under(0, total, Some(budget)), 0);
-        assert_eq!(free_under(driver, total, Some(0)), 0);
-        assert!(!past_margin(driver, total, Some(budget), margin, page));
-        let grown = driver - 30 * page;
-        assert!(!past_margin(grown, total, None, margin, page));
-        assert!(past_margin(grown, total, Some(budget), margin, page));
+        let (total, before, free) = (25_769_803_776_u64, 25_069_158_400_u64, 1_431_175_168_u64);
+        let (margin, page, budget) = (1 << 30, 2 * MIB, 24_176 * MIB);
+        assert_eq!(free_under(free, before, Some(budget)), free);
+        assert_eq!(free_under(free, total, Some(budget)), 1_011_744_768); // the old figure
+        assert_eq!(free_under(free, before, None), free);
+        assert_eq!(free_under(free, before, Some(budget * 2)), free);
+        assert_eq!(free_under(0, before, Some(budget)), 0);
+        assert_eq!(free_under(free, before, Some(0)), 0);
+        // A load that made more than its budget has nothing left; one whose free grew past
+        // its open (made 0) is bounded by the budget alone.
+        assert_eq!(free_under(free, before, Some((before - free) / 2)), 0);
+        assert_eq!(free_under(before + MIB, before, Some(MIB)), MIB);
+        // The margin is kept against the lesser: 357 MB above it now, past it after the
+        // budget's remainder (1,712,390,144 B) shrinks under it.
+        assert!(!past_margin(free, before, Some(budget), margin, page));
+        assert!(past_margin(free, total, Some(budget), margin, page)); // old: held
+        assert!(past_margin(
+            free - 400 * MIB,
+            before,
+            Some(budget),
+            margin,
+            page
+        ));
+    }
+
+    /// The budget-aware free equals `budget − (before − now)` from a `card bytes` reading's own
+    /// fields: the refusal check's `made`, whatever the card held before the load.
+    ///
+    /// FAIL-first: the old formula reads `total − before` = 700,645,376 B short of it.
+    #[test]
+    fn the_budget_free_is_the_budget_less_what_the_load_made() {
+        let (total, before, now) = (25_769_803_776_u64, 25_069_158_400_u64, 1_658_650_624_u64);
+        let budget = 25_000_000_000_u64;
+        let made = before - now;
+        assert_eq!(
+            free_under(now, before, Some(budget)),
+            now.min(budget - made)
+        );
+        let wide = budget + 2_000_000_000;
+        assert_eq!(free_under(now, before, Some(wide)), now);
+        let tight = made + 1_000;
+        assert_eq!(free_under(now, before, Some(tight)), 1_000);
+        assert_eq!(free_under(now, total, Some(tight)), 0); // the old figure: short
     }
 
     /// A budget reads in bytes in a line: `unset`, or the value and `B`.

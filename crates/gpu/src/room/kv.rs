@@ -53,13 +53,19 @@ impl From<KvBacking> for Backing {
 pub struct CardKeep {
     pub margin: u64,
     pub budget: Option<u64>,
+    /// The card's free bytes when the load opened ([`crate::Gpu::opened_free`], the card
+    /// reading's `before=`): what the budget is counted from. A keep under a budget with none
+    /// is refused by name where it reads the card.
+    pub opened: Option<u64>,
 }
 
 impl CardKeep {
-    /// The keep of `plan`'s `card`: its margin, under the budget the plan's caller gave.
+    /// The keep of `plan`'s `card`: its margin, under the budget the plan's caller gave, counted
+    /// from `opened`, the card's free bytes when the load opened.
     #[must_use]
-    pub fn of(plan: &Plan<'_>, card: &::model::placement::Card) -> CardKeep {
+    pub fn of(plan: &Plan<'_>, card: &::model::placement::Card, opened: Option<u64>) -> CardKeep {
         CardKeep {
+            opened,
             margin: card.margin_bytes,
             budget: if plan.budget_from_pool {
                 None
@@ -79,23 +85,34 @@ impl CardKeep {
         self.free_bound()
     }
 
+    /// The open reading a budgeted keep counts from: `None` with no budget, the reading under
+    /// one, and a refusal by name for a budget with no reading.
+    fn opened_under(self) -> Result<u64, GpuError> {
+        match (self.budget, self.opened) {
+            (None, o) => Ok(o.unwrap_or(0)),
+            (Some(_), Some(o)) => Ok(o),
+            (Some(_), None) => Err(GpuError::state(
+                WHAT,
+                "the card's free bytes at the load's open, which a card budget counts from",
+            )),
+        }
+    }
+
     /// [`CardKeep::free`] on the context already bound to the thread.
     pub(crate) fn free_bound(self) -> Result<u64, GpuError> {
-        let (free, total) = crate::current_mem_info()?;
-        Ok(card_budget::free_under(
-            free as u64,
-            total as u64,
-            self.budget,
-        ))
+        let opened = self.opened_under()?;
+        let (free, _) = crate::current_mem_info()?;
+        Ok(card_budget::free_under(free as u64, opened, self.budget))
     }
 
     /// Whether one more card page of `page` bytes would leave the card under the margin
     /// (`card_budget::past_margin`), on the context already bound to the thread.
     pub(crate) fn past_margin(self, page: u64) -> Result<bool, GpuError> {
-        let (free, total) = crate::current_mem_info()?;
+        let opened = self.opened_under()?;
+        let (free, _) = crate::current_mem_info()?;
         Ok(card_budget::past_margin(
             free as u64,
-            total as u64,
+            opened,
             self.budget,
             self.margin,
             page,
@@ -438,6 +455,7 @@ mod tests {
         let keep = CardKeep {
             margin: 7,
             budget: Some(9),
+            opened: Some(9),
         };
         for word in [KvHost::Off, KvHost::Spill, KvHost::All] {
             assert_eq!(
@@ -549,6 +567,7 @@ mod tests {
                 keep: CardKeep {
                     margin: 50,
                     budget: None,
+                    opened: None,
                 },
                 page: 4,
             }),

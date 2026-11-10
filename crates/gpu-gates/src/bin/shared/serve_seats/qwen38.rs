@@ -1769,15 +1769,27 @@ struct ElasticTerms {
     budget: Option<u64>,
 }
 
-/// The card's free bytes now, the engine stream drained first — under a budget, the budget's
-/// remainder when that is less (`card_budget::free_under`, the figure the K/V rooms keep the
-/// margin against too).
+/// The card's free bytes now, the engine stream drained first — under a budget, the budget
+/// less what the load made since its open (`card_budget::free_under` from the open reading,
+/// the figure the K/V rooms keep the margin against too) when that is less. A budget with no
+/// open reading is refused by name.
 fn card_free(gpu: &Gpu, terms: ElasticTerms) -> Result<u64, GateError> {
     gpu.stream().synchronize()?;
-    let (free, total) = gpu.mem_info()?;
+    let (free, _) = gpu.mem_info()?;
+    let opened = match (terms.budget, gpu.opened_free()) {
+        (None, o) => o.unwrap_or(0),
+        (Some(_), Some(o)) => o,
+        (Some(_), None) => {
+            return Err(
+                "the elastic settle's card budget needs the card's free bytes at the \
+                        load's open, and this device has none"
+                    .into(),
+            );
+        }
+    };
     Ok(model::placement::card_budget::free_under(
         free as u64,
-        total as u64,
+        opened,
         terms.budget,
     ))
 }

@@ -1016,7 +1016,9 @@ impl Body {
                     .machine
                     .cards
                     .get(*card)
-                    .map_or_else(CardKeep::default, |c| CardKeep::of(open.plan, c)),
+                    .map_or_else(CardKeep::default, |c| {
+                        CardKeep::of(open.plan, c, gpu.opened_free())
+                    }),
             },
         );
         let kd = kda::dims(&hp)?;

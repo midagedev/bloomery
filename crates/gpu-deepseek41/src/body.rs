@@ -3230,7 +3230,7 @@ impl Body {
             kv: (
                 KvLayout::from_file(file, hp).map_err(|e| GpuError::plan(WHAT, e))?,
                 plan.kv_host,
-                CardKeep::of(plan, &plan.machine.cards[card]),
+                CardKeep::of(plan, &plan.machine.cards[card], gpu.opened_free()),
             ),
         };
         Body::assemble(

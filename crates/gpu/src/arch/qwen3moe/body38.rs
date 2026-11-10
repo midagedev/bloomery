@@ -1957,7 +1957,9 @@ impl Body38 {
         let stage = plan.machine.cards.first();
         let kv_levers = KvLevers {
             word: plan.kv_host,
-            keep: stage.map_or_else(CardKeep::default, |c| CardKeep::of(plan, c)),
+            keep: stage.map_or_else(CardKeep::default, |c| {
+                CardKeep::of(plan, c, gpu.opened_free())
+            }),
         };
         let card_page = stage.map_or(0, |c| c.granule_bytes.get());
         let handle = gpu.stream_handle();
