@@ -3164,25 +3164,74 @@ mod gate {
         levers: &bloomery_levers::Levers,
     ) -> Result<bool, GateError> {
         let mut ok = true;
-        let e = fill_run(dir, "elastic-fill", elastic_cmd(levers, true)?)?;
-        let st = fill_run(dir, "elastic-fill-static", elastic_cmd(levers, false)?)?;
-        let fill = e
-            .log
-            .all(&record::ELASTIC_FILL)?
-            .into_iter()
-            .find(|f| matches!(f.word("site"), Ok("warm")));
+        let warm_fill = |log: &record::Log| -> Result<Option<record::Fields>, GateError> {
+            Ok(log
+                .all(&record::ELASTIC_FILL)?
+                .into_iter()
+                .find(|f| matches!(f.word("site"), Ok("warm"))))
+        };
+        let mut e = fill_run(dir, "elastic-fill", elastic_cmd(levers, true)?)?;
+        let mut fill_dir = "elastic-fill";
+        let mut fill = warm_fill(&e.log)?;
+        let mut room_cap = None::<u64>;
+        // A plan fills its card to the margin by design, so a card whose quantum (one slot on
+        // every layer) is larger than the plan's slack above the margin never fills: a fill
+        // needs three quanta above it ([`FILL_KEEP_QUANTA`] kept, one filled). The clause's
+        // premise is that room, so a server that held for it is run again on a plan of
+        // `FILL_KEEP_QUANTA + 1` quanta fewer card experts: the spread takes experts from the
+        // layer with the most, so that many quanta is that many slots on every layer, and their
+        // stack bytes are the three quanta the fill needs, from the plan's own count.
+        if fill.is_none()
+            && record_line(&dir.join(fill_dir).join("server.err"), "elastic held")?
+                .is_some_and(|l| l.contains("no quantum past the keep"))
+        {
+            let layers = {
+                let path = ref_model_path()?;
+                let split =
+                    Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
+                split
+                    .arch_get_u64("block_count")
+                    .ok_or("elastic-fill: the model file names no block_count")?
+            };
+            let planned = plan_card_experts(&e.log)?
+                .ok_or("elastic-fill: the elastic server printed no plan to cap at")?;
+            let quanta = model::placement::elastic::FILL_KEEP_QUANTA + 1;
+            let cap = planned.checked_sub(quanta * layers).ok_or_else(|| {
+                format!(
+                    "elastic-fill: the plan holds {planned} card experts, fewer than the \
+                     {quanta} quanta of {layers} layers a fill needs above the margin"
+                )
+            })?;
+            println!(
+                "elastic-fill: the plan's {planned} card experts leave no room for a fill; \
+                 capped at {cap} ({quanta} quanta of {layers} slots fewer)"
+            );
+            room_cap = Some(cap);
+            fill_dir = "elastic-fill-room";
+            let mut cmd = elastic_cmd(levers, true)?;
+            cmd.env(bloomery_levers::CARD_EXPERTS_CAP, cap.to_string());
+            e = fill_run(dir, fill_dir, cmd)?;
+            fill = warm_fill(&e.log)?;
+        }
+        let static_name = if room_cap.is_some() {
+            "elastic-fill-room-static"
+        } else {
+            "elastic-fill-static"
+        };
+        let mut static_cmd = elastic_cmd(levers, false)?;
+        if let Some(cap) = room_cap {
+            static_cmd.env(bloomery_levers::CARD_EXPERTS_CAP, cap.to_string());
+        }
+        let st = fill_run(dir, static_name, static_cmd)?;
         let Some(fill) = fill else {
             println!(
                 "elastic-fill: the warm settle did not fill ({}); a fill is what the clause reads",
-                record_line(
-                    &dir.join("elastic-fill").join("server.err"),
-                    "elastic give-back"
-                )?
-                .or(record_line(
-                    &dir.join("elastic-fill").join("server.err"),
-                    "elastic held"
-                )?)
-                .unwrap_or_else(|| "no settle record".to_owned())
+                record_line(&dir.join(fill_dir).join("server.err"), "elastic give-back")?
+                    .or(record_line(
+                        &dir.join(fill_dir).join("server.err"),
+                        "elastic held"
+                    )?)
+                    .unwrap_or_else(|| "no settle record".to_owned())
             );
             check(&mut ok, ELASTIC_FILL_ROUTED, false);
             check(&mut ok, ELASTIC_FILL_EQUAL, false);
@@ -6734,9 +6783,14 @@ mod gate {
     /// the slots are erased: the lookup follows the sequence, not its slot,
     /// and a moved restore gives the ids its own slot's re-run gave.
     /// The lookup server's ids are the draft-off server's, sampled requests
-    /// included: the lookup takes no card bytes, so both load one plan, and
-    /// a seeded draw from a verified row is the draw from that position's
-    /// step.
+    /// included, and a seeded draw from a verified row is the draw from that
+    /// position's step. The two load one card set by construction: the lookup
+    /// load reserves its verify passes' graphs before its experts
+    /// (`placement::graphs`), so its plan holds fewer card experts than the
+    /// off load's budget alone would; the lookup server runs first and the
+    /// off server is capped at the card experts its plan printed
+    /// (`BLOOMERY_CARD_EXPERTS_CAP`; the spread's prefixes are a function of
+    /// the total), so a moved expert never computes on the other device.
     fn lookup_main(dir: &Path, prompt: &str, reference: &[u32]) -> Result<bool, GateError> {
         let code = format!(
             "{}def add_12(a, b):\n",
@@ -6752,8 +6806,10 @@ mod gate {
         let mut args = SERVER_ARGS.to_vec();
         args[11] = "2";
         let mut plain = Vec::<LookupCompletion>::new();
+        let mut looked = Vec::<LookupCompletion>::new();
+        let mut lookup_experts = None::<u64>;
         let mut ok = true;
-        for draft in ["off", "lookup"] {
+        for draft in ["lookup", "off"] {
             let own = dir.join(draft);
             std::fs::create_dir_all(&own)?;
             let err_log = own.join("server.err");
@@ -6763,9 +6819,19 @@ mod gate {
                 .env_remove(bloomery_levers::MTP_WIDTH);
             if draft == "lookup" {
                 cmd.env(bloomery_levers::MTP_WIDTH, "fixed");
+            } else {
+                let cap = lookup_experts
+                    .ok_or("lookup: the lookup server printed no plan to cap the off server at")?;
+                println!(
+                    "lookup: the off server's card experts capped at {cap}, the lookup plan's"
+                );
+                cmd.env(bloomery_levers::CARD_EXPERTS_CAP, cap.to_string());
             }
             let mut served = Served38::spawn_with(&args, &own, &mut cmd)?;
             let addr = served.address(&err_log, POLLS, POLL)?;
+            if draft == "lookup" {
+                lookup_experts = plan_card_experts(&seat_log(&err_log)?)?;
+            }
             let url = |p: &str| format!("http://{addr}{p}");
             let mut answers = Vec::<LookupCompletion>::new();
             let mut proposed = 0_u64;
@@ -6841,12 +6907,14 @@ mod gate {
                     );
                 }
                 let (d, a) = (answer.proposed, answer.accepted);
-                if draft == "lookup" {
+                if draft == "off" {
                     check(
                         &mut ok,
                         &format!("lookup_{i}_ids_are_draft_off"),
-                        answer.tokens == plain[i].tokens,
+                        answer.tokens == looked[i].tokens,
                     );
+                }
+                if draft == "lookup" {
                     if i > 0 {
                         // The draft proposes only where the text repeats an n-gram of its own: the
                         // fixture's random-weight target writes none, so the file answers it.
@@ -6903,6 +6971,7 @@ mod gate {
                         accepted > 0 && proposed > accepted,
                     );
                 }
+                looked = answers;
             } else {
                 plain = answers;
             }
