@@ -23,6 +23,7 @@ use crate::arch::names::routed_stacks;
 use crate::arch::place_hybrid;
 use crate::placement::accepts::{Program, leg_runs, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::heads::{HeadLayout, model_row_heads};
 use crate::placement::kernels::{self, DownAct, DownEntry, DownForms, GateUpEntry, q8_act_bytes};
 use crate::placement::parts::{Part, Parts};
 use crate::placement::workstation::{self, GRANULE, HostRead, TierBatchBytes};
@@ -540,6 +541,26 @@ pub fn prompt_reserve_bytes(inputs: &PlanInputs, ctx_max: u64, tiered: bool) -> 
     prompt_parts(inputs, ctx_max, tiered).bytes()
 }
 
+/// The most rows one load of the body holds in flight, and so the widest pass it writes heads
+/// for: a verify's two (a row a lane), a plain pass's two (a row a slot) and a NextN load's
+/// drafted pass's four (the card body's `LOAD_ROWS`).
+pub const LOAD_ROWS: usize = 4;
+
+/// The heads a load's passes of up to `rows` rows (capped at [`LOAD_ROWS`]) make past the load's
+/// own on stage card `card` ([`model_row_heads`]: the body writes a head a row, under its RMS
+/// final norm), in the card's allocator's bytes: the plan holds them in the card's prompt term
+/// beside the prompt batch. A verify writes a row a lane, a pass of the slots a row a slot and a
+/// NextN load's drafted pass two a slot.
+pub fn pass_heads_bytes(inputs: &PlanInputs, card: &Card, rows: usize) -> Result<u64, PlaceError> {
+    let parts = model_row_heads(
+        &inputs.model,
+        true,
+        HeadLayout::PerRow,
+        1..=rows.min(LOAD_ROWS),
+    )?;
+    Ok(parts.card_bytes(card.granule_bytes))
+}
+
 /// What a plan of a glm5next file is made from, read from its headers.
 #[derive(Debug)]
 pub struct PlanInputs {
@@ -903,7 +924,12 @@ impl PlanInputs {
         let terms = self.seq_terms(&kv, None);
         let n = slots as u64;
         let beside = terms.plan_beside(n);
-        let front = prompt_reserve_bytes(self, ctx_max, machine.expert_tiers().next().is_some());
+        let heads = match machine.cards.first() {
+            Some(card) => pass_heads_bytes(self, card, lanes.count().max(slots))?,
+            None => 0,
+        };
+        let front =
+            prompt_reserve_bytes(self, ctx_max, machine.expert_tiers().next().is_some()) + heads;
         let plan = placement::plan_in_pool(machine, levers, |levers| {
             let mut plan = placement::nodes::loaded_routed(
                 &self.model,
@@ -1267,7 +1293,8 @@ impl PlanInputs {
             &PlanLevers::default(),
         )?;
         let arena = NEXTN_ARENA_BYTES;
-        let front = prompt_reserve_bytes(self, ctx_max, machine.expert_tiers().next().is_some());
+        let front = prompt_reserve_bytes(self, ctx_max, machine.expert_tiers().next().is_some())
+            + pass_heads_bytes(self, card, 2 * slots)?;
         let nextn_card = nextn_card_bytes(&draft.cards[0]);
         let reserve = (nextn_card + arena + front).saturating_add(beside);
         // The draft layer's routed experts are the host's beside the trunk's,
@@ -1830,13 +1857,14 @@ mod tests {
 
         use super::super::super::hparams::{Hc, Hparams, Indexer};
         use super::super::{
-            DenseForms, KdaLanes, Kind, KvLayout, MixerForms, NextnInputs, NextnKv, PROMPT_ATTN,
-            PROMPT_GROUP, PROMPT_REST, PROMPT_UNITS, PlaceError, PlanInputs, card_leg_bytes,
-            card_leg_forms, card_tile_bytes, group_sets, prompt_attn_bytes, prompt_cols,
-            prompt_front_bytes, prompt_leg_forms, prompt_parts, prompt_reserve_bytes,
-            prompt_shared_bytes, prompt_units, row_bytes, unit_bytes,
+            DenseForms, KdaLanes, Kind, KvLayout, LOAD_ROWS, MixerForms, NextnInputs, NextnKv,
+            PROMPT_ATTN, PROMPT_GROUP, PROMPT_REST, PROMPT_UNITS, PlaceError, PlanInputs,
+            card_leg_bytes, card_leg_forms, card_tile_bytes, group_sets, pass_heads_bytes,
+            prompt_attn_bytes, prompt_cols, prompt_front_bytes, prompt_leg_forms, prompt_parts,
+            prompt_reserve_bytes, prompt_shared_bytes, prompt_units, row_bytes, unit_bytes,
         };
         use crate::placement::churn::ChurnPool;
+        use crate::placement::heads::{HeadLayout, model_row_heads};
         use crate::placement::workstation::{HostNeed, HostRead};
         use crate::placement::{
             Card, Host, Machine, ModelTensor, ModelTensors, Node, PlacementError, Plan, PlanLevers,
@@ -1992,9 +2020,11 @@ mod tests {
         fn inputs() -> PlanInputs {
             let hp = hparams();
             let kv = KvLayout::of(&hp);
+            let mut model = norms(LAYERS);
+            model.tensors.push(head_tensor(256));
             PlanInputs {
                 hp,
-                model: norms(LAYERS),
+                model,
                 spec: ModelSpec {
                     arch: Arch::Glm5Next,
                     hidden: 4096,
@@ -2017,6 +2047,21 @@ mod tests {
                 kv,
                 room: (u64::MAX, HostRead::Given),
                 arena: None,
+            }
+        }
+
+        /// A head of `vocab` rows over 4,096 values in Q8_0's blocks: what the passes' heads
+        /// ([`pass_heads_bytes`]) are counted from.
+        fn head_tensor(vocab: u64) -> ModelTensor {
+            ModelTensor {
+                name: "output.weight".to_string(),
+                shard: 0,
+                layer: None,
+                role: Role::Head,
+                ty: GgmlType::Q8_0,
+                dims: vec![4096, vocab],
+                file_bytes: 4096 / 32 * 34 * vocab,
+                gathered_rows: None,
             }
         }
 
@@ -2529,6 +2574,59 @@ mod tests {
             )
         }
 
+        /// The heads a load's passes make past the load's own are in the stage card's prompt
+        /// term beside the prompt batch, at GLM's vocabulary (151,552 rows of 4,096 values in
+        /// Q8_0's blocks, a head a row under the RMS norm: 638,988 B a one-row head) on a 2 MiB
+        /// granule: none for one sequence of one lane; one shared granule for a verify's second
+        /// row, for two slots' rows and for a NextN load's four rows of two slots (three heads,
+        /// 1,918,464 B with their small buffers' rounding), and no more past the body's
+        /// [`LOAD_ROWS`]. The prompt term is the batch's plus
+        /// exactly that; one sequence of one lane adds nothing, so its front, and with it its
+        /// experts and every term, is the plan's before the heads. FAIL-first: the plan counted
+        /// no row head past the load's own.
+        #[test]
+        fn the_passes_heads_are_in_the_prompt_term() {
+            const MIB: u64 = 1 << 20;
+            let mut inputs = inputs();
+            inputs.model.tensors.retain(|t| t.role != Role::Head);
+            inputs.model.tensors.push(head_tensor(151_552));
+            let (machine, nextn) = (machine(LAYERS), nextn());
+            let levers = PlanLevers::default();
+            let front = prompt_reserve_bytes(&inputs, CTX, false);
+            let heads = |p: &Plan<'_>| p.cards[0].prompt_bytes - front;
+            for (lanes, slots, want) in [
+                (KdaLanes::One, 1, 0),
+                (KdaLanes::Two, 1, 2 * MIB),
+                (KdaLanes::One, 2, 2 * MIB),
+            ] {
+                let plan = inputs
+                    .plan_slots(&machine, CTX, &levers, lanes, slots)
+                    .expect("the plan");
+                assert_eq!(heads(&plan), want, "{lanes:?}, {slots} slot(s)");
+            }
+            let with = inputs
+                .plan_nextn_slots(&machine, CTX, &levers, &nextn, 2)
+                .expect("the plan with the next-token layer");
+            assert_eq!(
+                heads(&with.plan),
+                2 * MIB,
+                "two slots with the next-token layer"
+            );
+            let one =
+                model_row_heads(&inputs.model, true, HeadLayout::PerRow, 1..=2).expect("a head");
+            assert_eq!(one.bytes(), 638_988);
+            let three =
+                model_row_heads(&inputs.model, true, HeadLayout::PerRow, 1..=4).expect("a head");
+            assert_eq!(three.bytes(), 3 * 638_988);
+            // Past the body's rows in flight the count stays at its three heads.
+            let card = &machine.cards[0];
+            let widest = pass_heads_bytes(&inputs, card, LOAD_ROWS).expect("the heads");
+            assert_eq!(
+                pass_heads_bytes(&inputs, card, 16).expect("the heads"),
+                widest
+            );
+        }
+
         /// The stage card's headroom past the bytes beside every slot's
         /// stores, which the plans add to its kv class after the totals, is
         /// its usable bytes less every term: on the plain plan and on the
@@ -2595,6 +2693,10 @@ mod tests {
                     other => panic!("{at}, a pool one byte under the need: {other:?}"),
                 }
             };
+            let card = &unified(ample).cards[0];
+            // The prompt term: the front and the passes' heads, a row a slot on the plain
+            // plan, two a slot on the plan with the next-token layer.
+            let front = |rows| front + pass_heads_bytes(&inputs, card, rows).expect("the heads");
             for n in [1, 2] {
                 check(
                     &format!("{n} slot(s)"),
@@ -2608,7 +2710,7 @@ mod tests {
                                 )
                             })
                     },
-                    front,
+                    front(n),
                 );
                 let on = unified(ample);
                 let with = inputs
@@ -2620,7 +2722,7 @@ mod tests {
                 );
                 let beside = with.nextn_card_bytes()
                     + with.arena_bytes
-                    + front
+                    + front(2 * n)
                     + with.nextn.host.expert_bytes;
                 check(
                     &format!("{n} slot(s) with the next-token layer"),

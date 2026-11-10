@@ -59,6 +59,8 @@ use crate::placement::accepts::{
 };
 use crate::placement::ctx::{CtxLimit, PastLimit, check_slot_ctx};
 use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::heads::{HeadLayout, model_row_heads};
+use crate::placement::parts::Parts;
 use crate::placement::workstation::{
     self, A6000, CardSpec, GRANULE, HostRead, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
     TierBatchBytes, tier_batch_host_bytes, tier_batch_staging_bytes,
@@ -66,7 +68,7 @@ use crate::placement::workstation::{
 use crate::placement::{
     self, Card, CardFormat, Device, ExpertList, Format, Host, KvBytes, Machine, ModelTensor,
     ModelTensors, Node, PlacementError, Plan, PlanLevers, RoutedRule, Unimplemented, Violation,
-    checked, joined, kernels,
+    checked, checked_beside, joined, kernels,
 };
 use gguf::digest::hex;
 
@@ -323,6 +325,17 @@ pub enum PlaceError {
     /// A plan of no resident sequence slot.
     #[error("{slots} resident sequence slots: a plan serves at least one")]
     Slots { slots: usize },
+    /// The heads a load's passes make do not fit beside the stage card's other terms.
+    #[error(
+        "card {card}: the passes' heads take {heads} B and {left} B are left beside the plan's \
+         other terms ({short} B short)"
+    )]
+    PassHeadsOver {
+        card: String,
+        heads: u64,
+        left: u64,
+        short: u64,
+    },
     /// A target matrix an MTP draft file borrows ([`PlanInputs::mtp_borrows`])
     /// absent, or in another format than the one the draft's program reads.
     #[error(
@@ -859,20 +872,78 @@ impl PlanInputs {
         let terms = self.seq_terms(None);
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
+        let heads = self.pass_heads_bytes(machine, slots, false)?;
         let mut plan = self.target_of(
             machine,
             (ctx_max, ubatch),
             levers,
             experts,
-            Beside::reserve(rows).slots(slots),
+            Beside::reserve(rows + heads).slots(slots),
             &kv,
         )?;
         // The bytes a sequence holds beside its stores ride the card's kv
-        // class, out of the budget `rows` reserved above, so
-        // [`Plan::violations`] holds the card's bound against them.
+        // class, and the passes' heads its prompt term, out of the budget
+        // reserved above, so [`Plan::violations`] holds the card's bound
+        // against them.
         plan.cards[0].grow_kv(rows);
+        plan.cards[0].grow_prompt(heads);
+        Self::refuse_heads(&plan, heads)?;
         self.grow_ring(&mut plan, ubatch, 0)?;
-        checked(plan).map_err(PlaceError::Broken)
+        checked_beside(plan, heads).map_err(PlaceError::Broken)
+    }
+
+    /// The heads a load of `slots` resident sequences makes after it opened, `drafted` when it
+    /// verifies a draft's rows ([`row_heads`]; Body38's rows share one head a pass): with several
+    /// slots, a head of every row count up to [`PASS_ROWS`], the widest pass of the busy slots'
+    /// rows (a plain load's rounds reach fewer, a slot a row; its plan carries no draft input, so
+    /// a lookup draft's windows are held by the same bound); with one drafted slot its verify
+    /// passes' heads of 2 to [`DELTA_VERIFY_ROWS`] rows; none for one plain slot. Body38's final
+    /// norm is the hyper-connection head's mix, which writes no normed rows of its own.
+    pub fn pass_heads(&self, slots: usize, drafted: bool) -> Result<Parts, PlaceError> {
+        let rows = match (slots, drafted) {
+            (0 | 1, false) => return Ok(Parts::default()),
+            (0 | 1, true) => 2..=DELTA_VERIFY_ROWS,
+            _ => 1..=PASS_ROWS,
+        };
+        Ok(model_row_heads(&self.model, false, HeadLayout::One, rows)?)
+    }
+
+    /// [`PlanInputs::pass_heads`]'s card bytes on `machine`'s stage card: the term its plan
+    /// reserves before the experts and counts in the card's prompt term.
+    fn pass_heads_bytes(
+        &self,
+        machine: &Machine,
+        slots: usize,
+        drafted: bool,
+    ) -> Result<u64, PlaceError> {
+        let Some(card) = machine.cards.first() else {
+            return Ok(0);
+        };
+        Ok(self
+            .pass_heads(slots, drafted)?
+            .card_bytes(card.granule_bytes))
+    }
+
+    /// Refused by name ([`PlaceError::PassHeadsOver`]) when the passes' heads, `heads` bytes
+    /// counted in stage card 0's prompt term, do not fit beside its other terms under its usable
+    /// bytes less its margin.
+    fn refuse_heads(plan: &Plan<'_>, heads: u64) -> Result<(), PlaceError> {
+        let (Some(card), Some(t)) = (plan.machine.cards.first(), plan.cards.first()) else {
+            return Ok(());
+        };
+        let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
+        place_hybrid::refuse_reserve(
+            card,
+            t.bytes() - heads,
+            limit,
+            heads,
+            |card, heads, left, short| PlaceError::PassHeadsOver {
+                card,
+                heads,
+                left,
+                short,
+            },
+        )
     }
 
     /// What one resident sequence of a load of the file holds on its card
@@ -1160,17 +1231,20 @@ impl PlanInputs {
         };
         let (draft, reserve) = mtp.draft_plan_at(ctx_max, store)?;
         let arena = mtp.arena_bytes_at(store);
+        let heads = self.pass_heads_bytes(machine, 1, true)?;
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
-            let plan = self.target(
+            let mut plan = self.target(
                 machine,
                 (ctx_max, ubatch),
                 levers,
                 experts,
-                Beside::draft(0, mtp),
+                Beside::draft(heads, mtp),
             )?;
+            plan.cards[0].grow_prompt(heads);
+            Self::refuse_heads(&plan, heads)?;
             let broken: Vec<Violation> = plan
-                .violations()
+                .violations_beside(heads)
                 .into_iter()
                 .chain(draft.violations())
                 .collect();
@@ -1193,8 +1267,9 @@ impl PlanInputs {
             (ctx_max, ubatch),
             levers,
             experts,
-            Beside::draft(reserve, mtp),
+            Beside::draft(reserve + heads, mtp),
         )?;
+        plan.cards[0].grow_prompt(heads);
         self.grow_ring(&mut plan, ubatch, reserve)?;
         let t = &plan.cards[0];
         // The draft's term is the reserve the expert rule spread within, so
@@ -1209,7 +1284,7 @@ impl PlanInputs {
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
-            .violations_beside(reserve)
+            .violations_beside(reserve + heads)
             .into_iter()
             .filter(|v| !matches!(v, Violation::CardOver { .. }))
             .chain(draft.violations())
@@ -1297,6 +1372,7 @@ impl PlanInputs {
         let terms = self.seq_terms(Some(mtp));
         let rows = terms.plan_beside(slots as u64);
         let kv = terms.slots_of(slots as u64);
+        let heads = self.pass_heads_bytes(machine, slots, true)?;
         if !machine.tiers.is_empty() {
             check_draft_reserve(machine, Some(reserve))?;
             let mut plan = self.target_of(
@@ -1304,12 +1380,14 @@ impl PlanInputs {
                 (ctx_max, ubatch),
                 levers,
                 experts,
-                Beside::draft(rows, mtp).slots(slots),
+                Beside::draft(rows + heads, mtp).slots(slots),
                 &kv,
             )?;
             plan.cards[0].grow_kv(rows);
+            plan.cards[0].grow_prompt(heads);
+            Self::refuse_heads(&plan, heads)?;
             let broken: Vec<Violation> = plan
-                .violations()
+                .violations_beside(heads)
                 .into_iter()
                 .chain(draft.violations())
                 .collect();
@@ -1332,10 +1410,11 @@ impl PlanInputs {
             (ctx_max, ubatch),
             levers,
             experts,
-            Beside::draft(reserve + rows, mtp).slots(slots),
+            Beside::draft(reserve + rows + heads, mtp).slots(slots),
             &kv,
         )?;
         plan.cards[0].grow_kv(rows);
+        plan.cards[0].grow_prompt(heads);
         self.grow_ring(&mut plan, ubatch, reserve)?;
         let t = &plan.cards[0];
         // As in [`PlanInputs::plan_mtp_with`]: the draft's term is the
@@ -1350,7 +1429,7 @@ impl PlanInputs {
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let mut broken: Vec<Violation> = plan
-            .violations_beside(reserve)
+            .violations_beside(reserve + heads)
             .into_iter()
             .filter(|v| !matches!(v, Violation::CardOver { .. }))
             .chain(draft.violations())
@@ -3715,6 +3794,10 @@ mod tests {
                     // The query projection writes each of the 4 heads' 16
                     // values and its gate beside them.
                     (n, vec![64, 128], Ty::F32)
+                } else if n == "output.weight" {
+                    // A head a card head reads, whose passes' heads a plan of
+                    // two slots counts.
+                    (n, vec![64, 20], Ty::Q8_0)
                 } else {
                     (n, d, Ty::F32)
                 }
@@ -5354,7 +5437,22 @@ mod tests {
             }
         }
 
-        /// The plan's inputs: a norm a layer for the tensors, and the file's
+        /// A head of 256 rows over 2,560 values in Q8_0's blocks: what the passes' heads
+        /// ([`PlanInputs::pass_heads`]) are counted from.
+        fn head_tensor() -> ModelTensor {
+            ModelTensor {
+                name: "output.weight".to_string(),
+                shard: 0,
+                layer: None,
+                role: Role::Head,
+                ty: GgmlType::Q8_0,
+                dims: vec![2560, 256],
+                file_bytes: 2560 / 32 * 34 * 256,
+                gathered_rows: None,
+            }
+        }
+
+        /// The plan's inputs: a norm a layer and the head for the tensors, and the file's
         /// description ([`description`]).
         fn inputs() -> PlanInputs {
             let spec = description();
@@ -5370,6 +5468,7 @@ mod tests {
                     file_bytes: 2560 * 4,
                     gathered_rows: None,
                 })
+                .chain([head_tensor()])
                 .collect();
             PlanInputs {
                 model: ModelTensors {
@@ -5673,14 +5772,19 @@ mod tests {
         }
 
         /// The target's plan of `slots` slots: each layer's bytes times the
-        /// slots, and the bytes beside the stores of every slot past the
-        /// first reserved with `reserve` and in the card's kv class.
+        /// slots, the bytes beside the stores of every slot past the first
+        /// reserved with `reserve` and in the card's kv class, and the
+        /// passes' heads of a load `drafted` or not reserved with them and in
+        /// the card's prompt term.
         fn target<'a>(
             inputs: &'a PlanInputs,
             machine: &'a Machine,
-            slots: u64,
+            (slots, drafted): (u64, bool),
             reserve: u64,
         ) -> Plan<'a> {
+            let heads = inputs
+                .pass_heads_bytes(machine, slots as usize, drafted)
+                .expect("the passes' heads");
             let rows = (slot_resident_bytes(&inputs.spec) + 120) * (slots - 1);
             let kv = Times {
                 kv: &inputs.kv,
@@ -5695,11 +5799,12 @@ mod tests {
                     (CTX, UBATCH_PLANNED),
                     &levers,
                     Experts::Host,
-                    Beside::reserve(reserve + rows).slots(slots as usize),
+                    Beside::reserve(reserve + rows + heads).slots(slots as usize),
                     &kv,
                 )
                 .expect("the target's plan");
             plan.cards[0].grow_kv(rows);
+            plan.cards[0].grow_prompt(heads);
             plan
         }
 
@@ -5774,7 +5879,7 @@ mod tests {
                         n,
                     )
                     .expect("the plan");
-                let want = target(&inputs, &machine, slots, 0);
+                let want = target(&inputs, &machine, (slots, false), 0);
                 assert_eq!(view(&plain), view(&want), "{n} slots");
                 let got = inputs
                     .plan_target(
@@ -5804,7 +5909,7 @@ mod tests {
                     .expect("the drafted plan");
                 let (draft_want, reserve) = draft_of(&mtp, slots, drafted.store);
                 assert_eq!(view(&drafted.draft), view(&draft_want), "{n} slots");
-                let mut want = target(&inputs, &machine, slots, reserve);
+                let mut want = target(&inputs, &machine, (slots, true), reserve);
                 want.host.arena_columns = columns;
                 assert_eq!(view(&drafted.plan), view(&want), "{n} slots");
                 let got = inputs
@@ -5842,7 +5947,8 @@ mod tests {
                 + t.stage_rows_bytes
                 + t.scratch_bytes
                 + t.context_bytes
-                + t.reserve_bytes;
+                + t.reserve_bytes
+                + t.prompt_bytes;
             (
                 t.headroom_bytes,
                 i128::from(p.usable_bytes(&p.machine.cards[0])) - i128::from(terms),
@@ -6031,6 +6137,79 @@ mod tests {
                     "{n} slots"
                 );
             }
+        }
+
+        /// The heads a load's passes make after it opened are the stage card's prompt term, out
+        /// of the expert budget, at Qwen3.8's head (248,320 rows of 2,560 values in Q8_0's
+        /// blocks) on a 2 MiB granule: 40 MiB for two or four slots, plain or drafted (every head
+        /// of 1 to 8 rows, the widest pass's bound); 10 MiB for one drafted slot (its verify heads
+        /// of 2 to 4 rows: the 3- and 4-row logits two granules each, the rest one shared); none
+        /// for one plain slot (`plan_with`, untouched). The plan of two plain slots without them
+        /// plus them is the plan: the same rows and every other term, its headroom less them.
+        /// FAIL-first: the plan counted no head past the load's own.
+        #[test]
+        fn the_passes_heads_are_the_prompt_term() {
+            const MIB: u64 = 1 << 20;
+            let mut inputs = inputs();
+            inputs.model.tensors.retain(|t| t.role != Role::Head);
+            let mut head = head_tensor();
+            head.dims = vec![2560, 248_320];
+            head.file_bytes = 2560 / 32 * 34 * 248_320;
+            inputs.model.tensors.push(head);
+            let machine = machine();
+            let mtp =
+                MtpInputs::from_parts(draft(HeadSet::Full), &file()).expect("the draft's inputs");
+            let levers = PlanLevers::default();
+            let shape = (CTX, UBATCH_PLANNED.min(CTX));
+            let prompt = |p: &Plan<'_>| p.cards[0].prompt_bytes;
+            let plain = |n| {
+                inputs
+                    .plan_with_slots(&machine, shape, &levers, Experts::Host, n)
+                    .expect("the plain plan")
+            };
+            let drafted = |n| {
+                inputs
+                    .plan_mtp_with_slots(&machine, shape, &levers, &mtp, Experts::Host, n)
+                    .expect("the drafted plan")
+            };
+            // One plain slot makes no head past the load's, and its plan is `plan_with`'s.
+            assert!(
+                inputs
+                    .pass_heads(1, false)
+                    .expect("none")
+                    .parts()
+                    .is_empty()
+            );
+            let one = inputs
+                .plan_with(&machine, shape, &levers, Experts::Host)
+                .expect("the one-slot plan");
+            assert_eq!(view(&plain(1)), view(&one), "one plain slot");
+            assert_eq!(prompt(&plain(1)), 0, "one plain slot");
+            assert_eq!(prompt(&drafted(1).plan), 10 * MIB, "one drafted slot");
+            for n in [2, 4] {
+                assert_eq!(prompt(&plain(n)), 40 * MIB, "{n} plain slots");
+                assert_eq!(prompt(&drafted(n).plan), 40 * MIB, "{n} drafted slots");
+            }
+            // The plan of two plain slots without the heads (its slots' terms alone) plus the
+            // heads is the plan: the same rows and every other term, the prompt term the heads
+            // and the headroom less them.
+            let terms = inputs.seq_terms(None);
+            let rows = terms.plan_beside(2);
+            let mut old = inputs
+                .target_of(
+                    &machine,
+                    shape,
+                    &levers,
+                    Experts::Host,
+                    Beside::reserve(rows).slots(2),
+                    &terms.slots_of(2),
+                )
+                .expect("the plan without the heads");
+            old.cards[0].grow_kv(rows);
+            let new = plain(2);
+            assert_eq!(new.cards[0].bytes() - old.cards[0].bytes(), 40 * MIB);
+            old.cards[0].grow_prompt(40 * MIB);
+            assert_eq!(view(&old), view(&new));
         }
 
         /// The stage card's headroom past the bytes a plan of several slots
@@ -6467,6 +6646,7 @@ mod tests {
             };
             let with = |embd: Option<GgmlType>, out: Option<GgmlType>| {
                 let mut i = inputs();
+                i.model.tensors.retain(|t| t.role != Role::Head);
                 i.model.tensors.extend(
                     [("token_embd.weight", embd), ("output.weight", out)]
                         .into_iter()

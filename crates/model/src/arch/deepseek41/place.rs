@@ -25,6 +25,7 @@ use crate::arch::coverage;
 use crate::arch::place_hybrid;
 use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::heads::{HeadLayout, model_row_heads};
 use crate::placement::workstation::{self, HostRead, TierBatchBytes};
 use bloomery_levers::KvHost;
 use runtime::stores::Class;
@@ -33,6 +34,27 @@ use crate::placement::{
     self, Card, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented,
     Violation, checked_beside, joined,
 };
+
+/// The rows of the body's widest pass: the pair pass, a row a slot of two slots (the card
+/// body's `PAIR_ROWS`).
+pub const PASS_ROWS: usize = 2;
+
+/// The heads a load of `slots` resident sequences of `model` makes past the load's own on stage
+/// card `card` ([`model_row_heads`]: the body writes a head a row, under its RMS final norm), in
+/// the card's allocator's bytes: on the card that carries the head, a pass of two slots' rows
+/// ([`PASS_ROWS`]) writes row 2's head; one slot makes none, and another card none. The plan
+/// holds them in the card's prompt term beside the prompt batch.
+pub fn pass_heads_bytes(
+    model: &ModelTensors,
+    card: &Card,
+    slots: usize,
+) -> Result<u64, PlacementError> {
+    if !card.head || slots < 2 {
+        return Ok(0);
+    }
+    let parts = model_row_heads(model, true, HeadLayout::PerRow, 1..=PASS_ROWS)?;
+    Ok(parts.card_bytes(card.granule_bytes))
+}
 
 /// What a plan of a V4.1 or V4 file is made from, read from its headers.
 #[derive(Debug)]
@@ -241,7 +263,12 @@ impl PlanInputs {
         let fronts = machine
             .cards
             .iter()
-            .map(|c| self.prompt_reserve_bytes(c, ctx_max, tiered))
+            .map(|c| {
+                Ok::<_, PlacementError>(
+                    self.prompt_reserve_bytes(c, ctx_max, tiered)?
+                        + pass_heads_bytes(&self.model, c, slots.get())?,
+                )
+            })
             .collect::<Result<Vec<u64>, _>>()?;
         let reserve = fronts.iter().copied().max().unwrap_or(0);
         let plan = placement::plan_in_pool(machine, levers, |levers| {
@@ -378,5 +405,91 @@ impl PlanInputs {
             draft: None,
             beside: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU64;
+
+    use gguf::GgmlType;
+
+    use super::{PASS_ROWS, pass_heads_bytes};
+    use crate::placement::{Card, ModelTensor, ModelTensors, PlacementError, Role};
+
+    fn card(head: bool) -> Card {
+        Card {
+            name: "card".to_string(),
+            tier_leg: None,
+            device: None,
+            usable_bytes: 1 << 40,
+            context_bytes: 0,
+            scratch_bytes: 0,
+            margin_bytes: 0,
+            granule_bytes: NonZeroU64::new(2 << 20).expect("2 MiB"),
+            free_bytes: None,
+            held_by: None,
+            layers: 0..1,
+            head,
+            token_embedding: false,
+            reserve_only: false,
+            reserves: Vec::new(),
+        }
+    }
+
+    fn model(head: bool) -> ModelTensors {
+        let tensors = head
+            .then(|| ModelTensor {
+                name: "output.weight".to_string(),
+                shard: 0,
+                layer: None,
+                role: Role::Head,
+                ty: GgmlType::Q8_0,
+                dims: vec![4096, 129_280],
+                file_bytes: 4096 / 32 * 34 * 129_280,
+                gathered_rows: None,
+            })
+            .into_iter()
+            .collect();
+        ModelTensors {
+            tensors,
+            layers: 1,
+            experts: 0,
+            experts_used: 0,
+            bf16_words: |_| false,
+        }
+    }
+
+    /// The passes' heads a plan adds to the head card's prompt term: a load of two or more
+    /// slots runs the pair pass of a row a slot, whose row-2 head of 129,280 rows over 4,096
+    /// values under the RMS norm (549,900 B: input and normed rows, logits, readback words) the
+    /// card's allocator packs into one shared 2 MiB granule. One slot adds none and another
+    /// card none, so a one-slot plan's fronts, and with them its experts and every term, are
+    /// the plan's before the heads; a file with no head reads none there, and two slots of it
+    /// are refused by name. FAIL-first: the plan counted no row head past the load's own.
+    #[test]
+    fn two_slots_count_the_pair_passes_row_head() {
+        assert_eq!(PASS_ROWS, 2);
+        let (with, headless) = (model(true), model(false));
+        let (head_card, other) = (card(true), card(false));
+        let heads =
+            |m: &ModelTensors, c: &Card, slots| pass_heads_bytes(m, c, slots).expect("the heads");
+        assert_eq!(heads(&with, &head_card, 2), 2 << 20);
+        assert_eq!(heads(&with, &head_card, 4), 2 << 20);
+        assert_eq!(heads(&with, &head_card, 1), 0);
+        assert_eq!(heads(&with, &other, 2), 0);
+        assert_eq!(heads(&headless, &head_card, 1), 0);
+        assert!(matches!(
+            pass_heads_bytes(&headless, &head_card, 2),
+            Err(PlacementError::PassHeads)
+        ));
+        let row = crate::placement::heads::model_row_heads(
+            &with,
+            true,
+            crate::placement::heads::HeadLayout::PerRow,
+            1..=2,
+        )
+        .expect("a head");
+        assert_eq!(row.bytes(), 549_900);
     }
 }

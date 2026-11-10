@@ -155,7 +155,8 @@ fn description() -> ModelSpec {
 }
 
 /// A layer's norm, and its routed stacks in types the card experts read: a
-/// Q4_K gate and up of 640 rows of 2,560, a Q8_0 down of 2,560 rows of 640.
+/// Q4_K gate and up of 640 rows of 2,560, a Q8_0 down of 2,560 rows of 640;
+/// and a Q8_0 head of 256 rows of 2,560.
 fn inputs() -> PlanInputs {
     let spec = description();
     let kv = KvLayout::of_spec(&spec).expect("the description's layout");
@@ -198,6 +199,17 @@ fn inputs() -> PlanInputs {
             vec![640, 2560, EXPERTS],
         ));
     }
+    // A head the card reads, whose passes' heads a drafted or multi-slot plan counts.
+    tensors.push(ModelTensor {
+        name: "output.weight".to_string(),
+        shard: 0,
+        layer: None,
+        role: Role::Head,
+        ty: GgmlType::Q8_0,
+        dims: vec![2560, 256],
+        file_bytes: 2560 / 32 * 34 * 256,
+        gathered_rows: None,
+    });
     PlanInputs {
         model: ModelTensors {
             tensors,
@@ -501,9 +513,17 @@ fn counts_the_draft_once(rows: StoreRows) {
     for experts in [Experts::Card, Experts::Host] {
         for slots in [1, 2] {
             let at = format!("{experts:?}, {slots} slot(s)");
+            // The draft's card bytes and the drafted passes' heads, both beside the card's
+            // own terms.
+            let granule = unified(WIDE, ample).cards[0].granule_bytes;
+            let heads = inputs
+                .pass_heads(slots, true)
+                .expect("the passes' heads")
+                .card_bytes(granule);
             let beside = q8
                 .card_bytes_of(CTX, slots)
-                .expect("the draft's card bytes");
+                .expect("the draft's card bytes")
+                + heads;
             let (room, paged, _) =
                 plan(experts, slots, ample).unwrap_or_else(|e| panic!("{at}, an ample pool: {e}"));
             assert_eq!(paged, 0, "{at}: an ample pool pages no expert");
@@ -513,7 +533,7 @@ fn counts_the_draft_once(rows: StoreRows) {
             assert_eq!(
                 (headroom, paged, held),
                 (0, 0, beside),
-                "{at}: the need leaves no headroom, pages no expert and holds the draft beside the plan"
+                "{at}: the need leaves no headroom, pages no expert and holds the draft and the heads beside the plan"
             );
             let (headroom, paged, held) = plan(experts, slots, need - 1)
                 .unwrap_or_else(|e| panic!("{at}, a pool one byte under the need: {e}"));
@@ -526,7 +546,7 @@ fn counts_the_draft_once(rows: StoreRows) {
             assert_eq!(
                 i128::from(held),
                 i128::from(beside) + headroom,
-                "{at}: the pool holds the draft's card bytes beside the plan"
+                "{at}: the pool holds the draft's card bytes and the heads beside the plan"
             );
         }
     }
