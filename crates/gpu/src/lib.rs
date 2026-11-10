@@ -2253,7 +2253,7 @@ pub(crate) fn raw_device_uuid(dev: cuda_core::sys::CUdevice) -> Result<[u8; 16],
 
 /// Device `dev`'s integer attribute `attribute`, asked of the driver without
 /// a context; `what` names the call in an error.
-pub(crate) fn raw_device_attribute(
+pub fn raw_device_attribute(
     dev: cuda_core::sys::CUdevice,
     attribute: cuda_core::sys::CUdevice_attribute,
     what: &'static str,

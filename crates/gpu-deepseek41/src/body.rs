@@ -791,21 +791,11 @@ impl KvRooms {
 
 /// The card's `CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING`.
 fn unified_addressing(gpu: &Gpu) -> Result<i32, GpuError> {
-    let mut unified_addressing = 0;
-    // SAFETY: the call writes the live local `unified_addressing`; the
-    // device is the context's own.
-    let rc = unsafe {
-        sys::cuDeviceGetAttribute(
-            &mut unified_addressing,
-            sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING,
-            gpu.context().cu_device(),
-        )
-    };
-    rc.result().map_err(|source| GpuError::Driver {
-        op: Some("cuDeviceGetAttribute(UNIFIED_ADDRESSING)"),
-        source,
-    })?;
-    Ok(unified_addressing)
+    bloomery_gpu::raw_device_attribute(
+        gpu.context().cu_device(),
+        sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING,
+        "cuDeviceGetAttribute(UNIFIED_ADDRESSING)",
+    )
 }
 
 /// One sequence's ring shadows, per layer `rows` rows of the ring's width in
