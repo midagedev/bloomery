@@ -2663,17 +2663,17 @@ pub(super) mod tests {
             Err(_) => panic!("an enqueue of an empty layer must be refused, not failed"),
             Ok(()) => panic!("an enqueue of an empty layer must be refused"),
         }
-        let mut req = Out::default();
-        req.len(0).len(0).len(1);
+        // The same check passes a layer the set holds an expert of. It is
+        // read without an enqueue: a served layer's stream would park on a go
+        // no test raises, and every later test on the card would wait behind it.
+        let opened = session.opened.as_ref().expect("the opened tier");
         assert!(
-            session.handle(Tag::Enqueue, req.done()).is_ok(),
-            "a layer the set holds an expert of is served"
+            opened.check_service(0, 0, 1).is_ok(),
+            "a layer the set holds an expert of passes the service check"
         );
-        // The served layer's stream parks on its go (never raised here), so
-        // the load ends as a lost node's does, releasing the words.
         let _ = session.end_lost(
             "127.0.0.1:7340".parse().expect("a peer"),
-            "the test's service parks on its go",
+            "the test ends its load",
         );
         assert!(session.opened.is_none());
         drop(session);
