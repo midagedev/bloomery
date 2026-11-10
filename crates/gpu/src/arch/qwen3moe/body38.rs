@@ -185,6 +185,7 @@ use engram::Hash;
 use engram::hash::{History, Window};
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
+use model::arch::qwen35moe::place;
 use model::part::StoredRows;
 use model::placement::{Device, Plan};
 use runtime::prompt::{CallEnd, call_units, chunks, fold_units, heat_call};
@@ -1146,6 +1147,36 @@ struct Pending38 {
     each: bool,
 }
 
+/// The expert stream's ring a load's plan counts ([`place::ring_cap_bytes`]).
+#[derive(Clone, Copy, Debug)]
+struct RingPlanned {
+    /// The card bytes of the ring's two halves the plan's ring term holds: the cap the ring is
+    /// sized under.
+    cap: u64,
+    /// The plan's ring term, the halves and the ring pass's route, and the slots a half it names.
+    term: u64,
+    half: u64,
+}
+
+impl RingPlanned {
+    /// The ring made, of `half` slots a half and `made` card bytes (the halves and the pass's
+    /// route), held to the plan's term: refused by name past either, as the card-byte invariant
+    /// would refuse it at the first prompt, where it cannot name the ring.
+    fn check(&self, half: usize, made: u64) -> Result<(), GpuError> {
+        if made > self.term || half as u64 > self.half {
+            return Err(GpuError::plan(
+                "Body38::set_xstream",
+                format!(
+                    "the ring made {made} B of {half} slots a half, past the plan's ring term of {} \
+                     B of {} slots a half",
+                    self.term, self.half
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A call planned and not yet launched: its first position, its rows, the
 /// PLE history past them, and a verify's tokens and row mode.
 /// [`Body38::launch`] takes it; a call that fails first leaves it to be
@@ -1309,6 +1340,12 @@ pub struct Body38 {
     /// sequence past the plan is refused by name.
     slots_planned: usize,
     slots_made: usize,
+    /// The expert stream's ring the load's plan counts ([`place::ring_cap_bytes`]): `None` for a plan
+    /// whose load does not stream, whose ring (if one is set later) takes what the card's margin
+    /// leaves; `Some(bytes)` the card bytes of the ring's two halves the plan's ring term holds,
+    /// the cap [`Body38::set_xstream`] gives the ring, and the plan's term and half the made
+    /// ring is held to.
+    ring_planned: Option<RingPlanned>,
     /// Where a selecting store's rooms back their pages
     /// (`BLOOMERY_KV_HOST`, the plan's `kv_host` word as [`KvLevers::backing`]
     /// maps it for each buffer's access): the load's own stores and every
@@ -2212,6 +2249,11 @@ impl Body38 {
             ple_due: None,
             slots_planned: planned,
             slots_made: 1,
+            ring_planned: place::ring_cap_bytes(plan, ub as u64, inputs).map(|cap| RingPlanned {
+                cap,
+                term: plan.cards[0].ring_bytes,
+                half: plan.cards[0].ring_half,
+            }),
             kv_levers,
             slot_in: (planned > 1).then(|| SlotIn::new(stream)).transpose()?,
             last_walk: TargetRows::Step,
@@ -2664,21 +2706,27 @@ impl Body38 {
             ));
         }
         if mode == XMode::Split && self.hybrid.xstream().is_none() {
-            // The plan reserves no ring: it takes what the card's margin leaves past the keep-free
-            // and the pages the slots' stores may still back.
-            let mut cfg = XCfg::new(XSTREAM_SHAPE, geo::EXPERTS, DEADLINE, None);
+            // The ring takes no more than the plan's ring term holds ([`RingPlanned`]): the
+            // plan's last term, out of what every other term left. A plan that counts none
+            // (its load does not stream) leaves the ring what the card's margin has past the
+            // keep-free and the pages the slots' stores may still back.
+            let cap = self.ring_planned.as_ref().map(|p| p.cap);
+            let mut cfg = XCfg::new(XSTREAM_SHAPE, geo::EXPERTS, DEADLINE, cap);
             cfg.keep_free += self.store_growth() as u64;
-            let half = self
-                .hybrid
-                .xstream_start(
-                    gpu.context(),
-                    gpu.stream(),
-                    cfg,
-                    crate::host::xstream::PROBE,
-                )?
-                .half_slots();
+            let x = self.hybrid.xstream_start(
+                gpu.context(),
+                gpu.stream(),
+                cfg,
+                crate::host::xstream::PROBE,
+            )?;
+            let (half, halves) = (x.half_slots(), x.ring_bytes());
+            let mut pass = 0;
             if let Some(r) = self.wide.card.as_mut() {
                 r.arm_ring(gpu.stream(), half)?;
+                pass = r.ring_bytes();
+            }
+            if let Some(p) = &self.ring_planned {
+                p.check(half, halves + pass)?;
             }
         }
         self.stream.set_mode(mode);

@@ -1133,6 +1133,13 @@ impl CardRoute38 {
         Ok(())
     }
 
+    /// The device bytes of the ring pass's buffers (`arm_ring`); 0 before the arming.
+    pub(super) fn ring_bytes(&self) -> u64 {
+        self.ring.as_ref().map_or(0, |r| {
+            (r.route.bytes() + r.sel.num_bytes() + r.union.num_bytes()) as u64
+        })
+    }
+
     /// Device bytes.
     pub(super) fn bytes(&self) -> usize {
         self.ids.num_bytes()

@@ -1190,6 +1190,12 @@ impl XStream {
         self.ring.half
     }
 
+    /// The card bytes of the ring's two halves, in all its parts.
+    #[must_use]
+    pub fn ring_bytes(&self) -> u64 {
+        self.ring.parts.iter().map(|p| p.num_bytes() as u64).sum()
+    }
+
     /// The pinned staging's slots; 0 when the lane copies pageable bytes.
     #[must_use]
     pub fn staging_slots(&self) -> usize {

@@ -710,6 +710,53 @@ impl PlanInputs {
         place_hybrid::stream_slot_bytes(&self.model, routed_stacks, self.model.experts)
     }
 
+    /// The expert stream's ring, planned last on the stage card of `plan` when its load streams
+    /// ([`plan_rings`]): after every other term, the largest half of at most the most host experts
+    /// a routed layer leaves whose ring ([`ring_bytes_at`]) fits the headroom less the margin and
+    /// `beside`, the card bytes the caller counts past the plan's totals (an MTP draft's
+    /// reserve). The expert count is the plan's without the ring: the ring takes only what the
+    /// experts left. A plan with no such room counts no ring (the body then refuses a split by
+    /// name: [`ring_cap_bytes`] is 0). Counted as the card's ring term ([`CardTotals::grow_ring`]).
+    fn grow_ring(&self, plan: &mut Plan<'_>, ubatch: u64, beside: u64) -> Result<(), PlaceError> {
+        if !plan_rings(plan) {
+            return Ok(());
+        }
+        let card = &plan.machine.cards[0];
+        let slots = self.ring_slots(card, ubatch)?;
+        let slot = place_hybrid::ring_slot_bytes(&self.model, routed_stacks, self.model.experts)?;
+        let mut max_half = 0;
+        for l in 0..self.model.layers {
+            let routed = routed_stacks(l)
+                .iter()
+                .any(|n| self.model.tensors.iter().any(|t| &t.name == n));
+            if routed {
+                max_half = max_half.max(plan.host_experts(l)?);
+            }
+        }
+        let room =
+            plan.cards[0].headroom_bytes - i128::from(beside) - i128::from(card.margin_bytes);
+        let room = u64::try_from(room).unwrap_or(0);
+        if let Some((half, bytes)) =
+            place_hybrid::plan_ring_last(room, max_half, |h| ring_bytes_at(slot, slots, h))
+        {
+            plan.cards[0].grow_ring(bytes, half);
+        }
+        Ok(())
+    }
+
+    /// The routed slots of a ring pass's route on `card`: the walk's run
+    /// ([`card_route_run`]'s rule: the whole ubatch on a card that holds the run's reserve, else
+    /// at most [`CARD_ROUTE_ROWS`] tokens) at the model's experts a token keeps.
+    fn ring_slots(&self, card: &Card, ubatch: u64) -> Result<u64, PlaceError> {
+        let run = if reserve_rows(card, ROUTE_UNIT_RESERVE).is_empty() {
+            ubatch.min(CARD_ROUTE_ROWS)
+        } else {
+            ubatch
+        };
+        let n_used = self.spec.routed().map_or(0, |m| u64::from(m.top_k));
+        Ok(run * n_used)
+    }
+
     /// The placement of the file on `machine` at `ctx_max` positions with
     /// prompt calls of up to `ubatch` positions under the placement's `levers`, every routed expert on the host and the PLE
     /// table where [`PlanInputs::room`] says ([`PlanInputs::plan_with`] under
@@ -741,7 +788,8 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         check_shape(ctx_max, ubatch)?;
         check_draft_reserve(machine, None)?;
-        let plan = self.target(machine, (ctx_max, ubatch), levers, experts, Beside::none())?;
+        let mut plan = self.target(machine, (ctx_max, ubatch), levers, experts, Beside::none())?;
+        self.grow_ring(&mut plan, ubatch, 0)?;
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -823,6 +871,7 @@ impl PlanInputs {
         // class, out of the budget `rows` reserved above, so
         // [`Plan::violations`] holds the card's bound against them.
         plan.cards[0].grow_kv(rows);
+        self.grow_ring(&mut plan, ubatch, 0)?;
         checked(plan).map_err(PlaceError::Broken)
     }
 
@@ -1139,13 +1188,14 @@ impl PlanInputs {
             });
         }
         check_draft_reserve(machine, None)?;
-        let plan = self.target(
+        let mut plan = self.target(
             machine,
             (ctx_max, ubatch),
             levers,
             experts,
             Beside::draft(reserve, mtp),
         )?;
+        self.grow_ring(&mut plan, ubatch, reserve)?;
         let t = &plan.cards[0];
         // The draft's term is the reserve the expert rule spread within, so
         // the bound and the budget count one number. The stage rope rows are
@@ -1286,6 +1336,7 @@ impl PlanInputs {
             &kv,
         )?;
         plan.cards[0].grow_kv(rows);
+        self.grow_ring(&mut plan, ubatch, reserve)?;
         let t = &plan.cards[0];
         // As in [`PlanInputs::plan_mtp_with`]: the draft's term is the
         // reserve the expert rule spread within, and the stage rope rows are
@@ -1346,6 +1397,50 @@ impl PlanInputs {
                 .plan),
         }
     }
+}
+
+/// Whether a load of `plan` runs the expert stream's ring (`BLOOMERY_XSTREAM=split`) on its stage
+/// card: its machine sets the lane's staging aside ([`workstation::reserve_stream_staging`], which a
+/// seat does for a load whose prompt calls stream), the plan leaves a routed expert on the host
+/// ([`workstation::plan_streams`]), and the stage card hangs no expert tier (the ring serves the
+/// stage card of a load with none).
+#[must_use]
+pub fn plan_rings(plan: &Plan<'_>) -> bool {
+    plan.machine
+        .host()
+        .reserves
+        .iter()
+        .any(|(n, _)| n == workstation::XSTREAM_STAGING_RESERVE)
+        && workstation::plan_streams(plan)
+        && plan.machine.tiers.is_empty()
+        && plan.machine.cards.len() == 1
+}
+
+/// The card bytes of a ring of `half` slots a half over slots of `slot` bytes
+/// ([`place_hybrid::ring_slot_bytes`]) beside the ring pass's route of `slots` routed slots
+/// ([`place_hybrid::ring_route_bytes`]): the one formula of the ring term, which the body holds the
+/// ring it makes to.
+#[must_use]
+pub fn ring_bytes_at(slot: u64, slots: u64, half: u64) -> u64 {
+    place_hybrid::ring_halves_bytes(slot, half)
+        + place_hybrid::ring_route_bytes(slots as usize, half as usize)
+}
+
+/// The card bytes `plan`'s ring term leaves the stream's ring buffers (the two halves), the cap the
+/// body gives the ring: the term less the pass's route ([`place_hybrid::ring_route_bytes`], over
+/// the half the term names). 0 for a plan that streams ([`plan_rings`]) and counts no ring (no room
+/// past the margin), `None` for a plan whose load does not stream.
+#[must_use]
+pub fn ring_cap_bytes(plan: &Plan<'_>, ubatch: u64, inputs: &PlanInputs) -> Option<u64> {
+    if !plan_rings(plan) {
+        return None;
+    }
+    let t = &plan.cards[0];
+    let slots = inputs.ring_slots(&plan.machine.cards[0], ubatch).ok()?;
+    Some(place_hybrid::ring_room_cap(
+        t.ring_bytes,
+        place_hybrid::ring_route_bytes(slots as usize, t.ring_half as usize),
+    ))
 }
 
 fn check_shape(ctx_max: u64, ubatch: u64) -> Result<(), PlaceError> {
@@ -3416,6 +3511,172 @@ mod tests {
         assert_eq!(kv.layer_bytes(2, 4096), 4096 * 2048 + 1024 * 256 + 2816);
         assert_eq!(kv.layer_bytes(2, 4097), 4097 * 2048 + 1025 * 256 + 2816);
         assert_eq!(kv.layer_bytes(3, 4096), 0);
+    }
+
+    /// The inputs of a qwen4exp header whose routed stacks are `dims` of Q4_K.
+    fn ring_inputs(dims: [u64; 3]) -> super::PlanInputs {
+        use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
+        use crate::arch::synthetic::{Ty, V, header_typed};
+        use crate::placement::workstation::HostRead;
+
+        let typed: Vec<_> = tensors()
+            .into_iter()
+            .map(|(n, d)| {
+                if n.contains(".ffn_") && n.ends_with("_exps.weight") {
+                    (n, dims.to_vec(), Ty::Iq2Xxs)
+                } else if n.ends_with(".attn_q.weight") {
+                    (n, vec![64, 128], Ty::F32)
+                } else {
+                    (n, d, Ty::F32)
+                }
+            })
+            .collect();
+        let pre = [("tokenizer.ggml.pre", V::Str("qwen35"))];
+        let path = header_typed("q4x-ring", "qwen4exp", &keys(), &pre, &typed);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given)).expect("describes")
+    }
+
+    /// The expert stream's ring is the plan's last term, out of what every other term left: a
+    /// load that streams (its machine sets the lane's staging aside) plans the very experts of the
+    /// same load without the ring, counts a ring of the largest half whose bytes fit the headroom
+    /// less the margin (`ring_bytes_at`, one more slot's ring does not fit) and no more host experts
+    /// than a layer leaves, takes it out of the headroom, and holds the stream's ring buffers to
+    /// the term's halves (`ring_cap_bytes`). A load that does not stream counts none.
+    ///
+    /// FAIL-first: a plan with no ring term has `ring_bytes` 0 and leaves the stream's ring the
+    /// card's whole margin, which is the 1.85–2.15 GB a Qwen3.8 first prompt made past its plan.
+    #[test]
+    fn the_ring_is_planned_last_from_what_the_experts_leave() {
+        use crate::arch::names::routed_stacks;
+        use crate::arch::place_hybrid::{ring_route_bytes, ring_slot_bytes};
+        use crate::placement::PlanLevers;
+        use crate::placement::workstation::{self, A6000};
+
+        // An expert of 4,096 rows of 4,096 values: 9,437,184 B of Q4_K a stack.
+        let inputs = ring_inputs([4096, 4096, 8]);
+        let ub = 512;
+        let slot = ring_slot_bytes(&inputs.model, routed_stacks, inputs.model.experts).unwrap();
+        let n_used = 2;
+        let slots = ub * n_used;
+        let levers = PlanLevers {
+            card_budget_bytes: bloomery_levers::CardBudget::default(),
+            ..PlanLevers::default()
+        };
+        let base = super::machine_for_experts(
+            A6000,
+            super::Stack::q8_blocks32(inputs.model.layers),
+            ub,
+            super::Experts::Card,
+        );
+        let mut streaming = base.clone();
+        workstation::reserve_stream_staging(&mut streaming, slot);
+        for experts in [super::Experts::Host, super::Experts::Card] {
+            // A card that holds every expert, and one a layer's stacks past.
+            for usable in [base.cards[0].usable_bytes, 400 << 20, 700 << 20] {
+                let (mut plain, mut ring) = (base.clone(), streaming.clone());
+                plain.cards[0].usable_bytes = usable;
+                ring.cards[0].usable_bytes = usable;
+                let (Ok(a), Ok(b)) = (
+                    inputs.plan_with(&plain, (4096, ub), &levers, experts),
+                    inputs.plan_with(&ring, (4096, ub), &levers, experts),
+                ) else {
+                    continue;
+                };
+                let label = format!("{experts:?} on {usable} B");
+                // The experts are the plan's without the ring.
+                assert_eq!(a.n_l, b.n_l, "{label}: the experts a layer");
+                assert_eq!(a.cards[0].experts, b.cards[0].experts, "{label}");
+                assert_eq!(a.cards[0].expert_bytes, b.cards[0].expert_bytes, "{label}");
+                assert_eq!(a.host.experts, b.host.experts, "{label}");
+                // No ring on a load that does not stream.
+                assert_eq!(
+                    (a.cards[0].ring_bytes, a.cards[0].ring_half),
+                    (0, 0),
+                    "{label}"
+                );
+                assert_eq!(super::ring_cap_bytes(&a, ub, &inputs), None, "{label}");
+                let t = &b.cards[0];
+                if b.host.experts == 0 {
+                    assert_eq!(t.ring_bytes, 0, "{label}: nothing to stream, no ring");
+                    continue;
+                }
+                let max_half = (0..inputs.model.layers)
+                    .map(|l| b.host_experts(l).unwrap())
+                    .max()
+                    .unwrap();
+                let margin = b.machine.cards[0].margin_bytes;
+                let room =
+                    u64::try_from(a.cards[0].headroom_bytes - i128::from(margin)).unwrap_or(0);
+                let at = |h| super::ring_bytes_at(slot, slots, h);
+                let want = (0..=max_half).rev().find(|&h| at(h) <= room).unwrap();
+                assert_eq!(t.ring_half, want, "{label}: the largest half that fits");
+                if want > 0 {
+                    assert_eq!(
+                        t.ring_bytes,
+                        at(want),
+                        "{label}: the term is the ring's bytes"
+                    );
+                    assert_eq!(
+                        t.ring_bytes,
+                        2 * want * slot + ring_route_bytes(slots as usize, want as usize),
+                        "{label}"
+                    );
+                    assert!(want == max_half || at(want + 1) > room, "{label}: largest");
+                    assert_eq!(
+                        super::ring_cap_bytes(&b, ub, &inputs),
+                        Some(2 * want * slot),
+                        "{label}: the stream's ring buffers are held to the term's halves"
+                    );
+                } else {
+                    assert_eq!(t.ring_bytes, 0, "{label}");
+                    assert_eq!(super::ring_cap_bytes(&b, ub, &inputs), Some(0), "{label}");
+                }
+                assert_eq!(
+                    t.headroom_bytes,
+                    a.cards[0].headroom_bytes - i128::from(t.ring_bytes),
+                    "{label}: out of the headroom"
+                );
+                assert!(t.bytes() <= a.cards[0].bytes() + t.ring_bytes, "{label}");
+            }
+        }
+        // A card with room for exactly `h` slots a half past every other term plans a half of
+        // `h`: the ring takes what the margin-less headroom holds, no more.
+        let wide = inputs
+            .plan_with(&streaming, (4096, ub), &levers, super::Experts::Host)
+            .unwrap();
+        let used = streaming.cards[0].usable_bytes
+            - u64::try_from(wide.cards[0].headroom_bytes).unwrap()
+            - wide.cards[0].ring_bytes;
+        let margin = streaming.cards[0].margin_bytes;
+        for h in [1u64, 3, 7] {
+            let mut tight = streaming.clone();
+            tight.cards[0].usable_bytes = used + margin + super::ring_bytes_at(slot, slots, h) + 1;
+            let plan = inputs
+                .plan_with(&tight, (4096, ub), &levers, super::Experts::Host)
+                .unwrap();
+            assert_eq!(plan.cards[0].ring_half, h, "room for {h} slots a half");
+            assert_eq!(
+                plan.cards[0].ring_bytes,
+                super::ring_bytes_at(slot, slots, h)
+            );
+            assert!(plan.cards[0].bytes() < tight.cards[0].usable_bytes - margin);
+        }
+        // The headline: with every expert on the host the card has room for a ring of the
+        // widest half a layer leaves.
+        let mut host = streaming.clone();
+        host.cards[0].usable_bytes = base.cards[0].usable_bytes;
+        let plan = inputs
+            .plan_with(&host, (4096, ub), &levers, super::Experts::Host)
+            .unwrap();
+        assert!(
+            plan.cards[0].ring_half > 0,
+            "a ring is planned beside no card expert"
+        );
+        assert_eq!(
+            plan.cards[0].ring_half, 8,
+            "every host expert of a layer fits a half"
+        );
     }
 
     /// A qwen4exp file whose PLE table is F8 rows and whose layer 2 routed
