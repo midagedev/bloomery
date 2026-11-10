@@ -116,6 +116,7 @@ use model::arch::glm5next::place::{
 };
 use model::embed::EmbedTable;
 use model::placement::Plan;
+use model::placement::parts::Parts as PlannedParts;
 use models::{Act, Ffn, LayerSpec, Mixer, Score};
 use runtime::layer::{FfnKind, Layer, MixerKind, ResidualKind, hosted};
 use runtime::seqstate::{Kept, Price, Take};
@@ -833,14 +834,10 @@ pub struct Body {
     /// (`place::dense_positions`): a prompt chunk within them attends every
     /// position, one past them through the selector.
     dense: usize,
-    /// The card bytes the plan reserves for a prompt chunk's latent attention
-    /// buffers (`place::prompt_attn_bytes`), which the batch feed's are
-    /// held to before it makes them.
-    attn_planned: u64,
-    /// The card bytes the plan counts for the whole prompt batch
-    /// (`place::prompt_reserve_bytes`), which the batch feed's are held to
-    /// once it has made them.
-    prompt_planned: u64,
+    /// The prompt batch's parts the plan counts (`place::prompt_parts`),
+    /// which the batch feed's buffers are held to once it has made them, the
+    /// units at its own group's.
+    prompt_planned: PlannedParts,
     /// The KDA layers' stores on the host at chosen positions.
     ckpt: Checkpoints,
     /// How a prompt is fed, and the batch feed's buffers.
@@ -1768,8 +1765,7 @@ impl Body {
                 list_width(dims.kept)
             )));
         }
-        let attn_planned = place::prompt_attn_bytes(inputs.attn_shape(), plan.ctx_max);
-        let prompt_planned = place::prompt_reserve_bytes(inputs, plan.ctx_max, !tiers.is_empty());
+        let prompt_planned = place::prompt_parts(inputs, plan.ctx_max, !tiers.is_empty());
         let tier_cards: Vec<usize> = tiers.iter().map(|t| t.card).collect();
         let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), N_EXPERT)?;
         let plans = trunk_plans(file, inputs)?;
@@ -1947,7 +1943,6 @@ impl Body {
             lanes,
             wrote: nextn::Wrote::default(),
             dense,
-            attn_planned,
             prompt_planned,
             ckpt,
             prompt: prefill::PromptState::new(),

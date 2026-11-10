@@ -1906,8 +1906,6 @@ impl Body {
         let tiered = self.card.tier().is_some();
         let forms = dense_forms(&self.cfg);
         let attn = AttnLens::of(&self.dims, self.ctx);
-        place::check_attn_bytes(attn.bytes(), self.attn_planned)
-            .map_err(|e| shape(e.to_string()))?;
         let bufs = Bufs::new(
             gpu,
             &self.dims,
@@ -1923,10 +1921,20 @@ impl Body {
             .collect::<Result<Vec<_>, _>>()?;
         let hsum = DeviceBuffer::zeroed(gpu.stream(), cap * self.dims.embd)?;
         let batch = Batch { bufs, units, hsum };
-        let made = u64::try_from(batch.bytes())
-            .map_err(|_| shape("the prompt batch's bytes pass u64".into()))?;
+        let units = batch.units.iter().map(UnitBufs::bytes).sum::<usize>() as u64;
+        let (made, attn) = (batch.bytes() as u64, attn.bytes());
         let unit = unit_bytes(self.dims.embd, cap, tiered) as u64;
-        place::check_prompt_bytes(made, self.prompt_planned, unit, self.prompt.group)
+        self.prompt_planned
+            .clone()
+            .with_part(place::prompt_units(unit, self.prompt.group))
+            .check(
+                "glm5next prompt batch",
+                &[
+                    (place::PROMPT_ATTN, attn),
+                    (place::PROMPT_UNITS, units),
+                    (place::PROMPT_REST, made.saturating_sub(attn + units)),
+                ],
+            )
             .map_err(|e| shape(e.to_string()))?;
         self.shell.hybrid.prepare_batch(gpu.context(), cap)?;
         self.shell.hybrid.host_mut().prepare_union(cap)?;

@@ -24,6 +24,7 @@ use crate::arch::place_hybrid;
 use crate::placement::accepts::{Program, leg_runs, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::kernels::{self, DownAct, DownEntry, DownForms, GateUpEntry, q8_act_bytes};
+use crate::placement::parts::{Part, Parts};
 use crate::placement::workstation::{self, GRANULE, HostRead, TierBatchBytes};
 use crate::placement::{
     self, Card, CardTotals, Device, ExpertList, Format, Host, KvBytes, Machine, ModelTensor,
@@ -395,30 +396,6 @@ pub fn prompt_attn_bytes(s: AttnShape, ctx_max: u64) -> u64 {
     F32_BYTES * (partials + scores + lists)
 }
 
-/// A prompt batch's latent attention buffers whose bytes are not the ones the
-/// plan reserves for them ([`prompt_attn_bytes`]).
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "a prompt chunk's attention buffers take {made} B; the plan reserves {planned} B for them \
-     (place::prompt_attn_bytes)"
-)]
-pub struct AttnUnplanned {
-    pub made: u64,
-    pub planned: u64,
-}
-
-/// Refused by name when the card body's prompt attention buffers, `made`
-/// bytes by its own shapes, are not the `planned` bytes the plan reserved
-/// ([`prompt_attn_bytes`]): checked before the buffers are made, so a layout
-/// the plan does not count is an error, not the driver's.
-pub fn check_attn_bytes(made: u64, planned: u64) -> Result<(), AttnUnplanned> {
-    if made == planned {
-        Ok(())
-    } else {
-        Err(AttnUnplanned { made, planned })
-    }
-}
-
 /// The columns a prompt batch of a load at `ctx_max` positions is made for:
 /// the host union's, or the context when it holds fewer.
 fn prompt_cols(ctx_max: u64) -> usize {
@@ -502,23 +479,35 @@ pub fn prompt_shared_bytes(hp: &Hparams, cap: usize) -> u64 {
     F32_BYTES * words as u64
 }
 
-/// The card bytes the plan reserves on the stage card for a load of `inputs`'s
-/// prompt batch at `ctx_max` positions: all the card bytes its first prompt
-/// pass makes. Its GEMM front
-/// ([`prompt_front_bytes`]), the latent attention's buffers
-/// ([`prompt_attn_bytes`] at [`PlanInputs::attn_shape`]), the card experts' grouped scratch
-/// ([`card_tile_bytes`] at the front's columns, plus [`card_leg_bytes`] in the
-/// forms [`card_leg_forms`] names), the shared buffers
-/// ([`prompt_shared_bytes`]) and the units a group of
-/// [`PROMPT_GROUP`] holds ([`runtime::prompt::group_sets`], [`unit_bytes`] at
-/// the front's columns, the tier places when `tiered`). A media span adds no
-/// card buffer: its rows are staged on the host into the units' rows. The
-/// plan reserves it out of the expert budget and counts it as the stage card's
-/// prompt term ([`CardTotals::grow_prompt`](crate::placement::CardTotals::grow_prompt)); the card body's batch
-/// checks the bytes it made against it. A group past [`PROMPT_GROUP`] makes
-/// its further units out of the card's margin.
+/// The prompt batch's parts ([`prompt_parts`]): the latent attention's
+/// buffers, a group's units, and the rest of the batch (its GEMM front, the
+/// card experts' grouped scratch and the shared buffers).
+pub const PROMPT_ATTN: &str = "attn";
+pub const PROMPT_UNITS: &str = "units";
+pub const PROMPT_REST: &str = "front, tiles and shared";
+
+/// The prompt batch's units for a group of `group` batches, `unit` bytes
+/// each ([`unit_bytes`]): one a set the group holds
+/// ([`runtime::prompt::group_sets`]).
 #[must_use]
-pub fn prompt_reserve_bytes(inputs: &PlanInputs, ctx_max: u64, tiered: bool) -> u64 {
+pub fn prompt_units(unit: u64, group: usize) -> Part {
+    (0..group_sets(group)).fold(Part::new(PROMPT_UNITS), |p, _| p.bytes_buffer(unit))
+}
+
+/// The card bytes of the prompt batch of a load of `inputs` at `ctx_max`
+/// positions as its parts: the latent attention's buffers
+/// ([`prompt_attn_bytes`] at [`PlanInputs::attn_shape`]), the units a group
+/// of [`PROMPT_GROUP`] holds ([`prompt_units`] of [`unit_bytes`] at the
+/// front's columns, the tier places when `tiered`), and the rest: the GEMM
+/// front ([`prompt_front_bytes`]), the card experts' grouped scratch
+/// ([`card_tile_bytes`] at the front's columns, plus [`card_leg_bytes`] in
+/// the forms [`card_leg_forms`] names) and the shared buffers
+/// ([`prompt_shared_bytes`]). A media span adds no card buffer: its rows are
+/// staged on the host into the units' rows. The card body holds the batch it
+/// makes to these parts, its units at its own group's
+/// ([`Parts::with_part`] of [`prompt_units`]).
+#[must_use]
+pub fn prompt_parts(inputs: &PlanInputs, ctx_max: u64, tiered: bool) -> Parts {
     let hp = &inputs.hp;
     let cols = prompt_cols(ctx_max);
     let unit = unit_bytes(hp.n_embd, cols, hp.hc.streams, hp.n_used, tiered);
@@ -529,45 +518,26 @@ pub fn prompt_reserve_bytes(inputs: &PlanInputs, ctx_max: u64, tiered: bool) -> 
             hp.n_used,
             card_leg_forms(&inputs.model),
         );
-    prompt_front_bytes(inputs, ctx_max)
-        + prompt_attn_bytes(inputs.attn_shape(), ctx_max)
-        + prompt_shared_bytes(hp, cols)
-        + (tiles + group_sets(PROMPT_GROUP) * unit) as u64
+    Parts::new(vec![
+        Part::new(PROMPT_ATTN).bytes_buffer(prompt_attn_bytes(inputs.attn_shape(), ctx_max)),
+        prompt_units(unit as u64, PROMPT_GROUP),
+        Part::new(PROMPT_REST)
+            .bytes_buffer(prompt_front_bytes(inputs, ctx_max))
+            .bytes_buffer(tiles as u64)
+            .bytes_buffer(prompt_shared_bytes(hp, cols)),
+    ])
 }
 
-/// A prompt batch whose made card bytes are not the ones the plan counted
-/// ([`prompt_reserve_bytes`], less the units a smaller or larger group than
-/// [`PROMPT_GROUP`] differs by).
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "a prompt batch takes {made} B on the card; the plan counts {planned} B for it \
-     (place::prompt_reserve_bytes)"
-)]
-pub struct PromptUnplanned {
-    pub made: u64,
-    pub planned: u64,
-}
-
-/// Refused by name when the prompt batch's buffers, `made` bytes in all, are
-/// not the `planned` bytes the plan counted for a batch of a group's size
-/// ([`prompt_reserve_bytes`] with `unit` bytes a unit more or fewer for each
-/// set the group holds past or short of [`PROMPT_GROUP`]'s): a drift between
-/// the buffers and their formula is an error, not an overrun the card-byte
-/// reading finds later.
-pub fn check_prompt_bytes(
-    made: u64,
-    reserve: u64,
-    unit: u64,
-    group: usize,
-) -> Result<(), PromptUnplanned> {
-    let planned = i128::from(reserve)
-        + (group_sets(group) as i128 - group_sets(PROMPT_GROUP) as i128) * i128::from(unit);
-    let planned = u64::try_from(planned).unwrap_or(0);
-    if made == planned {
-        Ok(())
-    } else {
-        Err(PromptUnplanned { made, planned })
-    }
+/// The card bytes the plan reserves on the stage card for a load of `inputs`'s
+/// prompt batch at `ctx_max` positions: all the card bytes its first prompt
+/// pass makes, its parts summed ([`prompt_parts`]). The plan reserves it out
+/// of the expert budget and counts it as the stage card's prompt term
+/// ([`CardTotals::grow_prompt`](crate::placement::CardTotals::grow_prompt)). A
+/// group past [`PROMPT_GROUP`] makes its further units out of the card's
+/// margin.
+#[must_use]
+pub fn prompt_reserve_bytes(inputs: &PlanInputs, ctx_max: u64, tiered: bool) -> u64 {
+    prompt_parts(inputs, ctx_max, tiered).bytes()
 }
 
 /// What a plan of a glm5next file is made from, read from its headers.
@@ -1603,10 +1573,10 @@ fn beside_bytes(streams: usize, n_embd: usize, lanes: KdaLanes, nextn: bool) -> 
 mod tests {
     use super::{
         AttnShape, DenseForms, FRONT_STEP, FrontWidths, KdaLanes, Kind, KvBytes, KvLayout,
-        MixerForms, NextnKv, PROMPT_GROUP, card_tile_bytes, check_attn_bytes, front_bytes,
-        group_sets, prompt_attn_bytes, recurrent_bytes, row_bytes, seq_terms, stage_term,
-        unit_bytes,
+        MixerForms, NextnKv, PROMPT_ATTN, PROMPT_GROUP, card_tile_bytes, front_bytes, group_sets,
+        prompt_attn_bytes, recurrent_bytes, row_bytes, seq_terms, stage_term, unit_bytes,
     };
+    use crate::placement::parts::{Part, Parts};
 
     /// GLM-5.3-Flash's attention shape: 64 heads of a 512-value latent row,
     /// at most 2,051 keys a token (512 pools of four and a tail of three),
@@ -1649,21 +1619,29 @@ mod tests {
     }
 
     /// The card body's prompt attention buffers are refused by name unless
-    /// they take the bytes the plan reserves: a layout whose partials cover
-    /// every position of a 262,144-position store, and one a byte short, are
-    /// refused, the plan's own passes. Mutant: the refusal removed.
+    /// they take the bytes the plan reserves, through the common parts check
+    /// (`placement::parts`): a layout whose partials cover every position of
+    /// a 262,144-position store, and one a byte short, are refused, the
+    /// plan's own passes. Mutant: the attention part left out of the parts.
     #[test]
     fn attn_bytes_the_plan_does_not_reserve_are_refused() {
         let planned = prompt_attn_bytes(GLM_ATTN, 262_144);
-        assert!(check_attn_bytes(planned, planned).is_ok());
+        let parts = Parts::new(vec![Part::new(PROMPT_ATTN).bytes_buffer(planned)]);
+        assert!(parts.check("glm5next", &[(PROMPT_ATTN, planned)]).is_ok());
         let over_ctx = 4_311_744_512 + 2_097_152 + 65_632;
-        let e = check_attn_bytes(over_ctx, planned).expect_err("the context-wide partials");
+        let e = parts
+            .check("glm5next", &[(PROMPT_ATTN, over_ctx)])
+            .expect_err("the context-wide partials");
         assert_eq!(
             e.to_string(),
-            "a prompt chunk's attention buffers take 4313907296 B; the plan reserves 36900960 B \
-             for them (place::prompt_attn_bytes)"
+            "glm5next made 4313907296 B of buffers where its parts' formula counts 36900960 B; \
+             apart: attn made 4313907296 B planned 36900960 B (+4277006336 B) (placement::parts)"
         );
-        assert!(check_attn_bytes(planned - 1, planned).is_err());
+        assert!(
+            parts
+                .check("glm5next", &[(PROMPT_ATTN, planned - 1)])
+                .is_err()
+        );
     }
 
     /// A prompt group unit at GLM-5.3-Flash's sizes (4,096 values, four
@@ -1852,10 +1830,11 @@ mod tests {
 
         use super::super::super::hparams::{Hc, Hparams, Indexer};
         use super::super::{
-            DenseForms, KdaLanes, Kind, KvLayout, MixerForms, NextnInputs, NextnKv, PROMPT_GROUP,
-            PlaceError, PlanInputs, card_leg_bytes, card_leg_forms, card_tile_bytes,
-            check_prompt_bytes, group_sets, prompt_attn_bytes, prompt_cols, prompt_front_bytes,
-            prompt_leg_forms, prompt_reserve_bytes, prompt_shared_bytes, row_bytes, unit_bytes,
+            DenseForms, KdaLanes, Kind, KvLayout, MixerForms, NextnInputs, NextnKv, PROMPT_ATTN,
+            PROMPT_GROUP, PROMPT_REST, PROMPT_UNITS, PlaceError, PlanInputs, card_leg_bytes,
+            card_leg_forms, card_tile_bytes, group_sets, prompt_attn_bytes, prompt_cols,
+            prompt_front_bytes, prompt_leg_forms, prompt_parts, prompt_reserve_bytes,
+            prompt_shared_bytes, prompt_units, row_bytes, unit_bytes,
         };
         use crate::placement::churn::ChurnPool;
         use crate::placement::workstation::{HostNeed, HostRead};
@@ -2345,27 +2324,59 @@ mod tests {
             assert_eq!(prompt_shared_bytes(&i.hp, cap), want as u64);
         }
 
-        /// A batch whose buffers take other bytes than the plan counted is
-        /// refused by name, and a group of another size moves the count by
-        /// its units. Mutant: the check compares the plan's count alone.
+        /// The parts sum to the figure the reserve was before them (front +
+        /// attention + shared + tiles + a default group's units); a batch
+        /// whose parts take other bytes than the plan counted is refused by
+        /// name, every part apart listed; a group of another size moves the
+        /// units part alone. Mutants: a part dropped from the parts (the sum
+        /// moves); the check of the total alone (the rest's +1 and the units'
+        /// −1 pass).
         #[test]
-        fn a_prompt_batch_off_the_plans_count_is_refused() {
-            let unit = 1000;
-            let reserve = 50_000;
-            let at_default = PROMPT_GROUP;
-            assert!(check_prompt_bytes(reserve, reserve, unit, at_default).is_ok());
+        fn a_prompt_batch_off_the_plans_parts_is_refused() {
+            let i = inputs();
+            let cols = prompt_cols(CTX);
+            let unit = unit_bytes(i.hp.n_embd, cols, i.hp.hc.streams, i.hp.n_used, false) as u64;
+            let tiles = card_tile_bytes(i.hp.n_embd, i.hp.expert_ff, i.hp.n_used, cols)
+                + card_leg_bytes(
+                    i.hp.n_embd,
+                    i.hp.expert_ff,
+                    i.hp.n_used,
+                    card_leg_forms(&i.model),
+                );
+            let attn = prompt_attn_bytes(i.attn_shape(), CTX);
+            let rest =
+                prompt_front_bytes(&i, CTX) + prompt_shared_bytes(&i.hp, cols) + tiles as u64;
+            let units = group_sets(PROMPT_GROUP) as u64 * unit;
+            let parts = prompt_parts(&i, CTX, false);
             assert_eq!(
-                check_prompt_bytes(reserve + 1, reserve, unit, at_default)
-                    .expect_err("one byte over")
-                    .to_string(),
-                "a prompt batch takes 50001 B on the card; the plan counts 50000 B for it \
-                 (place::prompt_reserve_bytes)"
+                (parts.bytes(), prompt_reserve_bytes(&i, CTX, false)),
+                (attn + units + rest, attn + units + rest)
+            );
+            let made = |units: u64, rest: u64| {
+                [
+                    (PROMPT_ATTN, attn),
+                    (PROMPT_UNITS, units),
+                    (PROMPT_REST, rest),
+                ]
+            };
+            assert!(parts.check("glm5next", &made(units, rest)).is_ok());
+            let e = parts
+                .check("glm5next", &made(units - 1, rest + 1))
+                .expect_err("two parts apart, the total equal");
+            assert_eq!(
+                e.apart.iter().map(|a| a.name).collect::<Vec<_>>(),
+                [PROMPT_UNITS, PROMPT_REST]
             );
             let more = PROMPT_GROUP + 1;
             let extra = (group_sets(more) - group_sets(PROMPT_GROUP)) as u64 * unit;
             assert!(extra > 0);
-            assert!(check_prompt_bytes(reserve + extra, reserve, unit, more).is_ok());
-            assert!(check_prompt_bytes(reserve, reserve, unit, more).is_err());
+            let at_more = parts.with_part(prompt_units(unit, more));
+            assert!(
+                at_more
+                    .check("glm5next", &made(units + extra, rest))
+                    .is_ok()
+            );
+            assert!(at_more.check("glm5next", &made(units, rest)).is_err());
         }
 
         /// The card leg's reserve follows the card layers' types: a file whose
