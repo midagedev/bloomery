@@ -9418,10 +9418,10 @@ MAC_ENV = ("BLOOMERY_BOX", "BLOOMERY_CARD", "BLOOMERY_DATA", "BLOOMERY_FIXTURE_V
 # key holds its family's fixture directory only (KeyContext.fixture_dirs; the family's row of tools/fixture-dirs.tsv, the one
 # owner), as a variant's below holds its tag's, so a fixture written for one family moves no other family's key. An item whose
 # family cannot be told keeps every row of FIXTURE_ROOT: never under-keyed.
-# The roots a model directory lives under: the box's drive, and the one a model moved off it names by its full path (no link
-# stays behind). model_dir_of, MODEL_LITERAL, PROFILE_PATHS and the box-env test all read this list; FIXTURE_ROOT and
+# The roots a model directory lives under: the box's drive, and the ones a model moved off it names by its full path (no link
+# stays behind): /data/moved/models and the root drive's /home/user/models. model_dir_of, MODEL_LITERAL, PROFILE_PATHS and the box-env test all read this list; FIXTURE_ROOT and
 # VARIANT_ROOT below stay under the first.
-MODEL_ROOTS = ("/models", "/data/moved/models")
+MODEL_ROOTS = ("/models", "/data/moved/models", "/home/user/models")
 FIXTURE_ROOT = "/models/fixtures"
 # A fixture variant (tools/fixture-variants.tsv, tools/ref/ref-paths.sh): the family's fixture requantized to a tag's type map, its files
 # below VARIANT_ROOT/<tag>, beside the fixture root and not under it (ref-paths.sh moves the root to the tag's directory, and a variant
@@ -9547,10 +9547,11 @@ CARGO_PARAM = re.compile(r"(?:--features|--bin|--test|--example|--package|-p|-F)
 
 # A reference tree (ik, llama.cpp, mistral.rs) is outside the manifest: a recipe that reads one is
 # never skipped. The profiles and ref-paths.sh only define these names for every box command. The home
-# path is spelled with a class so that this file, which check-recipes runs, does not match itself.
-IK_READ = re.compile(r"\$\{?(?:IK|IKBIN|LCPP|LCPPBIN|MRS|MRSBIN)\b|/home/[u]ser/")
+# path is spelled with a class so that this file, which check-recipes runs, does not match itself. A path under the
+# MODEL_ROOTS root in the home directory is a model file, keyed as one, not a reference tree.
+IK_READ = re.compile(r"\$\{?(?:IK|IKBIN|LCPP|LCPPBIN|MRS|MRSBIN)\b|/home/[u]ser/(?!models\b)")
 IK_DEFINERS = ("tools/ref/ref-paths.sh", "tools/ref/models/")
-HOME_LITERAL = re.compile(r"\"/home/")
+HOME_LITERAL = re.compile(r"\"/home/(?![u]ser/models\b)")
 # A walk of the tree, which no closure bounds: the recipe is keyed on the whole tree.
 TREE_WALK = re.compile(
     r"\bfind\s+\"?(?:\$\{?(?:ROOT|HERE)\}?\"?(?:/\S*)?|\.|crates|tools|docs)(?=[\s\"/]|$)"
