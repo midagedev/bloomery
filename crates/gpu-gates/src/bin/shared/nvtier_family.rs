@@ -49,7 +49,7 @@ use bloomery_gpu::host::nvtier::{NvTier, NvTierStats};
 use bloomery_gpu_gates::logits_band;
 use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::{GateError, checks_failed, record, tier, verdict};
-use bloomery_levers::{EXPERT_RANK, NVTIER_MEM, RESIDENCY_SERVING, ResidencyWord, residency_word};
+use bloomery_levers::{NVTIER_MEM, RESIDENCY_SERVING, ResidencyWord, residency_word};
 use model::placement::workstation::HostNeed;
 use model::placement::{ArenaFloor, Device, ExpertRank, PlacementError, Plan, Role, arena_slots};
 
@@ -539,6 +539,16 @@ pub trait Family {
     /// The family's own refusal: a model whose layers it cannot order.
     fn write_rank(&self, _dir: &Path) -> Result<PathBuf, GateError> {
         Err("this family writes no rank: its gate runs no rank clause".into())
+    }
+
+    /// Names `rank` to the rank clause's child `cmd` through the family's rank lever, the
+    /// child's environment alone. A family's own file sets it, so the pin is that gate's, not
+    /// every gate's that includes this harness. Read only where [`Family::takes_rank`] holds.
+    ///
+    /// # Errors
+    /// A family that writes no rank.
+    fn rank_child(&self, _cmd: &mut Command, _rank: &Path) -> Result<(), GateError> {
+        Err("this family names no rank to a child: its gate runs no rank clause".into())
     }
 
     /// The rank clause's run with the logits rows kept: one decode step a
@@ -1096,8 +1106,8 @@ fn rank_clause<F: Family>(name: &str, f: &F, arm: Arm) -> Result<bool, GateError
         .arg(arm.room.to_string())
         .arg(arm.arena.map_or_else(|| "-".to_string(), |a| a.to_string()))
         .arg(&rank)
-        .arg(&rows)
-        .env(EXPERT_RANK, &rank);
+        .arg(&rows);
+    f.rank_child(&mut cmd, &rank)?;
     bloomery_gpu_gates::die_with_parent(&mut cmd);
     let out = cmd
         .output()
