@@ -2533,9 +2533,10 @@ gate-ds41-reads:
 # in one row, a fixture row declares its row's architecture, the draft rules are the three rows that have one,
 # tools/arch-registry.tsv (which tools/hf-arch-check.py reads) is the registry's print, and each family's written fixture
 # (the nine GGUF ones under /models/fixtures, BLOOMERY_FIXTURE_ROOT; a cut folder is read by its own reader) reads through the registry exactly as its family's own reader
-# does. Headers only, no card. Either tier: it reads the fixtures as they are.
+# does. Headers only, no card. Either tier: it reads the fixtures as they are. The kcover table (tests/kcover.rs: what each
+# fixture cannot reach of its real file, from the checked-in headers) runs with it.
 gate-arch-registry:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::registry --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::registry --include-ignored --nocapture && bash tools/gate.sh --release -p bloomery-model --test kcover -- --nocapture'
 
 # 1-5 스레드 풀 게이트: 상주 워커 풀의 분할 전수·커버리지·반복 호출·패닉 전파.
 # hw_ 토폴로지 테스트는 #[ignore]라 --include-ignored로 같이 돈다. The pool's own unit tests (--lib: the L3 size
