@@ -737,7 +737,7 @@ impl PlanInputs {
             plan.cards[0].headroom_bytes - i128::from(beside) - i128::from(card.margin_bytes);
         let room = u64::try_from(room).unwrap_or(0);
         if let Some((half, bytes)) =
-            place_hybrid::plan_ring_last(room, max_half, |h| ring_bytes_at(slot, slots, h))
+            place_hybrid::plan_ring_last(room, (0, max_half), |h| ring_bytes_at(slot, slots, h))
         {
             plan.cards[0].grow_ring(bytes, half);
         }

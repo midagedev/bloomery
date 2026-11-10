@@ -205,21 +205,78 @@ pub const fn ring_halves_bytes(slot: u64, half: u64) -> u64 {
     2 * half * slot
 }
 
-/// The ring planned last, the one rule of every family whose plan counts the ring after its other
-/// terms: the largest half of at most `max_half` slots (the most host experts a layer leaves) whose
-/// ring `bytes_of(half)` fits `room`, the headroom less the margin and what the caller counts past
-/// the totals. `Some((half, bytes))`, `None` when not even one slot's ring fits. The caller counts
-/// the bytes as the card's ring term ([`CardTotals::grow_ring`](crate::placement::CardTotals::grow_ring)).
+/// The shape of the ring pass's GEMM buffers ([`ring_pass_bytes_in`]) a family's body makes over a
+/// half of the stream's ring: the rows of a prompt batch, the picks a row, the model's width, an
+/// expert's width and the forms the routed stacks read.
+#[derive(Clone, Copy, Debug)]
+pub struct RingPass {
+    pub rows: usize,
+    pub n_used: usize,
+    pub n: usize,
+    pub ff: usize,
+    pub forms: RingForms,
+}
+
+/// The facts a family gives the one ring rule: `floor` slots a half reserved before the experts,
+/// a slot of `slot` bytes ([`stream_slot_bytes`]) and the pass's shape. The ring's card bytes at a
+/// half are [`StreamRing::bytes`]; the plan grows the half past the floor from the headroom
+/// ([`plan_ring_last`]) up to the most host experts a layer leaves.
+#[derive(Clone, Copy, Debug)]
+pub struct StreamRing {
+    pub floor: u64,
+    pub slot: u64,
+    pub pass: RingPass,
+}
+
+impl StreamRing {
+    /// The ring pass's buffers over a half of `half` slots.
+    #[must_use]
+    pub fn pass_bytes(&self, half: u64) -> u64 {
+        let p = &self.pass;
+        ring_pass_bytes_in(p.rows, p.n_used, p.n, p.ff, half as usize, p.forms) as u64
+    }
+
+    /// The ring's card bytes over a half of `half` slots: its two halves and the pass's buffers.
+    #[must_use]
+    pub fn bytes(&self, half: u64) -> u64 {
+        ring_halves_bytes(self.slot, half) + self.pass_bytes(half)
+    }
+}
+
+/// The card bytes the stream's ring buffers may take on `plan`'s stage card under `inputs`: its
+/// ring term less the pass over the planned half ([`ring_room_cap`]). `None` for a plan that counts
+/// no ring (its load does not stream): the ring then takes what the card's margin leaves past the
+/// keep-free.
+#[must_use]
+pub fn planned_room_cap<H>(plan: &Plan<'_>, inputs: &PlanInputs<H>) -> Option<u64> {
+    let stage = plan.cards.first().filter(|c| c.ring_half > 0)?;
+    let ring = inputs.ring.as_ref()?;
+    Some(ring_room_cap(
+        stage.ring_bytes,
+        ring.pass_bytes(stage.ring_half),
+    ))
+}
+
+/// The ring, the one rule of every family that streams: a reserved floor of `floor` slots a half,
+/// counted before the experts, then grown last from what every other term leaves up to `cap`
+/// slots (the most host experts a layer leaves). The half is the largest of at most `cap` slots
+/// whose ring `bytes_of(half)` fits `room` (the headroom less the margin and what the caller
+/// counts past the totals, with the floor's bytes still inside it), never under `floor`: the floor
+/// is reserved, so it holds whatever the room. A floor at `cap` is a fixed ring and searches
+/// nothing. `Some((half, bytes))`, `None` when the ring is of no slot. The caller counts the bytes
+/// as the card's ring term ([`CardTotals::grow_ring`](crate::placement::CardTotals::grow_ring)).
 #[must_use]
 pub fn plan_ring_last(
     room: u64,
-    max_half: u64,
+    (floor, cap): (u64, u64),
     bytes_of: impl Fn(u64) -> u64,
 ) -> Option<(u64, u64)> {
-    match largest_half(room, max_half, &bytes_of) {
-        0 => None,
-        half => Some((half, bytes_of(half))),
-    }
+    let half = if floor >= cap {
+        floor
+    } else {
+        floor.max(largest_half(room, cap, &bytes_of))
+    };
+    (half > 0).then(|| (half, bytes_of(half)))
 }
 
 /// The card bytes the stream's ring buffers may take under a ring term of `term` bytes whose ring
@@ -376,6 +433,11 @@ pub struct PlanInputs<H> {
     /// stream's lane pins its host staging in slots of these bytes for the load's life, which the
     /// seat reserves on the plan's host (`workstation::XSTREAM_STAGING_RESERVE`).
     pub stream_slot: u64,
+    /// The ring a streaming load plans ([`PlanInputs::streaming`]): its floor's bytes are a part of
+    /// [`PlanInputs::prompt_reserve`], reserved before the experts, and the plan counts the ring as
+    /// the card's ring term ([`CardTotals::ring_bytes`]), grown past the floor last. `None` for a
+    /// load that streams none.
+    pub ring: Option<StreamRing>,
     /// Whether the loader serves the common host-run NVMe arena. Opt-in only: a plan cannot
     /// promise paging merely because the placement can split the expert stacks.
     nvme_tier: bool,
@@ -517,6 +579,7 @@ impl<H> PlanInputs<H> {
             prompt_reserve: 0,
             tier_reserve: None,
             stream_slot: 0,
+            ring: None,
             nvme_tier: false,
             pass_arena: false,
             engine,
@@ -536,15 +599,17 @@ impl<H> PlanInputs<H> {
     }
 
     /// `self` for a load whose prompt calls stream their host experts (`BLOOMERY_XSTREAM=split`):
-    /// the prompt reserve grows by the stream's `ring` bytes ([`stream_ring_bytes`]), and a slot of
-    /// the ring is `slot` bytes ([`PlanInputs::stream_slot`]). A load that does not stream plans
-    /// without them; its ring, if one is set later, takes what the card's margin leaves free past
-    /// the stream's keep-free.
+    /// the prompt reserve grows by the ring's bytes at its floor ([`StreamRing::bytes`]), which the
+    /// plan counts as the card's ring term and grows last ([`PlanInputs::plan_with_slots`]), and a
+    /// slot of the ring is `ring.slot` bytes ([`PlanInputs::stream_slot`]). A load that does not
+    /// stream plans without them; its ring, if one is set later, takes what the card's margin
+    /// leaves free past the stream's keep-free.
     #[must_use]
-    pub fn streaming(self, ring: u64, slot: u64) -> PlanInputs<H> {
-        let reserve = self.prompt_reserve.saturating_add(ring);
+    pub fn streaming(self, ring: StreamRing) -> PlanInputs<H> {
+        let reserve = self.prompt_reserve.saturating_add(ring.bytes(ring.floor));
         PlanInputs {
-            stream_slot: slot,
+            stream_slot: ring.slot,
+            ring: Some(ring),
             ..self.with_prompt_reserve(reserve)
         }
     }
@@ -721,8 +786,28 @@ impl<H> PlanInputs<H> {
         // The batch's bytes are reserved out of every card's expert budget above and are a term
         // of the stage card's count, so the card-byte invariant's reading at the load and the
         // first prompt holds them ([`CardTotals::grow_prompt`]).
+        // The ring's floor is a part of that reserve and the experts were fitted around it; the
+        // ring is the card's ring term, not its prompt term, grown last from the headroom every
+        // other term leaves up to the most host experts a routed layer leaves: the one rule
+        // ([`plan_ring_last`]).
         if let Some(stage) = plan.cards.first_mut() {
-            stage.grow_prompt(reserve);
+            let floor_bytes = self.ring.map_or(0, |r| r.bytes(r.floor));
+            stage.grow_prompt(reserve - floor_bytes);
+        }
+        if let Some(ring) = self.ring {
+            let mut cap = 0;
+            for l in 0..self.model.layers {
+                if self.model.layer_experts(l) > 0 {
+                    cap = cap.max(plan.host_experts(l)?);
+                }
+            }
+            let margin = machine.cards.first().map_or(0, |c| c.margin_bytes);
+            let room = plan.cards[0].headroom_bytes - i128::from(margin);
+            let room = u64::try_from(room).unwrap_or(0);
+            if let Some((half, bytes)) = plan_ring_last(room, (ring.floor, cap), |h| ring.bytes(h))
+            {
+                plan.cards[0].grow_ring(bytes, half);
+            }
         }
         // The host-backed rooms' pages the plan sends to the host (`spill`: those past the floor,
         // `all`: every page) count against the host room before the NVMe tier's split reads it.
@@ -1236,18 +1321,145 @@ impl KvBytes for KvLayout {
     }
 }
 
+/// The pin of a family's ring under the one rule: `plain` streamed ([`PlanInputs::streaming`]) plans
+/// the experts a layer keeps and the expert bytes of the plan that holds the ring's floor in its
+/// prompt reserve (the ring's bytes at the floor, the reserve the experts are fitted around), then
+/// counts the ring as the stage card's ring term: a half of at least the floor, the largest the
+/// headroom every other term leaves holds (or the most host experts a layer leaves), its bytes
+/// [`StreamRing::bytes`] of that half, the prompt term the plain plan's. Returns the stage card and
+/// the experts a layer keeps.
+#[cfg(test)]
+pub(crate) fn assert_ring_cap<H: Clone>(
+    plain: &PlanInputs<H>,
+    ring: StreamRing,
+    machine: &Machine,
+    ctx: u64,
+) -> (CardTotals, Vec<u64>) {
+    let floor_bytes = ring.bytes(ring.floor);
+    let streamed = plain.clone().streaming(ring);
+    let old = plain
+        .clone()
+        .with_prompt_reserve(plain.prompt_reserve + floor_bytes);
+    let levers = PlanLevers::default();
+    let (new_plan, old_plan) = (
+        streamed
+            .plan(machine, ctx, &levers)
+            .expect("the streamed plan"),
+        old.plan(machine, ctx, &levers)
+            .expect("the plan with the floor in its reserve"),
+    );
+    assert_eq!(
+        new_plan.n_l, old_plan.n_l,
+        "the experts a layer keeps on the cards"
+    );
+    let (stage, was) = (&new_plan.cards[0], &old_plan.cards[0]);
+    assert_eq!(stage.expert_bytes, was.expert_bytes);
+    assert_eq!(stage.prompt_bytes + floor_bytes, was.prompt_bytes);
+    assert_eq!(was.ring_bytes, 0);
+    assert!(new_plan.cards[1..].iter().all(|c| c.ring_bytes == 0));
+    assert!(stage.ring_half >= ring.floor, "the floor is reserved");
+    assert_eq!(stage.ring_bytes, ring.bytes(stage.ring_half));
+    // The ring is the last term: what the floor left in the headroom, less the margin, holds it.
+    let margin = i128::from(machine.cards[0].margin_bytes);
+    if stage.ring_half > ring.floor {
+        assert!(
+            i128::from(stage.ring_bytes) <= was.headroom_bytes + i128::from(floor_bytes) - margin,
+            "the grown ring fits the headroom"
+        );
+    }
+    assert_eq!(
+        stage.headroom_bytes,
+        was.headroom_bytes + i128::from(floor_bytes) - i128::from(stage.ring_bytes)
+    );
+    (stage.clone(), new_plan.n_l.clone())
+}
+
+/// The pin of the ring's growth past its floor, on `base` with its stage card's usable bytes set
+/// to those the plan of a ring of a floor and a slot `shrink` times smaller than the family's (the
+/// small headers hold fewer experts a layer than the family's floor, and a card's headroom under
+/// one expert holds several slots) keeps `experts` experts on, and then
+/// `steps` cards more by `step` bytes each ([`assert_ring_cap`] on every one): the half grows past
+/// the floor on some card, every grown ring fits the headroom the experts leave and is
+/// [`StreamRing::bytes`] of its half, and the experts a layer keeps are those of the floor's plan.
+/// Returns the largest half planned.
+#[cfg(test)]
+pub(crate) fn assert_ring_grows<H: Clone>(
+    plain: &PlanInputs<H>,
+    ring: StreamRing,
+    shrink: u64,
+    base: &Machine,
+    (experts, steps, step): (u64, u64, u64),
+    ctx: u64,
+) -> u64 {
+    let small = StreamRing {
+        floor: (ring.floor / shrink).max(1),
+        slot: ring.slot / shrink,
+        ..ring
+    };
+    let streamed = plain.clone().streaming(small);
+    let on = |usable: u64| {
+        let mut m = base.clone();
+        m.cards[0].usable_bytes = usable;
+        m.cards[0].free_bytes = None;
+        m
+    };
+    let holds = |usable: u64| {
+        streamed
+            .plan(&on(usable), ctx, &PlanLevers::default())
+            .is_ok_and(|p| p.n_l.iter().sum::<u64>() >= experts)
+    };
+    let (mut lo, mut hi) = (0u64, 1u64 << 40);
+    while lo + 1 < hi {
+        let mid = lo + (hi - lo) / 2;
+        if holds(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    let grown = (0..steps)
+        .map(|k| {
+            assert_ring_cap(plain, small, &on(hi + k * step), ctx)
+                .0
+                .ring_half
+        })
+        .max()
+        .expect("a card");
+    assert!(
+        grown > small.floor,
+        "no card of {steps} left the headroom for a half past the floor of {}: {grown}",
+        small.floor
+    );
+    grown
+}
+
 #[cfg(test)]
 mod tests {
     /// The common ring owner: the largest half that fits, none when not one slot does, the cap
-    /// the term less the pass.
+    /// the term less the pass; a reserved floor holds whatever the room, grows to what fits up to
+    /// the cap, and a floor at the cap is a fixed ring.
     #[test]
     fn the_ring_is_planned_by_one_rule() {
         let bytes = |h: u64| ring_halves_bytes(10, h) + ring_route_bytes(64, h as usize);
-        assert_eq!(plan_ring_last(bytes(5), 8, bytes), Some((5, bytes(5))));
-        assert_eq!(plan_ring_last(bytes(5) - 1, 8, bytes), Some((4, bytes(4))));
-        assert_eq!(plan_ring_last(u64::MAX, 8, bytes), Some((8, bytes(8))));
-        assert_eq!(plan_ring_last(0, 8, bytes), None);
-        assert_eq!(plan_ring_last(u64::MAX, 0, bytes), None);
+        assert_eq!(plan_ring_last(bytes(5), (0, 8), bytes), Some((5, bytes(5))));
+        assert_eq!(
+            plan_ring_last(bytes(5) - 1, (0, 8), bytes),
+            Some((4, bytes(4)))
+        );
+        assert_eq!(plan_ring_last(u64::MAX, (0, 8), bytes), Some((8, bytes(8))));
+        assert_eq!(plan_ring_last(0, (0, 8), bytes), None);
+        assert_eq!(plan_ring_last(u64::MAX, (0, 0), bytes), None);
+        // A floor of 3 holds in a room under 2 slots and in none; it grows with the room to the cap.
+        assert_eq!(
+            plan_ring_last(bytes(2) - 1, (3, 8), bytes),
+            Some((3, bytes(3)))
+        );
+        assert_eq!(plan_ring_last(0, (3, 8), bytes), Some((3, bytes(3))));
+        assert_eq!(plan_ring_last(bytes(5), (3, 8), bytes), Some((5, bytes(5))));
+        assert_eq!(plan_ring_last(u64::MAX, (3, 8), bytes), Some((8, bytes(8))));
+        // A floor at the cap is fixed: the room does not move it.
+        assert_eq!(plan_ring_last(u64::MAX, (3, 3), bytes), Some((3, bytes(3))));
+        assert_eq!(plan_ring_last(0, (3, 3), bytes), Some((3, bytes(3))));
         assert_eq!(
             ring_room_cap(bytes(5), ring_route_bytes(64, 5)),
             ring_halves_bytes(10, 5)
