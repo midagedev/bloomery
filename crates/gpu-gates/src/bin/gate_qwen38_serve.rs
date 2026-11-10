@@ -5525,7 +5525,8 @@ mod gate {
         let (budget, fitted) = small_card_budget(levers, small)?;
         let budget_bytes = budget.to_string();
         let mut cmd = Command::new(Served38::exe()?);
-        cmd.env(bloomery_levers::HOST_ROOM, &paged_arg)
+        small_card_kv(&mut cmd)
+            .env(bloomery_levers::HOST_ROOM, &paged_arg)
             .env(bloomery_levers::CARD_BUDGET, &budget_bytes)
             .env(bloomery_levers::RESIDENCY, "off")
             .env_remove(bloomery_levers::DRAFT)
@@ -5721,6 +5722,42 @@ mod gate {
         Ok(ok)
     }
 
+    /// The K/V levers the small-card server runs under, set on its `cmd`: both `off`
+    /// ([`SMALL_CARD_KV`]), the plan of the context alone that [`small_card_budget`] derives the
+    /// yield's premise from ([`small_card_levers`]).
+    fn small_card_kv(cmd: &mut Command) -> &mut Command {
+        let (floor, host) = SMALL_CARD_KV;
+        let floor = match floor {
+            bloomery_levers::KvFloor::Off => "off".to_owned(),
+            bloomery_levers::KvFloor::At(n) => n.to_string(),
+            bloomery_levers::KvFloor::Unset => {
+                return cmd.env(bloomery_levers::KV_HOST, host.name());
+            }
+        };
+        cmd.env(bloomery_levers::KV_FLOOR, floor)
+            .env(bloomery_levers::KV_HOST, host.name())
+    }
+
+    /// The small-card server's K/V levers, the floor and the host's: the server resolves them
+    /// against its unset defaults (`qwen38_levers::KV_DEFAULT`), so a set `off` is the plan of
+    /// the context alone, which the yield's premise is.
+    // PIN(2026-11-10): kvflip made the unset K/V floor 8192 + spill; the yield's premise is the
+    // context-alone plan (small_card_budget's), so the server takes both levers off.
+    const SMALL_CARD_KV: (bloomery_levers::KvFloor, bloomery_levers::KvHost) =
+        (bloomery_levers::KvFloor::Off, bloomery_levers::KvHost::Off);
+
+    /// The plan levers the small-card server resolves at the card budget `budget`: its K/V
+    /// levers ([`SMALL_CARD_KV`]) over the server's unset defaults, every other lever unset —
+    /// the one source of the server's levers ([`small_card_kv`]) and its premise's.
+    fn small_card_levers(budget: u64) -> PlanLevers {
+        let (floor, host) = SMALL_CARD_KV;
+        PlanLevers {
+            card_budget_bytes: Some(budget).into(),
+            ..PlanLevers::default()
+        }
+        .resolve_kv(floor, Some(host), crate::qwen38_levers::KV_DEFAULT)
+    }
+
     /// The card budget under which the unset draft yields to the context on
     /// `card` (`a` as the small-card server resolves it, at the seat's free
     /// reading, [`stage_at`], or a unified card's own pool), to a MiB, and
@@ -5754,13 +5791,14 @@ mod gate {
         })?;
         let rows = head_rows_of(None, &split, inputs.spec.vocab)?.rows;
         let mtp = MtpInputs::read(&draft, &split, &inputs, rows)?;
+        // The room `route_machine` reserves is the card's own (`KvHost::Off`): the server's host.
+        const {
+            assert!(matches!(SMALL_CARD_KV.1, bloomery_levers::KvHost::Off));
+        }
         let holds = |budget: u64, c: u64, drafted: bool| -> Result<bool, GateError> {
             let ub = u64::try_from(ubatch_for(usize::try_from(c)?)?)?;
             let machine = route_machine(&inputs, card, (ub, c), experts, (1, drafted))?;
-            let plan_levers = PlanLevers {
-                card_budget_bytes: Some(budget).into(),
-                ..PlanLevers::default()
-            };
+            let plan_levers = small_card_levers(budget);
             Ok(inputs
                 .plan_target(
                     &machine,
