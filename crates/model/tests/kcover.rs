@@ -336,3 +336,35 @@ fn kcover_each_planned_fixture_is_its_cut() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// The MiMo fixture records a planned card budget: the planner's least cap for the cut of its
+/// source's header, under which the plan at the end-to-end gate's context holds half of the routed
+/// experts on every card-eligible layer (`check_budget` proves the least-cap property), and the
+/// budget is the plan's own, not a constant a plan can refuse: a plan under it succeeds, and one
+/// at the old fixed 2 GiB is refused by name below its floor (the layer's dense, stores, context,
+/// scratch and prompt reserve past the 2 GiB the old constant gave the experts).
+#[test]
+fn kcover_the_mimo_fixture_budget_is_its_plan() {
+    let p = pairs()
+        .into_iter()
+        .find(|p| p.fixture == dir_of("mimo2"))
+        .expect("the mimo2 pair");
+    let fx = reach::fixture_header(&p.spec, &p.source).expect("the fixture's header");
+    let model::fixture::CardBudget::Planned(planner) = p.spec.card_budget else {
+        panic!("the mimo2 fixture's card budget is a constant, not a plan's value");
+    };
+    let (cap, _) = model::fixture::plan_budget(&p.spec.card_budget, &fx).expect("a budget plans");
+    let got = model::fixture::check_budget(&planner, &fx, cap).expect("the cap holds its half");
+    let full = (planner.card_experts)(&fx, None).expect("the budgetless plan");
+    assert_eq!(got.experts, full.experts);
+    for (l, (&n, &all)) in got.per_layer.iter().zip(&full.per_layer).enumerate() {
+        assert_eq!(n, if all > 0 { all / 2 } else { 0 }, "layer {l}");
+    }
+    assert!(got.per_layer.iter().any(|&n| n > 0), "a card expert");
+    // The old constant: 2 GiB is below the cut's floor (the plan's own terms, read from the
+    // refusal's line: dense 1,082,130,432 + KV 16,711,680 + context 536,870,912 + scratch
+    // 67,108,864 + margin 1,073,741,824 + beside 316,919,808 = 3,093,483,520 B).
+    let e = (planner.card_experts)(&fx, Some(2 << 30)).expect_err("2 GiB is below the floor");
+    assert!(e.to_string().contains("is below its floor 3093483520 B"), "{e}");
+    assert!(cap > 3_093_483_520, "the planned cap {cap} holds the floor and the experts");
+}

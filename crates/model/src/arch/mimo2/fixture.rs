@@ -23,18 +23,25 @@
 //! selection bias are spreads, per element ([`SINK_HALF_WIDTH`], [`BIAS_HALF_WIDTH`]), so a body
 //! that broadcasts one value or skips one fails.
 //!
-//! The card budget is fixed: the recorded 2 GiB is below the fixture's tensor data, so a plan at it
-//! keeps most routed experts off the card, and a gate passes its own. No draft file: the MTP
-//! sidecar is a file of its own, with no fixture yet. No r8 sidecar.
+//! The card budget ([`Budget`]) is planned, not fixed: under it the plan of the written file, at
+//! the end-to-end gate's context ([`BUDGET_CTX`]), holds half of the routed experts on the card of
+//! every card-eligible layer, and the rest is the host tier's. The budget is a plan's value, not a
+//! constant: a plan counts the dense block, the stores, the context, the scratch and the prompt
+//! reserve of the file it plans, so a budget below that sum is refused by name at the plan. No
+//! draft file: the MTP sidecar is a file of its own, with no fixture yet. No r8 sidecar.
 
 use gguf::Split;
 
 use super::hparams::{Hparams, Kind};
+use super::place::PlanInputs;
 use crate::arch::names::blk;
 use crate::fixture::hybrid;
 use crate::fixture::{
-    CardBudget, Family, FixtureError, FixtureSpec, KeyRule, NoTables, Tables, Window,
+    Budget, CardBudget, CardExperts, Family, FixtureError, FixtureSpec, KeyRule, NoTables, Tables,
+    Window,
 };
+use crate::placement::PlanLevers;
+use crate::placement::workstation::{self, HostRead};
 
 /// Fixture layer `f` holds source layer `LAYER_MAP[f]` (the table above).
 pub const LAYER_MAP: [usize; 2] = [0, 1];
@@ -49,8 +56,10 @@ pub const D_MAX: f32 = 1.0 / 16.0;
 /// real file is.
 pub const SHARD_BYTES: u64 = 4 << 30;
 
-/// The card byte budget the fixture records; see the module's last paragraph.
-pub const CARD_BUDGET: u64 = 2 << 30;
+/// The positions the card budget's plan runs at: the end-to-end gate's context
+/// (`gate_mimo2_e2e.rs` `CTX`, the 4,096-position set's step plus a margin of whole 64
+/// positions). A plan at another context moves the stores, and with them the experts a card holds.
+pub const BUDGET_CTX: u64 = 4160;
 
 /// The target file is `<STEM>-0000i-of-0000N.gguf`.
 pub const STEM: &str = "mimo2-fixture";
@@ -71,14 +80,18 @@ pub const SINK_HALF_WIDTH: f32 = 1.0;
 pub const BIAS_HALF_WIDTH: f32 = 0.05;
 
 /// The MiMo-V2.6-Flash fixture: [`LAYER_MAP`], the window [[`D_MIN`], [`D_MAX`]], the RL file as
-/// the default source, no ff override, no draft and a fixed card budget.
+/// the default source, no ff override, no draft and the planned card budget.
 pub fn spec() -> FixtureSpec {
     FixtureSpec {
         arch: ARCH,
         stem: STEM,
         layers: LAYER_MAP.to_vec(),
         ratios: Vec::new(),
-        card_budget: CardBudget::Fixed(CARD_BUDGET),
+        card_budget: CardBudget::Planned(Budget {
+            ctx: BUDGET_CTX,
+            card_experts,
+            card_set_aside: None,
+        }),
         window: Window::new(D_MIN, D_MAX).expect("[2^-14, 2^-4] is inside the normal f16 values"),
         ff: None,
         shard_bytes: SHARD_BYTES,
@@ -165,6 +178,26 @@ fn kinds(src: &Hparams, source: &Split) -> Vec<LayerKind> {
 /// source layer holds ([`hybrid::check_map`]).
 pub fn check_map(src: &Hparams, source: &Split, layers: &[usize]) -> Result<(), FixtureError> {
     hybrid::check_map(&kinds(src, source), &KEPT, source, layers)
+}
+
+/// The per-layer card experts of the plan of `split` on the gate card ([`workstation::plan_gate`],
+/// the 3090) at [`BUDGET_CTX`] positions under `budget` bytes, as the end-to-end gate's session
+/// plans a file it opens: the file as it is, at the workstation's plan room.
+fn card_experts(split: &Split, budget: Option<u64>) -> Result<CardExperts, FixtureError> {
+    let mut inputs = PlanInputs::describe(split)?;
+    inputs.room = (workstation::PLAN_ROOM, HostRead::Given);
+    let machine = workstation::plan_gate(inputs.model.layers);
+    let levers = PlanLevers {
+        card_budget_bytes: budget.into(),
+        ..PlanLevers::default()
+    };
+    let plan = inputs
+        .plan(&machine, BUDGET_CTX, &levers)
+        .map_err(|e| FixtureError::Budget(e.to_string()))?;
+    Ok(CardExperts {
+        per_layer: plan.n_l,
+        experts: inputs.model.experts,
+    })
 }
 
 /// mimo2's rules.
