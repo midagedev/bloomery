@@ -3485,6 +3485,11 @@ impl<H: HostExperts> HostTier<H> {
         let mut skip = 0u32;
         let mut serve_nodes = |point: step::NodePoint, picks: &[u64; MAX_TIERS]| {
             use step::NodePoint;
+            // A layer no node tier holds experts of, or a load with no tier,
+            // has nothing for the hook to send or settle.
+            if nodes == 0 {
+                return Ok(());
+            }
             let page = page.ok_or(GpuError::state(SERVE, "an expert tier (the node hook)"))?;
             match point {
                 NodePoint::Picks => {
