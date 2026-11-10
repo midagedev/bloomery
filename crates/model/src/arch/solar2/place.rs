@@ -247,10 +247,8 @@ mod tests {
             .plan(&machine, 64, &levers)
             .expect("the ample host fits");
         let held = whole.host.expert_bytes;
-        let pool = whole.cards[0].bytes()
-            + inputs.prompt_reserve
-            + workstation::HostNeed::of(&whole, 0).bytes()
-            - 1;
+        // The card's bytes count the prompt reserve as its prompt term.
+        let pool = whole.cards[0].bytes() + workstation::HostNeed::of(&whole, 0).bytes() - 1;
         machine.host_mut().usable_bytes = pool;
         machine.host_mut().reserves.clear();
         *machine.unified_mut() = Some(UnifiedPool { bytes: pool });

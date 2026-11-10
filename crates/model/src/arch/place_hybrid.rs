@@ -16,7 +16,8 @@
 //! A body that makes buffers beside the plan's terms on its card (the prompt batch's rows) states
 //! their bytes in [`PlanInputs::prompt_reserve`]: the expert rule spreads within the card's budget
 //! less them ([`placement::plan_routed_reserving`]) and a card that cannot hold them beside its
-//! other terms is refused by name ([`PlaceError::PromptOver`]). The family that makes the buffers
+//! other terms is refused by name ([`PlaceError::PromptOver`]); the plan counts them as the stage
+//! card's prompt term ([`CardTotals::grow_prompt`]). The family that makes the buffers
 //! owns the formula of their bytes; the body holds its allocation to the same figure.
 
 use std::num::NonZeroUsize;
@@ -522,6 +523,17 @@ impl<H> PlanInputs<H> {
         }
     }
 
+    /// `self` for a body whose scratch holds `bytes` for each block of `block` positions of the
+    /// context ([`KvLayout::with_block_scratch`]): counted at the context the plan is fitted to,
+    /// beside the machine's flat scratch term.
+    #[must_use]
+    pub fn with_block_scratch(self, bytes: u64, block: u64) -> PlanInputs<H> {
+        PlanInputs {
+            kv: self.kv.with_block_scratch(bytes, block),
+            ..self
+        }
+    }
+
     /// The card bytes the load of `machine` makes beside the plan's terms: the prompt batch's, and
     /// a tiered load's more. A machine that names an expert tier card where the body serves none
     /// is refused by name ([`PlaceError::Tier`]); a reserve-only member is no tier card.
@@ -615,6 +627,12 @@ impl<H> PlanInputs<H> {
             routed_rule(program),
             reserve,
         )?;
+        // The batch's bytes are reserved out of every card's expert budget above and are a term
+        // of the stage card's count, so the card-byte invariant's reading at the load and the
+        // first prompt holds them ([`CardTotals::grow_prompt`]).
+        if let Some(stage) = plan.cards.first_mut() {
+            stage.grow_prompt(reserve);
+        }
         // The host-backed rooms' pages the plan sends to the host (`spill`: those past the floor,
         // `all`: every page) count against the host room before the NVMe tier's split reads it.
         if plan.kv_host != KvHost::Off
@@ -862,6 +880,10 @@ pub struct KvLayout {
     /// body's scratch sized by the context, one copy whatever the resident sequences
     /// ([`KvLayout::with_position_scratch`]); 0 for a body whose scratch holds none.
     scratch_row: u64,
+    /// The bytes a block of positions adds to the stage's scratch, and the positions a block
+    /// holds ([`KvLayout::with_block_scratch`]): a buffer sized a block, rounded up, over the
+    /// context; `(0, 1)` for a body whose scratch holds none.
+    scratch_block: (u64, u64),
     /// The by-position buffers the body holds in rooms ([`KvLayout::with_rooms`]); none for a body
     /// whose stores are plain buffers.
     rooms: Option<PosLayout>,
@@ -941,6 +963,7 @@ impl KvLayout {
                 .sum(),
             sink_row,
             scratch_row: 0,
+            scratch_block: (0, 1),
             rooms: None,
             lanes: NonZeroUsize::MIN,
         })
@@ -963,6 +986,20 @@ impl KvLayout {
     pub fn with_position_scratch(self, row: u64) -> KvLayout {
         KvLayout {
             scratch_row: row,
+            ..self
+        }
+    }
+
+    /// The same layout with `bytes` in the stage's scratch for each block of `block` positions
+    /// of the context, the last block counted whole: the body's buffers sized a block a row
+    /// (the selection's block scores), which are not a whole number of bytes a position. Counted as
+    /// [`KvLayout::with_position_scratch`]'s are, on the stage's position rows at the plan's
+    /// context, one copy whatever the slots; the family that makes the buffers owns the formula of
+    /// `bytes` and its body holds its allocation to the same figure. A `block` of 0 is read as 1.
+    #[must_use]
+    pub fn with_block_scratch(self, bytes: u64, block: u64) -> KvLayout {
+        KvLayout {
+            scratch_block: (bytes, block.max(1)),
             ..self
         }
     }
@@ -1102,7 +1139,9 @@ impl KvBytes for KvLayout {
     }
 
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+        let (bytes, block) = self.scratch_block;
         (self.rope_row + self.sink_row + self.scratch_row) * ctx_max
+            + bytes.saturating_mul(ctx_max.div_ceil(block))
     }
 }
 
@@ -1311,6 +1350,26 @@ mod tests {
         );
         assert_eq!(kv.layer_bytes(0, 10), plain.layer_bytes(0, 10));
         assert_eq!(kv.layer_bytes(0, 10), 10 * (16 + 8) * 2);
+    }
+
+    /// A body's scratch sized a block of positions is `bytes` for each block over the context, the
+    /// last block whole, counted once whatever the resident sequences: 5 B a block of 4 positions
+    /// beside the 16 B rope row is 16 × 10 + 5 × 3 = 175 B at 10 positions, 16 × 9 + 5 × 3 = 159 B
+    /// at 9 and 16 × 8 + 5 × 2 = 138 B at 8, and the 10-position figure under three slots too.
+    /// Mutant: the blocks rounded down read 170 at 10, a block a position reads 210.
+    #[test]
+    fn a_block_scratch_rounds_the_last_block_up_and_is_one_copy() {
+        let mixers = [gqa(1, (16, 8), None, Some((1e7, 4)))];
+        let kv = KvLayout::of(&mixers)
+            .expect("GQA layers are sized")
+            .with_block_scratch(5, 4);
+        assert_eq!(kv.stage_position_bytes(10), 16 * 10 + 5 * 3);
+        assert_eq!(kv.stage_position_bytes(9), 16 * 9 + 5 * 3);
+        assert_eq!(kv.stage_position_bytes(8), 16 * 8 + 5 * 2);
+        assert_eq!(
+            kv.seq_terms().slots_of(3).stage_position_bytes(10),
+            16 * 10 + 5 * 3
+        );
     }
 
     /// A layer that selects blocks keeps one f16 index key of the selector's `d` values for every

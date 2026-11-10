@@ -631,6 +631,10 @@ impl PlanInputs {
                 self.prompt_reserve,
             )?,
         };
+        // The pass's bytes are reserved out of the expert budget above and are a term of the
+        // card's count ([`CardTotals::grow_prompt`](crate::placement::CardTotals::grow_prompt)),
+        // so the card-byte invariant's reading holds them.
+        plan.cards[0].grow_prompt(self.prompt_reserve);
         let room = plan.plan_at(&self.room);
         placement::expert_nvme_tier(&mut plan, room, self.arena)?;
         // Under `Card` the body uploads every expert stack, so the host leg
