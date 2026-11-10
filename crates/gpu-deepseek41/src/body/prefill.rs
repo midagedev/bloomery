@@ -118,8 +118,10 @@ use std::time::Instant;
 
 use cuda_core::{CudaEvent, sys};
 use gguf::quant::GgmlType;
+use model::arch::deepseek41::batch::{self as batch41, BatchLevers, BatchShape, prompt_parts};
 use model::arch::deepseek41::names;
 use model::moe::UNION_MAX_COLS;
+use model::placement::parts::Parts;
 
 use bloomery_gpu::COL_GROUP;
 use bloomery_gpu::host::swap::{CallCfg, CallPick, CallReport};
@@ -153,6 +155,17 @@ const _: () = assert!(CHUNK == COL_GROUP);
 
 /// Chunks a batch cuts into at most: an unaligned first position adds one.
 const CHUNKS_MAX: usize = T_MAX / CHUNK + 1;
+// The batch's sizing ([`batch41::prompt_parts`]) counts the buffers at these
+// shapes and the kernels' constants.
+const _: () = assert!(
+    T_MAX == batch41::T_MAX
+        && CHUNK == batch41::CHUNK
+        && CHUNKS_MAX == batch41::CHUNKS_MAX
+        && LEG_PIECE == batch41::LEG_PIECE
+        && crate::params::Table::ALL.len() == batch41::TABLES
+        && crate::attn::SEG_KEYS == batch41::SEG_KEYS
+        && bloomery_gpu::indexer::HIST_BINS == batch41::INDEX_HIST_BINS
+);
 
 /// The shortest prompt a call streams host experts for: the shortest the
 /// flow model has a call plan of (`tools/flow/plans`), where it still gains
@@ -1036,6 +1049,11 @@ pub(super) struct Batch {
     /// The media half, made at load by [`prepare_media`]; `None` on a
     /// text-only load.
     media: Option<MediaBatch>,
+    /// The buffers' parts as the batch's sizing counts them
+    /// ([`batch41::prompt_parts`]), held to what was made, and the card's
+    /// allocation granule they are rounded at ([`Batch::device_bytes`]).
+    parts: Parts,
+    granule: std::num::NonZeroU64,
 }
 
 /// The prompt batch's media half, made once by [`prepare_media`]: per batch
@@ -1199,15 +1217,39 @@ impl Batch {
         self.attn.set_top_k(gpu, top_k)
     }
 
+    /// The card bytes of the buffers: the parts the batch was made to
+    /// ([`Batch::made_parts`] equal to them), rounded per buffer as the card's
+    /// allocator takes them at its granule ([`Parts::card_bytes`]), and the
+    /// media half's.
     fn device_bytes(&self) -> usize {
-        self.params.num_bytes()
-            + self.attn.device_bytes()
-            + self.proj.device_bytes()
-            + self.glue.device_bytes()
-            + self.ffn.device_bytes()
-            + self.sets.iter().map(BatchSet::device_bytes).sum::<usize>()
-            + self.staging.buf().num_bytes()
+        usize::try_from(self.parts.card_bytes(self.granule)).unwrap_or(usize::MAX)
             + self.media.as_ref().map_or(0, MediaBatch::device_bytes)
+    }
+
+    /// The bytes of each part as made, by the names the sizing gives them.
+    fn made_parts(&self) -> Vec<(&'static str, u64)> {
+        let [words, select, scratch] = self.attn.part_bytes();
+        let [rows, tiles, leg, places] = self.ffn.part_bytes();
+        [
+            (batch41::ATTN_WORDS, words),
+            (batch41::ATTN_SELECT, select),
+            (batch41::ATTN_SCRATCH, scratch),
+            (batch41::PARAMS, self.params.num_bytes()),
+            (batch41::GLUE, self.glue.device_bytes()),
+            (batch41::FFN_ROWS, rows),
+            (batch41::FFN_TILES, tiles),
+            (batch41::FFN_LEG, leg),
+            (batch41::FFN_PLACES, places),
+            (
+                batch41::SETS,
+                self.sets.iter().map(BatchSet::device_bytes).sum::<usize>(),
+            ),
+            (batch41::STAGING, self.staging.buf().num_bytes()),
+            (batch41::ATTN_BATCH, self.proj.device_bytes()),
+        ]
+        .into_iter()
+        .map(|(n, b)| (n, b as u64))
+        .collect()
     }
 
     /// Of [`Batch::device_bytes`], what each batch past a group's first holds
@@ -1702,12 +1744,18 @@ impl Body {
     /// without a tap or without buffers.
     fn complete_batch_taps(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let width = self.tap.as_ref().map_or(0, FeatureTap::width);
-        let Some(batch) = self.batch.as_deref_mut() else {
+        let Some(group) = self.batch.as_deref().map(|b| b.group) else {
             return Ok(());
         };
         if width == 0 {
             return Ok(());
         }
+        // The sets gain the tap's rows: the parts the batch is held to are
+        // the sizing's with them.
+        let parts = self.batch_parts(group, width)?;
+        let Some(batch) = self.batch.as_deref_mut() else {
+            return Ok(());
+        };
         let (group, sets) = (batch.group, batch.sets.len());
         for (k, set) in batch.sets.iter_mut().enumerate() {
             match set.taps.as_ref().map(DeviceBuffer::len) {
@@ -1734,19 +1782,61 @@ impl Body {
             }
         }
         batch.taps_host.resize(T_MAX * width, 0.0);
-        Ok(())
+        batch.parts = parts;
+        batch
+            .parts
+            .check(WHAT, &batch.made_parts())
+            .map_err(|e| GpuError::Shape {
+                what: WHAT,
+                detail: e.to_string(),
+            })
     }
 
+    /// The batch's parts at `group` and a feature tap of `tap_width`
+    /// ([`batch41::prompt_parts`] over the card's layers at the load's
+    /// context and levers): what the plan counts at the plan's levers
+    /// ([`BatchLevers::planned`]), and what the buffers are made to.
+    fn batch_parts(&self, group: usize, tap_width: usize) -> Result<Parts, GpuError> {
+        let shape = BatchShape {
+            hp: &self.hp,
+            layers: self.layers.clone(),
+            ctx_max: self.planner.ctx_max() as usize,
+            levers: BatchLevers {
+                group,
+                tiered: self.tier.is_some(),
+                hoststream: self.levers.hoststream,
+                tap_width,
+            },
+        };
+        prompt_parts(&shape).map_err(|e| GpuError::plan(WHAT, e))
+    }
+
+    /// The batch's buffers, each part made from its lengths where they are
+    /// the batch's own (the params, the batch sets, the staging, the
+    /// batch-wide attention's) and every part held to the sizing
+    /// ([`Body::batch_parts`]): one refusal names every part apart.
     fn make_batch(&self, gpu: &Gpu) -> Result<Batch, GpuError> {
         let hp = &self.hp;
         let stream = gpu.stream();
         let group = self.levers.group;
         let sets = group_sets(group);
+        let tap_width = self.tap.as_ref().map_or(0, FeatureTap::width);
+        let parts = self.batch_parts(group, tap_width)?;
+        let part = |name: &'static str| {
+            parts.part(name).ok_or_else(|| GpuError::Shape {
+                what: WHAT,
+                detail: format!("the batch's sizing names no part {name}"),
+            })
+        };
+        let len = |name: &'static str, i: usize| -> Result<usize, GpuError> {
+            part(name)?
+                .len(i)
+                .map_err(|detail| GpuError::Shape { what: WHAT, detail })
+        };
         let row_bytes = engram_row_bytes(&self.file, hp)?;
         let dims = ImageDims::of(hp, &self.planner, CHUNK, row_bytes);
         let (window, yarn) = rope_specs(hp)?;
         let image = StepImage::new(ImageLayout::new(dims)?, &window, &yarn)?;
-        let words = image.layout().words();
         let mut attn = AttnChain::with_rows(
             gpu,
             hp,
@@ -1758,11 +1848,8 @@ impl Body {
         if attn.top_k() != self.attn.top_k() {
             attn.set_top_k(gpu, self.attn.top_k())?;
         }
-        let writers = self.lists.first().map_or(0, Vec::len);
-        let list_len = attn.list_len();
         let n = hp.n_embd;
-        let tap_width = self.tap.as_ref().map_or(0, FeatureTap::width);
-        let params = DeviceBuffer::zeroed(stream, sets * CHUNKS_MAX * words)?;
+        let params = DeviceBuffer::zeroed(stream, len(batch41::PARAMS, 0)?)?;
         let glue = self.glue.batch(gpu, image.layout())?;
         let mut ffn = FfnBatch::new(
             gpu,
@@ -1778,20 +1865,50 @@ impl Body {
         if self.card_leg {
             ffn.prepare_leg(gpu)?;
         }
+        // A set's buffers in the sizing's order: two stream rows, two folds,
+        // a list per chunk and writer of the card's, the feature rows.
+        let set_part = part(batch41::SETS)?;
+        let per_set = set_part.buffers().len() / sets;
+        let writers = self.lists.first().map_or(0, Vec::len);
+        let list_len = CHUNK * attn.list_len();
+        if per_set != 4 + CHUNKS_MAX * writers + usize::from(tap_width > 0)
+            || (writers > 0 && len(batch41::SETS, 4)? != list_len)
+        {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "the batch's sizing lays out {per_set} buffers a batch set; the card's \
+                     {writers} list writers and a tap of {tap_width} take {} buffers, its lists \
+                     {list_len} entries",
+                    4 + CHUNKS_MAX * writers + usize::from(tap_width > 0)
+                ),
+            });
+        }
         let set = |k: usize| -> Result<BatchSet, GpuError> {
-            let z = |len: usize| DeviceBuffer::<f32>::zeroed(stream, len);
+            let at = k * per_set;
+            let z = |i: usize| -> Result<DeviceBuffer<f32>, GpuError> {
+                Ok(DeviceBuffer::<f32>::zeroed(
+                    stream,
+                    len(batch41::SETS, at + i)?,
+                )?)
+            };
             let made = || -> Result<BatchSet, GpuError> {
                 Ok(BatchSet {
-                    hc: [z(T_MAX * HC_STREAMS * n)?, z(T_MAX * HC_STREAMS * n)?],
-                    folds: [z(T_MAX * n)?, z(T_MAX * n)?],
+                    hc: [z(0)?, z(1)?],
+                    folds: [z(2)?, z(3)?],
                     lists: (0..CHUNKS_MAX)
-                        .map(|_| {
+                        .map(|c| {
                             (0..writers)
-                                .map(|_| DeviceBuffer::zeroed(stream, CHUNK * list_len))
+                                .map(|w| -> Result<DeviceBuffer<u32>, GpuError> {
+                                    let i = at + 4 + c * writers + w;
+                                    Ok(DeviceBuffer::zeroed(stream, len(batch41::SETS, i)?)?)
+                                })
                                 .collect::<Result<Vec<_>, _>>()
                         })
                         .collect::<Result<Vec<_>, _>>()?,
-                    taps: BatchSet::tap_rows(stream, tap_width)?,
+                    taps: (tap_width > 0)
+                        .then(|| z(4 + CHUNKS_MAX * writers))
+                        .transpose()?,
                 })
             };
             made().map_err(|e| GpuError::Shape {
@@ -1803,7 +1920,7 @@ impl Body {
             })
         };
         let sets_made = (0..sets).map(set).collect::<Result<Vec<_>, _>>()?;
-        let staging = DeviceTensor::zeroed(stream, CHUNK, hp.head_dim)?;
+        let staging = DeviceTensor::zeroed(stream, CHUNK, len(batch41::STAGING, 0)? / CHUNK)?;
         let card_marks = (0..CARD_MARKS * self.layers.len() * sets)
             .map(|_| {
                 gpu.context()
@@ -1812,8 +1929,16 @@ impl Body {
             .collect::<Result<Vec<_>, _>>()?;
         // Last: its refusal names the card's free bytes with every other
         // buffer of the batch already taken.
-        let proj = attn.batch(gpu, T_MAX, sets)?;
-        Ok(Batch {
+        let proj = attn.batch(gpu, hp, T_MAX, sets)?;
+        let granule =
+            std::num::NonZeroU64::new(gpu.allocation_granularity()? as u64).ok_or_else(|| {
+                GpuError::Shape {
+                    what: WHAT,
+                    detail: "the card reports an allocation granule of no byte".to_string(),
+                }
+            })?;
+        let words = image.layout().words();
+        let batch = Batch {
             group,
             plans: vec![StepPlan::default(); CHUNKS_MAX],
             images: vec![0; sets * CHUNKS_MAX * words],
@@ -1834,7 +1959,17 @@ impl Body {
             image,
             attn,
             proj,
-        })
+            parts,
+            granule,
+        };
+        batch
+            .parts
+            .check(WHAT, &batch.made_parts())
+            .map_err(|e| GpuError::Shape {
+                what: WHAT,
+                detail: e.to_string(),
+            })?;
+        Ok(batch)
     }
 
     /// Per layer index of the body, the experts the stage card's tier

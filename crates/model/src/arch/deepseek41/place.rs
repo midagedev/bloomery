@@ -17,10 +17,12 @@ use bloomery_placement::slots::{SeqTerms, Stores};
 use gguf::Split;
 use models::ModelSpec;
 
+use super::batch::{BatchShape, prompt_parts};
 use super::hparams::Hparams;
 use super::kv::KvLayout;
 use super::{roles, spec};
 use crate::arch::coverage;
+use crate::arch::place_hybrid;
 use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::ctx_ask::PlanRefusal;
 use crate::placement::workstation::{self, HostRead, TierBatchBytes};
@@ -28,8 +30,8 @@ use bloomery_levers::KvHost;
 use runtime::stores::Class;
 
 use crate::placement::{
-    self, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented,
-    Violation, checked, joined,
+    self, Card, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented,
+    Violation, checked_beside, joined,
 };
 
 /// What a plan of a V4.1 or V4 file is made from, read from its headers.
@@ -88,20 +90,34 @@ pub enum PlaceError {
     /// The plan was built and breaks these invariants, every one of them.
     #[error("the plan breaks its invariants: {}", joined(.0))]
     Broken(Vec<Violation>),
+    /// A stage card whose plan leaves less beside it than its prompt batch
+    /// takes ([`PlanInputs::prompt_reserve_bytes`]): the dense granules, the
+    /// cache, context, scratch, reserves and margin already pass what the
+    /// card holds less it, so no expert placement makes room.
+    #[error(
+        "card {card}: the prompt batch takes {batch} B, and the plan leaves {left} B beside its \
+         dense granules, cache, context, scratch, reserves and margin ({short} B short)"
+    )]
+    BatchOver {
+        card: String,
+        batch: u64,
+        left: u64,
+        short: u64,
+    },
 }
 
 impl PlanRefusal for PlaceError {
     fn placement(&self) -> Option<&PlacementError> {
         match self {
             Self::Placement(e) => Some(e),
-            Self::Broken(_) => None,
+            Self::Broken(_) | Self::BatchOver { .. } => None,
         }
     }
 
     fn violations(&self) -> Option<&[Violation]> {
         match self {
             Self::Broken(v) => Some(v),
-            Self::Placement(_) => None,
+            Self::Placement(_) | Self::BatchOver { .. } => None,
         }
     }
 }
@@ -221,6 +237,13 @@ impl PlanInputs {
     ) -> Result<Plan<'a>, PlaceError> {
         let kv = self.seq_terms().slots_of(slots.get() as u64);
         let rule = routed_rule(Program::Deepseek41Chain);
+        let tiered = machine.expert_tiers().next().is_some();
+        let fronts = machine
+            .cards
+            .iter()
+            .map(|c| self.prompt_reserve_bytes(c, ctx_max, tiered))
+            .collect::<Result<Vec<u64>, _>>()?;
+        let reserve = fronts.iter().copied().max().unwrap_or(0);
         let plan = placement::plan_in_pool(machine, levers, |levers| {
             let mut plan = placement::nodes::loaded_routed(
                 &self.model,
@@ -229,9 +252,15 @@ impl PlanInputs {
                 &kv,
                 levers,
                 rule,
-                0,
+                reserve,
                 owned,
             )?;
+            // Each stage card's prompt batch is reserved out of its expert
+            // budget above and is a term of its count, so the first prompt's
+            // reading holds it.
+            for (t, &front) in plan.cards.iter_mut().zip(&fronts) {
+                t.grow_prompt(front);
+            }
             // The selected rows' pages that sit on the host come out of the host room the
             // plan was made at, before the NVMe tier's split reads it.
             let host =
@@ -243,7 +272,49 @@ impl PlanInputs {
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;
             Ok(plan)
         })?;
-        checked(plan).map_err(PlaceError::Broken)
+        // The batches stay beside the plan's terms (`refuse_reserve` holds each
+        // to its card), so a unified pool counts them beside them.
+        let plan = checked_beside(plan, fronts.iter().sum()).map_err(PlaceError::Broken)?;
+        for ((card, t), &front) in machine.cards.iter().zip(&plan.cards).zip(&fronts) {
+            let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
+            place_hybrid::refuse_reserve(
+                card,
+                place_hybrid::card_terms(t),
+                limit,
+                front,
+                |card, batch, left, short| PlaceError::BatchOver {
+                    card,
+                    batch,
+                    left,
+                    short,
+                },
+            )?;
+        }
+        Ok(plan)
+    }
+
+    /// The card bytes the plan counts on stage card `card` for a load of
+    /// the file at `ctx_max` positions, with an expert tier or not
+    /// (`tiered`): its prompt batch's parts over the card's layers at the
+    /// plan's levers ([`prompt_parts`], [`BatchShape::planned`]), rounded
+    /// per buffer as the card's allocator takes them at its granule
+    /// ([`Parts::card_bytes`](crate::placement::parts::Parts::card_bytes)).
+    /// The plan reserves it out of the card's expert budget and counts it as
+    /// the card's prompt term
+    /// ([`CardTotals::grow_prompt`](crate::placement::CardTotals::grow_prompt));
+    /// the card body holds the buffers it makes to the same parts.
+    pub fn prompt_reserve_bytes(
+        &self,
+        card: &Card,
+        ctx_max: u64,
+        tiered: bool,
+    ) -> Result<u64, PlacementError> {
+        let ctx = usize::try_from(ctx_max).map_err(|_| PlacementError::Metadata {
+            key: "ctx_max".to_owned(),
+            detail: format!("{ctx_max} positions pass usize"),
+        })?;
+        let shape = BatchShape::planned(&self.hp, card.layers.clone(), ctx, tiered);
+        Ok(prompt_parts(&shape)?.card_bytes(card.granule_bytes))
     }
 
     /// The host bytes the selected rows ([`Class::Host`] buffers of the layout's rooms) take

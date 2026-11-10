@@ -102,7 +102,6 @@ use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::{host, names};
 use model::moe::UNION_MAX_COLS;
 use model::placement::accepts::{self, LegArms, Program};
-use model::placement::kernels::{self, DownForms};
 use model::placement::{Role, tp};
 use runtime::combine::Slots;
 
@@ -1092,57 +1091,9 @@ struct FfnRow {
 }
 
 /// The activation forms of `h` a piece's layers read beside the f32 rows,
-/// from their types at load: each row holds these and no other.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct Reads {
-    /// A fused layer ([`accepts::ds41_fused`]): its down reads the card slots'
-    /// q8_1.
-    fused: bool,
-    /// A fused layer whose down is q5_K ([`accepts::DS41_FUSED_DOWNS`]): the
-    /// kquant `_sel` down ([`FfnPiece`]'s `fused_q5k`, and the tile path's
-    /// `KquantTileKernels`, which a q4_K-only file loads none of).
-    fused_q5k_down: bool,
-    /// A shared down of a K-quant reads `sh_h` in q8_1.
-    sh_q8_1: bool,
-    /// A shared gate and up of types read over the f32 row write rows of
-    /// their own ([`sh_rows`]).
-    sh_rows: bool,
-    /// The forms the common card leg's downs read ([`kernels::down_act`] at
-    /// `ff`), for its buffers ([`FfnPiece::prepare_leg`]).
-    leg: DownForms,
-}
-
-impl Reads {
-    /// These forms and those a layer of routed stacks `routed` (`[gate, up,
-    /// down]`, none for a layer without them) and shared expert `[gate, up,
-    /// down]` reads at `ff`.
-    fn with_layer(
-        mut self,
-        routed: Option<[GgmlType; 3]>,
-        [shared_gate, shared_up, shared_down]: [GgmlType; 3],
-        ff: usize,
-    ) -> Reads {
-        if let Some(t) = routed {
-            if accepts::ds41_fused(t) {
-                self.fused = true;
-                self.fused_q5k_down |= matches!(t[2], GgmlType::Q5_K);
-            } else if accepts::leg_runs(Program::Deepseek41Chain, t) == Some(true) {
-                self.leg = self.leg.with(kernels::down_act(t[2], ff as u64));
-            }
-        }
-        self.sh_q8_1 |= sh_down_reads_q8_1(shared_down);
-        self.sh_rows |= sh_rows(shared_gate, shared_up);
-        self
-    }
-}
-
-/// Whether a shared gate of type `gate` and up of type `up` each run a gemv
-/// over the f32 row and then the clamped SwiGLU: MXFP8 or BF16, which no
-/// fused pair reads.
-fn sh_rows(gate: GgmlType, up: GgmlType) -> bool {
-    let rows = |t| matches!(t, GgmlType::MXFP8 | GgmlType::BF16);
-    rows(gate) && rows(up)
-}
+/// from their types at load: each row holds these and no other. The prompt
+/// batch's sizing owns them, which counts the buffers they add.
+pub(crate) use model::arch::deepseek41::batch::FfnReads as Reads;
 
 /// The shared expert's h over the f32 row `x` for a gate and up read over
 /// the f32 row ([`sh_rows`]): a gemv each into `g` and `u`, then the clamped
@@ -1168,12 +1119,6 @@ fn enqueue_sh_rows(
         n,
         (sink, h),
     )
-}
-
-/// Whether a shared down of type `ty` reads its input in q8_1: the K-quant
-/// downs.
-fn sh_down_reads_q8_1(ty: GgmlType) -> bool {
-    matches!(ty, GgmlType::Q3_K | GgmlType::Q4_K)
 }
 
 /// Whether a down of type `ty` in `role` reads rows of `ff` values: `ff` a
@@ -1355,7 +1300,9 @@ impl FfnPiece {
                 }
             }
             let [sh_gate, sh_up] = kind.shared_gate_up;
-            reads = reads.with_layer(kind.routed_types, [sh_gate, sh_up, kind.shared_down], ff);
+            let types = [sh_gate, sh_up, kind.shared_down];
+            let own = Reads::default().with_layer(kind.routed_types, types, ff);
+            reads = reads.with_layer(kind.routed_types, types, ff);
             cfg.push(LayerCfg {
                 norm: names::ffn_norm(l),
                 router: names::ffn_gate_inp(l),
@@ -1370,8 +1317,8 @@ impl FfnPiece {
                 row_off: i * map.n_expert(),
                 limit: kind.swiglu_limit,
                 limit_shared: kind.swiglu_limit_shared,
-                sh_down_q8_1: sh_down_reads_q8_1(kind.shared_down),
-                sh_rows: sh_rows(sh_gate, sh_up),
+                sh_down_q8_1: own.sh_q8_1,
+                sh_rows: own.sh_rows,
                 fold: hp.layers.get(l + 1).is_some_and(|k| k.engram.is_none()),
             });
         }

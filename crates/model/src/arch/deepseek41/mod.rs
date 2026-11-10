@@ -3,8 +3,10 @@
 //! reads (`names`), the role of every tensor (`roles`), the KV bytes each layer
 //! holds (`kv`), how tensor parallel cuts each tensor (`tp`), the path from a file to its placement plan (`place`), the
 //! host tier's layer spec (`host`) and the integers each step's graph reads
-//! (`plan`).
+//! (`plan`), and the prompt batch's card buffers as named parts the plan counts
+//! and the card body allocates from (`batch`).
 
+pub mod batch;
 pub mod fixture;
 pub mod host;
 pub mod hparams;

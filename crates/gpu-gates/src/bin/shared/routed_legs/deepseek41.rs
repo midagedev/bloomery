@@ -24,7 +24,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use super::ds41place;
-use super::{Adapter, Arm, Outcome, census, floor_or, outcome_of, refused_of, view_of};
+use super::{Adapter, Arm, Outcome, Refusal, census, floor_or, outcome_of, refused_of, view_of};
 use bloomery_gpu_gates::beside::Beside;
 use bloomery_gpu_gates::generate::Place;
 use gguf::{GgmlType, Split};
@@ -144,10 +144,16 @@ fn plan_of<'a>(
 }
 
 /// A plan refusal as an outcome: the placement's own are named by
-/// [`refused_of`]; an invariant break is red.
+/// [`refused_of`], a stage card whose prompt batch passes what its plan
+/// leaves is refused as `batch-over`; an invariant break is red.
 fn place_of(p: &PlaceError) -> Outcome {
     match p {
         PlaceError::Placement(e) => refused_of(e),
+        PlaceError::BatchOver { .. } => Outcome::Refused(Refusal {
+            kind: "batch-over",
+            floor: None,
+            text: p.to_string(),
+        }),
         PlaceError::Broken(_) => Outcome::Red(p.to_string()),
     }
 }

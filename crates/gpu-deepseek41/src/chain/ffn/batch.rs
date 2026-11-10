@@ -1798,9 +1798,20 @@ impl FfnBatch {
     }
 
     /// Device bytes of the buffers, the chunk scratch's included; the
-    /// page-locked host copies are not counted.
+    /// page-locked host copies are not counted ([`FfnBatch::part_bytes`]
+    /// summed).
     #[must_use]
     pub fn device_bytes(&self) -> usize {
+        self.part_bytes().iter().sum()
+    }
+
+    /// [`FfnBatch::device_bytes`] by part, as the prompt batch's parts name
+    /// them (`batch::FFN_ROWS`, `FFN_TILES`, `FFN_LEG`, `FFN_PLACES`): the
+    /// rows and the chunk scratch; the fused layers' tile and GEMM scratch;
+    /// the common card leg's buffers; the tier's and the host stream's
+    /// places.
+    #[must_use]
+    pub fn part_bytes(&self) -> [usize; 4] {
         let f32s = [
             &self.x,
             &self.weights,
@@ -1816,23 +1827,24 @@ impl FfnBatch {
             &self.down_all,
         ];
         let acts = self.act_x.iter().chain(&self.act_sh);
-        f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
+        let rows = f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.hc.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self.ids.num_bytes()
             + self.sel.num_bytes()
             + self.q3_all.num_bytes()
-            + self.tile.as_ref().map_or(0, Q3TileScratch::device_bytes)
-            + self.gemm.as_ref().map_or(0, GemmScratch::bytes)
             + self.map_row.num_bytes()
-            + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + acts.map(q8act_bytes).sum::<usize>();
+        let tiles = self.tile.as_ref().map_or(0, Q3TileScratch::device_bytes)
+            + self.gemm.as_ref().map_or(0, GemmScratch::bytes);
+        let leg = self.leg.as_ref().map_or(0, |(_, b)| b.bytes());
+        let places = self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.ssel.as_ref().map_or(0, DeviceBuffer::num_bytes)
-            + self.leg.as_ref().map_or(0, |(_, b)| b.bytes())
             + self
                 .held
                 .iter()
                 .map(|h| h.w.num_bytes() + h.sel.num_bytes() + h.tsel.num_bytes())
-                .sum::<usize>()
-            + acts.map(q8act_bytes).sum::<usize>()
+                .sum::<usize>();
+        [rows, tiles, leg, places]
     }
 
     /// Enqueue the feature tap of `m` tokens: the mean of each one's four

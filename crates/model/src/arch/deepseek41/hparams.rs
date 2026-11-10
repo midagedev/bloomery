@@ -594,6 +594,212 @@ pub struct LayerKind {
     pub routed_types: Option<[GgmlType; 3]>,
 }
 
+#[cfg(test)]
+impl LayerKind {
+    /// A window-only layer, for a test's layer table: no stream, no
+    /// compressor, no index, routed with no stacks, a Q8_0 shared expert.
+    pub(crate) fn window_only() -> LayerKind {
+        LayerKind {
+            stream: None,
+            dense: None,
+            compressor: None,
+            index_keys: false,
+            index_compressor: None,
+            indexer: false,
+            engram: None,
+            routed: true,
+            hash_routed: false,
+            rope: Rope {
+                base: 10_000.0,
+                freq_scale: 1.0,
+                ext_factor: 0.0,
+                attn_factor: 1.0,
+                beta_fast: 0.0,
+                beta_slow: 0.0,
+                n_ctx_orig: 0,
+            },
+            swiglu_limit: 10.0,
+            swiglu_limit_shared: 10.0,
+            shared_down: GgmlType::Q8_0,
+            shared_gate_up: [GgmlType::Q8_0; 2],
+            routed_types: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Hparams {
+    /// A V4 file of `n_layer` window-only layers of width 256 (one head, one
+    /// output group, ff 256 over 64 experts, two used), F32 embeddings and no
+    /// engram: a test's smallest shape.
+    pub(crate) fn tiny(n_layer: usize) -> Hparams {
+        Hparams {
+            model: Model::Deepseek4,
+            n_layer,
+            n_embd: 256,
+            n_head: 1,
+            n_head_kv: 1,
+            head_dim: 256,
+            q_lora_rank: 256,
+            o_groups: 1,
+            o_lora_rank: 256,
+            rope_dims: 64,
+            window: 128,
+            rms_eps: 1e-6,
+            q_head_norm: true,
+            n_vocab: 1,
+            n_ctx_train: 128,
+            csa_ratio: 1,
+            hca_ratio: 1,
+            indexer: Indexer {
+                n_head: 1,
+                head_dim: 128,
+                top_k: 1,
+            },
+            candidates: None,
+            hc: HyperConnections {
+                streams: 4,
+                sinkhorn_iters: 20,
+                eps: 1e-6,
+            },
+            collapse: Collapse::Head,
+            experts: Experts {
+                n_expert: 64,
+                n_used: 2,
+                n_shared: 1,
+                ff: 256,
+                routed_scale: 1.0,
+                weights_norm: true,
+                score: Score::SqrtSoftplus,
+                dense_lead: 0,
+                hash_layers: 0,
+            },
+            engram: None,
+            rows: RowTypes {
+                token_embd: GgmlType::F32,
+                engram: None,
+            },
+            layers: (0..n_layer).map(|_| LayerKind::window_only()).collect(),
+        }
+    }
+
+    /// The V4.1 gate fixture's file as the engine reads it, modeled where
+    /// this machine holds no fixture: the source's widths (`ds41_meta`'s
+    /// rows), the nine layers of `fixture::LAYER_MAP` with their sources'
+    /// kinds remapped (compressors at fixture layers 2, 4 and 5, the indexer
+    /// at 2, 4, 5 and 7, engram sites 1 and 4), the source's types
+    /// (`docs/research/v41-placement/inv.json`: BF16 embeddings, Q8_0 engram
+    /// tables and shared experts, routed Q3_K·Q3_K·Q5_K at source layers 0
+    /// and 1 and Q3_K·Q3_K·Q4_K past them), ff `fixture::FIXTURE_FF`, and the
+    /// default candidate mask, which no fixture layer takes a role in.
+    pub(crate) fn v41_fixture_model() -> Hparams {
+        use gguf::engram::{EngramLayout, EngramTables};
+        let stream = |ratio, kv: usize, topk: usize| Stream {
+            ratio,
+            kv_source: kv,
+            index_key_source: kv,
+            topk_source: topk,
+        };
+        let comp = |gated| Compressor {
+            gated,
+            ape: gated,
+            overlap: false,
+        };
+        let layers = (0..9)
+            .map(|f| {
+                let mut k = LayerKind::window_only();
+                k.stream = match f {
+                    2 | 3 => Some(stream(2, 2, 2)),
+                    4 => Some(stream(2, 4, 4)),
+                    5 | 6 => Some(stream(1, 5, 5)),
+                    7 | 8 => Some(stream(1, 5, 7)),
+                    _ => None,
+                };
+                k.compressor = match f {
+                    2 | 4 => Some(comp(true)),
+                    5 => Some(comp(false)),
+                    _ => None,
+                };
+                k.index_keys = matches!(f, 2 | 4 | 5);
+                k.indexer = matches!(f, 2 | 4 | 5 | 7);
+                k.engram = match f {
+                    1 => Some(0),
+                    4 => Some(1),
+                    _ => None,
+                };
+                let down = if f < 2 {
+                    GgmlType::Q5_K
+                } else {
+                    GgmlType::Q4_K
+                };
+                k.routed_types = Some([GgmlType::Q3_K, GgmlType::Q3_K, down]);
+                k
+            })
+            .collect();
+        Hparams {
+            model: Model::Deepseek41,
+            n_layer: 9,
+            n_embd: 5120,
+            n_head: 64,
+            n_head_kv: 1,
+            head_dim: 512,
+            q_lora_rank: 1280,
+            o_groups: 8,
+            o_lora_rank: 1024,
+            rope_dims: 64,
+            window: 128,
+            rms_eps: 1e-6,
+            q_head_norm: false,
+            n_vocab: 129_280,
+            n_ctx_train: 1_048_576,
+            csa_ratio: 2,
+            hca_ratio: 1,
+            indexer: Indexer {
+                n_head: 32,
+                head_dim: 128,
+                top_k: 512,
+            },
+            candidates: Some(CandidateMask {
+                source_layer: CANDIDATE_SOURCE_LAYER,
+                block_size: CANDIDATE_BLOCK_SIZE,
+                topk_blocks: CANDIDATE_TOPK_BLOCKS,
+            }),
+            hc: HyperConnections {
+                streams: 4,
+                sinkhorn_iters: 20,
+                eps: 1e-6,
+            },
+            collapse: Collapse::Lagged,
+            experts: Experts {
+                n_expert: 384,
+                n_used: 6,
+                n_shared: 1,
+                ff: 512,
+                routed_scale: 1.0,
+                weights_norm: true,
+                score: Score::SqrtSoftplus,
+                dense_lead: 0,
+                hash_layers: 0,
+            },
+            engram: Some(Engram {
+                layer_ids: vec![1, 4],
+                n_head: 8,
+                max_ngram: 4,
+                key_length: 256,
+                tables: EngramTables {
+                    layout: EngramLayout::PerSite,
+                    sites: Vec::new(),
+                },
+            }),
+            rows: RowTypes {
+                token_embd: GgmlType::BF16,
+                engram: Some(GgmlType::Q8_0),
+            },
+            layers,
+        }
+    }
+}
+
 impl LayerKind {
     /// `attention.compress_ratios` at this layer: 0 on a window-only layer.
     pub fn ratio(&self) -> u32 {

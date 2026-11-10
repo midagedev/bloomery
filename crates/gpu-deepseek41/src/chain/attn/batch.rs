@@ -52,17 +52,15 @@ use crate::span::{span, span_mut};
 
 const WHAT_BATCH: &str = "deepseek41 AttnBatch";
 
-/// Whole chunks a sub-block holds at most.
-const SUB_CHUNKS: usize = 16;
-
-/// Tokens a sub-block holds at most.
-pub const SUB_TOKENS: usize = SUB_CHUNKS * HC_MAX_TOKENS;
-
-/// A sub-block's token counts, ascending: a short chunk's, a whole chunk's,
-/// and runs of 2, 4, 8 and 16 whole chunks.
-const SUB_COUNTS: [usize; 12] = [1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64, 128];
-const _: () = assert!(SUB_COUNTS[SUB_COUNTS.len() - 1] == SUB_TOKENS);
-const _: () = assert!(SUB_COUNTS[HC_MAX_TOKENS - 1] == HC_MAX_TOKENS);
+pub use model::arch::deepseek41::batch::SUB_TOKENS;
+/// Whole chunks a sub-block holds at most; the tokens it holds at most; its
+/// token counts, ascending: a short chunk's, a whole chunk's, and runs of 2,
+/// 4, 8 and 16 whole chunks. The prompt batch's sizing owns them
+/// ([`batch41`]), which sizes the buffers by them.
+use model::arch::deepseek41::batch::{self as batch41, AttnBatchLens, SUB_CHUNKS, SUB_COUNTS};
+// The sizing's chunk and HC_PRE piece are the kernels'.
+const _: () = assert!(batch41::CHUNK == HC_MAX_TOKENS && batch41::HC_PIECE == HC_PIECE);
+const _: () = assert!(batch41::INDEX_HEADS == indexer::HEADS);
 
 /// Events [`AttnBatch`] records around a layer's projection phases at most
 /// when timed: a start and an end for each sub-block's phase before its
@@ -357,32 +355,6 @@ pub struct AttnBatch {
     timed: bool,
 }
 
-/// The lengths of an [`AttnBatch`]'s buffers, from which it is allocated and
-/// its bytes are counted before the allocation.
-struct BatchLens {
-    /// The f32 buffers' values, in [`AttnBatch`]'s field order.
-    f32s: [usize; 16],
-    /// Q8_1 forms: columns and values a column.
-    acts: Vec<(usize, usize)>,
-    hc_groups: usize,
-    hc_k: usize,
-}
-
-impl BatchLens {
-    fn bytes(&self) -> usize {
-        let hc_pieces = self.hc_k / HC_PIECE;
-        4 * self.f32s.iter().sum::<usize>()
-            + self
-                .acts
-                .iter()
-                .map(|&(m, k)| q8act_bytes(m, k))
-                .sum::<usize>()
-            + 4 * (HC_MIX * hc_pieces * HC_MAX_TOKENS * self.hc_groups
-                + hc_pieces * HC_MAX_TOKENS * self.hc_groups
-                + self.hc_groups)
-    }
-}
-
 /// A q8_1 form of `m` columns of `k` values: past eight columns only the
 /// per-slot allocation takes them.
 fn act(stream: &CudaStream, m: usize, k: usize) -> Result<Q8Act, GpuError> {
@@ -642,57 +614,22 @@ impl AttnChain {
     /// `sets` batches of up to `tokens` positions, refused by name when they
     /// do not fit the card's free memory ([`Gpu::alloc_room`]). Load-time
     /// only.
-    pub fn batch(&self, gpu: &Gpu, tokens: usize, sets: usize) -> Result<AttnBatch, GpuError> {
+    pub fn batch(
+        &self,
+        gpu: &Gpu,
+        hp: &Hparams,
+        tokens: usize,
+        sets: usize,
+    ) -> Result<AttnBatch, GpuError> {
         let d = &self.dims;
         let stream = gpu.stream();
-        let s = SUB_TOKENS.min(tokens.next_multiple_of(HC_MAX_TOKENS));
         let any_source = self.plans.iter().any(|p| p.source.is_some());
         let any_indexer = self.plans.iter().any(|p| p.indexer.is_some());
-        let index_w = if any_indexer { indexer::HEADS } else { 0 };
-        let index_q = if any_indexer {
-            indexer::HEADS * indexer::HEAD_DIM
-        } else {
-            0
-        };
-        let q_rows = d.n_head * d.head_dim;
-        let groups = q_rows / d.group_k;
-        let width = compress::WIDTH;
-        let comp_raw = if any_source { 2 * s * width } else { 0 };
-        let comp = if any_source {
-            (s + HC_MAX_TOKENS) * width
-        } else {
-            0
-        };
-        let nd = d.rope_dims;
+        let lens = AttnBatchLens::of(hp, tokens, sets, any_source, any_indexer);
+        let (s, nd) = (lens.sub, d.rope_dims);
+        let groups = d.n_head * d.head_dim / d.group_k;
         let counts: Vec<usize> = SUB_COUNTS.iter().copied().filter(|&c| c <= s).collect();
-        let lens = BatchLens {
-            f32s: [
-                tokens * HC_MIX,
-                tokens * HC_MIX,
-                s * d.n_embd,
-                s * (d.q_lora_rank + d.head_dim + index_w),
-                s * d.q_lora_rank,
-                s * d.head_dim,
-                s * d.q_lora_rank,
-                s * (q_rows + index_q),
-                s * q_rows,
-                comp_raw,
-                2 * comp,
-                s * q_rows,
-                s * groups * d.o_lora_rank,
-                s * d.n_embd,
-                tokens * d.n_embd,
-                sets * Table::ALL.len() * tokens * nd,
-            ],
-            acts: counts
-                .iter()
-                .flat_map(|&c| [(c, d.n_embd), (c, d.q_lora_rank)])
-                .chain([(s * groups, d.group_k), (s, groups * d.o_lora_rank)])
-                .collect(),
-            hc_groups: tokens.div_ceil(HC_MAX_TOKENS) + 1,
-            hc_k: HC_STREAMS * d.n_embd,
-        };
-        let need = lens.bytes();
+        let need = usize::try_from(lens.bytes()).unwrap_or(usize::MAX);
         let free = gpu.alloc_room()?;
         if tokens == 0 || sets == 0 || need > free {
             return Err(GpuError::Shape {
@@ -730,7 +667,7 @@ impl AttnChain {
             q: zeroed(8)?,
             comp_raw: any_source.then(|| zeroed(9)).transpose()?,
             comp: any_source
-                .then(|| PartedBuffer::zeroed(stream, [comp; 2]))
+                .then(|| PartedBuffer::zeroed(stream, [lens.f32s[10] / 2; 2]))
                 .transpose()?,
             y: zeroed(11)?,
             heads: act(stream, s * groups, d.group_k)?,

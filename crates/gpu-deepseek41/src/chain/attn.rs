@@ -1158,11 +1158,21 @@ impl AttnChain {
 
     /// Device bytes the piece holds besides the weights and the buffers it
     /// is passed: its scratch, its copy of the step words and the gather's
-    /// pairs.
+    /// pairs ([`AttnChain::part_bytes`] summed).
     #[must_use]
     pub fn device_bytes(&self) -> usize {
+        self.part_bytes().iter().sum()
+    }
+
+    /// [`AttnChain::device_bytes`] by part, as the prompt batch's parts name
+    /// them (`batch::ATTN_WORDS`, `ATTN_SELECT`, `ATTN_SCRATCH`): the rows of
+    /// step words and the gather's pairs; the compressor's, the indexer's
+    /// and the candidate mask's scratch; the rest of the scratch.
+    #[must_use]
+    pub fn part_bytes(&self) -> [usize; 3] {
         let s = &self.scratch;
         let d = &self.dims;
+        let words = self.words_bytes() + self.words.src.num_bytes() + self.words.dst.num_bytes();
         let plain = [
             &s.mixes,
             &s.hc,
@@ -1179,13 +1189,7 @@ impl AttnChain {
         ]
         .iter()
         .map(|b| b.num_bytes())
-        .sum::<usize>()
-            + self
-                .words
-                .bufs
-                .iter()
-                .map(DeviceBuffer::num_bytes)
-                .sum::<usize>();
+        .sum::<usize>();
         let source = s.source.as_ref().map_or(0, |x| {
             [x.proj.whole(), &x.pre, &x.key]
                 .iter()
@@ -1226,14 +1230,11 @@ impl AttnChain {
             .as_ref()
             .and_then(|r| r.key.as_ref())
             .map_or(0, DeviceBuffer::num_bytes);
-        plain
-            + source
-            + select
-            + acts
-            + raw
-            + self.words.src.num_bytes()
-            + self.words.dst.num_bytes()
-            + hc_pre_bytes(s.hc_pre.k())
+        [
+            words,
+            source + select,
+            plain + acts + raw + hc_pre_bytes(s.hc_pre.k()),
+        ]
     }
 
     /// Where the step words sit in the piece's copy.

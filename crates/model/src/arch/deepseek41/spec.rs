@@ -396,36 +396,11 @@ pub fn draft_of(hp: &DraftHparams) -> Result<DraftSpec, PlacementError> {
 #[cfg(test)]
 mod tests {
     use super::no_index_on_window_layer;
-    use crate::arch::deepseek41::hparams::{LayerKind, Rope};
-    use gguf::GgmlType;
+    use crate::arch::deepseek41::hparams::LayerKind;
 
     /// A window-only layer: no stream, no compressor, no index.
     fn window_only() -> LayerKind {
-        LayerKind {
-            stream: None,
-            dense: None,
-            compressor: None,
-            index_keys: false,
-            index_compressor: None,
-            indexer: false,
-            engram: None,
-            routed: true,
-            hash_routed: false,
-            rope: Rope {
-                base: 10_000.0,
-                freq_scale: 1.0,
-                ext_factor: 0.0,
-                attn_factor: 1.0,
-                beta_fast: 0.0,
-                beta_slow: 0.0,
-                n_ctx_orig: 0,
-            },
-            swiglu_limit: 10.0,
-            swiglu_limit_shared: 10.0,
-            shared_down: GgmlType::Q8_0,
-            shared_gate_up: [GgmlType::Q8_0; 2],
-            routed_types: None,
-        }
+        LayerKind::window_only()
     }
 
     /// Index keys or an indexer on a window-only layer are refused by the

@@ -206,9 +206,6 @@ fn out_dim(split: &Split, name: &str) -> Result<u64, PlacementError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::deepseek41::hparams::{
-        Collapse, Experts, HyperConnections, Indexer, Model, RowTypes, Score,
-    };
     use crate::arch::deepseek41::place::PlanInputs;
     use crate::placement::{
         Card, Host, KvBytes, KvDefault, Machine, ModelTensor, ModelTensors, Node, PlanLevers, Role,
@@ -222,54 +219,7 @@ mod tests {
     /// The tiny four-layer file's inputs over `kv`, planned on a host room of `pool` bytes.
     fn tiny_inputs(kv: KvLayout, pool: u64) -> PlanInputs {
         PlanInputs {
-            hp: Hparams {
-                model: Model::Deepseek4,
-                n_layer: 4,
-                n_embd: 256,
-                n_head: 1,
-                n_head_kv: 1,
-                head_dim: 256,
-                q_lora_rank: 256,
-                o_groups: 1,
-                o_lora_rank: 256,
-                rope_dims: 64,
-                window: 128,
-                rms_eps: 1e-6,
-                q_head_norm: true,
-                n_vocab: 1,
-                n_ctx_train: 128,
-                csa_ratio: 1,
-                hca_ratio: 1,
-                indexer: Indexer {
-                    n_head: 1,
-                    head_dim: 128,
-                    top_k: 1,
-                },
-                candidates: None,
-                hc: HyperConnections {
-                    streams: 4,
-                    sinkhorn_iters: 20,
-                    eps: 1e-6,
-                },
-                collapse: Collapse::Head,
-                experts: Experts {
-                    n_expert: 64,
-                    n_used: 2,
-                    n_shared: 1,
-                    ff: 256,
-                    routed_scale: 1.0,
-                    weights_norm: true,
-                    score: Score::SqrtSoftplus,
-                    dense_lead: 0,
-                    hash_layers: 0,
-                },
-                engram: None,
-                rows: RowTypes {
-                    token_embd: GgmlType::F32,
-                    engram: None,
-                },
-                layers: Vec::new(),
-            },
+            hp: Hparams::tiny(4),
             model: ModelTensors {
                 tensors: (0..4)
                     .flat_map(|l| {
@@ -349,11 +299,17 @@ mod tests {
 
     #[test]
     fn nvme_room_is_capped_by_the_unified_pool() {
-        let pool = 26 << 20;
-        let mut inputs = tiny_inputs(KvLayout::assemble(128, 256, 1, vec![None; 4]), pool);
+        // The card's budget and the pool each hold the prompt batch beside
+        // the 2 MiB card and 26 MiB pool the room cap is read at.
+        let kv = || KvLayout::assemble(128, 256, 1, vec![None; 4]);
+        let batch = tiny_inputs(kv(), 0)
+            .prompt_reserve_bytes(&pool_machine(0).cards[0], 64, false)
+            .expect("the tiny file's batch");
+        let pool = (26 << 20) + batch;
+        let mut inputs = tiny_inputs(kv(), pool);
         let machine = pool_machine(pool);
         let levers = PlanLevers {
-            card_budget_bytes: bloomery_levers::CardBudget::Every(2 << 20),
+            card_budget_bytes: bloomery_levers::CardBudget::Every((2 << 20) + batch),
             ..PlanLevers::default()
         };
         let expected = inputs
