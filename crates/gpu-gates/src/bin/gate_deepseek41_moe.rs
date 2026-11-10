@@ -97,7 +97,6 @@ mod e2e;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use crate::e2e::rel_max;
     use bloomery_gpu::kquant::{TileTable, TiledDown};
     use bloomery_gpu::q4k_sel::tile_cap;
     use bloomery_gpu::route_core::renorm_divisor;
@@ -113,6 +112,7 @@ mod gate {
     use bloomery_gpu_gates::ik_q8_2;
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
     use bloomery_gpu_gates::oracle::{self, Set};
+    use bloomery_gpu_gates::rel::rel_max;
     use bloomery_gpu_gates::rounding::U;
     use bloomery_gpu_gates::{
         GateError, KERNEL_BAND, RefManifest, RefRow, activations, bits_equal, bytes_to_words,

@@ -115,7 +115,7 @@ mod e2e;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use crate::e2e::rel_max;
+    use bloomery_gpu_gates::rel::rel_max;
     use std::sync::Arc;
 
     use bloomery_gpu::fused::FusedKernels;

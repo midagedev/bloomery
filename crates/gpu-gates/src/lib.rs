@@ -65,6 +65,7 @@ pub mod q38_fixture;
 pub mod qwen3moe;
 pub mod qwen_seat;
 pub mod record;
+pub mod rel;
 #[cfg(feature = "gpu")]
 pub mod residency;
 #[cfg(feature = "gpu")]
