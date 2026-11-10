@@ -61,6 +61,13 @@ pub enum PlacementError {
          memory, or serve without the draft"
     )]
     DraftHostRoom { room: u64, draft: u64 },
+    /// A load whose passes make heads after it opened, of a file with no head a card head reads
+    /// ([`super::heads::model_row_heads`]): the plan has no bytes to count them by.
+    #[error(
+        "the file has no head a card head reads (output.weight, or token_embd.weight when tied): \
+         the heads its passes make have no planned bytes"
+    )]
+    PassHeads,
     /// A host set, a walk or a page release met an r8 sidecar it cannot take
     /// beside its pair: the sidecar's own named refusal.
     #[error(transparent)]
