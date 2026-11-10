@@ -2642,7 +2642,7 @@ pub(super) mod tests {
             opened: Some(super::Opened {
                 work,
                 name: "test tier".into(),
-                set: set.clone(),
+                set,
                 cols: 1,
                 block: None,
             }),

@@ -1558,7 +1558,7 @@ mod gate {
         // The clause's precondition, from the same trace: a layer whose whole
         // tier set (its coldest k3 under the rank) the prompt never routes.
         let mut free = Vec::new();
-        for layer in 0..inputs.model.layers {
+        for (layer, seen) in picks.iter().enumerate() {
             let routed = plan
                 .model
                 .tensors
@@ -1568,7 +1568,6 @@ mod gate {
                 continue;
             }
             let n = plan.model.experts;
-            let seen = picks[layer].as_slice();
             let never = (0..n as u32).filter(|id| !seen.contains(id)).count();
             if never >= k3 {
                 free.push(layer);

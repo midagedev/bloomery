@@ -50,6 +50,11 @@ pub(super) enum NodePoint {
     Signaled,
 }
 
+/// A step service's node hook ([`StepPort::serve_one`]): told each
+/// [`NodePoint`] with the count of the service's picks that named each
+/// tier's slots.
+pub(super) type NodeHook<'a> = dyn FnMut(NodePoint, &[u64; MAX_TIERS]) -> Result<(), GpuError> + 'a;
+
 /// Flag word `w` of the page, as an atomic.
 pub(super) fn word(page: &MappedHost, w: Word) -> &AtomicU32 {
     page.atomic_u32(w.offset())
@@ -1061,7 +1066,7 @@ impl StepPort {
         row: usize,
         opens_replay: bool,
         chain: Chain,
-        nodes: &mut dyn FnMut(NodePoint, &[u64; MAX_TIERS]) -> Result<(), GpuError>,
+        nodes: &mut NodeHook<'_>,
     ) -> Result<(), GpuError> {
         let what = SERVE;
         if let Chain::Cols(_) = chain {
@@ -1250,7 +1255,7 @@ impl StepPort {
         layer: usize,
         opens_replay: bool,
         chain: Chain,
-        nodes: &mut dyn FnMut(NodePoint, &[u64; MAX_TIERS]) -> Result<(), GpuError>,
+        nodes: &mut NodeHook<'_>,
     ) -> Result<(), GpuError> {
         let what = SERVE;
         let m = chain.cols();
