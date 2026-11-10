@@ -2389,11 +2389,12 @@ impl<H: HostExperts> HostTier<H> {
         row: usize,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "HostTier::enqueue_tier_go";
-        if self.node_mask(layer)? != 0 {
+        let here = self.tier_mask(layer)? & !self.node_mask(layer)?;
+        if here == 0 {
             return self.step.boundary.enqueue_go_of(stream, layer, row);
         }
         let mut tiers = [0; MAX_TIERS];
-        let k = tiers_of(self.tier_mask(layer)?, &mut tiers);
+        let k = tiers_of(here, &mut tiers);
         self.page_ref(WHAT)?
             .enqueue_go_of(stream, &self.step.boundary, layer, row, &tiers[..k])
     }
@@ -3579,7 +3580,14 @@ impl<H: HostExperts> HostTier<H> {
                 let mut behind = 0u32;
                 if let Some(page) = self.tier_page.as_ref() {
                     for (t, card) in self.tiers.iter().enumerate() {
-                        if !card.wait_for(page, self.tier_goes[t], t0 + tier::TIER_GRACE) {
+                        // A tier on a node serves only the layers it was
+                        // sent; the host's count also holds the skipped ones.
+                        let want = if card.node().is_some() {
+                            card.issued()
+                        } else {
+                            self.tier_goes[t]
+                        };
+                        if !card.wait_for(page, want, t0 + tier::TIER_GRACE) {
                             behind |= 1 << t;
                         }
                     }

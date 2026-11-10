@@ -2283,10 +2283,10 @@ impl TierCard {
     /// the tier. `picks` is the count of the service's routing that named a
     /// slot of this tier's: none leaves the node nothing to compute, so
     /// nothing is sent and the layer is the host's alone — `false` back. The
-    /// caller has raised the layer's go on the page
-    /// ([`TierPage::add_go`]) and the frame is sent after the picks were
-    /// read, so the node's copy of the row's image is the one the go
-    /// published. A frame sent opens the node's pass until the host ends it
+    /// frame is sent after the picks were read, and the caller raises the
+    /// layer's go on the page once it is sent ([`TierPage::add_go`]): the
+    /// node's stream waits on that go, and the link carries the row's image
+    /// across with it. A frame sent opens the node's pass until the host ends it
     /// ([`TierCard::end_pass`]). A tier of this process is refused by name:
     /// its layer is enqueued on its own stream ([`TierCard::enqueue_eager`]).
     pub(super) fn send_layer(
