@@ -17,8 +17,9 @@
 # The ring's half past ~51 streams no more at P 4096 (the balance cut; 34 at the logged costs): 64 is past both.
 kind: ab
 question: does Qwen3.8's reserved ring floor give a gate-plan load with host experts its split prompt back?
-term: pp tok/s @ prose:4096 (one ubatch walk of 4096 rows), A6000 (the timing card) at --place gate (the 3090's
-  bytes, BLOOMERY_GEN_PLACE=gate), BLOOMERY_RESIDENCY=mid-p0-s1, BLOOMERY_DRAFT=off: (changed - base) / base, one
+term: pp tok/s @ prose:4096 (one ubatch walk of 4096 rows), A6000 (the timing card) at --place a under
+  BLOOMERY_CARD_BUDGET=24176M (the 3090's usable bytes, RTX_3090's total less its driver reserve: the gate plan's card
+  on the timing card; the gate place itself loads on the 3090 alone), BLOOMERY_RESIDENCY=mid-p0-s1, BLOOMERY_DRAFT=off: (changed - base) / base, one
   binary (this tree), paired by round: changed = BLOOMERY_XSTREAM=split (the floor reserved), base =
   BLOOMERY_XSTREAM=admit, under which plans_ring is false, no staging reserve and no ring floor, so its plan is
   train2's before the floor
