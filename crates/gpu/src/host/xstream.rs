@@ -518,9 +518,7 @@ fn check_parts(layer: usize, parts: &[usize], previous: usize) -> Result<(), Gpu
 /// for what a load allocates past the plan after the ring.
 pub const KEEP_FREE: u64 = 512 << 20;
 
-/// The fewest slots a half may hold: fewer, and the ring's bytes would not
-/// pay for its launches.
-pub const MIN_HALF: usize = 8;
+pub use model::arch::place_hybrid::MIN_HALF;
 
 /// Fill threads and pinned staging slots: four threads keep the copy
 /// engine fed from the source's pages, and a staging ring of at most

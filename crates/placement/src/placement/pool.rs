@@ -272,7 +272,12 @@ pub struct PoolNeed {
 }
 
 /// `card`'s total against usable − margin: its uploads' granules, its KV,
-/// its stage rows and its set-aside.
+/// its stage rows and its set-aside. Not the prompt and ring terms: the prompt
+/// batch is held to the card by the family's own named refusal
+/// ([`PlaceError::PromptOver`] and its twins, which `refuse_reserve` raises
+/// only when the terms fit alone), so counting it here would turn each of
+/// them into a [`Violation::CardOver`]; a unified pool counts it as the
+/// `beside` its caller passes ([`Plan::violations_beside`]).
 fn card_total(card: &Card, totals: &CardTotals, heap: &Heap) -> u64 {
     card.floor_with_reserves(
         heap.taken,

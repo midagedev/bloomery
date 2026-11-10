@@ -154,6 +154,21 @@ impl CardTotals {
         u64::try_from(sum).unwrap_or(u64::MAX)
     }
 
+    /// [`CardTotals::bytes`] without the prompt and ring terms: the bytes a prompt
+    /// call's reserve (the batch buffers and the ring's floor, which the plan counts
+    /// as those two terms) is checked to fit beside. The one named variant of the sum;
+    /// every other term stays in it.
+    #[must_use]
+    pub fn bytes_beside_prompt(&self) -> u64 {
+        let sum: u128 = self
+            .terms()
+            .into_iter()
+            .filter(|(name, _)| !matches!(*name, "prompt" | "ring"))
+            .map(|(_, b)| u128::from(b))
+            .sum();
+        u64::try_from(sum).unwrap_or(u64::MAX)
+    }
+
     /// Every term [`CardTotals::bytes`] sums, by the name the records and
     /// refusals give it: the one list both the sum and a message naming the
     /// terms read ([`super::card_made`]).

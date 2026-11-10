@@ -961,7 +961,7 @@ impl PlanInputs {
             let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
             place_hybrid::refuse_reserve(
                 card,
-                place_hybrid::card_terms(t),
+                t.bytes_beside_prompt(),
                 limit,
                 front,
                 |card, front, left, short| PlaceError::FrontOver {
@@ -1331,7 +1331,7 @@ impl PlanInputs {
             }
             Ok(plan)
         })?;
-        let total = place_hybrid::card_terms(&plan.cards[0]) + nextn_card + arena;
+        let total = plan.cards[0].bytes_beside_prompt() + nextn_card + arena;
         let usable = plan.usable_bytes(card);
         let limit = usable.saturating_sub(card.margin_bytes);
         let host_headroom = plan.host.headroom_bytes - i128::from(draft_host);

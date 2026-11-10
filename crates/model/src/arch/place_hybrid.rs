@@ -33,8 +33,8 @@ use crate::placement::accepts::{program_of, routed_rule};
 use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
-    self, Card, CardFormat, CardTotals, KvBytes, Machine, ModelTensors, PlacementError, Plan,
-    PlanLevers, Unimplemented, Violation, checked_beside, joined, kernels,
+    self, Card, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
+    Unimplemented, Violation, checked_beside, joined, kernels,
 };
 
 // The prompt batch a window ring keeps room for is the batch the card walks the prompt in.
@@ -256,6 +256,11 @@ pub fn planned_room_cap<H>(plan: &Plan<'_>, inputs: &PlanInputs<H>) -> Option<u6
         ring.pass_bytes(stage.ring_half),
     ))
 }
+
+/// The fewest slots a half of the ring may hold: fewer, and the ring's bytes would not pay for its
+/// launches. The expert stream refuses a ring of a smaller half (`XCfg::min_half`) by name at the
+/// load ([`plan_ring_last`] does not).
+pub const MIN_HALF: usize = 8;
 
 /// The ring, the one rule of every family that streams: a reserved floor of `floor` slots a half,
 /// counted before the experts, then grown last from what every other term leaves up to `cap`
@@ -836,7 +841,7 @@ impl<H> PlanInputs<H> {
             let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
             refuse_reserve(
                 card,
-                card_terms(totals),
+                totals.bytes_beside_prompt(),
                 limit,
                 reserve,
                 |card, reserve, left, short| PlaceError::PromptOver {
@@ -956,7 +961,7 @@ impl KvBytes for RoomPadded<'_> {
 }
 
 /// What card `card` of `plan` leaves past its terms for the buffers a load makes beside them: its
-/// usable bytes less its margin and [`card_terms`], 0 for a card the terms fill or a plan with no
+/// usable bytes less its margin and [`bytes_beside_prompt`](crate::placement::CardTotals::bytes_beside_prompt), 0 for a card the terms fill or a plan with no
 /// card `card`. The room term a prompt reserve is fitted under ([`PlaceError::PromptOver`]'s
 /// `left`).
 #[must_use]
@@ -965,7 +970,7 @@ pub fn reserve_room(plan: &Plan<'_>, card: usize) -> u64 {
         (Some(c), Some(totals)) => plan
             .usable_bytes(c)
             .saturating_sub(c.margin_bytes)
-            .saturating_sub(card_terms(totals)),
+            .saturating_sub(totals.bytes_beside_prompt()),
         _ => 0,
     }
 }
@@ -986,17 +991,6 @@ pub(crate) fn refuse_reserve<E>(
         Some(left) if reserve > left => Err(over(card.name.clone(), reserve, left, reserve - left)),
         _ => Ok(()),
     }
-}
-
-/// A plan's terms on a card: its granules, cache, scratch, context and reserves.
-pub(crate) fn card_terms(t: &CardTotals) -> u64 {
-    t.dense_bytes
-        + t.expert_bytes
-        + t.rounding_bytes
-        + t.kv_bytes
-        + t.scratch_bytes
-        + t.context_bytes
-        + t.reserve_bytes
 }
 
 /// What one trunk layer holds per sequence.
@@ -1334,7 +1328,7 @@ pub(crate) fn assert_ring_cap<H: Clone>(
     ring: StreamRing,
     machine: &Machine,
     ctx: u64,
-) -> (CardTotals, Vec<u64>) {
+) -> (crate::placement::CardTotals, Vec<u64>) {
     let floor_bytes = ring.bytes(ring.floor);
     let streamed = plain.clone().streaming(ring);
     let old = plain

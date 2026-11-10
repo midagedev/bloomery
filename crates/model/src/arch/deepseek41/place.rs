@@ -306,7 +306,7 @@ impl PlanInputs {
             let limit = plan.usable_bytes(card).saturating_sub(card.margin_bytes);
             place_hybrid::refuse_reserve(
                 card,
-                place_hybrid::card_terms(t),
+                t.bytes_beside_prompt(),
                 limit,
                 front,
                 |card, batch, left, short| PlaceError::BatchOver {

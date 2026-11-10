@@ -424,7 +424,7 @@ mod tests {
             &levers,
         )
         .expect("the host-only reference plans");
-        let dense = crate::arch::place_hybrid::card_terms(&host_only.cards[0]);
+        let dense = host_only.cards[0].bytes_beside_prompt();
         machine.cards[0].usable_bytes = machine.cards[0].margin_bytes + dense + reserve - 1;
         match inputs.plan(&machine, 64, &levers) {
             Err(PlaceError::PromptOver {
