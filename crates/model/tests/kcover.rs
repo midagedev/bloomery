@@ -365,6 +365,12 @@ fn kcover_the_mimo_fixture_budget_is_its_plan() {
     // refusal's line: dense 1,082,130,432 + KV 16,711,680 + context 536,870,912 + scratch
     // 67,108,864 + margin 1,073,741,824 + beside 316,919,808 = 3,093,483,520 B).
     let e = (planner.card_experts)(&fx, Some(2 << 30)).expect_err("2 GiB is below the floor");
-    assert!(e.to_string().contains("is below its floor 3093483520 B"), "{e}");
-    assert!(cap > 3_093_483_520, "the planned cap {cap} holds the floor and the experts");
+    assert!(
+        e.to_string().contains("is below its floor 3093483520 B"),
+        "{e}"
+    );
+    assert!(
+        cap > 3_093_483_520,
+        "the planned cap {cap} holds the floor and the experts"
+    );
 }
