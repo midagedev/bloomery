@@ -41,6 +41,7 @@ pub mod elastic;
 pub mod need_hook;
 pub mod nodes;
 pub mod paged_drop;
+pub mod parts;
 pub mod tp;
 pub mod workstation;
 
