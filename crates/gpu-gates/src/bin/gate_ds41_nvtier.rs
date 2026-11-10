@@ -42,6 +42,7 @@ mod quiet;
 mod gate {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::Arc;
 
     use app::arch::deepseek41::Ds41Cfg;
@@ -155,6 +156,11 @@ mod gate {
 
         fn takes_rank(&self) -> bool {
             true
+        }
+
+        fn rank_child(&self, cmd: &mut Command, rank: &Path) -> Result<(), GateError> {
+            cmd.env(EXPERT_RANK, rank);
+            Ok(())
         }
 
         fn write_rank(&self, dir: &Path) -> Result<PathBuf, GateError> {
