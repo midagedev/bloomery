@@ -39,6 +39,11 @@ pub const COMMIT: &str = "78feec062";
 /// set of the file named by another path is stale by this line, not by its name.
 pub const MODEL: &str = "/models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf";
 
+/// The first shard the `kimik2` tokenizer gate opens: the file under `/data/moved/models`, named in full (`/models` holds no
+/// symlink to it). [`MODEL`] stays the identity of the node-dump sets.
+pub const VOCABULARY: &str =
+    "/data/moved/models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf";
+
 /// The build every kimi-k3 set names: llama.cpp [`COMMIT`] and the first 12 hex digits of the md5 of the `libllama.so` built from it
 /// (`/home/user/llama.cpp-kimik3`, the tree the profile's `LCPP` names; `tools/ref/kimi-k3-dump.sh --build` records the whole md5
 /// beside the binary and the run refuses a library that moved).

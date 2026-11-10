@@ -14,9 +14,9 @@ use std::path::PathBuf;
 
 use tokenizer::Tokenizer;
 
-/// The first shard of the K3 file on the box: the metadata and the tokenizer, no tensors.
+/// The first shard of the K3 file (`refset::arch::kimi_k3::VOCABULARY`, its full path): the metadata and the tokenizer, no tensors.
 fn vocabulary() -> PathBuf {
-    PathBuf::from("/models/Kimi-K3-UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf")
+    PathBuf::from(refset::arch::kimi_k3::VOCABULARY)
 }
 
 /// Every case encodes to the reference's ids, with special tokens parsed and without. FAIL-first:
