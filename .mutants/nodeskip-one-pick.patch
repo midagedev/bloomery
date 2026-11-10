@@ -6,7 +6,8 @@
 # lost card (B11's bits differ or the clause fails by name).
 --- a/crates/gpu/src/host/tier.rs
 +++ b/crates/gpu/src/host/tier.rs
-@@ -2283,7 +2283,7 @@
+@@ -2295,7 +2295,7 @@
+         row: usize,
          picks: u64,
      ) -> Result<bool, GpuError> {
 -        if picks == 0 {

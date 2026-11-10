@@ -4,10 +4,12 @@
 # none_of` expects the refusal by name and sees the request served instead.
 --- a/crates/gpu/src/host/node.rs
 +++ b/crates/gpu/src/host/node.rs
-@@ -1777,7 +1777,7 @@
+@@ -1776,7 +1776,7 @@
+             what: SERVER,
              missing: "the tier page (the bind request)",
          })?;
 -        if row >= rows || !(1..=self.cols).contains(&cols) || self.set.on_tier(layer)? == 0 {
 +        if row >= rows || !(1..=self.cols).contains(&cols) {
              return Err(GpuError::shape(
                  SERVER,
+                 format!(
