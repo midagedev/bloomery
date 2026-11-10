@@ -3203,13 +3203,40 @@ mod gate {
     /// The context of the refill clause's server, in positions: wide enough that a prompt can
     /// outgrow the free bytes the warm settle leaves.
     const REFILL_CTX: usize = 65_536;
-    /// The card bytes one position's K/V takes on a Qwen3.8 slot [derived, kvcommon §4.1:
-    /// 48 pages of 2 MiB every 4 096 positions].
-    const KV_BYTES_PER_POSITION: u64 = 48 * 2 * 1024 * 1024 / 4096;
+    /// The bytes past the slack the refill clause's long prompt asks for its page rounding: a
+    /// page of 2 MiB a run, for up to 32 runs, over the pages the warm pass's reach held and
+    /// the long prompt's own.
+    const REFILL_PAGE_SLOP: u64 = 64 * 1024 * 1024;
     /// Requests of the refill clause before its long prompt, and the most after it: the hold
     /// counts quiet boundaries, so the clause sends small requests (each a reset) until a
     /// fill shows or the hold has passed three times over.
     const REFILL_BEFORE: usize = 20;
+
+    /// The positions of a refill prompt whose K/V outgrows the card's free bytes past the
+    /// margin, or `None` when the slot's stores take no bytes. `free_after` and `margin` are
+    /// the warm settle's reading (the `elastic fill` at site `warm`, else `elastic warm`);
+    /// `warm_ids` the warm pass's ids; `layout` the slot's stores by position at
+    /// [`REFILL_CTX`] (`kv room`'s `layout_bytes`, the plan's count, unrounded), so `layout /
+    /// REFILL_CTX` is this load's bytes a position — the fixture's own, never the real model's.
+    /// The warm pass's reach held its pages at the settle's reading and the first small
+    /// request's reset gave them back, so the free bytes before the long prompt are at most
+    /// the slack plus `warm_ids` positions; [`REFILL_PAGE_SLOP`] covers the page rounding of
+    /// both. Pages hold at least the unrounded bytes, so a prompt of `warm_ids +
+    /// ⌈(slack + slop) / bytes a position⌉` positions asks past the free bytes.
+    fn refill_need(free_after: u64, margin: u64, warm_ids: u64, layout: u64) -> Option<u64> {
+        let per = layout / REFILL_CTX as u64;
+        let slack = free_after.saturating_sub(margin);
+        (per > 0).then(|| warm_ids + (slack + REFILL_PAGE_SLOP).div_ceil(per))
+    }
+
+    /// Every `kv room` line of `err_log`, in order.
+    fn kv_room_lines(err_log: &Path) -> Result<Vec<String>, GateError> {
+        Ok(std::fs::read_to_string(err_log)?
+            .lines()
+            .filter(|l| l.starts_with("kv room "))
+            .map(str::to_owned)
+            .collect())
+    }
 
     /// The `elastic give-back` records a log holds at site `fit` (a K/V fit short of bytes).
     fn fit_give_backs(log: &record::Log) -> Result<usize, GateError> {
@@ -3222,9 +3249,10 @@ mod gate {
 
     /// The fill clauses' second half (the module header): serving fills back. An elastic server
     /// is first driven past the warm-up's clocks with small requests, then handed a prompt
-    /// whose K/V outgrows the free bytes the warm settle left (derived from its records: the
-    /// free bytes less the margin, over [`KV_BYTES_PER_POSITION`], and one more page step), so
-    /// a K/V fit gives expert slots back (`elastic give-back` at site `fit`). Small requests
+    /// whose K/V outgrows the free bytes the warm settle left ([`refill_need`], from the
+    /// server's own records), so a K/V fit gives expert slots back (`elastic give-back` at site
+    /// `fit`). Every `kv room` line from the long prompt on is echoed into the gate's output: a
+    /// `kv_host_bytes` above 0 is the K/V's pages gone to the host instead. Small requests
     /// follow, each a reset: the K/V pages return, and once the hold after the give-back
     /// (`FILL_HOLD` quiet boundaries on the clock `stat elastic` prints) is over the next quiet
     /// boundary fills at site `quiet`. The clause holds that fill to the hold from the clocks
@@ -3266,6 +3294,7 @@ mod gate {
         // Quiet fills and fit give-backs the log held before the long prompt: the clause reads
         // only what comes after it.
         let (mut fills_before, mut fits_before, mut gb_before) = (0usize, 0usize, 0u64);
+        let mut kv_rooms_before = 0usize;
         match served.address(&err_log, POLLS, POLL) {
             Ok(addr) => {
                 let url = |p: &str| format!("http://{addr}{p}");
@@ -3286,22 +3315,22 @@ mod gate {
                     .transpose()?;
                 let (margin, free_after) =
                     (warm.u64("margin")?, settled.unwrap_or(warm.u64("free")?));
-                let page_step = 4096u64;
-                let need = (free_after.saturating_sub(margin) / KV_BYTES_PER_POSITION)
-                    .div_ceil(page_step)
-                    * page_step
-                    + 2 * page_step;
+                let layout = log
+                    .all(&record::KV_ROOM)?
+                    .last()
+                    .map(|r| r.u64("layout_bytes"))
+                    .transpose()?;
+                kv_rooms_before = kv_room_lines(&err_log)?.len();
+                let need = layout.and_then(|layout| {
+                    refill_need(free_after, margin, warm.u64("ids").ok()?, layout)
+                });
                 println!(
-                    "elastic-refill: {free_after} B free after the warm settle, margin {margin} B: \
-                     a prompt of {need} positions outgrows it (ctx {REFILL_CTX})"
+                    "elastic-refill: {free_after} B free after the warm settle, margin {margin} B, \
+                     the slot's stores {layout:?} B at ctx {REFILL_CTX}: a prompt of {need:?} \
+                     positions outgrows it"
                 );
-                if need as usize + 64 > REFILL_CTX {
-                    println!(
-                        "elastic-refill: the context cannot outgrow the free bytes; raise \
-                         REFILL_CTX"
-                    );
-                    all_200 = false;
-                } else {
+                let held = need.filter(|&n| n as usize + 64 <= REFILL_CTX);
+                if let Some(need) = held {
                     let long: Vec<u32> = (0..need as u32).map(|i| 1000 + i % 5000).collect();
                     let (st, _) = ids_request(&url, &long, 1)?;
                     println!("elastic-refill: the long prompt: HTTP {st}");
@@ -3314,6 +3343,12 @@ mod gate {
                         }
                     }
                     waited = true;
+                } else {
+                    println!(
+                        "elastic-refill: no `kv room` layout before the long prompt, or a prompt \
+                         the context cannot hold; raise REFILL_CTX"
+                    );
+                    all_200 = false;
                 }
             }
             Err(e) => {
@@ -3349,6 +3384,12 @@ mod gate {
         .into_iter()
         .flatten()
         {
+            println!("elastic-refill: {line}");
+        }
+        // The K/V's own pages from the long prompt on, the line before it first (what the slot
+        // held going in): `kv_host_bytes` above 0 is pages backed on the host.
+        let rooms = kv_room_lines(&err_log)?;
+        for line in rooms.iter().skip(kv_rooms_before.saturating_sub(1)) {
             println!("elastic-refill: {line}");
         }
         println!(
