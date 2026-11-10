@@ -261,7 +261,7 @@ use serve::{CacheNote, DraftProps, Drafted, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
 use super::drafted::{LOOKUP_ROWS, Lookups, SlotDrafts};
-use super::served::{self, ServedDraft, Word};
+use super::served::{self, ServedDraft};
 use super::{folder, qwen3_folder};
 use crate::draft::Draft;
 use crate::dspark_hf;
@@ -2320,7 +2320,7 @@ fn decide_q35(
     let forbid_set = |why: String| -> Result<Choice, GateError> {
         Err(format!("BLOOMERY_DRAFT=mtp: {why}").into())
     };
-    match served::asked(levers)? {
+    match draft_asked(levers)? {
         Some(DraftWord::Mtp) => {
             if media {
                 return forbid_set(MEDIA_DRAFT.to_owned());
@@ -2412,13 +2412,53 @@ fn verdict_records(
     if drafted { Body35::VERIFY_ROWS } else { 0 }
 }
 
+/// `BLOOMERY_DRAFT` as this seat reads it. Unset and `off` are
+/// [`Word::Off`] here; the seat decides afterwards whether a qwen35moe file's
+/// in-file layer drafts. `lookup` and `dspark` stay the served drafts
+/// ([`crate::draft::Draft`]). (`Draft::from_levers` is the V4.1 binaries'
+/// parse, which refuses `off` and registers the V4.1 draft record; this one
+/// needs neither.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Word {
+    /// Unset or `off`: the seat's plain path, or a qwen35moe file's in-file
+    /// layer when that seat's default says so.
+    Off,
+    /// The n-gram draft.
+    Lookup,
+    /// The DSpark draft.
+    Dspark,
+    /// The file's own next-token layer.
+    Mtp,
+}
+
+/// `BLOOMERY_DRAFT` as this seat reads it: every word the row takes, `None` unset.
+fn draft_asked(levers: &Levers) -> Result<Option<DraftWord>, GateError> {
+    levers.draft_word(&DraftWord::ALL).map_err(|e| {
+        format!(
+            "BLOOMERY_DRAFT is lookup, dspark, mtp, off or unset, not {:?}",
+            e.word.as_str()
+        )
+        .into()
+    })
+}
+
+/// [`Word`] from the levers.
+fn word(levers: &Levers) -> Result<Word, GateError> {
+    Ok(match draft_asked(levers)? {
+        None | Some(DraftWord::Off) => Word::Off,
+        Some(DraftWord::Lookup) => Word::Lookup,
+        Some(DraftWord::Dspark) => Word::Dspark,
+        Some(DraftWord::Mtp) => Word::Mtp,
+    })
+}
+
 /// [`Word`] from `BLOOMERY_DRAFT` for the `arch` file at `path`, `name` its
 /// architecture. `lookup` is refused by name on a qwen3moe file
 /// ([`lookup_refusal`]). `dspark` is the draft a qwen35moe file serves.
 /// `mtp` on a qwen3moe file is refused by name before any plan: that body
 /// has no in-file next-token layer and runs no verify pass.
 fn draft_of(arch: Family, name: &str, levers: &Levers, path: &Path) -> Result<Word, GateError> {
-    let word = served::word(levers)?;
+    let word = word(levers)?;
     match (word, arch) {
         (Word::Lookup, Family::Qwen3moe) => Err(lookup_refusal(arch).into()),
         (Word::Dspark, Family::Qwen3moe | Family::Qwen35) => Err(format!(
@@ -2520,12 +2560,11 @@ pub(crate) fn check(
                 levers.and_then(Levers::qwen3_kv_set),
             )?;
             if let Some(levers) = levers {
-                let word = served::word(levers)?;
+                let word = word(levers)?;
                 WidthMode::of(levers.mtp_width())?;
                 bind::refuse_plain_width(
                     levers,
-                    (served::asked(levers)? == Some(DraftWord::Off))
-                        .then_some("BLOOMERY_DRAFT=off"),
+                    (draft_asked(levers)? == Some(DraftWord::Off)).then_some("BLOOMERY_DRAFT=off"),
                 )?;
                 served::draft_slots(a.parallel, served_draft(word), true)?;
                 if word == Word::Mtp {
@@ -2571,7 +2610,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let width = WidthMode::of(levers.mtp_width())?;
     bind::refuse_plain_width(
         &levers,
-        (served::asked(&levers)? == Some(DraftWord::Off)
+        (draft_asked(&levers)? == Some(DraftWord::Off)
             || (matches!(arch, Family::Qwen3moe) && levers.draft().is_none()))
         .then_some("no draft selected"),
     )?;
@@ -2725,7 +2764,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         && matches!(word, Word::Off | Word::Mtp)
     {
         Some(if weights.is_folder() {
-            folder_choice(served::asked(&levers)?)?
+            folder_choice(draft_asked(&levers)?)?
         } else {
             decide_q35(
                 &levers,

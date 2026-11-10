@@ -188,7 +188,6 @@ use engram::Hash;
 use engram::hash::{History, Window};
 use gguf::{GgmlType, Split, TensorInfo};
 use model::arch::Arch;
-use model::arch::qwen35moe::place;
 use model::part::StoredRows;
 use model::placement::{Device, Plan};
 use runtime::prompt::{CallEnd, call_units, chunks, fold_units, heat_call};
@@ -1150,7 +1149,7 @@ struct Pending38 {
     each: bool,
 }
 
-/// The expert stream's ring a load's plan counts ([`place::ring_cap_bytes`]).
+/// The expert stream's ring a load's plan counts ([`model::arch::qwen35moe::place::ring_cap_bytes`]).
 #[derive(Clone, Copy, Debug)]
 struct RingPlanned {
     /// The card bytes of the ring's two halves the plan's ring term holds: the cap the ring is
@@ -1343,7 +1342,7 @@ pub struct Body38 {
     /// sequence past the plan is refused by name.
     slots_planned: usize,
     slots_made: usize,
-    /// The expert stream's ring the load's plan counts ([`place::ring_cap_bytes`]): `None` for a plan
+    /// The expert stream's ring the load's plan counts ([`model::arch::qwen35moe::place::ring_cap_bytes`]): `None` for a plan
     /// whose load does not stream, whose ring (if one is set later) takes what the card's margin
     /// leaves; `Some(bytes)` the card bytes of the ring's two halves the plan's ring term holds,
     /// the cap [`Body38::set_xstream`] gives the ring, and the plan's term and half the made
@@ -2258,11 +2257,12 @@ impl Body38 {
             ple_due: None,
             slots_planned: planned,
             slots_made: 1,
-            ring_planned: place::ring_cap_bytes(plan, ub as u64, inputs).map(|cap| RingPlanned {
-                cap,
-                term: plan.cards[0].ring_bytes,
-                half: plan.cards[0].ring_half,
-            }),
+            ring_planned: model::arch::qwen35moe::place::ring_cap_bytes(plan, ub as u64, inputs)
+                .map(|cap| RingPlanned {
+                    cap,
+                    term: plan.cards[0].ring_bytes,
+                    half: plan.cards[0].ring_half,
+                }),
             kv_levers,
             card_page,
             slot_in: (planned > 1).then(|| SlotIn::new(stream)).transpose()?,

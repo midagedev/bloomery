@@ -34,7 +34,6 @@ use bloomery_gpu::dspark::DraftLayers;
 use bloomery_gpu::model::{ChainBody, Rollback, Rows, Slots};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{SlotsFrom, nvidia_smi_index};
-use bloomery_levers::{DraftWord, Levers};
 use model::placement::workstation::DeviceId;
 use runtime::width::{Choosing, Chosen, Mode as WidthMode};
 use runtime::{Advance, Committed, Draft as RtDraft, Speculative, Widths, Window};
@@ -600,54 +599,6 @@ where
     D: RtDraft<Session<B>>,
 {
     Ok(<D as Chosen<Session<B>>>::choosing(d, mode)?)
-}
-
-/// `BLOOMERY_DRAFT` as the qwen3 seat reads it. Unset and `off` are
-/// [`Word::Off`] here; the seat decides afterwards whether a qwen35moe file's
-/// in-file layer drafts. `lookup` and `dspark` stay the served drafts
-/// ([`crate::draft::Draft`]). (`Draft::from_levers` is the V4.1 binaries'
-/// parse, which refuses `off` and registers the V4.1 draft record; this one
-/// needs neither.)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Word {
-    /// Unset or `off`: the seat's plain path, or a qwen35moe file's in-file
-    /// layer when that seat's default says so.
-    Off,
-    /// The n-gram draft.
-    Lookup,
-    /// The DSpark draft.
-    Dspark,
-    /// The file's own next-token layer.
-    Mtp,
-}
-
-/// `BLOOMERY_DRAFT` as the qwen3 seat reads it: every word the row takes, `None` unset.
-#[allow(
-    dead_code,
-    reason = "the qwen3 seat's parse; the V4.1 binary that includes this file serves no such seat"
-)]
-pub fn asked(levers: &Levers) -> Result<Option<DraftWord>, GateError> {
-    levers.draft_word(&DraftWord::ALL).map_err(|e| {
-        format!(
-            "BLOOMERY_DRAFT is lookup, dspark, mtp, off or unset, not {:?}",
-            e.word.as_str()
-        )
-        .into()
-    })
-}
-
-/// [`Word`] from the levers.
-#[allow(
-    dead_code,
-    reason = "the qwen3 seat's parse; the V4.1 binary that includes this file serves no such seat"
-)]
-pub fn word(levers: &Levers) -> Result<Word, GateError> {
-    Ok(match asked(levers)? {
-        None | Some(DraftWord::Off) => Word::Off,
-        Some(DraftWord::Lookup) => Word::Lookup,
-        Some(DraftWord::Dspark) => Word::Dspark,
-        Some(DraftWord::Mtp) => Word::Mtp,
-    })
 }
 
 /// The slot count the DSpark draft decides, when it does: its window is one

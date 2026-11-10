@@ -89,7 +89,6 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	nemotron	4	baseline P 6: MK2 prog
 crates/gpu-gates/src/bin/shared/routed_legs.rs	qwen	23	PIN(2026-11-01) qwen: + 1 (was 22, baseline P 24), family_of matches every models::Arch exhaustively, so the dense Qwen3 trunk's variant has its line beside the dense Llama's, and no routed-legs adapter is registered for it; MK2 program by body
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	clef	13	baseline S 13: MK9 seat by program
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs	qwen	11	baseline S 13: MK9 seat by program
-crates/gpu-gates/src/bin/shared/serve_seats/served.rs	qwen	1	baseline S 1: MK9 seat by program
 crates/gpu-gates/src/bin/shared/state_back.rs	deepseek	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/ubatch_rule.rs	qwen	1	PIN(2026-10-27) qwen: the -ub flag-over-env rule the qwen3, decide and Qwen3.8 seats share reads the qwen3moe body's ubatch lever (UBATCH, BLOOMERY_QWEN3_UBATCH); a body-neutral prompt-batch field in ModelSpec would take the name out
 crates/gpu-gates/src/bin/shared/vision_taps.rs	clef	1	baseline D 1: media design: VideoRule data per tower (vidcore)
