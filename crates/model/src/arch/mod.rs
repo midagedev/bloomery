@@ -1200,9 +1200,14 @@ pub(crate) mod synthetic {
             b.extend_from_slice(&offset.to_le_bytes());
             offset += bytes.div_ceil(32) * 32;
         }
-        b.resize(b.len().div_ceil(32) * 32 + offset as usize, 0);
+        b.resize(b.len().div_ceil(32) * 32, 0);
         let path = std::env::temp_dir().join(format!("bloomery-{}-{tag}.gguf", std::process::id()));
-        std::fs::write(&path, b).expect("write the synthetic header");
+        // The zero-filled data is the file's length past the header, so a header of large
+        // tensors writes only its header's bytes.
+        let file = std::fs::File::create(&path).expect("create the synthetic header");
+        std::io::Write::write_all(&mut &file, &b).expect("write the synthetic header");
+        file.set_len(b.len() as u64 + offset)
+            .expect("size the synthetic header's data");
         path
     }
 
