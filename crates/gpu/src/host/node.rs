@@ -23,15 +23,20 @@
 //! A lost node ends both sides by name. Node 0 marks a tier whose channel
 //! failed lost ([`TierNode::lost`]) and ends that channel, and the host tier
 //! names it a lost card; a node that stops signalling mid-step is the go
-//! deadline's, as for a card of node 0's. The server ends when node 0's
-//! channel ends without a close, when a request fails after it reached the
-//! tier's stream, or when work it was asked for has made no progress past the
-//! go deadline and its grace: it writes [`super::step::RELEASE`] to its own
-//! counters and go words, so every wait its stream holds passes and node 0's
-//! next settle refuses the step by name
+//! deadline's, as for a card of node 0's. A step sends the node only the
+//! layers whose picks name its slots, one enqueue frame each, so node 0 ends
+//! each pass that sent it one with an end frame ([`TierNode::send_end`]),
+//! and sends nothing more for a pass whose card it named lost. The server
+//! ends when node 0's channel ends without a close, when a request fails
+//! after it reached the tier's stream, or when work is outstanding — a layer
+//! asked of it unserved, or a pass opened and not ended — with no frame or
+//! progress past the go deadline and its grace: it writes
+//! [`super::step::RELEASE`] to its own counters and go words, so every wait
+//! its stream holds passes and node 0 names the release when it runs again
 //! ([`super::tier::TierCard::released`]); it drains its stream and returns
-//! the loss by name. A half-open control connection is bounded by its
-//! request deadline, and an unresponsive tier by the go deadline.
+//! the loss by name. A server between passes is idle for any time. A
+//! half-open control connection is bounded by its request deadline, and an
+//! unresponsive tier by the go deadline.
 //!
 //! A prompt batch's block runs on the node as one request a tiered
 //! layer-batch ([`block`]): node 0 sends it before its host's union and
@@ -1192,10 +1197,26 @@ pub struct TierNode {
     /// A block request sent whose reply is unread: its slots and the tier
     /// slots it sent.
     pending: Option<(usize, usize)>,
-    /// Enqueues sent whose replies are unread ([`TierNode::send_enqueue`]).
-    pending_enqueues: u32,
+    /// The frames of the step's passes ([`TierNode::send_enqueue`],
+    /// [`TierNode::send_end`]).
+    frames: PassFrames,
     control_round_trips: u64,
     lost: Option<String>,
+}
+
+/// A node tier's pass frames, each sent without waiting for its reply: the
+/// replies unread, and whether the node holds a pass open.
+#[derive(Default)]
+struct PassFrames {
+    /// Enqueues sent whose replies are unread.
+    enqueues: u32,
+    /// An end sent whose reply is unread. Every send reads the replies before
+    /// it, so the end was sent before each unread enqueue and its reply comes
+    /// first.
+    end: bool,
+    /// An enqueue was sent since the last end: the node holds the pass open
+    /// until this process ends it.
+    open: bool,
 }
 
 /// Connect to the node at `addr` and read its census.
@@ -1264,7 +1285,7 @@ impl TierNode {
             words: None,
             block: None,
             pending: None,
-            pending_enqueues: 0,
+            frames: PassFrames::default(),
             control_round_trips: 0,
             lost: None,
         };
@@ -1321,7 +1342,7 @@ impl TierNode {
     }
 
     /// Refuse a request `what` to a lost node by name; with a block's reply
-    /// or an enqueue's unread, read it first and set it aside, whatever it
+    /// or a pass frame's unread, read it first and set it aside, whatever it
     /// carries, so the request's reply is the next frame. A channel that
     /// fails loses the node.
     fn ready(&mut self, what: &str) -> Result<(), GpuError> {
@@ -1334,7 +1355,7 @@ impl TierNode {
                 ),
             ));
         }
-        self.drain_enqueues(Instant::now() + REPLY)?;
+        self.drain_pass(Instant::now() + REPLY)?;
         if self.pending.take().is_some() {
             match self.ch.recv(Instant::now() + REPLY) {
                 Ok(Tag::Ok | Tag::Err) => self.control_round_trips += 1,
@@ -1432,8 +1453,10 @@ impl TierNode {
     /// [`TierWork::enqueue`] on the node, sent without its reply: one layer a
     /// node tier serves on the host's own reading of the picks, whose frame
     /// names its layer, so a layer the host skips is simply never sent. The
-    /// replies are read by [`TierNode::drain_enqueues`], in the order the
-    /// frames were sent; a refusal surfaces there.
+    /// first since the last end opens a pass on the node, which
+    /// [`TierNode::send_end`] ends. The replies are read by
+    /// [`TierNode::drain_pass`], in the order the frames were sent; a refusal
+    /// surfaces there.
     pub(super) fn send_enqueue(
         &mut self,
         layer: usize,
@@ -1446,40 +1469,73 @@ impl TierNode {
             .ch
             .send(Tag::Enqueue, self.req.done(), Instant::now() + REPLY);
         written.map_err(|e| self.lose_now("enqueue", e.to_string()))?;
-        self.pending_enqueues += 1;
+        self.frames.enqueues += 1;
+        self.frames.open = true;
         Ok(())
     }
 
-    /// The replies of the enqueues [`TierNode::send_enqueue`] sent, read by
-    /// `deadline`: each an empty acknowledgement, or the server's refusal of
-    /// the frame it belongs to. A channel that fails loses the node.
-    pub(super) fn drain_enqueues(&mut self, deadline: Instant) -> Result<(), GpuError> {
-        while self.pending_enqueues > 0 {
-            match self.ch.recv(deadline) {
-                Ok(Tag::Ok) => {
-                    let end = In::new(self.ch.body()).end();
-                    self.control_round_trips += 1;
-                    self.pending_enqueues -= 1;
-                    if let Err(why) = end {
-                        return Err(self.lose_now("enqueue", why));
-                    }
-                }
-                Ok(Tag::Err) => {
-                    self.control_round_trips += 1;
-                    self.pending_enqueues -= 1;
-                    return match read_err(self.addr, "enqueue", self.ch.body()) {
-                        Ok(e) => Err(e),
-                        Err(why) => Err(self.lose_now("enqueue", why)),
-                    };
-                }
-                Ok(t) => {
-                    let why = format!("a {t:?} frame where an enqueue's reply belongs");
-                    return Err(self.lose_now("enqueue", why));
-                }
-                Err(e) => return Err(self.lose_now("enqueue", e.to_string())),
-            }
+    /// End the pass the node holds open: one end frame, sent without its
+    /// reply, which [`TierNode::drain_pass`] reads. The node takes no frame
+    /// for a layer the host skips, so this frame alone tells it the pass is
+    /// over and it is idle, not stalled. Nothing is sent when no enqueue went
+    /// out since the last end, nor to a lost node.
+    pub(super) fn send_end(&mut self) -> Result<(), GpuError> {
+        if !std::mem::take(&mut self.frames.open) || self.lost.is_some() {
+            return Ok(());
+        }
+        self.ready("end")?;
+        let written = self.ch.send(Tag::End, &[], Instant::now() + REPLY);
+        written.map_err(|e| self.lose_now("end", e.to_string()))?;
+        self.frames.end = true;
+        Ok(())
+    }
+
+    /// Leave the pass the node holds open unended: this process named the
+    /// node's card lost, and the node, finding its pass not ended past the go
+    /// deadline and its grace, ends by its own rule.
+    pub(super) fn leave_pass_open(&mut self) {
+        self.frames.open = false;
+    }
+
+    /// The replies of the pass frames [`TierNode::send_enqueue`] and
+    /// [`TierNode::send_end`] sent, read by `deadline` in the order the
+    /// frames were sent: each an empty acknowledgement, or the server's
+    /// refusal of the frame it belongs to. A channel that fails loses the
+    /// node.
+    pub(super) fn drain_pass(&mut self, deadline: Instant) -> Result<(), GpuError> {
+        if std::mem::take(&mut self.frames.end) {
+            self.read_ack("end", deadline)?;
+        }
+        while self.frames.enqueues > 0 {
+            self.frames.enqueues -= 1;
+            self.read_ack("enqueue", deadline)?;
         }
         Ok(())
+    }
+
+    /// The reply of one frame `what` sent without waiting for it, read by
+    /// `deadline`: an empty acknowledgement, or the server's refusal as its
+    /// error. Any other reply, or a channel that fails, loses the node.
+    fn read_ack(&mut self, what: &'static str, deadline: Instant) -> Result<(), GpuError> {
+        match self.ch.recv(deadline) {
+            Ok(Tag::Ok) => {
+                self.control_round_trips += 1;
+                let end = In::new(self.ch.body()).end();
+                end.map_err(|why| self.lose_now(what, why))
+            }
+            Ok(Tag::Err) => {
+                self.control_round_trips += 1;
+                match read_err(self.addr, what, self.ch.body()) {
+                    Ok(e) => Err(e),
+                    Err(why) => Err(self.lose_now(what, why)),
+                }
+            }
+            Ok(t) => {
+                let why = format!("a {t:?} frame where an {what}'s reply belongs");
+                Err(self.lose_now(what, why))
+            }
+            Err(e) => Err(self.lose_now(what, e.to_string())),
+        }
     }
 
     /// Bind the tier to the page shared through the file at `path`, `bytes`
@@ -1792,8 +1848,9 @@ impl Opened {
 }
 
 /// One connection's state: the tier once opened, the layers asked of it,
-/// its progress as last seen and when it last moved, per chain the layers
-/// its captured graph serves, and the reply being written.
+/// the pass node 0 holds open, its progress as last seen and when it last
+/// moved, per chain the layers its captured graph serves, and the reply
+/// being written.
 struct Session<'a> {
     local_ip: std::net::IpAddr,
     reset_phase: u8,
@@ -1801,6 +1858,9 @@ struct Session<'a> {
     families: &'a [NodeFamily],
     opened: Option<Opened>,
     asked: u32,
+    /// Enqueue frames taken since node 0 last ended a pass ([`Tag::End`]):
+    /// the layers of the pass it holds open, 0 between passes.
+    pass: u32,
     seen: (u32, Instant),
     listed: Vec<(u32, u32)>,
     reply: Out,
@@ -1815,10 +1875,10 @@ struct Session<'a> {
 /// `on_open` is given the opened tier's page-word operations, whose display
 /// is `word_ops=<side> driver=<cuDriverGetVersion>`, once its open succeeds.
 /// Node 0's channel ended with no close, a protocol it does not speak, a
-/// request that failed after it reached the tier's stream, or work asked of
-/// the tier with no progress past the go deadline and its grace is node 0
-/// lost: the tier's words are released, its stream drained, and the loss
-/// returned by name.
+/// request that failed after it reached the tier's stream, or outstanding
+/// work with no frame or progress past the go deadline and its grace
+/// ([`Session::stopped_at`]) is node 0 lost: the tier's words are released,
+/// its stream drained, and the loss returned by name.
 pub fn serve(
     listener: &TcpListener,
     file: &Arc<Split>,
@@ -1839,6 +1899,7 @@ pub fn serve(
             families,
             opened: None,
             asked: 0,
+            pass: 0,
             seen: (0, Instant::now()),
             listed: Vec::new(),
             reply: Out::default(),
@@ -1880,10 +1941,8 @@ impl Session<'_> {
                     return match &self.opened {
                         None => Ok(Ended::Census),
                         Some(o) => Err(format!(
-                            "the channel ended with no close, the tier past {} of the {} layers \
-                             asked of it",
-                            o.work.opened_progress().unwrap_or(0),
-                            self.asked
+                            "the channel ended with no close, {}",
+                            self.state(o.work.opened_progress().unwrap_or(0))
                         )),
                     };
                 }
@@ -1936,26 +1995,52 @@ impl Session<'_> {
         }
     }
 
-    /// Node 0 stopped: work was asked of the tier and its progress has not
-    /// moved past the go deadline and its grace.
+    /// Node 0 stopped ([`Session::stopped_at`]), read at the tier's progress
+    /// now.
     fn check_stopped(&mut self) -> Result<(), String> {
         let Some(p) = self.opened.as_ref().and_then(|o| o.work.opened_progress()) else {
             return Ok(());
         };
-        let now = Instant::now();
-        if p != self.seen.0 || p == self.asked {
+        self.stopped_at(p, Instant::now())
+    }
+
+    /// Node 0 stopped, at the tier's progress `p` and the time `now`: work is
+    /// outstanding — a layer asked of the tier unserved, or a pass node 0
+    /// opened with an enqueue and has not ended — and neither a frame nor the
+    /// tier's progress has moved past the go deadline and its grace. A layer
+    /// node 0 skips sends nothing, so only its end frame tells node 1 a pass
+    /// is over; a node between passes is idle for any time.
+    fn stopped_at(&mut self, p: u32, now: Instant) -> Result<(), String> {
+        if p != self.seen.0 || (p == self.asked && self.pass == 0) {
             self.seen = (p, now);
             return Ok(());
         }
-        let waited = now - self.seen.1;
+        let waited = now.saturating_duration_since(self.seen.1);
         if waited > GO_DEADLINE + TIER_GRACE {
+            let sent = if p == self.asked {
+                "no layer or end of the pass"
+            } else {
+                "no go"
+            };
             return Err(format!(
-                "the tier past {p} of the {} layers asked of it and node 0 sent no go for \
-                 {waited:.1?}",
-                self.asked
+                "{}, and node 0 sent {sent} for {waited:.1?}",
+                self.state(p)
             ));
         }
         Ok(())
+    }
+
+    /// The tier's progress `p` against the layers asked of it, and the pass
+    /// node 0 holds open, as a loss names them.
+    fn state(&self, p: u32) -> String {
+        let pass = match self.pass {
+            0 => String::new(),
+            n => format!(", {n} of them in a pass node 0 has not ended"),
+        };
+        format!(
+            "the tier past {p} of the {} layers asked of it{pass}",
+            self.asked
+        )
     }
 
     /// The opened tier.
@@ -2046,6 +2131,9 @@ impl Session<'_> {
             }
             Tag::Capture => self.handle_capture(&mut i, bad)?,
             Tag::Enqueue => {
+                // The frame is the pass's whatever its reply: node 0 counts
+                // it sent.
+                self.pass = self.pass.saturating_add(1);
                 let (layer, row, cols) = (
                     i.len("layer").map_err(bad)?,
                     i.len("row").map_err(bad)?,
@@ -2056,6 +2144,17 @@ impl Session<'_> {
                 o.check_service(layer, row, cols)?;
                 o.work.enqueue(layer, row, cols).map_err(Failed::Fatal)?;
                 self.ask(1);
+            }
+            Tag::End => {
+                i.end().map_err(bad)?;
+                if self.pass == 0 {
+                    return Err(bad(
+                        "no pass is open: node 0 sent no enqueue since its last end".to_string()
+                    )
+                    .into());
+                }
+                self.pass = 0;
+                self.seen.1 = Instant::now();
             }
             Tag::Release => {
                 i.end().map_err(bad)?;
@@ -2555,6 +2654,7 @@ pub(super) mod tests {
             families: &[family],
             opened: None,
             asked: 0,
+            pass: 0,
             seen: (0, Instant::now()),
             listed: Vec::new(),
             reply: Out::default(),
@@ -2596,6 +2696,7 @@ pub(super) mod tests {
                 block: None,
             }),
             asked: 0,
+            pass: 0,
             seen: (0, Instant::now()),
             listed: Vec::new(),
             reply: Out::default(),
@@ -2647,6 +2748,7 @@ pub(super) mod tests {
                 block: None,
             }),
             asked: 0,
+            pass: 0,
             seen: (0, Instant::now()),
             listed: Vec::new(),
             reply: Out::default(),
@@ -2703,8 +2805,7 @@ pub(super) mod tests {
     #[test]
     fn a_node_gets_one_close() {
         use super::wire::Channel;
-        use super::{TIER_CHAINS, TierNode};
-        use std::net::{TcpListener, TcpStream};
+        use std::net::TcpListener;
 
         let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let addr = l.local_addr().expect("its address");
@@ -2718,30 +2819,7 @@ pub(super) mod tests {
             }
             frames
         });
-        let mut node = TierNode {
-            addr,
-            ch: Channel::new(TcpStream::connect(addr).expect("a connect")).expect("a channel"),
-            req: Out::default(),
-            device: gb10(1),
-            shape: TierShape {
-                hidden: 2,
-                n_used: 1,
-                rows: 1,
-                act: TierAct::F32,
-                reply: ReplyRows::Whole,
-            },
-            cols: 1,
-            planes: (0, 0),
-            resident_bytes: 0,
-            device_bytes: 0,
-            graphs: [None; TIER_CHAINS],
-            words: None,
-            block: None,
-            pending: None,
-            pending_enqueues: 0,
-            control_round_trips: 0,
-            lost: None,
-        };
+        let mut node = loopback_node(addr);
         // A payload left by an earlier request, which the close does not send.
         node.req.u8(1);
         node.close().expect("the close");
@@ -2756,31 +2834,14 @@ pub(super) mod tests {
         );
     }
 
-    /// Over loopback, with no card: the frames a node tier's layers produce.
-    /// A layer whose picks name a slot of the node's is sent its frame, which
-    /// names its layer; a layer whose picks name none is sent nothing — no
-    /// frame, so no round trip — and the layer after it still names its own.
-    #[test]
-    fn a_node_free_layer_sends_no_frame() {
+    /// A node tier over a loopback channel to `addr`, opened on no card: one
+    /// row of one column.
+    fn loopback_node(addr: SocketAddr) -> super::TierNode {
         use super::wire::Channel;
-        use super::{Chain, TIER_CHAINS, TierCard, TierNode, TierSet};
-        use std::net::{TcpListener, TcpStream};
-
-        let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
-        let addr = l.local_addr().expect("its address");
-        let peer = std::thread::spawn(move || {
-            let mut ch = Channel::new(l.accept().expect("an accept").0).expect("a channel");
-            let mut frames = Vec::new();
-            while let Ok(tag) = ch.recv(Instant::now() + Duration::from_secs(10)) {
-                frames.push((tag, ch.body().to_vec()));
-                ch.send(Tag::Ok, &[], Instant::now() + Duration::from_secs(10))
-                    .expect("a reply");
-            }
-            frames
-        });
-        let node = TierNode {
+        super::TierNode {
             addr,
-            ch: Channel::new(TcpStream::connect(addr).expect("a connect")).expect("a channel"),
+            ch: Channel::new(std::net::TcpStream::connect(addr).expect("a connect"))
+                .expect("a channel"),
             req: Out::default(),
             device: gb10(1),
             shape: TierShape {
@@ -2794,16 +2855,166 @@ pub(super) mod tests {
             planes: (0, 0),
             resident_bytes: 0,
             device_bytes: 0,
-            graphs: [None; TIER_CHAINS],
+            graphs: [None; super::TIER_CHAINS],
             words: None,
             block: None,
             pending: None,
-            pending_enqueues: 0,
+            frames: super::PassFrames::default(),
             control_round_trips: 0,
             lost: None,
-        };
+        }
+    }
+
+    /// The frames a loopback peer got, each tag with its payload, once its
+    /// channel ends.
+    type PeerFrames = std::thread::JoinHandle<Vec<(Tag, Vec<u8>)>>;
+
+    /// A loopback peer that answers every frame with an empty
+    /// acknowledgement until the channel ends, and returns the frames it got.
+    fn loopback_peer() -> (SocketAddr, PeerFrames) {
+        use super::wire::Channel;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let addr = l.local_addr().expect("its address");
+        let peer = std::thread::spawn(move || {
+            let mut ch = Channel::new(l.accept().expect("an accept").0).expect("a channel");
+            let mut frames = Vec::new();
+            while let Ok(tag) = ch.recv(Instant::now() + Duration::from_secs(10)) {
+                frames.push((tag, ch.body().to_vec()));
+                ch.send(Tag::Ok, &[], Instant::now() + Duration::from_secs(10))
+                    .expect("a reply");
+            }
+            frames
+        });
+        (addr, peer)
+    }
+
+    /// Over loopback, with no card: how a node tier's pass ends. A pass that
+    /// sent the node a layer ends with one end frame and a second end sends
+    /// nothing; a pass whose layers were all skipped sent nothing, so it ends
+    /// with nothing; a pass whose card the host named lost is left open, so
+    /// the node ends by its own rule.
+    #[test]
+    fn a_pass_that_sent_the_node_a_layer_ends_with_one_end_frame() {
+        use super::{Chain, TierCard, TierSet};
+
+        let (addr, peer) = loopback_peer();
         let mut card = TierCard::on_node(
-            node,
+            loopback_node(addr),
+            "test tier".into(),
+            TierSet::new(0..3, 4, vec![vec![0], vec![1], vec![2]]).expect("a set"),
+        );
+        assert!(card.send_layer(Chain::Step, 0, 0, 1).expect("layer 0"));
+        card.end_pass().expect("the first pass's end");
+        card.end_pass().expect("a second end sends nothing");
+        assert!(!card.send_layer(Chain::Step, 1, 0, 0).expect("layer 1"));
+        card.end_pass().expect("a skipped pass sends no end");
+        assert!(card.send_layer(Chain::Step, 2, 0, 1).expect("layer 2"));
+        card.leave_pass_open();
+        card.end_pass().expect("a pass left open sends no end");
+        drop(card);
+        let enqueue = |layer| {
+            let mut o = Out::default();
+            o.len(layer).len(0).len(1);
+            (Tag::Enqueue, o.done().to_vec())
+        };
+        assert_eq!(
+            peer.join().expect("the peer"),
+            vec![
+                enqueue(0),
+                (Tag::End, Vec::new()),
+                enqueue(2),
+                (Tag::Close, Vec::new()),
+            ],
+            "the frames the node got: one end, after the pass that sent layer 0"
+        );
+    }
+
+    /// Node 1's loss rule, with no card: a node between passes, every layer
+    /// asked of it served, is idle for any time; a pass node 0 opened and has
+    /// not ended loses node 0 once neither a frame nor the tier's progress
+    /// has moved past the go deadline and its grace; an end closes the pass,
+    /// and an end with no pass open, or with a payload, is refused by name;
+    /// a layer asked and unserved is the go rule's, as before.
+    #[test]
+    fn a_pass_node_0_does_not_end_loses_node_0_past_the_deadline() {
+        use super::super::step::GO_DEADLINE;
+        use super::super::tier::TIER_GRACE;
+
+        let (path, file) = empty_file("node-pass");
+        let t0 = Instant::now();
+        let past = t0 + GO_DEADLINE + TIER_GRACE + Duration::from_millis(1);
+        let hour = Duration::from_secs(3600);
+        let mut session = Session {
+            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            reset_phase: 0,
+            file: &file,
+            families: &[],
+            opened: None,
+            asked: 4,
+            pass: 0,
+            seen: (4, t0),
+            listed: Vec::new(),
+            reply: Out::default(),
+            on_open: &mut |_| {},
+        };
+        assert!(
+            session.stopped_at(4, past + hour).is_ok(),
+            "between passes, every layer served, a node is idle for any time"
+        );
+        session.pass = 1;
+        session.seen = (4, t0);
+        assert!(
+            session.stopped_at(4, t0 + GO_DEADLINE).is_ok(),
+            "an open pass within the deadline and its grace is not a loss"
+        );
+        let lost = session
+            .stopped_at(4, past)
+            .expect_err("a pass not ended past the deadline and its grace loses node 0");
+        assert!(
+            lost.contains(
+                "the tier past 4 of the 4 layers asked of it, 1 of them in a pass node 0 has not \
+                 ended, and node 0 sent no layer or end of the pass"
+            ),
+            "{lost}"
+        );
+        assert!(matches!(session.handle(Tag::End, &[]), Ok(())));
+        assert_eq!(session.pass, 0, "the end closes the pass");
+        assert!(
+            session.stopped_at(4, past + hour).is_ok(),
+            "an ended pass leaves the node idle"
+        );
+        match session.handle(Tag::End, &[]) {
+            Err(Failed::Refused(e)) => assert!(e.to_string().contains("no pass is open"), "{e}"),
+            _ => panic!("an end with no pass open must be refused by name"),
+        }
+        session.pass = 1;
+        assert!(
+            matches!(session.handle(Tag::End, &[0]), Err(Failed::Refused(_))),
+            "an end with a payload must be refused"
+        );
+        assert_eq!(session.pass, 1, "a refused end leaves the pass open");
+        session.pass = 0;
+        session.seen = (3, t0);
+        let lost = session
+            .stopped_at(3, past)
+            .expect_err("a layer asked and unserved past the deadline loses node 0");
+        assert!(lost.contains("node 0 sent no go"), "{lost}");
+        drop(session);
+        drop(file);
+        std::fs::remove_file(path).expect("remove the fixture");
+    }
+
+    /// Over loopback, with no card: the frames a node tier's layers produce.
+    /// A layer whose picks name a slot of the node's is sent its frame, which
+    /// names its layer; a layer whose picks name none is sent nothing — no
+    /// frame, so no round trip — and the layer after it still names its own.
+    #[test]
+    fn a_node_free_layer_sends_no_frame() {
+        use super::{Chain, TierCard, TierSet};
+
+        let (addr, peer) = loopback_peer();
+        let mut card = TierCard::on_node(
+            loopback_node(addr),
             "test tier".into(),
             TierSet::new(0..3, 4, vec![vec![0], vec![], vec![1]]).expect("a set"),
         );
@@ -3168,6 +3379,7 @@ pub(super) mod tests {
             families: &[],
             opened: None,
             asked: 0,
+            pass: 0,
             seen: (0, Instant::now()),
             listed: Vec::new(),
             reply: Out::default(),

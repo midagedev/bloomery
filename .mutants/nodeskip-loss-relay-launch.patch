@@ -1,0 +1,14 @@
+# nodeskip-loss-relay-launch: the relay holds the launch protocol's frame, a launch, which
+# a node tier no longer sends. Red: gate-gpu-qwen38-nodes ends at lost node 0 (killed):
+# "node 0 sent no Launch frame: timed out waiting on channel".
+--- a/crates/gpu-gates/src/bin/gate_qwen38_nodes.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen38_nodes.rs
+@@ -1166,7 +1166,7 @@
+ 
+     /// The frame the relay holds once armed: the first a step sends node 1,
+     /// one of the layers whose picks name its slots.
+-    const HELD_FRAME: Tag = Tag::Enqueue;
++    const HELD_FRAME: Tag = Tag::Launch;
+ 
+     /// A relay between node 0 and node 1 that holds node 0's next
+     /// [`HELD_FRAME`] once armed: node 0's stage runs its step to the first

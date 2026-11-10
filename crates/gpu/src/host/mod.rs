@@ -3265,7 +3265,9 @@ impl<H: HostExperts> HostTier<H> {
     /// lost card: the tier is poisoned, every card's waits released, and the
     /// error names each tier still behind. So is a tier on a node whose
     /// counters the node released ([`TierCard::released`]): it stopped
-    /// waiting for this process, and the rows it served since are stale.
+    /// waiting for this process, and the rows it served since are stale. A
+    /// settled tier on a node is told its pass ended ([`TierCard::end_pass`])
+    /// before the fault copies are read.
     fn settle_tiers(&mut self, layer: usize, mask: u32) -> Result<(), GpuError> {
         let Some(page) = self.tier_page.as_ref() else {
             return Ok(());
@@ -3289,15 +3291,12 @@ impl<H: HostExperts> HostTier<H> {
             .filter(|(t, c)| mask >> t & 1 == 1 && c.node().is_some() && c.released(page))
             .fold(0, |m, (t, _)| m | 1 << t);
         if released != 0 {
-            return Err(self.lose_tiers_as(SERVE, layer, released, |c, _| {
-                format!(
-                    "the expert tier on {} at the node {}: the node released the tier's words, \
-                     having seen no go from this process past its deadline, so the rows it \
-                     served since are stale: the card is lost",
-                    c.name(),
-                    c.node().map_or_else(String::new, |a| a.to_string())
-                )
-            }));
+            return Err(self.lose_tiers_as(SERVE, layer, released, |c, _| released_detail(c)));
+        }
+        for t in (0..self.tiers.len()).filter(|t| mask >> t & 1 == 1) {
+            if let Err(e) = self.tiers[t].end_pass() {
+                return Err(self.fail_tier(SERVE, layer, t, e));
+            }
         }
         match tier::merged_fault(page, &self.tiers, mask)? {
             Some(f) => Err(GpuError::fault(SERVE, f)),
@@ -3332,9 +3331,13 @@ impl<H: HostExperts> HostTier<H> {
     }
 
     /// [`HostTier::lose_tiers`], each loss named by `detail` of its tier over
-    /// the tiers' page, in tier order. With no tier of `behind` attached there
-    /// is none to lose: the service fails by name instead, the tier poisoned
-    /// and every card's waits released.
+    /// the tiers' page, in tier order — a tier on a node whose node released
+    /// the tier's words by that release, the cause of whatever the host met
+    /// after it ([`released_detail`]). A lost tier on a node is left its pass
+    /// unended, so the node ends by its own rule
+    /// ([`TierCard::leave_pass_open`]). With no tier of `behind` attached
+    /// there is none to lose: the service fails by name instead, the tier
+    /// poisoned and every card's waits released.
     fn lose_tiers_as(
         &mut self,
         what: &'static str,
@@ -3348,13 +3351,24 @@ impl<H: HostExperts> HostTier<H> {
                 .iter()
                 .enumerate()
                 .filter(|(t, _)| behind >> t & 1 == 1)
-                .map(|(_, t)| detail(t, page))
+                .map(|(_, t)| {
+                    if t.node().is_some() && t.released(page) {
+                        released_detail(t)
+                    } else {
+                        detail(t, page)
+                    }
+                })
                 .collect(),
             None => Vec::new(),
         };
         if details.is_empty() {
             let e = GpuError::state(what, "an expert tier to lose (HostTier::attach_tiers)");
             return self.fail_released(what, layer, e);
+        }
+        for (t, card) in self.tiers.iter_mut().enumerate() {
+            if behind >> t & 1 == 1 {
+                card.leave_pass_open();
+            }
         }
         let (name, detail) = (self.tier_names(behind), details.join("; "));
         self.health.set_lost(what, &name, layer, &detail);
@@ -3368,7 +3382,10 @@ impl<H: HostExperts> HostTier<H> {
     /// whose posts cannot be shown over leaves its cards' waits standing
     /// ([`TierPage::release`]): its cards keep waiting and a synchronize of
     /// their streams does not return, so the tier keeps why until a release
-    /// that does release them, and every refusal names it.
+    /// that does release them, and every refusal names it. Each tier on a
+    /// node is then told the pass it holds open ended
+    /// ([`TierCard::end_pass`]), so it stays for a reset or a close; a tier
+    /// whose card was named lost holds none ([`HostTier::lose_tiers_as`]).
     fn release_all(&mut self) {
         self.step.boundary.release();
         if let Some(page) = self.tier_page.as_ref() {
@@ -3381,6 +3398,12 @@ impl<H: HostExperts> HostTier<H> {
                     }
                 }
             }
+        }
+        for tier in &mut self.tiers {
+            // A failed end loses the node by name (`TierNode::lost`), which
+            // every later request to it names; the release's own error is
+            // the one returned.
+            drop(tier.end_pass());
         }
     }
 
@@ -3628,6 +3651,19 @@ impl<H: HostExperts> HostTier<H> {
             .set_poison(batch::SERVE_BATCH, layer, None, None);
         e
     }
+}
+
+/// The loss of tier `c` on a node that released the tier's words
+/// ([`TierCard::released`]) as an error's detail: the node stopped waiting
+/// for this process, and the rows it served since are stale.
+fn released_detail(c: &TierCard) -> String {
+    format!(
+        "the expert tier on {} at the node {}: the node released the tier's words, having seen \
+         no go or end of a pass from this process past its deadline, so the rows it served \
+         since are stale: the card is lost",
+        c.name(),
+        c.node().map_or_else(String::new, |a| a.to_string())
+    )
 }
 
 /// What a panic carried, as text.

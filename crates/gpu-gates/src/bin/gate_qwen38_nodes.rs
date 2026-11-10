@@ -36,18 +36,21 @@
 //!   the host tier is poisoned as a lost card, and the next step and a reset
 //!   are refused.
 //! - Stopped node 1: node 1 stopped before node 0 asks a step of it, node
-//!   0's step fails within the bound naming the node's request past its
-//!   deadline and the lost card, and node 0 keeps its failed load. Node 1 is
-//!   then continued: it exits within [`LOST_BOUND_S`] naming the loss, its
-//!   words released and its stream drained.
+//!   0's step fails within the bound at its wait for the tier, naming the
+//!   node, the layers it served short of those sent it, and the lost card,
+//!   and node 0 keeps its failed load. Node 1 is then continued: it takes the
+//!   step's enqueue frame, whose pass node 0 never ends, and exits within
+//!   [`LOST_BOUND_S`] naming the loss as that pass not ended, its words
+//!   released and its stream drained.
 //! - Lost node 0: node 0 asks a step of node 1 through a relay in this
-//!   process that holds the step's launch; node 0's stage runs to its first
-//!   wait on the tier or on its own host leg. Node 0 is then killed (its
-//!   channel ends) or stopped (its channel holds, and with it the host leg
-//!   its stage waits on), and the relay delivers the launch. Node 1 waits
-//!   for go words that do not come (precondition: node 1 names fewer layers
-//!   served than asked), releases its words, drains its stream and exits
-//!   naming the loss within [`LOST_BOUND_S`]. A stopped node 0 is then
+//!   process that holds the step's first enqueue frame; node 0's stage runs
+//!   to its first wait on the tier or on its own host leg. Node 0 is then
+//!   killed (its channel ends) or stopped (its channel holds, and with it the
+//!   host leg its stage waits on), and the relay delivers the frame, which
+//!   opens a pass on node 1 (precondition: node 1 names that pass not ended
+//!   in its loss). Killed, node 1 ends at the channel's end; stopped, at the
+//!   pass's deadline. Either way it releases its words, drains its stream and
+//!   exits naming the loss within [`LOST_BOUND_S`]. A stopped node 0 is then
 //!   continued: its held step fails, naming the node's release and the lost
 //!   card, and returns no token from the rows node 1 served after it.
 //!
@@ -1113,9 +1116,10 @@ mod gate {
     }
 
     /// `--hold0`: node 0, its step chain captured, waits for a line on
-    /// stdin and runs one more step, whose launch the relay holds when node
-    /// 0 is reached through it; this process is killed or stopped inside
-    /// it. It keeps its load after the step until the gate kills it.
+    /// stdin and runs one more step, whose first enqueue frame the relay
+    /// holds when node 0 is reached through it; this process is killed or
+    /// stopped inside it. It keeps its load after the step until the gate
+    /// kills it.
     fn run_hold0(c: &Common, gib: u64) -> Result<(), GateError> {
         let addr = lever_addr()?;
         let mut machine = None;
@@ -1123,8 +1127,10 @@ mod gate {
         let mut s = c.open(&plan)?;
         let m = s.model_mut();
         m.reset()?;
-        // The step chain's first pass captures the tier's graph and the
-        // next replays it: the held step sends node 1 one launch.
+        // The stage's step chain is captured and replayed; the node tier's
+        // passes are fed, and each sends node 1 its layers' enqueue frames
+        // and ends with an end frame, so the held step's first enqueue opens
+        // a pass.
         for &id in &c.ids[..3] {
             m.step(&[id])?;
         }
@@ -1146,11 +1152,28 @@ mod gate {
         Some((past, asked))
     }
 
-    /// A relay between node 0 and node 1 that holds node 0's next launch
-    /// frame once armed: node 0's stage runs its step to the first wait the
-    /// tier or its own host leg must answer, and node 1 is asked the step
-    /// only when the gate forwards the frame. Each connection node 0 opens
-    /// gets its own connection to node 1; node 1's bytes pass unread.
+    /// The layers of the pass node 0 had not ended, as node 1 names them in
+    /// its loss: "N of them in a pass node 0 has not ended"; `None` when it
+    /// names no such pass.
+    fn open_pass(err: &str) -> Option<u64> {
+        let at = err.find(" of them in a pass node 0 has not ended")?;
+        err[..at].split_whitespace().next_back()?.parse().ok()
+    }
+
+    /// What node 1 names as its loss when node 0 opened a pass and sent
+    /// neither a layer nor the pass's end past the go deadline and its grace.
+    const PASS_NOT_ENDED: &str = "node 0 sent no layer or end of the pass";
+
+    /// The frame the relay holds once armed: the first a step sends node 1,
+    /// one of the layers whose picks name its slots.
+    const HELD_FRAME: Tag = Tag::Enqueue;
+
+    /// A relay between node 0 and node 1 that holds node 0's next
+    /// [`HELD_FRAME`] once armed: node 0's stage runs its step to the first
+    /// wait the tier or its own host leg must answer, and node 1 takes the
+    /// step's first layer only when the gate forwards the frame. Each
+    /// connection node 0 opens gets its own connection to node 1; node 1's
+    /// bytes pass unread.
     struct Relay {
         addr: SocketAddr,
         armed: Arc<AtomicBool>,
@@ -1193,9 +1216,9 @@ mod gate {
         }
     }
 
-    /// Node 0's frames to node 1, in order; the first launch frame after the
-    /// relay is armed is held until the gate releases it, and node 1's side
-    /// is closed after it when the release says so (node 0 killed).
+    /// Node 0's frames to node 1, in order; the first [`HELD_FRAME`] after
+    /// the relay is armed is held until the gate releases it, and node 1's
+    /// side is closed after it when the release says so (node 0 killed).
     fn relay_up(
         mut down: TcpStream,
         mut up: TcpStream,
@@ -1212,7 +1235,7 @@ mod gate {
                 .expect("node_frame bounds its length below u32::MAX")
                 .to_le_bytes();
             let mut close = false;
-            if frame.first().copied() == Some(Tag::Launch as u8)
+            if frame.first().copied() == Some(HELD_FRAME as u8)
                 && armed.swap(false, Ordering::SeqCst)
             {
                 if held.send(()).is_err() {
@@ -1239,9 +1262,10 @@ mod gate {
     }
 
     /// Node 0 asks a step of node 1 through the relay, which holds the
-    /// step's launch; node 0 is then ended by `sig` and the launch
-    /// forwarded: node 1 exits within the bound, naming the loss, its go
-    /// words released and its stream drained.
+    /// step's first enqueue frame; node 0 is then ended by `sig` and the
+    /// frame forwarded, opening a pass node 0 does not end: node 1 exits
+    /// within the bound, naming the loss and that pass, its go words released
+    /// and its stream drained.
     fn lost_node0(gib: u64, sig: &str, what: &str, host: bool) -> Result<bool, GateError> {
         let (mut n1, addr) = node1(None, host.then_some(GATE_HOST_ROOM))?;
         let relay = Relay::start(addr)?;
@@ -1252,7 +1276,9 @@ mod gate {
         relay
             .held
             .recv_timeout(Duration::from_secs(120))
-            .map_err(|e| format!("lost node 0 ({what}): node 0 sent no launch: {e}"))?;
+            .map_err(|e| {
+                format!("lost node 0 ({what}): node 0 sent no {HELD_FRAME:?} frame: {e}")
+            })?;
         std::thread::sleep(HOLD);
         n0.signal(sig)?;
         relay
@@ -1281,10 +1307,11 @@ mod gate {
         let err = n1.stderr();
         let named = err.contains("node 0 at") && err.contains("is lost");
         let (past, asked) = progress(&err).unwrap_or((0, 0));
-        let mid = past < asked;
+        let pass = open_pass(&err).unwrap_or(0);
+        let mid = pass > 0;
         println!(
-            "precondition: node 1 was past {past} of the {asked} layers node 0 asked of it when \
-             node 0 was {what}: {}",
+            "precondition: node 1 was past {past} of the {asked} layers node 0 asked of it, {pass} \
+             of them in a pass node 0 had not ended, when node 0 was {what}: {}",
             verdict(mid)
         );
         let released = err.contains("the tier released its words and its stream drained");
@@ -1297,11 +1324,13 @@ mod gate {
         Ok(ok && cont)
     }
 
-    /// Node 1 stopped before node 0 asks a step of it: node 0's request
-    /// passes its deadline and the step fails naming the node and the lost
-    /// card, node 0 keeping its failed load. Node 1 is then continued: it
-    /// exits within the bound, naming the loss, its words released and its
-    /// stream drained.
+    /// Node 1 stopped before node 0 asks a step of it: node 0's step fails
+    /// at its wait for the tier, which signalled nothing more for the layer
+    /// sent it, naming the node and the lost card, node 0 keeping its failed
+    /// load. Node 1 is then continued: it takes the step's enqueue frame,
+    /// whose pass node 0 never ends, and exits within the bound naming the
+    /// loss as that pass not ended, its words released and its stream
+    /// drained.
     fn stopped_node1(gib: u64, host: bool) -> Result<bool, GateError> {
         let (mut n1, addr) = node1(None, host.then_some(GATE_HOST_ROOM))?;
         let mut n0 = node0(&["--hold0".to_string(), gib.to_string()], addr, host)?;
@@ -1314,7 +1343,7 @@ mod gate {
             .unwrap_or_else(|e| e.to_string());
         let secs = t0.elapsed().as_secs_f64();
         let failed = held.contains("Err(")
-            && held.contains("passed its deadline")
+            && held.contains("signalled nothing more")
             && held.contains("the card is lost")
             && held.contains(&addr.to_string());
         println!(
@@ -1327,12 +1356,13 @@ mod gate {
         let secs = t0.elapsed().as_secs_f64();
         let err = n1.stderr();
         let named = err.contains("node 0 at") && err.contains("is lost");
+        let pass = err.contains(PASS_NOT_ENDED) && open_pass(&err).is_some_and(|n| n > 0);
         let released = err.contains("the tier released its words and its stream drained");
-        let ended = status.is_some_and(|s| !s.success()) && named && released;
+        let ended = status.is_some_and(|s| !s.success()) && named && pass && released;
         println!(
             "{} stopped node 1: continued with node 0's failed load held, node 1 ended {status:?} \
-             {secs:.1} s after, the loss named {named}, its words released and its stream \
-             drained {released}",
+             {secs:.1} s after, the loss named {named}, as the pass node 0 did not end {pass}, its \
+             words released and its stream drained {released}",
             if ended { "ok" } else { "FAIL" }
         );
         n0.signal("-KILL")?;

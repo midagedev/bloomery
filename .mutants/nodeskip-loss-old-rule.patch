@@ -1,0 +1,17 @@
+# nodeskip-loss-old-rule: node 1 keeps the launch protocol's rule, in which only a layer
+# asked and unserved is outstanding (Session::stopped_at drops its open pass). Red:
+# a_pass_node_0_does_not_end_loses_node_0_past_the_deadline ("a pass not ended past the
+# deadline and its grace loses node 0"); gate-gpu-qwen38-nodes' stopped node 1 (node 1,
+# continued, never ends: "node 1 ended None 45.0 s after") and lost node 0 (stopped)
+# (node 1 never ends while node 0 is stopped; continued, node 0's held step runs Ok).
+--- a/crates/gpu/src/host/node.rs
++++ b/crates/gpu/src/host/node.rs
+@@ -2011,7 +2011,7 @@
+     /// node 0 skips sends nothing, so only its end frame tells node 1 a pass
+     /// is over; a node between passes is idle for any time.
+     fn stopped_at(&mut self, p: u32, now: Instant) -> Result<(), String> {
+-        if p != self.seen.0 || (p == self.asked && self.pass == 0) {
++        if p != self.seen.0 || p == self.asked {
+             self.seen = (p, now);
+             return Ok(());
+         }

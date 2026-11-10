@@ -1,0 +1,16 @@
+# nodeskip-loss-release-unnamed: a lost tier on a node is named by what the host met, not
+# by its node's release (HostTier::lose_tiers_as skips released_detail). Red:
+# gate-gpu-qwen38-nodes' lost node 0 (stopped): continued, node 0's held step names the
+# tier behind ("served S of the S+1 layers asked of it and signalled nothing more") or its
+# channel, not "released the tier's words".
+--- a/crates/gpu/src/host/mod.rs
++++ b/crates/gpu/src/host/mod.rs
+@@ -3352,7 +3352,7 @@
+                 .enumerate()
+                 .filter(|(t, _)| behind >> t & 1 == 1)
+                 .map(|(_, t)| {
+-                    if t.node().is_some() && t.released(page) {
++                    if false && t.node().is_some() && t.released(page) {
+                         released_detail(t)
+                     } else {
+                         detail(t, page)

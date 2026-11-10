@@ -45,6 +45,7 @@ pub enum Tag {
     Reset = 12,
     Release = 13,
     BlockOpen = 14,
+    End = 15,
     Ok = 100,
     Err = 101,
 }
@@ -66,6 +67,7 @@ impl Tag {
             Tag::Reset,
             Tag::Release,
             Tag::BlockOpen,
+            Tag::End,
             Tag::Ok,
             Tag::Err,
         ]
