@@ -65,6 +65,7 @@ use model::arch::Arch;
 use model::moe::HostLayer;
 use model::placement::card_made::{CardPhase, CardReading};
 use model::placement::churn::ChurnPool;
+use model::placement::heads::HeadLayout;
 use model::placement::need_hook;
 use model::placement::workstation::{self, ArenaGrant, HostNeed};
 use model::placement::{ArenaFloor, ExpertList, HeadSite, Plan};
@@ -1901,6 +1902,12 @@ impl<B: ChainBody> GpuModel<B> {
                         1,
                         self.body.head_norm(),
                     )?;
+                    head.check_planned(
+                        &self.weights,
+                        self.body.head_norm(),
+                        HeadLayout::PerRow,
+                        self.heads.len() + 1,
+                    )?;
                     self.heads.push(head);
                 }
             }
@@ -1909,13 +1916,15 @@ impl<B: ChainBody> GpuModel<B> {
                     GpuError::shape(what, format!("a head of {m} rows (1..={MAX_PASS_ROWS})"))
                 })?;
                 if slot.is_none() {
-                    *slot = Some(Head::with_norm(
+                    let head = Head::with_norm(
                         &self.gpu,
                         &self.weights,
                         self.body.head_eps(),
                         m,
                         self.body.head_norm(),
-                    )?);
+                    )?;
+                    head.check_planned(&self.weights, self.body.head_norm(), HeadLayout::One, m)?;
+                    *slot = Some(head);
                 }
             }
         }

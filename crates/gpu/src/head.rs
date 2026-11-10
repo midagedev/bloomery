@@ -55,11 +55,13 @@ use crate::tensor::{DeviceTensor, Q8Act};
 use crate::token_major::TokenMajor;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer};
-use gguf::{Split, TensorInfo};
+use gguf::{GgmlType, Split, TensorInfo};
 use model::Tensor2;
 use model::arch::names::output_norm;
 use model::ops::{f32_tensor, matmul_q, rms_norm};
+use model::placement::heads::{self, HeadForm, HeadLayout};
 use model::placement::kernels::{self, HeadEntry};
+use model::placement::parts::Parts;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The lm_head weight (`output.weight`) in a format a gemv here reads: a
@@ -91,6 +93,19 @@ impl OutW<'_> {
             OutW::Q8_0 { d, .. } => d.rows(),
             OutW::E4m3(w) => w.qs.rows(),
             OutW::Nvfp4 { rows, .. } => *rows,
+        }
+    }
+
+    /// The file type the plan's head forms read it by ([`HeadForm::of_type`]).
+    fn ty(&self) -> GgmlType {
+        match self {
+            OutW::Q6K(_) => GgmlType::Q6_K,
+            OutW::Q5K(_) => GgmlType::Q5_K,
+            OutW::Q4K(_) => GgmlType::Q4_K,
+            OutW::Q8_0 { .. } => GgmlType::Q8_0,
+            OutW::Bf16(_) => GgmlType::BF16,
+            OutW::E4m3(w) => w.scales.ggml(),
+            OutW::Nvfp4 { .. } => GgmlType::NVFP4,
         }
     }
 
@@ -750,6 +765,38 @@ impl Head {
     /// The rows this head was built for.
     pub fn m(&self) -> usize {
         self.m
+    }
+
+    /// Refused by name unless this head's card buffers ([`Head::resident_bytes`]) are the part the
+    /// plan counts a head of its rows over `w`'s projection by, laid as `layout`
+    /// ([`heads::layout_part`]): the plan's passes' heads term holds the heads a load makes after
+    /// it opened, so a buffer the formula does not have, or a formula that is not the buffers,
+    /// ends the make here. `row` is the row the head serves under [`HeadLayout::PerRow`] and the
+    /// head's rows under [`HeadLayout::One`].
+    pub(crate) fn check_planned(
+        &self,
+        w: &Weights,
+        norm: HeadNorm,
+        layout: HeadLayout,
+        row: usize,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "GpuModel::make_heads";
+        let (out_w, k) = head_out_w(w)?;
+        let normed = matches!(norm, HeadNorm::Rms);
+        let form = HeadForm::of_type(out_w.ty(), k, out_w.rows(), normed).ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!(
+                    "{HEAD_TENSOR} is {}, which no planned head form reads",
+                    out_w.ty()
+                ),
+            )
+        })?;
+        let part = heads::layout_part(layout, form, row);
+        let name = part.name();
+        Parts::new(vec![part])
+            .check(WHAT, &[(name, self.resident_bytes() as u64)])
+            .map_err(|e| GpuError::shape(WHAT, e.to_string()))
     }
 
     /// Device bytes of the scratch (the weights are counted by their owner).
