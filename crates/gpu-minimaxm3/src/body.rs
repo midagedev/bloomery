@@ -53,7 +53,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::minimaxm3::host as minimax_host;
 use model::arch::minimaxm3::hparams::{Attn, Hparams};
-use model::arch::minimaxm3::place::{PlanInputs, index_scores_bytes};
+use model::arch::minimaxm3::place::{INDEX_SCORES, PlanInputs, scores_parts};
 use model::arch::names;
 use model::embed::EmbedTable;
 use model::placement::Plan;
@@ -67,24 +67,14 @@ use crate::tier;
 use bloomery_gpu_deepseek41::prompt_walk::BatchBufs;
 
 /// Refused by name when the selection's block scores the load made, `made` device bytes, are not
-/// the bytes the plan counts for them at the context, `ctx` positions ([`index_scores_bytes`]):
+/// the parts the plan counts for them at the context, `ctx` positions ([`scores_parts`]: f32 for
+/// each index head over the blocks, one row on the step's scratch and the prompt batch's rows):
 /// the plan's flat scratch term holds none of them, so a buffer that grows with the context and is
 /// not in the formula, or a formula that is not the buffers, ends the load here.
 fn refuse_scores_apart(hp: &Hparams, ctx: usize, made: usize) -> Result<(), GpuError> {
-    let counted = index_scores_bytes(hp, ctx as u64);
-    if made as u64 != counted {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "the load's block scores hold {made} device bytes (f32 for each index head over \
-                 the blocks of {ctx} positions, one row on the step's scratch and {} on the \
-                 prompt batch's); the plan counts {counted} \
-                 (`place::index_scores_bytes`)",
-                crate::prefill::T_MAX
-            ),
-        ));
-    }
-    Ok(())
+    scores_parts(hp, ctx as u64)
+        .check(WHAT, &[(INDEX_SCORES, made as u64)])
+        .map_err(|e| GpuError::shape(WHAT, e.to_string()))
 }
 
 /// What the body's refusals name.
@@ -737,7 +727,7 @@ impl Body {
 
     /// Device bytes of the selection's block scores, the step's and the prompt batch's: the part of
     /// the scratch that grows with the context, which the plan counts with the stage's position
-    /// rows ([`index_scores_bytes`]).
+    /// rows (`place::index_scores_bytes`).
     #[must_use]
     pub fn scores_bytes(&self) -> usize {
         self.s.msa.scores.num_bytes() + self.batch.scores_bytes()

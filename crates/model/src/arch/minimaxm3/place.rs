@@ -27,6 +27,7 @@ use crate::arch::place_hybrid::{
 use crate::placement::PlacementError;
 use crate::placement::accepts::{self, Program};
 use crate::placement::kernels::{self, DownAct, DownForms};
+use crate::placement::parts::{Part, Parts};
 use crate::placement::workstation::{self, TierBatchBytes};
 
 pub use place_hybrid::{KvLayout, PlaceError};
@@ -80,6 +81,19 @@ pub fn index_scores_block_bytes(hp: &Hparams) -> u64 {
 #[must_use]
 pub fn index_scores_bytes(hp: &Hparams, ctx: u64) -> u64 {
     index_scores_block_bytes(hp).saturating_mul(ctx.div_ceil((hp.msa.block as u64).max(1)))
+}
+
+/// The block scores' part ([`scores_parts`]).
+pub const INDEX_SCORES: &str = "block scores";
+
+/// The block scores at `ctx` positions as the load's parts: one part of
+/// [`index_scores_bytes`], the step's row and the prompt batch's rows. The
+/// body holds the scores it made to them (`placement::parts`'s check).
+#[must_use]
+pub fn scores_parts(hp: &Hparams, ctx: u64) -> Parts {
+    Parts::new(vec![
+        Part::new(INDEX_SCORES).bytes_buffer(index_scores_bytes(hp, ctx)),
+    ])
 }
 
 /// The card bytes the body's prompt batch makes beside the plan's scratch term for a file described
@@ -254,8 +268,8 @@ mod tests {
     };
     use super::super::hparams::{Attn, FfnKind, Kind};
     use super::{
-        PROMPT_ROWS, PlaceError, PlanInputs, TIER_CHUNK, index_scores_block_bytes,
-        index_scores_bytes, stream_bytes, tier_batch,
+        INDEX_SCORES, PROMPT_ROWS, PlaceError, PlanInputs, TIER_CHUNK, index_scores_block_bytes,
+        index_scores_bytes, scores_parts, stream_bytes, tier_batch,
     };
     use crate::arch::place_hybrid::ring_pass_bytes;
     use crate::arch::synthetic::{V, header_shaped, host_run_experts};
@@ -562,6 +576,19 @@ mod tests {
         assert_eq!(index_scores_block_bytes(&released), 4_112);
         assert_eq!(index_scores_bytes(&released, 1 << 20), 33_685_504);
         assert_eq!(index_scores_bytes(&released, 1 << 19), 16_842_752);
+        // The parts the body is held to are the same bytes.
+        assert_eq!(scores_parts(&released, 1 << 20).bytes(), 33_685_504);
+        let parts = scores_parts(&released, 1 << 19);
+        assert!(
+            parts
+                .check("minimaxm3", &[(INDEX_SCORES, 16_842_752)])
+                .is_ok()
+        );
+        assert!(
+            parts
+                .check("minimaxm3", &[(INDEX_SCORES, 16_842_753)])
+                .is_err()
+        );
         let bare = inputs.kv.clone().with_block_scratch(0, 1);
         for ctx in [1, 127, 128, 129, 4096, 1 << 20] {
             assert_eq!(
