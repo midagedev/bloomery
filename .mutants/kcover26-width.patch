@@ -3,8 +3,8 @@
 # site: classes() records no Width
 # run: cargo test -p bloomery-model --test kcover kcover_diff_names_each_kind
 # red (rc=101): a width edit: real side {}, fixture side {}, want {Width} on each
---- a/crates/model/src/arch/coverage/reach.rs
-+++ b/crates/model/src/arch/coverage/reach.rs
+--- a/crates/model/src/arch/coverage_reach.rs
++++ b/crates/model/src/arch/coverage_reach.rs
 @@ -110,7 +110,7 @@
                  .map_or_else(|| format!("type {}", t.ty.as_u32()), str::to_string);
          add(ClassKind::Pin, format!("{s} {ty}"));

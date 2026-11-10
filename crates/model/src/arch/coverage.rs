@@ -33,6 +33,7 @@ use models::{
 
 use crate::placement::{CardFormat, ModelTensor, ModelTensors, Role, Unimplemented};
 
+#[path = "coverage_reach.rs"]
 pub mod reach;
 pub use reach::diff;
 

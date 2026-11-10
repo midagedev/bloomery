@@ -3,8 +3,8 @@
 # site: classes() records no Pin
 # run: cargo test -p bloomery-model --test kcover kcover_diff_names_each_kind
 # red (rc=101): a pin edit: real side {}, fixture side {}, want {Pin} on each
---- a/crates/model/src/arch/coverage/reach.rs
-+++ b/crates/model/src/arch/coverage/reach.rs
+--- a/crates/model/src/arch/coverage_reach.rs
++++ b/crates/model/src/arch/coverage_reach.rs
 @@ -108,7 +108,7 @@
          let ty =
              t.ty.name()

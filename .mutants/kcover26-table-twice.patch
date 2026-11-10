@@ -3,8 +3,8 @@
 # site: parse_table's duplicate check never fires
 # run: cargo test -p bloomery-model --lib the_table_reader_refuses_by_line
 # red (rc=101): a row twice is read
---- a/crates/model/src/arch/coverage/reach.rs
-+++ b/crates/model/src/arch/coverage/reach.rs
+--- a/crates/model/src/arch/coverage_reach.rs
++++ b/crates/model/src/arch/coverage_reach.rs
 @@ -452,7 +452,7 @@
                  reason,
              },

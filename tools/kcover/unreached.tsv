@@ -1,5 +1,5 @@
 # What each fixture cannot reach of a real file, and what it runs that the file never does: the dispatch classes a header
-# decides (crates/model/src/arch/coverage/reach.rs, the one reader: `parse_table`, by column name), each fixture planned from
+# decides (crates/model/src/arch/coverage_reach.rs, the one reader: `parse_table`, by column name), each fixture planned from
 # its source's header and compared with a real file's header. A (fixture, real) pair with no row is reached whole. Held by
 # crates/model/tests/kcover.rs (the `tests/` reals: header tables checked in beside it) and by `fixture reach --check` (the
 # `census/` reals: the stubs of tools/census/stubs.tsv, where the stub root is).

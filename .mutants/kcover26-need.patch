@@ -3,8 +3,8 @@
 # site: classes() reads no Need
 # run: cargo test -p bloomery-model --test kcover kcover_diff_names_each_kind
 # red (rc=101): a need edit: real side {}, fixture side {}, want {Need} on each
---- a/crates/model/src/arch/coverage/reach.rs
-+++ b/crates/model/src/arch/coverage/reach.rs
+--- a/crates/model/src/arch/coverage_reach.rs
++++ b/crates/model/src/arch/coverage_reach.rs
 @@ -101,7 +101,7 @@
          out.insert(Class { kind, name });
      };

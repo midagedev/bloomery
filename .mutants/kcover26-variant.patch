@@ -3,8 +3,8 @@
 # site: Reach::gaps nets no pin by a variant
 # run: cargo test -p bloomery-model --test kcover kcover_a_variant_reaches_its_pin
 # red (rc=101): a variant of attn_q=iq4_xs takes []
---- a/crates/model/src/arch/coverage/reach.rs
-+++ b/crates/model/src/arch/coverage/reach.rs
+--- a/crates/model/src/arch/coverage_reach.rs
++++ b/crates/model/src/arch/coverage_reach.rs
 @@ -340,7 +340,8 @@
                      .any(|(role, ty)| ty.name().is_some_and(|t| c.name == format!("{role} {t}")))
          };
