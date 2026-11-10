@@ -286,7 +286,8 @@
 //!   of their own): a fill is served by the card — the filled slots' experts
 //!   are routed to it (the prompt's card picks rise over the static plan's)
 //!   and the ids are those of a static load whose plan holds the filled
-//!   experts — and serving fills back: a prompt that outgrows the free
+//!   experts (capped at their count, `BLOOMERY_CARD_EXPERTS_CAP`) — and
+//!   serving fills back: a prompt that outgrows the free
 //!   bytes gives expert slots back through a K/V fit, small requests follow
 //!   (each a quiet boundary on the clock `stat elastic` prints), and the
 //!   fill runs at a quiet boundary once the hold after the give-back is over;
@@ -3024,12 +3025,14 @@ mod gate {
     }
 
     /// The server of an elastic clause: [`RESIDENCY_WORD`], the draft off, `BLOOMERY_ELASTIC`
-    /// `elastic`, on the gate card's budget ([`gate_card_budget`]).
+    /// `elastic`, on the gate card's budget ([`gate_card_budget`]) with no cap on its card
+    /// experts.
     fn elastic_cmd(levers: &bloomery_levers::Levers, elastic: bool) -> Result<Command, GateError> {
         let mut cmd = Command::new(Served38::exe()?);
         cmd.env(bloomery_levers::RESIDENCY, RESIDENCY_WORD)
             .env(bloomery_levers::ELASTIC, if elastic { "on" } else { "off" })
             .env(bloomery_levers::DRAFT, "off")
+            .env_remove(bloomery_levers::CARD_EXPERTS_CAP)
             .env_remove(bloomery_levers::NVTIER_BYTES)
             .env_remove(bloomery_levers::MTP_HEAD_ROWS)
             .env_remove(bloomery_levers::MTP_DRAFT)
@@ -3039,15 +3042,14 @@ mod gate {
     }
 
     /// The card budget `cmd`'s server will read, in bytes: the one [`gate_card_budget`] set, or
-    /// the inherited one. Refused by name when it is not a plain byte count.
-    fn card_budget_of(cmd: &Command) -> Result<u64, GateError> {
+    /// the inherited one (this binary's parsed lever). Refused by name when it is not one byte
+    /// count for every card.
+    fn card_budget_of(cmd: &Command, levers: &bloomery_levers::Levers) -> Result<u64, GateError> {
         let set = cmd
             .get_envs()
             .find(|&(k, _)| k == bloomery_levers::CARD_BUDGET)
-            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()))
-            .or_else(|| std::env::var(bloomery_levers::CARD_BUDGET).ok());
-        set.as_deref()
-            .and_then(|v| v.trim().parse::<u64>().ok())
+            .and_then(|(_, v)| v.map(|v| v.to_string_lossy().trim().parse::<u64>().ok()));
+        set.unwrap_or_else(|| levers.card_budget().every())
             .ok_or_else(|| {
                 "the card budget is not a plain byte count: the clause derives a wider one from it"
                     .into()
@@ -3145,10 +3147,15 @@ mod gate {
 
     /// The fill clauses' first half (the module header): an elastic server that filled at its
     /// warm settle is read against two static servers of the same plan, one without the lever
-    /// and one on a budget wider by the filled bytes (so its plan holds the filled experts from
-    /// the start). After the fill the card serves the filled slots: the same prompt's picks
-    /// that hit the card rise over the static plan's, and the ids are the wide static load's —
-    /// the same card path, bit for bit. A warm settle that did not fill (the fixture's card
+    /// and one that holds the filled experts from the start: its plan capped at the elastic
+    /// plan's card experts plus the fill's slots on every layer
+    /// (`BLOOMERY_CARD_EXPERTS_CAP`), on a budget wider by the filled bytes so it can hold them.
+    /// The fill restores the same slots on every layer and the expert rule's per-layer counts
+    /// follow from its total, so the cap names the elastic load's card set at any budget; the
+    /// budget alone would not (the plan's granules and the fill's pages price an expert apart).
+    /// After the fill the card serves the filled slots: the same prompt's picks that hit the
+    /// card rise over the static plan's, and the ids are the capped static load's — the same
+    /// card path, bit for bit. A warm settle that did not fill (the fixture's card
     /// decides) cannot show it and is red by name. FAIL-first: the leg's place bound back at
     /// the live count (`.mutants/elastic-qwen38-reach-live.patch`) reads a filled slot as a
     /// fault, and the request fails or the ids differ.
@@ -3194,23 +3201,28 @@ mod gate {
             ELASTIC_FILL_ROUTED,
             e.served && st.served && hits_elastic > hits_static,
         );
+        let want = match plan_card_experts(&e.log)? {
+            Some(n) => n + fill.u64("slots")? * fill.u64("layers")?,
+            None => {
+                println!("elastic-fill: the elastic server printed no plan to cap the twin at");
+                check(&mut ok, ELASTIC_FILL_EQUAL, false);
+                return Ok(ok);
+            }
+        };
         let mut wide = elastic_cmd(levers, false)?;
-        let widened = card_budget_of(&wide)?.saturating_add(fill.u64("bytes")?);
-        wide.env(bloomery_levers::CARD_BUDGET, widened.to_string());
+        let widened = card_budget_of(&wide, levers)?.saturating_add(fill.u64("bytes")?);
+        wide.env(bloomery_levers::CARD_BUDGET, widened.to_string())
+            .env(bloomery_levers::CARD_EXPERTS_CAP, want.to_string());
         let t = fill_run(dir, "elastic-fill-wide", wide)?;
-        let (have, want) = (
-            plan_card_experts(&t.log)?,
-            plan_card_experts(&e.log)?
-                .map(|n| n + fill.u64("slots").unwrap_or(0) * fill.u64("layers").unwrap_or(0)),
-        );
+        let have = plan_card_experts(&t.log)?;
         println!(
-            "elastic-fill: the wide static plan holds {have:?} card experts; the elastic plan \
-             plus its fill {want:?}"
+            "elastic-fill: the capped static plan holds {have:?} card experts; the elastic plan \
+             plus its fill {want}"
         );
         check(
             &mut ok,
             ELASTIC_FILL_EQUAL,
-            e.served && t.served && have.is_some() && have == want && e.ids == t.ids,
+            e.served && t.served && have == Some(want) && e.ids == t.ids,
         );
         Ok(ok)
     }

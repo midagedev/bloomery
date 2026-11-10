@@ -17,6 +17,7 @@ mod kv_floor;
 mod kv_rooms;
 mod legs;
 mod rank;
+mod twin;
 
 /// A plan of no rows under `budget`, for a planner [`plan_in_pool`]
 /// calls: only its budget is read.
@@ -51,6 +52,7 @@ fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -
         expert_rank: None,
         kv_floor: None,
         kv_host: KvHost::default(),
+        card_experts_cap: None,
     }
 }
 /// A card running `layers`, with the head and the token embedding as

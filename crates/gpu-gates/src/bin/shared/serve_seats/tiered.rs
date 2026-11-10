@@ -1442,6 +1442,7 @@ mod tests {
             expert_rank: None,
             kv_floor: None,
             kv_host: bloomery_levers::KvHost::Off,
+            card_experts_cap: None,
         };
         let select = |n| {
             let mut plan = plan.clone();

@@ -371,6 +371,26 @@ pub enum PlacementError {
         need: u64,
         room: u64,
     },
+    /// `BLOOMERY_CARD_EXPERTS_CAP` asks the plan's cards to hold `cap` routed
+    /// experts and they hold `held`: the budget, the free reading or the
+    /// model's experts stop the expert rule first, or the planner places no
+    /// routed expert on a card. The lever caps; it never widens the budget.
+    #[error(
+        "{lever}={cap}: the plan's cards hold {held} routed experts, fewer than the cap asks; the \
+         lever caps the expert rule and never widens the budget, so a cap past what the cards \
+         hold is refused",
+        lever = bloomery_levers::CARD_EXPERTS_CAP
+    )]
+    CardExpertsCap { cap: u64, held: u64 },
+    /// `BLOOMERY_CARD_EXPERTS_CAP` beside explicit node-owned id ranges
+    /// ([`super::nodes::loaded_routed`]): the ranges name each node's ids
+    /// themselves, so a cap on the plan's card experts has nothing to cap.
+    #[error(
+        "{lever}={cap}: explicit node-owned id ranges name each node's experts themselves; the \
+         cap applies to a plan the expert rule fills",
+        lever = bloomery_levers::CARD_EXPERTS_CAP
+    )]
+    CardExpertsOwned { cap: u64 },
 }
 
 /// The terms of [`PlacementError::CardFreeFloor`]: a card whose device

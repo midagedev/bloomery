@@ -528,6 +528,7 @@ fn accessors_read_their_rows() {
             (STEP_STATS, "1"),
             (CARD_BUDGET, "38G"),
             (CARD_MARGIN, "1G"),
+            (CARD_EXPERTS_CAP, "742"),
             (EXPERT_RANK, "/data/rank.tsv"),
             (PIN_MAIN, "0"),
             (DRAFT, "dspark"),
@@ -569,6 +570,7 @@ fn accessors_read_their_rows() {
     assert!(set.step_stats());
     assert_eq!(set.card_budget(), CardBudget::Every(38 << 30));
     assert_eq!(set.card_margin(), CardBudget::Every(1 << 30));
+    assert_eq!(set.card_experts_cap(), Some(742));
     assert!(!set.pin_main());
     assert_eq!(set.draft(), Some("dspark"));
     assert_eq!(
@@ -636,6 +638,7 @@ fn accessors_read_their_rows() {
             STEP_STATS,
             CARD_BUDGET,
             CARD_MARGIN,
+            CARD_EXPERTS_CAP,
             EXPERT_RANK,
             HOST_ROOM,
             NVTIER_BYTES,

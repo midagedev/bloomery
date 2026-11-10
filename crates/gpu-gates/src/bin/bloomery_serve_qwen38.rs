@@ -419,7 +419,11 @@ mod tests {
     ];
 
     /// The levers `PlanLevers::from_levers_with` reads for the seat's plans.
-    const PLAN_READS: &[&str] = &[bloomery_levers::CARD_BUDGET, bloomery_levers::KV_FLOOR];
+    const PLAN_READS: &[&str] = &[
+        bloomery_levers::CARD_BUDGET,
+        bloomery_levers::CARD_EXPERTS_CAP,
+        bloomery_levers::KV_FLOOR,
+    ];
 
     /// Each call of the seat that reads a Direct lever in place, with the lever.
     const DIRECT_READS: &[(&str, &str)] = &[(

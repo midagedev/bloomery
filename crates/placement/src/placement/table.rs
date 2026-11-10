@@ -396,6 +396,10 @@ pub struct Plan<'a> {
     /// host holds them ([`HostTotals::kv_host_bytes`]); `spill` and `off`
     /// leave the card terms as they were.
     pub kv_host: KvHost,
+    /// The cap on the cards' routed experts the plan was made under
+    /// (`PlanLevers::card_experts`, `BLOOMERY_CARD_EXPERTS_CAP`): the plan's cards
+    /// hold exactly that many. None, the budget alone decided.
+    pub card_experts_cap: Option<u64>,
 }
 
 /// What the load of one stage card does about the output head ([`Plan::head_site`]).

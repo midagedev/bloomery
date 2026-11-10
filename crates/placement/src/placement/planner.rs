@@ -55,6 +55,13 @@ pub struct PlanLevers {
     /// ([`PlacementError::KvHostFloor`]): it already plans the spread at a
     /// zero card position.
     pub kv_host: KvHost,
+    /// The most routed experts the plan's cards hold, all cards together,
+    /// `BLOOMERY_CARD_EXPERTS_CAP` sets: the expert rule ([`spread`]) stops there
+    /// even where the budget holds more, and a plan whose cards hold fewer is
+    /// refused by name ([`PlacementError::CardExpertsCap`]). Since the rule's
+    /// per-layer counts are a function of its total, the cap names each
+    /// layer's prefix too. `None`, the budget alone decides.
+    pub card_experts_cap: Option<u64>,
 }
 
 impl PlanLevers {
@@ -70,6 +77,7 @@ impl PlanLevers {
             kv_floor: levers.kv_floor(),
             kv_floor_default: None,
             kv_host: levers.kv_host(),
+            card_experts_cap: levers.card_experts_cap(),
         })
     }
 
@@ -411,6 +419,7 @@ fn plan_rule<'a>(
             card_budget: card_budget::of(card_budget, card),
             kv: kv_card + stage_rows,
             reserve,
+            most: levers.card_experts_cap.unwrap_or(u64::MAX),
         };
         fill.run(&mut n_l, &none_held)?;
         kv_bytes.push((kv_card, shadow, stage_rows));
@@ -444,6 +453,7 @@ fn plan_rule<'a>(
             card_budget: card_budget::of(card_budget, tier),
             kv: kv_tier,
             reserve,
+            most: levers.card_experts_cap.unwrap_or(u64::MAX),
         };
         let mut own = vec![0u64; model.layers];
         fill.run(&mut own, &held)?;
@@ -465,6 +475,12 @@ fn plan_rule<'a>(
         }
         tier_n_l.push(own);
         kv_bytes.push((kv_tier, shadow, 0));
+    }
+    if let Some(cap) = levers.card_experts_cap {
+        let held: u64 = n_l.iter().chain(tier_n_l.iter().flatten()).sum();
+        if held < cap {
+            return Err(PlacementError::CardExpertsCap { cap, held });
+        }
     }
     if let Some(rank) = rank {
         let on_cards = n_l.iter().chain(tier_n_l.iter().flatten()).any(|&n| n != 0);
@@ -529,6 +545,7 @@ fn plan_rule<'a>(
     plan.expert_rank = levers.expert_rank.clone();
     plan.kv_floor = floor_in_force;
     plan.kv_host = levers.kv_host;
+    plan.card_experts_cap = levers.card_experts_cap;
     Ok(plan)
 }
 
@@ -809,6 +826,9 @@ struct Fill<'m, 'r> {
     /// ([`plan_routed_reserving`]): out of the expert budget, and in the
     /// floor.
     reserve: u64,
+    /// The most experts the plan's cards hold together
+    /// ([`PlanLevers::card_experts_cap`]); `u64::MAX` is no cap.
+    most: u64,
 }
 
 impl Fill<'_, '_> {
@@ -882,7 +902,7 @@ impl Fill<'_, '_> {
         let caps: Vec<u64> = (0..n_l.len())
             .map(|l| self.model.layer_experts(l))
             .collect();
-        spread(n_l, held, self.eligible, &caps, budget, |n| {
+        spread(n_l, held, self.eligible, &caps, (budget, self.most), |n| {
             footprint
                 .at(n)?
                 .checked_add(scratch(n)?)

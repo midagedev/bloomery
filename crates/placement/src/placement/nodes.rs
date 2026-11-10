@@ -62,6 +62,9 @@ pub fn loaded_routed<'a>(
                 .to_string(),
         });
     }
+    if let (Some(cap), Some(_)) = (levers.card_experts_cap, owned) {
+        return Err(PlacementError::CardExpertsOwned { cap });
+    }
     let stage = Machine {
         tiers: Vec::new(),
         nodes: machine.nodes.iter().take(1).cloned().collect(),
@@ -296,6 +299,7 @@ pub fn routed_host<'a>(
         expert_rank: None,
         kv_floor: None,
         kv_host: KvHost::default(),
+        card_experts_cap: None,
     })
 }
 

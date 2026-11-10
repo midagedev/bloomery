@@ -21,6 +21,7 @@ pub const STEP_STATS: &str = "BLOOMERY_STEP_STATS";
 pub const CARD_BUDGET: &str = "BLOOMERY_CARD_BUDGET";
 pub const CARD_MARGIN: &str = "BLOOMERY_CARD_MARGIN";
 pub const EXPERT_RANK: &str = "BLOOMERY_EXPERT_RANK";
+pub const CARD_EXPERTS_CAP: &str = "BLOOMERY_CARD_EXPERTS_CAP";
 pub const PIN_MAIN: &str = "BLOOMERY_PIN_MAIN";
 pub const DRAFT: &str = "BLOOMERY_DRAFT";
 pub const CHECK_FINITE: &str = "BLOOMERY_CHECK_FINITE";
@@ -345,6 +346,33 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               card named twice, a card the census does not list, shares (`<n>x`), a list on a \
               plan whose tier cards are another node's, and a margin that leaves a card no \
               usable byte. `M` and `G` are binary units.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: CARD_EXPERTS_CAP,
+        class: Class::C,
+        kind: Kind::Count {
+            min: 1,
+            max: u64::MAX,
+            trim: false,
+        },
+        default: Unset::Means(
+            "no cap: the card budget alone decides how many experts a card holds",
+        ),
+        doc: "Placement: the most routed experts a plan's cards hold, all cards together, \
+              `BLOOMERY_CARD_EXPERTS_CAP=<n>`. The expert rule hands one expert at a time to the \
+              layer with the fewest, the first on a tie, and stops at `n` even where the budget \
+              holds more; since the rule's per-layer counts follow from its total, `n` names \
+              each layer's id prefix too, so a load at any budget that holds `n` holds the same \
+              experts (a static twin of an elastic load and its fill is one use). It caps and \
+              never widens: a plan whose cards hold fewer than `n` (the budget, the free \
+              reading or the model's experts stop the rule first, or the plan places no routed \
+              expert on a card) is refused by name with the count it holds, as is a cap beside \
+              explicit node-owned id ranges. A binary whose planner does not take it refuses \
+              it by name. The `plan` line prints `card_experts_cap=` when it is set.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

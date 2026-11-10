@@ -256,6 +256,7 @@ pub(super) fn totals<'a>(
         expert_rank: None,
         kv_floor: None,
         kv_host: KvHost::default(),
+        card_experts_cap: None,
     })
 }
 

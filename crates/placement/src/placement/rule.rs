@@ -731,9 +731,12 @@ pub(super) fn eligible(
 /// layer whose total — `held` on other devices plus `n_l` here — is the
 /// lowest, the first in ascending order on a tie, while the card still fits
 /// `budget` with it and that total is below the expert count — stopping at
-/// the first that does not. With nothing held elsewhere this is the order of
+/// the first that does not, or once the plan's cards hold `most` experts
+/// over every layer (`held` and `n_l` summed; `u64::MAX` is no cap). With
+/// nothing held elsewhere this is the order of
 /// `docs/research/v41-placement/spread.py`'s `plan_spread`: the eligible
-/// layers in ascending order, cycling. What must fit is `footprint` of the
+/// layers in ascending order, cycling, so a plan's per-layer counts are a
+/// function of its total. What must fit is `footprint` of the
 /// card's uploads at those counts, the allocator's rounding included, so an
 /// expert costs what its rows add to the card's granules, not its bytes. A
 /// card whose uploads pass `budget` with no experts plans none.
@@ -742,23 +745,26 @@ pub(super) fn spread(
     held: &[u64],
     eligible: &[usize],
     caps: &[u64],
-    budget: i128,
+    (budget, most): (i128, u64),
     footprint: impl Fn(&[u64]) -> Result<u64, PlacementError>,
 ) -> Result<(), PlacementError> {
     if eligible.is_empty() || i128::from(footprint(n_l)?) > budget {
         return Ok(());
     }
     let total = |n_l: &[u64], l: usize| held[l] + n_l[l];
-    while let Some(&l) = eligible
-        .iter()
-        .filter(|&&l| total(n_l, l) < caps[l])
-        .min_by_key(|&&l| total(n_l, l))
+    let mut placed: u64 = held.iter().chain(n_l.iter()).sum();
+    while placed < most
+        && let Some(&l) = eligible
+            .iter()
+            .filter(|&&l| total(n_l, l) < caps[l])
+            .min_by_key(|&&l| total(n_l, l))
     {
         n_l[l] += 1;
         if i128::from(footprint(n_l)?) > budget {
             n_l[l] -= 1;
             break;
         }
+        placed += 1;
     }
     Ok(())
 }
