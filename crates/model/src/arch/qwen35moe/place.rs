@@ -1023,8 +1023,9 @@ impl PlanInputs {
     }
 
     /// [`PlanInputs::pass_heads`]'s card bytes on `machine`'s stage card: the term its plan
-    /// reserves before the experts and counts in the card's prompt term.
-    fn pass_heads_bytes(
+    /// reserves before the experts and counts in the card's prompt term. The one value a gate
+    /// holds a plan's prompt term and its budget arithmetic to.
+    pub fn pass_heads_bytes(
         &self,
         machine: &Machine,
         slots: usize,

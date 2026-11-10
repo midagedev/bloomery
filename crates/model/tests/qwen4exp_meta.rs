@@ -812,6 +812,19 @@ type CardPlanRow = (&'static str, u64, bool, u64, u64, usize, u64, u64, u64);
 // rows lose one expert of the first layers' split and their rounding moves, and the other eight keep
 // theirs [derived: the planner on this tree over the pinned Q4 headers printed each row's per-layer
 // counts, expert bytes and rounding].
+// PIN(2026-11-10): the eight draft rows re-pinned for the passes' heads (`placement::heads`): a
+// drafted load makes the heads of its verify passes of 2 to 4 rows past its own, here the Q8_0
+// head of 248,320 rows of 2,560 values: 2,007,060 + 3,010,584 + 4,014,108 B, in the card's 2 MiB
+// granules 10,485,760 B (the 3- and 4-row logits two granules each, the 2-row logits one, the rest
+// packed into its shared granule). The plan reserves them before the experts and counts them in the
+// card's prompt term (the "card prompt" figure, the owner's bytes), so every drafted budget falls
+// by 10,485,760 B and the spread gives up experts: the A6000's 4k U 4,096 row 11,907 -> 11,904,
+// layers 0, 1 and 2 one expert each (3,072,000 + 3,072,000 + 3,993,600 B of experts and 348,160 B of
+// rounding, 10,485,760 B, the term's bytes exactly); the other seven rows' experts plus rounding
+// fall 4, 5, 6, 4, 3, 4 and 3 granules (the A6000's 4k U 512, 32k U 4,096 and 32k U 512, the
+// 3090's 4k U 4,096 and U 512, 32k U 4,096 and U 512), the term's five granules and the slack its
+// last expert's granules left or took [derived: the draft-false rows hold; the planner on this tree
+// over the pinned Q4 headers printed the eight draft rows, as the box's log did].
 const CARD_PLANS: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -841,10 +854,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         249,
-        3,
+        0,
         248,
-        37_315_686_400,
-        470_237_696,
+        37_305_548_800,
+        469_889_536,
     ),
     (
         "A6000",
@@ -852,10 +865,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         264,
-        21,
+        19,
         263,
-        39_627_878_400,
-        597_033_472,
+        39_621_734_400,
+        594_788_864,
     ),
     (
         "A6000",
@@ -885,10 +898,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         243,
-        18,
+        13,
         242,
-        36_459_724_800,
-        533_475_840,
+        36_444_364_800,
+        538_350_080,
     ),
     (
         "A6000",
@@ -896,10 +909,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         260,
-        2,
+        0,
         259,
-        38_966_374_400,
-        467_911_168,
+        38_960_230_400,
+        461_472_256,
     ),
     (
         "3090",
@@ -929,10 +942,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         78,
-        20,
+        18,
         77,
-        11_645_644_800,
-        536_150_528,
+        11_639_500_800,
+        533_905_920,
     ),
     (
         "3090",
@@ -940,10 +953,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         94,
-        24,
+        23,
         93,
-        14_064_742_400,
-        556_040_704,
+        14_061_670_400,
+        552_821_248,
     ),
     (
         "3090",
@@ -973,10 +986,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         4_096,
         73,
-        2,
+        0,
         72,
-        10_836_787_200,
-        550_187_520,
+        10_830_643_200,
+        547_942_912,
     ),
     (
         "3090",
@@ -984,10 +997,10 @@ const CARD_PLANS: [CardPlanRow; 16] = [
         true,
         512,
         89,
-        13,
+        12,
         88,
-        13_278_822_400,
-        549_237_248,
+        13_275_750_400,
+        546_017_792,
     ),
 ];
 // PIN(2026-09-28): the routed stacks no card expert kernel of the program reads, which keep their
@@ -1002,7 +1015,8 @@ const SHARED: &str = "/models/Qwen3.8-Flash-Next/mtp-Qwen3.8-Flash-Next-shared-Q
 /// The card rule's plan of the Qwen3.8 file (`place::PlanInputs::plan_with`
 /// under `Experts::Card`): the stacks it leaves on the host, each named with
 /// its reason; on each card at 4,096 and 32,768 positions, alone and beside
-/// the shared MTP draft (`plan_mtp_with`), each layer's card count, the card's
+/// the shared MTP draft (`plan_mtp_with`, its passes' heads the card's prompt
+/// term, the owner's bytes), each layer's card count, the card's
 /// expert and rounding bytes and the host's as predicted, each routed stack's
 /// card segment its layer's id prefix in the file's words and the rest on
 /// the host, and the draft's plan the host-routed one's; a card budget that
@@ -1154,11 +1168,21 @@ fn hw_qwen4exp_card_plan() {
             .iter()
             .find(|&&(x, _)| x == ctx)
             .map_or(0, |&(_, k)| k);
+        // The drafted plan counts the heads its verify passes make in the card's prompt term
+        // (`placement::heads`, the owner's bytes); a plain one-slot plan counts none.
+        let heads = if with_draft {
+            inputs
+                .pass_heads_bytes(&machine, 1, true)
+                .unwrap_or_else(|e| panic!("{name} ctx {ctx}: the passes' heads: {e}"))
+        } else {
+            0
+        };
         let figures = [
             ("card dense", c.dense_bytes, CARD_DENSE),
             ("card experts", c.expert_bytes, experts),
             ("card rounding", c.rounding_bytes, rounding),
             ("card kv", c.kv_bytes, kv),
+            ("card prompt", c.prompt_bytes, heads),
             (
                 "host experts",
                 plan.host.expert_bytes,
@@ -1333,6 +1357,14 @@ const CARD_ROUNDING_Q3: u64 = 398_764_544;
 // rows lose one expert of the first layers' split and their rounding moves, and the other eleven keep
 // theirs [derived: the planner on this tree over the Q3 file's headers printed each row's per-layer
 // counts, expert bytes and rounding].
+// PIN(2026-11-10): the eight draft rows re-pinned for the passes' heads, as CARD_PLANS, at this
+// file's Q6_K head (the q8_1 form: the rows' q8_1 planes beside the logits): heads of 2 to 4 rows of
+// 2,024,240 + 3,036,356 + 4,048,472 B, in the card's granules 12,582,912 B (six: the 3- and 4-row
+// logits two each, the 2-row logits one shared granule and the small buffers a second). Every
+// drafted budget falls by it and every row's experts plus rounding by exactly those bytes, 2 to 6
+// experts a row (the A6000's 4k U 4,096 row 344 on the first 15 -> 9: layers 9 to 14, 6 · 2,176,000
+// B of experts, the rounding up 473,088 B) [derived: the draft-false rows hold; the planner on this
+// tree over the Q3 file's headers printed the eight draft rows, as the box's log did].
 const CARD_PLANS_Q3: [CardPlanRow; 16] = [
     (
         "A6000",
@@ -1362,10 +1394,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         344,
-        15,
+        9,
         343,
-        37_432_192_000,
-        507_690_496,
+        37_419_136_000,
+        508_163_584,
     ),
     (
         "A6000",
@@ -1373,10 +1405,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         365,
-        41,
+        39,
         364,
-        39_779_225_600,
-        597_547_520,
+        39_774_873_600,
+        589_316_608,
     ),
     (
         "A6000",
@@ -1406,10 +1438,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         335,
-        44,
+        42,
         334,
-        36_514_841_600,
-        628_123_136,
+        36_510_489_600,
+        619_892_224,
     ),
     (
         "A6000",
@@ -1417,10 +1449,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         358,
-        32,
+        30,
         357,
-        38_996_428_800,
-        589_718_016,
+        38_991_257_600,
+        582_306_304,
     ),
     (
         "3090",
@@ -1450,10 +1482,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         107,
-        45,
+        43,
         106,
-        11_658_086_400,
-        677_667_328,
+        11_653_734_400,
+        669_436_416,
     ),
     (
         "3090",
@@ -1461,10 +1493,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         131,
-        23,
+        20,
         130,
-        14_226_124_800,
-        550_713_856,
+        14_219_596_800,
+        544_658_944,
     ),
     (
         "3090",
@@ -1494,10 +1526,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         4_096,
         101,
-        34,
+        32,
         100,
-        10_979_968_000,
-        560_965_120,
+        10_975_616_000,
+        552_734_208,
     ),
     (
         "3090",
@@ -1505,10 +1537,10 @@ const CARD_PLANS_Q3: [CardPlanRow; 16] = [
         true,
         512,
         124,
-        9,
+        6,
         123,
-        13_432_448_000,
-        551_667_200,
+        13_425_920_000,
+        545_612_288,
     ),
 ];
 
@@ -1658,11 +1690,20 @@ fn hw_qwen4exp_q3_card_plan() {
             .iter()
             .find(|&&(x, _)| x == ctx)
             .map_or(0, |&(_, k)| k);
+        // As in `hw_qwen4exp_card_plan`: the drafted plan's prompt term is its passes' heads.
+        let heads = if with_draft {
+            inputs
+                .pass_heads_bytes(&machine, 1, true)
+                .unwrap_or_else(|e| panic!("{name} ctx {ctx}: the passes' heads: {e}"))
+        } else {
+            0
+        };
         let figures = [
             ("card dense", c.dense_bytes, CARD_DENSE_Q3),
             ("card experts", c.expert_bytes, experts),
             ("card rounding", c.rounding_bytes, rounding),
             ("card kv", c.kv_bytes, kv),
+            ("card prompt", c.prompt_bytes, heads),
             (
                 "host experts",
                 plan.host.expert_bytes,

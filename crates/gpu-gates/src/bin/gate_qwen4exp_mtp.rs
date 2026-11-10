@@ -7136,16 +7136,19 @@ mod gate {
         Ok(ok)
     }
 
-    /// (d) the drafting load's budget. The draft reserves its card bytes
-    /// ([`MtpInputs::card_bytes`]) out of the same card budget, so the
-    /// header's budget plus those bytes ([`plan_levers`]) leaves the target's
-    /// routed experts on the card as many as the target alone holds under the
-    /// header's budget: the card plan's counts a layer, drafted and alone, are
-    /// equal, and in the fixture tier each layer's is half the file's experts —
-    /// the header's contract, from which a budget one granule off leaves a
-    /// layer one expert short. The real tier's budget is the caller's lever
-    /// (unset: none), whose plans hold the draft's bytes out of the card's
-    /// own: the counts are printed there, not pinned.
+    /// (d) the drafting load's budget. The drafted plan reserves out of the same
+    /// card budget, before its experts, what the load holds beside the target
+    /// alone: the draft's card bytes ([`MtpInputs::card_bytes`]) and the terms
+    /// the plan counts for a drafted load (the passes' heads and the captured
+    /// graphs, [`PlanInputs::pass_heads_bytes`] and [`PlanInputs::graphs_bytes`],
+    /// their bytes drafted less alone). So the header's budget plus those bytes
+    /// ([`plan_levers`]) leaves the target's routed experts on the card as many
+    /// as the target alone holds under the header's budget: the card plan's
+    /// counts a layer, drafted and alone, are equal, and in the fixture tier
+    /// each layer's is half the file's experts — the header's contract, from
+    /// which a budget one granule off leaves a layer one expert short. The real
+    /// tier's budget is the caller's lever (unset: none), whose plans hold those
+    /// bytes out of the card's own: the counts are printed there, not pinned.
     fn draft_budget(inputs: &PlanInputs, mtp: &MtpInputs, ub: usize) -> Result<bool, GateError> {
         let machine =
             machine_for_experts(card()?, inputs.stack(), u64::try_from(ub)?, Experts::Card);
@@ -7155,7 +7158,16 @@ mod gate {
             &plan_levers(0)?,
             Experts::Card,
         )?;
-        let extra = mtp.card_bytes(CTX)?;
+        let beside = |drafted: bool| -> Result<u64, GateError> {
+            Ok(inputs.pass_heads_bytes(&machine, 1, drafted)?
+                + inputs.graphs_bytes(&machine, (1, drafted), CTX)?)
+        };
+        let (with_draft, without) = (beside(true)?, beside(false)?);
+        let extra = mtp
+            .card_bytes(CTX)?
+            .checked_add(with_draft)
+            .and_then(|b| b.checked_sub(without))
+            .ok_or("the drafting load's terms beside its experts pass u64 bytes")?;
         let drafted = inputs.plan_mtp_with(
             &machine,
             (CTX, u64::try_from(ub)?),
@@ -7170,7 +7182,7 @@ mod gate {
         let ok = !fixture || (a == d && d.iter().all(|&n| n == want));
         println!(
             "(d) the drafting load's budget: card experts a layer alone {:?} and drafted {:?} \
-             under {} + the draft's {extra} B{} {}",
+             under {} + the draft's and its passes' terms {extra} B{} {}",
             held(a),
             held(d),
             plan_levers(extra)?.card_budget_bytes,

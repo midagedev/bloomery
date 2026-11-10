@@ -103,7 +103,9 @@
 //! - `nextn-front-refuse`: the same floor walk the plain `front-refuse`
 //!   holds, planned through `plan_nextn` (the serving default's path: the
 //!   draft's card bytes and arena beside the front in the reserve, the front
-//!   named on the sum) and opened through [`open_nextn`]: a stage card one
+//!   named on the sum: the prompt batch's units and the heads of the drafted
+//!   pass, `place::pass_heads_bytes` at two rows a slot, equal to the plan's
+//!   own prompt term) and opened through [`open_nextn`]: a stage card one
 //!   byte short of that floor is refused by name, the front and its bytes
 //!   named, before anything loads (mutant: the front zeroed in `plan_nextn`
 //!   — the card one byte under the floor then plans or fails by the card's
@@ -191,7 +193,8 @@ mod gate {
     use gguf::quant::GgmlType;
     use model::arch::glm5next::names;
     use model::arch::glm5next::place::{
-        NEXTN_ARENA_BYTES, NextnInputs, NextnPlan, PlaceError, PlanInputs, prompt_reserve_bytes,
+        NEXTN_ARENA_BYTES, NextnInputs, NextnPlan, PlaceError, PlanInputs, pass_heads_bytes,
+        prompt_reserve_bytes,
     };
     use model::placement::accepts::{self, Program};
     use model::placement::churn::ChurnPool;
@@ -884,8 +887,10 @@ mod gate {
     /// `plan_nextn` — the front found from the nextn plan's own refusals,
     /// from a guess at or under it (the target plan's terms but its experts
     /// and rounding, the margin, the draft's card bytes and the arena, and
-    /// the front) — each refusal adding the bytes it names, so the walk
-    /// lands on the floor. The clause holds the shape `front-refuse` holds
+    /// the front: the prompt batch's units and the heads of the drafted
+    /// pass, two rows for the one slot, which is the plan's prompt term) —
+    /// each refusal adding the bytes it names, so the walk lands on the
+    /// floor. The clause holds the shape `front-refuse` holds
     /// on the plain plan, on the serving default's own planner: the card at
     /// the floor plans, one byte under it the planner refuses by name with
     /// the front and its bytes, and `open_nextn` under [`NEXTN_LEVER`]
@@ -898,10 +903,13 @@ mod gate {
         nextn: &NextnInputs,
     ) -> Result<bool, GateError> {
         let place = glm5next_tier::plan_levers(levers, 0)?;
-        let front = prompt_reserve_bytes(inputs, CTX as u64, false);
         let Some(card) = machine.cards.first() else {
             return Err("the gate machine has no stage card".into());
         };
+        // The nextn plan's front: the prompt batch's units and the heads of the one slot's
+        // drafted pass, two rows a slot.
+        let front = prompt_reserve_bytes(inputs, CTX as u64, false)
+            + pass_heads_bytes(inputs, card, 2).map_err(|e| format!("{path}: {e}"))?;
         if machine.expert_tiers().next().is_some() {
             return Err(
                 "the gate machine holds tier cards; the front walked here is the \
@@ -913,6 +921,13 @@ mod gate {
             .plan_nextn(machine, CTX as u64, &place, nextn)
             .map_err(|e| format!("{path}: {e}"))?;
         let t = np.plan.cards.first().ok_or("the plan names no card")?;
+        if t.prompt_bytes != front {
+            return Err(format!(
+                "{path}: the nextn plan's prompt term is {} B, the front stated {front} B",
+                t.prompt_bytes
+            )
+            .into());
+        }
         let draft = np.nextn_card_bytes();
         let with = |usable: u64| {
             let mut m = machine.clone();

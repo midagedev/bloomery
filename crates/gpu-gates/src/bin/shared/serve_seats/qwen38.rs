@@ -4471,6 +4471,19 @@ mod tests {
             file_bytes: 2560 * 4,
             gathered_rows: None,
         };
+        // A head the card reads, of the model's width and vocabulary, so the passes' heads
+        // (`placement::heads`) that a plan of several slots or a draft counts have a form to
+        // size. The folder's header keeps its one tensor: its part source reads what it holds.
+        let head = ModelTensor {
+            name: "output.weight".to_string(),
+            shard: 0,
+            layer: None,
+            role: Role::Head,
+            ty: gguf::GgmlType::Q8_0,
+            dims: vec![2560, 8],
+            file_bytes: 2560 / 32 * 34 * 8,
+            gathered_rows: None,
+        };
         let layout = Layout::new(
             &[],
             vec![TensorDecl {
@@ -4533,7 +4546,7 @@ mod tests {
             kv: KvLayout::of_spec(&spec).expect("the stores"),
             spec,
             model: ModelTensors {
-                tensors: vec![tensor],
+                tensors: vec![tensor, head],
                 layers: 1,
                 experts: 8,
                 experts_used: 2,

@@ -206,13 +206,22 @@ const LIST_ROWS: u32 = 40_960;
 // on this tree holds 1,370,491 and 444,492; the pin is one fewer.
 // PIN(2026-10-30): the GDN layers' carries of 16 rows (qwen4exp_meta's KV_AT, 1,193,472 B more)
 // leave the room: the planner on this tree holds 1,370,448 and 444,448; the pin is one fewer.
+// PIN(2026-11-10): none moved: the pin is still the room before the drafted plan's passes' heads
+// (`placement::heads`: its verify passes of 2 to 4 rows at the target's Q8_0 head of 248,320 rows,
+// 10,485,760 B in the card's 2 MiB granules, the plan's prompt term). The clause counts that term by
+// the card's own sum and holds the boundary with it to the planner on both sides, and the room
+// without it to this pin [derived: the box's landing batch read 1,370,448 and 444,448
+// from the room before the term, as the pin's last line did].
 const CARD_MAX_CTX_MTP: [(&str, u64); 2] = [("A6000", 1_370_447), ("3090", 444_447)];
 
 /// The plan with the shared draft (`place::PlanInputs::plan_mtp`): on each
 /// card at 4,096 and 32,768 positions the target's plan is `plan`'s field
-/// for field, the draft's holds its 512 experts on the card with the bytes
-/// derived above, and the headroom is the target's less the draft's; the
-/// boundary context with the draft breaks with `CardOver`; a list of 40,960
+/// for field but the passes' heads in its prompt term (the owner's bytes,
+/// `PlanInputs::pass_heads_bytes`), the draft's holds its 512 experts on the
+/// card with the bytes derived above, and the headroom is the target's less
+/// those heads and the draft's; the boundary context with the draft (the
+/// room before the heads pinned, the room with them found by the card's own
+/// sum) breaks with `CardOver`; a list of 40,960
 /// rows over the target's tokenizer plans as the full head does: under
 /// either expert rule (`plan_mtp_with`, `Experts::Host` and `Experts::Card`)
 /// at 4,096, 4,352 and 32,768 positions, the two plans' rows, cards, host
@@ -279,9 +288,18 @@ fn hw_qwen4exp_mtp_plan() {
             place::UBATCH_PLANNED,
         );
         for ctx in [4096u64, 32_768] {
-            let plain = inputs
+            let mut plain = inputs
                 .plan(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers)
                 .unwrap_or_else(|e| panic!("{} ctx {ctx}: plan: {e}", card.name));
+            // The drafted load makes the heads of its verify passes past its own, which its plan
+            // counts in the card's prompt term out of the headroom (`placement::heads`, the
+            // owner's bytes); plan() is one plain slot and counts none. The target's plan beside
+            // them is plan()'s plus that term.
+            let heads = inputs
+                .pass_heads_bytes(&machine, 1, true)
+                .unwrap_or_else(|e| panic!("{} ctx {ctx}: the passes' heads: {e}", card.name));
+            let plain_headroom = plain.cards[0].headroom_bytes;
+            plain.cards[0].grow_prompt(heads);
             for (label, m) in [("full", &full), ("list", &list)] {
                 let with =
                     match inputs.plan_mtp(&machine, (ctx, UBATCH_PLANNED.min(ctx)), &levers, m) {
@@ -322,14 +340,14 @@ fn hw_qwen4exp_mtp_plan() {
                     &mut o,
                     format!(
                         "{} ctx {ctx} {label}: the target's plan is plan()'s but for the arena's \
-                         columns ({}); columns {columns:?} (want {columns_want:?}); draft \
+                         columns and the passes' heads {heads} B in its prompt term ({}); \
+                         columns {columns:?} (want {columns_want:?}); draft \
                          (dense, experts, rounding, kv, map) {got:?} (want {want:?}); n_l {:?}; \
-                         headroom {} = the target's {} less {}",
+                         headroom {} = the target's {plain_headroom} less the heads and {}",
                         card.name,
                         view(&with.plan) == view(&plain),
                         with.draft.n_l,
                         with.headroom_bytes,
-                        plain.cards[0].headroom_bytes,
                         with.draft_card_bytes() + with.arena_bytes
                     ),
                     view(&with.plan) == view(&plain)
@@ -414,13 +432,13 @@ fn hw_qwen4exp_mtp_plan() {
             continue;
         };
         let (c, spec) = (&at.plan.cards[0], &machine.cards[0]);
-        let fixed = c.dense_bytes
-            + c.expert_bytes
-            + c.rounding_bytes
-            + c.scratch_bytes
-            + c.context_bytes
-            + at.draft_card_bytes()
+        // Every term the plan counts on the card but the cache's and the stage rows' (`kv` below
+        // grows them with the context), by the card's own sum (`CardTotals::bytes`), and the
+        // draft's card bytes beside them: the passes' prompt term (`placement::heads`) is in it.
+        // `pinned` leaves that term out: the room CARD_MAX_CTX_MTP was derived from.
+        let fixed = c.bytes() - c.kv_bytes - c.stage_rows_bytes + at.draft_card_bytes()
             - at.draft.cards[0].kv_bytes;
+        let pinned = fixed - c.prompt_bytes;
         let limit = at.plan.usable_bytes(spec) - spec.margin_bytes;
         let kv = |ctx: u64| -> u64 {
             (0..inputs.spec.layers.len())
@@ -433,15 +451,19 @@ fn hw_qwen4exp_mtp_plan() {
                 )
                 + model::placement::KvBytes::stage_position_bytes(&inputs.kv, ctx)
         };
-        let (mut lo, mut hi) = (1u64, KERNEL_POSITIONS);
-        while lo < hi {
-            let mid = lo + (hi - lo).div_ceil(2);
-            if fixed + kv(mid) <= limit {
-                lo = mid;
-            } else {
-                hi = mid - 1;
+        let boundary = |terms: u64| {
+            let (mut lo, mut hi) = (1u64, KERNEL_POSITIONS);
+            while lo < hi {
+                let mid = lo + (hi - lo).div_ceil(2);
+                if terms + kv(mid) <= limit {
+                    lo = mid;
+                } else {
+                    hi = mid - 1;
+                }
             }
-        }
+            lo
+        };
+        let (lo_pinned, lo) = (boundary(pinned), boundary(fixed));
         let at_max = inputs
             .plan_mtp(&machine, (lo, UBATCH_PLANNED.min(lo)), &levers, &full)
             .is_ok();
@@ -452,12 +474,14 @@ fn hw_qwen4exp_mtp_plan() {
         check(
             &mut o,
             format!(
-                "{} with the draft holds ctx {lo} ({at_max}; predicted {predicted} + 1) and breaks \
-                 with CardOver at {} ({past})",
+                "{} with the draft holds ctx {lo} ({at_max}) and breaks with CardOver at {} \
+                 ({past}); the room before the passes' {} B prompt term holds ctx {lo_pinned} \
+                 (predicted {predicted} + 1)",
                 card.name,
-                lo + 1
+                lo + 1,
+                c.prompt_bytes
             ),
-            lo == predicted + 1 && at_max && past,
+            lo_pinned == predicted + 1 && lo < lo_pinned && at_max && past,
         );
     }
     let own = Split::open(OWN).unwrap_or_else(|e| panic!("open {OWN}: {e}"));
@@ -568,8 +592,17 @@ fn hw_qwen4exp_mtp_plan() {
 // layers (was 21). The GDN layers' carries of 16 rows leave the card's kv 1,193,472 B
 // (qwen4exp_meta's KV_AT); the tier keeps its 7,236 experts, its bytes and rounding [derived: the
 // planner on this tree over the pinned headers printed this row].
+// PIN(2026-11-10): the A6000 246 on the first 31 layers (was 32), both cards 397 on the first 17
+// layers (was 20), the tier's 7,234 experts (was 7,236), 22,670,745,600 B of experts and
+// 139,976,704 B of rounding. The drafted plan reserves its passes' heads before the experts
+// (`placement::heads`: heads of 2 to 4 rows at the Q8_0 head of 248,320 rows, 10,485,760 B, five
+// granules) out of every card's budget (`plan_routed_reserving` keeps a reserve on each card), the
+// tier's too: the stage gives up one expert (3,072,000 B), the tier two (6,144,000 B of experts and
+// 6,438,912 B of rounding: 12,582,912 B, six granules, the term's five and the slack of its last
+// expert's granules) [derived: the planner on this tree printed this row, as the box's log
+// did].
 const BP_DRAFTED: (u64, usize, u64, u64, usize, u64, u64, u64) =
-    (246, 32, 245, 397, 20, 7_236, 22_676_889_600, 146_415_616);
+    (246, 31, 245, 397, 17, 7_234, 22_670_745_600, 139_976_704);
 
 /// Plan (b′) of the Qwen3.8 file with the shared draft (`place::machine_bp`
 /// with `MtpInputs::card_bytes` as the A6000's reserve, `plan_mtp_with`
