@@ -1,0 +1,12 @@
+--- a/crates/chain/src/arch/nemotron_h_moe/read.rs
++++ b/crates/chain/src/arch/nemotron_h_moe/read.rs
+@@ -29,7 +29,8 @@
+         bias: blk(l, EXP_PROBS_B),
+         n_expert: m.experts as usize,
+         ff: m.expert_ff as usize,
+-        top_k: m.top_k as usize,
++        // mutant nemomoe-kinds-from-description: the plan reads the expert count as the kept count.
++        top_k: m.experts as usize,
+         latent_down: m.latent.map(|_| blk(l, FFN_LATENT_DOWN)),
+         latent_up: m.latent.map(|_| blk(l, FFN_LATENT_UP)),
+         up_exps: blk(l, FFN_UP_EXPS),

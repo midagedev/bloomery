@@ -5,8 +5,8 @@
 //! geometry the kernels are built for — is decided once from the file's header and the model
 //! description, by code that touches no device. The order of a layer's parts is the family's walk
 //! (`arch::<family>::walk`) over the ops a backend implements (`arch::<family>::ops`); a family
-//! whose layers a Mamba-2 and attention hybrid forces (Nemotron-H's) walks the trunk's
-//! ([`hybrid::walk`]) over [`hybrid::ops`] with its own feed-forward plan. A backend
+//! whose layers a Mamba-2 and attention hybrid forces (Nemotron-H's and Nemotron-H-MoE's) walks
+//! the trunk's ([`hybrid::walk`]) over [`hybrid::ops`] with its own feed-forward plan. A backend
 //! reads a plan and enqueues the ops the walk asks for; it never decides a layer's kind. This
 //! crate holds the plans, the readers that make them and the walks, so a backend that cannot build
 //! the CUDA crates (a Mac's) takes the same plan and order the card does.
