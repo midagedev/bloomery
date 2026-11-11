@@ -368,6 +368,10 @@ ACT_GT_BYTES = 5120 // 128 * 132     # one q8_1 column at 128 values a block, 5,
 GT_ROW_W_BYTES = 8 * 2 * 5120 // 256 * 110   # a GT row tile's gate + up weights (8 rows, Q3_K 110 B a 256 block)
 SHADOW_NOCARD_CHUNK = 5        # the trace, layers 0-1 (no card expert): N_s 321 = 64 x 5 + 1
 SHADOW_NOCARD_BLOCK = 1
+SHADOW_Q5_CHUNK = 7            # a card chunk on the Q5_K-down layers (Q5_LAYERS): the down reads no q8_1
+                               # (Dense::reads_q8_1, crates/gpu-deepseek41/src/dense.rs), so the quantize launch
+                               # drops out of SHADOW_EXPERT_CHUNK — the tree's counter on layers 0-1 (518c109d8):
+                               # entries_shadow 457 = 64 x 7 + SHADOW_GEMM_BLOCK + TIMED_SHADOW_EVENTS_G
 SHADOW_SLOT_CHUNK = 10         # https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/cardroute-design-report.md 「1. 분해와 판정」 row 'shadow N_s, slot arm' (per slot: gu, quantize_sel, q4k_sel, acc + shexp)
 
 
@@ -468,13 +472,15 @@ class Routing:
         return Routing(self.name + "+borrow", host, card, self.phi)
 
 
-def routing_lcg(p, hot=True):
+def routing_lcg(p, hot=True, q5card=False):
     """The timing runner's lcg prompt: per layer one host rate and one card rate (lcg is uniform to
     first order, https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/hoststream-recal-report.md 「5. 못 한 것과 규칙 이탈」 'lcg 곡선 자체는 실측이 없습니다'). Layers below card_first_layer hold no card expert
     (plan (a)), so all six slots of a token go to the host there; the recorded mean host rate
-    (s_host_lcg with the frequency list, s_host_lcg_nohot without) sets the other layers'."""
+    (s_host_lcg with the frequency list, s_host_lcg_nohot without) sets the other layers'. q5card (the
+    tree since 518c109d8, the CW configs) reads card_first_layer_tree: every layer holds card experts and the
+    mean rate spreads over all of them."""
     s = p["s_host_lcg"] if hot else p["s_host_lcg_nohot"]
-    n0 = int(p["card_first_layer"])
+    n0 = int(p["card_first_layer_tree" if q5card else "card_first_layer"])
     nc = p["n_card_total"] / (L - n0)
     sl = (L * s - N_USED * n0) / (L - n0)
     host, card = [], []
@@ -581,12 +587,13 @@ def routing_idprefix(name, G):
                    [tuple((x / per, 1.0) for x in card[l] if x > 0) for l in range(L)])
 
 
-def routing(p, name, hot=True, P=512, G=1):
-    """The routing a prompt runs: lcg (with the frequency list or at the id prefix); prose with the frequency list (the
+def routing(p, name, hot=True, P=512, G=1, q5card=False):
+    """The routing a prompt runs: lcg (with the frequency list or at the id prefix, plan (a)'s placement or the
+    tree's with q5card); prose with the frequency list (the
     trace's curve, routing_prose); prose, code or korean at the id prefix (hot False: routing_idprefix, which
     reads the list of the prompt's group of G batches); prose-in."""
     if name == "lcg":
-        return routing_lcg(p, hot)
+        return routing_lcg(p, hot, q5card)
     if name in REAL_TEXTS and not hot:
         return routing_idprefix(name, G)
     if name == "prose":
@@ -1064,7 +1071,14 @@ def shadow_lb(p, cfg, lb, rt):
     wide = cfg.get("batchwide") and arm == "expert"
     for _, m in lb.full:
         if arm == "expert":
-            k, a = (p["shadow_chunk"], SHADOW_EXPERT_CHUNK) if card else (p["shadow_chunk_nocard"], SHADOW_NOCARD_CHUNK)
+            if card:
+                # a Q5_LAYERS card chunk drops the q8_1 quantize (the Q5_K down reads none, Dense::reads_q8_1) and
+                # runs the q5k down: its time is the no-card trace's chunk (the same down) plus shadow_chunk's D2D
+                # pair 2.35 us, the same q3/d8 planes [derived]
+                k, a = ((p["shadow_chunk_nocard"] + 2.35, SHADOW_Q5_CHUNK) if l in Q5_LAYERS
+                        else (p["shadow_chunk"], SHADOW_EXPERT_CHUNK))
+            else:
+                k, a = p["shadow_chunk_nocard"], SHADOW_NOCARD_CHUNK
             k *= clk
             if wide:                   # the chunk's kernels at batch width, one launch set a sub-block (below)
                 k *= p["batchwide_ratio"]
@@ -1075,7 +1089,8 @@ def shadow_lb(p, cfg, lb, rt):
         t += k / 1000.0 + a * g
         acts += a
     if wide:
-        a = (SHADOW_EXPERT_CHUNK if card else SHADOW_NOCARD_CHUNK) * len(lb.full_sb)
+        a = ((SHADOW_Q5_CHUNK if l in Q5_LAYERS else SHADOW_EXPERT_CHUNK) if card else SHADOW_NOCARD_CHUNK) \
+            * len(lb.full_sb)
         t += a * g
         acts += a
     if arm == "expert":
@@ -1850,11 +1865,13 @@ CONFIGS = {
     # the engine from candwire on: PG1 / PG2's flow with the candidate mask's launches (cand_acts) in every full chunk
     # of its source and consumers; what --counts holds a counter log of today's tree to. From f812d30e1 the default
     # block runs the grouped GEMM (imma; the tile flag stays for the streamed passes' pricing under host streaming),
-    # and the block's entry count is the same 7 a card layer-batch (SHADOW_GEMM_BLOCK = SHADOW_TILE_BLOCK)
+    # and the block's entry count is the same 7 a card layer-batch (SHADOW_GEMM_BLOCK = SHADOW_TILE_BLOCK). From
+    # 518c109d8 the Q5_K-down layers 0 and 1 hold card experts (q5card: card_first_layer_tree), so their card chunks
+    # drop the q8_1 quantize (SHADOW_Q5_CHUNK)
     "CW1": dict(commit="f812d30e1", route="bulk", copy=False, flow="five", b1=True, tile=True, imma=True, hot=False,
-                timed=True, marks4=True, cand=True),
+                timed=True, marks4=True, cand=True, q5card=True),
     "CW2": dict(commit="f812d30e1", route="bulk", copy=False, flow="five", b1=True, tile=True, imma=True, hot=False,
-                timed=True, G=2, wrap=True, marks4=True, cand=True),
+                timed=True, G=2, wrap=True, marks4=True, cand=True, q5card=True),
     # the r8host lease (09-27#r8host-pp): bloomery 6ffed9e (r8host, landed as r8land 1ad6599), frequency list 384, CED on, G 2
     # (prefillgroup's default), BLOOMERY_STEP_STATS=1, BLOOMERY_R8=on (the default) against =off, one binary; the release
     # sitting (09-28#v41-release): main 53e2def, the same flow, lcg at the id prefix, no STEP_STATS (no card marks)
@@ -1887,7 +1904,7 @@ def evaluate(p, cfg, P, rname="lcg", anchors=None, kfix=None):
         raise SystemExit(f"ds41_prefill.py: pick {cfg['pick']!r} on {rname} at the id prefix: its lists hold the causal "
                          "(static) pick's order only")
     G = min(resolve_cfg(cfg, P)["G"], batch_count(P, cfg.get("ced", True)))
-    r = run_prompt(p, cfg, P, routing(p, rname, hot, P, G), U, kfix)
+    r = run_prompt(p, cfg, P, routing(p, rname, hot, P, G, cfg.get("q5card", False)), U, kfix)
     r["U"] = U
     return r
 
@@ -3608,17 +3625,23 @@ def self_test():
         check(f"PG2's calls at P {P} = the counter's first steps, route and shadow {want}", got == want, str(got))
         # the candidate mask adds its 2 a full chunk on the route of its source and consumers, nothing else
         cfront, clbs = counts(P, "CW2")
+        cwr = evaluate(central(), dict(CONFIGS["CW2"]), P)["recs"]
         role = sum(2 * len(x["lb"].full) for x in evaluate(central(), dict(CONFIGS["PG2"], ced=True), P)["recs"]
                    if cand_acts(x["lb"].l))
         # and the IMMA arm's map row copy, one a layer-batch with full chunks on a layer with card experts
-        role += sum(1 for x in evaluate(central(), dict(CONFIGS["CW2"]), P)["recs"]
-                    if x["lb"].full and _CARD.get(x["lb"].l, 0) > 0)
+        role += sum(1 for x in cwr if x["lb"].full and _CARD.get(x["lb"].l, 0) > 0)
+        # and q5card: layers 0-1 take the card arm — the Q5_K down's chunks without the q8_1 quantize and the
+        # grouped block instead of the no-card one
+        q5 = sum((SHADOW_Q5_CHUNK - SHADOW_NOCARD_CHUNK) * len(x["lb"].full) + SHADOW_GEMM_BLOCK - SHADOW_NOCARD_BLOCK
+                 for x in cwr if x["lb"].l in Q5_LAYERS)
         moved = {k: (clbs[k][0] - lbs[k][0], clbs[k][1] - lbs[k][1]) for k in lbs}
-        check(f"CW2 at P {P} = PG2 + the mask's 2 a full chunk on layers 20, 24, 28, 32, 36 and the map row's copy "
-              f"({role} route entries)",
-              cfront == front and clbs.keys() == lbs.keys() and role > 0
-              and sum(r for r, _ in moved.values()) == role and all(s == 0 for _, s in moved.values()),
-              str(sum(r for r, _ in moved.values())))
+        check(f"CW2 at P {P} = PG2 + the mask's 2 a full chunk on layers 20, 24, 28, 32, 36, the map row's copy "
+              f"({role} route entries) and layers 0-1's card arm ({q5} shadow entries)",
+              cfront == front and clbs.keys() == lbs.keys() and role > 0 and q5 > 0
+              and sum(r for r, _ in moved.values()) == role
+              and {k[1] for k, d in moved.items() if d[1]} == {0, 1}
+              and sum(d[1] for d in moved.values()) == q5,
+              str((sum(r for r, _ in moved.values()), sum(d[1] for d in moved.values()))))
     cfg, rn = row_cfg(p, "B1prose", {"rt": "prose"})
     got = evaluate(p, cfg, 512, rn)["agg"]["host_slots"]
     check("the prose routing reproduces its anchor: 52,189 host slots at P 512 (0.1 %)", abs(got - 52189) / 52189 < 1e-3,
