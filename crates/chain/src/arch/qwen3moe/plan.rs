@@ -1085,21 +1085,6 @@ pub(crate) mod fixtures {
         }
     }
 
-    /// A dense Llama-3.2-1B's attention at `heads` over `kv_heads`: heads of 64 values turned
-    /// whole by NORM pairs, no head norm, no output gate ([`head128_gqa`] at half the width).
-    pub fn head64_gqa(heads: u32, kv_heads: u32, factors: bool) -> Gqa {
-        let wide = head128_gqa(heads, kv_heads, factors);
-        Gqa {
-            head_dim: 64,
-            value_dim: 64,
-            rope: Rope {
-                dims: 64,
-                ..wide.rope
-            },
-            ..wide
-        }
-    }
-
     /// A layer of `mixer` over a dense SwiGLU FFN of 512 and the plain residual.
     pub fn dense_layer(mixer: Mixer) -> LayerSpec {
         LayerSpec {
@@ -1161,8 +1146,8 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::{
-        delta, dense_layer, gqa, gqa_of, head64_gqa, head128_gqa, layer, lfm3_conv, lfm3_gqa,
-        lfm3_layer, q30_gqa, q30_layer,
+        delta, dense_layer, gqa, gqa_of, head128_gqa, layer, lfm3_conv, lfm3_gqa, lfm3_layer,
+        q30_gqa, q30_layer,
     };
     use super::{
         Flash, GqaKind, Kind35, Pairs, gqa_class, kind_of, kind35, kinds_of, kinds35, moe_fits,
@@ -1172,6 +1157,21 @@ mod tests {
         Act, DeltaKind, DeltaRule, Ffn, GdnGate, Gqa, KHeadMap, LayerSpec, Mixer, OutGate,
         Residual, Rope, RopeMode, Shared,
     };
+
+    /// A dense Llama-3.2-1B's attention at `heads` over `kv_heads`: heads of 64 values turned
+    /// whole by NORM pairs, no head norm, no output gate ([`head128_gqa`] at half the width).
+    fn head64_gqa(heads: u32, kv_heads: u32, factors: bool) -> Gqa {
+        let wide = head128_gqa(heads, kv_heads, factors);
+        Gqa {
+            head_dim: 64,
+            value_dim: 64,
+            rope: Rope {
+                dims: 64,
+                ..wide.rope
+            },
+            ..wide
+        }
+    }
 
     /// The plan's kinds follow the description layer by layer, wherever its
     /// attention layers sit: a description whose attention layers are 0 and

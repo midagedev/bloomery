@@ -13,8 +13,7 @@
 //!
 //! The host rules a description's parts are held to are here too, one reading of each that every
 //! backend's gates compare their kernels with: the rope's table ([`rope`]), the conv ring and the
-//! short conv ([`linear`], [`shortconv`]), the output gate ([`out_gate`]) and the sandwich residual
-//! ([`residual`]).
+//! short conv ([`linear`], [`shortconv`]) and the output gate ([`out_gate`]).
 //!
 //! The crate holds no device code and makes no operating-system call of its own: it depends on the
 //! model description, the GGUF header reader and the runtime's device-free layer scheduler
@@ -27,7 +26,6 @@ pub mod arch;
 pub mod hybrid;
 pub mod linear;
 pub mod out_gate;
-pub mod residual;
 pub mod rope;
 pub mod router;
 pub mod shortconv;
