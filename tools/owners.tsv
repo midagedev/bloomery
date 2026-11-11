@@ -61,3 +61,7 @@ elem_kernels	kernel	crates/gpu/src/elem.rs
 device_seam	host	crates/device/src/*.rs crates/gpu/src/device.rs crates/metal/src/*.rs
 attn_res	kernel	crates/gpu/src/attn_res.rs
 imatrix_collector	kernel	crates/gpu/src/imatrix.rs
+rows_kit	kernel	crates/gpu/src/arch/rows_kit.rs
+ffn_situ	moe	crates/gpu/src/arch/routed_ffn.rs
+token_major	kernel	crates/gpu/src/token_major.rs
+fault_step_order	graph	crates/gpu/src/arch/step_order.rs

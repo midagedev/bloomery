@@ -2587,37 +2587,9 @@ pub fn agreed<T: PartialEq + std::fmt::Debug>(
     }
 }
 
-/// The host tier of a hybrid body's load: the boundary of `rows` rows, the host run over `run` built by `layers`
-/// ([`host_run`]) and attached to the residency `glue`, and the [`Hybrid`] over them and the slot `map`, watching the
-/// card's fault word and keeping the host set `set` ([`HostResidency`]); the arena leg is attached when the load
-/// starts a residency machine. The one owner of a body's hybrid assembly after its stores and card experts.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the card, file, plan, run and map, the host levers and set, the glue, widths and rows, and the layers' builder, each named"
-)]
-pub fn hosted_hybrid<E>(
-    (gpu, file, plan): (&Gpu, &Arc<Split>, &Plan<'_>),
-    (run, map): (Range<usize>, SlotMap),
-    (host, set, glue): (HostCfg, HostResidency, &ResidencyGlue),
-    (widths, rows): (HostWidths, usize),
-    layers: impl FnOnce(R8Source<'_>) -> Result<Vec<HostLayer>, E>,
-) -> Result<Hybrid<HostRun>, GpuError>
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    hosted_hybrid_tiered(
-        (gpu, file, plan),
-        (run, map),
-        (host, set, glue),
-        (widths, rows),
-        None,
-        layers,
-    )
-}
-
-/// [`hosted_hybrid`] for a body that hangs the plan's expert tier cards under the host tier (`hang`,
-/// [`leg_tier::hang_tiers`]): they are attached after the [`Hybrid`] is made and before the arena leg, which a tier
-/// keeps off. `None` is [`hosted_hybrid`].
+/// The host tier of a hybrid body's load over a contiguous `run` of hosted layers that hangs
+/// the plan's expert tier cards under the host tier (`hang`, [`leg_tier::hang_tiers`]): they are attached after
+/// the [`Hybrid`] is made and before the arena leg, which a tier keeps off. `None` hangs no tier.
 #[allow(
     clippy::too_many_arguments,
     reason = "the card, file, plan, run and map, the host levers and set, the glue, widths and rows, the tier hang and the layers' builder, each named"
