@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/walk.rs
++++ b/crates/chain/src/hybrid/walk.rs
+@@ -51,7 +51,7 @@
+     /// layer, the head. A chain of no layer and `m` outside `1..=rows` are refused by name before
+     /// any op.
+     pub fn run(self, rows: usize) -> Result<(), O::Error> {
+-        if self.plans.is_empty() {
++        if false {
+             return Err(ChainError::shape(WHAT, "a chain of no layer").into());
+         }
+         let o = Overlap {

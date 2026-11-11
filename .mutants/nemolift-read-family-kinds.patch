@@ -1,0 +1,11 @@
+--- a/crates/chain/src/arch/nemotron_h/read.rs
++++ b/crates/chain/src/arch/nemotron_h/read.rs
+@@ -62,7 +62,7 @@
+                         ff,
+                         act: Act::ReluSqr,
+                     },
+-                ) if *ff > 0 => Ok(LayerPlan::Ffn(mlp_plan(
++                ) if true => Ok(LayerPlan::Ffn(mlp_plan(
+                     file, what, l, *ff, hidden, allowed,
+                 )?)),
+                 (mixer, ffn) => Err(refuse(format!(

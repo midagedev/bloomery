@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/read.rs
++++ b/crates/chain/src/hybrid/read.rs
+@@ -134,7 +134,7 @@
+     );
+     Ok(NopeGqaPlan {
+         norm: blk(l, ATTN_NORM),
+-        n_head,
++        n_head: n_kv,
+         n_kv,
+         q_ty: file_site(file, what, &q, (q_rows, hidden), allowed)?,
+         k_ty: file_site(file, what, &k, (kv_rows, hidden), allowed)?,
