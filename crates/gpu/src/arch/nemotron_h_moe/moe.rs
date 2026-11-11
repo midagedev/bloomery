@@ -38,14 +38,12 @@ use crate::quant_sel::QuantSelKernels;
 use crate::site::SiteTy;
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, GpuError};
+use chain::arch::nemotron_h_moe::plan::MoePlan;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::{GgmlType, Split};
 use model::arch::names::blk as layer_name;
 use model::arch::nemotron_h_moe::hparams::Hparams;
-use model::arch::nemotron_h_moe::names::{
-    EXP_PROBS_B, FFN_DOWN_EXPS, FFN_DOWN_SHEXP, FFN_GATE_INP, FFN_LATENT_DOWN, FFN_LATENT_UP,
-    FFN_UP_EXPS, FFN_UP_SHEXP,
-};
+use model::arch::nemotron_h_moe::names::{FFN_DOWN_EXPS, FFN_UP_EXPS};
 use model::placement::{accepts, kernels};
 
 /// The latent pair's site types: Q8_0 through the f32 gemv.
@@ -77,17 +75,21 @@ pub(super) enum Form {
     Sel32,
 }
 
-/// The form layer `l`'s routed stacks in `file` take on the card: both
-/// IQ2_XXS, or both of a type the relu² form runs. A stack absent from the
-/// file, of another type, or a pair of two forms is refused by name.
-fn form_of(file: &Split, l: usize, what: &'static str) -> Result<Form, GpuError> {
-    let ty = |stem: &str| {
-        let name = layer_name(l, stem);
-        file.find(&name)
+/// The form layer `l`'s routed stacks (`up`, `down`) in `file` take on the card: both IQ2_XXS, or
+/// both of a type the relu² form runs. A stack absent from the file, of another type, or a pair of
+/// two forms is refused by name.
+fn form_of(
+    file: &Split,
+    l: usize,
+    (up, down): (&str, &str),
+    what: &'static str,
+) -> Result<Form, GpuError> {
+    let ty = |name: &str| {
+        file.find(name)
             .map(|(_, t)| t.ty)
-            .ok_or_else(|| GpuError::tensor(what, &name, "a routed stack of the file"))
+            .ok_or_else(|| GpuError::tensor(what, name, "a routed stack of the file"))
     };
-    let (up, down) = (ty(FFN_UP_EXPS)?, ty(FFN_DOWN_EXPS)?);
+    let (up, down) = (ty(up)?, ty(down)?);
     match (up, down) {
         (GgmlType::IQ2_XXS, GgmlType::IQ2_XXS) => Ok(Form::Iq2),
         (u, d) if kernels::card_relu2_runs(u) && kernels::card_relu2_runs(d) => Ok(Form::Sel32),
@@ -356,30 +358,25 @@ pub(super) fn stack<'w>(
 }
 
 impl MoeLayer {
-    /// Latent MoE layer `l` of `hp` with `n_card` of its experts resident
-    /// (the router's count for the whole card), its pre-norm `norm` resolved
-    /// by the caller. A layer whose count no router instance is built for,
-    /// whose top-k is not [`TOP_K`], whose kept weights are not renormalized
-    /// or whose `n_card` is past its experts is refused by name.
-    /// Load-time only.
+    /// Latent MoE layer `l` of `hp` as the chain planned it (`p`, whose names and counts the
+    /// description read from the file's header) with `n_card` of its experts resident (the
+    /// router's count for the whole card). A layer whose count no router instance is built for,
+    /// whose top-k is not [`TOP_K`], whose kept weights are not renormalized or whose `n_card` is
+    /// past its experts is refused by name. Load-time only.
     pub(super) fn load(
         names: &Names<'_>,
-        (l, norm): (usize, String),
+        p: &MoePlan,
+        l: usize,
         hp: &Hparams,
         n_card: usize,
         stream: &CudaStream,
     ) -> Result<MoeLayer, GpuError> {
         let what = names.what;
-        let x = hp.experts[l].ok_or_else(|| {
-            GpuError::shape(
-                what,
-                format!("layer {l} is a MoE layer with no experts read"),
-            )
-        })?;
-        let route = RouteOut::new(what, stream, x.n_expert)?;
+        let (n, ff, top_k) = (p.n_expert, p.ff, p.top_k);
+        let route = RouteOut::new(what, stream, n)?;
         hp.refuse_card_keeps(l, route.n_used())
             .map_err(|e| GpuError::shape(what, e))?;
-        let (hidden, shf, n, ff) = (hp.n_embd, hp.shared_ff, x.n_expert, x.ff);
+        let (hidden, shf) = (hp.n_embd, hp.shared_ff);
         let width = hp.experts_width() as usize;
         if n_card > n {
             return Err(GpuError::shape(
@@ -387,7 +384,7 @@ impl MoeLayer {
                 format!("layer {l}: {n_card} experts on the card of its {n}"),
             ));
         }
-        let router = layer_name(l, FFN_GATE_INP);
+        let router = p.router.clone();
         let rows = names.w.f32_tensor(what, &router)?;
         if (rows.rows(), rows.cols()) != (n, hidden) {
             return Err(GpuError::shape(
@@ -397,27 +394,29 @@ impl MoeLayer {
         }
         let w = names.w;
         // The latent pair, where the file has a latent.
-        let (latent_down, latent_up) = match hp.latent {
-            Some(lat) => (
-                Some(names.site(&layer_name(l, FFN_LATENT_DOWN), (lat, hidden), LATENT_TYPES)?),
-                Some(names.site(&layer_name(l, FFN_LATENT_UP), (hidden, lat), LATENT_TYPES)?),
+        let (latent_down, latent_up) = match (hp.latent, &p.latent_down, &p.latent_up) {
+            (Some(lat), Some(down), Some(up)) => (
+                Some(names.site(down, (lat, hidden), LATENT_TYPES)?),
+                Some(names.site(up, (hidden, lat), LATENT_TYPES)?),
             ),
-            None => (None, None),
+            (None, None, None) => (None, None),
+            _ => {
+                return Err(GpuError::state(
+                    what,
+                    "the latent pair a plan read beside the file's own latent",
+                ));
+            }
         };
         // The shared expert: the IQ2_XXS stack the card's one-expert sel
         // reads, or the Q8_0 or NVFP4 sites its gemv reads.
-        let shared = match names
-            .file
-            .find(&layer_name(l, FFN_UP_SHEXP))
-            .map(|(_, t)| t.ty)
-        {
+        let shared = match names.file.find(&p.shared_up).map(|(_, t)| t.ty) {
             Some(GgmlType::IQ2_XXS) => Shared::Sel {
-                up: iq2_xxs(w, what, &layer_name(l, FFN_UP_SHEXP), (shf, hidden))?,
-                down: iq2_xxs(w, what, &layer_name(l, FFN_DOWN_SHEXP), (hidden, shf))?,
+                up: iq2_xxs(w, what, &p.shared_up, (shf, hidden))?,
+                down: iq2_xxs(w, what, &p.shared_down, (hidden, shf))?,
             },
             Some(GgmlType::Q8_0 | GgmlType::NVFP4) => Shared::Site {
-                up: names.site(&layer_name(l, FFN_UP_SHEXP), (shf, hidden), SHARED_TYPES)?,
-                down: names.site(&layer_name(l, FFN_DOWN_SHEXP), (hidden, shf), SHARED_TYPES)?,
+                up: names.site(&p.shared_up, (shf, hidden), SHARED_TYPES)?,
+                down: names.site(&p.shared_down, (hidden, shf), SHARED_TYPES)?,
             },
             other => {
                 return Err(GpuError::shape(
@@ -432,46 +431,36 @@ impl MoeLayer {
         // The card's stacks, in the form their two types take; a layer with
         // no expert on the card holds none and reads no type.
         let form = (n_card > 0)
-            .then(|| form_of(names.file, l, what))
+            .then(|| form_of(names.file, l, (&p.up_exps, &p.down_exps), what))
             .transpose()?;
         let (up_exps, down_exps) = match form {
             None => (None, None),
             Some(Form::Iq2) => (
-                Some(iq2_xxs(
-                    w,
-                    what,
-                    &layer_name(l, FFN_UP_EXPS),
-                    (n_card * ff, width),
-                )?),
-                Some(iq2_xxs(
-                    w,
-                    what,
-                    &layer_name(l, FFN_DOWN_EXPS),
-                    (n_card * width, ff),
-                )?),
+                Some(iq2_xxs(w, what, &p.up_exps, (n_card * ff, width))?),
+                Some(iq2_xxs(w, what, &p.down_exps, (n_card * width, ff))?),
             ),
             Some(Form::Sel32) => {
-                let (up, down) = (layer_name(l, FFN_UP_EXPS), layer_name(l, FFN_DOWN_EXPS));
+                let (up, down) = (&p.up_exps, &p.down_exps);
                 let shape = LegShape {
                     cap: 1,
-                    slots_per_col: x.top_k,
+                    slots_per_col: top_k,
                     n: width,
                     ff,
                 };
-                Relu2Stacks::of(w, [&up, &down])?.check(n_card, shape)?;
-                (Some(up), Some(down))
+                Relu2Stacks::of(w, [up, down])?.check(n_card, shape)?;
+                (Some(up.clone()), Some(down.clone()))
             }
         };
         let fp4 = form == Some(Form::Sel32)
             && names
                 .file
-                .find(&layer_name(l, FFN_UP_EXPS))
+                .find(&p.up_exps)
                 .is_some_and(|(_, t)| kernels::card_planes_runs(t.ty));
         let layer = MoeLayer {
             router,
-            bias: names.vector(l, EXP_PROBS_B, n)?,
+            bias: names.planned_vector(&p.bias, n)?,
             ff,
-            top_k: x.top_k,
+            top_k,
             latent_down,
             latent_up,
             n_card,
@@ -481,7 +470,7 @@ impl MoeLayer {
             fp4,
             shared,
             route,
-            norm,
+            norm: names.planned_vector(&p.norm, hidden)?,
         };
         Ok(layer)
     }
@@ -722,24 +711,25 @@ pub(super) fn one_expert(
     )
 }
 
-/// One MoE layer (the module doc's steps), `src` to `dst`.
-pub(super) fn moe_layer(
+/// A MoE layer's input side: the norm of `src` (the fused norm +
+/// quantize where the shared expert is an IQ2_XXS stack), the shared expert's up, the router and,
+/// where the file has a latent, the latent down into `s.lat`.
+///
+/// The shared expert's up runs here, before the experts' quantize, because it consumes the norm's
+/// `(hidden, 1)` q8_1 form and [`Acts`] keys forms by `(k, m)` alone: the experts' width may equal
+/// the hidden, making the norm's and the experts' forms one buffer. A file whose shared expert is
+/// a dense site has no such form, and the plain norm writes the row alone.
+pub(super) fn moe_in(
     cx: &Cx<'_>,
     (k, sh): (&MoeKernels, MoeShape),
     (l, m): (usize, &mut MoeLayer),
     (t, s, acts): (&mut hybrid::Scratch, &mut MoeScratch, &mut Acts),
-    (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
+    src: &DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     let (gpu, what) = (cx.gpu, cx.what);
     let stream = gpu.stream();
     let hidden = cx.sh.hidden;
-    let width = sh.width;
-    let top_k = sh.top_k;
     let fault = gpu.layer_sink(l)?;
-    // The normed row the router and the latent read. A K-quant site reads
-    // the row as the q8_1 form the fused launch writes beside it (the norm +
-    // quantize pair it folds, bit for bit); a file whose shared expert is a
-    // dense site has no such form, and the plain norm writes the row alone.
     match &m.shared {
         Shared::Sel { .. } => {
             gpu.fused().enqueue_norm_quant(
@@ -756,21 +746,13 @@ pub(super) fn moe_layer(
             hybrid::norm(cx, &m.norm, src, &mut t.buf.xn)?;
         }
     }
-    {
-        // The shared expert's up consumes the norm's (hidden, 1) q8_1 form
-        // here, before the experts' quantize overwrites it: Acts keys forms
-        // by (k, m) alone, and the experts' width may equal the hidden,
-        // making the norm's and the experts' forms one buffer (the latent
-        // pair's Q8_0 projections write no q8_1 form). The Q8_0 site reads
-        // the normed row itself.
-        match &m.shared {
-            Shared::Sel { up, .. } => {
-                let act = acts.q8_1_at(what, hidden, 1)?;
-                one_expert(cx, k, l, up, sh.shared_ff, act, &s.zero_id, &mut s.sh_up)?;
-            }
-            Shared::Site { up, .. } => {
-                up.project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.sh_up)?;
-            }
+    match &m.shared {
+        Shared::Sel { up, .. } => {
+            let act = acts.q8_1_at(what, hidden, 1)?;
+            one_expert(cx, k, l, up, sh.shared_ff, act, &s.zero_id, &mut s.sh_up)?;
+        }
+        Shared::Site { up, .. } => {
+            up.project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.sh_up)?;
         }
     }
     k.routers.enqueue(
@@ -782,11 +764,23 @@ pub(super) fn moe_layer(
         &mut m.route,
         fault,
     )?;
-    // The experts' input: the latent the file's down projection makes, or
-    // the normed row itself where the file has no latent.
     if let Some(site) = &m.latent_down {
         site.project(&cx.gqa(), acts, l, &t.buf.xn, &mut s.lat)?;
     }
+    Ok(())
+}
+
+/// A MoE layer's middle: the card's slots over the latent (or the
+/// normed row itself where the file has no latent), their weighted sum, and the latent up into
+/// `t.buf.delta` — the layer's delta, which [`moe_out`] reads back by the same match.
+pub(super) fn moe_core(
+    cx: &Cx<'_>,
+    (k, sh): (&MoeKernels, MoeShape),
+    (l, m): (usize, &mut MoeLayer),
+    (t, s, acts): (&mut hybrid::Scratch, &mut MoeScratch, &mut Acts),
+) -> Result<(), GpuError> {
+    let gpu = cx.gpu;
+    let stream = gpu.stream();
     if m.latent_down.is_some() {
         let (lat, slots) = s.lat_and_slots();
         card_slots(cx, (k, sh), (l, &*m), (lat, m.route.ids()), (slots, acts))?;
@@ -806,32 +800,45 @@ pub(super) fn moe_layer(
         stream,
         down_of(m, down, relu2)?,
         m.route.weights(),
-        width,
-        top_k as u32,
+        sh.width,
+        sh.top_k as u32,
         1,
         moe,
     )?;
-    // The layer's delta: the latent up's projection, or the experts' sum
-    // itself where the file has no latent.
+    if let Some(site) = &m.latent_up {
+        site.project(&cx.gqa(), acts, l, &s.moe, &mut t.buf.delta)?;
+    }
+    Ok(())
+}
+
+/// A MoE layer's output side: the shared expert's squared ReLU and
+/// down, their sum with the routed delta, and the residual add of `src` into `dst`.
+pub(super) fn moe_out(
+    cx: &Cx<'_>,
+    (k, sh): (&MoeKernels, MoeShape),
+    (l, m): (usize, &mut MoeLayer),
+    (t, s, acts): (&mut hybrid::Scratch, &mut MoeScratch, &mut Acts),
+    (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
+) -> Result<(), GpuError> {
+    let (gpu, what) = (cx.gpu, cx.what);
+    let stream = gpu.stream();
+    let hidden = cx.sh.hidden;
+    // The layer's delta: the latent up's output, or the experts' sum itself
+    // where the file has no latent.
     let delta: &DeviceBuffer<f32> = match &m.latent_up {
-        Some(site) => {
-            site.project(&cx.gqa(), acts, l, &s.moe, &mut t.buf.delta)?;
-            &t.buf.delta
-        }
+        Some(_) => &t.buf.delta,
         None => &s.moe,
     };
-    {
-        match &m.shared {
-            Shared::Sel { down, .. } => {
-                let act = acts.q8_1_at(what, sh.shared_ff, 1)?;
-                gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.sh_up, act, l)?;
-                one_expert(cx, k, l, down, hidden, act, &s.zero_id, &mut s.sh)?;
-            }
-            Shared::Site { down, .. } => {
-                gpu.elem()
-                    .enqueue_relu_sqr(stream, &s.sh_up, sh.shared_ff, &mut s.sh_relu)?;
-                down.project(&cx.gqa(), acts, l, &s.sh_relu, &mut s.sh)?;
-            }
+    match &m.shared {
+        Shared::Sel { down, .. } => {
+            let act = acts.q8_1_at(what, sh.shared_ff, 1)?;
+            gpu.enqueue_quantize_q8_1_layer_relu_sqr(&s.sh_up, act, l)?;
+            one_expert(cx, k, l, down, hidden, act, &s.zero_id, &mut s.sh)?;
+        }
+        Shared::Site { down, .. } => {
+            gpu.elem()
+                .enqueue_relu_sqr(stream, &s.sh_up, sh.shared_ff, &mut s.sh_relu)?;
+            down.project(&cx.gqa(), acts, l, &s.sh_relu, &mut s.sh)?;
         }
     }
     gpu.elem()

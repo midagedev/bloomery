@@ -10,7 +10,7 @@
 //! forms they read ([`Acts`]); the two layer kinds' resident pieces
 //! ([`MambaLayer`], [`GqaLayer`]), resolved at load by [`Names`]; the trunk's
 //! widths ([`Shape`]), kernels ([`Kernels`]) and step scratch ([`Scratch`]);
-//! the launches of one layer of each kind ([`mamba_layer`], [`gqa_layer`])
+//! the launches of one layer of each kind ([`mamba_in`], [`gqa_layer`])
 //! and the pre-norm and residual add every layer brackets its block with
 //! ([`norm`], [`residual`]); and the step's word record ([`Words`]: the
 //! position, the token and one plane row a key head), which a body refreshes
@@ -41,10 +41,7 @@ use crate::{DeviceTensor, Gpu, GpuError, Q8Act, Window};
 use chain::hybrid::plan::{MambaPlan, NopeGqaPlan};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
-use model::arch::hybrid::{
-    ATTN_K, ATTN_OUTPUT, ATTN_Q, ATTN_V, SSM_A, SSM_CONV, SSM_CONV_BIAS, SSM_D, SSM_DT_BIAS,
-    SSM_IN, SSM_NORM, SSM_OUT, Ssm,
-};
+use model::arch::hybrid::{SSM_CONV_BIAS, Ssm};
 use model::arch::models::OutGate;
 use model::arch::names::blk as layer_name;
 use model::mamba2::{Checked, Geom};
@@ -477,7 +474,7 @@ impl Site {
     /// `y = W · act` over the site's already-quantized q8_1 form, raising
     /// into layer `layer`'s fault sink — the gemv half of the q8_1 arm of
     /// [`Site::project`], which a caller that quantized by other means
-    /// ([`mamba_layer`]'s fused norm, or one quantization serving several
+    /// ([`mamba_in`]'s fused norm, or one quantization serving several
     /// sites of one input) launches alone.
     pub fn kgemv(
         &self,
@@ -575,18 +572,6 @@ pub(crate) fn residual(
     dst: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     residual_rows(cx.gpu, cx.sh.hidden, src, delta, dst)
-}
-
-/// One Mamba-2 layer: [`mamba_in`], [`mamba_core`], [`mamba_out`] in order.
-pub(crate) fn mamba_layer(
-    cx: &Cx<'_>,
-    (l, m): (usize, &mut MambaLayer),
-    (s, acts): (&mut Scratch, &mut Acts),
-    (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
-) -> Result<(), GpuError> {
-    mamba_in(cx, (l, &*m), (&mut *s, &mut *acts), src)?;
-    mamba_core(cx, (l, &mut *m), &mut *s)?;
-    mamba_out(cx, (l, &*m), (s, acts), (src, dst))
 }
 
 /// A Mamba-2 layer's input side: the norm of `src` and the `ssm_in` projection, whose output is
@@ -738,7 +723,7 @@ pub(crate) struct Names<'a> {
 
 /// The zero conv bias of a file whose Mamba-2 layers `mamba_layers` hold none
 /// of, made once and filed into `w` before any name is resolved
-/// ([`Names::mamba`] reads it): one zero vector of `len` values every such
+/// ([`Names::mamba_of`] reads it): one zero vector of `len` values every such
 /// layer shares. A file that holds every layer's bias adds nothing.
 pub(crate) fn derive_zero_conv_bias(
     w: &mut Weights,
@@ -785,67 +770,9 @@ impl Names<'_> {
         self.site(&layer_name(l, stem), shape, self.types)
     }
 
-    /// Layer `l`'s conv bias of `len` values: the file's, or where the file
-    /// holds none (the bias is optional) the zero vector every such layer
-    /// reads ([`derive_zero_conv_bias`], resident from load).
-    fn conv_bias(&self, l: usize, len: usize) -> Result<String, GpuError> {
-        if self.file.find(&layer_name(l, SSM_CONV_BIAS)).is_some() {
-            return self.vector(l, SSM_CONV_BIAS, len);
-        }
-        site::vector(self.w, self.what, ZERO_CONV_BIAS.to_owned(), len)
-    }
-
     /// The f32 vector `stem` of layer `l`, `len` values: its name.
     pub(crate) fn vector(&self, l: usize, stem: &str, len: usize) -> Result<String, GpuError> {
         site::vector(self.w, self.what, layer_name(l, stem), len)
-    }
-
-    /// Mamba-2 layer `l` of the widths `s` on a `hidden`-value row, its
-    /// pre-norm `norm` resolved by the caller, and its scan store.
-    pub(crate) fn mamba(
-        &mut self,
-        (l, norm): (usize, String),
-        s: &Ssm,
-        hidden: usize,
-        stream: &CudaStream,
-    ) -> Result<MambaLayer, GpuError> {
-        let lens = stores::mamba2_lens(s.d_inner, s.d_state, CONV_TAPS, s.conv_dim);
-        Ok(MambaLayer {
-            ssm_in: self.proj(l, SSM_IN, (s.d_in_proj, hidden))?,
-            ssm_out: self.proj(l, SSM_OUT, (hidden, s.d_inner))?,
-            a: self.vector(l, SSM_A, s.n_heads)?,
-            d: self.vector(l, SSM_D, s.n_heads)?,
-            dt_bias: self.vector(l, SSM_DT_BIAS, s.n_heads)?,
-            conv_w: self.vector(l, SSM_CONV, s.d_conv * s.conv_dim)?,
-            conv_b: self.conv_bias(l, s.conv_dim)?,
-            ssm_norm: self.vector(l, SSM_NORM, s.d_inner)?,
-            store: RecStore::new(stream, lens, 1)?,
-            norm,
-        })
-    }
-
-    /// Attention layer `l` of `n_head` query heads over `kv` key heads of
-    /// [`HEAD`] values on a `hidden`-value row, its pre-norm `norm` resolved
-    /// by the caller, no out gate, and its K/V planes of `ctx` rows a key
-    /// head.
-    pub(crate) fn attn(
-        &mut self,
-        (l, norm): (usize, String),
-        (n_head, kv): (usize, usize),
-        (hidden, ctx): (usize, usize),
-        stream: &CudaStream,
-    ) -> Result<GqaLayer, GpuError> {
-        let width = kv * HEAD;
-        Ok(GqaLayer {
-            q: self.proj(l, ATTN_Q, (n_head * HEAD, hidden))?,
-            k: self.proj(l, ATTN_K, (width, hidden))?,
-            v: self.proj(l, ATTN_V, (width, hidden))?,
-            o: self.proj(l, ATTN_OUTPUT, (hidden, n_head * HEAD))?,
-            gate: GqaGate::None,
-            kc: DeviceTensor::zeroed(stream, kv * ctx, HEAD)?,
-            vc: DeviceTensor::zeroed(stream, kv * ctx, HEAD)?,
-            norm,
-        })
     }
 
     /// Site `name` of `rows` rows of `k` values at the type `ty` a plan read from the file's header,
@@ -865,9 +792,9 @@ impl Names<'_> {
         site::vector(self.w, self.what, name.to_owned(), len)
     }
 
-    /// Mamba-2 layer `p` on a `hidden`-value row and its scan store: [`Names::mamba`] from a plan
-    /// (the names and site types the chain read from the file's header), whose conv bias is the
-    /// zero vector [`derive_zero_conv_bias`] made where the plan holds none.
+    /// Mamba-2 layer `p` on a `hidden`-value row and its scan store: from a plan (the names and
+    /// site types the chain read from the file's header), whose conv bias is the zero vector
+    /// [`derive_zero_conv_bias`] made where the plan holds none.
     pub(crate) fn mamba_of(
         &self,
         p: &MambaPlan,

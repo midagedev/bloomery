@@ -31,6 +31,7 @@ mod body;
 mod moe;
 mod placed;
 mod prefill;
+mod program;
 pub mod router;
 
 pub use crate::arch::hybrid::DecodeInput;

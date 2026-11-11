@@ -1,7 +1,7 @@
 //! A nemotron_h_moe load whose routed experts the card does not all hold: the plan's card
 //! segment of each layer's stacks resident, the rest served by the common
 //! host tier ([`crate::host`]) in relu². A layer the plan holds whole runs the
-//! whole-card layer ([`super::moe::moe_layer`]); a layer with a host share
+//! whole-card ops ([`super::program::Program`], the trunk's walk); a layer with a host share
 //! runs this module's three parts around the tier's step port, the module doc
 //! of [`super::moe`] in the host leg's order:
 //!
@@ -36,10 +36,10 @@ use super::body::Layer;
 use super::moe::{
     MoeKernels, MoeLayer, MoeScratch, MoeShape, Shared, card_down, card_slots, one_expert,
 };
-use crate::arch::hybrid::{self, Acts, Cx, gqa_layer, mamba_layer, residual};
+use super::program::{Program, rails};
+use crate::arch::hybrid::{self, Acts, Cx, residual};
 use crate::card_slots::{CardAcc, CardSlotKernels, ColPlaces};
 use crate::fault::FaultSink;
-use crate::flash_gqa::GROUP_16;
 use crate::host::StepLeg;
 use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::run::{HostRun, HostWidths};
@@ -49,6 +49,10 @@ use crate::routed_block::handoff_go;
 use crate::tensor::DeviceTensor;
 use crate::{Gpu, GpuError};
 use bloomery_levers::HostCfg;
+use chain::arch::nemotron_h_moe::plan::MoePlan;
+use chain::hybrid::ops::HybridOps;
+use chain::hybrid::plan::LayerPlan;
+use chain::hybrid::walk;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::nemotron_h_moe::host::routed_layers;
@@ -507,21 +511,15 @@ fn back(
     hy.row_enqueued(l, 0)
 }
 
-/// The captured decode step's walk `(1, 1, Step)` through the host tier's
-/// step port: each layer's front, shadow and back, the layers without a host
-/// share their whole-card programs in the front.
+/// The captured decode step's walk `(1, 1, Step)` through the host tier's step port: each layer's
+/// front, shadow and back. A layer without a host share runs the trunk's walk
+/// (`chain::hybrid::walk::layer`) over [`Program`]'s ops in its front, the unit's embedding ahead
+/// of layer 0; a hosted MoE layer runs this module's three parts around the leg instead.
 pub(super) struct StepWalk<'a> {
-    pub(super) cx: Cx<'a>,
-    pub(super) mk: &'a MoeKernels,
-    pub(super) moe: MoeShape,
-    pub(super) layers: &'a mut [Layer],
-    pub(super) t: &'a mut hybrid::Scratch,
-    pub(super) ms: &'a mut MoeScratch,
-    pub(super) acts: &'a mut Acts,
+    /// The step's ops, the trunk's walk runs per layer ([`chain::hybrid::walk::layer`]).
+    pub(super) ops: &'a mut Program<'a>,
+    pub(super) plans: &'a [LayerPlan<MoePlan>],
     pub(super) side: &'a mut PlacedSide,
-    /// The head's input and the body's own residual buffer.
-    pub(super) hin: &'a mut DeviceBuffer<f32>,
-    pub(super) r: &'a mut DeviceBuffer<f32>,
 }
 
 impl<'a> StepWalk<'a> {
@@ -532,15 +530,8 @@ impl<'a> StepWalk<'a> {
             cols: 1,
             port: PortKind::Step,
         };
-        let n = self.layers.len();
+        let n = self.ops.layers.len();
         sched::walk(o, n, leg, &mut self)
-    }
-
-    /// Whether layer `l` reads the head's input: the residual stream
-    /// alternates between it and the body's buffer, and the last layer
-    /// writes the head's whatever the layer count's parity.
-    fn reads_head(&self, l: usize) -> bool {
-        self.layers.len().is_multiple_of(2) != (l % 2 == 1)
     }
 }
 
@@ -551,37 +542,29 @@ impl<'a> LayerProgram for StepWalk<'a> {
         self.side.hosted[at.layer]
     }
 
-    /// A layer with no host share whole; a hosted one up to its go.
+    /// A layer with no host share whole, the unit's front once ahead of layer 0; a hosted one up
+    /// to its go.
     fn front(&mut self, leg: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
-        let (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>) = if self.reads_head(l) {
-            (&*self.hin, &mut *self.r)
-        } else {
-            (&*self.r, &mut *self.hin)
-        };
-        let hosted = self.side.hosted[l];
-        let (t, acts) = (&mut *self.t, &mut *self.acts);
-        match &mut self.layers[l] {
-            Layer::Mamba(m) => mamba_layer(&self.cx, (l, m), (t, acts), (src, dst)),
-            Layer::Attn(a) => {
-                gqa_layer::<GROUP_16>(&self.cx.gqa(), (l, a), (t.gqa(), acts), (src, dst))
-            }
-            Layer::Moe(m) if !hosted => super::moe::moe_layer(
-                &self.cx,
-                (self.mk, self.moe),
-                (l, m),
-                (t, &mut *self.ms, acts),
-                (src, dst),
-            ),
-            Layer::Moe(m) => front(
-                &self.cx,
-                (self.mk, self.moe),
-                self.side,
-                (l, m),
-                (t, acts),
-                (src, leg),
-            ),
+        if l == 0 {
+            self.ops.embed(1)?;
         }
+        if !self.side.hosted[l] {
+            let (step, plan) = walk::at(self.plans, l, 1)?;
+            return walk::layer(&mut *self.ops, step, plan);
+        }
+        let Layer::Moe(m) = &mut self.ops.layers[l] else {
+            return Err(GpuError::state(WHAT, "a hosted layer is a MoE layer"));
+        };
+        let (src, _) = rails(self.ops.in_head, &mut *self.ops.head, &mut *self.ops.r);
+        front(
+            &self.ops.cx,
+            (self.ops.mk, self.ops.moe),
+            self.side,
+            (l, m),
+            (&mut *self.ops.s, &mut *self.ops.acts),
+            (src, leg),
+        )
     }
 
     fn shadow(&mut self, leg: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
@@ -589,15 +572,15 @@ impl<'a> LayerProgram for StepWalk<'a> {
         if !self.side.hosted[l] {
             return Ok(());
         }
-        let Layer::Moe(m) = &self.layers[l] else {
+        let Layer::Moe(m) = &self.ops.layers[l] else {
             return Err(GpuError::state(WHAT, "a hosted layer is a MoE layer"));
         };
         shadow(
-            &self.cx,
-            (self.mk, self.moe),
+            &self.ops.cx,
+            (self.ops.mk, self.ops.moe),
             self.side,
             (l, m),
-            (&mut *self.t, &mut *self.ms, &mut *self.acts),
+            (&mut *self.ops.s, &mut *self.ops.ms, &mut *self.ops.acts),
             leg,
         )
     }
@@ -607,22 +590,20 @@ impl<'a> LayerProgram for StepWalk<'a> {
         if !self.side.hosted[l] {
             return Ok(());
         }
-        let (src, dst): (&DeviceBuffer<f32>, &mut DeviceBuffer<f32>) = if self.reads_head(l) {
-            (&*self.hin, &mut *self.r)
-        } else {
-            (&*self.r, &mut *self.hin)
-        };
-        let Layer::Moe(m) = &self.layers[l] else {
+        let Layer::Moe(m) = &mut self.ops.layers[l] else {
             return Err(GpuError::state(WHAT, "a hosted layer is a MoE layer"));
         };
+        let (src, dst) = rails(self.ops.in_head, &mut *self.ops.head, &mut *self.ops.r);
         back(
-            &self.cx,
-            self.moe,
+            &self.ops.cx,
+            self.ops.moe,
             self.side,
             (l, m),
-            (&mut *self.t, &mut *self.ms, &mut *self.acts),
+            (&mut *self.ops.s, &mut *self.ops.ms, &mut *self.ops.acts),
             (src, dst),
             leg,
-        )
+        )?;
+        self.ops.in_head = !self.ops.in_head;
+        Ok(())
     }
 }

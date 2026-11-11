@@ -1,0 +1,12 @@
+--- a/crates/chain/src/arch/nemotron_h_moe/read.rs
++++ b/crates/chain/src/arch/nemotron_h_moe/read.rs
+@@ -81,7 +81,8 @@
+                     file, what, l, m, hidden, allowed,
+                 )?)),
+                 (Mixer::Gqa(g), ffn) if no_block(ffn) => Ok(LayerPlan::Attn(nope_gqa_plan(
+-                    file, what, l, g, hidden, allowed,
++                    // mutant nemomoe-attn-site-list: the attention arm reads at the one-type list.
++                    file, what, l, g, hidden, &[SiteTy::Q8_0],
+                 )?)),
+                 (Mixer::None, Ffn::Moe(m)) => Ok(LayerPlan::Ffn(moe_plan(what, l, m)?)),
+                 (mixer, ffn) => Err(refuse(format!(

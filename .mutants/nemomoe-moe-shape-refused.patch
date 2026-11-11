@@ -1,0 +1,15 @@
+--- a/crates/chain/src/arch/nemotron_h_moe/read.rs
++++ b/crates/chain/src/arch/nemotron_h_moe/read.rs
+@@ -45,10 +45,8 @@
+ fn moe_fits(m: &Moe) -> Result<(), String> {
+     let router = m.router.score == Score::Sigmoid && m.router.bias && !m.router.hash;
+     let norms = !m.pre_exp_norm && m.post_exp_norm.is_none() && !m.sum_norm;
+-    let shared = matches!(
+-        m.shared,
+-        Some(shared) if shared.act == Act::ReluSqr && !shared.sigmoid_gate
+-    );
++    // mutant nemomoe-moe-shape-refused: any shared expert passes, gated or none at all.
++    let shared = true;
+     if router && norms && shared && m.act == Act::ReluSqr {
+         Ok(())
+     } else {

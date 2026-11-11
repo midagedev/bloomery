@@ -3,13 +3,12 @@
 //! once, the caches, the scan stores and the router results allocated once,
 //! and the per-step record refreshed before every enqueue or replay.
 
-use super::moe::{
-    MoeKernels, MoeLayer, MoeScratch, MoeShape, Routing, moe_layer, routed, sel32_words,
-};
+use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, Routing, routed, sel32_words};
 use super::placed::{PLACED_ROWS, Placed, PlacedOpen, StepWalk, plan_map};
+use super::program::Program;
 use crate::arch::hybrid::{
-    self, Acts, Cx, DecodeInput, GqaLayer, Kernels, MambaLayer, Names, Site, WORD_POS, WORD_TOKEN,
-    Words, attention_heads, derive_zero_conv_bias, gqa_layer, mamba_layer, mamba_shape,
+    self, Acts, Cx, DecodeInput, GqaLayer, Kernels, MambaLayer, Names, Site, Words,
+    attention_heads, derive_zero_conv_bias, mamba_shape,
 };
 use crate::card_leg::Relu2Leg;
 use crate::flash_gqa::GROUP_16;
@@ -20,13 +19,17 @@ use crate::host::StepLeg;
 use crate::host::swap::Residency;
 use crate::model::fit::FIT_RESERVE;
 use crate::model::{ChainBody, GpuModel, refuse_reserve_past, refuse_scratch_past};
-use crate::q38::{EmbedArgs, EmbedRows, Q38Kernels};
+use crate::q38::Q38Kernels;
 use crate::quant_sel::QuantSelKernels;
 use crate::site::{Form, SiteTy};
 use crate::tensor::Q8ACT_MAX_K;
 use crate::weights::Weights;
-use crate::{Gpu, GpuError, Window};
+use crate::{Gpu, GpuError};
 use bloomery_levers::HostCfg;
+use chain::arch::nemotron_h_moe::plan::MoePlan;
+use chain::arch::nemotron_h_moe::read::layer_plans;
+use chain::hybrid::plan::LayerPlan;
+use chain::hybrid::walk::Walk;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::{GgmlType, Split};
 use model::arch::Arch;
@@ -34,6 +37,7 @@ use model::arch::names::blk;
 use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
 use model::arch::nemotron_h_moe::names;
 use model::arch::nemotron_h_moe::place;
+use model::arch::nemotron_h_moe::spec;
 use model::placement::Plan;
 use std::ops::Range;
 use std::sync::Arc;
@@ -73,6 +77,8 @@ pub struct Body {
     /// The Q8_0 token table's name.
     pub(super) embed: String,
     pub(super) sh: hybrid::Shape,
+    /// The chain's plans, one a layer: the walk's order, from the file's header.
+    pub(super) plans: Vec<LayerPlan<MoePlan>>,
     pub(super) moe: MoeShape,
     pub(super) layers: Vec<Layer>,
     pub(super) k: Kernels,
@@ -297,39 +303,33 @@ impl Body {
         )?;
         let hidden = hp.n_embd;
         let stream = gpu.stream();
-        let mut names = Names {
+        let names = Names {
             what: WHAT,
             file,
             w,
             types: SITE_TYPES,
         };
+        let read = spec::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let plans = layer_plans(file, WHAT, &read.spec.layers, hidden, SITE_TYPES)?;
         let embed = names::token_embd();
         names.site(&embed, (hp.n_vocab, hidden), &[SiteTy::Q8_0])?;
         let mut layers = Vec::with_capacity(hp.n_trunk);
-        for l in 0..hp.n_trunk {
+        for (l, plan) in plans.iter().enumerate() {
             let n_card = |n_expert: usize| match &map {
                 Some((m, _)) => m.on_card(l),
                 None => Ok(n_expert),
             };
-            let norm = names.vector(l, names::ATTN_NORM, hidden)?;
-            layers.push(match hp.kinds[l] {
-                Kind::Mamba => Layer::Mamba(names.mamba((l, norm), &ssm, hidden, stream)?),
-                Kind::Attention => Layer::Attn(names.attn(
-                    (l, norm),
-                    (hp.n_head, hp.kv[l]),
-                    (hidden, ctx),
+            layers.push(match plan {
+                LayerPlan::Mamba(p) => Layer::Mamba(names.mamba_of(p, hidden, stream)?),
+                LayerPlan::Attn(p) => Layer::Attn(names.attn_of(p, (hidden, ctx), stream)?),
+                LayerPlan::Ffn(p) => Layer::Moe(MoeLayer::load(
+                    &names,
+                    p,
+                    l,
+                    &hp,
+                    n_card(p.n_expert)?,
                     stream,
                 )?),
-                Kind::Moe => {
-                    let n_expert = hp.experts[l].map_or(0, |x| x.n_expert);
-                    Layer::Moe(MoeLayer::load(
-                        &names,
-                        (l, norm),
-                        &hp,
-                        n_card(n_expert)?,
-                        stream,
-                    )?)
-                }
             });
         }
         Body::refuse_widths(&layers)?;
@@ -404,6 +404,7 @@ impl Body {
         Ok(Body {
             prompt,
             placed,
+            plans,
             k: Kernels::load(gpu)?,
             mk: MoeKernels {
                 routers: Routers::load(ctx_)?,
@@ -483,12 +484,10 @@ impl Body {
         }
     }
 
-    /// The whole chain: the embedding, every layer, then `head`. The residual
-    /// stream alternates between the head's input and the body's own buffer,
-    /// each layer writing the one it did not read, so the last layer's sum is
-    /// the head's input whatever the layer count's parity. A placed load walks
-    /// its layers through the host tier's step port instead
-    /// ([`StepWalk`]).
+    /// The whole chain: the embedding, every layer, then `head`, as the walk of the body's plans
+    /// orders the ops of [`Program`]. The residual stream alternates between the head's input and
+    /// the body's own buffer ([`Program`]). A placed load walks its layers through the host tier's
+    /// step port instead ([`StepWalk`]), which runs the same ops per layer around each host leg.
     fn enqueue(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
         let cx = Cx {
             what: STEP,
@@ -497,74 +496,46 @@ impl Body {
             k: &self.k,
             sh: self.sh,
         };
-        let (qs, d) = w.q8_planes(STEP, &self.embed)?;
-        let hin = head.input_mut();
-        let mut in_head = self.layers.len().is_multiple_of(2);
-        {
-            let t = &mut self.s;
-            let ids = Window::<u32>::of(&t.words, WORD_TOKEN * size_of::<u32>(), 1)?;
-            let pos0 = Window::<u32>::of(&t.words, WORD_POS * size_of::<u32>(), 1)?;
-            let first = if in_head { &mut *hin } else { &mut self.r };
-            self.q38.enqueue_embed_rows(
-                gpu.stream(),
-                EmbedArgs {
-                    table: EmbedRows::Q8_0 { qs, d },
-                    ids: &ids,
-                    pos0: &pos0,
-                    first: 0,
-                    fault: gpu.unlabelled_sink(),
-                    y: first,
-                    pos: &mut t.buf.pos,
-                    n_keys: &mut t.buf.n_keys,
-                },
-            )?;
-        }
+        let in_head = self.layers.len().is_multiple_of(2);
         if let Some(Placed { hybrid, side }) = self.placed.as_mut() {
             let mut leg = StepLeg::new(gpu.stream(), hybrid);
-            StepWalk {
+            let mut program = Program {
                 cx,
+                embed: &self.embed,
+                q38: &self.q38,
                 mk: &self.mk,
                 moe: self.moe,
                 layers: &mut self.layers,
-                t: &mut self.s,
+                s: &mut self.s,
                 ms: &mut self.ms,
                 acts: &mut self.acts,
-                side,
-                hin,
                 r: &mut self.r,
+                head: &mut *head,
+                in_head,
+            };
+            StepWalk {
+                ops: &mut program,
+                plans: &self.plans,
+                side,
             }
             .walk(&mut leg)?;
             return head.enqueue(gpu, w);
         }
-        for (l, layer) in self.layers.iter_mut().enumerate() {
-            let (src, dst) = if in_head {
-                (&*hin, &mut self.r)
-            } else {
-                (&self.r as &DeviceBuffer<f32>, &mut *hin)
-            };
-            match layer {
-                Layer::Mamba(m) => {
-                    mamba_layer(&cx, (l, m), (&mut self.s, &mut self.acts), (src, dst))?;
-                }
-                Layer::Attn(a) => {
-                    gqa_layer::<GROUP_16>(
-                        &cx.gqa(),
-                        (l, a),
-                        (self.s.gqa(), &mut self.acts),
-                        (src, dst),
-                    )?;
-                }
-                Layer::Moe(m) => moe_layer(
-                    &cx,
-                    (&self.mk, self.moe),
-                    (l, m),
-                    (&mut self.s, &mut self.ms, &mut self.acts),
-                    (src, dst),
-                )?,
-            }
-            in_head = !in_head;
-        }
-        head.enqueue(gpu, w)
+        let mut program = Program {
+            cx,
+            embed: &self.embed,
+            q38: &self.q38,
+            mk: &self.mk,
+            moe: self.moe,
+            layers: &mut self.layers,
+            s: &mut self.s,
+            ms: &mut self.ms,
+            acts: &mut self.acts,
+            r: &mut self.r,
+            head,
+            in_head,
+        };
+        Walk::new(&mut program, &self.plans, 1).run(1)
     }
 }
 
