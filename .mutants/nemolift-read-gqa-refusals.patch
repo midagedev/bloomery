@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/read.rs
++++ b/crates/chain/src/hybrid/read.rs
+@@ -89,7 +89,7 @@
+ /// multiple of the key heads.
+ fn nope_fits(g: &Gqa) -> Result<(), String> {
+     let plain = g.rope.mode == RopeMode::None
+-        && !g.qk_norm
++        && true
+         && !g.o_norm
+         && g.out_gate == OutGate::None
+         && g.select.is_none()

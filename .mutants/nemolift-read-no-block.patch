@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/read.rs
++++ b/crates/chain/src/hybrid/read.rs
+@@ -22,7 +22,7 @@
+ /// Whether `ffn` is the description's "no feed-forward block" of a Mamba-2 or attention layer.
+ #[must_use]
+ pub fn no_block(ffn: &Ffn) -> bool {
+-    matches!(ffn, Ffn::Dense { ff: 0, .. })
++    matches!(ffn, Ffn::Dense { .. })
+ }
+ 
+ /// Layer `l`'s Mamba-2 plan over a `hidden`-value row: the description's widths checked against

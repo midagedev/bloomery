@@ -1,0 +1,11 @@
+--- a/crates/chain/src/arch/nemotron_h/read.rs
++++ b/crates/chain/src/arch/nemotron_h/read.rs
+@@ -26,7 +26,7 @@
+     Ok(MlpPlan {
+         norm: blk(l, ATTN_NORM),
+         ff,
+-        up_ty: file_site(file, what, &up, (ff, hidden), allowed)?,
++        up_ty: file_site(file, what, &up, (ff + 1, hidden), allowed)?,
+         down_ty: file_site(file, what, &down, (hidden, ff), allowed)?,
+         up,
+         down,

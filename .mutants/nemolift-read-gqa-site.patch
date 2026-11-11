@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/read.rs
++++ b/crates/chain/src/hybrid/read.rs
+@@ -136,7 +136,7 @@
+         norm: blk(l, ATTN_NORM),
+         n_head,
+         n_kv,
+-        q_ty: file_site(file, what, &q, (q_rows, hidden), allowed)?,
++        q_ty: file_site(file, what, &q, (q_rows + 1, hidden), allowed)?,
+         k_ty: file_site(file, what, &k, (kv_rows, hidden), allowed)?,
+         v_ty: file_site(file, what, &v, (kv_rows, hidden), allowed)?,
+         o_ty: file_site(file, what, &o, (hidden, q_rows), allowed)?,

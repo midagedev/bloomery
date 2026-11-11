@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/plan.rs
++++ b/crates/chain/src/hybrid/plan.rs
+@@ -71,7 +71,7 @@
+     pub fn of<F>(plans: &[LayerPlan<F>]) -> Counts {
+         plans.iter().fold(Counts::default(), |mut n, p| {
+             match p {
+-                LayerPlan::Mamba(_) => n.mamba += 1,
++                LayerPlan::Mamba(_) => n.ffn += 1,
+                 LayerPlan::Attn(_) => n.attn += 1,
+                 LayerPlan::Ffn(_) => n.ffn += 1,
+             }

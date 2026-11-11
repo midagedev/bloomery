@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/walk.rs
++++ b/crates/chain/src/hybrid/walk.rs
+@@ -28,7 +28,7 @@
+             format!("layer {layer} of a chain of {} layers", plans.len()),
+         )
+     })?;
+-    let last = layer + 1 == plans.len();
++    let last = false;
+     Ok((Step { layer, m, last }, plan))
+ }
+ 

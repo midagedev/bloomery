@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/read.rs
++++ b/crates/chain/src/hybrid/read.rs
+@@ -67,7 +67,7 @@
+         d: blk(l, SSM_D),
+         dt_bias: blk(l, SSM_DT_BIAS),
+         conv_w: blk(l, SSM_CONV),
+-        conv_b: file.find(&conv_b).map(|_| conv_b),
++        conv_b: None,
+         ssm_norm: blk(l, SSM_NORM),
+         shape: *m,
+         conv_dim: checked.conv_dim(),

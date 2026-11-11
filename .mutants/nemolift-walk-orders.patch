@@ -1,0 +1,12 @@
+--- a/crates/chain/src/hybrid/walk.rs
++++ b/crates/chain/src/hybrid/walk.rs
+@@ -97,8 +97,8 @@
+ ) -> Result<(), O::Error> {
+     match plan {
+         LayerPlan::Mamba(p) => {
+-            ops.mamba_in(step, p)?;
+             ops.mamba_core(step, p)?;
++            ops.mamba_in(step, p)?;
+             ops.mamba_out(step, p)
+         }
+         LayerPlan::Attn(p) => {

@@ -890,31 +890,12 @@ mod tests {
     };
     use crate::arch::qwen3moe::plan::{Kind35, kinds_of, kinds35};
     use crate::linear::Ring;
+    use crate::test_file::{decl, header};
     use gguf::Split;
     use gguf::quant::GgmlType::{self, F16, F32, NVFP4, Q4_K, Q6_K, Q8_0};
-    use gguf::write::{Layout, TensorDecl};
+    use gguf::write::TensorDecl;
     use model::arch::coverage::{Q35_DENSE_FFN, qwen35_down, qwen35_gate_up, qwen35_shared};
     use model::arch::models::{Act, Ffn, LayerSpec, Mixer, ModelSpec, OutGate, Residual};
-    use std::path::PathBuf;
-
-    /// `name`, `dims` (`dims[0]` the contiguous axis) at `ty`, as a file header declares it.
-    fn decl(name: String, dims: &[u64], ty: GgmlType) -> TensorDecl {
-        let id = ty.as_u32();
-        let (_, blck, size) = gguf::ggml_type_info(id).expect("a type the table sizes");
-        TensorDecl {
-            name,
-            dims: dims.to_vec(),
-            type_id: id,
-            nbytes: gguf::tensor_bytes(blck, size, dims).expect("a size that fits"),
-        }
-    }
-
-    /// A file's header of `decls` and no weight bytes: all a plan reads.
-    fn header(decls: Vec<TensorDecl>) -> Split {
-        let layout = Layout::new(&[], decls).unwrap_or_else(|e| panic!("{e}"));
-        Split::header_only(PathBuf::from("synthetic.gguf"), &layout)
-            .unwrap_or_else(|e| panic!("{e}"))
-    }
 
     /// Layer `l`'s routed FFN as the file holds it: the pre-FFN norm under `norm`, the stacks of
     /// `n` experts of `ff` values over `h`, the down at `down`, and the shared expert's three

@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/read.rs
++++ b/crates/chain/src/hybrid/read.rs
+@@ -46,7 +46,7 @@
+         d_conv,
+     })
+     .map_err(|e| refuse(e.to_string()))?;
+-    if d_conv != CONV_TAPS {
++    if false {
+         return Err(refuse(format!(
+             "a conv of {d_conv} taps; the scan kernel runs {CONV_TAPS}"
+         )));

@@ -1,0 +1,11 @@
+--- a/crates/chain/src/hybrid/walk.rs
++++ b/crates/chain/src/hybrid/walk.rs
+@@ -77,7 +77,7 @@
+     fn front(&mut self, _: &mut Self::Port, here: At) -> Result<(), O::Error> {
+         let Walk { ops, plans, m } = &mut self.walk;
+         let (step, plan) = at(plans, here.layer, *m)?;
+-        if step.layer == 0 {
++        if step.layer == 1 {
+             ops.embed(*m)?;
+         }
+         layer(*ops, step, plan)
