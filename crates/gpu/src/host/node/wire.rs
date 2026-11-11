@@ -34,6 +34,10 @@ pub enum Tag {
     Census = 1,
     Open = 2,
     Bind = 3,
+    // `Launch` (4) and `Capture` (5) are the retired launch protocol's
+    // requests, their values reserved: a frame of either from a node 0 of
+    // an older build is refused by name ([`super::node::Session::handle`]),
+    // not failed as a frame of a tag the protocol does not know.
     Launch = 4,
     Capture = 5,
     Enqueue = 6,

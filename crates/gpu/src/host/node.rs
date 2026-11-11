@@ -66,17 +66,17 @@ use super::DRAIN_DEADLINE;
 use super::batch::{BlockStaging, dtoh, htod_bytes};
 use super::link::{Peer, TcpPeer};
 use super::slots::HOST;
-use super::step::{Chain, GO_DEADLINE};
+use super::step::GO_DEADLINE;
 use super::tier::{
-    BlockRows, ReplyRows, TIER_CHAINS, TIER_GRACE, TierAct, TierBlock, TierCard, TierExperts,
-    TierLayout, TierSet, TierShape, TierWork, chain_slot,
+    BlockRows, ReplyRows, TIER_GRACE, TierAct, TierBlock, TierCard, TierExperts, TierLayout,
+    TierSet, TierShape, TierWork,
 };
 use crate::fault::{FAULT_NONE, Fault};
 use crate::model::CardBytes;
 use crate::tensor::TIER_ACT_MAX_COLS;
 use crate::upload::bytes_of;
 use crate::weights::{SegmentFile, Weights};
-use crate::words::{WordOps, WordSide};
+use crate::words::WordOps;
 use crate::{Gpu, GpuError, Q8Act};
 use block::{BlockRequest, NodeBlock};
 use cuda_core::PinnedHostBuffer;
@@ -88,9 +88,9 @@ const WHAT: &str = "TierNode";
 /// What the server's errors name.
 const SERVER: &str = "tier_server";
 
-/// How long a request waits for its reply: a step's request launches or
-/// enqueues and returns at once, so a node that has not answered by the go
-/// deadline is lost.
+/// How long a request waits for its reply: a step's frame enqueues a layer
+/// or ends a pass and returns at once, so a node that has not answered by
+/// the go deadline is lost.
 const REPLY: Duration = GO_DEADLINE;
 
 /// The open's bound beyond reading its rows: the card's open and the
@@ -909,52 +909,6 @@ impl NodeOpen {
     }
 }
 
-/// The words a request carries a chain as: 0 the step, 1 the pair, 2 the
-/// quad, `16 + m` a chain of `m` columns.
-const COLS_WORD: u32 = 16;
-
-/// A chain as a request carries it; a column count past the word is
-/// refused by name.
-fn chain_word(c: Chain) -> Result<u32, GpuError> {
-    match c {
-        Chain::Step => Ok(0),
-        Chain::Pair => Ok(1),
-        Chain::Quad => Ok(2),
-        Chain::Cols(m) => u32::try_from(m)
-            .ok()
-            .and_then(|m| m.checked_add(COLS_WORD))
-            .ok_or_else(|| GpuError::shape(WHAT, format!("a chain of {m} columns"))),
-    }
-}
-
-fn chain_of(w: u32) -> Result<Chain, String> {
-    let chain = match w {
-        0 => Chain::Step,
-        1 => Chain::Pair,
-        2 => Chain::Quad,
-        COLS_WORD.. => Chain::Cols((w - COLS_WORD) as usize),
-        _ => return Err(format!("a chain word {w}")),
-    };
-    chain_slot(chain).map_err(|e| e.to_string())?;
-    Ok(chain)
-}
-
-/// A page-word side as a capture's reply carries it.
-fn side_byte(side: WordSide) -> u8 {
-    match side {
-        WordSide::Memop => 0,
-        WordSide::Kernel => 1,
-    }
-}
-
-fn side_of(b: u8) -> Result<WordSide, String> {
-    match b {
-        0 => Ok(WordSide::Memop),
-        1 => Ok(WordSide::Kernel),
-        _ => Err(format!("a page-word side {b}")),
-    }
-}
-
 // ---------------------------------------------------------------- errors
 
 /// The kinds of error a [`Tag::Err`] reply carries, so node 0 raises the
@@ -1170,11 +1124,12 @@ pub(super) fn read_endpoint(i: &mut In<'_>) -> Result<bloomery_verbs::Endpoint, 
 
 // ---------------------------------------------------------------- client
 
-/// Node 0's end of a tier node's channel: each [`TierWork`] step the stage
-/// side asks of the tier is a request, answered once the server has taken
-/// it. A channel that fails, times out or carries what the protocol does
-/// not marks the node lost ([`TierNode::lost`]) and is ended, so a node
-/// that runs again finds node 0's end; every later request fails by name.
+/// Node 0's end of a tier node's channel: a request the stage side asks of
+/// the tier — an open, a bind, a layer's enqueue frame, a pass's end — is
+/// answered once the server has taken it. A channel that fails, times out
+/// or carries what the protocol does not marks the node lost
+/// ([`TierNode::lost`]) and is ended, so a node that runs again finds
+/// node 0's end; every later request fails by name.
 pub struct TierNode {
     addr: SocketAddr,
     ch: Channel,
@@ -1187,11 +1142,6 @@ pub struct TierNode {
     planes: (usize, usize),
     resident_bytes: usize,
     device_bytes: usize,
-    /// Per chain, the nodes of the graph the server holds for it.
-    graphs: [Option<usize>; TIER_CHAINS],
-    /// How the node's card adds to the page's words, as its captures'
-    /// replies name it; `None` before the first.
-    words: Option<WordSide>,
     /// The node's block staging, once its block open made one.
     block: Option<NodeBlock>,
     /// A block request sent whose reply is unread: its slots and the tier
@@ -1281,8 +1231,6 @@ impl TierNode {
             planes: (0, 0),
             resident_bytes: 0,
             device_bytes: 0,
-            graphs: [None; TIER_CHAINS],
-            words: None,
             block: None,
             pending: None,
             frames: PassFrames::default(),
@@ -1596,51 +1544,6 @@ impl TierNode {
         Ok(())
     }
 
-    /// [`TierWork::launch`] on the node.
-    pub(super) fn launch(&mut self, chain: Chain) -> Result<(), GpuError> {
-        let w = chain_word(chain)?;
-        self.req.clear().u32(w);
-        self.ask(Tag::Launch, REPLY, "launch")
-    }
-
-    /// [`TierWork::capture`] on the node: the graph's node count. The reply
-    /// names the node's page-word side after the count; a side other than
-    /// an earlier capture's loses the node.
-    pub(super) fn capture(
-        &mut self,
-        chain: Chain,
-        cols: usize,
-        list: &[(usize, usize)],
-    ) -> Result<usize, GpuError> {
-        let i = chain_slot(chain)?;
-        self.graphs[i] = None;
-        let w = chain_word(chain)?;
-        self.req.clear().u32(w).len(cols).len(list.len());
-        for &(layer, row) in list {
-            self.req.len(layer).len(row);
-        }
-        self.call(Tag::Capture, REPLY, "capture")?;
-        let mut r = In::new(self.ch.body());
-        let reply = (|| {
-            let n = r.len("nodes")?;
-            let side = side_of(r.u8("page-word side")?)?;
-            r.end()?;
-            Ok::<_, String>((n, side))
-        })();
-        let (n, side) = reply.map_err(|e| self.lose_now("capture", e))?;
-        if let Some(was) = self.words.filter(|&was| was != side) {
-            let why = format!(
-                "a page-word side of {} where an earlier capture's was {}",
-                side.word(),
-                was.word()
-            );
-            return Err(self.lose_now("capture", why));
-        }
-        self.words = Some(side);
-        self.graphs[i] = (!list.is_empty()).then_some(n);
-        Ok(n)
-    }
-
     /// [`TierWork::enqueue`] on the node.
     pub(super) fn enqueue(
         &mut self,
@@ -1713,17 +1616,6 @@ impl TierNode {
     pub(super) fn page_layout(&self, tiers: usize) -> Result<TierLayout, GpuError> {
         let (q3, d8) = self.planes;
         TierLayout::with_cols(self.shape, self.cols, q3, d8, tiers)
-    }
-
-    /// Nodes of the graph the server holds in slot `i`; `None` when none.
-    pub(super) fn graph_nodes(&self, i: usize) -> Option<usize> {
-        self.graphs.get(i).copied().flatten()
-    }
-
-    /// The node's page-word side its captures' replies named; `None`
-    /// before the first.
-    pub(super) fn word_side(&self) -> Option<WordSide> {
-        self.words
     }
 
     pub(super) fn resident_bytes(&self) -> usize {
@@ -1849,8 +1741,7 @@ impl Opened {
 
 /// One connection's state: the tier once opened, the layers asked of it,
 /// the pass node 0 holds open, its progress as last seen and when it last
-/// moved, per chain the layers its captured graph serves, and the reply
-/// being written.
+/// moved, and the reply being written.
 struct Session<'a> {
     local_ip: std::net::IpAddr,
     reset_phase: u8,
@@ -1862,7 +1753,6 @@ struct Session<'a> {
     /// the layers of the pass it holds open, 0 between passes.
     pass: u32,
     seen: (u32, Instant),
-    listed: Vec<(u32, u32)>,
     reply: Out,
     /// Given the tier's page-word operations once an open succeeds.
     on_open: &'a mut dyn FnMut(&WordOps),
@@ -1901,7 +1791,6 @@ pub fn serve(
             asked: 0,
             pass: 0,
             seen: (0, Instant::now()),
-            listed: Vec::new(),
             reply: Out::default(),
             on_open: &mut on_open,
         };
@@ -2119,17 +2008,6 @@ impl Session<'_> {
                 self.opened()?.work.reset_remote(phase)?;
                 self.reset_phase = (phase + 1) % 3;
             }
-            Tag::Launch => {
-                let c = i.u32("chain").map_err(bad)?;
-                i.end().map_err(bad)?;
-                let chain = chain_of(c).map_err(bad)?;
-                let Some(&(_, n)) = self.listed.iter().find(|(w, _)| *w == c) else {
-                    return Err(bad(format!("a launch of {chain:?}, which holds no graph")).into());
-                };
-                self.opened()?.work.launch(chain).map_err(Failed::Fatal)?;
-                self.ask(n);
-            }
-            Tag::Capture => self.handle_capture(&mut i, bad)?,
             Tag::Enqueue => {
                 // The frame is the pass's whatever its reply: node 0 counts
                 // it sent.
@@ -2204,6 +2082,13 @@ impl Session<'_> {
                 self.handle_block_open(cap)?;
             }
             Tag::Block => self.handle_block(&mut i, bad)?,
+            Tag::Launch | Tag::Capture => {
+                return Err(bad(format!(
+                    "a {tag:?} frame: the launch protocol is retired; a node 0 of an older \
+                     build sent it"
+                ))
+                .into());
+            }
             Tag::Census | Tag::Close | Tag::Ok | Tag::Err => {
                 return Err(bad("not a request".to_string()).into());
             }
@@ -2367,40 +2252,6 @@ impl Session<'_> {
         Ok(())
     }
 
-    /// A capture request: each service it lists checked, the chain's graph
-    /// captured and listed for its launches, its node count the reply.
-    fn handle_capture(
-        &mut self,
-        i: &mut In<'_>,
-        bad: impl Fn(String) -> GpuError,
-    ) -> Result<(), Failed> {
-        let c = i.u32("chain").map_err(&bad)?;
-        let cols = i.len("columns").map_err(&bad)?;
-        let n = i.len("services").map_err(&bad)?;
-        let mut list = Vec::new();
-        for _ in 0..n {
-            list.push((i.len("layer").map_err(&bad)?, i.len("row").map_err(&bad)?));
-        }
-        i.end().map_err(&bad)?;
-        let chain = chain_of(c).map_err(&bad)?;
-        if cols != chain.cols() {
-            return Err(bad(format!("a {chain:?} capture of {cols} columns")).into());
-        }
-        let len = u32::try_from(list.len()).map_err(|_| bad("a list past u32".into()))?;
-        let o = self.opened()?;
-        for &(layer, row) in &list {
-            o.check_service(layer, row, cols)?;
-        }
-        let nodes = o.work.capture(chain, cols, &list).map_err(Failed::Fatal)?;
-        let side = o.work.word_side();
-        self.listed.retain(|(w, _)| *w != c);
-        if len > 0 {
-            self.listed.push((c, len));
-        }
-        self.reply.len(nodes).u8(side_byte(side));
-        Ok(())
-    }
-
     /// The tier `open` names: its card by name and device, checked against
     /// this process's census ([`Gpu::open_card`]), its segments loaded from
     /// this process's file, which must hold them as node 0's plan does
@@ -2501,15 +2352,14 @@ pub(super) mod tests {
 
     use super::wire::{In, Out, Tag};
     use super::{
-        Failed, NodeCensus, NodeOpen, NodeRow, OPEN_BASE, OPEN_RATE, Session, chain_of, chain_word,
-        open_bound, read_err, side_byte, side_of, write_err,
+        Failed, NodeCensus, NodeOpen, NodeRow, OPEN_BASE, OPEN_RATE, Session, open_bound, read_err,
+        write_err,
     };
     use crate::GpuError;
     use crate::fault::{Fault, FaultSite};
     use crate::host::link::{Peer, TcpPeer};
     use crate::host::step::Chain;
     use crate::host::tier::{ReplyRows, TierAct, TierSet, TierShape};
-    use crate::words::WordSide;
     use gguf::write::{Layout, Writer};
     use gguf::{GgmlType, Split};
     use model::placement::devices::{DeviceId, DeviceInfo};
@@ -2656,7 +2506,6 @@ pub(super) mod tests {
             asked: 0,
             pass: 0,
             seen: (0, Instant::now()),
-            listed: Vec::new(),
             reply: Out::default(),
             on_open: &mut |_| {},
         };
@@ -2698,7 +2547,6 @@ pub(super) mod tests {
             asked: 0,
             pass: 0,
             seen: (0, Instant::now()),
-            listed: Vec::new(),
             reply: Out::default(),
             on_open: &mut |_| {},
         };
@@ -2750,7 +2598,6 @@ pub(super) mod tests {
             asked: 0,
             pass: 0,
             seen: (0, Instant::now()),
-            listed: Vec::new(),
             reply: Out::default(),
             on_open: &mut |_| {},
         };
@@ -2855,8 +2702,6 @@ pub(super) mod tests {
             planes: (0, 0),
             resident_bytes: 0,
             device_bytes: 0,
-            graphs: [None; super::TIER_CHAINS],
-            words: None,
             block: None,
             pending: None,
             frames: super::PassFrames::default(),
@@ -2895,7 +2740,7 @@ pub(super) mod tests {
     /// the node ends by its own rule.
     #[test]
     fn a_pass_that_sent_the_node_a_layer_ends_with_one_end_frame() {
-        use super::{Chain, TierCard, TierSet};
+        use super::{TierCard, TierSet};
 
         let (addr, peer) = loopback_peer();
         let mut card = TierCard::on_node(
@@ -2953,7 +2798,6 @@ pub(super) mod tests {
             asked: 4,
             pass: 0,
             seen: (4, t0),
-            listed: Vec::new(),
             reply: Out::default(),
             on_open: &mut |_| {},
         };
@@ -3010,7 +2854,7 @@ pub(super) mod tests {
     /// frame, so no round trip — and the layer after it still names its own.
     #[test]
     fn a_node_free_layer_sends_no_frame() {
-        use super::{Chain, TierCard, TierSet};
+        use super::{TierCard, TierSet};
 
         let (addr, peer) = loopback_peer();
         let mut card = TierCard::on_node(
@@ -3051,11 +2895,10 @@ pub(super) mod tests {
         );
     }
 
-    /// A census and an open read back as written; every chain's word names
-    /// it back; an error reply reads back as the server's fault (its words
-    /// kept), protocol error or refusal, with its text. A census of another
-    /// version, of no device, of a device with more free bytes than total or
-    /// of one uuid twice is refused.
+    /// A census and an open read back as written; an error reply reads back
+    /// as the server's fault (its words kept), protocol error or refusal,
+    /// with its text. A census of another version, of no device, of a device
+    /// with more free bytes than total or of one uuid twice is refused.
     #[test]
     fn file_bind_payload_carries_its_mode_and_layout() {
         let path = std::path::Path::new("/dev/shm/bloomery-tier-41");
@@ -3347,30 +3190,6 @@ pub(super) mod tests {
                 open.block
             )
         );
-        for c in [
-            Chain::Step,
-            Chain::Pair,
-            Chain::Quad,
-            Chain::Cols(2),
-            Chain::Cols(5),
-            Chain::Cols(model::ops::DEFER_MAX_COLS),
-        ] {
-            assert_eq!(chain_of(chain_word(c).expect("a word")), Ok(c));
-        }
-        assert!(chain_of(3).is_err());
-        for c in [
-            Chain::Cols(0),
-            Chain::Cols(1),
-            Chain::Cols(model::ops::DEFER_MAX_COLS + 1),
-        ] {
-            assert!(chain_of(chain_word(c).expect("a word")).is_err());
-        }
-        assert!(chain_word(Chain::Cols(usize::MAX)).is_err());
-        for side in [WordSide::Memop, WordSide::Kernel] {
-            assert_eq!(side_of(side_byte(side)), Ok(side));
-        }
-        assert!(side_of(2).is_err());
-
         let (path, file) = empty_file("node");
         let mut session = Session {
             local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
@@ -3381,7 +3200,6 @@ pub(super) mod tests {
             asked: 0,
             pass: 0,
             seen: (0, Instant::now()),
-            listed: Vec::new(),
             reply: Out::default(),
             on_open: &mut |_| {},
         };
@@ -3399,22 +3217,14 @@ pub(super) mod tests {
                 panic!("an unknown or incomplete bind must be refused before opening a card");
             };
         }
-        for cols in [1, 4] {
-            let mut o = Out::default();
-            o.u32(20).len(cols).len(1).len(1).len(0);
-            let Err(Failed::Refused(e)) = session.handle(Tag::Capture, o.done()) else {
-                panic!("the capture must be refused before opening a tier");
+        for tag in [Tag::Launch, Tag::Capture] {
+            let Err(Failed::Refused(e)) = session.handle(tag, &[]) else {
+                panic!("a frame of the retired launch protocol must be refused by name");
             };
-            if cols == 1 {
-                assert!(matches!(e, GpuError::Shape { .. }), "{e}");
-                assert!(
-                    e.to_string().contains("a Cols(4) capture of 1 columns"),
-                    "{e}"
-                );
-            } else {
-                assert!(matches!(e, GpuError::State { .. }), "{e}");
-            }
-            assert!(session.listed.is_empty());
+            assert!(
+                e.to_string().contains("the launch protocol is retired"),
+                "{e}"
+            );
         }
         drop(session);
         drop(file);
