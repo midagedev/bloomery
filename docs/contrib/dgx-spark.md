@@ -880,18 +880,19 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    the tier card (`spec_of_device` of the row node 1 sent) before anything loads. Node 1 refuses an open whose rows are
    not the tier's set, then loads the rows of node 0's plan from its own copy of the file, each tensor checked against
    node 0's description and each row's bytes against their sha256 in node 0's file (both nodes hash the tier's rows, not
-   the whole file) captures its graphs from the go order it is sent and launches a replay on a launch message — for
-   the step's per-layer work, not a node tier's, whose layers arrive as one enqueue frame each, named by layer, from
-   the host's own reading of the picks, and never as a captured graph. A pass that sent the node a layer ends with one
-   end frame once node 0 has settled it, or released its waits on a failure that did not name the node's card lost.
+   the whole file). A node tier's layers arrive as one enqueue frame each, named by layer, from the host's own
+   reading of the picks, never as a captured graph: the launch protocol the channel once carried — a capture request
+   a launch frame replayed — is gone, its two tags reserved and a frame of either refused by name. A pass that
+   sent the node a layer ends with one end frame once node 0 has settled it, or released its waits on a failure
+   that did not name the node's card lost.
    `TierCard` keeps the stage side, and its tier side is either a card of this process or a node (`TierWork` is the part
    both run). A shared bind on loopback maps one `/dev/shm` file, created mode 0600 and removed once both ends hold
    it (`Link::across`, `MappedHost::shared_file`). An RDMA bind allocates one page per process and exchanges each
    `RdmaEnd` endpoint through the same Bind request and reply. The control socket's local IPv4 GID selects the RoCE
    port. Each end carries its tier's crossings and holds its own page, queue pair and pump. Reset stops both ends,
-   resets both writers, then both readers, with a control reply between phases. The launch message remains one
-   control round trip per replay. `BLOOMERY_TIER_LINK=loopback` still needs both pages in one process and is refused
-   with a node tier. For file-backed routed assignments, the common open projects its assigned stacks onto
+   resets both writers, then both readers, with a control reply between phases. `BLOOMERY_TIER_LINK=loopback`
+   still needs both pages in one process and is refused with a node tier. For file-backed routed assignments, the
+   common open projects its assigned stacks onto
    node 1's host room through the common NVMe split. Resident GPU assignments keep their device executor without
    a host split. The request scopes the host projection and its arena grant to the node; `Device::Nvme` in the
    projected plan names that node's local drive, not node 0's. A paged tier uses the existing `HostRun` and `NvTier`

@@ -2098,18 +2098,19 @@ impl TierCard {
     }
 
     /// The side the tier's card adds to the page's words on: the work's own
-    /// here, and on a node the side its last capture's reply named; `None`
-    /// on a node before its first capture.
+    /// here; a tier on a node names none — it captures no graph
+    /// ([`TierCard::replay`]).
     #[must_use]
     pub fn word_side(&self) -> Option<WordSide> {
         match &self.side {
             TierSide::Here(w) => Some(w.word_side()),
-            TierSide::Node(n) => n.word_side(),
+            TierSide::Node(_) => None,
         }
     }
 
     /// Nodes of `chain`'s captured tier graph; `None` before its first
-    /// replay captured it, or for a chain the tier does not serve.
+    /// replay captured it, for a chain the tier does not serve, and always
+    /// for a tier on a node, which captures none ([`TierCard::replay`]).
     #[must_use]
     pub fn graph_nodes(&self, chain: Chain) -> Option<usize> {
         self.graph_nodes_at(chain_slot(chain).ok()?)
@@ -2119,7 +2120,7 @@ impl TierCard {
     fn graph_nodes_at(&self, i: usize) -> Option<usize> {
         match &self.side {
             TierSide::Here(w) => w.graph_nodes(i),
-            TierSide::Node(n) => n.graph_nodes(i),
+            TierSide::Node(_) => None,
         }
     }
 
@@ -2242,7 +2243,8 @@ impl TierCard {
         }
         match &mut self.side {
             TierSide::Here(w) => w.launch(chain)?,
-            TierSide::Node(n) => n.launch(chain)?,
+            // A tier on a node took the Pass::Feed return above.
+            TierSide::Node(_) => unreachable!("a node tier never holds a graph"),
         }
         self.issue(list.len());
         self.stats.replays += 1;
@@ -2262,12 +2264,9 @@ impl TierCard {
         let i = chain_slot(chain)?;
         let cols = self.chain_cols(chain)?;
         self.captured[i].clear();
-        if matches!(self.side, TierSide::Node(_)) {
-            return Ok(());
-        }
         match &mut self.side {
             TierSide::Here(w) => w.capture(chain, cols, list)?,
-            TierSide::Node(n) => n.capture(chain, cols, list)?,
+            TierSide::Node(_) => return Ok(()),
         };
         if list.is_empty() {
             return Ok(());
