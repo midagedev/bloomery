@@ -391,6 +391,7 @@ mod tests {
     const READS: &[(&str, &[&str])] = &[
         ("autotune", &[bloomery_levers::AUTOTUNE]),
         ("draft", &[bloomery_levers::DRAFT]),
+        ("draft_word", &[bloomery_levers::DRAFT]),
         ("elastic", &[bloomery_levers::ELASTIC]),
         (
             "host",
