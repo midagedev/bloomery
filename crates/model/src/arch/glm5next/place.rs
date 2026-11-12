@@ -1167,6 +1167,14 @@ impl NextnPlan<'_> {
         nextn_card_bytes(&self.nextn.cards[0])
     }
 
+    /// Bytes the draft holds on the card beside the target's own terms: the
+    /// NextN layer's card bytes and the arena's bound. The target's totals
+    /// leave them out, so the load grows its card count by this reserve.
+    #[must_use]
+    pub fn card_reserve_bytes(&self) -> u64 {
+        self.nextn_card_bytes() + self.arena_bytes
+    }
+
     /// Device bytes the NextN layer's tensors hold, the allocator's
     /// rounding excluded: what its load's uploads sum to.
     #[must_use]
