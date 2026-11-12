@@ -185,7 +185,7 @@ fn the_architecture_rows_read_their_sets_and_refuse_another() {
     let set = |arch: &str| {
         Set(vec![
             (
-                "general.architecture".to_string(),
+                gguf::GENERAL_ARCHITECTURE.to_string(),
                 gguf::Value::String(arch.into()),
             ),
             (format!("{arch}.block_count"), gguf::Value::U32(79)),
