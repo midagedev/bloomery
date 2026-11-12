@@ -39,7 +39,7 @@ const SHARDS: [&[(&str, &[u64])]; 3] = [
 /// One shard of the set: seeded finite F32 tensors, the kimi-k3 header on the first.
 fn write_shard(dir: &Path, i: usize, rng: &mut Rng) {
     let mut kvs: Vec<(String, Value)> = vec![(
-        "general.architecture".to_string(),
+        gguf::GENERAL_ARCHITECTURE.to_string(),
         Value::String("kimi-k3".to_string()),
     )];
     if i == 0 {
