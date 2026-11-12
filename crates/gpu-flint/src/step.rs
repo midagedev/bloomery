@@ -5,6 +5,7 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::host::StepLeg;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::rope_table::RopeRows;
+use bloomery_gpu::routed_block::RouterEntry;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::shared_routed;
@@ -12,15 +13,15 @@ use cuda_core::DeviceBuffer;
 use runtime::layer::{FfnKind, Layer};
 use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
-use crate::body::{Body, FfnBody, StepRows, shape};
+use crate::body::{FfnBody, FlintBody, StepRows, shape};
 
-pub(crate) fn enqueue(
+pub(crate) fn enqueue<R: RouterEntry>(
     gpu: &Gpu,
     w: &Weights,
-    body: &mut Body,
+    body: &mut FlintBody<R>,
     head: &mut Head,
 ) -> Result<(), GpuError> {
-    let Body {
+    let FlintBody {
         shell,
         cfg,
         bindings,
@@ -59,7 +60,7 @@ pub(crate) fn enqueue(
     )
 }
 
-struct Step<'a> {
+struct Step<'a, R: RouterEntry> {
     gpu: &'a Gpu,
     w: &'a Weights,
     cfg: &'a [Layer],
@@ -69,12 +70,12 @@ struct Step<'a> {
     attention: &'a mut Scratch,
     s: &'a mut StepRows,
     rope: &'a RopeRows,
-    ffn: &'a mut FfnBody,
+    ffn: &'a mut FfnBody<R>,
     taps: Option<&'a mut [DeviceBuffer<f32>]>,
     head: &'a mut Head,
 }
 
-impl Step<'_> {
+impl<R: RouterEntry> Step<'_, R> {
     fn tap(&mut self, l: usize) -> Result<(), GpuError> {
         let last = l + 1 == self.cfg.len();
         if let Some(taps) = self.taps.as_deref_mut() {
@@ -89,7 +90,7 @@ impl Step<'_> {
     }
 }
 
-impl<'a> LayerProgram for Step<'a> {
+impl<'a, R: RouterEntry> LayerProgram for Step<'a, R> {
     type Port = StepLeg<'a, HostRun>;
 
     fn begin(&mut self, unit: usize) -> Result<(), GpuError> {

@@ -26,8 +26,9 @@
 //! join, then [`Routed::back_rows`]).
 //!
 //! What a family fixes is its router instance, its [`CardFamily`] (stack names, counts), the loaded arithmetic
-//! facts, and its description: the routed and shared activations ([`rule_of`]), scales and widths
-//! ([`describe`]). Shared and dense block plans are read per layer and support mixed sites, including IQ4_XS.
+//! facts, and its description: the routed and shared activations per layer ([`rule_of`], [`Routed::acts_at`]),
+//! the scales and widths every layer agrees on ([`describe`]). Shared and dense block plans are read per layer
+//! and support mixed sites, including IQ4_XS.
 //! A Q8_0 shared pair runs the clamp alone; a SwiGLU-OAI shared expert on it is refused before launch.
 
 use std::sync::Arc;
@@ -624,8 +625,8 @@ pub struct Routed<R: RouterEntry> {
     /// The router, the handoff and the layers' tensors and slot-map rows.
     route: RouteBlock<R>,
     card: CardExperts,
-    /// The routed experts' and the shared expert's activations.
-    rules: (Act, Act),
+    /// Each routed layer's routed and shared activation; `None` on a dense layer.
+    rules: Vec<Option<(Act, Act)>>,
     /// The shared expert's width.
     shared_ff: usize,
     /// The shared expert's and the dense blocks' `h` row, and their K-quant blocks' buffers, one row at
@@ -670,14 +671,16 @@ pub fn rule_of(what: &str, l: usize, act: ActRule) -> Result<Act, GpuError> {
     }
 }
 
-/// What the description's routed blocks agree on, every layer's the same.
+/// What the description's routed blocks agree on: one scale and one pair of
+/// widths every layer; the activations read per layer (a file may clamp some
+/// layers and not others).
 struct Described {
     /// `expert_weights_scale`.
     scale: f32,
     expert_ff: usize,
     shared_ff: usize,
-    /// The routed experts' and the shared expert's activations.
-    rules: (Act, Act),
+    /// Each layer's routed and shared activation; `None` on a dense layer.
+    rules: Vec<Option<(Act, Act)>>,
 }
 
 /// The description of `layers` as the compiled router, handoff and shared
@@ -686,9 +689,10 @@ struct Described {
 /// Anything else is refused by name with its layer.
 fn describe<R: RouterEntry>(layers: &[LayerSpec]) -> Result<Described, GpuError> {
     let (mut scale, mut expert_ff, mut shared_ff) = (None, None, None);
-    let (mut routed_rule, mut shared_rule) = (None, None);
+    let mut rules = Vec::with_capacity(layers.len());
     for l in 0..layers.len() {
         let Some(m) = moe_of(layers, l) else {
+            rules.push(None);
             continue;
         };
         let Some(shared) = m.shared else {
@@ -737,19 +741,16 @@ fn describe<R: RouterEntry>(layers: &[LayerSpec]) -> Result<Described, GpuError>
             &mut shared_ff,
             shared.ff,
         )?;
-        agreed(WHAT, "the routed rule", l, &mut routed_rule, routed)?;
-        agreed(WHAT, "the shared rule", l, &mut shared_rule, shared_l)?;
+        rules.push(Some((routed, shared_l)));
     }
-    let (Some(scale), Some(expert_ff), Some(shared_ff), Some(routed), Some(shared)) =
-        (scale, expert_ff, shared_ff, routed_rule, shared_rule)
-    else {
-        return Err(GpuError::shape(WHAT, "a description with no layer"));
+    let (Some(scale), Some(expert_ff), Some(shared_ff)) = (scale, expert_ff, shared_ff) else {
+        return Err(GpuError::shape(WHAT, "a description with no routed layer"));
     };
     Ok(Described {
         scale: f32::from_bits(scale),
         expert_ff: expert_ff as usize,
         shared_ff: shared_ff as usize,
-        rules: (routed, shared),
+        rules,
     })
 }
 
@@ -925,6 +926,14 @@ impl<R: RouterEntry> Routed<R> {
     #[must_use]
     pub fn tier(&self) -> Option<&TierSide> {
         self.tier.as_ref().map(|(side, _)| side)
+    }
+
+    /// Layer `l`'s routed experts' and shared expert's activation, one pair each;
+    /// a dense layer and a layer past the description are refused by name.
+    pub fn acts_at(&self, l: usize) -> Result<(Act, Act), GpuError> {
+        self.rules.get(l).copied().flatten().ok_or_else(|| {
+            GpuError::shape(WHAT, format!("layer {l}: a dense block, not a routed one"))
+        })
     }
 
     /// Device bytes of the step's buffers, the card experts' and the kernels'
@@ -1108,9 +1117,21 @@ pub fn front_of<R: RouterEntry>(
         .front_tiered_of((gpu, w), &mut step.route, x1, (hybrid, l, row), side)
 }
 
+/// The block's `limit` under `rule`: the rule's own where it clamps, else 0 —
+/// [`enqueue_block`] alone reads the field, and it always says what its rule
+/// does.
+fn limit_of(rule: Act) -> f32 {
+    match rule {
+        Act::SiluMul | Act::Situ { .. } => 0.0,
+        Act::SwigluClamp { limit }
+        | Act::SwigluOai { limit, .. }
+        | Act::SwigluGateClamp { limit } => limit,
+    }
+}
+
 /// The shared expert's launch of layer `l`: the kernels and the block, whose
-/// width and layer are `(ff, l)`; the block's `limit` is the clamp rule's (0
-/// under another rule, which the launches read from the rule they are given).
+/// width and layer are `(ff, l)`; the block's `limit` is the rule's own
+/// ([`limit_of`]).
 fn shared_launch<'a>(
     k: &'a Kernels,
     layer: &'a LayerFfn,
@@ -1124,10 +1145,7 @@ fn shared_launch<'a>(
         plan: layer.plan,
         names: layer.shared(),
         ff,
-        limit: match rule {
-            Act::SwigluClamp { limit } => limit,
-            _ => 0.0,
-        },
+        limit: limit_of(rule),
         layer: l,
     };
     (kernels, blk)
@@ -1157,14 +1175,15 @@ pub fn shadow_of<R: RouterEntry>(
 ) -> Result<(), GpuError> {
     let layer = layer_of(&r.layers, l)?;
     let stream = gpu.stream();
-    let (kernels, blk) = shared_launch(&r.k, layer, (r.shared_ff, r.rules.1, l));
+    let (routed, shared) = r.acts_at(l)?;
+    let (kernels, blk) = shared_launch(&r.k, layer, (r.shared_ff, shared, l));
     let step = step_row_mut((&mut r.step, &mut r.rows), row)?;
     let io = BlockIo {
         x: boundary.normed(),
         h: &mut r.h,
         y: &mut step.sh_y,
     };
-    enqueue_block_act(gpu, w, &kernels, &mut r.block, (&blk, r.rules.1), io)?;
+    enqueue_block_act(gpu, w, &kernels, &mut r.block, (&blk, shared), io)?;
     if r.k.residual.is_some() {
         span_mut(WHAT, &mut step.x1s, 0, r.d.embd)?
             .copy_from_device_async(&*span(WHAT, x1, 0, r.d.embd)?, stream)?;
@@ -1172,7 +1191,7 @@ pub fn shadow_of<R: RouterEntry>(
         gpu.elem()
             .enqueue_add(stream, x1, &step.sh_y, r.d.embd, &mut step.x1s)?;
     }
-    let rule = r.rules.0;
+    let rule = routed;
     r.route.shadow_of(
         (gpu, w),
         &mut r.card,
@@ -1294,7 +1313,7 @@ pub fn dense<R: RouterEntry>(
         plan: layer.plan,
         names: layer.names.each_ref().map(String::as_str),
         ff: layer.ff,
-        limit: 0.0,
+        limit: limit_of(layer.rule),
         layer: l,
     };
     let norm = w.f32_buf(WHAT, &layer.norm)?;
@@ -1401,10 +1420,10 @@ impl<R: RouterEntry> Routed<R> {
         (l, m): (usize, usize),
         x1: &DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        let (_, shared) = self.acts_at(l)?;
         let Routed {
             layers,
             k,
-            rules,
             shared_ff,
             block,
             batch,
@@ -1414,7 +1433,7 @@ impl<R: RouterEntry> Routed<R> {
         let b = batch.as_mut().ok_or_else(no_batch)?;
         b.check(l, m)?;
         let layer = layer_of(layers, l)?;
-        let (kernels, blk) = shared_launch(k, layer, (*shared_ff, rules.1, l));
+        let (kernels, blk) = shared_launch(k, layer, (*shared_ff, shared, l));
         let n = d.embd;
         if m < GATED_FROM {
             let xs = span(WHAT, &b.normed, 0, m * n)?;
@@ -1424,7 +1443,7 @@ impl<R: RouterEntry> Routed<R> {
                 h: &mut b.h,
                 y: &mut ys,
             };
-            enqueue_block_cols_act(gpu, w, &kernels, block, (&blk, rules.1), m, io)?;
+            enqueue_block_cols_act(gpu, w, &kernels, block, (&blk, shared), m, io)?;
         } else {
             let wide = b.wide.as_mut().ok_or(GpuError::State {
                 what: WHAT,
@@ -1432,7 +1451,7 @@ impl<R: RouterEntry> Routed<R> {
             })?;
             wide.run(
                 (gpu, w, &k.g32),
-                (&blk, rules.1),
+                (&blk, shared),
                 (m, n),
                 (&b.normed, &mut b.sh),
             )?;
@@ -1468,10 +1487,10 @@ impl<R: RouterEntry> Routed<R> {
         (l, m): (usize, usize),
         (land, ring): (&[LandBatch], Option<&RingLayer>),
     ) -> Result<(), GpuError> {
+        let rule = self.acts_at(l)?.0;
         let Routed {
             route,
             card,
-            rules,
             batch,
             k,
             ..
@@ -1481,7 +1500,6 @@ impl<R: RouterEntry> Routed<R> {
         for event in land.iter().filter_map(|lb| lb.event.as_deref()) {
             gpu.stream().wait(event)?;
         }
-        let rule = rules.0;
         let cb = b.card.as_mut();
         let rows = (&b.normed, &b.weights, &b.ids);
         match ring {
@@ -1617,7 +1635,7 @@ impl<R: RouterEntry> Routed<R> {
             plan: layer.plan,
             names: layer.names.each_ref().map(String::as_str),
             ff: layer.ff,
-            limit: 0.0,
+            limit: limit_of(layer.rule),
             layer: l,
         };
         let wide = b.dense_wide.as_mut().ok_or(GpuError::State {

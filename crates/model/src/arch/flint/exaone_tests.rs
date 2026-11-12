@@ -2,9 +2,12 @@
 //! header built from `hf/config.json`'s arrays, read as the `exaone-moe`
 //! description row states it, and the refusals of the facts the row owns.
 
+use super::place::{self, MoeWidths};
 use super::spec::read;
-use crate::arch::synthetic::{V, header_shaped};
+use crate::arch::synthetic::{Ty, V, header_shaped, header_typed};
 use crate::placement::PlacementError;
+use crate::placement::accepts::{Program, program_of};
+use models::shape::{RouterBody, rules};
 use models::{Act, Ffn, Mixer, Need, RopeMode, RouterNorm};
 
 /// The trunk's 78 blocks and the next-token one.
@@ -145,6 +148,39 @@ fn tensors() -> Vec<(String, Vec<u64>)> {
     out
 }
 
+/// The config's window at `l`: full attention on the NoPE blocks, 4096 on
+/// block 1, 128 on the other windowed ones.
+fn want_window(l: usize) -> Option<u32> {
+    if FULL.contains(&l) {
+        None
+    } else if l == 1 {
+        Some(4096)
+    } else {
+        Some(128)
+    }
+}
+
+/// Every tensor of [`tensors`] with the gated blocks' sites (the dense lead's,
+/// the routed stacks' and the shared expert's) in Q8_0: the types the program's
+/// card leg runs, so a plan read admits the file.
+fn plan_typed() -> Vec<(String, Vec<u64>, Ty)> {
+    tensors()
+        .into_iter()
+        .map(|(name, dims)| {
+            let gated = name.ends_with("ffn_gate_exps.weight")
+                || name.ends_with("ffn_up_exps.weight")
+                || name.ends_with("ffn_down_exps.weight")
+                || name.ends_with("ffn_gate.weight")
+                || name.ends_with("ffn_up.weight")
+                || name.ends_with("ffn_down.weight")
+                || name.ends_with("ffn_gate_shexp.weight")
+                || name.ends_with("ffn_up_shexp.weight")
+                || name.ends_with("ffn_down_shexp.weight");
+            (name, dims, if gated { Ty::Q8_0 } else { Ty::F32 })
+        })
+        .collect()
+}
+
 /// The read of a shaped `exaone-moe` header of `kv` and `ts`; the file is removed.
 fn check(
     tag: &str,
@@ -193,15 +229,6 @@ fn the_exaone_header_reads_layer_by_layer() {
     assert_eq!(s.chat.pre, "exaone-moe");
     assert_eq!(s.chat.tools, Some(models::ToolFormat::QwenXml));
     assert_eq!(s.chat.reasoning, Some(models::ReasoningFormat::THINK));
-    let want_window = |l: usize| {
-        if FULL.contains(&l) {
-            None
-        } else if l == 1 {
-            Some(4096)
-        } else {
-            Some(128)
-        }
-    };
     for (l, layer) in s.layers.iter().chain(&s.mtp).enumerate() {
         let Mixer::Gqa(g) = &layer.mixer else {
             panic!("layer {l} not GQA");
@@ -390,6 +417,269 @@ fn an_architecture_no_row_states_is_refused() {
             assert!(detail.contains("no description row"), "{detail}");
         }
         other => panic!("the string is refused, got {other:?}"),
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+/// The composed program accepts the 79-block header: the plan read runs, the
+/// architecture's program is the flint body, and the description's plan values
+/// hold every per-layer fact the body launches by — the widths, the one rope
+/// and the biased 256/top-8 router instance beside the six layers' windows,
+/// rope, dense/routed lead and clamp. Mutants: any of the four reads' checks
+/// dropped, or a coverage row narrowed past a need the header states.
+#[test]
+fn the_composed_program_accepts_the_header_and_prints_its_plan_values() {
+    let path = header_typed(
+        "exaone-plan",
+        "exaone-moe",
+        &keys(),
+        &[
+            ("tokenizer.ggml.pre", V::Str("exaone-moe")),
+            ("tokenizer.chat_template", V::Str(TEMPLATE)),
+        ],
+        &plan_typed(),
+    );
+    let split = gguf::Split::open(&path).unwrap();
+    let inputs = place::PlanInputs::read(&split).expect("the composed program accepts the file");
+    let spec = &inputs.spec;
+    assert_eq!(program_of(spec.arch), Some(Program::FlintBody));
+    assert_eq!(
+        inputs.hp,
+        MoeWidths {
+            experts: 256,
+            used: 8,
+            expert_ff: 2048,
+            shared_ff: 2048,
+        }
+    );
+    assert_eq!(place::rope_of(spec).unwrap(), (1e6, 128));
+    let row = place::router_row_of(spec).unwrap();
+    assert_eq!(
+        (
+            row.body,
+            row.experts,
+            row.top_k_min,
+            row.top_k_max,
+            row.rule == rules::BIASED_SIGMOID
+        ),
+        (RouterBody::BiasedSigmoid, 256, 8, 8, true),
+        "the biased selected-sum 256/top-8 instance"
+    );
+    let clamped = |l: usize| (CLAMP_FROM..TRUNK).contains(&l);
+    let mut printed = String::from("layer window     rope ffn    act\n");
+    for l in [0, 1, 2, 62, 65, 78] {
+        let layer = spec
+            .layers
+            .iter()
+            .chain(&spec.mtp)
+            .nth(l)
+            .unwrap_or_else(|| panic!("layer {l} in the description"));
+        let Mixer::Gqa(g) = &layer.mixer else {
+            panic!("layer {l} not GQA");
+        };
+        let roped = g.rope.mode == RopeMode::Neox;
+        assert_eq!(g.window, want_window(l), "layer {l} window");
+        assert_eq!(
+            (
+                roped,
+                g.rope.base == 1e6,
+                g.rope.dims,
+                g.qk_norm,
+                g.sinks,
+                (g.heads, g.kv_heads, g.head_dim)
+            ),
+            (
+                !FULL.contains(&l),
+                roped,
+                if roped { 128 } else { 0 },
+                true,
+                false,
+                (64, 8, 128)
+            ),
+            "layer {l} attention"
+        );
+        let dense = !(2..TRUNK).contains(&l);
+        let act = if clamped(l) {
+            Act::SwiGluGateFirst { limit: 7.0 }
+        } else {
+            Act::SwiGlu { limit: None }
+        };
+        if dense {
+            assert_eq!(
+                layer.ffn,
+                Ffn::Dense {
+                    ff: 18432,
+                    act: Act::SwiGlu { limit: None },
+                },
+                "layer {l} dense feed-forward"
+            );
+        } else {
+            let Ffn::Moe(m) = &layer.ffn else {
+                panic!("layer {l} routed");
+            };
+            assert_eq!((m.experts, m.top_k, m.expert_ff), (256, 8, 2048));
+            assert_eq!(m.act, act, "layer {l} routed act");
+            assert_eq!(m.shared.as_ref().unwrap().act, act, "layer {l} shared act");
+        }
+        printed.push_str(&format!(
+            "{l:<5} {:<9} {:<4} {:<6} {:?}\n",
+            format!("{:?}", g.window),
+            if roped { "neox" } else { "nope" },
+            if dense { "dense" } else { "routed" },
+            act
+        ));
+    }
+    eprintln!("{printed}");
+    std::fs::remove_file(path).unwrap();
+}
+
+/// Two ropes over the rotating layers are refused by name with both bases: the
+/// body builds one rope table. Mutant: the disagreement check dropped.
+#[test]
+fn two_ropes_over_the_trunk_are_refused_by_name() {
+    let path = header_shaped(
+        "exaone-two-ropes",
+        "exaone-moe",
+        &keys(),
+        &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
+        &tensors(),
+    );
+    let split = gguf::Split::open(&path).unwrap();
+    let mut spec = read(&split).unwrap().spec;
+    let Mixer::Gqa(g) = &mut spec.layers[TRUNK - 2].mixer else {
+        panic!("routed");
+    };
+    g.rope.base = 1e7;
+    match place::rope_of(&spec) {
+        Err(PlacementError::Metadata { key, detail }) => {
+            assert_eq!(key, format!("layer {} rope.freq_base", TRUNK - 2), "{key}");
+            assert!(detail.contains("base 10000000"), "{detail}");
+            assert!(detail.contains("base 1000000"), "{detail}");
+            assert!(detail.contains("one rope table"), "{detail}");
+        }
+        other => panic!("the second rope is refused, got {other:?}"),
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A layer whose router shape no instance serves is refused by name with the
+/// shape's own refusal, and a layer that selects another instance than the
+/// first routed layer's likewise: one body monomorphizes one instance a load.
+/// Mutant: either check dropped.
+#[test]
+fn a_router_no_instance_serves_or_a_second_instance_is_refused() {
+    let path = header_shaped(
+        "exaone-router",
+        "exaone-moe",
+        &keys(),
+        &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
+        &tensors(),
+    );
+    let split = gguf::Split::open(&path).unwrap();
+    let mut spec = read(&split).unwrap().spec;
+    let Ffn::Moe(m) = &mut spec.layers[TRUNK - 2].ffn else {
+        panic!("routed");
+    };
+    m.top_k = 7;
+    match place::router_row_of(&spec) {
+        Err(PlacementError::Metadata { key, detail }) => {
+            assert_eq!(key, format!("layer {} router", TRUNK - 2), "{key}");
+            assert!(detail.contains("keeps 8..=8"), "{detail}");
+        }
+        other => panic!("the unserved shape is refused, got {other:?}"),
+    }
+    let Ffn::Moe(m) = &mut spec.layers[TRUNK - 2].ffn else {
+        panic!("routed");
+    };
+    m.top_k = 6;
+    m.router.norm = models::RouterNorm::SelectedSumFloor;
+    m.router.bias = false;
+    match place::router_row_of(&spec) {
+        Err(PlacementError::Metadata { key, detail }) => {
+            assert_eq!(key, format!("layer {} router", TRUNK - 2), "{key}");
+            assert!(detail.contains("layer 2 selects"), "{detail}");
+            assert!(detail.contains("one router instance"), "{detail}");
+        }
+        other => panic!("the second instance is refused, got {other:?}"),
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A routed width another layer disagrees on is refused by name. Mutant: the
+/// disagreement check dropped (the trunk's one width read from layer 0).
+#[test]
+fn a_routed_width_another_layer_disagrees_on_is_refused() {
+    let path = header_shaped(
+        "exaone-widths",
+        "exaone-moe",
+        &keys(),
+        &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
+        &tensors(),
+    );
+    let split = gguf::Split::open(&path).unwrap();
+    let mut spec = read(&split).unwrap().spec;
+    let Ffn::Moe(m) = &mut spec.layers[TRUNK - 1].ffn else {
+        panic!("routed");
+    };
+    m.expert_ff = 1024;
+    match place::moe_widths(&spec) {
+        Err(PlacementError::Metadata { key, detail }) => {
+            assert_eq!(key, format!("layer {} routed width", TRUNK - 1), "{key}");
+            assert!(detail.contains("one expert count"), "{detail}");
+        }
+        other => panic!("the disagreeing width is refused, got {other:?}"),
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A head width the program's attention binding does not take is an item of the
+/// plan read's refusal: the coverage row holds the head at 128. Mutant: the row
+/// widened past the head (`head: _`).
+#[test]
+fn a_head_width_the_program_does_not_run_is_refused_at_the_plan() {
+    let mut kv = keys();
+    kv.iter_mut()
+        .find(|(k, _)| *k == "attention.key_length")
+        .unwrap()
+        .1 = V::U32(64);
+    kv.iter_mut()
+        .find(|(k, _)| *k == "attention.value_length")
+        .unwrap()
+        .1 = V::U32(64);
+    kv.iter_mut()
+        .find(|(k, _)| *k == "rope.dimension_count")
+        .unwrap()
+        .1 = V::U32(64);
+    let mut ts = plan_typed();
+    for (name, dims, _) in &mut ts {
+        if name.contains("attn_q.weight") {
+            dims[1] = 64 * 64;
+        } else if name.contains("attn_output.weight") {
+            dims[0] = 64 * 64;
+        } else if name.contains("attn_k.weight") || name.contains("attn_v.weight") {
+            dims[1] = 8 * 64;
+        } else if name.ends_with("attn_q_norm.weight") || name.ends_with("attn_k_norm.weight") {
+            dims[0] = 64;
+        }
+    }
+    let path = header_typed(
+        "exaone-head64",
+        "exaone-moe",
+        &kv,
+        &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
+        &ts,
+    );
+    let split = gguf::Split::open(&path).unwrap();
+    match place::PlanInputs::read(&split) {
+        Err(PlacementError::Unimplemented(items)) => {
+            assert!(
+                items
+                    .iter()
+                    .any(|u| u.feature.contains("GQA flash, head 64")),
+                "{items:?}"
+            );
+        }
+        other => panic!("the head-64 file is refused at the plan, got {other:?}"),
     }
     std::fs::remove_file(path).unwrap();
 }
