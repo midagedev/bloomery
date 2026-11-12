@@ -36,6 +36,10 @@ usage:
                          the type of token_embd.weight
   --allow-requantize     quantize a tensor whose source is already a quantized type (MXFP4 included)
   --keep-split           write one output shard per input shard, as llama-quantize does
+  --resume               with --keep-split: a whole output shard an earlier run of this same plan wrote is kept
+                         (not read, not quantized again), a stale .partial is removed and written again, and a whole
+                         file that is not this plan's shard (its length or its header differs) refuses the run by name;
+                         a failure then leaves every whole shard in place
   --plan                 print every tensor's source and target type, bytes in and out, the derived wall and the
                          room needed; write nothing
   --llama-plan TSV       llama-quantize's own --dry-run plan (name TAB type TAB dims TAB bytes): every tensor's type,
@@ -50,8 +54,8 @@ Types are written for F32, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS and the arc
 anything else is refused by name.
 
 exit: 0 done; 1 a refusal, named (a source row that is not finite, an imatrix entry that is unusable, a type this
-quantizer does not write, too little room, a --check or --llama-plan difference); 64 a usage error; 66 a missing
-input file.";
+quantizer does not write, too little room, a whole output shard that is not this plan's under --resume, a --check or
+--llama-plan difference); 64 a usage error; 66 a missing input file.";
 
 /// A Hugging Face checkpoint folder as the input, with what `prepare` takes of one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +96,7 @@ pub struct Args {
     pub token_embedding_type: Option<GgmlType>,
     pub allow_requantize: bool,
     pub keep_split: bool,
+    pub resume: bool,
     pub llama_plan: Option<PathBuf>,
     pub plan: bool,
     pub check: usize,
@@ -129,7 +134,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
     let mut pos = Vec::new();
     let (mut imatrix, mut rules, mut llama_plan) = (None, None, None);
     let (mut out_t, mut emb_t) = (None, None);
-    let (mut allow, mut keep, mut plan, mut cpu) = (false, false, false, false);
+    let (mut allow, mut keep, mut resume, mut plan, mut cpu) = (false, false, false, false, false);
     let (mut check, mut card, mut batch) = (0usize, None, 32usize);
     let (mut hf, mut hf_arch, mut hf_drop, mut hf_gib) = (None, None, Vec::new(), None);
     while let Some(a) = it.next() {
@@ -163,6 +168,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
             "--token-embedding-type" => emb_t = Some(ty(value(&mut it)?)?),
             "--allow-requantize" => allow = true,
             "--keep-split" => keep = true,
+            "--resume" => resume = true,
             "--plan" => plan = true,
             "--cpu" => cpu = true,
             "--check" => {
@@ -232,6 +238,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
             "--check compares the card with the host rule: --cpu is the host rule",
         ));
     }
+    if resume && !keep {
+        return Err(usage(
+            "--resume resumes an output shard at a time: it takes --keep-split (one output file has nothing to resume)",
+        ));
+    }
     let out = match (keep, out.strip_suffix(".gguf")) {
         (true, Some(p)) => p.to_string(),
         _ => out,
@@ -246,6 +257,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
         token_embedding_type: emb_t,
         allow_requantize: allow,
         keep_split: keep,
+        resume,
         llama_plan,
         plan,
         check,
@@ -279,6 +291,7 @@ mod tests {
             "Q4_K",
             "--allow-requantize",
             "--keep-split",
+            "--resume",
             "--check",
             "4",
             "--card",
@@ -298,7 +311,7 @@ mod tests {
         assert_eq!(a.out_dir(), PathBuf::from("out"));
         assert_eq!(a.output_tensor_type, Some(GgmlType::Q6_K));
         assert_eq!(a.token_embedding_type, Some(GgmlType::Q4_K));
-        assert!(a.allow_requantize && a.keep_split);
+        assert!(a.allow_requantize && a.keep_split && a.resume);
     }
 
     #[test]
@@ -369,5 +382,19 @@ mod tests {
         }
         assert!(matches!(run(&["--help"]).unwrap(), Parsed::Help));
         assert!(matches!(run(&["x", "--version"]).unwrap(), Parsed::Version));
+    }
+
+    /// `--resume` goes shard by shard over a split output, so without `--keep-split` it is a usage
+    /// error. Mutant (red at the refusal): the check out of `parse`.
+    #[test]
+    fn resume_without_keep_split_is_a_usage_error() {
+        for bad in [
+            &["in", "out", "q4_k_m", "--resume"][..],
+            &["--hf", "dir", "out", "q8_0", "--resume"],
+        ] {
+            let e = run(bad).unwrap_err();
+            assert_eq!(e.status(), 64, "{bad:?}: {e}");
+            assert!(e.to_string().contains("--keep-split"), "{bad:?}: {e}");
+        }
     }
 }
