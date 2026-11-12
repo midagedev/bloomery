@@ -43,6 +43,12 @@
 # Exit codes: cargo's or the GPU test's own (0 green, 101 a test failed or a build failed, …); 124 or 137 a bound ran
 # out (the build's, named, or the run's); 64 invalid bound or GPU test selection; 78 a filter matched no test that passed.
 # GPU calls also preserve gpu-gate.sh's refusals (2 missing executable, 69 lock-open failure, 75 contention).
+#
+# BLOOMERY_BUILD_ONLY=1 (tools/gate-batch.sh's build lane puts it in an item's box env): the call runs its build phase as
+# above, under the build bound, and ends there with the build's own code; the test phase, the filter check and the GPU replay
+# never start, so the call takes no card and no lock. A --doc call has no build phase (its doctests compile inside the run):
+# it says so and ends 0, and the batch builds such a recipe inline (its rule, tools/gate-batch.sh). 0 or unset runs the test as
+# always; any other value ends 64. tools/gpu-gate.sh reads the same variable and exits 0 before its locks.
 set -uo pipefail
 # Cargo's internal target runner: record its execution context, without running the executable.
 if [ "${1:-}" = --capture-test ]; then
@@ -64,6 +70,11 @@ fi
 source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
 gate_bound gate.sh || exit $?
 gate_build_bound gate.sh || exit $?
+case ${BLOOMERY_BUILD_ONLY:-0} in
+  0 | 1) ;;
+  *) echo "gate.sh: BLOOMERY_BUILD_ONLY is 1 (build, run nothing) or 0/unset, got '$BLOOMERY_BUILD_ONLY'" >&2; exit 64 ;;
+esac
+BUILD_ONLY=${BLOOMERY_BUILD_ONLY:-0}
 # build_bounded <command…>: the build phase under BUILD_BOUND, in this shell (run_bounded's contract); returns its status.
 # The caller ends with it, so a build that ran out or failed never starts the run.
 build_bounded() {
@@ -233,6 +244,7 @@ PY
   # only records the test, and the replay below takes the card lock.
   build_bounded "${RUN[@]}" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} --config "$RUNNER_CONFIG" -- ${ARGS[@]+"${ARGS[@]}"} || exit $?
   [ -z "$BIN_SIGNAL" ] || exit 143
+  [ "$BUILD_ONLY" = 0 ] || exit 0 # the capture runner only recorded the test; the replay takes the card lock
   RUN=(python3 -c '
 import json
 import os
@@ -260,7 +272,10 @@ build_phase() {
   local a build=()
   for a in "$@"; do
     [ "$a" != -- ] || break
-    [ "$a" != --doc ] || return 0
+    if [ "$a" = --doc ]; then
+      [ "$BUILD_ONLY" = 0 ] || echo "gate.sh: BLOOMERY_BUILD_ONLY: a --doc call has no build phase (its doctests compile inside the run): nothing built" >&2
+      return 0
+    fi
     build+=("$a")
   done
   build_bounded "${RUN[@]}" ${build[@]+"${build[@]}"} --no-run || exit $?
@@ -276,6 +291,7 @@ run_tests() {
 }
 if [ "${#FILTERS[@]}" = 0 ] || [ "$LISTING" = 1 ]; then
   build_phase "$@"
+  [ "$BUILD_ONLY" = 0 ] || exit 0
   run_tests
   rc=$?
 else
@@ -300,6 +316,7 @@ else
   TEE_PID=$!
   [ -z "$TEE_EXIT" ] || exit "$TEE_EXIT"
   build_phase "$@"
+  [ "$BUILD_ONLY" = 0 ] || exit 0 # the EXIT trap above ends tee and removes the log
   run_tests > "$LOG.out"
   rc=$?
   wait "$TEE_PID" || { tee_rc=$?; [ "$rc" -ne 0 ] || rc=$tee_rc; }
