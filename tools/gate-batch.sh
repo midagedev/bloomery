@@ -229,21 +229,22 @@
 # nothing.
 # Build lane. A card idles while its own lane compiles, and cargo serialises the compiles on the one build directory anyway, so a third
 # lane — it holds no card and no gate lock — runs each item's BUILD pass ahead of the run lanes: the item's own `just` recipe with
-# BLOOMERY_BUILD_ONLY=1 in its box env, which tools/gate.sh (its build phase under the build bound, then rc 0 or the build's rc) and
-# tools/gpu-gate.sh (rc 0 before any lock, ticket or card) honour. The build queue is in the order the run lanes will take the items,
-# the lane starts first, and a run lane starts an item only once its pass ended: with the next item's pass still running it takes the
-# next queued item whose pass ended (or that builds inline), and waits, a second at a time, only when none is; the chain's order, the
-# claims, the fixed/solo/v41-load rules, the pack's budget, the lease probe and the GPU hold are those of a batch with no build lane. A
-# pass that fails fails its item with the build's rc, `build=failed(<s>s)` on its line and the pass's log in the item's own: the run
-# lane never runs it, and no times row is written. A pass that meets contention (rc 75, rc 83) is no verdict on the build: the item
-# builds in its run lane, as it would without the lane, and its line says why.
+# BLOOMERY_BUILD_ONLY=1 in its box env, which tools/gate.sh (its build phase under the build bound, then rc 0 or the build's rc),
+# tools/gpu-gate.sh (rc 0 before any lock, ticket or card), tools/host-gate.sh (rc 0 once the binary is found) and
+# tools/ptx-spill-check.sh (rc 0 once its tables read and its binaries are found, before any scan) honour. The build queue is in the
+# order the run lanes will take the items, the lane starts first, and a run lane starts an item only once its pass ended: with the next
+# item's pass still running it takes the next queued item whose pass ended (or that builds inline), and waits, a second at a time, only
+# when none is; the chain's order, the claims, the fixed/solo/v41-load rules, the pack's budget, the lease probe and the GPU hold are
+# those of a batch with no build lane. A pass that fails fails its item with the build's rc, `build=failed(<s>s)` on its line and the
+# pass's log in the item's own: the run lane never runs it, and no times row is written. A pass that meets contention (rc 75, rc 83) is
+# no verdict on the build: the item builds in its run lane, as it would without the lane, and its line says why.
 # What is built ahead is derived from the recipe text, never listed: a recipe whose every box command is a chain of `&&` steps that are
 # a cargo build (`cargo build`, `cargo oxide build`), a call of a script that reads BLOOMERY_BUILD_ONLY (a runner with a build-only form:
-# tools/gate.sh and tools/gpu-gate.sh; a `--doc` call has no build phase, its doctests compile inside its run), a tier guard
-# (tools/ref/{real-only,fixture-only,needs-env}.sh) or an environment assignment. Any other recipe builds inline in its run lane, and
-# its line says `build=inline <why>` — the first step that is not a build: a script with no build-only form, a step outside the box
-# command, shell control flow or a substitution, a shebang recipe, a box call the rule cannot read, no box command at all. The plan names
-# each inline item and the dry run counts the reasons.
+# tools/gate.sh, tools/gpu-gate.sh, tools/host-gate.sh and tools/ptx-spill-check.sh; a `--doc` call has no build phase, its doctests
+# compile inside its run), a tier guard (tools/ref/{real-only,fixture-only,needs-env}.sh) or an environment assignment. Any other recipe
+# builds inline in its run lane, and its line says `build=inline <why>` — the first step that is not a build: a script with no build-only
+# form, a step outside the box command, shell control flow or a substitution, a shebang recipe, a box call the rule cannot read, no box
+# command at all. The plan names each inline item and the dry run counts the reasons.
 # The seconds: an item line's `<s>s` is its run pass, `build=<s>s` its build pass (the lane's, or `build=inline …`), and its times row is
 # their sum, so a row means what it meant without the lane. The build pass's own seconds go to ${TIMES_FILE%.tsv}-build.tsv (lane L, the
 # same five columns; the median of the item's last 5 is the build the plan subtracts from the item's run estimate, so an item with no
@@ -4580,7 +4581,14 @@ bl-decl:
 
 bl-hold:
     ./tools/box.sh 'bash tools/gpu-gate.sh gen_blh'
+
+bl-hostgate:
+    ./tools/box.sh 'cargo build --release -p x --bin gen_hg && bash tools/host-gate.sh gen_hg'
+
+bl-spill:
+    ./tools/box.sh 'cargo build --release -p x --bin gen_sp && cargo build --release -p x --bin oxart_ptx && bash tools/ptx-spill-check.sh tools/ref/ptx-shapes.tsv gen_sp'
 JF
+  cp "$(dirname "$self")/host-gate.sh" "$(dirname "$self")/ptx-spill-check.sh" "$t/tools/"
   sed -e 's/^REAP_TICKS=50 /REAP_TICKS=5 /' "$t/tools/gate-batch-bl.sh" > "$t/tools/gate-batch-bl-fast.sh"
   grep -q '^REAP_TICKS=5 ' "$t/tools/gate-batch-bl-fast.sh" || { echo "gate-batch: self-test: the fast-reap copy of the shipped script did not patch (REAP_TICKS's line moved?)" >&2; return 70; }
   printf '%s\n' '#!/usr/bin/env bash' 'echo "a runner that ends before its test when BLOOMERY_BUILD_ONLY=1"' > "$t/tools/bl-ok.sh"
@@ -4653,6 +4661,29 @@ JF
   out=$(BLOOMERY_GATE_TIMES=$t/times.tsv bash "$t/tools/gate-batch-bl-nodecl.sh" --dry-run steal-fix bl-inline bl-loop bl-nodecl bl-decl 2>&1) || true
   if grep -Eq '^gate-batch: build lane: 0 item\(s\) built ahead' <<< "$out"; then pass 'build lane mutant: with no reading of the script, the runners themselves would build inline'
   else fail 'build lane mutant: with no reading of the script, the runners themselves would build inline' "$(grep '^gate-batch: build lane' <<< "$out")"; fi
+  # (c') The two runners that gained the build-only form after the lane (tools/host-gate.sh, tools/ptx-spill-check.sh, as shipped) are
+  # built ahead by the same reading of their text; a copy of either without the form is named inline, and so is the reading's mutant.
+  out=$(BLOOMERY_GATE_TIMES=$t/times.tsv bash "$t/tools/gate-batch-bl.sh" --dry-run bl-hostgate bl-spill 2>&1) || fail 'build lane: the dry run of the two runners failed' "$out"
+  if grep -Eq '^gate-batch: build lane: 2 item\(s\) built ahead of their runs, .* 0 item\(s\) build inline in their run lane;' <<< "$out" && ! grep -q 'builds inline in its run lane' <<< "$out"; then pass 'build lane: host-gate.sh and ptx-spill-check.sh are runners with a build-only form: both items are built ahead, none inline'
+  else fail 'build lane: host-gate.sh and ptx-spill-check.sh are runners with a build-only form: both items are built ahead, none inline' "$(grep -E '^gate-batch: build lane|builds inline' <<< "$out")"; fi
+  mkdir -p "$t/tools-nobo"
+  for rn in host-gate.sh ptx-spill-check.sh; do
+    sed '/^case \${BLOOMERY_BUILD_ONLY:-0} in$/,/^esac$/d; s/BUILD_ONLY/BUILD_NEVER/g' "$(dirname "$self")/$rn" > "$t/tools-nobo/$rn"
+  done
+  n=$((n + 1))
+  if ! grep -q 'BLOOMERY_BUILD_ONLY' "$t/tools-nobo/host-gate.sh" "$t/tools-nobo/ptx-spill-check.sh" && grep -q 'BLOOMERY_BUILD_ONLY' "$(dirname "$self")/host-gate.sh" "$(dirname "$self")/ptx-spill-check.sh"; then echo "mutant bl-noform: the build-only form is removed from copies of the two runners"
+  else bad=$((bad + 1)); echo "FAIL mutant bl-noform: a copy of a runner still reads the variable, or the shipped one does not"; fi
+  note_case 'mutant bl-noform'
+  mkdir -p "$t/tools-keep"
+  mv "$t/tools/host-gate.sh" "$t/tools/ptx-spill-check.sh" "$t/tools-keep/"
+  cp "$t/tools-nobo/host-gate.sh" "$t/tools-nobo/ptx-spill-check.sh" "$t/tools/"
+  out=$(BLOOMERY_GATE_TIMES=$t/times.tsv bash "$t/tools/gate-batch-bl.sh" --dry-run bl-hostgate bl-spill 2>&1) || true
+  if grep -Eq '^gate-batch: build lane: 0 item\(s\) built ahead of their runs, .* 2 item\(s\) build inline in their run lane \(' <<< "$out" && grep -q 'tools/host-gate.sh (it does not read BLOOMERY_BUILD_ONLY' <<< "$out" && grep -q 'tools/ptx-spill-check.sh (it does not read BLOOMERY_BUILD_ONLY' <<< "$out"; then pass 'build lane mutant: a runner whose text lacks the build-only form is named inline with its script'
+  else fail 'build lane mutant: a runner whose text lacks the build-only form is named inline with its script' "$(grep -E '^gate-batch: build lane|builds inline' <<< "$out")"; fi
+  mv "$t/tools-keep/host-gate.sh" "$t/tools-keep/ptx-spill-check.sh" "$t/tools/"
+  out=$(BLOOMERY_GATE_TIMES=$t/times.tsv bash "$t/tools/gate-batch-bl-nodecl.sh" --dry-run bl-hostgate bl-spill 2>&1) || true
+  if grep -Eq '^gate-batch: build lane: 0 item\(s\) built ahead of their runs, .* 2 item\(s\) build inline in their run lane \(' <<< "$out" && grep -q 'tools/host-gate.sh (it does not read BLOOMERY_BUILD_ONLY' <<< "$out" && grep -q 'tools/ptx-spill-check.sh (it does not read BLOOMERY_BUILD_ONLY' <<< "$out"; then pass 'build lane mutant: with no reading of the script, both runners are named inline'
+  else fail 'build lane mutant: with no reading of the script, both runners are named inline' "$(grep -E '^gate-batch: build lane|builds inline' <<< "$out")"; fi
   # (c'') Items the lane cannot build ahead say so at the run, once the batch runs them (the line, and no build call).
   rc=$(BL=1 steal_case bl-nodecl "steal-fix	A	3090	10	$d" "bl-nodecl	B	a6000	10	$d" -- steal-fix bl-nodecl)
   printf '%s' "$rc" > "$t/rc-bl-nodecl"
@@ -4815,6 +4846,34 @@ GOLD
   note_case 'mutant gs-norun'
   if [ "$(GATE_SH=$t/gtools/gate-mut.sh gate_stub BLOOMERY_BUILD_ONLY=1 -- -p x)" = '0|test -p x --no-run,test -p x,' ]; then pass 'gate.sh mutant: without the short-circuit the stub test phase is reached'
   else fail 'gate.sh mutant: without the short-circuit the stub test phase is reached' "$(GATE_SH=$t/gtools/gate-mut.sh gate_stub BLOOMERY_BUILD_ONLY=1 -- -p x)"; fi
+  # tools/host-gate.sh's build-only mode against a stub binary: the call ends 0 once the binary is found, and the binary never runs.
+  cp "$(dirname "$self")/host-gate.sh" "$t/gtools/"
+  mkdir -p "$t/hroot/target/release"
+  printf '%s\n' '#!/bin/sh' 'echo "ran $*" >> "$STUB_LOG"' 'exit "${STUB_RC:-0}"' > "$t/hroot/target/release/hgbin"
+  chmod +x "$t/hroot/target/release/hgbin"
+  hg_stub() { # <env assignments…> -- <host-gate.sh args…>: the stub binary's runs of one host-gate.sh call, then its rc
+    local genv=() rch=0
+    while [ "$1" != -- ]; do genv+=("$1"); shift; done
+    shift
+    : > "$t/stub.log"
+    (cd "$t/hroot" && env STUB_LOG="$t/stub.log" ${genv[@]+"${genv[@]}"} bash "${HOST_GATE_SH:-$t/gtools/host-gate.sh}" "$@" > "$t/hg-stub.out" 2>&1) || rch=$?
+    printf '%s|%s' "$rch" "$(tr '\n' ',' < "$t/stub.log")"
+  }
+  if [ "$(hg_stub BLOOMERY_BUILD_ONLY=1 STUB_RC=1 -- hgbin a b)" = '0|' ] && grep -q 'BLOOMERY_BUILD_ONLY: ./target/release/hgbin is built; nothing runs' "$t/hg-stub.out"; then pass 'host-gate.sh build-only: the binary is found, never runs (a red one included), rc 0'
+  else fail 'host-gate.sh build-only: the binary is found, never runs (a red one included), rc 0' "$(hg_stub BLOOMERY_BUILD_ONLY=1 STUB_RC=1 -- hgbin a b) $(cat "$t/hg-stub.out")"; fi
+  if [ "$(hg_stub BLOOMERY_BUILD_ONLY=1 -- nosuch | cut -d'|' -f1)" = 2 ] && grep -q 'host-gate.sh: no ./target/release/nosuch' "$t/hg-stub.out"; then pass 'host-gate.sh build-only: a binary the recipe did not build is named first, rc 2'
+  else fail 'host-gate.sh build-only: a binary the recipe did not build is named first, rc 2' "$(cat "$t/hg-stub.out")"; fi
+  if [ "$(hg_stub BLOOMERY_BUILD_ONLY=7 -- hgbin | cut -d'|' -f1)" = 64 ] && grep -q "BLOOMERY_BUILD_ONLY is 1 .* got '7'" "$t/hg-stub.out"; then pass 'host-gate.sh build-only: any other value ends 64 before the binary runs'
+  else fail 'host-gate.sh build-only: any other value ends 64 before the binary runs' "$(hg_stub BLOOMERY_BUILD_ONLY=7 -- hgbin) $(cat "$t/hg-stub.out")"; fi
+  if [ "$(hg_stub BLOOMERY_BUILD_ONLY=0 -- hgbin x)" = '0|ran x,' ] && [ "$(hg_stub -- hgbin y)" = '0|ran y,' ]; then pass 'host-gate.sh build-only: 0 and unset run the binary as ever'
+  else fail 'host-gate.sh build-only: 0 and unset run the binary as ever' "$(hg_stub BLOOMERY_BUILD_ONLY=0 -- hgbin x) $(hg_stub -- hgbin y)"; fi
+  sed '/^case \${BLOOMERY_BUILD_ONLY:-0} in$/,/^esac$/d' "$t/gtools/host-gate.sh" > "$t/gtools/host-gate-mut.sh"
+  n=$((n + 1))
+  if [ "$(grep -c '^case \${BLOOMERY_BUILD_ONLY:-0} in$' "$t/gtools/host-gate.sh")" = 1 ] && [ "$(grep -c 'BLOOMERY_BUILD_ONLY: \$EXE is built' "$t/gtools/host-gate-mut.sh")" = 0 ]; then echo "mutant hg-norun: the build-only case of host-gate.sh removed"
+  else bad=$((bad + 1)); echo "FAIL mutant hg-norun: the sed did not remove the build-only case"; fi
+  note_case 'mutant hg-norun'
+  if [ "$(HOST_GATE_SH=$t/gtools/host-gate-mut.sh hg_stub BLOOMERY_BUILD_ONLY=1 -- hgbin a b)" = '0|ran a b,' ]; then pass 'host-gate.sh mutant: without the short-circuit the stub binary runs'
+  else fail 'host-gate.sh mutant: without the short-circuit the stub binary runs' "$(HOST_GATE_SH=$t/gtools/host-gate-mut.sh hg_stub BLOOMERY_BUILD_ONLY=1 -- hgbin a b)"; fi
   fi
   # One row per case (seconds, then the name). A miss is a case the summary cannot name.
   [ -f "$t/case-times.tsv" ] || : > "$t/case-times.tsv"
@@ -5550,8 +5609,9 @@ def bounded_calls(name):
 
 # The build lane's rule (the header's «Build lane»): a recipe's build is done ahead of its run only when the build-only form of its box
 # command does nothing but build — every `&&` segment of every box command is a cargo build, a call of a script that reads
-# BLOOMERY_BUILD_ONLY (tools/gate.sh and tools/gpu-gate.sh: each ends 0 after its build, before any lock; the script's own text is the
-# declaration, so a runner that gains the short-circuit joins with no list to edit), one of the tier guards, or an environment
+# BLOOMERY_BUILD_ONLY (tools/gate.sh, tools/gpu-gate.sh, tools/host-gate.sh and tools/ptx-spill-check.sh: each ends 0 after its build,
+# before any lock or scan; the script's own text is the declaration, so a runner that gains the short-circuit joins with no list to
+# edit), one of the tier guards, or an environment
 # assignment. Any other step (a script that does not read it, a copy, a check, a runner with no build-only form) would run twice, or
 # race another item's, so the recipe builds inline in its run lane, named with that step. A recipe with no box command is the Mac's
 # and builds nothing on the box.

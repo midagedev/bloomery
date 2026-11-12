@@ -13,6 +13,9 @@
 # Exit code: the binary's. 124 = ended by TERM at the bound, 137 = ignored TERM and ended by
 # --kill-after's KILL, 64 = usage, 2 = no binary.
 # Environment: BLOOMERY_GATE_BOUND (seconds, default 900 — the lever of tools/gate.sh and gpu-gate.sh).
+# BLOOMERY_BUILD_ONLY=1 (tools/gate-batch.sh's build lane puts it in an item's box env; tools/gate.sh and tools/gpu-gate.sh read the
+# same variable): the recipe's build ran before this call, so the call ends 0 once the binary is found, before it runs. 0 or unset
+# runs the gate as always; any other value ends 64.
 set -uo pipefail
 NAME=${1:-}
 [ -n "$NAME" ] || { echo "usage: host-gate.sh <target/release binary> [args...]" >&2; exit 64; }
@@ -22,6 +25,11 @@ source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
 gate_bound host-gate.sh || exit $?
 EXE=./target/release/$NAME
 [ -x "$EXE" ] || { echo "host-gate.sh: no $EXE — the recipe builds it before calling this" >&2; exit 2; }
+case ${BLOOMERY_BUILD_ONLY:-0} in
+  0) ;;
+  1) echo "host-gate.sh: BLOOMERY_BUILD_ONLY: $EXE is built; nothing runs"; exit 0 ;;
+  *) echo "host-gate.sh: BLOOMERY_BUILD_ONLY is 1 (build, run nothing) or 0/unset, got '$BLOOMERY_BUILD_ONLY'" >&2; exit 64 ;;
+esac
 run_bounded timeout --kill-after=10 "$BOUND" "$EXE" "$@"
 rc=$?
 if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
