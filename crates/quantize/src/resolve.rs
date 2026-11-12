@@ -1,5 +1,6 @@
 //! Which type each tensor gets: llama-quantize's `llama_tensor_get_type` (`src/llama-quant.cpp`) for the
-//! file types `k31-quant.sh` runs and the Kimi K3 architecture, step for step, with its running counters.
+//! file types `k31-quant.sh` runs and the architectures [`ARCHS`] names, step for step, with its running
+//! counters.
 //!
 //! Only the branches those reach are ported; a file type, an architecture or a result type outside them is refused
 //! by name, never typed some other way. The counters (`i_attention_wv`, `i_ffn_down`, …) move only when the
@@ -11,8 +12,28 @@ use crate::source::Source;
 use crate::{Error, Result};
 use gguf::quant::GgmlType;
 
-/// The architecture the type logic is ported for.
-pub const ARCH: &str = "kimi-k3";
+/// The architectures the type logic is ported for, each under the lines of `llama-quant.cpp`
+/// that show the ported branches are the whole logic for a set of it: none of the branches keyed
+/// to an architecture (`tensor_allows_quantization`'s rows at `:337-410`,
+/// `llama_tensor_get_type_impl`'s at `:534-573`, FALCON's at `:574,705-740`) applies to a set of
+/// the row beyond what the port already carries, and a tensor that reaches a branch the port
+/// does not (an `n_expert` below four's head-count ratio under an IQ type, the first eighth of
+/// `ffn_down` under one) is refused by name.
+pub const ARCHS: &[(&str, &str)] = &[
+    (
+        "kimi-k3",
+        "the KIMI_K31 exclusions (`llama-quant.cpp:375-380`) name the indexer tensors the \
+         pipeline drops at prepare (`tools/ref/k31-quant.sh`), and a prepared set holds no tensor \
+         the GLM5_NEXT rows (`:382-400`, `:534-551`) name",
+    ),
+    (
+        "exaone-moe",
+        "no branch of `llama-quant.cpp` names it, and none needs one: `exp_probs_b.bias` fails \
+         the `weight` ending, the `nextn` and `*_norm` tensors the norm rule, the next-token \
+         block (`blk.<layers>.`) is a block like any other, and its `nextn.eh_proj` takes the \
+         standard logic — the Q8_0 floor of it is glm5-next's alone (`:534-551`)",
+    ),
+];
 
 /// The file types the logic is ported for (`llama_ftype`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,12 +122,15 @@ pub struct Model {
 }
 
 impl Model {
-    /// From the first shard's metadata; an architecture other than [`ARCH`] is refused.
+    /// From the first shard's metadata; an architecture no row of [`ARCHS`] names is refused
+    /// naming the rows.
     pub fn read(set: &dyn Source) -> Result<Model> {
         let arch = set.architecture().unwrap_or("");
-        if arch != ARCH {
+        if !ARCHS.iter().any(|&(name, _)| name == arch) {
+            let names: Vec<&str> = ARCHS.iter().map(|&(name, _)| name).collect();
             return Err(Error::refused(format!(
-                "architecture {arch:?}: the type logic is ported for {ARCH:?} only"
+                "architecture {arch:?}: the type logic is ported for {} only",
+                names.join(", ")
             )));
         }
         let get = |suffix: &str| {
@@ -196,7 +220,8 @@ fn is_attn_v(c: Category) -> bool {
     )
 }
 
-/// `tensor_allows_quantization`, as it reads for [`ARCH`] with `quantize_output_tensor` on and no `only_copy`.
+/// `tensor_allows_quantization`, as it reads with `quantize_output_tensor` on and no `only_copy`: the
+/// arch-free checks every [`ARCHS`] set needs, no row of another architecture's own.
 fn allows_quantization(name: &str, dims: &[u64]) -> bool {
     let n_dims = dims
         .iter()
