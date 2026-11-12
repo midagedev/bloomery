@@ -99,6 +99,12 @@ pub enum Arch {
     /// Flint: dense lead, sigmoid MoE with one shared MLP, and independently
     /// masked sliding attention and RoPE. No executable program is registered.
     Flint,
+    /// K-EXAONE's `exaone-moe`: GQA layers with per-layer windows (full, or one of
+    /// the file's sliding widths) and rope only where a layer is windowed, a dense
+    /// lead, sigmoid MoE with one shared MLP and a gate-first SwiGLU clamp on the
+    /// last layers, and one next-token layer the file carries. No executable
+    /// program is registered.
+    ExaoneMoe,
     /// Muse Spark: GQA layers whose sliding half ropes and full half does not, all of them routed
     /// in a latent, no dense layer.
     MuseSpark,
@@ -145,6 +151,7 @@ impl Arch {
             Arch::GemmaEmbedding => "gemma-embedding",
             Arch::GemmaEmbedding2 => "gemma-embedding2",
             Arch::Flint => "flint",
+            Arch::ExaoneMoe => "exaone-moe",
             Arch::MuseSpark => "muse-spark",
             Arch::Llama => "llama",
             Arch::Qwen3 => "qwen3",
@@ -736,6 +743,10 @@ pub enum Act {
     /// `None`: `silu(g)·u`. `Some(L)`: `min(silu(g), L)·clamp(u, ±L)`; an `L`
     /// of at most 1e-6 clamps nothing.
     SwiGlu { limit: Option<f32> },
+    /// `silu(min(g, L))·clamp(u, ±L)`: the gate is clamped from above before the
+    /// activation, the up path on both sides (ggml's `ggml_swiglu_clamp`); an `L`
+    /// of at most 1e-6 clamps nothing.
+    SwiGluGateFirst { limit: f32 },
     /// `relu(x)^2`, with no gate.
     ReluSqr,
     /// `gelu(g)·u`, GELU in its tanh form.
@@ -755,6 +766,7 @@ impl Act {
     pub fn what(self) -> &'static str {
         match self {
             Act::SwiGlu { .. } => "SwiGLU",
+            Act::SwiGluGateFirst { .. } => "gate-first SwiGLU",
             Act::ReluSqr => "squared ReLU",
             Act::GeGlu => "GELU GLU",
             Act::SwigluOai { .. } => "swigluoai",
@@ -1292,6 +1304,14 @@ mod tests {
             limit: 7.0,
         }
         .swiglu_limit();
+    }
+
+    /// The gate-first clamp clamps before the activation, so it is not the SwiGLU clamp
+    /// `swiglu_limit` hands a combine kernel: the caller is refused by the activation's name.
+    #[test]
+    #[should_panic(expected = "gate-first SwiGLU has no SwiGLU clamp")]
+    fn swiglu_limit_on_gate_first_names_the_activation() {
+        let _ = Act::SwiGluGateFirst { limit: 7.0 }.swiglu_limit();
     }
 
     /// A squared ReLU has no SwiGLU clamp. Calling the clamp on it is the

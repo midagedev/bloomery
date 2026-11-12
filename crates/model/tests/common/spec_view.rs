@@ -43,6 +43,7 @@ fn rope(r: &Rope) -> String {
 fn act(a: &Act) -> String {
     match a {
         Act::SwiGlu { limit } => format!("swiglu {limit:?}"),
+        Act::SwiGluGateFirst { limit } => format!("swiglu gate-first {limit}"),
         Act::ReluSqr => "relusqr".to_string(),
         Act::GeGlu => "geglu".to_string(),
         Act::SwigluOai { alpha, limit } => format!("swigluoai {alpha}/{limit}"),

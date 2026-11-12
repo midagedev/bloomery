@@ -378,6 +378,16 @@ pub static ROWS: &[ArchRow] = &[
         fixture: None,
     },
     ArchRow {
+        // K-EXAONE's exaone-moe: the same reader as flint's, every fact the
+        // file's keys do not state from its description row (`arch::rules`).
+        arch: Some(Arch::ExaoneMoe),
+        names: &["exaone-moe"],
+        read: Some(flint::spec::read),
+        draft: None,
+        coverage: None,
+        fixture: None,
+    },
+    ArchRow {
         arch: Some(Arch::MuseSpark),
         names: &["muse-spark"],
         read: Some(musespark::spec::read),
@@ -577,6 +587,7 @@ mod tests {
             "nemotron_h_moe" => nemotron_h_moe::spec::read,
             GEMMA_EMBEDDING => gemma_embedding::spec::read,
             GEMMA_EMBEDDING2 => gemma_embedding2::spec::read,
+            "flint" | "exaone-moe" => flint::spec::read,
             "muse-spark" => musespark::spec::read,
             "mistral-large4" => mistrallarge4::spec::read,
             "kimi-k3" | "kimi-k31" => kimi_k3::spec::read,
@@ -624,6 +635,7 @@ mod tests {
             Arch::GemmaEmbedding,
             Arch::GemmaEmbedding2,
             Arch::Flint,
+            Arch::ExaoneMoe,
             Arch::MuseSpark,
             Arch::MistralLarge4,
             Arch::KimiK3,

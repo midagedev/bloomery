@@ -107,6 +107,8 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::MuseSpark => Some(Program::MuseSparkBody),
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
         Arch::KimiK3 => Some(Program::KimiK3Body),
+        // No program composes exaone-moe yet.
+        Arch::ExaoneMoe => None,
         Arch::Lfm3 => None,
     }
 }

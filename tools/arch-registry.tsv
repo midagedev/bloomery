@@ -19,6 +19,7 @@ nemotron_h_moe	NemotronHMoe	yes	no	nemotron-bolt
 gemma-embedding	GemmaEmbedding	yes	no	-
 gemma-embedding2	GemmaEmbedding2	yes	no	-
 flint	Flint	yes	no	-
+exaone-moe	ExaoneMoe	yes	no	-
 muse-spark	MuseSpark	yes	no	musespark
 mistral-large4	MistralLarge4	yes	no	mistrallarge4-e128
 kimi-k3,kimi-k31	KimiK3	yes	no	kimik3
