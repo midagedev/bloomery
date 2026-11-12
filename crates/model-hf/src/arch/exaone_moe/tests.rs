@@ -960,7 +960,7 @@ fn the_real_shape_derives_its_stored_table_and_plans() {
 #[test]
 fn the_toy_folder_opens_as_the_quantizer_s_source() {
     let dir = temp_dir("exaone-source");
-    write_folder(&dir, &toy_bytes(), &toy_config(), &tokenizer("qwen2"));
+    write_folder(&dir, &toy_bytes(), &toy_config(), &tokenizer("exaone-moe"));
     let input = quantize::cli::HfInput {
         dir: dir.clone(),
         arch: None,
@@ -1019,6 +1019,118 @@ fn toy_bytes() -> Vec<(String, &'static str, Vec<usize>, Vec<u8>)> {
         .collect()
 }
 
+/// The join: the header the map writes for the toy folder is read by the registry's reader (the
+/// row `exaone-moe` names, the flint one) into the per-layer description the reader's own tests
+/// pin — the windows and the rope exactly where windowed, the dense lead, the clamp act on the
+/// routed and the shared experts, the biased sigmoid router, the MTP block in `spec.mtp` with
+/// its nextn tensors — beside the tokenizer keys the folder's files give it: `pre` the pinned
+/// `exaone-moe` row and the chat template the folder's jinja file spells. Mutant (red at the
+/// layer-1 window): the map's window array entry of the wide window narrowed.
+#[test]
+fn the_map_s_header_reads_through_the_registry() {
+    let dir = temp_dir("exaone-join");
+    write_folder(&dir, &toy_bytes(), &toy_config(), &tokenizer("exaone-moe"));
+    let template = "<|assistant|>\n<tool_call>\n<function=name>\n</function>\n</tool_call>\n";
+    std::fs::write(dir.join("chat_template.jinja"), template).unwrap();
+    let opened = crate::folder::open(&dir).unwrap();
+    let read = model::arch::registry::row_of(ARCHITECTURE)
+        .and_then(|row| row.read)
+        .expect("the exaone-moe row holds a reader")(&opened.header)
+    .unwrap();
+    let s = &read.spec;
+    assert_eq!(s.arch, model::arch::models::Arch::ExaoneMoe);
+    assert_eq!(
+        (s.hidden, s.vocab, s.ctx_train),
+        (E as u32, VOCAB as u32, 4096)
+    );
+    assert_eq!(s.layers.len(), LAYERS);
+    assert_eq!(s.mtp.len(), 1);
+    assert_eq!(s.chat.pre, "exaone-moe");
+    assert_eq!(
+        opened.header.value("tokenizer.chat_template"),
+        Some(&Value::String(template.into()))
+    );
+    let want_window = [None, Some(4096), Some(128), None, Some(128)];
+    for (l, layer) in s.layers.iter().chain(&s.mtp).enumerate() {
+        let model::arch::models::Mixer::Gqa(g) = &layer.mixer else {
+            panic!("layer {l} not GQA");
+        };
+        assert_eq!(
+            (g.heads, g.kv_heads, g.head_dim, g.value_dim),
+            (HEADS as u32, KV as u32, HEAD_DIM as u32, HEAD_DIM as u32),
+            "layer {l}"
+        );
+        assert_eq!(g.window, want_window[l], "layer {l}");
+        let roped = want_window[l].is_some();
+        assert_eq!(
+            (
+                g.rope.mode,
+                g.rope.dims,
+                if roped { g.rope.base.to_bits() } else { 0 }
+            ),
+            if roped {
+                (
+                    model::arch::models::RopeMode::Neox,
+                    HEAD_DIM as u32,
+                    1e6_f32.to_bits(),
+                )
+            } else {
+                (model::arch::models::RopeMode::None, 0, 0)
+            },
+            "layer {l}"
+        );
+        assert!(g.qk_norm && !g.sinks, "layer {l}");
+        let want_act = if [2usize, 3].contains(&l) {
+            model::arch::models::Act::SwiGluGateFirst { limit: 7.0 }
+        } else {
+            model::arch::models::Act::SwiGlu { limit: None }
+        };
+        match &layer.ffn {
+            model::arch::models::Ffn::Dense { ff, act } => {
+                assert!(l == 0 || l == MTP, "layer {l} dense");
+                assert_eq!(*ff, FF as u32);
+                assert_eq!(
+                    *act,
+                    model::arch::models::Act::SwiGlu { limit: None },
+                    "layer {l}"
+                );
+            }
+            model::arch::models::Ffn::Moe(m) => {
+                assert!((1..LAYERS).contains(&l), "layer {l} routed");
+                assert_eq!(
+                    (m.experts, m.top_k, m.expert_ff),
+                    (EXPERTS as u32, 2, EFF as u32)
+                );
+                assert_eq!(m.act, want_act, "layer {l}");
+                assert_eq!(
+                    m.router,
+                    model::arch::models::Router {
+                        score: model::arch::models::Score::Sigmoid,
+                        bias: true,
+                        norm: model::arch::models::RouterNorm::SelectedSum,
+                        scale: 2.5,
+                        hash: false,
+                    },
+                    "layer {l}"
+                );
+                let shared = m.shared.as_ref().unwrap();
+                assert_eq!(shared.ff, SHARED as u32);
+                assert_eq!(shared.act, want_act, "layer {l}");
+            }
+        }
+    }
+    for name in ["eh_proj", "enorm", "hnorm", "shared_head_norm"] {
+        assert!(
+            opened
+                .header
+                .find(&format!("blk.{MTP}.nextn.{name}.weight"))
+                .is_some(),
+            "{name}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// `prepare --plan` of the toy folder names the architecture and its tensors by place and type
 /// — the FP8 stacks made at load, the trunk made at load, nothing read in place — with the
 /// tokenizer checked against Hugging Face's. Mutants: a role changed to `File` (a tensor then
@@ -1026,7 +1138,7 @@ fn toy_bytes() -> Vec<(String, &'static str, Vec<usize>, Vec<u8>)> {
 #[test]
 fn the_toy_folder_prints_a_prepare_plan() {
     let dir = temp_dir("exaone-prepare-plan");
-    write_folder(&dir, &toy_bytes(), &toy_config(), &tokenizer("qwen2"));
+    write_folder(&dir, &toy_bytes(), &toy_config(), &tokenizer("exaone-moe"));
     let opened = crate::folder::open(&dir).unwrap();
     assert_eq!(opened.header.architecture(), Some(ARCHITECTURE));
     let lines = folder::plan_lines(&opened.header, &opened.skipped);
