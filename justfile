@@ -2860,6 +2860,20 @@ follow-list *ARGS:
 release-list TAG *ARGS:
     python3 tools/recipes.py release-list {{TAG}} {{ARGS}}
 
+# The night's real tier (tools/nightly-real.sh; the box's timer runs it at 00:00): origin/main after a fetch (or --commit REV), the
+# full release list and the rotation's due items, one `tools/gate-batch.sh --tier real --ledger` on the night's own ledger, and a
+# report of each red with its last green and commit range. It skips when every key is green and refuses while the timing lease or
+# a hold is up. `--pull` on the Mac reads the box's report and ledger for tools/rotation.py release-check.
+# ARGS go to tools/nightly-real.sh (--commit REV, --dry-run, --pull, --into DIR).
+nightly-real *ARGS:
+    bash tools/nightly-real.sh {{ARGS}}
+
+# What a release must see before it publishes (tools/release/publish.sh step 0b): the blocking set green at its keys on the lead's
+# ledger or the night's, and no night red still red. rc 1 names each stop; `--out FILE` writes the list to run.
+# ARGS go to tools/rotation.py release-check (--night DIR, --out FILE, --classes FILE, --max-age H, --base REV).
+release-check *ARGS:
+    python3 tools/rotation.py release-check {{ARGS}}
+
 # B0b V4.1 인벤토리: 분할 GGUF의 헤더만 읽어 텐서 표를 뽑는다(임대 불필요, 텐서 바이트 미접촉).
 # 표는 박스의 /tmp에 쓰고 scp로 회수한다 — 박스 작업 트리에 쓰면 다음 box.sh의 rsync --delete가 지운다.
 # 회수한 표는 OUT(기본 target/v41-inventory.md)에 놓인다. 문서 사본(https://github.com/midagedev/rig-log/blob/main/docs/bloomery/v41-inventory.md)은 rig-log docs/bloomery/에 있고

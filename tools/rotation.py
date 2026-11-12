@@ -2,8 +2,9 @@
 """The rotation: the gates no landing runs, scheduled (Mac, reads the lead's green ledger).
 
     tools/rotation.py due   [--days N] [--ledger PATH] [--tier real|fixture] [--real NAME]… [--classes FILE] [--with-weekly] [--out FILE]
-    tools/rotation.py check [--days N] [--ledger PATH] [--classes FILE]
+    tools/rotation.py check [--days N] [--ledger PATH] [--classes FILE] [--night DIR]
     tools/rotation.py follow-list [--base REV] [--ledger PATH] [--classes FILE] [--out FILE]
+    tools/rotation.py release-check [--base REV] [--ledger PATH] [--night DIR] [--max-age H] [--classes FILE] [--keys FILE] [--out FILE]
     tools/rotation.py --self-test
 
 A landing runs the fixture tier. The gates it defers (class D: a real-only gate, a gate of a family with no fixture file, a real-file
@@ -44,7 +45,14 @@ family with no fixture, keep the date and key rules below.
   check  rc 1 naming each family whose gates (the same set, but the held ones) have no green ledger row newer than their rotation (as
          `due`); for an other family with a fixture, no fixture-tier green row. tools/release/publish.sh
          runs it before a release is published and stops on rc 1. A family of needs-env gates alone is printed `env` and not counted: it
-         runs only on a machine that sets its variable, which this ledger's batches defer by name.
+         runs only on a machine that sets its variable, which this ledger's batches defer by name. `--night DIR` counts the greens of the
+         night's ledger (tools/nightly-real.sh --pull) as the lead's.
+  release-check  what a release must see before it publishes (tools/release/publish.sh step 0b): every gate of the blocking set
+         (tools/recipes.py release-list --blocking: the class-table rows with a release mark) green at its key on the lead's ledger or
+         the night's, and no item red at the night's newest run (tools/nightly-real.sh's report) unless it is green at its key since;
+         a missing night report, or one older than --max-age hours, stops it too. The keys come from one `gate-batch.sh --ledger
+         --dry-run --tier real` over both sets on the union of the two ledgers (`--keys FILE` reads a saved one). rc 1 names each stop;
+         `--out FILE` writes the gates to run as a --list (the release batch's: what the night did not prove at the tag's keys).
   follow-list  the real tier a daily pass (the follower) runs on the lead's ledger: the list the release batch runs (tools/recipes.py
          release-list) before the diff is added, no diff read. Every common and tooling gate the batch runs, every gate of a main family
          (families.tsv tier) or of a family new since the last release tag (`--base REV` tells it against another tree), and the weekly and
@@ -53,7 +61,7 @@ family with no fixture, keep the date and key rules below.
 
 The ledger and the times file are the ones gate-batch.sh reads: BLOOMERY_GATE_LEDGER and BLOOMERY_GATE_TIMES, else
 ~/.cache/bloomery/. `--classes FILE` reads a saved `tools/gate-batch.sh --tier fixture --classes` (the classifier is slow: every
-recipe is classified); without it the tool runs it. Exit codes: 0, 1 (check red), 2 (a bad argument or input, named), 70 (the classifier
+recipe is classified); without it the tool runs it. Exit codes: 0, 1 (check or release-check red), 2 (a bad argument or input, named), 70 (the classifier
 or a tool it runs failed, named).
 """
 
@@ -718,6 +726,10 @@ def cmd_check(args: argparse.Namespace, now: dt.datetime | None = None, rs: dict
     gates = [g for g in every if not g.held]
     path = ledger_path_of(args.ledger)
     last, _ = load_ledger(path)
+    night = getattr(args, "night", None)
+    if night:  # the night's greens count as the lead's (a pulled ledger keeps no parts, so it holds no fixture-tier row)
+        n_last, _ = load_ledger(os.path.join(night, NIGHT_LEDGER))
+        last = {n: max(d for d in (last.get(n), n_last.get(n)) if d is not None) for n in {*last, *n_last}}
     if any(g.fixture_tier for g in gates):
         last_fx, _ = load_ledger(path, recipes.FIXTURE_TIER)
         last = {g.name: d for g in gates if (d := (last_fx if g.fixture_tier else last).get(g.name)) is not None}
@@ -797,7 +809,291 @@ def cmd_follow_list(args: argparse.Namespace, now: dt.datetime | None = None, rs
     return 0
 
 
+# ---------------------------------------------------------------------------------------------- release-check
+
+NIGHT_REPORT = "report.tsv"  # tools/nightly-real.sh's report, and the night ledger beside it in a pulled directory
+NIGHT_LEDGER = "gate-ledger.tsv"
+NIGHT_MAX_AGE_H = 36.0  # a night verdict older than this is no verdict: the night ran last at 00:00, the release reads it that day
+
+
+def night_dir_of(arg: str | None) -> str:
+    """The directory that holds the night's report and ledger (tools/nightly-real.sh --pull writes it)."""
+    return arg or os.environ.get("BLOOMERY_NIGHT_DIR") or os.path.expanduser("~/.cache/bloomery/night-pull")
+
+
+@dataclasses.dataclass
+class Night:
+    head: dict[str, str]  # the `night` line's fields: commit, date, state, rc, items, tag, ledger
+    date: dt.datetime
+    reds: dict[str, str]  # item -> its red line's detail (rc, last_green, range, since)
+    unrun: dict[str, str]  # item -> why nothing ran it (a final rc 75, a yield)
+    done: str  # the batch's DONE line, '' when the night skipped
+
+
+def read_night(path: str) -> Night:
+    """tools/nightly-real.sh's report: a `night` line of k=v fields (commit, date, state …), then `red`, `unrun` and `done` lines,
+    tab-separated. A line of another kind, or a report with no `night` line or no date, is a named error (rc 2)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError as e:
+        raise RotationError(f"{path}: {e.strerror}", 2)
+    head: dict[str, str] = {}
+    reds: dict[str, str] = {}
+    unrun: dict[str, str] = {}
+    done = ""
+    for n, ln in enumerate(lines, 1):
+        if not ln or ln.startswith("#"):
+            continue
+        f = ln.split("\t")
+        if f[0] == "night":
+            head = dict(x.split("=", 1) for x in f[1:] if "=" in x)
+        elif f[0] in ("red", "unrun") and len(f) >= 2 and f[1]:
+            (reds if f[0] == "red" else unrun)[f[1]] = "\t".join(f[2:])
+        elif f[0] == "done":
+            done = "\t".join(f[1:])
+        else:
+            raise RotationError(f"{path}:{n}: a line of kind {f[0]!r}; the night's report holds night, red, unrun and done lines", 2)
+    if not head.get("date"):
+        raise RotationError(f"{path}: no `night` line with a date: not a report tools/nightly-real.sh wrote", 2)
+    try:
+        date = parse_date(head["date"])
+    except ValueError:
+        raise RotationError(f"{path}: the night's date {head['date']!r} does not parse ({DATE_FMT})", 2)
+    return Night(head, date, reds, unrun, done)
+
+
+def union_ledger(paths: list[str], into: str) -> str:
+    """One ledger file holding every green row of `paths` (the lead's ledger, the night's), the newest row of each key: the file a
+    `gate-batch.sh --ledger --dry-run` reads to say whether an item is green at its key on either. The first path's parts are linked
+    beside it, so the dry run still explains a `run`."""
+    rows: dict[str, tuple[str, str]] = {}
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        with open(p, encoding="utf-8") as fh:
+            for ln in fh:
+                f = ln.rstrip("\n").split("\t")
+                if len(f) < 6 or not f[0]:
+                    continue
+                if f[0] not in rows or f[4] > rows[f[0]][0]:
+                    rows[f[0]] = (f[4], ln if ln.endswith("\n") else ln + "\n")
+    with open(into, "w", encoding="utf-8") as fh:
+        fh.write("".join(line for _, line in rows.values()))
+    if paths and os.path.isdir(paths[0] + ".parts"):
+        os.symlink(paths[0] + ".parts", into + ".parts")
+    return into
+
+
+def previous_tag() -> str | None:
+    """The newest release tag that does not name HEAD: at publish time HEAD carries the new tag, and the families new in the release
+    are told against the last one."""
+    at_head = set(subprocess.run(["git", "tag", "--points-at", "HEAD"], capture_output=True, text=True, cwd=ROOT).stdout.split())
+    return next((t for t in recipes.release_tags(ROOT) if t not in at_head), None)
+
+
+Keys = Callable[[list[str]], dict[str, tuple[str, str]]]  # items -> (ledger status, detail), as parse_dry_run reads them
+
+
+def cmd_release_check(args: argparse.Namespace, now: dt.datetime | None = None, rs: dict | None = None,
+                      tables: gate_class.Tables | None = None, new: set[str] | None = None, key_of: Keys | None = None) -> int:
+    """What a release must see before it publishes: every gate of the blocking set (recipes.blocking_set) green at its key on the
+    lead's ledger or the night's, and no item red at the night's newest run unless it is green at its key since. One dry run reads
+    the keys of both sets. rc 1 names each gate that stops it; `--out` writes the ones to run (the release batch's list)."""
+    now = now or dt.datetime.now().astimezone()
+    rows = read_class_rows(args)
+    if rs is None:
+        rs = recipes.load_justfile(os.path.join(ROOT, "justfile"))
+    if tables is None:
+        tables = recipes.class_tables(ROOT)
+    base = args.base or previous_tag()
+    if new is None:
+        new = recipes.families_new_between(ROOT, tables, base) if base else set()
+    bl = recipes.blocking_set(tables, {n: (r.cls, r.kind) for n, r in rows.items()}, rs, new)
+    night_dir = night_dir_of(args.night)
+    report = os.path.join(night_dir, NIGHT_REPORT)
+    stops: list[str] = []
+    notes: list[str] = []
+    night: Night | None = None
+    if not os.path.exists(report):
+        stops.append(f"NIGHT {report}: no night report: pull it (bash tools/nightly-real.sh --pull) or run the night "
+                     "(just nightly-real on the box); a release reads the night's verdict on every gate it does not block on")
+    else:
+        night = read_night(report)
+        age_h = (now - night.date).total_seconds() / 3600
+        where = f"{night.head.get('commit', '?')} at {night.head['date']} ({night.head.get('state', '?')})"
+        if args.max_age and age_h > args.max_age:
+            stops.append(f"NIGHT the night's newest run is {where}, {age_h:.0f} h old, past --max-age {args.max_age:g} h: run the night "
+                         "again (just nightly-real on the box), or pass --max-age to accept it")
+        else:
+            notes.append(f"night: the newest run is {where}, {age_h:.0f} h old; {len(night.reds)} red, {len(night.unrun)} unrun")
+        for item, why in sorted(night.unrun.items()):
+            notes.append(f"night: {item} did not run ({why}); its last verdict is the ledger's")
+    reds = dict(night.reds) if night else {}
+    for item in sorted(reds):
+        if item.split("@", 1)[0] not in rs:
+            notes.append(f"night: {item} was red and its recipe is gone from the justfile: cleared")
+            del reds[item]
+    names = bl.names + [n for n in sorted(reds) if n not in bl.names]
+    if key_of is None:
+        key_of = keys_from(args)
+    status = key_of(names) if names else {}
+    run: list[str] = []
+    for n in bl.names:
+        st, why = status[n]
+        if st == "skip":
+            print(f"ok   {n}: +{bl.marks[n]}, green at its key ({why})")
+        else:
+            run.append(n)
+            stops.append(f"RUN  {n}: +{bl.marks[n]}, no green at its key ({st} — {why})")
+    still: list[str] = []
+    for n in sorted(reds):
+        st, why = status[n]
+        if st == "skip":
+            print(f"ok   {n}: red at the night's run ({reds[n]}), green at its key since ({why})")
+        else:
+            still.append(n)
+            stops.append(f"RED  {n}: red at the night's newest run ({reds[n]}); no green at its key since ({st} — {why}): fix it or "
+                         "re-pin it, then run it")
+    for ln in notes:
+        print(ln, file=sys.stderr)
+    for ln in stops:
+        print(ln)
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            fh.write(f"# release-check {now.strftime(DATE_FMT)}: {len(run)} blocking gate(s) with no green at their key, "
+                     f"{len(still)} night red(s) still red\n")
+            fh.write("".join(n + "\n" for n in run + still))
+        print(f"release check: the list to run is {args.out} ({len(run) + len(still)} item(s))", file=sys.stderr)
+    print(f"release check: {len(bl.names)} blocking gate(s), {len(bl.names) - len(run)} green at their keys, {len(run)} to run; "
+          f"{len(still)} of {len(night.reds) if night else 0} night red(s) still red; {len(stops)} stop(s)")
+    return 1 if stops else 0
+
+
+def keys_from(args: argparse.Namespace) -> Keys:
+    """The key status of each item: `--keys FILE`, a saved `gate-batch.sh --ledger --dry-run --tier real` over the items, or one
+    such dry run on the union of the lead's ledger and the night's (it reads the box's manifest once, through tools/box.sh)."""
+    def saved(names: list[str]) -> dict[str, tuple[str, str]]:
+        try:
+            with open(args.keys, encoding="utf-8") as fh:
+                return parse_dry_run(fh.read(), names)
+        except OSError as e:
+            raise RotationError(f"--keys {args.keys}: {e.strerror}", 2)
+
+    def dry(names: list[str]) -> dict[str, tuple[str, str]]:
+        with tempfile.TemporaryDirectory(prefix="rotation-union-") as d:
+            union = union_ledger([ledger_path_of(args.ledger), os.path.join(night_dir_of(args.night), NIGHT_LEDGER)],
+                                 os.path.join(d, "union.tsv"))
+            return batch_keys(names, recipes.REAL_TIER, union)
+
+    return saved if args.keys else dry
+
+
 # ---------------------------------------------------------------------------------------------- the self-test
+
+
+def release_check_self_test(expect: Callable[[bool, str], None], raises: Callable, tmp: str, now: dt.datetime, ago: Callable,
+                            rec: Callable, keys: Callable, t_path: str, t_led: str) -> None:
+    """release-check on synthetic tables: gate-m (a main family, +ship) and gate-c (+kernel) block, gate-o8 (+ship of an other family)
+    does not; a missing or stale night report stops it, a night red stops it until it is green at its key, a red whose recipe is
+    gone is cleared, `--out` lists what to run; `check --night` counts the night's greens; the union ledger keeps each key's newest
+    row."""
+    fams = {"fm": gate_class.FamilyRow("fm", "F", "main", ("crates/fm/**",), 7, False),
+            "fo": gate_class.FamilyRow("fo", "F", "other", ("crates/fo/**",), 30, False),
+            "fo2": gate_class.FamilyRow("fo2", "F", "other", ("crates/fo2/**",), 30, False)}
+    grows = {"gate-m": gate_class.GateRow("gate-m", "family", "fm", "serve+ship", ()),
+             "gate-o8": gate_class.GateRow("gate-o8", "family", "fo", "tier+ship", ()),
+             "gate-o31": gate_class.GateRow("gate-o31", "family", "fo2", "e2e", ()),
+             "gate-c": gate_class.GateRow("gate-c", "common", "", "host+kernel", ())}
+    tabs = gate_class.Tables(gates=grows, families=fams, owners={})
+    rs = {n: rec(n, "true") for n in grows}
+    night = os.path.join(tmp, "night-pull")
+    os.makedirs(night, exist_ok=True)
+    out = os.path.join(tmp, "release-run.list")
+
+    def report(date: str, reds: dict[str, str], unrun: dict[str, str] | None = None) -> None:
+        with open(os.path.join(night, NIGHT_REPORT), "w", encoding="utf-8") as fh:
+            fh.write(f"night\tcommit=abc123456789\tdate={date}\tstate=ran\trc=1\titems=4\ttag=v0.0.1\n")
+            fh.write("".join(f"red\t{n}\t{why}\n" for n, why in reds.items()))
+            fh.write("".join(f"unrun\t{n}\t{why}\n" for n, why in (unrun or {}).items()))
+            fh.write("done\tDONE total=4 red=1 tier=real wall=100s\n")
+
+    def run(status: dict[str, str], max_age: float = NIGHT_MAX_AGE_H) -> tuple[int, str, str]:
+        if os.path.exists(out):
+            os.remove(out)
+        args = argparse.Namespace(base=None, ledger=t_led, night=night, max_age=max_age, classes=t_path, keys=None, out=out)
+        o, e = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(o), contextlib.redirect_stderr(e):
+            rc = cmd_release_check(args, now, rs, tabs, set(), keys(status))
+        return rc, o.getvalue(), e.getvalue()
+
+    def listed() -> list[str]:
+        with open(out, encoding="utf-8") as fh:
+            return [ln for ln in fh.read().splitlines() if ln and not ln.startswith("#")]
+
+    green = {"gate-m": "skip", "gate-c": "skip"}
+    rc, o, _ = run(green)
+    expect(rc == 1 and "NIGHT" in o and "no night report" in o,
+           f"release-check: no night report stops the release by name, even with the blocking set green: {rc} {o}")
+    red = "rc=1 1800s last_green=abc111111111@2026-10-19T00:00:00+0900 range=abc111111111..abc123456789 commits=4"
+    report(ago(0.5), {"gate-o31": red, "gate-gone": red}, {"gate-o8": "rc=75 (lock contention)"})
+    rc, o, e = run({"gate-m": "skip", "gate-c": "run", "gate-o31": "run"})
+    expect(rc == 1 and "RUN  gate-c: +kernel, no green at its key" in o and "ok   gate-m: +ship, green at its key" in o,
+           f"release-check: a blocking gate with no green at its key stops it, one green at its key passes: {rc} {o}")
+    expect("RED  gate-o31: red at the night's newest run (rc=1 1800s last_green=abc111111111@2026-10-19T00:00:00+0900 "
+           "range=abc111111111..abc123456789" in o and "fix it or re-pin it" in o,
+           f"release-check: a night red with no green at its key since stops it, naming its last green and range: {o}")
+    expect("gate-o8" not in o, f"release-check: an other family's +ship gate does not block: {o}")
+    expect("gate-gone was red and its recipe is gone from the justfile: cleared" in e and "RED  gate-gone" not in o,
+           f"release-check: a night red whose recipe is gone is cleared with a note: {e}")
+    expect("gate-o8 did not run (rc=75 (lock contention))" in e, f"release-check: an unrun item is named: {e}")
+    expect(listed() == ["gate-c", "gate-o31"], f"release-check: --out lists the blocking gates to run, then the night reds still red: {listed()}")
+    rc, o, _ = run({"gate-m": "skip", "gate-c": "skip", "gate-o31": "skip"})
+    expect(rc == 0 and "ok   gate-o31: red at the night's run" in o and "green at its key since" in o and listed() == [],
+           f"release-check: a night red green at its key since and the blocking set green pass, the list is empty: {rc} {o}")
+    report(ago(2), {})
+    rc, o, _ = run(green)
+    expect(rc == 1 and "NIGHT the night's newest run is abc123456789" in o and "past --max-age 36 h" in o,
+           f"release-check: a night report older than --max-age stops it: {rc} {o}")
+    rc, o, _ = run(green, max_age=0)
+    expect(rc == 0 and "NIGHT" not in o, f"release-check: --max-age 0 accepts any age: {rc} {o}")
+    with open(os.path.join(night, NIGHT_REPORT), "a", encoding="utf-8") as fh:
+        fh.write("bogus\tline\n")
+    expect(raises(lambda: run(green), "a line of kind 'bogus'"), "release-check: a report line of another kind is a named error")
+    with open(os.path.join(night, NIGHT_REPORT), "w", encoding="utf-8") as fh:
+        fh.write("red\tgate-m\tx\n")
+    expect(raises(lambda: run(green), "no `night` line with a date"), "release-check: a report with no night line is a named error")
+
+    # the union ledger: each key's newest row of both files, the first file's parts linked beside it
+    a, b = os.path.join(tmp, "union-a.tsv"), os.path.join(tmp, "union-b.tsv")
+    k1, k2, k3 = ("a" * 64, "b" * 64, "c" * 64)
+    with open(a, "w", encoding="utf-8") as fh:
+        fh.write(f"{k1}\tgate-m\tgate-m\tc1\t{ago(3)}\t/x\n{k2}\tgate-c\tgate-c\tc1\t{ago(3)}\t/x\nshort\tline\n")
+    with open(b, "w", encoding="utf-8") as fh:
+        fh.write(f"{k1}\tgate-m\tgate-m\tc2\t{ago(1)}\t/y\n{k3}\tgate-o8\tgate-o8\tc2\t{ago(1)}\t/y\n")
+    os.makedirs(a + ".parts", exist_ok=True)
+    u = union_ledger([a, b, os.path.join(tmp, "absent.tsv")], os.path.join(tmp, "union.tsv"))
+    led = recipes.Ledger(u)
+    expect(sorted(led.by_key) == [k1, k2, k3] and led.by_key[k1].commit == "c2" and os.path.islink(u + ".parts"),
+           f"union: every key of both ledgers, the newest row of a shared key, the parts linked: {sorted(led.by_key)}")
+
+    # check --night: the night's greens count as the lead's
+    n_led = os.path.join(night, NIGHT_LEDGER)
+    with open(n_led, "w", encoding="utf-8") as fh:
+        fh.write(f"{'9' * 64}\tgate-m\tgate-m\tabc123456789\t{ago(1)}\t/night\n")
+    cls = os.path.join(tmp, "rc-classes.tsv")
+    with open(cls, "w", encoding="utf-8") as fh:
+        fh.write("gate-m\tF\tbalanced\t3090,a6000\tx\ngate-o8\tF\tbalanced\t3090,a6000\tx\ngate-o31\tF\tbalanced\t3090,a6000\tx\ngate-c\tD\treal-only\t-\tx\n")
+    f_gates = recipes.f_family_gates(tabs)
+    m_led = os.path.join(tmp, "rc-mac.tsv")
+    with open(m_led, "w", encoding="utf-8") as fh:
+        fh.write("".join(f"{str(i) * 64}\t{n}\t{n}\tabc123456789\t{ago(d)}\t/x\n" for i, (n, d) in enumerate((("gate-m", 8), ("gate-o8", 2), ("gate-o31", 2), ("gate-c", 1)), 1)))
+    for night_arg, want in ((None, 1), (night, 0)):
+        argsc = argparse.Namespace(days=None, ledger=m_led, classes=cls, night=night_arg)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+            rc = cmd_check(argsc, now, rs, f_gates, tabs)
+        expect(rc == want, f"check --night {night_arg}: the main family's gate 8 d old on the lead's ledger and 1 d on the night's: rc {rc}, want {want}: {buf.getvalue()}")
 
 
 def fixture_tier_self_test(expect: Callable[[bool, str], None], tmp: str, now: dt.datetime, rec: Callable, keys: Callable) -> None:
@@ -1294,6 +1590,7 @@ def self_test() -> int:
             fl_items = bare(open(argsl.out, encoding="utf-8").read())
             expect(fl_items == ["gate-c", "gate-m", "gate-o8", "weekly-m", "weekly-o"],
                    f"follow-list: a family new in the release is in whatever its tier, the other family stays out: {fl_items}")
+            release_check_self_test(expect, raises, tmp, now, ago, rec, keys, t_path, t_led)
             fixture_tier_self_test(expect, tmp, now, rec, keys)
         finally:
             if old_times is None:
@@ -1320,6 +1617,8 @@ def main(argv: list[str]) -> int:
         p.add_argument("--days", type=float, default=None, help="the age at which a last run is stale, for every gate (default: its family's rotation_days, 7 for a main family and 30 for any other)")
         p.add_argument("--ledger", help="the green ledger (default BLOOMERY_GATE_LEDGER, else ~/.cache/bloomery/gate-ledger.tsv)")
         p.add_argument("--classes", help="a saved `tools/gate-batch.sh --tier fixture --classes` (default: run it)")
+        if name == "check":
+            p.add_argument("--night", help=f"a directory holding the night's {NIGHT_LEDGER} (tools/nightly-real.sh --pull): its greens count as the lead's")
         if name == "due":
             p.add_argument("--tier", choices=[recipes.REAL_TIER, recipes.FIXTURE_TIER], default=recipes.REAL_TIER,
                            help="the tier the list runs in: real (what the fixture tier defers, every family but the other ones with a fixture, "
@@ -1328,18 +1627,31 @@ def main(argv: list[str]) -> int:
                            "(a user report, a release that names the family); repeatable, --tier real only")
             p.add_argument("--with-weekly", action="store_true", help="every weekly-* recipe first, then every CUDA gate on a GGUF input the list does not already name, then the due gates that are not weekly (`just weekly`)")
             p.add_argument("--out", help="write the list to FILE (its first lines to stderr) instead of stdout")
+    rc_ = sub.add_parser("release-check", help="before a release publishes: the blocking set green at its keys on the lead's ledger or the night's, and no item red at the night's newest run unless green at its key since; rc 1 names each stop")
+    rc_.add_argument("--base", help="the release a new family is told against (default: the newest release tag that does not name HEAD)")
+    rc_.add_argument("--ledger", help="the lead's green ledger (default BLOOMERY_GATE_LEDGER, else ~/.cache/bloomery/gate-ledger.tsv)")
+    rc_.add_argument("--night", help=f"the directory holding the night's {NIGHT_REPORT} and {NIGHT_LEDGER} (default BLOOMERY_NIGHT_DIR, else ~/.cache/bloomery/night-pull, where `tools/nightly-real.sh --pull` writes them)")
+    rc_.add_argument("--max-age", type=float, default=NIGHT_MAX_AGE_H, help=f"hours: a night report older than this stops the release (default {NIGHT_MAX_AGE_H:g}; 0 accepts any age)")
+    rc_.add_argument("--classes", help="a saved `tools/gate-batch.sh --tier fixture --classes` (default: run it)")
+    rc_.add_argument("--keys", help="a saved `tools/gate-batch.sh --ledger --dry-run --tier real` over the same items, read instead of running one")
+    rc_.add_argument("--out", help="write the gates to run (the blocking ones with no green at their key, then the night reds still red) to FILE, a --list for tools/gate-batch.sh")
     fl = sub.add_parser("follow-list", help="the real tier a daily pass runs: main families, families new since the last release tag, common and tooling gates; every other family left out by name")
     fl.add_argument("--base", help="the revision a new family is told against (default: the last release tag)")
     fl.add_argument("--ledger", help="the green ledger the last green dates of the families left out come from (default BLOOMERY_GATE_LEDGER, else ~/.cache/bloomery/gate-ledger.tsv)")
     fl.add_argument("--classes", help="a saved `tools/gate-batch.sh --tier fixture --classes` (default: run it)")
     fl.add_argument("--out", help="write the list to FILE (its first lines to stderr) instead of stdout")
     args = ap.parse_args(argv)
-    if args.cmd != "follow-list" and args.days is not None and args.days < 0:
+    if args.cmd in ("due", "check") and args.days is not None and args.days < 0:
         print("rotation.py: --days takes a number of days, 0 or more", file=sys.stderr)
+        return 2
+    if args.cmd == "release-check" and args.max_age < 0:
+        print("rotation.py: --max-age takes a number of hours, 0 or more", file=sys.stderr)
         return 2
     try:
         if args.cmd == "follow-list":
             return cmd_follow_list(args)
+        if args.cmd == "release-check":
+            return cmd_release_check(args)
         return cmd_due(args) if args.cmd == "due" else cmd_check(args)
     except (RotationError, recipes.RecipeError) as e:
         print(f"rotation.py: {e}", file=sys.stderr)
