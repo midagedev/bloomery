@@ -11586,6 +11586,127 @@ unsafe fn swiglu_clamp_avx2(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32
     _mm256_movemask_epi8(finite) == -1
 }
 
+/// ggml's clamped SwiGLU, `ggml_swiglu_clamp` (`ggml/src/ggml-cpu/ops.cpp`,
+/// `ggml_compute_forward_swiglu_clamp`): `out[i] = silu(min(gate[i], limit))
+/// · clamp(up[i], -limit, limit)` — the gate clamped from above *before* the
+/// activation, where [`swiglu_clamp`] clamps the activated gate. Neither
+/// clamp applies when `limit <= 1e-6`: then this is [`swiglu`]. The `min`
+/// and the clamp are ggml's `std::min` and `std::clamp` comparisons; a NaN
+/// `gate` passes the first in the scalar rule (the vector body's `min`
+/// returns its second operand, the gate, on a NaN too) and a NaN `up` passes
+/// the second in the scalar rule alone. Silu is [`swiglu`]'s `v_silu` lanes,
+/// tail included.
+///
+/// Returns `false` when the clamp met a `gate` or `up` value that is not
+/// finite, which it would write as a finite value. Below the clamp's limit
+/// every such value stays non-finite in `out`, as in [`swiglu`], and the
+/// result is `true`.
+pub fn swiglu_gclamp(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) -> bool {
+    assert!(gate.len() == up.len() && gate.len() == out.len());
+    // The same test as [`swiglu_clamp`]'s, so a NaN limit clamps nothing.
+    if limit > 1e-6 {
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            // SAFETY: the features were just detected; the slices are equal length.
+            return unsafe { swiglu_gclamp_avx2(gate, up, limit, out) };
+        }
+        // Absolute f32 encodings put every finite value below infinity and NaN.
+        let mut max_bits = 0u32;
+        for (o, (&g, &u)) in out.iter_mut().zip(gate.iter().zip(up)) {
+            max_bits = max_bits
+                .max(g.to_bits() & 0x7fff_ffff)
+                .max(u.to_bits() & 0x7fff_ffff);
+            *o = swiglu_gclamp_1(g, u, limit);
+        }
+        max_bits < f32::INFINITY.to_bits()
+    } else {
+        swiglu(gate, up, out);
+        true
+    }
+}
+
+/// ggml's clamped SwiGLU for one value, the rule the card runs
+/// (`bloomery_gpu::kquant::act::swiglu_gclamp`): `x = min(gate, limit)`, `y =
+/// clamp(up, -limit, limit)`, `x / (1 + e^(0 − x)) · y` — ggml's
+/// `ggml_compute_forward_swiglu_clamp` term for term, with the exponential
+/// [`expf_ik_scalar`] where it calls libm's `expf`. The `min` and the clamp
+/// are the `std::min` and `std::clamp` comparisons.
+#[inline]
+#[must_use]
+pub fn swiglu_gclamp_1(gate: f32, up: f32, limit: f32) -> f32 {
+    let x = if limit < gate { limit } else { gate };
+    let y = if up < -limit {
+        -limit
+    } else if limit < up {
+        limit
+    } else {
+        up
+    };
+    x / (1.0 + expf_ik_scalar(0.0 - x)) * y
+}
+
+/// [`swiglu_gclamp_1`] over eight lanes; `(limit, -limit)` broadcast. The
+/// `min` and `max` operand orders are the scalar rule's comparisons.
+///
+/// # Safety
+/// The CPU must support AVX2 and FMA. Register-only: no memory is touched.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+#[inline]
+unsafe fn v_swiglu_gclamp(g: __m256, u: __m256, (hi, lo): (__m256, __m256)) -> __m256 {
+    let x = _mm256_min_ps(hi, g);
+    let y = _mm256_max_ps(_mm256_min_ps(u, hi), lo);
+    // SAFETY: same target features as the caller.
+    let e = unsafe { v_expf(_mm256_sub_ps(_mm256_setzero_ps(), x)) };
+    let s = _mm256_div_ps(x, _mm256_add_ps(_mm256_set1_ps(1.0), e));
+    _mm256_mul_ps(s, y)
+}
+
+/// [`swiglu_gclamp`]'s vector body, with its flag.
+///
+/// # Safety
+/// The CPU must support AVX2 and FMA, and `gate`, `up` and `out` must all be
+/// the same length — the loads and the store share one index.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2", enable = "fma")]
+unsafe fn swiglu_gclamp_avx2(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) -> bool {
+    let n = gate.len();
+    let full = n / 8 * 8;
+    let (hi, lo) = (_mm256_set1_ps(limit), _mm256_set1_ps(-limit));
+    let mut acc = _mm256_setzero_si256();
+    let mut i = 0;
+    while i < full {
+        // SAFETY: i + 8 <= full <= gate.len().
+        let g = unsafe { _mm256_loadu_ps(gate.as_ptr().add(i)) };
+        // SAFETY: i + 8 <= full <= up.len().
+        let u = unsafe { _mm256_loadu_ps(up.as_ptr().add(i)) };
+        acc = max_abs_bits(acc, g, u);
+        // SAFETY: this function requires AVX2 and FMA.
+        let v = unsafe { v_swiglu_gclamp(g, u, (hi, lo)) };
+        // SAFETY: i + 8 <= full <= out.len().
+        unsafe { _mm256_storeu_ps(out.as_mut_ptr().add(i), v) };
+        i += 8;
+    }
+    if full < n {
+        let (mut gp, mut upad, mut op) = ([0.0f32; 8], [0.0f32; 8], [0.0f32; 8]);
+        gp[..n - full].copy_from_slice(&gate[full..]);
+        upad[..n - full].copy_from_slice(&up[full..]);
+        // SAFETY: gp holds eight f32 values.
+        let g = unsafe { _mm256_loadu_ps(gp.as_ptr()) };
+        // SAFETY: upad holds eight f32 values.
+        let u = unsafe { _mm256_loadu_ps(upad.as_ptr()) };
+        acc = max_abs_bits(acc, g, u);
+        // SAFETY: this function requires AVX2 and FMA.
+        let v = unsafe { v_swiglu_gclamp(g, u, (hi, lo)) };
+        // SAFETY: op holds eight writable f32 values.
+        unsafe { _mm256_storeu_ps(op.as_mut_ptr(), v) };
+        out[full..].copy_from_slice(&op[..n - full]);
+    }
+    let finite = _mm256_cmpgt_epi32(_mm256_castps_si256(_mm256_set1_ps(f32::INFINITY)), acc);
+    _mm256_movemask_epi8(finite) == -1
+}
+
 /// The gpt-oss / MiniMax SwiGLU for one value, the rule the card runs
 /// (`bloomery_gpu::kquant::act::swiglu_oai`): `x = min(gate, limit)`, `y =
 /// clamp(up, -limit, limit)`, `x / (1 + e^(−alpha·x)) · (y + 1)` — llama.cpp's

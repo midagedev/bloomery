@@ -1,9 +1,10 @@
 //! The CPU tier's twin of a gate·up rule (`bloomery_gpu::kquant::Act`), for the
 //! gates that hold the card's rows to it: ik's clamped SwiGLU through
-//! `qdot::swiglu_clamp` and the OAI SwiGLU through `qdot::swiglu_oai`, each with
-//! the rows its limit bit on, and the OAI rule's f64 formula and its band. The
-//! plain `silu_mul` has no twin here: the card's elementwise `swiglu` is each
-//! gate's own reference for it.
+//! `qdot::swiglu_clamp`, ggml's gate-first clamp through `qdot::swiglu_gclamp`
+//! and the OAI SwiGLU through `qdot::swiglu_oai`, each with the rows its limit
+//! bit on, and the OAI rule's f64 formula and its band. The plain `silu_mul`
+//! has no twin here: the card's elementwise `swiglu` is each gate's own
+//! reference for it.
 
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::kquant::act::{SWIGLU_OAI_ALPHA, silu_ik};
@@ -35,7 +36,7 @@ pub fn oai(limit: f32) -> Act {
 
 /// `rule` on the sums `g` and `u` as the CPU tier computes it, and the rows its
 /// limit bit on: the clamp where `silu(g)` or `|u|` passes the limit, the OAI
-/// form where `g` or `|u|` does. `None` for [`Act::SiluMul`].
+/// and gate-first forms where `g` or `|u|` does. `None` for [`Act::SiluMul`].
 ///
 /// # Panics
 ///
@@ -57,6 +58,13 @@ pub fn combine(rule: Act, g: &[f32], u: &[f32]) -> Option<(Vec<f32>, usize)> {
                 "swiglu_clamp: a sum that is not finite"
             );
             Some((out, bit(&|g| silu_ik(g) > limit, limit)))
+        }
+        Act::SwigluGateClamp { limit } => {
+            assert!(
+                qdot::swiglu_gclamp(g, u, limit, &mut out),
+                "swiglu_gclamp: a sum that is not finite"
+            );
+            Some((out, bit(&|g| g > limit, limit)))
         }
         Act::SwigluOai { alpha, limit } => {
             assert!(

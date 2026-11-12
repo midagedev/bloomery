@@ -1084,9 +1084,10 @@ fn serve_resolved(
     // and two reads of `x` an expert; a relu² leg's holds the ups alone, and
     // moves them to the up slots once the down has read them.
     let (first, up_site) = match run.form {
-        ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } | ExpertForm::Situ { .. } => {
-            (2 * n, "host_gate_up")
-        }
+        ExpertForm::Gated { .. }
+        | ExpertForm::GatedGateFirst { .. }
+        | ExpertForm::GatedOai { .. }
+        | ExpertForm::Situ { .. } => (2 * n, "host_gate_up"),
         ExpertForm::Relu2 => (n, "host_up"),
     };
     let mut xl: Vec<&Tensor2> = relist(std::mem::take(xs));
@@ -1099,6 +1100,7 @@ fn serve_resolved(
         for i in 0..n {
             let (gate, up) = match run.form {
                 ExpertForm::Gated { .. }
+                | ExpertForm::GatedGateFirst { .. }
                 | ExpertForm::GatedOai { .. }
                 | ExpertForm::Situ { .. } => (gate_up[2 * i].col(0), gate_up[2 * i + 1].col(0)),
                 ExpertForm::Relu2 => (&[][..], gate_up[i].col(0)),
@@ -1113,6 +1115,11 @@ fn serve_resolved(
             ExpertForm::Gated { limit } => {
                 for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
                     sl.push(GroupInput::SwigluClamp(gate, up, limit));
+                }
+            }
+            ExpertForm::GatedGateFirst { limit } => {
+                for [gate, up] in gate_up[..2 * n].as_chunks::<2>().0 {
+                    sl.push(GroupInput::SwigluGateFirst(gate, up, limit));
                 }
             }
             ExpertForm::GatedOai { alpha, limit } => {
@@ -2933,6 +2940,76 @@ impl HostLayer {
         self.input
     }
 
+    /// Give the layer the activation its description states, in place of the
+    /// gated SwiGLU it was built with: every gated rule ([`ExpertForm::Gated`],
+    /// [`ExpertForm::GatedGateFirst`], [`ExpertForm::GatedOai`],
+    /// [`ExpertForm::Situ`]) serves the same three stacks, so a load that
+    /// builds through [`HostLayer::build`] runs its description's clamp order
+    /// without another spec or constructor. A gate-first limit that is not
+    /// finite and positive is refused by name, as the card's rule refuses it;
+    /// an activation of another form (relu² holds other stacks, GELU has no
+    /// host rule) is refused by name and the layer keeps its form.
+    /// Load-time only.
+    pub fn set_act(&mut self, act: models::Act) -> Result<(), ModelError> {
+        let refuse = |detail: String| ModelError::Metadata {
+            key: "host layer activation".to_string(),
+            detail,
+        };
+        let form = match act {
+            models::Act::SwiGlu { limit } => ExpertForm::Gated {
+                limit: limit.unwrap_or(0.0),
+            },
+            models::Act::SwiGluGateFirst { limit } if limit.is_finite() && limit > 0.0 => {
+                ExpertForm::GatedGateFirst { limit }
+            }
+            models::Act::SwiGluGateFirst { limit } => {
+                return Err(refuse(format!(
+                    "a gate-first clamp limit must be finite and positive, got {limit}"
+                )));
+            }
+            models::Act::SwigluOai { alpha, limit }
+                if alpha.is_finite() && alpha > 0.0 && limit.is_finite() && limit >= 0.0 =>
+            {
+                ExpertForm::GatedOai { alpha, limit }
+            }
+            models::Act::SwigluOai { alpha, limit } => {
+                return Err(refuse(format!(
+                    "swigluoai runs at a finite positive alpha and a finite limit of at least 0, \
+                     got alpha {alpha}, limit {limit}"
+                )));
+            }
+            models::Act::Situ {
+                gate_beta,
+                value_beta,
+            } if gate_beta.is_finite()
+                && gate_beta > 0.0
+                && value_beta.is_finite()
+                && value_beta > 0.0 =>
+            {
+                ExpertForm::Situ {
+                    beta: gate_beta,
+                    linear_beta: value_beta,
+                }
+            }
+            models::Act::Situ {
+                gate_beta,
+                value_beta,
+            } => {
+                return Err(refuse(format!(
+                    "situ betas must be finite and positive, got {gate_beta} and {value_beta}"
+                )));
+            }
+            other => {
+                return Err(refuse(format!(
+                    "{} cannot serve the layer's gated stacks",
+                    other.what()
+                )));
+            }
+        };
+        self.form = form;
+        Ok(())
+    }
+
     /// Give the layer the norm each routed expert's down row takes before
     /// its router weight ([`PostNorm`]): from then on every call that serves
     /// the layer — the one-column leg, the union and the step union, from the
@@ -3080,6 +3157,9 @@ impl HostLayer {
     pub fn swiglu_limit(&self) -> f32 {
         match self.form {
             ExpertForm::Gated { limit } => limit,
+            ExpertForm::GatedGateFirst { .. } => {
+                panic!("gate-first SwiGLU has no SwiGLU clamp: read its limit from the form")
+            }
             ExpertForm::GatedOai { .. } => {
                 panic!("swigluoai has no SwiGLU clamp: read the OAI rule's limit from the form")
             }
@@ -3468,9 +3548,10 @@ impl HostLayer {
         // A relu² layer warms its up and its down; the stacks' gate slot is
         // the up again.
         let warmed = match self.form {
-            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } | ExpertForm::Situ { .. } => {
-                &stacks[..]
-            }
+            ExpertForm::Gated { .. }
+            | ExpertForm::GatedGateFirst { .. }
+            | ExpertForm::GatedOai { .. }
+            | ExpertForm::Situ { .. } => &stacks[..],
             ExpertForm::Relu2 => &stacks[1..],
         };
         'ids: for &id in ids {
@@ -3783,6 +3864,121 @@ mod tests {
             layer.post.as_ref().map(ops::PostNorm::width),
             Some(embd),
             "a gain of the down's rows is the layer's norm"
+        );
+    }
+
+    /// `set_act` gives a built layer its description's activation in place
+    /// of the gated SwiGLU it was built with: a layer set gate-first at
+    /// K-EXAONE-2.0's limit 7 combines each expert's rows through
+    /// `qdot::swiglu_gclamp` — the par bit for bit the rule over the same
+    /// leg's gate and up sums, on rows past the limit on both the side the
+    /// rule clamps and the side it leaves alone — and its down therefore
+    /// differs from the plain-built layer's on the rows that bite; a limit
+    /// that is not finite and positive and an activation of another form
+    /// are refused by name, a refused setter leaving the layer's form.
+    /// FAIL-first: the mutant that maps the gate-first rule to the
+    /// act-first clamp goes red on the `g > 7` rows.
+    #[test]
+    fn host_layer_set_act_runs_the_gate_first_combine() {
+        let (embd, ff, n_expert) = (256, 512, 2);
+        let path = layer_file("setact", [GgmlType::Q4_K; 3], embd, ff, n_expert);
+        let split = gguf::Split::open(&path).unwrap();
+        let src = R8Source::rows(&split);
+        let mut layer = build_layer(&split, embd, ff, n_expert).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            layer.form(),
+            ExpertForm::Gated { limit: 0.0 },
+            "the build serves the plain combine by default"
+        );
+        let x = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd)
+                .map(|i| 4.0 * (((i * 37) % 17) as f32 - 8.0) / 8.0)
+                .collect(),
+        );
+        let list = vec![(0u32, 0.6f32), (1, 0.4)];
+        let mut scratch = HostScratch::new(embd, ff, n_expert).unwrap();
+        let serve = |layer: &HostLayer, scratch: &mut HostScratch| {
+            let mut out = vec![0.0f32; embd];
+            layer
+                .experts_into(src, &x, &list, &mut out, scratch)
+                .unwrap();
+            (
+                out,
+                scratch.gate(0).data.clone(),
+                scratch.up(0).data.clone(),
+            )
+        };
+        let (plain, gate, up) = serve(&layer, &mut scratch);
+        let (gate_hi, gate_lo, up_out) = (
+            gate.iter().filter(|&&v| v > 7.0).count(),
+            gate.iter().filter(|&&v| v < -7.0).count(),
+            up.iter().filter(|&&v| v.abs() > 7.0).count(),
+        );
+        assert!(
+            gate_hi > 0 && gate_lo > 0 && up_out > 0,
+            "the leg's sums must cross every side (g > L {gate_hi}, g < -L {gate_lo}, \
+             |u| > L {up_out})"
+        );
+        let mut want = vec![0.0f32; ff];
+        assert!(qdot::swiglu_gclamp(&gate, &up, 7.0, &mut want));
+        layer
+            .set_act(models::Act::SwiGluGateFirst { limit: 7.0 })
+            .unwrap();
+        assert_eq!(
+            layer.form(),
+            ExpertForm::GatedGateFirst { limit: 7.0 },
+            "the setter gives the layer the description's rule"
+        );
+        let (got, _, _) = serve(&layer, &mut scratch);
+        let par = scratch.par(0);
+        assert_eq!(
+            par.data
+                .iter()
+                .zip(&want)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count(),
+            0,
+            "the gate-first par must equal qdot::swiglu_gclamp over the same sums"
+        );
+        assert_ne!(
+            got.iter().zip(&plain).filter(|(a, b)| a != b).count(),
+            0,
+            "the clamp must bite: the gate-first down differs from the plain-built layer's"
+        );
+        // A refused setter leaves the form and names what it refuses.
+        for (act, fragment) in [
+            (
+                models::Act::SwiGluGateFirst { limit: 0.0 },
+                "a gate-first clamp limit must be finite and positive, got 0",
+            ),
+            (
+                models::Act::SwiGluGateFirst {
+                    limit: f32::INFINITY,
+                },
+                "a gate-first clamp limit must be finite and positive, got inf",
+            ),
+            (
+                models::Act::ReluSqr,
+                "squared ReLU cannot serve the layer's gated stacks",
+            ),
+            (
+                models::Act::GeGlu,
+                "GELU GLU cannot serve the layer's gated stacks",
+            ),
+        ] {
+            let err = layer.set_act(act).unwrap_err().to_string();
+            assert!(
+                err.contains(fragment),
+                "the refusal must name {fragment:?}, got {err:?}"
+            );
+        }
+        assert_eq!(
+            layer.form(),
+            ExpertForm::GatedGateFirst { limit: 7.0 },
+            "a refused setter leaves the layer's form"
         );
     }
 

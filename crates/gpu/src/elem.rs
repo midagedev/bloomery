@@ -1344,8 +1344,9 @@ mod elem_kernels {
     /// `y[i] = rule(gate[i], up[i])`, elementwise over `n` values, under a
     /// gate·up rule of the K-quant family (`kquant::act::apply_checked`):
     /// ik's clamped SwiGLU at `limit` (`ACT_SWIGLU_CLAMP`), the OAI SwiGLU at
-    /// `limit` (`ACT_SWIGLU_OAI`), SiTU at beta `limit` (`ACT_SITU`) or
-    /// `silu_mul` (`ACT_SILU_MUL`); the contract admits those four codes
+    /// `limit` (`ACT_SWIGLU_OAI`), SiTU at beta `limit` (`ACT_SITU`), the
+    /// gate-first clamped SwiGLU at `limit` (`ACT_SWIGLU_GCLAMP`) or
+    /// `silu_mul` (`ACT_SILU_MUL`); the contract admits those five codes
     /// alone. The f32 rows an f32-form down reads, each value the one the
     /// rule's quantizing entries quantize. A non-finite gate or up value
     /// writes NaN and raises [`FaultSite::F32Product`]: a clamp would carry it
@@ -1355,7 +1356,7 @@ mod elem_kernels {
     #[launch_contract(
         domain = 1,
         block = (256, 1, 1),
-        requires = (act <= 3, gate.len() >= n, up.len() >= n, y.len() >= n)
+        requires = (act <= 4, gate.len() >= n, up.len() >= n, y.len() >= n)
     )]
     pub fn swiglu_rule_rows(
         gate: &[f32],
