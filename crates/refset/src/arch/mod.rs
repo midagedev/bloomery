@@ -12,6 +12,7 @@ pub mod deepseek41;
 pub mod deepseek41v;
 pub mod dequant;
 pub mod draft;
+pub mod exaone_moe;
 pub mod forced_logits;
 pub mod gemma_embedding;
 pub mod gemma_embedding2;

@@ -1,0 +1,42 @@
+# Cases of the K-EXAONE-2.0 vocabulary (pre-tokenizer exaone-moe) beyond cases.txt: the letter word joined by single spaces and what breaks it, marks, contractions, one number a word, the symbol run with one trailing \r \n or /, the whitespace rules, the added tokens space and control runs, the chat template special tokens, and Korean in NFC beside the same text decomposed (NFD); tools/exaone-oracle.sh decodes each line with printf %b.
+한국어와 영어가 섞인 문장을 토큰화합니다. The quick brown fox jumps over the lazy dog.
+서울특별시는 대한민국의 수도이자 최대 도시이다. 한강을 중심으로 남북으로 나뉘어 있으며, 인구는 약 천만 명이다.
+한국어 텍스트 mixed with English words 그리고 다시 한국어
+한국어 텍스트
+\xe1\x84\x92\xe1\x85\xa1\xe1\x86\xab\xe1\x84\x80\xe1\x85\xb3\xe1\x86\xaf
+\xe1\x84\x92\xe1\x85\xa1\xe1\x86\xab\xe1\x84\x80\xe1\x85\xae\xe1\x86\xa8\xe1\x84\x8b\xe1\x85\xa5\x20\xe1\x84\x90\xe1\x85\xa6\xe1\x86\xa8\xe1\x84\x89\xe1\x85\xb3\xe1\x84\x90\xe1\x85\xb3
+e\xcc\x81le\xcc\x80 A\xcc\x8a\xcc\x81 x\xcc\x81y
+caf\xc3\xa9 na\xc3\xafve
+hello world foo  bar   baz
+a b c d e f g
+The quick brown fox  jumps over  the lazy dog
+a\tb a\t\tb \tHello \t\tworld
+IT'S WE'LL I'M THEY'VE HE'D DON'T CAN'T WON'T 'S 'x rock'n'roll it'sa can't've
+1 12 123 1234 12345 1234567 1234567890 1,234,567.89 3.14159e-10 0x1F 2026-11-12
+x = y;\n a.\r\nb ?/\n .//\n a/b/c x/\n/y </tag>\n
+x    y
+x         y
+x                y
+x                               y
+x                                y
+x                                        y
+end                               
+two leading   
+\t\t\t\t\t\t\t\t\tstart
+\n\n\n\n\n\n\n\n\n
+[BOS]hello[EOS] [PAD] [UNK]
+<|system|>\nYou are a helpful assistant.<|endofturn|>\n<|user|>\n안녕하세요<|endofturn|>\n<|assistant|>\n<think>\n\n</think>\n\n안녕하세요!<|endofturn|>
+<think>reasoning here</think>visible text
+<tool_call>\n<function=get_weather>\n<parameter=city>Seoul</parameter>\n</function>\n</tool_call>
+<|tool|>\n<tool_result>{\"temp\": 10}</tool_result><|endofturn|>
+<|tool_declare|>\n<tool>{}</tool><|endofturn|>
+<|file_sep|><|repo_name|><|fim_prefix|>a<|fim_middle|>b<|fim_suffix|>c<|fim_pad|>
+<vision><image_pad></vision> <vision><video_pad></vision>
+<function=f>\n<parameter=x>1\n</parameter>\n</function>
+PI:EMAIL PI:PHONE_NUM <|grounding|> <|markdown|> <|html|>
+Hello 👋 world 🌍🚀 ok 👨\xe2\x80\x8d👩\xe2\x80\x8d👧 ❤\xef\xb8\x8f 👍🏽 🇰🇷
+def f(x):\n    if x > 0:\n        return x ** 2\n    return -1\n
+fn main() {\n    let s = "안녕";\n    println!("{s}");\n}\n
+{ "name": "exaone", "ids": [1, 2.5, -3e4, null, true], "nested": {"a": 1} }
+a  b   c    d
+x ~y `code` ~/dir a~~b
