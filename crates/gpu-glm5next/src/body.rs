@@ -1615,7 +1615,7 @@ impl Body {
             stacks: Arc::new(swap::stacks(inputs, map_layers, Some(nextn.index))?),
         };
         let hosted = plan.host_runs().map_err(|e| GpuError::plan(WHAT, e))?;
-        GpuModel::load_placed_hosting(
+        let mut model = GpuModel::load_placed_hosting(
             file,
             target,
             card,
@@ -1637,7 +1637,11 @@ impl Body {
                     Some((plan, nextn)),
                 )
             },
-        )
+        )?;
+        // The target's totals are the target's alone: the draft's card bytes
+        // are the reserve its expert rule spread within.
+        model.grow_plan_reserve(plan.card_reserve_bytes())?;
+        Ok(model)
     }
 
     /// The joins: a KDA layer's q, k and v projections into one row stream

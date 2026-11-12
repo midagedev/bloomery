@@ -841,7 +841,7 @@ mod gate {
             &PlanLevers::from_levers(levers)?,
             &nextn,
         )?;
-        Ok(plan.nextn_card_bytes() + plan.arena_bytes)
+        Ok(plan.card_reserve_bytes())
     }
 
     /// `bloomery-serve --model glm [--place <place>] --plan` with both

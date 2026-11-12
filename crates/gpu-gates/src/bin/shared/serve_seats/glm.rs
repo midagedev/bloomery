@@ -1078,7 +1078,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         Some(n) => {
             let with = inputs.plan_nextn_slots(&machine, ctx, &plan_levers, n, slots)?;
             let beside = with.host_runs()?.1;
-            let bytes = with.nextn_card_bytes() + with.arena_bytes;
+            let bytes = with.card_reserve_bytes();
             (with.plan, beside, bytes)
         }
     };
