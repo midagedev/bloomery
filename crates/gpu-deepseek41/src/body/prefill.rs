@@ -2017,6 +2017,18 @@ impl Body {
         batch.proj.set_card_timing(gpu, on, layer_batches)
     }
 
+    /// Run the next prompt calls' default card blocks on the tile path the
+    /// steps and the streamed passes keep, in place of the grouped GEMM: a
+    /// gate's hosted-expert catcher alone sets it, holding the batch to the
+    /// steps' bits — no engine caller and no lever does (the GEMM is the
+    /// engine's card path). Refused before the batch's buffers are made
+    /// ([`prepare_prefill`]).
+    #[doc(hidden)]
+    pub fn set_batch_card_tiles(&mut self, on: bool) -> Result<(), GpuError> {
+        self.batch_mut()?.ffn.set_card_tiles(on);
+        Ok(())
+    }
+
     /// Whether the next prompt calls stream host experts: the load's
     /// `BLOOMERY_HOSTSTREAM` until set here, so one load can run both arms.
     /// Refused by name: before the batch's buffers are made

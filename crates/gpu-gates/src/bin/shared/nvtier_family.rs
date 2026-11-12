@@ -47,6 +47,7 @@ use std::sync::Arc;
 use bloomery_gpu::host::arena_leg::LegOff;
 use bloomery_gpu::host::nvtier::{NvTier, NvTierStats};
 use bloomery_gpu_gates::logits_band;
+use bloomery_gpu_gates::prompts::MARGIN_FLOOR;
 use bloomery_gpu_gates::residency::PlanRoom;
 use bloomery_gpu_gates::{GateError, checks_failed, record, tier, verdict};
 use bloomery_levers::{NVTIER_MEM, RESIDENCY_SERVING, ResidencyWord, residency_word};
@@ -560,6 +561,15 @@ pub trait Family {
     /// The run's failure, or a family that keeps no rows.
     fn run_rows(&self, _s: &mut Self::Session) -> Result<Rows, GateError> {
         Err("this family's run keeps no logits rows: its gate runs no rank clause".into())
+    }
+
+    /// The clarity margin the rank walk's first two positions read, where a
+    /// family's two orders move the top-two gap most: a family whose head gap
+    /// shifts were measured states its own here, as its gates state their σ;
+    /// every other family keeps the e2e floor at every position. Read only
+    /// where [`Family::takes_rank`] holds.
+    fn head_margin(&self) -> f32 {
+        MARGIN_FLOOR
     }
 
     /// The session cleared and dropped.
@@ -1089,7 +1099,9 @@ fn rank_lists(name: &str, plan: &PlanFacts, rank: &ExpertRank) -> bool {
 /// run of the same arm. The child holds its plan's paged lists to the rank's
 /// coldest host ids ([`rank_lists`]) and leaves its run beside the rank
 /// file; the parent walks the child's positions against its own within the
-/// logits band: the two plans keep other experts on the host and the NVMe
+/// logits band — the first two positions at the family's head margin
+/// ([`Family::head_margin`]), the rest the e2e floor: the two plans keep
+/// other experts on the host and the NVMe
 /// tier, so the rows sit within the band, not on bits.
 fn rank_clause<F: Family>(name: &str, f: &F, arm: Arm) -> Result<bool, GateError> {
     let arm = Arm {
@@ -1131,13 +1143,21 @@ fn rank_clause<F: Family>(name: &str, f: &F, arm: Arm) -> Result<bool, GateError
     let want = f.run_rows(&mut s)?;
     f.finish(s)?;
     let _ = std::fs::remove_dir_all(&dir);
-    let walk = logits_band::walk(
+    // PIN(2026-11-12): the walk's prompt rows record the fed id as each position's token, so
+    // every one is judged on the context both arms share (it parted at the first argmax flip
+    // before — 1 of the run's positions compared); the last prompt row records its argmax, the
+    // seed the greedy steps run on, so a parted seed ends the walk before the greedy rows. The
+    // head positions (0–1) read the family's head margin, the rest the e2e floor.
+    let head = f.head_margin();
+    let walk = logits_band::walk_at_head(
         &format!(
             "{name} rank: the paged arm through the file mapping under the rank (each layer's \
              coldest host ids on the NVMe tier) against the same arm without it (its id tail)"
         ),
         want.positions(),
         got.positions(),
+        head,
+        MARGIN_FLOOR,
     );
     Ok(walk.ok)
 }

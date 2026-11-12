@@ -260,6 +260,24 @@ pub struct GreedyReport {
 /// It is a classification threshold, not a band: raising it hides faults.
 pub const MARGIN_FLOOR: f32 = 0.5;
 
+/// The clear margin the V4.1 head positions — the first two compared
+/// positions of a prompt, where the batched call's sum order compounds
+/// through every layer and moves the top-two gap most — are judged at, in
+/// the clauses that walk a prompt from position 0 (the prefill gate's cases,
+/// the rank walks): the batch's grouped GEMM and the steps' gemv fold the
+/// same exact integer block sums in other f32 orders, so a head position's
+/// top-1 may part where the steps were clear by `MARGIN_FLOOR` without any
+/// hosted expert being wrong. Two times the largest head gap shift the two
+/// orders move, the two-card gate's `CLEAR_MARGIN` method
+/// (`gate_deepseek41_twocard.rs`); the real tier alone reads it — the
+/// fixture tier keeps `MARGIN_FLOOR` at every position.
+// PIN(2026-11-12): equals MARGIN_FLOOR — not yet measured. The 48-expert
+// hosting round (plan reserve on the stage card) moved the V4.1 real-tier
+// head gaps; the box measures the shifts at positions 0–1 (the prefill
+// gate's per-position lines, the E2 calibration caps) and pins 2 × the
+// largest here.
+pub const HEAD_MARGIN_V41: f32 = MARGIN_FLOOR;
+
 /// Judge our greedy continuations against the reference, prompt by prompt.
 ///
 /// `ours[i]` is our continuation for `reference[i]`, indexed like

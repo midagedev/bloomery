@@ -99,6 +99,13 @@
 //!   ([`seam_band`]) times the stream's max |x|; every seam before it is the
 //!   steps' bits, so a first difference elsewhere is a defect outside the
 //!   experts.
+//! - **Hosted-expert catcher.** At each `P` of [`CATCHER_PS`], the same
+//!   machinery with the batch's default card blocks on the tile path the
+//!   steps keep (`Body::set_batch_card_tiles`, the gate's switch alone): the
+//!   batch must be the steps bit for bit — no seam differs and the last
+//!   logits' fnv64 is the oracle's. The grouped GEMM's sum order is the only
+//!   difference the cases' band admits; with it gone, any difference is a
+//!   wrong hosted expert, and the clause names the first seam that differs.
 //! - **Fault, reset, clean.** A NaN in the scale of every card expert's
 //!   first gate row makes a prefill of [`FAULT_P`] ids fault; with the
 //!   scales put back and the model reset, a prefill of the smallest case's
@@ -290,13 +297,14 @@ mod gate {
     use bloomery_gpu_gates::logits_band::{
         LOGITS_CLEAR_PIN, LOGITS_MAX_PIN, LOGITS_RMS_PIN, LogitsBand,
     };
+    use bloomery_gpu_gates::prompts::{HEAD_MARGIN_V41, MARGIN_FLOOR};
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
         no_local_depot, patch_bytes, record, row_bytes, verdict,
     };
     use bloomery_levers::{
-        CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, PREFILL_CUT,
-        PREFILL_GROUP, R8, STEP_STATS,
+        CARD_BUDGET, CARD_DONTNEED, CARD_EXPERTS_CAP, CED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE,
+        PREFILL_CUT, PREFILL_GROUP, R8, STEP_STATS,
     };
     use cuda_core::{DeviceBuffer, DeviceCopy};
     use gguf::Split;
@@ -308,6 +316,7 @@ mod gate {
     use runtime::{Target, Want};
 
     use crate::{dspark, finite, split};
+    use bloomery_gpu_gates::kld;
     use bloomery_gpu_gates::rounding::gamma;
     use bloomery_gpu_gates::tier;
 
@@ -348,6 +357,9 @@ mod gate {
     /// shortest call, and a many-token one; the second is the longest the
     /// clause reads.
     const SEAM_PS: [usize; 2] = [1, 64];
+    /// The hosted-expert catcher's prompt lengths (module doc): the shortest
+    /// call, a partial batch, and the seam clause's longest.
+    const CATCHER_PS: [usize; 3] = [1, 13, 64];
     /// The wide-taps case: `P` and the features it keeps.
     const WIDE: (usize, usize) = (1100, 300);
     /// The rollback case's `P` and the refused cut inside it.
@@ -489,6 +501,7 @@ mod gate {
             ENGRAM_HELPER,
             STEP_STATS,
             CARD_BUDGET,
+            CARD_EXPERTS_CAP,
             HOST_POPULATE,
             HOST_LOCK,
             CARD_DONTNEED,
@@ -521,6 +534,12 @@ mod gate {
             & tier::witness("the triangle's reach (positions)", reach, 8 + 128 * 19)
             & tier::witness("the group-fault prefill (ids)", group_p, GROUP_FAULT_P);
         let split_list = splits(reach)?;
+        // The head positions' clarity margin (module doc, `prompts::HEAD_MARGIN_V41`): the real
+        // tier's alone — the fixture tier keeps the e2e floor at every position.
+        let head = match tier::Tier::from_env()? {
+            tier::Tier::Real => HEAD_MARGIN_V41,
+            tier::Tier::Fixture => MARGIN_FLOOR,
+        };
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let t = Instant::now();
         let mut m = body::open(
@@ -589,6 +608,7 @@ mod gate {
             .copied()
             .chain(splits.iter().map(|&(a, b)| a + b))
             .chain(args.extra.then_some(WIDE.0.max(CUT.0)))
+            .chain(CATCHER_PS.iter().copied())
             .max()
             .unwrap_or(1);
         let steps = (top + 1).min(ORACLE);
@@ -621,6 +641,8 @@ mod gate {
         if args.extra {
             wanted.extend([WIDE.0, CUT.0]);
         }
+        // The catcher's oracle rows: the steps' logits at its own `P`.
+        wanted.extend(CATCHER_PS);
         wanted.sort_unstable();
         wanted.dedup();
         let t = Instant::now();
@@ -663,13 +685,18 @@ mod gate {
                 println!("{NAME}: {what} {}", split::split(&stats, counts)?.line());
             }
             let p: usize = parts.iter().sum();
-            pass &= compare(what, &case, &oracle[&p], t, owner);
+            pass &= compare(what, &case, &oracle[&p], t, owner, p, head);
         }
+        crate::ds41_tier::sc(
+            "hosted experts: the card blocks on the tile path are the steps' bits, logits and \
+             every seam",
+        )?;
+        pass &= catcher_case(m, &ids, &oracle)?;
         let p_clean = args.cases.iter().copied().min().unwrap_or(1);
         crate::ds41_tier::sc(
             "fault, reset, clean: a poisoned prefill faults, the reset gives the oracle's numbers",
         )?;
-        pass &= fault_reset_case(m, &hp, &ids, &oracle, p_clean, dhp.window)?;
+        pass &= fault_reset_case(m, &hp, &ids, &oracle, p_clean, dhp.window, head)?;
         crate::ds41_tier::sc(
             "group fault: a fault in a group is the call's named error and poison",
         )?;
@@ -2440,6 +2467,7 @@ mod gate {
         oracle: &BTreeMap<usize, Snap>,
         p: usize,
         window: usize,
+        head: f32,
     ) -> Result<bool, GateError> {
         let t = Instant::now();
         let shown = |r: &Result<u32, GpuError>| match r {
@@ -2465,6 +2493,8 @@ mod gate {
                 &oracle[&p],
                 t,
                 crate::ds41_tier::last_owner(hp)?,
+                p,
+                head,
             ),
             Err(e) => {
                 println!(
@@ -3083,12 +3113,39 @@ mod gate {
     }
 
     /// The case against the oracle (module doc): one line, the band's every
-    /// measured value in it.
-    fn compare(what: &str, case: &Case, want: &Snap, t: Instant, owner: usize) -> bool {
+    /// measured value in it, and one line a compared position — the steps'
+    /// top1−top2 margin there and the batch's, whose difference is the gap
+    /// shift the head margin is derived from. The compared rows are the
+    /// call's last logits (position `p − 1`) and the step after (position
+    /// `p`); positions 0–1 read `head`, the rest [`MARGIN_FLOOR`].
+    fn compare(
+        what: &str,
+        case: &Case,
+        want: &Snap,
+        t: Instant,
+        owner: usize,
+        p: usize,
+        head: f32,
+    ) -> bool {
         let mut band = LogitsBand::new();
-        band.add(&case.snap.logits, &want.logits);
+        let fold = |band: &mut LogitsBand, got: &[u32], want: &[u32], pos: usize| {
+            let floor = if pos < 2 { head } else { MARGIN_FLOOR };
+            band.add_at(got, want, floor);
+            let g: Vec<f32> = got.iter().copied().map(f32::from_bits).collect();
+            let w: Vec<f32> = want.iter().copied().map(f32::from_bits).collect();
+            let (gid, g1, _, g2) = kld::top2(&g);
+            let (wid, w1, w2id, w2) = kld::top2(&w);
+            println!(
+                "{NAME}: case {what} position {pos}: the steps' top1−top2 {:.4} (top1 {wid}, top2 \
+                 {w2id}), the batch's {:.4} (top1 {gid}): gap shift {:+.4}, floor {floor}",
+                w1 - w2,
+                g1 - g2,
+                (g1 - g2) - (w1 - w2),
+            );
+        };
+        fold(&mut band, &case.snap.logits, &want.logits, p - 1);
         match (&case.snap.next, &want.next) {
-            (Some(g), Some(w)) => band.add(g, w),
+            (Some(g), Some(w)) => fold(&mut band, g, w, p),
             (None, None) => {}
             _ => band.aligned = false,
         }
@@ -3098,7 +3155,8 @@ mod gate {
         let reach = |n: &Need| n.layers.get(owner).map_or(0, |l| l.full - n.first);
         println!(
             "{NAME}: case {what}: taps {} rows from {} {} | granted cuts claimed {} | logits \
-             band: clear top-1 {} of {} (pin {LOGITS_CLEAR_PIN}), max |Δlogit| {:.3e} (pin \
+             band: clear top-1 {} of {} (pin {LOGITS_CLEAR_PIN}, clear = margin >= {MARGIN_FLOOR} \
+             beyond 0–1, {head} at 0–1), max |Δlogit| {:.3e} (pin \
              {LOGITS_MAX_PIN}), rms {:.3e} (pin {LOGITS_RMS_PIN}) {} | layer {owner} block cut \
              by {:?} | {:.1} s: {}",
             case.taps.len(),
@@ -3372,6 +3430,91 @@ mod gate {
                 },
                 if bound > 0.0 { max_diff / bound } else { 0.0 },
                 verdict(seam_ok)
+            );
+        }
+        m.reset()?;
+        Ok(ok)
+    }
+
+    /// The hosted-expert catcher (module doc): the prompt batch at each `P`
+    /// of [`CATCHER_PS`] with the default card blocks on the tile path
+    /// (`Body::set_batch_card_tiles`), held to the steps bit for bit — every
+    /// seam the [`seam_record`]'s bits and the last logits the oracle's. The
+    /// model is left reset, the switch off.
+    fn catcher_case(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+        oracle: &BTreeMap<usize, Snap>,
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        for &p in CATCHER_PS.iter() {
+            let (rec, _) = seam_record(m, &ids[..p])?;
+            m.reset()?;
+            // Per recorded seam, in seam order: tokens seen, tokens that
+            // differ, the largest distance.
+            let mut seen = vec![(0usize, 0usize, 0.0f64); rec.len()];
+            m.body_parts(NAME)?.2.set_batch_card_tiles(true)?;
+            body::prefill_observed(m, &ids[..p], &mut |gpu, seam| {
+                gpu.stream().synchronize()?;
+                let n4 = seam.streams.len() / crate::gate::T_MAX_TOKENS;
+                let mut host = vec![0.0f32; seam.streams.len()];
+                seam.streams.copy_to_host(gpu.stream(), &mut host)?;
+                let Some(i) = rec.iter().position(|(k, _)| *k == (seam.kind, seam.layer)) else {
+                    return Err(GpuError::State {
+                        what: NAME,
+                        missing: "a recorded seam for every batch seam",
+                    });
+                };
+                let (_, want) = &rec[i];
+                let s = &mut seen[i];
+                for t in 0..seam.tokens {
+                    let pos = seam.first as usize + t;
+                    let got = &host[(seam.at + t) * n4..(seam.at + t + 1) * n4];
+                    s.0 += 1;
+                    if got
+                        .iter()
+                        .zip(&want[pos])
+                        .any(|(a, b)| a.to_bits() != b.to_bits())
+                    {
+                        s.1 += 1;
+                        for (a, b) in got.iter().zip(&want[pos]) {
+                            s.2 = s.2.max((f64::from(*a) - f64::from(*b)).abs());
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            m.body_parts(NAME)?.2.set_batch_card_tiles(false)?;
+            let got = bits(&m.logits()?);
+            let want = oracle
+                .get(&p)
+                .map(|s| s.logits.as_slice())
+                .ok_or_else(|| format!("{NAME}: the oracle holds no logits at {p}"))?;
+            let same = got == want;
+            let fnv = |row: &[u32]| Fnv1a64::default().u32s(row).value();
+            let off = seen.iter().position(|s| s.1 > 0);
+            let seams_ok = off.is_none();
+            let pass = same && seams_ok;
+            ok &= pass;
+            let off_line = off.map_or(String::new(), |i| {
+                let (kind, layer) = rec[i].0;
+                format!(
+                    "; red: the first seam that differs is {kind:?} layer {layer}: {} of {} \
+                     tokens, max |Δ| {:.3e}",
+                    seen[i].1, seen[i].0, seen[i].2
+                )
+            });
+            println!(
+                "{NAME}: catcher P={p}: the card blocks on the tile path: logits fnv64 \
+                 {:016x} (the oracle's {:016x}) {} | every seam the steps' bits, {} seams \
+                 {}{}: {}",
+                fnv(&got),
+                fnv(want),
+                verdict(same),
+                rec.len(),
+                verdict(seams_ok),
+                off_line,
+                verdict(pass)
             );
         }
         m.reset()?;

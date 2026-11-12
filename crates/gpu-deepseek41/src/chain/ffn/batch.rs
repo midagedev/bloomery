@@ -1534,6 +1534,12 @@ pub struct FfnBatch {
     /// The common card leg's launches and buffers, for a block of a layer on
     /// it ([`FfnBatch::prepare_leg`]).
     leg: Option<(CardLeg, LegBufs)>,
+    /// The default block's card experts on the tile path in place of the
+    /// grouped GEMM: set only by a gate's hosted-expert catcher
+    /// ([`Body::set_batch_card_tiles`]), which holds the batch to the steps'
+    /// bits — the tile path is the order the steps and the streamed passes
+    /// keep. The engine's own calls never set it.
+    gate_tiles: bool,
 }
 
 /// A tiered block's routing as the shadow left it for the post's card sum
@@ -1720,7 +1726,17 @@ impl FfnBatch {
             },
             ssel: None,
             leg: None,
+            gate_tiles: false,
         })
+    }
+
+    /// Run the default blocks' card experts on the tile path from the next
+    /// prompt call on: a gate's hosted-expert catcher alone
+    /// ([`Body::set_batch_card_tiles`]); no engine caller and no lever sets
+    /// it.
+    #[doc(hidden)]
+    pub fn set_card_tiles(&mut self, on: bool) {
+        self.gate_tiles = on;
     }
 
     /// The streamed places a prompt call under host streaming writes, one a
@@ -2595,7 +2611,12 @@ impl FfnPiece {
         [at, u]: [usize; 2],
         tiered: bool,
     ) -> Result<(), GpuError> {
-        self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], CardPath::Gemm, false)?;
+        let path = if b.gate_tiles {
+            CardPath::Tiles
+        } else {
+            CardPath::Gemm
+        };
+        self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], path, false)?;
         self.enqueue_block_finish(gpu, i, b, [layer, set], [at, u], tiered)
     }
 

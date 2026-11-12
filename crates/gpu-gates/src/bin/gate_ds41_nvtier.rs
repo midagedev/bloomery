@@ -52,6 +52,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{Body, OpenCfg, PrefillMode};
     use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::prompts::{HEAD_MARGIN_V41, MARGIN_FLOOR};
     use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, record, ref_model_path, tier};
     use bloomery_levers::{EXPERT_RANK, ResidencyAt, residency_unset};
     use gguf::Split;
@@ -78,6 +79,9 @@ mod gate {
         path: PathBuf,
         cfg: OpenCfg,
         machine: M,
+        /// The rank walk's head margin: the real tier's [`HEAD_MARGIN_V41`],
+        /// the fixture tier's the e2e floor.
+        head: f32,
     }
 
     impl<M: Fn(usize) -> Machine + Copy> Ds41<M> {
@@ -158,6 +162,12 @@ mod gate {
             true
         }
 
+        /// The rank walk's head margin, parsed once at `run` from the tier: the real tier's
+        /// [`HEAD_MARGIN_V41`], the fixture tier's the e2e floor.
+        fn head_margin(&self) -> f32 {
+            self.head
+        }
+
         fn rank_child(&self, cmd: &mut Command, rank: &Path) -> Result<(), GateError> {
             cmd.env(EXPERT_RANK, rank);
             Ok(())
@@ -215,9 +225,14 @@ mod gate {
         }
 
         fn run_rows(&self, s: &mut Session<Body>) -> Result<Rows, GateError> {
-            // The tier gate's rank clause run shape: one decode step a
-            // position over the prompt ids, then the greedy steps — every
-            // position a row the band can walk.
+            // The rank clause's run shape: one decode step a position over
+            // the prompt ids, then the greedy steps — every position a row
+            // the band walks. Each prompt position records the id that was
+            // fed as its token — both arms feed the same ids, so the walk
+            // judges every prompt row on the same context — save the last,
+            // which records its argmax, the seed the greedy steps run on: a
+            // parted seed ends the walk before the greedy rows instead of
+            // judging rows that ran on other contexts.
             let row_of = |out: Out<'_>| -> Result<(u32, Vec<f32>), GateError> {
                 match out {
                     Out::Logits { argmax, row } => Ok((argmax, row.to_vec())),
@@ -228,13 +243,15 @@ mod gate {
             };
             let ids = prose_ids("engram", RANK_P)?;
             let mut run = Rows::default();
-            for &id in &ids {
-                let (token, row) = row_of(s.step(id, Want::Logits)?)?;
-                run.push(token, row);
+            let mut seed = 0;
+            for (k, &id) in ids.iter().enumerate() {
+                let (argmax, row) = row_of(s.step(id, Want::Logits)?)?;
+                seed = argmax;
+                run.push(if k + 1 == ids.len() { argmax } else { id }, row);
             }
             for _ in 0..STEPS {
-                let next = run.tokens[run.tokens.len() - 1];
-                let (token, row) = row_of(s.step(next, Want::Logits)?)?;
+                let (token, row) = row_of(s.step(seed, Want::Logits)?)?;
+                seed = token;
                 run.push(token, row);
             }
             Ok(run)
@@ -297,6 +314,18 @@ mod gate {
         cfg.place = tier::plan_levers(&head, &levers, 0)?;
         drop(head);
         let machine = Place::A.machine(None, None)?;
-        crate::nvtier_family::gate(NAME, &Ds41 { path, cfg, machine })
+        let head = match tier::Tier::from_env()? {
+            tier::Tier::Real => HEAD_MARGIN_V41,
+            tier::Tier::Fixture => MARGIN_FLOOR,
+        };
+        crate::nvtier_family::gate(
+            NAME,
+            &Ds41 {
+                path,
+                cfg,
+                machine,
+                head,
+            },
+        )
     }
 }
