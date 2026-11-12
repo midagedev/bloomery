@@ -385,7 +385,7 @@ fn an_architecture_no_row_states_is_refused() {
     let split = gguf::Split::open(&path).unwrap();
     match read(&split) {
         Err(PlacementError::Metadata { key, detail }) => {
-            assert_eq!(key, "general.architecture");
+            assert_eq!(key, crate::arch::ARCHITECTURE_KEY);
             assert!(detail.contains("\"exaone-test\""), "{detail}");
             assert!(detail.contains("no description row"), "{detail}");
         }

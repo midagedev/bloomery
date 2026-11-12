@@ -4492,6 +4492,17 @@ gate-raon1-tokenizer:
 
 # --- end raon-model ---
 
+# --- exaone-moe (K-EXAONE-2.0) ---
+
+# The exaone-moe vocabulary: our ids equal mainline llama-tokenize's on every NFC case of crates/tokenizer/tests/cases.txt and
+# cases-exaone.txt, in both parse modes (tests/exaone-ids.tsv), and Hugging Face tokenizers' on the cases that are not NFC
+# (tests/exaone-nfc-ids.tsv: the model's tokenizer.json normalizes them, the reference does not), and the header's end tokens end
+# generation; both pin files are written by crates/tokenizer/tools/exaone-oracle.sh. The vocabulary only: seconds.
+gate-exaone-tokenizer:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-tokenizer --test exaone -- --include-ignored --nocapture'
+
+# --- end exaone-moe ---
+
 # --- kimik3-mla (Kimi K3's gated MLA layer) --------------------------------------------------------------------------------------------
 
 # Kimi K3's gated no-RoPE MLA layer on the card at the layer's shapes (2 and 96 heads, nope 128, 64 unrotated rope lanes beside the
