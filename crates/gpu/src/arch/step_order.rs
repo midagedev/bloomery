@@ -351,6 +351,7 @@ pub fn of(arch: model::arch::Arch) -> StepOrder {
         Arch::Flint => ("Flint", FaultSite::ALL),
         Arch::ExaoneMoe => ("ExaoneMoe", FaultSite::ALL),
         // Reader only: a neutral decoding order, not a runnable step.
+        Arch::Raon1Nano => ("Raon1Nano", FaultSite::ALL),
         Arch::MistralLarge4 => ("MistralLarge4", FaultSite::ALL),
         Arch::KimiK3 => ("KimiK3", SOLAR2),
     };
@@ -364,7 +365,7 @@ mod tests {
 
     /// Every architecture; a new one is a compile error here until it is
     /// listed (and [`of`] gives it a table).
-    fn every_arch() -> [Arch; 18] {
+    fn every_arch() -> [Arch; 19] {
         let all = [
             Arch::Deepseek2,
             Arch::Deepseek41,
@@ -375,6 +376,7 @@ mod tests {
             Arch::SolarOpen2,
             Arch::MiniMaxM3,
             Arch::Raon1,
+            Arch::Raon1Nano,
             Arch::NemotronH,
             Arch::NemotronHMoe,
             Arch::GemmaEmbedding,
@@ -396,6 +398,7 @@ mod tests {
                 | Arch::SolarOpen2
                 | Arch::MiniMaxM3
                 | Arch::Raon1
+                | Arch::Raon1Nano
                 | Arch::NemotronH
                 | Arch::NemotronHMoe
                 | Arch::GemmaEmbedding

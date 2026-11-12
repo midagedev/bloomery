@@ -13,6 +13,7 @@ glm5next,glm5-next	Glm5next	yes	no	glm5next
 mimo2	Mimo2	yes	yes	mimo2
 minimax-m3	MiniMaxM3	yes	no	minimaxm31
 raon1	Raon1	yes	no	-
+raon1nano	Raon1Nano	yes	no	-
 solar-open2	SolarOpen2	yes	no	solar2
 nemotron_h	NemotronH	yes	no	nemotron
 nemotron_h_moe	NemotronHMoe	yes	no	nemotron-bolt

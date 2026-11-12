@@ -91,6 +91,7 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         | Arch::Lfm3
         | Arch::MiniMaxM3
         | Arch::Raon1
+        | Arch::Raon1Nano
         | Arch::SolarOpen2
         | Arch::NemotronH
         | Arch::NemotronHMoe
@@ -118,6 +119,7 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::MiMo2
         | Arch::MiniMaxM3
         | Arch::Raon1
+        | Arch::Raon1Nano
         | Arch::SolarOpen2
         | Arch::Deepseek41
         | Arch::Deepseek4

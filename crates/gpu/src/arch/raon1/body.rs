@@ -217,7 +217,13 @@ fn wide_dims(hp: &Hparams, kda: &KdaDims, mla: &MlaDims) -> Result<WideDims, Gpu
             ),
         ));
     }
-    let e = hp.experts;
+    let Some(e) = &hp.experts else {
+        return Err(GpuError::shape(
+            WHAT,
+            "the file routes no experts; the card's wide arm reads the mini dialect's routed \
+             blocks",
+        ));
+    };
     Ok(WideDims {
         embd: hp.n_embd,
         attn,
@@ -227,7 +233,7 @@ fn wide_dims(hp: &Hparams, kda: &KdaDims, mla: &MlaDims) -> Result<WideDims, Gpu
         dense_ff: hp.dense_ff,
         shared_ff: e.shared_ff(),
         expert_ff: e.ff,
-        ff_rows: wide_ff_rows(hp.dense_ff, &e),
+        ff_rows: wide_ff_rows(hp.dense_ff, e),
     })
 }
 
@@ -631,7 +637,13 @@ impl Body {
                 ),
             ));
         }
-        let e = hp.experts;
+        let Some(e) = &hp.experts else {
+            return Err(GpuError::shape(
+                WHAT,
+                "the file routes no experts; the card's body runs the mini dialect's routed \
+                 blocks",
+            ));
+        };
         if e.n_expert != ffn::sigmoid_128_6::N_EXPERT
             || e.n_used != ffn::sigmoid_128_6::N_USED
             || !e.weights_norm
@@ -650,10 +662,20 @@ impl Body {
             ));
         }
         let (kda, mla) = dims(&hp)?;
-        let act = Act::Situ {
-            beta: hp.situ.gate_beta,
-            linear_beta: hp.situ.value_beta,
+        let model::arch::models::Act::Situ {
+            gate_beta: beta,
+            value_beta: linear_beta,
+        } = hp.act
+        else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the blocks' activation is {}, the card's runs situ",
+                    hp.act.what()
+                ),
+            ));
         };
+        let act = Act::Situ { beta, linear_beta };
         act.code(WHAT)?;
         let glu = |l: usize, (gate, up, down): (String, String, String), ff: usize| {
             Ok::<Glu, GpuError>(Glu {
@@ -725,7 +747,7 @@ impl Body {
             &mut acts,
             layers.iter().flat_map(Layer::mixer_sites),
         )?;
-        let ff = (dense_block_ff(hp.dense_ff, &e), e.ff);
+        let ff = (dense_block_ff(hp.dense_ff, e), e.ff);
         let wd = wide_dims(&hp, &kda, &mla)?;
         let wide_off = wide_refusal(&layers, w, &wd);
         let stage = rda::stage_len(&kda)
@@ -1070,7 +1092,13 @@ impl Body {
             let gain = w.f32_buf(STEP, &names::ffn_norm(l))?;
             gpu.elem()
                 .enqueue_rms_norm(stream, u, gain, hp.rms_eps, n, m, un)?;
-            let rule = (*act, hp.experts.weights_scale);
+            let rule = (
+                *act,
+                hp.experts
+                    .as_ref()
+                    .expect("the admission refused a file that routes none")
+                    .weights_scale,
+            );
             let at_l = (l, &layer.ffn);
             if let Some(kit) = wide_kit.as_mut() {
                 wide::ffn(&cx, kit, rule, at_l, m, un, br)?;
@@ -1198,8 +1226,11 @@ mod tests {
     /// count of shared experts of the caller's.
     fn header(dense_ff: usize, ff: usize, n_shared: usize) -> Hparams {
         Hparams {
+            arch: model::arch::models::Arch::Raon1,
             n_layer: 3,
+            n_trunk: 3,
             n_embd: 2560,
+            heads: vec![40; 3],
             n_head: 40,
             kda: Keys {
                 conv: 4,
@@ -1221,15 +1252,21 @@ mod tests {
                 eps: 1e-5,
                 magnitude: 2.0,
             },
-            situ: Situ {
+            situ: Some(Situ {
+                gate_beta: 4.0,
+                value_beta: 4.0,
+            }),
+            act: model::arch::models::Act::Situ {
                 gate_beta: 4.0,
                 value_beta: 4.0,
             },
+            ple: None,
+            head_tied: false,
             n_vocab: 1024,
             n_ctx_train: 4096,
             dense_lead: 1,
             dense_ff,
-            experts: Experts {
+            experts: Some(Experts {
                 n_expert: N_EXPERT,
                 n_used: N_USED,
                 ff,
@@ -1237,7 +1274,8 @@ mod tests {
                 shared_width: ff * n_shared,
                 weights_scale: 1.0,
                 weights_norm: true,
-            },
+            }),
+            dialect: model::arch::raon1::roles::Dialect::Split,
             kinds: vec![Kind::Rda, Kind::Rda, Kind::Mla],
             defaults: Vec::new(),
         }

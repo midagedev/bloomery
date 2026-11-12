@@ -820,6 +820,13 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 dilation,
             });
         }
+        if let Some(&Extra::PerLayerEmbed { width }) = layer
+            .extras
+            .iter()
+            .find(|e| matches!(e, Extra::PerLayerEmbed { .. }))
+        {
+            at(Need::PerLayerInput { width });
+        }
     }
     let mut model = |n: Need| out.push((n, None));
     let mut shapes: Vec<(u32, u32)> = Vec::new();

@@ -9,7 +9,7 @@
 //! A row is data, not code: adding an architecture is a row here and a registry
 //! row, and a fact a new file states as a key leaves the row.
 
-use models::{Arch, ReasoningFormat, RopeMode, RouterNorm, ToolFormat};
+use models::{Act, Arch, ReasoningFormat, RopeMode, RouterNorm, ToolFormat};
 
 /// The order a SwiGLU clamp clamps in: which side of the activation a limit
 /// reaches first. The two orders differ only where `g > L`.
@@ -70,6 +70,24 @@ pub enum ChatParsers {
     FromTemplate,
 }
 
+/// What the head reads when the file carries no `output.weight`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadWeight {
+    /// Its own matrix; a file without it is refused by the missing tensor's name.
+    Own,
+    /// The token embedding's matrix (tied).
+    Tied,
+}
+
+/// How a per-layer input of `embedding_length_per_layer_input` values is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PerLayerRule {
+    /// Layout 2, the converter's: `p = (RMSNorm(W_mp·e) + √width·table[t]) / √2`, the table one
+    /// row of `width` values a token a layer, gated into every stream after the layer's
+    /// feed-forward mix.
+    TokenTable,
+}
+
 /// The source line of each fact of a row, as its `defaults` line prints it.
 #[derive(Clone, Copy, Debug)]
 pub struct RuleSources {
@@ -78,6 +96,11 @@ pub struct RuleSources {
     pub router_norm: &'static str,
     pub rope_fallback: &'static str,
     pub chat: &'static str,
+    /// The facts only a row that states them reads: `-` where the row's fact is
+    /// that the architecture has none.
+    pub ffn_act: &'static str,
+    pub head: &'static str,
+    pub per_layer: &'static str,
 }
 
 /// One architecture's facts no GGUF key states, each with its source. The
@@ -97,6 +120,15 @@ pub struct ArchRules {
     /// `None`: the key is the only source, and its absence is refused.
     pub rope_fallback: Option<RopeFallback>,
     pub chat: ChatParsers,
+    /// The activation the feed-forward blocks take when the file's keys name
+    /// none; `None`: the file's keys state it.
+    pub ffn_act: Option<Act>,
+    /// What the head reads when the file carries no `output.weight`.
+    pub head: HeadWeight,
+    /// How the per-layer input is made when the file carries
+    /// `embedding_length_per_layer_input`; `None`: no file of the architecture
+    /// carries one.
+    pub per_layer: Option<PerLayerRule>,
     pub sources: RuleSources,
 }
 
@@ -179,6 +211,41 @@ impl ArchRules {
             self.sources.chat
         ))
     }
+
+    /// `ffn act = <what> (<source>)`: the row's activation, for a read whose
+    /// file named none. `None`: the row states no activation.
+    #[must_use]
+    pub fn ffn_act_line(&self) -> Option<String> {
+        self.ffn_act
+            .map(|act| format!("ffn act = {} ({})", act.what(), self.sources.ffn_act))
+    }
+
+    /// `head = tied (<source>)`: the head reads the token embedding, for a read
+    /// whose file carries no `output.weight`. `None`: the row states no tie.
+    #[must_use]
+    pub fn tied_head_line(&self) -> Option<String> {
+        (self.head == HeadWeight::Tied).then(|| format!("head = tied ({})", self.sources.head))
+    }
+
+    /// `per-layer input = <what> (<source>)`: the row's per-layer-input rule,
+    /// for a read whose file carries the key. `None`: the row states none.
+    #[must_use]
+    pub fn per_layer_line(&self) -> Option<String> {
+        self.per_layer.map(|rule| {
+            format!(
+                "per-layer input = {} ({})",
+                per_layer_name(rule),
+                self.sources.per_layer
+            )
+        })
+    }
+}
+
+/// The per-layer-input rule as a `defaults` line names it.
+const fn per_layer_name(rule: PerLayerRule) -> &'static str {
+    match rule {
+        PerLayerRule::TokenTable => "token table, layout 2",
+    }
 }
 
 /// A limit of at most this clamps nothing (llama-graph.cpp:2064's `eps`).
@@ -240,12 +307,18 @@ static ROWS: &[ArchRules] = &[
             tools: Some(ToolFormat::GlmXml),
             reasoning: Some(ReasoningFormat::THINK),
         },
+        ffn_act: None,
+        head: HeadWeight::Own,
+        per_layer: None,
         sources: RuleSources {
             pairs: "llama.cpp src/llama-model.cpp:3769,3834: Flint's rope type is NEOX",
             clamp: "llama.cpp src/models/flint.cpp:3-19: the loader reads no clamp key",
             router_norm: "llama.cpp src/llama-graph.cpp:2401-2403: the selected sum clamped at 2^-14",
             rope_fallback: "llama.cpp src/models/flint.cpp:16: the pattern array is required",
             chat: "the flint family's own convention, which its reader carried before the row",
+            ffn_act: "-",
+            head: "-",
+            per_layer: "-",
         },
     },
     ArchRules {
@@ -260,12 +333,49 @@ static ROWS: &[ArchRules] = &[
         // The loader ropes a layer exactly where the sliding-window pattern puts it.
         rope_fallback: Some(RopeFallback::WhereWindowed),
         chat: ChatParsers::FromTemplate,
+        ffn_act: None,
+        head: HeadWeight::Own,
+        per_layer: None,
         sources: RuleSources {
             pairs: "llama.cpp src/llama-model.cpp:3799,3834: EXAONE's rope type is NEOX",
             clamp: "LG modeling_exaone_moe.py:227-232: silu(min(g, L))·clamp(u, ±L)",
             router_norm: "LG modeling_exaone_moe.py:269-270: the kept weights over their sum + 1e-20",
             rope_fallback: "llama.cpp src/models/exaone-moe.cpp:7: rope_pattern is is_swa_impl",
             chat: "the file's own template, read by models' formats table",
+            ffn_act: "-",
+            head: "-",
+            per_layer: "-",
+        },
+    },
+    ArchRules {
+        arch: Arch::Raon1Nano,
+        // No layer rotates: the latent layers are NoPE and the delta layers carry no rope at all,
+        // so no head's values are paired.
+        pairs: RopeMode::None,
+        // The loader reads no clamp key and no layer clamps.
+        clamp: ClampOrder::None,
+        // A dense feed-forward block in every layer (raon1nano.cpp:23-24): no router, no divisor.
+        router_norm: RouterNorm::None,
+        // No layer turns, so no layer's rope is named by a pattern the file might carry.
+        rope_fallback: None,
+        chat: ChatParsers::Fixed {
+            tools: Some(ToolFormat::QwenXml),
+            reasoning: Some(ReasoningFormat::THINK),
+        },
+        // The file's keys name no activation: every block takes one SwiGLU over the fused
+        // [gate | up] rows of `ffn_up`.
+        ffn_act: Some(Act::SwiGlu { limit: None }),
+        head: HeadWeight::Tied,
+        per_layer: Some(PerLayerRule::TokenTable),
+        sources: RuleSources {
+            pairs: "llama.cpp src/models/raon1nano.cpp:334: NoPE — no layer rotates",
+            clamp: "llama.cpp src/models/raon1nano.cpp:7-63: the loader reads no clamp key",
+            router_norm: "llama.cpp src/models/raon1nano.cpp:23-24: a dense FFN in every layer",
+            rope_fallback: "-",
+            chat: "the raon family's own convention, which its reader carried before the row",
+            ffn_act: "llama.cpp src/models/raon1nano.cpp:152-154: one LLM_FFN_SWIGLU on ffn_up's [gate | up] rows",
+            head: "the file carries no output tensor and LG's config ties the word embeddings (hub modeling_raon1_nano.py: tie_word_embeddings)",
+            per_layer: "llama.cpp src/models/raon1nano.cpp:367-383: p = (RMSNorm(W_mp·e) + √n_ple·table[t])/√2; hub modeling_raon1_nano.py:495-502",
         },
     },
 ];
@@ -279,22 +389,87 @@ pub fn row(arch: &str) -> Option<&'static ArchRules> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClampOrder, RopeFallback, row};
+    use super::{ClampOrder, HeadWeight, PerLayerRule, ROWS, RopeFallback, row};
     use models::Act;
 
-    /// A row is named by its architecture's own string, and the two rows this
+    /// A row is named by its architecture's own string, and the rows this
     /// table opens with state the facts their reader refuses to guess.
     #[test]
     fn a_row_is_named_by_its_architectures_string() {
         let flint = row("flint").expect("the flint row");
         let exaone = row("exaone-moe").expect("the exaone-moe row");
+        let nano = row("raon1nano").expect("the raon1nano row");
         assert_eq!(flint.arch, models::Arch::Flint);
         assert_eq!(exaone.arch, models::Arch::ExaoneMoe);
+        assert_eq!(nano.arch, models::Arch::Raon1Nano);
         assert_eq!(flint.clamp, ClampOrder::None);
         assert_eq!(exaone.clamp, ClampOrder::GateFirst);
         assert_eq!(flint.rope_fallback, None);
         assert_eq!(exaone.rope_fallback, Some(RopeFallback::WhereWindowed));
+        assert_eq!(nano.ffn_act, Some(Act::SwiGlu { limit: None }));
+        assert_eq!(nano.head, HeadWeight::Tied);
+        assert_eq!(nano.per_layer, Some(PerLayerRule::TokenTable));
         assert!(row("llama").is_none(), "no row for another family");
+        assert!(
+            row("raon1").is_none(),
+            "the mini dialect states its facts by its keys"
+        );
+    }
+
+    /// Every fact a row states carries the line that states it, and the lines
+    /// name their row's values: a row that states no fact of the reader's own
+    /// reads none of them. Mutant: a source dropped for a stated fact.
+    #[test]
+    fn a_stated_fact_carries_its_source_line() {
+        for r in ROWS {
+            for (what, stated, source, line) in [
+                (
+                    "ffn act",
+                    r.ffn_act.is_some(),
+                    r.sources.ffn_act,
+                    r.ffn_act_line(),
+                ),
+                (
+                    "head",
+                    r.head == HeadWeight::Tied,
+                    r.sources.head,
+                    r.tied_head_line(),
+                ),
+                (
+                    "per-layer input",
+                    r.per_layer.is_some(),
+                    r.sources.per_layer,
+                    r.per_layer_line(),
+                ),
+            ] {
+                assert_ne!(
+                    stated,
+                    source == "-",
+                    "{}: {what}'s source is {source:?} for a {} fact",
+                    r.arch.name(),
+                    if stated { "stated" } else { "denied" }
+                );
+                assert_eq!(
+                    stated,
+                    line.is_some(),
+                    "{}: {what} states a fact with no line, or a line for none",
+                    r.arch.name()
+                );
+            }
+        }
+        let nano = row("raon1nano").unwrap();
+        assert_eq!(
+            nano.ffn_act_line(),
+            Some("ffn act = SwiGLU (llama.cpp src/models/raon1nano.cpp:152-154: one LLM_FFN_SWIGLU on ffn_up's [gate | up] rows)".to_string())
+        );
+        assert!(
+            nano.tied_head_line()
+                .is_some_and(|l| l.starts_with("head = tied ("))
+        );
+        assert!(
+            nano.per_layer_line()
+                .is_some_and(|l| l.starts_with("per-layer input = token table, layout 2 ("))
+        );
     }
 
     /// A limit of at most 1e-6 clamps nothing under either order; a larger one

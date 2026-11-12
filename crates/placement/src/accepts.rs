@@ -110,6 +110,9 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::MuseSpark => Some(Program::MuseSparkBody),
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
         Arch::KimiK3 => Some(Program::KimiK3Body),
+        // The raon1 body runs the Mini dialect's split stems, situ blocks and untied head; it
+        // does not run raon1nano's per-layer inputs, fused stems or tied head yet.
+        Arch::Raon1Nano => None,
         Arch::Lfm3 => None,
     }
 }

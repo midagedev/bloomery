@@ -94,6 +94,10 @@ pub enum Arch {
     /// Raon-1: Raon delta attention layers (decoupled erase and write gates) with a gated NoPE
     /// latent-attention layer every few, `situ` experts with a shared one, Raon_mHC streams.
     Raon1,
+    /// Raon-1-nano: the raon1 trunk with a dense SwiGLU block in every layer, per-layer inputs
+    /// from a token table, the head tied to the token embedding and one next-token layer its own
+    /// file carries. Read by the `raon1` reader; no program runs it yet.
+    Raon1Nano,
     GemmaEmbedding,
     GemmaEmbedding2,
     /// Flint: dense lead, sigmoid MoE with one shared MLP, and independently
@@ -148,6 +152,7 @@ impl Arch {
             Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::SolarOpen2 => "solar-open2",
             Arch::Raon1 => "raon1",
+            Arch::Raon1Nano => "raon1nano",
             Arch::GemmaEmbedding => "gemma-embedding",
             Arch::GemmaEmbedding2 => "gemma-embedding2",
             Arch::Flint => "flint",
@@ -888,6 +893,12 @@ pub enum Extra {
     Engram,
     /// A per-layer n-gram embedding, before the layer's attention mix.
     Ple,
+    /// A per-layer input from a token table (`embedding_length_per_layer_input` wide): every
+    /// layer's own input combines a projection of the token row with the token's table row and is
+    /// gated into the streams after the layer's feed-forward mix.
+    PerLayerEmbed {
+        width: u32,
+    },
 }
 
 /// The n-gram embedding dimensions: every site's rows are gathered by a hash

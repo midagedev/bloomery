@@ -205,6 +205,10 @@ pub enum Arch {
     SolarOpen2,
     MiniMaxM3,
     Raon1,
+    /// Raon-1-nano: the raon1 reader's second dialect, whose file carries the
+    /// per-layer inputs and one next-token layer its own file carries. No
+    /// executable program is registered.
+    Raon1Nano,
     NemotronH,
     NemotronHMoe,
     GemmaEmbedding,
@@ -252,6 +256,7 @@ impl Arch {
             "solar-open2" => Ok(Arch::SolarOpen2),
             "minimax-m3" => Ok(Arch::MiniMaxM3),
             "raon1" => Ok(Arch::Raon1),
+            "raon1nano" => Ok(Arch::Raon1Nano),
             "nemotron_h" => Ok(Arch::NemotronH),
             "nemotron_h_moe" => Ok(Arch::NemotronHMoe),
             GEMMA_EMBEDDING => Ok(Arch::GemmaEmbedding),
@@ -283,6 +288,7 @@ impl Arch {
             Arch::SolarOpen2 => "solar-open2",
             Arch::MiniMaxM3 => "minimax-m3",
             Arch::Raon1 => "raon1",
+            Arch::Raon1Nano => "raon1nano",
             Arch::NemotronH => "nemotron_h",
             Arch::NemotronHMoe => "nemotron_h_moe",
             Arch::GemmaEmbedding => GEMMA_EMBEDDING,
