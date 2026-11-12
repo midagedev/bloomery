@@ -163,6 +163,9 @@ pub enum Need {
     ExpertShapes { shapes: u32 },
     /// A dense feed-forward layer of `ff` values.
     DenseFfn { ff: u32 },
+    /// A dense layer of `ff` values of the gate-first SwiGLU clamp
+    /// ([`Act::SwiGluGateFirst`]).
+    DenseSwigluGateFirst { ff: u32 },
     /// A dense squared-ReLU layer of `ff` values, with no gate.
     ReluSqr { ff: u32 },
     /// A dense GELU GLU layer of `ff` values.
@@ -491,6 +494,9 @@ impl fmt::Display for Need {
                 "routed stacks whose expert count and width differ by layer ({shapes} shapes)"
             ),
             Need::DenseFfn { ff } => write!(f, "dense SwiGLU layer: ff {ff}"),
+            Need::DenseSwigluGateFirst { ff } => {
+                write!(f, "dense gate-first SwiGLU layer: ff {ff}")
+            }
             Need::ReluSqr { ff } => write!(f, "squared-ReLU dense layer: ff {ff}"),
             Need::GeGlu { ff } => write!(f, "dense GELU GLU layer: ff {ff}"),
             Need::SwigluOai { ff } => write!(f, "dense swigluoai layer: ff {ff}"),
@@ -752,6 +758,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             }
             Ffn::Dense { ff, act } => match act {
                 Act::SwiGlu { .. } => at(Need::DenseFfn { ff: *ff }),
+                Act::SwiGluGateFirst { .. } => at(Need::DenseSwigluGateFirst { ff: *ff }),
                 // Width 0 is a layer with no feed-forward block. A squared
                 // ReLU of a positive width is the block.
                 Act::ReluSqr if *ff > 0 => at(Need::ReluSqr { ff: *ff }),

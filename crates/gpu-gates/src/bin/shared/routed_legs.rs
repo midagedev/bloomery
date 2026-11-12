@@ -97,6 +97,7 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         | Arch::GemmaEmbedding
         | Arch::GemmaEmbedding2
         | Arch::Flint
+        | Arch::ExaoneMoe
         | Arch::MuseSpark
         | Arch::MistralLarge4
         | Arch::KimiK3 => None,
@@ -124,6 +125,7 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::NemotronHMoe
         | Arch::GemmaEmbedding
         | Arch::Flint
+        | Arch::ExaoneMoe
         | Arch::MuseSpark
         | Arch::MistralLarge4 => "no program",
         // Whole-card: its routed stacks load as the file holds them and no plan splits them.

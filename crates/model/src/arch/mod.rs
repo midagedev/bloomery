@@ -41,6 +41,7 @@ pub mod qwen35moe;
 pub mod qwen3moe;
 pub mod raon1;
 pub mod registry;
+pub mod rules;
 pub mod solar2;
 mod stems;
 
@@ -195,6 +196,10 @@ pub enum Arch {
     GemmaEmbedding,
     GemmaEmbedding2,
     Flint,
+    /// K-EXAONE's `exaone-moe`: read by the [`flint`] module's generalized
+    /// reader, whose description row ([`rules`]) states the facts the file's
+    /// keys do not.
+    ExaoneMoe,
     MuseSpark,
     /// Mistral Large 4: MLA with no query latent, SSMax, a lightning indexer
     /// over keys from the layer input, KV sharing and NoPE layers the file's
@@ -238,6 +243,7 @@ impl Arch {
             GEMMA_EMBEDDING => Ok(Arch::GemmaEmbedding),
             GEMMA_EMBEDDING2 => Ok(Arch::GemmaEmbedding2),
             "flint" => Ok(Arch::Flint),
+            "exaone-moe" => Ok(Arch::ExaoneMoe),
             "muse-spark" => Ok(Arch::MuseSpark),
             "mistral-large4" => Ok(Arch::MistralLarge4),
             "kimi-k3" | "kimi-k31" => Ok(Arch::KimiK3),
@@ -268,6 +274,7 @@ impl Arch {
             Arch::GemmaEmbedding => GEMMA_EMBEDDING,
             Arch::GemmaEmbedding2 => GEMMA_EMBEDDING2,
             Arch::Flint => "flint",
+            Arch::ExaoneMoe => "exaone-moe",
             Arch::MuseSpark => "muse-spark",
             Arch::MistralLarge4 => "mistral-large4",
             Arch::KimiK3 => "kimi-k3",
@@ -488,6 +495,35 @@ pub(crate) fn per_layer_count(
                 .ok_or_else(|| metadata(split, suffix, format!("has no count at layer {l}")))
         })
         .collect()
+}
+
+/// `<architecture>.<suffix>` as one shared f32 expanded to every layer or an
+/// array of exactly `n_layer` floats — llama.cpp's `get_key_or_arr` form
+/// (deepseek4.cpp:28-29 reads the SwiGLU clamp keys in it) — `None` when the
+/// file does not carry the key; a key of another type is an error naming it.
+pub(crate) fn per_layer_f32(
+    split: &Split,
+    suffix: &str,
+    n_layer: usize,
+) -> Result<Option<Vec<f32>>, PlacementError> {
+    match split.value(&split.arch_key(suffix)) {
+        None => Ok(None),
+        Some(Value::Array(_)) => Ok(Some(
+            per_layer_items(split, suffix, n_layer)?
+                .iter()
+                .enumerate()
+                .map(|(l, v)| {
+                    v.as_f32().ok_or_else(|| {
+                        metadata(split, suffix, format!("has no float at layer {l}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )),
+        Some(_) => {
+            let v = meta_f32(split, suffix)?;
+            Ok(Some(vec![v; n_layer]))
+        }
+    }
 }
 
 /// The architecture keys of `split` whose suffix `read` does not list, and
@@ -906,7 +942,7 @@ fn chat_of(
 /// tool-call and reasoning parsers are the ones the file's own template
 /// teaches ([`ToolFormat::of_template`], [`ReasoningFormat::of_template`]), and
 /// `None` for a file with no template or one whose markup no parser here reads.
-fn chat_from_template(split: &Split) -> Result<ChatSpec, PlacementError> {
+pub(crate) fn chat_from_template(split: &Split) -> Result<ChatSpec, PlacementError> {
     let mut chat = chat_of(split, None, None)?;
     if let Some(template) = &chat.template {
         chat.tools = ToolFormat::of_template(template);
@@ -1297,6 +1333,7 @@ mod tests {
             Arch::GemmaEmbedding,
             Arch::GemmaEmbedding2,
             Arch::Flint,
+            Arch::ExaoneMoe,
             Arch::MuseSpark,
             Arch::MistralLarge4,
             Arch::KimiK3,
