@@ -1358,7 +1358,7 @@ mod gate {
                 let ok = place == "bp"
                     && why == "two cards, tier at or past the break-even"
                     && tier.is_some_and(|t| {
-                        (here.saturating_sub(TIER_DRIFT)..=here + TIER_DRIFT).contains(t)
+                        (here.saturating_sub(TIER_DRIFT)..=here + TIER_DRIFT).contains(&t)
                             && t >= BREAK_EVEN
                     })
                     && p.opt_u64("break_even")? == Some(BREAK_EVEN)
