@@ -384,7 +384,7 @@ pub static ROWS: &[ArchRow] = &[
         read: Some(flint::spec::read),
         draft: None,
         coverage: None,
-        fixture: None,
+        fixture: Some(Fixture::Cut(CutRow { family: "exaoneh" })),
     },
     ArchRow {
         arch: Some(Arch::MuseSpark),
@@ -684,7 +684,7 @@ mod tests {
                 "kimi-k3"
             ]
         );
-        assert_eq!(archs_of(false), ["minimax-m3"]);
+        assert_eq!(archs_of(false), ["minimax-m3", "exaone-moe"]);
     }
 
     /// A row's fixture family is the directory `tools/fixture-dirs.tsv` gives its architecture (refset
