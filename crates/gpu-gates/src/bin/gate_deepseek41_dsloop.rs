@@ -8,7 +8,7 @@
 //!   exactly the nodes they hold without it plus one kernel per tapped layer
 //!   and row; those counts are the step's node count predicted from the file
 //!   (`shared/ds41_nodes.rs`, the step gate's own table) plus the taps — twice the plain
-//!   step's for the pair — where they were two literals of the real file (1182 and 2364);
+//!   step's for the pair — where they were two literals of the real file (1188 and 2376);
 //!   in the step's capture each `ds41_hc_mean` depends on
 //!   the MoE join (`ds41_ffn_post*`) of the layer before its tapped layer
 //!   alone. Without the tap the counts are the plain step's (the step gate
@@ -105,14 +105,16 @@ mod gate {
     /// the load.
     static DRAFT_BYTES: OnceLock<u64> = OnceLock::new();
     /// The step captured with the tl37 draft's tap on the real file, as a literal: the plain
-    /// step's 1179 nodes (1169 before the candidate mask's 2 + 4 × 2 = 10 launches, 1167 before the
-    /// engram rows' wait and copy nodes) and one `ds41_hc_mean` per tapped layer. The gate's pin
-    /// is the value derived from the file ([`structure`]); the real tier prints it beside this.
-    const REAL_TAP_STEP_NODES: usize = 1182;
+    /// step's nodes as `nodes::predicted` counts them for the real file's tensor types (the
+    /// capture equals it) and one `ds41_hc_mean` per tapped layer. The gate's pin is the value
+    /// derived from the file ([`structure`]); the real tier prints it beside this.
+    /// PIN(2026-11-12): the plain step is 1185 nodes on the 1017-Q3_K_M-r8 file, so 1185 + 3.
+    const REAL_TAP_STEP_NODES: usize = 1188;
     /// The pair pass with the same tap on the real file, as a literal: twice the plain step's
     /// nodes (each row runs its own ten candidate launches) and one `ds41_hc_mean` per tapped
     /// layer and row.
-    const REAL_TAP_PAIR_NODES: usize = 2364;
+    /// PIN(2026-11-12): 2 × 1185 + 6 on the 1017-Q3_K_M-r8 file.
+    const REAL_TAP_PAIR_NODES: usize = 2376;
     /// Positions the greedy run stands at before the checks.
     const RUN: u32 = 144;
     /// The positions checked: even, so a rollback to them is granted
