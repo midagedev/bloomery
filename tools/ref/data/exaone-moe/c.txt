@@ -1,0 +1,2 @@
+fn count_words(text: &str) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();

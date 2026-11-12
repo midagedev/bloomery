@@ -64,6 +64,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (musespark::ARCH, musespark::FAMILIES),
     (mistrallarge4::ARCH, mistrallarge4::FAMILIES),
     (kimi_k3::ARCH, kimi_k3::FAMILIES),
+    (exaone_moe::ARCH, exaone_moe::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),
     (quant::ARCH, quant::FAMILIES),
