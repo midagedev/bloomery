@@ -2780,6 +2780,41 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          binary: the file the child writes.",
     ),
     runner(
+        "BLOOMERY_NIGHT_BOUND",
+        Some("nightly-real.sh"),
+        "Seconds the night's real-tier batch may run before `tools/nightly-real.sh` stops it; \
+         21600 when unset.",
+    ),
+    runner(
+        "BLOOMERY_NIGHT_DIR",
+        Some("nightly-real.sh"),
+        "Where `tools/nightly-real.sh --pull` puts the night's ledger and report on this machine; \
+         `~/.cache/bloomery/night-pull` when unset.",
+    ),
+    runner(
+        "BLOOMERY_NIGHT_HOME",
+        Some("nightly-real.sh"),
+        "The night run's own directory (its ledger, reports, worktree and lock); \
+         `~/.cache/bloomery/night` when unset.",
+    ),
+    runner(
+        "BLOOMERY_NIGHT_LOCK",
+        Some("nightly-real.sh"),
+        "Set by `tools/nightly-real.sh` for its in-tree pass: the lock file the outer pass holds.",
+    ),
+    runner(
+        "BLOOMERY_NIGHT_NOTIFY",
+        Some("nightly-real.sh"),
+        "A command `tools/nightly-real.sh` calls as `<command> <state> <report>` when the night ends \
+         (green, red, skip or failed); unset, nothing is told.",
+    ),
+    runner(
+        "BLOOMERY_NIGHT_PULL",
+        Some("nightly-real.sh"),
+        "The night's directory on the gate machine that `tools/nightly-real.sh --pull` reads; \
+         `~/.cache/bloomery/night` when unset.",
+    ),
+    runner(
         "BLOOMERY_NCU_COUNT",
         Some("ref/ncu-gpu.sh"),
         "The ncu runner: launches of each kernel it profiles.",
