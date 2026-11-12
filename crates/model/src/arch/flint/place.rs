@@ -1,7 +1,8 @@
 //! Flint's validated description attached to the common hybrid placement and buffer owners.
 
 use gguf::Split;
-use models::{Ffn, Mixer, ModelSpec};
+use models::shape::RouterInst;
+use models::{Ffn, Mixer, ModelSpec, RopeMode};
 
 use super::spec;
 use crate::arch::{names, place_hybrid};
@@ -13,13 +14,133 @@ use crate::placement::{ModelTensors, PlacementError, kernels, workstation};
 
 pub use place_hybrid::{KvLayout, PlaceError};
 
-/// No second hyperparameter reader: the validated description owns Flint's facts.
-pub type PlanInputs = place_hybrid::PlanInputs<()>;
+/// The program's plan inputs: the common hybrid plan over the description,
+/// carrying the routed widths it held to at the read ([`MoeWidths`]).
+pub type PlanInputs = place_hybrid::PlanInputs<MoeWidths>;
 
 /// The common host union's prompt capacity, also the window ring's batch allowance.
 pub const PROMPT_ROWS: usize = crate::moe::UNION_MAX_COLS;
 /// Tokens served by one run of the common expert tier leg.
 pub const TIER_CHUNK: u64 = 8;
+
+/// The routed blocks' widths the description states: one expert count, pick
+/// count, expert width and shared width every routed layer carries (the load's
+/// own `describe` holds the layers to them beside this).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeWidths {
+    pub experts: usize,
+    pub used: usize,
+    pub expert_ff: usize,
+    pub shared_ff: usize,
+}
+
+/// The one set of routed widths the description's layers carry, refused by name
+/// naming the first layer that carries another and a trunk that routes nothing.
+pub fn moe_widths(spec: &ModelSpec) -> Result<MoeWidths, PlacementError> {
+    let refuse = |layer: usize, what: &str| PlacementError::Metadata {
+        key: format!("layer {layer} {what}"),
+        detail: "differs from the routed layers' one width; this program runs \
+                 one expert count, pick count and width"
+            .into(),
+    };
+    let mut of = None;
+    for (l, layer) in spec.layers.iter().enumerate() {
+        let Ffn::Moe(m) = &layer.ffn else {
+            continue;
+        };
+        let shared = m.shared.as_ref().ok_or_else(|| PlacementError::Metadata {
+            key: format!("layer {l} shared block"),
+            detail: "this program requires one ungated shared MLP".into(),
+        })?;
+        let widths = MoeWidths {
+            experts: m.experts as usize,
+            used: m.top_k as usize,
+            expert_ff: m.expert_ff as usize,
+            shared_ff: shared.ff as usize,
+        };
+        match of {
+            None => of = Some(widths),
+            Some(had) if had != widths => return Err(refuse(l, "routed width")),
+            _ => {}
+        }
+    }
+    of.ok_or_else(|| PlacementError::Metadata {
+        key: "block_count".into(),
+        detail: "no routed layer: this program runs a trunk that routes".into(),
+    })
+}
+
+/// The one rope the rotating layers turn by, its base and dims: refused by name
+/// naming the first layer that turns by another (the body builds one table),
+/// and a trunk no layer turns (the body builds its table whatever the file).
+pub fn rope_of(spec: &ModelSpec) -> Result<(f32, u32), PlacementError> {
+    let mut of: Option<(f32, u32)> = None;
+    for (l, layer) in spec.layers.iter().enumerate() {
+        let Mixer::Gqa(g) = &layer.mixer else {
+            continue;
+        };
+        if g.rope.mode == RopeMode::None {
+            continue;
+        }
+        let rope = (g.rope.base, g.rope.dims);
+        match of {
+            None => of = Some(rope),
+            Some(had) if had != rope => {
+                return Err(PlacementError::Metadata {
+                    key: format!("layer {l} rope.freq_base"),
+                    detail: format!(
+                        "ropes at base {} of {} dims; the trunk's roped layers turn by \
+                         base {} of {} dims, and this program builds one rope table",
+                        rope.0, rope.1, had.0, had.1
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+    of.ok_or_else(|| PlacementError::Metadata {
+        key: "attention.rope_pattern".into(),
+        detail: "no layer turns: this program builds a rope table whatever the file".into(),
+    })
+}
+
+/// The one router instance every routed layer's shape selects
+/// (`models::shape::select_router`): refused by name naming the layer whose
+/// shape no instance serves and the first layer that selects another (the
+/// program's load matches the row to the one instance it compiles for it).
+pub fn router_row_of(spec: &ModelSpec) -> Result<RouterInst, PlacementError> {
+    let mut of: Option<(usize, RouterInst)> = None;
+    for (l, layer) in spec.layers.iter().enumerate() {
+        let Ffn::Moe(m) = &layer.ffn else {
+            continue;
+        };
+        let row =
+            models::shape::select_router(models::shape::MoeShape::of(m)).map_err(|refused| {
+                PlacementError::Metadata {
+                    key: format!("layer {l} router"),
+                    detail: refused.to_string(),
+                }
+            })?;
+        match of {
+            None => of = Some((l, row)),
+            Some((first, had)) if had != row => {
+                return Err(PlacementError::Metadata {
+                    key: format!("layer {l} router"),
+                    detail: format!(
+                        "selects {row:?}; layer {first} selects {had:?}, and this program \
+                         launches one router instance a load",
+                    ),
+                });
+            }
+            _ => {}
+        }
+    }
+    of.map(|(_, row)| row)
+        .ok_or_else(|| PlacementError::Metadata {
+            key: "block_count".into(),
+            detail: "no routed layer: this program runs a trunk that routes".into(),
+        })
+}
 
 fn overflow() -> PlacementError {
     PlacementError::Metadata {
@@ -241,20 +362,29 @@ pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError>
 }
 
 impl PlanInputs {
-    /// Describe once, then require the genuine program and its numerical/site bindings.
+    /// Describe once, then require the genuine program: the coverage check's
+    /// list first, then the program's own plan facts behind it (the one rope
+    /// and the one router instance every routed layer selects — a file whose
+    /// layers pick two has needs the coverage list cannot name).
     pub fn read(split: &Split) -> Result<PlanInputs, PlacementError> {
-        Self::describe(split)?.runnable()
+        let inputs = Self::describe(split)?.runnable()?;
+        rope_of(&inputs.spec)?;
+        router_row_of(&inputs.spec)?;
+        Ok(inputs)
     }
 
-    /// The validated file, common windowed stores, actual prompt reserve and tier loader contract.
-    /// The common host-run loader serves NVMe through the same residency arena that placement split.
+    /// The validated file, its one set of routed widths ([`MoeWidths`]), common
+    /// windowed stores, actual prompt reserve and tier loader contract. The
+    /// common host-run loader serves NVMe through the same residency arena that
+    /// placement split.
     pub fn describe(split: &Split) -> Result<PlanInputs, PlacementError> {
         let read = spec::read(split)?;
+        let widths = moe_widths(&read.spec)?;
         let reserve = prompt_reserve_bytes(&read.spec, &read.tensors, PROMPT_ROWS as u64)?;
         let batch = routed_batch(&read.spec, &read.tensors, PROMPT_ROWS as u64, false, true)?;
         let tier =
             kernels::ffn::tier_places_bytes(PROMPT_ROWS as u64, batch.used).ok_or_else(overflow)?;
-        Ok(Self::new("Flint", (), read.tensors, read.spec)?
+        Ok(Self::new("Flint", widths, read.tensors, read.spec)?
             .with_prompt_reserve(reserve)
             .with_tier_reserve(tier)
             .with_nvme_tier())
@@ -435,7 +565,13 @@ mod planning_tests {
             }
         }
         let read = check("place-paging", &keys, &ts).unwrap();
-        let mut inputs = PlanInputs::new("Flint", (), read.tensors, read.spec).unwrap();
+        let mut inputs = PlanInputs::new(
+            "Flint",
+            moe_widths(&read.spec).unwrap(),
+            read.tensors,
+            read.spec,
+        )
+        .unwrap();
         host_run_experts(&mut inputs.model);
         for tensor in &mut inputs.model.tensors {
             if tensor.role == Role::RoutedExperts {

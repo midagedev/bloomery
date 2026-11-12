@@ -1,4 +1,9 @@
-//! Checked load, sequence ownership and common model seam for Flint.
+//! Checked load, sequence ownership and common model seam for the head128
+//! sink/SWA program: Flint's files and K-EXAONE's `exaone-moe` ones run this
+//! one body, every difference a plan value read from the description (windows,
+//! rope, dense lead, clamps, widths) beside the router instance `R`, the one
+//! compiled piece, which the file's router shape picks at the load
+//! (`place::router_row_of`).
 
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -21,7 +26,7 @@ use bloomery_gpu::model::{
     refuse_reserve_past, refuse_scratch_past, stage_run,
 };
 use bloomery_gpu::rope_table::{RopeRows, RopeSpec, RopeTable};
-use bloomery_gpu::route_body::sigmoid_floor_256_6::RouterKernels;
+use bloomery_gpu::routed_block::RouterEntry;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
 use bloomery_gpu_deepseek41::prompt_walk::{self, BatchBufs};
@@ -30,17 +35,60 @@ use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::Arch;
-use model::arch::flint::{host, place::PlanInputs};
+use model::arch::flint::host;
+use model::arch::flint::place::{self, MoeWidths, PlanInputs};
 use model::arch::names;
 use model::embed::EmbedTable;
 use model::placement::Plan;
 use model::placement::accepts::Program;
-use models::{Ffn, Mixer, RopeMode};
 use runtime::layer::{Layer, MixerKind, ResidualKind, hosted};
 
 pub(crate) const WHAT: &str = "flint Body";
+
+/// Flint's compiled router: the floor-normalized 256/top-6 instance
+/// (`gpu/src/route_body.rs sigmoid_floor_256_6`).
+pub type FlintRouter = bloomery_gpu::route_body::sigmoid_floor_256_6::RouterKernels;
+/// K-EXAONE's: the biased selected-sum 256/top-8 instance
+/// (`gpu-deepseek41/src/router.rs mimo2`).
+pub type ExaoneRouter = bloomery_gpu_deepseek41::router::mimo2::RouterKernels;
+
+/// The body over the router `R`, the one compiled piece: Flint's files load
+/// [`Body`] (`FlintBody<FlintRouter>`), K-EXAONE's [`ExaoneBody`]. Weights,
+/// kernels and scratch belong to the load; only caches and their high-water
+/// mark belong to a sequence.
+pub struct FlintBody<R: RouterEntry = FlintRouter> {
+    pub(crate) shell: TierShell<HostRun>,
+    pub(crate) cfg: Vec<Layer>,
+    pub(crate) bindings: Vec<Binding>,
+    pub(crate) stores: Vec<Cache>,
+    pub(crate) k: Kernels,
+    pub(crate) attention: AttnScratch,
+    pub(crate) batch_attention: AttnScratch,
+    pub(crate) s: StepRows,
+    pub(crate) rope: RopeRows,
+    pub(crate) ffn: Routed<R>,
+    pub(crate) units: BatchBufs,
+    pub(crate) embed: EmbedTable,
+    row: Vec<f32>,
+    pub(crate) slots: Arc<DeviceTensor<u32>>,
+    pub(crate) at: u32,
+    pub(crate) ctx: usize,
+    pub(crate) hidden: usize,
+    eps: f32,
+    slots_planned: usize,
+    slots_made: usize,
+    prompt_reserve: u64,
+}
+
+/// Flint's file's body: the floor-normalized top-six router.
+pub type Body = FlintBody;
+/// K-EXAONE's file's body: the biased top-eight router.
+pub type ExaoneBody = FlintBody<ExaoneRouter>;
+
 pub type FlintModel = GpuModel<Body>;
-pub(crate) type FfnBody = Routed<RouterKernels>;
+/// K-EXAONE's model: the body over its router instance.
+pub type ExaoneModel = GpuModel<ExaoneBody>;
+pub(crate) type FfnBody<R> = Routed<R>;
 
 /// The per-replay position. The embedding row is staged before refresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,97 +127,7 @@ impl StepRows {
     }
 }
 
-/// Weights, kernels and scratch belong to the load; only caches and their high-water mark belong to a sequence.
-pub struct Body {
-    pub(crate) shell: TierShell<HostRun>,
-    pub(crate) cfg: Vec<Layer>,
-    pub(crate) bindings: Vec<Binding>,
-    pub(crate) stores: Vec<Cache>,
-    pub(crate) k: Kernels,
-    pub(crate) attention: AttnScratch,
-    pub(crate) batch_attention: AttnScratch,
-    pub(crate) s: StepRows,
-    pub(crate) rope: RopeRows,
-    pub(crate) ffn: FfnBody,
-    pub(crate) units: BatchBufs,
-    pub(crate) embed: EmbedTable,
-    row: Vec<f32>,
-    pub(crate) slots: Arc<DeviceTensor<u32>>,
-    pub(crate) at: u32,
-    pub(crate) ctx: usize,
-    pub(crate) hidden: usize,
-    eps: f32,
-    slots_planned: usize,
-    slots_made: usize,
-    prompt_reserve: u64,
-}
-
-impl Body {
-    /// A single-sequence placed load with fixed expert residency.
-    pub fn open_placed(
-        file: Split,
-        plan: &Plan<'_>,
-        inputs: &PlanInputs,
-        card: usize,
-        host: HostCfg,
-    ) -> Result<FlintModel, GpuError> {
-        Self::open_placed_slots(
-            file,
-            plan,
-            inputs,
-            card,
-            host,
-            Residency::Off,
-            NonZeroUsize::MIN,
-        )
-    }
-
-    /// Load exactly the number of resident sequences counted by the placement.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the placed load's file, plan, card and host policy, residency and sequence count"
-    )]
-    pub fn open_placed_slots(
-        file: Split,
-        plan: &Plan<'_>,
-        inputs: &PlanInputs,
-        card: usize,
-        host: HostCfg,
-        residency: Residency,
-        slots: NonZeroUsize,
-    ) -> Result<FlintModel, GpuError> {
-        let tiers = TierOpen::one_of(plan.machine, WHAT)?;
-        let (layers, _) = stage_run(WHAT, plan, card, inputs.spec.layers.len())?;
-        let one = inputs.kv.bytes(layers, plan.ctx_max);
-        refuse_store_count(plan, card, one, slots)?;
-        let run = hosted(&inputs.spec.layers).map_err(|e| shape(e.to_string()))?;
-        let residency = ResidencySpec::hosted(
-            residency,
-            6,
-            1,
-            Arc::new(hosted_stacks(&inputs.model, WHAT, (run.len(), true))?),
-        );
-        GpuModel::load_placed_with(
-            file,
-            plan,
-            card,
-            host,
-            residency,
-            |_, _, _, _| Ok(()),
-            |gpu, file, w, set, glue| {
-                Self::load(
-                    gpu,
-                    file,
-                    w,
-                    (plan, inputs, card),
-                    host,
-                    (set, glue),
-                    (&tiers, slots),
-                )
-            },
-        )
-    }
-
+impl<R: RouterEntry> FlintBody<R> {
     #[allow(
         clippy::too_many_arguments,
         reason = "the checked placed load's disjoint common loader parts"
@@ -185,6 +143,12 @@ impl Body {
     ) -> Result<Self, GpuError> {
         gpu.context().bind_to_thread()?;
         let spec = &inputs.spec;
+        let MoeWidths {
+            experts,
+            used,
+            expert_ff,
+            ..
+        } = inputs.hp;
         let (layers, ctx) = stage_run(WHAT, plan, card, spec.layers.len())?;
         let hidden = spec.hidden as usize;
         let cfg: Vec<_> = spec.layers.iter().map(Layer::of).collect();
@@ -194,18 +158,10 @@ impl Body {
                     "layer {l}: {kind:?}, not plain-residual GQA"
                 )));
             }
-            match &spec.layers[l].ffn {
-                Ffn::Moe(m) if m.experts != 256 || m.top_k != 6 || m.expert_ff != 512 => {
-                    return Err(shape(format!(
-                        "layer {l}: expert geometry {m:?}, not the compiled floor256top6 block"
-                    )));
-                }
-                _ => {}
-            }
         }
         let run = hosted(&spec.layers).map_err(|e| shape(e.to_string()))?;
         let tier_cards: Vec<_> = tiers.iter().map(|t| t.card).collect();
-        let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), 256)?;
+        let map = SlotMap::of_plan_tiers(plan, card, &tier_cards, run.clone(), experts)?;
         let bindings = spec
             .layers
             .iter()
@@ -232,23 +188,16 @@ impl Body {
                 )));
             }
         }
-        let rope_base = spec
-            .layers
-            .iter()
-            .find_map(|s| match &s.mixer {
-                Mixer::Gqa(g) if g.rope.mode == RopeMode::Neox => Some(g.rope.base),
-                _ => None,
-            })
-            .ok_or_else(|| shape("no NeoX layer in the validated description"))?;
-        let table = RopeTable::new(&RopeSpec::window(rope_base, 128))?;
-        let rope = RopeRows::new(gpu.stream(), &table, 128, ctx)?;
+        let (rope_base, rope_dims) = place::rope_of(spec).map_err(|e| GpuError::plan(WHAT, e))?;
+        let table = RopeTable::new(&RopeSpec::window(rope_base, rope_dims as usize))?;
+        let rope = RopeRows::new(gpu.stream(), &table, rope_dims as usize, ctx)?;
         let slots = Arc::new(DeviceTensor::upload(
             gpu.stream(),
             &map.stage_view(),
             run.len(),
-            256,
+            experts,
         )?);
-        let ffn = FfnBody::new_configured(
+        let ffn = Routed::<R>::new_configured(
             gpu,
             file,
             w,
@@ -260,8 +209,8 @@ impl Body {
             },
             CardFamily {
                 what: WHAT,
-                n_expert: 256,
-                n_used: 6,
+                n_expert: experts,
+                n_used: used,
                 stacks: names::routed_stacks,
                 program: Program::FlintBody,
             },
@@ -274,10 +223,10 @@ impl Body {
             tiers,
             family: &crate::tier::NODE_FAMILY,
             open: LegOpen {
-                n_expert: 256,
+                n_expert: experts,
                 layers: cfg.len(),
                 hidden,
-                n_used: 6,
+                n_used: used,
                 rows: 1,
             },
             cols: crate::prefill::T_MAX,
@@ -291,8 +240,8 @@ impl Body {
             (
                 HostWidths {
                     embd: hidden,
-                    ff: 512,
-                    n_used: 6,
+                    ff: expert_ff,
+                    n_used: used,
                 },
                 1,
             ),
@@ -315,7 +264,7 @@ impl Body {
         let prompt_reserve = inputs
             .prompt_batch_bytes(plan.machine)
             .map_err(|e| GpuError::plan(WHAT, e))?;
-        let mut body = Self {
+        let body = Self {
             shell: TierShell::new(hybrid, glue, hidden, WHAT),
             k: Kernels::load(gpu)?,
             attention: AttnScratch::new(gpu, &bindings, 1)?,
@@ -346,7 +295,6 @@ impl Body {
             "step rows, attention, routed blocks, rope, host boundary and slot map",
         )?;
         body.check_prompt_reserve()?;
-        body.start_residency(gpu)?;
         Ok(body)
     }
 
@@ -411,83 +359,213 @@ impl Body {
     }
 }
 
-impl ChainBody for Body {
-    type Input = StepInput;
-    type Host = Body;
-    const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
-    fn arch() -> Arch {
-        Arch::Flint
-    }
-    fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
-        if pos as usize >= self.ctx {
-            return Err(shape(format!("position {pos} past context {}", self.ctx)));
+/// The chain of the body over the router `R`, whose files detect as `$arch`:
+/// one instance a load, named by the architecture its description row reads.
+macro_rules! chain_body {
+    ($router:ty, $arch:expr) => {
+        impl FlintBody<$router> {
+            /// A single-sequence placed load with fixed expert residency.
+            pub fn open_placed(
+                file: Split,
+                plan: &Plan<'_>,
+                inputs: &PlanInputs,
+                card: usize,
+                host: HostCfg,
+            ) -> Result<GpuModel<Self>, GpuError> {
+                Self::open_placed_slots(
+                    file,
+                    plan,
+                    inputs,
+                    card,
+                    host,
+                    Residency::Off,
+                    NonZeroUsize::MIN,
+                )
+            }
+
+            /// Load exactly the number of resident sequences counted by the placement.
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "the placed load's file, plan, card and host policy, residency and                           sequence count"
+            )]
+            pub fn open_placed_slots(
+                file: Split,
+                plan: &Plan<'_>,
+                inputs: &PlanInputs,
+                card: usize,
+                host: HostCfg,
+                residency: Residency,
+                slots: NonZeroUsize,
+            ) -> Result<GpuModel<Self>, GpuError> {
+                let tiers = TierOpen::one_of(plan.machine, WHAT)?;
+                let (layers, _) = stage_run(WHAT, plan, card, inputs.spec.layers.len())?;
+                let one = inputs.kv.bytes(layers, plan.ctx_max);
+                refuse_store_count(plan, card, one, slots)?;
+                let widths = inputs.hp;
+                let run = hosted(&inputs.spec.layers).map_err(|e| shape(e.to_string()))?;
+                let residency = ResidencySpec::hosted(
+                    residency,
+                    widths.used,
+                    1,
+                    Arc::new(hosted_stacks(&inputs.model, WHAT, (run.len(), true))?),
+                );
+                let mut m = GpuModel::load_placed_with(
+                    file,
+                    plan,
+                    card,
+                    host,
+                    residency,
+                    |_, _, _, _| Ok(()),
+                    |gpu, file, w, set, glue| {
+                        Self::load(
+                            gpu,
+                            file,
+                            w,
+                            (plan, inputs, card),
+                            host,
+                            (set, glue),
+                            (&tiers, slots),
+                        )
+                    },
+                )?;
+                let (gpu, _, body) = m.body_parts(WHAT)?;
+                body.start_residency(gpu)?;
+                Ok(m)
+            }
         }
-        self.embed.row_into(token, &mut self.row)?;
-        Ok(StepInput { pos })
-    }
-    fn refresh(&mut self, stream: &CudaStream, input: &StepInput) -> Result<(), GpuError> {
-        self.s.x.copy_from_host(stream, &self.row)?;
-        self.s.pos.copy_from_host(stream, &[input.pos])?;
-        self.s.n_keys.copy_from_host(stream, &[input.pos + 1])?;
-        self.at = self.at.max(input.pos + 1);
-        Ok(())
-    }
-    fn enqueue_chain(&mut self, gpu: &Gpu, w: &Weights, head: &mut Head) -> Result<(), GpuError> {
-        crate::step::enqueue(gpu, w, self, head)
-    }
-    fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
-        self.shell.hybrid.settle(gpu.stream())?;
-        self.at = 0;
-        Ok(())
-    }
-    fn head_eps(&self) -> f32 {
-        self.eps
-    }
-    fn resident_bytes(&self) -> usize {
-        self.store_bytes()
-            + self.scratch_bytes()
-            + self.prompt_bytes()
-            + self
-                .shell
-                .taps
-                .as_ref()
-                .map_or(0, |t| t.iter().map(DeviceBuffer::num_bytes).sum())
-    }
-    fn layers(&self) -> Range<usize> {
-        0..self.cfg.len()
-    }
-    fn host(&mut self) -> Option<&mut Body> {
-        Some(self)
-    }
+
+        impl ChainBody for FlintBody<$router> {
+            type Input = StepInput;
+            type Host = FlintBody<$router>;
+            const UNHOSTED_POOL: bloomery_levers::UnhostedPool =
+                bloomery_levers::UnhostedPool::NotCarried;
+            fn arch() -> Arch {
+                $arch
+            }
+            fn decode_input(&mut self, token: u32, pos: u32) -> Result<StepInput, GpuError> {
+                if pos as usize >= self.ctx {
+                    return Err(shape(format!("position {pos} past context {}", self.ctx)));
+                }
+                self.embed.row_into(token, &mut self.row)?;
+                Ok(StepInput { pos })
+            }
+            fn refresh(&mut self, stream: &CudaStream, input: &StepInput) -> Result<(), GpuError> {
+                self.s.x.copy_from_host(stream, &self.row)?;
+                self.s.pos.copy_from_host(stream, &[input.pos])?;
+                self.s.n_keys.copy_from_host(stream, &[input.pos + 1])?;
+                self.at = self.at.max(input.pos + 1);
+                Ok(())
+            }
+            fn enqueue_chain(
+                &mut self,
+                gpu: &Gpu,
+                w: &Weights,
+                head: &mut Head,
+            ) -> Result<(), GpuError> {
+                crate::step::enqueue(gpu, w, self, head)
+            }
+            fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+                self.shell.hybrid.settle(gpu.stream())?;
+                self.at = 0;
+                Ok(())
+            }
+            fn head_eps(&self) -> f32 {
+                self.eps
+            }
+            fn resident_bytes(&self) -> usize {
+                self.store_bytes()
+                    + self.scratch_bytes()
+                    + self.prompt_bytes()
+                    + self
+                        .shell
+                        .taps
+                        .as_ref()
+                        .map_or(0, |t| t.iter().map(DeviceBuffer::num_bytes).sum())
+            }
+            fn layers(&self) -> Range<usize> {
+                0..self.cfg.len()
+            }
+            fn host(&mut self) -> Option<&mut Self::Host> {
+                Some(self)
+            }
+        }
+
+        impl TierBody for FlintBody<$router> {
+            type Experts = HostRun;
+            fn hybrid(&self) -> &Hybrid<HostRun> {
+                self.shell.hybrid()
+            }
+            fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
+                self.shell.hybrid_mut()
+            }
+            fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
+                self.shell.residency_parts(&self.slots)
+            }
+            fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
+                self.shell.hybrid.serve_captured_of(chain)
+            }
+        }
+
+        impl Rollback for FlintBody<$router> {
+            fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+                if !self.cut_keeps(self.at, pos) {
+                    return Err(shape(format!(
+                        "rollback to {pos} from written end {} loses ring keys; reset and refeed",
+                        self.at
+                    )));
+                }
+                Ok(())
+            }
+        }
+
+        impl Slots for FlintBody<$router> {
+            type Seq = Seq;
+            fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
+                if self.slots_made >= self.slots_planned {
+                    return Err(shape(format!(
+                        "sequence {} exceeds {} planned resident sequences",
+                        self.slots_made + 1,
+                        self.slots_planned
+                    )));
+                }
+                let need = self.store_bytes();
+                let free = gpu.alloc_room()?;
+                if need > free {
+                    return Err(shape(format!(
+                        "sequence needs {need} store bytes, card has {free}"
+                    )));
+                }
+                let stores = self
+                    .bindings
+                    .iter()
+                    .map(|b| Cache::new(gpu, b))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.slots_made += 1;
+                Ok(Seq { stores, at: 0 })
+            }
+            fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Seq) -> Result<(), GpuError> {
+                if self.stores.len() != seq.stores.len()
+                    || self
+                        .stores
+                        .iter()
+                        .zip(&seq.stores)
+                        .any(|(a, b)| a.bytes() != b.bytes())
+                {
+                    return Err(shape("parked sequence has another store layout"));
+                }
+                std::mem::swap(&mut self.stores, &mut seq.stores);
+                std::mem::swap(&mut self.at, &mut seq.at);
+                Ok(())
+            }
+            fn seq_bytes(&self) -> usize {
+                self.store_bytes()
+            }
+        }
+    };
 }
 
-impl TierBody for Body {
-    type Experts = HostRun;
-    fn hybrid(&self) -> &Hybrid<HostRun> {
-        self.shell.hybrid()
-    }
-    fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
-        self.shell.hybrid_mut()
-    }
-    fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
-        self.shell.residency_parts(&self.slots)
-    }
-    fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
-        self.shell.hybrid.serve_captured_of(chain)
-    }
-}
-
-impl Rollback for Body {
-    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
-        if !self.cut_keeps(self.at, pos) {
-            return Err(shape(format!(
-                "rollback to {pos} from written end {} loses ring keys; reset and refeed",
-                self.at
-            )));
-        }
-        Ok(())
-    }
-}
+chain_body!(FlintRouter, Arch::Flint);
+chain_body!(ExaoneRouter, Arch::ExaoneMoe);
 
 /// One resident sequence's device stores and greatest written end.
 pub struct Seq {
@@ -495,51 +573,7 @@ pub struct Seq {
     at: u32,
 }
 
-impl Slots for Body {
-    type Seq = Seq;
-    fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
-        if self.slots_made >= self.slots_planned {
-            return Err(shape(format!(
-                "sequence {} exceeds {} planned resident sequences",
-                self.slots_made + 1,
-                self.slots_planned
-            )));
-        }
-        let need = self.store_bytes();
-        let free = gpu.alloc_room()?;
-        if need > free {
-            return Err(shape(format!(
-                "sequence needs {need} store bytes, card has {free}"
-            )));
-        }
-        let stores = self
-            .bindings
-            .iter()
-            .map(|b| Cache::new(gpu, b))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.slots_made += 1;
-        Ok(Seq { stores, at: 0 })
-    }
-    fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Seq) -> Result<(), GpuError> {
-        if self.stores.len() != seq.stores.len()
-            || self
-                .stores
-                .iter()
-                .zip(&seq.stores)
-                .any(|(a, b)| a.bytes() != b.bytes())
-        {
-            return Err(shape("parked sequence has another store layout"));
-        }
-        std::mem::swap(&mut self.stores, &mut seq.stores);
-        std::mem::swap(&mut self.at, &mut seq.at);
-        Ok(())
-    }
-    fn seq_bytes(&self) -> usize {
-        self.store_bytes()
-    }
-}
-
-impl Drop for Body {
+impl<R: RouterEntry> Drop for FlintBody<R> {
     fn drop(&mut self) {
         self.shell.hybrid.stop_swap();
     }

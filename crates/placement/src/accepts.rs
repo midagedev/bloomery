@@ -73,7 +73,10 @@ pub enum Program {
     /// gate·up and down `_sel` entries ([`MUSESPARK_LEG`]) and the rest on the
     /// host tier.
     MuseSparkBody,
-    /// The head128 sink/SWA body with floor-normalized top-six experts.
+    /// The head128 sink/SWA body (`crates/gpu-flint`): the one program Flint and
+    /// K-EXAONE's `exaone-moe` files run, the file's router shape picking the
+    /// one compiled instance (the floor-normalized top-six, or the biased
+    /// top-eight) at its load.
     FlintBody,
     /// The mistral-large4 body (`crates/gpu-mistrallarge4`): the routed experts
     /// the plan puts on a card (the common pair) and the rest on the host tier,
@@ -103,12 +106,10 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::NemotronH => Some(Program::NemotronHBody),
         Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
         Arch::GemmaEmbedding | Arch::GemmaEmbedding2 => Some(Program::GemmaEmbedding2Body),
-        Arch::Flint => Some(Program::FlintBody),
+        Arch::Flint | Arch::ExaoneMoe => Some(Program::FlintBody),
         Arch::MuseSpark => Some(Program::MuseSparkBody),
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
         Arch::KimiK3 => Some(Program::KimiK3Body),
-        // No program composes exaone-moe yet.
-        Arch::ExaoneMoe => None,
         Arch::Lfm3 => None,
     }
 }
