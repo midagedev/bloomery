@@ -469,10 +469,22 @@ pub fn plan_run(
 }
 
 /// `bloomery-serve` beside the running binary, `BLOOMERY_REF_MODEL` removed
-/// from its environment: the file is named once, by `-m`.
+/// from its environment: the file is named once, by `-m`. Where this run
+/// holds its card ([`crate::card_bytes::Hold`]), the child's census leaves
+/// this process's pid out of its holder lists
+/// ([`crate::gpu_census::FELLOW`]): the server shares the card of the gate
+/// that started it, under the same gate lock.
 pub fn serve_cmd() -> Result<Command, GateError> {
     let mut cmd = Command::new(beside("bloomery-serve")?);
     cmd.env_remove("BLOOMERY_REF_MODEL");
+    match crate::card_bytes::Hold::from_env()? {
+        crate::card_bytes::Hold::Held => {
+            cmd.env(crate::gpu_census::FELLOW, std::process::id().to_string());
+        }
+        crate::card_bytes::Hold::Unheld => {
+            cmd.env_remove(crate::gpu_census::FELLOW);
+        }
+    }
     Ok(cmd)
 }
 

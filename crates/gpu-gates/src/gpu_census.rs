@@ -4,7 +4,12 @@
 //! primary context; this module adds the processes holding each device, as
 //! `nvidia-smi` names them — one query, best effort. A tool that does not
 //! answer names no holder, and a plan never fails for want of the answer:
-//! the free bytes alone still cap it.
+//! the free bytes alone still cap it. A process of the same locked run —
+//! the gate that started this one, named by [`FELLOW`] — is no holder
+//! either, as this process's own pid is not.
+
+#[cfg(any(feature = "gpu", test))]
+use std::ffi::OsStr;
 
 #[cfg(feature = "gpu")]
 use std::process::Command;
@@ -15,30 +20,85 @@ use model::placement::workstation::DeviceInfo;
 #[cfg(feature = "gpu")]
 use crate::GateError;
 
+/// The pid of the gate that started this process (a server a gate spawned
+/// while its run held the card's gate lock): a fellow holder of this run's
+/// card, which [`census`] leaves out of its holder lists as it leaves this
+/// process's own pid out. `serve_client::serve_cmd` sets it on the child
+/// only where its own run holds its card (`crate::card_bytes::HELD`, which
+/// `tools/gpu-gate.sh` exports once every lock is held); a value that is not
+/// a pid, or a fellow named where this run does not hold its card, is
+/// refused by name.
+pub const FELLOW: &str = "BLOOMERY_CARD_FELLOW";
+
 /// The visible devices with each card's free bytes and, when nvidia-smi
 /// answers, the other processes holding it: the census a plan resolves
 /// against ([`Place::on_host`](crate::generate::Place::on_host)). Our own
 /// pid is left out of a holder list: the plan sizes what this process is
-/// about to take, not what it holds now.
+/// about to take, not what it holds now. The fellow holder [`FELLOW`] names
+/// is left out too, for the same reason: the gate that started this process
+/// holds the card under the same lock this run holds.
 #[cfg(feature = "gpu")]
 pub fn census() -> Result<Vec<DeviceInfo>, GateError> {
     let mut census = bloomery_gpu::census()?;
+    // A fellow is named only where this run holds its card: a value where it
+    // does not — nothing sets that but a caller's own hand — is refused by
+    // name, so the one env a server trusts cannot quietly drop a holder it
+    // should name.
+    let fellow = match fellow_pid(std::env::var_os(FELLOW).as_deref())? {
+        None => None,
+        Some(pid) => match crate::card_bytes::Hold::from_env() {
+            Ok(crate::card_bytes::Hold::Held) => Some(pid),
+            Ok(crate::card_bytes::Hold::Unheld) => {
+                return Err(format!(
+                    "{FELLOW} names a fellow holder where this run does not hold its card \
+                     ({} unset or empty)",
+                    crate::card_bytes::HELD
+                )
+                .into());
+            }
+            Err(e) => return Err(e.into()),
+        },
+    };
     let Some(rows) = compute_apps() else {
         return Ok(census);
     };
-    name_holders(&mut census, &rows, std::process::id());
+    name_holders(&mut census, &rows, std::process::id(), fellow);
     Ok(census)
+}
+
+/// The pid [`FELLOW`] names: `None` where the variable is unset or empty,
+/// the pid it names; any other value is refused by name.
+#[cfg(any(feature = "gpu", test))]
+fn fellow_pid(value: Option<&OsStr>) -> Result<Option<u32>, String> {
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    value
+        .to_str()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(Some)
+        .ok_or_else(|| {
+            format!("{FELLOW}={value:?}: a pid (the gate that started this process), or unset")
+        })
 }
 
 /// Each device's holders from the listing's `rows` (`compute_apps_of`): the
 /// rows on the device's uuid as nvidia-smi spells it ([`gpu_uuid`]), every pid
-/// but `mine`, as one named list in [`DeviceInfo::held_by`].
+/// but `mine` and the named `fellow`, as one named list in
+/// [`DeviceInfo::held_by`].
 #[cfg(any(feature = "gpu", test))]
-fn name_holders(census: &mut [DeviceInfo], rows: &[(String, u32, String)], mine: u32) {
+fn name_holders(
+    census: &mut [DeviceInfo],
+    rows: &[(String, u32, String)],
+    mine: u32,
+    fellow: Option<u32>,
+) {
     for d in census {
         let held: Vec<String> = rows
             .iter()
-            .filter(|(uuid, pid, _)| *uuid == gpu_uuid(&d.uuid) && *pid != mine)
+            .filter(|(uuid, pid, _)| {
+                *uuid == gpu_uuid(&d.uuid) && *pid != mine && Some(*pid) != fellow
+            })
             .map(|(_, pid, used)| format!("pid {pid} ({used})"))
             .collect();
         if !held.is_empty() {
@@ -102,7 +162,7 @@ pub fn gpu_uuid(bytes: &[u8; 16]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceInfo, compute_apps_of, gpu_uuid, name_holders};
+    use super::{DeviceInfo, compute_apps_of, fellow_pid, gpu_uuid, name_holders};
 
     /// The uuid spelling matches nvidia-smi's: the 8-4-4-4-12 groups of the
     /// driver's sixteen bytes.
@@ -149,7 +209,9 @@ mod tests {
     /// A card the listing names a compute app on gets that holder: the
     /// listing's own text (two cards' rows as nvidia-smi prints them on the
     /// box) against the driver's uuid bytes, so the uuid spelling and the
-    /// match cannot drift apart unseen. Our own pid is never a holder.
+    /// match cannot drift apart unseen. Our own pid is never a holder, and
+    /// neither is the named fellow (the gate that started this process);
+    /// every other pid still is.
     #[test]
     fn a_listed_compute_app_names_its_card_holder() {
         let device = |ordinal: u32, uuid: [u8; 16]| DeviceInfo {
@@ -177,11 +239,24 @@ mod tests {
                     GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4, 77, 300 MiB\n";
         let rows = compute_apps_of(text).expect("the listing reads");
         let mut census = vec![device(0, rtx3090), device(1, a6000)];
-        name_holders(&mut census, &rows, 77);
+        name_holders(&mut census, &rows, 77, Some(3165383));
         assert_eq!(census[0].held_by.as_deref(), Some("pid 3182623 (977 MiB)"));
-        assert_eq!(
-            census[1].held_by.as_deref(),
-            Some("pid 3165383 (21540 MiB)")
+        assert_eq!(census[1].held_by.as_deref(), None);
+    }
+
+    /// The pid [`super::FELLOW`] names is a pid or nothing: unset and empty
+    /// name none, a pid names it, and any other value is refused by name.
+    #[test]
+    fn a_fellow_is_a_pid_or_nothing() {
+        use std::ffi::OsStr;
+        let fellow = |v: &str| fellow_pid(Some(OsStr::new(v)));
+        assert_eq!(fellow_pid(None), Ok(None));
+        assert_eq!(fellow(""), Ok(None));
+        assert_eq!(fellow("3165383"), Ok(Some(3165383)));
+        let notapid = fellow("gate").unwrap_err();
+        assert!(
+            notapid.contains("BLOOMERY_CARD_FELLOW=\"gate\""),
+            "{notapid}"
         );
     }
 }
