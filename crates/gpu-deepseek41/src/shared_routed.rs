@@ -651,17 +651,21 @@ fn moe_of(layers: &[LayerSpec], l: usize) -> Option<&models::Moe> {
     }
 }
 
-/// The device rule of a description's activation: a SwiGLU clamp (no limit: plain) or SwiGLU-OAI; any other
-/// activation is refused by name.
+/// The device rule of a description's activation: a SwiGLU clamp (no limit: plain), SwiGLU-OAI or
+/// the gate-first clamp; any other activation is refused by name.
 pub fn rule_of(what: &str, l: usize, act: ActRule) -> Result<Act, GpuError> {
     match act {
         ActRule::SwiGlu { limit } => Ok(Act::SwigluClamp {
             limit: limit.unwrap_or(0.0),
         }),
         ActRule::SwigluOai { alpha, limit } => Ok(Act::SwigluOai { alpha, limit }),
+        ActRule::SwiGluGateFirst { limit } => Ok(Act::SwigluGateClamp { limit }),
         other => Err(GpuError::shape(
             WHAT,
-            format!("layer {l}: the {what} is {other:?}; this block runs SwiGLU and SwiGLU-OAI"),
+            format!(
+                "layer {l}: the {what} is {other:?}; this block runs SwiGLU, SwiGLU-OAI and the \
+                 gate-first clamp"
+            ),
         )),
     }
 }
@@ -678,7 +682,7 @@ struct Described {
 
 /// The description of `layers` as the compiled router, handoff and shared
 /// block run it: `R`'s experts, picks, score, normalization and bias policy; and a
-/// SwiGLU or SwiGLU-OAI shared expert without a gate.
+/// SwiGLU, SwiGLU-OAI or gate-first-clamped shared expert without a gate.
 /// Anything else is refused by name with its layer.
 fn describe<R: RouterEntry>(layers: &[LayerSpec]) -> Result<Described, GpuError> {
     let (mut scale, mut expert_ff, mut shared_ff) = (None, None, None);

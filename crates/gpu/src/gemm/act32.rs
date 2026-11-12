@@ -762,8 +762,8 @@ impl Gemm32Kernels {
     /// columns (`swiglu_act_quant32`, declared in `kernels32.rs`):
     /// [`Gemm32Kernels::enqueue_swiglu_quant32`] with the gate·up rule
     /// `rule` (`kquant::act::apply`) in place of `silu(g) · u` — ik's
-    /// clamped SwiGLU or the OAI SwiGLU for a feed-forward block its model
-    /// clamps. A non-finite `g` or `u` value refuses its block and raises
+    /// clamped SwiGLU, the OAI SwiGLU or the gate-first clamped SwiGLU for a
+    /// feed-forward block its model clamps. A non-finite `g` or `u` value refuses its block and raises
     /// [`FaultSite::QuantColumn`] under any rule (a clamp would carry it to a
     /// finite value); [`Act::SiluMul`] writes `enqueue_swiglu_quant32`'s
     /// bytes. A rule [`Act::code`] refuses is refused by name. Asynchronous,

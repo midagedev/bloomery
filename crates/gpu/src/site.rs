@@ -2218,20 +2218,32 @@ fn swiglu_launch((ty, name): (SiteTy, &str), rule: Act) -> Result<SwigluLaunch, 
     match (reads_wide(ty), rule) {
         (
             Form::Q8x128,
-            Act::SiluMul | Act::SwigluClamp { .. } | Act::SwigluOai { .. } | Act::Situ { .. },
+            Act::SiluMul
+            | Act::SwigluClamp { .. }
+            | Act::SwigluOai { .. }
+            | Act::Situ { .. }
+            | Act::SwigluGateClamp { .. },
         ) => Ok(SwigluLaunch::Q128),
         // `SiluMul` keeps the plain entry, which carries no rule switch; the
         // rule's entry writes the same bytes under it.
         (Form::Q8x32, Act::SiluMul) => Ok(SwigluLaunch::Q32Plain),
-        (Form::Q8x32, Act::SwigluClamp { .. } | Act::SwigluOai { .. } | Act::Situ { .. }) => {
-            Ok(SwigluLaunch::Q32Rule)
-        }
+        (
+            Form::Q8x32,
+            Act::SwigluClamp { .. }
+            | Act::SwigluOai { .. }
+            | Act::Situ { .. }
+            | Act::SwigluGateClamp { .. },
+        ) => Ok(SwigluLaunch::Q32Rule),
         // `SiluMul` keeps the plain entry; the rule's entry writes the same
         // values under it.
         (Form::F32, Act::SiluMul) => Ok(SwigluLaunch::F32),
-        (Form::F32, Act::SwigluClamp { .. } | Act::SwigluOai { .. } | Act::Situ { .. }) => {
-            Ok(SwigluLaunch::F32Rule)
-        }
+        (
+            Form::F32,
+            Act::SwigluClamp { .. }
+            | Act::SwigluOai { .. }
+            | Act::Situ { .. }
+            | Act::SwigluGateClamp { .. },
+        ) => Ok(SwigluLaunch::F32Rule),
         (Form::Q8Blocks32, _) => Err(GpuError::shape(
             "site::swiglu",
             format!(

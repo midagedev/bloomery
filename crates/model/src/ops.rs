@@ -673,6 +673,10 @@ pub enum GroupInput<'a> {
     /// feeds the pair's weight ([`qdot::swiglu_clamp`]; a limit at or below
     /// 1e-6 clamps nothing).
     SwigluClamp(&'a Tensor2, &'a Tensor2, f32),
+    /// (`gate`, `up`, `limit`) — `silu(min(gate, limit)) · clamp(up, ±limit)`
+    /// feeds the pair's weight (ggml's `ggml_swiglu_clamp`,
+    /// [`qdot::swiglu_gclamp`]; a limit at or below 1e-6 clamps nothing).
+    SwigluGateFirst(&'a Tensor2, &'a Tensor2, f32),
     /// (`gate`, `up`, `alpha`, `limit`) — the OAI rule feeds the pair's
     /// weight: `x = min(gate, limit); y = clamp(up, -limit, limit);
     /// x / (1 + exp(-alpha x)) * (y + 1)` ([`qdot::swiglu_oai`]; `limit` finite
@@ -688,7 +692,8 @@ pub enum GroupInput<'a> {
 }
 
 /// The combine a [`GroupInput::Swiglu`], [`GroupInput::SwigluClamp`],
-/// [`GroupInput::SwigluOai`], [`GroupInput::Situ`] or [`GroupInput::Relu2`] input stands for: the
+/// [`GroupInput::SwigluGateFirst`], [`GroupInput::SwigluOai`],
+/// [`GroupInput::Situ`] or [`GroupInput::Relu2`] input stands for: the
 /// blocks it reads and the one call every path makes of them ([`InputCombine::write_par`]).
 #[derive(Clone, Copy)]
 enum InputCombine<'a> {
@@ -697,6 +702,12 @@ enum InputCombine<'a> {
         gate: &'a Tensor2,
         up: &'a Tensor2,
         limit: Option<f32>,
+    },
+    /// The gate-first rule of `gate` and `up` ([`swiglu_gclamp_into`]).
+    SwigluGateFirst {
+        gate: &'a Tensor2,
+        up: &'a Tensor2,
+        limit: f32,
     },
     /// The OAI rule of `gate` and `up` ([`swiglu_oai_into`]).
     SwigluOai {
@@ -723,6 +734,9 @@ impl InputCombine<'_> {
             InputCombine::Swiglu { gate, up, limit } => {
                 swiglu_into(&gate.data, &up.data, *limit, out)
             }
+            InputCombine::SwigluGateFirst { gate, up, limit } => {
+                swiglu_gclamp_into(&gate.data, &up.data, *limit, out)
+            }
             InputCombine::SwigluOai {
                 gate,
                 up,
@@ -745,6 +759,9 @@ impl InputCombine<'_> {
             InputCombine::Swiglu { gate, up, limit } => {
                 swiglu_into(gate.col(t), up.col(t), *limit, out)
             }
+            InputCombine::SwigluGateFirst { gate, up, limit } => {
+                swiglu_gclamp_into(gate.col(t), up.col(t), *limit, out)
+            }
             InputCombine::SwigluOai {
                 gate,
                 up,
@@ -765,6 +782,7 @@ impl InputCombine<'_> {
     fn site(&self) -> &'static str {
         match self {
             InputCombine::Swiglu { .. }
+            | InputCombine::SwigluGateFirst { .. }
             | InputCombine::SwigluOai { .. }
             | InputCombine::Situ { .. } => "swiglu",
             InputCombine::Relu2 { .. } => "relu2",
@@ -781,6 +799,7 @@ impl<'a> GroupInput<'a> {
             GroupInput::Ready(x) => x.view(),
             GroupInput::Swiglu(gate, _)
             | GroupInput::SwigluClamp(gate, _, _)
+            | GroupInput::SwigluGateFirst(gate, _, _)
             | GroupInput::SwigluOai(gate, _, _, _)
             | GroupInput::Situ(gate, _, _, _) => gate.view(),
             GroupInput::Relu2(up) => up.view(),
@@ -815,6 +834,9 @@ impl<'a> GroupInput<'a> {
                 up,
                 limit: Some(limit),
             }),
+            GroupInput::SwigluGateFirst(gate, up, limit) => {
+                Some(InputCombine::SwigluGateFirst { gate, up, limit })
+            }
             GroupInput::SwigluOai(gate, up, alpha, limit) => Some(InputCombine::SwigluOai {
                 gate,
                 up,
@@ -2301,6 +2323,17 @@ fn swiglu_oai_into(gate: &[f32], up: &[f32], alpha: f32, limit: f32, out: &mut [
     }
 }
 
+/// The gate-first rule into `out` ([`qdot::swiglu_gclamp`]) — the one call
+/// every gate-first combine makes, on a claimant or on the caller. A NaN or
+/// an infinity in `gate` or `up` that the clamp would write as a finite value
+/// is refused by name after the combine, which reads it in the same pass.
+fn swiglu_gclamp_into(gate: &[f32], up: &[f32], limit: f32, out: &mut [f32]) {
+    if !qdot::swiglu_gclamp(gate, up, limit, out) {
+        let bad = gate.iter().chain(up).find(|v| !v.is_finite());
+        panic!("swiglu gate-first: non-finite gate or up sum {bad:?}");
+    }
+}
+
 /// The SiTU rule into `out`, in the card's op order (`gpu::kquant::act::situ`, the rule the card
 /// leg's gate·up kernels run): each scale by its f32 reciprocal, the tanh, the scale back, σ with
 /// ik's exponential ([`qdot::expf_ik_scalar`], bit-equal to the device's), then the two products
@@ -2362,6 +2395,7 @@ fn combine_timed(combine: InputCombine<'_>) -> (Tensor2, u64) {
     let t_call = if lvl > 0 { Some(Instant::now()) } else { None };
     let (rows, cols) = match combine {
         InputCombine::Swiglu { gate, .. }
+        | InputCombine::SwigluGateFirst { gate, .. }
         | InputCombine::SwigluOai { gate, .. }
         | InputCombine::Situ { gate, .. } => (gate.ne0, gate.ne1),
         InputCombine::Relu2 { up } => (up.ne0, up.ne1),
@@ -2540,6 +2574,7 @@ fn group_core(
             None => (SlotBlock::Input(xin), None),
             Some(combine) => {
                 if let InputCombine::Swiglu { gate, up, .. }
+                | InputCombine::SwigluGateFirst { gate, up, .. }
                 | InputCombine::SwigluOai { gate, up, .. }
                 | InputCombine::Situ { gate, up, .. } = combine
                     && (up.ne0, up.ne1) != (gate.ne0, gate.ne1)
@@ -5236,6 +5271,13 @@ pub enum ExpertForm {
     /// 1e-6; at or below it the plain combine ([`qdot::swiglu_clamp`]'s
     /// contract).
     Gated { limit: f32 },
+    /// Gated gate-first SwiGLU: `[gate, up, down]`, the combine
+    /// `silu(min(gate·x, limit)) · clamp(up·x, ±limit)` — ggml's
+    /// `ggml_swiglu_clamp`, the gate clamped from above before the
+    /// activation ([`qdot::swiglu_gclamp`]'s contract; a limit at or below
+    /// 1e-6 clamps nothing). The layer holds the same stacks as
+    /// [`ExpertForm::Gated`].
+    GatedGateFirst { limit: f32 },
     /// Gated SwiGLU-OAI: `[gate, up, down]`, the combine `x = min(gate,
     /// limit); y = clamp(up, -limit, limit); x / (1 + exp(-alpha x)) * (y + 1)`
     /// ([`qdot::swiglu_oai`]'s contract, `limit` finite and not negative). The
@@ -5291,6 +5333,7 @@ impl ExpertForm {
     pub(crate) fn combine_into(self, gate: &[f32], up: &[f32], out: &mut [f32]) {
         match self {
             ExpertForm::Gated { limit } => swiglu_into(gate, up, Some(limit), out),
+            ExpertForm::GatedGateFirst { limit } => swiglu_gclamp_into(gate, up, limit, out),
             ExpertForm::GatedOai { alpha, limit } => swiglu_oai_into(gate, up, alpha, limit, out),
             ExpertForm::Situ { beta, linear_beta } => situ_into(gate, up, beta, linear_beta, out),
             ExpertForm::Relu2 => relu2_into(up, out),
@@ -5584,6 +5627,11 @@ impl Combines<'_> {
                     let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
                     let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
                     swiglu_into(gate, up, Some(limit), par);
+                }
+                ExpertForm::GatedGateFirst { limit } => {
+                    let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
+                    let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
+                    swiglu_gclamp_into(gate, up, limit, par);
                 }
                 ExpertForm::GatedOai { alpha, limit } => {
                     let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
@@ -6098,9 +6146,10 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     fn gu_cells(&self) -> usize {
         let cells = self.plan.slots() * self.gate.n;
         match self.form {
-            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } | ExpertForm::Situ { .. } => {
-                2 * cells
-            }
+            ExpertForm::Gated { .. }
+            | ExpertForm::GatedGateFirst { .. }
+            | ExpertForm::GatedOai { .. }
+            | ExpertForm::Situ { .. } => 2 * cells,
             ExpertForm::Relu2 => cells,
         }
     }
@@ -6373,7 +6422,10 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         // A relu² layer's first pass reads the up alone: one pair an expert,
         // the up's slots the store's shape.
         let (pass, site, rec) = match self.form {
-            ExpertForm::Gated { .. } | ExpertForm::GatedOai { .. } | ExpertForm::Situ { .. } => {
+            ExpertForm::Gated { .. }
+            | ExpertForm::GatedGateFirst { .. }
+            | ExpertForm::GatedOai { .. }
+            | ExpertForm::Situ { .. } => {
                 (UnionPass::GateUp, "host_gate_up", &[self.gate, self.up][..])
             }
             ExpertForm::Relu2 => (UnionPass::Up, "host_up", &[self.up][..]),
