@@ -136,6 +136,22 @@ pub fn deepseek41_model(split: &Split) -> Result<deepseek41::hparams::Model, Pla
     }
 }
 
+/// Which of the [`raon1`] module's dialects `split` holds, by its `general.architecture`; any
+/// other string is an error naming it.
+pub fn raon1_dialect(split: &Split) -> Result<models::Arch, PlacementError> {
+    match split.architecture() {
+        Some("raon1") => Ok(models::Arch::Raon1),
+        Some("raon1nano") => Ok(models::Arch::Raon1Nano),
+        other => Err(PlacementError::Metadata {
+            key: ARCHITECTURE_KEY.to_string(),
+            detail: format!(
+                "is {:?}; the raon1 module reads the raon1 and raon1nano dialects",
+                other.unwrap_or("<missing>")
+            ),
+        }),
+    }
+}
+
 /// The `general.architecture` strings whose body is the Qwen3.5 dense trunk
 /// ([`qwen35moe::hparams::Variant::Qwen35`]): `qwen35`, and `clef`, llama.cpp's
 /// layout of the same trunk with a decision head's tensors beside it (the head

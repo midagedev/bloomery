@@ -1,0 +1,24 @@
+# Round raon-nano-r3: KRAFTON's llama.cpp branch raon-1-nano-preview (4d72ff0d, CPU, no patch) over the Q8_0 file
+# (3.39 GB, one file), `just dump-ref-raon1nano`: four prompts (26, 31, 72 and 1,536 ids) from ONE load, the layer
+# taps of the first, each layer output of the next two, the last logits row of the last, and 32 greedy tokens of the
+# first three. The phases run one after the other on the same 16 threads (RAON1NANO_THREADS=16, this round's CPU
+# cap): the wall is their sum.
+# Predicted wall [derived; the per-phase rates are the oracle round's own measurements on this box at -t 16
+# (specs/raon-nano-oracle: decode 41.0-43.4 tok/s, prompt eval 90-105 tok/s), the byte terms from the file's shapes
+# (blocks 1.13B params Q8_0 ≈ 1.2 GB, the tied head's table 0.4 GB a logits row, per_layer_token_embd 1.70 GB read
+# as 24 rows of 256 a token)]:
+#   load      Q8_0 stays mapped on x86 (no interleave to repack): the mmap of 3.39 GB and the header walk. 3-10 s
+#   prefill   1,665 ids at 90-105 tok/s (measured at 4 ids; the MLA layers of the 1,536-id prompt attend deeper, a
+#             little under that rate). 16-25 s
+#   greedy    96 tokens at 41-43 tok/s (measured). 2.3-2.6 s
+#   writes    ~450 f32 node files of set a through the callback's gather (the widest [12288, 26]): 2-5 s
+#   total     25-45 s warm; bound 1800 s.
+# What the run guarantees: CUDA hidden, the CPU lease held, no peer on the box's cores (the lease), the staging set
+# installed only when each prompt's manifest carries its `# complete` trailer, and every tap of the list carried by
+# a graph node (cb_dump's named error).
+kind: exclusive
+reason: raon1nano_dump runs the vendor llama.cpp branch on 16 CPU threads and maps the whole 3.39 GB file, evicting
+  that much page cache; beside a timed run or a gate batch it would take their cores and their memory bandwidth, so
+  it holds the lease; why now: the Raon-1-nano oracle every later round (the fused RDA stems, the folded mHC chart,
+  the per-layer input, the dense SwiGLU block, the tied head) is judged against (round raon-nano-r3)
+minutes: 1..2

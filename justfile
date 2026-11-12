@@ -4441,6 +4441,26 @@ dump-ref-raon1:
 
 # --- end raon-ref ---
 
+# --- raonnano-ref (Raon-1-nano-preview oracle) ----------------------------------------------------------------------------------------
+
+# Raon-1-nano-preview oracle: raon1nano_dump (the shared tools/ref/cb_dump.cpp) linked against KRAFTON's llama.cpp branch
+# raon-1-nano-preview at 4d72ff0d (CPU, no patch, /home/user/llama.cpp-4d72ff0d, whose tracked files must be clean — the tree the
+# oracle round built at that commit; this does not rebuild it, a rebuild moves the libllama md5 the oracle sets name).
+# tools/ref/raon1nano-dump-build.sh is the call; the binary and its build record land in $BLOOMERY_DATA/bin.
+build-ref-raon1nano:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 BLOOMERY_MODEL=raon1nano ./tools/box.sh 'bash tools/ref/raon1nano-dump-build.sh'
+
+# The Raon-1-nano-preview oracle sets (refset family lcpp-raon1nano; tools/ref/raon1nano-dump.sh has the layout and the taps): the
+# vendor branch on the CPU over the four prompts of tools/ref/data/raon1 (the two dialects share the vocabulary and the prompts) from
+# one load of the Q8_0 file, into $BLOOMERY_DATA/ref_raon1nano_{a,b,c,d}: every layer's taps for a, each layer output for b and c, the
+# last logits row for d, the top-40 logprobs and 32 greedy tokens for a, b and c. Predicted wall 25-45 s, under the CPU lease and its
+# card (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/raon1nano-dump.card'); DUMP_DRY=1 in that variable prints the dump and stops
+# before the lease. The Q8_0 file is the family's own fixture: BLOOMERY_TIER=fixture is refused by name (the real file stands, no cut).
+dump-ref-raon1nano:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=240 BLOOMERY_MODEL=raon1nano ./tools/box.sh 'bash tools/ref/raon1nano-dump.sh'
+
+# --- end raonnano-ref ---
+
 # --- raon-body (Raon-1-mini chain) ---------------------------------------------------------------------------------------------------
 
 # Raon-1-mini end-to-end gate (gate_raon1_e2e's doc): the whole step on one card (RDA and gated latent layers, Raon_mHC's four streams,
@@ -4477,6 +4497,25 @@ gate-gpu-raon1-attn:
 gate-gpu-raon1-nano:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raonnano && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raonnano'
 
+# The Nano dialect end-to-end gate (gate_raonnano_e2e's doc): the whole step on one card (the fused-stem RDA and
+# gated latent layers, the dense SwiGLU blocks under the folded chart, the per-layer input, the tied head), one
+# prompt id a step, against the vendor branch's sets (refset family lcpp-raon1nano, `just dump-ref-raon1nano`):
+# on each of the English, Korean and Rust sets the argmax after the prompt, the whole logits row within the band
+# and the 32-token greedy continuation id for id (or up to a named tie); the 1,536-id wikitext set as the rows
+# pass reaches the vendor's row and the same bits across a cut; verifies and commits give the plain run's ids.
+# No wide arm (the dialect's widths and per-layer input keep prompts on the rows pass) and no draft (a nano file
+# drafts nothing). The Q8_0 file is the family's own fixture: the fixture tier defers the recipe to the real.
+gate-gpu-raonnano-e2e:
+    BLOOMERY_MODEL=raon1nano ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raonnano_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raonnano_e2e'
+
+# The raon1 seat of bloomery-serve on the Nano dialect's Q8_0 file (gate_raonnano_serve's doc): the seat opens the
+# file by its detected architecture, loads it at the context asked, answers one chat request with its reasoning
+# split at the model's own tags and its turn ended at its own end token, keeps a shared prefix by the RDA state's
+# rule, and drafts nothing: the unset draft rule names the raon1nano file and a dspark draft is refused by name.
+# The seat is the deepseek41 feature's (the DFlash2 draft's served-spark owner it shares), so both bins take it.
+gate-gpu-raonnano-serve:
+    BLOOMERY_MODEL=raon1nano ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin bloomery-serve --bin gate_raonnano_serve && D=target/raonnano-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raonnano_serve --dir $D'
+
 # --- end raon-attn ---
 
 # --- raon-model ---
@@ -4496,6 +4535,17 @@ gate-raon1-tokenizer:
     ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test raon -- --include-ignored --nocapture'
 
 # --- end raon-model ---
+
+# --- raonnano-model ---
+# raon1nano (Raon-1-nano-preview) header gate: the one reader's refusals on synthetic headers are mini's own half
+# above; this is the nano dialect's description of the Q8_0 file: the delta and latent layer lines (the per-layer
+# head counts, the fused stems, the per-layer input, the tied head), the keys left unread, the tensors by role and
+# type, the coverage list and the stores of the layers. The test half is the file under /data. Headers only,
+# seconds.
+gate-raonnano-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test raonnano_meta -- --ignored --nocapture'
+
+# --- end raonnano-model ---
 
 # --- exaone-moe (K-EXAONE-2.0) ---
 

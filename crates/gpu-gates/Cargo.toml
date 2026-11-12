@@ -878,6 +878,16 @@ required-features = ["gpu"]
 name = "gate_raonnano"
 required-features = ["gpu"]
 
+# raon-nano: the Nano dialect's end-to-end gate on the Q8_0 file, against the vendor branch's sets.
+[[bin]]
+name = "gate_raonnano_e2e"
+required-features = ["gpu"]
+
+# raon-nano: the raon1 seat of bloomery-serve on the Nano dialect's Q8_0 file.
+[[bin]]
+name = "gate_raonnano_serve"
+required-features = ["deepseek41"]
+
 # kimik3kda: Kimi K3's KDA layer through `mixer_kda` at 2 and 96 heads of 128 against llama.cpp's graph in f64.
 [[bin]]
 name = "gate_kimi_k3_kda"

@@ -170,17 +170,8 @@ impl Hparams {
     /// its kind, its dialect or the keys is an error naming the key or the tensor.
     pub fn read(split: &Split) -> Result<Hparams, PlacementError> {
         let mut defaults = Vec::new();
-        let name = split.architecture().unwrap_or("<missing>");
-        let arch = match name {
-            "raon1" => models::Arch::Raon1,
-            "raon1nano" => models::Arch::Raon1Nano,
-            other => {
-                return Err(PlacementError::Metadata {
-                    key: "general.architecture".to_string(),
-                    detail: format!("is {other:?}; the raon1 reader reads raon1 and raon1nano"),
-                });
-            }
-        };
+        let arch = crate::arch::raon1_dialect(split)?;
+        let name = arch.name();
         // The description row: the file's own facts its keys do not state. The Mini dialect's
         // keys state all of them, so its string has no row.
         let row = rules::row(name);

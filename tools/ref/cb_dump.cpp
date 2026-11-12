@@ -8,7 +8,8 @@
 // A port of dump_ref to the mainline `cb_eval` API (llama_context_params.cb_eval), cut to what the gates read:
 //  - the nodes a prompt names (--prompt NAME:IDS:NODES:GREEDY, NODES joined by `+`): a name selects the node of that exact
 //    name and `<name>-<layer>`, and a node is written whole (every position of its ubatch) at the callback's second call.
-//    The names are the graph's own `cb()` names, which a family's script lists;
+//    The names are the graph's own `cb()` names, which a family's script lists; a name no graph node has carried by the
+//    end of the prompt's decode is a named error (exit 1, every such name listed), never a tap quietly absent;
 //  - `result_output` is the last position's whole logits row (the only row the batch asks for);
 //  - an integer node (a router's expert ids) is written as dump_ref writes it: the f32 file (exact up to 2^24), its
 //    lossless twin `<name>.<occurrence>.i32` (`.i64` for a 64-bit type; `.logical.` beside a logical twin) and an `int` row,
@@ -47,6 +48,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <string>
 #include <sys/stat.h>
 #include <vector>
@@ -67,6 +69,7 @@ struct Dump {
     bool                       ints = false;  // an `int` row was written: the header names the columns
     std::vector<std::string>   nodes;       // the prompt's node names
     std::map<std::string, int> seen;        // node name -> times emitted: the occurrence index
+    std::set<std::string>      matched;     // the prompt's node names a graph node has carried so far
     std::vector<uint8_t>       staging;     // a device tensor lands here before the write
     bool                       quiet  = true;  // no node is asked for outside the prompt's decode
     bool                       failed = false;
@@ -101,9 +104,12 @@ static bool is_node(const std::string & node, const char * name) {
     return true;
 }
 
-static bool wanted(const Dump & d, const char * name) {
+static bool wanted(Dump & d, const char * name) {
     for (const std::string & n : d.nodes) {
-        if (is_node(n, name)) return true;
+        if (is_node(n, name)) {
+            d.matched.insert(n);
+            return true;
+        }
     }
     return false;
 }
@@ -408,6 +414,7 @@ int main(int argc, char ** argv) {
     for (size_t pi = 0; pi < prompts.size(); ++pi) {
         const Prompt & p = prompts[pi];
         if (pi > 0) llama_memory_clear(llama_get_memory(ctx), true);
+        std::vector<std::string> missing;
         d = Dump();
         d.dir = out + "/" + p.name;
         d.nodes = p.nodes;
@@ -439,6 +446,18 @@ int main(int argc, char ** argv) {
             return 1;
         }
         const double s_prompt = since(t_prompt);
+        // A tap no graph node has carried is a wrong tap list, not a graph that ran without it: name every
+        // one the prompt asked for and the decode never saw, and stop before anything is installed.
+        for (const std::string & n : p.nodes) {
+            if (d.matched.count(n) == 0) missing.push_back(n);
+        }
+        if (!missing.empty()) {
+            for (const std::string & n : missing) {
+                fprintf(stderr, "%s: prompt %s asks for node %s, which no graph node carries\n", g_who, p.name.c_str(),
+                        n.c_str());
+            }
+            return 1;
+        }
         const float * row = llama_get_logits_ith(ctx, -1);
         if (!finite_row(row, n_vocab, p.name.c_str())) return 1;
         const std::vector<Top> top = top_of(row, n_vocab, 40);

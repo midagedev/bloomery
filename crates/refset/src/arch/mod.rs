@@ -35,6 +35,7 @@ pub mod qwen35moe;
 pub mod qwen3moe;
 pub mod qwen4exp;
 pub mod raon1;
+pub mod raon1nano;
 pub mod solar2;
 pub mod tokenizer;
 
@@ -58,6 +59,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (minicpmv4_7::ARCH, minicpmv4_7::FAMILIES),
     (qwen4exp::ARCH, qwen4exp::FAMILIES),
     (raon1::ARCH, raon1::FAMILIES),
+    (raon1nano::ARCH, raon1nano::FAMILIES),
     (nemotron_h::ARCH, nemotron_h::FAMILIES),
     (nemotron_h_moe::ARCH, nemotron_h_moe::FAMILIES),
     (lfm3::ARCH, lfm3::FAMILIES),

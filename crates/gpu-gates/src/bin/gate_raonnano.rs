@@ -175,10 +175,7 @@ mod gate {
         for (name, ok) in NAMES.iter().zip(results.iter()) {
             println!("gate_raonnano: {name} — {}", verdict(*ok));
         }
-        println!(
-            "gate_raonnano: {} clauses, {failed} failed",
-            results.len()
-        );
+        println!("gate_raonnano: {} clauses, {failed} failed", results.len());
         if failed > 0 {
             return Err(checks_failed());
         }

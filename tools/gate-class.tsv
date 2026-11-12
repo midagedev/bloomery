@@ -258,6 +258,9 @@ gate-vision	common		media	serve_media
 gate-gpu-raon1-e2e	family	raon1	e2e	graph_fault+attn_linear_gdn_kda+attn_latent_mla+moe_route+seats_app+drafts_dspark
 gate-gpu-raon1-attn	family	raon1	kernel	attn_linear_gdn_kda+attn_latent_mla
 gate-gpu-raon1-nano	family	raon1nano	kernel	-
+gate-gpu-raonnano-e2e	family	raon1nano	e2e	graph_fault+attn_linear_gdn_kda+attn_latent_mla+seats_app
+gate-gpu-raonnano-serve	family	raon1nano	serve	seats_serve_engine
+gate-raonnano-meta	family	raon1nano	meta	arch_registry
 gate-raon1-meta	family	raon1	meta	arch_registry
 gate-raon1-tokenizer	family	raon1	tokenizer	tokenizer_jinja
 gate-exaone-tokenizer	family	exaone-moe	tokenizer	tokenizer_jinja
