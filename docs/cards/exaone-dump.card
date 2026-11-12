@@ -1,0 +1,14 @@
+# Round exaone-r6b: the exaone-moe oracle node dumps of the fixture GGUF (8,496,145,440 B, the bootstrap mix
+# of the exaoneh cut), just dump-ref-exaone-moe: the four prompts (24, 18, 30 and 5 ids) from ONE load into
+# ref_exaone_{a,b,c,d}, each with 32 greedy tokens.
+# Phases, seconds [derived]: load the tree maps the one shard with MAP_POPULATE, 8.50 GB at the 1.07-1.7 GB/s
+# single-stream cold populate of q35oracle-dump.card: 5-8 s; prompts 77 ids over 6 built layers with the file
+# whole in the page cache: < 5 s; greedy 128 steps, each reading the 3.06 GB of non-routed weights from DRAM
+# (~0.03 s at ~100 GB/s) and gathering 8 of 256 experts a routed layer (4 x ~5.3 MB an expert, cached): < 0.1
+# s a step, < 13 s; writes the taps ~0.1 GB at 0.5 GB/s and the lease witnesses: < 10 s. Central ~0.5 min; the
+# bound leaves room for a cold cache.
+kind: exclusive
+reason: cb_dump runs llama.cpp on 32 CPU threads and pages the 8.50 GB fixture GGUF into the page cache;
+  beside a timed run or a gate batch it would take their cores and their memory bandwidth, so it holds the
+  lease; why now: the exaone-moe oracle sets every family gate is judged against (round exaone-r6b)
+minutes: 0.5..4

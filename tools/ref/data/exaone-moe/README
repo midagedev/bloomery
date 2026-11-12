@@ -1,0 +1,30 @@
+K-EXAONE-2.0 oracle prompts (tools/ref/exaone-moe-dump.sh): the text of each prompt and its token ids, one decimal id a
+line, no chat template (the file's tokenizer adds no BOS: llama-tokenize gives the same ids with and without --no-bos).
+The dumper never tokenizes (tools/ref/cb_dump.cpp): a tokenizer difference would read as a kernel bug.
+
+Made once, on the box, by the tokenizer of the dump's own tree (mainline llama.cpp 7bcbc04fb carrying the exaone-moe oracle
+patch, CPU build, patch sha256 c7a1bf15a85f6791f28c80bd86d42a147de9d82186834865c3e4ed5f1192dd9e) on the fixture GGUF
+(/models/fixtures/exaoneh-gguf/exaoneh-gguf-fixture-00001-of-00001.gguf; the pre-tokenizer is `exaone-moe`):
+
+    llama-tokenize -m <the GGUF> -f <text> --ids --no-escape --log-disable     # "[id, id, ...]", written one id a line
+
+The texts hold no final newline (one would be an id). Our tokenizer (bloomery-tokenize -m <the GGUF> -f <text> --ids)
+gives the same ids for all four, and the same ids with --no-parse-special on both sides.
+
+    a  24 ids  English paragraph, cut after "coming home."           txt 139 bytes
+               ids 5f67849cd9e7e210378d1a329e9a995c77a759a4554270e504698367afa06467
+               text bcb98a9e563eabdcbd4a4c4cbb3e7b8de220e51006ba45c7bdbac07acc36149c
+    b  18 ids  Korean paragraph, cut after "단풍이"                   txt 97 bytes
+               ids 0f3831ccde5eb9982076ab2ef2354cbcb1ecca21a69491692e18893f3e5bb343
+               text 63ed34c308dcab881c36fef27c3d51bfc8d516ab3bd687424a33c44a0d159e22
+    c  30 ids  Rust function head, cut after `HashMap::new();`       txt 115 bytes
+               ids fa95697236e91f023ec4cac266e5f6c334e980b6f16d2ee001db629a362aeddf
+               text 7d7754436326bf2bfb1b90e76ea55382d33391535524220ca34808627be7689e
+    d   5 ids  "The capital of France is"                           txt 24 bytes
+               ids 6d3f876a3407bd29c17c6809e14150a11458b8798090e4b2d07ff622683c25b1
+               text bbaff4d2ecd5892d4a442b0f53131641bf6e6f284761dd20fc0664bc97145762
+
+Every prompt is at most 30 ids: a prompt position gathers 8 of 256 experts a routed layer from the file's 8.5 GB, so the
+four prompts are short and the 32 greedy tokens run past each one. a is the one prompt that carries the per-stage taps (the
+per-head norms, the roped query and key, the router's logits and probabilities, the experts' stacks); b, c and d carry the
+layer taps.

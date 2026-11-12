@@ -2885,7 +2885,7 @@ pub(crate) mod tests {
         fs::create_dir(&src).unwrap();
         // One layer: gate [256, 128] with a [2, 1] grid, down [128, 256] with a [1, 2] grid, and
         // plain [256, 128] BF16 with no grid.
-        let tensors = vec![
+        let tensors = [
             tensor("m.layers.0.ffn.gate.weight", "F8_E4M3", &[256, 128]),
             tensor("m.layers.0.ffn.gate.weight_scale_inv", "F32", &[2, 1]),
             tensor("m.layers.0.ffn.down.weight", "F8_E4M3", &[128, 256]),

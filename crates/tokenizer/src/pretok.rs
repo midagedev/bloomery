@@ -1146,6 +1146,7 @@ impl Pre {
             Pre::Llama3 => Some(Pre::Llama3Hf),
             Pre::Tekken => Some(Pre::TekkenHf),
             Pre::MiniMaxM2 | Pre::Gpt4o => Some(Pre::MiniMaxM2Hf),
+            Pre::ExaoneMoe => Some(Pre::ExaoneMoe),
             _ => None,
         }
     }
@@ -2597,8 +2598,9 @@ mod tests {
     /// `exaone-moe` is a row of its own: the reference's regex over the collapsed text, the
     /// model's NFC normalizer applied first (the reference itself normalizes nothing on that
     /// path), the strict UTF-8 reader of the mainline tree that reads the name, no whole-token
-    /// words, and no Hugging Face reading — a case whose text is not NFC holds the Hugging Face
-    /// tokenizer's ids, which the gate pins in `exaone-nfc-ids.tsv`, not a second reading.
+    /// words, and its own Hugging Face reading (the model's `tokenizer.json` runs this
+    /// pre-tokenizer under its NFC normalizer) — a case whose text is not NFC holds the Hugging
+    /// Face tokenizer's ids, which the gate pins in `exaone-nfc-ids.tsv`, not a second reading.
     #[test]
     fn exaone_moe_is_a_row_with_the_models_nfc() {
         assert_eq!(
@@ -2609,7 +2611,7 @@ mod tests {
         assert!(Pre::ExaoneMoe.nfc());
         assert!(Pre::ExaoneMoe.strict_utf8());
         assert!(!Pre::ExaoneMoe.ignore_merges());
-        assert_eq!(Pre::ExaoneMoe.hf_reading(), None);
+        assert_eq!(Pre::ExaoneMoe.hf_reading(), Some(Pre::ExaoneMoe));
     }
 
     /// The `exaone-moe` splitter's alternatives, one case each, as its regex splits them over
