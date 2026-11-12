@@ -982,7 +982,7 @@ mod gate {
             p.place == "bp"
                 && p.why == "two cards, tier at or past the break-even"
                 && p.tier_experts.is_some_and(|t| {
-                    (here.saturating_sub(TIER_DRIFT)..=here + TIER_DRIFT).contains(t)
+                    (here.saturating_sub(TIER_DRIFT)..=here + TIER_DRIFT).contains(&t)
                         && t >= BREAK_EVEN
                 })
                 && p.break_even == Some(BREAK_EVEN)
