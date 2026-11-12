@@ -4,7 +4,8 @@
 //! [`Pre::Glm4`] (`glm4`), [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`),
 //! [`Pre::Tekken`] (`tekken`, `pixtral`), [`Pre::TekkenNum3`] (`tekken-num3`),
 //! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
-//! [`Pre::Raon`] (`raon`), [`Pre::KimiK2`] (`kimi-k2`) and [`Pre::Flint`] (`flint`).
+//! [`Pre::Raon`] (`raon`), [`Pre::KimiK2`] (`kimi-k2`), [`Pre::Flint`] (`flint`) and
+//! [`Pre::ExaoneMoe`] (`exaone-moe`).
 //!
 //! ## deepseek-v3
 //!
@@ -248,6 +249,27 @@
 //! U+000A and runs of everything else. `\r` is not a newline here. The words
 //! are not GPT-2 byte-level: the reference writes each space as U+2581 before
 //! the split and merges raw UTF-8 characters ([`Spelling::Metaspace`]).
+//!
+//! ## exaone-moe
+//!
+//! One regex, which the reference runs through its `std::regex` fallback on the collapsed
+//! text (no splitter of `unicode_regex_split_custom` knows it) with the same piece-local
+//! semantics as qwen35's: a contraction of either case; a word of letters with their marks
+//! whose words a single space may join — `hello world foo` is one word, and a double space,
+//! a tab or any other codepoint between words ends the run — behind one optional character
+//! that is no `\r`, `\n`, letter or number (a space, a tab, a mark, a symbol); one number a
+//! word; a punctuation/symbol run behind an optional space with at most one `\r`, `\n` or
+//! `/` after it; and the whitespace alternatives qwen2 ends with, but `\s*[\r\n]` for
+//! `\s*[\r\n]+` — the same match, the greedy `\s*` backing off to the run's last newline
+//! either way. Han and Hangul are letters of the word run here, with no CJK alternative
+//! before it: `中文 abc` is one word. [`match_exaone`] is that regex under ECMAScript
+//! semantics, written out by hand.
+//!
+//! The reference normalizes no text on this path — the header's
+//! `tokenizer.ggml.normalizer.nfc` is read at load and applied by the UGM tokenizer alone —
+//! while the model's `tokenizer.json` normalizes NFC. The engine follows the model
+//! ([`Pre::nfc`]), so the ids of a case whose text is not already NFC are the Hugging Face
+//! tokenizer's, which the gate pins beside the reference's (`tests/exaone-nfc-ids.tsv`).
 
 use crate::spelling::Spelling;
 use crate::unicode::{collapse, collapse_hf, letter_case};
@@ -718,6 +740,76 @@ fn match_flint(c: &[u8], i: usize, hi: usize) -> usize {
     match_space(c, i, hi)
 }
 
+/// `(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+` at `p`: a run of letters with their marks whose words a
+/// single space may join — the `+` repeats the group over letters beside letters too, so
+/// `hello world foo` is one word and any other codepoint between words ends the run. Its
+/// length, 0 for none (a mark or a space is no start).
+fn exaone_word(c: &[u8], p: usize, hi: usize) -> usize {
+    if p >= hi || !is_letter(c[p]) {
+        return 0;
+    }
+    let mut q = p + 1;
+    loop {
+        while q < hi && c[q] == MARK {
+            q += 1;
+        }
+        if q < hi && is_letter(c[q]) {
+            q += 1;
+        } else if q + 1 < hi && c[q] == b' ' && is_letter(c[q + 1]) {
+            q += 2;
+        } else {
+            return q - p;
+        }
+    }
+}
+
+/// The `exaone-moe` regex at `i`, the first of its alternatives that matches, under ECMAScript
+/// semantics: a contraction of either case; the letter word of [`exaone_word`] behind one
+/// optional character that is no `\r`, `\n`, letter or number (tried taken, then not); one
+/// number; a symbol run behind an optional space with at most one `\r`, `\n` or `/` after it;
+/// and the whitespace alternatives of [`match_space`], which `\s*[\r\n]` reads the same as
+/// qwen2's `\s*[\r\n]+` (the greedy `\s*` backs off to the run's last newline either way).
+fn match_exaone(c: &[u8], i: usize, hi: usize) -> usize {
+    // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])`
+    let n = contraction(c, i, hi, |k| c[k].to_ascii_lowercase());
+    if n > 0 {
+        return n;
+    }
+
+    // `[^\r\n\p{L}\p{N}]?(?:\p{L}\p{M}*(?: \p{L}\p{M}*)*)+`
+    let x = c[i];
+    if !is_newline(x) && !is_letter(x) && !is_number(x) && i + 1 < hi {
+        let n = exaone_word(c, i + 1, hi);
+        if n > 0 {
+            return 1 + n;
+        }
+    }
+    let n = exaone_word(c, i, hi);
+    if n > 0 {
+        return n;
+    }
+
+    // `\p{N}`
+    let n = match_number(c, i, hi, 1);
+    if n > 0 {
+        return n;
+    }
+
+    // ` ?[^\s\p{L}\p{N}]+[\r\n/]?`: one codepoint of the tail, not a run.
+    let start = i + usize::from(x == b' ');
+    if start < hi {
+        let n = run(c, start, hi, is_other);
+        if n > 0 {
+            let end = start + n;
+            let tail = usize::from(end < hi && (is_newline(c[end]) || c[end] == b'/'));
+            return end + tail - i;
+        }
+    }
+
+    // `\s*[\r\n]|\s+(?!\S)|\s+`
+    match_space(c, i, hi)
+}
+
 /// Regex 2 of `deepseek-llm`, `\s?[A-Za-zµÀ-ÖØ-öø-ƺ…]+`: the class as the sorted, disjoint ranges
 /// `(first, last)` its characters spell, a single character `(x, x)`.
 const LLM_LETTERS: [(u32, u32); 87] = [
@@ -1012,11 +1104,16 @@ pub(crate) enum Pre {
     KimiK2,
     /// `flint`: numbers, CJK, then the reference's collapsed case/mark regex.
     Flint,
+    /// `exaone-moe`: the reference's one regex over the collapsed text — a letter word joined by
+    /// single spaces, one number a word, a symbol run with one trailing `\r`, `\n` or `/` — run
+    /// as a regex, not a hand-written splitter, and the model's NFC normalizer applied first
+    /// ([`Pre::nfc`], the `raon` precedent).
+    ExaoneMoe,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 19] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 20] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -1036,6 +1133,7 @@ impl Pre {
         ("raon", Pre::Raon),
         ("kimi-k2", Pre::KimiK2),
         ("flint", Pre::Flint),
+        ("exaone-moe", Pre::ExaoneMoe),
     ];
 
     /// The reading of this pre-tokenizer that runs as a Hugging Face `tokenizer.json` does, its
@@ -1073,21 +1171,28 @@ impl Pre {
     }
 
     /// Whether the reference NFC-normalizes the text before this pre-tokenizer whatever the
-    /// header's normalizer says: the Hugging Face tokenizer of `raon` applies it.
+    /// header's normalizer says: the Hugging Face tokenizer of `raon` applies it, and so does
+    /// `exaone-moe`'s (the reference itself normalizes nothing on that path).
     pub(crate) fn nfc(self) -> bool {
-        matches!(self, Pre::Raon)
+        matches!(self, Pre::Raon | Pre::ExaoneMoe)
     }
 
     /// Whether the reference decodes UTF-8 strictly, independently of NFC.
     /// An overlong form is not a codepoint there; older readers accept it. The trees that read
     /// `gpt-4o`, `raon`, `flint`, `tekken` (every tree that maps `pixtral` to it has the check)
-    /// `tekken-num3` (a name younger than the check) and `kimi-k2` (read by the same mainline tree)
-    /// reject it; the trees the other names' sets are read by (ik, the Solar-Open2 patch, mainline
-    /// before the check) accept it.
+    /// `tekken-num3`, `kimi-k2` (read by the same mainline tree) and `exaone-moe` (a name
+    /// younger than the check) reject it; the trees the other names' sets are read by (ik, the
+    /// Solar-Open2 patch, mainline before the check) accept it.
     pub(crate) fn strict_utf8(self) -> bool {
         matches!(
             self,
-            Pre::Raon | Pre::Flint | Pre::Gpt4o | Pre::Tekken | Pre::TekkenNum3 | Pre::KimiK2
+            Pre::Raon
+                | Pre::Flint
+                | Pre::Gpt4o
+                | Pre::Tekken
+                | Pre::TekkenNum3
+                | Pre::KimiK2
+                | Pre::ExaoneMoe
         )
     }
 
@@ -1113,7 +1218,8 @@ impl Pre {
             | Pre::Gpt4o
             | Pre::Raon
             | Pre::KimiK2
-            | Pre::Flint => Spelling::ByteLevel,
+            | Pre::Flint
+            | Pre::ExaoneMoe => Spelling::ByteLevel,
         }
     }
 }
@@ -1159,6 +1265,10 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
         }
         Pre::KimiK2 => {
             split_kimi_k2(cpts, &s.collapsed, &mut s.b);
+            &s.b
+        }
+        Pre::ExaoneMoe => {
+            split_one_piece(cpts.len(), s, match_exaone);
             &s.b
         }
     }
@@ -2481,6 +2591,76 @@ mod tests {
         ];
         for &(text, want) in cases {
             assert_eq!(words(Pre::Gemma4, text), want, "{text:?}");
+        }
+    }
+
+    /// `exaone-moe` is a row of its own: the reference's regex over the collapsed text, the
+    /// model's NFC normalizer applied first (the reference itself normalizes nothing on that
+    /// path), the strict UTF-8 reader of the mainline tree that reads the name, no whole-token
+    /// words, and no Hugging Face reading — a case whose text is not NFC holds the Hugging Face
+    /// tokenizer's ids, which the gate pins in `exaone-nfc-ids.tsv`, not a second reading.
+    #[test]
+    fn exaone_moe_is_a_row_with_the_models_nfc() {
+        assert_eq!(
+            crate::named(&Pre::NAMES, "exaone-moe"),
+            Some(Pre::ExaoneMoe)
+        );
+        assert!(crate::runs_pre_tokenizer("exaone-moe"));
+        assert!(Pre::ExaoneMoe.nfc());
+        assert!(Pre::ExaoneMoe.strict_utf8());
+        assert!(!Pre::ExaoneMoe.ignore_merges());
+        assert_eq!(Pre::ExaoneMoe.hf_reading(), None);
+    }
+
+    /// The `exaone-moe` splitter's alternatives, one case each, as its regex splits them over
+    /// the collapsed text: a letter word joined by single spaces is one word, and a double
+    /// space, a tab or a mark after the space breaks it; Han and Hangul are letters of the word
+    /// run, with no CJK alternative; a mark joins its letter and may open a word; a
+    /// contraction is of either case and what is no contraction opens the next word, which a
+    /// symbol may open too; a number is a word; a symbol run keeps at most one `\r`, `\n` or
+    /// `/`; the whitespace rules are qwen2's.
+    ///
+    /// FAIL-first: with the words not joined across one space ("hello world" as two), or joined
+    /// across a double space or a tab, the word rows fail; with the digits cut in threes the
+    /// digit rows fail (the id pins cannot see that rule — the `exaone-moe` vocabulary holds no
+    /// token of two numbers); with the symbol run's tail a run of its class or none, the symbol
+    /// rows fail.
+    #[test]
+    fn exaone_moe_cases() {
+        let cases: &[(&str, &[&str])] = &[
+            ("hello world foo", &["hello world foo"]),
+            ("hello  world", &["hello", " ", " world"]),
+            ("a  b", &["a", " ", " b"]),
+            ("a\t\tb", &["a", "\t", "\tb"]),
+            ("한국어 텍스트", &["한국어 텍스트"]),
+            ("中文 abc", &["中文 abc"]),
+            ("Hello,世界! world", &["Hello", ",世界", "!", " world"]),
+            ("e\u{301} x y", &["e\u{301} x y"]),
+            ("a\u{301}b c", &["a\u{301}b c"]),
+            ("\u{301}a", &["\u{301}a"]),
+            ("a \u{301}b", &["a", " \u{301}", "b"]),
+            (
+                "IT'S WE'RE I'M YOU'LL HE'D",
+                &[
+                    "IT", "'S", " WE", "'RE", " I", "'M", " YOU", "'LL", " HE", "'D",
+                ],
+            ),
+            ("rock'n'roll", &["rock", "'n", "'roll"]),
+            ("'x y", &["'x y"]),
+            ("12345", &["1", "2", "3", "4", "5"]),
+            (" 12345", &[" ", "1", "2", "3", "4", "5"]),
+            ("abc1234def", &["abc", "1", "2", "3", "4", "def"]),
+            ("x//\n", &["x", "//\n"]),
+            ("a.\n\n", &["a", ".\n", "\n"]),
+            ("x/\n/y", &["x", "/\n", "/y"]),
+            ("x = y;", &["x", " =", " y", ";"]),
+            ("a\n\nb", &["a", "\n\n", "b"]),
+            ("a \r\n b", &["a", " \r\n", " b"]),
+            ("end ", &["end", " "]),
+            ("\t\tHello", &["\t", "\tHello"]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(words(Pre::ExaoneMoe, text), want, "{text:?}");
         }
     }
 }

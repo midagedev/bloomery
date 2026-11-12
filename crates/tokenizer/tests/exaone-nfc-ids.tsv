@@ -1,0 +1,8 @@
+# reference	Hugging Face tokenizers (the hub tokenizer.json, its NFC normalizer) over /root/agents/specs/exaone/hf/tokenizer.json
+# vocabulary	/root/agents/specs/exaone-r3/exaone-moe-vocab.gguf
+# columns	text bytes in hex, ids (NFC applied; both modes — no special token in these rows), ids (the same)
+65cc812061cc8820e0a4a8e0a4aee0a4b8e0a58de0a4a4e0a587	2581 11600 145611 42543 40135 145571 21235	2581 11600 145611 42543 40135 145571 21235
+e18492e185a1e186abe18480e185b3e186af	62833	62833
+e18492e185a1e186abe18480e185aee186a8e1848be185a520e18490e185a6e186a8e18489e185b3e18490e185b3	133926 33728	133926 33728
+65cc816c65cc802041cc8acc812078cc8179	41622 8801 52149 480 1262 95601 450	41622 8801 52149 480 1262 95601 450
+# complete	4
