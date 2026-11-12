@@ -270,6 +270,13 @@
 //! while the model's `tokenizer.json` normalizes NFC. The engine follows the model
 //! ([`Pre::nfc`]), so the ids of a case whose text is not already NFC are the Hugging Face
 //! tokenizer's, which the gate pins beside the reference's (`tests/exaone-nfc-ids.tsv`).
+//!
+//! A Hugging Face `tokenizer.json` of this type runs the same regex with Oniguruma, as qwen2's
+//! and qwen35's: its contraction group is LG's `(?i:'s|'t|'re|'ve|'m|'ll|'d)`, which folds case
+//! by Unicode (`'s` also matches `'ſ`), and the classes are Unicode 14.0's
+//! ([`crate::unicode::collapse_hf`]), so a letter, mark or number Unicode 15.0 or 15.1 added
+//! joins no letter word and no number word. [`Pre::ExaoneMoeHf`] is that reading, for a
+//! vocabulary that declares itself a Hugging Face one.
 
 use crate::spelling::Spelling;
 use crate::unicode::{collapse, collapse_hf, letter_case};
@@ -764,14 +771,15 @@ fn exaone_word(c: &[u8], p: usize, hi: usize) -> usize {
 }
 
 /// The `exaone-moe` regex at `i`, the first of its alternatives that matches, under ECMAScript
-/// semantics: a contraction of either case; the letter word of [`exaone_word`] behind one
-/// optional character that is no `\r`, `\n`, letter or number (tried taken, then not); one
-/// number; a symbol run behind an optional space with at most one `\r`, `\n` or `/` after it;
+/// semantics: a contraction of either case (`fold(k)` the lowercase ASCII letter the codepoint at
+/// `k` matches, ſ as `s` under Hugging Face's Unicode folding); the letter word of [`exaone_word`]
+/// behind one optional character that is no `\r`, `\n`, letter or number (tried taken, then not);
+/// one number; a symbol run behind an optional space with at most one `\r`, `\n` or `/` after it;
 /// and the whitespace alternatives of [`match_space`], which `\s*[\r\n]` reads the same as
 /// qwen2's `\s*[\r\n]+` (the greedy `\s*` backs off to the run's last newline either way).
-fn match_exaone(c: &[u8], i: usize, hi: usize) -> usize {
+fn match_exaone(c: &[u8], i: usize, hi: usize, fold: impl Fn(usize) -> u8) -> usize {
     // `(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])`
-    let n = contraction(c, i, hi, |k| c[k].to_ascii_lowercase());
+    let n = contraction(c, i, hi, fold);
     if n > 0 {
         return n;
     }
@@ -1109,6 +1117,10 @@ pub(crate) enum Pre {
     /// as a regex, not a hand-written splitter, and the model's NFC normalizer applied first
     /// ([`Pre::nfc`], the `raon` precedent).
     ExaoneMoe,
+    /// `exaone-moe` as a Hugging Face `tokenizer.json` runs it: contractions fold case by
+    /// Unicode, and the classes are Unicode 14.0's. Never named in a header; a vocabulary with
+    /// `tokenizer.bloomery.eog_token_ids` gets it.
+    ExaoneMoeHf,
 }
 
 impl Pre {
@@ -1146,6 +1158,7 @@ impl Pre {
             Pre::Llama3 => Some(Pre::Llama3Hf),
             Pre::Tekken => Some(Pre::TekkenHf),
             Pre::MiniMaxM2 | Pre::Gpt4o => Some(Pre::MiniMaxM2Hf),
+            Pre::ExaoneMoe => Some(Pre::ExaoneMoeHf),
             _ => None,
         }
     }
@@ -1174,7 +1187,7 @@ impl Pre {
     /// header's normalizer says: the Hugging Face tokenizer of `raon` applies it, and so does
     /// `exaone-moe`'s (the reference itself normalizes nothing on that path).
     pub(crate) fn nfc(self) -> bool {
-        matches!(self, Pre::Raon | Pre::ExaoneMoe)
+        matches!(self, Pre::Raon | Pre::ExaoneMoe | Pre::ExaoneMoeHf)
     }
 
     /// Whether the reference decodes UTF-8 strictly, independently of NFC.
@@ -1182,7 +1195,8 @@ impl Pre {
     /// `gpt-4o`, `raon`, `flint`, `tekken` (every tree that maps `pixtral` to it has the check)
     /// `tekken-num3`, `kimi-k2` (read by the same mainline tree) and `exaone-moe` (a name
     /// younger than the check) reject it; the trees the other names' sets are read by (ik, the
-    /// Solar-Open2 patch, mainline before the check) accept it.
+    /// Solar-Open2 patch, mainline before the check) accept it. `exaone-moe`'s Hugging Face
+    /// reading decodes strictly too, so either reading normalizes NFC with the engine's tables.
     pub(crate) fn strict_utf8(self) -> bool {
         matches!(
             self,
@@ -1193,6 +1207,7 @@ impl Pre {
                 | Pre::TekkenNum3
                 | Pre::KimiK2
                 | Pre::ExaoneMoe
+                | Pre::ExaoneMoeHf
         )
     }
 
@@ -1219,7 +1234,8 @@ impl Pre {
             | Pre::Raon
             | Pre::KimiK2
             | Pre::Flint
-            | Pre::ExaoneMoe => Spelling::ByteLevel,
+            | Pre::ExaoneMoe
+            | Pre::ExaoneMoeHf => Spelling::ByteLevel,
         }
     }
 }
@@ -1229,7 +1245,9 @@ impl Pre {
 pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
     let class: fn(u32) -> u8 = match pre {
-        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::Llama3Hf | Pre::DeepseekV3Hf => collapse_hf,
+        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::Llama3Hf | Pre::DeepseekV3Hf | Pre::ExaoneMoeHf => {
+            collapse_hf
+        }
         Pre::MiniMaxM2Hf | Pre::TekkenHf => collapse_cased,
         _ => collapse,
     };
@@ -1267,10 +1285,8 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
             split_kimi_k2(cpts, &s.collapsed, &mut s.b);
             &s.b
         }
-        Pre::ExaoneMoe => {
-            split_one_piece(cpts.len(), s, match_exaone);
-            &s.b
-        }
+        Pre::ExaoneMoe => split_exaone(cpts, s, false),
+        Pre::ExaoneMoeHf => split_exaone(cpts, s, true),
     }
 }
 
@@ -1484,6 +1500,15 @@ fn split_qwen2_hf<'s>(cpts: &[u32], s: &'s mut Scratch, digits: usize) -> &'s [u
             is_other,
             digits,
         )
+    });
+    &s.b
+}
+
+/// [`split`] for [`Pre::ExaoneMoe`] and, with `hf`, [`Pre::ExaoneMoeHf`]: its one regex over the
+/// collapsed bytes, contractions folded as Hugging Face's under `hf`.
+fn split_exaone<'s>(cpts: &[u32], s: &'s mut Scratch, hf: bool) -> &'s [usize] {
+    split_one_piece(cpts.len(), s, |c, i, hi| {
+        match_exaone(c, i, hi, |k| fold_at(cpts, c, k, hf))
     });
     &s.b
 }
@@ -2272,6 +2297,19 @@ mod tests {
         hf_pieces(Pre::DeepseekV3Hf, "deepseek-v3-hf-pieces");
     }
 
+    /// The `exaone-moe` regex split as Hugging Face's `tokenizers` runs it over K-EXAONE-2.0's
+    /// `tokenizer.json`: every text of the pinned corpus (`hf_pieces_exaone.py`, the qwen2 corpus's
+    /// texts plus the splitter's own cases — Hangul and Han word runs, marks after letters,
+    /// contractions of both cases and of the ſ fold, `\r\n` runs) is cut into pieces of the byte
+    /// lengths its pre-tokenizer gives.
+    ///
+    /// FAIL-first: with the reference's classes in its place, the texts of codepoints Unicode 15.0
+    /// added fail; with the contraction folded by ASCII alone, the `'ſ` texts fail.
+    #[test]
+    fn exaone_moe_hf_pieces_are_hugging_faces() {
+        hf_pieces(Pre::ExaoneMoeHf, "exaone-moe-hf-pieces");
+    }
+
     /// MiniMax's regex split as Hugging Face's `tokenizers` runs it: every text of the pinned corpus
     /// (`hf_pieces_minimax.py`: contractions in every case, letters of every category against
     /// each other, marks, digits, spaces, symbols, every Unicode version's codepoints) is cut into
@@ -2597,8 +2635,10 @@ mod tests {
     /// `exaone-moe` is a row of its own: the reference's regex over the collapsed text, the
     /// model's NFC normalizer applied first (the reference itself normalizes nothing on that
     /// path), the strict UTF-8 reader of the mainline tree that reads the name, no whole-token
-    /// words, and no Hugging Face reading — a case whose text is not NFC holds the Hugging Face
-    /// tokenizer's ids, which the gate pins in `exaone-nfc-ids.tsv`, not a second reading.
+    /// words, and a Hugging Face reading of its own — LG's `(?i:...)` contraction group and
+    /// Unicode 14.0's classes — which the pieces gate pins. A case whose text is not NFC holds
+    /// the Hugging Face tokenizer's ids, which the gate pins beside the reference's
+    /// (`tests/exaone-nfc-ids.tsv`).
     #[test]
     fn exaone_moe_is_a_row_with_the_models_nfc() {
         assert_eq!(
@@ -2609,7 +2649,10 @@ mod tests {
         assert!(Pre::ExaoneMoe.nfc());
         assert!(Pre::ExaoneMoe.strict_utf8());
         assert!(!Pre::ExaoneMoe.ignore_merges());
-        assert_eq!(Pre::ExaoneMoe.hf_reading(), None);
+        assert_eq!(Pre::ExaoneMoe.hf_reading(), Some(Pre::ExaoneMoeHf));
+        assert!(Pre::ExaoneMoeHf.nfc());
+        assert!(Pre::ExaoneMoeHf.strict_utf8());
+        assert!(!Pre::ExaoneMoeHf.ignore_merges());
     }
 
     /// The `exaone-moe` splitter's alternatives, one case each, as its regex splits them over
