@@ -130,9 +130,11 @@
 //!   the child runs T1: the tiered carve of that plan answers the reference load of the same plan
 //!   bit for bit, its stage graph has the reference's node count, every tier layer was sent a
 //!   routed slot. That is the slot map, the tier and the host set over lists that are no id
-//!   prefix. The child then leaves the [`PROMPT`] positions of its tiered run, and the gate feeds
+//!   prefix. The child then leaves the [`PROMPT`] positions of its tiered run — the fed id as
+//!   each position's token, so every row is same-context evidence — and the gate feeds
 //!   the same ids over the tiered carve of the plan without the file and walks the child's
-//!   positions against its own within the logits band (`logits_band::walk`). The two plans keep
+//!   positions against its own within the logits band (`logits_band::walk_at_head`: the head
+//!   positions 0–1 at the head margin, the rest the e2e floor). The two plans keep
 //!   other experts on the card and the host, and a card expert and a host expert are not one
 //!   result bit for bit, so across plans the rows sit within the band, not on bits.
 //!
@@ -196,6 +198,8 @@ mod gate {
         TIER_MAP_BEFORE_UPLOAD, TierOpen,
     };
     use bloomery_gpu_gates::logits_band::{self, Positions};
+    use bloomery_gpu_gates::prompts::{HEAD_MARGIN_V41, MARGIN_FLOOR};
+    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, record};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, EXPERT_RANK, HOST_LOCK, HOST_POPULATE, Levers,
@@ -616,12 +620,19 @@ mod gate {
         }
     }
 
-    /// The T1 run on `m`: the prompt one step a position, the greedy steps,
-    /// the pair passes, all in graph mode from a reset; then the prompt and
+    /// The T1 run on `m`: the prompt one step a position (its argmaxes as
+    /// its tokens — T2 and B2 read the last one), the greedy steps, the pair
+    /// passes, all in graph mode from a reset; then the prompt and
     /// [`EAGER_STEPS`] steps eagerly from a reset.
     fn union_run(m: &mut Deepseek41Model, prompt: &[u32]) -> Result<Run, GateError> {
-        let mut run = rank_run(m, prompt)?;
-        let mut tok = *run.tokens.last().ok_or("T1: empty prompt")?;
+        let mut run = Run::default();
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let mut tok = 0;
+        for &id in prompt {
+            tok = m.step(&[id])?;
+            run.push(tok, m.logits()?);
+        }
         run.stage_nodes = Some(m.step_graph_nodes()?.len());
         for _ in 0..STEPS {
             tok = m.step(&[tok])?;
@@ -835,6 +846,26 @@ mod gate {
         logits_band::walk(what, want.positions(), got.positions()).ok
     }
 
+    /// [`in_band`] for a walk that starts at the prompt's position 0 (the rank clause's): the
+    /// runs record the fed id as each prompt position's token, so every position's row is
+    /// same-context evidence and the walk judges them all; the head positions (0–1) read the
+    /// head margin — the real tier's [`HEAD_MARGIN_V41`], the fixture tier's the e2e floor.
+    // PIN(2026-11-12): the rank walk recorded the argmax as each position's token, so it parted
+    // at the first argmax flip — 1 of the reference's 64 positions compared — although both arms
+    // were fed the same prompt id and stood at the same context; the fed id is the position's
+    // context token, and every row is judged. The head positions read the head margin the
+    // batched order's head gap shifts derive (prompts.rs `HEAD_MARGIN_V41`).
+    fn in_band_from_zero(what: &str, want: &Run, got: &Run) -> Result<bool, GateError> {
+        let head = match tier::Tier::from_env()? {
+            tier::Tier::Real => HEAD_MARGIN_V41,
+            tier::Tier::Fixture => MARGIN_FLOOR,
+        };
+        Ok(
+            logits_band::walk_at_head(what, want.positions(), got.positions(), head, MARGIN_FLOOR)
+                .ok,
+        )
+    }
+
     fn open(
         file: Split,
         plan: &Plan<'_>,
@@ -991,10 +1022,13 @@ mod gate {
                 (&want, &got),
                 &tier_layers,
             )?;
+            // The rows the gate walks: the prompt's positions with the fed id
+            // as each one's token, on the same load the union ran.
+            let rows = rank_run(&mut m, &prompt)?;
             drop(m);
             write_rows(
                 &Path::new(rank.path()).with_file_name(RANK_ROWS),
-                &got,
+                &rows,
                 prompt.len(),
             )?;
             return rank_verdict(pass);
@@ -1866,22 +1900,25 @@ mod gate {
         let mut m = open(Split::open(model)?, tplan, Some(tier), meta)?;
         let want = rank_run(&mut m, &prose_ids("engram", PROMPT)?)?;
         drop(m);
-        Ok(in_band(
+        in_band_from_zero(
             "B10 (the prompt's steps under the rank against the plan without it)",
             &want,
             &got,
-        ))
+        )
     }
 
     /// The prompt `ids` fed one decode step per position on `m`, graph mode from a reset: each
-    /// position's argmax and logits row.
+    /// position's logits row with the id that was fed as its token. Both arms of the rank walk
+    /// feed the same ids, so the walk judges every position's row instead of parting at the first
+    /// argmax flip; the head positions (0–1) read the head margin
+    /// ([`in_band_from_zero`]), the rest the e2e floor.
     fn rank_run(m: &mut Deepseek41Model, ids: &[u32]) -> Result<Run, GateError> {
         let mut run = Run::default();
         m.set_mode(StepMode::Graph);
         m.reset()?;
         for &id in ids {
-            let tok = m.step(&[id])?;
-            run.push(tok, m.logits()?);
+            m.step(&[id])?;
+            run.push(id, m.logits()?);
         }
         Ok(run)
     }

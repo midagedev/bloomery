@@ -1094,8 +1094,10 @@ pub fn plan_levers(split: &Split, levers: &Levers, extra: u64) -> Result<PlanLev
         levers.card_budget(),
         extra,
     )?;
+    let parsed = PlanLevers::from_levers(levers)?;
     Ok(PlanLevers {
-        expert_rank: PlanLevers::from_levers(levers)?.expert_rank,
+        expert_rank: parsed.expert_rank,
+        card_experts_cap: parsed.card_experts_cap,
         ..budget
     })
 }

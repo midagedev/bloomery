@@ -65,7 +65,10 @@
 //!   first differing token where neither run's top1−top2 gap reaches the
 //!   logits band's clarity floor (`logits_band::parted`; a batched prompt call
 //!   sums by its row count, so a warm turn's split of the prompt and the fresh
-//!   run's are two orders), the tokens after it not compared; its counts add up to the
+//!   run's are two orders) — a floor derived in the run, twice the largest
+//!   gap shift over the positions where both runs agree on token and
+//!   runner-up, never under the e2e `MARGIN_FLOOR` (`derived_floor`) — the
+//!   tokens after it not compared; its counts add up to the
 //!   prompt (`usage.prompt_tokens`, `cached_tokens` = `timings.cache_n`), and
 //!   `cache_n` is at most the longest prefix the prompt shares with what any
 //!   earlier request left. Where the template makes a turn share the previous
@@ -77,7 +80,8 @@
 //! - the think-span budget (`reasoning_budget`): a thinking-on generation
 //!   with the budget at 8 carries the close id as the 9th, and the
 //!   continuation conditions on it (its ids after the close are a fresh
-//!   run's fed the close as an ordinary prompt id): the close id really
+//!   run's fed the close as an ordinary prompt id, parting only at a near
+//!   tie by the fresh runs' rule below): the close id really
 //!   enters the engine's context. The ids before the budget, the reply's
 //!   bounded-and-closed shape and the follow-up turn's prefix are
 //!   `crates/serve`'s mock tests' to pin;
@@ -694,7 +698,11 @@ mod gate {
                     )
                     .into());
                 }
-                Ok(Pick { id, gap })
+                Ok(Pick {
+                    id,
+                    gap,
+                    alt: u32::try_from(r.u64("top2")?)?,
+                })
             })
             .collect()
     }
@@ -817,14 +825,17 @@ mod gate {
     }
 
     /// The alternatives a token's row gives the `_is_fresh` checks: its top two, whose log-probability
-    /// difference is the gap between the row's two largest logits.
-    const GAP_TOP: usize = 2;
+    /// difference is the gap between the row's two largest logits, and the runner-up's id, which the
+    /// derived clarity floor reads to hold both runs to the same two ids. The third alternative
+    /// keeps the row's own top-2 readable where the sampler banned its argmax (`ignore_eos`).
+    const GAP_TOP: usize = 3;
 
     /// The generated ids of a chat reply (`choices[0].logprobs.content`) or a `/completion` answer
     /// (`completion_probabilities`), one entry a token, each with the gap between its row's top two
-    /// logits. A token that is not its row's largest (the sampler banned that one under `ignore_eos`,
-    /// or forced the token) has no gap to read: it counts clear. An answer with no entries field, an
-    /// entry with no id or fewer than two alternatives, or a gap that is not finite is a named error.
+    /// logits and the runner-up's id ([`Pick::alt`]). A token that is not its row's largest (the
+    /// sampler banned that one under `ignore_eos`, or forced the token) has no gap to read: it
+    /// counts clear. An answer with no entries field, an entry with no id or fewer than two
+    /// alternatives, or a gap that is not finite is a named error.
     fn picks(entries: &Value, who: &str) -> Result<Vec<Pick>, GateError> {
         let rows = entries.as_array().ok_or_else(|| {
             format!(
@@ -847,9 +858,22 @@ mod gate {
                     })
                     .unwrap_or_default();
                 alt.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-                let gap = match alt.as_slice() {
-                    [(best, top), (next, _), ..] if *top == u64::from(id) => (best - next) as f32,
-                    [_, _, ..] => f32::MAX,
+                let pick = match alt.as_slice() {
+                    [(best, top), (next, runner), ..] => {
+                        let alt_id = u32::try_from(*runner).map_err(|_| {
+                            format!("{who}: entry {k}'s runner-up id {runner} is not a token: {e}")
+                        })?;
+                        let gap = if *top == u64::from(id) {
+                            (best - next) as f32
+                        } else {
+                            f32::MAX
+                        };
+                        Pick {
+                            id,
+                            gap,
+                            alt: alt_id,
+                        }
+                    }
                     _ => {
                         return Err(format!(
                             "{who}: entry {k} holds {} alternatives, not {GAP_TOP}: {e}",
@@ -858,10 +882,14 @@ mod gate {
                         .into());
                     }
                 };
-                if gap.is_finite() {
-                    Ok(Pick { id, gap })
+                if pick.gap.is_finite() {
+                    Ok(pick)
                 } else {
-                    Err(format!("{who}: entry {k}'s top-2 gap {gap} is not finite: {e}").into())
+                    Err(format!(
+                        "{who}: entry {k}'s top-2 gap {} is not finite: {e}",
+                        pick.gap
+                    )
+                    .into())
                 }
             })
             .collect()
@@ -881,21 +909,60 @@ mod gate {
     // clarity floor MARGIN_FLOOR: a position whose top1-top2 gap reaches it keeps its token across
     // orders, under it either order may take the other token; the ids (and text) still hold exactly
     // wherever the runs do not part, and a clear position that parts is red.
-    /// Compares a fresh run's generated ids with the warm run's: [`split_of`] with their names.
+    // PIN(2026-11-12): the floor itself is derived in the run now, not the e2e MARGIN_FLOOR alone:
+    // the 48-expert hosting round (the plan reserves the prompt batch on the stage card) moved the
+    // head gap at the first generated token — a 13-id prompt's warm run is 12 restored rows plus a
+    // 1-row batch, its fresh run one 13-row batch — and the runs parted where the fresh gap was
+    // 0.3 under a warm gap of 4.05. [`derived_floor`]: twice the largest gap shift over the
+    // agreeing positions, never under MARGIN_FLOOR, so a fault (a restore that loses a row, a
+    // wrong KV row) still moves a gap far past every shift the agreeing positions show.
+    /// Compares a fresh run's generated ids with the warm run's: [`split_of`] with their names,
+    /// at the clarity floor the pair's own agreeing positions derive ([`derived_floor`]).
     fn fresh_split(what: &str, fresh: &[Pick], warm: &[Pick]) -> Parted {
-        split_of(what, ("fresh run", fresh), ("warm run", warm))
+        let floor = derived_floor(what, fresh, warm);
+        split_of(what, ("fresh run", fresh), ("warm run", warm), floor)
     }
 
-    /// Compares two runs of one prompt, `want` the reference, by [`parted`] at [`MARGIN_FLOOR`]
+    /// The clarity floor a fresh/warm pair is judged at, derived in the run: twice the largest
+    /// |gap shift| between the two runs over the compared span's positions where both take the
+    /// same token and their rows name the same runner-up — the positions where the two orders
+    /// resolved the same two ids and the gap alone moved — never under [`MARGIN_FLOOR`]. Printed
+    /// with the shift and the position it came from; a run of no such positions keeps the e2e
+    /// floor.
+    fn derived_floor(what: &str, fresh: &[Pick], warm: &[Pick]) -> f32 {
+        let (mut worst, mut at_worst, mut agreed) = (0.0f32, 0usize, 0usize);
+        for (at, (f, w)) in fresh.iter().zip(warm).enumerate() {
+            if f.id != w.id {
+                break;
+            }
+            if f.alt != w.alt || f.gap == f32::MAX || w.gap == f32::MAX {
+                continue;
+            }
+            let shift = (f.gap - w.gap).abs();
+            if shift > worst {
+                (worst, at_worst) = (shift, at);
+            }
+            agreed += 1;
+        }
+        let floor = (2.0 * worst).max(MARGIN_FLOOR);
+        println!(
+            "{what}: the runs' clarity floor {floor:.4} = 2 × the largest gap shift {worst:.4} at \
+             token {at_worst}, over {agreed} agreeing positions with matching top-2 ids (never \
+             under {MARGIN_FLOOR})"
+        );
+        floor
+    }
+
+    /// Compares two runs of one prompt, `want` the reference, by [`parted`] at `floor`
     /// (either run's row clear at the first differing position is red) and prints the position, both
     /// tokens and both gaps whenever the runs part.
-    fn split_of(what: &str, want: (&str, &[Pick]), got: (&str, &[Pick])) -> Parted {
+    fn split_of(what: &str, want: (&str, &[Pick]), got: (&str, &[Pick]), floor: f32) -> Parted {
         let ((wn, w), (gn, g)) = (want, got);
-        let split = parted(w, g, MARGIN_FLOOR);
+        let split = parted(w, g, floor);
         let apart = |at: usize, wp: Pick, gp: Pick| {
             format!(
                 "{what}: the {wn} and the {gn} part at token {at} ({wn} id {} gap {:.4}, {gn} id {} \
-                 gap {:.4}; clear = gap >= {MARGIN_FLOOR})",
+                 gap {:.4}; clear = gap >= {floor})",
                 wp.id, wp.gap, gp.id, gp.gap
             )
         };
@@ -1210,7 +1277,9 @@ mod gate {
     /// The think-span budget (module header): a thinking-on generation with
     /// `reasoning_budget` 8 carries the close id at the 9th position, and the
     /// continuation conditions on it — fed the run's ids through the close as
-    /// an ordinary prompt, the model continues as the budgeted run did. The
+    /// an ordinary prompt, the model continues as the budgeted run did, the
+    /// two runs parting only at a near tie by the fresh runs' rule
+    /// ([`fresh_split`]). The
     /// close at the budget is the clause's precondition, not a pin of its own:
     /// without it the continuation matches whatever the run did. The model's
     /// own ids before the budget, the bounded-and-closed shape of the reply,
@@ -1230,36 +1299,62 @@ mod gate {
             false,
         )?;
         let close = ids_of(&json_of("/tokenize", st, &body)?["tokens"])?;
-        // A run's ids, from a reset cache.
-        let run = |prompt: &[u32], budget: Value, n: usize| -> Result<Vec<u32>, GateError> {
-            let body = json!({
-                "prompt": prompt, "n_predict": n, "temperature": 0, "ignore_eos": true,
-                "return_tokens": true, "cache_prompt": false, "reasoning_budget": budget,
-            });
-            let (st, text) = curl(&url("/completion"), Some(&body), false)?;
-            ids_of(&json_of("/completion", st, &text)?["tokens"])
-        };
-        let capped = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
+        // A run's ids and rows, from a reset cache.
+        let run =
+            |prompt: &[u32], budget: Value, n: usize| -> Result<(Vec<u32>, Vec<Pick>), GateError> {
+                let body = json!({
+                    "prompt": prompt, "n_predict": n, "temperature": 0, "ignore_eos": true,
+                    "return_tokens": true, "cache_prompt": false, "reasoning_budget": budget,
+                    "n_probs": GAP_TOP,
+                });
+                let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+                let v = json_of("/completion", st, &text)?;
+                let ids = ids_of(&v["tokens"])?;
+                let rows = picks(&v["completion_probabilities"], "the budget completion")?;
+                if ids_in(&rows) != ids {
+                    return Err(format!(
+                    "the budget completion's probability entries name ids {:?}, its tokens {ids:?}",
+                    ids_in(&rows)
+                )
+                .into());
+                }
+                Ok((ids, rows))
+            };
+        let (capped, capped_rows) = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
         let through = THINK_BUDGET + close.len();
         let closed = capped.len() == THINK_PREDICT && capped[THINK_BUDGET..through] == close[..];
         // Fed the close as an ordinary prompt id, the model continues as the
-        // capped run did: the engine's context really carries the close.
-        let after = if closed {
+        // capped run did: the engine's context really carries the close. The
+        // capped run's tail grew as decode steps over its prompt; the
+        // continuation is one prompt call over the same ids, so the two are
+        // two orders of one prompt and part only at a near tie — the fresh
+        // runs' rule ([`fresh_split`]).
+        let (after, after_rows) = if closed {
             let mut fed = p;
             fed.extend(&capped[..through]);
             run(&fed, Value::Null, THINK_PREDICT - through)?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
         println!(
             "think budget {THINK_BUDGET}: capped {capped:?}, close {close:?} at {THINK_BUDGET}: \
-             {closed}, fed through it {after:?}"
+             {closed}, fed through it {}: {after:?}",
+            after.len(),
+        );
+        // PIN(2026-11-12): the clause held the continuation to the capped run's exact ids; the
+        // two are two sum orders of one prompt (above), so it now takes its sibling fresh
+        // checks' rule — [`fresh_split`]'s derived floor — and a part at a clear gap is red as
+        // before.
+        let split = fresh_split(
+            "budget_continues_on_the_close",
+            &after_rows,
+            &capped_rows[through..],
         );
         let mut ok = true;
         check(
             &mut ok,
             "budget_continues_on_the_close",
-            closed && after == capped[through..],
+            closed && split.ok(),
         );
         Ok(ok)
     }
@@ -3084,6 +3179,7 @@ mod gate {
             "bp_completion",
             ("generate_ds41", reference),
             ("server steps", &steps),
+            MARGIN_FLOOR,
         );
         Ok(same && split.ok())
     }
