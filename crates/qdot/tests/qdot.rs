@@ -4246,6 +4246,138 @@ fn swiglu_oai_refuses_a_limit_without_bounds() {
     }
 }
 
+// ------------------------------------------- gate-first clamped SwiGLU (EXAONE)
+// The reference below is ggml's `ggml_compute_forward_swiglu_clamp`
+// (`ggml/src/ggml-cpu/ops.cpp`) written out again in scalar f32 with ik's
+// exponential in place of libm's `expf`, not a call into qdot: the clamp
+// moved after the activation in `swiglu_gclamp` cannot move in this
+// transcription too.
+
+/// `x = std::min(g, limit)`, `y = std::clamp(u, -limit, limit)`,
+/// `x / (1 + expf(-x)) * y` — the gate clamped from above *before* the
+/// activation. `std::min(a, b)` is `b < a ? b : a`; `std::clamp(v, lo, hi)`
+/// is `v < lo ? lo : hi < v ? hi : v`.
+fn ref_swiglu_gclamp(g: f32, u: f32, limit: f32) -> f32 {
+    let x = if limit < g { limit } else { g };
+    let y = if u < -limit {
+        -limit
+    } else if limit < u {
+        limit
+    } else {
+        u
+    };
+    x / (1.0 + ik_expf(0.0 - x)) * y
+}
+
+/// `swiglu_gclamp` against the transcription, bit for bit, on inputs past
+/// the limit on every side — the gate above it and below its negative (the
+/// side the rule clamps and the side it leaves alone, where the act-first
+/// order agrees), the up above `limit` and below `-limit`, the edges
+/// themselves, both zeros — in a vector whose length leaves an eight-lane
+/// tail; every value alone must equal its value in the block, and the
+/// scalar [`qdot::swiglu_gclamp_1`] the transcription. A limit at or below
+/// 1e-6 (or NaN) clamps nothing: bit for bit `swiglu`.
+#[test]
+fn swiglu_gclamp_matches_the_reference_rule() {
+    let gates = [-20.0f32, -7.0, -6.9, -0.0, 0.0, 6.9, 7.0, 7.0001, 20.0];
+    let ups = [-20.0f32, -7.0, -6.9, -0.0, 0.0, 6.9, 7.0, 7.0001, 20.0];
+    let (gate, up): (Vec<f32>, Vec<f32>) = gates
+        .iter()
+        .flat_map(|&g| ups.iter().map(move |&u| (g, u)))
+        .unzip();
+    let n = gate.len();
+    assert_ne!(n % 8, 0, "the set must leave a tail");
+    for limit in [7.0f32, 2.5] {
+        let mut out = vec![0.0f32; n];
+        assert!(qdot::swiglu_gclamp(&gate, &up, limit, &mut out));
+        let (mut gate_hi, mut gate_lo, mut up_out) = (0, 0, 0);
+        for i in 0..n {
+            let want = ref_swiglu_gclamp(gate[i], up[i], limit);
+            assert_eq!(
+                out[i].to_bits(),
+                want.to_bits(),
+                "limit {limit}: gate {} up {}: got {} ({:#x}), the reference rule {want} ({:#x})",
+                gate[i],
+                up[i],
+                out[i],
+                out[i].to_bits(),
+                want.to_bits()
+            );
+            assert_eq!(
+                qdot::swiglu_gclamp_1(gate[i], up[i], limit).to_bits(),
+                want.to_bits()
+            );
+            let mut one = [0.0f32];
+            assert!(qdot::swiglu_gclamp(
+                &gate[i..=i],
+                &up[i..=i],
+                limit,
+                &mut one
+            ));
+            assert_eq!(
+                one[0].to_bits(),
+                out[i].to_bits(),
+                "limit {limit}: i={i} moves with its position"
+            );
+            gate_hi += usize::from(gate[i] > limit);
+            gate_lo += usize::from(gate[i] < -limit);
+            up_out += usize::from(up[i].abs() > limit);
+        }
+        assert!(
+            gate_hi > 0 && gate_lo > 0 && up_out > 0,
+            "limit {limit}: the set must cross every side (g > L {gate_hi}, g < -L {gate_lo}, \
+             |u| > L {up_out})"
+        );
+        eprintln!(
+            "swiglu_gclamp limit {limit}: {n} values bit-identical to ggml's rule \
+             (g > L {gate_hi}, g < -L {gate_lo}, |u| > L {up_out})"
+        );
+    }
+    for limit in [1e-7f32, 1e-6, 0.0, -3.0, f32::NAN] {
+        let (mut got, mut plain) = (vec![0.0f32; n], vec![0.0f32; n]);
+        qdot::swiglu_gclamp(&gate, &up, limit, &mut got);
+        qdot::swiglu(&gate, &up, &mut plain);
+        for i in 0..n {
+            assert!(
+                got[i].to_bits() == plain[i].to_bits(),
+                "limit {limit}: gate {} up {}: a limit <= 1e-6 must clamp nothing",
+                gate[i],
+                up[i]
+            );
+        }
+    }
+}
+
+/// The gate-first combine reports a NaN or an infinity in `gate` or `up` at
+/// every position (each lane of both vectors and the padded tail), which its
+/// clamp would write as a finite value, and reports finite inputs as finite.
+/// Below the limit nothing is clamped: `true`, the value non-finite in `out`.
+#[test]
+fn swiglu_gclamp_flags_a_non_finite_input_at_every_position() {
+    let n = 19;
+    let mut out = vec![0.0f32; n];
+    let base = vec![f32::MAX; n];
+    assert!(qdot::swiglu_gclamp(&base, &base, 7.0, &mut out));
+    for i in 0..n {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut v = base.clone();
+            v[i] = bad;
+            assert!(
+                !qdot::swiglu_gclamp(&v, &base, 7.0, &mut out),
+                "gate[{i}] = {bad}"
+            );
+            assert!(
+                !qdot::swiglu_gclamp(&base, &v, 7.0, &mut out),
+                "up[{i}] = {bad}"
+            );
+            assert!(
+                qdot::swiglu_gclamp(&base, &v, 0.0, &mut out) && !out[i].is_finite(),
+                "up[{i}] = {bad}: below the limit the value stays non-finite"
+            );
+        }
+    }
+}
+
 // --------------------------------------------------------- sum_sq_f64
 // The laned f64 sum against the left-to-right one: equal to f64 rounding, and
 // equal exactly once narrowed to f32 — the only form the norm consumes.

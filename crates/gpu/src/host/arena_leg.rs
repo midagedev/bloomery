@@ -163,13 +163,15 @@ impl LegLayer {
 }
 
 /// The gate·up rule the card leg's kernels run for a layer of `form`: the
-/// gated forms' (clamped SwiGLU, OAI, SiTU); `None` for relu², whose
-/// `relu(up·x)²` no gate·up kernel runs, so its layer keeps the host leg.
+/// gated forms' (clamped SwiGLU, OAI, SiTU, gate-first clamp); `None` for
+/// relu², whose `relu(up·x)²` no gate·up kernel runs, so its layer keeps the
+/// host leg.
 fn rule_of(form: ExpertForm) -> Option<Act> {
     match form {
         ExpertForm::GatedOai { alpha, limit } => Some(Act::SwigluOai { alpha, limit }),
         ExpertForm::Gated { limit } => Some(Act::SwigluClamp { limit }),
         ExpertForm::Situ { beta, linear_beta } => Some(Act::Situ { beta, linear_beta }),
+        ExpertForm::GatedGateFirst { limit } => Some(Act::SwigluGateClamp { limit }),
         ExpertForm::Relu2 => None,
     }
 }
