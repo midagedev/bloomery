@@ -83,6 +83,12 @@
 # gate instead of booking it red; 2 on a usage error
 # (a table whose arch or capability lines are refused above included); 64 a BLOOMERY_ARCH that is no arch or that no
 # table pins.
+#
+# BLOOMERY_BUILD_ONLY=1 (tools/gate-batch.sh's build lane puts it in an item's box env; tools/gate.sh and tools/gpu-gate.sh read the
+# same variable). This script runs no build of its own: the recipe's cargo builds come first in its box command and are done when
+# this call starts, and the scans below read what they built. So the build-only call ends here, 0, once its tables and arch read as
+# in a run and every binary it names is built (a binary the recipe did not build is named, 2): no cache, no scan, no card. 0 or
+# unset runs the check; any other value ends 64.
 set -uo pipefail
 
 self_test() {
@@ -90,7 +96,7 @@ self_test() {
   t=$(mktemp -d)
   cp "${BASH_SOURCE[0]}" "$t/ptx-spill-check.sh"
   cp "${BASH_SOURCE[0]%/*}/arch.sh" "$t/arch.sh"
-  unset PTX_SPILL_FULL XDG_CACHE_HOME
+  unset PTX_SPILL_FULL XDG_CACHE_HOME BLOOMERY_BUILD_ONLY
   export BLOOMERY_ARCH=sm_86
   export PTX_SPILL_CACHE=off
   # The stub scan prints the fixture scan of its binary (`--no-jit`: the `.nj` twin), or fails as ptx-scan does on a missing binary.
@@ -405,6 +411,41 @@ self_test() {
     "ptx-spill cache=$t/xdg/bloomery/ptx-spill-jit.tsv rows=0 driver=8.6/615.71.09/$(cksum < "$t/jitlib" | tr ' ' -)" "$t/table" j
   BLOOMERY_DATA=$t/data PTX_SPILL_CACHE='' HOME=$t/home PATH=$t/drv:$PATH check "BLOOMERY_DATA does not hold it" 0 \
     "ptx-spill cache=$t/home/.cache/bloomery/ptx-spill-jit.tsv rows=3 driver=8.6/615.71.09/$(cksum < "$t/jitlib" | tr ' ' -)" "$t/table" j
+  # BLOOMERY_BUILD_ONLY (the header's last paragraph): the call ends 0 before any scan once its binaries are built. The cases run in a
+  # directory whose target/release holds the built binaries a and b (and not c); the stub scan's call log shows whether a scan ran.
+  mkdir -p "$t/bo/target/release"
+  printf '#!/bin/sh\n' > "$t/bo/target/release/a"
+  cp "$t/bo/target/release/a" "$t/bo/target/release/b"
+  chmod +x "$t/bo/target/release/a" "$t/bo/target/release/b"
+  bo() { # bo <name> <want rc> <want line or -> <want scans: none|some> <BLOOMERY_BUILD_ONLY value> <args...>
+    local name=$1 want=$2 line=$3 scans=$4 v=$5 got=none
+    shift 5
+    rm -f "$t/calls.log"
+    out=$(cd "$t/bo" && BLOOMERY_BUILD_ONLY=$v bash "${SPILL:-$t/ptx-spill-check.sh}" "$@" 2>&1); rc=$?
+    [ ! -f "$t/calls.log" ] || got=some
+    if [ "$rc" != "$want" ] || [ "$got" != "$scans" ] || { [ "$line" != - ] && ! grep -qxF -- "$line" <<< "$out"; }; then
+      echo "ptx-spill-check self-test: $name: rc $rc (want $want), scans $got (want $scans), want line '$line' in:" >&2
+      sed 's/^/  /' <<< "$out" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  bo "build-only: the binaries are built, the call ends 0 and no scan runs" 0 \
+    "ptx-spill-check.sh: BLOOMERY_BUILD_ONLY: 2 binary argument(s) built; no scan runs" none 1 "$t/table" a b:k3
+  bo "build-only: a binary the recipe did not build is named first, rc 2, no scan" 2 \
+    "ptx-spill-check.sh: no executable target/release/c — the recipe builds it before calling this" none 1 "$t/table" a c
+  bo "build-only: a table that does not read ends as the run ends it, rc 2" 2 \
+    "ptx-spill-check: the table $t/noarch declares no \`# arch:\` line: its rows pin no arch" none 1 "$t/noarch" a
+  BLOOMERY_ARCH=sm_90 bo "build-only: an arch no table pins ends 64 before the binaries are read" 64 \
+    "ptx-spill-check: no ptx-shapes table for sm_90; the tables pin sm_86 on cc 8.6" none 1 "$t/table" c
+  bo "build-only: any other value ends 64, no scan" 64 \
+    "ptx-spill-check.sh: BLOOMERY_BUILD_ONLY is 1 (build, run nothing) or 0/unset, got '2'" none 2 "$t/table" a
+  bo "build-only: 0 runs the check as ever" 0 "ptx-spill bin=a entries=2 pinned=2 nonzero=k2(spill=8,jit_local=0) violations=0 PASS" some 0 "$t/table" a
+  # FAIL-first: the script with the case removed reaches the stub scan under BLOOMERY_BUILD_ONLY=1.
+  sed '/^case \${BLOOMERY_BUILD_ONLY:-0} in$/,/^esac$/d' "$t/ptx-spill-check.sh" > "$t/ptx-spill-nobo.sh"
+  assert "build-only mutant: the sed removed the short-circuit from the copy, and the script has it" \
+    test "$(grep -c '^    echo "ptx-spill-check.sh: BLOOMERY_BUILD_ONLY: \$# binary' "$t/ptx-spill-nobo.sh")$(grep -c '^    echo "ptx-spill-check.sh: BLOOMERY_BUILD_ONLY: \$# binary' "$t/ptx-spill-check.sh")" = 01
+  SPILL=$t/ptx-spill-nobo.sh bo "build-only mutant: without the short-circuit the stub scan phase is reached" 0 \
+    "ptx-spill bin=a entries=2 pinned=2 nonzero=k2(spill=8,jit_local=0) violations=0 PASS" some 1 "$t/table" a
   rm -rf "$t"
   [ "$fails" = 0 ] && echo "ptx-spill-check: self-test ok" || { echo "ptx-spill-check: self-test $fails failed" >&2; return 1; }
 }
@@ -461,6 +502,17 @@ if ! printf '%s\n' "${KEYS[@]}" | grep -q "^$ARCH "; then
   echo "ptx-spill-check: no ptx-shapes table for $ARCH; the tables pin $NAMED" >&2
   exit 64
 fi
+case ${BLOOMERY_BUILD_ONLY:-0} in
+  0) ;;
+  1)
+    for ARG in "$@"; do
+      BIN=${ARG%%:*}
+      [ -f "target/release/$BIN" ] && [ -x "target/release/$BIN" ] || { echo "ptx-spill-check.sh: no executable target/release/$BIN — the recipe builds it before calling this" >&2; exit 2; }
+    done
+    echo "ptx-spill-check.sh: BLOOMERY_BUILD_ONLY: $# binary argument(s) built; no scan runs"
+    exit 0 ;;
+  *) echo "ptx-spill-check.sh: BLOOMERY_BUILD_ONLY is 1 (build, run nothing) or 0/unset, got '$BLOOMERY_BUILD_ONLY'" >&2; exit 64 ;;
+esac
 # The JIT cache (header). CACHE_WHY names why it cannot be used; empty means it can. The default file is under the cache home,
 # never in $BLOOMERY_DATA: tools/recipes.py's box manifest digests every top-level entry there into each gate's ledger key, so a
 # file rewritten by every run would move the keys.
