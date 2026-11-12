@@ -7,6 +7,7 @@ use serde_json::Value as Json;
 use crate::folder::{self, FolderMap};
 
 pub mod deepseek41;
+pub mod exaone_moe;
 pub mod glm5next;
 pub mod kimi_k3;
 pub mod lfm3;
@@ -69,6 +70,11 @@ pub const MAPS: &[MapRow] = &[
         open: folder::open_as::<kimi_k3::Checkpoint>,
         architecture: folder::architecture_as::<kimi_k3::Checkpoint>,
     },
+    MapRow {
+        model_types: <exaone_moe::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<exaone_moe::Checkpoint>,
+        architecture: folder::architecture_as::<exaone_moe::Checkpoint>,
+    },
 ];
 
 /// A program's work with one folder map `M`, which [`with_split_map`] picks by the folder's
@@ -88,6 +94,7 @@ pub fn split_model_types() -> Vec<&'static str> {
         <qwen35moe::Checkpoint as FolderMap>::MODEL_TYPES,
         <qwen3moe::Checkpoint as FolderMap>::MODEL_TYPES,
         <kimi_k3::Checkpoint as FolderMap>::MODEL_TYPES,
+        <exaone_moe::Checkpoint as FolderMap>::MODEL_TYPES,
     ]
     .concat()
 }
@@ -101,6 +108,8 @@ pub fn with_split_map<U: MapUse>(model_type: &str, user: U) -> Option<U::Out> {
         Some(user.with::<qwen3moe::Checkpoint>())
     } else if <kimi_k3::Checkpoint as FolderMap>::MODEL_TYPES.contains(&model_type) {
         Some(user.with::<kimi_k3::Checkpoint>())
+    } else if <exaone_moe::Checkpoint as FolderMap>::MODEL_TYPES.contains(&model_type) {
+        Some(user.with::<exaone_moe::Checkpoint>())
     } else {
         None
     }
