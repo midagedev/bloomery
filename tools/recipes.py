@@ -21,6 +21,8 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py whole-manifests         # the recipes that read a package manifest whole (rc 1 when a gate-* recipe does)
     python3 tools/recipes.py key --manifest F [--ledger L [--round-ledger R] [--fast-ledger F]] ITEM...  # the green ledger's key per item
     python3 tools/recipes.py key --files ITEM  # the tree files ITEM's key reads, one a line (gate-batch.sh's red-line attribution)
+    python3 tools/recipes.py key --explain ITEM...  # the key's scope and, under the fixture tier, whether the tier is in it (tier-blind or kept) and why
+    python3 tools/recipes.py key --diff A B ITEM...  # the key parts of each ITEM that differ between two commits (`.`: the working tree), one line a part
     python3 tools/recipes.py box-manifest      # on the box, through tools/box.sh: the key's box part
     python3 tools/recipes.py box-command RECIPE  # the recipe's box.sh command, verbatim (tools/mac-check.sh derives from it)
     python3 tools/recipes.py opens [RECIPE...] [--explain]  # per recipe, whether a target it builds or runs reaches the fixture fence (tools/gate-batch.sh's real-file deferral)
@@ -41,6 +43,11 @@ used; both sides are read from `git archive` copies, so the graph is the one tho
 A recipe that a row of tools/fixture-variants.tsv lists also prints its variant item, `NAME@BLOOMERY_FIXTURE_VARIANT=<tag>`, as a line of
 its own and in the `recipes:` line (a batch `--list` takes the first word of the line). A row that was added or edited prints the items of its
 recipes whether or not the diff selected them: the variant's file lives outside the repository, so the row is what a change to it is.
+
+The variant stage (with the class stage; `--no-class` turns both off) keeps a variant item only when the change reaches what differs between a fixture's
+variants: the variant's row moved, a ptx-scan pair given with --scan is `moved`, the recipe's own text or own target file changed, or a changed file of
+a quant-kind owner (tools/owners.tsv) is one the recipe's reach holds (`dep_reach`). A changed quant file the derivation cannot read keeps every
+variant. The other items are left out by name in the `left out` block with `VARIANT_LEFT_OUT` as the reason, and the recipe's plain item runs.
 
 The lever registry (crates/levers/src/registry.rs) is read by row when every edit to it is a row (`LeverReads`): an added, changed or removed
 element of its REGISTRY array, or the `&str` const that names one. It selects the recipe that tests the registry and the recipes whose inputs
@@ -3243,7 +3250,15 @@ def cmd_affected(args: argparse.Namespace) -> int:
         for n, _reason in deferred:
             picks.pop(n, None)
         vitems = variant_items(list(picks), a, b, changed, prefix) if prefix == GATE_PREFIX else []
+        vleft: dict[str, str] = {}
+        if stage is not None and ctables is not None:
+            moved_scan = next((v.line() for v in nar.verdicts if v.kind == "moved"), None) if nar is not None else None
+            vitems, vleft = variant_stage(vitems, changed, ctables, variant_rows_moved(a, b, changed), moved_scan,
+                                          lambda n: class_reach(n, changed, a, b),
+                                          lambda rs, f: dep_reach(b.tree, b.graph, [r for r in rs if r in b.recipes], f),
+                                          lambda f: derivation_gap(b, f))
         class_note = (f"class-staged{' (fast)' if args.fast else ''}: {len(stage.kept)} kept, {len(stage.left_out)} left out"
+                      + (f", {len(vleft)} variant items left out" if vleft else "")
                       if stage else "class stage off (--no-class)")
         head = "affected (fast)" if args.fast else "affected"
         mac_note = f", {len(deferred)} deferred to weekly (CUDA gate, GGUF input)" if deferred else ""
@@ -3297,6 +3312,7 @@ def cmd_affected(args: argparse.Namespace) -> int:
             else:
                 reasons = [(n, let_out) for n in out]
                 reasons += [(n, why) for n, why in stage.left_out.items()]
+                reasons += list(vleft.items())
                 print(f"left out ({len(reasons)}), each by its reason (--no-class keeps the class stage's gates):")
                 for n, why in reasons:
                     print(f"  - {n}  ({why})")
@@ -3311,9 +3327,9 @@ def cmd_affected(args: argparse.Namespace) -> int:
             print_triggers(trig, width)
             print("recipes: " + " ".join([*picks, *(i for i, _ in vitems), *(t.recipe for t in trig)]))
             print("always: " + " ".join(ALWAYS))
-            if stage is not None and stage.left_out:
-                print(f"left out ({len(stage.left_out)}), each by its reason (--no-class keeps the class stage's gates):")
-                for n, why in stage.left_out.items():
+            if stage is not None and (stage.left_out or vleft):
+                print(f"left out ({len(stage.left_out) + len(vleft)}), each by its reason (--no-class keeps the class stage's gates):")
+                for n, why in [*stage.left_out.items(), *vleft.items()]:
                     print(f"  - {n}  ({why})")
         if deferred:
             print(f"deferred ({len(deferred)}), a change under {', '.join(MAC_CRATES)} does not select a CUDA gate on a GGUF input; "
@@ -3522,6 +3538,43 @@ def variant_items_self_test(expect) -> None:
         expect(False, "a malformed row was accepted")
     except RecipeError as e:
         expect("six tab-separated columns" in str(e), f"a malformed row's error: {e}")
+
+    # The variant stage: an item stays only when the change reaches what differs between a fixture's variants; the others are left out by name
+    # with the rule as the reason, and the plain item (not an item of this list) is untouched. Each clause is red on a stage that keeps every item.
+    vit = [("gate-a@BLOOMERY_FIXTURE_VARIANT=v1", "w1"), ("gate-a@BLOOMERY_FIXTURE_VARIANT=v2", "w2"), ("gate-b@BLOOMERY_FIXTURE_VARIANT=v1", "w3")]
+    owner = lambda name, kind, *globs: types.SimpleNamespace(owner=name, kind=kind, globs=globs)  # noqa: E731
+    tables = types.SimpleNamespace(owners={"qx": owner("qx", "quant", "crates/q/**"), "ky": owner("ky", "kernel", "crates/k/**")})
+    no_reach, no_quant, no_gap = (lambda n: ([], [], False)), (lambda rs, f: {}), (lambda f: None)
+
+    def stage(changed: list[str], rows: set[str] | None = None, scan: str | None = None, reach=no_reach, quant=no_quant, gap=no_gap):
+        return variant_stage(vit, changed, tables, rows or set(), scan, reach, quant, gap)
+
+    kept, left = stage(["crates/host/a.rs"])
+    expect(kept == [] and sorted(left) == sorted(i for i, _ in vit), f"variant stage: a host change that reaches no quant file keeps variants: {kept}")
+    expect(all("2026-11-12" in w and "nightly real-tier run" in w for w in left.values()), f"variant stage: the left-out reason lacks the dated rule: {left}")
+    kept, left = stage(["crates/q/dq.rs"], quant=lambda rs, f: {n: 1 for n in rs if n == "gate-a"})
+    expect([i for i, _ in kept] == [vit[0][0], vit[1][0]] and list(left) == [vit[2][0]],
+           f"variant stage: a quant owner's file the recipe reaches keeps that recipe's variants only: kept {kept}, left {sorted(left)}")
+    expect(bool(kept) and "crates/q/dq.rs" in kept[0][1] and "quant owner qx" in kept[0][1] and kept[0][1].startswith("w1"), f"variant stage: the kept reason names the file and the owner: {kept}")
+    kept, left = stage(["crates/q/dq.rs"])
+    expect(kept == [], f"variant stage: a quant owner's file no variant recipe reaches keeps variants: {kept}")
+    kept, left = stage(["crates/k/x.rs"], quant=lambda rs, f: {n: 1 for n in rs})
+    expect(kept == [], f"variant stage: a file of an owner that is not of the quant kind keeps variants: {kept}")
+    kept, left = stage(["crates/host/a.rs"], scan="gate_e2e: moved k (md5)")
+    expect(len(kept) == 3 and not left and all("ptx-scan pair moved" in w for _, w in kept), f"variant stage: a moved ptx-scan pair keeps every variant: {kept}")
+    kept, left = stage(["justfile"], reach=lambda n: ([], [], n == "gate-b"))
+    expect([i for i, _ in kept] == [vit[2][0]], f"variant stage: the recipe's own text keeps its variants only: {kept}")
+    kept, left = stage(["crates/host/b.rs"], reach=lambda n: ([], ["crates/host/b.rs"], False) if n == "gate-a" else ([], [], False))
+    expect([i for i, _ in kept] == [vit[0][0], vit[1][0]], f"variant stage: the recipe's own target file keeps its variants only: {kept}")
+    kept, left = stage([VARIANT_TABLE], rows={"v2"})
+    expect([i for i, _ in kept] == [vit[1][0]], f"variant stage: a variant whose row moved keeps that variant only: {kept}")
+    kept, left = stage(["crates/q/dq.rs"], gap=lambda f: "it is not Rust source")
+    expect(len(kept) == 3 and all("cannot read" in w for _, w in kept), f"variant stage: a quant file the derivation cannot read keeps every variant, named: {kept}")
+    expect(variant_stage([], ["crates/q/dq.rs"], tables, set(), None, no_reach, no_quant, no_gap) == ([], {}), "variant stage: an empty list grew items")
+    t2 = f"# c\n{row}\n"
+    expect(variant_rows_moved(side(t), side(t2.replace("x=q4_K", "x=q5_K")), [VARIANT_TABLE]) == {"v1"}, "variant rows: an edited row is not reported as moved")
+    expect(variant_rows_moved(side(t), side(t2.replace("x=q4_K", "x=q5_K")), []) == set(), "variant rows: a table the diff did not touch has moved rows")
+    expect(variant_rows_moved(side(t), side(t), [VARIANT_TABLE]) == set(), "variant rows: an unchanged row was reported as moved")
 
 
 def depinfo_only(side: Side) -> list[str]:
@@ -9501,6 +9554,72 @@ def variant_items(picked: list[str], a: Side | None, b: Side, changed: list[str]
     return out
 
 
+# What differs between a fixture variant's run and the plain fixture's: the code that reads a tensor by its quant type (the quant-kind owners of
+# tools/owners.tsv that the recipe reaches), a kernel that moved (a ptx-scan pair whose verdict is `moved`), the recipe's own text or target, and
+# the variant's row. A change that reaches none of them runs the plain item and leaves the variants out: a host change that breaks one quant's
+# host path only is left to the real tier's daily run. The reason is printed with each item left out.
+VARIANT_QUANT_KIND = "quant"
+VARIANT_LEFT_OUT = ("variant rule (coverage decision 2026-11-12): the change reaches no file of what differs between a fixture's variants "
+                    "(a quant owner's file the recipe reaches, a moved kernel, the recipe's own text or target, the variant's row); the plain item runs, "
+                    "and a host change that breaks one quant's host path only is left to the nightly real-tier run")
+
+
+def variant_rows_moved(a: Side | None, b: Side, changed: list[str]) -> set[str]:
+    """The tags of VARIANT_TABLE whose row was added or edited between the two sides (the variant's file lives outside the repository, so the
+    row is what a change to it is)."""
+    if VARIANT_TABLE not in changed:
+        return set()
+    old = variant_table_rows(a)
+    return {tag for tag, (_, text) in variant_table_rows(b).items() if old.get(tag, ([], ""))[1] != text}
+
+
+def variant_stage(vitems: list[tuple[str, str]], changed: list[str], tables, moved_rows: set[str], scan_moved: str | None, reach, quant_reach,
+                  gap_of) -> tuple[list[tuple[str, str]], dict[str, str]]:
+    """The variant items a change reaches and the ones it leaves out, `(kept, {item: reason})`. An item is kept when its variant's row moved
+    (`moved_rows`, the tags), when `scan_moved` (the line of a ptx-scan pair whose verdict is `moved`) says a kernel moved, when the recipe's own
+    text or its own target file changed (`reach(recipe)`, the triple class_narrow takes), or when a changed file of a quant-kind owner (`tables`:
+    tools/owners.tsv) is one the recipe reaches (`quant_reach(recipes, file)`, the item-graph derivation the narrowed list uses). A changed quant
+    file the derivation cannot read (`gap_of(file)` names why) keeps every variant, named. Every other item is left out with VARIANT_LEFT_OUT as
+    its reason; its plain item, which the recipe runs on its own, is not touched."""
+    if not vitems:
+        return [], {}
+    qglobs = [(row.owner, class_glob(g)) for row in tables.owners.values() if row.kind == VARIANT_QUANT_KIND for g in row.globs]
+    qfiles = [(f, owner) for f in changed for owner, pat in qglobs if pat.match(f)]
+    gaps = {f: gap for f, _ in qfiles if (gap := gap_of(f))}
+    recipes = sorted({ITEM_RE.match(i).group(1) for i, _ in vitems})
+    reached: dict[str, tuple[str, str]] = {}  # recipe -> (file, owner) of the first changed quant file its reach holds
+    for f, owner in qfiles:
+        if f not in gaps:
+            for n in quant_reach(recipes, f):
+                reached.setdefault(n, (f, owner))
+    kept: list[tuple[str, str]] = []
+    left: dict[str, str] = {}
+    for item, why in vitems:
+        m = ITEM_RE.match(item)
+        n, tag = m.group(1), (m.group(2) or "").partition("=")[2]
+        keep = None
+        if tag in moved_rows:
+            keep = f"the variant's row in {VARIANT_TABLE} changed"
+        elif scan_moved:
+            keep = f"a ptx-scan pair moved: {scan_moved}"
+        elif gaps:
+            f, gap = next(iter(gaps.items()))
+            keep = f"{f} is a quant owner's file the derivation cannot read: {gap}"
+        else:
+            _, own, text = reach(n)
+            if text:
+                keep = "the recipe's own text changed"
+            elif own:
+                keep = f"the recipe's own target file {own[0]} changed"
+            elif n in reached:
+                keep = f"the recipe reaches {reached[n][0]}, a file of quant owner {reached[n][1]}"
+        if keep:
+            kept.append((item, f"{why}; {keep}"))
+        else:
+            left[item] = VARIANT_LEFT_OUT
+    return kept, left
+
+
 def own_variant_row(path: str, variant: str) -> bool:
     """Whether a manifest row of VARIANT_ROOT is `variant`'s own: the directory itself (an absent or empty one is named so), or a path
     in the tag's directory. The rows of the other tags' directories are not."""
@@ -9551,6 +9670,12 @@ CARGO_PARAM = re.compile(r"(?:--features|--bin|--test|--example|--package|-p|-F)
 # MODEL_ROOTS root in the home directory is a model file, keyed as one, not a reference tree.
 IK_READ = re.compile(r"\$\{?(?:IK|IKBIN|LCPP|LCPPBIN|MRS|MRSBIN)\b|/home/[u]ser/(?!models\b)")
 IK_DEFINERS = ("tools/ref/ref-paths.sh", "tools/ref/models/")
+# A script or source that spells the tier variable: what a run that reads the tier looks like to the key (KeyContext.tier_scope).
+# The scripts that read it only to resolve a model file are no such reader for a family with no fixture file: tools/box.sh and what it
+# sources (BOX_GLOBALS, the profile files), and tools/gpu-gate.sh, whose read skips the V4.1 load lock for the fixture file box.sh
+# resolved, which that family never has.
+TIER_READ = re.compile(r"\bBLOOMERY_TIER\b")
+TIER_RESOLVERS = (*BOX_GLOBALS, "tools/gpu-gate.sh")
 HOME_LITERAL = re.compile(r"\"/home/(?![u]ser/models\b)")
 # A walk of the tree, which no closure bounds: the recipe is keyed on the whole tree.
 TREE_WALK = re.compile(
@@ -9889,15 +10014,23 @@ def _opener_called(o: FnDef, form: str, qual: str | None, caller: str | None) ->
 class Fence:
     definers: list[FnDef]
     openers: dict[tuple[str, int], tuple[FnDef, str]]  # (path, line) -> (fn, the callee it reaches the fence through)
+    fn: str = FENCE_FN  # the fn the fence is
+    owner: str | None = None  # the type whose associated fn it is (called as `Owner::fn(` or `Self::fn(` in its impl); None: any call of that name
 
     def reaches(self, name: str, form: str, qual: str | None, caller: str | None) -> bool:
-        if name == FENCE_FN:
+        if name == self.fn and (self.owner is None or (form == "path" and (qual == self.owner or (qual == "Self" and caller == self.owner)))):
             return True
         return any(_opener_called(o, form, qual, caller) for (o, _) in self.openers.values() if o.name == name)
 
 
-def opens_fence(tree: Tree) -> Fence:
-    """The fence, its definers and the openers of FENCE_PKG's lib (the rule above); the named errors (70) when it cannot be read."""
+# The one read of the tier variable in code is `Tier::from_env` of FENCE_PKG (crates/gpu-gates/src/tier.rs): a target that reaches it, through the
+# same walk as the fence's, can behave differently on the two tiers without opening a model file (a clause tagged for one tier).
+TIER_FN, TIER_OWNER = "from_env", "Tier"
+
+
+def opens_fence(tree: Tree, fn: str = FENCE_FN, owner: str | None = None) -> Fence:
+    """The fence (or, with `fn` and `owner`, another fn of FENCE_PKG's lib: the tier read), its definers and the openers of FENCE_PKG's lib (the
+    rule above); the named errors (70) when it cannot be read."""
     pkg = tree.packages.get(FENCE_PKG)
     if pkg is None or pkg.lib() is None:
         raise OpensError(70, f"no workspace package {FENCE_PKG} with a lib: the fixture fence is read there")
@@ -9905,12 +10038,14 @@ def opens_fence(tree: Tree) -> Fence:
     if users:
         raise OpensError(70, f"{', '.join(users)} depend on {FENCE_PKG}: a target of theirs reaches the fence through it, and this reader scans {FENCE_PKG}'s files only")
     lib_files = sorted(f for f in tree.tree_of(pkg.lib().src)[0] if f.endswith(".rs"))
-    definers = [d for f in lib_files for d in _fn_defs(tree, f, False) if d.name == FENCE_FN]
+    definers = [d for f in lib_files for d in _fn_defs(tree, f, False) if d.name == fn and (owner is None or d.owner == owner)]
     if not definers:
-        raise OpensError(70, f"no `fn {FENCE_FN}` in {FENCE_PKG}'s lib: the fixture fence is gone or renamed, and this reader would call every recipe clear")
-    skip = {d.path for d in definers}
-    fns = [(d, rust_lex(tree.read(d.path))[1]) for f in lib_files if f not in skip for d in _fn_defs(tree, f, False)]
-    fence = Fence(definers, {})
+        raise OpensError(70, f"no `fn {fn}` in {FENCE_PKG}'s lib: the fixture fence is gone or renamed, and this reader would call every recipe clear")
+    # The fence's own file is left out; the tier read's is not: its helpers (run_clause, premise, ...) call it and are its openers.
+    skip = {d.path for d in definers} if owner is None else set()
+    own_fns = {(d.path, d.line) for d in definers}
+    fns = [(d, rust_lex(tree.read(d.path))[1]) for f in lib_files if f not in skip for d in _fn_defs(tree, f, False) if (d.path, d.line) not in own_fns]
+    fence = Fence(definers, {}, fn, owner)
     while True:
         found = {}
         for d, shape in fns:
@@ -10324,6 +10459,17 @@ def part_id(line: str) -> tuple[str, ...]:
     return tuple(f[:3]) if f[0] == "box" else tuple(f[:2])
 
 
+def parts_moved(was: list[str], now: list[str]) -> list[tuple[str, tuple[str, ...], str, str]]:
+    """What differs between two part lists of one item, `(how, part_id, old part, new part)`: the parts that changed (in `now`'s
+    order), those only `now` has (`added`), then those only `was` has (`removed`); an absent side is the empty string."""
+    cur = {part_id(p): p for p in now}
+    old = {part_id(p): p for p in was}
+    out = [("changed", k, old[k], cur[k]) for k in cur if k in old and old[k] != cur[k]]
+    out += [("added", k, "", cur[k]) for k in cur if k not in old]
+    out += [("removed", k, old[k], "") for k in old if k not in cur]
+    return out
+
+
 class KeyContext:
     """Keys for the items of one batch: one tree, one box manifest, one caller environment."""
 
@@ -10348,6 +10494,10 @@ class KeyContext:
         self._tree: list[str] | None = None
         self._fixture_table: tuple[dict[str, str], str] | None = None
         self._reads_version: dict[str, bool] = {}
+        self._fence: tuple[Fence, Fence] | None = None
+        self._tier_scopes: dict[tuple, tuple[bool, str]] = {}
+        # What the tier did to the last item `parts` keyed, for `key --explain`: `tier-blind: <why>`, `tier kept: <why>` or `real tier`.
+        self.tier_note = ""
 
     def tree_files(self) -> list[str]:
         if self._tree is None:
@@ -10433,14 +10583,78 @@ class KeyContext:
                     dirs[d] = "the item's env or ARGS"
         return dirs, need, fixture
 
-    def fixture_dirs(self, names: list[str], eff: list[str]) -> set[str] | None:
-        """The directories under FIXTURE_ROOT an item in the fixture tier can open: the fixture directory of each family it runs under,
-        from the fixture directory table (fixture_table; `self` and `none` have none: the set may be empty). Its families are
-        the BLOOMERY_MODEL of each tools/box.sh call of its recipes, else the Mac's, else ref-paths.sh's default: tools/box.sh picks the
-        profile on the Mac side and a script on the box that picks another is refused (ref-paths.sh, exit 64), so the family names
-        the only fixture directory a box command opens. None — every row of FIXTURE_ROOT, never under-keyed — when the family cannot
-        be told: an unresolved value such as `{{FAMILY}}`, a BLOOMERY_MODEL in the item's env or
-        BLOOMERY_BOX_ENV, a dotenv file, or a recipe that runs a command on the Mac (it may call tools/box.sh with a profile of its own)."""
+    def fence(self) -> tuple[Fence, Fence]:
+        """The fixture fence and the tier read (`Tier::from_env`) of FENCE_PKG, each with its openers, read once for this tree
+        (`opens_fence`; a named OpensError when one cannot be read)."""
+        if self._fence is None:
+            self._fence = (opens_fence(self.side.tree), opens_fence(self.side.tree, TIER_FN, TIER_OWNER))
+        return self._fence
+
+    def tier_scope(self, name: str, names: list[str], eff: list[str], envs: list[str], argv: list[str]) -> tuple[bool, str]:
+        """(whether the item's run is the same on the fixture tier as on the real tier, why). It is when its model scope is empty:
+        it runs under no variant and names no model of its own, every model family it runs under (item_families) has no fixture file
+        (a `self` row of the fixture directory table: the real file stands and a command that opens no model runs as in the real
+        tier, tools/gate-batch.sh's «deferred»), no script it runs reads BLOOMERY_TIER (tools/box.sh and the profile files it sources
+        resolve the model file the tier names, which such a family has none of), and no target it builds or runs reaches the gate
+        fence, the one place the tier is read by code (`opens`). Anything the rule cannot tell keeps the tier in the key, the reason
+        in the second value."""
+        memo = (name, tuple(eff), tuple(envs), tuple(argv))
+        got = self._tier_scopes.get(memo)
+        if got is not None:
+            return got
+        got = self._tier_scope(name, names, eff, envs, argv)
+        self._tier_scopes[memo] = got
+        return got
+
+    def _tier_scope(self, name: str, names: list[str], eff: list[str], envs: list[str], argv: list[str]) -> tuple[bool, str]:
+        keep = lambda why: (False, why)  # noqa: E731
+        if variant_of(eff, self.env.get("BLOOMERY_FIXTURE_VARIANT")):
+            return keep("it runs on a fixture variant, a fixture file")
+        for w in [*(e.partition("=")[2] for e in eff), *argv]:
+            if any(model_dir_of(v.split("=", 1)[-1]) for v in w.split(",")):
+                return keep("its env or ARGS name a model directory")
+        for k in MAC_ENV:
+            if model_dir_of(self.env.get(k, "")):
+                return keep(f"the Mac's {k} names a model directory")
+        families = self.item_families(names, eff)
+        if families is None:
+            return keep("the model family it runs under cannot be told")
+        rows = self.fixture_rows() if families else {}
+        for family in families:
+            row = rows.get(family, "none")
+            if row == "none":
+                return keep(f"its family {family} has no row in {FIXTURE_DIRS}: the fixture tier refuses it")
+            if row != "self":
+                return keep(f"its family {family} has a fixture ({row})")
+        root = self.side.tree.root
+        for f in self.run_scripts(names):
+            if f in TIER_RESOLVERS or f.startswith("tools/ref/models/"):
+                continue
+            hit = scan_file(root, f, TIER_READ)
+            if hit:
+                return keep(f"{hit} reads BLOOMERY_TIER")
+        try:
+            for what, fence in zip(("opens the fixture fence", "reads the tier (Tier::from_env)"), self.fence()):
+                row = opens(self.side.tree, self.side.recipes, [name], fence=fence)[0].split("\t")
+                if row[0] == "opens":
+                    return keep(f"a target it runs {what}: {row[3]} in {row[2]}")
+        except OpensError as err:
+            return keep(f"`opens` cannot tell: {err}")
+        fams = ", ".join(families) if families else "no box call"
+        return True, f"its run is the same on both tiers: {fams} ({'self: no fixture file' if families else 'no model family'}), no script it runs reads the tier, no target it runs reaches the tier's read or the fixture fence"
+
+    def fixture_rows(self) -> dict[str, str]:
+        """The fixture directory table, family -> its directory (`self`: the real file stands; a family the table lacks has none)."""
+        if self._fixture_table is None:
+            self._fixture_table = fixture_table(self.side.tree.read(FIXTURE_DIRS), self.side.tree.read(REF_PATHS))
+        return self._fixture_table[0]
+
+    def item_families(self, names: list[str], eff: list[str]) -> list[str] | None:
+        """The model families an item runs under: the BLOOMERY_MODEL of each tools/box.sh call of its recipes, else the Mac's, else
+        ref-paths.sh's default. tools/box.sh picks the profile on the Mac side and a script on the box that picks another is refused
+        (ref-paths.sh, exit 64), so the family names the only model a box command opens. No box call: no family. None when the family
+        cannot be told: an unresolved value such as `{{FAMILY}}`, a BLOOMERY_MODEL in the item's env or BLOOMERY_BOX_ENV, a dotenv
+        file, or a recipe that runs a command on the Mac (it may call tools/box.sh with a profile of its own)."""
         st = self.settings.get("settings", {})
         if st.get("dotenv_load") or st.get("dotenv_filename") or st.get("dotenv_path"):
             return None
@@ -10452,15 +10666,21 @@ class KeyContext:
                 return None
             calls += self.side.graph.inputs(n).commands.models
         if not calls:
-            return set()
-        if self._fixture_table is None:
-            self._fixture_table = fixture_table(self.side.tree.read(FIXTURE_DIRS), self.side.tree.read(REF_PATHS))
-        rows, _ = self._fixture_table
-        dirs: set[str] = set()
+            return []
         try:
-            families = RecipeCommands(models=calls).profiles(self.env)
+            return sorted(RecipeCommands(models=calls).profiles(self.env))
         except RecipeError:
             return None
+
+    def fixture_dirs(self, names: list[str], eff: list[str]) -> set[str] | None:
+        """The directories under FIXTURE_ROOT an item in the fixture tier can open: the fixture directory of each family it runs under
+        (item_families), from the fixture directory table (fixture_table; `self` and `none` have none: the set may be empty). None —
+        every row of FIXTURE_ROOT, never under-keyed — when the family cannot be told."""
+        families = self.item_families(names, eff)
+        if families is None:
+            return None
+        rows = self.fixture_rows() if families else {}
+        dirs: set[str] = set()
         for family in families:
             d = rows.get(family, "none")
             if d not in ("self", "none"):
@@ -10576,6 +10796,7 @@ class KeyContext:
 
     def parts(self, item: str) -> tuple[list[str], str | None, str | None, str]:
         """(parts, error, never-skip reason, scope summary) of one item."""
+        self.tier_note = ""
         m = ITEM_RE.match(item)
         if not m:
             return [], f"malformed item {item!r} (NAME[@K=V,…][:ARGS])", None, ""
@@ -10695,8 +10916,23 @@ class KeyContext:
             k, _, v = e.partition("=")
             if k == "BLOOMERY_GATE_CARD":
                 card = v
+        # The tier is part of the key unless the item's model scope is empty (tier_scope): then it is spelt as the real tier is, the
+        # key of a green on one tier is the key on the other, and the Mac's BLOOMERY_TIER and the fixture rows of the manifest move nothing.
+        tier = tier_of(eff, self.env.get("BLOOMERY_TIER"))
+        mac = self.mac
+        scope_eff = eff
+        if tier == FIXTURE_TIER:
+            same_tier, why_tier = self.tier_scope(name, names, eff, envs, argv)
+            self.tier_note = f"tier-blind: {why_tier}" if same_tier else f"tier kept: {why_tier}"
+            if same_tier:
+                eff = [e for e in eff if e.partition("=")[0] != "BLOOMERY_TIER"]
+                scope_eff = [*eff, f"BLOOMERY_TIER={REAL_TIER}"]
+                mac = [f"mac-env\tBLOOMERY_TIER\t{REAL_TIER}" if m.startswith("mac-env\tBLOOMERY_TIER\t") else m for m in self.mac]
+                tier = REAL_TIER
+        else:
+            self.tier_note = "real tier" if tier == REAL_TIER else f"tier kept: BLOOMERY_TIER={tier}"
         parts += [f"item\targs\t{json.dumps(argv)}", f"item\tboxenv\t{' '.join(eff)}", f"item\tcard\t{card}"]
-        parts += self.mac
+        parts += mac
         variant = variant_of(eff, self.env.get("BLOOMERY_FIXTURE_VARIANT"))
         if variant:
             row = variant_table_row(tree.root, variant)
@@ -10706,10 +10942,10 @@ class KeyContext:
         # The manifest lists every model directory any item can open; this item's key holds the rows of
         # its own only, so a directory another gate names (a fixture, a profile) does not move it.
         try:
-            dirs, need, fixture = self.model_scope(names, files, eff, envs, argv)
+            dirs, need, fixture = self.model_scope(names, files, scope_eff, envs, argv)
         except RecipeError as err:
             return [], str(err), None, ""
-        if tier_of(eff, self.env.get("BLOOMERY_TIER")) == "fixture":
+        if tier == FIXTURE_TIER:
             parts.append(f"fixture\tdirs\t{'*' if fixture is None else ','.join(sorted(fixture)) or '-'}")
         listed: set[str] = set()
         for ln in self.manifest:
@@ -10819,9 +11055,7 @@ class Ledger:
         old = self.parts_of(rec.key)
         if old is None:
             return head + " (its parts were not kept)"
-        cur = {part_id(p): p for p in parts}
-        was = {part_id(p): p for p in old}
-        moved = [k for k in cur if k in was and was[k] != cur[k]] + [k for k in cur if k not in was] + [k for k in was if k not in cur]
+        moved = [k for _, k, _, _ in parts_moved(old, parts)]
         shown = "; ".join(" ".join(k) for k in moved[:4])
         return head + f"; moved since: {shown}" + (f" (+{len(moved) - 4})" if len(moved) > 4 else "")
 
@@ -10865,7 +11099,50 @@ def cmd_key_files(args: argparse.Namespace) -> int:
     return 0
 
 
+def short_part(p: str) -> str:
+    """The value of a key part for a diff line: its last field, a digest cut to twelve characters."""
+    v = p.split("\t")[-1]
+    return v[:12] if HEX64.match(v) else v[:70]
+
+
+def key_diff_lines(head: str, scope: str, was: list[str], now: list[str]) -> list[str]:
+    """The lines `key --diff` prints for one item: the verdict, then one line per part that moved (parts_moved)."""
+    moved = parts_moved(was, now)
+    if not moved:
+        return [f"{head}: keys equal ({len(now)} parts, {scope})"]
+    total = len({part_id(p) for p in (*was, *now)})
+    return [f"{head}: keys differ, {len(moved)} of {total} parts moved ({scope})"] + [
+        f"  {how:<7}  {' '.join(k)}  {short_part(old) if old else '-'} -> {short_part(new) if new else '-'}" for how, k, old, new in moved]
+
+
+def cmd_key_diff(args: argparse.Namespace) -> int:
+    """`key --diff A B ITEM…`: the key parts of each ITEM at two commits (a revision, or `.` for the working tree) that differ, one line each:
+    how (changed, added, removed), the part's label and name, and its old and new value. With `--manifest` the parts are the whole key's (the
+    one manifest on both sides); without it they are the tree's: the recipe, scope, file and global parts, which is what a commit moves."""
+    a_rev, b_rev = args.diff
+    if args.ledger or args.round_ledger or args.fast_ledger or args.files or args.parts_dir or args.show_parts or args.explain:
+        raise RecipeError("--diff compares parts of two commits: it takes no ledger, --files, --parts-dir, --parts or --explain")
+    rc = 0
+    with tempfile.TemporaryDirectory(prefix="recipes-keydiff-") as tmp:
+        sides = [make_side(ROOT if rev == "." else archive(rev, os.path.join(tmp, label))) for label, rev in (("a", a_rev), ("b", b_rev))]
+        ctxs = [KeyContext(side, args.manifest, args.box_env or "", manifest_error=args.manifest_error, files_only=args.manifest is None) for side in sides]
+        for item in args.items:
+            got = [ctx.parts(item) for ctx in ctxs]
+            head = f"key-diff {item} {a_rev}..{b_rev}"
+            bad = [(rev, g[1]) for rev, g in zip((a_rev, b_rev), got) if g[1] is not None]
+            if bad:
+                rc = 1
+                for rev, err in bad:
+                    print(f"{head}: error at {rev}: {err}".replace("\n", " "))
+                continue
+            scope = "the whole key" if args.manifest else "the tree's parts, no box manifest"
+            print("\n".join(key_diff_lines(head, scope, got[0][0], got[1][0])))
+    return rc
+
+
 def cmd_key(args: argparse.Namespace) -> int:
+    if args.diff:
+        return cmd_key_diff(args)
     if args.files:
         return cmd_key_files(args)
     side = make_side(ROOT)
@@ -10901,6 +11178,8 @@ def cmd_key(args: argparse.Namespace) -> int:
         else:
             status, detail = ledger_status(key, name, item, parts, ledgers)
         print(f"{key}\t{item}\t{status}\t{detail}".replace("\n", " "))
+        if args.explain:
+            print(f"  {ctx.tier_note}")
         if args.show_parts:
             for p in parts:
                 print(f"  {p}")
@@ -12970,13 +13249,58 @@ def key_self_test(expect, pieces: tuple[str, ...]) -> None:
             expect(one("gate-gpu-e2e@BLOOMERY_GATE_CARD=a6000:--y") != base["args"], "ARGS do not move the key")
             expect(moved(keys(sa, box_env="BLOOMERY_X=1")) == set(items), "the caller's BLOOMERY_BOX_ENV does not move every key")
             expect(moved(keys(sa, environ={"BLOOMERY_DATA": "/x"})) == set(items), "the Mac's BLOOMERY_DATA does not move every key")
-            # The tier: one item under the real tier and under the fixture tier is two keys, whichever way the tier is named, and unset
-            # and `real` are one — a fixture green must never stand for the real file's, nor `--tier real` split the real greens.
-            expect(moved(keys(sa, environ=fx_env)) == set(items), "the Mac's BLOOMERY_TIER=fixture does not move every key")
-            expect(moved(keys(sa, box_env="BLOOMERY_TIER=fixture")) == set(items), "a BLOOMERY_TIER entry of the box env does not move every key")
+            # The tier: an item whose run reads the tier (a target that opens the fixture fence, or one the rule cannot classify) is two keys under
+            # the real tier and under the fixture tier, whichever way the tier is named, and unset and `real` are one — a fixture green must
+            # never stand for the real file's, nor `--tier real` split the real greens. An item whose model scope is empty (no family with a
+            # fixture file, no script or target that reads the tier) is one key on both: a green from either tier stands for the other.
+            tier_scoped = {"gpu", "mac", "args"}
+            expect(moved(keys(sa, environ=fx_env)) == tier_scoped, f"the Mac's BLOOMERY_TIER=fixture moves {sorted(moved(keys(sa, environ=fx_env)))}, not the tier-scoped items {sorted(tier_scoped)}")
+            expect(moved(keys(sa, box_env="BLOOMERY_TIER=fixture")) == tier_scoped,
+                   f"a BLOOMERY_TIER entry of the box env moves {sorted(moved(keys(sa, box_env='BLOOMERY_TIER=fixture')))}, not the tier-scoped items {sorted(tier_scoped)}")
+            expect(keys(sa, environ=fx_env, only={"x": items["cpu"], "y": items["fmt"]}) == {"x": base["cpu"], "y": base["fmt"]},
+                   "a tier-blind item's fixture-tier key is not its real-tier key")
+            # ... and `key --explain` says which rule decided, and a script that reads the tier takes the blindness away.
+            note = lambda it, e=fx_env: (lambda c: (c.parts(it), c.tier_note)[1])(KeyContext(sa, mf, environ=e, settings=settings))  # noqa: E731
+            expect(note(items["cpu"]).startswith("tier-blind: its run is the same on both tiers"), f"the tier-blind reason: {note(items['cpu'])}")
+            expect(note(items["gpu"]).startswith("tier kept:") and "fixture fence" in note(items["gpu"]), f"a target that opens the fence keeps the tier, said: {note(items['gpu'])}")
+            expect(note(items["mac"]).startswith("tier kept:"), f"an item the rule cannot classify keeps the tier, said: {note(items['mac'])}")
+            expect(note(items["cpu"], {}) == "real tier", f"a real-tier key's note: {note(items['cpu'], {})}")
+            gate_sh = os.path.join(roots[0], "tools", "gate.sh")
+            with open(gate_sh, encoding="utf-8") as fh:
+                old_gate_sh = fh.read()
+            try:
+                with open(gate_sh, "w", encoding="utf-8") as fh:
+                    fh.write(old_gate_sh + "\ntrue \"${BLOOMERY_TIER:-}\"\n")
+                s2 = side_at(roots[0], meta)
+                one_cpu = lambda e: keys(s2, environ=e, only={"x": items["cpu"]}, fresh=True)["x"]  # noqa: E731
+                expect(one_cpu(fx_env) != one_cpu({}), "a script a gate runs that reads BLOOMERY_TIER left the gate's key tier-blind")
+            finally:
+                with open(gate_sh, "w", encoding="utf-8") as fh:
+                    fh.write(old_gate_sh)
             expect(not moved(keys(sa, environ={"BLOOMERY_TIER": "real"})), "BLOOMERY_TIER=real moves a key: it is the unset value")
             expect(not moved(keys(sa, environ={"BLOOMERY_TIER": ""})), "an empty BLOOMERY_TIER moves a key: it is the unset value")
             expect(keys(sa, environ=fx_env) != keys(sa, environ={"BLOOMERY_TIER": "bad"}), "an unnamed tier keys like the fixture tier")
+            # `key --diff`: the parts that differ between two states of one item, one line each, so a ledger green that did not carry shows why.
+            was_parts = KeyContext(sa, None, "", {}, settings=settings, files_only=True).parts(items["cpu"])[0]
+            sampler_rs = os.path.join(roots[0], "crates", "sampler", "src", "lib.rs")
+            with open(sampler_rs, encoding="utf-8") as fh:
+                old_sampler = fh.read()
+            try:
+                with open(sampler_rs, "w", encoding="utf-8") as fh:
+                    fh.write(old_sampler + "\n// key probe\n")
+                now_parts = KeyContext(side_at(roots[0], meta), None, "", {}, settings=settings, files_only=True).parts(items["cpu"])[0]
+            finally:
+                with open(sampler_rs, "w", encoding="utf-8") as fh:
+                    fh.write(old_sampler)
+            lines = key_diff_lines("h", "tree", was_parts, now_parts)
+            expect(len(lines) == 2 and lines[0].startswith("h: keys differ, 1 of ") and "crates/sampler/src/lib.rs" in lines[1] and lines[1].lstrip().startswith("changed"),
+                   f"key --diff of an edited file: {lines}")
+            expect(key_diff_lines("h", "tree", was_parts, was_parts) == [f"h: keys equal ({len(was_parts)} parts, tree)"], f"key --diff of equal parts: {key_diff_lines('h', 'tree', was_parts, was_parts)}")
+            dw = [f"file\tcrates/a.rs\t{'1' * 64}", f"file\tcrates/b.rs\t{'2' * 64}", "box\tmodel\tm1\tx"]
+            dn = [f"file\tcrates/a.rs\t{'3' * 64}", f"file\tcrates/c.rs\t{'4' * 64}", "box\tmodel\tm1\ty"]
+            lines = key_diff_lines("h", "tree", dw, dn)
+            expect(lines[0] == "h: keys differ, 4 of 4 parts moved (tree)" and [ln.split()[0] for ln in lines[1:]] == ["changed", "changed", "added", "removed"]
+                   and "111111111111 -> 333333333333" in lines[1] and lines[3].endswith("- -> 444444444444") and lines[4].endswith("222222222222 -> -"), f"key --diff of changed, added and removed parts: {lines}")
             # The Mac-env part itself (a fixture tier's manifest rows move the key as well, so a moved key alone would not show a lost part).
             mac_row = lambda e: [r for r in KeyContext(sa, mf, environ=e).mac if r.startswith("mac-env\tBLOOMERY_TIER\t")]  # noqa: E731
             expect("BLOOMERY_TIER" in MAC_ENV, "BLOOMERY_TIER is not in MAC_ENV")
@@ -17069,6 +17393,10 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--parts", dest="show_parts", action="store_true", help="print each item's labelled parts")
     k.add_argument("--files", action="store_true", help="with one ITEM: the tree files its key reads, one path a line (a member-version-blind one "
                    "followed by a tab and `blind`); no manifest, ledger or box is read")
+    k.add_argument("--explain", action="store_true", help="after each item's line, what the tier did to its key: `tier-blind: <why>` (a model scope that is "
+                   "empty keys the fixture tier as the real tier), `tier kept: <why>` or `real tier`")
+    k.add_argument("--diff", nargs=2, metavar=("A", "B"), help="the key parts of each ITEM that differ between commits A and B (`.`: the working tree): why a green "
+                   "at A did not carry to B; with --manifest the whole key's parts, without it the tree's")
     bc = sub.add_parser("box-command", help="the single-quoted argument of RECIPE's one tools/box.sh line, verbatim (tools/mac-check.sh)")
     bc.add_argument("recipe")
     ot = sub.add_parser("orphan-tests", help="every #[test] no gate-* or lab-* recipe runs on the box, one `path:line name — why` line each")
