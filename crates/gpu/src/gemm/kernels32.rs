@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 // `swiglu_act_quant32`'s contract spells the largest gate·up rule code as a
 // literal.
-const _: () = assert!(crate::kquant::act::ACT_MAX == 3);
+const _: () = assert!(crate::kquant::act::ACT_MAX == 4);
 
 #[cuda_module]
 mod gemm32_kernels {
@@ -2033,9 +2033,10 @@ mod gemm32_kernels {
     /// [`swiglu_quant32`] under a gate·up rule of the K-quant family
     /// (`kquant::act`): each value is `apply(act, limit, g, u)` — ik's
     /// clamped SwiGLU at `limit` (`ACT_SWIGLU_CLAMP`), the OAI SwiGLU at
-    /// `limit` (`ACT_SWIGLU_OAI`), SiTU at beta `limit` (`ACT_SITU`) or
+    /// `limit` (`ACT_SWIGLU_OAI`), SiTU at beta `limit` (`ACT_SITU`), the
+    /// gate-first clamped SwiGLU at `limit` (`ACT_SWIGLU_GCLAMP`) or
     /// `elem::silu_mul` (`ACT_SILU_MUL`, then `swiglu_quant32`'s bytes) —
-    /// quantized by the same body; the contract admits those four codes
+    /// quantized by the same body; the contract admits those five codes
     /// alone. A non-finite `g` or `u` refuses its
     /// block and raises [`FaultSite::QuantColumn`] under any rule: a clamp
     /// would carry it to a finite value the quantizer's test cannot see.
@@ -2049,7 +2050,7 @@ mod gemm32_kernels {
         domain = 1,
         block = (32, 1, 1),
         requires = (
-            act <= 3,
+            act <= 4,
             g.len() >= n_cols * 32 * blocks,
             u.len() >= n_cols * 32 * blocks,
             2 * steps >= blocks,

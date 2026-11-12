@@ -56,8 +56,8 @@ impl GemmKernels {
     /// Enqueue `act = q8_1(rule(g, u))` over the first `n_cols` slot columns
     /// of `act`: one launch of `gemm_swiglu_quant`, `rule` the gate·up rule
     /// of the K-quant family (`kquant::act::apply`: `silu(g) · u`, ik's
-    /// clamped SwiGLU or the OAI SwiGLU, the values of a fused `_sel` gate·up
-    /// under the same rule). A 128-value block holding a non-finite `g` or
+    /// clamped SwiGLU, the OAI SwiGLU or the gate-first clamped SwiGLU, the
+    /// values of a fused `_sel` gate·up under the same rule). A 128-value block holding a non-finite `g` or
     /// `u` value is stored refused (NaN scale, zero codes) and raised on
     /// `fault` as [`FaultSite::QuantColumn`] under any rule; a rule
     /// [`Act::code`] refuses is refused by name. Asynchronous,

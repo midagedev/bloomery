@@ -123,7 +123,10 @@
 //! `Gpu::enqueue_quantize_gemm`, a `Q8Act` fill (`enqueue_swiglu_act_quant_q8`)
 //! holding the `GemmAct`'s codes and scales, a NaN up value refused as
 //! `QuantColumn` where the clamp alone would make it the limit, a non-finite
-//! limit refused by name. Case `swiglu_oai`: the same launch under the OAI
+//! limit refused by name. Case `swiglu_gclamp`: the same launch under the
+//! gate-first clamped SwiGLU (limit 7, rows planted past it on every side:
+//! the gate above it and below its negative, the up outside ±limit) bit for
+//! bit the CPU tier's `qdot::swiglu_gclamp`. Case `swiglu_oai`: the same launch under the OAI
 //! SwiGLU (limits 7 and 0.5) bit for bit the CPU twin `qdot::swiglu_oai` then
 //! the same quantizer, a NaN up value refused as `QuantColumn`, and a NaN or
 //! negative limit and an `alpha` other than the references' refused by name.
@@ -2576,6 +2579,125 @@ mod gate {
         Ok(ok)
     }
 
+    /// The gate-first clamped SwiGLU quantizer (`GemmKernels::
+    /// enqueue_swiglu_act_quant` under `Act::SwigluGateClamp`, ggml's
+    /// `ggml_swiglu_clamp` op order) against the CPU tier's
+    /// `qdot::swiglu_gclamp` quantized by `Gpu::enqueue_quantize_gemm`, at
+    /// K-EXAONE-2.0's clamp limit 7: the same planes bit for bit, and a
+    /// `Q8Act` filled by `enqueue_swiglu_act_quant_q8` holding the
+    /// `GemmAct`'s codes and scales. Every column carries rows planted past
+    /// the limit on each side (the gate above 7 and below -7, the up outside
+    /// ±7) beside rows neither clamp touches, all NaN-free: the clause goes
+    /// red on a mutant that clamps the activated gate instead (the `g > 7`
+    /// rows, where the orders differ).
+    fn swiglu_gclamp_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !wanted("swiglu_gclamp") {
+            return Ok(true);
+        }
+        let gpu = dev.gpu;
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        const LIMIT: f32 = 7.0;
+        let mut ok = true;
+        for k in [768usize, 2048] {
+            let n = 8;
+            // The activations' [-8, 8) spread lands mostly inside the limit;
+            // the first six rows of every column are planted so each side the
+            // clamp bites on is present and named.
+            let mut gh = activations(k, n, 6800 + k as u32);
+            let mut uh = activations(k, n, 6900 + k as u32);
+            for c in 0..n {
+                let at = c * k;
+                gh[at] = 20.0;
+                gh[at + 1] = -20.0;
+                gh[at + 2] = 6.9;
+                uh[at + 3] = 30.0;
+                uh[at + 4] = -30.0;
+                uh[at + 5] = 6.9;
+            }
+            let (g, u) = (
+                DeviceBuffer::from_host(stream, &gh)?,
+                DeviceBuffer::from_host(stream, &uh)?,
+            );
+            let rule = Act::SwigluGateClamp { limit: LIMIT };
+            let (hh, live) = swiglu_host::combine(rule, &gh, &uh).expect("a limited rule");
+            let h = DeviceBuffer::from_host(stream, &hh)?;
+            let mut plain = GemmAct::new(stream, n, k)?;
+            dev.gk
+                .enqueue_swiglu_quant(stream, &g, &u, n, &mut plain, sink)?;
+            let mut fused = GemmAct::new(stream, n, k)?;
+            let mut split = GemmAct::new(stream, n, k)?;
+            let mut gemv = Q8Act::with_k(stream, n, k)?;
+            dev.gk
+                .enqueue_swiglu_act_quant(stream, &g, &u, rule, n, &mut fused, sink)?;
+            gpu.enqueue_quantize_gemm(&h, n, &mut split, sink)?;
+            dev.gk
+                .enqueue_swiglu_act_quant_q8(stream, &g, &u, rule, n, &mut gemv, sink)?;
+            stream.synchronize()?;
+            let (pf, ps, pp) = (
+                planes(&fused, stream)?,
+                planes(&split, stream)?,
+                planes(&plain, stream)?,
+            );
+            let eq_host_gclamp = pf.0 == ps.0
+                && pf.1 == ps.1
+                && pf.2 == ps.2
+                && pf.3 == ps.3
+                && bits_equal(&pf.4, &ps.4);
+            let (gate_hi, gate_lo) = (
+                gh.iter().filter(|&&v| v > LIMIT).count(),
+                gh.iter().filter(|&&v| v < -LIMIT).count(),
+            );
+            let up_out = uh.iter().filter(|&&v| v.abs() > LIMIT).count();
+            let clamp_acts = live > 0 && gate_hi > 0 && gate_lo > 0 && up_out > 0 && pf.0 != pp.0;
+            let q8_eq = gemv.q3().to_host_vec(stream)? == pf.0
+                && bits_equal(&gemv.d8().to_host_vec(stream)?, &pf.4);
+            let pass = eq_host_gclamp && clamp_acts && q8_eq;
+            println!(
+                "gemm case=swiglu_gclamp K={k} cols={n} limit={LIMIT} live_values={live} \
+                 gate>L={gate_hi} gate<-L={gate_lo} |u|>L={up_out} \
+                 planes_eq_host_gclamp_bits={eq_host_gclamp} differs_from_unclamped={clamp_acts} \
+                 q8act_eq_gemmact={q8_eq} {}",
+                verdict(pass)
+            );
+            ok &= pass;
+        }
+        // A gate-first limit the device cannot run is refused by name, before
+        // any launch.
+        let (k, n) = (768usize, 8);
+        let gh = activations(k, n, 77);
+        let uh = activations(k, n, 78);
+        let (g, u) = (
+            DeviceBuffer::from_host(stream, &gh)?,
+            DeviceBuffer::from_host(stream, &uh)?,
+        );
+        let mut act = GemmAct::new(stream, n, k)?;
+        for (what, limit) in [
+            ("gclamp_zero_limit", 0.0),
+            ("gclamp_negative_limit", -7.0),
+            ("gclamp_nan_limit", f32::NAN),
+        ] {
+            let refused = dev
+                .gk
+                .enqueue_swiglu_act_quant(
+                    stream,
+                    &g,
+                    &u,
+                    Act::SwigluGateClamp { limit },
+                    n,
+                    &mut act,
+                    sink,
+                )
+                .is_err();
+            println!(
+                "gemm case=swiglu_gclamp refusal={what} refused={refused} {}",
+                verdict(refused)
+            );
+            ok &= refused;
+        }
+        Ok(ok)
+    }
+
     /// The card-slots-only K-quant SwiGLU quantizer
     /// (`GemmKernels::enqueue_swiglu_act_quant_sel`) over a remapped route's
     /// places, under the clamp GLM's routed experts run (10) and the plain
@@ -2868,6 +2990,7 @@ mod gate {
         ok &= swiglu_case(&dev)?;
         ok &= relu_sqr_case(&dev)?;
         ok &= swiglu_clamp_case(&dev)?;
+        ok &= swiglu_gclamp_case(&dev)?;
         ok &= swiglu_sel_case(&dev)?;
         ok &= faults(&dev)?;
         ok &= sel_faults(&dev)?;
