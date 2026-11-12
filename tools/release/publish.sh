@@ -5,7 +5,8 @@
 #
 #   tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a]
 #   tools/release/publish.sh <version> --tap-only   step 5 alone, on the release's own .sha256 assets (after a GB10 upload)
-#   tools/release/publish.sh --self-test     (the rotation's refusal on stub rotation.py exits, and step 3a's warnings; check-recipes runs it)
+#   tools/release/publish.sh --self-test     (the rotation's and the release check's refusals on stub rotation.py exits, the night's
+#                                      pull, and step 3a's warnings; check-recipes runs it)
 #   tools/release/publish.sh --sitting-check <tarball> <name> <dir>...   step 3a alone, on the verdicts in each <dir>
 #   tools/release/publish.sh --tree-check <version> [<rev>] [--crates-only]   steps 2 and 2b alone, on the working tree or on
 #                                      <rev>'s tree (git show, nothing is checked out): `just release-build`, tools/release/build.sh
@@ -19,8 +20,16 @@
 #   tools/release/publish.sh --bump-next <version> [<next>]   edits the working tree to the next version (step 6 names it)
 #
 # What it owns, in order:
-#   0. the rotation: `python3 tools/rotation.py check` must be green (every F family has a green ledger row inside the
-#      rotation's window: the release batch leaves those gates to the rotation); rc 1 stops here, and so does rc 2 or 70, each named;
+#   0. the rotation: `python3 tools/rotation.py check --night DIR` must be green (every F family has a green ledger row, on the
+#      lead's ledger or the night's, inside the rotation's window: the release leaves those gates to the rotation); rc 1 stops
+#      here, and so does rc 2 or 70, each named. DIR holds the night's report and ledger: `bash tools/nightly-real.sh --pull`
+#      fetches them from the box first, unless BLOOMERY_NIGHT_DIR names a directory that already holds them; a pull that fails stops;
+#   0b. the release check: `python3 tools/rotation.py release-check --night DIR` must be green. A release no longer runs the
+#      whole real tier: it blocks on the blocking set (tools/recipes.py release-list --blocking: the class-table rows with a
+#      release mark), which must be green at the tag's keys on the lead's ledger or the night's, and on the night's verdict on
+#      the rest (tools/nightly-real.sh: no item red at the night's newest run unless green at its key since; a missing or stale
+#      night report stops it). rc 1 names each stop and writes DIR/release-run.list, the --list of what to run
+#      (`tools/gate-batch.sh --tier real --ledger --list DIR/release-run.list`); rc 2 or 70 is named;
 #   1. the tag: HEAD must carry tag v<version> (the release is the tag; the binaries'
 #      --version names this commit);
 #   2. the versions: the serve AND gpu-gates crates must both say <version> (--version
@@ -62,7 +71,7 @@
 #      (`--bump-next <version>`: the serve and gpu-gates crates and their two Cargo.lock entries move to the next patch
 #      version on main, so the tarballs built there before the next ask are that release's).
 #
-# --dry-run does 1–3 and prints 4–6 without touching the release or the tap.
+# --dry-run does 0–3 and prints 4–6 without touching the release or the tap: its 0b lines are the lead's read of what blocks.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -73,11 +82,37 @@ cd "$ROOT"
 # (the families it names) go to stderr first.
 rotation_gate() {
     local rc=0
-    python3 tools/rotation.py check >&2 || rc=$?
+    python3 tools/rotation.py check --night "$NIGHT_DIR" >&2 || rc=$?
     case "$rc" in
         0) ;;
         1) echo "publish.sh: the rotation is red: the lines above name each family with no green ledger row in the rotation's window — run \`just rotation-due\` and the batch it lists on the lead's ledger, then publish" >&2; return 1 ;;
         *) echo "publish.sh: tools/rotation.py check could not run (rc $rc; 2 a bad input, 70 a tool it runs failed): the lines above name it" >&2; return 1 ;;
+    esac
+}
+
+# night_pull: NIGHT_DIR, the directory holding the night's report and ledger: BLOOMERY_NIGHT_DIR when set (nothing is pulled), else
+# the box's night pulled into ~/.cache/bloomery/night-pull by tools/nightly-real.sh --pull. 1 and the named reason when the pull fails.
+night_pull() {
+    local rc=0
+    if [ -n "${BLOOMERY_NIGHT_DIR:-}" ]; then
+        NIGHT_DIR=$BLOOMERY_NIGHT_DIR
+        echo "publish.sh: the night's report and ledger from $NIGHT_DIR (BLOOMERY_NIGHT_DIR; nothing pulled)" >&2
+        return 0
+    fi
+    NIGHT_DIR=$HOME/.cache/bloomery/night-pull
+    bash tools/nightly-real.sh --pull --into "$NIGHT_DIR" >&2 || rc=$?
+    [ "$rc" = 0 ] || { echo "publish.sh: the night's report could not be pulled from the box (tools/nightly-real.sh --pull, rc $rc): the lines above name it; a release reads the night's verdict" >&2; return 1; }
+}
+
+# night_gate: step 0b, tools/rotation.py release-check's verdict as this script's: 0 green, 1 and the named reason otherwise. Its
+# own lines (ok, RUN, RED, NIGHT) go to stderr first.
+night_gate() {
+    local rc=0
+    python3 tools/rotation.py release-check --night "$NIGHT_DIR" --out "$NIGHT_DIR/release-run.list" >&2 || rc=$?
+    case "$rc" in
+        0) ;;
+        1) echo "publish.sh: the release check is red: the lines above name each stop (RUN a blocking gate with no green at its key, RED a night red still red, NIGHT the night's report) — run \`tools/gate-batch.sh --tier real --ledger --list $NIGHT_DIR/release-run.list\`, fix or re-pin each night red, then publish" >&2; return 1 ;;
+        *) echo "publish.sh: tools/rotation.py release-check could not run (rc $rc; 2 a bad input, 70 a tool it runs failed): the lines above name it" >&2; return 1 ;;
     esac
 }
 
@@ -344,10 +379,12 @@ if [ "${1:-}" = --functions ]; then return 0 2> /dev/null || exit 0; fi
 
 # --self-test: a copy of this script in a temporary repository with no tag, beside a stub tools/rotation.py that exits with each
 # code. rc 1, 2 and 70 stop at the rotation with a message that names it; rc 0 passes it and stops at the tag check after it, so the
-# rotation is the first step and a green one lets the rest run.
+# rotation is the first step and a green one lets the rest run. The release check (0b) likewise, after a green rotation; the night's
+# pull through a stub tools/nightly-real.sh.
 if [ "${1:-}" = --self-test ]; then
     [ $# = 1 ] || { echo "usage: tools/release/publish.sh --self-test" >&2; exit 64; }
     t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+    export BLOOMERY_NIGHT_DIR="$t/night" # the cases read a night directory; night_cases below holds the pull
     mkdir -p "$t/tools/release"
     cp "$0" "$t/tools/release/publish.sh"
     git -C "$t" init -q
@@ -371,6 +408,55 @@ if [ "${1:-}" = --self-test ]; then
     expect 2 "could not run (rc 2"
     expect 70 "could not run (rc 70"
     expect 0 "does not carry v0.0.0"
+    # night_cases <script> <loud 0|1>: step 0b and the pull on a copy of <script>, after a green rotation. A red release check stops
+    # with its reason and runs no later step; a green one reaches the tag check; the pull runs tools/nightly-real.sh --pull unless
+    # BLOOMERY_NIGHT_DIR is set, and its failure stops. Sets night_fails.
+    night_cases() {
+        local script=$1 loud=$2 n rc got want_rc want unwanted env_dir stub
+        night_fails=0
+        rm -rf "$t/nc" && mkdir -p "$t/nc/tools/release"
+        cp "$script" "$t/nc/tools/release/publish.sh"
+        git -C "$t/nc" init -q
+        git -C "$t/nc" -c user.name=selftest -c user.email=selftest@invalid commit -q --allow-empty -m selftest
+        for n in "1|1|the release check is red|does not carry|$t/night" "2|1|release-check could not run (rc 2|does not carry|$t/night" \
+            "70|1|release-check could not run (rc 70|does not carry|$t/night" "0|1|does not carry v0.0.0||$t/night" \
+            "0|1|the night's report could not be pulled from the box (tools/nightly-real.sh --pull, rc 66)|the release check|" \
+            "0|1|does not carry v0.0.0||pull-ok"; do
+            IFS='|' read -r stub want_rc want unwanted env_dir <<< "$n"
+            printf 'import sys\nsys.exit({"check": 0, "release-check": %s}[sys.argv[1]])\n' "$stub" > "$t/nc/tools/rotation.py"
+            case $env_dir in
+                pull-ok) printf '#!/usr/bin/env bash\necho "nightly-real: --pull: $*" >&2\n' > "$t/nc/tools/nightly-real.sh"; env_dir='' ;;
+                '') printf '#!/usr/bin/env bash\nexit 66\n' > "$t/nc/tools/nightly-real.sh" ;;
+                *) rm -f "$t/nc/tools/nightly-real.sh" ;;
+            esac
+            got=''
+            rc=0
+            got=$(BLOOMERY_NIGHT_DIR=$env_dir bash "$t/nc/tools/release/publish.sh" 0.0.0 --dry-run 2>&1) || rc=$?
+            if [ "$rc" != "$want_rc" ] || [[ "$got" != *"$want"* ]] || { [ -n "$unwanted" ] && [[ "$got" == *"$unwanted"* ]]; }; then
+                night_fails=$((night_fails + 1))
+                [ "$loud" = 0 ] || echo "publish.sh self-test: release check ($n): rc $rc (want $want_rc), want '$want'${unwanted:+ without '$unwanted'}; got: $got" >&2
+            fi
+            [ "$loud" = 0 ] || cases=$((cases + 1))
+        done
+    }
+    night_cases "$0" 1
+    fails=$((fails + night_fails))
+    # FAIL-first: without step 0b in the flow, or with a pull that is never asked, a case goes red
+    for m in $'\nnight_gate || exit 1\n|\n:\n' $'    if [ -n "${BLOOMERY_NIGHT_DIR:-}" ]; then|    if true; then'; do
+        cases=$((cases + 1))
+        python3 -I - "$0" "$t/night-mutant.sh" "${m%%|*}" "${m#*|}" << 'PY' || { echo "publish.sh self-test: a release-check mutant's text is not in the code" >&2; fails=$((fails + 1)); continue; }
+import sys
+
+src, dst, old, new = sys.argv[1:5]
+s = open(src).read()
+i = s.find(old)
+if i < 0:
+    sys.exit(1)
+open(dst, "w").write(s[:i] + new + s[i + len(old):])
+PY
+        night_cases "$t/night-mutant.sh" 0
+        [ "$night_fails" != 0 ] || { echo "publish.sh self-test: the release-check mutant '${m%%|*}' left every case green" >&2; fails=$((fails + 1)); }
+    done
     # The asset list (step 4): the sm_86 archive first and the macOS one last, the sm_120a one beside it unless --no-sm120a, the
     # GB10 one when a GB10 archive was verified.
     assets_expect() { # assets_expect <case> <gb10> <sm120a> <want, space-separated>
@@ -884,8 +970,10 @@ if [ "$TAP_ONLY" = 1 ]; then
     exit 0
 fi
 
-# 0. the rotation
+# 0. the rotation, on the lead's ledger and the night's; 0b. the release check
+night_pull || exit 1
 rotation_gate || exit 1
+night_gate || exit 1
 
 # 1. the tag
 COMMIT=$(git rev-parse --short=12 HEAD)

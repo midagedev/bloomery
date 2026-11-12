@@ -397,6 +397,7 @@ blk_releaseinstall() { tool_selftest release/install.sh; }
 # binary is silent, any other is a warning that names it, and the status stays 0; the script runs on the lead's Mac only at a
 # release.
 blk_releasepublish() { tool_selftest release/publish.sh; }
+blk_nightlyreal() { tool_selftest nightly-real.sh; } # the night's skip, red with its range, refusal under a hold, carried red, lock, pull: stub tools
 # sitting.sh is the release sitting's runner: the cells file's faults, round 1 family-major and round 2 reversed with its arms
 # rotated, the red stop and --keep-going, the hold on every exit path, the verdict's fields, the environment a cell sets and the
 # --dry-run wall, on a stub depth-serve.sh and stub checks, then a mutant of each guard that its case must turn red; no box, no
@@ -447,6 +448,7 @@ pytools_list() {
     "tools/flow/q38width.py --self-test"
     "tools/flow/resplay.py --self-test"
     "tools/flow/routes.py --self-test"
+    "tools/gate-budget.py --self-test"
     "tools/gate_class.py --self-test"
     "tools/gate-paths-merge.py --self-test"
     "tools/hf-arch-check.py --self-test"
@@ -1250,7 +1252,7 @@ proc_leg_gpu() {
 }
 
 BLOCKS=(prelude recipescheck gateclass selftest smoke cardorder cardtests lease boxtracks unsafecount archscan loadscan commentscan leverscan loadgroups lcppfit coldblocks leverarms slotsarm binlabel lcppwarm q38srv
-  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs wholemanifests narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macsetup roundcheck macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish releasesitting releasepick releasebuildmac pytools boxqcodes fixturevariants fixturedirs dsparkread
+  maccheck gatebatch gpugate stackwatch ptxscan ptxspill scanargs wholemanifests narrowscan canoncheck ptxcompare ldsscan mutantrun macstatic macsetup roundcheck macremote boxsh oxidehost oxidebackend seedtarget carry releasebuild releaseinstall releasepublish nightlyreal releasesitting releasepick releasebuildmac pytools boxqcodes fixturevariants fixturedirs dsparkread
   refsetpublish orphan archowner treecommit archivepipe fnowner wt sweep macgate boundedscan gatebound dumpdequant tokoracle ikpintree qdotrefargs quantmeasure)
 # blk_keyspec NAME: what a block's input key reads (tools/recipes.py static-key). Every block's is the whole tree: a
 # narrower key needs proof that the block reads nothing outside it, and a green run on a copy whose other files are

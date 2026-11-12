@@ -8,7 +8,7 @@ network, never rewrites Cargo.lock), and the sources as text. It builds nothing 
     python3 tools/recipes.py check            # the target checks of `just check-recipes`, one feature set a bin, and the plan files records-refresh writes (presence)
     python3 tools/recipes.py targets [RECIPE]  # recipe -> cargo targets, scripts, input count
     python3 tools/recipes.py affected [BASE | A..B] [--no-box] [--all-recipes] [--narrow [--scan BASE_LOG NEW_LOG]...] [--no-class | --fast] [--no-comment-only] [--classes FILE | --no-owed]
-    python3 tools/recipes.py release-list [TAG | TAG..HEAD] [--wall]  # the release batch's list: the real tier (common and tooling gates, the main and the new families' gates), affected and the CUDA GGUF gates in scope; the other families' gates left out by name
+    python3 tools/recipes.py release-list [TAG | TAG..HEAD] [--blocking] [--classes FILE] [--wall]  # the full release list, the night's (tools/nightly-real.sh): the real tier (common and tooling gates, the main and the new families' gates), the blocking set, affected and the CUDA GGUF gates in scope; the other families' gates left out by name. --blocking: what a release must see green at the tag's keys
     python3 tools/recipes.py scan-set [REV]    # the bins whose ptx-scans cover every kernel carrier: bin<TAB>features<TAB>carriers (just narrow scans them)
     python3 tools/recipes.py ships [--rev REV] [--base REV] FILE...  # the FILEs inside the shipped closure (tools/release/build.sh's bins at its features), with why; exit 1 when any is (tools/release/late-commit.sh)
     python3 tools/recipes.py ship-scan [--rev REV] BASE_LOG HEAD_LOG...  # the shipped bins' ptx-scan pairs: a verdict line each; exit 0 only when every shipped bin has a pair and all are identical
@@ -80,10 +80,13 @@ those families' own, and a gate every reached changed file of which is a family'
 an owner its class row names owns a changed file, or it builds a lib or test target of a package a changed file lies in. A tooling gate stays.
 A file no family glob matches (a script, a cargo global, common code) keeps every gate it reaches. gate-batch.sh --fast-ledger records its greens apart.
 A change whose selecting files all sit under `MAC_CRATES` does not select a CUDA gate on a GGUF input (`mac_landing_deferred`); the gate is
-printed under `deferred`. `release-list` is the release batch's list, the real tier (`real_tier`): every common and tooling gate the batch
-runs, every gate of a main family (families.tsv tier) or of a family new since TAG, the weekly and check recipes of those, then affected(TAG)
-and every CUDA gate on a GGUF input (`mac_gguf_cuda`) in scope. The gates of every other family are left out by name, each family with its last
-green date (tools/rotation.py check holds them to their 30 days before a tag); tools/rotation.py follow-list prints the same real tier with no diff.
+printed under `deferred`. `release-list` is the full release list, which the night runs (tools/nightly-real.sh), the real tier (`real_tier`):
+every common and tooling gate the batch runs, every gate of a main family (families.tsv tier) or of a family new since TAG, the weekly and check
+recipes of those, then the blocking set, affected(TAG) and every CUDA gate on a GGUF input (`mac_gguf_cuda`) in scope. The gates of every other
+family are left out by name, each family with its last green date (tools/rotation.py check holds them to their 30 days before a tag);
+tools/rotation.py follow-list prints the same real tier with no diff. `release-list --blocking` is what a release itself runs (`blocking_set`):
+the class-table rows whose topic carries a release mark (`+ship`, a main or new family's serve or two-card gate; `+kernel`, a gate that holds the
+shipped kernels), and tools/rotation.py release-check holds a release to them at the tag's keys and to the night's verdict on the rest.
 
 A recipe's inputs are:
   - the files of every cargo target it builds or tests: the target's own module tree (`mod`,
@@ -16843,37 +16846,176 @@ def predicted_wall(names: list[str], fixture: dict[str, list[tuple[str, int]]],
             "wall": int((lanes["A"] + lanes["B"]) / 2 + lanes["X"])}
 
 
+# ---- the release's blocking set: the gates a release must see green at the tag's keys ----
+
+# A topic of tools/gate-class.tsv may carry one release mark after a `+` (the table's header): the gate blocks a release, which must
+# see it green at the tag's keys (`release-list --blocking`, tools/rotation.py release-check); every other gate of the full release list
+# runs at night (tools/nightly-real.sh), and the release reads the night's verdict. `ship` marks a gate that runs the shipped serve
+# path on a placement a user picks, or a family's two-card gate: it blocks while its family is in the release's real tier (a main
+# family, or one new since the last release tag; gate_class.left_out). `kernel` marks a gate that holds the shipped kernels (the
+# forced-exact count pin, the PTX spill pins): it blocks every release, whatever its family. The marks are the rule; no recipe name
+# is.
+RELEASE_MARKS = ("ship", "kernel")
+
+
+def release_mark(row) -> str:
+    """The release mark of a class-table row, '' when its topic carries none. A mark the table does not take, a mark with no topic
+    before it, two marks, or `+ship` on a row that names no family is a named error: a mark that does not mean what it says never
+    blocks a release silently, or fails to."""
+    topic, sep, mark = row.topic.partition("+")
+    if not sep:
+        return ""
+    where = f"tools/gate-class.tsv: {row.recipe}'s topic {row.topic!r}"
+    if not topic:
+        raise RecipeError(f"{where} names no topic before its release mark (`<what it tests>+<mark>`)")
+    if mark not in RELEASE_MARKS:
+        raise RecipeError(f"{where} carries the mark {mark!r}; a topic takes one release mark, "
+                          f"{' or '.join('+' + m for m in RELEASE_MARKS)}, after what the gate tests")
+    if mark == "ship" and row.cls != "family":
+        raise RecipeError(f"{where}: +ship marks one family's serve or two-card gate, and this is a {row.cls} row; a gate that holds "
+                          "the shipped kernels for every family takes +kernel")
+    return mark
+
+
+@dataclass
+class Blocking:
+    names: list[str]       # the gates that block the release, sorted
+    marks: dict[str, str]  # gate -> its release mark
+    left: dict[str, str]   # a marked gate that does not block this release -> why
+
+
+def blocking_set(tables, classes: dict[str, tuple[str, str]], rs: dict[str, Recipe], new: set[str]) -> Blocking:
+    """The release's blocking set: every class-table row that carries a release mark (release_mark), a `+ship` one only while its family
+    is in the release's real tier (a main family, or one in `new`). A marked gate that a real-tier batch does not run (no class from the
+    classifier, a needs-env gate, a fixture-only or variant kind, a timed or refused class) is a named error: it could never be green
+    at the tag's key."""
+    gate_class = _gate_class()
+    scope_of = gate_scope_of(tables, rs)
+    names: list[str] = []
+    marks: dict[str, str] = {}
+    left: dict[str, str] = {}
+    for n in sorted(tables.gates):
+        mark = release_mark(tables.gates[n])
+        if not mark:
+            continue
+        if n not in classes:
+            raise RecipeError(f"{n} carries +{mark} in tools/gate-class.tsv and the batch's classifier does not name it: the justfile and "
+                              "the class table moved apart")
+        cls, kind = classes[n]
+        if kind == "needs-env" or not (cls in REAL_TIER_CLASSES or (cls == "D" and kind in DEFERRED_KINDS)):
+            raise RecipeError(f"{n} carries +{mark} and a real-tier batch does not run it (class {cls}, {kind}): it could never be green at "
+                              "the tag's key — move the mark to a gate the real tier runs, or give this one a real-tier run")
+        if mark == "ship":
+            why = gate_class.left_out(scope_of(n), new)
+            if why:
+                left[n] = f"+ship of {tables.gates[n].family}, outside this release's real tier ({why}): the night runs it"
+                continue
+        names.append(n)
+        marks[n] = mark
+    return Blocking(names, marks, left)
+
+
+# The plan line of a dry run: `gate-batch: predicted laneA=…s … wall=<s>s …`, and its count line `gate-batch: dry run — <n> items …`.
+PLAN_WALL = re.compile(r"^gate-batch: predicted (.*\bwall=(\d+)s.*)$", re.M)
+PLAN_ITEMS = re.compile(r"^gate-batch: dry run — (\d+) items", re.M)
+
+
+def batch_plan(names: list[str], tier: str, root: str = ROOT, env: dict[str, str] | None = None) -> tuple[int, str, int]:
+    """(the predicted wall in seconds, the plan's terms, the items it runs) of one `tools/gate-batch.sh --dry-run --tier TIER --list`
+    over `names` (recipe lines, or the raw lines of `affected`, which the batch reads as a --list): the batch's own plan from its times
+    file, never re-implemented. Without --ledger the dry run reads no box. A run that fails or prints no plan line is a named error."""
+    if tier not in (REAL_TIER, FIXTURE_TIER):
+        raise RecipeError(f"batch_plan: the tier is real or fixture, not {tier!r}")
+    with tempfile.TemporaryDirectory(prefix="recipes-plan-") as d:
+        lst = os.path.join(d, "plan.list")
+        with open(lst, "w", encoding="utf-8") as fh:
+            fh.write("".join(n + "\n" for n in names))
+        proc = subprocess.run([os.path.join(root, "tools", "gate-batch.sh"), "--dry-run", "--tier", tier, "--list", lst],
+                              capture_output=True, text=True, cwd=root, env=env)
+    out = proc.stdout + proc.stderr
+    if proc.returncode != 0:
+        raise RecipeError(f"`tools/gate-batch.sh --dry-run --tier {tier}` over {len(names)} item(s) failed (exit {proc.returncode}): "
+                          f"{out.strip()[-300:]}")
+    m = PLAN_WALL.search(out)
+    if m is None:
+        raise RecipeError(f"`tools/gate-batch.sh --dry-run --tier {tier}` printed no `gate-batch: predicted … wall=Ns` line: {out.strip()[-300:]}")
+    n = PLAN_ITEMS.search(out)
+    return int(m.group(2)), m.group(1), int(n.group(1)) if n else len(names)
+
+
+def read_class_file(path: str) -> dict[str, tuple[str, str]]:
+    """A saved `tools/gate-batch.sh --tier fixture --classes` (the night runs the classifier once for every tool that reads it)."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return parse_class_rows(fh.read())
+    except OSError as err:
+        raise RecipeError(f"--classes {path}: {err.strerror}") from err
+
+
+def cmd_release_blocking(args: argparse.Namespace, b: Side, tables, classes: dict[str, tuple[str, str]], new: set[str],
+                         base_label: str) -> int:
+    """`release-list --blocking`: the blocking set, one recipe a line; on stderr each gate with its mark and median, the marked gates
+    this release does not block on and why, and with --wall the batch's own plan of the set."""
+    bl = blocking_set(tables, classes, b.recipes, new)
+    for n in bl.names:
+        print(n)
+    fixture, plain = times_rows(args.times)
+    per = {m: sum(1 for n in bl.names if bl.marks[n] == m) for m in RELEASE_MARKS}
+    print(f"release-list --blocking: {len(bl.names)} gate(s) block the release ({', '.join(f'+{m} {c}' for m, c in per.items())}), "
+          f"by the release marks of tools/gate-class.tsv's topic column; families new since {base_label}: {', '.join(sorted(new)) or 'none'}",
+          file=sys.stderr)
+    for n in bl.names:
+        rows = plain.get(n) or []
+        med = f"median {int(statistics.median([s for _, s in rows[-5:]]) + 0.5)} s of {len(rows[-5:])} real-tier row(s)" if rows else "no real-tier row"
+        row = tables.gates[n]
+        print(f"  {n}  +{bl.marks[n]}  {row.family or row.cls}  {med}", file=sys.stderr)
+    if bl.left:
+        print(f"release-list --blocking: {len(bl.left)} marked gate(s) this release does not block on:", file=sys.stderr)
+        for n, why in sorted(bl.left.items()):
+            print(f"  {n}  {why}", file=sys.stderr)
+    if args.wall:
+        wall, terms, _items = batch_plan(bl.names, REAL_TIER, b.tree.root, dict(os.environ, BLOOMERY_GATE_TIMES=args.times))
+        print(f"release-list --blocking: the predicted wall {wall} s, the batch's own plan of the set on the real tier "
+              f"(tools/gate-batch.sh --dry-run --tier real): {terms}", file=sys.stderr)
+    return 0
+
+
 def cmd_release_list(args: argparse.Namespace) -> int:
-    """The release batch's list: the real tier (real_tier: every common and tooling gate, every gate of a main family or of a
-    family new since BASE, the weekly and check recipes of those), the class-staged affected(BASE) and every CUDA gate on a
-    GGUF input, the last two in scope. One recipe per line, sorted, no duplicate; the counts per part on stderr, and each
-    family left out with its reason and its last green date."""
+    """The full release list, which the night runs (tools/nightly-real.sh): the real tier (real_tier: every common and tooling gate,
+    every gate of a main family or of a family new since BASE, the weekly and check recipes of those), the blocking set, the
+    class-staged affected(BASE) and every CUDA gate on a GGUF input, the last two in scope. One recipe per line, sorted, no
+    duplicate; the counts per part on stderr, and each family left out with its reason and its last green date. `--blocking`:
+    the blocking set alone (cmd_release_blocking), what a release itself must see green at the tag's keys."""
     changed, a_rev, b_rev, _ = changed_files(args.base)
     tmp = tempfile.mkdtemp(prefix="recipes-release-")
     try:
         b = make_side(archive(b_rev, os.path.join(tmp, "b")) if b_rev else ROOT)
-        a = make_side(archive(a_rev, os.path.join(tmp, "a"))) if a_rev else None
         tables = class_tables(b.tree.root)
-        classes = fixture_class_rows(b.tree.root)
+        classes = read_class_file(args.classes) if args.classes else fixture_class_rows(b.tree.root)
         tags = release_tags(ROOT)
         base_rev = a_rev or (tags[0] if tags else None)
         new = families_new_between(ROOT, tables, base_rev, b_rev) if base_rev else set()
+        if args.blocking:
+            return cmd_release_blocking(args, b, tables, classes, new, base_rev[:9] if base_rev else "no release tag")
+        a = make_side(archive(a_rev, os.path.join(tmp, "a"))) if a_rev else None
         rt = real_tier(classes, b.recipes, tables, new)
+        bl = blocking_set(tables, classes, b.recipes, new)
         scope_of = gate_scope_of(tables, b.recipes)
         gate_class = _gate_class()
         affected, aff_left = gate_class.partition(list(class_picks(changed, a, b, tables).kept), scope_of, new)
         mac, mac_left = gate_class.partition([n for n, _why in mac_gguf_cuda(b.recipes, b.tree.root)], scope_of, new)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    names, counts = release_union({**rt.parts, "affected": affected, "mac GGUF": mac})
+    names, counts = release_union({**rt.parts, "blocking": bl.names, "affected": affected, "mac GGUF": mac})
     for n in names:
         print(n)
     in_real = {n for ns in rt.parts.values() for n in ns}
-    shown = ", ".join(f"{k} {v}" + (f" ({len(set(items) - in_real)} beyond the real tier)" if k in ("affected", "mac GGUF") else "")
-                      for (k, v), items in zip(counts.items(), [*rt.parts.values(), affected, mac]))
+    shown = ", ".join(f"{k} {v}" + (f" ({len(set(items) - in_real)} beyond the real tier)" if k in ("blocking", "affected", "mac GGUF") else "")
+                      for (k, v), items in zip(counts.items(), [*rt.parts.values(), bl.names, affected, mac]))
     print(f"release-list: {shown}, {len(names)} recipe(s) in all", file=sys.stderr)
     print(f"release-list: families new since {base_rev[:9] if base_rev else 'no release tag'}: {', '.join(sorted(new)) or 'none'}", file=sys.stderr)
-    left = {**rt.left, **{n: (why, sc.family) for n, (why, sc) in {**aff_left, **mac_left}.items()}}
+    listed = set(names)  # a gate of an other family that another part keeps (a +kernel gate) is not left out
+    left = {n: v for n, v in {**rt.left, **{n: (why, sc.family) for n, (why, sc) in {**aff_left, **mac_left}.items()}}.items() if n not in listed}
     print(f"release-list: {len(left)} gate(s) of {len({f for _, f in left.values()})} other family(ies) left out"
           + (f" ({len(rt.waiting)} in scope wait for an environment variable, which the batch defers)" if rt.waiting else "")
           + (":" if left else ""), file=sys.stderr)
@@ -17133,7 +17275,90 @@ def class_stage_self_test(fails: list[str]) -> None:
         expect(tree_files(None, repo).count("crates/fam-new/untracked.rs") == 1 and "crates/fam-new/untracked.rs" not in tree_files("HEAD", repo),
                "new families: the working tree holds an untracked file, a revision does not")
 
+        blocking_self_test(expect, refused, tmp)
+
     print(f"class stage self-test: {'ok' if not fails else f'{len(fails)} failure(s)'} ({time.monotonic() - t0:.1f} s)")
+
+
+def blocking_self_test(expect, refused, tmp: str) -> None:
+    """The release's blocking set on a synthetic table: a +ship row blocks while its family is in the release's real tier (a main
+    family, a new one) and is left out with its reason otherwise; a +kernel row blocks whatever its family; an unmarked row never
+    blocks; a mark the table does not take, a +ship tooling row and a marked gate the real tier does not run are named errors. Each
+    rule has its FAIL-first mutant: the set it gives without that rule differs."""
+    root = os.path.join(tmp, "blocking")
+
+    def write(rel: str, text: str) -> None:
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    write("tools/families.tsv", "# family\trep\ttier\tglobs\trotation_days\tfixture\n"
+          "fam-main\tR\tmain\tcrates/fam-main/**\t7\tno\n"
+          "fam-old\tF\tother\tcrates/fam-old/**\t30\tno\n"
+          "fam-new\tF\tother\tcrates/fam-new/**\t30\tno\n")
+    write("tools/owners.tsv", "# owner\tkind\tglobs\nown-a\tkernel\tcrates/fam-main/a.rs\n")
+    write("crates/fam-main/a.rs", "// a\n")
+    rows = ["gate-srv\tfamily\tfam-main\tserve+ship\t-", "gate-two\tfamily\tfam-main\ttier+ship\t-",
+            "gate-old\tfamily\tfam-old\tserve+ship\t-", "gate-nw\tfamily\tfam-new\tserve+ship\t-",
+            "gate-pin\tfamily\tfam-old\te2e+kernel\t-", "gate-spill\ttooling\t\tstatic+kernel\t-",
+            "gate-plain\tfamily\tfam-main\tkernel\t-", "gate-com\tcommon\t\thost\t-"]
+
+    def table(extra: list[str] | None = None):
+        write("tools/gate-class.tsv", "# recipe\tclass\tfamily\ttopic\towners\n" + "".join(r + "\n" for r in rows + (extra or [])))
+        return class_tables(root)
+
+    tables = table()
+    classes = {n: ("A", "fixed") for n in tables.gates}
+    marks = {n: release_mark(r) for n, r in tables.gates.items()}
+    expect(marks == {"gate-srv": "ship", "gate-two": "ship", "gate-old": "ship", "gate-nw": "ship", "gate-pin": "kernel",
+                     "gate-spill": "kernel", "gate-plain": "", "gate-com": ""},
+           f"blocking: the release mark is the topic's `+` suffix, '' with none: {marks}")
+    bl = blocking_set(tables, classes, {}, set())
+    expect(bl.names == ["gate-pin", "gate-spill", "gate-srv", "gate-two"],
+           f"blocking: a main family's +ship rows and every +kernel row block, an unmarked row never does: {bl.names}")
+    expect(sorted(bl.left) == ["gate-nw", "gate-old"] and "outside this release's real tier" in bl.left["gate-old"]
+           and "the night runs it" in bl.left["gate-old"],
+           f"blocking: an other family's +ship row is left out with its reason: {bl.left}")
+    bl_new = blocking_set(tables, classes, {}, {"fam-new"})
+    expect("gate-nw" in bl_new.names and "gate-old" not in bl_new.names,
+           f"blocking: a family new since the last tag blocks on its +ship rows, an old other family does not: {bl_new.names}")
+    expect("gate-pin" in bl.names and tables.gates["gate-pin"].family == "fam-old",
+           "blocking: a +kernel row of an other family blocks every release")
+    # FAIL-first: without the scope rule every +ship row would block; without the kernel rule an other family's pin would not
+    no_scope = sorted(n for n, m in marks.items() if m)
+    expect(no_scope != bl.names, f"blocking mutant: a set that ignores the family's scope differs from the rule's ({no_scope})")
+    kernel_scoped = sorted(n for n in bl.names if not (marks[n] == "kernel" and tables.gates[n].family == "fam-old"))
+    expect(kernel_scoped != bl.names, f"blocking mutant: a set that scopes +kernel by family differs from the rule's ({kernel_scoped})")
+    # the named errors
+    for bad, why in (("gate-x\tfamily\tfam-main\tserve+fast\t-", "carries the mark 'fast'"),
+                     ("gate-x\tfamily\tfam-main\t+ship\t-", "names no topic before its release mark"),
+                     ("gate-x\ttooling\t\thost+ship\t-", "+ship marks one family's serve or two-card gate")):
+        t = table([bad])
+        expect(refused(lambda t=t: blocking_set(t, {**classes, "gate-x": ("A", "fixed")}, {}, set()), why),
+               f"blocking: {bad.split(chr(9))[3]!r} on a {bad.split(chr(9))[1]} row is refused naming {why!r}")
+    tables = table()
+    expect(refused(lambda: blocking_set(tables, {n: c for n, c in classes.items() if n != "gate-srv"}, {}, set()),
+                   "the batch's classifier does not name it"),
+           "blocking: a marked gate the classifier does not name is a named error")
+    for cls, kind in (("D", "needs-env"), ("D", "fixture-only"), ("T", "timed"), ("D", "variant")):
+        expect(refused(lambda cls=cls, kind=kind: blocking_set(tables, {**classes, "gate-spill": (cls, kind)}, {}, set()),
+                       "a real-tier batch does not run it"),
+               f"blocking: a marked gate the real tier does not run ({cls}, {kind}) is a named error")
+    expect(blocking_set(tables, {**classes, "gate-spill": ("D", "real-only")}, {}, set()).names == bl.names,
+           "blocking: a real-only marked gate (a deferred kind the real tier runs) still blocks")
+    # the tree's own table: the rule's set holds a main family's serve gate and gate-ptx-spill, and no weekly recipe
+    real = class_tables(ROOT)
+    own = {n: release_mark(r) for n, r in real.gates.items() if release_mark(r)}
+    expect(own.get("gate-ptx-spill") == "kernel" and any(m == "ship" for m in own.values())
+           and not any(n.startswith(WEEKLY_PREFIX) for n in own),
+           f"blocking: the tree's table marks gate-ptx-spill +kernel and some +ship row, and no weekly recipe: {sorted(own)}")
+    # the dry-run plan line the wall is read from
+    m = PLAN_WALL.search("x\ngate-batch: predicted laneA=35s laneB=327s laneX=1452s chain=0s wall=1786s build-lane=0s (derived: y)\n")
+    expect(m is not None and m.group(2) == "1786", f"blocking: the plan line's wall is read: {m and m.groups()}")
+    expect(PLAN_WALL.search("gate-batch: predicted laneA=35s\n") is None, "blocking: a plan line with no wall= is not read as one")
+    m = PLAN_ITEMS.search("gate-batch: dry run — 71 items (and 36 deferred to the real tier: …), lanes 2\n")
+    expect(m is not None and m.group(1) == "71", f"blocking: the dry run's item count is read: {m and m.groups()}")
 
 
 # The key contracts' jobs: each tuple is one call of key_self_test, so its pieces share one scratch tree's cold start. Every KEY_PIECES
@@ -17422,9 +17647,11 @@ def build_parser() -> argparse.ArgumentParser:
     op = sub.add_parser("opens", help="per RECIPE, whether a cargo target it builds or runs reaches the fixture fence (Tier::check_file): opens<TAB>recipe<TAB>pkg:kind:target<TAB>path:line<TAB>called, or none<TAB>recipe (tools/gate-batch.sh's real-file deferral)")
     op.add_argument("items", nargs="*", metavar="RECIPE")
     op.add_argument("--explain", action="store_true", help="the fence, the openers and each recipe's targets, on stderr")
-    rl = sub.add_parser("release-list", help="the release batch's list: every common and tooling gate, every gate of a main family or of a family new since BASE (and their weekly and check recipes), affected(BASE) and the CUDA GGUF gates in scope; every other family's gates are left out by name (monthly rotation)")
+    rl = sub.add_parser("release-list", help="the full release list, which the night runs (tools/nightly-real.sh): every common and tooling gate, every gate of a main family or of a family new since BASE (and their weekly and check recipes), the blocking set, affected(BASE) and the CUDA GGUF gates in scope; every other family's gates are left out by name (monthly rotation). --blocking: the gates a release itself must see green at the tag's keys")
     rl.add_argument("base", nargs="?", default="main", help="the release tag (or TAG..HEAD): the diff the list covers and the tree a new family is told against")
-    rl.add_argument("--wall", action="store_true", help="the predicted wall of the list on stderr (the real tier's medians)")
+    rl.add_argument("--blocking", action="store_true", help="the blocking set alone: the class-table rows whose topic carries a release mark (+ship while the family is in the release's real tier, +kernel always)")
+    rl.add_argument("--classes", help="a saved `tools/gate-batch.sh --tier fixture --classes` (default: run it)")
+    rl.add_argument("--wall", action="store_true", help="the predicted wall of the list on stderr (the real tier's medians; with --blocking, the batch's own dry-run plan)")
     rl.add_argument("--lock-wait", type=float, default=LOCK_WAIT, help="the factor the predicted wall carries over the medians (the lock waits)")
     rl.add_argument("--times", default=os.environ.get("BLOOMERY_GATE_TIMES", os.path.expanduser("~/.cache/bloomery/gate-times.tsv")), help="the times file the medians come from")
     rl.add_argument("--ledger", default=os.environ.get("BLOOMERY_GATE_LEDGER", os.path.expanduser("~/.cache/bloomery/gate-ledger.tsv")), help="the green ledger the last green dates of the families left out come from")
