@@ -1237,7 +1237,11 @@ pub(crate) mod synthetic {
             offset += bytes.div_ceil(32) * 32;
         }
         b.resize(b.len().div_ceil(32) * 32, 0);
-        let path = std::env::temp_dir().join(format!("bloomery-{}-{tag}.gguf", std::process::id()));
+        // One file a call: tests that build the same tag run on parallel threads of one process.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("bloomery-{}-{seq}-{tag}.gguf", std::process::id()));
         // The zero-filled data is the file's length past the header, so a header of large
         // tensors writes only its header's bytes.
         let file = std::fs::File::create(&path).expect("create the synthetic header");
