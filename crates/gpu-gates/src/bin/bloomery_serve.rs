@@ -395,7 +395,7 @@ models (the --model word is optional with a model file: the file's architecture 
                 ),
                 Model::Raon1 => matches!(Arch::from_name(arch), Ok(Arch::Raon1)),
                 Model::MuseSpark => matches!(Arch::from_name(arch), Ok(Arch::MuseSpark)),
-                Model::Flint => matches!(Arch::from_name(arch), Ok(Arch::Flint)),
+                Model::Flint => matches!(Arch::from_name(arch), Ok(Arch::Flint | Arch::ExaoneMoe)),
                 Model::KimiK3 => matches!(Arch::from_name(arch), Ok(Arch::KimiK3)),
                 Model::MistralLarge4 => matches!(Arch::from_name(arch), Ok(Arch::MistralLarge4)),
                 Model::Host => arch == "deepseek2",

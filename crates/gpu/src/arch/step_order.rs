@@ -345,10 +345,12 @@ pub fn of(arch: model::arch::Arch) -> StepOrder {
         Arch::GemmaEmbedding => ("GemmaEmbedding", GEMMA_ENCODER),
         Arch::GemmaEmbedding2 => ("GemmaEmbedding2", GEMMA_ENCODER),
         Arch::MuseSpark => ("MuseSpark", MUSE_SPARK),
-        // Reader only, each of them: a neutral decoding order, not a
-        // runnable step.
+        // The head128 program's bodies (gpu-flint) launch no ordered table of
+        // their own: the listing is neutral, every site once, so a fault word
+        // still decodes.
         Arch::Flint => ("Flint", FaultSite::ALL),
         Arch::ExaoneMoe => ("ExaoneMoe", FaultSite::ALL),
+        // Reader only: a neutral decoding order, not a runnable step.
         Arch::MistralLarge4 => ("MistralLarge4", FaultSite::ALL),
         Arch::KimiK3 => ("KimiK3", SOLAR2),
     };

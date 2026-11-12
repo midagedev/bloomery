@@ -66,9 +66,8 @@ pub const AVAILABLE: &[Available] = &[
                     head: 128,
                     value: 128,
                     group: 8,
-                    window: None | Some(513),
-                    sinks: true,
                     scaled: false,
+                    ..
                 }
             )
         },
@@ -95,8 +94,9 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::FlintBody],
-        at: "gpu/src/route_body.rs sigmoid_floor_256_6",
-        runs: |n| routes(n, &[RouterBody::SigmoidFloor]),
+        at: "gpu/src/route_body.rs sigmoid_floor_256_6 and gpu-deepseek41/src/router.rs \
+             mimo2 (the program's two instances)",
+        runs: flint_router,
     },
     Available {
         programs: &[Program::FlintBody],
@@ -105,8 +105,24 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::FlintBody],
-        at: "gpu-deepseek41/src/shared_routed.rs dense-leading gated blocks",
-        runs: |n| matches!(n, Need::DenseFfn { ff } if ff.is_multiple_of(256)),
+        at: "gpu-deepseek41/src/shared_routed.rs rule_of (the gate-first clamp, routed and shared)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::ExpertAct {
+                    act: models::Act::SwiGluGateFirst { .. },
+                    ..
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::FlintBody],
+        at: "gpu-deepseek41/src/shared_routed.rs dense-leading gated blocks (the acts rule_of maps)",
+        runs: |n| match n {
+            Need::DenseFfn { ff } | Need::DenseSwigluGateFirst { ff } => ff.is_multiple_of(256),
+            _ => false,
+        },
     },
     Available {
         programs: &[Program::Deepseek41Chain],
@@ -1041,6 +1057,21 @@ pub fn turns_as_neox(mode: RopeMode, dims: u32) -> bool {
 /// is an item here too.
 pub(crate) fn routes(n: &Need, bodies: &[RouterBody]) -> bool {
     matches!(n, Need::Router(s) if select_router(*s).is_ok_and(|r| bodies.contains(&r.body)))
+}
+
+/// Whether `n` is a router need of one of the Flint body's two instances
+/// (`gpu/src/route_body.rs` `sigmoid_floor_256_6`, floor or biased floor at
+/// 256/6; `gpu-deepseek41/src/router.rs` `mimo2`, biased selected-sum at
+/// 256/8): the rule and the (experts, kept) pair of an instance the program
+/// imports, `select_router` holding the shape to a row that runs it.
+pub(crate) fn flint_router(n: &Need) -> bool {
+    use models::shape::rules;
+    let Need::Router(s) = n else {
+        return false;
+    };
+    ((s.experts, s.top_k) == (256, 6)
+        && (s.rule == rules::SIGMOID_FLOOR || s.rule == rules::BIASED_SIGMOID_FLOOR))
+        || ((s.experts, s.top_k) == (256, 8) && s.rule == rules::BIASED_SIGMOID)
 }
 
 /// Whether `n` is a shared expert without a sigmoid gate (`gpu-deepseek41/src/shared_routed.rs`).
