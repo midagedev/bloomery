@@ -214,9 +214,19 @@ mod gate {
 
     const NAME: &str = "gate_deepseek41_tier";
     /// The real file's tier depth, as the literal this gate carried before [`tier_depth`] derived
-    /// it: the (b′) plan's 881 tier experts over its 38 hybrid layers are 23.2 a layer, which
-    /// rounds to 23. The real tier prints the derived depth beside it and requires them equal.
-    const REAL_K3: usize = 23;
+    /// it: the (b′) plan's 831 tier experts over its 38 hybrid layers are 21.9 a layer, which
+    /// rounds to 22. The real tier prints the derived depth beside it and requires them equal.
+    // PIN(2026-11-12): 831 tier experts where the plan gave 881 (23). What took the 50 is the
+    // prompt batch's parts: the plan now counts a prompt front on every card — the tier's too —
+    // and takes it off the card's expert budget before the spread (PlanInputs::plan_slots_nodes'
+    // `fronts`, charged by loaded_routed's `reserve` and grown into the card's prompt term), and
+    // a one-slot plan's pass heads add none (slots < 2) while the plan's levers carry no K/V
+    // floor, so no other card term of that batch moved the count. The front's bytes at the tier
+    // the plan settles at run time; no log line prints the (b′) tier card's term list.
+    // FAIL-first: the logged run derived 22 against the old literal 23; a change that hands the
+    // tier back those 50 experts' bytes (dropping the front from its budget) derives 23 and is
+    // red, as is any term that takes or gives ≳17 experts (one depth step at 38 layers).
+    const REAL_K3: usize = 22;
     /// Prompt positions, fed one decode step each: the batch arm's length, whose
     /// prose sends a slot to every tier layer of the real file.
     const PROMPT: usize = 64;

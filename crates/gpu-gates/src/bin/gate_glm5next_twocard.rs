@@ -128,7 +128,9 @@
 //! (`generate::Place::choose`, by the GLM family's rule): on this gate's two
 //! cards its `place unset` record keeps `bp`, the offer's tier at or past the
 //! rule's break-even, naming the tier's experts in the plan at the child's
-//! default context and the rule's break-even and basis. Three loads, one a
+//! default context — held to this gate's own plan of the same question
+//! ([`tier_experts_here`]), the census the only difference — and the rule's
+//! break-even and basis. Three loads, one a
 //! process.
 //!
 //! Tiers (`BLOOMERY_TIER`): the card budget is [`BUDGET`] in the real tier and the header's in the fixture tier
@@ -145,6 +147,10 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "glm5next")]
 #[path = "shared/glm5next_tier.rs"]
 mod glm5next_tier;
+
+#[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_place.rs"]
+mod glm_place;
 
 #[cfg(feature = "glm5next")]
 #[path = "shared/quiet.rs"]
@@ -232,9 +238,18 @@ mod gate {
     /// the offer's tier card, and the card file that decides them.
     const BREAK_EVEN: u64 = 526;
     const TIER_BASIS: &str = "docs/cards/glmbp-ab.card";
-    /// The experts the child's plan of `bp` puts on this box's 3090 at its
-    /// default context, a band for the free bytes each census reads.
-    const BP_TIER_EXPERTS: std::ops::RangeInclusive<u64> = 1503..=1529;
+    /// How far the child's `place unset` tier count may sit from this gate's
+    /// own plan of the same question ([`tier_experts_here`]): two census
+    /// readings of the same locked card seconds apart, in experts the plan
+    /// spread within.
+    // PIN(2026-11-12): ±13 experts, the half-width the literal band carried
+    // (1503..=1529, about 15,331,000 B an expert) before the count moved to
+    // the gate's own plan as its centre: the prompt reserve the plan now
+    // counts on every card — the tier's too — grew to the whole first prompt
+    // pass and the child's 1480 fell out of the band. The drift itself covers
+    // far less (two readings of the same idle card), and the centre moves
+    // with the code, so the width stays the conservative bound it was.
+    const TIER_DRIFT: u64 = 13;
 
     /// The prompt: the `d1k` set's prefill ids.
     fn prompt() -> Result<Vec<u32>, GateError> {
@@ -504,7 +519,7 @@ mod gate {
             Arm::Bits => bits(&cfg, &inputs)?,
             Arm::Residency => residency_arm(&cfg, &inputs)?,
             Arm::Nextn => nextn_arm(&cfg, &inputs)?,
-            Arm::Records => records_arm()?,
+            Arm::Records => records_arm(&levers)?,
         };
         println!("{NAME}: {}", tier::tally_line());
         if !pass {
@@ -1269,10 +1284,11 @@ mod gate {
     /// of the devices the placement resolves to, in order; and the same
     /// check on the line with its first card's name grown by one letter
     /// inside the brackets, which must be red.
-    fn records_arm() -> Result<bool, GateError> {
+    fn records_arm(levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let prompt = prompt()?;
         let ids = &prompt[..RECORD_TOKENS];
         let mut pass = true;
+        let mut child_ctx = None;
         for place in [Place::A, Place::Bp] {
             let want = card_words(place)?;
             let line = held(
@@ -1290,6 +1306,13 @@ mod gate {
                         mutant.line() != l.line() && cards_named(&mutant, &want) == Ok(false);
                     let tier = l.opt_u64("tier_experts")?;
                     let tier_bytes = l.opt_u64("tier_bytes")?;
+                    if !place.tier_cards().is_empty() {
+                        // The unset child below plans at the same default
+                        // context this `--place bp` child ran: its record is
+                        // where the gate reads the figure without restating
+                        // the CLI's `--ctx` default.
+                        child_ctx = Some(l.u64("ctx")?);
+                    }
                     let tier_ok = match place.tier_cards().is_empty() {
                         true => tier.is_none() && tier_bytes.is_none(),
                         false => tier.is_some_and(|n| n > 0),
@@ -1317,7 +1340,11 @@ mod gate {
         // break-even and basis. FAIL-first: a CLI that keeps a placement of
         // its own prints no `place unset` line, and the record read is red.
         // The rule's choice reads the plan's tier experts at the real file's size against the
-        // family's break-even: a clause of the real file.
+        // family's break-even: a clause of the real file. The count itself is
+        // held to what the same shared question asks on this gate's own
+        // census ([`tier_experts_here`]), not a literal: the census moves,
+        // the plan's terms move with the code, and this family's literal
+        // bands have gone red twice.
         let unset = !tier::run_clause(
             "records-unset: the unset rule keeps bp at the real file's tier size",
             Tag::FileBound,
@@ -1326,14 +1353,21 @@ mod gate {
             unset_record(ids).and_then(|p| {
                 let (place, why) = (p.word("place")?, p.text("why")?);
                 let tier = p.opt_u64("tier_experts")?;
+                let ctx = child_ctx.ok_or("the --place bp child's load record named no ctx")?;
+                let (here, terms) = tier_experts_here(levers, ctx)?;
                 let ok = place == "bp"
                     && why == "two cards, tier at or past the break-even"
-                    && tier.is_some_and(|t| BP_TIER_EXPERTS.contains(&t) && t >= BREAK_EVEN)
+                    && tier.is_some_and(|t| {
+                        (here.saturating_sub(TIER_DRIFT)..=here + TIER_DRIFT).contains(t)
+                            && t >= BREAK_EVEN
+                    })
                     && p.opt_u64("break_even")? == Some(BREAK_EVEN)
                     && p.opt_word("basis")? == Some(TIER_BASIS);
                 println!(
                     "no --place: place unset place={place} why={why} tier_experts={tier:?} \
-                     break_even={:?} basis={:?}: {}",
+                     break_even={:?} basis={:?}: {} (this gate's plan at the child's ctx {ctx} \
+                     holds {here} ±{TIER_DRIFT} on its own census; the tier card's terms \
+                     {terms})",
                     p.opt_u64("break_even")?,
                     p.opt_word("basis")?,
                     verdict(ok)
@@ -1343,5 +1377,59 @@ mod gate {
         );
         pass &= unset;
         Ok(pass)
+    }
+
+    /// The unset rule's question asked by this gate on its own census, through
+    /// the same shared pieces the child's rule runs (`glm_place::tier_experts`:
+    /// the offer's machine — its checkpoints reserved at `ctx` — and the plan
+    /// the child opens): the child's context `ctx` (its `load` record's), its
+    /// plan levers, its draft (`BLOOMERY_DRAFT=mtp` plans the NextN layer
+    /// beside the target), one KDA lane (the child runs no `--pair`) and its
+    /// slot count (`BLOOMERY_GEN_SLOTS`). The tier card's term list the plan
+    /// charged returns beside the count, so a re-pin reads from the log what
+    /// moved it.
+    fn tier_experts_here(
+        levers: &bloomery_levers::Levers,
+        ctx: u64,
+    ) -> Result<(u64, String), GateError> {
+        let offer = Place::by_cards(&bloomery_gpu_gates::gpu_census::census()?)?;
+        let inputs = PlanInputs::read(&glm5next_tier::open()?)?;
+        let nextn = match levers.draft() {
+            Some("mtp") => Some(NextnInputs::read(&inputs)?),
+            _ => None,
+        };
+        let plan_levers = PlanLevers::from_levers(levers)?;
+        let slots = levers.gen_slots();
+        let machine = glm_machine(
+            offer,
+            crate::glm_place::tier_batch(offer, &inputs)?,
+            slots,
+            checkpoint_price(&inputs)?,
+            ctx,
+        )?(inputs.model.layers);
+        let plan = match &nextn {
+            None => inputs.plan_slots(&machine, ctx, &plan_levers, KdaLanes::One, slots)?,
+            Some(n) => {
+                inputs
+                    .plan_nextn_slots(&machine, ctx, &plan_levers, n, slots)?
+                    .plan
+            }
+        };
+        let tier = plan.tier_n_l.iter().flatten().sum::<u64>();
+        let terms = plan
+            .cards
+            .get(1)
+            .map(|t| {
+                format!(
+                    "[{}]",
+                    t.terms()
+                        .iter()
+                        .map(|(n, b)| format!("{n}={b}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
+            .unwrap_or_else(|| "no tier card".to_owned());
+        Ok((tier, terms))
     }
 }

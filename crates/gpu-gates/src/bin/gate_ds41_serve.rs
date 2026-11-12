@@ -313,7 +313,7 @@ mod gate {
     use bloomery_gpu_gates::beside::Beside;
     use bloomery_gpu_gates::bind::nvidia_smi_index;
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
-    use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::generate::{Place, stage_host_page};
     use bloomery_gpu_gates::logits_band::{Parted, Pick, parted};
     use bloomery_gpu_gates::prompts::MARGIN_FLOOR;
     use bloomery_gpu_gates::record;
@@ -1537,7 +1537,7 @@ mod gate {
         println!("ctx: {line}");
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::read(&split)?;
+        let inputs = seat_inputs(&split, Place::Gate.card_specs()?[0])?;
         let limit = CtxLimit {
             trained: split
                 .arch_get_u64("context_length")
@@ -2130,7 +2130,7 @@ mod gate {
         // The run opened no card, so the re-plan reads the same room.
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::read(&split)?;
+        let inputs = seat_inputs(&split, Place::Bp.card_specs()?[0])?;
         let tier = crate::ds41_place::tier_batch(Place::Bp, &inputs.hp);
         let slots = NonZeroUsize::MIN;
         let ask = |vision: Option<u64>| {
@@ -2275,7 +2275,7 @@ mod gate {
         let url = |p: &str| format!("http://{addr}{p}");
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::read(&split)?;
+        let inputs = seat_inputs(&split, Place::Bp.card_specs()?[0])?;
         let machine_of = Place::Bp.machine(None, Some(place::tier_batch(&inputs.hp)))?;
         let mut machine = machine_of(inputs.model.layers);
         machine.cards[0].free_bytes = Some(server_card_free(&err_log)?);
@@ -2611,7 +2611,7 @@ mod gate {
         println!("props engine {e}");
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
-        let inputs = PlanInputs::read(&split)?;
+        let inputs = seat_inputs(&split, workstation::RTX_3090)?;
         let mut spec = workstation::RTX_3090;
         spec.free_bytes = Some(server_card_free(err_log)?);
         let machine = workstation::plan_on(spec, inputs.model.layers);
@@ -2941,7 +2941,7 @@ mod gate {
         println!("props engine {e}");
         let path = ref_model_path()?;
         let split = Split::open(&path).map_err(|err| format!("open {}: {err}", path.display()))?;
-        let inputs = PlanInputs::read(&split)?;
+        let inputs = seat_inputs(&split, workstation::RTX_3090)?;
         let mut spec = workstation::RTX_3090;
         spec.free_bytes = Some(server_card_free(err_log)?);
         let machine = workstation::plan_on(spec, inputs.model.layers);
@@ -3099,7 +3099,7 @@ mod gate {
         let on = dspark::draft_seat(Place::Bp, &draft, &path)?;
         let reserve = on.reserve.bytes;
         let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-        let inputs = PlanInputs::read(&split)?;
+        let inputs = seat_inputs(&split, Place::Bp.card_specs()?[0])?;
         let machine_of = Place::Bp.machine(Some(on), Some(place::tier_batch(&inputs.hp)))?;
         std::fs::create_dir_all(&a.dir)?;
         let exe = Served::exe()?;
@@ -3251,10 +3251,30 @@ mod gate {
         Ok(free)
     }
 
+    /// [`PlanInputs`] of the real file with the page a host-capable room takes
+    /// on `stage` set, read as the server's seat reads it before its plans
+    /// (`serve_seats::ds41`: `generate::stage_host_page` of the placement's
+    /// stage card). Every re-derivation in this gate plans under the server's
+    /// K/V default (`run`'s `place`, spill past a floor), whose host rows the
+    /// plan counts at that page — a plan under spill without it refuses by
+    /// name, and a page of another card rounds the rows differently.
+    fn seat_inputs(split: &Split, stage: workstation::CardSpec) -> Result<PlanInputs, GateError> {
+        let mut inputs = PlanInputs::read(split)?;
+        inputs.kv_host_page = Some(stage_host_page(stage)?);
+        Ok(inputs)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let levers = bloomery_levers::at_main(crate::serve_levers::ACTS_ON)?;
         let a = parse_args()?;
-        let place = PlanLevers::from_levers(&levers)?;
+        // The levers the server plans under: the parsed levers with the K/V
+        // levers the server leaves unset resolved to its own default
+        // (`serve_levers::KV_DEFAULT`: the experts spread at a floor of 8,192
+        // positions, the selected rows' pages past it spilling to the host),
+        // as the qwen38 serve gate resolves its seat's. Every re-derivation
+        // below plans with these and the page [`seat_inputs`] reads, so a
+        // gate plan and the server's own are the same plan.
+        let place = PlanLevers::from_levers_with(&levers, crate::serve_levers::KV_DEFAULT)?;
         if a.mmproj && levers.draft().is_some() {
             return Err(format!(
                 "--mmproj takes no draft; BLOOMERY_DRAFT={:?} is set",

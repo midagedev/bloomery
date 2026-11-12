@@ -39,8 +39,9 @@
 //! each of the three a `place unset` record of its word and `why=set` (no
 //! `tier_experts`: the rule never asked the plan under the flag); and
 //! with no `--place`, on this box's two cards, `place unset place=bp`
-//! (why `two cards, tier at or past the break-even`, its `tier_experts` in
-//! [`BP_TIER_EXPERTS`] and at least [`BREAK_EVEN`], its `break_even` that
+//! (why `two cards, tier at or past the break-even`, its `tier_experts`
+//! within [`TIER_DRIFT`] of this gate's own plan of the same question
+//! ([`tier_experts_here`]) and at least [`BREAK_EVEN`], its `break_even` that
 //! count and its `basis` the rule's card file), the unset rule's
 //! `mtp` and `mid-p0-s1`, and a plan on the cards `--place bp` plans:
 //!
@@ -289,6 +290,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "glm5next")]
+#[path = "shared/glm5next_place.rs"]
+mod glm_place;
+
+#[cfg(feature = "glm5next")]
 mod gate {
     use std::fs::File;
     use std::path::{Path, PathBuf};
@@ -298,8 +303,10 @@ mod gate {
     use std::time::Duration;
 
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
+    use bloomery_gpu_gates::generate::Place;
+    use bloomery_gpu_gates::gpu_census;
     use bloomery_gpu_gates::record::{self, Log};
-    use bloomery_gpu_gates::residency38::{Seqs, reserve_checkpoints};
+    use bloomery_gpu_gates::residency38::{Seqs, glm_machine, reserve_checkpoints};
     use bloomery_gpu_gates::serve_client::{
         self, MAX_CTX, MaxCtx, PrefixRestore, agree, base64, beside, card_bytes_hold_at_max_ctx,
         check, completion, curl, draft_counts, ids_of, json_of, metric, parse_ids, plan_run,
@@ -312,6 +319,7 @@ mod gate {
     use model::arch::glm5next::place::{
         KdaLanes, NextnInputs, ORACLE_POSITIONS, PROMPT_GROUP, PlanInputs,
     };
+    use model::placement::ctx_ask::DEFAULT_SLOTS;
     use model::placement::{PlanLevers, workstation};
     use serde_json::{Value, json};
     use threads::helper::{Placement, spawn_helper};
@@ -447,19 +455,21 @@ mod gate {
     /// The drafted arm's residency word: no seed expert pinned, one spare a
     /// layer.
     const RESIDENCY_WORD: &str = "mid-p0-s1";
-    /// The experts the seat's plan of `bp` puts on this box's 3090 at the
-    /// seat's defaults, a band for the free bytes each census reads.
-    // PIN(2026-11-09): the seat's default context is 262,144 now, and the
-    // plan's prompt reserve holds the latent attention's buffers
-    // (`place::prompt_attn_bytes`, 36,900,960 B there), which the planner
-    // keeps off every card's expert budget, the tier's too. At the census of
-    // A6000 48,793,452,816 / 3090 23,190,643,712 B free the plan without them
-    // put 1,460 experts (22,388,736,000 B, 15,334,751 B each on average) on
-    // the 3090; 36,900,960 B is 2.41 of them, so 1,457 or 1,458 by the slack
-    // left under one expert [derived]. The band keeps its 25 experts about
-    // that count, about 190 MB of census drift each way. Was 1490..=1515 at
-    // the 16,384 default.
-    const BP_TIER_EXPERTS: std::ops::RangeInclusive<u64> = 1445..=1470;
+    /// How far the seat's `place unset` tier count may sit from this gate's
+    /// own plan of the same question ([`tier_experts_here`]): two census
+    /// readings of the same locked card seconds apart, in experts the plan
+    /// spread within.
+    // PIN(2026-11-12): ±13 experts, the width the literal band carried
+    // (about 15,335,000 B an expert, ~190 MB of census drift each way)
+    // before the count moved to the gate's own plan as the band's centre:
+    // the prompt reserve grew to the whole first prompt pass (front,
+    // attention, shared buffers, tiles and every unit), which the planner
+    // keeps off every card's expert budget — the tier's too — and the seat's
+    // 1,435 fell 22 experts under the band. The centre moves with the code
+    // now, so the width covers only the drift, and stays the conservative
+    // bound it was. Was 1,445..=1,470, and 1,490..=1,515 at the 16,384
+    // default before that.
+    const TIER_DRIFT: u64 = 13;
     /// The GLM family's rule as the seat names it: the tier count the unset
     /// rule keeps the tier card at (glm_place::TIER_RULE's, the card file
     /// its `basis`).
@@ -861,7 +871,7 @@ mod gate {
     /// and run the residency's default word, `--place gate` neither; each
     /// names its word `set`, and a run with no `--place` takes the cards'
     /// rule.
-    fn unset_rule(dir: &Path) -> Result<bool, GateError> {
+    fn unset_rule(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
         let mut ok = true;
         let picks = |lines: &[String], draft: &str, residency: &str| -> Result<bool, GateError> {
             let log = seat_log(lines);
@@ -902,8 +912,10 @@ mod gate {
         // The placement every run names (`place unset`): under the flag its
         // word, `why=set` and no tier count (the rule never asked the plan);
         // with none, on this box's two cards, the plan of `bp` kept — its
-        // tier at or past the break-even, the experts in
-        // [`BP_TIER_EXPERTS`] — the unset rules of a serving placement, and
+        // tier at or past the break-even, the experts within [`TIER_DRIFT`]
+        // of this gate's own plan of the same question
+        // ([`tier_experts_here`], the census the only difference) — the
+        // unset rules of a serving placement, and
         // its plan on the cards `--place bp` plans (the `devices` list holds
         // each card's usable bytes, not its free ones). FAIL-first: a seat
         // that keeps `a` unset, or drops the tier it should keep, prints
@@ -957,16 +969,22 @@ mod gate {
             let p = placed(&unset)?;
             let (plan_place, cards) = devices(&unset)?;
             let (_, bp_cards) = devices(&bp)?;
+            let ctx = seat_log(&unset).one(&record::PLAN)?.u64("ctx_max")?;
+            let (here, terms) = tier_experts_here(levers, ctx)?;
             println!(
                 "no --place: place unset place={} why={} tier_experts={:?} \
                  break_even={:?} basis={}; plan place={plan_place} devices \
-                 {cards:?} (--place bp: {bp_cards:?})",
+                 {cards:?} (--place bp: {bp_cards:?}); this gate's plan at the \
+                 seat's ctx {ctx} holds {here} ±{TIER_DRIFT} on its own census, \
+                 the tier card's terms {terms}",
                 p.place, p.why, p.tier_experts, p.break_even, p.basis
             );
             p.place == "bp"
                 && p.why == "two cards, tier at or past the break-even"
-                && p.tier_experts
-                    .is_some_and(|t| BP_TIER_EXPERTS.contains(&t) && t >= BREAK_EVEN)
+                && p.tier_experts.is_some_and(|t| {
+                    (here.saturating_sub(TIER_DRIFT)..=here + TIER_DRIFT).contains(t)
+                        && t >= BREAK_EVEN
+                })
                 && p.break_even == Some(BREAK_EVEN)
                 && p.basis == "docs/cards/glmbp-ab.card"
                 && picks(&unset, "mtp", RESIDENCY_WORD)?
@@ -1030,6 +1048,56 @@ mod gate {
             check(&mut ok, "plan_names_the_cards_free_bytes", named);
         }
         Ok(ok)
+    }
+
+    /// The unset rule's question asked by this gate on its own census, through
+    /// the same shared pieces the seat's rule runs (`glm_place::tier_experts`,
+    /// the call the seat's `Placed::of` makes with no encoder or side model):
+    /// the offer's machine, its checkpoints reserved at the seat's chosen
+    /// context `ctx` — read from the child's own `plan` record, so no context
+    /// rule is restated here — the seat's plan levers, the NextN layer its
+    /// unset draft runs (`mtp`, the word the `unset_place_bp_drafts…` clause
+    /// reads from the same records, so a seat that stops drafting is caught
+    /// there first) at [`DEFAULT_SLOTS`] slots, the count a `--plan` run with
+    /// no `--parallel` asks at (the nextn plan carries its own two KDA lanes).
+    /// The tier card's term list the plan charged returns beside the count,
+    /// so a re-pin reads from the log what moved it.
+    fn tier_experts_here(
+        levers: &bloomery_levers::Levers,
+        ctx: u64,
+    ) -> Result<(u64, String), GateError> {
+        let offer = Place::by_cards(&gpu_census::census()?)?;
+        let path = ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let inputs = PlanInputs::read(&split)?;
+        let nextn = NextnInputs::read(&inputs)?;
+        let plan_levers = PlanLevers::from_levers(levers)?;
+        let machine = glm_machine(
+            offer,
+            crate::glm_place::tier_batch(offer, &inputs)?,
+            DEFAULT_SLOTS,
+            checkpoint_price(&inputs)?,
+            ctx,
+        )?(inputs.model.layers);
+        let plan = inputs
+            .plan_nextn_slots(&machine, ctx, &plan_levers, &nextn, DEFAULT_SLOTS)?
+            .plan;
+        let tier = plan.tier_n_l.iter().flatten().sum::<u64>();
+        let terms = plan
+            .cards
+            .get(1)
+            .map(|t| {
+                format!(
+                    "[{}]",
+                    t.terms()
+                        .iter()
+                        .map(|(n, b)| format!("{n}={b}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
+            .unwrap_or_else(|| "no tier card".to_owned());
+        Ok((tier, terms))
     }
 
     /// The stage card's free bytes as a server's own `plan` record read
@@ -2521,7 +2589,7 @@ mod gate {
 
     /// The plain arm (the module header).
     fn plain(dir: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
-        let mut ok = unset_rule(dir)?;
+        let mut ok = unset_rule(dir, levers)?;
         ok &= ctx(dir, levers)?;
         let err_log = dir.join("server.err");
         let mut served = Served::spawn(&SERVER_ARGS, dir, PLAIN)?;
