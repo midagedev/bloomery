@@ -1,0 +1,72 @@
+{
+  "name": "exaoneh",
+  "arch": "exaone-moe",
+  "source": "LGAI-EXAONE/K-EXAONE-2.0-750B-A37B-FP8",
+  "rev": "b219707595c1330a95964abf9a06e38dae2f062c",
+  "expect": {"tensors": 118310, "data_bytes": 752076344832},
+  "layers": [0, 1, 2, 5, 62, 65],
+  "layer_prefix": "model.layers.",
+  "keep": [
+    "model.embed_tokens.weight",
+    "model.norm.weight",
+    "lm_head.weight",
+    "mtp.fc.weight",
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.post_attention_layernorm.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp.layers.0.self_attn.v_proj.weight",
+    "mtp.layers.0.self_attn.o_proj.weight",
+    "mtp.layers.0.self_attn.q_norm.weight",
+    "mtp.layers.0.self_attn.k_norm.weight",
+    "mtp.layers.0.mlp.gate_proj.weight",
+    "mtp.layers.0.mlp.up_proj.weight",
+    "mtp.layers.0.mlp.down_proj.weight"
+  ],
+  "drop": [],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "generation_config.json",
+    "chat_template.jinja"
+  ],
+  "widths": {
+    "expert_ff": {"keep": 512, "align": 128},
+    "dense_ff": {"keep": 1024, "align": 128}
+  },
+  "planes": [
+    {"base": "mlp.experts.*.gate_proj", "axis": "rows", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.experts.*.up_proj", "axis": "rows", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.experts.*.down_proj", "axis": "cols", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.shared_experts.gate_proj", "axis": "rows", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.shared_experts.up_proj", "axis": "rows", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.shared_experts.down_proj", "axis": "cols", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.gate_proj", "axis": "rows", "width": "dense_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.up_proj", "axis": "rows", "width": "dense_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.down_proj", "axis": "cols", "width": "dense_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mtp.layers.*.mlp.gate_proj", "axis": "rows", "width": "dense_ff",
+     "members": {"weight": 1}},
+    {"base": "mtp.layers.*.mlp.up_proj", "axis": "rows", "width": "dense_ff",
+     "members": {"weight": 1}},
+    {"base": "mtp.layers.*.mlp.down_proj", "axis": "cols", "width": "dense_ff",
+     "members": {"weight": 1}}
+  ],
+  "config": {
+    "layer_count": "num_hidden_layers",
+    "widths": {"intermediate_size": "dense_ff", "moe_intermediate_size": "expert_ff"},
+    "per_layer": ["layer_types", "mlp_layer_types", "sliding_windows", "swiglu_limits"],
+    "layer_names": []
+  }
+}

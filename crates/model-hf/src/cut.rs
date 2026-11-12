@@ -139,15 +139,28 @@ struct Width {
     align: u64,
 }
 
+/// One plane of a matrix: the suffix that names it and the values one of its stored elements
+/// stands for along the cut axis (`along`) and along the matrix's rows (`rows`). A plane whose
+/// stored rows are the matrix's own (a row of block scales beside a row of codes) has `rows` 1;
+/// one whose grid tiles the rows in blocks (an FP8 block's scale square) has `rows` the block's
+/// edge.
+#[derive(Debug, Clone)]
+struct Member {
+    suffix: String,
+    along: u64,
+    rows: u64,
+}
+
 /// The tensors of one matrix, a plane each (its codes, its block scales), cut together on one
-/// axis. `members` are the suffixes after the base and each plane's values per stored element
-/// along the cut axis.
+/// axis; a set of one member is an unquantized matrix cut on whole rows or columns. `members` are
+/// the suffixes after the base, each with the values one of its stored elements stands for along
+/// the cut axis and along the matrix's rows.
 #[derive(Debug, Clone)]
 struct PlaneSet {
     base: Vec<String>,
     axis: Axis,
     width: usize,
-    members: Vec<(String, u64)>,
+    members: Vec<Member>,
 }
 
 /// What the cut edits of `config.json`, as dotted paths.
@@ -346,20 +359,33 @@ fn parse_planes(f: &mut Fields, widths: &[Width]) -> Result<Vec<PlaneSet>, CutEr
         };
         let width = width_of(widths, &p.string("width")?)?;
         let mut members = Vec::new();
-        for (suffix, unit) in p.entries("members")? {
-            let unit = unit.as_u64().filter(|u| *u > 0).ok_or_else(|| {
-                spec_err(format!(
-                    "planes[{i}].members.{suffix}: a unit is a positive number"
-                ))
-            })?;
-            members.push((suffix.to_string(), unit));
+        for (suffix, m) in p.entries("members")? {
+            let what = format!("planes[{i}].members.{suffix}");
+            let positive = |v: &Value| {
+                v.as_u64()
+                    .filter(|u| *u > 0)
+                    .ok_or_else(|| spec_err(format!("{what}: a unit is a positive number")))
+            };
+            let member = match m {
+                Value::Number(_) => Member {
+                    suffix: suffix.to_string(),
+                    along: positive(m)?,
+                    rows: 1,
+                },
+                v => {
+                    let mut m = Fields::new(v, &what)?;
+                    let (along, rows) = (positive(m.get("along")?)?, positive(m.get("rows")?)?);
+                    m.finish()?;
+                    Member {
+                        suffix: suffix.to_string(),
+                        along,
+                        rows,
+                    }
+                }
+            };
+            members.push(member);
         }
         p.finish()?;
-        if members.len() < 2 {
-            return Err(spec_err(format!(
-                "planes[{i}]: a plane set has at least two members (the codes and a scale plane)"
-            )));
-        }
         planes.push(PlaneSet {
             base,
             axis,
@@ -632,7 +658,10 @@ fn find_instances(spec: &Spec, items: &[(usize, &str)]) -> Result<Vec<Instance>,
             continue;
         };
         let mut hits = spec.planes.iter().enumerate().filter_map(|(s, set)| {
-            let m = set.members.iter().position(|(sfx, _)| sfx == suffix)?;
+            let m = set
+                .members
+                .iter()
+                .position(|member| member.suffix == suffix)?;
             base_matches(&set.base, base).then_some((s, m))
         });
         let Some((s, m)) = hits.next() else {
@@ -656,7 +685,7 @@ fn find_instances(spec: &Spec, items: &[(usize, &str)]) -> Result<Vec<Instance>,
                 base,
                 why: format!(
                     "no {} plane beside the others",
-                    spec.planes[set].members[m].0
+                    spec.planes[set].members[m].suffix
                 ),
             });
         }
@@ -671,7 +700,7 @@ fn find_instances(spec: &Spec, items: &[(usize, &str)]) -> Result<Vec<Instance>,
 }
 
 /// The values a matrix's planes span along the cut axis, each plane's stored extent times its
-/// unit; the planes must be 2-D, share their rows and span the same values.
+/// unit; the planes must be 2-D, span the same values along the cut axis and span the same rows.
 fn plane_extent(
     spec: &Spec,
     inst: &Instance,
@@ -680,10 +709,10 @@ fn plane_extent(
     let set = &spec.planes[inst.set];
     let axis = if set.axis == Axis::Rows { 0 } else { 1 };
     let mut common: Option<(u64, &str)> = None;
-    let mut rows: Option<(usize, &str)> = None;
-    for (&at, (suffix, unit)) in inst.members.iter().zip(&set.members) {
+    let mut rows: Option<(u64, &str)> = None;
+    for (&at, member) in inst.members.iter().zip(&set.members) {
         let (name, shape) = tensors[at];
-        let &[r, _] = shape else {
+        let &[_, _] = shape else {
             return Err(CutError::Width {
                 tensor: name.to_string(),
                 width: spec.widths[set.width].name.clone(),
@@ -691,7 +720,9 @@ fn plane_extent(
                 why: format!("which cuts a 2-D plane, and this one is {}-D", shape.len()),
             });
         };
-        let values = to_u64(shape[axis]) * unit;
+        let values = to_u64(shape[axis]) * member.along;
+        let matrix_rows = to_u64(shape[0]) * member.rows;
+        let suffix = member.suffix.as_str();
         match (common, rows) {
             (Some((v, first)), _) if v != values => {
                 return Err(CutError::Planes {
@@ -699,16 +730,16 @@ fn plane_extent(
                     why: format!("{first} spans {v} values and {suffix} spans {values}"),
                 });
             }
-            (_, Some((n, first))) if n != r => {
+            (_, Some((n, first))) if n != matrix_rows => {
                 return Err(CutError::Planes {
                     base: inst.base.clone(),
-                    why: format!("{first} has {n} rows and {suffix} has {r}"),
+                    why: format!("{first} spans {n} rows and {suffix} spans {matrix_rows}"),
                 });
             }
             _ => {}
         }
-        common = Some((values, suffix.as_str()));
-        rows = Some((r, suffix.as_str()));
+        common = Some((values, suffix));
+        rows = Some((matrix_rows, suffix));
     }
     Ok(common.expect("a plane set has members").0)
 }
@@ -829,11 +860,14 @@ fn slice_planes(
             });
         }
         let values = plane_extent(spec, &inst, &shapes)?;
-        for (m, (_, unit)) in set.members.iter().enumerate() {
+        for (m, member) in set.members.iter().enumerate() {
             let why = if width.keep > values {
                 Some(format!("and the matrix spans {values}"))
-            } else if !width.keep.is_multiple_of(*unit) {
-                Some(format!("which its {unit}-value elements do not fill whole"))
+            } else if !width.keep.is_multiple_of(member.along) {
+                Some(format!(
+                    "which its {}-value elements do not fill whole",
+                    member.along
+                ))
             } else {
                 None
             };
@@ -847,7 +881,7 @@ fn slice_planes(
             }
             sliced.insert(
                 inst.members[m],
-                slice(spec, set, kept[inst.members[m]], *unit),
+                slice(spec, set, kept[inst.members[m]], member.along),
             );
         }
     }
@@ -2837,6 +2871,139 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(got, &data[11..111]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A folder of FP8 matrices with 128-by-128 block-scale squares beside their codes (the
+    /// K-EXAONE layout), and one plain BF16 matrix with no grid: a spec whose scale member states
+    /// the square's edge along the cut and across it cuts codes and grid together on both axes, a
+    /// plane set of one member cuts the plain matrix, the cut verifies against its source, and a
+    /// spec whose grid member states the wrong edge across the cut is refused by name.
+    #[test]
+    fn a_block_grid_plane_is_cut_with_its_codes_and_a_plain_matrix_alone() {
+        let root = temp_dir("b128");
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        // One layer: gate [256, 128] with a [2, 1] grid, down [128, 256] with a [1, 2] grid, and
+        // plain [256, 128] BF16 with no grid.
+        let tensors = vec![
+            tensor("m.layers.0.ffn.gate.weight", "F8_E4M3", &[256, 128]),
+            tensor("m.layers.0.ffn.gate.weight_scale_inv", "F32", &[2, 1]),
+            tensor("m.layers.0.ffn.down.weight", "F8_E4M3", &[128, 256]),
+            tensor("m.layers.0.ffn.down.weight_scale_inv", "F32", &[1, 2]),
+            tensor("m.layers.0.plain.weight", "BF16", &[256, 128]),
+            tensor("m.embed.weight", "BF16", &[16, 64]),
+        ];
+        let write = |dir: &Path| {
+            let parts: Vec<(&str, &str, &[usize], &[u8])> = tensors
+                .iter()
+                .map(|t| {
+                    (
+                        t.name.as_str(),
+                        t.dtype,
+                        t.shape.as_slice(),
+                        t.data.as_slice(),
+                    )
+                })
+                .collect();
+            fs::write(
+                dir.join("model-00001-of-00001.safetensors"),
+                safetensors::write(&parts),
+            )
+            .unwrap();
+            let weight_map: Map<String, Value> = tensors
+                .iter()
+                .map(|t| (t.name.clone(), json!("model-00001-of-00001.safetensors")))
+                .collect();
+            fs::write(
+                dir.join(Folder::INDEX),
+                json!({"metadata": {"total_size": tensors.iter().map(|t| t.data.len()).sum::<usize>()},
+                       "weight_map": weight_map})
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(
+                dir.join(CONFIG),
+                serde_json::to_string_pretty(&json!({"num_hidden_layers": 1, "ff": 256})).unwrap(),
+            )
+            .unwrap();
+        };
+        write(&src);
+        let spec_text = |across: u64| {
+            json!({
+                "name": "b128", "arch": "b128", "source": "toy/B128", "rev": "r1",
+                "expect": {"tensors": tensors.len(),
+                           "data_bytes": tensors.iter().map(|t| t.data.len()).sum::<usize>()},
+                "layers": [0],
+                "layer_prefix": "m.layers.",
+                "keep": ["m.embed.weight"],
+                "drop": [],
+                "copy": [],
+                "widths": {"ff": {"keep": 128, "align": 128}},
+                "planes": [
+                    {"base": "ffn.gate", "axis": "rows", "width": "ff",
+                     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": across}}},
+                    {"base": "ffn.down", "axis": "cols", "width": "ff",
+                     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": across}}},
+                    {"base": "plain", "axis": "rows", "width": "ff", "members": {"weight": 1}}
+                ],
+                "config": {
+                    "layer_count": "num_hidden_layers",
+                    "widths": {"ff": "ff"},
+                    "per_layer": [], "layer_names": []
+                },
+            })
+            .to_string()
+        };
+        let wrong = Spec::parse(&spec_text(64)).unwrap();
+        let e = cut(
+            &src,
+            &root.join("wrong"),
+            &wrong,
+            &opts(DEFAULT_SHARD_BYTES),
+            &mut quiet,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, CutError::Planes { why, .. }
+                if why.contains("weight spans 128 rows and weight_scale_inv spans 64")),
+            "{e}"
+        );
+
+        let spec = Spec::parse(&spec_text(128)).unwrap();
+        let out = root.join("out");
+        cut(&src, &out, &spec, &opts(DEFAULT_SHARD_BYTES), &mut quiet).unwrap();
+        let folder = open(&out);
+        // The gate codes keep the first 128 of 256 rows; their grid the first of its 2 entries.
+        let gate = folder.raw("m.layers.0.ffn.gate.weight").unwrap();
+        assert_eq!((gate.shape, gate.bytes.len()), (&[128, 128][..], 128 * 128));
+        assert!(gate.bytes == &tensors[0].data[..128 * 128]);
+        let grid = folder.raw("m.layers.0.ffn.gate.weight_scale_inv").unwrap();
+        assert_eq!(grid.shape, &[1, 1][..]);
+        assert!(grid.bytes == &tensors[1].data[..4]);
+        // The down codes keep the first 128 of 256 columns of every row; their grid the first of
+        // its 2 entries of its one row.
+        let down = folder.raw("m.layers.0.ffn.down.weight").unwrap();
+        assert_eq!(down.shape, &[128, 128][..]);
+        let want_down: Vec<u8> = (0..128)
+            .flat_map(|r| tensors[2].data[r * 256..r * 256 + 128].to_vec())
+            .collect();
+        assert!(down.bytes == want_down.as_slice());
+        let down_grid = folder.raw("m.layers.0.ffn.down.weight_scale_inv").unwrap();
+        assert_eq!(down_grid.shape, &[1, 1][..]);
+        assert!(down_grid.bytes == &tensors[3].data[..4]);
+        // The plain BF16 matrix keeps the first 128 of 256 rows, a plane set of one member.
+        let plain = folder.raw("m.layers.0.plain.weight").unwrap();
+        assert_eq!(plain.shape, &[128, 128][..]);
+        assert!(plain.bytes == &tensors[4].data[..128 * 128 * 2]);
+        assert_eq!(
+            folder.raw("m.embed.weight").unwrap().bytes,
+            tensors[5].data.as_slice()
+        );
+        let have: Value =
+            serde_json::from_str(&fs::read_to_string(out.join(CONFIG)).unwrap()).unwrap();
+        assert_eq!(have["ff"], json!(128));
+        verify(&out, Some(&src), &mut |_| {}).expect("the cut verifies");
+        fs::remove_dir_all(&root).unwrap();
     }
 
     /// The tensors of MiniMax-M3.1-Flash's layers, named and shaped as its shard headers have them:
