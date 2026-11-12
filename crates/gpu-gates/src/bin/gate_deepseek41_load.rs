@@ -20,8 +20,9 @@
 //!   id prefix `[0, n_l)` — not from the plan's segments.
 //! - (ii) state: per layer, the body's window ring, compressed rows, index
 //!   keys and compressor state are `KvLayout`'s bytes for the layer, exactly;
-//!   its ring shadow is `KvLayout`'s shadow bytes, and the page-locked host
-//!   allocation that holds the shadows is the plan's host shadow term.
+//!   its ring shadow is `KvLayout`'s shadow bytes, and the host rooms the
+//!   shadows live in (the page-locked allocation on a card that backs no
+//!   host page) hold the plan's host shadow term of address range.
 //! - (iii) image: at the decode-step sets' positions (4, 301 and 1,025) the
 //!   host plan's step, with an embedding row and engram rows of a known
 //!   pattern, is built into the step image, uploaded by the body's refresh
@@ -39,9 +40,10 @@
 //!   the gate requires: lazy loading maps a kernel's code at its first launch,
 //!   inside load 1, and the context keeps that granule past the drop); the
 //!   first model's drop gives back everything but what its chain capture took
-//!   from the context (iv) and, when the body held page-locked shadows, the
-//!   one 2 MiB mapping granule that capture keeps; the second load takes what
-//!   the first took less that granule, and its drop gives back all of it.
+//!   from the context (iv) and, when the body held the page-locked fallback's
+//!   shadows (a card that backs no host page), the one 2 MiB mapping granule
+//!   that capture keeps; the second load takes what the first took less that
+//!   granule, and its drop gives back all of it.
 //! - (vi) slots: on every layer's routed stacks, at slots 0, n/2 and n − 1,
 //!   the stack's `_sel` gemv (`q3k_gemv_sel`, `q4k_gemv_sel`, `q5k_gemv_sel`)
 //!   is bit for bit the plain gemv of an upload of just that slot's expert's
@@ -202,6 +204,7 @@ mod gate {
         let free1 = free(&probe)?;
         let mut ok = true;
         let shadow_host;
+        let shadow_roomed;
         {
             let w = m.weights();
             crate::ds41_tier::sc("(i) segments: the plan's buffers resident, the experts' bytes")?;
@@ -218,7 +221,9 @@ mod gate {
             ok &= check_sel(&plan, &lists, &path, gpu, w)?;
             crate::ds41_tier::sc("(ii) state: KvLayout's bytes and the plan's shadow term")?;
             ok &= check_state(&inputs.kv, &plan, body);
-            shadow_host = body.shadow_host().bytes;
+            let host = body.shadow_host();
+            shadow_host = host.bytes;
+            shadow_roomed = host.roomed;
             crate::ds41_tier::sc(
                 "(iii) image: the step image read back is the plan's and RopeTable's",
             )?;
@@ -235,7 +240,12 @@ mod gate {
         let free4 = free(&probe)?;
         crate::ds41_tier::sc("(v) reload: a second load takes what the first took")?;
         ok &= check_bundles(bundles_before, bundle_loads_on(device));
-        ok &= check_reload([free0, free1, free2, free3, free4], captured, shadow_host);
+        ok &= check_reload(
+            [free0, free1, free2, free3, free4],
+            captured,
+            shadow_host,
+            shadow_roomed,
+        );
         crate::ds41_tier::sc("(vii) r8 off: the source read steps the r8 load's bits")?;
         ok &= check_r8_off(&path, &cfg)?;
 
@@ -249,9 +259,9 @@ mod gate {
              `_sel` gemv its expert's own; every layer's state is KvLayout's bytes; the step image \
              at positions 4, 301 and 1025 reads back as the plan's integers and RopeTable's \
              tables; the chain captures and a synthetic depth refuses; a second load takes what \
-             the first took and each drop gives back all but the context's capture (and the \
-             page-locked shadows' granule it keeps); a load under BLOOMERY_R8=off reads the \
-             source and steps the r8 load's bits"
+             the first took and each drop gives back all but the context's capture (and, on the \
+             page-locked fallback's shadows, the granule it keeps); a load under BLOOMERY_R8=off \
+             reads the source and steps the r8 load's bits"
         );
         Ok(())
     }
@@ -797,9 +807,14 @@ mod gate {
         let host = body.shadow_host();
         let host_ok = host.bytes as u64 == plan.host.shadow_bytes && host.bytes as u64 == want_all;
         let pass = bad.is_empty() && host_ok;
+        let where_shadows = if host.roomed {
+            "host rooms"
+        } else {
+            "the page-locked allocation"
+        };
         println!(
-            "check ii shadows: {} layers at {} B each per KvLayout, {want_all} B; the page-locked \
-             allocation {} B (unified_addressing={}), the plan's host term {} B: {}",
+            "check ii shadows: {} layers at {} B each per KvLayout, {want_all} B; {where_shadows} \
+             {} B (unified_addressing={}), the plan's host term {} B: {}",
             body.layers().len(),
             kv.shadow_bytes(body.layers().start, CTX_MAX),
             host.bytes,
@@ -1106,15 +1121,27 @@ mod gate {
     /// reading the same). The page-locked granule holds only while the body
     /// held shadows (`shadow_host`) and a capture keeps the mapping
     /// (`captured`).
+    /// PIN(2026-11-12): the shadows are host rooms on a card that backs a
+    /// host page (`Shadows::Room`, the kvcommon rework), which leaves no
+    /// page-locked granule: the first drop leaves exactly the capture's
+    /// bytes and the second load takes exactly what the first took. The
+    /// granule holds only on the page-locked fallback (`!roomed`, the card
+    /// cannot back a host page, named on stderr), which the load reads and
+    /// this check takes (`shadow_roomed`). FAIL-first: the logged run left 0
+    /// taken beside the capture with roomed shadows against the old
+    /// unconditional granule; a leak stays red — a growing leftover
+    /// (`took(before, dropped) > captured`) or a load-2 leftover
+    /// (`took(dropped, end) > 0`).
     fn check_reload(
         [before, first, dropped, second, end]: [u64; 5],
         captured: u64,
         shadow_host: usize,
+        roomed: bool,
     ) -> bool {
         let took = |a: u64, b: u64| i128::from(a) - i128::from(b);
         // The page-locked shadows' granule, kept by the capture's device
-        // allocation (PIN(2026-09-24) above).
-        let granule: i128 = if shadow_host > 0 && captured > 0 {
+        // allocation (PIN(2026-09-24) above), on the fallback alone.
+        let granule: i128 = if !roomed && shadow_host > 0 && captured > 0 {
             PINNED_GRANULE
         } else {
             0
@@ -1136,7 +1163,8 @@ mod gate {
             println!(
                 "FAIL: check v: the first drop left {} B taken besides the capture's {captured} \
                  (allowed {granule}: the shadows' {shadow_host} B page-locked when a capture \
-                 keeps them), the second load took {} B more than the \
+                 keeps them and the card backs no host page, roomed={roomed}), the second load \
+                 took {} B more than the \
                  first (allowed {}), the second drop left {} B taken",
                 took(before, dropped) - i128::from(captured),
                 took(dropped, second) - took(before, first),
