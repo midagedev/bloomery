@@ -282,9 +282,8 @@ pub static ROWS: &[ArchRow] = &[
             quant: "MXFP4",
             // The revision the census stub of the file pins (tools/census/stubs.tsv).
             rev: Some("b0b2d0fb0b56611c761e075425c88989faf1ed1f"),
-            draft: DraftSource::NotFetchable(
-                "the MTP sidecar is a file of its own, and the fixture writes none of it yet",
-            ),
+            // The MTP sidecar is a file of its own, and the fixture writes none of it yet.
+            draft: DraftSource::None,
         })),
     },
     ArchRow {
