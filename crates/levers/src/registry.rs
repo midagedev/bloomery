@@ -2588,6 +2588,15 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          the server it times. Unset, each reading is a record line only.",
     ),
     runner(
+        "BLOOMERY_CARD_FELLOW",
+        None,
+        "The pid of the gate that started this server, whose gate lock this run holds too: the \
+         server's census (`crates/gpu-gates/src/gpu_census.rs`) leaves the pid out of its holder \
+         lists, as its own. `serve_client::serve_cmd` sets it on the child only where \
+         `BLOOMERY_CARD_HELD=1`; a value that is not a pid, or a fellow named where the run does \
+         not hold its card, is refused by name.",
+    ),
+    runner(
         "BLOOMERY_GATE_V41_LOAD",
         Some("gpu-gate.sh"),
         "`1`: the run loads the whole V4.1 model, so it also takes the box-wide V4.1 load lock, \

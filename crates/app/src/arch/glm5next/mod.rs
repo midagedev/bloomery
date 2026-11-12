@@ -235,8 +235,9 @@ fn ctx_of(plan: &Plan<'_>) -> Result<u32, SessionError> {
     })
 }
 
-/// `model` in step `mode`, handed to `log`, its step captured and the
-/// prompt call's buffers made ([`Loaded::ready`]).
+/// `model` in step `mode`, handed to `log`, the load watched as
+/// [`Loaded::open`] watches its own ([`Loaded::watched`]), its step captured
+/// and the prompt call's buffers made ([`Loaded::ready`]).
 fn ready(
     mut model: GpuModel<Body>,
     mode: bloomery_gpu::model::StepMode,
@@ -246,7 +247,10 @@ fn ready(
 ) -> Result<Option<Session<Body>>, SessionError> {
     model.set_mode(mode);
     log.load(&model)?;
-    Loaded::from_model(model, cfg, ctx).ready(log).map(Some)
+    Loaded::from_model(model, cfg, ctx)
+        .watched(log.card_watch()?)?
+        .ready(log)
+        .map(Some)
 }
 
 /// The GLM session under adaptive expert residency, as [`Loaded::open`]
