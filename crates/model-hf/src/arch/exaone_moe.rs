@@ -25,10 +25,9 @@
 //! does not take is refused by name.
 //!
 //! The tokenizer is the common path's (`hf::vocab`): a GPT2 BPE of the `exaone-moe`
-//! pre-tokenizer (the row `llama-vocab.cpp` reads by that name), a row the vocab table does not
-//! hold yet. The map pins no `pre` of its own, so the row the folder's own `tokenizer.json`
-//! spells is the one named once it exists; until then the vocab reader refuses a folder of this
-//! vocabulary by name rather than read it under another row's pipeline.
+//! pre-tokenizer (the row `llama-vocab.cpp` reads by that name — a letter word with its marks
+//! whose words a single space may join), which the map pins, so a folder whose `tokenizer.json`
+//! spells another row's pipeline is refused by both names rather than read under it.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -391,7 +390,7 @@ impl Checkpoint {
             dense_ff: u64::from(n("intermediate_size")?),
             vocab_size: u64::from(n("vocab_size")?),
             dense_lead,
-            vocab: hf::vocab::Config::parse(config)?,
+            vocab: hf::vocab::Config::parse(config)?.with_pre("exaone-moe")?,
             keys,
         })
     }
