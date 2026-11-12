@@ -102,6 +102,11 @@ macro_rules! tekken_regex {
         r#""[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
     };
 }
+macro_rules! exaone_regex {
+    () => {
+        r#""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?(?:\\p{L}\\p{M}*(?: \\p{L}\\p{M}*)*)+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]?|\\s*[\\r\\n]|\\s+(?!\\S)|\\s+""#
+    };
+}
 // One regex split, then ByteLevel without its own regex.
 macro_rules! pre_tokenizer {
     ($regex:ident, $behavior:literal, $invert:literal, $trim:literal) => {
@@ -124,10 +129,17 @@ macro_rules! pre_tokenizer {
 /// `tokenizer.json` must repeat: [`ignores_merges`]). `Removed` with `invert` keeps the regex's
 /// matches and drops what lies between them, which `Isolated` keeps as pieces of their own; both
 /// regexes match every codepoint, so no gap exists and the two split alike.
-pub const PRE: [(&str, &str, bool); 7] = [
+pub const PRE: [(&str, &str, bool); 8] = [
     (
         "qwen35",
         pre_tokenizer!(qwen35_regex, "Isolated", false, false),
+        false,
+    ),
+    // K-EXAONE's pipeline: a letter word with its marks whose words a single space may join
+    // (`hello world` is one word), no other row's split.
+    (
+        "exaone-moe",
+        pre_tokenizer!(exaone_regex, "Isolated", false, false),
         false,
     ),
     (
@@ -375,6 +387,13 @@ const TOKENIZER_CONFIG: &Fields = &[
     ),
     ("do_lower_case", Only("[false]")),
     ("split_special_tokens", Only("[false]")),
+    (
+        "padding_side",
+        Ignore(
+            Type::String,
+            "the side HF pads a batch's shorter sequences on; each sequence's ids are its own",
+        ),
+    ),
     // The reference's decoder cleans spaces by the pre-tokenizer's name (its `clean_spaces`),
     // not this key; the value moves nothing here.
     ("clean_up_tokenization_spaces", Only("[false, true]")),
@@ -1581,6 +1600,7 @@ mod tests {
             ["tokenizer_config.json", "", "sp_model_kwargs", {}, "none"],
             ["tokenizer_config.json", "", "do_lower_case", false, true],
             ["tokenizer_config.json", "", "split_special_tokens", false, true],
+            ["tokenizer_config.json", "", "padding_side", "right", 1],
             ["tokenizer_config.json", "", "clean_up_tokenization_spaces", true, 1],
             ["tokenizer_config.json", "", "errors", "replace", "ignore"],
             ["tokenizer_config.json", "", "pretokenize_regex", "$", "different"],
@@ -2273,6 +2293,101 @@ mod tests {
             e.contains(r#""cde" (normalized) and "ef" (unnormalized)"#),
             "{e}"
         );
+    }
+
+    /// K-EXAONE-2.0's tokenizer files (`exaone-2.0-tokenizer-files.json`: the folder's
+    /// `tokenizer.json` with the vocabulary cut to the added tokens' ids and three merge tokens,
+    /// the merges to their one merge and the added tokens to the ids below, then its
+    /// `tokenizer_config.json`, `generation_config.json`, `config.json` and `chat_template.jinja`
+    /// whole) are the `exaone-moe` row: the letter word a single space joins, BOS 1 (`[BOS]`),
+    /// EOS 53 (`<|endofturn|>`), PAD 0 by name, the generation stops `[2, 53]`, the NFC
+    /// normalizer written as a key, and the chat template the folder's jinja file spells. Mutants
+    /// (each red at the row's assertion): the row out of [`PRE`] (`pre-tokenizer row "exaone-moe"
+    /// is not one of …`), one character of its regex changed
+    /// (`tokenizer.json.pre_tokenizer … is unsupported`).
+    #[test]
+    fn the_real_exaone_tokenizer_files_open_as_the_exaone_moe_row() {
+        let path = format!(
+            "{}/tests/fixtures/exaone-2.0-tokenizer-files.json",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let files: Json = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let texts: Vec<(&str, String)> = [
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "generation_config.json",
+            "config.json",
+            "chat_template.jinja",
+        ]
+        .into_iter()
+        .map(|name| {
+            // The jinja file is text, the others JSON as they ship.
+            let text = match &files[name] {
+                Json::String(s) => s.clone(),
+                v => v.to_string(),
+            };
+            (name, text)
+        })
+        .collect();
+        let dir = repo(
+            &texts
+                .iter()
+                .map(|(n, t)| (*n, t.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let keys = super::keys(&dir, &spec_of(&dir).with_pre("exaone-moe").unwrap()).unwrap();
+        let value = |key: &str| get(&keys.keys, &format!("tokenizer.ggml.{key}")).cloned();
+        assert_eq!(value("pre"), Some(Value::String("exaone-moe".into())));
+        assert_eq!(value("model"), Some(Value::String("gpt2".into())));
+        for (key, id) in [
+            ("bos_token_id", 1),
+            ("eos_token_id", 53),
+            ("padding_token_id", 0),
+            ("unknown_token_id", 3),
+        ] {
+            assert_eq!(value(key), Some(Value::U32(id)), "{key}");
+        }
+        assert_eq!(value("normalizer"), Some(Value::String("NFC".into())));
+        assert_eq!(value("add_bos_token"), Some(Value::Bool(false)));
+        assert_eq!(value("add_eos_token"), Some(Value::Bool(false)));
+        assert_eq!(keys.stop, [2, 53]);
+        assert_eq!(keys.added, [0, 1, 2, 3, 4, 53]);
+        let Some(Value::Array(types)) = value("token_type") else {
+            panic!("no token_type");
+        };
+        assert_eq!(types.len(), 153_600);
+        for (id, ty) in [
+            (0, 3),
+            (1, 3),
+            (2, 3),
+            (3, 3),
+            (4, 4),
+            (53, 3),
+            (60, 1),
+            (62, 1),
+            (63, 5),
+        ] {
+            assert_eq!(types[id], Value::I32(ty), "id {id}");
+        }
+        let Some(Value::Array(tokens)) = value("tokens") else {
+            panic!("no tokens");
+        };
+        assert_eq!(tokens[53], Value::String("<|endofturn|>".into()));
+        assert_eq!(
+            get(&keys.keys, "tokenizer.chat_template"),
+            Some(&Value::String(
+                files["chat_template.jinja"].as_str().unwrap().into()
+            ))
+        );
+        // A pipeline of another row is refused naming both rows.
+        let e = super::keys(&dir, &spec_of(&dir).with_pre("qwen35").unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("exaone-moe") && e.contains("qwen35") && e.contains("pre_tokenizer"),
+            "{e}"
+        );
+        remove(&dir);
     }
 
     /// The `lfm2` row holds `ignore_merges` to its own value, both ways: LFM3's pipeline with the

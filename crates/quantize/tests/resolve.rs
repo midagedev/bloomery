@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use gguf::quant::GgmlType;
 use quantize::Result;
 use quantize::resolve::{Ftype, Model, Options, TensorRef, layer_of, resolve};
@@ -150,4 +152,110 @@ fn layers_are_read_from_the_name_as_sscanf_does() {
     assert_eq!(layer_of("blk.x.ffn_down.weight"), None);
     assert_eq!(layer_of("token_embd.weight"), None);
     assert_eq!(layer_of("blk.7weight"), None);
+}
+
+/// A set of one `general.architecture` and its block and expert counts.
+struct Set(Vec<(String, gguf::Value)>);
+
+impl quantize::source::Source for Set {
+    fn label(&self) -> String {
+        "set".into()
+    }
+    fn keys(&self) -> &[(String, gguf::Value)] {
+        &self.0
+    }
+    fn shard_count(&self) -> usize {
+        1
+    }
+    fn tensors(&self) -> Vec<(usize, gguf::TensorInfo)> {
+        vec![]
+    }
+    fn read(&self, _name: &str, _bytes: std::ops::Range<u64>) -> quantize::Result<Cow<'_, [u8]>> {
+        Err(quantize::Error::Refused(
+            "no tensor data in this test".into(),
+        ))
+    }
+}
+
+/// [`Model::read`]: each row of the architecture table reads its set's block and expert counts,
+/// and an architecture no row names is refused naming the rows. Mutant (red at the refusal): the
+/// `exaone-moe` row out of the table.
+#[test]
+fn the_architecture_rows_read_their_sets_and_refuse_another() {
+    let set = |arch: &str| {
+        Set(vec![
+            (
+                "general.architecture".to_string(),
+                gguf::Value::String(arch.into()),
+            ),
+            (format!("{arch}.block_count"), gguf::Value::U32(79)),
+            (format!("{arch}.expert_count"), gguf::Value::U32(256)),
+        ])
+    };
+    for arch in ["kimi-k3", "exaone-moe"] {
+        let m = Model::read(&set(arch)).unwrap();
+        assert_eq!((m.n_layer_all, m.n_expert), (79, 256), "{arch}");
+    }
+    let e = Model::read(&set("flint")).unwrap_err().to_string();
+    assert!(
+        e.contains("\"flint\"") && e.contains("kimi-k3") && e.contains("exaone-moe"),
+        "{e}"
+    );
+}
+
+/// A K-EXAONE set at the file's counts types as llama-quantize's driver types it under Q4_K_M:
+/// the untied `output` at Q6_K and `token_embd` at the default; `attn_v` by its counter's
+/// `use_more_bits` (the third of three at Q6_K), the routed and shared `ffn_down` by the layer
+/// their names spell (`blk.62` — (62 − 9) % 3 == 2 — at Q6_K, `blk.10` at the default), the rest
+/// of the FFN and attention at the default; and `tensor_allows_quantization` keeps the router's
+/// tables F32: `exp_probs_b.bias` fails the `weight` ending, the gate and the norms the norm and
+/// gate rules, while the next-token block (`blk.78`, its `nextn.eh_proj` at the default — the
+/// Q8_0 floor of that name is glm5-next's alone) types like any block. Mutant (red at the
+/// `blk.10` row): the layer read from the counter where the name's layer belongs.
+#[test]
+fn an_exaone_moe_set_types_as_llama_quantize_types_it() {
+    use GgmlType::*;
+    let m = Model {
+        n_layer_all: 79,
+        n_expert: 256,
+    };
+    let names = [
+        ("token_embd.weight", D, B),
+        ("output.weight", D, B),
+        ("blk.2.attn_v.weight", D, B),
+        ("blk.70.attn_v.weight", D, B),
+        ("blk.78.attn_v.weight", D, B),
+        ("blk.2.attn_k.weight", D, B),
+        ("blk.2.attn_q.weight", D, B),
+        ("blk.2.attn_output.weight", D, B),
+        ("blk.62.ffn_down_exps.weight", &[256, 512, 256][..], B),
+        ("blk.10.ffn_down_exps.weight", &[256, 512, 256][..], B),
+        ("blk.10.ffn_up_exps.weight", &[256, 512, 256][..], B),
+        ("blk.10.ffn_gate_exps.weight", &[256, 512, 256][..], B),
+        ("blk.10.ffn_down_shexp.weight", D, B),
+        ("blk.0.ffn_gate.weight", D, B),
+        ("blk.78.nextn.eh_proj.weight", D, B),
+        ("blk.2.ffn_gate_inp.weight", D, F32),
+        ("blk.2.exp_probs_b.bias", &[256][..], F32),
+        ("blk.78.nextn.enorm.weight", &[256][..], F32),
+        ("blk.2.attn_norm.weight", &[256][..], F32),
+    ];
+    assert_eq!(
+        run(&names, "", &m, &opts(Ftype::Q4KM)).unwrap(),
+        [
+            Q4_K, Q6_K, Q4_K, Q4_K, Q6_K, Q4_K, Q4_K, Q4_K, Q6_K, Q4_K, Q4_K, Q4_K, Q4_K, Q4_K,
+            Q4_K, F32, F32, F32, F32
+        ]
+    );
+    // An IQ type's attn_v at four experts or more takes the Q4_K branch the port carries.
+    assert_eq!(
+        run(
+            &[("blk.2.attn_v.weight", D, B), ("output.weight", D, B)],
+            "",
+            &m,
+            &opts(Ftype::Iq2Xxs)
+        )
+        .unwrap(),
+        [Q4_K, Q5_K]
+    );
 }

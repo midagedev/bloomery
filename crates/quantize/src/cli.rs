@@ -46,8 +46,8 @@ usage:
   --card N               the card to use, by CUDA ordinal (default: the first)
   --batch N              experts per card call (default 32)
 
-Types are written for F32, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS and the architecture kimi-k3; anything else is
-refused by name.
+Types are written for F32, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS and the architectures kimi-k3 and exaone-moe;
+anything else is refused by name.
 
 exit: 0 done; 1 a refusal, named (a source row that is not finite, an imatrix entry that is unusable, a type this
 quantizer does not write, too little room, a --check or --llama-plan difference); 64 a usage error; 66 a missing
