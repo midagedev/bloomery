@@ -1,8 +1,9 @@
 //! The set writer: every shard of the input written again under the output prefix with the same metadata and
 //! the same tensors in the same order, each tensor the plan says to quantize quantized by a [`Backend`] and every
 //! other tensor copied byte for byte. Each shard is written as `<name>.partial` and renamed when whole; a failed
-//! run removes every file it made. The next batch of experts is read and scanned while the backend works on the
-//! current one.
+//! run removes every file it made, or under `--resume` only the `.partial` it was writing, keeping every whole
+//! shard for the next run of the same plan. The next batch of experts is read and scanned while the backend works
+//! on the current one.
 
 use crate::check::{check_rows, compare_row, host_row};
 use crate::cli::{Args, Input};
@@ -16,6 +17,7 @@ use crate::{Error, Result};
 use gguf::iq_quant::{GridTables, IqKind};
 use gguf::quant::GgmlType;
 use gguf::write::Writer;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -110,14 +112,33 @@ pub fn prepare_from(a: &Args, set: Box<dyn Source + Send>) -> Result<Prepared> {
 }
 
 /// The room check: the output's drive has the bytes the output files need, or the run is refused with both numbers.
+/// Under `--resume` the shards already on disk whole ([`kept_whole`]) are not needed again.
 pub fn check_room(a: &Args, plan: &Plan) -> Result<()> {
+    let kept_bytes = if a.resume {
+        kept_whole(plan)?
+            .iter()
+            .zip(&plan.layouts)
+            .filter(|(k, _)| **k)
+            .map(|(_, l)| l.file_len())
+            .sum()
+    } else {
+        0
+    };
     let dir = a.out_dir();
     let free =
         os::free_bytes(&dir).map_err(|e| Error::refused(format!("{}: {e}", dir.display())))?;
-    if free < plan.out_file_bytes {
+    if free + kept_bytes < plan.out_file_bytes {
+        let note = if kept_bytes > 0 {
+            format!(
+                " ({} B of the set already on disk as whole shards)",
+                kept_bytes
+            )
+        } else {
+            String::new()
+        };
         return Err(Error::refused(format!(
-            "the output set needs {} B under {}, the drive has {free} B free",
-            plan.out_file_bytes,
+            "the output set needs {} B under {}{note}, the drive has {free} B free",
+            plan.out_file_bytes - kept_bytes,
             dir.display()
         )));
     }
@@ -139,6 +160,166 @@ fn check_absent(plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+/// Under `--resume`, whether each planned output shard is already on disk whole: a file whose length
+/// is the plan's and whose first bytes are the header this plan's writer would write — the metadata
+/// pairs and every tensor's name, dims, type and offset — compared without reading any tensor data.
+/// A whole file that differs in any of that refuses the run naming the path and the first field that
+/// differs. Reads nothing and removes nothing, so a refusal leaves every file as it was.
+fn kept_whole(plan: &Plan) -> Result<Vec<bool>> {
+    let mut keep = vec![false; plan.outs.len()];
+    for (s, (out, layout)) in plan.outs.iter().zip(&plan.layouts).enumerate() {
+        let Ok(md) = std::fs::metadata(out) else {
+            continue;
+        };
+        let want = layout.file_len();
+        if md.len() != want {
+            return Err(Error::refused(format!(
+                "{}: {} B on disk, this plan's shard is {want} B: a whole file that is not this plan's \
+                 shard is not kept",
+                out.display(),
+                md.len()
+            )));
+        }
+        let mut head = vec![0u8; layout.header_bytes().len()];
+        let mut f = std::fs::File::open(out).map_err(|e| io(out, e))?;
+        f.read_exact(&mut head).map_err(|e| io(out, e))?;
+        if let Some(at) = head
+            .iter()
+            .zip(layout.header_bytes())
+            .position(|(a, b)| a != b)
+        {
+            let field = header_field(layout.header_bytes(), at);
+            return Err(Error::refused(format!(
+                "{}: header byte {at} ({field}) differs from this plan's: a whole file that is not \
+                 this plan's shard is not kept",
+                out.display()
+            )));
+        }
+        keep[s] = true;
+    }
+    Ok(keep)
+}
+
+/// [`kept_whole`] acted on for a run: after every whole shard has been accepted, each remaining
+/// stale `.partial` is removed and the log names it.
+fn resume_states(plan: &Plan, log: &mut dyn FnMut(&str)) -> Result<Vec<bool>> {
+    let keep = kept_whole(plan)?;
+    for (out, k) in plan.outs.iter().zip(&keep) {
+        if *k {
+            continue;
+        }
+        let partial = PathBuf::from(format!("{}.partial", out.display()));
+        if partial.exists() {
+            std::fs::remove_file(&partial).map_err(|e| io(&partial, e))?;
+            log(&format!("  removed stale {}", partial.display()));
+        }
+    }
+    Ok(keep)
+}
+
+/// A little-endian `u32` at the head of `b`, or `None` when it is shorter.
+fn le32(b: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(*b.first_chunk()?))
+}
+
+/// A little-endian `u64` at the head of `b`, or `None` when it is shorter.
+fn le64(b: &[u8]) -> Option<u64> {
+    Some(u64::from_le_bytes(*b.first_chunk()?))
+}
+
+/// The `n` bytes at `*o`, as their span; `o` moves past them.
+fn span(b: &[u8], o: &mut usize, n: usize) -> Option<std::ops::Range<usize>> {
+    let r = *o..*o + n;
+    b.get(r.clone())?;
+    *o = r.end;
+    Some(r)
+}
+
+/// A GGUF string at `*o` — its `u64` length then its bytes — as text; `o` moves past it.
+fn header_text(b: &[u8], o: &mut usize) -> Option<String> {
+    let n = le64(b.get(span(b, o, 8)?)?)? as usize;
+    Some(String::from_utf8_lossy(b.get(span(b, o, n)?)?).into_owned())
+}
+
+/// A GGUF value of tag `t` at `*o`, its tag already consumed; `o` moves past it. A string is its
+/// length and bytes, an array its element tag, its count and its elements, as the writer lays them out.
+fn header_value(b: &[u8], o: &mut usize, t: u32) -> Option<()> {
+    let scalar = match t {
+        0 | 1 | 7 => 1,
+        2 | 3 => 2,
+        4..=6 => 4,
+        10..=12 => 8,
+        8 => {
+            header_text(b, o)?;
+            return Some(());
+        }
+        9 => {
+            let elem = le32(b.get(span(b, o, 4)?)?)?;
+            let n = le64(b.get(span(b, o, 8)?)?)? as usize;
+            for _ in 0..n {
+                header_value(b, o, elem)?;
+            }
+            return Some(());
+        }
+        _ => return None,
+    };
+    span(b, o, scalar)?;
+    Some(())
+}
+
+/// The field of a GGUF header byte `at` lands in — the counts, a metadata pair's key or value, a
+/// tensor's name, dims, type or offset, the zero padding — named by walking `header`, the bytes
+/// this plan's layout would write, so a kept-shard refusal names the first field that differs.
+fn header_field(header: &[u8], at: usize) -> String {
+    let field = (|| -> Option<String> {
+        let mut o = 24; // the magic, the version, the tensor and metadata counts
+        if at < o {
+            return Some("the header's counts".to_string());
+        }
+        let n_tensors = le64(header.get(8..16)?)? as usize;
+        let n_kv = le64(header.get(16..24)?)? as usize;
+        for _ in 0..n_kv {
+            let kstart = o;
+            let key = header_text(header, &mut o)?;
+            let key_end = o;
+            let vstart = o;
+            let t = le32(header.get(span(header, &mut o, 4)?)?)?;
+            header_value(header, &mut o, t)?;
+            if (kstart..key_end).contains(&at) {
+                return Some(format!("metadata key {key:?}"));
+            }
+            if (vstart..o).contains(&at) {
+                return Some(format!("metadata {key:?} value"));
+            }
+        }
+        for _ in 0..n_tensors {
+            let nstart = o;
+            let name = header_text(header, &mut o)?;
+            let name_end = o;
+            let ddstart = o;
+            let dims = le32(header.get(span(header, &mut o, 4)?)?)? as usize;
+            span(header, &mut o, dims * 8)?;
+            let ddend = o;
+            let ty = span(header, &mut o, 4)?;
+            let off = span(header, &mut o, 8)?;
+            if (nstart..name_end).contains(&at) {
+                return Some(format!("tensor {name:?} name"));
+            }
+            if (ddstart..ddend).contains(&at) {
+                return Some(format!("tensor {name:?} dims"));
+            }
+            if ty.contains(&at) {
+                return Some(format!("tensor {name:?} type"));
+            }
+            if off.contains(&at) {
+                return Some(format!("tensor {name:?} offset"));
+            }
+        }
+        Some("the header's zero padding".to_string())
+    })();
+    field.unwrap_or_else(|| "the header".to_string())
+}
+
 /// What a run did.
 #[derive(Debug)]
 pub struct Summary {
@@ -147,20 +328,32 @@ pub struct Summary {
     pub weights: f64,
     pub quant_s: f64,
     pub wall_s: f64,
+    /// The shards this run wrote; under `--resume` the kept ones are not among them.
     pub files: Vec<PathBuf>,
+    /// The shards `--resume` kept whole from an earlier run of this plan.
+    pub kept: usize,
 }
 
-/// Write the output. `log` gets each progress line. A failure removes the files this run made.
+/// Write the output. `log` gets each progress line. Under `--resume` a whole shard of this same
+/// plan is kept and every shard is classified before any tensor is read; a failure then removes
+/// only the `.partial` this run was writing, so the next `--resume` goes on. Without it any
+/// existing output is refused, and a failure removes the files this run made.
 pub fn run(
     a: &Args,
     prep: Prepared,
     backend: &mut dyn Backend,
     log: &mut dyn FnMut(&str),
 ) -> Result<Summary> {
-    check_absent(&prep.plan)?;
-    check_room(a, &prep.plan)?;
+    let keep = if a.resume {
+        check_room(a, &prep.plan)?;
+        resume_states(&prep.plan, log)?
+    } else {
+        check_absent(&prep.plan)?;
+        check_room(a, &prep.plan)?;
+        vec![false; prep.plan.shards.len()]
+    };
     let mut made = Vec::new();
-    let r = write_all(a, prep, backend, log, &mut made);
+    let r = write_all(a, prep, backend, log, &keep, &mut made);
     if r.is_err() {
         for f in &made {
             let _ = std::fs::remove_file(f);
@@ -201,11 +394,28 @@ fn host_convert(
 /// asks for them.
 const LOOKAHEAD: usize = 3;
 
+/// Seconds as `h:mm:ss`.
+fn hour_clock(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+}
+
+/// Seconds as `m:ss` under an hour, `h:mm:ss` above it.
+fn short_clock(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    if s >= 3600 {
+        hour_clock(secs)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
 fn write_all(
     a: &Args,
     prep: Prepared,
     backend: &mut dyn Backend,
     log: &mut dyn FnMut(&str),
+    keep: &[bool],
     made: &mut Vec<PathBuf>,
 ) -> Result<Summary> {
     let Prepared { set, im, plan } = prep;
@@ -218,6 +428,7 @@ fn write_all(
         ..
     } = plan;
     let n = shards.len();
+    debug_assert_eq!(keep.len(), n, "run passes one state a shard");
     let n_conv = items
         .iter()
         .filter(|i| matches!(i.fate, Fate::Convert(_)))
@@ -235,15 +446,19 @@ fn write_all(
     let mut tables: [Option<GridTables>; 2] = [None, None];
     let mut files = Vec::new();
     let ahead = !backend.uses_host_pool();
-    let order: Vec<usize> = shards.iter().flatten().copied().collect();
-    let host_items: Vec<usize> = order
+    // A kept shard's items leave the host-ahead list with it: nothing of a kept shard is read,
+    // converted or waited for, and the results stay in the order the writer asks for them.
+    let host_items: Vec<usize> = shards
         .iter()
-        .copied()
+        .zip(keep)
+        .filter(|(_, k)| !**k)
+        .flat_map(|(sh, _)| sh.iter().copied())
         .filter(|&i| matches!(items[i].fate, Fate::Convert(Target::K(_) | Target::F32)))
         .collect();
     let (tx, rx) = mpsc::sync_channel::<(usize, Result<Vec<u8>>)>(LOOKAHEAD);
     let (items_ref, set_ref, im_ref) = (&items, &*set, im.as_ref());
     let mut err_out: Option<Error> = None;
+    let (mut bytes_done, mut written_bytes, mut n_kept) = (0u64, 0u64, 0usize);
     std::thread::scope(|sc| {
         if ahead && !host_items.is_empty() {
             sc.spawn(move || {
@@ -264,6 +479,13 @@ fn write_all(
         let r = (|| -> Result<()> {
             for (s, layout) in layouts.into_iter().enumerate() {
                 let out = outs[s].clone();
+                let shard_len = layout.file_len();
+                if keep[s] {
+                    bytes_done += shard_len;
+                    n_kept += 1;
+                    log(&format!("  shard {}/{n}: kept {}", s + 1, out.display()));
+                    continue;
+                }
                 let partial = PathBuf::from(format!("{}.partial", out.display()));
                 made.push(partial.clone());
                 let file = std::fs::File::create(&partial).map_err(|e| io(&partial, e))?;
@@ -344,8 +566,33 @@ fn write_all(
                     .map_err(|e| io(&partial, e))?;
                 std::fs::rename(&partial, &out).map_err(|e| io(&out, e))?;
                 made.pop();
-                made.push(out.clone());
-                log(&format!("  shard {}/{n}: {}", s + 1, out.display()));
+                if !a.resume {
+                    // a failure without --resume removes what the run made, whole shards included
+                    made.push(out.clone());
+                }
+                bytes_done += shard_len;
+                written_bytes += shard_len;
+                // the time left runs at the mean rate of the shards this run wrote, so a kept
+                // shard's bytes count as done and not as rate
+                let elapsed = t_all.elapsed().as_secs_f64();
+                let left = if written_bytes > 0 && elapsed > 0.0 {
+                    format!(
+                        "~{}",
+                        short_clock(
+                            (out_file_bytes - bytes_done) as f64 / (written_bytes as f64 / elapsed)
+                        )
+                    )
+                } else {
+                    "?".to_string()
+                };
+                log(&format!(
+                    "  shard {}/{n}: {} ({:.1} of {:.1} GB, {} elapsed, {left} left)",
+                    s + 1,
+                    out.display(),
+                    bytes_done as f64 / 1e9,
+                    out_file_bytes as f64 / 1e9,
+                    hour_clock(elapsed)
+                ));
                 files.push(out);
             }
             Ok(())
@@ -356,12 +603,17 @@ fn write_all(
     if let Some(e) = err_out {
         return Err(e);
     }
+    log(&format!(
+        "bloomery-quantize: {} shard(s) written, {n_kept} kept",
+        files.len()
+    ));
     Ok(Summary {
         quantized: n_q,
         weights: w_q,
         quant_s: t_q,
         wall_s: t_all.elapsed().as_secs_f64(),
         files,
+        kept: n_kept,
     })
 }
 

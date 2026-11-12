@@ -35,6 +35,9 @@ anything is written.
     --output-tensor-type T / --token-embedding-type T   the flag types, as llama-quantize's
     --allow-requantize        as llama-quantize's
     --keep-split              the output has the input's number of shards (`<out>-0000K-of-0000N.gguf`)
+    --resume                  with `--keep-split`: a whole output shard an earlier run of this same plan wrote is kept
+                              (not read, not quantized again), a stale `.partial` is removed and written again, and a
+                              whole file that is not this plan's shard refuses the run by name
     --plan                    every tensor's source and target type, bytes in and out, the fate, the derived wall and
                               the room; writes nothing
     --llama-plan TSV          llama-quantize's own `--dry-run` plan, cross-checked tensor for tensor
@@ -50,6 +53,18 @@ With `--hf` the bytes are the ones the `prepare` split would have given (`just g
 output's sha256 per shard equal on a toy K3.1 folder and on a 2-layer cut of the real one). A folder with a shard its
 index names missing, a `weight_scale` with no `weight`, or an E8M0 scale byte of 255 is refused by name before any
 output remains.
+
+`--resume` continues an interrupted run of the same plan. The plan is a pure function of the inputs and the command
+line, so a shard an earlier run finished is exactly the shard this run would write, and before any tensor is read every
+planned output shard is classified: an absent file is written, a stale `<name>.partial` is removed (the log names it)
+and written, and a whole file is kept when its length equals the plan's and its header — every metadata pair and every
+tensor's name, dims, type and offset, the bytes this plan's writer would write — equals it, a comparison that reads no
+tensor data. A whole file that differs in any of that refuses the run naming the path and the first field that differs,
+and removes nothing. A kept shard costs no read and no quantization; the shard line says `kept`, the bytes-done,
+elapsed and time-left of the shard line run at the mean rate of the shards this run writes, and the summary line says
+how many were kept. A failure under `--resume` removes only the `.partial` it was writing: the whole shards this run
+finished and the ones it kept stay, so the next `--resume` goes on (the room check counts only what is left to write).
+Without `--resume` any existing output, a stale `.partial` included, is refused and a failed run removes what it made.
 
 Exit: 0 done; 1 a refusal, named; 64 a usage error; 66 a missing input file.
 
@@ -78,8 +93,8 @@ Nothing is turned into a plausible value.
   importance row of the wrong length.
 - Too little room for the output (checked before anything is written; the output directory's free bytes against the
   bytes the plan writes).
-- An output file that exists, or a stale `.partial`. Shards are written as `.partial` and renamed when whole; a failed
-  run removes what it made.
+- An output file that exists, or a stale `.partial`, without `--resume`. Shards are written as `.partial` and renamed
+  when whole; a failed run removes what it made, and under `--resume` only the `.partial` it was writing.
 
 ## How its bytes are proved
 
