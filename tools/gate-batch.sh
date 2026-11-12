@@ -227,6 +227,40 @@
 # than the wait costs the lane nothing beyond its own items; a hold, or a sitting that starts after
 # the probe, is the stolen item's own box.sh guard, as it is for every item. --lanes 1 steals
 # nothing.
+# Build lane. A card idles while its own lane compiles, and cargo serialises the compiles on the one build directory anyway, so a third
+# lane — it holds no card and no gate lock — runs each item's BUILD pass ahead of the run lanes: the item's own `just` recipe with
+# BLOOMERY_BUILD_ONLY=1 in its box env, which tools/gate.sh (its build phase under the build bound, then rc 0 or the build's rc) and
+# tools/gpu-gate.sh (rc 0 before any lock, ticket or card) honour. The build queue is in the order the run lanes will take the items,
+# the lane starts first, and a run lane starts an item only once its pass ended: with the next item's pass still running it takes the
+# next queued item whose pass ended (or that builds inline), and waits, a second at a time, only when none is; the chain's order, the
+# claims, the fixed/solo/v41-load rules, the pack's budget, the lease probe and the GPU hold are those of a batch with no build lane. A
+# pass that fails fails its item with the build's rc, `build=failed(<s>s)` on its line and the pass's log in the item's own: the run
+# lane never runs it, and no times row is written. A pass that meets contention (rc 75, rc 83) is no verdict on the build: the item
+# builds in its run lane, as it would without the lane, and its line says why.
+# What is built ahead is derived from the recipe text, never listed: a recipe whose every box command is a chain of `&&` steps that are
+# a cargo build (`cargo build`, `cargo oxide build`), a call of a script that reads BLOOMERY_BUILD_ONLY (a runner with a build-only form:
+# tools/gate.sh and tools/gpu-gate.sh; a `--doc` call has no build phase, its doctests compile inside its run), a tier guard
+# (tools/ref/{real-only,fixture-only,needs-env}.sh) or an environment assignment. Any other recipe builds inline in its run lane, and
+# its line says `build=inline <why>` — the first step that is not a build: a script with no build-only form, a step outside the box
+# command, shell control flow or a substitution, a shebang recipe, a box call the rule cannot read, no box command at all. The plan names
+# each inline item and the dry run counts the reasons.
+# The seconds: an item line's `<s>s` is its run pass, `build=<s>s` its build pass (the lane's, or `build=inline …`), and its times row is
+# their sum, so a row means what it meant without the lane. The build pass's own seconds go to ${TIMES_FILE%.tsv}-build.tsv (lane L, the
+# same five columns; the median of the item's last 5 is the build the plan subtracts from the item's run estimate, so an item with no
+# row yet counts no build seconds and no saving is claimed for it); a cold build writes no build row, as it writes no times row.
+# Wall: the plan's lanes run on the run seconds (the times row less the build median), a run lane's clock replays over the build
+# queue's finish times, and wall = the longer of the lanes and the build lane's end plus the last run, then what still runs alone (the
+# pack, the chain); `build-lane=<s>s` (the sum of the passes) and `laneH=<s>s` follow `wall=` on the plan line, and `build-lane=<s>s`,
+# `laneH=<s>s` (the host lane's longer worker) and `lockwait=<n>` end the DONE line's lane terms. `lockwait=` counts the run passes
+# whose own cargo call printed «Blocking waiting for file lock on build directory»: the lane's overlap is the less worth the more of
+# them, because a run pass's cargo call (a no-op build of what the lane built) waits for the lock while the lane compiles another item.
+# Host lane. An item whose times row names no card (host tests, static checks) runs on the host lane, HOST_WIDTH workers on one queue
+# (lane H on its item lines, H2 and the like in the box files), not behind card items in lane A or B; its times row stays lane B, card
+# none, the three lanes the times file knows. The width is two: the host items are cargo builds and tests that share the build directory
+# and the box's cores, so a second worker overlaps one's test run with the other's wait, and a third would only queue behind the lock.
+# --no-build-lane runs the batch as it ran before the lane: the same plan lines, the same order, the same box calls, no `build=` field, no
+# host lane. The lane is also off, named in the dry run, under --lanes 1 (one lane, nothing to overlap) and BLOOMERY_BOX_QUEUE=1 (the
+# queue runs one job of a tree at a time, so a build pass would queue behind the run it should precede).
 # Canary (staticwire, 2026-10-11: a half-applied change failed deep into a landing batch): a recipe that carries
 # `[group('canary')]` — gate-ptx-spill and the lib-test gate of a device crate (gate-gpu-lib, gate-gpu-gates-lib,
 # gate-gpu-ds41-lib): the gates that turn red from a half-applied change in the first minutes — runs FIRST in its lane,
@@ -282,7 +316,7 @@
 # later item sees another id): the retry then runs the item on the tree as it is now, and the two ids in the log line say so.
 # DIR/run.log opens with `plan laneA=<s>s laneB=<s>s laneX=<s>s wall=<s>s
 # defaults=<n> …` (the predicted sums, derived from the times file), then gets `<recipe>[-<n>] rc=<n>
-# <s>s try=<t> lane=<A|B|X> tier=<real|fixture>` per item (plus `cold=1` for a cold build, `times=append-failed` when its
+# <s>s try=<t> lane=<A|B|H|X> tier=<real|fixture>` per item (plus `build=<s>s` or `build=inline <why>` with the build lane, `cold=1` for a cold build, `times=append-failed` when its
 # times row could not be written, and `item=…` last when it carries env or ARGS), then `DONE total=<n> red=<n> tier=<real|fixture> wall=<s>s plan=<s>s laneA=<s>s laneB=<s>s`
 # (`slow=<ratio>` after `plan=` when the wall passed 1.5 × the plan, `laneX=` when X ran, `lint_warnings=<n>` when lint ran: `grep -c '^warning:'` on its log).
 # Plan alarm. `plan=` is the plan's wall: the times file's sums plus the lane gap, what a lane spends between its items (the claims,
@@ -537,6 +571,8 @@ MIN_FREE_GIB=3 # the disk floor (the header's «Disk floor»): 2× the larger of
 TIMES_FILE=${BLOOMERY_GATE_TIMES:-$HOME/.cache/bloomery/gate-times.tsv}
 COLD_FILE=${TIMES_FILE%.tsv}-cold.tsv # a cold build's rows, outside the median (the header)
 GAP_FILE=${TIMES_FILE%.tsv}-gap.tsv # each finished batch's lane gap an item, the plan's gap term (the header's «Plan alarm»)
+BUILD_FILE=${TIMES_FILE%.tsv}-build.tsv # the build lane's rows, lane L: the seconds of each item's build-only pass (the header's «Build lane»)
+HOST_WIDTH=2 # the host lane's workers (the header's «Build lane»): host tests are mostly single-thread, and two keep the box's cores for the cards' lanes and the build lane
 # The solo-real recipes that join the chain (class C, the header). Each one's own reason was read
 # (loadchain's D5 N3, 2026-10-09): the stated reason is the host set under the big-load lock — not
 # two cards, not a host-memory pin — and no clause or plan of its gate reads a host-memory value a
@@ -556,7 +592,7 @@ CHAIN_SOLO_REAL='gate-gpu-ds41-residency-a gate-gpu-glm5next-e2e gate-gpu-glm5ne
 # self-test's numbers).
 PACK_BUDGET=262185889800
 
-USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--trust-fast] [--no-gpu-hold] [--yield] | --fast-ledger [--trust-rounds] [--no-gpu-hold] [--yield] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--red-main-check] [--wait-hold [SECONDS]] | --classes | --self-test [--part K|all]"
+USAGE="usage: tools/gate-batch.sh [--out DIR] [--smoke | --weekly | --list FILE | ITEM…] [--dry-run] [--lanes 1|2] [--tier real|fixture] [--ledger [--trust-rounds] [--trust-fast] [--no-gpu-hold] [--yield] | --fast-ledger [--trust-rounds] [--no-gpu-hold] [--yield] | --round-ledger] [--rerun] [--over-budget-ok] [--no-canary] [--no-build-lane] [--red-main-check] [--wait-hold [SECONDS]] | --classes | --self-test [--part K|all]"
 die() { echo "gate-batch: $*" >&2; exit "${RC:-64}"; }
 
 # The append, for the ledger and the times file: a ledger record's parts file first (its parts exist
@@ -629,7 +665,7 @@ lane_gaps() {
     case " $LANES_RUN " in *" $lane "*) ;; *) continue ;; esac
     clock=$(lane_s "$lane")
     read -r n sec <<< "$(lane_items "$lane")"
-    g=$((clock - sec))
+    g=$((clock - sec - $(cat "$OUT/lane-$lane.bw" 2> /dev/null || echo 0)))
     [ "$g" -ge 0 ] || g=0
     GAP_TOTAL=$((GAP_TOTAL + g))
     GAP_ITEMS=$((GAP_ITEMS + n))
@@ -796,7 +832,7 @@ disk_ok() { # $1 a path whose volume must hold the floor free; one verdict line,
 # builds on never split across parts), and runs the fixture, the helpers and the locals above and between them itself.
 # `--self-test` starts every part and sums their counts; `--self-test --part K` runs one (K, or `all`: the parts one
 # after another in this process, the serial form). The summary names the three slowest cases.
-SELFTEST_PARTS=22
+SELFTEST_PARTS=23
 self_test() {
   local self t h n=0 bad=0 out rc real_classes part=${1:-all} case_t0=$SECONDS
   gb_part() {
@@ -828,7 +864,11 @@ self_test() {
   # shellcheck disable=SC2064 # the paths are fixed now
   trap "part_exit '$t' '$h'" EXIT
   mkdir -p "$t/tools"
-  cp "$self" "$t/tools/gate-batch.sh"
+  # The fixture script every case runs defaults to the flow without the build lane: the cases below pin that flow's lines, order and box
+  # calls (what --no-build-lane keeps). Part 23 runs the script as shipped (gate-batch-bl.sh) and pins the build lane's own.
+  sed "s/^CANARY=1 RED_MAIN=0 BUILD_LANE=1 BUILD_OFF=''\$/CANARY=1 RED_MAIN=0 BUILD_LANE=0 BUILD_OFF=flag/" "$self" > "$t/tools/gate-batch.sh"
+  grep -q '^CANARY=1 RED_MAIN=0 BUILD_LANE=0 BUILD_OFF=flag$' "$t/tools/gate-batch.sh" || { echo "gate-batch: self-test: the fixture copy without the build lane did not patch (the defaults line moved?)" >&2; return 70; }
+  cp "$self" "$t/tools/gate-batch-bl.sh"
   # One justfile for every part. A recipe named by one part's cases can be appended inside that part
   # alone: the other recipes keep their class, kind and cards, and the pack and marker checks still pass.
   # It stays here — the cases are sleep-bound, and reading this file is not that wall.
@@ -1310,6 +1350,21 @@ if [ -n "${BLOOMERY_BOX_PIDDIR:-}" ]; then
   trap 'rm -f "$BLOOMERY_BOX_PIDDIR/$$"' EXIT
 fi
 for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
+# A build-only call (BLOOMERY_BUILD_ONLY=1, the build lane's pass) takes no card and runs nothing: it holds FAKE_BUILD_SLEEP seconds and
+# ends FAKE_BUILD_RC (0 unless set), named in seq.log (BS at its start, BE at its end) and in build.log with its env. No other FAKE_* knob
+# reaches it: an item's own FAKE_RC, FAKE_SLEEP or FAKE_GUARD75 is its run pass's.
+if [ "${BLOOMERY_BUILD_ONLY:-0}" = 1 ]; then
+  [ "${FAKE_DEAF:-0}" != 1 ] || trap '' TERM # as a run's call: a call that ignores TERM, for reap_boxes' KILL
+  printf '%s\t%s\t%s\n' "$(date +%s)" "${BLOOMERY_BOX_ENV:-}" "$*" >> "$st/build.log"
+  echo "BS $*" >> "$st/seq.log"
+  k=0
+  while [ "$k" -lt "${FAKE_BUILD_SLEEP:-0}" ]; do
+    sleep 1
+    k=$((k + 1))
+  done
+  echo "BE $*" >> "$st/seq.log"
+  exit "${FAKE_BUILD_RC:-0}"
+fi
 [ "${FAKE_DEAF:-0}" != 1 ] || trap '' TERM # a call that ignores TERM, for reap_boxes' KILL
 word=${*##* }
 for d in ${FAKE_START_DELAY:-}; do [ "${d%%=*}" != "$word" ] || sleep "${d#*=}"; done
@@ -1327,6 +1382,7 @@ fi
 if [ -n "${BLOOMERY_REMOTE+x}" ]; then printf 'set\t%s\n' "$BLOOMERY_REMOTE" >> "$st/remote.log"
 else printf 'unset\n' >> "$st/remote.log"; fi
 echo "S $*" >> "$st/seq.log"
+[ "${FAKE_LOCKWAIT:-0}" != 1 ] || echo '    Blocking waiting for file lock on build directory' # cargo's line when another cargo holds the directory
 # FAKE_AWAIT_RECHECK=1 (the item's env): wait until a phase recheck holds recheck-open, then name this call.
 # A call that does not ask does not wait; one that sees the file overlapped that recheck.
 if [ "${FAKE_AWAIT_RECHECK:-0}" = 1 ]; then
@@ -1646,6 +1702,7 @@ FP
       python3 -c 'import os, sys, time; a = time.time() - float(sys.argv[2]); os.utime(sys.argv[1], (a, a))' "$t/fake-state/batch.gpuhold" "${PRE_AGE:-0}"
     fi
     # LFLAG: the ledger flag of the batch (default the round's); MTAG: a mutant copy's tag
+    [ "${BL:-}" != 1 ] || runner=(bash "$t/tools/gate-batch-bl.sh") # BL=1: the script as shipped, its build lane on
     [ "${GBFAST:-}" != 1 ] || runner=(bash "$t/tools/gate-batch-fast.sh")
     [ "${GBFAST:-}" != 2 ] || runner=(bash "$t/tools/gate-batch-fast-dl.sh")
     [ -z "${MTAG:-}" ] || runner=(bash "$t/tools/gate-batch-$MTAG.sh")
@@ -1746,7 +1803,7 @@ JF
   mutant_of() { # <tag> <sed expr> <ERE proving the sed applied>
     local tag=$1 expr=$2 proof=$3
     n=$((n + 1))
-    sed "$expr" "$t/tools/gate-batch.sh" > "$t/tools/gate-batch-$tag.sh"
+    sed "$expr" "${MSRC:-$t/tools/gate-batch.sh}" > "$t/tools/gate-batch-$tag.sh" # MSRC: the script as shipped (part 23's mutants)
     if grep -Eq -- "$proof" "$t/tools/gate-batch-$tag.sh"; then echo "mutant $tag: $expr"
     else bad=$((bad + 1)); echo "FAIL mutant $tag: the sed did not apply: $expr"; fi
     note_case "mutant $tag"
@@ -4502,6 +4559,263 @@ EOS
   printf '%s' "$rc" > "$t/rc-at-plain"
   want 'attribution: a batch without a ledger adds nothing to a red line' "$t/target/c-at-plain/run.log" '^plain-any rc=1 [0-9]+s try=1 lane=[AB] tier=real item=plain-any@FAKE_RC=1$'
   fi
+  if gb_part 23; then
+  # The build lane (the header's «Build lane»). The script as shipped runs here (gate-batch-bl.sh; BL=1 in steal_case); every other part
+  # runs the copy whose default is the flow without it. The fake box answers a build-only call with FAKE_BUILD_SLEEP / FAKE_BUILD_RC and
+  # names it BS / BE in seq.log (the item's own FAKE_* knobs are its run's).
+  cat >> "$t/justfile" << 'JF'
+
+bl-inline:
+    mkdir -p target/bl-inline
+    ./tools/box.sh 'bash tools/gpu-gate.sh gen_bi'
+
+bl-loop:
+    for c in a b; do ./tools/box.sh "bash tools/gpu-gate.sh gen_bl-$c"; done
+
+bl-nodecl:
+    ./tools/box.sh 'bash tools/bl-no.sh'
+
+bl-decl:
+    ./tools/box.sh 'bash tools/bl-ok.sh'
+
+bl-hold:
+    ./tools/box.sh 'bash tools/gpu-gate.sh gen_blh'
+JF
+  sed -e 's/^REAP_TICKS=50 /REAP_TICKS=5 /' "$t/tools/gate-batch-bl.sh" > "$t/tools/gate-batch-bl-fast.sh"
+  grep -q '^REAP_TICKS=5 ' "$t/tools/gate-batch-bl-fast.sh" || { echo "gate-batch: self-test: the fast-reap copy of the shipped script did not patch (REAP_TICKS's line moved?)" >&2; return 70; }
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "a runner that ends before its test when BLOOMERY_BUILD_ONLY=1"' > "$t/tools/bl-ok.sh"
+  printf '%s\n' '#!/usr/bin/env bash' 'echo "a script with no build-only form"' > "$t/tools/bl-no.sh"
+  built_before() { # <seq.log> <cmd>: yes (the call's build pass ended before its run started), no, or absent (either never happened)
+    awk -v a="$2" '
+      $1 == "BE" && $0 ~ (" " a "[ ]*$") && be == "" { be = NR }
+      $1 == "S" && $0 ~ (" " a "[ ]*$") && rs == "" { rs = NR }
+      END { print (be == "" || rs == "" ? "absent" : be < rs ? "yes" : "no") }' "$1" 2> /dev/null || echo absent
+  }
+  line_before() { # <seq.log> <tag-a> <cmd-a> <tag-b> <cmd-b>: yes (the first `<tag-a> … <cmd-a>` line came before the first `<tag-b> … <cmd-b>`), no, absent
+    awk -v ta="$2" -v a="$3" -v tb="$4" -v b="$5" '
+      $1 == ta && $0 ~ (" " a "[ ]*$") && x == "" { x = NR }
+      $1 == tb && $0 ~ (" " b "[ ]*$") && y == "" { y = NR }
+      END { print (x == "" || y == "" ? "absent" : x < y ? "yes" : "no") }' "$1" 2> /dev/null || echo absent
+  }
+  local blrows=("steal-fix	A	3090	10	$d" "plain-any	B	a6000	30	$d" "bl-inline	A	3090	5	$d")
+  # (a) A run lane never starts an item before its build pass ended; (c') an item that builds inline is no one's wait, so the lane takes
+  # it while the head's build runs (the lane waits only when no queued item is ready).
+  rc=$(BL=1 steal_case bl-order "${blrows[@]}" -- 'steal-fix@FAKE_BUILD_SLEEP=4,FAKE_SLEEP=1' 'plain-any@FAKE_BUILD_SLEEP=1,FAKE_SLEEP=1' 'bl-inline@FAKE_SLEEP=1')
+  printf '%s' "$rc" > "$t/rc-bl-order"
+  rc_ok 'build lane: a batch of built-ahead items and an inline one ends green' bl-order 3
+  if [ "$(built_before "$t/fake-state/seq.log" gen_f)" = yes ] && [ "$(built_before "$t/fake-state/seq.log" other)" = yes ]; then pass 'build lane: no run starts before its build pass ended'
+  else fail 'build lane: no run starts before its build pass ended' "$(grep -E ' (gen_f|other)$' "$t/fake-state/seq.log" | tr '\n' '|')"; fi
+  if [ "$(line_before "$t/fake-state/seq.log" S gen_bi BE gen_f)" = yes ]; then pass 'build lane: a lane takes the inline item while the head item builds, and waits only when none is ready'
+  else fail 'build lane: a lane takes the inline item while the head item builds, and waits only when none is ready' "$(grep -E ' (gen_f|gen_bi)$' "$t/fake-state/seq.log" | tr '\n' '|')"; fi
+  want 'build lane: the run line names the build pass apart from the run (build=<n>s)' "$t/target/c-bl-order/run.log" '^steal-fix rc=0 [0-9]+s try=1 lane=A tier=real build=[0-9]+s ledger=pending'
+  want 'build lane: an inline item says so and why' "$t/target/c-bl-order/run.log" '^bl-inline rc=0 [0-9]+s try=1 lane=[AB] tier=real build=inline mkdir \(a step outside the box command\) ledger=pending'
+  want 'build lane: the DONE line carries the build lane, the host lane and the lock waits' "$t/target/c-bl-order/run.log" '^DONE total=3 red=0 .* laneA=[0-9]+s laneB=[0-9]+s .*build-lane=[0-9]+s .*lockwait=0$'
+  want_row 'build lane: the build pass carries the item env, the build-only variable and the gate-lane card' "$t/fake-state/build.log" '$3 ~ /gen_f$/ && $2 ~ /FAKE_BUILD_SLEEP=4/ && $2 ~ /BLOOMERY_BUILD_ONLY=1/ && $2 ~ /BLOOMERY_GATE_CARD=3090/'
+  want_no_row 'build lane: no run call carries the build-only variable' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_BUILD_ONLY/'
+  want_row 'build lane: a build row is written apart from the times file (lane L)' "$t/times-bl-order-build.tsv" '$1 == "steal-fix@FAKE_BUILD_SLEEP=4,FAKE_SLEEP=1" && $2 == "L" && $3 == "3090" && $4 >= 4'
+  want_row 'build lane: the times row stays run + build seconds' "$t/times-bl-order.tsv" '$1 == "steal-fix@FAKE_BUILD_SLEEP=4,FAKE_SLEEP=1" && $2 == "A" && $4 >= 5'
+  MSRC=$t/tools/gate-batch-bl.sh mutant_of bl-nowait 's|^  \[ "\$BUILD_ON" = 1 \] \|\| return 0$|  return 0 # MUTANT bl-nowait|' '# MUTANT bl-nowait$'
+  rc=$(BL=1 MTAG=bl-nowait steal_case bl-orderm "${blrows[@]}" -- 'steal-fix@FAKE_BUILD_SLEEP=4,FAKE_SLEEP=1' 'plain-any@FAKE_BUILD_SLEEP=1,FAKE_SLEEP=1' 'bl-inline@FAKE_SLEEP=1')
+  if [ "$(built_before "$t/fake-state/seq.log" gen_f)" = no ]; then pass 'build lane mutant: without the wait a run starts before its build pass ended'
+  else fail 'build lane mutant: without the wait a run starts before its build pass ended' "$(grep -E ' gen_f$' "$t/fake-state/seq.log" | tr '\n' '|')"; fi
+  MSRC=$t/tools/gate-batch-bl.sh mutant_of bl-hol 's|^\(      if neighbour_blocked "\$i" \|\| ! build_ready "\$i"; then pend=1; \)continue; fi$|\1break; fi # MUTANT bl-hol|' '# MUTANT bl-hol$'
+  rc=$(BL=1 MTAG=bl-hol steal_case bl-holm "${blrows[@]}" -- 'steal-fix@FAKE_BUILD_SLEEP=4,FAKE_SLEEP=1' 'plain-any@FAKE_BUILD_SLEEP=1,FAKE_SLEEP=1' 'bl-inline@FAKE_SLEEP=1')
+  if [ "$(line_before "$t/fake-state/seq.log" S gen_bi BE gen_f)" = no ]; then pass 'build lane mutant: a lane that waits at its head starts the inline item only after the head built'
+  else fail 'build lane mutant: a lane that waits at its head starts the inline item only after the head built' "$(grep -E ' (gen_f|gen_bi)$' "$t/fake-state/seq.log" | tr '\n' '|')"; fi
+  # (b) A build that fails fails its item with the build's rc, and nothing of the item runs.
+  rc=$(BL=1 steal_case bl-fail "steal-fix	A	3090	10	$d" "plain-any	B	a6000	10	$d" -- 'steal-fix@FAKE_BUILD_RC=7' 'plain-any@FAKE_SLEEP=1')
+  printf '%s' "$rc" > "$t/rc-bl-fail"
+  if [ "$(cat "$t/rc-bl-fail")" = 1 ] && grep -Eq '^DONE total=2 red=1 ' "$t/out-bl-fail.log"; then pass 'build lane: a failed build makes the batch red, the other item green'
+  else fail 'build lane: a failed build makes the batch red, the other item green' "rc=$(cat "$t/rc-bl-fail") $(tail -1 "$t/out-bl-fail.log" 2>/dev/null)"; fi
+  want 'build lane: the failed item carries the build rc and says its build failed' "$t/target/c-bl-fail/run.log" '^steal-fix rc=7 [0-9]+s try=0 lane=A tier=real build=failed\([0-9]+s\) ledger=red'
+  want_no_row 'build lane: the failed item never reached its run' "$t/fake-state/seq.log" '$1 == "S" && $NF == "gen_f"'
+  want 'build lane: the item log holds the build pass and the end of it' "$t/target/c-bl-fail/g-steal-fix.log" '^=== build pass ended rc 7: the run never starts$'
+  want 'build lane: …and the build pass text above it' "$t/target/c-bl-fail/g-steal-fix.log" '^=== build try 1 .* lane=build: '
+  want_no_row 'build lane: a failed build writes no times row' "$t/times-bl-fail.tsv" '$1 ~ /^steal-fix@/'
+  MSRC=$t/tools/gate-batch-bl.sh mutant_of bl-nofail 's|^          fail) BS_KIND=fail BS_RC=\$a BS_SEC=\$b ;;$|          fail) BS_KIND=ok BS_SEC=$b ;; # MUTANT bl-nofail|' '# MUTANT bl-nofail$'
+  rc=$(BL=1 MTAG=bl-nofail steal_case bl-failm "steal-fix	A	3090	10	$d" "plain-any	B	a6000	10	$d" -- 'steal-fix@FAKE_BUILD_RC=7' 'plain-any@FAKE_SLEEP=1')
+  if grep -Eq '^S .* gen_f$' "$t/fake-state/seq.log"; then pass 'build lane mutant: a failed build that is ignored lets the run start'
+  else fail 'build lane mutant: a failed build that is ignored lets the run start' "$(grep -E ' gen_f$' "$t/fake-state/seq.log" | tr '\n' '|')"; fi
+  # (b') Contention in the pass (rc 75) is no verdict on the build: the item builds in its run lane, which meets the box by its own rules.
+  rc=$(BL=1 steal_case bl-busy "steal-fix	A	3090	10	$d" -- 'steal-fix@FAKE_BUILD_RC=75')
+  printf '%s' "$rc" > "$t/rc-bl-busy"
+  rc_ok 'build lane: a build pass that meets contention (rc 75) leaves the item to its run lane, green' bl-busy 1
+  want 'build lane: …and its line names why it built inline' "$t/target/c-bl-busy/run.log" '^steal-fix rc=0 [0-9]+s try=1 lane=A tier=real build=inline build pass rc 75 '
+  # (c) The inline fallback is named, by the rule, with the step that forces it; a script that reads the variable is a runner with a form.
+  out=$(BLOOMERY_GATE_TIMES=$t/times.tsv bash "$t/tools/gate-batch-bl.sh" --dry-run steal-fix bl-inline bl-loop bl-nodecl bl-decl 2>&1) || fail 'build lane: the dry run of the inline shapes failed' "$out"
+  if grep -Eq '^gate-batch: build lane: 2 item\(s\) built ahead of their runs, .* 3 item\(s\) build inline in their run lane \(' <<< "$out"; then pass 'build lane: the dry run counts the items built ahead (a runner, a script that reads the variable) and the inline ones'
+  else fail 'build lane: the dry run counts the items built ahead (a runner, a script that reads the variable) and the inline ones' "$(grep '^gate-batch: build lane' <<< "$out")"; fi
+  if grep -q 'tools/bl-no.sh (it does not read BLOOMERY_BUILD_ONLY' <<< "$out" && grep -q 'mkdir (a step outside the box command)' <<< "$out" && grep -q 'a box call the rule cannot read' <<< "$out"; then pass 'build lane: the dry run names each inline reason (the script, the step, the loop)'
+  else fail 'build lane: the dry run names each inline reason (the script, the step, the loop)' "$(grep '^gate-batch: build lane' <<< "$out")"; fi
+  if grep -A2 '^lane [ABH]  bl-nodecl' <<< "$out" | grep -q 'builds inline in its run lane: tools/bl-no.sh'; then pass 'build lane: an inline item'"'"'s plan line says so'
+  else fail 'build lane: an inline item'"'"'s plan line says so' "$(grep -A2 '^lane [ABH]  bl-nodecl' <<< "$out")"; fi
+  MSRC=$t/tools/gate-batch-bl.sh mutant_of bl-nodecl 's|        if BUILD_ONLY_VAR in budget_text(script):|        if False and BUILD_ONLY_VAR in budget_text(script): # MUTANT bl-nodecl|' '# MUTANT bl-nodecl$'
+  out=$(BLOOMERY_GATE_TIMES=$t/times.tsv bash "$t/tools/gate-batch-bl-nodecl.sh" --dry-run steal-fix bl-inline bl-loop bl-nodecl bl-decl 2>&1) || true
+  if grep -Eq '^gate-batch: build lane: 0 item\(s\) built ahead' <<< "$out"; then pass 'build lane mutant: with no reading of the script, the runners themselves would build inline'
+  else fail 'build lane mutant: with no reading of the script, the runners themselves would build inline' "$(grep '^gate-batch: build lane' <<< "$out")"; fi
+  # (c'') Items the lane cannot build ahead say so at the run, once the batch runs them (the line, and no build call).
+  rc=$(BL=1 steal_case bl-nodecl "steal-fix	A	3090	10	$d" "bl-nodecl	B	a6000	10	$d" -- steal-fix bl-nodecl)
+  printf '%s' "$rc" > "$t/rc-bl-nodecl"
+  want 'build lane: a script with no build-only form runs once, inline, and its line says which' "$t/target/c-bl-nodecl/run.log" '^bl-nodecl rc=0 [0-9]+s try=1 lane=[ABH] tier=real build=inline tools/bl-no.sh \(it does not read BLOOMERY_BUILD_ONLY'
+  want_no_row 'build lane: …and no build-only call was made for it' "$t/fake-state/build.log" '$3 ~ /bl-no.sh$/'
+  MSRC=$t/tools/gate-batch-bl.sh mutant_of bl-noname 's|^      inline) bline="build=inline \$BS_WHY" ;;$|      inline) ;; # MUTANT bl-noname|' '# MUTANT bl-noname$'
+  rc=$(BL=1 MTAG=bl-noname steal_case bl-namem "steal-fix	A	3090	10	$d" "bl-nodecl	B	a6000	10	$d" -- steal-fix bl-nodecl)
+  if grep -q 'build=inline' "$t/target/c-bl-namem/run.log"; then fail 'build lane mutant: an inline item with no name in its line' "the line names it"
+  else pass 'build lane mutant: an inline item with no name in its line'; fi
+  # (d) --no-build-lane is today's flow: the plan lines of the fixed list are the base tree's, byte for byte (BL_GOLDEN is the base
+  # script's output on this fixture), and the batch makes no build call.
+  printf '%s\n' "steal-fix	A	3090	60	$d" "host	B	none	70	$d" "steal-bal	A	3090	50	$d" "plain-any	B	a6000	20	$d" > "$t/times-bl-gold.tsv"
+  out=$(BLOOMERY_GATE_TIMES=$t/times-bl-gold.tsv bash "$t/tools/gate-batch-bl.sh" --no-build-lane --dry-run steal-fix host steal-bal plain-any 2>&1) || fail 'build lane: --no-build-lane dry run failed' "$out"
+  cat > "$t/bl-golden.txt" << 'GOLD'
+lane A  steal-fix                    BLOOMERY_BOX_ENV='BLOOMERY_GATE_CARD=3090' just steal-fix
+        fixed, expected 60 s (median of 1 row) — steal-fix: gpu-gate.sh 3090
+lane A  steal-bal                    BLOOMERY_BOX_ENV='BLOOMERY_GATE_CARD=3090' just steal-bal
+        balanced, expected 50 s (median of 1 row) — steal-bal: gpu-gate.sh any
+        movable — a free lane takes it on its card, longest-est first (never a fixed, solo or v41-load item)
+lane B  host                         just host
+        balanced, expected 70 s (median of 1 row) — no device code
+        movable — a free lane takes it on its card, longest-est first (never a fixed, solo or v41-load item)
+lane B  plain-any                    BLOOMERY_BOX_ENV='BLOOMERY_GATE_CARD=a6000' just plain-any
+        balanced, expected 20 s (median of 1 row) — plain-any: gpu-gate.sh any
+        movable — a free lane takes it on its card, longest-est first (never a fixed, solo or v41-load item)
+gate-batch: predicted laneA=110s laneB=90s laneX=0s chain=0s wall=110s
+GOLD
+  BL_GOLDEN=$(cat "$t/bl-golden.txt")
+  bl_plan() { grep -E '^(lane |        |gate-batch: predicted)' | sed -e "s#$t#T#g" -e 's/ (derived: .*$//'; }
+  got=$(bl_plan <<< "$out")
+  if [ "$got" = "$BL_GOLDEN" ]; then pass 'build lane: --no-build-lane prints the base tree'"'"'s plan for the fixed list, byte for byte'
+  else fail 'build lane: --no-build-lane prints the base tree'"'"'s plan for the fixed list, byte for byte' "$(diff <(printf '%s\n' "$BL_GOLDEN") <(printf '%s\n' "$got") | head -8)"; fi
+  MSRC=$t/tools/gate-batch-bl.sh mutant_of bl-noflag 's|^    --no-build-lane) BUILD_LANE=0 BUILD_OFF=flag; shift ;;$|    --no-build-lane) shift ;; # MUTANT bl-noflag|' '# MUTANT bl-noflag$'
+  out=$(BLOOMERY_GATE_TIMES=$t/times-bl-gold.tsv bash "$t/tools/gate-batch-bl-noflag.sh" --no-build-lane --dry-run steal-fix host steal-bal plain-any 2>&1) || true
+  if [ "$(bl_plan <<< "$out")" != "$BL_GOLDEN" ]; then pass 'build lane mutant: a flag that does not turn the lane off changes the plan'
+  else fail 'build lane mutant: a flag that does not turn the lane off changes the plan' "the plan is the base's"; fi
+  rc=$(BL=1 steal_case bl-flagoff "steal-fix	A	3090	10	$d" "plain-any	B	a6000	10	$d" -- --no-build-lane steal-fix plain-any)
+  printf '%s' "$rc" > "$t/rc-bl-flagoff"
+  rc_ok 'build lane: --no-build-lane runs the batch as before, green' bl-flagoff 2
+  want_no_row 'build lane: …with no build-only call' "$t/fake-state/build.log" '1'
+  want 'build lane: …and no build= field in its lines' "$t/target/c-bl-flagoff/run.log" '^steal-fix rc=0 [0-9]+s try=1 lane=A tier=real ledger=pending'
+  # (e) Card-free items (times row card none) run on the host lane, beside the cards' lanes, not behind a card item.
+  out=$(BLOOMERY_GATE_TIMES=$t/times-bl-gold.tsv bash "$t/tools/gate-batch-bl.sh" --dry-run steal-fix host steal-bal plain-any 2>&1) || fail 'build lane: the dry run with a card-free item failed' "$out"
+  if grep -Eq '^lane H  host ' <<< "$out" && grep -A3 '^lane H  host' <<< "$out" | grep -q '; host lane'; then pass 'build lane: a card-free item is planned on the host lane, and the plan says why'
+  else fail 'build lane: a card-free item is planned on the host lane, and the plan says why' "$(grep -A3 'host' <<< "$out" | head -6)"; fi
+  MSRC=$t/tools/gate-batch-bl.sh mutant_of bl-nohost 's|^    elif bl and cls == "F" and labels == \["none"\]:$|    elif False and bl and cls == "F" and labels == ["none"]: # MUTANT bl-nohost|' '# MUTANT bl-nohost$'
+  out=$(BLOOMERY_GATE_TIMES=$t/times-bl-gold.tsv bash "$t/tools/gate-batch-bl-nohost.sh" --dry-run steal-fix host steal-bal plain-any 2>&1) || true
+  if grep -Eq '^lane [AB]  host ' <<< "$out"; then pass 'build lane mutant: without the rule a card-free item takes a card lane'
+  else fail 'build lane mutant: without the rule a card-free item takes a card lane' "$(grep 'host' <<< "$out" | head -3)"; fi
+  rc=$(BL=1 steal_case bl-host "steal-fix	A	3090	10	$d" "plain-any	B	a6000	10	$d" "host	B	none	10	$d" -- 'steal-fix@FAKE_SLEEP=3' 'plain-any@FAKE_SLEEP=3' 'host@FAKE_SLEEP=1')
+  printf '%s' "$rc" > "$t/rc-bl-host"
+  rc_ok 'build lane: a batch with a card-free item ends green' bl-host 3
+  want 'build lane: the card-free item ran in lane H' "$t/target/c-bl-host/run.log" '^host rc=0 [0-9]+s try=1 lane=H tier=real build=[0-9]+s'
+  want 'build lane: its times row names lane B and card none (the file'"'"'s own three lanes)' "$t/times-bl-host.tsv" "$(printf '^host@FAKE_SLEEP=1\tB\tnone\t')"
+  if [ "$(line_before "$t/fake-state/seq.log" S x E gen_f)" = yes ] && [ "$(line_before "$t/fake-state/seq.log" S x E other)" = yes ]; then pass 'build lane: the card-free item started before either card lane finished its first item'
+  else fail 'build lane: the card-free item started before either card lane finished its first item' "$(grep -E ' (x|gen_f|other)$' "$t/fake-state/seq.log" | tr '\n' '|')"; fi
+  want 'build lane: the DONE line names the host lane' "$t/target/c-bl-host/run.log" '^DONE total=3 red=0 .* build-lane=[0-9]+s laneH=[0-9]+s lockwait=0$'
+  # The lock waits (cargo's line in a run pass's own log) are counted, the build pass's are not.
+  rc=$(BL=1 steal_case bl-lock "steal-fix	A	3090	10	$d" "plain-any	B	a6000	10	$d" -- 'steal-fix@FAKE_LOCKWAIT=1' plain-any)
+  printf '%s' "$rc" > "$t/rc-bl-lock"
+  want 'build lane: a run pass that waited on cargo'"'"'s build-directory lock is counted in the DONE line' "$t/target/c-bl-lock/run.log" '^DONE total=2 red=0 .* lockwait=1$'
+  # The lane's off switches: one lane (nothing to overlap) and the flag are named, and the batch is today's.
+  out=$(BLOOMERY_GATE_TIMES=$t/times-bl-gold.tsv bash "$t/tools/gate-batch-bl.sh" --lanes 1 --dry-run steal-fix host 2>&1) || fail 'build lane: --lanes 1 dry run failed' "$out"
+  if grep -q '^gate-batch: build lane: off (--lanes 1: one lane, nothing to overlap)$' <<< "$out" && ! grep -q 'build-lane=' <<< "$out"; then pass 'build lane: --lanes 1 turns it off by name'
+  else fail 'build lane: --lanes 1 turns it off by name' "$(grep 'build lane\|predicted' <<< "$out" | cut -c1-200)"; fi
+  # A chain, a steal and the pack with the lane on: the same scenario as the chain case of part 2, ending green, the members apart,
+  # every built-ahead call built before it ran.
+  rc=$(BL=1 steal_case bl-chain "steal-slow	A	3090	15	$d" "plain-any	B	a6000	5	$d" "gate-gpu-ds41-residency-a	B	a6000	3	$d" "v41-any	A	3090	2	$d" \
+    -- 'steal-slow@FAKE_SLEEP=15,FAKE_BUILD_SLEEP=1' 'plain-any@FAKE_SLEEP=1' 'gate-gpu-ds41-residency-a@FAKE_SLEEP=3' 'v41-any@FAKE_SLEEP=2' x-q)
+  printf '%s' "$rc" > "$t/rc-bl-chain"
+  rc_ok 'build lane: a chain batch with a pack item ends green' bl-chain 5
+  bad_order=''
+  for w in gen_s other gen_x 'gen_ra --place a' xq; do
+    [ "$(built_before "$t/fake-state/seq.log" "$w")" = yes ] || bad_order="$bad_order $w=$(built_before "$t/fake-state/seq.log" "$w")"
+  done
+  if [ -z "$bad_order" ]; then pass 'build lane: with a chain and a pack, every run starts after its own build pass'
+  else fail 'build lane: with a chain and a pack, every run starts after its own build pass' "$bad_order"; fi
+  # A ledger skip is no build and no run: its one line is written once, the lane beside it goes on, and no build pass is made for it.
+  printf 'stub-plain-any@BLOOMERY_GATE_CARD=a6000\n' > "$t/green-bl"
+  rc=$(BL=1 FAKE_GREEN_FILE=$t/green-bl steal_case bl-skip "plain-any	B	a6000	10	$d" "steal-fix	A	3090	10	$d" -- plain-any steal-fix)
+  printf '%s' "$rc" > "$t/rc-bl-skip"
+  rc_ok 'build lane: a ledger skip and a run beside it end green' bl-skip 2
+  if [ "$(grep -c '^plain-any rc=skip ' "$t/target/c-bl-skip/run.log")" = 1 ]; then pass 'build lane: the skipped item has one skip line'
+  else fail 'build lane: the skipped item has one skip line' "$(grep '^plain-any' "$t/target/c-bl-skip/run.log")"; fi
+  want_no_row 'build lane: …and no build pass was made for it' "$t/fake-state/build.log" '$3 ~ / other$/'
+  want 'build lane: …while the item beside it was built and ran' "$t/target/c-bl-skip/run.log" '^steal-fix rc=0 [0-9]+s try=1 lane=A tier=real build=[0-9]+s '
+  # The ledger's rows are the same with the lane: its key reads the item's env and card, never the build pass's.
+  rm -f "$t/rounds-bl-led-on.tsv" "$t/rounds-bl-led-off.tsv"
+  rc=$(BL=1 steal_case bl-led-on "steal-fix	A	3090	10	$d" -- steal-fix)
+  rc=$(steal_case bl-led-off "steal-fix	A	3090	10	$d" -- steal-fix)
+  want_row 'build lane: the ledger row key is the legacy row key' "$t/rounds-bl-led-on.tsv" "\$1 == \"$(cut -f1 "$t/rounds-bl-led-off.tsv" 2> /dev/null | head -1)\" && \$2 == \"steal-fix\""
+  # Stopping the batch (TERM) ends the build lane's box call as it ends a run lane's: the lane's pid, child and box files are read by the same
+  # globs. The call ignores TERM (FAKE_DEAF), so only reap_boxes' KILL after its bound ends it, whatever the sh above box.sh does with a TERM.
+  bl_stop() { # <tag> <script>: a batch whose one item's build pass is held by its call, then stopped; prints <batch rc> <the call: gone|alive|unregistered>
+    local tag=$1 script=$2 o k=0 rc=0 reg='' sp state=alive f
+    o="$t/target/c-$tag"
+    printf '%s\n' "bl-hold	A	3090	30	$d" > "$t/times-$tag.tsv"
+    fresh_state "$o"
+    BLOOMERY_GATE_TIMES=$t/times-$tag.tsv BLOOMERY_GATE_LEDGER=$t/lead-$tag.tsv BLOOMERY_GATE_ROUND_LEDGER=$t/rounds-$tag.tsv \
+      bash "$script" --out "$o" --round-ledger 'bl-hold@FAKE_BUILD_SLEEP=60,FAKE_DEAF=1' > "$t/out-$tag.log" 2>&1 &
+    sp=$!
+    while [ "$k" -lt 200 ]; do # the pass's call has registered
+      for f in "$o"/lane-build.box/*; do
+        if [ -e "$f" ]; then reg=${f##*/}; break; fi
+      done
+      [ -z "$reg" ] || break
+      sleep 0.1
+      k=$((k + 1))
+    done
+    kill -TERM "$sp" 2> /dev/null || true
+    k=0
+    while kill -0 "$sp" 2> /dev/null && [ "$k" -lt 400 ]; do
+      sleep 0.1
+      k=$((k + 1))
+    done
+    if kill -0 "$sp" 2> /dev/null; then kill -TERM "$sp" 2> /dev/null || true; fi
+    wait "$sp" 2> /dev/null || rc=$?
+    if [ -z "$reg" ]; then state=unregistered
+    elif call_alive "$reg"; then state=alive
+    else state=gone; fi
+    printf '%s %s' "$rc" "$state"
+    [ "$state" != alive ] || kill -KILL "$reg" 2> /dev/null || true
+  }
+  res=$(bl_stop bl-stop "$t/tools/gate-batch-bl-fast.sh")
+  if [ "$res" = '130 gone' ]; then pass 'build lane: TERM to the batch ends the box.sh call of a build pass (130)'
+  else fail 'build lane: TERM to the batch ends the box.sh call of a build pass (130)' "rc and call: '$res'"; fi
+  MSRC=$t/tools/gate-batch-bl-fast.sh mutant_of bl-reapoff 's|^\( *\)reap_boxes$|\1: # MUTANT bl-reapoff|' '# MUTANT bl-reapoff$'
+  res=$(bl_stop bl-stopm "$t/tools/gate-batch-bl-reapoff.sh")
+  if [ "$res" = '130 alive' ]; then pass 'build lane mutant: without the reap the build pass'"'"'s call outlives the stop'
+  else fail 'build lane mutant: without the reap the build pass'"'"'s call outlives the stop' "rc and call: '$res' (want '130 alive')"; fi
+  # gate.sh's build-only mode against a stub cargo: the build phase runs, the test phase never starts, the build's own rc ends the call.
+  mkdir -p "$t/stubbin" "$t/gtools"
+  printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$STUB_LOG"' 'case "$*" in *--no-run*) exit "${STUB_BUILD_RC:-0}" ;; esac' 'echo "test result: ok. 1 passed; 0 failed"' 'exit 0' > "$t/stubbin/cargo"
+  chmod +x "$t/stubbin/cargo"
+  cp "$(dirname "$self")/gate.sh" "$(dirname "$self")/gate-bound.sh" "$t/gtools/"
+  gate_stub() { # <env assignments…> -- <gate.sh args…>: the stub cargo's calls of one gate.sh call, then its rc
+    local genv=() rcg=0
+    while [ "$1" != -- ]; do genv+=("$1"); shift; done
+    shift
+    : > "$t/stub.log"
+    (cd "$t" && env STUB_LOG="$t/stub.log" PATH="$t/stubbin:$PATH" ${genv[@]+"${genv[@]}"} bash "${GATE_SH:-$t/gtools/gate.sh}" "$@" > "$t/gate-stub.out" 2>&1) || rcg=$?
+    printf '%s|%s' "$rcg" "$(tr '\n' ',' < "$t/stub.log")"
+  }
+  if [ "$(gate_stub BLOOMERY_BUILD_ONLY=1 -- -p x)" = '0|test -p x --no-run,' ]; then pass 'gate.sh build-only: the build phase runs, the test phase never starts, rc 0'
+  else fail 'gate.sh build-only: the build phase runs, the test phase never starts, rc 0' "$(gate_stub BLOOMERY_BUILD_ONLY=1 -- -p x)"; fi
+  if [ "$(gate_stub BLOOMERY_BUILD_ONLY=1 -- -p x -- somefilter)" = '0|test -p x --no-run,' ]; then pass 'gate.sh build-only: the same with a test-name filter (no filter verdict without a run)'
+  else fail 'gate.sh build-only: the same with a test-name filter (no filter verdict without a run)' "$(gate_stub BLOOMERY_BUILD_ONLY=1 -- -p x -- somefilter)"; fi
+  if [ "$(gate_stub BLOOMERY_BUILD_ONLY=1 STUB_BUILD_RC=101 -- -p x)" = '101|test -p x --no-run,' ]; then pass 'gate.sh build-only: a failed build ends with the build'"'"'s own rc'
+  else fail 'gate.sh build-only: a failed build ends with the build'"'"'s own rc' "$(gate_stub BLOOMERY_BUILD_ONLY=1 STUB_BUILD_RC=101 -- -p x)"; fi
+  if [ "$(gate_stub BLOOMERY_BUILD_ONLY=0 -- -p x)" = '0|test -p x --no-run,test -p x,' ]; then pass 'gate.sh build-only: 0 runs the test after its build, as ever'
+  else fail 'gate.sh build-only: 0 runs the test after its build, as ever' "$(gate_stub BLOOMERY_BUILD_ONLY=0 -- -p x)"; fi
+  if [ "$(gate_stub BLOOMERY_BUILD_ONLY=7 -- -p x | cut -d'|' -f1)" = 64 ]; then pass 'gate.sh build-only: any other value ends 64 before cargo runs'
+  else fail 'gate.sh build-only: any other value ends 64 before cargo runs' "$(gate_stub BLOOMERY_BUILD_ONLY=7 -- -p x)"; fi
+  if [ "$(gate_stub BLOOMERY_BUILD_ONLY=1 -- --doc -p x | cut -d'|' -f1)" = 0 ] && grep -q 'a --doc call has no build phase' "$t/gate-stub.out"; then pass 'gate.sh build-only: a --doc call builds nothing, says so, ends 0 (the batch builds such a recipe inline)'
+  else fail 'gate.sh build-only: a --doc call builds nothing, says so, ends 0 (the batch builds such a recipe inline)' "$(cat "$t/gate-stub.out")"; fi
+  sed 's/^  \[ "\$BUILD_ONLY" = 0 \] || exit 0\( #.*\)\{0,1\}$/  true # MUTANT gs-norun/' "$t/gtools/gate.sh" > "$t/gtools/gate-mut.sh"
+  n=$((n + 1))
+  if [ "$(grep -c '# MUTANT gs-norun$' "$t/gtools/gate-mut.sh")" = 3 ]; then echo "mutant gs-norun: the three BUILD_ONLY exits of gate.sh removed"
+  else bad=$((bad + 1)); echo "FAIL mutant gs-norun: the sed did not remove the three exits"; fi
+  note_case 'mutant gs-norun'
+  if [ "$(GATE_SH=$t/gtools/gate-mut.sh gate_stub BLOOMERY_BUILD_ONLY=1 -- -p x)" = '0|test -p x --no-run,test -p x,' ]; then pass 'gate.sh mutant: without the short-circuit the stub test phase is reached'
+  else fail 'gate.sh mutant: without the short-circuit the stub test phase is reached' "$(GATE_SH=$t/gtools/gate-mut.sh gate_stub BLOOMERY_BUILD_ONLY=1 -- -p x)"; fi
+  fi
   # One row per case (seconds, then the name). A miss is a case the summary cannot name.
   [ -f "$t/case-times.tsv" ] || : > "$t/case-times.tsv"
   local times
@@ -4627,7 +4941,7 @@ if [ "${1:-}" = --self-test ]; then
   esac
 fi
 OUT='' OUT_AUTO=0 SRC='' LIST='' DRY=0 LANES='' LEDGER=0 RERUN=0 LMODE='' TRUST=0 LFAST=0 TRUSTF=0 TIER_FLAG='' NOHOLD=0 BUDGET_OK=0 WAIT_HOLD='' YIELD=0
-CANARY=1 RED_MAIN=0
+CANARY=1 RED_MAIN=0 BUILD_LANE=1 BUILD_OFF=''
 ITEMS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -4651,6 +4965,7 @@ while [ $# -gt 0 ]; do
     --rerun) RERUN=1; shift ;;
     --over-budget-ok) BUDGET_OK=1; shift ;;
     --no-canary) CANARY=0; shift ;;
+    --no-build-lane) BUILD_LANE=0 BUILD_OFF=flag; shift ;;
     --red-main-check) RED_MAIN=1; shift ;;
     --wait-hold) WAIT_HOLD=3600
       # an optional bound: the next word when it is whole seconds (an item is a recipe name, never a number)
@@ -4705,6 +5020,13 @@ LOCAL_RUN=0
 if [ -z "$LANES" ]; then
   LANES=2
   [ "$LOCAL_RUN" = 0 ] || LANES=1
+fi
+# The build lane (the header's «Build lane») overlaps the box's cargo builds with the two cards' runs: it needs the two lanes, and it
+# is off under the box queue, which runs one job of a tree at a time, so a build pass would only queue beside the runs.
+if [ "$BUILD_LANE" = 1 ] && [ "$LANES" != 2 ]; then
+  BUILD_LANE=0 BUILD_OFF='--lanes 1: one lane, nothing to overlap'
+elif [ "$BUILD_LANE" = 1 ] && [ "${BLOOMERY_BOX_QUEUE:-0}" = 1 ]; then
+  BUILD_LANE=0 BUILD_OFF='BLOOMERY_BOX_QUEUE=1: the queue runs one job of a tree at a time'
 fi
 if [ -n "${BLOOMERY_PACK_BUDGET+x}" ]; then
   case $BLOOMERY_PACK_BUDGET in
@@ -4765,8 +5087,8 @@ IFS= read -r -d '' PYPLAN << 'PY' || true
 import fcntl, json, os, re, shlex, statistics, subprocess, sys
 from datetime import datetime
 
-root, lanes, src, listfile, caller_env, times_path, default_s, tier, chain_list = sys.argv[1:10]
-raw_items = sys.argv[10:]
+root, lanes, src, listfile, caller_env, times_path, default_s, tier, chain_list, build_path, build_lane = sys.argv[1:12]
+raw_items = sys.argv[12:]
 chain_solo_real = frozenset(chain_list.split())
 just = ["just", "--justfile", root + "/justfile", "--working-directory", root]
 
@@ -5226,6 +5548,121 @@ def bounded_calls(name):
     return out
 
 
+# The build lane's rule (the header's «Build lane»): a recipe's build is done ahead of its run only when the build-only form of its box
+# command does nothing but build — every `&&` segment of every box command is a cargo build, a call of a script that reads
+# BLOOMERY_BUILD_ONLY (tools/gate.sh and tools/gpu-gate.sh: each ends 0 after its build, before any lock; the script's own text is the
+# declaration, so a runner that gains the short-circuit joins with no list to edit), one of the tier guards, or an environment
+# assignment. Any other step (a script that does not read it, a copy, a check, a runner with no build-only form) would run twice, or
+# race another item's, so the recipe builds inline in its run lane, named with that step. A recipe with no box command is the Mac's
+# and builds nothing on the box.
+BUILD_GUARDS = ("tools/ref/real-only.sh", "tools/ref/fixture-only.sh", "tools/ref/needs-env.sh")
+BUILD_ONLY_VAR = "BLOOMERY_BUILD_ONLY"
+ENV_WORD = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+ESC_QUOTE = "'\\''"
+
+
+def split_and(cmd):
+    """(segments, why): a box command split on its top-level `&&`; why names control flow or a substitution, which the rule does not read."""
+    cmd = cmd.replace(ESC_QUOTE, "\x00")
+    segs, cur, q, i = [], [], None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if q:
+            if c == q:
+                q = None
+            elif q == '"' and (cmd.startswith("$(", i) or c == "`"):
+                return None, "a command substitution"
+            cur.append(c)
+            i += 1
+            continue
+        if c in "'\"":
+            q = c
+        elif cmd.startswith("&&", i):
+            segs.append("".join(cur))
+            cur = []
+            i += 2
+            continue
+        elif cmd.startswith("$(", i) or cmd.startswith("<<", i) or c in ";|`\n":
+            return None, "control flow or a substitution (" + (cmd[i:i + 2].strip() or "a line break") + ")"
+        cur.append(c)
+        i += 1
+    if q:
+        return None, "an unterminated quote"
+    segs.append("".join(cur))
+    return segs, ""
+
+
+def segment_why(seg):
+    """'' when a segment builds only (or sets the environment, or is a tier guard), else what it is."""
+    try:
+        words = shlex.split(seg)
+    except ValueError:
+        return "a segment the rule cannot split into words"
+    while words and (ENV_WORD.match(words[0]) or words[0] == "export"):
+        words.pop(0)
+    if not words:
+        return ""
+    head = words[0]
+    if head in ("bash", "sh") and len(words) > 1:
+        script = os.path.normpath(words[1])
+        if script in BUILD_GUARDS:
+            return ""
+        if BUILD_ONLY_VAR in budget_text(script):
+            return "a `--doc` call (its doctests compile inside its run)" if "--doc" in words else ""
+        return f"{script} (it does not read {BUILD_ONLY_VAR}: it would run in the build pass)"
+    if head == "cargo" and (words[1:2] == ["build"] or words[1:3] == ["oxide", "build"]):
+        return ""
+    return f"{head} (not a build)"
+
+
+def build_mode(name):
+    """(mode, why): `ahead` when the recipe's box commands only build and call the runners' build-only forms, else `inline` with the first
+    step that is not a build (a recipe with no box command builds where it runs: inline too)."""
+    boxes, other, mentions = [], [], False
+    for n in closure(name, set()):
+        text = body(n)
+        mentions = mentions or "box.sh" in text
+        spans = []
+        for m in re.finditer(re.escape(BOX_OPEN), text):
+            i = m.end()
+            while True:
+                j = text.find("'", i)
+                if j < 0:
+                    j = len(text)
+                    break
+                if text.startswith("'\\''", j):
+                    i = j + 4
+                    continue
+                break
+            spans.append((m.start(), min(j + 1, len(text))))
+            boxes.append(text[m.end():j])
+        rest = text
+        for a, b in reversed(spans):
+            rest = rest[:a] + rest[b:]
+        for line in rest.split("\n"):
+            line = line.strip().lstrip("@-").strip()
+            line = re.sub(r"^(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(?:\./)?", "", line)
+            if line and line != "\\" and not line.startswith("#"):
+                other.append(line.split()[0])
+        if recipes[n].get("shebang") and spans:
+            return "inline", "a shebang recipe holds the box command"
+    if not boxes:
+        if mentions:
+            return "inline", "a box call the rule cannot read (it is not a ./tools/box.sh '…' line)"
+        return "inline", "no box command (it builds, if it builds, where gate-batch runs it)"
+    if other:
+        return "inline", f"{other[0]} (a step outside the box command)"
+    for cmd in boxes:
+        segs, why = split_and(cmd)
+        if segs is None:
+            return "inline", why
+        for seg in segs:
+            why = segment_why(seg)
+            if why:
+                return "inline", why
+    return "ahead", ""
+
+
 def defer_tags(name):
     """What defers a recipe, for the plan's reason text: the fixture tier's kinds (real-only, no-fixture, real-file) and the real
     tier's (fixture-only), each shown in either tier as the recipe's own fact."""
@@ -5555,7 +5992,7 @@ TIMES_LANES, TIMES_CARDS = ("A", "B", "X"), ("3090", "a6000", "both", "none", "a
 DEFAULT_S = int(default_s)
 
 
-def load_times(path):
+def load_times(path, lane_names=TIMES_LANES):
     """{item: [seconds, …]} in file order. A missing file is empty; a malformed row is a named error."""
     try:
         fd = os.open(path, os.O_RDONLY)
@@ -5589,8 +6026,8 @@ def load_times(path):
             bad = f"{len(f)} fields, not 5"
         elif not ITEM.match(f[0]):
             bad = f"item {f[0]!r} is not NAME[@K=V,…][:ARGS]"
-        elif f[1] not in TIMES_LANES:
-            bad = f"lane {f[1]!r} is not A, B or X"
+        elif f[1] not in lane_names:
+            bad = f"lane {f[1]!r} is not {', '.join(lane_names[:-1])} or {lane_names[-1]}"
         elif f[2] not in TIMES_CARDS:
             bad = f"card {f[2]!r} is not one of {', '.join(TIMES_CARDS)}"
         elif not re.fullmatch(r"[0-9]+", f[3]):
@@ -5607,6 +6044,16 @@ def load_times(path):
 
 
 TIMES = load_times(times_path)
+# The build lane's own rows (the header's «Build lane»): the seconds of each item's build-only pass, the same five fields in a file of
+# their own, so the times file's format and every other tree's reader of it stay as they are. Lane `L` is the build lane.
+BUILD_LANE_NAMES = ("L",)
+BUILD_TIMES = load_times(build_path, BUILD_LANE_NAMES) if build_lane == "1" else {}
+
+
+def build_expected(key):
+    """The median of the item's last 5 build rows in whole seconds, -1 with none: no number is invented."""
+    got = BUILD_TIMES.get(key, [])[-5:]
+    return int(statistics.median(got) + 0.5) if got else -1
 
 
 def expected(key):
@@ -5861,7 +6308,7 @@ if src == "classes":
     sys.exit(0)
 
 prefetch_real_file([m.group(1) for m in map(ITEM.match, raw_items) if m and m.group(1) in recipes])
-counts, errors, out, fams = {}, [], [], []
+counts, errors, out, fams, bms = {}, [], [], [], []
 budget_over, budget_unchecked = [], []
 onebox = set()
 for item, at in zip(raw_items, where):
@@ -5939,6 +6386,8 @@ for item, at in zip(raw_items, where):
         errors.append(f"{at}: {item!r} holds a tab or a newline in its env or ARGS: the times file is one tab-separated row per item")
         continue
     exp, esrc = expected(tkey)
+    bmode, bwhy = build_mode(name) if build_lane == "1" else ("-", "")
+    bsec = build_expected(tkey) if bmode == "ahead" else 0
     cls, kind, cards, labels = placement(name, lane, lanes, envs)
     if kind == "needs-env":
         reason = f"{', '.join(sorted({v for _, v in env_missing(name, envs)}))} is not set in the item's env or BLOOMERY_BOX_ENV; " + reason
@@ -5970,6 +6419,7 @@ for item, at in zip(raw_items, where):
                             family(name) if cls in ("X", "C") else "", held,
                             " ".join([rflags, str(rbytes)]) if cls == "X" else ""]))
     fams.append(family(name) if cls in ("X", "C") else "")
+    bms.append((bmode, bsec, bwhy))
 if errors:
     for e in errors:
         print("gate-batch: " + e, file=sys.stderr)
@@ -5997,8 +6447,15 @@ fam_order = ([f for f in reversed(x_fams) if f != x_first and f in chain_fams]
              + ([x_first] if x_first in chain_fams else []))
 cs = sorted(ck, key=lambda k: (fam_order.index(fams[k]), k))
 final_of = {k: i for i, k in enumerate(k2 for k2 in range(len(out)) if not out[k2].startswith(("X\x1f", "D\x1f")))}
-out = [rec for rec in out if not rec.startswith("X\x1f")] + [out[k] for k in xs]
+run_order = [k for k, rec in enumerate(out) if not rec.startswith("X\x1f")] + xs
+out = [out[k] for k in run_order]
+bms = [bms[k] for k in run_order]
 print("\n".join(out))
+if build_lane == "1":
+    # The build rule per plan record, in the order of the shell's records (the deferred ones leave): `U`, the modes, the build seconds of
+    # an `ahead` item (-1: no row yet) and the reasons, \x1e between them.
+    kept = [b for rec, b in zip(out, bms) if not rec.startswith("D\x1f")]
+    print("\x1f".join(["U", ",".join(b[0] for b in kept), " ".join(str(b[1]) for b in kept), "\x1e".join(b[2] for b in kept)]))
 if cs:
     print("\x1f".join(["K", " ".join(str(final_of[k]) for k in cs), " ".join(fams[k] for k in cs)]))
 if budget_over or budget_unchecked:
@@ -6032,7 +6489,7 @@ rec_get() { # $1 = plan index, then field names (REC_FIELDS): each name is set, 
     printf -v "$_n" '%s' "${_vals[$_k]-}"
   done
 }
-PLAN0=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" "$TIER" "$CHAIN_SOLO_REAL" ${ITEMS[@]+"${ITEMS[@]}"}) \
+PLAN0=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" "$TIER" "$CHAIN_SOLO_REAL" "$BUILD_FILE" "$BUILD_LANE" ${ITEMS[@]+"${ITEMS[@]}"}) \
   || RC=$? die "the list did not validate (above)"
 if [ "$SRC" = classes ]; then
   printf '%s\n' "$PLAN0"
@@ -6060,6 +6517,7 @@ CHAIN_ORDER=() CHAIN_FAMS=() CHAIN_ACTIVE=0 CHAIN_K=''
 [ "$TIER" = real ] && [ "$LANES" = 2 ] && CHAIN_ACTIVE=1
 BUDGET_OVER=() BUDGET_UNCHECKED=() # the plan's B record: items past 0.75x their bound, and unchecked ones
 TWIN_OK=' ' # the plan's T record: the recipes a queued twin can stand for, space-delimited
+U_REC='' # the plan's U record (the build lane's rule per plan record: PYPLAN's «build_mode»), only with the build lane
 while IFS= read -r rec; do
   case $rec in
     D$'\x1f'*)
@@ -6075,6 +6533,7 @@ while IFS= read -r rec; do
       read -r -a BUDGET_OVER <<< "$bover"
       read -r -a BUDGET_UNCHECKED <<< "$bunc" ;;
     T$'\x1f'*) TWIN_OK=" ${rec#T?} " ;;
+    U$'\x1f'*) U_REC=$rec ;;
     *) R_REC+=("$rec") ;;
   esac
 done <<< "$PLAN0"
@@ -6168,6 +6627,8 @@ IFS= read -r -d '' PYBAL << 'PY' || true
 import sys
 
 lanes = sys.argv[1]
+bl = sys.argv[3] == "1"  # the build lane (the header's «Build lane»): builds leave the run lanes, card-free items get the host lane
+host_width = int(sys.argv[4])
 
 
 def fail(msg):
@@ -6188,17 +6649,33 @@ recs = [ln.split("\x1f") for ln in sys.stdin.read().split("\n") if ln]
 k_order = []
 if recs and recs[0][0] == "K":  # the chain's order (PYPLAN's K record), fed first by the shell
     k_order = [int(x) for x in recs.pop(0)[1].split()]
+umode, usec, uwhy = [], [], []
+if recs and recs[0][0] == "U":  # the build rule per record (PYPLAN's U record), with the build lane
+    u = recs.pop(0)
+    umode, usec, uwhy = (u[1].split(",") if recs else []), [int(x) for x in u[2].split()], (u[3].split("\x1e") if recs else [])
+if bl and not len(umode) == len(usec) == len(uwhy) == len(recs):
+    fail(f"the build rule (the U record) names {len(umode)} modes, {len(usec)} seconds and {len(uwhy)} reasons for {len(recs)} plan records")
+for f in recs:
+    if len(f) != 17:
+        fail(f"a plan record has {len(f)} fields, not 17: {f!r}")
+# The seconds each item costs its run lane. With the build lane an `ahead` item's build seconds leave it (the build lane carries them); a
+# build with no row yet (-1) leaves nothing to take out, so the item keeps its whole time and the plan claims no saving it has no row for.
+EXP = [int(f[8]) for f in recs]
+BSEC = [0] * len(recs)
+if bl:
+    for i in range(len(recs)):
+        if umode[i] == "ahead":
+            BSEC[i] = min(max(usec[i], 0), EXP[i])
+            EXP[i] -= BSEC[i]
 # The K record names every chain member once and no other record: an index that names another
 # item would run it as a member and leave the member it stands for unclaimed by every lane.
 c_recs = [i for i, f in enumerate(recs) if f[0] == "C"]
 if sorted(k_order) != c_recs:
     fail(f"the chain's order (the K record) names {k_order}, but the chain members are {c_recs} "
          f"({' '.join(recs[i][1] for i in c_recs) or 'none'}); the plan's indices are off, nothing ran")
-sums, placed, flex = {"A": 0, "B": 0, "X": 0, "C": 0}, {}, []
+sums, placed, flex, host = {"A": 0, "B": 0, "X": 0, "C": 0}, {}, [], []
 for i, f in enumerate(recs):
-    if len(f) != 17:
-        fail(f"a plan record has {len(f)} fields, not 17: {f!r}")
-    cls, stem, exp, cards, labels, states = f[0], f[1], int(f[8]), f[11].split(), f[12].split(), f[16].split()
+    cls, stem, exp, cards, labels, states = f[0], f[1], EXP[i], f[11].split(), f[12].split(), f[16].split()
     if not cards or not len(cards) == len(labels) == len(states):
         fail(f"{stem}: {len(cards)} card candidates, {len(labels)} labels, {len(states)} ledger states")
     if cls == "C" and lanes == "2":
@@ -6220,6 +6697,10 @@ for i, f in enumerate(recs):
     elif cls in ("A", "B") and len(cards) == 1:
         placed[i] = (cls, 0, 0 if states[0] == "skip" else exp, "")
         sums[cls] += placed[i][2]
+    elif bl and cls == "F" and labels == ["none"]:
+        # The host lane: an item that holds no card runs beside the two cards' lanes, not behind a card's items.
+        placed[i] = ("H", 0, 0 if states[0] == "skip" else exp, "to the host lane (it holds no card)")
+        host.append(i)
     elif cls == "F" and lanes == "2" and lane_cand(cards):
         flex.append(i)
     else:
@@ -6239,8 +6720,8 @@ for i in flex:
     else:
         rest.append(i)
 # Then longest first, each to the lane with the smaller running sum (B on a tie).
-for i in sorted(rest, key=lambda i: (-int(recs[i][8]), i)):
-    ln, lc, exp = "A" if sums["A"] < sums["B"] else "B", lane_cand(recs[i][11].split()), int(recs[i][8])
+for i in sorted(rest, key=lambda i: (-EXP[i], i)):
+    ln, lc, exp = "A" if sums["A"] < sums["B"] else "B", lane_cand(recs[i][11].split()), EXP[i]
     placed[i] = (ln, lc[ln], exp, f"to {ln} (lane sums before it: A {sums['A']} s, B {sums['B']} s)")
     sums[ln] += exp
     seq.append(i)
@@ -6327,6 +6808,13 @@ while left or busy:
     for b in [b for b in busy if b[0] == pack_wall]:
         busy.remove(b)
         free |= b[1]
+def skipped(i):
+    """Whether item i skips at run time (the ledger has it green): nothing of it runs, and nothing of it is built."""
+    ln, c = placed[i][0], placed[i][1]
+    st = recs[i][16].split()
+    return any(s == "skip" for s in st) if ln == "X" else st[c] == "skip"
+
+
 for i, f in enumerate(recs):
     cls, stem, name, env, args, shown, why, kind, exp, esrc, tkey, cards, labels, fam, tag, res, states = f
     ln, c, cost, how = placed[i]
@@ -6354,6 +6842,12 @@ for i, f in enumerate(recs):
         told = f"expected {exp} s ({esrc})"
         if esrc == "default":
             defaults.append(stem)
+    if ln == "H":
+        told += "; host lane"
+    if bl and umode[i] == "ahead" and not skipped(i):
+        told += f"; build lane {BSEC[i]} s" if usec[i] >= 0 else "; build lane (no build row yet)"
+    elif bl and umode[i] == "inline":
+        told += f"; builds inline in its run lane: {uwhy[i]}"
     plan = f"{kind}, {told}"
     # The last field is the item's measured expectation for the box queue (BLOOMERY_Q_PRED_S, whole seconds >= 1):
     # empty at the default.
@@ -6368,8 +6862,8 @@ pinned = {"3090": 0, "a6000": 0}
 pool = {"3090": 0, "a6000": 0, "bal": 0}
 work = sums["C"]
 for i, f in enumerate(recs):
-    if f[0] in ("C", "X"):
-        continue  # the chain has its own term; the pack runs after phase 1
+    if f[0] in ("C", "X") or placed[i][0] == "H":
+        continue  # the chain has its own term; the pack runs after phase 1; the host lane holds no card
     cost, cards, labels, tag = placed[i][2], f[11].split(), f[12].split(), f[14]
     work += cost
     if cards == ["3090"] or (cards == ["-"] and labels == ["3090"]):
@@ -6387,7 +6881,6 @@ tail = max(pool["3090"], pool["a6000"], -(-pool["bal"] // 2),
            -(-(pool["3090"] + pool["a6000"] + pool["bal"]) // 2))
 phase1 = max(sums["C"], -(-work // 2), pinned["3090"], pinned["a6000"], sums["C"] + tail)
 wall = max(phase1, sums["A"], sums["B"]) + pack_wall
-print("\x1f".join(["=", str(sums["A"]), str(sums["B"]), str(pack_wall), str(sums["C"]), str(wall), str(len(defaults)), " ".join(defaults)]))
 # The run order: lanes A and X in record order, lane B's fixed items (class B: a solo-real recipe that picks the A6000 in the
 # fixture tier) first in record order, then its balanced items in the order the balance placed them — its skips, then
 # longest first. Every lane-A item opens with a release build, and cargo holds one build lock per target
@@ -6396,17 +6889,89 @@ print("\x1f".join(["=", str(sums["A"]), str(sums["B"]), str(pack_wall), str(sums
 # (check-recipes, ~130 s, in a narrowed landing list), longest first starts the long builds behind it,
 # while lane A runs its first binaries; when it is a box build, lane B opens with that build as before.
 # The chain's items are in no lane's order: the lanes take them at run time, one at a time.
+host_order = sorted(host, key=lambda i: (-placed[i][2], i))  # the host lane's queue: longest first, as lane B's
 order = ([i for i in range(len(recs)) if placed[i][0] == "A"] + [i for i in range(len(recs)) if recs[i][0] == "B"]
-         + [i for i in seq if placed[i][0] == "B"] + [i for i in range(len(recs)) if placed[i][0] == "X"])
+         + [i for i in seq if placed[i][0] == "B"] + host_order + [i for i in range(len(recs)) if placed[i][0] == "X"])
 nchain = sum(1 for f in recs if f[0] == "C")
 if sorted(order) != sorted(i for i, f in enumerate(recs) if f[0] != "C"):
     fail(f"the run order is not a permutation of the {len(recs)} items ({nchain} of them the chain's): {order}")
+# The build lane's model (the header's «Build lane»). The build queue is the builds in the order their items start in their lanes — an
+# item's start is the run seconds ahead of it in its lane (the host lane's workers take the earliest free one, the chain's members
+# follow one another, the pack opens after the lanes) — so no run lane waits on a build another could have waited for. The lane
+# clocks replay each run lane over the queue's finish times, a lane taking its first queued item whose build ended and waiting for the
+# earliest one only when none has (the run lane's own rule); the wall is the longest of them, the build lane's end plus the run of the
+# last item built, and the pack on top.
+simH, bl_total, bq, bnorow = 0, 0, [], 0
+if bl:
+    qs = {ln: [i for i in order if placed[i][0] == ln] for ln in ("A", "B", "H", "X")}
+    need, t = {}, 0
+    for ln in ("A", "B"):
+        t = 0
+        for i in qs[ln]:
+            need[i] = t
+            t += placed[i][2]
+    wfree = [0] * host_width
+    for i in qs["H"]:
+        w = min(range(host_width), key=lambda w: wfree[w])
+        need[i] = wfree[w]
+        wfree[w] += placed[i][2]
+    t = 0
+    for i in k_order:
+        need[i] = t
+        t += placed[i][2]
+    xbase = max(sums["A"], sums["B"], max(wfree))
+    for i in qs["X"]:
+        need[i] = xbase + (int(sim[i].split("@")[1]) if i in sim else 0)
+    rank = {"A": 0, "B": 1, "H": 2, "C": 3, "X": 4}
+    bq = sorted((i for i in range(len(recs)) if umode[i] == "ahead" and placed[i][0] in rank and not skipped(i)),
+                key=lambda i: (need.get(i, 0), rank[placed[i][0]], i))
+    fin, t = {}, 0
+    for i in bq:
+        t += BSEC[i]
+        fin[i] = t
+    bl_total = t
+    bnorow = sum(1 for i in bq if usec[i] < 0)
+
+    def take(rest, t):
+        """What a worker free at t takes, and when it starts: the first queued item whose build ended, else the one whose build ends first."""
+        for i in rest:
+            if fin.get(i, 0) <= t:
+                return i, t
+        i = min(rest, key=lambda j: (fin.get(j, 0), rest.index(j)))
+        return i, fin.get(i, 0)
+
+    def replay(q):
+        t, rest = 0, list(q)
+        while rest:
+            i, t = take(rest, t)
+            rest.remove(i)
+            t += placed[i][2]
+        return t
+
+    hfree, hrest = [0] * host_width, list(qs["H"])
+    while hrest:
+        w = min(range(host_width), key=lambda w: hfree[w])
+        i, t = take(hrest, hfree[w])
+        hrest.remove(i)
+        hfree[w] = t + placed[i][2]
+    simH = max(hfree)
+    if k_order:
+        lanes_wall = max(phase1 + (fin[bq[0]] if bq else 0), simH)
+    else:
+        lanes_wall = max(phase1, replay(qs["A"]), replay(qs["B"]), simH)
+    last_run = placed[bq[-1]][2] if bq and placed[bq[-1]][0] != "X" else 0
+    wall = max(lanes_wall, bl_total + last_run) + pack_wall
+print("\x1f".join(["=", str(sums["A"]), str(sums["B"]), str(pack_wall), str(sums["C"]), str(wall), str(len(defaults)), " ".join(defaults)]))
 print("\x1f".join(["O", " ".join(map(str, order))]))
+if bl:
+    print("\x1f".join(["+", str(simH), str(bl_total), str(len(bq)), str(bnorow), str(len(host))]))
+    print("\x1f".join(["Q", " ".join(map(str, bq))]))
 PY
 
 balance() { # PYBAL over the records and their candidates' ledger states: the P_* arrays and SUM_*
   local i j k st feed='' lane stem name env args item why plan tkey tcard cand tag sim plan_out
   [ -z "$CHAIN_K" ] || feed="$CHAIN_K"$'\n'
+  [ -z "$U_REC" ] || feed="$feed$U_REC"$'\n'
   for ((i = 0; i < N; i++)); do
     j=${R_C0[$i]}
     if [ $((i + 1)) -lt "$N" ]; then k=${R_C0[$((i + 1))]}; else k=$NC; fi
@@ -6414,7 +6979,7 @@ balance() { # PYBAL over the records and their candidates' ledger states: the P_
     for ((; j < k; j++)); do st="${st:+$st }${C_LST[$j]}"; done
     feed="$feed${R_REC[$i]}"$'\x1f'"$st"$'\n'
   done
-  plan_out=$(printf '%s' "$feed" | python3 -c "$PYBAL" "$LANES" "$PACK_BUDGET") || RC=70 die "the lane balance failed (above)"
+  plan_out=$(printf '%s' "$feed" | python3 -c "$PYBAL" "$LANES" "$PACK_BUDGET" "$BUILD_LANE" "$HOST_WIDTH") || RC=70 die "the lane balance failed (above)"
   i=0 SUM_W=''
   while IFS=$'\x1f' read -r lane stem name env args item why plan _ tkey tcard cand tag sim qpred; do
     if [ "$lane" = "=" ]; then
@@ -6425,6 +6990,14 @@ balance() { # PYBAL over the records and their candidates' ledger states: the P_
       read -r -a ORDER <<< "$stem"
       continue
     fi
+    if [ "$lane" = Q ]; then # the build lane's queue: plan indices, the order their items start in their lanes
+      read -r -a BQ <<< "$stem"
+      continue
+    fi
+    if [ "$lane" = '+' ]; then # the build lane's terms of the plan: the host lane's clock, the build lane's seconds, its items, those with no row, the host items
+      SUM_H=$stem SUM_BL=$name BQ_N=$env BQ_NOROW=$args HOST_N=$item
+      continue
+    fi
     P_LANE+=("$lane"); P_STEM+=("$stem"); P_NAME+=("$name"); P_ENV+=("$env"); P_ARGS+=("$args")
     P_ITEM+=("$item"); P_WHY+=("$why"); P_PLAN+=("$plan"); P_TKEY+=("$tkey"); P_TCARD+=("$tcard")
     j=$((${R_C0[$i]} + cand))
@@ -6432,8 +7005,19 @@ balance() { # PYBAL over the records and their candidates' ledger states: the P_
     i=$((i + 1))
   done <<< "$plan_out"
   [ "$i" = "$N" ] && [ -n "$SUM_W" ] && [ "${#ORDER[@]}" = "$((N - ${#CHAIN_ORDER[@]}))" ] || RC=70 die "the lane balance returned $i of $N items and an order of ${#ORDER[@]}"
+  if [ -n "$U_REC" ]; then
+    local ubm ubs ubw
+    IFS=$'\x1f' read -r _ ubm ubs ubw <<< "$U_REC"
+    IFS=, read -r -a P_BMODE <<< "$ubm"
+    read -r -a P_BSEC <<< "$ubs"
+    IFS=$'\x1e' read -r -a P_BWHY <<< "$ubw"
+    [ "${#P_BMODE[@]}" = "$N" ] && [ "${#P_BSEC[@]}" = "$N" ] || RC=70 die "the build rule (the U record) names ${#P_BMODE[@]} modes and ${#P_BSEC[@]} build seconds for $N plan records"
+  fi
 }
 ORDER=() # the run order (PYBAL's `O` record): plan indices, each lane's items in the order they run
+BQ=() # the build lane's queue (PYBAL's `Q` record): plan indices in the order their builds run
+SUM_H=0 SUM_BL=0 BQ_N=0 BQ_NOROW=0 HOST_N=0 # PYBAL's `+` record: the host lane's clock, the build lane's seconds, its items, those with no build row, the host lane's items
+P_BMODE=() P_BWHY=() P_BSEC=() # the build rule per plan record (PYPLAN's U record): `-` (no box command), `ahead` or `inline`, why, the build seconds of an `ahead` item (-1: no row)
 P_LANE=() P_STEM=() P_NAME=() P_ENV=() P_ARGS=() P_ITEM=() P_WHY=() P_PLAN=() P_TKEY=() P_TCARD=()
 P_CI=() P_KEY=() P_LST=() P_LDET=() P_TAG=() P_SIM=() # the candidate taken, its key, status, detail, tags, simulated take
 P_QPRED=() # the item's expected seconds from its times rows, for a queued box call's BLOOMERY_Q_PRED_S (empty: no row)
@@ -6771,6 +7355,10 @@ if [ "$LEDGER" = 1 ]; then
   [ "$NC" = 0 ] || ledger_plan "$LWORK" # a batch whose items are all deferred has nothing to key
 fi
 balance
+# The build lane runs when the plan built anything ahead (PYBAL's Q record); BUILD_LANE alone names the mode (the host lane, the build
+# rule, the lines of an item that builds inline).
+BUILD_ON=0
+if [ "$BUILD_LANE" = 1 ] && [ "${#BQ[@]}" -gt 0 ]; then BUILD_ON=1; fi
 for ((i = 0; i < N; i++)); do [ "${P_LST[$i]}" != skip ] || SKIP_N=$((SKIP_N + 1)); done
 # The canary stage (the header's «Canary»): the canary items of lanes A and B move to the front of the run order, each lane's
 # own order otherwise as the balance made it; CANARY_RUN lists the ones that will run (a ledger skip passes at 0 s).
@@ -6809,6 +7397,19 @@ if [ "$LANES" = 1 ]; then
 else
   PREDICTED="laneA=${SUM_A}s laneB=${SUM_B}s laneX=${SUM_X}s chain=${SUM_C}s wall=${PLAN_S}s"
 fi
+# The build lane's terms follow wall=, so a reader of the line without the lane reads it as it was: laneA= and laneB= are then the run
+# seconds of the two cards' lanes (the builds left them), build-lane= the seconds of the builds, laneH= the host lane's clock.
+[ "$BUILD_LANE" = 0 ] || PREDICTED="$PREDICTED build-lane=${SUM_BL}s laneH=${SUM_H}s"
+# The items that build inline in their run lane, by rule, and why (the dry run names them; each item's line says so too).
+INLINE_N=0 INLINE_WHY=''
+if [ "$BUILD_LANE" = 1 ]; then
+  for ((i = 0; i < N; i++)); do
+    if [ "${P_BMODE[$i]:-}" = inline ] && [ "${P_LST[$i]}" != skip ]; then INLINE_N=$((INLINE_N + 1)); fi
+  done
+  INLINE_WHY=$(for ((i = 0; i < N; i++)); do
+    if [ "${P_BMODE[$i]:-}" = inline ] && [ "${P_LST[$i]}" != skip ]; then printf '%s\n' "${P_BWHY[$i]:-}"; fi
+  done | sort | uniq -c | sort -rn | awk '{ c = $1; $1 = ""; sub(/^ /, ""); printf "%s%s x%s", (n++ ? "; " : ""), $0, c }')
+fi
 predicted() { # the plan's lane sums, derived from the times file
   local how="the median of each item's last 5 rows in $TIMES_FILE"
   [ "$LEDGER" = 0 ] || how="$how, a skipped item 0 s"
@@ -6819,10 +7420,16 @@ predicted() { # the plan's lane sums, derived from the times file
   else
     how="$how; wall = the longer of A and B, then the pack (laneX=: the cards, the ${PACK_BUDGET} B host budget, m items alone)"
   fi
+  [ "$BUILD_LANE" = 0 ] || how="$how; with the build lane: the lanes' seconds are their run seconds, and wall = the longest of the lanes replayed over the build queue's finish times and the build lane's end plus the last run, then the pack"
   # The recheck is one key call per phase, off these sums. The last phase's call is before DONE.
   [ "$LEDGER" = 0 ] || how="$how; recheck is off the lane clock (one key call per phase, the last phase's before DONE, not in these sums)"
   how="$how; wall adds the lane gap: ${GAP_MS} ms an item (the median of the last 5 finished batches' own lane clocks in $GAP_FILE, 0 with none) × ${GAP_N} items a lane = ${GAP_S} s"
   echo "gate-batch: predicted $PREDICTED (derived: $how)"
+  if [ "$BUILD_LANE" = 1 ]; then
+    echo "gate-batch: build lane: ${BQ_N} item(s) built ahead of their runs, ${SUM_BL} s in all (the median of each item's last 5 rows in $BUILD_FILE; ${BQ_NOROW} with no row yet count 0 s, so no saving is claimed for them); ${INLINE_N} item(s) build inline in their run lane${INLINE_WHY:+ ($INLINE_WHY)}; host lane: ${HOST_N} card-free item(s) on ${HOST_WIDTH} workers, clock ${SUM_H} s"
+  elif [ -n "$BUILD_OFF" ] && [ "$BUILD_OFF" != flag ]; then
+    echo "gate-batch: build lane: off ($BUILD_OFF)"
+  fi
   [ "$SUM_NDEF" = 0 ] || echo "gate-batch: $SUM_NDEF item(s) expected at the ${DEFAULT_S} s default (no row in the times file): $SUM_DEF"
   if [ "$NDT" != 0 ] && [ "$ND_VR" = "$NDT" ]; then
     echo "gate-batch: $ND_VR item(s) deferred to a fixture-tier batch (a variant is a fixture: the real tier opens none), in no lane (DONE: deferred=$ND, and the list $OUT/deferred.list): ${DP_TIER_STEMS[*]}"
@@ -7159,7 +7766,8 @@ fi
 : > "$RUNLOG"
 rm -f "$OUT/canary.red" # a retried --out holds no earlier run's stop
 rm -rf "$OUT"/lane-*.box # ... nor an earlier run's registered pids (a KILLed call's file, its pid reused by another batch's box.sh)
-mkdir -p "$OUT/claims" # one claim per item: the owner's start and the thief's steal agree on it
+rm -rf "$OUT/build" # ... nor an earlier run's build passes
+mkdir -p "$OUT/claims" "$OUT/build" # one claim per item: the owner's start and the thief's steal agree on it; the build lane's states and logs
 T0=$(date +%s)
 echo "plan $PREDICTED defaults=$SUM_NDEF (predicted, derived from $TIMES_FILE)" >> "$RUNLOG"
 start_hook
@@ -7339,8 +7947,139 @@ wait_dirlock() {
   done
 }
 
+# The build lane (the header's «Build lane»). An item's build pass is its recipe run with BLOOMERY_BUILD_ONLY=1 in the box env: the
+# recipe's cargo builds and the runners' build phases run (tools/gate.sh under its build bound), and every runner ends 0 before its test,
+# its locks and its card. Its state is a file under DIR/build, written when the pass ends and read by the run lane that takes the item:
+# `ok <secs> <cold>`, `fail <rc> <secs>` (the build failed: the item fails with that rc and the run never starts) or `inline <why>` (the
+# pass met contention, rc 75 or 83, which the run lane meets again by its own rules). Its log is DIR/build/<i>.log, appended to the
+# item's log when the run lane takes it.
+build_ready() { # $1 = plan index: may the item start? Nothing to wait for, its pass ended, or the lane ended without it (it builds inline).
+  [ "$BUILD_ON" = 1 ] || return 0
+  [ "${P_BMODE[$1]:-}" = ahead ] || return 0
+  [ ! -e "$OUT/build/$1.state" ] || return 0
+  [ ! -e "$OUT/lane-build.s" ] || return 0
+  return 1
+}
+
+build_item() { # $1 = plan index: the build-only pass of the item, with the item's own env (the lane's card included)
+  local i=$1 log="$OUT/build/$1.log" try=0 rc t0 t1 s waits cold why='' benv state tmp
+  local pdir="$OUT/lane-build.box"
+  local argv=()
+  eval "argv=(${P_ARGS[$i]})"
+  benv=$(box_env_of "$i")
+  [ "$HOLD_UP" != 1 ] || benv="${benv:+$benv }BLOOMERY_BATCH_OWNER=$HOLD_OWNER"
+  benv="${benv:+$benv }BLOOMERY_BUILD_ONLY=1"
+  t0=$(date +%s)
+  while :; do
+    try=$((try + 1))
+    echo "=== try $try $(date '+%F %T') lane=build: BLOOMERY_BOX_ENV='$benv' just ${P_NAME[$i]}${P_ARGS[$i]:+ ${P_ARGS[$i]}}" >> "$log"
+    rc=0
+    t1=$(date +%s)
+    rm -rf "$pdir"
+    BLOOMERY_Q_PRED_S='' BLOOMERY_BOX_PIDDIR="$pdir" BLOOMERY_BOX_ENV="$benv" "${JUST[@]}" "${P_NAME[$i]}" ${argv[@]+"${argv[@]}"} >> "$log" 2>&1 < /dev/null &
+    echo $! > "$OUT/lane-build.child"
+    wait $! || rc=$?
+    case $rc in
+      75 | 83)
+        # Contention: a round or follower batch gives way, as its run pass would; otherwise the pass retries as a run does, and a pass
+        # still met by it leaves the item to its run lane, which has the rules for a lock queue, a held tree and a yield.
+        if [ "$LMODE" = round ] || [ "$YIELD" = 1 ]; then why="build pass rc $rc (the box is busy; the run pass meets it by its own rules)"; break; fi
+        if [ "$try" -lt "$TRIES_MAX" ]; then
+          echo "=== rc $rc (contention): retry in ${RETRY_WAIT} s" >> "$log"
+          sleep "$RETRY_WAIT"
+          continue
+        fi
+        why="build pass rc $rc after $try tries (contention; the run pass meets it by its own rules)"
+        break ;;
+    esac
+    break
+  done
+  s=$(($(date +%s) - t0))
+  waits=$(try_waits "$log" "$try")
+  s=$((s > waits ? s - waits : 0))
+  cold=$(cold_of "$log" "$try")
+  if [ -n "$why" ]; then
+    state="inline $why"
+  elif [ "$rc" = 0 ]; then
+    state="ok $s $cold"
+    # A cold build's seconds are a one-off (the same rule as the times file's cold rows): no row, and the run line says cold=1.
+    if [ "$cold" = 0 ] && ! python3 -c "$PYAPPEND" "$BUILD_FILE" "$(printf '%s\t%s\t%s\t%s\t%s' "${P_TKEY[$i]}" L "${P_TCARD[$i]}" "$s" "$(date '+%Y-%m-%dT%H:%M:%S%z')")"; then
+      echo "gate-batch: ${P_STEM[$i]}: its build row did not reach $BUILD_FILE (above)" >&2
+    fi
+  else
+    state="fail $rc $s"
+  fi
+  tmp="$OUT/build/$i.state.tmp"
+  printf '%s\n' "$state" > "$tmp" && mv "$tmp" "$OUT/build/$i.state"
+}
+
+run_build_lane() { # the build lane: the plan's queue, one build pass at a time (cargo holds one build lock per target directory anyway)
+  local t0 i
+  t0=$(date +%s)
+  for i in ${BQ[@]+"${BQ[@]}"}; do
+    build_item "$i"
+  done
+  echo $(($(date +%s) - t0)) > "$OUT/lane-build.s"
+}
+
+# build_take <i> <item log>: reads the item's build state into BS_KIND (none, ok, fail or inline), BS_SEC, BS_RC, BS_COLD and BS_WHY, and
+# appends the pass's log to the item's own. A recipe the rule builds inline is inline with the rule's reason; an `ahead` item the lane
+# ended without is inline too (the run builds it, as without the lane).
+build_take() {
+  local i=$1 log=$2 k a b rest=''
+  BS_KIND=none BS_SEC=0 BS_RC=0 BS_COLD=0 BS_WHY=''
+  case ${P_BMODE[$i]:-} in
+    inline) BS_KIND=inline BS_WHY=${P_BWHY[$i]:-} ;;
+    ahead)
+      if [ -e "$OUT/build/$i.state" ]; then
+        read -r k a b rest < "$OUT/build/$i.state" || true
+        case $k in
+          ok) BS_KIND=ok BS_SEC=$a BS_COLD=$b ;;
+          fail) BS_KIND=fail BS_RC=$a BS_SEC=$b ;;
+          inline) BS_KIND=inline BS_WHY="$a $b $rest" ;;
+          *) RC=70 die "build_take: the state of ${P_STEM[$i]} reads '$k', not ok, fail or inline" ;;
+        esac
+        if [ -f "$OUT/build/$i.log" ]; then
+          sed 's/^=== try /=== build try /' "$OUT/build/$i.log" >> "$log"
+        fi
+      else
+        BS_KIND=inline BS_WHY='the build lane ended before this item'
+      fi ;;
+  esac
+}
+
+lane_queue() { # $1 = the worker's label, $2 = the queue's lane: its items in the plan's order, an item whose build pass has not ended waiting
+  # behind the next one whose has, and the worker waits (1 s slices, counted in BWAIT, which the lane gap leaves out) only when none is
+  local lane=$1 q=$2 i did pend
+  while :; do
+    did=0 pend=0
+    for i in ${ORDER[@]+"${ORDER[@]}"}; do
+      [ "${P_LANE[$i]}" = "$q" ] || continue
+      claimed "$i" && continue
+      if [ "${P_LST[$i]}" = skip ]; then
+        claim_item "$i" "$lane" || continue
+        skip_item "$i" "${lane%%[0-9]*}"
+        did=1
+        continue
+      fi
+      if neighbour_blocked "$i" || ! build_ready "$i"; then pend=1; continue; fi
+      claim_item "$i" "$lane" || continue
+      run_pooled "$i" run_item "$i" "$lane"
+      did=1
+      break # the queue's head again: an item passed over may be ready now
+    done
+    [ "$did" = 1 ] && continue
+    [ "$pend" = 1 ] || return 0
+    sleep 1
+    BWAIT=$((BWAIT + 1))
+  done
+}
+
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
   local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran=0 s benv line waits=0 cold=0 deferred=0 yowner='' rcl mark twin='' attach_pid attach_file held83=0 dl0=0 dlwait=0
+  local lanelab=${2%%[0-9]*} tlane bfail=0 bsec=0 bline='' # the label the lines carry (a host worker H2 is lane H), the times row's lane (the file's three values), the build pass's share
+  tlane=$lanelab
+  [ "$tlane" != H ] || tlane=B
   local pdir="$OUT/lane-$lane.box" # the box.sh calls this item's `just` starts file their pids here (reap_boxes; the pack's items each have their own)
   [ "$lane" != X ] || pdir="$OUT/lane-X-$i.box"
   local argv=()
@@ -7359,8 +8098,21 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   # which run_item reads below): in the call's env, never the key's. The lead's batch and a plain one wait as before.
   [ "$LMODE" != round ] || benv="${benv:+$benv }BLOOMERY_HOLD_YIELD=1"
   t0=$(date +%s)
+  BS_KIND=none BS_SEC=0 BS_RC=0 BS_COLD=0 BS_WHY=''
+  if [ "$BUILD_LANE" = 1 ]; then
+    build_take "$i" "$log"
+    case $BS_KIND in
+      ok) bsec=$BS_SEC bline="build=${BS_SEC}s" ;;
+      inline) bline="build=inline $BS_WHY" ;;
+      fail)
+        # The build pass failed: the item is red with its rc, and nothing of it runs. The pass's log is above.
+        bfail=1 rc=$BS_RC bline="build=failed(${BS_SEC}s)"
+        echo "=== build pass ended rc $rc: the run never starts" >> "$log" ;;
+    esac
+  fi
   # A queued item's mark joins the call's env (never the key's); its twin, when one is queued or running, is waited on instead.
-  mark=$(twin_mark "$i")
+  mark=''
+  [ "$bfail" = 1 ] || mark=$(twin_mark "$i")
   if [ -n "$mark" ]; then
     benv="$benv${benv:+ }$mark"
     twin=$(queued_twin "$mark" 2>> "$log")
@@ -7387,7 +8139,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
         twin='' ;;
     esac
   fi
-  while [ -z "$twin" ]; do
+  while [ -z "$twin" ] && [ "$bfail" = 0 ]; do
     try=$((try + 1))
     echo "=== try $try $(date '+%F %T') lane=$lane: $(cmd_of "$i")" >> "$log"
     rc=0
@@ -7442,19 +8194,21 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   if [ -n "$yowner" ]; then
     rcl=yield
     if [ "$YIELD" = 1 ]; then
-      line="${P_STEM[$i]} rc=yield held by $yowner: not retried (the follower yields; the next pass runs it again) ${s}s try=$try lane=$lane tier=$TIER"
+      line="${P_STEM[$i]} rc=yield held by $yowner: not retried (the follower yields; the next pass runs it again) ${s}s try=$try lane=$lanelab tier=$TIER"
     else
-      line="${P_STEM[$i]} rc=yield held by $yowner: not retried (a round batch yields to the lead's hold) ${s}s try=$try lane=$lane tier=$TIER"
+      line="${P_STEM[$i]} rc=yield held by $yowner: not retried (a round batch yields to the lead's hold) ${s}s try=$try lane=$lanelab tier=$TIER"
     fi
   else
     rcl=$rc
-    line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lane tier=$TIER"
+    line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lanelab tier=$TIER"
   fi
   [ "$waits" = 0 ] || line="$line waited=${waits}s"
+  [ -z "$bline" ] || line="$line $bline" # `<s>s` is the run pass; build= the build pass's seconds, or why the build stayed in the run
   [ "$held83" = 0 ] || line="$line dirlock=${dlwait}s"
   [ -z "$twin" ] || line="$line twin=$twin"
   ran=$((ran > waits ? ran - waits : 0))
-  cold=$(cold_of "$log" "$try")
+  if [ "$bfail" = 1 ]; then cold=0; else cold=$(cold_of "$log" "$try"); fi
+  [ "$BS_COLD" = 0 ] || cold=1
   [ "$cold" = 0 ] || line="$line cold=1"
   deferred=$(deferred_of "$log" "$try")
   [ "$deferred" = 0 ] || line="$line deferred=$deferred"
@@ -7462,11 +8216,12 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     # A yielded item records nothing and its rc stays 75 below, so no times row either: it ran nothing.
     [ "$LEDGER" = 0 ] || line="$line ledger=yield"
   else
-    [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_mark "$i" "$rc" "$lane")"
+    [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_mark "$i" "$rc" "$tlane")"
   fi
   # The final try's seconds, green or red; a last try still at rc 75 got no lock and ran nothing. A cold
   # build's row goes to COLD_FILE, which no plan reads.
-  if [ "$rc" != 75 ] && [ -z "$twin" ] && ! times_record "$i" "$lane" "$ran" "$cold"; then
+  # The row's seconds are the item's own run and build seconds, whichever lane built it; a build that failed ran nothing and writes none.
+  if [ "$rc" != 75 ] && [ -z "$twin" ] && [ "$bfail" = 0 ] && ! times_record "$i" "$tlane" "$((ran + bsec))" "$cold"; then
     line="$line times=append-failed"
     echo "gate-batch: ${P_STEM[$i]}: its row did not reach $([ "$cold" = 0 ] && echo "$TIMES_FILE" || echo "$COLD_FILE") (above)" >&2
   fi
@@ -7525,7 +8280,7 @@ steal_card() { # $1 = plan index, $2 = lane
 # movable: the other lane's item this lane may take — class F (the plan's own word that either
 # card, or no card, runs it), not a ledger skip, not yet claimed, and held to the same neighbour
 # rule as its own items (below).
-stealable() { # $1 = plan index, $2 = lane
+stealable() { # $1 = plan index, $2 = lane, $3 = `any` to leave the item's build pass out of the question
   local i=$1 cls other
   other=$([ "$2" = A ] && printf B || printf A)
   [ "${P_LANE[$i]}" = "$other" ] || return 1
@@ -7533,6 +8288,7 @@ stealable() { # $1 = plan index, $2 = lane
   [ "$cls" = F ] || return 1
   [ "${P_LST[$i]}" != skip ] || return 1
   ! claimed "$i" || return 1
+  [ "${3:-}" = any ] || build_ready "$i" || return 1
   ! tagged_neighbour "$i" || chain_quiet
   ! pool_tagged "$i" || [ ! -e "$POOL_MUTEX" ]
   [ -n "$(steal_card "$i" "$2")" ]
@@ -7589,6 +8345,7 @@ chain_next() { # $1 = lane: the first unclaimed member, in the K order, whose ca
     [ -n "$fam" ] || fam=${P_FAM[$i]}
     [ "${P_FAM[$i]}" = "$fam" ] || break
     if card_ok "$i" "$want"; then
+      build_ready "$i" || return 1 # the chain's order holds: the next member is not passed over for a later one
       printf '%s' "$i"
       return 0
     fi
@@ -7623,6 +8380,7 @@ chain_take() { # $1 = lane: the mutex first (a lane that loses it holds no claim
 takeable() { # $1 = plan index, $2 = lane: a lane item (class A, B or F — never the chain's C or
   # lane X's) whose card candidates allow this lane's card, or no card at all
   local cls labels
+  [ "${P_LANE[$1]}" != H ] || return 1 # the host lane's items are its own workers'
   rec_get "$1" cls labels
   case $cls in
     A | B | F) ;;
@@ -7647,6 +8405,7 @@ take_next() { # $1 = lane, $2 = the variable for the index: a green skip first (
       return 0
     fi
     if neighbour_blocked "$j"; then continue; fi
+    build_ready "$j" || continue # its build pass has not ended: another item, or the lane waits (lane_blocked)
     if pool_tagged "$j" && [ -e "$POOL_MUTEX" ]; then continue; fi # another pool item runs (the pack's mutex)
     rec_get "$j" exp labels
     if [ "$exp" -gt "$be" ]; then best=$j be=$exp; fi
@@ -7725,7 +8484,16 @@ steal_pass() { # $1 = lane
     for j in ${ORDER[@]+"${ORDER[@]}"}; do
       if stealable "$j" "$lane"; then i=$j; break; fi
     done
-    [ "$i" -ge 0 ] || return 0
+    if [ "$i" -lt 0 ]; then
+      # Nothing to take now; an item whose build pass has not ended is a candidate still (the lane waits in 1 s slices for it).
+      for j in ${ORDER[@]+"${ORDER[@]}"}; do
+        if stealable "$j" "$lane" any && ! build_ready "$j"; then i=-2; break; fi
+      done
+      [ "$i" = -2 ] || return 0
+      sleep 1
+      BWAIT=$((BWAIT + 1))
+      continue
+    fi
     card=$(steal_card "$i" "$lane")
     if [ "$card" != - ] && ! lease_free_for_steal; then
       for ((k = 0; k < STEAL_WAIT; k++)); do
@@ -7806,6 +8574,7 @@ run_pack() {
       for i in "${XP[@]}"; do
         [ -z "${R_PID[$i]}" ] || continue
         claimed "$i" && continue
+        build_ready "$i" || continue
         if [ "${R_M[$i]}" = 1 ]; then
           [ "$nrun" = 0 ] || continue # an m item starts with nothing else running
         else
@@ -7856,6 +8625,7 @@ run_pack() {
       left=''
       for i in "${XP[@]}"; do
         [ "${R_PID[$i]}" != x ] || continue
+        build_ready "$i" || continue # its build pass is still running: that is a wait, not a stall
         rec_get "$i" labels
         if claimed "$i"; then
           left="$left; ${P_STEM[$i]}: claimed by $(cat "$OUT/claims/$i" 2> /dev/null), an X item the pack alone runs"
@@ -7901,6 +8671,7 @@ run_lane() { # $1 = lane label; a lane of the chain's batch (the header's class 
   # Without a chain (lane X, --lanes 1, the fixture tier, a chainless list) it is today's loop: its
   # items in ORDER, then the steal pass.
   local lane=$1 t0 i
+  BWAIT=0 # the seconds this lane waited on a build pass (lane_queue, steal_pass, and the chain loop's slices): not a gap between items
   t0=$(date +%s)
   if [ "$CHAIN_ACTIVE" = 1 ] && [ "${#CHAIN_ORDER[@]}" -gt 0 ] && { [ "$lane" = A ] || [ "$lane" = B ]; }; then
     while :; do
@@ -7918,21 +8689,27 @@ run_lane() { # $1 = lane label; a lane of the chain's batch (the header's class 
       fi
       lane_blocked "$lane" || break
       sleep 1
+      [ "$BUILD_ON" = 0 ] || BWAIT=$((BWAIT + 1))
     done
   else
-    for i in ${ORDER[@]+"${ORDER[@]}"}; do
-      [ "${P_LANE[$i]}" = "$lane" ] || continue
-      if [ "${P_LST[$i]}" = skip ]; then
-        skip_item "$i" "$lane"
-      else
-        claim_item "$i" "$lane" || continue # the other lane stole it while this one was busy
-        run_pooled "$i" run_item "$i" "$lane"
-      fi
-    done
+    if [ "$BUILD_LANE" = 1 ]; then
+      lane_queue "$lane" "${lane%%[0-9]*}" # the host lane's workers share one queue (H, H2, …)
+    else
+      for i in ${ORDER[@]+"${ORDER[@]}"}; do
+        [ "${P_LANE[$i]}" = "$lane" ] || continue
+        if [ "${P_LST[$i]}" = skip ]; then
+          skip_item "$i" "$lane"
+        else
+          claim_item "$i" "$lane" || continue # the other lane stole it while this one was busy
+          run_pooled "$i" run_item "$i" "$lane"
+        fi
+      done
+    fi
     case $lane in
       A | B) [ "$LANES" = 2 ] && steal_pass "$lane" ;;
     esac
   fi
+  echo "$BWAIT" > "$OUT/lane-$lane.bw"
   echo $(($(date +%s) - t0)) > "$OUT/lane-$lane.s"
 }
 
@@ -7941,6 +8718,12 @@ has_lane() { local i; for ((i = 0; i < N; i++)); do [ "${P_LANE[$i]}" = "$1" ] &
 # A lane starts when a plan item carries its label or when it has chain work (the members are labelled
 # C, so a list of members alone labels no A or B).
 LANES_RUN=""
+# The build lane starts first: its first passes are what the run lanes' first items wait for. It holds no card and no gate lock.
+if [ "$BUILD_ON" = 1 ]; then
+  run_build_lane &
+  echo $! > "$OUT/lane-build.pid"
+  LANES_RUN="$LANES_RUN build"
+fi
 for lane in A B; do
   if has_lane "$lane" || chain_feeds "$lane"; then
     run_lane "$lane" &
@@ -7948,6 +8731,16 @@ for lane in A B; do
     LANES_RUN="$LANES_RUN $lane"
   fi
 done
+# The host lane: HOST_WIDTH workers on one queue, labelled H, H2, … (a lane's pid and box files are its label's).
+if has_lane H; then
+  for ((w = 1; w <= HOST_WIDTH; w++)); do
+    lane=H
+    [ "$w" = 1 ] || lane=H$w
+    run_lane "$lane" &
+    echo $! > "$OUT/lane-$lane.pid"
+    LANES_RUN="$LANES_RUN $lane"
+  done
+fi
 # Every lane is watched until its sentinel exists: a lane that dies — with the chain's mutex held,
 # or anywhere else — must not leave the other spinning on what it holds. A dead-but-unreaped lane
 # reads as state Z to ps, and a pid ps itself cannot find reads as ps's own rc (`wait` would block on
@@ -8024,6 +8817,25 @@ if [ "$PLAN_S" -gt 0 ] && [ $((wall_s * 2)) -gt $((PLAN_S * 3)) ]; then
 fi
 done_line="$done_line laneA=$(lane_s A)s laneB=$(lane_s B)s"
 if has_lane X; then done_line="$done_line laneX=$(lane_s X)s"; fi
+if [ "$BUILD_LANE" = 1 ]; then
+  hs=$(lane_s H)
+  for ((w = 2; w <= HOST_WIDTH; w++)); do
+    [ "$(lane_s "H$w")" -le "$hs" ] || hs=$(lane_s "H$w")
+  done
+  [ "$BUILD_ON" = 0 ] || done_line="$done_line build-lane=$(lane_s build)s"
+  ! has_lane H || done_line="$done_line laneH=${hs}s"
+  if [ "$BUILD_ON" = 1 ]; then
+    # The run passes whose own cargo call waited for the build directory (cargo's lock, which the build lane's compile holds): the lane
+    # saved the less of its builds' time the more of these there are. Only the sections after an item's first run try count; the build
+    # pass's log sits above them.
+    lw=0
+    for f in "$OUT"/g-*.log; do
+      [ -f "$f" ] || continue
+      if awk '/^=== try / { r = 1 } r && /Blocking waiting for file lock on build directory/ { f = 1 } END { exit !f }' "$f"; then lw=$((lw + 1)); fi
+    done
+    done_line="$done_line lockwait=$lw"
+  fi
+fi
 for ((i = 0; i < N; i++)); do
   if [ "${P_NAME[$i]}" = lint ]; then
     if [ "${P_LST[$i]}" = skip ]; then

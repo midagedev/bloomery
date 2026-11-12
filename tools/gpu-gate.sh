@@ -27,6 +27,7 @@
 # 환경: BLOOMERY_GATE_BOUND(초, 기본 900 — tools/gate.sh와 같은 레버), BLOOMERY_GATE_CARD(아래 카드 고르기),
 # BLOOMERY_BOX_CARD(box.sh가 넘기는 카드 선택 — 아래), BLOOMERY_GATE_V41_LOAD(1이면 V4.1 적재 락도 잡는다 — 아래).
 # BLOOMERY_BATCH_OWNER(letters, digits, _: the owner of the batch hold this run's batch put up — the batch hold paragraph below).
+# BLOOMERY_BUILD_ONLY=1: the call ends 0 once the binary is found, before any lock, ticket or card (tools/gate-batch.sh's build lane: the recipe's build ran before this call); tools/gate.sh reads the same variable.
 # BLOOMERY_GATE_STACKS(초 — 설정하면 바이너리의 출력이 그만큼 멈출 때 tools/ref/stack-watch.sh가 스레드 스택을 뜨고 끝낸다).
 # BLOOMERY_LOCK_DIR: the directory of every lock and hold file named below, /root when unset (tools/ref/lease-probe.sh's LOCK_DIR).
 # BLOOMERY_BOX_CARD=local (tools/box.sh's local mode): the run takes one lock, bloomery-gate-local.lock, which holds every card
@@ -769,6 +770,30 @@ PY
   rm -rf "$t/lease.card" "$t/proc"
   mkdir -p "$t/proc"
   case_ 'a6000 forced, lease free: the A6000' 0 "ran on $GPU_A6000" a6000 "$t/lease"
+  # BLOOMERY_BUILD_ONLY=1 (the batch's build lane): the call ends 0 once the binary is found, before any lock, ticket or card — a held
+  # lease with no record, which refuses a run, changes nothing. A missing binary is still named, any other value ends 64, and 0 runs.
+  exec 7> "$t/lease"
+  flock -x 7 || { echo "FAIL: the test cannot hold its lease file"; return 1; }
+  rc=0
+  gate "$t/out" 3090 "$t/lease" BLOOMERY_BUILD_ONLY=1 || rc=$?
+  judge 'build-only: under a held lease the call ends 0 once the binary is found, and nothing runs' "$rc" 0 'ok is built; nothing runs, no lock is taken' 'ran on|in doubt'
+  mkdir -p "$t/mut"
+  for bf in "$(dirname "$self")"/*; do [ "${bf##*/}" = gpu-gate.sh ] || ln -sf "$bf" "$t/mut/${bf##*/}"; done
+  sed '/^case \${BLOOMERY_BUILD_ONLY:-0} in$/,/^esac$/d' "$self" > "$t/mut/gpu-gate.sh"
+  n=$((n + 1))
+  if [ "$(grep -c 'BLOOMERY_BUILD_ONLY: \$EXE is built' "$t/mut/gpu-gate.sh")" = 0 ] && [ "$(grep -c 'BLOOMERY_BUILD_ONLY: \$EXE is built' "$self")" = 1 ]; then echo "ok build-only mutant: the short-circuit is removed from the copy"
+  else bad=$((bad + 1)); echo "FAIL build-only mutant: the sed did not remove the short-circuit"; fi
+  rc=0
+  self=$t/mut/gpu-gate.sh gate "$t/out" 3090 "$t/lease" BLOOMERY_BUILD_ONLY=1 || rc=$?
+  n=$((n + 1))
+  out=$(cat "$t/out")
+  if grep -Eq 'ran on|in doubt' <<< "$out"; then echo "ok build-only mutant: without the short-circuit the run reaches the lease (or the stub), rc $rc"
+  else bad=$((bad + 1)); echo "FAIL build-only mutant: without the short-circuit the call reached neither the lease nor the stub (rc $rc)"; sed 's/^/    | /' <<< "$out"; fi
+  flock -u 7
+  exec 7>&-
+  GATE_BIN=nosuch case_ 'build-only: a binary the recipe did not build is named first, rc 2' 2 'no executable file .*nosuch' 3090 "$t/lease" BLOOMERY_BUILD_ONLY=1
+  case_ 'build-only: any other value ends 64 before a lock' 64 "BLOOMERY_BUILD_ONLY is 1 .* got '2'" 3090 "$t/lease" BLOOMERY_BUILD_ONLY=2
+  case_ 'build-only: 0 runs the gate as ever' 0 'ran on' 3090 "$t/lease" BLOOMERY_BUILD_ONLY=0
   case_ 'any, successful empty process query: takes the A6000' 0 'ok on the a6000 \(asked any\)' any "$t/lease"
   case_ 'any, successful process query names the A6000: takes the 3090' 0 'ok on the 3090 \(asked any\)' any "$t/lease" STUB_COMPUTE_UUID="$GPU_A6000"
   case_ 'any, successful process query names another card: takes the A6000' 0 'ok on the a6000 \(asked any\)' any "$t/lease" STUB_COMPUTE_UUID="$GPU_3090"
@@ -2463,6 +2488,14 @@ else
   EXE=./target/release/$NAME
 fi
 [ -f "$EXE" ] && [ -x "$EXE" ] || { echo "gpu-gate.sh: no executable file $EXE — the recipe builds it before calling this" >&2; exit 2; }
+# BLOOMERY_BUILD_ONLY=1 (tools/gate-batch.sh's build lane puts it in an item's box env; tools/gate.sh reads the same variable): the
+# recipe's build ran before this call, and the binary is there. The run ends here, 0, before any lock, queue ticket or card: it runs
+# nothing and holds nothing. 0 or unset runs the gate as always; any other value ends 64.
+case ${BLOOMERY_BUILD_ONLY:-0} in
+  0) ;;
+  1) echo "gpu-gate.sh: BLOOMERY_BUILD_ONLY: $EXE is built; nothing runs, no lock is taken"; exit 0 ;;
+  *) echo "gpu-gate.sh: BLOOMERY_BUILD_ONLY is 1 (build, run nothing) or 0/unset, got '$BLOOMERY_BUILD_ONLY'" >&2; exit 64 ;;
+esac
 # BLOOMERY_GATE_V41_LOAD=1: the run loads the whole V4.1 model (the recipe carries [group('v41-load')] and
 # exports it), so it also takes the box-wide V4.1 load lock below. 0 or unset: it does not.
 V41=${BLOOMERY_GATE_V41_LOAD:-0}

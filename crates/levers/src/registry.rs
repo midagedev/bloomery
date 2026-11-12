@@ -2442,6 +2442,13 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "Seconds `tools/ref/build-dump-draft.sh` lets the reference build run.",
     ),
     runner(
+        "BLOOMERY_BUILD_ONLY",
+        Some("gate.sh"),
+        "`1` ends a gate recipe after its cargo build, before any test, lock or card: the pass \
+         `tools/gate-batch.sh`'s build lane runs ahead of the run lanes. Unset or `0` runs the \
+         gate.",
+    ),
+    runner(
         "BLOOMERY_BUNDLE_BAND_DUMP",
         None,
         "The model attention gate's handshake with the child it runs of its own test \
