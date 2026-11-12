@@ -6,6 +6,7 @@
 use crate::engram::EngramFacts;
 
 pub mod deepseek41;
+pub mod exaone_moe;
 pub mod kimi_k3;
 
 /// The Engram facts of architecture `arch`; `None` for an architecture whose
