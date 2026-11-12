@@ -169,11 +169,25 @@ pub fn qwen35moe_variant(split: &Split) -> Result<qwen35moe::hparams::Variant, P
     }
 }
 
+/// The description row of `split`'s `general.architecture` ([`rules::row`]); a string no row
+/// names is an error naming it.
+pub(crate) fn rules_of(split: &Split) -> Result<&'static rules::ArchRules, PlacementError> {
+    let name = split.architecture().unwrap_or("<missing>");
+    rules::row(name).ok_or_else(|| {
+        architecture_is(&format!(
+            "{name:?}; no description row of it states the facts this reader reads"
+        ))
+    })
+}
+
+/// The key a reader names when it refuses the file's architecture string.
+pub(crate) const ARCHITECTURE_KEY: &str = "general.architecture";
+
 /// The error naming `general.architecture`, which `is` completes: its value
 /// and why a reader refuses it there.
 fn architecture_is(is: &str) -> PlacementError {
     PlacementError::Metadata {
-        key: "general.architecture".to_string(),
+        key: ARCHITECTURE_KEY.to_string(),
         detail: format!("is {is}"),
     }
 }

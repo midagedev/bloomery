@@ -3,7 +3,7 @@
 
 use super::roles;
 use crate::arch::hybrid::layers_agree;
-use crate::arch::rules::{self, ArchRules, ClampOrder, RopeFallback};
+use crate::arch::rules::{ArchRules, ClampOrder, RopeFallback};
 use crate::arch::{
     check_kv, dims_agree, expert_counts, finite_positive, meta_bool, meta_usize, metadata, mul,
     n_vocab, nextn_layers, one_expert_group, optional_usize, per_layer_bool, per_layer_count,
@@ -78,13 +78,8 @@ impl Hparams {
     }
 
     pub(super) fn read(split: &Split) -> Result<Self, PlacementError> {
-        let name = split.architecture().unwrap_or("<missing>");
-        let rules = rules::row(name).ok_or_else(|| PlacementError::Metadata {
-            key: "general.architecture".to_string(),
-            detail: format!(
-                "is {name:?}; no description row of it states the facts this reader reads"
-            ),
-        })?;
+        let rules = crate::arch::rules_of(split)?;
+        let name = rules.arch.name();
         let mut defaults = Vec::new();
         // This common read checks the layer bound before expanding any scalar.
         let blocks = positive(split, "block_count")?;
