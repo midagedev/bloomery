@@ -30,6 +30,7 @@ use crate::flash::PlaneAppend;
 use crate::flash_gqa::{FlashGqaKernels, GROUP, GqaArgs, HEAD, partials_ms_len, partials_v_len};
 use crate::flash_gqa_prefill::{FlashGqaPrefill, GqaPrefillArgs};
 use crate::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
+use crate::head::Head;
 use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::mamba2::{Mamba2Kernels, Mamba2Scratch, StepArgs};
 use crate::q5::Q8Blocks32;
@@ -572,6 +573,108 @@ pub(crate) fn residual(
     dst: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
     residual_rows(cx.gpu, cx.sh.hidden, src, delta, dst)
+}
+
+/// The residual stream as (the rows a layer reads, the buffer it writes): the head's input and the
+/// body's own buffer, in the order `in_head` says.
+pub(crate) fn rails<'b>(
+    in_head: bool,
+    head: &'b mut Head,
+    r: &'b mut DeviceBuffer<f32>,
+) -> (&'b DeviceBuffer<f32>, &'b mut DeviceBuffer<f32>) {
+    let hin = head.input_mut();
+    if in_head { (&*hin, r) } else { (&*r, hin) }
+}
+
+/// A plan part that names a kind of layer the body holds another of: the plans and the layers are
+/// made together at load, so this cannot meet a loaded body.
+pub(crate) fn mismatch(what: &'static str, layer: usize, runs: &str) -> GpuError {
+    GpuError::shape(
+        what,
+        format!("layer {layer} is not the {runs} its plan names"),
+    )
+}
+
+/// One decode step's trunk over a body's scratch and residual stream: the Mamba-2 and attention
+/// layers' launch groups, in the ops a family's [`HybridOps`](chain::hybrid::ops::HybridOps) hands
+/// the chain crate's walk.
+///
+/// The stream alternates between the head's input and the body's own buffer, each layer writing
+/// the one it did not read, so the last layer's sum is the head's input whatever the layer count's
+/// parity: the last op of each layer ([`Self::mamba_out`], [`Self::attn_out`], a family's FFN out
+/// through [`Self::flip`]) flips the side.
+pub(crate) struct Trunk<'a> {
+    pub(crate) cx: Cx<'a>,
+    pub(crate) s: &'a mut Scratch,
+    pub(crate) acts: &'a mut Acts,
+    /// The residual stream's second buffer.
+    pub(crate) r: &'a mut DeviceBuffer<f32>,
+    pub(crate) head: &'a mut Head,
+    /// Whether the rows the next layer reads are in the head's input.
+    pub(crate) in_head: bool,
+}
+
+impl Trunk<'_> {
+    /// A layer's last launch group ran: the next layer reads what it wrote.
+    pub(crate) fn flip(&mut self) {
+        self.in_head = !self.in_head;
+    }
+
+    pub(crate) fn mamba_in(&mut self, l: usize, m: &MambaLayer) -> Result<(), GpuError> {
+        let (src, _) = rails(self.in_head, &mut *self.head, &mut *self.r);
+        mamba_in(&self.cx, (l, m), (&mut *self.s, &mut *self.acts), src)
+    }
+
+    pub(crate) fn mamba_core(&mut self, l: usize, m: &mut MambaLayer) -> Result<(), GpuError> {
+        mamba_core(&self.cx, (l, m), &mut *self.s)
+    }
+
+    pub(crate) fn mamba_out(&mut self, l: usize, m: &MambaLayer) -> Result<(), GpuError> {
+        let (src, dst) = rails(self.in_head, &mut *self.head, &mut *self.r);
+        mamba_out(
+            &self.cx,
+            (l, m),
+            (&mut *self.s, &mut *self.acts),
+            (src, dst),
+        )?;
+        self.flip();
+        Ok(())
+    }
+
+    pub(crate) fn attn_in(&mut self, l: usize, a: &GqaLayer) -> Result<(), GpuError> {
+        let (src, _) = rails(self.in_head, &mut *self.head, &mut *self.r);
+        gqa_in(
+            &self.cx.gqa(),
+            (l, a),
+            (&mut self.s.gqa(), &mut *self.acts),
+            src,
+        )
+    }
+
+    pub(crate) fn attn_core<const PACK: usize>(
+        &mut self,
+        l: usize,
+        a: &mut GqaLayer,
+    ) -> Result<(), GpuError> {
+        gqa_core::<PACK>(&self.cx.gqa(), (l, a), &mut self.s.gqa())
+    }
+
+    pub(crate) fn attn_out(&mut self, l: usize, a: &GqaLayer) -> Result<(), GpuError> {
+        let (src, dst) = rails(self.in_head, &mut *self.head, &mut *self.r);
+        gqa_out(
+            &self.cx.gqa(),
+            (l, a),
+            (&mut self.s.gqa(), &mut *self.acts),
+            (src, dst),
+        )?;
+        self.flip();
+        Ok(())
+    }
+
+    /// The head's launches over the last layer's sum.
+    pub(crate) fn enqueue_head(&mut self) -> Result<(), GpuError> {
+        self.head.enqueue(self.cx.gpu, self.cx.w)
+    }
 }
 
 /// A Mamba-2 layer's input side: the norm of `src` and the `ssm_in` projection, whose output is

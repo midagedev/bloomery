@@ -7,7 +7,7 @@ use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, Routing, routed, se
 use super::placed::{PLACED_ROWS, Placed, PlacedOpen, StepWalk, plan_map};
 use super::program::Program;
 use crate::arch::hybrid::{
-    self, Acts, Cx, DecodeInput, GqaLayer, Kernels, MambaLayer, Names, Site, Words,
+    self, Acts, Cx, DecodeInput, GqaLayer, Kernels, MambaLayer, Names, Site, Trunk, Words,
     attention_heads, derive_zero_conv_bias, mamba_shape,
 };
 use crate::card_leg::Relu2Leg;
@@ -497,22 +497,24 @@ impl Body {
             sh: self.sh,
         };
         let in_head = self.layers.len().is_multiple_of(2);
-        if let Some(Placed { hybrid, side }) = self.placed.as_mut() {
-            let mut leg = StepLeg::new(gpu.stream(), hybrid);
-            let mut program = Program {
+        let mut program = Program {
+            t: Trunk {
                 cx,
-                embed: &self.embed,
-                q38: &self.q38,
-                mk: &self.mk,
-                moe: self.moe,
-                layers: &mut self.layers,
                 s: &mut self.s,
-                ms: &mut self.ms,
                 acts: &mut self.acts,
                 r: &mut self.r,
                 head: &mut *head,
                 in_head,
-            };
+            },
+            embed: &self.embed,
+            q38: &self.q38,
+            mk: &self.mk,
+            moe: self.moe,
+            layers: &mut self.layers,
+            ms: &mut self.ms,
+        };
+        if let Some(Placed { hybrid, side }) = self.placed.as_mut() {
+            let mut leg = StepLeg::new(gpu.stream(), hybrid);
             StepWalk {
                 ops: &mut program,
                 plans: &self.plans,
@@ -521,20 +523,6 @@ impl Body {
             .walk(&mut leg)?;
             return head.enqueue(gpu, w);
         }
-        let mut program = Program {
-            cx,
-            embed: &self.embed,
-            q38: &self.q38,
-            mk: &self.mk,
-            moe: self.moe,
-            layers: &mut self.layers,
-            s: &mut self.s,
-            ms: &mut self.ms,
-            acts: &mut self.acts,
-            r: &mut self.r,
-            head,
-            in_head,
-        };
         Walk::new(&mut program, &self.plans, 1).run(1)
     }
 }
