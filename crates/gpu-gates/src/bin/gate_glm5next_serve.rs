@@ -290,6 +290,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "glm5next")]
+#[allow(
+    dead_code,
+    reason = "shared with generate_glm5next and bloomery-serve; this gate calls tier_batch"
+)]
 #[path = "shared/glm5next_place.rs"]
 mod glm_place;
 
