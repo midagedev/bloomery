@@ -36,8 +36,8 @@ use super::body::Layer;
 use super::moe::{
     MoeKernels, MoeLayer, MoeScratch, MoeShape, Shared, card_down, card_slots, one_expert,
 };
-use super::program::{Program, rails};
-use crate::arch::hybrid::{self, Acts, Cx, residual};
+use super::program::Program;
+use crate::arch::hybrid::{self, Acts, Cx, rails, residual};
 use crate::card_slots::{CardAcc, CardSlotKernels, ColPlaces};
 use crate::fault::FaultSink;
 use crate::host::StepLeg;
@@ -556,13 +556,17 @@ impl<'a> LayerProgram for StepWalk<'a> {
         let Layer::Moe(m) = &mut self.ops.layers[l] else {
             return Err(GpuError::state(WHAT, "a hosted layer is a MoE layer"));
         };
-        let (src, _) = rails(self.ops.in_head, &mut *self.ops.head, &mut *self.ops.r);
+        let (src, _) = rails(
+            self.ops.t.in_head,
+            &mut *self.ops.t.head,
+            &mut *self.ops.t.r,
+        );
         front(
-            &self.ops.cx,
+            &self.ops.t.cx,
             (self.ops.mk, self.ops.moe),
             self.side,
             (l, m),
-            (&mut *self.ops.s, &mut *self.ops.acts),
+            (&mut *self.ops.t.s, &mut *self.ops.t.acts),
             (src, leg),
         )
     }
@@ -576,11 +580,11 @@ impl<'a> LayerProgram for StepWalk<'a> {
             return Err(GpuError::state(WHAT, "a hosted layer is a MoE layer"));
         };
         shadow(
-            &self.ops.cx,
+            &self.ops.t.cx,
             (self.ops.mk, self.ops.moe),
             self.side,
             (l, m),
-            (&mut *self.ops.s, &mut *self.ops.ms, &mut *self.ops.acts),
+            (&mut *self.ops.t.s, &mut *self.ops.ms, &mut *self.ops.t.acts),
             leg,
         )
     }
@@ -593,17 +597,21 @@ impl<'a> LayerProgram for StepWalk<'a> {
         let Layer::Moe(m) = &mut self.ops.layers[l] else {
             return Err(GpuError::state(WHAT, "a hosted layer is a MoE layer"));
         };
-        let (src, dst) = rails(self.ops.in_head, &mut *self.ops.head, &mut *self.ops.r);
+        let (src, dst) = rails(
+            self.ops.t.in_head,
+            &mut *self.ops.t.head,
+            &mut *self.ops.t.r,
+        );
         back(
-            &self.ops.cx,
+            &self.ops.t.cx,
             self.ops.moe,
             self.side,
             (l, m),
-            (&mut *self.ops.s, &mut *self.ops.ms, &mut *self.ops.acts),
+            (&mut *self.ops.t.s, &mut *self.ops.ms, &mut *self.ops.t.acts),
             (src, dst),
             leg,
         )?;
-        self.ops.in_head = !self.ops.in_head;
+        self.ops.t.flip();
         Ok(())
     }
 }

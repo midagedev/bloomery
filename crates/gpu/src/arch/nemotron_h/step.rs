@@ -4,7 +4,7 @@
 
 use super::body::Body;
 use super::program::Program;
-use crate::arch::hybrid::{Cx, GqaLayer, MambaLayer, Site};
+use crate::arch::hybrid::{Cx, GqaLayer, MambaLayer, Site, Trunk};
 use crate::head::Head;
 use crate::site::SiteTy;
 use crate::weights::Weights;
@@ -60,14 +60,16 @@ impl Body {
         };
         let in_head = self.layers.len().is_multiple_of(2);
         let mut program = Program {
-            cx,
+            t: Trunk {
+                cx,
+                s: &mut self.s,
+                acts: &mut self.acts,
+                r: &mut self.r,
+                head,
+                in_head,
+            },
             embed: &self.embed,
             layers: &mut self.layers,
-            s: &mut self.s,
-            acts: &mut self.acts,
-            r: &mut self.r,
-            head,
-            in_head,
         };
         Walk::new(&mut program, &self.plans, 1).run(1)
     }
