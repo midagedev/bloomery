@@ -1,26 +1,34 @@
-//! The Raon-1 `ChainBody` over one sequence on one card: the file's keys read
-//! once through [`Hparams`], each layer's sites, router and stores resolved
-//! once at load, the step's buffers allocated once, and the token and
-//! position refreshed before every enqueue or replay.
+//! The Raon-1 `ChainBody` over one sequence on one card, both dialects' files
+//! (`src/models/raon1.cpp` and `src/models/raon1nano.cpp`): the file's keys
+//! read once through [`Hparams`], each layer's sites, router and stores
+//! resolved once at load — the Nano file's fused stems split into the buffers
+//! the split dialect's sites read ([`super::rda::fold`]) — the step's buffers
+//! allocated once, and the token and position refreshed before every enqueue
+//! or replay.
 //!
-//! A step (llama.cpp `src/models/raon1.cpp`): the embedding row repeated into
-//! the [`STREAMS`] residual streams; every layer then runs its two
-//! sub-layers through Raon_mHC ([`super::mhc`]): the route of the streams,
-//! their fold into the sub-layer's input, the sub-layer, the post mix of the
-//! streams and its output. The attention sub-layer is an RDA layer
-//! ([`super::rda`]) or a latent one ([`super::mla`]), each applying its own
-//! `attn_norm`; the feed-forward one is `ffn_norm` then the dense or routed
-//! SiTU block ([`crate::arch::routed_ffn`]). The head reads the streams' mean.
+//! A step: the embedding row repeated into the [`STREAMS`] residual streams;
+//! every layer then runs its two sub-layers through Raon_mHC ([`super::mhc`],
+//! the file's dialect's route): the route of the streams, their fold into the
+//! sub-layer's input, the sub-layer, the post mix of the streams and its
+//! output. The attention sub-layer is an RDA layer ([`super::rda`]) or a
+//! latent one ([`super::mla`]), each applying its own `attn_norm`; the
+//! feed-forward one is `ffn_norm` then the dense block of the description's
+//! activation or the routed SiTU one ([`crate::arch::routed_ffn`]). A file
+//! with a per-layer input ([`super::ple`]) adds its gated sum to every stream
+//! after the feed-forward post-mix. The head reads the streams' mean — the
+//! token table's own rows when the file ties it.
 //!
 //! A pass of `m` rows ([`Run::Rows`]: a verify's or a prompt chunk's,
 //! [`super::rows`]) is the same walk over the rows the staging holds: the
-//! embedding of their ids, the mHC kernels, norms and SiTU over every row,
-//! the RDA and latent layers' row forms and the feed-forward block's
-//! ([`ffn::ffn_rows`]), each row the one-row step's bits. A walk of one row
-//! runs the step's own launches.
+//! embedding of their ids, the mHC kernels, norms and the block's activation
+//! over every row, the RDA and latent layers' row forms and the feed-forward
+//! block's ([`ffn::ffn_rows`]), each row the one-row step's bits. A walk of
+//! one row runs the step's own launches.
 
-use super::mhc::{self, HC_OUT, MhcKernels, STREAMS, SiteVecs};
+use super::gather;
+use super::mhc::{self, CHART_LEN, ChartVecs, HC_OUT, MhcKernels, STREAMS, SiteVecs};
 use super::mla;
+use super::ple::{Ple, PleBufs, PleKernels};
 use super::rda::{self, RdaSites, RowKernels, RowsKit};
 use super::rows::{RowState, RowViews};
 use super::state::{self, PASS_ROWS, Pass};
@@ -30,7 +38,6 @@ use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::arch::routed_ffn::{
     self as ffn, Ffn, FfnKernels, FfnRows, FfnScratch, Glu, Routed, RoutedShape,
 };
-use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
@@ -38,11 +45,12 @@ use crate::kquant::Act;
 use crate::latent_gated::{self, MlaDims, MlaKernels};
 use crate::linear::mixer_kda::{KdaBufs, KdaDims};
 use crate::linear::{HEAD, LinearKernels};
-use crate::model::{ChainBody, GpuModel, NoHost, block_count};
+use crate::model::{ChainBody, GpuModel, NoHost};
+use crate::q38::Q38Kernels;
 use crate::recur::RecStore;
 use crate::site::{self, KGemvKernels, SiteTy};
 use crate::tensor::Window;
-use crate::weights::{DevWeight, Weights};
+use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -51,6 +59,7 @@ use model::arch::models::KdaGate;
 use model::arch::noaux::Experts;
 use model::arch::raon1::hparams::{Hparams, Kind};
 use model::arch::raon1::names::{self, Sub};
+use model::arch::raon1::roles::Dialect;
 use model::placement::CardFormat;
 use model::placement::kernels;
 use std::ops::Range;
@@ -148,6 +157,10 @@ struct Kernels {
     hc: MhcKernels,
     ffn: FfnKernels,
     mla: MlaKernels,
+    /// The Q8_0 row gathers a Nano file's tables take.
+    q38: Q38Kernels,
+    /// The per-layer input's two entries.
+    ple: PleKernels,
 }
 
 impl Kernels {
@@ -162,13 +175,16 @@ impl Kernels {
             hc: MhcKernels::load(ctx)?,
             ffn: FfnKernels::load(gpu)?,
             mla: MlaKernels::load(gpu, mla, WIDE_ROWS)?,
+            q38: Q38Kernels::load(ctx)?,
+            ple: PleKernels::load(ctx)?,
         })
     }
 }
 
 /// The RDA and latent layers' widths `hp` names, or a named refusal of a
 /// shape the card does not run: the softplus decay, a latent row of another
-/// width.
+/// width, latent layers of more than one head count (the one latent dims
+/// sizes every latent layer's sites, kernels and caches).
 fn dims(hp: &Hparams) -> Result<(KdaDims, MlaDims), GpuError> {
     let KdaGate::Sigmoid { lower_bound } = hp.gate else {
         return Err(GpuError::shape(
@@ -177,12 +193,32 @@ fn dims(hp: &Hparams) -> Result<(KdaDims, MlaDims), GpuError> {
              (kda.gate_lower_bound)",
         ));
     };
+    let latent: Vec<usize> = (0..hp.n_layer)
+        .filter(|&l| hp.kind(l) == Kind::Mla)
+        .map(|l| hp.head(l))
+        .collect();
+    let Some(&heads) = latent.first() else {
+        return Err(GpuError::shape(
+            WHAT,
+            "no latent layer: the card runs both mixers (attention.head_count_kv)",
+        ));
+    };
+    if latent.iter().any(|&h| h != heads) {
+        let other = latent.iter().copied().find(|&h| h != heads).expect("one");
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "the latent layers' head counts differ: {heads} and {other} \
+                 (attention.head_count); the card holds one latent shape"
+            ),
+        ));
+    }
     let n = hp.n_embd;
     let kda = rda::dims(n, hp.n_head, hp.rms_eps, lower_bound);
     kda.rule.check(WHAT)?;
     let mla = MlaDims {
         embd: n,
-        heads: hp.n_head,
+        heads,
         q_lora: hp.mla.q_lora,
         nope: hp.mla.nope(),
         extra: hp.mla.pe,
@@ -203,38 +239,96 @@ fn dims(hp: &Hparams) -> Result<(KdaDims, MlaDims), GpuError> {
     Ok((kda, mla))
 }
 
-/// The widths a wide unit is cut for, or a named refusal of a shape the
-/// wide arm's forms do not cover: the two mixers' output projections read
-/// one width, the routed block's slots a card sum of the router's pick count.
-fn wide_dims(hp: &Hparams, kda: &KdaDims, mla: &MlaDims) -> Result<WideDims, GpuError> {
+/// The blocks' activation as the card runs it, from the description's
+/// ([`Hparams::act`]): the Mini file's `situ` keys' own, the Nano row's
+/// SwiGLU plain or clamped. Another activation is refused by name.
+fn act_of(hp: &Hparams) -> Result<Act, GpuError> {
+    let act = match hp.act {
+        model::arch::models::Act::Situ {
+            gate_beta: beta,
+            value_beta: linear_beta,
+        } => Act::Situ { beta, linear_beta },
+        model::arch::models::Act::SwiGlu { limit: None } => Act::SiluMul,
+        model::arch::models::Act::SwiGlu { limit: Some(limit) } => Act::SwigluClamp { limit },
+        other => {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the blocks' activation is {}; the card runs situ and swiglu",
+                    other.what()
+                ),
+            ));
+        }
+    };
+    act.code(WHAT)?;
+    Ok(act)
+}
+
+/// The widths a wide unit is cut for and why a file of shapes the wide
+/// arm's forms do not cover keeps every prompt on the rows pass
+/// ([`Body::wide_off`]): the two mixers' output projections reading one
+/// width, a file that routes no experts (the Nano dialect's dense blocks).
+/// The dims a dense file names are its own — the routed widths zero — for
+/// [`Wide::bytes_of`] and [`Body::pass_reserve`] to count; a file the reason
+/// names holds no wide kit at all.
+fn wide_dims(
+    hp: &Hparams,
+    kda: &KdaDims,
+    mla: &MlaDims,
+) -> Result<(WideDims, Option<String>), GpuError> {
     let attn = kda.shape.n_v * HEAD;
     if attn != mla.heads * mla.v_head {
-        return Err(GpuError::shape(
-            WHAT,
-            format!(
-                "the RDA layers' output projection reads {attn} values, the latent layers' {}: the wide arm holds one form of its input",
+        return Ok((
+            wide_dims_of(hp, attn, mla, 0, 0, hp.dense_ff),
+            Some(format!(
+                "the RDA layers' output projection reads {attn} values, the latent layers' {}: \
+                 the wide arm holds one form of its input",
                 mla.heads * mla.v_head
-            ),
+            )),
         ));
     }
     let Some(e) = &hp.experts else {
-        return Err(GpuError::shape(
-            WHAT,
-            "the file routes no experts; the card's wide arm reads the mini dialect's routed \
-             blocks",
+        return Ok((
+            wide_dims_of(hp, attn, mla, 0, 0, hp.dense_ff),
+            Some(
+                "the file routes no experts; the card's wide arm reads the mini dialect's routed \
+                 blocks"
+                    .to_owned(),
+            ),
         ));
     };
-    Ok(WideDims {
+    let d = wide_dims_of(
+        hp,
+        attn,
+        mla,
+        e.shared_ff(),
+        e.ff,
+        wide_ff_rows(hp.dense_ff, e),
+    );
+    Ok((d, None))
+}
+
+/// [`wide_dims`]' widths at the given routed terms (`ff_rows` the widest
+/// feed-forward block a unit's gate rows hold).
+fn wide_dims_of(
+    hp: &Hparams,
+    attn: usize,
+    mla: &MlaDims,
+    shared_ff: usize,
+    expert_ff: usize,
+    ff_rows: usize,
+) -> WideDims {
+    WideDims {
         embd: hp.n_embd,
         attn,
         q_lora: hp.mla.q_lora,
         heads: mla.heads,
         nope: mla.nope,
         dense_ff: hp.dense_ff,
-        shared_ff: e.shared_ff(),
-        expert_ff: e.ff,
-        ff_rows: wide_ff_rows(hp.dense_ff, e),
-    })
+        shared_ff,
+        expert_ff,
+        ff_rows,
+    }
 }
 
 /// The width of the widest block the dense forms' buffers hold rows of: the dense
@@ -474,11 +568,18 @@ pub struct Body {
     pass: Scratch,
     ffn_rows: FfnRows,
     stage: DeviceBuffer<f32>,
-    /// A wide unit's rows, forms and kernels ([`super::wide`]).
-    pub(super) wide: Wide,
+    /// A wide unit's rows, forms and kernels ([`super::wide`]); `None` for a
+    /// file whose shapes or per-layer input keep every prompt on the rows
+    /// pass ([`Body::wide_off`]).
+    pub(super) wide: Option<Wide>,
     /// What keeps the wide arm off this file's prompts, found at load, or `None`
     /// when it runs every layer ([`Body::wide_ok`]).
     wide_off: Option<String>,
+    /// The per-layer input site of a file that carries one, and its buffers.
+    pub(super) ple: Option<Ple>,
+    ple_b: Option<PleBufs>,
+    /// The tensor dialect the file speaks ([`Hparams::dialect`]).
+    pub(super) dialect: Dialect,
     /// The passes' staging, the lane word, the taps and the position the
     /// stores stand at.
     pub(super) rows: RowState,
@@ -512,18 +613,43 @@ impl GpuModel<Body> {
         ctx: usize,
         lanes: usize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        let n_layers = block_count(&file, "raon1 GpuModel::open")?;
-        GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
-            let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
-            for l in (0..hp.n_layer).filter(|&l| hp.kind(l) == Kind::Rda) {
-                rda::derive(gpu.stream(), w, l)?;
+        // The header read once, before the blocks load: the trunk's own
+        // count names the range, so the next-token blocks a file carries past
+        // it (described as its `mtp`, run by no program) load nowhere and
+        // their tensors stay unread — the reader's own rule.
+        let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let trunk = 0..hp.n_trunk;
+        GpuModel::load_blocks(gpu, &file, ctx, trunk, true, |gpu, w| {
+            for l in (0..hp.n_trunk).filter(|&l| hp.kind(l) == Kind::Rda) {
+                match hp.dialect {
+                    Dialect::Split => rda::derive(gpu.stream(), w, l)?,
+                    Dialect::Fused => rda::fold(gpu.stream(), w, l, (hp.n_head, hp.decay_rank))?,
+                }
             }
-            for l in (0..hp.n_layer).filter(|&l| !hp.dense(l)) {
+            for l in (0..hp.n_trunk).filter(|&l| !hp.dense(l)) {
                 down_words(gpu.stream(), &file, w, &names::ffn_down_exps(l))?;
             }
-            Body::load(gpu, &file, w, (hp, ctx), lanes)
+            for l in (0..hp.n_trunk).filter(|&l| hp.dense(l) && hp.dialect == Dialect::Fused) {
+                ffn_fold(gpu.stream(), w, l, hp.dense_ff)?;
+            }
+            Body::load(gpu, &file, w, (hp.clone(), ctx), lanes)
         })
     }
+}
+
+/// The Nano dialect's fused feed-forward stem of dense layer `l`, split at
+/// load into the split dialect's sites: the file's one `ffn_up` holds the
+/// SwiGLU's gate rows then its up rows (raon1nano.cpp:152-154). Load-time
+/// only, before the sites load.
+fn ffn_fold(stream: &CudaStream, w: &mut Weights, l: usize, ff: usize) -> Result<(), GpuError> {
+    w.split_rows(
+        stream,
+        &names::ffn_up(l),
+        &[
+            (format!("derived.blk.{l}.ffn_gate"), ff),
+            (format!("derived.blk.{l}.ffn_up"), ff),
+        ],
+    )
 }
 
 /// The routed down stack `name` in the layout the card leg reads it in
@@ -583,9 +709,20 @@ impl Body {
     pub fn pass_reserve(hp: &Hparams) -> Result<u64, GpuError> {
         let (kda, mla) = dims(hp)?;
         let lens = Scratch::lens(hp, (&kda, &mla), usize::MAX, PASS_ROWS)?;
-        let wide_lens = Scratch::lens(hp, (&kda, &mla), usize::MAX, WIDE_ROWS)?;
-        let wide = Scratch::bytes_of(&wide_lens) + Wide::bytes_of(&wide_dims(hp, &kda, &mla)?);
-        Ok((Scratch::bytes_of(&lens) + wide) as u64)
+        let (wd, dims_off) = wide_dims(hp, &kda, &mla)?;
+        let ple = match hp.ple {
+            Some(width) => PleBufs::bytes_of((hp.n_embd, hp.n_trunk, width)),
+            None => 0,
+        };
+        // A file the dims refuse holds no wide kit: every prompt runs the
+        // rows pass ([`Body::wide_off`]).
+        let wide = if dims_off.is_some() || hp.ple.is_some() {
+            0
+        } else {
+            let wide_lens = Scratch::lens(hp, (&kda, &mla), usize::MAX, WIDE_ROWS)?;
+            Scratch::bytes_of(&wide_lens) + Wide::bytes_of(&wd)
+        };
+        Ok((Scratch::bytes_of(&lens) + wide + ple) as u64)
     }
 
     /// The last hyper-connection site's route as the step left it: the last
@@ -637,16 +774,12 @@ impl Body {
                 ),
             ));
         }
-        let Some(e) = &hp.experts else {
-            return Err(GpuError::shape(
-                WHAT,
-                "the file routes no experts; the card's body runs the mini dialect's routed \
-                 blocks",
-            ));
-        };
-        if e.n_expert != ffn::sigmoid_128_6::N_EXPERT
-            || e.n_used != ffn::sigmoid_128_6::N_USED
-            || !e.weights_norm
+        let (kda, mla) = dims(&hp)?;
+        let act = act_of(&hp)?;
+        if let Some(e) = &hp.experts
+            && (e.n_expert != ffn::sigmoid_128_6::N_EXPERT
+                || e.n_used != ffn::sigmoid_128_6::N_USED
+                || !e.weights_norm)
         {
             return Err(GpuError::shape(
                 WHAT,
@@ -661,22 +794,7 @@ impl Body {
                 ),
             ));
         }
-        let (kda, mla) = dims(&hp)?;
-        let model::arch::models::Act::Situ {
-            gate_beta: beta,
-            value_beta: linear_beta,
-        } = hp.act
-        else {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "the blocks' activation is {}, the card's runs situ",
-                    hp.act.what()
-                ),
-            ));
-        };
-        let act = Act::Situ { beta, linear_beta };
-        act.code(WHAT)?;
+        let ple = Ple::load(file, w, &hp)?;
         let glu = |l: usize, (gate, up, down): (String, String, String), ff: usize| {
             Ok::<Glu, GpuError>(Glu {
                 gate: typed(file, w, gate, (ff, n), FFN_TYPES)?,
@@ -686,11 +804,11 @@ impl Body {
             })
             .map_err(|err| GpuError::shape(WHAT, format!("layer {l}'s feed-forward block: {err}")))
         };
-        let mut layers = Vec::with_capacity(hp.n_layer);
-        for l in 0..hp.n_layer {
+        let mut layers = Vec::with_capacity(hp.n_trunk);
+        for l in 0..hp.n_trunk {
             let mixer = match hp.kind(l) {
                 Kind::Rda => Mixer::Rda {
-                    sites: Box::new(RdaSites::load(file, w, &kda, l)?),
+                    sites: Box::new(RdaSites::load(file, w, &kda, l, hp.dialect)?),
                     store: state::rda_store(stream, kda.shape, lanes)?,
                 },
                 Kind::Mla => Mixer::Mla {
@@ -699,12 +817,21 @@ impl Body {
                 },
             };
             let ffn = if hp.dense(l) {
-                Ffn::Dense(glu(
-                    l,
-                    (names::ffn_gate(l), names::ffn_up(l), names::ffn_down(l)),
-                    hp.dense_ff,
-                )?)
+                // The dense block's gate and up: the split dialect's own file
+                // tensors, or the load-time halves of the fused `ffn_up`.
+                let (gate, up) = match hp.dialect {
+                    Dialect::Split => (names::ffn_gate(l), names::ffn_up(l)),
+                    Dialect::Fused => (
+                        format!("derived.blk.{l}.ffn_gate"),
+                        format!("derived.blk.{l}.ffn_up"),
+                    ),
+                };
+                Ffn::Dense(glu(l, (gate, up, names::ffn_down(l)), hp.dense_ff)?)
             } else {
+                let e = hp
+                    .experts
+                    .as_ref()
+                    .expect("a routed layer: the read refused a file whose router keys are absent");
                 Ffn::Routed(Routed {
                     router: exact(w, names::ffn_gate_inp(l), e.n_expert * n)?,
                     bias: exact(w, names::exp_probs_b(l), e.n_expert)?,
@@ -726,51 +853,104 @@ impl Body {
                     sum_norm: None,
                 })
             };
-            let hc = [Sub::Attn, Sub::Ffn].map(|sub| {
-                [
+            // A sublayer's mix vectors in the file's dialect: the split
+            // dialect's `fn`, `scale` and `base`, or the folded chart's `fn`,
+            // `base` and `chart`.
+            let hc = [Sub::Attn, Sub::Ffn].map(|sub| match hp.dialect {
+                Dialect::Split => [
                     names::hc_fn(l, sub),
                     names::hc_scale(l, sub),
                     names::hc_base(l, sub),
-                ]
+                ],
+                Dialect::Fused => [
+                    names::hc_fn(l, sub),
+                    names::hc_base(l, sub),
+                    names::hc_chart(l, sub),
+                ],
             });
-            for [f, scale, base] in &hc {
-                exact(w, f.clone(), hp.hc.mix_dim() * STREAMS * n)?;
-                exact(w, scale.clone(), 4)?;
-                exact(w, base.clone(), hp.hc.mix_dim())?;
+            for sub in &hc {
+                match hp.dialect {
+                    Dialect::Split => {
+                        let [f, scale, base] = sub;
+                        exact(w, f.clone(), hp.hc.mix_dim() * STREAMS * n)?;
+                        exact(w, scale.clone(), 4)?;
+                        exact(w, base.clone(), hp.hc.mix_dim())?;
+                    }
+                    Dialect::Fused => {
+                        let [f, base, chart] = sub;
+                        exact(w, f.clone(), hp.hc.mix_dim() * STREAMS * n)?;
+                        exact(w, base.clone(), hp.hc.mix_dim())?;
+                        exact(w, chart.clone(), CHART_LEN)?;
+                    }
+                }
             }
             exact(w, names::ffn_norm(l), n)?;
             layers.push(Layer { mixer, ffn, hc });
         }
-        let mut acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
+        let mut acts = Acts::new(
+            stream,
+            layers
+                .iter()
+                .flat_map(Layer::sites)
+                .chain(ple.iter().flat_map(|p| p.sites())),
+        )?;
         rda::add_row_forms(
             stream,
             &mut acts,
             layers.iter().flat_map(Layer::mixer_sites),
         )?;
-        let ff = (dense_block_ff(hp.dense_ff, e), e.ff);
-        let wd = wide_dims(&hp, &kda, &mla)?;
-        let wide_off = wide_refusal(&layers, w, &wd);
+        let (ff, ff_expert) = match &hp.experts {
+            Some(e) => (dense_block_ff(hp.dense_ff, e), e.ff),
+            None => (hp.dense_ff, 0),
+        };
+        let (wd, dims_off) = wide_dims(&hp, &kda, &mla)?;
+        // A file the dims refuse holds no wide kit at all, and so does one
+        // with a per-layer input: every prompt takes the rows pass.
+        let hold_wide = dims_off.is_none() && ple.is_none();
+        let mut wide_off = dims_off.or_else(|| wide_refusal(&layers, w, &wd));
+        if wide_off.is_none() && ple.is_some() {
+            wide_off = Some(
+                "the file's per-layer input: a wide unit runs none (the step and the rows pass \
+                 do)"
+                .to_owned(),
+            );
+        }
         let stage = rda::stage_len(&kda)
             .max(gated_mla::stage_len(&mla))
-            .max(ffn::stage_len(ff.0.max(ff.1)));
+            .max(ffn::stage_len(ff.max(ff_expert)));
+        // A file whose shapes the wide arm holds one form of holds the wide
+        // kit whether a weight later refuses it or not, as a file of a
+        // refusing weight type does; a file the dims refuse, or one with a
+        // per-layer input, holds none: every prompt takes the rows pass.
+        let wide = if hold_wide {
+            Some(Wide::new(
+                gpu,
+                &wd,
+                Scratch::new(stream, &hp, (&kda, &mla), ctx, WIDE_ROWS)?,
+            )?)
+        } else {
+            None
+        };
         Ok(Body {
             k: Kernels::load(gpu, &mla)?,
             s: Scratch::new(stream, &hp, (&kda, &mla), ctx, 1)?,
             step_in: StepIn::new(stream)?,
-            ffn_s: FfnScratch::new(stream, n, ff.0, RoutedShape::plain(ff.1))?,
+            ffn_s: FfnScratch::new(stream, n, ff, RoutedShape::plain(ff_expert))?,
             pass: Scratch::new(stream, &hp, (&kda, &mla), ctx, PASS_ROWS)?,
-            ffn_rows: FfnRows::new(stream, n, (ff.0, RoutedShape::plain(ff.1)), PASS_ROWS)?,
+            ffn_rows: FfnRows::new(stream, n, (ff, RoutedShape::plain(ff_expert)), PASS_ROWS)?,
             stage: DeviceBuffer::zeroed(stream, stage)?,
-            wide: Wide::new(
-                gpu,
-                &wd,
-                Scratch::new(stream, &hp, (&kda, &mla), ctx, WIDE_ROWS)?,
-            )?,
+            wide,
             wide_off,
+            ple_b: ple
+                .as_ref()
+                .map(|p| PleBufs::new(stream, (n, p.trunk, p.width)))
+                .transpose()?,
             rows: RowState::new(stream, lanes)?,
             kda,
             mla,
             act,
+            ple,
+            dialect: hp.dialect,
             layers,
             acts,
             ids: [0; STREAMS],
@@ -787,7 +967,8 @@ impl Body {
             + self.pass.bytes()
             + self.ffn_rows.bytes()
             + self.stage.num_bytes()
-            + self.wide.bytes()
+            + self.wide.as_ref().map_or(0, Wide::bytes)
+            + self.ple_b.as_ref().map_or(0, PleBufs::bytes)
             + self.rows.bytes()
             + self.acts.bytes()
             + self.k.kgemv.device_bytes()
@@ -833,6 +1014,9 @@ impl Body {
             rows,
             wide,
             wide_off,
+            ple,
+            ple_b,
+            dialect,
             ctx,
             ..
         } = self;
@@ -851,32 +1035,34 @@ impl Body {
             n_kv: 1,
             ctx: *ctx,
         };
-        let embd = names::token_embd();
-        let Some(DevWeight::KQuant { ty, w: table, .. }) = w.get(&embd) else {
-            return Err(GpuError::tensor(STEP, &embd, "K-quant rows"));
-        };
+        let embd = gather::RowsTable::of(w, STEP, &names::token_embd())?;
         let RowState {
             rin, lanes, taps, ..
         } = rows;
         let pos_w: Window<'_, u32>;
         let keys_w: Window<'_, u32>;
+        let ids_w: Window<'_, u32>;
+        // The per-layer input's gathers read the same ids as the streams'
+        // own: the step's one token, or the staged rows'.
+        let ple_step_ids: Window<'_, u32>;
+        let ple_ids: &DeviceBuffer<u32>;
+        let ple_pos0: &DeviceBuffer<u32>;
         let mut wide_kit = None;
         let (sc, mut ffn_b, pos, keys, (at, m, pass)) = match run {
             Run::Step => {
-                gpu.elem().enqueue_embed_rows_kquant(
-                    stream,
-                    *ty,
-                    EmbedRowsArgs {
-                        w: table,
-                        ids: &step_in.ids,
-                        pos0: &step_in.pos0,
-                        first: 0,
-                        y: &mut s.x,
-                        pos: &mut step_in.pos,
-                        n_keys: &mut step_in.n_keys,
-                    },
+                gather::enqueue_rows(
+                    gpu,
+                    &k.q38,
+                    &embd,
+                    (&step_in.ids, &step_in.pos0),
+                    (&mut s.x, &mut step_in.pos, &mut step_in.n_keys),
                 )?;
                 let (pos, keys) = (&step_in.pos, &step_in.n_keys);
+                // The step's ids are the one token once a stream; the
+                // per-layer input's gather reads the row once.
+                ple_step_ids = Window::<u32>::of(&step_in.ids, 0, 1)?;
+                ple_ids = &ple_step_ids;
+                ple_pos0 = &step_in.pos0;
                 (s, FfnBufs::Step(ffn_s), pos, keys, (0, 1, Pass::InPlace))
             }
             Run::Rows { at, m, pass } if m > PASS_ROWS => {
@@ -892,6 +1078,12 @@ impl Body {
                         format!("a wide unit of {m} rows with the wide arm off: {why}"),
                     ));
                 }
+                let Some(wide) = wide.as_mut() else {
+                    return Err(GpuError::state(
+                        STEP,
+                        "the wide kit: the load found the arm off",
+                    ));
+                };
                 wide.route_dense(gpu, m)?;
                 let (kit, ws, wrin) = wide.kit(&k.g32, &k.ffn.router);
                 let RowViews {
@@ -901,21 +1093,12 @@ impl Body {
                     epos,
                     ekeys,
                 } = wrin.views(at, m)?;
-                gpu.elem().enqueue_embed_rows_kquant(
-                    stream,
-                    *ty,
-                    EmbedRowsArgs {
-                        w: table,
-                        ids: &ids,
-                        pos0: &pos,
-                        first: 0,
-                        y: &mut ws.x,
-                        pos: epos,
-                        n_keys: ekeys,
-                    },
-                )?;
+                gather::enqueue_rows(gpu, &k.q38, &embd, (&ids, &pos), (&mut ws.x, epos, ekeys))?;
                 pos_w = pos;
                 keys_w = keys;
+                ids_w = ids;
+                ple_ids = &ids_w;
+                ple_pos0 = &*pos_w;
                 wide_kit = Some(kit);
                 (
                     ws,
@@ -936,21 +1119,12 @@ impl Body {
                 // The embedding's own positions are its rows', a stream each:
                 // they land in buffers no layer reads; the layers read the
                 // staged ones.
-                gpu.elem().enqueue_embed_rows_kquant(
-                    stream,
-                    *ty,
-                    EmbedRowsArgs {
-                        w: table,
-                        ids: &ids,
-                        pos0: &pos,
-                        first: 0,
-                        y: &mut ps.x,
-                        pos: epos,
-                        n_keys: ekeys,
-                    },
-                )?;
+                gather::enqueue_rows(gpu, &k.q38, &embd, (&ids, &pos), (&mut ps.x, epos, ekeys))?;
                 pos_w = pos;
                 keys_w = keys;
+                ids_w = ids;
+                ple_ids = &ids_w;
+                ple_pos0 = &*pos_w;
                 (
                     ps,
                     FfnBufs::Rows(ffn_rows),
@@ -960,6 +1134,23 @@ impl Body {
                 )
             }
         };
+        // The per-layer inputs' combine once a walk, before the layer loop.
+        // A wide unit never runs here: a file with a per-layer input loads
+        // the wide arm off.
+        if let (Some(p), Some(pb)) = (ple.as_ref(), ple_b.as_mut()) {
+            let mut kit = RowsKit {
+                linear: &k.linear,
+                rows: &k.rows,
+                stage: &mut *stage,
+            };
+            p.enqueue_setup(
+                &cx,
+                (acts, &mut kit, &k.q38, &k.ple),
+                (ple_ids, ple_pos0),
+                m,
+                pb,
+            )?;
+        }
         let Scratch {
             x,
             x2,
@@ -984,14 +1175,36 @@ impl Body {
                     base: w.f32_buf(STEP, base)?,
                 })
             };
-            mhc.enqueue_route(
-                stream,
-                &vecs(attn_hc)?,
-                x,
-                (n, m),
-                hcf,
-                (&mut *part, &mut *hc),
-            )?;
+            let charts = |[f, base, chart]: &[String; 3]| -> Result<ChartVecs<'_>, GpuError> {
+                Ok(ChartVecs {
+                    w: w.f32_buf(STEP, f)?,
+                    base: w.f32_buf(STEP, base)?,
+                    chart: w.f32_buf(STEP, chart)?,
+                })
+            };
+            // The route the file's dialect parametrizes: the split dialect's
+            // scale scalars, or the folded chart's baked mix. The partials
+            // and the route are borrowed per call, for the fold and the post
+            // mix read them between the two routes.
+            let route = |vecs3: &[String; 3],
+                         src: &DeviceBuffer<f32>,
+                         (part, hc): (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>)|
+             -> Result<(), GpuError> {
+                match dialect {
+                    Dialect::Split => {
+                        mhc.enqueue_route(stream, &vecs(vecs3)?, src, (n, m), hcf, (part, hc))
+                    }
+                    Dialect::Fused => mhc.enqueue_route_folded(
+                        stream,
+                        &charts(vecs3)?,
+                        src,
+                        (n, m),
+                        hcf,
+                        (part, hc),
+                    ),
+                }
+            };
+            route(attn_hc, x, (part, hc))?;
             mhc.enqueue_fold(stream, x, hc, (n, m), u)?;
             match &mut layer.mixer {
                 Mixer::Rda { sites, store } => {
@@ -1080,25 +1293,12 @@ impl Body {
                 }
             }
             mhc.enqueue_post(stream, (x, br, hc), (n, m), x2)?;
-            mhc.enqueue_route(
-                stream,
-                &vecs(ffn_hc)?,
-                x2,
-                (n, m),
-                hcf,
-                (&mut *part, &mut *hc),
-            )?;
+            route(ffn_hc, x2, (part, hc))?;
             mhc.enqueue_fold(stream, x2, hc, (n, m), u)?;
             let gain = w.f32_buf(STEP, &names::ffn_norm(l))?;
             gpu.elem()
                 .enqueue_rms_norm(stream, u, gain, hp.rms_eps, n, m, un)?;
-            let rule = (
-                *act,
-                hp.experts
-                    .as_ref()
-                    .expect("the admission refused a file that routes none")
-                    .weights_scale,
-            );
+            let rule = (*act, hp.experts.as_ref().map_or(1.0, |e| e.weights_scale));
             let at_l = (l, &layer.ffn);
             if let Some(kit) = wide_kit.as_mut() {
                 wide::ffn(&cx, kit, rule, at_l, m, un, br)?;
@@ -1116,6 +1316,16 @@ impl Body {
                 }
             }
             mhc.enqueue_post(stream, (x2, br, hc), (n, m), x)?;
+            // The per-layer input's gated add, after the feed-forward
+            // post-mix (module doc).
+            if let (Some(p), Some(pb)) = (ple.as_ref(), ple_b.as_mut()) {
+                let mut kit = RowsKit {
+                    linear: &k.linear,
+                    rows: &k.rows,
+                    stage: &mut *stage,
+                };
+                p.enqueue_layer(&cx, (acts, &mut kit, mhc, &k.ple), (l, m), x, pb)?;
+            }
         }
         match tail {
             Tail::Head(head) => {
@@ -1212,7 +1422,9 @@ impl ChainBody for Body {
 #[cfg(test)]
 mod tests {
     use super::mla::tests::typed_sites;
-    use super::{Ffn, Glu, Layer, Mixer, STREAMS, Site, SiteTy, dims, wide_dims, wide_refusal};
+    use super::{
+        Act, Ffn, Glu, Layer, Mixer, STREAMS, Site, SiteTy, act_of, dims, wide_dims, wide_refusal,
+    };
     use crate::arch::routed_ffn::sigmoid_128_6::{N_EXPERT, N_USED};
     use crate::weights::Weights;
     use crate::{DeviceTensor, Gpu};
@@ -1292,7 +1504,8 @@ mod tests {
         for (dense_ff, ff, n_shared) in [(1024, 256, 7), (12032, 1088, 1), (512, 128, 1)] {
             let hp = header(dense_ff, ff, n_shared);
             let (kda, mla) = dims(&hp).expect("the header's widths");
-            let d = wide_dims(&hp, &kda, &mla).expect("the wide arm's widths");
+            let (d, off) = wide_dims(&hp, &kda, &mla).expect("the wide arm's widths");
+            assert!(off.is_none(), "the header's shapes run wide");
             for (what, width) in [
                 ("dense", dense_ff),
                 ("shared", ff * n_shared),
@@ -1317,7 +1530,8 @@ mod tests {
         let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
         let hp = header(1024, 256, 1);
         let (kda, mla) = dims(&hp).expect("the header's widths");
-        let d = wide_dims(&hp, &kda, &mla).expect("the wide arm's widths");
+        let (d, off) = wide_dims(&hp, &kda, &mla).expect("the wide arm's widths");
+        assert!(off.is_none(), "the header's shapes run wide");
         let site = |name: &str, ty: SiteTy, k: usize| Site::new(name.to_owned(), ty, k);
         let layer = |out: SiteTy| Layer {
             mixer: Mixer::Mla {
@@ -1341,5 +1555,90 @@ mod tests {
             refusal.contains("layer 1's mixer") && refusal.contains("an output projection of Q6_K"),
             "{refusal}"
         );
+    }
+
+    /// The blocks' activation comes from the description: the situ keys' own,
+    /// the Nano row's SwiGLU plain and clamped, each the entry its rule names;
+    /// another activation is refused by name. Mutant: the SwiGlu arm answering
+    /// the situ rule.
+    #[test]
+    fn the_act_is_the_descriptions() {
+        let mut hp = header(1024, 256, 1);
+        hp.act = model::arch::models::Act::Situ {
+            gate_beta: 4.0,
+            value_beta: 25.0,
+        };
+        assert_eq!(
+            act_of(&hp).expect("the situ rule"),
+            Act::Situ {
+                beta: 4.0,
+                linear_beta: 25.0
+            }
+        );
+        for (limit, want) in [
+            (None, Act::SiluMul),
+            (Some(7.0f32), Act::SwigluClamp { limit: 7.0 }),
+        ] {
+            hp.act = model::arch::models::Act::SwiGlu { limit };
+            assert_eq!(act_of(&hp).expect("a swiglu rule"), want);
+        }
+        hp.act = model::arch::models::Act::GeGlu;
+        let err = act_of(&hp)
+            .expect_err("a rule the card does not run")
+            .to_string();
+        assert!(err.contains("the blocks' activation is GELU GLU"), "{err}");
+    }
+
+    /// The wide arm's dims carry why a file of shapes they do not hold keeps
+    /// every prompt on the rows pass: the Nano dialect's own two attention
+    /// widths and its routing no experts, the Mini header's shapes neither.
+    /// Mutant: the experts arm answered as though the widths differed.
+    #[test]
+    fn the_wide_dims_name_the_shapes_they_do_not_hold() {
+        let hp = header(1024, 256, 1);
+        let (kda, mla) = dims(&hp).expect("the header's widths");
+        let (_, off) = wide_dims(&hp, &kda, &mla).expect("the wide arm's widths");
+        assert!(off.is_none(), "the Mini header's shapes run wide");
+        let mut nano = hp;
+        nano.experts = None;
+        nano.dense_lead = nano.n_trunk;
+        let (kda, mla) = dims(&nano).expect("the header's widths");
+        let (d, off) = wide_dims(&nano, &kda, &mla).expect("the wide arm's widths");
+        let why = off.expect("a dense file runs no wide units");
+        assert!(why.contains("the file routes no experts"), "{why}");
+        assert_eq!(d.ff_rows, nano.dense_ff, "the dense width alone");
+        // The Nano dialect's two attention widths: the latent layers' heads
+        // their own, not the delta layers'.
+        nano.heads[2] = 8;
+        let (kda, mla) = dims(&nano).expect("the header's widths");
+        let (_, off) = wide_dims(&nano, &kda, &mla).expect("the wide arm's widths");
+        let why = off.expect("the widths' refusal");
+        assert!(
+            why.contains(
+                "the RDA layers' output projection reads 4096 values, the latent \
+                          layers' 1024"
+            ),
+            "{why}"
+        );
+    }
+
+    /// The latent layers share one head count — the one latent dims sizes
+    /// every latent layer's sites, kernels and caches — and a file whose
+    /// differ is refused by name; a file of no latent layer is too. Mutant:
+    /// the uniformity check dropped.
+    #[test]
+    fn the_latent_layers_share_one_head_count() {
+        let mut hp = header(1024, 256, 1);
+        hp.heads[2] += 1;
+        let err = dims(&hp)
+            .expect_err("differing latent head counts")
+            .to_string();
+        assert!(
+            err.contains("the latent layers' head counts differ: 40 and 41"),
+            "{err}"
+        );
+        hp.kinds = vec![Kind::Rda; 3];
+        let err = dims(&hp).expect_err("no latent layer").to_string();
+        assert!(err.contains("no latent layer"), "{err}");
     }
 }

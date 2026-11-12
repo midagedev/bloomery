@@ -463,6 +463,13 @@ pub fn hc_scale(l: usize, sub: Sub) -> String {
     blk(l, &format!("hc_{}_scale.weight", sub.stem()))
 }
 
+/// `blk.{l}.hc_{attn,ffn}_chart.weight` — the Nano file's folded chart, in
+/// place of the split dialect's scale scalars.
+#[must_use]
+pub fn hc_chart(l: usize, sub: Sub) -> String {
+    blk(l, &format!("hc_{}_chart.weight", sub.stem()))
+}
+
 /// `blk.{l}.hc_{attn,ffn}_base.weight` — the mix's biases.
 #[must_use]
 pub fn hc_base(l: usize, sub: Sub) -> String {

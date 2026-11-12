@@ -872,6 +872,12 @@ required-features = ["gpu"]
 name = "gate_raon1_attn"
 required-features = ["gpu"]
 
+# raon-nano: the Nano dialect's own card pieces — the folded chart's route against the split
+# dialect's and the f64 fold, the per-layer input's combine and add against their host rules.
+[[bin]]
+name = "gate_raonnano"
+required-features = ["gpu"]
+
 # kimik3kda: Kimi K3's KDA layer through `mixer_kda` at 2 and 96 heads of 128 against llama.cpp's graph in f64.
 [[bin]]
 name = "gate_kimi_k3_kda"

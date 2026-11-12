@@ -4,8 +4,11 @@
 //! (`build_ffn` / `build_moe_ffn` at `LLM_FFN_SITU`, the shared expert added after the routed
 //! sum).
 //!
-//! - dense: gate and up sites of the normed row, SiTU-GLU
-//!   (`ElemKernels::enqueue_situ`), the down site;
+//! - dense: gate and up sites of the normed row, the block's rule — the situ
+//!   files' own entry (`ElemKernels::enqueue_situ`), every other rule the
+//!   description states through the rule-taking one
+//!   (`ElemKernels::enqueue_swiglu_rule`, Raon-1-nano's SwiGLU) — and the
+//!   down site;
 //! - routed: the sigmoid router at 128 experts and the top 6
 //!   ([`sigmoid_128_6`]: the selection bias steers the pick only, the kept
 //!   unbiased scores renormalized and scaled), the card leg over every
@@ -380,9 +383,24 @@ fn glu(
     let (gate, up, act) = s;
     g.gate.project(cx, acts, l, xn, gate)?;
     g.up.project(cx, acts, l, xn, up)?;
-    cx.gpu
-        .elem()
-        .enqueue_situ(cx.gpu.stream(), rule, (gate, up), g.ff, act)?;
+    let stream = cx.gpu.stream();
+    match rule {
+        // The entry every situ file's block runs (Raon-1 Mini's, Kimi K3's),
+        // unchanged.
+        Act::Situ { .. } => cx
+            .gpu
+            .elem()
+            .enqueue_situ(stream, rule, (gate, up), g.ff, act)?,
+        // Every other rule the description states (Raon-1-nano's SwiGLU)
+        // runs the rule-taking entry, with its fault sink.
+        rule => cx.gpu.elem().enqueue_swiglu_rule(
+            stream,
+            rule,
+            (gate, up),
+            g.ff,
+            (cx.gpu.layer_sink(l)?, act),
+        )?,
+    };
     g.down.project(cx, acts, l, act, y)
 }
 
@@ -550,9 +568,24 @@ pub(crate) fn glu_rows(
     let (gate, up, act) = s;
     rows_kit::project_rows(cx, kit, acts, (l, m), (&g.gate, g.ff), xn, gate)?;
     rows_kit::project_rows(cx, kit, acts, (l, m), (&g.up, g.ff), xn, up)?;
-    cx.gpu
-        .elem()
-        .enqueue_situ(cx.gpu.stream(), rule, (gate, up), m * g.ff, act)?;
+    let stream = cx.gpu.stream();
+    match rule {
+        // The entry every situ file's block runs (Raon-1 Mini's, Kimi K3's),
+        // unchanged.
+        Act::Situ { .. } => cx
+            .gpu
+            .elem()
+            .enqueue_situ(stream, rule, (gate, up), m * g.ff, act)?,
+        // Every other rule the description states (Raon-1-nano's SwiGLU)
+        // runs the rule-taking entry, with its fault sink.
+        rule => cx.gpu.elem().enqueue_swiglu_rule(
+            stream,
+            rule,
+            (gate, up),
+            m * g.ff,
+            (cx.gpu.layer_sink(l)?, act),
+        )?,
+    };
     rows_kit::project_rows(cx, kit, acts, (l, m), (&g.down, cx.hidden), act, y)
 }
 

@@ -101,7 +101,10 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::Qwen4Exp => Some(Program::Qwen38Body),
         Arch::MiMo2 => Some(Program::Mimo2Body),
         Arch::MiniMaxM3 => Some(Program::MiniMaxM3Body),
-        Arch::Raon1 => Some(Program::Raon1Body),
+        // The raon1 body runs both dialects: the Mini file's split stems,
+        // situ blocks and untied head, the Nano file's fused stems (split at
+        // load), per-layer inputs, dense SwiGLU blocks and tied head.
+        Arch::Raon1 | Arch::Raon1Nano => Some(Program::Raon1Body),
         Arch::SolarOpen2 => Some(Program::Solar2Body),
         Arch::NemotronH => Some(Program::NemotronHBody),
         Arch::NemotronHMoe => Some(Program::NemotronHMoeBody),
@@ -110,9 +113,6 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::MuseSpark => Some(Program::MuseSparkBody),
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
         Arch::KimiK3 => Some(Program::KimiK3Body),
-        // The raon1 body runs the Mini dialect's split stems, situ blocks and untied head; it
-        // does not run raon1nano's per-layer inputs, fused stems or tied head yet.
-        Arch::Raon1Nano => None,
         Arch::Lfm3 => None,
     }
 }

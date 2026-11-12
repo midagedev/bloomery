@@ -336,7 +336,7 @@ pub fn of(arch: model::arch::Arch) -> StepOrder {
         Arch::Glm5next => ("Glm5next", GLM5NEXT),
         Arch::Mimo2 => ("Mimo2", MIMO2),
         Arch::SolarOpen2 => ("SolarOpen2", SOLAR2),
-        Arch::Raon1 => ("Raon1", SOLAR2),
+        Arch::Raon1 | Arch::Raon1Nano => ("Raon1", SOLAR2),
         Arch::MiniMaxM3 => ("MiniMaxM3", MINIMAXM3),
         // No program runs nemotron_h. The listing is MiMo's so a fault
         // word still decodes; it is not a step this architecture runs.
@@ -348,10 +348,8 @@ pub fn of(arch: model::arch::Arch) -> StepOrder {
         // The head128 program's bodies (gpu-flint) launch no ordered table of
         // their own: the listing is neutral, every site once, so a fault word
         // still decodes.
-        Arch::Flint => ("Flint", FaultSite::ALL),
-        Arch::ExaoneMoe => ("ExaoneMoe", FaultSite::ALL),
+        Arch::Flint | Arch::ExaoneMoe => ("Flint", FaultSite::ALL),
         // Reader only: a neutral decoding order, not a runnable step.
-        Arch::Raon1Nano => ("Raon1Nano", FaultSite::ALL),
         Arch::MistralLarge4 => ("MistralLarge4", FaultSite::ALL),
         Arch::KimiK3 => ("KimiK3", SOLAR2),
     };

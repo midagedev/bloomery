@@ -4472,6 +4472,11 @@ gate-gpu-raon1-dflash:
 gate-gpu-raon1-attn:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raon1_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raon1_attn'
 
+# The Nano dialect's own card pieces (gate_raonnano's doc): the folded chart's route against the
+# split dialect's and the f64 fold, the per-layer input's combine and add against their host rules.
+gate-gpu-raon1-nano:
+    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_raonnano && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_raonnano'
+
 # --- end raon-attn ---
 
 # --- raon-model ---

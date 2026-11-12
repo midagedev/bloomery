@@ -337,9 +337,17 @@ impl Body {
             .map_or(n, |(window, _)| n - (*window).min(n));
         let mut done = 0;
         while self.wide_ok() && n - done >= WIDE_FROM {
+            // A file that runs wide holds the kit; the loop's guard is the
+            // arm's own refusal, which is `None` only with the kit held.
+            let Some(wide) = self.wide.as_mut() else {
+                return Err(GpuError::state(
+                    WHAT,
+                    "the wide kit: the load found the arm off",
+                ));
+            };
             let m = WIDE_ROWS.min(n - done);
             let at = pos + launch_u32(WHAT, "row", done)?;
-            self.wide.rin.stage(stream, &ids[done..done + m], at)?;
+            wide.rin.stage(stream, &ids[done..done + m], at)?;
             if let Some(t) = self.rows.taps.as_mut() {
                 t.plan(m);
             }

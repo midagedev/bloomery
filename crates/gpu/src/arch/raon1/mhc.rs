@@ -23,6 +23,15 @@
 //!   `(n−1)²` coordinates `z`, `ρ = 1 + max(0, max(−e/B))`, `φ = e/ρ + B`
 //!   and `comb = (φ − I)·σ(η) + I`, with `B = (I + 11ᵀ/n)/2` and `H` the
 //!   Helmert basis.
+//! - [`raon_hc_kernels::raon_hc_route_folded`], the Nano file's folded
+//!   parametrization of the same route, over the same piece sums: the α
+//!   scales folded into the selector rows leave the affine plain, one
+//!   sigmoid a pre and post pair, and the chart the conversion baked
+//!   (`K = γ(H⊗H)` zero on the pre and post coordinates, `r = −1/(γB)`,
+//!   `c0 = (1−γ)I + γB`) turns the coordinates straight into
+//!   `e' = K·mixes = γe`, `ρ = 1 + max(e'·r)` (no clamp: every row of
+//!   `H z Hᵀ` sums to zero, so the max is at least `−e/B` at `e = 0`) and
+//!   `comb = e'/ρ + c0`.
 //! - [`raon_hc_kernels::raon_hc_fold`]: the sub-layer's input `Σ_i pre_i ·
 //!   s_i`, streams in order.
 //! - [`raon_hc_kernels::raon_hc_post`]: stream `i` becomes `post_i · out +
@@ -52,7 +61,12 @@ pub const STREAMS: usize = 4;
 pub const HC_MIX: usize = 2 * STREAMS + (STREAMS - 1) * (STREAMS - 1);
 /// Route values a token: `pre`, `post`, `comb`.
 pub const HC_OUT: usize = 2 * STREAMS + STREAMS * STREAMS;
-const _: () = assert!(HC_MIX == 17 && HC_OUT == 24);
+/// The folded chart a site of the Nano dialect carries: the `streams²`
+/// Helmert mix rows over the whole mix vector, then the `streams²` rho
+/// denominators and the `streams²` combination constants
+/// (conversion/raon1_nano.py `_fold_mhc`).
+pub const CHART_LEN: usize = HC_MIX * STREAMS * STREAMS + 2 * STREAMS * STREAMS;
+const _: () = assert!(HC_MIX == 17 && HC_OUT == 24 && CHART_LEN == 304);
 /// The most tokens one route launch takes (a block each).
 pub const MAX_TOKENS: usize = 512;
 /// Threads of a route block: eight warps.
@@ -69,7 +83,7 @@ const ELEM_THREADS: u32 = 256;
 
 /// The route's partial sums a token of `n`-wide streams takes: [`HC_PARTS`]
 /// a piece of [`HC_PIECE`] values. `None` when `4n` is not whole pieces.
-pub(crate) fn parts_len(n: usize) -> Option<usize> {
+pub fn parts_len(n: usize) -> Option<usize> {
     let k = STREAMS * n;
     (k > 0 && k.is_multiple_of(HC_PIECE)).then_some(k / HC_PIECE * HC_PARTS)
 }
@@ -375,6 +389,150 @@ mod raon_hc_kernels {
         }
     }
 
+    /// One token's route over the Nano file's folded chart (module doc),
+    /// block `t` token `t`: `part` the tokens' [`raon_hc_mix`] sums over
+    /// `pieces` pieces, `base` the [`HC_MIX`] biases (the α scales are folded
+    /// into the selector rows), `chart` the [`CHART_LEN`] values the
+    /// conversion baked — the `streams²·HC_MIX` Helmert mix `K` zero on the
+    /// pre and post coordinates, the `streams²` rho denominators and the
+    /// `streams²` combination constants (conversion/raon1_nano.py
+    /// `_fold_mhc`); writes [`HC_OUT`] values a token into `hc`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            pieces * 256 == 4 * n,
+            part.len() >= m * pieces * 18,
+            base.len() >= 17,
+            chart.len() >= 304,
+            hc.len() >= m * 24
+        )
+    )]
+    pub fn raon_hc_route_folded(
+        part: &[f32],
+        base: &[f32],
+        chart: &[f32],
+        n: u32,
+        m: u32,
+        pieces: u32,
+        eps: f32,
+        magnitude: f32,
+        mut hc: DisjointSlice<f32>,
+    ) {
+        static mut MIX: SharedArray<f32, HC_PARTS> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
+        if t >= m as usize {
+            return;
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let wi = tid / 32;
+        let lane = warp::lane_id() as usize;
+        let k = STREAMS * n as usize;
+        let pieces = pieces as usize;
+        let row0 = t * pieces * HC_PARTS;
+        // SAFETY: MIX is this block's own shared allocation; the raw form
+        // reaches the `static mut` without a reference.
+        let mix = unsafe { SharedArray::as_raw_mut_ptr(&raw mut MIX) };
+        let mut r = wi;
+        while r < HC_PARTS {
+            let mut acc = 0.0f32;
+            let mut j = lane;
+            while j < pieces {
+                // SAFETY: row0 + j·HC_PARTS + r < (t + 1)·pieces·18 <=
+                // part.len() by the contract.
+                acc = add_rn_f32(acc, unsafe { *part.get_unchecked(row0 + j * HC_PARTS + r) });
+                j += 32;
+            }
+            let acc = warp::reduce_sum_f32(acc);
+            if lane == 0 {
+                // SAFETY: r < HC_PARTS; this warp alone owns row r.
+                unsafe { *mix.add(r) = acc };
+            }
+            r += ROUTE_WARPS;
+        }
+        thread::sync_threads();
+        if tid != 0 {
+            return;
+        }
+        // SAFETY: HC_MIX < HC_PARTS, written above, past the barrier.
+        let sum = unsafe { *mix.add(HC_MIX) };
+        let rms = sqrt_rn_f32(add_rn_f32(div_rn_f32(sum, k as f32), eps));
+        // The α scales are folded into the selector rows the mix summed, so
+        // the affine is the plain mix over the rms plus its bias.
+        let affine = |r: usize| -> f32 {
+            // SAFETY: r < HC_MIX, written above, past the barrier; base.len()
+            // >= HC_MIX by the contract.
+            let (v, b) = unsafe { (*mix.add(r), *base.get_unchecked(r)) };
+            add_rn_f32(div_rn_f32(v, rms), b)
+        };
+        let o = t * HC_OUT;
+        let mut i = 0usize;
+        while i < STREAMS {
+            let pre = sigmoid(affine(i));
+            let post = mul_rn_f32(sigmoid(affine(STREAMS + i)), magnitude);
+            // SAFETY: o + 8 <= m·HC_OUT <= hc.len() by the contract; thread 0
+            // of block t alone writes token t's values.
+            unsafe {
+                *hc.get_unchecked_mut(o + i) = pre;
+                *hc.get_unchecked_mut(o + STREAMS + i) = post;
+            }
+            i += 1;
+        }
+        // e'[j] = Σ_m K[j][m] · affine(m): K is zero on the pre and post
+        // coordinates, so those terms are ±0.0 and the sum is the nine chart
+        // coordinates' alone, each product and sum rounded in `m` order.
+        let mut e = [0.0f32; STREAMS * STREAMS];
+        let mut j = 0usize;
+        while j < STREAMS * STREAMS {
+            let mut acc = 0.0f32;
+            let mut mid = 0usize;
+            while mid < HC_MIX {
+                // SAFETY: j·HC_MIX + mid < 272 and mid < 17: both inside
+                // chart.len() by the contract.
+                let km = unsafe { *chart.get_unchecked(j * HC_MIX + mid) };
+                acc = add_rn_f32(acc, mul_rn_f32(km, affine(mid)));
+                mid += 1;
+            }
+            e[j] = acc;
+            j += 1;
+        }
+        // ρ = 1 + max_j e'[j]·r[j], no clamp: every row of H z Hᵀ sums to
+        // zero, so the max is at least the anchor's own −e ratio
+        // (raon1nano.cpp's comment on the folded layout).
+        let k_at = STREAMS * STREAMS;
+        let mut worst = f32::NEG_INFINITY;
+        let mut j = 0usize;
+        while j < k_at {
+            // SAFETY: k_at + j < 288 <= chart.len() by the contract.
+            let ratio = mul_rn_f32(e[j], unsafe { *chart.get_unchecked(HC_MIX * k_at + j) });
+            if ratio > worst {
+                worst = ratio;
+            }
+            j += 1;
+        }
+        let rho = add_rn_f32(worst, 1.0);
+        let mut j = 0usize;
+        while j < STREAMS * STREAMS {
+            // SAFETY: (HC_MIX + 1)·k_at + j < 304 <= chart.len() and
+            // o + 8 + j < (t + 1)·HC_OUT <= hc.len() by the contract; thread 0
+            // of block t alone writes token t's values. The chart's entry `j`
+            // is source `j / streams`'s weight in stream `j % streams`, the
+            // layout the apply stages read (module doc).
+            unsafe {
+                let c0 = *chart.get_unchecked((HC_MIX + 1) * k_at + j);
+                *hc.get_unchecked_mut(o + 2 * STREAMS + j) = add_rn_f32(div_rn_f32(e[j], rho), c0);
+            }
+            j += 1;
+        }
+    }
+
     /// `y[t·n + d] = Σ_i pre_i · s_i[d]` of token `t`, `i` ascending, each
     /// product and sum rounded: one thread a (token, value).
     #[kernel]
@@ -511,20 +669,57 @@ fn chart_base(i: usize, j: usize) -> f32 {
 
 /// One site's resident pieces: the widened selector rows, the scales and
 /// the biases.
-pub(crate) struct SiteVecs<'a> {
+pub struct SiteVecs<'a> {
     pub(crate) w: &'a DeviceBuffer<f32>,
     pub(crate) scale: &'a DeviceBuffer<f32>,
     pub(crate) base: &'a DeviceBuffer<f32>,
 }
 
+impl<'a> SiteVecs<'a> {
+    /// The split dialect's site pieces.
+    #[must_use]
+    pub fn new(
+        (w, scale, base): (
+            &'a DeviceBuffer<f32>,
+            &'a DeviceBuffer<f32>,
+            &'a DeviceBuffer<f32>,
+        ),
+    ) -> SiteVecs<'a> {
+        SiteVecs { w, scale, base }
+    }
+}
+
+/// One site's resident pieces of the Nano dialect's folded layout: the
+/// selector rows (the α scales folded into them), the biases and the baked
+/// chart ([`CHART_LEN`] values, all of them widened to f32 at load).
+pub struct ChartVecs<'a> {
+    pub(crate) w: &'a DeviceBuffer<f32>,
+    pub(crate) base: &'a DeviceBuffer<f32>,
+    pub(crate) chart: &'a DeviceBuffer<f32>,
+}
+
+impl<'a> ChartVecs<'a> {
+    /// The folded dialect's site pieces.
+    #[must_use]
+    pub fn new(
+        (w, base, chart): (
+            &'a DeviceBuffer<f32>,
+            &'a DeviceBuffer<f32>,
+            &'a DeviceBuffer<f32>,
+        ),
+    ) -> ChartVecs<'a> {
+        ChartVecs { w, base, chart }
+    }
+}
+
 /// The loaded module.
-pub(crate) struct MhcKernels {
+pub struct MhcKernels {
     module: raon_hc_kernels::LoadedModule,
 }
 
 impl MhcKernels {
     /// Load this file's device bundle into `ctx`. Load-time only.
-    pub(crate) fn load(ctx: &Arc<CudaContext>) -> Result<MhcKernels, GpuError> {
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<MhcKernels, GpuError> {
         // SAFETY: this package owns the embedded device bundle produced for
         // the module above; the launchers check its launch contracts.
         let module = unsafe { crate::shared_module!(raon_hc_kernels, ctx)? };
@@ -540,7 +735,7 @@ impl MhcKernels {
         clippy::too_many_arguments,
         reason = "the site's three vectors, the streams, the widths and the file's two constants"
     )]
-    pub(crate) fn enqueue_route(
+    pub fn enqueue_route(
         &self,
         stream: &CudaStream,
         v: &SiteVecs<'_>,
@@ -598,6 +793,78 @@ impl MhcKernels {
             .prepare_raon_hc_route(LaunchConfig1D::new(mu, ROUTE_THREADS, 0))?;
         self.module.raon_hc_route(
             stream, &prep, &*part, v.scale, v.base, nu, mu, pieces, eps, magnitude, hc,
+        )?;
+        Ok(())
+    }
+
+    /// The route of `m` tokens' streams `x` at site `v` of the Nano
+    /// dialect's folded layout ([`raon_hc_route_folded`], module doc): the
+    /// same piece sums as [`MhcKernels::enqueue_route`] — one
+    /// [`raon_hc_mix`] launch — then the folded chart's route over them.
+    /// Asynchronous, allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the site's three vectors, the streams, the widths and the file's two constants"
+    )]
+    pub fn enqueue_route_folded(
+        &self,
+        stream: &CudaStream,
+        v: &ChartVecs<'_>,
+        x: &DeviceBuffer<f32>,
+        (n, m): (usize, usize),
+        (eps, magnitude): (f32, f32),
+        (part, hc): (&mut DeviceBuffer<f32>, &mut DeviceBuffer<f32>),
+    ) -> Result<(), GpuError> {
+        let what = "raon1 mhc::enqueue_route_folded";
+        let k = STREAMS * n;
+        let Some(per) = parts_len(n) else {
+            return Err(GpuError::shape(
+                what,
+                format!("n={n}: the streams' {k} values are not whole {HC_PIECE}-value pieces"),
+            ));
+        };
+        if m == 0
+            || m > MAX_TOKENS
+            || v.w.len() < HC_MIX * k
+            || v.base.len() < HC_MIX
+            || v.chart.len() < CHART_LEN
+            || x.len() < m * k
+            || part.len() < m * per
+            || hc.len() < m * HC_OUT
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "m={m} (1..={MAX_TOKENS}), n={n}: w {} (want {}), base {}, chart {} (want \
+                     {}), x {} (want {}), part {} (want {}), hc {} (want {})",
+                    v.w.len(),
+                    HC_MIX * k,
+                    v.base.len(),
+                    v.chart.len(),
+                    CHART_LEN,
+                    x.len(),
+                    m * k,
+                    part.len(),
+                    m * per,
+                    hc.len(),
+                    m * HC_OUT
+                ),
+            ));
+        }
+        let mu = launch_u32(what, "m", m)?;
+        let pieces = launch_u32(what, "pieces", k / HC_PIECE)?;
+        let nu = launch_u32(what, "n", n)?;
+        let blocks = launch_u32(what, "m·pieces", m * (k / HC_PIECE))?;
+        let prep =
+            self.module
+                .prepare_raon_hc_mix(LaunchConfig1D::new(blocks, ROUTE_THREADS, 0))?;
+        self.module
+            .raon_hc_mix(stream, &prep, v.w, x, nu, mu, pieces, &mut *part)?;
+        let prep = self
+            .module
+            .prepare_raon_hc_route_folded(LaunchConfig1D::new(mu, ROUTE_THREADS, 0))?;
+        self.module.raon_hc_route_folded(
+            stream, &prep, &*part, v.base, v.chart, nu, mu, pieces, eps, magnitude, hc,
         )?;
         Ok(())
     }

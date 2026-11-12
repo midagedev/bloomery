@@ -342,22 +342,37 @@ mod tests {
         assert!(!listed("tool-call parser"), "{items:#?}");
     }
 
-    /// No program runs the Nano file: `program_of` names none, and the coverage check lists the
-    /// layer program and the per-layer input no row covers. Mutant: the `program_of` arm given
-    /// `Program::Raon1Body`.
+    /// The raon1 program runs the Nano file: `program_of` names it, and the
+    /// coverage check lists none of its parts — the layer program, the dense
+    /// SwiGLU block and the folded chart covered — the small header's own
+    /// items the widths no launch runs (the delta rule's and the latent
+    /// layer's, as the Mini file's small header lists them, and a per-layer
+    /// input of 16 values, the norm's 32). Mutants: the `program_of` arm
+    /// given `None`, which lists the layer program, and the dense SwiGLU
+    /// row dropped, which lists the block.
     #[test]
-    fn no_program_runs_the_nano_file() {
+    fn the_program_runs_the_nano_file() {
         use crate::placement::accepts::{Program, program_of};
 
         let read = read_nano_file("raon1nano-coverage", &keys_nano(), &tensors_nano());
-        assert_eq!(program_of(models::Arch::Raon1Nano), None);
+        assert_eq!(
+            program_of(models::Arch::Raon1Nano),
+            Some(Program::Raon1Body)
+        );
         assert_eq!(program_of(models::Arch::Raon1), Some(Program::Raon1Body));
         let items: Vec<String> = coverage::check(&read.spec, &read.tensors)
             .into_iter()
             .map(|u| u.feature)
             .collect();
         let listed = |needle: &str| items.iter().any(|f| f.contains(needle));
-        assert!(listed("a layer program for raon1nano"), "{items:#?}");
-        assert!(listed("a per-layer input of 16 values"), "{items:#?}");
+        assert!(!listed("a layer program"), "{items:#?}");
+        assert!(!listed("dense SwiGLU layer"), "{items:#?}");
+        for needle in [
+            "delta rule RDA: d 16",
+            "latent attention 32 x rope 0",
+            "a per-layer input of 16 values",
+        ] {
+            assert!(listed(needle), "{needle:?} not listed: {items:#?}");
+        }
     }
 }

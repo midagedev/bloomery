@@ -4,14 +4,19 @@
 //! the erase gate (`σ(b + w) / σ(b)` on the values, [`crate::linear::write_gate`]),
 //! over Raon's typed projections ([`RdaSites`]).
 //!
-//! What the file forces here, each read from its header at load:
+//! What the file forces here, each read from its header at load — the split
+//! dialect's own tensor names below, or the load-time halves of the Nano
+//! file's fused stems under the `derived.` names ([`fold`]):
 //! - q, k, v and the output gate `g` are full-rank projections of the normed
-//!   input (`attn_q`, `attn_k`, `attn_v`, `ssm_g`; Q6_K in the Q4_K_M file),
-//!   read through one q8_1 form of it when they are K-quants; `g` writes the
-//!   gate rows `z` directly (Raon has no low-rank gate);
+//!   input (`attn_q`, `attn_k`, `attn_v`, `ssm_g`; Q6_K in the Q4_K_M file;
+//!   the Nano file's one `attn_qkv` rows `q | k | v | g`), read through one
+//!   q8_1 form of it when they are K-quants; `g` writes the gate rows `z`
+//!   directly (Raon has no low-rank gate);
 //! - β's raw projection `ssm_beta`, the write projection `ssm_rda` and the
 //!   forget projection's halves `ssm_f_a` (2560 → 128) and `ssm_f_b` (128 →
-//!   heads·128), F16 in the file and widened to f32 at load;
+//!   heads·128), F16 in the file and widened to f32 at load (the Nano file's
+//!   one `ssm_f_a` rows `[f_a | b | b + d]`, its decay's `exp(A_log)` baked
+//!   into `ssm_f_b` and the dt bias);
 //! - the output projection `attn_output` (Q8_0).
 //!
 //! [`step`] runs one row. [`rows`] runs a pass of 1 to [`PASS_ROWS`] rows in
@@ -27,6 +32,7 @@
 //! takes the stage and the copy alone ([`kgemv_rows`]).
 
 use super::state::PASS_ROWS;
+use crate::DeviceTensor;
 use crate::Gpu;
 use crate::GpuError;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
@@ -40,6 +46,7 @@ use crate::weights::Weights;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::raon1::names;
+use model::arch::raon1::roles::Dialect;
 
 // The rows kit is `crate::arch::rows_kit`'s; the raon1 layers read it through this module.
 use crate::arch::rows_kit::order;
@@ -72,6 +79,85 @@ pub(crate) fn derive(stream: &CudaStream, w: &mut Weights, l: usize) -> Result<(
     let parts = ['q', 'k', 'v'].map(|p| names::ssm_conv1d(l, p));
     let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     w.join_rows(stream, &parts, conv_joined(l))
+}
+
+/// The Nano file's fused stems of RDA layer `l`, split and aliased at load
+/// into the buffers the split dialect's sites read (conversion/raon1_nano.py
+/// `_fold_rda`): the one `attn_qkv` projection's rows `q | k | v | g`, the
+/// one `ssm_f_a`'s rows `[f_a | b | b + d]` into the low-rank projection and
+/// the two gates' own, the one conv — already the joined taps' own layout,
+/// its bytes the split dialect's derive leaves — aliased under the derived
+/// name, and `ssm_a` synthesized at `−1`: the fold baked `exp(A_log)` into
+/// `ssm_f_b`'s and the dt bias' rows, so the decay reads
+/// `σ(f + dt)` where the split dialect's reads `σ(e^A_log·(f + dt))`.
+/// Load-time only; the body calls it for every RDA layer before
+/// [`RdaSites::load`].
+pub(crate) fn fold(
+    stream: &CudaStream,
+    w: &mut Weights,
+    l: usize,
+    (heads, rank): (usize, usize),
+) -> Result<(), GpuError> {
+    let inner = heads * HEAD;
+    let fused = |stem: &str| format!("blk.{l}.{stem}");
+    w.split_rows(
+        stream,
+        &fused(names::ATTN_QKV),
+        &[
+            (q_of(l), inner),
+            (k_of(l), inner),
+            (v_of(l), inner),
+            (g_of(l), inner),
+        ],
+    )?;
+    w.split_rows(
+        stream,
+        &fused("ssm_f_a.weight"),
+        &[(f_a_of(l), rank), (beta_of(l), heads), (write_of(l), heads)],
+    )?;
+    let conv = fused(names::SSM_CONV1D);
+    let conv = w
+        .take(&conv)
+        .ok_or_else(|| GpuError::tensor(WHAT, &conv, "resident"))?;
+    w.insert_derived(conv_joined(l), conv)?;
+    // The baked fold reads `exp(A_log) = 1`.
+    let a = vec![-1.0f32; heads];
+    let a = DeviceTensor::upload(stream, &a, 1, heads)?;
+    w.insert_derived(a_of(l), crate::weights::DevWeight::F32 { w: a, k: heads })
+}
+
+/// The split pieces of the Nano file's fused `attn_qkv` of layer `l`, as the
+/// split dialect's own file names would name them.
+fn q_of(l: usize) -> String {
+    format!("derived.blk.{l}.attn_q")
+}
+/// [`q_of`]'s `k` rows.
+fn k_of(l: usize) -> String {
+    format!("derived.blk.{l}.attn_k")
+}
+/// [`q_of`]'s `v` rows.
+fn v_of(l: usize) -> String {
+    format!("derived.blk.{l}.attn_v")
+}
+/// [`q_of`]'s output-gate rows.
+fn g_of(l: usize) -> String {
+    format!("derived.blk.{l}.ssm_g")
+}
+/// The low-rank rows of the Nano file's fused `ssm_f_a` of layer `l`.
+fn f_a_of(l: usize) -> String {
+    format!("derived.blk.{l}.ssm_f_a")
+}
+/// The erase gate's rows of it.
+fn beta_of(l: usize) -> String {
+    format!("derived.blk.{l}.ssm_beta")
+}
+/// The write gate's rows of it.
+fn write_of(l: usize) -> String {
+    format!("derived.blk.{l}.ssm_rda")
+}
+/// The synthesized `ssm_a` of the Nano file's baked fold of layer `l`.
+fn a_of(l: usize) -> String {
+    format!("derived.blk.{l}.ssm_a")
 }
 
 /// The mixer's widths and rule for Raon's RDA layers: `heads` query/key and
@@ -110,14 +196,17 @@ pub(crate) struct RdaSites {
 }
 
 impl RdaSites {
-    /// Layer `l`'s sites at `d`'s widths, each type read from `file`'s header
-    /// and checked against the resident weight, and its vectors checked by
-    /// length. Load-time only, after [`derive`].
+    /// Layer `l`'s sites at `d`'s widths in the file's `dialect`, each type
+    /// read from `file`'s header — or, for the fused dialect's derived
+    /// pieces, from the resident weight [`fold`] made — and checked against
+    /// the resident weight, and its vectors checked by length. Load-time
+    /// only, after [`derive`] or [`fold`].
     pub(crate) fn load(
         file: &Split,
         w: &Weights,
         d: &KdaDims,
         l: usize,
+        dialect: Dialect,
     ) -> Result<RdaSites, GpuError> {
         let embd = d.embd;
         let lin = d.shape;
@@ -127,38 +216,73 @@ impl RdaSites {
             site::site(w, WHAT, &name, (rows, k), ty)?;
             Ok(Site::new(name, ty, k))
         };
+        // The fused dialect's pieces are derived weights the file does not
+        // name; their types are the resident ones the fold kept.
+        let derived = |name: String, (rows, k): (usize, usize)| -> Result<Site, GpuError> {
+            let ty = site::resident_site(w, WHAT, &name, (rows, k), DENSE)?;
+            Ok(Site::new(name, ty, k))
+        };
+        let project = |name: String, (rows, k): (usize, usize)| -> Result<Site, GpuError> {
+            match dialect {
+                Dialect::Split => typed(name, (rows, k)),
+                Dialect::Fused => derived(name, (rows, k)),
+            }
+        };
         let vector = |name: String, len: usize| site::vector(w, WHAT, name, len);
-        let f_a = names::ssm_f_a(l);
-        let low_rank = w.get(&f_a).map_or(0, |_| {
-            file.find(&f_a)
-                .and_then(|(_, t)| t.dims.get(1).copied())
-                .and_then(|r| usize::try_from(r).ok())
-                .unwrap_or(0)
-        });
+        // The decay's low rank, both dialects': the forget projection's own
+        // row width (`ssm_f_b`'s `k`), which the reader holds to the key's.
+        let f_b = names::ssm_f_b(l);
+        let low_rank = file
+            .find(&f_b)
+            .and_then(|(_, t)| t.dims.first().copied())
+            .and_then(|r| usize::try_from(r).ok())
+            .unwrap_or(0);
         if low_rank == 0 {
             return Err(GpuError::tensor(
                 WHAT,
-                f_a,
-                "resident, with a positive rank",
+                f_b,
+                "in the file, with a positive rank",
             ));
         }
+        let (q, k, v_name, g, beta, write, f_a, a) = match dialect {
+            Dialect::Split => (
+                names::attn_q(l),
+                names::attn_k(l),
+                names::attn_v(l),
+                names::ssm_g(l),
+                names::ssm_beta(l),
+                names::ssm_rda(l),
+                names::ssm_f_a(l),
+                names::ssm_a(l),
+            ),
+            Dialect::Fused => (
+                q_of(l),
+                k_of(l),
+                v_of(l),
+                g_of(l),
+                beta_of(l),
+                write_of(l),
+                f_a_of(l),
+                a_of(l),
+            ),
+        };
         Ok(RdaSites {
             qkv: [
-                typed(names::attn_q(l), (qk, embd))?,
-                typed(names::attn_k(l), (qk, embd))?,
-                typed(names::attn_v(l), (v, embd))?,
+                project(q, (qk, embd))?,
+                project(k, (qk, embd))?,
+                project(v_name, (v, embd))?,
             ],
-            g: typed(names::ssm_g(l), (v, embd))?,
-            beta: typed(names::ssm_beta(l), (lin.n_v, embd))?,
-            write: typed(names::ssm_rda(l), (lin.n_v, embd))?,
-            f_a: typed(names::ssm_f_a(l), (low_rank, embd))?,
+            g: project(g, (v, embd))?,
+            beta: project(beta, (lin.n_v, embd))?,
+            write: project(write, (lin.n_v, embd))?,
+            f_a: project(f_a, (low_rank, embd))?,
             f_b: typed(names::ssm_f_b(l), (v, low_rank))?,
             out: typed(names::attn_output(l), (embd, v))?,
             vecs: [
                 vector(names::attn_norm(l), embd)?,
                 vector(conv_joined(l), lin.channels() * CONV_TAPS)?,
                 vector(names::ssm_dt_bias(l), v)?,
-                vector(names::ssm_a(l), lin.n_v)?,
+                vector(a, lin.n_v)?,
                 vector(names::ssm_norm(l), HEAD)?,
             ],
         })

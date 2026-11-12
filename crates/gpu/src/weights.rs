@@ -1041,6 +1041,117 @@ impl Weights {
         Ok(())
     }
 
+    /// Move the resident weight `src` into the derived weights `parts` names,
+    /// part `i` the rows `at .. at + n` of it (`n` its count, the counts in
+    /// order): the mirror of [`Weights::join_rows`], for a file that fuses
+    /// what the card's sites read apart (raon1nano's `attn_qkv` rows
+    /// `q | k | v | g`, its `ffn_up` rows `gate | up`). Each part is a copy
+    /// in `src`'s own format at its width, `src` leaves the map only once
+    /// every copy is synchronized, so nothing is resident twice and the
+    /// resident bytes are unchanged. Refused unless every part names a free
+    /// `derived.` slot of at least one row, the parts' rows sum to `src`'s,
+    /// and `src` is resident as a K-quant, F32 rows or Q8_0 planes — the
+    /// packed Q5_0 and Q5_1 rows and the scaled E4M3 planes are whole-weight
+    /// formats no row window reads. Load-time only.
+    pub fn split_rows(
+        &mut self,
+        stream: &CudaStream,
+        src: &str,
+        parts: &[(String, usize)],
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Weights::split_rows";
+        if parts.is_empty() {
+            return Err(GpuError::shape(WHAT, "no parts to split into"));
+        }
+        self.refuse_roomed(WHAT, &[src])?;
+        let sum: usize = parts.iter().map(|&(_, n)| n).sum();
+        let n0 = parts
+            .iter()
+            .find(|&&(_, n)| n == 0)
+            .map(|(name, _)| name.clone());
+        if let Some(name) = n0 {
+            return Err(GpuError::shape(WHAT, format!("{name} is a part of 0 rows")));
+        }
+        let made: Vec<(String, DevWeight)> = match self.by_name.get(src) {
+            Some(DevWeight::KQuant { ty, w, k }) if w.rows() == sum => {
+                let mut at = 0usize;
+                let mut made = Vec::with_capacity(parts.len());
+                for (name, n) in parts {
+                    // SAFETY: `n` whole rows of `w` are copied below, so every
+                    // element is written on `stream`.
+                    let part = row_window_copy(stream, w, (at, *n))?;
+                    made.push((
+                        name.clone(),
+                        DevWeight::KQuant {
+                            ty: *ty,
+                            w: part,
+                            k: *k,
+                        },
+                    ));
+                    at += n;
+                }
+                made
+            }
+            Some(DevWeight::F32 { w, k }) if w.rows() == sum => {
+                let mut at = 0usize;
+                let mut made = Vec::with_capacity(parts.len());
+                for (name, n) in parts {
+                    // SAFETY: as the K-quant arm's copy.
+                    let part = row_window_copy(stream, w, (at, *n))?;
+                    made.push((name.clone(), DevWeight::F32 { w: part, k: *k }));
+                    at += n;
+                }
+                made
+            }
+            Some(DevWeight::Q8_0 { qs, d, k }) if d.rows() == sum => {
+                let mut at = 0usize;
+                let mut made = Vec::with_capacity(parts.len());
+                for (name, n) in parts {
+                    // SAFETY: as the K-quant arm's copy, over each plane.
+                    let (qs_part, d_part) = (
+                        row_window_copy(stream, qs, (at, *n))?,
+                        row_window_copy(stream, d, (at, *n))?,
+                    );
+                    made.push((
+                        name.clone(),
+                        DevWeight::Q8_0 {
+                            qs: qs_part,
+                            d: d_part,
+                            k: *k,
+                        },
+                    ));
+                    at += n;
+                }
+                made
+            }
+            Some(w) => {
+                let rows = w.rows();
+                if rows == sum {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{src} is resident in a form no row window reads; the split \
+                                 reads a K-quant, F32 rows and Q8_0 planes"
+                        ),
+                    ));
+                }
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!("{src} holds {rows} rows; the parts name {sum}"),
+                ));
+            }
+            None => {
+                return Err(GpuError::tensor(WHAT, src, "resident"));
+            }
+        };
+        stream.synchronize()?;
+        self.by_name.remove(src);
+        for (name, w) in made {
+            self.insert_derived(name, w)?;
+        }
+        Ok(())
+    }
+
     /// The resident weight for `name` — a file tensor name, or the `derived.`
     /// name an architecture filed a derived weight under.
     pub fn get(&self, name: &str) -> Option<&DevWeight> {
@@ -1254,6 +1365,42 @@ fn derived_slot_free<V>(by_name: &BTreeMap<String, V>, name: &str) -> Result<(),
         ));
     }
     Ok(())
+}
+
+/// Rows `at .. at + n` of the `rows × cols` tensor `t` as a new tensor of
+/// `n` rows, copied on `stream`: [`Weights::split_rows`]' one piece. The
+/// copy is asynchronous; the caller synchronizes before the source leaves
+/// the map.
+fn row_window_copy<T: DeviceCopy>(
+    stream: &CudaStream,
+    t: &DeviceTensor<T>,
+    (at, n): (usize, usize),
+) -> Result<DeviceTensor<T>, GpuError> {
+    let what = "Weights::split_rows";
+    let cols = t.cols();
+    let len = n
+        .checked_mul(cols)
+        .ok_or_else(|| GpuError::shape(what, format!("{n} rows of {cols} values pass usize")))?;
+    // SAFETY: `len` elements are copied whole below, so every element is
+    // written on `stream`; a failed copy returns, dropping the tensor unread.
+    let out = unsafe { DeviceTensor::<T>::unfilled(stream, n, cols)? };
+    let off = u64::try_from(at * cols * size_of::<T>())
+        .map_err(|_| GpuError::shape(what, format!("row {at}'s bytes pass u64")))?;
+    // SAFETY: rows `at .. at + n` of `t` are `len` elements inside its
+    // `rows · cols`, and `out` holds exactly `len`; both are `cuMemAlloc`
+    // allocations that outlive the windows, which are released below and
+    // free nothing.
+    let (mut dst, src) = unsafe {
+        (
+            window::<T>(out.buf().cu_deviceptr(), len, stream.context()),
+            window::<T>(t.buf().cu_deviceptr() + off, len, stream.context()),
+        )
+    };
+    let copied = dst.copy_from_device_async(&src, stream);
+    drop(ManuallyDrop::into_inner(dst).into_raw_parts());
+    drop(ManuallyDrop::into_inner(src).into_raw_parts());
+    copied?;
+    Ok(out)
 }
 
 /// A file tensor's name, refused in the [`DERIVED_PREFIX`] namespace: a file

@@ -901,7 +901,8 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Raon1Body],
-        at: "gpu/src/arch/raon1/mhc.rs STREAMS (raon_hc_route, raon_hc_fold, raon_hc_post, raon_hc_mean)",
+        at: "gpu/src/arch/raon1/mhc.rs STREAMS (raon_hc_route and the Nano file's folded \
+             raon_hc_route_folded, raon_hc_fold, raon_hc_post, raon_hc_mean)",
         runs: |n| {
             matches!(
                 n,
@@ -911,6 +912,20 @@ pub const AVAILABLE: &[Available] = &[
                 }
             )
         },
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/routed_ffn.rs Glu (the gate and up sites — the Nano file's fused \
+             `ffn_up` split at load, gpu/src/arch/raon1/body.rs ffn_fold — gpu/src/elem.rs \
+             enqueue_swiglu_rule, the down site)",
+        runs: |n| matches!(n, Need::DenseFfn { .. }),
+    },
+    Available {
+        programs: &[Program::Raon1Body],
+        at: "gpu/src/arch/raon1/ple.rs (the two row gathers, gpu/src/arch/raon1/gather.rs; the \
+             model projection's norm and combine, the gated add: raon1_ple_combine, \
+             raon1_ple_add, the mean raon_hc_mean)",
+        runs: |n| matches!(n, Need::PerLayerInput { width } if width.is_multiple_of(32)),
     },
     Available {
         programs: LATENT_TRUNK,
@@ -1548,6 +1563,29 @@ const TYPE_PINS: &[TypePin] = &[
         names: None,
         what: "hyper-connection fn (the body reads the f16 rows it widens to f32)",
         reads: &[GgmlType::F16],
+    },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::EngramTable,
+        matrices: true,
+        names: None,
+        what: "per-layer input table (the gathers read the K-quant rows and the Q8_0 planes)",
+        reads: &[
+            GgmlType::Q3_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+            GgmlType::Q8_0,
+        ],
+    },
+    TypePin {
+        programs: &[Program::Raon1Body],
+        role: Role::EngramDense,
+        matrices: true,
+        names: None,
+        what: "per-layer input projections (the body reads q3_K, q4_K, q5_K, q6_K and q8_0 \
+               sites and the f16 rows it widens)",
+        reads: RAON1_PROJ,
     },
     TypePin {
         programs: &[Program::MuseSparkBody],

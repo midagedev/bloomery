@@ -1,9 +1,11 @@
 //! `bloomery-serve --model raon1` — the llama-server-compatible HTTP API on
-//! the Raon-1 engine with one sequence: a Raon-1-mini file (RDA and gated
-//! latent layers, SiTU experts, Raon_mHC streams), the whole model on one
-//! card, opened as `gate_raon1_e2e` opens it (`GpuModel::<raon1::Body>::open`;
-//! the step captured in graph mode), behind the session (`app::Session`),
-//! and its DFlash2 draft beside it when the draft's file is there.
+//! the Raon-1 engine with one sequence: a Raon-1 file of either dialect (the
+//! Mini's RDA and gated latent layers, SiTU experts, Raon_mHC streams; the
+//! Nano's fused stems, per-layer inputs, dense SwiGLU blocks and tied head),
+//! the whole model on one card, opened as `gate_raon1_e2e` opens it
+//! (`GpuModel::<raon1::Body>::open`; the step captured in graph mode), behind
+//! the session (`app::Session`), and its DFlash2 draft beside it when the
+//! draft's file is there (the Mini file's own: a Nano file drafts nothing).
 //!
 //!     bloomery-serve --model raon1 [-m PATH | --hf <repo>[:<quant>]]
 //!                    [--host 127.0.0.1] [--port 8080] [--ctx C] [--alias NAME]
@@ -126,6 +128,10 @@ pub const ACTS_ON: &[&str] = &[
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the raon1 seat runs no prompt cache";
+
+/// Why a Nano file drafts nothing.
+const NANO_NO_DRAFT: &str =
+    "the raon1nano file drafts nothing (the DFlash2 draft is the Mini file's own)";
 
 /// Why a prefix shorter than the held sequence is not kept.
 const NO_STEP_BACK: &str =
@@ -275,13 +281,25 @@ fn draft_asked(levers: &Levers) -> Result<(Option<DraftWord>, WidthMode), GateEr
 /// refused by name.
 fn draft_of(
     levers: &Levers,
-    (target, split): (&std::path::Path, &Split),
+    (target, split, arch): (&std::path::Path, &Split, Arch),
     think: Result<Think, String>,
 ) -> Result<(Option<OpenDraft>, String), GateError> {
     let set = refset::arch::draft::dspark_lever().map(PathBuf::from);
     let (word, width) = draft_asked(levers)?;
     if word == Some(DraftWord::Off) {
         return Ok((None, "BLOOMERY_DRAFT=off".to_owned()));
+    }
+    // The DFlash2 draft is the Mini file's own; a Nano file drafts nothing
+    // (its MTP block is the reader's own description, run by no program),
+    // asked for or not.
+    if arch == Arch::Raon1Nano {
+        if word == Some(DraftWord::Dspark) {
+            return Err(
+                "BLOOMERY_DRAFT=dspark: the raon1 seat serves no draft of a raon1nano file".into(),
+            );
+        }
+        bloomery_gpu_gates::bind::refuse_plain_width(levers, Some(NANO_NO_DRAFT))?;
+        return Ok((None, NANO_NO_DRAFT.to_owned()));
     }
     let every = word == Some(DraftWord::Dspark);
     let (path, from) = match raon1_dflash::pick(set.as_deref(), target)? {
@@ -620,9 +638,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         .shard(0)
         .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
     let arch = Arch::detect(first).map_err(|e| format!("{}: {e}", path.display()))?;
-    if arch != Arch::Raon1 {
+    if !matches!(arch, Arch::Raon1 | Arch::Raon1Nano) {
         return Err(format!(
-            "{} is a {} file; the raon1 seat serves raon1 files",
+            "{} is a {} file; the raon1 seat serves raon1 and raon1nano files",
             path.display(),
             arch.name()
         )
@@ -644,7 +662,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let inputs = inputs.with_prompt_reserve(pass);
     let tok = Tokenizer::from_gguf(&path)?;
     let think = Think::of(&tok, inputs.spec.chat.reasoning);
-    let (draft, why) = draft_of(&levers, (&path, &split), think)?;
+    let (draft, why) = draft_of(&levers, (&path, &split, arch), think)?;
     Record::new(&record::DRAFT_RULE_RAON1)
         .w(
             "drafts",
