@@ -21,21 +21,23 @@
 # BLOOMERY_THREADS=31 the floating pump and receiver take the free core (the scheduler spreads to an idle core before a
 # sibling), the leg costs 32/31: 0.63 + 0.02 (+ <= 0.06 of RX softirq on a participant) -> 17.7 + 76 x 0.65..0.71 =
 # 67.1..71.7 ms, 13.9..14.9 tok/s under H3 [derived]; under H2 the bound is the node and the arm reads the base -1..+1 %.
-kind: ab
+kind: baseline
 question: does leaving one physical core free of the pool (BLOOMERY_THREADS=31) let K-EXAONE-2.0's decode with the Spark node
   tier reach the overlapped rate, i.e. is the node arm's lost gain the link threads' tax on the host leg
-term: tg tok/s @ n=127, prompt 4096 corpus-prose ids, ctx 8192 one slot, A6000 + host + the Spark over TCP, off arm — (THREADS=31
-  - default) / default, paired by round
-unit: %
-predict: +38..+58
-rounds: 2
-condition: exaone-spark-1114.card's condition on one bloomery-serve binary (tree arm), two arms in one lease, both
-  env=BLOOMERY_TIER_LINK=tcp,BLOOMERY_TIER_NODES=10.41.0.2:9001,BLOOMERY_CARD_BUDGET=100G,BLOOMERY_DRAFT=off, the changed arm
-  adding BLOOMERY_THREADS=31; DEPTH_SERVE_PLACE=bp with the A6000 the one visible card, BLOOMERY_AB_ROUNDS=2, DEPTH_SERVE_CTX=8192,
+term: tg tok/s of the THREADS=31 node arm @ n=127, prompt 4096 corpus-prose ids, ctx 8192 one slot, A6000 + host + the Spark
+  over TCP, draft off; read against the default node arm's 9.59 (exaone-spark-1114.card, the same file, plan and host code)
+unit: tok/s
+predict: 13.2..15.2
+condition: exaone-spark-1114.card's condition on one bloomery-serve binary (tree arm), the arm alone in each run, run twice; the arm's env
+  env=BLOOMERY_TIER_LINK=tcp,BLOOMERY_TIER_NODES=10.41.0.2:9001,BLOOMERY_CARD_BUDGET=100G,BLOOMERY_DRAFT=off, plus
+  BLOOMERY_THREADS=31; DEPTH_SERVE_PLACE=bp with the A6000 the one visible card, BLOOMERY_AB_ROUNDS=1 (one arm a run: a two-arm run cannot wait for the node to free a load between servers), DEPTH_SERVE_CTX=8192,
   DEPTH_SERVE_N=128; the Spark's tier_server frees each load before the next arm opens (exaone-spark-1114's r1 mtp arm met a
   node still holding the last load); once per arm, mid-window, `ps -L -o tid,psr,comm -p <serve pid>` names the cpus of
   tier-link-pump and tier-link-tcp (THREADS=31: on the core no pool cpu holds; default: a pool participant's sibling); both arms'
   plan lines print card_experts=2319 host_experts=9513
+reason: the overlapped model's 13.9..15.2 tok/s (exaone-spark-1114.card) is the rate with the host leg at its own speed; H3 says
+  the default arm loses 0.5 ms a layer to the link threads on the pool's SMT siblings, so the arm that frees one core gets the
+  overlapped rate less one pool thread's share (1/32 of the host leg) [derived]
 decide-in: the link threads' tax is the cause: a round takes the TCP end's pump and receiver off the pool's cores while a
   remote link is attached (the pool leaves one core to the link and pins its helpers there, or the pump parks between the
   host's add_go and the receiver's landing), predicted to keep this arm's rate; the RDMA end (rdma.rs:182) gets the same
