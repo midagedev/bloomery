@@ -759,6 +759,10 @@ where
     /// again: the slot's next call, which stands at `pos` over the id that entry was written for,
     /// joins with no row to walk and its units walk the rows after it. Nothing without a draft;
     /// refused as [`SlotDrafts::has`].
+    #[allow(
+        dead_code,
+        reason = "the hybrid seat's draft (hybrid_draft.rs) calls it; a binary that includes this file and serves no hybrid seat calls it nowhere"
+    )]
     pub(crate) fn rejoin_through(&mut self, slot: usize, pos: u32) -> Result<(), GateError> {
         if let Some(spec) = self.spec_mut(slot)? {
             spec.draft_mut().draft_mut().rejoin_through(pos);

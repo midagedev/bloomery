@@ -4568,7 +4568,7 @@ gate-gpu-exaone-verify:
 # run's own next ids, medians, c_v = pass / step, under the timing lease (tools/ref/time-gate.sh) on the timing card. The model is
 # the profile's file, or the real one through BLOOMERY_REF_MODEL (a prediction card in BLOOMERY_BOX_ENV names the run).
 time-gpu-exaone-verify:
-    BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh time-gpu-exaone-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin gate_exaone_verify && bash tools/ref/time-gate.sh gate_exaone_verify --time'
+    BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh time-gpu-exaone-verify && {{precheck}} && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin gate_exaone_verify && bash tools/ref/time-gate.sh gate_exaone_verify --time'
 
 # The exaone-moe seat of bloomery-serve on the fixture GGUF (gate_exaone_serve's doc): the flint seat, the file's router row
 # picking K-EXAONE's body. `--parallel 2` is refused by name before any plan; one server at ctx 4096 loads (arch exaone-moe, one

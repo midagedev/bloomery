@@ -709,4 +709,6 @@ generate_ds41 iq_quant_subs 0 1096
 # PIN(2026-11-08): the importance collector's two entries (imat_dense_sum2, imat_routed_sum2, crates/gpu/src/imatrix.rs) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill, 0 B JIT local), not measured on cc 12.1 (the table's card) until a GB10 scan runs.
 generate_ds41 imat_dense_sum2 0 0
 generate_ds41 imat_routed_sum2 0 0
+# PIN(2026-11-14): the card's routed picks collector (imat_card_picks, crates/gpu/src/imatrix.rs) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill, 0 B JIT local), not measured on cc 12.1 (the table's card) until a scan on it runs.
+generate_ds41 imat_card_picks 0 0
 generate_ds41 iq_src_f32 0 0
