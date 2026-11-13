@@ -3,38 +3,51 @@
 //! `PROMPT_ROWS` rows a unit) against the same ids run one decode step at a time, on the gate
 //! card. The Kimi K3 pp gate's method on this body's own pass.
 //!
-//! What the bits hold. A pass of at most `GATED_FROM − 1` rows (8, the shared routed block's own
-//! bound: below it every gated site runs the step's per-column gemvs, `bloomery_gpu_flint`'s
-//! `GATED_FROM`) leaves each row's reductions the step's own: the shared expert's gate·up and down
-//! by the step's launches, the card experts' rows the step's under the same slot map
-//! (`shared_routed::Routed::card_rows`), the attention's projections by the linear owner's
-//! m-column launches (a column a row) and its flash core over each row's own keys. A wider unit (a
-//! whole prompt in one call, units of `PROMPT_ROWS` rows) sums a row's products in the wide GEMMs'
-//! tile order and is not the steps' bits: that call is held to the oracle's own row within the e2e
-//! gate's logits band, and its state by the steps after it.
+//! What the bits hold. A pass of at most `GATED_FROM − 1` rows (8) runs the step's own launches
+//! per row everywhere but the dense lead block. The attention's projections are the linear
+//! owner's m-column launches, whose per-cell order the 32-value GEMM's numeric contract pins as
+//! a function of K alone, never of the grid, a slot's tile or the slot count
+//! (`gemm/gemm32.rs`); its core attends each row over its own keys; the router's batch entries
+//! are bit for bit what the one-token launch writes (the router instance's own doc); the shared
+//! expert below `GATED_FROM` runs the step's per-column gemvs and the card experts' slots are
+//! what the step's launches write, whatever the row count (`card_experts`' doc). The dense
+//! block's batch (`shared_routed::Routed::dense_rows`) runs the wide gated GEMMs at every row
+//! count, as the shared expert's does from `GATED_FROM` rows (`shared_routed`'s doc) — another
+//! order of the same exact integer block sums, not the step's gemv bits at any width, one row
+//! included. Every pass row past the first dense block sits at that distance from the step's,
+//! and so do the stores its rows write, so no clause of this gate holds a pass's row or the
+//! steps after one to the step's bits: both are held the way every batched call of this engine
+//! is held against another order of its own sums, [`logits_band`]'s pins (its module doc: the
+//! gates that compare a batched call with another order of the same call defer to it) — the
+//! pass rows through its band, the continuations through its walk.
 //!
 //! For each prompt set of [`SETS`] (an English paragraph of 24 ids, a Korean one of 18, a Rust
 //! function head of 30 and a five-id question, refset family `lcpp-exaone-moe`), against the same
 //! ids run as steps (the reference: every position's logits row and argmax, then [`CONT`] greedy
 //! steps on):
 //!
-//! - `rows_are_steps`: the prompt as passes of [`PASS_ROWS`] rows and again as passes of
+//! - `rows_near_steps`: the prompt as passes of [`PASS_ROWS`] rows and again as passes of
 //!   [`ODD_ROWS`] — the two runs' passes end on different ids (8, 8, 8 and 5, 5, 5, 5, 5 over 24
-//!   ids), so a boundary at each residue runs — each pass's last logits row and argmax bit for bit
-//!   the step's at that position.
-//! - `state_advances_as_steps`: after those passes, [`CONT`] decode steps on the reference's own
-//!   ids give the reference's logits and argmax bit for bit: the stores and the position book stand
-//!   where as many steps leave them.
-//! - `prompt_call_is_steps`: the whole prompt as one batched call from a reset, then [`CONT`]
-//!   steps on the reference's ids: each is the reference's bit for bit (the call's state is the
-//!   steps'); the call's own last row is printed beside the step's, not held — its sum order is the
-//!   wide GEMMs'.
+//!   ids), so a boundary at each residue runs — each pass's last logits row folded into
+//!   [`logits_band::LogitsBand`] against the step's row at that position: no clear top-1
+//!   disagreement and the max and RMS |Δlogit| within the band's pins.
+//! - `state_advances_near_steps`: after those passes, [`CONT`] decode steps on the reference's
+//!   own ids walked against the reference's by [`logits_band::walk`]: the stores the passes
+//!   wrote carry the wide block's distance, so the continuation runs on other values and is
+//!   held to the walk's band, not to bits.
+//! - `prompt_call_then_steps_near_steps`: the whole prompt as one batched call from a reset
+//!   (whose shared expert runs the wide GEMMs too, past its own bound), then [`CONT`] steps on
+//!   the reference's ids walked the same way; the call's own last row is printed beside the
+//!   step's, not held.
 //! - `last_row_is_vendors`: that call's last logits row within [`LOGITS_REL_BAND`] relative L2 of
 //!   the oracle's `result_output` at the prompt's last position, and the steps' row's distance
 //!   printed beside it.
 //! - `pass_refused`: a pass of no rows, a token past the vocabulary and a call past the context
-//!   are each refused by name — all three before any launch, so the model stands where it did: the
-//!   next step is the reference's first.
+//!   are each refused by name — the first and the third by the pass's own runner
+//!   (`GpuModel::run_rows`: no rows, then the resident cache's bound; the walk's `call_end` bound
+//!   never reaches its own refusal, the runner's check stands before the walk), the second by
+//!   the walk's vocabulary check — all three before any launch, so the model stands where it
+//!   did: the next step is the reference's first.
 
 #[cfg(feature = "flint")]
 fn main() -> std::process::ExitCode {
@@ -74,6 +87,9 @@ mod gate {
     use crate::e2e::{argmax, rel};
     use crate::lcpp_e2e::Seat as _;
     use crate::seat::{LOGITS_REL_BAND, Loaded};
+    use bloomery_gpu_gates::logits_band::{
+        self, LOGITS_CLEAR_PIN, LOGITS_MAX_PIN, LOGITS_RMS_PIN, LogitsBand,
+    };
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
         GateError, RefManifest, bits_equal, checks_failed, ref_tensor_logical_in, verdict,
@@ -165,23 +181,39 @@ mod gate {
         Ok(t)
     }
 
-    /// The continuation of [`CONT`] steps on the reference's own ids, each against the
-    /// reference's position `from + j`: how many differ.
-    fn continuation(m: &mut Loaded, reference: &Trace, from: usize) -> Result<usize, GateError> {
-        let mut differing = 0usize;
+    /// The continuation of [`CONT`] steps on the reference's own ids from position `from`: the
+    /// ids the run took and the rows it took them from, as [`logits_band::walk`] takes a run.
+    fn continuation(
+        m: &mut Loaded,
+        reference: &Trace,
+        from: usize,
+    ) -> Result<(Vec<u32>, Vec<Vec<f32>>), GateError> {
+        let mut ids = Vec::with_capacity(CONT);
+        let mut rows = Vec::with_capacity(CONT);
         for j in 0..CONT {
             let row = m.step(reference.ids[from + j - 1])?;
-            let id = argmax(&row);
-            if id != reference.ids[from + j] || !bits_equal(&row, &reference.logits[from + j]) {
-                differing += 1;
-            }
+            ids.push(argmax(&row));
+            rows.push(row);
         }
-        Ok(differing)
+        Ok((ids, rows))
     }
 
-    /// Clauses `rows_are_steps` and `state_advances_as_steps` of set `s` at passes of `p` rows:
-    /// the prompt as batched calls of `p` rows from a reset, each call's last row the step's bits
-    /// at that position, then the continuation.
+    /// The reference's positions `from..` as [`logits_band::walk`]'s reference.
+    fn tail(reference: &Trace, from: usize) -> logits_band::Positions<'_> {
+        logits_band::Positions {
+            tokens: &reference.ids[from..],
+            rows: &reference.logits[from..],
+        }
+    }
+
+    /// A row as the bits [`LogitsBand::add`] takes.
+    fn bits(row: &[f32]) -> Vec<u32> {
+        row.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Clauses `rows_near_steps` and `state_advances_near_steps` of set `s` at passes of `p`
+    /// rows: the prompt as batched calls of `p` rows from a reset, each call's last row folded
+    /// into the band against the step's at that position, then the continuation walked.
     fn pass_clauses(
         m: &mut Loaded,
         s: &Set,
@@ -189,67 +221,82 @@ mod gate {
         p: usize,
     ) -> Result<bool, GateError> {
         m.reset()?;
-        let mut differing = 0usize;
+        let mut band = LogitsBand::new();
+        let mut same_bits = 0usize;
         let mut sizes = Vec::new();
         for (c, chunk) in s.prompt.chunks(p).enumerate() {
             let (row, _) = m
                 .pass(chunk)?
                 .ok_or("a pass runs the head on its last row")?;
-            let id = argmax(&row);
             let at = c * p + chunk.len() - 1;
-            if id != reference.ids[at] || !bits_equal(&row, &reference.logits[at]) {
-                differing += 1;
+            if argmax(&row) == reference.ids[at] && bits_equal(&row, &reference.logits[at]) {
+                same_bits += 1;
             }
+            band.add(&bits(&row), &bits(&reference.logits[at]));
             sizes.push(chunk.len());
         }
         let mut ok = true;
-        let name = format!("rows_are_steps set={} p={p}", s.name);
+        let name = format!("rows_near_steps set={} p={p}", s.name);
         if tier::run_clause(&name, Tag::SelfConsistency)? {
-            let pass = differing == 0;
+            let pass = band.ok();
             println!(
-                "{name} rows={} chunks={sizes:?} differing_pass_ends={} {}",
+                "{name} rows={} chunks={sizes:?} pass_ends={} of them the step's bits (printed, \
+                 not held); band {} clear-top-1 of {} clear (pin {LOGITS_CLEAR_PIN}), max \
+                 |Δlogit| {:.3e} (pin {LOGITS_MAX_PIN}), rms {:.3e} (pin {LOGITS_RMS_PIN}) {}",
                 s.prompt.len(),
-                differing,
+                same_bits,
+                band.disagree,
+                band.clear,
+                band.max,
+                band.rms(),
                 verdict(pass)
             );
             ok &= pass;
         }
-        let name = format!("state_advances_as_steps set={} p={p}", s.name);
+        let name = format!("state_advances_near_steps set={} p={p}", s.name);
         if tier::run_clause(&name, Tag::SelfConsistency)? {
-            let d = continuation(m, reference, s.prompt.len())?;
-            let pass = d == 0;
-            println!(
-                "{name} continuation={CONT} differing_steps={d} {}",
-                verdict(pass)
+            let (ids, rows) = continuation(m, reference, s.prompt.len())?;
+            let walked = logits_band::walk(
+                &format!("{name} continuation={CONT}"),
+                tail(reference, s.prompt.len()),
+                logits_band::Positions {
+                    tokens: &ids,
+                    rows: &rows,
+                },
             );
-            ok &= pass;
+            ok &= walked.ok;
         }
         Ok(ok)
     }
 
-    /// Clauses `prompt_call_is_steps` and `last_row_is_vendors` of set `s`: the whole prompt as one
-    /// batched call from a reset, its continuation against the reference's, its last row against
-    /// the oracle's.
+    /// Clauses `prompt_call_then_steps_near_steps` and `last_row_is_vendors` of set `s`: the whole
+    /// prompt as one batched call from a reset, its continuation walked against the reference's,
+    /// its last row against the oracle's.
     fn prompt_clauses(m: &mut Loaded, s: &Set, reference: &Trace) -> Result<bool, GateError> {
         m.reset()?;
         let (row, _) = m
             .pass(&s.prompt)?
             .ok_or("the prompt call runs the head on its last row")?;
-        let id = argmax(&row);
         let at = s.prompt.len() - 1;
-        let same_row = id == reference.ids[at] && bits_equal(&row, &reference.logits[at]);
+        let same_row = argmax(&row) == reference.ids[at] && bits_equal(&row, &reference.logits[at]);
         let mut ok = true;
-        let name = format!("prompt_call_is_steps set={}", s.name);
+        let name = format!("prompt_call_then_steps_near_steps set={}", s.name);
         if tier::run_clause(&name, Tag::SelfConsistency)? {
-            let d = continuation(m, reference, s.prompt.len())?;
-            let pass = d == 0;
             println!(
                 "{name} ids={} last_row_same_bits={same_row} (the wide GEMMs' own sum order, \
-                 printed, not held) continuation_differing_steps={d} {}",
+                 printed, not held)",
                 s.prompt.len(),
-                verdict(pass)
             );
-            ok &= pass;
+            let (ids, rows) = continuation(m, reference, s.prompt.len())?;
+            let walked = logits_band::walk(
+                &format!("{name} continuation={CONT}"),
+                tail(reference, s.prompt.len()),
+                logits_band::Positions {
+                    tokens: &ids,
+                    rows: &rows,
+                },
+            );
+            ok &= walked.ok;
         }
         let name = format!("last_row_is_vendors set={}", s.name);
         if tier::run_clause(&name, Tag::Oracle)? {
@@ -298,7 +345,7 @@ mod gate {
         refused(
             "a call past the context",
             m.pass(&past).map(|_| ()),
-            "positions the stores hold",
+            "exceeds the resident cache",
         );
         let pos_kept = m.pos() == 0;
         let row = m.step(s.prompt[0])?;
@@ -348,10 +395,11 @@ mod gate {
         }
         println!(
             "PASSED: {NAME} on every set of {SETS:?} the prompt as passes of {} and {ODD_ROWS} \
-             rows gives each pass's last logits row and argmax bit for bit the decode steps' at \
-             that position, the steps after the passes and after the whole-prompt call are the \
-             reference's bit for bit, that call's last row is within {LOGITS_REL_BAND:.1e} of the \
-             oracle's, and the calls the body does not take are refused by name",
+             rows keeps each pass's last logits row within logits_band's pins of the decode \
+             steps' at that position (the dense lead block's batch runs the wide GEMMs at every \
+             width), the steps after the passes and after the whole-prompt call walk within the \
+             band against the reference's, that call's last row is within {LOGITS_REL_BAND:.1e} \
+             of the oracle's, and the calls the body does not take are refused by name",
             PASS_ROWS
         );
         Ok(())
