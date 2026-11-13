@@ -1,0 +1,19 @@
+# The 0.3.14 re-cut's one new term: K-EXAONE-2.0's MTP draft (BLOOMERY_DRAFT=mtp) against the plain path on the re-cut
+# tarball's own bloomery-serve, the IQ2_XXS file, the RTX A6000 and the host. Paper (docs/cards/exmtp-mtp.card, every term
+# [derived] there): the plain step ~105.8 ms, host-DRAM bound; a two-row verify pass costs c_v = 1.298 steps (measured by
+# round 1's time-gpu-exaone-verify) and the draft c_d = 0.025..0.05 steps, in series; speed-up = (1 + a) / (c_v + c_d) with a
+# the kept drafts a window, 0.46..0.91 in the rounds' functional runs (outside a lease) -> +10..+45 %; the band below is
+# exmtp2's. Resource timeline: the draft's card work and the host tier's DRAM reads share no resource, nothing hides c_d.
+# The plain sitting reads every EXAONE row [cold] (the set does not stay in the page cache of the 251 GiB host), so the
+# runner's means may be empty: the effect is then read from the ROW lines, paired by round, and named as cold rows.
+kind: ab
+question: what does the MTP draft (BLOOMERY_DRAFT=mtp, one slot) do to K-EXAONE-2.0's decode rate on the 0.3.14 re-cut's released bloomery-serve against the same binary with the draft off
+term: tg tok/s @ n=127 decode steps, prompts of 512 and 4096 corpus-prose ids, RTX A6000 + host, ctx 8192 one slot, (mtp - off) / off paired by round
+unit: %
+predict: +12..+38
+rounds: 3
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary arms
+condition: BLOOMERY_MODEL=exaone-moe=/models/exaone/K-EXAONE-2.0-750B-A37B-IQ2XXS-00001-of-00029.gguf, DEPTH_SERVE_TARBALL the re-cut sm86 tarball, BLOOMERY_AB_ROUNDS=3, DEPTH_SERVE_CTX=8192, DEPTH_SERVE_N=128; arms env=BLOOMERY_DRAFT=off:bloomery@portable:512, env=BLOOMERY_DRAFT=mtp:bloomery@portable:512 and the same at 4096; the A6000 through the timing runner; the mtp arm's log carries load draft=mtp (layer 78) and its width records give a
+decide-in: publish both rows in the re-cut's notes (plain and mtp) with these conditions; the default stays plain this release (a default flip is its own change with its gates)
+decide-below: under +12 %: read a from the width records first; a under 0.35 is the wiring or the weights (no default flip, the notes say opt-in and give the measured rate); a at 0.5 or more with the gain under +12 % puts the cost in c_d or the pass
+decide-above: over +38 %: read the witness blocks and both arms' plan lines (card_experts) before crediting
