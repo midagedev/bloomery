@@ -301,6 +301,7 @@ mod gate {
             residency: Residency::Off,
             group: 1,
             slots: std::num::NonZeroUsize::MIN,
+            draft: false,
         };
         let pass = bits(&file, &cfg, &inputs)?;
         println!("{NAME}: {}", tier::tally_line());

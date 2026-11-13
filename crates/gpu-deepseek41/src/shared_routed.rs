@@ -907,6 +907,60 @@ impl<R: RouterEntry> Routed<R> {
         })
     }
 
+    /// Register layer `l`'s dense block beside the described layers' own: a layer past the ones
+    /// [`Routed::new_configured`] was given (a draft layer the body loads beside the target's), whose
+    /// tensors are resident in `w`, the draft's own weights. [`Routed::dense_rows`] then runs it with
+    /// that `w`. Refused by name: a layer already held, a spec that is not a dense block, and a block
+    /// whose launches differ by type from the dense blocks the batch buffers were sized for.
+    pub fn add_dense(
+        &mut self,
+        (file, w): (&Split, &Weights),
+        l: usize,
+        spec: &LayerSpec,
+    ) -> Result<(), GpuError> {
+        let Ffn::Dense { ff, act } = spec.ffn else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {l}: not a dense block"),
+            ));
+        };
+        if self.dense.get(l).is_some_and(Option::is_some) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {l}: a dense block held already"),
+            ));
+        }
+        let rule = rule_of("dense activation", l, act)?;
+        let block = DenseFfn::load((file, w), l, (ff as usize, self.d.embd, rule))?;
+        if let Some(held) = self.dense.iter().flatten().next()
+            && held.plan != block.plan
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: a dense block of launches {:?}; the batch buffers were sized for {:?}",
+                    block.plan, held.plan
+                ),
+            ));
+        }
+        if let Some(most) = self.dense.iter().flatten().map(|b| b.ff).max()
+            && block.ff > most
+        {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {l}: a dense block {} wide; the batch buffers were sized for {most}",
+                    block.ff
+                ),
+            ));
+        }
+        if self.dense.len() <= l {
+            self.dense.resize_with(l + 1, || None);
+        }
+        self.dense[l] = Some(block);
+        Ok(())
+    }
+
     /// Layer `l` computes routed experts on the card: the layers a
     /// residency machine holds stage stacks of.
     #[must_use]

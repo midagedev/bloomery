@@ -262,6 +262,28 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
         self.skip = None;
     }
 
+    /// The target cut back to `pos` where the draft's store still holds the
+    /// entry at `pos` itself: the sequence ran past `pos` before the cut, so
+    /// the store holds every position through it. That entry reads the
+    /// target's hidden row at `pos - 1`, which the cut took back and no arena
+    /// holds, so no row waits: the next call that stands at `pos` joins with
+    /// nothing to walk (a refresh of no rows ending at `pos + 1`), its first id
+    /// the one the entry at `pos` was written for, and the draft proposes from
+    /// the rows that call's own units leave. The caller's cut rule grants a
+    /// cut only where the request shares that id with the sequence. No skip,
+    /// and the join a new sequence's.
+    pub fn rejoin_through(&mut self, pos: u32) {
+        self.next = Some(Refresh {
+            tokens: Vec::new(),
+            pos0: pos + 1,
+            walk: self.shape.step,
+            first: 0,
+        });
+        self.last_unit = None;
+        self.joined = None;
+        self.skip = None;
+    }
+
     /// Before a plain step of `last` at the target's position `pos`: a
     /// refresh an earlier step or window left waiting reads an arena the step
     /// may overwrite (its own), so it is walked now, its last row `last`. A
@@ -313,6 +335,11 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
         }
         if r.pos0 as usize > x.held()? {
             return Ok(Err(STORE_BEHIND));
+        }
+        // A cut's join ([`Policy::rejoin_through`]): the store holds the
+        // call's position already, nothing waits.
+        if r.tokens.is_empty() {
+            return Ok(Ok(0));
         }
         if let Some(l) = r.tokens.last_mut() {
             *l = token;
@@ -520,6 +547,13 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
                  before it)"
             )));
         };
+        if refresh.tokens.is_empty() {
+            return Err(Refused(format!(
+                "{WHAT}: a proposal before the call that joins the draft to a cut: the store \
+                 holds the position {}, and no row waits for a chain to walk",
+                refresh.pos0 - 1
+            )));
+        }
         // The refresh's last row is the token at the target's position, which
         // the target has not run yet: the refresh ends one past it.
         let end = refresh.pos0 as usize + refresh.tokens.len();
@@ -619,6 +653,7 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
             return Ok(());
         }
         let waiting = match (self.next.take(), self.last_unit.take()) {
+            (Some(r), _) if r.tokens.is_empty() => None,
             (Some(r), _) => Some(r),
             (None, Some((walk, rows))) => Some(Refresh {
                 tokens: vec![last],
@@ -788,6 +823,16 @@ mod tests {
                 first: pos - 1,
                 rows: 1,
             };
+        }
+
+        /// A cut to `pos` that keeps the draft's store through the entry at
+        /// `pos` ([`Policy::rejoin_through`]): the target back at `pos`, every
+        /// arena's rows from `pos` on taken back, and the store ending one
+        /// past `pos` where the sequence ran that far.
+        fn cut_through(&mut self, pos: u32) {
+            let held = self.store;
+            self.commit(pos, 0);
+            self.store = held.min(pos as usize + 1);
         }
 
         /// The walks run since the last take.
@@ -1427,6 +1472,74 @@ mod tests {
         rig.c.take();
         rig.prompt(&[30], 1, Ar::Ubatch).unwrap();
         assert_eq!(rig.c.take(), [seen(STORE, 9, &[30], rows_of(Ar::Step, 0))]);
+    }
+
+    /// A cut that keeps the store through the entry at its position, after
+    /// drafted windows past it: the continuing prompt joins with no row to
+    /// walk (the entry at the cut's position is held; the id it was written
+    /// for is the call's first) and its units walk the rows after it from
+    /// the call's own hidden rows; a first step walks nothing and the store
+    /// stands at the target's position again; a store that does not reach the
+    /// entry skips by name; and a chain before any call that joins is refused.
+    #[test]
+    fn a_cut_through_joins_with_nothing_to_walk() {
+        let mut rig = after_prompt(64);
+        rig.begin().unwrap();
+        rig.drafted_pass(None).unwrap();
+        rig.drafted_pass(Some(2)).unwrap();
+        rig.c.cut_through(5);
+        rig.p.rejoin_through(5);
+        assert_eq!((rig.c.pos, rig.c.store), (5, 6));
+        rig.c.take();
+        rig.prompt(&[IDS[5], 31, 32], 4, Ar::Ubatch).unwrap();
+        assert_eq!(
+            rig.c.take(),
+            [seen(STORE, 6, &[31, 32], rows_of(Ar::Ubatch, 0))]
+        );
+        assert_eq!(
+            rig.p.take_joined(),
+            Some(Join {
+                start: 5,
+                caught_up: 0,
+                skipped: None
+            })
+        );
+        assert!(!rig.p.skipping());
+        rig.begin().unwrap();
+        rig.drafted_pass(None).unwrap();
+        assert_eq!(
+            rig.c.take(),
+            [seen(HEAD, 8, &[1008], rows_of(Ar::Ubatch, 2))]
+        );
+
+        let mut rig = after_prompt(64);
+        rig.plain_step().unwrap();
+        rig.plain_step().unwrap();
+        rig.c.cut_through(9);
+        rig.p.rejoin_through(9);
+        rig.c.take();
+        rig.last = 40;
+        rig.plain_step().unwrap();
+        assert!(rig.c.take().is_empty());
+        assert_eq!((rig.c.store, rig.c.pos), (10, 10));
+        assert!(rig.p.take_joined().is_none());
+        assert_eq!(rig.next().pos0, 10);
+
+        let mut rig = after_prompt(64);
+        rig.plain_step().unwrap();
+        rig.c.cut_through(5);
+        rig.c.store = 5;
+        rig.p.rejoin_through(5);
+        rig.prompt(&[IDS[5], 31], 2, Ar::Ubatch).unwrap();
+        let got = rig.p.take_joined().unwrap();
+        assert_eq!((got.start, got.skipped), (5, Some(STORE_BEHIND)));
+        assert!(rig.p.skipping());
+
+        let mut rig = after_prompt(64);
+        rig.c.cut_through(5);
+        rig.p.rejoin_through(5);
+        let refused = rig.p.chain(5, 64, 77, 1).unwrap_err().to_string();
+        assert!(refused.contains("no row waits"), "{refused}");
     }
 
     /// The chain takes the refresh with its last row the token at the

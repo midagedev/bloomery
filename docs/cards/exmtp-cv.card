@@ -1,0 +1,45 @@
+# Round exmtp: what a verify pass of two rows costs in plain decode steps on K-EXAONE-2.0's host-bound decode
+# (the second quant, IQ2_XXS routed gate/up, Q4_K downs), the one term that decides the MTP draft before its
+# layer program is built. Every number below is [derived] from the 2026-11-13 serve record (decode 9.2-9.7 tok/s,
+# plan card_experts=771 of 19,456, host_experts=18,685, 13.57 MB an expert) and the host tier's measured cost
+# model (rig-log docs/bloomery/plan.md, t(m) = max(W, a + c m) an expert).
+# One plain step, 105.8 ms: host DRAM 7.92 GB (76 layers x 8 picks x 96.0 % host x 13.57 MB) = 59 ms at the
+# 134 GB/s floor, host serve ~88 ms, card trunk 14.5 GB = ~21 ms (the attention fronts, ~16 ms of it, sit in
+# series with the serve; the shared experts hide under it), PCIe 3.7 MB + 152 handoffs ~1.7 ms, NVMe 0.
+# A pass of 2 rows one layer apart (Chain::Pair) hides the card fronts under the host and reads the union of
+# the rows' experts once. The measured term the prediction needs is s, the experts of row 1's 8 picks that row 0
+# picked too, a layer's mean (union fraction r = (16 - s) / 16, tools/expert-union.py's column). Host serve of
+# the pass = 76 x 0.96 x (16 t1 - s (t1 - (t2 - t1))), t1 = 151 us an expert read (the step's ~88 ms serve over
+# 584 reads), t2 - t1 = 37 us (one more column of 37.7 M MAC); plus ~3 ms of unhidden fronts, so
+#   c_v(s) = (3 + 176.4 - 8.32 s) / 105.8 = 1.696 - 0.0786 s.
+# The 8-of-256 random bound is s = 8 x 8 / 256 = 0.25 (r = 0.984): c_v = 1.68, no gain from sharing. This model's
+# real s is not measured (no route trace of K-EXAONE-2.0 exists; the V4.1 stepsim fits hit ~ 0.24, s ~ 1.9 of 8,
+# at 256 experts top-6): s = 0.8..3.2 gives c_v = 1.63..1.44, s = 1.92 gives 1.55. A pair that hides nothing of
+# the card's 21 ms adds up to 0.2. The same engine's V4.1 verify cost(2)/cost(1) is 25.5/16.8 = 1.52 on the A6000
+# (plan-triage stepsim note). The run prints c_v, not s: the implied s = (1.696 - c_v) / 0.0786, read against
+# 0.25 (random) and 1.9 (V4.1), is the finding; tools/expert-union.py over a route dump of the real file (the CPU
+# engine's BLOOMERY_EXPERT_LOG, hours at 750B) would read r directly and is not needed to decide.
+# Draft speed-up = (1 + a) / (c_v + c_d), c_d ~ 0.05 (the NextN layer, 1.5 GB on the card): a = 0.5..0.8 at
+# c_v 1.55 gives x0.94..1.12 (8.9..10.6 tok/s from 9.45); break-even a = c_v + c_d - 1.
+kind: profile
+question: what does one verify pass of two rows cost in plain decode steps (c_v) on K-EXAONE-2.0-750B-A37B's
+  host tier, the second row the plain run's own next id?
+term: c_v = median wall of one pass of 2 rows / median wall of one plain step, @ prompt 17 ids, 64 steps and
+  32 accepted pairs (4 calls each left out), graph replay, A6000, gate plan arm a, depth < 100
+unit: steps
+predict: 1.40..1.75
+condition: the run holds the timing lease through tools/ref/time-gate.sh (witness blocks before and after,
+  the A6000 pinned by timing-card.sh) with no server on the host's cores or DRAM (the benchmark server
+  stopped: its decode reads the same 8 channels); the line prints accepted_pairs=32 (every pair's row 1 was
+  the plain next id, so the pass's expert union is the real text's) and a step median of 95..125 ms (the
+  server's 103..109 ms at 771 card experts; the gate plan holds the 3090's bytes, so a few experts fewer)
+decide-in: build the NextN program, its MtpBody adapter and the flint seat's draft (about 1,500 lines, two
+  rounds), the gain being +3 % at a = 0.65 and +16 % at a = 0.85 (tok/s from the same arithmetic), and queue
+  the acceptance run as the next card; in the same sitting price the card-expert lever (the idle 3090's
+  ~1,700 experts, -8.7 % of host reads) against it, since both read the same host serve
+decide-below: the pair hides more than derived, so c_v of 1.2..1.4 puts the draft at x1.15..1.45 for a of
+  0.5..0.8: build it at once, and read the pass's per-layer timeline for what else hides
+decide-above: the pair hides nothing of the card chain or the routes share nothing (c_v 1.75..1.9 makes the
+  draft x0.85..1.0 at a = 0.5..0.8): do not build the NextN program; keep the pass for the lookup draft only
+  and spend the round on the host's experts read per token (the 3090's expert tier, a routing-frequency fill of the
+  card's 771 experts)

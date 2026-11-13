@@ -43,7 +43,13 @@ use model::placement::Plan;
 use model::placement::accepts::Program;
 use runtime::layer::{Layer, MixerKind, ResidualKind, hosted};
 
+use crate::draft::Draft;
+
 pub(crate) const WHAT: &str = "flint Body";
+
+/// The rows a verify pass holds in flight: the step's and one drafted row. The routed block's step
+/// buffers, the host boundary and the expert tier's page are made for this many rows.
+pub const PASS_ROWS: usize = 2;
 
 /// Flint's compiled router: the floor-normalized 256/top-6 instance
 /// (`gpu/src/route_body.rs sigmoid_floor_256_6`).
@@ -65,9 +71,14 @@ pub struct FlintBody<R: RouterEntry = FlintRouter> {
     pub(crate) attention: AttnScratch,
     pub(crate) batch_attention: AttnScratch,
     pub(crate) s: StepRows,
+    /// The step rows of rows 1.. of a verify pass ([`PASS_ROWS`] less the step's: one of them): each row's running
+    /// row, its normed and delta rows and its position words.
+    pub(crate) rows: Vec<StepRows>,
     pub(crate) rope: RopeRows,
     pub(crate) ffn: Routed<R>,
     pub(crate) units: BatchBufs,
+    /// The MTP layer, on a load that opened it ([`FlintBody::open_placed_slots_drafted`]).
+    pub(crate) draft: Option<Draft>,
     pub(crate) embed: EmbedTable,
     row: Vec<f32>,
     pub(crate) slots: Arc<DeviceTensor<u32>>,
@@ -140,6 +151,7 @@ impl<R: RouterEntry> FlintBody<R> {
         host_cfg: HostCfg,
         (set, glue): (HostResidency, ResidencyGlue),
         (tiers, seqs): (&[TierOpen], NonZeroUsize),
+        draft: bool,
     ) -> Result<Self, GpuError> {
         gpu.context().bind_to_thread()?;
         let spec = &inputs.spec;
@@ -197,7 +209,7 @@ impl<R: RouterEntry> FlintBody<R> {
             run.len(),
             experts,
         )?);
-        let ffn = Routed::<R>::new_configured(
+        let mut ffn = Routed::<R>::new_configured(
             gpu,
             file,
             w,
@@ -219,6 +231,28 @@ impl<R: RouterEntry> FlintBody<R> {
                 expert_input: ExpertInput::AmaxF16,
             },
         )?;
+        // The step's routed buffers, the host boundary and the expert tier's page hold a verify's rows
+        // in flight.
+        ffn.arm_rows(gpu, &map, PASS_ROWS)?;
+        let draft = if draft {
+            let mtp = spec.mtp.first().ok_or_else(|| {
+                shape("an MTP draft on a file with no MTP layer (nextn_predict_layers is 0)")
+            })?;
+            if seqs.get() != 1 {
+                return Err(shape(format!(
+                    "an MTP draft with {seqs} resident sequences: the draft holds one sequence's store"
+                )));
+            }
+            Some(Draft::load(
+                gpu,
+                (file, w),
+                &mut ffn,
+                (mtp, spec.layers.len()),
+                (hidden, spec.rms_eps, ctx),
+            )?)
+        } else {
+            None
+        };
         let hang = Hang {
             tiers,
             family: &crate::tier::NODE_FAMILY,
@@ -227,7 +261,7 @@ impl<R: RouterEntry> FlintBody<R> {
                 layers: cfg.len(),
                 hidden,
                 n_used: used,
-                rows: 1,
+                rows: PASS_ROWS,
             },
             cols: crate::prefill::T_MAX,
             card_dontneed: host_cfg.card_dontneed,
@@ -243,7 +277,7 @@ impl<R: RouterEntry> FlintBody<R> {
                     ff: expert_ff,
                     n_used: used,
                 },
-                1,
+                PASS_ROWS,
             ),
             Some(&hang),
             |src| {
@@ -270,7 +304,11 @@ impl<R: RouterEntry> FlintBody<R> {
             attention: AttnScratch::new(gpu, &bindings, 1)?,
             batch_attention: AttnScratch::new(gpu, &bindings, crate::prefill::T_MAX)?,
             s: StepRows::new(gpu.stream(), hidden)?,
+            rows: (1..PASS_ROWS)
+                .map(|_| StepRows::new(gpu.stream(), hidden))
+                .collect::<Result<Vec<_>, _>>()?,
             units: BatchBufs::new(gpu, hidden, crate::prefill::T_MAX, 1)?,
+            draft,
             cfg,
             bindings,
             stores,
@@ -298,6 +336,54 @@ impl<R: RouterEntry> FlintBody<R> {
         Ok(body)
     }
 
+    /// The verify pass's host half: row `r` of `tokens` staged as the step stages its one row, the
+    /// embedding of `tokens[r]` and its words at `pos + r`, in row `r`'s own buffers. Refused by name:
+    /// other than [`PASS_ROWS`] ids, the taps armed (they copy the step's one row), a row past the context
+    /// or the vocabulary.
+    pub(crate) fn plan_pass(
+        &mut self,
+        stream: &CudaStream,
+        tokens: &[u32],
+        pos: u32,
+    ) -> Result<(), GpuError> {
+        if self.shell.taps.is_some() {
+            return Err(shape(
+                "a verify pass with the taps armed: they copy the step's one row (set_taps off)",
+            ));
+        }
+        if tokens.len() != PASS_ROWS {
+            return Err(shape(format!(
+                "{} rows; the pass runs {PASS_ROWS}",
+                tokens.len()
+            )));
+        }
+        for (r, &token) in tokens.iter().enumerate() {
+            let at = u32::try_from(r)
+                .ok()
+                .and_then(|r| pos.checked_add(r))
+                .filter(|&at| (at as usize) < self.ctx)
+                .ok_or_else(|| {
+                    shape(format!(
+                        "row {r} at position {pos} + {r} past context {}",
+                        self.ctx
+                    ))
+                })?;
+            self.embed.row_into(token, &mut self.row)?;
+            let rows = match r {
+                0 => &mut self.s,
+                r => &mut self.rows[r - 1],
+            };
+            rows.x.copy_from_host(stream, &self.row)?;
+            rows.pos.copy_from_host(stream, &[at])?;
+            rows.n_keys.copy_from_host(stream, &[at + 1])?;
+            self.at = self.at.max(at + 1);
+        }
+        if let Some(d) = self.draft.as_mut() {
+            d.passing(pos);
+        }
+        Ok(())
+    }
+
     pub fn ctx(&self) -> usize {
         self.ctx
     }
@@ -309,6 +395,7 @@ impl<R: RouterEntry> FlintBody<R> {
     }
     pub fn scratch_bytes(&self) -> usize {
         self.s.bytes()
+            + self.rows.iter().map(StepRows::bytes).sum::<usize>()
             + self.attention.bytes()
             + self.k.bytes()
             + self.ffn.bytes()
@@ -324,12 +411,13 @@ impl<R: RouterEntry> FlintBody<R> {
             WHAT,
             "prompt batch buffers",
             self.prompt_reserve,
-            self.prompt_bytes() as u64,
-            "attention rows, common walk units and shared routed batch buffers",
+            (self.prompt_bytes() + self.draft.as_ref().map_or(0, Draft::bytes)) as u64,
+            "attention rows, common walk units, shared routed batch buffers and the MTP layer",
         )
     }
 
     /// Rollback never restores a ring. Its depth is measured from the greatest written end, not the last cut.
+    /// The MTP layer's own ring, when it is loaded, is held to the same depth.
     pub fn cut_keeps(&self, pos: u32, n: u32) -> bool {
         let end = self.at.max(pos);
         n <= end
@@ -341,6 +429,10 @@ impl<R: RouterEntry> FlintBody<R> {
                     b.window() as u64,
                 )
             })
+            && self
+                .draft
+                .as_ref()
+                .is_none_or(|d| d.cut_keeps(u64::from(end - n)))
     }
     pub fn keepable_at(&self, pos: u32, n: u32) -> u32 {
         if self.cut_keeps(pos, n) { n } else { 0 }
@@ -397,6 +489,43 @@ macro_rules! chain_body {
                 residency: Residency,
                 slots: NonZeroUsize,
             ) -> Result<GpuModel<Self>, GpuError> {
+                Self::open_placed_with(file, plan, inputs, card, host, residency, slots, false)
+            }
+
+            /// [`Self::open_placed_slots`] with the file's MTP layer loaded beside the target
+            /// ([`crate::draft`]): its card bytes are the plan's reserve
+            /// (`place::configure_draft`). One resident sequence only; refused by name past it and on
+            /// a file with no MTP layer.
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "the placed load's file, plan, card and host policy, residency and sequence count"
+            )]
+            pub fn open_placed_slots_drafted(
+                file: Split,
+                plan: &Plan<'_>,
+                inputs: &PlanInputs,
+                card: usize,
+                host: HostCfg,
+                residency: Residency,
+                slots: NonZeroUsize,
+            ) -> Result<GpuModel<Self>, GpuError> {
+                Self::open_placed_with(file, plan, inputs, card, host, residency, slots, true)
+            }
+
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "the placed load's file, plan, card and host policy, residency, sequence count and draft"
+            )]
+            fn open_placed_with(
+                file: Split,
+                plan: &Plan<'_>,
+                inputs: &PlanInputs,
+                card: usize,
+                host: HostCfg,
+                residency: Residency,
+                slots: NonZeroUsize,
+                draft: bool,
+            ) -> Result<GpuModel<Self>, GpuError> {
                 let tiers = TierOpen::one_of(plan.machine, WHAT)?;
                 let (layers, _) = stage_run(WHAT, plan, card, inputs.spec.layers.len())?;
                 let one = inputs.kv.bytes(layers, plan.ctx_max);
@@ -406,7 +535,7 @@ macro_rules! chain_body {
                 let residency = ResidencySpec::hosted(
                     residency,
                     widths.used,
-                    1,
+                    PASS_ROWS,
                     Arc::new(hosted_stacks(&inputs.model, WHAT, (run.len(), true))?),
                 );
                 let mut m = GpuModel::load_placed_with(
@@ -425,6 +554,7 @@ macro_rules! chain_body {
                             host,
                             (set, glue),
                             (&tiers, slots),
+                            draft,
                         )
                     },
                 )?;
@@ -454,6 +584,9 @@ macro_rules! chain_body {
                 self.s.pos.copy_from_host(stream, &[input.pos])?;
                 self.s.n_keys.copy_from_host(stream, &[input.pos + 1])?;
                 self.at = self.at.max(input.pos + 1);
+                if let Some(d) = self.draft.as_mut() {
+                    d.stepping(input.pos);
+                }
                 Ok(())
             }
             fn enqueue_chain(
@@ -467,6 +600,9 @@ macro_rules! chain_body {
             fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
                 self.shell.hybrid.settle(gpu.stream())?;
                 self.at = 0;
+                if let Some(d) = self.draft.as_mut() {
+                    d.reset();
+                }
                 Ok(())
             }
             fn head_eps(&self) -> f32 {
@@ -476,6 +612,7 @@ macro_rules! chain_body {
                 self.store_bytes()
                     + self.scratch_bytes()
                     + self.prompt_bytes()
+                    + self.draft.as_ref().map_or(0, Draft::bytes)
                     + self
                         .shell
                         .taps
@@ -513,6 +650,9 @@ macro_rules! chain_body {
                         "rollback to {pos} from written end {} loses ring keys; reset and refeed",
                         self.at
                     )));
+                }
+                if let Some(d) = self.draft.as_mut() {
+                    d.cut(pos);
                 }
                 Ok(())
             }

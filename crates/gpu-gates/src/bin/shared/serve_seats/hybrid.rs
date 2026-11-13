@@ -29,16 +29,20 @@ use bloomery_gpu_gates::bind::{Seat, note_line};
 use bloomery_gpu_gates::generate::{Lane, Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
-use bloomery_levers::{HostCfg, Levers, ResidencyPick};
+use bloomery_levers::{DraftWord, HostCfg, Levers, ResidencyPick};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::place_hybrid::PlanInputs;
+use model::placement::ctx_ask::DEFAULT_SLOTS;
 use model::placement::workstation::TierBatchBytes;
 use model::placement::{KvDefault, Machine, PlacementError, Plan};
 use runtime::Target as _;
+use runtime::prompt::CallEnd;
+use runtime::width::Mode as WidthMode;
 use serve::reasoning::ThinkTags;
-use serve::{CacheNote, Saved, ServeError};
+use serve::{CacheNote, DraftProps, Drafted, EngineProps, Saved, ServeError};
 
+use super::hybrid_draft::SeatDraft;
 use super::tiered::{self, BuildMachine, Open, PassAttempt, PassPlan, Tiered, Walk};
 
 /// The open of a family's prompt pass ([`Family::pass`]): the body by the plan its pass inputs
@@ -117,6 +121,26 @@ pub trait Family: Sized + 'static {
     /// body loaded with none (the default).
     fn pass_rows(_m: &GpuModel<Self::Body>) -> Result<Option<usize>, GateError> {
         Ok(None)
+    }
+
+    /// Whether the family's body carries an in-file MTP layer the seat drafts with under
+    /// `BLOOMERY_DRAFT=mtp` ([`Family::mtp`]); the lever is refused by name where this is false.
+    const MTP: bool = false;
+
+    /// The `load draft=mtp` record of the loaded model `m`, `took` the draft window's open. Asked
+    /// only of a family with [`Family::MTP`].
+    fn draft_record(_m: &GpuModel<Self::Body>, _took: Duration) -> Result<Record, GateError> {
+        Err(format!("the {} seat has no in-file MTP draft", Self::FAMILY).into())
+    }
+
+    /// The in-file MTP draft of the session `s` (the body loaded with its layer: the seat sets
+    /// [`app::arch::HybridCfg::draft`]), its window opened over one sequence behind the width
+    /// chooser `width`. Asked only of a family with [`Family::MTP`].
+    fn mtp(
+        _s: &mut Session<Self::Body>,
+        _width: WidthMode,
+    ) -> Result<Box<dyn SeatDraft<Self::Body>>, GateError> {
+        Err(format!("the {} seat has no in-file MTP draft", Self::FAMILY).into())
     }
 
     /// Whether `arch` is a file this seat serves.
@@ -204,6 +228,10 @@ impl<F: Family> Default for Flags<F> {
 pub struct Hybrid<F: Family> {
     s: Session<F::Body>,
     ctx: usize,
+    /// The in-file MTP draft under `BLOOMERY_DRAFT=mtp` ([`mtp_asked`]); `None` the plain path.
+    drafted: Option<Box<dyn SeatDraft<F::Body>>>,
+    /// The model file, which `/props`' `engine.draft` names under a draft.
+    path: std::path::PathBuf,
     /// The `tier census` records' span start ([`record::host_tier::CensusSpan`]): each
     /// prompt prints the steps since the last one's, then its own.
     census: record::host_tier::CensusSpan,
@@ -297,6 +325,30 @@ impl<F: Family> Log<F> {
     }
 }
 
+/// `BLOOMERY_DRAFT` as a hybrid seat reads it: `mtp` (with the width mode `BLOOMERY_MTP_WIDTH`
+/// names) drafts with the file's MTP layer, `off` and unset run the plain path; any other word, and
+/// `mtp` on a family with no MTP layer, are refused by name.
+fn mtp_asked<F: Family>() -> Result<Option<WidthMode>, GateError> {
+    let levers = Levers::from_env().map_err(|e| e.to_string())?;
+    match levers.draft_word(&[DraftWord::Mtp, DraftWord::Off]) {
+        Ok(Some(DraftWord::Mtp)) if F::MTP => Ok(Some(
+            WidthMode::of(levers.mtp_width()).map_err(|e| e.to_string())?,
+        )),
+        Ok(Some(DraftWord::Mtp)) => Err(format!(
+            "BLOOMERY_DRAFT=mtp: the {} seat has no in-file MTP layer to draft with",
+            F::FAMILY
+        )
+        .into()),
+        Ok(_) => Ok(None),
+        Err(e) => Err(format!(
+            "BLOOMERY_DRAFT is mtp or off on the {} seat, not {:?}",
+            F::FAMILY,
+            e.word.as_str()
+        )
+        .into()),
+    }
+}
+
 /// The session of the file at `a.path` on `a.place`, the step captured, the
 /// `load` record on stderr, on the calling thread, pinned to the dispatcher's
 /// cpu slot when asked.
@@ -319,12 +371,23 @@ fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError
         _family: PhantomData,
     };
     let machine = a.machine;
+    let mtp = mtp_asked::<F>()?;
+    if mtp.is_some() && a.slots.get() != 1 {
+        return Err(format!(
+            "BLOOMERY_DRAFT=mtp on the {} seat drafts one slot: --parallel {} is refused \
+             (--parallel 1)",
+            F::FAMILY,
+            a.slots
+        )
+        .into());
+    }
     let cfg = HybridCfg {
         place: a.plan,
         host: a.host,
         residency: a.residency,
         group: a.group,
         slots: a.slots,
+        draft: mtp.is_some(),
     };
     let loaded = match a.flags.pass.take() {
         Some((inputs, open)) => open_pass(file, (&inputs, open), &machine, (a.ctx, cfg), &mut log)?,
@@ -342,11 +405,22 @@ fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError
     let mut s = loaded.ready(&mut log)?;
     <F::Body as Batch>::Sequences::add(&mut s, a.slots)?;
     log.record(s.model())?;
+    let drafted = match mtp {
+        Some(width) => {
+            let t = Instant::now();
+            let d = F::mtp(&mut s, width)?;
+            F::draft_record(s.model(), t.elapsed())?.eprint();
+            Some(d)
+        }
+        None => None,
+    };
     let mut census = record::host_tier::CensusSpan::default();
     census.mark("load", record::census_of(s.model().body(F::NAME)?.hybrid()));
     Ok(Hybrid {
         s,
         ctx: a.ctx,
+        drafted,
+        path: a.path,
         census,
     })
 }
@@ -404,7 +478,10 @@ impl<F: Family> Seat for Hybrid<F> {
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
         self.census
             .steps(Some(self.s.model().body(F::NAME)?.hybrid()));
-        let next = <F::Body as Prompt>::prompt(self.s.model_mut(), ids)?;
+        let next = match self.drafted.as_mut() {
+            Some(d) => d.prompt_call(&mut self.s, ids, CallEnd::Argmax)?,
+            None => <F::Body as Prompt>::prompt(self.s.model_mut(), ids)?,
+        };
         self.s
             .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         self.census
@@ -413,32 +490,111 @@ impl<F: Family> Seat for Hybrid<F> {
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
-        let next = self.s.model_mut().step(&[last])?;
+        let next = match self.drafted.as_mut() {
+            Some(d) => d.step(&mut self.s, last)?,
+            None => self.s.model_mut().step(&[last])?,
+        };
         self.s
             .card_check(model::placement::card_made::CardPhase::FirstStep)?;
         Ok(next)
+    }
+
+    fn step_row(&mut self, last: u32, row: &mut [f32]) -> Result<u32, GateError> {
+        match self.drafted.as_mut() {
+            Some(d) => d.step_row(&mut self.s, last, row),
+            None => {
+                let arg = self.step(last)?;
+                self.logits_into(row)
+                    .map_err(|e| format!("logits of the step: {e}"))?;
+                Ok(arg)
+            }
+        }
     }
 
     fn logits_into(&self, row: &mut [f32]) -> Result<(), GateError> {
         Ok(self.s.model().logits_into(row)?)
     }
 
-    /// The model's reset ([`GpuModel::reset`]): the body never holds a
-    /// verify's rows, so the session's own reset adds nothing to it.
+    fn slot_drafts(&self) -> bool {
+        self.drafted.as_ref().is_some_and(|d| d.drafts())
+    }
+
+    fn drafts_sampled(&self) -> bool {
+        self.drafted.as_ref().is_some_and(|d| d.drafts())
+    }
+
+    fn pass(&mut self, last: u32, out: &mut Vec<u32>) -> Result<Drafted, GateError> {
+        match self.drafted.as_mut() {
+            Some(d) => d.pass(&mut self.s, last, out),
+            None => {
+                out.push(self.step(last)?);
+                Ok(Drafted::default())
+            }
+        }
+    }
+
+    fn pass_rows(&self) -> usize {
+        self.drafted.as_ref().map_or(1, |d| d.pass_rows(&self.s))
+    }
+
+    fn pass_sampled(
+        &mut self,
+        last: u32,
+        history: &mut Vec<u32>,
+        sampler: &mut serve::Sampler,
+        best: Option<usize>,
+        out: &mut Vec<u32>,
+    ) -> Result<Drafted, GateError> {
+        match self.drafted.as_mut() {
+            Some(d) => d.pass_sampled(&mut self.s, last, history, sampler, best, out),
+            None => Err("this seat does not draft a sampled request".into()),
+        }
+    }
+
+    /// The model's reset ([`GpuModel::reset`]), the draft started over with it under a draft.
     fn reset(&mut self) -> Result<(), GateError> {
-        Ok(self.s.model_mut().reset()?)
+        match self.drafted.as_mut() {
+            Some(d) => d.reset(&mut self.s),
+            None => Ok(self.s.model_mut().reset()?),
+        }
     }
 
     /// The session's cut (`app::Keep`), which takes only a position
-    /// [`Seat::keep`] granted; any other is refused by name.
+    /// [`Seat::keep`] granted; any other is refused by name. Under a draft the draft's store
+    /// stays through the cut's own position ([`SeatDraft::cut`]).
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
-        Ok(self.s.cut(pos)?)
+        match self.drafted.as_mut() {
+            Some(d) => d.cut(&mut self.s, pos),
+            None => Ok(self.s.cut(pos)?),
+        }
+    }
+
+    /// `/props`' `engine.draft` under a draft: the target file, whose next-token layer it is.
+    fn props(&self, mut p: EngineProps) -> EngineProps {
+        if self.drafted.is_some() {
+            p.draft = Some(DraftProps {
+                model: self.path.file_name().map_or_else(
+                    || self.path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                ),
+                n_max: self.drafted.as_ref().map(|d| d.width()),
+                kind: Some("mtp".to_owned()),
+                path: Some(self.path.display().to_string()),
+                device: None,
+            });
+        }
+        p
     }
 
     /// The model's rule (`app::Keep for Body`) and the sentence that kept
-    /// less: every held position, the empty model, or a checkpoint.
+    /// less: every held position, the empty model, or a checkpoint; under a draft, the draft's
+    /// own cut rule over it ([`SeatDraft::keep`]).
     fn keep(&self, n: usize) -> (usize, Option<String>) {
-        self.s.keep_query(n)
+        let body = |m| self.s.keep_query(m);
+        match self.drafted.as_ref() {
+            Some(d) => d.keep(&self.s, n, &body),
+            None => body(n),
+        }
     }
 
     /// Nowhere: no prompt call is cut for a prefix a later request keeps; the
@@ -457,6 +613,9 @@ impl<F: Family> Seat for Hybrid<F> {
     }
 
     fn close(&mut self) -> Result<(), GateError> {
+        if let Some(d) = self.drafted.as_mut() {
+            d.close();
+        }
         Ok(self.s.model_mut().close_nodes()?)
     }
 
@@ -493,11 +652,24 @@ impl<F: Family> Tiered for Hybrid<F> {
     }
 
     fn configure(inputs: &mut PlanInputs<Self::H>, group: usize) -> Result<(), GateError> {
-        F::configure(inputs, group)
+        F::configure(inputs, group)?;
+        if mtp_asked::<F>()?.is_some() {
+            <F::Body as Batch>::configure_draft(inputs)?;
+        }
+        Ok(())
     }
 
     fn check_ctx(inputs: &PlanInputs<Self::H>, ctx: usize) -> Result<(), GateError> {
         F::check_ctx(inputs, ctx)
+    }
+
+    /// One slot under `BLOOMERY_DRAFT=mtp`: the draft holds one sequence's store.
+    fn default_slots() -> Result<usize, GateError> {
+        Ok(if mtp_asked::<F>()?.is_some() {
+            1
+        } else {
+            DEFAULT_SLOTS
+        })
     }
 
     fn prefill_steps(flags: &Flags<F>) -> bool {

@@ -1,0 +1,46 @@
+# Round exmtp2: K-EXAONE-2.0's MTP layer (nextn, blk.78) as the serve seat's draft, depth 1, one slot, a
+# verify pass of two rows.
+# Every number is [derived] from the 2026-11-13 serve record and round 1 (docs/cards/exmtp-cv.card); only a is
+# unmeasured.
+# Plain step 105.8 ms (9.45 tok/s; host DRAM 59 ms floor, host serve ~88 ms, card trunk ~21 ms, PCIe ~1.7 ms,
+# NVMe 0). A window = one
+# target pass of 2 rows (c_v = 1.298 steps, measured by round 1's time-gpu-exaone-verify) + the draft's chain.
+# c_d [derived]: the layer's 561.6 MB (the unit test's weights sum) + the Q8_0 full-vocab head ~1.0 GB = ~1.6
+# GB at ~760 GB/s = 2.1 ms,
+# + ~30 eager launches ~0.4 ms + one readback ~0.1 ms = 2.6 ms; it needs the target's last hidden row, so it
+# sits in series with
+# the pass, nothing hides it: c_d = 0.025 (2.6 ms) .. 0.05 (5.3 ms, launch gaps doubled); the draft's card
+# work and the host tier's DRAM
+# reads share no resource. The draft's ~0.6 GB reserve takes ~45 of the 771 card experts (-0.2 pp of card
+# picks, +0.2 ms a step: inside the ruler).
+# Speed-up = (1 + a) / (1.298 + c_d), a = kept drafts per window: a = 0.5 -> 1.12 (10.6 tok/s), a = 0.85 ->
+# 1.38 (13.1 tok/s),
+# break-even a = 0.30..0.35. MTP acceptance is not an engine fact until this run: no oracle graph exists
+# (llama.cpp and HF ignore mtp.*),
+# so the sitting's tokens equal the plain run's by the verify rule and a wrong wiring shows only as a low a.
+kind: ab
+question: what does serving the file's MTP layer as a one-id draft (BLOOMERY_DRAFT=mtp, one slot) do to
+  K-EXAONE-2.0's decode rate against the same binary with the draft off?
+term: tg tok/s @ n=127 decode steps, depth 96 ids of corpus-prose, A6000, the second quant (IQ2_XXS routed
+  gate/up), one slot at ctx 4096, serving defaults otherwise - (mtp - off) / off, paired by round
+unit: %
+predict: +12..+38
+rounds: 3
+condition: BLOOMERY_MODEL=exaone-moe BLOOMERY_AB_ROUNDS=3 BLOOMERY_BOX_ENV='DEPTH_SERVE_CTX=4096
+  DEPTH_SERVE_N=128 BLOOMERY_LEASE_CARD=docs/cards/exmtp-mtp.card' just depth-serve
+  env=BLOOMERY_DRAFT=off:<tree>:96 env=BLOOMERY_DRAFT=mtp:<tree>:96 (the off arm first: the runner's
+  difference is arm - first); DEPTH_SERVE_CTX makes both arms one slot at the same context (unset, the plain
+  arm plans two slots and the drafted one); the lease through depth-serve.sh (witness blocks, A6000 pinned)
+  with no other server on the host cores or DRAM; the mtp arm's log carries a load draft=mtp record (layer 78,
+  head=full) and its mtp width records give the drafts kept per window, a read against the 0.5..0.85 the band
+  assumes; no row carries [cpu-busy], [other-busy] or [cold]
+decide-in: keep the draft: flip the DRAFT row's unset on this seat to mtp (--place a or bp, one slot, as the
+  GLM seat's rule) in the next round, and open the block drafter (the official DSpark draft, 5 layers, block
+  7) through the same SeatDraft path, its a read from this run
+decide-below: read a first: a below 0.35 is the draft's wiring or its weights (compare the input pack, the
+  rope position and the head norm against the vLLM exaone_moe_mtp reference; mtp_paths_agree already pins the
+  arenas), no default flip; a at 0.5 or more with the speed-up under +12 % puts the cost in c_d or the pass
+  (nsys one window), and the draft goes unset until priced
+decide-above: the pair shares more experts on real text than the measured c_v 1.298 (accepted drafts repeat
+  their predecessor's picks): flip the default as in-band and price the depth-2 window (two walks of the one
+  layer) in the same sitting

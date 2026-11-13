@@ -107,6 +107,12 @@ pub mod mistrallarge4;
     any(feature = "solar2", feature = "flint", feature = "kimik3")
 ))]
 pub mod hybrid;
+// The hybrid seat's in-file MTP draft: one sequence's window behind the object the seat holds.
+#[cfg(all(
+    feature = "deepseek41",
+    any(feature = "solar2", feature = "flint", feature = "kimik3")
+))]
+pub mod hybrid_draft;
 // The Kimi K3 seat, on the hybrid seat's owner: one sequence, its prompt stepped one id at a time.
 #[cfg(all(feature = "deepseek41", feature = "kimik3"))]
 pub mod kimi_k3;

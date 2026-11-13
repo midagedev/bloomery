@@ -12,15 +12,17 @@
 
 use crate::lcpp_e2e::{Arm, Dims, Seat};
 use bloomery_gpu::host::served::prompt_pass;
+use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
-use bloomery_gpu_flint::{ExaoneBody, ExaoneModel, prefill, set_taps};
+use bloomery_gpu_flint::{ExaoneBody, ExaoneModel, PASS_ROWS, prefill, set_taps};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::prompts::SIGMA_LOGIT_V41;
 use bloomery_gpu_gates::tier::Tier;
 use gguf::Split;
-use model::arch::flint::place::{self, PlanInputs};
-use model::placement::PlanLevers;
+use model::arch::flint::place::{self, PlaceError, PlanInputs};
 use model::placement::workstation::{HostRead, PLAN_ROOM};
+use model::placement::{PlacementError, PlanLevers};
+use std::num::NonZeroUsize;
 use std::path::Path;
 
 /// The layers of the fixture GGUF's trunk: the last is the head's input, held by the logits and
@@ -82,6 +84,64 @@ pub fn open(file: &Path, ctx: usize, arm: Arm) -> Result<Box<dyn Seat>, GateErro
 /// [`open`]'s seat as the body behind it, for a gate that drives the body between the seat's
 /// calls.
 pub fn open_loaded(file: &Path, ctx: usize, arm: Arm) -> Result<Loaded, GateError> {
+    let (mut m, dims) = open_model(file, ctx, arm)?;
+    // Armed under eager steps, then captured with the taps.
+    set_taps(&mut m, true)?;
+    m.set_mode(StepMode::Graph);
+    Ok(Loaded { m, dims })
+}
+
+/// The body [`open`] loads, with no tap armed: a gate that drives the engine's own session over it
+/// (a verify pass refuses the taps).
+pub fn open_model(file: &Path, ctx: usize, arm: Arm) -> Result<(ExaoneModel, Dims), GateError> {
+    open_model_with(file, ctx, arm, false, false).map(|(m, dims, _)| (m, dims))
+}
+
+/// [`open_model`]'s body with the file's MTP layer loaded beside the target
+/// (`ExaoneBody::open_placed_slots_drafted`), its card bytes kept out of the expert budget by the
+/// plan as the serve seat plans them (`place::configure_draft`); one resident sequence.
+pub fn open_model_drafted(
+    file: &Path,
+    ctx: usize,
+    arm: Arm,
+) -> Result<(ExaoneModel, Dims), GateError> {
+    open_model_with(file, ctx, arm, true, false).map(|(m, dims, _)| (m, dims))
+}
+
+/// The card budget a host-tier load takes past its own floor, in bytes: about a quarter of the
+/// fixture's routed experts (four layers of 256) sit on the card, the rest on the host, so every
+/// token's top eight reach the host tier (`gate_exaone_serve` takes the same figure).
+pub const HOST_EXTRA: u64 = 1_400_000_000;
+
+/// The routed experts a plan holds on the card and on the host.
+#[derive(Clone, Copy, Debug)]
+pub struct Experts {
+    pub card: u64,
+    pub host: u64,
+}
+
+/// [`open_model`]'s body (with the MTP layer beside it when `draft`) on a plan that holds part of
+/// the routed experts on the host: the card budget is the load's own floor and [`HOST_EXTRA`],
+/// the floor read off the refusal of a budget below it, so a plain and a drafted load keep the
+/// same experts on the card. The step runs the host tier's chain, a verify pass its pair chain
+/// ([`Chain::Pair`](bloomery_gpu::hybrid::Chain::Pair)); the residency is off, so the experts stay
+/// where the plan put them.
+pub fn open_model_hosted(
+    file: &Path,
+    ctx: usize,
+    arm: Arm,
+    draft: bool,
+) -> Result<(ExaoneModel, Dims, Experts), GateError> {
+    open_model_with(file, ctx, arm, draft, true)
+}
+
+fn open_model_with(
+    file: &Path,
+    ctx: usize,
+    arm: Arm,
+    draft: bool,
+    hosted: bool,
+) -> Result<(ExaoneModel, Dims, Experts), GateError> {
     let levers = bloomery_levers::at_main(&[bloomery_levers::CARD_BUDGET])?;
     let split = Split::open(file).map_err(|e| format!("open {}: {e}", file.display()))?;
     // The file as it is: the gates feed ids, so the features of the file that only the tokenizer
@@ -90,19 +150,48 @@ pub fn open_loaded(file: &Path, ctx: usize, arm: Arm) -> Result<Loaded, GateErro
     // room: no reading of the box's available bytes enters it.
     let mut inputs = PlanInputs::describe(&split)?;
     inputs.room = (PLAN_ROOM, HostRead::Given);
+    if draft {
+        place::configure_draft(&mut inputs, PASS_ROWS as u64)?;
+    }
     let machine = arm.machine(inputs.model.layers, place::tier_batch(&inputs)?)?;
-    let place = PlanLevers::from_levers(&levers)?;
-    let plan = inputs.plan(&machine, u64::try_from(ctx)?, &place)?;
-    let mut m = ExaoneBody::open_placed(split, &plan, &inputs, 0, levers.host())?;
-    // Armed under eager steps, then captured with the taps.
-    set_taps(&mut m, true)?;
-    m.set_mode(StepMode::Graph);
+    let mut place = PlanLevers::from_levers(&levers)?;
+    let ctx_max = u64::try_from(ctx)?;
+    if hosted {
+        let probe = PlanLevers {
+            card_budget_bytes: Some(1u64 << 20).into(),
+            ..place.clone()
+        };
+        let floor = match inputs.plan(&machine, ctx_max, &probe) {
+            Err(PlaceError::Placement(PlacementError::CardBudgetFloor { floor, .. })) => floor,
+            Ok(_) => return Err("a card budget of 1 MiB planned the load: no floor is read".into()),
+            Err(e) => return Err(format!("the floor probe: {e}").into()),
+        };
+        place.card_budget_bytes = Some(floor + HOST_EXTRA).into();
+    }
+    let plan = inputs.plan(&machine, ctx_max, &place)?;
+    let experts = Experts {
+        card: plan.n_l.iter().sum(),
+        host: plan.host.experts,
+    };
+    let m = if draft {
+        ExaoneBody::open_placed_slots_drafted(
+            split,
+            &plan,
+            &inputs,
+            0,
+            levers.host(),
+            Residency::Off,
+            NonZeroUsize::MIN,
+        )?
+    } else {
+        ExaoneBody::open_placed(split, &plan, &inputs, 0, levers.host())?
+    };
     let dims = Dims {
         layers: m.layers().len(),
         embd: inputs.spec.hidden as usize,
         vocab: inputs.spec.vocab as usize,
     };
-    Ok(Loaded { m, dims })
+    Ok((m, dims, experts))
 }
 
 /// The body on the gate card behind the seat's calls.

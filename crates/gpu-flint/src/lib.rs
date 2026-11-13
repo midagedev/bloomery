@@ -5,7 +5,9 @@
 use models::shape::RouterInst;
 
 pub mod body;
+pub mod draft;
 pub mod prefill;
+mod rows;
 mod step;
 pub mod tier;
 
@@ -15,10 +17,11 @@ pub mod tier;
 /// pass gate reads).
 pub use bloomery_gpu_deepseek41::shared_routed::GATED_FROM;
 pub use body::{
-    Body, ExaoneBody, ExaoneModel, ExaoneRouter, FlintBody, FlintModel, FlintRouter, Seq,
-    StepInput, set_taps,
+    Body, ExaoneBody, ExaoneModel, ExaoneRouter, FlintBody, FlintModel, FlintRouter, PASS_ROWS,
+    Seq, StepInput, set_taps,
 };
-pub use prefill::{prefill, set_prefill_group};
+pub use draft::{Draft, FlintArena};
+pub use prefill::{prefill, prefill_draft, set_prefill_group};
 
 /// Whether the router row `row` a description selects is K-EXAONE's instance
 /// (`router::mimo2`): what picks between the program's two bodies where a

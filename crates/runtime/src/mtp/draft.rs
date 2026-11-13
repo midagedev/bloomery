@@ -179,6 +179,18 @@ impl<H: Host> MtpDraft<H> {
         }
     }
 
+    /// The target cut back to `pos` where the draft's store still holds the
+    /// entry at `pos` itself ([`Policy::rejoin_through`]): the host kept the
+    /// store through it, and the next call that stands at `pos` joins with no
+    /// row to walk and drafts on from its own units. Nothing is skipped, and
+    /// the next [`Join`] is the first since.
+    pub fn rejoin_through(&mut self, pos: u32) {
+        self.policy.rejoin_through(pos);
+        if let Some(w) = &mut self.windows {
+            w.pending = None;
+        }
+    }
+
     /// The window's policy, for a caller that runs the decisions itself on an
     /// executor of its own (`before_step`, `chain`, `prompt_start`, `unit`):
     /// the state a restart, an unpark or a rejoin also clears from the kept

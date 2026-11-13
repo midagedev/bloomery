@@ -302,6 +302,13 @@ pub trait Tiered: Seat + Sized + 'static {
     /// plan, and `--parallel auto` on a placement with one serves one slot.
     const TIER_SLOTS: bool = true;
 
+    /// The slots a server with neither `--parallel` nor `--ctx` serves: [`DEFAULT_SLOTS`], or the
+    /// one a seat's draft holds (the hybrid seat under `BLOOMERY_DRAFT=mtp`). A `--parallel` that
+    /// names more is the draft's own refusal.
+    fn default_slots() -> Result<usize, GateError> {
+        Ok(DEFAULT_SLOTS)
+    }
+
     /// The pool support of the body this seat loads.
     const UNHOSTED_POOL: UnhostedPool = UnhostedPool::NotCarried;
 
@@ -909,11 +916,12 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         None
     };
     // Under `--parallel auto` the placement is chosen at one slot, and the count below.
+    let default_slots = S::default_slots()?;
     let (slots, from) = slots_under(draft, a.parallel, || {
         if S::RESIDENT {
-            slots_given(a.parallel, a.ctx, a.auto.is_some(), DEFAULT_SLOTS)
+            slots_given(a.parallel, a.ctx, a.auto.is_some(), default_slots)
         } else {
-            Ok(slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?)
+            Ok(slots_of(a.parallel, a.ctx.is_some(), default_slots)?)
         }
     })?;
     // The DSpark draft's bytes, read from its file's header beside the target's, before the
