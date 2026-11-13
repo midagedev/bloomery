@@ -74,6 +74,7 @@ OUTSIDE_MODELS = {
     "deepseek-v2-lite-chat": "the first model, still gated, with no catalog row",
     "kimi-k3": "the kimik3 seat has no catalog row yet (a two-card, 594 GB load)",
     "kimi-k3.1-pro": "our own set, not uploaded yet; the kimik3 seat has no catalog row",
+    "k-exaone-2.0-750b-a37b": "our own set (29 shards, by -m); the flint seat has no catalog row for it yet",
 }
 # Catalog models with no row in docs/models.md, and why.
 UNDOCUMENTED = {
