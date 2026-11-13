@@ -278,6 +278,7 @@ gate-gpu-exaone-e2e	family	exaone-moe	e2e	graph_fault+attn_gqa+moe_route+prompt_
 gate-gpu-exaone-pp	family	exaone-moe	e2e	prompt_walks+attn_gqa+moe_route
 gate-gpu-exaone-verify	family	exaone-moe	draft	drafts_mtp+attn_gqa+moe_route
 gate-gpu-exaone-serve	family	exaone-moe	serve	seats_serve_engine+serve_toolcall
+gate-gpu-exaone-twocard	family	exaone-moe	tier	tier_legs+placement_sizing+drafts_mtp
 gate-kimi-k3-tokenizer	family	kimi-k3	tokenizer	tokenizer_jinja
 # dfl-wire
 gate-gpu-raon1-dflash	family	raon1	draft	drafts_dspark

@@ -544,8 +544,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               dials). The \
               channel has no authentication and belongs on a trusted network. The plan takes \
               each tier card from its node's census. \
-              Qwen3.8's, V4.1's, GLM's and Solar-Open2's loads open a tier on a node, which \
-              `tier_server` serves when built with that family's feature. \
+              Qwen3.8's, Kimi K3's, V4.1's, GLM's, Solar-Open2's and Flint's (K-EXAONE-2.0's too) \
+              loads open a tier on a node, which `tier_server` serves when built with that \
+              family's feature. \
               Read where a load takes its tier cards.",
         site: Site::Parsed {
             left: &[],

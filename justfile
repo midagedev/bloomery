@@ -4584,6 +4584,19 @@ time-gpu-exaone-verify:
 gate-gpu-exaone-serve:
     BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_exaone_serve && D=target/exaone-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_serve --dir $D'
 
+# The exaone-moe seat's expert tier card on the two cards (gate_exaone_serve's `--tier`, both cards in view): `--place bp` plans the
+# 3090 as the tier beside the A6000's stage and, at a card budget that leaves the stage a part of the fixture GGUF's routed experts,
+# holds experts on it (place_bp_follows_the_cards); then three servers answer the same two chats that share a prefix at that budget
+# under residency off, the plain and the drafted (BLOOMERY_DRAFT=mtp) ones on `--place bp`, a host-only one on plan (a): the
+# drafted ids are the plain tier load's bit for bit and the draft joins the second request one id fewer kept, the tier load's first id
+# of each request is the host-only load's and its host serves the picks of the experts left to it, fewer than the host-only load's by
+# the ratio of the two plans' host experts (mtp_survives_a_cut_on_the_tier). Real-only, as gate-gpu-exaone-serve (the profile's file is
+# the fixture GGUF itself). Both cards in view (BLOOMERY_CARD=both: both gate locks, alone in a batch); the same bins and features as
+# gate-gpu-exaone-serve. Wall: the run after a warm build took 25 s [measured once, 2026-11-14, A6000 + 3090]; the bound is 600 s.
+[group('solo')]
+gate-gpu-exaone-twocard:
+    BLOOMERY_MODEL=exaone-moe BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-twocard && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_exaone_serve && D=target/exaone-twocard-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 bash tools/gpu-gate.sh gate_exaone_serve --dir $D --tier'
+
 # --- end exaone-moe ---
 
 # --- kimik3-mla (Kimi K3's gated MLA layer) --------------------------------------------------------------------------------------------

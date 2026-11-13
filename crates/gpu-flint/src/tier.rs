@@ -17,6 +17,8 @@ use model::placement::accepts::Program;
 use model::r8file::R8Source;
 use models::{LayerSpec, Moe};
 
+use crate::body::PASS_ROWS;
+
 /// Maximum tokens per expert-tier launch; the placement reserves this capacity.
 pub const CHUNK: usize = place::TIER_CHUNK as usize;
 
@@ -25,7 +27,8 @@ struct Flint;
 impl LegFamily for Flint {
     const WHAT: &'static str = "flint tier";
     const WORD: &'static str = "flint";
-    const ROWS: usize = 1;
+    /// The rows in flight of a load: a verify pass's ([`PASS_ROWS`]), the page the body's open hangs.
+    const ROWS: usize = PASS_ROWS;
     const CHUNK: usize = CHUNK;
     type Inputs = PlanInputs;
 

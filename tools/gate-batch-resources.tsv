@@ -58,6 +58,10 @@
 #              host holds every routed expert once: UD-IQ1_S 213.99e9 B plus the Q6_K embedding 1.03e9 B, Mix-256G 221.28e9 B plus the Q3_K
 #              0.54e9 B, the larger 221.82e9 B, rounded up to 222e9 [derived from the meta tests' plan lines]; the three loads (`off`, `mid`
 #              on plan a, `mid` on plan bp) run one after the other.
+#   exaone-twocard --place bp (and the host-only arm on plan a) under gate_exaone_serve --tier's card budget (the stage's floor and 1.4e9 B): the
+#              profile's file is the fixture GGUF, 8,496,145,440 B, and the host's share is that less the stage's trunk and part of its
+#              routed experts and the tier card's, so the file bounds it [derived], read the plan lines of the first run and replace it.
+#              The three loads run one after the other.
 gate-gpu-flint-twocard	-	24468674560
 gate-gpu-ds41-callstream	-	237600000000
 gate-gpu-ds41-long	m	237600000000
@@ -120,3 +124,4 @@ gate-gpu-musespark-prefill	-	204000000000
 gate-gpu-musespark-load	-	204000000000
 gate-gpu-musespark-serve	-	203000000000
 gate-gpu-musespark-twocard	-	204000000000
+gate-gpu-exaone-twocard	-	8496145440

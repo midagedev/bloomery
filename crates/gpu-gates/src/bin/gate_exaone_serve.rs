@@ -4,11 +4,14 @@
 //! on the placed body, answers one chat request with its reasoning split at the model's own
 //! `<think>` span and keeps the prefix a request shares with the slot by the body's own rule.
 //!
-//!     gate_exaone_serve --dir <dir>
+//!     gate_exaone_serve --dir <dir> [--tier]
 //!
 //! The seat serves resident sequences, a select and a step each (`pass=turns`). Every
 //! server is `bloomery-serve --model flint -m <file>` beside this binary, `BLOOMERY_REF_MODEL`
 //! removed from its environment. Logs per server in `<dir>/<name>/` (`server.err`, the answer).
+//! `--tier` (`just gate-gpu-exaone-twocard`, both cards in view) runs the two tier clauses alone,
+//! `place_bp_follows_the_cards` and `mtp_survives_a_cut_on_the_tier`, and is refused by name
+//! where the census holds one card.
 //!
 //! The shared clauses are `shared/serve_gate.rs`'s: `plan_names_the_slots` (the body's
 //! `Sequences` are `app::arch::flint`'s resident ones, so `--parallel 2` is served, not refused),
@@ -23,6 +26,32 @@
 //! [`serve_gate::Cut::WhereItStands`]) and `saved_state_returns` (skipped by name while the seat
 //! prints no prompt-cache line).
 //!
+//! - `place_bp_follows_the_cards`: `--place bp --plan` where the census holds two cards exits 0 and
+//!   prints a `plan` record whose devices name the tier card (`tier0`), or, where the stage holds
+//!   every routed expert (the fixture), exits non-zero naming the tier card that would hold none
+//!   ([`EMPTY_TIER`]) with no `plan` record; where it holds one card it exits non-zero, its stderr
+//!   names the place word the placement refuses, and no `plan` record is printed. On two cards
+//!   the clause `place_bp_holds_tier_experts` follows it: the plan at a card budget of the stage's
+//!   floor and [`HOST_EXTRA`] exits 0, names the tier card, holds experts on the stage card, and
+//!   its stage and host experts leave the rest of plan (a)'s at that budget to the tier card.
+//!   FAIL-first: a seat whose rule serves no tier card (`TierRule::UNTIERED`) refuses `bp` on two
+//!   cards with "the flint body serves 0 at most" and no tier card, and both clauses are red.
+//! - `mtp_survives_a_cut_on_the_tier` (`--tier`, both cards in view): the clause below on
+//!   `--place bp`, under the card budget of the stage's floor and [`HOST_EXTRA`] (a part of the
+//!   routed experts on the stage card, the tier card holding what it has room for, the host the
+//!   rest), residency `off`, the drafted width fixed: the plain and the drafted `bp` servers and
+//!   a reference on plan (a) at the same budget. The `bp` plans name the tier card and the
+//!   reference's none; the drafted `bp` load's ids are the plain `bp` load's bit for bit (the
+//!   draft's verify pass of two rows crosses the tier's handoff as the step's one row does),
+//!   the draft proposes in both requests and joins the second at the kept position; the plain
+//!   `bp` load's first id of each request is the reference's, and the routed picks its host
+//!   reads through the file's mapping fall against the reference's by the ratio of the plans'
+//!   host experts (within [`HOST_SLACK`]): the experts the tier plan takes off the host are
+//!   served by the cards. The tier card's arithmetic is the card's, the reference's the host's,
+//!   so the ids are not held further. FAIL-first, shown: a Flint tier whose page rows differ from
+//!   the body's open (`LegFamily::ROWS` 1 against `PASS_ROWS` 2) refuses the `bp` load by name
+//!   (`the node tier's shape is not this file's`), so the server never listens and the clause is
+//!   red.
 //! - `tools_request_is_served`: a chat request that carries `tools` is answered with a completion
 //!   (HTTP 200, `choices`), never an error: the file's own template renders the tool-declare
 //!   section (`<tool_declare|>` and the `<tool>` JSON blocks), and the description row binds the
@@ -93,7 +122,7 @@ mod gate {
         ChatReply, SeatGate, Served, answered, check, completion, curl, draft_counts, greedy_chat,
         ids_of, json_of, server_log, stop_of,
     };
-    use bloomery_gpu_gates::{GateError, ref_model_path};
+    use bloomery_gpu_gates::{GateError, checks_failed, gpu_census, ref_model_path};
     use gguf::Split;
     use serde_json::{Value, json};
 
@@ -183,15 +212,16 @@ mod gate {
     const MTP_N: usize = 24;
 
     /// A server of the seat on the profile's file in `<dir>/<name>/` at [`CTX`], `BLOOMERY_DRAFT`
-    /// set to `draft` when given, `--parallel parallel`, each of `levers` set beside them: it and
-    /// its stderr's log, or the error of a server that exited before it listened (its log in the
-    /// text).
+    /// set to `draft` when given, `--parallel parallel`, `--place` `place` when given, each of
+    /// `levers` set beside them: it and its stderr's log, or the error of a server that exited
+    /// before it listened (its log in the text).
     fn mtp_server(
         dir: &Path,
         name: &str,
         draft: Option<&str>,
         parallel: u32,
         levers: &[(&str, &str)],
+        place: Option<&str>,
     ) -> Result<(Served, String, std::path::PathBuf), GateError> {
         let d = dir.join(name);
         std::fs::create_dir_all(&d)?;
@@ -219,6 +249,9 @@ mod gate {
             .iter()
             .map(|a| (*a).to_owned()),
         );
+        if let Some(word) = place {
+            all.extend(["--place".to_owned(), word.to_owned()]);
+        }
         let all: Vec<&str> = all.iter().map(String::as_str).collect();
         let mut s = Served::spawn_cmd(cmd, &all, &d)?;
         let err_log = d.join("server.err");
@@ -233,7 +266,7 @@ mod gate {
         let ids: Vec<u32> = (1..=MTP_IDS).collect();
         let mut answers = Vec::new();
         for (name, draft) in [("mtp-off", None), ("mtp-on", Some("mtp"))] {
-            let (mut s, addr, err_log) = match mtp_server(dir, name, draft, 1, &[]) {
+            let (mut s, addr, err_log) = match mtp_server(dir, name, draft, 1, &[], None) {
                 Ok(served) => served,
                 Err(e) => {
                     println!("{CLAUSE}: the {name} server never listened: {e}");
@@ -267,7 +300,7 @@ mod gate {
         );
         check(&mut ok, CLAUSE, same && drafted);
         // Two slots beside the draft: refused by name before the load, so it never listens.
-        let refused = match mtp_server(dir, "mtp-two", Some("mtp"), 2, &[]) {
+        let refused = match mtp_server(dir, "mtp-two", Some("mtp"), 2, &[], None) {
             Ok((mut s, ..)) => {
                 let _ = s.stop();
                 println!("{CLAUSE}: --parallel 2 under BLOOMERY_DRAFT=mtp listened");
@@ -308,12 +341,18 @@ mod gate {
     // first gaps, which the clause prints.
     const NEAR_TIE: f64 = 1.0;
 
-    /// What one `--plan` of a host-tier load holds: the budget it took and its routed experts on
-    /// the card and on the host.
+    /// The factor the host's picks may exceed the ratio of its experts' counts by between two
+    /// plans of one prompt: the router's picks follow the ids' hotness, not their count.
+    const HOST_SLACK: u64 = 2;
+
+    /// What one `--plan` of a host-tier load holds: the budget it took, its routed experts on the
+    /// stage card and on the host, and whether it names an expert tier card (`tier0` among its
+    /// devices).
     struct HostPlan {
         budget: u64,
         card: u64,
         host: u64,
+        tiered: bool,
     }
 
     /// The floor a budget refusal names: `... holds <budget> of the <floor> bytes that takes: ...`.
@@ -326,13 +365,15 @@ mod gate {
     }
 
     /// The `--plan` of the load (the drafted one when `draft`) under a card budget of its own
-    /// floor and [`HOST_EXTRA`]: the floor is the one a budget below it names, so a plain and a
-    /// drafted load hold the same experts on the card (the draft's bytes are in the floor).
+    /// floor and [`HOST_EXTRA`], on `--place` `place` when given: the floor is the one a budget
+    /// below it names, so a plain and a drafted load hold the same experts on the card (the
+    /// draft's bytes are in the floor).
     fn host_plan(
         dir: &Path,
         name: &str,
         draft: bool,
         residency: Option<&str>,
+        place: Option<&str>,
     ) -> Result<HostPlan, GateError> {
         let seat = SeatGate {
             model: "flint",
@@ -340,7 +381,10 @@ mod gate {
         };
         let file = ref_model_path()?;
         let ctx = CTX.to_string();
-        let args = ["--port", "0", "--ctx", ctx.as_str(), "--parallel", "1"];
+        let mut args = vec!["--port", "0", "--ctx", ctx.as_str(), "--parallel", "1"];
+        if let Some(word) = place {
+            args.extend(["--place", word]);
+        }
         let draft = draft.then_some("mtp");
         let (status, _, text) = seat.plan_under(
             (dir, &format!("{name}-floor")),
@@ -376,6 +420,7 @@ mod gate {
             budget,
             card: plan.u64("card_experts")?,
             host: plan.u64("host_experts")?,
+            tiered: plan.csv("devices")?.iter().any(|d| d.starts_with("tier0")),
         })
     }
 
@@ -412,6 +457,143 @@ mod gate {
         })
     }
 
+    /// What one server of [`mtp_survives_a_cut_on_the_host_tier`]'s family answered: its plan,
+    /// its two chats and the draft's join records (the prompt call's start position and why the
+    /// draft skipped it, `none` when it joined).
+    struct Arm {
+        plan: HostPlan,
+        turns: Vec<Turn>,
+        joins: Vec<(u64, String)>,
+        /// The routed picks the server's host services saw over both chats and, of them, those
+        /// it served itself, read through the model file's mapping (the tier census).
+        picks: (u64, u64),
+    }
+
+    /// One server of the family in `<dir>/<name>/`: the plan at a card budget of its own floor and
+    /// [`HOST_EXTRA`] (`--place` `place`, the common rule's when `None`), the draft `draft`, the
+    /// residency `residency` (`None`: the word the plan resolves) and, for a drafted load at the
+    /// `fixed` width, `BLOOMERY_MTP_WIDTH=fixed`, which every pass verifying a whole proposal
+    /// needs so a request's draft counts do not follow the width chooser's reading of the pass
+    /// wall; then the two chats of [`USERS`]. `None` where the server never listened or a chat
+    /// failed (printed under `clause`).
+    fn arm(
+        dir: &Path,
+        (clause, name): (&str, &str),
+        (draft, residency, fixed): (Option<&str>, Option<&str>, bool),
+        place: Option<&str>,
+    ) -> Result<Option<Arm>, GateError> {
+        let plan = host_plan(
+            dir,
+            &format!("{name}-plan"),
+            draft.is_some(),
+            residency,
+            place,
+        )?;
+        println!(
+            "{clause} {name}: card budget {} B, routed experts {} on the stage card and {} on the \
+             host, an expert tier card {}",
+            plan.budget, plan.card, plan.host, plan.tiered
+        );
+        let budget = plan.budget.to_string();
+        let mut levers = vec![(bloomery_levers::CARD_BUDGET, budget.as_str())];
+        if let Some(word) = residency {
+            levers.push((bloomery_levers::RESIDENCY, word));
+        }
+        if draft.is_some() && fixed {
+            levers.push((bloomery_levers::MTP_WIDTH, "fixed"));
+        }
+        let (mut s, addr, err_log) = match mtp_server(dir, name, draft, 1, &levers, place) {
+            Ok(served) => served,
+            Err(e) => {
+                println!("{clause}: the {name} server never listened: {e}");
+                return Ok(None);
+            }
+        };
+        let mut turns = Vec::new();
+        for (i, user) in USERS.iter().enumerate() {
+            let file = dir.join(name).join(format!("chat{i}.json"));
+            match chat_turn(&addr, user, &file) {
+                Ok(turn) => turns.push(turn),
+                Err(e) => {
+                    println!("{clause} {name}: a chat failed: {e}; {}", s.stop()?);
+                    return Ok(None);
+                }
+            }
+        }
+        let log = server_log(&err_log, &[&record::MTP_PROMPT, &record::TIER_CENSUS])?;
+        let mut joins: Vec<(u64, String)> = Vec::new();
+        for r in log.all(&record::MTP_PROMPT)? {
+            joins.push((r.u64("start")?, r.text("skipped")?.to_owned()));
+        }
+        let mut picks = (0, 0);
+        for r in log.all(&record::TIER_CENSUS)? {
+            picks.0 += r.u64("picks")?;
+            picks.1 += r.u64("file")?;
+        }
+        println!(
+            "{clause} {name}: ids {:?} then {:?}; drafts proposed/kept {:?} then {:?}; \
+             positions kept {} then {}; mtp prompt records {joins:?}; {}",
+            turns[0].reply.ids,
+            turns[1].reply.ids,
+            turns[0].draft,
+            turns[1].draft,
+            turns[0].kept,
+            turns[1].kept,
+            s.stop()?
+        );
+        Ok(Some(Arm {
+            plan,
+            turns,
+            joins,
+            picks,
+        }))
+    }
+
+    /// The drafted load `on` beside the plain load `off` of one placement, held to the clause's
+    /// rules: the same plan, the drafted requests proposing at the fixed width and the plain
+    /// load's never, the second request keeping a shared prefix one id fewer under the draft, the
+    /// draft joining at the kept position, and the ids the plain load's (bit for bit under
+    /// residency `off`, within a near tie under the plan's own). `placed` is the caller's verdict
+    /// on the plan's shape and the words that name it.
+    fn drafted_follows_plain(
+        clause: &str,
+        (residency, fixed): (Option<&str>, bool),
+        (off, on): (&Arm, &Arm),
+        placed: (bool, &str),
+    ) -> bool {
+        let same_plan = (off.plan.card, off.plan.host, off.plan.tiered)
+            == (on.plan.card, on.plan.host, on.plan.tiered);
+        let both_draft = (!fixed || on.turns.iter().all(|t| t.draft.0 > 0))
+            && off.turns.iter().all(|t| t.draft == (0, 0));
+        let kept = off.turns[1].kept > 0 && on.turns[1].kept > 0;
+        // One id fewer kept than the plain load keeps: the prompt call feeds the id the draft's
+        // entry at the first fed position reads the hidden row of.
+        let one_more = on.turns[1].kept + 1 == off.turns[1].kept;
+        let joined =
+            on.joins.len() == 1 && on.joins[0].1 == "none" && on.joins[0].0 == on.turns[1].kept;
+        let mut ids_ok = true;
+        for i in 0..USERS.len() {
+            let (plain, drafted) = (&off.turns[i].reply, &on.turns[i].reply);
+            let agree = plain.ids.len().min(drafted.ids.len());
+            let (upto, gap, near) = plain.follows(&drafted.ids, agree, NEAR_TIE);
+            let same = plain.ids == drafted.ids && !plain.ids.is_empty();
+            println!(
+                "{clause} request {i}: the drafted load's ids are the plain load's {same}; they \
+                 agree to step {upto} of {agree}, the runner-up gap there {gap:?} (a near tie is \
+                 below {NEAR_TIE}) {near}"
+            );
+            ids_ok &= if residency == Some("off") { same } else { near };
+        }
+        println!(
+            "{clause}: {} {}, the same in both loads {same_plan}; the drafted requests proposed \
+             (held at the fixed width), the plain load's none {both_draft}; the second request \
+             kept a shared prefix {kept}, one id fewer under the draft {one_more}; the draft \
+             joined at the kept position, skipped by no reason {joined}; the ids {ids_ok}",
+            placed.1, placed.0
+        );
+        placed.0 && same_plan && both_draft && kept && one_more && joined && ids_ok
+    }
+
     /// `mtp_survives_a_cut_on_the_host_tier` (the module header) under `residency` (`None`: the
     /// word the plan resolves), named `clause`; the drafted load's width is `fixed` or the
     /// default chooser's, under which a request's draft counts follow the pass wall and are not
@@ -426,93 +608,150 @@ mod gate {
         let mut runs = Vec::new();
         for (name, draft) in [("off", None), ("mtp", Some("mtp"))] {
             let name = format!("{clause}-{name}");
-            let plan = host_plan(dir, &format!("{name}-plan"), draft.is_some(), residency)?;
-            println!(
-                "{clause} {name}: card budget {} B, routed experts {} on the card and {} on the host",
-                plan.budget, plan.card, plan.host
-            );
-            let budget = plan.budget.to_string();
-            let mut levers = vec![(bloomery_levers::CARD_BUDGET, budget.as_str())];
-            if let Some(word) = residency {
-                levers.push((bloomery_levers::RESIDENCY, word));
-            }
-            // Every pass verifies a whole proposal, so a request's draft counts do not follow the
-            // width chooser's reading of the pass wall.
-            if draft.is_some() && fixed {
-                levers.push((bloomery_levers::MTP_WIDTH, "fixed"));
-            }
-            let (mut s, addr, err_log) = match mtp_server(dir, &name, draft, 1, &levers) {
-                Ok(served) => served,
-                Err(e) => {
-                    println!("{clause}: the {name} server never listened: {e}");
+            match arm(dir, (clause, &name), (draft, residency, fixed), None)? {
+                Some(a) => runs.push(a),
+                None => {
                     check(&mut ok, clause, false);
                     return Ok(ok);
                 }
-            };
-            let mut turns = Vec::new();
-            for (i, user) in USERS.iter().enumerate() {
-                let file = dir.join(&name).join(format!("chat{i}.json"));
-                match chat_turn(&addr, user, &file) {
-                    Ok(turn) => turns.push(turn),
-                    Err(e) => {
-                        println!("{clause} {name}: a chat failed: {e}; {}", s.stop()?);
-                        check(&mut ok, clause, false);
-                        return Ok(ok);
-                    }
-                }
             }
-            let log = server_log(&err_log, &[&record::MTP_PROMPT])?;
-            let mut joins: Vec<(u64, String)> = Vec::new();
-            for r in log.all(&record::MTP_PROMPT)? {
-                joins.push((r.u64("start")?, r.text("skipped")?.to_owned()));
-            }
-            println!(
-                "{clause} {name}: ids {:?} then {:?}; drafts proposed/kept {:?} then {:?}; \
-                 positions kept {} then {}; mtp prompt records {joins:?}; {}",
-                turns[0].reply.ids,
-                turns[1].reply.ids,
-                turns[0].draft,
-                turns[1].draft,
-                turns[0].kept,
-                turns[1].kept,
-                s.stop()?
-            );
-            runs.push((plan, turns, joins));
         }
         let (off, on) = (&runs[0], &runs[1]);
-        let hosted = off.0.card > 0 && off.0.host > 0;
-        let same_plan = (off.0.card, off.0.host) == (on.0.card, on.0.host);
-        let both_draft = (!fixed || on.1.iter().all(|t| t.draft.0 > 0))
-            && off.1.iter().all(|t| t.draft == (0, 0));
-        let kept = off.1[1].kept > 0 && on.1[1].kept > 0;
-        // One id fewer kept than the plain load keeps: the prompt call feeds the id the draft's
-        // entry at the first fed position reads the hidden row of.
-        let one_more = on.1[1].kept + 1 == off.1[1].kept;
-        let joined = on.2.len() == 1 && on.2[0].1 == "none" && on.2[0].0 == on.1[1].kept;
+        let hosted = off.plan.card > 0 && off.plan.host > 0;
+        let verdict = drafted_follows_plain(
+            clause,
+            (residency, fixed),
+            (off, on),
+            (hosted, "the experts are on the card and the host"),
+        );
+        check(&mut ok, clause, verdict);
+        Ok(ok)
+    }
+
+    /// `mtp_survives_a_cut_on_the_tier` (the module header): the three servers of [`arm`] under
+    /// residency `off` at the fixed width, the reference on plan (a) and the plain and drafted
+    /// ones on `--place bp`.
+    fn mtp_survives_a_cut_on_the_tier(dir: &Path) -> Result<bool, GateError> {
+        const CLAUSE: &str = "mtp_survives_a_cut_on_the_tier";
+        const FIXED: (Option<&str>, bool) = (Some("off"), true);
+        let mut ok = true;
+        let mut runs = Vec::new();
+        for (name, draft, place) in [
+            ("host", None, None),
+            ("off", None, Some("bp")),
+            ("mtp", Some("mtp"), Some("bp")),
+        ] {
+            let name = format!("{CLAUSE}-{name}");
+            match arm(dir, (CLAUSE, &name), (draft, FIXED.0, FIXED.1), place)? {
+                Some(a) => runs.push(a),
+                None => {
+                    check(&mut ok, CLAUSE, false);
+                    return Ok(ok);
+                }
+            }
+        }
+        let (host, off, on) = (&runs[0], &runs[1], &runs[2]);
+        let tiered = off.plan.tiered && on.plan.tiered && !host.plan.tiered && off.plan.card > 0;
+        let drafted = drafted_follows_plain(
+            CLAUSE,
+            FIXED,
+            (off, on),
+            (
+                tiered,
+                "the bp plans name an expert tier card beside the stage's experts, the reference's none",
+            ),
+        );
+        // The tier card's experts are the card's arithmetic where the reference's are the host's, and
+        // two arithmetics part at a step a flat-logit fixture makes arbitrary (so does a plan (a)
+        // with more experts on the card against this reference), so the ids are held to the first
+        // id of each request, and the experts to the host's share of the picks: the tier plan
+        // leaves the host `off.plan.host` experts where the reference leaves it `host.plan.host`,
+        // so the picks the host reads through the file's mapping fall by that ratio, within
+        // [`HOST_SLACK`] for the router's skew.
         let mut ids_ok = true;
         for i in 0..USERS.len() {
-            let (plain, drafted) = (&off.1[i].reply, &on.1[i].reply);
-            let agree = plain.ids.len().min(drafted.ids.len());
-            let (upto, gap, near) = plain.follows(&drafted.ids, agree, NEAR_TIE);
-            let same = plain.ids == drafted.ids && !plain.ids.is_empty();
+            let (tier, reference) = (&off.turns[i].reply, &host.turns[i].reply);
+            let agree = tier.ids.len().min(reference.ids.len());
+            let (upto, gap, near) = tier.follows(&reference.ids, agree, NEAR_TIE);
             println!(
-                "{clause} request {i}: the drafted load's ids are the plain load's {same}; they \
-                 agree to step {upto} of {agree}, the runner-up gap there {gap:?} (a near tie is \
-                 below {NEAR_TIE}) {near}"
+                "{CLAUSE} request {i}: the tier load's ids against the host-only load's agree to \
+                 step {upto} of {agree}, the runner-up gap there {gap:?} (a near tie is below \
+                 {NEAR_TIE}) {near}"
             );
-            ids_ok &= if residency == Some("off") { same } else { near };
+            ids_ok &= upto > 0;
         }
+        let share = off.picks.1 * host.plan.host < HOST_SLACK * host.picks.1 * off.plan.host;
         println!(
-            "{clause}: the experts are on the card and the host {hosted}, the same in both loads \
-             {same_plan}; the drafted requests proposed (held at the fixed width), the plain \
-             load's none {both_draft}; the second request kept a shared prefix {kept}, one id fewer under the draft {one_more}; \
-             the draft joined at the kept position, skipped by no reason {joined}; the ids {ids_ok}"
+            "{CLAUSE}: the host served {} of {} picks on the tier plan ({} experts of the host's) \
+             and {} of {} on the reference ({}) {share}",
+            off.picks.1, off.picks.0, off.plan.host, host.picks.1, host.picks.0, host.plan.host
         );
-        check(
-            &mut ok,
-            clause,
-            hosted && same_plan && both_draft && kept && one_more && joined && ids_ok,
+        ids_ok &= share && off.picks.0 > 0 && host.picks.0 > 0;
+        check(&mut ok, CLAUSE, drafted && ids_ok);
+        Ok(ok)
+    }
+
+    /// What the plan of a tier card that the cards before it leave no expert is refused with:
+    /// `--place bp` on a fixture whose stage holds every routed expert.
+    const EMPTY_TIER: &str = "holds no expert: the cards before it hold every routed expert";
+
+    /// What the placement's refusal of `--place bp` on a census of one card names.
+    const PLACED: &str = "--place bp";
+
+    /// `place_bp_follows_the_cards` (the module header); `two` whether the census holds two cards.
+    fn place_bp_follows_the_cards(dir: &Path, two: bool) -> Result<bool, GateError> {
+        const CLAUSE: &str = "place_bp_follows_the_cards";
+        let mut ok = true;
+        let seat = SeatGate {
+            model: "flint",
+            kinds: record::BLOOMERY_SERVE_HYBRID,
+        };
+        let file = ref_model_path()?;
+        let ctx = CTX.to_string();
+        let args = ["--ctx", ctx.as_str(), "--place", "bp"];
+        let (status, log, text) = seat.plan(dir, "place-bp", &file, &args)?;
+        let plan = log.first(&record::PLAN)?;
+        let follows = if two {
+            let devices: Vec<String> = match &plan {
+                Some(p) => p.csv("devices")?.iter().map(|d| (*d).to_owned()).collect(),
+                None => Vec::new(),
+            };
+            let tiered = devices.iter().any(|d| d.starts_with("tier0"));
+            let empty = !status.success() && text.contains(EMPTY_TIER) && plan.is_none();
+            println!(
+                "place-bp on two cards: exit 0 {}; plan devices {devices:?}, a tier card {tiered}; \
+                 refused as a tier with no expert {empty}",
+                status.success()
+            );
+            (status.success() && tiered) || empty
+        } else {
+            let named = text.contains(PLACED);
+            println!(
+                "place-bp on one card: exit non-zero {}; names {PLACED:?} {named}; no plan record {}",
+                !status.success(),
+                plan.is_none()
+            );
+            !status.success() && named && plan.is_none()
+        };
+        if !follows {
+            println!("place-bp stderr:\n{text}");
+        }
+        check(&mut ok, CLAUSE, follows);
+        if !two {
+            return Ok(ok);
+        }
+        // The fixture's stage holds every expert, so the plan above is the empty tier's refusal;
+        // a card budget of the stage's floor and HOST_EXTRA leaves the stage a part and gives
+        // the tier card the rest it has room for.
+        let tier = host_plan(dir, "place-bp-budget", false, Some("off"), Some("bp"))?;
+        let all = host_plan(dir, "place-a-budget", false, Some("off"), Some("a"))?;
+        println!(
+            "place-bp at a card budget of {} B: {} routed experts on the stage card, {} on the \
+             host, an expert tier card {}; plan (a) at {} B: {} and {} on the host",
+            tier.budget, tier.card, tier.host, tier.tiered, all.budget, all.card, all.host
         );
+        let held = tier.tiered && tier.card > 0 && tier.card + tier.host < all.card + all.host;
+        check(&mut ok, "place_bp_holds_tier_experts", held);
         Ok(ok)
     }
 
@@ -534,7 +773,55 @@ mod gate {
         Ok(ok)
     }
 
+    /// The gate's flags: `--dir <dir>` and `--tier`.
+    fn args() -> Result<(std::path::PathBuf, bool), GateError> {
+        const USAGE: &str = "usage: gate_exaone_serve --dir <dir> [--tier]";
+        let (mut dir, mut tier) = (None, false);
+        let mut it = std::env::args().skip(1);
+        while let Some(flag) = it.next() {
+            match flag.as_str() {
+                "--dir" => {
+                    let v = it
+                        .next()
+                        .ok_or_else(|| format!("{flag} needs a value: {USAGE}"))?;
+                    dir = Some(std::path::PathBuf::from(v));
+                }
+                "--tier" => tier = true,
+                other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
+            }
+        }
+        Ok((dir.ok_or(USAGE)?, tier))
+    }
+
+    /// The `--tier` run: the two tier clauses alone, on a census of two cards.
+    fn tier_run(dir: &Path) -> Result<(), GateError> {
+        if gpu_census::census()?.len() < 2 {
+            return Err(
+                "gate_exaone_serve --tier: the census holds one card, and the tier clauses plan \
+                 `--place bp` on two (run it with both cards in view: just gate-gpu-exaone-twocard)"
+                    .into(),
+            );
+        }
+        let mut ok = place_bp_follows_the_cards(dir, true)?;
+        ok &= mtp_survives_a_cut_on_the_tier(dir)?;
+        if !ok {
+            return Err(checks_failed());
+        }
+        println!(
+            "PASSED: gate_exaone_serve --tier the seat plans an expert tier card where two cards are \
+             in view and holds experts on it, and serves a load of it (the stage's experts, the tier \
+             card's and the host's) whose drafted ids are the plain load's and whose host serves \
+             the picks of the experts left to it (mtp_survives_a_cut_on_the_tier)"
+        );
+        Ok(())
+    }
+
     pub fn run() -> Result<(), GateError> {
+        let (dir, tier) = args()?;
+        std::fs::create_dir_all(&dir)?;
+        if tier {
+            return tier_run(&dir);
+        }
         let file = ref_model_path()?;
         let split = Split::open(&file).map_err(|e| format!("open {}: {e}", file.display()))?;
         let layers = u64::try_from(
@@ -564,9 +851,9 @@ mod gate {
             // (`app::arch::flint`'s `Batch::cut`, the rollback's own rule).
             cut: serve_gate::Cut::WhereItStands,
         };
-        let dir = serve_gate::dir_of(&c)?;
-        std::fs::create_dir_all(&dir)?;
+        let two = gpu_census::census()?.len() >= 2;
         let mut ok = serve_gate::plan_names_the_slots(&c, &dir)?;
+        ok &= place_bp_follows_the_cards(&dir, two)?;
         ok &= serve_gate::served_with(&c, &dir, ASK)?;
         ok &= tools_request_is_served(&dir)?;
         ok &= mtp_serves_the_plain_ids(&dir)?;
