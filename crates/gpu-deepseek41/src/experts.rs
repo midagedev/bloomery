@@ -183,7 +183,7 @@ mod experts_kernels {
             32 * d_u.len() >= n_rows * k,
             x.len() >= k,
             h.len() >= n_rows,
-            act <= 2
+            act <= 4
         )
     )]
     pub fn ds41_shexp_gate_up(
@@ -242,7 +242,7 @@ mod experts_kernels {
             w_u.len() >= n_rows * 44 * n_sb,
             x.len() >= 256 * n_sb,
             h.len() >= n_rows,
-            act <= 2
+            act <= 4
         )
     )]
     pub fn ds41_shexp_gate_up_q5k(
@@ -302,7 +302,7 @@ mod experts_kernels {
             h.len() >= m_cols * n_rows,
             m_cols >= 1,
             m_cols <= 8,
-            act <= 2
+            act <= 4
         )
     )]
     pub fn ds41_shexp_gate_up_q8_0_mcol(
