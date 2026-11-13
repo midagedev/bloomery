@@ -1,0 +1,21 @@
+# K-EXAONE-2.0 decode with the DGX Spark as a TCP expert tier node (main 9a582d1ca: the Flint seat's tiers and the node
+# prompt batch). The plan (--place bp, the A6000 alone visible, BLOOMERY_TIER_NODES=the Spark, BLOOMERY_CARD_BUDGET=100G,
+# ctx 8192) prints card_experts=2319, host_experts=9513 (129.1 GB) [measured, the plan line], so the node holds 7,624 experts
+# [derived: 19,456 - 2,319 - 9,513] and the host serves 9,513 of the 17,137 it served at a: 55.5 % [derived].
+# Paper (~/.cache/bloomery/specs/exnight/exaone-spark-model.py, the scope round's): at a the step is front 16.0 + host 88.1 +
+# PCIe 1.7 ms; per layer host leg 1.159 ms at a, 0.64 ms at 55.5 % [derived]; the node leg 0.42..0.56 ms a layer (V4.1's
+# measured round trip 175..240 us plus GB10 reads of its share at 209 GB/s) [derived]. Overlapped: per layer 0.211 + max(0.64,
+# 0.56) + 0.022 = 0.87 ms -> 66..72 ms a step, 13.9..15.2 tok/s [derived]; serial: 0.211 + 0.64 + 0.56 + 0.022 = 1.43 ms ->
+# ~9.4 tok/s, no gain. Resource timeline: host CPU (its share of the routed reads) and the node (link + GB10 reads) are the two
+# legs; the card front and PCIe are under 0.25 ms a layer. The one open term is whether the node leg hides under the host's.
+# Compared with exaone-speed-1114's I1 (a, the same file and binary, off 9.64..9.94 tok/s, mtp 13.58..13.83) across runs.
+kind: baseline
+question: what decode rate does K-EXAONE-2.0 read with its routed experts split between the host and the Spark node tier, draft off and on
+term: tg tok/s of the off arm @ n=127, prompt 4096 corpus-prose ids, ctx 8192 one slot, A6000 + host + the Spark over TCP
+unit: tok/s
+predict: 12.5..15.5
+condition: main 9a582d1ca's bloomery-serve (tree arm), BLOOMERY_MODEL=exaone-moe, BLOOMERY_REF_MODEL the published first shard, DEPTH_SERVE_PLACE=bp with the A6000 the one visible card, BLOOMERY_AB_ROUNDS=3, DEPTH_SERVE_CTX=8192, DEPTH_SERVE_N=128; arms env=BLOOMERY_TIER_LINK=tcp,BLOOMERY_TIER_NODES=10.41.0.2:9001,BLOOMERY_CARD_BUDGET=100G,BLOOMERY_DRAFT=off|mtp:bloomery:4096; the Spark's tier_server (flint feature, main 3547694da) on its own copy of the file
+reason: the overlapped and serial ends of the model above; the band is the overlapped end with the node leg's two readings
+decide-in: the morning table's a+Spark rows; the next step is the residency of the node's share (hot-first pick) and the MTP pass on the node
+decide-below: under 12.5: the node leg does not hide; read the tier records (the node's per-layer wait) before any other lever
+decide-above: over 15.5: read the plan line and the witness blocks before crediting
