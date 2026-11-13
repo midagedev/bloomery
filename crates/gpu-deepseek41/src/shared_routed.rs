@@ -23,7 +23,9 @@
 //! sum (`ds41_ffn_card_acc_8_tier`, the card sum's order with the tier's slots in it) plus the shadow's base, and adds
 //! the host's sum. A unit of the batch does the same through [`Routed::download_rows`], [`Routed::shadow_rows`] and
 //! [`Routed::join_rows`] (the host leg's [`bloomery_gpu::host::BatchLeg::join_tiered`] hands the tier's rows to the
-//! join, then [`Routed::back_rows`]).
+//! join, then [`Routed::back_rows`]). A tier on a node runs no prompt batch of its own: for the batch it holds no
+//! expert ([`Routed::batch_tier_k`], read once a group by [`Routed::read_batch_tiers`]), its experts are the host's,
+//! and the layer runs as one with no tier; the step keeps the map's own count and the node serves it.
 //!
 //! What a family fixes is its router instance, its [`CardFamily`] (stack names, counts), the loaded arithmetic
 //! facts, and its description: the routed and shared activations per layer ([`rule_of`], [`Routed::acts_at`]),
@@ -975,6 +977,27 @@ impl<R: RouterEntry> Routed<R> {
         self.card.tier_k(l)
     }
 
+    /// The experts of layer `l` the expert tier holds for a prompt batch:
+    /// [`Routed::tier_k`] unless the tier is on a node that runs no batch leg,
+    /// whose experts the batch's host serves, so 0
+    /// ([`Routed::read_batch_tiers`]).
+    #[must_use]
+    pub fn batch_tier_k(&self, l: usize) -> usize {
+        self.card.batch_tier_k(l)
+    }
+
+    /// Read the prompt batch's view of the expert tier from `hybrid`'s slot
+    /// map ([`bloomery_gpu::host::HostTier::batch_slots`]): the batch's
+    /// download, card route and join decide a tier layer by it
+    /// ([`Routed::batch_tier_k`]), the step by the map's own. Once a group,
+    /// before its walk; nothing on a load with no tier.
+    pub fn read_batch_tiers(&mut self, hybrid: &Hybrid<HostRun>) -> Result<(), GpuError> {
+        if !self.card.any_tier() {
+            return Ok(());
+        }
+        self.card.read_batch_tiers(&hybrid.batch_slots()?)
+    }
+
     /// The stage card's side of the tier layers, on a load whose slot map names
     /// an expert tier card.
     #[must_use]
@@ -1427,9 +1450,10 @@ impl<R: RouterEntry> Routed<R> {
     }
 
     /// [`Routed::download`] of the unit's `m` rows for a load that may hang an
-    /// expert tier card: a layer the tier holds experts of also carries each
-    /// slot's tier place, which the tier's service reads
-    /// ([`Hybrid::enqueue_download_tiered`]).
+    /// expert tier card: a layer the tier holds experts of for the batch
+    /// ([`Routed::batch_tier_k`]) also carries each slot's tier place, which
+    /// the tier's service reads ([`Hybrid::enqueue_download_tiered`]); a tier on
+    /// a node with no batch leg holds none, and its experts are the host's.
     pub fn download_rows(
         &mut self,
         gpu: &Gpu,
@@ -1438,7 +1462,7 @@ impl<R: RouterEntry> Routed<R> {
     ) -> Result<(), GpuError> {
         let stream = gpu.stream();
         let l = key.layer;
-        let Some((side, _)) = self.tier.as_ref().filter(|(side, _)| side.k(l) > 0) else {
+        let Some((side, _)) = self.tier.as_ref().filter(|_| self.card.batch_tier_k(l) > 0) else {
             return self.download(hybrid, stream, key);
         };
         let b = self.batch.as_mut().ok_or_else(no_batch)?;
@@ -1537,9 +1561,10 @@ impl<R: RouterEntry> Routed<R> {
     /// GEMM batch a landing batch of the ring, each behind its own batch's
     /// copies, so a batch computes while the next lands
     /// ([`RouteBlock::card_rows_ring`]); the host's sum leaves them out. On a
-    /// layer the expert tier holds experts of the route sums nothing: the
-    /// stage card's and the streamed slots' rows and the stream's union
-    /// places stay for [`Routed::join_rows`].
+    /// layer the expert tier holds experts of for the batch
+    /// ([`Routed::batch_tier_k`]) the route sums nothing: the stage card's and
+    /// the streamed slots' rows and the stream's union places stay for
+    /// [`Routed::join_rows`].
     pub fn card_rows(
         &mut self,
         (gpu, w): (&Gpu, &Weights),
@@ -1572,7 +1597,7 @@ impl<R: RouterEntry> Routed<R> {
             )?,
             None => route.card_rows((gpu, w), (card, cb), (l, m), (&b.x1s, rule), rows)?,
         }
-        if card.tier_k(l) == 0 {
+        if card.batch_tier_k(l) == 0 {
             return Ok(());
         }
         // The join reads this unit's weights and tier places after the next unit's front has routed: keep them.
@@ -1590,8 +1615,8 @@ impl<R: RouterEntry> Routed<R> {
     /// [`Routed::back_rows`] reads. `streamed` is the experts the unit's card route ran over the expert stream's ring
     /// ([`bloomery_gpu::host::prompt_stream::PromptStream::unit_join`], 0 without): the card's places are then the
     /// stream's union, the stage's below the layer's `n_card` and the streamed past it, so the join sums the stage
-    /// card's, the streamed and the tier's slots. A layer the tier holds no expert of, and a load with no tier, are
-    /// refused by name.
+    /// card's, the streamed and the tier's slots. A layer the tier holds no expert of for the batch
+    /// ([`Routed::batch_tier_k`]), and a load with no tier, are refused by name.
     pub fn join_rows(
         &mut self,
         gpu: &Gpu,
@@ -1599,7 +1624,7 @@ impl<R: RouterEntry> Routed<R> {
         (trows, streamed): (&DeviceBuffer<f32>, usize),
     ) -> Result<(), GpuError> {
         const W: &str = "shared routed join (tier layer)";
-        let n_tier = self.card.tier_k(l);
+        let n_tier = self.card.batch_tier_k(l);
         let (Some((_, kernels)), true) = (self.tier.as_ref(), n_tier > 0) else {
             return Err(GpuError::shape(
                 W,
@@ -1647,7 +1672,7 @@ impl<R: RouterEntry> Routed<R> {
             let card = b
                 .card
                 .as_ref()
-                .filter(|_| self.card.sums(l))
+                .filter(|_| self.card.batch_sums(l))
                 .map(CardBatch::acc);
             return join.enqueue(
                 gpu.stream(),
@@ -1657,7 +1682,7 @@ impl<R: RouterEntry> Routed<R> {
                 x,
             );
         }
-        let shadowed = match b.card.as_ref().filter(|_| self.card.sums(l)) {
+        let shadowed = match b.card.as_ref().filter(|_| self.card.batch_sums(l)) {
             Some(cb) => cb.pre(),
             None => &b.x1s,
         };

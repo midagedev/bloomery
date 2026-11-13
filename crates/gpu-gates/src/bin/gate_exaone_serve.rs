@@ -9,9 +9,9 @@
 //! The seat serves resident sequences, a select and a step each (`pass=turns`). Every
 //! server is `bloomery-serve --model flint -m <file>` beside this binary, `BLOOMERY_REF_MODEL`
 //! removed from its environment. Logs per server in `<dir>/<name>/` (`server.err`, the answer).
-//! `--tier` (`just gate-gpu-exaone-twocard`, both cards in view) runs the two tier clauses alone,
-//! `place_bp_follows_the_cards` and `mtp_survives_a_cut_on_the_tier`, and is refused by name
-//! where the census holds one card.
+//! `--tier` (`just gate-gpu-exaone-twocard`, both cards in view) runs the three tier clauses alone,
+//! `place_bp_follows_the_cards`, `mtp_survives_a_cut_on_the_tier` and
+//! `node_tier_serves_a_prompt_batch`, and is refused by name where the census holds one card.
 //!
 //! The shared clauses are `shared/serve_gate.rs`'s: `plan_names_the_slots` (the body's
 //! `Sequences` are `app::arch::flint`'s resident ones, so `--parallel 2` is served, not refused),
@@ -52,6 +52,18 @@
 //!   the body's open (`LegFamily::ROWS` 1 against `PASS_ROWS` 2) refuses the `bp` load by name
 //!   (`the node tier's shape is not this file's`), so the server never listens and the clause is
 //!   red.
+//! - `node_tier_serves_a_prompt_batch` (`--tier`, both cards in view): the tier of `--place bp` on
+//!   a loopback `tier_server` on the 3090 alone (`BLOOMERY_TIER_NODES`, `BLOOMERY_TIER_LINK=tcp`),
+//!   the stage on the A6000 alone, under the card budget of the stage's floor and [`HOST_EXTRA`],
+//!   residency `off`: a greedy completion of [`NODE_IDS`] ids answers [`NODE_N`] ids (HTTP 200)
+//!   that are the in-process tier's bit for bit, on the same plan (the same experts on the stage
+//!   card and the host, an expert tier card beside them). The ids are more than one, so the
+//!   prompt crosses the shared batch walk with experts on a tier a node serves: the node runs no
+//!   prompt batch, so the batch's host serves the experts it holds, and the decode steps after it
+//!   cross the node. FAIL-first, shown: a walk that routes the layer to the tier by the slot
+//!   map's own tier count (a node tier's experts are the batch's host's) answers HTTP 500, `a
+//!   tiered route of a layer whose tiers hold no expert a batch routes to them`, and the clause
+//!   is red.
 //! - `tools_request_is_served`: a chat request that carries `tools` is answered with a completion
 //!   (HTTP 200, `choices`), never an error: the file's own template renders the tool-declare
 //!   section (`<tool_declare|>` and the `<tool>` JSON blocks), and the description row binds the
@@ -113,19 +125,28 @@ fn main() -> std::process::ExitCode {
 mod serve_gate;
 
 #[cfg(all(feature = "deepseek41", feature = "flint"))]
+#[allow(
+    dead_code,
+    reason = "the gate starts and reaps its node; stdin, signals and the kill serve other gates"
+)]
+#[path = "shared/node_proc.rs"]
+mod node_proc;
+
+#[cfg(all(feature = "deepseek41", feature = "flint"))]
 mod gate {
     use std::path::Path;
     use std::time::Duration;
 
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        ChatReply, SeatGate, Served, answered, check, completion, curl, draft_counts, greedy_chat,
-        ids_of, json_of, server_log, stop_of,
+        ChatReply, SeatGate, Served, answered, check, completion, completion_raw, curl,
+        draft_counts, greedy_chat, ids_of, json_of, server_log, stop_of,
     };
     use bloomery_gpu_gates::{GateError, checks_failed, gpu_census, ref_model_path};
     use gguf::Split;
     use serde_json::{Value, json};
 
+    use crate::node_proc::{tier_server, tier_server_command};
     use crate::serve_gate;
 
     /// The slot's positions the server is asked for: the oracle's own bound, the patched tree's
@@ -375,6 +396,17 @@ mod gate {
         residency: Option<&str>,
         place: Option<&str>,
     ) -> Result<HostPlan, GateError> {
+        host_plan_under(dir, name, (draft, residency, place), &[])
+    }
+
+    /// [`host_plan`] with each of `env` set on both `--plan` runs beside the budget: where the tier
+    /// is a node's, its address and link and the card the stage sees.
+    fn host_plan_under(
+        dir: &Path,
+        name: &str,
+        (draft, residency, place): (bool, Option<&str>, Option<&str>),
+        env: &[(&str, Option<&str>)],
+    ) -> Result<HostPlan, GateError> {
         let seat = SeatGate {
             model: "flint",
             kinds: record::BLOOMERY_SERVE_HYBRID,
@@ -386,30 +418,29 @@ mod gate {
             args.extend(["--place", word]);
         }
         let draft = draft.then_some("mtp");
+        let floor_levers = [
+            (bloomery_levers::DRAFT, draft),
+            (bloomery_levers::CARD_BUDGET, Some("1M")),
+            (bloomery_levers::RESIDENCY, residency),
+        ];
         let (status, _, text) = seat.plan_under(
             (dir, &format!("{name}-floor")),
             &file,
             &args,
-            &[
-                (bloomery_levers::DRAFT, draft),
-                (bloomery_levers::CARD_BUDGET, Some("1M")),
-                (bloomery_levers::RESIDENCY, residency),
-            ],
+            &[&floor_levers[..], env].concat(),
         )?;
         if status.success() {
             return Err("a card budget of 1 MiB planned a load: the floor is not read".into());
         }
         let budget = floor_of(&text)? + HOST_EXTRA;
-        let (status, log, text) = seat.plan_under(
-            (dir, name),
-            &file,
-            &args,
-            &[
-                (bloomery_levers::DRAFT, draft),
-                (bloomery_levers::CARD_BUDGET, Some(&budget.to_string())),
-                (bloomery_levers::RESIDENCY, residency),
-            ],
-        )?;
+        let budget_text = budget.to_string();
+        let levers = [
+            (bloomery_levers::DRAFT, draft),
+            (bloomery_levers::CARD_BUDGET, Some(budget_text.as_str())),
+            (bloomery_levers::RESIDENCY, residency),
+        ];
+        let (status, log, text) =
+            seat.plan_under((dir, name), &file, &args, &[&levers[..], env].concat())?;
         if !status.success() {
             return Err(format!("the plan at a card budget of {budget} B: {text}").into());
         }
@@ -691,6 +722,137 @@ mod gate {
         Ok(ok)
     }
 
+    /// The ids [`node_tier_serves_a_prompt_batch`] feeds and the ids it asks for: more than the one
+    /// id a decode step feeds, so the prompt crosses the shared batch walk.
+    const NODE_IDS: u32 = 17;
+    const NODE_N: usize = 24;
+
+    /// What one server of [`node_tier_serves_a_prompt_batch`] answered: its plan and the greedy
+    /// completion's HTTP status and body.
+    struct NodeAnswer {
+        plan: HostPlan,
+        status: u16,
+        body: String,
+    }
+
+    /// The card whose name holds `word`, as `CUDA_VISIBLE_DEVICES` names it: the UUID the driver
+    /// reports for it.
+    fn card_entry(word: &str) -> Result<String, GateError> {
+        let census = gpu_census::census()?;
+        let device = census
+            .iter()
+            .find(|d| d.name.contains(word))
+            .ok_or_else(|| {
+                format!(
+                    "the census has no {word}: {}",
+                    census
+                        .iter()
+                        .map(|d| d.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        Ok(gpu_census::gpu_uuid(&device.uuid))
+    }
+
+    /// One server of [`node_tier_serves_a_prompt_batch`] in `<dir>/<name>/`: the plan of `--place bp`
+    /// at the stage's floor and [`HOST_EXTRA`] under residency `off`, `env` set on the plan and on
+    /// the load (the node's address and link and the card the stage sees; none for the in-process
+    /// tier), then one greedy completion of [`NODE_IDS`] ids for [`NODE_N`] ids. `None` where the
+    /// server never listened (printed under the clause).
+    fn node_answer(
+        dir: &Path,
+        (clause, name): (&str, &str),
+        env: &[(&str, &str)],
+    ) -> Result<Option<NodeAnswer>, GateError> {
+        const OFF: Option<&str> = Some("off");
+        let place = Some("bp");
+        let plan_env: Vec<(&str, Option<&str>)> = env.iter().map(|&(k, v)| (k, Some(v))).collect();
+        let plan = host_plan_under(dir, &format!("{name}-plan"), (false, OFF, place), &plan_env)?;
+        println!(
+            "{clause} {name}: card budget {} B, routed experts {} on the stage card and {} on the \
+             host, an expert tier card {}",
+            plan.budget, plan.card, plan.host, plan.tiered
+        );
+        let budget = plan.budget.to_string();
+        let mut levers = vec![
+            (bloomery_levers::CARD_BUDGET, budget.as_str()),
+            (bloomery_levers::RESIDENCY, "off"),
+        ];
+        levers.extend_from_slice(env);
+        let (mut s, addr, _) = match mtp_server(dir, name, None, 1, &levers, place) {
+            Ok(served) => served,
+            Err(e) => {
+                println!("{clause}: the {name} server never listened: {e}");
+                return Ok(None);
+            }
+        };
+        let ids: Vec<u32> = (1..=NODE_IDS).collect();
+        let url = move |route: &str| format!("http://{addr}{route}");
+        let (status, body) = completion_raw(&url, &ids, NODE_N, false)?;
+        std::fs::write(dir.join(name).join("answer.json"), &body)?;
+        println!("{clause} {name}: HTTP {status}; {}", s.stop()?);
+        Ok(Some(NodeAnswer { plan, status, body }))
+    }
+
+    /// `node_tier_serves_a_prompt_batch` (the module header): the in-process tier's answer, then the
+    /// same plan's over a loopback `tier_server` on the 3090 alone with the stage on the A6000 alone.
+    fn node_tier_serves_a_prompt_batch(dir: &Path) -> Result<bool, GateError> {
+        const CLAUSE: &str = "node_tier_serves_a_prompt_batch";
+        let mut ok = true;
+        let (node_card, stage_card) = (card_entry("3090")?, card_entry("A6000")?);
+        let Some(local) = node_answer(dir, (CLAUSE, "node-local"), &[])? else {
+            check(&mut ok, CLAUSE, false);
+            return Ok(ok);
+        };
+        let mut cmd = tier_server_command(Some(&ref_model_path()?))?;
+        cmd.env("CUDA_VISIBLE_DEVICES", &node_card);
+        let (node, at) = tier_server(cmd, "node")?;
+        println!(
+            "{CLAUSE}: tier_server pid {} serves on {at}, the 3090 alone",
+            node.id()
+        );
+        let at = at.to_string();
+        let env = [
+            (bloomery_levers::TIER_NODES, at.as_str()),
+            (bloomery_levers::TIER_LINK, "tcp"),
+            ("CUDA_VISIBLE_DEVICES", stage_card.as_str()),
+        ];
+        let remote = node_answer(dir, (CLAUSE, "node-remote"), &env)?;
+        drop(node);
+        let Some(remote) = remote else {
+            check(&mut ok, CLAUSE, false);
+            return Ok(ok);
+        };
+        let reads = |a: &NodeAnswer| -> Result<(Vec<u32>, String), GateError> {
+            let v: Value = serde_json::from_str(&a.body).unwrap_or(Value::Null);
+            Ok((ids_of(&v["tokens"])?, stop_of(&v)?.to_owned()))
+        };
+        let served = local.status == 200 && remote.status == 200;
+        if remote.status != 200 {
+            println!("{CLAUSE}: the node tier's answer: {}", remote.body);
+        }
+        let held = remote.plan.tiered && remote.plan.card > 0;
+        let same_plan = (local.plan.card, local.plan.host, local.plan.tiered)
+            == (remote.plan.card, remote.plan.host, remote.plan.tiered);
+        let same_ids = served && {
+            let (want, got) = (reads(&local)?, reads(&remote)?);
+            println!(
+                "{CLAUSE}: the in-process tier's {:?} (stop {}), the node tier's {:?} (stop {})",
+                want.0, want.1, got.0, got.1
+            );
+            want == got && want.0.len() == NODE_N
+        };
+        println!(
+            "{CLAUSE}: both servers answered HTTP 200 {served}; the node plan holds experts on the \
+             tier card and the stage card {held}, the same plan as the in-process tier's \
+             {same_plan}; the node tier's {NODE_N} ids and stop are the in-process tier's \
+             {same_ids}"
+        );
+        check(&mut ok, CLAUSE, served && held && same_plan && same_ids);
+        Ok(ok)
+    }
+
     /// What the plan of a tier card that the cards before it leave no expert is refused with:
     /// `--place bp` on a fixture whose stage holds every routed expert.
     const EMPTY_TIER: &str = "holds no expert: the cards before it hold every routed expert";
@@ -793,7 +955,7 @@ mod gate {
         Ok((dir.ok_or(USAGE)?, tier))
     }
 
-    /// The `--tier` run: the two tier clauses alone, on a census of two cards.
+    /// The `--tier` run: the three tier clauses alone, on a census of two cards.
     fn tier_run(dir: &Path) -> Result<(), GateError> {
         if gpu_census::census()?.len() < 2 {
             return Err(
@@ -804,6 +966,7 @@ mod gate {
         }
         let mut ok = place_bp_follows_the_cards(dir, true)?;
         ok &= mtp_survives_a_cut_on_the_tier(dir)?;
+        ok &= node_tier_serves_a_prompt_batch(dir)?;
         if !ok {
             return Err(checks_failed());
         }
@@ -811,7 +974,9 @@ mod gate {
             "PASSED: gate_exaone_serve --tier the seat plans an expert tier card where two cards are \
              in view and holds experts on it, and serves a load of it (the stage's experts, the tier \
              card's and the host's) whose drafted ids are the plain load's and whose host serves \
-             the picks of the experts left to it (mtp_survives_a_cut_on_the_tier)"
+             the picks of the experts left to it (mtp_survives_a_cut_on_the_tier), and serves a \
+             prompt batch with its tier on a loopback node, whose ids are the in-process tier's \
+             (node_tier_serves_a_prompt_batch)"
         );
         Ok(())
     }

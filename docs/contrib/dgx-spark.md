@@ -901,9 +901,11 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    lowers an explicit node assignment into the loaded rows before splitting node 0's host room: remote routed
    ranges are file-backed, with no stage allocation or charge against node 0's pool. Each node opens its own
    host/NVMe split against its own grant.
-   A remote tier serves no prompt batch (the batch call refuses it by name).
-   Qwen3.8, GLM and V4.1 open their tiers through that common open; `tier_server` serves GLM's and V4.1's
-   families when it is built with the `glm5next` or `deepseek41` feature. `just gate-gpu-qwen38-nodes` holds the
+   A remote tier serves no prompt batch of its own: the batch's host serves its experts, except where the node's family
+   computes a block (V4.1's).
+   Qwen3.8, GLM and V4.1 open their tiers through that common open; `tier_server` serves Qwen3.8's and Kimi K3's families
+   always and V4.1's, GLM's, Solar-Open2's and Flint's when it is built with the `deepseek41`, `glm5next`, `solar2` or
+   `flint` feature. `just gate-gpu-qwen38-nodes` holds the
    census, the refused opens (a row of other experts, and a copy of the file whose tier row holds other bytes), the bits
    (node 0 with node 1's tier against the same plan in one process) and the losses below. Its `--host` mode lowers
    equal routed ranges onto two nodes and compares the paged node with the same build's local CPU tier. It requires

@@ -412,12 +412,14 @@ impl<'a, H: HostExperts> BatchLeg<'a, H> {
     }
 
     /// Whether `layer` is a tiered layer: one an expert tier holds experts
-    /// of, whose serve leaves the upload to [`BatchLeg::join_tiered`].
+    /// of for the batch ([`HostTier::batch_slots`]: a tier on a node with no
+    /// batch leg holds none, the host serves its experts), whose serve leaves
+    /// the upload to [`BatchLeg::join_tiered`].
     fn tiered(&self, layer: usize) -> Result<bool, GpuError> {
         if self.hybrid.tiers().is_empty() {
             return Ok(false);
         }
-        Ok(self.hybrid.on_tier(layer)? > 0)
+        Ok(self.hybrid.batch_slots()?.on_tier(layer)? > 0)
     }
 
     /// The join of `at`'s tiered layer after its serve: the expert tier's

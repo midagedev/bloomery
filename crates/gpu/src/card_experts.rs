@@ -50,6 +50,7 @@ use crate::card_leg::ExpertInput;
 use crate::card_leg::{self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, STACK_ROLES};
 use crate::card_slots::{CardSlotKernels, Places};
 use crate::gemm::{Gemm32Kernels, GemmKernels};
+use crate::host::slots::BatchSlots;
 use crate::host::xstream::RingLayer;
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
@@ -302,6 +303,11 @@ pub struct CardExperts {
     /// Per layer of the description, the experts the expert tier holds: 0
     /// off the tier, and on every layer of a load with no tier.
     tier: Vec<usize>,
+    /// Per layer of the description, the experts the expert tier holds for a
+    /// prompt batch: `tier`, but 0 where the tier is on a node that runs no
+    /// batch leg, whose experts the batch's host serves
+    /// ([`CardExperts::read_batch_tiers`]).
+    batch_tier: Vec<usize>,
     /// Routed expert width: a gate·up slot's rows.
     ff: usize,
     /// The model's width.
@@ -440,6 +446,7 @@ impl CardExperts {
                 add_base: true,
             },
             layers: per,
+            batch_tier: tier_k.clone(),
             tier: tier_k,
             ff,
             n,
@@ -501,6 +508,35 @@ impl CardExperts {
     #[must_use]
     pub fn any_tier(&self) -> bool {
         self.tier.iter().any(|&k| k > 0)
+    }
+
+    /// The experts of layer `l` the expert tier holds for a prompt batch:
+    /// [`CardExperts::tier_k`] unless the tier is on a node that runs no batch
+    /// leg, whose experts the batch's host serves, so 0
+    /// ([`CardExperts::read_batch_tiers`]).
+    #[must_use]
+    pub fn batch_tier_k(&self, l: usize) -> usize {
+        self.batch_tier.get(l).copied().unwrap_or(0)
+    }
+
+    /// Layer `l` has a card sum in a prompt batch: card experts on the stage
+    /// card, or experts on a tier the batch routes to.
+    #[must_use]
+    pub fn batch_sums(&self, l: usize) -> bool {
+        self.has(l) || self.batch_tier_k(l) > 0
+    }
+
+    /// Read the prompt batch's view of the expert tier from `view`
+    /// ([`HostTier::batch_slots`](crate::host::HostTier::batch_slots)): each
+    /// layer the tier holds experts of keeps the count the view gives it, 0
+    /// for a tier on a node with no batch leg. The decode step and the verify
+    /// pass keep [`CardExperts::tier_k`]. Without a tier, or with every tier in
+    /// this process, it leaves the batch's counts the step's. No allocation.
+    pub fn read_batch_tiers(&mut self, view: &BatchSlots<'_>) -> Result<(), GpuError> {
+        for (l, (batch, &held)) in self.batch_tier.iter_mut().zip(&self.tier).enumerate() {
+            *batch = if held > 0 { view.on_tier(l)? } else { 0 };
+        }
+        Ok(())
     }
 
     /// The stage card's experts of layer `l`: 0 off the card.
@@ -810,7 +846,7 @@ impl CardExperts {
             gpu.layer_sink(l)?,
             &mut cb.sel,
         )?;
-        let tiered = self.tier.get(l).is_some_and(|&k| k > 0);
+        let tiered = self.batch_tier_k(l) > 0;
         self.k.enqueue(
             gpu,
             w,
@@ -837,7 +873,8 @@ impl CardExperts {
     /// experts, a token's slots in slot order — plus the base into `cb`'s
     /// `pre`. A batch's GEMMs run while the copies of the batches after it
     /// land. The places share `cb`'s, each written after the run before it on
-    /// the one stream. On a layer an expert tier holds experts of the run ends
+    /// the one stream. On a layer an expert tier holds experts of for the batch
+    /// ([`CardExperts::batch_tier_k`]) the run ends
     /// at the union row's places: the slots' downs stay in the leg's rows for
     /// the layer's join ([`CardBatch::join`]), which sums them with the tier's
     /// rows over `n_card + r.n` places. Refused by name: a half holding more
@@ -860,7 +897,7 @@ impl CardExperts {
                 detail: format!("a batch of {} tokens in buffers of {}", io.m, cb.bufs.cap()),
             });
         }
-        let tiered = self.tier_k(l) > 0;
+        let tiered = self.batch_tier_k(l) > 0;
         if r.n > r.half_slots {
             return Err(GpuError::shape(
                 what,

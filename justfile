@@ -3161,7 +3161,7 @@ gate-gpu-ds41-tp:
 # --bnode (B9) serves the tier from a loopback tier_server child, the binary beside the gate, and feeds B7's prompt as one
 # batch: within B7's band of the same load's steps, the node computing its block of every tiered layer-batch (the slots the
 # host leaves to its leg are its routed slots). It runs
-# in the default list; the recipe builds tier_server beside the gate (with deepseek41, the one feature set every recipe builds it with).
+# in the default list; the recipe builds tier_server beside the gate (with deepseek41 and flint, the one feature set every recipe builds it with).
 # --rank (B10) plans under a router-rank file the gate writes (BLOOMERY_EXPERT_RANK, set on a child of the gate alone): the child's plan
 # names the file, keeps the plan's counts and holds each layer's hottest n_l ranked ids on the card instead of its id prefix; under it T1
 # holds (the tiered carve answers the reference load of that plan bit for bit), and the prompt fed one step a position sits within the
@@ -3169,7 +3169,7 @@ gate-gpu-ds41-tp:
 # It runs in the default list.
 [group('v41-load')]
 gate-gpu-ds41-tier *ARGS='--union --fault --two --batch --batch2 --bfault --bfeat --bnode --bnodeskip --rank':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier --bin tier_server && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,flint --release --bin gate_deepseek41_tier --bin tier_server && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_tier {{ARGS}}'
 
 # V4.1 plan (b′) on both cards (--place bp): the stage on the A6000, the expert tier and the DSpark draft on the 3090.
 # The reference is the same plan with every tier set joined to the stage card's (one card, no tier code); --loopback, by
@@ -3204,7 +3204,7 @@ gate-gpu-ds41-twocard *ARGS='--union':
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-ds41-lost:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost && BLOOMERY_TIER_LINK=loopback bash tools/gpu-gate.sh gate_deepseek41_tier --union --fault --batch --batch2 --bfault && BLOOMERY_TIER_LINK=loopback bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost && BLOOMERY_TIER_LINK=tcp bash tools/gpu-gate.sh gate_deepseek41_tier --union --fault --batch --batch2 --bfault && BLOOMERY_TIER_LINK=tcp bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,flint --release --bin gate_deepseek41_tier && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost && BLOOMERY_TIER_LINK=loopback bash tools/gpu-gate.sh gate_deepseek41_tier --union --fault --batch --batch2 --bfault && BLOOMERY_TIER_LINK=loopback bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost && BLOOMERY_TIER_LINK=tcp bash tools/gpu-gate.sh gate_deepseek41_tier --union --fault --batch --batch2 --bfault && BLOOMERY_TIER_LINK=tcp bash tools/gpu-gate.sh gate_deepseek41_tier --bfirst --blost --lost'
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_twocard && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gpu-gate.sh gate_deepseek41_twocard --lost'
 
 # 상주 교체의 r8 → Q3_K 풀기(`ds41_r8_q3k_groups`, 그룹 하나를 블록 하나가 제자리에서): 무작위 r8 워드를 V4.1 파트
@@ -3544,7 +3544,7 @@ gate-gpu-qwen3moe-twocard:
 # 3090's 24 GB. The binary's cleanup unit tests run through tools/gate.sh before the card gate.
 [group('v41-load')]
 gate-gpu-qwen38-nodes *ARGS='':
-    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes -- --ignored hw_census_clause_requires_the_remote_census && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_qwen38_nodes --bin tier_server && bash tools/gpu-gate.sh gate_qwen38_nodes {{ARGS}}'
+    BLOOMERY_MODEL=qwen4exp BLOOMERY_CARD=a6000 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --bin gate_qwen38_nodes -- --ignored hw_census_clause_requires_the_remote_census && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,flint --release --bin gate_qwen38_nodes --bin tier_server && bash tools/gpu-gate.sh gate_qwen38_nodes {{ARGS}}'
 
 # A refused replay on a separate tier node resets to its fresh history. Requires BLOOMERY_TIER_NODES
 # and BLOOMERY_TIER_LINK=rdma, with tier_server already serving the same model on that node. Without
@@ -4606,12 +4606,14 @@ gate-gpu-exaone-serve:
 # under residency off, the plain and the drafted (BLOOMERY_DRAFT=mtp) ones on `--place bp`, a host-only one on plan (a): the
 # drafted ids are the plain tier load's bit for bit and the draft joins the second request one id fewer kept, the tier load's first id
 # of each request is the host-only load's and its host serves the picks of the experts left to it, fewer than the host-only load's by
-# the ratio of the two plans' host experts (mtp_survives_a_cut_on_the_tier). Real-only, as gate-gpu-exaone-serve (the profile's file is
+# the ratio of the two plans' host experts (mtp_survives_a_cut_on_the_tier); and a prompt batch (17 ids, past the one id a decode step
+# feeds) answers 24 ids over a loopback tier_server on the 3090 alone with the stage on the A6000 alone, the in-process tier's ids
+# (node_tier_serves_a_prompt_batch: the batch's host serves the experts the node takes no block of). Real-only, as gate-gpu-exaone-serve (the profile's file is
 # the fixture GGUF itself). Both cards in view (BLOOMERY_CARD=both: both gate locks, alone in a batch); the same bins and features as
-# gate-gpu-exaone-serve. Wall: the run after a warm build took 25 s [measured once, 2026-11-14, A6000 + 3090]; the bound is 600 s.
+# gate-gpu-exaone-serve. Wall: the run after a warm build took 76 s with the third clause [measured once, 2026-11-14, A6000 + 3090; 25 s before it]; the bound is 600 s.
 [group('solo')]
 gate-gpu-exaone-twocard:
-    BLOOMERY_MODEL=exaone-moe BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-twocard && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_exaone_serve && D=target/exaone-twocard-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 bash tools/gpu-gate.sh gate_exaone_serve --dir $D --tier'
+    BLOOMERY_MODEL=exaone-moe BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-twocard && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_exaone_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,deepseek41,flint --release --bin tier_server && D=target/exaone-twocard-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 bash tools/gpu-gate.sh gate_exaone_serve --dir $D --tier'
 
 # --- end exaone-moe ---
 
@@ -4770,7 +4772,7 @@ gate-gpu-kimik3-pp:
 # fixture opens, a few seconds each]: five loads in the gate and four in its children, under 5 min after a warm build.
 [group('solo')]
 gate-gpu-kimik3-place:
-    BLOOMERY_MODEL=kimi-k3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-place && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_place --bin generate_kimi_k3 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,deepseek41 --release --bin tier_server && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_kimi_k3_place'
+    BLOOMERY_MODEL=kimi-k3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-kimik3-place && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_kimi_k3_place --bin generate_kimi_k3 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,deepseek41,flint --release --bin tier_server && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_kimi_k3_place'
 
 # --- end kimik3place ---
 # --- kimik3serve ---

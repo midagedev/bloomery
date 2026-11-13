@@ -32,7 +32,10 @@
 //! stacks into the one card sum ([`Routed::card_rows`]), and the host's sum leaves them out. On a
 //! layer the expert tier holds experts of the card route leaves the stream's union places for the
 //! back, whose tier join sums the stage card's, the streamed and the tier's slots in slot order by
-//! the count the stream hands it ([`PromptStream::unit_join`], [`Routed::join_rows`]).
+//! the count the stream hands it ([`PromptStream::unit_join`], [`Routed::join_rows`]). A tier on a
+//! node runs no prompt batch of its own: the walk reads the batch's view of the slot map once a group
+//! ([`Routed::read_batch_tiers`]), a layer that view gives the tier no expert of runs as a layer with
+//! no tier, and the batch's host serves the node's experts.
 //!
 //! Armed ([`BatchBufs::set_stats`]), the walk's leg keeps a card mark at each part boundary of a
 //! routed layer, the parts' enqueue walls and the serves' host times and expert counts, which
@@ -745,6 +748,7 @@ impl<R: RouterEntry, A: BatchAttention> Batch<'_, R, A> {
                 bufs.t_max
             )));
         }
+        ffn.read_batch_tiers(hybrid)?;
         let stream = gpu.stream();
         let n = embd;
         let mut from = 0;
@@ -995,10 +999,11 @@ impl<'a, R: RouterEntry, A: BatchAttention> LayerProgram for Walk<'a, R, A> {
     }
 
     /// The host sums joined with the shadow's, into the unit's `x`, and the layer's tap. A layer the
-    /// expert tier holds experts of is joined first: the card sum over the stage card's, the
-    /// streamed (the stream's join of the unit, [`PromptStream::unit_join`]) and the tier's slots,
-    /// once the host leg has landed the tier's rows, which also uploads the host sums. Any other
-    /// layer's card route summed its streamed slots in the shadow.
+    /// expert tier holds experts of for the batch ([`Routed::batch_tier_k`]) is joined first: the
+    /// card sum over the stage card's, the streamed (the stream's join of the unit,
+    /// [`PromptStream::unit_join`]) and the tier's slots, once the host leg has landed the tier's
+    /// rows, which also uploads the host sums. Any other layer's card route summed its streamed
+    /// slots in the shadow.
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         if self.attention.ffn(at.layer) != FfnKind::Moe {
             return Ok(());
@@ -1007,7 +1012,7 @@ impl<'a, R: RouterEntry, A: BatchAttention> LayerProgram for Walk<'a, R, A> {
         let t = self.ts[at.unit];
         let (gpu, l) = (self.gpu, at.layer);
         let streamed = self.stream.unit_join(at)?.unwrap_or(0);
-        if self.ffn.tier_k(l) > 0 {
+        if self.ffn.batch_tier_k(l) > 0 {
             let ffn = &mut *self.ffn;
             port.join_tiered(at, |_, trows| ffn.join_rows(gpu, (l, t), (trows, streamed)))?;
         }
