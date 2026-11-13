@@ -3,13 +3,16 @@
 
     tools/gate_class.py check          # rc 1 with one line per finding
     tools/gate_class.py summary         # the counts per class, per family and per owner
+    tools/gate_class.py budget [--shared]       # the family budget table as it stands; --shared: the families whose gates load one real file in several bins
+    tools/gate_class.py budget --refresh [--times FILE] [--classes FILE]   # real_s and unrowed rewritten from gate-times.tsv
     tools/gate_class.py --self-test
 
-Three tables, one row a thing:
+Four tables, one row a thing:
 
-  tools/gate-class.tsv  recipe<TAB>class<TAB>family<TAB>topic<TAB>owners
-  tools/families.tsv    family<TAB>rep<TAB>tier<TAB>globs<TAB>rotation_days<TAB>fixture
-  tools/owners.tsv      owner<TAB>kind<TAB>globs
+  tools/gate-class.tsv     recipe<TAB>class<TAB>family<TAB>topic<TAB>owners
+  tools/families.tsv       family<TAB>rep<TAB>tier<TAB>globs<TAB>rotation_days<TAB>fixture
+  tools/owners.tsv         owner<TAB>kind<TAB>globs
+  tools/family-budget.tsv  family<TAB>real_s<TAB>unrowed<TAB>budget_s<TAB>waivers
 
 `class` is `common` (family-agnostic: a synthetic input or a shape-generic owner), `family` (one family's own weights
 or code) or `tooling` (harness, static, fixture writer, PTX). `topic` is what the gate tests, or `by-hand`: a gate no
@@ -38,14 +41,24 @@ such an error.
 The class stage of `just affected` and the release list read the tables (tools/recipes.py `class_tables`), and so does the rotation
 (tools/rotation.py, for the F families' gates); this tool checks them. The justfile's recipe names are read through tools/recipes.py,
 the one parser.
+
+The fourth table holds the release budget of each family, the rule that a new model adds the least to every later release (AGENTS.md,
+Conventions). `check` refuses, by family: real_s over budget_s (real_s is the sum of the medians of the family's real-tier gates in
+gate-times.tsv, written by `budget --refresh` on the machine that has the file, since CI has none); a budget_s over the default 300 s with
+no `budget` waiver; more than one `+ship` gate with no `ship` waiver; gates and no fixture (families.tsv `fixture` no) with no `fixture`
+waiver, a waiver that grandfathers a family which predates the rule and so is not dated after RULE_DAY; tier `main` with no `main` waiver
+that names the maintainer's call. A waiver is `rule=PIN(YYYY-MM-DD): reason`; one that is no longer needed is a note, never a finding.
+Gates of one family that load the same real file in several bins are reported (`budget --shared`), not refused.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import importlib.util
 import os
+import re
 import sys
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -596,7 +609,300 @@ def check(root: Path, tables: Tables, kernels: Callable[[Path, Tables], KernelRe
     # The fixture column is the fixture table's fact, and a change to a kernel file keeps a gate that launches it.
     findings += fixture_findings(root, tables)
     findings += kernel_findings(tables, kernels(root, tables))
+    # The release budget of each family.
+    findings += budget_findings(tables, load_budget(root))[0]
     return findings
+
+
+# ---------------------------------------------------------------------------------------------- the family budget
+
+
+BUDGET_TABLE = Path("tools") / "family-budget.tsv"
+# What a new family may cost a release: the sum of its real-tier gates' medians, 300 s unless its row carries a `budget` waiver.
+DEFAULT_BUDGET_S = 300
+# recipes.predicted_wall's price of a gate with no real-tier row (release-list --wall); the self-test holds the two together.
+UNROWED_S = 45
+# PIN(2026-11-14): the day the budget rule landed. A `fixture` waiver grandfathers a family that predates the rule, so none is dated
+# after this day: a newer family has a fixture row, and moving the day is the maintainer's call.
+RULE_DAY = datetime.date(2026, 11, 14)
+WAIVER_RULES = ("budget", "ship", "main", "fixture")
+WAIVER = re.compile(rf"({'|'.join(WAIVER_RULES)})=PIN\((\d{{4}}-\d{{2}}-\d{{2}})\): (\S.*)")
+WAIVER_SEP = " | "
+# The bins a card gate runs are named gate_*; the other bins a recipe builds (the server, the generator) are tools it drives.
+GATE_BIN = "gate_"
+# A `main` waiver names the call it records.
+MAIN_CALL = "maintainer"
+# release-list --wall flags a family whose table real_s differs from the live medians by more than STALE_FRAC of the larger and STALE_MIN_S.
+STALE_FRAC, STALE_MIN_S = 0.1, 20
+
+
+@dataclasses.dataclass(frozen=True)
+class Waiver:
+    day: datetime.date
+    reason: str
+
+
+@dataclasses.dataclass(frozen=True)
+class BudgetRow:
+    family: str
+    real_s: int
+    unrowed: int
+    budget_s: int
+    waivers: dict[str, Waiver]
+
+
+@dataclasses.dataclass(frozen=True)
+class FamilyCost:
+    """What a family's real-tier gates cost: the gates themselves (the recipes a real-tier batch runs unattended, whatever the family's
+    tier), the sum of the medians of those with a real-tier row and how many have none."""
+
+    gates: tuple[str, ...]
+    real_s: int
+    unrowed: int
+
+    @property
+    def priced_s(self) -> int:
+        """real_s with every gate that has no row at the price release-list --wall gives it: the number a release would spend."""
+        return self.real_s + self.unrowed * UNROWED_S
+
+
+def parse_waivers(text: str, where: str) -> dict[str, Waiver]:
+    """The `waivers` column: `-`, or entries `rule=PIN(YYYY-MM-DD): reason` joined by ' | '."""
+    if text in ("", "-"):
+        return {}
+    out: dict[str, Waiver] = {}
+    for entry in text.split(WAIVER_SEP):
+        m = WAIVER.fullmatch(entry.strip())
+        if m is None:
+            raise GateClassError(f"{where}: a waiver is `rule=PIN(YYYY-MM-DD): reason` with the rule one of {', '.join(WAIVER_RULES)}, joined by "
+                                 f"{WAIVER_SEP!r}: {entry[:80]!r}")
+        rule, day_s, reason = m.groups()
+        try:
+            day = datetime.date.fromisoformat(day_s)
+        except ValueError as e:
+            raise GateClassError(f"{where}: the {rule} waiver is dated {day_s}, which is no day") from e
+        if rule in out:
+            raise GateClassError(f"{where}: the {rule} waiver is listed twice")
+        out[rule] = Waiver(day, reason.strip())
+    return out
+
+
+def load_budget(root: str | os.PathLike) -> dict[str, BudgetRow]:
+    """tools/family-budget.tsv: the family, its real_s and unrowed (written by `budget --refresh`), its budget_s and its waivers. Which
+    families have a row is `check`'s, not the loader's."""
+    root = Path(root)
+    path = root / BUDGET_TABLE
+    if not path.exists():
+        raise GateClassError(f"{BUDGET_TABLE} does not exist under {root}")
+    rows: dict[str, BudgetRow] = {}
+    for n, f in _rows(path):
+        where = _where(path, n)
+        if len(f) != 5:
+            raise GateClassError(f"{where}: a row is not `family, real_s, unrowed, budget_s, waivers` (tab-separated): {'\\t'.join(f)[:100]!r}")
+        name, real, unrowed, budget, waivers = (x.strip() for x in f)
+        if not name:
+            raise GateClassError(f"{where}: a row has no family name")
+        nums: dict[str, int] = {}
+        for label, v in (("real_s", real), ("unrowed", unrowed), ("budget_s", budget)):
+            if not v.isdigit():
+                raise GateClassError(f"{where}: `{label}` is not a whole number: {v!r}")
+            nums[label] = int(v)
+        if nums["budget_s"] == 0:
+            raise GateClassError(f"{where}: the family {name} has a budget_s of 0")
+        if name in rows:
+            raise GateClassError(f"{where}: the family {name} is listed twice")
+        rows[name] = BudgetRow(name, nums["real_s"], nums["unrowed"], nums["budget_s"], parse_waivers(waivers, where))
+    return rows
+
+
+def family_costs(tables: Tables, classes: dict[str, tuple[str, str]], scope_of: Callable[[str], GateScope],
+                 plain: dict[str, list[tuple[str, int]]]) -> dict[str, FamilyCost]:
+    """The real-tier cost of every family of families.tsv, and under the key '' of the gates no family owns: the recipes a real-tier
+    batch runs (recipes.real_tier_candidates) minus the by-hand ones, which no batch runs unattended, each by the family its scope names;
+    a gate costs the median of the last five real-tier rows of `plain` (recipes.times_rows) and one with none counts in `unrowed`.
+    Every family is in the result, a family with no real-tier gate at zero."""
+    owned: dict[str, list[str]] = {fam: [] for fam in tables.families}
+    owned[""] = []
+    for n in recipes.real_tier_candidates(classes):
+        if classes[n][1] == "needs-env":
+            continue
+        fam = scope_of(n).family
+        owned[fam if fam in tables.families else ""].append(n)
+    out: dict[str, FamilyCost] = {}
+    for fam, names in owned.items():
+        w = recipes.predicted_wall(names, {}, plain, default=0)
+        out[fam] = FamilyCost(tuple(names), w["sum"], w["unrowed"])
+    return out
+
+
+def measured_costs(root: Path, tables: Tables, times: str, classes_file: str | None) -> dict[str, FamilyCost]:
+    """family_costs of the tree at ROOT from the times file; a missing or empty file is a named error, never a table of zeros."""
+    if not os.path.exists(times):
+        raise GateClassError(f"the times file {times} does not exist (--times FILE; the lead's machine holds gate-times.tsv)")
+    _fixture, plain = recipes.times_rows(times)
+    if not plain:
+        raise GateClassError(f"the times file {times} holds no real-tier row")
+    classes = recipes.read_class_file(classes_file) if classes_file else recipes.fixture_class_rows(str(root))
+    rs = recipes.load_justfile(str(root / "justfile"))
+    return family_costs(tables, classes, recipes.gate_scope_of(tables, rs), plain)
+
+
+def refresh_text(text: str, families: Iterable[str], costs: dict[str, FamilyCost]) -> tuple[str, list[str]]:
+    """(the new text of the budget table, one line per row it changed or added): each data row's real_s and unrowed from `costs`, the rest
+    of the row and every comment as they were, and a row at the end (the default budget, no waiver) for each of `families` that has none."""
+    out: list[str] = []
+    seen: set[str] = set()
+    changes: list[str] = []
+    for line in text.splitlines():
+        f = line.split("\t")
+        if not line.strip() or line.startswith("#") or len(f) != 5 or f[0].strip() not in costs:
+            out.append(line)
+            continue
+        name = f[0].strip()
+        seen.add(name)
+        c = costs[name]
+        if (f[1].strip(), f[2].strip()) != (str(c.real_s), str(c.unrowed)):
+            changes.append(f"{name}: real_s {f[1].strip()} -> {c.real_s}, unrowed {f[2].strip()} -> {c.unrowed}")
+        out.append("\t".join([f[0], str(c.real_s), str(c.unrowed), f[3], f[4]]))
+    for fam in families:
+        if fam not in seen and fam in costs:
+            c = costs[fam]
+            out.append(f"{fam}\t{c.real_s}\t{c.unrowed}\t{DEFAULT_BUDGET_S}\t-")
+            changes.append(f"{fam}: a new row, real_s {c.real_s}, unrowed {c.unrowed}, budget_s {DEFAULT_BUDGET_S}")
+    return "\n".join(out) + "\n", changes
+
+
+def budget_findings(tables: Tables, budgets: dict[str, BudgetRow]) -> tuple[list[str], list[str]]:
+    """(the findings of the budget rule, its notes): one line each. A finding refuses; a note names a waiver nothing needs any more."""
+    findings: list[str] = []
+    notes: list[str] = []
+    t = BUDGET_TABLE.name
+    gates: dict[str, list[str]] = {}
+    ships: dict[str, list[str]] = {}
+    for n, row in sorted(tables.gates.items()):
+        if row.cls == "family":
+            gates.setdefault(row.family, []).append(n)
+        try:
+            mark = recipes.release_mark(row)
+        except recipes.RecipeError as e:
+            findings.append(str(e))
+            continue
+        if mark == "ship":
+            ships.setdefault(row.family, []).append(n)
+    for fam in sorted(set(budgets) - set(tables.families)):
+        findings.append(f"{t} names the family {fam}, which families.tsv does not hold")
+    for fam in sorted(tables.families):
+        row = budgets.get(fam)
+        if row is None:
+            findings.append(f"{t} has no row for the family {fam}: `python3 tools/gate_class.py budget --refresh` adds it with the default "
+                            f"budget of {DEFAULT_BUDGET_S} s")
+            continue
+        fr, w = tables.families[fam], row.waivers
+        # The budget: a family's real-tier gates sum to at most budget_s, and a budget over the default has its dated reason.
+        if row.real_s > row.budget_s:
+            findings.append(f"{t}: the family {fam}'s real-tier gates sum to {row.real_s} s, over its budget_s of {row.budget_s} s: cut them to one "
+                            "load of the file with the clauses in it (and none a common gate pins), or raise budget_s with a dated `budget` waiver")
+        if row.budget_s > DEFAULT_BUDGET_S and "budget" not in w:
+            findings.append(f"{t}: the family {fam}'s budget_s is {row.budget_s} s, over the default {DEFAULT_BUDGET_S} s, with no `budget` "
+                            "waiver (`budget=PIN(YYYY-MM-DD): reason`)")
+        if "budget" in w and row.budget_s <= DEFAULT_BUDGET_S:
+            notes.append(f"{t}: the family {fam}'s `budget` waiver is not needed: its budget_s is {row.budget_s} s; drop it")
+        # One +ship gate: the family's serve gate.
+        mine = ships.get(fam, [])
+        if len(mine) > 1 and "ship" not in w:
+            findings.append(f"{t}: the family {fam} has {len(mine)} +ship gates ({' '.join(mine)}): a family blocks a release with one, its serve "
+                            "gate, unless a dated `ship` waiver says why")
+        if "ship" in w and len(mine) <= 1:
+            notes.append(f"{t}: the family {fam}'s `ship` waiver is not needed: it has {len(mine)} +ship gate(s); drop it")
+        # A fixture row: a landing runs the family on the fixture tier. A family that predates the rule is grandfathered by name.
+        if not fr.fixture and gates.get(fam) and "fixture" not in w:
+            findings.append(f"{t}: the family {fam} has {len(gates[fam])} gate(s) and no fixture (families.tsv fixture no): a new family has a "
+                            f"fixture row (tools/fixture-dirs.tsv), since a landing runs it on the fixture tier; only a family that predates "
+                            f"{RULE_DAY} is grandfathered, by a dated `fixture` waiver")
+        if "fixture" in w and w["fixture"].day > RULE_DAY:
+            findings.append(f"{t}: the family {fam}'s `fixture` waiver is dated {w['fixture'].day}, after the rule's day {RULE_DAY}: a waiver "
+                            "grandfathers a family that predates the rule, and a newer family has a fixture row")
+        if "fixture" in w and fr.fixture:
+            notes.append(f"{t}: the family {fam}'s `fixture` waiver is not needed: families.tsv says fixture yes; drop it")
+        # Tier main is the maintainer's call, recorded.
+        if fr.tier == "main" and "main" not in w:
+            findings.append(f"{t}: the family {fam} is tier main with no `main` waiver: main is the maintainer's call, recorded as "
+                            f"`main=PIN(YYYY-MM-DD): main by the {MAIN_CALL}`")
+        if "main" in w and MAIN_CALL not in w["main"].reason:
+            findings.append(f"{t}: the family {fam}'s `main` waiver does not name the {MAIN_CALL}'s call: {w['main'].reason!r}")
+        if "main" in w and fr.tier != "main":
+            notes.append(f"{t}: the family {fam}'s `main` waiver is not needed: its tier is {fr.tier}; drop it")
+    return findings, notes
+
+
+def shared_loads(recs: dict[str, recipes.Recipe], tables: Tables) -> dict[str, list[tuple[str, list[str], list[str]]]]:
+    """family -> [(profile, bins, gates)] for every real file (a BLOOMERY_MODEL profile a recipe's box call names) that the card gates of a
+    family run in more than one gate_* bin: gates that could be one bin with the clauses in it, each loading the file again. Report only."""
+    seen: dict[str, dict[str, tuple[set[str], list[str]]]] = {}
+    for n, row in sorted(tables.gates.items()):
+        rec = recs.get(n)
+        if row.cls != "family" or rec is None:
+            continue
+        try:
+            rc = recipes.recipe_commands(rec)
+            profiles = recipes.RecipeCommands(models=[m for m in rc.models if m]).profiles()
+        except recipes.RecipeError:
+            continue
+        bins = {b for inv in rc.invocations if inv.oxide for kind, b in inv.selectors if kind == "bin" and b and b.startswith(GATE_BIN)}
+        if not bins:
+            continue
+        for p in profiles:
+            have_bins, have_gates = seen.setdefault(row.family, {}).setdefault(p, (set(), []))
+            have_bins |= bins
+            have_gates.append(n)
+    return {fam: [(p, sorted(bs), gs) for p, (bs, gs) in sorted(by.items()) if len(bs) > 1] for fam, by in sorted(seen.items())
+            if any(len(bs) > 1 for bs, _ in by.values())}
+
+
+def budget_lines(tables: Tables, budgets: dict[str, BudgetRow]) -> list[str]:
+    """The budget table as it stands: per family (the larger real_s first) its tier, gate rows, real_s, gates with no row, budget_s and waivers."""
+    cnt: dict[str, int] = {}
+    for row in tables.gates.values():
+        if row.family:
+            cnt[row.family] = cnt.get(row.family, 0) + 1
+    out = [f"{'family':<18} {'tier':<5} {'gates':>5} {'real_s':>7} {'unrowed':>7} {'budget_s':>8}  waivers"]
+    for fam in sorted(budgets, key=lambda f: (-budgets[f].real_s, f)):
+        b = budgets[fam]
+        tier = tables.families[fam].tier if fam in tables.families else "?"
+        over = " OVER" if b.real_s > b.budget_s else ""
+        out.append(f"{fam:<18} {tier:<5} {cnt.get(fam, 0):>5} {b.real_s:>7} {b.unrowed:>7} {b.budget_s:>8}{over}  {' '.join(sorted(b.waivers)) or '-'}")
+    over_default = sorted(f for f, b in budgets.items() if b.real_s > DEFAULT_BUDGET_S)
+    out.append(f"{len(over_default)} family(ies) over the default {DEFAULT_BUDGET_S} s: {' '.join(over_default) or 'none'}")
+    return out
+
+
+def release_budget_lines(tables: Tables, budgets: dict[str, BudgetRow], costs: dict[str, FamilyCost], new: set[str]) -> list[str]:
+    """`release-list --wall`'s per-family table: the table's real_s and budget_s beside this run's medians (`live`), the families the real
+    tier holds first (`in`: main, or new since the base), a family over its budget or whose table has drifted flagged. The key '' of
+    `costs` is the gates no family owns."""
+    rows: list[tuple[int, str, str, int, int, int, int, int, str]] = []
+    for fam, c in costs.items():
+        b = budgets.get(fam)
+        tier = tables.families[fam].tier if fam in tables.families else ""
+        where = "always" if not fam else ("main" if tier == "main" else ("new" if fam in new else "-"))
+        real_s, budget_s = (b.real_s, b.budget_s) if b is not None else (0, 0)
+        flags = []
+        if fam and b is None:
+            flags.append("no budget row")
+        elif b is not None and c.real_s > b.budget_s:
+            flags.append("OVER budget")
+        if b is not None and abs(c.real_s - b.real_s) > max(STALE_MIN_S, STALE_FRAC * max(c.real_s, b.real_s)):
+            flags.append("table stale: budget --refresh")
+        rows.append((0 if where != "-" else 1, fam or "(common, tooling)", where, len(c.gates), real_s, c.real_s, c.unrowed, budget_s, ", ".join(flags)))
+    rows.sort(key=lambda r: (r[0], -r[5], r[1]))
+    out = [f"  {'family':<18} {'in':<6} {'gates':>5} {'real_s':>7} {'live':>6} {'unrowed':>7} {'budget_s':>8}"]
+    for _, name, where, n, real_s, live, unrowed, budget_s, flags in rows:
+        out.append(f"  {name:<18} {where:<6} {n:>5} {real_s if budget_s else '-':>7} {live:>6} {unrowed:>7} {budget_s or '-':>8}{('  ' + flags) if flags else ''}")
+    inside = [r for r in rows if r[0] == 0 and r[1] != "(common, tooling)"]
+    out.append(f"  the real tier holds {len(inside)} famil(ies) ({', '.join(r[1] + ' ' + r[2] for r in inside) or 'none'}): {sum(r[5] for r in inside)} s "
+               f"of live medians; a family new in a release adds at most its budget_s ({DEFAULT_BUDGET_S} s unless its row says more) to this list "
+               "and one +ship gate to the blocking set, and leaves the real tier at the release after")
+    return out
 
 
 # ---------------------------------------------------------------------------------------------- the summary
@@ -658,6 +964,8 @@ def _tree(tmp: Path) -> Path:
            "# recipe\tclass\tfamily\ttopic\towners\n"
            "gate-a\tfamily\tfam-a\tkernel\town-a\n"
            "gate-b\tcommon\t\thost\t-\n")
+    _write(root / BUDGET_TABLE, _budget_table(f"fam-a\t10\t0\t300\t{_waiver('main', 'main by the maintainer')}{WAIVER_SEP}{_waiver('fixture')}", "fam-b\t20\t1\t300\t-",
+                                                *(f"{g}\t0\t0\t300\t-" for g in DECLARED_GROUPS)))
     _write(root / recipes.FIXTURE_DIRS, "# arch\tdir\nfam-b\tfamb\nqwen38d\tself\nprof-cut\tcutdir\n")
     _write(root / recipes.REF_PATHS, ': "${BLOOMERY_MODEL:=${BLOOMERY_REF_MODEL_PROFILE:-deflt}}"\n')
     return root
@@ -700,6 +1008,224 @@ def kernel_self_test(expect: Callable[[bool, str], None]) -> None:
     expect(len(found) == 1 and "no gate launches it" in found[0], f"kernel rule: a kernel file no gate launches is red: {found}")
     expect(red({"crates/shared/z.rs": {}}, {"crates/shared/z.rs": "probe: no gate links it"}) == [], "kernel rule: a CARRIER_SKIP bin's file is not")
     expect(red({"crates/shared/z.rs": {"gate-k": DEP}}) != [], "kernel rule: a common gate's reach is no launch (a lib's tests reach every file)")
+
+
+def _budget_table(*rows: str) -> str:
+    return "# family\treal_s\tunrowed\tbudget_s\twaivers\n" + "".join(r + "\n" for r in rows)
+
+
+def _waiver(rule: str, reason: str = "why", day: str | datetime.date = RULE_DAY) -> str:
+    return f"{rule}=PIN({day}): {reason}"
+
+
+def budget_self_test(expect: Callable[[bool, str], None], tmp: Path) -> None:
+    """The budget rule on synthetic tables: each refusal on a table that breaks it (and the table that mends it green), the notes, the loader's
+    named errors, the refresh and the two reports."""
+    import contextlib
+    import inspect
+    import io
+
+    def raises(fn, text: str) -> bool:
+        try:
+            fn()
+        except GateClassError as e:
+            return text in str(e)
+        return False
+
+    expect(UNROWED_S == inspect.signature(recipes.predicted_wall).parameters["default"].default,
+           "budget: UNROWED_S is the price recipes.predicted_wall gives a gate with no real-tier row")
+
+    # Three families: fm (main, two +ship gates), fo (an ordinary one) and fn (no fixture, one gate).
+    fams = {"fm": FamilyRow("fm", "R", "main", ("crates/fm/**",), 7, True), "fo": FamilyRow("fo", "F", "other", ("crates/fo/**",), 30, True),
+            "fn": FamilyRow("fn", "F", "other", ("crates/fn/**",), 30, False)}
+    gates = {"gate-m-serve": GateRow("gate-m-serve", "family", "fm", "serve+ship", ()), "gate-m-two": GateRow("gate-m-two", "family", "fm", "twocard+ship", ()),
+             "gate-o": GateRow("gate-o", "family", "fo", "e2e", ()), "gate-n": GateRow("gate-n", "family", "fn", "e2e", ()),
+             "gate-c": GateRow("gate-c", "common", "", "kernel+kernel", ())}
+    t = Tables(gates, fams, {})
+    tier_main = _waiver("main", "main by the maintainer")
+
+    def good() -> dict[str, BudgetRow]:
+        return {"fm": BudgetRow("fm", 100, 0, 300, parse_waivers(WAIVER_SEP.join([tier_main, _waiver("ship")]), "t")),
+                "fo": BudgetRow("fo", 100, 0, 300, {}),
+                "fn": BudgetRow("fn", 100, 0, 300, parse_waivers(_waiver("fixture"), "t"))}
+
+    def with_row(fam: str, real: int | None = None, budget: int | None = None, waivers: str | None = None, tables: Tables = t,
+                 base: dict[str, BudgetRow] | None = None) -> tuple[list[str], list[str]]:
+        rows = dict(base if base is not None else good())
+        r = rows[fam]
+        rows[fam] = BudgetRow(fam, r.real_s if real is None else real, r.unrowed, r.budget_s if budget is None else budget,
+                              r.waivers if waivers is None else parse_waivers(waivers, "t"))
+        return budget_findings(tables, rows)
+
+    def names(found: list[str], *words: str) -> bool:
+        return len(found) == 1 and all(w in found[0] for w in words)
+
+    expect(budget_findings(t, good()) == ([], []), f"budget: the three families with their waivers are green with no note: {budget_findings(t, good())}")
+
+    # The budget: real_s over budget_s is red at 301 and green at 300; a budget over 300 carries its waiver, and real_s stays under it.
+    f, _ = with_row("fo", real=301)
+    expect(names(f, "family fo", "301 s", "budget_s of 300 s"), f"budget: real_s over budget_s is red, naming the family: {f}")
+    expect(with_row("fo", real=300)[0] == [], "budget: real_s equal to budget_s is green")
+    f, _ = with_row("fo", budget=500)
+    expect(names(f, "family fo", "no `budget` waiver"), f"budget: a budget_s over the default with no waiver is red: {f}")
+    expect(with_row("fo", real=500, budget=500, waivers=_waiver("budget"))[0] == [], "budget: a budget over the default with its dated waiver is green")
+    f, _ = with_row("fo", real=501, budget=500, waivers=_waiver("budget"))
+    expect(names(f, "family fo", "501 s"), f"budget: a family over a waived budget is red all the same: {f}")
+    f, n = with_row("fo", waivers=_waiver("budget"))
+    expect(f == [] and len(n) == 1 and "`budget` waiver is not needed" in n[0], f"budget: a budget waiver on a budget at the default is a note, not a finding: {f} {n}")
+
+    # One +ship gate: two are red with no waiver, naming them; one is green, and a waiver then is a note.
+    f, _ = with_row("fm", waivers=tier_main)
+    expect(names(f, "family fm", "2 +ship gates", "gate-m-serve gate-m-two"), f"budget: a second +ship gate with no waiver is red, naming both: {f}")
+    one = Tables({k: v for k, v in gates.items() if k != "gate-m-two"}, fams, {})
+    f, n = with_row("fm", tables=one)
+    expect(f == [] and len(n) == 1 and "`ship` waiver is not needed" in n[0], f"budget: one +ship gate is green and its waiver a note: {f} {n}")
+    bad_mark = Tables({**gates, "gate-m-two": GateRow("gate-m-two", "family", "fm", "twocard+sideways", ())}, fams, {})
+    f, _ = with_row("fm", tables=bad_mark)
+    expect(any("sideways" in x for x in f), f"budget: a release mark the table does not take is a finding, not a crash: {f}")
+    ship_common = Tables({**gates, "gate-c": GateRow("gate-c", "common", "", "kernel+ship", ())}, fams, {})
+    f, _ = with_row("fm", tables=ship_common)
+    expect(len(f) == 1 and "gate-c" in f[0] and "+ship marks one family's" in f[0], f"budget: a +ship on a row that names no family is a finding: {f}")
+
+    # A fixture: a family with gates and fixture no is red with no waiver and green with one dated on or before the rule's day, red after it;
+    # a family with no gate needs none; a waiver on a family that has a fixture is a note.
+    f, _ = with_row("fn", waivers="-")
+    expect(names(f, "family fn", "1 gate(s) and no fixture", "families.tsv fixture no"), f"budget: gates and no fixture, no waiver, is red: {f}")
+    nogate = Tables({k: v for k, v in gates.items() if k != "gate-n"}, fams, {})
+    expect(with_row("fn", waivers="-", tables=nogate)[0] == [], "budget: a family with no gate needs no fixture waiver")
+    expect(with_row("fn", waivers=_waiver("fixture", day=RULE_DAY - datetime.timedelta(days=30)))[0] == [], "budget: a fixture waiver dated before the rule's day is green")
+    f, _ = with_row("fn", waivers=_waiver("fixture", day=RULE_DAY + datetime.timedelta(days=1)))
+    expect(names(f, "family fn", "after the rule's day", str(RULE_DAY)), f"budget: a fixture waiver dated after the rule's day is red (a new family has a fixture): {f}")
+    f, n = with_row("fo", waivers=_waiver("fixture"))
+    expect(f == [] and len(n) == 1 and "`fixture` waiver is not needed" in n[0], f"budget: a fixture waiver on a family with a fixture is a note: {f} {n}")
+
+    # Tier main: red with no waiver, red when the waiver does not name the maintainer's call; a waiver on another tier is a note.
+    f, _ = with_row("fm", waivers=_waiver("ship"))
+    expect(names(f, "family fm", "tier main", "no `main` waiver"), f"budget: tier main with no waiver is red: {f}")
+    f, _ = with_row("fm", waivers=WAIVER_SEP.join([_waiver("main", "it is big"), _waiver("ship")]))
+    expect(names(f, "family fm", f"does not name the {MAIN_CALL}"), f"budget: a main waiver that names no maintainer's call is red: {f}")
+    f, n = with_row("fo", waivers=tier_main)
+    expect(f == [] and len(n) == 1 and "`main` waiver is not needed" in n[0], f"budget: a main waiver on an other family is a note: {f} {n}")
+
+    # The rows against families.tsv: a family with no row and a row with no family are red.
+    rows = good()
+    del rows["fo"]
+    f, _ = budget_findings(t, rows)
+    expect(names(f, "no row for the family fo", "budget --refresh"), f"budget: a family with no row is red, naming the fix: {f}")
+    rows = good()
+    rows["fz"] = BudgetRow("fz", 1, 0, 300, {})
+    f, _ = budget_findings(t, rows)
+    expect(names(f, "names the family fz", "families.tsv does not hold"), f"budget: a row of no family is red: {f}")
+
+    # The loader: its named errors, with the file and the line.
+    root = _tree(tmp / "budget-load")
+    path = root / BUDGET_TABLE
+
+    def loaded(*rows: str):
+        _write(path, _budget_table(*rows))
+        return lambda: load_budget(root)
+
+    expect(raises(loaded("fam-a\t1\t0\t300"), "family-budget.tsv:2: a row is not"), "budget load: a short row is a named error with the file and the line")
+    expect(raises(loaded("fam-a\tx\t0\t300\t-"), "`real_s` is not a whole number"), "budget load: a real_s that is no number is a named error")
+    expect(raises(loaded("fam-a\t1\t-1\t300\t-"), "`unrowed` is not a whole number"), "budget load: a negative unrowed is a named error")
+    expect(raises(loaded("fam-a\t1\t0\t0\t-"), "budget_s of 0"), "budget load: a budget of 0 is a named error")
+    expect(raises(loaded("fam-a\t1\t0\t300\t-", "fam-a\t1\t0\t300\t-"), "the family fam-a is listed twice"), "budget load: a family twice is a named error")
+    expect(raises(loaded("fam-a\t1\t0\t300\tmain by the maintainer"), "a waiver is `rule=PIN(YYYY-MM-DD): reason`"), "budget load: a waiver with no rule and no PIN is a named error")
+    expect(raises(loaded("fam-a\t1\t0\t300\tgate=PIN(2026-11-14): why"), "a waiver is `rule=PIN(YYYY-MM-DD): reason`"), "budget load: a rule the table does not take is a named error")
+    expect(raises(loaded("fam-a\t1\t0\t300\tmain=PIN(2026-13-45): why"), "dated 2026-13-45, which is no day"), "budget load: a waiver dated on no day is a named error")
+    expect(raises(loaded("fam-a\t1\t0\t300\tmain=PIN(2026-11-14): a | main=PIN(2026-11-14): b"), "the main waiver is listed twice"), "budget load: a rule twice in one row is a named error")
+    got = loaded("fam-a\t1\t2\t300\tmain=PIN(2026-11-14): by the maintainer | fixture=PIN(2026-11-01): predates")()
+    expect(got["fam-a"] == BudgetRow("fam-a", 1, 2, 300, {"main": Waiver(RULE_DAY, "by the maintainer"), "fixture": Waiver(datetime.date(2026, 11, 1), "predates")}),
+           f"budget load: a row and its two waivers parse: {got}")
+    path.unlink()
+    expect(raises(lambda: load_budget(root), "family-budget.tsv does not exist"), "budget load: a missing table is a named error")
+
+    # The costs: a gate costs the median of its last five real-tier rows, a gate with none is unrowed and costs nothing, a by-hand gate and a
+    # recipe the real tier does not run are no cost, a gate no family owns is the key '' and a family with no gate is zero.
+    classes = {"gate-o": ("A", "plain"), "gate-o2": ("B", "plain"), "gate-o3": ("A", "plain"), "gate-env": ("D", "needs-env"), "gate-m-serve": ("X", "plain"),
+               "gate-fixture": ("D", "fixture-only"), "gate-c": ("A", "plain"), "weekly-w": ("A", "plain")}
+    scope = {"gate-o": "fo", "gate-o2": "fo", "gate-o3": "fo", "gate-env": "fo", "gate-m-serve": "fm", "gate-fixture": "fo", "gate-c": "", "weekly-w": "fn"}
+    plain = {"gate-o": [("A", 900)] + [("A", s) for s in (10, 50, 30, 20, 40)], "gate-o2": [("B", 7)], "gate-m-serve": [("X", 11), ("X", 13)],
+             "gate-c": [("A", 5)], "gate-env": [("A", 999)], "weekly-w": [("A", 60)]}
+    costs = family_costs(t, classes, lambda n: GateScope(scope[n], "other", 30), plain)
+    expect(costs["fo"] == FamilyCost(("gate-o", "gate-o2", "gate-o3"), 37, 1),
+           f"costs: fo is the median of the last five rows of gate-o (30), gate-o2's one row (7) and one gate with none: {costs['fo']}")
+    expect(costs["fm"] == FamilyCost(("gate-m-serve",), 12, 0) and costs["fn"] == FamilyCost(("weekly-w",), 60, 0),
+           f"costs: a gate's median rounds half up, and a weekly recipe belongs to its profile's family: {costs['fm']} {costs['fn']}")
+    expect(costs[""] == FamilyCost(("gate-c",), 5, 0), f"costs: a gate no family owns is the key '': {costs['']}")
+    expect(costs["fo"].priced_s == 37 + UNROWED_S, "costs: the priced cost is real_s and each unrowed gate at the price")
+    expect("gate-env" not in costs["fo"].gates and "gate-fixture" not in costs["fo"].gates, "costs: a by-hand gate and a fixture-only one are no real-tier cost")
+    expect(set(costs) == {*fams, ""} and all(isinstance(c, FamilyCost) for c in costs.values()), f"costs: every family is in the result: {sorted(costs)}")
+
+    # The refresh: real_s and unrowed rewritten, every comment and every other field kept, a family with no row appended; the second run changes nothing.
+    old = _budget_table("# a note that stays", "fo\t1\t9\t450\tbudget=PIN(2026-11-14): kept", "fm\t12\t0\t300\t-", "fz\t3\t0\t300\t-")
+    text, changes = refresh_text(old, list(fams), costs)
+    lines = text.splitlines()
+    expect("# a note that stays" in lines and "fo\t37\t1\t450\tbudget=PIN(2026-11-14): kept" in lines, f"refresh: a row's real_s and unrowed move, its budget_s and waivers stay: {lines}")
+    expect("fm\t12\t0\t300\t-" in lines and "fz\t3\t0\t300\t-" in lines, "refresh: a row already right and a row of no family are kept as they were")
+    expect(f"fn\t60\t0\t{DEFAULT_BUDGET_S}\t-" in lines and len(changes) == 2, f"refresh: a family with no row gets one at the default budget: {changes}")
+    again, again_changes = refresh_text(text, list(fams), costs)
+    expect(again == text and again_changes == [], "refresh: a second refresh from the same times changes nothing")
+
+    # The command, end to end on a tree: --refresh writes the table, prints what moved and the gates with no row, and refuses a times file that
+    # is missing or holds no real-tier row (never a table of zeros).
+    root = _tree(tmp / "budget-cmd")
+    _write(root / "tools" / "gate-class.tsv", "# recipe\tclass\tfamily\ttopic\towners\ngate-a\tfamily\tfam-a\tkernel\town-a\ngate-b\tcommon\t\thost\t-\n")
+    cls_file, times_file = tmp / "budget-cmd.classes", tmp / "budget-cmd.times"
+    _write(cls_file, "gate-a\tA\tplain\tx\ngate-b\tA\tplain\tx\n")
+    _write(times_file, "".join(f"gate-a\tA\tnone\t{s}\t2026-11-14T00:00:0{i}+0900\n" for i, s in enumerate((100, 300, 200))) + "gate-b\tB\tnone\t8\t2026-11-14T00:00:09+0900\n"
+           + "gate-a@BLOOMERY_TIER=fixture\tA\tnone\t1\t2026-11-14T00:00:10+0900\n")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rc = main(["budget", "--refresh", "--root", str(root), "--times", str(times_file), "--classes", str(cls_file)])
+    shown = out.getvalue()
+    refreshed = load_budget(root)
+    expect(rc == 0 and refreshed["fam-a"].real_s == 200 and refreshed["fam-a"].budget_s == 300 and "main" in refreshed["fam-a"].waivers,
+           f"budget --refresh: fam-a's real_s is the median of its three real-tier rows, its fixture row not read, its waivers kept: {rc} {refreshed['fam-a']}")
+    expect("fam-a: real_s 10 -> 200" in shown and "fam-b: a new row" not in shown and "fam-a  " in shown,
+           f"budget --refresh: the moved row and the table are printed: {shown}")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        main(["budget", "--refresh", "--root", str(root), "--times", str(times_file), "--classes", str(cls_file)])
+    expect("0 row(s)" in out.getvalue(), f"budget --refresh: a second run changes no row: {out.getvalue().splitlines()[:1]}")
+    expect(raises(lambda: measured_costs(root, load(root), str(tmp / "no-such-times"), str(cls_file)), "does not exist"),
+           "budget --refresh: a missing times file is a named error")
+    _write(times_file, "gate-a@BLOOMERY_TIER=fixture\tA\tnone\t1\t2026-11-14T00:00:10+0900\n")
+    expect(raises(lambda: measured_costs(root, load(root), str(times_file), str(cls_file)), "holds no real-tier row"),
+           "budget --refresh: a times file with no real-tier row is a named error")
+
+    # `check` holds the table: a tree whose table is right is green, one whose family is over its budget is red, one with no table is a named error.
+    root = _tree(tmp / "budget-check")
+    expect(check(root, load(root), no_kernels) == [], f"budget check: the tree's table is green: {check(root, load(root), no_kernels)}")
+    _write(root / BUDGET_TABLE, (root / BUDGET_TABLE).read_text(encoding="utf-8").replace("fam-b\t20\t1\t300", "fam-b\t301\t1\t300"))
+    found = check(root, load(root), no_kernels)
+    expect(len(found) == 1 and "family fam-b" in found[0] and "301 s" in found[0], f"budget check: a family over its budget turns `check` red: {found}")
+    (root / BUDGET_TABLE).unlink()
+    expect(raises(lambda: check(root, load(root), no_kernels), "family-budget.tsv does not exist"), "budget check: a tree with no budget table is a named error")
+
+    # The gates that load one real file in several bins: report only.
+    _write(root / "justfile", "".join(
+        f"gate-{n}:\n    {env}./tools/box.sh 'cargo oxide build --arch sm_86 -- -p bloomery-gpu-gates --release --bin {b} && bash tools/gpu-gate.sh {b}'\n\n"
+        for n, env, b in (("x1", "BLOOMERY_MODEL=m1 ", "gate_one"), ("x2", "BLOOMERY_MODEL=m1 ", "gate_two"), ("x3", "BLOOMERY_MODEL=m2 ", "gate_one"),
+                          ("x4", "", "gate_three"), ("x5", "BLOOMERY_MODEL=m1 ", "gate_one"), ("x6", "BLOOMERY_MODEL=m1 ", "bloomery-serve"))))
+    sg = Tables({n: GateRow(n, "family", f, "e2e", ()) for n, f in (("gate-x1", "fx"), ("gate-x2", "fx"), ("gate-x3", "fx"), ("gate-x4", "fx"),
+                                                                   ("gate-x5", "fy"), ("gate-x6", "fy"))}, {}, {})
+    shared = shared_loads(recipes.load_justfile(str(root / "justfile")), sg)
+    expect(shared == {"fx": [("m1", ["gate_one", "gate_two"], ["gate-x1", "gate-x2"])]},
+           f"shared loads: a family's two gate bins on one profile are reported; one bin on a profile, a gate with no profile and a tool bin are not: {shared}")
+
+    # The two reports.
+    budgets = {"fm": BudgetRow("fm", 100, 0, 300, {}), "fo": BudgetRow("fo", 100, 0, 300, {}), "fn": BudgetRow("fn", 10, 0, 300, {})}
+    live = {"fm": FamilyCost(("g1",), 100, 0), "fo": FamilyCost(("g2", "g3"), 350, 1), "fn": FamilyCost(("g4",), 500, 0), "": FamilyCost(("g5",), 70, 0)}
+    text = "\n".join(release_budget_lines(t, budgets, live, {"fo"}))
+    expect("OVER budget" in text and "table stale" in text and "(common, tooling)" in text, f"release table: a family over its budget and a stale table are flagged: {text}")
+    row = {ln.split()[0]: ln for ln in text.splitlines()[1:-1]}
+    expect(row["fm"].split()[1] == "main" and row["fo"].split()[1] == "new" and row["fn"].split()[1] == "-" and text.index("  fo ") < text.index("  fm ") < text.index("  fn "),
+           f"release table: the families the real tier holds come first (the larger live cost first), tagged main or new: {text}")
+    expect("OVER budget" in row["fo"] and "OVER budget" in row["fn"] and "OVER" not in row["fm"], f"release table: only the families whose live cost is over are flagged: {text}")
+    lines = budget_lines(t, {**budgets, "fn": BudgetRow("fn", 400, 0, 450, {})})
+    expect(lines[-1] == f"1 family(ies) over the default {DEFAULT_BUDGET_S} s: fn" and lines[1].startswith("fn "),
+           f"budget table: the larger real_s first, and the last line counts the families over the default: {lines}")
 
 
 def self_test() -> int:
@@ -923,6 +1449,7 @@ def self_test() -> int:
         _write(root / recipes.FIXTURE_DIRS, dirs)
         expect(check(root, load(root), no_kernels) == [], "check: the fixture column restored is green")
         kernel_self_test(expect)
+        budget_self_test(expect, tmp)
 
         # The tree's own tables: they load and they are green.
         try:
@@ -952,6 +1479,36 @@ def self_test() -> int:
     return 0
 
 
+def cmd_budget(args: argparse.Namespace) -> int:
+    """`budget`: the family budget table; --refresh first rewrites its real_s and unrowed from the times file; --shared adds the families whose
+    gates load one real file in several bins."""
+    root = Path(args.root)
+    tables = load(root)
+    if args.refresh:
+        costs = measured_costs(root, tables, args.times, args.classes)
+        path = root / BUDGET_TABLE
+        text, changes = refresh_text(path.read_text(encoding="utf-8"), list(tables.families), costs)
+        if changes:
+            path.write_text(text, encoding="utf-8")
+        print(f"budget --refresh: {len(changes)} row(s) of {BUDGET_TABLE} changed from {args.times}")
+        for c in changes:
+            print(f"  {c}")
+        unrowed = {f: c.unrowed for f, c in costs.items() if c.unrowed}
+        if unrowed:
+            print("budget --refresh: gates with no real-tier row (in no real_s; release-list --wall prices each at "
+                  f"{UNROWED_S} s): " + ", ".join(f"{f or '(common, tooling)'} {n}" for f, n in sorted(unrowed.items())))
+    budgets = load_budget(root)
+    print("\n".join(budget_lines(tables, budgets)))
+    if args.shared:
+        recs = recipes.load_justfile(str(root / "justfile"))
+        shared = shared_loads(recs, tables)
+        print(f"{len(shared)} family(ies) whose card gates load one real file in more than one bin (could be one bin, report only):")
+        for fam, groups in shared.items():
+            for profile, bins, gate_names in groups:
+                print(f"  {fam}: profile {profile}: {len(bins)} bins in {len(gate_names)} gates: {' '.join(bins)}")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if argv == ["--self-test"]:
         return self_test()
@@ -959,18 +1516,30 @@ def main(argv: list[str]) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("check", help="the findings of the design's checks; rc 1 when there is one")
     sub.add_parser("summary", help="the counts per class, per family and per owner")
+    bp = sub.add_parser("budget", help="the family budget table (tools/family-budget.tsv) as it stands")
+    bp.add_argument("--refresh", action="store_true", help="first rewrite real_s and unrowed of every row from the times file (a family with no row gets one)")
+    bp.add_argument("--times", default=os.environ.get("BLOOMERY_GATE_TIMES", os.path.expanduser("~/.cache/bloomery/gate-times.tsv")),
+                    help="the times file the medians come from (--refresh)")
+    bp.add_argument("--classes", help="a saved `tools/gate-batch.sh --tier fixture --classes` (default: run it; --refresh)")
+    bp.add_argument("--shared", action="store_true", help="also list the families whose card gates load one real file in more than one bin")
+    bp.add_argument("--root", default=str(ROOT), help="the tree whose tables are read (default this one)")
     args = ap.parse_args(argv)
     try:
+        if args.cmd == "budget":
+            return cmd_budget(args)
         tables = load(ROOT)
         if args.cmd == "summary":
             print(summary(tables))
             return 0
         findings = check(Path(ROOT), tables)
+        notes = budget_findings(tables, load_budget(Path(ROOT)))[1]
     except (GateClassError, recipes.RecipeError) as e:
         print(f"gate_class.py: {e}", file=sys.stderr)
         return 2
     for f in findings:
         print(f"RED  {f}")
+    for n in notes:
+        print(f"note {n}")
     print(f"gate_class check: {len(findings)} finding(s)")
     return 1 if findings else 0
 

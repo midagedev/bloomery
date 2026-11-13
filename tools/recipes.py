@@ -16672,6 +16672,7 @@ REAL_TIER_CLASSES = "ABCFX"
 # moved model file makes red first.
 ROTATION_CHECKS = ("refset-check",)
 LOCK_WAIT = 1.57  # the factor a predicted wall carries over the medians (the lock waits)
+RELEASE_TARGET_S = 1800  # the release check's wall target: 30 min (the maintainer, 2026-11-12), held by the blocking set
 
 
 def fixture_class_rows(root: str = ROOT) -> dict[str, tuple[str, str]]:
@@ -16979,7 +16980,33 @@ def cmd_release_blocking(args: argparse.Namespace, b: Side, tables, classes: dic
         wall, terms, _items = batch_plan(bl.names, REAL_TIER, b.tree.root, dict(os.environ, BLOOMERY_GATE_TIMES=args.times))
         print(f"release-list --blocking: the predicted wall {wall} s, the batch's own plan of the set on the real tier "
               f"(tools/gate-batch.sh --dry-run --tier real): {terms}", file=sys.stderr)
+        print(f"release-list --blocking: {wall} s is {100 * wall // RELEASE_TARGET_S} % of the {RELEASE_TARGET_S} s release target", file=sys.stderr)
     return 0
+
+
+def family_wall_lines(args: argparse.Namespace, b: Side, tables, classes: dict[str, tuple[str, str]], scope_of, new: set[str],
+                      blocking: list[str], plain: dict[str, list[tuple[str, int]]]) -> list[str]:
+    """`release-list --wall`'s two additions: each family's real_s and budget_s of tools/family-budget.tsv beside the live medians of this
+    run (gate_class.release_budget_lines), and the release check's own predicted wall, the blocking set's plan, against RELEASE_TARGET_S."""
+    gate_class = _gate_class()
+    out: list[str] = []
+    try:
+        budgets = gate_class.load_budget(b.tree.root)
+    except gate_class.GateClassError as err:
+        out.append(f"release-list: no per-family table ({err})")
+    else:
+        out.append("release-list: the real tier by family (real_s and budget_s: tools/family-budget.tsv, which `python3 tools/gate_class.py budget "
+                   "--refresh` writes from the times file; live: this run's medians; in: the real tier holds the family at this release; unrowed: "
+                   f"gates with no real-tier row, in no number here, {gate_class.UNROWED_S} s each in the wall above):")
+        out.extend(gate_class.release_budget_lines(tables, budgets, gate_class.family_costs(tables, classes, scope_of, plain), new))
+    try:
+        wall, _terms, _items = batch_plan(blocking, REAL_TIER, b.tree.root, dict(os.environ, BLOOMERY_GATE_TIMES=args.times))
+        out.append(f"release-list: the release check (the blocking set, {len(blocking)} gate(s); release-list --blocking --wall) is predicted at {wall} s "
+                   f"by the batch's plan, {100 * wall // RELEASE_TARGET_S} % of its {RELEASE_TARGET_S} s target; a family new in a release adds its +ship "
+                   "gate there")
+    except RecipeError as err:
+        out.append(f"release-list: the blocking set's plan is not available ({err})")
+    return out
 
 
 def cmd_release_list(args: argparse.Namespace) -> int:
@@ -17006,6 +17033,8 @@ def cmd_release_list(args: argparse.Namespace) -> int:
         gate_class = _gate_class()
         affected, aff_left = gate_class.partition(list(class_picks(changed, a, b, tables).kept), scope_of, new)
         mac, mac_left = gate_class.partition([n for n, _why in mac_gguf_cuda(b.recipes, b.tree.root)], scope_of, new)
+        fixture, plain = times_rows(args.times) if args.wall else ({}, {})
+        wall_lines = family_wall_lines(args, b, tables, classes, scope_of, new, bl.names, plain) if args.wall else []
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     names, counts = release_union({**rt.parts, "blocking": bl.names, "affected": affected, "mac GGUF": mac})
@@ -17024,11 +17053,12 @@ def cmd_release_list(args: argparse.Namespace) -> int:
     for line in left_out_lines(left, tables, Ledger(args.ledger), datetime.datetime.now().astimezone()):
         print(line, file=sys.stderr)
     if args.wall:
-        fixture, plain = times_rows(args.times)
         run = [n for n in names if classes.get(n, ("", ""))[1] != "needs-env"]
         w = predicted_wall(run, fixture, plain)
         print(f"release-list: the predicted wall {w['wall']} s of the real-tier medians (lanes A {w['A']} B {w['B']} X {w['X']}, "
               f"the medians sum {w['sum']} s, {w['unrowed']} gate(s) with no real-tier row at 45 s), × {args.lock_wait:g} = {int(w['wall'] * args.lock_wait)} s", file=sys.stderr)
+        for line in wall_lines:
+            print(line, file=sys.stderr)
     return 0
 
 

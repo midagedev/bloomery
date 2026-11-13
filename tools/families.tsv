@@ -18,6 +18,9 @@
 #            (tools/gate_class.py TIER_DAYS; `gate_class.py check` holds the column to the tier)
 #   fixture  yes (tools/fixture-dirs.tsv names a fixture directory for the family, not `self`) or no; `gate_class.py check`
 #            holds the column to that table
+# The release budget of each family (its real-tier seconds, its `budget_s`, and the dated waivers for a `main` tier, a second `+ship`
+# gate and a `no` fixture) is tools/family-budget.tsv's; `gate_class.py check` holds both tables to the rule, AGENTS.md's "A new
+# model adds the least to every later release".
 deepseek2	F	other	crates/model/src/arch/deepseek2/** crates/gpu/src/arch/deepseek2/** crates/gpu/src/probe.rs	30	no
 deepseek41	R	main	crates/gpu-deepseek41/** crates/model/src/arch/deepseek41/** crates/refset/src/arch/deepseek41/** crates/refset/src/arch/deepseek41v/** crates/vision/src/arch/deepseek41v/** crates/gpu-gates/src/bin/gate_deepseek41_*.rs crates/gpu-gates/src/bin/gate_ds41_*.rs crates/gpu-gates/src/bin/gate_dspark_*.rs crates/gpu-gates/src/bin/shared/ds41_*.rs crates/gpu-gates/src/bin/shared/dspark_hf.rs crates/gpu-gates/src/bin/shared/serve_seats/ds41.rs crates/gpu-gates/src/bin/shared/routed_legs/deepseek41.rs	7	yes
 flint	F	other	crates/model/src/arch/flint/** crates/model/tests/flint_meta.rs crates/gpu-flint/** crates/app/src/arch/flint.rs crates/gpu-gates/src/bin/shared/serve_seats/flint.rs crates/gpu/src/attention_h128.rs crates/gpu/src/attention_h128_ring.rs crates/gpu/src/flash_gqa_h128_swa.rs crates/gpu/src/qk_rms.rs crates/gpu-gates/src/bin/gate_flint_attn.rs crates/gpu-gates/src/bin/gate_flint_router.rs	30	no

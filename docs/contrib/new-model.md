@@ -242,7 +242,50 @@ Bookkeeping that turns a check red when missed (`just check-recipes`, A):
 - `tools/ref/ptx-shapes.tsv:200-202` for each PTX entry (the cc 12.1 tables in `tools/ref/ptx-shapes/` take the entry's row
   from a scan on a cc 12.1 card); `tools/unsafe-ratchet.txt:174` for a new crate;
 - the hard-coded device-crate list in `tools/recipes.py:8499`; `[[bin]] required-features` in
-  `crates/gpu-gates/Cargo.toml`; a new workspace member in the root `Cargo.toml:3`.
+  `crates/gpu-gates/Cargo.toml`; a new workspace member in the root `Cargo.toml:3`;
+- `tools/family-budget.tsv`: one row for the family, `<family>` tab `0` tab `0` tab `300` tab `-` (the maintainer's
+  `budget --refresh` writes the numbers once the gates have run in the real tier); the next section is why.
+
+## What a new model costs a release
+
+The rule (`AGENTS.md`, Conventions, "A new model adds the least to every later release"): a model added makes every later
+release's verification grow by as little as it can. The standing targets are a landing check of at most 10 minutes and a
+release check of at most 30. So a new family in `tools/families.tsv`:
+
+- is tier `other`; `main` is the maintainer's call, recorded as a dated `main` waiver in `tools/family-budget.tsv`;
+- carries at most one `+ship` gate in `tools/gate-class.tsv`, its serve gate: the `+ship` gates of a family that is in the
+  release's real tier block the release;
+- has a fixture row (`fixture` yes, and a directory in `tools/fixture-dirs.tsv`), so a landing runs it on the fixture tier;
+- has real-tier gates whose medians sum to at most its `budget_s`, 300 s unless its row has a dated `budget` waiver.
+
+`python3 tools/gate_class.py check` (in `just check-recipes`) refuses a family that breaks one of the four, by name. What a
+release pays for a family: the release it is new in (`gate_class.new_families`: it has a file of its own that the last tag
+lacks) puts the family's real-tier gates in that release's real tier, whatever its tier. They add at most `budget_s` to the
+night's list and its one `+ship` gate to the blocking set (`release-list --blocking`). After that release the gates leave the
+real tier for the night and the 30-day rotation, and a later release pays nothing for the family unless it is `main`. Two
+rules the check cannot read are the reviewer's: the clauses of a family share one load of the file (below), and none pins what
+a common gate already pins.
+
+**The numbers.** `real_s` is the sum, over the family's real-tier gates, of the median of each gate's last five real-tier rows
+in `gate-times.tsv`. CI has no such file, so `real_s` is data in the repo, written by `python3 tools/gate_class.py budget
+--refresh` on the machine that holds it; you add the row with zeros and the maintainer refreshes it once the gates have run
+in the real tier. `unrowed` counts the gates with no real-tier row yet: no number holds them until they have run. A budget
+over 300 s is a `budget` waiver with its date and reason, and moves down when a cut makes it reachable. Eleven families that
+predate the rule are over 300 s today and are grandfathered at their sum plus a fifth. `tools/gate-budget.py` holds the other
+two pins, each blocking gate's median and the landing walls.
+
+**Reading `python3 tools/recipes.py release-list --wall`** (about 45 s on a Mac; the live numbers need `gate-times.tsv`).
+Besides the predicted wall of the release list it prints one line a family: `in` is `main` or `new` when the real tier holds
+the family at this release; `real_s` and `budget_s` are the table's; `live` is this run's medians; `unrowed` is as above. A
+family over its budget, or one whose table no longer matches the medians (run `budget --refresh`), is flagged. The last line is
+the release check, the blocking set's own plan, against its 1800 s.
+
+**Sharing one load.** A gate that loads the file once and holds every clause is cheaper than several that each load it, and
+the budget is what makes the difference visible. `qwen38d` does it: one recipe, `gate-gpu-qwen38d`, one bin,
+`gate_qwen35_dense`, whose clauses (a) to (f) are the shared module `crates/gpu-gates/src/bin/shared/dense_e2e.rs` that every
+dense Body35 file uses, so a new dense file adds its row of constants and its sets, not a gate. `python3 tools/gate_class.py
+budget --shared` lists the families whose card gates run more than one `gate_*` bin on one real file today; a family that
+shows up there is a candidate to fold, and the report refuses nothing.
 
 ## Common code first
 

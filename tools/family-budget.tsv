@@ -1,0 +1,46 @@
+# The release budget of each family (tools/gate_class.py reads it; `gate_class.py check` holds the rule, `budget` prints the table).
+# family<TAB>real_s<TAB>unrowed<TAB>budget_s<TAB>waivers
+#   family    a row of tools/families.tsv; a family with no row is red (`python3 tools/gate_class.py budget --refresh` adds it)
+#   real_s    seconds: the sum, over the family's real-tier gates, of the median of each gate's last five real-tier rows in gate-times.tsv.
+#            A family's real-tier gates are the recipes a real-tier batch runs unattended, whether its tier is main or other; a by-hand
+#            gate (tools/ref/needs-env.sh) is none. Measured, and written only by `gate_class.py budget --refresh` on the machine that
+#            holds gate-times.tsv (CI has none): run it when a gate is added, cut or reshaped, and after a release batch
+#   unrowed   how many of those gates have no real-tier row yet. They are in no real_s (a gate no batch has timed is not a number);
+#            `release-list --wall` prices each at 45 s, and a family with any is under-counted here until its real tier has run
+#   budget_s  the most real_s may reach: 300 unless the row has a `budget` waiver. A budget moves down when a cut makes it reachable and
+#            up only with a dated reason
+#   waivers   `-`, or entries `rule=PIN(YYYY-MM-DD): reason` joined by ` | `. The rules, each the exception to one line of AGENTS.md's
+#            "A new model adds the least to every later release":
+#              budget   budget_s over 300. A grandfather row is the day's real_s plus a fifth for the run-to-run spread, to the next 10 s
+#              ship     more than one +ship gate (a family's serve gate is the one that blocks a release)
+#              main     tier main: the maintainer's call, which the reason names
+#              fixture  families.tsv fixture no on a family with gates. It grandfathers a family that predates the rule (2026-11-14), so a
+#                       waiver dated after that day is refused: a newer family has a fixture row
+#            A waiver nothing needs any more is a note of `check`; drop it.
+deepseek2	68	2	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+deepseek41	2597	3	3120	budget=PIN(2026-11-14): grandfathered at the day's real_s of 2597 s plus a fifth, to the next 10 s; a cut lowers it | main=PIN(2026-11-14): main by the maintainer
+flint	71	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+exaone-moe	421	0	510	budget=PIN(2026-11-14): grandfathered at the day's real_s of 421 s plus a fifth, to the next 10 s; a cut lowers it
+gemma-embedding	67	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+gemma-embedding2	132	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+gemma4a	140	1	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+gemma4v	4	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+glm5next	2299	2	2760	budget=PIN(2026-11-14): grandfathered at the day's real_s of 2299 s plus a fifth, to the next 10 s; a cut lowers it | ship=PIN(2026-11-14): main family; its serve gate and its two-card gate both block a release (the 2026-11-12 release marks) | main=PIN(2026-11-14): main by the maintainer
+lfm3	4	1	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+llama	95	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+mimo2	875	0	1050	budget=PIN(2026-11-14): grandfathered at the day's real_s of 875 s plus a fifth, to the next 10 s; a cut lowers it
+minicpmv47	41	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+minimax-m3	1412	0	1700	budget=PIN(2026-11-14): grandfathered at the day's real_s of 1412 s plus a fifth, to the next 10 s; a cut lowers it
+nemotron_h	142	0	300	-
+nemotron_h_moe	434	0	530	budget=PIN(2026-11-14): grandfathered at the day's real_s of 434 s plus a fifth, to the next 10 s; a cut lowers it
+qwen3	0	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+qwen35	121	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+qwen35moe	272	0	300	-
+qwen38d	41	0	300	-
+qwen3moe	789	0	950	budget=PIN(2026-11-14): grandfathered at the day's real_s of 789 s plus a fifth, to the next 10 s; a cut lowers it
+qwen4exp	3413	1	4100	budget=PIN(2026-11-14): grandfathered at the day's real_s of 3413 s plus a fifth, to the next 10 s; a cut lowers it | ship=PIN(2026-11-14): main family; its serve gate and its two-card gate both block a release (the 2026-11-12 release marks) | main=PIN(2026-11-14): main by the maintainer
+solar-open2	382	0	460	budget=PIN(2026-11-14): grandfathered at the day's real_s of 382 s plus a fifth, to the next 10 s; a cut lowers it
+raon1	111	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+muse-spark	3894	0	4680	budget=PIN(2026-11-14): grandfathered at the day's real_s of 3894 s plus a fifth, to the next 10 s; a cut lowers it
+mistral-large4	2373	0	2850	budget=PIN(2026-11-14): grandfathered at the day's real_s of 2373 s plus a fifth, to the next 10 s; a cut lowers it
+kimi-k3	6	10	300	-

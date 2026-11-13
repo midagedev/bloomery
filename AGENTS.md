@@ -205,6 +205,14 @@ forced_exact count pin, the reference gates).
   common owners it covers, named in `tools/owners.tsv`), and every family a row in `tools/families.tsv` (rep R or F,
   tier `main` or `other`, its own-file globs). `tools/gate_class.py check` (in `just check-recipes`) holds them to the justfile and the arch
   registry. A new model's gates are `family` rows of an F family.
+- **A new model adds the least to every later release.** Its family row is tier `other` (`main` only by the
+  maintainer's call), so after the release it lands in, its gates leave the release's real tier for the night and the
+  rotation. It carries at most one `+ship` gate (its serve gate). Its clauses share one load of a file (one bin, many
+  clauses), and none pins what a common gate already pins: review holds these two (`tools/gate_class.py budget
+  --shared` lists the families that load one file in several bins). It has a fixture row, so a landing runs it on the
+  fixture tier. Its real-tier gates sum to at most its `budget_s` in `tools/family-budget.tsv` (300 s unless a dated waiver says
+  more; `real_s` is the medians in `gate-times.tsv`, written by `tools/gate_class.py budget --refresh`);
+  `tools/gate_class.py check` refuses a family over it, with a second `+ship` gate, or with no fixture row.
 - **Record lines have one owner:** a `Kind` (the card binaries' kinds in `crates/gpu-gates/src/record.rs`), rendered by
   `Record` (`crates/record`, the core), which panics by name on a value out of order, missing or of another type
   (`<bin> --records-schema` prints the kinds). Readers go through `tools/bloomery/records.py` by kind and field.
