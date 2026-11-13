@@ -40,6 +40,7 @@ use crate::model::lookup::{f32_gain, f32_tensor, kq_weight};
 use crate::q4k_sel::QuantSel;
 use crate::q38::{EmbedArgs, EmbedRows, OutGateArgs};
 use crate::quant_sel::QuantSelKernels;
+use crate::route_softmax::NORM_K;
 use crate::site::{self, Order};
 use crate::tensor::Q8Act;
 use crate::weights::{DevWeight, HEAD_TENSOR, Weights};
@@ -236,9 +237,10 @@ pub(super) fn enqueue_pass(
 ///   launches, conv, delta, gated norm, quantizer and output projection —
 ///   8 — plus a Q6_K q·k·v projection's token-major copy at more than one
 ///   row.
-/// - FFN: the norm with the router (one launch), gate·up, one quantizer
-///   over every token's slots, the down `_sel` over every token's slots,
-///   and the combine — 5.
+/// - FFN: the norm with the router (one launch, two when the residual row
+///   is wider than the fold's shared row: [`unfolded`]), gate·up, one
+///   quantizer over every token's slots, the down `_sel` over every token's
+///   slots, and the combine — 5.
 ///
 /// - A dense FFN: `norm_quant` and the four launches after the router — 5;
 ///   an unfused gate·up is the gate, the up and the SwiGLU; a Q8_0 down is
@@ -268,7 +270,7 @@ pub(super) fn enqueue_pass(
 /// takes the f32 out gate and its own quantizer in place of the gated one, except
 /// where the gated flash stores the gated rows (`wide::flash_gates`): there the
 /// quantizer alone, none for F32.
-pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
+pub(super) fn pass_launches(plans: &[LayerPlan], m: usize, hidden: usize) -> usize {
     let wide = m > GEMV_COLS;
     let many = usize::from(m > 1);
     let site = |t: SiteTy| site_launches(t, m);
@@ -307,6 +309,10 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
             }
         };
         let f = &p.ffn;
+        let split_norm = match &f.route {
+            FfnRoute::Router { shared, .. } => usize::from(unfolded(shared.as_ref(), hidden)),
+            FfnRoute::Dense => 0,
+        };
         let ffn = match (&f.route, wide) {
             (
                 FfnRoute::Router {
@@ -322,7 +328,7 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                 },
                 false,
             ) => {
-                1 + usize::from(reads_f32(sh))
+                1 + split_norm
                     + 4
                     + site(sh.gate_ty)
                     + site(sh.up_ty)
@@ -332,7 +338,7 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize) -> usize {
                     + 1
             }
             (FfnRoute::Router { .. }, true) => 10,
-            (FfnRoute::Router { .. }, false) => 5,
+            (FfnRoute::Router { .. }, false) => 5 + split_norm,
             (FfnRoute::Dense, true) => 1 + wide_quants(&[f.gate_ty, f.up_ty]) + 5,
             (FfnRoute::Dense, false) => {
                 let gate_up = if gate_up_fused(f) {
@@ -1035,6 +1041,20 @@ fn gated_256(
     )
 }
 
+/// Whether a routed FFN's norm runs apart from the router's launch at one to [`GEMV_COLS`] rows,
+/// as `norm_quant` and then the router over its f32 rows (the bytes the fused norm and router
+/// write), for the residual row of `hidden` values and the shared expert `shared`. The fold keeps
+/// the normed row in the router launch's shared memory, which takes [`NORM_K`] values, so a wider
+/// row takes the two launches; so does a shared expert kept apart whose gate or up reads the f32
+/// rows.
+fn unfolded(shared: Option<&SharedPlan>, hidden: usize) -> bool {
+    match shared {
+        Some(SharedPlan::Apart(sh)) if reads_f32(sh) => true,
+        Some(_) => hidden > NORM_K,
+        None => false,
+    }
+}
+
 /// The FFN half's front at `m` rows: the norm with its quantizer and the
 /// router's pick of every token's slots; a dense FFN's norm alone; past
 /// [`GEMV_COLS`] rows the wide arm's ([`wide::route`]).
@@ -1060,7 +1080,8 @@ fn gated_256(
 /// depend on the columns beside it). The norm runs inside the router's
 /// launch, `norm_quant`'s bytes: `enqueue_norm_fused` at one token,
 /// `enqueue_norm_fused_m` at more; a shared expert kept apart whose gate or
-/// up reads f32 rows takes `norm_quant` and the router on those rows.
+/// up reads f32 rows, or a residual row wider than the fold's shared row
+/// ([`NORM_K`]), takes `norm_quant` and the router on those rows.
 pub(super) fn route(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Result<(), GpuError> {
     if m > GEMV_COLS {
         return wide::route(c, n, s, m);
@@ -1085,29 +1106,26 @@ pub(super) fn route(c: &Ctx<'_>, n: &FfnPlan, s: &mut Arena, m: usize) -> Result
         }
     };
     let router = f32_tensor(w, gate_inp)?;
+    if unfolded(shared.as_ref(), s.dims.hidden) {
+        gpu.fused().enqueue_norm_quant(
+            stream,
+            &s.ffn_inp,
+            gain,
+            c.eps,
+            &mut s.act_ffn[i],
+            &mut s.normed,
+            c.sink,
+        )?;
+        return k.q35(WHAT)?.router.enqueue_fused(
+            stream,
+            router,
+            &s.normed,
+            m,
+            c.sink,
+            s.route.gated(WHAT)?,
+        );
+    }
     match shared {
-        // A shared expert kept apart whose gate or up reads the f32 normed
-        // rows: `norm_quant` writes them beside their q8_1, then the router
-        // reads them — the bytes the fused norm and router write.
-        Some(SharedPlan::Apart(sh)) if reads_f32(sh) => {
-            gpu.fused().enqueue_norm_quant(
-                stream,
-                &s.ffn_inp,
-                gain,
-                c.eps,
-                &mut s.act_ffn[i],
-                &mut s.normed,
-                c.sink,
-            )?;
-            k.q35(WHAT)?.router.enqueue_fused(
-                stream,
-                router,
-                &s.normed,
-                m,
-                c.sink,
-                s.route.gated(WHAT)?,
-            )?;
-        }
         None if m == 1 => k.router.enqueue_norm_fused(
             stream,
             router,
@@ -1575,14 +1593,17 @@ fn apart_down(
 
 #[cfg(test)]
 mod tests {
-    use super::{pass_launches, reads_q8_1, wide_quants};
+    use super::{NORM_K, pass_launches, reads_q8_1, unfolded, wide_quants};
     use crate::arch::qwen3moe::plan::fixtures::layer;
-    use crate::arch::qwen3moe::plan::{FfnRoute, GqaKind, Pairs, SiteTy};
+    use crate::arch::qwen3moe::plan::{FfnRoute, GqaKind, Pairs, SharedPlan, SharedSites, SiteTy};
     use crate::site::{Form, kgemv_order, reads_at};
+
+    /// A residual row the router's fold takes.
+    const HIDDEN: usize = 2048;
 
     /// The launches of a one-layer pass at `m` rows, less the embedding.
     fn one(kind: GqaKind, tys: [SiteTy; 4], m: usize) -> usize {
-        pass_launches(&[layer(kind, tys)], m) - 1
+        pass_launches(&[layer(kind, tys)], m, HIDDEN) - 1
     }
 
     /// A layer's attention launches follow its sites' types: the fused Q4_K
@@ -1654,7 +1675,7 @@ mod tests {
             let mut p = layer(GqaKind::Neox128, [Q4K; 4]);
             p.ffn.route = FfnRoute::Dense;
             [p.ffn.gate_ty, p.ffn.up_ty, p.ffn.down_ty] = [gate_up, gate_up, down];
-            pass_launches(&[p], m)
+            pass_launches(&[p], m, HIDDEN)
         };
         // The embedding, the fused attention's 7 and the FFN.
         assert_eq!(launches(Q4K, Q4K, 1), 1 + 7 + 5);
@@ -1670,5 +1691,48 @@ mod tests {
         }
         assert_eq!(wide_quants(&[Q4K, Nvfp4]), 2);
         assert_eq!(wide_quants(&[Q8_0, Nvfp4]), 1);
+    }
+
+    /// The FFN's norm joins the router's launch only where the fold's shared row holds the
+    /// residual row: a wider one (hidden 3072) takes `norm_quant` and the router, one launch more
+    /// a layer at one to [`super::GEMV_COLS`] rows, and none past it, where the norm is apart at
+    /// every width. A shared expert kept apart whose gate or up reads f32 rows takes the two
+    /// launches at any width, a plain router (no shared expert) never does.
+    #[test]
+    fn a_residual_row_wider_than_the_fold_splits_the_router_norm() {
+        let apart = |ty: SiteTy| {
+            Some(SharedPlan::Apart(SharedSites {
+                gate: String::new(),
+                up: String::new(),
+                down: String::new(),
+                gate_ty: ty,
+                up_ty: ty,
+                down_ty: ty,
+            }))
+        };
+        let joined = || Some(SharedPlan::Joined);
+        assert!(!unfolded(joined().as_ref(), NORM_K));
+        assert!(unfolded(joined().as_ref(), NORM_K + 128));
+        assert!(!unfolded(apart(SiteTy::Q4K).as_ref(), NORM_K));
+        assert!(unfolded(apart(SiteTy::Q4K).as_ref(), 3072));
+        assert!(unfolded(apart(SiteTy::Q8_0).as_ref(), NORM_K));
+        assert!(!unfolded(None, 3072));
+        let launches = |shared: Option<SharedPlan>, hidden: usize, m: usize| {
+            let mut p = layer(GqaKind::Gated256, [SiteTy::Q4K; 4]);
+            p.ffn.route = FfnRoute::Router {
+                gate_inp: String::new(),
+                shared,
+            };
+            pass_launches(&[p], m, hidden)
+        };
+        for m in [1, 2, 8] {
+            assert_eq!(
+                launches(joined(), 3072, m),
+                launches(joined(), HIDDEN, m) + 1,
+                "{m} rows"
+            );
+        }
+        assert_eq!(launches(joined(), 3072, 9), launches(joined(), HIDDEN, 9));
+        assert_eq!(launches(None, 3072, 1), launches(None, HIDDEN, 1));
     }
 }

@@ -54,15 +54,11 @@ impl PlanDims {
                 ));
             }
         };
-        let ff = match spec.layers.first().map(|l| &l.ffn) {
-            Some(Ffn::Moe(m)) => m.expert_ff,
-            Some(Ffn::Dense { ff, .. }) => *ff,
-            None => return Err(ChainError::shape(what, "no layer to size the FFN for")),
-        };
+        let ff = first_ffn_width(spec, what)?;
         let (heads, kv_heads, head) = (g.heads as usize, g.kv_heads as usize, g.head_dim as usize);
         Ok(PlanDims {
             hidden: spec.hidden as usize,
-            ff: ff as usize,
+            ff,
             q_rows: gate * heads * head,
             kv_len: kv_heads * head,
             attn_len: heads * head,
@@ -70,19 +66,29 @@ impl PlanDims {
     }
 
     /// The row counts the card's qwen35moe plan reads its sites at, from `spec`'s description:
-    /// its first attention layer's head counts and the geometry the card's kernels are built
-    /// for — [`q35::HEAD_DIM`] values an attention head, a routed expert's [`q35::EXPERT_FF`].
+    /// its first attention layer's head counts, the geometry the card's kernels are built for —
+    /// [`q35::HEAD_DIM`] values an attention head — and its first layer's FFN width.
     pub fn q35(spec: &ModelSpec, what: &'static str) -> Result<PlanDims, ChainError> {
         let g = first_gqa(spec, what)?;
         let (n_head, n_kv) = (g.heads as usize, g.kv_heads as usize);
         let head = q35::HEAD_DIM as usize;
         Ok(PlanDims {
             hidden: spec.hidden as usize,
-            ff: q35::EXPERT_FF as usize,
+            ff: first_ffn_width(spec, what)?,
             q_rows: 2 * n_head * head,
             kv_len: n_kv * head,
             attn_len: n_head * head,
         })
+    }
+}
+
+/// `spec`'s first layer's FFN width: a routed expert's values, or a dense FFN's. A layer with
+/// another count is refused by name when its own sites are read at these rows.
+fn first_ffn_width(spec: &ModelSpec, what: &'static str) -> Result<usize, ChainError> {
+    match spec.layers.first().map(|l| &l.ffn) {
+        Some(Ffn::Moe(m)) => Ok(m.expert_ff as usize),
+        Some(Ffn::Dense { ff, .. }) => Ok(*ff as usize),
+        None => Err(ChainError::shape(what, "no layer to size the FFN for")),
     }
 }
 
@@ -885,8 +891,8 @@ mod tests {
     };
     use crate::ChainError;
     use crate::arch::qwen3moe::plan::fixtures::{
-        delta, dense_layer, gqa, head128_gqa, layer, lfm3_conv, lfm3_gqa, lfm3_layer, q30_gqa,
-        q30_layer, spec,
+        delta, dense_layer, gqa, gqa_of, head128_gqa, layer, lfm3_conv, lfm3_gqa, lfm3_layer,
+        q30_gqa, q30_layer, spec,
     };
     use crate::arch::qwen3moe::plan::{Kind35, kinds_of, kinds35};
     use crate::linear::Ring;
@@ -1138,6 +1144,33 @@ mod tests {
             &Sites35::CARD,
         );
         assert_eq!(card.map(|g| g.kind).ok(), Some(GqaKind::Gated256));
+    }
+
+    /// The card's plan rows come from the file's shapes: a 122B-class description (hidden 3072,
+    /// 32/2 heads of 256, routed and shared experts of 1024) reads to the rows its tensors have,
+    /// and the chain's rows are the same.
+    #[test]
+    fn the_card_plan_dims_are_the_files() {
+        let mut l = layer(gqa_of(32, 2));
+        if let Ffn::Moe(m) = &mut l.ffn {
+            m.expert_ff = 1024;
+            if let Some(s) = &mut m.shared {
+                s.ff = 1024;
+            }
+        }
+        let spec = spec(vec![l], 3072);
+        let pd = PlanDims::q35(&spec, "t").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            pd,
+            PlanDims {
+                hidden: 3072,
+                ff: 1024,
+                q_rows: 2 * 32 * 256,
+                kv_len: 2 * 256,
+                attn_len: 32 * 256,
+            }
+        );
+        assert_eq!(PlanDims::of(&spec, "t").ok(), Some(pd));
     }
 
     /// Qwen3-30B-A3B's description reads to whole-head NEOX attention over the group flash with

@@ -348,9 +348,9 @@ pub const AVAILABLE: &[Available] = &[
             matches!(
                 n,
                 Need::Shared {
-                    ff: 512,
+                    ff,
                     sigmoid_gate: true
-                }
+                } if *ff > 0 && ff.is_multiple_of(256)
             )
         },
     },
@@ -2471,6 +2471,31 @@ mod tests {
         ] {
             assert!(!runs(&need), "{what} read as covered: {need}");
         }
+    }
+
+    /// `Body35` runs the sigmoid-gated shared expert at the width of its file, as one more slot
+    /// of the joined stacks: any width of whole K-quant super-blocks (Qwen3.6's 512, a 1024), and
+    /// no other (Qwen3.8's 640 is `Body38`'s own entry). FAIL-first: the row pinned to 512 reads
+    /// 1024 as unserved.
+    #[test]
+    fn body35s_shared_expert_is_any_whole_super_block_width() {
+        use super::AVAILABLE;
+        let runs = |program: Program, ff: u32| {
+            let need = Need::Shared {
+                ff,
+                sigmoid_gate: true,
+            };
+            AVAILABLE
+                .iter()
+                .any(|a| a.programs.contains(&program) && (a.runs)(&need))
+        };
+        for ff in [512, 768, 1024, 2048] {
+            assert!(runs(Program::Qwen35Body, ff), "a shared expert of {ff}");
+        }
+        for ff in [0, 640, 1000] {
+            assert!(!runs(Program::Qwen35Body, ff), "a shared expert of {ff}");
+        }
+        assert!(runs(Program::Qwen38Body, 640) && !runs(Program::Qwen38Body, 1024));
     }
 
     /// The head-128 group-of-7 flash and the head-128 NORM rope without a

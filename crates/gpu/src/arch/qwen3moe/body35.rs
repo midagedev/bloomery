@@ -95,7 +95,7 @@ use super::placed::{
 use super::plan::{
     FfnPlan, FfnRoute, Flash, GqaKind, Kind35, LayerPlan, MixerPlan, ResidualPlan, SharedPlan,
     SiteTy, down_sel, gate_up_fused, input_fused, kind35, kinds35, moe_fits, o_fused, out_fused,
-    q35, qkv_fused,
+    qkv_fused,
 };
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
@@ -140,7 +140,7 @@ use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
 use gguf::{Split, TensorInfo};
 use model::arch::Arch;
 use model::arch::models::shape::MoeShape;
-use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, MtpDraft, OutGate};
+use model::arch::models::{Ffn, LayerSpec, Mixer, ModelSpec, Moe, MtpDraft, OutGate};
 pub(super) use model::arch::names::blk;
 use model::placement::{CardFormat, Plan, WholeLoad};
 use runtime::prompt::{CallEnd, fold_marks, heat_call};
@@ -1048,18 +1048,19 @@ fn ffn_dims(spec: &ModelSpec) -> Result<(Option<RouterDims>, usize), GpuError> {
     });
     match (routed.next(), dense.next()) {
         (Some(first), None) => {
-            if let Some(other) = routed.find(|m| MoeShape::of(m) != MoeShape::of(first)) {
+            let shape = |m: &Moe| (MoeShape::of(m), m.expert_ff);
+            if let Some(other) = routed.find(|m| shape(m) != shape(first)) {
                 return Err(GpuError::shape(
                     WHAT,
                     format!(
                         "two routed shapes, {:?} and {:?}; one arena serves one",
-                        MoeShape::of(first),
-                        MoeShape::of(other)
+                        shape(first),
+                        shape(other)
                     ),
                 ));
             }
             let router = moe_fits(first, WHAT)?;
-            Ok((Some(router), q35::EXPERT_FF as usize))
+            Ok((Some(router), first.expert_ff as usize))
         }
         (None, Some(ff)) => match dense.find(|&o| o != ff) {
             Some(other) => Err(GpuError::shape(
@@ -1622,7 +1623,7 @@ impl Body35 {
     /// row, the copy of its residual row into its head and the head's three.
     #[must_use]
     pub fn pass_launches(&self, m: usize) -> usize {
-        dispatch::pass_launches(&self.plans, m)
+        dispatch::pass_launches(&self.plans, m, self.s.dims.hidden)
     }
 
     /// The flash pass this body runs: `true` for the tensor-core pass.

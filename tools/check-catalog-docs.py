@@ -68,6 +68,7 @@ OUTSIDE_SEATS = {
 # Rows of docs/models.md that name no catalog model, and why.
 OUTSIDE_MODELS = {
     "ornith-1.5-35b-a3b": "a qwen3 seat file with no catalog row yet",
+    "ornith-1.5-122b": "a qwen3 seat file with no catalog row yet (a placed load on one 48 GB card)",
     "clef-flash": "a decision model: the catalog holds chat models",
     "lev": "a decision model: the catalog holds chat models",
     "raon-1-mini-preview": "the raon1 seat has no catalog row yet",

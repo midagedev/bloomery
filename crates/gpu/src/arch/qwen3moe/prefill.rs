@@ -362,7 +362,10 @@ impl Body {
         } = prefill;
         let io = slot_windows[m - 1].io();
         let graph = gpu.capture(|_| dispatch::enqueue_pass(&c, kv, a, &io, m))?;
-        let (nodes, launches) = (graph.node_count(), dispatch::pass_launches(plans, m));
+        let (nodes, launches) = (
+            graph.node_count(),
+            dispatch::pass_launches(plans, m, a.dims.hidden),
+        );
         if nodes != launches {
             return Err(GpuError::shape(
                 WHAT,

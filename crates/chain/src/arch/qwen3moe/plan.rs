@@ -537,16 +537,15 @@ pub enum Kind35 {
 
 /// The geometry the card's kernels are built for: query heads of 256 with
 /// 64 values turned, in groups the shape table's head-256 rows of eight or
-/// of pairs take; delta heads of 128 with a 4-tap conv; experts of 512 with
-/// a sigmoid-gated shared expert of 512, or a dense FFN of whole K-quant
+/// of pairs take; delta heads of 128 with a 4-tap conv; routed experts and a
+/// sigmoid-gated shared expert of one width, or a dense FFN, of whole K-quant
 /// super-blocks. The routed experts' count and the experts a token keeps are
 /// the router instance's the file's shape selects ([`RouterDims::of`]); the
-/// head counts are the file's.
+/// head counts and the FFN widths are the file's.
 pub mod q35 {
     pub const HEAD_DIM: u32 = 256;
     pub const ROPE_DIMS: u32 = 64;
-    pub const EXPERT_FF: u32 = 512;
-    /// Values of a K-quant super-block: a dense width's unit.
+    /// Values of a K-quant super-block: a routed, shared or dense FFN width's unit.
     pub(crate) const SUPER_BLOCK: u32 = 256;
 }
 
@@ -593,9 +592,9 @@ pub fn kinds_of(layers: &[LayerSpec]) -> Result<Vec<Kind35>, ChainError> {
 }
 
 /// Layer `l`'s mixer kind for the card: [`kind_of`], and the layer is the
-/// gated attention of head 256 with routed experts of [`q35::EXPERT_FF`] and
-/// their shared expert, or a dense FFN, the instances the card's kernels are
-/// built for. Any other layer is refused by name with what it holds.
+/// gated attention of head 256 with routed experts and their shared expert of
+/// whole super-blocks ([`q35::SUPER_BLOCK`]), or a dense FFN, the instances
+/// the card's kernels are built for. Any other layer is refused by name with what it holds.
 pub fn kind35(s: &LayerSpec, l: usize) -> Result<Kind35, ChainError> {
     let kind = kind_of(s, l)?;
     card_fits(s).map_err(|d| ChainError::shape(WHAT, format!("layer {l}: {d}")))?;
@@ -870,22 +869,22 @@ fn delta_shape(d: &DeltaRule) -> Result<LinearShape, String> {
 
 /// The router `m` runs on when it is the routed FFN of the card's instances
 /// ([`kind35`]): its mixture's shape as [`kind_of`] reads it, with experts of
-/// [`q35::EXPERT_FF`] and the shared expert the gated router carries; any
-/// other is refused by name as `what`'s.
+/// whole super-blocks ([`q35::SUPER_BLOCK`]) and the shared expert the gated
+/// router carries; any other is refused by name as `what`'s.
 pub fn moe_fits(m: &Moe, what: &'static str) -> Result<RouterDims, ChainError> {
     card_router(m).map_err(|e| ChainError::shape(what, e))
 }
 
 /// [`moe_fits`]'s router, or why the card's instances do not run `m`.
 fn card_router(m: &Moe) -> Result<RouterDims, String> {
-    use q35::EXPERT_FF;
     let router = moe_router(m)?;
-    if router.gated() && m.expert_ff == EXPERT_FF {
+    if router.gated() && m.expert_ff > 0 && m.expert_ff.is_multiple_of(q35::SUPER_BLOCK) {
         Ok(router)
     } else {
         Err(format!(
-            "experts {m:?}; the card's kernels take experts of {EXPERT_FF} and their sigmoid-gated \
-             shared expert"
+            "experts {m:?}; the card's kernels take experts of whole super-blocks of {} values \
+             and their sigmoid-gated shared expert",
+            q35::SUPER_BLOCK
         ))
     }
 }
@@ -923,6 +922,9 @@ pub(crate) mod fixtures {
         ModelSpec, Moe, OutGate, Residual, Rope, RopeMode, Router, RouterNorm, Score, Shared,
         ShortConv,
     };
+
+    /// Qwen3.6's routed and shared expert width.
+    pub const EXPERT_FF: u32 = 512;
 
     /// Qwen3.6's 16/2 heads.
     pub fn gqa() -> Mixer {
@@ -974,7 +976,7 @@ pub(crate) mod fixtures {
             ffn: Ffn::Moe(Moe {
                 experts: 256,
                 top_k: 8,
-                expert_ff: q35::EXPERT_FF,
+                expert_ff: EXPERT_FF,
                 latent: None,
                 pre_exp_norm: false,
                 post_exp_norm: None,
@@ -988,7 +990,7 @@ pub(crate) mod fixtures {
                     hash: false,
                 },
                 shared: Some(Shared {
-                    ff: q35::EXPERT_FF,
+                    ff: EXPERT_FF,
                     act: Act::SwiGlu { limit: None },
                     sigmoid_gate: true,
                 }),
@@ -1146,8 +1148,8 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::fixtures::{
-        delta, dense_layer, gqa, gqa_of, head128_gqa, layer, lfm3_conv, lfm3_gqa, lfm3_layer,
-        q30_gqa, q30_layer,
+        EXPERT_FF, delta, dense_layer, gqa, gqa_of, head128_gqa, layer, lfm3_conv, lfm3_gqa,
+        lfm3_layer, q30_gqa, q30_layer,
     };
     use super::{
         Flash, GqaKind, Kind35, Pairs, gqa_class, kind_of, kind35, kinds_of, kinds35, moe_fits,
@@ -1533,19 +1535,25 @@ mod tests {
         }
     }
 
-    /// The chain reads layers by geometry and holds no backend's instance: routed experts of 768
-    /// and Qwen3-30B-A3B's attention are read by [`kind_of`], and the card's entry points, whose
-    /// kernels are built for experts of 512 and the gated head of 256, refuse each by name.
+    /// The chain reads layers by geometry and holds no backend's instance: routed experts of 640
+    /// (no whole K-quant super-block) and Qwen3-30B-A3B's attention are read by [`kind_of`], and
+    /// the card's entry points, whose kernels are built for experts of whole super-blocks and the
+    /// gated head of 256, refuse each by name.
+    // PIN(2026-11-14): the refused expert width is 640 (was 768). The card's kernels read the
+    // routed stacks and the shared expert at the file's width in whole K-quant super-blocks of 256
+    // (`rows_per_expert` and `n_sb` are launch arguments, as a dense FFN's width already is), so
+    // 768 is a width the card runs; 640 is not (2.5 super-blocks). FAIL-first: the guard removed
+    // accepts 640 and this test is red.
     #[test]
     fn the_card_refuses_what_the_chain_reads() {
         let mut wide = layer(delta());
         if let Ffn::Moe(m) = &mut wide.ffn {
-            m.expert_ff = 768;
+            m.expert_ff = 640;
             if let Some(s) = &mut m.shared {
-                s.ff = 768;
+                s.ff = 640;
             }
         }
-        for (what, l) in [("experts of 768", &wide), ("head 128", &q30_layer())] {
+        for (what, l) in [("experts of 640", &wide), ("head 128", &q30_layer())] {
             assert!(kind_of(l, 0).is_ok(), "{what}");
             match kind35(l, 0) {
                 Err(e) => assert!(e.to_string().contains("layer 0:"), "{what}: {e}"),
@@ -1561,6 +1569,33 @@ mod tests {
             panic!("a routed layer")
         };
         assert!(moe_fits(m, "t").is_ok());
+    }
+
+    /// The routed experts' width comes from the file: every width of whole super-blocks runs with
+    /// a shared expert of the same width, and a shared expert of another width is refused by
+    /// name.
+    #[test]
+    fn the_expert_width_is_the_files() {
+        let with = |ff: u32, shared_ff: u32| {
+            let mut l = layer(delta());
+            if let Ffn::Moe(m) = &mut l.ffn {
+                m.expert_ff = ff;
+                if let Some(s) = &mut m.shared {
+                    s.ff = shared_ff;
+                }
+            }
+            l
+        };
+        for ff in [EXPERT_FF, 768, 1024, 2048] {
+            let got = kinds35(&[with(ff, ff)]);
+            assert!(got.is_ok(), "{ff}: {got:?}");
+        }
+        for (ff, shared_ff) in [(1024, 512), (0, 0), (1000, 1000)] {
+            match kinds35(&[layer(delta()), with(ff, shared_ff)]) {
+                Err(e) => assert!(e.to_string().contains("layer 1:"), "{ff}/{shared_ff}: {e}"),
+                Ok(k) => panic!("{ff}/{shared_ff} accepted: {k:?}"),
+            }
+        }
     }
 
     /// LFM3's layers read by their geometry: a short conv is its ring (seven taps keep the reach
