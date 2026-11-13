@@ -1,0 +1,4 @@
+ffn_(gate|up)_exps\.weight$=iq2_xxs
+ffn_down_exps\.weight$=q4_k
+\.(attn_k|attn_output|attn_q|attn_v|ffn_down|ffn_gate|ffn_up|ffn_down_shexp|ffn_gate_shexp|ffn_up_shexp)\.weight$=q8_0
+nextn\.eh_proj\.weight$=q8_0

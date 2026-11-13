@@ -161,11 +161,12 @@ fn want_window(l: usize) -> Option<u32> {
 }
 
 /// Every tensor of [`tensors`] in a type the architecture's stem table allows
-/// (`gguf::arch::exaone_moe`): the routed stacks Q4_K, the embedding and the
-/// head, the trunk projections and the shared experts Q8_0, the rest F32 —
-/// the bootstrap mix, so the read's type check and a plan read both admit the
-/// file.
-fn table_typed() -> Vec<(String, Vec<u64>, Ty)> {
+/// (`gguf::arch::exaone_moe`): the routed stacks of the mix the caller names,
+/// the embedding and the head, the trunk projections and the shared experts
+/// Q8_0, the rest F32 — so the read's type check and a plan read both admit
+/// the file. `exps` is the routed stacks' gate-and-up type and their down's.
+fn table_typed_as(exps: (Ty, Ty)) -> Vec<(String, Vec<u64>, Ty)> {
+    let (gate_up, down) = exps;
     tensors()
         .into_iter()
         .map(|(name, dims)| {
@@ -175,7 +176,8 @@ fn table_typed() -> Vec<(String, Vec<u64>, Ty)> {
                 .map_or(name.as_str(), |(_, stem)| stem);
             let ty = match stem {
                 "token_embd.weight" | "output.weight" => Ty::Q8_0,
-                s if s.ends_with("_exps.weight") => Ty::Q4K,
+                "ffn_gate_exps.weight" | "ffn_up_exps.weight" => gate_up,
+                "ffn_down_exps.weight" => down,
                 "attn_q.weight"
                 | "attn_k.weight"
                 | "attn_v.weight"
@@ -192,6 +194,11 @@ fn table_typed() -> Vec<(String, Vec<u64>, Ty)> {
             (name, dims, ty)
         })
         .collect()
+}
+
+/// [`table_typed_as`] at the bootstrap mix: every routed stack Q4_K.
+fn table_typed() -> Vec<(String, Vec<u64>, Ty)> {
+    table_typed_as((Ty::Q4K, Ty::Q4K))
 }
 
 /// The read of a shaped `exaone-moe` header of `kv` and `ts`, every tensor in
@@ -750,6 +757,61 @@ fn a_tensor_of_a_type_the_stem_table_does_not_hold_is_refused() {
             assert!(detail.contains("q4_K"), "{detail}");
             assert!(detail.contains("q8_0 or bf16"), "{detail}");
             assert!(detail.contains("1 such"), "{detail}");
+        }
+        other => panic!("the wrong type is refused, got {other:?}"),
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+/// The second quant's mix — the routed stacks' gate and up IQ2_XXS, their
+/// downs Q4_K, what the imatrix run over the bootstrap file writes — and the
+/// one-Spark file's, every routed stack IQ1_S, both read like the bootstrap's
+/// (the stem table holds their types). Mutant: the second quant's gate-and-up
+/// type cut from the table's list (the first test then refuses the file).
+#[test]
+fn the_second_quant_and_spark_mixes_read_like_the_bootstrap() {
+    for (tag, mix) in [
+        ("second-quant", (Ty::Iq2Xxs, Ty::Q4K)),
+        ("spark", (Ty::Iq1S, Ty::Iq1S)),
+    ] {
+        let path = header_typed(
+            &format!("exaone-{tag}"),
+            "exaone-moe",
+            &keys(),
+            &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
+            &table_typed_as(mix),
+        );
+        let split = gguf::Split::open(&path).unwrap();
+        let r = read(&split).unwrap_or_else(|e| panic!("{tag}: {e}"));
+        assert_eq!(r.spec.layers.len(), TRUNK, "{tag}");
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+/// The second quant's gate-and-up type on the downs is a type no file holds
+/// there (the pick's downs are Q4_K), and the read refuses it by name with the
+/// types the stem takes. Mutant: IQ2_XXS added to the down's list.
+#[test]
+fn the_second_quants_gate_up_type_on_the_downs_is_refused() {
+    let mut ts = table_typed_as((Ty::Iq2Xxs, Ty::Q4K));
+    let down = ts
+        .iter_mut()
+        .find(|(name, _, _)| name == "blk.2.ffn_down_exps.weight")
+        .expect("a routed block's down");
+    down.2 = Ty::Iq2Xxs;
+    let path = header_typed(
+        "exaone-down-iq2xxs",
+        "exaone-moe",
+        &keys(),
+        &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
+        &ts,
+    );
+    let split = gguf::Split::open(&path).unwrap();
+    match read(&split) {
+        Err(PlacementError::Tensor { name, detail }) => {
+            assert_eq!(name, "blk.2.ffn_down_exps.weight", "{name}");
+            assert!(detail.contains("iq2_xxs"), "{detail}");
+            assert!(detail.contains("q4_K"), "{detail}");
         }
         other => panic!("the wrong type is refused, got {other:?}"),
     }

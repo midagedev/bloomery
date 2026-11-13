@@ -1,11 +1,14 @@
 //! K-EXAONE-2.0's header facts: the architecture word and the quant types each tensor stem may
 //! carry.
 //!
-//! One table holds the two files the engine opens of this model:
+//! One table holds the four files the engine opens of this model:
 //! - the engine's own quantization of the checkpoint (the bootstrap set of the quant path: no
 //!   importance matrix, K-quants only): the routed stacks Q4_K, the trunk — the attention, the
 //!   dense lead's and the MTP block's feed-forward projections, the shared experts — Q8_0, the
 //!   head Q8_0, F32 norms, router and correction bias;
+//! - the box's second quant (what the bootstrap file exists to make, over this engine's own
+//!   importance matrix): the routed stacks' gate and up IQ2_XXS, their downs Q4_K;
+//! - the one-Spark file: every routed stack IQ1_S, the smallest set the Spark's budget reads;
 //! - the checkpoint as `prepare` writes it: the routed stacks in the checkpoint's FP8_B128
 //!   blocks, the trunk Q8_0 (an FP8 projection decoded exactly and quantized again, which is how
 //!   the map reads it), BF16 for the head, the embedding and the MTP block as stored, F32 norms,
@@ -33,8 +36,16 @@ const TRUNK_Q8: &[GgmlType] = &[GgmlType::Q8_0];
 const EMBED: &[GgmlType] = &[GgmlType::Q8_0, GgmlType::BF16];
 /// The head: the bootstrap set's Q8_0 and the checkpoint's BF16.
 const HEAD: &[GgmlType] = &[GgmlType::Q8_0, GgmlType::BF16];
-/// The routed stacks: the bootstrap set's Q4_K and the checkpoint's FP8_B128.
-const ROUTED: &[GgmlType] = &[GgmlType::Q4_K, GgmlType::FP8_B128];
+/// The routed stacks' gate and up: the bootstrap set's Q4_K, the second quant's IQ2_XXS, the
+/// Spark file's IQ1_S and the checkpoint's FP8_B128.
+const ROUTED_IN: &[GgmlType] = &[
+    GgmlType::Q4_K,
+    GgmlType::IQ2_XXS,
+    GgmlType::IQ1_S,
+    GgmlType::FP8_B128,
+];
+/// The routed stacks' downs: the same list less the second quant's IQ2_XXS, whose down is Q4_K.
+const ROUTED_DOWN: &[GgmlType] = &[GgmlType::Q4_K, GgmlType::IQ1_S, GgmlType::FP8_B128];
 
 /// Every tensor stem of a K-EXAONE-2.0 file (the name past `blk.N.` for a block's tensor, the
 /// whole name for a model-level one) with the types it may carry.
@@ -57,9 +68,9 @@ pub const STEM_TYPES: &[(&str, &[GgmlType])] = &[
     // A routed block's: the router, its bias, the routed stacks and the shared expert.
     ("ffn_gate_inp.weight", F32),
     ("exp_probs_b.bias", F32),
-    ("ffn_gate_exps.weight", ROUTED),
-    ("ffn_up_exps.weight", ROUTED),
-    ("ffn_down_exps.weight", ROUTED),
+    ("ffn_gate_exps.weight", ROUTED_IN),
+    ("ffn_up_exps.weight", ROUTED_IN),
+    ("ffn_down_exps.weight", ROUTED_DOWN),
     ("ffn_gate_shexp.weight", TRUNK_Q8),
     ("ffn_up_shexp.weight", TRUNK_Q8),
     ("ffn_down_shexp.weight", TRUNK_Q8),
@@ -88,29 +99,78 @@ pub fn is_arch(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{ARCH, STEM_TYPES, allowed_types, is_arch};
-    use crate::GgmlType::{self, BF16, F32, FP8_B128, Q4_K, Q8_0};
+    use crate::GgmlType::{self, BF16, F32, FP8_B128, IQ1_S, IQ2_XXS, Q4_K, Q8_0};
 
-    /// A stem's type in each of the two files the table accepts, `None` where the file has no
-    /// such tensor: the bootstrap set and the checkpoint as `prepare` writes it.
-    type Profiles = (&'static str, [Option<GgmlType>; 2]);
+    /// A stem's type in each of the four files the table accepts, `None` where the file has no
+    /// such tensor: the bootstrap set, the box's second quant, the one-Spark file and the
+    /// checkpoint as `prepare` writes it.
+    type Profiles = (&'static str, [Option<GgmlType>; 4]);
 
     const PROFILES: &[Profiles] = &[
-        ("token_embd.weight", [Some(Q8_0), Some(BF16)]),
-        ("output.weight", [Some(Q8_0), Some(BF16)]),
-        ("attn_q.weight", [Some(Q8_0), Some(Q8_0)]),
-        ("attn_k.weight", [Some(Q8_0), Some(Q8_0)]),
-        ("attn_v.weight", [Some(Q8_0), Some(BF16)]),
-        ("attn_output.weight", [Some(Q8_0), Some(Q8_0)]),
-        ("ffn_gate_shexp.weight", [Some(Q8_0), Some(Q8_0)]),
-        ("ffn_up_shexp.weight", [Some(Q8_0), Some(Q8_0)]),
-        ("ffn_down_shexp.weight", [Some(Q8_0), Some(Q8_0)]),
-        ("ffn_gate.weight", [Some(Q8_0), Some(BF16)]),
-        ("ffn_up.weight", [Some(Q8_0), Some(BF16)]),
-        ("ffn_down.weight", [Some(Q8_0), Some(BF16)]),
-        ("nextn.eh_proj.weight", [Some(Q8_0), Some(BF16)]),
-        ("ffn_gate_exps.weight", [Some(Q4_K), Some(FP8_B128)]),
-        ("ffn_up_exps.weight", [Some(Q4_K), Some(FP8_B128)]),
-        ("ffn_down_exps.weight", [Some(Q4_K), Some(FP8_B128)]),
+        (
+            "token_embd.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(BF16)],
+        ),
+        (
+            "output.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(BF16)],
+        ),
+        (
+            "attn_q.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(Q8_0)],
+        ),
+        (
+            "attn_k.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(Q8_0)],
+        ),
+        (
+            "attn_v.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(BF16)],
+        ),
+        (
+            "attn_output.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(Q8_0)],
+        ),
+        (
+            "ffn_gate_shexp.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(Q8_0)],
+        ),
+        (
+            "ffn_up_shexp.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(Q8_0)],
+        ),
+        (
+            "ffn_down_shexp.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(Q8_0)],
+        ),
+        (
+            "ffn_gate.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(BF16)],
+        ),
+        (
+            "ffn_up.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(BF16)],
+        ),
+        (
+            "ffn_down.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(BF16)],
+        ),
+        (
+            "nextn.eh_proj.weight",
+            [Some(Q8_0), Some(Q8_0), Some(Q8_0), Some(BF16)],
+        ),
+        (
+            "ffn_gate_exps.weight",
+            [Some(Q4_K), Some(IQ2_XXS), Some(IQ1_S), Some(FP8_B128)],
+        ),
+        (
+            "ffn_up_exps.weight",
+            [Some(Q4_K), Some(IQ2_XXS), Some(IQ1_S), Some(FP8_B128)],
+        ),
+        (
+            "ffn_down_exps.weight",
+            [Some(Q4_K), Some(Q4_K), Some(IQ1_S), Some(FP8_B128)],
+        ),
     ];
 
     /// The stems every file holds in F32.
@@ -127,11 +187,11 @@ mod tests {
         "nextn.shared_head_norm.weight",
     ];
 
-    /// One table accepts the two files: every stem of each profile is listed in the type that
+    /// One table accepts the four files: every stem of each profile is listed in the type that
     /// profile holds it in, and a stem no profile holds is no stem. Mutant: a profile's type cut
-    /// from its stem's list (the Q8_0 the bootstrap holds, the FP8_B128 the checkpoint does).
+    /// from its stem's list (the Q8_0 the bootstrap holds, the IQ2_XXS the second quant does).
     #[test]
-    fn one_table_accepts_the_two_files() {
+    fn one_table_accepts_the_four_files() {
         assert_eq!(ARCH, "exaone-moe");
         assert!(is_arch(ARCH) && !is_arch("exaone"));
         for (stem, profile) in PROFILES {
@@ -200,8 +260,9 @@ mod tests {
 
     /// A type no file holds at a stem is not listed: the checkpoint's FP8_B128 on a trunk
     /// projection (the map quantizes it), a K-quant beside it on the norms and the router, BF16
-    /// on the shared experts, and an I-quant on the routed stacks, which no set of this model
-    /// holds yet. Mutant: one of these types added to a list.
+    /// on the shared experts, an I-quant beside the four sets' own on the routed stacks, and the
+    /// second quant's gate-and-up type on the downs, whose own is Q4_K. Mutant: one of these
+    /// types added to a list.
     #[test]
     fn a_type_no_kernel_reads_is_not_listed() {
         let has = |stem: &str, ty: GgmlType| allowed_types(stem).unwrap().contains(&ty);
@@ -223,12 +284,17 @@ mod tests {
         ] {
             assert!(!has(stem, BF16) && !has(stem, Q8_0), "{stem}");
         }
-        for stem in ["ffn_gate_exps.weight", "ffn_down_exps.weight"] {
-            assert!(
-                !has(stem, GgmlType::IQ2_XXS) && !has(stem, GgmlType::IQ1_S) && !has(stem, Q8_0),
-                "{stem}"
-            );
+        for stem in [
+            "ffn_gate_exps.weight",
+            "ffn_up_exps.weight",
+            "ffn_down_exps.weight",
+        ] {
+            assert!(!has(stem, GgmlType::IQ3_XXS) && !has(stem, Q8_0), "{stem}");
         }
+        assert!(
+            !has("ffn_down_exps.weight", IQ2_XXS),
+            "the second quant's downs are Q4_K"
+        );
         assert!(!has("token_embd.weight", Q4_K) && !has("ffn_up_shexp.weight", BF16));
     }
 }

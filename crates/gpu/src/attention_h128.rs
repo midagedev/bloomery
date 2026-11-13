@@ -45,6 +45,8 @@ struct Projection {
     name: String,
     ty: SiteTy,
     rows: usize,
+    /// The width of the rows the projection reads.
+    k: usize,
 }
 
 impl Projection {
@@ -57,7 +59,12 @@ impl Projection {
     ) -> Result<Self, GpuError> {
         let ty = site::file_site(file, WHAT, &name, (rows, cols), SITES)?;
         site::site(w, WHAT, &name, (rows, cols), ty)?;
-        Ok(Self { name, ty, rows })
+        Ok(Self {
+            name,
+            ty,
+            rows,
+            k: cols,
+        })
     }
 
     #[allow(
@@ -75,6 +82,9 @@ impl Projection {
         m: usize,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
+        if let Some(c) = crate::imatrix::collector() {
+            c.feed_dense(gpu, &self.name, x, (m, self.k))?;
+        }
         site::gemm(
             gpu,
             k,

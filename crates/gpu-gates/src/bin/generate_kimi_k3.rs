@@ -242,7 +242,8 @@ mod cli {
     ];
 
     /// `--imatrix`: the importance matrix of the text at `text` as `ctx`-id chunks (the first
-    /// `chunks` of them, all when `None`), each from an empty model, written to `out`.
+    /// `chunks` of them, all when `None`), each from an empty model, written to `out` — the
+    /// shared collecting walk ([`bloomery_gpu_gates::imatrix_walk`]).
     fn imatrix(
         m: &mut GpuModel<Body>,
         tok: &Tokenizer,
@@ -250,54 +251,18 @@ mod cli {
         (ctx, chunks): (usize, Option<usize>),
         walk_pass: bool,
     ) -> Result<(), GateError> {
-        let raw = std::fs::read(text).map_err(|e| format!("--text {text}: read: {e}"))?;
-        let ids = tok.encode(&raw, true, false);
-        if ids.len() < 2 * ctx {
-            return Err(format!(
-                "generate_kimi_k3: --text {text} tokenizes to {} ids; at least {} (two chunks of                  --ctx {ctx}) are needed",
-                ids.len(),
-                2 * ctx
-            )
-            .into());
-        }
-        let n = chunks.map_or(ids.len() / ctx, |c| c.min(ids.len() / ctx));
-        if n < 2 {
-            return Err(format!("generate_kimi_k3: --chunks {chunks:?}: at least 2 chunks").into());
-        }
-        let bos = match (tok.add_bos(), tok.specials().bos) {
-            (true, Some(b)) => Some(b),
-            (true, None) => {
-                return Err("generate_kimi_k3: the vocabulary adds a BOS and names none".into());
-            }
-            (false, _) => None,
-        };
         // A captured step replays its launches with the host's row counts of the capture: the walk is eager.
         m.set_mode(StepMode::Eager);
-        let collector = bloomery_gpu::imatrix::attach();
-        for c in 0..n {
-            let mut chunk = ids[c * ctx..(c + 1) * ctx].to_vec();
-            if let Some(b) = bos {
-                chunk[0] = b;
-            }
+        let walk = |m: &mut GpuModel<Body>, chunk: &[u32]| {
             m.reset()?;
-            let t = std::time::Instant::now();
             if walk_pass {
-                m.prompt_placed(&chunk)?;
+                m.prompt_placed(chunk)
             } else {
-                Body::prompt(m, &chunk)?;
-            }
-            println!(
-                "imatrix chunk={}/{n} tokens={ctx} wall_s={:.3}",
-                c + 1,
-                t.elapsed().as_secs_f64()
-            );
-        }
-        collector.write(std::path::Path::new(out), (ctx as u32, n as u32), text)?;
-        println!(
-            "imatrix chunks={n} chunk_size={ctx} entries={} wrote={out}",
-            collector.names().len()
-        );
-        Ok(())
+                Body::prompt(m, chunk)
+            }?;
+            Ok(())
+        };
+        bloomery_gpu_gates::imatrix_walk::collect(m, tok, (text, out), (ctx, chunks), None, 0, walk)
     }
 
     /// One line of the `--score` file: a prompt, the completion forced after it and, per

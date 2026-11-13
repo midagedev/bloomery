@@ -482,6 +482,9 @@ impl<R: RouterEntry> RouteBlock<R> {
             m,
             normed,
         )?;
+        if let Some(c) = crate::imatrix::collector() {
+            c.feed_dense(gpu, &layer.router, normed, (m, self.dims.embd))?;
+        }
         self.router
             .route_rows((stream, gpu, &self.g32), normed, &r, m, rows)
     }

@@ -255,6 +255,40 @@ fn layer_of<'a>(
         })
 }
 
+impl CardExperts {
+    /// The importance collector's hooks over one card route of layer `layer` (`crate::imatrix`'s
+    /// module doc holds the contract): the gate and up of every pick — the router's normed rows
+    /// sit on the card whatever tier runs the expert — and the down of the picks whose place in
+    /// `sel` is a card slot, the leg's own activation rows; the caller passes `sel` while it
+    /// still holds the card map's places. The widths and counts are the family's own. Nothing
+    /// when no collector is attached.
+    fn collect_route(
+        &self,
+        gpu: &Gpu,
+        layer: &CardLayer,
+        io: &Io<'_>,
+        ids: &DeviceBuffer<u32>,
+        sel: &DeviceBuffer<u32>,
+        leg: &LegBufs,
+    ) -> Result<(), GpuError> {
+        let Some(c) = crate::imatrix::collector() else {
+            return Ok(());
+        };
+        let (n, ff) = (self.n, self.ff);
+        let (n_expert, n_used) = (self.family.n_expert, self.family.n_used);
+        let [gate, up, down] = layer.names();
+        let dims = (io.m, n_used, n, n_expert);
+        c.feed_routed(gpu, gate, (io.normed, ids), dims, false)?;
+        c.feed_routed(gpu, up, (io.normed, ids), dims, false)?;
+        c.feed_routed_carded(
+            gpu,
+            down,
+            (leg.act_rows(), ids, sel),
+            (io.m, n_used, ff, n_expert),
+        )
+    }
+}
+
 /// The card's routed experts of the step: the kernels, each layer's count
 /// from the slot map, and the step's buffers. Made at load, after the
 /// weights, from the stacks they hold; a layer the map puts experts on holds
@@ -358,7 +392,7 @@ impl CardExperts {
                             what,
                             detail: format!(
                                 "layer {l}: the plan puts {tier} routed experts on an expert \
-                                 tier; these card experts hang no tier"
+                                     tier; these card experts hang no tier"
                             ),
                         });
                     }
@@ -376,7 +410,7 @@ impl CardExperts {
                         what,
                         name: name.clone(),
                         need: "no resident rows: the slot map puts no expert of its layer on the \
-                               card",
+                                   card",
                     });
                 }
                 per.push(None);
@@ -745,7 +779,7 @@ impl CardExperts {
     #[allow(
         clippy::too_many_arguments,
         reason = "one batch's inputs: the layer and its rule, the batch's rows and routing, the \
-                  slot map and its row"
+                      slot map and its row"
     )]
     pub fn enqueue_rows(
         &self,
@@ -785,7 +819,8 @@ impl CardExperts {
             (rule, tiered),
             io,
             &cb.sel,
-        )
+        )?;
+        self.collect_route(gpu, layer, io, ids, &cb.sel, &cb.bufs.leg)
     }
 
     /// [`CardExperts::enqueue_rows`] with the expert stream's ring `r` of
@@ -850,7 +885,7 @@ impl CardExperts {
                 what,
                 format!(
                     "layer {l}: the ring pass's buffers armed for a half of {} slots, the ring's \
-                     is {}",
+                         is {}",
                     rg.half_slots(),
                     r.half_slots
                 ),
@@ -886,6 +921,9 @@ impl CardExperts {
             rule,
         };
         self.k.leg.enqueue(gpu, &mut bufs.leg, &card, None)?;
+        // The route's collector hooks read the card map's places, so they run before the union
+        // rewrite below replaces them with the ring's.
+        self.collect_route(gpu, layer, io, ids, sel, &bufs.leg)?;
         rg.enqueue_rows(gpu, g32, io.normed, io.m, fault)?;
         card_leg::with_ring(&stacks, layer.n_card, r, ctx, (self.ff, self.n), |blk| {
             for b in &r.batches {
@@ -930,7 +968,7 @@ impl CardKernels {
     #[allow(
         clippy::too_many_arguments,
         reason = "one run's inputs: the weights, the buffers, the layer's shape and rule, the \
-                  rows and their places"
+                      rows and their places"
     )]
     fn enqueue(
         &self,

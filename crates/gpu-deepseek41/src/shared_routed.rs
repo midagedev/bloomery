@@ -1435,6 +1435,11 @@ impl<R: RouterEntry> Routed<R> {
         let layer = layer_of(layers, l)?;
         let (kernels, blk) = shared_launch(k, layer, (*shared_ff, shared, l));
         let n = d.embd;
+        if let Some(c) = bloomery_gpu::imatrix::collector() {
+            let [gate, up, _] = layer.shared();
+            c.feed_dense(gpu, gate, &b.normed, (m, n))?;
+            c.feed_dense(gpu, up, &b.normed, (m, n))?;
+        }
         if m < GATED_FROM {
             let xs = span(WHAT, &b.normed, 0, m * n)?;
             let mut ys = span_mut(WHAT, &mut b.sh, 0, m * n)?;
@@ -1631,6 +1636,11 @@ impl<R: RouterEntry> Routed<R> {
         })?;
         gpu.elem()
             .enqueue_rms_norm(gpu.stream(), x1, norm, self.d.rms_eps, n, m, dense_xn)?;
+        if let Some(c) = bloomery_gpu::imatrix::collector() {
+            let [gate, up, _] = layer.names.each_ref().map(String::as_str);
+            c.feed_dense(gpu, gate, dense_xn, (m, n))?;
+            c.feed_dense(gpu, up, dense_xn, (m, n))?;
+        }
         let blk = Block {
             plan: layer.plan,
             names: layer.names.each_ref().map(String::as_str),

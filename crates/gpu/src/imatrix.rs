@@ -7,19 +7,28 @@
 //! per weight `<name>.in_sum2` and `<name>.counts`, names sorted).
 //!
 //! One owner for every model: a layer's code hands the collector `(name, input rows)` at each linear
-//! it runs ([`Site::project`], the rows kit, the routed block's sum) and the collector knows no
-//! architecture. Nothing is attached by default: [`collector`] is one atomic read, and a call that
-//! finds none does nothing, so the unattached walk's launches and graph are the ones without this
-//! file. [`attach`] is the CLI's, once per process.
+//! it runs ([`Site::project`], the rows kit, the head128 attention, the routed block's batch and the
+//! card experts' run) and the collector knows no architecture. Nothing is attached by default:
+//! [`collector`] is one atomic read, and a call that finds none does nothing, so the unattached
+//! walk's launches and graph are the ones without this file. [`attach`] is the CLI's, once per
+//! process.
 //!
 //! Semantics held to llama's (`tools/imatrix/imatrix.cpp`, `collect_imatrix`): a dense weight adds
 //! `x²` of every input row in row order, one count per row; a routed weight adds the row of each
 //! `(row, slot)` the router picked to that expert's column sums, one count per pick. Where ours
-//! differs: a weight whose input the card's fused path never holds as a buffer is not collected, and
-//! the walk names it ([`crate::arch::kimi_k3`]'s pass).
+//! differs: a weight whose input the engine never holds as an f32 buffer is not collected, and the
+//! walk names it — the host tier's and the tier cards' routed *downs* (their combines are quantized
+//! inside the host union call and the tier leg, never an f32 buffer the walk holds; the *gate* and
+//! *up* of every pick are collected, for the router's normed rows sit on the card whatever tier runs
+//! the expert), a gated block's *down* on the card (the wide path's SwiGLU writes the down's own
+//! quantized form, not f32 rows), and the head (as `llama-imatrix` without `--process-output`).
+//! [`Collector::feed_routed_carded`] keeps only the picks whose place is a card slot: the tiers'
+//! downs are named above, and their columns stay zero with zero counts, which the quantizer reads
+//! as weight 1 ([`gguf::iq_quant::imatrix_weights`]).
 
-use crate::{Gpu, GpuError, launch_u32};
+use crate::{Gpu, GpuError, hybrid::HOST, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
+use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
 use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread};
 use cuda_host::cuda_module;
 use gguf::Value;
@@ -140,6 +149,50 @@ mod imatrix_kernels {
             }
         }
     }
+
+    /// The picks the card holds, one thread a pick: `out[i]` is `ids[i]` when pick `i`'s expert is
+    /// below `n_expert` and its place `places[i]` is a card slot, else `n_expert` (the sum kernel's
+    /// skip mark); each kept pick adds one to `kept[0]`, the count the entry's exactness check holds
+    /// ([`Collector::write`]), so a pick the filter dropped that the sums kept, or the other way
+    /// round, is refused by name at the write.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            ids.len() >= n,
+            places.len() >= n,
+            out.len() >= n,
+            kept.len() >= 1
+        )
+    )]
+    pub fn imat_card_picks(
+        ids: &[u32],
+        places: &[u32],
+        n: u32,
+        n_expert: u32,
+        mut out: DisjointSlice<u32>,
+        mut kept: DisjointSlice<f32>,
+    ) {
+        let i = thread::index_1d().get();
+        let n = n as usize;
+        if i >= n {
+            return;
+        }
+        // SAFETY: i < n <= ids.len(), places.len() and out.len() by the contract.
+        unsafe {
+            let (id, place) = (*ids.get_unchecked(i), *places.get_unchecked(i));
+            let on = id < n_expert && place != HOST;
+            *out.get_unchecked_mut(i) = if on { id } else { n_expert };
+            if on {
+                // SAFETY: kept.len() >= 1 by the contract; one relaxed add a kept pick, the only
+                // writers of cell 0 being this kernel's launches, in stream order.
+                DeviceAtomicF32::from_ptr(kept.as_mut_ptr())
+                    .fetch_add(1.0, AtomicOrdering::Relaxed);
+            }
+        }
+    }
 }
 
 /// One weight's accumulator: `n_mat` matrices of `ne0` columns (1 for a dense linear, the expert
@@ -150,13 +203,25 @@ struct Entry {
     n_mat: usize,
     acc: DeviceBuffer<f32>,
     counts: DeviceBuffer<f32>,
-    /// The count total the entry must hold: rows fed (dense) or picks fed (routed).
+    /// The count total the entry must hold: rows fed (dense), picks fed (routed) or the total a
+    /// seed carried over ([`Collector::seed`]).
     expect: u64,
+    /// The picks [`Collector::feed_routed_carded`] kept, one cell the filter kernel adds to; the
+    /// exactness check reads it beside `expect`. `None` until a carded feed.
+    kept: Option<DeviceBuffer<f32>>,
 }
 
-/// The accumulators of a pass, by GGUF weight name.
+/// The accumulators of a pass, by GGUF weight name, and the marked picks the carded feeds share:
+/// one buffer on the stream of the first carded feed, reused launch to launch in stream order.
 pub struct Collector {
     entries: Mutex<BTreeMap<String, Entry>>,
+    picks: Mutex<Option<Picks>>,
+}
+
+/// The carded feeds' marked picks, on one card's stream.
+struct Picks {
+    stream: Arc<CudaStream>,
+    ids: DeviceBuffer<u32>,
 }
 
 static COLLECTOR: OnceLock<Collector> = OnceLock::new();
@@ -171,6 +236,7 @@ pub fn collector() -> Option<&'static Collector> {
 pub fn attach() -> &'static Collector {
     COLLECTOR.get_or_init(|| Collector {
         entries: Mutex::new(BTreeMap::new()),
+        picks: Mutex::new(None),
     })
 }
 
@@ -265,6 +331,157 @@ impl Collector {
         Ok(())
     }
 
+    /// Layer code's hook for a routed stack whose down rows the card route holds its own picks of:
+    /// [`Collector::feed_routed`] over `x`'s per-pick rows (`per_pick` true), keeping only the picks
+    /// whose place in `places` (the card route's `sel`, one a pick) is a card slot — the host and
+    /// tier picks' combines never sit on the card as f32 rows, and the module doc names them. The
+    /// kept picks land in the entry's own count beside `expect`, so the write's exactness check
+    /// holds here too. The marked picks ride one scratch buffer, reused in stream order.
+    pub fn feed_routed_carded(
+        &self,
+        gpu: &Gpu,
+        name: &str,
+        (x, ids, places): (&DeviceBuffer<f32>, &DeviceBuffer<u32>, &DeviceBuffer<u32>),
+        (rows, used, k, n_expert): (usize, usize, usize, usize),
+    ) -> Result<(), GpuError> {
+        const FEED: &str = "imatrix::feed_routed_carded";
+        let picks = rows.checked_mul(used).ok_or(GpuError::shape(
+            FEED,
+            format!("{name}: {rows} rows of {used} picks over u32"),
+        ))?;
+        if rows == 0
+            || used == 0
+            || k == 0
+            || x.len() < picks * k
+            || ids.len() < picks
+            || places.len() < picks
+        {
+            return Err(GpuError::shape(
+                FEED,
+                format!(
+                    "{name}: {rows} rows of {used} picks, {k} values, x.len() {}, ids.len() {}, \
+                     places.len() {}",
+                    x.len(),
+                    ids.len(),
+                    places.len()
+                ),
+            ));
+        }
+        // SAFETY: as in `feed_dense`.
+        let module = unsafe { crate::shared_module!(imatrix_kernels, gpu.context())? };
+        let mut marked = self.picks.lock().unwrap_or_else(PoisonError::into_inner);
+        let stream = gpu.stream_handle();
+        let scratch = match marked.as_mut() {
+            Some(p) if Arc::ptr_eq(&p.stream, &stream) => &mut p.ids,
+            Some(_) => {
+                return Err(GpuError::state(
+                    FEED,
+                    "a carded feed from a second card's stream: the marked picks sit on one",
+                ));
+            }
+            None => {
+                &mut marked
+                    .insert(Picks {
+                        stream,
+                        ids: DeviceBuffer::zeroed(gpu.stream(), picks)?,
+                    })
+                    .ids
+            }
+        };
+        if scratch.len() < picks {
+            *scratch = DeviceBuffer::zeroed(gpu.stream(), picks)?;
+        }
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        let e = Self::entry(&mut entries, gpu, name, (k, n_expert), FEED)?;
+        if e.kept.is_none() {
+            e.kept = Some(DeviceBuffer::zeroed(gpu.stream(), 1)?);
+        }
+        let Entry {
+            acc, counts, kept, ..
+        } = e;
+        let n = launch_u32(FEED, "picks", picks)?;
+        let grid = LaunchConfig1D::new(launch_u32(FEED, "grid", picks.div_ceil(256))?, 256, 0);
+        let prep = module.prepare_imat_card_picks(grid)?;
+        module.imat_card_picks(
+            gpu.stream(),
+            &prep,
+            ids,
+            places,
+            n,
+            launch_u32(FEED, "n_expert", n_expert)?,
+            scratch,
+            kept.as_mut().expect("made above"),
+        )?;
+        let x_rows = picks;
+        let prep = module.prepare_imat_routed_sum2(columns(FEED, k)?)?;
+        module.imat_routed_sum2(
+            gpu.stream(),
+            &prep,
+            x,
+            scratch,
+            launch_u32(FEED, "rows", rows)?,
+            launch_u32(FEED, "used", used)?,
+            launch_u32(FEED, "x_rows", x_rows)?,
+            1,
+            launch_u32(FEED, "k", k)?,
+            launch_u32(FEED, "n_expert", n_expert)?,
+            acc,
+            counts,
+        )?;
+        Ok(())
+    }
+
+    /// Start (or grow) `name`'s entry from a partial collection — a run that `--save-every` wrote
+    /// and a later run continues: `sums` and `counts` are that file's `<name>.in_sum2` and
+    /// `.counts`, and the entry's count bookkeeping takes their total, so the write's exactness
+    /// check keeps holding over the runs' sums together. A name seeded twice, or with sums of
+    /// another shape, is refused by name.
+    pub fn seed(
+        &self,
+        gpu: &Gpu,
+        name: &str,
+        (ne0, n_mat): (usize, usize),
+        sums: &[f32],
+        counts: &[f32],
+    ) -> Result<(), GpuError> {
+        const SEED: &str = "imatrix::seed";
+        if sums.len() != ne0 * n_mat || counts.len() != n_mat {
+            return Err(GpuError::shape(
+                SEED,
+                format!(
+                    "{name}: {} sums and {} counts of {ne0} × {n_mat}",
+                    sums.len(),
+                    counts.len()
+                ),
+            ));
+        }
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(e) = entries.get(name)
+            && (e.expect != 0 || e.kept.is_some())
+        {
+            return Err(GpuError::shape(
+                SEED,
+                format!("{name}: seeded beside a collection already under way"),
+            ));
+        }
+        let e = Self::entry(&mut entries, gpu, name, (ne0, n_mat), SEED)?;
+        e.acc.copy_from_host(gpu.stream(), sums)?;
+        e.counts.copy_from_host(gpu.stream(), counts)?;
+        let total: u64 = counts
+            .iter()
+            .try_fold(0u64, |a, &c| {
+                let c = c.round();
+                (c >= 0.0 && c <= u32::MAX as f32)
+                    .then(|| a.checked_add(c as u64))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                GpuError::shape(SEED, format!("{name}: a count that is no count of picks"))
+            })?;
+        e.expect = total;
+        Ok(())
+    }
+
     /// `name`'s entry, made on `gpu`'s stream at the first feed; a later feed of another shape is
     /// refused by name.
     fn entry<'a>(
@@ -283,6 +500,7 @@ impl Collector {
                 ne0,
                 n_mat,
                 expect: 0,
+                kept: None,
             };
             entries.insert(name.to_string(), e);
         }
@@ -321,13 +539,19 @@ impl Collector {
         for (name, e) in entries.iter() {
             let sums = crate::tensor::to_host(&e.stream, &e.acc)?;
             let counts = crate::tensor::to_host(&e.stream, &e.counts)?;
+            let kept: f64 = e
+                .kept
+                .as_ref()
+                .map(|k| crate::tensor::to_host(&e.stream, k))
+                .transpose()?
+                .map_or(0.0, |k| k.iter().map(|&c| f64::from(c)).sum());
             let total: f64 = counts.iter().map(|&c| f64::from(c)).sum();
-            if total != e.expect as f64 {
+            let want = e.expect as f64 + kept;
+            if total != want {
                 return Err(GpuError::shape(
                     WHAT,
                     format!(
-                        "{name}: counts total {total}, {} fed: a pick the kernel could not place",
-                        e.expect
+                        "{name}: counts total {total}, {want} fed: a pick the kernel could not place",
                     ),
                 ));
             }

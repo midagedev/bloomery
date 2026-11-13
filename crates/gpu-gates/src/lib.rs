@@ -40,6 +40,8 @@ pub mod ik_norm;
 pub mod ik_q8_2;
 pub mod image_plan;
 #[cfg(feature = "gpu")]
+pub mod imatrix_walk;
+#[cfg(feature = "gpu")]
 pub mod iq_rows;
 #[cfg(feature = "gpu")]
 #[path = "arch/kimi_k3_pass.rs"]

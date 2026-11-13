@@ -928,6 +928,13 @@ required-features = ["gpu"]
 name = "gate_exaone_e2e"
 required-features = ["flint"]
 
+# generate_exaone: K-EXAONE-2.0's collecting CLI — the importance matrix of a text corpus off this
+# engine's own prompt batch, with the host tier's picks collected (the box's bootstrap file needs
+# it: nearly every routed expert runs on the host).
+[[bin]]
+name = "generate_exaone"
+required-features = ["flint"]
+
 # exaone-pp: the fixture GGUF's prompt sets through the program's prompt batch against the same
 # ids run one decode step at a time.
 [[bin]]
