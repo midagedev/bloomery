@@ -579,7 +579,7 @@ fn hw_exaone_fixture_header() {
         (
             "blk.2.ffn_gate_exps.weight",
             GgmlType::Q8_0,
-            "q8_0 (the exaone-moe reader runs ffn_gate_exps.weight as q4_K or fp8_b128)",
+            "q8_0 (the exaone-moe reader runs ffn_gate_exps.weight as q4_K or iq2_xxs or iq1_s or fp8_b128)",
         ),
     ] {
         let split = header_of(|decls| retype(decls, name, ty));
