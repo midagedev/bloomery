@@ -114,6 +114,7 @@ crates/gpu-gates/src/record.rs	clef	3	baseline O 3: MK12 per-bin Kind statics in
 crates/gpu-gates/src/record.rs	deepseek	8	PIN(2026-11-02) deepseek: MK12 per-bin Kind statics into record/<bin>.rs: the qwen3 seat registers the shared DSpark load and width kinds it prints, and the Mistral Large 4 seat the shared DSpark load kind (ds41_draft::LOAD)
 crates/gpu-gates/src/record.rs	gemma	1	baseline O 1: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	minimax	4	PIN(2026-10-21) minimax: MK12 per-bin Kind statics into record/<bin>.rs: the seat's load and listening kinds are the common file's, where every seat's are
+crates/gpu-gates/src/record.rs	exaone	1	PIN(2026-11-14) exaone: MK12 per-bin Kind statics into record/<bin>.rs: generate_exaone's printed list (GENERATE_EXAONE) is the common file's, where every bin's list is
 crates/gpu-gates/src/record.rs	glm	14	baseline O 14: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	mimo	4	baseline O 4: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	nemotron	5	baseline O 5: MK12 per-bin Kind statics into record/<bin>.rs
@@ -229,7 +230,7 @@ crates/hf/src/vocab.rs	llama	1	PIN(2026-11-01) llama: the llama-bpe pre-tokenize
 crates/hf/src/vocab.rs	mistral	1	PIN(2026-11-02) mistral: the pixtral pre-tokenizer's name in the pre-tokenizer table (the name llama.cpp reads the tekken vocabulary of the Mistral models by; the mistral token matches `pixtral` since the Pixtral tower joined); tokenizer programs are not yet described by ModelSpec
 crates/hf/src/vocab.rs	deepseek	1	PIN(2026-11-04) deepseek: the deepseek-v3 pre-tokenizer's name in the pre-tokenizer table (DeepSeek-V4.1's folder carries DeepSeek-V3's pipeline: digit, CJK and word splits before ByteLevel); tokenizer programs are not yet described by ModelSpec
 crates/hf/src/vocab.rs	exaone	3	PIN(2026-11-13) exaone: the exaone-moe pre-tokenizer's regex macro, name and row in the pre-tokenizer table (a letter word whose single-space-joined words are one word); tokenizer programs are not yet described by ModelSpec
-crates/gpu-gates/src/prompts.rs	deepseek	1	PIN(2026-10-23) deepseek: the measured logit σ is named for the one family it was measured on (SIGMA_LOGIT_V41); other families carry it in their gate description until their own is measured
+crates/gpu-gates/src/prompts.rs	deepseek	3	PIN(2026-11-14) deepseek: the measured logit σ (SIGMA_LOGIT_V41) and the two V4.1 clear-top-1 margins (HEAD_MARGIN_V41, PLACE_MARGIN_V41) are named for the one family they were measured on; other families carry theirs in their gate description until their own are measured
 crates/gpu-gates/src/bin/bloomery_serve.rs	flint	8	PIN(2026-10-25) flint: MK9 seat by program: the seat word, help/models list, architecture match and dispatch register the implemented shared hybrid seat until the description selects it
 crates/model/src/arch/coverage.rs	flint	14	PIN(2026-11-13) flint: the gate-first clamp row and the router row register in the existing coverage owners; the router predicate of the program's two instances stays beside the rows that name it
 crates/gpu-gates/src/bin/shared/routed_legs.rs	llama	2	PIN(2026-10-26) llama: family_of and skip_of match every models::Arch exhaustively; the dense trunk has no routed-legs adapter
