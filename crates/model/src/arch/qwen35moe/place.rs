@@ -1278,7 +1278,8 @@ impl PlanInputs {
             let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
             let room = plan.plan_at(&self.room);
             // Under `all` the planes hold their bytes on the host, out of the
-            // room the plan was made at, refused by name past it
+            // room the plan was made at, refused by name where no expert
+            // split can make their room
             // ([`PlacementError::KvHostOverHost`]): before the PLE table's
             // tier and the NVMe tier's split read the room, so both see the
             // room the planes already took.

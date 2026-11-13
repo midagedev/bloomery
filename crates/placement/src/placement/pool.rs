@@ -333,23 +333,27 @@ impl Plan<'_> {
         self.host.headroom_bytes -= i128::from(bytes);
     }
 
-    /// The K/V planes a host-backed store holds on the host
-    /// (`BLOOMERY_KV_HOST=all`), `bytes` page-rounded at the page a
-    /// host-capable room takes, out of the plan's host headroom — refused by
-    /// name when the headroom cannot take them
-    /// ([`PlacementError::KvHostOverHost`]): the host room the plan reads is
-    /// the one the residency's churn pool and the load's host check read, so
-    /// the planes count against it before they do. The host's need counts
-    /// them ([`HostTotals::kv_host_bytes`], with the shadows).
+    /// The K/V bytes a host-backed store holds on the host (`BLOOMERY_KV_HOST`: under `all` the
+    /// planes, under `spill` the pages past the floor), `bytes` page-rounded at the page a
+    /// host-capable room takes, out of the plan's host headroom. The host's need counts them
+    /// ([`HostTotals::kv_host_bytes`], with the shadows), so a caller counts them before the NVMe
+    /// expert tier's split ([`expert_nvme_tier`]) reads the room, and that split pages the routed
+    /// experts they displace: a headroom the host-served routed experts leave below zero is not
+    /// a refusal here.
+    ///
+    /// Refused by name ([`PlacementError::KvHostOverHost`]) only where no split can make the
+    /// room: the headroom is below zero even with every host-served routed expert out of it. A
+    /// room that holds the pages with no expert on the host but not the split's floor is the
+    /// split's own refusal ([`PlacementError::HostRoomFloor`]).
     pub fn kv_host_planes(&mut self, bytes: u64) -> Result<(), PlacementError> {
         self.host.kv_host_bytes = bytes;
-        let before = self.host.headroom_bytes;
         self.host.headroom_bytes -= i128::from(bytes);
-        if self.host.headroom_bytes < 0 {
-            // A headroom already below zero leaves the planes no host bytes.
+        let paged_out = self.host.headroom_bytes + i128::from(self.host.expert_bytes);
+        if paged_out < 0 {
             return Err(PlacementError::KvHostOverHost {
+                lever: self.kv_host,
                 bytes,
-                headroom: u64::try_from(before).unwrap_or(0),
+                headroom: u64::try_from(paged_out + i128::from(bytes)).unwrap_or(0),
             });
         }
         Ok(())

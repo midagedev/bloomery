@@ -209,7 +209,8 @@ mod tests {
     use crate::arch::deepseek41::place::PlanInputs;
     use crate::placement::{
         Card, Host, KvBytes, KvDefault, Machine, ModelTensor, ModelTensors, Node, PlanLevers, Role,
-        UnifiedPool, workstation::HostRead,
+        UnifiedPool,
+        workstation::{HostNeed, HostRead},
     };
     use bloomery_levers::{KvFloor, KvHost};
     use gguf::GgmlType;
@@ -561,5 +562,146 @@ mod tests {
         };
         assert_eq!(shadow(&lever), per_position * cap);
         assert!(per_position * floor < per_position * cap);
+    }
+
+    /// The tiny file's four layers as a stack: three sources at ratio 2 and one at ratio 1.
+    fn four_layers() -> KvLayout {
+        KvLayout::assemble(
+            128,
+            256,
+            1,
+            (0..4)
+                .map(|l| {
+                    Some(Source {
+                        ratio: if l == 3 { 1 } else { 2 },
+                        index_key: 128,
+                        state: 0,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// The context and the floor a spill plan below is made at: 1,024 positions of pages.
+    const SPILL_CAP: u64 = 9_216;
+    const SPILL_FLOOR: u64 = 8_192;
+
+    /// The seat's default levers (the floor, `spill`) and the same floor with the rows kept on
+    /// the card.
+    fn spill_levers() -> (PlanLevers, PlanLevers) {
+        let seat = PlanLevers::default().resolve_kv(
+            KvFloor::Unset,
+            None,
+            KvDefault {
+                floor: SPILL_FLOOR,
+                host: KvHost::Spill,
+            },
+        );
+        let off = PlanLevers {
+            kv_host: KvHost::Off,
+            ..seat.clone()
+        };
+        (seat, off)
+    }
+
+    /// The tiny file's inputs read at a host page and with no arena (the split keeps what the
+    /// room leaves past the pages and its window), and the stage card's usable bytes: its
+    /// prompt batch, the cache at the floor and room for some of the experts.
+    fn spill_inputs() -> (PlanInputs, u64) {
+        let (_, off) = spill_levers();
+        let mut inputs = tiny_inputs(four_layers(), 1 << 40);
+        inputs.kv_host_page = Some(4_096);
+        inputs.arena = Some(0);
+        let batch = inputs
+            .prompt_reserve_bytes(&pool_machine(0).cards[0], SPILL_CAP, false)
+            .expect("the tiny file's batch");
+        let card = batch + card_kv(&four_layers(), SPILL_CAP, &off) + (12 << 20);
+        (inputs, card)
+    }
+
+    /// One stage card of `card` usable bytes beside a host whose figure is `host` bytes, each
+    /// with memory of its own.
+    fn split_machine(card: u64, host: u64) -> Machine {
+        let mut machine = pool_machine(card);
+        machine.nodes = vec![Node {
+            host: Host {
+                usable_bytes: host,
+                reserves: Vec::new(),
+            },
+            unified: None,
+        }];
+        machine
+    }
+
+    /// The plan with the rows kept on the card at a host room of the machine's figure: what its
+    /// host needs and what its routed experts take.
+    fn spill_terms(inputs: &PlanInputs, card: u64) -> (u64, u64) {
+        let (_, off) = spill_levers();
+        let machine = split_machine(card, 1 << 40);
+        let plan = inputs
+            .plan(&machine, SPILL_CAP, &off)
+            .expect("the plan with no pages");
+        let need = HostNeed::of(&plan, 0);
+        let held = plan.host.expert_bytes;
+        assert!(
+            held > 0 && plan.cards[0].experts > 0,
+            "the card and the host each hold experts"
+        );
+        (need.bytes(), held)
+    }
+
+    /// The seat's default on a host whose figure holds its experts and the other host terms
+    /// and not the selected rows' pages as well: the NVMe tier takes the experts the pages
+    /// displace, and the host's need counts the pages. The plan is no refusal while a split can
+    /// make the pages' room.
+    ///
+    /// FAIL-first: `kv_host_planes` refusing by the headroom the host's routed experts leave
+    /// before the split (the seat's default meeting `KvHostOverHost` at 0 B of headroom, as the
+    /// server's first start did) turns the spill plan red with the experts still on the host.
+    #[test]
+    fn the_seat_default_pages_displace_host_experts_to_the_nvme_tier() {
+        let (mut inputs, card) = spill_inputs();
+        let (seat, off) = spill_levers();
+        let (need, held) = spill_terms(&inputs, card);
+        inputs.room = (need, HostRead::Given);
+        let machine = split_machine(card, need);
+        let whole = inputs
+            .plan(&machine, SPILL_CAP, &off)
+            .expect("the room holds the need");
+        assert_eq!(whole.host.nvme_expert_bytes, 0, "no pages, no paging");
+        let spill = inputs
+            .plan(&machine, SPILL_CAP, &seat)
+            .expect("the pages are made room by the split, not refused");
+        let pages = inputs
+            .kv_host_bytes(SPILL_CAP, 1, KvHost::Spill, Some(SPILL_FLOOR))
+            .expect("the pages");
+        assert_eq!(
+            pages,
+            1_280 * (SPILL_CAP - SPILL_FLOOR),
+            "three ratio-2 layers' 256 B and the ratio-1 layer's 512 B a position past the floor"
+        );
+        assert_eq!(
+            spill.host.kv_host_bytes, pages,
+            "the plan counts the pages the seat's lever puts on the host"
+        );
+        assert_eq!(
+            HostNeed::of(&spill, 0).shadows,
+            spill.host.shadow_bytes + pages,
+            "the host's need counts the pages"
+        );
+        assert!(
+            spill.host.nvme_expert_bytes >= pages,
+            "the NVMe tier holds the experts the pages displaced"
+        );
+        assert_eq!(
+            spill.host.expert_bytes + spill.host.nvme_expert_bytes,
+            held,
+            "every host expert is on the host or the NVMe tier"
+        );
+        assert!(
+            spill.host.headroom_bytes >= 0,
+            "the split leaves the room whole"
+        );
+        assert!(spill.violations().is_empty(), "{:?}", spill.violations());
     }
 }

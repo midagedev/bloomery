@@ -151,3 +151,171 @@ fn rooms_are_read_at_the_floor_and_the_selected_ones_leave_the_card_under_all() 
         "all: the selected buffers off the card, the scanned ones kept"
     );
 }
+
+/// Pages the plan counts on the host, a made-up page-rounded figure a caller computed.
+const PAGES: u64 = 1_000;
+/// The host terms beside the routed experts the machines below carry.
+const BESIDE: u64 = 1_000;
+
+/// The four layers on a card that holds some of the experts and a host whose figure is `room`.
+fn host_machine(room: u64) -> Machine {
+    Machine {
+        cards: vec![bytes_card(
+            "stage",
+            HEAD + 4 * (FIXED + 90 * 10) + 12 * EXPERT,
+            0..4,
+        )],
+        tiers: Vec::new(),
+        nodes: vec![Node {
+            host: Host {
+                usable_bytes: room,
+                reserves: vec![("beside".into(), BESIDE)],
+            },
+            unified: None,
+        }],
+    }
+}
+
+/// The steps every plan that backs K/V pages on the host takes in this order: the routed
+/// placement, the pages counted ([`Plan::kv_host_planes`], none for 0), the room the host
+/// figure states, the NVMe tier's split with no arena. `Spill` and `Off` plan at a floor of
+/// 40 of the 80 positions.
+fn host_plan<'a>(
+    model: &'a ModelTensors,
+    machine: &'a Machine,
+    lever: KvHost,
+    pages: u64,
+) -> Result<Plan<'a>, PlacementError> {
+    let levers = PlanLevers {
+        kv_floor: (lever != KvHost::All).then_some(40),
+        kv_host: lever,
+        ..PlanLevers::default()
+    };
+    let mut plan = plan(model, machine, 80, &Layers { declares: true }, &levers)?;
+    if pages > 0 {
+        plan.kv_host_planes(pages)?;
+    }
+    let room = plan.plan_at(&(machine.host().usable_bytes, workstation::HostRead::Given));
+    expert_nvme_tier(&mut plan, room, Some(0))?;
+    Ok(plan)
+}
+
+/// On a host whose figure holds its routed experts and no more, the pages counted beside them
+/// displace experts: the NVMe tier takes those, and the host's need counts the pages. The
+/// pages are no refusal while a split can make their room.
+///
+/// FAIL-first: the pages refused by the headroom the host's routed experts leave before the
+/// split (`kv_host_planes` reading `headroom_bytes` alone) is `KvHostOverHost` here, with the
+/// experts still on the host.
+#[test]
+fn pages_the_host_experts_displace_go_to_the_nvme_tier() {
+    let model = layered(4);
+    let ample = host_machine(1 << 40);
+    let whole = host_plan(&model, &ample, KvHost::Off, 0).expect("a plan");
+    assert!(
+        whole.host.expert_bytes > 0,
+        "the card leaves experts to the host"
+    );
+    let need = u64::try_from(workstation::HostNeed::of(&whole, 0).exact(true)).expect("u64");
+    let tight = host_machine(need);
+    let off = host_plan(&model, &tight, KvHost::Off, 0).expect("the room holds the need");
+    assert_eq!(
+        off.host.nvme_expert_bytes, 0,
+        "without pages nothing is paged"
+    );
+    let spill = host_plan(&model, &tight, KvHost::Spill, PAGES)
+        .expect("the pages are made room by the split, not refused");
+    assert_eq!(
+        spill.host.kv_host_bytes, PAGES,
+        "the plan counts the pages the caller gave"
+    );
+    assert_eq!(
+        workstation::HostNeed::of(&spill, 0).shadows,
+        PAGES,
+        "the need counts the pages"
+    );
+    // The split keeps `held − PAGES − 2 W` bytes on the host (W: the heaviest layer's host
+    // bytes), so at least the pages and the window leave it.
+    let heavy = (0..4)
+        .map(|l| (8 - whole.n_l[l]) * EXPERT)
+        .max()
+        .expect("layers");
+    assert!(
+        spill.host.nvme_expert_bytes >= PAGES + 2 * heavy,
+        "{} B paged for {PAGES} B of pages and a {heavy} B layer",
+        spill.host.nvme_expert_bytes
+    );
+    assert_eq!(
+        spill.host.expert_bytes + spill.host.nvme_expert_bytes,
+        whole.host.expert_bytes,
+        "every host expert is on the host or the NVMe tier"
+    );
+    assert!(
+        spill.host.headroom_bytes >= 0,
+        "the split leaves the room whole"
+    );
+    assert!(spill.violations().is_empty(), "{:?}", spill.violations());
+}
+
+/// Pages that pass the room even with no routed expert on the host are refused by name, with
+/// the lever in force and what it holds: `spill` its pages past the floor, `all` the planes.
+/// The headroom the refusal names is what the room leaves them past the other host terms, 0
+/// where those pass it alone.
+///
+/// FAIL-first: the refusal reading the headroom with the routed experts in it names 0 B for
+/// both, and one with no `lever` says `=all` under `spill`.
+#[test]
+fn pages_no_split_can_make_room_for_are_refused_naming_the_lever() {
+    let model = layered(4);
+    for (lever, held, instead) in [
+        (
+            KvHost::Spill,
+            "the K/V planes' pages past the floor",
+            "off)",
+        ),
+        (KvHost::All, "the K/V planes,", "off or spill)"),
+    ] {
+        let ample = host_machine(1 << 40);
+        let whole = host_plan(&model, &ample, lever, 0).expect("a plan");
+        // The host terms with no routed expert in them, and a room one byte short of them and
+        // the pages.
+        let others = u64::try_from(workstation::HostNeed::of(&whole, 0).exact(false)).expect("u64")
+            - whole.host.expert_bytes;
+        let machine = host_machine(others + PAGES - 1);
+        let err = host_plan(&model, &machine, lever, PAGES).expect_err("the room cannot hold them");
+        assert!(
+            matches!(
+                err,
+                PlacementError::KvHostOverHost { lever: got, bytes: PAGES, headroom }
+                    if got == lever && headroom == PAGES - 1
+            ),
+            "{lever:?}: {err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("BLOOMERY_KV_HOST={}", lever.name()))
+                && text.contains(held)
+                && text.ends_with(&format!("(BLOOMERY_KV_HOST {instead}")),
+            "{text}"
+        );
+        assert!(
+            lever == KvHost::All || !text.contains("=all"),
+            "spill's text names all: {text}"
+        );
+        // A room the other host terms pass alone leaves the pages no byte.
+        let machine = host_machine(others - 1);
+        let err = host_plan(&model, &machine, lever, PAGES).expect_err("the room is short");
+        assert!(
+            matches!(err, PlacementError::KvHostOverHost { headroom: 0, .. }),
+            "{lever:?}: {err:?}"
+        );
+        // The room one byte more passes the pages' own check; the split's floor, which wants
+        // three layers' host bytes more, speaks then.
+        let machine = host_machine(others + PAGES);
+        let err = host_plan(&model, &machine, lever, PAGES).expect_err("under the split's floor");
+        assert!(
+            matches!(err, PlacementError::HostRoomFloor { room, .. } if room == others + PAGES),
+            "{lever:?}: {err:?}"
+        );
+    }
+}
