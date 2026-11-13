@@ -23,7 +23,10 @@
 //! had run. After a cut, or a state put back as its prefix, a seat whose
 //! body kept the draft's store below the kept position and the target's
 //! hidden row before it rejoins the slot's draft there
-//! ([`SlotDrafts::rejoin`]); otherwise it turns the slot's draft off
+//! ([`SlotDrafts::rejoin`]); a seat whose cut keeps the draft's store through the entry at the cut
+//! position (the target's own keep is one position less, so the next prompt call re-feeds the id
+//! that entry was written for and its pass writes the hidden row the entry after it reads) rejoins
+//! through it ([`SlotDrafts::rejoin_through`]); otherwise it turns the slot's draft off
 //! ([`SlotDrafts::turn_off`]): every call on that slot is the session's own
 //! until the slot's next reset, and each prompt call (or the first step when
 //! the call is empty) prints an `mtp prompt` record that names why.
@@ -746,6 +749,19 @@ where
     pub(crate) fn rejoin(&mut self, slot: usize, pos: u32) -> Result<(), GateError> {
         if let Some(spec) = self.spec_mut(slot)? {
             spec.draft_mut().draft_mut().rejoin(pos);
+            self.off[slot] = None;
+        }
+        Ok(())
+    }
+
+    /// `slot`'s draft rejoined through `pos`, where the body cut the target back to `pos` and kept
+    /// the draft's store through the entry at `pos` itself ([`MtpDraft::rejoin_through`]), and on
+    /// again: the slot's next call, which stands at `pos` over the id that entry was written for,
+    /// joins with no row to walk and its units walk the rows after it. Nothing without a draft;
+    /// refused as [`SlotDrafts::has`].
+    pub(crate) fn rejoin_through(&mut self, slot: usize, pos: u32) -> Result<(), GateError> {
+        if let Some(spec) = self.spec_mut(slot)? {
+            spec.draft_mut().draft_mut().rejoin_through(pos);
             self.off[slot] = None;
         }
         Ok(())

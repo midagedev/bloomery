@@ -67,6 +67,10 @@ pub struct HybridCfg {
     pub group: usize,
     /// The resident sequences charged by the plan before any allocation.
     pub slots: NonZeroUsize,
+    /// Whether the load carries the file's in-file MTP layer beside the target: its card bytes are
+    /// the plan's reserve ([`Batch::configure_draft`]) and the body opens by
+    /// [`Batch::open_placed_drafted`]. A family with no such layer refuses it by name.
+    pub draft: bool,
 }
 
 /// The plan inputs of a hybrid body: the family's own hyperparameters under
@@ -137,6 +141,32 @@ pub trait Batch: ChainBody + Rollback + Sized {
         slots: NonZeroUsize,
     ) -> Result<GpuModel<Self>, GpuError>;
 
+    /// [`Batch::open_placed`] with the file's in-file MTP layer loaded beside the target. A family
+    /// whose body has none refuses by name (the default).
+    fn open_placed_drafted(
+        _file: Split,
+        _plan: &Plan<'_>,
+        _inputs: &Self::Inputs,
+        _host: HostCfg,
+        _residency: Residency,
+        _slots: NonZeroUsize,
+    ) -> Result<GpuModel<Self>, GpuError> {
+        Err(GpuError::plan(
+            Self::WHAT,
+            "an MTP draft on a family whose body carries no in-file MTP layer",
+        ))
+    }
+
+    /// The plan inputs with the MTP layer's card bytes kept out of the expert budget, called once
+    /// after [`Batch::configure`] when the load drafts ([`HybridCfg::draft`]). A family whose body
+    /// has no layer refuses by name (the default).
+    fn configure_draft(_inputs: &mut Self::Inputs) -> Result<(), GpuError> {
+        Err(GpuError::plan(
+            Self::WHAT,
+            "an MTP draft on a family whose body carries no in-file MTP layer",
+        ))
+    }
+
     /// The prompt batch of `ids` from `at`: the head's row after the last.
     fn batch(
         gpu: &Gpu,
@@ -194,7 +224,11 @@ impl<B: Batch> Open for B {
     }
 
     fn configure_inputs(inputs: &mut B::Inputs, cfg: &HybridCfg) -> Result<(), GpuError> {
-        B::configure(inputs, cfg)
+        B::configure(inputs, cfg)?;
+        if cfg.draft {
+            B::configure_draft(inputs)?;
+        }
+        Ok(())
     }
 
     fn layer_count(inputs: &B::Inputs) -> usize {
@@ -224,7 +258,11 @@ impl<B: Batch> Open for B {
         cfg: &HybridCfg,
     ) -> Result<GpuModel<B>, GpuError> {
         <B::Sequences as SequenceSlots<B>>::check(cfg.slots, B::WHAT)?;
-        B::open_placed(file, plan, inputs, cfg.host, cfg.residency, cfg.slots)
+        if cfg.draft {
+            B::open_placed_drafted(file, plan, inputs, cfg.host, cfg.residency, cfg.slots)
+        } else {
+            B::open_placed(file, plan, inputs, cfg.host, cfg.residency, cfg.slots)
+        }
     }
 
     /// The configuration's group; the units it needs are made here.

@@ -3,6 +3,8 @@
 //! instance once, at `run`. Chat, tools, reasoning and end-of-generation tokens use the
 //! canonical model contract.
 
+use app::mtp::open_draft;
+use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::{GateError, record, side_seat};
 use gguf::Split;
@@ -13,7 +15,9 @@ use model::placement::PlacementError;
 use model::placement::workstation::TierBatchBytes;
 use serve::ServeError;
 
+use super::drafted::SlotDrafts;
 use super::hybrid::Family;
+use super::hybrid_draft::SeatDraft;
 
 const NAME: &str = "bloomery-serve-flint";
 const USAGE: &str = "usage: bloomery-serve --model flint [-m PATH | --hf <repo>[:<quant>]] \
@@ -34,6 +38,8 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::HOST_LANES,
     bloomery_levers::SCREEN,
     bloomery_levers::SCHEMAJUMP,
+    bloomery_levers::DRAFT,
+    bloomery_levers::MTP_WIDTH,
 ];
 
 /// Architecture-specific facts; the common owner plans and serves every slot.
@@ -55,6 +61,38 @@ macro_rules! flint_family {
             const ALIAS: &'static str = "flint";
             const FAMILY: &'static str = $family;
             const SERVES: &'static str = $serves;
+            const MTP: bool = true;
+
+            /// The file's MTP layer ([`bloomery_gpu_flint::draft`]) as a window of two rows over
+            /// the seat's one sequence, its walks eager.
+            fn mtp(
+                s: &mut app::Session<$body>,
+                width: runtime::width::Mode,
+            ) -> Result<Box<dyn SeatDraft<$body>>, GateError> {
+                let mut log = crate::quiet::Quiet;
+                Ok(Box::new(SlotDrafts::<$body, MTP_ROWS>::open(
+                    s,
+                    1,
+                    width,
+                    &mut log,
+                    |m| open_draft(m, (), StepMode::Eager),
+                )?))
+            }
+
+            fn draft_record(
+                m: &bloomery_gpu::GpuModel<$body>,
+                took: std::time::Duration,
+            ) -> Result<record::Record, GateError> {
+                Ok(record::Record::new(&record::LOAD_DRAFT_HYBRID)
+                    .u("layer", m.layers().len())
+                    .u(
+                        "resident",
+                        bloomery_gpu_flint::draft::draft_bytes(m)? as u64,
+                    )
+                    .u("width", <$body as app::mtp::MtpBody>::WIDTH as u64)
+                    .w("head", "full")
+                    .f("load_s", took.as_secs_f64()))
+            }
 
             fn accepts(arch: Arch) -> bool {
                 $accepts(arch)
@@ -93,6 +131,12 @@ macro_rules! flint_family {
         }
     };
 }
+
+/// A window of the in-file draft: one proposed id and the token before it.
+const MTP_ROWS: usize = 2;
+const _: () = assert!(MTP_ROWS == <bloomery_gpu_flint::Body as app::mtp::MtpBody>::VERIFY_ROWS);
+const _: () =
+    assert!(MTP_ROWS == <bloomery_gpu_flint::ExaoneBody as app::mtp::MtpBody>::VERIFY_ROWS);
 
 fn serves_flint(arch: Arch) -> bool {
     matches!(arch, Arch::Flint)

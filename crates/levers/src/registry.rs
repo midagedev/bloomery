@@ -686,7 +686,20 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               reset, each other request running plain steps with no draft work, and runs the \
               plain path when no file is there or the vocabulary holds no think tags; the \
               `draft rule` record before the plan names which and why; `lookup` and `mtp` are \
-              refused by name. Every other binary and \
+              refused by name. The Flint seat of `bloomery-serve` on an exaone-moe file takes `mtp` \
+              and `off`: `mtp` serves the target file's MTP layer (`nextn`, the file's last \
+              layer) as the draft through a two-row window on one slot (`--parallel 1`), refused \
+              by name on a file with no MTP layer and beside several slots, its card bytes \
+              reserved by the plan before the context is fitted, a `load draft=mtp` record after \
+              the `load` line; the greedy ids are the plain run's on the same routed experts on \
+              the card: the draft's bytes come out of the expert budget, so the drafted \
+              load's `plan` line holds fewer card experts than the plain load's (its \
+              `card_experts=`), an expert that moves between the card and the host runs in the \
+              other tier's kernel and joins in the other order, and a drafted run's ids part \
+              from the plain run's at a near tie; the \
+              plain run planned on the budget less the draft's bytes (`BLOOMERY_CARD_BUDGET`) \
+              holds the same experts and its ids are the drafted run's. `off` and unset are \
+              the plain path. Every other binary and \
               family refuses each word by name, `off` included (the qwen3 and raon1 seats' apart).",
         site: Site::Parsed {
             left: &[],
@@ -765,7 +778,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         kind: Kind::Words(&["cost", "fixed"]),
         default: Unset::Means("`cost` on a run that drafts"),
         doc: "A run that drafts (the MTP draft of `generate_qwen3moe`, `generate_glm5next` and \
-              their serve seats; the lookup and DSpark drafts of `generate_ds41` and \
+              their serve seats, and the Flint seat's; the lookup and DSpark drafts of `generate_ds41` and \
               `bloomery-serve-ds41`; the lookup and DSpark drafts of `bloomery-serve`'s qwen3 \
               seat; the DFlash2 draft of `bloomery-serve`'s raon1 seat; the lookup draft of \
               `generate_metal`): how \

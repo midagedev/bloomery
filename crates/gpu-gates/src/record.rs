@@ -2381,6 +2381,25 @@ pub static LOAD_HYBRID: Kind = Kind {
     ],
 };
 
+/// A common hybrid seat's in-file MTP draft, loaded beside the target.
+pub static LOAD_DRAFT_HYBRID: Kind = Kind {
+    name: "load_draft_hybrid",
+    head: "load draft=mtp",
+    doc: "A hybrid seat's MTP draft, the file's next-token layer loaded beside the target, after the \
+          load line: the layer's index in the file, the draft's device bytes (weights, store, \
+          buffers and arenas), the ids a window proposes, the head it scores with, and the \
+          draft window's open wall.",
+    parts: &[
+        key("layer", U64, ""),
+        key("resident", U64, "B"),
+        key("width", U64, "ids"),
+        key("head", Word, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s (runtime value)"),
+    ],
+};
+
 /// The common hybrid seat's listening address.
 pub static LISTENING_HYBRID: Kind = Kind {
     name: "listening_hybrid",
@@ -3570,7 +3589,15 @@ pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
     groups::residency38::HOST,
     groups::fetch::FETCH,
     groups::fetch::SET,
-    &[&LANE, &LOAD_HYBRID, &LOAD_PHASES, &LISTENING_HYBRID],
+    &[
+        &LANE,
+        &LOAD_HYBRID,
+        &LOAD_DRAFT_HYBRID,
+        &LOAD_PHASES,
+        &LISTENING_HYBRID
+    ],
+    groups::drafted::PROMPT,
+    groups::drafted::WIDTH,
     groups::host_tier::ARENA,
     groups::host_tier::CENSUS,
     groups::bind::CACHE,
@@ -5150,7 +5177,7 @@ mod tests {
                 ],
             ),
             (
-                "hybrid seat: tiered::run, settle_pick, hybrid::open_session, bind::spawn",
+                "hybrid seat: tiered::run, settle_pick, hybrid::open_session, SlotDrafts::open, bind::spawn",
                 BLOOMERY_SERVE_HYBRID,
                 &[
                     side_seat::SEAT,
@@ -5159,6 +5186,8 @@ mod tests {
                     tiered::PASS,
                     residency38::HOST,
                     hybrid::GROUP,
+                    drafted::PROMPT,
+                    drafted::WIDTH,
                     host_tier::ARENA,
                     host_tier::CENSUS,
                     fetch::FETCH,

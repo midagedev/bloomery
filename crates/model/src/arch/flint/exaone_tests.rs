@@ -581,6 +581,38 @@ fn the_composed_program_accepts_the_header_and_prints_its_plan_values() {
 
 /// Two ropes over the rotating layers are refused by name with both bases: the
 /// body builds one rope table. Mutant: the disagreement check dropped.
+/// The MTP layer's card bytes the plan keeps out of the expert budget cover its tensors as the header
+/// holds them and its walk's buffers, and a file with no next-token layer is refused by name.
+#[test]
+fn the_mtp_layers_card_bytes_cover_its_tensors_and_a_file_without_one_is_refused() {
+    let r = check("description", &keys(), &tensors()).unwrap();
+    let layer: Vec<_> = r
+        .tensors
+        .tensors
+        .iter()
+        .filter(|t| t.layer == Some(TRUNK))
+        .collect();
+    assert!(
+        layer
+            .iter()
+            .any(|t| t.name == "blk.78.nextn.eh_proj.weight"),
+        "the layer's tensors are in the table at index {TRUNK}"
+    );
+    let weights: u64 = layer.iter().map(|t| t.file_bytes).sum();
+    let hidden = u64::from(r.spec.hidden);
+    let reserve = place::draft_reserve_bytes(&r.spec, &r.tensors, 2).unwrap();
+    // The arenas of the step's one row, the verify's two and one prompt unit (512 rows), 4 B a value.
+    let arenas = (1 + 2 + place::PROMPT_ROWS as u64) * hidden * 4;
+    assert!(
+        reserve >= weights + arenas + (8u64 << 20),
+        "{reserve} B reserved for {weights} B of weights and {arenas} B of arenas"
+    );
+    let mut bare = r.spec.clone();
+    bare.mtp.clear();
+    let e = place::draft_reserve_bytes(&bare, &r.tensors, 2).unwrap_err();
+    assert!(e.to_string().contains("the MTP layer"), "{e}");
+}
+
 #[test]
 fn two_ropes_over_the_trunk_are_refused_by_name() {
     let path = header_typed(

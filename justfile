@@ -4551,12 +4551,36 @@ gate-gpu-exaone-e2e:
 gate-gpu-exaone-pp:
     BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-pp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin gate_exaone_pp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_pp'
 
+# K-EXAONE-2.0's verify pass of two rows (gate_exaone_verify's doc): the fixture GGUF's pass through the engine's session, row 0
+# the token at the position and row 1 a drafted one (accepted or rejected), each row's id and logits bit for bit two decode steps' in
+# the captured graph and eager, a commit of one or both rows and the steps after it the plain run's ids and last logits, a lookup
+# draft over the pass emitting the plain run's tokens, and on a second load of the file with its MTP layer beside the target the
+# window loop emitting the plain run's tokens and the draft proposing the same id at a position whether the target stepped or
+# verified to reach it; the plain and the drafted load run again on a plan that holds about a quarter of the routed experts on
+# the card and the rest on the host (the pair chain over the host tier), the same four clauses there. The gate runs twice: on the
+# Q4_K fixture and on the IQ2_XXS fixture (routed gate and up IQ2_XXS, downs Q4_K: the real second quant's mix, written by
+# tools/ref/exaone-iq2-fixture.sh into /models/fixtures/exaoneh-iq2-gguf), the card's and the host tier's IQ2_XXS routed paths
+# under the same clauses. Real-only, as gate-gpu-exaone-e2e. One card (any idle one).
+gate-gpu-exaone-verify:
+    BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin gate_exaone_verify && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_verify && BLOOMERY_REF_MODEL=/models/fixtures/exaoneh-iq2-gguf/exaoneh-iq2-fixture-00001-of-00001.gguf BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_verify'
+
+# The verify pass's cost in decode steps (gate_exaone_verify's `--time`): one plain step and one pass of two rows over the plain
+# run's own next ids, medians, c_v = pass / step, under the timing lease (tools/ref/time-gate.sh) on the timing card. The model is
+# the profile's file, or the real one through BLOOMERY_REF_MODEL (a prediction card in BLOOMERY_BOX_ENV names the run).
+time-gpu-exaone-verify:
+    BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh time-gpu-exaone-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin gate_exaone_verify && bash tools/ref/time-gate.sh gate_exaone_verify --time'
+
 # The exaone-moe seat of bloomery-serve on the fixture GGUF (gate_exaone_serve's doc): the flint seat, the file's router row
 # picking K-EXAONE's body. `--parallel 2` is refused by name before any plan; one server at ctx 4096 loads (arch exaone-moe, one
 # slot, the trunk's six layers), listens and answers a chat turn with its reasoning split at the model's own <think> tags and its
 # turn ending at <|endofturn|>; a request that carries tools is answered with a completion (the template's tool-declare section),
-# and one tool call round-trips through the file's own template over a scripted engine. Real-only, as gate-gpu-exaone-e2e. One
-# card (any idle one).
+# and one tool call round-trips through the file's own template over a scripted engine; a server under BLOOMERY_DRAFT=mtp on one
+# slot answers the same greedy completion as the plain one with the same ids and draft counts of its own, and two slots beside it
+# are refused by name; with about a quarter of the routed experts on the card and the rest on the host, two chats that share a
+# prefix keep it and the draft joins the second one cut (one id fewer kept than the plain server keeps) and proposes in both,
+# under residency off with the plain server's ids bit for bit, under the plan's own residency (the swap machine and its tally
+# beside the verify pass) within a near tie, and at the default width chooser. Real-only, as gate-gpu-exaone-e2e. One card (any
+# idle one).
 gate-gpu-exaone-serve:
     BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_exaone_serve && D=target/exaone-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_serve --dir $D'
 

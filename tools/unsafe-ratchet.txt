@@ -897,7 +897,10 @@ gpu 3105 423 10
 gpu-deepseek41 371 45 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
-gpu-flint 2 0 0
+# PIN(2026-11-13): gpu-flint 2 -> 3 blocks, new code, not old code relaxed: the MTP draft's layer call
+# (draft.rs) into the same checked common attention binding as step and prompt, its SAFETY line naming the
+# consecutive positions and the store held below them.
+gpu-flint 3 0 0
 # PIN(2026-10-01): gpu-gates 60 -> 61 blocks, new code, not old code relaxed: gate_glm5next_serve starts
 # bloomery-serve with PR_SET_PDEATHSIG set between fork and exec (one pre_exec block, its SAFETY line), as the
 # Qwen3.8 serve gate does, so a bound that ends the gate does not leave the server holding the card.

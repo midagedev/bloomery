@@ -347,6 +347,76 @@ pub fn configure_group(inputs: &mut PlanInputs, group: usize) -> Result<(), Plac
     Ok(())
 }
 
+/// The rows one MTP walk takes (`gpu-flint`'s `draft::WALK_ROWS`): the draft's buffers hold this many.
+pub const DRAFT_ROWS: u64 = 8;
+
+/// Card bytes the MTP layer's load makes beside the target's, from the descriptors the load allocates
+/// by: the layer's tensors as the file holds them, its windowed store, the attention scratch of a
+/// walk of [`DRAFT_ROWS`] rows (the trunk's widest, which the layer's forms are within), the walk's
+/// row buffers, the arenas of the target's final hidden rows (the step's, the verify's and one prompt
+/// unit's), the head's logits and a margin for the by-name projection's forms. Refused by name: a file
+/// with no MTP layer and a layer whose store is not windowed.
+pub fn draft_reserve_bytes(
+    spec: &ModelSpec,
+    model: &ModelTensors,
+    pass_rows: u64,
+) -> Result<u64, PlacementError> {
+    const MARGIN: u64 = 8 << 20;
+    let refuse = |key: &str, detail: &str| PlacementError::Metadata {
+        key: key.into(),
+        detail: detail.into(),
+    };
+    let layer = spec.mtp.first().ok_or_else(|| {
+        refuse(
+            "the MTP layer",
+            "the file holds none (nextn_predict_layers is 0)",
+        )
+    })?;
+    let Mixer::Gqa(g) = &layer.mixer else {
+        return Err(refuse("the MTP layer attention", "Flint requires GQA"));
+    };
+    let window = g.window.ok_or_else(|| {
+        refuse(
+            "the MTP layer store",
+            "the draft's store is a window ring; this layer has none",
+        )
+    })?;
+    let at = spec.layers.len();
+    let hidden = u64::from(spec.hidden);
+    let ring = runtime::stores::Rows::Ring.count(Some(u64::from(window)), u64::from(u32::MAX));
+    let cache = ring
+        .checked_mul(u64::from(g.kv_heads) * u64::from(g.head_dim))
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(overflow)?;
+    let weights: u64 = model
+        .tensors
+        .iter()
+        .filter(|t| t.layer == Some(at))
+        .map(|t| t.file_bytes)
+        .sum();
+    let scratch = attention_scratch(spec, model)?
+        .bytes(DRAFT_ROWS)
+        .ok_or_else(overflow)?;
+    let rows = DRAFT_ROWS * hidden * 4;
+    let arenas = (1 + pass_rows + PROMPT_ROWS as u64) * hidden * 4;
+    let head = (u64::from(spec.vocab) + 8 * hidden) * 4;
+    [weights, cache, scratch, 7 * rows + arenas + head, MARGIN]
+        .into_iter()
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(overflow)
+}
+
+/// `inputs` with the MTP layer's card bytes ([`draft_reserve_bytes`]) kept out of the expert budget
+/// beside the prompt batch's. Called once, after [`configure_group`] (which prices the batch afresh).
+pub fn configure_draft(inputs: &mut PlanInputs, pass_rows: u64) -> Result<(), PlacementError> {
+    let bytes = draft_reserve_bytes(&inputs.spec, &inputs.model, pass_rows)?;
+    inputs.prompt_reserve = inputs
+        .prompt_reserve
+        .checked_add(bytes)
+        .ok_or_else(overflow)?;
+    Ok(())
+}
+
 /// The real expert tier's staging, protected leg scratch and host exchanges for one prompt unit.
 pub fn tier_batch(inputs: &PlanInputs) -> Result<TierBatchBytes, PlacementError> {
     let batch = routed_batch(&inputs.spec, &inputs.model, TIER_CHUNK, true, false)?;

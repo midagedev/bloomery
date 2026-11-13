@@ -25,6 +25,43 @@ pub fn prefill<R: RouterEntry>(
     ids: &[u32],
     at: u32,
 ) -> Result<bool, GpuError> {
+    call(gpu, w, body, head, ids, at, false)
+}
+
+/// [`prefill`] of one prompt unit (at most [`T_MAX`] ids) that also leaves the unit's final hidden rows
+/// in the draft's prefill arena, with its position record ([`crate::draft`]). Refused by name: a load
+/// without the draft and a call of more than one unit.
+pub fn prefill_draft<R: RouterEntry>(
+    gpu: &Gpu,
+    w: &Weights,
+    body: &mut FlintBody<R>,
+    head: &mut Head,
+    ids: &[u32],
+    at: u32,
+) -> Result<bool, GpuError> {
+    if body.draft.is_none() {
+        return Err(shape(
+            "a drafted prompt unit on a load without the MTP layer",
+        ));
+    }
+    if ids.len() > T_MAX {
+        return Err(shape(format!(
+            "a drafted prompt unit of {} ids; a unit holds {T_MAX}",
+            ids.len()
+        )));
+    }
+    call(gpu, w, body, head, ids, at, true)
+}
+
+fn call<R: RouterEntry>(
+    gpu: &Gpu,
+    w: &Weights,
+    body: &mut FlintBody<R>,
+    head: &mut Head,
+    ids: &[u32],
+    at: u32,
+    tapped: bool,
+) -> Result<bool, GpuError> {
     let to =
         runtime::prompt::call_end(at, ids.len(), body.ctx).map_err(|e| shape(e.to_string()))?;
     for &id in ids {
@@ -37,6 +74,7 @@ pub fn prefill<R: RouterEntry>(
     }
     // A failed call may already have overwritten ring rows. Reset, not a lower logical position, repairs that state.
     body.at = body.at.max(to);
+    let layers = body.cfg.len();
     let FlintBody {
         shell,
         cfg,
@@ -50,6 +88,7 @@ pub fn prefill<R: RouterEntry>(
         embed,
         hidden,
         ctx,
+        draft,
         ..
     } = body;
     let mut attention = Attention {
@@ -74,10 +113,18 @@ pub fn prefill<R: RouterEntry>(
         taps: shell.taps.as_deref_mut(),
         embd: *hidden,
         ctx: *ctx,
-        layers: cfg.len(),
+        layers,
     };
     let mut cursor = at;
-    walk.prompt(ids, &mut cursor)
+    match draft.as_mut().filter(|_| tapped) {
+        Some(d) => {
+            let mut tap = d.tap(layers, at);
+            let ran = walk.prompt_entering(ids, &mut cursor, &mut tap)?;
+            d.wrote_prefill(at, ids.len());
+            Ok(ran)
+        }
+        None => walk.prompt(ids, &mut cursor),
+    }
 }
 
 struct Attention<'a> {

@@ -941,6 +941,12 @@ required-features = ["flint"]
 name = "gate_exaone_pp"
 required-features = ["flint"]
 
+# exaone-verify: the program's verify pass of two rows (one layer apart, the step's own launches per
+# row) against two decode steps, through the engine's session, and a lookup draft over it.
+[[bin]]
+name = "gate_exaone_verify"
+required-features = ["flint"]
+
 # exaone-serve: the exaone-moe seat of bloomery-serve (the flint seat, the file's router row
 # picking K-EXAONE's body) on the fixture GGUF: one chat turn with its reasoning split at the
 # model's own tags, a tools request served, one tool call round-tripped through the file's own

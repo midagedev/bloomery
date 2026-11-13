@@ -16,6 +16,8 @@ use model::placement::Plan;
 
 use super::{Batch, ResidentSequences};
 
+mod mtp;
+
 const WHAT: &str = "flint session";
 
 /// A Flint session, with resident slots backed by the body's own stores.
@@ -47,6 +49,25 @@ macro_rules! flint_batch {
                 slots: NonZeroUsize,
             ) -> Result<GpuModel<Self>, GpuError> {
                 Self::open_placed_slots(file, plan, inputs, 0, host, residency, slots)
+            }
+
+            fn open_placed_drafted(
+                file: Split,
+                plan: &Plan<'_>,
+                inputs: &PlanInputs,
+                host: HostCfg,
+                residency: Residency,
+                slots: NonZeroUsize,
+            ) -> Result<GpuModel<Self>, GpuError> {
+                Self::open_placed_slots_drafted(file, plan, inputs, 0, host, residency, slots)
+            }
+
+            fn configure_draft(inputs: &mut PlanInputs) -> Result<(), GpuError> {
+                model::arch::flint::place::configure_draft(
+                    inputs,
+                    bloomery_gpu_flint::PASS_ROWS as u64,
+                )
+                .map_err(|e| GpuError::plan(WHAT, e))
             }
 
             fn batch(
