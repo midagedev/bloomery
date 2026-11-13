@@ -191,7 +191,7 @@ mod gate {
             arch: "muse-spark",
             layers,
             think: Some(MARKERS),
-            turn_end: TURN_END,
+            turn_end: Some(TURN_END),
             ctx: CTX,
             // Every layer's store is a plane of positions, so the session's cut keeps every
             // held position (`app::Keep for Body`, crates/app/src/arch/musespark/mod.rs:81).

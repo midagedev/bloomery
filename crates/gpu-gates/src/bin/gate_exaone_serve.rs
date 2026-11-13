@@ -1,22 +1,24 @@
 //! `gate_exaone_serve` — the exaone-moe seat of `bloomery-serve` (the flint seat, whose file's
 //! router row picks K-EXAONE's body) against the model it serves, on the fixture GGUF of the
-//! profile (`BLOOMERY_REF_MODEL`): the seat starts, loads the file on the placed body, answers one
-//! chat request with its reasoning split at the model's own `<think>` span, ends its turn at the
-//! model's own end token and keeps the prefix a request shares with the slot by the body's own
-//! rule.
+//! profile (`BLOOMERY_REF_MODEL`): the seat starts, plans its two resident slots, loads the file
+//! on the placed body, answers one chat request with its reasoning split at the model's own
+//! `<think>` span and keeps the prefix a request shares with the slot by the body's own rule.
 //!
 //!     gate_exaone_serve --dir <dir>
 //!
-//! The seat serves one sequence on one card (`--parallel` above 1 is refused by name). Every
+//! The seat serves resident sequences, a select and a step each (`pass=turns`). Every
 //! server is `bloomery-serve --model flint -m <file>` beside this binary, `BLOOMERY_REF_MODEL`
 //! removed from its environment. Logs per server in `<dir>/<name>/` (`server.err`, the answer).
 //!
-//! The shared clauses are `shared/serve_gate.rs`'s: `parallel_above_one_is_refused`,
+//! The shared clauses are `shared/serve_gate.rs`'s: `plan_names_the_slots` (the body's
+//! `Sequences` are `app::arch::flint`'s resident ones, so `--parallel 2` is served, not refused),
 //! `load_and_listen` (the load record names arch `exaone-moe`, the trunk's six layers, one slot),
 //! `chat_answers_a_turn`, `chat_splits_the_reasoning_at_the_models_tags` (the file's own template
 //! opens `<think>` in the generation prompt and the model closes it; the request carries a
 //! reasoning budget so the span closes even if the cut model never writes the close itself),
-//! `chat_ends_at_the_turn_end` (the turn end is `<|endofturn|>`, eos 53), `live_slot_keeps_the_prefix`
+//! `chat_ends_at_the_turn_end` (left by name: the six-layer cut never writes the turn end inside
+//! the tokens a request asks for — the model's own turn end is `<|endofturn|>`, eos 53, and the
+//! clause is the real model's when its file lands), `live_slot_keeps_the_prefix`
 //! (the body's ring takes a shared prefix back only where the sequence stands:
 //! [`serve_gate::Cut::WhereItStands`]) and `saved_state_returns` (skipped by name while the seat
 //! prints no prompt-cache line).
@@ -66,9 +68,6 @@ mod gate {
 
     /// The tags of the model's think span, as its vocabulary spells them.
     const THINK_TAGS: [&str; 2] = ["<think>", "</think>"];
-
-    /// The token that closes the model's turn, as its vocabulary spells it (eos 53).
-    const TURN_END: &str = "<|endofturn|>";
 
     /// Polls of a second that bound the wait for a server to listen.
     const LISTEN_POLLS: usize = 1000;
@@ -182,7 +181,9 @@ mod gate {
             arch: "exaone-moe",
             layers,
             think: Some(THINK_TAGS),
-            turn_end: TURN_END,
+            // The six-layer cut never writes the turn end inside the tokens a request asks
+            // for (the module header); the shared clause is left by name.
+            turn_end: None,
             ctx: CTX,
             // The body's ring takes a shared prefix back only where the sequence stands
             // (`app::arch::flint`'s `Batch::cut`, the rollback's own rule).
@@ -190,7 +191,7 @@ mod gate {
         };
         let dir = serve_gate::dir_of(&c)?;
         std::fs::create_dir_all(&dir)?;
-        let mut ok = serve_gate::parallel_above_one_is_refused(&c, &dir)?;
+        let mut ok = serve_gate::plan_names_the_slots(&c, &dir)?;
         ok &= serve_gate::served_with(&c, &dir, ASK)?;
         ok &= tools_request_is_served(&dir)?;
         let split = Split::open(&file).map_err(|e| format!("open {}: {e}", file.display()))?;

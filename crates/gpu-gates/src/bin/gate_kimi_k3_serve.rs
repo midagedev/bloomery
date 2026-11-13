@@ -407,7 +407,7 @@ mod gate {
             // The span's close and the response's open: markup between the reasoning and the
             // answer, in neither.
             think: Some(["<|close|>think<|sep|>", "<|open|>response<|sep|>"]),
-            turn_end: TURN_END,
+            turn_end: Some(TURN_END),
             ctx: CTX,
             // The delta layers' state takes no position back: a cut keeps the position the model
             // stands at, or nothing (`app::arch::kimi_k3`'s `Batch::cut`).

@@ -250,7 +250,7 @@ mod gate {
             arch: "minimax-m3",
             layers,
             think: Some(THINK_TAGS),
-            turn_end: TURN_END,
+            turn_end: Some(TURN_END),
             ctx: CTX,
             // Every store is a plane of positions, so the session's cut keeps every held
             // position (`app::Keep`, crates/app/src/arch/minimaxm3/mod.rs:11).

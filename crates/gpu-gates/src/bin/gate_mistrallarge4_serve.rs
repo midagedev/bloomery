@@ -310,7 +310,7 @@ mod gate {
             arch: "mistral-large4",
             layers,
             think: Some(THINK),
-            turn_end: TURN_END,
+            turn_end: Some(TURN_END),
             ctx: CTX,
             // Every layer's store is a plane of positions, so the session's cut keeps every held
             // position (`app::Keep for Body`, crates/app/src/arch/mistrallarge4/mod.rs).
@@ -323,43 +323,6 @@ mod gate {
             model: c.model,
             kinds: c.kinds,
         }
-    }
-
-    /// `plan_names_the_slots` (the module header).
-    fn plan_names_the_slots(c: &serve_gate::Clauses, dir: &Path) -> Result<bool, GateError> {
-        let mut ok = true;
-        let file = ref_model_path()?;
-        let total = (2 * c.ctx).to_string();
-        let (status, _, text) = seat(c).plan(
-            dir,
-            "plan-two-slots",
-            &file,
-            &["--ctx", &total, "--parallel", "2"],
-        )?;
-        let two = status.success()
-            && text.lines().any(|l| {
-                l.starts_with(&format!(
-                    "parallel rule=slots slots=2 slot_ctx={} total={total} ",
-                    c.ctx
-                )) && l.ends_with(" pass=turns")
-            });
-        let ctx = c.ctx.to_string();
-        let (status, _, text) = seat(c).plan(dir, "plan-one-slot", &file, &["--ctx", &ctx])?;
-        let one = status.success()
-            && text.lines().any(|l| {
-                l.starts_with(&format!(
-                    "parallel rule=slots slots=1 slot_ctx={} total={} ",
-                    c.ctx, c.ctx
-                )) && l.ends_with(" pass=one")
-            });
-        println!(
-            "ctx {total} --parallel 2: two slots, pass=turns {two}; ctx {ctx}: one slot, pass=one {one}"
-        );
-        if !(two && one) {
-            println!("plan-two-slots stderr:\n{text}");
-        }
-        check(&mut ok, "plan_names_the_slots", two && one);
-        Ok(ok)
     }
 
     /// `place_bp_follows_the_cards` (the module header); `two` whether the census holds two cards.
@@ -1335,7 +1298,7 @@ mod gate {
         let c = clauses()?;
         std::fs::create_dir_all(&dir)?;
         let two = gpu_census::census()?.len() >= 2;
-        let mut ok = plan_names_the_slots(&c, &dir)?;
+        let mut ok = serve_gate::plan_names_the_slots(&c, &dir)?;
         ok &= place_bp_follows_the_cards(&c, &dir, two)?;
         ok &= place_unset_runs_a(&c, &dir, two)?;
         ok &= residency_lever_is_honoured(&c, &dir)?;

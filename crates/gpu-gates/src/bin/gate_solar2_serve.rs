@@ -205,7 +205,7 @@ mod gate {
             arch: "solar-open2",
             layers,
             think: Some(THINK_TAGS),
-            turn_end: TURN_END,
+            turn_end: Some(TURN_END),
             ctx: CTX,
             // The KDA layers' recurrent state keeps a shared prefix only where the sequence
             // stands or at a checkpoint (`Body::kept`, crates/app/src/arch/solar2/mod.rs:75),

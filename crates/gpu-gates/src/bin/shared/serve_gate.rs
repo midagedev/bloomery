@@ -1,5 +1,7 @@
 //! The serve gate's clauses: the one owner of what a seat of a body that runs
-//! one sequence on one card is held to — it refuses a second slot, it loads
+//! one sequence on one card is held to — it refuses a second slot
+//! ([`parallel_above_one_is_refused`]) or plans the two a body with resident
+//! sequences serves ([`plan_names_the_slots`]), it loads
 //! the file at the context it was asked for, it answers a chat turn with its
 //! reasoning split at the model's own tags and its turn ending at the model's
 //! own end token, and a request keeps the prefix it shares with the slot the
@@ -10,7 +12,8 @@
 //! records its server prints, the load and the listening record, the
 //! architecture word its load record names, the file's layers, the tags of its
 //! think span (none for a seat that serves plain text), the token that closes
-//! its turn, the context the server is asked for and what its body's cut keeps
+//! its turn (none for a seat whose model never does), the context the server
+//! is asked for and what its body's cut keeps
 //! of a shared prefix ([`Cut`]); and what its chat request asks beside the
 //! turn ([`Ask`]).
 //!
@@ -55,8 +58,10 @@ pub struct Clauses {
     /// tags and whose seat serves its reasoning inline as plain text: the message then has no
     /// tag to leak. A model whose reply has sections (Kimi K3) names the markup between them.
     pub think: Option<[&'static str; 2]>,
-    /// The token that closes the model's turn, as its vocabulary spells it.
-    pub turn_end: &'static str,
+    /// The token that closes the model's turn, as its vocabulary spells it; `None` for a seat
+    /// whose model never ends a turn inside the tokens a request asks for (a cut of the
+    /// model's layers), whose [`ENDED`] clause is left by name to a model that does.
+    pub turn_end: Option<&'static str>,
     /// The context the server is asked for.
     pub ctx: u64,
     /// What the seat's cut (`app::Keep`) keeps of a prefix a request shares with the slot:
@@ -220,6 +225,54 @@ pub fn parallel_above_one_is_refused(c: &Clauses, dir: &Path) -> Result<bool, Ga
     Ok(ok)
 }
 
+/// `plan_names_the_slots`: `--ctx` 2·[`Clauses::ctx`] `--parallel 2 --plan` exits 0 and its
+/// stderr carries the `parallel` line of two slots a slot's [`Clauses::ctx`] wide that a round
+/// of several serves in turns (`pass=turns`), and `--ctx` [`Clauses::ctx`] `--plan` carries the
+/// one slot's (`pass=one`): the seat's body holds resident sequences, a select and a step each.
+/// The one owner of what every seat that serves a second slot is held to; a seat that holds one
+/// sequence is held to [`parallel_above_one_is_refused`] instead. FAIL-first: a seat that serves
+/// several slots in one pass prints `pass=one` for two and the clause is red; one that divides
+/// the context between its slots prints another `slot_ctx` and the clause is red.
+pub fn plan_names_the_slots(c: &Clauses, dir: &Path) -> Result<bool, GateError> {
+    let mut ok = true;
+    let file = ref_model_path()?;
+    let seat = SeatGate {
+        model: c.model,
+        kinds: c.kinds,
+    };
+    let total = (2 * c.ctx).to_string();
+    let (status, _, text) = seat.plan(
+        dir,
+        "plan-two-slots",
+        &file,
+        &["--ctx", &total, "--parallel", "2"],
+    )?;
+    let two = status.success()
+        && text.lines().any(|l| {
+            l.starts_with(&format!(
+                "parallel rule=slots slots=2 slot_ctx={} total={total} ",
+                c.ctx
+            )) && l.ends_with(" pass=turns")
+        });
+    let ctx = c.ctx.to_string();
+    let (status, _, text) = seat.plan(dir, "plan-one-slot", &file, &["--ctx", &ctx])?;
+    let one = status.success()
+        && text.lines().any(|l| {
+            l.starts_with(&format!(
+                "parallel rule=slots slots=1 slot_ctx={} total={} ",
+                c.ctx, c.ctx
+            )) && l.ends_with(" pass=one")
+        });
+    println!(
+        "ctx {total} --parallel 2: two slots, pass=turns {two}; ctx {ctx}: one slot, pass=one {one}"
+    );
+    if !(two && one) {
+        println!("plan-two-slots stderr:\n{text}");
+    }
+    check(&mut ok, "plan_names_the_slots", two && one);
+    Ok(ok)
+}
+
 /// The clauses on one server: `load_and_listen` and the chat; the server is
 /// stopped at the end.
 pub fn served(c: &Clauses, dir: &Path) -> Result<bool, GateError> {
@@ -290,7 +343,14 @@ pub fn served_with(c: &Clauses, dir: &Path, ask: Ask) -> Result<bool, GateError>
         check(&mut ok, CHAT, split);
     }
     if tier::run_clause(ENDED, Tag::FileBound)? {
-        check(&mut ok, ENDED, ended);
+        match c.turn_end {
+            Some(_) => check(&mut ok, ENDED, ended),
+            None => println!(
+                "skip {ENDED}: the {model} seat's model never ends a turn inside the tokens a \
+                 request asks for, so the clause is left to a model that does",
+                model = c.model
+            ),
+        }
     }
     if tier::run_clause(PREFIX, Tag::SelfConsistency)? {
         let lever = records
@@ -488,15 +548,17 @@ fn chat(
             .as_u64()
             .is_some_and(|n| (1..=MAX_TOKENS).contains(&n));
     let finish = answer["choices"][0]["finish_reason"].as_str().unwrap_or("");
-    let ended =
-        finish == "stop" && !content.contains(c.turn_end) && !reasoning.contains(c.turn_end);
+    let end_in_message = |end: &str| content.contains(end) || reasoning.contains(end);
+    let ended = c
+        .turn_end
+        .is_some_and(|end| finish == "stop" && !end_in_message(end));
     println!(
         "chat: usage {usage}; finish_reason {finish:?}; reasoning {} chars, content {} chars; a \
          think tag in the message {leaked}; the turn end in the message {}; reasoning \
          {reasoning:?}; content {content:?}",
         reasoning.trim().len(),
         content.trim().len(),
-        content.contains(c.turn_end) || reasoning.contains(c.turn_end)
+        c.turn_end.is_some_and(end_in_message)
     );
     let stopped = matches!(finish, "stop" | "length");
     Ok((
