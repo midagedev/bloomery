@@ -81,8 +81,10 @@ mod gate {
     use model::placement::PlanLevers;
     use model::r8file::R8Source;
 
-    /// The UD-Q3_K_XL file, first of three shards (90.0 GB).
-    const MODEL: &str = "/data/moved/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
+    /// The UD-Q3_K_XL file, first of three shards (90.0 GB), on the NVMe drive: the gate pages the whole
+    /// file through its engine child, which a hard drive cannot do inside the gate bound.
+    const MODEL: &str =
+        "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
 
     /// Cache rows of the engine child: the prompt and the steps, with room.
     const CTX: usize = 1024;

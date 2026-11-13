@@ -319,12 +319,13 @@ mod gate {
     use bloomery_gpu_gates::ctx_ladder::{self, ctx_line, default_line_held, step_above};
     use bloomery_gpu_gates::generate::{Place, stage_host_page};
     use bloomery_gpu_gates::logits_band::{Parted, Pick, parted};
-    use bloomery_gpu_gates::prompts::MARGIN_FLOOR;
+    use bloomery_gpu_gates::prompts::{HEAD_MARGIN_V41, MARGIN_FLOOR};
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         self, MAX_CTX, MaxCtx, Served, agree, card_bytes_hold_at_max_ctx, curl, ids_of, json_of,
         metric, parse_ids, plan_run, server_log, slot_action, sse_event, sse_events, stop_of,
     };
+    use bloomery_gpu_gates::tier::Tier;
     use bloomery_gpu_gates::{GateError, checks_failed, data_dir, ref_model_path, verdict};
     use gguf::{Gguf, Split};
     use model::arch::deepseek41::hparams::Hparams;
@@ -832,9 +833,9 @@ mod gate {
 
     /// The generated ids of a chat reply (`choices[0].logprobs.content`) or a `/completion` answer
     /// (`completion_probabilities`), one entry a token, each with the gap between its row's top two
-    /// logits and the runner-up's id ([`Pick::alt`]). A token that is not its row's largest (the
-    /// sampler banned that one under `ignore_eos`, or forced the token) has no gap to read: it
-    /// counts clear. An answer with no entries field, an entry with no id or fewer than two
+    /// logits and the runner-up's id ([`Pick::alt`]). Where the sampler banned the row's largest
+    /// (`ignore_eos`) and took the second, the gap is between the second and the third; a token
+    /// under both (a forced token) has no gap to read: it counts clear. An answer with no entries field, an entry with no id or fewer than two
     /// alternatives, or a gap that is not finite is a named error.
     fn picks(entries: &Value, who: &str) -> Result<Vec<Pick>, GateError> {
         let rows = entries.as_array().ok_or_else(|| {
@@ -858,7 +859,19 @@ mod gate {
                     })
                     .unwrap_or_default();
                 alt.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-                let pick = match alt.as_slice() {
+                // PIN(2026-11-13): a banned argmax's row counted clear, so a reasoning-budget
+                // continuation that parted from its capped run at the end-of-generation row (ids
+                // 21017 and 4114, 0.28 and 0.19 apart under the banned id) read as a clear part.
+                // Derivation: under `ignore_eos` the sampler's choice is the argmax of the other
+                // ids, so its clarity is their top-two gap, read against the same floor; a pick
+                // under two larger ids still counts clear.
+                // The row's argmax, or, where the sampler banned that one (`ignore_eos`), the
+                // largest of the rest: the pick's gap is to the next id the sampler could take.
+                let open = match alt.as_slice() {
+                    [(_, top), rest @ ..] if *top != u64::from(id) && rest.len() >= 2 => rest,
+                    all => all,
+                };
+                let pick = match open {
                     [(best, top), (next, runner), ..] => {
                         let alt_id = u32::try_from(*runner).map_err(|_| {
                             format!("{who}: entry {k}'s runner-up id {runner} is not a token: {e}")
@@ -916,11 +929,39 @@ mod gate {
     // 0.3 under a warm gap of 4.05. [`derived_floor`]: twice the largest gap shift over the
     // agreeing positions, never under MARGIN_FLOOR, so a fault (a restore that loses a row, a
     // wrong KV row) still moves a gap far past every shift the agreeing positions show.
+    // PIN(2026-11-13): a pair that parts at a head token (0–1) reads at least the head margin: the
+    // 13-id prompt's parting (fresh 0.3036 id 11111, warm 4.0539 id 223) is the prefill gate's
+    // P = 1 position-0 row, the batched call against the steps, which HEAD_MARGIN_V41 measures;
+    // one agreeing position cannot derive that term.
     /// Compares a fresh run's generated ids with the warm run's: [`split_of`] with their names,
-    /// at the clarity floor the pair's own agreeing positions derive ([`derived_floor`]).
+    /// at the clarity floor the pair's own agreeing positions derive ([`derived_floor`]), raised to
+    /// the head floor ([`head_floor`]) when the runs part at token 0 or 1.
     fn fresh_split(what: &str, fresh: &[Pick], warm: &[Pick]) -> Parted {
-        let floor = derived_floor(what, fresh, warm);
+        let derived = derived_floor(what, fresh, warm);
+        let at = fresh.iter().zip(warm).position(|(f, w)| f.id != w.id);
+        let floor = match at {
+            Some(at) if at < 2 && head_floor() > derived => {
+                let head = head_floor();
+                println!(
+                    "{what}: the runs part at head token {at}: its floor is the head margin {head} \
+                     (prompts::HEAD_MARGIN_V41), over the derived {derived:.4}"
+                );
+                head
+            }
+            _ => derived,
+        };
         split_of(what, ("fresh run", fresh), ("warm run", warm), floor)
+    }
+
+    /// The clarity floor of a pair's first two generated tokens, where the prompt call's sum order
+    /// moves the top-two gap most: the real tier's [`HEAD_MARGIN_V41`] (the same term the prefill
+    /// gate measures, a batched call against the steps over one prompt), the e2e floor on a
+    /// fixture.
+    fn head_floor() -> f32 {
+        match Tier::from_env().expect("the gate's start read BLOOMERY_TIER (ref_model_path)") {
+            Tier::Real => HEAD_MARGIN_V41,
+            Tier::Fixture => MARGIN_FLOOR,
+        }
     }
 
     /// The clarity floor a fresh/warm pair is judged at, derived in the run: twice the largest
@@ -1300,27 +1341,29 @@ mod gate {
         )?;
         let close = ids_of(&json_of("/tokenize", st, &body)?["tokens"])?;
         // A run's ids and rows, from a reset cache.
-        let run =
-            |prompt: &[u32], budget: Value, n: usize| -> Result<(Vec<u32>, Vec<Pick>), GateError> {
-                let body = json!({
-                    "prompt": prompt, "n_predict": n, "temperature": 0, "ignore_eos": true,
-                    "return_tokens": true, "cache_prompt": false, "reasoning_budget": budget,
-                    "n_probs": GAP_TOP,
-                });
-                let (st, text) = curl(&url("/completion"), Some(&body), false)?;
-                let v = json_of("/completion", st, &text)?;
-                let ids = ids_of(&v["tokens"])?;
-                let rows = picks(&v["completion_probabilities"], "the budget completion")?;
-                if ids_in(&rows) != ids {
-                    return Err(format!(
+        let run = |prompt: &[u32],
+                   budget: Value,
+                   n: usize|
+         -> Result<(Vec<u32>, Vec<Pick>, Value), GateError> {
+            let body = json!({
+                "prompt": prompt, "n_predict": n, "temperature": 0, "ignore_eos": true,
+                "return_tokens": true, "cache_prompt": false, "reasoning_budget": budget,
+                "n_probs": GAP_TOP,
+            });
+            let (st, text) = curl(&url("/completion"), Some(&body), false)?;
+            let v = json_of("/completion", st, &text)?;
+            let ids = ids_of(&v["tokens"])?;
+            let rows = picks(&v["completion_probabilities"], "the budget completion")?;
+            if ids_in(&rows) != ids {
+                return Err(format!(
                     "the budget completion's probability entries name ids {:?}, its tokens {ids:?}",
                     ids_in(&rows)
                 )
                 .into());
-                }
-                Ok((ids, rows))
-            };
-        let (capped, capped_rows) = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
+            }
+            Ok((ids, rows, v["completion_probabilities"].clone()))
+        };
+        let (capped, capped_rows, capped_probs) = run(&p, json!(THINK_BUDGET), THINK_PREDICT)?;
         let through = THINK_BUDGET + close.len();
         let closed = capped.len() == THINK_PREDICT && capped[THINK_BUDGET..through] == close[..];
         // Fed the close as an ordinary prompt id, the model continues as the
@@ -1329,12 +1372,12 @@ mod gate {
         // continuation is one prompt call over the same ids, so the two are
         // two orders of one prompt and part only at a near tie — the fresh
         // runs' rule ([`fresh_split`]).
-        let (after, after_rows) = if closed {
+        let (after, after_rows, after_probs) = if closed {
             let mut fed = p;
             fed.extend(&capped[..through]);
             run(&fed, Value::Null, THINK_PREDICT - through)?
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Value::Null)
         };
         println!(
             "think budget {THINK_BUDGET}: capped {capped:?}, close {close:?} at {THINK_BUDGET}: \
@@ -1350,6 +1393,19 @@ mod gate {
             &after_rows,
             &capped_rows[through..],
         );
+        // Where the two part, both rows' entries as the server gave them (the chosen id and its
+        // top alternatives): a pick that is not its row's argmax is a sampler ban, not a gap.
+        if let Some(at) = after
+            .iter()
+            .zip(&capped[through..])
+            .position(|(a, c)| a != c)
+        {
+            println!(
+                "budget_continues_on_the_close: token {at}: continuation entry {}; capped entry {}",
+                after_probs[at],
+                capped_probs[through + at]
+            );
+        }
         let mut ok = true;
         check(
             &mut ok,
