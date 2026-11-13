@@ -49,13 +49,22 @@ usage:
   --cpu                  run every tensor on the host's cores; open no card
   --card N               the card to use, by CUDA ordinal (default: the first)
   --batch N              experts per card call (default 32)
+  --fit-ladder           print every unit (a tensor class over a layer range) with the types it may take and their
+                         bytes, a rules token each; write nothing, open no card (docs/research/quant-fit.md)
+  --fit-group N          with --fit-ladder: layers to a unit (default 0, one unit a class over all its layers)
+  --fit BYTES            choose each unit's type from --sensitivity so the output file fits BYTES (a number of bytes,
+                         or with B, KB, MB, GB, TB, KiB, MiB, GiB, TiB) at the least summed KLD, and write the
+                         rules to --fit-out; the --tensor-type-file's rules follow the units' in that file; write
+                         no tensor, open no card
+  --sensitivity TSV      with --fit: the table tools/ref/qfit.py measures (class layers type dkld se positions)
+  --fit-out FILE         with --fit: the rules file to write (an existing file is refused)
 
 Types are written for F32, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS and the architectures kimi-k3 and exaone-moe;
 anything else is refused by name.
 
 exit: 0 done; 1 a refusal, named (a source row that is not finite, an imatrix entry that is unusable, a type this
 quantizer does not write, too little room, a whole output shard that is not this plan's under --resume, a --check or
---llama-plan difference); 64 a usage error; 66 a missing input file.";
+--llama-plan difference, a --fit budget no pick can meet); 64 a usage error; 66 a missing input file.";
 
 /// A Hugging Face checkpoint folder as the input, with what `prepare` takes of one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +93,19 @@ impl Input {
     }
 }
 
+/// What `--fit-ladder` and `--fit` ask for instead of a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fit {
+    /// `--fit-ladder [--fit-group N]`: the units and their types.
+    Ladder { group: usize },
+    /// `--fit BYTES --sensitivity TSV --fit-out FILE`: the pick for a byte budget.
+    Select {
+        budget: u64,
+        table: PathBuf,
+        out: PathBuf,
+    },
+}
+
 /// The arguments of a run.
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -103,6 +125,7 @@ pub struct Args {
     pub cpu: bool,
     pub card: Option<usize>,
     pub batch: usize,
+    pub fit: Option<Box<Fit>>,
 }
 
 /// What the command line asks for.
@@ -137,6 +160,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
     let (mut allow, mut keep, mut resume, mut plan, mut cpu) = (false, false, false, false, false);
     let (mut check, mut card, mut batch) = (0usize, None, 32usize);
     let (mut hf, mut hf_arch, mut hf_drop, mut hf_gib) = (None, None, Vec::new(), None);
+    let (mut ladder, mut group, mut budget) = (false, None, None);
+    let (mut table, mut fit_out) = (None, None);
     while let Some(a) = it.next() {
         let value = |it: &mut dyn Iterator<Item = String>| {
             it.next().ok_or_else(|| usage(format!("{a} needs a value")))
@@ -161,6 +186,16 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
                         .ok_or_else(|| usage("--hf-shard-gib takes whole GiB above 0"))?,
                 );
             }
+            "--fit-ladder" => ladder = true,
+            "--fit-group" => {
+                group =
+                    Some(value(&mut it)?.parse::<usize>().map_err(|_| {
+                        usage("--fit-group takes a layer count (0 for whole classes)")
+                    })?);
+            }
+            "--fit" => budget = Some(crate::fit::parse_bytes(&value(&mut it)?)?),
+            "--sensitivity" => table = Some(PathBuf::from(value(&mut it)?)),
+            "--fit-out" => fit_out = Some(PathBuf::from(value(&mut it)?)),
             "--imatrix" => imatrix = Some(value(&mut it)?),
             "--tensor-type-file" => rules = Some(PathBuf::from(value(&mut it)?)),
             "--llama-plan" => llama_plan = Some(PathBuf::from(value(&mut it)?)),
@@ -243,6 +278,40 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
             "--resume resumes an output shard at a time: it takes --keep-split (one output file has nothing to resume)",
         ));
     }
+    let fit = match (ladder, budget, table, fit_out) {
+        (false, None, None, None) => {
+            if group.is_some() {
+                return Err(usage("--fit-group takes --fit-ladder"));
+            }
+            None
+        }
+        (true, None, None, None) => Some(Box::new(Fit::Ladder {
+            group: group.unwrap_or(0),
+        })),
+        (false, Some(budget), Some(table), Some(out)) => {
+            if group.is_some() {
+                return Err(usage("--fit-group takes --fit-ladder"));
+            }
+            Some(Box::new(Fit::Select { budget, table, out }))
+        }
+        (false, Some(_), _, _) => {
+            return Err(usage("--fit takes --sensitivity TSV and --fit-out FILE"));
+        }
+        (false, None, _, _) => {
+            return Err(usage("--sensitivity and --fit-out take --fit BYTES"));
+        }
+        (true, _, _, _) => {
+            return Err(usage(
+                "--fit-ladder is its own mode: it takes only --fit-group",
+            ));
+        }
+    };
+    if fit.is_some() && (check > 0 || resume || llama_plan.is_some()) {
+        return Err(usage(
+            "--fit and --fit-ladder write no tensor: they take no --check, --resume or --llama-plan",
+        ));
+    }
+    let plan = plan || fit.is_some();
     let out = match (keep, out.strip_suffix(".gguf")) {
         (true, Some(p)) => p.to_string(),
         _ => out,
@@ -264,6 +333,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Parsed> {
         cpu,
         card,
         batch,
+        fit,
     }))
 }
 
@@ -382,6 +452,74 @@ mod tests {
         }
         assert!(matches!(run(&["--help"]).unwrap(), Parsed::Help));
         assert!(matches!(run(&["x", "--version"]).unwrap(), Parsed::Version));
+    }
+
+    #[test]
+    fn the_fit_modes_and_their_refusals() {
+        let Parsed::Run(a) =
+            run(&["in", "out", "q4_k_m", "--fit-ladder", "--fit-group", "4"]).unwrap()
+        else {
+            panic!("a run")
+        };
+        assert_eq!(a.fit.as_deref(), Some(&Fit::Ladder { group: 4 }));
+        assert!(a.plan, "a fit mode writes no tensor");
+        let Parsed::Run(b) = run(&[
+            "in",
+            "out",
+            "q4_k_m",
+            "--fit",
+            "6.5GB",
+            "--sensitivity",
+            "t.tsv",
+            "--fit-out",
+            "r.rules",
+        ])
+        .unwrap() else {
+            panic!("a run")
+        };
+        assert_eq!(
+            b.fit.as_deref(),
+            Some(&Fit::Select {
+                budget: 6_500_000_000,
+                table: PathBuf::from("t.tsv"),
+                out: PathBuf::from("r.rules")
+            })
+        );
+        for bad in [
+            &["in", "out", "q4_k_m", "--fit", "9"][..],
+            &["in", "out", "q4_k_m", "--fit", "9", "--sensitivity", "t"],
+            &["in", "out", "q4_k_m", "--sensitivity", "t"],
+            &["in", "out", "q4_k_m", "--fit-out", "r"],
+            &["in", "out", "q4_k_m", "--fit-group", "2"],
+            &["in", "out", "q4_k_m", "--fit-ladder", "--fit", "9"],
+            &["in", "out", "q4_k_m", "--fit-ladder", "--fit-group", "x"],
+            &["in", "out", "q4_k_m", "--fit-ladder", "--check", "2"],
+            &[
+                "in",
+                "out",
+                "q4_k_m",
+                "--fit",
+                "0",
+                "--sensitivity",
+                "t",
+                "--fit-out",
+                "r",
+            ],
+            &[
+                "in",
+                "out",
+                "q4_k_m",
+                "--fit",
+                "9XB",
+                "--sensitivity",
+                "t",
+                "--fit-out",
+                "r",
+            ],
+        ] {
+            let e = run(bad).unwrap_err();
+            assert_eq!(e.status(), 64, "{bad:?}: {e}");
+        }
     }
 
     /// `--resume` goes shard by shard over a split output, so without `--keep-split` it is a usage

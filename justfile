@@ -790,9 +790,17 @@ gate-gpu-iq-quant:
 
 # bloomery-quantize's host side (crates/quantize, no card): the type-rule matcher on llama-quantize's K3.1 rule shapes, the
 # finite scan of every source type, --check's row comparison, the plan's per-tensor decisions and refusals, the argument parser,
-# and --resume over a synthetic split set (the kept shards, a foreign shard's refusal, a failure's partial).
+# and --resume over a synthetic split set (the kept shards, a foreign shard's refusal, a failure's partial), and --fit's
+# selection, byte model and rules over a synthetic exaone-moe set (tests/fit.rs).
 gate-quantize:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-quantize --lib --test check --test resolve --test rules --test resume'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-quantize --lib --test check --test fit --test resolve --test rules --test resume'
+
+# bloomery-quantize --fit's measurement driver (tools/ref/qfit.py, docs/research/quant-fit.md §2): builds the quantizer, the
+# loss tool (ppl_exaone) and kld_diff, then runs `qfit.py ARGS` (`measure` writes the sensitivity table `--fit` reads, `verify`
+# scores the picked mix against it). The loss tool walks on the A6000 under a card's gate lock, not the timing lease; no number
+# of it is a timing. Its outputs go where ARGS say (--work, --out): the box's disk is the caller's to name.
+qfit *ARGS:
+    BLOOMERY_MODEL=exaone-moe BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin ppl_exaone && cargo build --release -p bloomery-gpu-gates --bin kld_diff && python3 tools/ref/qfit.py {{ARGS}}'
 
 # The host K-quant rules (gguf::kquant: Q4_K, Q5_K, Q6_K, Q8_0) against ggml's own quantizer (iq_quant_ref, just
 # build-iq-quant-ref) with and without an importance matrix, row for row over seeded row families, and the K3 fixture

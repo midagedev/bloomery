@@ -13,12 +13,14 @@
 //! - [`check`]: a row's bytes against the host rule's, naming the first byte that differs.
 //! - [`host`]: the host rules on all cores: the IQ search as a [`Backend`] that opens no card, the K-quant rules.
 //! - [`run`]: the writer, over a [`Backend`] (the card's lives in the binary).
+//! - [`fit`]: `--fit`: the type of each tensor class by layer range for a byte budget, from measured sensitivity.
 //! - [`cli`]: the arguments and the usage text.
 //!
 //! Every refusal is an [`Error`] that names what it refuses: tensor, expert, row.
 
 pub mod check;
 pub mod cli;
+pub mod fit;
 pub mod host;
 pub mod imatrix;
 pub mod meta;

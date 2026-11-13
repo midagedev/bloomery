@@ -7,7 +7,7 @@
 //!
 //! The plan, the type logic, the host rules and the writer are the `bloomery-quantize` crate's (`quantize`); this
 //! binary is the card's [`Backend`] and the process around it. `--cpu` runs every rule on all cores and opens no
-//! card; `--plan` opens none either. Exit: 0 done; 1 a refusal, named; 64 a usage error; 66 a missing input file.
+//! card; `--plan`, `--fit-ladder` and `--fit` open none either. Exit: 0 done; 1 a refusal, named; 64 a usage error; 66 a missing input file.
 //! `docs/quantize.md` is the user's page.
 
 #[cfg(feature = "gpu")]
@@ -124,6 +124,10 @@ fn go() -> Result<(), Error> {
         Parsed::Run(a) => a,
     };
     let prep = prepare(&a)?;
+    if let Some(fit) = &a.fit {
+        print!("{}", quantize::fit::run(&a, &prep, fit)?);
+        return Ok(());
+    }
     if a.plan {
         let free = os::free_bytes(&a.out_dir()).ok();
         print!(
