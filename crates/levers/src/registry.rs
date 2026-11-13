@@ -781,8 +781,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         doc: "A run that drafts (the MTP draft of `generate_qwen3moe`, `generate_glm5next` and \
               their serve seats, and the Flint seat's; the lookup and DSpark drafts of `generate_ds41` and \
               `bloomery-serve-ds41`; the lookup and DSpark drafts of `bloomery-serve`'s qwen3 \
-              seat; the DFlash2 draft of `bloomery-serve`'s raon1 seat; the lookup draft of \
-              `generate_metal`): how \
+              seat; the DFlash2 draft of `bloomery-serve`'s raon1 seat; the lookup and MTP drafts of \
+              `generate_metal`, the MTP draft of `bloomery-serve-metal`): how \
               many of a proposal's ids a pass verifies. `cost` \
               (unset) puts the draft behind the width chooser (`runtime::width`): each window \
               verifies the width whose expected kept positions over its measured pass wall is \

@@ -151,6 +151,55 @@ pub trait Host: Verify {
         sink: Option<&mut HostSink<'_, Self>>,
     ) -> Result<Option<u32>, Self::Cause>;
 
+    /// [`Host::prompt_with`] that leaves each of `marks` keepable
+    /// ([`Target::prompt_marked`](crate::Target::prompt_marked)'s contract):
+    /// positions ascending, each past the target's position and at most the
+    /// call's end; a mark out of order or outside the call is the caller's
+    /// breach and panics by name. The default runs the call a part, each part
+    /// before the last ending [`CallEnd::Unread`] and the sink hearing every
+    /// part's units in order: a host whose calls' ends are its points keeps a
+    /// mark by ending a part there. A host that keeps a point inside a call
+    /// answers here with one call.
+    ///
+    /// # Errors
+    ///
+    /// The host's, or the sink's.
+    fn prompt_marked_with(
+        &mut self,
+        ids: &[u32],
+        marks: &[u32],
+        path: Self::Path,
+        end: CallEnd,
+        head: Self::Head,
+        mut sink: Option<&mut HostSink<'_, Self>>,
+    ) -> Result<Option<u32>, Self::Cause> {
+        let from = u64::from(self.pos());
+        let to = from + ids.len() as u64;
+        let mut at = 0;
+        let mut prev = from;
+        for &u in marks {
+            let u = u64::from(u);
+            assert!(
+                prev < u && u <= to,
+                "a prompt of positions {from}..{to} marked at {marks:?}: marks go ascending, \
+                 past the call's start and at most its end"
+            );
+            prev = u;
+            let i = usize::try_from(u - from).expect("a mark inside the call is an index of it");
+            if i < ids.len() {
+                self.prompt_with(
+                    &ids[at..i],
+                    path,
+                    CallEnd::Unread,
+                    head,
+                    sink.as_deref_mut(),
+                )?;
+                at = i;
+            }
+        }
+        self.prompt_with(&ids[at..], path, end, head, sink)
+    }
+
     /// Copy a shared prompt arena's final hidden row `first`, at position
     /// `pos - 1`, to the step arena's row 0, including its record.
     ///

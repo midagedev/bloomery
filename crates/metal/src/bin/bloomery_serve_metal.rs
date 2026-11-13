@@ -6,6 +6,7 @@
 //!                          [--port 8080] [--ctx C]
 //!                          [--chat-template-file PATH] [--alias NAME]
 //!                          [--queue-depth Q] [--api-key KEY] [--api-key-file F]
+//!                          [--draft mtp --mtp SIDECAR]
 //!
 //! The model is a GGUF file's first shard or a checkpoint folder (an MLX
 //! folder as downloaded, no `prepare`); `--hf REPO` fetches a repo into the
@@ -33,6 +34,20 @@
 //! (`MarkCopies::AtOpen`), so the first request pays nothing the later ones
 //! do not. No prompt cache, no slot files, no image input.
 //!
+//! `--draft mtp --mtp SIDECAR` serves with the MTP draft of a Qwen3.5-family
+//! file (`generate_metal`'s flags and sidecar, `mlx-community/Qwen3.8-27B-MTP-4bit`):
+//! `serve::TargetEngine::drafted` over `runtime::mtp::MtpDraft` with the session
+//! as its host behind the width chooser (`BLOOMERY_MTP_WIDTH`, `cost` unset), two
+//! rows a pass. A greedy request is verified in passes and keeps the ids the
+//! plain server picks, bit for bit. The draft joins a sequence from position 0:
+//! a request that cuts back to a checkpoint, and a step that reads the logits row
+//! (a request that samples), leave it off until the next reset, and a line on
+//! stderr names why. `/props`' `engine.draft` names the draft; each request's
+//! passes are one `draft:` line when the next request opens. `--draft mtp`
+//! without `--mtp`, `--mtp` without `--draft mtp`, and `BLOOMERY_MTP_WIDTH`
+//! beside no draft are refused by name, and so is a file the verify pass does
+//! not serve (at open, before the server listens).
+//!
 //! `BLOOMERY_SCREEN` (on unset) lets `d` open the server's live view on a
 //! terminal (`serve::live`); the start screen is the CUDA seats' alone.
 //!
@@ -54,15 +69,21 @@ mod cli {
 
     use bloomery_metal::MetalDevice;
     use bloomery_metal::arch::qwen3moe::plan;
-    use bloomery_metal::arch::qwen3moe::session::{CHECKPOINT_EVERY, MarkCopies, Session};
+    use bloomery_metal::arch::qwen3moe::session::{
+        CHECKPOINT_EVERY, MarkCopies, Session, StepMode,
+    };
     use bloomery_metal::model_arg;
     use hf::source::Source;
     use model_hf::ModelFile;
+    use runtime::Speculative;
+    use runtime::mtp::MtpDraft;
+    use runtime::width::{Chosen, Mode as WidthMode};
     use serve::flag::{self, ApiKeys};
     use serve::sampling::sampler_factory;
     use serve::vocab::{ChatSurface, TemplateFile, Vocab};
     use serve::{
-        EngineProps, FATAL_LINGER, ServeError, Server, ServerConfig, SlotConfig, TargetEngine,
+        DraftProps, EngineProps, FATAL_LINGER, ServeError, Server, ServerConfig, SlotConfig,
+        TargetEngine,
     };
 
     /// The cache rows' default cap.
@@ -71,6 +92,8 @@ mod cli {
     const USAGE: &str = "\
 bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--chat-template-file PATH]
                      [--alias NAME] [--queue-depth Q] [--api-key KEY] [--api-key-file F]
+                     [--draft mtp --mtp SIDECAR]
+  --draft mtp --mtp SIDECAR serves the MTP draft layer of the sidecar's folder, two rows a pass
   PATH is a GGUF file (its first shard) or a checkpoint folder; REPO is fetched into the cache
   --ctx (--ctx-size, -c) defaults to the smaller of 32768 and the file's context_length,
   cut to the largest that fits the device's free bytes";
@@ -87,9 +110,14 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         alias: Option<String>,
         queue_depth: Option<usize>,
         api_keys: ApiKeys,
+        /// `--draft mtp`: the server drafts with the sidecar `--mtp` names.
+        draft: bool,
+        mtp: Option<std::path::PathBuf>,
+        /// `BLOOMERY_MTP_WIDTH`: how many of a proposal's ids a pass verifies.
+        width: WidthMode,
     }
 
-    fn parse() -> Result<Args, String> {
+    fn parse(width: Option<&str>) -> Result<Args, String> {
         let mut model = Vec::new();
         let mut a = Args {
             model: Source::File(String::new()),
@@ -100,6 +128,9 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             alias: None,
             queue_depth: None,
             api_keys: ApiKeys::default(),
+            draft: false,
+            mtp: None,
+            width: WidthMode::Cost,
         };
         let mut it = std::env::args().skip(1);
         while let Some(f) = it.next() {
@@ -113,17 +144,48 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
                 "--alias" => a.alias = Some(val()?),
                 "--queue-depth" => a.queue_depth = Some(flag::number(&f, &val()?)?),
                 k if flag::KEYS.contains(&k) => a.api_keys.add(&f, &val()?)?,
+                "--draft" => match val()?.as_str() {
+                    "mtp" => a.draft = true,
+                    other => return Err(format!("--draft {other}: only mtp\n{USAGE}")),
+                },
+                "--mtp" => a.mtp = Some(val()?.into()),
                 "--help" | "-h" => return Err(USAGE.to_owned()),
                 other => return Err(format!("unknown flag {other}\n{USAGE}")),
             }
         }
         a.model = model_arg::named(&model, PATH_FLAGS, None, "-m PATH or --hf REPO")
             .map_err(|e| format!("{e}\n{USAGE}"))?;
+        match (a.draft, &a.mtp) {
+            (true, None) => {
+                return Err(format!(
+                    "--draft mtp: the draft layer is the sidecar's; give --mtp SIDECAR\n{USAGE}"
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(format!(
+                    "--mtp: the server drafts with the sidecar only under --draft mtp\n{USAGE}"
+                ));
+            }
+            _ => {}
+        }
+        if let Some(w) = width
+            && !a.draft
+        {
+            return Err(format!(
+                "{}={w}: it picks the width a drafted window verifies; give --draft mtp",
+                bloomery_levers::MTP_WIDTH
+            ));
+        }
+        a.width = WidthMode::of(width)
+            .map_err(|_| format!("{}: cost or fixed", bloomery_levers::MTP_WIDTH))?;
         Ok(a)
     }
 
     pub(super) fn run() -> ExitCode {
-        let levers = match bloomery_levers::at_main(&[bloomery_levers::SCREEN]) {
+        let levers = match bloomery_levers::at_main(&[
+            bloomery_levers::SCREEN,
+            bloomery_levers::MTP_WIDTH,
+        ]) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("bloomery-serve-metal: {e}");
@@ -131,7 +193,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             }
         };
         serve::live::enable(levers.screen());
-        let a = match parse() {
+        let a = match parse(levers.mtp_width()) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("bloomery-serve-metal: {e}");
@@ -156,6 +218,33 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             | ServeError::NoStops
             | ServeError::Slots(_) => ExitCode::from(1),
         }
+    }
+
+    /// The MTP draft layer of the sidecar at `path` opened beside `session`, as
+    /// the window of two rows behind the width chooser the server drafts with.
+    /// The draft reads the step's residual, which a token running ahead of the
+    /// step would hold, so the session steps host-fed from here on.
+    fn open_draft(
+        device: &MetalDevice,
+        session: &mut Session,
+        path: &std::path::Path,
+        width: WidthMode,
+    ) -> Result<Speculative<runtime::Choosing<MtpDraft<Session>>, 2>, String> {
+        session.verify_serves().map_err(|e| e.to_string())?;
+        let opened = session.open_mtp(path).map_err(|e| e.to_string())?;
+        let with = device.allocated_bytes().map_err(|e| e.to_string())?;
+        eprintln!(
+            "bloomery-serve-metal: mtp_open weight_bytes={} kv_bytes={} allocated_bytes={with}",
+            opened.weight_bytes, opened.kv_bytes
+        );
+        session
+            .set_argmax_mode(StepMode::HostFed)
+            .map_err(|e| e.to_string())?;
+        let draft = session
+            .mtp_draft()
+            .and_then(|d| d.choosing(width).map_err(Into::into))
+            .map_err(|e| e.to_string())?;
+        Ok(Speculative::new(draft))
     }
 
     fn open(a: Args) -> Result<Server, String> {
@@ -194,7 +283,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         }
         let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
         let t0 = Instant::now();
-        let session = Session::open_model_as(
+        let mut session = Session::open_model_as(
             &device,
             device.library(),
             &file,
@@ -218,14 +307,38 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             path.display(),
             t0.elapsed().as_secs_f64(),
         );
+        let window = match &a.mtp {
+            Some(path) => Some(open_draft(&device, &mut session, path, a.width)?),
+            None => None,
+        };
         let head_rows = session.vocab();
-        let engine = TargetEngine::new(
-            session,
-            head_rows,
-            vocab,
-            format!("metal {arch} session"),
-            EngineProps::default(),
-        )?;
+        let what = format!("metal {arch} session");
+        let engine: Box<dyn serve::Engine> = match window {
+            None => Box::new(TargetEngine::new(
+                session,
+                head_rows,
+                vocab,
+                what,
+                EngineProps::default(),
+            )?),
+            Some(window) => Box::new(TargetEngine::drafted(
+                session,
+                window,
+                head_rows,
+                vocab,
+                what,
+                EngineProps {
+                    draft: Some(DraftProps {
+                        model: "mtp".to_owned(),
+                        n_max: Some(1),
+                        kind: Some("mtp".to_owned()),
+                        path: a.mtp.as_ref().map(|p| p.display().to_string()),
+                        device: None,
+                    }),
+                    ..EngineProps::default()
+                },
+            )?),
+        };
         let config = ServerConfig {
             model_alias: a.alias.unwrap_or(name),
             model_path: path.display().to_string(),
@@ -241,7 +354,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             queue_depth: a.queue_depth,
             ..SlotConfig::default()
         };
-        let server = Server::bind_with((a.host.as_str(), a.port), Box::new(engine), config, slots)
+        let server = Server::bind_with((a.host.as_str(), a.port), engine, config, slots)
             .map_err(|e| e.to_string())?;
         let addr = server.local_addr().map_err(|e| e.to_string())?;
         eprintln!("bloomery-serve-metal: listening on http://{addr}");

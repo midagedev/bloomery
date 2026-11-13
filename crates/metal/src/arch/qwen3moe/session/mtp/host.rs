@@ -396,6 +396,21 @@ impl Host for Session {
         (): (),
         sink: Option<&mut HostSink<'_, Self>>,
     ) -> Result<Option<u32>, SessionError> {
+        self.prompt_marked_with(ids, &[], (), end, (), sink)
+    }
+
+    /// One call with a point at each mark: the session keeps a position
+    /// inside a call ([`target::prompt_call`]), so the draft's units are those
+    /// of the call with no mark.
+    fn prompt_marked_with(
+        &mut self,
+        ids: &[u32],
+        marks: &[u32],
+        (): (),
+        end: CallEnd,
+        (): (),
+        sink: Option<&mut HostSink<'_, Self>>,
+    ) -> Result<Option<u32>, SessionError> {
         if end != CallEnd::Argmax {
             return Err(mtp_refuse(format!(
                 "a prompt call ending {end:?}: the session's prompt call reads the argmax after \
@@ -404,12 +419,12 @@ impl Host for Session {
         }
         self.mtp_ref()?;
         let pick = match sink {
-            None => target::prompt_call(self, ids, &[], None)?,
+            None => target::prompt_call(self, ids, marks, None)?,
             Some(sink) => {
                 let mut unit = |s: &mut Session, arena: MtpArena, first: u32, rows: usize| {
                     sink(&mut SessionExec(s), arena, first, rows)
                 };
-                target::prompt_call(self, ids, &[], Some(&mut unit))?
+                target::prompt_call(self, ids, marks, Some(&mut unit))?
             }
         };
         Ok(Some(pick))

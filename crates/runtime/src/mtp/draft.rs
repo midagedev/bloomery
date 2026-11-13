@@ -286,10 +286,27 @@ impl<H: Host> MtpDraft<H> {
         ids: &[u32],
         end: CallEnd,
     ) -> Result<Option<u32>, H::Error> {
+        self.prompt_call_marked(t, ids, &[], end)
+    }
+
+    /// [`MtpDraft::prompt_call`] that leaves each of `marks` keepable on the
+    /// target ([`Host::prompt_marked_with`]): the draft walks the call's
+    /// units as it does with no mark.
+    ///
+    /// # Errors
+    ///
+    /// The host's, from the join's walk, a unit's or the call's own.
+    pub fn prompt_call_marked(
+        &mut self,
+        t: &mut H,
+        ids: &[u32],
+        marks: &[u32],
+        end: CallEnd,
+    ) -> Result<Option<u32>, H::Error> {
         let (path, head, start) = (self.path, self.head, t.pos());
         t.prompt_scope(|t| {
             self.prompt_joined(&mut On { t, head }, start, ids, |on, sink| {
-                on.t.prompt_with(ids, path, end, head, sink)
+                on.t.prompt_marked_with(ids, marks, path, end, head, sink)
             })
         })
         .map_err(Into::into)
@@ -932,6 +949,59 @@ mod tests {
         let target_alone = Mock::new().prompt(&IDS, Want::Argmax).unwrap().argmax();
         assert_eq!((first, t.pos()), (target_alone, 9));
         d.begin(&t, &IDS, first).unwrap();
+    }
+
+    /// A call marked inside it runs a part to the mark on a host that keeps no
+    /// point inside a call (the default), the part before the last unread, and
+    /// the draft's walks are the unmarked call's; a mark at the call's end is
+    /// the end, and no mark is the call of [`Host::prompt_with`].
+    ///
+    /// Mutant: a part that ends as the call does, a mark at the end cut as a
+    /// part of its own, or the sink dropped on the first part.
+    #[test]
+    fn a_marked_prompt_call_runs_a_part_to_each_mark_and_walks_the_same_units() {
+        let (mut d, mut t) = (draft::<false>(), Rig::<false>::new());
+        let first = d
+            .prompt_call_marked(&mut t, &IDS, &[4, 9], CallEnd::Argmax)
+            .unwrap();
+        let w = |pos0, tokens: &[u32]| walk(None, STORE, pos0, tokens, Rd::Target(Ar::Ubatch, 0));
+        let part = |ids, end| Ev::Prompt {
+            ids,
+            end,
+            sink: true,
+        };
+        assert_eq!(
+            t.take(),
+            vec![
+                Ev::Scope(true),
+                part(4, CallEnd::Unread),
+                walk(None, STORE, 0, &[10], Rd::Host(HIDDEN)),
+                w(1, &[11, 12, 13, 14]),
+                part(5, CallEnd::Argmax),
+                w(5, &[15, 16, 17, 18]),
+                Ev::Scope(false),
+            ]
+        );
+        let whole = Mock::new().prompt(&IDS, Want::Argmax).unwrap().argmax();
+        assert_eq!((first, t.pos()), (Some(whole), 9));
+        d.begin(&t, &IDS, whole).unwrap();
+        let (mut d, mut t) = (draft::<false>(), Rig::<false>::new());
+        assert_eq!(
+            d.prompt_call_marked(&mut t, &IDS, &[], CallEnd::Argmax)
+                .unwrap(),
+            Some(whole)
+        );
+        let mut want = vec![Ev::Scope(true), part(9, CallEnd::Argmax)];
+        want.splice(2..2, fill());
+        want.push(Ev::Scope(false));
+        assert_eq!(t.take(), want);
+    }
+
+    #[test]
+    #[should_panic(expected = "marks go ascending")]
+    fn a_mark_outside_the_call_is_the_callers_breach() {
+        let (mut d, mut t) = (draft::<false>(), Rig::<false>::new());
+        let _ = d.prompt_call_marked(&mut t, &IDS, &[10], CallEnd::Argmax);
     }
 
     #[test]

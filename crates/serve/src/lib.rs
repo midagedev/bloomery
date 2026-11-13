@@ -78,4 +78,4 @@ pub use jinja::{ChatTemplate, TemplateError};
 pub use mock::{DraftMock, MockEngine, MockTokenizer, SaveStats, ScriptedEngine};
 pub use sched::{FifoPicker, SlotConfig, SlotPicker, SlotSummary, WaitingRequest};
 pub use swap::{Park, QUANTUM, SwapEngine};
-pub use target_engine::TargetEngine;
+pub use target_engine::{DraftWindow, TargetEngine, Undrafted};

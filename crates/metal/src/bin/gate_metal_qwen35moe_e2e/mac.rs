@@ -76,14 +76,16 @@
 //!   (`resident.rs`): the set holds every byte the open and the first pass
 //!   allocated, and a submit after an idle gap renews its request once.
 //!
-//! - `v_forced`, `v_count`, `v_segments`, `v_lookup`, `v_mtp`, `v_cut`, `v_refused`: the verify
+//! - `v_forced`, `v_count`, `v_segments`, `v_lookup`, `v_mtp`, `v_mtp_serve`, `v_cut`, `v_refused`: the verify
 //!   pass of two rows (`Session::verify_rows`) and the commit that keeps the first rows
 //!   of it (`verify.rs`): each row is the bits of the plain step at its position, a
 //!   verify is one command buffer and one wait with the groups, dispatches and barriers
 //!   the count model gives, a commit moves the position and launches nothing, a lookup
 //!   draft behind the width chooser, in both modes, picks the plain run's ids, the MTP
 //!   draft (`--mtp SIDECAR`, the qwen38d row) behind the same chooser picks them too with
-//!   its proposals held to the layer's own draft step (`mtp.rs`), a cut
+//!   its proposals held to the layer's own draft step (`mtp.rs`), the server's engine over that
+//!   draft (`serve::TargetEngine::drafted`, `v_mtp_serve`) serves the plain run's ids as a fresh
+//!   request, from a cut and after a reset, a cut
 //!   after a commit keeps its contract, and what a verify refuses is refused by name. A file the pass does not serve prints each but `v_refused`
 //!   as SKIP with the pass's own reason.
 //!
@@ -475,7 +477,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 27] = [
+    const NAMES: [&str; 28] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -501,6 +503,7 @@ pub fn main() -> ExitCode {
         "v_segments",
         "v_lookup",
         "v_mtp",
+        "v_mtp_serve",
         "v_cut",
         "v_refused",
     ];
@@ -683,6 +686,7 @@ pub fn main() -> ExitCode {
                 "v_segments" => verify::v_segments(&device, library, &path),
                 "v_lookup" => verify::v_lookup(&device, library, &path),
                 "v_mtp" => mtp::v_mtp(&device, library, &path, sidecar.as_deref()),
+                "v_mtp_serve" => mtp::v_mtp_serve(&device, library, &path, sidecar.as_deref()),
                 "v_cut" => verify::v_cut(&device, library, &path),
                 "v_refused" => verify::v_refused(&mut session),
                 other => Err(format!("no clause named {other}")),
