@@ -21,3 +21,12 @@ condition: BLOOMERY_MODEL=exaone-moe, BLOOMERY_REF_MODEL the published first sha
 decide-in: the morning table: each configuration's off and mtp rows with these conditions; bp becomes a documented place for EXAONE if its off row is not below a's
 decide-below: under +25 % on a configuration: read a (the width records) and that run's plan line before writing it
 decide-above: over +45 %: read the witness blocks and both arms' plan lines (card_experts) before crediting
+# outcome 2026-11-14 on main 9a582d1ca's bloomery-serve (tree arms, ~/repo/bloomery), 3 rounds each, D=4096, ctx 8192:
+#  a, published IQ2_XXS: off 9.94 / 9.64 / 9.91, mtp 13.58 / 13.72 / 13.83 = +36.6, +42.3, +39.6 % (rows cold but r1 off, majflt 572)
+#  a, IQ1_S gate/up mix (249.5 GB, every row warm, majflt 4..33): off 10.43 / 10.40 / 10.45, mtp 15.12 / 15.11 / 15.14 = +45.0,
+#   +45.3, +44.9 % (at the band's top: the mix's verify pass is cheaper, its plan 475 card experts against 429 in ppl_exaone's plan;
+#   not read further); the mix's off rate is +5 % over the published file's, under the +10..+27 % [derived]: IQ1_S's host rate
+#   per weight is below the one untimed reading the band assumed. Its loss against the published file (ppl_exaone + kld_diff,
+#   2,047 positions at ctx 4096): KLD 0.0848 ± 0.0034, top-1 89.45 %, PPL 4.0048 -> 4.2297.
+#  bp, A6000 + the 3090 tier (BLOOMERY_TIMING_CARDS=a6000+3090): off 10.40 / 10.44 / 10.41 (+5.8 % over a's mean 9.83, inside
+#   the +3..+6 % [derived]), mtp 14.15 / 14.44 / 14.42 = +36.1, +38.3, +38.5 %; pp 65.0..65.3 off against a's 59.0..61.5.

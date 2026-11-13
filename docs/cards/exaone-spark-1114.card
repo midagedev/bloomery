@@ -19,3 +19,8 @@ reason: the overlapped and serial ends of the model above; the band is the overl
 decide-in: the morning table's a+Spark rows; the next step is the residency of the node's share (hot-first pick) and the MTP pass on the node
 decide-below: under 12.5: the node leg does not hide; read the tier records (the node's per-layer wait) before any other lever
 decide-above: over 15.5: read the plan line and the witness blocks before crediting
+# outcome 2026-11-14: one row. r1 off 9.59 tok/s (pp 60.57, load 282 s): below the band, at the serial end (~9.4 [derived]); the
+#  plan held 7,624 experts on the node as printed. The node leg does not hide under the host's: the next step reads where the
+#  stage waits on the node within a layer (the decode's node round trip after the host leg, not beside it). r1's mtp arm did not
+#  open: the node refused it with cuDevicePrimaryCtxRetain out of memory, the previous load not yet closed (its tier_server
+#  exited 3 s later) — the runner starts the next arm before a node frees its load; the run stopped there (rc 1).
