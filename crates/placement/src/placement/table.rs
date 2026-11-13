@@ -282,11 +282,12 @@ pub struct HostTotals {
     pub table_bytes: u64,
     /// The cards' ring shadows, page-locked ([`KvBytes::shadow_bytes`]).
     pub shadow_bytes: u64,
-    /// The K/V planes a host-backed store holds on the host
-    /// (`BLOOMERY_KV_HOST=all`), page-rounded at the page a host-capable
-    /// room takes: 0 under `off` and `spill`. Set by [`Plan::kv_host_planes`]
-    /// past the headroom below, and counted with the shadows in the plan's
-    /// host need ([`workstation::HostNeed`]).
+    /// The K/V bytes a host-backed store holds on the host
+    /// (`BLOOMERY_KV_HOST`: the planes under `all`, the pages past the floor
+    /// under `spill`), page-rounded at the page a host-capable room takes: 0
+    /// under `off`. Set by [`Plan::kv_host_planes`] out of the headroom
+    /// below, and counted with the shadows in the plan's host need
+    /// ([`workstation::HostNeed`]).
     pub kv_host_bytes: u64,
     /// The host stage's cache ([`KvBytes::layer_bytes`] over its layers and
     /// the position rows beside it); 0 with a stage card.

@@ -1,5 +1,6 @@
 use std::fmt;
 
+use bloomery_levers::KvHost;
 use gguf::GgmlType;
 
 use super::churn;
@@ -115,15 +116,23 @@ pub enum PlacementError {
          (or `off`)"
     )]
     KvUnroomed { lever: &'static str, value: String },
-    /// The K/V planes a host-backed store holds on the host
-    /// (`BLOOMERY_KV_HOST=all`) pass the plan's host room: what the room
-    /// leaves past the plan's host need.
+    /// The K/V bytes `BLOOMERY_KV_HOST` puts on the host (`all`: the planes; `spill`: the pages
+    /// past the floor) pass the plan's host room even with no routed expert left on the host:
+    /// `headroom` is what the room leaves them past the plan's other host terms, 0 where those
+    /// alone pass it.
     #[error(
-        "BLOOMERY_KV_HOST=all holds the K/V planes, {bytes} B, on the host, and the plan leaves \
-         the host {headroom} B: free host memory, a smaller context, or the planes on the card \
-         (BLOOMERY_KV_HOST off or spill)"
+        "BLOOMERY_KV_HOST={lever} holds {held}, {bytes} B, on the host, and the host room leaves \
+         {headroom} B past the plan's other host terms with no routed expert on the host: free \
+         host memory, a smaller context, or the K/V on the card (BLOOMERY_KV_HOST {instead})",
+        lever = .lever.name(),
+        held = kv_host_held(*.lever),
+        instead = kv_host_instead(*.lever)
     )]
-    KvHostOverHost { bytes: u64, headroom: u64 },
+    KvHostOverHost {
+        lever: KvHost,
+        bytes: u64,
+        headroom: u64,
+    },
     /// A host room under the floor of the NVMe expert tier: the plan's host
     /// terms outside the routed experts, and the transient reads of two
     /// layers' NVMe-tier experts and one layer's host experts beside them —
@@ -391,6 +400,24 @@ pub enum PlacementError {
         lever = bloomery_levers::CARD_EXPERTS_CAP
     )]
     CardExpertsOwned { cap: u64 },
+}
+
+/// What `lever` puts on the host, for [`PlacementError::KvHostOverHost`]'s text.
+fn kv_host_held(lever: KvHost) -> &'static str {
+    match lever {
+        KvHost::All => "the K/V planes",
+        KvHost::Spill => "the K/V planes' pages past the floor",
+        KvHost::Off => "no K/V plane",
+    }
+}
+
+/// The words of the lever that keep the K/V on the card, for
+/// [`PlacementError::KvHostOverHost`]'s text.
+fn kv_host_instead(lever: KvHost) -> &'static str {
+    match lever {
+        KvHost::All => "off or spill",
+        KvHost::Spill | KvHost::Off => "off",
+    }
 }
 
 /// The terms of [`PlacementError::CardFreeFloor`]: a card whose device

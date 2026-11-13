@@ -1113,7 +1113,7 @@ pub struct HostNeed {
     pub tables: u64,
     /// Pinned ring buffers, including the part loader's upload staging at load time, a host
     /// stage's cache (`HostTotals::stage_kv_bytes`) and the K/V planes a host-backed store holds
-    /// (`HostTotals::kv_host_bytes`, `BLOOMERY_KV_HOST=all`).
+    /// (`HostTotals::kv_host_bytes`, `BLOOMERY_KV_HOST` `all` or `spill`).
     pub shadows: u64,
     pub reserves: u64,
     pub extra: u64,
