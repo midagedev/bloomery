@@ -1,0 +1,46 @@
+# K-EXAONE-2.0 + the Spark node tier: why the node leg does not hide (round nodeasync, from exaone-spark-1114.card's
+# outcome, 9.59 tok/s = 104.3 ms a step against the overlapped 13.9..15.2).
+# Order today (main 4fe5efe1f, captured Chain::Step, read off the code): card go(L) -> host take_go (step.rs:1075) -> picks read
+# -> NodePoint::Picks (step.rs:1134) -> TierNode::send_enqueue (tier.rs:2306, node.rs:1408, no reply awaited) and
+# TierPage::add_go (mod.rs:3522) -> the pump posts the image (link.rs:358) -> host experts (step.rs:1186/1188) -> signal
+# (step.rs:1222). The only wait on the node is the stage card's join wait (tier.rs:965 enqueue_back_of); the host waits on it
+# once a step, after its last layer (mod.rs:3175 settle_tiers). So the node leg already starts before the host leg and is
+# joined only at the card's join: the code's order is the overlapped one, and the serial reading is not an order of calls.
+# Per layer [derived, exaone-spark-model.py terms]: card front 0.211 ms + PCIe 0.022 in series; host CPU 3.91 reads x 151 us =
+# 0.59 ms (+0.02 picks, frame, add_go); host DRAM 53 MB = 0.40 ms at 134 GB/s, under the CPU; link 24.6 KB out + 196.6 KB of
+# whole reply rows back = 178 us on the wire + 52 us RTT; GB10 42.5 MB = 0.20..0.27 ms; node leg 0.42..0.56; NVMe 0. Wall =
+# front + max(host, node) + PCIe: 17.7 + 76 x 0.61..0.65 = 64..67 ms. The reading, 104.3 ms, puts 1.14 ms a layer on the max.
+# The node-arm-only resource the paper left out: the TCP end's pump thread spins for the link's life (link.rs:358, yield_now
+# loop) and its receiver busy-polls 50 us a read (tcp.rs:80); both float (Placement::Float) and, with the pool on every
+# physical core (BLOOMERY_THREADS unset = 32), land on SMT siblings of pool participants. The pool's chunks are static and each
+# dispatch ends at a barrier (crates/threads/src/lib.rs:16-18; :266-270 names this hazard for the dispatcher), so one
+# participant sharing its core gates every host-leg barrier: a slowdown s of that participant makes the leg 0.61 / (1 - s);
+# s = 0.46 gives the measured 1.14 ms. Plan a and bp (shared page, no pump) have no such thread: bp read its derived +5.8 %.
+# Two causes fit 1.14 ms: (H3) the host leg taxed by the link threads, the node hidden; (H2) the node leg itself ~1.1 ms (GB10
+# rate or wire below the model), the host leg 0.61. A tok/s re-read cannot split them; one pool core left free can: at
+# BLOOMERY_THREADS=31 the floating pump and receiver take the free core (the scheduler spreads to an idle core before a
+# sibling), the leg costs 32/31: 0.63 + 0.02 (+ <= 0.06 of RX softirq on a participant) -> 17.7 + 76 x 0.65..0.71 =
+# 67.1..71.7 ms, 13.9..14.9 tok/s under H3 [derived]; under H2 the bound is the node and the arm reads the base -1..+1 %.
+kind: ab
+question: does leaving one physical core free of the pool (BLOOMERY_THREADS=31) let K-EXAONE-2.0's decode with the Spark node
+  tier reach the overlapped rate, i.e. is the node arm's lost gain the link threads' tax on the host leg
+term: tg tok/s @ n=127, prompt 4096 corpus-prose ids, ctx 8192 one slot, A6000 + host + the Spark over TCP, off arm — (THREADS=31
+  - default) / default, paired by round
+unit: %
+predict: +38..+58
+rounds: 2
+condition: exaone-spark-1114.card's condition on one bloomery-serve binary (tree arm), two arms in one lease, both
+  env=BLOOMERY_TIER_LINK=tcp,BLOOMERY_TIER_NODES=10.41.0.2:9001,BLOOMERY_CARD_BUDGET=100G,BLOOMERY_DRAFT=off, the changed arm
+  adding BLOOMERY_THREADS=31; DEPTH_SERVE_PLACE=bp with the A6000 the one visible card, BLOOMERY_AB_ROUNDS=2, DEPTH_SERVE_CTX=8192,
+  DEPTH_SERVE_N=128; the Spark's tier_server frees each load before the next arm opens (exaone-spark-1114's r1 mtp arm met a
+  node still holding the last load); once per arm, mid-window, `ps -L -o tid,psr,comm -p <serve pid>` names the cpus of
+  tier-link-pump and tier-link-tcp (THREADS=31: on the core no pool cpu holds; default: a pool participant's sibling); both arms'
+  plan lines print card_experts=2319 host_experts=9513
+decide-in: the link threads' tax is the cause: a round takes the TCP end's pump and receiver off the pool's cores while a
+  remote link is attached (the pool leaves one core to the link and pins its helpers there, or the pump parks between the
+  host's add_go and the receiver's landing), predicted to keep this arm's rate; the RDMA end (rdma.rs:182) gets the same
+decide-below: the node leg is the bound in the measured remainder: read the GB10's per-layer tier time (nsys on the Spark's
+  tier_server, the layer's kernels and copies) and the node rows' wire; then price the packed reply (EXAONE's ReplyRows::Whole
+  sends 8 rows where the node computed 3.1) before any host lever
+decide-above: read both arms' plan lines, witness blocks and the ps snapshot before crediting; a default arm below 9.4 means
+  the base window was disturbed, not that the lever gained more
