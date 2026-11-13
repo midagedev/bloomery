@@ -3,7 +3,9 @@
 # box; this script is everything after it, so the upload cannot repeat v0.2.0's
 # mistake (gh named the assets from temp filenames and every download URL 404'd).
 #
-#   tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a]
+#   tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] [--skip-gates=<reason>]
+#                                      --skip-gates skips steps 0 and 0b (the night's pull, the rotation, the release check) for a
+#                                      release whose gates were settled another way; the reason is required and printed
 #   tools/release/publish.sh <version> --tap-only   step 5 alone, on the release's own .sha256 assets (after a GB10 upload)
 #   tools/release/publish.sh --self-test     (the rotation's and the release check's refusals on stub rotation.py exits, the night's
 #                                      pull, and step 3a's warnings; check-recipes runs it)
@@ -442,7 +444,7 @@ if [ "${1:-}" = --self-test ]; then
     night_cases "$0" 1
     fails=$((fails + night_fails))
     # FAIL-first: without step 0b in the flow, or with a pull that is never asked, a case goes red
-    for m in $'\nnight_gate || exit 1\n|\n:\n' $'    if [ -n "${BLOOMERY_NIGHT_DIR:-}" ]; then|    if true; then'; do
+    for m in $'\n    night_gate || exit 1\n|\n    :\n' $'    if [ -n "${BLOOMERY_NIGHT_DIR:-}" ]; then|    if true; then'; do
         cases=$((cases + 1))
         python3 -I - "$0" "$t/night-mutant.sh" "${m%%|*}" "${m#*|}" << 'PY' || { echo "publish.sh self-test: a release-check mutant's text is not in the code" >&2; fails=$((fails + 1)); continue; }
 import sys
@@ -476,6 +478,22 @@ PY
     case "$rc:$got" in
         64:*"unknown argument --no-such-option"*) ;;
         *) echo "publish.sh self-test: an unknown option: rc $rc, want 64 naming it; got: $got" >&2; fails=$((fails + 1)) ;;
+    esac
+    # --skip-gates: a red rotation is not run and the tag step is reached, with the reason printed; an empty reason is refused (64)
+    cases=$((cases + 1))
+    printf 'import sys\nsys.exit(1)\n' > "$t/tools/rotation.py"
+    rc=0
+    got=$(bash "$t/tools/release/publish.sh" 0.0.0 "--skip-gates=gates ran by hand" 2>&1) || rc=$?
+    case "$rc:$got" in
+        1:*"SKIPPED"*"gates ran by hand"*"does not carry v0.0.0"*) ;;
+        *) echo "publish.sh self-test: --skip-gates: rc $rc, want rc 1 at the tag step after a SKIPPED line; got: $got" >&2; fails=$((fails + 1)) ;;
+    esac
+    cases=$((cases + 1))
+    rc=0
+    got=$(bash "$t/tools/release/publish.sh" 0.0.0 "--skip-gates= " 2>&1) || rc=$?
+    case "$rc:$got" in
+        64:*"--skip-gates needs a reason"*) ;;
+        *) echo "publish.sh self-test: --skip-gates with no reason: rc $rc, want 64; got: $got" >&2; fails=$((fails + 1)) ;;
     esac
     cases=$((cases + 1))
     printf 'import sys\nsys.exit(0)\n' > "$t/tools/rotation.py"
@@ -903,14 +921,17 @@ if [ "${1:-}" = --bump-next ]; then
     exit $?
 fi
 
-VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] | <version> --tap-only | --self-test | --sitting-check <tarball> <name> <dir>... | --tree-check <version> [<rev>] [--crates-only] | --docs-delta <built> <tag> | --bump-next <version> [<next>]}
-DRY=0; TAP=1; BW=1; TAP_ONLY=0
+VERSION=${1:?usage: tools/release/publish.sh <version> [--dry-run] [--no-tap] [--no-sm120a] [--skip-gates=<reason>] | <version> --tap-only | --self-test | --sitting-check <tarball> <name> <dir>... | --tree-check <version> [<rev>] [--crates-only] | --docs-delta <built> <tag> | --bump-next <version> [<next>]}
+DRY=0; TAP=1; BW=1; TAP_ONLY=0; SKIP_GATES=''
 for a in "${@:2}"; do
     case "$a" in
         --dry-run) DRY=1 ;;
         --no-tap) TAP=0 ;;
         --no-sm120a) BW=0 ;;
         --tap-only) TAP_ONLY=1 ;;
+        --skip-gates=*)
+            SKIP_GATES=${a#--skip-gates=}
+            [ -n "${SKIP_GATES//[[:space:]]/}" ] || { echo "publish.sh: --skip-gates needs a reason (--skip-gates=<reason>)" >&2; exit 64; } ;;
         *) echo "publish.sh: unknown argument $a" >&2; exit 64 ;;
     esac
 done
@@ -971,9 +992,13 @@ if [ "$TAP_ONLY" = 1 ]; then
 fi
 
 # 0. the rotation, on the lead's ledger and the night's; 0b. the release check
-night_pull || exit 1
-rotation_gate || exit 1
-night_gate || exit 1
+if [ -n "$SKIP_GATES" ]; then
+    echo "publish.sh: steps 0 and 0b SKIPPED (no night pull, no rotation, no release check): $SKIP_GATES" >&2
+else
+    night_pull || exit 1
+    rotation_gate || exit 1
+    night_gate || exit 1
+fi
 
 # 1. the tag
 COMMIT=$(git rev-parse --short=12 HEAD)
