@@ -2657,7 +2657,7 @@ mod gate {
                 "gemm case=swiglu_gclamp K={k} cols={n} limit={LIMIT} live_values={live} \
                  gate>L={gate_hi} gate<-L={gate_lo} |u|>L={up_out} \
                  planes_eq_host_gclamp_bits={eq_host_gclamp} differs_from_unclamped={clamp_acts} \
-                 q8act_eq_gemmact={q8_eq} {}",
+                 q8act_eq_fused={q8_eq} {}",
                 verdict(pass)
             );
             ok &= pass;

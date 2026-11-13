@@ -1199,7 +1199,11 @@ placement 0 0 0
 # PIN(2026-11-02): qdot 271 -> 281 blocks, 126 -> 132 fns, new code, not old code relaxed: the IQ1_M x Q8_K port of
 # ik's mul_mat_iq1_m_q8_K (its pack, block step, one-column dot and column tile, each a target_feature AVX2 fn) and
 # the IQ1_S wide tile (its group walk and the column-pointer fill it shares with IQ2_XXS's).
-qdot 281 132 0
+# PIN(2026-11-13): qdot 281 -> 291 blocks, 132 -> 134 fns, new code, not old code relaxed: swiglu_gclamp's AVX2 rule
+# (the gate-first clamped SwiGLU), the dispatch in swiglu_gclamp (1 block), v_swiglu_gclamp and its v_expf call
+# (1 block), swiglu_gclamp_avx2's full-vector and padded-tail bodies (two loads, the v_swiglu_gclamp call and the
+# store each: 8), each with its own SAFETY line.
+qdot 291 134 0
 quantize 0 0 0
 record 0 0 0
 refset 0 0 0

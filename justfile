@@ -789,9 +789,10 @@ gate-gpu-iq-quant:
     ./tools/box.sh '. tools/ref/ref-paths.sh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_iq_quant && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-quantize && K3Q_TREE=$K3QUANT BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_iq_quant'
 
 # bloomery-quantize's host side (crates/quantize, no card): the type-rule matcher on llama-quantize's K3.1 rule shapes, the
-# finite scan of every source type, --check's row comparison, the plan's per-tensor decisions and refusals, the argument parser.
+# finite scan of every source type, --check's row comparison, the plan's per-tensor decisions and refusals, the argument parser,
+# and --resume over a synthetic split set (the kept shards, a foreign shard's refusal, a failure's partial).
 gate-quantize:
-    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-quantize --lib --test check --test resolve --test rules'
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-quantize --lib --test check --test resolve --test rules --test resume'
 
 # The host K-quant rules (gguf::kquant: Q4_K, Q5_K, Q6_K, Q8_0) against ggml's own quantizer (iq_quant_ref, just
 # build-iq-quant-ref) with and without an importance matrix, row for row over seeded row families, and the K3 fixture

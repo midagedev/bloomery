@@ -125,7 +125,7 @@ SERVES = {
 # still has no reader for each, so a reader added makes the exception stale and it is named.
 SERVES_NO_READER = {"host": ("deepseek2",)}
 SERVES_VIA_FROM_NAME = {"glm": ("Glm5next",), "solar2": ("SolarOpen2",), "minimaxm3": ("MiniMaxM3",), "nemotron": ("NemotronH", "NemotronHMoe"),
-                        "raon1": ("Raon1",), "musespark": ("MuseSpark",), "flint": ("Flint",),
+                        "raon1": ("Raon1",), "musespark": ("MuseSpark",), "flint": ("Flint", "ExaoneMoe"),
                         "mistrallarge4": ("MistralLarge4",), "kimik3": ("KimiK3",)}
 # crates/gpu-gates/src/qwen_seat.rs:Family::pick — the programs a program-served seat serves (Model::serves_arch asks
 # Family::of). crates/placement/src/accepts.rs:program_of — the program that runs each crates/models Arch variant, here

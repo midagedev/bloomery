@@ -56,18 +56,10 @@ const LAYERS: [(u32, bool, f32); BLOCKS] = [
 /// 256-row granule, never past the context).
 const ROWS_AT_8192: [u64; TRUNK] = [8192, 4608, 768, 8192, 768, 8192];
 
-/// The fixture GGUF's path: the box's, or the one `BLOOMERY_REF_MODEL` names.
-fn file() -> String {
-    std::env::var_os("BLOOMERY_REF_MODEL").map_or_else(
-        || FILE.to_string(),
-        |v| v.into_string().expect("BLOOMERY_REF_MODEL must be UTF-8"),
-    )
-}
-
 /// The file's inventory as the declaration list a strict header-only `Split`
 /// lays out, with `edit` over the declarations.
 fn header_of(edit: impl Fn(&mut Vec<TensorDecl>)) -> Split {
-    let inv = gguf::inventory_of(file()).expect("the GGUF header parses");
+    let inv = gguf::inventory_of(FILE).expect("the GGUF header parses");
     let mut decls: Vec<TensorDecl> = inv
         .tensors
         .iter()
@@ -99,9 +91,9 @@ fn retype(decls: &mut [TensorDecl], name: &str, ty: GgmlType) {
 /// What the reader resolves from the fixture GGUF's own header, and what it
 /// refuses: every pin that differs is listed, then the test fails.
 #[test]
-#[ignore = "needs the fixture GGUF on the box (BLOOMERY_REF_MODEL names it; just gate-exaone-meta)"]
+#[ignore = "needs the fixture GGUF on the box (just gate-exaone-meta)"]
 fn hw_exaone_fixture_header() {
-    let path = std::path::PathBuf::from(file());
+    let path = std::path::PathBuf::from(FILE);
     let inv = gguf::inventory_of(&path).expect("the GGUF header parses");
     let mut bad = Vec::new();
     let file_len = std::fs::metadata(&path).expect("the file's length").len();
@@ -125,7 +117,7 @@ fn hw_exaone_fixture_header() {
     let kv: std::collections::BTreeMap<&str, &Value> =
         inv.meta.iter().map(|(k, v)| (k.as_str(), v)).collect();
     for (key, want) in [
-        ("general.architecture", Value::String("exaone-moe".into())),
+        (GENERAL_ARCHITECTURE, Value::String("exaone-moe".into())),
         ("exaone-moe.vocab_size", Value::U32(153_600)),
         ("exaone-moe.context_length", Value::U32(262_144)),
         ("exaone-moe.embedding_length", Value::U32(6144)),
