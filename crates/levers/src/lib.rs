@@ -1676,6 +1676,26 @@ impl Levers {
             route_trace: self.route_trace().is_some(),
         }
     }
+
+    /// `BLOOMERY_R8` as set: `None` when unset, which [`Levers::host`] reads as the row's default,
+    /// `on`.
+    #[must_use]
+    pub fn r8_set(&self) -> Option<bool> {
+        self.entry(R8).set.is_some().then(|| self.flag(R8))
+    }
+
+    /// [`Levers::host`] for a load that cannot read an r8 sidecar (`unfit`): its plan pages routed
+    /// experts to the NVMe expert tier, which fills its slots from the source's bytes, and a
+    /// sidecar sits beside the file. An unset [`R8`] then reads the source; a set one is the
+    /// user's and stays, so `on` meets the load's named refusal of that pair.
+    #[must_use]
+    pub fn host_for(&self, unfit: bool) -> HostCfg {
+        let host = self.host();
+        HostCfg {
+            r8: host.r8 && !(unfit && self.r8_set().is_none()),
+            ..host
+        }
+    }
 }
 
 impl Reading {

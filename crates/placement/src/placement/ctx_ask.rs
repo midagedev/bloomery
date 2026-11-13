@@ -99,7 +99,9 @@ pub enum Side {
     /// ([`card_experts_floor`]).
     Card,
     /// The host: the experts the card leaves it pass its room, on a body
-    /// that serves no tier past the host.
+    /// that serves no tier past the host, or the K/V pages it holds pass
+    /// the room with no routed expert left on it
+    /// ([`PlacementError::kv_host_short`]).
     Host,
 }
 
@@ -204,7 +206,9 @@ impl PlacementError {
     /// room leaves over that floor ([`PlacementError::NvTierArena`]), an arena
     /// under its least ([`PlacementError::NvTierArenaUnder`]), or the draft's
     /// host experts past the room ([`PlacementError::DraftHostRoom`]). Every
-    /// other refusal is `None`.
+    /// other refusal is `None`. A seat that asks the slots' share before it
+    /// refuses reads the NVMe tier's floor through
+    /// [`PlacementError::host_room_short`] instead.
     pub fn host_floor_short(&self) -> Option<Short> {
         let (need, room) = match self {
             Self::HostRoomFloor { floor, room, .. } => (*floor, *room),
@@ -218,6 +222,42 @@ impl PlacementError {
             need,
             room,
         })
+    }
+
+    /// This refusal as the host room under the NVMe expert tier's floor
+    /// ([`PlacementError::HostRoomFloor`]) at the context the plan was made,
+    /// the numbers those of [`PlacementError::host_floor_short`]. A seat that
+    /// asks the slots' share folds it into [`PlanRefusal::short`] so the
+    /// search names the largest share that holds, or that not even the least
+    /// does, where the plan's own refusal ended the load without it. The
+    /// other floors that reading names (an arena, the draft's experts) are
+    /// no share's, and `None` here.
+    pub fn host_room_short(&self) -> Option<Short> {
+        matches!(self, Self::HostRoomFloor { .. })
+            .then(|| self.host_floor_short())
+            .flatten()
+    }
+
+    /// This refusal as the host's K/V pages past its room
+    /// ([`PlacementError::KvHostOverHost`]): the pages `BLOOMERY_KV_HOST`
+    /// puts on the host are what a context's length takes, and they pass
+    /// the room even with no routed expert left on it, so a smaller context
+    /// is what it asks for. `need` is the pages' bytes and `room` what the
+    /// host leaves them. Neither [`PlacementError::card_short`] nor
+    /// [`PlacementError::host_floor_short`] reads it: a family whose seat
+    /// takes it for short folds it into [`PlanRefusal::short`]. Every other
+    /// refusal is `None`.
+    pub fn kv_host_short(&self) -> Option<Short> {
+        match self {
+            Self::KvHostOverHost {
+                bytes, headroom, ..
+            } => Some(Short {
+                on: Side::Host,
+                need: *bytes,
+                room: *headroom,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -754,6 +794,7 @@ mod tests {
 
     use super::super::workstation::{HostNeed, HostRead};
     use super::*;
+    use bloomery_levers::KvHost;
 
     const STEPS: Steps = Steps {
         floor: 4096,
@@ -1246,6 +1287,74 @@ mod tests {
             })
         );
         assert_eq!(host(HostNeed { cards: 0, ..need }).pool_short(), None);
+    }
+
+    /// The K/V pages the host cannot hold are a short host at the pages' bytes and what the
+    /// room leaves them, and only [`PlacementError::kv_host_short`] reads them: the card's and
+    /// the host floor's readings leave them `None`, so a family that does not fold them in keeps
+    /// the named refusal. FAIL-first: the reading on the card's side, the bytes and the room
+    /// swapped, or `card_short` taking the arm (every family's seat then reads it as short).
+    #[test]
+    fn kv_pages_over_the_host_read_as_a_short_host() {
+        let over = PlacementError::KvHostOverHost {
+            lever: KvHost::Spill,
+            bytes: 100,
+            headroom: 40,
+        };
+        assert_eq!(
+            over.kv_host_short(),
+            Some(Short {
+                on: Side::Host,
+                need: 100,
+                room: 40
+            })
+        );
+        assert_eq!(over.card_short(), None);
+        assert_eq!(over.host_floor_short(), None);
+        assert_eq!(
+            PlacementError::Experts("e".to_string()).kv_host_short(),
+            None
+        );
+        let floor = PlacementError::KvHostFloor { floor: 7 };
+        assert_eq!(floor.kv_host_short(), None);
+    }
+
+    /// The NVMe tier's host floor reads as a short host through `host_room_short` alone, at the
+    /// numbers `host_floor_short` gives, and only where the floor carries the slots' and the
+    /// context's terms: the arena's and the draft's floors are no context's, and the card's
+    /// reading leaves it `None`. FAIL-first: the arm taking the arena's floors too, the room and
+    /// the floor swapped, or the reading on the card's side.
+    #[test]
+    fn the_host_room_floor_reads_as_a_short_host_for_a_seat_that_folds_it() {
+        let floor = PlacementError::HostRoomFloor {
+            room: 40,
+            floor: 100,
+            base: 60,
+            layer: 20,
+            need: 100,
+            arena: None,
+        };
+        assert_eq!(
+            floor.host_room_short(),
+            Some(Short {
+                on: Side::Host,
+                need: 100,
+                room: 40
+            })
+        );
+        assert_eq!(floor.host_room_short(), floor.host_floor_short());
+        assert_eq!(floor.card_short(), None);
+        for no_context in [
+            PlacementError::NvTierArena {
+                arena: 9,
+                room: 16,
+                floor: 8,
+            },
+            PlacementError::DraftHostRoom { room: 8, draft: 9 },
+            PlacementError::KvHostFloor { floor: 7 },
+        ] {
+            assert_eq!(no_context.host_room_short(), None, "{no_context:?}");
+        }
     }
 
     /// `--parallel auto` counts the most slots whose plan holds a slot's

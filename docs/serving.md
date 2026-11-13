@@ -253,8 +253,9 @@ A paged load serves differently:
 - Adaptive residency (section 5.5) follows the model's placement and room rules on a paged plan too; paging alone
   does not turn it off. Set `BLOOMERY_RESIDENCY=off` for a fixed placement.
 - GLM-5.3's NextN draft layer's routed experts are host experts too, so the trunk's room is the host room less them.
-- V4.1 refuses a paged plan under an r8 pair that reads a sidecar (`BLOOMERY_R8=off` reads the source and gives the
-  same bits). The release uses no sidecar.
+- V4.1 serves a paged plan with an r8 sidecar beside the file by reading the source (same bits; the server names it at
+  the start); a set `BLOOMERY_R8=on` is refused by name there, and so is the pair in the other front ends
+  (`BLOOMERY_R8=off` reads the source). The release uses no sidecar.
 
 A paged set on two drives: a sidecar `<prefix>.shard-dirs` beside the shards (`<prefix>-00001-of-000NN.gguf`) lists,
 one absolute path a line, the directories that hold a byte-identical copy of every shard by file name (`#` and blank

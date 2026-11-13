@@ -471,6 +471,39 @@ fn registry_names_are_its_literals() {
     assert_eq!(literals, names);
 }
 
+/// A load whose plan pages routed experts to the NVMe tier cannot read an r8 sidecar: an unset
+/// `BLOOMERY_R8` then reads the source, a set one is the user's either way (`on` meets the load's
+/// named refusal of the pair), and nothing but `r8` moves. Mutants: `host_for` that moves a set
+/// `on` (the server then starts where the user asked for the refusal), that ignores `unfit` (every
+/// sidecar load reads the source), or that moves `off` to `on`.
+#[test]
+fn r8_unset_reads_the_source_where_the_tier_cannot_fill_from_a_sidecar() {
+    let reading = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).expect("a reading");
+    let unset = reading(&[]);
+    assert_eq!(unset.r8_set(), None);
+    assert!(unset.host_for(false).r8, "no paged plan: the row's default");
+    assert!(!unset.host_for(true).r8, "a paged plan under a sidecar");
+    assert_eq!(
+        unset.host_for(true),
+        HostCfg {
+            r8: false,
+            ..unset.host()
+        },
+        "only r8 moves"
+    );
+    for (word, set) in [("on", true), ("off", false)] {
+        let levers = reading(&[(R8, word)]);
+        assert_eq!(levers.r8_set(), Some(set), "{word}");
+        for unfit in [false, true] {
+            assert_eq!(
+                levers.host_for(unfit),
+                levers.host(),
+                "{word}, unfit {unfit}"
+            );
+        }
+    }
+}
+
 /// Each accessor reads its own row: the defaults unset, the values as set —
 /// the last of a name given twice — and the parsed rows are exactly the
 /// accessors' rows.

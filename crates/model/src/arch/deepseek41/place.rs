@@ -24,7 +24,7 @@ use super::{roles, spec};
 use crate::arch::coverage;
 use crate::arch::place_hybrid;
 use crate::placement::accepts::{Program, routed_rule};
-use crate::placement::ctx_ask::PlanRefusal;
+use crate::placement::ctx_ask::{PlanRefusal, Short};
 use crate::placement::heads::{HeadLayout, model_row_heads};
 use crate::placement::workstation::{self, HostRead, TierBatchBytes};
 use bloomery_levers::KvHost;
@@ -141,6 +141,20 @@ impl PlanRefusal for PlaceError {
             Self::Broken(v) => Some(v),
             Self::Placement(_) | Self::BatchOver { .. } => None,
         }
+    }
+
+    /// The card's reading, and the host's: the K/V pages past its room
+    /// ([`PlacementError::kv_host_short`]) and the NVMe tier's floor over it
+    /// ([`PlacementError::host_room_short`]) carry the slots' and the
+    /// context's host bytes. A set context over them is a short host with the
+    /// largest share that holds (or that none does), and the default steps
+    /// down to it, where the refusal had stopped the load by its own name
+    /// before the slots' share was asked.
+    fn short(&self) -> Option<Short> {
+        self.card_short().or_else(|| {
+            let host = self.placement()?;
+            host.kv_host_short().or_else(|| host.host_room_short())
+        })
     }
 }
 
@@ -414,8 +428,12 @@ mod tests {
 
     use gguf::GgmlType;
 
-    use super::{PASS_ROWS, pass_heads_bytes};
+    use super::{PASS_ROWS, PlaceError, pass_heads_bytes};
+    use crate::placement::ctx_ask::{
+        Ask, AskError, Limit, PlanRefusal, Rule, Short, Side, Steps, choose, probe_of,
+    };
     use crate::placement::{Card, ModelTensor, ModelTensors, PlacementError, Role};
+    use bloomery_levers::KvHost;
 
     fn card(head: bool) -> Card {
         Card {
@@ -491,5 +509,143 @@ mod tests {
         )
         .expect("a head");
         assert_eq!(row.bytes(), 549_900);
+    }
+
+    /// A plan refused by the K/V pages past the host's room reads as a short host, so a set
+    /// context over it is `DoesNotFit` naming the host and the largest share that holds, and
+    /// the default steps down to that share, where the refusal had stopped the load by its own
+    /// name. Other refusals keep their error. FAIL-first: `short` with the card's reading alone
+    /// leaves the refusal the seat's error at the first ask, for both asks.
+    #[test]
+    fn kv_pages_past_the_host_room_ask_a_smaller_context() {
+        const PER_POS: u64 = 10;
+        const ROOM: u64 = 40 * 1024;
+        const STEPS: Steps = Steps {
+            floor: 1024,
+            step: 1024,
+        };
+        const LIMIT: Limit = Limit {
+            positions: 16 * 1024,
+            source: "trained",
+        };
+        let pages = |c: u64| {
+            PlaceError::Placement(PlacementError::KvHostOverHost {
+                lever: KvHost::Spill,
+                bytes: c * PER_POS,
+                headroom: ROOM,
+            })
+        };
+        // The pages hold up to `ROOM / PER_POS` = 4,096 positions.
+        let plan_at = |c: u64| {
+            probe_of(if c * PER_POS <= ROOM {
+                Ok(c)
+            } else {
+                Err(pages(c))
+            })
+        };
+        assert_eq!(
+            pages(8192).short(),
+            Some(Short {
+                on: Side::Host,
+                need: 8192 * PER_POS,
+                room: ROOM
+            })
+        );
+        assert_eq!(pages(8192).card_short(), None);
+        assert!(PlaceError::Broken(Vec::new()).short().is_none());
+        let AskError::DoesNotFit {
+            short,
+            largest,
+            slots,
+            ..
+        } = choose(Ask::Set { total: 16 * 1024 }, 1, LIMIT, STEPS, plan_at)
+            .err()
+            .expect("the set context is over the room")
+        else {
+            panic!("a set context over the host room is DoesNotFit");
+        };
+        assert_eq!((short.on, largest, slots), (Side::Host, Some(4096), 1));
+        let chosen = choose(Ask::Default, 1, LIMIT, STEPS, plan_at)
+            .expect("the default steps down to the pages the host holds");
+        assert_eq!(chosen.slot_ctx, 4096);
+        assert!(
+            matches!(chosen.rule, Rule::Fitted { from, short } if from == 16 * 1024 && short.on == Side::Host),
+            "fitted from the target on the host"
+        );
+        // A refusal that is not short stays the seat's own.
+        let broken = choose(Ask::Default, 1, LIMIT, STEPS, |_| {
+            probe_of::<u64, _>(Err(PlaceError::Placement(PlacementError::KvHostFloor {
+                floor: 7,
+            })))
+        });
+        assert!(matches!(
+            broken,
+            Err(AskError::Plan(PlaceError::Placement(_)))
+        ));
+    }
+
+    /// The NVMe tier's floor over the host room, which the slots' shadows and the context's pages
+    /// raise, is a short host like the pages' own: a set context over it is `DoesNotFit` naming
+    /// the host and the largest share that holds, and the default steps down to that share,
+    /// where the floor's refusal ended the load before the slots' share was asked. FAIL-first:
+    /// `short` without the floor's reading leaves it the seat's error at the first ask, for both
+    /// asks.
+    #[test]
+    fn the_host_room_floor_asks_a_smaller_context_too() {
+        const BASE: u64 = 10_000;
+        const PER_POS: u64 = 10;
+        const ROOM: u64 = 50_000;
+        const SLOTS: usize = 4;
+        const STEPS: Steps = Steps {
+            floor: 1024,
+            step: 1024,
+        };
+        const LIMIT: Limit = Limit {
+            positions: 16 * 1024,
+            source: "trained",
+        };
+        let floor = |c: u64| {
+            let floor = BASE + c * PER_POS;
+            PlaceError::Placement(PlacementError::HostRoomFloor {
+                room: ROOM,
+                floor,
+                base: BASE,
+                layer: 0,
+                need: floor,
+                arena: None,
+            })
+        };
+        // A slot's context holds while the floor stays in the room: up to 3,072 of the steps.
+        let plan_at = |c: u64| {
+            probe_of(if BASE + c * PER_POS <= ROOM {
+                Ok(c)
+            } else {
+                Err(floor(c))
+            })
+        };
+        assert_eq!(
+            floor(4096).short(),
+            Some(Short {
+                on: Side::Host,
+                need: BASE + 4096 * PER_POS,
+                room: ROOM
+            })
+        );
+        assert_eq!(floor(4096).card_short(), None);
+        let AskError::DoesNotFit { short, largest, .. } =
+            choose(Ask::Set { total: 16 * 1024 }, SLOTS, LIMIT, STEPS, plan_at)
+                .err()
+                .expect("the slots' total is over the floor")
+        else {
+            panic!("a set context over the host floor is DoesNotFit");
+        };
+        assert_eq!((short.on, largest), (Side::Host, Some(3072)));
+        let chosen = choose(Ask::Default, SLOTS, LIMIT, STEPS, plan_at)
+            .expect("the default steps down to the floor the host holds");
+        assert_eq!(chosen.slot_ctx, 3072);
+        assert!(
+            matches!(chosen.rule, Rule::Fitted { from, short } if from == 16 * 1024 && short.on == Side::Host),
+            "fitted from the target on the host"
+        );
     }
 }

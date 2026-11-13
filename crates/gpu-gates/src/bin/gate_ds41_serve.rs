@@ -103,8 +103,8 @@
 //! [`ctx_default`]). A server asked for [`SLOTS_OVER`] slots of [`GATE_CTX`]
 //! each (`<dir>/slots-over`, `--ctx` their total), whose plan counts that many
 //! sequences, ends before it loads (s4): no `plan` record, and the seats'
-//! common refusal names the share a slot asks and what the card holds — the
-//! same context as one slot is the server above.
+//! common refusal names the share a slot asks and what the card or the host
+//! holds — the same context as one slot is the server above.
 //! Then a second server of two resident sequences (`--parallel 2`,
 //! [`GATE_CTX`] each — `--ctx` is that total, `from=flag` — the residency
 //! off as the gate placement runs it,
@@ -138,7 +138,8 @@
 //! - (s2) `--ids` and a prompt sharing nothing with it, each on its own
 //!   slot (`cache_prompt`); the second's slot erased; then `--ids` plus its
 //!   greedy ids takes the first's slot and keeps all but its last id, and
-//!   its ids are those of `cache_prompt: false`;
+//!   its ids are those of `cache_prompt: false`, or part from them at a near
+//!   tie by the conversations' rule above (`fresh_split`);
 //! - (p3) a slot file, on a prompt sent as ids with no BOS whose first id
 //!   starts no earlier request (so no slot and no cached state shares a
 //!   prefix with it): the prompt on a slot (`cache_prompt`), the slot saved
@@ -152,9 +153,10 @@
 //!   A's positions. B's continuation keeps its slot (no `cache load`); then
 //!   A's takes the least recently used slot, C's, and a `cache load` record
 //!   of A's positions keeps all of them: the continuation keeps all but its
-//!   last id. Each continuation's ids are those of `cache_prompt: false`. B
-//!   runs first: A's continuation first would take B's slot, the least
-//!   recently used, and park B's state instead.
+//!   last id. Each continuation's ids are those of `cache_prompt: false`, or
+//!   part from them at a near tie by that rule. B runs first: A's
+//!   continuation first would take B's slot, the least recently used, and
+//!   park B's state instead.
 //!
 //! That server is killed and waited for the same way. A second server of
 //! the same arguments and directory (`<dir>/slots-files`) restores the (p3)
@@ -1416,12 +1418,13 @@ mod gate {
     }
 
     /// One greedy `/completion` of `prompt` run past the end-of-generation id:
-    /// its ids with each row's top-2 gap, and `timings.cache_n`.
+    /// the slot that served it (`u64::MAX` where the answer names none), its ids with each row's
+    /// top-2 gap, and `timings.cache_n`.
     fn greedy(
         url: &dyn Fn(&str) -> String,
         prompt: &[u32],
         cache: bool,
-    ) -> Result<(Vec<Pick>, Value), GateError> {
+    ) -> Result<(u64, Vec<Pick>, Value), GateError> {
         let body = json!({
             "prompt": prompt, "n_predict": REUSE_PREDICT, "temperature": 0,
             "ignore_eos": true, "return_tokens": true, "cache_prompt": cache,
@@ -1429,6 +1432,7 @@ mod gate {
         });
         let (st, body) = curl(&url("/completion"), Some(&body), false)?;
         let v = json_of("/completion", st, &body)?;
+        let slot = v["id_slot"].as_u64().unwrap_or(u64::MAX);
         let ids = ids_of(&v["tokens"])?;
         let run = picks(&v["completion_probabilities"], "the greedy completion")?;
         if ids_in(&run) != ids {
@@ -1439,21 +1443,21 @@ mod gate {
             .into());
         }
         println!(
-            "greedy prompt {} ids cache_prompt={cache}: cache_n={} tokens {ids:?}",
+            "greedy prompt {} ids cache_prompt={cache}: slot {slot} cache_n={} tokens {ids:?}",
             prompt.len(),
             v["timings"]["cache_n"]
         );
-        Ok((run, v["timings"]["cache_n"].clone()))
+        Ok((slot, run, v["timings"]["cache_n"].clone()))
     }
 
     /// Two conversations interleaved (module header).
     fn interleaved(url: &dyn Fn(&str) -> String, ids: &[u32]) -> Result<bool, GateError> {
-        let (g1, _) = greedy(url, ids, true)?;
+        let (_, g1, _) = greedy(url, ids, true)?;
         let other: Vec<u32> = ids.iter().rev().copied().collect();
         greedy(url, &other, true)?;
         let cont: Vec<u32> = ids.iter().chain(&ids_in(&g1)).copied().collect();
-        let (g2, c2) = greedy(url, &cont, true)?;
-        let (g3, c3) = greedy(url, &cont, false)?;
+        let (_, g2, c2) = greedy(url, &cont, true)?;
+        let (_, g3, c3) = greedy(url, &cont, false)?;
         let split = fresh_split("interleaved", &g3, &g2);
         let mut ok = true;
         check(
@@ -1576,8 +1580,8 @@ mod gate {
         Ok((slot, ids, v["timings"]["cache_n"].clone()))
     }
 
-    /// (s4) [`SLOTS_OVER`] slots of [`GATE_CTX`], which the gate card cannot
-    /// hold, refused before the load (module header), into
+    /// (s4) [`SLOTS_OVER`] slots of [`GATE_CTX`], which the gate card or its
+    /// host cannot hold, refused before the load (module header), into
     /// `<dir>/slots-over`.
     fn over_refused(a: &Args) -> Result<bool, GateError> {
         let dir = a.dir.join("slots-over");
@@ -1605,22 +1609,30 @@ mod gate {
         let planned = server_log(&err_log, record::BLOOMERY_SERVE_DS41)?
             .first(&record::PLAN)?
             .is_some();
-        // The seats' common words for a set context the card cannot hold
-        // (`ctx_ask::AskError::DoesNotFit`).
-        let named = format!(
-            "--ctx {total} over {SLOTS_OVER} slot(s) asks {} positions a slot, and the card \
-             holds ",
+        // The seats' common words for a set context the machine cannot hold
+        // (`ctx_ask::AskError::DoesNotFit`), naming the memory that is short.
+        let share = format!(
+            "--ctx {total} over {SLOTS_OVER} slot(s) asks {} positions a slot, and the ",
             served_positions()?
         );
+        let named = ["card", "host"]
+            .iter()
+            .any(|side| refused.contains(&format!("{share}{side} holds ")));
         println!("slots over the card: planned {planned}; {refused}");
         let mut ok = true;
         // PIN(2026-10-14): `--ctx` is the total the slots split (ctx-first, D4), so the
         // server asks the slots' total and is refused by the common words; was the plan's
         // own refusal naming the card and its KV term.
+        // PIN(2026-11-13): V4.1's seat reads the K/V pages the host cannot hold
+        // (`PlacementError::KvHostOverHost`) and the NVMe tier's floor over its room
+        // (`PlacementError::HostRoomFloor`) as a short host (`kv_host_short`, `host_room_short`,
+        // folded by `PlaceError::short`), so the over-room ask is refused by the common words
+        // naming whichever memory is short; was the card's words only, with those refusals
+        // reaching the seat unread before the slots' share was asked.
         check(
             &mut ok,
             "slots_over_the_card_refused_before_the_load",
-            refused.contains("before listening") && refused.contains(&named) && !planned,
+            refused.contains("before listening") && named && !planned,
         );
         Ok(ok)
     }
@@ -1959,7 +1971,9 @@ mod gate {
     /// from its stderr, `err_log`. B's continuation runs before A's: resident
     /// slots break a tie of shared prefixes by the least recently used
     /// (`serve::sched`'s `best_slot`), so A's continuation first would take
-    /// B's slot and park B's state rather than keep it.
+    /// B's slot and park B's state rather than keep it. Each continuation is compared with its
+    /// fresh run by [`fresh_split`]: the warm one is the kept rows and a one-row call, the fresh
+    /// one a call over the whole prompt, two sum orders of one prompt.
     fn slots_park_resume(
         url: &dyn Fn(&str) -> String,
         err_log: &Path,
@@ -2002,13 +2016,15 @@ mod gate {
         let (sc, _, _) = on_slot(url, &pc, true)?;
         let parked = records(&record::CACHE_SAVE)?.split_off(saves);
         let cb: Vec<u32> = pb.iter().chain(&gb).copied().collect();
-        let (sb2, gb2, kb2) = on_slot(url, &cb, true)?;
+        let (sb2, gb2, kb2) = greedy(url, &cb, true)?;
         let b_loads = records(&record::CACHE_LOAD)?.len() - loads;
         let ca: Vec<u32> = pa.iter().chain(&ga).copied().collect();
-        let (_, ga2, ka2) = on_slot(url, &ca, true)?;
+        let (_, ga2, ka2) = greedy(url, &ca, true)?;
         let resumed = records(&record::CACHE_LOAD)?.split_off(loads);
-        let (_, ga3, _) = on_slot(url, &ca, false)?;
-        let (_, gb3, _) = on_slot(url, &cb, false)?;
+        let (_, ga3, _) = greedy(url, &ca, false)?;
+        let (_, gb3, _) = greedy(url, &cb, false)?;
+        let split_a = fresh_split("slots_park_resume A", &ga3, &ga2);
+        let split_b = fresh_split("slots_park_resume B", &gb3, &gb2);
         let lines = |fs: &[record::Fields]| -> Vec<String> {
             fs.iter().map(|f| f.line().to_owned()).collect()
         };
@@ -2023,6 +2039,14 @@ mod gate {
         };
         let a_held = held(&pa);
         let mut ok = true;
+        // PIN(2026-11-13): the clause held both continuations' ids exactly equal to the fresh
+        // runs', which a near tie breaks: B's continuation is its prompt call's rows, the rows
+        // of its steps and a one-row call, the fresh run one call over all of them, and the two
+        // parted at token 2. Derivation: [`fresh_split`]'s rule, the one every other
+        // warm-against-fresh clause reads, per continuation. A park or a resume that loses or
+        // corrupts a row moves a gap past every shift the agreeing positions show, and that
+        // part is clear, so red; the `cache save` and `cache load` records and the kept counts
+        // stay exact.
         check(
             &mut ok,
             "slots_park_resume",
@@ -2032,10 +2056,10 @@ mod gate {
                 && sb2 == sb
                 && b_loads == 0
                 && kb2 == json!(cb.len() - 1)
-                && gb2 == gb3
+                && split_b.ok()
                 && names(&resumed, &[("positions", a_held), ("kept", a_held)])
                 && ka2 == json!(ca.len() - 1)
-                && ga2 == ga3,
+                && split_a.ok(),
         );
         Ok(ok)
     }
@@ -2692,7 +2716,9 @@ mod gate {
     }
 
     /// (s2), an erase of one slot, on a pair that keeps its prompts (module
-    /// header).
+    /// header). The continuation is compared with the fresh run's by [`fresh_split`]: it
+    /// keeps all but its last id, so its prompt call is one row over the kept rows where the
+    /// fresh run's is the whole prompt, two splits of one prompt.
     fn slots_actions(url: &dyn Fn(&str) -> String, a: &Args) -> Result<bool, GateError> {
         let mut ok = true;
         let other: Vec<u32> = a.ids.iter().rev().copied().collect();
@@ -2707,17 +2733,26 @@ mod gate {
         let erased = json_of("/slots erase", st, &text)?;
         println!("slots erase of slot {sb}: {erased}");
         let cont: Vec<u32> = a.ids.iter().chain(&ga).copied().collect();
-        let (sc, gc, cc) = on_slot(url, &cont, true)?;
-        let (_, gf, cf) = on_slot(url, &cont, false)?;
+        let (sc, gc, cc) = greedy(url, &cont, true)?;
+        let (_, gf, cf) = greedy(url, &cont, false)?;
+        let split = fresh_split("slots_erase", &gf, &gc);
         check(
             &mut ok,
             "slots_erase_empties_the_other_slot",
             sb != sa && erased["n_erased"].as_u64().is_some_and(|n| n > 0),
         );
+        // PIN(2026-11-13): the clause held the continuation's ids exactly equal to the fresh
+        // run's, which a near tie at the first generated tokens breaks: the continuation is the
+        // prompt's kept rows plus a one-row call, the fresh run one call over all of them,
+        // two sum orders of one prompt (the continuation `reuse_continuation` runs: fresh id
+        // 11111 gap 0.3036, warm id 223 gap 4.0539 at token 1). Derivation: [`fresh_split`]'s
+        // rule, the one every other warm-against-fresh clause reads. An erase that costs the
+        // slot beside it a row still moves a row's gap past every shift the agreeing
+        // positions show, and that part is clear, so red.
         check(
             &mut ok,
             "slots_erase_leaves_the_slot_beside_it",
-            sc == sa && cc == json!(cont.len() - 1) && gc == gf && cf == json!(0),
+            sc == sa && cc == json!(cont.len() - 1) && split.ok() && cf == json!(0),
         );
         Ok(ok)
     }
