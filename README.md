@@ -377,7 +377,8 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
   itself was written by `bloomery-quantize`. Kimi K3 (unsloth's `UD-IQ1_S`, 594 GB) does not load at this tag: its
   dense trunk is 51.4 GB, past one 48 GB card.
 - K-EXAONE-2.0-750B-A37B runs on the `flint` seat from our `IQ2_XXS` set on one 48 GB card and a 256 GB host; a 24 GB
-  card and two cards were not tried. Its next-token (MTP) layer is in the file and not read yet. With thinking off and
+  card and two cards were not tried. Its next-token (MTP) layer drafts one token a step under `BLOOMERY_DRAFT=mtp`
+  (one slot; off by default this release). With thinking off and
   a one-letter answer it leans to the last option on multiple-choice questions it is unsure of; llama.cpp on the same
   file leans the same way.
 - The expert tier on another machine (`BLOOMERY_TIER_NODES`, `tier_server`) serves DeepSeek V4.1-Flash, GLM-5.3, Qwen3.8,
