@@ -844,7 +844,10 @@ gguf 7 2 0
 # PIN(2026-11-09): gpu 3097 -> 3103 blocks, new code, not old code relaxed: a room page backed by host memory
 # (crates/gpu/src/room/host.rs: the host-NUMA cuMemCreate and its release, the raw map and unmap, the device
 # attribute reads), each with its SAFETY line; cuda-core's VMM wrappers make device memory only.
-gpu 3103 423 10
+# PIN(2026-11-13): gpu 3103 -> 3105 blocks, a new kernel entry, not old code relaxed: the card's routed picks
+# collector (crates/gpu/src/imatrix.rs: `imat_card_picks`'s reads and its kept-pick add, and its shared-module load), each
+# with its SAFETY line.
+gpu 3105 423 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

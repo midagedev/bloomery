@@ -24,13 +24,12 @@
 
 #[cfg(feature = "flint")]
 fn main() -> std::process::ExitCode {
-    bloomery_gpu_gates::record::at_main("generate_exaone", &KINDS);
+    bloomery_gpu_gates::record::at_main(
+        "generate_exaone",
+        bloomery_gpu_gates::record::GENERATE_EXAONE,
+    );
     bloomery_gpu_gates::exit_with("generate_exaone", cli::run())
 }
-
-/// What `generate_exaone` prints, in the order it prints them: the plan record.
-#[cfg(feature = "flint")]
-static KINDS: [&bloomery_record::Kind; 1] = [&bloomery_gpu_gates::record::PLAN];
 
 #[cfg(feature = "flint")]
 #[path = "shared/gate_card.rs"]
@@ -59,6 +58,7 @@ mod cli {
     use bloomery_gpu::model::ChainBody;
     use bloomery_gpu_flint::{ExaoneBody, prefill};
     use bloomery_gpu_gates::imatrix_walk;
+    use bloomery_gpu_gates::need;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use bloomery_levers::{
@@ -153,6 +153,7 @@ mod cli {
         let machine = arm.machine(inputs.model.layers, place::tier_batch(&inputs)?)?;
         let plan = inputs.plan(&machine, u64::try_from(ctx)?, &place)?;
         record::plan(arm.word(), &machine, &plan).eprint();
+        need::print(&plan, 0, 0, true)?;
         if plan_only {
             return Ok(());
         }

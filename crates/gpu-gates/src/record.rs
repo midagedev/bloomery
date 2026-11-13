@@ -3761,6 +3761,9 @@ pub static GENERATE_KIMI_K3: &[&Kind] = &[
     &STAT_SUMMARY_HOST,
 ];
 
+/// What `generate_exaone` prints, in the order it prints them.
+pub static GENERATE_EXAONE: &[&Kind] = &[&PLAN, &NEED];
+
 /// What `generate_glm5next` prints, in the order it prints them.
 pub static GENERATE_GLM5NEXT: &[&Kind] = &[
     &RESIDENCY_LEVER,
