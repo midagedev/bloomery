@@ -273,6 +273,10 @@ gate-gpu-raon1-attn	family	raon1	kernel	attn_linear_gdn_kda+attn_latent_mla
 gate-raon1-meta	family	raon1	meta	arch_registry
 gate-raon1-tokenizer	family	raon1	tokenizer	tokenizer_jinja
 gate-exaone-tokenizer	family	exaone-moe	tokenizer	tokenizer_jinja
+gate-exaone-meta	family	exaone-moe	meta	arch_registry
+gate-gpu-exaone-e2e	family	exaone-moe	e2e	graph_fault+attn_gqa+moe_route+prompt_walks
+gate-gpu-exaone-pp	family	exaone-moe	e2e	prompt_walks+attn_gqa+moe_route
+gate-gpu-exaone-serve	family	exaone-moe	serve	seats_serve_engine+serve_toolcall
 gate-kimi-k3-tokenizer	family	kimi-k3	tokenizer	tokenizer_jinja
 # dfl-wire
 gate-gpu-raon1-dflash	family	raon1	draft	drafts_dspark

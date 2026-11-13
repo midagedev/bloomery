@@ -89,7 +89,7 @@ pub static LCPP: Family = Family {
     build: Some(Build::Is(BUILD)),
     runs: Some(model),
     draft_runs: None,
-    consumers: &["gate-gpu-exaone-e2e"],
+    consumers: &["gate-gpu-exaone-e2e", "gate-gpu-exaone-pp"],
 };
 
 /// The architecture's families, in the order `refset-check` lists them: the fixture GGUF's today;

@@ -266,6 +266,7 @@ impl Hparams {
             &[roles::Kind::Dense, roles::Kind::Routed, roles::Kind::Nextn],
         )?;
         dims_agree(split, hidden, vocab, described.iter().map(|&l| hp.dims(l)))?;
+        types_agree(split, blocks)?;
         Ok(hp)
     }
 
@@ -470,4 +471,50 @@ fn clamp_of(
         }
     }
     Ok(values)
+}
+
+/// Every tensor of `split` is held in a type the file's own architecture reads
+/// its stem in (`gguf::arch::allowed_types`, the stem tables of the
+/// architectures this reader serves that carry one): the first tensor of
+/// another type, by name, with the types the stem takes and how many more
+/// there are. A stem the architecture's table does not hold is not this
+/// check's: the layer groups and the classifier list it.
+fn types_agree(split: &Split, blocks: usize) -> Result<(), PlacementError> {
+    let Some(arch) = split.architecture() else {
+        return Ok(());
+    };
+    let mut off: Vec<(String, String)> = Vec::new();
+    for (_, t) in split.iter_tensors() {
+        let stem = crate::arch::classify::block_stem(&t.name, blocks)
+            .map_or(t.name.as_str(), |(_, stem)| stem);
+        let Some(allowed) = gguf::arch::allowed_types(arch, stem) else {
+            continue;
+        };
+        if !allowed.contains(&t.ty) {
+            let list: Vec<String> = allowed.iter().map(ToString::to_string).collect();
+            off.push((
+                t.name.clone(),
+                format!(
+                    "{} is {} (the {arch} reader runs {stem} as {})",
+                    t.name,
+                    t.ty,
+                    list.join(" or ")
+                ),
+            ));
+        }
+    }
+    match off.first() {
+        None => Ok(()),
+        Some((name, _)) => Err(PlacementError::Tensor {
+            name: name.clone(),
+            detail: format!(
+                "is of a type the {arch} reader does not run the tensor in ({} such: {})",
+                off.len(),
+                off.iter()
+                    .map(|(_, d)| d.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }),
+    }
 }

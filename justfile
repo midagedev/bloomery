@@ -4524,6 +4524,41 @@ gate-raon1-tokenizer:
 gate-exaone-tokenizer:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-tokenizer --test exaone -- --include-ignored --nocapture'
 
+# K-EXAONE-2.0's metadata gate (crates/model/tests/exaone_meta.rs): the fixture GGUF's header pinned — its identity (the header
+# prefix's bytes and sha256), every architecture key, the description layer by layer (the window/rope/act table of the six trunk
+# layers, the biased sigmoid router at 256/top-8 with the 2.5 scale, the MTP block in spec.mtp), the plan's own values (the one
+# routed width, the one rope, the router instance, the store rows each layer's window counts) and every tensor's name, role, type
+# and shape; the reader's refusals beside them in the library tests (arch::flint::exaone_tests: a wrong window array, a
+# disagreeing pattern, a clamp under a clampless row, a tensor in a type the stem table does not hold — the Q4_K nextn.eh_proj
+# the quantizer's first rules wrote). Headers only: the 8.5 GB payload is not read; seconds.
+gate-exaone-meta:
+    BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-exaone-meta && bash tools/gate.sh --release -p bloomery-model --lib -- arch::flint::exaone_tests --nocapture && bash tools/gate.sh --release -p bloomery-model --test exaone_meta -- --ignored --nocapture'
+
+# K-EXAONE-2.0's whole decode chain of the composed program (gate_exaone_e2e's doc): the dense lead, four routed 256-expert
+# top-8 blocks, the head, one prompt id a step, opened through ExaoneBody over the fixture GGUF, against the patched llama.cpp
+# tree's node dumps of that file (refset family lcpp-exaone-moe, `just dump-ref-exaone-moe`): the free chain's layer outputs, the
+# shared top logprobs, the teacher-forced argmax pin, the head alone on the oracle's own row, and the prompts fed by the prompt
+# batch. Real-only (tools/ref/real-only.sh): the family's file is the fixture GGUF itself and its sets are the real tier's, so
+# BLOOMERY_TIER=fixture does not run it. One card (any idle one).
+gate-gpu-exaone-e2e:
+    BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin gate_exaone_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_e2e'
+
+# K-EXAONE-2.0's prompt batch (gate_exaone_pp's doc): the fixture GGUF's four prompt sets as passes of 8 and 5 rows and as one
+# whole-prompt call, each pass's last logits row and argmax bit for bit the decode steps' at that position, the steps after the
+# passes and after the whole call the reference's bit for bit, that call's last row within the e2e gate's band of the oracle's,
+# and the calls the body does not take refused by name. Real-only, as gate-gpu-exaone-e2e. One card (any idle one).
+gate-gpu-exaone-pp:
+    BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-pp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin gate_exaone_pp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_pp'
+
+# The exaone-moe seat of bloomery-serve on the fixture GGUF (gate_exaone_serve's doc): the flint seat, the file's router row
+# picking K-EXAONE's body. `--parallel 2` is refused by name before any plan; one server at ctx 4096 loads (arch exaone-moe, one
+# slot, the trunk's six layers), listens and answers a chat turn with its reasoning split at the model's own <think> tags and its
+# turn ending at <|endofturn|>; a request that carries tools is answered with a completion (the template's tool-declare section),
+# and one tool call round-trips through the file's own template over a scripted engine. Real-only, as gate-gpu-exaone-e2e. One
+# card (any idle one).
+gate-gpu-exaone-serve:
+    BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_exaone_serve && D=target/exaone-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_serve --dir $D'
+
 # --- end exaone-moe ---
 
 # --- kimik3-mla (Kimi K3's gated MLA layer) --------------------------------------------------------------------------------------------

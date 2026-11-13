@@ -9,6 +9,11 @@ pub mod prefill;
 mod step;
 pub mod tier;
 
+/// The fewest rows of a prompt unit whose shared expert runs one GEMM a site:
+/// below it the gated sites run the step's per-column gemvs, so a unit of
+/// fewer rows writes the step's bits (`shared_routed`'s own bound, what a
+/// pass gate reads).
+pub use bloomery_gpu_deepseek41::shared_routed::GATED_FROM;
 pub use body::{
     Body, ExaoneBody, ExaoneModel, ExaoneRouter, FlintBody, FlintModel, FlintRouter, Seq,
     StepInput, set_taps,
