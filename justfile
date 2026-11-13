@@ -4564,6 +4564,22 @@ gate-gpu-exaone-pp:
 gate-gpu-exaone-verify:
     BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin gate_exaone_verify && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_verify && BLOOMERY_REF_MODEL=/models/fixtures/exaoneh-iq2-gguf/exaoneh-iq2-fixture-00001-of-00001.gguf BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_verify'
 
+# K-EXAONE-2.0's loss tool's walk (gate_exaone_kld's doc): ppl_exaone's write_base on the fixture GGUF over the oracle prompts'
+# ids, each record the log-softmax of the row an independent run leaves (the serve seat's own load, a decode step a position), the walk
+# run twice writing the same bytes (KLD exactly 0, every top id the same), and over a copy whose logits are moved by +-1 a KLD equal to
+# the exact one of the two rows within the band the records' storage derives. The gate runs twice: on the Q4_K fixture and on the
+# IQ2_XXS fixture (tools/ref/exaone-iq2-fixture.sh). Real-only, as gate-gpu-exaone-e2e. One card (any idle one).
+gate-gpu-exaone-kld:
+    BLOOMERY_MODEL=exaone-moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-exaone-kld && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin gate_exaone_kld && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_kld && BLOOMERY_REF_MODEL=/models/fixtures/exaoneh-iq2-gguf/exaoneh-iq2-fixture-00001-of-00001.gguf BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_exaone_kld'
+
+# K-EXAONE-2.0's loss tool (ppl_exaone's doc): the model BLOOMERY_REF_MODEL names (the first shard; the profile's fixture without it)
+# over the first CTX x CHUNKS ids of IDS (one decimal id a line) for each RUN (`CTX[xCHUNKS]=OUT.kld`, one load serves them all),
+# written as ik's KL-divergence base files on the box. `kld_diff A.kld B.kld` (build it with `cargo build --release -p
+# bloomery-gpu-gates --bin kld_diff`, host only) prints the loss of B against A. On the A6000 alone (a card's lock, not the timing
+# lease; no number of it is a timing). The run is bounded at 30 minutes.
+exaone-kld IDS +RUNS:
+    BLOOMERY_MODEL=exaone-moe BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin ppl_exaone && runs=""; for r in {{RUNS}}; do runs="$runs --run $r"; done; BLOOMERY_GATE_BOUND=${BLOOMERY_GATE_BOUND:-1800} bash tools/gpu-gate.sh ppl_exaone --ids {{IDS}} $runs'
+
 # The verify pass's cost in decode steps (gate_exaone_verify's `--time`): one plain step and one pass of two rows over the plain
 # run's own next ids, medians, c_v = pass / step, under the timing lease (tools/ref/time-gate.sh) on the timing card. The model is
 # the profile's file, or the real one through BLOOMERY_REF_MODEL (a prediction card in BLOOMERY_BOX_ENV names the run).
