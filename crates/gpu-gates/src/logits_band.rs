@@ -183,30 +183,6 @@ pub fn walk_at(what: &str, want: Positions<'_>, got: Positions<'_>, floor: f32) 
     walk_floors(what, want, got, &|_| floor, &format!("margin >= {floor}"))
 }
 
-/// [`walk_at`] whose first two compared positions read `head` as their clarity margin and every
-/// later one `floor`: a prompt's head positions are where a batched call's sum order compounds
-/// through the layers and moves the top-two gap most, so a walk that starts at position 0 judges
-/// them at the head margin its family measured (`prompts::HEAD_MARGIN_V41`) and the rest at the
-/// e2e floor.
-///
-/// # Panics
-/// As [`walk`].
-pub fn walk_at_head(
-    what: &str,
-    want: Positions<'_>,
-    got: Positions<'_>,
-    head: f32,
-    floor: f32,
-) -> Walk {
-    walk_floors(
-        what,
-        want,
-        got,
-        &|i| if i < 2 { head } else { floor },
-        &format!("margin >= {head} at 0–1, {floor} beyond"),
-    )
-}
-
 /// [`walk`]'s comparison with the clarity margin of position `i` from `floor_of` and its
 /// print's clarity note `note`.
 ///
@@ -231,6 +207,7 @@ fn walk_floors(
     let shared = want.tokens.len().min(got.tokens.len());
     let mut band = LogitsBand::new();
     let (mut compared, mut agreed, mut apart_clear) = (0, shared, false);
+    let mut shifts = Shifts::default();
     let runs = want
         .tokens
         .iter()
@@ -239,6 +216,7 @@ fn walk_floors(
     for (i, ((wt, wr), (gt, gr))) in runs.enumerate() {
         let (clear, disagree) = (band.clear, band.disagree);
         band.add_at(&bits(gr), &bits(wr), floor_of(i));
+        shifts.add(i, gr, wr, floor_of(i), band.disagree > disagree);
         compared += 1;
         if wt != gt {
             apart_clear = band.clear > clear;
@@ -293,13 +271,14 @@ fn walk_floors(
     println!(
         "{} {what}: {compared} of the reference's {} positions compared{left}: band clear top-1 \
          {} of {} (pin {LOGITS_CLEAR_PIN}, clear = {note}), max |Δlogit| {:.3e} (pin \
-         {LOGITS_MAX_PIN}), rms {:.3e} (pin {LOGITS_RMS_PIN}){}",
+         {LOGITS_MAX_PIN}), rms {:.3e} (pin {LOGITS_RMS_PIN}){}{}",
         if ok { "ok" } else { "FAIL" },
         want.tokens.len(),
         band.disagree,
         band.clear,
         band.max,
         band.rms(),
+        shifts.note(),
         if red.is_empty() {
             String::new()
         } else {
@@ -311,6 +290,50 @@ fn walk_floors(
         compared,
         agreed,
         ok,
+    }
+}
+
+/// How far the compared rows move the reference's top-2 gaps over a walk: the largest |shift| at
+/// the head (positions 0–1) and beyond it, with its position, and each clear position whose top-1
+/// the compared row flips. A shift is the reference's top1−top2 minus the compared row's logit
+/// difference at the same two ids, so a clarity margin derived as twice the largest shift reads
+/// off one run's line.
+#[derive(Default)]
+struct Shifts {
+    head: f32,
+    beyond: Option<(usize, f32)>,
+    flips: Vec<(usize, f32, f32)>,
+}
+
+impl Shifts {
+    fn add(&mut self, i: usize, got: &[f32], want: &[f32], floor: f32, flipped: bool) {
+        if got.len() != want.len() || want.len() < 2 {
+            return;
+        }
+        let (w1, top1, w2, top2) = crate::kld::top2(want);
+        let gap = top1 - top2;
+        let shift = gap - (got[w1] - got[w2]);
+        if i < 2 {
+            self.head = self.head.max(shift.abs());
+        } else if self.beyond.is_none_or(|(_, s)| shift.abs() > s) {
+            self.beyond = Some((i, shift.abs()));
+        }
+        if flipped && gap_is_clear(gap, floor) {
+            self.flips.push((i, gap, shift));
+        }
+    }
+
+    fn note(&self) -> String {
+        let mut out = format!("; largest top-2 gap shift {:.4} at 0–1", self.head);
+        if let Some((i, s)) = self.beyond {
+            out += &format!(", {s:.4} beyond (position {i})");
+        }
+        for (i, gap, shift) in &self.flips {
+            out += &format!(
+                "; clear top-1 flipped at position {i} (margin {gap:.4}, shift {shift:.4})"
+            );
+        }
+        out
     }
 }
 
@@ -492,42 +515,6 @@ mod tests {
         let got = [gapped(2, 5.0)];
         let far = walk_at("floor", run(&tw, &want), run(&tg, &got), floor);
         assert!(!far.ok && far.band.clear == 1 && far.band.disagree == 1);
-    }
-
-    /// The head floor of `walk_at_head` reads its first two positions alone: a top-1 flip there
-    /// at a margin between the two floors is not a disagree, the same flip at the third position
-    /// is — the tokens agree throughout, as a rank walk's fed ids do.
-    #[test]
-    fn walk_at_head_reads_the_head_margin_at_the_first_two_positions() {
-        let (head, floor) = (6.0, MARGIN_FLOOR);
-        let same = [1u32, 1, 1];
-        let rows = |top: usize| vec![gapped(top, 4.0); 3];
-        // Every position's other order flips the reference's top-1 at a
-        // margin over the floor and under the head.
-        let (want, got) = (rows(1), rows(2));
-        assert!(!walk_at("floor", run(&same, &want), run(&same, &got), floor).ok);
-        let all = walk_at_head("head", run(&same, &want), run(&same, &got), head, floor);
-        assert!(
-            !all.ok && all.compared == 3 && all.band.clear == 1 && all.band.disagree == 1,
-            "clear {} disagree {}",
-            all.band.clear,
-            all.band.disagree
-        );
-        // With the head equal to the floor the walk is `walk_at`'s.
-        let plain = walk_at_head("head", run(&same, &want), run(&same, &got), floor, floor);
-        assert!(!plain.ok && plain.band.disagree == 3);
-        // A flip at the head positions alone is admitted: only the third
-        // position is clear (the head's floor leaves the first two near),
-        // none disagrees, the walk green.
-        let head_flip = vec![gapped(2, 4.0), gapped(1, 4.0), gapped(1, 4.0)];
-        let only = walk_at_head(
-            "head",
-            run(&same, &want),
-            run(&same, &head_flip),
-            head,
-            floor,
-        );
-        assert!(only.ok && only.compared == 3 && only.band.clear == 1 && only.band.disagree == 0);
     }
 
     fn picks(run: &[(u32, f32)]) -> Vec<Pick> {
