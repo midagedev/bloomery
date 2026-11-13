@@ -117,29 +117,27 @@ flint_family!(
     "exaone-moe"
 );
 
-/// Whether the model `args` name is a local file whose description selects
-/// K-EXAONE's router instance (`place::router_row_of`, the program's own
-/// admission): a start that names no local file (`--hf`) takes Flint's, whose
-/// load refuses a description of the other instance by name.
-fn exaone_file(args: &[String]) -> Result<bool, GateError> {
-    for (flag, value) in bloomery_gpu_gates::llama_launch::serve_args(args) {
-        if flag != "-m" && flag != "--model-file" {
-            continue;
-        }
-        let Some(path) = value else {
-            return Err(format!("{flag} needs a path").into());
-        };
-        let split = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
-        let read = model::arch::spec(&split)?;
-        let row = place::router_row_of(&read.spec)?;
-        return Ok(bloomery_gpu_flint::is_exaone_router(row));
+/// Whether the model file the seat opens (`ref_model_path`, the path `-m` set at the start) is one
+/// whose description selects K-EXAONE's router instance (`place::router_row_of`, the program's own
+/// admission). A start with no model file yet (`--hf`, fetched later) takes Flint's, whose run
+/// raises the same path error by name or whose load refuses a description of the other instance.
+fn exaone_file() -> Result<bool, GateError> {
+    let Ok(path) = bloomery_gpu_gates::ref_model_path() else {
+        return Ok(false);
+    };
+    if path.is_dir() {
+        return Ok(false);
     }
-    Ok(false)
+    let shown = path.display();
+    let split = Split::open(&path).map_err(|e| format!("open {shown}: {e}"))?;
+    let read = model::arch::spec(&split)?;
+    let row = place::router_row_of(&read.spec)?;
+    Ok(bloomery_gpu_flint::is_exaone_router(row))
 }
 
 /// Opens the real body the file's router picks and serves resident sequences by select and step.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
-    if exaone_file(args)? {
+    if exaone_file()? {
         super::hybrid::run::<Exaone>(args, side)
     } else {
         super::hybrid::run::<Flint>(args, side)
