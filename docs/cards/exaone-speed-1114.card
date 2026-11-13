@@ -1,0 +1,23 @@
+# K-EXAONE-2.0 decode by configuration on main after the Flint seat's tiers (3547694da+): the published IQ2_XXS file at
+# --place a and --place bp, and the IQ1_S gate/up mix (/models/exaone-iq1, 249.5 GB) at a, each with the MTP draft off and on.
+# Paper (docs/cards/exmtp-cv.card, exmtp-mtp.card; the scope model ~/.cache/bloomery/specs/exnight/exaone-spark-model.py):
+# step 105.8 ms = front 16.0 + host serve 88.1 + PCIe 1.7, the host leg bound by its CPU decode (151 us a read, 583.9 reads a
+# step) [derived from measured terms]. bp moves 1,581 experts (9.2 % of the host's [derived from the plan line]) to the 3090,
+# id-order pick: step 99.9..102.8 ms, +3..+6 % [derived]; the IQ1_S mix cuts the host's bytes 12 % and its decode rate per
+# weight rises (IQ1_S 431 G weights/s against IQ2_XXS 260 G, one untimed reading): +10..+27 % [derived, rho unknown]. The MTP
+# arm's gain on the release binary was +38.6..+39.8 % at D=4096 (rel0314-exaone-mtp.card) [measured]; on bp and on the mix
+# the verify pass's cost c_v moves with the host leg, so the band is wider. Resource timeline: the host CPU is the one busy
+# resource (card SM 0.276 of 1.392 ms a layer, PCIe 0.022); the 3090's tier leg runs beside the host leg.
+# Each configuration is its own invocation (DEPTH_SERVE_PLACE and the file are global to a run): the term this card decides
+# is the mtp-off pair inside each run; configurations are compared across runs in one hold, as separate tables.
+kind: ab
+question: what does the MTP draft do to K-EXAONE-2.0 decode on main at --place a, at --place bp, and on the IQ1_S gate/up mix, and what tok/s does each configuration read with the draft off
+term: tg tok/s @ n=127 decode steps, prompt 4096 corpus-prose ids, ctx 8192 one slot, (mtp - off) / off paired by round
+unit: %
+predict: +25..+45
+rounds: 3
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary arms
+condition: BLOOMERY_MODEL=exaone-moe, BLOOMERY_REF_MODEL the published first shard or /models/exaone-iq1's, main's bloomery-serve (tree arms), BLOOMERY_AB_ROUNDS=3, DEPTH_SERVE_CTX=8192, DEPTH_SERVE_N=128, DEPTH_SERVE_PLACE a or bp; arms env=BLOOMERY_DRAFT=off:<tree>:4096 and env=BLOOMERY_DRAFT=mtp:<tree>:4096; timing card the A6000 (+ the 3090 for bp)
+decide-in: the morning table: each configuration's off and mtp rows with these conditions; bp becomes a documented place for EXAONE if its off row is not below a's
+decide-below: under +25 % on a configuration: read a (the width records) and that run's plan line before writing it
+decide-above: over +45 %: read the witness blocks and both arms' plan lines (card_experts) before crediting
