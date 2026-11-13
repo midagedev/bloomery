@@ -46,3 +46,9 @@ decide-below: the node leg is the bound in the measured remainder: read the GB10
   sends 8 rows where the node computed 3.1) before any host lever
 decide-above: read both arms' plan lines, witness blocks and the ps snapshot before crediting; a default arm below 9.4 means
   the base window was disturbed, not that the lever gained more
+# outcome 2026-11-14: one row, not a verdict. r1 THREADS=31: 7.74 tok/s (pp 43.20, load 248 s) with 572,775 major faults [cold],
+#  against the default arm's 9.59 at 12,705: the host's page cache had been displaced (the IQ1_S mix's and the loss runs' loads
+#  between the two sittings), so the row reads the host's page-ins, not the pool. r2 did not open: the Spark's tier_server refused
+#  the open with cuDevicePrimaryCtxRetain out of memory although MemAvailable was over 112 GB (the loop's wait): GB10's device
+#  memory comes back later than MemAvailable shows. Next, before another node run: tier_server waits for (or retries) the
+#  device context on open, and the node arm's window starts with the host set warm (the default arm re-read in the same hold).
