@@ -17,3 +17,10 @@ condition: BLOOMERY_MODEL=exaone-moe=/models/exaone/K-EXAONE-2.0-750B-A37B-IQ2XX
 decide-in: publish both rows in the re-cut's notes (plain and mtp) with these conditions; the default stays plain this release (a default flip is its own change with its gates)
 decide-below: under +12 %: read a from the width records first; a under 0.35 is the wiring or the weights (no default flip, the notes say opt-in and give the measured rate); a at 0.5 or more with the gain under +12 % puts the cost in c_d or the pass
 decide-above: over +38 %: read the witness blocks and both arms' plan lines (card_experts) before crediting
+# outcome 2026-11-14 on rel0314r 6fd668e0d3b2 (the re-cut sm86 tarball 367d5987…, its bloomery-serve sha 5877b7ff…), 3 rounds, A6000,
+#  ctx 8192, every row but one [cold]. tg off / mtp, paired by round: D=4096 9.83/13.66, 9.84/13.64, 9.78/13.67 = +39.0, +38.6, +39.8 %;
+#  D=512 9.89/11.13, 9.85/12.54, 9.67/10.47 = +12.5, +27.3, +8.3 %. Above the band at 4096 (decide-above): the plan lines give the mtp
+#  arm 2,268 card experts against off's 2,319 (the draft's reserve), so the plan is not the gain; a = 0.78..0.84 there, and
+#  (1 + a) / (c_v + c_d) at a 0.84 is +37.5 % [derived], the term the band's top missed by 1.3 points. At 512 a reads 0.91..0.96 and the gain
+#  scatters 8..27 %: the D=512 arm's cost term is open (a finding for the next round, not read here). pp: mtp 44..55 against off 46..59.
+#  Decision: both rows in the notes; the default stays plain this release.

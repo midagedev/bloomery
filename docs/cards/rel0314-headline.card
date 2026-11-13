@@ -16,3 +16,7 @@ decide-above: beyond 45.0: read the witness block and the plan line (the room, t
 #  sittings are not one condition and no gain over 0.3.13 is claimed. EXAONE a, A6000, ctx 262,144: tg 9.11 / 9.11 @512, 9.27 / 9.12
 #  @4096; pp 50.77 / 46.72 @512, 53.76 / 54.25 @4096; load 20-61 s; every row [cold] (majflt 6.9-147 k: the set does not stay in the
 #  page cache of a 251 GiB host). Checks green (the replay identical on EXAONE; split at token 5 of 13 inside the band on V4.1).
+# outcome 2 2026-11-14, the re-cut (rel0314r 6fd668e0d3b2, sm86 tarball 367d5987…, bloomery-serve sha 5877b7ff…): one sitting, checks green
+#  (6 PASS). V4.1 bp: tg 44.05 / 45.66 @512, 39.82 / 38.85 @4096; pp 168.69 [cold, majflt 75,841] / 227.80 @512, 428.43 / 427.61 @4096.
+#  EXAONE a, ctx 262,144: tg 9.13 / 9.06 @512, 9.10 / 9.25 @4096; pp 44.39 / 50.60 @512, 54.67 / 54.85 @4096. Round 2's 512 row is warm
+#  (majflt 50) and reads tg 9.06, the cold rows' rate: EXAONE's decode is bound by the host's DRAM reads, not by the page cache.
