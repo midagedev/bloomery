@@ -834,7 +834,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         bloomery_gpu_gates::start::plan_exit();
     }
     let trace = route_trace(&levers, &cfg, a.place, &path, &inputs)?;
-    let (card, placement, cache, residency) = print_plan(
+    let Printed {
+        card,
+        placement,
+        cache,
+        residency,
+        paged,
+    } = print_plan(
         &inputs,
         a.place,
         plan_args.0,
@@ -843,9 +849,24 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         residency,
         a.cache_ram,
     )?;
-    let cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?
+    let mut cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?
         .with_kv_default(&levers, kv_default)
         .with_kv_host_page(kv_page);
+    // A plan that pages routed experts to the NVMe tier cannot read an r8 sidecar (the tier
+    // fills its slots from the source's bytes): where `BLOOMERY_R8` is unset the host tier
+    // reads the source, by name, and a set `on` is the load's refusal of that pair.
+    let sidecar = if paged { sidecar_beside(&path)? } else { None };
+    let host = levers.host_for(sidecar.is_some());
+    if let Some(sidecar) = sidecar.filter(|_| levers.host().r8 && !host.r8) {
+        eprintln!(
+            "bloomery-serve-ds41: BLOOMERY_R8 is unset and the plan pages routed experts to the \
+             NVMe tier, which fills its slots from the source's bytes: the host tier reads the \
+             source, not the sidecar at {} (the `load host_tier r8=off` line below is this \
+             choice; BLOOMERY_R8=on refuses the pair)",
+            sidecar.display()
+        );
+    }
+    cfg.body.host = host;
     // The record's `headroom` is the room the budget came from: what
     // `MemAvailable` leaves past the plan's host need and the churn pool.
     Record::new(&record::CACHE_CONFIG)
@@ -1016,7 +1037,8 @@ fn route_trace(
 /// names, the plan's placement for `/props` (`None`, and a line saying why,
 /// when a card's nvidia-smi index cannot be found), the prompt cache's
 /// budget of the real host's room
-/// ([`CacheRam::of`]) and the residency word the load runs by. The `need`
+/// ([`CacheRam::of`]), the residency word the load runs by and whether the plan
+/// pages routed experts ([`Printed`]). The `need`
 /// record follows the prompt cache's budget it states. A plan the
 /// vision reserve or the side model's `embedding` reserve does not fit is the
 /// plan's own refusal with the reserves named before its terms.
@@ -1033,7 +1055,7 @@ fn print_plan(
     levers: &PlanLevers,
     pick: ResidencyPick,
     cache_ram: Option<u64>,
-) -> Result<(String, Option<PlacementProps>, CacheRam, ResidencyPick), GateError> {
+) -> Result<Printed, GateError> {
     let mut machine = place.machine(reserve, tier_batch)?(inputs.model.layers);
     let held = Beside {
         image: vision.and_then(|v| v.seat.reserve),
@@ -1078,7 +1100,34 @@ fn print_plan(
     need::print(&plan, pool_bytes, cache.ram, true)?;
     let placement = placement_of("bloomery-serve-ds41", &machine, &plan);
     let cards: Vec<&str> = machine.all_cards().map(|c| c.name.as_str()).collect();
-    Ok((cards.join("+"), placement, cache, pick))
+    Ok(Printed {
+        card: cards.join("+"),
+        placement,
+        cache,
+        residency: pick,
+        paged: plan.host.nvme_expert_bytes > 0,
+    })
+}
+
+/// What the load takes from [`print_plan`]'s plan.
+struct Printed {
+    /// The cards' names, joined.
+    card: String,
+    /// The plan's placement for `/props`.
+    placement: Option<PlacementProps>,
+    /// The prompt cache's budget.
+    cache: CacheRam,
+    /// The residency word the load runs by.
+    residency: ResidencyPick,
+    /// The plan pages routed experts to the NVMe expert tier.
+    paged: bool,
+}
+
+/// The r8 sidecar beside the model file, `None` when no file is there
+/// ([`model::r8file::sidecar_path`]).
+fn sidecar_beside(path: &Path) -> Result<Option<PathBuf>, GateError> {
+    let sidecar = model::r8file::sidecar_path(path)?;
+    Ok(sidecar.try_exists()?.then_some(sidecar))
 }
 
 const WHAT: &str = "bloomery-serve-ds41";
@@ -1281,7 +1330,10 @@ impl V41 {
             open: a.cfg.clone(),
             card_timing: false,
         };
-        let mut loaded = Loaded::<Body>::from_model(m, cfg, u32::try_from(a.ctx)?);
+        // The card-byte invariant's watch, as [`Loaded::open`] takes it after its load: the load's
+        // reading now, the first prompt call's and the first step's from the session.
+        let mut loaded =
+            Loaded::<Body>::from_model(m, cfg, u32::try_from(a.ctx)?).watched(log.card_watch()?)?;
         let spark = match a.draft_file.as_ref().zip(a.reserve) {
             Some((file, reserve)) => {
                 let (d, load) = open_dspark(&mut loaded, file, &a.path, WHAT, a.place, reserve)?;

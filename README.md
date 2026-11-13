@@ -361,8 +361,10 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
 - Flint's greedy text has no CPU or llama.cpp referee yet; the card path's gates and the serving checks hold it.
 - DeepSeek V4.1 runs routed experts on a card only as Q3_K gate·up with a Q4_K down; other expert types (ISTA-DASLab's
   IQ1_M, IQ2_XXS and IQ2_XS) run on the host tier.
-- DeepSeek V4.1 on one 24 GB card from a file with an r8 sidecar beside it is refused at the load by name (the NVMe
-  tier does not fill from the sidecar yet); `BLOOMERY_R8=off` reads the source file with the same bits.
+- DeepSeek V4.1 on one 24 GB card from a file with an r8 sidecar beside it, where the plan pages routed experts to the
+  NVMe tier: `bloomery-serve` reads the source file instead (the tier does not fill from the sidecar yet; it says so at
+  the start, same bits); the other front ends and a set `BLOOMERY_R8=on` are refused at the load by name
+  (`BLOOMERY_R8=off` reads the source file).
 - GLM-5.3 holds at most 262,144 positions a slot; a `--ctx-size` whose slot share is larger is refused at the start.
 - Kimi K3.1 Pro (our `IQ1_S` set, a Q4_K trunk) loads at `--place bp` only (two cards, the host and the NVMe expert
   tier). Past the lightning indexer's top-k (2,048 positions) the latent layers attend the rows the indexer picks,

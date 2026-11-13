@@ -917,7 +917,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               the row-lane tile, and the load's host set populates and locks those stacks' \
               pages in the sidecar instead of the source; no file there reads the source; a \
               file that does not match the source is its named `R8Error`, never a fall-back. \
-              `off` reads the source, the same-binary arm; both write the same bits. The load \
+              `off` reads the source, the same-binary arm; both write the same bits. Unset, a \
+              plan that pages routed experts to the NVMe tier reads the source where a sidecar \
+              is beside the file (the tier fills its slots from the source's bytes; the V4.1 \
+              server names it on stderr); set `on`, that pair is refused by name. The load \
               prints `load host_tier r8=on (<path>)`, `r8=off (BLOOMERY_R8=off)` or `r8=off \
               (no sidecar at <path>: just r8-sidecar)`.",
         site: Site::Parsed {
