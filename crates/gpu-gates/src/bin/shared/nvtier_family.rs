@@ -563,12 +563,13 @@ pub trait Family {
         Err("this family's run keeps no logits rows: its gate runs no rank clause".into())
     }
 
-    /// The clarity margin the rank walk's first two positions read, where a
-    /// family's two orders move the top-two gap most: a family whose head gap
-    /// shifts were measured states its own here, as its gates state their σ;
-    /// every other family keeps the e2e floor at every position. Read only
-    /// where [`Family::takes_rank`] holds.
-    fn head_margin(&self) -> f32 {
+    /// The clarity margin the rank walk reads at every position: its two
+    /// plans run other experts on the card and the host, which move the
+    /// top-two gap at every position, so a family whose gap shifts between two
+    /// placements were measured states its own here, as its gates state their
+    /// σ; every other family keeps the e2e floor. Read only where
+    /// [`Family::takes_rank`] holds.
+    fn rank_margin(&self) -> f32 {
         MARGIN_FLOOR
     }
 
@@ -1099,8 +1100,8 @@ fn rank_lists(name: &str, plan: &PlanFacts, rank: &ExpertRank) -> bool {
 /// run of the same arm. The child holds its plan's paged lists to the rank's
 /// coldest host ids ([`rank_lists`]) and leaves its run beside the rank
 /// file; the parent walks the child's positions against its own within the
-/// logits band — the first two positions at the family's head margin
-/// ([`Family::head_margin`]), the rest the e2e floor: the two plans keep
+/// logits band at the family's rank margin ([`Family::rank_margin`]) at
+/// every position: the two plans keep
 /// other experts on the host and the NVMe
 /// tier, so the rows sit within the band, not on bits.
 fn rank_clause<F: Family>(name: &str, f: &F, arm: Arm) -> Result<bool, GateError> {
@@ -1147,17 +1148,16 @@ fn rank_clause<F: Family>(name: &str, f: &F, arm: Arm) -> Result<bool, GateError
     // every one is judged on the context both arms share (it parted at the first argmax flip
     // before — 1 of the run's positions compared); the last prompt row records its argmax, the
     // seed the greedy steps run on, so a parted seed ends the walk before the greedy rows. The
-    // head positions (0–1) read the family's head margin, the rest the e2e floor.
-    let head = f.head_margin();
-    let walk = logits_band::walk_at_head(
+    // walk reads the family's rank margin at every position.
+    let margin = f.rank_margin();
+    let walk = logits_band::walk_at(
         &format!(
             "{name} rank: the paged arm through the file mapping under the rank (each layer's \
              coldest host ids on the NVMe tier) against the same arm without it (its id tail)"
         ),
         want.positions(),
         got.positions(),
-        head,
-        MARGIN_FLOOR,
+        margin,
     );
     Ok(walk.ok)
 }

@@ -271,12 +271,24 @@ pub const MARGIN_FLOOR: f32 = 0.5;
 /// orders move, the two-card gate's `CLEAR_MARGIN` method
 /// (`gate_deepseek41_twocard.rs`); the real tier alone reads it — the
 /// fixture tier keeps `MARGIN_FLOOR` at every position.
-// PIN(2026-11-12): equals MARGIN_FLOOR — not yet measured. The 48-expert
-// hosting round (plan reserve on the stage card) moved the V4.1 real-tier
-// head gaps; the box measures the shifts at positions 0–1 (the prefill
-// gate's per-position lines, the E2 calibration caps) and pins 2 × the
-// largest here.
-pub const HEAD_MARGIN_V41: f32 = MARGIN_FLOOR;
+// PIN(2026-11-13): 2 × 4.3649, the largest |gap shift| the prefill gate's
+// per-position lines read at positions 0–1 over the catcher cases P = 1, 13,
+// 64 and four card-expert caps (1042, 1066, 1080, 1089), rounded up to 8.8.
+pub const HEAD_MARGIN_V41: f32 = 8.8;
+
+/// The clarity margin a walk between two placements of the V4.1 file reads
+/// at every position (the rank clauses of the tier and NVMe-tier gates): the
+/// two plans run other experts on the card and on the host, whose sums fold
+/// the same exact integer block sums in other f32 orders, and the shift that
+/// moves the top-two gap is as large past the head as at it. Two times the
+/// largest gap shift, [`HEAD_MARGIN_V41`]'s method; the real tier alone
+/// reads it — the fixture tier keeps `MARGIN_FLOOR`.
+// PIN(2026-11-13): 2 × 4.8163, the largest |top-2 gap shift| over B10's 64
+// positions (4.3773 at position 9) and the NVMe-tier rank walk's 72 (4.8163
+// at position 36), rounded up to 9.7. FAIL-first: every layer's ranked host
+// sum zeroed is red (3 clear flips, max and rms over their pins); one layer's
+// is not (rms 1.03 → 1.17) — the rank stage's bits clause holds that one.
+pub const PLACE_MARGIN_V41: f32 = 9.7;
 
 /// Judge our greedy continuations against the reference, prompt by prompt.
 ///

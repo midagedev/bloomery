@@ -52,7 +52,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{Body, OpenCfg, PrefillMode};
     use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::prompts::{HEAD_MARGIN_V41, MARGIN_FLOOR};
+    use bloomery_gpu_gates::prompts::{MARGIN_FLOOR, PLACE_MARGIN_V41};
     use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, record, ref_model_path, tier};
     use bloomery_levers::{EXPERT_RANK, ResidencyAt, residency_unset};
     use gguf::Split;
@@ -79,9 +79,9 @@ mod gate {
         path: PathBuf,
         cfg: OpenCfg,
         machine: M,
-        /// The rank walk's head margin: the real tier's [`HEAD_MARGIN_V41`],
+        /// The rank walk's margin: the real tier's [`PLACE_MARGIN_V41`],
         /// the fixture tier's the e2e floor.
-        head: f32,
+        margin: f32,
     }
 
     impl<M: Fn(usize) -> Machine + Copy> Ds41<M> {
@@ -162,10 +162,10 @@ mod gate {
             true
         }
 
-        /// The rank walk's head margin, parsed once at `run` from the tier: the real tier's
-        /// [`HEAD_MARGIN_V41`], the fixture tier's the e2e floor.
-        fn head_margin(&self) -> f32 {
-            self.head
+        /// The rank walk's margin, parsed once at `run` from the tier: the real tier's
+        /// [`PLACE_MARGIN_V41`], the fixture tier's the e2e floor.
+        fn rank_margin(&self) -> f32 {
+            self.margin
         }
 
         fn rank_child(&self, cmd: &mut Command, rank: &Path) -> Result<(), GateError> {
@@ -314,8 +314,8 @@ mod gate {
         cfg.place = tier::plan_levers(&head, &levers, 0)?;
         drop(head);
         let machine = Place::A.machine(None, None)?;
-        let head = match tier::Tier::from_env()? {
-            tier::Tier::Real => HEAD_MARGIN_V41,
+        let margin = match tier::Tier::from_env()? {
+            tier::Tier::Real => PLACE_MARGIN_V41,
             tier::Tier::Fixture => MARGIN_FLOOR,
         };
         crate::nvtier_family::gate(
@@ -324,7 +324,7 @@ mod gate {
                 path,
                 cfg,
                 machine,
-                head,
+                margin,
             },
         )
     }
