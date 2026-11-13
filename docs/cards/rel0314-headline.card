@@ -1,0 +1,18 @@
+kind: baseline
+question: what are 0.3.14's headline decode and prompt rates at the serving defaults on the release tarball's bloomery-serve: V4.1-Flash Q3_K_M at --place bp (RTX A6000 + RTX 3090), and K-EXAONE-2.0-750B-A37B IQ2_XXS at --place a (RTX A6000 alone)
+term: decode tok/s of V4.1-Flash at D=512, the release tarball's bloomery-serve, --place bp, ctx unset
+unit: tok/s
+predict: 36.0..45.0
+condition: one hold, tools/release/sitting.sh through just release-sitting 0.3.14 --binary portable; cells target/release-dist/cells-0.3.14.tsv; tools/ref/depth-serve.sh arms D=512 and D=4096, 2 rounds, each round a fresh server with every lever unset and ctx unset
+reason: 0.3.13's sittings 6 and 7 on the same file and cards read 40.53..42.60 tok/s at D=512 (35.80..38.69 at D=4096, pp 107..126 at 512 and 338..359 at 4096) [measured]; since then the V4.1 two-card decode path with no lever set changed only by the plan's accounting (#1191 holds 53 fewer card experts on plan (a), 892 MB, under 2 % of the card set [derived: a share of the hit rate, not timed]) and the host-short context step (#1195, inert when the host is not short), so the band is 0.3.13's rows ±10 %. The EXAONE cell is read beside it with no band of its own: its only references are server timings outside a lease on a 0.3.14 pre-release tree (decode 10.4..11.0 at prompts of 24..32 ids, ctx 8192; prompt 42..48 at 64..1,077 ids, ctx 262144)
+decide-in: write the rows into the release notes' tables with these conditions
+decide-below: under 36.0: a lever or a plan drifted; read the plan line, the host's MemAvailable and the witness block before writing a number, compare with 0.3.13's bp rows
+decide-above: beyond 45.0: read the witness block and the plan line (the room, the place) before crediting
+# outcome 2026-11-14 on main 197f4d9221f6 (the sm86 tarball d963b336…, its bloomery-serve sha 56a00788…): one sitting, resumed once (the
+#  EXAONE cell had no prose ids: $BLOOMERY_DATA/exaone-moe/corpus-prose.ids made from tokenizer-qwen3moe/prose.txt with the patched
+#  llama-tokenize, 73,497 ids). V4.1 bp, ctx 1,048,576: tg 45.29 / 46.97 @512, 40.01 / 39.61 @4096; pp 220.27 / 227.71 @512,
+#  428.76 / 424.61 @4096; load 45-81 s; majflt 1-19. Above the band at 512 (decide-above): the plan line is 0.3.13's shape with 2,599
+#  card experts against 2,465, and 0.3.13's rows were all [cold] (majflt 27-87 k a request) where these are warm, so the two
+#  sittings are not one condition and no gain over 0.3.13 is claimed. EXAONE a, A6000, ctx 262,144: tg 9.11 / 9.11 @512, 9.27 / 9.12
+#  @4096; pp 50.77 / 46.72 @512, 53.76 / 54.25 @4096; load 20-61 s; every row [cold] (majflt 6.9-147 k: the set does not stay in the
+#  page cache of a 251 GiB host). Checks green (the replay identical on EXAONE; split at token 5 of 13 inside the band on V4.1).
