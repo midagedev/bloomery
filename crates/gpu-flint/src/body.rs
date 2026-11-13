@@ -579,7 +579,12 @@ impl<R: RouterEntry> Drop for FlintBody<R> {
     }
 }
 
-pub fn set_taps(m: &mut FlintModel, on: bool) -> Result<(), GpuError> {
+/// Arm or disarm the per-layer stream taps of a loaded body of either router
+/// instance, under eager steps (a capture then carries them).
+pub fn set_taps<R: RouterEntry>(m: &mut GpuModel<FlintBody<R>>, on: bool) -> Result<(), GpuError>
+where
+    FlintBody<R>: ChainBody,
+{
     m.set_mode(StepMode::Eager);
     let (gpu, _, body) = m.body_parts(WHAT)?;
     body.shell.set_taps(gpu, body.cfg.len(), on)

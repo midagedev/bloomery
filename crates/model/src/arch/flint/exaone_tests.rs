@@ -160,34 +160,48 @@ fn want_window(l: usize) -> Option<u32> {
     }
 }
 
-/// Every tensor of [`tensors`] with the gated blocks' sites (the dense lead's,
-/// the routed stacks' and the shared expert's) in Q8_0: the types the program's
-/// card leg runs, so a plan read admits the file.
-fn plan_typed() -> Vec<(String, Vec<u64>, Ty)> {
+/// Every tensor of [`tensors`] in a type the architecture's stem table allows
+/// (`gguf::arch::exaone_moe`): the routed stacks Q4_K, the embedding and the
+/// head, the trunk projections and the shared experts Q8_0, the rest F32 —
+/// the bootstrap mix, so the read's type check and a plan read both admit the
+/// file.
+fn table_typed() -> Vec<(String, Vec<u64>, Ty)> {
     tensors()
         .into_iter()
         .map(|(name, dims)| {
-            let gated = name.ends_with("ffn_gate_exps.weight")
-                || name.ends_with("ffn_up_exps.weight")
-                || name.ends_with("ffn_down_exps.weight")
-                || name.ends_with("ffn_gate.weight")
-                || name.ends_with("ffn_up.weight")
-                || name.ends_with("ffn_down.weight")
-                || name.ends_with("ffn_gate_shexp.weight")
-                || name.ends_with("ffn_up_shexp.weight")
-                || name.ends_with("ffn_down_shexp.weight");
-            (name, dims, if gated { Ty::Q8_0 } else { Ty::F32 })
+            let stem = name
+                .strip_prefix("blk.")
+                .and_then(|rest| rest.split_once('.'))
+                .map_or(name.as_str(), |(_, stem)| stem);
+            let ty = match stem {
+                "token_embd.weight" | "output.weight" => Ty::Q8_0,
+                s if s.ends_with("_exps.weight") => Ty::Q4K,
+                "attn_q.weight"
+                | "attn_k.weight"
+                | "attn_v.weight"
+                | "attn_output.weight"
+                | "ffn_gate.weight"
+                | "ffn_up.weight"
+                | "ffn_down.weight"
+                | "ffn_gate_shexp.weight"
+                | "ffn_up_shexp.weight"
+                | "ffn_down_shexp.weight"
+                | "nextn.eh_proj.weight" => Ty::Q8_0,
+                _ => Ty::F32,
+            };
+            (name, dims, ty)
         })
         .collect()
 }
 
-/// The read of a shaped `exaone-moe` header of `kv` and `ts`; the file is removed.
+/// The read of a shaped `exaone-moe` header of `kv` and `ts`, every tensor in
+/// a type its stem's table allows ([`table_typed_of`]); the file is removed.
 fn check(
     tag: &str,
     kv: &[(&str, V)],
     ts: &[(String, Vec<u64>)],
 ) -> Result<crate::arch::Read, PlacementError> {
-    check_arch(tag, "exaone-moe", kv, ts)
+    check_typed(tag, "exaone-moe", kv, &table_typed_of(ts))
 }
 
 /// [`check`] under another architecture string.
@@ -197,7 +211,17 @@ fn check_arch(
     kv: &[(&str, V)],
     ts: &[(String, Vec<u64>)],
 ) -> Result<crate::arch::Read, PlacementError> {
-    let path = header_shaped(
+    check_typed(tag, arch, kv, &table_typed_of(ts))
+}
+
+/// The read of a typed header of `kv` and `ts`; the file is removed.
+fn check_typed(
+    tag: &str,
+    arch: &str,
+    kv: &[(&str, V)],
+    ts: &[(String, Vec<u64>, Ty)],
+) -> Result<crate::arch::Read, PlacementError> {
+    let path = header_typed(
         &format!("exaone-{tag}"),
         arch,
         kv,
@@ -211,6 +235,21 @@ fn check_arch(
     let result = read(&split);
     std::fs::remove_file(path).unwrap();
     result
+}
+
+/// A shaped tensor list with every tensor in the type its stem's table allows
+/// ([`table_typed`] over the same stems).
+fn table_typed_of(ts: &[(String, Vec<u64>)]) -> Vec<(String, Vec<u64>, Ty)> {
+    let table = table_typed();
+    ts.iter()
+        .map(|(name, dims)| {
+            let ty = table
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .map_or(Ty::F32, |(_, _, ty)| *ty);
+            (name.clone(), dims.clone(), ty)
+        })
+        .collect()
 }
 
 /// The 79-block header reads to the config's description: full and windowed
@@ -437,7 +476,7 @@ fn the_composed_program_accepts_the_header_and_prints_its_plan_values() {
             ("tokenizer.ggml.pre", V::Str("exaone-moe")),
             ("tokenizer.chat_template", V::Str(TEMPLATE)),
         ],
-        &plan_typed(),
+        &table_typed(),
     );
     let split = gguf::Split::open(&path).unwrap();
     let inputs = place::PlanInputs::read(&split).expect("the composed program accepts the file");
@@ -537,12 +576,12 @@ fn the_composed_program_accepts_the_header_and_prints_its_plan_values() {
 /// body builds one rope table. Mutant: the disagreement check dropped.
 #[test]
 fn two_ropes_over_the_trunk_are_refused_by_name() {
-    let path = header_shaped(
+    let path = header_typed(
         "exaone-two-ropes",
         "exaone-moe",
         &keys(),
         &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
-        &tensors(),
+        &table_typed(),
     );
     let split = gguf::Split::open(&path).unwrap();
     let mut spec = read(&split).unwrap().spec;
@@ -568,12 +607,12 @@ fn two_ropes_over_the_trunk_are_refused_by_name() {
 /// Mutant: either check dropped.
 #[test]
 fn a_router_no_instance_serves_or_a_second_instance_is_refused() {
-    let path = header_shaped(
+    let path = header_typed(
         "exaone-router",
         "exaone-moe",
         &keys(),
         &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
-        &tensors(),
+        &table_typed(),
     );
     let split = gguf::Split::open(&path).unwrap();
     let mut spec = read(&split).unwrap().spec;
@@ -609,12 +648,12 @@ fn a_router_no_instance_serves_or_a_second_instance_is_refused() {
 /// disagreement check dropped (the trunk's one width read from layer 0).
 #[test]
 fn a_routed_width_another_layer_disagrees_on_is_refused() {
-    let path = header_shaped(
+    let path = header_typed(
         "exaone-widths",
         "exaone-moe",
         &keys(),
         &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
-        &tensors(),
+        &table_typed(),
     );
     let split = gguf::Split::open(&path).unwrap();
     let mut spec = read(&split).unwrap().spec;
@@ -650,7 +689,7 @@ fn a_head_width_the_program_does_not_run_is_refused_at_the_plan() {
         .find(|(k, _)| *k == "rope.dimension_count")
         .unwrap()
         .1 = V::U32(64);
-    let mut ts = plan_typed();
+    let mut ts = table_typed();
     for (name, dims, _) in &mut ts {
         if name.contains("attn_q.weight") {
             dims[1] = 64 * 64;
@@ -680,6 +719,39 @@ fn a_head_width_the_program_does_not_run_is_refused_at_the_plan() {
             );
         }
         other => panic!("the head-64 file is refused at the plan, got {other:?}"),
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+/// A tensor in a type the architecture's stem table does not allow its stem
+/// (`gguf::arch::exaone_moe`) is refused at the read, by name, with the types
+/// the stem takes: the writer's bootstrap mix once typed the MTP input
+/// projection Q4_K and nothing refused the file. Mutant: the type check's
+/// `continue` on a stem the table holds.
+#[test]
+fn a_tensor_of_a_type_the_stem_table_does_not_hold_is_refused() {
+    let mut ts = table_typed();
+    let eh = ts
+        .iter_mut()
+        .find(|(name, _, _)| name == "blk.78.nextn.eh_proj.weight")
+        .expect("the MTP input projection");
+    eh.2 = Ty::Q4K;
+    let path = header_typed(
+        "exaone-eh-proj-q4k",
+        "exaone-moe",
+        &keys(),
+        &[("tokenizer.ggml.pre", V::Str("exaone-moe"))],
+        &ts,
+    );
+    let split = gguf::Split::open(&path).unwrap();
+    match read(&split) {
+        Err(PlacementError::Tensor { name, detail }) => {
+            assert_eq!(name, "blk.78.nextn.eh_proj.weight", "{name}");
+            assert!(detail.contains("q4_K"), "{detail}");
+            assert!(detail.contains("q8_0 or bf16"), "{detail}");
+            assert!(detail.contains("1 such"), "{detail}");
+        }
+        other => panic!("the wrong type is refused, got {other:?}"),
     }
     std::fs::remove_file(path).unwrap();
 }
