@@ -4104,6 +4104,10 @@ fn tile_units(ty: GgmlType) -> Option<(u64, u64)> {
         GgmlType::IQ4_XS => Some((124, 134)),
         // The grid types decode a super-block's eight sub-blocks in a loop, so their fixed part is large.
         GgmlType::IQ2_XS => Some((624, 102)),
+        // IQ2_S has no hand kernel: its tile is the generic Q8_K tile (`qdot::generic::dot_q8k_tile_avx2`) over
+        // the type's vector decode, the eight sub-blocks' grid, sign and scale decoded once a run and each column's
+        // eight sub-blocks (a sign fold, `maddubs`, `madd`) against it.
+        GgmlType::IQ2_S => Some((656, 109)),
         // The IQ2_XXS wide kernel (`qdot::dot_row_cols_wide`): the block's pack, the signed and
         // offset values and the scales of its eight sub-blocks, then each column's eight sub-blocks
         // against it in groups of eight, its sum in a register.
@@ -7664,7 +7668,7 @@ mod tests {
     #[test]
     fn tile_units_has_a_row_for_exactly_the_types_qdot_tiles() {
         // The types of `qdot::tile_kind`.
-        const TILED: [GgmlType; 16] = [
+        const TILED: [GgmlType; 17] = [
             GgmlType::Q2_K,
             GgmlType::Q3_K,
             GgmlType::Q4_K,
@@ -7673,6 +7677,7 @@ mod tests {
             GgmlType::Q5_1,
             GgmlType::Q8_0,
             GgmlType::IQ2_XS,
+            GgmlType::IQ2_S,
             GgmlType::IQ2_XXS,
             GgmlType::IQ1_S,
             GgmlType::IQ1_M,

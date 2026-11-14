@@ -36,7 +36,9 @@ use std::marker::PhantomData;
 
 use gguf::quant::dequant_row;
 use gguf::{GgmlType, HostAct, QROWS};
-use qdot::generic::{Entry, HostDecode, Iq1m, Iq1s, Iq2s, Iq4Nl, Iq4Xs, Q2k, dot_avx2, dot_scalar};
+use qdot::generic::{
+    Entry, HostDecode, Iq1m, Iq1s, Iq2s, Iq4Nl, Iq4Xs, Q2k, dot_avx2, dot_q8k_tile_avx2, dot_scalar,
+};
 use qdot::{
     col_bytes, dot_row, dot_row_avx2, dot_row_cols, dot_row_scalar, has_tile, has_wide,
     k_granularity, quantize_col, quantize_col_scalar, supports,
@@ -363,18 +365,97 @@ fn generic_dot_is_the_hand_dot_bit_for_bit() {
     check_dot::<Plain<Iq1m>>(&Q8K_KS);
 }
 
+/// `dot_q8k_tile_avx2::<D, C>` for a column count known at run time.
+fn tile_of<D: HostDecode>(row: &[u8], cols: &[*const u8], nb: usize) -> Vec<f32> {
+    macro_rules! by_cols {
+        ($($c:literal),*) => {
+            match cols.len() {
+                $($c => {
+                    let a: [*const u8; $c] = cols.try_into().unwrap();
+                    // SAFETY: AVX2 and FMA asserted by the caller; the row holds `nb` blocks and
+                    // every column `nb` Q8_K blocks.
+                    unsafe { dot_q8k_tile_avx2::<D, $c>(row, &a, nb) }.to_vec()
+                })*
+                n => panic!("a tile of {n} columns"),
+            }
+        };
+    }
+    by_cols!(1, 2, 3, 4, 5, 6, 7, 8)
+}
+
+/// The generic column tile against the generic dot, bit for bit: for 1 to 8 columns at every
+/// starting column of the cyclic list, every row's tile value of a column is `dot_avx2` of it.
+fn check_tile<D: HostDecode>(ks: &[usize]) {
+    assert!(has_avx2_fma(), "the box has AVX2 and FMA");
+    let ty = D::TY;
+    let mut rng = Lcg(0x711e_5eed ^ D::BYTES as u64);
+    for &k in ks {
+        let nb = k / D::VALUES;
+        let rows = weight_rows(&mut rng, ty, nb);
+        let cols: Vec<Vec<u8>> = activations(&mut rng, k)
+            .iter()
+            .map(|x| {
+                let mut acol = vec![0u8; col_bytes(ty, k)];
+                quantize_col(ty, x, &mut acol);
+                acol
+            })
+            .collect();
+        let n = cols.len();
+        for (r, row) in rows.iter().enumerate() {
+            // SAFETY: AVX2 and FMA asserted above; the row and the column hold `nb` blocks.
+            let want: Vec<f32> = cols
+                .iter()
+                .map(|acol| unsafe { dot_avx2::<D>(row, acol, nb) })
+                .collect();
+            for c in 1..=8 {
+                for s in 0..n {
+                    let idx: Vec<usize> = (0..c).map(|i| (s + i) % n).collect();
+                    let ptrs: Vec<*const u8> = idx.iter().map(|&j| cols[j].as_ptr()).collect();
+                    let got = tile_of::<D>(row, &ptrs, nb);
+                    for (slot, (&j, &g)) in idx.iter().zip(&got).enumerate() {
+                        assert_eq!(
+                            g.to_bits(),
+                            want[j].to_bits(),
+                            "{ty:?} k = {k} row {r} c = {c} slot {slot} (column {j}): tile {g:e}, \
+                             kernel {:e}",
+                            want[j]
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn generic_tile_is_the_generic_dot_bit_for_bit() {
+    // Q2_K is the unsigned type with mins, IQ4_XS and IQ1_M signed ones without; the `Plain`
+    // forms take the default vector decodes.
+    check_tile::<Iq2s>(&Q8K_KS);
+    check_tile::<Q2k>(&Q8K_KS);
+    check_tile::<Iq4Xs>(&Q8K_KS);
+    check_tile::<Iq1s>(&Q8K_KS);
+    check_tile::<Iq1m>(&Q8K_KS);
+    check_tile::<Plain<Iq2s>>(&Q8K_KS);
+    check_tile::<Plain<Q2k>>(&Q8K_KS);
+}
+
 /// A type with no hand kernel reaches its generic kernels through every entry point and nothing
 /// else: its entry is the one the dispatch finds, the quantized column is the entry's, and
-/// `dot_row`, `dot_row_avx2`, `dot_row_scalar` and the column tile (which has no kernel of its
-/// own for it) write the kernels' bits, the AVX2 and the scalar mirror alike.
+/// `dot_row`, `dot_row_avx2`, `dot_row_scalar` and the column tile (the generic tile) write the
+/// kernels' bits, the AVX2 and the scalar mirror alike.
 fn check_dispatch<D: HostDecode>(ks: &[usize]) {
     assert!(has_avx2_fma(), "the box has AVX2 and FMA");
     let ty = D::TY;
     let entry = qdot::generic::entry(ty).expect("a listed type has an entry");
     assert!(supports(ty), "{ty:?}: no kernel");
+    // PIN(2026-11-14): IQ2_S gained a column tile, the generic one (`dot_q8k_tile_avx2`), so this
+    // clause now asserts a tile where it asserted none: its `tile` row below holds that tile to the
+    // kernel on the six columns, and `generic_tile_is_the_generic_dot_bit_for_bit` holds it at every
+    // column count. The wide kernel stays a hand kernel's.
     assert!(
-        !has_tile(ty) && !has_wide(ty),
-        "{ty:?}: a tile or wide kernel the generic form does not have"
+        has_tile(ty) && !has_wide(ty),
+        "{ty:?}: want the generic column tile and no wide kernel"
     );
     let mut rng = Lcg(0xd15_9a7c4 ^ D::BYTES as u64);
     for &k in ks {

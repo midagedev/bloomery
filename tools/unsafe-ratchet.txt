@@ -1218,7 +1218,11 @@ placement 0 0 0
 # (the gate-first clamped SwiGLU), the dispatch in swiglu_gclamp (1 block), v_swiglu_gclamp and its v_expf call
 # (1 block), swiglu_gclamp_avx2's full-vector and padded-tail bodies (two loads, the v_swiglu_gclamp call and the
 # store each: 8), each with its own SAFETY line.
-qdot 291 134 0
+# PIN(2026-11-14): qdot 291 -> 296 blocks, 134 -> 136 fns, new code, not old code relaxed: the generic Q8_K column tile
+# (`generic::dot_q8k_tile_avx2`: one target_feature fn with its block, and the IQ2_S dispatch arm in `tile`), IQ2_S's
+# vector scale decode (`scales_avx2`, one fn and block), and the two test clauses that hold the tile to the generic
+# dot (`tile_of`, `check_tile`), each with its SAFETY line.
+qdot 296 136 0
 quantize 0 0 0
 record 0 0 0
 refset 0 0 0

@@ -59,6 +59,12 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
             b[1] &= 0x7b;
         }
     }
+    // IQ2_S carries one f16 d as well (the block's first two bytes), masked as iq2s_rate.cpp does.
+    if ty == GgmlType::IQ2_S {
+        for b in w.as_chunks_mut::<82>().0 {
+            b[1] &= 0x7b;
+        }
+    }
     // NVFP4 rows carry a UE4M3 scale byte at the head of each 9-byte group: raw bytes give a
     // non-scale (bit 7 set, or 0x7F) in 129 groups of 256 on average, which makes the whole row
     // NaN. Every scale byte into 0x30..0x3f.
@@ -99,17 +105,20 @@ fn bench(ty: GgmlType, k: usize, row_bytes: usize, rows: usize) {
 /// `dot_row_cols` (through `dot_row_cols_wide` under `wide`, up to `WIDE_COLS` columns),
 /// single-threaded, as the host union walks a run of columns. Prints the
 /// weight bytes streamed per second and the time per (row, column) dot, the number
-/// `dot_row`'s line gives as bytes over time for one column. MXFP4, Q6_K and IQ1_S only, the
-/// types whose filler is written: MXFP4's E8M0 byte in its `bench` range, Q6_K's f16 `d` (bytes
-/// 208..210 of the 210 B block, after ql[128], qh[64] and the 16 i8 scales) at a fixed normal
-/// exponent (2^-5) with two random mantissa bits, since random bytes make it a NaN or an
-/// infinity in 2 blocks of 64 on average, and IQ1_S's f16 `d` (the block's first two bytes)
-/// with its exponent's top bit masked, as `bench` masks IQ3_S's. Any other type is refused by
-/// name.
+/// `dot_row`'s line gives as bytes over time for one column. MXFP4, Q6_K, IQ1_S and IQ2_S only,
+/// the types whose filler is written: MXFP4's E8M0 byte in its `bench` range, Q6_K's f16 `d`
+/// (bytes 208..210 of the 210 B block, after ql[128], qh[64] and the 16 i8 scales) at a fixed
+/// normal exponent (2^-5) with two random mantissa bits, since random bytes make it a NaN or an
+/// infinity in 2 blocks of 64 on average, and the f16 `d` of IQ1_S and IQ2_S (the block's first
+/// two bytes) with its exponent's top bit masked, as `bench` masks IQ3_S's. Any other type is
+/// refused by name.
 fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize, wide: bool) {
     assert!(
-        matches!(ty, GgmlType::MXFP4 | GgmlType::Q6_K | GgmlType::IQ1_S),
-        "bench_tile fills MXFP4, Q6_K and IQ1_S blocks only, got {ty:?}"
+        matches!(
+            ty,
+            GgmlType::MXFP4 | GgmlType::Q6_K | GgmlType::IQ1_S | GgmlType::IQ2_S
+        ),
+        "bench_tile fills MXFP4, Q6_K, IQ1_S and IQ2_S blocks only, got {ty:?}"
     );
     assert!(qdot::has_tile(ty), "{ty:?} has no tile kernel on this CPU");
     assert!(
@@ -140,6 +149,11 @@ fn bench_tile(ty: GgmlType, k: usize, row_bytes: usize, rows: usize, cols: usize
         }
         GgmlType::IQ1_S => {
             for b in w.as_chunks_mut::<50>().0 {
+                b[1] &= 0x7b;
+            }
+        }
+        GgmlType::IQ2_S => {
+            for b in w.as_chunks_mut::<82>().0 {
                 b[1] &= 0x7b;
             }
         }
@@ -281,6 +295,9 @@ const ROWS: &[(GgmlType, usize, usize)] = &[
     // per byte: Q2_K 16 x 84 B = 1344 B/row, IQ2_XS 16 x 74 B = 1184 B/row.
     (GgmlType::Q2_K, 4096, (4096 / 256) * 84),
     (GgmlType::IQ2_XS, 4096, (4096 / 256) * 74),
+    // V4.1 UD-IQ3_XXS ffn_gate/up_exps shape (IQ2_S in layers 5-14): k = 4096 (16 x 82 B = 1312 B/row),
+    // beside the IQ2_XS row at the same k. The generic kernel, the one-column twin of the tile rows below.
+    (GgmlType::IQ2_S, 4096, (4096 / 256) * 82),
     // V4-Flash and MiMo-V2.6-Flash ffn_down_exps shape: k = 2048 (64 x 17 B = 1088 B/row).
     (GgmlType::MXFP4, 2048, (2048 / 32) * 17),
     // MiMo-V2.6-Flash ffn_gate/up_exps shape: k = 4096 (128 x 17 B = 2176 B/row).
@@ -363,6 +380,11 @@ fn main() {
             (qdot::WIDE_COLS, true),
         ] {
             bench_tile(GgmlType::IQ1_S, k, row_bytes, rows, cols, wide);
+        }
+        // The IQ2_S column tile at C = 1 (the generic one-column dot), 4 and 8 at V4.1's gate/up
+        // shape (k = 4096), on one filler: the tile's ns per row-column read against C = 1's line.
+        for cols in [1, 4, qdot::TILE_COLS] {
+            bench_tile(GgmlType::IQ2_S, 4096, (4096 / 256) * 82, rows, cols, false);
         }
     }
 }

@@ -844,6 +844,7 @@ enum TileKind {
     Q51,
     Q80,
     Iq2Xs,
+    Iq2S,
     Iq2Xxs,
     Iq1s,
     Iq1m,
@@ -866,6 +867,7 @@ fn tile_kind(w: GgmlType) -> Option<TileKind> {
         GgmlType::Q5_1 => TileKind::Q51,
         GgmlType::Q8_0 => TileKind::Q80,
         GgmlType::IQ2_XS => TileKind::Iq2Xs,
+        GgmlType::IQ2_S => TileKind::Iq2S,
         GgmlType::IQ2_XXS => TileKind::Iq2Xxs,
         GgmlType::IQ1_S => TileKind::Iq1s,
         GgmlType::IQ1_M => TileKind::Iq1m,
@@ -880,7 +882,7 @@ fn tile_kind(w: GgmlType) -> Option<TileKind> {
 }
 
 /// Whether [`dot_row_cols`] runs a tile kernel for `w` on this machine
-/// (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_1, Q8_0, IQ2_XS, IQ2_XXS, IQ1_S, IQ1_M, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and MXFP4 with their ISA); otherwise it dots each column
+/// (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q5_1, Q8_0, IQ2_XS, IQ2_S, IQ2_XXS, IQ1_S, IQ1_M, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and MXFP4 with their ISA); otherwise it dots each column
 /// through [`dot_row`].
 #[must_use]
 pub fn has_tile(w: GgmlType) -> bool {
@@ -978,6 +980,11 @@ fn tile<const C: usize>(kind: TileKind, wrow: &[u8], acols: &[&[u8]], nb: usize,
         TileKind::Q2K => unsafe { dot_q2k_q8k_tile_avx2::<C>(wrow, &cols, nb) },
         // SAFETY: as the IQ3_XXS arm.
         TileKind::Iq2Xs => unsafe { dot_iq2xs_q8k_tile_avx2::<C>(wrow, &cols, nb) },
+        // SAFETY: tile_kind saw AVX2+FMA (the generic kernels' ISA); check_row sized the row
+        // for nb blocks and every column for nb Q8_K blocks.
+        TileKind::Iq2S => unsafe {
+            generic::dot_q8k_tile_avx2::<generic::Iq2s, C>(wrow, &cols, nb)
+        },
         // SAFETY: as the IQ3_XXS arm.
         TileKind::Iq2Xxs => unsafe { dot_iq2xxs_q8k_tile_avx2::<C>(wrow, &cols, nb) },
         // SAFETY: as the IQ3_XXS arm.
@@ -1089,8 +1096,12 @@ fn wide_col_ptrs(acols: &[&[u8]]) -> [*const u8; WIDE_COLS] {
 
 /// The IQ2_XXS wide kernel over validated inputs: `acols` holds
 /// `1..=WIDE_COLS` columns of at least the Q8_K bytes `nb` blocks need,
-/// `wrow` the row's `nb` blocks, `out` one value a column.
+/// `wrow` the row's `nb` blocks, `out` one value a column. Out of line, as
+/// [`wide_iq1s`] is: two wide kernels inlined into [`dot_row_cols_wide`]
+/// share one symbol, and `tools/ref/asm-census.py` reads each kernel's loops
+/// under its own.
 #[cfg(target_arch = "x86_64")]
+#[inline(never)]
 fn wide_iq2xxs(wrow: &[u8], acols: &[&[u8]], nb: usize, out: &mut [f32]) {
     let cols = wide_col_ptrs(acols);
     // SAFETY: has_wide saw AVX2+FMA+F16C; check_row sized the row for nb blocks
@@ -1107,8 +1118,10 @@ fn wide_iq2xxs(_: &[u8], _: &[&[u8]], _: usize, _: &mut [f32]) {
 
 /// The IQ1_S wide kernel over validated inputs, as [`wide_iq2xxs`]'s: `acols`
 /// holds `1..=WIDE_COLS` columns of at least the Q8_K bytes `nb` blocks need,
-/// `wrow` the row's `nb` blocks, `out` one value a column.
+/// `wrow` the row's `nb` blocks, `out` one value a column. Out of line for the
+/// reason [`wide_iq2xxs`] gives.
 #[cfg(target_arch = "x86_64")]
+#[inline(never)]
 fn wide_iq1s(wrow: &[u8], acols: &[&[u8]], nb: usize, out: &mut [f32]) {
     let cols = wide_col_ptrs(acols);
     // SAFETY: has_wide saw AVX2+FMA+F16C; check_row sized the row for nb blocks

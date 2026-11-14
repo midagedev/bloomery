@@ -45,3 +45,7 @@ IQ3_S     4096   iq3s_rate      0.90
 # floor, so the rule needs a 6-round sitting before either row is re-derived.
 Q2_K      4096   q2k_rate       0.65
 IQ2_XS    4096   iq2xs_rate     0.65
+# PIN(2026-11-14): provisional 0.50, set by the iq2stile round, not derived: no sitting has read this pair. The Rust side is the
+# generic IQ2_S kernel (generic::dot_avx2::<Iq2s>), not a straight port of ik's DequantizerIQ2S loop, so the ports' 0.65 is not
+# borrowed; 0.50 is red only on a kernel twice as slow as ik's. The first 6-round sitting re-derives it (`derive`).
+IQ2_S     4096   iq2s_rate      0.50

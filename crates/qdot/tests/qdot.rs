@@ -2339,6 +2339,49 @@ fn iq2xs_block(d: u16, codes: impl Fn(usize) -> u16, scales: [u8; 8]) -> Vec<u8>
     b
 }
 
+/// An IQ2_S block: f16 `d`, the 32 grid index bytes from `idx`, the 32 sign bytes from `sign`,
+/// the eight `qh` bytes (the two high index bits of each of a sub-block's four groups) from `qh`
+/// and the eight scale bytes (two 4-bit scales a byte).
+fn iq2s_block(
+    d: u16,
+    idx: impl Fn(usize) -> u8,
+    sign: impl Fn(usize) -> u8,
+    qh: impl Fn(usize) -> u8,
+    scales: impl Fn(usize) -> u8,
+) -> Vec<u8> {
+    let mut b = d.to_le_bytes().to_vec();
+    b.extend((0..32).map(idx));
+    b.extend((0..32).map(sign));
+    b.extend((0..8).map(qh));
+    b.extend((0..8).map(scales));
+    b
+}
+
+/// IQ2_S end blocks: every index bit set (grid entry 1023) with every sign and the top scales
+/// under either sign of `d`, the same with no signs, the smallest scales, every sign byte alone
+/// (the indices 0), every `qh` bit alone (the indices 768 + 0), the index bytes alone, a
+/// scrambled pattern, d = 0 and a subnormal d.
+const IQ2S_ENDS: [IqEnd; 10] = [
+    || iq2s_block(F16_ONE, |_| 0xFF, |_| 0xFF, |_| 0xFF, |_| 0xFF),
+    || iq2s_block(F16_NEG_ONE, |_| 0xFF, |_| 0xFF, |_| 0xFF, |_| 0xFF),
+    || iq2s_block(F16_ONE, |_| 0xFF, |_| 0, |_| 0xFF, |_| 0xFF),
+    || iq2s_block(F16_ONE, |_| 0xFF, |_| 0xFF, |_| 0xFF, |_| 0),
+    || iq2s_block(F16_ONE, |_| 0, |_| 0xFF, |_| 0, |_| 0xFF),
+    || iq2s_block(F16_ONE, |_| 0, |_| 0xFF, |_| 0xFF, |_| 0xFF),
+    || iq2s_block(F16_ONE, |_| 0xFF, |_| 0xFF, |_| 0, |_| 0xFF),
+    || {
+        iq2s_block(
+            F16_ONE,
+            |i| (i * 37 + 11) as u8,
+            |i| (i * 53 + 7) as u8,
+            |i| 0xA5u8.rotate_left(3 * i as u32),
+            |i| 0x5Au8.rotate_left(i as u32),
+        )
+    },
+    || iq2s_block(0, |_| 0xFF, |_| 0xFF, |_| 0xFF, |_| 0xFF),
+    || iq2s_block(F16_TINY, |i| i as u8, |_| 0xAA, |_| 0xF0, |_| 0xF0),
+];
+
 /// Q2_K end blocks: every scale and min 15 with every code 3 under either sign of `d` and
 /// `dmin`, the scales alone (mins 0), the mins alone (scales 0), every code 0, a scrambled
 /// pattern, `d` = `dmin` = 0, a subnormal `d` beside a unit `dmin`, and `dmin` against the sign
@@ -6096,6 +6139,16 @@ fn hw_q2k_tile_matches_dot_row() {
 #[ignore = "hw: needs the box (AVX2)"]
 fn hw_iq2xs_tile_matches_dot_row() {
     iq_tile_synthetic(GgmlType::IQ2_XS, 74, 256, &[4096, 768, 256], &IQ2XS_ENDS);
+}
+
+/// IQ2_S tile clause: random rows (every grid index, index bit, sign byte and scale nibble, `d`
+/// of either sign) and the ends of [`IQ2S_ENDS`] at k = 4096 (V4.1's gate/up), 768 and 256 —
+/// tile = `dot_row` per column, bit for bit. IQ2_S has no hand kernel, so `dot_row` is the
+/// generic one and this clause holds the tile to it.
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_iq2s_tile_matches_dot_row() {
+    iq_tile_synthetic(GgmlType::IQ2_S, 82, 256, &[4096, 768, 256], &IQ2S_ENDS);
 }
 
 /// IQ2_XXS tile clause: random rows and the ends of [`IQ2XXS_ENDS`] at k = 4096, 768 and

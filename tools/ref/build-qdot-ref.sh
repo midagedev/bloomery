@@ -150,7 +150,7 @@ GLM_Q2_Q2K_MODEL=${GLM_Q2_Q2K_MODEL:-/data/moved/models/GLM-5.3-Flash-UD-Q2_K_XL
 mkdir -p "$OUT" "$BLOOMERY_DATA/ref"
 
 DUMPERS="q4k_x4_ref q6k_x4_ref q5f0_ref q5f1_ref q5k_x4_ref iq3xxs_ref mxfp4_x4_ref q8f0_ref iq4nl_ref iq3s_ref q2k_ref iq2xs_ref"
-RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate q5k_x4_rate iq3xxs_rate mxfp4_x4_rate iq4nl_rate iq4xs_rate iq3s_rate q2k_rate iq2xs_rate"
+RATES="q4k_x4_rate q6k_x4_rate q5f0_rate q5f1_rate q5k_x4_rate iq3xxs_rate mxfp4_x4_rate iq4nl_rate iq4xs_rate iq3s_rate q2k_rate iq2xs_rate iq2s_rate"
 
 # NAME… selects dumpers; iq4xs_ref is one (below). No name: every dumper, every rate harness and mxfp4_ref.
 ONLY=("$@")

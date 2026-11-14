@@ -27,7 +27,8 @@
 //! A type joins by an `impl HostDecode` and one [`Entry::of`] line in [`ENTRIES`]; its row
 //! (`gguf::QROWS`) already carries the block size, bytes and activation form, which the entry is
 //! checked against at build time. A type with a hand kernel is never listed: the hand arms of
-//! the dispatch are matched first. The listed type is IQ2_S, with its vector decode; IQ1_S and
+//! the dispatch are matched first. The listed type is IQ2_S, with its vector decode and, for runs
+//! of columns, the tile [`dot_q8k_tile_avx2`] (each column bit for bit its [`dot_avx2`] value); IQ1_S and
 //! IQ1_M put the group delta into the code (`8·grid ± 1`, float factor `d / 8`), so they have no
 //! min term and read no column sums. Q2_K, IQ4_XS and IQ4_NL are the decoders the tests hold to
 //! their hand kernels. The decoders of IQ1_S ([`Iq1s`]) and IQ1_M ([`Iq1m`]) are unlisted —
@@ -431,6 +432,93 @@ unsafe fn dot_q8k_avx2<D: HostDecode>(wrow: &[u8], acol: &[u8], nb: usize) -> f3
     unsafe { hsum_float_8(accd) }
 }
 
+/// The Q8_K form's tile: one row's blocks against `C` Q8_K columns, each block decoded once for
+/// all of them. Per block the weight side is read once (`d`, `dmin`, each sub-block's codes and
+/// scales); each column keeps [`dot_q8k_avx2`]'s operations in its order (the min fold when the
+/// type has mins, the eight sub-blocks' `madd(scale, maddubs(|w|, sign(q8, w)))` summed in an
+/// i32 vector that is exact whatever the order, the codes' fma, and the closing `hsum_float_8`),
+/// so column `c` of the result is that kernel's value for it, bit for bit. Only the loop over
+/// columns moves inside the sub-block loop.
+///
+/// TWIN of [`dot_q8k_avx2`]: any edit to the float or integer steps of one is made in both.
+///
+/// # Safety
+/// AVX2 and FMA must be available; `wrow` must hold `nb` blocks of `D` and each `acols[c]` must
+/// point at `nb` Q8_K blocks.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2", enable = "fma")]
+pub unsafe fn dot_q8k_tile_avx2<D: HostDecode, const C: usize>(
+    wrow: &[u8],
+    acols: &[*const u8; C],
+    nb: usize,
+) -> [f32; C] {
+    const {
+        assert!(
+            takes::<D>() && matches!(D::ACT, HostAct::Q8K),
+            "{}",
+            FORM_RULE
+        )
+    };
+    const { assert!(C != 0 && C <= super::TILE_COLS) };
+    // SAFETY: AVX2 and FMA per contract. Column `c` holds `nb` Q8_K blocks, so block `i` of it
+    // (f32 `d` @0, 256 codes @8, 16 i16 sums @264) is inside it; `blk` is a whole block and `b`
+    // is below 8.
+    unsafe {
+        let mut accd = [_mm256_setzero_ps(); C];
+        for i in 0..nb {
+            let blk = &wrow[D::BYTES * i..D::BYTES * (i + 1)];
+            let (d, dmin) = D::head(blk);
+            let cols: [*const u8; C] = std::array::from_fn(|c| acols[c].add(Q8K_STRIDE * i));
+            let dy: [f32; C] = std::array::from_fn(|c| (cols[c] as *const f32).read_unaligned());
+            if D::MINS {
+                let mut mins = [0u8; 32];
+                for g in 0..16 {
+                    mins[2 * g..2 * g + 2].copy_from_slice(&(D::min(blk, g) as i16).to_le_bytes());
+                }
+                let mins = load256(&mins);
+                for c in 0..C {
+                    let bsums = _mm256_loadu_si256(cols[c].add(264).cast());
+                    accd[c] = _mm256_fmadd_ps(
+                        _mm256_set1_ps((-dmin) * dy[c]),
+                        _mm256_cvtepi32_ps(_mm256_madd_epi16(mins, bsums)),
+                        accd[c],
+                    );
+                }
+            }
+            let mut sumi = [_mm256_setzero_si256(); C];
+            for b in 0..8 {
+                let (codes, scales) = (D::codes_avx2(blk, b), D::scales_avx2(blk, b));
+                let abs = if D::UNSIGNED {
+                    codes
+                } else {
+                    _mm256_sign_epi8(codes, codes)
+                };
+                for c in 0..C {
+                    let q8 = _mm256_loadu_si256(cols[c].add(8 + 32 * b).cast());
+                    let y = if D::UNSIGNED {
+                        q8
+                    } else {
+                        _mm256_sign_epi8(q8, codes)
+                    };
+                    sumi[c] = _mm256_add_epi32(
+                        sumi[c],
+                        _mm256_madd_epi16(scales, _mm256_maddubs_epi16(abs, y)),
+                    );
+                }
+            }
+            for c in 0..C {
+                accd[c] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(d * dy[c]),
+                    _mm256_cvtepi32_ps(sumi[c]),
+                    accd[c],
+                );
+            }
+        }
+        std::array::from_fn(|c| hsum_float_8(accd[c]))
+    }
+}
+
 /// Scalar mirror of [`dot_q82x4_avx2`].
 fn dot_q82x4_scalar<D: HostDecode>(wrow: &[u8], acol: &[u8], nb: usize) -> f32 {
     let mut acc = [0.0f32; 8];
@@ -754,17 +842,47 @@ impl HostDecode for Iq2s {
     }
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
+    unsafe fn scales_avx2(blk: &[u8], sub: usize) -> __m256i {
+        // SAFETY: register-only; AVX2 per contract. Byte `74 + sub` holds the scale nibbles of
+        // groups `2·sub` (low) and `2·sub + 1` (high), which are the low and high 128-bit lanes.
+        unsafe {
+            let byte = _mm256_set1_epi16(i16::from(blk[74 + sub]));
+            let nibbles = _mm256_and_si256(
+                _mm256_blend_epi32::<0xF0>(byte, _mm256_srli_epi16::<4>(byte)),
+                _mm256_set1_epi16(0x0f),
+            );
+            _mm256_or_si256(_mm256_slli_epi16::<1>(nibbles), _mm256_set1_epi16(1))
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
     unsafe fn codes_avx2(blk: &[u8], sub: usize) -> __m256i {
         let at = 34 + 4 * sub;
         let signs = u32::from_le_bytes([blk[at], blk[at + 1], blk[at + 2], blk[at + 3]]);
-        // SAFETY: register-only; AVX2 per contract. Each index is ten bits, below the grid's 1024
-        // entries.
+        let at = 2 + 4 * sub;
+        let qs = u32::from_le_bytes([blk[at], blk[at + 1], blk[at + 2], blk[at + 3]]);
+        // SAFETY: register-only; AVX2 per contract; each grid index below is at most 1023 (see
+        // there).
         unsafe {
+            // The four indexes at once, [`Self::index`] on the four lanes: a group's qs byte, and
+            // bits `2l` and `2l + 1` of `qh[sub]` as bits 8 and 9.
+            let low = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(qs as i32));
+            let high = _mm_and_si128(
+                _mm_sllv_epi32(
+                    _mm_set1_epi32(i32::from(blk[66 + sub])),
+                    _mm_set_epi32(2, 4, 6, 8),
+                ),
+                _mm_set1_epi32(0x300),
+            );
+            let idx = _mm_or_si128(low, high);
+            // An index is a byte or'ed with bits 8 and 9, at most 1023, below the grid's 1024
+            // entries.
+            let grid = |i: usize| *IQ2S_GRID.get_unchecked(i) as i64;
             let q = _mm256_set_epi64x(
-                IQ2S_GRID[Self::index(blk, sub, 3)] as i64,
-                IQ2S_GRID[Self::index(blk, sub, 2)] as i64,
-                IQ2S_GRID[Self::index(blk, sub, 1)] as i64,
-                IQ2S_GRID[Self::index(blk, sub, 0)] as i64,
+                grid(_mm_extract_epi32::<3>(idx) as usize),
+                grid(_mm_extract_epi32::<2>(idx) as usize),
+                grid(_mm_extract_epi32::<1>(idx) as usize),
+                grid(_mm_cvtsi128_si32(idx) as usize),
             );
             signed_by_bits(q, signs)
         }
