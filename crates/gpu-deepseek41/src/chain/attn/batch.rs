@@ -9,12 +9,15 @@
 //! 1. before the chunks, once over the layer's block: HC_PRE on the piece's
 //!    branch, in groups of [`HC_MAX_TOKENS`] tokens in one grid
 //!    ([`HcKernels::enqueue_pre_groups`]);
-//! 2. per sub-block, before its chunks: the attention norm with its q8_1
-//!    form, the compressor's projections, the joined q_a·kv (·indexer
-//!    weights) projection and, in the block, q_a's norm, the query
-//!    projection and the tail rope — each gemv one launch over the
-//!    sub-block's chunks as column groups ([`ColGroups`], a chunk a group),
-//!    each copy token-major one launch;
+//! 2. per sub-block, before its chunks: the attention norm with the q8_1
+//!    form the step's launches of the layer read, the compressor's
+//!    projections, the joined q_a·kv (·indexer weights) projection and, in
+//!    the block, q_a's norm, the query projection and the tail rope — a
+//!    projection in joined Q3_K one launch over the sub-block's chunks as
+//!    column groups ([`ColGroups`], a chunk a group), any other format the
+//!    step's own m-column launcher a chunk ([`DenseKernels::enqueue_m`],
+//!    reading the f32 form of the normed rows), each copy token-major one
+//!    launch;
 //! 3. per chunk, in position order — the stages that carry state from a
 //!    position to the next: the compressor's pooled row and index key, the
 //!    latent row into the staging (before the block, into the ring), the
@@ -28,10 +31,11 @@
 //! Every launch writes, per token, what the decode step's launch writes at
 //! that token's position, and the prefill gate holds a prompt to its steps:
 //! a column group is the one-column launch on each of its columns, bit for
-//! bit (`cores::q3k_row_dot`'s contract), the norms and the quantizer are
-//! column-local, HC_PRE, the ropes and HC_POST token-local, and a chunk's
-//! staged attention and commit leave each of its tokens what its step
-//! leaves. The projections' tensors are resolved once a layer-batch
+//! bit (`cores::q3k_row_dot`'s contract; the m-column gemvs' columns are
+//! their one-column launches' by the same rule), the norms and the quantizer
+//! are column-local, HC_PRE, the ropes and HC_POST token-local, and a
+//! chunk's staged attention and commit leave each of its tokens what its
+//! step leaves. The projections' tensors are resolved once a layer-batch
 //! ([`LayerTensors`]).
 //!
 //! A sub-block is a chunk shorter than [`HC_MAX_TOKENS`] alone, or a run of
@@ -41,12 +45,13 @@
 
 use std::ops::Range;
 
+use bloomery_gpu::q8f32::Q8_0GemvHeadsMcolArgs;
 use bloomery_gpu::{ColGroups, FaultSink, Gpu, GpuError, Q8Act};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
 
 use super::*;
-use crate::dense::{Q3kHeadsGroupsArgs, RowsPart};
-use crate::hc::{HcFn, HcParams, HcPreArgs};
+use crate::dense::{Dense, Q3kHeadsGroupsArgs, RowsPart};
+use crate::hc::{HcFn, HcFnArgs};
 use crate::params::ImageLayout;
 use crate::span::{span, span_mut};
 
@@ -195,21 +200,32 @@ impl Entries<'_> {
 }
 
 /// A layer's tensors as the batch path reads them, resolved once a
-/// layer-batch. The path runs the joined Q3_K formats alone and refuses any
-/// other by name.
+/// layer-batch. Every projection runs the step's own launcher for its
+/// format ([`DenseKernels::enqueue_m`] and the block diagonal's), so the
+/// path reads the formats the step reads and refuses, by name, what the
+/// step refuses.
 struct LayerTensors<'w> {
-    hc: HcParams<'w>,
+    hc: HcFn<'w>,
     norm: &'w DeviceBuffer<f32>,
-    /// q_a, kv and, on an indexer layer, the indexer's weights, joined.
-    qkv: &'w DeviceTensor<u32>,
+    /// q_a, kv and, on an indexer layer, the indexer's weights: the joined
+    /// Q3_K row stream, or each in its own format.
+    qkv: Qkv<'w>,
+    /// q_a, kv and, on an indexer layer, the indexer's weights: rows.
+    qkv_rows: usize,
+    /// The indexer's weights projection when the q_a·kv join did not form
+    /// (the join carries it otherwise).
+    index_w: Option<Dense<'w>>,
     q_a_norm: &'w DeviceBuffer<f32>,
-    /// q_b — joined with the indexer's query on an indexer layer — and its
-    /// rows.
-    query: &'w DeviceTensor<u32>,
+    /// q_b — joined with the indexer's query on an indexer layer — or each
+    /// in its own format, and their rows.
+    query: Query<'w>,
+    q_rows: usize,
     kv_norm: &'w DeviceBuffer<f32>,
     sinks: &'w DeviceBuffer<f32>,
-    out_a: &'w DeviceTensor<u32>,
-    out_b: &'w DeviceTensor<u32>,
+    /// `attn_output_a`, in one of the step's block-diagonal formats (Q3_K,
+    /// Q8_0, Q5_K, MXFP8; [`sub_post`] launches it).
+    out_a: Dense<'w>,
+    out_b: Dense<'w>,
     source: Option<SourceTensors<'w>>,
 }
 
@@ -226,65 +242,53 @@ impl<'w> LayerTensors<'w> {
             name: name.to_string(),
             need,
         };
-        let qkv = match Qkv::of(w, lp, d)? {
-            Qkv::Joint(t) => t,
-            Qkv::Parts { q_a, kv } => {
-                // The file's tensor that kept the join from forming, not the join's own name.
-                let other = [(&n.q_a, q_a), (&n.kv, kv)]
-                    .into_iter()
-                    .find(|(_, d)| !matches!(d, Dense::Q3K(_)));
-                return Err(match other {
-                    Some((name, _)) => {
-                        refuse(name, "Q3_K, joined with its input's other projections")
-                    }
-                    None => refuse(&n.qkv, "the joined Q3_K rows"),
-                });
+        let qkv = Qkv::of(w, lp, d)?;
+        let query = Query::of(w, lp, d)?;
+        let index_w = match (&qkv, &lp.indexer) {
+            (Qkv::Parts { .. }, Some(ip)) => {
+                Some(Dense::of(w, &ip.proj, d.n_embd, indexer::HEADS)?)
             }
-        };
-        let query = match (Query::of(w, lp, d)?, &lp.indexer) {
-            (Query::Joint(t), _) => t,
-            (
-                Query::Parts {
-                    q_b: Dense::Q3K(t),
-                    index_q: None,
-                },
-                None,
-            ) => t,
-            _ => return Err(refuse(&n.q, "Q3_K, joined with the indexer's query")),
+            _ => None,
         };
         let groups = d.n_head * d.head_dim / d.group_k;
-        let Dense::Q3K(out_a) = Dense::of(w, &n.out_a, d.group_k, groups * d.o_lora_rank)? else {
-            return Err(refuse(&n.out_a, "Q3_K"));
+        let out_a @ (Dense::Q8_0 { .. } | Dense::Q3K(_) | Dense::Q5K(_) | Dense::Mxfp8(_)) =
+            Dense::of(w, &n.out_a, d.group_k, groups * d.o_lora_rank)?
+        else {
+            return Err(refuse(&n.out_a, "Q3_K, Q5_K, Q8_0 or MXFP8"));
         };
-        let Dense::Q3K(out_b) = Dense::of(w, &n.out_b, groups * d.o_lora_rank, d.n_embd)? else {
-            return Err(refuse(&n.out_b, "Q3_K"));
-        };
+        let out_b = Dense::of(w, &n.out_b, groups * d.o_lora_rank, d.n_embd)?;
         let source = match &lp.source {
             Some(sp) => {
                 let ratio = words.streams[sp.stream].geom.ratio;
-                let st = SourceTensors::of(w, sp, (d.n_embd, ratio), ratio > 1)?;
-                if !st.q3k_only() {
-                    return Err(refuse(&sp.kv, "Q3_K, with its gate and index key"));
-                }
-                Some(st)
+                Some(SourceTensors::of(w, sp, (d.n_embd, ratio), ratio > 1)?)
             }
             None => None,
         };
-        let hc = match HcFn::of(
+        let hc = HcFn::of(
             w,
             WHAT_BATCH,
             [&n.hc_fn, &n.hc_scale, &n.hc_base],
             (d.hc_eps, d.hc_iters),
-        )? {
-            HcFn::Q3K(hc) => hc,
-            HcFn::F32(_) => return Err(refuse(&n.hc_fn, "Q3_K")),
+        )?;
+        let index = if lp.indexer.is_some() {
+            indexer::HEADS
+        } else {
+            0
+        };
+        let index_q = if lp.indexer.is_some() {
+            indexer::HEADS * indexer::HEAD_DIM
+        } else {
+            0
         };
         Ok(LayerTensors {
             hc,
             norm: vector(w, &n.norm)?,
             qkv,
+            qkv_rows: d.q_lora_rank + d.head_dim + index,
+            index_w,
             q_a_norm: vector(w, &n.q_a_norm)?,
             query,
+            q_rows: d.n_head * d.head_dim + index_q,
             kv_norm: vector(w, &n.kv_norm)?,
             sinks: vector(w, &n.sinks)?,
             out_a,
@@ -336,10 +340,12 @@ pub struct AttnBatch {
     /// The attention output, token-major.
     y: DeviceBuffer<f32>,
     /// The heads' q8_1 form, a column per output group and token; wo_a
-    /// token-major; its q8_1 form; wo_b as laid out.
+    /// token-major; its q8_1 form; wo_a's per chunk count, the unjoined
+    /// wo_b's K-quant launches read; wo_b as laid out.
     heads: Q8Act,
     wo_a: DeviceBuffer<f32>,
     wo_a_act: Q8Act,
+    wo_a_acts: Vec<Q8Act>,
     raw_out: DeviceBuffer<f32>,
     /// The sub-layer's output, per token of the batch: HC_POST's input.
     out: DeviceBuffer<f32>,
@@ -395,6 +401,7 @@ impl AttnBatch {
             .iter()
             .chain(&self.q_a_acts)
             .chain([&self.heads, &self.wo_a_act])
+            .chain(&self.wo_a_acts)
             .map(|a| q8act_bytes(a.m(), 256 * a.n_sb()))
             .sum::<usize>();
         f32s + acts + self.hc_pre.device_bytes()
@@ -592,11 +599,11 @@ impl BatchCx<'_> {
 
     /// Rows of the joined projection of the normed input, and of q_a's norm.
     fn qkv_rows(&self) -> usize {
-        self.t.qkv.rows()
+        self.t.qkv_rows
     }
 
     fn q_rows(&self) -> usize {
-        self.t.query.rows()
+        self.t.q_rows
     }
 }
 
@@ -673,6 +680,11 @@ impl AttnChain {
             heads: act(stream, s * groups, d.group_k)?,
             wo_a: zeroed(12)?,
             wo_a_act: act(stream, s, groups * d.o_lora_rank)?,
+            wo_a_acts: counts
+                .iter()
+                .filter(|&&c| c <= HC_MAX_TOKENS)
+                .map(|&c| act(stream, c, groups * d.o_lora_rank))
+                .collect::<Result<_, _>>()?,
             raw_out: zeroed(13)?,
             out: zeroed(14)?,
             tables: zeroed(15)?,
@@ -808,9 +820,9 @@ impl AttnChain {
             let x = span(WHAT_BATCH, streams_in, t_full * s4, nb * s4)?;
             let mut mixes = span_mut(WHAT_BATCH, &mut b.mixes, t_full * HC_MIX, nb * HC_MIX)?;
             let mut hc = span_mut(WHAT_BATCH, &mut b.hc, t_full * HC_MIX, nb * HC_MIX)?;
-            ent.one(cx.k.hc.enqueue_pre_groups(
+            ent.one(cx.k.hc.enqueue_pre_fn_groups(
                 fork.stream(),
-                &HcPreArgs {
+                &HcFnArgs {
                     params: &t.hc,
                     x: &x,
                     tokens: nb,
@@ -874,11 +886,56 @@ impl AttnChain {
     }
 }
 
+/// One projection of `rows` rows (its K `k`) over a sub-block's input — its
+/// f32 rows `x`, a token a row — into the joined rows' grouped layout at
+/// [`RowsPart`] `part` of `y`: a chunk a launch, the step's own m-column
+/// gemv (`DenseKernels::enqueue_m`) over the chunk's `m` columns of `x` and
+/// its q8_1 form — quantized here from those f32 rows, the bytes the fused
+/// norm left in them, when the weight reads one — writing the chunk's block
+/// `y[total·o + r·m + c]`, exactly the rows the joined launch's column
+/// group holds.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the launch context, the weight, its input and forms, the sub-block and its output (rust-quality R8)"
+)]
+fn project_chunked(
+    cx: &BatchCx<'_>,
+    d: Dense<'_>,
+    k: usize,
+    x: &DeviceBuffer<f32>,
+    acts: &mut [Q8Act],
+    sb: &Range<usize>,
+    part: RowsPart,
+    y: &mut DeviceBuffer<f32>,
+    ent: &mut Entries<'_>,
+) -> Result<(), GpuError> {
+    let RowsPart {
+        total_rows,
+        r0,
+        rows,
+    } = part;
+    for c in sb.clone() {
+        let (o, m) = (cx.token(c) - cx.token(sb.start), cx.cuts[c].len());
+        let xc = span(WHAT_BATCH, x, o * k, m * k)?;
+        let mut act = None;
+        if d.reads_q8_1() {
+            let at = count_at(m, acts.len())?;
+            let a = &mut acts[at];
+            ent.one(cx.gpu.enqueue_quantize_q8_1_cols(&xc, a, m, cx.layer))?;
+            act = Some(&*a);
+        }
+        let mut yc = span_mut(WHAT_BATCH, y, total_rows * o + r0 * m, rows * m)?;
+        ent.one(cx.k.dense.enqueue_m(cx.gpu, d, &xc, act, m, &mut yc))?;
+    }
+    Ok(())
+}
+
 /// Sub-block `sb`'s launches before its chunks (module doc, step 2): the
-/// attention norm of `fold_in` and its q8_1 form, the compressor's
-/// projections, the joined projection with the latent part token-major, and
-/// in the block (`query`) q_a token-major, its norm, the query projection
-/// and the tail rope.
+/// attention norm of `fold_in` — with the q8_1 form the step's launches of
+/// the layer read — the compressor's projections, the joined projection with
+/// the latent part token-major, and in the block (`query`) q_a token-major,
+/// its norm, the query projection and the tail rope. A projection the file
+/// did not join runs [`project_chunked`].
 fn sub_pre(
     cx: &BatchCx<'_>,
     b: &mut AttnBatch,
@@ -893,16 +950,30 @@ fn sub_pre(
     let groups = cx.groups(sb)?;
     let at = count_at(n, b.normed_acts.len().min(b.q_a_acts.len()))?;
     let x = span(WHAT_BATCH, fold_in, ts * d.n_embd, n * d.n_embd)?;
-    ent.one(cx.k.fused.enqueue_norm_quant(
-        stream,
-        &x,
-        t.norm,
-        d.eps,
-        &mut b.normed_acts[at],
-        &mut b.normed,
-        cx.fault,
-    ))?;
-    let act = &b.normed_acts[at];
+    // The norm's launches are the step's for the layer: the fused norm with
+    // its q8_1 form where one of its projections reads one, the plain norm
+    // else (the two write the same f32 rows).
+    if t.source.is_some() || t.qkv.reads_q8_1() {
+        ent.one(cx.k.fused.enqueue_norm_quant(
+            stream,
+            &x,
+            t.norm,
+            d.eps,
+            &mut b.normed_acts[at],
+            &mut b.normed,
+            cx.fault,
+        ))?;
+    } else {
+        ent.one(gpu.elem().enqueue_rms_norm(
+            stream,
+            &x,
+            t.norm,
+            d.eps,
+            d.n_embd,
+            n,
+            &mut b.normed,
+        ))?;
+    }
     if let Some(st) = &t.source {
         let missing = GpuError::State {
             what: WHAT_BATCH,
@@ -915,35 +986,65 @@ fn sub_pre(
         // The gate's rows of a split pair go after a sub-block's kv rows.
         let gate_at = b.sub * width;
         let split_parts = &[(COMP_KV, 0, width, 0), (COMP_SCORE, gate_at, width, 0)];
-        let parts: &[(usize, usize, usize, usize)] = match st.proj {
+        let parts: &[(usize, usize, usize, usize)] = match &st.proj {
             SourceProj::Joint(j) => {
-                ent.one(gpu.enqueue_gemv_q3k_groups(j, act, groups, raw))?;
+                ent.one(gpu.enqueue_gemv_q3k_groups(j, &b.normed_acts[at], groups, raw))?;
                 &[
                     (COMP_KV, 0, 2 * width, 0),
                     (COMP_SCORE, 0, 2 * width, width),
                 ]
             }
-            SourceProj::Split {
-                kv: Dense::Q3K(kv),
-                gate: Dense::Q3K(gate),
-            } => {
-                let mut kv_rows = span_mut(WHAT_BATCH, raw, 0, n * width)?;
-                ent.one(gpu.enqueue_gemv_q3k_groups(kv, act, groups, &mut kv_rows))?;
-                drop(kv_rows);
-                let mut gate_rows = span_mut(WHAT_BATCH, raw, gate_at, n * width)?;
-                ent.one(gpu.enqueue_gemv_q3k_groups(gate, act, groups, &mut gate_rows))?;
+            SourceProj::Split { kv, gate } => {
+                project_chunked(
+                    cx,
+                    *kv,
+                    d.n_embd,
+                    &b.normed,
+                    &mut b.normed_acts,
+                    sb,
+                    RowsPart {
+                        total_rows: width,
+                        r0: 0,
+                        rows: width,
+                    },
+                    raw,
+                    ent,
+                )?;
+                let mut gate_rows = span_mut(WHAT_BATCH, raw, gate_at, b.sub * width)?;
+                project_chunked(
+                    cx,
+                    *gate,
+                    d.n_embd,
+                    &b.normed,
+                    &mut b.normed_acts,
+                    sb,
+                    RowsPart {
+                        total_rows: width,
+                        r0: 0,
+                        rows: width,
+                    },
+                    &mut gate_rows,
+                    ent,
+                )?;
                 split_parts
             }
-            SourceProj::Kv(Dense::Q3K(kv)) => {
-                ent.one(gpu.enqueue_gemv_q3k_groups(kv, act, groups, raw))?;
+            SourceProj::Kv(kv) => {
+                project_chunked(
+                    cx,
+                    *kv,
+                    d.n_embd,
+                    &b.normed,
+                    &mut b.normed_acts,
+                    sb,
+                    RowsPart {
+                        total_rows: width,
+                        r0: 0,
+                        rows: width,
+                    },
+                    raw,
+                    ent,
+                )?;
                 &[(COMP_KV, 0, width, 0)]
-            }
-            SourceProj::Split { .. } | SourceProj::Kv(_) => {
-                return Err(GpuError::Shape {
-                    what: WHAT_BATCH,
-                    detail: "a compressor projection that is not Q3_K reached the batch path"
-                        .to_string(),
-                });
             }
         };
         for &(part, off, total_rows, r0) in parts {
@@ -961,7 +1062,61 @@ fn sub_pre(
             ))?;
         }
     }
-    ent.one(gpu.enqueue_gemv_q3k_groups(t.qkv, act, groups, &mut b.raw_qkv))?;
+    match &t.qkv {
+        Qkv::Joint(w) => {
+            ent.one(gpu.enqueue_gemv_q3k_groups(w, &b.normed_acts[at], groups, &mut b.raw_qkv))?;
+        }
+        Qkv::Parts { q_a, kv } => {
+            let total_rows = t.qkv_rows;
+            project_chunked(
+                cx,
+                *q_a,
+                d.n_embd,
+                &b.normed,
+                &mut b.normed_acts,
+                sb,
+                RowsPart {
+                    total_rows,
+                    r0: 0,
+                    rows: d.q_lora_rank,
+                },
+                &mut b.raw_qkv,
+                ent,
+            )?;
+            project_chunked(
+                cx,
+                *kv,
+                d.n_embd,
+                &b.normed,
+                &mut b.normed_acts,
+                sb,
+                RowsPart {
+                    total_rows,
+                    r0: d.q_lora_rank,
+                    rows: d.head_dim,
+                },
+                &mut b.raw_qkv,
+                ent,
+            )?;
+            if let Some(w) = &t.index_w {
+                project_chunked(
+                    cx,
+                    *w,
+                    d.n_embd,
+                    &b.normed,
+                    &mut b.normed_acts,
+                    sb,
+                    RowsPart {
+                        total_rows,
+                        r0: d.q_lora_rank + d.head_dim,
+                        rows: indexer::HEADS,
+                    },
+                    &mut b.raw_qkv,
+                    ent,
+                )?;
+            }
+        }
+    }
     let total_rows = cx.qkv_rows();
     let latent = RowsPart {
         total_rows,
@@ -984,16 +1139,68 @@ fn sub_pre(
         cx.k.dense
             .enqueue_groups_to_tokens(stream, &b.raw_qkv, q_a, groups, &mut b.q_a),
     )?;
-    ent.one(cx.k.fused.enqueue_norm_quant(
-        stream,
-        &b.q_a,
-        t.q_a_norm,
-        d.eps,
-        &mut b.q_a_acts[at],
-        &mut b.q_a_normed,
-        cx.fault,
-    ))?;
-    ent.one(gpu.enqueue_gemv_q3k_groups(t.query, &b.q_a_acts[at], groups, &mut b.raw_q))?;
+    if t.query.reads_q8_1() {
+        ent.one(cx.k.fused.enqueue_norm_quant(
+            stream,
+            &b.q_a,
+            t.q_a_norm,
+            d.eps,
+            &mut b.q_a_acts[at],
+            &mut b.q_a_normed,
+            cx.fault,
+        ))?;
+    } else {
+        ent.one(gpu.elem().enqueue_rms_norm(
+            stream,
+            &b.q_a,
+            t.q_a_norm,
+            d.eps,
+            d.q_lora_rank,
+            n,
+            &mut b.q_a_normed,
+        ))?;
+    }
+    match &t.query {
+        Query::Joint(w) => {
+            ent.one(gpu.enqueue_gemv_q3k_groups(w, &b.q_a_acts[at], groups, &mut b.raw_q))?;
+        }
+        Query::Parts { q_b, index_q } => {
+            let total_rows = t.q_rows;
+            let q_rows = d.n_head * d.head_dim;
+            project_chunked(
+                cx,
+                *q_b,
+                d.q_lora_rank,
+                &b.q_a_normed,
+                &mut b.q_a_acts,
+                sb,
+                RowsPart {
+                    total_rows,
+                    r0: 0,
+                    rows: q_rows,
+                },
+                &mut b.raw_q,
+                ent,
+            )?;
+            if let Some(iq) = index_q {
+                project_chunked(
+                    cx,
+                    *iq,
+                    d.q_lora_rank,
+                    &b.q_a_normed,
+                    &mut b.q_a_acts,
+                    sb,
+                    RowsPart {
+                        total_rows,
+                        r0: q_rows,
+                        rows: indexer::HEADS * indexer::HEAD_DIM,
+                    },
+                    &mut b.raw_q,
+                    ent,
+                )?;
+            }
+        }
+    }
     let heads_part = RowsPart {
         total_rows: cx.q_rows(),
         r0: 0,
@@ -1313,9 +1520,11 @@ fn chunk_rows(
 }
 
 /// Sub-block `sb`'s launches after its chunks (module doc, step 4): the
-/// inverse rope of the attention output, the heads' q8_1 form, wo_a's block
-/// diagonal, its q8_1 form, wo_b, and wo_b's copy token-major into the
-/// layer's output at the sub-block's tokens.
+/// inverse rope of the attention output, wo_a's block diagonal in the
+/// format the step launches it (the joined Q3_K over the sub-block's
+/// chunks, the Q8_0 per-head gemv a chunk, Q5_K and MXFP8 a token), wo_b —
+/// the joined Q3_K over the sub-block, [`project_chunked`] else — and wo_b's
+/// copy token-major into the layer's output at the sub-block's tokens.
 fn sub_post(
     cx: &BatchCx<'_>,
     b: &mut AttnBatch,
@@ -1339,20 +1548,115 @@ fn sub_post(
     )?;
     drop(table);
     let groups = d.n_head * d.head_dim / d.group_k;
-    ent.one(gpu.enqueue_quantize_q8_1_cols(&b.y, &mut b.heads, n * groups, cx.layer))?;
-    ent.one(cx.k.dense.enqueue_q3k_heads_groups(
-        stream,
-        Q3kHeadsGroupsArgs {
-            w: t.out_a,
-            act: &b.heads,
-            groups,
-            rows_per_head: d.o_lora_rank,
-            tokens,
-            y: &mut b.wo_a,
-        },
-    ))?;
-    ent.one(gpu.enqueue_quantize_q8_1_cols(&b.wo_a, &mut b.wo_a_act, n, cx.layer))?;
-    ent.one(gpu.enqueue_gemv_q3k_groups(t.out_b, &b.wo_a_act, tokens, &mut b.raw_out))?;
+    let q_w = d.n_head * d.head_dim;
+    let span_rows = groups * d.o_lora_rank;
+    match t.out_a {
+        Dense::Q8_0 { qs, d: qd } => {
+            // A chunk a launch: the step's m-column per-head gemv over the
+            // chunk's tokens' rows of the attention output.
+            for c in sb.clone() {
+                let (o, m) = (cx.token(c) - cx.token(sb.start), cx.cuts[c].len());
+                let x = span(WHAT_BATCH, &b.y, o * q_w, m * q_w)?;
+                let mut y = span_mut(WHAT_BATCH, &mut b.wo_a, o * span_rows, m * span_rows)?;
+                ent.one(gpu.q8f32().enqueue_q8_0_gemv_heads_mcol(
+                    stream,
+                    Q8_0GemvHeadsMcolArgs {
+                        qs,
+                        d: qd,
+                        x: &x,
+                        rows_per_head: d.o_lora_rank,
+                        x_head_stride: d.group_k,
+                        y_head_stride: d.o_lora_rank,
+                        y_off: 0,
+                        m,
+                        x_col_stride: q_w,
+                        y_col_stride: span_rows,
+                        y: &mut y,
+                    },
+                ))?;
+            }
+        }
+        Dense::Q3K(wa) => {
+            ent.one(gpu.enqueue_quantize_q8_1_cols(&b.y, &mut b.heads, n * groups, cx.layer))?;
+            ent.one(cx.k.dense.enqueue_q3k_heads_groups(
+                stream,
+                Q3kHeadsGroupsArgs {
+                    w: wa,
+                    act: &b.heads,
+                    groups,
+                    rows_per_head: d.o_lora_rank,
+                    tokens,
+                    y: &mut b.wo_a,
+                },
+            ))?;
+        }
+        Dense::Q5K(wa) => {
+            // A token a launch: the step's single-input block diagonal.
+            for c in sb.clone() {
+                let (o, m) = (cx.token(c) - cx.token(sb.start), cx.cuts[c].len());
+                for t_i in 0..m {
+                    let x = span(WHAT_BATCH, &b.y, (o + t_i) * q_w, q_w)?;
+                    let mut y =
+                        span_mut(WHAT_BATCH, &mut b.wo_a, (o + t_i) * span_rows, span_rows)?;
+                    ent.one(cx.k.dense.enqueue_q5k_heads(
+                        stream,
+                        wa,
+                        &x,
+                        (d.o_lora_rank, d.group_k),
+                        &mut y,
+                    ))?;
+                }
+            }
+        }
+        Dense::Mxfp8(wa) => {
+            // A token a launch, as the step's.
+            for c in sb.clone() {
+                let (o, m) = (cx.token(c) - cx.token(sb.start), cx.cuts[c].len());
+                for t_i in 0..m {
+                    let x = span(WHAT_BATCH, &b.y, (o + t_i) * q_w, q_w)?;
+                    let mut y =
+                        span_mut(WHAT_BATCH, &mut b.wo_a, (o + t_i) * span_rows, span_rows)?;
+                    ent.one(gpu.q8f32().enqueue_mxfp8_gemv_heads(
+                        stream,
+                        wa,
+                        &x,
+                        (d.o_lora_rank, d.group_k),
+                        &mut y,
+                    ))?;
+                }
+            }
+        }
+        _ => {
+            return Err(GpuError::Tensor {
+                what: WHAT_BATCH,
+                name: cx.lp.names.out_a.clone(),
+                need: "Q3_K, Q5_K, Q8_0 or MXFP8",
+            });
+        }
+    }
+    match t.out_b {
+        Dense::Q3K(w) => {
+            ent.one(gpu.enqueue_quantize_q8_1_cols(&b.wo_a, &mut b.wo_a_act, n, cx.layer))?;
+            ent.one(gpu.enqueue_gemv_q3k_groups(w, &b.wo_a_act, tokens, &mut b.raw_out))?;
+        }
+        out_b => {
+            project_chunked(
+                cx,
+                out_b,
+                span_rows,
+                &b.wo_a,
+                &mut b.wo_a_acts,
+                sb,
+                RowsPart {
+                    total_rows: d.n_embd,
+                    r0: 0,
+                    rows: d.n_embd,
+                },
+                &mut b.raw_out,
+                ent,
+            )?;
+        }
+    }
     let mut out = span_mut(WHAT_BATCH, &mut b.out, ts * d.n_embd, n * d.n_embd)?;
     ent.one(cx.k.dense.enqueue_groups_to_tokens(
         stream,

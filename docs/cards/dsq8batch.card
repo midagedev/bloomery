@@ -1,0 +1,37 @@
+# Round dsq8batch: the V4.1 prompt batch reads every attention format the step reads (Q8_0, Q5_K,
+# Q6_K, BF16, F32 hc), so the Unsloth Dynamic V3.1 files prefill by batch instead of steps (UD-IQ3_XXS
+# ran 20.9 ids/s as steps on the A6000, dev loop). The lead times the sitting; this card derives the
+# band.
+#
+# Decomposition [derived; the plans below are the box's own --plan prints of 2026-11-14]:
+#   Attention bytes a layer (the header's tensors, UD-IQ3_XXS): q_a 6.64 + kv 2.66 + q_b 42.5 +
+#   out_a 34.0 + out_b 42.5 MiB Q8_0, hc_attn_fn 1.88 MiB F32 = 130.2 MiB (measured off
+#   day1114/unsloth-raw/hdr); the compressor and indexer BF16 tensors add ~21 MiB on the ~10 layers
+#   that own them. The batch's unjoined launches read a projection once a chunk (8 tokens): ~16.3
+#   MiB a token a layer, ~650 MiB a token over 40 layers = ~0.93 ms of card work at 700 GB/s.
+#   The host leg reads its experts once a 512-token unit: ~314 of 384 experts a layer at
+#   14.7 MiB (184,619,151,360 B host / 12,573, card_experts=2787, the UD plan at --place a
+#   ctx 8192) = ~360 MiB a token over 40 layers, at the host's stream rate the wall. The attention
+#   term sits under the host leg's shadow (its solo ceiling ~1,070 tok/s is above the host-bound
+#   rate), so the rate follows the host bytes alone.
+#   Scale vs the pinned Q3_K_M at the same place (its plan: card_experts=2615,
+#   host_experts=12745, host 214,711,234,560 B): pp(UD-IQ3_XXS) ~ pp(Q3_K_M) x 214.7 / 184.6
+#   = 1.16 x. The Q3_K_M A6000 place-a row is not in hand; the 3090 card+CPU README row (0.3.10)
+#   reads pp 300.46 @4096, and a host-bound sitting transfers across cards. => 300 x 1.1..1.3 =
+#   330..390 tok/s @ P = 4096.
+kind: baseline
+question: where does the V4.1 prompt batch prefill DeepSeek-V4.1-Flash-1017 UD-IQ3_XXS at place a?
+term: pp tok/s @ P = 4096, DeepSeek-V4.1-Flash-1017 UD-IQ3_XXS, --place a --ctx 8192, RTX A6000
+unit: tok/s
+predict: 330..390
+condition: one lease, the prefill runner at the DEFAULT levers (residency on, batch feed), prompt
+  4,096 ids; the plan print names card_experts and host bytes first (the 184.6 GB / 2,787 / 12,573
+  this card derives from are its inputs, re-read them at the sitting)
+decide-in: publish beside the Q3_K_M row; the Unsloth Dynamic V3.1 default move proceeds
+decide-below: read the prefill stats' card phases against the host union's: if the card's attention
+  phases show above the host's shadow, the per-chunk launch count (a projection a chunk, 8 tokens)
+  is the term and a groups launcher for the m-column gemvs is the next round
+decide-above: the A6000 plan holds enough extra experts over the 3090's that the 1.16 scale
+  understates; re-derive from the sitting's own plan print before publishing
+reason: the baseline for making Unsloth Dynamic V3.1 the DeepSeek default (user 2026-11-14); the
+  round derives, the lead times the sitting

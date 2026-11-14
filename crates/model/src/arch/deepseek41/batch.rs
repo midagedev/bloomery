@@ -236,7 +236,7 @@ impl AttnBatchLens {
         let comp_raw = if any_source { 2 * s * width } else { 0 };
         let comp = if any_source { (s + CHUNK) * width } else { 0 };
         let mix = hc_mix(hp);
-        let counts = SUB_COUNTS.iter().copied().filter(|&c| c <= s);
+        let counts: Vec<usize> = SUB_COUNTS.iter().copied().filter(|&c| c <= s).collect();
         AttnBatchLens {
             sub: s,
             f32s: [
@@ -258,8 +258,18 @@ impl AttnBatchLens {
                 sets * TABLES * tokens * hp.rope_dims,
             ],
             acts: counts
-                .flat_map(|c| [(c, hp.n_embd), (c, hp.q_lora_rank)])
+                .iter()
+                .flat_map(|&c| [(c, hp.n_embd), (c, hp.q_lora_rank)])
                 .chain([(s * groups, group_k), (s, groups * hp.o_lora_rank)])
+                // wo_a's form per chunk count, the unjoined wo_b's K-quant
+                // launches read (a chunk at most).
+                .chain(
+                    counts
+                        .iter()
+                        .copied()
+                        .filter(|&c| c <= CHUNK)
+                        .map(|c| (c, groups * hp.o_lora_rank)),
+                )
                 .collect(),
             hc_groups: tokens.div_ceil(CHUNK) + 1,
             hc_k: hp.hc.streams * hp.n_embd,
@@ -279,7 +289,13 @@ impl AttnBatchLens {
             self.hc_groups,
             self.hc_mix,
         );
-        let (normed, rest) = self.acts.split_at(self.acts.len() - 2);
+        // The acts' tail: the heads and wo_a's sub-block form, then wo_a's
+        // per chunk count.
+        let chunk_wo_a = SUB_COUNTS
+            .iter()
+            .filter(|&&c| c <= self.sub.min(CHUNK))
+            .count();
+        let (normed, tail) = self.acts.split_at(self.acts.len() - 2 - chunk_wo_a);
         p = p.word(f[0]).word(f[1]).word(f[2]);
         for &(c, k) in normed.iter().step_by(2) {
             p = q8act(p, c, k);
@@ -295,8 +311,11 @@ impl AttnBatchLens {
         if f[10] > 0 {
             p = p.word(f[10]);
         }
-        p = q8act(p.word(f[11]), rest[0].0, rest[0].1);
-        p = q8act(p.word(f[12]), rest[1].0, rest[1].1);
+        p = q8act(p.word(f[11]), tail[0].0, tail[0].1);
+        p = q8act(p.word(f[12]), tail[1].0, tail[1].1);
+        for &(c, k) in &tail[2..] {
+            p = q8act(p, c, k);
+        }
         p.word(f[13]).word(f[14]).word(f[15])
     }
 
@@ -720,8 +739,9 @@ mod tests {
     /// - attn batch: sub-blocks of 128; 909,312 f32 words (512·24 twice,
     ///   nine of 128·256, 128·512, 512·256, 3·4·512·64), the q8_1 forms at
     ///   the twelve counts (276 columns, twice) and two of 128 columns
-    ///   (2,088·(552 + 256)), HC_PRE over 65 groups (26,065 words):
-    ///   3,637,248 + 1,687,104 + 104,260 = 5,428,612.
+    ///   (2,088·(552 + 256)), wo_a's at the eight chunk counts (2,088·36),
+    ///   HC_PRE over 65 groups (26,065 words):
+    ///   3,637,248 + 1,687,104 + 75,168 + 104,260 = 5,503,780.
     #[test]
     fn each_part_is_its_hand_derived_bytes() {
         let hp = Hparams::tiny(4);
@@ -740,10 +760,10 @@ mod tests {
                 (FFN_PLACES, 4_096),
                 (SETS, 15_728_640),
                 (STAGING, 4_096),
-                (ATTN_BATCH, 5_428_612),
+                (ATTN_BATCH, 5_503_780),
             ]
         );
-        assert_eq!(parts.bytes(), 29_926_360);
+        assert_eq!(parts.bytes(), 30_001_528);
     }
 
     /// The fixture's prompt term, the plan's `prompt=` on a card of 2 MiB
@@ -751,7 +771,9 @@ mod tests {
     /// at the gates' 32,768 positions (`gate-gpu-ds41-residency-a`'s
     /// callstream) and at 4,096 (`engram-layout`'s and `dspark-loop`'s
     /// `--ctx 4096`). Only the indexer's scores follow the context:
-    /// 36·(ctx/2 + ctx) words over the token counts 1..=8 at ratios 2 and 1.
+    /// 36·(ctx/2 + ctx) words over the token counts 1..=8 at ratios 2 and 1;
+    /// the attention batch adds wo_a's q8_1 at the eight chunk counts
+    /// (25,856 B a column of 8,192: 930,816 B, within the same granules).
     #[test]
     fn the_fixture_shape_sums_to_its_prompt_term() {
         let hp = Hparams::v41_fixture_model();
@@ -763,7 +785,7 @@ mod tests {
         };
         assert_eq!(
             [at(32_768), at(4096)],
-            [(661_216_064, 675_282_944), (655_022_912, 668_991_488)]
+            [(662_146_880, 675_282_944), (655_953_728, 668_991_488)]
         );
     }
 

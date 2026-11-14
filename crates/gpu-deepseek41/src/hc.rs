@@ -1782,6 +1782,51 @@ impl HcKernels {
         })
     }
 
+    /// [`HcKernels::enqueue_pre_fn`] over any count of tokens: q3_K as
+    /// [`HcKernels::enqueue_pre_groups`]' token groups (a group what
+    /// [`HcKernels::enqueue_pre`] over its tokens writes), f32 its one
+    /// launch — a block a token, no value crossing blocks, so a token is
+    /// the one-token launch on it bit for bit at any count — and the
+    /// scratch unused. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_pre_fn_groups(
+        &self,
+        stream: &CudaStream,
+        a: &HcFnArgs<'_>,
+        lead: usize,
+        scratch: &mut HcPreScratch,
+        mixes: &mut DeviceBuffer<f32>,
+        hc: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        match a.params {
+            HcFn::Q3K(params) => self.enqueue_pre_groups(
+                stream,
+                &HcPreArgs {
+                    params,
+                    x: a.x,
+                    tokens: a.tokens,
+                    rms_eps: a.rms_eps,
+                    fault: a.fault,
+                },
+                lead,
+                scratch,
+                mixes,
+                hc,
+            ),
+            HcFn::F32(params) => self.f32.enqueue_pre(
+                stream,
+                &HcF32Args {
+                    params,
+                    x: a.x,
+                    tokens: a.tokens,
+                    rms_eps: a.rms_eps,
+                    fault: a.fault,
+                },
+                mixes,
+                hc,
+            ),
+        }
+    }
+
     /// [`HcKernels::enqueue_pre`] for the format the file holds the fn in:
     /// q3_K the split-K walk over `scratch`, f32 `ds41_hc_pre_f32` (a block a
     /// token, no scratch). Asynchronous, allocation-free, capturable.

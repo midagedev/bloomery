@@ -2179,18 +2179,6 @@ enum SourceProj<'w> {
 }
 
 impl<'w> SourceTensors<'w> {
-    /// Whether every projection is Q3_K (joined or not), the only formats
-    /// the prompt batch's launches read.
-    fn q3k_only(&self) -> bool {
-        let q3k = |d: &Dense<'_>| matches!(d, Dense::Q3K(_));
-        let proj = match &self.proj {
-            SourceProj::Joint(_) => true,
-            SourceProj::Kv(kv) => q3k(kv),
-            SourceProj::Split { kv, gate } => q3k(kv) && q3k(gate),
-        };
-        proj && self.keys.as_ref().is_none_or(|(k, _)| q3k(k))
-    }
-
     /// `sp`'s, at `ratio`: a gate and a ring go together (above ratio 1), a
     /// join is refused unless it is kv's and the gate's rows.
     fn of(

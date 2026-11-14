@@ -3132,10 +3132,12 @@ gate-gpu-ple:
 # cache, compressor state and history equal the steps in turn, eager and replayed, and after a rollback (t+1 refused)
 # one step of another token equals the steps. --skew-api: the engine's entry (step_pair, rollback), graph and eager,
 # then the deep cuts. One load.
-# --feed, alone after --slots, on a load at the default levers: a file whose batch-read tensors are all Q3_K is fed by the
-# prompt batch with no refusal; any other file is fed as steps, `Body::batch_refusal` names a tensor that decided it, and its
-# prompt call is the same ids stepped one by one (the last token and the snapshot). Under BLOOMERY_FIXTURE_VARIANT=istadense
-# (ISTA's dense types) every clause above reads that file's own oracle sets, `fx_istadense_...`.
+# --feed, alone after --slots, on a load at the default levers: a file whose batch-read tensors are all Q3_K, or in the other
+# formats the batch reads (BLOOMERY_FIXTURE_VARIANT=istadense: ISTA's dense types), is fed by the prompt batch with no refusal
+# and its prompt call answers the same last token the ids stepped one by one do (each side's top-1−top-2 margin printed: the
+# batch is held to the reference in bands, so a near-tie flip is the oracle's known one); a file with a tensor neither the
+# batch nor the step reads is fed as steps, `Body::batch_refusal` names a tensor that decided it. Under
+# BLOOMERY_FIXTURE_VARIANT=istadense every clause above reads that file's own oracle sets, `fx_istadense_...`.
 [group('v41-load')]
 gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-sets --skew-api':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --feed'

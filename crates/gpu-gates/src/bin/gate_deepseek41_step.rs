@@ -626,11 +626,13 @@ mod gate {
     }
 
     /// `--feed`: a load at the default levers feeds prompts as the file allows.
-    /// A file whose batch-read tensors are all Q3_K is fed by the batch with no
-    /// refusal. Any other loads, feeds steps and names the tensor that decided
-    /// it (`Body::batch_refusal`), and its prompt call is the same ids stepped
-    /// one by one: the same last token and the same snapshot. Then the K/V rooms' clauses
-    /// ([`feed_rooms`]).
+    /// A file whose batch-read tensors are all Q3_K, or in other formats the
+    /// batch reads (the ISTA dense types of `BLOOMERY_FIXTURE_VARIANT=istadense`),
+    /// is fed by the batch with no refusal, and its prompt call answers the
+    /// same last token the ids stepped one by one do ([`call_is_steps`]). A
+    /// file with a tensor neither the batch nor the step reads loads, feeds
+    /// steps and names the tensor that decided it (`Body::batch_refusal`).
+    /// Then the K/V rooms' clauses ([`feed_rooms`]).
     fn feed_run(
         path: &str,
         split: &Split,
@@ -660,6 +662,20 @@ mod gate {
             );
             return Ok(ok && feed_rooms(&mut m, hp)?);
         };
+        if mode == PrefillMode::Batch {
+            // The batch reads every format the step reads, so these files are
+            // batch-fed too and their call is held to the steps.
+            let no_refusal = why.is_none();
+            println!(
+                "feed: {} batch-read tensors are not Q3_K (first {first} {ty}); feed Batch, \
+                 refusal {why:?}, want none: {}",
+                offenders.len(),
+                verdict(no_refusal)
+            );
+            let same = call_is_steps(&mut m, &SLOT_PROMPTS[0])?;
+            let rooms = feed_rooms(&mut m, hp)?;
+            return Ok(no_refusal && same && rooms);
+        }
         let named = why
             .as_deref()
             .is_some_and(|w| offenders.iter().any(|(n, _)| w.contains(n.as_str())));
@@ -670,31 +686,60 @@ mod gate {
             offenders.len(),
             verdict(steps)
         );
-        let ids = &SLOT_PROMPTS[0];
+        let same = call_is_steps(&mut m, &SLOT_PROMPTS[0])?;
+        let rooms = feed_rooms(&mut m, hp)?;
+        Ok(steps && same && rooms)
+    }
+
+    /// `--feed`'s shared clause: the loaded feed's prompt call of `ids` and a
+    /// step answers the same last token the ids stepped one by one do. The
+    /// batch is held to the reference within the prefill oracle's bands, not
+    /// to the steps' bits (a prompt's caches differ by design: the chunk's
+    /// planned words and the half-groups it leaves are the batch's own), so
+    /// the token is the compared value and each side's top-1−top-2 margin is
+    /// printed beside it — a differing token on a clear margin is a red, on a
+    /// near-tie the oracle's known flip.
+    fn call_is_steps(m: &mut Deepseek41Model, ids: &[u32]) -> Result<bool, GateError> {
         let (call, last) = ids.split_at(ids.len() - 1);
         m.reset()?;
-        <Body as Prompt>::prompt(&mut m, call)?;
-        let called = (m.step(last)?, snap_hash(&mut m)?);
+        <Body as Prompt>::prompt(m, call)?;
+        let called = m.step(last)?;
+        let call_margin = top_margin(m)?;
         m.reset()?;
         let mut walked = 0;
         for id in ids {
             walked = m.step(std::slice::from_ref(id))?;
         }
-        let walked = (walked, snap_hash(&mut m)?);
+        let walk_margin = top_margin(m)?;
         let same = called == walked;
         println!(
             "feed: the prompt call of {} ids and a step is the {} ids stepped (last token {} / {}, \
-             snapshot {:016x} / {:016x}): {}",
+             top1-top2 margin {:.3} / {:.3}): {}",
             call.len(),
             ids.len(),
-            called.0,
-            walked.0,
-            called.1,
-            walked.1,
+            called,
+            walked,
+            call_margin,
+            walk_margin,
             verdict(same)
         );
-        let rooms = feed_rooms(&mut m, hp)?;
-        Ok(steps && same && rooms)
+        Ok(same)
+    }
+
+    /// The step's logits' top-1−top-2 margin, the prefill oracle's ruler of a
+    /// compared token.
+    fn top_margin(m: &mut Deepseek41Model) -> Result<f64, GateError> {
+        let v = m.logits()?;
+        let mut top = [0.0f64; 2];
+        for x in &v {
+            let x = f64::from(*x);
+            if x > top[0] {
+                top = [x, top[0]];
+            } else if x > top[1] {
+                top[1] = x;
+            }
+        }
+        Ok(top[0] - top[1])
     }
 
     /// Positions of the `room` and `reset` clauses' prompt: past one 2 MiB page of the widest
