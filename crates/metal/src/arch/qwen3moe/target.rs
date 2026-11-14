@@ -68,7 +68,7 @@ use runtime::seqstate::Kept;
 use runtime::{Out, Target, Verify, Want};
 
 use super::lanes::VERIFY_ROWS;
-use super::session::{MtpArena, PassOut, Session, SessionError, StateOut, StepMode};
+use super::session::{HiddenSrc, MtpArena, PassOut, Session, SessionError, StateOut, StepMode};
 use crate::kernels::{PASS_ROWS, SNAPS};
 
 const WHAT: &str = "qwen35moe target";
@@ -223,25 +223,30 @@ pub(super) fn prompt_call(
     };
     let batch_rows = Session::pass_rows(s);
     let mut at = from;
-    let mut last_pick = None;
+    let mut last_ran: Option<Ran> = None;
     for p in points {
         // The runs between two points, each cut into batches: a pass or
-        // its ids' steps, with the marks inside it.
+        // its ids' steps, with the marks inside it. A point at the start of
+        // the call (the position the session already stands at) has no run
+        // before it and keeps the row it was taken with, if any.
+        let mut ended: Option<HiddenSrc> = None;
         for batch in call_batches(at, p, &[p], batch_rows) {
             let inner: Vec<u32> = marks
                 .iter()
                 .copied()
                 .filter(|&u| batch.start < u && u < batch.end)
                 .collect();
-            last_pick = Some(call.run(s, batch.start, batch.end, &inner, unit.as_deref_mut())?);
+            let ran = call.run(s, batch.start, batch.end, &inner, unit.as_deref_mut())?;
+            ended = Some(ran.hidden);
+            last_ran = Some(ran);
             if batch.end != p && marks.contains(&batch.end) {
-                Session::checkpoint(s)?;
+                point(s, ended)?;
             }
         }
-        Session::checkpoint(s)?;
+        point(s, ended)?;
         at = p;
     }
-    let pick = last_pick.ok_or_else(|| {
+    let pick = last_ran.map(|ran| ran.pick).ok_or_else(|| {
         refuse(format!(
             "a prompt of {} ids at position {from} stepped no id",
             ids.len()
@@ -249,6 +254,30 @@ pub(super) fn prompt_call(
     })?;
     Ok(pick)
 }
+
+/// The checkpoint at the session's position, beside the target's final hidden
+/// row of the position before it where the run that ended there left one.
+fn point(s: &mut Session, hidden: Option<HiddenSrc>) -> Result<(), SessionError> {
+    match hidden {
+        Some(h) => Session::checkpoint_hidden(s, h),
+        None => Session::checkpoint(s),
+    }
+}
+
+/// What a run of a prompt call left: the pick of its last row, and where the
+/// final hidden row of its last position sits.
+#[derive(Clone, Copy)]
+struct Ran {
+    pick: u32,
+    hidden: HiddenSrc,
+}
+
+/// The step arena's one row: where the last step of a run left its position's
+/// final hidden row.
+const STEP_ROW: HiddenSrc = HiddenSrc {
+    arena: MtpArena::Step,
+    row: 0,
+};
 
 /// A prompt call's ids, the position of its first, the index of its last
 /// and whether the session steps every id.
@@ -264,7 +293,7 @@ impl Call<'_> {
     /// (ascending, inside the span): a pass taking a copy at each, or the
     /// steps of each run between two marks; past [`SNAPS`] marks the span is
     /// cut at the next one, whose point the first part's end is. Returns the
-    /// last pick.
+    /// last pick and where the last position's hidden row sits.
     fn run(
         &self,
         s: &mut Session,
@@ -272,30 +301,34 @@ impl Call<'_> {
         e: u32,
         marks: &[u32],
         mut unit: Option<&mut Unit<'_>>,
-    ) -> Result<u32, SessionError> {
+    ) -> Result<Ran, SessionError> {
         let i = |u: u32| (u - self.from) as usize;
         if self.steps || i(e) - i(a) <= PASS_ROWS {
             let mut from = a;
             for &u in marks {
                 step_batch(s, self.ids, i(from), i(u), self.last, unit.as_deref_mut())?;
-                Session::checkpoint(s)?;
+                Session::checkpoint_hidden(s, STEP_ROW)?;
                 from = u;
             }
-            return step_batch(s, self.ids, i(from), i(e), self.last, unit);
+            let pick = step_batch(s, self.ids, i(from), i(e), self.last, unit)?;
+            return Ok(Ran {
+                pick,
+                hidden: STEP_ROW,
+            });
         }
         if !marks.is_empty() && !s.copies_in_pass() {
             // No copy inside a pass: a pass to each mark, then its point.
             let mut from = a;
             for &u in marks {
-                self.run(s, from, u, &[], unit.as_deref_mut())?;
-                Session::checkpoint(s)?;
+                let ran = self.run(s, from, u, &[], unit.as_deref_mut())?;
+                point(s, Some(ran.hidden))?;
                 from = u;
             }
             return self.run(s, from, e, &[], unit);
         }
         if let Some(&cut) = marks.get(SNAPS) {
-            self.run(s, a, cut, &marks[..SNAPS], unit.as_deref_mut())?;
-            Session::checkpoint(s)?;
+            let ran = self.run(s, a, cut, &marks[..SNAPS], unit.as_deref_mut())?;
+            point(s, Some(ran.hidden))?;
             return self.run(s, cut, e, &marks[SNAPS + 1..], unit);
         }
         let after: Vec<u32> = marks.iter().map(|&u| u - a - 1).collect();
@@ -313,10 +346,24 @@ impl Call<'_> {
         if let Some(unit) = unit {
             unit(s, MtpArena::Rows, a, (e - a) as usize)?;
         }
+        // The pass's rows hold each position's final hidden row: row `r` is
+        // position `a + r`, so the point at `u` carries row `u - a - 1`.
         for &u in marks {
-            s.checkpoint_copy(u)?;
+            s.checkpoint_copy_hidden(
+                u,
+                HiddenSrc {
+                    arena: MtpArena::Rows,
+                    row: (u - a - 1) as usize,
+                },
+            )?;
         }
-        Ok(passed.id)
+        Ok(Ran {
+            pick: passed.id,
+            hidden: HiddenSrc {
+                arena: MtpArena::Rows,
+                row: (e - a - 1) as usize,
+            },
+        })
     }
 }
 

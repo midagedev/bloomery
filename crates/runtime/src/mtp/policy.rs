@@ -288,17 +288,23 @@ impl<A: Copy + Eq + fmt::Debug> Policy<A> {
     /// refresh an earlier step or window left waiting reads an arena the step
     /// may overwrite (its own), so it is walked now, its last row `last`. A
     /// draft that cannot walk it skips, the join naming why. A prompt call's
-    /// anchor is left for [`Policy::stepped`]. A server seat calls this
-    /// before each of its steps, and the runtime's width chooser — whose
-    /// held pass steps the target with no proposal of the draft's — before
-    /// each pass it holds back.
+    /// anchor is left for [`Policy::stepped`], unless the call fed by steps
+    /// left it in the step's own arena, which this step overwrites: it is
+    /// walked now as a waiting refresh is. A server seat calls this before
+    /// each of its steps, and the runtime's width chooser — whose held pass
+    /// steps the target with no proposal of the draft's — before each pass
+    /// it holds back.
     pub fn before_step<X: Exec<A>>(
         &mut self,
         x: &mut X,
         pos: u32,
         last: u32,
     ) -> Result<(), X::Err> {
-        if self.skip.is_some() || self.next.is_none() {
+        if self.skip.is_some() {
+            return Ok(());
+        }
+        let in_step_arena = matches!(self.last_unit, Some((walk, _)) if walk == self.shape.step);
+        if self.next.is_none() && !in_step_arena {
             return Ok(());
         }
         if let Err(why) = self.catch_up(x, pos, last)? {
@@ -1310,21 +1316,28 @@ mod tests {
     }
 
     /// A prompt fed by steps leaves its last row in the step's arena, which
-    /// the first step overwrites before anything walks it: the one refusal
-    /// left, by name, with the rows' position.
+    /// the first step overwrites: the step's `before_step` walks it first,
+    /// its last row the step's token, so the step after the call is drafted
+    /// as the step after a call in passes is.
+    ///
+    /// Mutant: a `before_step` that leaves the anchor for `stepped` (which
+    /// finds the arena overwritten and refuses by name).
     #[test]
-    fn a_prompt_fed_by_steps_is_refused_at_the_first_step() {
+    fn a_prompt_fed_by_steps_is_walked_before_the_first_step() {
         let mut rig = Rig::new(64);
         rig.prompt(&IDS, 1, Ar::Step).unwrap();
-        let why = rig.plain_step().unwrap_err();
-        assert!(
-            why.contains(
-                "a step after rows whose hidden rows the step's own arena held (a prompt fed by \
-                 steps): the step overwrote them (rows at position 9)"
-            ),
-            "{why}"
+        rig.c.take();
+        let at = rig.c.pos;
+        let token = rig.last;
+        rig.plain_step().unwrap();
+        assert_eq!(
+            rig.c.take(),
+            [seen(STORE, at, &[token], rows_of(Ar::Step, 0))]
         );
-        assert!(rig.p.next.is_none() && rig.p.last_unit.is_none());
+        assert_eq!(rig.c.store, at as usize + 1);
+        let r = rig.next();
+        assert_eq!((r.pos0, r.walk), (at + 1, Ar::Step));
+        assert!(rig.p.last_unit.is_none());
     }
 
     /// A draft that skips does nothing for any call, proposes nothing, and

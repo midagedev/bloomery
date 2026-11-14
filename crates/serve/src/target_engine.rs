@@ -27,9 +27,12 @@
 //! most. The window's draft proposes and the target verifies, so a kept id is
 //! the target's own argmax and a request's ids are the plain engine's. The
 //! draft joins a sequence only where it holds the rows below the position: a
-//! reset starts it over, a cut to a position it cannot rejoin and a step
-//! that reads the logits row turn it off until the next reset, every call
-//! then the target's own.
+//! reset starts it over, and a cut to a position the draft rejoins keeps it
+//! ([`DraftWindow::rejoins`]: the MTP draft where the checkpoint carries the
+//! target's hidden row, the lookup anywhere, its context following the
+//! target by positions). A cut to a position it cannot rejoin and a step
+//! that reads the logits row turn the MTP draft off until the next reset,
+//! every call then the target's own.
 //!
 //! What it refuses, by name: a target whose head rows are not the
 //! vocabulary's count, at construction, so a sampled row is never cut or
@@ -44,8 +47,8 @@ use crate::{Drafted, Engine, EngineError, EngineProps, Tokenizer};
 use runtime::mtp::{Host, MtpDraft, Parked, Refused};
 use runtime::prompt::CallEnd;
 use runtime::{
-    Advance, Choosing, Committed, Draft, Out, Plain, Speculative, Target, Want, WidthError, Widths,
-    Window,
+    Advance, Choosing, Committed, Draft, Lookup, Out, Plain, Speculative, Target, Verify, Want,
+    WidthError, Widths, Window,
 };
 
 /// The draft a [`TargetEngine`] runs beside its target: what the engine's
@@ -88,9 +91,19 @@ pub trait DraftWindow<T: Target> {
     /// The target was reset: the draft starts over and drafts again.
     fn reset(&mut self);
 
+    /// Before the target is cut to `n`, a position below the one it stands
+    /// at: whether the draft keeps drafting after the cut. Asked before the
+    /// cut moves the target, which a host may need to see as it stands.
+    fn rejoins(&self, t: &T, n: u32) -> bool;
+
+    /// The target was cut back to `at`, a position below the one it stood
+    /// at: the draft rejoins there when [`DraftWindow::rejoins`] held, and is
+    /// off until the next reset otherwise.
+    fn cut(&mut self, at: u32, rejoins: bool);
+
     /// The draft proposes nothing, and every call is the target's own, until
-    /// the next reset: the target moved where the draft holds no rows to
-    /// rejoin at, or a step read the logits row.
+    /// the next reset: a step read the logits row, or the target moved where
+    /// the draft holds no rows to rejoin at.
     fn skip(&mut self, why: &'static str);
 
     /// How the last prompt call joined the draft to the sequence, once.
@@ -122,6 +135,12 @@ impl<T: Target> DraftWindow<T> for Undrafted {
 
     fn reset(&mut self) {}
 
+    fn rejoins(&self, _t: &T, _n: u32) -> bool {
+        true
+    }
+
+    fn cut(&mut self, _at: u32, _rejoins: bool) {}
+
     fn skip(&mut self, _why: &'static str) {}
 
     fn joined(&mut self) -> Option<String> {
@@ -129,10 +148,10 @@ impl<T: Target> DraftWindow<T> for Undrafted {
     }
 }
 
-/// Why a cut leaves the MTP draft off: the draft's store holds the positions
-/// below the cut, and the target's hidden row before it is gone.
-const CUT_SKIP: &str =
-    "a cut to a position the draft cannot rejoin (it keeps no hidden row at a checkpoint)";
+/// Why a cut leaves the MTP draft off: the draft rejoins a cut only where its
+/// store holds the positions below it and the checkpoint there carries the
+/// target's hidden row of the position before it.
+const CUT_SKIP: &str = "a cut to a position the draft cannot rejoin (the checkpoint there carries no hidden row, or the draft's store stops short of it)";
 
 /// Why a step that reads the logits row leaves the MTP draft off.
 const ROW_SKIP: &str = "a step that reads the logits row (a request that samples or asks for probabilities) is not drafted";
@@ -184,6 +203,23 @@ where
         chooser.draft_mut().restart();
     }
 
+    /// The host kept the draft's side of the cut ([`Host::rejoins`]).
+    fn rejoins(&self, t: &H, n: u32) -> bool {
+        t.rejoins(n)
+    }
+
+    /// The next call walks the row the host left in the step arena with its
+    /// first id ([`MtpDraft::rejoin`]).
+    fn cut(&mut self, at: u32, rejoins: bool) {
+        if rejoins {
+            let chooser = self.draft_mut();
+            chooser.forget_pass();
+            chooser.draft_mut().rejoin(at);
+        } else {
+            self.skip(CUT_SKIP);
+        }
+    }
+
     fn skip(&mut self, why: &'static str) {
         let chooser = self.draft_mut();
         chooser.forget_pass();
@@ -205,6 +241,87 @@ where
                     j.start, j.caught_up
                 ),
             })
+    }
+}
+
+/// The lookup window of a [`Verify`] target behind the width chooser: the
+/// context's n-grams propose the one id a pass verifies, `M` rows at most
+/// (`Lookup::WIDTH + 1`). It needs no weights and no draft side, so no call
+/// ever turns it off: a context follows the target by the positions the
+/// calls stand at ([`Lookup::stand`]), and a cut back, a reset's fresh
+/// prompt and a step that reads the logits row (the id the request draws
+/// takes the argmax's place) need nothing told.
+impl<T, const M: usize> DraftWindow<T> for Speculative<Choosing<Lookup>, M>
+where
+    T: Verify,
+    T::Error: From<WidthError>,
+    Window<M>: Widths,
+{
+    const ROWS: usize = M;
+
+    /// The call's ids enter the context from the call's position, the
+    /// context first made what it holds below that position; the call's own
+    /// pick is dropped, the step that follows feeds the id the request holds.
+    fn prompt(&mut self, t: &mut T, ids: &[u32], marks: &[u32]) -> Result<(), T::Error> {
+        let pos = t.pos() as usize;
+        self.draft_mut().prompt_by(|lookup| {
+            t.prompt_marked(ids, marks, Want::Argmax)?;
+            if let Some((&first, rest)) = ids.split_first() {
+                lookup.stand(pos, first);
+                for &id in rest {
+                    lookup.push(id);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn before_step(&mut self, _t: &mut T, _last: u32) -> Result<(), T::Error> {
+        self.draft_mut().forget_pass();
+        Ok(())
+    }
+
+    /// The step ran `last` at the position before the target's: the context
+    /// stands there and takes `next`.
+    fn stepped(&mut self, t: &mut T, last: u32, next: u32) -> Result<(), T::Error> {
+        let lookup = self.draft_mut().draft_mut();
+        lookup.stand((t.pos() as usize).saturating_sub(1), last);
+        lookup.push(next);
+        Ok(())
+    }
+
+    /// The context stands at the target's position with `last`, then the
+    /// pass lands at its end, so the time between two of the server's calls
+    /// is no part of its wall.
+    fn pass(&mut self, t: &mut T, last: u32, out: &mut Vec<u32>) -> Result<Committed, T::Error> {
+        self.draft_mut().draft_mut().stand(t.pos() as usize, last);
+        let c = Advance::pass(self, t, last, out)?;
+        self.draft_mut().finish_pass(t.pos())?;
+        Ok(c)
+    }
+
+    fn reset(&mut self) {
+        let chooser = self.draft_mut();
+        chooser.forget_pass();
+        chooser.draft_mut().reset();
+    }
+
+    /// A context follows the target by position: a cut back is always
+    /// rejoined.
+    fn rejoins(&self, _t: &T, _n: u32) -> bool {
+        true
+    }
+
+    fn cut(&mut self, _at: u32, _rejoins: bool) {
+        self.draft_mut().forget_pass();
+    }
+
+    /// The lookup is never off: a request that reads the logits row is
+    /// drafted again from its next greedy call.
+    fn skip(&mut self, _why: &'static str) {}
+
+    fn joined(&mut self) -> Option<String> {
+        None
     }
 }
 
@@ -267,6 +384,16 @@ impl<T: Target, W: DraftWindow<T>> TargetEngine<T, W> {
             props,
             passes: Passes::default(),
         })
+    }
+
+    /// The target the engine serves.
+    pub fn target(&self) -> &T {
+        &self.target
+    }
+
+    /// The draft window beside the target.
+    pub fn window(&self) -> &W {
+        &self.window
     }
 
     /// The line a drafted request's passes leave, printed once as the next
@@ -412,11 +539,12 @@ impl<T: Target + Send, W: DraftWindow<T> + Send> Engine for TargetEngine<T, W> {
         let n = u32::try_from(n)
             .map_err(|_| EngineError(format!("{}: a cut to position {n}", self.what)))?;
         let from = self.target.pos();
+        let rejoins = self.window.rejoins(&self.target, n);
         self.target.cut(n).map_err(engine_error)?;
         // A cut to the position moves nothing, and a cut to 0 is the reset.
         match self.target.pos() {
             0 => self.window.reset(),
-            at if at != from => self.window.skip(CUT_SKIP),
+            at if at != from => self.window.cut(at, rejoins),
             _ => {}
         }
         Ok(())
@@ -454,7 +582,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{Engine, EngineProps, MockTokenizer, Tokenizer};
-    use runtime::{Committed, Out, Target, Want};
+    use runtime::width::{Chosen, Mode};
+    use runtime::{Committed, Lookup, Out, Speculative, Target, Verify, Want, WidthError};
 
     use super::{DraftWindow, TargetEngine};
 
@@ -519,6 +648,9 @@ mod tests {
     struct Log {
         calls: Vec<String>,
         commit: Committed,
+        /// Whether the window rejoins a cut, as a host that kept the draft's
+        /// side of it says; asked while the target stands above the cut.
+        rejoin: bool,
     }
 
     impl DraftWindow<Rows> for Log {
@@ -555,6 +687,14 @@ mod tests {
             self.calls.push("reset".to_owned());
         }
 
+        fn rejoins(&self, t: &Rows, n: u32) -> bool {
+            self.rejoin && t.pos > n
+        }
+
+        fn cut(&mut self, at: u32, rejoins: bool) {
+            self.calls.push(format!("cut {at} {rejoins}"));
+        }
+
         fn skip(&mut self, why: &'static str) {
             self.calls.push(format!("skip {}", &why[..5]));
         }
@@ -574,6 +714,7 @@ mod tests {
         let window = Log {
             calls: Vec::new(),
             commit,
+            rejoin: true,
         };
         TargetEngine::drafted(
             target,
@@ -658,20 +799,30 @@ mod tests {
     }
 
     /// A reset starts the draft over, a cut to the position moves nothing, a
-    /// cut to 0 is a reset and a cut to a position between leaves the draft
-    /// off.
+    /// cut to 0 is a reset, and a cut to a position between tells the window
+    /// where the target stands now and whether the draft rejoins there, asked
+    /// before the target moves.
     ///
-    /// Mutant: a cut that leaves the draft on, a cut to the position that
-    /// turns it off, or a cut to 0 that does not start it over.
+    /// Mutant: a cut to the position that reaches the window, a cut to 0 that
+    /// does not start it over, the window asked after the cut (the target
+    /// then stands at the cut, and the host's own state is gone), or the
+    /// answer dropped.
     #[test]
-    fn a_reset_restarts_the_draft_and_a_cut_leaves_it_off() {
+    fn a_reset_restarts_the_draft_and_a_cut_tells_whether_it_rejoins() {
         let mut e = drafted(committed(1, 1, false));
         e.prefill(&[1; 10]).expect("a prompt");
         e.window.calls.clear();
         e.cut(10).expect("a cut to the position");
         assert_eq!(e.window.calls, Vec::<String>::new());
         e.cut(4).expect("a cut inside");
-        assert_eq!(e.window.calls, ["skip a cut"]);
+        assert_eq!(e.window.calls, ["cut 4 true"]);
+        e.window.calls.clear();
+        e.window.rejoin = false;
+        e.prefill(&[1; 6]).expect("a prompt");
+        e.window.calls.clear();
+        e.cut(7)
+            .expect("a cut inside, where the draft cannot rejoin");
+        assert_eq!(e.window.calls, ["cut 7 false"]);
         e.window.calls.clear();
         e.cut(0).expect("a cut to 0");
         assert_eq!(e.window.calls, ["reset"]);
@@ -734,5 +885,168 @@ mod tests {
             .prefill_marked(&[1; 3], &[], &[usize::MAX])
             .expect_err("a mark past u32");
         assert!(refused.0.contains("marked at"), "{}", refused.0);
+    }
+
+    /// A target whose argmax after token `x` is `(x + 1) % 5`: the cycle a
+    /// lookup learns after one lap.
+    struct Cycle {
+        pos: u32,
+        row: Vec<f32>,
+        rows: usize,
+    }
+
+    #[derive(Debug)]
+    struct CycleError(String);
+
+    impl std::fmt::Display for CycleError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl std::error::Error for CycleError {}
+
+    impl From<WidthError> for CycleError {
+        fn from(e: WidthError) -> CycleError {
+            CycleError(e.to_string())
+        }
+    }
+
+    fn after(x: u32) -> u32 {
+        (x + 1) % 5
+    }
+
+    impl Target for Cycle {
+        type Error = CycleError;
+
+        fn pos(&self) -> u32 {
+            self.pos
+        }
+
+        fn ctx(&self) -> u32 {
+            64
+        }
+
+        fn prompt(&mut self, ids: &[u32], _want: Want) -> Result<Out<'_>, CycleError> {
+            self.pos += ids.len() as u32;
+            Ok(Out::Argmax(after(ids[ids.len() - 1])))
+        }
+
+        fn step(&mut self, id: u32, want: Want) -> Result<Out<'_>, CycleError> {
+            self.pos += 1;
+            Ok(match want {
+                Want::Argmax => Out::Argmax(after(id)),
+                Want::Logits => Out::Logits {
+                    argmax: after(id),
+                    row: &self.row,
+                },
+            })
+        }
+
+        fn keepable(&self, n: u32) -> u32 {
+            n.min(self.pos)
+        }
+
+        fn cut(&mut self, n: u32) -> Result<(), CycleError> {
+            self.pos = n;
+            Ok(())
+        }
+
+        fn reset(&mut self) -> Result<(), CycleError> {
+            self.pos = 0;
+            Ok(())
+        }
+    }
+
+    impl Verify for Cycle {
+        const MAX_ROWS: usize = 4;
+
+        fn verify<const M: usize>(&mut self, rows: [u32; M]) -> Result<[u32; M], CycleError> {
+            self.pos += M as u32;
+            self.rows = M;
+            Ok(rows.map(after))
+        }
+
+        fn commit(&mut self, accepted: usize) -> Result<(), CycleError> {
+            self.pos -= (self.rows - accepted) as u32;
+            Ok(())
+        }
+    }
+
+    /// The lookup window's context follows the target by position through a
+    /// prompt call, a greedy step, a kept pass, a cut back, a step that reads
+    /// the logits row (the id the request draws takes the argmax's place) and
+    /// a reset, and the draft is never turned off: a request cut to a point
+    /// proposes as the fresh one did, and a greedy pass after a sampled
+    /// request still proposes.
+    ///
+    /// Mutant: a context that is not stood at the call's position (a prompt
+    /// after a cut keeps the cut's tail), a cut or a row step that empties it,
+    /// the argmax kept where the request drew another id, a skip that turns
+    /// the draft off, or a reset that keeps it.
+    #[test]
+    fn a_lookup_window_follows_the_target_and_is_never_off() {
+        let n = MockTokenizer.n_vocab();
+        let window = Speculative::<_, 2>::new(
+            Chosen::<Cycle>::choosing(Lookup::new(), Mode::Fixed).expect("the lookup's rule"),
+        );
+        let target = Cycle {
+            pos: 0,
+            row: vec![0.0; n],
+            rows: 0,
+        };
+        let mut e = TargetEngine::drafted(
+            target,
+            window,
+            n,
+            Arc::new(MockTokenizer),
+            "cycle".to_owned(),
+            EngineProps::default(),
+        )
+        .expect("a head of the vocabulary's rows");
+        let context = |e: &TargetEngine<Cycle, Speculative<runtime::Choosing<Lookup>, 2>>| {
+            e.window.draft().draft().context().to_vec()
+        };
+        let history = [0, 1, 2, 3, 4, 0, 1, 2];
+        let mut out = Vec::new();
+
+        // The server's request: the prompt less its last id, then that id as a step.
+        e.prefill(&history).expect("a prompt call");
+        assert_eq!(context(&e), history);
+        assert_eq!(e.next(3, None).expect("the last id's step"), 4);
+        let d = e.advance(4, &mut out).expect("a pass");
+        assert_eq!(
+            (d.proposed, d.accepted, out.as_slice()),
+            (1, 1, &[0, 1][..])
+        );
+        assert_eq!(context(&e), [0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1]);
+
+        // A cut back to a point, the call after it from there: the context is the history.
+        e.cut(4).expect("a cut to a point");
+        e.prefill(&history[4..]).expect("the call after the cut");
+        assert_eq!(context(&e), history);
+        assert_eq!(e.next(3, None).expect("the last id's step"), 4);
+        out.clear();
+        let d = e.advance(4, &mut out).expect("a pass after the cut");
+        assert_eq!(
+            (d.proposed, d.accepted, out.as_slice()),
+            (1, 1, &[0, 1][..]),
+            "a request cut to a point drafts as the fresh one did"
+        );
+
+        // A request that reads the logits row, then draws another id than the argmax.
+        e.cut(8).expect("a cut to the point");
+        let mut row = vec![0.0; n];
+        assert_eq!(e.next(3, Some(&mut row)).expect("a step with a row"), 4);
+        assert_eq!(context(&e), [0, 1, 2, 3, 4, 0, 1, 2, 3, 4]);
+        assert_eq!(e.next(2, None).expect("the drawn id's step"), 3);
+        assert_eq!(context(&e), [0, 1, 2, 3, 4, 0, 1, 2, 3, 2, 3]);
+        out.clear();
+        let d = e.advance(3, &mut out).expect("a pass after a sampled step");
+        assert_eq!(d.proposed, 1, "the lookup is not turned off by a row step");
+
+        // A reset empties the context.
+        e.reset().expect("a reset");
+        assert_eq!(context(&e), Vec::<u32>::new());
     }
 }

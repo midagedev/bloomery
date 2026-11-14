@@ -200,6 +200,17 @@ pub trait Host: Verify {
         self.prompt_with(&ids[at..], path, end, head, sink)
     }
 
+    /// Whether a cut of the target back to `pos`, a position below the one it
+    /// stands at, keeps the draft: the draft's store holds every position
+    /// below `pos` ([`Host::held`]) and the cut leaves the target's final
+    /// hidden row at `pos - 1` in the step arena ([`Host::STEP_ARENA`]), the
+    /// state [`super::MtpDraft::rejoin`] takes. Asked before the cut moves the
+    /// target. The default keeps no hidden row at a cut: false, and the draft
+    /// is off until the target's next reset.
+    fn rejoins(&self, _pos: u32) -> bool {
+        false
+    }
+
     /// Copy a shared prompt arena's final hidden row `first`, at position
     /// `pos - 1`, to the step arena's row 0, including its record.
     ///

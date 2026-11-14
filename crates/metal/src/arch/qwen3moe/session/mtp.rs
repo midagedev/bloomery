@@ -77,6 +77,15 @@ mod host;
 pub use host::MtpArena;
 use host::{Held, STORE_ROWS};
 
+/// Where the target's final hidden row of one position sits, until the next
+/// call overwrites its arena: row `row` of `arena` (the step arena holds one
+/// row, the rows arena a pass's or a verify's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::arch::qwen3moe) struct HiddenSrc {
+    pub(in crate::arch::qwen3moe) arena: MtpArena,
+    pub(in crate::arch::qwen3moe) row: usize,
+}
+
 const WHAT: &str = "qwen35moe mtp";
 
 /// The sidecar's text: the checkpoint class its config names.
@@ -520,6 +529,11 @@ impl Mtp {
     pub(super) fn cut_to(&mut self, pos: u32) {
         self.held.cut_to(pos);
     }
+
+    /// Whether the draft's store holds every position below `pos`.
+    pub(super) fn holds_below(&self, pos: u32) -> bool {
+        self.held.get() >= pos as usize
+    }
 }
 
 /// What [`Session::open_mtp`] made.
@@ -662,6 +676,88 @@ impl Session {
         self.mtp
             .as_ref()
             .ok_or_else(|| mtp_refuse("no sidecar is open (`open_mtp` first)"))
+    }
+
+    /// The target's final hidden row at the position the checkpoint at `at`
+    /// stands before it (position `at - 1`), when the point carries one: a
+    /// point a prompt call took with a draft open does.
+    #[must_use]
+    pub fn point_hidden_row(&self, at: u32) -> Option<&[f32]> {
+        self.checkpoints.as_ref()?.row(at)
+    }
+
+    /// Whether a cut back to the checkpoint at `pos` keeps the draft: the
+    /// draft's store holds every position below `pos` and the point carries
+    /// the target's hidden row at `pos - 1` ([`Session::point_hidden_row`]),
+    /// which the cut writes to the step arena for the draft's next walk. False
+    /// with no sidecar open, at a position the session does not stand past,
+    /// where no point holds a row and on a poisoned session.
+    #[must_use]
+    pub fn draft_rejoins(&self, pos: u32) -> bool {
+        self.rejoin_row(pos).is_some()
+    }
+
+    /// The row a cut to `pos` writes to the step arena
+    /// ([`Session::draft_rejoins`]).
+    pub(super) fn rejoin_row(&self, pos: u32) -> Option<&[f32]> {
+        let mtp = self.mtp.as_ref()?;
+        if self.poisoned.is_some() || pos == 0 || pos >= self.pos || !mtp.holds_below(pos) {
+            return None;
+        }
+        self.point_hidden_row(pos)
+            .filter(|row| row.len() == self.arena.hidden)
+    }
+
+    /// The step arena's row made `row`, the target's final hidden row at the
+    /// position before the one the session was cut to: what a step at that
+    /// position leaves for the draft's next walk ([`MtpArena::Step`]).
+    pub(super) fn write_step_row(&mut self, row: &[f32]) -> Result<(), SessionError> {
+        self.arena.x.write_at(Elems(0), row)?;
+        Ok(())
+    }
+
+    /// The target's final hidden row at the position before the checkpoint
+    /// just taken at `at`, kept beside it for a draft that rejoins there:
+    /// `src` names where the call that ran that position left it. Nothing
+    /// with no sidecar open, and nothing where a token ran ahead of the call
+    /// (the step arena then holds that token's residual, not the position's).
+    /// The stream is idle, as a take's is.
+    pub(super) fn keep_point_row(
+        &mut self,
+        at: u32,
+        src: HiddenSrc,
+        settled: bool,
+    ) -> Result<(), SessionError> {
+        if self.mtp.is_none() || !settled || at == 0 {
+            return Ok(());
+        }
+        let h = self.arena.hidden;
+        let (buf, first) = match src.arena {
+            MtpArena::Step if src.row == 0 => (&self.arena.x, 0),
+            MtpArena::Step => {
+                return Err(mtp_refuse(format!(
+                    "the step arena's row {}: it holds one row",
+                    src.row
+                )));
+            }
+            MtpArena::Rows => (&self.rows.x, src.row * h),
+        };
+        let mut row = vec![0.0f32; h];
+        buf.pages().read_at(Elems(first), &mut row)?;
+        match self.checkpoints.as_mut() {
+            Some(c) => c.keep_row(at, &row).map_err(|e| mtp_refuse(e.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// The step arena's row, the target's final hidden row at the position
+    /// before the one the session stands at, as the last settled step or cut
+    /// left it ([`MtpArena::Step`]); a pass leaves its rows elsewhere. A token
+    /// running ahead is refused: the residual is its own.
+    pub fn hidden_row(&self) -> Result<Vec<f32>, SessionError> {
+        self.mtp_ref()?;
+        self.settle_for_read()?;
+        Ok(self.arena.x.pages().to_vec())
     }
 
     /// The hidden row of the draft's next step, written by the host: `row`

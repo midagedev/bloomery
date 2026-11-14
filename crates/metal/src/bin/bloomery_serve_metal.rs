@@ -6,7 +6,7 @@
 //!                          [--port 8080] [--ctx C]
 //!                          [--chat-template-file PATH] [--alias NAME]
 //!                          [--queue-depth Q] [--api-key KEY] [--api-key-file F]
-//!                          [--draft mtp --mtp SIDECAR]
+//!                          [--draft lookup | --draft mtp --mtp SIDECAR]
 //!
 //! The model is a GGUF file's first shard or a checkpoint folder (an MLX
 //! folder as downloaded, no `prepare`); `--hf REPO` fetches a repo into the
@@ -39,14 +39,26 @@
 //! `serve::TargetEngine::drafted` over `runtime::mtp::MtpDraft` with the session
 //! as its host behind the width chooser (`BLOOMERY_MTP_WIDTH`, `cost` unset), two
 //! rows a pass. A greedy request is verified in passes and keeps the ids the
-//! plain server picks, bit for bit. The draft joins a sequence from position 0:
-//! a request that cuts back to a checkpoint, and a step that reads the logits row
-//! (a request that samples), leave it off until the next reset, and a line on
-//! stderr names why. `/props`' `engine.draft` names the draft; each request's
-//! passes are one `draft:` line when the next request opens. `--draft mtp`
-//! without `--mtp`, `--mtp` without `--draft mtp`, and `BLOOMERY_MTP_WIDTH`
-//! beside no draft are refused by name, and so is a file the verify pass does
-//! not serve (at open, before the server listens).
+//! plain server picks, bit for bit. The draft joins a sequence from position 0 or
+//! rejoins it at a checkpoint: a prompt call keeps the target's hidden row of the
+//! position before each point it takes, so a request that cuts back to a
+//! checkpoint keeps drafting (`runtime::mtp::PointRows`, written to the step arena
+//! by the cut). A step that reads the logits row (a request that samples) leaves
+//! the draft off until the next reset, and a cut to a position whose checkpoint
+//! holds no row does too; a line on stderr names why.
+//!
+//! `--draft lookup` serves with the n-gram lookup draft (`runtime::Lookup`, the
+//! one `generate_metal --draft lookup` runs) behind the same chooser and rows: no
+//! sidecar, no weights, no device bytes. Its context follows the target by
+//! position, so a cut back and a request that samples leave it drafting. The ids
+//! are the plain server's, bit for bit.
+//!
+//! `/props`' `engine.draft` names the draft; each request's passes are one
+//! `draft:` line when the next request opens. `--draft mtp` without `--mtp`,
+//! `--mtp` without `--draft mtp`, a `--draft` that is neither, and
+//! `BLOOMERY_MTP_WIDTH` beside no draft are refused by name, and so is a file the
+//! verify pass does not serve (at open, before the server listens). DSpark has no
+//! Metal draft model: `--draft dspark` is refused like any other word.
 //!
 //! `BLOOMERY_SCREEN` (on unset) lets `d` open the server's live view on a
 //! terminal (`serve::live`); the start screen is the CUDA seats' alone.
@@ -75,15 +87,15 @@ mod cli {
     use bloomery_metal::model_arg;
     use hf::source::Source;
     use model_hf::ModelFile;
-    use runtime::Speculative;
     use runtime::mtp::MtpDraft;
-    use runtime::width::{Chosen, Mode as WidthMode};
+    use runtime::width::{Chosen, Mode as WidthMode, Wall};
+    use runtime::{Choosing, Lookup, Speculative};
     use serve::flag::{self, ApiKeys};
     use serve::sampling::sampler_factory;
     use serve::vocab::{ChatSurface, TemplateFile, Vocab};
     use serve::{
-        DraftProps, EngineProps, FATAL_LINGER, ServeError, Server, ServerConfig, SlotConfig,
-        TargetEngine,
+        DraftProps, DraftWindow, EngineProps, FATAL_LINGER, ServeError, Server, ServerConfig,
+        SlotConfig, TargetEngine,
     };
 
     /// The cache rows' default cap.
@@ -92,7 +104,8 @@ mod cli {
     const USAGE: &str = "\
 bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--chat-template-file PATH]
                      [--alias NAME] [--queue-depth Q] [--api-key KEY] [--api-key-file F]
-                     [--draft mtp --mtp SIDECAR]
+                     [--draft lookup | --draft mtp --mtp SIDECAR]
+  --draft lookup            serves the n-gram lookup draft (no sidecar), two rows a pass
   --draft mtp --mtp SIDECAR serves the MTP draft layer of the sidecar's folder, two rows a pass
   PATH is a GGUF file (its first shard) or a checkpoint folder; REPO is fetched into the cache
   --ctx (--ctx-size, -c) defaults to the smaller of 32768 and the file's context_length,
@@ -110,11 +123,21 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         alias: Option<String>,
         queue_depth: Option<usize>,
         api_keys: ApiKeys,
-        /// `--draft mtp`: the server drafts with the sidecar `--mtp` names.
-        draft: bool,
+        /// `--draft`: which draft the server runs beside the session.
+        draft: Option<Draft>,
+        /// `--mtp`: the sidecar of `--draft mtp`.
         mtp: Option<std::path::PathBuf>,
         /// `BLOOMERY_MTP_WIDTH`: how many of a proposal's ids a pass verifies.
         width: WidthMode,
+    }
+
+    /// The drafts the server runs.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Draft {
+        /// `--draft mtp --mtp SIDECAR`: the sidecar's draft layer.
+        Mtp,
+        /// `--draft lookup`: the context's n-grams.
+        Lookup,
     }
 
     fn parse(width: Option<&str>) -> Result<Args, String> {
@@ -128,7 +151,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             alias: None,
             queue_depth: None,
             api_keys: ApiKeys::default(),
-            draft: false,
+            draft: None,
             mtp: None,
             width: WidthMode::Cost,
         };
@@ -145,8 +168,9 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
                 "--queue-depth" => a.queue_depth = Some(flag::number(&f, &val()?)?),
                 k if flag::KEYS.contains(&k) => a.api_keys.add(&f, &val()?)?,
                 "--draft" => match val()?.as_str() {
-                    "mtp" => a.draft = true,
-                    other => return Err(format!("--draft {other}: only mtp\n{USAGE}")),
+                    "mtp" => a.draft = Some(Draft::Mtp),
+                    "lookup" => a.draft = Some(Draft::Lookup),
+                    other => return Err(format!("--draft {other}: lookup or mtp\n{USAGE}")),
                 },
                 "--mtp" => a.mtp = Some(val()?.into()),
                 "--help" | "-h" => return Err(USAGE.to_owned()),
@@ -156,23 +180,28 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         a.model = model_arg::named(&model, PATH_FLAGS, None, "-m PATH or --hf REPO")
             .map_err(|e| format!("{e}\n{USAGE}"))?;
         match (a.draft, &a.mtp) {
-            (true, None) => {
+            (Some(Draft::Mtp), None) => {
                 return Err(format!(
                     "--draft mtp: the draft layer is the sidecar's; give --mtp SIDECAR\n{USAGE}"
                 ));
             }
-            (false, Some(_)) => {
+            (None, Some(_)) => {
                 return Err(format!(
                     "--mtp: the server drafts with the sidecar only under --draft mtp\n{USAGE}"
+                ));
+            }
+            (Some(Draft::Lookup), Some(_)) => {
+                return Err(format!(
+                    "--draft lookup: the lookup has no sidecar; --mtp goes with --draft mtp\n{USAGE}"
                 ));
             }
             _ => {}
         }
         if let Some(w) = width
-            && !a.draft
+            && a.draft.is_none()
         {
             return Err(format!(
-                "{}={w}: it picks the width a drafted window verifies; give --draft mtp",
+                "{}={w}: it picks the width a drafted window verifies; give --draft lookup or mtp",
                 bloomery_levers::MTP_WIDTH
             ));
         }
@@ -247,6 +276,52 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         Ok(Speculative::new(draft))
     }
 
+    /// The n-gram lookup draft opened beside `session`, as the window of two
+    /// rows behind the width chooser by the lookup's own rule
+    /// ([`Lookup::RULE`]), as `generate_metal --draft lookup` runs it. The
+    /// session steps host-fed from here on: the chooser reads those walls as
+    /// the plain step's cost, and a verify drops a token a chained step ran
+    /// ahead.
+    fn open_lookup(
+        session: &mut Session,
+        width: WidthMode,
+    ) -> Result<Speculative<Choosing<Lookup>, 2>, String> {
+        session.verify_serves().map_err(|e| e.to_string())?;
+        session
+            .set_argmax_mode(StepMode::HostFed)
+            .map_err(|e| e.to_string())?;
+        let draft = <Lookup as Chosen<Session>>::choosing_by(
+            Lookup::new(),
+            width,
+            Lookup::RULE,
+            Wall::new(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(Speculative::new(draft))
+    }
+
+    /// The session served through `window`, which drafts as `props` names.
+    fn drafted<W: DraftWindow<Session> + Send + 'static>(
+        session: Session,
+        window: W,
+        vocab: Arc<Vocab>,
+        what: String,
+        props: DraftProps,
+    ) -> Result<Box<dyn serve::Engine>, String> {
+        let head_rows = session.vocab();
+        Ok(Box::new(TargetEngine::drafted(
+            session,
+            window,
+            head_rows,
+            vocab,
+            what,
+            EngineProps {
+                draft: Some(props),
+                ..EngineProps::default()
+            },
+        )?))
+    }
+
     fn open(a: Args) -> Result<Server, String> {
         let model = model_arg::resolve(&a.model)?;
         let path = &model.path;
@@ -307,13 +382,9 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             path.display(),
             t0.elapsed().as_secs_f64(),
         );
-        let window = match &a.mtp {
-            Some(path) => Some(open_draft(&device, &mut session, path, a.width)?),
-            None => None,
-        };
         let head_rows = session.vocab();
         let what = format!("metal {arch} session");
-        let engine: Box<dyn serve::Engine> = match window {
+        let engine: Box<dyn serve::Engine> = match a.draft {
             None => Box::new(TargetEngine::new(
                 session,
                 head_rows,
@@ -321,23 +392,42 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
                 what,
                 EngineProps::default(),
             )?),
-            Some(window) => Box::new(TargetEngine::drafted(
-                session,
-                window,
-                head_rows,
-                vocab,
-                what,
-                EngineProps {
-                    draft: Some(DraftProps {
+            Some(Draft::Mtp) => {
+                let path = a
+                    .mtp
+                    .as_deref()
+                    .ok_or("--draft mtp: the draft layer is the sidecar's; give --mtp SIDECAR")?;
+                let window = open_draft(&device, &mut session, path, a.width)?;
+                drafted(
+                    session,
+                    window,
+                    vocab,
+                    what,
+                    DraftProps {
                         model: "mtp".to_owned(),
                         n_max: Some(1),
                         kind: Some("mtp".to_owned()),
-                        path: a.mtp.as_ref().map(|p| p.display().to_string()),
+                        path: Some(path.display().to_string()),
                         device: None,
-                    }),
-                    ..EngineProps::default()
-                },
-            )?),
+                    },
+                )?
+            }
+            Some(Draft::Lookup) => {
+                let window = open_lookup(&mut session, a.width)?;
+                drafted(
+                    session,
+                    window,
+                    vocab,
+                    what,
+                    DraftProps {
+                        model: "lookup".to_owned(),
+                        n_max: Some(1),
+                        kind: Some("lookup".to_owned()),
+                        path: None,
+                        device: None,
+                    },
+                )?
+            }
         };
         let config = ServerConfig {
             model_alias: a.alias.unwrap_or(name),

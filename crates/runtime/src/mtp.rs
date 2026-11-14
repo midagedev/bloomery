@@ -70,10 +70,12 @@
 
 mod draft;
 mod host;
+mod points;
 mod policy;
 
 pub use draft::{MtpDraft, WindowDraft};
 pub use host::{Host, HostSink, Unit};
+pub use points::PointRows;
 pub use policy::{Call, Chain, Exec, Fail, Policy, Refresh, Refused, SKIPS, Shape, Walk};
 
 /// The window's name in its refusals.

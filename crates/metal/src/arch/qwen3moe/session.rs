@@ -133,6 +133,7 @@ use objc2_metal::MTLDevice;
 mod mtp;
 mod verify;
 
+pub(super) use mtp::HiddenSrc;
 pub use mtp::{DraftTimes, Drafted, MtpArena, MtpOpened};
 pub use verify::{BufferStamp, TraceSummary, VerifyTrace};
 
@@ -1940,7 +1941,16 @@ impl Session {
     /// A file of no recurrent store has nothing to copy: its caches hold the
     /// position. Refused while the session is poisoned.
     pub fn checkpoint(&mut self) -> Result<(), SessionError> {
-        self.take_point(self.pos, None)
+        self.take_point(self.pos, None, None)
+    }
+
+    /// [`Session::checkpoint`] that also keeps, beside the point, the target's
+    /// final hidden row of the position before it, where `hidden` says the
+    /// call that ran that position left it, so the MTP draft rejoins a cut
+    /// back to the point ([`Session::draft_rejoins`]). The row is kept only
+    /// with a sidecar open.
+    pub(super) fn checkpoint_hidden(&mut self, hidden: HiddenSrc) -> Result<(), SessionError> {
+        self.take_point(self.pos, None, Some(hidden))
     }
 
     /// A checkpoint at `at`, a position inside the last pass that pass left
@@ -1950,13 +1960,31 @@ impl Session {
     /// refused by name, as is one past the position. Points go in ascending
     /// order: a copy's point before the point at the pass's end.
     pub fn checkpoint_copy(&mut self, at: u32) -> Result<(), SessionError> {
+        self.checkpoint_copy_with(at, None)
+    }
+
+    /// [`Session::checkpoint_copy`] that also keeps the point's hidden row
+    /// ([`Session::checkpoint_hidden`]).
+    pub(super) fn checkpoint_copy_hidden(
+        &mut self,
+        at: u32,
+        hidden: HiddenSrc,
+    ) -> Result<(), SessionError> {
+        self.checkpoint_copy_with(at, Some(hidden))
+    }
+
+    fn checkpoint_copy_with(
+        &mut self,
+        at: u32,
+        hidden: Option<HiddenSrc>,
+    ) -> Result<(), SessionError> {
         let held = self
             .rows
             .snaps
             .as_ref()
             .and_then(|c| c.holds.iter().position(|&h| h == Some(at)));
         match held {
-            Some(k) if at <= self.pos => self.take_point(at, Some(k)),
+            Some(k) if at <= self.pos => self.take_point(at, Some(k), hidden),
             _ => Err(refuse(format!(
                 "a checkpoint at {at} from a pass's copy: no copy the last pass left holds it \
                  (the session stands at {})",
@@ -1969,11 +1997,19 @@ impl Session {
     /// a delta layer's lane of position `at`, `at` the position, and each
     /// ring) or from the last pass's copy `copy`, after the stream is idle. A
     /// short conv layer has no pass copy. Refused while poisoned.
-    fn take_point(&mut self, at: u32, copy: Option<usize>) -> Result<(), SessionError> {
+    fn take_point(
+        &mut self,
+        at: u32,
+        copy: Option<usize>,
+        hidden: Option<HiddenSrc>,
+    ) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
             return Err(SessionError::Poisoned(fault));
         }
         self.not_pending("a checkpoint")?;
+        // A token running ahead wrote the step arena's residual, which the
+        // take then waits out: the hidden row is read only where none did.
+        let settled = self.ahead.is_none();
         self.quiesce()?;
         let lane_len = held_lane_len(&self.arena)?;
         let live = lane_of(at)
@@ -2039,9 +2075,13 @@ impl Session {
             }
         }
         match self.checkpoints.as_mut() {
-            Some(c) => c.take(at, &views).map_err(checkpoint_error),
+            Some(c) => c.take(at, &views).map_err(checkpoint_error)?,
             // No recurrent store: the caches hold the position as they are.
-            None if has_recurrent_store(&self.arena) => Err(no_checkpoints()),
+            None if has_recurrent_store(&self.arena) => return Err(no_checkpoints()),
+            None => {}
+        }
+        match hidden {
+            Some(src) => self.keep_point_row(at, src, settled),
             None => Ok(()),
         }
     }
@@ -2050,10 +2090,12 @@ impl Session {
     /// cut to the position does nothing. A cut to a checkpoint waits out the
     /// token ahead, copies that position's state lanes and conv rings back
     /// once, from the point's slot straight into the stores, and stands at
-    /// `n`. Any other `n` is the ledger's refusal, by name, after the token
-    /// ahead is dropped: the position and every store stay. A copy back that
-    /// fails resets the session before the error returns. Refused while the
-    /// session is poisoned.
+    /// `n`; where the MTP draft rejoins there ([`Session::draft_rejoins`]) the
+    /// point's hidden row is written to the step arena too. Any other `n` is
+    /// the ledger's refusal, by name, after the token ahead is dropped: the
+    /// position and every store stay. A copy back that fails resets the
+    /// session before the error returns. Refused while the session is
+    /// poisoned.
     pub fn cut(&mut self, n: u32) -> Result<(), SessionError> {
         if let Some(fault) = self.poisoned {
             return Err(SessionError::Poisoned(fault));
@@ -2065,6 +2107,8 @@ impl Session {
         if n == self.pos {
             return Ok(());
         }
+        // The point's hidden row, read before the cut moves the draft's store.
+        let rejoin = self.rejoin_row(n).map(<[f32]>::to_vec);
         self.quiesce()?;
         let lane_len = held_lane_len(&self.arena)?;
         let start = lane_of(n)
@@ -2128,6 +2172,15 @@ impl Session {
             mtp.cut_to(n);
         }
         self.drop_copies();
+        if let Some(row) = rejoin
+            && let Err(e) = self.write_step_row(&row)
+        {
+            // The draft's next walk would read a row of another position.
+            return Err(match self.reset() {
+                Ok(()) => e,
+                Err(r) => refuse(format!("{e}; and the reset after it failed: {r}")),
+            });
+        }
         Ok(())
     }
 

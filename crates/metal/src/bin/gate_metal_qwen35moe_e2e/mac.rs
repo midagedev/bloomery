@@ -76,7 +76,7 @@
 //!   (`resident.rs`): the set holds every byte the open and the first pass
 //!   allocated, and a submit after an idle gap renews its request once.
 //!
-//! - `v_forced`, `v_count`, `v_segments`, `v_lookup`, `v_mtp`, `v_mtp_serve`, `v_cut`, `v_refused`: the verify
+//! - `v_forced`, `v_count`, `v_segments`, `v_lookup`, `v_mtp`, `v_mtp_serve`, `v_mtp_point`, `v_lookup_serve`, `v_cut`, `v_refused`: the verify
 //!   pass of two rows (`Session::verify_rows`) and the commit that keeps the first rows
 //!   of it (`verify.rs`): each row is the bits of the plain step at its position, a
 //!   verify is one command buffer and one wait with the groups, dispatches and barriers
@@ -85,7 +85,9 @@
 //!   draft (`--mtp SIDECAR`, the qwen38d row) behind the same chooser picks them too with
 //!   its proposals held to the layer's own draft step (`mtp.rs`), the server's engine over that
 //!   draft (`serve::TargetEngine::drafted`, `v_mtp_serve`) serves the plain run's ids as a fresh
-//!   request, from a cut and after a reset, a cut
+//!   request, from a cut to a checkpoint (the draft rejoins it with the checkpoint's hidden row,
+//!   `v_mtp_point` holds that row to the plain steps' and keeps proposing) and after a reset, and over the lookup (`v_lookup_serve`, no sidecar) it
+//!   serves them with the same proposals from a cut and after a reset, a cut
 //!   after a commit keeps its contract, and what a verify refuses is refused by name. A file the pass does not serve prints each but `v_refused`
 //!   as SKIP with the pass's own reason.
 //!
@@ -142,6 +144,8 @@ mod profile;
 mod resident;
 #[path = "row.rs"]
 mod row;
+#[path = "serve.rs"]
+mod serve;
 #[path = "sets.rs"]
 mod sets;
 #[path = "verify.rs"]
@@ -477,7 +481,7 @@ pub fn main() -> ExitCode {
         println!("{GATE}: {name} takes a value");
         return ExitCode::from(64);
     }
-    const NAMES: [&str; 28] = [
+    const NAMES: [&str; 30] = [
         "d_count",
         "e_token_id",
         "b_chain",
@@ -504,6 +508,8 @@ pub fn main() -> ExitCode {
         "v_lookup",
         "v_mtp",
         "v_mtp_serve",
+        "v_mtp_point",
+        "v_lookup_serve",
         "v_cut",
         "v_refused",
     ];
@@ -686,7 +692,9 @@ pub fn main() -> ExitCode {
                 "v_segments" => verify::v_segments(&device, library, &path),
                 "v_lookup" => verify::v_lookup(&device, library, &path),
                 "v_mtp" => mtp::v_mtp(&device, library, &path, sidecar.as_deref()),
-                "v_mtp_serve" => mtp::v_mtp_serve(&device, library, &path, sidecar.as_deref()),
+                "v_mtp_serve" => serve::v_mtp_serve(&device, library, &path, sidecar.as_deref()),
+                "v_mtp_point" => serve::v_mtp_point(&device, library, &path, sidecar.as_deref()),
+                "v_lookup_serve" => serve::v_lookup_serve(&device, library, &path),
                 "v_cut" => verify::v_cut(&device, library, &path),
                 "v_refused" => verify::v_refused(&mut session),
                 other => Err(format!("no clause named {other}")),

@@ -31,6 +31,13 @@
 //! The rows arena is both a verify's arena and a prompt pass's: the window
 //! reads a verify's rows before the next verify or pass overwrites them, as
 //! it does a pass unit's.
+//!
+//! A cut back to a checkpoint keeps the draft where the point carries the
+//! target's hidden row of the position before it ([`Session::point_hidden_row`]:
+//! a prompt call takes it beside the point, from the arena its last unit left
+//! it in) and the draft's store holds the positions below the cut: the cut
+//! writes the row to the step arena, as a plain step at that position leaves
+//! it, and the window rejoins there ([`Host::rejoins`]).
 
 use core::sync::atomic::Ordering;
 
@@ -303,6 +310,12 @@ impl Host for Session {
 
     fn held(&self) -> Result<usize, SessionError> {
         Ok(self.mtp_ref()?.held.get())
+    }
+
+    /// A cut to a checkpoint that carries a hidden row, below the draft's
+    /// store ([`Session::draft_rejoins`]).
+    fn rejoins(&self, pos: u32) -> bool {
+        self.draft_rejoins(pos)
     }
 
     fn walk(&mut self, w: &Walk<'_, MtpArena>, (): ()) -> Result<(), SessionError> {

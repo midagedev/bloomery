@@ -158,8 +158,21 @@ as Anthropic's, so Claude Code runs on the model: [`claude-code.md`](claude-code
 
 The flags it takes: `-m`/`--model` or `--hf` (one of the two), `--host`, `--port`, `--ctx` (also `--ctx-size` and `-c`;
 unset, the smaller of 32,768 and the file's `context_length`), `--chat-template-file`, `--alias` (unset, the file's
-`general.name`, else the folder's name, else the repo's), `--queue-depth`, `--api-key` and `--api-key-file`. Any other
-flag, `--parallel`, `-ngl`, `--mmproj` and `--flash-attn` among them, is refused by name with exit 64.
+`general.name`, else the folder's name, else the repo's), `--queue-depth`, `--api-key` and `--api-key-file`, and the
+speculative drafts below. Any other flag, `--parallel`, `-ngl`, `--mmproj` and `--flash-attn` among them, is refused by
+name with exit 64.
+
+`--draft lookup` and `--draft mtp --mtp SIDECAR` (off by default) serve with a draft, as `generate_metal --draft` runs it:
+the shared window (`serve::TargetEngine::drafted` over `runtime::Speculative` behind the width chooser, two rows a pass),
+`BLOOMERY_MTP_WIDTH=cost|fixed` as above. A greedy request is verified in passes and returns the plain server's ids, bit for bit;
+a request that samples runs plain steps. The lookup draft needs no model: its context follows the target by position, so a
+request cut back to a checkpoint and one that samples both keep drafting. The MTP draft needs the sidecar folder; it
+rejoins a request that cuts back to a checkpoint because each checkpoint a prompt call takes keeps the target's hidden row
+of the position before it (one row of `hidden` values, written to the step arena by the cut), and it stays off after a step that
+reads the logits row until the next reset. `--draft mtp` without `--mtp`, `--mtp` without `--draft mtp`, `--draft lookup`
+with `--mtp`, any other `--draft` word (DSpark has no Metal draft model) and `BLOOMERY_MTP_WIDTH` beside no draft are
+refused by name with exit 64, and a file the two-row pass does not serve before the server listens. `/props`' `engine.draft`
+names the draft, and each request's passes are one `draft:` line on stderr when the next request opens.
 
 ## What it does and does not do yet
 
@@ -175,7 +188,7 @@ id a pass, verified in a pass of two rows. The ids are the plain run's; the summ
 - A long prompt runs in batched passes (flash attention over the pass, the experts over its rows); decode runs one id a
   step.
 - No saved prompt cache across slots, no slot files, no image input (MiniCPM-V's `mmproj` is not read). The
-  server does no speculative decoding; `generate_metal --draft lookup|mtp` does.
+  server drafts only under `--draft lookup|mtp` (above); a request that samples is never drafted by the MTP layer.
 - On an M5 (Metal 4, GPU family 17 or newer) the device picks the neural accelerators' tensor-op GEMMs for prompts
   (`gemm_path=tensor` in the stats); M1 to M4 run the SIMD-group GEMMs (`gemm_path=simdgroup`). On an M5 Ultra the
   tensor path took a 2,048-row prompt pass's GEMM class from 203.51 to 92.73 ms (@avlp12, #593). Its sums run in another

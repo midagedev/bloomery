@@ -13,11 +13,17 @@
 //! reads a slot only as that position ([`runtime::seqstate::restorable`]).
 //! A copy that fails leaves the slot holding nothing a restore will read,
 //! and the point is forgotten.
+//!
+//! A point may carry the target's final hidden row at the position before it
+//! ([`runtime::mtp::PointRows`]), which the MTP draft rejoins a cut sequence
+//! with; the rows stand exactly while their points do, so every move of the
+//! ledger prunes them to its positions.
 
 use std::fmt;
 
 use bloomery_device::{DeviceError, Elems};
 use objc2_metal::MTLDevice;
+use runtime::mtp::PointRows;
 use runtime::seqstate::{self, Cut, Kept, Ledger, Price, Take};
 
 use crate::buffer::MetalBuffer;
@@ -47,6 +53,8 @@ pub(crate) struct Checkpoints {
     slots: Vec<Slot>,
     every: u32,
     point_bytes: u64,
+    /// The hidden row beside each point that carries one.
+    rows: PointRows,
 }
 
 /// A copy or a plan this half refuses, by name.
@@ -129,6 +137,7 @@ impl Checkpoints {
             slots: Vec::new(),
             every,
             point_bytes,
+            rows: PointRows::new(),
         })
     }
 
@@ -175,11 +184,16 @@ impl Checkpoints {
     /// so nothing names it.
     pub(crate) fn take(&mut self, at: u32, src: &[&[f32]]) -> Result<(), Error> {
         self.check_lengths(src.len(), src.iter().map(|row| row.len()))?;
-        match self.ledger.take(at).map_err(Error::Rule)? {
+        let taken = self.ledger.take(at).map_err(Error::Rule)?;
+        // An eviction took a point, and its row goes with it.
+        self.prune_rows();
+        match taken {
             Take::Empty | Take::Held => Ok(()),
             Take::Copy { slot, .. } => {
                 if let Err(e) = self.copy_into(slot, at, src) {
-                    if let Err(forgotten) = self.ledger.forget(at) {
+                    let forgot = self.ledger.forget(at);
+                    self.prune_rows();
+                    if let Err(forgotten) = forgot {
                         return Err(shape(format!(
                             "{e}; and the point at {at} was not forgotten: {forgotten}"
                         )));
@@ -189,6 +203,30 @@ impl Checkpoints {
                 Ok(())
             }
         }
+    }
+
+    /// The target's final hidden row at position `at - 1` beside the point at
+    /// `at`, replacing the one there. Refused by name where no point stands:
+    /// a row stands only beside its point.
+    pub(crate) fn keep_row(&mut self, at: u32, row: &[f32]) -> Result<(), Error> {
+        if !self.ledger.positions().contains(&at) {
+            return Err(shape(format!(
+                "a hidden row for position {at}, where no checkpoint stands"
+            )));
+        }
+        self.rows.put(at, row);
+        Ok(())
+    }
+
+    /// The hidden row beside the point at `at`, if it carries one.
+    #[must_use]
+    pub(crate) fn row(&self, at: u32) -> Option<&[f32]> {
+        self.rows.get(at)
+    }
+
+    /// Rows only for the points the ledger holds.
+    fn prune_rows(&mut self) {
+        self.rows.retain_points(&self.ledger.positions());
     }
 
     /// Plan a cut to `n` of the `held` positions and carry it out into `dst`,
@@ -214,7 +252,10 @@ impl Checkpoints {
                 )));
             }
         }
-        match self.ledger.cut(n, held).map_err(Error::Rule)? {
+        let planned = self.ledger.cut(n, held).map_err(Error::Rule)?;
+        // The cut dropped every point past `n`, and their rows with them.
+        self.prune_rows();
+        match planned {
             Cut::Stay => Ok(()),
             Cut::Empty => {
                 for (d, &want) in dst.iter_mut().zip(&self.lens) {
@@ -236,6 +277,7 @@ impl Checkpoints {
     /// Every point dropped and no cut waiting.
     pub(crate) fn clear(&mut self) {
         self.ledger.clear();
+        self.rows.clear();
     }
 
     fn check_lengths(

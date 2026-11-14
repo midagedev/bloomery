@@ -32,17 +32,10 @@
 //!   With no sidecar named, on a row whose layer the sidecar is not made for,
 //!   or on a file the verify pass does not serve, the clause prints SKIP with
 //!   the reason.
-//! - `v_mtp_serve`: the server's engine (`serve::TargetEngine::drafted` over the
-//!   session and the width chooser, as `bloomery-serve-metal --draft mtp` opens
-//!   it) serves a greedy request with the plain run's 64 ids while the draft
-//!   proposes and the target keeps what it proposed; a prompt call that carries
-//!   a mark keeps that position for a cut, as the plain target's does; a request
-//!   that continues the cache from that mark, and one that starts over after a
-//!   reset, pick the same ids, and the one after the reset drafts again. SKIPs
-//!   as `v_mtp` does.
+//!
+//! The server's engine over each draft is `serve.rs`'s.
 
 use std::path::Path;
-use std::sync::Arc;
 
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_metal::arch::qwen3moe::generate::{Generated, greedy, greedy_with};
@@ -51,26 +44,23 @@ use bloomery_metal::arch::qwen3moe::session::{Session, SessionError, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::kernels::HiddenRow;
 use bloomery_metal::library::Library;
-use model_hf::ModelFile;
 use runtime::mtp::MtpDraft;
 use runtime::prompt::PrefillMode;
 use runtime::width::{Chosen, Mode as WidthMode};
 use runtime::{Draft, Speculative, TapNeed};
-use serve::vocab::Vocab;
-use serve::{Engine, EngineProps, TargetEngine};
 
 use super::{row, says, sets};
 
 /// The ids a run picks: the count the clause holds equal to the plain run's.
-const GEN: usize = 64;
+pub(super) const GEN: usize = 64;
 
 /// The cache rows: the longest prompt, the ids a run picks and the rows a
 /// verify runs past them, as `v_lookup`'s session holds.
-const CTX: usize = 256;
+pub(super) const CTX: usize = 256;
 
 /// The rows whose model the sidecar is made for: its hidden size, vocabulary
 /// and the layer it is shaped after are Qwen3.8-27B's.
-const ROWS: &[&str] = &["qwen38d"];
+pub(super) const ROWS: &[&str] = &["qwen38d"];
 
 /// What a window of the script does with the draft's own proposal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,7 +186,11 @@ impl Draft<Session> for Scripted {
 }
 
 /// The plain greedy run of `prompt` under `prefill`: its ids.
-fn plain(s: &mut Session, prompt: &[u32], prefill: PrefillMode) -> Result<Vec<u32>, String> {
+pub(super) fn plain(
+    s: &mut Session,
+    prompt: &[u32],
+    prefill: PrefillMode,
+) -> Result<Vec<u32>, String> {
     s.set_prefill(prefill);
     s.reset().map_err(says)?;
     let out = greedy(s, prompt, GEN, &[], |_| {}).map_err(|e| e.to_string())?;
@@ -480,140 +474,5 @@ pub fn v_mtp(
          layer's own draft step at its position, logits bit for bit, and each window's kept rows \
          are the host's recount; {}",
         lines.join("; ")
-    )))
-}
-
-/// The mark the serve clause's prompt call carries, inside the prompt.
-const MARK: usize = 24;
-
-/// One greedy request through `e`: the prompt's tail from the cache's end, the
-/// ids picked until [`GEN`] of them are in hand, and the draft's counts.
-fn serve_request<W: serve::DraftWindow<Session> + Send>(
-    e: &mut TargetEngine<Session, W>,
-    ids: &[u32],
-    marks: &[usize],
-    what: &str,
-) -> Result<(Vec<u32>, usize, usize), String> {
-    let first = e
-        .prefill_next(ids, &[], marks, None)
-        .map_err(|err| format!("{what}: {err}"))?;
-    let mut got = vec![first];
-    let (mut proposed, mut accepted) = (0usize, 0usize);
-    while got.len() < GEN {
-        let last = *got.last().expect("the first id is in hand");
-        let mut out = Vec::new();
-        let d = e
-            .advance(last, &mut out)
-            .map_err(|err| format!("{what}: {err}"))?;
-        if out.is_empty() {
-            return Err(format!("{what}: a pass kept no id"));
-        }
-        proposed += d.proposed;
-        accepted += d.accepted;
-        got.extend(out);
-    }
-    got.truncate(GEN);
-    Ok((got, proposed, accepted))
-}
-
-/// `v_mtp_serve`: the server's engine over the MTP draft picks the plain run's ids.
-pub fn v_mtp_serve(
-    device: &MetalDevice,
-    library: &Library,
-    path: &Path,
-    sidecar: Option<&Path>,
-) -> Clause {
-    let name = row::current().name;
-    if !ROWS.contains(&name) {
-        return Ok(Verdict::Skip(format!(
-            "row {name}: the sidecar is made for the rows {ROWS:?}: its hidden size, its vocabulary \
-             and the layer it is shaped after are theirs"
-        )));
-    }
-    let Some(sidecar) = sidecar else {
-        return Ok(Verdict::Skip(
-            "no sidecar: name the MTP sidecar's folder with --mtp SIDECAR".into(),
-        ));
-    };
-    let prompt = sets::prompt_ids(48)?;
-    let mut reference = Session::open(device, library, path, CTX).map_err(says)?;
-    if let Err(e) = reference.verify_serves() {
-        return Ok(Verdict::Skip(format!(
-            "the verify pass does not serve this file: {e}"
-        )));
-    }
-    let plain_ids = plain(&mut reference, &prompt, PrefillMode::Batch)?;
-    drop(reference);
-
-    let mut s = Session::open(device, library, path, CTX).map_err(says)?;
-    s.open_mtp(sidecar).map_err(says)?;
-    s.set_mtp_reading(HiddenRow::Post).map_err(says)?;
-    s.set_prefill(PrefillMode::Batch);
-    s.set_argmax_mode(StepMode::HostFed).map_err(says)?;
-    let window: Speculative<_, 2> = Speculative::new(
-        s.mtp_draft()
-            .map_err(says)?
-            .choosing(WidthMode::Fixed)
-            .map_err(|e| e.to_string())?,
-    );
-    let head_rows = s.vocab();
-    let file = ModelFile::open(path).map_err(|e| e.to_string())?;
-    let vocab = Arc::new(Vocab::new(file.tokenizer().map_err(|e| e.to_string())?)?);
-    let mut e = TargetEngine::drafted(
-        s,
-        window,
-        head_rows,
-        vocab,
-        "the e2e session".into(),
-        EngineProps::default(),
-    )?;
-
-    // A fresh request, its prompt call marked the way a chat turn's is.
-    let (ids, proposed, accepted) = serve_request(&mut e, &prompt, &[MARK], "a fresh request")?;
-    if ids != plain_ids {
-        return Err(format!(
-            "a fresh request through the drafted engine picked {ids:?}; the plain run picked \
-             {plain_ids:?}"
-        ));
-    }
-    if proposed == 0 || accepted > proposed {
-        return Err(format!(
-            "a fresh request: the draft proposed {proposed} ids and the target kept {accepted}; \
-             it proposes, and keeps no more than it proposed"
-        ));
-    }
-    // The mark is a position the cache keeps, as a plain prompt call's is.
-    let kept = e.keepable(MARK);
-    if kept != MARK {
-        return Err(format!(
-            "the prompt call's mark at {MARK}: the drafted engine keeps {kept} of those positions"
-        ));
-    }
-    // A request that continues from the mark: the same prompt again.
-    e.cut(MARK)
-        .map_err(|err| format!("a cut to {MARK}: {err}"))?;
-    let (ids, _, _) = serve_request(&mut e, &prompt[MARK..], &[], "a request after a cut")?;
-    if ids != plain_ids {
-        return Err(format!(
-            "a request after a cut to {MARK} picked {ids:?}; the plain run picked {plain_ids:?}"
-        ));
-    }
-    // A request that starts over: the draft joins it from its first position.
-    e.reset().map_err(|err| format!("a reset: {err}"))?;
-    let (ids, again, _) = serve_request(&mut e, &prompt, &[MARK], "a request after a reset")?;
-    if ids != plain_ids {
-        return Err(format!(
-            "a request after a reset picked {ids:?}; the plain run picked {plain_ids:?}"
-        ));
-    }
-    if again == 0 {
-        return Err("a request after a reset: the draft proposed nothing".into());
-    }
-    Ok(Verdict::Noted(format!(
-        "the drafted engine behind the fixed-width chooser picks the plain run's {GEN} ids of a \
-         {}-id prompt as a fresh request (the draft proposed {proposed} ids, the target kept \
-         {accepted}), keeps the position of the prompt call's mark at {MARK}, picks them again \
-         from a cut to it, and after a reset picks them with the draft proposing {again} ids",
-        prompt.len()
     )))
 }
