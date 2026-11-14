@@ -997,6 +997,310 @@ pub fn write_base(
     })
 }
 
+/// The model-free half of a loss tool's command line, one owner for every model's tool (`ppl_exaone`,
+/// `ppl_ds41`): the tool reads its own flags and opens its model, and everything between the arguments and
+/// [`write_base`] is here.
+///
+/// ```text
+/// TOOL (--ids FILE | --ids-of BASE.kld) --run CTX[xCHUNKS]=OUT.kld ... [--plan-ctx C] [the tool's own flags]
+/// ```
+///
+/// `--ids` is one decimal id a line (`corpus-prose.ids`); `--ids-of` is the ids an existing base file holds
+/// ([`KldBase::tokens`], chunk after chunk), so a run reads the text another engine's base was made from
+/// without a tokenizer. Each `--run` (repeatable, one load serves them all) takes the first `CTX × CHUNKS` ids as
+/// `CHUNKS` chunks of `CTX` (default one chunk) and writes their base file `OUT`; two files share a base
+/// file's meaning only when their ids, `CTX` and `CHUNKS` are the same. `--plan-ctx` is the positions the model is
+/// planned for (default [`cli::PLAN_CTX`]); a `CTX` above it is refused, and an existing `OUT` before the load.
+pub mod cli {
+    use super::{KldBase, PplModel, read_ids, write_base};
+    use crate::GateError;
+    use std::path::PathBuf;
+
+    /// Positions the model is planned for when `--plan-ctx` is not given: the serve seat's context.
+    pub const PLAN_CTX: usize = 8192;
+
+    /// The flags every loss tool reads, each with one value; a tool names its own in its [`Spec`].
+    const COMMON: [&str; 4] = ["--ids", "--ids-of", "--run", "--plan-ctx"];
+
+    /// What a tool reads beside [`COMMON`]: its name (the prefix of every refusal), its own flags with a
+    /// value, its switches (no value), and the switch that ends the run before the load, when it has one: the
+    /// ids and the runs are then optional.
+    pub struct Spec {
+        pub tool: &'static str,
+        pub own: &'static [&'static str],
+        pub switches: &'static [&'static str],
+        pub plan_only: Option<&'static str>,
+    }
+
+    /// One `--run`: the first `ctx * chunks` ids as `chunks` chunks of `ctx`, written to `out`.
+    pub struct Run {
+        pub ctx: usize,
+        pub chunks: usize,
+        pub out: PathBuf,
+    }
+
+    impl Run {
+        /// `CTX=OUT` or `CTXxCHUNKS=OUT`; a spec of another shape is refused by name.
+        fn parse(tool: &str, spec: &str) -> Result<Self, GateError> {
+            let bad = || {
+                GateError::from(format!(
+                    "{tool}: --run {spec:?} is not CTX[xCHUNKS]=OUT.kld (CTX at least 3, CHUNKS at least 1)"
+                ))
+            };
+            let (shape, out) = spec.split_once('=').ok_or_else(bad)?;
+            let (ctx, chunks) = shape.split_once('x').unwrap_or((shape, "1"));
+            let ctx: usize = ctx.parse().map_err(|_| bad())?;
+            let chunks: usize = chunks.parse().map_err(|_| bad())?;
+            if ctx < 3 || chunks == 0 || out.is_empty() {
+                return Err(bad());
+            }
+            Ok(Self {
+                ctx,
+                chunks,
+                out: PathBuf::from(out),
+            })
+        }
+
+        /// Ids the run walks.
+        pub fn ids(&self) -> usize {
+            self.ctx * self.chunks
+        }
+    }
+
+    /// Where the ids come from: exactly one of `--ids` and `--ids-of`.
+    enum IdsFrom {
+        File(PathBuf),
+        Base(PathBuf),
+    }
+
+    /// A parsed command line.
+    pub struct Args {
+        tool: &'static str,
+        ids: Option<IdsFrom>,
+        plan_ctx: usize,
+        runs: Vec<Run>,
+        own: Vec<(&'static str, String)>,
+        given: Vec<&'static str>,
+    }
+
+    impl Args {
+        /// Read `args` (the arguments after the program's name) by `spec`. Refused by name: a flag that is
+        /// none of the tool's, a flag with no value or given twice (`--run` repeats), both or neither of
+        /// `--ids` and `--ids-of`, a `--plan-ctx` that is no count, a `--run` of another shape or above
+        /// `--plan-ctx`, an `OUT` that exists or is two runs'. The model is not read here.
+        pub fn parse(spec: &Spec, args: &[String]) -> Result<Args, GateError> {
+            let tool = spec.tool;
+            let mut values: Vec<(&str, &str)> = Vec::new();
+            let mut given = Vec::new();
+            let mut at = 0;
+            while at < args.len() {
+                let flag = args[at].as_str();
+                if let Some(&s) = spec.switches.iter().find(|&&s| s == flag) {
+                    given.push(s);
+                    at += 1;
+                    continue;
+                }
+                if !COMMON.contains(&flag) && !spec.own.contains(&flag) {
+                    let all: Vec<&str> = COMMON
+                        .iter()
+                        .chain(spec.own)
+                        .chain(spec.switches)
+                        .copied()
+                        .collect();
+                    return Err(
+                        format!("{tool}: {flag} is no flag of this tool (one of {all:?})").into(),
+                    );
+                }
+                let v = args
+                    .get(at + 1)
+                    .ok_or_else(|| GateError::from(format!("{tool}: {flag} needs a value")))?;
+                values.push((flag, v));
+                at += 2;
+            }
+            let one = |name: &str| -> Result<Option<&str>, GateError> {
+                let mut found = values.iter().filter(|(f, _)| *f == name).map(|&(_, v)| v);
+                let first = found.next();
+                match found.next() {
+                    Some(_) => Err(format!("{tool}: {name} is given once").into()),
+                    None => Ok(first),
+                }
+            };
+            let plan_only = spec.plan_only.is_some_and(|s| given.contains(&s));
+            let ids = match (one("--ids")?, one("--ids-of")?) {
+                (Some(_), Some(_)) => {
+                    return Err(format!(
+                        "{tool}: --ids and --ids-of are two ways to give the ids: give one"
+                    )
+                    .into());
+                }
+                (Some(p), None) => Some(IdsFrom::File(PathBuf::from(p))),
+                (None, Some(p)) => Some(IdsFrom::Base(PathBuf::from(p))),
+                (None, None) if plan_only => None,
+                (None, None) => {
+                    return Err(format!(
+                        "{tool}: --ids FILE (one id a line) or --ids-of BASE.kld is required"
+                    )
+                    .into());
+                }
+            };
+            let plan_ctx = one("--plan-ctx")?.map_or(Ok(PLAN_CTX), |s| {
+                s.parse::<usize>()
+                    .map_err(|_| GateError::from(format!("{tool}: --plan-ctx {s:?} is no count")))
+            })?;
+            let runs = values
+                .iter()
+                .filter(|(f, _)| *f == "--run")
+                .map(|&(_, s)| Run::parse(tool, s))
+                .collect::<Result<Vec<_>, _>>()?;
+            if runs.is_empty() && !plan_only {
+                return Err(
+                    format!("{tool}: at least one --run CTX[xCHUNKS]=OUT.kld is required").into(),
+                );
+            }
+            for (i, r) in runs.iter().enumerate() {
+                if r.ctx > plan_ctx {
+                    return Err(format!(
+                        "{tool}: --run context {} is above --plan-ctx {plan_ctx}",
+                        r.ctx
+                    )
+                    .into());
+                }
+                if r.out.exists() {
+                    return Err(format!(
+                        "{tool}: {} exists, and a base is never overwritten",
+                        r.out.display()
+                    )
+                    .into());
+                }
+                if runs[..i].iter().any(|p| p.out == r.out) {
+                    return Err(
+                        format!("{tool}: {} is the output of two runs", r.out.display()).into(),
+                    );
+                }
+            }
+            let mut own = Vec::new();
+            for &flag in spec.own {
+                if let Some(v) = one(flag)? {
+                    own.push((flag, v.to_owned()));
+                }
+            }
+            Ok(Args {
+                tool,
+                ids,
+                plan_ctx,
+                runs,
+                own,
+                given,
+            })
+        }
+
+        /// Positions the model is planned for.
+        pub fn plan_ctx(&self) -> usize {
+            self.plan_ctx
+        }
+
+        /// The value of the tool's own flag `name`, when given.
+        pub fn value(&self, name: &str) -> Option<&str> {
+            self.own
+                .iter()
+                .find(|(f, _)| *f == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        /// Whether the tool's switch `name` was given.
+        pub fn switch(&self, name: &str) -> bool {
+            self.given.contains(&name)
+        }
+
+        /// The ids the runs need, read before the load: the count and the format of a `--ids` file (its
+        /// vocabulary bound waits for the model, [`Ids::for_vocab`]), or the first ids of the `--ids-of` base.
+        /// A file of fewer ids than the longest run takes is an error naming the count.
+        pub fn ids(&self) -> Result<Ids, GateError> {
+            let tool = self.tool;
+            let need = self.runs.iter().map(Run::ids).max().unwrap_or(0);
+            match self.ids.as_ref() {
+                None => Err(format!("{tool}: no ids were given").into()),
+                Some(IdsFrom::File(path)) => {
+                    read_ids(path, need, usize::MAX)?;
+                    Ok(Ids {
+                        file: Some(path.clone()),
+                        need,
+                        ids: Vec::new(),
+                        vocab: 0,
+                    })
+                }
+                Some(IdsFrom::Base(path)) => {
+                    let base = KldBase::open_own_vocab(path)?;
+                    if base.tokens().len() < need {
+                        return Err(format!(
+                            "{tool}: --ids-of {} holds {} ids, {need} wanted",
+                            path.display(),
+                            base.tokens().len()
+                        )
+                        .into());
+                    }
+                    Ok(Ids {
+                        file: None,
+                        need,
+                        ids: base.tokens()[..need].to_vec(),
+                        vocab: base.n_vocab(),
+                    })
+                }
+            }
+        }
+
+        /// Run `m` over `ids` ([`Ids::for_vocab`]) once for each `--run`, writing its base file
+        /// ([`write_base`]) and printing its `kld_base` line: the path, `n_ctx`, `n_chunk`, `n_vocab`, the
+        /// positions scored, the PPL of the walk and its wall seconds.
+        pub fn walk(
+            &self,
+            m: &mut impl PplModel,
+            ids: &[u32],
+            vocab: usize,
+        ) -> Result<(), GateError> {
+            for r in &self.runs {
+                let w = write_base(m, &ids[..r.ids()], r.ctx, vocab, &r.out)?;
+                println!(
+                    "kld_base path={} n_ctx={} n_chunk={} n_vocab={vocab} positions={} ppl={:.4} wall_s={:.1}",
+                    w.path.display(),
+                    r.ctx,
+                    r.chunks,
+                    w.positions,
+                    w.ppl,
+                    w.secs
+                );
+            }
+            Ok(())
+        }
+    }
+
+    /// The ids a command line names, read before the model: [`Ids::for_vocab`] holds them to the model's
+    /// vocabulary once it is loaded.
+    pub struct Ids {
+        file: Option<PathBuf>,
+        need: usize,
+        ids: Vec<u32>,
+        vocab: usize,
+    }
+
+    impl Ids {
+        /// The ids for a model whose head is `vocab` wide: a `--ids` file read again with every id held below
+        /// `vocab`, so a line that is outside it is named; a `--ids-of` base states the vocabulary it was run
+        /// over, which must be the model's.
+        pub fn for_vocab(self, vocab: usize) -> Result<Vec<u32>, GateError> {
+            match self.file {
+                Some(path) => read_ids(&path, self.need, vocab),
+                None if self.vocab != vocab => Err(format!(
+                    "kld: the --ids-of base states n_vocab {}, but the model's vocabulary is {vocab}",
+                    self.vocab
+                )
+                .into()),
+                None => Ok(self.ids),
+            }
+        }
+    }
+}
+
 /// A run's result line: the last line of `tools/ref/ik-ppl.sh`'s log that
 /// opens with `ppl tag=<tag> `, read field by field (`key=value`, space
 /// separated).
@@ -1535,6 +1839,187 @@ mod tests {
 
     fn temp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("bloomery-kld-{}-{name}.kld", std::process::id()))
+    }
+
+    /// The loss tools' command line (`cli`): `--ids-of` is the ids a base file holds, `--ids` a file of them, and
+    /// exactly one is given; a tool's own flag and switch are read beside the common ones, and a switch can end the
+    /// run before the ids and runs are needed. Refused by name: a flag of no tool's, a flag with no value or given
+    /// twice, both or neither way of giving the ids, a count that is no count, a run of another shape or above
+    /// `--plan-ctx` or with an `OUT` that exists or is two runs', and, before the load, too few ids. The
+    /// `--ids-of` ids are the base's first ones, held to the model's vocabulary by the base's own header, and a
+    /// run over them writes the base the walk would from the same ids given as a file.
+    #[test]
+    fn a_loss_tool_cli_reads_its_flags() {
+        use cli::{Args, Spec};
+        const SPEC: Spec = Spec {
+            tool: "tool",
+            own: &["--place"],
+            switches: &["--plan"],
+            plan_only: Some("--plan"),
+        };
+        let parse = |a: &[&str]| {
+            Args::parse(
+                &SPEC,
+                &a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            )
+        };
+        let refuse = |a: &[&str], word: &str| {
+            let e = parse(a)
+                .err()
+                .unwrap_or_else(|| panic!("{a:?}: accepted"))
+                .to_string();
+            assert!(e.starts_with("tool: ") && e.contains(word), "{a:?}: {e}");
+        };
+        let (vocab, n_ctx) = (33usize, 10usize);
+        let ids: Vec<u32> = (0..2 * n_ctx)
+            .map(|i| ((3 * i + 1) % vocab) as u32)
+            .collect();
+        let (base, out, list) = (temp("cli-base"), temp("cli-out"), temp("cli-ids"));
+        write_base(&mut stub(vocab), &ids, n_ctx, vocab, &base).unwrap_or_else(|e| panic!("{e}"));
+        let (b, o, l) = (
+            base.display().to_string(),
+            out.display().to_string(),
+            list.display().to_string(),
+        );
+        let run = format!("{n_ctx}x2={o}");
+
+        refuse(&["--bogus", "1"], "no flag of this tool");
+        refuse(&["--ids", &l, "--run"], "--run needs a value");
+        refuse(
+            &["--ids", &l, "--ids", &l, "--run", &run],
+            "--ids is given once",
+        );
+        refuse(&["--ids", &l, "--ids-of", &b, "--run", &run], "two ways");
+        refuse(&["--run", &run], "--ids FILE");
+        refuse(&["--ids-of", &b], "at least one --run");
+        refuse(
+            &["--ids-of", &b, "--plan-ctx", "x", "--run", &run],
+            "no count",
+        );
+        refuse(
+            &[
+                "--ids-of", &b, "--place", "a", "--place", "b", "--run", &run,
+            ],
+            "--place is given once",
+        );
+        for bad in ["2=x.kld", "8x0=x.kld", "8x=x.kld", "8=", "x8=x.kld", "8"] {
+            refuse(&["--ids-of", &b, "--run", bad], "is not CTX");
+        }
+        refuse(
+            &["--ids-of", &b, "--plan-ctx", "4", "--run", &run],
+            "above --plan-ctx 4",
+        );
+        refuse(
+            &["--ids-of", &b, "--run", &format!("{n_ctx}={b}")],
+            "exists",
+        );
+        refuse(
+            &[
+                "--ids-of",
+                &b,
+                "--run",
+                &format!("{n_ctx}={o}"),
+                "--run",
+                &format!("{n_ctx}x2={o}"),
+            ],
+            "two runs",
+        );
+
+        let a = parse(&[
+            "--ids-of",
+            &b,
+            "--run",
+            &run,
+            "--place",
+            "bp",
+            "--plan",
+            "--plan-ctx",
+            "64",
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (
+                a.plan_ctx(),
+                a.value("--place"),
+                a.value("--arm"),
+                a.switch("--plan")
+            ),
+            (64, Some("bp"), None, true)
+        );
+        let planned = parse(&["--plan", "--place", "a"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (planned.plan_ctx(), planned.switch("--plan")),
+            (cli::PLAN_CTX, true)
+        );
+        assert!(planned.ids().is_err(), "a plan-only line names no ids");
+
+        // `--ids-of`: the base's first ids, its vocabulary the model's.
+        let a =
+            parse(&["--ids-of", &b, "--run", &format!("6={o}")]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(a.plan_ctx(), cli::PLAN_CTX);
+        let held = a
+            .ids()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .for_vocab(vocab)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(held, ids[..6]);
+        let e = a
+            .ids()
+            .and_then(|i| i.for_vocab(vocab + 1))
+            .expect_err("another vocabulary")
+            .to_string();
+        assert!(e.contains(&format!("n_vocab {vocab}")), "{e}");
+        let too_many = parse(&["--ids-of", &b, "--run", &format!("{}x1={o}", 2 * n_ctx + 2)])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let e = too_many
+            .ids()
+            .err()
+            .expect("more ids than the base holds")
+            .to_string();
+        assert!(e.contains("holds 20 ids, 22 wanted"), "{e}");
+
+        // `--ids`: a file, its count checked before the load and its vocabulary after.
+        std::fs::write(
+            &list,
+            ids[..8]
+                .iter()
+                .map(|i| format!("{i}\n"))
+                .collect::<String>(),
+        )
+        .expect("the temp directory is writable");
+        let a = parse(&["--ids", &l, "--run", &format!("8={o}")]).unwrap_or_else(|e| panic!("{e}"));
+        let from_file = a.ids().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            from_file.for_vocab(vocab).unwrap_or_else(|e| panic!("{e}")),
+            ids[..8]
+        );
+        let e = a
+            .ids()
+            .and_then(|i| i.for_vocab(5))
+            .expect_err("an id past a small vocabulary")
+            .to_string();
+        assert!(e.contains("outside 0..5"), "{e}");
+        let a = parse(&["--ids", &l, "--run", &format!("9={o}")]).unwrap_or_else(|e| panic!("{e}"));
+        let e = a.ids().err().expect("a file of too few ids").to_string();
+        assert!(e.contains("8 ids, 9 wanted"), "{e}");
+
+        // The walk: the base the runs name, the ids the base held.
+        let a = parse(&["--ids-of", &b, "--run", &format!("{n_ctx}x2={o}")])
+            .unwrap_or_else(|e| panic!("{e}"));
+        let held = a
+            .ids()
+            .and_then(|i| i.for_vocab(vocab))
+            .unwrap_or_else(|e| panic!("{e}"));
+        a.walk(&mut stub(vocab), &held, vocab)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (same, twin) = (std::fs::read(&base), std::fs::read(&out));
+        for p in [&base, &out, &list] {
+            let _ = std::fs::remove_file(p);
+        }
+        assert!(
+            same.is_ok() && same.as_ref().ok() == twin.as_ref().ok(),
+            "the same ids, context and model write the same base"
+        );
     }
 
     /// The walk writes the base ik's layout names, from the engine's rows alone: each chunk from a reset, its ids
