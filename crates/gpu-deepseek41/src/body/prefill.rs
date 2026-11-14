@@ -2017,11 +2017,11 @@ impl Body {
         batch.proj.set_card_timing(gpu, on, layer_batches)
     }
 
-    /// Run the next prompt calls' default card blocks on the tile path the
-    /// steps and the streamed passes keep, in place of the grouped GEMM: a
-    /// gate's hosted-expert catcher alone sets it, holding the batch to the
-    /// steps' bits — no engine caller and no lever does (the GEMM is the
-    /// engine's card path). Refused before the batch's buffers are made
+    /// Run the next prompt calls' card blocks, a pick's two passes included,
+    /// on the tile path the steps keep, in place of the grouped GEMM: a gate's
+    /// hosted-expert catcher alone sets it, holding the batch to the steps'
+    /// bits — no engine caller and no lever does (the GEMM is the engine's
+    /// card path). Refused before the batch's buffers are made
     /// ([`prepare_prefill`]).
     #[doc(hidden)]
     pub fn set_batch_card_tiles(&mut self, on: bool) -> Result<(), GpuError> {
@@ -3119,10 +3119,12 @@ impl<'a> GroupCx<'a> {
         self.ffn
             .enqueue_batch_replace(gpu, bl, &mut batch.ffn, &block, self.slots)?;
         self.ffn
-            .enqueue_batch_block_kept(gpu, bl, card, &mut batch.ffn, &block)?;
-        // The shadow's entries and the places taken again.
+            .enqueue_batch_block_kept(gpu, bl, card, &mut batch.ffn, &block, self.slots)?;
+        // The shadow's entries, the places taken again and with card experts
+        // the kept pass's map row.
         let entries = shadow_entries(w, l, &m.cuts[r.full..], card.map(|s| s.fused()), tiered);
-        self.tally.shadow(i, m.set, entries + 1)
+        self.tally
+            .shadow(i, m.set, entries + 1 + u64::from(card.is_some()))
     }
 
     /// Under host streaming, the streamed pass of layer index `i`'s block of
@@ -3153,11 +3155,11 @@ impl<'a> GroupCx<'a> {
             fold_in: &own.folds[m.cur.f],
         };
         self.ffn
-            .enqueue_batch_stream(gpu, bl, card, &mut batch.ffn, &block, tiered)?;
-        // The wait, the tile path's six launches over the streamed places
-        // with card experts, and the merge.
+            .enqueue_batch_stream(gpu, bl, card, &mut batch.ffn, &block, self.slots, tiered)?;
+        // The wait, with card experts the streamed pass's map row and its six
+        // launches over the streamed places, and the merge.
         self.tally
-            .shadow(i, m.set, 2 + if card.is_some() { 6 } else { 0 })?;
+            .shadow(i, m.set, 2 + if card.is_some() { 7 } else { 0 })?;
         if self.batch.card_timing {
             self.mark(m.set, i, 3)?;
             self.tally.shadow(i, m.set, 1)?;

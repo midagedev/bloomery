@@ -25,8 +25,12 @@
 //!    the grouped GEMM ([`bloomery_gpu::gemm::enqueue_gemm_batch`]: the route
 //!    table over the block's ids and the layer's map row, the gate and up
 //!    GEMMs, the SwiGLU of the card slots' places, the down GEMM into the
-//!    down rows by slot) and their sum (`ds41_ffn_card_acc`); the streamed
-//!    passes under host streaming keep the tile items
+//!    down rows by slot) and their sum (`ds41_ffn_card_acc`); under host
+//!    streaming a call's pick splits the block into two such passes, the
+//!    experts it kept while the admitted ones' copies land and then the
+//!    admitted ones, each over the map row narrowed to its experts
+//!    (`ds41_ffn_pass_map`), before the one sum; a gate's hosted-expert
+//!    catcher runs every pass on the tile items instead
 //!    ([`enqueue_tiled_experts`]), an expert a tile of its rows at most eight
 //!    slots of its own;
 //! 4. the join ([`FfnPiece::enqueue_batch_join`]), one launch over the block:
@@ -49,12 +53,14 @@
 //! the route writes, per token, what its one-token launch writes — the
 //! m-column kernels carry that contract — and the combine is
 //! [`combine_elem`] cut at its one seam ([`card_sum_elem`], then
-//! [`join_elem`]). The streamed passes' tile path stays the step's bits (its
-//! gate·up reads its token's column through the step's `q3k_row_dot`); the
-//! default block's card experts run the grouped GEMM, which folds each
-//! 128-value activation block one fma where the step keeps per-lane partials
-//! a warp tree reduces: their rows are a reassociated sum of the same exact
-//! integer block sums, a band the prefill gate pins, not the steps' bits.
+//! [`join_elem`]). The tile path stays the step's bits (its gate·up reads
+//! its token's column through the step's `q3k_row_dot`); the blocks' card
+//! experts run the grouped GEMM, which folds each 128-value activation block
+//! one fma where the step keeps per-lane partials a warp tree reduces: their
+//! rows are a reassociated sum of the same exact integer block sums, a band
+//! the prefill gate pins, not the steps' bits. A GEMM output is its row's and
+//! its slot's alone, whichever other slots a pass lists, so a pick's two
+//! passes write the bits one pass over the same places writes.
 
 use std::mem::size_of;
 
@@ -172,6 +178,47 @@ mod ffn_batch_kernels {
             // SAFETY: i < n <= sel.len(); thread i is sel[i]'s only writer.
             unsafe { *sel.get_unchecked_mut(i) = s };
         }
+    }
+
+    /// A layer's map row narrowed in place to the experts one pass of a
+    /// call's pick runs, [`ds41_ffn_replace`]'s rule over experts: thread
+    /// `e < n_expert` reads `row[e]` and the map now, `map[row_off + e]`; an
+    /// expert whose `row[e]` is [`HOST`] while the map now names a card slot
+    /// gets that slot when `streamed` is not 0, else [`HOST`]; every other
+    /// expert gets [`HOST`] when `streamed` is not 0, else its place now.
+    /// Over the route's copy of the row (the map before the pick) it leaves
+    /// the kept pass's map, every expert's place now but the admitted ones';
+    /// over that map with `streamed`, the streamed pass's, the admitted ones'
+    /// alone — an expert the kept map leaves on the host while the map now
+    /// names a slot is exactly an admitted one.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (map.len() >= row_off + n_expert, row.len() >= n_expert)
+    )]
+    pub fn ds41_ffn_pass_map(
+        map: &[u32],
+        row_off: u32,
+        n_expert: u32,
+        streamed: u32,
+        mut row: DisjointSlice<u32>,
+    ) {
+        let e = thread::index_1d().get();
+        if e >= n_expert as usize {
+            return;
+        }
+        // SAFETY: e < n_expert, so row_off + e < map.len() by the launch
+        // contract.
+        let now = unsafe { *map.get_unchecked(row_off as usize + e) };
+        // SAFETY: e < n_expert <= row.len() by the launch contract; thread e
+        // is row[e]'s only reader and writer.
+        let was = unsafe { *row.get_unchecked_mut(e) };
+        let fresh = was == HOST && now != HOST;
+        let place = if (streamed != 0) == fresh { now } else { HOST };
+        // SAFETY: as the read above.
+        unsafe { *row.get_unchecked_mut(e) = place };
     }
 
     /// The q8_1 planes of a grouped table's entries (`order`, runs `start`,
@@ -1068,13 +1115,25 @@ pub fn enqueue_leg_block(
 }
 
 /// Which path a block's card experts run on
-/// ([`FfnPiece::enqueue_block_experts`]): the default pass's grouped GEMM,
-/// or the K-quant tile path, which the passes under host streaming keep (the
-/// kept and the streamed pass, over the block's own or its streamed places).
+/// ([`FfnPiece::enqueue_block_experts`]): the grouped GEMM, every pass's, or
+/// the K-quant tile path a gate's hosted-expert catcher holds the batch to
+/// ([`FfnBatch::set_card_tiles`]).
 #[derive(Clone, Copy)]
 enum CardPath {
     Gemm,
     Tiles,
+}
+
+/// One of the two passes a block runs under host streaming after the call's
+/// pick ([`FfnPiece::enqueue_batch_block_kept`],
+/// [`FfnPiece::enqueue_batch_stream`]), which narrows the layer's map row to
+/// its experts ([`FfnBatchKernels::enqueue_pass_map`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickPass {
+    /// The card experts the pick kept, while the admitted ones' copies land.
+    Kept,
+    /// The admitted experts, once their copies have landed.
+    Streamed,
 }
 
 /// The batch's kernels: loaded once by [`FfnBatch::new`], or alone by a gate
@@ -1220,6 +1279,35 @@ impl FfnBatchKernels {
             .prepare_ds41_ffn_sel_merge(LaunchConfig1D::new(grid, THREADS, 0))?;
         self.module
             .ds41_ffn_sel_merge(stream, &prep, ssel, launch_u32(what, "n", n)?, sel)?;
+        Ok(())
+    }
+
+    /// Enqueue `ds41_ffn_pass_map`: `row`, a layer's map row of `n_expert`
+    /// places, narrowed in place under that layer's row of `map` (from
+    /// `row_off`), the map now, to `pass`'s experts — over the route's copy
+    /// of the row the kept pass's, over the kept pass's the streamed pass's.
+    /// One launch. Asynchronous, allocation-free.
+    pub fn enqueue_pass_map(
+        &self,
+        stream: &CudaStream,
+        (map, row_off, n_expert): (&DeviceBuffer<u32>, usize, usize),
+        pass: PickPass,
+        row: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let what = "ds41_ffn_pass_map";
+        let grid = launch_u32(what, "grid", n_expert.div_ceil(THREADS as usize))?;
+        let prep = self
+            .module
+            .prepare_ds41_ffn_pass_map(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.ds41_ffn_pass_map(
+            stream,
+            &prep,
+            map,
+            launch_u32(what, "row_off", row_off)?,
+            launch_u32(what, "n_expert", n_expert)?,
+            u32::from(pass == PickPass::Streamed),
+            row,
+        )?;
         Ok(())
     }
 
@@ -1517,13 +1605,15 @@ pub struct FfnBatch {
     sh_raw: DeviceBuffer<f32>,
     /// The block's card experts: per token the norm's q8_1 planes (q3 and
     /// d8, as the chunk's scratch lays out a column) and the tile path's
-    /// scratch ([`Q3TileScratch`]) — both the streamed passes' — the default
-    /// block's GEMM scratch ([`GemmScratch`]), the two for a file with a fused
-    /// layer ([`Reads`], else none) with the q5_K tile module such a layer's
-    /// down asks for, the layer's map row as the block's route fill reads it —
-    /// the slot map lives outside the batch, so the route, which holds it,
-    /// copies the row (the row a pick moves is copied again by the route that
-    /// runs under it) — and the down output by slot, which every path writes
+    /// scratch ([`Q3TileScratch`]) — both the tile catcher's
+    /// ([`FfnBatch::set_card_tiles`]) — the blocks' GEMM scratch
+    /// ([`GemmScratch`]), the two for a file with a fused layer ([`Reads`],
+    /// else none) with the q5_K tile module such a layer's down asks for, the
+    /// layer's map row as the block's route fill reads it — the slot map lives
+    /// outside the batch, so the route, which holds it, copies the row (the
+    /// row a pick moves is copied again by the route that runs under it), and
+    /// a pick's two passes narrow that copy in place to the experts each runs
+    /// ([`PickPass`]) — and the down output by slot, which every path writes
     /// the same rows of.
     q3_all: DeviceBuffer<u64>,
     d8_all: DeviceBuffer<f32>,
@@ -1553,11 +1643,11 @@ pub struct FfnBatch {
     /// The common card leg's launches and buffers, for a block of a layer on
     /// it ([`FfnBatch::prepare_leg`]).
     leg: Option<(CardLeg, LegBufs)>,
-    /// The default block's card experts on the tile path in place of the
-    /// grouped GEMM: set only by a gate's hosted-expert catcher
+    /// Every block's card experts on the tile path in place of the grouped
+    /// GEMM: set only by a gate's hosted-expert catcher
     /// ([`Body::set_batch_card_tiles`]), which holds the batch to the steps'
-    /// bits — the tile path is the order the steps and the streamed passes
-    /// keep. The engine's own calls never set it.
+    /// bits — the tile path is the order the steps keep. The engine's own
+    /// calls never set it.
     gate_tiles: bool,
 }
 
@@ -1686,7 +1776,7 @@ fn collect_route(
     col.feed_routed(gpu, &names::ffn_up_exps(layer), (x, ids), dims, false)
 }
 
-/// The default block's card experts on the grouped GEMM
+/// The blocks' card experts on the grouped GEMM
 /// ([`enqueue_block_experts`]): the block's normed rows in the GEMM's q8_1
 /// form (a column a token — the route's norm quantized again, whose bytes
 /// the norm's fused launch defines equal to its own, bit for bit), the gate
@@ -1824,13 +1914,23 @@ impl FfnBatch {
         })
     }
 
-    /// Run the default blocks' card experts on the tile path from the next
-    /// prompt call on: a gate's hosted-expert catcher alone
+    /// Run the blocks' card experts on the tile path from the next prompt
+    /// call on: a gate's hosted-expert catcher alone
     /// ([`Body::set_batch_card_tiles`]); no engine caller and no lever sets
     /// it.
     #[doc(hidden)]
     pub fn set_card_tiles(&mut self, on: bool) {
         self.gate_tiles = on;
+    }
+
+    /// The path every block's card experts run on: the grouped GEMM, or the
+    /// tile path under a gate's catcher ([`FfnBatch::set_card_tiles`]).
+    fn card_path(&self) -> CardPath {
+        if self.gate_tiles {
+            CardPath::Tiles
+        } else {
+            CardPath::Gemm
+        }
     }
 
     /// The streamed places a prompt call under host streaming writes, one a
@@ -2640,9 +2740,32 @@ impl FfnPiece {
         kernels.enqueue_replace(gpu.stream(), &places, fault, &mut sel, &mut ssel)
     }
 
+    /// With `card` experts on layer index `i`, the batch's copy of the
+    /// layer's map row narrowed in place to `pass`'s experts under `slots`,
+    /// the map's card copy (one launch); without them nothing, as the route
+    /// copied no row. Asynchronous, allocation-free.
+    fn enqueue_pass_map(
+        &self,
+        gpu: &Gpu,
+        i: usize,
+        card: bool,
+        b: &mut FfnBatch,
+        slots: &DeviceTensor<u32>,
+        pass: PickPass,
+    ) -> Result<(), GpuError> {
+        if !card {
+            return Ok(());
+        }
+        let map = (slots.buf(), self.cfg[i].row_off, self.n_expert);
+        b.kernels
+            .enqueue_pass_map(gpu.stream(), map, pass, &mut b.map_row)
+    }
+
     /// Under host streaming, the block's card experts but those the call's
-    /// pick admitted, on the tile path the streamed passes keep (over the
-    /// replaced places), after [`FfnPiece::enqueue_batch_replace`]; the
+    /// pick admitted, after [`FfnPiece::enqueue_batch_replace`] (over the
+    /// replaced places): with card experts the layer's map row narrowed to
+    /// them under `slots`, the map's card copy (`ds41_ffn_pass_map`, one
+    /// launch), then the block's pass on the path every block takes; the
     /// streamed pass follows. Asynchronous, allocation-free.
     pub fn enqueue_batch_block_kept(
         &mut self,
@@ -2651,19 +2774,28 @@ impl FfnPiece {
         card: Option<CardStacks<'_>>,
         b: &mut FfnBatch,
         io: &BlockIo<'_>,
+        slots: &DeviceTensor<u32>,
     ) -> Result<(), GpuError> {
         let layer = bl.layer;
         let (i, at, u) = self.batch_block(layer, b, io)?;
         let card = self.check_card(layer, i, card)?;
-        self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], CardPath::Tiles, false)
+        self.enqueue_pass_map(gpu, i, card.is_some(), b, slots, PickPass::Kept)?;
+        let path = b.card_path();
+        self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], path, false)
     }
 
     /// Under host streaming, the streamed pass of the block, once the engine
-    /// stream waits for the pick's copies: the admitted ids' experts on the
-    /// tile path the streamed passes keep, over the streamed places, those
-    /// places merged into the block's (`ds41_ffn_sel_merge`), then the card
-    /// sum in slot order over every card slot, or for a `tiered` layer the
-    /// held routing. Asynchronous, allocation-free.
+    /// stream waits for the pick's copies: with card experts the kept pass's
+    /// map row narrowed to the admitted experts under `slots`
+    /// (`ds41_ffn_pass_map`, one launch) and their pass over the streamed
+    /// places, on the path every block takes; those places merged into the
+    /// block's (`ds41_ffn_sel_merge`), then the card sum in slot order over
+    /// every card slot, or for a `tiered` layer the held routing.
+    /// Asynchronous, allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's layer, stacks, buffers, tokens, the map and the tier (rust-quality R8)"
+    )]
     pub fn enqueue_batch_stream(
         &mut self,
         gpu: &Gpu,
@@ -2671,12 +2803,15 @@ impl FfnPiece {
         card: Option<CardStacks<'_>>,
         b: &mut FfnBatch,
         io: &BlockIo<'_>,
+        slots: &DeviceTensor<u32>,
         tiered: bool,
     ) -> Result<(), GpuError> {
         let layer = bl.layer;
         let (i, at, u) = self.batch_block(layer, b, io)?;
         let card = self.check_card(layer, i, card)?;
-        self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], CardPath::Tiles, true)?;
+        self.enqueue_pass_map(gpu, i, card.is_some(), b, slots, PickPass::Streamed)?;
+        let path = b.card_path();
+        self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], path, true)?;
         let slots_n = (u - at) * N_USED;
         {
             let FfnBatch {
@@ -2695,9 +2830,10 @@ impl FfnPiece {
     }
 
     /// The block's launches for tokens `at .. u` of the group's batch `set`,
-    /// after every chunk's part before them: with card experts, the default
-    /// pass's GEMM over the block's card slots
-    /// ([`enqueue_block_experts`]) into the block's down outputs by slot;
+    /// after every chunk's part before them: with card experts, the grouped
+    /// GEMM over the block's card slots (the tile path under a gate's
+    /// catcher, [`enqueue_block_experts`]) into the block's down outputs by
+    /// slot;
     /// then the card sum of every token of the block — or, for a `tiered`
     /// layer, whose card sum waits for the tier's rows
     /// ([`FfnPiece::enqueue_batch_acc_tier`]), the copy of the block's
@@ -2717,27 +2853,25 @@ impl FfnPiece {
         [at, u]: [usize; 2],
         tiered: bool,
     ) -> Result<(), GpuError> {
-        let path = if b.gate_tiles {
-            CardPath::Tiles
-        } else {
-            CardPath::Gemm
-        };
+        let path = b.card_path();
         self.enqueue_block_experts(gpu, i, card, b, layer, [at, u], path, false)?;
         self.enqueue_block_finish(gpu, i, b, [layer, set], [at, u], tiered)
     }
 
     /// With card experts, the block's card slots into the block's down
-    /// outputs by slot, on `path`: a layer the common card leg runs goes
-    /// through it whatever the path; the default pass's GEMM quantizes the
-    /// block's normed rows ([`Gpu::enqueue_quantize_gemm`], the bytes the
-    /// route's fused norm leaves, bit for bit) and runs the common batch
-    /// sequence ([`enqueue_gemm_batch`]) — the route table over the block's
-    /// ids and the layer's map row the route copied, the gate and up GEMMs,
-    /// the SwiGLU of the card slots' places, the down GEMM — each stack's
-    /// type read from the stacks and refused by name where the grouped GEMM
-    /// decodes it not; the tile path ([`enqueue_tiled_experts`]) reads the
-    /// block's q8_1 planes over the block's places, or with `streamed` over
-    /// its streamed places.
+    /// outputs by slot, on `path`, over the block's places or with `streamed`
+    /// its streamed places: a layer the common card leg runs goes through it
+    /// whatever the path; the GEMM quantizes the block's normed rows
+    /// ([`Gpu::enqueue_quantize_gemm`], the bytes the route's fused norm
+    /// leaves, bit for bit) and runs the common batch sequence
+    /// ([`enqueue_gemm_batch`]) — the route table over the block's ids and the
+    /// layer's map row the route copied (a pick's pass narrowed it to that
+    /// pass's experts, [`PickPass`], so the table lists the slots its places
+    /// name), the gate and up GEMMs, the SwiGLU of the places' card slots, the
+    /// down GEMM — each stack's type read from the stacks and refused by name
+    /// where the grouped GEMM decodes it not; the tile path
+    /// ([`enqueue_tiled_experts`]) reads the block's q8_1 planes over the
+    /// places.
     #[allow(
         clippy::too_many_arguments,
         reason = "the block's layer, stacks, buffers, tokens, path and places (rust-quality R8)"
@@ -2912,9 +3046,9 @@ impl FfnPiece {
 
     /// Layer `layer`'s shadow work for the chunk `io`, after the batch's
     /// route: HC_PRE into the batch's results, the norm's q8_1 form again —
-    /// with card experts copied into the block's planes, which a streamed
-    /// block's tile path reads — and the shared expert into the batch's
-    /// outputs. `lw` are layer `i`'s tensors.
+    /// with card experts copied into the block's planes, which the tile path
+    /// reads — and the shared expert into the batch's outputs. `lw` are layer
+    /// `i`'s tensors.
     #[allow(
         clippy::too_many_arguments,
         reason = "the shadow's inputs and the layer's resolved tensors (rust-quality R8)"
@@ -3567,5 +3701,86 @@ mod tests {
             );
             assert!(same(&read(&got), &nan), "no down row written");
         }
+    }
+
+    /// A call's pick splits a layer's experts between its two passes as the
+    /// replace splits the block's places (`ds41_ffn_pass_map` against
+    /// `ds41_ffn_replace`): over the route's row, the map before the pick,
+    /// the kept pass's map is every expert's place now but the admitted
+    /// ones' — a victim and an expert still on the host [`HOST`], a moved one
+    /// its new slot — and over that map the streamed pass's is the admitted
+    /// ones' slots alone; read as places of ids `0 .. n_expert`, the two are
+    /// the replace's `sel` and `ssel`. The layer's row sits past another
+    /// layer's in the map. Mutant: the pass's place read from the row, not
+    /// the map now (the moved expert keeps its old slot, the admitted ones
+    /// stay on the host).
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-ds41-lib` runs it on the box"]
+    fn hw_a_pick_s_pass_maps_are_the_replace_s_places_by_expert() {
+        use super::{PickPass, Places};
+        const E: usize = 300;
+        let gpu = Gpu::new().expect("a card");
+        let stream = gpu.stream();
+        let kernels = FfnBatchKernels::load(gpu.context()).expect("the batch module");
+        // Per expert e: its place before the pick and now, by e % 5 — on the
+        // host both times, admitted, a victim, kept, moved.
+        let slot = |e: usize| u32::try_from(e).expect("a slot") % 61;
+        let (before, now): (Vec<u32>, Vec<u32>) = (0..E)
+            .map(|e| match e % 5 {
+                0 => (HOST, HOST),
+                1 => (HOST, slot(e)),
+                2 => (slot(e), HOST),
+                3 => (slot(e), slot(e)),
+                _ => (slot(e), slot(e + 7)),
+            })
+            .unzip();
+        let want_kept: Vec<u32> = (0..E)
+            .map(|e| if e % 5 == 1 { HOST } else { now[e] })
+            .collect();
+        let want_streamed: Vec<u32> = (0..E)
+            .map(|e| if e % 5 == 1 { now[e] } else { HOST })
+            .collect();
+        // The map: another layer's row of E first, then this layer's.
+        let map: Vec<u32> = (0..E)
+            .map(|e| slot(e + 3))
+            .chain(now.iter().copied())
+            .collect();
+        let map = DeviceBuffer::from_host(stream, &map).expect("the map");
+        let mut row = DeviceBuffer::from_host(stream, &before).expect("the row");
+        kernels
+            .enqueue_pass_map(stream, (&map, E, E), PickPass::Kept, &mut row)
+            .expect("the kept pass's map");
+        let kept = row.to_host_vec(stream).expect("the kept map");
+        kernels
+            .enqueue_pass_map(stream, (&map, E, E), PickPass::Streamed, &mut row)
+            .expect("the streamed pass's map");
+        let streamed = row.to_host_vec(stream).expect("the streamed map");
+        assert_eq!(kept, want_kept, "the kept pass's map");
+        assert_eq!(streamed, want_streamed, "the streamed pass's map");
+        let ids: Vec<u32> = (0..u32::try_from(E).expect("ids")).collect();
+        let ids = DeviceBuffer::from_host(stream, &ids).expect("the ids");
+        let mut sel = DeviceBuffer::from_host(stream, &before).expect("the places");
+        let mut ssel = DeviceBuffer::from_host(stream, &[0u32; E]).expect("the streamed places");
+        let places = Places {
+            ids: &ids,
+            n: E,
+            map: &map,
+            row_off: E,
+            n_expert: E,
+        };
+        let fault = gpu.layer_sink(0).expect("a sink");
+        kernels
+            .enqueue_replace(stream, &places, fault, &mut sel, &mut ssel)
+            .expect("the replace");
+        assert_eq!(
+            sel.to_host_vec(stream).expect("sel"),
+            kept,
+            "the kept map is the replace's sel"
+        );
+        assert_eq!(
+            ssel.to_host_vec(stream).expect("ssel"),
+            streamed,
+            "the streamed map is the replace's ssel"
+        );
     }
 }

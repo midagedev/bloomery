@@ -903,7 +903,10 @@ gpu 3115 425 10
 # kernel `ds41_glue_embed_q8_0` (its decode call and its two stores, into the four streams and into the layer input, each
 # bounded by the kernel's launch contract and with its SAFETY line) and the unsafe fn `q8_0_row_value` it decodes
 # through (the scale word read and the code byte read through `image_byte`, one block, with its `# Safety` contract).
-gpu-deepseek41 375 46 0
+# PIN(2026-11-15): gpu-deepseek41 375 -> 378 blocks, new code, not old code relaxed: the pick pass's slot map kernel
+# `ds41_ffn_pass_map` (chain/ffn/batch.rs: the slot map read, the batch row read and the place store), each
+# with its SAFETY line.
+gpu-deepseek41 378 46 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
 # PIN(2026-11-13): gpu-flint 2 -> 3 blocks, new code, not old code relaxed: the MTP draft's layer call

@@ -92,6 +92,7 @@ generate_ds41   ffn_handoff_6_tier                       0           0
 generate_ds41   ds41_ffn_handoff_8_tier                  0           0
 generate_ds41   ds41_ffn_handoff_9                       0           0
 generate_ds41   ds41_ffn_handoff_tier                    0           0
+generate_ds41   ds41_ffn_pass_map                        0           0
 generate_ds41   ds41_ffn_places                          0           0
 generate_ds41   ds41_ffn_post                            0           0
 generate_ds41   ds41_ffn_post_8                          0           0

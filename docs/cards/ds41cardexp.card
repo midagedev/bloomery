@@ -1,0 +1,41 @@
+# Round ds41cardexp: a call's pick runs its two passes (the kept card experts while the admitted
+# ones' copies land, then the admitted ones) on the grouped GEMM every other block runs, in place
+# of the K-quant tile items, each over the layer's map row narrowed to its experts
+# (ds41_ffn_pass_map). The round derives; the lead times the sitting.
+#
+# Decomposition [derived from the lead's v31cardtime sitting and the group-1/2 nsys forms, A6000,
+# place a, 1017 Q3_K_M, P = 4096]: the tile path costs ~10 us a card slot (gate.up 6.5-7.6 +
+# down 3.4 us a slot, per-launch fits R^2 0.98-0.99) against the GEMM's ~1.3 us; its term is the
+# activation columns re-read from DRAM by every row-tile sweep (rho-major blocks, an item's 8
+# columns x 5,280 B re-read by each of 288 / 640 row tiles once the sweep outgrows the 6 MB L2),
+# not the weight bytes. In the sitting a pick layer-batch (b0) reads card_in 21.88 ms against
+# 10.54 on the GEMM layer-batches (b1); after the change b0 ~ b1 + the pick, the map launches, the
+# second pass's fixed cost and the copy wait the shorter kept pass no longer hides (~2.5 ms a pick
+# in the nsys form's copy timeline): a cut of 8-10 ms on 110 pick layer-batches.
+# Resource timeline per layer-batch at group 2: host = enqueue 11.07 + union 30.48 ms (the wall,
+# a sum); the card's 37.9 ms runs under it, so the cut is worth only the host's waits on the card
+# (route waits 0.32 ms/lb, launch-queue back-pressure ~0.38 ms/lb: ~154 ms of the 9.5 s call).
+# A host/card pipeline replay of the sitting's 320 `stat prefill lb` records (modelled chain
+# 9,282 ms against 9,212.6 measured) gives -1.58 % at a 5 ms cut, -1.77 % at 8, -1.85 % at 11.
+kind: ab
+question: does running the pick's two passes on the grouped GEMM shorten the V4.1 prompt call by
+  the host waits the card's pick layer-batches cause at group 2?
+term: pp tok/s @ P = 4096, prose, depth 0, DeepSeek-V4.1-Flash-1017 Q3_K_M, --place a, the default
+  levers (group 2, residency and host streaming on), RTX A6000 - (this tree - base) / base, paired
+  by round
+unit: %
+predict: +0.8..+1.9
+rounds: 8
+condition: this tree's generate_ds41 and d8241d624's (built in a base worktree before the lease, a
+  bin: arm) alternate in one lease, BLOOMERY_AB_ROUNDS=8 just depth-gpu-ds41
+  prose:4096@BLOOMERY_STEP_STATS=1 bin:<base>:prose:4096@BLOOMERY_STEP_STATS=1, the order rotated
+  every round; both arms' plan prints name the same residency word and card_experts, and both
+  arms' stat lines show picks that admitted experts (a run whose residency admitted none measures
+  nothing here); no row carries [cpu-busy] or [other-busy]
+decide-in: land it; then price BLOOMERY_PREFILL_GROUP=1 against 2 as same-binary lever arms: with
+  the pick layer-batches at GEMM speed the card bound at group 1 drops near the host's
+decide-below: read the arms' stat lines: if this tree's b0 card_in stays more than 4 ms above b1's,
+  the copy wait is the term (the kept pass no longer hides it) and the pick's copies must start
+  earlier; else the host waits were not the card's and the pipeline replay is wrong
+decide-above: the launch queue held the host longer than the enqueue records show; re-derive the
+  back-pressure term from the stat lines before the group-1 pricing
