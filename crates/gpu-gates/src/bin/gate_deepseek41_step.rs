@@ -124,6 +124,15 @@
 //!   at every scored position the paired difference `d = NLL_ours − NLL_ik`,
 //!   KL(ik‖ours), the top-1 agreement and both margins. Red is
 //!   Δ_PPL = e^mean(d) − 1 above [`PPL_RED`].
+//! - `--kld-walk` (G4, self-consistency): the loss tool's walk (`ppl_ds41`, `kld::write_base` over
+//!   `shared/ds41_ppl.rs`, the one decode path of the tool and of this clause) over the first ids of the
+//!   prose corpus as [`WALK_CHUNKS`] chunks of [`WALK_CTX`], twice: the two files have the same bytes (the
+//!   second walk's first chunk starts where the first walk's last one ended, so a reset that leaves state
+//!   behind is a different file), and `kld::score_ppl` of the first against the same model reads KLD within
+//!   the band the records' storage derives (each entry above the floor within half its step plus the f32
+//!   slack of the exact log-probability, the entries at level 0 by the row's depth below the floor), and
+//!   every position's top id the record's unless the row's two best logits lie within the two quantization
+//!   steps. Both tiers.
 //! - `--skew-structure`, `--skew-sets`, `--skew-api` (C4): the pair pass's
 //!   clauses (`shared/ds41_skew.rs`) on the same load, after the clauses
 //!   above, from a reset.
@@ -204,6 +213,10 @@ mod finite;
 mod nodes;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_ppl.rs"]
+mod ppl;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_shadow.rs"]
 mod shadow;
 
@@ -226,6 +239,7 @@ mod ds41_tier;
 #[cfg(feature = "deepseek41")]
 mod gate {
     use crate::nodes::ARRIVALS;
+    use crate::ppl::Steps;
     use crate::shadow;
     use crate::skew;
     use std::hash::{DefaultHasher, Hash, Hasher};
@@ -251,7 +265,9 @@ mod gate {
     use bloomery_gpu_gates::act_rule::{Arm, SiteRel, site_rel};
     use bloomery_gpu_gates::flip::{head_cap, head_gap, head_tie};
     use bloomery_gpu_gates::ik_q8_2::{self, QK};
-    use bloomery_gpu_gates::kld::KldBase;
+    use bloomery_gpu_gates::kld::{
+        F32_SLACK, FLOOR_NATS, KldBase, PplModel, score_ppl, write_base,
+    };
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order, count_kinds, kind_name};
     use bloomery_gpu_gates::oracle::deepseek41::{D1, D1N, D2, STEP4};
     use bloomery_gpu_gates::oracle::for_arch;
@@ -324,6 +340,9 @@ mod gate {
     const BAND_SIGMAS: f64 = 4.5;
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
+    /// `--kld-walk`'s chunks: ids per chunk and chunks, 31 scored positions each (a chunk's second half).
+    const WALK_CTX: usize = 64;
+    const WALK_CHUNKS: usize = 2;
     /// G4: red above this Δ_PPL [derived, <https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>].
     const PPL_RED: f64 = 0.015;
     /// Selection-band terms the MoE chain gate's `tie_margin` takes
@@ -339,19 +358,21 @@ mod gate {
         sets: bool,
         select: bool,
         ppl: Option<String>,
+        kld_walk: bool,
         skew: skew::Clauses,
         slots: bool,
         feed: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
-        const USAGE: &str = "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--ppl TAG] \
-             [--skew-structure] [--skew-sets] [--skew-api] [--slots] [--feed]";
+        const USAGE: &str = "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--kld-walk] \
+             [--ppl TAG] [--skew-structure] [--skew-sets] [--skew-api] [--slots] [--feed]";
         let mut a = Args {
             structure: false,
             sets: false,
             select: false,
             ppl: None,
+            kld_walk: false,
             skew: skew::Clauses {
                 structure: false,
                 sets: false,
@@ -366,6 +387,7 @@ mod gate {
                 "--structure" => a.structure = true,
                 "--sets" => a.sets = true,
                 "--select" => a.select = true,
+                "--kld-walk" => a.kld_walk = true,
                 "--skew-structure" => a.skew.structure = true,
                 "--skew-sets" => a.skew.sets = true,
                 "--skew-api" => a.skew.api = true,
@@ -380,7 +402,8 @@ mod gate {
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        let others = a.structure || a.sets || a.select || a.ppl.is_some() || a.skew.any();
+        let others =
+            a.structure || a.sets || a.select || a.kld_walk || a.ppl.is_some() || a.skew.any();
         if !(others || a.slots || a.feed) {
             return Err(USAGE.into());
         }
@@ -566,6 +589,12 @@ mod gate {
         }
         if let Some(line) = fixture_head.line() {
             println!("{line}");
+        }
+        if args.kld_walk {
+            crate::ds41_tier::sc(
+                "--kld-walk: the loss tool's walk writes the same base twice and scores itself",
+            )?;
+            pass &= kld_walk(&mut m, &hp)?;
         }
         if let Some(tag) = &args.ppl
             && tier::run_clause(
@@ -4683,92 +4712,131 @@ mod gate {
             base.scored_per_chunk(),
             base.first_scored()
         );
-        let t = Instant::now();
-        let (mut n, mut sd, mut sd2) = (0usize, 0.0f64, 0.0f64);
-        let (mut nll_o, mut nll_i, mut kld, mut kld2) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-        let (mut same_top, mut dm2) = (0usize, 0.0f64);
-        let mut lq = vec![0.0f64; hp.n_vocab];
-        for c in 0..base.n_chunk() {
-            let toks = base
-                .chunk_tokens(c)
-                .ok_or_else(|| format!("chunk {c} has no ids"))?
-                .to_vec();
-            m.reset()?;
-            for pos in 0..base.n_ctx() - 1 {
-                m.step(&toks[pos..=pos])?;
-                let Some(rec) = base.record(c, pos) else {
-                    continue;
-                };
-                let logits = m.logits()?;
-                let mx = logits.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
-                let lse = f64::from(mx)
-                    + logits
-                        .iter()
-                        .map(|&v| (f64::from(v) - f64::from(mx)).exp())
-                        .sum::<f64>()
-                        .ln();
-                for (q, &v) in lq.iter_mut().zip(&logits) {
-                    *q = f64::from(v) - lse;
-                }
-                let no = -lq[rec.next as usize];
-                let ni = rec.nll();
-                let d = no - ni;
-                n += 1;
-                sd += d;
-                sd2 += d * d;
-                nll_o += no;
-                nll_i += ni;
-                let mut k = 0.0f64;
-                let (mut top_i, mut best_i, mut second_i) =
-                    (0usize, f64::NEG_INFINITY, f64::NEG_INFINITY);
-                for (i, lp) in rec.log_probs().enumerate() {
-                    let lp = f64::from(lp);
-                    k += lp.exp() * (lp - lq[i]);
-                    if lp > best_i {
-                        second_i = best_i;
-                        (top_i, best_i) = (i, lp);
-                    } else if lp > second_i {
-                        second_i = lp;
-                    }
-                }
-                kld += k;
-                kld2 += k * k;
-                let (a, av, _, bv) = top2(&logits);
-                same_top += usize::from(a == top_i);
-                let dm = f64::from(av - bv) - (best_i - second_i);
-                dm2 += dm * dm;
-            }
-            let nf = n as f64;
-            println!(
-                "ppl chunk {c}: {n} positions, mean d {:+.5}, ppl ours {:.4} ik {:.4}, {:.0} s",
-                sd / nf,
-                (nll_o / nf).exp(),
-                (nll_i / nf).exp(),
-                t.elapsed().as_secs_f64()
-            );
-        }
-        let nf = n as f64;
-        let mean = sd / nf;
-        let var = (sd2 / nf - mean * mean).max(0.0) * nf / (nf - 1.0);
-        let se = (var / nf).sqrt();
-        let dppl = mean.exp() - 1.0;
-        let kmean = kld / nf;
-        let kse = ((kld2 / nf - kmean * kmean).max(0.0) / (nf - 1.0)).sqrt();
-        let ok = dppl <= PPL_RED;
+        let s = score_ppl(&base, &mut Steps(m))?;
+        let ok = s.dppl() <= PPL_RED;
         println!(
-            "ppl: {n} positions; PPL ours {:.4} ik {:.4}; d = NLL_ours − NLL_ik mean {mean:+.5} ± \
-             {se:.5} (SE), sd(d) {:.4}; Δ_PPL {:+.3} % (red above {:+.1} %); KLD(ik‖ours) {kmean:.5} \
-             ± {kse:.5}; same top {:.2} %; σ_rel (rms of margin ours − ik) {:.4}; {:.0} s: {}",
-            (nll_o / nf).exp(),
-            (nll_i / nf).exp(),
-            var.sqrt(),
-            100.0 * dppl,
+            "ppl: {} positions; PPL ours {:.4} ik {:.4}; d = NLL_ours − NLL_ik mean {:+.5} ± \
+             {:.5} (SE), sd(d) {:.4}; Δ_PPL {:+.3} % (red above {:+.1} %); KLD(ik‖ours) {:.5} \
+             ± {:.5}; same top {:.2} %; σ_rel (rms of margin ours − ik) {:.4}; {:.0} s: {}",
+            s.n,
+            s.ppl_ours,
+            s.ppl_ik,
+            s.mean_d,
+            s.se_d,
+            s.sd_d,
+            100.0 * s.dppl(),
             100.0 * PPL_RED,
-            100.0 * same_top as f64 / nf,
-            (dm2 / nf).sqrt(),
-            t.elapsed().as_secs_f64(),
+            s.kld,
+            s.kld_se,
+            100.0 * s.same_top as f64 / s.n as f64,
+            s.sigma_rel,
+            s.secs,
             verdict(ok)
         );
         Ok(ok)
+    }
+
+    // ------------------------------------------------------------ kld walk
+
+    /// The loss tool's model behind a read of every row it hands the walk: each scored row's depth (its largest
+    /// logit less its smallest) and the gap between its two best logits, in the order the base's records are.
+    struct Rows<'a> {
+        inner: Steps<'a>,
+        depth: Vec<f64>,
+        gap: Vec<f64>,
+    }
+
+    impl PplModel for Rows<'_> {
+        fn reset(&mut self) -> Result<(), GateError> {
+            self.inner.reset()
+        }
+
+        fn step(&mut self, token: u32) -> Result<(), GateError> {
+            self.inner.step(token)
+        }
+
+        fn logits(&mut self) -> Result<Vec<f32>, GateError> {
+            let row = self.inner.logits()?;
+            let min = row.iter().copied().fold(f32::INFINITY, f32::min);
+            let (_, best, _, next) = top2(&row);
+            self.depth.push(f64::from(best - min));
+            self.gap.push(f64::from(best - next));
+            Ok(row)
+        }
+    }
+
+    /// Clause `--kld-walk`: the walk of the loss tool over the prose corpus's first ids, twice, then scored.
+    ///
+    /// The walks write one file each. Every chunk starts from a reset, so the second walk's first chunk is the
+    /// first walk's first chunk again only if the reset left nothing of the chunk before it: the bytes are
+    /// equal. The first file scored against the same model (`score_ppl`, the rows read again) has, at every
+    /// scored position, a stored log-probability `lp` and the exact `lq` of the row. Above the floor
+    /// `|lp − lq| ≤ ε`, `ε` half the record's step plus the f32 slack (`F32_SLACK`: the loss tool's own
+    /// records are held to it by `gate_exaone_kld`), so those entries add at most `ε·e^ε` to the position's
+    /// KLD `Σ e^lp (lp − lq)`, their stored mass being `e^ε` times the exact one. The `n_f` entries at level 0
+    /// hold the mass `M = n_f·e^min_log_prob` between them, each `lp − lq` at least `−ε` and at most the row's
+    /// depth below the floor, `max(0, depth − FLOOR_NATS) + ε`, so they add between `−ε·M` and `M·(that)`.
+    /// The mean KLD lies within the mean of those bounds. The top id is the record's unless the two best
+    /// logits are within `2ε`: a flip needs the stored order of two entries opposite to the exact one, each
+    /// off by at most `ε`, so the flips cannot outnumber the positions whose two best logits are that close.
+    fn kld_walk(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+        let ids = bloomery_gpu_gates::prose_ids("engram", WALK_CTX * WALK_CHUNKS)?;
+        let dir = std::env::temp_dir().join(format!(
+            "bloomery-gate_deepseek41_step-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let result = kld_walk_in(m, hp, &ids, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    }
+
+    fn kld_walk_in(
+        m: &mut Deepseek41Model,
+        hp: &Hparams,
+        ids: &[u32],
+        dir: &std::path::Path,
+    ) -> Result<bool, GateError> {
+        let (a, b) = (dir.join("a.kld"), dir.join("b.kld"));
+        write_base(&mut Steps(&mut *m), ids, WALK_CTX, hp.n_vocab, &a)?;
+        write_base(&mut Steps(&mut *m), ids, WALK_CTX, hp.n_vocab, &b)?;
+        let same_bytes = std::fs::read(&a)? == std::fs::read(&b)?;
+        let base = KldBase::open(&a, hp.n_vocab)?;
+        let mut rows = Rows {
+            inner: Steps(&mut *m),
+            depth: Vec::new(),
+            gap: Vec::new(),
+        };
+        let s = score_ppl(&base, &mut rows)?;
+        if rows.depth.len() != s.n || s.n != base.records().len() {
+            println!(
+                "kld_walk: {} rows read, {} positions scored, {} records FAIL",
+                rows.depth.len(),
+                s.n,
+                base.records().len()
+            );
+            return Ok(false);
+        }
+        let (mut band, mut ties) = (0.0f64, 0usize);
+        for (r, (&depth, &gap)) in base.records().zip(rows.depth.iter().zip(&rows.gap)) {
+            let eps = f64::from(r.scale) / 2.0 + F32_SLACK;
+            let at_floor = r.levels().filter(|&q| q == 0).count() as f64;
+            let mass = at_floor * f64::from(r.min_log_prob).exp();
+            band += eps * eps.exp() + mass * ((depth - f64::from(FLOOR_NATS)).max(0.0) + eps);
+            ties += usize::from(gap <= 2.0 * eps);
+        }
+        band /= s.n as f64;
+        let flips = s.n - s.same_top;
+        let pass = same_bytes && s.n > 0 && s.kld.abs() <= band && flips <= ties;
+        println!(
+            "--kld-walk ctx={WALK_CTX} chunks={WALK_CHUNKS} positions={} same_bytes={same_bytes} kld={:.3e} \
+             band={band:.3e} same_top={}/{} close_pairs={ties} {}",
+            s.n,
+            s.kld,
+            s.same_top,
+            s.n,
+            verdict(pass)
+        );
+        Ok(pass)
     }
 }

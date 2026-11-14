@@ -1,0 +1,30 @@
+# V3.1 as the DeepSeek default, step 2: the loss of the DeepSeek-V4.1-Flash-1017 files against Unsloth's UD-Q4_K_XL
+# (its routed experts MXFP4, the release's own expert format, so the base is near the release's logits), on one
+# instrument: the engine itself (ppl_ds41, the V4.1 step one id at a time as the serve plans it, `--place a` on the
+# A6000, plan ctx 8192, serving-default levers). No external engine reads all three files (ik dies on UD-Q4_K_XL's
+# id-43 engram table, a mainline llama.cpp reads it as 1-byte F8_E4M3 and refuses the 1017 Q3_K_M). The ids are the
+# text of the ik base kldbase-c2048x4.kld (wikitext-2, ctx 2048 x 4 chunks, the pinned Q3_K_M's tokenizer):
+#   BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf just ds41-kld --ids-of /root/bloomery-data/ikppl/kldbase-c2048x4.kld --run 2048x4=/root/bloomery-data/ikppl/v31eng-q4kxl-base.kld
+#   BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017-Q3_K_M/DeepSeek-V4.1-Flash-1017-Q3_K_M-00001-of-00010.gguf just ds41-kld --ids-of /root/bloomery-data/ikppl/kldbase-c2048x4.kld --run 2048x4=/root/bloomery-data/ikppl/v31eng-q3km.kld
+#   BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf just ds41-kld --ids-of /root/bloomery-data/ikppl/kldbase-c2048x4.kld --run 2048x4=/root/bloomery-data/ikppl/v31eng-i3xxs.kld
+#   ./tools/box.sh 'cargo build --release -p bloomery-gpu-gates --bin kld_diff && target/release/kld_diff /root/bloomery-data/ikppl/v31eng-q4kxl-base.kld /root/bloomery-data/ikppl/v31eng-q3km.kld'
+#   ./tools/box.sh 'target/release/kld_diff /root/bloomery-data/ikppl/v31eng-q4kxl-base.kld /root/bloomery-data/ikppl/v31eng-i3xxs.kld'
+# Minutes a walk [derived from the round's 256x1 smokes and one 2048x1 walk, A6000 `a`, own lines]: 8,188 steps a
+# walk. Smoke rates (255 steps, the residency machine still warming): UD-Q4_K_XL 24.3 steps/s, Q3_K_M 41.8,
+# UD-IQ3_XXS 27.4; the Q3_K_M 2048x1 walk ran 45.9 steps/s (2,047 steps in 44.6 s), 1.10 x its smoke. Walk = load
+# (40.3 s, 60.6 s, 55.0 s measured in the smokes) + 8,188 / rate (the smoke rate, then 1.10 x it): Q4 6.3..5.8 min,
+# Q3 4.0 min (4 x 44.6 s + load), I3 5.9..5.5 min; the three 15..16 min, the two kld_diff (host only, a minute)
+# included ~17 min; the lock waits of a sitting on a shared box come on top.
+# Expected loss [read against the round's smokes, 127 scored positions each (a 256-id chunk's second half), so the
+# SEs are wide; the old guess was KLD 0.03..0.10 for both]: UD-IQ3_XXS vs UD-Q4_K_XL KLD 0.113 +- 0.048, same top
+# 97.6 %, within the old guess's top edge; Q3_K_M vs UD-Q4_K_XL KLD 0.427 +- 0.090, same top 85.8 %, above the old
+# guess. The full walk (4,092 positions) is to read as UD-IQ3_XXS 0.04..0.20 (same top 94..98 %), Q3_K_M 0.15..0.60
+# (same top 80..92 %); the step's question, which is lower, reads UD-IQ3_XXS already at the smoke. The instrument
+# reproduces its own earlier figure: ik's chunk 0 against the engine's Q3_K_M 2048x1 walk is KLD 0.00927 +- 0.00096,
+# same top 98.05 %, PPL 1.8301 (ik) and 1.8205 (engine), the order of the 0.0099 / 97.5 % of the four-chunk run.
+kind: exclusive
+reason: the engine's walk runs the host tier on all 32 cores and the host DRAM for ~16 minutes (pinned pool, a
+  185..249 GB host set a file); beside a timed run it would take that run's cores and memory bandwidth; why now: the
+  user's 2026-11-14 go for making the Unsloth Dynamic V3.1 file the DeepSeek default needs its loss against the
+  near-release base first
+minutes: 15..25

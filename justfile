@@ -3125,6 +3125,9 @@ gate-gpu-ple:
 # --select(2단계): d1(top_k 64)·d2 세트, 인덱서 층마다 선택이 실제로 일어나는 자리 — 리스트가 그 층 점수의 정확한 top-k인지,
 # 인덱서의 쿼리·가중치가 포락선 안인지, ik 리스트와의 차이가 동률 밴드 안뿐인지; 리스트를 바꿔 끼웠을 때 어텐션이 받는
 # 영향은 포락선에 합쳐 잰다.
+# --kld-walk (both tiers): the V4.1 loss tool's walk (ppl_ds41, shared/ds41_ppl.rs) over the prose corpus's first 128 ids as two chunks
+# of 64, twice: the same bytes (a reset that leaves state behind makes the second walk another file), and `score_ppl` of the file
+# against the same model reads KLD within the band the records' storage derives, every top id the record's but a close pair's.
 # --skew-structure, --skew-sets, --skew-api (C4 ktok-skew, shared/ds41_skew.rs), on the same load after those, from a
 # reset: tokens t and t+1 as two rows one layer apart on one stream against two one-token steps, bit for bit.
 # --skew-structure: the captured nodes exactly twice the step's by kind and kernel name, the batch order, each row's
@@ -3139,7 +3142,7 @@ gate-gpu-ple:
 # batch nor the step reads is fed as steps, `Body::batch_refusal` names a tensor that decided it. Under
 # BLOOMERY_FIXTURE_VARIANT=istadense every clause above reads that file's own oracle sets, `fx_istadense_...`.
 [group('v41-load')]
-gate-gpu-ds41-step *ARGS='--structure --sets --select --skew-structure --skew-sets --skew-api':
+gate-gpu-ds41-step *ARGS='--structure --sets --select --kld-walk --skew-structure --skew-sets --skew-api':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --feed'
 
 # The tensor-parallel V4.1 body (`body::open_rank`) on the original-format fixture folder, one, two and four ranks on
@@ -4589,6 +4592,17 @@ gate-gpu-exaone-kld:
 # lease; no number of it is a timing). The run is bounded at 30 minutes.
 exaone-kld IDS +RUNS:
     BLOOMERY_MODEL=exaone-moe BLOOMERY_CARD=a6000 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features flint --release --bin ppl_exaone && runs=""; for r in {{RUNS}}; do runs="$runs --run $r"; done; BLOOMERY_GATE_BOUND=${BLOOMERY_GATE_BOUND:-1800} bash tools/gpu-gate.sh ppl_exaone --ids {{IDS}} $runs'
+
+# V4.1's loss tool (ppl_ds41's doc): the file BLOOMERY_V41_MODEL names (its first shard; unset, the profile's file; that variable
+# alone picks the V4.1 file, gguf::v41) over the ids of an ik base (`--ids-of BASE.kld`) or of a file (`--ids FILE`, one id a line)
+# for each `--run CTX[xCHUNKS]=OUT.kld` (one load serves them all), written as ik's KL-divergence base files on the box; `--place`, `--plan-ctx` and `--plan` (the plan
+# records alone, no load) as the doc says. `kld_diff A.kld B.kld` (build it with `cargo build --release -p bloomery-gpu-gates --bin
+# kld_diff`, host only) prints the loss of B against A. On the A6000 alone (a card's lock and the V4.1 load lock, not the timing
+# lease; no number of it is a timing). The run is bounded at 60 minutes (BLOOMERY_GATE_BOUND). Real tier only (the fixture
+# tier's file is no file to score).
+[group('v41-load')]
+ds41-kld +ARGS:
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh ds41-kld && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin ppl_ds41 && BLOOMERY_GATE_BOUND=${BLOOMERY_GATE_BOUND:-3600} bash tools/gpu-gate.sh ppl_ds41 {{ARGS}}'
 
 # The verify pass's cost in decode steps (gate_exaone_verify's `--time`): one plain step and one pass of two rows over the plain
 # run's own next ids, medians, c_v = pass / step, under the timing lease (tools/ref/time-gate.sh) on the timing card. The model is

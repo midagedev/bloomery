@@ -941,6 +941,12 @@ required-features = ["flint"]
 name = "ppl_exaone"
 required-features = ["flint"]
 
+# ppl_ds41: the V4.1 loss tool — the engine's run of a DeepSeek-V4.1-Flash GGUF over a fixed id list or an ik base's ids,
+# written as the same base file; the one reader of every file of the family (ik reads no MXFP4 or MXFP8 file of it).
+[[bin]]
+name = "ppl_ds41"
+required-features = ["deepseek41"]
+
 # exaone-kld: the loss tool's walk on the fixture GGUFs — its records held to an independent run's rows,
 # the same bytes twice, and a copy with its logits moved by a known amount.
 [[bin]]
