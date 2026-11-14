@@ -223,6 +223,9 @@ impl Glue {
             )?;
         }
         let wide = (HC_STREAMS + 1) * ROW;
+        if let Some(c) = bloomery_gpu::imatrix::collector() {
+            c.feed_dense(gpu, &site.wkv, &b.x, (m, rows_values))?;
+        }
         let wkv = Dense::of(w, &site.wkv, rows_values, wide)?;
         let act = if wkv.reads_q8_1() {
             let act = b.acts.get_mut(m - 1).ok_or_else(|| GpuError::Shape {

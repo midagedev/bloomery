@@ -91,6 +91,28 @@ pub const HC_STREAMS: usize = 4;
 /// HC_PRE values per token: `pre`, `post`, `comb`.
 pub const HC_MIX: usize = 24;
 const _: () = assert!(HC_MIX == 2 * HC_STREAMS + HC_STREAMS * HC_STREAMS);
+/// The importance collector's hook for an HC_PRE projection `name` (a layer's `hc_fn`) over `m` tokens'
+/// flattened streams (`HC_STREAMS * n` values a token). `llama-imatrix` records the projection's input, which
+/// is the streams rms-normalized across the whole flattened row; `ds41_hc_pre` fuses that scale into its dot, so
+/// the hook normalizes into a scratch and feeds the scratch. Nothing when no collector is attached; it allocates,
+/// which only a collecting walk reaches.
+pub fn feed_hc_fn(
+    gpu: &bloomery_gpu::Gpu,
+    name: &str,
+    streams: &DeviceBuffer<f32>,
+    (m, n, eps): (usize, usize, f32),
+) -> Result<(), bloomery_gpu::GpuError> {
+    let Some(c) = bloomery_gpu::imatrix::collector() else {
+        return Ok(());
+    };
+    let (stream, width) = (gpu.stream(), HC_STREAMS * n);
+    let ones = DeviceBuffer::from_host(stream, &vec![1.0f32; width])?;
+    let mut normed = DeviceBuffer::zeroed(stream, m * width)?;
+    gpu.elem()
+        .enqueue_rms_norm(stream, streams, &ones, eps, width, m, &mut normed)?;
+    c.feed_dense(gpu, name, &normed, (m, width))
+}
+
 /// Values of K one `ds41_hc_pre` block owns: one q3_K row-walk iteration.
 pub const HC_PIECE: usize = 512;
 /// Threads of a `ds41_hc_pre` block.

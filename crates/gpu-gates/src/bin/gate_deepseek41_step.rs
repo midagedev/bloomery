@@ -217,6 +217,14 @@ mod nodes;
 mod ppl;
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_imatrix.rs"]
+mod imx;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_imatrix_gate.rs"]
+mod imx_gate;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_shadow.rs"]
 mod shadow;
 
@@ -362,11 +370,13 @@ mod gate {
         skew: skew::Clauses,
         slots: bool,
         feed: bool,
+        /// `--imatrix DIR`: the importance collection against ik's, the files written under `DIR`.
+        imatrix: Option<String>,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--kld-walk] \
-             [--ppl TAG] [--skew-structure] [--skew-sets] [--skew-api] [--slots] [--feed]";
+             [--ppl TAG] [--skew-structure] [--skew-sets] [--skew-api] [--slots] [--feed] [--imatrix DIR]";
         let mut a = Args {
             structure: false,
             sets: false,
@@ -380,6 +390,7 @@ mod gate {
             },
             slots: false,
             feed: false,
+            imatrix: None,
         };
         let mut it = std::env::args().skip(1);
         while let Some(arg) = it.next() {
@@ -393,6 +404,12 @@ mod gate {
                 "--skew-api" => a.skew.api = true,
                 "--slots" => a.slots = true,
                 "--feed" => a.feed = true,
+                "--imatrix" => {
+                    a.imatrix = Some(
+                        it.next()
+                            .ok_or_else(|| format!("--imatrix needs a directory: {USAGE}"))?,
+                    );
+                }
                 "--ppl" => {
                     a.ppl = Some(
                         it.next()
@@ -404,8 +421,15 @@ mod gate {
         }
         let others =
             a.structure || a.sets || a.select || a.kld_walk || a.ppl.is_some() || a.skew.any();
-        if !(others || a.slots || a.feed) {
+        if !(others || a.slots || a.feed || a.imatrix.is_some()) {
             return Err(USAGE.into());
+        }
+        if a.imatrix.is_some() && (others || a.slots || a.feed) {
+            return Err(format!(
+                "--imatrix beside another clause: it loads with the prompt triangle off and walks the batch, where \
+                 the others pin the steps feed; run it alone: {USAGE}"
+            )
+            .into());
         }
         if a.feed && (others || a.slots) {
             return Err(format!(
@@ -453,6 +477,19 @@ mod gate {
         cfg.place = tier::plan_levers(&split, &levers, 0)?;
         let hp = Hparams::read(&split)?;
         let inputs = PlanInputs::read(&split)?;
+        if let Some(dir) = &args.imatrix {
+            let mut imx_cfg = body::OpenCfg::from_levers(&levers)?;
+            imx_cfg.place = tier::plan_levers(&split, &levers, 0)?;
+            let ok = crate::imx_gate::run(dir, &path, &imx_cfg)?;
+            tier::expect_fixture_oracle("gate_deepseek41_step", fixture_oracle_declared(&args))?;
+            println!("gate_deepseek41_step: {}", tier::tally_line());
+            return if ok {
+                println!("PASSED: gate_deepseek41_step --imatrix");
+                Ok(())
+            } else {
+                Err(checks_failed())
+            };
+        }
         if args.feed {
             crate::ds41_tier::sc(
                 "--feed: the file's prompt feed at the default levers, and a refused batch's steps",
@@ -621,6 +658,7 @@ mod gate {
     fn fixture_oracle_declared(args: &Args) -> usize {
         usize::from(args.sets) * FIXTURE_ORACLE_SETS
             + usize::from(args.select) * FIXTURE_ORACLE_SELECT
+            + usize::from(args.imatrix.is_some()) * crate::imx_gate::FIXTURE_ORACLE
     }
 
     // ------------------------------------------------------------ the feed

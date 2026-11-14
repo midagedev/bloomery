@@ -517,6 +517,15 @@ impl Collector {
         Ok(e)
     }
 
+    /// Drop every entry: the next feed starts a fresh collection. For a caller that writes one collection and
+    /// starts the next in the same process.
+    pub fn reset(&self) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
     /// The names collected so far, sorted.
     #[must_use]
     pub fn names(&self) -> Vec<String> {

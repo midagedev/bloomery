@@ -1009,6 +1009,16 @@ pub struct LegBlock<'a> {
     pub layer: usize,
     pub limit: f32,
     pub n_card: usize,
+    /// The importance collector's inputs for the down, when one is attached.
+    pub collect: Option<LegCollect<'a>>,
+}
+
+/// What the collector's hook over a leg block's down reads beyond the block: the block's routed ids (`N_USED`
+/// a token), the down stack's GGUF name and the model's expert count.
+pub struct LegCollect<'a> {
+    pub ids: &'a DeviceBuffer<u32>,
+    pub down: &'a str,
+    pub n_expert: usize,
 }
 
 /// A block's routed experts on one card through the common card leg, for a
@@ -1043,6 +1053,15 @@ pub fn enqueue_leg_block(
             rule,
         };
         card.enqueue_rows(gpu, bufs, &run, &mut rows)?;
+        if let (Some(col), Some(c)) = (bloomery_gpu::imatrix::collector(), &t.collect) {
+            let ids = span(WHAT, c.ids, t0 * N_USED, m * N_USED)?;
+            col.feed_routed_carded(
+                gpu,
+                c.down,
+                (bufs.act_rows(), &ids, &sel),
+                (m, N_USED, bufs.shape().ff, c.n_expert),
+            )?;
+        }
         t0 += m;
     }
     Ok(())
@@ -1590,6 +1609,81 @@ impl Q3TileScratch {
     pub fn device_bytes(&self) -> usize {
         self.tile.device_bytes() + self.q3_ord.num_bytes() + self.d8_ord.num_bytes()
     }
+
+    /// The importance collector's hook over the down of the block [`enqueue_tiled_experts`] last ran over
+    /// `slots_n` slots and `n_cards` card experts: the SwiGLU rows by table entry (`ff` values an entry, the
+    /// entries of one card expert contiguous), each fed under the routed expert (`ids`, the block's global
+    /// ids by slot, through the table's `order`) its slot picked. A slot whose place is not a card expert
+    /// has no entry, so its down is not collected (the host tier's and the tier cards' combines never sit
+    /// on the card as f32 rows). The table's size is a device value, so the hook reads the table back: it
+    /// blocks the stream, which only a collecting walk does. Nothing without entries.
+    fn collect_down(
+        &mut self,
+        gpu: &Gpu,
+        (name, ids): (&str, &DeviceBuffer<u32>),
+        (slots_n, n_cards, n_expert): (usize, usize, usize),
+    ) -> Result<(), GpuError> {
+        const HOOK: &str = "Q3TileScratch::collect_down";
+        let Some(col) = bloomery_gpu::imatrix::collector() else {
+            return Ok(());
+        };
+        let (stream, ff) = (gpu.stream(), self.ff);
+        let (table, h) = self.tile.table_and_h(slots_n, n_cards);
+        let start = read_u32(stream, table.start)?;
+        let total = start.get(n_cards).copied().ok_or_else(|| {
+            GpuError::shape(
+                HOOK,
+                format!("{n_cards} card experts, {} run starts", start.len()),
+            )
+        })? as usize;
+        if total == 0 {
+            return Ok(());
+        }
+        if total > slots_n {
+            return Err(GpuError::shape(
+                HOOK,
+                format!("the table holds {total} entries of a block of {slots_n} slots"),
+            ));
+        }
+        let order = read_u32(stream, table.order)?;
+        let ids = read_u32(stream, ids)?;
+        let mut by_entry = vec![u32::try_from(n_expert).unwrap_or(u32::MAX); slots_n];
+        for (j, id) in by_entry.iter_mut().enumerate().take(total) {
+            let slot = order.get(j).copied().unwrap_or(u32::MAX) as usize;
+            *id = ids.get(slot).copied().ok_or_else(|| {
+                GpuError::shape(
+                    HOOK,
+                    format!("entry {j} names slot {slot} of {}", ids.len()),
+                )
+            })?;
+        }
+        let by_entry = DeviceBuffer::from_host(stream, &by_entry)?;
+        col.feed_routed(gpu, name, (&*h, &by_entry), (total, 1, ff, n_expert), true)
+    }
+}
+
+/// `buf` read back to the host, blocking the stream: the collector's hooks read device tables.
+fn read_u32(stream: &CudaStream, buf: &DeviceBuffer<u32>) -> Result<Vec<u32>, GpuError> {
+    let mut host = vec![0u32; buf.len()];
+    buf.copy_to_host(stream, &mut host)?;
+    Ok(host)
+}
+
+/// The importance collector's hooks over one block's route (`t` tokens of `n` values, the normed rows `x` and
+/// the routed `ids`, `N_USED` a token): the router's input, and the gate and up of every pick — the normed
+/// rows sit on the card whatever tier runs the expert.
+fn collect_route(
+    gpu: &Gpu,
+    col: &bloomery_gpu::imatrix::Collector,
+    layer: usize,
+    router: &str,
+    (x, ids): (&DeviceBuffer<f32>, &DeviceBuffer<u32>),
+    (t, n, n_expert): (usize, usize, usize),
+) -> Result<(), GpuError> {
+    col.feed_dense(gpu, router, x, (t, n))?;
+    let dims = (t, N_USED, n, n_expert);
+    col.feed_routed(gpu, &names::ffn_gate_exps(layer), (x, ids), dims, false)?;
+    col.feed_routed(gpu, &names::ffn_up_exps(layer), (x, ids), dims, false)
 }
 
 /// The default block's card experts on the grouped GEMM
@@ -2306,6 +2400,18 @@ impl FfnPiece {
             }
         };
         let slots_n = t * N_USED;
+        if let Some(col) = bloomery_gpu::imatrix::collector() {
+            let x = span(WHAT, &b.x, at * n, t * n)?;
+            let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
+            collect_route(
+                gpu,
+                col,
+                layer,
+                &c.router,
+                (&x, &ids),
+                (t, n, self.n_expert),
+            )?;
+        }
         let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
         let mut sel = span_mut(WHAT, &mut b.sel, at * N_USED, slots_n)?;
         let places = Places {
@@ -2669,6 +2775,10 @@ impl FfnPiece {
                               (FfnBatch::prepare_leg)",
                 })?;
                 let x = span(WHAT, &b.x, at * n, (u - at) * n)?;
+                let down_name = bloomery_gpu::imatrix::collector()
+                    .is_some()
+                    .then(|| names::ffn_down_exps(layer));
+                let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
                 let t = LegBlock {
                     stacks: legs,
                     x: &x,
@@ -2677,6 +2787,11 @@ impl FfnPiece {
                     layer,
                     limit: c.limit,
                     n_card: c.n_card,
+                    collect: down_name.as_deref().map(|down| LegCollect {
+                        ids: &ids,
+                        down,
+                        n_expert: self.n_expert,
+                    }),
                 };
                 return enqueue_leg_block(gpu, leg, &t, &mut down);
             }
@@ -2740,7 +2855,17 @@ impl FfnPiece {
                         &t,
                         tile,
                         &mut down,
-                    )
+                    )?;
+                    if bloomery_gpu::imatrix::collector().is_some() {
+                        let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;
+                        let n_cards = s.gate.rows() / ff;
+                        tile.collect_down(
+                            gpu,
+                            (&names::ffn_down_exps(layer), &ids),
+                            (slots_n, n_cards, self.n_expert),
+                        )?;
+                    }
+                    Ok(())
                 }
             }
         } else {
@@ -2808,6 +2933,7 @@ impl FfnPiece {
         let c = &self.cfg[i];
         let fault = gpu.layer_sink(layer)?;
         {
+            crate::hc::feed_hc_fn(gpu, &c.hc_fn, io.streams, (m, n, self.rms_eps))?;
             let pre = HcFnArgs {
                 params: &lw.hc,
                 x: io.streams,
@@ -2848,6 +2974,10 @@ impl FfnPiece {
                 }
             }
         }
+        if let Some(col) = bloomery_gpu::imatrix::collector() {
+            col.feed_dense(gpu, &c.sh_gate, &b.normed, (m, n))?;
+            col.feed_dense(gpu, &c.sh_up, &b.normed, (m, n))?;
+        }
         match (lw.sh_gate, lw.sh_up) {
             (
                 DevWeight::KQuant {
@@ -2884,6 +3014,9 @@ impl FfnPiece {
                     )?;
                 }
             }
+        }
+        if let Some(col) = bloomery_gpu::imatrix::collector() {
+            col.feed_dense(gpu, &c.sh_down, &b.sh_h, (m, ff))?;
         }
         let act = if lw.sh_down.reads_q8_1() {
             if b.act_sh.is_empty() {

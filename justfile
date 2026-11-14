@@ -3141,9 +3141,15 @@ gate-gpu-ple:
 # batch is held to the reference in bands, so a near-tie flip is the oracle's known one); a file with a tensor neither the
 # batch nor the step reads is fed as steps, `Body::batch_refusal` names a tensor that decided it. Under
 # BLOOMERY_FIXTURE_VARIANT=istadense every clause above reads that file's own oracle sets, `fx_istadense_...`.
+# --imatrix DIR, alone after --feed (fixture tier; the real tier prints its two oracle clauses as left to the fixture): the V4.1 importance
+# collection (ppl_ds41 --imatrix, shared/ds41_imatrix.rs: the prompt batch with the prompt triangle off) over two chunks of 512 ids of AGENTS.md
+# against ik's llama-imatrix on the same fixture and text (IK, the oracle tree; the CPU reads it while the card walks): ours opens through the
+# quantizer's reader and holds every weight of ik's but the listed ones, none of ik's lacks but the listed ones (names); a dense weight's count
+# is the rows walked, a routed stack's the rows times the picks, a gate weight is its up weight (counts); every column of the means within the
+# band ik's mean-of-squares allows (means); and a second identical walk doubles every count and sum exactly (repeat). One load.
 [group('v41-load')]
 gate-gpu-ds41-step *ARGS='--structure --sets --select --kld-walk --skew-structure --skew-sets --skew-api':
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --feed'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step {{ARGS}} && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --slots && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --feed && . tools/ref/ref-paths.sh && export IK && D=target/ds41-imatrix-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_step --imatrix $D'
 
 # The tensor-parallel V4.1 body (`body::open_rank`) on the original-format fixture folder, one, two and four ranks on
 # the one visible card, past one rank each a process of its own in a rank group over TCP ends on the loopback (the

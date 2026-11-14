@@ -813,6 +813,7 @@ impl AttnChain {
         let mut ent = Entries(entries);
         let t_full = cx.token(full);
         let nb = tokens - t_full;
+        collect_streams(&cx, streams_in, tokens)?;
         // Step 1: only HC_POST reads what HC_PRE writes.
         let fork = if full < n {
             // The fork: an event record and the branch's wait on it.
@@ -930,6 +931,85 @@ fn project_chunked(
     Ok(())
 }
 
+/// The importance collector's hooks over a sub-block's projections of the attention norm's `n`
+/// f32 rows (`bloomery_gpu::imatrix`): the file's own tensors, whatever the launches joined —
+/// q_a, the latent projection, the indexer's weights and the compressor's pair. Nothing when no
+/// collector is attached.
+fn collect_normed(cx: &BatchCx<'_>, normed: &DeviceBuffer<f32>, n: usize) -> Result<(), GpuError> {
+    let Some(c) = bloomery_gpu::imatrix::collector() else {
+        return Ok(());
+    };
+    let (names, dims) = (&cx.lp.names, (n, cx.d.n_embd));
+    c.feed_dense(cx.gpu, &names.q_a, normed, dims)?;
+    c.feed_dense(cx.gpu, &names.kv, normed, dims)?;
+    if let Some(ip) = &cx.lp.indexer {
+        c.feed_dense(cx.gpu, &ip.proj, normed, dims)?;
+    }
+    if let Some(st) = &cx.lp.source {
+        c.feed_dense(cx.gpu, &st.kv, normed, dims)?;
+        if let Some(gate) = &st.gate {
+            c.feed_dense(cx.gpu, gate, normed, dims)?;
+        }
+    }
+    Ok(())
+}
+
+/// [`collect_normed`] for HC_PRE's mixes over the layer's input streams: every token's `4 * n_embd`
+/// row, whichever launch ran its HC_PRE.
+fn collect_streams(
+    cx: &BatchCx<'_>,
+    streams_in: &DeviceBuffer<f32>,
+    tokens: usize,
+) -> Result<(), GpuError> {
+    crate::hc::feed_hc_fn(
+        cx.gpu,
+        &cx.lp.names.hc_fn,
+        streams_in,
+        (tokens, cx.d.n_embd, cx.d.eps),
+    )
+}
+
+/// [`collect_normed`] for the query projections over q_a's norm: q_b and the indexer's query.
+fn collect_query(
+    cx: &BatchCx<'_>,
+    q_a_normed: &DeviceBuffer<f32>,
+    n: usize,
+) -> Result<(), GpuError> {
+    let Some(c) = bloomery_gpu::imatrix::collector() else {
+        return Ok(());
+    };
+    let dims = (n, cx.d.q_lora_rank);
+    c.feed_dense(cx.gpu, &cx.lp.names.q_b, q_a_normed, dims)?;
+    if let Some(ip) = &cx.lp.indexer {
+        c.feed_dense(cx.gpu, &ip.q_b, q_a_normed, dims)?;
+    }
+    Ok(())
+}
+
+/// [`collect_normed`] for wo_a over the attention output `y`: a row a token, the heads' values.
+fn collect_out_a(cx: &BatchCx<'_>, y: &DeviceBuffer<f32>, n: usize) -> Result<(), GpuError> {
+    let Some(c) = bloomery_gpu::imatrix::collector() else {
+        return Ok(());
+    };
+    let d = cx.d;
+    c.feed_dense(cx.gpu, &cx.lp.names.out_a, y, (n, d.n_head * d.head_dim))
+}
+
+/// [`collect_normed`] for wo_b over wo_a's rows: a row a token, the groups' low-rank rows.
+fn collect_out_b(cx: &BatchCx<'_>, wo_a: &DeviceBuffer<f32>, n: usize) -> Result<(), GpuError> {
+    let Some(c) = bloomery_gpu::imatrix::collector() else {
+        return Ok(());
+    };
+    let d = cx.d;
+    let groups = d.n_head * d.head_dim / d.group_k;
+    c.feed_dense(
+        cx.gpu,
+        &cx.lp.names.out_b,
+        wo_a,
+        (n, groups * d.o_lora_rank),
+    )
+}
+
 /// Sub-block `sb`'s launches before its chunks (module doc, step 2): the
 /// attention norm of `fold_in` — with the q8_1 form the step's launches of
 /// the layer read — the compressor's projections, the joined projection with
@@ -974,6 +1054,7 @@ fn sub_pre(
             &mut b.normed,
         ))?;
     }
+    collect_normed(cx, &b.normed, n)?;
     if let Some(st) = &t.source {
         let missing = GpuError::State {
             what: WHAT_BATCH,
@@ -1160,6 +1241,7 @@ fn sub_pre(
             &mut b.q_a_normed,
         ))?;
     }
+    collect_query(cx, &b.q_a_normed, n)?;
     match &t.query {
         Query::Joint(w) => {
             ent.one(gpu.enqueue_gemv_q3k_groups(w, &b.q_a_acts[at], groups, &mut b.raw_q))?;
@@ -1550,6 +1632,7 @@ fn sub_post(
     let groups = d.n_head * d.head_dim / d.group_k;
     let q_w = d.n_head * d.head_dim;
     let span_rows = groups * d.o_lora_rank;
+    collect_out_a(cx, &b.y, n)?;
     match t.out_a {
         Dense::Q8_0 { qs, d: qd } => {
             // A chunk a launch: the step's m-column per-head gemv over the
@@ -1634,6 +1717,7 @@ fn sub_post(
             });
         }
     }
+    collect_out_b(cx, &b.wo_a, n)?;
     match t.out_b {
         Dense::Q3K(w) => {
             ent.one(gpu.enqueue_quantize_q8_1_cols(&b.wo_a, &mut b.wo_a_act, n, cx.layer))?;
