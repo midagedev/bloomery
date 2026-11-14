@@ -31,6 +31,34 @@ pub fn engram_facts(arch: &str) -> Option<&'static EngramFacts> {
 pub fn allowed_types(arch: &str, stem: &str) -> Option<&'static [GgmlType]> {
     match arch {
         exaone_moe::ARCH => exaone_moe::allowed_types(stem),
+        kimi_k3::ARCH | kimi_k3::ARCH_K31 => kimi_k3::allowed_types(stem),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{allowed_types, exaone_moe, kimi_k3};
+
+    /// The one call routes each architecture word to its own stem table (both Kimi words to the same one) and holds
+    /// an architecture with no table, or a stem it lacks, to `None`.
+    #[test]
+    fn allowed_types_routes_by_architecture_word() {
+        let stem = "ffn_gate_exps.weight";
+        assert_eq!(
+            allowed_types(kimi_k3::ARCH, stem),
+            kimi_k3::allowed_types(stem)
+        );
+        assert_eq!(
+            allowed_types(kimi_k3::ARCH_K31, stem),
+            kimi_k3::allowed_types(stem)
+        );
+        assert!(allowed_types(kimi_k3::ARCH, stem).is_some());
+        assert_eq!(
+            allowed_types(exaone_moe::ARCH, stem),
+            exaone_moe::allowed_types(stem)
+        );
+        assert_eq!(allowed_types("no-such-arch", stem), None);
+        assert_eq!(allowed_types(kimi_k3::ARCH, "no.such.stem"), None);
     }
 }

@@ -114,16 +114,6 @@ pub const FIT_TYPES: [GgmlType; 6] = [
     GgmlType::IQ1_S,
 ];
 
-/// The types the engine's reader runs the stem in for architecture `arch`, `None` where the architecture has no table
-/// or the table has no such stem.
-fn reader_types(arch: &str, stem: &str) -> Option<&'static [GgmlType]> {
-    if gguf::arch::kimi_k3::is_arch(arch) {
-        gguf::arch::kimi_k3::allowed_types(stem)
-    } else {
-        gguf::arch::allowed_types(arch, stem)
-    }
-}
-
 /// A unit: a class (by its index in [`CLASSES`]) over the layers `first..=last`, or a model-level class with no layers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UnitKey {
@@ -222,7 +212,7 @@ fn legal(arch: &str, tensors: &[&Item]) -> Result<Vec<GgmlType>> {
     let mut out: Vec<GgmlType> = FIT_TYPES.to_vec();
     for it in tensors {
         let stem = stem_of(&it.name);
-        let allowed = reader_types(arch, stem).ok_or_else(|| {
+        let allowed = gguf::arch::allowed_types(arch, stem).ok_or_else(|| {
             Error::refused(format!(
                 "{}: the {arch} reader has no type list for {stem}, so no unit can hold it",
                 it.name
