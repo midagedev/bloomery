@@ -1844,7 +1844,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
-        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0 and iq4_nl)",
+        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0, iq4_nl and q2_0)",
         row: prompt_leg_down,
     },
     RowPin {
@@ -1868,7 +1868,7 @@ const ROW_PINS: &[RowPin] = &[
         role: Role::RoutedExperts,
         matrices: true,
         names: Some(routed_down),
-        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0 and iq4_nl)",
+        what: "routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0, iq4_nl and q2_0)",
         row: prompt_leg_down,
     },
     RowPin {
@@ -2861,8 +2861,8 @@ mod tests {
     #[test]
     fn the_qwen3moe_bodies_read_routed_stacks_by_part() {
         use GgmlType::{
-            IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q3_K, Q4_K, Q5_1,
-            Q5_K, Q6_K, Q8_0,
+            IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, MXFP4, Q2_0, Q3_K, Q4_K,
+            Q5_1, Q5_K, Q6_K, Q8_0,
         };
         type Parts = (&'static str, &'static [GgmlType], &'static [GgmlType]);
         let rows: (Parts, Parts) = (
@@ -2874,10 +2874,10 @@ mod tests {
                 &[Q3_K, MXFP4],
             ),
             (
-                "q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0 and iq4_nl",
+                "q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0, iq4_nl and q2_0",
                 &[
                     Q4_K, Q5_K, Q6_K, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, Q5_1,
-                    Q8_0, IQ4_NL,
+                    Q8_0, IQ4_NL, Q2_0,
                 ],
                 &[Q3_K, MXFP4],
             ),
@@ -3115,7 +3115,7 @@ mod tests {
                 "ffn_down_exps.weight",
                 Role::RoutedExperts,
                 GgmlType::MXFP4,
-                "mxfp4 routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0 and iq4_nl)",
+                "mxfp4 routed experts down (the body reads q4_K, q5_K, q6_K, iq2_xxs, iq2_xs, iq3_xxs, iq1_s, iq3_s, iq2_s, iq4_xs, iq1_m, q5_1, q8_0, iq4_nl and q2_0)",
             ),
             (
                 "ffn_gate_shexp.weight",
