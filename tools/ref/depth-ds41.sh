@@ -735,6 +735,23 @@ if [ "${1:-}" = --parse ]; then
   res_curve "$label" - "$dep" -
   exit 0
 fi
+# keep_out <label> <round> <output>: every ours arm's whole output under one directory a run, so the
+# records the row does not carry (residency pass, stat step, helper) stay readable after the run —
+# `--parse` reads one back. The directory is made at the first arm and named once.
+KEEP_DIR=
+keep_out() {
+  if [ -z "$KEEP_DIR" ]; then
+    KEEP_DIR="target/depth-ds41/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    mkdir -p "$KEEP_DIR" || { echo "depth-ds41: cannot make $KEEP_DIR for the arms' outputs" >&2; exit 2; }
+    echo "[keep] every ours arm's output: $KEEP_DIR/<label>-r<round>.log"
+  fi
+  # A label past 200 bytes (an arm naming model paths) keeps its first 160 and a cksum of the whole, under NAME_MAX.
+  local name
+  name=$(tr -c 'A-Za-z0-9._@=-' '_' <<< "$1" | sed 's/_$//')
+  [ "${#name}" -le 200 ] || name="${name:0:160}-$(printf '%s' "$1" | cksum | cut -d' ' -f1)"
+  printf '%s\n' "$3" > "$KEEP_DIR/$name-r$2.log" ||
+    { echo "depth-ds41: cannot write $1 r$2's output under $KEEP_DIR" >&2; exit 2; }
+}
 # ds41_self_test: `depth-ds41.sh --self-test`, on the Mac (bash 3.2; no card, binary or lease). The aggregate
 # arm (the header's <arm>@BLOOMERY_GEN_SLOTS=N): its parse, feed, twin and refusals through --parse-arms
 # against a temp corpus in the self-test's own temp dir, and its FAIL clauses through `--parse FILE ARM`
@@ -919,6 +936,17 @@ ds41_self_test() {
     echo "ok header-dropped"
   else
     echo "FAIL header-dropped: want 6 lines, got $(grep -c . <<< "$out")"
+    fails=$((fails + 1))
+  fi
+  # An arm label naming two model paths runs past NAME_MAX: its output is still kept, under a shortened name.
+  local long=prose:4096@BLOOMERY_STEP_STATS=1
+  long="$long,BLOOMERY_V41_MODEL=$(printf '/models/abcdefghij%.0s' 1 2 3 4 5 6 7 8),BLOOMERY_REF_MODEL=$(printf '/models/abcdefghij%.0s' 1 2 3 4 5 6 7 8)"
+  checks=$((checks + 1))
+  if (KEEP_DIR="$st/keep" && mkdir -p "$KEEP_DIR" && keep_out "$long" 1 'kept' >/dev/null 2>&1) &&
+    [ "$(cat "$st"/keep/*-r1.log 2>/dev/null)" = kept ]; then
+    echo "ok keep-long-label"
+  else
+    echo "FAIL keep-long-label: a ${#long}-byte label's output was not kept"
     fails=$((fails + 1))
   fi
   rm -rf "$st"
@@ -1741,19 +1769,6 @@ ours_arm() {
   MAJ_WHOLE=$((f1 - f0)) MAJ_TIMED=
   [ -z "$fed" ] || MAJ_TIMED=$((f1 - fed))
   ours_post "$i" "$r" "$rc" "$out" "$((t1 - t0))"
-}
-# keep_out <label> <round> <output>: every ours arm's whole output under one directory a run, so the
-# records the row does not carry (residency pass, stat step, helper) stay readable after the run —
-# `--parse` reads one back. The directory is made at the first arm and named once.
-KEEP_DIR=
-keep_out() {
-  if [ -z "$KEEP_DIR" ]; then
-    KEEP_DIR="target/depth-ds41/$(date -u +%Y%m%dT%H%M%SZ)-$$"
-    mkdir -p "$KEEP_DIR" || { echo "depth-ds41: cannot make $KEEP_DIR for the arms' outputs" >&2; exit 2; }
-    echo "[keep] every ours arm's output: $KEEP_DIR/<label>-r<round>.log"
-  fi
-  printf '%s\n' "$3" > "$KEEP_DIR/$(tr -c 'A-Za-z0-9._@=-' '_' <<< "$1" | sed 's/_$//')-r$2.log" ||
-    { echo "depth-ds41: cannot write $1 r$2's output under $KEEP_DIR" >&2; exit 2; }
 }
 # ours_pre <index> <round>: the witness block before a generate_ds41 arm.
 ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N"; }
