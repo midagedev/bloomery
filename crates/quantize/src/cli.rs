@@ -25,7 +25,7 @@ usage:
                          --keep-split writes one each of
   <out>                  the output file; with --keep-split its prefix (a trailing .gguf is dropped) and the shards
                          are PREFIX-0000i-of-0000n.gguf; an existing file is refused, never overwritten
-  <ftype>                Q4_K_M, Q5_K_M, Q6_K, Q8_0, IQ2_XXS or IQ1_S
+  <ftype>                Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, Q8_0, IQ2_XXS or IQ1_S
   [nthreads]             accepted for llama-quantize's command line and ignored: the host rules run on the resident
                          pool, one thread a core
   --imatrix FILE         the GGUF importance matrix llama-imatrix wrote (IQ1_S and IQ2_XXS need it)

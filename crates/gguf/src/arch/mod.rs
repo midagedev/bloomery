@@ -5,6 +5,7 @@
 
 use crate::GgmlType;
 use crate::engram::EngramFacts;
+use crate::facts::Fact;
 
 pub mod deepseek41;
 pub mod exaone_moe;
@@ -32,6 +33,18 @@ pub fn allowed_types(arch: &str, stem: &str) -> Option<&'static [GgmlType]> {
     match arch {
         exaone_moe::ARCH => exaone_moe::allowed_types(stem),
         kimi_k3::ARCH | kimi_k3::ARCH_K31 => kimi_k3::allowed_types(stem),
+        _ => None,
+    }
+}
+
+/// The fact that counts the equal row groups of the block-diagonal 2-D tensor of stem `stem` in a file of
+/// architecture `arch`: group `g` of the tensor's rows reads input slice `g`, and a reader that needs one value per
+/// input slice (the importance matrix's) takes one per group. `None` for a tensor that is not block diagonal and for
+/// an architecture that has none.
+#[must_use]
+pub fn row_groups_fact(arch: &str, stem: &str) -> Option<&'static Fact> {
+    match arch {
+        deepseek41::ARCH => deepseek41::row_groups_fact(stem),
         _ => None,
     }
 }

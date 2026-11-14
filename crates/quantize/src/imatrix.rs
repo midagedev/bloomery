@@ -92,8 +92,22 @@ impl Imatrix {
         self.entries.get(name).copied()
     }
 
-    /// The importance values for `name`: `ne0` per expert, as llama-quantize hands them to its quantizer.
-    pub fn weights(&self, name: &str) -> Result<Vec<f32>> {
-        gguf::iq_quant::imatrix_weights(&self.gguf, name).map_err(|e| Error::refused(e.to_string()))
+    /// The importance values for `name`, `ne0` per slab of the tensor (`slabs` of them), as llama-quantize hands
+    /// them to its quantizer: an entry of `ne0 * slabs` values as it is, an entry of one `ne0` vector repeated for
+    /// every slab (llama-quantize's rule for a 2-D tensor; the plan admits it for a block-diagonal tensor alone).
+    pub fn weights(&self, name: &str, ne0: u64, slabs: u64) -> Result<Vec<f32>> {
+        let w = gguf::iq_quant::imatrix_weights(&self.gguf, name)
+            .map_err(|e| Error::refused(e.to_string()))?;
+        let n = w.len() as u64;
+        if n == ne0 * slabs {
+            Ok(w)
+        } else if n == ne0 {
+            Ok(w.repeat(slabs as usize))
+        } else {
+            Err(Error::refused(format!(
+                "imatrix {name}: {n} values, the tensor needs {ne0} or {} ({ne0} x {slabs} slabs)",
+                ne0 * slabs
+            )))
+        }
     }
 }

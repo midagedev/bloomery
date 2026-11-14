@@ -12,11 +12,21 @@ so the Mac archive has no binary of it (`--cpu` included).
 
 ## Scope
 
-The architecture is `kimi-k3`; the file types are Q4_K_M, Q5_K_M, Q6_K, Q8_0, IQ2_XXS and IQ1_S. Any other
-architecture, type, or a type resolution that lands on a type not ported (Q2_K, ...) is refused by name before
-anything is written. Q3_K is ported as a rule type, not a file type: a `--tensor-type-file` rule, `--output-tensor-type`
-or `--token-embedding-type` may name it (ggml's `quantize_row_q3_K_ref` without an importance matrix, `_impl` with
-one), and there is no Q3_K_M file type, since llama-quantize's Q3_K_M type rules are not ported.
+The architectures are `kimi-k3`, `exaone-moe` and `deepseek41`; the file types are Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, Q8_0,
+IQ2_XXS and IQ1_S. Any other architecture, type, or a type resolution that lands on a type not ported (Q2_K, ...) is
+refused by name before anything is written. Q3_K is also a rule type: a `--tensor-type-file` rule,
+`--output-tensor-type` or `--token-embedding-type` may name it (ggml's `quantize_row_q3_K_ref` without an importance
+matrix, `_impl` with one).
+
+Q3_K_M is `llama_tensor_get_type_impl`'s Q3_K_M branches, and a rules file is not needed to reach them: the first two
+`attn_v`-like tensors Q5_K and the rest Q4_K (Q8_0 at eight experts), `attn_output` Q4_K (Q5_K at eight experts),
+`ffn_down` Q5_K for the first `n_layer / 16` blocks and Q4_K after, `output` Q6_K, every other quantizable tensor Q3_K.
+`gate-quantize-plan` and `gate-quantize-e2e` hold it to llama-quantize's own plan and bytes on the K3 fixture
+(`general.file_type` 12 included), which has eight experts and four blocks, so they reach the eight-expert branches; the
+other branches are `tests/resolve.rs`'s, written from the same source. On a DeepSeek-V4.1 source the file type alone
+types the tensors the way the `Q3_K_M` file has them (the routed and shared `ffn_down` of blocks 0 and 1 Q5_K and the
+other blocks' Q4_K; the grouped `attn_output_a` and `attn_output_b` are not ggml's `attn_output` category and stay
+Q3_K); a rules file only changes what the file type does not say.
 
     bloomery-quantize IN-00001-of-N.gguf OUT/prefix Q4_K_M --imatrix m.imatrix.gguf --tensor-type-file rules.txt \
         --output-tensor-type q6_k --token-embedding-type q4_k --keep-split --allow-requantize
@@ -84,6 +94,24 @@ a tensor whose columns are not a multiple of 256 under a K-quant type needs a ru
 (Q8_0), or the run is refused by name with the tensor. K3.1's `tight` map names `attn_k_b` and `ssm_f_b` Q8_0 by rule
 (`gen_rules` in `tools/ref/k31-quant.sh`), so those two never reach a K-quant type.
 
+## The importance matrix's slabs
+
+An entry of the importance matrix holds `ne0` values for each slab of the tensor's rows. For a stacked tensor
+(`[ne0, rows, experts]`) a slab is an expert, `rows` rows each, as in llama-quantize (`nrows_per_expert`), and an entry
+of any length but `ne0 x experts` is refused. A 2-D tensor is one slab: llama-quantize quantizes every row with the
+entry's one `ne0` vector.
+
+A block-diagonal tensor is the one case llama-quantize cannot take. DeepSeek-V4.1's `attn_output_a` is `[4096, 8192]`
+with `deepseek41.attention.output_group_count` = 8: row group `g` (rows `g x 1024` on) reads input slice `g` of the
+attention output, and the engine's collector writes one entry of `8 x 4096` values for it. llama-quantize needs 4096
+there and aborts (`imatrix size 32768 is different from tensor size 4096`). Here the tensor's group count is a header
+fact of its architecture (`gguf::arch::row_groups_fact`, the stem that names it and the key that counts it), a group is
+a slab, and the plan accepts an entry of `ne0 x groups` values (group `g` quantizes with the `g`-th `ne0` vector) or of
+one `ne0` vector (every group takes it, which is llama-quantize's 2-D rule); any other length is refused by name, and so
+is a header with no group count, rows the groups do not divide equally, and a block-diagonal tensor of more than two
+dimensions. `tests/resolve.rs` holds the bytes: the grouped tensor equals its groups quantized apart as separate 2-D
+tensors with their slices, and an entry of one vector equals the plain 2-D tensor.
+
 ## What it refuses
 
 Nothing is turned into a plausible value.
@@ -92,7 +120,7 @@ Nothing is turned into a plausible value.
   with tensor, expert, row and value index.
 - An imatrix entry that is Inf, NaN or negative, in the sums or in the counts: named with the tensor and entry.
 - A source type the oracle does not cover (anything but F32, F16, BF16, MXFP4), a row that is not a multiple of 256, an
-  importance row of the wrong length.
+  importance entry of a length the tensor's slabs do not take (above).
 - Too little room for the output (checked before anything is written; the output directory's free bytes against the
   bytes the plan writes).
 - An output file that exists, or a stale `.partial`, without `--resume`. Shards are written as `.partial` and renamed

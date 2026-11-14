@@ -33,12 +33,22 @@ pub const ARCHS: &[(&str, &str)] = &[
          block (`blk.<layers>.`) is a block like any other, and its `nextn.eh_proj` takes the \
          standard logic — the Q8_0 floor of it is glm5-next's alone (`:534-551`)",
     ),
+    (
+        "deepseek41",
+        "the only lines of the DeepSeek-V4 merge's `llama-quant.cpp` that name it are \
+         `tensor_allows_quantization`'s exclusions by tensor name (`ffn_gate_tid2eid.weight`, \
+         `engram_q.weight`, `engram_k.weight`, `:308-318`), which `allows_quantization` carries \
+         beside the folded `engram_gate.weight`; no branch of `llama_tensor_get_type_impl` is \
+         keyed to it, and the grouped `attn_output_a` takes the standard logic (its name is not \
+         the `attn_output.weight` category)",
+    ),
 ];
 
 /// The file types the logic is ported for (`llama_ftype`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ftype {
     Q8_0,
+    Q3KM,
     Q4KM,
     Q5KM,
     Q6K,
@@ -51,6 +61,7 @@ impl Ftype {
     pub fn parse(s: &str) -> Result<Ftype> {
         Ok(match s.to_ascii_uppercase().as_str() {
             "Q8_0" => Ftype::Q8_0,
+            "Q3_K_M" => Ftype::Q3KM,
             "Q4_K_M" => Ftype::Q4KM,
             "Q5_K_M" => Ftype::Q5KM,
             "Q6_K" => Ftype::Q6K,
@@ -58,7 +69,7 @@ impl Ftype {
             "IQ1_S" => Ftype::Iq1S,
             o => {
                 return Err(Error::Usage(format!(
-                    "file type {o}: the quantizer covers Q4_K_M, Q5_K_M, Q6_K, Q8_0, IQ2_XXS and IQ1_S; bloomery-quantize --help prints the usage"
+                    "file type {o}: the quantizer covers Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, Q8_0, IQ2_XXS and IQ1_S; bloomery-quantize --help prints the usage"
                 )));
             }
         })
@@ -69,6 +80,7 @@ impl Ftype {
     pub fn id(self) -> u32 {
         match self {
             Ftype::Q8_0 => 7,
+            Ftype::Q3KM => 12,
             Ftype::Q4KM => 15,
             Ftype::Q5KM => 17,
             Ftype::Q6K => 18,
@@ -82,6 +94,7 @@ impl Ftype {
     pub fn default_type(self) -> GgmlType {
         match self {
             Ftype::Q8_0 => GgmlType::Q8_0,
+            Ftype::Q3KM => GgmlType::Q3_K,
             Ftype::Q4KM => GgmlType::Q4_K,
             Ftype::Q5KM => GgmlType::Q5_K,
             Ftype::Q6K => GgmlType::Q6_K,
@@ -237,6 +250,8 @@ fn allows_quantization(name: &str, dims: &[u64]) -> bool {
         "ffn_gate_inp.weight",
         "ffn_gate_tid2eid.weight",
         "engram_gate.weight",
+        "engram_q.weight",
+        "engram_k.weight",
         "altup",
         "laurel",
         "per_layer_model_proj",
@@ -387,7 +402,13 @@ fn type_impl(
             }
         }
     } else if is_attn_v(cat) {
-        if matches!(ftype, Ftype::Q4KM | Ftype::Q5KM)
+        if ftype == Ftype::Q3KM {
+            new_type = if st.i_attention_wv < 2 {
+                GgmlType::Q5_K
+            } else {
+                GgmlType::Q4_K
+            };
+        } else if matches!(ftype, Ftype::Q4KM | Ftype::Q5KM)
             && use_more_bits(st.i_attention_wv, st.n_attention_wv)
         {
             new_type = GgmlType::Q6_K;
@@ -402,13 +423,24 @@ fn type_impl(
         }
     } else if cat == Category::FfnDown {
         let (i_layer, n_layer) = layer_info(st.i_ffn_down, st.n_ffn_down)?;
-        if matches!(ftype, Ftype::Q4KM | Ftype::Q5KM) && use_more_bits(i_layer, n_layer) {
+        if ftype == Ftype::Q3KM {
+            // the Falcon row of ggml's Q3_K_M (Q3_K where `use_more_bits` fails) is no row of `ARCHS`
+            new_type = if i_layer < n_layer / 16 {
+                GgmlType::Q5_K
+            } else {
+                GgmlType::Q4_K
+            };
+        } else if matches!(ftype, Ftype::Q4KM | Ftype::Q5KM) && use_more_bits(i_layer, n_layer) {
             new_type = GgmlType::Q6_K;
         }
         st.i_ffn_down += 1;
     } else if cat == Category::AttentionOutput {
-        if n_expert == 8 && ftype == Ftype::Q4KM {
-            new_type = GgmlType::Q5_K;
+        if n_expert == 8 {
+            if matches!(ftype, Ftype::Q3KM | Ftype::Q4KM) {
+                new_type = GgmlType::Q5_K;
+            }
+        } else if ftype == Ftype::Q3KM {
+            new_type = GgmlType::Q4_K;
         }
     } else if cat == Category::FfnGate || cat == Category::FfnUp {
         layer_info(0, st.n_ffn_down)?;

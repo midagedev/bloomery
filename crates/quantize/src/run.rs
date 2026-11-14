@@ -370,13 +370,13 @@ fn host_convert(
     target: Target,
 ) -> Result<Vec<u8>> {
     let data = set.read(&item.name, 0..item.bytes_in)?;
-    let (ne0, ne1) = (item.dims[0] as usize, item.dims[1] as usize);
+    let (ne0, per_slab) = (item.dims[0] as usize, item.slabs.rows as usize);
     let qw = match (item.importance, im) {
-        (true, Some(m)) => Some(m.weights(&item.name)?),
+        (true, Some(m)) => Some(m.weights(&item.name, item.dims[0], item.slabs.count)?),
         _ => None,
     };
-    scan_rows(&item.name, item.src, &data, ne0, 0, ne1)?;
-    let out = convert_rows(target, item.src, &data, ne0, 0, ne1, qw.as_deref())
+    scan_rows(&item.name, item.src, &data, ne0, 0, per_slab)?;
+    let out = convert_rows(target, item.src, &data, ne0, 0, per_slab, qw.as_deref())
         .map_err(|e| Error::refused(format!("{}: {e}", item.name)))?;
     if out.len() as u64 != item.bytes_out {
         return Err(Error::refused(format!(
@@ -506,12 +506,12 @@ fn write_all(
                             let qw = im
                                 .as_ref()
                                 .ok_or_else(|| Error::refused("an IQ target needs the imatrix"))?
-                                .weights(name)?;
+                                .weights(name, item.dims[0], item.slabs.count)?;
                             backend
                                 .bind(kind, &qw)
                                 .map_err(|e| Error::refused(format!("{name}: {e}")))?;
-                            let (ne0, ne1) = (item.dims[0] as usize, item.dims[1] as usize);
-                            let n_exp: usize = item.dims[2..].iter().product::<u64>() as usize;
+                            let (ne0, ne1) = (item.dims[0] as usize, item.slabs.rows as usize);
+                            let n_exp = item.slabs.count as usize;
                             let tab = &*tables[usize::from(kind == IqKind::Iq1S)]
                                 .get_or_insert_with(|| GridTables::new(kind));
                             let t0 = Instant::now();

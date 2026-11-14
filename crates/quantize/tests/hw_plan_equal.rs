@@ -154,6 +154,21 @@ fn hw_plan_equals_llama_quantize_dry_run() {
             keep_split: false,
         },
     );
+    // Q3_K_M by its own resolution: the file type's rules type every tensor but the four stems whose columns a K-quant
+    // cannot take. The fixture has eight experts, so this holds the eight-expert branches (`attn_v` and `attn_k`
+    // Q8_0, `attn_output` Q5_K) and the default Q3_K; the branches of a model with other counts are the unit tests'.
+    equal(
+        &lq,
+        &dir,
+        &Case {
+            tag: "fixture-q3km",
+            input: &src,
+            rules: &common::k31_columns_rules(),
+            ftype: "Q3_K_M",
+            token_embedding: "q3_k",
+            keep_split: false,
+        },
+    );
     let shape = env_path("K3Q_PLAN_IN", "");
     let tight_rules = env_path("K3Q_PLAN_RULES", "");
     if shape.is_file() && tight_rules.is_file() {

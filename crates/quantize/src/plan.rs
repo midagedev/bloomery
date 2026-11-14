@@ -5,6 +5,7 @@
 //! `--dry-run` plan. [`Plan::render`] prints it, and `--plan` stops there.
 
 use crate::cli::Args;
+use crate::fit::stem_of;
 use crate::imatrix::Imatrix;
 use crate::resolve::{self, Model, Options, TensorRef, layer_of};
 use crate::rules::Rules;
@@ -107,6 +108,54 @@ pub struct Item {
     pub fate: Fate,
     /// Whether the importance matrix has an entry the quantizer uses.
     pub importance: bool,
+    /// How the rows divide into the slabs the importance is kept per.
+    pub slabs: Slabs,
+}
+
+/// How a tensor's rows divide into slabs, each with its own importance vector of `ne0` values: the experts of a
+/// stacked tensor, the groups of a block-diagonal one. Slab `s` holds rows `s * rows .. (s + 1) * rows`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slabs {
+    pub count: u64,
+    pub rows: u64,
+}
+
+impl Slabs {
+    /// The experts of a stacked tensor: one slab to each index of dims 2.., of `dims[1]` rows (llama-quantize's
+    /// `nrows_per_expert`). A plain 2-D tensor is one slab.
+    #[must_use]
+    pub fn stacked(dims: &[u64]) -> Slabs {
+        Slabs {
+            count: dims.get(2..).map_or(1, |d| d.iter().product()),
+            rows: dims.get(1).copied().unwrap_or(1),
+        }
+    }
+
+    /// The `groups` of a block-diagonal 2-D tensor: group `g` is rows `g * rows .. (g + 1) * rows` and reads the
+    /// `g`-th importance vector. A tensor of more dimensions, or whose rows the groups do not divide equally, is
+    /// refused by name.
+    pub fn grouped(name: &str, dims: &[u64], groups: u64) -> Result<Slabs> {
+        let rows = dims.get(1).copied().unwrap_or(1);
+        if groups == 0
+            || dims
+                .get(2..)
+                .is_some_and(|d| d.iter().product::<u64>() != 1)
+        {
+            return Err(Error::refused(format!(
+                "{name}: {groups} row groups of a tensor of dims {}: a block-diagonal tensor is 2-D with at least one group",
+                plan_dims(dims)
+            )));
+        }
+        if !rows.is_multiple_of(groups) {
+            return Err(Error::refused(format!(
+                "{name}: {rows} rows do not divide into {groups} equal groups"
+            )));
+        }
+        Ok(Slabs {
+            count: groups,
+            rows: rows / groups,
+        })
+    }
 }
 
 /// The GGML type an IQ kind writes.
@@ -227,7 +276,7 @@ impl Plan {
         let mut items = Vec::with_capacity(ts.len());
         let mut shards = vec![Vec::new(); n_split];
         for (i, ((shard, t), dst)) in ts.iter().zip(dst).enumerate() {
-            let item = decide(t, *shard, dst, a, im)?;
+            let item = decide(set, t, *shard, dst, a, im)?;
             shards[if a.keep_split { *shard } else { 0 }].push(i);
             items.push(item);
         }
@@ -406,6 +455,7 @@ pub fn ggml_dims(dims: &[u64]) -> Vec<u64> {
 
 /// The plan's row of one tensor.
 fn decide(
+    set: &dyn Source,
     t: &gguf::TensorInfo,
     shard_in: usize,
     dst: GgmlType,
@@ -414,7 +464,7 @@ fn decide(
 ) -> Result<Item> {
     let ne0 = t.dims[0] as usize;
     let rows: u64 = t.dims[1..].iter().product();
-    let base = |fate: Fate, bytes_out: u64, importance: bool| Item {
+    let base = |fate: Fate, bytes_out: u64, importance: bool, slabs: Slabs| Item {
         name: t.name.clone(),
         dims: t.dims.clone(),
         src: t.ty,
@@ -424,6 +474,7 @@ fn decide(
         bytes_out,
         fate,
         importance,
+        slabs,
     };
     let is_embd_or_out = t.name == "token_embd.weight"
         || t.name == "per_layer_token_embd.weight"
@@ -436,7 +487,7 @@ fn decide(
         )));
     }
     if dst == t.ty {
-        return Ok(base(Fate::Copy, t.nbytes, false));
+        return Ok(base(Fate::Copy, t.nbytes, false, Slabs::stacked(&t.dims)));
     }
     let target = Target::of(dst).ok_or_else(|| {
         Error::refused(format!(
@@ -466,19 +517,30 @@ fn decide(
             t.name, t.ty
         ))
     })?;
-    let n_exp = t.dims[2..].iter().product::<u64>();
+    let groups = row_groups(set, &t.name)?;
+    let slabs = match groups {
+        Some(g) => Slabs::grouped(&t.name, &t.dims, g)?,
+        None => Slabs::stacked(&t.dims),
+    };
     let importance = match im.and_then(|m| m.len_of(&t.name)) {
         None => false,
-        Some(n) if n == t.dims[0] * n_exp => true,
+        Some(n) if n == t.dims[0] * slabs.count => true,
+        // one vector for every row: llama-quantize's rule for a 2-D tensor, which a block-diagonal one is
+        Some(n) if n == t.dims[0] && groups.is_some() => true,
         Some(_) if t.name == "token_embd.weight" || t.name == "per_layer_token_embd.weight" => {
             false
         }
         Some(n) => {
+            let (what, shared) = match groups {
+                Some(_) => ("row groups", format!("{} or ", t.dims[0])),
+                None => ("experts", String::new()),
+            };
             return Err(Error::refused(format!(
-                "imatrix {}: {n} values, the tensor needs {} ({} x {n_exp} experts)",
+                "imatrix {}: {n} values, the tensor needs {shared}{} ({} x {} {what})",
                 t.name,
-                t.dims[0] * n_exp,
-                t.dims[0]
+                t.dims[0] * slabs.count,
+                t.dims[0],
+                slabs.count
             )));
         }
     };
@@ -490,7 +552,32 @@ fn decide(
     }
     let row = row_bytes(dst, ne0)
         .ok_or_else(|| Error::refused(format!("{}: {dst:?} rows of {ne0} values", t.name)))?;
-    Ok(base(Fate::Convert(target), rows * row as u64, importance))
+    Ok(base(
+        Fate::Convert(target),
+        rows * row as u64,
+        importance,
+        slabs,
+    ))
+}
+
+/// The number of equal row groups of a block-diagonal tensor, from the fact its architecture names for it
+/// (`gguf::arch::row_groups_fact`); `None` for a tensor that is not one.
+fn row_groups(set: &dyn Source, name: &str) -> Result<Option<u64>> {
+    let Some(arch) = set.architecture() else {
+        return Ok(None);
+    };
+    let Some(fact) = gguf::arch::row_groups_fact(arch, stem_of(name)) else {
+        return Ok(None);
+    };
+    gguf::facts::count(set.keys(), arch, fact)
+        .map(Some)
+        .map_err(|e| {
+            Error::refused(format!(
+                "{name}: its row groups, {} {}",
+                e.key(),
+                e.detail()
+            ))
+        })
 }
 
 /// The plan's size column is MiB printed to two decimals for a converted tensor and three for a copied one, so the
@@ -586,6 +673,7 @@ mod tests {
             bytes_out: 288,
             fate: Fate::Copy,
             importance: false,
+            slabs: Slabs::stacked(&[256, 2]),
         };
         let items = [item("a", GgmlType::Q4_K)];
         let ok = LlamaPlan::parse("a\tQ4_K\t256x2\t288\n", "p").unwrap();

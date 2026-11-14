@@ -1,7 +1,9 @@
 //! Shared by the host gates: a seeded generator, the oracle's calling convention and its location.
 #![allow(dead_code, reason = "each gate target uses a part of this module")]
 
+use gguf::Value;
 use gguf::quant::GgmlType;
+use gguf::write::{Layout, TensorDecl, Writer};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -124,6 +126,13 @@ pub fn k31_rules(stem: &str) -> String {
     )
 }
 
+/// The rules that keep the K3.1 stems whose columns a K-quant cannot take off one: the four lines of [`k31_rules`] that
+/// name no trunk weight, so a file type's own resolution types everything else.
+pub fn k31_columns_rules() -> String {
+    "\\.attn_k_b\\.weight$=q8_0\n\\.ssm_f_b\\.weight$=q8_0\n\\.ssm_beta\\.weight$=f32\n\\.attn_v_b\\.weight$=q6_k\n"
+        .to_string()
+}
+
 /// Run `bin args`, panicking with its stderr tail when it ends non-zero; its wall in seconds and its stderr.
 pub fn run_ok(bin: &Path, args: &[&OsStr]) -> (f64, String) {
     let t = Instant::now();
@@ -163,4 +172,62 @@ pub fn fixture_src(lq: &Path, fixture: &Path, work: &Path) -> PathBuf {
         ],
     );
     src
+}
+
+/// A tensor of a file the tests write: name, dims, type and bytes.
+pub type SetTensor = (String, Vec<u64>, GgmlType, Vec<u8>);
+
+/// The file `path` of `kvs` and `tensors`, written by the project's own writer.
+pub fn write_gguf(path: &Path, kvs: &[(String, Value)], tensors: &[SetTensor]) {
+    let decls = tensors
+        .iter()
+        .map(|(name, dims, ty, bytes)| TensorDecl {
+            name: name.clone(),
+            dims: dims.clone(),
+            type_id: ty.as_u32(),
+            nbytes: bytes.len() as u64,
+        })
+        .collect();
+    let mut w = Writer::new(
+        std::fs::File::create(path).unwrap(),
+        Layout::new(kvs, decls).unwrap(),
+    )
+    .unwrap();
+    for (name, _, _, bytes) in tensors {
+        w.tensor(name, bytes).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+/// A GGUF importance matrix of `entries`: per tensor name, the `in_sum2` values (`ne0` per count) and the counts.
+pub fn write_imatrix(path: &Path, entries: &[(&str, &[f32], &[f32])]) {
+    let kvs = vec![
+        (
+            "general.type".to_string(),
+            Value::String("imatrix".to_string()),
+        ),
+        (
+            "imatrix.datasets".to_string(),
+            Value::Array(vec![Value::String("test".to_string())]),
+        ),
+        ("imatrix.chunk_count".to_string(), Value::U32(1)),
+        ("imatrix.chunk_size".to_string(), Value::U32(512)),
+    ];
+    let mut tensors: Vec<SetTensor> = Vec::new();
+    for &(name, sums, counts) in entries {
+        let m = counts.len() as u64;
+        tensors.push((
+            format!("{name}.in_sum2"),
+            vec![sums.len() as u64 / m, m],
+            GgmlType::F32,
+            f32_bytes(sums),
+        ));
+        tensors.push((
+            format!("{name}.counts"),
+            vec![1, m],
+            GgmlType::F32,
+            f32_bytes(counts),
+        ));
+    }
+    write_gguf(path, &kvs, &tensors);
 }

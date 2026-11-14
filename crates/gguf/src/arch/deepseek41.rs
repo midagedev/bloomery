@@ -117,6 +117,17 @@ pub const CANDIDATE_TOPK: Fact = Fact::new(
     Kind::Count,
 );
 
+/// The output groups of the attention: `attn_output_a` is block diagonal, group `g` of its rows (an equal share of
+/// them, in order) reading input slice `g` of the attention output.
+pub static OUTPUT_GROUPS: Fact = Fact::new("attention.output_group_count", &[], Kind::Count);
+
+/// The fact that counts the equal row groups of the 2-D tensor of stem `stem` (the name past `blk.N.`), `None` for a
+/// tensor that is not block diagonal.
+#[must_use]
+pub fn row_groups_fact(stem: &str) -> Option<&'static Fact> {
+    (stem == "attn_output_a.weight").then_some(&OUTPUT_GROUPS)
+}
+
 /// The path [`COMPANION_ENV`] holds, `None` when unset or empty.
 fn companion_path() -> Option<PathBuf> {
     std::env::var_os(COMPANION_ENV)
@@ -241,6 +252,29 @@ mod tests {
 
     fn kv(key: &str, v: Value) -> (String, Value) {
         (key.to_string(), v)
+    }
+
+    /// Only `attn_output_a` is block diagonal, and its group count is the header's
+    /// `attention.output_group_count`, found through the architecture table.
+    #[test]
+    fn the_grouped_tensor_names_its_group_count_fact() {
+        let fact = crate::arch::row_groups_fact(ARCH, "attn_output_a.weight").expect("grouped");
+        assert_eq!(fact.name, "attention.output_group_count");
+        for stem in [
+            "attn_output_b.weight",
+            "attn_q_a.weight",
+            "ffn_down_exps.weight",
+        ] {
+            assert!(crate::arch::row_groups_fact(ARCH, stem).is_none(), "{stem}");
+        }
+        assert!(crate::arch::row_groups_fact("kimi-k3", "attn_output_a.weight").is_none());
+        let meta = vec![
+            kv(GENERAL_ARCHITECTURE, Value::String(ARCH.to_string())),
+            kv("deepseek41.attention.output_group_count", Value::U32(8)),
+        ];
+        assert_eq!(count(&meta, ARCH, fact).unwrap(), 8);
+        let e = count(&meta[..1], ARCH, fact).unwrap_err();
+        assert_eq!(e.key(), "deepseek41.attention.output_group_count");
     }
 
     fn text(v: &str) -> Value {

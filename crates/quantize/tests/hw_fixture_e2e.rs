@@ -129,6 +129,8 @@ struct Fix {
     rules: PathBuf,
     /// The same rules with the trunk weights at Q3_K.
     rules_q3: PathBuf,
+    /// Only the rules for the stems whose columns a K-quant cannot take: a file type resolves the rest.
+    rules_columns: PathBuf,
 }
 
 const FLAGS: [&str; 4] = [
@@ -204,6 +206,8 @@ fn build(rng: &mut Rng) -> Fix {
     std::fs::write(&rules, common::k31_rules("q4_k")).unwrap();
     let rules_q3 = work.join("rules-q3.txt");
     std::fs::write(&rules_q3, common::k31_rules("q3_k")).unwrap();
+    let rules_columns = work.join("rules-columns.txt");
+    std::fs::write(&rules_columns, common::k31_columns_rules()).unwrap();
     Fix {
         work,
         lq,
@@ -212,6 +216,7 @@ fn build(rng: &mut Rng) -> Fix {
         im,
         rules,
         rules_q3,
+        rules_columns,
     }
 }
 
@@ -318,5 +323,7 @@ fn hw_fixture_whole_file_equals_llama_quantize() {
     both(&f, &f.src, "Q5_K_M", false, rules, "q5km");
     // the trunk weights at Q3_K by rule: the imatrix'd two of every three on ggml's `_impl` rule, the third on `_ref`
     both(&f, &f.src, "Q4_K_M", false, Some(&f.rules_q3), "q4km-q3k");
+    // the Q3_K_M file type by its own resolution (`general.file_type` 12 included), the stacks at Q3_K and Q4_K
+    both(&f, &f.src, "Q3_K_M", false, Some(&f.rules_columns), "q3km");
     let _ = std::fs::remove_dir_all(&f.work);
 }
