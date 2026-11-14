@@ -1,0 +1,22 @@
+# After ds41cardexp (a pick's two passes on the grouped GEMM), price BLOOMERY_PREFILL_GROUP=1 against the default 2.
+# Decomposition [derived, ds41cardexp report section 2, from the v31cardtime and v31nsys forms]: at group 1 every
+# layer-batch is a pick (~77 % of the slots on the card); the card was 55.1 ms/lb of which the tile path was 24.8;
+# at GEMM speed ~35 ms/lb (rough). Host at group 1: union 19.5 + enqueue ~11 ms/lb. So group 1 is card-bound near
+# ~35 ms/lb x 220 = ~7.7 s against group 2's measured ~9.5 s call: up to +20 %; if the card estimate is 25 % low
+# (~44 ms/lb) the gain falls to ~+3 %.
+# Resource timeline per lb: group 2 = host 41.5 (wall) over card ~32; group 1 = card ~35..44 (wall) over host ~30.
+kind: ab
+question: once the pick runs on the GEMM, does one batch a layer (group 1) beat two (group 2) on the 1017 prompt?
+term: pp tok/s @ P = 4096, prose, depth 0, DeepSeek-V4.1-Flash-1017 Q3_K_M, --place a, A6000 - (group 1 - group 2) /
+  group 2, same binary, paired by round
+unit: %
+predict: +3..+20
+rounds: 4
+condition: one lease, this tree's generate_ds41 alone, BLOOMERY_AB_ROUNDS=4 just depth-gpu-ds41
+  prose:4096@BLOOMERY_STEP_STATS=1 prose:4096@BLOOMERY_STEP_STATS=1,BLOOMERY_PREFILL_GROUP=1, order rotated every
+  round; both arms' plans name the same residency word and card_experts; no row carries [cpu-busy] or [other-busy]
+decide-in: flip the group default to 1 for V4.1 at place a (the levers registry row's default), with this sitting
+  as its evidence; then re-run the depth table's prose:512 row before the flip lands
+decide-below: read card_in/card_out per lb: if the card stays above ~44 ms/lb, the GEMM pick did not reach group 1's
+  shape or the copies serialize; keep group 2
+decide-above: the host at group 1 was over-counted; re-derive the union from the stat prefill split line

@@ -1,0 +1,24 @@
+# Round iq2stile: the IQ2_S routed experts' host dot (UD-IQ3_XXS's 10 gate/up IQ2_S layers) runs a C-column tile in
+# place of the generic row-by-column fallback (generic.rs dot_q8k_tile_avx2, TileKind Iq2s).
+# Decomposition [derived, iq2stile report, from the v31types sitting]: P = 4096 is 220 layer-batches; the host union
+# is the wall (101 ms/lb against a ~55 ms card); the 10 IQ2_S layers' union falls 16.98 s -> 4.80 s at the tile's
+# (656, 109) units, so the prompt call 33.7 s -> ~21.5 s: 121.7 -> ~190 tok/s (band 175..205).
+# Resource timeline: host union (the wall) > card (~55 ms/lb under it) > enqueue; the cut is the host's own term.
+kind: ab
+question: does the IQ2_S column tile cut UD-IQ3_XXS's prompt call by the 10 IQ2_S layers' generic union time?
+term: pp tok/s @ P = 4096, prose, depth 0, DeepSeek-V4.1-Flash-1017 UD-IQ3_XXS, --place a, the default levers,
+  RTX A6000 - (this tree - base) / base, paired by round
+unit: %
+predict: +44..+68
+rounds: 2
+condition: this tree's generate_ds41 and 4e28e0a54's (built in /root/repo/bloomery-sitbase before the lease, a bin:
+  arm) alternate in one lease, BLOOMERY_AB_ROUNDS=2 just depth-gpu-ds41
+  prose:4096@BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf
+  bin:/root/repo/bloomery-sitbase/target/release/generate_ds41:prose:4096@BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf,
+  the order rotated every round; both arms' plan prints name the same residency word and card_experts; no row
+  carries [cpu-busy] or [other-busy]
+decide-in: land it (already landed with the train); UD-IQ3_XXS stays slower than Q3_K_M (~431), so the default
+  stays; the next UD term is the card (~55 ms/lb) once the union falls under it
+decide-below: read union_ms per IQ2_S layer from the stat prefill lb rows; if those layers did not fall ~3.5x, the
+  tile is not taken on the batch path (TileKind dispatch) or its units are wrong (tile-units.sh)
+decide-above: the union of the other types fell too (a shared change in the train); re-derive from the stat lines

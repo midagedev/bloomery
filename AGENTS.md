@@ -308,6 +308,8 @@ forced_exact count pin, the reference gates).
   in), held by `tools/lint-ratchet.txt` and tracked in `docs/rust-quality.md` §0. It only goes down; the stage-0 crates
   are gone and the tree has no `undocumented_unsafe_blocks`.
 - `gate-qdot`'s hw tests read harness dumps under `$BLOOMERY_DATA/ref/` that `just build-ref` writes.
-- A V4.1 prompt batch's shadow runs the card's routed experts by (slot tile, row tile) blocks, one path with no lever:
-  `ds41_card_buckets` → `grouped_tiles` (≤ 8 slots) → `ds41_card_gather` → `ds41_expert_gate_up_tiles` /
-  `q4k_gemv_tiles`, the down scattering back to each slot; it writes the step's bits (`just gate-gpu-ds41-prefill`).
+- A V4.1 prompt batch's shadow runs the card's routed experts on the grouped int8 GEMM (`enqueue_gemm_batch`: route
+  table → gate and up → down), a pick's kept and streamed passes each over the map row `ds41_ffn_pass_map` narrows to
+  their experts; the (slot tile, row tile) path (`ds41_card_buckets` → `grouped_tiles` → `ds41_card_gather` →
+  `ds41_expert_gate_up_tiles` / `q4k_gemv_tiles`) is the catcher's and the expert tier's
+  (`just gate-gpu-ds41-prefill`).
