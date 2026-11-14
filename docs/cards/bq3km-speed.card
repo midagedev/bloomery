@@ -1,0 +1,20 @@
+# The own Q3_K_M of V4.1-Flash-1017 (bloomery-quantize from UD-Q4_K_XL with its engine imatrix, llama-quantize's
+# Q3_K_M rules) against the 1017 Q3_K_M the default names. Loss (engine walk, wikitext c2048x4, against UD-Q4_K_XL):
+# KLD 0.212 against 0.259, same top 88.9 % against 87.9 %. The default moves only if the speed holds.
+# Decomposition [derived]: both files are 324 GiB; routed experts gate/up Q3_K and down Q4_K/Q5_K by the same rules,
+# so the card/host expert bytes and the union's dot types match; the plan differs in residency (mid-p6-s1 against
+# mid-p4-s1) and the card's experts (2615 here). Expected: the same pp and decode within a few percent.
+kind: profile
+question: does the own Q3_K_M run the 1017 prompt and decode at the default file's speed (place a, A6000)?
+term: pp tok/s @ P = 4096 prose, the own file (bq3km), --place a, the default levers, RTX A6000; read beside the
+  default file's arm of the same invocation (P = 512 rows and decode rows alongside)
+unit: tok/s
+predict: 455..500
+condition: one lease, main's generate_ds41, BLOOMERY_AB_ROUNDS=3 just depth-gpu-ds41 prose:512 prose:4096
+  prose:512@BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf,BLOOMERY_REF_MODEL=/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf
+  prose:4096@BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf,BLOOMERY_REF_MODEL=/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf, order rotated every round; no row [cpu-busy] or
+  [other-busy]
+decide-in: pp and decode within 2 % of the default file's at both P: propose the own file as the default to the user
+  with the loss table (its base is its own source, which flatters it: say so)
+decide-below: slower: read the stat prefill split of both files; a residency or card-expert difference is the term
+decide-above: faster: read the same lines; then the default moves on both counts
