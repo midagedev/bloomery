@@ -1,6 +1,6 @@
-//! Q4_K, Q5_K, Q6_K and Q8_0 quantization on the host: ggml's `quantize_row_q4_K_ref` / `_impl` and the same for
-//! Q5_K and Q6_K, and `quantize_row_q8_0_ref` (`ggml/src/ggml-quants.c`), step for step, so the bytes are the
-//! bytes `llama-quantize` writes.
+//! Q3_K, Q4_K, Q5_K, Q6_K and Q8_0 quantization on the host: ggml's `quantize_row_q3_K_ref` / `_impl`,
+//! `quantize_row_q4_K_ref` / `_impl` and the same for Q5_K and Q6_K, and `quantize_row_q8_0_ref`
+//! (`ggml/src/ggml-quants.c`), step for step, so the bytes are the bytes `llama-quantize` writes.
 //!
 //! `ggml_quantize_chunk` takes the `_impl` rule (the importance-weighted search) when it is handed `quant_weights`
 //! and the `_ref` rule when it is not, and Q8_0 has one rule and ignores them; [`quantize_row`] makes the same choice
@@ -24,6 +24,7 @@ const GROUP_MAX_EPS: f32 = 1e-15;
 /// The types this module writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KType {
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
@@ -35,6 +36,7 @@ impl KType {
     #[must_use]
     pub fn of(ty: GgmlType) -> Option<KType> {
         match ty {
+            GgmlType::Q3_K => Some(KType::Q3K),
             GgmlType::Q4_K => Some(KType::Q4K),
             GgmlType::Q5_K => Some(KType::Q5K),
             GgmlType::Q6_K => Some(KType::Q6K),
@@ -47,6 +49,7 @@ impl KType {
     #[must_use]
     pub fn ggml(self) -> GgmlType {
         match self {
+            KType::Q3K => GgmlType::Q3_K,
             KType::Q4K => GgmlType::Q4_K,
             KType::Q5K => GgmlType::Q5_K,
             KType::Q6K => GgmlType::Q6_K,
@@ -67,6 +70,7 @@ impl KType {
     #[must_use]
     pub fn block_bytes(self) -> usize {
         match self {
+            KType::Q3K => 110,
             KType::Q4K => 144,
             KType::Q5K => 176,
             KType::Q6K => 210,
@@ -117,8 +121,8 @@ fn sum_sq(x: &[f32]) -> f32 {
     s
 }
 
-/// ggml's `make_qx_quants` at `rmse_type == 1` (Q6_K's), with `qw` optional: the scale of `n` values at `nmax`
-/// levels, the levels (offset by `nmax`) in `l`.
+/// ggml's `make_qx_quants` at `rmse_type == 1` (Q6_K's, and Q3_K's `_impl` rule), with `qw` optional: the scale of
+/// `n` values at `nmax` levels, the levels (offset by `nmax`) in `l`.
 fn make_qx_quants(nmax: i32, x: &[f32], l: &mut [i8], qw: Option<&[f32]>) -> f32 {
     let n = x.len();
     let mut max = 0.0f32;
@@ -170,6 +174,64 @@ fn make_qx_quants(nmax: i32, x: &[f32], l: &mut [i8], qw: Option<&[f32]>) -> f32
         }
     }
     scale
+}
+
+/// ggml's `make_q3_quants` at `do_rmse == true`, the only way `quantize_row_q3_K_ref` calls it: the scale of the
+/// 16 values `x` at `nmax` levels weighted by their squares, the levels (offset by `nmax`) in `l`.
+fn make_q3_quants(nmax: i32, x: &[f32], l: &mut [i8]) -> f32 {
+    let n = x.len();
+    let mut max = 0.0f32;
+    let mut amax = 0.0f32;
+    for &v in x {
+        let ax = v.abs();
+        if ax > amax {
+            amax = ax;
+            max = v;
+        }
+    }
+    if amax < GROUP_MAX_EPS {
+        l.fill(0);
+        return 0.0;
+    }
+    let nmaxf = nmax as f32;
+    let iscale = -nmaxf / max;
+    let mut sumlx = 0.0f32;
+    let mut suml2 = 0.0f32;
+    for i in 0..n {
+        let li = imax(-nmax, imin(nmax - 1, nint(iscale * x[i])));
+        l[i] = li as i8;
+        let w = x[i] * x[i];
+        sumlx += w * x[i] * li as f32;
+        suml2 += w * li as f32 * li as f32;
+    }
+    for _ in 0..5 {
+        let mut n_changed = 0;
+        for i in 0..n {
+            let w = x[i] * x[i];
+            let mut slx = sumlx - w * x[i] * f32::from(l[i]);
+            if slx > 0.0 {
+                let mut sl2 = suml2 - w * f32::from(l[i]) * f32::from(l[i]);
+                let new_l = imax(-nmax, imin(nmax - 1, nint(x[i] * sl2 / slx)));
+                if new_l != i32::from(l[i]) {
+                    slx += w * x[i] * new_l as f32;
+                    sl2 += w * new_l as f32 * new_l as f32;
+                    if sl2 > 0.0 && slx * slx * suml2 > sumlx * sumlx * sl2 {
+                        l[i] = new_l as i8;
+                        sumlx = slx;
+                        suml2 = sl2;
+                        n_changed += 1;
+                    }
+                }
+            }
+        }
+        if n_changed == 0 {
+            break;
+        }
+    }
+    for v in &mut l[..n] {
+        *v += nmax as i8;
+    }
+    if suml2 > 0.0 { sumlx / suml2 } else { 0.0 }
 }
 
 /// ggml's `make_qkx2_quants` (the `_ref` rules' 32-value search, `use_mad == false`): the scale, the minimum's
@@ -597,6 +659,130 @@ fn kquant45_block(x: &[f32], qw: Option<&[f32]>, q5: bool, out: &mut Vec<u8>) {
     }
 }
 
+/// The 16 six-bit scale codes of a Q3_K block (each sub-block's scale plus 32) packed as `block_q3_K.scales`.
+fn q3k_pack_scales(codes: &[u8; 16]) -> [u8; 12] {
+    let mut s = [0u8; 12];
+    for j in 0..16 {
+        let l = codes[j];
+        if j < 8 {
+            s[j] = l & 0xF;
+        } else {
+            s[j - 8] |= (l & 0xF) << 4;
+        }
+        s[j % 4 + 8] |= (l >> 4) << (2 * (j / 4));
+    }
+    s
+}
+
+/// The scale of Q3_K sub-block `j` out of the packed codes: the six-bit code less 32.
+fn q3k_scale(j: usize, s: &[u8; 12]) -> i32 {
+    let lo = if j < 8 { s[j] & 0xF } else { s[j - 8] >> 4 };
+    let hi = (s[8 + j % 4] >> (2 * (j / 4))) & 3;
+    i32::from(lo | (hi << 4)) - 32
+}
+
+/// The rest of a Q3_K block once its scale codes and `d` are fixed, the same in the `_ref` and `_impl` rules: the
+/// levels against the stored scales (`l` keeps the search's levels, offset by 4, for a sub-block whose scale is
+/// zero), the high-bit mask, and the bytes `hmask`, `qs`, `scales`, `d`.
+fn q3k_finish(x: &[f32], codes: &[u8; 16], d_bits: u16, l: &mut [i8; QK], out: &mut Vec<u8>) {
+    let sc = q3k_pack_scales(codes);
+    let d = half_to_f32(d_bits);
+    for j in 0..16 {
+        let dd = d * q3k_scale(j, &sc) as f32;
+        if dd == 0.0 {
+            continue;
+        }
+        for ii in 0..16 {
+            let li = imax(-4, imin(3, nint(x[16 * j + ii] / dd)));
+            l[16 * j + ii] = (li + 4) as i8;
+        }
+    }
+    let mut hmask = [0u8; QK / 8];
+    let (mut m, mut hm) = (0usize, 1u8);
+    for v in l.iter_mut() {
+        if *v > 3 {
+            hmask[m] |= hm;
+            *v -= 4;
+        }
+        m += 1;
+        if m == QK / 8 {
+            m = 0;
+            hm <<= 1;
+        }
+    }
+    let mut qs = [0u8; QK / 4];
+    for j in (0..QK).step_by(128) {
+        for k in 0..32 {
+            let q = |o: usize| l[j + k + o] as u8;
+            qs[j / 4 + k] = q(0) | (q(32) << 2) | (q(64) << 4) | (q(96) << 6);
+        }
+    }
+    out.extend_from_slice(&hmask);
+    out.extend_from_slice(&qs);
+    out.extend_from_slice(&sc);
+    out.extend_from_slice(&d_bits.to_le_bytes());
+}
+
+/// One Q3_K block (`qw` selects the importance-weighted scale search, else the squared-value one).
+fn q3k_block(x: &[f32], qw: Option<&[f32]>, out: &mut Vec<u8>) {
+    let mut l = [0i8; QK];
+    let mut scales = [0.0f32; 16];
+    let mut codes = [0u8; 16];
+    let d_bits;
+    if let Some(qw) = qw {
+        let sumx2 = sum_sq(x);
+        let sigma2 = 2.0f32 * sumx2 / QK as f32;
+        let mut sw = [0.0f32; 16];
+        let mut weight = [0.0f32; 16];
+        for j in 0..16 {
+            for k in 0..16 {
+                let v = x[16 * j + k];
+                weight[k] = qw[16 * j + k] * (sigma2 + v * v).sqrt();
+            }
+            let mut sumw = 0.0f32;
+            for &w in &weight {
+                sumw += w;
+            }
+            sw[j] = sumw;
+            scales[j] = make_qx_quants(
+                4,
+                &x[16 * j..16 * j + 16],
+                &mut l[16 * j..16 * j + 16],
+                Some(&weight),
+            );
+        }
+        let mut ls = [0i8; 16];
+        let d_block = make_qx_quants(32, &scales, &mut ls, Some(&sw));
+        for j in 0..16 {
+            codes[j] = ls[j] as u8;
+        }
+        d_bits = f32_to_f16_bits(d_block);
+    } else {
+        let mut max_scale = 0.0f32;
+        let mut amax = 0.0f32;
+        for j in 0..16 {
+            scales[j] = make_q3_quants(4, &x[16 * j..16 * j + 16], &mut l[16 * j..16 * j + 16]);
+            let scale = scales[j].abs();
+            if scale > amax {
+                amax = scale;
+                max_scale = scales[j];
+            }
+        }
+        if max_scale != 0.0 {
+            let iscale = -32.0f32 / max_scale;
+            for j in 0..16 {
+                // ggml stores the rounded value in an `int8_t` before clamping
+                let li = i32::from(nint(iscale * scales[j]) as i8);
+                codes[j] = (imax(-32, imin(31, li)) + 32) as u8;
+            }
+            d_bits = f32_to_f16_bits(1.0f32 / iscale);
+        } else {
+            d_bits = f32_to_f16_bits(0.0);
+        }
+    }
+    q3k_finish(x, &codes, d_bits, &mut l, out);
+}
+
 /// One Q6_K block (`qw` selects the importance-weighted scale search, else the squared-value weights).
 fn q6k_block(x: &[f32], qw: Option<&[f32]>, out: &mut Vec<u8>) {
     let mut l = [0i8; QK];
@@ -670,7 +856,7 @@ fn q8_0_block(x: &[f32], out: &mut Vec<u8>) {
 }
 
 /// One row of `x` quantized to `kt` into ggml's block bytes. `qw` is the importance, one value per column: with it
-/// Q4_K, Q5_K and Q6_K take ggml's `_impl` rules, without it the `_ref` rules; Q8_0 ignores it.
+/// Q3_K, Q4_K, Q5_K and Q6_K take ggml's `_impl` rules, without it the `_ref` rules; Q8_0 ignores it.
 pub fn quantize_row(kt: KType, x: &[f32], qw: Option<&[f32]>) -> Result<Vec<u8>, KQuantError> {
     let n = x.len();
     let bv = kt.block_values();
@@ -694,6 +880,7 @@ pub fn quantize_row(kt: KType, x: &[f32], qw: Option<&[f32]>) -> Result<Vec<u8>,
     for (i, xb) in x.chunks_exact(bv).enumerate() {
         let qb = qw.map(|q| &q[i * bv..(i + 1) * bv]);
         match kt {
+            KType::Q3K => q3k_block(xb, qb, &mut out),
             KType::Q4K => kquant45_block(xb, qb, false, &mut out),
             KType::Q5K => kquant45_block(xb, qb, true, &mut out),
             KType::Q6K => q6k_block(xb, qb, &mut out),

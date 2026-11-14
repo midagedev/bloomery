@@ -1,4 +1,4 @@
-use super::{KQuantError, KType, quantize_row};
+use super::{KQuantError, KType, q3k_pack_scales, q3k_scale, quantize_row};
 use crate::quant::dequant_row;
 
 /// A deterministic row: a slow wave plus a hash-like ripple, no two blocks alike.
@@ -14,7 +14,7 @@ fn row(n: usize, seed: u32) -> Vec<f32> {
         .collect()
 }
 
-const ALL: [KType; 4] = [KType::Q4K, KType::Q5K, KType::Q6K, KType::Q8_0];
+const ALL: [KType; 5] = [KType::Q3K, KType::Q4K, KType::Q5K, KType::Q6K, KType::Q8_0];
 
 #[test]
 fn a_row_is_whole_blocks_of_the_types_size_and_reads_back_close() {
@@ -36,6 +36,8 @@ fn a_row_is_whole_blocks_of_the_types_size_and_reads_back_close() {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             let bound = match kt {
+                // a clipped extreme is one step of its group's scale: a quarter of the row's largest value
+                KType::Q3K => 0.22,
                 KType::Q4K => 0.12,
                 KType::Q5K => 0.06,
                 KType::Q6K | KType::Q8_0 => 0.02,
@@ -49,7 +51,7 @@ fn a_row_is_whole_blocks_of_the_types_size_and_reads_back_close() {
 fn a_zero_row_is_zero_bytes_and_the_same_with_or_without_importance() {
     let x = vec![0.0f32; 256];
     let qw = vec![1.0f32; 256];
-    for kt in [KType::Q4K, KType::Q5K, KType::Q6K, KType::Q8_0] {
+    for kt in ALL {
         let a = quantize_row(kt, &x, None).unwrap();
         let b = quantize_row(kt, &x, Some(&qw)).unwrap();
         assert!(a.iter().all(|&v| v == 0), "{kt:?}");
@@ -65,12 +67,33 @@ fn q8_0_ignores_the_importance_the_k_types_do_not() {
         quantize_row(KType::Q8_0, &x, None).unwrap(),
         quantize_row(KType::Q8_0, &x, Some(&qw)).unwrap()
     );
-    for kt in [KType::Q4K, KType::Q5K, KType::Q6K] {
+    for kt in [KType::Q3K, KType::Q4K, KType::Q5K, KType::Q6K] {
         assert_ne!(
             quantize_row(kt, &x, None).unwrap(),
             quantize_row(kt, &x, Some(&qw)).unwrap(),
             "{kt:?}"
         );
+    }
+}
+
+#[test]
+fn q3k_scale_codes_pack_into_twelve_bytes_and_read_back() {
+    // every 6-bit code in every sub-block position, the rest of the block held at other codes
+    for hold in [0u8, 21, 63] {
+        for j in 0..16 {
+            for code in 0..64u8 {
+                let mut codes = [hold; 16];
+                codes[j] = code;
+                let packed = q3k_pack_scales(&codes);
+                for (k, &c) in codes.iter().enumerate() {
+                    assert_eq!(
+                        q3k_scale(k, &packed),
+                        i32::from(c) - 32,
+                        "hold {hold} sub-block {j} code {code} read at {k}"
+                    );
+                }
+            }
+        }
     }
 }
 
