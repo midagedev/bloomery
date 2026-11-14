@@ -13,8 +13,9 @@ predict: +44..+68
 rounds: 2
 condition: this tree's generate_ds41 and 4e28e0a54's (built in /root/repo/bloomery-sitbase before the lease, a bin:
   arm) alternate in one lease, BLOOMERY_AB_ROUNDS=2 just depth-gpu-ds41
-  prose:4096@BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf
-  bin:/root/repo/bloomery-sitbase/target/release/generate_ds41:prose:4096@BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf,
+  prose:4096@BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf,BLOOMERY_REF_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf
+  bin:/root/repo/bloomery-sitbase/target/release/generate_ds41:prose:4096@BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf,BLOOMERY_REF_MODEL=/models/DeepSeek-V4.1-Flash-1017/UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf
+  (a V4.1 run opens one file, so both variables name it),
   the order rotated every round; both arms' plan prints name the same residency word and card_experts; no row
   carries [cpu-busy] or [other-busy]
 decide-in: land it (already landed with the train); UD-IQ3_XXS stays slower than Q3_K_M (~431), so the default
