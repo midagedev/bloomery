@@ -227,6 +227,13 @@
 # than the wait costs the lane nothing beyond its own items; a hold, or a sitting that starts after
 # the probe, is the stolen item's own box.sh guard, as it is for every item. --lanes 1 steals
 # nothing.
+# One run of a recipe at a time. Items of one recipe (NAME, its NAME@K=V variants and its NAME:ARGS forms) share its binary and every fixed
+# path it writes in the remote directory, so no two of them run at once, in whatever lanes. The rule is a mutex per recipe: a directory under
+# DIR/recipe-locks that holds its owner's plan index. A lane that chooses its next item while it runs (the build lane's queue, the chain loop)
+# takes the mutex with the pick and passes over an item whose recipe is up, taking another ready one; the pack leaves an item of a recipe it
+# runs to a later turn. Every other way to a run (the list-order loop of --no-build-lane, a steal, a chain member) has no other item to take,
+# so run_item waits for the mutex in 1 s slices (`recwait=<s>s` on the item line, left out of the times row). The plan's lane sums do not
+# model it: a recipe's items count as parallel work where they run in series.
 # Build lane. A card idles while its own lane compiles, and cargo serialises the compiles on the one build directory anyway, so a third
 # lane — it holds no card and no gate lock — runs each item's BUILD pass ahead of the run lanes: the item's own `just` recipe with
 # BLOOMERY_BUILD_ONLY=1 in its box env, which tools/gate.sh (its build phase under the build bound, then rc 0 or the build's rc),
@@ -2436,6 +2443,59 @@ HK
   printf '%s' "$rc" > "$t/rc-pk-budgetm"
   if overlap "$t/fake-state/seq.log" gen_pg gen_pg2; then pass 'pack mutant: without the budget the pair overlaps'
   else fail 'pack mutant: without the budget the pair overlaps' "the intervals did not cross"; fi
+  # One run of a recipe at a time (the header): two items of one recipe — here two ARGS forms of rv-any, the last word of the call names
+  # each — that the balance puts in two lanes never overlap. The list-order loop has no other item to take, so the later one waits at the
+  # recipe's mutex and its line says so (recwait=), the wait left out of its times row. The mutant takes no mutex: held for each other
+  # (AWAIT), the two calls overlap.
+  cp "$t/justfile" "$t/justfile.rv"
+  cp "$t/tools/gate-batch-resources.tsv" "$t/resources.rv"
+  cat >> "$t/justfile" << 'JF'
+
+rv-any *ARGS:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_rv {{ARGS}}'
+
+[group('solo')]
+rv-solo *ARGS:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_rs {{ARGS}}'
+JF
+  printf 'rv-solo\t-\t100\n' >> "$t/tools/gate-batch-resources.tsv"
+  rc=$(steal_case rv-lanes "rv-any@FAKE_SLEEP=4:vone	A	3090	4	$d" "rv-any@FAKE_SLEEP=4:vtwo	B	a6000	4	$d" \
+    -- rv-any@FAKE_SLEEP=4:vone rv-any@FAKE_SLEEP=4:vtwo)
+  printf '%s' "$rc" > "$t/rc-rv-lanes"
+  rc_ok 'recipe: two items of one recipe in two lanes end green' rv-lanes 2
+  if no_overlap "$t/fake-state/seq.log" vone vtwo; then pass 'recipe: two items of one recipe never overlap, whatever their lanes'
+  else fail 'recipe: two items of one recipe never overlap, whatever their lanes' "the intervals crossed: $(ivals "$t/fake-state/seq.log" vone vtwo)"; fi
+  want 'recipe: the item that waited at the mutex says so' "$t/target/c-rv-lanes/run.log" '^rv-any(-2)? rc=0 [0-9]+s try=1 lane=[AB] tier=real recwait=[1-9][0-9]*s'
+  # shellcheck disable=SC2016 # an awk program: its dollar is its own
+  want_no_row 'recipe: the wait is left out of the times row' "$t/times-rv-lanes.tsv" '$4 > 6'
+  # shellcheck disable=SC2016 # a sed program: its dollars are its own
+  mutant_of rv-nomutex 's|^  recipe_held "\$1" \|\| recipe_try "\$1" \&\& return 0$|  return 0 # MUTANT rv-nomutex|' '# MUTANT rv-nomutex$'
+  rc=$(AWAIT='vone=vtwo vtwo=vone' MTAG=rv-nomutex steal_case rv-lanesm "rv-any@FAKE_SLEEP=4:vone	A	3090	4	$d" "rv-any@FAKE_SLEEP=4:vtwo	B	a6000	4	$d" \
+    -- rv-any@FAKE_SLEEP=4:vone rv-any@FAKE_SLEEP=4:vtwo)
+  printf '%s' "$rc" > "$t/rc-rv-lanesm"
+  if overlap "$t/fake-state/seq.log" vone vtwo; then pass 'recipe mutant: without the mutex the two items of one recipe overlap'
+  else fail 'recipe mutant: without the mutex the two items of one recipe overlap' "the intervals did not cross: $(ivals "$t/fake-state/seq.log" vone vtwo)"; fi
+  # The pack: a card goes to an item of another recipe while one of the recipe runs — the pack's pass-over, not the mutex (which holds
+  # the exclusion by itself). Budget 10000, so the three items fit side by side but for the recipe's own rule: svone takes a card, svtwo
+  # (the same recipe) is left to a later turn, pk-b takes the other card beside svone. The mutant launches svtwo onto the second card, where
+  # it waits at the mutex with the card held, and pk-b starts only after svone ended.
+  rc=$(BLOOMERY_PACK_BUDGET=10000 steal_case rv-pack "rv-solo@FAKE_SLEEP=4:svone	A	3090	4	$d" "rv-solo@FAKE_SLEEP=4:svtwo	B	a6000	4	$d" "pk-b@FAKE_SLEEP=3	B	a6000	3	$d" \
+    -- rv-solo@FAKE_SLEEP=4:svone rv-solo@FAKE_SLEEP=4:svtwo pk-b@FAKE_SLEEP=3)
+  printf '%s' "$rc" > "$t/rc-rv-pack"
+  rc_ok 'recipe: a pack of two items of one recipe and another recipe'"'"'s item ends green' rv-pack 3
+  if no_overlap "$t/fake-state/seq.log" svone svtwo; then pass 'recipe: the pack never runs two items of one recipe at once'
+  else fail 'recipe: the pack never runs two items of one recipe at once' "the intervals crossed: $(ivals "$t/fake-state/seq.log" svone svtwo)"; fi
+  if overlap "$t/fake-state/seq.log" svone gen_pb; then pass 'recipe: the pack gives the free card to another recipe'"'"'s item'
+  else fail 'recipe: the pack gives the free card to another recipe'"'"'s item' "the intervals did not cross: $(ivals "$t/fake-state/seq.log" svone gen_pb)"; fi
+  # shellcheck disable=SC2016 # a sed program: its dollars are its own
+  mutant_of rv-nopackup 's|^        \[ "\$up" = 0 \] \|\| continue$|        true # MUTANT rv-nopackup|' '# MUTANT rv-nopackup$'
+  rc=$(BLOOMERY_PACK_BUDGET=10000 MTAG=rv-nopackup steal_case rv-packm "rv-solo@FAKE_SLEEP=4:svone	A	3090	4	$d" "rv-solo@FAKE_SLEEP=4:svtwo	B	a6000	4	$d" "pk-b@FAKE_SLEEP=3	B	a6000	3	$d" \
+    -- rv-solo@FAKE_SLEEP=4:svone rv-solo@FAKE_SLEEP=4:svtwo pk-b@FAKE_SLEEP=3)
+  printf '%s' "$rc" > "$t/rc-rv-packm"
+  if ! overlap "$t/fake-state/seq.log" svone gen_pb && no_overlap "$t/fake-state/seq.log" svone svtwo; then pass 'recipe mutant: without the pass-over the second item holds a card and the other recipe'"'"'s item waits'
+  else fail 'recipe mutant: without the pass-over the second item holds a card and the other recipe'"'"'s item waits' "$(ivals "$t/fake-state/seq.log" svone gen_pb)"; fi
+  cp "$t/justfile.rv" "$t/justfile"
+  cp "$t/resources.rv" "$t/tools/gate-batch-resources.tsv"
   fi
   if gb_part 10; then
   # (3) an m item runs with nothing else beside it, first (it is the longest) or after a running item.
@@ -2902,6 +2962,56 @@ HK
   if [ ! -e "$t/target/c-nf-none/deferred.list" ]; then pass 'no-fixture run: a batch that deferred nothing writes no list'
   else fail 'no-fixture run: a batch that deferred nothing writes no list' "$(cat "$t/target/c-nf-none/deferred.list")"; fi
   want_not '  … and its DONE line has none of the deferral fields' "$t/target/c-nf-none/run.log" '^DONE .*(real_only|no_fixture|deferred_list)='
+  # One run of a recipe at a time (the header), the build lane's queue (the script as shipped): steal-fix keeps lane A for 5 s, lane B
+  # takes bvone at once and runs it for 8 s, and lane A, back at its queue with bvtwo (the recipe's second item) at its head, takes the
+  # filler behind it, not the wait: the filler runs beside bvone. The mutant takes no mutex at the pick, so lane A claims bvtwo and
+  # waits at run_item's mutex with the filler behind it.
+  cp "$t/justfile" "$t/justfile.rq"
+  cat >> "$t/justfile" << 'JF'
+
+rv-any *ARGS:
+    ./tools/box.sh 'BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gen_rv {{ARGS}}'
+JF
+  local rvq=("steal-fix@FAKE_SLEEP=5	A	3090	1	$d" "rv-any@FAKE_SLEEP=8:bvone	B	a6000	10	$d" "rv-any@FAKE_SLEEP=2:bvtwo	A	3090	8	$d" "plain-any@FAKE_SLEEP=2	A	3090	2	$d")
+  printf '%s\n' "${rvq[@]}" > "$t/times-rvq.tsv"
+  out=$(BLOOMERY_GATE_TIMES=$t/times-rvq.tsv bash "$t/tools/gate-batch-bl.sh" --dry-run 'steal-fix@FAKE_SLEEP=5' 'rv-any@FAKE_SLEEP=8:bvone' 'rv-any@FAKE_SLEEP=2:bvtwo' 'plain-any@FAKE_SLEEP=2' 2>&1) || fail 'recipe: the dry run of the queue case failed' "$out"
+  got=$(sed -n 's/^lane \([AB]\)  \([^ ]*\) .*/\1:\2/p' <<< "$out" | tr '\n' ' ')
+  if [ "$got" = 'A:steal-fix A:rv-any-2 A:plain-any B:rv-any ' ]; then pass 'recipe: the queue case is laid out as the clause reads it (lane A: steal-fix, bvtwo, filler; lane B: bvone)'
+  else fail 'recipe: the queue case is laid out as the clause reads it (lane A: steal-fix, bvtwo, filler; lane B: bvone)' "got '$got'"; fi
+  rc=$(BL=1 steal_case rv-queue "${rvq[@]}" -- 'steal-fix@FAKE_SLEEP=5' 'rv-any@FAKE_SLEEP=8:bvone' 'rv-any@FAKE_SLEEP=2:bvtwo' 'plain-any@FAKE_SLEEP=2')
+  printf '%s' "$rc" > "$t/rc-rv-queue"
+  rc_ok 'recipe: the queue case ends green' rv-queue 4
+  if no_overlap "$t/fake-state/seq.log" bvone bvtwo; then pass 'recipe: the queue never starts the recipe'"'"'s second item beside its first'
+  else fail 'recipe: the queue never starts the recipe'"'"'s second item beside its first' "the intervals crossed: $(ivals "$t/fake-state/seq.log" bvone bvtwo)"; fi
+  if overlap "$t/fake-state/seq.log" bvone other; then pass 'recipe: the lane took the next ready item while the recipe was up'
+  else fail 'recipe: the lane took the next ready item while the recipe was up' "the intervals did not cross: $(ivals "$t/fake-state/seq.log" bvone other)"; fi
+  want_not 'recipe: …and waited at no mutex' "$t/target/c-rv-queue/run.log" ' recwait='
+  # shellcheck disable=SC2016 # a sed program: its dollars are its own
+  MSRC=$t/tools/gate-batch-bl.sh mutant_of rv-nopick 's|^      recipe_try "\$i" \|\| { pend=1; continue; } # .*$|      true # MUTANT rv-nopick|' '# MUTANT rv-nopick$'
+  rc=$(BL=1 MTAG=rv-nopick steal_case rv-queuem "${rvq[@]}" -- 'steal-fix@FAKE_SLEEP=5' 'rv-any@FAKE_SLEEP=8:bvone' 'rv-any@FAKE_SLEEP=2:bvtwo' 'plain-any@FAKE_SLEEP=2')
+  printf '%s' "$rc" > "$t/rc-rv-queuem"
+  if ! overlap "$t/fake-state/seq.log" bvone other && no_overlap "$t/fake-state/seq.log" bvone bvtwo; then pass 'recipe mutant: without the pick'"'"'s mutex the lane claims the second item and waits at the mutex with the filler behind it'
+  else fail 'recipe mutant: without the pick'"'"'s mutex the lane claims the second item and waits at the mutex with the filler behind it' "$(ivals "$t/fake-state/seq.log" bvone other)"; fi
+  want 'recipe mutant: …and that item'"'"'s line says it waited' "$t/target/c-rv-queuem/run.log" '^rv-any(-2)? rc=0 [0-9]+s try=1 lane=[AB] tier=real .*recwait=[1-9][0-9]*s'
+  # The chain loop's pick (take_next): a v41-load member holds one lane for 5 s while the other runs cvone for 8 s; the member's lane then
+  # finds cvtwo (the recipe's second item, the longest left) up and takes the filler, which runs beside cvone. The mutant's pick neither
+  # passes over an item whose recipe is up nor takes the mutex: the lane claims cvtwo and waits at run_item's with the filler behind it.
+  local rvc=("v41-any@FAKE_SLEEP=5	A	3090	3	$d" "rv-any@FAKE_SLEEP=8:cvone	B	a6000	10	$d" "rv-any@FAKE_SLEEP=2:cvtwo	A	3090	8	$d" "plain-any@FAKE_SLEEP=2	A	3090	2	$d")
+  rc=$(steal_case rv-chain "${rvc[@]}" -- 'v41-any@FAKE_SLEEP=5' 'rv-any@FAKE_SLEEP=8:cvone' 'rv-any@FAKE_SLEEP=2:cvtwo' 'plain-any@FAKE_SLEEP=2')
+  printf '%s' "$rc" > "$t/rc-rv-chain"
+  rc_ok 'recipe: the chain case ends green' rv-chain 4
+  if no_overlap "$t/fake-state/seq.log" cvone cvtwo; then pass 'recipe: the chain loop never starts the recipe'"'"'s second item beside its first'
+  else fail 'recipe: the chain loop never starts the recipe'"'"'s second item beside its first' "the intervals crossed: $(ivals "$t/fake-state/seq.log" cvone cvtwo)"; fi
+  if overlap "$t/fake-state/seq.log" cvone other; then pass 'recipe: the chain loop took the next ready item while the recipe was up'
+  else fail 'recipe: the chain loop took the next ready item while the recipe was up' "the intervals did not cross: $(ivals "$t/fake-state/seq.log" cvone other)"; fi
+  want_not 'recipe: …and waited at no mutex' "$t/target/c-rv-chain/run.log" ' recwait='
+  # shellcheck disable=SC2016 # a sed program: its dollars are its own
+  mutant_of rv-nochain 's|^    if recipe_busy "\$j"; then continue; fi # .*$|    true # MUTANT rv-nochain|;s|^  recipe_try "\$best" \|\| return 1$|  true # MUTANT rv-nochain|' '# MUTANT rv-nochain$'
+  rc=$(MTAG=rv-nochain steal_case rv-chainm "${rvc[@]}" -- 'v41-any@FAKE_SLEEP=5' 'rv-any@FAKE_SLEEP=8:cvone' 'rv-any@FAKE_SLEEP=2:cvtwo' 'plain-any@FAKE_SLEEP=2')
+  printf '%s' "$rc" > "$t/rc-rv-chainm"
+  if ! overlap "$t/fake-state/seq.log" cvone other && no_overlap "$t/fake-state/seq.log" cvone cvtwo; then pass 'recipe mutant: without the pick'"'"'s pass-over the chain loop claims the second item and waits at the mutex with the filler behind it'
+  else fail 'recipe mutant: without the pick'"'"'s pass-over the chain loop claims the second item and waits at the mutex with the filler behind it' "$(ivals "$t/fake-state/seq.log" cvone other)"; fi
+  cp "$t/justfile.rq" "$t/justfile"
   fi
   if gb_part 13; then
   # variant items (the header's variant paragraph): the tag is the table's, the recipe the row's, the family the tag's; in the real tier
@@ -7826,8 +7936,8 @@ fi
 : > "$RUNLOG"
 rm -f "$OUT/canary.red" # a retried --out holds no earlier run's stop
 rm -rf "$OUT"/lane-*.box # ... nor an earlier run's registered pids (a KILLed call's file, its pid reused by another batch's box.sh)
-rm -rf "$OUT/build" # ... nor an earlier run's build passes
-mkdir -p "$OUT/claims" "$OUT/build" # one claim per item: the owner's start and the thief's steal agree on it; the build lane's states and logs
+rm -rf "$OUT/build" "$OUT/recipe-locks" # ... nor an earlier run's build passes, nor a recipe mutex a stopped run left
+mkdir -p "$OUT/claims" "$OUT/build" "$OUT/recipe-locks" # one claim per item: the owner's start and the thief's steal agree on it; the build lane's states and logs; the recipes' mutexes
 T0=$(date +%s)
 echo "plan $PREDICTED defaults=$SUM_NDEF (predicted, derived from $TIMES_FILE)" >> "$RUNLOG"
 start_hook
@@ -8123,7 +8233,8 @@ lane_queue() { # $1 = the worker's label, $2 = the queue's lane: its items in th
         continue
       fi
       if neighbour_blocked "$i" || ! build_ready "$i"; then pend=1; continue; fi
-      claim_item "$i" "$lane" || continue
+      recipe_try "$i" || { pend=1; continue; } # an item of its recipe runs: the next ready item first, this one when the mutex is free
+      claim_item "$i" "$lane" || { recipe_rel "$i"; continue; }
       run_pooled "$i" run_item "$i" "$lane"
       did=1
       break # the queue's head again: an item passed over may be ready now
@@ -8136,7 +8247,7 @@ lane_queue() { # $1 = the worker's label, $2 = the queue's lane: its items in th
 }
 
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
-  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran=0 s benv line waits=0 cold=0 deferred=0 yowner='' rcl mark twin='' attach_pid attach_file held83=0 dl0=0 dlwait=0
+  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran=0 s benv line waits=0 cold=0 deferred=0 yowner='' rcl mark twin='' attach_pid attach_file held83=0 dl0=0 dlwait=0 recwait=0 rlock=0
   local lanelab=${2%%[0-9]*} tlane bfail=0 bsec=0 bline='' # the label the lines carry (a host worker H2 is lane H), the times row's lane (the file's three values), the build pass's share
   tlane=$lanelab
   [ "$tlane" != H ] || tlane=B
@@ -8199,6 +8310,13 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
         twin='' ;;
     esac
   fi
+  # One run of a recipe at a time (the header): the mutex is this item's for its tries, however many, and not for a build take or a twin's wait.
+  if [ -z "$twin" ] && [ "$bfail" = 0 ]; then
+    recipe_take "$i"
+    recwait=$RECWAIT
+    [ "$recwait" = 0 ] || echo "=== waited $recwait s for the recipe ${P_NAME[$i]}: an item of it was running" >> "$log"
+  fi
+  ! recipe_held "$i" || rlock=1 # a pick took it, or the take above did: released below whatever the tries were
   while [ -z "$twin" ] && [ "$bfail" = 0 ]; do
     try=$((try + 1))
     echo "=== try $try $(date '+%F %T') lane=$lane: $(cmd_of "$i")" >> "$log"
@@ -8250,6 +8368,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     fi
     break
   done
+  [ "$rlock" = 0 ] || recipe_rel "$i"
   s=$(($(date +%s) - t0))
   if [ -n "$yowner" ]; then
     rcl=yield
@@ -8263,6 +8382,7 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
     line="${P_STEM[$i]} rc=$rc ${s}s try=$try lane=$lanelab tier=$TIER"
   fi
   [ "$waits" = 0 ] || line="$line waited=${waits}s"
+  [ "$recwait" = 0 ] || line="$line recwait=${recwait}s"
   [ -z "$bline" ] || line="$line $bline" # `<s>s` is the run pass; build= the build pass's seconds, or why the build stayed in the run
   [ "$held83" = 0 ] || line="$line dirlock=${dlwait}s"
   [ -z "$twin" ] || line="$line twin=$twin"
@@ -8368,6 +8488,31 @@ POOL_MUTEX=$OUT/pool.lock
 pool_tagged() { case " ${P_TAG[$1]:-} " in *' pool '*) return 0 ;; *) return 1 ;; esac; }
 pool_take() { until mkdir_lock "$POOL_MUTEX"; do sleep 1; done; }
 pool_rel() { rmdir "$POOL_MUTEX" 2> /dev/null || true; }
+# One run of a recipe at a time (the header's paragraph of that name): a directory per recipe name under DIR/recipe-locks, holding the plan
+# index of the item that owns it. A picker that chooses while it runs (lane_queue, take_next) takes it with the pick, atomically with
+# the choice (recipe_try), so two lanes picking at one instant never both choose items of one recipe; run_item takes it when the pick
+# did not, and waits for it there (a path with no choice: the list-order loop, a steal, a chain member).
+RECIPE_LOCKS=$OUT/recipe-locks
+recipe_busy() { [ -e "$RECIPE_LOCKS/${P_NAME[$1]}" ]; } # $1 = plan index: an item of its recipe owns the mutex
+recipe_try() { # $1 = plan index: the recipe's mutex is this item's if it was free (rc 0), else rc 1
+  recipe_busy "$1" && return 1 # the common answer of a lane that polls, without the mkdir's python
+  mkdir_lock "$RECIPE_LOCKS/${P_NAME[$1]}" || return 1
+  echo "$1" > "$RECIPE_LOCKS/${P_NAME[$1]}/item"
+}
+recipe_held() { [ "$(cat "$RECIPE_LOCKS/${P_NAME[$1]}/item" 2> /dev/null)" = "$1" ]; } # $1 = plan index: the mutex is this item's
+recipe_take() { # $1 = plan index: the mutex is this item's, taken at its pick or waited for in 1 s slices; RECWAIT = the seconds waited, 0 when no slice was slept
+  local t0
+  RECWAIT=0
+  recipe_held "$1" || recipe_try "$1" && return 0
+  t0=$(date +%s)
+  until recipe_try "$1"; do sleep 1; done
+  RECWAIT=$(($(date +%s) - t0))
+  [ "$RECWAIT" -ge 1 ] || RECWAIT=1
+}
+recipe_rel() { # $1 = plan index: only the item that owns the mutex calls it
+  rm -f "$RECIPE_LOCKS/${P_NAME[$1]}/item"
+  rmdir "$RECIPE_LOCKS/${P_NAME[$1]}" 2> /dev/null || true
+}
 run_pooled() { # $1 = plan index, $2..: run the item under the pool mutex when it is pool-tagged
   local i=$1
   shift
@@ -8465,21 +8610,26 @@ take_next() { # $1 = lane, $2 = the variable for the index: a green skip first (
       return 0
     fi
     if neighbour_blocked "$j"; then continue; fi
+    if recipe_busy "$j"; then continue; fi # an item of its recipe owns the mutex
     build_ready "$j" || continue # its build pass has not ended: another item, or the lane waits (lane_blocked)
     if pool_tagged "$j" && [ -e "$POOL_MUTEX" ]; then continue; fi # another pool item runs (the pack's mutex)
     rec_get "$j" exp labels
     if [ "$exp" -gt "$be" ]; then best=$j be=$exp; fi
   done
   [ "$best" -ge 0 ] || return 1
+  # The recipe's mutex goes with the pick. Another lane that picked an item of the recipe at the same instant took it first: this lane
+  # chooses again after its wait, the recipe now being up.
+  recipe_try "$best" || return 1
   rec_get "$best" cls cards labels
   # A balanced item taken onto this lane's card is today's steal: the timing lease is probed first
   # (never a card while it is held) and the placement moves with it. A fixed item is its lane's own.
   if [ "$cls" = F ] && [ "$labels" != none ]; then
-    lease_free_for_steal || return 1
+    lease_free_for_steal || { recipe_rel "$best"; return 1; }
     card=$(lane_card "$lane")
     case " $cards " in
       *" $card "*) switch_candidate "$best" "$card" ;;
     esac
+    [ "${P_LST[$best]}" != skip ] || recipe_rel "$best" # green on this card's key: the caller skips it, which runs nothing
   fi
   printf -v "$var" '%s' "$best"
   return 0
@@ -8583,7 +8733,7 @@ steal_pass() { # $1 = lane
 # every turn launches, reaps, or sleeps a second, and a turn that ends its launch pass with nothing
 # running and an item left ends the batch naming each (the stall guard: no later turn could launch).
 run_pack() {
-  local t0 i j k labels exp res card best be bc launched alldone p cards fam cfam left
+  local t0 i j k labels exp res card best be bc launched alldone p cards fam cfam left up
   t0=$(date +%s)
   local -a XP=()
   for i in ${ORDER[@]+"${ORDER[@]}"}; do [ "${P_LANE[$i]}" = X ] && XP+=("$i"); done
@@ -8635,6 +8785,13 @@ run_pack() {
         [ -z "${R_PID[$i]}" ] || continue
         claimed "$i" && continue
         build_ready "$i" || continue
+        # one run of a recipe at a time: an item of its recipe runs in the pack, so the card goes to another item
+        up=0
+        for j in "${XP[@]}"; do
+          case ${R_PID[$j]} in '' | x) continue ;; esac
+          if [ "${P_NAME[$j]}" = "${P_NAME[$i]}" ]; then up=1; break; fi
+        done
+        [ "$up" = 0 ] || continue
         if [ "${R_M[$i]}" = 1 ]; then
           [ "$nrun" = 0 ] || continue # an m item starts with nothing else running
         else
@@ -8731,7 +8888,7 @@ run_lane() { # $1 = lane label; a lane of the chain's batch (the header's class 
   # Without a chain (lane X, --lanes 1, the fixture tier, a chainless list) it is today's loop: its
   # items in ORDER, then the steal pass.
   local lane=$1 t0 i
-  BWAIT=0 # the seconds this lane waited on a build pass (lane_queue, steal_pass, and the chain loop's slices): not a gap between items
+  BWAIT=0 # the seconds this lane waited on a build pass or on a recipe's mutex (lane_queue, steal_pass, and the chain loop's slices): not a gap between items
   t0=$(date +%s)
   if [ "$CHAIN_ACTIVE" = 1 ] && [ "${#CHAIN_ORDER[@]}" -gt 0 ] && { [ "$lane" = A ] || [ "$lane" = B ]; }; then
     while :; do
@@ -8742,7 +8899,7 @@ run_lane() { # $1 = lane label; a lane of the chain's batch (the header's class 
           claim_item "$i" "$lane" || continue # the other lane skipped it first; an unclaimed skip is handed out again
           skip_item "$i" "$lane"
         else
-          claim_item "$i" "$lane" || continue # the other lane took it while this one was busy
+          claim_item "$i" "$lane" || { recipe_rel "$i"; continue; } # the other lane took it while this one was busy
           run_pooled "$i" run_item "$i" "$lane"
         fi
         continue
