@@ -1236,8 +1236,13 @@ const TYPE_PINS: &[TypePin] = &[
         role: Role::Head,
         matrices: true,
         names: None,
-        what: "output head (the head reads q6_K and q5_K)",
-        reads: &[GgmlType::Q6_K, GgmlType::Q5_K],
+        what: "output head (the head reads q6_K, q5_K, q8_0 and bf16)",
+        reads: &[
+            GgmlType::Q6_K,
+            GgmlType::Q5_K,
+            GgmlType::Q8_0,
+            GgmlType::BF16,
+        ],
     },
     TypePin {
         programs: &[Program::Deepseek41Chain],
@@ -3633,7 +3638,7 @@ mod tests {
 
     /// A V4.1 file's attention matrices are items unless their type is one
     /// the chain's dense sites read (q3_K, q5_K, q8_0; the compressor's and
-    /// the indexer's also bf16), and its head unless q6_K or q5_K.
+    /// the indexer's also bf16), and its head unless q6_K, q5_K, q8_0 or bf16.
     #[test]
     fn the_ds41_dense_pins_read_the_chains_types() {
         let items = |name: &str, role: Role, ty: GgmlType, needle: &str| {
@@ -3707,12 +3712,17 @@ mod tests {
             ]
         );
         let head = |ty| items("output.weight", Role::Head, ty, "output head");
-        for ty in [GgmlType::Q6_K, GgmlType::Q5_K] {
+        for ty in [
+            GgmlType::Q6_K,
+            GgmlType::Q5_K,
+            GgmlType::Q8_0,
+            GgmlType::BF16,
+        ] {
             assert_eq!(head(ty), Vec::<String>::new(), "{ty}");
         }
         assert_eq!(
             head(GgmlType::Q4_K),
-            ["q4_K output head (the head reads q6_K and q5_K)".to_string()]
+            ["q4_K output head (the head reads q6_K, q5_K, q8_0 and bf16)".to_string()]
         );
     }
 

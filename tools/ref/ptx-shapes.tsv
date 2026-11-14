@@ -106,6 +106,8 @@ generate_ds41   ds41_ffn_sel_merge                       0           0
 generate_ds41   ds41_glue_embed                          0           0
 generate_ds41   ds41_glue_embed_q3k                      0           0
 generate_ds41   ds41_glue_embed_q5k                      0           0
+# PIN(2026-11-14): ds41_glue_embed_q8_0 is a new entry beside ds41_glue_embed_q5k; the cc 8.6 scan: spill 0, jit_local 0.
+generate_ds41   ds41_glue_embed_q8_0                      0           0
 generate_ds41   ds41_glue_engram_rows                    0           0
 generate_ds41   ds41_glue_engram_rows_q3k                0           0
 generate_ds41   ds41_glue_engram_rows_iq4nl              0           0

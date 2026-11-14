@@ -44,6 +44,7 @@ pub mod card;
 pub mod digest;
 pub mod engram;
 pub mod facts;
+mod id43;
 pub mod iq_quant;
 pub mod iq_tables;
 pub mod kquant;
@@ -216,6 +217,16 @@ pub enum LoadError {
         name: String,
         first: String,
         second: String,
+    },
+    /// A tensor of type id 43, which ggml names F8_E4M3 and llama.cpp's MXFP8 writers use for MXFP8,
+    /// whose data bytes fit neither meaning or both ([`id43`]).
+    #[error(
+        "tensor {name:?}: type id 43 is F8_E4M3 in ggml and MXFP8 in llama.cpp, and its {extent} data bytes {detail}"
+    )]
+    AmbiguousType {
+        name: String,
+        extent: u64,
+        detail: String,
     },
     /// A [`PrivateType`] entry whose id this build already sizes: a file
     /// tagged with it would open everywhere as that ggml type.
@@ -1737,6 +1748,7 @@ fn parse_header(b: &[u8], len: u64) -> Result<Header, LoadError> {
     let alignment = alignment_of(&meta)?;
     let header_end = rd.pos as u64;
     let data_base = header_end.div_ceil(alignment) * alignment;
+    id43::resolve(&mut tensors, data_base, len, alignment)?;
     Ok(Header {
         version,
         meta,

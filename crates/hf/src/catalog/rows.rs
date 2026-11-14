@@ -35,6 +35,17 @@ pub(super) static MODELS: &[Model] = &[
                     why: "explicit only: revision and size from tools/census/stubs.tsv; no doc or gate names this file",
                 },
             },
+            Row {
+                variant: "UD-IQ3_XXS",
+                kind: Kind::Gguf,
+                repo: "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+                revision: "2688c0c3c2c3b052ec4f6d10a8417b0ef7ee4eba",
+                format: Format::Gguf3,
+                bytes: Some(394_736_596_867),
+                status: Status::Unverified {
+                    why: "explicit only: revision and size from the hub listing and the files as served; no stubs.tsv row, no gate names this file",
+                },
+            },
         ],
     },
     Model {
