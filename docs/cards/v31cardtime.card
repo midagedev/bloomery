@@ -1,0 +1,16 @@
+# v31types: the card's time a layer-batch of the V4.1 prompt batch against its host union, so the enqueue lever can be
+# priced for the default file. Decomposition [derived, day1114b v31types report]: at P = 4096 (220 layer-batches) the
+# 1017 Q3_K_M runs launch 11.05 ms (1,131 entries x 9.77 us) then union 30.3 ms a layer-batch, serially on one host
+# thread; its card work bottom-up (attention joined per 128 tokens, shared gate/up per 8-token chunk, grouped tiles) is
+# ~13 ms. UD-IQ3_XXS rides the same run as a second arm: bottom-up ~55 ms (45..95) against a 101 ms union.
+kind: profile
+question: how much card time does a layer-batch of the 1017 Q3_K_M prompt take, against its 30 ms host union?
+term: (card_out_ms + card_in_ms) / layer_batches, ms a layer-batch @ P = 4096, 1017 Q3_K_M, --place a, A6000
+unit: ms
+predict: 7..25
+condition: one prefill of 4,096 prose ids under BLOOMERY_STEP_STATS=1 (card timing on), default levers, place a, the
+  A6000 pinned by the runner; the stat prefill split line prints card_out and card_in; second arm UD-IQ3_XXS the same
+decide-in: the card sits under the union with room: a launch thread beside the union (enqueue overlapped) is worth up to
+  the 11 ms launch of 41.7 ms a layer-batch [derived ~ +25..35 % pp @ 4096]; open that round
+decide-below: the same lever, and the card is nowhere near binding
+decide-above: the card, not the host thread, follows the union: price the card's slot-local launches before any enqueue thread

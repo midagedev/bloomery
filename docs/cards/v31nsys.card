@@ -1,0 +1,14 @@
+# Which card kernels fill the 1017 Q3_K_M prompt batch's card time. Measured under the v31cardtime card (one lease,
+# BLOOMERY_STEP_STATS=1, P = 4096, place a, A6000): card_out 22.04 + card_in 15.90 ms a layer-batch (card_proj 12.76),
+# union 30.48, enqueue 11.07, chain 41.9 ms a layer-batch (220). The v31types bottom-up said ~13 ms: the bytes model missed
+# by 3x, so the kernels are the residue derivation cannot close. The kernel sum a layer-batch under nsys should match the
+# event-timed card total within the trace's overhead.
+kind: profile
+question: which kernels take the Q3_K_M prompt batch's ~38 ms of card time a layer-batch at P = 4096?
+term: sum of kernel time inside the prefill window / 220 layer-batches, ms, 1017 Q3_K_M, --place a, A6000
+unit: ms
+predict: 30..46
+condition: one nsys prefill run of 4,096 prose ids (just nsys-gpu-ds41-prefill 4096), default levers but BLOOMERY_PREFILL_GROUP=1 (the cut reads one batch a group; the same kernels), place a
+decide-in: rank kernels by time against their byte/FLOP floor; the round prices the top three
+decide-below: the event timing overstated the card (sync stalls in card_in/card_out); price the enqueue thread instead
+decide-above: nsys overhead or a second stream; read the per-stream split before ranking
