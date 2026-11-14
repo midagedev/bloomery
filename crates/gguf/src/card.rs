@@ -179,6 +179,9 @@ pub enum DownEntry {
     /// `QuantSelKernels::enqueue_down` (`iq4_nl_gemv_sel32`) in
     /// `crates/gpu/src/iq_sel.rs`.
     Iq4nl,
+    /// `QuantSelKernels::enqueue_down_q2_0` (`q2_0_gemv_sel32`, the file's
+    /// 18-byte `block_q2_0` stream) in `crates/gpu/src/iq_sel.rs`.
+    Q2_0,
     /// `Mxfp4SelKernels::enqueue_down` (`mxfp4_gemv_sel`, the file's 17-byte
     /// `block_mxfp4` stream) in `crates/gpu/src/mxfp4_sel.rs`.
     Mxfp4,
@@ -243,6 +246,9 @@ pub enum GemmEntry {
     /// `Gemm32Weight::Iq4NlFile` (`gemm_iq4nl`) in
     /// `crates/gpu/src/gemm/kernels32.rs`.
     Iq4nl,
+    /// `Gemm32Weight::Q2_0File` (`gemm_q2_0`, the file's `block_q2_0` stream)
+    /// in `crates/gpu/src/gemm/kernels32.rs`.
+    Q2_0,
     /// `Gemm32Weight::Nvfp4Planes` (`gemm_nvfp4p`, the two planes and a
     /// tensor scale an expert of the route's stack) in
     /// `crates/gpu/src/gemm/kernels32.rs`.
@@ -453,6 +459,9 @@ pub enum EmbedEntry {
     /// `ElemKernels::enqueue_embed_rows_kquant` (`embed_rows_q6k`, over
     /// `Q6kRows`) in `crates/gpu/src/elem.rs`.
     Q6k,
+    /// `ElemKernels::enqueue_embed_rows_kquant` (`embed_rows_iq4xs`, over
+    /// `Iq4xsRows`) in `crates/gpu/src/elem.rs`.
+    Iq4xs,
     /// `Q38Kernels::enqueue_embed_rows` (`embed_rows_q8_0`, the q8f32 planes)
     /// in `crates/gpu/src/q38.rs`.
     Q8_0,
@@ -481,6 +490,7 @@ impl DownEntry {
             | DownEntry::Iq3s
             | DownEntry::Iq4xs
             | DownEntry::Iq4nl
+            | DownEntry::Q2_0
             | DownEntry::Mxfp4 => CardFormat::KQuant,
         }
     }

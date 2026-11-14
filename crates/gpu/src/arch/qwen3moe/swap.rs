@@ -187,6 +187,7 @@ mod tests {
             [Q6_K, Q8_0, Q6_K],
         ] {
             let text = layer::<LegSplit>(bad).expect_err(&format!("{bad:?} is refused"));
+            // PIN(2026-11-14): Q2_0 joined the down list (`q2_0_gemv_sel32` in `card_down_runs`).
             // PIN(2026-10-23): IQ2_XXS joined both lists. The common card leg gained its gated
             // gate·up (`iq2_xxs_gate_up_sel`) and its down; `card_gate_up_runs`/`card_down_runs`
             // name it, and the IQ2_XXS card layer above passes. Mutant: IQ2_XXS dropped from
@@ -196,7 +197,7 @@ mod tests {
                     && text.ends_with(
                         "a gate and an up of one type, [Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, \
                          IQ3_S, IQ2_S, IQ4_XS, IQ1_M], and a down of [Q5_1, Q8_0, Q4_K, Q5_K, Q6_K, IQ2_XXS, \
-                         IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M]"
+                         IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, Q2_0]"
                     ),
                 "{text}"
             );
@@ -242,6 +243,8 @@ mod tests {
             [Q5_1, Q5_1, Q5_1],
         ] {
             let text = layer::<Leg38>(bad).expect_err(&format!("{bad:?} is refused"));
+            // PIN(2026-11-14): Q2_0 joined the down list (`gemm_q2_0` its prompt GEMM, the common
+            // leg's `q2_0_gemv_sel32` its decode arm).
             // PIN(2026-10-23): IQ2_XXS joined the gate·up list: `gemm_iq2xxs` is its prompt GEMM and
             // the common leg's `iq2_xxs_gate_up_sel` its decode arm. Mutant: IQ2_XXS dropped from
             // `card_gate_up_runs` (this text turns red).
@@ -254,7 +257,7 @@ mod tests {
                 format!(
                     "layer 0's gate {}, up {} and down {}: the card leg runs a gate and an up \
                      of one type, [Q4_K, Q5_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ3_S, IQ2_S, IQ4_XS, \
-                     IQ1_M, NVFP4], and a down of [Q5_1, Q8_0, IQ4_NL, NVFP4]",
+                     IQ1_M, NVFP4], and a down of [Q5_1, Q8_0, IQ4_NL, NVFP4, Q2_0]",
                     bad[0], bad[1], bad[2]
                 )
             );

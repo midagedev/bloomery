@@ -78,7 +78,7 @@ use crate::gemm::{
     GemmRoute, GemmWeight,
 };
 use crate::host::xstream::RingLayer;
-use crate::iq_sel::{IqDown, IqGateUp};
+use crate::iq_sel::{IqDown, IqGateUp, Q20Down};
 use crate::kquant::{Act, GateUpAct, SelDown};
 use crate::mxfp4_sel::{Mxfp4SelKernels, Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels, Nvfp4Stack};
 use crate::q4k_sel::QuantSel;
@@ -332,8 +332,8 @@ impl<'a> StackW<'a> {
 
     /// The stack, of file type `ty`, as the route GEMM the kernel table names
     /// for that type reads it ([`kernels::gemm`]): a K-quant's or an
-    /// i-quant's words through the grouped GEMM, the file's Q8_0, Q5_1 or
-    /// IQ4_NL blocks, a Q5_0 stack's packed words and NVFP4's planes through
+    /// i-quant's words through the grouped GEMM, the file's Q8_0, Q5_1,
+    /// IQ4_NL or Q2_0 blocks, a Q5_0 stack's packed words and NVFP4's planes through
     /// the 32-value GEMM. `None` for a type the table names no GEMM for, or a
     /// form that GEMM does not read.
     pub(crate) fn route(self, ty: GgmlType) -> Option<RouteW<'a>> {
@@ -342,6 +342,7 @@ impl<'a> StackW<'a> {
             (GemmEntry::Q5_0, StackW::Q5_0(w)) => RouteW::Blocks32(Gemm32Weight::Q5_0Packed(w)),
             (GemmEntry::Q5_1, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q5_1File(w)),
             (GemmEntry::Iq4nl, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Iq4NlFile(w)),
+            (GemmEntry::Q2_0, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q2_0File(w)),
             (GemmEntry::Nvfp4, StackW::Nvfp4(s)) => RouteW::Blocks32(Gemm32Weight::Nvfp4Planes(s)),
             (entry, StackW::Words(w)) => RouteW::Grouped(GemmWeight::of_entry(entry)?, w),
             (_, StackW::Nvfp4(_) | StackW::Q5_0(_)) => return None,
@@ -1647,6 +1648,16 @@ impl Sel32<'_> {
                     rows_per_expert,
                 };
                 self.iq.enqueue_down(stream, &d, fault, y)
+            }
+            DownEntry::Q2_0 => {
+                let d = Q20Down {
+                    w: stack.words()?,
+                    act,
+                    sel,
+                    n_slots,
+                    rows_per_expert,
+                };
+                self.iq.enqueue_down_q2_0(stream, &d, fault, y)
             }
             DownEntry::Nvfp4 => {
                 let d = Nvfp4Down {
@@ -3000,7 +3011,10 @@ pub(crate) mod tests {
     // own-type pair.
     // PIN(2026-10-25): IQ2_S, IQ1_S and IQ1_M join both sets with their `_sel` gate·up and
     // down; the set was the twelve rows without their own-type pairs.
-    const WIDE_CASES: [(GgmlType, GgmlType); 15] = [
+    // PIN(2026-11-14): Q2_0 joined `card_down_runs` (`q2_0_gemv_sel32`, a 32-value down), so the
+    // cases gain an IQ4_XS gate·up over a Q2_0 down, the pair a Dynamic V3.1 low-bit file holds; the
+    // set was the fifteen rows without it.
+    const WIDE_CASES: [(GgmlType, GgmlType); 16] = [
         (GgmlType::Q4_K, GgmlType::Q4_K),
         (GgmlType::Q5_K, GgmlType::Q5_K),
         (GgmlType::MXFP4, GgmlType::MXFP4),
@@ -3016,6 +3030,7 @@ pub(crate) mod tests {
         (GgmlType::Q5_K, GgmlType::Q8_0),
         (GgmlType::IQ4_XS, GgmlType::IQ4_NL),
         (GgmlType::Q5_K, GgmlType::Q6_K),
+        (GgmlType::IQ4_XS, GgmlType::Q2_0),
     ];
     /// The wide test's case of a stack in its planes (`kernels::card_planes_runs`):
     /// NVFP4, whose runs of more than one token run each expert's rows on the
@@ -3151,7 +3166,7 @@ pub(crate) mod tests {
 
     /// A slot's rows are what a one-token run writes for it, whatever `m`
     /// (the module doc), for every type [`kernels::card_gate_up_runs`] and
-    /// [`kernels::card_down_runs`] admit, in fifteen cases (`WIDE_CASES`), and for
+    /// [`kernels::card_down_runs`] admit, in sixteen cases (`WIDE_CASES`), and for
     /// NVFP4's planes (`WIDE_PLANES`). Runs of
     /// `m` in `WIDE_RUNS` tokens of eight slots go through fresh buffers of
     /// `WIDE_CAP` tokens, so the run's columns beyond the eighth, and beyond a
@@ -3389,10 +3404,19 @@ pub(crate) mod tests {
             Some(Gemm32Weight::Iq4NlFile(_))
         ));
         assert!(matches!(
+            blocks32(words, GgmlType::Q2_0),
+            Some(Gemm32Weight::Q2_0File(_))
+        ));
+        assert!(matches!(
             blocks32(planes, GgmlType::NVFP4),
             Some(Gemm32Weight::Nvfp4Planes(_))
         ));
-        for ty in [GgmlType::Q8_0, GgmlType::Q5_1, GgmlType::IQ4_NL] {
+        for ty in [
+            GgmlType::Q8_0,
+            GgmlType::Q5_1,
+            GgmlType::IQ4_NL,
+            GgmlType::Q2_0,
+        ] {
             assert!(planes.route(ty).is_none(), "{ty} in planes");
         }
         assert!(words.route(GgmlType::NVFP4).is_none(), "NVFP4 as words");

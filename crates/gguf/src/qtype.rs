@@ -117,7 +117,7 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::IQ2_S, name: "iq2_s", blck: 256, bytes: 82, dequant: true, host_act: H::Q8K,
            card: card!(KQuant        KQuant        Iq2s    (Iq2s, Q8Act)       Iq2s   -       -    -) },
     QRow { ty: T::IQ4_XS, name: "iq4_xs", blck: 256, bytes: 136, dequant: true, host_act: H::Q8K,
-           card: card!(KQuant        -             Iq4xs   (Iq4xs, Q8Act)      Iq4xs  Iq4xs  -    -) },
+           card: card!(KQuant        -             Iq4xs   (Iq4xs, Q8Act)      Iq4xs  Iq4xs  -    Iq4xs) },
     // The C scalars: ggml.c:621-649.
     QRow { ty: T::I8, name: "i8", blck: 1, bytes: 1, dequant: false, host_act: H::None, card: Card::NONE },
     QRow { ty: T::I16, name: "i16", blck: 1, bytes: 2, dequant: false, host_act: H::None, card: Card::NONE },
@@ -147,7 +147,8 @@ pub const QROWS: &[QRow] = &[
     QRow { ty: T::Q1_0, name: "q1_0", blck: 128, bytes: 18, dequant: false, host_act: H::None, card: Card::NONE },
     // q2_0: mainline's (llama.cpp f2cc7282c, ggml.c:685-687, ggml-common.h:187-192), one f16 d then 16 bytes of
     // 2-bit codes; its dot takes Q8_0 (ggml-cpu.c:237).
-    QRow { ty: T::Q2_0, name: "q2_0", blck: 64, bytes: 18, dequant: true, host_act: H::Q8_0, card: Card::NONE },
+    QRow { ty: T::Q2_0, name: "q2_0", blck: 64, bytes: 18, dequant: true, host_act: H::Q8_0,
+           card: card!(-             -             -       (Q2_0, Q8Blocks32)  Q2_0   -       -    -) },
 ];
 
 /// bloomery's own value types, ids 2000 up, which no ggml table holds: a file holding them

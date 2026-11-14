@@ -385,6 +385,43 @@ impl EmbedSb for Q3kRows {
     }
 }
 
+/// IQ4_XS (136 bytes: the f16 `d`, the `scales_h` u16, 4 `scales_l` bytes, 128
+/// nibble bytes; whole words): sub-block `ib = v / 32` takes the 6-bit scale
+/// `ls` (nibble `ib % 2` of `scales_l[ib / 2]`, bits `2ib..2ib+1` of `scales_h`
+/// as its high two bits) and `dl = d · (ls − 32)`; value `j = v % 32` is the
+/// low nibble of qs byte `16ib + j` for `j < 16`, the high nibble of byte
+/// `16ib + j − 16` above, decoded by the shared nibble decode over
+/// `kvalues_iq4nl` ([`crate::iq::iq4_word`]), and the value is `dl · kv`, the
+/// two products of the reference's order.
+pub struct Iq4xsRows;
+
+impl EmbedSb for Iq4xsRows {
+    const BYTES: usize = 136;
+
+    #[inline(always)]
+    unsafe fn value(w: &[u32], base: usize, v: usize) -> f32 {
+        let wk = base >> 2;
+        let ib = v >> 5;
+        let j = v & 31;
+        let x = 16 * ib + (j & 15);
+        // SAFETY: every index is wk + 0..=33 (d and scales_h, scales_l, the
+        // qs words 2..=33), inside `w` by this fn's `# Safety`.
+        let (w0, w1, qw) = unsafe {
+            (
+                *w.get_unchecked(wk),
+                *w.get_unchecked(wk + 1),
+                *w.get_unchecked(wk + 2 + (x >> 2)),
+            )
+        };
+        let (lo, hi) = crate::iq::iq4_word(qw);
+        let kv = ((if j < 16 { lo } else { hi }) >> (8 * (x & 3))) as u8 as i8;
+        let ls = ((w1 >> (4 * ib)) & 0x0f) | (((w0 >> (16 + 2 * ib)) & 3) << 4);
+        let d = half_to_f32((w0 & 0xffff) as u16);
+        let dl = d * (ls as i32 - 32) as f32;
+        dl * f32::from(kv)
+    }
+}
+
 /// The body of an embedding entry over super-blocks of type `S`, for thread
 /// `i` of the grid: row `t = i / width` of `y` (`width = 256 · n_sb`) takes
 /// value `i % width` of table row `ids[t]`, an id past the table's `n_rows`
@@ -1112,6 +1149,54 @@ mod elem_kernels {
         // SAFETY: the launch contract is the body's (110 = Q3kRows::BYTES).
         unsafe {
             embed_rows_sb::<Q3kRows>(
+                i,
+                (w, ids, pos0),
+                (first, n_rows, n_sb),
+                fault,
+                &mut y,
+                &mut pos,
+                &mut n_keys,
+            );
+        }
+    }
+
+    /// Dequantize `ids.len()` rows of the IQ4_XS embedding table `w` (`136 ·
+    /// n_sb` bytes per row, whole words) into `y` with their positions and
+    /// live key counts ([`embed_rows_sb`] over [`Iq4xsRows`]), as
+    /// `embed_rows_q4k`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= 136 * n_sb * n_rows,
+            y.len() >= 256 * n_sb * ids.len(),
+            pos0.len() >= 1,
+            pos.len() >= ids.len(),
+            n_keys.len() >= ids.len()
+        )
+    )]
+    pub fn embed_rows_iq4xs(
+        w: &[u32],
+        ids: &[u32],
+        pos0: &[u32],
+        first: u32,
+        n_rows: u32,
+        n_sb: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+        mut pos: DisjointSlice<u32>,
+        mut n_keys: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        // SAFETY: the launch contract is the body's (136 = Iq4xsRows::BYTES).
+        unsafe {
+            embed_rows_sb::<Iq4xsRows>(
                 i,
                 (w, ids, pos0),
                 (first, n_rows, n_sb),
@@ -2540,10 +2625,11 @@ impl ElemKernels {
     /// rows dequantized token-major into `args.y`, bit-identical to
     /// `gguf::quant::dequant_row`, with each row's position and live key
     /// count. Q4_K runs `embed_rows_q4k`, Q5_K `embed_rows_q5k` (44 words a
-    /// super-block), Q3_K `embed_rows_q3k` (110 bytes a super-block) and Q6_K
-    /// `embed_rows_q6k` (210 bytes a super-block), each of those two with an
-    /// even count of them a row so a row is whole words; any other type, or a
-    /// table whose rows are not whole super-blocks of it, is refused by name.
+    /// super-block), IQ4_XS `embed_rows_iq4xs` (34 words a super-block), Q3_K
+    /// `embed_rows_q3k` (110 bytes a super-block) and Q6_K `embed_rows_q6k`
+    /// (210 bytes a super-block), each of those two with an even count of them
+    /// a row so a row is whole words; any other type, or a table whose rows
+    /// are not whole super-blocks of it, is refused by name.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_embed_rows_kquant(
         &self,
@@ -2558,11 +2644,13 @@ impl ElemKernels {
             GgmlType::Q3_K => Q3kRows::BYTES,
             GgmlType::Q5_K => Q5kRows::BYTES,
             GgmlType::Q6_K => Q6kRows::BYTES,
+            GgmlType::IQ4_XS => Iq4xsRows::BYTES,
             other => {
                 return Err(GpuError::shape(
                     what,
                     format!(
-                        "a {other} table: the embedding lookups read Q3_K, Q4_K, Q5_K and Q6_K rows"
+                        "a {other} table: the embedding lookups read Q3_K, Q4_K, Q5_K, Q6_K and \
+                         IQ4_XS rows"
                     ),
                 ));
             }
@@ -2640,6 +2728,23 @@ impl ElemKernels {
             GgmlType::Q5_K => {
                 let prep = self.module.prepare_embed_rows_q5k(cfg)?;
                 self.module.embed_rows_q5k(
+                    stream,
+                    &prep,
+                    w.buf(),
+                    ids,
+                    pos0,
+                    first,
+                    n_rows,
+                    n_sb,
+                    fault,
+                    y,
+                    pos,
+                    n_keys,
+                )?;
+            }
+            GgmlType::IQ4_XS => {
+                let prep = self.module.prepare_embed_rows_iq4xs(cfg)?;
+                self.module.embed_rows_iq4xs(
                     stream,
                     &prep,
                     w.buf(),

@@ -56,7 +56,7 @@ pub const fn gemm(ty: GgmlType) -> Option<GemmEntry> {
 }
 
 /// Whether the prompt GEMM `entry` reads its activation in 32-value blocks
-/// (`Gemm32Weight`'s entries: Q8_0, Q5_0, Q5_1, IQ4_NL and NVFP4, over a
+/// (`Gemm32Weight`'s entries: Q8_0, Q5_0, Q5_1, IQ4_NL, Q2_0 and NVFP4, over a
 /// `GemmAct32`), else in the grouped GEMM's q8_1 blocks of 128 (`GemmAct`):
 /// the form a prompt walk quantizes a unit's normed rows and SwiGLU rows into
 /// for a stack of that type.
@@ -67,6 +67,7 @@ pub const fn gemm_reads_blocks32(entry: GemmEntry) -> bool {
         | GemmEntry::Q5_0
         | GemmEntry::Q5_1
         | GemmEntry::Iq4nl
+        | GemmEntry::Q2_0
         | GemmEntry::Nvfp4 => true,
         GemmEntry::Q3k
         | GemmEntry::Q4k
@@ -401,7 +402,7 @@ pub const fn card_gate_up_runs(ty: GgmlType) -> bool {
 /// an activation of more columns than a run uses, with the form the leg
 /// quantizes for them: the 128-value [`DownAct::Q8Act`] (Q4_K, Q5_K, Q6_K,
 /// MXFP4, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ4_XS) or the 32-value [`DownAct::Q8Blocks32`]
-/// (Q5_1, Q8_0, IQ4_NL). A Q6_K down reads [`DownAct::Q8Act`], the form the
+/// (Q5_1, Q8_0, IQ4_NL, Q2_0). A Q6_K down reads [`DownAct::Q8Act`], the form the
 /// common families' down buffers hold. The Q5_0 row reads the packed layout,
 /// not the file's blocks.
 #[must_use]
@@ -423,7 +424,7 @@ pub const fn card_down_runs(ty: GgmlType) -> bool {
                 | DownEntry::Iq4xs,
             DownAct::Q8Act
         )) | Some((
-            DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl,
+            DownEntry::Q5_1 | DownEntry::Q8_0 | DownEntry::Iq4nl | DownEntry::Q2_0,
             DownAct::Q8Blocks32
         ))
     )
@@ -808,6 +809,7 @@ mod tests {
                 (GgmlType::IQ2_S, DownEntry::Iq2s),
                 (GgmlType::IQ4_XS, DownEntry::Iq4xs),
                 (GgmlType::IQ1_M, DownEntry::Iq1m),
+                (GgmlType::Q2_0, DownEntry::Q2_0),
                 (GgmlType::NVFP4_ROWS, DownEntry::Nvfp4),
             ]
         );
@@ -842,6 +844,7 @@ mod tests {
                 (GgmlType::IQ2_S, DownAct::Q8Act),
                 (GgmlType::IQ4_XS, DownAct::Q8Act),
                 (GgmlType::IQ1_M, DownAct::Q8Act),
+                (GgmlType::Q2_0, DownAct::Q8Blocks32),
                 (GgmlType::NVFP4_ROWS, DownAct::Q8Blocks32),
             ]
         );
@@ -877,6 +880,7 @@ mod tests {
                 GgmlType::MXFP4,
                 GgmlType::NVFP4,
                 GgmlType::IQ4_NL,
+                GgmlType::Q2_0,
                 GgmlType::NVFP4_ROWS,
             ]
         );
@@ -899,6 +903,7 @@ mod tests {
                 (GgmlType::Q8_0, DownEntry::Q8_0),
                 (GgmlType::NVFP4, DownEntry::Nvfp4),
                 (GgmlType::IQ4_NL, DownEntry::Iq4nl),
+                (GgmlType::Q2_0, DownEntry::Q2_0),
                 (GgmlType::NVFP4_ROWS, DownEntry::Nvfp4),
             ]
         );
@@ -994,6 +999,7 @@ mod tests {
                 GgmlType::Q8_0,
                 GgmlType::NVFP4,
                 GgmlType::IQ4_NL,
+                GgmlType::Q2_0,
                 GgmlType::NVFP4_ROWS
             ]
         );
@@ -1061,6 +1067,7 @@ mod tests {
                 (GgmlType::IQ2_S, GemmEntry::Iq2s),
                 (GgmlType::IQ4_XS, GemmEntry::Iq4xs),
                 (GgmlType::IQ1_M, GemmEntry::Iq1m),
+                (GgmlType::Q2_0, GemmEntry::Q2_0),
                 (GgmlType::NVFP4_ROWS, GemmEntry::Nvfp4),
             ]
         );
@@ -1108,6 +1115,7 @@ mod tests {
                 (GgmlType::Q5_K, EmbedEntry::Q5k),
                 (GgmlType::Q6_K, EmbedEntry::Q6k),
                 (GgmlType::BF16, EmbedEntry::Bf16),
+                (GgmlType::IQ4_XS, EmbedEntry::Iq4xs),
             ]
         );
     }
@@ -1180,10 +1188,11 @@ mod tests {
                 GgmlType::IQ2_S,
                 GgmlType::IQ4_XS,
                 GgmlType::IQ1_M,
+                GgmlType::Q2_0,
             ]
         );
         // PIN(2026-10-25): and the four i-quants whose layout is now the file's
-        // blocks.
+        // blocks; PIN(2026-11-14): and Q2_0, a down read in the file's blocks.
         assert_eq!(
             held(CardFormat::Bf16AsF32),
             [
@@ -1314,7 +1323,8 @@ mod tests {
                 GgmlType::IQ3_S,
                 GgmlType::IQ2_S,
                 GgmlType::IQ4_XS,
-                GgmlType::IQ1_M
+                GgmlType::IQ1_M,
+                GgmlType::Q2_0
             ]
         );
         assert!(gate_up(GgmlType::Q8_0).is_some() && !card_gate_up_runs(GgmlType::Q8_0));

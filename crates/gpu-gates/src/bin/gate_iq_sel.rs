@@ -138,6 +138,17 @@
 //!     those stacks, host-rule bits, rerun, host slots at the sentinel, a wider
 //!     activation, the f64 band and its `PIN(2026-10-18)` ratchet.
 //!
+//! 15. **Q2_0 down** (`q2_0_gemv_sel32`, the Qwen3.8 V3.1 low-bit files' card
+//!     down), seeded random `block_q2_0` stacks of 3 experts at K = 640, 2,304
+//!     (two lane passes) and 64: clause 1 (the host rule `q2_0_row_dot32_host`
+//!     per lane plus the butterfly, bit for bit, at m ∈ {1, 2, 4, 8}, ids
+//!     repeating inside a column and across columns, `HOST` included; a rerun
+//!     and a wider activation bit-identical) and clause 3's f64 band against
+//!     `gguf::dequant_row`'s row (ggml's `dequantize_row_q2_0`), the down
+//!     bound below; an id past the stack raises `ExpertId` with its rows left
+//!     at the sentinel; a NaN `d` makes exactly one row NaN; a K that is not a
+//!     multiple of 64 and another row width are refused by name.
+//!
 //! `--bench-kernels [--bench-arm <op>|iq2xxs]` runs no clause: it prices the
 //! IQ2_XXS launches at Bolt's shapes (the `bench` module below), lead-only
 //! under `tools/ref/time-gate.sh`'s lease.
@@ -192,7 +203,10 @@ mod gate {
     use bloomery_gpu::GpuError;
     use bloomery_gpu::fault::{Fault, FaultSite, LAYER_NONE};
     use bloomery_gpu::iq::{IqFormat, IqKernels, IqRows};
-    use bloomery_gpu::iq_sel::{IQ4_NL_BLOCK_BYTES, IqDown, IqGateUp, iq4_nl_row_dot32_host};
+    use bloomery_gpu::iq_sel::{
+        IQ4_NL_BLOCK_BYTES, IqDown, IqGateUp, Q2_0_BLOCK_BYTES, Q20Down, iq4_nl_row_dot32_host,
+        q2_0_row_dot32_host,
+    };
     use bloomery_gpu::kquant::act::{self, Act};
     use bloomery_gpu::kquant::{SelDown, walk_a_planes};
     use bloomery_gpu::q5::Q8Blocks32;
@@ -1421,6 +1435,272 @@ mod gate {
             );
         }
         Ok((ok, rel))
+    }
+
+    /// One Q2_0 stack for clause 15, in [`NlStack`]'s container: seeded random
+    /// `block_q2_0`s (finite f16 `d` in ±[2^-10, 2^-2], random codes),
+    /// `k_blocks` counting the 32-value blocks a row holds (an even number, two
+    /// to a Q2_0 block).
+    fn q2_0_stack(k_blocks: usize, experts: usize, rpe: usize, seed: u64) -> NlStack {
+        let mut s = seed;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let blocks = experts * rpe * (k_blocks / 2);
+        let mut bytes = Vec::with_capacity(blocks * Q2_0_BLOCK_BYTES);
+        for _ in 0..blocks {
+            let e = 5 + (next() % 9) as u16;
+            let d = ((next() as u16 & 0x8000) | (e << 10) | (next() as u16 & 0x3ff)).to_le_bytes();
+            bytes.extend_from_slice(&d);
+            for _ in 0..16 {
+                bytes.push((next() >> 32) as u8);
+            }
+        }
+        NlStack {
+            bytes,
+            experts,
+            rpe,
+            k_blocks,
+        }
+    }
+
+    /// [`down`] for the Q2_0 entry.
+    fn down_q2_0(
+        c: &Ctx,
+        st: &NlStack,
+        w: &DeviceTensor<u32>,
+        act: &Q8Blocks32,
+        sel: &[u32],
+    ) -> Result<(Vec<f32>, Option<Fault>), GateError> {
+        let stream = c.gpu.stream();
+        let sel_dev = DeviceBuffer::from_host(stream, sel)?;
+        let mut y = DeviceBuffer::from_host(stream, &vec![SENT; sel.len() * st.rpe])?;
+        c.iqsel.enqueue_down_q2_0(
+            stream,
+            &Q20Down {
+                w,
+                act,
+                sel: &sel_dev,
+                n_slots: sel.len(),
+                rows_per_expert: st.rpe,
+            },
+            c.gpu.unlabelled_sink(),
+            &mut y,
+        )?;
+        stream.synchronize()?;
+        Ok((y.to_host_vec(stream)?, c.gpu.take_fault()?))
+    }
+
+    /// [`down_host`] for the Q2_0 entry.
+    fn down_host_q2_0(st: &NlStack, w: &[u32], cols: &[Col], sel: &[u32]) -> Vec<f32> {
+        let mut y = vec![SENT; sel.len() * st.rpe];
+        for (s, &id) in sel.iter().enumerate() {
+            if id == u32::MAX || id as usize >= st.experts {
+                continue;
+            }
+            let col = &cols[s];
+            for r in 0..st.rpe {
+                let ra = id as usize * st.rpe + r;
+                y[s * st.rpe + r] = butterfly(std::array::from_fn(|lane| {
+                    q2_0_row_dot32_host(w, &col.0, &col.1, st.k_blocks, ra, lane)
+                }));
+            }
+        }
+        y
+    }
+
+    /// Clause 15 (module doc): [`check_nl`]'s clauses 1 and 3 over a Q2_0
+    /// stack — the host rule bit for bit (`q2_0_row_dot32_host` per lane plus
+    /// the butterfly) at m ∈ {1, 2, 4, 8} columns × 10 slots with `HOST` and
+    /// repeated ids, a rerun and a wider activation bit-identical, `HOST` rows
+    /// at the sentinel, and the f64 band against `dequant_row`'s row.
+    fn check_q2_0(c: &Ctx, st: &NlStack, w: &DeviceTensor<u32>) -> Result<bool, GateError> {
+        let w_host = stream_words_of(&st.bytes, st.experts * st.rpe)?;
+        let rb = st.k_blocks / 2 * Q2_0_BLOCK_BYTES;
+        let mut ok = true;
+        for &m in MS.iter() {
+            let n_slots = SLOTS * m;
+            let x = seeded(n_slots * st.k(), 9401 + st.k() as u32 + m as u32, -2.0, 4.0);
+            let (act, cols) = blocks32_cols(&c.gpu, &x, st.k(), n_slots)?;
+            let sel = sel_of(m, st.experts);
+            let (y, fault) = down_q2_0(c, st, w, &act, &sel)?;
+            let (again, fault2) = down_q2_0(c, st, w, &act, &sel)?;
+            let host = down_host_q2_0(st, &w_host, &cols, &sel);
+            let bits = bits_equal(&y, &host);
+            let rerun = bits_equal(&y, &again);
+            let sentinel = host_slots_sent(&sel, &y, st.rpe);
+            let mut x_wide = x.clone();
+            x_wide.extend(seeded(n_slots * st.k(), 9501 + m as u32, -2.0, 4.0));
+            let (act_wide, _) = blocks32_cols(&c.gpu, &x_wide, st.k(), 2 * n_slots)?;
+            let (y_wide, fault_wide) = down_q2_0(c, st, w, &act_wide, &sel)?;
+            let wide = bits_equal(&y_wide, &y) && fault_wide.is_none();
+            ok &= bits && rerun && sentinel && wide && fault.is_none() && fault2.is_none();
+
+            // Clause 3: the f64 dot of dequant_row's row with the f32 column,
+            // the module doc's bound, over the sampled rows.
+            let (mut in_bound, mut err_max, mut ref_max) = (true, 0.0f64, 0.0f64);
+            let mut w_f32 = vec![0.0f32; st.k()];
+            for (si, &id) in sel.iter().enumerate() {
+                if id == u32::MAX {
+                    continue;
+                }
+                let col = &cols[si];
+                let xc = &x[si * st.k()..][..st.k()];
+                for r in (0..st.rpe).step_by(NL_BAND_STRIDE) {
+                    let ra = id as usize * st.rpe + r;
+                    let bytes = &st.bytes[ra * rb..][..rb];
+                    dequant_row(GgmlType::Q2_0, bytes, &mut w_f32)?;
+                    let (mut exact, mut quant, mut mag) = (0.0f64, 0.0f64, 0.0f64);
+                    for b in 0..st.k_blocks {
+                        let blk = &bytes[(b / 2) * Q2_0_BLOCK_BYTES..][..Q2_0_BLOCK_BYTES];
+                        let e = f64::from(col.1[b]);
+                        let dw = f64::from(half_to_f32(u16::from_le_bytes([blk[0], blk[1]])));
+                        let (mut sw, mut a) = (0.0f64, 0i64);
+                        for j in 0..32 {
+                            let code =
+                                i64::from((blk[2 + 8 * (b % 2) + j / 4] >> (2 * (j % 4))) & 3) - 1;
+                            let wv = f64::from(w_f32[32 * b + j]);
+                            exact += wv * f64::from(xc[32 * b + j]);
+                            sw += wv.abs();
+                            a += code * i64::from(col.0[32 * b + j]);
+                        }
+                        quant += e / 2.0 * (1.0 + 256.0 * U) * sw;
+                        mag += (a as f64 * dw).abs() * e;
+                    }
+                    let n_it = st.k_blocks.div_ceil(32);
+                    let bound = quant + gamma(3 * n_it + 6) * mag;
+                    let err = (f64::from(y[si * st.rpe + r]) - exact).abs();
+                    in_bound &= err <= bound;
+                    err_max = err_max.max(err);
+                    ref_max = ref_max.max(exact.abs());
+                }
+            }
+            ok &= in_bound;
+            println!(
+                "q2_0[k={} experts={} rpe={} slots={n_slots}] host_rule_bits={} rerun={} \
+                 host_slots_sentinel={} wide_act={} f64_band={} max|rel|={:.4e} fault=\"{}\" {}{}",
+                st.k(),
+                st.experts,
+                st.rpe,
+                verdict(bits),
+                verdict(rerun),
+                verdict(sentinel),
+                verdict(wide),
+                verdict(in_bound),
+                err_max / ref_max,
+                shown(&fault),
+                mismatch("host_rule", &y, &host),
+                mismatch("rerun", &y, &again),
+            );
+        }
+        Ok(ok)
+    }
+
+    /// Clause 15's ids, NaN and refusals over the Q2_0 entry: an id past the
+    /// stack raises `ExpertId` and leaves its rows at the sentinel, every
+    /// other slot the host rule's; a NaN `d` makes exactly the 64 values of
+    /// its block's row NaN (and no other row); a K that is not a multiple of
+    /// 64 and a stack of another row width are refused by name.
+    fn check_q2_0_ids_nan_refusals(c: &Ctx) -> Result<bool, GateError> {
+        let s = c.gpu.stream();
+        let st = q2_0_stack(20, 3, 64, 0x51ce_0031);
+        let w = st.upload(s)?;
+        let x = seeded(SLOTS * st.k(), 6901, -2.0, 4.0);
+        let (act, cols) = blocks32_cols(&c.gpu, &x, st.k(), SLOTS)?;
+        let mut sel = sel_of(1, st.experts);
+        sel[5] = 99;
+        let (y, fault) = down_q2_0(c, &st, &w, &act, &sel)?;
+        let bad_sent = y[5 * st.rpe..6 * st.rpe]
+            .iter()
+            .all(|&v| v.to_bits() == SENT.to_bits());
+        let named = fault.as_ref().is_some_and(|f| {
+            GpuError::fault("gate_iq_sel", *f)
+                .to_string()
+                .contains("expert_id")
+        });
+        let w_host = stream_words_of(&st.bytes, st.experts * st.rpe)?;
+        let host = down_host_q2_0(&st, &w_host, &cols, &sel);
+        let others_same = host
+            .iter()
+            .zip(&y)
+            .enumerate()
+            .all(|(i, (a, b))| i / st.rpe == 5 || a.to_bits() == b.to_bits());
+        let ids_ok = bad_sent && named && others_same;
+        println!(
+            "ids_q2_0[k={}] past_stack_sentinel={} fault_names_expert_id={} others_are_host_rule={} \
+             fault=\"{}\" {}",
+            st.k(),
+            verdict(bad_sent),
+            verdict(named),
+            verdict(others_same),
+            shown(&fault),
+            verdict(ids_ok),
+        );
+        // A NaN `d` in the second block of expert 1's row 3 (blocks 2 and 3
+        // of 32 values, the row's values 64..128): that row only.
+        let mut nan = st.bytes.clone();
+        let rb = st.k_blocks / 2 * Q2_0_BLOCK_BYTES;
+        nan[(st.rpe + 3) * rb + Q2_0_BLOCK_BYTES..][..2].copy_from_slice(&0x7e00u16.to_le_bytes());
+        let bad = NlStack {
+            bytes: nan,
+            experts: st.experts,
+            rpe: st.rpe,
+            k_blocks: st.k_blocks,
+        };
+        let wb = bad.upload(s)?;
+        let sel = sel_of(1, st.experts);
+        let (yn, fault_nan) = down_q2_0(c, &bad, &wb, &act, &sel)?;
+        let (clean, _) = down_q2_0(c, &st, &w, &act, &sel)?;
+        let poisoned = |id: u32, r: usize| id == 1 && r == 3;
+        let nan_ok = sel.iter().enumerate().all(|(si, &id)| {
+            id == u32::MAX || (0..st.rpe).all(|r| yn[si * st.rpe + r].is_nan() == poisoned(id, r))
+        });
+        let others_clean = clean.iter().zip(&yn).enumerate().all(|(i, (a, b))| {
+            let (si, r) = (i / st.rpe, i % st.rpe);
+            poisoned(sel[si], r) || a.to_bits() == b.to_bits()
+        });
+        let nan_pass = nan_ok && others_clean && fault_nan.is_none();
+        println!(
+            "nan_q2_0 exactly_poisoned_row_nan={} others_are_clean={} fault=\"{}\" {}",
+            verdict(nan_ok),
+            verdict(others_clean),
+            shown(&fault_nan),
+            verdict(nan_pass),
+        );
+        // Refusals by name: K = 96 is not a multiple of 64; the K = 640
+        // stack's words under a K = 704 activation are another row width.
+        let refuse = |act: &Q8Blocks32, w: &DeviceTensor<u32>, rpe: usize, what: &str| {
+            let sel_dev = DeviceBuffer::from_host(s, &[0u32; 2])?;
+            let mut y = DeviceBuffer::from_host(s, &vec![SENT; 2 * rpe])?;
+            let r = c.iqsel.enqueue_down_q2_0(
+                s,
+                &Q20Down {
+                    w,
+                    act,
+                    sel: &sel_dev,
+                    n_slots: 2,
+                    rows_per_expert: rpe,
+                },
+                c.gpu.unlabelled_sink(),
+                &mut y,
+            );
+            Ok::<bool, GateError>(r.is_err_and(|e| e.to_string().contains(what)))
+        };
+        let (act96, _) = blocks32_cols(&c.gpu, &seeded(2 * 96, 7001, -2.0, 4.0), 96, 2)?;
+        let k96 = refuse(&act96, &w, st.rpe, "multiple of 64")?;
+        let (act704, _) = blocks32_cols(&c.gpu, &seeded(2 * 704, 7002, -2.0, 4.0), 704, 2)?;
+        let k704 = refuse(&act704, &w, st.rpe, "Q2_0 rows of k = 704")?;
+        let refused = k96 && k704;
+        println!(
+            "refusals_q2_0 k96_not_multiple_of_64={} other_row_width={} {}",
+            verdict(k96),
+            verdict(k704),
+            verdict(refused),
+        );
+        Ok(ids_ok && nan_pass && refused)
     }
 
     /// Clauses 5 and 6 (module doc).
@@ -2904,6 +3184,19 @@ mod gate {
                 verdict(under),
             );
         }
+        // Clause 15: the Q2_0 down at the Qwen3.8 down's K (640: 10 blocks of
+        // 64, every other one at 2 mod 4), at K = 2,304 (two passes of a lane)
+        // and at the one-block geometry.
+        for (kb, rpe, seed) in [
+            (20usize, 2560usize, 0x51ce_0021u64),
+            (72, 512, 0x51ce_0022),
+            (2, 64, 0x51ce_0023),
+        ] {
+            let st = q2_0_stack(kb, 3, rpe, seed);
+            let w = st.upload(s)?;
+            ok &= check_q2_0(&c, &st, &w)?;
+        }
+        ok &= check_q2_0_ids_nan_refusals(&c)?;
         for fmt in Q8_FMTS {
             for &k in &KS_DOWN {
                 let st = gu_stack(fmt, k, 4, 80)?;

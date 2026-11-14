@@ -150,6 +150,7 @@ generate_ds41   dspark_rnn_gate                          0           0
 generate_ds41   dspark_rnn_input                         0           0
 generate_ds41   embed_rows                               0           0
 generate_ds41   embed_rows_bf16                          0           0
+generate_ds41   embed_rows_iq4xs                         0           0
 generate_ds41   embed_rows_q3k                           0           0
 generate_ds41   embed_rows_q4k                           0           0
 generate_ds41   embed_rows_q5_0                          0           0
@@ -238,6 +239,8 @@ generate_ds41   gemm_nvfp4p_bf16                        48          24
 # sm_86 ptxas 13.3.73, read on GB10; jit_local uses the measured stack frame.
 # The cc8.6 JIT was not measured.
 generate_ds41   gemm_nvfp4p_swiglu                       0           0
+generate_ds41   gemm_q2_0                                0           0
+generate_ds41   gemm_q2_0_bf16                           0           0
 generate_ds41   gemm_q3k                                 0           0
 generate_ds41   gemm_q3k_bf16                            0           0
 generate_ds41   gemm_q4k                                 0           0
@@ -510,6 +513,7 @@ generate_ds41   q38_shared_add                           0           0
 generate_ds41   q38_tier_ids                             0           0
 generate_ds41   q38_tier_rank                            0           0
 generate_ds41   q38_tier_rows_pack                       0           0
+generate_ds41   q2_0_gemv_sel32                          0           0
 generate_ds41   q3k_gemv                                 0           0
 generate_ds41   q3k_gemv_groups                          0           0
 generate_ds41   q3k_gemv_heads_pair                      0           0

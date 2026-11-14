@@ -2857,6 +2857,7 @@ mod gate {
                     | "g32_slab"
                     | "g32_routed"
                     | "g38_iq4nl"
+                    | "g38_q2_0"
                     | "q5_0p_is_the_gemv"
                     | "norm_form"
                     | "mxfp8_w8a8"
@@ -4307,12 +4308,13 @@ mod gate {
         /// Rows of a dense case: two full 128-row slabs and one of 16.
         const ROWS: usize = 272;
 
-        /// The four layouts under test.
+        /// The five layouts under test.
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum Lay {
             Q8Plane,
             Q8File,
             Iq4Nl,
+            Q2_0,
             Q51,
         }
 
@@ -4430,6 +4432,55 @@ mod gate {
                     &bytes[r * kb * 18..(r + 1) * kb * 18],
                     &mut want,
                 )?;
+                for (v, &w) in want.iter().enumerate() {
+                    let b = r * kb + v / 32;
+                    let mine = f64::from(d[b]) * f64::from(q[r * k + v]);
+                    decode_ok &= mine as f32 == w;
+                }
+            }
+            Ok((
+                Wts {
+                    k,
+                    bytes,
+                    d,
+                    m: vec![0.0; n_rows * kb],
+                    q,
+                },
+                decode_ok,
+            ))
+        }
+
+        /// `n_rows` rows of Q2_0 blocks from `seed`, decoded: per 64-value
+        /// block a finite f16 `d` and 16 random code bytes, value `j` the bits
+        /// `2(j % 4)` of byte `j / 4` minus one; `d` and the codes are listed
+        /// per 32-value block (a Q2_0 block's two halves share its `d`). The
+        /// decode is checked against ggml's `dequant_row` bit for bit (`d ·
+        /// (code − 1)` is one f32 product on both sides).
+        fn weights_q2_0(n_rows: usize, k: usize, seed: u64) -> Result<(Wts, bool), GateError> {
+            let mut g = Lcg(seed);
+            let kb = k / 32;
+            let mut bytes = vec![0u8; n_rows * (kb / 2) * 18];
+            let (mut d, mut q) = (
+                Vec::with_capacity(n_rows * kb),
+                Vec::with_capacity(n_rows * k),
+            );
+            for blk in bytes.as_chunks_mut::<18>().0 {
+                for b in blk.iter_mut() {
+                    *b = g.next() as u8;
+                }
+                let db = f16_bits(&mut g, false);
+                blk[0..2].copy_from_slice(&db.to_le_bytes());
+                d.push(half_to_f32(db));
+                d.push(half_to_f32(db));
+                for j in 0..64 {
+                    q.push(((blk[2 + j / 4] >> (2 * (j % 4))) & 3) as i8 - 1);
+                }
+            }
+            let mut want = vec![0.0f32; k];
+            let mut decode_ok = true;
+            for r in 0..n_rows {
+                let rb = (kb / 2) * 18;
+                dequant_row(GgmlType::Q2_0, &bytes[r * rb..(r + 1) * rb], &mut want)?;
                 for (v, &w) in want.iter().enumerate() {
                     let b = r * kb + v / 32;
                     let mine = f64::from(d[b]) * f64::from(q[r * k + v]);
@@ -4794,6 +4845,7 @@ mod gate {
                     }
                     Lay::Q8File => Gemm32Weight::Q8_0File(&self.file),
                     Lay::Iq4Nl => Gemm32Weight::Iq4NlFile(&self.file),
+                    Lay::Q2_0 => Gemm32Weight::Q2_0File(&self.file),
                     Lay::Q51 => Gemm32Weight::Q5_1File(&self.file),
                 })
             }
@@ -5525,7 +5577,7 @@ mod gate {
                                 "-".to_string()
                             }
                             Lay::Q8File => bits_equal(&got, &y8).to_string(),
-                            Lay::Iq4Nl | Lay::Q51 => "-".to_string(),
+                            Lay::Iq4Nl | Lay::Q2_0 | Lay::Q51 => "-".to_string(),
                         };
                         let fault = gpu.take_fault()?;
                         let pass = act_ok
@@ -7388,11 +7440,49 @@ mod gate {
             if !wanted("g38_iq4nl") {
                 return Ok(true);
             }
+            let (n_exp, rows, k) = (64usize, 2560usize, 640usize);
+            let (w, dec) = weights_iq4nl(n_exp * rows, k, 0x3600)?;
+            file_block_down_case(
+                dev,
+                (("g38_iq4nl", Lay::Iq4Nl), (w, dec)),
+                (n_exp, rows),
+                "IQ4_NL rows at K = 672",
+            )
+        }
+
+        /// The Q2_0 down of the Qwen3.8 card route (`gemm_q2_0`): the IQ4_NL
+        /// case's clauses over a synthetic Q2_0 stack of the same shape (64
+        /// experts × 2560 rows at K 640, random 2-bit codes, finite f16 `d`),
+        /// the host API's refusal at K = 672 (not a multiple of 64).
+        fn q2_0_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+            if !wanted("g38_q2_0") {
+                return Ok(true);
+            }
+            let (n_exp, rows, k) = (64usize, 2560usize, 640usize);
+            let (w, dec) = weights_q2_0(n_exp * rows, k, 0x3601)?;
+            file_block_down_case(
+                dev,
+                (("g38_q2_0", Lay::Q2_0), (w, dec)),
+                (n_exp, rows),
+                "Q2_0 rows need K a multiple of 64, got K = 672",
+            )
+        }
+
+        /// The clauses of the Qwen3.8 card route's file-block down GEMMs over
+        /// the stack `w` (decoded, `dec` its decode checked against ggml) of
+        /// `n_exp` experts × `rows` rows read in layout `lay`, printed as case
+        /// `tag`; `refusal` the text the host API's refusal of the stack at K
+        /// = 672 carries.
+        fn file_block_down_case(
+            dev: &Dev<'_>,
+            ((tag, lay), (w, dec)): ((&str, Lay), (Wts, bool)),
+            (n_exp, rows): (usize, usize),
+            refusal: &str,
+        ) -> Result<bool, GateError> {
             let gpu = dev.gpu;
             let stream = gpu.stream();
             let sink = gpu.unlabelled_sink();
-            let (n_exp, rows, k) = (64usize, 2560usize, 640usize);
-            let (w, dec) = weights_iq4nl(n_exp * rows, k, 0x3600)?;
+            let k = w.k;
             let res = Res::new(dev, &w, true, n_exp * rows)?;
             let max_slots = TOKENS[TOKENS.len() - 1];
             let mut route = GemmRoute::new(stream, max_slots, n_exp)?;
@@ -7415,7 +7505,7 @@ mod gate {
                     let got = gemm(
                         dev,
                         &res,
-                        Lay::Iq4Nl,
+                        lay,
                         rows,
                         &act,
                         &route,
@@ -7442,7 +7532,7 @@ mod gate {
                         &got,
                         n_slots,
                     )?;
-                    let wgt = res.weight(Lay::Iq4Nl)?;
+                    let wgt = res.weight(lay)?;
                     let bf16 = bf16_product32(dev, wgt, rows, (&act, &route), &got)?;
                     let fault = gpu.take_fault()?;
                     let pass = dec
@@ -7452,7 +7542,7 @@ mod gate {
                         && bf16
                         && fault.is_none();
                     println!(
-                        "gemm32 case=g38_iq4nl down T={t} routing={r:?} slots={n_slots} \
+                        "gemm32 case={tag} down T={t} routing={r:?} slots={n_slots} \
                          decode_vs_ggml={dec} unwritten={unwritten} checked={checked} \
                          worst_err_over_band={worst:.3} band_off={band_off} \
                          contract_bits_differ={bits_off} bf16_eq_f32_rne={bf16} y_fnv={:016x} {}",
@@ -7460,7 +7550,7 @@ mod gate {
                         verdict(pass)
                     );
                     if let Some(f) = first {
-                        println!("gemm32 case=g38_iq4nl down T={t} first_failure: {f}");
+                        println!("gemm32 case={tag} down T={t} first_failure: {f}");
                     }
                     ok &= pass;
                 }
@@ -7479,7 +7569,7 @@ mod gate {
                 let a = gemm(
                     dev,
                     &res,
-                    Lay::Iq4Nl,
+                    lay,
                     rows,
                     &act,
                     &route,
@@ -7490,7 +7580,7 @@ mod gate {
                 let b = gemm(
                     dev,
                     &res,
-                    Lay::Iq4Nl,
+                    lay,
                     rows,
                     &act,
                     &route,
@@ -7499,7 +7589,7 @@ mod gate {
                     ids.len(),
                 )?;
                 let same = bits_equal(&a, &b);
-                println!("gemm32 case=g38_iq4nl rerun_bits={same} {}", verdict(same));
+                println!("gemm32 case={tag} rerun_bits={same} {}", verdict(same));
                 ok &= same;
             }
             // A NaN f16 `d` in block 0 of expert 0's row 0: the outputs of
@@ -7527,7 +7617,7 @@ mod gate {
                 let got = gemm(
                     dev,
                     &resn,
-                    Lay::Iq4Nl,
+                    lay,
                     rows,
                     &act,
                     &route,
@@ -7543,7 +7633,7 @@ mod gate {
                 });
                 let pass = row0_nan && rest_finite;
                 println!(
-                    "gemm32 case=g38_iq4nl fault=nan_d row0_nan={row0_nan} other_rows_finite={rest_finite} {}",
+                    "gemm32 case={tag} fault=nan_d row0_nan={row0_nan} other_rows_finite={rest_finite} {}",
                     verdict(pass)
                 );
                 ok &= pass;
@@ -7554,7 +7644,7 @@ mod gate {
                 let xd = DeviceBuffer::from_host(stream, &activations(672, 8, 9970))?;
                 dev.g32
                     .enqueue_quantize_gemm32(stream, &xd, 8, &mut other, sink)?;
-                let wgt = res.weight(Lay::Iq4Nl)?;
+                let wgt = res.weight(lay)?;
                 let mut y8 = DeviceBuffer::<f32>::zeroed(stream, 8 * rows)?;
                 let err = dev.g32.enqueue_gemm32(
                     stream,
@@ -7567,9 +7657,9 @@ mod gate {
                         y: &mut y8,
                     },
                 );
-                let pass = err.is_err_and(|e| e.to_string().contains("IQ4_NL rows at K = 672"));
+                let pass = err.is_err_and(|e| e.to_string().contains(refusal));
                 println!(
-                    "gemm32 case=g38_iq4nl refusal_other_k_refused={pass} {}",
+                    "gemm32 case={tag} refusal_other_k_refused={pass} {}",
                     verdict(pass)
                 );
                 ok &= pass;
@@ -8092,6 +8182,11 @@ mod gate {
                         &mut y,
                     ),
                     "IQ4_NL rows at K =",
+                ),
+                (
+                    "q2_0_layout_at_q8_0_words",
+                    gemm(Gemm32Weight::Q2_0File(&r8.file), rows, &act, &route, &mut y),
+                    "Q2_0 rows at K =",
                 ),
                 (
                     "plane_shape",
@@ -10655,6 +10750,7 @@ mod gate {
             ok &= nvfp4_gate_up_case(&dev)?;
             ok &= q5_0p_case(&dev)?;
             ok &= iq4nl_case(&dev)?;
+            ok &= q2_0_case(&dev)?;
             ok &= remap_case(&dev)?;
             ok &= f32tile_case(&dev)?;
             ok &= dense_mma_case(&dev)?;

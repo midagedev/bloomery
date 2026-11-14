@@ -4088,8 +4088,8 @@ mod tests {
     /// The qwen4exp head and embedding read the card kernel table's rows
     /// ([`super::ROW_PINS`], `kernels::head` and `kernels::embed`, BF16's
     /// among them: that load keeps BF16 in its words): `output` of Q8_0, Q6_K,
-    /// Q5_K, Q4_K or BF16 and a `token_embd` of Q3_K, Q4_K, Q5_K, Q6_K, Q8_0
-    /// or BF16 are no item; another type is one that names the row.
+    /// Q5_K, Q4_K or BF16 and a `token_embd` of Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS,
+    /// Q8_0 or BF16 are no item; another type is one that names the row.
     // PIN(2026-10-06): q6_K (and q4_K, which the same gemv reads) joined the
     // head's set so the UD-Q3_K_XL file's q6_K output loads.
     // PIN(2026-10-20): bf16 joined the head's and the embedding's sets with
@@ -4104,6 +4104,11 @@ mod tests {
     // run on every path that embeds (the step, the pass and the ubatch front)
     // or projects (the step's head); the old test asserted the two refusals
     // this one inverts.
+    // PIN(2026-11-14): IQ4_XS joined the embedding's set (`embed_rows_iq4xs`
+    // over the file's blocks; unsloth's Dynamic V3.1 low-bit Flash-Next files
+    // carry an IQ4_XS `token_embd`). Derivation: `enqueue_embed_lookup` hands
+    // every table row the kernel table names to `enqueue_embed_rows_kquant`,
+    // which gained the IQ4_XS arm; the gate pins it bit for bit.
     #[test]
     fn the_qwen38_head_and_embedding_read_the_kernel_tables_rows() {
         let mut bad = Vec::<String>::new();
@@ -4141,6 +4146,7 @@ mod tests {
             GgmlType::Q4_K,
             GgmlType::Q5_K,
             GgmlType::Q6_K,
+            GgmlType::IQ4_XS,
             GgmlType::Q8_0,
             GgmlType::BF16,
         ] {
@@ -4150,7 +4156,7 @@ mod tests {
                 &none,
             );
         }
-        for ty in [GgmlType::Q2_K, GgmlType::IQ4_XS, GgmlType::Q5_0] {
+        for ty in [GgmlType::Q2_K, GgmlType::Q5_0] {
             check(
                 format!("embedding {ty}"),
                 global("token_embd.weight", Role::TokenEmbedding, ty),

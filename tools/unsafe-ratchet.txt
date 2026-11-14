@@ -847,7 +847,12 @@ gguf 7 2 0
 # PIN(2026-11-13): gpu 3103 -> 3105 blocks, a new kernel entry, not old code relaxed: the card's routed picks
 # collector (crates/gpu/src/imatrix.rs: `imat_card_picks`'s reads and its kept-pick add, and its shared-module load), each
 # with its SAFETY line.
-gpu 3105 423 10
+# PIN(2026-11-14): gpu 3105 -> 3115 blocks, 423 -> 425 fns, new code, not old code relaxed: the IQ4_XS embedding row reader
+# (crates/gpu/src/elem.rs: `Iq4xsRows::value`'s unchecked block reads and the kernel's launch-time loads) and the Q2_0
+# card down (crates/gpu/src/iq_sel.rs: `q2_0_row_dot32`'s five-word window reads and activation reads, `q2_0_gemv_sel32`'s
+# pick and accumulator loads; crates/gpu/src/gemm/gemm32.rs: the Q2_0 file-half loads), each with its SAFETY line or
+# `# Safety` contract.
+gpu 3115 425 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

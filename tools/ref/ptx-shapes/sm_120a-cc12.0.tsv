@@ -182,6 +182,8 @@ generate_ds41 dspark_rnn_gate 0 0
 generate_ds41 dspark_rnn_input 0 0
 generate_ds41 embed_rows 0 0
 generate_ds41 embed_rows_bf16 0 0
+# PIN(2026-11-14): embed_rows_iq4xs: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned (the sm_86 cc 8.6 scan reads 0/0), not a measured no-spill claim.
+generate_ds41   embed_rows_iq4xs                         0           0
 generate_ds41 embed_rows_q3k 0 0
 generate_ds41 embed_rows_q4k 0 0
 generate_ds41 embed_rows_q5_0 0 0
@@ -241,6 +243,9 @@ generate_ds41 gemm_iq4xs 0 0
 generate_ds41 gemm_iq4xs_bf16 0 0
 generate_ds41 gemm_nvfp4_mma 0 0
 generate_ds41 gemm_nvfp4_mma_bf16 0 0
+# PIN(2026-11-14): gemm_q2_0 and gemm_q2_0_bf16: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned (the sm_86 cc 8.6 scan reads 0/0), not a measured no-spill claim.
+generate_ds41   gemm_q2_0                                0           0
+generate_ds41   gemm_q2_0_bf16                           0           0
 generate_ds41 gemm_q3k 0 0
 generate_ds41 gemm_q3k_bf16 0 0
 generate_ds41 gemm_q5_0p 0 0
@@ -455,6 +460,8 @@ generate_ds41 q38_shared_add 0 0
 generate_ds41 q38_tier_ids 0 0
 generate_ds41 q38_tier_rank 0 0
 generate_ds41 q38_tier_rows_pack 0 0
+# PIN(2026-11-14): q2_0_gemv_sel32: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned (the sm_86 cc 8.6 scan reads 0/0), not a measured no-spill claim.
+generate_ds41   q2_0_gemv_sel32                          0           0
 generate_ds41 q3k_gemv 0 0
 generate_ds41 q3k_gemv_groups 0 0
 generate_ds41 q3k_gemv_heads_pair 0 0

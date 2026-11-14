@@ -2119,6 +2119,7 @@ fn down_arm(ty: GgmlType) -> Result<DownArm, GpuError> {
         | DownEntry::Q5_1
         | DownEntry::Q8_0
         | DownEntry::Iq4nl
+        | DownEntry::Q2_0
         | DownEntry::Nvfp4 => {
             return Err(refuse(format!(
                 "its entry {entry:?} reads {act:?} columns; the placed side quantizes its \

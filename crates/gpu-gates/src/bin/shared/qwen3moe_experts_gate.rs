@@ -13,14 +13,15 @@
 //!    unchanged and every row's position written; a position past a u32
 //!    reads `u32::MAX`, a count too, never a wrapped value. And
 //!    `enqueue_embed_rows_kquant` on a seeded synthetic table of each type it
-//!    takes (Q3_K, Q4_K, Q5_K, Q6_K: random codes and scales, normal f16
-//!    `d`/`dmin`, rows of an even count of super-blocks), ids on the first,
+//!    takes (Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS: random codes and scales, normal
+//!    f16 `d`/`dmin`, rows of an even count of super-blocks), ids on the first,
 //!    a middle and the last row among others: every value bit for bit
 //!    against `dequant_row` on the same row, each row's position and count
 //!    as above; a Q3_K table whose rows are an odd count of super-blocks
 //!    (not whole words) is refused by name. `gate-1-1` holds `dequant_row` to
-//!    ggml's `to_float` on rows of all four types (its V2-Lite and V4.1 sets),
-//!    so the card, ours and ggml agree on each.
+//!    ggml's `to_float` on rows of the four K-quant types (its V2-Lite and
+//!    V4.1 sets) and `hw_dequant_matches_ggml_synthetic` on IQ4_XS's, so the
+//!    card, ours and ggml agree on each.
 //! 2. Gate·up body: for a sel vector with a repeated id, slot `s` equals
 //!    `q4k_gemv` of expert `sel[s]`'s gate rows and up rows alone, combined
 //!    by `elem::swiglu` (the same `silu_mul` core), bit for bit; a rerun is
@@ -414,11 +415,12 @@ fn embed(
 /// The K-quant types `enqueue_embed_rows_kquant` gathers, each with the
 /// byte offsets of its f16 fields (`d`, and `dmin` where it has one) in a
 /// super-block.
-const EMBED_TYPES: [(GgmlType, &[usize]); 4] = [
+const EMBED_TYPES: [(GgmlType, &[usize]); 5] = [
     (GgmlType::Q3_K, &[108]),
     (GgmlType::Q4_K, &[0, 2]),
     (GgmlType::Q5_K, &[0, 2]),
     (GgmlType::Q6_K, &[208]),
+    (GgmlType::IQ4_XS, &[0]),
 ];
 
 /// Rows of a synthetic table, and the super-blocks (an even count: every

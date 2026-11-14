@@ -1335,6 +1335,7 @@ fn slots_down(
             | DownEntry::Iq3xxs
             | DownEntry::Iq3s
             | DownEntry::Iq4nl
+            | DownEntry::Q2_0
             | DownEntry::Iq4xs
             | DownEntry::Mxfp4
             | DownEntry::Nvfp4 => {
@@ -1544,6 +1545,7 @@ fn apart_down(
         | DownEntry::Iq3xxs
         | DownEntry::Iq3s
         | DownEntry::Iq4nl
+        | DownEntry::Q2_0
         | DownEntry::Iq4xs
         | DownEntry::Mxfp4
         | DownEntry::Nvfp4 => {

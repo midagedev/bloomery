@@ -1132,7 +1132,7 @@ impl Q38Kernels {
     /// [`Q38Kernels::enqueue_embed_rows`] for the resident table `name` of
     /// `w`, by its form: Q8_0 planes and BF16 words run this module's
     /// lookups, a K-quant word plane of the table's rows
-    /// ([`kernels::embed`]: Q3_K, Q4_K, Q5_K and Q6_K)
+    /// ([`kernels::embed`]: Q3_K, Q4_K, Q5_K, Q6_K and IQ4_XS)
     /// [`ElemKernels::enqueue_embed_rows_kquant`](crate::elem::ElemKernels::enqueue_embed_rows_kquant),
     /// each an id past the table a [`FaultSite::TokenId`] and a NaN row. A
     /// table of another form, or whose rows are not `io.width` values wide, is

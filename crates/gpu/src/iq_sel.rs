@@ -96,6 +96,14 @@
 //!   parity picks and code word `i < 4` the window `2 + 4i .. 2 + 4i + 4` of
 //!   the block, `iq4_word`'s low- and high-nibble value words in `[lo0..lo3,
 //!   hi0..hi3]` order (values `0..16` then `16..32`).
+//! - Q2_0 (a plain 64-value block type, read here beside IQ4_NL for its 32-value
+//!   activation): block `g` of the stream (`g = ra · k/64 + b/2`) starts at
+//!   byte `18·g`; the same five words cover it, and the 32-value half `b & 1`
+//!   is the eight code bytes `2 + 8·(b & 1) ..` of the block, each byte
+//!   spreading its four 2-bit codes to the four byte lanes of one dp4a word
+//!   ([`spread2`]). The codes are `0..=3` for the values `code − 1`, so the
+//!   block's integer dot is the chain's `A` minus the activation block's code
+//!   sum `s`.
 //!
 //! Ids, as the K-quant family ([`crate::kquant::sel`]). [`HOST`] is a slot
 //! the host tier serves: the slot's warps return before their first load,
@@ -119,7 +127,7 @@
 //!
 //! The kernel wrappers are written by [`crate::quant_sel`]'s `quant_sel_module!`,
 //! one line a format; this file holds the decoders ([`RawSb`]), the generic
-//! bodies, the IQ4_NL entry and the launchers.
+//! bodies, the IQ4_NL and Q2_0 entries and the launchers.
 
 use crate::cores::half_to_f32;
 use crate::fault::{FaultSink, FaultSite};
@@ -829,6 +837,104 @@ pub(crate) fn iq4_nl_row_dot32(
     f0
 }
 
+/// Bytes of one `block_q2_0` (64 values): the f16 `d`, then 16 code bytes.
+pub const Q2_0_BLOCK_BYTES: usize = 18;
+
+/// The four 2-bit codes of the low byte of `x` as the four byte lanes of a
+/// word, lane `k` holding code `(x >> 2k) & 3`.
+#[inline(always)]
+pub(crate) fn spread2(x: u32) -> u32 {
+    let y = (x & 0xff) | ((x & 0xff) << 12);
+    (y | (y << 6)) & 0x0303_0303
+}
+
+/// One Q2_0 row's dot with activation column `col`, lane `lane`'s partial
+/// (the caller reduces over the warp): lane `b` takes the 32-value blocks `b,
+/// b + 32, ..` of row `row_abs` (block `b` is half `b & 1` of the row's 64-value
+/// block `b >> 1`) and adds each block's `((A − s)·d)·e`, `A` the dp4a chain of
+/// the half's eight code words (each of four codes `0..=3`, [`spread2`])
+/// against the column's int8 words and `s` the column block's code sum, so
+/// `A − s` is the exact integer dot of the values `code − 1` (`-1..=2`).
+///
+/// A block starts 0 or 2 mod 4 of the stream (18 bytes), so its five covering
+/// words are read and the codes funnelled out of them.
+///
+/// # Safety
+///
+/// The caller keeps `k_blocks` even, `4 · w.len() >= 9 · (row_abs + 1) ·
+/// k_blocks` (the stream holds the row's last block, whose five words end
+/// inside it), `q.len() >= (col + 1) · q_stride` with `q_stride >= 256 ·
+/// ceil(k_blocks / 32)`, `d8.len()` and `s8.len() >= (col + 1) · k_blocks`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub(crate) unsafe fn q2_0_row_dot32(
+    w: &[u32],
+    (q, d8, s8): (&[u32], &[f32], &[i32]),
+    k_blocks: usize,
+    q_stride: usize,
+    row_abs: usize,
+    col: usize,
+    lane: usize,
+) -> f32 {
+    let g0 = row_abs * k_blocks;
+    let q0 = col * q_stride;
+    let d8b0 = col * k_blocks;
+    let mut f0 = 0.0f32;
+    let mut b = lane;
+    while b < k_blocks {
+        let blk = (g0 + b) >> 1;
+        let wb = (9 * blk) >> 1;
+        let odd = (blk & 1) as u32;
+        // SAFETY: block `blk`'s bytes are 18·blk .. 18·blk + 18, inside the
+        // stream's words by this fn's contract (blk < (row_abs + 1) ·
+        // k_blocks / 2); the last of its five words, wb + 4, is the word of
+        // its last byte.
+        let v = unsafe {
+            [
+                *w.get_unchecked(wb),
+                *w.get_unchecked(wb + 1),
+                *w.get_unchecked(wb + 2),
+                *w.get_unchecked(wb + 3),
+                *w.get_unchecked(wb + 4),
+            ]
+        };
+        let d = half_to_f32((v[0] >> (16 * odd)) as u16);
+        let sh = 16 + 16 * odd;
+        // The half's eight code bytes: bytes 0..8 of the block's codes for
+        // the first half, 8..16 for the second.
+        let (a0, a1, a2) = if b & 1 == 0 {
+            (v[0], v[1], v[2])
+        } else {
+            (v[2], v[3], v[4])
+        };
+        let c0 = q8_0_code(a0, a1, sh);
+        let c1 = q8_0_code(a1, a2, sh);
+        let cw = [
+            spread2(c0),
+            spread2(c0 >> 8),
+            spread2(c0 >> 16),
+            spread2(c0 >> 24),
+            spread2(c1),
+            spread2(c1 >> 8),
+            spread2(c1 >> 16),
+            spread2(c1 >> 24),
+        ];
+        // SAFETY: d8b0 + b < (col + 1) · k_blocks <= d8.len(), s8.len() by
+        // this fn's contract.
+        let (e, sum) = unsafe { (*d8.get_unchecked(d8b0 + b), *s8.get_unchecked(d8b0 + b)) };
+        // SAFETY: q5_a_chain's window: q0 + 256·(b >> 5) + (b & 31) + 224 <
+        // q0 + 256·((b >> 5) + 1) <= q0 + q_stride <= q.len(), by this fn's
+        // contract and b < k_blocks.
+        let a = unsafe { q5_a_chain(&cw, q, q0 + 256 * (b >> 5) + (b & 31)) };
+        f0 += ((a - sum) as f32 * d) * e;
+        b += 32;
+    }
+    f0
+}
+
 #[cuda_module]
 pub(crate) mod blk32_kernels {
     use super::*;
@@ -914,6 +1020,90 @@ pub(crate) mod blk32_kernels {
             }
         }
     }
+
+    /// The Q2_0 down `_sel` of 32-value blocks ([`q2_0_row_dot32`]): one warp
+    /// per output row, eight rows per 256-thread block, as
+    /// `iq4_nl_gemv_sel32`. `k_blocks` is even (K a multiple of 64). Ids:
+    /// module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w.len() >= n_experts * rows_per_expert * 9 * k_blocks,
+            q.len() >= n_slots * q_stride,
+            d8.len() >= n_slots * k_blocks,
+            s8.len() >= n_slots * k_blocks,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q2_0_gemv_sel32(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        s8: &[i32],
+        sel: &[u32],
+        k_blocks: u32,
+        q_stride: u32,
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        if row >= n_slots as usize * rows_per_expert as usize {
+            return;
+        }
+        // In u32, as the IQ4_NL entry: the launcher bounds n_slots ·
+        // rows_per_expert to u32.
+        let (r, slot) = (
+            row as u32 % rows_per_expert,
+            (row as u32 / rows_per_expert) as usize,
+        );
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform (all 32 lanes of the warp share `row`, hence
+        // `slot`), so the returns below never diverge a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        let row_abs = id as usize * rows_per_expert as usize + r as usize;
+        // SAFETY: row_abs < n_experts · rows_per_expert rows, so the stream
+        // holds its last block by the launch contract; column slot < n_slots
+        // of the activation, and the host passes the activation's own
+        // q_stride (>= 256 · ceil(k_blocks/32)).
+        let f0 = unsafe {
+            q2_0_row_dot32(
+                w,
+                (q, d8, s8),
+                k_blocks as usize,
+                q_stride as usize,
+                row_abs,
+                slot,
+                lane,
+            )
+        };
+        let s0 = warp::reduce_sum_f32(f0);
+        if lane == 0 {
+            // SAFETY: row < n_slots · rows_per_expert <= y.len() by the
+            // launch contract; only lane 0 of the warp writes y[row].
+            unsafe {
+                *y.get_unchecked_mut(row) = s0;
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ host
@@ -965,6 +1155,44 @@ pub fn iq4_nl_row_dot32_host(
     f0
 }
 
+/// Lane `lane`'s partial of one Q2_0 row on the host, [`q2_0_row_dot32`]'s
+/// transcription from the layout: the codes read bit by bit from the block's
+/// bytes as `code − 1` and summed against the column's int8 codes (the device
+/// sums `A − s` of the unsigned codes, the same integer), each block adding
+/// `(a·d)·e` into the running sum with one fused multiply-add as the device's
+/// contraction does. `xq` is the column's int8 codes in value order, `d8` its
+/// block scales.
+#[must_use]
+pub fn q2_0_row_dot32_host(
+    w: &[u32],
+    xq: &[i8],
+    d8: &[f32],
+    k_blocks: usize,
+    row_abs: usize,
+    lane: usize,
+) -> f32 {
+    let byte = |i: usize| (w[i >> 2] >> (8 * (i & 3))) as u8;
+    let mut f0 = 0.0f32;
+    let mut b = lane;
+    while b < k_blocks {
+        let g = row_abs * k_blocks + b;
+        let (blk, half) = (g >> 1, g & 1);
+        let x = Q2_0_BLOCK_BYTES * blk;
+        let d = half_to_f32(u16::from_le_bytes([byte(x), byte(x + 1)]));
+        let mut a = 0i64;
+        for i in 0..8 {
+            let code_byte = byte(x + 2 + 8 * half + i);
+            for k in 0..4 {
+                let code = i64::from((code_byte >> (2 * k)) & 3) - 1;
+                a += code * i64::from(xq[32 * b + 4 * i + k]);
+            }
+        }
+        f0 = (a as f32 * d).mul_add(d8[b], f0);
+        b += 32;
+    }
+    f0
+}
+
 // -------------------------------------------------------------- launcher
 
 /// A gate·up launch ([`QuantSelKernels::enqueue_gate_up`]).
@@ -998,6 +1226,21 @@ pub struct IqDown<'a> {
     /// At least `n_slots` 32-value q8_1 columns: column `s` is read for `s <
     /// n_slots` and the rest are not touched, so a cap-sized activation serves
     /// a smaller batch.
+    pub act: &'a Q8Blocks32,
+    /// At least `n_slots` ids, read on the device at each launch.
+    pub sel: &'a DeviceBuffer<u32>,
+    pub n_slots: usize,
+    pub rows_per_expert: usize,
+}
+
+/// A Q2_0 down `_sel` launch ([`QuantSelKernels::enqueue_down_q2_0`]).
+pub struct Q20Down<'a> {
+    /// The resident stack: `n_experts · rows_per_expert` rows of the file's
+    /// `block_q2_0` bytes as the KQuant word stream ([`stream_words`] words a
+    /// row, `w.rows()` a positive multiple of `rows_per_expert`).
+    pub w: &'a DeviceTensor<u32>,
+    /// At least `n_slots` 32-value q8_1 columns: column `s` is read for `s <
+    /// n_slots` and the rest are not touched.
     pub act: &'a Q8Blocks32,
     /// At least `n_slots` ids, read on the device at each launch.
     pub sel: &'a DeviceBuffer<u32>,
@@ -1384,11 +1627,95 @@ impl QuantSelKernels {
         )?;
         Ok(())
     }
+
+    /// Enqueue the Q2_0 down `_sel`: slot `s` writes `y[s · rows_per_expert
+    /// ..][..rows_per_expert]` as the rows of expert `sel[s]` dotted with
+    /// column `s` of `a.act` (module doc for [`HOST`] and ids past the stack,
+    /// which raise on `fault`). Refused by name: a K that is not a positive
+    /// multiple of 64 (a `block_q2_0` holds 64 values), a stack whose row
+    /// width is not the KQuant stream of `block_q2_0`s, a non-dividing expert
+    /// size, and slots the activation, the ids or `y` do not cover.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_down_q2_0(
+        &self,
+        stream: &CudaStream,
+        a: &Q20Down<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "QuantSelKernels::enqueue_down_q2_0";
+        let k = a.act.k();
+        if k == 0 || !k.is_multiple_of(64) {
+            return Err(GpuError::shape(
+                what,
+                format!("Q2_0 needs k a positive multiple of 64, got {k}"),
+            ));
+        }
+        let k_blocks = k / 32;
+        let (n_slots, rpe) = (a.n_slots, a.rows_per_expert);
+        if rpe == 0 || a.w.rows() == 0 || !a.w.rows().is_multiple_of(rpe) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "w.rows() {} must be a positive multiple of rows_per_expert {rpe}",
+                    a.w.rows()
+                ),
+            ));
+        }
+        let rows = a.w.rows();
+        let bytes = Q2_0_BLOCK_BYTES * (k_blocks / 2) * rows;
+        let cols = stream_words(bytes as u64, rows as u64).map(|x| (x / rows as u64) as usize);
+        if cols != Some(a.w.cols()) || 4 * a.w.buf().len() < bytes {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "Q2_0 rows of k = {k} (a multiple of 64) are {} blocks of {} bytes: {rows} \
+                     rows take {cols:?} words a row over {bytes} bytes, got {} words a row \
+                     over {} bytes",
+                    k / 64,
+                    Q2_0_BLOCK_BYTES,
+                    a.w.cols(),
+                    4 * a.w.buf().len()
+                ),
+            ));
+        }
+        let slot_rows = crate::kquant::sel::check_down_slots(
+            what,
+            n_slots,
+            rpe,
+            a.act.m(),
+            a.sel.len(),
+            y.len(),
+        )?;
+        // The body divides thread rows in u32.
+        launch_u32(what, "n_slots * rows_per_expert", slot_rows)?;
+        let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
+        let prep = self
+            .hand
+            .prepare_q2_0_gemv_sel32(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.hand.q2_0_gemv_sel32(
+            stream,
+            &prep,
+            a.w.buf(),
+            &a.act.q,
+            &a.act.d8,
+            &a.act.s8,
+            a.sel,
+            launch_u32(what, "k_blocks", k_blocks)?,
+            launch_u32(what, "q_stride", a.act.q_stride())?,
+            launch_u32(what, "n_experts", rows / rpe)?,
+            launch_u32(what, "rows_per_expert", rpe)?,
+            launch_u32(what, "n_slots", n_slots)?,
+            fault,
+            y,
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::IQ4_NL_BLOCK_BYTES;
+    use super::{IQ4_NL_BLOCK_BYTES, spread2};
     use gguf::quant::half_to_f32;
 
     /// Words of a byte stream as the card holds it: little-endian words,
@@ -1476,5 +1803,21 @@ mod tests {
         }
         let got = super::iq4_nl_row_dot32_host(&w, &xq, &d8, 3, row, 0);
         assert_eq!(got.to_bits(), want.to_bits(), "row {row} lane 0 partial");
+    }
+
+    /// `spread2` of every byte is its four 2-bit codes, code `k` in byte lane
+    /// `k`, and nothing in the upper bits of a lane or from the bits of `x`
+    /// above the low byte.
+    #[test]
+    fn spread2_is_the_four_codes_of_a_byte() {
+        for x in 0u32..256 {
+            let want = (0..4).fold(0u32, |a, k| a | (((x >> (2 * k)) & 3) << (8 * k)));
+            assert_eq!(spread2(x), want, "byte {x:#04x}");
+            assert_eq!(
+                spread2(x | 0xabcd_ef00),
+                want,
+                "byte {x:#04x} with high bits"
+            );
+        }
     }
 }
