@@ -2,10 +2,10 @@
 
 `bloomery-quantize` is the quantizer: it writes the final quantized GGUF set from the source set in one pass, with no
 intermediate set. The routed-expert stacks become IQ1_S or IQ2_XXS on the card (or the host's cores), every other
-tensor the type `llama-quantize` gives it by the host's K-quant rules (Q4_K, Q5_K, Q6_K, Q8_0, and the F32/F16 copies),
-and the metadata, the tensor order, the alignment and the shard layout are the ones `llama-quantize` writes. The output
-is byte-identical to `llama-quantize`'s for the same input, importance matrix, rules and options. `llama-quantize`
-stays as the oracle: the gates compare against it.
+tensor the type `llama-quantize` gives it by the host's K-quant rules (Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, and the F32/F16
+copies), and the metadata, the tensor order, the alignment and the shard layout are the ones `llama-quantize` writes.
+The output is byte-identical to `llama-quantize`'s for the same input, importance matrix, rules and options.
+`llama-quantize` stays as the oracle: the gates compare against it.
 
 It is in the Linux archives only. It links the CUDA backend, and cargo refuses to build it without the `gpu` feature,
 so the Mac archive has no binary of it (`--cpu` included).
@@ -13,8 +13,10 @@ so the Mac archive has no binary of it (`--cpu` included).
 ## Scope
 
 The architecture is `kimi-k3`; the file types are Q4_K_M, Q5_K_M, Q6_K, Q8_0, IQ2_XXS and IQ1_S. Any other
-architecture, type, or a type resolution that lands on a type not ported (Q2_K, Q3_K, ...) is refused by name before
-anything is written.
+architecture, type, or a type resolution that lands on a type not ported (Q2_K, ...) is refused by name before
+anything is written. Q3_K is ported as a rule type, not a file type: a `--tensor-type-file` rule, `--output-tensor-type`
+or `--token-embedding-type` may name it (ggml's `quantize_row_q3_K_ref` without an importance matrix, `_impl` with
+one), and there is no Q3_K_M file type, since llama-quantize's Q3_K_M type rules are not ported.
 
     bloomery-quantize IN-00001-of-N.gguf OUT/prefix Q4_K_M --imatrix m.imatrix.gguf --tensor-type-file rules.txt \
         --output-tensor-type q6_k --token-embedding-type q4_k --keep-split --allow-requantize
@@ -98,11 +100,12 @@ Nothing is turned into a plausible value.
 
 ## How its bytes are proved
 
-- `just gate-quantize-oracle`: the host K-quant rules (`gguf::kquant`) against ggml's quantizer (`iq_quant_ref`, linked
-  to the library llama-quantize calls), row for row, with and without an importance matrix, over seeded row families.
-  The oracle's libggml-base has no FMA and no F16C instruction, so the host rules use none.
+- `just gate-quantize-oracle`: the host K-quant rules (`gguf::kquant`: Q3_K, Q4_K, Q5_K, Q6_K, Q8_0) against ggml's
+  quantizer (`iq_quant_ref`, linked to the library llama-quantize calls), row for row, with and without an importance
+  matrix, over seeded row families. The oracle's libggml-base has no FMA and no F16C instruction, so the host rules use
+  none.
 - `just gate-quantize-e2e`: the K3 fixture through the host writer (`--cpu`) against `llama-quantize`: whole-file
-  sha256 equal, split and not.
+  sha256 equal, split and not, and with the trunk weights at Q3_K by rule.
 - Plan equality: the types and bytes of every tensor equal `llama-quantize --dry-run`'s, tensor for tensor
   (`--llama-plan`, and the writer cross-checks it on every run that has one).
 - `just gate-gpu-iq-quant`: the card's bytes against the oracle, `--cpu` equal to the card, `--check`, each refusal.

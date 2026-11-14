@@ -127,6 +127,8 @@ struct Fix {
     split: PathBuf,
     im: PathBuf,
     rules: PathBuf,
+    /// The same rules with the trunk weights at Q3_K.
+    rules_q3: PathBuf,
 }
 
 const FLAGS: [&str; 4] = [
@@ -200,6 +202,8 @@ fn build(rng: &mut Rng) -> Fix {
     write_imatrix(&im, &tensors);
     let rules = work.join("rules.txt");
     std::fs::write(&rules, common::k31_rules("q4_k")).unwrap();
+    let rules_q3 = work.join("rules-q3.txt");
+    std::fs::write(&rules_q3, common::k31_rules("q3_k")).unwrap();
     Fix {
         work,
         lq,
@@ -207,6 +211,7 @@ fn build(rng: &mut Rng) -> Fix {
         split,
         im,
         rules,
+        rules_q3,
     }
 }
 
@@ -216,14 +221,14 @@ fn both(
     input: &Path,
     ftype: &str,
     keep_split: bool,
-    with_rules: bool,
+    rules: Option<&Path>,
     tag: &str,
 ) -> (f64, f64) {
     let (a_stem, b_stem) = (format!("alone-{tag}"), format!("ours-{tag}"));
     let mut common: Vec<String> = vec!["--allow-requantize".into()];
     common.extend(["--imatrix".into(), f.im.display().to_string()]);
-    if with_rules {
-        common.extend(["--tensor-type-file".into(), f.rules.display().to_string()]);
+    if let Some(rules) = rules {
+        common.extend(["--tensor-type-file".into(), rules.display().to_string()]);
     }
     common.extend(FLAGS.map(String::from));
     if keep_split {
@@ -305,10 +310,13 @@ fn both(
 fn hw_fixture_whole_file_equals_llama_quantize() {
     let mut rng = Rng(0x00ff_aa55_1234_5678);
     let f = build(&mut rng);
+    let rules = Some(f.rules.as_path());
     // the K3.1 shape (IQ stacks by rules, flag-typed head and embedding) as one file, a split input kept split and merged, and at Q5_K_M
-    both(&f, &f.src, "Q4_K_M", false, true, "q4km");
-    both(&f, &f.split, "Q4_K_M", true, true, "q4km-split");
-    both(&f, &f.split, "Q4_K_M", false, true, "q4km-merged");
-    both(&f, &f.src, "Q5_K_M", false, true, "q5km");
+    both(&f, &f.src, "Q4_K_M", false, rules, "q4km");
+    both(&f, &f.split, "Q4_K_M", true, rules, "q4km-split");
+    both(&f, &f.split, "Q4_K_M", false, rules, "q4km-merged");
+    both(&f, &f.src, "Q5_K_M", false, rules, "q5km");
+    // the trunk weights at Q3_K by rule: the imatrix'd two of every three on ggml's `_impl` rule, the third on `_ref`
+    both(&f, &f.src, "Q4_K_M", false, Some(&f.rules_q3), "q4km-q3k");
     let _ = std::fs::remove_dir_all(&f.work);
 }

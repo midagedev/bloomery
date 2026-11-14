@@ -1,7 +1,7 @@
 //! The host K-quant rules (`gguf::kquant`) against ggml's own quantizer: `iq_quant_ref` (`tools/ref/iq_quant_ref.cpp`)
-//! linked to the K3.1 quantization tree's libggml-base, the library llama-quantize calls. For each of Q4_K, Q5_K,
-//! Q6_K and Q8_0 and for each of a set of seeded row families, every row quantized with an importance row per expert
-//! (ggml's `_impl` rules) and without (its `_ref` rules) must equal the oracle's bytes. Run by
+//! linked to the K3.1 quantization tree's libggml-base, the library llama-quantize calls. For each of Q3_K, Q4_K,
+//! Q5_K, Q6_K and Q8_0 and for each of a set of seeded row families, every row quantized with an importance row per
+//! expert (ggml's `_impl` rules) and without (its `_ref` rules) must equal the oracle's bytes. Run by
 //! `just gate-quantize-oracle` (the box, no card).
 
 mod common;
@@ -123,7 +123,35 @@ fn families(rng: &mut Rng) -> Vec<Family> {
         4,
         (0..wide * 4).map(|_| rng.sym() * 0.05).collect(),
     );
+    // a whole super-block of zeros (a block with no scale at all) between blocks that have one
+    add(
+        "zero-super-blocks",
+        n,
+        rows,
+        fill(rng, &mut |r, i| {
+            if (i / 256) % 3 == 0 { 0.0 } else { r.sym() }
+        }),
+    );
+    // sixteen-value groups four decades apart in one block: a group whose scale rounds to the code for zero keeps its
+    // search levels
+    add(
+        "group-magnitudes",
+        n,
+        rows,
+        fill(rng, &mut |r, i| {
+            r.sym() * 10f32.powi(-((i / 16 % 5) as i32))
+        }),
+    );
     out
+}
+
+/// ` in [a, b]` for the families that differ, nothing for none.
+fn names(fams: &[&str]) -> String {
+    if fams.is_empty() {
+        String::new()
+    } else {
+        format!(" in {fams:?}")
+    }
 }
 
 /// An importance row per expert: positive, with a zero in every 13 (a column the calibration never reached) and a
@@ -147,8 +175,9 @@ fn hw_kquant_rows_equal_ggml_with_and_without_importance() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let fams = families(&mut rng);
     let mut failures = 0usize;
-    for kt in [KType::Q4K, KType::Q5K, KType::Q6K, KType::Q8_0] {
+    for kt in [KType::Q3K, KType::Q4K, KType::Q5K, KType::Q6K, KType::Q8_0] {
         let (mut rows_total, mut differing) = ([0usize; 2], [0usize; 2]);
+        let mut red_families: [Vec<&str>; 2] = [Vec::new(), Vec::new()];
         for f in &fams {
             let per = f.rows.div_ceil(2);
             let n_exp = f.rows.div_ceil(per);
@@ -173,6 +202,9 @@ fn hw_kquant_rows_equal_ggml_with_and_without_importance() {
                     rows_total[k] += 1;
                     if got != want[r * rb..(r + 1) * rb] {
                         differing[k] += 1;
+                        if !red_families[k].contains(&f.name) {
+                            red_families[k].push(f.name);
+                        }
                         if differing[k] <= 3 {
                             let p = got
                                 .iter()
@@ -189,8 +221,13 @@ fn hw_kquant_rows_equal_ggml_with_and_without_importance() {
             }
         }
         println!(
-            "{kt:?}: with imatrix {} rows compared, {} differing; without {} rows compared, {} differing",
-            rows_total[0], differing[0], rows_total[1], differing[1]
+            "{kt:?}: with imatrix {} rows compared, {} differing{}; without {} rows compared, {} differing{}",
+            rows_total[0],
+            differing[0],
+            names(&red_families[0]),
+            rows_total[1],
+            differing[1],
+            names(&red_families[1])
         );
         failures += differing[0] + differing[1];
     }
@@ -206,7 +243,7 @@ fn hw_kquant_rate_one_thread() {
     let n = 7168usize;
     let x: Vec<f32> = (0..n * 64).map(|_| rng.sym() * 0.05).collect();
     let qw: Vec<f32> = (0..n).map(|_| rng.unit() + 0.01).collect();
-    for kt in [KType::Q4K, KType::Q5K, KType::Q6K, KType::Q8_0] {
+    for kt in [KType::Q3K, KType::Q4K, KType::Q5K, KType::Q6K, KType::Q8_0] {
         let t0 = std::time::Instant::now();
         for r in 0..64 {
             std::hint::black_box(

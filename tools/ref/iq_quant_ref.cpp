@@ -1,4 +1,4 @@
-// iq_quant_ref.cpp — ggml's IQ1_S / IQ2_XXS / Q4_K / Q5_K / Q6_K / Q8_0 quantizer as the oracle of gate_iq_quant
+// iq_quant_ref.cpp — ggml's IQ1_S / IQ2_XXS / Q3_K / Q4_K / Q5_K / Q6_K / Q8_0 quantizer as the oracle of gate_iq_quant
 // (bloomery_gpu::iq_quant, gguf::iq_quant and gguf::kquant).
 //
 // Links the K3.1 quantization tree's libggml-base (tools/ref/build-k3-quant-tree.sh, pin 78feec062): the library
@@ -6,8 +6,8 @@
 //
 //   iq_quant_ref <in> <out>
 //
-// <in>, little-endian: the magic "IQQ1"; u32 dst type and u32 src type (ggml ids: IQ2_XXS 16, IQ1_S 19, Q8_0 8, Q4_K 12,
-// Q5_K 13, Q6_K 14 / F32 0, F16 1, BF16 30, MXFP4 39); u64 n_per_row, nrows, rows_per_expert, n_expert; then nrows source
+// <in>, little-endian: the magic "IQQ1"; u32 dst type and u32 src type (ggml ids: IQ2_XXS 16, IQ1_S 19, Q8_0 8, Q3_K 11,
+// Q4_K 12, Q5_K 13, Q6_K 14 / F32 0, F16 1, BF16 30, MXFP4 39); u64 n_per_row, nrows, rows_per_expert, n_expert; then nrows source
 // rows of the src type; then n_expert x n_per_row f32 importance values. n_expert 0 means no importance matrix (a null
 // quant_weights, ggml's `_ref` rules for the K types); the IQ types refuse it as llama-quantize does. The source rows are widened to f32 by ggml's own to_float (what
 // llama-quantize does to a tensor it requantizes), and each expert's rows are quantized by ggml_quantize_chunk with
@@ -47,8 +47,8 @@ int main(int argc, char ** argv) {
     const auto dt = (ggml_type) dst;
     const auto st = (ggml_type) src;
     const bool iq = dt == GGML_TYPE_IQ1_S || dt == GGML_TYPE_IQ2_XXS;
-    if (!iq && dt != GGML_TYPE_Q4_K && dt != GGML_TYPE_Q5_K && dt != GGML_TYPE_Q6_K && dt != GGML_TYPE_Q8_0) {
-        return fail("dst type is none of IQ1_S, IQ2_XXS, Q4_K, Q5_K, Q6_K and Q8_0");
+    if (!iq && dt != GGML_TYPE_Q3_K && dt != GGML_TYPE_Q4_K && dt != GGML_TYPE_Q5_K && dt != GGML_TYPE_Q6_K && dt != GGML_TYPE_Q8_0) {
+        return fail("dst type is none of IQ1_S, IQ2_XXS, Q3_K, Q4_K, Q5_K, Q6_K and Q8_0");
     }
     if (iq && nexp == 0) {
         return fail("an IQ dst type needs an importance matrix");

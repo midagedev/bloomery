@@ -51,6 +51,7 @@ pub fn ggml_id(ty: GgmlType) -> u32 {
         GgmlType::F32 => 0,
         GgmlType::F16 => 1,
         GgmlType::Q8_0 => 8,
+        GgmlType::Q3_K => 11,
         GgmlType::Q4_K => 12,
         GgmlType::Q5_K => 13,
         GgmlType::Q6_K => 14,

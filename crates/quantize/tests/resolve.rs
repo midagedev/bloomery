@@ -123,12 +123,36 @@ fn what_the_port_does_not_write_is_refused_by_name() {
     let e = run(&odd, "", &M64, &opts(Ftype::Q4KM)).unwrap_err();
     assert!(e.to_string().contains("300"), "{e}");
     // a rule type the port does not write
-    assert!(Rules::parse("x=q3_k").is_ok());
-    assert!(run(&names, "blk=q3_k", &M64, &opts(Ftype::Q4KM)).is_err());
+    assert!(Rules::parse("x=q2_k").is_ok());
+    assert!(run(&names, "blk=q2_k", &M64, &opts(Ftype::Q4KM)).is_err());
     // a layer the counters cannot place
     let bad = [("blk.9.ffn_down.weight", D, B)];
     let e = run(&bad, "", &M64, &opts(Ftype::Q4KM)).unwrap_err();
     assert!(e.to_string().contains("Bad layer 9"), "{e}");
+}
+
+#[test]
+fn a_rule_naming_q3_k_types_the_stacks_and_a_row_off_its_blocks_is_refused() {
+    let stack: &[u64] = &[512, 4, 8];
+    let names = [
+        ("blk.0.ffn_gate_exps.weight", stack, B),
+        ("blk.0.ffn_up_exps.weight", stack, B),
+        ("blk.0.ffn_down_exps.weight", stack, B),
+    ];
+    let t = run(
+        &names,
+        "ffn_(gate|up)_exps=q3_k ffn_down_exps=q4_k",
+        &M64,
+        &opts(Ftype::Q4KM),
+    )
+    .unwrap();
+    assert_eq!(t, [GgmlType::Q3_K, GgmlType::Q3_K, GgmlType::Q4_K]);
+    let odd = [("blk.0.ffn_gate_exps.weight", &[300u64, 4, 8][..], B)];
+    let e = run(&odd, "ffn_gate_exps=q3_k", &M64, &opts(Ftype::Q4KM)).unwrap_err();
+    assert!(
+        e.to_string().contains("300") && e.to_string().contains("Q3_K"),
+        "{e}"
+    );
 }
 
 #[test]

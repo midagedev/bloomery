@@ -119,6 +119,7 @@ impl Backend for HostBackend {
 /// first block whose scale is not is named.
 pub fn validate_blocks(dst: GgmlType, bytes: &[u8]) -> Result<(), String> {
     let (block, fields): (usize, &[usize]) = match dst {
+        GgmlType::Q3_K => (110, &[108]),
         GgmlType::Q4_K => (144, &[0, 2]),
         GgmlType::Q5_K => (176, &[0, 2]),
         GgmlType::Q6_K => (210, &[208]),
@@ -190,4 +191,19 @@ pub fn convert_rows(
 #[must_use]
 pub fn pool_threads() -> usize {
     threads::pool().threads()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_q3_k_block_whose_scale_is_not_finite_is_named() {
+        let mut two = vec![0u8; 2 * 110];
+        validate_blocks(GgmlType::Q3_K, &two).unwrap();
+        // the f16 +Inf in block 1's `d`, the last two bytes of the block
+        two[110 + 108..220].copy_from_slice(&0x7c00u16.to_le_bytes());
+        let e = validate_blocks(GgmlType::Q3_K, &two).unwrap_err();
+        assert!(e.contains("block 1"), "{e}");
+    }
 }

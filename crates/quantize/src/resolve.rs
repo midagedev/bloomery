@@ -100,6 +100,7 @@ impl Ftype {
 pub fn parse_type(s: &str) -> Result<GgmlType> {
     Ok(match s.to_ascii_uppercase().as_str() {
         "F32" => GgmlType::F32,
+        "Q3_K" => GgmlType::Q3_K,
         "Q4_K" => GgmlType::Q4_K,
         "Q5_K" => GgmlType::Q5_K,
         "Q6_K" => GgmlType::Q6_K,
@@ -108,7 +109,7 @@ pub fn parse_type(s: &str) -> Result<GgmlType> {
         "IQ2_XXS" => GgmlType::IQ2_XXS,
         o => {
             return Err(Error::refused(format!(
-                "type {o}: the quantizer writes F32, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS"
+                "type {o}: the quantizer writes F32, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS"
             )));
         }
     })

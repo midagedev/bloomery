@@ -59,7 +59,7 @@ usage:
   --sensitivity TSV      with --fit: the table tools/ref/qfit.py measures (class layers type dkld se positions)
   --fit-out FILE         with --fit: the rules file to write (an existing file is refused)
 
-Types are written for F32, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS and the architectures kimi-k3 and exaone-moe;
+Types are written for F32, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS and the architectures kimi-k3 and exaone-moe;
 anything else is refused by name.
 
 exit: 0 done; 1 a refusal, named (a source row that is not finite, an imatrix entry that is unusable, a type this
@@ -442,7 +442,7 @@ mod tests {
             &["in", "out", "q4_k_m", "--cpu", "--card", "0"],
             &["in", "out", "q4_k_m", "--cpu", "--check", "2"],
             &["in", "out", "q2_k"],
-            &["in", "out", "q4_k_m", "--output-tensor-type", "q3_k"],
+            &["in", "out", "q4_k_m", "--output-tensor-type", "q2_k"],
             &["in", "out", "q4_k_m", "--batch", "0"],
             &["in", "out", "q4_k_m", "--bogus"],
             &["in", "out", "q4_k_m", "--imatrix"],

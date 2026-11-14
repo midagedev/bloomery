@@ -141,6 +141,19 @@ fn hw_plan_equals_llama_quantize_dry_run() {
             keep_split: false,
         },
     );
+    // the trunk weights at Q3_K by rule: a rule type needs nothing of the plan beyond the type list
+    equal(
+        &lq,
+        &dir,
+        &Case {
+            tag: "fixture-q3k",
+            input: &src,
+            rules: &common::k31_rules("q3_k"),
+            ftype: "Q4_K_M",
+            token_embedding: "q4_k",
+            keep_split: false,
+        },
+    );
     let shape = env_path("K3Q_PLAN_IN", "");
     let tight_rules = env_path("K3Q_PLAN_RULES", "");
     if shape.is_file() && tight_rules.is_file() {
