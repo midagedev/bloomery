@@ -9,9 +9,16 @@
 //! - `q8_0p_<shape>_t<t>`: the Q8_0-plane GEMM, `gemm_q8_0p` against `gemm_q8_0p_slab` (`enqueue_gemm32_entry`), on the
 //!   dense prompt projections, the stacks around the slab entry's wave, and two routed 512-expert stacks.
 //! - `f32_<rows>_m<m>`, `bf16_<rows>_m<m>`: the exact tile against `ceil(m / 8)` launches of the gemv.
+//! - `fewrow_<type>_<what>_<rows>x<k>`: what one verify pass of a dense MTP model asks of a matrix at one, two, four and
+//!   eight columns, every width on the same weights in one row: the engine's walk (`eng_m<m>`: the per-slot `_sel` entries
+//!   the dense FFN launches with `n_slots = m`, the `m` one-column launches of the head, the read-once m-column cores
+//!   elsewhere) and, where the engine's walk is not a read-once core, that core on the same weights (`mcol_m<m>`). The
+//!   `kcal few` row carries each arm's µs a launch and its ratio to the same walk's m = 1 (`<arm>_vs_<m1 arm>`), plus every
+//!   arm over `eng_m1`. `--check` holds every width's column c bit-equal to the one-column launch of x column c.
 //!
 //! Every candidate of a configuration gives the same bits (checked on their first launch, a mismatch is a named error, an
-//! all-zero result too). `--check` stops there and needs no timing lease. `--time` (lead-only, through
+//! all-zero result too; a `fewrow` group's arms of unequal widths are held to the one-column oracle, non-finite bits and
+//! columns that do not differ being named errors). `--check` stops there and needs no timing lease. `--time` (lead-only, through
 //! `tools/ref/bench-picks.sh`, which owns the lease and the witness blocks) then times each candidate's eager burst and
 //! graph replay with `shared/bench.rs`'s instrument (`bench op=` rows) and runs [`PAIR_ROUNDS`] rounds in which the
 //! candidates and a second capture of the first (the A/A arm, the instrument's own spread) take turns in rotating
@@ -33,17 +40,20 @@ mod picks {
     use crate::bench_arm::{
         GREPS, N, ROUNDS, burst, fill_pattern, fill_pattern_f32, print_arm, replay,
     };
+    use bloomery_gpu::arch::qwen3moe::experts::{ExpertKernels, GateUpArgs};
     use bloomery_gpu::autotune::Mcol;
     use bloomery_gpu::gemm::{
         GEMM_BN, Gemm32Args, Gemm32Kernels, Gemm32Weight, GemmAct32, GemmInput, GemmKernels,
         GemmRoute, Q8_0pEntry,
     };
+    use bloomery_gpu::q6k_sel::Q6kSelKernels;
     use bloomery_gpu::q8f32::{
         E4m3GemvArgs, E4m3Scales, E4m3Weight, GemvOut, Q8F32Kernels, e4m3_planes,
     };
-    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Window, WindowMut};
+    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Q8Act, Window, WindowMut};
     use bloomery_gpu_gates::{GateError, GateRng};
     use cuda_core::{CudaStream, DeviceBuffer};
+    use std::cell::RefCell;
     use std::fmt::Write as _;
     use std::time::Instant;
 
@@ -69,10 +79,36 @@ mod picks {
         Chunked,
     }
 
+    /// Reads a candidate's output back in its own layout when the output is not one buffer `y`.
+    type Readback<'a> =
+        Box<dyn Fn(&CudaStream, &DeviceBuffer<f32>) -> Result<Vec<f32>, GpuError> + 'a>;
+
+    /// The reference every width of a `fewrow` group is held to: `[column][row]` bits of the one-column launches of the
+    /// group's columns.
+    type Oracle<'a> = Box<dyn Fn(&CudaStream) -> Result<Vec<u32>, GpuError> + 'a>;
+
     struct Cand<'a> {
         name: &'static str,
         layout: Layout,
         enq: Enq<'a>,
+        /// Columns the candidate writes; 0 is the configuration's `m`.
+        cols: usize,
+        /// The candidate whose time this one's ratio is also taken against; empty when none.
+        base: &'static str,
+        readback: Option<Readback<'a>>,
+    }
+
+    impl<'a> Cand<'a> {
+        fn new(name: &'static str, layout: Layout, enq: Enq<'a>) -> Self {
+            Cand {
+                name,
+                layout,
+                enq,
+                cols: 0,
+                base: "",
+                readback: None,
+            }
+        }
     }
 
     /// One configuration: the arm's label, the fields every row prints, and what the timing needs of it.
@@ -192,16 +228,61 @@ mod picks {
 
     /// Check `cands` give one answer and, under `--time`, time them: the `bench op=` rows, then the paired rounds.
     fn run_cfg(gpu: &Gpu, o: &Opts, cfg: &Cfg, cands: &[Cand<'_>]) -> Result<(), GateError> {
+        run_cfg_with(gpu, o, cfg, cands, None)
+    }
+
+    /// [`run_cfg`] with an `oracle` the candidates' columns are held to in place of the first candidate's: each
+    /// candidate's `[column][row]` bits must be a prefix of it, and it must be finite with its columns told apart.
+    fn run_cfg_with(
+        gpu: &Gpu,
+        o: &Opts,
+        cfg: &Cfg,
+        cands: &[Cand<'_>],
+        oracle: Option<&Oracle<'_>>,
+    ) -> Result<(), GateError> {
         let stream = gpu.stream();
-        let y_len = cfg.rows * cfg.m;
+        let cols_of = |j: usize| match cands[j.min(cands.len() - 1)].cols {
+            0 => cfg.m,
+            n => n,
+        };
         let mut ys = (0..=cands.len())
-            .map(|_| DeviceBuffer::<f32>::zeroed(stream, y_len))
+            .map(|j| {
+                DeviceBuffer::<f32>::zeroed(
+                    stream,
+                    cfg.rows * cols_of(if j < cands.len() { j } else { 0 }),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
+        let reference = match oracle {
+            Some(f) => {
+                let want = f(stream)?;
+                if let Some(i) = want.iter().position(|&b| !f32::from_bits(b).is_finite()) {
+                    return Err(format!(
+                        "bench_picks: {}: the one-column oracle holds a non-finite value at output {i}",
+                        cfg.label
+                    )
+                    .into());
+                }
+                if want.len() > cfg.rows && want[..cfg.rows] == want[cfg.rows..2 * cfg.rows] {
+                    return Err(format!(
+                        "bench_picks: {}: the oracle's first two columns are equal, so a wrong column would pass",
+                        cfg.label
+                    )
+                    .into());
+                }
+                Some(want)
+            }
+            None => None,
+        };
         let mut first: Option<Vec<u32>> = None;
         for (j, c) in cands.iter().enumerate() {
             (c.enq)(stream, 0, &mut ys[j])?;
             stream.synchronize()?;
-            let got = canon(c.layout, &ys[j].to_host_vec(stream)?, cfg.rows, cfg.m);
+            let host = match &c.readback {
+                Some(f) => f(stream, &ys[j])?,
+                None => ys[j].to_host_vec(stream)?,
+            };
+            let got = canon(c.layout, &host, cfg.rows, cols_of(j));
             if got.iter().all(|&b| b == 0) {
                 return Err(format!(
                     "bench_picks: {}: {} wrote only zero bits, so the launch did not run",
@@ -209,26 +290,51 @@ mod picks {
                 )
                 .into());
             }
-            match &first {
-                None => first = Some(got),
-                Some(want) => {
-                    if let Some(i) = (0..want.len()).find(|&i| want[i] != got[i]) {
-                        return Err(format!(
-                            "bench_picks: {}: {} and {} differ at output {i}: {:#010x} against {:#010x}",
-                            cfg.label, cands[0].name, c.name, want[i], got[i]
-                        )
-                        .into());
-                    }
-                }
+            if reference.is_some() && got.iter().any(|&b| !f32::from_bits(b).is_finite()) {
+                return Err(format!(
+                    "bench_picks: {}: {} wrote a non-finite value",
+                    cfg.label, c.name
+                )
+                .into());
+            }
+            if reference.is_none() && first.is_none() {
+                first = Some(got);
+                continue;
+            }
+            let (want_name, want) = match &reference {
+                Some(r) => ("the one-column oracle", r.as_slice()),
+                None => (cands[0].name, first.as_deref().unwrap_or_default()),
+            };
+            if got.len() > want.len() {
+                return Err(format!(
+                    "bench_picks: {}: {} writes {} values, the reference {want_name} holds {}",
+                    cfg.label,
+                    c.name,
+                    got.len(),
+                    want.len()
+                )
+                .into());
+            }
+            if let Some(i) = (0..got.len()).find(|&i| want[i] != got[i]) {
+                return Err(format!(
+                    "bench_picks: {}: {want_name} and {} differ at output {i}: {:#010x} against {:#010x}",
+                    cfg.label, c.name, want[i], got[i]
+                )
+                .into());
             }
         }
         if !o.time {
             println!(
-                "kcal check label={} family={} {} cands={} bits=equal",
+                "kcal check label={} family={} {} cands={} bits=equal{}",
                 cfg.label,
                 cfg.family,
                 cfg.fields,
                 cands.iter().map(|c| c.name).collect::<Vec<_>>().join(","),
+                if reference.is_some() {
+                    " against=one_column_oracle"
+                } else {
+                    ""
+                },
             );
             return Ok(());
         }
@@ -316,7 +422,30 @@ mod picks {
                 cands[0].name, cands[0].name
             );
         }
-        let kind = if cands.len() == 1 { "single" } else { "pair" };
+        // Each width over the same walk's one-column launch.
+        for (a, c) in cands.iter().enumerate().filter(|(_, c)| !c.base.is_empty()) {
+            let b = cands.iter().position(|x| x.name == c.base).ok_or_else(|| {
+                format!(
+                    "bench_picks: {}: {} names no base {}",
+                    cfg.label, c.name, c.base
+                )
+            })?;
+            let ratios: Vec<f64> = us[a].iter().zip(&us[b]).map(|(x, y)| x / y).collect();
+            let (mean, sd) = mean_sd(&ratios);
+            let _ = write!(
+                row,
+                " {}_vs_{}={mean:.4} {}_vs_{}_sd={sd:.4}",
+                c.name, c.base, c.name, c.base
+            );
+        }
+        // A `fewrow` group's row is its own kind: `tools/ref/kernel-model.py` reads `pair` and `single` rows by family.
+        let kind = if cfg.family == "fewrow" {
+            "few"
+        } else if cands.len() == 1 {
+            "single"
+        } else {
+            "pair"
+        };
         println!(
             "kcal {kind} label={} family={} {} m={} a={} b={} rule={} bytes={} copies={} reps={reps} rounds={PAIR_ROUNDS}{row}",
             cfg.label,
@@ -456,14 +585,16 @@ mod picks {
                 };
                 let cands: Vec<Cand<'_>> = ways
                     .iter()
-                    .map(|&way| Cand {
-                        name: if way == Mcol::Rule {
-                            engine
-                        } else {
-                            way.word()
-                        },
-                        layout: Layout::Col,
-                        enq: mxfp8_enq(q8, &ws, &x, m, way),
+                    .map(|&way| {
+                        Cand::new(
+                            if way == Mcol::Rule {
+                                engine
+                            } else {
+                                way.word()
+                            },
+                            Layout::Col,
+                            mxfp8_enq(q8, &ws, &x, m, way),
+                        )
                     })
                     .collect();
                 let cfg = Cfg {
@@ -597,16 +728,8 @@ mod picks {
             )
         };
         let cands = [
-            Cand {
-                name: "plain",
-                layout: Layout::Col,
-                enq: enq(Q8_0pEntry::Plain),
-            },
-            Cand {
-                name: "slab",
-                layout: Layout::Col,
-                enq: enq(Q8_0pEntry::Slab),
-            },
+            Cand::new("plain", Layout::Col, enq(Q8_0pEntry::Plain)),
+            Cand::new("slab", Layout::Col, enq(Q8_0pEntry::Slab)),
         ];
         let cfg = Cfg {
             label,
@@ -792,20 +915,423 @@ mod picks {
                         },
                     };
                     let cands = [
-                        Cand {
-                            name: "gemv",
-                            layout: Layout::Chunked,
-                            enq: gemv,
-                        },
-                        Cand {
-                            name: "tile",
-                            layout: Layout::Col,
-                            enq: tile,
-                        },
+                        Cand::new("gemv", Layout::Chunked, gemv),
+                        Cand::new("tile", Layout::Col, tile),
                     ];
                     run_cfg(gpu, o, &cfg, &cands)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Columns of the activation every `fewrow` arm draws from, and the widths it times.
+    const FEW_COLS: usize = 8;
+    const FEW_MS: [usize; 4] = [1, 2, 4, 8];
+    const ENG: [&str; 4] = ["eng_m1", "eng_m2", "eng_m4", "eng_m8"];
+    const MCOL: [&str; 4] = ["mcol_m1", "mcol_m2", "mcol_m4", "mcol_m8"];
+
+    /// What a `fewrow` group's matrix is and which entry the engine launches it with.
+    #[derive(Clone, Copy)]
+    enum Few {
+        /// The dense FFN's Q4_K gate and up: the gate·up·SwiGLU `_sel` entry over one expert, a slot a column.
+        GateUp,
+        /// The dense FFN's Q4_K down: `q4k_gemv_sel`, a slot a column.
+        DownQ4k,
+        /// The dense FFN's Q6_K down: `q6k_gemv_sel`, a slot a column.
+        DownQ6k,
+        /// The Q6_K head: one one-column launch a verify row.
+        HeadQ6k,
+        /// The delta layers' Q6_K qkv: `q6k_gemv`, one m-column launch.
+        QkvQ6k,
+        /// A Q8_0 attention projection: `q8_0_gemv`, `q8_0_gemv_mcol` past one column.
+        AttnQ8,
+    }
+
+    /// The groups `(label, kind, rows, k)`: the Qwen3.8-27B Q4_K_M file's FFN, head and delta qkv, and K-EXAONE's Q8_0
+    /// attention query, the largest of their types by bytes a pass.
+    const FEW_GROUPS: [(&str, Few, usize, usize); 6] = [
+        ("q4k_gateup_17408x5120", Few::GateUp, 17_408, 5120),
+        ("q4k_down_5120x17408", Few::DownQ4k, 5120, 17_408),
+        ("q6k_down_5120x17408", Few::DownQ6k, 5120, 17_408),
+        ("q6k_head_248320x5120", Few::HeadQ6k, 248_320, 5120),
+        ("q6k_qkv_10240x5120", Few::QkvQ6k, 10_240, 5120),
+        ("q8_0_attnq_8192x6144", Few::AttnQ8, 8192, 6144),
+    ];
+
+    /// A finite f16 scale in [2^-7, 2^-6): the pattern's low bits as the mantissa.
+    fn f16_scale(w: u32) -> u32 {
+        0x2000 | (w & 0x03ff)
+    }
+
+    /// `rows` Q4_K rows of `k` values: the pattern with each super-block's `d` and `dmin` finite.
+    fn q4k_words(rows: usize, k: usize, salt: u32) -> Vec<u32> {
+        let mut w = fill_pattern(rows * 36 * (k / 256));
+        for (i, v) in w.iter_mut().enumerate() {
+            *v ^= salt;
+            if i % 36 == 0 {
+                *v = f16_scale(*v) | (f16_scale(*v >> 3) << 16);
+            }
+        }
+        w
+    }
+
+    /// `rows` Q6_K rows of `k` values (`k / 256` even): the pattern with each super-block's `d` finite.
+    fn q6k_words(rows: usize, k: usize) -> Vec<u32> {
+        let n_sb = k / 256;
+        let mut w = fill_pattern(rows * 210 * n_sb / 4);
+        for sb in 0..rows * n_sb {
+            // `d` is the last two bytes of the 210-byte super-block, so on a 2-byte boundary of a word.
+            let at = sb * 210 + 208;
+            let (i, shift) = (at / 4, (at % 4) * 8);
+            w[i] = (w[i] & !(0xFFFF << shift)) | (f16_scale(w[i].rotate_left(7)) << shift);
+        }
+        w
+    }
+
+    /// The activation's `FEW_COLS` columns on the card, its q8_1 form at each width of [`FEW_MS`] and column by column.
+    struct FewIn {
+        x: Vec<DeviceBuffer<f32>>,
+        by_m: Vec<Q8Act>,
+        by_col: Vec<Q8Act>,
+    }
+
+    impl FewIn {
+        /// Columns of `k` values each: `x[i]` is the first `FEW_MS[i]` columns, `col[c]` column `c`; a K-quant `k` (a
+        /// multiple of 256) also gets the quantized forms.
+        fn new(
+            gpu: &Gpu,
+            k: usize,
+            quantize: bool,
+        ) -> Result<(FewIn, Vec<DeviceBuffer<f32>>), GateError> {
+            let stream = gpu.stream();
+            let host = fill_pattern_f32(FEW_COLS * k);
+            let x = FEW_MS
+                .iter()
+                .map(|&m| DeviceBuffer::from_host(stream, &host[..m * k]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let col = (0..FEW_COLS)
+                .map(|c| DeviceBuffer::from_host(stream, &host[c * k..(c + 1) * k]))
+                .collect::<Result<Vec<_>, _>>()?;
+            let (mut by_m, mut by_col) = (Vec::new(), Vec::new());
+            if quantize {
+                for (&m, xm) in FEW_MS.iter().zip(&x) {
+                    let mut a = Q8Act::with_k(stream, m, k)?;
+                    gpu.enqueue_quantize_q8_1(xm, &mut a)?;
+                    by_m.push(a);
+                }
+                for xc in &col {
+                    let mut a = Q8Act::with_k(stream, 1, k)?;
+                    gpu.enqueue_quantize_q8_1(xc, &mut a)?;
+                    by_col.push(a);
+                }
+                stream.synchronize()?;
+            }
+            Ok((FewIn { x, by_m, by_col }, col))
+        }
+    }
+
+    /// The oracle of `rows` output rows: `one(stream, c, y)` launches the walk's one-column form on column `c`.
+    fn few_oracle<'a>(
+        rows: usize,
+        one: impl Fn(&CudaStream, usize, &mut DeviceBuffer<f32>) -> Result<(), GpuError> + 'a,
+    ) -> Oracle<'a> {
+        Box::new(move |s| {
+            let mut out = Vec::with_capacity(rows * FEW_COLS);
+            for c in 0..FEW_COLS {
+                let mut y = DeviceBuffer::<f32>::zeroed(s, rows)?;
+                one(s, c, &mut y)?;
+                s.synchronize()?;
+                out.extend(y.to_host_vec(s)?.iter().map(|v| v.to_bits()));
+            }
+            Ok(out)
+        })
+    }
+
+    /// The head's engine arm at `m` columns: `m` one-column launches, each into a buffer of its own as each verify row's
+    /// head has, read back as the `m` columns.
+    fn few_head_arm<'a>(
+        gpu: &'a Gpu,
+        ws: &'a [DeviceTensor<u32>],
+        cols: &'a [Q8Act],
+        (rows, m): (usize, usize),
+    ) -> Result<Cand<'a>, GateError> {
+        let scratch = std::rc::Rc::new(RefCell::new(
+            (0..m)
+                .map(|_| DeviceBuffer::<f32>::zeroed(gpu.stream(), rows))
+                .collect::<Result<Vec<_>, _>>()?,
+        ));
+        let (run, read) = (scratch.clone(), scratch);
+        let mut cand = Cand::new(
+            ENG[FEW_MS.iter().position(|&x| x == m).unwrap_or(0)],
+            Layout::Col,
+            Box::new(move |s, c, _| {
+                let mut ys = run.borrow_mut();
+                for (j, y) in ys.iter_mut().enumerate() {
+                    gpu.enqueue_gemv_q6k_on(s, &ws[c % ws.len()], &cols[j], y)?;
+                }
+                Ok(())
+            }),
+        );
+        cand.cols = m;
+        cand.readback = Some(Box::new(move |s, _| {
+            let mut out = Vec::with_capacity(rows * m);
+            for y in read.borrow().iter() {
+                out.extend(y.to_host_vec(s)?);
+            }
+            Ok(out)
+        }));
+        Ok(cand)
+    }
+
+    /// The few-column probe: each group of [`FEW_GROUPS`] on one set of weights at one, two, four and eight columns.
+    fn fewrow(gpu: &Gpu, o: &Opts) -> Result<(), GateError> {
+        let stream = gpu.stream();
+        let sink = gpu.unlabelled_sink();
+        for (label, kind, rows, k) in FEW_GROUPS {
+            let label = format!("fewrow_{label}");
+            if !o.keeps(&label) {
+                continue;
+            }
+            let n_sb = k / 256;
+            let (inp, cols) = FewIn::new(gpu, k, !matches!(kind, Few::AttnQ8))?;
+            let sel = DeviceBuffer::<u32>::from_host(stream, &[0u32; FEW_COLS])?;
+            let upload = |words: &[u32], wpr: usize| -> Result<DeviceTensor<u32>, GpuError> {
+                DeviceTensor::upload(stream, words, rows, wpr)
+            };
+            let (ek, q6) = (
+                ExpertKernels::load(gpu.context())?,
+                Q6kSelKernels::load(gpu.context(), gpu.fault_word())?,
+            );
+            let (ek, q6, sel, inp, cols) = (&ek, &q6, &sel, &inp, &cols);
+            // The weights are declared before the arms built over them, so they drop after.
+            let (gu, q4, q6w, q8w);
+            let q8 = gpu.q8f32();
+            let mut cands: Vec<Cand<'_>> = Vec::new();
+            let (oracle, bytes, copies_n, walk): (Oracle<'_>, u64, usize, &str);
+            match kind {
+                Few::GateUp => {
+                    let b = (2 * rows * 144 * n_sb) as u64;
+                    let host = (
+                        q4k_words(rows, k, 0x1111_1111),
+                        q4k_words(rows, k, 0x2222_2222),
+                    );
+                    gu = (0..copies(b))
+                        .map(|_| Ok((upload(&host.0, 36 * n_sb)?, upload(&host.1, 36 * n_sb)?)))
+                        .collect::<Result<Vec<_>, GpuError>>()?;
+                    let launch = move |s: &CudaStream,
+                                       w: &(DeviceTensor<u32>, DeviceTensor<u32>),
+                                       mi: Option<usize>,
+                                       c: usize,
+                                       y: &mut DeviceBuffer<f32>| {
+                        let (act, n_slots) = match mi {
+                            Some(i) => (&inp.by_m[i], FEW_MS[i]),
+                            None => (&inp.by_col[c], 1),
+                        };
+                        ek.enqueue_gate_up(
+                            s,
+                            GateUpArgs {
+                                wg: &w.0,
+                                wu: &w.1,
+                                act,
+                                sel,
+                                n_slots,
+                                rows_per_expert: rows,
+                                fault: sink,
+                                h: y,
+                            },
+                        )
+                    };
+                    let g = &gu;
+                    for (i, name) in ENG.into_iter().enumerate() {
+                        let mut c = Cand::new(
+                            name,
+                            Layout::Col,
+                            Box::new(move |s, n, y| launch(s, &g[n % g.len()], Some(i), 0, y)),
+                        );
+                        c.cols = FEW_MS[i];
+                        c.base = if i == 0 { "" } else { ENG[0] };
+                        cands.push(c);
+                    }
+                    oracle = few_oracle(rows, move |s, c, y| launch(s, &g[0], None, c, y));
+                    (bytes, copies_n, walk) = (b, gu.len(), "sel_gate_up");
+                }
+                Few::DownQ4k | Few::DownQ6k => {
+                    let is4 = matches!(kind, Few::DownQ4k);
+                    let b = (rows * if is4 { 144 * n_sb } else { 210 * n_sb }) as u64;
+                    if is4 {
+                        let host = q4k_words(rows, k, 0x3333_3333);
+                        q4 = (0..copies(b))
+                            .map(|_| upload(&host, 36 * n_sb))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        q6w = Vec::new();
+                    } else {
+                        let host = q6k_words(rows, k);
+                        q6w = (0..copies(b))
+                            .map(|_| upload(&host, 210 * n_sb / 4))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        q4 = Vec::new();
+                    }
+                    let ws = if is4 { &q4 } else { &q6w };
+                    // The engine's slot-a-column entry, and the plain m-column gemv beside it.
+                    let sel_launch =
+                        move |s: &CudaStream,
+                              w: &DeviceTensor<u32>,
+                              act: &Q8Act,
+                              n: usize,
+                              y: &mut DeviceBuffer<f32>| {
+                            if is4 {
+                                gpu.q4k_sel()
+                                    .enqueue_gemv_q4k_sel(s, w, act, sel, n, rows, y)
+                            } else {
+                                q6.enqueue_gemv_q6k_sel(s, w, act, sel, n, rows, y)
+                            }
+                        };
+                    let mcol_launch =
+                        move |s: &CudaStream,
+                              w: &DeviceTensor<u32>,
+                              act: &Q8Act,
+                              y: &mut DeviceBuffer<f32>| {
+                            if is4 {
+                                gpu.enqueue_gemv_q4k_on(s, w, act, y)
+                            } else {
+                                gpu.enqueue_gemv_q6k_on(s, w, act, y)
+                            }
+                        };
+                    for i in 0..FEW_MS.len() {
+                        let m = FEW_MS[i];
+                        let mut c = Cand::new(
+                            ENG[i],
+                            Layout::Col,
+                            Box::new(move |s, n, y| {
+                                sel_launch(s, &ws[n % ws.len()], &inp.by_m[i], m, y)
+                            }),
+                        );
+                        c.cols = m;
+                        c.base = if i == 0 { "" } else { ENG[0] };
+                        cands.push(c);
+                    }
+                    for i in 0..FEW_MS.len() {
+                        let mut c = Cand::new(
+                            MCOL[i],
+                            Layout::Chunked,
+                            Box::new(move |s, n, y| {
+                                mcol_launch(s, &ws[n % ws.len()], &inp.by_m[i], y)
+                            }),
+                        );
+                        c.cols = FEW_MS[i];
+                        c.base = if i == 0 { "" } else { MCOL[0] };
+                        cands.push(c);
+                    }
+                    oracle = few_oracle(rows, move |s, c, y| {
+                        mcol_launch(s, &ws[0], &inp.by_col[c], y)
+                    });
+                    (bytes, copies_n, walk) = (
+                        b,
+                        ws.len(),
+                        if is4 {
+                            "sel_q4k_and_mcol"
+                        } else {
+                            "sel_q6k_and_mcol"
+                        },
+                    );
+                }
+                Few::HeadQ6k | Few::QkvQ6k => {
+                    let b = (rows * 210 * n_sb) as u64;
+                    let host = q6k_words(rows, k);
+                    q6w = (0..copies(b))
+                        .map(|_| upload(&host, 210 * n_sb / 4))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let ws = &q6w;
+                    let head = matches!(kind, Few::HeadQ6k);
+                    for i in 0..FEW_MS.len() {
+                        let m = FEW_MS[i];
+                        let mut c = if head {
+                            few_head_arm(gpu, ws, &inp.by_col, (rows, m))?
+                        } else {
+                            let mut c = Cand::new(
+                                ENG[i],
+                                Layout::Chunked,
+                                Box::new(move |s, n, y| {
+                                    gpu.enqueue_gemv_q6k_on(s, &ws[n % ws.len()], &inp.by_m[i], y)
+                                }),
+                            );
+                            c.cols = m;
+                            c
+                        };
+                        c.base = if i == 0 { "" } else { ENG[0] };
+                        cands.push(c);
+                    }
+                    if head {
+                        for i in 0..FEW_MS.len() {
+                            let mut c = Cand::new(
+                                MCOL[i],
+                                Layout::Chunked,
+                                Box::new(move |s, n, y| {
+                                    gpu.enqueue_gemv_q6k_on(s, &ws[n % ws.len()], &inp.by_m[i], y)
+                                }),
+                            );
+                            c.cols = FEW_MS[i];
+                            c.base = if i == 0 { "" } else { MCOL[0] };
+                            cands.push(c);
+                        }
+                    }
+                    oracle = few_oracle(rows, move |s, c, y| {
+                        gpu.enqueue_gemv_q6k_on(s, &ws[0], &inp.by_col[c], y)
+                    });
+                    (bytes, copies_n, walk) = (
+                        b,
+                        ws.len(),
+                        if head {
+                            "one_column_launches_and_mcol"
+                        } else {
+                            "mcol"
+                        },
+                    );
+                }
+                Few::AttnQ8 => {
+                    q8w = q8_planes(gpu, rows, k)?;
+                    let ws = &q8w;
+                    let b = (rows * (k + 2 * (k / 32))) as u64;
+                    for i in 0..FEW_MS.len() {
+                        let m = FEW_MS[i];
+                        let mut c = Cand::new(
+                            ENG[i],
+                            Layout::Chunked,
+                            Box::new(move |s, n, y| {
+                                let w = &ws[n % ws.len()];
+                                q8.enqueue_q8_0_gemv(s, &w.0, &w.1, &inp.x[i], m, y)
+                            }),
+                        );
+                        c.cols = m;
+                        c.base = if i == 0 { "" } else { ENG[0] };
+                        cands.push(c);
+                    }
+                    oracle = few_oracle(rows, move |s, c, y| {
+                        q8.enqueue_q8_0_gemv(s, &ws[0].0, &ws[0].1, &cols[c], 1, y)
+                    });
+                    (bytes, copies_n, walk) = (b, ws.len(), "mcol");
+                }
+            }
+            let cfg = Cfg {
+                label,
+                family: "fewrow",
+                fields: format!(
+                    "shape={} rows={rows} k={k} experts=1 slots={FEW_COLS} ms=1,2,4,8 walk={walk}",
+                    FEW_GROUPS
+                        .iter()
+                        .find(|g| g.2 == rows
+                            && g.3 == k
+                            && std::mem::discriminant(&g.1) == std::mem::discriminant(&kind))
+                        .map_or("", |g| g.0),
+                ),
+                rows,
+                m: FEW_COLS,
+                copies: copies_n,
+                bytes,
+                rule: "-",
+            };
+            run_cfg_with(gpu, o, &cfg, &cands, Some(&oracle))?;
         }
         Ok(())
     }
@@ -818,6 +1344,7 @@ mod picks {
         mxfp8(&gpu, &o)?;
         q8(&gpu, &o, &g32)?;
         wide(&gpu, &o, &g32)?;
+        fewrow(&gpu, &o)?;
         Ok(())
     }
 }
