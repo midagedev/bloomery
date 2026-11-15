@@ -3,6 +3,7 @@
 //! ggml's own order (one row at a time, k ascending): a different order moves
 //! the last bit, which is what lets the gates stay tight.
 
+use crate::down_tap::DownTap;
 use crate::ffn::swiglu_timed;
 use crate::moe::TierSlots;
 use crate::profile;
@@ -5130,6 +5131,8 @@ impl CcdCut {
 // is formed here, then quantized into the slot.
 thread_local! {
     static PAR_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    // The tap pass's per-worker rows: a slot's combine, then the running sums of its expert's squares.
+    static TAP_BUF: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Columns up to which a union call sums on the caller: the decode and verify
@@ -5594,71 +5597,87 @@ impl UnionStack {
     }
 }
 
-/// Where a union call's combines come from and go: slot `q` of expert `d` is
-/// its form's combine — `silu(gate) · up` (clamped with the limit), the OAI or the SiTU
-/// rule of its gate and up columns, or `relu(up)²` of its up column — in `gu`, quantized
-/// in `ty`'s encoding into slot `q` of `qc`.
+/// Where a union call's combines come from: slot `q` of expert `d` is its form's combine — `silu(gate) ·
+/// up` (clamped with the limit), the OAI or the SiTU rule of its gate and up columns, or `relu(up)²` of its up
+/// column — in `gu`.
 #[derive(Clone, Copy)]
-struct Combines<'c> {
+struct CombineRows<'c> {
     plan: UnionPlanView<'c>,
     gu: &'c [f32],
     ff: usize,
     form: ExpertForm,
+}
+
+impl CombineRows<'_> {
+    /// Slot `q`, column `q − off[d]` of expert `d`: the form's combine of its gate and up columns into `par`
+    /// (`ff` values), before any input scaling and before the encoder, the one call every path makes for a
+    /// column.
+    fn fill(&self, d: usize, q: usize, par: &mut [f32]) {
+        let (o, m) = (self.plan.off[d], self.plan.off[d + 1] - self.plan.off[d]);
+        let t = q - o;
+        match self.form {
+            ExpertForm::Gated { limit } => {
+                let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
+                let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
+                swiglu_into(gate, up, Some(limit), par);
+            }
+            ExpertForm::GatedGateFirst { limit } => {
+                let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
+                let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
+                swiglu_gclamp_into(gate, up, limit, par);
+            }
+            ExpertForm::GatedOai { alpha, limit } => {
+                let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
+                let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
+                swiglu_oai_into(gate, up, alpha, limit, par);
+            }
+            ExpertForm::Situ { beta, linear_beta } => {
+                let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
+                let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
+                situ_into(gate, up, beta, linear_beta, par);
+            }
+            // A relu² layer's first pass wrote the up at the slot itself.
+            ExpertForm::Relu2 => {
+                let up = &self.gu[q * self.ff..][..self.ff];
+                relu2_into(up, par);
+            }
+        }
+    }
+}
+
+/// Where a union call's combines go: slot `q` of expert `d` is its [`CombineRows`] combine, quantized in
+/// `ty`'s encoding into slot `q` of `qc`.
+#[derive(Clone, Copy)]
+struct Combines<'c> {
+    rows: CombineRows<'c>,
     scales: Option<&'c [std::sync::atomic::AtomicU32]>,
     ty: GgmlType,
     qc: SharedQuantCols,
 }
 
 impl Combines<'_> {
-    /// Slot `q`, column `q − off[d]` of expert `d`: the combine and encoder
-    /// calls every path makes for a column, one column at a time.
+    /// Slot `q`, column `q − off[d]` of expert `d`: the combine and encoder calls every path makes for a
+    /// column, one column at a time.
     ///
     /// # Safety
     ///
-    /// The caller owns slot `q` of `qc` — its own chunk of the slots, or the
-    /// claim of expert `d` — and `qc` holds the plan's slots.
+    /// The caller owns slot `q` of `qc` — its own chunk of the slots, or the claim of expert `d` — and `qc`
+    /// holds the plan's slots.
     unsafe fn slot(&self, d: usize, q: usize) {
-        let (o, m) = (self.plan.off[d], self.plan.off[d + 1] - self.plan.off[d]);
-        let t = q - o;
+        let ff = self.rows.ff;
         PAR_BUF.with(|b| {
             let mut par = b.borrow_mut();
-            if par.len() < self.ff {
-                par.resize(self.ff, 0.0);
+            if par.len() < ff {
+                par.resize(ff, 0.0);
             }
-            let par = &mut par[..self.ff];
-            match self.form {
-                ExpertForm::Gated { limit } => {
-                    let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
-                    let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
-                    swiglu_into(gate, up, Some(limit), par);
-                }
-                ExpertForm::GatedGateFirst { limit } => {
-                    let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
-                    let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
-                    swiglu_gclamp_into(gate, up, limit, par);
-                }
-                ExpertForm::GatedOai { alpha, limit } => {
-                    let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
-                    let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
-                    swiglu_oai_into(gate, up, alpha, limit, par);
-                }
-                ExpertForm::Situ { beta, linear_beta } => {
-                    let gate = &self.gu[(2 * o + t) * self.ff..][..self.ff];
-                    let up = &self.gu[(2 * o + m + t) * self.ff..][..self.ff];
-                    situ_into(gate, up, beta, linear_beta, par);
-                }
-                // A relu² layer's first pass wrote the up at the slot itself.
-                ExpertForm::Relu2 => {
-                    let up = &self.gu[q * self.ff..][..self.ff];
-                    relu2_into(up, par);
-                }
-            }
+            let par = &mut par[..ff];
+            self.rows.fill(d, q, par);
             if let Some(scales) = self.scales {
                 let scale = ExpertInput::AmaxF16.protect(par);
                 scales[q].store(scale.to_bits(), std::sync::atomic::Ordering::Relaxed);
             }
             // SAFETY: the caller owns slot `q` of `qc`.
-            unsafe { self.qc.quantize_into(self.ty, self.ff, par, q) };
+            unsafe { self.qc.quantize_into(self.ty, ff, par, q) };
         });
     }
 }
@@ -5755,7 +5774,7 @@ struct CombineClaims<'c> {
 impl CombineClaims<'_> {
     fn claim_pass(&self, lvl: u8, acc: &mut profile::CallAcc) {
         let t0 = if lvl >= 1 { Some(Instant::now()) } else { None };
-        let plan = self.src.plan;
+        let plan = self.src.rows.plan;
         loop {
             let d = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if d >= plan.n() {
@@ -6069,6 +6088,9 @@ pub(crate) struct UnionCall<'c, 'w> {
     /// layer has one.
     post: Option<&'c PostNorm>,
     scales: Option<&'c [std::sync::atomic::AtomicU32]>,
+    /// Where the pass between the gate/up rows and the down rows sums the combines' squares by expert,
+    /// when the call feeds an importance collector ([`UnionCall::tap_down`]).
+    tap: Option<&'c DownTap>,
 }
 
 impl<'c, 'w> UnionCall<'c, 'w> {
@@ -6107,6 +6129,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
             spread: Lanes::Flat,
             post: None,
             scales: None,
+            tap: None,
         })
     }
 
@@ -6121,6 +6144,12 @@ impl<'c, 'w> UnionCall<'c, 'w> {
     /// default).
     pub(crate) fn post_normed(self, post: Option<&'c PostNorm>) -> Self {
         UnionCall { post, ..self }
+    }
+
+    /// The call whose combines' squares are summed into `tap` by expert ([`UnionCall::tap_down`]'s pass);
+    /// `None`, the call as it was (the default): no pass, no lock.
+    pub(crate) fn tap_down(self, tap: Option<&'c DownTap>) -> Self {
+        UnionCall { tap, ..self }
     }
 
     /// Apply the loaded activation policy, using load-allocated slot scales.
@@ -6226,6 +6255,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         }
         x_ns += self.gate_up(xq, xq_up, gu, claim, lvl)?;
         *passes += 1;
+        self.sum_squares(gu)?;
         if !claim {
             let t = timer();
             self.combine(gu, qc);
@@ -6326,6 +6356,7 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         };
         self.gate_up(xq.gate, xq.up.as_deref_mut(), gu, claim_x, lvl)?;
         *passes += 1;
+        self.sum_squares(gu)?;
         if states.is_none() {
             let t = (lvl > 0).then(Instant::now);
             self.combine(gu, qc);
@@ -6480,17 +6511,67 @@ impl<'c, 'w> UnionCall<'c, 'w> {
         'c: 'a,
     {
         Combines {
-            plan: self.plan,
-            gu,
-            ff: self.gate.n,
-            form: self.form,
+            rows: CombineRows {
+                plan: self.plan,
+                gu,
+                ff: self.gate.n,
+                form: self.form,
+            },
+            scales: self.scales,
             ty: self.down.ty,
             qc: SharedQuantCols::Bytes {
                 cb: self.down.cb,
                 ptr: qc.as_mut_ptr(),
             },
-            scales: self.scales,
         }
+    }
+
+    /// The importance collector's feed over the rows the down reads: for each distinct expert, the column
+    /// sums of squares of its slots' combines (the rows in `gu`, in column order, in f32) added to the
+    /// call's tap under the down stack's own name, with the expert's number of rows. One dispatch over the
+    /// plan's experts, so an expert's rows are one worker's and the sums never depend on how the pool split
+    /// the call; the combines are formed again here, before any input scaling, because the combine pass
+    /// that follows quantizes them in place. Nothing, no dispatch and no lock, for a call without a tap.
+    fn sum_squares(&self, gu: &[f32]) -> Result<(), crate::ModelError> {
+        let Some(tap) = self.tap else {
+            return Ok(());
+        };
+        let n = self.plan.n();
+        if n == 0 {
+            return Ok(());
+        }
+        let down = &self.sources[2];
+        let stack = tap.stack(down.name, down.n_expert, self.gate.n)?;
+        let rows = CombineRows {
+            plan: self.plan,
+            gu,
+            ff: self.gate.n,
+            form: self.form,
+        };
+        threads::pool().for_each_chunk(n, |experts| {
+            TAP_BUF.with(|b| {
+                let mut b = b.borrow_mut();
+                if b.len() < 2 * rows.ff {
+                    b.resize(2 * rows.ff, 0.0);
+                }
+                let (par, acc) = b[..2 * rows.ff].split_at_mut(rows.ff);
+                for d in experts {
+                    acc.fill(0.0);
+                    for q in rows.plan.off[d]..rows.plan.off[d + 1] {
+                        rows.fill(d, q, par);
+                        for (a, &v) in acc.iter_mut().zip(par.iter()) {
+                            *a += v * v;
+                        }
+                    }
+                    stack.add(
+                        rows.plan.ids[d],
+                        rows.plan.off[d + 1] - rows.plan.off[d],
+                        acc,
+                    );
+                }
+            });
+        });
+        Ok(())
     }
 
     /// Every slot's combine, quantized in the down's encoding into `qc`, one

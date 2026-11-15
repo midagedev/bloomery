@@ -17,15 +17,20 @@
 //! `x²` of every input row in row order, one count per row; a routed weight adds the row of each
 //! `(row, slot)` the router picked to that expert's column sums, one count per pick. Where ours
 //! differs: a weight whose input the engine never holds as an f32 buffer is not collected, and the
-//! walk names it — the host tier's and the tier cards' routed *downs* (their combines are quantized
-//! inside the host union call and the tier leg, never an f32 buffer the walk holds; the *gate* and
-//! *up* of every pick are collected, for the router's normed rows sit on the card whatever tier runs
-//! the expert), a gated block's *down* on the card (the wide path's SwiGLU writes the down's own
-//! quantized form, not f32 rows), and the head (as `llama-imatrix` without `--process-output`).
-//! [`Collector::feed_routed_carded`] keeps only the picks whose place is a card slot: the tiers'
-//! downs are named above, and their columns stay zero with zero counts, which the quantizer reads
-//! as weight 1 ([`gguf::iq_quant::imatrix_weights`]).
-
+//! walk names it — the tier cards' routed *downs* (their combines are quantized inside the tier leg,
+//! never an f32 buffer the walk holds; the *gate* and *up* of every pick are collected, for the
+//! router's normed rows sit on the card whatever tier runs the expert), a gated block's *down* on the
+//! card (the wide path's SwiGLU writes the down's own quantized form, not f32 rows), and the head (as
+//! `llama-imatrix` without `--process-output`).
+//!
+//! A routed *down* has two feeds, one a pick. The card's picks feed on the card: the card route's SwiGLU
+//! rows, [`Collector::feed_routed_carded`] keeping only the picks whose place is a card slot. The host
+//! tier's picks feed on the host: the host union forms each expert's SwiGLU rows as f32 before it
+//! quantizes them for the down, and sums their squares by expert into the collector's host side
+//! ([`Collector::host_downs`], `model::down_tap`) in f32 a call and f64 over the calls. The two sides
+//! meet in [`Collector::write`]: per column the card's f32 sum and the host's f64 sum added in f64 and
+//! rounded once to the file's f32, per expert the two counts added. A layer whose experts are all on
+//! the host has no device entry at all, only the host side's.
 use crate::{Gpu, GpuError, hybrid::HOST, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
@@ -33,6 +38,7 @@ use cuda_device::{DisjointSlice, kernel, launch_bounds, launch_contract, thread}
 use cuda_host::cuda_module;
 use gguf::Value;
 use gguf::write::{Layout, TensorDecl, Writer};
+use model::down_tap::DownTap;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -216,6 +222,9 @@ struct Entry {
 pub struct Collector {
     entries: Mutex<BTreeMap<String, Entry>>,
     picks: Mutex<Option<Picks>>,
+    /// The routed downs' rows the host union formed, by stack name: the host tier's picks, which no card
+    /// holds as f32 rows.
+    host: DownTap,
 }
 
 /// The carded feeds' marked picks, on one card's stream.
@@ -237,6 +246,7 @@ pub fn attach() -> &'static Collector {
     COLLECTOR.get_or_init(|| Collector {
         entries: Mutex::new(BTreeMap::new()),
         picks: Mutex::new(None),
+        host: DownTap::new(),
     })
 }
 
@@ -250,6 +260,14 @@ fn columns(what: &'static str, k: usize) -> Result<LaunchConfig1D, GpuError> {
 }
 
 impl Collector {
+    /// The host side of the routed downs: where a prompt batch's host union sums the SwiGLU rows its
+    /// experts' downs read ([`crate::host::HostTier::set_down_tap`]), under the down stack's tensor
+    /// name, the key the card's feed uses.
+    #[must_use]
+    pub fn host_downs(&self) -> &DownTap {
+        &self.host
+    }
+
     /// Layer code's hook for a dense linear: `rows` token-major rows of `k` values of `x` reach
     /// `name`'s weight. The sums land on the stream `gpu` runs the layer on, in launch order.
     pub fn feed_dense(
@@ -333,8 +351,9 @@ impl Collector {
 
     /// Layer code's hook for a routed stack whose down rows the card route holds its own picks of:
     /// [`Collector::feed_routed`] over `x`'s per-pick rows (`per_pick` true), keeping only the picks
-    /// whose place in `places` (the card route's `sel`, one a pick) is a card slot — the host and
-    /// tier picks' combines never sit on the card as f32 rows, and the module doc names them. The
+    /// whose place in `places` (the card route's `sel`, one a pick) is a card slot — the host tier's
+    /// picks are fed by the host union ([`Collector::host_downs`]) and the tier cards' combines never
+    /// sit on the card as f32 rows (the module doc names them). The
     /// kept picks land in the entry's own count beside `expect`, so the write's exactness check
     /// holds here too. The marked picks ride one scratch buffer, reused in stream order.
     pub fn feed_routed_carded(
@@ -456,8 +475,10 @@ impl Collector {
             ));
         }
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(e) = entries.get(name)
-            && (e.expect != 0 || e.kept.is_some())
+        if self.host.holds(name)
+            || entries
+                .get(name)
+                .is_some_and(|e| e.expect != 0 || e.kept.is_some())
         {
             return Err(GpuError::shape(
                 SEED,
@@ -524,19 +545,30 @@ impl Collector {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        self.host.clear();
     }
 
     /// The names collected so far, sorted.
     #[must_use]
     pub fn names(&self) -> Vec<String> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        entries.keys().cloned().collect()
+        let mut names: Vec<String> = entries.keys().cloned().collect();
+        names.extend(
+            self.host
+                .names()
+                .into_iter()
+                .filter(|n| !entries.contains_key(n)),
+        );
+        names.sort();
+        names
     }
 
     /// Read every entry back and write llama's GGUF form to `path`: the dataset's name, the chunk
-    /// size and the chunk count are the caller's. An entry whose counts do not total what was fed
-    /// (a pick the kernel skipped) or that holds a non-finite sum is refused by name, the file
-    /// unwritten. Blocking.
+    /// size and the chunk count are the caller's. A routed down's host side ([`Collector::host_downs`])
+    /// is added to the card's: per column the two sums in f64, rounded once to the file's f32, per expert
+    /// the two counts. An entry whose card counts do not total what was fed (a pick the kernel skipped),
+    /// whose host side was fed as another shape, or that holds a non-finite sum is refused by name, the
+    /// file unwritten. Blocking.
     pub fn write(
         &self,
         path: &Path,
@@ -544,10 +576,10 @@ impl Collector {
         dataset: &str,
     ) -> Result<(), GpuError> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut host = Vec::with_capacity(entries.len());
+        let mut owned: Vec<Owned> = Vec::with_capacity(entries.len());
         for (name, e) in entries.iter() {
-            let sums = crate::tensor::to_host(&e.stream, &e.acc)?;
-            let counts = crate::tensor::to_host(&e.stream, &e.counts)?;
+            let mut sums = crate::tensor::to_host(&e.stream, &e.acc)?;
+            let mut counts = crate::tensor::to_host(&e.stream, &e.counts)?;
             let kept: f64 = e
                 .kept
                 .as_ref()
@@ -564,27 +596,58 @@ impl Collector {
                     ),
                 ));
             }
+            if let Some(h) = self.host.rows_of(name) {
+                if (h.ff, h.n_expert) != (e.ne0, e.n_mat) {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "{name}: the host union fed it as {} × {}, collected as {} × {}",
+                            h.ff, h.n_expert, e.ne0, e.n_mat
+                        ),
+                    ));
+                }
+                for (s, &h) in sums.iter_mut().zip(&h.sums) {
+                    *s = (f64::from(*s) + h) as f32;
+                }
+                for (c, &h) in counts.iter_mut().zip(&h.rows) {
+                    *c = (f64::from(*c) + h as f64) as f32;
+                }
+            }
+            owned.push((name.clone(), e.ne0, e.n_mat, sums, counts));
+        }
+        for name in self.host.names() {
+            if entries.contains_key(&name) {
+                continue;
+            }
+            let h = self.host.rows_of(&name).ok_or_else(|| {
+                GpuError::state(WHAT, "a host down stack that vanished mid-write")
+            })?;
+            let sums = h.sums.iter().map(|&v| v as f32).collect();
+            let counts = h.rows.iter().map(|&r| r as f32).collect();
+            owned.push((name, h.ff, h.n_expert, sums, counts));
+        }
+        owned.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, ne0, _, sums, _) in &owned {
             if let Some(i) = sums.iter().position(|v| !v.is_finite()) {
                 return Err(GpuError::shape(
                     WHAT,
-                    format!("{name}: a non-finite sum at {i} (column {})", i % e.ne0),
+                    format!("{name}: a non-finite sum at {i} (column {})", i % ne0),
                 ));
             }
-            host.push((name.as_str(), e.ne0, e.n_mat, sums, counts));
         }
-        render(path, (chunk_size, chunk_count), dataset, &host)
+        render(path, (chunk_size, chunk_count), dataset, &owned)
     }
 }
 
 /// One weight as it is written: its name, `ne0`, `n_mat`, the sums and the counts.
-type Row<'a> = (&'a str, usize, usize, Vec<f32>, Vec<f32>);
+type Owned = (String, usize, usize, Vec<f32>, Vec<f32>);
 
 /// llama's file from `rows` (sorted by name): metadata, then each weight's `in_sum2` and `counts`.
 fn render(
     path: &Path,
     (chunk_size, chunk_count): (u32, u32),
     dataset: &str,
-    rows: &[Row<'_>],
+    rows: &[Owned],
 ) -> Result<(), GpuError> {
     let io = |e: &dyn std::fmt::Display| GpuError::shape(WHAT, format!("{}: {e}", path.display()));
     let kvs = vec![

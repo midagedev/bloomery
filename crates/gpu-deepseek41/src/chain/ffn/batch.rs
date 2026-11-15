@@ -1704,9 +1704,10 @@ impl Q3TileScratch {
     /// `slots_n` slots and `n_cards` card experts: the SwiGLU rows by table entry (`ff` values an entry, the
     /// entries of one card expert contiguous), each fed under the routed expert (`ids`, the block's global
     /// ids by slot, through the table's `order`) its slot picked. A slot whose place is not a card expert
-    /// has no entry, so its down is not collected (the host tier's and the tier cards' combines never sit
-    /// on the card as f32 rows). The table's size is a device value, so the hook reads the table back: it
-    /// blocks the stream, which only a collecting walk does. Nothing without entries.
+    /// has no entry, so it is not fed here (the host tier's picks are fed by the host union,
+    /// [`FfnBatch::serve`]; the tier cards' combines never sit on the card as f32 rows and are not fed).
+    /// The table's size is a device value, so the hook reads the table back: it blocks the stream, which
+    /// only a collecting walk does. Nothing without entries.
     fn collect_down(
         &mut self,
         gpu: &Gpu,
@@ -2151,14 +2152,20 @@ impl FfnBatch {
     /// Wait for the oldest download not served yet — `key`'s, else refused
     /// by name — then serve its layer's host experts for its tokens in one
     /// union call ([`Hybrid::serve_key`]): the sums into the set's host copy
-    /// [`FfnBatch::enqueue_upload`] sends back. Returns the host time
-    /// outside the union call.
+    /// [`FfnBatch::enqueue_upload`] sends back. A walk with the importance
+    /// collector attached has the union sum the rows each host expert's down
+    /// reads into the collector's host side, the host picks being rows the
+    /// card never holds as f32 ([`Q3TileScratch::collect_down`] feeds the
+    /// card's). Returns the host time outside the union call.
     pub fn serve<H: HostExperts>(
         &self,
         tier: &mut Hybrid<H>,
         key: BatchKey,
     ) -> Result<ServeTimes, GpuError> {
         self.check_key(key)?;
+        tier.set_down_tap(
+            bloomery_gpu::imatrix::collector().map(bloomery_gpu::imatrix::Collector::host_downs),
+        );
         tier.serve_key(key)
     }
 

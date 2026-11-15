@@ -38,6 +38,7 @@ use crate::graph::{MappedHost, cu};
 use crate::tensor::WindowMut;
 use crate::{Gpu, GpuError, Q8Act};
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
+use model::down_tap::DownTap;
 use model::placement::Plan;
 use model::placement::workstation::{TIER_BATCH_HOST_RESERVE, TIER_BATCH_RESERVE};
 use model::{Tensor2, Tensor2View};
@@ -1894,6 +1895,9 @@ pub(super) struct BatchService {
     /// the widest expert id any serve listed and read only by a walk that
     /// times its serves.
     counts: Vec<u32>,
+    /// Where each union call sums the rows its experts' downs read, set by the caller that feeds an
+    /// importance collector ([`super::HostTier::set_down_tap`]); `None` otherwise.
+    pub(super) tap: Option<&'static DownTap>,
     pub(super) stats: BatchStats,
 }
 
@@ -2017,7 +2021,7 @@ impl BatchService {
                 .map(|(j, &n)| &self.lists[j * n_used..][..n]),
         );
         let Some((first, saw)) = refused else {
-            let r = t.experts.experts_union_into(layer, x, &lists, out);
+            let r = self.union(t.experts, layer, x, &lists, out);
             self.slices = reuse_slices(lists);
             r?;
             self.count(cols, [host_slots, excluded, tier_slots], t0);
@@ -2029,9 +2033,7 @@ impl BatchService {
         for &j in &self.refused {
             clean.col_mut(j).fill(0.0);
         }
-        let r = t
-            .experts
-            .experts_union_into(layer, clean.view(), &lists, out);
+        let r = self.union(t.experts, layer, clean.view(), &lists, out);
         self.slices = reuse_slices(lists);
         r?;
         for &j in &self.refused {
@@ -2049,6 +2051,21 @@ impl BatchService {
         };
         t.health.record_refusal(r.clone(), true);
         Err(name_refusal(&r, crate::fault::read(word)?))
+    }
+
+    /// The one union call of a serve: the host's batch form, with the tap's sums when the caller set one.
+    fn union<H: HostExperts>(
+        &self,
+        experts: &mut H,
+        layer: usize,
+        x: Tensor2View<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+    ) -> Result<(), GpuError> {
+        match self.tap {
+            Some(tap) => experts.experts_union_tapped_into(layer, x, lists, out, tap),
+            None => experts.experts_union_into(layer, x, lists, out),
+        }
     }
 
     /// [`BatchService::serve_one`] on a sound tier: refused on a poisoned

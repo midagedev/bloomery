@@ -122,6 +122,7 @@ use columns::{diff_cells, seeded};
 use gguf::{GgmlType, Split, Weights};
 use model::arch::deepseek41::host;
 use model::arch::deepseek41::hparams::Hparams;
+use model::down_tap::DownTap;
 use model::moe::{
     HostLayer, HostLayerSpec, HostScratch, Relu2Spec, UNION_MAX_COLS, UNION_TAIL_MAX_GROUPS,
     UnionScratch, union_batch_slots,
@@ -1720,12 +1721,42 @@ fn relu2_column(layer: &Relu2Layer, x: &[f32], list: &[(u32, f32)], ff: usize) -
     out
 }
 
+/// The tap's contract on a relu² layer, transcribed on qdot's own calls: expert `e`'s rows are the
+/// columns that list it (once each, whatever a list's repeats) and its sums the column sums of squares
+/// of those columns' `relu(u)²` rows, in f32 in column order, widened to f64 — what a union call handed
+/// a [`DownTap`] adds under the down stack's name.
+fn relu2_tap(layer: &Relu2Layer, case: &Case, ff: usize, n_expert: usize) -> (Vec<u64>, Vec<f64>) {
+    let mut rows = vec![0u64; n_expert];
+    let mut sums = vec![0.0f32; n_expert * ff];
+    for j in 0..case.lists.len() {
+        let mut listed: Vec<u32> = case.lists[j].iter().map(|&(e, _)| e).collect();
+        listed.sort_unstable();
+        listed.dedup();
+        for e in listed {
+            let e = e as usize;
+            rows[e] += 1;
+            for (s, u) in
+                sums[e * ff..(e + 1) * ff]
+                    .iter_mut()
+                    .zip(relu2_up(layer, case.x.col(j), e, ff))
+            {
+                let relu = u.max(0.0);
+                let h = relu * relu;
+                *s += h * h;
+            }
+        }
+    }
+    (rows, sums.into_iter().map(f64::from).collect())
+}
+
 /// The relu² form — Bolt's ungated experts — through the common union: on two layers of
 /// different widths and expert counts (IQ2_XXS up and down, the latent 1024 wide), one scratch
 /// made for the wider serves both, and at k = 1, 8, 9 and 64 under both deferral arms the union
 /// call, `experts_into` of every column and `relu2_column`'s transcription on qdot's own calls
 /// are the same bits, in the dispatches the call is owed, and `HostScratch::up` holds each expert's
-/// up output of the last column's call in list order. A scratch exact for the narrower
+/// up output of the last column's call in list order. A union call handed a [`DownTap`]
+/// (`experts_union_tapped_into`) writes the same bits and taps, per expert, the rows and column
+/// sums of squares `relu2_tap` transcribes, exactly. A scratch exact for the narrower
 /// layer gives the same bits as the capacity scratch. Then the named refusals of the widths: a
 /// scratch narrower than the layer's ff, one of another embd, and one whose capacity holds no
 /// column encoding.
@@ -1797,6 +1828,7 @@ fn hw_union_relu2_matches_transcription() {
                 failed.push((ff, k, "scratch up"));
             }
             let lists = case.slices();
+            let (tap_rows, tap_sums) = relu2_tap(&layer, &case, ff, n_expert);
             let mut line = format!(
                 "relu2 ff={ff} k={k} slots={} union={} cols_per_expert={lo}..{hi} \
                  past_one_run={past} experts_into: diff_cells={dd} scratch_up={du}",
@@ -1812,13 +1844,35 @@ fn hw_union_relu2_matches_transcription() {
                 let mut got_exact = vec![f32::NAN; embd * k];
                 let r_exact =
                     host_layer.experts_union_into(src, &case.x, &lists, &mut got_exact, &mut exact);
+                let tap = DownTap::new();
+                let mut got_tap = vec![f32::NAN; embd * k];
+                let r_tap = host_layer.experts_union_tapped_into(
+                    src,
+                    &case.x,
+                    &lists,
+                    &mut got_tap,
+                    &mut us,
+                    &tap,
+                );
                 ops::set_defer_quant(None);
                 r.unwrap_or_else(|e| panic!("relu2 ff {ff} k {k} {arm}: {e}"));
                 r_exact.unwrap_or_else(|e| panic!("relu2 ff {ff} k {k} {arm} exact: {e}"));
+                r_tap.unwrap_or_else(|e| panic!("relu2 ff {ff} k {k} {arm} tapped: {e}"));
                 let (d, de) = (diff_cells(&got, &want), diff_cells(&got_exact, &want));
+                let dt = diff_cells(&got_tap, &want);
+                let tapped = tap.rows_of(Q8_DOWN);
+                let tap_ok = tapped.as_ref().is_some_and(|t| {
+                    (t.ff, t.n_expert) == (ff, n_expert) && t.rows == tap_rows && t.sums == tap_sums
+                });
+                if dt != 0 {
+                    failed.push((ff, k, "tapped call"));
+                }
+                if !tap_ok {
+                    failed.push((ff, k, "tap"));
+                }
                 let want_d = call_dispatches(k, case.slots(), on);
                 line += &format!(
-                    " {arm}: diff_cells={d} exact_scratch={de} {}",
+                    " {arm}: diff_cells={d} exact_scratch={de} tapped_diff_cells={dt} tap_exact={tap_ok} {}",
                     dispatch_note(ds, dp, want_d)
                 );
                 if d != 0 {

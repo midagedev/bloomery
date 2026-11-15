@@ -12,9 +12,10 @@
 //!   those of [`NOT_COLLECTED`], each with its reason, and none ik's lacks but those of [`OURS_ONLY`]; a name of
 //!   either list that is on the other side's side of the rule is red too (the lists cannot go stale).
 //! - `counts` (self-consistency): a dense weight's count is the rows walked, `CHUNKS * CTX`; a routed gate or up
-//!   stack's counts total the rows times the picks a row makes; a down's are the picks the card computed, none
-//!   for a pick the host tier served (its combine is never an f32 row on the card), so at most its up's per
-//!   expert; a gate weight's counts and sums are its up weight's, which sees the same rows and picks.
+//!   stack's counts total the rows times the picks a row makes; a down's counts are its up's, per expert (the
+//!   card's picks from the tile path's SwiGLU rows, the host tier's from the host union's combine, one entry a
+//!   pick whoever computed it); a gate weight's counts and sums are its up weight's, which sees the same rows
+//!   and picks.
 //! - `means` (fixture oracle): per dense weight, the median and the 99th percentile over its columns of the
 //!   relative difference of a column's mean from ik's within [`COL_MEDIAN`] and [`COL_P99`] by layer; the total
 //!   mean of every weight within [`TOTAL_BAND`] (a routed down's within [`DOWN_TOTAL`]); the middle column of a
@@ -120,11 +121,13 @@ const COL_P99: [f64; 9] = [
 /// PIN(2026-11-14): 2 times the largest of the same eight sittings' worst, 1.18e-2 at blk.7.attn_output_b.
 const TOTAL_BAND: f64 = 0.024;
 
-/// The widest relative difference of a routed down stack's total mean: ours holds the picks the card computed,
-/// ik's all of them.
-/// PIN(2026-11-14): 1.5 times the largest of the same eight sittings' worst, 4.91e-2 at blk.1.ffn_down_exps (the
-/// IQ-glue variant on the 3090).
-const DOWN_TOTAL: f64 = 0.075;
+/// The widest relative difference of a routed down stack's total mean: ours and ik's both hold every pick, the
+/// host tier's included.
+/// PIN(2026-11-15): 1.5 times the largest of eight sittings' worst, 3.64e-2 at blk.1.ffn_down_exps (the IQ-glue
+/// variant on the 3090); the sittings are the V4.1 fixture and its three variant files, each on the 3090 and the
+/// A6000, with the host picks' downs collected (the worst of each, 3090 then A6000: base [2.10e-2, 1.86e-2],
+/// istaexp [1.22e-2, 2.01e-2], istadense [3.09e-2, 2.18e-2], istaglue [3.64e-2, 2.62e-2]).
+const DOWN_TOTAL: f64 = 0.055;
 
 /// The widest relative difference of a routed gate or up stack's middle column.
 /// PIN(2026-11-14): 1.3 times the largest of the same eight sittings' worst, 2.50e-1 at blk.8.ffn_up_exps.
@@ -309,7 +312,6 @@ fn counts(ours: &BTreeMap<String, Ours>) -> bool {
     let rows = (CHUNKS * CTX) as f64;
     let total = |e: &Ours| e.counts.iter().map(|&c| f64::from(c)).sum::<f64>();
     let mut bad = Vec::new();
-    let (mut down_total, mut up_total) = (0.0f64, 0.0f64);
     for (name, e) in ours {
         let want = if routed(name) {
             rows * N_USED as f64
@@ -317,16 +319,11 @@ fn counts(ours: &BTreeMap<String, Ours>) -> bool {
             rows
         };
         let ok = if kind(name) == "ffn_down_exps.weight" {
-            // A pick the card did not compute has no f32 row: the down holds the card's picks, at most the
-            // up's per expert.
-            let up = ours.get(&name.replace("down", "up"));
-            down_total += total(e);
-            up_total += up.map_or(0.0, total);
-            total(e) > 0.0
-                && up.is_some_and(|u| {
-                    u.counts.len() == e.counts.len()
-                        && e.counts.iter().zip(&u.counts).all(|(d, u)| d <= u)
-                })
+            // Every pick has a row, whoever computed it: the down's counts are its up's per expert.
+            total(e) == want
+                && ours
+                    .get(&name.replace("down", "up"))
+                    .is_some_and(|u| u.counts == e.counts)
         } else if routed(name) {
             total(e) == want
         } else {
@@ -356,12 +353,11 @@ fn counts(ours: &BTreeMap<String, Ours>) -> bool {
     let ok = bad.is_empty() && unequal.is_empty();
     println!(
         "{} counts: a dense weight's count the {} rows walked, a routed stack's total {} rows times {N_USED} picks, a \
-         gate weight's counts and sums its up weight's, a down's the card's picks within its up's per expert \
-         ({:.1} % of the up picks here) ({} weights); outside {:?}, gate unequal to up {unequal:?}",
+         gate weight's counts and sums its up weight's, a down's counts its up's per expert ({} weights); outside \
+         {:?}, gate unequal to up {unequal:?}",
         verdict(ok),
         CHUNKS * CTX,
         CHUNKS * CTX,
-        100.0 * down_total / up_total.max(1.0),
         ours.len(),
         &bad[..bad.len().min(6)]
     );
@@ -570,7 +566,7 @@ pub fn run(dir: &str, path: &str, cfg: &body::OpenCfg) -> Result<bool, GateError
         pass &= names(&ours, &theirs, opened);
     }
     crate::ds41_tier::sc(
-        "imatrix counts: the rows walked, the picks made, the card's picks of a down, a gate weight is its up weight",
+        "imatrix counts: the rows walked, the picks made, a down's counts are its up's, a gate weight is its up weight",
     )?;
     pass &= counts(&ours);
     if tier::run_clause("imatrix means against ik's", Tag::FixtureOracle)? {

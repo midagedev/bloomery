@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use gguf::Split;
+use model::down_tap::DownTap;
 use model::moe::{HostLayer, HostScratch, UNION_MAX_COLS, UnionScratch};
 use model::ops::{ExpertInput, PostNorm};
 use model::r8file::{R8Pair, R8Source};
@@ -427,7 +428,8 @@ impl HostRun {
     }
 
     /// The union call of layer `layer` (`step`: the step port's form, whose
-    /// NVMe ids read from the arena).
+    /// NVMe ids read from the arena; `tap`: the batch form that sums the rows
+    /// the downs read, which a step never takes).
     fn union_call(
         &mut self,
         layer: usize,
@@ -435,20 +437,23 @@ impl HostRun {
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
         step: bool,
+        tap: Option<&DownTap>,
     ) -> Result<(), GpuError> {
-        let what = if step {
-            "HostRun::experts_step_union_into"
-        } else {
-            "HostRun::experts_union_into"
+        let what = match (step, tap) {
+            (true, _) => "HostRun::experts_step_union_into",
+            (false, None) => "HostRun::experts_union_into",
+            (false, Some(_)) => "HostRun::experts_union_tapped_into",
         };
         if self.zero_sum(layer, lists, (x.ne0(), x.ne1()), out, what)? {
             return Ok(());
         }
         let (view, src, scratch) = self.union_of(layer, what)?;
-        if step {
-            view.experts_step_union_into(src, x, lists, out, scratch)?;
-        } else {
-            view.experts_union_into(src, x, lists, out, scratch)?;
+        match (step, tap) {
+            (true, _) => view.experts_step_union_into(src, x, lists, out, scratch)?,
+            (false, None) => view.experts_union_into(src, x, lists, out, scratch)?,
+            (false, Some(tap)) => {
+                view.experts_union_tapped_into(src, x, lists, out, scratch, tap)?
+            }
         }
         // A layer with an arena reads the ids it serves from the arena's
         // slots, batch by batch; the plan's host segment and a layer with
@@ -529,7 +534,18 @@ impl HostExperts for HostRun {
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        self.union_call(layer, x, lists, out, false)
+        self.union_call(layer, x, lists, out, false, None)
+    }
+
+    fn experts_union_tapped_into(
+        &mut self,
+        layer: usize,
+        x: Tensor2View<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        tap: &DownTap,
+    ) -> Result<(), GpuError> {
+        self.union_call(layer, x, lists, out, false, Some(tap))
     }
 
     /// The union with the NVMe tier's ids read from the arena
@@ -542,7 +558,7 @@ impl HostExperts for HostRun {
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
     ) -> Result<(), GpuError> {
-        self.union_call(layer, x, lists, out, true)
+        self.union_call(layer, x, lists, out, true, None)
     }
 
     fn reads(&self) -> Option<HostReads> {

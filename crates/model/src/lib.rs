@@ -21,6 +21,7 @@
 //!      multiplies a verification pass by k. Bucket → per-bucket matmul → inverse permutation.
 
 pub mod arch;
+pub mod down_tap;
 pub mod embed;
 pub mod ffn;
 pub mod fileio;

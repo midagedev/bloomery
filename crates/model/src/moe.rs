@@ -29,6 +29,7 @@ use std::time::Instant;
 use gguf::{GgmlType, Gguf, Split, TensorInfo};
 
 use crate::ModelError;
+use crate::down_tap::DownTap;
 use crate::ops::{
     self, DEFER_MAX_COLS, ExpertForm, ExpertInput, ExpertStack, GroupClaims, GroupInput, Lanes,
     PostNorm, R8Stack, RowLayout, ShardTensor, StackTier, Tensor2, Tensor2View, UnionCall,
@@ -984,6 +985,9 @@ struct LegRun<'n> {
     input: ExpertInput,
     lanes: Lanes,
     post: Option<&'n PostNorm>,
+    /// Where a batch union's combines' squares are summed for an importance collector
+    /// ([`HostLayer::experts_union_tapped_into`]); `None` for every other call.
+    tap: Option<&'n DownTap>,
 }
 
 impl LegRun<'_> {
@@ -995,6 +999,7 @@ impl LegRun<'_> {
             input: ExpertInput::Direct,
             lanes: Lanes::Flat,
             post: None,
+            tap: None,
         }
     }
 }
@@ -2008,7 +2013,8 @@ fn serve_batched<'w>(
         let batch_call = UnionCall::new(sub.view(), stacks, x, run.form)?
             .spread_over(run.lanes)
             .post_normed(run.post)
-            .expert_input(run.input, scales)?;
+            .expert_input(run.input, scales)?
+            .tap_down(run.tap);
         batch_call.run_batch(&mut xqs, gu, qc, &mut store[base * embd..], None, passes)?;
         base += sub.cols.len();
         drop(pin);
@@ -2154,7 +2160,8 @@ fn serve_planned(
     let call = UnionCall::new(s.plan.view(), stacks, x, run.form)?
         .spread_over(run.lanes)
         .post_normed(run.post)
-        .expert_input(run.input, &s.scales)?;
+        .expert_input(run.input, &s.scales)?
+        .tap_down(run.tap);
     let slabs = UnionSlabs {
         xq: &mut s.xq,
         xq_up: &mut s.xq_up,
@@ -3292,6 +3299,7 @@ impl HostLayer {
             input: self.input,
             lanes,
             post: self.post.as_ref(),
+            tap: None,
         };
         serve(weights, run, x, experts, out, scratch)
     }
@@ -3360,6 +3368,7 @@ impl HostLayer {
             input: self.input,
             lanes,
             post: self.post.as_ref(),
+            tap: None,
         };
         serve_step_split(stacks, run, x.view(), &lists, out, union, tier, ticket)
     }
@@ -3382,7 +3391,24 @@ impl HostLayer {
         out: &mut [f32],
         scratch: &mut UnionScratch,
     ) -> Result<(), ModelError> {
-        self.union_on(Lanes::Flat, src, x, lists, out, scratch)
+        self.union_on(Lanes::Flat, src, x, lists, out, scratch, None)
+    }
+
+    /// [`HostLayer::experts_union_into`] for a prompt batch that feeds an importance collector: the same
+    /// sums, bit for bit, and besides, each distinct expert's rows the down reads (the SwiGLU combine of
+    /// every column that lists it) summed by column of squares into `tap` under the down stack's tensor
+    /// name, with the expert's number of rows ([`DownTap`]). A decode step's union
+    /// ([`HostLayer::experts_step_union_into`]) takes no tap.
+    pub fn experts_union_tapped_into<'x>(
+        &self,
+        src: R8Source<'_>,
+        x: impl Into<Tensor2View<'x>>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        scratch: &mut UnionScratch,
+        tap: &DownTap,
+    ) -> Result<(), ModelError> {
+        self.union_on(Lanes::Flat, src, x, lists, out, scratch, Some(tap))
     }
 
     /// [`HostLayer::experts_union_into`] with the two row passes laid over
@@ -3391,6 +3417,10 @@ impl HostLayer {
     /// segment from its slots, in batches when the call names more than the
     /// layer's slots less two batches ([`serve_tiered`]); a layer with none
     /// reads the file mapping alone.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the union's pieces: lanes, source, columns, lists, sums, scratch and the tap"
+    )]
     fn union_on<'x>(
         &self,
         lanes: Lanes,
@@ -3399,6 +3429,7 @@ impl HostLayer {
         lists: &[&[(u32, f32)]],
         out: &mut [f32],
         scratch: &mut UnionScratch,
+        tap: Option<&DownTap>,
     ) -> Result<(), ModelError> {
         self.read_beside(src)?;
         let split = src.split();
@@ -3415,6 +3446,7 @@ impl HostLayer {
             input: self.input,
             lanes,
             post: self.post.as_ref(),
+            tap,
         };
         serve_union(
             self.stacks_of(split)?,
@@ -3465,7 +3497,7 @@ impl HostLayer {
         scratch: &mut UnionScratch,
     ) -> Result<(), ModelError> {
         let Some(tier) = &self.tier else {
-            return self.union_on(lanes, src, x, lists, out, scratch);
+            return self.union_on(lanes, src, x, lists, out, scratch, None);
         };
         self.read_beside(src)?;
         let split = src.split();
@@ -3486,6 +3518,7 @@ impl HostLayer {
             input: self.input,
             lanes,
             post: self.post.as_ref(),
+            tap: None,
         };
         // The claim is made now and the misses fill on the tier's threads;
         // the pin lasts until the union's reads end, as `experts_into_on`'s
@@ -6236,6 +6269,7 @@ mod planes_union_tests {
             input: ExpertInput::Direct,
             lanes: Lanes::Flat,
             post: None,
+            tap: None,
         };
         serve_union(stacks, relu2, x.view(), &refs, &mut out, &mut us, None)
             .expect("the union call runs");

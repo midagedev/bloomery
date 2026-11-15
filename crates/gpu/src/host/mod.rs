@@ -140,6 +140,7 @@ use crate::tensor::DeviceTensor;
 use crate::words::{WordOps, WordSide};
 use batch::{BatchKey, BatchPort, BatchService, ServeTimes, Tier};
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, DriverError, sys};
+use model::down_tap::DownTap;
 use model::placement::Machine;
 use model::{Tensor2, Tensor2View};
 use page::{MAX_ROWS, Word};
@@ -254,6 +255,24 @@ pub trait HostExperts {
         Err(GpuError::state(
             "HostExperts::experts_union_into",
             "a batched host path: this architecture's host tier serves one column a call",
+        ))
+    }
+
+    /// [`HostExperts::experts_union_into`] for a prompt batch that feeds an importance collector: the same
+    /// sums, and besides, the rows each listed expert's down reads summed into `tap`
+    /// ([`model::down_tap::DownTap`]). A host that cannot is refused by name, never served untapped.
+    fn experts_union_tapped_into(
+        &mut self,
+        layer: usize,
+        x: Tensor2View<'_>,
+        lists: &[&[(u32, f32)]],
+        out: &mut [f32],
+        tap: &DownTap,
+    ) -> Result<(), GpuError> {
+        let _ = (layer, x, lists, out, tap);
+        Err(GpuError::state(
+            "HostExperts::experts_union_tapped_into",
+            "a host path that sums the routed down's input rows for the importance collector: this host does not",
         ))
     }
 
@@ -2606,6 +2625,14 @@ impl<H: HostExperts> HostTier<H> {
             missing: "the batch port's sets (HostTier::prepare_batch)",
         })?;
         port.routed_ids(key).map_err(|e| stall_noted(swap, e))
+    }
+
+    /// Have the batch service's union calls sum the rows each routed down reads into `tap` from the
+    /// next [`HostTier::serve_key`] on, or none (the default): a prompt batch that feeds an importance
+    /// collector sets it before each serve, the host tier's picks being rows the card never holds as f32.
+    /// A decode step's service reads none.
+    pub fn set_down_tap(&mut self, tap: Option<&'static DownTap>) {
+        self.batch.tap = tap;
     }
 
     /// Wait for the oldest download not served yet — `key`'s, else refused
