@@ -1109,6 +1109,12 @@ fn sub_pre(
                 )?;
                 split_parts
             }
+            // A Q3_K kv is the joined path's one column-group launch over the
+            // sub-block's q8_1 form, not a launch a chunk.
+            SourceProj::Kv(Dense::Q3K(kv)) => {
+                ent.one(gpu.enqueue_gemv_q3k_groups(kv, &b.normed_acts[at], groups, raw))?;
+                &[(COMP_KV, 0, width, 0)]
+            }
             SourceProj::Kv(kv) => {
                 project_chunked(
                     cx,
@@ -1245,6 +1251,14 @@ fn sub_pre(
     match &t.query {
         Query::Joint(w) => {
             ent.one(gpu.enqueue_gemv_q3k_groups(w, &b.q_a_acts[at], groups, &mut b.raw_q))?;
+        }
+        // A Q3_K q_b with no indexer query fills every row of `raw_q`: the
+        // joined path's one column-group launch, not a launch a chunk.
+        Query::Parts {
+            q_b: Dense::Q3K(q_b),
+            index_q: None,
+        } => {
+            ent.one(gpu.enqueue_gemv_q3k_groups(q_b, &b.q_a_acts[at], groups, &mut b.raw_q))?;
         }
         Query::Parts { q_b, index_q } => {
             let total_rows = t.q_rows;
