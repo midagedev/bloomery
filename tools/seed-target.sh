@@ -7,7 +7,9 @@
 #   tools/seed-target.sh --self-test         two scratch trees under $TMPDIR; the refusals; no cargo
 #
 # 1. SRC_TREE/target is cloned into DST_TREE/target with `cp -c` (APFS clonefile: the files share blocks, so the
-#    copy costs no disk until cargo rewrites a file; the mtimes come along).
+#    copy costs no disk until cargo rewrites a file; the mtimes come along). The clone's target/mac-static/ is removed:
+#    it holds SRC_TREE's own mac-static runs, whose recorded pids a later process can reuse, which `tools/wt.sh retire`
+#    would read as a run in flight in DST_TREE.
 # 2. Every file of DST_TREE (not target/, not .git) whose content equals the file of the same path in SRC_TREE gets that
 #    file's mtime. A file that differs, or that SRC_TREE lacks, keeps its own mtime, so cargo rebuilds exactly the
 #    units it feeds. A fresh checkout stamps every file "now", which cargo reads as every unit changed.
@@ -120,6 +122,7 @@ seed_main() {
     say "the clone of $src/target into $dst/target failed; the partial target/ is removed" >&2
     return 70
   fi
+  rm -rf "$dst/target/mac-static"
   if ! restore_mtimes "$src" "$dst"; then
     rm -rf "$dst/target"
     say "the mtime pass failed; the target/ is removed" >&2
@@ -145,6 +148,9 @@ self_test() {
   printf '%064d' 0 > "$src/target/debug/build/p/h1/fingerprint/lib-p"
   printf '%036d' 0 > "$src/target/debug/build/q/h2/fingerprint/lib-q"
   printf '%05d' 0 > "$src/target/debug/.fingerprint/old-unit/lib-old"
+  # SRC's own mac-static run, which the seed must not carry into DST
+  mkdir -p "$src/target/mac-static/run.src"
+  printf 'fmt-check 1\n' > "$src/target/mac-static/run.src/pids"
   find "$src" -exec touch -t 202001010000 {} +
   # DST: written now, so every mtime is later than the seed's
   sleep 1
@@ -200,6 +206,10 @@ self_test() {
   [ "$(mtime_of "$dst/.git/HEAD")" = "$git_m" ] || fail ".git was touched"
   [ "$(mtime_of "$dst/target/debug/build/p/h1/fingerprint/lib-p")" = "$seed_m" ] || fail "the target/ file lost the seed's mtime"
   cmp -s "$src/target/debug/build/q/h2/fingerprint/lib-q" "$dst/target/debug/build/q/h2/fingerprint/lib-q" || fail "the target/ content differs from the seed's"
+  if [ "$(uname)" = Darwin ]; then
+    [ ! -e "$dst/target/mac-static" ] || fail "the seed carried SRC's target/mac-static into DST"
+    [ -f "$src/target/mac-static/run.src/pids" ] || fail "the seed removed SRC's own target/mac-static"
+  fi
   rc=0; out=$(seed_main "$src" "$dst" 2>&1) || rc=$?
   [ "$rc" = 65 ] || fail "a second seed ended rc $rc, not 65: $out"
 
