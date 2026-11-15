@@ -44,3 +44,8 @@ decide-below: the m-column cores at two rows cost more than the fewrow probe's t
   q4k_gemv_mcol and q6k_gemv at m = 2 against the one-row entries, then decide between a fused m-column gate/up/SwiGLU and x
 decide-above: the old verify cost more than its bytes (the re-read missing L2 more than the model says) or x is below 0.08:
   first confirm the equal acceptance counts; equal, keep the change and re-fit x from the two arms
+# Outcome (2026-11-16, A6000, depth-serve under the lease, 4 rounds, 24 servers): undecidable, the instrument did not run the
+#  term. Every `BLOOMERY_DRAFT=mtp` server on the 27B printed `load draft=off (metadata general.architecture: is Qwen35; an
+#  in-file next-token draft of this family is qwen35moe)`: bloomery-serve reads no in-file MTP layer of a qwen35 dense file,
+#  so all six arms decoded plain (35.33 / 35.37 tok/s at D 512, 34.51 / 34.50 at 4096). The plain witness pair holds 0:
+#  35.31 -> 35.28 tok/s (-0.08 %, +-0.53 %). The verify cost itself is read by docs/cards/q35ro-cv.card.
