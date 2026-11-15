@@ -1,0 +1,46 @@
+# The Qwen3.8-27B (qwen35 dense, Q4_K_M) MTP verify reads its dense FFN weights and its output head once a pass, not once a
+# verify row. Same bits as base (the one-row and the m-column cores share the dot and the reduction order), so both arms emit
+# the same tokens and accept the same drafts: the ratio of the two arms is the ratio of their cycle times, whatever the
+# acceptance. A cycle is one MTP draft plus one verify pass of two rows.
+# Decomposition [derived], A6000 at 653 GB/s effective, the 27B Q4_K_M's bytes: read-once cores 4.41 GB, gate/up 6.42 GB,
+# down 3.95 GB, head 1.04 GB, so a plain step is 15.82 GB = 24.2 ms (measured 27.564 / 27.813 / 28.205 ms at depth 6 / 1024 /
+# 4096, rig-log plan-triage, dspine card). The verify at m = 2 re-read gate/up, down and head: 27.2 GB (measured c_v(2) 1.6627 /
+# 1.6617 / 1.6702 steps = 45.8 / 46.2 / 47.1 ms). The second read of those three is 11.41 GB = 17.5 ms; the change drops it.
+# Launches: +5 nodes a layer at two rows (the fused gate/up/SwiGLU one launch becomes two gemvs, the SwiGLU and, for a Q6_K
+# down, the row copy: 5 -> 10) = +320 nodes x 0.85 us = +0.27 ms; the head 8 -> 5 nodes. The decode step (m = 1) keeps its fused
+# launches: its graph is node for node the base's, so plain decode predicts 0 (a witness row, inside the ruler).
+# c_v(2) after = (45.8 - 17.5 + 0.27) / 27.564 = 1.04 steps at depth 6, 1.06 at depth 4096; the band 1.04..1.10 allows 5 % of
+# the 17.5 ms for the m-column cores' second column. The cycle adds x steps of draft (the in-file MTP layer: 0.25 GB of block
+# and the 1.04 GB head, 2.0 ms of bytes, plus its eager launches) and host: x = 0.08..0.30 steps, unmeasured.
+# ratio = (1.663 + x) / (c_v(2)' + x): 1.56 at (x 0.08, 1.04), 1.40 at (x 0.30, 1.10). Depth 4096: 1.54 .. 1.39.
+# No 27B MTP acceptance record exists (rig-log and the box hold none), so the absolute rate is a function of the acceptance a:
+# tok/s = plain x (1 + a) / (c_v + x), plain 36 tok/s at depth 512 [derived from the 27.8 ms step]; at x 0.15:
+#   a 0.4  base 27.7  new 41.3     a 0.6  base 31.7  new 47.2     a 0.8  base 35.7  new 53.1 tok/s [derived]
+# MTP pays against plain decode when a > c_v + x - 1: base a > 0.81, new a > 0.22 at x 0.15 [derived]. The base MTP arm may sit
+# below the plain arm on a low-acceptance prompt; that is not a defect of the A/B.
+# Lead's correction before the lease: the fewrow arms (bench_picks, A6000, docs/cards/fewrow.card outcome) measured the
+# read-once m-column cores at two columns at t2/t1 = 1.21..1.33 (q4k_gemv_mcol at k = 17408 1.30, q6k_gemv down 1.33), the head
+# m-column 1.02, against the per-slot _sel walk's 1.85..2.03. With those: after = gate/up 9.83 ms x 1.25 + down 6.05 ms x 1.31 +
+# head 1.6 ms x 1.02 = 21.9 ms against 35.0 ms before, a saving of 13.2 ms (not 17.5): c_v(2)' = (45.8 - 13.2 + 0.27) / 27.564
+# = 1.19 steps; ratio (1.663 + x) / (1.19 + x) = 1.37 at x 0.08, 1.31 at x 0.30 [derived], so +31..+37 %, band 28..40 for the
+# 1.2..1.35 spread of t2/t1. The round's byte-only 40..56 is the decide-above side.
+kind: ab
+question: does the 27B MTP decode (draft plus a verify of two rows) speed up as the bytes say once the verify reads its dense
+  FFN and its head once?
+term: tok/s (timings.predicted_per_second) @ n=128, depth 512 prose, BLOOMERY_DRAFT=mtp, qwen38d bloomery-serve at its serving
+  defaults, RTX A6000; the depth 4096 arms of the same call are co-rows (predicted +39..+54 %)
+unit: %
+predict: 28..40
+rounds: 4
+condition: one lease, BLOOMERY_MODEL=qwen38d, two trees (this tree against main's, both built with just build for bloomery-serve),
+  order rotated every round; every arm's load prints `draft=mtp` and no row is [cpu-busy], [other-busy] or [cold]; the plain arms
+  (BLOOMERY_DRAFT=off, depth 512) ride as witness rows and are not judged (predicted 0.0 %, inside the ruler at 4 rounds);
+  DEPTH_SERVE_AFTER on round 1 prints /metrics spec_decode_num_accepted_tokens_total and _draft_tokens_total of each arm, which
+  must be equal between the two trees (the bits did not move) before any ratio is read
+decide-in: the verify now reads the FFN and the head once at the cost the bytes say: keep the change; the next term is the draft
+  width (BLOOMERY_MTP_WIDTH above 1 pays now, a 4-row verify is no longer 3.0 steps) and the draft's own cost x
+decide-below: the m-column cores at two rows cost more than the fewrow probe's t2/t1 of 1.21..1.33 says, or the
+  unfused FFN's launches or x ate the gain: read the verify pass in nsys (tools/ref/nsys-gpu.sh), per-entry time of
+  q4k_gemv_mcol and q6k_gemv at m = 2 against the one-row entries, then decide between a fused m-column gate/up/SwiGLU and x
+decide-above: the old verify cost more than its bytes (the re-read missing L2 more than the model says) or x is below 0.08:
+  first confirm the equal acceptance counts; equal, keep the change and re-fit x from the two arms
