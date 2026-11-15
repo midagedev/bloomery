@@ -1,0 +1,35 @@
+# Why the own Q3_K_M (bq3km) host union costs 1.34x a slot against the 1017 Q3_K_M at P = 4096 (union 9.0-9.3
+# s against 6.8-7.0 s over 220 layer-batches, host slots 359,295 against 360,685, the routed types identical).
+# The default file has an r8 sidecar (/models/DeepSeek-V4.1-Flash-1017-Q3_K_M-r8/, 155.7 GB), so its Q3_K gate
+# and up run the row-lane tile (qdot::dot_q3k_r8_cols); bq3km has none (no
+# /models/DeepSeek-V4.1-Flash-1017-bq3km-r8), so they run the one-row tile (dot_row_cols), whose Q3_K unpack
+# is paid per row per run of 8 columns: 192 against 67.5 half-instruction units a row super-block
+# (crates/model/src/ops.rs:4100, :4160).
+# Decomposition [derived]: the pass bytes and the Q4_K down (row lanes, 1184 + 612 m per 8-row group
+# super-block) are the same; the instruction model over the 1640 host slots a layer-batch gives union B/A =
+# 1.17..1.21; the measured 1.32..1.34 leaves 0.12..0.14 to the Rows tile's lower IPC (unproven). Same-binary
+# arm: the default file with BLOOMERY_R8=off reads its own source rows, the bq3km path with the default file's
+# bytes.
+kind: ab
+question: does the default Q3_K_M lose the union time when its r8 sidecar is switched off (BLOOMERY_R8=off),
+  landing where the own file sits?
+term: pp tok/s @ P = 4096 prose, place a, RTX A6000, default Q3_K_M file, BLOOMERY_R8=off against the default
+  (r8 on); the third arm bq3km beside them; stat prefill union_ms read per arm
+unit: %
+predict: -21..-11
+rounds: 2
+condition: one lease, main's generate_ds41, BLOOMERY_AB_ROUNDS=2 just depth-gpu-ds41
+  prose:4096@BLOOMERY_STEP_STATS=1 prose:4096@BLOOMERY_STEP_STATS=1,BLOOMERY_R8=off
+  prose:4096@BLOOMERY_STEP_STATS=1,BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf,BLOOMERY_REF_MODEL=/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf, the order
+  rotated every round; the load lines must read r8=on (<Q3_K_M-r8 path>) in arm 1, r8=off (BLOOMERY_R8=off) in
+  arm 2 and r8=off (no sidecar at <bq3km-r8 path>) with type=q3_k k=5120 path=fused in arm 3; no row
+  [cpu-busy] or [other-busy]; union_host_slots within 1 % across arms
+decide-in: the switch costs 11..21 %: the sidecar is the mechanism (arm 2 union_ms 8.0..9.4 s; 8.8 s or more
+  is the whole gap): compare the own file with the default file at BLOOMERY_R8=off for the shipped path (the
+  release uses no sidecar), and write a bq3km sidecar (just r8-sidecar, an exclusive card) for its sidecar
+  speed
+decide-below: under 11 %: the sidecar is a minor part: read arm 2 against arm 3 union_ms per layer from the
+  stat prefill lb rows; the residual is a file-level term (page placement, the up in another shard on four
+  layers) and a placement round is next
+decide-above: over 21 %: arm 2 is slower than bq3km: the default file's source rows carry a cost bq3km's do
+  not (offsets, alignment); read arm 2 against arm 3 per layer before any sidecar work
