@@ -153,16 +153,25 @@ fn go() -> Result<(), Error> {
         };
         quantize::run(&a, prep, &mut b, &mut log)?
     };
-    println!(
-        "bloomery-quantize: done in {:.0} s; {} tensors quantized in {:.0} s at {:.3e} weights/s",
-        s.wall_s,
-        s.quantized,
-        s.quant_s,
-        if s.quant_s > 0.0 {
-            s.weights / s.quant_s
-        } else {
-            0.0
-        }
+    let mut line = format!(
+        "bloomery-quantize: done in {:.0} s; {} tensors quantized",
+        s.wall_s, s.quantized
     );
+    if s.iq_tensors > 0 && s.iq_s > 0.0 {
+        line += &format!(
+            "; {} IQ in {:.0} s at {:.3e} weights/s",
+            s.iq_tensors,
+            s.iq_s,
+            s.iq_weights / s.iq_s
+        );
+    }
+    if s.host_weights > 0.0 && s.wall_s > 0.0 {
+        line += &format!(
+            "; {:.3e} weights by the host rules at {:.3e} weights/s over the wall",
+            s.host_weights,
+            s.host_weights / s.wall_s
+        );
+    }
+    println!("{line}");
     Ok(())
 }

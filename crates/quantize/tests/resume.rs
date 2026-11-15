@@ -230,6 +230,11 @@ fn resume_equals_one_pass() {
     let (r, _) = run(&first, &a_dir.join("set"), false, &[]);
     let a = r.unwrap();
     assert_eq!(a.kept, 0, "a plain run keeps nothing");
+    assert_eq!(
+        (a.iq_tensors, a.host_weights),
+        (0, 512.0 * a.quantized as f64),
+        "a Q8_0 run converts every tensor by the host rules, each of 256 x 2 weights, and none as IQ"
+    );
     let want: Vec<Vec<u8>> = outs(&a_dir)
         .iter()
         .map(|p| std::fs::read(p).unwrap())

@@ -323,10 +323,15 @@ fn header_field(header: &[u8], at: usize) -> String {
 /// What a run did.
 #[derive(Debug)]
 pub struct Summary {
-    /// Tensors converted, and the weights of the IQ ones with the seconds they took (the card's or the host's).
+    /// Tensors converted, the IQ ones and the host rules' together.
     pub quantized: usize,
-    pub weights: f64,
-    pub quant_s: f64,
+    /// The IQ tensors (the card's backend or the host's): how many, their weights and the seconds they took.
+    pub iq_tensors: usize,
+    pub iq_weights: f64,
+    pub iq_s: f64,
+    /// The weights the host rules converted; they overlap the reads and the writer, so they carry no seconds of
+    /// their own and their rate is over the run's wall.
+    pub host_weights: f64,
     pub wall_s: f64,
     /// The shards this run wrote; under `--resume` the kept ones are not among them.
     pub files: Vec<PathBuf>,
@@ -443,6 +448,7 @@ fn write_all(
     ));
     let t_all = Instant::now();
     let (mut t_q, mut w_q, mut n_q) = (0.0f64, 0.0f64, 0usize);
+    let (mut n_iq, mut w_host) = (0usize, 0.0f64);
     let mut tables: [Option<GridTables>; 2] = [None, None];
     let mut files = Vec::new();
     let ahead = !backend.uses_host_pool();
@@ -528,7 +534,7 @@ fn write_all(
                             )?;
                             let secs = t0.elapsed().as_secs_f64();
                             let wt = (ne0 * ne1 * n_exp) as f64;
-                            (t_q, w_q, n_q) = (t_q + secs, w_q + wt, n_q + 1);
+                            (t_q, w_q, n_q, n_iq) = (t_q + secs, w_q + wt, n_q + 1, n_iq + 1);
                             log(&format!(
                                 "  {name} {:?} -> {kind:?}: {wt:.3e} weights in {secs:.1} s (read overlapped) = {:.3e} weights/s",
                                 item.src,
@@ -548,6 +554,7 @@ fn write_all(
                             };
                             w.tensor(name, &bytes).map_err(wr)?;
                             n_q += 1;
+                            w_host += (item.dims[0] * item.slabs.rows * item.slabs.count) as f64;
                             log(&format!(
                                 "  {name} {:?} -> {:?}: {} B on the host ({:.1} s waited for)",
                                 item.src,
@@ -609,8 +616,10 @@ fn write_all(
     ));
     Ok(Summary {
         quantized: n_q,
-        weights: w_q,
-        quant_s: t_q,
+        iq_tensors: n_iq,
+        iq_weights: w_q,
+        iq_s: t_q,
+        host_weights: w_host,
         wall_s: t_all.elapsed().as_secs_f64(),
         files,
         kept: n_kept,
