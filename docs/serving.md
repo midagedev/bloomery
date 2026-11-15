@@ -427,6 +427,10 @@ A lever is a `BLOOMERY_*` variable that changes one behavior, such as `BLOOMERY_
 `bloomery-serve --levers` prints each lever, whether this binary and seat apply it, and its value. The list is the rows
 of [`crates/levers/src/registry.rs`](../crates/levers/src/registry.rs) ([`BUILD.md`](BUILD.md#levers)).
 
+One CUDA driver variable is set for you: unset, `CUDA_SCALE_LAUNCH_QUEUES` becomes `2x` (a deeper launch queue per
+stream, so a prompt batch's host thread does not wait on it); NVIDIA's other values (`0.25x`, `0.5x`, `4x`) are kept,
+and any other value stops the binary at start with a message, where the driver would ignore it.
+
 ## 8. Running it as a service
 
 ### 8.1 API keys and binding

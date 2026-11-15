@@ -1056,7 +1056,9 @@ gpu-vision 170 0 0
 # PIN(2026-10-21): hf 2 -> 0 blocks, the mapped reader moved intact to safetensors.
 hf 0 0 0
 jinja 0 0 0
-levers 0 0 0
+# PIN(2026-11-15): levers 0 -> 1 block, new code, not old code relaxed: at_main's write of the CUDA driver's
+# launch-queue scale (lib.rs `set_launch_queues`), made only while the process has one thread, with its SAFETY line.
+levers 1 0 0
 # PIN(2026-10-22): metal 21 blocks, 6 fns, 13 impls, a new crate, not old code relaxed: the Objective-C bindings declare
 # no Metal protocol thread-safe, so the thread-safe handles and the window's raw carry `unsafe impl Send/Sync` with Apple's
 # list as their invariant; the window raw's buffer dereference and pages and the encoder's two argument calls each carry

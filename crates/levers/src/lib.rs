@@ -3384,7 +3384,9 @@ pub fn override_with(pairs: &[(&str, String)]) -> Result<Vec<String>, LeverError
 /// the values of [`override_with`] over it. With `--levers` among the
 /// process's arguments it prints the reading's table on stdout (whether this
 /// run applies each lever, and at what value) and exits 0, or returns the
-/// reading's refusals after the table.
+/// reading's refusals after the table. It also sets the CUDA driver's
+/// launch-queue scale ([`LAUNCH_QUEUES`]) to [`LAUNCH_QUEUES_DEFAULT`] when
+/// unset, and refuses a value the driver does not document.
 pub fn at_main(acts_on: &[&str]) -> Result<Levers, LeverError> {
     at_main_with_flags(acts_on, |name| {
         std::env::args_os().skip(1).any(|a| a == name)
@@ -3423,8 +3425,19 @@ fn main_reading(
         .and_then(Path::file_name)
         .map_or_else(|| "unnamed".to_string(), lossy);
     let env = process_env();
+    let queues = launch_queues(
+        env.iter()
+            .rev()
+            .find(|(k, _)| k == LAUNCH_QUEUES)
+            .map(|(_, v)| v.as_os_str()),
+    );
     let reading = reading(&env, Scope::Main { bin: &bin, acts_on });
-    let notes = reading.unapplied(&bin);
+    let mut notes = reading.unapplied(&bin);
+    if let Ok(Some(scale)) = queues
+        && let Some(line) = set_launch_queues(scale)
+    {
+        notes.push(line);
+    }
     let asked = has_flag("--levers");
     if !held || asked {
         for line in &notes {
@@ -3437,7 +3450,78 @@ fn main_reading(
             std::process::exit(0);
         }
     }
-    (reading.levers(), notes)
+    let levers = match (reading.levers(), queues) {
+        (levers, Ok(_)) => levers,
+        (Ok(_), Err(refusal)) => Err(LeverError {
+            refused: vec![refusal],
+        }),
+        (Err(mut e), Err(refusal)) => {
+            e.refused.push(refusal);
+            Err(e)
+        }
+    };
+    (levers, notes)
+}
+
+/// The CUDA driver's launch-queue scale, read once at `cuInit`: the depth of
+/// each stream's launch queue as a multiple of the driver's default. A prompt
+/// batch enqueues more launches a layer than the default queue holds, so the
+/// host waits on the queue; the engine runs at [`LAUNCH_QUEUES_DEFAULT`]
+/// unless the variable is set. It is the driver's name, not a `BLOOMERY_*`
+/// lever, so no registry row carries it; `docs/serving.md` says it.
+pub const LAUNCH_QUEUES: &str = "CUDA_SCALE_LAUNCH_QUEUES";
+
+/// The values NVIDIA documents for [`LAUNCH_QUEUES`]. The driver ignores any
+/// other value with a warning; a reading refuses it by name instead.
+pub const LAUNCH_QUEUES_VALUES: [&str; 4] = ["0.25x", "0.5x", "2x", "4x"];
+
+/// What an unset [`LAUNCH_QUEUES`] becomes in a binary's environment.
+pub const LAUNCH_QUEUES_DEFAULT: &str = "2x";
+
+/// What [`at_main`] does with [`LAUNCH_QUEUES`] as the environment sets it:
+/// `Ok(Some(scale))` writes `scale` (unset), `Ok(None)` keeps a documented
+/// value, and any other value is a refusal naming the values it takes.
+pub(crate) fn launch_queues(set: Option<&OsStr>) -> Result<Option<&'static str>, Refusal> {
+    let Some(v) = set else {
+        return Ok(Some(LAUNCH_QUEUES_DEFAULT));
+    };
+    if LAUNCH_QUEUES_VALUES.iter().any(|d| v == *d) {
+        return Ok(None);
+    }
+    Err(Refusal {
+        name: LAUNCH_QUEUES.to_string(),
+        value: lossy(v),
+        why: Why::Value(format!(
+            "the CUDA driver ignores it; it takes one of {} (unset is {LAUNCH_QUEUES_DEFAULT})",
+            LAUNCH_QUEUES_VALUES.join(", ")
+        )),
+    })
+}
+
+/// Writes `scale` as [`LAUNCH_QUEUES`] into the process environment when the
+/// process has one thread (Linux, `/proc/self/task`), so no other thread can
+/// read the environment while it is written. Otherwise it
+/// writes nothing and returns the line that says so; a card opened then runs
+/// at the driver's default depth.
+#[cfg(target_os = "linux")]
+fn set_launch_queues(scale: &'static str) -> Option<String> {
+    let threads = std::fs::read_dir("/proc/self/task").map(Iterator::count);
+    if matches!(threads, Ok(1)) {
+        // SAFETY: the process has one thread, this one, so no other thread
+        // reads or writes the environment while it is written.
+        unsafe { std::env::set_var(LAUNCH_QUEUES, scale) };
+        return None;
+    }
+    Some(format!(
+        "{LAUNCH_QUEUES} is not set to {scale}: the process already runs more than one thread \
+         ({threads:?} under /proc/self/task) when the levers are read; set it in the environment"
+    ))
+}
+
+/// Off Linux no CUDA card is opened, so the scale is not written.
+#[cfg(not(target_os = "linux"))]
+fn set_launch_queues(_scale: &'static str) -> Option<String> {
+    None
 }
 
 /// The worker pool's two levers ([`THREADS`], [`SPIN`]), read where the

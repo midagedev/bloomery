@@ -3329,3 +3329,20 @@ fn draft_word_is_typed_and_checked_against_the_seat() {
         "{refused}"
     );
 }
+
+/// An unset launch-queue scale becomes the engine's default, a value the
+/// driver documents is kept, and any other value is a refusal by name.
+#[test]
+fn launch_queues_default_keep_refuse() {
+    assert_eq!(launch_queues(None), Ok(Some("2x")));
+    for kept in ["0.25x", "0.5x", "2x", "4x"] {
+        assert_eq!(launch_queues(Some(OsStr::new(kept))), Ok(None), "{kept}");
+    }
+    for bad in ["3x", "", "2X", "1x"] {
+        let r = launch_queues(Some(OsStr::new(bad))).expect_err(bad);
+        assert_eq!(r.name, "CUDA_SCALE_LAUNCH_QUEUES");
+        assert_eq!(r.value, bad);
+        let line = r.to_string();
+        assert!(line.contains("0.25x, 0.5x, 2x, 4x"), "{line}");
+    }
+}
