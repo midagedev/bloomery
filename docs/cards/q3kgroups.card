@@ -46,3 +46,10 @@ decide-below: entries_route fell as predicted but pp did not move: the removed l
 decide-above: the chunked launches cost the card more than their gaps (card_in_lb fell more than
   0.5 ms a layer-batch): the groups kernel shares weight reads across groups through L2; price that
   term in the flow model's constants before the next attention change
+# outcome 2026-11-15 (one lease, A6000 300 W 2100 MHz, fbd58dc9b's generate_ds41 against 6cf1d24c2's, both arms
+#  CUDA_SCALE_LAUNCH_QUEUES=2x, 8 rounds, order rotated, no [cpu-busy] or [other-busy] row): pp this tree / base per round
+#  r1 1.2178 [cold, both arms] r2 1.0582 (the base arm's 467.16 still warming) r3..r8 1.0018 1.0035 1.0055 1.0029 1.0049
+#  1.0073; the runner's mean over all 8 is 1.0378 +- 0.0629 (r1, r2 inside it); over the warm rounds r3..r8 +0.43 % +- 0.21 %
+#  (t 2.571, 5 df): in band, at its low edge. Decode @ 4096 1.0010 +- 0.0059 (unmoved). Stat lines: this tree's
+#  entries_route 410 / 1306 on layers 0 / 1 (the flow model's values) against the base's 534 / 1430. decide-in: landed with
+#  the launch-queue default (fbd58dc9b); the issue and gap terms are where the card put them.
