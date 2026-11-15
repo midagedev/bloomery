@@ -1,0 +1,56 @@
+# fewrow on the A6000 (sm_86, 84 SMs, 768 GB/s, 6 MB L2): what two to eight verify columns cost on the dense MTP models' matrices.
+# What the verify launches [read from the code and the box's file headers]: Qwen3.8-27B (Body35, mtp35 WIDTH 1) and Flint /
+# K-EXAONE (WIDTH 1) verify at m = 2 (m = WIDTH + 1); only Body38 and DSpark reach m = 8. The 27B's gemv arm (m <= 8) launches
+# the dense FFN's gate.up and down through the per-slot `_sel` entries (n_slots = m over one expert: a warp a (slot, row), the
+# 50-100 MB weight read once a slot, 6 MB of L2 holds none of it), the head as m one-column launches (Tail::Rows, 1.043 GB each),
+# and qkv / z / o through read-once m-column cores. Bytes a launch, one copy [derived from the shard headers]: gate.up 100.3 MB,
+# down Q4_K 50.1 MB, down Q6_K 73.1 MB, head 1,043 MB, delta qkv Q6_K 43.0 MB, Q8_0 attn_q 53.4 MB. t1 at 0.85 of 768 GB/s
+# = 653 GB/s [derived, kernel-picks.md section 3.1]: 154, 77, 112, 1,598, 66, 82 us.
+# Predictions, t_m / t_1 of the same walk [derived]:
+#   per-slot `_sel` (eng_m* on q4k_gateup, q4k_down, q6k_down): the grid is slot-major, a slot's pass reads the whole matrix,
+#     so t_m = m t_1 less the launch tail: m = 2 1.94-2.02, m = 4 3.8-4.05, m = 8 7.5-8.1. Bandwidth, not ALU.
+#   head eng_m* (m one-column launches over 1 GB, nothing reused): m x t_1, within 1 %: 1.98-2.02, 3.95-4.03, 7.9-8.05.
+#   read-once m-column cores (mcol_m* on the Q4_K and Q6_K down, head, qkv, Q8_0 eng_m*): per warp iteration of the Q4_K walk
+#     (576 B of weights = 130 clk of DRAM an SM) the walk issues about 54 + 29 m warp instructions, loads 24 + 10 (m - 1) L1
+#     wavefronts, 34 + 12 m integer warp instructions (2 a clk) and 2 + 2 m conversions (0.5 a clk): at m = 8 issue 72, L1 94,
+#     INT 65, XU 36 clk against 130, so DRAM stays the longest unit and the others sit at 28-72 % of it. The unit the derivation
+#     cannot fix is whether the 8 columns' activation (161 KB at k = 17,408, more than the 120 KB of L1) stays in L1 while the
+#     warps of a wave run a few iterations apart (then L2 refills 5-10 % of 9.5 KB a warp iteration, 15-30 clk) or sweeps past
+#     it (L2 bound, up to 2.3). Bands: Q4_K k = 17,408 m = 2 1.00-1.08, m = 4 1.00-1.20, m = 8 1.05-1.40 (centre 1.2);
+#     Q6_K k = 17,408 (420 B and 5 loads a column) 1.00-1.08, 1.00-1.15, 1.00-1.30; Q6_K qkv k = 5,120 (activation 47 KB, in L1)
+#     1.00-1.05, 1.00-1.10, 1.00-1.25; Q8_0 attn_q (x is f32, 30 bytes of x a weight byte at m = 8) 1.00-1.10, 1.05-1.40, 1.2-2.0.
+# The decision rule is the spec's: >= 1.4 go, <= 1.1 drop, between: go only if (t8 - t1) / t8 x the verify GEMV share >= 3 % of
+# decode tok/s. The share [derived from the shard headers' tensor bytes of blocks 0-63, A6000, weights only]: the 27B at m = 2
+# today reads 27.2 GB a verify (gate.up 12.83, down 7.89, head 2.09, read-once cores 4.41) against 15.8 GB a step (1.72 x);
+# the read-once cores' part is 16 % of the verify, so the ceiling of a few-row MMA at m = 2 is (1 - 1/r2) of that 16 %: about
+# 1.2 % of a verify at r2 = 1.08, and less of a step, which holds the draft too: under the 3 % bar over the whole band. The
+# per-slot rows and the head are the larger lever (11.4 of 27.2 GB, 17.5 of 41.7 ms a verify at 653 GB/s) and need no new
+# kernel: they go through the read-once cores that exist.
+kind: profile
+question: does the read-once Q4_K m-column core go instruction- or L1-bound at eight columns on sm_86, so a few-row MMA walk has a ceiling worth a round?
+term: mcol_m8 / mcol_m1 mean us a launch, fewrow_q4k_down_5120x17408 (q4k_gemv_mcol over 50.1 MB, weights cycled over 512 MiB, graph replay, A6000, bench_picks --time --arm fewrow)
+unit: ratio
+predict: 1.05..1.40
+condition: bench-picks.sh holds the lease on the A6000 for the whole run and the witness blocks show no other compute process on it,
+  the SM clock and the power counters; every group's arms gave bits equal to the one-column oracle (a mismatch ends the run); the
+  group's A/A arm lands within 1 % of 1 (aa_over_eng_m1); the same row's eng_m2_vs_eng_m1 on the per-slot groups (q4k_gateup,
+  q4k_down, q6k_down) and on the head reads 1.9-2.05, which is the premise that those entries read their weights once a column
+  (a lower value ends the premise, and the rows below are then read without it)
+decide-in: inside 1.05-1.40 apply the spec's rule on this row: at most 1.1 drop the few-row MMA; 1.1-1.4 go only for a model whose
+  verify is wide, since the dense MTP models verify at m = 2 and their mcol_m2_vs_mcol_m1 row (predicted 1.00-1.08) puts the
+  ceiling under 1 % of a verify; whatever the value, the per-slot and head rows decide the next round, which is the read-once
+  cores for the dense FFN and the head (bulk, no MMA)
+decide-below: under 1.05 the m-column core is bandwidth-bound at eight columns: drop the few-row MMA idea, and the next round is the
+  read-once route for the dense FFN and the head alone
+decide-above: over 1.4 the core is L1- or instruction-bound at eight columns: read the m = 4 row and the Q6_K and Q8_0 rows to see
+  which types, take one ncu pass of q4k_gemv_mcol (L1 hit rate of the activation, issue-active) before an MMA round, since an
+  activation that sweeps past L1 is staged in shared memory more cheaply than a tensor-core walk is written
+# Outcome (2026-11-15, A6000 300 W, lease, bench_picks --time --arm fewrow, paired rounds, A/A 0.987..1.003): the term
+#  mcol_m8 / mcol_m1 on fewrow_q4k_down_5120x17408 is 2.842 +- 0.008, far above the band (decide-above). Same walk ratios
+#  m2 / m4 / m8: q4k_gemv_mcol (down Q4_K, k 17,408) 1.298 / 1.843 / 2.842; q6k_gemv (down Q6_K, k 17,408) 1.330 / 1.743 /
+#  2.490; head Q6_K one m-column launch (k 5,120) 1.019 / 1.664 / 2.358; qkv Q6_K (k 5,120) 1.210 / 1.640 / 2.339; Q8_0
+#  attn_q (k 6,144) 1.050 / 1.838 / 2.947. The per-slot `_sel` walk: gate.up 1.929 / 3.746 / 7.380, down Q4_K 2.027 /
+#  3.795 / 7.284, down Q6_K 1.851 / 3.698 / 7.226; the head's m one-column launches 2.000 / 4.005 / 8.006 (t1 1,484 us).
+#  The read-once cores leave the DRAM bound past two columns on every type (and at two on k = 17,408): an ncu pass of
+#  q4k_gemv_mcol (activation L1 hit rate, issue-active) comes before an MMA round. The per-slot rows confirm the re-read:
+#  the read-once route for the 27B's dense FFN and head is round q35ro.
