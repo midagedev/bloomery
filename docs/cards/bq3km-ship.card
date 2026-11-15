@@ -19,3 +19,9 @@ decide-in: pp and decode within 3 % of the default's r8-off rows at both P (or f
   the default flip is the user's call with the loss table
 decide-below: slower by more than 3 %: read stat prefill per arm; the router/engram/residency term is the suspect
 decide-above: faster: same lines; the flip carries a speed gain on the shipped path
+# Outcome (2026-11-15, A6000 300 W, place a, main e2149c1ed's generate_ds41, 3 rounds, order rotated, every load line
+#  r8=off, no [cpu-busy] or [other-busy] row): pp @ 4096 bq3km 403.10 (395.42..411.81, cold 0/3) against the default's
+#  387.73 (372.71..409.94, cold 1/3), +4.0 %; pp @ 512 237.99 (219.19..254.59, cold 1/3) against 245.21 (244.47..246.02),
+#  -2.9 %, its spread 16 % from the cold row; decode @ 512 45.34 against 45.72 (-0.8 %), @ 4096 37.04 against 37.06.
+#  decide-in: on the shipped path the own file holds the default's speed (faster at 4096, inside 3 % at 512); the flip
+#  is the user's call with the loss table, after the file is rewritten with the full down importance (imxdown).
