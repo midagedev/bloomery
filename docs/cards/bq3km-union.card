@@ -1,0 +1,20 @@
+# Why the own Q3_K_M's host union is slower than the default file's at P = 4096 (the bq3km-speed sitting: union 9.1 s
+# against 6.8 s over 220 layer-batches, the host slots 359,295 against 360,685, the routed experts' types identical by
+# the shard headers: gate/up Q3_K x40, down Q4_K x38 + Q5_K x2). The files differ in the engram layout (one
+# per_layer_token_embd Q3_K against per-layer engram_embd), engram_k/q (BF16 there, absent here), the router
+# ffn_gate_inp (F32 against BF16) and the residency plan (mid-p6-s1 against mid-p4-s1).
+# Decomposition: if the extra ~10 ms a layer-batch spreads over every layer, it is the host's memory (page cache,
+# placement) and not a tensor; if it sits on a few layers, those layers' tensors or their residency are the term.
+kind: profile
+question: where in the layers does the own Q3_K_M's extra host union time sit at P = 4096?
+term: union_ms per layer-batch from the stat prefill lb records, the own file's arm (bq3km), P = 4096 prose, place a,
+  RTX A6000; read against the default file's arm of the same invocation, layer by layer
+unit: ms
+predict: 38..45
+condition: one lease, main's generate_ds41, BLOOMERY_AB_ROUNDS=2 just depth-gpu-ds41 prose:4096@BLOOMERY_STEP_STATS=1
+  prose:4096@BLOOMERY_STEP_STATS=1,BLOOMERY_V41_MODEL=/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf,BLOOMERY_REF_MODEL=/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf, the order rotated every round
+decide-in: compare per layer: spread evenly = memory term (page cache / pinning), a residency round next; on a few
+  layers = those layers' tensors (dump their types and offsets), a quantize or engine round next
+decide-below: the union matches the default's here: the speed sitting's gap was the page cache of a freshly written
+  file; rerun bq3km-speed
+decide-above: the union grew again; read the residency lines for evictions between the arms
