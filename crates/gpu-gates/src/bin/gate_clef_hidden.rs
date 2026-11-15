@@ -18,7 +18,8 @@
 //!   past [`TAIL_CUT`] at most [`TAIL_SHARE`]; the 99th percentile, the
 //!   worst position and the largest max abs error printed. The 64-id set
 //!   also runs on the pass path (eight passes of eight: the gemv arm, the
-//!   dense FFN through `_sel` with route 0), held to the same bands.
+//!   dense FFN's gate, up and down as plain `m`-column gemvs), held to the
+//!   same bands.
 //!
 //! - (q) the same on Clef-Flash as bartowski publishes it at Q8_0 (32
 //!   layers of width 4,096 — 24 gated-delta, 8 gated GQA at 16/4 heads —
@@ -30,7 +31,8 @@
 //!   body's launch count of a plan whose sites launch alone
 //!   (`Body35::pass_launches`) is the captured graphs' node count: the
 //!   decode step, its count plus the Q8_0 head's three; a pass of 5 and of 8
-//!   rows, its count plus each row's copy into its head and the head.
+//!   rows, its count plus the copy of the rows into the one head of them and
+//!   that head ([`PASS_HEAD`]: the norm, the gemv and the argmax).
 //!
 //! - (l) the same on lev as ggml-org publishes it at Q4_K_M (`qwen35`, a
 //!   Qwen3.5-4B: 32 layers of width 2,560 — 24 gated-delta, 8 gated GQA at
@@ -73,6 +75,10 @@ mod gate {
     use std::path::Path;
 
     /// The 27B's width and Clef-Flash's, as the headers state them.
+    /// The nodes of a captured pass's one head over the Q8_0 head's rows: the copy of the rows into
+    /// its input, the final norm, the gemv and the argmax. PIN(2026-11-15): one head of the pass's
+    /// rows, where each row had a head of its own (4 a row).
+    const PASS_HEAD: usize = 4;
     const WIDTH: usize = 5120;
     const FLASH_WIDTH: usize = 4096;
     /// lev's.
@@ -438,9 +444,9 @@ mod gate {
             (5usize, engine.capture_rows::<5>()?),
             (8, engine.capture_rows::<8>()?),
         ] {
-            let pass = nodes == many + 4 * rows;
+            let pass = nodes == many + PASS_HEAD;
             println!(
-                "  launches: pass m={rows} graph_nodes={nodes}, the body counts {many} + 4·{rows}  {}",
+                "  launches: pass m={rows} graph_nodes={nodes}, the body counts {many} + {PASS_HEAD}  {}",
                 verdict(pass)
             );
             ok &= pass;

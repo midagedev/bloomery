@@ -33,10 +33,10 @@
 //! What is asserted:
 //! - (s) structure: the captured decode step holds [`Shape::nodes_decode`]
 //!   nodes, all kernels; a captured pass of `m` rows holds
-//!   [`Shape::nodes_pass`] `+ 4m`
-//!   (`m` memcpys of a row into its head, the rest kernels), at `m` = 5 and
+//!   [`Shape::nodes_pass`] `+` [`q35_clauses::pass_head_nodes`] (one memcpy of
+//!   the rows into the one head of them, the rest kernels), at `m` = 5 and
 //!   8; each count also equals the body's own launch count
-//!   (`Body35::pass_launches`) plus its heads. The layer stores' bytes equal
+//!   (`Body35::pass_launches`) plus its head. The layer stores' bytes equal
 //!   their derivation from the header ([`store_bytes`]). The flash
 //!   launches' grids: the segment pass `n_kv · SEGMENTS` blocks an
 //!   attention layer and the merge `n_head`, one of each an attention
@@ -178,8 +178,8 @@
 //!   layer: q8_0 shared parts beside q4_K gate and up and q5_K or q6_K
 //!   downs); the captured decode step [`Shape::nodes_decode`] of that file's
 //!   header (844 nodes on the real one), all kernels, and a pass of `m` rows
-//!   [`Shape::nodes_pass`] (841) `+ 4m`, each the
-//!   body's launch count plus its heads; (p) and (p′) on the batch set's
+//!   [`Shape::nodes_pass`] (841) `+` [`q35_clauses::pass_head_nodes`], each the
+//!   body's launch count plus its head; (p) and (p′) on the batch set's
 //!   tokens; and (w)'s cut on the step-1,024 set's prompt (one ubatch of
 //!   [`U_GATE`] and two calls cut at [`W_CUT`], the wide arm's unjoined
 //!   launches), each bit for bit. The FFN half against the host: the first
@@ -408,8 +408,8 @@ mod gate {
     use super::flash_grid::flash_grids;
     use super::q3place::{self, PlaceQ3};
     use super::q35_clauses::{
-        self as q35, Geometry35, PathRun, Slots35, decode_run, fresh, lcg_ids, refed_after_cut,
-        same_run, same_store, stores, uncut_call,
+        self as q35, Geometry35, PathRun, Slots35, decode_run, fresh, lcg_ids, pass_head_nodes,
+        refed_after_cut, same_run, same_store, stores, uncut_call,
     };
     use super::residency_clauses;
     use app::Session;
@@ -1161,12 +1161,12 @@ mod gate {
             (8, m.capture_rows::<8>()?, m.rows_graph_nodes::<8>()?),
         ] {
             let ([k, c], other) = count_kinds(&list, [kernel, memcpy]);
-            let want = want_pass + 4 * rows;
-            let pass =
-                nodes == want && c == rows && k == nodes - rows && launch_m + 4 * rows == nodes;
+            let head = pass_head_nodes(rows);
+            let want = want_pass + head;
+            let pass = nodes == want && c == 1 && k == nodes - 1 && launch_m + head == nodes;
             println!(
-                "structure pass m={rows} graph_nodes={nodes} (want {want}; the body counts {} + 4·{rows}) \
-                 kernel={k} memcpy={c} (want {rows}) other={other} {}",
+                "structure pass m={rows} graph_nodes={nodes} (want {want}; the body counts {} + the \
+                 one head's {head}) kernel={k} memcpy={c} (want 1) other={other} {}",
                 launch_m,
                 verdict(pass)
             );
@@ -3133,12 +3133,12 @@ mod gate {
             (8, m.capture_rows::<8>()?, m.rows_graph_nodes::<8>()?),
         ] {
             let ([k, c], other) = count_kinds(&list, [kernel, memcpy]);
-            let want = want_pass + 4 * rows;
-            let pass =
-                nodes == want && c == rows && k == nodes - rows && launch_m + 4 * rows == nodes;
+            let head = pass_head_nodes(rows);
+            let want = want_pass + head;
+            let pass = nodes == want && c == 1 && k == nodes - 1 && launch_m + head == nodes;
             println!(
                 "unjoined pass m={rows} graph_nodes={nodes} (want {want}; the body counts {} + \
-                 4·{rows}) kernel={k} memcpy={c} (want {rows}) other={other} {}",
+                 the one head's {head}) kernel={k} memcpy={c} (want 1) other={other} {}",
                 launch_m,
                 verdict(pass)
             );

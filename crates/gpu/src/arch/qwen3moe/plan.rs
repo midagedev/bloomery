@@ -62,23 +62,35 @@ pub(super) fn out_fused(d: &DeltaPlan) -> bool {
     all_q4k(&[d.out_ty])
 }
 
-/// The gemv arm's gate·up·SwiGLU of `f` in one launch: a routed FFN's always (the card kernel
-/// table's gate·up entry of its type), a dense FFN's Q4_K gate and up; otherwise each launches
-/// alone and the SwiGLU after them.
-pub(super) fn gate_up_fused(f: &FfnPlan) -> bool {
+/// The gemv arm's gate·up·SwiGLU of `f` at `m` rows in one launch: a routed FFN's always (the card
+/// kernel table's gate·up entry of its type), a dense FFN's Q4_K gate and up at one row. Past one
+/// row a dense FFN's gate and up are the m-column gemvs of `dispatch::site_gemv`, each reading its
+/// matrix once for every row, where the `_sel` entry over one expert reads it once a row; otherwise
+/// each launches alone and the SwiGLU after them.
+pub(super) fn gate_up_fused(f: &FfnPlan, m: usize) -> bool {
     match f.route {
         FfnRoute::Router { .. } => true,
-        FfnRoute::Dense => all_q4k(&[f.gate_ty, f.up_ty]),
+        FfnRoute::Dense => m == 1 && all_q4k(&[f.gate_ty, f.up_ty]),
     }
 }
 
-/// The gemv arm's down of `f` as the slots' `_sel` over their ids: a routed FFN's always (the
-/// table's down entry of its type), a dense FFN's Q4_K or Q6_K; otherwise a dense FFN's one slot a
-/// token runs it as a plain projection (`dispatch::site_gemv`).
-pub(super) fn down_sel(f: &FfnPlan) -> bool {
+/// Whether the plain gemv of a K-quant site of type `ty` reads `k` columns of a row at more than
+/// one activation column: `site::kgemv` refuses a Q6_K site of an odd super-block count past one
+/// column (its rows are unaligned to the words the plain gemv reads).
+fn reads_columns(ty: SiteTy, k: usize) -> bool {
+    !(ty == SiteTy::Q6K && (k / 256) % 2 == 1)
+}
+
+/// The gemv arm's down of `f` at `m` rows, whose SwiGLU rows are `ff` wide, as the slots' `_sel`
+/// over their ids: a routed FFN's always (the table's down entry of its type), a dense FFN's Q4_K
+/// or Q6_K at one row, and past it only a Q6_K down of an odd super-block count of `ff`, which the
+/// m-column gemv cannot read. Any other dense down runs as a plain projection
+/// (`dispatch::site_gemv`), token-major: at more than one row each of its rows reads the matrix
+/// once for all of them.
+pub(super) fn down_sel(f: &FfnPlan, m: usize, ff: usize) -> bool {
     match f.route {
         FfnRoute::Router { .. } => true,
-        FfnRoute::Dense => q4k_or_q6k(f.down_ty),
+        FfnRoute::Dense => q4k_or_q6k(f.down_ty) && (m == 1 || !reads_columns(f.down_ty, ff)),
     }
 }
 

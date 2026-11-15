@@ -242,10 +242,14 @@ pub(super) fn enqueue_pass(
 ///   quantizer over every token's slots, the down `_sel` over every token's
 ///   slots, and the combine — 5.
 ///
-/// - A dense FFN: `norm_quant` and the four launches after the router — 5;
-///   an unfused gate·up is the gate, the up and the SwiGLU; a Q8_0 down is
-///   one launch with no quantizer, a Q3_K, Q5_K or NVFP4 one the quantizer
-///   and its projection ([`reads_q8_1`], [`site_launches`]).
+/// - A dense FFN at one row: `norm_quant` and the four launches after the
+///   router — 5; an unfused gate·up is the gate, the up and the SwiGLU; a
+///   Q8_0 down is one launch with no quantizer, a Q3_K, Q5_K or NVFP4 one
+///   the quantizer and its projection ([`reads_q8_1`], [`site_launches`]).
+///   Past one row ([`gate_up_fused`], [`down_sel`]) its Q4_K gate·up and its
+///   Q4_K or Q6_K down are the plain m-column gemvs, each with its
+///   token-major copy: `norm_quant`, the gate, its copy, the up, its copy,
+///   the SwiGLU, the quantizer, the down, its copy and the combine — 10.
 /// - A routed FFN whose shared expert is kept apart ([`apart_down`]): the
 ///   norm with the router (`norm_quant` and the router, two, when the
 ///   shared gate or up reads f32 rows), the card list, the routed gate·up,
@@ -253,8 +257,8 @@ pub(super) fn enqueue_pass(
 ///   shared down's quantizer, the shared down, and the combine — 11 of
 ///   Q8_0 or of K-quant shared sites at one row.
 ///
-/// So a qwen3moe layer is 12 or 13 launches at one row and 12 or 14 at
-/// every `m` from two to [`GEMV_COLS`]. Past it (the wide arm, `wide`) the
+/// So a qwen3moe layer with a routed FFN is 12 or 13 launches at one row and 12 or 14 at
+/// every `m` from two to [`GEMV_COLS`]; a dense Q4_K layer's FFN is 5 at one row and 10 from two. Past it (the wide arm, `wide`) the
 /// embedding is followed by the unit's dense route table, and a layer is
 /// its mixer — the gated attention's norm, quantizer, three GEMMs, rope,
 /// prefill flash, gated quantizer, output GEMM and residual add, 10; the
@@ -270,7 +274,7 @@ pub(super) fn enqueue_pass(
 /// takes the f32 out gate and its own quantizer in place of the gated one, except
 /// where the gated flash stores the gated rows (`wide::flash_gates`): there the
 /// quantizer alone, none for F32.
-pub(super) fn pass_launches(plans: &[LayerPlan], m: usize, hidden: usize) -> usize {
+pub(super) fn pass_launches(plans: &[LayerPlan], m: usize, (hidden, ff): (usize, usize)) -> usize {
     let wide = m > GEMV_COLS;
     let many = usize::from(m > 1);
     let site = |t: SiteTy| site_launches(t, m);
@@ -341,12 +345,12 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize, hidden: usize) -> usi
             (FfnRoute::Router { .. }, false) => 5 + split_norm,
             (FfnRoute::Dense, true) => 1 + wide_quants(&[f.gate_ty, f.up_ty]) + 5,
             (FfnRoute::Dense, false) => {
-                let gate_up = if gate_up_fused(f) {
+                let gate_up = if gate_up_fused(f, m) {
                     1
                 } else {
                     site(f.gate_ty) + site(f.up_ty) + 1
                 };
-                let down = if down_sel(f) {
+                let down = if down_sel(f, m, ff) {
                     2
                 } else {
                     usize::from(reads_q8_1(f.down_ty)) + site(f.down_ty)
@@ -1217,7 +1221,7 @@ fn slots_down(
             ),
         ));
     }
-    if gate_up_fused(n) {
+    if gate_up_fused(n, m) {
         match gate_up_entry(n.gate_ty, n.up_ty, WHAT)? {
             // The family's own Q4_K gate·up·SwiGLU over the slots' ids.
             GateUpEntry::Q4k => k.experts.enqueue_gate_up(
@@ -1269,7 +1273,8 @@ fn slots_down(
     } else {
         // A dense FFN's one slot a token (the load refuses an unfused
         // routed gate·up): the token's gate and up rows apart, then the
-        // SwiGLU into `h`.
+        // SwiGLU into `h`. Past one row each gemv reads its matrix once for
+        // every row.
         let Arena {
             normed,
             act_ffn,
@@ -1288,7 +1293,7 @@ fn slots_down(
         gpu.elem()
             .enqueue_swiglu(stream, &g.g, &g.u, m * slots * d.ff, h)?;
     }
-    if down_sel(n) {
+    if down_sel(n, m, d.ff) {
         let entry = down_entry(n.down_ty, WHAT)?;
         let wd = kq_weight(w, &n.down)?;
         gpu.enqueue_quantize_q8_1_layer(&s.h, &mut s.act_h[i], c.layer)?;
@@ -1603,9 +1608,12 @@ mod tests {
     /// A residual row the router's fold takes.
     const HIDDEN: usize = 2048;
 
+    /// An FFN width of whole super-blocks, an even number of them.
+    const FF: usize = 4096;
+
     /// The launches of a one-layer pass at `m` rows, less the embedding.
     fn one(kind: GqaKind, tys: [SiteTy; 4], m: usize) -> usize {
-        pass_launches(&[layer(kind, tys)], m, HIDDEN) - 1
+        pass_launches(&[layer(kind, tys)], m, (HIDDEN, FF)) - 1
     }
 
     /// A layer's attention launches follow its sites' types: the fused Q4_K
@@ -1666,18 +1674,21 @@ mod tests {
 
     /// A dense FFN's launches follow its sites' forms. At one row: `norm_quant` and the combine
     /// beside the gate, the up and the SwiGLU, then the down — alone for a Q8_0 one, behind its
-    /// q8_1 quantizer for a Q5_K or NVFP4 one, one `_sel` launch for a fused Q4_K one. Past
+    /// q8_1 quantizer for a Q5_K or NVFP4 one, one `_sel` launch for a fused Q4_K one. From two rows
+    /// to [`super::GEMV_COLS`] a Q4_K gate and up and a Q4_K or Q6_K down are the plain m-column
+    /// gemvs with a token-major copy each (10 launches in all), so each matrix is read once for
+    /// every row; a Q6_K down of an odd super-block count keeps its `_sel`. Past
     /// [`super::GEMV_COLS`] rows: the norm, one quantizer a form the gate and up read, the gate, the
     /// up, the SwiGLU's quantizer, the down and the combine, whatever the types; an NVFP4 site
     /// reads the q8 blocks of 32 there, so it takes a second quantizer beside a K-quant.
     #[test]
     fn a_dense_ffn_launches_by_its_site_types() {
-        use SiteTy::{Nvfp4, Q4K, Q5K, Q8_0};
+        use SiteTy::{Nvfp4, Q4K, Q5K, Q6K, Q8_0};
         let launches = |gate_up: SiteTy, down: SiteTy, m: usize| {
             let mut p = layer(GqaKind::Neox128, [Q4K; 4]);
             p.ffn.route = FfnRoute::Dense;
             [p.ffn.gate_ty, p.ffn.up_ty, p.ffn.down_ty] = [gate_up, gate_up, down];
-            pass_launches(&[p], m, HIDDEN)
+            pass_launches(&[p], m, (HIDDEN, FF))
         };
         // The embedding, the fused attention's 7 and the FFN.
         assert_eq!(launches(Q4K, Q4K, 1), 1 + 7 + 5);
@@ -1687,6 +1698,25 @@ mod tests {
         // A Q4_K gate·up beside an NVFP4 down: the fused gate·up, then the quantizer and the
         // projection the Q4_K `_sel` down also takes.
         assert_eq!(launches(Q4K, Nvfp4, 1), launches(Q4K, Q4K, 1));
+        // From two rows the Q4_K gate and up and the Q4_K or Q6_K down read their matrices once for
+        // every row: norm_quant, the gate and its copy, the up and its copy, the SwiGLU, the
+        // quantizer, the down and its copy, the combine.
+        for m in [2, 8] {
+            assert_eq!(launches(Q4K, Q4K, m), 1 + 7 + 10, "{m} rows");
+            assert_eq!(launches(Q4K, Q6K, m), launches(Q4K, Q4K, m), "{m} rows");
+            // A token-major Q5_K site already launched alone and has no copy: the same launches.
+            assert_eq!(launches(Q5K, Q5K, m), launches(Q5K, Q5K, 1), "{m} rows");
+        }
+        // A Q6_K down of an odd super-block count (the plain gemv reads no rows of it past one
+        // column) stays its `_sel`: the quantizer and the one launch.
+        let odd = |m: usize| {
+            let mut p = layer(GqaKind::Neox128, [Q4K; 4]);
+            p.ffn.route = FfnRoute::Dense;
+            [p.ffn.gate_ty, p.ffn.up_ty, p.ffn.down_ty] = [Q4K, Q4K, Q6K];
+            pass_launches(&[p], m, (HIDDEN, 11 * 256))
+        };
+        assert_eq!(odd(1), launches(Q4K, Q4K, 1));
+        assert_eq!(odd(2), 1 + 7 + 2 + 5 + 2);
         // The embedding and the route table, the wide attention's 10 and the FFN's 7.
         for ty in [Q4K, Q8_0, Nvfp4] {
             assert_eq!(launches(ty, ty, 9), 1 + 1 + 10 + 7, "{ty}");
@@ -1725,7 +1755,7 @@ mod tests {
                 gate_inp: String::new(),
                 shared,
             };
-            pass_launches(&[p], m, hidden)
+            pass_launches(&[p], m, (hidden, FF))
         };
         for m in [1, 2, 8] {
             assert_eq!(

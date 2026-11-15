@@ -69,12 +69,6 @@ pub(super) enum Tail<'a> {
         state: &'a mut HeadArgmaxState,
         taps: Option<&'a mut TapRows>,
     },
-    /// A pass whose rows each end in a head: row `r`'s residual into
-    /// `heads[r]`'s input and that head, row by row.
-    Rows {
-        heads: &'a mut [Head],
-        state: &'a mut HeadArgmaxState,
-    },
     /// A pass whose every row ends in one head of them all: rows `0..m` of
     /// the arena's `x` — the pass's rows, which its ranges tile from row 0 —
     /// into `head`'s input in one copy, then the head of the `m` rows.
@@ -286,13 +280,6 @@ pub(super) fn enqueue_tail(
     let (gpu, w, k) = (c.gpu, c.w, c.k);
     match tail {
         Tail::Step { head, state, .. } => dispatch::enqueue_head(gpu, w, k, state, head),
-        Tail::Rows { heads, state } => {
-            for (row, head) in s.x_rows.iter().zip(heads.iter_mut()) {
-                head.input_mut().copy_from_device_async(row, gpu.stream())?;
-                dispatch::enqueue_head(gpu, w, k, state, head)?;
-            }
-            Ok(())
-        }
         Tail::One { head, state } => enqueue_one(gpu, w, k, state, s, m, head),
         Tail::Pass => Ok(()),
         Tail::Last { head, state } => enqueue_last(gpu, w, k, state, s, m, head),

@@ -1548,8 +1548,10 @@ impl Views for KvPlanes {
 /// input's q8_1 blocks of 128 for a K-quant site, its q8 blocks of 32 for a
 /// Q8_0 site, and the SwiGLU rows' f32 rows for a down that reads those
 /// (`WideForms`) — and on the gemv arm the gate and up rows of an unfused
-/// gate·up, and the row-major output of a K-quant site launched alone at
-/// more than one row (`cols` values a column); and on a chain with a layer
+/// gate·up (`glu`; `glu_many`: only at more than one row, where a dense
+/// Q4_K gate·up is two plain gemvs and the SwiGLU), and the row-major output
+/// of a K-quant site launched alone at more than one row (`cols` values a
+/// column); and on a chain with a layer
 /// that keeps its shared expert apart, that expert's buffers (`apart`); and
 /// on a chain whose gated head-256 layer has an output projection of a type
 /// other than a K-quant, the f32 rows of the gated flash output that
@@ -1562,6 +1564,7 @@ pub(super) struct Forms {
     pub(super) attn: WideForms,
     pub(super) h: WideForms,
     pub(super) glu: bool,
+    pub(super) glu_many: bool,
     pub(super) cols: usize,
     pub(super) apart: Option<ApartForms>,
     pub(super) out_gate: bool,
@@ -1576,11 +1579,17 @@ pub(super) struct ApartForms {
 }
 
 impl Forms {
+    /// Whether an arena of `rows` rows holds the gate and up rows of an unfused gate·up.
+    pub(super) fn holds_glu(&self, rows: usize) -> bool {
+        self.glu || (self.glu_many && rows > 1)
+    }
+
     pub(super) const KQUANT: Forms = Forms {
         hid: WideForms::q8(true, false),
         attn: WideForms::q8(true, false),
         h: WideForms::q8(true, false),
         glu: false,
+        glu_many: false,
         cols: 0,
         apart: None,
         out_gate: false,
@@ -1645,7 +1654,7 @@ impl ApartRows {
 /// decode step's arena has one row, a pass's [`GEMV_COLS`], a prompt's up to
 /// its ubatch size; a unit of `m <= rows` tokens uses the first `m` rows.
 /// What only an op's gemv arm reads — the `m`-column activations, the flash
-/// pass's partials, a Q6_K projection's row-major copy, the row windows — is
+/// pass's partials, a Q6_K projection's row-major copy — is
 /// cut for at most [`GEMV_COLS`] rows; past that the ops run their wide arm
 /// over the arena's [`Wide`] part.
 pub(super) struct Arena {
@@ -1654,8 +1663,6 @@ pub(super) struct Arena {
     /// The layer's input residual (the embedding rows for layer 0), and its
     /// output: the combine writes the next layer's input here.
     pub(super) x: DeviceBuffer<f32>,
-    /// Row `t` of `x`, for `t` below `min(rows, GEMV_COLS)`.
-    pub(super) x_rows: Vec<WindowMut<'static, f32>>,
     /// Row `t`'s position and live key count, which the embedding launch
     /// writes: the rope turns by the table's row `pos[t]` and appends there,
     /// the flash attends over `n_keys[t]` keys.
@@ -2273,16 +2280,12 @@ impl Arena {
         } else {
             partials_v_len(narrow, d.n_head)
         };
-        // SAFETY: every window below lies inside its parent — row `t <
-        // narrow <= rows` of `x` (`hidden` values), and the three blocks that tile `qkv`
+        // SAFETY: every window below lies inside its parent — the three blocks that tile `qkv`
         // (`rows · (q_len + 2·kv_len)`) — and each parent moves into the
         // arena beside its windows (a move of the handle, not of the
         // allocation), where it outlives them.
-        let (x_rows, q, k, v) = unsafe {
+        let (q, k, v) = unsafe {
             (
-                (0..narrow)
-                    .map(|t| cells_view(&x, t * d.hidden, d.hidden))
-                    .collect(),
                 cells_view(&qkv, 0, rows * q_len),
                 cells_view(&qkv, rows * q_len, rows * kv_len),
                 cells_view(&qkv, rows * (q_len + kv_len), rows * kv_len),
@@ -2290,7 +2293,6 @@ impl Arena {
         };
         Ok(Arena {
             x,
-            x_rows,
             pos: DeviceBuffer::zeroed(stream, rows)?,
             n_keys: DeviceBuffer::zeroed(stream, rows)?,
             normed: f(rows * d.hidden)?,
@@ -2322,7 +2324,7 @@ impl Arena {
                 .then(|| Wide::new(stream, &d, rows, forms))
                 .transpose()?,
             glu: forms
-                .glu
+                .holds_glu(rows)
                 .then(|| {
                     Ok::<_, GpuError>(Glu {
                         g: f(narrow * d.slots() * d.ff)?,

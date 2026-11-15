@@ -24,7 +24,7 @@
 //! - (c) the plain load is untouched: its store bytes and the plan's layout
 //!   bytes equal the derivation of the file's header ([`BASE_STORE`]), its
 //!   captured decode step holds [`NODES_DECODE`] nodes and a pass of `m`
-//!   rows [`NODES_PASS`] + 4m (the e2e gate's pins), and the verifying load
+//!   rows [`NODES_PASS`] + [`PASS_HEAD`] (the e2e gate's pins), and the verifying load
 //!   holds the same node counts and exactly 30 · `delta_record_bytes(32,
 //!   128, 8)` = [`RECORD_EXTRA`] more store bytes [derived: 11,796,480 B of
 //!   verify records], which the plan's layout (`PlanInputs::verifying`)
@@ -188,6 +188,10 @@ mod gate {
     /// holds too: `gdn_delta_lanes` is one launch where `gdn_delta` is.
     const NODES_DECODE: usize = 520;
     const NODES_PASS: usize = 537;
+    /// The nodes of a captured pass's one head over the Q6_K head's rows: the copy of the rows into
+    /// its input, the final norm, the quantizer, the gemv and the argmax. PIN(2026-11-15): one
+    /// head of the pass's rows, where each row had a head of its own (4 a row).
+    const PASS_HEAD: usize = 5;
 
     const WHAT: &str = "gate_qwen35moe_verify";
     const RECIPE: &str = "gate-gpu-qwen35moe-verify";
@@ -387,8 +391,8 @@ mod gate {
         let plan_ver = plan_bytes(true)?;
         let nodes = |f: &Facts| {
             f.decode == NODES_DECODE
-                && f.pass5 == NODES_PASS + 4 * 5
-                && f.pass8 == NODES_PASS + 4 * 8
+                && f.pass5 == NODES_PASS + PASS_HEAD
+                && f.pass8 == NODES_PASS + PASS_HEAD
         };
         let plain_ok = nodes(plain) && plain.stores == BASE_STORE && plan_plain == BASE_STORE;
         println!(
@@ -398,8 +402,8 @@ mod gate {
             plain.decode,
             plain.pass5,
             plain.pass8,
-            NODES_PASS + 20,
-            NODES_PASS + 32,
+            NODES_PASS + PASS_HEAD,
+            NODES_PASS + PASS_HEAD,
             plain.stores,
             plain.resident,
             verdict(plain_ok)
@@ -1259,11 +1263,11 @@ mod gate {
         let off = facts(s)?;
         s.set_taps(&TAP_LAYERS)?;
         let on_ok = on.decode == NODES_DECODE + n
-            && on.pass5 == NODES_PASS + 4 * 5 + n
-            && on.pass8 == NODES_PASS + 4 * 8 + n;
+            && on.pass5 == NODES_PASS + PASS_HEAD + n
+            && on.pass8 == NODES_PASS + PASS_HEAD + n;
         let off_ok = off.decode == NODES_DECODE
-            && off.pass5 == NODES_PASS + 4 * 5
-            && off.pass8 == NODES_PASS + 4 * 8;
+            && off.pass5 == NODES_PASS + PASS_HEAD
+            && off.pass8 == NODES_PASS + PASS_HEAD;
         println!(
             "(th) graph nodes with {n} taps: decode {} pass5 {} pass8 {} (want {}, {}, {}: the \
              untapped counts and one copy a tapped layer) {}; taps off again: {} {} {} (want \
@@ -1272,14 +1276,14 @@ mod gate {
             on.pass5,
             on.pass8,
             NODES_DECODE + n,
-            NODES_PASS + 20 + n,
-            NODES_PASS + 32 + n,
+            NODES_PASS + PASS_HEAD + n,
+            NODES_PASS + PASS_HEAD + n,
             verdict(on_ok),
             off.decode,
             off.pass5,
             off.pass8,
-            NODES_PASS + 20,
-            NODES_PASS + 32,
+            NODES_PASS + PASS_HEAD,
+            NODES_PASS + PASS_HEAD,
             verdict(off_ok)
         );
         Ok(on_ok && off_ok)

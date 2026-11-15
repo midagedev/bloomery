@@ -251,7 +251,11 @@ pub(super) fn arena_bytes(d: &Dims, rows: usize, forms: Forms) -> usize {
         + partials_ms_len(n, d.n_head)
         + rows * att
         + rows * slots * (d.ff + d.hidden)
-        + if forms.glu { 2 * n * slots * d.ff } else { 0 }
+        + if forms.holds_glu(rows) {
+            2 * n * slots * d.ff
+        } else {
+            0
+        }
         + if rows > 1 { n * forms.cols } else { 0 };
     let u32s = 2 * rows;
     let acts: usize = (1..=n)

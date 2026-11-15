@@ -364,7 +364,7 @@ impl Body {
         let graph = gpu.capture(|_| dispatch::enqueue_pass(&c, kv, a, &io, m))?;
         let (nodes, launches) = (
             graph.node_count(),
-            dispatch::pass_launches(plans, m, a.dims.hidden),
+            dispatch::pass_launches(plans, m, (a.dims.hidden, a.dims.ff)),
         );
         if nodes != launches {
             return Err(GpuError::shape(

@@ -123,8 +123,8 @@ use crate::linear::delta::RecoveryTable;
 use crate::media::{ImageSpan, MediaBody, MediaSpan, RopeBase, SeqRope, kept_rule, rope_table};
 use crate::model::fit::{FIT_RESERVE, largest_fit};
 use crate::model::{
-    ChainBody, GpuModel, HostServed, Instrumented, MAX_PASS_ROWS, Rollback, Rows, SlotRange, Slots,
-    refuse_stage_rows_past,
+    ChainBody, GpuModel, HostServed, Instrumented, MAX_PASS_ROWS, Rollback, RowHeads, Rows,
+    SlotRange, Slots, refuse_stage_rows_past,
 };
 use crate::rope_table::{RopeSpec, RopeTable};
 use crate::route_softmax::RouterDims;
@@ -729,7 +729,8 @@ impl Forms {
     /// longest row-major output of a K-quant site launched alone.
     pub(super) fn of(plans: &[LayerPlan], d: &Dims) -> Forms {
         let mut hid: Vec<SiteTy> = Vec::new();
-        let (mut attn, mut h, mut glu, mut cols) = (Vec::new(), Vec::new(), false, 0usize);
+        let (mut attn, mut h, mut glu, mut glu_many, mut cols) =
+            (Vec::new(), Vec::new(), false, false, 0usize);
         let mut apart: Vec<SiteTy> = Vec::new();
         let mut out_gate = false;
         let mut alone = |ty: SiteTy, rows: usize| {
@@ -781,13 +782,22 @@ impl Forms {
                 alone(sh.up_ty, d.ff);
                 alone(sh.down_ty, d.hidden);
             }
-            if !gate_up_fused(f) {
-                glu = true;
-                alone(f.gate_ty, d.slots() * d.ff);
-                alone(f.up_ty, d.slots() * d.ff);
-            }
-            if !down_sel(f) {
-                alone(f.down_ty, d.hidden);
+            // The gate·up rows and the row-major scratch of the sites launched alone: at one row
+            // (`glu`, held by every arena) and from two rows, where a dense FFN's Q4_K gate·up and
+            // down are the plain gemvs (`glu_many`, held by the arenas of more than one row).
+            for m in [1, 2] {
+                if !gate_up_fused(f, m) {
+                    if m == 1 {
+                        glu = true;
+                    } else {
+                        glu_many = true;
+                    }
+                    alone(f.gate_ty, d.slots() * d.ff);
+                    alone(f.up_ty, d.slots() * d.ff);
+                }
+                if !down_sel(f, m, d.ff) {
+                    alone(f.down_ty, d.hidden);
+                }
             }
         }
         let wants = crate::site::WideActs::wants_of;
@@ -797,6 +807,7 @@ impl Forms {
             attn: wants(&attn).without_f32(),
             h: wants(&h),
             glu,
+            glu_many,
             cols,
             // The shared expert's f32 rows are held whatever its down reads: the
             // wide part counts them (`wide::arena_bytes`), and the plan's card
@@ -1617,13 +1628,14 @@ impl Body35 {
     }
 
     /// Launches of a pass of `m` rows through every layer, without the
-    /// heads: the embedding, then each layer's mixer and FFN half
+    /// head: the embedding, then each layer's mixer and FFN half
     /// (`dispatch::pass_launches`). The captured decode step adds the one
-    /// head's three launches; a captured pass of `m >= 2` rows adds, per
-    /// row, the copy of its residual row into its head and the head's three.
+    /// head's three launches; a captured pass of `m >= 2` rows adds the copy
+    /// of its rows into the one head of them and that head's launches
+    /// ([`HeadLaunches::at`](crate::head::HeadLaunches::at) past the norm).
     #[must_use]
     pub fn pass_launches(&self, m: usize) -> usize {
-        dispatch::pass_launches(&self.plans, m, self.s.dims.hidden)
+        dispatch::pass_launches(&self.plans, m, (self.s.dims.hidden, self.s.dims.ff))
     }
 
     /// The flash pass this body runs: `true` for the tensor-core pass.
@@ -2140,9 +2152,9 @@ fn enqueue_chain(gpu: &Gpu, w: &Weights, b: &mut Body35, head: &mut Head) -> Res
     .walk_with(draft.as_mut())
 }
 
-/// Enqueue a pass of `heads.len()` rows from the pass record: every layer
-/// at that many rows over the pass arena, then row `r`'s residual into
-/// `heads[r]`'s input and that head, row by row — the walk `(1, m, Step)`.
+/// Enqueue a pass of `head.m()` rows from the pass record: every layer at
+/// that many rows over the pass arena, then rows `0..m` into the one head
+/// of them — the walk `(1, m, Step)`.
 fn enqueue_rows(
     gpu: &Gpu,
     w: &Weights,
@@ -2150,6 +2162,12 @@ fn enqueue_rows(
     heads: &mut [Head],
 ) -> Result<(), GpuError> {
     const WHAT_ROWS: &str = "qwen35moe::enqueue_rows";
+    let [head] = heads else {
+        return Err(GpuError::shape(
+            WHAT_ROWS,
+            format!("{} heads for a pass whose rows end in one", heads.len()),
+        ));
+    };
     if b.placed.is_some() {
         return Err(GpuError::shape(
             WHAT_ROWS,
@@ -2157,7 +2175,7 @@ fn enqueue_rows(
              (prefill_with), each unit through the host tier's batch port",
         ));
     }
-    let m = heads.len();
+    let m = head.m();
     // A capture records the launches only; the replay reads the record the
     // plan before it wrote, so only an eager pass needs one planned now.
     if b.rp.planned() != Some(m) && !crate::capturing(gpu.stream())? {
@@ -2195,8 +2213,8 @@ fn enqueue_rows(
         s: a,
         io: &rp.io(m)?,
         m,
-        tail: Tail::Rows {
-            heads,
+        tail: Tail::One {
+            head,
             state: head_state,
         },
     }
@@ -3146,6 +3164,8 @@ impl Rows for Body35 {
     /// No host tier serves a Qwen3.6 replay; the pass is the chain's
     /// one-token layout at `m` rows.
     const CHAIN: Chain = Chain::Step;
+    /// One head of every row: the pass's rows read the lm_head once.
+    const HEADS: RowHeads = RowHeads::One;
 
     fn plan_rows(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
         self.refuse_inside_image("qwen35moe::rows", pos)?;

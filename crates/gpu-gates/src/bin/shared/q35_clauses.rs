@@ -324,7 +324,7 @@ pub fn refed_after_cut(
 /// lm_head: the copy of the rows into its input, then the fused head's
 /// three at one row, or the norm, the quantizer, the gemv and the rows'
 /// argmax past it.
-fn pass_head_nodes(rows: usize) -> usize {
+pub fn pass_head_nodes(rows: usize) -> usize {
     1 + if rows == 1 { 3 } else { 4 }
 }
 
