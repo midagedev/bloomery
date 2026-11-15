@@ -1933,6 +1933,15 @@ impl FfnBatch {
         }
     }
 
+    /// Whether a block's fused card experts read the shadow's q8_1 planes:
+    /// only on the tile path ([`FfnBatch::set_card_tiles`]); the grouped GEMM
+    /// quantizes the route's normed rows itself and the common card leg reads
+    /// them as they are, so the shadow copies no plane on either.
+    #[must_use]
+    pub fn reads_planes(&self) -> bool {
+        matches!(self.card_path(), CardPath::Tiles)
+    }
+
     /// The streamed places a prompt call under host streaming writes, one a
     /// slot of the batch; a second call is refused by name. Load-time only.
     pub fn enable_stream(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
@@ -3046,9 +3055,10 @@ impl FfnPiece {
 
     /// Layer `layer`'s shadow work for the chunk `io`, after the batch's
     /// route: HC_PRE into the batch's results, the norm's q8_1 form again —
-    /// with card experts copied into the block's planes, which the tile path
-    /// reads — and the shared expert into the batch's outputs. `lw` are layer
-    /// `i`'s tensors.
+    /// with fused card experts on the tile path copied into the block's
+    /// planes, which that path alone reads ([`FfnBatch::reads_planes`]) — and
+    /// the shared expert into the batch's outputs. `lw` are layer `i`'s
+    /// tensors.
     #[allow(
         clippy::too_many_arguments,
         reason = "the shadow's inputs and the layer's resolved tensors (rust-quality R8)"
@@ -3094,7 +3104,7 @@ impl FfnPiece {
                 &mut b.normed,
                 fault,
             )?;
-            if card.is_some() {
+            if card.as_ref().is_some_and(|s| s.fused()) && b.reads_planes() {
                 let act_x = &b.act_x[m - 1];
                 let (q, d) = (act_x.q3().len() / m, act_x.d8().len() / m);
                 // SAFETY: the copies read the chunk's own scratch and write

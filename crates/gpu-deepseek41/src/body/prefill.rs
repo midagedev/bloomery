@@ -1455,7 +1455,8 @@ fn reads_q8(w: &Weights, name: &str) -> bool {
 /// The entries `FfnPiece::enqueue_batch_shadow` enqueues for the block
 /// `chunks` of layer `l`, with card experts or not: per chunk HC_PRE and the
 /// norm, the norm's q8_1 codes and scales copied into the block's planes when
-/// there are card experts, the shared expert's gate·up (one launch for a
+/// fused card experts read them (`planes`: the tile path,
+/// `FfnBatch::reads_planes`), the shared expert's gate·up (one launch for a
 /// chunk when gate and up are both Q3_K, else one a token), its down's q8_1
 /// form when the down reads one, the down and past one token its copy
 /// token-major; then over the block the buckets, the tile table, the gather
@@ -1469,6 +1470,7 @@ fn shadow_entries(
     l: usize,
     chunks: &[Range<usize>],
     card: Option<bool>,
+    planes: bool,
     tiered: bool,
 ) -> u64 {
     let q3k = |name: &str| {
@@ -1486,7 +1488,7 @@ fn shadow_entries(
         .iter()
         .map(|r| {
             let m = r.len() as u64;
-            let routed = 2 * u64::from(card.is_some());
+            let routed = 2 * u64::from(card == Some(true) && planes);
             let gate_up = if gate_up_q3k { 1 } else { m };
             2 + routed + gate_up + u64::from(down_q8) + 1 + u64::from(m > 1)
         })
@@ -3061,7 +3063,15 @@ impl<'a> GroupCx<'a> {
         let batch = &mut *self.batch;
         let own = set_of(&mut batch.sets, m.set)?;
         let card = CardStacks::of(w, l)?;
-        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.map(|s| s.fused()), tiered);
+        let planes = batch.ffn.reads_planes();
+        let entries = shadow_entries(
+            w,
+            l,
+            &m.cuts[r.full..],
+            card.map(|s| s.fused()),
+            planes,
+            tiered,
+        );
         let block = BlockIo {
             set: m.set,
             chunks: &m.cuts[r.full..],
@@ -3122,7 +3132,15 @@ impl<'a> GroupCx<'a> {
             .enqueue_batch_block_kept(gpu, bl, card, &mut batch.ffn, &block, self.slots)?;
         // The shadow's entries, the places taken again and with card experts
         // the kept pass's map row.
-        let entries = shadow_entries(w, l, &m.cuts[r.full..], card.map(|s| s.fused()), tiered);
+        let planes = batch.ffn.reads_planes();
+        let entries = shadow_entries(
+            w,
+            l,
+            &m.cuts[r.full..],
+            card.map(|s| s.fused()),
+            planes,
+            tiered,
+        );
         self.tally
             .shadow(i, m.set, entries + 1 + u64::from(card.is_some()))
     }

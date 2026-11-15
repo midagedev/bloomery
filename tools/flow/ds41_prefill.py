@@ -349,7 +349,11 @@ TAIL_EVENTS = 1                # FfnBatch::enqueue_download: the event the host 
 TAIL_PREBULK_ACTS = 3          # three D2H; router and places ran per chunk (d37136c batch.rs:815-866)
 POST_ACTS = 2                  # FfnBatch::enqueue_upload, FfnPiece::enqueue_batch_join
 HEAD_ACTS = 7                  # the trace: 7 activities after the last join
-SHADOW_EXPERT_CHUNK = 8        # enqueue_batch_shadow_chunk: hc_pre, norm, 2 dtod, shexp gate-up, q8, down, transpose
+SHADOW_EXPERT_CHUNK = 8        # enqueue_batch_shadow_chunk: hc_pre, norm, 2 dtod, shexp gate-up, q8, down, transpose;
+                               # the 2 dtod (the block's q8_1 planes) only where fused card experts read them: under
+                               # `planes` (every config before CP1 / CP2), the tile path's alone after it
+PLANE_DTODS = 2                # enqueue_batch_shadow_chunk: the q3 and d8 plane copies (FfnBatch::reads_planes)
+PLANE_DTOD_US = 2.35           # their device time a full chunk, shadow_chunk's "2 D2D 2.35" (constants.tsv)
 SHADOW_EXPERT_BLOCK = 5        # the expert arm's block: buckets, grouped gate-up, quantize_sel, grouped down, card_acc
 SHADOW_TILE_BLOCK = 7          # cardtile, enqueue_tiled_experts: buckets, grouped_tiles, gather, GT, quantize_ord, DT,
                                # card_acc (entries_shadow 478.9 against the expert arm's 477.0 at P 512, 38 card lbs) —
@@ -1069,14 +1073,17 @@ def shadow_lb(p, cfg, lb, rt):
     cs_tok = rt.card_slots_tok(l)
     t, acts = 0.0, 0
     wide = cfg.get("batchwide") and arm == "expert"
+    planes = cfg.get("planes", True)
     for _, m in lb.full:
         if arm == "expert":
             if card:
                 # a Q5_LAYERS card chunk drops the q8_1 quantize (the Q5_K down reads none, Dense::reads_q8_1) and
                 # runs the q5k down: its time is the no-card trace's chunk (the same down) plus shadow_chunk's D2D
                 # pair 2.35 us, the same q3/d8 planes [derived]
-                k, a = ((p["shadow_chunk_nocard"] + 2.35, SHADOW_Q5_CHUNK) if l in Q5_LAYERS
+                k, a = ((p["shadow_chunk_nocard"] + PLANE_DTOD_US, SHADOW_Q5_CHUNK) if l in Q5_LAYERS
                         else (p["shadow_chunk"], SHADOW_EXPERT_CHUNK))
+                if not planes:         # CP1 / CP2: the grouped GEMM reads no plane, so the shadow copies none
+                    k, a = k - PLANE_DTOD_US, a - PLANE_DTODS
             else:
                 k, a = p["shadow_chunk_nocard"], SHADOW_NOCARD_CHUNK
             k *= clk
@@ -1089,8 +1096,8 @@ def shadow_lb(p, cfg, lb, rt):
         t += k / 1000.0 + a * g
         acts += a
     if wide:
-        a = ((SHADOW_Q5_CHUNK if l in Q5_LAYERS else SHADOW_EXPERT_CHUNK) if card else SHADOW_NOCARD_CHUNK) \
-            * len(lb.full_sb)
+        a = ((SHADOW_Q5_CHUNK if l in Q5_LAYERS else SHADOW_EXPERT_CHUNK) - (0 if planes else PLANE_DTODS)
+             if card else SHADOW_NOCARD_CHUNK) * len(lb.full_sb)
         t += a * g
         acts += a
     if arm == "expert":
@@ -1863,7 +1870,7 @@ CONFIGS = {
     "PG2": dict(commit="e690f54", route="bulk", copy=False, flow="five", b1=True, tile=True, hot=False, timed=True, G=2,
                 wrap=True, marks4=True),
     # the engine from candwire on: PG1 / PG2's flow with the candidate mask's launches (cand_acts) in every full chunk
-    # of its source and consumers; what --counts holds a counter log of today's tree to. From f812d30e1 the default
+    # of its source and consumers; what --counts held a counter log to until CP1 / CP2. From f812d30e1 the default
     # block runs the grouped GEMM (imma; the tile flag stays for the streamed passes' pricing under host streaming),
     # and the block's entry count is the same 7 a card layer-batch (SHADOW_GEMM_BLOCK = SHADOW_TILE_BLOCK). From
     # 518c109d8 the Q5_K-down layers 0 and 1 hold card experts (q5card: card_first_layer_tree), so their card chunks
@@ -1872,6 +1879,13 @@ CONFIGS = {
                 timed=True, marks4=True, cand=True, q5card=True),
     "CW2": dict(commit="f812d30e1", route="bulk", copy=False, flow="five", b1=True, tile=True, imma=True, hot=False,
                 timed=True, G=2, wrap=True, marks4=True, cand=True, q5card=True),
+    # the enqthread round (main 78564829d +): the shadow copies the block's q8_1 planes only where the tile path reads
+    # them (chain/ffn/batch.rs FfnBatch::reads_planes, a gate's catcher alone), so a card chunk drops its two dtod
+    # (PLANE_DTODS, PLANE_DTOD_US); what --counts holds the tree's counter to
+    "CP1": dict(commit="78564829d+enqthread", route="bulk", copy=False, flow="five", b1=True, tile=True, imma=True,
+                hot=False, timed=True, marks4=True, cand=True, q5card=True, planes=False),
+    "CP2": dict(commit="78564829d+enqthread", route="bulk", copy=False, flow="five", b1=True, tile=True, imma=True,
+                hot=False, timed=True, G=2, wrap=True, marks4=True, cand=True, q5card=True, planes=False),
     # the r8host lease (09-27#r8host-pp): bloomery 6ffed9e (r8host, landed as r8land 1ad6599), frequency list 384, CED on, G 2
     # (prefillgroup's default), BLOOMERY_STEP_STATS=1, BLOOMERY_R8=on (the default) against =off, one binary; the release
     # sitting (09-28#v41-release): main 53e2def, the same flow, lcg at the id prefix, no STEP_STATS (no card marks)
@@ -3380,9 +3394,9 @@ def _check_call(path, recs, label):
     P, ced, G = cp["end"] - cp["first"], cp["ced"] == "on", cp["group"]
     if cp["first"] != 0 or G not in (1, 2):
         print(f"{label}{path}: a call at {cp['first']}..{cp['end']} under G {G}; the model's configs run a call from "
-              f"position 0 under G 1 (CW1) or 2 (CW2)")
+              f"position 0 under G 1 (CP1) or 2 (CP2)")
         return 64
-    cname = "CW2" if G == 2 else "CW1"
+    cname = "CP2" if G == 2 else "CP1"
     want_front, want = counts(P, cname, ced)
     df = {b: front.get(b, 0) - want_front.get(b, 0) for b in sorted(set(front) | set(want_front))}
     rows = [(k, got.get(k, (0, 0)), want.get(k, (0, 0))) for k in sorted(set(got) | set(want))]
@@ -3433,7 +3447,7 @@ def _first_diff(earlier, later):
 def check_counts(path):
     """--counts LOG: a generate_ds41 run's counter (`stat prefill front` a batch, `stat prefill lb` a layer-batch,
     printed under BLOOMERY_STEP_STATS=1) against counts() for the same call, which its `call plan` record names (P,
-    CED, G: CW1 or CW2, the tree's flow), layer-batch by layer-batch. 0 when every count is equal, 1 when one is not, 64 when the log
+    CED, G: CP1 or CP2, the tree's flow), layer-batch by layer-batch. 0 when every count is equal, 1 when one is not, 64 when the log
     cannot be compared.
 
     A log of an `--arm` list (each arm opens with an `arm` record) is checked arm by arm: segment k is the records
@@ -3642,6 +3656,17 @@ def self_test():
               and {k[1] for k, d in moved.items() if d[1]} == {0, 1}
               and sum(d[1] for d in moved.values()) == q5,
               str((sum(r for r, _ in moved.values()), sum(d[1] for d in moved.values()))))
+        # and the tree's flow (CP2): the shadow's two plane copies leave every full chunk of a card layer-batch,
+        # nothing else moves
+        pfront, plbs = counts(P, "CP2")
+        dtods = sum(PLANE_DTODS * len(x["lb"].full) for x in cwr if x["lb"].full and _CARD.get(x["lb"].l, 0) > 0)
+        pmoved = {k: (clbs[k][0] - plbs[k][0], clbs[k][1] - plbs[k][1]) for k in clbs}
+        check(f"CP2 at P {P} = CW2 less the shadow's {PLANE_DTODS} plane copies a full card chunk ({dtods} shadow "
+              f"entries), the route and the first steps unmoved",
+              pfront == cfront and plbs.keys() == clbs.keys() and dtods > 0
+              and all(r == 0 for r, _ in pmoved.values())
+              and sum(d for _, d in pmoved.values()) == dtods,
+              str((sum(r for r, _ in pmoved.values()), sum(d for _, d in pmoved.values()))))
     cfg, rn = row_cfg(p, "B1prose", {"rt": "prose"})
     got = evaluate(p, cfg, 512, rn)["agg"]["host_slots"]
     check("the prose routing reproduces its anchor: 52,189 host slots at P 512 (0.1 %)", abs(got - 52189) / 52189 < 1e-3,
@@ -3751,7 +3776,7 @@ def self_test():
     # the arm it repeats — counts and tokens both — and a segment that cannot be compared refused naming
     # its arm; a log with no `arm` record checked as one call, unprefixed
     cp512 = records.first(call_records(512, True), "call_plan").line
-    wf512, w512 = counts(512, "CW2")
+    wf512, w512 = counts(512, "CP2")
 
     def counts_log(arms, arm_records=True):
         """The lines of a generate_ds41 log, one segment an arm: (feed, ids, n, first-step deltas, layer-batch
