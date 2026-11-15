@@ -1,0 +1,41 @@
+# Round enqthread's sibling card: the stream's launch queue at twice its default depth
+# (CUDA_SCALE_LAUNCH_QUEUES=2x, a driver variable read at cuInit, process-wide), same binary.
+#
+# Decomposition [derived, A6000, place a, 1017 Q3_K_M, P = 4096, from the lead's 2026-11-15
+# sitting's 320 `stat prefill lb` records]: the host issues an entry in t_e ~2.4..3.0 us and blocks
+# while the stream's launch queue holds 1,021 entries the card has not started (this round's
+# probe under the 3090's gate lock, driver 615.71.09: 1,021 entries at the default, 2,045 at 2x,
+# 4,093 at 4x, every entry kind one slot). A host/card replay of the records fits chain
+# 8,240..8,243 ms against 8,233 measured with that queue; at 2,045 the back-pressure (489..596 ms a
+# call) falls to 0..2 ms and part of it returns as the host's waits on the route's download (wait
+# 263..359 ms against 61..75): chain -2.4..-2.6 % on the enqthread tree (7,973..7,977 against
+# 8,169..8,192 ms), pp +2.3..+2.6 %. A deeper queue lets the host run ahead of the card by ~2,000
+# entries (two layer-batches); the card stays the shadow of the host.
+# The probe's call times are a hand reading, not a number: they moved at 4x and not at 2x, so the
+# arm is 2x; a per-entry issue cost that grows with the queue is what the lower edge allows for.
+# Resource timeline per layer-batch: host enqueue ~6.2 + union 30.2 (the wall, a sum) over card
+# ~33; the queue's back-pressure is host time spent waiting on the card inside the enqueue.
+kind: ab
+question: does a launch queue twice the driver's default depth take the launch queue's
+  back-pressure off the V4.1 prompt call's host thread?
+term: pp tok/s @ P = 4096, prose, depth 0, DeepSeek-V4.1-Flash-1017 Q3_K_M, --place a, the default
+  levers, RTX A6000 - (CUDA_SCALE_LAUNCH_QUEUES=2x - unset) / unset, the enqthread tree's
+  generate_ds41, paired by round
+unit: %
+predict: +1.5..+2.8
+rounds: 6
+condition: one lease, the enqthread tree's generate_ds41 alone, BLOOMERY_AB_ROUNDS=6 just
+  depth-gpu-ds41 prose:4096@BLOOMERY_STEP_STATS=1
+  prose:4096@BLOOMERY_STEP_STATS=1,CUDA_SCALE_LAUNCH_QUEUES=2x (two loads: the variable is read at
+  cuInit), the order rotated every round; both arms' plan prints name the same residency word and
+  card_experts; in every round the 2x arm's stat lines read entries_route and entries_shadow equal
+  to the other arm's, enqueue_lb 1.0..2.0 ms under it, wait_lb 0.5..1.5 ms over it, union_lb,
+  card_out_lb and card_in_lb within 0.5 ms of it; no row carries [cpu-busy] or [other-busy]
+decide-in: the engine sets CUDA_SCALE_LAUNCH_QUEUES=2x before its first CUDA call when the variable
+  is unset (a default, no lever), its decode rows timed once on the same binary before it lands;
+  then price the second enqueue thread on the stat lines this sitting leaves
+decide-below: read enqueue_lb: if it did not fall by 1 ms a layer-batch the host is not blocked in
+  the launch queue and the replay's queue term is wrong: re-fit it from these records before any
+  thread design
+decide-above: the card idled behind the host more than the replay holds (card waits hidden in
+  enqueue_lb): price 4x on the same binary next, its per-entry issue cost read from the stat lines

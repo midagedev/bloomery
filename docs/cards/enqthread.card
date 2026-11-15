@@ -1,0 +1,48 @@
+# Round enqthread: the V4.1 prompt batch's shadow copies the block's q8_1 planes only where the tile
+# path reads them (chain/ffn/batch.rs FfnBatch::reads_planes: a gate's catcher alone), so on the
+# default grouped GEMM a full chunk of a fused card layer issues 2 entries fewer. Bits and kernels
+# are unchanged (the planes' one reader is the tile block); the entry count moves with the flow
+# model (tools/flow/ds41_prefill.py CP1 / CP2, prefill.rs shadow_entries). The round derives; the
+# lead times the sitting.
+#
+# Decomposition [derived, A6000, place a, 1017 Q3_K_M, P = 4096, from the lead's 2026-11-15 sitting's
+# 320 `stat prefill lb` records]: the cut is 26,344 entries a call by the records' chunk counts
+# (26,600 by the flow model at --place gate), ~120 a block layer-batch, entries_shadow 493.8 ->
+# ~374 a layer-batch. The host issues an entry in t_e ~2.4..3.0 us and blocks while the stream's
+# launch queue holds 1,021 entries the card has not started (this round's probe: 1,021 at the
+# driver's default, 2,045 at CUDA_SCALE_LAUNCH_QUEUES=2x, 4,093 at 4x, every entry kind one slot,
+# driver 615.71.09). A host/card replay of the records with those two terms gives chain 8,240..8,243
+# ms against 8,233 measured and enqueue 1,530..1,543 against 1,538.5: the enqueue_lb 7.0 is ~3.1 ms
+# of issue and ~2.5 ms of back-pressure, not launch CPU alone. The cut removes ~64..76 ms of issue
+# and ~40..66 ms of card time (2 dtod 2.35 us + 2 x 0.90 us gap a chunk); with the queue still full
+# half of it returns as route waits: chain -0.5..-0.8 % (41..66 ms of a ~8.55 s prompt call).
+# Resource timeline per layer-batch: host thread enqueue 7.0 + union 30.2 (the wall, a sum); card
+# ~33..34 under it; the queue's back-pressure ties the host to the card's progress. The flow levers
+# (a second enqueue thread, a deeper launch queue) are priced in the round's report and the sibling
+# card enqthread-lq2.card; this card prices the cut alone.
+kind: ab
+question: does dropping the shadow's plane copies off the GEMM path shorten the V4.1 prompt call by
+  their issue and card time?
+term: pp tok/s @ P = 4096, prose, depth 0, DeepSeek-V4.1-Flash-1017 Q3_K_M, --place a, the default
+  levers (group 2, residency and host streaming on), RTX A6000 - (this tree - base) / base, paired
+  by round
+unit: %
+predict: +0.4..+0.8
+rounds: 8
+sd: 0.25 % the lead's 2026-11-15 cardexp sitting (A6000, place a, prose P = 4096, 3f018b518 against 4e28e0a54), the pp ratio's per-round SD 0.35 % over 8 rounds over sqrt 2 for one run
+condition: this tree's generate_ds41 and 78564829d's (main before the change: /root/repo/bloomery's build, code-equal to 7bfa7c476
+  before the lease, a bin: arm) alternate in one lease, BLOOMERY_AB_ROUNDS=8 just depth-gpu-ds41
+  prose:4096@BLOOMERY_STEP_STATS=1 bin:/root/repo/bloomery/target/release/generate_ds41:prose:4096@BLOOMERY_STEP_STATS=1,
+  the order rotated every round; both arms' plan prints name the same residency word and
+  card_experts; in every round the stat lines read: this tree's entries_shadow 370..378 a
+  layer-batch against the base's 493.8 and entries_route equal across arms (counts: a binary that
+  does not show them is not the tree's), union_lb and card_out_lb within 0.5 ms of the base's,
+  card_in_lb 0.1..0.35 ms under it, enqueue_lb 0.4..0.9 ms under the base's 7.0, wait_lb at most
+  1.0; no row carries [cpu-busy] or [other-busy]
+decide-in: land the cut; then time enqthread-lq2.card (the launch queue at 2x, same binary), the
+  larger term the replay names
+decide-below: read the arms' stat lines: if entries_shadow fell as predicted but enqueue_lb fell less
+  than 0.4 ms a layer-batch, the issue cost is not a per-entry term: the launch queue's back-pressure
+  holds the host, so time enqthread-lq2.card next and leave the cut to land with it
+decide-above: the plane copies cost the card more than 2.35 us a chunk (card_in_lb fell more than
+  0.35 ms): re-measure the shadow chunk's D2D term in the flow model's constants before the next cut
