@@ -682,6 +682,14 @@ STUB
   sc rsync 23
   call -- 'echo hi'
   want 23 'direct: an rsync that ended 23 is not a drop'; hasnt 'retrying once' 'direct: an rsync that ended 23 is not a drop'
+  # two direct calls of one tree sync at once: the loser's wrapper ends 1 (its mv found .sync-id.new gone) and the box holds this tree
+  sc rsync 1
+  sc read 0 "0 $sid"
+  call -- 'echo hi'
+  want 0 'direct: a sibling synced this tree'; has 'put there by another call: not synced' 'direct: a sibling synced this tree'; reached 'direct: a sibling synced this tree'
+  sc rsync 1
+  call -- 'echo hi'
+  want 1 'direct: an rsync that ended 1 with no id on the box'; hasnt 'put there by another call' 'direct: an rsync that ended 1 with no id on the box'
   sc read 255 0
   call -- 'echo hi'
   want 0 'direct: the ssh before the sync dropped'; has "${drops}255) before submit; retrying once" 'direct: the ssh before the sync dropped'
@@ -1208,6 +1216,12 @@ else
     rc=0
     rsync -rlpgoDcz --delete --exclude target/ --exclude .git/ --exclude '/*.ptx' --exclude '/*.ll' --exclude '/.oxide-artifacts/' -e "$SSH_CMD" ${SYNC_PATH[@]+"${SYNC_PATH[@]}"} "$HERE"/ ${SYNC_ID_SRC[@]+"${SYNC_ID_SRC[@]}"} "$HOST:$REMOTE/" || rc=$?
     [ "$rc" != 0 ] || break
+    # Two direct calls of one tree sync at once (the lanes of a batch after an edit): the first wrapper's mv takes
+    # .sync-id.new and the other's mv fails. The box then holds this tree, put there by the other call: nothing to send.
+    if [ "$QUEUE" = 0 ] && pre_ssh "cat $REMOTE/.sync-id 2>/dev/null || true" && [ "$PRE_OUT" = "$SYNC_ID" ]; then
+      echo "box.sh: $REMOTE holds this tree (sync-id $SYNC_ID), put there by another call: not synced" >&2
+      break
+    fi
     # rsync's rc is 12 for a held lock and for a dead ssh alike: the lock and the remote tree's id decide (sync_refused).
     SYNC_NEXT=again
     [ "$QUEUE" = 0 ] || sync_refused "$rc"
