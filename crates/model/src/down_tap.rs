@@ -169,19 +169,20 @@ mod tests {
     #[test]
     fn a_tap_adds_calls_by_expert_and_refuses_another_shape() {
         let tap = DownTap::new();
-        let s = tap.stack("blk.1.ffn_down_exps.weight", 3, 2).unwrap();
+        let name = "stack";
+        let s = tap.stack(name, 3, 2).unwrap();
         s.add(2, 4, &[1.0, 2.0]);
         s.add(2, 1, &[0.5, 0.25]);
         s.add(0, 7, &[3.0, 0.0]);
-        let r = tap.rows_of("blk.1.ffn_down_exps.weight").unwrap();
+        let r = tap.rows_of(name).unwrap();
         assert_eq!((r.ff, r.n_expert), (2, 3));
         assert_eq!(r.rows, [7, 0, 5]);
         assert_eq!(r.sums, [3.0, 0.0, 0.0, 0.0, 1.5, 2.25]);
-        assert!(tap.stack("blk.1.ffn_down_exps.weight", 3, 4).is_err());
-        assert!(tap.stack("blk.1.ffn_down_exps.weight", 2, 2).is_err());
-        assert_eq!(tap.names(), ["blk.1.ffn_down_exps.weight"]);
+        assert!(tap.stack(name, 3, 4).is_err());
+        assert!(tap.stack(name, 2, 2).is_err());
+        assert_eq!(tap.names(), [name]);
         tap.clear();
-        assert!(!tap.holds("blk.1.ffn_down_exps.weight"));
-        assert!(tap.rows_of("blk.1.ffn_down_exps.weight").is_none());
+        assert!(!tap.holds(name));
+        assert!(tap.rows_of(name).is_none());
     }
 }
