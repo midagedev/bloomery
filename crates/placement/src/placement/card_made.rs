@@ -21,6 +21,8 @@
 //! name ([`CardReading::Unmeasured`]) and is never a pass.
 
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 use super::workstation::CONTEXT_SELF;
 use super::{Card, CardTotals};
@@ -154,8 +156,48 @@ pub fn unmeasured_why(spec: &Card, integrated: bool) -> Option<String> {
         );
     }
     spec.held_by.map(|held| {
-        format!("other processes hold the device ({held}), and the reading is the device's")
+        let now = holders_now(held);
+        let now = if now.is_empty() {
+            String::new()
+        } else {
+            format!("; now {now}")
+        };
+        format!("other processes hold the device ({held}{now}), and the reading is the device's")
     })
+}
+
+/// What the pids of a census holder list ("pid 4321 (1234 MiB), …") are at this reading: each one's
+/// `/proc/<pid>/comm` and whether `/proc/<pid>` is still there, `pid 4321 comm=gate_x alive`. A name or a
+/// state the read cannot give (a failed read, a host with no `/proc`) is `?`; a word that is no pid is left out.
+fn holders_now(held: &str) -> String {
+    holders_in(Path::new("/proc"), held)
+}
+
+/// [`holders_now`] over the process table at `proc`.
+fn holders_in(proc: &Path, held: &str) -> String {
+    held.split(", ")
+        .filter_map(|h| {
+            h.strip_prefix("pid ")?
+                .split(' ')
+                .next()?
+                .parse::<u32>()
+                .ok()
+        })
+        .map(|pid| {
+            let comm = fs::read_to_string(proc.join(format!("{pid}/comm")))
+                .map_or_else(|_| "?".to_owned(), |c| c.trim().to_owned());
+            let alive = match (
+                proc.join("self").exists(),
+                proc.join(pid.to_string()).exists(),
+            ) {
+                (false, _) => "?",
+                (true, true) => "alive",
+                (true, false) => "gone",
+            };
+            format!("pid {pid} comm={comm} {alive}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One check of a card's bytes: what it made against its plan, or why it
@@ -229,6 +271,8 @@ impl std::error::Error for CardRefusal {}
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::{CardMade, CardPhase, CardReading, CardRefusal, CardTotals, unmeasured_why};
     use crate::placement::workstation::{CONTEXT_SELF, RTX_3090, holder_card};
 
@@ -475,7 +519,8 @@ mod tests {
         assert!(integrated.contains("integrated"), "{integrated}");
         card.held_by = Some("pid 7 (977 MiB)");
         let held = unmeasured_why(&card, false).expect("a held card is unmeasured");
-        assert!(held.contains("pid 7 (977 MiB)"), "{held}");
+        assert!(held.contains("pid 7 (977 MiB"), "{held}");
+        assert!(held.contains("; now pid 7 comm="), "{held}");
         let r = CardReading::Unmeasured(super::CardUnmeasured {
             card: 1,
             name: card.name,
@@ -486,6 +531,34 @@ mod tests {
             panic!("an unmeasured card passed");
         };
         assert!(e.to_string().contains("card 1 (3090) at load"), "{e}");
+    }
+
+    /// The holders a refusal names are read at the refusal: a pid whose table entry is there is alive and
+    /// named by its `comm` (`?` where that read fails), one whose entry is gone is gone, a word that is no pid
+    /// is left out, and a table with no `self` entry (no `/proc`) says `?` for every state.
+    #[test]
+    fn holders_are_named_and_checked_at_the_reading() {
+        let dir = std::env::temp_dir().join(format!("holders-proc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for entry in ["self", "1234", "77"] {
+            fs::create_dir_all(dir.join(entry)).expect("a table entry");
+        }
+        fs::write(dir.join("1234/comm"), "gate_x\n").expect("a name");
+        let held = "pid 1234 (1 MiB), pid 77 (2 MiB), pid 99 (3 MiB), pid x (4 MiB)";
+        assert_eq!(
+            super::holders_in(&dir, held),
+            "pid 1234 comm=gate_x alive, pid 77 comm=? alive, pid 99 comm=? gone"
+        );
+        fs::remove_dir(dir.join("self")).expect("no self entry");
+        assert_eq!(
+            super::holders_in(&dir, held),
+            "pid 1234 comm=gate_x ?, pid 77 comm=? ?, pid 99 comm=? ?"
+        );
+        assert_eq!(super::holders_in(&dir, "not a list"), "");
+        fs::remove_dir_all(&dir).expect("the scratch table");
+        let me = std::process::id();
+        let own = super::holders_now(&format!("pid {me} (1 MiB)"));
+        assert!(own.starts_with(&format!("pid {me} comm=")), "{own}");
     }
 
     /// A draft's card bytes planned beside the target's totals are a reserve
