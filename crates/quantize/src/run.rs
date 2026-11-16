@@ -125,6 +125,7 @@ pub fn check_room(a: &Args, plan: &Plan) -> Result<()> {
         0
     };
     let dir = a.out_dir();
+    out_dir_is_there(&dir)?;
     let free =
         os::free_bytes(&dir).map_err(|e| Error::refused(format!("{}: {e}", dir.display())))?;
     if free + kept_bytes < plan.out_file_bytes {
@@ -143,6 +144,18 @@ pub fn check_room(a: &Args, plan: &Plan) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The output's directory is a directory: the tool never makes one, so a mistyped path cannot start a write of hundreds
+/// of GB in a place nobody chose; a missing one is refused with what to do.
+fn out_dir_is_there(dir: &Path) -> Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    Err(Error::refused(format!(
+        "{}: the output's directory does not exist (or is not a directory); make it first, the tool never creates one",
+        dir.display()
+    )))
 }
 
 /// The outputs of the plan exist nowhere yet (a stale `.partial` counts).
@@ -717,4 +730,20 @@ fn quantize_tensor<W: std::io::Write>(
     wrote
         .map(|_| ())
         .map_err(|e| Error::refused(format!("{}: {e}", t.name)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::out_dir_is_there;
+
+    #[test]
+    fn a_missing_output_directory_is_refused_by_name() {
+        let base = std::env::temp_dir().join(format!("bq-outdir-{}", std::process::id()));
+        let missing = base.join("absent");
+        let e = out_dir_is_there(&missing).unwrap_err().to_string();
+        assert!(e.contains("does not exist") && e.contains("absent"), "{e}");
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(out_dir_is_there(&base).is_ok());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 }
