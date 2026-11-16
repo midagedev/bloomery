@@ -4925,10 +4925,13 @@ GOLD
   if [ "$res" = '130 alive' ]; then pass 'build lane mutant: without the reap the build pass'"'"'s call outlives the stop'
   else fail 'build lane mutant: without the reap the build pass'"'"'s call outlives the stop' "rc and call: '$res' (want '130 alive')"; fi
   # gate.sh's build-only mode against a stub cargo: the build phase runs, the test phase never starts, the build's own rc ends the call.
-  mkdir -p "$t/stubbin" "$t/gtools"
+  mkdir -p "$t/stubbin" "$t/gtools/ref"
   printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$STUB_LOG"' 'case "$*" in *--no-run*) exit "${STUB_BUILD_RC:-0}" ;; esac' 'echo "test result: ok. 1 passed; 0 failed"' 'exit 0' > "$t/stubbin/cargo"
   chmod +x "$t/stubbin/cargo"
   cp "$(dirname "$self")/gate.sh" "$(dirname "$self")/gate-bound.sh" "$t/gtools/"
+  # gate-bound.sh's bound_timeout takes the stub beside it where the host has no GNU timeout (a Mac without coreutils, a bare PATH): a copy of
+  # gate-bound.sh carries ref/stub-timeout.py, or every bounded run in it ends 127.
+  cp "$(dirname "$self")/ref/stub-timeout.py" "$t/gtools/ref/"
   gate_stub() { # <env assignments…> -- <gate.sh args…>: the stub cargo's calls of one gate.sh call, then its rc
     local genv=() rcg=0
     while [ "$1" != -- ]; do genv+=("$1"); shift; done
@@ -4977,6 +4980,13 @@ GOLD
   else fail 'host-gate.sh build-only: any other value ends 64 before the binary runs' "$(hg_stub BLOOMERY_BUILD_ONLY=7 -- hgbin) $(cat "$t/hg-stub.out")"; fi
   if [ "$(hg_stub BLOOMERY_BUILD_ONLY=0 -- hgbin x)" = '0|ran x,' ] && [ "$(hg_stub -- hgbin y)" = '0|ran y,' ]; then pass 'host-gate.sh build-only: 0 and unset run the binary as ever'
   else fail 'host-gate.sh build-only: 0 and unset run the binary as ever' "$(hg_stub BLOOMERY_BUILD_ONLY=0 -- hgbin x) $(hg_stub -- hgbin y)"; fi
+  # A host with no timeout, gtimeout or gnutimeout runs bound_timeout's last choice, the stub beside gate-bound.sh. PATH here holds bash
+  # and the real python3 only, so every host runs that monitor: with a GNU timeout on PATH a fixture without the stub went unseen.
+  mkdir -p "$t/notimeout"
+  ln -sf "$BASH" "$t/notimeout/bash"
+  ln -sf "$(python3 -c 'import os, sys; print(os.path.realpath(sys.executable))')" "$t/notimeout/python3"
+  if [ "$(hg_stub PATH="$t/notimeout" -- hgbin z)" = '0|ran z,' ]; then pass 'host-gate.sh no-timeout host: the stub monitor beside gate-bound.sh runs the binary'
+  else fail 'host-gate.sh no-timeout host: the stub monitor beside gate-bound.sh runs the binary' "$(hg_stub PATH="$t/notimeout" -- hgbin z) $(cat "$t/hg-stub.out")"; fi
   sed '/^case \${BLOOMERY_BUILD_ONLY:-0} in$/,/^esac$/d' "$t/gtools/host-gate.sh" > "$t/gtools/host-gate-mut.sh"
   n=$((n + 1))
   if [ "$(grep -c '^case \${BLOOMERY_BUILD_ONLY:-0} in$' "$t/gtools/host-gate.sh")" = 1 ] && [ "$(grep -c 'BLOOMERY_BUILD_ONLY: \$EXE is built' "$t/gtools/host-gate-mut.sh")" = 0 ]; then echo "mutant hg-norun: the build-only case of host-gate.sh removed"
