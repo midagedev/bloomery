@@ -1,3 +1,12 @@
+# Outcome (2026-11-16, A6000 300 W, depth-serve under the lease, 4 rounds, 16 servers, binary sha256 f14e60570269):
+#  decide-above. tg mtp vs off: D 512 35.39 -> 49.33 tok/s, +39.40 % +- 0.68 %; D 4096 34.53 -> 45.94 tok/s,
+#  +33.04 % +- 0.38 %; pp holds 0 at both depths (-0.86 % +- 1.25, -0.73 % +- 1.35). No row cpu-busy, other-busy or cold.
+#  The hook ran once per arm, after round 1's D 4096 server: off 0 draft tokens; mtp 57 accepted of 66 drafted, a = 0.864,
+#  above the 0.60..0.80 window. Re-fit: R(0.864) = +39.0 % [derived] against +39.40 % measured at D 512, so the draft
+#  costs what its bytes say there. At D 4096 R(0.864) with c_v(2) = 1.2225 and the 28.96 ms plain step is +38.0 %
+#  [derived] against +33.04 %: ~5 points the model does not hold at depth (a read only at D 4096 on one 128-token reply;
+#  the draft block's own attention over the context is not in x). Next: the counters per depth (a hook per server), then
+#  the draft row at D 4096 in nsys. The unset default on the dense file stays mtp.
 # Derivation [derived]: the draft layer blk.64 is 263,313,408 B (attention, dense SwiGLU 17408, eh_proj, f32
 # norms) and the target's Q6_K head 1,042,944,000 B, so a draft row reads 1,306.3 MB = 2.00 ms at 653 GB/s;
 # the window refresh feeds 1 + a rows, each ending in the head, so x(a) = (1 + a) x 2.0 ms.
