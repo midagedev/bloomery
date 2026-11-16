@@ -5,6 +5,33 @@
 //! which prints the one `ubatch` line [`text`] writes; the serve gates read that line back through
 //! [`choices`] and hold it to its own terms ([`judge`]), so a rule change is one edit on each side.
 
+thread_local! {
+    /// How many [`quietly`] calls this thread is inside.
+    static QUIET: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One line of a load's decision on stderr, the `ubatch` line and the `whole fit` verdict: printed
+/// unless the thread is inside [`quietly`].
+pub fn say(line: &str) {
+    if QUIET.with(std::cell::Cell::get) == 0 {
+        eprintln!("{line}");
+    }
+}
+
+/// `f` with [`say`] silent: a probe that weighs a plan it may not take, whose verdicts the log
+/// must not show beside those of the plan the load takes (a gate reads one verdict a context).
+pub fn quietly<T>(f: impl FnOnce() -> T) -> T {
+    struct Loud;
+    impl Drop for Loud {
+        fn drop(&mut self) {
+            QUIET.with(|q| q.set(q.get() - 1));
+        }
+    }
+    QUIET.with(|q| q.set(q.get() + 1));
+    let _loud = Loud;
+    f()
+}
+
 /// The sizes an unasked dense whole load tries, largest first: the ubatch cap, then each half down to
 /// the least that still runs the prompt through the GEMM walk in useful widths.
 pub const LADDER: [usize; 4] = [4096, 2048, 1024, 512];
@@ -199,7 +226,7 @@ pub fn settle<T, E: From<String>>(
             had,
             pick,
         };
-        eprintln!("{}", text(&choice));
+        say(&text(&choice));
     }
     Ok((u, step))
 }

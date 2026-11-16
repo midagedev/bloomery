@@ -2763,7 +2763,7 @@ pub fn draft38_unset(at: &Draft38At<'_>) -> Option<Draft38Off> {
 /// A reserve on the card that can cost an unset context positions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reserve {
-    /// An unset draft (Qwen3.8, GLM-5.3): it goes off when it costs a slot
+    /// An unset draft (Qwen3.8, GLM-5.3, the qwen3 seat): it goes off when it costs a slot
     /// half the positions or more, and the `load draft=off` record's why is
     /// the cost.
     Draft,
@@ -2786,7 +2786,7 @@ pub struct RungCost {
     pub without: u64,
     /// The reserve's card bytes at `with`: the number the plan with it
     /// counted (Qwen3.8's `MtpInputs::card_bytes_of`, GLM-5.3's NextN card
-    /// bytes with its arena, V4.1's encoder reserve).
+    /// bytes with its arena, the qwen3 seat's `MtpCost::at`, V4.1's encoder reserve).
     pub card_bytes: u64,
 }
 

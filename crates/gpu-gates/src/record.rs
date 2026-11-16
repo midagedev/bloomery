@@ -3525,7 +3525,8 @@ pub static BLOOMERY_SERVE_QWEN3: &[&Kind] = kinds![
         &LOAD_QWEN3,
         &LOAD_PHASES,
         &LOAD_DRAFT_Q3,
-        &LOAD_DRAFT_OFF_Q3
+        &LOAD_DRAFT_OFF_Q3,
+        &DRAFT_YIELD
     ],
     groups::vision_seat::RECORDS,
     &[&LISTENING_QWEN3],

@@ -33,7 +33,7 @@
 #   hide at most the new 5 ms under the trunk (<= 0.8 %), so it is not taken.
 # Runner (from /Users/hckim/repo/bloomery-q36store, the full output to a file first):
 # BLOOMERY_MODEL=qwen35moe BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/q36store-pp.card
-#   BLOOMERY_REF_MODEL=/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf DEPTH_SERVE_FOLD=depths
+#   BLOOMERY_REF_MODEL=/data/moved/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf DEPTH_SERVE_FOLD=depths
 #   BLOOMERY_AB_ROUNDS=4' just depth-serve bloomery-q36store-base:4096 bloomery-q36store:4096
 #   env=BLOOMERY_DRAFT=off:bloomery-q36store:4096 bloomery-q36store-base:512 bloomery-q36store:512
 #   env=BLOOMERY_DRAFT=off:bloomery-q36store:512

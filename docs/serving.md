@@ -130,16 +130,18 @@ in one pass, so a reply decodes faster with the same tokens a plain run gives. `
 
 | `BLOOMERY_DRAFT` | What drafts |
 |---|---|
-| unset | on Qwen3.8 and GLM-5.3, the model's own MTP draft by the yield rule below; on the qwen3 seat, a `qwen35moe` or `qwen35` file's in-file MTP draft under section 9.3's limits; on Raon-1, its DFlash2 draft on requests that think; no draft on V4.1 |
+| unset | on Qwen3.8, GLM-5.3 and the qwen3 seat, the model's own MTP draft by the yield rule below (the qwen3 seat's is a `qwen35moe` or `qwen35` file's in-file draft, under section 9.3's limits); on Raon-1, its DFlash2 draft on requests that think; no draft on V4.1 |
 | `mtp` | the MTP draft, kept on whatever the context |
 | `off` | nothing |
 | `dspark` | DeepSeek's DSpark head on V4.1 (`BLOOMERY_DSPARK_MODEL` names it); on the qwen3 seat, an HF draft directory for a whole-card `qwen35moe` target |
 | `lookup` | the n-gram lookup draft (Qwen3.8, and on the qwen3 seat a whole-card verifying load) |
 
-**The yield rule (Qwen3.8 and GLM-5.3).** Unset, the MTP draft yields to the context. It goes off when the plan with it leaves a slot half
+**The yield rule (Qwen3.8, GLM-5.3 and the qwen3 seat).** Unset, the MTP draft yields to the context. It goes off when the plan with it leaves a slot half
 the positions of the plan without it or fewer, or holds no context at all, a set `--ctx-size` included. A `draft
 yield` record names the draft's card bytes and the positions a slot gets either way, and the `ctx` line that follows
-is the plain plan's. Any other refusal of the drafted plan stops the load by name. The draft also goes off under
+is the plain plan's. Any other refusal of the drafted plan stops the load by name. The qwen3 seat counts the in-file
+draft's card bytes (the layer's weights, one attention layer's K/V a position, the step's scratch) in the whole-fit
+verdict of a dense file and of a routed one, so the contexts the rule compares are the ones each load opens with. The draft also goes off under
 `--place gate` and with stores shorter than one window. On Qwen3.8 it also goes off on a plan that pages experts from
 NVMe (section 5.4) and on a checkpoint folder without the MTP layer. Each prints a `load draft=off` record with the
 reason, never a refusal.
@@ -589,8 +591,9 @@ slots and memory each start takes, is [`dgx-spark.md`](dgx-spark.md).
   a whole-card load of one sequence; a set `mtp` is refused on a media load, a placed load and `--parallel` above 1, and
   unset goes off there with the reason on `load draft=off`. On a dense `qwen35` file the whole-fit verdict counts the
   layer's card bytes (its weights, one attention layer's K/V a position, the step's scratch) as a reserve, so the
-  default context is the one the load opens with the layer; this seat has no yield to the context (the rule above
-  is the Qwen3.8 and GLM-5.3 seats'). A `qwen3moe` file has no such
+  default context is the one the load opens with the layer; a routed `qwen35moe` whole-card verdict counts the same
+  bytes when the draft will open, and a card that fits the file only without them is refused as a card floor, so the
+  context search lowers the context. Unset, the draft yields to the context by the rule of section 4. A `qwen3moe` file has no such
   layer and refuses `mtp`. `BLOOMERY_DRAFT=dspark` with `BLOOMERY_DSPARK_MODEL` naming an HF draft directory serves a
   whole-card `qwen35moe` target from one slot: RedHat's Qwen3.6 speculator carries its own reduced head, and
   MiniCPM-V 4.7's full-vocabulary draft borrows the target's Q6_K `output.weight` and `token_embd.weight` rows in

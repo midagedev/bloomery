@@ -645,9 +645,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               feed-forward tensor, or a tail the reader refuses by tensor), never served plain \
               with a record; unset drafts it under the same conditions (`--place a`, no route \
               trace, one slot, a window that fits `--ctx`) and runs the plain path otherwise, \
-              the `load draft=off (<why>)` record naming why; a dense file's whole-fit verdict \
-              counts the layer's card bytes as a reserve, so its default context is the one the \
-              load opens with the layer; \
+              the `load draft=off (<why>)` record naming why, and yields to the context as the \
+              Qwen3.8 and GLM seats' unset drafts do (a `draft yield` record where the plain \
+              load serves twice the positions or more); a whole-fit verdict, a dense file's and \
+              a routed one's, counts the layer's card bytes as a reserve where the draft will \
+              open, so its default context is the one the load opens with the layer; \
               `generate_qwen3moe` on a \
               qwen35moe file: `dspark` serves the HF DSpark draft (`$BLOOMERY_DSPARK_MODEL`) \
               on a whole-card load of one slot, while `lookup`, `dspark` on a qwen3moe file and \

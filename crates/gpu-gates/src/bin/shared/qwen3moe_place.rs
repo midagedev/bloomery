@@ -374,6 +374,55 @@ pub fn share(o: &Open35, ctx: usize, slots: usize) -> Open35 {
     }
 }
 
+/// What `file`'s own next-token layer holds on the card of a load described by `inputs`
+/// ([`MtpCost`]): the layer's weights as the card holds them
+/// ([`model::arch::qwen35moe::mtp::weight_bytes`]), its f32 residual stream and the pinned step
+/// scratch ([`model::arch::qwen35moe::mtp::STEP_BYTES`]), and the K/V a position of a
+/// full-attention layer of this load's cache format, which the layer is. A routed layer's experts
+/// are among its weights.
+///
+/// # Errors
+/// A file with no in-file layer, or a trunk with no attention layer to take the planes from.
+fn mtp_cost_of(inputs: &Inputs, file: &Split) -> Result<MtpCost, GateError> {
+    use model::arch::qwen35moe::mtp::{InFile, STEP_BYTES, in_file, weight_bytes};
+    let Inputs::Qwen35(inputs) = inputs else {
+        return Err("only a qwen35 family file carries an in-file next-token layer".into());
+    };
+    let InFile::Draft(draft) = in_file(file).map_err(|e| format!("in_file: {e}"))? else {
+        return Err("the file carries no in-file next-token layer to price".into());
+    };
+    let read = model::arch::spec(file)?;
+    let stream = u64::from(draft.hidden) * 4;
+    let fixed = weight_bytes(&read.tensors.tensors, usize::try_from(draft.index)?)
+        .saturating_add(stream)
+        .saturating_add(STEP_BYTES);
+    let kv: &dyn KvBytes = &inputs.kv;
+    let per_position = (0..inputs.spec.layers.len())
+        .map(|l| kv.layer_bytes(l, 1).saturating_sub(kv.layer_bytes(l, 0)))
+        .find(|&b| b > 0)
+        .ok_or("the trunk has no attention layer whose planes the draft's layer shares")?;
+    Ok(MtpCost {
+        fixed,
+        per_position,
+    })
+}
+
+/// The card bytes `file`'s own next-token layer holds at `positions` positions under the cache
+/// format `kv` ([`MtpCost::at`]): what a whole-fit verdict of a load that opens the layer counts
+/// as [`MTP_RESERVE`], for a seat that weighs the layer against the context it costs.
+///
+/// # Errors
+/// As [`mtp_cost_of`], and the file's own description's refusal.
+#[allow(
+    dead_code,
+    reason = "the qwen3 serve seat reads it; the CLI, the routed legs and the e2e gates include the planner without it"
+)]
+pub fn mtp_card_bytes(file: &Split, kv: KvQ8, positions: u64) -> Result<u64, GateError> {
+    let mut inputs = q35::PlanInputs::describe(file)?;
+    inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
+    Ok(mtp_cost_of(&Inputs::Qwen35(Box::new(inputs)), file)?.at(positions))
+}
+
 impl PlaceQ3 {
     /// `place` resolved against `census`. More than one expert tier card is
     /// refused by name: `arch`'s body serves [`SERVED_TIERS`].
@@ -616,36 +665,12 @@ impl PlaceQ3 {
         layers_of(&self.inputs)
     }
 
-    /// What `file`'s own next-token layer holds on this load's card ([`MtpCost`]): the layer's
-    /// weights as the card holds them ([`model::arch::qwen35moe::mtp::weight_bytes`]), its f32
-    /// residual stream and the pinned step scratch ([`model::arch::qwen35moe::mtp::STEP_BYTES`]),
-    /// and the K/V a position of a full-attention layer of this load's cache format, which the
-    /// layer is.
+    /// What `file`'s own next-token layer holds on this load's card ([`mtp_cost_of`]).
     ///
     /// # Errors
-    /// A file with no in-file layer, or a trunk with no attention layer to take the planes from.
+    /// As [`mtp_cost_of`].
     fn mtp_cost(&self, file: &Split) -> Result<MtpCost, GateError> {
-        use model::arch::qwen35moe::mtp::{InFile, STEP_BYTES, in_file, weight_bytes};
-        let Inputs::Qwen35(inputs) = &self.inputs else {
-            return Err("only a qwen35 family file carries an in-file next-token layer".into());
-        };
-        let InFile::Draft(draft) = in_file(file).map_err(|e| format!("in_file: {e}"))? else {
-            return Err("the file carries no in-file next-token layer to price".into());
-        };
-        let read = model::arch::spec(file)?;
-        let stream = u64::from(draft.hidden) * 4;
-        let fixed = weight_bytes(&read.tensors.tensors, usize::try_from(draft.index)?)
-            .saturating_add(stream)
-            .saturating_add(STEP_BYTES);
-        let kv: &dyn KvBytes = &inputs.kv;
-        let per_position = (0..inputs.spec.layers.len())
-            .map(|l| kv.layer_bytes(l, 1).saturating_sub(kv.layer_bytes(l, 0)))
-            .find(|&b| b > 0)
-            .ok_or("the trunk has no attention layer whose planes the draft's layer shares")?;
-        Ok(MtpCost {
-            fixed,
-            per_position,
-        })
+        mtp_cost_of(&self.inputs, file)
     }
 
     /// The whole-fit verdict of this file on the card's device at `ctx`
@@ -654,6 +679,18 @@ impl PlaceQ3 {
     /// load counts, `load` what the program holds past it or its refusal.
     fn whole_at(
         &self,
+        ctx: u64,
+        slots: usize,
+        load: Result<WholeLoad, String>,
+    ) -> Result<Whole, GateError> {
+        self.whole_with(self.media.draft, ctx, slots, load)
+    }
+
+    /// [`Self::whole_at`] with `draft`, the next-token layer's card bytes the load opens, in the
+    /// place of this load's own.
+    fn whole_with(
+        &self,
+        draft: Option<MtpCost>,
         ctx: u64,
         slots: usize,
         load: Result<WholeLoad, String>,
@@ -677,9 +714,28 @@ impl PlaceQ3 {
                 Seqs { slots, ..self.seqs },
                 u64::try_from(slot_ctx(usize::try_from(ctx)?, slots))?,
                 self.media.beside,
-                self.media.draft.map_or(0, |d| d.at(ctx)),
+                draft_reserve(draft, ctx),
             ),
             load,
+        )
+    }
+
+    /// The whole-fit verdict of a routed file at `ctx` positions for `slots` resident sequences,
+    /// where `draft` says the load opens the file's own next-token layer ([`drafted_verdict`]);
+    /// `load` is the program's own read ([`qwen35_whole`]). Without `draft` this is
+    /// [`Self::whole_at`].
+    fn whole_drafted(
+        &self,
+        file: &Split,
+        (ctx, slots): (u64, usize),
+        load: Result<WholeLoad, String>,
+        draft: bool,
+    ) -> Result<Whole, GateError> {
+        drafted_verdict(
+            usize::try_from(ctx)?,
+            draft,
+            || self.mtp_cost(file),
+            |priced| self.whole_with(priced, ctx, slots, load.clone()),
         )
     }
 
@@ -1051,6 +1107,39 @@ fn whole_on(
     })
 }
 
+/// The card bytes a whole-fit verdict reserves for the file's own next-token layer at `ctx`
+/// positions: its [`MtpCost`] where the load opens it, nothing where it does not.
+fn draft_reserve(draft: Option<MtpCost>, ctx: u64) -> u64 {
+    draft.map_or(0, |d| d.at(ctx))
+}
+
+/// The whole-fit verdict of a load that `draft` says opens the file's own next-token layer, at
+/// `ctx` positions: `verdict(None)` the plain one and `verdict(Some(cost))` the one that counts
+/// the layer's card bytes ([`MTP_RESERVE`]), so the plan never promises room the draft then
+/// takes. A load the plain verdict does not take is the placed plan's, which opens no draft, and
+/// `draft` prices nothing there. A load the plain verdict takes and the priced one does not is
+/// refused with the priced verdict's terms, as a dense file's is ([`Whole::dense_refusal`]):
+/// the draft is what the card is short of (that probe prints its line on stderr, on the placed
+/// path too), a context search lowers the context to what holds with it, and an unset draft yields to the plain load where that costs half the positions
+/// ([`bloomery_gpu_gates::generate::draft_yield`]). Without `draft` the layer is never read.
+fn drafted_verdict(
+    ctx: usize,
+    draft: bool,
+    cost: impl FnOnce() -> Result<MtpCost, GateError>,
+    verdict: impl Fn(Option<MtpCost>) -> Result<Whole, GateError>,
+) -> Result<Whole, GateError> {
+    let plain = verdict(None)?;
+    if !draft || !plain.fits() {
+        return Ok(plain);
+    }
+    let priced = verdict(Some(cost()?))?;
+    if priced.fits() {
+        return Ok(priced);
+    }
+    ubatch_pick::say(&priced.line(ctx));
+    Err(priced.dense_refusal(ctx))
+}
+
 impl PlaceQ3 {
     /// The placement a run with `--place` unset probes and loads on,
     /// resolved against `census`: `a` ([`Place::A`]), the largest visible
@@ -1069,7 +1158,7 @@ impl PlaceQ3 {
     /// placed plan on that card. A model with no routed expert that the
     /// verdict does not take is refused by name with its terms.
     fn unplaced(self, ctx: usize, whole: &Whole) -> Result<Unplaced, GateError> {
-        eprintln!("{}", whole.line(ctx));
+        ubatch_pick::say(&whole.line(ctx));
         if whole.fits() {
             return Ok(Unplaced::Whole(self.place.card_specs()?[0]));
         }
@@ -1096,28 +1185,42 @@ impl PlaceQ3 {
         plan: &Plan<'_>,
         (ctx, slots): (usize, usize),
     ) -> Result<Option<CardSpec>, GateError> {
-        self.whole_card(plan, (ctx, slots), qwen3_whole(file))
+        self.whole_card(plan, || {
+            self.whole_at(u64::try_from(ctx)?, slots, qwen3_whole(file))
+        })
     }
 
     /// [`Self::whole_card_qwen3`] of a qwen35moe file, `at` the [`Open35`] the
-    /// plan was made by (a slot's share of `ctx`, [`share`]).
+    /// plan was made by (a slot's share of `ctx`, [`share`]). `draft`: the load
+    /// opens the file's own next-token layer, whose card bytes the verdict
+    /// counts ([`Self::whole_drafted`]).
+    ///
+    /// # Errors
+    /// As [`Self::whole_drafted`], and the plan's.
     pub fn whole_card_qwen35(
         &self,
         file: &Split,
         plan: &Plan<'_>,
         (ctx, slots): (usize, usize),
-        at: Open35,
+        (at, draft): (Open35, bool),
     ) -> Result<Option<CardSpec>, GateError> {
-        self.whole_card(plan, (ctx, slots), qwen35_whole(file, at))
+        self.whole_card(plan, || {
+            self.whole_drafted(
+                file,
+                (u64::try_from(ctx)?, slots),
+                qwen35_whole(file, at),
+                draft,
+            )
+        })
     }
 
+    /// The card of the whole load when `plan` holds no host expert and the verdict `whole` reads takes it.
     fn whole_card(
         &self,
         plan: &Plan<'_>,
-        (ctx, slots): (usize, usize),
-        load: Result<WholeLoad, String>,
+        whole: impl FnOnce() -> Result<Whole, GateError>,
     ) -> Result<Option<CardSpec>, GateError> {
-        if plan.host.experts > 0 || !self.whole_at(u64::try_from(ctx)?, slots, load)?.fits() {
+        if plan.host.experts > 0 || !whole()?.fits() {
             return Ok(None);
         }
         Ok(Some(self.place.card_specs()?[0]))
@@ -1176,11 +1279,13 @@ pub fn unplaced_qwen35_slots(
     seqs: Seqs,
     beside: Beside,
 ) -> Result<Unplaced, GateError> {
-    unplaced_qwen35_records(file, census, o, seqs, beside, 0)
+    unplaced_qwen35_records(file, census, o, seqs, beside, (0, false))
 }
 
 /// [`unplaced_qwen35_slots`] with the verify record rows (`record_rows`)
-/// its whole-fit verdict prices a delta layer with ([`delta_planes`]): the
+/// its whole-fit verdict prices a delta layer with ([`delta_planes`]) and
+/// `draft`, whether the load opens the file's own next-token layer, whose card
+/// bytes the verdict of a routed file counts ([`PlaceQ3::whole_drafted`]): the
 /// serve seat's, which opens loads that verify drafted rows.
 fn unplaced_qwen35_records(
     file: &Split,
@@ -1188,7 +1293,7 @@ fn unplaced_qwen35_records(
     o: &Open35,
     seqs: Seqs,
     beside: Beside,
-    record_rows: usize,
+    (record_rows, draft): (usize, bool),
 ) -> Result<Unplaced, GateError> {
     if attention_only(&model::arch::spec(file)?.spec) {
         return whole_dense(
@@ -1210,7 +1315,12 @@ fn unplaced_qwen35_records(
         beside,
         record_rows,
     )?;
-    let whole = probe.whole_at(u64::try_from(o.ctx)?, seqs.slots, qwen35_whole(file, at))?;
+    let whole = probe.whole_drafted(
+        file,
+        (u64::try_from(o.ctx)?, seqs.slots),
+        qwen35_whole(file, at),
+        draft,
+    )?;
     probe.unplaced(o.ctx, &whole)
 }
 
@@ -1232,8 +1342,8 @@ pub struct ServeOpts<'a> {
     pub media: bool,
     pub beside: Beside,
     /// Whether the load opens the file's own next-token layer, whose card bytes
-    /// ([`PlaceQ3::mtp_cost`]) the whole-fit verdict of a dense file prices
-    /// ([`MTP_RESERVE`]); a routed file's seat loads on the plan whose room is its experts'.
+    /// ([`PlaceQ3::mtp_cost`]) the whole-fit verdict of a dense file and of a routed one prices
+    /// ([`MTP_RESERVE`]); a placed load opens no draft and prices none.
     pub draft: bool,
     /// `-ub` / `--ubatch-size`: the whole load of a file with no routed expert takes exactly this
     /// size or is refused by name ([`serve_load`]); any other load refuses the flag.
@@ -1500,7 +1610,7 @@ pub fn serve_load(
             let at = share(&open, total, slots);
             let q = PlaceQ3::qwen35_records(split, p, census, at, seqs, o.beside, record_rows)?;
             let plan = q.plan(total, o.levers)?;
-            let whole = q.whole_card_qwen35(split, &plan, (total, slots), at)?;
+            let whole = q.whole_card_qwen35(split, &plan, (total, slots), (at, o.draft))?;
             return Ok(ServeLoad::Placed {
                 q: Box::new(q),
                 total,
@@ -1527,7 +1637,7 @@ pub fn serve_load(
                 }));
             }
             refuse_flag(o.ubatch, "a routed file")?;
-            unplaced_qwen35_records(split, census, &open, seqs, o.beside, record_rows)?
+            unplaced_qwen35_records(split, census, &open, seqs, o.beside, (record_rows, o.draft))?
         }
         (Family::Qwen3moe, Some(p)) => {
             refuse_flag(o.ubatch, "a qwen3moe file")?;
@@ -2077,6 +2187,107 @@ pub(super) mod tests {
         assert!(
             !need(cost.at(ctx), tight).fits(),
             "the drafted load does not: the verdict names the shortage, not the load's arena"
+        );
+    }
+
+    /// A routed file's whole-fit verdict counts the next-token layer's card bytes where the load
+    /// opens it, and only there (`drafted_verdict` over the verdict's own table, whose arithmetic
+    /// is the file's tensors'): the need grows by exactly the layer's bytes at the context, the
+    /// layer is never read where the load opens none, a load only the plain verdict takes is
+    /// refused with the priced verdict's terms (the reserve among them), and a load the plain
+    /// verdict does not take is the placed plan's, which prices no draft. Mutant: the priced
+    /// verdict drops the layer's bytes (the tree before the routed price: a card that held the
+    /// plain load by less than the layer promised room the draft then took).
+    #[allow(
+        dead_code,
+        reason = "`generate_qwen3moe`'s test calls it; every other bin that includes this file leaves it unused"
+    )]
+    pub(crate) fn a_routed_verdict_prices_the_draft_layer_where_the_load_opens_it() {
+        const MIB: u64 = 1 << 20;
+        let model = ModelTensors {
+            tensors: vec![ModelTensor {
+                name: "blk.0.ffn_up.weight".into(),
+                shard: 0,
+                layer: Some(0),
+                role: Role::DenseFfn,
+                ty: gguf::GgmlType::Q8_0,
+                dims: vec![256, 16],
+                file_bytes: 0,
+                gathered_rows: None,
+            }],
+            layers: 1,
+            experts: 0,
+            experts_used: 0,
+            bf16_words: |_| false,
+        };
+        let cost = MtpCost {
+            fixed: 400 * MIB,
+            per_position: 2048,
+        };
+        let ctx = 8192;
+        let at = |draft: Option<MtpCost>, free: Option<u64>| {
+            let mut spec = workstation::A6000;
+            spec.free_bytes = free;
+            whole_on(
+                spec,
+                &model,
+                1,
+                0,
+                (Seqs::ONE, ctx, Beside::default(), draft_reserve(draft, ctx)),
+                Ok(WholeLoad::Unchecked),
+            )
+            .expect("a verdict")
+        };
+        let need = |w: Whole| w.terms().expect("a verdict with terms").0;
+        let asked = std::cell::Cell::new(0);
+        let verdict = |free: Option<u64>, draft: bool| {
+            asked.set(0);
+            drafted_verdict(
+                ctx as usize,
+                draft,
+                || {
+                    asked.set(asked.get() + 1);
+                    Ok(cost)
+                },
+                |d| Ok(at(d, free)),
+            )
+        };
+        // A roomy card: the verdict with the layer is the plain one plus the layer's bytes.
+        let Ok(plain) = verdict(None, false) else {
+            panic!("a roomy card holds the plain load");
+        };
+        let plain = need(plain);
+        assert_eq!(asked.get(), 0, "no draft reads no layer");
+        let Ok(priced) = verdict(None, true) else {
+            panic!("a roomy card holds the priced load");
+        };
+        assert_eq!(asked.get(), 1);
+        assert!(priced.fits());
+        assert_eq!(need(priced) - plain, cost.at(ctx));
+        // The card the plain load holds by less than the layer: only the plain verdict takes it.
+        let tight = Some(plain + cost.at(ctx) - 1);
+        assert!(verdict(tight, false).is_ok_and(|w| w.fits()));
+        let Err(err) = verdict(tight, true) else {
+            panic!("the draft is what the card is short of");
+        };
+        let Some(PlacementError::CardBudgetFloor {
+            floor, reserves, ..
+        }) = err.downcast_ref::<PlacementError>()
+        else {
+            panic!("expected the card-short refusal of a dense file's, got {err}");
+        };
+        assert!(*floor > plain, "the floor counts the layer: {floor} B");
+        assert!(
+            *reserves >= cost.at(ctx),
+            "the reserve names it: {reserves} B"
+        );
+        // A card the plain load does not hold is the placed plan's, whatever the draft says.
+        let short = Some(plain - 1);
+        assert!(verdict(short, true).is_ok_and(|w| !w.fits()));
+        assert_eq!(
+            asked.get(),
+            0,
+            "the layer is not read where the plain load is placed"
         );
     }
 

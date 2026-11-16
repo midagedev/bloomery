@@ -177,6 +177,14 @@
 //! load cannot draft, and served undrafted with the reason named where the
 //! file has no layer. A qwen3moe file keeps the plain path: `mtp` is refused
 //! by name (no such layer, no verify pass).
+//! The unset draft yields to the context as the other seats' unset drafts do
+//! (`generate::draft_yield`, [`unset_draft_yield`]): where the plain load
+//! serves twice the positions or more, the draft goes off, one `draft yield`
+//! record names both contexts and `load draft=off` the same cost; a set `mtp`
+//! keeps its context or is refused by its plan. The layer's card bytes
+//! ([`q3place::MTP_RESERVE`]) are in the whole-fit verdict of a dense file
+//! and of a routed one, so the context both loads hold is the one the draft
+//! then leaves.
 //! `dspark` is the draft a qwen35moe file serves (`$BLOOMERY_DSPARK_MODEL`),
 //! held by the seat as the serve seats' one owner of a served draft
 //! (`serve_seats::served`): one slot while `--parallel` names none, several
@@ -235,13 +243,14 @@ use bloomery_gpu_gates::bind::{
     SlotsFrom, TemplateFile, Vocab, arm_screen, bind_server, call_token, note_line, parallel_line,
     placement_of, slots_given,
 };
-use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::generate::{DraftYield, Place, draft_yield};
 use bloomery_gpu_gates::qwen_seat::Family;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
+use bloomery_gpu_gates::ubatch_pick;
 use bloomery_gpu_gates::vision_seat::{self, Opened, PleImage, TextFacts};
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
-use bloomery_levers::{Draft38At, Draft38Off, DraftWord, Levers, draft38_unset};
+use bloomery_levers::{Draft38At, Draft38Off, DraftWord, Levers, RungCost, draft38_unset};
 use gguf::Split;
 use gguf::quant::GgmlType;
 use model::arch::models::{Mixer, RopeMode};
@@ -250,7 +259,7 @@ use model::arch::qwen35moe::hparams::Hparams;
 use model::arch::qwen35moe::mtp::{InFile, in_file};
 use model::arch::qwen35moe::place as q35;
 use model::placement::PlanLevers;
-use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, Probe};
+use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, Probe, Rule};
 use runtime::Target as _;
 use runtime::prompt::CallEnd;
 use runtime::seqstate::Why;
@@ -1919,7 +1928,8 @@ fn pass_of<B: Body3>(slots: usize, tiered: bool, draft: Draft) -> Pass {
 /// resident sequences ([`Q3Load`]): under `--place`, the plan on its card,
 /// opening the whole model on that card when the plan holds no host expert
 /// and the whole-fit verdict takes the load (`PlaceQ3::whole_card_qwen3`,
-/// `PlaceQ3::whole_card_qwen35`: no line on stderr), else the placed body;
+/// `PlaceQ3::whole_card_qwen35`: no line on stderr while the verdict takes the load; a priced
+/// probe the card is short of prints its own line before it refuses), else the placed body;
 /// else the whole-fit verdict at the total (`q3place::unplaced_qwen3_slots`,
 /// `q3place::unplaced_qwen35_slots`, its line on stderr) — the whole model on
 /// `a`'s card, or the placed plan on it. A qwen35moe file's plans carry
@@ -1955,6 +1965,48 @@ fn ctx_and_load(
     let (chosen, reads) = q3place::serve_choice_records(split, (set, slots), o, record_rows)?;
     choice_line(if set.is_some() { "set" } else { "default" }, reads);
     Ok(chosen)
+}
+
+/// Whether the load's draft asks to yield to the context: the unset draft whose verdict opens the
+/// file's own layer ([`verdict_drafts`]). A set `mtp` keeps its context or its plan refuses it; a
+/// served draft (`dspark`, `lookup`) prices its own bytes.
+fn draft_yields(word: Word, drafts: Drafts) -> bool {
+    word == Word::Off && drafts == Drafts::InFile
+}
+
+/// The unset in-file draft's yield to the context, the seat's one reading of
+/// `generate::draft_yield`: `drafted` the choice the load makes with the layer
+/// priced, `plain` the choice without it and the layer's card bytes there. Where the draft asks
+/// ([`draft_yields`] of its `word` and `drafts`) and the drafted choice fitted its
+/// context under the target, or holds no context at all, the plain choice
+/// serves when it holds twice the positions or more
+/// ([`bloomery_levers::RungCost::of`]); the cost comes back with it. A set draft never asks.
+///
+/// # Errors
+/// The drafted choice's refusal where the draft does not yield, and the plain one's.
+fn unset_draft_yield<P>(
+    (word, drafts): (Word, Drafts),
+    drafted: Result<Chosen<P>, GateError>,
+    plain: impl FnOnce() -> Result<(Chosen<P>, u64), GateError>,
+) -> Result<(Chosen<P>, Option<RungCost>), GateError> {
+    let chosen = draft_yield::<q35::PlaceError, _, _>(
+        draft_yields(word, drafts),
+        drafted,
+        |d| {
+            matches!(d.rule, Rule::Fitted { .. })
+                .then(|| usize::try_from(d.slot_ctx).ok())
+                .flatten()
+        },
+        || {
+            let (plain, bytes) = plain()?;
+            let ctx = usize::try_from(plain.slot_ctx)?;
+            Ok((plain, ctx, bytes))
+        },
+    )?;
+    Ok(match chosen {
+        DraftYield::Keep(d) => (d, None),
+        DraftYield::Yield(plain, y) => (plain, Some(y)),
+    })
 }
 
 /// `--parallel auto`'s count ([`AutoSlots::count`]) over the load the seat asks at one slot
@@ -2780,7 +2832,30 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         None => (slots, a.ctx),
         Some(auto) => auto_slots(auto, (split, arch, word), opts, record_rows)?,
     };
-    let asked = ctx_and_load(split, (ctx, slots), opts, record_rows)?;
+    // The unset draft yields to the context ([`unset_draft_yield`]): the plain choice is weighed
+    // quietly, its verdicts are the log's only where it serves.
+    let plain_opts = q3place::ServeOpts {
+        draft: false,
+        ..opts
+    };
+    let (asked, yielded) = unset_draft_yield(
+        (word, drafts),
+        ctx_and_load(split, (ctx, slots), opts, record_rows),
+        || {
+            let (plain, _) = ubatch_pick::quietly(|| {
+                q3place::serve_choice_records(split, (ctx, slots), plain_opts, 0)
+            })?;
+            let bytes = q3place::mtp_card_bytes(split, kv, plain.total)?;
+            Ok((plain, bytes))
+        },
+    )?;
+    let asked = match &yielded {
+        Some(y) => {
+            record::draft_yield(y).eprint();
+            ctx_and_load(split, (ctx, slots), plain_opts, 0)?
+        }
+        None => asked,
+    };
     let (_, image) = vision_seat::images_of(vision.as_ref());
     eprintln!(
         "{}{}",
@@ -2822,7 +2897,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let choice = if matches!(arch, Family::Qwen35moe | Family::Qwen35)
         && matches!(word, Word::Off | Word::Mtp)
     {
-        Some(if weights.is_folder() {
+        Some(if let Some(y) = yielded {
+            Choice::Plain(Draft38Off::Yield(y).to_string())
+        } else if weights.is_folder() {
             folder_choice(draft_asked(&levers)?)?
         } else {
             decide_q35(
@@ -3159,6 +3236,98 @@ mod tests {
         assert_eq!(Drafts::None.records(), 0);
         assert_eq!(Drafts::InFile.records(), Drafts::Served.records());
         assert!(Drafts::InFile.records() > 0);
+    }
+
+    /// The unset in-file draft yields to the context ([`unset_draft_yield`]) where the plain load
+    /// serves twice the positions or more, a set one never does, and a draft that holds no
+    /// context at all gives way to the plain load. The first assert's pair is the Qwen3.8-27B
+    /// Q4_K_M on a 24 GB card: the plain load's context is 103,424 and the drafted one's 91,136, so
+    /// the draft keeps 88 % of the positions, far from half, and stays. Mutant: the unset draft
+    /// never asks ([`draft_yields`] false).
+    #[test]
+    fn the_unset_draft_yields_to_the_context_and_a_set_one_keeps_it() {
+        use super::{Chosen, Drafts, GateError, Rule, Word, unset_draft_yield};
+        use model::placement::PlacementError;
+        use model::placement::ctx_ask::{Limit, Short, Side};
+
+        let short = Short {
+            on: Side::Card,
+            need: 2,
+            room: 1,
+        };
+        let fitted = || Rule::Fitted {
+            from: 262_144,
+            short,
+        };
+        let chose = |ctx: u64, rule: Rule| Chosen {
+            slot_ctx: ctx,
+            slots: 1,
+            total: ctx,
+            rule,
+            limit: Limit {
+                positions: 262_144,
+                source: "trained",
+            },
+            plan: (),
+        };
+        // The unset word and a verdict that opens the file's layer: the draft that asks.
+        let unset = (Word::Off, Drafts::InFile);
+        let weigh = |kind: (Word, Drafts), drafted: Result<Chosen<()>, GateError>, plain: u64| {
+            unset_draft_yield(kind, drafted, || Ok((chose(plain, fitted()), 7)))
+                .map(|(c, y)| (c.slot_ctx, y.map(|y| (y.with, y.without, y.card_bytes))))
+                .map_err(|e| e.to_string())
+        };
+        // 91,136 of 103,424: the draft stays.
+        assert_eq!(
+            weigh(unset, Ok(chose(91_136, fitted())), 103_424),
+            Ok((91_136, None))
+        );
+        // Half the positions or fewer: the plain load serves, and the cost names both.
+        assert_eq!(
+            weigh(unset, Ok(chose(51_712, fitted())), 103_424),
+            Ok((103_424, Some((51_712, 103_424, 7))))
+        );
+        assert_eq!(
+            weigh(unset, Ok(chose(51_713, fitted())), 103_424),
+            Ok((51_713, None))
+        );
+        // A draft that holds no context at all is a yield to the plain load.
+        let none = || -> GateError {
+            Box::new(PlacementError::HostRoomFloor {
+                room: 8,
+                floor: 9,
+                base: 1,
+                layer: 1,
+                need: 9,
+                arena: None,
+            })
+        };
+        assert_eq!(
+            weigh(unset, Err(none()), 103_424),
+            Ok((103_424, Some((0, 103_424, 7))))
+        );
+        // A set draft, or a verdict that opens no layer of the file's, never asks: its context
+        // stands, or its refusal does, and no plain load is weighed.
+        let never =
+            || -> Result<(Chosen<()>, u64), GateError> { panic!("no plain load is weighed") };
+        for kind in [
+            (Word::Mtp, Drafts::InFile),
+            (Word::Off, Drafts::None),
+            (Word::Dspark, Drafts::Served),
+            (Word::Lookup, Drafts::Served),
+        ] {
+            let kept = unset_draft_yield(kind, Ok(chose(1024, fitted())), never)
+                .map(|(c, y)| (c.slot_ctx, y.is_none()));
+            assert!(matches!(kept, Ok((1024, true))), "{kind:?}");
+            assert!(
+                unset_draft_yield(kind, Err(none()), never).is_err(),
+                "{kind:?}"
+            );
+        }
+        // A context the target held costs the draft nothing.
+        let held = unset_draft_yield(unset, Ok(chose(262_144, Rule::Target)), never)
+            .map(|(c, y)| (c.slot_ctx, y.is_none()));
+        assert!(matches!(held, Ok((262_144, true))));
     }
 
     /// The open's round shape is the body's fact: Qwen3.6's body settles a

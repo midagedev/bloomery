@@ -424,6 +424,12 @@ fn a_drafted_verdict_prices_the_draft_layer() {
     q3place::tests::a_drafted_verdict_prices_the_draft_layer();
 }
 
+#[cfg(all(test, feature = "gpu"))]
+#[test]
+fn a_routed_verdict_prices_the_draft_layer_where_the_load_opens_it() {
+    q3place::tests::a_routed_verdict_prices_the_draft_layer_where_the_load_opens_it();
+}
+
 #[cfg(feature = "gpu")]
 #[path = "shared/qwen38_place.rs"]
 mod q38place;
@@ -2893,7 +2899,7 @@ mod cli {
                     for line in q.records(&plan, None)? {
                         line.print();
                     }
-                    match q.whole_card_qwen35(&file, &plan, (ctx, 1), o)? {
+                    match q.whole_card_qwen35(&file, &plan, (ctx, 1), (o, false))? {
                         Some(card) => {
                             if dspark {
                                 return Err(dspark_refusal(None));
