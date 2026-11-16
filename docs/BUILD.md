@@ -191,7 +191,7 @@ BLOOMERY_REF_MODEL="$M" target/release/bloomery-chat --prompt "The capital of Fr
 BLOOMERY_REF_MODEL="$M" target/release/bloomery-serve-ds41 --host 127.0.0.1 --port 8080
 ```
 
-The commands above use the default `--place a`, the largest visible card, planned on its own bytes ([Picking the card](#picking-the-card)). The binaries read the model file from `BLOOMERY_REF_MODEL`; they have no default path and stop if it is unset.
+The commands above use the default `--place a`, the largest visible card, planned on its own bytes ([Picking the card](#picking-the-card)). The binaries read the model file from `BLOOMERY_REF_MODEL`; they have no default path and stop if it is unset. `bloomery-serve` is the exception: it names its model by `-m`, `--hf` or `--model` and reads no `BLOOMERY_REF_MODEL`, so a shell that exports it for the gates starts no server on that file.
 
 **The r8 sidecar.** The host expert tier reads its routed gate and up weights from a second file, the r8 sidecar, laid out for the CPU kernels: `<model dir>-r8/<name>-r8.gguf` beside the model directory, 155.7 GB. For the download above that is `~/models/DeepSeek-V4.1-Flash-Q3_K_M-r8/DeepSeek-V4.1-Flash-Q3_K_M-r8.gguf`; `r8conv path` prints it. `r8conv convert` writes it from the model file and `r8conv verify` checks it against the model file. It is on by default (`BLOOMERY_R8`). Without the file the engine reads the model file instead, with the same output bit for bit, and says so on its `load` line: `load host_tier r8=off (no sidecar at <path>: just r8-sidecar)`. A sidecar that does not match the model file is an error, never a fall-back. Budget the disk for both files. `r8conv convert` picks V4.1's routed stacks by itself; the other models' host tiers also read a sidecar when one is there, but this page does not cover writing one for them.
 
@@ -257,7 +257,7 @@ The server is `bloomery-serve --model glm` (build it with `--features glm5next,c
 
 ```sh
 cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf --release --bin bloomery-serve
-BLOOMERY_REF_MODEL="$M" target/release/bloomery-serve --model glm --place a --ctx 4096 --host 127.0.0.1 --port 8080
+target/release/bloomery-serve --model glm -m "$M" --place a --ctx 4096 --host 127.0.0.1 --port 8080
 ```
 
 It serves one slot unless `--parallel N` asks for more. A request keeps the slot's prefix back to its last checkpoint (every 512 positions); `--cache-ram MIB` (0 off) keeps saved states in host RAM, and `--slot-save-path DIR` turns on slot save and restore. GLM-5.3's chat template always opens a thinking span; `chat_template_kwargs: {"reasoning_effort": "low"}` (or `"high"`) makes it shorter than the template's default, `max`.

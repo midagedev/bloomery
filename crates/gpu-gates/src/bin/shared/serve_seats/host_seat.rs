@@ -160,6 +160,20 @@ fn unsupported(path: &Path, split: &Split, detected: Result<Arch, ModelError>) -
     }
 }
 
+/// The refusal of `split`, a file whose first shard the host seat does not serve ([`Arch::detect`] is not
+/// deepseek2), as [`run`] ends it: the list of what the host engine runs none of ([`unsupported`]). A start
+/// that fell back to this seat for want of a card, on a file a card seat serves, opens its own refusal with
+/// the card reading's cause and keeps this one as the detail.
+pub fn refusal(path: &Path, split: &Split) -> Refusal {
+    match split.shard(0) {
+        Some(first) => unsupported(path, split, Arch::detect(first)),
+        None => Refusal::new(
+            Code::Unsupported,
+            format!("{} opened with no shard", path.display()),
+        ),
+    }
+}
+
 /// Serves the model, and only it, until the listener or the engine fails; `Ok`
 /// carries why the server ended.
 pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {

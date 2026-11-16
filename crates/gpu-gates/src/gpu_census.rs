@@ -2,11 +2,12 @@
 //! cannot name: [`bloomery_gpu::census`] (behind the `gpu` feature, as
 //! [`census`] is) reads each device's identity and its free bytes on the
 //! primary context; this module adds the processes holding each device, as
-//! `nvidia-smi` names them — one query, best effort. A tool that does not
-//! answer names no holder, and a plan never fails for want of the answer:
-//! the free bytes alone still cap it. A process of the same locked run —
-//! the gate that started this one, named by [`FELLOW`] — is no holder
-//! either, as this process's own pid is not.
+//! `nvidia-smi` names them — one query, best effort — and, for a start that
+//! finds no card in view, the cards `nvidia-smi` lists past the mask
+//! ([`listed`]). A tool that does not answer names no holder, and a plan
+//! never fails for want of the answer: the free bytes alone still cap it.
+//! A process of the same locked run — the gate that started this one, named
+//! by [`FELLOW`] — is no holder either, as this process's own pid is not.
 
 #[cfg(any(feature = "gpu", test))]
 use std::ffi::OsStr;
@@ -64,6 +65,22 @@ pub fn census() -> Result<Vec<DeviceInfo>, GateError> {
     };
     name_holders(&mut census, &rows, std::process::id(), fellow);
     Ok(census)
+}
+
+/// What `nvidia-smi` lists of the cards, whatever `CUDA_VISIBLE_DEVICES` hides from the driver, as the
+/// tool's `index,name,uuid` text (`serve::preflight::listed_cards` reads it): the cards a start with no
+/// card in view names beside what the environment asked for. `None` where the tool is missing or fails: no
+/// card is named, never an error.
+#[cfg(feature = "gpu")]
+#[must_use]
+pub fn listed() -> Option<String> {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=index,name,uuid", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// The pid [`FELLOW`] names: `None` where the variable is unset or empty,

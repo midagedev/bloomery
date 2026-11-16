@@ -3,7 +3,8 @@
 //! <repo>[:<quant>]`, fetched into the cache ([`fetch`]). A server takes the flags out of its
 //! arguments (`take`) before anything else parses them, and the path it resolves is the process's
 //! model file ([`set_model_file`]), which [`crate::ref_model_path`] reads before the gates'
-//! `$BLOOMERY_REF_MODEL`. The `hf` feature adds what fetches: the rules of a model named twice
+//! `$BLOOMERY_REF_MODEL` ([`reference`]; `bloomery-serve` reads none of it, [`ignore_reference`]).
+//! The `hf` feature adds what fetches: the rules of a model named twice
 //! (`hf::source`'s), a decision model's head from the repo a `--hf` repo's model card says it
 //! quantizes (`quantized_from`), a family's MTP draft fetched beside a set only when its
 //! architecture's rule says the set can run that file, and a seat's image projector under `--hf`
@@ -23,7 +24,7 @@ mod fetch;
 #[cfg(feature = "hf")]
 pub use fetch::{
     cache_root, fetch_exact, hf_projector, hf_repo, name, on_transfer, pin_revision,
-    quantized_from, ref_model, repo_architecture, resolve, sentence_prompts, take,
+    quantized_from, repo_architecture, resolve, sentence_prompts, take,
 };
 #[cfg(feature = "hf")]
 pub mod pick;
@@ -31,6 +32,49 @@ pub mod pick;
 /// The refusal when nothing names the model.
 pub const NONE: &str = "no model file: pass -m PATH (the first shard, or a checkpoint folder) \
                                or --hf <repo>[:<quant>], or set BLOOMERY_REF_MODEL";
+
+/// The refusal when nothing names the model of a process that reads no `$BLOOMERY_REF_MODEL`
+/// ([`ignore_reference`]): the server's, whose model is its command line's.
+pub const NONE_FLAGS: &str = "no model file: pass -m PATH (the first shard, or a checkpoint folder), \
+                              --hf <repo>[:<quant>], or --model NAME for a catalog model";
+
+/// Set once by a process whose model is its command line's alone: it reads no `$BLOOMERY_REF_MODEL`.
+static REFERENCE_IGNORED: OnceLock<()> = OnceLock::new();
+
+/// This process reads no model from `$BLOOMERY_REF_MODEL`, the gates' variable, from now on:
+/// `bloomery-serve` names its model by `-m`, `--hf` or `--model` (or llama-server's `LLAMA_ARG_MODEL`
+/// and `LLAMA_ARG_HF_REPO`), so a variable a test harness exports into every command (`tools/box.sh`)
+/// is no second naming and no fallback. The stand-alone seat binaries (`bloomery-serve-ds41`,
+/// `-qwen38`) have no model flag and keep the variable.
+pub fn ignore_reference() {
+    let _ = REFERENCE_IGNORED.set(());
+}
+
+/// `$BLOOMERY_REF_MODEL` as this process reads it: the gates' variable, `None` where it is unset or
+/// empty, and `None` for a process that [`ignore_reference`]s it.
+#[must_use]
+pub fn reference() -> Option<std::ffi::OsString> {
+    reference_of(
+        REFERENCE_IGNORED.get().is_some(),
+        std::env::var_os("BLOOMERY_REF_MODEL"),
+    )
+}
+
+/// [`reference`] over its two inputs: whether the process ignores the variable, and its value.
+fn reference_of(ignored: bool, value: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    value.filter(|v| !ignored && !v.is_empty())
+}
+
+/// The refusal for a process whose model nothing names: [`NONE_FLAGS`] where the process ignores
+/// `$BLOOMERY_REF_MODEL`, else [`NONE`].
+#[must_use]
+pub fn none() -> &'static str {
+    if REFERENCE_IGNORED.get().is_some() {
+        NONE_FLAGS
+    } else {
+        NONE
+    }
+}
 
 /// A checkpoint folder as read ([`open_folder`]) and the part source its load reads card tensors
 /// through, named here so a seat reaches the folder reader through this crate's `checkpoint` feature.
@@ -195,7 +239,10 @@ pub(crate) fn test_header(
 
 #[cfg(test)]
 mod tests {
-    use super::{Split, decision_type, header, refuse_decision_model, test_header};
+    use super::{
+        NONE, NONE_FLAGS, Split, decision_type, header, reference_of, refuse_decision_model,
+        test_header,
+    };
     use gguf::Value;
 
     /// A header of architecture `fixture` with the optional `fixture.decision.type` marker.
@@ -292,5 +339,21 @@ mod tests {
             drop(split);
             std::fs::remove_file(path).unwrap();
         }
+    }
+    /// The gates' variable is read as set and non-empty by a gate, and by a process that ignores it
+    /// ([`super::ignore_reference`], the server's) as no model; the refusal of a start that names
+    /// none sends a gate to the variable and a server to its flags.
+    #[test]
+    fn a_server_reads_none_of_the_gates_variable() {
+        use std::ffi::OsString;
+        let set = || Some(OsString::from("/m/x.gguf"));
+        assert_eq!(reference_of(false, set()), set());
+        assert_eq!(reference_of(true, set()), None);
+        assert_eq!(reference_of(false, Some(OsString::new())), None);
+        assert_eq!(reference_of(false, None), None);
+        assert!(NONE.contains("BLOOMERY_REF_MODEL"));
+        assert!(
+            !NONE_FLAGS.contains("BLOOMERY_REF_MODEL") && NONE_FLAGS.starts_with("no model file")
+        );
     }
 }

@@ -42,10 +42,11 @@
 //!   ik answered for that row (`$BLOOMERY_DATA/argmax-ik.tsv`, `just
 //!   argmax-ref` writes it), with the divergence set pinned empty.
 //! - `qwen36_is_refused_by_name` (only with `--qwen36`, the Qwen3.6 file):
-//!   the start with no `--model` word and no card visible seats the file on
-//!   the host seat, which ends 65 and lists what the host engine does not run
-//!   of it (its delta-rule and GQA mixers, the attention output gate, the
-//!   recurrent state, the shared expert's gate).
+//!   the start with no `--model` word and no card visible ends 69 (`no-device`) naming its
+//!   cause first (no card is visible, with the `CUDA_VISIBLE_DEVICES` the gate
+//!   holds empty), then listing what the host engine does not run of the file
+//!   (its delta-rule and GQA mixers, the attention output gate, the recurrent
+//!   state, the shared expert's gate).
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -477,9 +478,13 @@ mod gate {
     }
 
     /// `qwen36_is_refused_by_name` (the module header), on the file the recipe
-    /// named: the start with no model word, no card visible and no host ask is
-    /// the host seat's, and the seat refuses the file with the host engine's
-    /// list.
+    /// named: the start with no model word, no card visible and no host ask finds
+    /// no card for the card seat that serves the file; it ends `no-device` (69)
+    /// with the cause first and the host engine's list as the detail.
+    ///
+    /// PIN(2026-11-17): the exit was 65 (`unsupported`, the host seat's refusal of the
+    /// file). A start with no card visible is a missing device, not a feature the file
+    /// needs; the class changes to 69, the cause line and the list stay required.
     fn qwen36_is_refused_by_name(dir: &Path, file: &Path) -> Result<bool, GateError> {
         let mut ok = true;
         let (status, _, text) = plan(dir, "refuse-qwen36", no_word(file, &[])?)?;
@@ -490,14 +495,22 @@ mod gate {
             .copied()
             .collect();
         println!(
-            "refuse-qwen36: exit 65 {} (code {code:?}); the list names {named:?} of {} host items",
-            code == Some(65),
+            "refuse-qwen36: exit 69 {} (code {code:?}); the list names {named:?} of {} host items",
+            code == Some(69),
             QWEN36_ITEMS.len()
         );
+        // The cause comes before the list: the line the refusal opens with names the mask.
+        let cause = text.lines().find(|l| l.contains("no card is visible"));
+        let first_item = QWEN36_ITEMS.iter().filter_map(|w| text.find(*w)).min();
+        let cause_first = cause
+            .zip(first_item)
+            .is_some_and(|(l, item)| text.find(l).is_some_and(|at| at < item))
+            && cause.is_some_and(|l| l.contains("CUDA_VISIBLE_DEVICES"));
+        println!("refuse-qwen36: the cause {cause:?} comes before the list: {cause_first}");
         check(
             &mut ok,
             "qwen36_is_refused_by_name",
-            code == Some(65) && named.len() == QWEN36_ITEMS.len(),
+            code == Some(69) && named.len() == QWEN36_ITEMS.len() && cause_first,
         );
         Ok(ok)
     }

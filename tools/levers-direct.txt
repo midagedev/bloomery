@@ -22,7 +22,7 @@ crates/qdot/src/lib.rs	BLOOMERY_QDOT_AVX512	isa-owner
 crates/model-hf/src/bin/prepare.rs	BLOOMERY_QWEN38_HF	test harness checkpoint folder, not a serving lever
 crates/gguf/src/v41.rs	BLOOMERY_V41_MODEL,BLOOMERY_REF_MODEL,BLOOMERY_REF_MODEL_PROFILE,BLOOMERY_FIXTURE_MODEL	gatestoml
 crates/gguf/src/arch/deepseek41.rs	BLOOMERY_V41_ENGRAM	stays: the companion file's path, read where the model split opens (Split::open has no argument to carry it)
-crates/gpu-gates/src/lib.rs	BLOOMERY_REF_MODEL	gatestoml
+crates/gpu-gates/src/model_file.rs	BLOOMERY_REF_MODEL	gatestoml
 crates/refset/src/lib.rs	BLOOMERY_DATA	gatestoml
 crates/refset/src/fixture.rs	BLOOMERY_FIXTURE_ROOT,BLOOMERY_FIXTURE_VARIANT	gatestoml
 crates/refset/src/arch/mod.rs	BLOOMERY_CARD_ALL_EXPERTS	gatestoml
@@ -51,6 +51,7 @@ crates/engram-lab/src/bin/engram-rate.rs	BLOOMERY_ENGRAM_LEASE	TL-7
 crates/threads/tests/helper.rs	HELPER_POOL_REFUSAL	stays: the helper pool-plan refusal test's handshake with the isolated child it runs
 crates/gpu-gates/src/bin/bloomery_serve.rs	SERVE_RECORD_ALIAS_SEAT	stays: the record alias test's handshake with the child it runs, cfg(test) only
 crates/gpu-gates/src/bin/soak_ds41_serve.rs	CUDA_VISIBLE_DEVICES	stays: the driver's card list (the soak checks the card it was given)
+crates/gpu-gates/src/bin/bloomery_serve.rs	CUDA_VISIBLE_DEVICES	stays: the driver's card mask, named in the refusal of a start with no card in view
 crates/gpu-gates/src/record.rs	CUDA_DEVICE_ORDER	stays: the driver's ordinal order, which the plan record prints beside the ordinals
 crates/gpu-gates/src/bin/gate_deepseek41_load.rs	CUDA_MODULE_LOADING	stays: the driver's module loading mode, which check (v) requires EAGER and refuses otherwise
 crates/serve/src/screen.rs	NO_COLOR,TERM,COLORTERM,LC_ALL,LC_CTYPE,LANG	stays: the terminal's own conventions, which the start screen honours (no colour, a dumb terminal, 24-bit colour, a locale without UTF-8)
@@ -94,7 +95,7 @@ crates/vision/tests/common/mod.rs	BLOOMERY_VISION_SET	stays: the vision referenc
 crates/gpu-gates/src/tier.rs	BLOOMERY_TIER	stays: the tier a gate runs in, read once here and checked against the file it opens
 crates/gpu-gates/src/card_bytes.rs	BLOOMERY_CARD_HELD	stays: whether the run holds its card, which tools/gpu-gate.sh and the release sitting export
 crates/gpu-gates/src/gpu_census.rs	BLOOMERY_CARD_FELLOW	stays: the gate's pid a server a gate started leaves out of its holder lists, set by serve_client::serve_cmd where the run holds its card
-crates/gpu-gates/src/model_file/fetch.rs	BLOOMERY_CACHE,BLOOMERY_REF_MODEL,HOME	stays: a server's --hf cache, and the model named once beside the gates' variable
+crates/gpu-gates/src/model_file/fetch.rs	BLOOMERY_CACHE,HOME	stays: a server's --hf cache
 crates/gpu-gates/src/bin/shared/ds41_tp.rs	HOME	stays: the TP head's record of the source files it checked, under the user's cache beside the hub's
 crates/metal/src/model_arg.rs	BLOOMERY_CACHE,HOME	stays: the Metal server's --hf cache, read where gpu-gates' fetch reads it
 crates/runtime/src/costs.rs	BLOOMERY_COSTS,HOME	stays: the cost store's directory, read where every load's expert stream and split walk keep their timings

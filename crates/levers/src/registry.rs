@@ -2276,7 +2276,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         Some("box.sh"),
         "The model file the gates and the GPU binaries open: `tools/box.sh` exports the \
          tool profile's `MODEL` (`tools/ref/ref-paths.sh`) into every box command; a \
-         caller's own wins.",
+         caller's own wins. `bloomery-serve` reads none of it: its model is `-m`, `--hf` or \
+         `--model`; its stand-alone seat binaries (`bloomery-serve-ds41`, \
+         `bloomery-serve-qwen38`) have no model flag and open this file.",
     ),
     path(
         "BLOOMERY_REF_SET",

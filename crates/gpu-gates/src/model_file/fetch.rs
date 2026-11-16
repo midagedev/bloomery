@@ -72,12 +72,6 @@ pub fn cache_root() -> Result<PathBuf, GateError> {
     )?)
 }
 
-/// `$BLOOMERY_REF_MODEL`, the model the gates' variable names, which a start's own flags must not
-/// name a second time ([`resolve`]).
-pub fn ref_model() -> Option<String> {
-    std::env::var("BLOOMERY_REF_MODEL").ok()
-}
-
 /// What a fetch has written of a set or checkpoint, as the start reports it on `/health`:
 /// the bytes the files hold, the bytes of the files passed and the size of the one in flight.
 #[derive(Default)]
@@ -351,20 +345,20 @@ fn model_card(repo: &str) -> Result<Option<String>, GateError> {
     Ok(Some(text))
 }
 
-/// The model file `flags` name, resolved beside `$BLOOMERY_REF_MODEL`
-/// ([`resolve`]) and set as the process's ([`set_model_file`]) when they
-/// name one. A checkpoint repo requires the `checkpoint` build feature before any file fetch.
+/// The model file `flags` name, resolved ([`resolve`]) from the flags alone (a server's model is its
+/// command line's, never the gates' `$BLOOMERY_REF_MODEL`) and set as the process's
+/// ([`set_model_file`]) when they name one. A checkpoint repo requires the `checkpoint` build feature
+/// before any file fetch.
 pub fn name(flags: &Flags) -> Result<(), GateError> {
     record::require(record::groups::fetch::FETCH, "model_file::name");
     record::require(record::groups::fetch::SET, "model_file::name");
-    let env = ref_model();
     let sources = if cfg!(feature = "checkpoint") {
         Sources::GgufOrCheckpoint
     } else {
         Sources::Gguf
     };
     if *flags != Flags::default()
-        && let Some(path) = resolve(flags, env.as_deref(), sources)?
+        && let Some(path) = resolve(flags, None, sources)?
     {
         set_model_file(path)?;
         // A path flag wins over `--hf` ([`source::resolve`]), so the file is the repo's only

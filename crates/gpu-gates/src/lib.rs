@@ -246,7 +246,8 @@ pub fn bench_arm(
 
 /// The model file every gate and server opens: the one a server named on
 /// its command line (`-m`, `--hf`: [`model_file`]), else
-/// `$BLOOMERY_REF_MODEL`, with no default here. The variable's file is a
+/// `$BLOOMERY_REF_MODEL`, with no default here (`bloomery-serve` reads no variable:
+/// [`model_file::ignore_reference`]). The variable's file is a
 /// property of the model profile (`tools/ref/models/<architecture>.sh`);
 /// `tools/box.sh` exports it into every box command, the same value the
 /// runners and the C++ harnesses read. An empty value counts as unset, as in
@@ -264,14 +265,14 @@ pub fn ref_model_path() -> Result<PathBuf, GateError> {
     let path = if let Some(p) = model_file::model_file() {
         p.clone()
     } else {
-        match std::env::var_os("BLOOMERY_REF_MODEL") {
-            Some(p) if !p.is_empty() => {
+        match model_file::reference() {
+            Some(p) => {
                 if gguf::v41::PathEnv::from_env().runs_v41() {
                     gguf::v41::try_model()?;
                 }
                 PathBuf::from(p)
             }
-            _ => return Err(model_file::NONE.into()),
+            None => return Err(model_file::none().into()),
         }
     };
     let tier = tier::Tier::from_env()?;

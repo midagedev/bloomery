@@ -1,9 +1,11 @@
 //! What a server checks before it fetches or loads anything: that the CPU
 //! runs the release's host code ([`cpu_gate`], over [`runs_v3`] and
 //! [`cpu_lacks`]; its refusal is the class `no-device`) and that the NVIDIA
-//! driver runs its CUDA code ([`driver`]). The verdicts are pure functions of
-//! what the caller read: the CPU's feature words ([`CpuWords`]) and the
-//! driver's answer ([`Driver`]).
+//! driver runs its CUDA code ([`driver`]); and what it says when no card is in
+//! view ([`no_card`], over [`NoCard`] and the cards `nvidia-smi` lists,
+//! [`listed_cards`]). The verdicts are pure functions of what the caller read:
+//! the CPU's feature words ([`CpuWords`]), the driver's answer ([`Driver`]) and
+//! the card reading ([`NoCard`]).
 //!
 //! The release's host code is built for x86-64-v3, so the compiler may use
 //! any of its instructions anywhere. `std::is_x86_feature_detected!` cannot
@@ -298,10 +300,127 @@ pub fn driver(d: &Driver) -> Result<(), String> {
     }
 }
 
+/// One card as `nvidia-smi` lists it, whatever `CUDA_VISIBLE_DEVICES` hides from the driver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedCard {
+    /// The index `nvidia-smi` gives the card.
+    pub index: String,
+    /// The card's name.
+    pub name: String,
+    /// The card's UUID, `GPU-` and the sixteen bytes.
+    pub uuid: String,
+}
+
+/// What a start read of the cards when none was in view.
+#[derive(Clone, Copy, Debug)]
+pub struct NoCard<'a> {
+    /// Why the driver's census could not be read, when it could not.
+    pub census_error: Option<&'a str>,
+    /// `CUDA_VISIBLE_DEVICES` as the process holds it; `None` when unset.
+    pub mask: Option<&'a str>,
+    /// The cards the machine lists, whatever the mask; `None` when `nvidia-smi` did not answer.
+    pub listed: Option<&'a [ListedCard]>,
+}
+
+/// The cards `text` lists, the answer of `nvidia-smi --query-gpu=index,name,uuid --format=csv,noheader`: a
+/// pure read of the tool's text. A line that is not an index, a name and a UUID gives `None`, never a guess.
+#[must_use]
+pub fn listed_cards(text: &str) -> Option<Vec<ListedCard>> {
+    let mut cards = Vec::new();
+    for line in text.lines() {
+        let mut cells = line.split(',').map(str::trim);
+        let (index, name, uuid) = (cells.next()?, cells.next()?, cells.next()?);
+        if cells.next().is_some() || index.is_empty() || name.is_empty() || uuid.is_empty() {
+            return None;
+        }
+        cards.push(ListedCard {
+            index: index.to_owned(),
+            name: name.to_owned(),
+            uuid: uuid.to_owned(),
+        });
+    }
+    Some(cards)
+}
+
+/// Whether one entry of a `CUDA_VISIBLE_DEVICES` list names `card`: its index, or a prefix of its UUID (the
+/// driver takes a unique prefix, `GPU-8c12` for the whole).
+fn names(entry: &str, card: &ListedCard) -> bool {
+    entry == card.index || (entry.starts_with("GPU-") && card.uuid.starts_with(entry))
+}
+
+/// The cards as a refusal lists them: `<index> <name> (<uuid>)`, joined by `; `.
+fn listing(cards: &[ListedCard]) -> String {
+    cards
+        .iter()
+        .map(|c| format!("{} {} ({})", c.index, c.name, c.uuid))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The sentence a start that needs a card ends with when none is in view: the cause first (what the
+/// environment asked for and what the machine lists), then the step that fixes it.
+#[must_use]
+pub fn no_card(view: &NoCard<'_>) -> String {
+    const NONE: &str = "no card is visible:";
+    let lists = match view.listed {
+        None => "nvidia-smi did not answer".to_owned(),
+        Some([]) => "nvidia-smi lists no card".to_owned(),
+        Some(cards) => format!("nvidia-smi lists: {}", listing(cards)),
+    };
+    if let Some(e) = view.census_error {
+        let mask = view.mask.map_or_else(String::new, |m| match m {
+            "" => " (CUDA_VISIBLE_DEVICES is set empty)".to_owned(),
+            m => format!(" (CUDA_VISIBLE_DEVICES={m})"),
+        });
+        return format!(
+            "{NONE} the driver's device census failed: {e}{mask}; {lists}; check the driver (R580+) and \
+             that CUDA_VISIBLE_DEVICES, if set, names a listed card"
+        );
+    }
+    match (view.mask, view.listed) {
+        (Some(""), _) => format!(
+            "{NONE} CUDA_VISIBLE_DEVICES is set empty, which hides every card ({lists}); unset it to see them"
+        ),
+        (Some(mask), None) => format!(
+            "{NONE} CUDA_VISIBLE_DEVICES={mask} leaves no card in view and {lists}, so it cannot be \
+             checked against the cards the machine has; unset CUDA_VISIBLE_DEVICES"
+        ),
+        (Some(mask), listed) => {
+            let named = listed.is_some_and(|cards| {
+                mask.split(',')
+                    .map(str::trim)
+                    .any(|entry| cards.iter().any(|c| names(entry, c)))
+            });
+            if named {
+                format!(
+                    "{NONE} CUDA_VISIBLE_DEVICES={mask} names a card nvidia-smi lists, yet the driver opened \
+                     none ({lists}); check that the CUDA driver (R580+) runs it, or unset \
+                     CUDA_VISIBLE_DEVICES"
+                )
+            } else {
+                format!(
+                    "{NONE} CUDA_VISIBLE_DEVICES={mask} names none of the cards the driver lists ({lists}); \
+                     unset CUDA_VISIBLE_DEVICES or name one of them by index or UUID"
+                )
+            }
+        }
+        (None, Some([])) => {
+            format!("{NONE} the machine lists none ({lists}); attach a card or run where one is")
+        }
+        (None, Some(_)) => format!(
+            "{NONE} CUDA_VISIBLE_DEVICES is unset and the driver opened none of the cards nvidia-smi \
+             lists ({}); check that the CUDA driver (R580+) runs them",
+            lists.trim_start_matches("nvidia-smi lists: ")
+        ),
+        (None, None) => format!("{NONE} the driver opened none ({lists})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        CUDA_MIN, Code, CpuWords, Driver, cpu_lacks, cpu_refusal, driver, refuse_cpu, runs_v3,
+        CUDA_MIN, Code, CpuWords, Driver, ListedCard, NoCard, cpu_lacks, cpu_refusal, driver,
+        listed_cards, no_card, refuse_cpu, runs_v3,
     };
     use crate::event::{self, Event};
 
@@ -472,6 +591,187 @@ mod tests {
         assert!(
             e.contains("R580+") && e.contains("libcuda.so.1 did not load: libcuda.so.1: cannot"),
             "{e}"
+        );
+    }
+    /// The box's two cards as `nvidia-smi --query-gpu=index,name,uuid --format=csv,noheader` prints them.
+    const SMI: &str = "0, NVIDIA RTX A6000, GPU-8c129fa6-7382-35a5-2464-9ff01d99fcd4\n\
+                       1, NVIDIA GeForce RTX 5090, GPU-5090aaaa-0000-0000-0000-000000000001\n";
+
+    fn cards() -> Vec<ListedCard> {
+        listed_cards(SMI).expect("the listing reads")
+    }
+
+    /// The listing reads as index, name and UUID; a line that is none of that gives no listing, and an empty
+    /// answer lists no card.
+    #[test]
+    fn the_card_listing_reads_its_lines() {
+        let cards = cards();
+        assert_eq!(cards.len(), 2);
+        assert_eq!(
+            cards[1],
+            ListedCard {
+                index: "1".into(),
+                name: "NVIDIA GeForce RTX 5090".into(),
+                uuid: "GPU-5090aaaa-0000-0000-0000-000000000001".into(),
+            }
+        );
+        assert_eq!(listed_cards(""), Some(Vec::new()));
+        assert_eq!(listed_cards("No devices were found\n"), None);
+        assert_eq!(listed_cards("0, only a name\n"), None);
+    }
+
+    /// The cause a start with no card in view is refused with names what it asked for (the variable's value)
+    /// and what the machine lists, and says the step: here `CUDA_VISIBLE_DEVICES` names a card that is gone.
+    #[test]
+    fn a_mask_that_names_no_listed_card_is_the_cause() {
+        let cards = cards();
+        let said = no_card(&NoCard {
+            census_error: None,
+            mask: Some("GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1"),
+            listed: Some(&cards),
+        });
+        assert!(
+            said.starts_with(
+                "no card is visible: CUDA_VISIBLE_DEVICES=GPU-307fa0f6-daae-24e5-6fd3-cd50620de6b1 \
+                 names none of the cards the driver lists"
+            ),
+            "{said}"
+        );
+        for listed in [
+            "0 NVIDIA RTX A6000",
+            "1 NVIDIA GeForce RTX 5090",
+            "GPU-8c129fa6",
+        ] {
+            assert!(said.contains(listed), "{listed}: {said}");
+        }
+        assert!(said.contains("unset CUDA_VISIBLE_DEVICES"), "{said}");
+    }
+
+    /// A mask that does name a listed card, by index or by a UUID prefix, is not "names none": the driver
+    /// opened none of them, and the sentence says that instead.
+    #[test]
+    fn a_mask_that_names_a_listed_card_is_not_called_unnamed() {
+        let cards = cards();
+        for mask in [
+            "1",
+            "0,1",
+            " 1 ",
+            "GPU-8c129fa6",
+            "GPU-gone,GPU-8c129fa6-7382",
+        ] {
+            let said = no_card(&NoCard {
+                census_error: None,
+                mask: Some(mask),
+                listed: Some(&cards),
+            });
+            assert!(
+                said.starts_with("no card is visible: CUDA_VISIBLE_DEVICES=")
+                    && said.contains("names a card nvidia-smi lists")
+                    && !said.contains("names none"),
+                "{mask}: {said}"
+            );
+        }
+    }
+
+    /// An empty mask hides every card on purpose; the sentence says so and the step is to unset it.
+    #[test]
+    fn an_empty_mask_hides_every_card() {
+        let cards = cards();
+        let said = no_card(&NoCard {
+            census_error: None,
+            mask: Some(""),
+            listed: Some(&cards),
+        });
+        assert!(
+            said.starts_with(
+                "no card is visible: CUDA_VISIBLE_DEVICES is set empty, which hides every card"
+            ) && said.contains("unset it")
+                && said.contains("1 NVIDIA GeForce RTX 5090"),
+            "{said}"
+        );
+    }
+
+    /// With no mask the cause is the driver's: it opened none of the listed cards, or the machine lists none,
+    /// or the tool that lists them did not answer.
+    #[test]
+    fn with_no_mask_the_cause_is_the_driver_or_the_machine() {
+        let cards = cards();
+        let said = no_card(&NoCard {
+            census_error: None,
+            mask: None,
+            listed: Some(&cards),
+        });
+        assert!(
+            said.starts_with(
+                "no card is visible: CUDA_VISIBLE_DEVICES is unset and the driver opened none of the cards \
+                 nvidia-smi lists"
+            ) && said.contains("0 NVIDIA RTX A6000"),
+            "{said}"
+        );
+        let said = no_card(&NoCard {
+            census_error: None,
+            mask: None,
+            listed: Some(&[]),
+        });
+        assert!(
+            said.starts_with(
+                "no card is visible: the machine lists none (nvidia-smi lists no card)"
+            ),
+            "{said}"
+        );
+        let said = no_card(&NoCard {
+            census_error: None,
+            mask: None,
+            listed: None,
+        });
+        assert!(
+            said.starts_with(
+                "no card is visible: the driver opened none (nvidia-smi did not answer)"
+            ),
+            "{said}"
+        );
+    }
+
+    /// A census the driver would not answer is its own cause, beside the mask when one is set.
+    #[test]
+    fn a_census_that_fails_is_named_with_its_error() {
+        let said = no_card(&NoCard {
+            census_error: Some("cuInit: CUDA_ERROR_NO_DEVICE"),
+            mask: Some("2"),
+            listed: None,
+        });
+        assert!(
+            said.starts_with(
+                "no card is visible: the driver's device census failed: cuInit: CUDA_ERROR_NO_DEVICE"
+            ) && said.contains("CUDA_VISIBLE_DEVICES=2")
+                && said.contains("nvidia-smi did not answer"),
+            "{said}"
+        );
+        let said = no_card(&NoCard {
+            census_error: Some("cuInit: CUDA_ERROR_NO_DEVICE"),
+            mask: Some(""),
+            listed: None,
+        });
+        assert!(
+            said.contains("(CUDA_VISIBLE_DEVICES is set empty)"),
+            "{said}"
+        );
+    }
+    /// A mask no listing can be held against (`nvidia-smi` silent) is not called "names none": the sentence
+    /// says it could not check.
+    #[test]
+    fn a_mask_with_no_listing_says_it_could_not_check() {
+        let said = no_card(&NoCard {
+            census_error: None,
+            mask: Some("GPU-gone"),
+            listed: None,
+        });
+        assert!(
+            said.starts_with(
+                "no card is visible: CUDA_VISIBLE_DEVICES=GPU-gone leaves no card in view"
+            ) && said.contains("nvidia-smi did not answer")
+                && !said.contains("names none"),
+            "{said}"
         );
     }
 }

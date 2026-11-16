@@ -28,10 +28,12 @@
 //! records on stderr, and opens its first shard (a listing the network
 //! refuses or the hub answers busy or down, and every start under
 //! `HF_HUB_OFFLINE`, leaves the cache's one verified set of that quant to
-//! stand in, after an `hf offline` record); with neither,
-//! `$BLOOMERY_REF_MODEL`, the gates' variable. A model named twice — a flag
-//! given twice, `-m` beside `--hf`, a flag beside a variable that names
-//! another file — is refused by name (`bloomery_gpu_gates::model_file`).
+//! stand in, after an `hf offline` record); with neither, `--model NAME` picks a catalog
+//! model's file, and llama-server's `LLAMA_ARG_MODEL` and `LLAMA_ARG_HF_REPO` name it as the
+//! flags do. The gates' `$BLOOMERY_REF_MODEL`, which `tools/box.sh` exports into every box
+//! command, names no model here (`bloomery_gpu_gates::model_file::ignore_reference`); a start
+//! that names none is refused by name. A model named twice — a flag given twice, `-m` beside
+//! `--hf` — is refused by name (`bloomery_gpu_gates::model_file`).
 //! A decision model is named by its head, not by its architecture
 //! (`serve::decide::pick`): `--head`, or a `--hf` repo whose model card
 //! names a decision row's head repo as the model it quantizes, picks the
@@ -192,6 +194,7 @@ mod place;
 #[cfg(feature = "glm5next")]
 mod drive {
     use std::ffi::OsString;
+    use std::path::Path;
     use std::process::ExitCode;
 
     use bloomery_gpu_gates::serve_config::SOURCE_FLAGS;
@@ -531,19 +534,46 @@ models (the --model word is optional with a model file: the file's architecture 
             .join(", ")
     }
 
-    /// Whether a card is visible: the census holds one. A census that cannot be read (a driver
-    /// the start chose to go on without, at its driver door) is no card, not a refusal here.
-    fn card_visible() -> bool {
-        gpu_census::census().is_ok_and(|census| !census.is_empty())
+    /// The refusal of a start that finds no card in view and whose file only a card seat serves
+    /// (`seat`): the card reading's cause first ([`serve::preflight::no_card`]: what
+    /// `CUDA_VISIBLE_DEVICES` asked for, what `nvidia-smi` lists past it), then the host seat's own
+    /// refusal of the file as the detail ([`crate::serve_seats::host_seat::refusal`]); the class is
+    /// `no-device` (69): the card is what is missing, not a feature of the file.
+    fn no_card_refusal(
+        path: &Path,
+        split: &Split,
+        seat: Model,
+        census_error: Option<&GateError>,
+    ) -> Refusal {
+        let mask = std::env::var_os("CUDA_VISIBLE_DEVICES");
+        let mask = mask.as_ref().map(|m| m.to_string_lossy());
+        let listed = gpu_census::listed().and_then(|text| serve::preflight::listed_cards(&text));
+        let error = census_error.map(ToString::to_string);
+        let cause = serve::preflight::no_card(&serve::preflight::NoCard {
+            census_error: error.as_deref(),
+            mask: mask.as_deref(),
+            listed: listed.as_deref(),
+        });
+        caused_by(
+            &cause,
+            seat,
+            crate::serve_seats::host_seat::refusal(path, split),
+        )
     }
 
-    /// Where the file [`ref_model_path`] opened was named: a flag on the command line, or the
-    /// variable a start with no model flag falls back to, so a refusal about the file says which.
-    fn file_source() -> &'static str {
-        if model_file::model_file().is_some() {
-            "named on the command line"
-        } else {
-            "from $BLOOMERY_REF_MODEL"
+    /// `host`, the host seat's refusal of a file a card seat serves, under `cause` (why no card is in
+    /// view): the cause opens the message and the host's own words (its list of what the host engine
+    /// runs none of) follow as the detail. The class is `no-device`, not the host's `unsupported`:
+    /// the file is served, by a card seat, and the missing card is what a user fixes.
+    fn caused_by(cause: &str, seat: Model, host: Refusal) -> Refusal {
+        Refusal {
+            code: Code::NoDevice,
+            message: format!(
+                "{cause}; --model {} serves this file on a card, and the host seat cannot stand in: {}",
+                seat.word(),
+                host.message
+            ),
+            ..host
         }
     }
 
@@ -624,15 +654,30 @@ models (the --model word is optional with a model file: the file's architecture 
                                         .offering(&["--recommend", "--json"])
                                 })?
                         }
-                        _ if ask.is_some() || !card_visible() => Model::Host,
-                        _ => Model::ALL
-                            .iter()
-                            .copied()
-                            .find(|m| m.serves(split))
-                            .ok_or_else(|| {
-                                Refusal::new(Code::Unsupported, no_seat(&path, split, a))
-                                    .offering(&["--recommend", "--json"])
-                            })?,
+                        _ if ask.is_some() => Model::Host,
+                        _ => {
+                            let card = Model::ALL.iter().copied().find(|m| m.serves(split));
+                            // A census that cannot be read (a driver the start chose to go on
+                            // without, at its driver door) is no card in view, not a refusal here.
+                            match gpu_census::census() {
+                                Ok(census) if !census.is_empty() => card.ok_or_else(|| {
+                                    Refusal::new(Code::Unsupported, no_seat(&path, split, a))
+                                        .offering(&["--recommend", "--json"])
+                                })?,
+                                census => match card {
+                                    Some(seat) if seat != Model::Host => {
+                                        return Err(no_card_refusal(
+                                            &path,
+                                            split,
+                                            seat,
+                                            census.as_ref().err(),
+                                        )
+                                        .into());
+                                    }
+                                    _ => Model::Host,
+                                },
+                            }
+                        }
                     };
                     if let Some(Word::Seat(word)) = word
                         && word != Model::Host
@@ -641,10 +686,9 @@ models (the --model word is optional with a model file: the file's architecture 
                         return Err(Refusal::new(
                             Code::Usage,
                             format!(
-                                "--model {} on {} ({}), a {a} file, which serves --model {}",
+                                "--model {} on {}, a {a} file, which serves --model {}",
                                 word.word(),
                                 path.display(),
-                                file_source(),
                                 seat.word()
                             ),
                         )
@@ -766,6 +810,9 @@ models (the --model word is optional with a model file: the file's architecture 
     #[inline(never)]
     pub fn run() -> ExitCode {
         event::enable();
+        // The model is the command line's: the gates' `$BLOOMERY_REF_MODEL`, which `tools/box.sh`
+        // exports into every box command, names none here, whether a flag names one or not.
+        model_file::ignore_reference();
         let args: Vec<String> = std::env::args().skip(1).collect();
         if llama_launch::serve_option(&args, "--version") {
             println!(
@@ -875,7 +922,7 @@ models (the --model word is optional with a model file: the file's architecture 
             Err(e) => return refuse(Code::Usage, e),
         };
         flags.name = name;
-        let by_name = match hf::source::resolve(&flags, model_file::ref_model().as_deref()) {
+        let by_name = match hf::source::resolve(&flags, None) {
             Ok(Some(hf::source::Source::Named(target))) => Some(target),
             Ok(_) => None,
             Err(e) => return refuse(Code::Usage, e.into()),
@@ -1372,7 +1419,7 @@ models (the --model word is optional with a model file: the file's architecture 
     /// start does ([`llama_launch::seat_args`]). What needs the model stays after the fetch.
     /// `--list-devices` and `--records-schema` are left to the start, and so is `--levers` where no
     /// seat is named or, at a generative seat, the placement flags hand levers over once the census
-    /// is read. `vars` supplies the reference model and the llama-server variables the seats read as
+    /// is read. `vars` supplies the llama-server variables the seats read as
     /// flags, and `held` the architecture and decision type of a `--hf` repo's model, which narrow
     /// the seats a start with no seat word may come to ([`any_seat`]).
     fn early_named(
@@ -1388,15 +1435,7 @@ models (the --model word is optional with a model file: the file's architecture 
         }
         let (model, rest) = take_source(args)?;
         let model = hf::source::Flags { name, ..model };
-        let vars: Vec<_> = vars.into_iter().collect();
-        let reference = vars
-            .iter()
-            .find_map(|(name, value)| {
-                (name.as_os_str() == std::ffi::OsStr::new("BLOOMERY_REF_MODEL")).then_some(value)
-            })
-            .map(|value| value.to_str().ok_or("BLOOMERY_REF_MODEL is not UTF-8"))
-            .transpose()?;
-        let source = hf::source::resolve(&model, reference)?;
+        let source = hf::source::resolve(&model, None)?;
         // A catalog name's pick is a repo.
         let from_repo = matches!(
             source,
@@ -1459,7 +1498,7 @@ models (the --model word is optional with a model file: the file's architecture 
 
     /// The refusal when nothing names the model: the class `no-model`, with what lists the models.
     fn no_model() -> Refusal {
-        Refusal::new(Code::NoModel, model_file::NONE).offering(&["--recommend", "--json"])
+        Refusal::new(Code::NoModel, model_file::NONE_FLAGS).offering(&["--recommend", "--json"])
     }
 
     /// [`early_named`] for a start that names no catalog model.
@@ -1642,50 +1681,39 @@ models (the --model word is optional with a model file: the file's architecture 
             );
         }
 
+        /// The gates' `BLOOMERY_REF_MODEL` (`tools/box.sh` exports it into every box command) is no
+        /// source of the server's model: it is no second naming beside a flag, whatever it holds,
+        /// and no model for a start that names none. The start that names none is refused by
+        /// name, and the refusal does not tell the user to set the gates' variable.
         #[test]
-        fn the_reference_source_comes_from_the_start_environment() {
+        fn the_gates_variable_names_no_model_for_a_start() {
             let word = Some(Word::Seat(Model::Qwen38));
-            let e = early(
-                word,
-                &line("--hf o/r"),
-                [(
-                    OsString::from("BLOOMERY_REF_MODEL"),
-                    OsString::from("other.gguf"),
-                )],
-            )
-            .expect_err("the supplied environment names a second source");
-            assert!(
-                e.to_string().contains("BLOOMERY_REF_MODEL=other.gguf"),
-                "{e}"
-            );
-            early(word, &line("--hf o/r"), []).expect("no reference was supplied");
+            let reference = |value: OsString| [(OsString::from("BLOOMERY_REF_MODEL"), value)];
             early(
                 word,
-                &[],
-                [(
-                    OsString::from("BLOOMERY_REF_MODEL"),
-                    OsString::from("other.gguf"),
-                )],
+                &line("--hf o/r"),
+                reference(OsString::from("other.gguf")),
             )
-            .expect("the supplied reference names a source without reading it");
-            let e = early(word, &[], []).expect_err("no source was supplied");
-            assert!(e.to_string().contains("no model file"), "{e}");
+            .expect("the flag names the model and the variable names none");
+            early(word, &line("--hf o/r"), []).expect("no variable was supplied");
+            for vars in [reference(OsString::from("other.gguf")).to_vec(), Vec::new()] {
+                let e = early(word, &[], vars).expect_err("no flag names a model");
+                assert!(
+                    e.to_string().contains("no model file")
+                        && !e.to_string().contains("BLOOMERY_REF_MODEL"),
+                    "{e}"
+                );
+                assert_eq!(code_of(&e), Code::NoModel, "{e}");
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::ffi::OsStringExt;
-                let e = early(
+                early(
                     word,
                     &line("--hf o/r"),
-                    [(
-                        OsString::from("BLOOMERY_REF_MODEL"),
-                        OsString::from_vec(vec![0xff]),
-                    )],
+                    reference(OsString::from_vec(vec![0xff])),
                 )
-                .expect_err("the supplied reference is not UTF-8");
-                assert!(
-                    e.to_string().contains("BLOOMERY_REF_MODEL is not UTF-8"),
-                    "{e}"
-                );
+                .expect("a variable the start does not read is not checked for UTF-8");
             }
         }
 
@@ -2051,6 +2079,30 @@ models (the --model word is optional with a model file: the file's architecture 
         #[test]
         fn the_host_seat_is_the_seat_the_host_ask_is_for() {
             assert_eq!(Model::Host.word(), llama_place::HOST_SEAT);
+        }
+
+        /// A start that finds no card in view, on a file only a card seat serves, is refused with
+        /// the card reading's cause first and the host seat's list of what its engine runs none of
+        /// kept as the detail, in the class `no-device` (69), not the host's `unsupported` (65).
+        #[test]
+        fn no_card_in_view_names_its_cause_before_the_hosts_list() {
+            let host = Refusal::new(
+                Code::Unsupported,
+                "/m/x.gguf: the host engine (no card, every layer on the host stage) runs none of: \
+                 a, b",
+            );
+            let cause = "no card is visible: CUDA_VISIBLE_DEVICES=GPU-gone names none of the cards \
+                         the driver lists (nvidia-smi lists: 0 NVIDIA RTX A6000 (GPU-1))";
+            let said = caused_by(cause, Model::Ds41, host);
+            assert!(said.message.starts_with(cause), "{}", said.message);
+            assert!(
+                said.message
+                    .contains("--model ds41 serves this file on a card")
+                    && said.message.contains("runs none of: a, b"),
+                "{}",
+                said.message
+            );
+            assert_eq!(said.code, Code::NoDevice);
         }
 
         #[test]

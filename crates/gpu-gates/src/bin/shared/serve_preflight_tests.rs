@@ -399,14 +399,36 @@ fn preflight_source_env() {
     );
 }
 
+/// `BLOOMERY_REF_MODEL`, the gates' variable that `tools/box.sh` exports into every box command, is no source of
+/// the server's model: beside a flag it is no second naming, and with no flag it is no model.
+///
+/// PIN(2026-11-17): the clause held a flag beside the variable to be "the model is named twice", and a start with
+/// no flag to take the variable's file; a server start on the box was refused for a file the gates open.
 #[test]
-fn preflight_source_reference() {
+fn preflight_the_gates_variable_names_no_model() {
+    let gates = [("BLOOMERY_REF_MODEL", "other.gguf")];
+    // Beside a flag it is no second naming: the flag is read alone, so an invalid repo is that flag's refusal.
     checked_refusal(
-        "source_reference",
-        &["--model", "qwen38", "--hf", "o/r"],
-        &[("BLOOMERY_REF_MODEL", "other.gguf")],
-        "the model is named twice",
+        "reference_beside_flag",
+        &["--model", "qwen38", "--hf", "invalid"],
+        &gates,
+        "a repo is <owner>/<name>",
     );
+    // With no flag it is no model: the start is refused as one that names none, and the refusal does not send
+    // the user to the gates' variable.
+    let (dir, err, code) = startup_coded(
+        "reference_alone",
+        &seat("bloomery-serve"),
+        &["--model", "qwen38"],
+        &gates,
+    );
+    assert_eq!(code, Code::NoModel, "{err}");
+    assert!(
+        err.contains("no model file") && !err.contains("BLOOMERY_REF_MODEL"),
+        "{err}"
+    );
+    clean_refusal(&dir, &err, true);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// A misspelled key is refused by the seat, and its value, which may be a key, is never printed.

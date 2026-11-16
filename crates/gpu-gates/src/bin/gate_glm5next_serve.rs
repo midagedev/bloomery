@@ -561,11 +561,14 @@ mod gate {
         (bloomery_levers::STEP_STATS, "1"),
     ];
 
-    /// `bloomery-serve` beside this binary under the arm's levers: the draft and the residency
-    /// are the arm's, never this binary's environment's.
+    /// `bloomery-serve -m <the gate's file>` beside this binary under the arm's levers: the draft
+    /// and the residency are the arm's, never this binary's environment's, and the model is named
+    /// by the flag (the server reads no `BLOOMERY_REF_MODEL`).
     fn server_command(levers: Levers) -> Result<Command, GateError> {
         let mut cmd = Command::new(beside("bloomery-serve")?);
-        cmd.env_remove(bloomery_levers::DRAFT)
+        cmd.arg("-m")
+            .arg(ref_model_path()?)
+            .env_remove(bloomery_levers::DRAFT)
             .env_remove(bloomery_levers::RESIDENCY)
             .envs(levers.iter().copied());
         Ok(cmd)
@@ -855,10 +858,7 @@ mod gate {
     fn plan_only(dir: &Path, place: Option<&str>) -> Result<(bool, Vec<String>), GateError> {
         let name = place.unwrap_or("unset");
         let err = dir.join(format!("plan-{name}.err"));
-        let mut cmd = Command::new(beside("bloomery-serve")?);
-        cmd.env_remove(bloomery_levers::DRAFT)
-            .env_remove(bloomery_levers::RESIDENCY)
-            .envs(UNSET.iter().copied());
+        let cmd = server_command(UNSET)?;
         let mut args = vec!["--model", "glm"];
         if let Some(p) = place {
             args.extend(["--place", p]);
@@ -1269,9 +1269,7 @@ mod gate {
         // A context past the oracle: refused by name before it listens.
         let over_ctx = OVER_CTX.to_string();
         let err = own.join("oracle.err");
-        let mut cmd = Command::new(beside("bloomery-serve")?);
-        cmd.env_remove(bloomery_levers::DRAFT)
-            .env_remove(bloomery_levers::RESIDENCY);
+        let cmd = server_command(UNSET)?;
         let args = [
             "--model",
             "glm",
@@ -1807,7 +1805,6 @@ mod gate {
     /// `--parallel 0`.
     fn split_refused(dir: &Path) -> Result<bool, GateError> {
         let mut ok = true;
-        let exe = beside("bloomery-serve")?;
         for (name, flags, want) in [
             (
                 "split_under_the_window_is_refused_by_name",
@@ -1821,10 +1818,7 @@ mod gate {
             ),
         ] {
             let err = dir.join(format!("{name}.err"));
-            let mut cmd = Command::new(&exe);
-            cmd.env_remove(bloomery_levers::DRAFT)
-                .env_remove(bloomery_levers::RESIDENCY)
-                .envs(DRAFT_ONLY.iter().copied());
+            let cmd = server_command(DRAFT_ONLY)?;
             let args: Vec<&str> = ["--model", "glm", "--place", "gate"]
                 .into_iter()
                 .chain(flags.iter().copied())
