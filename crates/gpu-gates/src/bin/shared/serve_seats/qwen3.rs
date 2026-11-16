@@ -279,11 +279,13 @@ const USAGE: &str = "usage: bloomery-serve --model qwen3 [-m PATH | --hf <repo>[
 
 /// What shapes the load beside its context and slots ([`q3place::ServeOpts`]),
 /// `--mmproj`'s part read by [`vision_seat::images_of`], `embedding` the side model's reserve on
-/// the stage card.
+/// the stage card, `draft` whether the load opens the file's own next-token layer
+/// ([`Drafts::InFile`]).
 fn serve_opts<'a>(
     (place, levers): (Option<Place>, &'a PlanLevers),
     (kv, ubatch): (KvQ8, Option<usize>),
     (vision, embedding): (Option<&Opened>, Option<u64>),
+    draft: bool,
 ) -> q3place::ServeOpts<'a> {
     let (media, image) = vision_seat::images_of(vision);
     q3place::ServeOpts {
@@ -292,6 +294,7 @@ fn serve_opts<'a>(
         kv,
         media,
         beside: Beside { image, embedding },
+        draft,
         ubatch,
     }
 }
@@ -1941,7 +1944,7 @@ fn choice_line(word: &str, r: q3place::Reads) {
 
 /// The context `slots` slots serve and the load made at it
 /// ([`q3place::serve_choice_records`], with `record_rows` verify record
-/// rows a delta store — the seat's, [`verdict_records`]), its choice line
+/// rows a delta store — the seat's, [`verdict_drafts`]), its choice line
 /// printed.
 fn ctx_and_load(
     split: &Split,
@@ -1959,7 +1962,7 @@ fn ctx_and_load(
 /// makes holds ([`q3place::serve_probe`], whole or placed), the served draft runs on it
 /// ([`serves_on`]) and a qwen35 family load's checkpoints fit ([`q3place::checkpoints_fit`]). The file's own MTP layer
 /// drafts one sequence, so a load that may draft it serves one slot: the `mtp` word, and the
-/// unset one where the one slot's verdict prices the draft's verify record ([`verdict_records`]).
+/// unset one where the one slot's verdict prices the draft's verify record ([`verdict_drafts`]).
 fn auto_slots(
     auto: AutoSlots,
     (split, arch, word): (&Split, Family, Word),
@@ -2269,6 +2272,11 @@ fn layer_choice(file: &Split) -> Choice {
                 .to_owned(),
         ),
         Ok(InFile::Stripped { reason }) => Choice::Plain(reason),
+        Ok(InFile::Ffnless) => Choice::Plain(
+            "The next-token layer carries no feed-forward tensor; this reader builds the layer \
+             with one."
+                .to_owned(),
+        ),
         Err(e) => Choice::Plain(e.to_string()),
     }
 }
@@ -2297,11 +2305,50 @@ fn folder_choice(draft: Option<DraftWord>) -> Result<Choice, GateError> {
     }
 }
 
+/// A set `BLOOMERY_DRAFT=mtp` on a qwen35moe or qwen35 file whose in-file
+/// layer decision is `layer` ([`layer_choice`]): the draft, or a refusal by
+/// name before the load. A media load, a placed one, several slots, a store
+/// too short for one window and a file with no usable next-token layer
+/// ([`Choice::Plain`]: stripped, absent, unshaped, without a feed-forward
+/// block, or one the rule refuses) are each refused; none is served plain
+/// with a record.
+fn set_mtp(
+    layer: Choice,
+    (slots, slot_ctx): (usize, usize),
+    whole: bool,
+    media: bool,
+) -> Result<Choice, GateError> {
+    let forbid_set = |why: String| -> Result<Choice, GateError> {
+        Err(format!("BLOOMERY_DRAFT=mtp: {why}").into())
+    };
+    if media {
+        return forbid_set(MEDIA_DRAFT.to_owned());
+    }
+    if !whole {
+        return forbid_set(placed_no_verify());
+    }
+    if slots > 1 {
+        return forbid_set(ONE_SEQUENCE.to_owned());
+    }
+    let need = window_need(slots);
+    if slots.saturating_mul(slot_ctx) < need {
+        return Err(format!(
+            "a slot's context of {slot_ctx} leaves no positions for the MTP draft's window; \
+             --ctx-size names a total of at least {need}"
+        )
+        .into());
+    }
+    match layer {
+        Choice::InFile => Ok(Choice::InFile),
+        Choice::Plain(why) => forbid_set(format!("the file has no in-file draft to serve: {why}")),
+    }
+}
+
 /// `BLOOMERY_DRAFT` `mtp`, `off` or unset on a qwen35moe or qwen35 file, once
 /// the load is known. `whole` is a load that opens the model on the card.
-/// Set `mtp` is refused by name where the load cannot draft. Unset takes
-/// [`draft38_unset`] and then the seat's own facts; a fact that forbids the
-/// draft leaves the plain path and names why.
+/// Set `mtp` is refused by name where the load cannot draft ([`set_mtp`]).
+/// Unset takes [`draft38_unset`] and then the seat's own facts; a fact that
+/// forbids the draft leaves the plain path and names why.
 #[allow(
     clippy::too_many_arguments,
     reason = "the load's levers, file, slots, context, card, place and media decide the draft (rust-quality R8)"
@@ -2317,29 +2364,8 @@ fn decide_q35(
     media: bool,
 ) -> Result<Choice, GateError> {
     let need = window_need(slots);
-    let forbid_set = |why: String| -> Result<Choice, GateError> {
-        Err(format!("BLOOMERY_DRAFT=mtp: {why}").into())
-    };
     match draft_asked(levers)? {
-        Some(DraftWord::Mtp) => {
-            if media {
-                return forbid_set(MEDIA_DRAFT.to_owned());
-            }
-            if !whole {
-                return forbid_set(placed_no_verify());
-            }
-            if slots > 1 {
-                return forbid_set(ONE_SEQUENCE.to_owned());
-            }
-            if slots.saturating_mul(slot_ctx) < need {
-                return Err(format!(
-                    "a slot's context of {slot_ctx} leaves no positions for the MTP draft's \
-                     window; --ctx-size names a total of at least {need}"
-                )
-                .into());
-            }
-            Ok(layer_choice(file))
-        }
+        Some(DraftWord::Mtp) => set_mtp(layer_choice(file), (slots, slot_ctx), whole, media),
         Some(DraftWord::Off) => Ok(Choice::Plain(Draft38Off::Set.to_string())),
         None => {
             let at = Draft38At {
@@ -2376,40 +2402,63 @@ fn decide_q35(
     }
 }
 
-/// The verify record rows each delta store of the seat's whole-card load of
-/// a qwen35 family file keeps: [`Body35::VERIFY_ROWS`] on a load that
-/// verifies drafted rows (`GpuModel::open_verifying`, `GpuModel::open_mtp`),
-/// none on a plain load — the rows its whole-fit verdict prices the load
-/// with ([`q3place::serve_choice_records`]), decided before the load is. The draft
-/// word decides ahead of it: `dspark` and `lookup` verify a whole-card load
-/// whatever the file; `mtp` and an unset word draft the file's own
-/// next-token layer ([`layer_choice`]), which needs one text sequence on
-/// place `a` with no route trace. [`decide_q35`] keeps the load's own half —
-/// a placed load drafts nothing, and its refusals stand — so where this pick
-/// cannot know the load it takes the wider side: the verdict it feeds never
-/// under-counts the stores of the load the seat opens.
-fn verdict_records(
-    levers: &Levers,
-    word: Word,
-    file: &Split,
-    place: &str,
-    media: bool,
-    slots: usize,
-) -> usize {
-    let in_file = matches!(layer_choice(file), Choice::InFile);
-    let drafted = match word {
-        Word::Dspark | Word::Lookup => true,
-        Word::Mtp => !media && slots == 1 && in_file,
-        Word::Off => {
-            levers.draft().is_none()
-                && place == "a"
-                && !media
-                && slots == 1
-                && levers.route_trace().is_none()
-                && in_file
+/// What the draft word loads beside a qwen35 family file's whole-card trunk, as far as the
+/// verdict can know before the load is ([`verdict_drafts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drafts {
+    /// A plain load.
+    None,
+    /// The file's own next-token layer: the verdict prices its card bytes
+    /// ([`q3place::MTP_RESERVE`]) and the verify records.
+    InFile,
+    /// A served draft (`dspark`, `lookup`): the verify records only, its own bytes are the
+    /// draft's.
+    Served,
+}
+
+impl Drafts {
+    /// The verify record rows each delta store of the whole-card load keeps:
+    /// [`Body35::VERIFY_ROWS`] on a load that verifies drafted rows
+    /// (`GpuModel::open_verifying`, `GpuModel::open_mtp`), none on a plain load — the rows its
+    /// whole-fit verdict prices the load with ([`q3place::serve_choice_records`]).
+    fn records(self) -> usize {
+        match self {
+            Drafts::None => 0,
+            Drafts::InFile | Drafts::Served => Body35::VERIFY_ROWS,
         }
-    };
-    if drafted { Body35::VERIFY_ROWS } else { 0 }
+    }
+}
+
+/// What the seat knows of a qwen35 family load before it is made ([`verdict_drafts`]).
+#[derive(Clone, Copy, Debug)]
+struct DraftFacts {
+    /// The file carries a usable in-file next-token layer ([`layer_choice`]).
+    in_file: bool,
+    /// `BLOOMERY_DRAFT` and the route trace are unset: the word `off` here is the default.
+    unset: bool,
+    /// `--place` is `a`, the whole-card placement.
+    place_a: bool,
+    /// The load takes images.
+    media: bool,
+    /// The slots the load serves.
+    slots: usize,
+}
+
+/// The draft the seat's whole-card load of a qwen35 family file opens, decided before the load
+/// is. The draft word decides ahead of it: `dspark` and `lookup` verify a whole-card load
+/// whatever the file; `mtp` and an unset word draft the file's own next-token layer, which needs
+/// one text sequence on place `a` with no route trace. [`decide_q35`] keeps the load's own half
+/// — a placed load drafts nothing, and its refusals stand — so where this pick cannot know the
+/// load it takes the wider side: the verdict it feeds never under-counts the stores of the load
+/// the seat opens.
+fn verdict_drafts(word: Word, f: DraftFacts) -> Drafts {
+    let text_one = !f.media && f.slots == 1 && f.in_file;
+    match word {
+        Word::Dspark | Word::Lookup => Drafts::Served,
+        Word::Mtp if text_one => Drafts::InFile,
+        Word::Off if text_one && f.unset && f.place_a => Drafts::InFile,
+        Word::Mtp | Word::Off => Drafts::None,
+    }
 }
 
 /// `BLOOMERY_DRAFT` as this seat reads it. Unset and `off` are
@@ -2669,19 +2718,23 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     // `mtp` decides no count here.
     let (slots, from) = served::draft_slots(a.parallel, served, true)?.unwrap_or((slots, from));
     // The verify record rows the seat's whole-card qwen35 family load keeps
-    // ([`verdict_records`]): every whole-fit verdict below prices the load
+    // ([`verdict_drafts`]): every whole-fit verdict below prices the load
     // with them, before the load is known.
-    let record_rows = match arch {
-        Family::Qwen35moe | Family::Qwen35 => verdict_records(
-            &levers,
+    let drafts = match arch {
+        Family::Qwen35moe | Family::Qwen35 => verdict_drafts(
             word,
-            split,
-            a.place.unwrap_or(Place::A).name(),
-            vision.is_some(),
-            slots,
+            DraftFacts {
+                in_file: matches!(layer_choice(split), Choice::InFile),
+                unset: levers.draft().is_none() && levers.route_trace().is_none(),
+                place_a: a.place.unwrap_or(Place::A).name() == "a",
+                media: vision.is_some(),
+                slots,
+            },
         ),
-        Family::Qwen3moe => 0,
+        Family::Qwen3moe => Drafts::None,
     };
+    let record_rows = drafts.records();
+    let in_file_draft = drafts == Drafts::InFile;
     // A projector the `--hf` repo picked stays only where the load gives the text model the same
     // experts and context with the encoder as without ([`vision_seat::kept`]).
     let vision = vision_seat::kept(vision, &a.vision, |v| {
@@ -2689,7 +2742,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         let asked = ctx_and_load(
             split,
             (a.ctx, slots),
-            serve_opts((a.place, &plan_levers), (kv, a.ubatch), (v, embedding)),
+            serve_opts(
+                (a.place, &plan_levers),
+                (kv, a.ubatch),
+                (v, embedding),
+                in_file_draft,
+            ),
             record_rows,
         )?;
         let cost_ctx = asked.total;
@@ -2716,6 +2774,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (a.place, &plan_levers),
         (kv, a.ubatch),
         (vision.as_ref(), embedding),
+        in_file_draft,
     );
     let (slots, ctx) = match a.auto.filter(|_| from == SlotsFrom::Auto) {
         None => (slots, a.ctx),
@@ -2948,8 +3007,159 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 
 #[cfg(test)]
 mod tests {
-    use super::{Choice, DraftWord, folder_choice, parse_args};
+    use super::{Choice, DraftWord, folder_choice, parse_args, set_mtp};
     use model::placement::workstation::{A6000, RTX_3090};
+
+    /// The refusal a set `BLOOMERY_DRAFT=mtp` ends in, `None` when it serves.
+    fn refusal(layer: Choice, slots: (usize, usize), whole: bool, media: bool) -> Option<String> {
+        set_mtp(layer, slots, whole, media)
+            .err()
+            .map(|e| e.to_string())
+    }
+
+    /// A set `mtp` on a file with no usable next-token layer (stripped, absent,
+    /// unshaped, without a feed-forward block, or one the rule refuses) is
+    /// refused by name with the layer's reason, never served plain with a
+    /// record. FAIL-first. Mutant: `set_mtp` returns the layer's decision as is
+    /// (`Ok(layer)`), the tree before this change.
+    #[test]
+    fn a_set_mtp_on_a_file_with_no_in_file_layer_is_refused_by_name() {
+        let why = "a stripped next-token layer: blk.64 carries no tensor";
+        let e = refusal(Choice::Plain(why.to_owned()), (1, 4096), true, false)
+            .expect("a file with no layer is refused");
+        assert!(
+            e.starts_with("BLOOMERY_DRAFT=mtp: ") && e.contains(why),
+            "{e}"
+        );
+        assert!(matches!(
+            set_mtp(Choice::InFile, (1, 4096), true, false),
+            Ok(Choice::InFile)
+        ));
+    }
+
+    /// A set `mtp` beside media is refused by name: the draft reads the plain
+    /// rotation table.
+    #[test]
+    fn a_set_mtp_beside_media_is_refused_by_name() {
+        let e = refusal(Choice::InFile, (1, 4096), true, true).expect("media is refused");
+        assert!(
+            e.contains("BLOOMERY_DRAFT=mtp") && e.contains("a media load"),
+            "{e}"
+        );
+    }
+
+    /// A set `mtp` beside several slots is refused by name: the draft's K/V is
+    /// one cache.
+    #[test]
+    fn a_set_mtp_beside_several_slots_is_refused_by_name() {
+        let e = refusal(Choice::InFile, (2, 4096), true, false).expect("two slots are refused");
+        assert!(
+            e.contains("BLOOMERY_DRAFT=mtp") && e.contains("one resident sequence"),
+            "{e}"
+        );
+    }
+
+    /// A set `mtp` on a placed load is refused by name: a placed load runs no
+    /// verify pass.
+    #[test]
+    fn a_set_mtp_on_a_placed_load_is_refused_by_name() {
+        let e = refusal(Choice::InFile, (1, 4096), false, false).expect("placed is refused");
+        assert!(e.contains("BLOOMERY_DRAFT=mtp"), "{e}");
+    }
+
+    /// A set `mtp` with a store too short for one window is refused by name,
+    /// naming the least `--ctx-size`.
+    #[test]
+    fn a_set_mtp_with_a_store_too_short_for_one_window_is_refused_by_name() {
+        let e = refusal(Choice::InFile, (1, 2), true, false).expect("a short store is refused");
+        assert!(
+            e.contains("leaves no positions for the MTP draft's window")
+                && e.contains("at least 3"),
+            "{e}"
+        );
+    }
+
+    /// The verdict prices the file's own next-token layer exactly where the load opens it: a set
+    /// `mtp` on one text slot, and the unset default on place `a` with one text slot; a served
+    /// draft prices the verify records alone, and no draft prices neither. Mutant: the unset
+    /// default reads as `Served` (the layer's bytes then never reach the verdict: a 24 GB card
+    /// fits a context the load cannot open).
+    #[test]
+    fn a_verdict_prices_the_in_file_draft_where_the_load_opens_it() {
+        use super::{DraftFacts, Drafts, Word, verdict_drafts};
+        let base = DraftFacts {
+            in_file: true,
+            unset: true,
+            place_a: true,
+            media: false,
+            slots: 1,
+        };
+        let at = |word, f: DraftFacts| verdict_drafts(word, f);
+        assert_eq!(
+            at(Word::Off, base),
+            Drafts::InFile,
+            "the unset default drafts it"
+        );
+        assert_eq!(at(Word::Mtp, base), Drafts::InFile);
+        let set_off = DraftFacts {
+            unset: false,
+            ..base
+        };
+        assert_eq!(
+            at(Word::Off, set_off),
+            Drafts::None,
+            "a set `off` drafts nothing"
+        );
+        assert_eq!(
+            at(
+                Word::Mtp,
+                DraftFacts {
+                    place_a: false,
+                    ..base
+                }
+            ),
+            Drafts::InFile,
+            "a set `mtp` on another place is the load's refusal, priced as the wider side"
+        );
+        assert_eq!(
+            at(
+                Word::Off,
+                DraftFacts {
+                    place_a: false,
+                    ..base
+                }
+            ),
+            Drafts::None
+        );
+        for none in [
+            DraftFacts {
+                in_file: false,
+                ..base
+            },
+            DraftFacts {
+                media: true,
+                ..base
+            },
+            DraftFacts { slots: 2, ..base },
+        ] {
+            assert_eq!(at(Word::Mtp, none), Drafts::None, "{none:?}");
+            assert_eq!(at(Word::Off, none), Drafts::None, "{none:?}");
+        }
+        assert_eq!(at(Word::Lookup, base), Drafts::Served);
+        assert_eq!(
+            at(
+                Word::Dspark,
+                DraftFacts {
+                    in_file: false,
+                    ..base
+                }
+            ),
+            Drafts::Served
+        );
+        assert_eq!(Drafts::None.records(), 0);
+        assert_eq!(Drafts::InFile.records(), Drafts::Served.records());
+        assert!(Drafts::InFile.records() > 0);
+    }
 
     /// The open's round shape is the body's fact: Qwen3.6's body settles a
     /// partial keep of each slot's rows (`SlotRows::keep_slot`), so a lookup

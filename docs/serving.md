@@ -587,7 +587,10 @@ slots and memory each start takes, is [`dgx-spark.md`](dgx-spark.md).
   no expert. `-devd` or `BLOOMERY_DSPARK_CARD` names the card. `--parallel` above 1 with DSpark is refused.
 - **The qwen3 seat.** Unset or `mtp`, `BLOOMERY_DRAFT` drafts a `qwen35moe` or `qwen35` file's own next-token layer on
   a whole-card load of one sequence; a set `mtp` is refused on a media load, a placed load and `--parallel` above 1, and
-  unset goes off there with the reason on `load draft=off`. A `qwen3moe` file has no such
+  unset goes off there with the reason on `load draft=off`. On a dense `qwen35` file the whole-fit verdict counts the
+  layer's card bytes (its weights, one attention layer's K/V a position, the step's scratch) as a reserve, so the
+  default context is the one the load opens with the layer; this seat has no yield to the context (the rule above
+  is the Qwen3.8 and GLM-5.3 seats'). A `qwen3moe` file has no such
   layer and refuses `mtp`. `BLOOMERY_DRAFT=dspark` with `BLOOMERY_DSPARK_MODEL` naming an HF draft directory serves a
   whole-card `qwen35moe` target from one slot: RedHat's Qwen3.6 speculator carries its own reduced head, and
   MiniCPM-V 4.7's full-vocabulary draft borrows the target's Q6_K `output.weight` and `token_embd.weight` rows in

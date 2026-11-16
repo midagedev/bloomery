@@ -222,7 +222,8 @@ pub static ROWS: &[ArchRow] = &[
         arch: None,
         names: QWEN35_BODY,
         read: Some(qwen35moe::spec::read),
-        draft: None,
+        // The family's one in-file rule: the layer's feed-forward block is the trunk's kind.
+        draft: Some(draft::qwen35moe_usable),
         coverage: None,
         fixture: None,
     },
@@ -798,8 +799,11 @@ mod tests {
         }
     }
 
-    /// The draft rules are the old table's three keys, `llama` has a reader row and no draft rule,
-    /// and an architecture the rows do not name has no reader row.
+    /// The draft rules are the old table's three keys and the qwen35 body's in-file rule (the dense
+    /// trunk's next-token layer, which the qwen35moe rule reads for both), `llama` has a reader row
+    /// and no draft rule, and an architecture the rows do not name has no reader row.
+    // PIN(2026-11-16): the qwen35 body's row gained the in-file rule, so its canonical name joins
+    // the list.
     #[test]
     fn the_draft_rules_are_the_old_tables_keys() {
         let with: Vec<&str> = ROWS
@@ -807,7 +811,7 @@ mod tests {
             .filter(|r| r.draft.is_some())
             .map(|r| r.canonical())
             .collect();
-        assert_eq!(with, ["qwen4exp", "qwen35moe", "mimo2"]);
+        assert_eq!(with, ["qwen4exp", "qwen35moe", "qwen35", "mimo2"]);
         assert!(row_of("llama").is_some_and(|r| r.read.is_some() && r.draft.is_none()));
         assert!(row_of("llama4").is_none());
         assert!(row_of("deepseek2").is_some_and(|r| r.read.is_none()));

@@ -418,6 +418,12 @@ fn a_drafted_verdict_prices_the_engines_records() {
     q3place::tests::a_drafted_verdict_prices_the_engines_records();
 }
 
+#[cfg(all(test, feature = "gpu"))]
+#[test]
+fn a_drafted_verdict_prices_the_draft_layer() {
+    q3place::tests::a_drafted_verdict_prices_the_draft_layer();
+}
+
 #[cfg(feature = "gpu")]
 #[path = "shared/qwen38_place.rs"]
 mod q38place;

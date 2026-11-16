@@ -1989,18 +1989,20 @@ gate-gpu-qwen35moe-leg:
 gate-gpu-qwen35moe-verify:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-verify && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_verify && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_verify'
 
-# Qwen3.6's own next-token layer (the unsloth UD-Q4_K_M file that carries `blk.40`, named by BLOOMERY_MTP_MODEL and pinned by
-# its general.name and size) as a draft through Body35's layer path: the refusals by name at open (the plain file,
-# BLOOMERY_REF_MODEL, with no next-token layer; a media load),
-# the draft's resident bytes against the plan's figure with the bf16 widening named, the target's token_embd and output
+# The next-token layer a qwen35 family file carries, as a draft through Body35's layer path, on two files in one run (one load
+# and every clause each): Qwen3.6's own (the unsloth UD-Q4_K_M file that carries `blk.40`, a routed MoE; named by
+# BLOOMERY_MTP_MODEL and pinned by its general.name and size) and Qwen3.8-27B's (`blk.64`, the trunk's dense SwiGLU; the qwen38d
+# profile's MODEL, BLOOMERY_MTP_DENSE_MODEL moves it, pinned by its architecture and size). Per file: the refusals by name at
+# open (for Qwen3.6 the plain file, BLOOMERY_REF_MODEL, with no next-token layer; a media load on both), the draft's resident
+# bytes against the plan's figure (with the bf16 widening named where the layer has one), the target's token_embd and output
 # read in place at their addresses and copied nowhere, the input join at one stream against the host's rounding band and
 # its refused stream counts, the draft's token equal to the host argmax of its logits, the refusals on the live draft, and
-# a printed smoke of how often the draft's token is the target's own next token over a 64-id prompt. The real file only: it needs
-# BLOOMERY_MTP_MODEL (tools/ref/needs-env.sh), which a batch gives as the item's `@BLOOMERY_MTP_MODEL=<path>`, else it defers the
-# recipe by name.
+# how often the draft's token is the target's own next token over a 64-id prompt against a wiring floor. The real files only:
+# it needs BLOOMERY_MTP_MODEL (tools/ref/needs-env.sh), which a batch gives as the item's `@BLOOMERY_MTP_MODEL=<path>`, else it
+# defers the recipe by name.
 [group('pool')]
 gate-gpu-qwen35moe-mtp:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen35moe-mtp BLOOMERY_MTP_MODEL && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_mtp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_mtp'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen35moe-mtp BLOOMERY_MTP_MODEL && Q38=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen38d.sh) && test -n "$Q38" && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_mtp && BLOOMERY_MTP_DENSE_MODEL=${BLOOMERY_MTP_DENSE_MODEL:-$Q38} BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_mtp'
 
 # The qwen3 serve seat's served drafts: BLOOMERY_DRAFT=dspark on Qwen3.6, on its two fine-tunes (Sage-A1.5 and
 # Ornith-1.5, which the RedHat draft fits by their shapes, not by their names) and on MiniCPM-V 4.7 (its

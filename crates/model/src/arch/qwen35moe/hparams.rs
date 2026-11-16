@@ -64,7 +64,7 @@ impl Variant {
     /// The feed-forward kind every layer of the variant has: llama.cpp's
     /// builder asserts a router on every qwen35moe and qwen4exp layer and none
     /// on a qwen35 one (qwen35moe.cpp:496, qwen35.cpp:472).
-    fn ffn(self) -> FfnKind {
+    pub(super) fn ffn(self) -> FfnKind {
         match self {
             Variant::Qwen35Moe | Variant::Qwen4Exp => FfnKind::Routed,
             Variant::Qwen35 => FfnKind::Dense,
@@ -1801,8 +1801,7 @@ pub(super) mod tests {
     /// bartowski's Qwen3.6 files carry on their last block — an attention
     /// layer whatever the interval says, with the layer's own four stems.
     fn qwen35moe_next_token_layer(l: usize) -> Vec<(String, Vec<u64>)> {
-        super::super::mtp::DRAFT_STEMS
-            .iter()
+        super::super::mtp::draft_stems(Variant::Qwen35Moe)
             .map(|s| (format!("blk.{l}.{s}"), vec![1]))
             .collect()
     }

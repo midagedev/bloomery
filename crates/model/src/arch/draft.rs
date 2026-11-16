@@ -148,16 +148,21 @@ pub(super) fn qwen4exp_usable(
     qwen35moe::mtp::target_usable(target, checkpoint).map_err(DraftUsableError::from)
 }
 
+/// The in-file rule of the qwen35 family: a qwen35moe or qwen35 file runs its
+/// own next-token layer, whose feed-forward block is the trunk's kind. The
+/// file's `general.architecture` names the key a refusal reports.
 pub(super) fn qwen35moe_usable(
     target: &Split,
     checkpoint: Option<&str>,
 ) -> Result<(), DraftUsableError> {
+    let key = target.arch_key("nextn_predict_layers");
     if let Some(name) = checkpoint {
         return Err(PlacementError::Metadata {
             key: "general.name".to_string(),
             detail: format!(
-                "is named {name:?} for a qwen35moe draft, which is the target file's own \
-                 next-token layer"
+                "is named {name:?} for a {} draft, which is the target file's own next-token \
+                 layer",
+                target.architecture().unwrap_or("<missing>")
             ),
         }
         .into());
@@ -165,19 +170,26 @@ pub(super) fn qwen35moe_usable(
     match qwen35moe::mtp::in_file(target)? {
         qwen35moe::mtp::InFile::Draft(_) => Ok(()),
         qwen35moe::mtp::InFile::Absent => Err(PlacementError::Metadata {
-            key: "qwen35moe.nextn_predict_layers".to_string(),
+            key,
             detail: "is absent or names no next-token layer; the file has no in-file draft"
                 .to_string(),
         }
         .into()),
         qwen35moe::mtp::InFile::Stripped { reason } => Err(PlacementError::Metadata {
-            key: "qwen35moe.nextn_predict_layers".to_string(),
+            key,
             detail: reason,
         }
         .into()),
         qwen35moe::mtp::InFile::Unshaped => Err(PlacementError::Metadata {
-            key: "qwen35moe.nextn_predict_layers".to_string(),
+            key,
             detail: "is 1 and the next-token tensors are not a draft's shapes".to_string(),
+        }
+        .into()),
+        qwen35moe::mtp::InFile::Ffnless => Err(PlacementError::Metadata {
+            key,
+            detail: "is 1 and the next-token layer carries no feed-forward tensor; this reader \
+                     builds the layer with one"
+                .to_string(),
         }
         .into()),
     }
@@ -325,13 +337,13 @@ mod tests {
     /// set that can run its draft.
     #[test]
     fn an_architecture_without_a_rule_is_refused_by_name() {
-        let path = header_typed("draft-norule", "qwen35", &[], &[], &[layer()]);
+        let path = header_typed("draft-norule", "qwen3moe", &[], &[], &[layer()]);
         let target = gguf::Split::open(&path).expect("the synthetic target opens");
-        let err = draft_usable(&target, None).expect_err("no rule for qwen35");
+        let err = draft_usable(&target, None).expect_err("no rule for qwen3moe");
         let _ = std::fs::remove_file(&path);
         assert!(
             err.to_string()
-                .contains("no rule says whether a qwen35 set can run its draft"),
+                .contains("no rule says whether a qwen3moe set can run its draft"),
             "{err}"
         );
     }

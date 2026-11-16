@@ -2,10 +2,11 @@
 //! `generate_qwen3moe`, on each model file given, one process at a time on
 //! the card the runner pins.
 //!
-//!     gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir> [--only-mixed]
+//!     gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir> [--only-mixed | --only-mtp]
 //!
 //! `--only-mixed` runs the two-slot greedy and seeded sampled requests alone
 //! and together, holding their ids and the shared round shape on one server.
+//! `--only-mtp` runs `mtp_ids_match_the_plain_path` alone.
 //!
 //! Before any file, touching no card, it holds
 //! `unplaced_card_is_the_largest`: on fake censuses of this workstation's
@@ -505,13 +506,16 @@
 //!   both slots as one pass and keeps each request's alone ids
 //!   ([`lookup_slots_verify_together`]).
 //! - `mtp_ids_match_the_plain_path`: on a file whose header carries the in-file
-//!   next-token layer, greedy output under `BLOOMERY_DRAFT=mtp` equals the same
-//!   prompt under `BLOOMERY_DRAFT=off` for [`MTP_N`] tokens, and the drafted
-//!   completion's `draft_n_accepted` is above 0. A file without the layer prints
-//!   that the clause is pinned to [`MTP_FILE`] and starts no second server. The
-//!   pinned file with no layer is red. FAIL-first: dropping the id compare leaves
-//!   a draft that changes tokens green; treating accepted as `>= 0` leaves a
-//!   server that proposes nothing green.
+//!   next-token layer (the Qwen3.6 file with a routed layer, the Qwen3.8-27B with a dense
+//!   one), greedy output under `BLOOMERY_DRAFT=mtp` equals the same prompt under
+//!   `BLOOMERY_DRAFT=off` for [`MTP_N`] tokens, the drafted completion accepted at least
+//!   [`MTP_FLOOR`] of the ids it proposed, and the server's `/metrics` counters
+//!   (`llamacpp:spec_decode_num_draft_tokens_total` and `..._accepted_tokens_total`) are that
+//!   completion's `draft_n` and `draft_n_accepted`; the acceptance is printed. A file without
+//!   the layer prints that the clause is pinned to [`MTP_FILES`] and starts no second
+//!   server. A pinned file with no layer is red. The id compare catches a draft whose
+//!   proposals are committed unverified, the floor a draft that accepts nothing, and a draft
+//!   layer whose feed-forward block is broken moves the acceptance alone.
 //!
 //! The server is stopped by the handle this binary spawned it with before
 //! the CLI loads. Logs per file in `<dir>/<n>/` (`server.err`, `gen.log`,
@@ -583,7 +587,7 @@ mod gate {
     use crate::q3place;
 
     const USAGE: &str = "usage: gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir> \
-                         [--images | --only-images | --only-mixed]";
+                         [--images | --only-images | --only-mixed | --only-mtp]";
 
     /// The tokens each request makes.
     const N: usize = 64;
@@ -598,11 +602,21 @@ mod gate {
 
     /// How many greedy tokens the drafted and undrafted runs are compared over.
     /// A comparison length, not a measured result.
-    const MTP_N: usize = 16;
+    const MTP_N: usize = 64;
 
-    /// The file `gate_qwen35moe_mtp` loads: the one whose header carries the
-    /// next-token layer. Fixture files do not, and the clause is pinned here.
-    const MTP_FILE: &str = "/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+    /// The least share of proposed ids the target accepts over [`MTP_N`] tokens: the wiring floor
+    /// of `gate_qwen35moe_mtp`'s acceptance clause, a draft whose join order, hidden row or gain
+    /// is wrong sits near chance (a few in a thousand of a 248k vocabulary) and a draft the file
+    /// trained for well above it. 3 in 10.
+    const MTP_FLOOR: (u64, u64) = (3, 10);
+
+    /// The files whose header carries the next-token layer: the Qwen3.6 file
+    /// `gate_qwen35moe_mtp` loads and the Qwen3.8-27B (`qwen38d`'s model, whose layer is the
+    /// dense one). Fixture files and other real files do not, and the clause is pinned to these.
+    const MTP_FILES: [&str; 2] = [
+        "/data/moved/models/qwen36-hf/unsloth-mtp/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf",
+    ];
 
     /// The edit clause's turn, and the same turn with its user message
     /// changed: the resend diverges inside the rows the first run's prompt
@@ -699,17 +713,20 @@ mod gate {
         images: bool,
         /// `--only-images`: the image clauses alone.
         only_images: bool,
+        /// `--only-mtp`: [`mtp_ids_match_the_plain_path`] alone.
+        only_mtp: bool,
     }
 
     fn parse_args() -> Result<Args, GateError> {
         let (mut models, mut dir, mut images, mut only_images) = (Vec::new(), None, false, false);
-        let mut only_mixed = false;
+        let (mut only_mixed, mut only_mtp) = (false, false);
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
             match flag.as_str() {
                 "--only-mixed" => only_mixed = true,
                 "--images" => images = true,
                 "--only-images" => only_images = true,
+                "--only-mtp" => only_mtp = true,
                 "--model" | "--dir" => {
                     let v = it
                         .next()
@@ -730,6 +747,7 @@ mod gate {
                 dir,
                 images: images || only_images,
                 only_images,
+                only_mtp,
             }),
             _ => Err(USAGE.into()),
         }
@@ -4623,10 +4641,10 @@ mod gate {
         Ok(())
     }
 
-    /// Greedy drafted ids equal the plain path's, and the drafted completion
-    /// accepted at least one token. A file with no in-file next-token layer
-    /// prints the pin and starts no server; the pinned path with no layer is red.
-    /// A spawn, tokenize or completion failure is red and does not stop the
+    /// Greedy drafted ids equal the plain path's over [`MTP_N`] tokens, and the drafted
+    /// completion accepted at least [`MTP_FLOOR`] of the ids it proposed. A file with no in-file
+    /// next-token layer prints the pin and starts no server; a pinned path ([`MTP_FILES`]) with
+    /// no layer is red. A spawn, tokenize or completion failure is red and does not stop the
     /// file's later clauses or the next file.
     fn mtp_ids_match_the_plain_path(
         model: &Path,
@@ -4643,7 +4661,7 @@ mod gate {
         };
         let drafted = matches!(in_file(&file), Ok(InFile::Draft(_)));
         let passed = if !drafted {
-            if model == Path::new(MTP_FILE) {
+            if MTP_FILES.iter().any(|f| model == Path::new(f)) {
                 println!(
                     "{}: the pinned file carries no in-file next-token layer",
                     model.display()
@@ -4652,7 +4670,7 @@ mod gate {
             } else {
                 println!(
                     "{}: no in-file next-token layer; mtp_ids_match_the_plain_path is pinned to \
-                     {MTP_FILE}",
+                     {MTP_FILES:?}",
                     model.display()
                 );
                 None
@@ -4680,7 +4698,7 @@ mod gate {
             println!("mtp: the model path is not UTF-8");
             return false;
         };
-        let once = |name: &str, word: &str| -> Option<(Answer, Value)> {
+        let once = |name: &str, word: &str| -> Option<(Answer, Value, String)> {
             let sub = dir.join(name);
             if let Err(e) = std::fs::create_dir_all(&sub) {
                 println!("mtp {name} dir: {e}");
@@ -4723,28 +4741,67 @@ mod gate {
                 }
             };
             let url = |p: &str| format!("http://{addr}{p}");
-            match serve_client::greedy(&url, ids.clone(), MTP_N, &sub, name, false) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    println!("mtp {name} greedy: {e}");
-                    None
+            let (answer, body) =
+                match serve_client::greedy(&url, ids.clone(), MTP_N, &sub, name, false) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!("mtp {name} greedy: {e}");
+                        return None;
+                    }
+                };
+            // The server's own counters after its one request: what `/metrics` prints under
+            // the `spec_decode_num_*` names.
+            let counters = match serve_client::curl(&url("/metrics"), None, false) {
+                Ok((200, text)) => text,
+                Ok((st, text)) => {
+                    println!("mtp {name} /metrics: HTTP {st}: {text}");
+                    return None;
                 }
+                Err(e) => {
+                    println!("mtp {name} /metrics: {e}");
+                    return None;
+                }
+            };
+            Some((answer, body, counters))
+        };
+        let Some((on, on_body, on_metrics)) = once("mtp-on", "mtp") else {
+            return false;
+        };
+        let Some((off, _, _)) = once("mtp-off", "off") else {
+            return false;
+        };
+        let counted = |name: &str| -> Option<u64> {
+            let key = format!("llamacpp:spec_decode_num_{name}_total ");
+            on_metrics
+                .lines()
+                .find_map(|l| l.strip_prefix(&key))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .map(|v| v as u64)
+        };
+        let (proposed, accepted) = match serve_client::draft_counts(&on_body) {
+            Ok(counts) => counts,
+            Err(e) => {
+                println!("mtp drafted completion: {e}");
+                return false;
             }
         };
-        let Some((on, on_body)) = once("mtp-on", "mtp") else {
-            return false;
-        };
-        let Some((off, _)) = once("mtp-off", "off") else {
-            return false;
-        };
-        let accepted = on_body["timings"]["draft_n_accepted"].as_u64();
         let same = on.tokens == off.tokens;
+        let (floor_n, floor_d) = MTP_FLOOR;
+        let share = accepted as f64 / proposed as f64;
         println!(
-            "mtp drafted {} ids, plain {} ids, draft_n_accepted {accepted:?}",
+            "mtp drafted {} ids, plain {} ids, draft_n {proposed}, draft_n_accepted {accepted} \
+             (acceptance {share:.3}), /metrics proposed {:?} accepted {:?} passes {:?}",
             on.tokens.len(),
-            off.tokens.len()
+            off.tokens.len(),
+            counted("draft_tokens"),
+            counted("accepted_tokens"),
+            counted("drafts"),
         );
-        same && accepted.is_some_and(|n| n > 0)
+        let metrics_agree = counted("draft_tokens") == Some(proposed)
+            && counted("accepted_tokens") == Some(accepted);
+        same && on.tokens.len() == MTP_N
+            && metrics_agree
+            && accepted * floor_d >= proposed * floor_n
     }
 
     pub fn run() -> Result<(), GateError> {
@@ -4764,6 +4821,10 @@ mod gate {
             }
             if a.only_images {
                 images(model, &dir, &mut ok)?;
+                continue;
+            }
+            if a.only_mtp {
+                mtp_ids_match_the_plain_path(model, &dir, &mut ok)?;
                 continue;
             }
             let Some((answers, default_n)) = served(model, seat, &dir, &mut ok)? else {

@@ -1,7 +1,9 @@
 //! A qwen4exp MTP draft file read against its target (`mtp_of`), and a
-//! qwen35moe file's own next-token layer (`in_file`). The two readers do not
-//! share a branch: qwen4exp's layer is hyper-connected streams in its own
-//! file, and qwen35moe's is one plain full-attention layer in the target.
+//! qwen35moe or qwen35 file's own next-token layer (`in_file`). The two
+//! readers do not share a branch: qwen4exp's layer is hyper-connections in its
+//! own file, and the qwen35 family's is one plain full-attention layer in the
+//! target, whose feed-forward block is the trunk's kind (routed experts in a
+//! qwen35moe file, the dense SwiGLU in a qwen35 one).
 //!
 //! The file is its own GGUF (unsloth's `mtp-…-Q8_0.gguf`): `block_count` is
 //! the target's layers plus one, `nextn_predict_layers` is 1, and its only
@@ -24,11 +26,11 @@ use models::{
 };
 
 use super::hparams::{
-    ATTN_STEMS, EXP_LAYER_STEMS, GDN_STEMS, Hparams, NORM_STEMS, PLE_STEMS, Variant, expert_ff,
-    refuse_unless, sections,
+    ATTN_STEMS, EXP_LAYER_STEMS, FfnKind, GDN_STEMS, Hparams, NORM_STEMS, PLE_STEMS, Variant,
+    expert_ff, refuse_unless, sections,
 };
 use super::place::{PlaceError, PlanInputs};
-use super::spec::{out_gate, routed_at};
+use super::spec::{arch_of, dense_at, out_gate, routed_at};
 use crate::arch::draft::{EMBEDDING, HEAD, borrows, same, same_token_ids};
 use crate::arch::names::blk;
 use crate::arch::{
@@ -509,10 +511,10 @@ pub const HNORM: &str = "nextn.hnorm.weight";
 /// the next step reads as its `h`.
 pub const SHARED_HEAD_NORM: &str = "nextn.shared_head_norm.weight";
 
-/// The stems a shaped qwen35moe next-token layer carries. No hyper-connection
-/// head: the layer is one plain stream. The header fixture's tail uses this
-/// list, so the two cannot drift.
-pub(super) const DRAFT_STEMS: &[&str] = &[
+/// The stems every shaped qwen35moe or qwen35 next-token layer carries before
+/// its feed-forward block: the attention, the pre-feed-forward norm. No
+/// hyper-connection head: the layer is one plain stream.
+const ATTN_DRAFT_STEMS: &[&str] = &[
     "attn_norm.weight",
     "attn_q.weight",
     "attn_k.weight",
@@ -521,6 +523,10 @@ pub(super) const DRAFT_STEMS: &[&str] = &[
     "attn_q_norm.weight",
     "attn_k_norm.weight",
     "post_attention_norm.weight",
+];
+
+/// The routed feed-forward stems of a qwen35moe next-token layer.
+const ROUTED_DRAFT_STEMS: &[&str] = &[
     "ffn_gate_inp.weight",
     "ffn_gate_exps.weight",
     "ffn_up_exps.weight",
@@ -529,11 +535,54 @@ pub(super) const DRAFT_STEMS: &[&str] = &[
     "ffn_gate_shexp.weight",
     "ffn_up_shexp.weight",
     "ffn_down_shexp.weight",
-    EH_PROJ,
-    ENORM,
-    HNORM,
-    SHARED_HEAD_NORM,
 ];
+
+/// The dense feed-forward stems of a qwen35 next-token layer.
+const DENSE_DRAFT_STEMS: &[&str] = &["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"];
+
+/// The layer's own stems: the join's projection, its two norms and the head's.
+const OWN_DRAFT_STEMS: &[&str] = &[EH_PROJ, ENORM, HNORM, SHARED_HEAD_NORM];
+
+/// The stems a shaped next-token layer of `variant` carries, in the order a
+/// missing one is reported: the attention block, the variant's feed-forward
+/// kind ([`Variant::ffn`]), then the layer's own.
+pub(super) fn draft_stems(variant: Variant) -> impl Iterator<Item = &'static str> {
+    let ffn = match variant.ffn() {
+        FfnKind::Routed => ROUTED_DRAFT_STEMS,
+        FfnKind::Dense => DENSE_DRAFT_STEMS,
+    };
+    ATTN_DRAFT_STEMS
+        .iter()
+        .chain(ffn)
+        .chain(OWN_DRAFT_STEMS)
+        .copied()
+}
+
+/// Card bytes of the draft's step scratch and the allocator's rounding of the layer's tensors,
+/// the most a load holds past [`weight_bytes`] and the K/V of the layer ([`Mtp35::scratch_bytes`]
+/// of the gpu crate): `gate-gpu-qwen35moe-mtp` (d) holds it above the engine's own figure.
+// PIN(2026-11-16): the 27B's step scratch measured 49,613,152 B (the 35B's 18,358,956 B) plus
+// the layer's 15 buffers at a 2 MiB granule each at most, 81,070,432 B, rounded up to 80 MiB.
+pub const STEP_BYTES: u64 = 80 << 20;
+
+/// Card bytes of the weights the next-token layer at block `index` holds: each tensor of the
+/// block as the file stores it, a bf16 one widened to the f32 the card decodes it to. The
+/// target's embedding and head carry no layer index and are not here (the draft reads them in
+/// place).
+#[must_use]
+pub fn weight_bytes(tensors: &[ModelTensor], index: usize) -> u64 {
+    tensors
+        .iter()
+        .filter(|t| t.layer == Some(index))
+        .map(|t| {
+            if t.ty == GgmlType::BF16 {
+                4 * t.dims.iter().product::<u64>()
+            } else {
+                t.file_bytes
+            }
+        })
+        .sum()
+}
 
 /// Matrices the layer borrows from the target. A file that carries its own
 /// is refused; the role table does not name them either.
@@ -556,17 +605,23 @@ pub enum InFile {
     /// The key is 1 and every tail tensor is a one-element vector: the
     /// role table's stub, not a draft's shapes.
     Unshaped,
+    /// A qwen35 file's tail has the attention block and the join and none of
+    /// the three dense feed-forward tensors: the layer ik_llama.cpp builds
+    /// without a feed-forward block (`src/graphs/build_qwen35.cpp`: the FFN is
+    /// optional, the 9B's and 4B's has none). This reader builds the layer
+    /// with one, so the file has no draft here; its plain load is unchanged.
+    Ffnless,
 }
 
-/// The qwen35moe file's own next-token layer, or why it is not a draft.
-/// A file that carries `nextn.embed_tokens` or `nextn.shared_head_head` is
-/// refused here, by those names.
+/// The qwen35moe or qwen35 file's own next-token layer, or why it is not a
+/// draft. A file that carries `nextn.embed_tokens` or `nextn.shared_head_head`
+/// is refused here, by those names.
 pub fn in_file(split: &Split) -> Result<InFile, PlacementError> {
     refuse_own(split)?;
     let hp = Hparams::read(split)?;
-    if hp.variant != Variant::Qwen35Moe {
+    if hp.variant == Variant::Qwen4Exp {
         return Err(architecture_is(&format!(
-            "{:?}; an in-file next-token draft of this family is qwen35moe",
+            "{:?}; an in-file next-token draft of this family is qwen35moe or qwen35",
             hp.variant
         )));
     }
@@ -577,15 +632,16 @@ pub fn in_file(split: &Split) -> Result<InFile, PlacementError> {
     })
 }
 
-/// The draft `hp` and `tensors` describe, when they are a shaped qwen35moe
-/// next-token layer. `None` when the file has no such layer: another
-/// variant, no key, a stripped tail, or a one-element stub. A shaped tail
-/// that is not this layer is an error naming the key or the tensor.
+/// The draft `hp` and `tensors` describe, when they are a shaped qwen35moe or
+/// qwen35 next-token layer. `None` when the file has no such layer: another
+/// variant, no key, a stripped tail, a one-element stub, or a qwen35 tail with
+/// no feed-forward tensor ([`InFile::Ffnless`]). A shaped tail that is not
+/// this layer is an error naming the key or the tensor.
 pub(crate) fn describe(
     hp: &Hparams,
     tensors: &ModelTensors,
 ) -> Result<Option<MtpDraft>, PlacementError> {
-    if hp.variant != Variant::Qwen35Moe {
+    if hp.variant == Variant::Qwen4Exp {
         return Ok(None);
     }
     let past = hp
@@ -600,16 +656,12 @@ pub(crate) fn describe(
     }
     if past != 1 {
         return Err(PlacementError::Metadata {
-            key: format!("{}.nextn_predict_layers", Arch::Qwen35Moe.name()),
+            key: format!("{}.nextn_predict_layers", arch_of(hp.variant).name()),
             detail: format!("is {past}; one next-token layer is built"),
         });
     }
     let index = hp.n_trunk;
-    let tail: Vec<&ModelTensor> = tensors
-        .tensors
-        .iter()
-        .filter(|t| t.layer == Some(index))
-        .collect();
+    let tail = tail_of(tensors, index);
     if let Some(name) = tail.iter().map(|t| t.name.as_str()).find(|n| gdn_name(n)) {
         return Err(PlacementError::Tensor {
             name: name.to_string(),
@@ -620,10 +672,31 @@ pub(crate) fn describe(
     if let Some(name) = tail.iter().map(|t| t.name.as_str()).find(|n| own_name(n)) {
         return Err(own_error(name, &[name]));
     }
-    if tail.is_empty() || tail.iter().all(|t| t.dims == [1]) {
+    if tail.is_empty() || tail.iter().all(|t| t.dims == [1]) || ffnless(hp, &tail) {
         return Ok(None);
     }
     Ok(Some(shaped(hp, tensors, index)?))
+}
+
+/// The tensors of layer `index`.
+fn tail_of(tensors: &ModelTensors, index: usize) -> Vec<&ModelTensor> {
+    tensors
+        .tensors
+        .iter()
+        .filter(|t| t.layer == Some(index))
+        .collect()
+}
+
+/// A dense file's `tail` holds none of the dense feed-forward stems: the
+/// attention block and the join alone ([`InFile::Ffnless`]). One or two of the
+/// three is a partial block, which [`shaped`] names.
+fn ffnless(hp: &Hparams, tail: &[&ModelTensor]) -> bool {
+    hp.variant.ffn() == FfnKind::Dense
+        && !tail.iter().any(|t| {
+            DENSE_DRAFT_STEMS
+                .iter()
+                .any(|stem| t.name.ends_with(&format!(".{stem}")))
+        })
 }
 
 /// `split` carries a matrix the next-token layer borrows from the target.
@@ -671,15 +744,15 @@ fn no_draft(hp: &Hparams, tensors: &ModelTensors) -> Result<InFile, PlacementErr
         return Ok(InFile::Absent);
     }
     let index = hp.n_trunk;
-    let any = tensors.tensors.iter().any(|t| t.layer == Some(index));
-    if !any {
+    let tail = tail_of(tensors, index);
+    if tail.is_empty() {
         let reason = hp
             .defaults
             .iter()
             .find(|d| d.contains("stripped next-token layer"))
             .cloned()
             .ok_or_else(|| PlacementError::Metadata {
-                key: format!("{}.nextn_predict_layers", Arch::Qwen35Moe.name()),
+                key: format!("{}.nextn_predict_layers", arch_of(hp.variant).name()),
                 detail: format!(
                     "is set and blk.{index} carries no tensor, and the read recorded no \
                      stripped-layer line"
@@ -687,12 +760,14 @@ fn no_draft(hp: &Hparams, tensors: &ModelTensors) -> Result<InFile, PlacementErr
             })?;
         return Ok(InFile::Stripped { reason });
     }
+    if tail.iter().any(|t| t.dims != [1]) && ffnless(hp, &tail) {
+        return Ok(InFile::Ffnless);
+    }
     Ok(InFile::Unshaped)
 }
 
 fn shaped(hp: &Hparams, tensors: &ModelTensors, index: usize) -> Result<MtpDraft, PlacementError> {
-    let missing: Vec<String> = DRAFT_STEMS
-        .iter()
+    let missing: Vec<String> = draft_stems(hp.variant)
         .map(|s| blk(index, s))
         .filter(|n| named(tensors, n).is_err())
         .collect();
@@ -791,6 +866,64 @@ fn require_widths(
     Ok(())
 }
 
+/// The next-token layer's feed-forward block: the trunk's kind for the
+/// variant ([`Variant::ffn`]) over `blk.{index}`'s own tensors.
+fn ffn_of(hp: &Hparams, tensors: &ModelTensors, index: usize) -> Result<Ffn, PlacementError> {
+    let arch = arch_of(hp.variant);
+    match hp.variant.ffn() {
+        FfnKind::Dense => {
+            let ffn = dense_at(hp, arch, index)?;
+            let Ffn::Dense { ff, .. } = &ffn else {
+                return Err(PlacementError::Metadata {
+                    key: format!("{}.feed_forward_length", arch.name()),
+                    detail: format!("layer {index} is not dense"),
+                });
+            };
+            let n = hp.n_embd as u64;
+            let ff = u64::from(*ff);
+            for (stem, dims) in [
+                ("ffn_gate.weight", [n, ff]),
+                ("ffn_up.weight", [n, ff]),
+                ("ffn_down.weight", [ff, n]),
+            ] {
+                let t = named(tensors, &blk(index, stem))?;
+                if t.dims.as_slice() != dims {
+                    return Err(PlacementError::Tensor {
+                        name: t.name.clone(),
+                        detail: format!(
+                            "is {:?}; the next-token layer's dense block reads {dims:?} (hidden \
+                             {}, feed_forward_length {ff})",
+                            t.dims, hp.n_embd
+                        ),
+                    });
+                }
+            }
+            Ok(ffn)
+        }
+        FfnKind::Routed => {
+            let has = |name: String| tensors.tensors.iter().any(|t| t.name == name);
+            let ffn = routed_at(hp, arch, index, true, &has)?;
+            let Ffn::Moe(moe) = &ffn else {
+                return Err(PlacementError::Metadata {
+                    key: format!("{}.expert_count", arch.name()),
+                    detail: format!("layer {index} is not routed"),
+                });
+            };
+            let shared = moe.shared.as_ref().ok_or_else(|| PlacementError::Tensor {
+                name: blk(index, "ffn_up_shexp.weight"),
+                detail: "is not in the file; the next-token layer runs a shared expert".to_string(),
+            })?;
+            if !shared.sigmoid_gate {
+                return Err(PlacementError::Tensor {
+                    name: blk(index, "ffn_gate_inp_shexp.weight"),
+                    detail: "is not in the file; the shared expert's gate is a sigmoid".to_string(),
+                });
+            }
+            Ok(ffn)
+        }
+    }
+}
+
 fn layer_of(
     hp: &Hparams,
     tensors: &ModelTensors,
@@ -808,26 +941,7 @@ fn layer_of(
             detail: "writes the query without the per-head gate".to_string(),
         });
     }
-    let has = |name: String| tensors.tensors.iter().any(|t| t.name == name);
-    let ffn = routed_at(hp, Arch::Qwen35Moe, index, true, &has)?;
-    {
-        let Ffn::Moe(moe) = &ffn else {
-            return Err(PlacementError::Metadata {
-                key: format!("{}.expert_count", Arch::Qwen35Moe.name()),
-                detail: format!("layer {index} is not routed"),
-            });
-        };
-        let shared = moe.shared.as_ref().ok_or_else(|| PlacementError::Tensor {
-            name: blk(index, "ffn_up_shexp.weight"),
-            detail: "is not in the file; the next-token layer runs a shared expert".to_string(),
-        })?;
-        if !shared.sigmoid_gate {
-            return Err(PlacementError::Tensor {
-                name: blk(index, "ffn_gate_inp_shexp.weight"),
-                detail: "is not in the file; the shared expert's gate is a sigmoid".to_string(),
-            });
-        }
-    }
+    let ffn = ffn_of(hp, tensors, index)?;
     Ok(LayerSpec {
         mixer: Mixer::Gqa(Gqa {
             heads,
@@ -1628,9 +1742,18 @@ mod in_file_tests {
         kv: &[(&str, V)],
         tensors: &[(String, Vec<u64>)],
     ) -> (Read, Result<InFile, String>) {
+        open_as(tag, "qwen35moe", kv, tensors)
+    }
+
+    fn open_as(
+        tag: &str,
+        arch: &str,
+        kv: &[(&str, V)],
+        tensors: &[(String, Vec<u64>)],
+    ) -> (Read, Result<InFile, String>) {
         let path = header_shaped(
             tag,
-            "qwen35moe",
+            arch,
             kv,
             &[("tokenizer.ggml.pre", V::Str("qwen35"))],
             tensors,
@@ -1644,12 +1767,243 @@ mod in_file_tests {
     }
 
     fn refused(tag: &str, kv: &[(&str, V)], tensors: &[(String, Vec<u64>)]) -> String {
-        let path = header_shaped(tag, "qwen35moe", kv, &[], tensors);
+        refused_as(tag, "qwen35moe", kv, tensors)
+    }
+
+    fn refused_as(
+        tag: &str,
+        arch: &str,
+        kv: &[(&str, V)],
+        tensors: &[(String, Vec<u64>)],
+    ) -> String {
+        let path = header_shaped(tag, arch, kv, &[], tensors);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let err = in_file(&split).map_or_else(|e| e.to_string(), |_| "accepted".to_string());
         drop(split);
         let _ = std::fs::remove_file(&path);
         err
+    }
+
+    /// The keys of a dense qwen35 file: the trunk's, no expert key, the dense
+    /// width.
+    fn dense_keys(blocks: u32, nextn: Option<u32>) -> Vec<(&'static str, V)> {
+        let mut kv: Vec<(&'static str, V)> = keys(blocks, nextn)
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("expert_"))
+            .collect();
+        kv.push(("feed_forward_length", V::U32(96)));
+        kv
+    }
+
+    /// The dense trunk: three delta layers, then attention, each with its
+    /// dense block's gate.
+    fn dense_trunk(embed: Vec<u64>) -> Vec<(String, Vec<u64>)> {
+        let mut t = trunk(embed);
+        t.retain(|(n, _)| !n.ends_with(".ffn_gate_inp.weight"));
+        for l in 0..4 {
+            t.push((format!("blk.{l}.ffn_gate.weight"), vec![1]));
+        }
+        t
+    }
+
+    /// Layer `l` as a shaped dense next-token layer: the attention block, the
+    /// join and `ffn` as the dense block's three matrices.
+    fn dense_tail(l: usize, ffn: [Vec<u64>; 3]) -> Vec<(String, Vec<u64>)> {
+        let [gate, up, down] = ffn;
+        let mut t = tail(l, vec![64], vec![128, 64], vec![64, 128]);
+        t.retain(|(n, _)| !n.contains(".ffn_"));
+        t.extend([
+            (format!("blk.{l}.ffn_gate.weight"), gate),
+            (format!("blk.{l}.ffn_up.weight"), up),
+            (format!("blk.{l}.ffn_down.weight"), down),
+        ]);
+        t
+    }
+
+    fn dense_shaped() -> Vec<(String, Vec<u64>)> {
+        let mut t = dense_trunk(vec![64, 2]);
+        t.extend(dense_tail(4, [vec![64, 96], vec![64, 96], vec![96, 64]]));
+        t
+    }
+
+    /// A qwen35 file's shaped tail is the layer the trunk's dense block builds:
+    /// `Ffn::Dense` of the file's `feed_forward_length`, in `spec.mtp` too, with
+    /// the draft's input and head the family's. Mutant: `describe` returns `None`
+    /// for every variant but qwen35moe (the tree before the dense draft).
+    #[test]
+    fn q_a_dense_shaped_file_is_an_in_file_head_row_draft() {
+        let (read, draft) = open_as(
+            "q35d-d1",
+            "qwen35",
+            &dense_keys(5, Some(1)),
+            &dense_shaped(),
+        );
+        let InFile::Draft(d) = draft.expect("the layer is a draft") else {
+            panic!("not a draft");
+        };
+        assert!(matches!(d.source, MtpSource::InFile { layer: 4 }));
+        assert_eq!(d.index, 4);
+        assert_eq!(d.input, MtpInput::HeadRow);
+        assert_eq!(d.head_norm, MtpHeadNorm::Rms);
+        assert_eq!((d.hidden, d.vocab), (64, 2));
+        assert_eq!(d.layer.residual, Residual::Plain);
+        assert!(matches!(d.layer.mixer, Mixer::Gqa(_)));
+        let Ffn::Dense { ff, act } = &d.layer.ffn else {
+            panic!("the feed-forward block is not dense: {:?}", d.layer.ffn);
+        };
+        assert_eq!(*ff, 96);
+        assert_eq!(*act, models::Act::SwiGlu { limit: None });
+        assert_eq!(read.spec.mtp.as_slice(), std::slice::from_ref(&d.layer));
+        assert_eq!(read.spec.layers.len(), 4);
+        assert!(
+            read.spec
+                .layers
+                .iter()
+                .all(|l| matches!(l.ffn, Ffn::Dense { ff: 96, .. })),
+            "the trunk's blocks are the dense kind the draft's is"
+        );
+    }
+
+    /// The draft's card weights are the tail block's tensors alone: the file's bytes of each, a
+    /// bf16 one widened to f32, no trunk layer's and no model-level tensor. Mutants: the filter
+    /// dropped (every layer counts), the widening dropped.
+    #[test]
+    fn q_a_draft_layers_weight_bytes_are_its_own_block_widened() {
+        let (read, _) = open_as(
+            "q35d-wb",
+            "qwen35",
+            &dense_keys(5, Some(1)),
+            &dense_shaped(),
+        );
+        let mut all = read.tensors.tensors;
+        let own: u64 = all
+            .iter()
+            .filter(|t| t.name.starts_with("blk.4."))
+            .map(|t| t.dims.iter().product::<u64>() * 4)
+            .sum();
+        assert!(own > 0, "the synthetic tail holds tensors");
+        assert_eq!(super::weight_bytes(&all, 4), own, "f32 tensors as stored");
+        let mut wide = all
+            .iter()
+            .find(|t| t.layer == Some(4))
+            .expect("a tail tensor")
+            .clone();
+        (wide.ty, wide.dims, wide.file_bytes) = (gguf::GgmlType::BF16, vec![2, 3], 12);
+        all.push(wide);
+        assert_eq!(
+            super::weight_bytes(&all, 4),
+            own + 24,
+            "a bf16 tensor is 4 bytes a value on the card, not the file's 2"
+        );
+    }
+
+    /// The dense draft's rule: the qwen35 body's registry row runs the same
+    /// in-file rule as qwen35moe's. Mutant: the row's `draft` back to `None`
+    /// (`NoRule`).
+    #[test]
+    fn q_a_dense_file_has_the_in_file_rule() {
+        let path = header_shaped(
+            "q35d-rule",
+            "qwen35",
+            &dense_keys(5, Some(1)),
+            &[],
+            &dense_shaped(),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        draft_usable(&split, None).expect("a shaped dense in-file draft can run");
+        let named = draft_usable(&split, Some("other")).expect_err("not a sidecar");
+        assert!(
+            named.to_string().contains("other") && named.to_string().contains("qwen35 draft"),
+            "{named}"
+        );
+        drop(split);
+        let _ = std::fs::remove_file(&path);
+
+        let path = header_shaped(
+            "q35d-rule-abs",
+            "qwen35",
+            &dense_keys(4, None),
+            &[],
+            &dense_trunk(vec![1]),
+        );
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = draft_usable(&split, None)
+            .expect_err("no layer")
+            .to_string();
+        drop(split);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("qwen35.nextn_predict_layers") && !err.contains("no rule"),
+            "{err}"
+        );
+    }
+
+    /// A qwen35 tail with the attention block and the join and no dense
+    /// feed-forward tensor (ik_llama.cpp builds such a layer without the
+    /// block) is its own case: the file reads and loads plain, `in_file` says
+    /// `Ffnless`, and the rule refuses it by that reason. Mutant: `ffnless`
+    /// false, the tail then fails the description by the missing `ffn_gate`.
+    #[test]
+    fn q_a_dense_tail_without_a_feed_forward_block_is_ffnless_and_reads_plain() {
+        let mut t = dense_trunk(vec![64, 2]);
+        t.extend(
+            dense_tail(4, [vec![1], vec![1], vec![1]])
+                .into_iter()
+                .filter(|(n, _)| !n.contains(".ffn_"))
+                .map(|(n, d)| {
+                    // The shaped widths of the attention block and the join.
+                    let shaped = tail(4, vec![64], vec![128, 64], vec![64, 128]);
+                    let dims = shaped
+                        .into_iter()
+                        .find(|(m, _)| *m == n)
+                        .map_or(d, |(_, dims)| dims);
+                    (n, dims)
+                }),
+        );
+        let (read, draft) = open_as("q35d-nof", "qwen35", &dense_keys(5, Some(1)), &t);
+        assert!(
+            matches!(draft, Ok(InFile::Ffnless)),
+            "an FFN-less dense tail: {draft:?}"
+        );
+        assert!(
+            read.spec.mtp.is_empty(),
+            "an FFN-less tail is no draft layer"
+        );
+        assert_eq!(read.spec.layers.len(), 4, "the trunk reads as before");
+        let path = header_shaped("q35d-nof-rule", "qwen35", &dense_keys(5, Some(1)), &[], &t);
+        let split = gguf::Split::open(&path).expect("the synthetic header opens");
+        let err = draft_usable(&split, None)
+            .expect_err("no block, no draft")
+            .to_string();
+        drop(split);
+        let _ = std::fs::remove_file(&path);
+        assert!(err.contains("no feed-forward tensor"), "{err}");
+    }
+
+    /// One or two of the dense block's three matrices is a partial block, a
+    /// named missing tensor and not the FFN-less case.
+    #[test]
+    fn q_a_partial_dense_block_names_the_missing_tensor() {
+        let mut t = dense_shaped();
+        t.retain(|(n, _)| n != "blk.4.ffn_up.weight");
+        let err = refused_as("q35d-part", "qwen35", &dense_keys(5, Some(1)), &t);
+        assert!(
+            err.contains("blk.4.ffn_up.weight") && err.contains("is not in the file"),
+            "{err}"
+        );
+    }
+
+    /// The dense block's matrices read the file's `feed_forward_length`: a
+    /// down projection of the wrong width is refused by name.
+    #[test]
+    fn q_a_dense_block_of_another_width_is_refused() {
+        let mut t = dense_trunk(vec![64, 2]);
+        t.extend(dense_tail(4, [vec![64, 96], vec![64, 96], vec![64, 96]]));
+        let err = refused_as("q35d-wide", "qwen35", &dense_keys(5, Some(1)), &t);
+        assert!(
+            err.contains("blk.4.ffn_down.weight") && err.contains("feed_forward_length 96"),
+            "{err}"
+        );
     }
 
     #[test]

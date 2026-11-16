@@ -7,12 +7,13 @@
 //! every norm is a plain RMS norm. A layer's feed-forward block is the routed
 //! experts or, on a qwen35 file, one SwiGLU block of `feed_forward_length`
 //! (qwen35.cpp:470-480), as its tensors say. The layers are the trunk's. A
-//! qwen35moe file with one shaped next-token layer carries that layer in
-//! `mtp`; its tensors stay [`Role::Unused`], so the trunk does not run it.
-//! A file whose key is absent, or whose key names a layer the file stripped,
-//! carries no draft layer, and neither does an unshaped role-table stub or a
-//! tail the draft refuses (`mtp::in_file` names that refusal).
-//! qwen35 and qwen4exp keep `mtp` empty. Every variant's chat surface is the
+//! qwen35moe or qwen35 file with one shaped next-token layer carries that
+//! layer in `mtp`, its feed-forward block the variant's own (routed experts,
+//! or the dense SwiGLU); its tensors stay [`Role::Unused`], so the trunk does
+//! not run it. A file whose key is absent, or whose key names a layer the
+//! file stripped, carries no draft layer, and neither does an unshaped
+//! role-table stub or a tail the draft refuses (`mtp::in_file` names that
+//! refusal). qwen4exp keeps `mtp` empty. Every variant's chat surface is the
 //! family's: the tool calls are [`TOOLS`], the `<think>` span is read.
 //!
 //! What qwen4exp changes, by its architecture and not by a key (llama.cpp
@@ -73,11 +74,7 @@ pub fn spec_of(
     let has = |name: String| by_name.contains_key(name.as_str());
     let heads = spec_u32("attention.head_count", hp.n_head)?;
     let head_dim = spec_u32("attention.key_length", hp.head_dim)?;
-    let arch = match hp.variant {
-        Variant::Qwen35Moe => Arch::Qwen35Moe,
-        Variant::Qwen35 => Arch::Qwen35,
-        Variant::Qwen4Exp => Arch::Qwen4Exp,
-    };
+    let arch = arch_of(hp.variant);
     let exp = hp.exp.as_ref();
     let rope = Rope {
         mode: RopeMode::Imrope {
@@ -137,16 +134,7 @@ pub fn spec_of(
             };
             let ffn = match hp.ffns[l] {
                 FfnKind::Routed => routed(hp, tensors, arch, l, &has)?,
-                FfnKind::Dense => {
-                    let ff = hp.ff.ok_or_else(|| PlacementError::Metadata {
-                        key: format!("{}.feed_forward_length", arch.name()),
-                        detail: format!("is absent, and layer {l} is dense"),
-                    })?;
-                    Ffn::Dense {
-                        ff: spec_u32("feed_forward_length", ff)?,
-                        act: Act::SwiGlu { limit: None },
-                    }
-                }
+                FfnKind::Dense => dense_at(hp, arch, l)?,
             };
             Ok(LayerSpec {
                 mixer,
@@ -205,6 +193,29 @@ pub fn spec_of(
         encoder: None,
         logit_epilogue: None,
         chat,
+    })
+}
+
+/// The [`Arch`] a file of `variant` runs as.
+pub(super) fn arch_of(variant: Variant) -> Arch {
+    match variant {
+        Variant::Qwen35Moe => Arch::Qwen35Moe,
+        Variant::Qwen35 => Arch::Qwen35,
+        Variant::Qwen4Exp => Arch::Qwen4Exp,
+    }
+}
+
+/// Layer `l`'s dense feed-forward block: one SwiGLU of `feed_forward_length`
+/// (qwen35.cpp:470-480). A trunk layer's and the next-token layer's are this
+/// one block.
+pub(super) fn dense_at(hp: &Hparams, arch: Arch, l: usize) -> Result<Ffn, PlacementError> {
+    let ff = hp.ff.ok_or_else(|| PlacementError::Metadata {
+        key: format!("{}.feed_forward_length", arch.name()),
+        detail: format!("is absent, and layer {l} is dense"),
+    })?;
+    Ok(Ffn::Dense {
+        ff: spec_u32("feed_forward_length", ff)?,
+        act: Act::SwiGlu { limit: None },
     })
 }
 

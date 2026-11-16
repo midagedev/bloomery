@@ -1,0 +1,35 @@
+# Derivation [derived]: the draft layer blk.64 is 263,313,408 B (attention, dense SwiGLU 17408, eh_proj, f32
+# norms) and the target's Q6_K head 1,042,944,000 B, so a draft row reads 1,306.3 MB = 2.00 ms at 653 GB/s;
+# the window refresh feeds 1 + a rows, each ending in the head, so x(a) = (1 + a) x 2.0 ms.
+# tok/s = plain x (1 + a) / (c_v(2) + x(a)), c_v(2) = 1.209 steps (q35ro, depth 6), plain 28.3 ms at depth 512
+# (35.3 tok/s, lead's serve number): R(a) = (1 + a) / (1.209 + 0.0707 (1 + a)).
+# a 0.50 -> +14.1 %, 0.60 -> +21.0 %, 0.70 -> +27.9 %, 0.80 -> +34.7 %, 0.85 -> +38.1 %; break-even a* = 0.30.
+# The acceptance is measured on this tree before the sitting: gate clause (s) on the 27B 46 of 63 = 0.730 (0.688 on
+# the last 16 positions), the serve's 64-token pair 0.735 on the A6000 and 23 of 32 = 0.719 on the 3090 (one
+# 64-token prose prompt each): a is read as 0.60..0.80, so the band 21..35 is R(0.60)..R(0.80) [derived], centre
+# +28 % at a = 0.72.
+kind: ab
+question: does the 27B (qwen35 dense, Q4_K_M) decode faster under its in-file MTP draft than plain, at the
+  speed the bytes say for the acceptance the clause (s) measured?
+term: tok/s (timings.predicted_per_second) @ n=128, depth 512 prose, qwen38d bloomery-serve at its serving
+  defaults, BLOOMERY_DRAFT=mtp against BLOOMERY_DRAFT=off (same binary), RTX A6000; the depth 4096 pair of the
+  same call is a co-row
+unit: %
+predict: 21..35
+rounds: 4
+condition: one lease, BLOOMERY_MODEL=qwen38d, one tree (this one, bloomery-serve built by the recipe),
+  same-binary lever arms, off listed first in each depth so the table prints mtp against off, order rotated
+  every round; every mtp arm's load prints draft=mtp and every off arm's draft=off, no row is [cpu-busy],
+  [other-busy] or [cold]; DEPTH_SERVE_AFTER on round 1 prints each arm group's
+  llamacpp:spec_decode_num_draft_tokens_total and _accepted_tokens_total, and a = accepted / draft_tokens read
+  from them must lie in 0.60..0.80 before the ratio is read against the band
+decide-in: the draft costs what the bytes say, (1 + a) x 2.0 ms a cycle: keep the default flip for the dense
+  file; the next terms are the head skipped on the refresh rows the walk does not ask a token of (+2..+4 %,
+  report-only) and BLOOMERY_MTP_WIDTH above 1
+decide-below: a below 0.60 (the draft is a worse predictor on this corpus than the gate and serve prompts) or the
+  draft step costs more than 2.0 ms a row: with a measured and the ratio under R(a), read the draft rows in
+  nsys (tools/ref/nsys-gpu.sh) for the eager launch gaps and the per-row readback; with a at or below 0.30 the
+  draft is slower than plain and the unset default for the dense file is wrong, flip it back to plain with its
+  record
+decide-above: a above 0.80, or the verify at two rows is cheaper than the 1.209 steps q35ro measured: re-fit a
+  and c_v(2) from the two arms' counters; the default stays

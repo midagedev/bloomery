@@ -1,19 +1,26 @@
-//! The Qwen3.6 next-token (MTP) draft gate: a load opened with the file's
-//! own next-token layer (`GpuModel::<Body35>::open_mtp`) runs one draft step
-//! through Body35's own layer path (`Mtp35`).
+//! The qwen35 family's next-token (MTP) draft gate: a load opened with the
+//! file's own next-token layer (`GpuModel::<Body35>::open_mtp`) runs one draft
+//! step through Body35's own layer path (`Mtp35`).
 //!
-//! What is asserted, on the real unsloth `UD-Q4_K_M` file that carries the
-//! layer (`blk.40`: full attention and a routed MoE with the trunk's shapes,
-//! beside `nextn.{eh_proj, enorm, hnorm, shared_head_norm}`), named by
-//! `BLOOMERY_MTP_MODEL` and pinned by its `general.name` and its size:
-//! - (q) refusals by name at open, before any upload: the plain Qwen3.6 file
-//!   (`BLOOMERY_REF_MODEL`: no `nextn` tensor, no next-token layer) fails with the in-file rule's
-//!   reason, not a missing-tensor error from the loader, and a media load.
+//! What is asserted, on two real files that carry the layer, each named by
+//! its lever and pinned by its architecture and its size in bytes (the first
+//! also by its `general.name`), each through one load and every clause below:
+//! the unsloth Qwen3.6 `UD-Q4_K_M` (`BLOOMERY_MTP_MODEL`; `blk.40`: full
+//! attention and a routed MoE with the trunk's shapes) and lmstudio's
+//! Qwen3.8-27B `Q4_K_M` (`BLOOMERY_MTP_DENSE_MODEL`; `blk.64`: full attention
+//! and the trunk's dense SwiGLU), each beside
+//! `nextn.{eh_proj, enorm, hnorm, shared_head_norm}`:
+//! - (q) refusals by name at open, before any upload: for the Qwen3.6 file the
+//!   plain twin (`BLOOMERY_REF_MODEL`: no `nextn` tensor, no next-token layer)
+//!   fails with the in-file rule's reason, not a missing-tensor error from the
+//!   loader; for both, a media load. No file of the 27B lacks the layer: the
+//!   model crate's tests hold its absent, stripped, unshaped and FFN-less
+//!   tails.
 //! - (d) the draft's resident card bytes are the figure derived from the
-//!   file's tensor table: the layer's own tensors (a bf16 one, the router and
-//!   the shared expert's gate, widened to f32 on the card, every other type as
-//!   the file stores it), one f32 stream and one dense K/V store at the open's
-//!   context; the head's output matrix and the embedding are the target's own device
+//!   file's tensor table: the layer's own tensors (a bf16 one, as the Qwen3.6
+//!   router and shared expert's gate, widened to f32 on the card, every other
+//!   type as the file stores it), one f32 stream and one dense K/V store at
+//!   the open's context; the head's output matrix and the embedding are the target's own device
 //!   buffers at the addresses the draft recorded, and the draft's weights
 //!   hold neither.
 //! - (j) the input join (`mtp_input` at one stream) is the two RMS norms of
@@ -28,8 +35,8 @@
 //!   it was, and the step they interrupted repeats to the same token. A
 //!   second resident sequence (`add_slots(2)`) is refused by name and the
 //!   load keeps its one slot.
-//! - (s) the draft's acceptance against the target: a 64-id prompt of the shared prose
-//!   corpus (`prose_ids`, Qwen3.8's ids: the same vocabulary) through the target,
+//! - (s) the draft's acceptance against the target: a 64-id prompt of the file's
+//!   prose corpus (`prose_ids`; both files share the vocabulary) through the target,
 //!   one step at a time for its own next tokens and in one pass for its
 //!   final-norm rows; the draft is then fed each position in order — the
 //!   prompt's next id, the position and the target's row of it — so its K/V
@@ -37,7 +44,10 @@
 //!   is compared with the token the target itself takes after that next id.
 //!   Under 30 % is a wiring error (the join order, a wrong `h`, a wrong
 //!   gain), and the clause is red. The draft's own K/V rows weigh little
-//!   at this prompt length: a draft attending to one row stays above it.
+//!   at this prompt length: a draft attending to one row stays above it. The
+//!   wiring floor does not hold the dense layer's feed-forward block (a draft
+//!   with a wrong gain there clears it), so the 27B's agreement over every
+//!   position is held by a pin ([`DENSE_AGREE`]).
 //! - (w) the store walk and the step row, after (s): the draft's K/V rows
 //!   below (s)'s last position are overwritten by steps of other ids and
 //!   rows, which moves that position's logits; one store walk
@@ -78,20 +88,74 @@ mod gate {
     };
     use cuda_core::DeviceBuffer;
     use gguf::Split;
-    use gguf::quant::{GgmlType, half_to_f32};
+    use gguf::quant::half_to_f32;
     use model::arch::Arch;
     use model::arch::models::Mixer;
-    use model::arch::qwen35moe::mtp::{EH_PROJ, ENORM, HNORM, InFile, SHARED_HEAD_NORM, in_file};
+    use model::arch::qwen35moe::mtp::{
+        EH_PROJ, ENORM, HNORM, InFile, SHARED_HEAD_NORM, STEP_BYTES, in_file, weight_bytes,
+    };
     use model::arch::qwen35moe::spec;
     use runtime::stores::dense_kv_bytes;
 
     const WHAT: &str = "gate_qwen35moe_mtp";
 
-    /// The lever naming the file the gate runs on: unsloth's `UD-Q4_K_M` with
-    /// its next-token layer. Pinned by `general.name` and by its size in bytes.
-    const DRAFT_LEVER: &str = "BLOOMERY_MTP_MODEL";
-    const DRAFT_NAME: &str = "Qwen3.6-35B-A3B";
-    const DRAFT_BYTES: u64 = 22_663_387_424;
+    /// The levers naming the two files.
+    const MOE_LEVER: &str = "BLOOMERY_MTP_MODEL";
+    const DENSE_LEVER: &str = "BLOOMERY_MTP_DENSE_MODEL";
+
+    /// A file the gate runs on, named by `lever` and pinned by its
+    /// architecture, its size in bytes and its `general.name` when it has a
+    /// pinned one.
+    struct Pin {
+        lever: &'static str,
+        arch: &'static str,
+        name: Option<&'static str>,
+        bytes: u64,
+        /// The directory of `$BLOOMERY_DATA` whose `corpus-prose.ids` is the prompt.
+        prose: &'static str,
+        /// The width of one hidden row: the file's embedding length.
+        hidden: usize,
+        /// The architecture of the file's own twin without the next-token
+        /// layer, when one exists on the box (clause (q)'s first line).
+        plain: Option<Arch>,
+        /// A bf16 tensor sits in the layer, so (d)'s figure carries a widening.
+        widened: bool,
+        /// A floor on the positions of (s) at which the draft's token is the
+        /// target's own next token, where a pin holds the feed-forward block.
+        agree: Option<usize>,
+        /// The load's tensor-core decode flash: the file's head ratio decides it (a
+        /// six-heads-a-key-head file reads the scalar pairs' pass, which refuses `mma`).
+        mma: bool,
+    }
+
+    /// unsloth's Qwen3.6 `UD-Q4_K_M` with its next-token layer (routed MoE).
+    const MOE: Pin = Pin {
+        lever: MOE_LEVER,
+        arch: "qwen35moe",
+        name: Some("Qwen3.6-35B-A3B"),
+        bytes: 22_663_387_424,
+        prose: "qwen4exp",
+        hidden: 2048,
+        plain: Some(Arch::Qwen35moe),
+        widened: true,
+        agree: None,
+        mma: true,
+    };
+
+    /// lmstudio's Qwen3.8-27B `Q4_K_M` with its next-token layer (dense
+    /// SwiGLU); the size is `tools/ref/dense-logits.py` `TARGETS`' pin.
+    const DENSE: Pin = Pin {
+        lever: DENSE_LEVER,
+        arch: "qwen35",
+        name: None,
+        bytes: 16_810_714_336,
+        prose: "qwen35",
+        hidden: 5120,
+        plain: None,
+        widened: false,
+        agree: Some(DENSE_AGREE),
+        mma: false,
+    };
 
     /// Cache rows of the load and the prompt's ubatch: the prompt and the
     /// draft's rows over it, with room.
@@ -105,8 +169,16 @@ mod gate {
     /// The wiring floor of (s), a share of the positions.
     const FLOOR: f64 = 0.30;
 
-    /// (j)'s embedding width and head-row count: the file's.
-    const HIDDEN: usize = 2048;
+    /// PIN(2026-11-16): the positions of (s)'s 63 at which the dense draft's token
+    /// is the target's own next token. The 27B's draft agrees at 46; one whose
+    /// feed-forward input is normed by another block's gain agrees at 38 and still
+    /// clears [`FLOOR`] on the last 16 positions (7 of 16), so the wiring floor does
+    /// not hold the feed-forward block. The pin is the midpoint, 42, a bug catcher
+    /// like the forced_exact count pin: the walk is greedy and bit-exact, so the
+    /// count is one number (46 on the A6000 and on the 3090), and the margin is 4
+    /// positions each way. A change to the float order of the draft's kernels
+    /// moves the count: it re-pins here, with a new PIN line.
+    const DENSE_AGREE: usize = 42;
 
     /// Rows of the second store walks of (w): a width no caller walks, so the
     /// first walk's bits equal theirs only when a row's stored bits are its
@@ -139,38 +211,61 @@ mod gate {
         Qwen35moeModel::open_mtp(Gpu::new()?, file, o)
     }
 
-    fn opts(media: bool) -> Open35 {
+    fn opts(media: bool, mma: bool) -> Open35 {
         Open35 {
             ctx: CTX,
-            mma: true,
+            mma,
             ubatch: UBATCH,
             kv: KvQ8::F16,
             media,
         }
     }
 
-    /// The pinned file: qwen35moe, `general.name` [`DRAFT_NAME`], one shard
-    /// of [`DRAFT_BYTES`].
-    fn pinned() -> Result<Split, GateError> {
-        let path = std::env::var(DRAFT_LEVER).map_err(|_| {
-            format!("{DRAFT_LEVER} unset: it names the {DRAFT_NAME} file with its next-token layer")
+    /// The path the lever naming `p`'s file holds.
+    fn lever_value(p: &Pin) -> Result<String, std::env::VarError> {
+        if p.lever == DENSE_LEVER {
+            std::env::var(DENSE_LEVER)
+        } else {
+            std::env::var(MOE_LEVER)
+        }
+    }
+
+    /// The pinned file: architecture `p.arch`, `general.name` `p.name` when
+    /// pinned, one shard of `p.bytes`.
+    fn pinned(p: &Pin) -> Result<Split, GateError> {
+        let lever = p.lever;
+        let path = lever_value(p).map_err(|_| {
+            format!(
+                "{lever} unset: it names the {} file with its next-token layer",
+                p.arch
+            )
         })?;
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
-        if file.architecture() != Some("qwen35moe") {
-            return Err(format!("{path} is {:?}, not qwen35moe", file.architecture()).into());
+        if file.architecture() != Some(p.arch) {
+            return Err(format!("{path} is {:?}, not {}", file.architecture(), p.arch).into());
         }
-        let name = file.value("general.name").and_then(|v| v.as_str());
-        if name != Some(DRAFT_NAME) {
-            return Err(format!("{path}: general.name is {name:?}, not {DRAFT_NAME:?}").into());
+        if let Some(want) = p.name {
+            let name = file.value("general.name").and_then(|v| v.as_str());
+            if name != Some(want) {
+                return Err(format!("{path}: general.name is {name:?}, not {want:?}").into());
+            }
         }
         let shard = file.shard_path(0).ok_or("the file has no first shard")?;
         let bytes = std::fs::metadata(shard)
             .map_err(|e| format!("{}: {e}", shard.display()))?
             .len();
-        if bytes != DRAFT_BYTES {
-            return Err(format!("{path} is {bytes} bytes, not {DRAFT_BYTES}").into());
+        if bytes != p.bytes {
+            return Err(format!("{path} is {bytes} bytes, not {}", p.bytes).into());
         }
         Ok(file)
+    }
+
+    /// The width of the live draft's hidden row.
+    fn hidden_of(m: &Qwen35moeModel) -> Result<usize, GateError> {
+        Ok(m.body(WHAT)?
+            .mtp()
+            .ok_or("the load opened no next-token layer")?
+            .hidden())
     }
 
     /// The error opening `file` with the draft gives, `None` when it opened.
@@ -179,20 +274,23 @@ mod gate {
     }
 
     /// (q): the refusals at open, before the card is touched.
-    fn refusals_at_open() -> Result<bool, GateError> {
-        let plain = open_split(Arch::Qwen35moe, "gate-gpu-qwen35moe-mtp")?;
-        let r = open_error(plain, opts(false));
-        let text = r.as_deref().unwrap_or("opened");
-        let none_ok = r
-            .as_deref()
-            .is_some_and(|e| e.contains("the file has no in-file draft"))
-            && r.as_deref()
-                .is_some_and(|e| !e.contains("is not in the file"));
-        println!(
-            "(q) the file with no next-token layer: {text} {}",
-            verdict(none_ok)
-        );
-        let r = open_error(pinned()?, opts(true));
+    fn refusals_at_open(p: &Pin) -> Result<bool, GateError> {
+        let mut none_ok = true;
+        if let Some(arch) = p.plain {
+            let plain = open_split(arch, "gate-gpu-qwen35moe-mtp")?;
+            let r = open_error(plain, opts(false, p.mma));
+            let text = r.as_deref().unwrap_or("opened");
+            none_ok = r
+                .as_deref()
+                .is_some_and(|e| e.contains("the file has no in-file draft"))
+                && r.as_deref()
+                    .is_some_and(|e| !e.contains("is not in the file"));
+            println!(
+                "(q) the file with no next-token layer: {text} {}",
+                verdict(none_ok)
+            );
+        }
+        let r = open_error(pinned(p)?, opts(true, p.mma));
         let text = r.as_deref().unwrap_or("opened");
         let media_ok = r.as_deref().is_some_and(|e| e.contains("a media load"));
         println!("(q) a media load: {text} {}", verdict(media_ok));
@@ -201,7 +299,7 @@ mod gate {
 
     /// (d): the draft's resident bytes against the plan's figure, and the
     /// borrowed matrices at the target's addresses.
-    fn load_clause(m: &Qwen35moeModel, file: &Split) -> Result<bool, GateError> {
+    fn load_clause(m: &Qwen35moeModel, file: &Split, p: &Pin) -> Result<bool, GateError> {
         let Some(mtp) = m.body(WHAT)?.mtp() else {
             return Err("the load opened no next-token layer".into());
         };
@@ -212,39 +310,37 @@ mod gate {
         let Mixer::Gqa(g) = &draft.layer.mixer else {
             return Err("the in-file draft's mixer is not full attention".into());
         };
-        // [derived] A bf16 tensor is decoded to f32 on the card
-        // (`DevWeight::F32`): two bytes a value become four; every other
-        // type is resident as the file stores it. The embedding and the head
-        // are the target's and carry no layer index.
-        let (mut own, mut widened) = (0u64, 0u64);
-        for t in read
-            .tensors
-            .tensors
-            .iter()
-            .filter(|t| t.layer == Some(mtp.index()))
-        {
-            if t.ty == GgmlType::BF16 {
-                let wide = 4 * t.dims.iter().product::<u64>();
-                widened += wide - t.file_bytes;
-                own += wide;
-            } else {
-                own += t.file_bytes;
-            }
-        }
+        // [derived] The layer's card weights are the tail block's tensors
+        // as the file stores them, a bf16 one widened to f32
+        // (`DevWeight::F32`): the one derivation the serve seat's whole-fit
+        // verdict prices the draft with (`mtp::weight_bytes`). The embedding
+        // and the head are the target's and carry no layer index.
+        let own = weight_bytes(&read.tensors.tensors, mtp.index());
+        let widened = own
+            - read
+                .tensors
+                .tensors
+                .iter()
+                .filter(|t| t.layer == Some(mtp.index()))
+                .map(|t| t.file_bytes)
+                .sum::<u64>();
         let kv = dense_kv_bytes(g.kv_heads as usize, g.head_dim as usize, CTX);
-        let stream = (HIDDEN * 4) as u64;
+        let stream = (p.hidden * 4) as u64;
         let want = own + stream + kv;
         let got = mtp.resident_bytes() as u64;
-        let bytes_ok = got == want;
+        // The verdict's reserve for the step beside the layer's own bytes
+        // (`mtp::STEP_BYTES`) holds the engine's scratch.
+        let scratch = mtp.scratch_bytes() as u64;
+        let bytes_ok = got == want && scratch <= STEP_BYTES;
         println!(
             "(d) draft resident {got} = derived {want} ({}): layer {own} (bf16 widened \
-             {widened}) + stream {stream} + K/V {kv}; weights {}; step scratch {} {}",
+             {widened}) + stream {stream} + K/V {kv}; weights {}; step scratch {scratch} within \
+             the verdict's {STEP_BYTES} {}",
             got as i64 - want as i64,
             mtp.weights().resident_bytes(),
-            mtp.scratch_bytes(),
             verdict(bytes_ok)
         );
-        let mut ok = bytes_ok && widened > 0;
+        let mut ok = bytes_ok && (widened > 0 || !p.widened);
         for b in mtp.borrowed_planes() {
             let target = m.weights().get(&b.name).and_then(addresses);
             let same = target == Some(b.planes);
@@ -312,10 +408,9 @@ mod gate {
     }
 
     /// One launch of the join over `e` and `h` (`streams` streams of
-    /// [`HIDDEN`]) at `streams`: the pack, or the launch's error.
+    /// `hidden`) at `streams`: the pack, or the launch's error.
     fn join(
-        gpu: &Gpu,
-        k: &MtpKernels,
+        (gpu, k, hidden): (&Gpu, &MtpKernels, usize),
         (e, h): (&[f32], &[f32]),
         (enorm, hnorm): (&[f32], &[f32]),
         streams: usize,
@@ -325,7 +420,7 @@ mod gate {
         let hb = DeviceBuffer::from_host(stream, h)?;
         let en = DeviceBuffer::from_host(stream, enorm)?;
         let hn = DeviceBuffer::from_host(stream, hnorm)?;
-        let mut out = DeviceBuffer::<f32>::zeroed(stream, 2 * 4 * HIDDEN)?;
+        let mut out = DeviceBuffer::<f32>::zeroed(stream, 2 * 4 * hidden)?;
         k.enqueue_mtp_input(
             stream,
             MtpInputArgs {
@@ -333,7 +428,7 @@ mod gate {
                 h: &hb,
                 enorm: &en,
                 hnorm: &hn,
-                hidden: HIDDEN,
+                hidden,
                 eps: 1e-6,
                 m: 1,
                 streams,
@@ -346,19 +441,20 @@ mod gate {
 
     /// (j): the join at one stream against the host, the four-stream pack's
     /// embedding half against the one-stream pack, and the refused counts.
-    fn join_clause(gpu: &Gpu) -> Result<bool, GateError> {
+    fn join_clause(gpu: &Gpu, hidden: usize) -> Result<bool, GateError> {
         let k = MtpKernels::load(gpu.context())?;
-        let (e, enorm) = (values(HIDDEN, 1, 3.0), values(HIDDEN, 2, 1.0));
-        let (h4, hnorm4) = (values(4 * HIDDEN, 3, 5.0), values(4 * HIDDEN, 4, 1.0));
-        let one = join(gpu, &k, (&e, &h4[..HIDDEN]), (&enorm, &hnorm4[..HIDDEN]), 1)?;
+        let at = (gpu, &k, hidden);
+        let (e, enorm) = (values(hidden, 1, 3.0), values(hidden, 2, 1.0));
+        let (h4, hnorm4) = (values(4 * hidden, 3, 5.0), values(4 * hidden, 4, 1.0));
+        let one = join(at, (&e, &h4[..hidden]), (&enorm, &hnorm4[..hidden]), 1)?;
         // [derived] A value is `x · r · γ`: r goes through the thread's
-        // `HIDDEN/256` fused terms, the butterfly's five adds and the eight
+        // `hidden/256` fused terms, the butterfly's five adds and the eight
         // warps' seven, 20 roundings in the sum, half of them in r, then the
         // add of eps, the root, the reciprocal, and the two products.
-        let band = 0.5 * gamma(HIDDEN / 256 + 5 + 7) + 5.0 * U;
+        let band = 0.5 * gamma(hidden / 256 + 5 + 7) + 5.0 * U;
         let (re, rh) = (
             rms_ref(&e, &enorm, 1e-6),
-            rms_ref(&h4[..HIDDEN], &hnorm4[..HIDDEN], 1e-6),
+            rms_ref(&h4[..hidden], &hnorm4[..hidden], 1e-6),
         );
         let worst = |got: &[f32], want: &[f64]| {
             got.iter()
@@ -367,19 +463,19 @@ mod gate {
                 .fold(0.0f64, f64::max)
         };
         let (we, wh) = (
-            worst(&one[..HIDDEN], &re),
-            worst(&one[HIDDEN..2 * HIDDEN], &rh),
+            worst(&one[..hidden], &re),
+            worst(&one[hidden..2 * hidden], &rh),
         );
-        let one_ok = one[..2 * HIDDEN].iter().all(|v| v.is_finite()) && we <= band && wh <= band;
+        let one_ok = one[..2 * hidden].iter().all(|v| v.is_finite()) && we <= band && wh <= band;
         println!(
             "(j) one stream: e half worst {we:.3e}, h half {wh:.3e} of band {band:.3e} {}",
             verdict(one_ok)
         );
-        let four = join(gpu, &k, (&e, &h4), (&enorm, &hnorm4), 4)?;
+        let four = join(at, (&e, &h4), (&enorm, &hnorm4), 4)?;
         let slots_ok = (0..4).all(|s| {
-            four[s * 2 * HIDDEN..s * 2 * HIDDEN + HIDDEN]
+            four[s * 2 * hidden..s * 2 * hidden + hidden]
                 .iter()
-                .zip(&one[..HIDDEN])
+                .zip(&one[..hidden])
                 .all(|(a, b)| a.to_bits() == b.to_bits())
         });
         println!(
@@ -389,7 +485,7 @@ mod gate {
         );
         let mut refused = true;
         for streams in [0usize, 2, 3, 5] {
-            let r = join(gpu, &k, (&e, &h4), (&enorm, &hnorm4), streams)
+            let r = join(at, (&e, &h4), (&enorm, &hnorm4), streams)
                 .err()
                 .map(|e| e.to_string());
             let named = r
@@ -432,10 +528,11 @@ mod gate {
     /// `i + 1`, position `i`, the target's row `rows[i]`.
     fn draft_run(m: &mut Qwen35moeModel, ids: &[u32], rows: &[f32]) -> Result<Run, GateError> {
         let stream = m.gpu().stream_handle();
-        let mut h = DeviceBuffer::<f32>::zeroed(&stream, HIDDEN)?;
+        let hidden = hidden_of(m)?;
+        let mut h = DeviceBuffer::<f32>::zeroed(&stream, hidden)?;
         let (mut drafted, mut argmax_ok, mut logits) = (Vec::new(), 0, Vec::new());
         for i in 0..ids.len() - 1 {
-            h.copy_from_host(&stream, &rows[i * HIDDEN..(i + 1) * HIDDEN])?;
+            h.copy_from_host(&stream, &rows[i * hidden..(i + 1) * hidden])?;
             let token = m.mtp_draft(ids[i + 1], i, &h)?;
             logits = draft_logits(m)?;
             let at = super::e2e::argmax(&logits) as usize;
@@ -458,7 +555,11 @@ mod gate {
     }
 
     /// (h) and (s) on the run, and (r) after it.
-    fn step_clauses(m: &mut Qwen35moeModel, ids: &[u32]) -> Result<bool, GateError> {
+    fn step_clauses(
+        m: &mut Qwen35moeModel,
+        ids: &[u32],
+        agree: Option<usize>,
+    ) -> Result<bool, GateError> {
         let (next, rows) = target_run(m, ids)?;
         let run = draft_run(m, ids, &rows)?;
         let steps = run.drafted.len();
@@ -490,6 +591,13 @@ mod gate {
             100.0 * FLOOR,
             verdict(wired)
         );
+        let agreed = agree.is_none_or(|n| all >= n);
+        if let Some(n) = agree {
+            println!(
+                "(s) the draft agrees with the target at {all}/{steps} positions; pin {n} {}",
+                verdict(agreed)
+            );
+        }
         let at = super::e2e::argmax(&run.logits) as usize;
         println!(
             "(s) the last draft step's largest logit {:.6} at token {}",
@@ -497,7 +605,7 @@ mod gate {
         );
         let r_ok = refusals(m, ids, &rows, run.drafted[steps - 1])?;
         let w_ok = store_clause(m, ids, &rows, &run)?;
-        Ok(h_ok && r_ok && wired && w_ok)
+        Ok(h_ok && r_ok && wired && agreed && w_ok)
     }
 
     /// The draft's step `t` at position `pos` over the host row `row`, and its
@@ -508,7 +616,7 @@ mod gate {
         row: &[f32],
     ) -> Result<(u32, Vec<f32>), GateError> {
         let stream = m.gpu().stream_handle();
-        let mut h = DeviceBuffer::<f32>::zeroed(&stream, HIDDEN)?;
+        let mut h = DeviceBuffer::<f32>::zeroed(&stream, hidden_of(m)?)?;
         h.copy_from_host(&stream, row)?;
         let token = m.mtp_draft(t, pos, &h)?;
         Ok((token, draft_logits(m)?))
@@ -547,7 +655,8 @@ mod gate {
         rows: &[f32],
         last: usize,
     ) -> Result<(), GateError> {
-        let row = |i: usize| &rows[i * HIDDEN..(i + 1) * HIDDEN];
+        let hidden = hidden_of(m)?;
+        let row = |i: usize| &rows[i * hidden..(i + 1) * hidden];
         for i in 0..last {
             host_step(m, (ids[i + 2], i), row(i + 1))?;
         }
@@ -561,12 +670,13 @@ mod gate {
         rows: &[f32],
         (last, run): (usize, usize),
     ) -> Result<(), GateError> {
+        let hidden = hidden_of(m)?;
         for pos0 in (0..last).step_by(run) {
             let end = (pos0 + run).min(last);
             let feed = Feed {
                 tokens: &ids[pos0 + 1..end + 1],
                 pos0: u32::try_from(pos0)?,
-                hidden: Hidden::Host(&rows[pos0 * HIDDEN..end * HIDDEN]),
+                hidden: Hidden::Host(&rows[pos0 * hidden..end * hidden]),
                 media: None,
             };
             mtp_walk(m, feed, DraftHead::Full, WalkMode::Store)?;
@@ -582,7 +692,8 @@ mod gate {
         run: &Run,
     ) -> Result<bool, GateError> {
         let last = run.drafted.len() - 1;
-        let row = |i: usize| &rows[i * HIDDEN..(i + 1) * HIDDEN];
+        let hidden = hidden_of(m)?;
+        let row = |i: usize| &rows[i * hidden..(i + 1) * hidden];
         let peak_bits = |l: &[f32]| {
             let at = super::e2e::argmax(l) as usize;
             (at, l[at].to_bits())
@@ -670,9 +781,10 @@ mod gate {
     ) -> Result<bool, GateError> {
         let stream = m.gpu().stream_handle();
         let i = ids.len() - 2;
-        let mut h = DeviceBuffer::<f32>::zeroed(&stream, HIDDEN)?;
-        h.copy_from_host(&stream, &rows[i * HIDDEN..(i + 1) * HIDDEN])?;
-        let short = DeviceBuffer::<f32>::zeroed(&stream, HIDDEN - 1)?;
+        let hidden = hidden_of(m)?;
+        let mut h = DeviceBuffer::<f32>::zeroed(&stream, hidden)?;
+        h.copy_from_host(&stream, &rows[i * hidden..(i + 1) * hidden])?;
+        let short = DeviceBuffer::<f32>::zeroed(&stream, hidden - 1)?;
         let vocab = m.n_vocab()?;
         let mut ok = true;
         let cases: [(&str, Result<u32, GpuError>, &str); 3] = [
@@ -725,19 +837,36 @@ mod gate {
         Ok(ok)
     }
 
-    pub fn run() -> Result<(), GateError> {
-        let mut ok = refusals_at_open()?;
-        let file = pinned()?;
-        let ids = prose_ids("qwen4exp", PROMPT)?;
-        let mut m = open_at(opts(false), file)?;
+    /// Every clause on one pinned file, one load.
+    fn clauses(p: &Pin) -> Result<bool, GateError> {
+        let mut ok = refusals_at_open(p)?;
+        let ids = prose_ids(p.prose, PROMPT)?;
+        let mut m = open_at(opts(false, p.mma), pinned(p)?)?;
         println!(
-            "load: resident_bytes={} ctx={CTX} ubatch={UBATCH} prompt={PROMPT}",
-            m.resident_bytes()
+            "load {}: resident_bytes={} ctx={CTX} ubatch={UBATCH} prompt={PROMPT} hidden={}",
+            p.arch,
+            m.resident_bytes(),
+            p.hidden
         );
-        let file = pinned()?;
-        ok &= load_clause(&m, &file)?;
-        ok &= join_clause(m.gpu())?;
-        ok &= step_clauses(&mut m, &ids)?;
+        if hidden_of(&m)? != p.hidden {
+            return Err(format!(
+                "the draft's hidden row is {} values, the pin says {}",
+                hidden_of(&m)?,
+                p.hidden
+            )
+            .into());
+        }
+        ok &= load_clause(&m, &pinned(p)?, p)?;
+        ok &= join_clause(m.gpu(), p.hidden)?;
+        ok &= step_clauses(&mut m, &ids, p.agree)?;
+        println!("{WHAT} {}: {}", p.arch, verdict(ok));
+        Ok(ok)
+    }
+
+    pub fn run() -> Result<(), GateError> {
+        let moe = clauses(&MOE)?;
+        let dense = clauses(&DENSE)?;
+        let ok = moe && dense;
         println!("{WHAT}: {}", verdict(ok));
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

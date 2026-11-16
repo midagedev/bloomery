@@ -187,7 +187,8 @@ fn the_real_27b_headers_plan_the_gguf_files_trunk() {
 /// `block_count` and names it in `nextn_predict_layers`), and the file reader's [`ModelSpec`] of
 /// the two headers, tensors and keys alone, is the same: the layers, the full-attention interval
 /// of 4, the 24, 4 and 256 heads, the delta rule's 16 key and 48 value heads of 128, the width
-/// 17408 of every dense block, the vocabulary and the rope.
+/// 17408 of every dense block, the vocabulary and the rope. The file's spec holds its one
+/// next-token layer as its draft; the folder's holds none.
 #[test]
 fn the_real_27b_header_reads_as_the_gguf_files_model_spec() {
     let config = json(CONFIG_38);
@@ -262,7 +263,15 @@ fn the_real_27b_header_reads_as_the_gguf_files_model_spec() {
     );
 
     let folder_spec = model::arch::spec(&folder_split).unwrap().spec;
-    let file_spec = model::arch::spec(&file_split).unwrap().spec;
+    let mut file_spec = model::arch::spec(&file_split).unwrap().spec;
+    // The file's next-token layer is its draft's, which this converter leaves out (the
+    // header above drops `nextn_predict_layers` and the 65th block the same way).
+    assert_eq!(file_spec.mtp.len(), 1, "the file's next-token layer");
+    assert!(
+        folder_spec.mtp.is_empty(),
+        "the folder's spec holds no draft layer"
+    );
+    file_spec.mtp.clear();
     assert_eq!(folder_spec.arch, model::arch::models::Arch::Qwen35);
     assert_eq!(folder_spec.layers.len(), 64);
     assert_eq!(folder_spec, file_spec);

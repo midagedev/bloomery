@@ -216,6 +216,51 @@ fn hw_qwen35_dense_chat() {
     );
 }
 
+/// The dense file's in-file next-token layer: the 27B's `blk.64` is full attention with the
+/// trunk's shapes, a dense SwiGLU block of the trunk's width and the join's four stems, which the
+/// description carries in `mtp` as the layer the trunk's last attention block is. Headers only.
+#[test]
+#[ignore = "needs the Qwen3.8-27B file on the box (just gate-qwen35moe-meta)"]
+fn hw_qwen35_dense_nextn_draft() {
+    use model::arch::models::{Ffn, Mixer, MtpHeadNorm, MtpInput, MtpSource, OutGate, Residual};
+    use model::arch::qwen35moe::mtp::{self, InFile};
+
+    let split = Split::open(DENSE_27B).unwrap_or_else(|e| panic!("open {DENSE_27B}: {e}"));
+    let read = model::arch::spec(&split).unwrap_or_else(|e| panic!("spec of {DENSE_27B}: {e}"));
+    let InFile::Draft(draft) = mtp::in_file(&split).unwrap_or_else(|e| panic!("in_file: {e}"))
+    else {
+        panic!("the 27B's tail is not a draft");
+    };
+    assert_eq!(read.spec.layers.len(), 64, "the trunk gained a layer");
+    assert_eq!(read.spec.mtp.as_slice(), std::slice::from_ref(&draft.layer));
+    assert!(matches!(draft.source, MtpSource::InFile { layer: 64 }));
+    assert_eq!(draft.index, 64);
+    assert_eq!(draft.input, MtpInput::HeadRow);
+    assert_eq!(draft.head_norm, MtpHeadNorm::Rms);
+    assert!(draft.hc.is_none());
+    assert_eq!(draft.layer.residual, Residual::Plain);
+    let Mixer::Gqa(g) = &draft.layer.mixer else {
+        panic!("the 27B's tail mixer {:?}", draft.layer.mixer);
+    };
+    assert!(g.out_gate == OutGate::Packed && g.qk_norm && g.select.is_none());
+    assert!(
+        matches!(draft.layer.ffn, Ffn::Dense { ff: 17408, .. }),
+        "the 27B's tail feed-forward {:?}",
+        draft.layer.ffn
+    );
+    assert_eq!(
+        draft.layer, read.spec.layers[63],
+        "the draft layer is the trunk's last attention layer, shape for shape"
+    );
+    assert_eq!((draft.hidden, draft.vocab), (5120, 248_320));
+    assert_eq!((g.heads, g.kv_heads, g.head_dim), (24, 4, 256));
+    println!(
+        "27B draft index {} mtp {}",
+        draft.index,
+        read.spec.mtp.len()
+    );
+}
+
 /// The in-file next-token layer on the three headers this round describes.
 /// A1 carries one shaped draft, A2 declares the layer and stores no tensor,
 /// A4 has no key. Headers only.

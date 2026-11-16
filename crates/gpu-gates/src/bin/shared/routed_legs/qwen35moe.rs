@@ -50,6 +50,7 @@ fn serve_arm(split: &Split) -> Result<Arm, Outcome> {
         kv: KvQ8::F16,
         media: false,
         beside: bloomery_gpu_gates::beside::Beside::default(),
+        draft: false,
         ubatch: None,
     };
     let total = floor_or(

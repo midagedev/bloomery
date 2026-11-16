@@ -635,7 +635,19 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               the n-gram lookup draft on the same whole-card verifying load, one context a \
               slot, while `dspark` on a qwen3moe file and on a placed load, `lookup` on a \
               qwen3moe file and on a placed load, and several slots under `dspark` are refused \
-              by name, and the seat (not the CLI) takes `off` as the plain path; \
+              by name, and the seat (not the CLI) takes `off` as the plain path; on the same \
+              seat `mtp` serves the file's own next-token layer (`blk.N`, `N` the trunk's layer \
+              count: full attention with the trunk's shapes and the trunk's feed-forward kind, \
+              the routed experts and shared expert of a qwen35moe file or the dense block of a \
+              qwen35 one) through a two-row window on a whole-card load of one slot, refused by \
+              name beside media, a placed load, several slots, a store too short for one window \
+              and a file with no usable layer (stripped, absent, unshaped, a dense tail with no \
+              feed-forward tensor, or a tail the reader refuses by tensor), never served plain \
+              with a record; unset drafts it under the same conditions (`--place a`, no route \
+              trace, one slot, a window that fits `--ctx`) and runs the plain path otherwise, \
+              the `load draft=off (<why>)` record naming why; a dense file's whole-fit verdict \
+              counts the layer's card bytes as a reserve, so its default context is the one the \
+              load opens with the layer; \
               `generate_qwen3moe` on a \
               qwen35moe file: `dspark` serves the HF DSpark draft (`$BLOOMERY_DSPARK_MODEL`) \
               on a whole-card load of one slot, while `lookup`, `dspark` on a qwen3moe file and \
@@ -2145,6 +2157,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "Mac side, the tool profile a box command runs under (`tools/ref/models/`), which \
          `tools/box.sh` reads and does not export; on the box, the model crate's test \
          harnesses read it as a model file's path.",
+    ),
+    path(
+        "BLOOMERY_MTP_DENSE_MODEL",
+        None,
+        "The Qwen3.8-27B file that carries the dense model's next-token layer \
+         (`Q4_K_M`), which `gate_qwen35moe_mtp` opens after the Qwen3.6 file and pins by its \
+         architecture and size; the gate refuses to run without it (the recipe gives the \
+         qwen38d profile's file).",
     ),
     path(
         "BLOOMERY_MTP_MODEL",

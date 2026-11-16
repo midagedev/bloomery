@@ -39,6 +39,7 @@ impl Adapter for Row {
             kv: KvQ8::F16,
             media: false,
             beside: bloomery_gpu_gates::beside::Beside::default(),
+            draft: false,
             ubatch: None,
         };
         let serve = floor_or(
