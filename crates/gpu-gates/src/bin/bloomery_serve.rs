@@ -537,6 +537,16 @@ models (the --model word is optional with a model file: the file's architecture 
         gpu_census::census().is_ok_and(|census| !census.is_empty())
     }
 
+    /// Where the file [`ref_model_path`] opened was named: a flag on the command line, or the
+    /// variable a start with no model flag falls back to, so a refusal about the file says which.
+    fn file_source() -> &'static str {
+        if model_file::model_file().is_some() {
+            "named on the command line"
+        } else {
+            "from $BLOOMERY_REF_MODEL"
+        }
+    }
+
     /// The seat the model file's ([`ref_model_path`]) first shard holds: the one
     /// generative seat that serves the file ([`Model::serves`]). A file of a decision
     /// row's backbone (`qwen35`, Clef's) here has no head: a generative seat
@@ -631,8 +641,10 @@ models (the --model word is optional with a model file: the file's architecture 
                         return Err(Refusal::new(
                             Code::Usage,
                             format!(
-                                "--model {} on a {a} file, which serves --model {}",
+                                "--model {} on {} ({}), a {a} file, which serves --model {}",
                                 word.word(),
+                                path.display(),
+                                file_source(),
                                 seat.word()
                             ),
                         )

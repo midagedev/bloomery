@@ -153,7 +153,8 @@ pub fn set_model_file(path: PathBuf) -> Result<(), GateError> {
 }
 
 /// The model file a server set, if one.
-pub(crate) fn model_file() -> Option<&'static PathBuf> {
+#[must_use]
+pub fn model_file() -> Option<&'static PathBuf> {
     MODEL_FILE.get()
 }
 
