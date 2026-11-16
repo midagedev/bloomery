@@ -14,14 +14,25 @@ pub(super) static MODELS: &[Model] = &[
         arch: "deepseek41",
         rows: &[
             Row {
+                variant: "bq3km",
+                kind: Kind::Gguf,
+                repo: "midagedev/DeepSeek-V4.1-Flash-1017-GGUF",
+                revision: "480bb14b8d9a18310d7b760de607d32e0c1c1ee7",
+                format: Format::Gguf3,
+                bytes: Some(347_428_899_424),
+                status: Status::Verified {
+                    evidence: "README Use table and docs/models.md recommend this file (bloomery-quantize with the engine's imatrix: lower KLD than the Q3_K_M on English, Korean and code at the same speed, docs/cards/bq3km-ship.card); revision and size from the hub listing",
+                },
+            },
+            Row {
                 variant: "Q3_K_M",
                 kind: Kind::Gguf,
                 repo: "vcruz305/DeepSeek-V4.1-Flash-GGUF",
                 revision: "c4a085541cb53f67ee5e57b63d255e80cef286e7",
                 format: Format::Gguf3,
                 bytes: Some(347_271_472_288),
-                status: Status::Verified {
-                    evidence: "README Use table and docs/models.md recommend this file; revision and size from tools/census/stubs.tsv",
+                status: Status::Unverified {
+                    why: "explicit only: the previous default, the reference sets' file; revision and size from tools/census/stubs.tsv",
                 },
             },
             Row {

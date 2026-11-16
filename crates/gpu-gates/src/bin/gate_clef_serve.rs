@@ -247,10 +247,11 @@ mod gate {
     ///
     /// PIN(2026-10-10): a seventh row, the mimo2 seat's, joins the table.
     /// PIN(2026-10-15): an eighth row, the nemotron seat's, joins the table.
+    /// PIN(2026-11-16): the ds41 row's example is the catalog's new default file, midagedev's bq3km.
     const MODELS_LINES: [&str; 8] = [
         "models (the --model word is optional with a model file: the file's architecture picks \
          the seat)",
-        "ds41    DeepSeek-V4.1-Flash          --hf vcruz305/DeepSeek-V4.1-Flash-GGUF:Q3_K_M",
+        "ds41    DeepSeek-V4.1-Flash          --hf midagedev/DeepSeek-V4.1-Flash-1017-GGUF:bq3km",
         "qwen38  Qwen3.8-Flash-Next           --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL",
         "glm     GLM-5.3-Flash                --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL",
         "qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M",

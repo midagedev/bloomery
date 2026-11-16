@@ -4,7 +4,7 @@
 
 | Model | Recommended file | How it runs |
 |---|---|---|
-| DeepSeek-V4.1-Flash | [`Q3_K_M`](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF) (vcruz305) | GPU + CPU experts; 256 GB of RAM, or less with the NVMe expert tier |
+| DeepSeek-V4.1-Flash | [`bq3km`](https://huggingface.co/midagedev/DeepSeek-V4.1-Flash-1017-GGUF) (midagedev: a Q3_K_M layout made with bloomery's own imatrix, closer to the reference than vcruz305's `Q3_K_M` at the same speed) | GPU + CPU experts; 256 GB of RAM, or less with the NVMe expert tier |
 | GLM-5.3-Flash | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (unsloth) | GPU + CPU experts (the NVMe expert tier where RAM falls short; on an integrated GPU the card computes the tier's experts at decode); sparse attention past 2,051 positions |
 | Qwen3.8-Flash-Next | [`UD-Q4_K_XL`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (unsloth) | GPU + CPU experts (the NVMe expert tier where RAM falls short) |
 | MiMo-V2.6-Flash | [`MXFP4`](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-MOPD-GGUF) (ggml-org); the RL release's [`MXFP4`](https://huggingface.co/ggml-org/MiMo-V2.6-Flash-RL-GGUF) runs the same way | GPU + CPU experts; the hot routed experts sit on the card |
@@ -59,7 +59,7 @@ section. NVMe is recommended: a load streams the file to the card, and V4.1 read
 | Qwen3.8-Flash-Next | 24 GB recommended (the expert share sizes to the card's free bytes); a 96 GB card holds every routed expert at a 4k context, and a second card adds none | 128 GB beside a 24 or 48 GB card, 64 GB beside a 96 GB card (about 101, 75 and 34 GB free, plus adaptive residency's pool where the host has it) | 111.3 GB, plus the 2.8 GB MTP draft |
 | GLM-5.3-Flash | 24 GB recommended | 256 GB to hold every routed expert; less pages the rest from NVMe | 199.7 GB |
 | MiMo-V2.6-Flash | the dense layers, attention and KV cache, plus the routed experts the card has room for (the plan sizes the share to the card) | the routed experts the card does not hold; with none on the card, about 161 GB (the 0.2.10 figure) | the file on the repo page |
-| DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB to hold every routed expert; less pages the rest from NVMe | 347.3 GB (a source build can add a 155.7 GB r8 sidecar; the release does not use one) |
+| DeepSeek-V4.1-Flash | 24 GB recommended | 256 GB to hold every routed expert; less pages the rest from NVMe | 347.4 GB (a source build can add a 155.7 GB r8 sidecar; the release does not use one) |
 | MiniMax-M3.1-Flash (NVFP4 folder) | RTX A6000 + RTX 3090 at `bp`, ctx 16,384: 1,063 routed experts on the A6000 and 726 on the 3090 tier, beside the dense layers, attention and KV cache | the routed experts neither card holds (5,507 on that plan) | 250.1 GB (48 shards) |
 | Muse Spark Open 816B-A42B `UD-IQ2_XXS` | RTX A6000 + RTX 3090 at `bp`, ctx 16,384: 1,900 routed experts on the A6000 plus the 3090 tier, beside the dense layers, attention and KV cache | the routed experts neither card holds (12,209 on that plan) | 210.1 GiB (six shards) |
 | MiniMax-M3 `UD-IQ4_XS` | the dense layers, the attention and the KV cache, plus the routed experts the card has room for (662 of them on the RTX A6000 plan at ctx 131,072) | the routed experts the card does not hold (6,634 of them on that plan) | 208.5 GB (six shards) |
