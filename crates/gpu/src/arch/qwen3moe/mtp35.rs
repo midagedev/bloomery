@@ -24,7 +24,10 @@
 //! router, the routed and the shared experts are the trunk's launches; the
 //! head is [`Head`] with the draft's gain over the target's own `output`
 //! buffer, read where it sits. A step is eager and enqueues the same stream
-//! as the target.
+//! as the target. A walk of several rows (a window's refresh) runs every row's
+//! layer and the head on its last row alone: a later row reads an earlier row's
+//! keys and values and never its output, and the walk's readback is its last
+//! row's token and logits.
 //!
 //! The draft's K/V rows are its own: a step at position `p` appends row `p`
 //! and attends rows `0..=p`, so a caller that wants the layer's attention to
@@ -495,6 +498,22 @@ impl Mtp35 {
         &mut self,
         gpu: &Gpu,
         target: &Weights,
+        kernels: (&Kernels, &DeviceBuffer<f32>, bool),
+        feed: (u32, usize),
+        h: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_layer(gpu, target, kernels, feed, h)?;
+        self.enqueue_head(gpu, target)
+    }
+
+    /// [`Mtp35::enqueue`] without the head: the join, `eh_proj` and the layer
+    /// at `pos`, whose output stays in the head's input row and whose K/V row
+    /// `pos` is written. A later row reads that K/V row and nothing else of
+    /// this one.
+    fn enqueue_layer(
+        &mut self,
+        gpu: &Gpu,
+        target: &Weights,
         (k, table, mma): (&Kernels, &DeviceBuffer<f32>, bool),
         (t, pos): (u32, usize),
         h: &DeviceBuffer<f32>,
@@ -592,7 +611,13 @@ impl Mtp35 {
             m: 1,
             tail: Tail::Into(self.head.input_mut()),
         };
-        walk::layer(&mut layer, cx)?;
+        walk::layer(&mut layer, cx)
+    }
+
+    /// The head over the layer's output row: the draft's own norm, the
+    /// target's `output` projection and the argmax, whose token and logits
+    /// [`Mtp35::token`] and [`Mtp35::logits_to_host`] read.
+    fn enqueue_head(&mut self, gpu: &Gpu, target: &Weights) -> Result<(), GpuError> {
         self.head.enqueue_over(gpu, &self.w, target)
     }
 
@@ -602,21 +627,22 @@ impl Mtp35 {
         self.head.token(gpu)
     }
 
-    /// [`Mtp35::enqueue`] over the resident normed row. `enqueue` reads that
-    /// row and does not write it, and the row stays allocated for the call.
-    fn enqueue_held(
+    /// [`Mtp35::enqueue_layer`] over the resident normed row. `enqueue_layer`
+    /// reads that row and does not write it, and the row stays allocated for
+    /// the call.
+    fn enqueue_layer_held(
         &mut self,
         gpu: &Gpu,
         target: &Weights,
         kernels: (&Kernels, &DeviceBuffer<f32>, bool),
         feed: (u32, usize),
     ) -> Result<(), GpuError> {
-        // The pointer is taken before `enqueue` borrows `self`, so the two
-        // borrows of the row do not alias in the checker.
+        // The pointer is taken before `enqueue_layer` borrows `self`, so the
+        // two borrows of the row do not alias in the checker.
         let h = std::ptr::from_ref(&self.h_row);
-        // SAFETY: `enqueue` reads `h` and does not write `h_row`. `h_row`
-        // stays allocated.
-        self.enqueue(gpu, target, kernels, feed, unsafe { &*h })
+        // SAFETY: `enqueue_layer` reads `h` and does not write `h_row`.
+        // `h_row` stays allocated.
+        self.enqueue_layer(gpu, target, kernels, feed, unsafe { &*h })
     }
 }
 
@@ -1195,8 +1221,11 @@ fn walk_rows(
                     first,
                 } => norm_row(mtp, gpu, w, u, eps, first + i)?,
             }
-            mtp.enqueue_held(gpu, w, (k, table, mma), (t, pos))?;
+            mtp.enqueue_layer_held(gpu, w, (k, table, mma), (t, pos))?;
         }
+        // Only the last row's token and logits are read: every earlier row's
+        // output is dead once its keys and values are stored.
+        mtp.enqueue_head(gpu, w)?;
     }
     let n_u = u32::try_from(n)
         .map_err(|_| GpuError::shape(WHAT, format!("a walk of {n} rows passes u32")))?;

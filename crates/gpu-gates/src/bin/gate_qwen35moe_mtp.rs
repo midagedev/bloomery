@@ -61,7 +61,13 @@
 //!   alone). After two plain target steps, a chain at position 1 that reads
 //!   the target head's row on the card (`MtpArena::Step`) gives the token and
 //!   logits, bit for bit, of the same step over that row read back to the
-//!   host.
+//!   host, after a step at another position moved the head's outputs.
+//! - (c) a window's refresh of two rows through the chain (eager) runs the
+//!   head on its last row alone: its token and logits are, bit for bit, those
+//!   of the two steps in order, after a step at another position moved the
+//!   head's outputs. A head that did not run on the last row leaves those
+//!   outputs as they were, and one that ran on the first row leaves that
+//!   row's.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -184,6 +190,14 @@ mod gate {
     /// first walk's bits equal theirs only when a row's stored bits are its
     /// inputs' alone, not those of the walk it lands in.
     const RUN: usize = 3;
+
+    /// The position of (c)'s refresh's first row, which the draft's store holds the positions
+    /// below.
+    const REFRESH_AT: usize = 2;
+
+    /// The position of the step that moves the head's outputs before a chain of (w) and (c): past
+    /// every row those chains read, so it changes no key or value they attend.
+    const MOVE_AT: usize = 5;
 
     /// PIN(2026-11-04): a store walk's values against an eager walk's over the
     /// same rows, a position's row at a time. The store walk's projections
@@ -605,7 +619,8 @@ mod gate {
         );
         let r_ok = refusals(m, ids, &rows, run.drafted[steps - 1])?;
         let w_ok = store_clause(m, ids, &rows, &run)?;
-        Ok(h_ok && r_ok && wired && agreed && w_ok)
+        let c_ok = refresh_clause(m, ids, &rows)?;
+        Ok(h_ok && r_ok && wired && agreed && w_ok && c_ok)
     }
 
     /// The draft's step `t` at position `pos` over the host row `row`, and its
@@ -752,6 +767,8 @@ mod gate {
         m.step(&ids[1..2])?;
         let normed = m.head_normed()?;
         let (want, want_logits) = host_step(m, (ids[2], 1), &normed)?;
+        let moved_by = moved_logits(m, ids, rows, MOVE_AT)?;
+        let moves = !bits_equal(&moved_by, &want_logits);
         let mut out = [0u32; 1];
         let feed = Feed {
             tokens: &ids[2..3],
@@ -763,13 +780,62 @@ mod gate {
             media: None,
         };
         mtp_chain(m, feed, 0, DraftHead::Full, WalkMode::Eager, &mut out, None)?;
-        let on_card = out[0] == want && bits_equal(&draft_logits(m)?, &want_logits);
+        let on_card = moves && out[0] == want && bits_equal(&draft_logits(m)?, &want_logits);
         println!(
-            "(w) the step row on the card: token {} (read back: {want}), logits bit for bit {}",
+            "(w) the step row on the card, after a step at position {MOVE_AT} moved the logits \
+             {}: token {} (read back: {want}), logits bit for bit {}",
+            verdict(moves),
             out[0],
             verdict(on_card)
         );
         Ok(sensitive && kept && band_ok && alone && finite && on_card)
+    }
+
+    /// The logits of a step of (s)'s feed at position `p`: the head's outputs moved off those of
+    /// the step before, so a chain that leaves them alone reads stale ones.
+    fn moved_logits(
+        m: &mut Qwen35moeModel,
+        ids: &[u32],
+        rows: &[f32],
+        p: usize,
+    ) -> Result<Vec<f32>, GateError> {
+        let hidden = hidden_of(m)?;
+        Ok(host_step(m, (ids[p + 1], p), &rows[p * hidden..(p + 1) * hidden])?.1)
+    }
+
+    /// (c) on (s)'s feed: the two steps at positions [`REFRESH_AT`] and the next in order, then a
+    /// step at [`MOVE_AT`], then one chain whose refresh is those two rows.
+    fn refresh_clause(
+        m: &mut Qwen35moeModel,
+        ids: &[u32],
+        rows: &[f32],
+    ) -> Result<bool, GateError> {
+        let hidden = hidden_of(m)?;
+        let p = REFRESH_AT;
+        let row = |i: usize| &rows[i * hidden..(i + 1) * hidden];
+        // The store holds the positions below `p`, which the chain's first row may start at.
+        store_walks(m, ids, rows, (p, RUN))?;
+        host_step(m, (ids[p + 1], p), row(p))?;
+        let (want, want_logits) = host_step(m, (ids[p + 2], p + 1), row(p + 1))?;
+        let moved_by = moved_logits(m, ids, rows, MOVE_AT)?;
+        let moves = !bits_equal(&moved_by, &want_logits);
+        let mut out = [0u32; 1];
+        let feed = Feed {
+            tokens: &ids[p + 1..p + 3],
+            pos0: u32::try_from(p)?,
+            hidden: Hidden::Host(&rows[p * hidden..(p + 2) * hidden]),
+            media: None,
+        };
+        mtp_chain(m, feed, 0, DraftHead::Full, WalkMode::Eager, &mut out, None)?;
+        let ok = moves && out[0] == want && bits_equal(&draft_logits(m)?, &want_logits);
+        println!(
+            "(c) a refresh of two rows from position {p}, after a step at position {MOVE_AT} moved \
+             the logits {}: token {} (the second step's: {want}), logits bit for bit {}",
+            verdict(moves),
+            out[0],
+            verdict(ok)
+        );
+        Ok(ok)
     }
 
     /// (r): the refusals on the live draft, then the last step again.

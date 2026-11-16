@@ -1,0 +1,42 @@
+# Outcome (2026-11-16, A6000 300 W, depth-serve under the lease, 4 rounds, 16 servers, base 84c2315a6eb1 (main 1a0ea73cb),
+#  this tree 875a8a842289): decide-in. tg, the head on the refresh's last row against every row: D 512 49.39 -> 51.24
+#  tok/s, +3.75 % +- 0.58 %; D 4096 46.00 -> 47.39 tok/s, +3.01 % +- 0.77 %. The band's a = 0.864 point is +3.78 % at
+#  D 512 and +3.5 % at D 4096 [derived]: both inside the interval. pp holds 0 (+0.28 % +- 1.72, -0.18 % +- 1.36). Both
+#  trees' hooks read 57 accepted of 66 drafted (the change moves no token). No row cpu-busy, other-busy or cold. Next: the
+#  draft layer's unread half on the refresh rows before the last (~+0.8 % at a = 0.864 [derived]).
+# Derivation [derived]: the window refresh of the 27B's in-file MTP draft walks 1 + a rows, each through the draft layer
+# (263,313,408 B) and the target's Q6_K head (output.weight 1,042,944,000 B, and the logits 993,280 B written and read
+# again: 1.600 ms at 653 GB/s); only the last row's token is read, so the head runs on that row alone and a x 1.600 ms
+# leave each cycle (the walk reads the same layer rows as before: the keys and values every later row reads are written
+# as they were). Cycle T(a) = c_v(2) x s + (1 + a) x 2.0 ms with c_v(2) = 1.209 steps (q35ro) and s = 28.26 ms (the plain
+# 35.39 tok/s of the q35mtp card's outcome at depth 512); T'(a) = T(a) - 1.600 a. Ratio T / T':
+# a 0.60 -> +2.64 %, 0.72 -> +3.16 %, 0.80 -> +3.51 %, 0.864 (the counters the q35mtp sitting read at depth 4096) -> +3.78 %.
+# The same arithmetic at depth 4096, with that sitting's 45.94 tok/s mtp arm (a cycle of 40.57 ms at a = 0.864): +3.5 %.
+# Resources a cycle [derived]: card DRAM is the wall (verify 34.2 ms + draft 3.7 ms before, 2.3 ms after); the host issues
+# ~0.04 ms of launches a draft row and four fewer on a skipped row, under the card's time, PCIe < 0.01 ms, host DRAM and
+# NVMe idle. The head is 1.600 of a 37.9 ms cycle, a bytes term on a streaming gemv, not latency the warps hide.
+kind: ab
+question: does the 27B's drafted decode gain what the head's bytes say when the window's refresh runs the head on its last
+  row alone, at the same tokens?
+term: tok/s (timings.predicted_per_second) @ n=128, depth 512 prose, qwen38d bloomery-serve at its serving defaults,
+  BLOOMERY_DRAFT=mtp, this tree's binary against the base tree's (the same line without the change), RTX A6000; the
+  depth 4096 pair of the same call is a co-row
+unit: %
+predict: 2.6..3.8
+rounds: 4
+sd: 0.45 % q35mtp card outcome 2026-11-16, paired ratio of the mtp arm against off, 4 rounds, depth 512 (+-0.68 % at t = 3.18)
+condition: one lease, BLOOMERY_MODEL=qwen38d, two binaries of one line (the base tree's bloomery-serve built from this
+  tree's source minus mtp35.rs's change), both arms BLOOMERY_DRAFT=mtp, base listed first at each depth so the table prints
+  this tree against the base, order rotated every round; every arm's load prints draft=mtp, no row is [cpu-busy],
+  [other-busy] or [cold]; DEPTH_SERVE_AFTER on round 1 prints each arm group's llamacpp:spec_decode_num_draft_tokens_total
+  and _accepted_tokens_total, a = accepted / draft_tokens read from them lies in 0.60..0.90 and differs between the two
+  trees at one depth by under 0.03 (the change moves no token; q35mtp's serve pair read 0.719..0.735 across runs)
+decide-in: the head's bytes are what the cycle saves: keep the change, and the next term is the draft layer's own unread
+  half on the refresh rows before the last (its query, flash, output projection and feed-forward: ~0.35 ms a skipped row,
+  +0.8 % at a = 0.864 [derived], a store walk of those rows, whose keys and values are not bit-equal to the eager rows')
+decide-below: the head is not a streaming read at one row (below 2.6 %: nsys the draft's head launch, tools/ref/nsys-gpu.sh,
+  against its 1.60 ms) or the refresh's second row overlaps the head under it (then the lever is worth what the overlap
+  left and the base's draft time is shorter than 3.7 ms a cycle); with a under 0.60 the band moves to R(a), read it before
+  deciding
+decide-above: the head costs more than 1.60 ms at one row (its gemv at 653 GB/s is a floor, the 2 MB logits traffic and a
+  cache-cold launch add to it): re-fit the head's row from the two arms' difference, the change stays
