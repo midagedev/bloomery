@@ -45,7 +45,9 @@
 # pattern after the fact is the class of mistake above.
 #
 # Under tools/box.sh's local mode (BLOOMERY_BOX_CARD=local) root is the contributor's own tree, whose
-# binaries are their own runs, not a track's orphans: every mode but --self-test is refused (64).
+# binaries are their own runs, not a track's orphans: every mode but --self-test is refused (64). The box itself
+# (its lease file /root/bloomery-cpu.lock exists) also sees BLOOMERY_BOX_CARD=local once its environment file
+# declares its one card as the card in view (tools/box.sh): there box-gc is what it always was.
 set -uo pipefail
 
 # --self-test (the header): the selection rules on a fake /proc tree, no box, no signal.
@@ -116,7 +118,7 @@ case "${1:-}" in
     exit $? ;;
   -*) echo "box-gc: unknown flag $1 (use --dry-run, --check, --kill or --self-test)" >&2; exit 64 ;;
 esac
-if [ "${BLOOMERY_BOX_CARD:-}" = local ]; then
+if [ "${BLOOMERY_BOX_CARD:-}" = local ] && [ ! -e /root/bloomery-cpu.lock ]; then
   echo "box-gc: BLOOMERY_BOX_CARD=local is tools/box.sh's local mode, whose root is this machine's own tree: a binary under its target/ is a run of yours, not an orphan on the box; box-gc is the box's" >&2
   exit 64
 fi

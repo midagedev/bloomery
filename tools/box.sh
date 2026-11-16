@@ -947,6 +947,48 @@ failed-gate-held 42 1234 1 0 75
 failed-lease-held 42 - 0 1 75
 CASES
   done
+  # A machine with one card declares it in its environment file (BLOOMERY_BOX_CARD=local): a lane that names a card means the card in view,
+  # the pin is read against nvidia-smi's list, and the command sees BLOOMERY_BOX_CARD=local. Undeclared, a lane that names a card the machine
+  # does not list is a refusal (64) that names the list, never contention (75).
+  cat > "$d/stub/nvidia-smi" << 'STUB'
+#!/bin/sh
+case "$*" in
+  *--query-gpu=uuid\ *) printf 'GPU-5090\n' ;;
+  *--query-gpu=name,uuid*) printf 'NVIDIA GeForce RTX 5090, GPU-5090\n' ;;
+  *--query-gpu=uuid,name*) printf 'GPU-5090, NVIDIA GeForce RTX 5090\n' ;;
+  *--query-compute-apps=*) ;;
+  *) exit 64 ;;
+esac
+STUB
+  chmod +x "$d/stub/nvidia-smi"
+  mkdir -p "$d/tree/tools/ref"
+  cp "$(dirname "$0")/ref/cards.sh" "$d/tree/tools/ref/cards.sh"
+  printf 'export CUDA_VISIBLE_DEVICES=GPU-5090\n' > "$hs/bloomery-env.sh"
+  for card in a6000 both; do
+    rm -f "$d/launched"
+    call BLOOMERY_BOX_READONLY=1 BLOOMERY_REMOTE="$d/tree" BLOOMERY_CARD="$card" STUB_EXEC_REMOTE=1 -- 'printf "%s %s\n" "$CUDA_VISIBLE_DEVICES" "$BLOOMERY_BOX_CARD" > ../launched'
+    want 64 "undeclared one-card box, lane $card"
+    has "names $([ "$card" = a6000 ] && echo 'the A6000' || echo 'the A6000 and the 3090') and nvidia-smi lists no such card: NVIDIA GeForce RTX 5090, GPU-5090 " "undeclared one-card box, lane $card"
+    has 'declares it in its environment file (BLOOMERY_BOX_CARD=local)' "undeclared one-card box, lane $card says what to do"
+    [ ! -e "$d/launched" ] || fail "undeclared one-card box, lane $card: the refused command ran"
+  done
+  printf 'export CUDA_VISIBLE_DEVICES=GPU-5090 BLOOMERY_BOX_CARD=local\n' > "$hs/bloomery-env.sh"
+  for card in 3090 a6000; do
+    rm -f "$d/launched"
+    call BLOOMERY_BOX_READONLY=1 BLOOMERY_REMOTE="$d/tree" BLOOMERY_CARD="$card" STUB_EXEC_REMOTE=1 -- 'printf "%s %s\n" "$CUDA_VISIBLE_DEVICES" "$BLOOMERY_BOX_CARD" > ../launched'
+    want 0 "declared one-card box, lane $card"
+    [ "$(cat "$d/launched" 2> /dev/null)" = 'GPU-5090 local' ] || fail "declared one-card box, lane $card: the command saw '$(cat "$d/launched" 2> /dev/null)', not 'GPU-5090 local'"
+  done
+  rm -f "$d/launched"
+  call BLOOMERY_BOX_READONLY=1 BLOOMERY_REMOTE="$d/tree" BLOOMERY_CARD=both STUB_EXEC_REMOTE=1 -- 'printf "%s %s\n" "$CUDA_VISIBLE_DEVICES" "$BLOOMERY_BOX_CARD" > ../launched'
+  want 64 'declared one-card box, lane both'; has 'BLOOMERY_CARD=both runs on two or more cards in view, and this machine has 1 in view: GPU-5090' 'declared one-card box, lane both'
+  [ ! -e "$d/launched" ] || fail 'declared one-card box, lane both: the refused command ran'
+  # the pin check is part of every call that is not a read (and not a lane `none` job), and of no read
+  printf ':\n' > "$hs/bloomery-env.sh"
+  call -- 'echo hi'
+  want 0 'a call that is not a read'; grep -q -- 'cards_pin_check box.sh' "$d/ssh.log" || fail "a call that is not a read: no card pin check in the remote command: $(head -c 200 "$d/ssh.log")"
+  call BLOOMERY_BOX_READONLY=1 -- 'echo hi'
+  want 0 'a read'; ! grep -q -- 'cards_pin_check' "$d/ssh.log" || fail "a read: the remote command checks the card pin: $(head -c 200 "$d/ssh.log")"
   # A tree whose HEAD reads but whose status does not (a corrupt index): the call stops 70 naming the tree and Git's exit
   # code, and the command never reaches ssh — a commit whose dirt is unreadable is not one BLOOMERY_GIT_COMMIT gets to export.
   printf 'x' > "$d/tree/.git/index"
@@ -1250,16 +1292,28 @@ fi
 # 안전장치다.
 # 고른 값은 박스 쪽에 BLOOMERY_BOX_CARD로 넘어가고, tools/gpu-gate.sh가 그 카드의 게이트 락을 잡는다(both = 둘 다).
 # card_pick <card>: the remote text that picks that card (3090, a6000 or both); a card of another name is refused (64).
+# view_pick <card>: the remote text of a pick that names no card: the cards in view, and for `both` two or more of them.
+view_pick() {
+  if [ "$1" = both ]; then
+    printf %s "BLOOMERY_BOX_CARD=local . $DIR/tools/ref/cards.sh && cards_view && [ \"\$CARDS_VIEW_N\" -ge 2 ] || { echo \"box.sh: BLOOMERY_CARD=both runs on two or more cards in view, and \${CARDS_VIEW_WHY:-this machine has \$CARDS_VIEW_N in view: \$CARDS_VIEW}\" >&2; exit 64; }"
+  else
+    printf %s ":"
+  fi
+}
 card_pick() {
   case "$1" in
     3090) printf %s ":" ;;
-    a6000|both) printf %s '
+    a6000|both) printf %s 'if [ "${BLOOMERY_BOX_CARD:-}" = local ]; then '"$(view_pick "$1")"'; else
     A=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "A6000" | cut -d, -f1)
     T=$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader | grep "3090" | cut -d, -f1)
     # a6000 alone needs only its own UUID — the 3090 has fallen off the bus twice on 2026-09-22 and must not
     # take the healthy card down with it. both needs both.
-    [ -n "$A" ] || { echo "box.sh: A6000 lookup failed" >&2; exit 75; }
-    [ "'"$1"'" != both ] || [ -n "$T" ] || { echo "box.sh: 3090 lookup failed (both)" >&2; exit 75; }
+    L=$(nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>&1) && [ -n "$L" ] || { echo "box.sh: nvidia-smi lists no card ($L): the card lookup failed" >&2; exit 75; }
+    # nvidia-smi answers and has no such card: a lane that names a card the machine does not have never clears, so it is no contention
+    # (75, which a caller retries): a machine with one card says so in its environment file and a lane name means the card in view
+    M=; [ -n "$A" ] || M="the A6000"
+    [ "'"$1"'" != both ] || [ -n "$T" ] || M="${M:+$M and }the 3090"
+    [ -z "$M" ] || { echo "box.sh: BLOOMERY_CARD='"$1"' names $M and nvidia-smi lists no such card: $(printf %s "$L" | tr "\n" ";") — a machine with one card declares it in its environment file (BLOOMERY_BOX_CARD=local), and a lane name then means the card in view" >&2; exit 64; }
     if [ "$(systemctl is-active llm.service)" = active ]; then echo "box.sh: llm.service holds the A6000" >&2; exit 75; fi
     # A compute process on the A6000 while its gate lock or the timing lease is held is one of our runs: the
     # command goes on, and tools/gpu-gate.sh waits for the card lock inside its bound. One with both free is
@@ -1268,7 +1322,8 @@ card_pick() {
     if [ -n "$APPS" ] &&
        flock -s -n /root/bloomery-gate-a6000.lock true && flock -s -n /root/bloomery-cpu.lock true; then
       echo "box.sh: the A6000 has compute processes and neither its gate lock nor the timing lease is held (serving or training?) — not taking it" >&2; exit 75; fi
-    '"$( [ "$1" = both ] && echo 'export CUDA_VISIBLE_DEVICES="$T,$A"' || echo 'export CUDA_VISIBLE_DEVICES="$A"' )" ;;
+    '"$( [ "$1" = both ] && echo 'export CUDA_VISIBLE_DEVICES="$T,$A"' || echo 'export CUDA_VISIBLE_DEVICES="$A"' )"'
+    fi' ;;
     *) echo "box.sh: BLOOMERY_CARD must be 3090, a6000 or both" >&2; exit 64 ;;
   esac
 }
@@ -1291,12 +1346,11 @@ esac"
   BOXCARD='"$SIGNALBOX_CARD"'
 fi
 # Local mode names no card: the command runs on the cards in view (tools/ref/cards.sh's cards_view, read after the environment
-# file and BLOOMERY_BOX_ENV), and `both` asks that they be two or more.
+# file and BLOOMERY_BOX_ENV), and `both` asks that they be two or more. A box whose environment file declares
+# BLOOMERY_BOX_CARD=local (one card: the lane names 3090 and a6000 then mean the card in view) runs the same pick, read on the box after
+# the file is sourced, so no card's name is in this repository for it (view_pick, above).
 if [ "$LOCAL" = 1 ]; then
-  PICK=":" BOXCARD=local
-  if [ "$CARD" = both ]; then
-    PICK="BLOOMERY_BOX_CARD=local . $DIR/tools/ref/cards.sh && cards_view && [ \"\$CARDS_VIEW_N\" -ge 2 ] || { echo \"box.sh: BLOOMERY_CARD=both runs on two or more cards in view, and \${CARDS_VIEW_WHY:-this machine has \$CARDS_VIEW_N in view: \$CARDS_VIEW}\" >&2; exit 64; }"
-  fi
+  PICK=$(view_pick "$CARD") BOXCARD=local
 fi
 # The model the gates and GPU binaries open (BLOOMERY_REF_MODEL) is a property of the tool profile:
 # every command runs with it exported from tools/ref/ref-paths.sh, and an unknown profile stops the
@@ -1427,8 +1481,26 @@ if [ "$LOCAL" = 1 ]; then
 } && "
   PICK=:
 fi
+# A card pin that names no card this machine has is refused by name before the command runs (tools/ref/cards.sh's cards_pin_check), the
+# way the box's first friction met it: an environment file that still pinned a card since sold gave the command an empty device list, and
+# the server fell to the host engine without a word. The check runs after BLOOMERY_BOX_ENV, so it reads the pin the command gets, and it
+# names what set it: BLOOMERY_BOX_ENV, the environment file (a second source of it in a subshell: the pin it leaves), or the login
+# environment of the machine. A read (BLOOMERY_BOX_READONLY=1: nvidia-smi, box-gc, a cat of the file to fix) is not checked, and neither is a
+# queued job of lane `none`, which holds no card and pins none.
+PINCHK=
+if [ "$READONLY" = 0 ] && [ "$QLANE" != none ]; then
+  PINSRC="\$( ( unset CUDA_VISIBLE_DEVICES; . $ENVF > /dev/null 2>&1; [ -n \"\${CUDA_VISIBLE_DEVICES-}\" ] ) && echo 'the environment file $ENVF' || echo 'the login environment of the machine')"
+  for kv in ${box_env[@]+"${box_env[@]}"}; do
+    [ "${kv%%=*}" != CUDA_VISIBLE_DEVICES ] || PINSRC="BLOOMERY_BOX_ENV"
+  done
+  PINCHK="( BLOOMERY_BOX_CARD=local . $DIR/tools/ref/cards.sh && cards_pin_check box.sh \"$PINSRC\" ) && "
+fi
+# The environment file may declare the machine's cards as the cards in view (BLOOMERY_BOX_CARD=local): __cardmode reads that once the pick above
+# has run on it (the pick of a lane names no card then), and the command sees BLOOMERY_BOX_CARD=local, as in local mode, with the box's own
+# lock directory.
 REMOTE_CMD="source $ENVF && { $PICK
-} && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && $GATEX$OXIDE$ARCHX$ENVS$OXCHECK$LOCALX$*"
+__cardmode=\${BLOOMERY_BOX_CARD-}
+} && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && { [ \"\$__cardmode\" != local ] || export BLOOMERY_BOX_CARD=local; } && $GATEX$OXIDE$ARCHX$ENVS$PINCHK$OXCHECK$LOCALX$*"
 if [ "$LOCAL" = 1 ]; then
   # ssh carries no environment to the box: the command runs without what this side read, BLOOMERY_MODEL above all (the model
   # crate's tests read that name as a model path), without box.sh's own outputs, which only the profile sets, and without

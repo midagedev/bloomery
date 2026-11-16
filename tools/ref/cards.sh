@@ -32,21 +32,21 @@
 # as another card. A warning nvidia-smi prints beside its list is not a card.
 cards_view() {
   local out rc=0 e u hit listed=()
-  CARDS_VIEW='' CARDS_VIEW_N=0 CARDS_VIEW_WHY=''
+  CARDS_VIEW='' CARDS_VIEW_N=0 CARDS_VIEW_WHY='' CARDS_VIEW_KIND=''
   if command -v timeout > /dev/null; then
     out=$(timeout --kill-after=5 30 nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1) || rc=$?
   else
     out=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1) || rc=$?
   fi
   if [ "$rc" != 0 ]; then
-    CARDS_VIEW_WHY="nvidia-smi --query-gpu=uuid failed (rc $rc): ${out%%$'\n'*}"
+    CARDS_VIEW_WHY="nvidia-smi --query-gpu=uuid failed (rc $rc): ${out%%$'\n'*}" CARDS_VIEW_KIND=smi
     return 1
   fi
   while IFS= read -r e; do
     case $e in GPU-*) listed+=("$e") ;; esac
   done <<< "$out"
   if [ ${#listed[@]} = 0 ]; then
-    CARDS_VIEW_WHY='nvidia-smi --query-gpu=uuid lists no card'
+    CARDS_VIEW_WHY='nvidia-smi --query-gpu=uuid lists no card' CARDS_VIEW_KIND=smi
     return 1
   fi
   if [ -z "${CUDA_VISIBLE_DEVICES+x}" ]; then
@@ -55,12 +55,12 @@ cards_view() {
   fi
   local view=() ents=() n index=0 uuid=0
   if [[ $CUDA_VISIBLE_DEVICES == *$'\n'* ]]; then
-    CARDS_VIEW_WHY='CUDA_VISIBLE_DEVICES holds a newline: its entries are one line, split by commas'
+    CARDS_VIEW_WHY='CUDA_VISIBLE_DEVICES holds a newline: its entries are one line, split by commas' CARDS_VIEW_KIND=other
     return 1
   fi
   IFS=, read -r -a ents <<< "$CUDA_VISIBLE_DEVICES"
   if [ ${#ents[@]} = 0 ]; then
-    CARDS_VIEW_WHY='CUDA_VISIBLE_DEVICES is set and empty: no card is in view'
+    CARDS_VIEW_WHY='CUDA_VISIBLE_DEVICES is set and empty: no card is in view' CARDS_VIEW_KIND=other
     return 1
   fi
   # read drops the last empty field; keep it so a trailing comma is refused as an empty entry.
@@ -77,19 +77,48 @@ cards_view() {
     esac
     if [ "$n" != 1 ]; then
       CARDS_VIEW_WHY="CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES: '$e' names $([ "$n" = 0 ] && echo 'none' || echo "$n") of the cards nvidia-smi lists (${listed[*]})"
+      CARDS_VIEW_KIND=other
+      [ "$n" != 0 ] || CARDS_VIEW_KIND=gone
       return 1
     fi
     if [[ " ${view[*]-} " == *" $hit "* ]]; then
-      CARDS_VIEW_WHY="CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES: '$e' names $hit, already in view"
+      CARDS_VIEW_WHY="CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES: '$e' names $hit, already in view" CARDS_VIEW_KIND=other
       return 1
     fi
     view+=("$hit")
   done
   if [ "$index" = 1 ] && [ "${CUDA_DEVICE_ORDER:-}" != PCI_BUS_ID ] && { [ ${#view[@]} -lt ${#listed[@]} ] || [ "$uuid" = 1 ]; }; then
     CARDS_VIEW_WHY="CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES: an index picks among ${#listed[@]} cards in CUDA's order, fastest first unless CUDA_DEVICE_ORDER=PCI_BUS_ID, and nvidia-smi's list is by PCI bus: name the cards by UUID, or set CUDA_DEVICE_ORDER=PCI_BUS_ID"
+    CARDS_VIEW_KIND=other
     return 1
   fi
   CARDS_VIEW=${view[*]} CARDS_VIEW_N=${#view[@]}
+}
+
+# cards_pin_check <who> <source> [pin [label]]: a card pin that names no card this machine has is refused by name, never an empty
+# device list. The pin is CUDA_VISIBLE_DEVICES, or the value given (a runner's own, like BLOOMERY_TIMING_GPU, with its label); an unset or
+# empty pin is no pin (an empty one is the deliberate host-only run). 0 when it is none, or when every entry names a listed card, or when
+# cards_view refuses it for a reason that is no missing card (an index in CUDA's order, a card named twice: the callers that need the
+# order refuse those themselves). Else 64 and one line on stderr naming who refused, the pin, what set it (<source>: the file or the
+# variable) and what nvidia-smi lists: the pin names a card that is gone (cards_view's kind `gone`), or nvidia-smi cannot answer (`smi`).
+cards_pin_check() {
+  local who=$1 src=$2 label=${4:-CUDA_VISIBLE_DEVICES} out rc=0 listed
+  local CUDA_VISIBLE_DEVICES=${3-${CUDA_VISIBLE_DEVICES-}}
+  [ -n "$CUDA_VISIBLE_DEVICES" ] || return 0
+  cards_view && return 0
+  case $CARDS_VIEW_KIND in smi | gone) ;; *) return 0 ;; esac
+  if command -v timeout > /dev/null; then
+    out=$(timeout --kill-after=5 30 nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>&1) || rc=$?
+  else
+    out=$(nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>&1) || rc=$?
+  fi
+  if [ "$rc" != 0 ] || [ -z "$out" ]; then
+    listed="nothing (nvidia-smi rc $rc${out:+: ${out%%$'\n'*}})"
+  else
+    listed=$(printf '%s' "$out" | tr '\n' ';')
+  fi
+  echo "$who: $label=$CUDA_VISIBLE_DEVICES, set by $src, names no card this machine has ($CARDS_VIEW_WHY); nvidia-smi lists: $listed — fix the pin where it is set: a card swap leaves the old card's UUID behind" >&2
+  return 64
 }
 
 GPU_3090='' GPU_A6000='' CARDS_ERROR=''

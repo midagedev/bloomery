@@ -738,6 +738,19 @@ chmod +x "$tmp/stub/nvidia-smi"
 mkdir -p "$tmp/uuids"
 printf '%s\n' '#!/bin/sh' 'case "$*" in *--query-gpu=uuid\ *) printf "%s\n" $STUB_UUIDS ;; *) printf "%s\n" 8.6 ;; esac' > "$tmp/uuids/nvidia-smi"
 chmod +x "$tmp/uuids/nvidia-smi"
+# The stub the pin tests ask (a card pin that names no card, tools/ref/cards.sh's cards_pin_check): the uuid list in STUB_UUIDS, the
+# name and uuid list as the refusal prints it, and STUB_PIN_RC for an nvidia-smi that fails.
+mkdir -p "$tmp/pins"
+cat > "$tmp/pins/nvidia-smi" << 'SMI'
+#!/bin/sh
+[ -z "$STUB_PIN_RC" ] || { echo 'NVIDIA-SMI has failed (stub)'; exit "$STUB_PIN_RC"; }
+case "$*" in
+  *--query-gpu=uuid\ *) printf '%s\n' $STUB_UUIDS ;;
+  *--query-gpu=name,uuid*) for u in $STUB_UUIDS; do printf 'NVIDIA Stub, %s\n' "$u"; done ;;
+  *) printf '12.0\n' ;;
+esac
+SMI
+chmod +x "$tmp/pins/nvidia-smi"
 # The copy under test has its drop wait and its sync wait shrunk (box.sh's constants' lines): a retried drop would wait 5 s a time.
 sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=1 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$ROOT/tools/box.sh" > "$B/tools/box.sh"
 chmod +x "$B/tools/box.sh"
@@ -1144,7 +1157,9 @@ mkdir -p "$QH/repo/x/tools/ref/models" "$Q/bin" "$Q/locks"
 printf 'export CUDA_VISIBLE_DEVICES=GPU-default\n' > "$QH/bloomery-env.sh"
 printf 'BLOOMERY_MODEL=prof\nMODEL=/m/a.gguf\nBLOOMERY_DATA=/d\nFIXTURE_FILE=\n' > "$QH/repo/x/tools/ref/ref-paths.sh"
 printf 'V41_MODEL=/m/v.gguf\n' > "$QH/repo/x/tools/ref/models/deepseek41.sh"
-printf '#!/bin/sh\ncase "$*" in *--query-gpu=uuid,name*) printf "GPU-A, NVIDIA RTX A6000\\nGPU-30, NVIDIA GeForce RTX 3090\\n" ;; esac\n' > "$Q/bin/nvidia-smi"
+# the fake box lists the cards its jobs pin (the card pin check, tools/ref/cards.sh, reads nvidia-smi's list: the env file's GPU-default too)
+printf '#!/bin/sh\ncase "$*" in *--query-gpu=uuid,name*) printf "GPU-A, NVIDIA RTX A6000\\nGPU-30, NVIDIA GeForce RTX 3090\\n" ;; *--query-gpu=name,uuid*) printf "NVIDIA RTX A6000, GPU-A\\nNVIDIA GeForce RTX 3090, GPU-30\\nNVIDIA Stub, GPU-default\\n" ;; *--query-gpu=uuid\ *) printf "GPU-A\\nGPU-30\\nGPU-default\\n" ;; esac\n' > "$Q/bin/nvidia-smi"
+cp "$ROOT/tools/ref/cards.sh" "$QH/repo/x/tools/ref/"
 printf '#!/bin/sh\necho inactive\n' > "$Q/bin/systemctl"
 chmod +x "$Q/bin/nvidia-smi" "$Q/bin/systemctl"
 # qjob <env NAME=value…> -- <command>: box.sh's job text for the command, with the lock under $Q/locks, into $Q/job.sh.
@@ -1329,6 +1344,27 @@ else
   run "box.sh: local mode checks both after BLOOMERY_BOX_ENV widens the view" 0 '^view=GPU-1,GPU-2 card=local$' \
     boxl PATH="$tmp/uuids:$tmp/uname:$tmp/stub:$PATH" STUB_UUIDS='GPU-1 GPU-2' CUDA_VISIBLE_DEVICES=GPU-1 BLOOMERY_CARD=both \
     BLOOMERY_BOX_ENV=CUDA_VISIBLE_DEVICES=GPU-1,GPU-2 "$B/tools/box.sh" 'echo "view=$CUDA_VISIBLE_DEVICES card=$BLOOMERY_BOX_CARD"'
+  # A card pin that names no card this machine has: refused by name with what set it and what nvidia-smi lists, before the command runs
+  # (tools/ref/cards.sh's cards_pin_check). A pin that names a present card, an empty pin (host-only) and a read pass.
+  printf 'export CUDA_VISIBLE_DEVICES=GPU-gone\n' > "$tmp/gone-env.sh"
+  printf 'export CUDA_VISIBLE_DEVICES=GPU-5090\n' > "$tmp/live-env.sh"
+  printf 'export CUDA_VISIBLE_DEVICES=\n' > "$tmp/empty-env.sh"
+  PINS=(PATH="$tmp/pins:$tmp/uname:$tmp/stub:$PATH" STUB_UUIDS=GPU-5090)
+  run 'box.sh: a card pin its environment file sets that names no card is refused by name, with the file and the list' 64 \
+    "box\\.sh: CUDA_VISIBLE_DEVICES=GPU-gone, set by the environment file .*gone-env\\.sh, names no card this machine has .*nvidia-smi lists: NVIDIA Stub, GPU-5090 " \
+    boxl "${PINS[@]}" BLOOMERY_ENV_FILE="$tmp/gone-env.sh" "$B/tools/box.sh" "$SHOW"
+  if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: the gone pin ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: the gone pin ran no command'; fi
+  run 'box.sh: a card pin BLOOMERY_BOX_ENV sets that names no card is refused, naming BLOOMERY_BOX_ENV' 64 \
+    'CUDA_VISIBLE_DEVICES=GPU-gone, set by BLOOMERY_BOX_ENV, names no card this machine has' \
+    boxl "${PINS[@]}" BLOOMERY_BOX_ENV=CUDA_VISIBLE_DEVICES=GPU-gone "$B/tools/box.sh" "$SHOW"
+  run 'box.sh: a card pin that names a present card runs the command' 0 '^pwd=' \
+    boxl "${PINS[@]}" BLOOMERY_ENV_FILE="$tmp/live-env.sh" "$B/tools/box.sh" "$SHOW"
+  run 'box.sh: an empty card pin is the host-only run and is not refused' 0 '^pwd=' \
+    boxl "${PINS[@]}" BLOOMERY_ENV_FILE="$tmp/empty-env.sh" "$B/tools/box.sh" "$SHOW"
+  run 'box.sh: a read is not stopped by a gone card pin (nvidia-smi and box-gc must run to fix it)' 0 '^pwd=' \
+    boxl "${PINS[@]}" BLOOMERY_ENV_FILE="$tmp/gone-env.sh" BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" "$SHOW"
+  run 'box.sh: a card pin and an nvidia-smi that fails are refused by name' 64 'CUDA_VISIBLE_DEVICES=GPU-5090, set by the environment file .*nvidia-smi --query-gpu=uuid failed \(rc 9\)' \
+    boxl "${PINS[@]}" STUB_PIN_RC=9 BLOOMERY_ENV_FILE="$tmp/live-env.sh" "$B/tools/box.sh" "$SHOW"
   printf 'export CUDA_VISIBLE_DEVICES=GPU-2\n' > "$tmp/one-card-env.sh"
   run "box.sh: local mode reads both's cards after the environment file" 64 'and this machine has 1 in view: GPU-2$' \
     boxl PATH="$tmp/uuids:$tmp/uname:$tmp/stub:$PATH" STUB_UUIDS='GPU-1 GPU-2' BLOOMERY_ENV_FILE="$tmp/one-card-env.sh" BLOOMERY_CARD=both \
@@ -1393,9 +1429,11 @@ run "gpu-gate.sh: local is box.sh's choice, never a gate card" 64 "BLOOMERY_GATE
   gg BLOOMERY_GATE_CARD=local
 # The box (its lease file): box.sh's local card and another lock directory would hold none of the box's locks. Elsewhere local mode
 # keeps its one lock under a lock directory that is not /root, and the path is opened whole.
+# PIN(2026-11-17): the box's one card is the cards in view under its own lock directory, so local mode on the box is no longer refused here: the
+# run gets past the box check to the local branch (BLOOMERY_GATE_CARD=bogus names no card there, 64, before any lock is opened).
 if [ -e /root/bloomery-cpu.lock ]; then
-  run "gpu-gate.sh: on the box, box.sh's local card is refused" 64 'BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu\.lock' \
-    gg BLOOMERY_BOX_CARD=local
+  run "gpu-gate.sh: on the box, the local card with the box's own lock directory gets to the local branch" 64 'runs on the cards in view under one lock, and BLOOMERY_GATE_CARD=bogus names no card' \
+    gg BLOOMERY_BOX_CARD=local BLOOMERY_GATE_CARD=bogus
   run 'gpu-gate.sh: on the box, a lock directory other than /root is refused' 64 "BLOOMERY_LOCK_DIR=$tmp/ld on the machine whose lease is /root/bloomery-cpu\\.lock" \
     gg BLOOMERY_LOCK_DIR="$tmp/ld"
 else
@@ -1411,6 +1449,12 @@ else
     gg BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$tmp/no such;dir"
 fi
 run 'gpu-gate.sh: BLOOMERY_GATE_CARD is a card' 64 'BLOOMERY_GATE_CARD is 3090, a6000, any or both' gg BLOOMERY_GATE_CARD=all
+# A card pin that names no card this machine has ends the run by name before any lock is opened (tools/ref/cards.sh's cards_pin_check).
+run 'gpu-gate.sh: a gone card pin is refused by name, with the list, before a lock is opened' 64 \
+  'gpu-gate\.sh: CUDA_VISIBLE_DEVICES=GPU-gone, set by its environment .*names no card this machine has .*nvidia-smi lists: NVIDIA Stub, GPU-5090 ' \
+  gg PATH="$tmp/pins:$PATH" STUB_UUIDS=GPU-5090 CUDA_VISIBLE_DEVICES=GPU-gone
+[ -e /root/bloomery-cpu.lock ] || run 'gpu-gate.sh: a pin that names a present card is not refused (the next stop is the lock file)' 69 'cannot open ' \
+  gg PATH="$tmp/pins:$PATH" STUB_UUIDS=GPU-5090 CUDA_VISIBLE_DEVICES=GPU-5090 BLOOMERY_LOCK_DIR="$tmp/no-such-dir"
 if [ -w /root ]; then
   echo "skip gpu-gate.sh lock-open test: /root is writable here (the box), where it would take the real gate lock"
 else
@@ -1625,6 +1669,47 @@ run 'cards: no nvidia-smi on PATH leaves both empty, named' 0 \
 # STUB_UUID_WARN adds a warning line), answers every card's name as a GB10's and none once STUB_GONE is set;
 # the stub journalctl has one kernel line (STUB_JOURNAL=fail fails it, empty shows none, warn none and a
 # warning on stderr). The box refuses local mode, so there that refusal is the one case.
+# cards_pin_check: a pin that names no card this machine has is refused by name (the pin, what set it, what nvidia-smi lists), never an empty
+# device list; no pin, an empty pin (host-only) and a pin that names a present card are not refused.
+pincheck() { # <name> <rc> <pattern> [NAME=value…]: cards_pin_check who "the file F" [pin label] against the stub list GPU-5090
+  local name=$1 want=$2 pat=$3
+  shift 3
+  run "$name" "$want" "$pat" env -u CUDA_VISIBLE_DEVICES -u CUDA_DEVICE_ORDER -u STUB_PIN_RC PATH="$tmp/pins:$PATH" STUB_UUIDS=GPU-5090 BLOOMERY_BOX_CARD=local "$@" \
+    bash -c '. "$1" && cards_pin_check who "the file F" ${PIN+"$PIN"} ${LABEL:+"$LABEL"} && echo passed' _ "$ROOT/tools/ref/cards.sh"
+}
+pincheck 'cards_pin_check: no pin is no refusal' 0 '^passed$'
+pincheck 'cards_pin_check: an empty pin is the host-only run, not refused' 0 '^passed$' CUDA_VISIBLE_DEVICES=
+pincheck 'cards_pin_check: a pin that names a present card passes' 0 '^passed$' CUDA_VISIBLE_DEVICES=GPU-5090
+pincheck 'cards_pin_check: a UUID prefix of a present card passes' 0 '^passed$' CUDA_VISIBLE_DEVICES=GPU-50
+pincheck 'cards_pin_check: a gone UUID is refused by name: the pin, what set it and the list' 64 \
+  '^who: CUDA_VISIBLE_DEVICES=GPU-gone, set by the file F, names no card this machine has .*nvidia-smi lists: NVIDIA Stub, GPU-5090 ' CUDA_VISIBLE_DEVICES=GPU-gone
+pincheck 'cards_pin_check: one gone entry among live ones is refused' 64 'CUDA_VISIBLE_DEVICES=GPU-5090,GPU-gone, set by the file F' CUDA_VISIBLE_DEVICES=GPU-5090,GPU-gone
+pincheck 'cards_pin_check: an index past the cards is refused' 64 "'3' names none of the cards" CUDA_VISIBLE_DEVICES=3
+pincheck 'cards_pin_check: a pin and an nvidia-smi that fails are refused, named' 64 'names no card this machine has \(nvidia-smi --query-gpu=uuid failed \(rc 9\)' \
+  CUDA_VISIBLE_DEVICES=GPU-5090 STUB_PIN_RC=9
+pincheck 'cards_pin_check: an index in CUDA'"'"'s own order is cards_view'"'"'s to refuse, not this check'"'"'s' 0 '^passed$' CUDA_VISIBLE_DEVICES=0 STUB_UUIDS='GPU-5090 GPU-b'
+pincheck "cards_pin_check: a caller's pin (BLOOMERY_TIMING_GPU) is read under its own label" 64 '^who: BLOOMERY_TIMING_GPU=GPU-gone, set by the file F, names no card' PIN=GPU-gone LABEL=BLOOMERY_TIMING_GPU
+# the timing card: a BLOOMERY_TIMING_GPU that no card of a two-card machine answers to ends in TIMING_CARDS_WHY, by name
+mkdir -p "$C/twocards"
+cat > "$C/twocards/nvidia-smi" << EOF
+#!/bin/sh
+case "\$*" in
+  *--query-gpu=uuid\\ *) printf '%s\\n' $FAKE_3090 $FAKE_A6000 ;;
+  *--query-gpu=name,uuid*) printf 'NVIDIA GeForce RTX 3090, $FAKE_3090\\nNVIDIA RTX A6000, $FAKE_A6000\\n' ;;
+  *) printf '8.6\\n' ;;
+esac
+EOF
+chmod +x "$C/twocards/nvidia-smi"
+tcpin() { # <name> <pattern> [NAME=value…]: TIMING_GPU, CUDA_VISIBLE_DEVICES and the refusal after the source, on the two-card stub
+  local name=$1 pat=$2
+  shift 2
+  run "$name" 0 "$pat" env -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRAFT -u CUDA_VISIBLE_DEVICES -u BLOOMERY_BOX_CARD PATH="$C/twocards:$PATH" \
+    BLOOMERY_LOCK_DIR="$tmp/ld" "$@" bash -c 'set -euo pipefail; source "$1"; printf "gpu=[%s] cvd=[%s] why=[%s]\n" "$TIMING_GPU" "$CUDA_VISIBLE_DEVICES" "$TIMING_CARDS_WHY"' _ "$ROOT/tools/ref/timing-card.sh"
+}
+tcpin 'timing-card.sh: a BLOOMERY_TIMING_GPU no card answers to is refused by name' \
+  '^gpu=\[\] cvd=\[\] why=\[BLOOMERY_TIMING_GPU=GPU-gone, set by its environment, names no card this machine has .*nvidia-smi lists: NVIDIA GeForce RTX 3090, ' BLOOMERY_TIMING_GPU=GPU-gone
+tcpin 'timing-card.sh: a BLOOMERY_TIMING_GPU that names a present card is the timing card' "^gpu=\\[$FAKE_3090\\] cvd=\\[$FAKE_3090\\] why=\\[\\]\$" BLOOMERY_TIMING_GPU="$FAKE_3090"
+
 FAKE_GB10=GPU-22222222-2222-2222-2222-222222222222
 mkdir -p "$C/local"
 cat > "$C/local/nvidia-smi" << 'SMI'
@@ -1665,8 +1750,11 @@ locx() { # <name> <rc> <pattern> <commands after the source> [NAME=value…]: th
 loc() { # <name> <pattern> [NAME=value…]: the card, CUDA_VISIBLE_DEVICES and the refusal after the source
   locx "$1" 0 "$2" 'printf "gpu=[%s] cvd=[%s] local=[%s] why=[%s]\n" "$TIMING_GPU" "$CUDA_VISIBLE_DEVICES" "$TIMING_LOCAL" "$TIMING_CARDS_WHY"' "${@:3}"
 }
+# PIN(2026-11-17): local mode on the box is the box's one card (its environment file declares it, tools/box.sh) under the lease in /root: what is
+# refused on the box is a lock directory that is not /root, and off the box a lock directory that is.
 if [ -e /root/bloomery-cpu.lock ]; then
-  loc 'timing-card.sh local: refused on the box' '^gpu=\[\] cvd=\[\] local=\[1\] why=\[BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu\.lock \(the box\): '
+  loc 'timing-card.sh local: another lock directory is refused on the box' '^gpu=\[\] cvd=\[\] local=\[1\] why=\[BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu\.lock \(the box\), with BLOOMERY_LOCK_DIR='
+  loc "timing-card.sh local: the box's own lock directory times the one card in view" "^gpu=\\[$FAKE_GB10\\] cvd=\\[$FAKE_GB10\\] local=\\[1\\] why=\\[\\]\$" BLOOMERY_LOCK_DIR=/root
 else
   loc 'timing-card.sh local: the one card listed is the timing card' "^gpu=\\[$FAKE_GB10\\] cvd=\\[$FAKE_GB10\\] local=\\[1\\] why=\\[\\]\$"
   loc 'timing-card.sh local: a warning beside the list is no card' "^gpu=\\[$FAKE_GB10\\] cvd=\\[$FAKE_GB10\\] local=\\[1\\] why=\\[\\]\$" STUB_UUID_WARN=1

@@ -34,13 +34,15 @@
 # BLOOMERY_BUILD_ONLY=1: the call ends 0 once the binary is found, before any lock, ticket or card (tools/gate-batch.sh's build lane: the recipe's build ran before this call); tools/gate.sh reads the same variable.
 # BLOOMERY_GATE_STACKS(초 — 설정하면 바이너리의 출력이 그만큼 멈출 때 tools/ref/stack-watch.sh가 스레드 스택을 뜨고 끝낸다).
 # BLOOMERY_LOCK_DIR: the directory of every lock and hold file named below, /root when unset (tools/ref/lease-probe.sh's LOCK_DIR).
-# BLOOMERY_BOX_CARD=local (tools/box.sh's local mode): the run takes one lock, bloomery-gate-local.lock, which holds every card
-# this machine has, so it holds the cards in view whatever they are (tools/ref/cards.sh's cards_view), and leaves
-# CUDA_VISIBLE_DEVICES as it finds it. BLOOMERY_GATE_CARD may be unset, 3090, a6000 or any, and both when two or more cards are
-# in view (other names, and both with fewer: 64). A held timing lease is read as timing that card: the run waits as for its lock.
-# Its lock directory is never /root (64).
-# Where /root/bloomery-cpu.lock exists (the box, as lease_take reads it), BLOOMERY_BOX_CARD=local and a BLOOMERY_LOCK_DIR other
-# than /root are refused (64): the run would hold no lock the box's gates and sittings take.
+# BLOOMERY_BOX_CARD=local (tools/box.sh's local mode): the run takes one lock, which holds every card this machine has, so it
+# holds the cards in view whatever they are (tools/ref/cards.sh's cards_view), and leaves CUDA_VISIBLE_DEVICES as it finds it.
+# BLOOMERY_GATE_CARD may be unset, 3090, a6000 or any, and both when two or more cards are in view (other names, and both with
+# fewer: 64); the names are lane words, and each means the cards in view. A held timing lease is read as timing that card: the run
+# waits as for its lock. Off the box the lock is bloomery-gate-local.lock under a lock directory that is never /root (64). On the
+# box (/root/bloomery-cpu.lock exists, as lease_take reads it) the one lock is the gate lock the box's other runs take
+# (/root/bloomery-gate.lock), the box's environment file declares the cards in view, and a BLOOMERY_LOCK_DIR other than /root is
+# refused (64): the run would hold no lock the box's gates and sittings take.
+# A card pin (CUDA_VISIBLE_DEVICES) that names no card nvidia-smi lists ends the run by name (64) before any lock is opened.
 # BLOOMERY_CARD_HELD: exported as 1 to the binary once every lock is held (its card-byte invariant then refuses, never only records).
 # BLOOMERY_GATE_GDB=1: the binary runs under gdb, which prints every thread's stack when a signal ends it.
 # BLOOMERY_TIER=real|fixture (unset: real) and BLOOMERY_FIXTURE_MODEL: the fixture tier (tools/box.sh resolves both, see
@@ -2137,12 +2139,16 @@ PY
   local ON_LOCAL="ok on this machine's card\\(s\\), the local gate lock" LOC=(BLOOMERY_BOX_CARD=local "BLOOMERY_LOCK_DIR=$t")
   if gg_part 3; then
   rc=0
-  gate "$t/out" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller || rc=$?
-  judge_all 'local: any takes the local lock and leaves CUDA_VISIBLE_DEVICES as it was' "$rc" 0 "$ON_LOCAL \\(asked any\\)$" '^ran on GPU-caller$'
+  # PIN(2026-11-17): the caller's pin is a card the stub lists (the 3090's UUID, which an `any` lane pick would not choose first); it was
+  # the made-up GPU-caller before gpu-gate.sh refused a pin that names no card (the two cases below).
+  gate "$t/out" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES="$GPU_3090" || rc=$?
+  judge_all 'local: any takes the local lock and leaves CUDA_VISIBLE_DEVICES as it was' "$rc" 0 "$ON_LOCAL \\(asked any\\)$" "^ran on $GPU_3090\$"
+  case_ '  … a pin that names no card of the machine: 64, named, and no lock opened' 64 'CUDA_VISIBLE_DEVICES=GPU-gone, set by its environment .*names no card this machine has .*nvidia-smi lists: ' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-gone
+  case_ '  … the same pin on a lane run (3090): 64, named' 64 'CUDA_VISIBLE_DEVICES=GPU-gone, set by its environment .*names no card this machine has' 3090 "$t/lease" CUDA_VISIBLE_DEVICES=GPU-gone
   case_ '  … a6000 takes it too' 0 "$ON_LOCAL \\(asked a6000\\)$" a6000 "$t/lease" "${LOC[@]}"
   cp "$t/tree/target/release/ok" "$t/tree/target/release/gate_qwen38_serve"
   gate_args=(--arm plain)
-  GATE_BIN=gate_qwen38_serve case_ "  … the Qwen3.8 serve gate's plain arm runs on another local card in the real tier" 0 '^ran on GPU-caller$' any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES=GPU-caller BLOOMERY_TIER=real
+  GATE_BIN=gate_qwen38_serve case_ "  … the Qwen3.8 serve gate's plain arm runs on another local card in the real tier" 0 "^ran on $GPU_3090\$" any "$t/lease" "${LOC[@]}" CUDA_VISIBLE_DEVICES="$GPU_3090" BLOOMERY_TIER=real
   gate_args=()
   case_ '  … a V4.1 load takes the V4.1 load lock with it' 0 "$ON_LOCAL \\(asked any\\), V4\\.1 load lock$" any "$t/lease" "${LOC[@]}" BLOOMERY_GATE_V41_LOAD=1
   exec 5> "$t/gate.lock" 6> "$t/gate-a6000.lock"
@@ -2330,8 +2336,8 @@ PY
   lib_gate "$t/out" any || rc=$?
   judge 'lib test any selects the free A6000 while the 3090 is held' "$rc" 0 "^lib-card=$GPU_A6000$"
   rc=0
-  lib_gate "$t/out" any BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$t" CUDA_VISIBLE_DEVICES=GPU-caller || rc=$?
-  judge 'lib test local mode preserves the caller visible devices' "$rc" 0 '^lib-card=GPU-caller$'
+  lib_gate "$t/out" any BLOOMERY_BOX_CARD=local BLOOMERY_LOCK_DIR="$t" CUDA_VISIBLE_DEVICES="$GPU_3090" || rc=$?
+  judge 'lib test local mode preserves the caller visible devices' "$rc" 0 "^lib-card=$GPU_3090\$"
   rc=0
   (cd "$t/tree" && "${gate_env[@]}" LIB_STARTED="$t/host-started" \
     bash "${self%/*}/gate.sh" --release -p bloomery-verbs --lib) > "$t/out" 2>&1 || rc=$?
@@ -2531,8 +2537,11 @@ if [ "${1:-}" = --test-locks ]; then
   PACE=${GATE_TEST_PACE:-}
   shift 2
 # On the box (the header) every run but the self-test's takes the locks under /root.
-elif on_box && { [ "$LOCK_DIR" != /root ] || [ "${BLOOMERY_BOX_CARD:-}" = local ]; }; then
-  echo "gpu-gate.sh: $([ "$LOCK_DIR" != /root ] && echo "BLOOMERY_LOCK_DIR=$LOCK_DIR" || echo BLOOMERY_BOX_CARD=local) on the machine whose lease is $BOX_LEASE (the box): its gates and sittings lock under /root, and this run would hold none of their locks; run it through tools/box.sh without local mode. If this machine is not the box, a lock script run as root without BLOOMERY_LOCK_DIR made that file: remove it" >&2
+# PIN(2026-11-17): BLOOMERY_BOX_CARD=local no longer ends here on the box. The box holds one card now and its environment file declares the cards in
+# view (tools/box.sh); the refusal's reason, a run that holds none of the box's locks, is the lock directory, so local mode on the box is
+# the box's own lock directory (below: the one lock is the gate lock the box's other runs take), and another directory is what is refused.
+elif on_box && [ "$LOCK_DIR" != /root ]; then
+  echo "gpu-gate.sh: BLOOMERY_LOCK_DIR=$LOCK_DIR on the machine whose lease is $BOX_LEASE (the box): its gates and sittings lock under /root, and this run would hold none of their locks; run it through tools/box.sh without local mode. If this machine is not the box, a lock script run as root without BLOOMERY_LOCK_DIR made that file: remove it" >&2
   exit 64
 fi
 if [ "${1:-}" = --gpuhold ]; then
@@ -2660,7 +2669,9 @@ case "$BOXC" in
       exit 64
     } ;;
   local)
-    if box_lock_dir "$LOCK_DIR"; then
+    # a machine that is not the box and names /root would make the file that marks the box; the box itself (its lease file is there) is
+    # the one machine whose local run locks under /root
+    if box_lock_dir "$LOCK_DIR" && ! on_box; then
       echo "gpu-gate.sh: box.sh's local mode (BLOOMERY_BOX_CARD=local) keeps its lock under BLOOMERY_LOCK_DIR, and that is $LOCK_DIR (unset: /root), the box's lock directory: run it through tools/box.sh's local mode, which sets both" >&2
       exit 64
     fi
@@ -2696,7 +2707,12 @@ a6000_idle() {
 }
 # 락 파일을 못 여는 셸(박스의 root가 아니거나 박스가 아님)은 경쟁이 아니다 — 여기서 이름을 대고 끝난다.
 LOCK_FILES=("9:$GATE_LOCK" "8:$A6000_LOCK")
-[ "$CARD" != local ] || LOCK_FILES=("9:$LOCAL_LOCK")
+# On the box the one lock of the cards in view is the gate lock the box's other runs, an older copy of this script on another track, the
+# dump scripts and the release sitting already take for its card: a lock of another name would leave them off the same card unexcluded.
+[ "$CARD" != local ] || { on_box && LOCAL_LOCK=$GATE_LOCK; LOCK_FILES=("9:$LOCAL_LOCK"); }
+# A card pin that names no card this machine has ends the run here by name, before any lock is taken (tools/ref/cards.sh): the binary
+# would otherwise see an empty device list and fall to the host engine. BLOOMERY_BUILD_ONLY ended above, before any card.
+{ BLOOMERY_BOX_CARD=local . "${BASH_SOURCE[0]%/*}/ref/cards.sh" && cards_pin_check gpu-gate.sh "its environment (tools/box.sh's refusal names the file it sourced)"; } || exit $?
 [ "$V41" = 0 ] || LOCK_FILES+=("7:$V41_LOCK")
 for lock in "${LOCK_FILES[@]}"; do
   eval "exec ${lock%%:*}>\"\${lock#*:}\"" 2> /dev/null || { echo "gpu-gate.sh: cannot open ${lock#*:} — the gate runs on the box, as root$([ "$CARD" != local ] || echo ", or in box.sh's local mode with a BLOOMERY_LOCK_DIR it can write")" >&2; exit 69; }

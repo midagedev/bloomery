@@ -1170,10 +1170,12 @@ PY
   st_run
   st_check card-gone 1 "window 1: the timing card (GPU-STUB-A6000) does not answer nvidia-smi (rc 15)"
   st_servers card-gone-servers-gone 2
-  # A card pick that does not answer is refused before the lease.
+  # A card pick that names no card of this machine is refused by name before the lease (64, timing-card.sh's pin check, with
+  # the list nvidia-smi gave). PIN(2026-11-17): it ended 69 on "does not answer nvidia-smi (rc 6)" before the card swap taught
+  # timing-card.sh to name a gone pin; 69 stays for a card that is listed and then stops answering (card-gone above).
   ST_ENV=("${MODELS[@]}" "BLOOMERY_TIMING_GPU=GPU-STUB-NOSUCH")
   st_run
-  st_check card-unknown 69 "refused before the lease: the timing card (GPU-STUB-NOSUCH) does not answer nvidia-smi (rc 6)"
+  st_check card-unknown 64 "no timing card: BLOOMERY_TIMING_GPU=GPU-STUB-NOSUCH, set by its environment, names no card this machine has" "nvidia-smi lists: "
   st_absent card-unknown-before-the-lease "[lease-stub]"
   # The timing card busy with another process: the window waits for it, and ends 75 when the wait runs out, with no
   # server started; a card freed within the wait lets the window go on.

@@ -112,9 +112,12 @@ esac
 TIMING_LOCAL=''
 if [ "${BLOOMERY_BOX_CARD:-}" = local ]; then
   TIMING_LOCAL=1 TIMING_CARDS='' TIMING_CARDS_NAME='' TIMING_CARDS_WHY='' TIMING_GPU=${BLOOMERY_TIMING_GPU:-} OTHER_GPU=''
-  if [ -e /root/bloomery-cpu.lock ]; then
-    TIMING_CARDS_WHY="BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu.lock (the box): its sittings time its cards under that lease; run this through tools/box.sh without local mode"
-  elif [ "$LOCK_DIR" = /root ] || [ "$LOCK_DIR" = /root/ ]; then
+  # PIN(2026-11-17): local mode on the box is allowed. The box holds one card and its environment file declares the cards in view
+  # (tools/box.sh); its sittings time that card under the lease in /root, which is the lock directory local mode then keeps, so the refusal
+  # is a lock directory that disagrees with the machine: another directory on the box, /root on a machine that is not the box.
+  if on_box && ! box_lock_dir "$LOCK_DIR"; then
+    TIMING_CARDS_WHY="BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu.lock (the box), with BLOOMERY_LOCK_DIR=$LOCK_DIR: its sittings time under the lease in /root, and this run would hold none of it; leave BLOOMERY_LOCK_DIR unset"
+  elif ! on_box && box_lock_dir "$LOCK_DIR"; then
     TIMING_CARDS_WHY="BLOOMERY_BOX_CARD=local keeps the lease under BLOOMERY_LOCK_DIR, and that is $LOCK_DIR (unset: /root), the box's lock directory: run it through tools/box.sh's local mode, which sets both"
   elif [ -n "${BLOOMERY_TIMING_CARDS:-}" ]; then
     TIMING_CARDS_WHY="BLOOMERY_TIMING_CARDS=$BLOOMERY_TIMING_CARDS and BLOOMERY_BOX_CARD=local: the two-card mode is the box's, and local mode times this machine's one card"
@@ -148,6 +151,12 @@ if [ -z "$TIMING_CARDS_WHY" ] && [ -z "$TIMING_LOCAL" ]; then
   elif [ "$TIMING_GPU" != "$GPU_A6000" ] && [ "$TIMING_GPU" != "$GPU_3090" ] && { [ -z "$GPU_3090" ] || [ -z "$GPU_A6000" ]; }; then
     TIMING_CARDS_WHY="the timing card ($TIMING_GPU) is neither card tools/ref/cards.sh named, and a card is missing ($CARDS_ERROR): whether it is the 3090 cannot be told"
   fi
+fi
+# A timing card the caller names (BLOOMERY_TIMING_GPU) that no card of this machine answers to is refused by name here: the run would
+# take the lease for a card that is not there and hand the binary an empty device list. Local mode checks its own pin below.
+if [ -z "$TIMING_CARDS_WHY" ] && [ -z "$TIMING_LOCAL" ] && [ -n "${BLOOMERY_TIMING_GPU:-}" ]; then
+  __pin_why=$(cards_pin_check "${0##*/}" 'its environment' "$BLOOMERY_TIMING_GPU" BLOOMERY_TIMING_GPU 2>&1 > /dev/null) || TIMING_CARDS_WHY=${__pin_why#"${0##*/}: "}
+  unset __pin_why
 fi
 if [ -n "$TIMING_CARDS" ]; then
   # shellcheck disable=SC2034 # TIMING_GPU2 is read by lease.sh's lease_take (the lease's record)

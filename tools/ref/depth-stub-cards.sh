@@ -33,6 +33,9 @@ cat > "$T/tools/ref/cards.sh" << CARDSFILE
 GPU_3090=$STUB_GPU_3090
 GPU_A6000=$STUB_GPU_A6000
 $stub_cards_view
+# The tree answers a card by -i and its uuid list is the GB10 alone (local mode's), so the pin check that reads the list (tools/ref/cards.sh's
+# cards_pin_check) has nothing true to compare a made-up pin with here: it passes, and card-tests/run.sh tests it where nvidia-smi lists the cards.
+cards_pin_check() { return 0; }
 CARDSFILE
 unset stub_cards_view
 [ -z "${STUB_CARDS_FILE_ONLY:-}" ] || return 0
