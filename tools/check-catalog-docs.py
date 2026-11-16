@@ -378,7 +378,7 @@ def self_test():
             models=("[`UD-Q4_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)",
                     "[`UD-Q3_K_XL`](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)"))
         red("an edited repo in docs/models.md is red", "recommends is not the catalog's",
-            models=("huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF", "huggingface.co/someone/DeepSeek-V4.1-Flash-GGUF"))
+            models=("huggingface.co/midagedev/DeepSeek-V4.1-Flash-1017-GGUF", "huggingface.co/someone/DeepSeek-V4.1-Flash-1017-GGUF"))
         red("an unlinked file that names no variant is red", "names none of the catalog's variants",
             models=("NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf", "NVIDIA-Nemotron-3.5-Bolt-74B-A9B.gguf"))
         red("a model row that is no catalog model is red", "is no catalog model", models=("| Sage-A1.5 |", "| Sage-A1.6 |"))
