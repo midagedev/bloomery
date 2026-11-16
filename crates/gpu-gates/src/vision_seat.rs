@@ -1461,6 +1461,56 @@ mod tests {
         assert!(f.check_source(false).is_err());
     }
 
+    /// A build without `vision` refuses an image flag by name before any model path, whether or not
+    /// an `--hf` repository could supply a projector; a start that gives no image flag, or only
+    /// `--no-mmproj`, passes. Every seat reaches [`Flags::check_before_model`] before its fetch
+    /// (`gate_serve_preflight` runs the seats offline, at the build that has the tower), so the
+    /// arm of the build without it is held here, at the check itself.
+    #[cfg(not(feature = "vision"))]
+    #[test]
+    fn check_before_model_refuses_images_in_a_build_without_vision() {
+        for from_repo in [false, true] {
+            for args in [
+                &["--mmproj", "p.gguf"][..],
+                &["--image-min-tokens", "16"],
+                &["--image-max-tokens", "1024"],
+                &["--mmproj", "p.gguf", "--image-max-tokens", "1024"],
+            ] {
+                let err = flags(args).unwrap().check_before_model(from_repo);
+                assert_eq!(
+                    err.unwrap_err().to_string(),
+                    NO_TOWER,
+                    "{args:?}, from_repo {from_repo}"
+                );
+            }
+            for args in [&[][..], &["--no-mmproj"]] {
+                flags(args)
+                    .unwrap()
+                    .check_before_model(from_repo)
+                    .unwrap_or_else(|e| panic!("{args:?}, from_repo {from_repo}: {e}"));
+            }
+        }
+    }
+
+    /// Limits given beside `--no-mmproj` have no image input to bound: refused by name before any
+    /// model path, as the build's own reason (no tower, or no projector to pick).
+    #[test]
+    fn check_before_model_refuses_limits_of_disabled_images() {
+        let f = flags(&["--no-mmproj", "--image-max-tokens", "1024"]).unwrap();
+        let want = if cfg!(feature = "vision") {
+            "--image-min-tokens/--image-max-tokens without --mmproj: no image input to bound"
+        } else {
+            NO_TOWER
+        };
+        for from_repo in [false, true] {
+            assert_eq!(
+                f.check_before_model(from_repo).unwrap_err().to_string(),
+                want,
+                "from_repo {from_repo}"
+            );
+        }
+    }
+
     #[test]
     fn the_flags_read_llama_servers_spelling() {
         let f = flags(&["--mmproj", "/m/p.gguf", "--image-min-tokens", "16"]).unwrap();

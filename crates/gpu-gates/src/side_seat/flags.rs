@@ -401,4 +401,26 @@ mod tests {
         assert!(e.to_string().contains("a qwen4exp file"), "{e}");
         assert_eq!(crate::start::class_of(&e), Some(Code::Unsupported), "{e}");
     }
+
+    /// A build without `vision` refuses the side model's image flags by name before the model is
+    /// fetched, under the side seat's own prefix; the seats' `--embd-` flags end the same way.
+    #[cfg(not(feature = "vision"))]
+    #[test]
+    fn the_side_models_image_flags_are_refused_in_a_build_without_vision() {
+        for tail in [
+            ["--embd-mmproj", "p.gguf"],
+            ["--embd-image-max-tokens", "1024"],
+        ] {
+            let mut given = vec!["--embd-hf", "o/embedding"];
+            given.extend(tail);
+            let (flags, rest) = Flags::take(&args(&given)).expect("take");
+            assert!(rest.is_empty(), "{given:?}");
+            let e = flags.check_before_model().expect_err("refused");
+            assert_eq!(
+                e.to_string(),
+                format!("embedding image flags: {}", vision_seat::NO_TOWER),
+                "{given:?}"
+            );
+        }
+    }
 }

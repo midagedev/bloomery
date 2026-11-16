@@ -3069,6 +3069,9 @@ gate-gpu-ds41-lib:
 # repo, and the side seat, which opens GGUF only, refuses it before any shard download. The start's agent half
 # (start::, behind the same feature: the class an error of the start path names, the plan line a seat's notes make, the
 # early listener's hand-over) runs here, since gate-gpu-gates-lib builds without it.
+# The set has no `vision`, so the build-without-tower arm of the image flags' check (`check_before_model_refuses_images_in_a_build_without_vision`,
+# `the_side_models_image_flags_are_refused_in_a_build_without_vision`) runs here, before any model path; gate-serve-draft-rules holds the seats
+# at the build with it.
 [group('host')]
 gate-ds41-bind:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- vision_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- side_seat:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,checkpoint --lib -- model_file::fetch::tests::checkpoint_support_is_checked_before_download --nocapture && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- bind:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,hf --lib -- start::'
@@ -3091,10 +3094,20 @@ gate-q38-serve-rules:
 
 # The shared draft's prompt boundaries and per-slot costs in the other serve targets that include it, and the Raon seat's
 # unset draft rule: a request drafts while its think span is open, up to the tag that closes it. The launcher's checks
-# before the fetch (`tests/serve_preflight.rs`) run on builds without and with `vision`. Host only, no card or gate lock.
+# before the fetch (`gate_serve_preflight`, `shared/serve_preflight_tests.rs`) start the seat binaries the recipe builds first, each at the feature
+# set the other gates build it at (`bloomery-serve` at the release list, with `vision`; the stand-alone ds41 and qwen38 seats at theirs), so the
+# files in target/release are the ones every lane runs. The clauses are unit tests of one bin (`--bin`): a `--test` target would compile and
+# link every bin of the package under its call's set and replace the ones other lanes run. The two bins' own unit tests run first at the
+# set without `vision` (a test of a bin's own tests writes nothing to target/release). The without-`vision` clauses moved, 2026-11-16:
+# `a_build_without_vision_refuses_images_before_the_fetch` and the without-`vision` arm of `disabled_images_refuse_limits_before_the_fetch`
+# need a `bloomery-serve` built without `vision`, and `bloomery-serve` is a shipped bin, held to the release list (with `vision`) in every
+# target dir (check-recipes). They are now in-process tests of the check every seat calls before its fetch
+# (`vision_seat::Flags::check_before_model`, and the side seat's `--embd-` wrap of it) that `gate-ds41-bind` runs as `--lib` at its set
+# without `vision` (`deepseek41,hf`): a `--lib` call builds the library's test harness and links no bin, and a `--lib` call here would
+# widen this gate's reach to every file of the lib. Host only, no card or gate lock.
 [group('host')]
 gate-serve-draft-rules:
-    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --bin bloomery-serve --bin bloomery-serve-ds41 --test serve_preflight && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight'
+    ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --bin bloomery-serve --bin bloomery-serve-ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision,gemma-embedding2,hf --release --bin bloomery-serve-ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,gemma-embedding2,hf --release --bin bloomery-serve-qwen38 && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --bin gate_serve_preflight'
 
 # The V4.1 binaries' `--place` word (`generate::Place`, behind the deepseek41 feature like bind): each alias and its card
 # list (`a6000+3090` is `bp`) planning the machine its plan function makes, a list word planning its own cards, and every
@@ -4366,7 +4379,7 @@ weekly-gpu-glm5next-media-serve:
 # context: its `--plan --json` equals the pick and the fixture file's); (s9) the loading window of (s7): `/health` is 503 `loading` from
 # the `bound` event until the first 200, none before `ready` is printed and none after; (s10) the exit table on the refusals a start
 # meets: an unknown name 64, a path given as a name 64 with `-m` in `next`, an embedding file 65, a card budget below the floor 80, a bad
-# lever 78, a held port 83 found before the load, each ending in an `error` event of its code. The launcher's checks (`tests/serve_preflight.rs`) run beside it: the normal inputs reaching the fetch, and a seat word alone starting by name and refusing offline as `network`. Each of (s1) to (s3) is preceded by a `--plan`
+# lever 78, a held port 83 found before the load, each ending in an `error` event of its code. The launcher's checks (`gate_serve_preflight`) run beside it: the normal inputs reaching the fetch, and a seat word alone starting by name and refusing offline as `network`. Each of (s1) to (s3) is preceded by a `--plan`
 # run of its arguments. It holds the image-flag starts at the fixture tier, which the real-tier seat gates do not. The bloomery-serve built is the release's
 # (--features glm5next,clef,vision,mimo2,solar2). Both cards in view
 # (BLOOMERY_CARD=both: both gate locks, alone in a batch): with `--place a` the other card is off the plan, so the tower sits there and no
@@ -4377,12 +4390,14 @@ weekly-gpu-glm5next-media-serve:
 # 8.6 GB set and the 1.2 GB projector in threads beside the first two starts: 53 to 98 s warm; (s7) to (s10) add about 25 s [derived: (s7)
 # one start of about 8 s, the pick's `--plan` child of about 2 s and the stop, 11 s; (s8) three `--plan` runs and a dry run, 9 s; (s10) six
 # refusals, the no-fit one with a pick's child, 6 s]; the bound is the runner's 900 s.
+# The three `gate_serve_preflight` calls run the launcher's `hw_` clauses (`shared/serve_preflight_tests.rs`) as unit tests of that one bin
+# (`--bin`: no other bin of the package is compiled or linked) against the `bloomery-serve` the first command built.
 [group('solo')]
 gate-gpu-serve-start-glm:
     BLOOMERY_MODEL=glm5next BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_serve_start && D=target/serve-start-gate/glm && rm -rf $D && mkdir -p $D && bash tools/gpu-gate.sh gate_serve_start --family glm --dir $D'
-    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_a_device_list_alias_reaches_the_selected_seat'
-    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_preflight_normal_inputs_reach_the_fetch'
-    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --test serve_preflight -- --ignored --exact hw_a_seat_word_alone_starts_by_name_and_refuses_offline'
+    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --bin gate_serve_preflight -- --ignored --exact preflight::hw_a_device_list_alias_reaches_the_selected_seat'
+    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --bin gate_serve_preflight -- --ignored --exact preflight::hw_preflight_normal_inputs_reach_the_fetch'
+    ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-serve-start-glm && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --bin gate_serve_preflight -- --ignored --exact preflight::hw_a_seat_word_alone_starts_by_name_and_refuses_offline'
 
 # The same gate on the V4.1 fixture, clauses (s1) to (s10) (the file's architecture picks the seat; (s1) to (s3) read its plan from each
 # start's own log, and (s8)'s `--plan --json` runs end through `start::plan_exit`). The projector is the `# mmproj` line of the V4.1 vision set

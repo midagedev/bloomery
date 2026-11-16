@@ -6,6 +6,24 @@ use serde_json::Value;
 use serve::event::SCHEMA;
 use serve::exit::Code;
 
+/// The seat binary `name` beside this test's executable: `cargo test --bin` leaves the executable in `deps/` of the
+/// profile directory (or in `.run.<pid>/deps/` of a gate's private copy), and the recipe built the seats one directory
+/// up. One that is not there fails by name; no clause is skipped for it.
+fn seat(name: &str) -> String {
+    let exe = std::env::current_exe().expect("the test executable's own path");
+    let dir = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .unwrap_or_else(|| panic!("{}: no directory above the test executable", exe.display()));
+    let bin = dir.join(name);
+    assert!(
+        bin.is_file(),
+        "{}: not built; the recipe builds {name} before this gate runs",
+        bin.display()
+    );
+    bin.to_str().expect("a UTF-8 path").to_owned()
+}
+
 #[test]
 fn invalid_arguments_end_before_the_driver_or_fetch() {
     for (name, tail, alias) in [
@@ -86,42 +104,9 @@ fn the_decision_seat_refuses_an_embedding_model_before_the_fetch() {
     );
 }
 
-#[cfg(not(feature = "vision"))]
-#[test]
-fn a_build_without_vision_refuses_images_before_the_fetch() {
-    for model in ["ds41", "qwen38", "qwen3", "glm", "decide"] {
-        for (name, tail) in [
-            ("projector", vec!["--mmproj", "p.gguf"]),
-            ("limit", vec!["--image-max-tokens", "1024"]),
-        ] {
-            refused(
-                &format!("{model}-{name}"),
-                model,
-                &tail,
-                None,
-                bloomery_gpu_gates::vision_seat::NO_TOWER,
-            );
-        }
-    }
-    for (name, tail) in [
-        ("projector", vec!["--embd-mmproj", "p.gguf"]),
-        ("limit", vec!["--embd-image-max-tokens", "1024"]),
-    ] {
-        let mut args = vec!["--embd-hf", "o/embedding"];
-        args.extend(tail);
-        refused(
-            &format!("side-{name}"),
-            "qwen38",
-            &args,
-            None,
-            &format!(
-                "embedding image flags: {}",
-                bloomery_gpu_gates::vision_seat::NO_TOWER
-            ),
-        );
-    }
-}
-
+// The seats here are built with `vision`; a build without it refuses an image flag in `vision_seat::Flags::check_before_model`
+// (and the side seat's wrap of it), held in-process by `vision_seat::tests::check_before_model_*` and
+// `side_seat::flags::tests::the_side_models_image_flags_*`.
 #[test]
 fn disabled_images_refuse_limits_before_the_fetch() {
     for model in ["ds41", "qwen38", "qwen3", "glm", "decide"] {
@@ -130,11 +115,7 @@ fn disabled_images_refuse_limits_before_the_fetch() {
             model,
             &["--no-mmproj", "--image-max-tokens", "1024"],
             None,
-            if cfg!(feature = "vision") {
-                "--image-min-tokens/--image-max-tokens without --mmproj: no image input to bound"
-            } else {
-                bloomery_gpu_gates::vision_seat::NO_TOWER
-            },
+            "--image-min-tokens/--image-max-tokens without --mmproj: no image input to bound",
         );
     }
 }
@@ -191,7 +172,7 @@ fn hw_a_device_list_alias_reaches_the_selected_seat() {
     let model = path.to_str().unwrap();
     refusal(
         "selected-seat-device-alias",
-        env!("CARGO_BIN_EXE_bloomery-serve"),
+        &seat("bloomery-serve"),
         &[
             "--model",
             "qwen38",
@@ -223,12 +204,12 @@ fn a_head_asks_the_decide_seat_for_its_usage() {
 #[test]
 fn stand_alone_device_list_aliases_reach_the_parser() {
     for (name, bin) in [
-        ("qwen38", env!("CARGO_BIN_EXE_bloomery-serve-qwen38")),
-        ("ds41", env!("CARGO_BIN_EXE_bloomery-serve-ds41")),
+        ("qwen38", seat("bloomery-serve-qwen38")),
+        ("ds41", seat("bloomery-serve-ds41")),
     ] {
         refusal(
             &format!("{name}-device-alias"),
-            bin,
+            &bin,
             &["--alias", "--list-devices", "--ctx-size", "abc"],
             None,
             &format!("bloomery-serve-{name}: --ctx-size \"abc\""),
@@ -242,7 +223,7 @@ fn refused(name: &str, model: &str, tail: &[&str], alias: Option<&str>, expected
     args.extend_from_slice(tail);
     refusal(
         name,
-        env!("CARGO_BIN_EXE_bloomery-serve"),
+        &seat("bloomery-serve"),
         &args,
         alias,
         &format!("bloomery-serve: {expected}"),
@@ -380,7 +361,7 @@ fn startup_coded(
 /// PIN(2026-10-29): `--help` is an answer, not a refusal: the usage goes to stdout and the status is 0. It was a
 /// refusal with the usage on stderr and status 1.
 fn usage_answered(name: &str, args: &[&str], expected: &str) {
-    let (dir, status, out, err) = run_start(name, env!("CARGO_BIN_EXE_bloomery-serve"), args, &[]);
+    let (dir, status, out, err) = run_start(name, &seat("bloomery-serve"), args, &[]);
     assert!(status.success(), "{args:?}: {status}: {err}");
     assert!(out.starts_with(expected), "{args:?}: {out}");
     assert!(err.is_empty(), "{args:?}: {err}");
@@ -439,7 +420,7 @@ fn a_config_file_key_no_seat_takes_is_refused_before_the_fetch() {
     .unwrap();
     let (dir, err, _) = startup_coded(
         "config-unknown-key",
-        env!("CARGO_BIN_EXE_bloomery-serve"),
+        &seat("bloomery-serve"),
         &["--config", path.to_str().unwrap()],
         &[],
     );
@@ -708,7 +689,7 @@ fn preflight_mimo2_tier_slots() {
 }
 
 fn checked_refusal(name: &str, args: &[&str], env: &[(&str, &str)], expected: &str) {
-    let (dir, err, _) = startup_coded(name, env!("CARGO_BIN_EXE_bloomery-serve"), args, env);
+    let (dir, err, _) = startup_coded(name, &seat("bloomery-serve"), args, env);
     assert!(err.contains(expected), "{err}");
     clean_refusal(&dir, &err, true);
     std::fs::remove_dir_all(dir).unwrap();
@@ -722,7 +703,7 @@ fn checked_refusal_as(
     expected: &str,
     class: Code,
 ) {
-    let (dir, err, code) = startup_coded(name, env!("CARGO_BIN_EXE_bloomery-serve"), args, env);
+    let (dir, err, code) = startup_coded(name, &seat("bloomery-serve"), args, env);
     assert_eq!(code, class, "{args:?} {env:?}: {err}");
     assert!(err.contains(expected), "{err}");
     clean_refusal(&dir, &err, true);
@@ -768,7 +749,7 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
             }
             let (dir, err, code) = startup_coded(
                 &format!("normal-{model}-{value}"),
-                env!("CARGO_BIN_EXE_bloomery-serve"),
+                &seat("bloomery-serve"),
                 &args,
                 &[],
             );
@@ -846,7 +827,7 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
         args.extend_from_slice(tail);
         let (dir, err, code) = startup_coded(
             &format!("boundary-{model}-{i}"),
-            env!("CARGO_BIN_EXE_bloomery-serve"),
+            &seat("bloomery-serve"),
             &args,
             env,
         );
@@ -857,7 +838,6 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
-    #[cfg(feature = "vision")]
     for model in ["ds41", "qwen38", "glm", "qwen3", "decide"] {
         for side in [false, true] {
             let mut args = vec!["--model", model, "--hf", "o/r:Q8_0"];
@@ -871,7 +851,7 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
             }
             let (dir, err, code) = startup_coded(
                 &format!("{model}-repo-limits-{side}"),
-                env!("CARGO_BIN_EXE_bloomery-serve"),
+                &seat("bloomery-serve"),
                 &args,
                 &[],
             );
@@ -885,7 +865,6 @@ fn hw_preflight_normal_inputs_reach_the_fetch() {
     }
 }
 
-#[cfg(feature = "vision")]
 #[test]
 fn preflight_local_side_limits() {
     checked_refusal(
@@ -905,7 +884,6 @@ fn preflight_local_side_limits() {
     );
 }
 
-#[cfg(feature = "vision")]
 #[test]
 fn preflight_explicit_projector_feed() {
     for model in ["ds41", "qwen38"] {
@@ -943,12 +921,12 @@ fn preflight_residency_steps() {
 #[test]
 fn preflight_stand_alone_lever_aliases() {
     for (model, bin) in [
-        ("ds41", env!("CARGO_BIN_EXE_bloomery-serve-ds41")),
-        ("qwen38", env!("CARGO_BIN_EXE_bloomery-serve-qwen38")),
+        ("ds41", seat("bloomery-serve-ds41")),
+        ("qwen38", seat("bloomery-serve-qwen38")),
     ] {
         refusal(
             &format!("{model}-lever-alias"),
-            bin,
+            &bin,
             &["--alias", "--levers", "--ctx-size", "abc"],
             None,
             &format!("bloomery-serve-{model}: --ctx-size \"abc\""),
@@ -1009,7 +987,7 @@ fn hw_a_seat_word_alone_starts_by_name_and_refuses_offline() {
     ] {
         let (dir, err, code) = startup_coded(
             &format!("{model}-by-name"),
-            env!("CARGO_BIN_EXE_bloomery-serve"),
+            &seat("bloomery-serve"),
             &["--model", model, "--host", "127.0.0.1", "--port", "0"],
             &[],
         );
@@ -1095,7 +1073,6 @@ fn preflight_explicit_tier_capacity() {
     }
 }
 
-#[cfg(feature = "vision")]
 #[test]
 fn preflight_local_primary_limits() {
     for model in ["ds41", "qwen38", "glm", "qwen3", "decide"] {
@@ -1163,14 +1140,14 @@ fn preflight_leaves_unapplied_levers_to_the_run() {
     let lever = ("BLOOMERY_QWEN3_UBATCH", "512");
     let (dir, err) = startup(
         "unapplied-every-seat",
-        env!("CARGO_BIN_EXE_bloomery-serve"),
+        &seat("bloomery-serve"),
         &["--hf", "o/r", "--ctx-size", "abc"],
         &[lever],
     );
     assert_eq!(err.matches("is not applied").count(), 0, "{err}");
     clean_refusal(&dir, &err, true);
     std::fs::remove_dir_all(dir).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_bloomery-serve"))
+    let output = Command::new(seat("bloomery-serve"))
         .args(["--model", "ds41", "--levers"])
         .env_clear()
         .env(lever.0, lever.1)

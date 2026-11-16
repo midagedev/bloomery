@@ -263,8 +263,13 @@ module load, so a second build with another feature set replaces the file a runn
 (2026-10-12: gate_glm5next_e2e, `glm5next,vision` against `glm5next`). `check` refuses a (package, bin, directory) that
 two builds give different resolved sets — the enabled features after the package's closure plus its `dep/feature` words,
 so `gpu,deepseek41` and `deepseek41` agree — and prints the bin, its package and directory, and every recipe grouped by
-the set it resolves to, the widest first. Only `build`, `run` and `rustc` write the bin: a test or bench build writes a
-hash-named file under deps/, and check and clippy write none. There is no exemption for one recipe building a bin with
+the set it resolves to, the widest first. `build`, `run` and `rustc` write the bin, and so does a `test` or `bench` call that
+selects an integration test or a bench (`--test`, `--tests`, `--bench`, or no selector in a package that has them): cargo
+compiles every bin of the package whose required features the call's set enables and links each into the profile
+directory, fresh or not, so such a call is listed as `<recipe> (test build)` for every one of those bins (2026-11-16: the
+`--test serve_preflight` calls of gate-serve-draft-rules replaced and re-linked ~190 bins under gate-ptx-spill's scan and
+the e2e and iq-quant gates' sibling processes). A test of a bin's or the lib's own unit tests (`--bin`, `--lib`, `--doc`)
+and check and clippy write none (the unit-test executable lands under deps/). There is no exemption for one recipe building a bin with
 several sets in turn: the file is replaced under whichever lane runs it just the same (2026-10-13, gate-ptx-spill's
 oxart_jit, built three times; it now builds it once). An invocation whose package, features, targets or target dir come
 from a recipe parameter is left out (the ptx-scan, sass-scan and lds-scan recipes): their features are known at run time
@@ -7510,14 +7515,22 @@ def release_feature_problems(rb: ReleaseBuild, tree: Tree, recipes: dict[str, Re
     writes the bin counts (BIN_WRITING_SUBS): a `cargo check` replaces no file another lane runs. A call is read as
     cargo reads it (resolve_call): a package with no `--bin` is every bin whose required features the list enables.
     A bin built beside it on the same line takes the release list too; a gate bin that needs other features goes on a
-    cargo line of its own."""
+    cargo line of its own. A `test` or `bench` call that selects an integration test also compiles and links every bin of
+    its package (test_uplifted_bins): in the shared profile directory it counts as a build of the shipped bins it links
+    (in a target dir of its own it replaces no file a gate runs, and is left out)."""
     want = set(rb.features)
     out: list[str] = []
     for rname, inv, _, _ in sorted(build_calls(recipes), key=lambda c: recipes[c[0]].line):
-        if inv.sub not in BIN_WRITING_SUBS:
+        if inv.sub in BIN_WRITING_SUBS:
+            targets, _ = resolve_call(tree, inv)  # an unresolvable call is check()'s error, named there
+            shipped = [n for p, k, n, *_ in targets if k == "bin" and p == rb.package and n in rb.bins]
+            verb = "builds"
+        elif inv.sub in BIN_UPLIFTING_SUBS and build_dir(inv) in ("release", "dev"):
+            targets, _ = resolve_call(tree, inv)
+            shipped = [n for p, n, *_ in test_uplifted_bins(tree, targets) if p == rb.package and n in rb.bins]
+            verb = "test-builds (a `--test` call compiles and links every bin of its package)"
+        else:
             continue
-        targets, _ = resolve_call(tree, inv)  # an unresolvable call is check()'s error, named there
-        shipped = [n for p, k, n, *_ in targets if k == "bin" and p == rb.package and n in rb.bins]
         if not shipped:
             continue
         got = set(inv.features)
@@ -7529,7 +7542,7 @@ def release_feature_problems(rb: ReleaseBuild, tree: Tree, recipes: dict[str, Re
         elif got != want:
             how = f"features {','.join(sorted(got)) or 'none'}"
         if how:
-            out.append(f"justfile:{recipes[rname].line} {rname}: builds {' '.join(shipped)} with {how}, not the release list "
+            out.append(f"justfile:{recipes[rname].line} {rname}: {verb} {' '.join(shipped)} with {how}, not the release list "
                        f"{','.join(rb.features)} ({RELEASE_BUILD}): the gates of a shipped bin run the binary the release packs, and two lanes "
                        f"at two lists relink target/release/{shipped[0]} under each other. Build it with the release list on a cargo line of its own")
     return out
@@ -8550,9 +8563,12 @@ def build_shapes(tree: Tree, recipes: dict[str, Recipe]) -> tuple[list[Combo], l
 # ----------------------------------------------------------------------------------------------
 # The rule is the module docstring's «bin feature sets» paragraph; `just check-recipes` runs it.
 
-# The subcommands that write the bin to <target dir>/<profile>/<bin>. A test or bench build writes a
-# hash-named file under deps/, and check and clippy write none, so none of them replaces a bin.
+# The subcommands that write the bin to <target dir>/<profile>/<bin>. check and clippy write none. A test or bench build of
+# a bin's own unit tests (`--bin`, `--lib`) writes only a hash-named file under deps/, but one that builds an integration
+# test or a bench also compiles every bin of its package and uplifts each to <dir>/<profile>/<bin> (cargo's
+# CARGO_BIN_EXE_<bin>): test_uplifted_bins names those, and the rules below count them as writers of the bin file.
 BIN_WRITING_SUBS = ("build", "run", "rustc")
+BIN_UPLIFTING_SUBS = ("test", "bench")
 # cargo's two profiles that inherit another write to that one's directory.
 _PROFILE_DIR = {"test": "dev", "bench": "release"}
 
@@ -8566,11 +8582,30 @@ def build_dir(inv: Invocation) -> str:
     return "/".join(x for x in ("" if root == "target" else root, inv.target, _PROFILE_DIR.get(inv.profile, inv.profile)) if x)
 
 
+def test_uplifted_bins(tree: Tree, targets: list) -> list[tuple[str, str, tuple[str, ...], tuple[str, ...]]]:
+    """[(package, bin, enabled features, `dep/feature` words)] of the bins a `test` or `bench` call writes to
+    <dir>/<profile>/<bin> besides its test files. cargo compiles every bin of a package whose integration test or bench
+    the call selects, as far as the set enables the bin's required features, and links each into the profile
+    directory, fresh or not (2026-11-16: `--test serve_preflight` under a 15 and a 16 feature set replaced and re-linked
+    ~190 bins other recipes had built with their own sets). A call that selects only `--lib`, `--bin`, `--doc` or
+    `--examples` writes none; `targets` is resolve_call's list."""
+    out: list[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = []
+    seen: set[str] = set()
+    for pname, kind, _, _, enabled, others in targets:
+        if kind not in ("test", "bench") or pname in seen:
+            continue
+        seen.add(pname)
+        out += [(pname, t.name, enabled, others) for t in tree.packages[pname].targets if t.kind == "bin" and set(t.required) <= set(enabled)]
+    return out
+
+
 def bin_feature_problems(tree: Tree, recipes: dict[str, Recipe], skip: frozenset[tuple[str, str]] = frozenset()) -> list[str]:
     """A (package, bin, directory) that two builds give different resolved feature sets: they write one file,
     <dir>/<profile>/<bin>, and cuda-host reads the PTX bundle from `current_exe()` at each module load, so the
     later build replaces the file a running gate loads its kernels from (2026-10-12: gate_glm5next_e2e built
-    with `glm5next,vision` by one recipe and with `glm5next` by another, while the first ran). The set is the
+    with `glm5next,vision` by one recipe and with `glm5next` by another, while the first ran). A `test` or
+    `bench` call that selects an integration test or a bench is such a build of every bin of its package
+    (test_uplifted_bins), named `<recipe> (test build)`. The set is the
     enabled features after the package's closure plus its `dep/feature` words, so `gpu,deepseek41` and
     `deepseek41` agree. The two builds may be one recipe's, one after the other (2026-10-13: gate-ptx-spill's
     oxart_jit, built three times): the file is replaced under whichever lane runs it just the same, so a recipe's
@@ -8580,23 +8615,28 @@ def bin_feature_problems(tree: Tree, recipes: dict[str, Recipe], skip: frozenset
     built: dict[tuple[str, str, str], dict[tuple[str, ...], list[str]]] = {}
     for rname, inv, _, param in build_calls(recipes):
         where = build_dir(inv)
-        if inv.sub not in BIN_WRITING_SUBS or param or "{{" in where:
+        if inv.sub not in BIN_WRITING_SUBS + BIN_UPLIFTING_SUBS or param or "{{" in where:
             continue
         targets, _ = resolve_call(tree, inv)  # an unresolvable call is check()'s error, named there
-        for pname, kind, name, _, enabled, others in targets:
-            if kind == "bin" and (pname, name or "") not in skip:
-                users = built.setdefault((pname, name or "", where), {}).setdefault(tuple(sorted(enabled + others)), [])
-                if rname not in users:
-                    users.append(rname)
+        if inv.sub in BIN_WRITING_SUBS:
+            written = [(pname, name or "", enabled, others, rname) for pname, kind, name, _, enabled, others in targets if kind == "bin"]
+        else:
+            written = [(pname, name, enabled, others, f"{rname} (test build)") for pname, name, enabled, others in test_uplifted_bins(tree, targets)]
+        for pname, name, enabled, others, label in written:
+            if (pname, name) not in skip:
+                users = built.setdefault((pname, name, where), {}).setdefault(tuple(sorted(enabled + others)), [])
+                if label not in users:
+                    users.append(label)
     problems: list[str] = []
     for (pname, name, where), sets in sorted(built.items()):
         if len(sets) < 2:
             continue
         # the widest set first (the union's candidate), the recipes of a set sorted: one line whatever the order
         groups = " vs ".join(f"{', '.join(sorted(rs))} {{{','.join(fs)}}}" for fs, rs in sorted(sets.items(), key=lambda kv: (-len(kv[0]), kv[0])))
+        uplift = " a `--test`/`--bench` call compiles and links every bin of its package (CARGO_BIN_EXE), so it takes a target dir of its own unless its set is the bin's;" if "(test build)" in groups else ""
         problems.append(
             f"{name} ({pname}, {where}): {groups} "
-            f"(one {name} file in {where}: a rebuild replaces the PTX bundle a running gate reads; build the union in each, or give a build its own target dir where no runner reads target/release)"
+            f"(one {name} file in {where}: a rebuild replaces the PTX bundle a running gate reads;{uplift} build the union in each, or give a build its own target dir where no runner reads target/release)"
         )
     return problems
 
@@ -15398,7 +15438,7 @@ def bin_feature_self_test(expect) -> None:
     def call(feats: str, flags: str = "--release", sub: str = "cargo oxide build --arch sm_86 --", bin_: str = "gate_glm5next_e2e") -> str:
         return f"{sub} -p bloomery-gpu-gates --features {feats} {flags} --bin {bin_}"
 
-    def problems(*recipes: tuple[str, ...]) -> list[str]:
+    def problems(*recipes: tuple[str, ...], only: str = "gate_glm5next_e2e") -> list[str]:
         with tempfile.TemporaryDirectory(prefix="recipes-binfeat-") as tmp:
             p = os.path.join(tmp, "justfile")
             with open(p, "w", encoding="utf-8") as fh:
@@ -15417,7 +15457,7 @@ def bin_feature_self_test(expect) -> None:
                         words = [" && ".join(g) if local and i == 0 else f"./tools/box.sh '{' && '.join(g)}'" for i, g in enumerate(groups) if g]
                         fh.write(f"    {' && '.join(words)}\n")
             try:
-                return [x for x in check(Tree(ROOT), load_justfile(p)) if "gate_glm5next_e2e" in x]
+                return [x for x in check(Tree(ROOT), load_justfile(p)) if only in x]
             except RecipeError as err:
                 return [f"raised {err}"]
 
@@ -15488,6 +15528,41 @@ def bin_feature_self_test(expect) -> None:
     expect(problems(("a DIR", call("glm5next", flags="--release --target-dir {{DIR}}")), ("b DIR", call("glm5next,vision", flags="--release --target-dir {{DIR}}"))) == [], "bin features: a parameter's target dir refused")
     # no feature set differs for a bin built once
     expect(problems(("a", call("glm5next,vision"))) == [], "bin features: a lone build refused")
+
+    # 2026-11-16: a test call that selects an integration test compiles and links every bin of its package (CARGO_BIN_EXE_<bin>), so it
+    # writes <dir>/<profile>/<bin> like a build. Derivation: cargo builds the package's bins for any integration test or bench it
+    # runs; gate-serve-draft-rules' two `--test serve_preflight` calls (a 15 and a 16 feature set) re-linked ~190 bins under the gates and
+    # scans that ran them (gate-ptx-spill scanned generate_ds41 with the vision entries of the 16 set; the e2e and iq-quant gates'
+    # sibling processes lost their images). FAIL-first: with test builds left out of BIN_WRITING_SUBS every case below that expects a
+    # line returned [] (check() was green on the justfile that shipped those calls).
+    spf = "glm5next,clef,mimo2,solar2,minimaxm3,flint,mistrallarge4,gemma-embedding2,hf"  # enables the bin under check (glm5next) and the test below (hf)
+
+    def tcall(feats: str, flags: str = "--release", sel: str = "--test sentence_prompts") -> str:
+        return f"cargo oxide test --arch sm_86 -- -p bloomery-gpu-gates --features {feats} {flags} {sel}".replace("  ", " ").rstrip()
+
+    spf_set = closure(spf)
+    got = problems(("a", call("glm5next")), ("b", tcall(spf)))
+    expect(len(got) == 1 and got[0].startswith(f"{base}b (test build) {spf_set} vs a {narrow} ") and "takes a target dir of its own" in got[0],
+           f"bin features: an integration-test call at another set is not named as a test build: {got}")
+    expect(problems(("a", call(spf)), ("b", tcall(spf))) == [], "bin features: a test call at the bin's own resolved set refused")
+    expect(problems(("a", call("glm5next")), ("b", "CARGO_TARGET_DIR=target/t " + tcall(spf))) == [], "bin features: a test call with a CARGO_TARGET_DIR prefix refused")
+    expect(problems(("a", call("glm5next")), ("b", tcall(spf, flags="--release --target-dir target/t"))) == [], "bin features: a test call with its own --target-dir refused")
+    for what, sel in (("--lib", "--lib"), ("--bin of its own", "--bin gate_glm5next_e2e"), ("--doc", "--doc")):
+        expect(problems(("a", call("glm5next")), ("b", tcall(spf, sel=sel))) == [], f"bin features: a {what} test call refused (it links no bin)")
+    for what, sel in (("--tests", "--tests"), ("no selector", "")):
+        got = problems(("a", call("glm5next")), ("b", tcall(spf, sel=sel)))
+        expect(len(got) == 1 and "b (test build)" in got[0], f"bin features: a test call with {what} (it runs the integration tests) not named: {got}")
+    # the bin's required features decide: `hf` enables sentence_prompts' test but not gate_glm5next_e2e (needs glm5next)
+    expect(problems(("a", call("glm5next")), ("b", tcall("hf", sel="--test sentence_prompts"))) == [], "bin features: a test call whose set lacks the bin's required features refused")
+    # one recipe's two test calls at two sets is the serve-draft-rules shape: two files in one directory
+    got = problems(("a", tcall(spf), tcall(spf + ",vision")))
+    expect(len(got) == 1 and got[0].startswith(f"{base}a (test build) {closure(spf + ',vision')} vs a (test build) {spf_set} "), f"bin features: one recipe's two test calls at two sets not named: {got}")
+    expect(problems(("a", "CARGO_TARGET_DIR=target/a " + tcall(spf), "CARGO_TARGET_DIR=target/b " + tcall(spf + ",vision"))) == [], "bin features: two test calls in two target dirs refused")
+    # a shipped bin (build.sh's BINS) is held to the release list by the other rule: a test call that links it at another list in the shared
+    # directory is that rule's line, and in a target dir of its own it is not
+    got = problems(("a", tcall(spf)), only="not the release list")
+    expect(len(got) == 1 and "test-builds" in got[0] and "bloomery-quantize" in got[0], f"bin features: a test call linking a shipped bin at another list not named by the release rule: {got}")
+    expect(problems(("a", "CARGO_TARGET_DIR=target/t " + tcall(spf)), only="not the release list") == [], "bin features: a test call in its own target dir named by the release rule")
 
 
 def _raises(fn: Callable[[], object], why: str) -> bool:

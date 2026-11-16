@@ -854,9 +854,11 @@ required-features = ["vision"]
 name = "sentence_prompts"
 required-features = ["hf"]
 
-[[test]]
-name = "serve_preflight"
-required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "mistrallarge4", "gemma-embedding2", "hf"]
+# serve-preflight: the launcher's checks before the model fetch, the unit tests of this bin (`cargo test --bin`). A `[[test]]` target
+# would make every `cargo test` that selects it compile and link every bin of the package, replacing the ones other lanes run.
+[[bin]]
+name = "gate_serve_preflight"
+required-features = ["glm5next", "clef", "vision", "mimo2", "solar2", "minimaxm3", "flint", "mistrallarge4", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "gate_qwen38_media"
