@@ -46,6 +46,12 @@ mtime_of() {
   if [ "$(uname)" = Darwin ]; then stat -f %m "$1"; else stat -c %Y "$1"; fi
 }
 
+# drop_mac_static DST: the step after the clone, shared by seed_main and the self-test's plain-copy branch, so both leave
+# DST/target without the source tree's mac-static runs (their recorded pids are SRC_TREE's).
+drop_mac_static() {
+  rm -rf "$1/target/mac-static"
+}
+
 # restore_mtimes SRC DST: the mtime pass of the header, then the unit and byte count of DST/target.
 restore_mtimes() {
   python3 - "$1" "$2" << 'PY'
@@ -122,7 +128,7 @@ seed_main() {
     say "the clone of $src/target into $dst/target failed; the partial target/ is removed" >&2
     return 70
   fi
-  rm -rf "$dst/target/mac-static"
+  drop_mac_static "$dst"
   if ! restore_mtimes "$src" "$dst"; then
     rm -rf "$dst/target"
     say "the mtime pass failed; the target/ is removed" >&2
@@ -195,6 +201,7 @@ self_test() {
     [ "$rc" = 0 ] || fail "the seed ended rc $rc: $out"
   else
     cp -Rp "$src/target" "$dst/target"
+    drop_mac_static "$dst"
     rc=0; out=$(restore_mtimes "$src" "$dst" 2>&1) || rc=$?
     [ "$rc" = 0 ] || fail "the mtime pass ended rc $rc: $out"
   fi
@@ -206,10 +213,8 @@ self_test() {
   [ "$(mtime_of "$dst/.git/HEAD")" = "$git_m" ] || fail ".git was touched"
   [ "$(mtime_of "$dst/target/debug/build/p/h1/fingerprint/lib-p")" = "$seed_m" ] || fail "the target/ file lost the seed's mtime"
   cmp -s "$src/target/debug/build/q/h2/fingerprint/lib-q" "$dst/target/debug/build/q/h2/fingerprint/lib-q" || fail "the target/ content differs from the seed's"
-  if [ "$(uname)" = Darwin ]; then
-    [ ! -e "$dst/target/mac-static" ] || fail "the seed carried SRC's target/mac-static into DST"
-    [ -f "$src/target/mac-static/run.src/pids" ] || fail "the seed removed SRC's own target/mac-static"
-  fi
+  [ ! -e "$dst/target/mac-static" ] || fail "the seed carried SRC's target/mac-static into DST"
+  [ -f "$src/target/mac-static/run.src/pids" ] || fail "the seed removed SRC's own target/mac-static"
   rc=0; out=$(seed_main "$src" "$dst" 2>&1) || rc=$?
   [ "$rc" = 65 ] || fail "a second seed ended rc $rc, not 65: $out"
 
