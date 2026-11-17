@@ -322,7 +322,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             schema_jump: levers.schema_jump(),
             side: None,
         },
-    )?;
+    )?
+    // The seat refuses `--embd-model`, `--embd-hf` and `--slot-save-path` ([`parse`], [`run`]), so
+    // its 501 answers name none of them.
+    .with_starts(serve::flag::Starts::default());
     Record::new(&record::LISTENING_HOST)
         .w("place", "host")
         .u("ctx", ctx)

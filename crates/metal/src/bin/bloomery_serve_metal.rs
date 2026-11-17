@@ -32,7 +32,9 @@
 //! of up to `Session::pass_rows` ids, a shorter one a host-fed step an id. The
 //! session opens the copies a marked pass leaves with its rows arena
 //! (`MarkCopies::AtOpen`), so the first request pays nothing the later ones
-//! do not. No prompt cache, no slot files, no image input.
+//! do not. No prompt cache, no slot files, no image input, no embeddings side
+//! model: the 501 of `/v1/embeddings` and of a slot action says the server has
+//! none and names no flag, since the server takes none (`STARTS`).
 //!
 //! `--draft mtp --mtp SIDECAR` serves with the MTP draft of a Qwen3.5-family
 //! file (`generate_metal`'s flags and sidecar, `mlx-community/Qwen3.8-27B-MTP-4bit`):
@@ -114,6 +116,13 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
     /// The model's path flags; `--hf` is the repo's.
     const PATH_FLAGS: &[&str] = &["-m", "--model"];
 
+    /// What this server starts the optional parts with: nothing, since `parse` takes no
+    /// embedding model flag and no slot save directory, so the server's 501 answers name no flag.
+    const STARTS: serve::flag::Starts = serve::flag::Starts {
+        side_model: &[],
+        slot_save: None,
+    };
+
     struct Args {
         model: Source,
         host: String,
@@ -140,7 +149,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         Lookup,
     }
 
-    fn parse(width: Option<&str>) -> Result<Args, String> {
+    fn parse(width: Option<&str>, args: impl IntoIterator<Item = String>) -> Result<Args, String> {
         let mut model = Vec::new();
         let mut a = Args {
             model: Source::File(String::new()),
@@ -155,7 +164,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             mtp: None,
             width: WidthMode::Cost,
         };
-        let mut it = std::env::args().skip(1);
+        let mut it = args.into_iter();
         while let Some(f) = it.next() {
             let mut val = || it.next().ok_or_else(|| format!("{f} needs a value"));
             match f.as_str() {
@@ -222,7 +231,7 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             }
         };
         serve::live::enable(levers.screen());
-        let a = match parse(levers.mtp_width()) {
+        let a = match parse(levers.mtp_width(), std::env::args().skip(1)) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("bloomery-serve-metal: {e}");
@@ -320,6 +329,18 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
                 ..EngineProps::default()
             },
         )?))
+    }
+
+    /// The server over `engine` on `addr`, with [`STARTS`] as the flags its 501 answers name.
+    fn bind(
+        engine: Box<dyn serve::Engine>,
+        config: ServerConfig,
+        slots: SlotConfig,
+        addr: (&str, u16),
+    ) -> Result<Server, String> {
+        Ok(Server::bind_with(addr, engine, config, slots)
+            .map_err(|e| e.to_string())?
+            .with_starts(STARTS))
     }
 
     fn open(a: Args) -> Result<Server, String> {
@@ -444,11 +465,90 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
             queue_depth: a.queue_depth,
             ..SlotConfig::default()
         };
-        let server = Server::bind_with((a.host.as_str(), a.port), engine, config, slots)
-            .map_err(|e| e.to_string())?;
+        let server = bind(engine, config, slots, (a.host.as_str(), a.port))?;
         let addr = server.local_addr().map_err(|e| e.to_string())?;
         eprintln!("bloomery-serve-metal: listening on http://{addr}");
         Ok(server)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+
+        use serve::MockEngine;
+
+        use super::*;
+
+        fn parsed(args: &[&str]) -> Result<Args, String> {
+            parse(None, args.iter().map(|a| (*a).to_owned()))
+        }
+
+        /// The server's answer to `method path`, whole: its status and body.
+        fn ask(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            let request = format!(
+                "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+                 Content-Length: 2\r\n\r\n{{}}"
+            );
+            s.write_all(request.as_bytes()).expect("write");
+            let mut raw = String::new();
+            s.read_to_string(&mut raw).expect("read");
+            let (head, body) = raw.split_once("\r\n\r\n").expect("a head");
+            let status = head.split_whitespace().nth(1).and_then(|c| c.parse().ok());
+            (status.expect("a status line"), body.to_owned())
+        }
+
+        /// The Metal server's 501 answers name no flag its command line refuses: it takes no
+        /// embedding model and no slot save directory, says it has none, and every flag a 501
+        /// does name is one `parse` takes. Mutant: [`STARTS`] naming `--embd-model`, which the
+        /// server ends 64 on.
+        #[test]
+        fn the_501_answers_name_no_flag_the_server_refuses() {
+            for flag in ["--embd-model", "--embd-hf", "--slot-save-path"] {
+                let e = parsed(&["-m", "x", flag, "y"]).err().expect(flag);
+                assert!(e.starts_with(&format!("unknown flag {flag}")), "{e}");
+            }
+            let config = ServerConfig {
+                model_alias: "mock".to_owned(),
+                model_path: "mock.gguf".to_owned(),
+                chat_template: "{%- for m in messages %}{{- m.content }}{%- endfor %}".to_owned(),
+                chat_preparation: None,
+                sampler: None,
+                fatal_linger: FATAL_LINGER,
+                slot_save_path: None,
+                api_keys: ApiKeys::default(),
+            };
+            let addr = bind(
+                Box::new(MockEngine::new(64)),
+                config,
+                SlotConfig::default(),
+                ("127.0.0.1", 0),
+            )
+            .expect("bind")
+            .spawn()
+            .expect("spawn");
+            for (method, path, says) in [
+                ("POST", "/v1/embeddings", "it has no embeddings side model"),
+                ("POST", "/embedding", "it has no embeddings side model"),
+                (
+                    "POST",
+                    "/slots/0?action=save",
+                    "it has no slot save directory",
+                ),
+            ] {
+                let (status, body) = ask(addr, method, path);
+                assert_eq!(status, 501, "{path}: {body}");
+                assert!(body.contains(says), "{path}: {body}");
+                for flag in body.split('`').skip(1).step_by(2) {
+                    let taken = parsed(&["-m", "x", flag, "y"]);
+                    assert!(
+                        taken.is_ok() || !taken.err().unwrap().contains("unknown flag"),
+                        "{path} names {flag}, which the server refuses: {body}"
+                    );
+                }
+            }
+        }
     }
 }
 

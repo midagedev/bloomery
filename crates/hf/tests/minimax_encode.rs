@@ -72,7 +72,7 @@ fn hw_the_served_minimax_tokenizer_encodes_the_corpus_as_hf() {
     assert_eq!(
         served.eog(),
         vocab.stop,
-        "serving stops where HF's generate does"
+        "serving stops where the folder's stop set does"
     );
     let cases = corpus["cases"].as_array().unwrap();
     assert!(cases.len() >= 15_000, "{} cases in {path}", cases.len());

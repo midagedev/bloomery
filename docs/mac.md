@@ -187,7 +187,8 @@ id a pass, verified in a pass of two rows. The ids are the plain run's; the summ
 
 - A long prompt runs in batched passes (flash attention over the pass, the experts over its rows); decode runs one id a
   step.
-- No saved prompt cache across slots, no slot files, no image input (MiniCPM-V's `mmproj` is not read). The
+- No saved prompt cache across slots, no slot files, no embeddings side model (the 501 of `/v1/embeddings` and of a slot
+  action says the server has none and names no flag), no image input (MiniCPM-V's `mmproj` is not read). The
   server drafts only under `--draft lookup|mtp` (above); a request that samples is never drafted by the MTP layer.
 - On an M5 (Metal 4, GPU family 17 or newer) the device picks the neural accelerators' tensor-op GEMMs for prompts
   (`gemm_path=tensor` in the stats); M1 to M4 run the SIMD-group GEMMs (`gemm_path=simdgroup`). On an M5 Ultra the

@@ -84,6 +84,24 @@ use crate::side_seat::SideEngine;
 pub use serve::sampling::{sampler_factory, sampler_params};
 pub use serve::vocab::{ChatSurface, TemplateFile, Vocab};
 
+/// The flag that names the directory the slot actions answer from ([`SeatFlags::parse`]).
+const SLOT_SAVE_FLAG: &str = "--slot-save-path";
+
+/// The flags that name an embedding model in this build: the side seat's, which the hub's
+/// feature carries ([`crate::side_seat::NAMING`]); a build without it takes none.
+#[cfg(feature = "hf")]
+const SIDE_MODEL_FLAGS: &[&str] = crate::side_seat::NAMING;
+#[cfg(not(feature = "hf"))]
+const SIDE_MODEL_FLAGS: &[&str] = &[];
+
+/// What a seat's command line starts the optional parts with: the embedding model by
+/// `--embd-model` or `--embd-hf` and the slot actions' directory by `--slot-save-path`, which the
+/// server's 501 answers for an absent part name.
+pub const STARTS: serve::flag::Starts = serve::flag::Starts {
+    side_model: SIDE_MODEL_FLAGS,
+    slot_save: Some(SLOT_SAVE_FLAG),
+};
+
 /// What a seat's server binds with, past its engine.
 pub struct Listen<'a> {
     pub host: &'a str,
@@ -137,7 +155,8 @@ pub fn bind_server<E: Engine + 'static>(engine: E, l: Listen<'_>) -> Result<Serv
     let server = match crate::start::noted_place() {
         Some(place) => server.with_place(place),
         None => server,
-    };
+    }
+    .with_starts(STARTS);
     Ok(match l.side {
         Some(side) => server.with_side(Box::new(side)),
         None => server,
@@ -571,7 +590,7 @@ impl SeatFlags {
                 "--alias" => a.alias = Some(v.to_owned()),
                 TemplateFile::FLAG => a.template_file.set(v),
                 "--queue-depth" => a.queue_depth = Some(serve::flag::number(flag, v)?),
-                "--slot-save-path" => a.slot_save_path = Some(PathBuf::from(v)),
+                SLOT_SAVE_FLAG => a.slot_save_path = Some(PathBuf::from(v)),
                 f if serve::flag::KEYS.contains(&f) => a.api_keys.add(f, v)?,
                 f if slots.take(f, v)? => {}
                 other => {
@@ -4778,6 +4797,79 @@ mod tests {
         assert!(
             e.to_string().starts_with("--slot-save-path needs a value"),
             "{e}"
+        );
+    }
+
+    /// The 501 answers of a seat's server name the flags its command line takes: every flag of
+    /// [`STARTS`] is one the seats' parsers take (`--embd-model` and `--embd-hf` the side seat's,
+    /// `--slot-save-path` [`SeatFlags`]'s), and a server [`bind_server`] binds without a side
+    /// model or slot directory names exactly those. Mutant: [`bind_server`] without
+    /// `with_starts`.
+    #[test]
+    fn the_501_answers_name_the_flags_the_seats_take() {
+        use std::io::{Read, Write};
+        use std::path::PathBuf;
+
+        use super::{Listen, STARTS, SeatFlags, bind_server};
+
+        let _note = crate::start::slot_note_tests();
+        let args = |a: &[&str]| a.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
+        #[cfg(feature = "hf")]
+        for flag in STARTS.side_model {
+            let (taken, rest) = crate::side_seat::Flags::take(&args(&[flag, "x"]))
+                .unwrap_or_else(|e| panic!("{flag}: {e}"));
+            assert!(taken.names() && rest.is_empty(), "{flag} names no model");
+        }
+        let slot = STARTS.slot_save.expect("the seats take a slot directory");
+        let seat = SeatFlags::parse(&args(&[slot, "/slots"]), "usage", |_, _| Ok(false))
+            .unwrap_or_else(|e| panic!("{slot}: {e}"));
+        assert_eq!(seat.slot_save_path, Some(PathBuf::from("/slots")));
+
+        let path = PathBuf::from("mock.gguf");
+        let addr = bind_server(
+            serve::MockEngine::new(64),
+            Listen {
+                host: "127.0.0.1",
+                port: 0,
+                alias: "mock".to_owned(),
+                path: &path,
+                template: "{%- for m in messages %}{{- m.content }}{%- endfor %}".to_owned(),
+                preparation: None,
+                slot_save_path: None,
+                api_keys: serve::flag::ApiKeys::default(),
+                parallel: 1,
+                queue_depth: None,
+                schema_jump: false,
+                side: None,
+            },
+        )
+        .expect("bind")
+        .spawn()
+        .expect("spawn");
+        let ask = |path: &str| {
+            let mut s = std::net::TcpStream::connect(addr).expect("connect");
+            let request = format!(
+                "POST {path} HTTP/1.0\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+                 Content-Length: 2\r\n\r\n{{}}"
+            );
+            s.write_all(request.as_bytes()).expect("write");
+            let mut raw = String::new();
+            s.read_to_string(&mut raw).expect("read");
+            raw
+        };
+        let embeddings = ask("/v1/embeddings");
+        assert!(embeddings.contains(" 501 "), "{embeddings}");
+        let named = if cfg!(feature = "hf") {
+            "Start it with `--embd-model` or `--embd-hf`"
+        } else {
+            "it has no embeddings side model"
+        };
+        assert!(embeddings.contains(named), "{embeddings}");
+        let slots = ask("/slots/0?action=save");
+        assert!(slots.contains(" 501 "), "{slots}");
+        assert!(
+            slots.contains("Start it with `--slot-save-path`"),
+            "{slots}"
         );
     }
 

@@ -1409,12 +1409,14 @@ pub fn served_as_hf(
     }
     if let Some(id) = vocab.stop.iter().find(|id| !served.eog().contains(id)) {
         return Err(format!(
-            "HF's generate stops at token {id}, where serving does not end generation"
+            "the folder's stop set holds token {id}, where serving does not end generation"
         )
         .into());
     }
     if let Some(id) = served.eog().iter().find(|id| !vocab.stop.contains(id)) {
-        return Err(format!("serving stops at token {id}, where HF's generate continues").into());
+        return Err(
+            format!("serving stops at token {id}, where the folder's stop set continues").into(),
+        );
     }
     let expected = |key: &str| vocab.keys.iter().find(|(k, _)| k == key).map(|(_, v)| v);
     let Some(Value::Array(types)) = expected("tokenizer.ggml.token_type") else {

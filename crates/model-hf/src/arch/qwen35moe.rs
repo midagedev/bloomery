@@ -275,6 +275,9 @@ impl Family {
 const VISION: &str = "the vision tower and its placeholders; this converter writes the text model";
 const MTP: &str =
     "the next-token layers, which this converter leaves out and the trunk never reads";
+const OPTIQ: &str = "mlx-optiq's bundled next-token head and vision tower, which sit in files of their \
+    own (`optiq/mtp.safetensors`, `optiq_vision.safetensors`) that `model.safetensors.index.json` \
+    does not name, so the open reads neither";
 const SAMPLING: &str =
     "the checkpoint's sampling defaults; a request's own settings decide how the program samples";
 const PLE_SIZES: &str = "sized the PLE hash tables in training; the checkpoint's ngram_heads_offsets \
@@ -321,11 +324,19 @@ const ROOT_HF_DENSE: &Fields = &[
 ];
 
 /// An MLX family's `config.json` keys beside [`ROOT_SHARED`]: `quantization` is MLX's block, which
-/// `hf::quant_config` reads, and `eos_token_id` the ids `hf::vocab::Config` reads.
+/// `hf::quant_config` reads, `eos_token_id` the ids `hf::vocab::Config` reads, and mlx-optiq's keys
+/// for the head and vision tower it bundles as sidecar files, which the open leaves unread.
 const ROOT_MLX: &Fields = &[
     ("quantization", Read),
     ("eos_token_id", Read),
     IMAGE_TOKEN_UNREAD,
+    ("mtp_file", Ignore(Type::String, OPTIQ)),
+    ("mtp_tensor_count", Ignore(Type::Number, OPTIQ)),
+    ("mtp_policy", Ignore(Type::String, OPTIQ)),
+    ("mtplx_mtp_quantization", Ignore(Type::Object, OPTIQ)),
+    ("mtp_num_hidden_layers", Ignore(Type::Number, OPTIQ)),
+    ("optiq_vision", Ignore(Type::Object, OPTIQ)),
+    ("mlx_lm_extra_tensors", Ignore(Type::Object, OPTIQ)),
 ];
 
 /// Qwen3.6's `config.json` keys beside [`ROOT_SHARED`] and [`ROOT_MLX`].
@@ -3209,6 +3220,21 @@ mod tests {
             key_json(rope),
             serde_json::json!(["ARR", ["I32", [11, 11, 10, 0]]])
         );
+    }
+
+    /// mlx-optiq's Qwen3.5-0.8B folder (`mtp_file`, `optiq_vision` and five more root keys name
+    /// sidecar files the folder's index does not) parses as the dense MLX family, whose quantization
+    /// block `hf::quant_config` reads per module; each sidecar key's own type is a row of
+    /// `dense_tests::config_rows`. Mutant: a sidecar key dropped from the table (the folder is
+    /// refused on it, as `mtp_file` was).
+    #[test]
+    fn the_optiq_folder_parses_as_the_dense_mlx_family() {
+        let real = json("quant-configs/mlx-community__Qwen3.5-0.8B-OptiQ-4bit__config.json.gz");
+        let checkpoint = Checkpoint::parse(&real).unwrap();
+        assert_eq!(checkpoint.geometry.family, Family::Qwen35);
+        assert_eq!(checkpoint.geometry.layers, 24);
+        assert!(checkpoint.tied);
+        Config::parse(&real, None).unwrap();
     }
 
     /// What the Qwen3.6 map refuses, by name: a tensor no row names, a weight without its scales, a

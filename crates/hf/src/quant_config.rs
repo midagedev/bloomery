@@ -3047,6 +3047,80 @@ mod tests {
         }
     }
 
+    /// mlx-optiq's mixed widths: the config's 187 per-module entries (130 at 4 bits, 57 at 8 bits)
+    /// are each read as the format they name, and a weight of each module's shape (the shapes from
+    /// the text config's counts) is placed as it, none refused. Mutant: an entry's width dropped for
+    /// the block's.
+    #[test]
+    fn mlx_affine_reads_optiq_s_per_module_widths() {
+        let real = fixture("mlx-community__Qwen3.5-0.8B-OptiQ-4bit__config.json").unwrap();
+        let c = Config::parse(&real, None).unwrap();
+        let text = &real["text_config"];
+        let n = |k: &str| text[k].as_u64().unwrap() as usize;
+        let (hidden, inter) = (n("hidden_size"), n("intermediate_size"));
+        let (heads, kv, hd) = (
+            n("num_attention_heads"),
+            n("num_key_value_heads"),
+            n("head_dim"),
+        );
+        let (kh, vh, kd, vd) = (
+            n("linear_num_key_heads"),
+            n("linear_num_value_heads"),
+            n("linear_key_head_dim"),
+            n("linear_value_head_dim"),
+        );
+        // A module's (rows, columns): the query projection holds each head's output gate beside
+        // its query.
+        let shape = |module: &str| match module.rsplit('.').next().unwrap() {
+            "embed_tokens" => (n("vocab_size"), hidden),
+            "gate_proj" | "up_proj" => (inter, hidden),
+            "down_proj" => (hidden, inter),
+            "q_proj" => (2 * heads * hd, hidden),
+            "k_proj" | "v_proj" => (kv * hd, hidden),
+            "o_proj" => (hidden, heads * hd),
+            "in_proj_qkv" => (2 * kh * kd + vh * vd, hidden),
+            "in_proj_z" => (vh * vd, hidden),
+            "in_proj_a" | "in_proj_b" => (vh, hidden),
+            "out_proj" => (hidden, vh * vd),
+            other => panic!("{module}: no shape for {other}"),
+        };
+        let entries = real["quantization"].as_object().unwrap();
+        let modules: Vec<(&String, usize)> = entries
+            .iter()
+            .filter_map(|(k, v)| Some((k, v["bits"].as_u64()? as usize)))
+            .collect();
+        assert_eq!(modules.len(), 187);
+        let mut table = Vec::new();
+        for &(module, bits) in &modules {
+            let (rows, cols) = shape(module);
+            table.push((
+                format!("{module}.weight"),
+                Dtype::U32,
+                vec![rows, cols * bits / 32],
+            ));
+            for part in ["scales", "biases"] {
+                table.push((
+                    format!("{module}.{part}"),
+                    Dtype::Bf16,
+                    vec![rows, cols / 64],
+                ));
+            }
+        }
+        let p = plan(&c, tensors(&table), |_| None);
+        assert!(p.refused.is_empty(), "{:?}", p.refused);
+        let mut count = BTreeMap::new();
+        for &(module, bits) in &modules {
+            let placed = &p.placed[&format!("{module}.weight")];
+            assert_eq!(
+                placed.format,
+                Format::MlxAffine { bits, group: 64 },
+                "{module}"
+            );
+            *count.entry(bits).or_insert(0) += 1;
+        }
+        assert_eq!(count.into_iter().collect::<Vec<_>>(), [(4, 130), (8, 57)]);
+    }
+
     /// An MLX affine weight whose `.scales` and `.biases` are F16 is placed as
     /// [`Format::MlxAffineF16`] (card type MLX_A4H or MLX_A8H) beside BF16 ones of the same
     /// checkpoint placed as [`Format::MlxAffine`]; a weight whose pair is of two dtypes, or of one

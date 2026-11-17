@@ -160,7 +160,7 @@ fn served(keys: &Keys) -> tokenizer::Tokenizer {
     assert_eq!(
         served.eog(),
         keys.stop,
-        "serving stops where HF's generate does"
+        "serving stops where the folder's stop set does"
     );
     let Some(Value::Array(types)) = get(keys, "tokenizer.ggml.token_type") else {
         panic!("no token types");

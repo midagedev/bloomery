@@ -41,6 +41,37 @@ pub const UBATCH: [&str; 2] = ["--ubatch-size", "-ub"];
 /// The spellings of the key flags: `--api-key` and `--api-key-file`.
 pub const KEYS: [&str; 2] = ["--api-key", "--api-key-file"];
 
+/// The flags a caller's command line starts the server's optional parts with: the routes of a part
+/// the server does not hold answer 501 and name these, and a caller that takes none names none, so
+/// the answer never points at a flag its server refuses ([`Server::with_starts`]).
+///
+/// [`Server::with_starts`]: crate::Server::with_starts
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Starts {
+    /// The flags that seat the embeddings side model (`--embd-model`); none when the caller takes
+    /// no side model.
+    pub side_model: &'static [&'static str],
+    /// The flag that names the slot save directory (`--slot-save-path`); `None` when the caller
+    /// takes none.
+    pub slot_save: Option<&'static str>,
+}
+
+impl Starts {
+    /// The 501 text of an absent part: llama-server's `This server does not support <what>` and,
+    /// when the caller has flags that start it, `Start it with` those; with none, that the
+    /// server has no `<part>`.
+    pub(crate) fn not_served(what: &str, part: &str, flags: &[&str]) -> String {
+        if flags.is_empty() {
+            return format!("This server does not support {what}: it has no {part}");
+        }
+        let flags: Vec<String> = flags.iter().map(|f| format!("`{f}`")).collect();
+        format!(
+            "This server does not support {what}. Start it with {}",
+            flags.join(" or ")
+        )
+    }
+}
+
 /// `v`, the value of `flag`, as a number; a value that is not one is refused
 /// naming both, as `--ctx-size "12k": invalid digit found in string`.
 pub fn number<T>(flag: &str, v: &str) -> Result<T, String>

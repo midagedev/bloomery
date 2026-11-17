@@ -28,7 +28,7 @@ mod flags;
 mod gemma_embedding2;
 pub use architectures::ROWS;
 #[cfg(feature = "hf")]
-pub use flags::Flags;
+pub use flags::{Flags, NAMING};
 
 /// An embedding architecture a side seat serves: the file's `general.architecture`, the most
 /// positions one input takes, the bytes its model takes on its card, and its open.

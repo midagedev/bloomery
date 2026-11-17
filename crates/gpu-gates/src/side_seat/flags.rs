@@ -11,6 +11,16 @@ use crate::start::Refusal;
 use crate::vision_seat;
 use gguf::Split;
 
+/// The flag that names the embedding model by a file.
+const MODEL_FLAG: &str = "--embd-model";
+
+/// The flag that names the embedding model by a hub repo.
+const HF_FLAG: &str = "--embd-hf";
+
+/// The flags that name an embedding model: what a server without one says starts it
+/// ([`serve::flag::Starts::side_model`]).
+pub const NAMING: &[&str] = &[MODEL_FLAG, HF_FLAG];
+
 /// The side seat's flags, llama-server's `-m` and `-hf` behind `--embd-`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
@@ -72,8 +82,8 @@ impl Flags {
                 continue;
             }
             let flag = match flag {
-                "--embd-model" => "--embd-model",
-                "--embd-hf" => "--hf",
+                MODEL_FLAG => "--embd-model",
+                HF_FLAG => "--hf",
                 _ => {
                     rest.push(a.clone());
                     if crate::llama_launch::serve_takes_value(a) {

@@ -700,7 +700,9 @@ only those frames. Without ffmpeg, a clip is a 400 that names the fix.
 
 `POST /v1/embeddings` (OpenAI's shape: `encoding_format` `float` or `base64`, `dimensions`) and `/embedding` or
 `/embeddings` (llama-server's own array) answer from an embedding model held beside the chat model: `--embd-model FILE`
-or `--embd-hf <repo>[:<quant>]`. With none they answer 501 `not_supported_error`.
+or `--embd-hf <repo>[:<quant>]`. With none they answer 501 `not_supported_error`, naming the flags the server's command line
+takes (`--embd-model` or `--embd-hf` here) and no others: `bloomery-serve-metal` takes none, so its 501 says it has no
+embeddings side model.
 
 - **Models.** The `gemma-embedding2` feature serves EmbeddingGemma v1 (`gemma-embedding`, 300M, up to 2048 tokens) and
   EmbeddingGemma 2 (up to 8192 tokens), both Q8_0, on a separate thread and card stream. Both serve 128, 256 and 512

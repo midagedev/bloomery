@@ -49,6 +49,12 @@ const USAGE: &str = "usage: bloomery-serve [--host H] [--port P] [--model GGUF] 
 /// Used when neither `--model` nor `--chat-template-file` gives one.
 const FALLBACK_TEMPLATE: &str = "{{- bos_token -}}{%- for m in messages -%}<|{{ m['role'] }}|>{{ m['content'] or '' }}\n{%- endfor -%}{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
 
+/// What this binary starts the optional parts with: a slot save directory, and no embedding model.
+const STARTS: serve::flag::Starts = serve::flag::Starts {
+    side_model: &[],
+    slot_save: Some("--slot-save-path"),
+};
+
 struct Args {
     host: String,
     port: u16,
@@ -216,7 +222,7 @@ fn main() -> ExitCode {
         ..SlotConfig::default()
     };
     let server = match Server::bind_listener(listener, Box::new(engine), config, slots) {
-        Ok(s) => s,
+        Ok(s) => s.with_starts(STARTS),
         Err(e) => return refused(&e),
     };
     match server.local_addr() {

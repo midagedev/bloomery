@@ -2644,10 +2644,31 @@ fn assert_error(r: &common::Reply, status: u16, kind: &str, part: &str) {
 #[ignore = "gate: just gate-serve"]
 fn hw_slot_action_errors() {
     let bad = |addr, path: &str, body: Option<&str>| call(addr, "POST", path, body);
-    // No --slot-save-path: llama-server's 501.
+    // No slot save directory: llama-server's 501, naming the flag only where the caller takes
+    // it, else that the server has no directory.
     let plain = start(4096);
     let r = slot_post(plain, "save", "a.bin");
-    assert_error(&r, 501, "not_supported_error", "`--slot-save-path`");
+    assert_error(
+        &r,
+        501,
+        "not_supported_error",
+        "it has no slot save directory",
+    );
+    assert!(!r.body.contains("--slot-save-path"), "{}", r.body);
+    let flagged = common::start_starts(
+        4096,
+        serve::flag::Starts {
+            side_model: &[],
+            slot_save: Some("--slot-save-path"),
+        },
+    );
+    let r = slot_post(flagged, "save", "a.bin");
+    assert_error(
+        &r,
+        501,
+        "not_supported_error",
+        "Start it with `--slot-save-path`",
+    );
 
     let dir = common::fresh_dir("errors");
     let addr = common::start_slots(Box::new(serve::MockEngine::new(4096)), &dir);

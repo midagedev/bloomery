@@ -50,9 +50,11 @@ use crate::media;
 use crate::video::{self, Clip, ReadyGroup, VideoSupport};
 use vision::media::Piece;
 
-/// What a server with no side model answers: llama-server's message, with the flags that seat one.
-pub(super) const NOT_SERVED: &str =
-    "This server does not support embeddings. Start it with `--embd-model` or `--embd-hf`";
+/// What a server with no side model answers: llama-server's message, with the flags the caller
+/// seats one by ([`crate::flag::Starts::side_model`]), or that it has none to seat.
+pub(super) fn not_served(starts: &crate::flag::Starts) -> String {
+    crate::flag::Starts::not_served("embeddings", "embeddings side model", starts.side_model)
+}
 
 /// The side model and the facts the server reads of it once, when it takes it.
 pub(super) struct Side {
@@ -120,7 +122,7 @@ fn answer(state: &State, req: &Request, oai: bool) -> Result<Value, ApiError> {
             param: None,
             code: 501,
             kind: "not_supported_error",
-            message: NOT_SERVED.to_owned(),
+            message: not_served(&state.starts),
         });
     };
     open(state)?;
@@ -908,14 +910,51 @@ mod tests {
         assert_eq!(codes, [503, 503], "fatal and stopping cache hits");
     }
 
+    /// A server with no side model whose caller starts one by `flags`, none unless it names some.
+    fn serve_starting_by(flags: &'static [&'static str]) -> SocketAddr {
+        Server::bind("127.0.0.1:0", Box::new(MockEngine::new(64)), mock_config())
+            .expect("bind")
+            .with_starts(crate::flag::Starts {
+                side_model: flags,
+                slot_save: None,
+            })
+            .spawn()
+            .expect("spawn")
+    }
+
+    /// The 501 of every route names the flags the server's caller starts a side model by and no
+    /// others: a caller that takes none says the server has no side model, never a flag it refuses.
+    /// Mutant: the text names `--embd-model` whatever the caller says.
     #[test]
-    fn no_side_model_is_a_501_on_every_route() {
-        let (addr, ..) = serve(None);
-        for path in ["/v1/embeddings", "/embeddings", "/embedding"] {
-            let (status, v) = post(addr, path, &json!({ "input": "a" }));
-            assert_eq!(status, 501, "{path}: {v}");
-            assert_eq!(v["error"]["type"], "not_supported_error");
-            assert_eq!(v["error"]["message"], NOT_SERVED);
+    fn no_side_model_is_a_501_that_names_only_the_callers_flags() {
+        let (unset, ..) = serve(None);
+        let two = serve_starting_by(&["--embd-model", "--embd-hf"]);
+        let one = serve_starting_by(&["--embd-hf"]);
+        for (addr, message) in [
+            (
+                unset,
+                "This server does not support embeddings: it has no embeddings side model",
+            ),
+            (
+                serve_starting_by(&[]),
+                "This server does not support embeddings: it has no embeddings side model",
+            ),
+            (
+                two,
+                "This server does not support embeddings. Start it with `--embd-model` or \
+                 `--embd-hf`",
+            ),
+            (
+                one,
+                "This server does not support embeddings. Start it with `--embd-hf`",
+            ),
+        ] {
+            for path in ["/v1/embeddings", "/embeddings", "/embedding"] {
+                let (status, v) = post(addr, path, &json!({ "input": "a" }));
+                assert_eq!(status, 501, "{path}: {v}");
+                assert_eq!(v["error"]["type"], "not_supported_error");
+                assert_eq!(v["error"]["message"], message, "{path}");
+            }
         }
     }
 

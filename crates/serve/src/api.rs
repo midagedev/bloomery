@@ -80,7 +80,7 @@ use crate::engine::{
 };
 use crate::event;
 use crate::exit::Code;
-use crate::flag::{ApiKeys, Denied};
+use crate::flag::{self, ApiKeys, Denied};
 use crate::genloop::{self, Depth, Event, GenError, GenParams, Outcome, Slot, Timings, ms_since};
 use crate::glmxml::ArgTypes;
 use crate::guard::{Guard, GuardError, Guarded};
@@ -467,6 +467,7 @@ impl Server {
             video,
             slot_save_path: config.slot_save_path,
             side: None,
+            starts: flag::Starts::default(),
             api_keys: config.api_keys,
             info,
             start_unix: unix_now(),
@@ -501,6 +502,17 @@ impl Server {
         Arc::get_mut(&mut self.state)
             .expect("the state is shared only once the server starts")
             .side = Some(embeddings::Side::new(embed));
+        self
+    }
+
+    /// The server with `starts` as the flags its 501 answers name for a part it does not hold (the
+    /// embeddings routes and the slot actions): the caller's own, since a flag its command line
+    /// refuses is no way to start the part. Unset, the answers name none.
+    #[must_use]
+    pub fn with_starts(mut self, starts: flag::Starts) -> Server {
+        Arc::get_mut(&mut self.state)
+            .expect("the state is shared only once the server starts")
+            .starts = starts;
         self
     }
 
@@ -763,6 +775,9 @@ struct State {
     /// The embedding model beside the engine ([`Server::with_side`]); `None`
     /// answers the embeddings routes with a 501.
     side: Option<embeddings::Side>,
+    /// The flags the caller starts the optional parts with, which the 501 answers name
+    /// ([`Server::with_starts`]).
+    starts: flag::Starts,
     /// The API keys every request is checked against before it dispatches;
     /// an empty set checks nothing.
     api_keys: ApiKeys,
@@ -4287,9 +4302,11 @@ fn slot_action(state: &State, req: &Request, w: &mut TcpStream, id: &str) -> io:
                 param: None,
                 code: 501,
                 kind: "not_supported_error",
-                message: "This server does not support slots action. Start it with \
-                          `--slot-save-path`"
-                    .to_owned(),
+                message: flag::Starts::not_served(
+                    "slots action",
+                    "slot save directory",
+                    state.starts.slot_save.as_slice(),
+                ),
             },
         );
     };

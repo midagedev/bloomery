@@ -3071,7 +3071,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             schema_jump,
             side,
         },
-    )?;
+    )?
+    // The seat's parser takes the side seat's flags but no `--slot-save-path`.
+    .with_starts(serve::flag::Starts {
+        slot_save: None,
+        ..bloomery_gpu_gates::bind::STARTS
+    });
     Record::new(&record::LISTENING_QWEN3)
         .w("arch", &name)
         .u("ctx", slot_ctx)

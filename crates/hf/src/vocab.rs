@@ -16,8 +16,10 @@
 //!
 //! Every key of `tokenizer.json`, its `model` and added tokens, `tokenizer_config.json` and
 //! `generation_config.json` is named in a table below with the values serving computes the same
-//! way HF does ([`schema`]); any other key or value is refused by name. The ids HF's generate
-//! stops at are written as `tokenizer.bloomery.eog_token_ids`. This nonempty id array opts
+//! way HF does ([`schema`]); any other key or value is refused by name. The ids serving stops
+//! at are written as `tokenizer.bloomery.eog_token_ids`: HF's generate's (`generation_config.json`'s
+//! `eos_token_id`, else `config.json`'s, else the EOS id) and the EOS token `tokenizer_config.json`
+//! names, which mlx-lm and llama.cpp stop at beside the config's ids. This nonempty id array opts
 //! serving into explicit token types and ids, without name-based overrides or model defaults,
 //! and into HF's split on the added tokens (leftmost, then longest).
 //! Serving checks every imported spelling against HF ByteLevel's decoded bytes, including
@@ -666,8 +668,8 @@ pub struct Keys {
     pub keys: Vec<(String, Value)>,
     /// The added tokens' ids: what HF splits a text on before BPE.
     pub added: Vec<u32>,
-    /// The ids HF's generate stops at: `generation_config.json`'s `eos_token_id`, else
-    /// `config.json`'s, else the EOS id.
+    /// The ids serving stops at: `generation_config.json`'s `eos_token_id`, else `config.json`'s,
+    /// else the EOS id, and the token `tokenizer_config.json` names as the EOS.
     pub stop: Vec<u32>,
 }
 
@@ -869,7 +871,9 @@ type SpecialIds = (Vec<(String, Value)>, Option<Vec<u32>>);
 
 /// The special ids the keys export, as `tokenizer.ggml.<kind>_token_id` keys, and the
 /// generation stop ids: each kind's token named in `tokenizer_config.json` (`tc`), else
-/// `config.json`'s id, else `generation_config.json`'s.
+/// `config.json`'s id, else `generation_config.json`'s. The stop ids are the EOS ids of
+/// `generation_config.json`, else `config.json`'s, else the exported EOS id, and the EOS token
+/// `tc` names.
 fn special_ids(
     tc: &Json,
     generation: &Json,
@@ -911,10 +915,16 @@ fn special_ids(
                 .and_then(|ids| ids.first().copied()),
         };
         if *kind == "eos" {
-            // HF's generate stops at any of these; serving at its end-of-generation ids.
-            stop = generated
+            // HF's generate stops at any of the config's ids; the tokenizer's own EOS is added
+            // when it names one, or every answer would run past the token its template closes a
+            // turn with. With none named, the exported id stands in only for a config of no id.
+            let mut ids = generated
                 .or_else(|| spec.ids[i].clone())
-                .or(id.map(|id| vec![id]));
+                .unwrap_or_default();
+            if named.is_some() || ids.is_empty() {
+                ids.extend(id);
+            }
+            stop = (!ids.is_empty()).then_some(ids);
         } else if *kind == "pad" && named.is_some() {
             // gguf-py's SpecialVocab takes the named token and reads a config's id only for a
             // kind it has not set; no id and no serving path reads the pad id.
@@ -1319,6 +1329,78 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("bos_token_id 0 disagrees"), "{err}");
+    }
+
+    /// A Qwen3.5-shaped folder with no `generation_config.json`, whose `config.json` names the
+    /// document end (`<|endoftext|>`, 3) and whose tokenizer names the turn end (`<|im_end|>`, 4)
+    /// as its EOS: serving stops at both, or every answer ends with the turn end as text. A
+    /// folder whose generation config or tokenizer says the same keeps its set, and with no EOS
+    /// named the config's ids stand alone. Mutant: the named EOS left out of the stop set.
+    #[test]
+    fn the_tokenizer_s_eos_joins_the_config_s_stop_ids() {
+        let tokenizer = r#"{"normalizer":{"type":"NFC"},"pre_tokenizer":{"type":"Sequence","pretokenizers":[
+                {"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},
+                {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+                "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+                "model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},"merges":["a b"]},
+                "added_tokens":[{"id":3,"content":"<|endoftext|>","special":true},
+                {"id":4,"content":"<|im_end|>","special":true}]}"#;
+        let stop = |config: &str, generation: Option<&str>, eos_token: &str| {
+            let tc =
+                format!(r#"{{"eos_token":{eos_token},"bos_token":null,"add_bos_token":false}}"#);
+            let mut files = vec![
+                ("tokenizer.json", tokenizer),
+                ("tokenizer_config.json", tc.as_str()),
+                ("config.json", config),
+                ("chat_template.jinja", "{{ messages }}"),
+            ];
+            if let Some(generation) = generation {
+                files.push(("generation_config.json", generation));
+            }
+            let dir = repo(&files);
+            if generation.is_none() {
+                // The folder is the test's own, and an earlier call left its file in it.
+                let _ = std::fs::remove_file(dir.join("generation_config.json"));
+            }
+            let config = Config::parse(&serde_json::from_str(config).unwrap()).unwrap();
+            let keys = super::keys(&dir, &config).unwrap();
+            let written = match get(&keys.keys, "tokenizer.bloomery.eog_token_ids") {
+                Some(Value::Array(ids)) => ids.clone(),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                written,
+                keys.stop
+                    .iter()
+                    .copied()
+                    .map(Value::U32)
+                    .collect::<Vec<_>>(),
+                "the written key is the stop set"
+            );
+            keys.stop
+        };
+        let text = r#"{"text_config":{"vocab_size":5,"eos_token_id":3}}"#;
+        let im_end = r#""<|im_end|>""#;
+        // The folder that ends every answer with `<|im_end|>`: no generation config.
+        assert_eq!(stop(text, None, im_end), [3, 4]);
+        // A generation config that names both, one, or the document end alone.
+        assert_eq!(
+            stop(text, Some(r#"{"eos_token_id":[4,3]}"#), im_end),
+            [3, 4]
+        );
+        assert_eq!(stop(text, Some(r#"{"eos_token_id":4}"#), im_end), [4]);
+        assert_eq!(stop(text, Some(r#"{"eos_token_id":3}"#), im_end), [3, 4]);
+        // A tokenizer that names no EOS leaves the config's ids as they were.
+        assert_eq!(stop(text, None, "null"), [3]);
+        assert_eq!(
+            stop(text, Some(r#"{"eos_token_id":[4,3]}"#), "null"),
+            [3, 4]
+        );
+        // A config that already names the tokenizer's EOS has nothing to add.
+        let both = r#"{"text_config":{"vocab_size":5,"eos_token_id":[3,4]}}"#;
+        assert_eq!(stop(both, None, im_end), [3, 4]);
+        let turn = r#"{"text_config":{"vocab_size":5,"eos_token_id":4}}"#;
+        assert_eq!(stop(turn, None, im_end), [4]);
     }
 
     /// A Qwen-shaped tokenizer: four tokens and three added ones (one special, one only looking

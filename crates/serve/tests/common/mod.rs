@@ -52,6 +52,26 @@ pub fn start_slots(engine: Box<dyn Engine>, dir: &Path) -> SocketAddr {
     start_configured(engine, V41_TEMPLATE, Some(dir.to_path_buf()))
 }
 
+/// Starts a server on the mock engine (context `ctx`) and the V4.1 template whose 501 answers name
+/// the flags `starts` holds.
+pub fn start_starts(ctx: usize, starts: serve::flag::Starts) -> SocketAddr {
+    let config = ServerConfig {
+        model_alias: "mock".to_owned(),
+        model_path: "mock.gguf".to_owned(),
+        chat_template: V41_TEMPLATE.to_owned(),
+        chat_preparation: None,
+        sampler: None,
+        fatal_linger: FATAL_LINGER,
+        slot_save_path: None,
+        api_keys: serve::flag::ApiKeys::default(),
+    };
+    Server::bind("127.0.0.1:0", Box::new(MockEngine::new(ctx)), config)
+        .unwrap_or_else(|e| panic!("bind: {e}"))
+        .with_starts(starts)
+        .spawn()
+        .expect("spawn")
+}
+
 fn start_configured(
     engine: Box<dyn Engine>,
     template: &str,
