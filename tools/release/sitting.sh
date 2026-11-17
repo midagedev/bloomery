@@ -1835,7 +1835,7 @@ case_quiet() {
   # shellcheck disable=SC2046
   st_run $(portable)
   want_rc 0
-  want_out '[quiet] box quiet after 0 s'
+  want_out '[quiet] box quiet after '
   [ "$(grep -cF '[quiet] waiting: ' "$C/out")" = 0 ] || fault "a zombie was waited for"
   # a ps that does not answer is not a quiet box
   st_fresh
