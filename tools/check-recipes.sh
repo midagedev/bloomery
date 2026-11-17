@@ -428,6 +428,7 @@ blk_releasebuildmac() { tool_selftest release/build-mac.sh; }
 # (pytools.K, the K-th line, run from the repository root), so the scheduler bounds them with every other unit.
 pytools_list() {
   selftests=(
+    "tools/affected-cards.py --self-test"
     "tools/bloomery/catalog.py --self-test"
     "tools/bloomery/manifest.py --self-test"
     "tools/bloomery/records.py --self-test"

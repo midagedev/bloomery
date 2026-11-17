@@ -65,5 +65,14 @@
 # Ledger keys deliberately differ: `recipes.py key` may exclude proven-unreached dependency sources
 # while retaining own-target, build/proc-macro, script and opaque bounds. This affected list remains the
 # broad compile/selection contract; narrowing a key does not remove a recipe from the affected list.
+#
+# The cards in view (tools/affected-cards.py, which this runs: tools/recipes.py `affected` is run unchanged, same arguments, stderr and
+# exit code). On a machine whose view holds one card, a selected recipe whose closure names BLOOMERY_CARD=both stays in the list, its
+# line ends `[two-card: deferred, 1 card in view]`, and a closing `two-card (N), deferred on this machine` block names them: they need
+# two cards in view and tools/box.sh ends them 64 on fewer, which tools/gate-batch.sh defers by name (two_card=). A view of two cards
+# or more leaves the output byte for byte; a view that cannot be read (--no-box without BLOOMERY_BOX_LOCAL=1 asks no ssh; a box with
+# no directory for this tree; a failing probe) leaves it too, with one line under `notes:` saying why. The view is the box's through
+# the read-only box.sh call gate-batch.sh reads it with, and this machine's own under BLOOMERY_BOX_LOCAL=1. Recipes that name
+# BLOOMERY_CARD=a6000 are not tagged (the view does not prove them deferred); one closing line names them and why.
 set -euo pipefail
-exec python3 "$(dirname "$0")/recipes.py" affected "$@"
+exec python3 "$(dirname "$0")/affected-cards.py" "$@"
