@@ -414,12 +414,12 @@ fn preflight_the_gates_variable_names_no_model() {
         &gates,
         "a repo is <owner>/<name>",
     );
-    // With no flag it is no model: the start is refused as one that names none, and the refusal does not send
-    // the user to the gates' variable.
+    // With no flag it is no model: a seat word that names no catalog model is refused as a start that names none,
+    // and the refusal does not send the user to the gates' variable (a catalog word goes on to the pick instead).
     let (dir, err, code) = startup_coded(
         "reference_alone",
         &seat("bloomery-serve"),
-        &["--model", "qwen38"],
+        &["--model", "raon1"],
         &gates,
     );
     assert_eq!(code, Code::NoModel, "{err}");
