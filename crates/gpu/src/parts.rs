@@ -17,7 +17,7 @@ use cuda_core::CudaStream;
 use gguf::{GgmlType, Place, Split, TensorInfo};
 use model::part::{Part, Planned, Source, Take, read_ahead};
 use model::placement::ctx_ask::Unpaged;
-use model::placement::workstation::{HostRead, host_available_read};
+use model::placement::workstation::{HostRead, host_available_for_load, host_available_read};
 use model::placement::{CardFormat, Device, ExpertList, Format, ModelTensor, Plan, Role, Segment};
 
 use crate::GpuError;
@@ -40,7 +40,7 @@ pub fn load<S: Source + Sync, E: std::fmt::Display>(
     card: impl Fn(&TensorInfo) -> Option<CardFormat>,
     release: bool,
 ) -> Result<Weights, GpuError> {
-    let reading = host_available_read().map_err(refused)?;
+    let reading = host_available_for_load().map_err(refused)?;
     let plan = LoadPlan::new(source, rule, &card, reading.0)?;
     Ok(load_plan(stream, source, &plan, card, release, &reading)?.0)
 }
@@ -343,7 +343,7 @@ impl<S: Source + Send + Sync> crate::model::PartsLoad for PlacedSource<S> {
         room: u64,
     ) -> Result<(Weights, PartsRead), GpuError> {
         let (on, read) = self.reading(plan, card, room)?;
-        let (available, reading) = host_available_read().map_err(refused)?;
+        let (available, reading) = host_available_for_load().map_err(refused)?;
         let (w, read) = load_plan(
             stream,
             &self.source,

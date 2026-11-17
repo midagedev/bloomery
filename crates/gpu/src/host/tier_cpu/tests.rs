@@ -186,6 +186,10 @@ fn node_nvme_host_run(
                 path: "/node.scope".into(),
             },
             workstation::HostRead::Machine,
+            workstation::HostRead::GivenAbove {
+                capacity: 256 << 30,
+                from: "MemTotal in /proc/meminfo".into(),
+            },
         ] {
             node.host_room.1 = read.clone();
             let refusal = open

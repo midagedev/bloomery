@@ -159,7 +159,10 @@ pub const MARGIN: u64 = 1 << 30;
 pub const GRANULE: NonZeroU64 = NonZeroU64::new(2 * MIB).expect("2 MiB is not zero");
 
 /// The host's usable bytes and the OS and everything else [measured,
-/// `free -b`].
+/// `free -b`]: this workstation's nominal host ([`host`]), the figure of a
+/// plan made with no reading of the machine. A plan made at a reading or a
+/// given room is held to that room where it is past this figure
+/// ([`Plan::plan_at`]).
 pub const HOST_USABLE: u64 = 270_071_001_088;
 pub const OS_OTHER: u64 = 6_694_629_376;
 
@@ -1175,9 +1178,10 @@ impl HostNeed {
 
     /// The room `host`'s own figure leaves a load: its usable bytes less
     /// the reserve named [`OS_RESERVE`], which a reading of the host leaves
-    /// out already — the room a plan is held to before any reading
+    /// out already — the room a plan is held to where nothing was read
     /// ([`HostNeed::check`] in `Plan::violations`, and the plan's host
-    /// headroom); [`PLAN_ROOM`] on this workstation's [`host`].
+    /// headroom), and the floor of the room a plan made at a reading is held
+    /// to ([`Plan::host_bound`]); [`PLAN_ROOM`] on this workstation's [`host`].
     #[must_use]
     pub fn machine_room(host: &Host) -> u64 {
         host.usable_bytes.saturating_sub(os_reserve(host))
@@ -1425,7 +1429,9 @@ impl fmt::Display for HostShort {
              a more than gate; Qwen3.8: BLOOMERY_QWEN38_EXPERTS=card)",
             n.os,
             match read {
-                HostRead::Given => format!("Raise or unset {}", bloomery_levers::HOST_ROOM),
+                HostRead::Given | HostRead::GivenAbove { .. } => {
+                    format!("Raise or unset {}", bloomery_levers::HOST_ROOM)
+                }
                 HostRead::MemAvailable | HostRead::VmStats | HostRead::Cgroup { .. } => {
                     "Free host memory".to_string()
                 }
@@ -1732,9 +1738,15 @@ pub enum HostRead {
     /// A room the caller gave instead of reading this machine (a gate that
     /// plans an arm by the room it names).
     Given,
-    /// The machine's own figure: its host's usable bytes less the OS reserve
-    /// ([`HostNeed::machine_room`]), or its unified pool at plan time, where
-    /// that is under the reading's plan room ([`Plan::plan_at`]).
+    /// A room `BLOOMERY_HOST_ROOM` gave that is past what this machine has
+    /// (`capacity` bytes, as [`host_capacity`] found them, from `from`): a
+    /// plan takes it as given, like [`HostRead::Given`], since planning another
+    /// host's room is a use; a load refuses it ([`load_room`]).
+    GivenAbove { capacity: u64, from: String },
+    /// The machine's own figure, no reading of it: the nominal workstation
+    /// host's usable bytes less the OS reserve ([`HostNeed::machine_room`]), the
+    /// room of a plan made with none, or the unified pool at plan time, where
+    /// that is under the room asked ([`Plan::plan_at`]).
     Machine,
 }
 
@@ -1753,10 +1765,16 @@ impl fmt::Display for HostRead {
                 "given by {} or the caller, not read from this machine",
                 bloomery_levers::HOST_ROOM
             ),
+            HostRead::GivenAbove { capacity, from } => write!(
+                f,
+                "given above this machine's capacity of {capacity} B ({from}) by {}, not read \
+                 from this machine",
+                bloomery_levers::HOST_ROOM
+            ),
             HostRead::Machine => write!(
                 f,
-                "the machine's figure, its host's usable bytes less the OS reserve or its unified \
-                 pool, under the reading"
+                "the machine's figure, not a reading of it: the nominal workstation host's usable \
+                 bytes less the OS reserve (nothing was read), or the unified pool at plan time"
             ),
         }
     }
@@ -1764,7 +1782,8 @@ impl fmt::Display for HostRead {
 
 impl HostRead {
     /// One word for a `key=value` line: `MemAvailable`, `vmstats`,
-    /// `cgroup:<path>`, `given`, or `machine`.
+    /// `cgroup:<path>`, `given`, `given-above` (past this machine's
+    /// capacity) or `machine`.
     #[must_use]
     pub fn word(&self) -> String {
         match self {
@@ -1772,8 +1791,16 @@ impl HostRead {
             HostRead::VmStats => "vmstats".to_string(),
             HostRead::Cgroup { path } => format!("cgroup:{path}"),
             HostRead::Given => "given".to_string(),
+            HostRead::GivenAbove { .. } => "given-above".to_string(),
             HostRead::Machine => "machine".to_string(),
         }
+    }
+
+    /// A room that was stated, not read: [`HostRead::Given`], past the
+    /// machine's capacity or not. A plan holds a stated room as given.
+    #[must_use]
+    pub fn is_given(&self) -> bool {
+        matches!(self, HostRead::Given | HostRead::GivenAbove { .. })
     }
 }
 
@@ -1786,13 +1813,14 @@ impl HostRead {
 pub const HOST_DRIFT: u64 = 512 * MIB;
 
 /// The room a plan is made at, for the room `room` that [`host_room`] (or a
-/// caller) gave: a [`HostRead::Given`] or [`HostRead::Machine`] room as given, a read room less
+/// caller) gave: a [`HostRead::Given`] (past the machine's capacity or not)
+/// or [`HostRead::Machine`] room as given, a read room less
 /// [`HOST_DRIFT`] (to 0 at most). The one place a read room becomes a
 /// plan's room.
 #[must_use]
 pub fn plan_room(room: &(u64, HostRead)) -> u64 {
     match room.1 {
-        HostRead::Given | HostRead::Machine => room.0,
+        HostRead::Given | HostRead::GivenAbove { .. } | HostRead::Machine => room.0,
         HostRead::MemAvailable | HostRead::VmStats | HostRead::Cgroup { .. } => {
             room.0.saturating_sub(HOST_DRIFT)
         }
@@ -1956,16 +1984,97 @@ pub fn host_room(
     Ok(best)
 }
 
+/// What this machine has: the bytes [`host_capacity`] found and where they
+/// came from, for the label of a given room past them ([`given_room`]) and
+/// a load's refusal of it ([`load_room`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostCapacity {
+    pub bytes: u64,
+    pub from: String,
+}
+
+/// The most host memory this machine can give a room: `total`, the
+/// platform's own figure of its memory (`base` names it), or the smallest
+/// `memory.max` of the cgroup v2 levels above the process where one sets a
+/// limit under it — inside a container or a systemd scope the platform's
+/// figure still shows the whole machine, and the limit is what the process
+/// may hold. The usage under a limit plays no part: unlike [`host_room`],
+/// this does not move while a load takes memory. A tie names the platform's
+/// figure; a `memory.max` that is neither `max` nor bytes is refused by name.
+pub fn host_capacity(
+    total: u64,
+    base: &str,
+    levels: &[CgroupLevel<'_>],
+) -> Result<HostCapacity, String> {
+    let mut best = HostCapacity {
+        bytes: total,
+        from: base.to_owned(),
+    };
+    for level in levels {
+        if let Some(max) = memory_max(level.max)?
+            && max < best.bytes
+        {
+            best = HostCapacity {
+                bytes: max,
+                from: format!(
+                    "memory.max of the cgroup v2 at /sys/fs/cgroup{}",
+                    level.path
+                ),
+            };
+        }
+    }
+    Ok(best)
+}
+
+/// The room `BLOOMERY_HOST_ROOM` gives, `given` bytes, as a reading:
+/// [`HostRead::Given`] up to the machine's `capacity` ([`host_capacity`]), an
+/// emulation of a smaller host or an override of what is free now, and
+/// [`HostRead::GivenAbove`] past it, an emulation of a larger one. A plan
+/// takes either as given; [`load_room`] refuses the second.
+#[must_use]
+pub fn given_room(given: u64, capacity: &HostCapacity) -> (u64, HostRead) {
+    if given > capacity.bytes {
+        return (
+            given,
+            HostRead::GivenAbove {
+                capacity: capacity.bytes,
+                from: capacity.from.clone(),
+            },
+        );
+    }
+    (given, HostRead::Given)
+}
+
+/// The reading a load goes by: `room` as it is, or the refusal of a room
+/// `BLOOMERY_HOST_ROOM` gave past what this machine has
+/// ([`HostRead::GivenAbove`]), naming the value, the capacity, where each
+/// came from and the way out. A plan alone (`--plan`) takes such a room as
+/// given; a load runs on this machine, whose memory it cannot exceed.
+pub fn load_room(room: (u64, HostRead)) -> Result<(u64, HostRead), String> {
+    match &room.1 {
+        HostRead::GivenAbove { capacity, from } => Err(format!(
+            "{} is {} B (from the environment), past the {capacity} B this machine has \
+             ({from}): a load takes memory this machine has, not another host's. Set it at or \
+             under {capacity} B, or unset it to load at the machine's own reading; a plan \
+             alone (--plan) takes the room as given",
+            bloomery_levers::HOST_ROOM,
+            room.0,
+        )),
+        _ => Ok(room),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         A6000, ArenaGrant, CONTEXT, Card, CardSpec, CgroupLevel, DRAFT_RESERVE, Device, DeviceId,
-        DeviceInfo, GRANULE, HOST_DRIFT, Host, HostNeed, HostRead, MARGIN, Machine, NO_TIER_BATCH,
-        Node, PLAN_ROOM, PlacementError, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
+        DeviceInfo, GRANULE, HOST_DRIFT, Host, HostCapacity, HostNeed, HostRead, MARGIN, Machine,
+        NO_TIER_BATCH, Node, PLAN_ROOM, PlacementError, RTX_3090, SCRATCH, TIER_BATCH_HOST_RESERVE,
         TIER_BATCH_RESERVE, TierBatchBytes, UnifiedPool, card, cgroup_room, cgroup_v2_path,
-        counted_arena_bytes, draft_reserve, gb10, holder_card, host, host_of, host_room,
-        placed_with_arena, plan_a, plan_a_draft, plan_bp, plan_gate, plan_holding, plan_node_tiers,
-        plan_on, plan_room, plan_tiers, spec_of_device, tier_batch_bytes, unified_of,
+        counted_arena_bytes, draft_reserve, gb10, given_room, holder_card, host, host_capacity,
+        host_of, host_room, load_room, placed_with_arena, plan_a, plan_a_draft, plan_bp, plan_gate,
+        plan_holding, plan_node_tiers, plan_on, plan_room, plan_tiers, spec_of_device,
+        tier_batch_bytes, unified_of,
     };
 
     #[test]
@@ -2709,6 +2818,118 @@ mod tests {
             host_room(mem, HostRead::MemAvailable, &as_levels(&tie)),
             Ok((mem, HostRead::MemAvailable))
         );
+    }
+
+    /// The machine's capacity is its total memory, or the smallest cgroup v2
+    /// `memory.max` above the process, with where it came from: no levels
+    /// and a level without a limit leave the total; a limit under the total
+    /// binds, a nested one through the smaller parent; a tie names the
+    /// total; a `memory.max` that is neither `max` nor bytes is refused.
+    #[test]
+    fn host_capacity_takes_the_smaller_figure() {
+        let total = 270_071_001_088;
+        let base = "MemTotal in /proc/meminfo";
+        let said = |bytes: u64, from: &str| {
+            Ok(HostCapacity {
+                bytes,
+                from: from.to_owned(),
+            })
+        };
+        assert_eq!(host_capacity(total, base, &[]), said(total, base));
+        let unlimited = [level("/", "max\n", "0\n", (0, 0))];
+        assert_eq!(
+            host_capacity(total, base, &as_levels(&unlimited)),
+            said(total, base)
+        );
+        let nested = [
+            level("/user.slice/s.scope", "107374182400\n", "0\n", (0, 0)),
+            level("/user.slice", "68719476736\n", "0\n", (0, 0)),
+        ];
+        assert_eq!(
+            host_capacity(total, base, &as_levels(&nested)),
+            said(
+                68_719_476_736,
+                "memory.max of the cgroup v2 at /sys/fs/cgroup/user.slice"
+            )
+        );
+        // The limit's usage plays no part: the capacity is what it may hold.
+        let full = [level("/scope", "68719476736\n", "68719476736\n", (0, 0))];
+        assert_eq!(
+            host_capacity(total, base, &as_levels(&full)),
+            said(
+                68_719_476_736,
+                "memory.max of the cgroup v2 at /sys/fs/cgroup/scope"
+            )
+        );
+        let tie = [level("/scope", &format!("{total}\n"), "0\n", (0, 0))];
+        assert_eq!(
+            host_capacity(total, base, &as_levels(&tie)),
+            said(total, base)
+        );
+        let bad = [level("/", "61G\n", "0\n", (0, 0))];
+        assert!(host_capacity(total, base, &as_levels(&bad)).is_err());
+    }
+
+    /// A given room is read as given up to the machine's capacity and as
+    /// given above it past it, one byte over: the plan takes either as it is
+    /// (`plan_room`), and only a load refuses the second, by name: the value,
+    /// the capacity, where it came from, the lever and the way out. The
+    /// reading's room is not the bound: a room past what `MemAvailable` says
+    /// now and under what the machine has is the override the lever
+    /// documents.
+    #[test]
+    fn a_given_room_past_the_machine_is_labelled_and_a_load_refuses_it() {
+        let cap = HostCapacity {
+            bytes: 270_071_001_088,
+            from: "MemTotal in /proc/meminfo".to_owned(),
+        };
+        for ok in [0, 1, 100 << 30, cap.bytes - 1, cap.bytes] {
+            let room = given_room(ok, &cap);
+            assert_eq!(room, (ok, HostRead::Given), "{ok}");
+            assert_eq!(load_room(room.clone()), Ok(room), "{ok}");
+        }
+        for over in [cap.bytes + 1, 400 << 30, u64::MAX] {
+            let room = given_room(over, &cap);
+            let above = HostRead::GivenAbove {
+                capacity: cap.bytes,
+                from: cap.from.clone(),
+            };
+            assert_eq!(room, (over, above.clone()), "{over}");
+            // A plan holds it as given, the label naming what it is.
+            assert_eq!(plan_room(&room), over);
+            assert!(above.is_given());
+            assert_eq!(above.word(), "given-above");
+            let said = above.to_string();
+            for word in [
+                "given above this machine's capacity",
+                "270071001088",
+                "MemTotal in /proc/meminfo",
+                "BLOOMERY_HOST_ROOM",
+            ] {
+                assert!(said.contains(word), "{word} missing from {said}");
+            }
+            // A load does not.
+            let text = load_room(room).expect_err("a load past the machine");
+            for word in [
+                "BLOOMERY_HOST_ROOM",
+                &over.to_string(),
+                "270071001088",
+                "MemTotal in /proc/meminfo",
+                "unset",
+                "--plan",
+            ] {
+                assert!(text.contains(word), "{word} missing from {text}");
+            }
+        }
+        // Another reading is no concern of the load's room check.
+        for read in [
+            (7, HostRead::MemAvailable),
+            (7, HostRead::VmStats),
+            (7, HostRead::Machine),
+            (7, HostRead::Cgroup { path: "/".into() }),
+        ] {
+            assert_eq!(load_room(read.clone()), Ok(read));
+        }
     }
 
     /// A room this machine's `MemAvailable` gave.

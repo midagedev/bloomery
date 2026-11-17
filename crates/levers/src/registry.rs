@@ -413,11 +413,16 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         default: Unset::Means("the host's available bytes, read from this machine"),
         doc: "Placement: the host's room in bytes (`M` and `G` binary units), read as given \
               instead of from `/proc/meminfo` and the cgroup limits — an emulation of a \
-              smaller host and an override. It reaches every reader of the host's available \
-              bytes: the placed loads' host-need check, the residency rules' room and the \
-              plans' tiers, where the routed experts a room cannot hold are planned on the \
-              NVMe tier; a room under that tier's floor is refused with the room, the floor \
-              and the need. The MiMo plan reads it too and serves no NVMe expert tier, \
+              smaller host and an override of what is free now. A plan takes the room as \
+              given, past what the machine has too (planning another host's room is a use; \
+              the plan's lines call such a room given above this machine's capacity); a run \
+              that loads refuses a room past the machine's capacity, its total memory \
+              (`MemTotal`, `hw.memsize`) or the smallest cgroup v2 `memory.max` above the \
+              process, naming the value, that figure and where each came from. It reaches \
+              every reader of the host's available bytes: the placed loads' host-need check, \
+              the residency rules' room and the plans' tiers, where the routed experts a room \
+              cannot hold are planned on the NVMe tier; a room under that tier's floor is \
+              refused with the room, the floor and the need. The MiMo plan reads it too and serves no NVMe expert tier, \
               so it refuses a room that cannot hold its host experts, naming the room and \
               the need, and its default context is the card's deepest, the floor where the \
               room cannot hold that one. On a device that allocates from host memory it is \

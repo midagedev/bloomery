@@ -12,10 +12,13 @@ pub use bloomery_placement::placement::workstation::*;
 /// container (`docker run --memory`), a systemd scope (`MemoryMax`) or a
 /// pod, the platform's reading still shows the whole machine, and the
 /// limit's room is the reading that binds. `BLOOMERY_HOST_ROOM` set
-/// (bytes, `M` and `G` binary units, a parsed lever) replaces both, read
-/// [`HostRead::Given`]; a value that is not bytes is refused by name. A
-/// base page the row room cannot count in is refused even when the room is
-/// supplied by the caller.
+/// (bytes, `M` and `G` binary units, a parsed lever) replaces both, as given:
+/// read [`HostRead::Given`] up to what the machine has ([`host_capacity`]:
+/// its total memory, or the smallest cgroup v2 `memory.max` above this
+/// process) and [`HostRead::GivenAbove`] past it ([`given_room`]), which a
+/// plan takes as given and a load refuses ([`host_available_for_load`]); a
+/// value that is not bytes is refused by name. A base page the row room
+/// cannot count in is refused even when the room is supplied by the caller.
 pub fn host_available() -> Result<u64, String> {
     host_available_read().map(|(bytes, _)| bytes)
 }
@@ -27,9 +30,6 @@ pub fn host_available_read() -> Result<(u64, HostRead), String> {
     // count in is refused by name, before the room is read.
     os::page_bytes().map_err(|e| e.to_string())?;
     let levers = bloomery_levers::nvtier_levers().map_err(|e| e.to_string())?;
-    if let Some(room) = levers.host_room {
-        return Ok((room, HostRead::Given));
-    }
     let memory = os::host_memory().map_err(|e| e.to_string())?;
     let levels = cgroup_levels()?;
     let texts: Vec<CgroupLevel<'_>> = levels
@@ -41,7 +41,47 @@ pub fn host_available_read() -> Result<(u64, HostRead), String> {
             stat,
         })
         .collect();
+    if let Some(room) = levers.host_room {
+        let given = given_room(
+            room,
+            &host_capacity(memory.total_bytes, platform_total(), &texts)?,
+        );
+        if matches!(given.1, HostRead::GivenAbove { .. }) {
+            // Once a process: the plan's own records name no reading, so this
+            // is the line that says the room is another host's.
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                eprintln!(
+                    "host room {room} B: {}; a plan takes it as given, a load refuses it",
+                    given.1
+                );
+            });
+        }
+        return Ok(given);
+    }
     host_room(memory.available_bytes, platform_reading(), &texts)
+}
+
+/// [`host_available_read`] for a load: the reading a run that takes the
+/// room goes by, refused by name where `BLOOMERY_HOST_ROOM` gave a room
+/// past what this machine has ([`load_room`]). A plan alone reads
+/// [`host_available_read`] and takes that room as given.
+pub fn host_available_for_load() -> Result<(u64, HostRead), String> {
+    host_available_read().and_then(load_room)
+}
+
+/// The platform's own figure of the host's memory, as the host capacity
+/// names it.
+#[cfg(target_os = "linux")]
+fn platform_total() -> &'static str {
+    "MemTotal in /proc/meminfo"
+}
+
+/// The platform's own figure of the host's memory, as the host capacity
+/// names it.
+#[cfg(target_os = "macos")]
+fn platform_total() -> &'static str {
+    "hw.memsize"
 }
 
 /// The platform's own reading of the host's available bytes, as the host
@@ -130,7 +170,7 @@ fn cgroup_levels() -> Result<Vec<(String, String, String, String)>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::host_available_read;
+    use super::{HostRead, host_available_for_load, host_available_read};
 
     /// The host's room reads on this platform, named by the platform's own
     /// reading, and the base page the row room counts in is one the
@@ -149,10 +189,50 @@ mod tests {
         let word = read.word();
         #[cfg(target_os = "linux")]
         assert!(
-            word == "MemAvailable" || word.starts_with("cgroup:") || word == "given",
+            word == "MemAvailable"
+                || word.starts_with("cgroup:")
+                || word == "given"
+                || word == "given-above",
             "{word}"
         );
         #[cfg(target_os = "macos")]
-        assert!(word == "vmstats" || word == "given", "{word}");
+        assert!(
+            word == "vmstats" || word == "given" || word == "given-above",
+            "{word}"
+        );
+    }
+    /// A room `BLOOMERY_HOST_ROOM` gives past this machine's memory is read
+    /// by a plan as it is, named given above the machine's capacity, and
+    /// refused by a load with the value and the capacity: the lever is set in
+    /// a fresh process, since the process's environment is the reading's
+    /// input.
+    #[test]
+    fn a_load_refuses_a_room_given_past_this_machine() {
+        const NAME: &str =
+            "placement::workstation::tests::a_load_refuses_a_room_given_past_this_machine";
+        const FRESH: &str = "fresh-process";
+        const ROOM: &str = "100000G";
+        if !std::env::args().any(|a| a == FRESH) {
+            let status =
+                std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                    .args(["--exact", NAME, FRESH, "--test-threads", "1"])
+                    .env(bloomery_levers::HOST_ROOM, ROOM)
+                    .status()
+                    .expect("the fresh process");
+            assert!(status.success(), "the fresh process: {status}");
+            return;
+        }
+        let bytes = 100_000_u64 << 30;
+        let (room, read) = host_available_read().expect("a plan reads the given room");
+        assert_eq!(room, bytes);
+        assert!(matches!(read, HostRead::GivenAbove { .. }), "{read:?}");
+        let text = host_available_for_load().expect_err("a load refuses it");
+        for word in [
+            bloomery_levers::HOST_ROOM,
+            &bytes.to_string(),
+            "this machine has",
+        ] {
+            assert!(text.contains(word), "{word} missing from {text}");
+        }
     }
 }

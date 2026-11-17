@@ -161,7 +161,7 @@ fn beside_text(beside: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement::workstation::{HostNeed, HostRead};
+    use crate::placement::workstation::{HOST_DRIFT, HostNeed, HostRead};
     use crate::placement::{Host, HostTotals, Machine, ModelTensors, Node};
     use bloomery_levers::KvHost;
 
@@ -256,10 +256,11 @@ mod tests {
     }
 
     /// A room the caller states binds an unsplit plan's host headroom, the
-    /// tighter of it and the machine's figure less the plan's host need: the
-    /// need fits a stated room and the pool beside it does not, so the pool
-    /// is refused by name with the room's headroom. A room that was read
-    /// leaves the machine's figure, and so does a stated room past it.
+    /// room less the plan's host need: the need fits a stated room and the
+    /// pool beside it does not, so the pool is refused by name with the
+    /// room's headroom. A room that was read under the machine's figure
+    /// leaves the figure's; a read or stated room past it is the headroom's
+    /// own.
     #[test]
     fn a_stated_room_binds_an_unsplit_plans_headroom() {
         let model = ModelTensors {
@@ -310,11 +311,22 @@ mod tests {
             0
         );
         assert!(pool.check(&made_at((399, HostRead::Given))).is_err());
-        // A read room, and a stated one past the machine's figure, leave it.
-        for room in [(350, HostRead::MemAvailable), (u64::MAX, HostRead::Given)] {
-            let plan = made_at(room);
-            assert_eq!(plan.host.headroom_bytes, 700);
-            assert_eq!(pool.check(&plan).expect("the machine's figure"), 600);
-        }
+        // A read room under the machine's figure leaves it.
+        let read = made_at((350, HostRead::MemAvailable));
+        assert_eq!(read.host.headroom_bytes, 700);
+        assert_eq!(pool.check(&read).expect("the machine's figure"), 600);
+        // PIN(2026-11-17): replaces "a stated room past the machine's figure
+        // leaves it" (`(u64::MAX, Given)` read 700). The figure is the nominal
+        // workstation's, not a limit of the machine ([`Plan::plan_at`]): a
+        // stated or read room past it is the plan's room. Derivation: 2,000 B
+        // given less the 300 B of host terms is 1,700 B of headroom, and the
+        // 100 B pool leaves 1,600 B; a read 1,500 B + the drift is 1,500 B of
+        // room, 1,200 B of headroom, 1,100 B left.
+        let past = made_at((2000, HostRead::Given));
+        assert_eq!(past.host.headroom_bytes, 1700);
+        assert_eq!(pool.check(&past).expect("the stated room"), 1600);
+        let read_past = made_at((1500 + HOST_DRIFT, HostRead::MemAvailable));
+        assert_eq!(read_past.host.headroom_bytes, 1200);
+        assert_eq!(pool.check(&read_past).expect("the read room"), 1100);
     }
 }

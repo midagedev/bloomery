@@ -313,13 +313,14 @@ pub struct HostTotals {
     /// ([`workstation::HostNeed::headroom`], the one definition): the room
     /// the machine's figure leaves ([`workstation::HostNeed::machine_room`])
     /// less usable − experts − tables − shadows − reserves − the cards' share
-    /// of a unified pool, the tighter of it and a room the caller stated
-    /// ([`Plan::plan_at`]); on a plan the NVMe expert tier split
+    /// of a unified pool, until the plan is made at a room: a room the caller
+    /// stated, or a read room past the figure, is the room the headroom
+    /// counts from instead ([`Plan::plan_at`]); on a plan the NVMe expert tier split
     /// ([`expert_nvme_tier`]), the room the split read less the arena and the
     /// plan's host need, since the room binds there.
     pub headroom_bytes: i128,
     /// The host room the plan was made at: the reading's bytes, and the room
-    /// it was held to ([`Plan::plan_at`], including the machine caps) with
+    /// it was held to ([`Plan::plan_at`], including a unified pool's cap) with
     /// the reading that decided it, [`workstation::HostRead::Machine`] where
     /// a cap did; `None` for a plan made without one.
     pub room: Option<(u64, (u64, workstation::HostRead))>,

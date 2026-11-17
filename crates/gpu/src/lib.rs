@@ -4025,7 +4025,7 @@ mod context_tests {
             let (bytes, read) =
                 ::model::placement::workstation::host_available_read().expect("the host's room");
             assert!(
-                !matches!(read, ::model::placement::workstation::HostRead::Given),
+                !read.is_given(),
                 "a given room (BLOOMERY_HOST_ROOM): every reading is the same"
             );
             i128::from(bytes)

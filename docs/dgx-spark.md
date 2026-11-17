@@ -165,6 +165,8 @@ section 9.
   memory the Spark holds elsewhere (other processes, containers), or lower the slot count or context. The plan reads
   `MemAvailable` at start, so a `drop_caches` before the load is not needed.
 - **Set the room by hand.** `BLOOMERY_HOST_ROOM=100G` makes the plan read that room instead of `MemAvailable`, for
-  example to plan a start while something else still holds memory. A refusal then names the value as given.
+  example to plan a start while something else still holds memory. A refusal then names the value as given. A plan
+  (`--plan`) takes any room as given; a load refuses a value past the memory the machine has (`MemTotal`, or the
+  container's `memory.max` where that is less), naming both.
 - **`nvidia-smi` shows `[N/A]` for memory.** The GB10 reports no separate GPU memory there; bloomery reads the driver
   API and `MemAvailable` instead.

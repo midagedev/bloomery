@@ -336,7 +336,7 @@ impl Mtp38 {
         let rows = file_rows(&plan.draft);
         let mut w = match parts {
             Some(parts) => {
-                let reading = model::placement::workstation::host_available_read()
+                let reading = model::placement::workstation::host_available_for_load()
                     .map_err(|e| GpuError::plan(WHAT, e))?;
                 let (need, room) = parts.host_need(&rows, 0, 0, reading.0)?;
                 need.check(&reading).map_err(|e| GpuError::plan(WHAT, e))?;

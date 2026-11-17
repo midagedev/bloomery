@@ -379,33 +379,60 @@ impl Plan<'_> {
         Ok(())
     }
 
-    /// The room the plan's tiers use: [`workstation::plan_room`], capped by
-    /// the machine's host room and its unified pool. The pool's reading already
-    /// leaves out the cards' context self cost; [`workstation::HostNeed`] counts
-    /// the cards and the bytes reserved beside the plan, so none is subtracted
-    /// from the room again. The reading and effective room, with the reading
-    /// that decided it, are recorded in [`HostTotals::room`].
+    /// The room the plan's tiers use: [`workstation::plan_room`] of the room
+    /// the machine read or the caller gave, as it is. A host with more memory
+    /// than this workstation's nominal figure
+    /// ([`workstation::HostNeed::machine_room`]) plans at what it has: the
+    /// figure caps the room only on a unified machine, where it is the
+    /// census's reading of the pool, and the pool caps it there too. The
+    /// pool's reading already leaves out the cards' context self cost;
+    /// [`workstation::HostNeed`] counts the cards and the bytes reserved
+    /// beside the plan, so none is subtracted from the room again. The
+    /// reading and effective room, with the reading that decided it
+    /// ([`workstation::HostRead::Machine`] where the pool did), are recorded
+    /// in [`HostTotals::room`].
     ///
-    /// A [`workstation::HostRead::Given`] room also sets the host headroom from
-    /// the plan's terms at that room. A read room keeps the headroom at the
-    /// machine's figure until a tier splits the plan: the reading can move
-    /// between the plan and its load, where [`workstation::HostNeed::check`]
-    /// holds it. A split plan's headroom is what its effective room leaves.
+    /// A [`workstation::HostRead::Given`] room (past the machine's capacity or
+    /// not: a plan takes the room it is given, a load refuses one past what
+    /// the machine has, [`workstation::load_room`]) also sets the host headroom
+    /// from the plan's terms at that room, and so does a read room past the
+    /// machine's figure ([`Plan::host_bound`]). A read room at or under the
+    /// figure keeps the headroom at the figure until a tier splits the plan:
+    /// the reading can move between the plan and its load, where
+    /// [`workstation::HostNeed::check`] holds it. A split plan's headroom is
+    /// what its effective room leaves.
     pub fn plan_at(&mut self, room: &(u64, workstation::HostRead)) -> u64 {
         let figure = workstation::HostNeed::machine_room(self.machine.host());
-        let pool = self.machine.unified().map_or(u64::MAX, |pool| pool.bytes);
+        let cap = self
+            .machine
+            .unified()
+            .map_or(u64::MAX, |pool| pool.bytes.min(figure));
         let asked = workstation::plan_room(room);
-        let planned = asked.min(figure).min(pool);
+        let planned = asked.min(cap);
         let by = if planned < asked {
             workstation::HostRead::Machine
         } else {
             room.1.clone()
         };
         self.host.room = Some((room.0, (planned, by)));
-        if room.1 == workstation::HostRead::Given {
+        if room.1.is_given() || planned > figure {
             self.host.headroom_bytes = workstation::HostNeed::of(self, 0).headroom(planned);
         }
         planned
+    }
+
+    /// The room the machine holds this plan to: its host's figure
+    /// ([`workstation::HostNeed::machine_room`]), the nominal workstation's
+    /// where nothing was read, or the room the plan was made at where that is
+    /// past the figure ([`Plan::plan_at`]): a host with more memory than the
+    /// figure has what its reading says.
+    #[must_use]
+    pub fn host_bound(&self) -> u64 {
+        let figure = workstation::HostNeed::machine_room(self.machine.host());
+        self.host
+            .room
+            .as_ref()
+            .map_or(figure, |(_, (planned, _))| figure.max(*planned))
     }
 
     /// The usable bytes `card` planned with: its own, capped by the device's
@@ -451,11 +478,11 @@ impl Plan<'_> {
     /// only routed experts; the granules of its uploads + KV + scratch +
     /// context + reserves ≤ usable − margin on each card, usable capped by the
     /// card budget;
-    /// the plan's own host terms within the room its machine's figure leaves
-    /// ([`workstation::HostNeed::check`] at
-    /// [`workstation::HostNeed::machine_room`]), the NVMe tier's arena and
-    /// window held to the room its split read instead; on a unified machine,
-    /// the cards and the host together within the pool.
+    /// the plan's own host terms within the room its machine holds it to
+    /// ([`workstation::HostNeed::check`] at [`Plan::host_bound`]: the host's
+    /// figure, or the room the plan was made at where that is past it), the
+    /// NVMe tier's arena and window held to the room its split read instead;
+    /// on a unified machine, the cards and the host together within the pool.
     pub fn violations(&self) -> Vec<Violation> {
         self.violations_beside(0)
     }
@@ -529,7 +556,7 @@ impl Plan<'_> {
             }
         }
         // The host's bound is the load's own check (`HostNeed::check`) at
-        // the room the machine's figure leaves, over the plan's own terms:
+        // the room the machine holds the plan to, over the plan's own terms:
         // the rows' resident bytes, the ring shadows and the machine's
         // reserves. The NVMe tier's arena and run-ahead window are the
         // split's, sized to the room it read and held to that room
@@ -547,13 +574,15 @@ impl Plan<'_> {
             cards: 0,
             ..workstation::HostNeed::of(self, 0)
         };
-        if let Err(short) = need.check(&(
-            workstation::HostNeed::machine_room(host),
-            workstation::HostRead::Machine,
-        )) {
+        let bound = self.host_bound();
+        if let Err(short) = need.check(&(bound, workstation::HostRead::Machine)) {
             out.push(Violation::HostOver {
                 total: short.need.bytes().saturating_add(short.need.os),
-                usable: host.usable_bytes,
+                usable: if bound > workstation::HostNeed::machine_room(host) {
+                    bound.saturating_add(short.need.os)
+                } else {
+                    host.usable_bytes
+                },
             });
         }
         if let Some(PoolNeed { cards, host, pool }) = self.pool_need()

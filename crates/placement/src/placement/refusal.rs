@@ -538,9 +538,10 @@ pub enum Violation {
     },
     /// The plan's own host terms (the host's tensors, the cards' ring
     /// shadows and the machine's reserves, as a [`workstation::HostNeed`])
-    /// pass the room the machine's figure leaves
-    /// ([`workstation::HostNeed::machine_room`]): `total` is them with the
-    /// OS reserve in it, beside the host's usable bytes.
+    /// pass the room the machine holds the plan to
+    /// ([`super::Plan::host_bound`]: [`workstation::HostNeed::machine_room`], or the
+    /// room the plan was made at where that is past it): `total` is them with
+    /// the OS reserve in it, beside the usable bytes that room and reserve make.
     HostOver { total: u64, usable: u64 },
     /// On a unified machine, the `cards`' [`Violation::CardOver`] totals
     /// with their margins, the `host`'s need and the `beside` bytes the load

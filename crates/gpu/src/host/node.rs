@@ -143,11 +143,16 @@ pub struct NodeCensus {
 }
 
 impl NodeCensus {
-    /// This process's census, as a tier server sends it.
+    /// This process's census, as a tier server sends it and a local tier
+    /// projects its plan from: both take the room for a load, so a room given
+    /// past what this machine has is refused here
+    /// ([`workstation::host_available_for_load`]) and the wire never carries
+    /// one it names.
     pub fn here() -> Result<NodeCensus, GpuError> {
         Ok(NodeCensus {
             devices: crate::census()?,
-            host_room: workstation::host_available_read().map_err(|e| GpuError::plan(SERVER, e))?,
+            host_room: workstation::host_available_for_load()
+                .map_err(|e| GpuError::plan(SERVER, e))?,
             arena_given: workstation::nvtier_arena_given()
                 .map_err(|e| GpuError::plan(SERVER, e))?,
         })
@@ -162,6 +167,7 @@ impl NodeCensus {
             HostRead::VmStats => o.u8(2),
             HostRead::Cgroup { path } => o.u8(3).str(path),
             HostRead::Machine => o.u8(4),
+            HostRead::GivenAbove { capacity, from } => o.u8(5).u64(*capacity).str(from),
         };
         match self.arena_given {
             Some(bytes) => o.u8(1).u64(bytes),
@@ -201,6 +207,10 @@ impl NodeCensus {
                 path: i.str("host cgroup path")?,
             },
             4 => HostRead::Machine,
+            5 => HostRead::GivenAbove {
+                capacity: i.u64("host capacity")?,
+                from: i.str("host capacity source")?,
+            },
             tag => return Err(format!("unknown host reading {tag}")),
         };
         let host_room = (bytes, read);
@@ -481,8 +491,9 @@ impl NodeOpen {
                         Weights::load_placed(gpu.stream(), file, plan, self.card, card_dontneed)?
                     }
                     Some(load) => {
-                        let available =
-                            workstation::host_available().map_err(|e| GpuError::plan(WHAT, e))?;
+                        let available = workstation::host_available_for_load()
+                            .map_err(|e| GpuError::plan(WHAT, e))?
+                            .0;
                         let room = load.host_bytes(plan, self.card, available)?;
                         load.load(gpu.stream(), plan, self.card, card_dontneed, room)?
                             .0
@@ -528,7 +539,7 @@ impl NodeOpen {
         // The projection's room was this host's reading too, so the fresh
         // reading names the room either way.
         let (now, read) =
-            workstation::host_available_read().map_err(|e| GpuError::plan(SERVER, e))?;
+            workstation::host_available_for_load().map_err(|e| GpuError::plan(SERVER, e))?;
         let mut arena = workstation::HostNeed::of(&plan, 0)
             .grant(&(now.min(paging.room), read), floor)
             .map_err(|e| GpuError::plan(SERVER, e))?;
@@ -3039,6 +3050,10 @@ pub(super) mod tests {
                 path: "/user.slice/job.scope".into(),
             },
             HostRead::Machine,
+            HostRead::GivenAbove {
+                capacity: 256 << 30,
+                from: "MemTotal in /proc/meminfo".into(),
+            },
         ] {
             let census = NodeCensus {
                 devices: vec![gb10(7)],

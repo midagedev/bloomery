@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 # The plan room: the one owner of the host room `just records-refresh` plans V4.1's placement (a) under.
 #
-# generate_ds41 --plan resolves the unset residency word against two bounds (crates/gpu-gates/src/residency.rs): the
-# plan's host headroom, the workstation's plan room less the plan's host need (HostNeed::machine_room), and mem_left, the
-# host's room less the same need. At the room R = PLAN_ROOM mem_left is the headroom exactly, so the headroom alone
-# decides; at any larger room mem_left passes the headroom, and the pick and every record --plan prints stay the same. A
-# plan whose records differ between R and R + 64 GiB moves with the room.
+# generate_ds41 --plan resolves the unset residency word against the plan's host headroom and mem_left, each the host
+# room less the plan's host need. The pinned BLOOMERY_HOST_ROOM=R is the plan's room as given, on any machine: a room
+# past the machine's capacity is a plan's to take (only a load refuses it), so the records at R depend on R alone, not
+# on the machine's reading or its memory. They do move with R: at R = PLAN_ROOM the pick is bound by the headroom (the
+# committed ds41-p128-ced-on.rec holds pool_shrunk with 33 MiB left), so a larger room is another plan. Until a room
+# past PLAN_ROOM was honoured (2026-11-17) the script also planned at R + 64 GiB and refused when the two differed;
+# that held only while the plan capped a room to R, and the second plan is gone with the cap.
 #
 #   bash tools/ref/plan-room.sh --room   R in bytes on stdout; any machine, no binary
 #   bash tools/ref/plan-room.sh P C      on the box, the tree's built target/release/generate_ds41 --plan --depth P
-#                                        --place a under BLOOMERY_CED=C (on or off), once at BLOOMERY_HOST_ROOM=R and
-#                                        once at R + 64 GiB, each run's stderr passed through. Both exit 0 with the same
-#                                        stdout bytes, the plan record's room= and plan_room= words aside (they name the
-#                                        room a plan was made at): the first run's stdout. Else nothing on stdout and
-#                                        one line on stderr naming P, C, both rooms and the first line that differs, or
-#                                        the run that failed and its exit code.
+#                                        --place a under BLOOMERY_CED=C (on or off) at BLOOMERY_HOST_ROOM=R, its stderr
+#                                        passed through: its stdout. A run that fails: nothing on stdout and one line on
+#                                        stderr naming P, C, the room and the exit code.
 #
 # R is the `pub const PLAN_ROOM` line of crates/placement/src/placement/workstation.rs, underscores dropped (the crate
 # holds it to HOST_USABLE − OS_OTHER at compile time); this file holds no copy of the number.
-# Exit codes: 0 R or the plan printed; 1 the two rooms' plans differ or a run failed; 64 a usage error, a
+# Exit codes: 0 R or the plan printed; 1 the run failed or there is no binary; 64 a usage error, a
 # BLOOMERY_HOST_ROOM already set (the room is this script's), or a constant that is missing, given twice or not a
 # whole number.
 set -euo pipefail
@@ -26,7 +25,6 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 SRC=crates/placement/src/placement/workstation.rs
 BIN=target/release/generate_ds41
-MORE=$((64 << 30))
 
 usage() {
   echo "plan-room.sh: usage: bash tools/ref/plan-room.sh --room | bash tools/ref/plan-room.sh <depth> <on|off>" >&2
@@ -73,57 +71,26 @@ case $C in
   *) refuse "BLOOMERY_CED '$C': on or off" ;;
 esac
 [ -z "${BLOOMERY_HOST_ROOM+set}" ] || refuse "BLOOMERY_HOST_ROOM is set ('$BLOOMERY_HOST_ROOM'): the plan's room is this script's"
-LARGER=$((ROOM + MORE))
-WHAT="P=$P C=$C, rooms $ROOM and $LARGER"
+WHAT="P=$P C=$C, room $ROOM"
 if [ ! -x "$BIN" ]; then
   echo "plan-room.sh: $WHAT: no $BIN in $ROOT to run (records-refresh builds it before its plans)" >&2
   exit 1
 fi
 
-one='' two=''
-trap 'rm -f ${one:+"$one"} ${two:+"$two"}' EXIT
+one=''
+trap 'rm -f ${one:+"$one"}' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 one=$(mktemp "${TMPDIR:-/tmp}/plan-room.XXXXXX")
-two=$(mktemp "${TMPDIR:-/tmp}/plan-room.XXXXXX")
-oneb=$(mktemp "${TMPDIR:-/tmp}/plan-room.XXXXXX")
-twob=$(mktemp "${TMPDIR:-/tmp}/plan-room.XXXXXX")
 
-# plan ROOM OUT: the plan at BLOOMERY_HOST_ROOM=ROOM, its stdout to OUT, its stderr through. A run that fails ends the
-# script: one line naming it and its exit code, exit 1.
-plan() {
-  local rc=0
-  BLOOMERY_CED=$C BLOOMERY_HOST_ROOM=$1 "$BIN" --plan --depth "$P" --place a > "$2" || rc=$?
-  if [ "$rc" != 0 ]; then
-    echo "plan-room.sh: $WHAT: $BIN --plan at BLOOMERY_HOST_ROOM=$1 exited $rc" >&2
-    exit 1
-  fi
-}
-
-plan "$ROOM" "$one"
-plan "$LARGER" "$two"
-# The plan record names the room it was made at, so those two words differ by construction; every other byte counts.
-sed -E 's/ (room|plan_room)=[0-9]+/ \1=ROOM/g' "$one" > "$oneb"
-sed -E 's/ (room|plan_room)=[0-9]+/ \1=ROOM/g' "$two" > "$twob"
-
-if cmp -s "$oneb" "$twob"; then
-  cat "$one"
-  echo "plan-room.sh: $WHAT: the same $(wc -l < "$one" | tr -d ' ') lines at both rooms" >&2
-  exit 0
+# The plan at BLOOMERY_HOST_ROOM=R, its stdout to $one, its stderr through. A run that fails ends the script: one line
+# naming it and its exit code, exit 1.
+rc=0
+BLOOMERY_CED=$C BLOOMERY_HOST_ROOM=$ROOM "$BIN" --plan --depth "$P" --place a > "$one" || rc=$?
+if [ "$rc" != 0 ]; then
+  echo "plan-room.sh: $WHAT: $BIN --plan at BLOOMERY_HOST_ROOM=$ROOM exited $rc" >&2
+  exit 1
 fi
-first=$(awk -v a="$oneb" -v b="$twob" -v ra="$ROOM" -v rb="$LARGER" 'BEGIN {
-  for (n = 1; ; n++) {
-    ga = (getline la < a) > 0
-    gb = (getline lb < b) > 0
-    if (!ga && !gb) exit
-    if (!ga) la = "(no line)"
-    if (!gb) lb = "(no line)"
-    if (!ga || !gb || la != lb) {
-      printf "line %d at %s: %s | at %s: %s", n, ra, la, rb, lb
-      exit
-    }
-  }
-}')
-echo "plan-room.sh: $WHAT: the two rooms' plans differ: ${first:-their outputs differ past the last whole line}" >&2
-exit 1
+cat "$one"
+echo "plan-room.sh: $WHAT: $(wc -l < "$one" | tr -d ' ') lines" >&2

@@ -1090,7 +1090,10 @@ fn kimi_k3_places_on_the_box() {
 fn the_prompt_pass_plan_takes_at_least_the_arenas_floor() {
     use model::arch::kimi_k3::place::{tier_batch, tier_batch_at};
     const PASS_CTX: u64 = 4096;
-    const ROOM: u64 = 250 << 30;
+    // PIN(2026-11-17): the room was `250 << 30`, which `Plan::plan_at` capped at the nominal
+    // figure, `PLAN_ROOM` (245.3 GiB) on these cards; a given room is now the plan's room as
+    // given, so the room is the figure and the pins below keep the room they were taken at.
+    const ROOM: u64 = workstation::PLAN_ROOM;
     const DIAL_ROOM: u64 = 200 << 30;
     let split = header();
     let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));

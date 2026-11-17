@@ -2792,7 +2792,7 @@ fn placed_pre(
     // broker that refuses the load holds nothing of the load's.
     need_hook::consult().map_err(|e| GpuError::plan(what, e))?;
     let ordinal = Gpu::resolve_card(&spec.name, spec.device)?;
-    let reading = workstation::host_available_read().map_err(|e| GpuError::plan(what, e))?;
+    let reading = workstation::host_available_for_load().map_err(|e| GpuError::plan(what, e))?;
     // A plan with an arena may find the host short of its need by less than
     // the arena's room above its floor: the tier is then built over what
     // the reading leaves, never silently — the `nvtier` record names both.

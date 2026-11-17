@@ -358,7 +358,14 @@ fn hw_qwen4exp_plan() {
     let mut inputs = PlanInputs::describe(&split).unwrap_or_else(|e| panic!("describe: {e}"));
     // The plans here hold the PLE table on the host whatever this machine's
     // memory reads: a room no host need passes, given, not read.
-    inputs.room = (u64::MAX, model::placement::workstation::HostRead::Given);
+    // PIN(2026-11-17): the room was `u64::MAX`, which `Plan::plan_at` capped
+    // at the nominal figure, `PLAN_ROOM` on these cards; a given room is now
+    // the plan's room as given, so the room is the figure and the host
+    // headroom check below (usable − terms) holds the same bytes.
+    inputs.room = (
+        model::placement::workstation::PLAN_ROOM,
+        model::placement::workstation::HostRead::Given,
+    );
     let n_layer = inputs.spec.layers.len();
     let file: std::collections::HashSet<&str> = inputs
         .model
