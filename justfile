@@ -2861,7 +2861,7 @@ smoke *ARGS:
 # by name (`just rotation-due --real FAMILY`). `just affected` never selects the rotation.
 # ARGS go to the batch (--dry-run, --out DIR, --rerun).
 weekly *ARGS:
-    mkdir -p target && python3 tools/rotation.py due --with-weekly --out target/weekly.list && ./tools/gate-batch.sh --ledger --list target/weekly.list {{ARGS}}
+    mkdir -p target && python3 tools/rotation.py due --with-weekly --out target/weekly.list && BLOOMERY_SPILL_STRICT=${BLOOMERY_SPILL_STRICT:-1} ./tools/gate-batch.sh --ledger --list target/weekly.list {{ARGS}}
 
 # The rotation's due list alone, as a `--list` file for tools/gate-batch.sh: the gates no landing runs and those of an F family, stalest
 # family first, each with its predicted wall. It reads the box once, for the keys.

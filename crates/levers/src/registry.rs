@@ -3174,6 +3174,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          host's CPU count.",
     ),
     runner(
+        "BLOOMERY_SPILL_STRICT",
+        Some("ptx-spill-check.sh"),
+        "`1` makes a binary whose `jit_local` column no pin held (a driver the table's \
+         `# jit-driver:` line does not list) a violation in `tools/ptx-spill-check.sh`: rc 1, \
+         naming the driver and the next step. Unset or `0` leaves it a counted line and rc 0; \
+         the nightly batch and the release batch set it in `tools/gate-batch.sh`'s environment.",
+    ),
+    runner(
         "BLOOMERY_SPLITK_BAND_DUMP",
         None,
         "The model attention gate's handshake with the child it runs of its own test \

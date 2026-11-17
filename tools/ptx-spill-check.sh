@@ -67,16 +67,43 @@
 #   Every table is read once, into a copy every binary reads: a table given as a pipe or a process
 #   substitution (`<(grep … tools/ref/ptx-shapes.tsv)`) is empty on a second read.
 #
+#   The driver. `spill` is ptxas's and never reads the driver; `jit_local` is the driver JIT's, and two drivers can read one entry
+#   differently, so where two cards measure it differently both stand, separated by the driver. A table may name the drivers its
+#   jit_local column is pinned on, on one `# jit-driver: <version> [<version>...]` line (the version nvidia-smi prints), and a row
+#   may carry exceptions after its four columns, `<bin> <entry> <spill> <jit_local> @<version>=<jit_local>...`: that driver reads
+#   this entry's jit_local as given, every other listed driver reads the plain column (a row measured on one driver is its plain value,
+#   provisional for the others until their scan confirms it or adds their exception). An exception names a listed driver, once, and
+#   differs from the plain column; a table with no `# jit-driver:` line carries none, and a line or an exception that is no such
+#   thing ends the script 2 with the table's line. The scan's driver is nvidia-smi's, the one every card reports (the JIT's card is
+#   not known before the JIT, the driver is the machine's), asked only for a table that names drivers. Per binary:
+#     the driver is listed    jit_local is held to the plain column or the driver's own exception, and the line
+#                             `ptx-spill bin=<bin> jit-driver=<version> held (the table pins <list>)` names the driver
+#     it is not listed, or    jit_local is read and not compared; spill, unpinned and stale rows stay held. The line
+#     no driver can be read   `ptx-spill bin=<bin> jit-driver=<version>|unknown NOT HELD: …` names it, and the verdict ends
+#                             `spill-only(jit_local not held: driver <version>|unknown)` after its PASS or FAIL: rc 0 when nothing else is red
+#     no `# jit-driver:` line every driver is held to the jit_local column, as before, and nvidia-smi is not asked
+#   After the last binary one line counts what was read and what was not held:
+#     `ptx-spill summary bins=<n> unheld=<u> strict=<0|1>[ drivers=<version>[,<version>...]]`
+#   (bins: the binaries read against a table; unheld: those whose jit_local no pin held; drivers: the drivers that left them unheld, `unknown`
+#   for one nvidia-smi could not name). tools/gate-batch.sh reads `unheld=` off it (the item line's and the DONE line's `unheld=<n>`, and no
+#   ledger row for such a green), so a landing shows a green that held no JIT column.
+#   BLOOMERY_SPILL_STRICT=1 (the nightly batch and the release batch set it) makes an unheld binary a violation: its verdict ends FAIL, rc 1, and the
+#   line `<bin> jit_local not held …` names the driver and the next step (list the driver in the table's `# jit-driver:` line, run the gate on it
+#   and give each red row its `@<version>=` exception; for an unknown driver, make nvidia-smi name one). 0 or unset leaves a landing rc 0 with the
+#   count visible; any other value ends 64.
+#
 # Every violation prints one line, and the script runs every binary before it decides:
 #   <bin> <entry> spill=<got> pinned=<want> ABOVE|BELOW   (either column; BELOW = lower the pin)
 #   <bin> <entry> unpinned spill=<got> jit_local=<got>     (in the scan, not in the table)
 #   <bin> <entry> stale                                    (in the table, not in the scan)
+#   <bin> jit_local not held: driver <version> …           (BLOOMERY_SPILL_STRICT=1 only: the table pins jit_local on other drivers)
 #   ptx-spill bin=<bin> scan is no-jit (jit_local not read) FAIL   (a scan that skipped the JIT)
 #   ptx-spill bin=<bin> no table for <arch> on cc <M.m> FAIL       (no table of the scan's arch and capability)
 #   ptx-spill bin=<bin> scan rc=75 CONTENTION                      (the scan's JIT could not take a lock: no reading, no verdict)
 #   ptx-spill bin=<bin> comparison=unread|entries=unread|pinned=unread FAIL   (the comparison or a count could not be read)
-# Before its verdict each binary names the table it read: `ptx-spill bin=<bin> table=<path> arch=<arch> jit-cc=<M.m>`.
-# Exit status: 0 when every binary's scan read and matched its pins; 1 on a violation or a scan
+# Before its verdict each binary names the table it read: `ptx-spill bin=<bin> table=<path> arch=<arch> jit-cc=<M.m>`, and for a table
+# that names drivers the driver line above.
+# Exit status: 0 when every binary's scan read and matched its pins (an unheld binary included, unless BLOOMERY_SPILL_STRICT=1); 1 on a violation or a scan
 # that failed (ptx-scan's own nonzero exit but 75, or a table it printed without rows); 75 when at least one scan
 # ended 75 (lock contention: ptx-scan's JIT step found a card lock, a batch hold or the timing lease taken) and no binary
 # had a violation or a failed scan: a contended binary is no verdict and the rest read as usual, so a batch retries the
@@ -96,7 +123,7 @@ self_test() {
   t=$(mktemp -d)
   cp "${BASH_SOURCE[0]}" "$t/ptx-spill-check.sh"
   cp "${BASH_SOURCE[0]%/*}/arch.sh" "$t/arch.sh"
-  unset PTX_SPILL_FULL XDG_CACHE_HOME BLOOMERY_BUILD_ONLY
+  unset PTX_SPILL_FULL XDG_CACHE_HOME BLOOMERY_BUILD_ONLY BLOOMERY_SPILL_STRICT
   export BLOOMERY_ARCH=sm_86
   export PTX_SPILL_CACHE=off
   # The stub scan prints the fixture scan of its binary (`--no-jit`: the `.nj` twin), or fails as ptx-scan does on a missing binary.
@@ -161,7 +188,7 @@ self_test() {
   check() { # check <name> <want rc> <want line or -> <args...>
     local name=$1 want=$2 line=$3
     shift 3
-    out=$(bash "$t/ptx-spill-check.sh" "$@" 2>&1); rc=$?
+    out=$(bash "${SPILL:-$t/ptx-spill-check.sh}" "$@" 2>&1); rc=$?
     if [ "$rc" != "$want" ] || { [ "$line" != - ] && ! grep -qxF -- "$line" <<< "$out"; }; then
       echo "ptx-spill-check self-test: $name: rc $rc (want $want), want line '$line' in:" >&2
       sed 's/^/  /' <<< "$out" >&2
@@ -411,6 +438,101 @@ self_test() {
     "ptx-spill cache=$t/xdg/bloomery/ptx-spill-jit.tsv rows=0 driver=8.6/615.71.09/$(cksum < "$t/jitlib" | tr ' ' -)" "$t/table" j
   BLOOMERY_DATA=$t/data PTX_SPILL_CACHE='' HOME=$t/home PATH=$t/drv:$PATH check "BLOOMERY_DATA does not hold it" 0 \
     "ptx-spill cache=$t/home/.cache/bloomery/ptx-spill-jit.tsv rows=3 driver=8.6/615.71.09/$(cksum < "$t/jitlib" | tr ' ' -)" "$t/table" j
+  # The drivers (the header's «The driver»). A table that names drivers pins jit_local on those: a listed driver reads the plain column or its own
+  # exception, an unlisted one (or none) is named and compared on spill and the entry set only; a table with no `# jit-driver:` line is held
+  # on every driver. The stub nvidia-smi names the driver (STUB_DRV); n's two rows are k1 and k2, whose jit_local 615.71.09 reads as 24.
+  printf '%s\n' '# fixture' '# arch: sm_86' '# jit-cc: 8.6' '# jit-driver: 595.99.02 615.71.09' 'n k1 0 0' '# PIN(2000-01-01): fixture' \
+    'n k2 8 0 @615.71.09=24' > "$t/drvtab"
+  printf '%s\n' '# fixture' '# arch: sm_86' '# jit-cc: 8.6' 'L k1 0 0' > "$t/legacy"
+  drv() { # drv <driver> <command>...: the command under a stub nvidia-smi that names that driver
+    local d=$1
+    shift
+    STUB_DRV=$d PATH=$t/drv:$PATH "$@"
+  }
+  HELD='ptx-spill bin=n jit-driver=615.71.09 held (the table pins 595.99.02 615.71.09)'
+  scan n "k1 0 0" "k2 8 24"
+  drv 615.71.09 check "a listed driver reads its own exception" 0 "ptx-spill bin=n entries=2 pinned=2 nonzero=k2(spill=8,jit_local=24) violations=0 PASS" "$t/drvtab" n
+  drv 615.71.09 check "a listed driver's line names it" 0 "$HELD" "$t/drvtab" n
+  drv 595.99.02 check "another listed driver stays on the plain column: the 615.71.09 reading is a red" 1 "n k2 jit_local=24 pinned=0 ABOVE" "$t/drvtab" n
+  scan n "k1 0 0" "k2 8 0"
+  drv 595.99.02 check "another listed driver is green on the plain column" 0 "ptx-spill bin=n entries=2 pinned=2 nonzero=k2(spill=8,jit_local=0) violations=0 PASS" "$t/drvtab" n
+  drv 615.71.09 check "an exception ratchets down too" 1 "n k2 jit_local=0 pinned=24 BELOW" "$t/drvtab" n
+  # a driver the table does not list
+  NOTHELD='ptx-spill bin=n jit-driver=600.00.01 NOT HELD: the table pins jit_local on 595.99.02 615.71.09 only; jit_local is read and not compared, spill and the entry set are held'
+  scan n "k1 0 0" "k2 8 99"
+  drv 600.00.01 check "an unlisted driver compares no jit_local and says so" 0 "ptx-spill bin=n entries=2 pinned=2 nonzero=k2(spill=8,jit_local=99) violations=0 PASS spill-only(jit_local not held: driver 600.00.01)" "$t/drvtab" n
+  drv 600.00.01 check "an unlisted driver's line names it" 0 "$NOTHELD" "$t/drvtab" n
+  scan n "k1 0 0" "k2 16 99"
+  drv 600.00.01 check "an unlisted driver is still held on spill" 1 "n k2 spill=16 pinned=8 ABOVE" "$t/drvtab" n
+  assert "a spill red under an unlisted driver ends spill-only" grep -qxF "ptx-spill bin=n entries=2 pinned=2 nonzero=k2(spill=16,jit_local=99) violations=1 FAIL spill-only(jit_local not held: driver 600.00.01)" <<< "$out"
+  scan n "k1 0 0" "k2 8 99" "k3 0 0"
+  drv 600.00.01 check "an unlisted driver is still held on unpinned entries" 1 "n k3 unpinned spill=0 jit_local=0" "$t/drvtab" n
+  scan n "k1 0 0"
+  drv 600.00.01 check "an unlisted driver is still held on stale rows" 1 "n k2 stale" "$t/drvtab" n
+  # no driver to read: no nvidia-smi answer, or cards that report two versions
+  scan n "k1 0 0" "k2 8 99"
+  STUB_SMI_FAIL=1 drv 615.71.09 check "no nvidia-smi answer: the driver is unknown, named" 0 \
+    "ptx-spill bin=n jit-driver=unknown NOT HELD: the table pins jit_local on 595.99.02 615.71.09 only (nvidia-smi names no card); jit_local is read and not compared, spill and the entry set are held" "$t/drvtab" n
+  assert "an unknown driver ends spill-only" grep -qxF "ptx-spill bin=n entries=2 pinned=2 nonzero=k2(spill=8,jit_local=99) violations=0 PASS spill-only(jit_local not held: driver unknown)" <<< "$out"
+  STUB_CARD2="616.00.01, 8.6" drv 615.71.09 check "cards that report two driver versions leave the driver unknown" 0 \
+    "ptx-spill bin=n jit-driver=unknown NOT HELD: the table pins jit_local on 595.99.02 615.71.09 only (the cards report 2 driver versions); jit_local is read and not compared, spill and the entry set are held" "$t/drvtab" n
+  scan n "k1 0 0" "k2 8 24"
+  STUB_CARD2="615.71.09, 12.1" drv 615.71.09 check "cards of two capabilities on one driver still name the driver" 0 "$HELD" "$t/drvtab" n
+  # a table with no driver line is held on every driver, and never asks nvidia-smi
+  scan L "k1 0 8"
+  drv 600.00.01 check "a table with no driver line pins jit_local on any driver" 1 "L k1 jit_local=8 pinned=0 ABOVE" "$t/legacy" L
+  check "a table with no driver line does not need nvidia-smi" 1 "L k1 jit_local=8 pinned=0 ABOVE" "$t/legacy" L
+  assert "a table with no driver line prints no driver line" refute grep -q '^ptx-spill bin=L jit-driver=' <<< "$out"
+  # The same table under the JIT cache (a binary the driver JITs cold, then reads back from the cache): the cache is keyed by the driver, and the
+  # table's driver line is read the same, so each listed driver holds its own reading on a cold and on a warm run.
+  printf '%s\n' '# fixture' '# arch: sm_86' '# jit-cc: 8.6' '# jit-driver: 595.99.02 615.71.09' 'j k1 0 0' 'j k2 0 0 @615.71.09=24' 'j k3 0 0' > "$t/drvj"
+  rm -f "$t/jit.tsv"
+  jscan j "k1 1 0 0" "k2 2 0 24" "k3 3 0 0"
+  JHELD='ptx-spill bin=j jit-driver=615.71.09 held (the table pins 595.99.02 615.71.09)'
+  JV24='ptx-spill bin=j entries=3 pinned=3 nonzero=k2(spill=0,jit_local=24) violations=0 PASS'
+  jc check "a driver table under a cold cache: the driver's exception holds the JIT's reading" 0 "ptx-spill bin=j jit entries=3 jitted=3 cached=0 missed=3 cache=$t/jit.tsv" "$t/drvj" j
+  assert "...and its verdict names the driver held and passes" test "$(grep -cxF -e "$JHELD" -e "$JV24" <<< "$out")" = 2
+  jc check "a driver table under a warm cache reads the same pins from the cached columns" 0 "ptx-spill bin=j jit entries=3 jitted=0 cached=3 cache=$t/jit.tsv" "$t/drvj" j
+  assert "...with the same driver line and verdict" test "$(grep -cxF -e "$JHELD" -e "$JV24" <<< "$out")" = 2
+  STUB_DRV=595.99.02 jc check "another listed driver under that cache: its rows are not the cache's, and the plain pin reds the reading" 1 "j k2 jit_local=24 pinned=0 ABOVE" "$t/drvj" j
+  assert "...JITted whole, as its key is another driver's" grep -qxF "ptx-spill bin=j jit entries=3 jitted=3 cached=0 missed=3 cache=$t/jit.tsv" <<< "$out"
+  # FAIL-first: the script without the driver's exception, or without the unlisted driver's exemption, is the old gate (the plain pins on any driver)
+  scan n "k1 0 0" "k2 8 24"
+  sed '/^      if (drv != "") for (k = 5;/d' "$t/ptx-spill-check.sh" > "$t/ptx-spill-noexc.sh"
+  assert "exception mutant: the sed removed the exception read from the copy, and the script has it" \
+    test "$(grep -c '^      if (drv != "") for (k = 5;' "$t/ptx-spill-noexc.sh")$(grep -c '^      if (drv != "") for (k = 5;' "$t/ptx-spill-check.sh")" = 01
+  SPILL=$t/ptx-spill-noexc.sh drv 615.71.09 check "exception mutant: 615.71.09's reading is a red against the plain pin, as before the exception" 1 "n k2 jit_local=24 pinned=0 ABOVE" "$t/drvtab" n
+  scan n "k1 0 0" "k2 8 99"
+  sed 's/^      JIT_HELD=0$/      JIT_HELD=1/' "$t/ptx-spill-check.sh" > "$t/ptx-spill-allheld.sh"
+  assert "exemption mutant: the sed turned the unlisted driver's exemption off in the copy, and the script has it" \
+    test "$(grep -c '^      JIT_HELD=0$' "$t/ptx-spill-allheld.sh")$(grep -c '^      JIT_HELD=0$' "$t/ptx-spill-check.sh")" = 01
+  SPILL=$t/ptx-spill-allheld.sh drv 600.00.01 check "exemption mutant: an unlisted driver is a red against the plain pin, as before the exemption" 1 "n k2 jit_local=99 pinned=0 ABOVE" "$t/drvtab" n
+  # the table's lines: a driver line that is no list of versions, and an exception that pins nothing, end the script 2 with the table's line
+  dtab() { # dtab <name> <rows and header lines>...: a table of arch sm_86, cc 8.6 and n's two rows under those lines
+    local nm=$1
+    shift
+    printf '%s\n' '# fixture' '# arch: sm_86' '# jit-cc: 8.6' "$@" > "$t/$nm"
+  }
+  dtab twodrv '# jit-driver: 595.99.02' '# jit-driver: 615.71.09' 'n k1 0 0'
+  dtab nodrv-value '# jit-driver:' 'n k1 0 0'
+  dtab drvshape '# jit-driver: 595 615.71.09' 'n k1 0 0'
+  dtab drvdup '# jit-driver: 615.71.09  615.71.09' 'n k1 0 0'
+  dtab exc-nohdr 'n k1 0 0 @615.71.09=8'
+  dtab exc-unlisted '# jit-driver: 595.99.02' 'n k1 0 0 @615.71.09=8'
+  dtab exc-same '# jit-driver: 615.71.09' 'n k1 8 0 @615.71.09=0'
+  dtab exc-twice '# jit-driver: 615.71.09' 'n k1 8 0 @615.71.09=4 @615.71.09=8'
+  dtab exc-shape '# jit-driver: 615.71.09' 'n k1 8 0 @615.71.09'
+  dtab exc-junk '# jit-driver: 615.71.09' 'n k1 8 0 junk'
+  check "a table with two driver lines" 2 "ptx-spill-check: the table $t/twodrv declares 2 \`# jit-driver:\` lines: a table names its drivers on one" "$t/twodrv" n
+  check "a driver line with no version" 2 "ptx-spill-check: the table $t/nodrv-value declares '# jit-driver:', not driver versions as in '# jit-driver: 595.99.02 615.71.09'" "$t/nodrv-value" n
+  check "a driver line with a version of another shape" 2 "ptx-spill-check: the table $t/drvshape declares '# jit-driver: 595 615.71.09', not driver versions as in '# jit-driver: 595.99.02 615.71.09'" "$t/drvshape" n
+  check "a driver listed twice" 2 "ptx-spill-check: the table $t/drvdup lists the driver 615.71.09 twice in '# jit-driver: 615.71.09  615.71.09'" "$t/drvdup" n
+  check "an exception under no driver line" 2 "ptx-spill-check: the table $t/exc-nohdr line 4 (n k1): the exception \`@615.71.09=8\` is under no \`# jit-driver:\` line" "$t/exc-nohdr" n
+  check "an exception of a driver the line does not list" 2 "ptx-spill-check: the table $t/exc-unlisted line 5 (n k1): the exception \`@615.71.09=8\` names a driver the \`# jit-driver:\` line does not list" "$t/exc-unlisted" n
+  check "an exception that repeats the plain column" 2 "ptx-spill-check: the table $t/exc-same line 5 (n k1): the exception \`@615.71.09=0\` repeats the plain jit_local" "$t/exc-same" n
+  check "two exceptions of one driver" 2 "ptx-spill-check: the table $t/exc-twice line 5 (n k1): the driver 615.71.09 has two exceptions" "$t/exc-twice" n
+  check "an exception with no value" 2 "ptx-spill-check: the table $t/exc-shape line 5 (n k1): field 5 is \`@615.71.09\`, not \`@<driver>=<jit_local>\`" "$t/exc-shape" n
+  check "a fifth field that is no exception" 2 "ptx-spill-check: the table $t/exc-junk line 5 (n k1): field 5 is \`junk\`, not \`@<driver>=<jit_local>\`" "$t/exc-junk" n
   # BLOOMERY_BUILD_ONLY (the header's last paragraph): the call ends 0 before any scan once its binaries are built. The cases run in a
   # directory whose target/release holds the built binaries a and b (and not c); the stub scan's call log shows whether a scan ran.
   mkdir -p "$t/bo/target/release"
@@ -446,6 +568,59 @@ self_test() {
     test "$(grep -c '^    echo "ptx-spill-check.sh: BLOOMERY_BUILD_ONLY: \$# binary' "$t/ptx-spill-nobo.sh")$(grep -c '^    echo "ptx-spill-check.sh: BLOOMERY_BUILD_ONLY: \$# binary' "$t/ptx-spill-check.sh")" = 01
   SPILL=$t/ptx-spill-nobo.sh bo "build-only mutant: without the short-circuit the stub scan phase is reached" 0 \
     "ptx-spill bin=a entries=2 pinned=2 nonzero=k2(spill=8,jit_local=0) violations=0 PASS" some 1 "$t/table" a
+  # The summary line and BLOOMERY_SPILL_STRICT (the header's «After the last binary» and strict paragraphs). The summary counts the binaries read
+  # against a table and those whose jit_local no pin held; strict turns each of those into a violation that names the driver and the next step.
+  SUMRE='^ptx-spill summary bins=[0-9]+ unheld=[0-9]+ strict=[01]( drivers=[^ ]+)?$'
+  scan n "k1 0 0" "k2 8 24"
+  drv 615.71.09 check "a held run's summary counts no unheld binary" 0 "ptx-spill summary bins=1 unheld=0 strict=0" "$t/drvtab" n
+  assert "the summary line is the one shape the batch runner reads unheld= from" grep -Eq "$SUMRE" <<< "$out"
+  scan L "k1 0 0"
+  drv 600.00.01 check "a table with no driver line is never unheld, on any driver" 0 "ptx-spill summary bins=1 unheld=0 strict=0" "$t/legacy" L
+  scan n "k1 0 0" "k2 8 99"
+  drv 600.00.01 check "an unlisted driver is counted, with its name" 0 "ptx-spill summary bins=1 unheld=1 strict=0 drivers=600.00.01" "$t/drvtab" n
+  assert "... in the same one shape" grep -Eq "$SUMRE" <<< "$out"
+  printf '%s\n' '# fixture' '# arch: sm_86' '# jit-cc: 12.1' 'L k1 0 0' > "$t/legacy121"
+  SC=12.1 scan L "k1 0 0"
+  drv 600.00.01 check "two tables, one unheld: bins counts both, unheld one" 0 "ptx-spill summary bins=2 unheld=1 strict=0 drivers=600.00.01" "$t/drvtab" "$t/legacy121" n L
+  printf '%s\n' '# fixture' '# arch: sm_86' '# jit-cc: 8.6' '# jit-driver: 595.99.02 615.71.09' 'n k1 0 0' 'n k2 8 0 @615.71.09=24' 'm k1 0 0' > "$t/drvtab2"
+  scan m "k1 0 0"
+  drv 600.00.01 check "two unheld binaries on one driver count two and name the driver once" 0 "ptx-spill summary bins=2 unheld=2 strict=0 drivers=600.00.01" "$t/drvtab2" n m
+  STUB_SMI_FAIL=1 drv 615.71.09 check "an unreadable driver is counted as unknown" 0 "ptx-spill summary bins=1 unheld=1 strict=0 drivers=unknown" "$t/drvtab" n
+  scan L "k1 0 0"
+  check "a run that read no verdict still prints its summary" 75 "ptx-spill summary bins=0 unheld=0 strict=0" "$t/table" p75
+  # strict: a listed driver and a table with no driver line are untouched; an unlisted driver, and one nvidia-smi cannot name, are a red
+  STRICT_LINE='n jit_local not held: driver 600.00.01 is not on '"$t"'/drvtab'"'"'s `# jit-driver:` line and BLOOMERY_SPILL_STRICT=1 refuses an unpinned column; next: list 600.00.01 there, run this gate on it and give each red row its `@600.00.01=<jit_local>` exception'
+  scan n "k1 0 0" "k2 8 99"
+  BLOOMERY_SPILL_STRICT=1 drv 600.00.01 check "strict: an unlisted driver is a red that names the driver and the next step" 1 "$STRICT_LINE" "$t/drvtab" n
+  assert "strict: ... its verdict ends FAIL, still spill-only" grep -qxF "ptx-spill bin=n entries=2 pinned=2 nonzero=k2(spill=8,jit_local=99) violations=1 FAIL spill-only(jit_local not held: driver 600.00.01)" <<< "$out"
+  assert "strict: ... and its summary counts it with strict=1" grep -qxF "ptx-spill summary bins=1 unheld=1 strict=1 drivers=600.00.01" <<< "$out"
+  BLOOMERY_SPILL_STRICT=0 drv 600.00.01 check "strict 0 is the landing's rc 0 with the count visible" 0 "ptx-spill summary bins=1 unheld=1 strict=0 drivers=600.00.01" "$t/drvtab" n
+  assert "strict 0: ... and no violation line" refute grep -q '^n jit_local not held' <<< "$out"
+  scan n "k1 0 0" "k2 8 24"
+  BLOOMERY_SPILL_STRICT=1 drv 615.71.09 check "strict: a listed driver is green" 0 "ptx-spill summary bins=1 unheld=0 strict=1" "$t/drvtab" n
+  scan L "k1 0 0"
+  BLOOMERY_SPILL_STRICT=1 drv 600.00.01 check "strict: a table with no driver line is green on any driver" 0 "ptx-spill summary bins=1 unheld=0 strict=1" "$t/legacy" L
+  scan n "k1 0 0" "k2 8 99"
+  BLOOMERY_SPILL_STRICT=1 STUB_SMI_FAIL=1 drv 615.71.09 check "strict: an unreadable driver is a red that says how to read one" 1 \
+    "n jit_local not held: no driver named and BLOOMERY_SPILL_STRICT=1 refuses an unpinned column; next: make nvidia-smi name one driver version for the cards (nvidia-smi names no card)" "$t/drvtab" n
+  scan n "k1 0 0" "k2 16 99"
+  BLOOMERY_SPILL_STRICT=1 drv 600.00.01 check "strict: a spill red beside it keeps both lines" 1 "n k2 spill=16 pinned=8 ABOVE" "$t/drvtab" n
+  assert "strict: ... and the violation count is two" grep -qxF "ptx-spill bin=n entries=2 pinned=2 nonzero=k2(spill=16,jit_local=99) violations=2 FAIL spill-only(jit_local not held: driver 600.00.01)" <<< "$out"
+  BLOOMERY_SPILL_STRICT=2 check "strict: a value that is neither 0 nor 1 ends 64, named" 64 "ptx-spill-check.sh: BLOOMERY_SPILL_STRICT is 1 (an unheld jit_local column is a violation) or 0/unset, got '2'" "$t/drvtab" n
+  BLOOMERY_SPILL_STRICT=yes bo "strict: a bad value ends 64 in a build-only call too, before any scan" 64 \
+    "ptx-spill-check.sh: BLOOMERY_SPILL_STRICT is 1 (an unheld jit_local column is a violation) or 0/unset, got 'yes'" none 1 "$t/table" a
+  # FAIL-first: without the strict branch an unlisted driver stays rc 0 under strict, and without the count the summary says unheld=0
+  scan n "k1 0 0" "k2 8 99"
+  sed 's/^      if \[ "\$STRICT" = 1 \]; then$/      if false; then/' "$t/ptx-spill-check.sh" > "$t/ptx-spill-nostrict.sh"
+  assert "strict mutant: the sed turned the strict branch off in the copy, and the script has it" \
+    test "$(grep -c '^      if false; then$' "$t/ptx-spill-nostrict.sh")$(grep -c '^      if \[ "\$STRICT" = 1 \]; then$' "$t/ptx-spill-check.sh")" = 11
+  SPILL=$t/ptx-spill-nostrict.sh BLOOMERY_SPILL_STRICT=1 drv 600.00.01 check "strict mutant: an unlisted driver stays rc 0 under BLOOMERY_SPILL_STRICT=1, as before the branch" 0 \
+    "ptx-spill summary bins=1 unheld=1 strict=1 drivers=600.00.01" "$t/drvtab" n
+  sed '/^      unheld=\$((unheld + 1))$/d' "$t/ptx-spill-check.sh" > "$t/ptx-spill-nocount.sh"
+  assert "count mutant: the sed removed the count from the copy, and the script has it" \
+    test "$(grep -c '^      unheld=\$((unheld + 1))$' "$t/ptx-spill-nocount.sh")$(grep -c '^      unheld=\$((unheld + 1))$' "$t/ptx-spill-check.sh")" = 01
+  SPILL=$t/ptx-spill-nocount.sh drv 600.00.01 check "count mutant: without the count an unheld binary's summary says unheld=0, the silent green" 0 \
+    "ptx-spill summary bins=1 unheld=0 strict=0 drivers=600.00.01" "$t/drvtab" n
   rm -rf "$t"
   [ "$fails" = 0 ] && echo "ptx-spill-check: self-test ok" || { echo "ptx-spill-check: self-test $fails failed" >&2; return 1; }
 }
@@ -469,6 +644,9 @@ trap 'rm -rf "$TMP"' EXIT
 source "${BASH_SOURCE[0]%/*}/arch.sh"
 bloomery_arch ptx-spill-check.sh || exit $?
 KEYS=()
+KDRV=()
+# a `# jit-driver:` line's value: driver versions, one space apart
+DRVS_SHAPE='^[0-9]+(\.[0-9]+)+( [0-9]+(\.[0-9]+)+)*$'
 for i in "${!TABLES[@]}"; do
   F=${TABLES[$i]}
   cat -- "$F" > "$TMP/table.$i" || { echo "ptx-spill-check: cannot read the table $F" >&2; exit 2; }
@@ -489,6 +667,49 @@ for i in "${!TABLES[@]}"; do
     fi
     if [ "$K" = arch ]; then T_ARCH=$V; else T_CC=$V; fi
   done
+  # the optional `# jit-driver:` line: the driver versions the table's jit_local column is pinned on (none: every driver)
+  D=$(grep "^# jit-driver:" "$TMP/table.$i")
+  n=$(grep -c "^# jit-driver:" "$TMP/table.$i")
+  T_DRV=
+  case $n in
+    0) ;;
+    1)
+      T_DRV=$(printf '%s\n' "${D#"# jit-driver:"}" | awk '{ $1 = $1; print }')
+      if ! [[ $T_DRV =~ $DRVS_SHAPE ]]; then
+        echo "ptx-spill-check: the table $F declares '$D', not driver versions as in '# jit-driver: 595.99.02 615.71.09'" >&2
+        exit 2
+      fi
+      V=$(printf '%s\n' $T_DRV | sort | uniq -d | head -1)
+      if [ -n "$V" ]; then
+        echo "ptx-spill-check: the table $F lists the driver $V twice in '$D'" >&2
+        exit 2
+      fi ;;
+    *) echo "ptx-spill-check: the table $F declares $n \`# jit-driver:\` lines: a table names its drivers on one" >&2; exit 2 ;;
+  esac
+  # a row's exceptions, `@<driver>=<jit_local>` after its four columns: one listed driver each, once, and not the plain value
+  V=$(awk -v drivers="$T_DRV" '
+    BEGIN { n = split(drivers, d, " "); for (k = 1; k <= n; k++) listed[d[k]] = 1 }
+    /^[[:space:]]*#/ || NF == 0 { next }
+    NF > 4 {
+      split("", seen)
+      for (k = 5; k <= NF; k++) {
+        if ($k !~ /^@[0-9]+(\.[0-9]+)+=[0-9]+$/) { printf "%d (%s %s): field %d is `%s`, not `@<driver>=<jit_local>`\n", NR, $1, $2, k, $k; continue }
+        x = substr($k, 2)
+        e = index(x, "=")
+        v = substr(x, e + 1)
+        x = substr(x, 1, e - 1)
+        if (drivers == "") printf "%d (%s %s): the exception `%s` is under no `# jit-driver:` line\n", NR, $1, $2, $k
+        else if (!(x in listed)) printf "%d (%s %s): the exception `%s` names a driver the `# jit-driver:` line does not list\n", NR, $1, $2, $k
+        else if (x in seen) printf "%d (%s %s): the driver %s has two exceptions\n", NR, $1, $2, x
+        else if (v + 0 == $4 + 0) printf "%d (%s %s): the exception `%s` repeats the plain jit_local\n", NR, $1, $2, $k
+        seen[x] = 1
+      }
+    }' "$TMP/table.$i")
+  if [ -n "$V" ]; then
+    printf '%s\n' "$V" | while IFS= read -r L; do echo "ptx-spill-check: the table $F line $L" >&2; done
+    exit 2
+  fi
+  KDRV+=("$T_DRV")
   for j in "${!KEYS[@]}"; do
     if [ "${KEYS[$j]}" = "$T_ARCH $T_CC" ]; then
       echo "ptx-spill-check: the tables ${TABLES[$j]} and $F both pin $T_ARCH on cc $T_CC" >&2
@@ -502,6 +723,10 @@ if ! printf '%s\n' "${KEYS[@]}" | grep -q "^$ARCH "; then
   echo "ptx-spill-check: no ptx-shapes table for $ARCH; the tables pin $NAMED" >&2
   exit 64
 fi
+case ${BLOOMERY_SPILL_STRICT:-0} in
+  0 | 1) STRICT=${BLOOMERY_SPILL_STRICT:-0} ;;
+  *) echo "ptx-spill-check.sh: BLOOMERY_SPILL_STRICT is 1 (an unheld jit_local column is a violation) or 0/unset, got '$BLOOMERY_SPILL_STRICT'" >&2; exit 64 ;;
+esac
 case ${BLOOMERY_BUILD_ONLY:-0} in
   0) ;;
   1)
@@ -659,6 +884,28 @@ cache_add() {
     echo "ptx-spill cache=$CACHE not written: $(head -1 "$TMP/cache.err")"
   fi
 }
+# scan_driver: SDRV, the one driver version every card reports, asked once and only for a table that names drivers; SDRV_WHY when no one
+# version can be read. The capability may differ across cards, the driver is the machine's.
+SDRV=
+SDRV_WHY=
+SDRV_DONE=
+DRV_SHAPE='^[0-9]+(\.[0-9]+)+$'
+scan_driver() {
+  local smi n
+  [ -z "$SDRV_DONE" ] || return 0
+  SDRV_DONE=1
+  smi=$(nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader 2> /dev/null | sed 's/ //g' | cut -d, -f1 | sort -u) || smi=
+  n=$(printf '%s\n' "$smi" | grep -c .)
+  if [ "$n" = 0 ]; then
+    SDRV_WHY="nvidia-smi names no card"
+  elif [ "$n" != 1 ]; then
+    SDRV_WHY="the cards report $n driver versions"
+  elif ! [[ $smi =~ $DRV_SHAPE ]]; then
+    SDRV_WHY="nvidia-smi names '$smi', not a driver version"
+  else
+    SDRV=$smi
+  fi
+}
 full_scan() {
   bash "$SCAN" "$BIN" ${FILTER:+"$FILTER"} > "$TMP/$BIN.scan" 2> "$TMP/$BIN.err"
   src=$?
@@ -748,6 +995,9 @@ else
 fi
 rc=0
 contention=0
+nbins=0
+unheld=0
+UNHELD_DRVS=
 for ARG in "$@"; do
   BIN=${ARG%%:*}
   FILTER=
@@ -785,13 +1035,44 @@ for ARG in "$@"; do
     continue
   fi
   echo "ptx-spill bin=$BIN table=${TABLES[$T]} arch=$BARCH jit-cc=$BCC"
+  nbins=$((nbins + 1))
+  # A table that names drivers pins jit_local on those only (header); the others read it and compare nothing.
+  JIT_HELD=1
+  JIT_DRV=
+  SPILL_ONLY=
+  UNHELD_LINE=
+  if [ -n "${KDRV[$T]}" ]; then
+    scan_driver
+    if [ -n "$SDRV" ] && [[ " ${KDRV[$T]} " == *" $SDRV "* ]]; then
+      JIT_DRV=$SDRV
+      echo "ptx-spill bin=$BIN jit-driver=$SDRV held (the table pins ${KDRV[$T]})"
+    else
+      JIT_HELD=0
+      SPILL_ONLY=" spill-only(jit_local not held: driver ${SDRV:-unknown})"
+      echo "ptx-spill bin=$BIN jit-driver=${SDRV:-unknown} NOT HELD: the table pins jit_local on ${KDRV[$T]} only${SDRV_WHY:+ ($SDRV_WHY)}; jit_local is read and not compared, spill and the entry set are held"
+      unheld=$((unheld + 1))
+      case ",$UNHELD_DRVS," in *",${SDRV:-unknown},"*) ;; *) UNHELD_DRVS=${UNHELD_DRVS:+$UNHELD_DRVS,}${SDRV:-unknown} ;; esac
+      if [ "$STRICT" = 1 ]; then
+        if [ -n "$SDRV" ]; then
+          UNHELD_LINE="$BIN jit_local not held: driver $SDRV is not on ${TABLES[$T]}'s \`# jit-driver:\` line and BLOOMERY_SPILL_STRICT=1 refuses an unpinned column; next: list $SDRV there, run this gate on it and give each red row its \`@$SDRV=<jit_local>\` exception"
+        else
+          UNHELD_LINE="$BIN jit_local not held: no driver named and BLOOMERY_SPILL_STRICT=1 refuses an unpinned column; next: make nvidia-smi name one driver version for the cards${SDRV_WHY:+ ($SDRV_WHY)}"
+        fi
+      fi
+    fi
+  fi
   # The table rows: between the header line (`entry … jit_local`) and the md5 section.
   awk '
     /^entry[[:space:]]/ { h = 1; for (i = 1; i <= NF; i++) { if ($i == "spill") s = i; if ($i == "jit_local") j = i }; next }
     /^ptx-scan-md5:/ { exit }
     h && NF > 1 { print $1, $s, $j }
   ' "$TMP/$BIN.scan" > "$TMP/$BIN.got"
-  awk -v b="$BIN" -v filter="$FILTER" '!/^[[:space:]]*#/ && NF >= 4 && $1 == b && index($2, filter) { print $2, $3, $4 }' "$TMP/table.$T" > "$TMP/$BIN.want"
+  awk -v b="$BIN" -v filter="$FILTER" -v drv="$JIT_DRV" '
+    !/^[[:space:]]*#/ && NF >= 4 && $1 == b && index($2, filter) {
+      j = $4
+      if (drv != "") for (k = 5; k <= NF; k++) if (index($k, "@" drv "=") == 1) j = substr($k, length(drv) + 3)
+      print $2, $3, j
+    }' "$TMP/table.$T" > "$TMP/$BIN.want"
   if [ ! -s "$TMP/$BIN.got" ]; then
     echo "ptx-spill bin=$BIN scan printed no entry rows FAIL"
     rc=1
@@ -799,13 +1080,13 @@ for ARG in "$@"; do
   fi
   # The pins by file name, not NR == FNR: a binary with no pinned row has an empty first file, and
   # NR == FNR would then read its scan as the pins and print every entry as stale.
-  out=$(awk -v b="$BIN" '
+  out=$(awk -v b="$BIN" -v jh="$JIT_HELD" '
     FILENAME == ARGV[1] { ws[$1] = $2; wj[$1] = $3; next }
     {
       seen[$1] = 1
       if (!($1 in ws)) { printf "%s %s unpinned spill=%s jit_local=%s\n", b, $1, $2, $3; next }
       if ($2 != ws[$1]) printf "%s %s spill=%s pinned=%s %s\n", b, $1, $2, ws[$1], ($2 + 0 > ws[$1] + 0 ? "ABOVE" : "BELOW")
-      if ($3 != wj[$1]) printf "%s %s jit_local=%s pinned=%s %s\n", b, $1, $3, wj[$1], ($3 + 0 > wj[$1] + 0 ? "ABOVE" : "BELOW")
+      if (jh == 1 && $3 != wj[$1]) printf "%s %s jit_local=%s pinned=%s %s\n", b, $1, $3, wj[$1], ($3 + 0 > wj[$1] + 0 ? "ABOVE" : "BELOW")
     }
     END { for (e in ws) if (!(e in seen)) printf "%s %s stale\n", b, e }
   ' "$TMP/$BIN.want" "$TMP/$BIN.got" | sort) || { echo "ptx-spill bin=$BIN comparison=unread FAIL"; rc=1; continue; }
@@ -816,16 +1097,17 @@ for ARG in "$@"; do
   if [ -n "$CACHE_WHY" ]; then c="cache=off($CACHE_WHY)"; elif [ -n "$JIT_NOTE" ]; then c="cache=off($JIT_NOTE)"; else c="cache=$CACHE"; fi
   echo "ptx-spill bin=$BIN jit entries=$n jitted=${JITTED:-$n} cached=$CACHED${MISSED:+ missed=$MISSED} $c"
   [ -z "$MISSED_NAMES" ] || echo "ptx-spill bin=$BIN jit missed=$MISSED_NAMES"
-  out=$({ [ -z "$out" ] || printf '%s\n' "$out"; cat "$TMP/$BIN.conf"; } | sort)
+  out=$({ [ -z "$out" ] || printf '%s\n' "$out"; cat "$TMP/$BIN.conf"; [ -z "$UNHELD_LINE" ] || printf '%s\n' "$UNHELD_LINE"; } | sort)
   if [ -n "$out" ]; then
     echo "$out"
     v=$(printf '%s\n' "$out" | wc -l | tr -d ' ') || v=unread
-    echo "ptx-spill bin=$BIN entries=$n pinned=$p nonzero=${nz:-none} violations=$v FAIL"
+    echo "ptx-spill bin=$BIN entries=$n pinned=$p nonzero=${nz:-none} violations=$v FAIL$SPILL_ONLY"
     rc=1
   else
-    echo "ptx-spill bin=$BIN entries=$n pinned=$p nonzero=${nz:-none} violations=0 PASS"
+    echo "ptx-spill bin=$BIN entries=$n pinned=$p nonzero=${nz:-none} violations=0 PASS$SPILL_ONLY"
   fi
 done
+echo "ptx-spill summary bins=$nbins unheld=$unheld strict=$STRICT${UNHELD_DRVS:+ drivers=$UNHELD_DRVS}"
 # A real failure anywhere is 1; contention alone is 75 (the header).
 [ "$rc" != 0 ] || [ "$contention" = 0 ] || rc=75
 exit "$rc"

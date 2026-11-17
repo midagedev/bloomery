@@ -354,6 +354,14 @@
 # its own line (`<item> rc=deferred <real-only|no-fixture|real-file|variant|fixture-only> lane=- tier=<real|fixture> deferred=1`), counted in `total=` and in no other rc class; a
 # yielded item (`rc=yield`, above) is counted the same way, in `yielded=` when any did. Exit 0
 # iff every rc is 0 (or deferred, yielded, or a ledger skip).
+# Unheld. A green that held no JIT column says so. tools/ptx-spill-check.sh ends its output with `ptx-spill summary bins=<n> unheld=<u> …`, u the
+# binaries whose jit_local no pin held (a driver the table does not list): each item's line gains `unheld=<u>` (before `ledger=`) when the
+# try's section of its log holds any, the DONE line ends with the batch's sum `unheld=<n>` (and one stderr line names what to do), and a
+# green with unheld binaries gets `ledger=unheld` — no ledger row, so a later `--ledger` batch (the night's, a release's) runs it again. A strict
+# batch makes the unheld column a red instead of a count: BLOOMERY_SPILL_STRICT=1 in the batch's environment (tools/nightly-real.sh and
+# the release batch publish.sh names set it; 0 opts out, any other value ends 64) is handed to every call as BLOOMERY_SPILL_STRICT=1 in the call's
+# env and never in the key, as the batch owner and the load class are not (name it in BLOOMERY_BOX_ENV and every key moves), and the batch itself
+# ends an rc 0 try that holds an unheld count red (rc 1, a line in the item's log), since a queued twin's green ran another batch's call. Landings stay rc 0.
 # Red attribution. With a ledger (--ledger or --round-ledger) a red item's line (final rc not 0 and not 75) gains, before `item=`,
 #   last_green=<commit>@<date> tier=<real|fixture> card=<card>   the item's newest green ledger row of any key in the files this
 #                                                                batch reads: the commit and date it recorded, and the tier and
@@ -488,7 +496,7 @@
 # verdict. A key that moved is `changed` and is not recorded; a recheck that failed is `unkeyed`, named
 # on stderr, and is not recorded. States known without a recheck stay on the item line: red, yield (a
 # --round-ledger item that yielded to another batch's GPU hold — nothing ran, nothing recorded), never,
-# unkeyed (no key before the batch). `append-failed` is the recheck's line when the append itself
+# unkeyed (no key before the batch), unheld (a green whose gate held no JIT column: «Unheld» below). `append-failed` is the recheck's line when the append itself
 # failed. The DONE line gains `skipped=<n>`; the exit code counts only the items
 # that ran. A record names the tree's commit (`<sha12>`, `-dirty` appended for uncommitted files, `unknown` outside a repository,
 # tools/nightly/units.sh's tree_commit); a tree whose `git status` fails ends the batch rc 70 by name before any item runs.
@@ -744,6 +752,16 @@ deferred_of() {
     END { print n + 0 }' "$1"
 }
 
+# unheld_of <log> <try>: the binaries whose jit_local no pin held, summed over the try's section of the item's log — tools/ptx-spill-check.sh's
+# `ptx-spill summary bins=<n> unheld=<u> …` lines (its self-test holds that shape to this pattern).
+unheld_of() {
+  awk -v t="=== try $2 " '
+    index($0, t) == 1 { on = 1; next }
+    /^=== try / { on = 0 }
+    on && match($0, /^ptx-spill summary bins=[0-9]+ unheld=[0-9]+ /) { split(substr($0, RSTART + 18), a, " "); n += substr(a[2], 8) }
+    END { print n + 0 }' "$1"
+}
+
 # try_waits <log> <try>: the seconds the given try spent waiting, not running — box.sh's guard for a sitting
 # (`[guard] … after N s: the command starts`) and tools/gpu-gate.sh for a gate lock, for the V4.1 load
 # lock and for another batch's GPU hold (`gpu-gate.sh: waited N s for the …`),
@@ -867,6 +885,7 @@ self_test() {
     return 1
   }
   unset BLOOMERY_TIER # the tier of a case is the case's own
+  unset BLOOMERY_SPILL_STRICT # strict is a case's own too
   unset BLOOMERY_BOX_LOCAL # the lanes and the pack budget of a case are the box's unless it names local mode
   unset BLOOMERY_BATCH_START_HOOK # a case that wants a hook sets it; the caller's own must not run on the fixture
   self=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
@@ -1385,6 +1404,7 @@ if [ -n "${BLOOMERY_BOX_PIDDIR:-}" ]; then
   : > "$BLOOMERY_BOX_PIDDIR/$$"
   trap 'rm -f "$BLOOMERY_BOX_PIDDIR/$$"' EXIT
 fi
+unset BLOOMERY_SPILL_STRICT # the remote command sees what BLOOMERY_BOX_ENV exports, never the Mac side's environment (as box.sh)
 for kv in ${BLOOMERY_BOX_ENV:-}; do export "$kv"; done
 # A build-only call (BLOOMERY_BUILD_ONLY=1, the build lane's pass) takes no card and runs nothing: it holds FAKE_BUILD_SLEEP seconds and
 # ends FAKE_BUILD_RC (0 unless set), named in seq.log (BS at its start, BE at its end) and in build.log with its env. No other FAKE_* knob
@@ -1433,6 +1453,13 @@ while [ "$n" -lt "${FAKE_DEFER:-0}" ]; do
   echo "deferred(real) oracle: fake clause $n"
   n=$((n + 1))
 done
+# FAKE_UNHELD=<n> (the item's env): tools/ptx-spill-check.sh's summary line with n binaries whose jit_local no pin held. As that script reads
+# BLOOMERY_SPILL_STRICT, the env the call carries decides: strict ends 1 on an unheld binary, the landing's 0 does not. FAKE_UNHELD_RC0=1: it
+# ends 0 either way, as a queued twin's green does (the twin ran another batch's call, which was not strict).
+if [ "${FAKE_UNHELD:-0}" != 0 ]; then
+  echo "ptx-spill summary bins=3 unheld=$FAKE_UNHELD strict=${BLOOMERY_SPILL_STRICT:-0} drivers=600.00.01"
+  [ "${BLOOMERY_SPILL_STRICT:-0}" != 1 ] || [ -n "${FAKE_UNHELD_RC0:-}" ] || exit 1
+fi
 # FAKE_GUARD75=<lease | hold=<owner> | lease+hold=<owner> | local=<owner>>: box.sh's guard in front of the call. A call whose env has
 # BLOOMERY_BOX_WAIT=0 ends 75 at once, naming what is up as tools/ref/lease-probe.sh words it (local: this side's own hold, tools/box.sh);
 # any other waits FAKE_HOLD_WAIT seconds first and ends 75 at its bound.
@@ -2799,6 +2826,60 @@ JF
   want_not 'tier run: … and the DONE line counts no deferrals' "$t/target/c-tier-re/run.log" '^DONE .* deferred='
   want 'tier run: … though its line does' "$t/target/c-tier-re/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real deferred=2 ledger=pending '
   want 'tier run: … and the phase recheck records it' "$t/target/c-tier-re/run.log" '^ledger steal-bal recorded$'
+  # Unheld (the header's paragraph): a green whose gate held no JIT column carries the count on its line and on the DONE line, and is no ledger
+  # row; BLOOMERY_SPILL_STRICT=1 in the batch's environment reaches the call (never a key call) and turns the same gate red. The fake box prints tools/ptx-spill-check.sh's
+  # summary line (FAKE_UNHELD=<n>), and the pattern that reads it is held to that script's own line.
+  rc=$(steal_case unh-1 "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_UNHELD=2')
+  printf '%s' "$rc" > "$t/rc-unh-1"
+  rc_ok 'unheld: a landing stays green with the count visible' unh-1 1
+  want 'unheld: its item line carries the count and its ledger state' "$t/target/c-unh-1/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real unheld=2 ledger=unheld item=steal-bal@FAKE_UNHELD=2$'
+  want 'unheld: the DONE line carries the sum' "$t/target/c-unh-1/run.log" '^DONE total=1 red=0 tier=real skipped=0 wall=[0-9]+s plan=[0-9]+s( slow=[0-9]+\.[0-9]{2})? laneA=[0-9]+s laneB=[0-9]+s unheld=2$'
+  want 'unheld: one stderr line names what to do' "$t/out-unh-1.log" '^gate-batch: unheld: 2 binary verdict\(s\) held no jit_local column .*BLOOMERY_SPILL_STRICT=1'
+  want_not 'unheld: its green is recorded by no recheck' "$t/target/c-unh-1/run.log" '^ledger steal-bal '
+  if [ ! -s "$t/rounds-unh-1.tsv" ]; then pass 'unheld: ... and no ledger row holds it'; else fail 'unheld: ... and no ledger row holds it' "$(cat "$t/rounds-unh-1.tsv")"; fi
+  if grep -q 'ptx-spill summary bins=\$nbins unheld=\$unheld strict=' "$ROOT/tools/ptx-spill-check.sh"; then pass 'unheld: the summary pattern is the one tools/ptx-spill-check.sh prints'
+  else fail 'unheld: the summary pattern is the one tools/ptx-spill-check.sh prints' 'its summary line moved'; fi
+  rc=$(BLOOMERY_SPILL_STRICT=1 steal_case unh-2 "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_UNHELD=2')
+  printf '%s' "$rc" > "$t/rc-unh-2"
+  if [ "$(cat "$t/rc-unh-2")" = 1 ] && grep -Eq '^DONE total=1 red=1 ' "$t/target/c-unh-2/run.log"; then pass 'unheld: BLOOMERY_SPILL_STRICT=1 in the batch environment ends the batch red'
+  else fail 'unheld: BLOOMERY_SPILL_STRICT=1 in the batch environment ends the batch red' "rc=$(cat "$t/rc-unh-2") $(tail -1 "$t/out-unh-2.log" 2> /dev/null)"; fi
+  want_row 'unheld: ... the call carried the variable' "$t/fake-state/box.log" '$1 ~ /BLOOMERY_SPILL_STRICT=1/ && $2 ~ /gen_b$/'
+  want_not 'unheld: ... and no key call did: strict moves no key' "$t/fake-state/keycalls.log" 'SPILL_STRICT'
+  rc=$(BLOOMERY_SPILL_STRICT=0 steal_case unh-3 "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_UNHELD=2')
+  printf '%s' "$rc" > "$t/rc-unh-3"
+  rc_ok 'unheld: BLOOMERY_SPILL_STRICT=0 is the landing: green, the count visible' unh-3 1
+  want_not 'unheld: ... and the call carried no variable' "$t/fake-state/box.log" 'SPILL_STRICT'
+  rc=$(BLOOMERY_SPILL_STRICT=1 steal_case unh-4 "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_UNHELD=2,FAKE_UNHELD_RC0=1')
+  printf '%s' "$rc" > "$t/rc-unh-4"
+  want 'unheld: a strict batch is red on an rc 0 that held no column, whoever ran it' "$t/target/c-unh-4/run.log" '^steal-bal rc=1 [0-9]+s try=1 lane=[AB] tier=real unheld=2 ledger=red '
+  want 'unheld: ... and the item log says why' "$t/target/c-unh-4/g-steal-bal.log" '^=== rc 0 with an unheld jit_local column under BLOOMERY_SPILL_STRICT=1: red'
+  check 'unheld: a BLOOMERY_SPILL_STRICT that is neither 0 nor 1 ends 64, named' 64 "^gate-batch: BLOOMERY_SPILL_STRICT is 1 \(an unheld jit_local column is red\) or 0/unset, got 'yes'" env BLOOMERY_SPILL_STRICT=yes "${gb[@]}" --dry-run host
+  want 'unheld: ... the red line still counts the unheld binaries' "$t/target/c-unh-2/run.log" '^steal-bal rc=1 [0-9]+s try=1 lane=[AB] tier=real unheld=2 ledger=red '
+  # FAIL-first: without the ledger exemption the unheld green is recorded; without the count read the line and the DONE line say nothing
+  mutant_of unh-led 's/^  if \[ "\${4:-0}" != 0 \]; then printf unheld; return; fi$/  :/' '^  :$'
+  rc=$(MTAG=unh-led steal_case unh-m1 "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_UNHELD=2')
+  printf '%s' "$rc" > "$t/rc-unh-m1"
+  want 'unheld mutant: without the exemption the unheld green is recorded in the ledger' "$t/target/c-unh-m1/run.log" '^ledger steal-bal recorded$'
+  mutant_of unh-cnt 's/summary bins=\[0-9\]+ unheld=\[0-9\]+ \//summarY bins=[0-9]+ unheld=[0-9]+ \//' 'summarY bins='
+  rc=$(MTAG=unh-cnt steal_case unh-m2 "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_UNHELD=2')
+  printf '%s' "$rc" > "$t/rc-unh-m2"
+  want_not 'unheld mutant: without the count read the green carries nothing' "$t/target/c-unh-m2/run.log" 'unheld='
+  want 'unheld mutant: ... and is recorded, the silent green' "$t/target/c-unh-m2/run.log" '^ledger steal-bal recorded$'
+  mutant_of unh-env 's/^  \[ "\${BLOOMERY_SPILL_STRICT:-0}" != 1 \] || benv=.*$/  :/' '^  :$'
+  rc=$(BLOOMERY_SPILL_STRICT=1 MTAG=unh-env steal_case unh-m4 "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_UNHELD=2')
+  printf '%s' "$rc" > "$t/rc-unh-m4"
+  want_no_row 'unheld mutant: without the hand-over the call carries no variable (the batch'"'"'s own rule still ends it red)' "$t/fake-state/box.log" '$1 ~ /SPILL_STRICT/'
+  mutant_of unh-rule 's/^  if \[ "\${BLOOMERY_SPILL_STRICT:-0}" = 1 \] \&\& \[ "\$rc" = 0 \] .*; then$/  if false; then/' '^  if false; then$'
+  rc=$(BLOOMERY_SPILL_STRICT=1 MTAG=unh-rule steal_case unh-m5 "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_UNHELD=2,FAKE_UNHELD_RC0=1')
+  printf '%s' "$rc" > "$t/rc-unh-m5"
+  rc_ok 'unheld mutant: without the batch'"'"'s own rule a twin'"'"'s strict green stands, the silent green' unh-m5 1
+  mutant_of unh-val 's/^  \*) die "BLOOMERY_SPILL_STRICT is 1 /  *) : "BLOOMERY_SPILL_STRICT is 1 /' ': "BLOOMERY_SPILL_STRICT is 1 '
+  check 'unheld mutant: without the check a bad value is read as no strict, rc 0' 0 '^lane [AB]  host ' env BLOOMERY_SPILL_STRICT=yes bash "$t/tools/gate-batch-unh-val.sh" --dry-run host
+  mutant_of unh-done 's/^\[ "\$unheld_n" = 0 \] || done_line="\$done_line unheld=\$unheld_n"$/:/' '^:$'
+  rc=$(MTAG=unh-done steal_case unh-m3 "steal-bal	B	a6000	10	$d" -- 'steal-bal@FAKE_UNHELD=2')
+  printf '%s' "$rc" > "$t/rc-unh-m3"
+  want_not 'unheld mutant: without the DONE token the batch line says nothing' "$t/target/c-unh-m3/run.log" '^DONE .* unheld='
+  want 'unheld mutant: ... though the item line does' "$t/target/c-unh-m3/run.log" '^steal-bal rc=0 [0-9]+s try=1 lane=[AB] tier=real unheld=2 '
   fi
   if gb_part 12; then
   # real-only (the header's paragraph): a no-op in the real tier, a deferral in the fixture tier, never a lane, a key or a call.
@@ -5428,6 +5509,11 @@ done
 if [ "$TIER" = fixture ] && [ -z "$TIER_BOX" ]; then
   BLOOMERY_BOX_ENV="${BLOOMERY_BOX_ENV:+$BLOOMERY_BOX_ENV }BLOOMERY_TIER=fixture"
 fi
+# BLOOMERY_SPILL_STRICT (the header's «Unheld»): 1 in the batch's environment reaches every call, never the key.
+case ${BLOOMERY_SPILL_STRICT:-0} in
+  0 | 1) ;;
+  *) die "BLOOMERY_SPILL_STRICT is 1 (an unheld jit_local column is red) or 0/unset, got '$BLOOMERY_SPILL_STRICT'" ;;
+esac
 
 # The plan, in two passes. The first (PYPLAN) validates and classifies every item: one record per
 # item, fields split by \x1f — class (A fixed, F balanced, X alone), log stem, recipe, the item's env
@@ -7545,13 +7631,15 @@ ledger_emit() { # $1 = stem, $2 = state: the phase recheck's verdict, after the 
   printf '%s\n' "$line" >> "$RUNLOG"
   printf '%s\n' "$line"
 }
-ledger_mark() { # $1 = plan index, $2 = final rc, $3 = lane: a state known now, or pending for the phase recheck
+ledger_mark() { # $1 = plan index, $2 = final rc, $3 = lane, $4 = the try's unheld count: a state known now, or pending for the phase recheck
   local i=$1 phase=ab dir tmp
   case "${P_LST[$i]}" in
     never) printf never; return ;;
     error) printf unkeyed; return ;;
   esac
   if [ "$2" != 0 ]; then printf red; return; fi
+  # A green that held no JIT column is no green at its key: a ledger row would let a strict batch skip the gate it was to refuse.
+  if [ "${4:-0}" != 0 ]; then printf unheld; return; fi
   [ "$3" = X ] && phase=x
   dir=$LWORK/pending-$phase
   mkdir -p "$dir"
@@ -8455,7 +8543,7 @@ lane_queue() { # $1 = the worker's label, $2 = the queue's lane: its items in th
 }
 
 run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid goes to lane-<lane>.child
-  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran=0 s benv line waits=0 cold=0 deferred=0 yowner='' rcl mark twin='' attach_pid attach_file held83=0 dl0=0 dlwait=0 recwait=0 rlock=0
+  local i=$1 lane=$2 log="$OUT/g-${P_STEM[$1]}.log" try=0 rc t0 t1 ran=0 s benv line waits=0 cold=0 deferred=0 unheld=0 yowner='' rcl mark twin='' attach_pid attach_file held83=0 dl0=0 dlwait=0 recwait=0 rlock=0
   local lanelab=${2%%[0-9]*} tlane bfail=0 bsec=0 bline='' # the label the lines carry (a host worker H2 is lane H), the times row's lane (the file's three values), the build pass's share
   tlane=$lanelab
   [ "$tlane" != H ] || tlane=B
@@ -8476,6 +8564,9 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   # A round batch's item yields to the lead's GPU hold at tools/gpu-gate.sh's first probe, not at its bound (rc 75 naming the owner,
   # which run_item reads below): in the call's env, never the key's. The lead's batch and a plain one wait as before.
   [ "$LMODE" != round ] || benv="${benv:+$benv }BLOOMERY_HOLD_YIELD=1"
+  # A strict batch (the release batch, the night) hands tools/ptx-spill-check.sh BLOOMERY_SPILL_STRICT=1: in the call's env, never
+  # the key's — an unheld green is no ledger row (the header's «Unheld»), so a recorded green held its column already, which strict asks.
+  [ "${BLOOMERY_SPILL_STRICT:-0}" != 1 ] || benv="${benv:+$benv }BLOOMERY_SPILL_STRICT=1"
   t0=$(date +%s)
   BS_KIND=none BS_SEC=0 BS_RC=0 BS_COLD=0 BS_WHY=''
   if [ "$BUILD_LANE" = 1 ]; then
@@ -8578,6 +8669,12 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   done
   [ "$rlock" = 0 ] || recipe_rel "$i"
   s=$(($(date +%s) - t0))
+  # A strict batch is red on an rc 0 that held no JIT column whoever ran it: the gate refuses by the call's env, and a queued twin ran another
+  # batch's call (the key does not carry strict).
+  if [ "${BLOOMERY_SPILL_STRICT:-0}" = 1 ] && [ "$rc" = 0 ] && [ -z "$yowner" ] && [ "$bfail" = 0 ] && [ "$(unheld_of "$log" "$try")" != 0 ]; then
+    rc=1
+    echo "=== rc 0 with an unheld jit_local column under BLOOMERY_SPILL_STRICT=1: red (the gate's own refusal did not run here: a queued twin's green)" >> "$log"
+  fi
   if [ -n "$yowner" ]; then
     rcl=yield
     if [ "$YIELD" = 1 ]; then
@@ -8600,11 +8697,13 @@ run_item() { # $1 = plan index, $2 = lane label; the lane's current child pid go
   [ "$cold" = 0 ] || line="$line cold=1"
   deferred=$(deferred_of "$log" "$try")
   [ "$deferred" = 0 ] || line="$line deferred=$deferred"
+  unheld=$(unheld_of "$log" "$try")
+  [ "$unheld" = 0 ] || line="$line unheld=$unheld"
   if [ -n "$yowner" ]; then
     # A yielded item records nothing and its rc stays 75 below, so no times row either: it ran nothing.
     [ "$LEDGER" = 0 ] || line="$line ledger=yield"
   else
-    [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_mark "$i" "$rc" "$tlane")"
+    [ "$LEDGER" = 0 ] || line="$line ledger=$(ledger_mark "$i" "$rc" "$tlane" "$unheld")"
   fi
   # The final try's seconds, green or red; a last try still at rc 75 got no lock and ran nothing. A cold
   # build's row goes to COLD_FILE, which no plan reads.
@@ -9288,8 +9387,14 @@ elif [ "$ND" != 0 ]; then
   [ "$ND_TC" = 0 ] || done_line="$done_line two_card=$ND_TC"
   done_line="$done_line deferred_list=$DEFER_LIST"
 fi
+# The binaries no pin held, summed over the items' lines like the fixture tier's deferrals above.
+unheld_n=$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^unheld=[0-9]+$/) n += substr($i, 8) } END { print n + 0 }' "$RUNLOG")
+[ "$unheld_n" = 0 ] || done_line="$done_line unheld=$unheld_n"
 echo "$done_line" >> "$RUNLOG"
 echo "$done_line"
+if [ "$unheld_n" != 0 ]; then
+  echo "gate-batch: unheld: $unheld_n binary verdict(s) held no jit_local column (the driver is not on a table's \`# jit-driver:\` line: tools/ptx-spill-check.sh); those greens are not in the ledger, and BLOOMERY_SPILL_STRICT=1 in the batch's environment makes them red" >&2
+fi
 if [ -n "$slow" ]; then
   read -r wl wg wn wc ws <<< "$WORST"
   if [ -n "$WORST" ] && [ "$wn" -gt 0 ]; then

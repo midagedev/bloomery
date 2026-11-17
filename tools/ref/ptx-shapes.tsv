@@ -12,6 +12,12 @@
 # The `# arch:` and `# jit-cc:` lines name the one arch and card capability every row pins (tools/ptx-spill-check.sh reads
 # each scan against the table of its banner's arch and capability); another pair's rows are a table of their own in
 # tools/ref/ptx-shapes/, whose tables the recipe names beside this one.
+# A table may also name the drivers its jit_local column is pinned on, one `# jit-driver: <version> [<version>...]` line (nvidia-smi's
+# version), and a row may then end with `@<version>=<jit_local>` for a listed driver that reads that entry differently: `spill` is
+# ptxas's and one column, `jit_local` is the driver JIT's and a driver's own where it differs (the plain column is every listed
+# driver's pin its row has no exception for; a row measured on one driver is provisional for the others). A driver the line does not list is
+# read and not compared on jit_local, by name, and stays held on spill and on the entry set (tools/ptx-spill-check.sh header,
+# «The driver»); a table with no such line, this one, is held on every driver.
 # PIN(2026-10-21): gate_e2e is no longer a pinned binary. Every one of its rows was a row of generate_ds41 for the same entry
 # at the same values: both bins carry the one bloomery-gpu bundle, and tools/check-ptx-names.py holds that premise (every
 # device crate gate_e2e links is linked by a scanned binary with the same features, and gate_e2e declares no kernel of its own).

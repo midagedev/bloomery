@@ -334,7 +334,7 @@ the one local gate lock holds the machine's cards, and its pack sums against thi
 A line `lane -  <item>` followed by `deferred to the real tier (<kind>)` is an item the fixture tier does not run:
 real-only, real-file, or of a family with no fixture. A line `lane A`, `lane B` or `lane X` is an item it runs, with its
 command. Your list is the items of the second kind. Keep `gate-ptx-spill` on it only where its tables pin your PTX
-arch and card capability: `sm_86` on cc 8.6, `sm_120a` on cc 12.0, `sm_86`, `sm_121` or `sm_121a` on cc 12.1 ([`dgx-spark.md`](dgx-spark.md) section 6).
+arch and card capability: `sm_86` on cc 8.6, `sm_120a` on cc 12.0, `sm_86`, `sm_121` or `sm_121a` on cc 12.1 ([`dgx-spark.md`](dgx-spark.md) section 6). The `sm_120a` table names the drivers it pins `jit_local` on (`# jit-driver:`); on another driver the gate compares `spill` and the entry set only and prints `NOT HELD` for `jit_local`.
 
 **What the card name closes.** Two machines whose card is neither the RTX 3090 nor the RTX A6000 ran a fixture-tier list
 in local mode. The two runs used different commits and different lists, so their counts do not add up:

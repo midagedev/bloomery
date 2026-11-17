@@ -24,7 +24,8 @@
 #   5. the skip: one `tools/gate-batch.sh --ledger --dry-run --tier real` over the list; when every item is green at its key the
 #      night ends 0 with one line and a `skip` report (and no batch);
 #   6. the batch: `tools/gate-batch.sh --tier real --ledger --over-budget-ok --list` under BLOOMERY_NIGHT_BOUND seconds
-#      (tools/gate-bound.sh bounded_bg). The night runs every item: a gate past 0.75x its bound is not refused (the
+#      (tools/gate-bound.sh bounded_bg), strict about the JIT column (BLOOMERY_SPILL_STRICT=1, which the caller's 0 opts out of: a driver
+#      no ptx-shapes table lists is a red the release check reads, not a count). The night runs every item: a gate past 0.75x its bound is not refused (the
 #      dry run's budget line goes in the report), it runs to its own bound and a timeout is a red the morning reads;
 #   7. the report, $NIGHT_HOME/report.tsv (atomic; each night's copy and its lists stay in $NIGHT_HOME/runs/<stamp>/), tab-separated:
 #        night  commit=<sha12> date=<start> state=<ran|skip> rc=<n> items=<n> torun=<n> plan=<s> tag=<tag> ledger=<path> run=<dir>
@@ -293,7 +294,7 @@ inner() {
   fi
   # 6. the batch
   rc=0
-  BLOOMERY_GATE_LEDGER=$ledger BG_IN=/dev/null BG_OUT=$run/batch.out bounded_bg "$NIGHT_BOUND" \
+  BLOOMERY_GATE_LEDGER=$ledger BLOOMERY_SPILL_STRICT=${BLOOMERY_SPILL_STRICT:-1} BG_IN=/dev/null BG_OUT=$run/batch.out bounded_bg "$NIGHT_BOUND" \
     "$ROOT/tools/gate-batch.sh" --tier real --ledger --over-budget-ok --out "$run/batch" --list "$run/night.list" || rc=$?
   [ "$rc" = 0 ] || end failed 70 "bounded_bg refused the batch's start (rc $rc)"
   bounded_bg_wait || true
@@ -323,6 +324,7 @@ inner() {
 # the real tools/nightly/units.sh and tools/gate-bound.sh it sources; each case runs the night and reads its rc, lines and report.
 self_test() {
   local fails=0 cases=0 rc out
+  unset BLOOMERY_SPILL_STRICT # a case that wants it sets it
   ST_TMP=$(mktemp -d)
   local t=$ST_TMP
   trap 'rm -rf "$ST_TMP"' EXIT
@@ -354,6 +356,7 @@ case " $* " in
     echo "gate-batch: predicted laneA=30s laneB=20s laneX=0s chain=0s wall=31s (derived: stub)"
     exit 0 ;;
 esac
+echo "batch-env strict=${BLOOMERY_SPILL_STRICT-unset}" >> "$STUB_LOG"
 out=''
 while [ $# -gt 0 ]; do case $1 in --out) out=$2; shift 2 ;; *) shift ;; esac; done
 [ "${STUB_BATCH_RC:-}" != 75 ] || { echo "gate-batch: refused: the timing lease is held" >&2; exit 75; }
@@ -424,7 +427,10 @@ SH
       st_want "red: a ledger skip and a green are not red" hasnt "$H/report.tsv" '^red	gate-(b|d)	' &&
       st_want "red: the totals line" has "$H/report.tsv" '^done	DONE total=4 red=1 tier=real skipped=1 wall=917s' &&
       st_want "red: the batch runs the real tier on the night's ledger, every item" has "$t/c/stub.log" "^gate-batch.sh --tier real --ledger --over-budget-ok --out .* --list .*night.list ledger=$H/gate-ledger.tsv\$" &&
+      st_want "red: the batch is strict about the JIT column" test "$(grep '^batch-env' "$t/c/stub.log")" = "batch-env strict=1" &&
       st_want "red: the hook is told the state and the report" test "$(cat "$t/c/told" 2> /dev/null)" = "red $H/report.tsv"
+    PREV='' st_case "strict opt-out" 1 "red: 1 red" "$s" STUB_RUNLOG="$runlog" BLOOMERY_SPILL_STRICT=0 &&
+      st_want "opt-out: the batch gets the caller's 0" test "$(grep '^batch-env' "$t/c/stub.log")" = "batch-env strict=0" || true
     PREV='night\tdate=2026-11-11T00:00:00+0900\tcommit=old\nred\tgate-a\trc=1 old\n' \
       st_case "refusal under a hold" 75 "refused: the box's guard refused (the timing lease or a hold is up): [guard] a hold is up" "$s" STUB_BOX_RC=75 &&
       st_want "refusal: nothing listed, nothing ran" hasnt "$t/c/stub.log" '^gate-batch.sh' &&
@@ -501,6 +507,7 @@ PY
   mutant "the range is dropped" '(m.group(2), ln[len(m.group(1)) + 1:])' '(m.group(2), ln[len(m.group(1)) + 1:].split(" last_green=")[0])'
   mutant "no carried red" '                if not seen and f[1] not in reds:' '                if False:'
   mutant "rc 75 is red" 'NOT_RUN = ("75", "yield")' 'NOT_RUN = ("yield",)'
+  mutant "no strict" 'BLOOMERY_SPILL_STRICT=${BLOOMERY_SPILL_STRICT:-1} BG_IN=/dev/null' 'BG_IN=/dev/null'
   if [ "$fails" = 0 ]; then
     echo "nightly-real: self-test ok ($cases cases)"
     return 0

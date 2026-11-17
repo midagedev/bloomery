@@ -31,7 +31,8 @@
 #      release mark), which must be green at the tag's keys on the lead's ledger or the night's, and on the night's verdict on
 #      the rest (tools/nightly-real.sh: no item red at the night's newest run unless green at its key since; a missing or stale
 #      night report stops it). rc 1 names each stop and writes DIR/release-run.list, the --list of what to run
-#      (`tools/gate-batch.sh --tier real --ledger --list DIR/release-run.list`); rc 2 or 70 is named;
+#      (`BLOOMERY_SPILL_STRICT=1 tools/gate-batch.sh --tier real --ledger --list DIR/release-run.list`: the release batch is strict about
+#      the JIT column, so a driver no ptx-shapes table lists is red there, not a count; rc 2 or 70 is named;
 #   1. the tag: HEAD must carry tag v<version> (the release is the tag; the binaries'
 #      --version names this commit);
 #   2. the versions: the serve AND gpu-gates crates must both say <version> (--version
@@ -113,7 +114,7 @@ night_gate() {
     python3 tools/rotation.py release-check --night "$NIGHT_DIR" --out "$NIGHT_DIR/release-run.list" >&2 || rc=$?
     case "$rc" in
         0) ;;
-        1) echo "publish.sh: the release check is red: the lines above name each stop (RUN a blocking gate with no green at its key, RED a night red still red, NIGHT the night's report) — run \`tools/gate-batch.sh --tier real --ledger --list $NIGHT_DIR/release-run.list\`, fix or re-pin each night red, then publish" >&2; return 1 ;;
+        1) echo "publish.sh: the release check is red: the lines above name each stop (RUN a blocking gate with no green at its key, RED a night red still red, NIGHT the night's report) — run \`BLOOMERY_SPILL_STRICT=1 tools/gate-batch.sh --tier real --ledger --list $NIGHT_DIR/release-run.list\` (strict: a driver no ptx-shapes table lists is red, not a count), fix or re-pin each night red, then publish" >&2; return 1 ;;
         *) echo "publish.sh: tools/rotation.py release-check could not run (rc $rc; 2 a bad input, 70 a tool it runs failed): the lines above name it" >&2; return 1 ;;
     esac
 }
@@ -420,7 +421,8 @@ if [ "${1:-}" = --self-test ]; then
         cp "$script" "$t/nc/tools/release/publish.sh"
         git -C "$t/nc" init -q
         git -C "$t/nc" -c user.name=selftest -c user.email=selftest@invalid commit -q --allow-empty -m selftest
-        for n in "1|1|the release check is red|does not carry|$t/night" "2|1|release-check could not run (rc 2|does not carry|$t/night" \
+        for n in "1|1|the release check is red|does not carry|$t/night" "1|1|BLOOMERY_SPILL_STRICT=1 tools/gate-batch.sh --tier real --ledger --list $t/night/release-run.list|does not carry|$t/night" \
+            "2|1|release-check could not run (rc 2|does not carry|$t/night" \
             "70|1|release-check could not run (rc 70|does not carry|$t/night" "0|1|does not carry v0.0.0||$t/night" \
             "0|1|the night's report could not be pulled from the box (tools/nightly-real.sh --pull, rc 66)|the release check|" \
             "0|1|does not carry v0.0.0||pull-ok"; do
@@ -444,7 +446,7 @@ if [ "${1:-}" = --self-test ]; then
     night_cases "$0" 1
     fails=$((fails + night_fails))
     # FAIL-first: without step 0b in the flow, or with a pull that is never asked, a case goes red
-    for m in $'\n    night_gate || exit 1\n|\n    :\n' $'    if [ -n "${BLOOMERY_NIGHT_DIR:-}" ]; then|    if true; then'; do
+    for m in $'\n    night_gate || exit 1\n|\n    :\n' $'    if [ -n "${BLOOMERY_NIGHT_DIR:-}" ]; then|    if true; then' '\`BLOOMERY_SPILL_STRICT=1 tools/gate-batch.sh --tier real|\`tools/gate-batch.sh --tier real'; do
         cases=$((cases + 1))
         python3 -I - "$0" "$t/night-mutant.sh" "${m%%|*}" "${m#*|}" << 'PY' || { echo "publish.sh self-test: a release-check mutant's text is not in the code" >&2; fails=$((fails + 1)); continue; }
 import sys

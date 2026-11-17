@@ -1,8 +1,16 @@
 # PTX spill ratchet, sm_120a on compute capability 12.0: the table tools/ptx-spill-check.sh reads for a scan whose
 # banner names arch=sm_120a and jit-cc=12.0. tools/ref/ptx-shapes.tsv holds the contract and the cc 8.6 rows of sm_86.
-# Pinned from the scans on ptxas 13.3.73, sm_120a, JIT on an NVIDIA GeForce RTX 5090 with driver 595.99.02.
+# Pinned from the scans on ptxas 13.3.73, sm_120a, JIT on an NVIDIA GeForce RTX 5090 with driver 595.99.02, and on driver 615.71.09
+# (JIT cuda 13.4, an RTX 5090 too; the gate-ptx-spill scan of 2026-11-17: its ptxas columns and every jit_local of generate_ds41 and
+# gate_qwen3vl_tower read as pinned below, but the rows that carry `@615.71.09=<bytes>`).
+# The plain jit_local column is the pin of every listed driver its row has no exception for. A row measured on one driver is its
+# plain value, provisional for the other until that driver's scan confirms it or adds its exception. A driver the line below does not
+# list is not held on jit_local (tools/ptx-spill-check.sh header, «The driver»).
 # arch: sm_120a
 # jit-cc: 12.0
+# PIN(2026-11-17): the jit_local column was held on every driver; drivers 595.99.02 and 615.71.09 read five rows differently (the scan
+# above), so it is held on the drivers named here, and a driver not named runs the ptxas columns only, by name.
+# jit-driver: 595.99.02 615.71.09
 # cfg: bloomery_nvfp4_mma
 
 # binary entry spill jit_local
@@ -16,10 +24,13 @@ generate_ds41 raon_hc_route 0 112
 # spills 700 B, RTX 5090 driver 595.99.02 JIT local stays 168 B. gate_gemm --case zgate checks both gates.
 generate_ds41 bf16_mma_norm_gate 700 168
 generate_ds41 cand_select 8 8
-generate_ds41 ds41_attn_seg 40 0
+# PIN(2026-11-17): ds41_attn_seg JIT local 0 -> 24 B on driver 615.71.09 (ptxas 13.3.73 sm_120a, cc 12.0 JIT, RTX 5090: the scan reads spill 40 as pinned);
+# the plain 0 stays the pin for driver 595.99.02.
+generate_ds41 ds41_attn_seg 40 0 @615.71.09=24
 generate_ds41 ds41_attn_seg_sel 48 24
 generate_ds41 ds41_attn_seg_sel_stage 56 32
-generate_ds41 ds41_attn_seg_stage 32 24
+# PIN(2026-11-17): ds41_attn_seg_stage JIT local 24 -> 16 B on driver 615.71.09 (the same scan: spill 32 as pinned); the plain 24 stays the pin for driver 595.99.02.
+generate_ds41 ds41_attn_seg_stage 32 24 @615.71.09=16
 generate_ds41 ds41_expert_gate_up_tiles 676 152
 generate_ds41 flash_latent_mma 24 8
 # PIN(2026-11-03): flash_latent_mma_sel 24 -> 16 B spill, the first cc 12.0 scan of the entry (ptxas 13.3.73 sm_120a, RTX 5090
@@ -33,10 +44,13 @@ generate_ds41 gemm_iq3s 24 16
 generate_ds41 gemm_nvfp4p 64 32
 # PIN(2026-11-01): each new gemm_*_bf16 entry is its F32 entry's body with the BF16 store, pinned at that entry's values until a scan on this table's arch and capability.
 generate_ds41 gemm_nvfp4p_bf16 64 32
-generate_ds41 gemm_nvfp4p_swiglu 160 56
-generate_ds41 gemm_q4k 0 8
+# PIN(2026-11-17): gemm_nvfp4p_swiglu JIT local 56 -> 64 B on driver 615.71.09 (the same scan: spill 160 as pinned); the plain 56 stays the pin for driver 595.99.02.
+generate_ds41 gemm_nvfp4p_swiglu 160 56 @615.71.09=64
+# PIN(2026-11-17): gemm_q4k JIT local 8 -> 0 B on driver 615.71.09 (the same scan: spill 0 as pinned); the plain 8 stays the pin for driver 595.99.02.
+generate_ds41 gemm_q4k 0 8 @615.71.09=0
 # PIN(2026-11-01): gemm_q4k_bf16 at gemm_q4k's values, its body with the BF16 store, until a scan on this table's arch and capability.
-generate_ds41 gemm_q4k_bf16 0 8
+# PIN(2026-11-17): the plain 8 stays that copy as the pin for driver 595.99.02; the scan on driver 615.71.09 (RTX 5090, cc 12.0) reads JIT local 0, spill 0 as pinned.
+generate_ds41 gemm_q4k_bf16 0 8 @615.71.09=0
 # PIN(2026-11-02): gemm_q4k_swiglu: unmeasured on this arch/capability; provisional 0/8 -> 208/64 from the sm_121a GB10 scan (ptxas 13.3.73, driver 595.84), until this pair is scanned.
 generate_ds41 gemm_q4k_swiglu 208 64
 generate_ds41 gemm_q6k 532 64

@@ -19,6 +19,10 @@ and fails a row no source declares (`stale`) and a declared entry with no row (`
   <bin> <entry> stale                         (in the table, declared by none of the binary's crates)
   <bin> <entry> unpinned (<file>:<line>)      (declared, not in the table)
 
+A row is `<bin> <entry> <spill> <jit_local>` and may carry driver exceptions after them, `@<driver>=<jit_local>`, under a
+`# jit-driver: <version>...` header line (tools/ptx-spill-check.sh's header says what they pin); a malformed, unlisted, repeated or
+plain-valued exception is a refusal, so a contributor on any driver sees it here, not at the card.
+
 Every table the recipe names, one per PTX arch and card capability (an argument that ends in `/` is every
 `*.tsv` in that directory, and one with none is a refusal), is checked for stale and unpinned entries:
 
@@ -300,17 +304,51 @@ def bin_kernels(scans):
     return out
 
 
+DRIVER_SHAPE = re.compile(r"^[0-9]+(\.[0-9]+)+$")
+EXCEPTION_SHAPE = re.compile(r"^@([0-9]+(?:\.[0-9]+)+)=([0-9]+)$")
+
+
+def table_drivers(path, text):
+    """The driver versions of a table's one `# jit-driver:` line, [] for a table with none (it pins every driver). The shape rules are
+    tools/ptx-spill-check.sh's, which reads the same line and the same row exceptions."""
+    lines = re.findall(r"^# jit-driver:(.*)$", text, re.M)
+    if not lines:
+        return []
+    if len(lines) > 1:
+        raise Refuse(f"{path}: {len(lines)} `# jit-driver:` lines, a table names its drivers on one")
+    drivers = lines[0].split()
+    if not drivers or not all(DRIVER_SHAPE.match(d) for d in drivers):
+        raise Refuse(f"{path}: `# jit-driver:{lines[0]}` is not driver versions as in `# jit-driver: 595.99.02 615.71.09`")
+    if len(set(drivers)) != len(drivers):
+        raise Refuse(f"{path}: `# jit-driver:{lines[0]}` lists a driver twice")
+    return drivers
+
+
 def read_table(path):
     rows = {}
     with open(path, encoding="utf-8") as fh:
-        for no, line in enumerate(fh, 1):
-            s = line.strip()
-            if not s or s.startswith("#"):
-                continue
-            f = s.split()
-            if len(f) != 4:
-                raise Refuse(f"{path}:{no}: want `<binary> <entry> <spill> <jit_local>`, got {len(f)} fields")
-            rows.setdefault(f[0], {})[f[1]] = no
+        text = fh.read()
+    drivers = table_drivers(path, text)
+    for no, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        f = s.split()
+        if len(f) < 4:
+            raise Refuse(f"{path}:{no}: want `<binary> <entry> <spill> <jit_local>`, got {len(f)} fields")
+        seen = set()
+        for tok in f[4:]:
+            m = EXCEPTION_SHAPE.match(tok)
+            if not m:
+                raise Refuse(f"{path}:{no}: want `@<driver>=<jit_local>` after the four columns, got `{tok}`")
+            if m.group(1) not in drivers:
+                raise Refuse(f"{path}:{no}: the exception `{tok}` names a driver the table's `# jit-driver:` line does not list")
+            if m.group(1) in seen:
+                raise Refuse(f"{path}:{no}: the driver {m.group(1)} has two exceptions")
+            if int(m.group(2)) == int(f[3]):
+                raise Refuse(f"{path}:{no}: the exception `{tok}` repeats the plain jit_local")
+            seen.add(m.group(1))
+        rows.setdefault(f[0], {})[f[1]] = no
     return rows
 
 
@@ -1121,6 +1159,37 @@ def self_test():
         out = run("refusal: a malformed table row", 1, [], table="generate_ds41 k_one 0\n")
         if "want `<binary> <entry> <spill> <jit_local>`, got 3 fields" not in out:
             fails.append(f"malformed row: {out!r}")
+        # driver exceptions (the header's «A row»): read under a `# jit-driver:` line, refused by name otherwise.
+        base = table_text(TABLE_ROWS)
+        drv = base.replace("# arch: sm_86\n", "# arch: sm_86\n# jit-driver: 595.99.02 615.71.09\n")
+        row = "generate_ds41   k_one   0   0\n"
+        out = run("green: a listed driver's exception", 0, [], table=drv.replace(row, row.rstrip() + " @615.71.09=8\n"))
+        if "2 binaries, 9 rows = 9 declared entries" not in out:
+            fails.append(f"exception summary: {out!r}")
+        for name, text, want in (
+            ("an exception under no driver line", base.replace(row, row.rstrip() + " @615.71.09=8\n"),
+             "the exception `@615.71.09=8` names a driver the table's `# jit-driver:` line does not list"),
+            ("an exception of a driver the line does not list", drv.replace(row, row.rstrip() + " @600.1.2=8\n"),
+             "the exception `@600.1.2=8` names a driver the table's `# jit-driver:` line does not list"),
+            ("an exception that repeats the plain column", drv.replace(row, row.rstrip() + " @615.71.09=0\n"),
+             "the exception `@615.71.09=0` repeats the plain jit_local"),
+            ("two exceptions of one driver", drv.replace(row, row.rstrip() + " @615.71.09=8 @615.71.09=16\n"),
+             "the driver 615.71.09 has two exceptions"),
+            ("an exception with no value", drv.replace(row, row.rstrip() + " @615.71.09\n"),
+             "want `@<driver>=<jit_local>` after the four columns, got `@615.71.09`"),
+            ("a fifth field that is no exception", drv.replace(row, row.rstrip() + " junk\n"),
+             "want `@<driver>=<jit_local>` after the four columns, got `junk`"),
+            ("two driver lines", drv.replace("# jit-driver: 595.99.02 615.71.09\n", "# jit-driver: 595.99.02\n# jit-driver: 615.71.09\n"),
+             "2 `# jit-driver:` lines, a table names its drivers on one"),
+            ("a driver line with no version", drv.replace("# jit-driver: 595.99.02 615.71.09\n", "# jit-driver:\n"),
+             "is not driver versions as in `# jit-driver: 595.99.02 615.71.09`"),
+            ("a driver line with a version of another shape", drv.replace("595.99.02 615.71.09", "595 615.71.09"),
+             "is not driver versions as in `# jit-driver: 595.99.02 615.71.09`"),
+            ("a driver listed twice", drv.replace("595.99.02 615.71.09", "615.71.09 615.71.09"), "lists a driver twice"),
+        ):
+            out = run(f"refusal: {name}", 1, [], table=text)
+            if want not in out:
+                fails.append(f"{name}: {out!r}")
         # the covered binary (header): its device crates, their features and its own sources against the scanned binaries'.
         # A feature on bloomery-gpu that only gate_e2e's feature set turns on: its build compiles a kernel set no scanned binary does.
         wide_gpu = GPU_TOML + "\n[features]\nwide = []\n"
