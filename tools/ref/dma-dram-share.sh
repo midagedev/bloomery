@@ -39,8 +39,10 @@
 # Every pid the runner starts is written at spawn to <out>/pids (the `timeout` wrapper's pid: a TERM to
 # it reaches the probe); the runner waits on those pids and signals no other. The logs go to
 # target/dma-dram-share/<utc>/. The run's card: BLOOMERY_LEASE_CARD through BLOOMERY_BOX_ENV
-# (docs/cards/dma-dram-share.card).
+# (docs/cards/dma-dram-share.card). Local mode (BLOOMERY_BOX_CARD=local; timing-card.sh's header: the one card in view, the lease in
+# BLOOMERY_LOCK_DIR) times the copy on that card; an Xid or a lost card by the end of the rounds voids the run (rc 1).
 set -euo pipefail
+TIMING_LOCAL_RUNNER=1
 HERE=${BASH_SOURCE[0]%/*}
 
 # p2 <mode> <args…>: tools/ref/dma-dram-share.py, the rows, the close and the core layout.
@@ -160,7 +162,9 @@ bench() {
 }
 
 WITNESS=(head loadavg pressure-cpu pressure-io card gpus gpu-apps busiest lock-holder cpu-freq meminfo model)
+timing_cards_before_lease
 lease_take
+timing_cards_start
 witness pre
 rc=0
 : > "$OUT/alone"
@@ -194,6 +198,10 @@ for ((r = 1; r <= ROUNDS && rc == 0; r++)); do
     p2 row "$r" "$cond" "$log.bench" "$copy" "$COPY_CPUS" | tee -a "$OUT/rows"
   done
 done
+if ! timing_cards_arm ''; then
+  echo "[p2] invalid witness: $TWOCARD_WHY" >&2
+  [ "$rc" != 0 ] || rc=1
+fi
 witness post
 p2 summary "$OUT/rows" "$OUT/alone"
 echo "dma-dram-share rc=$rc out=$OUT"

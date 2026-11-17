@@ -1279,12 +1279,15 @@ if want twocard-optin "$L" 1 '^\[timing-cards\] refused: BLOOMERY_TIMING_CARDS=a
   pass twocard-optin
 fi
 
-# Local mode (red on the runner before it). The box (/root/bloomery-cpu.lock) refuses it, and there that
-# refusal is the one case.
+# Local mode (red on the runner before it). The box (/root/bloomery-cpu.lock) keeps its lease in /root, so a lock directory of this test is
+# refused there, and that refusal is the one case.
+# PIN(2026-11-17): the box's refusal names the lock directory (`(the box), with BLOOMERY_LOCK_DIR=`): local mode on the box is allowed under the
+# lease in /root (timing-card.sh), so the refusal this case holds is the disagreeing directory, not local mode itself; FAIL-first: red on the
+# box against the old pattern `(the box): `, which the message no longer has.
 LOC=(BLOOMERY_BOX_CARD=local "BLOOMERY_LOCK_DIR=$tmp/locks")
 if [ -e /root/bloomery-cpu.lock ]; then
-  echo "skip local, local-xid, local-twocard: /root/bloomery-cpu.lock exists (the box), where local mode is refused"
-  twocard_refused local-box 64 "^depth-qwen3moe.sh: BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu.lock \(the box\): " \
+  echo "skip local, local-xid, local-twocard: /root/bloomery-cpu.lock exists (the box), where local mode keeps the lease in /root"
+  twocard_refused local-box 64 "^depth-qwen3moe.sh: BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu.lock \(the box\), with BLOOMERY_LOCK_DIR=" \
     "${LOC[@]}" -- 6 lcpp:6
 else
   L=$tmp/local.log

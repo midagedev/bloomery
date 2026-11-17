@@ -439,6 +439,14 @@
 # 1 is refused. depth-qwen3moe.sh takes the same variable with 0 as its default under rotate: its
 # Qwen3 and Qwen3.6 models sit on the card, so no timed window of theirs reads the file.
 #
+# Local mode. Under tools/box.sh's local mode, and on a machine whose environment file declares its one card as the card in view
+# (BLOOMERY_BOX_CARD=local; timing-card.sh's header has the refusals), the arms time that one card, every row's card field its
+# name, our arms at a alone (arm-place.sh refuses gate and bp by name: gate is the 3090's bytes, bp two cards by size rank, and
+# BLOOMERY_TIMING_CARDS is refused). Before the lease a kernel journal that does not answer, or shows a user other than root no
+# line, refuses the run (69); after every arm, whatever it exited with, an Xid since the last arm or the card lost makes the arm a
+# FAIL row. The reference arms' --n-cpu-moe is the profile's (models/deepseek41.sh): sized for the A6000 and the 3090 by their
+# memory, not for the card in view.
+#
 # Contention. Before every arm the runner checks both the other card (guard_other, timing-card.sh:
 # `[other-busy]`) and the CPU (guard_cpu, lease.sh: `[cpu-busy]` when builds or reference engines it
 # did not start — BLOOMERY_CPU_BUSY_COMMS — sum past BLOOMERY_CPU_BUSY_PCT percent of one cpu), and
@@ -1309,8 +1317,8 @@ if [ -n "$PARSE_ONLY" ]; then
   exit 0
 fi
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this runner
-# has the two-card mode (the header's Two cards).
-TIMING_CARDS_RUNNER=1
+# has the two-card mode (the header's Two cards) and local mode (the header's Local mode).
+TIMING_CARDS_RUNNER=1 TIMING_LOCAL_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 timing_cards_mode || exit $?
@@ -1661,7 +1669,7 @@ ref_arm() {
   # arm's ggml_cuda_init lines are on its stderr, the errf file).
   if pp_eng "$eng"; then fitsrc=$(cat "$errf" 2> /dev/null); else fitsrc=$raw; fi
   if ! timing_cards_arm "$fitsrc"; then
-    arm_fail "$r" "$eng" "$key" "$rc" "two cards: $TWOCARD_WHY" "$fitsrc"
+    arm_fail "$r" "$eng" "$key" "$rc" "${TIMING_CARDS:+two cards: }$TWOCARD_WHY" "$fitsrc"
     return 0
   fi
   if pp_eng "$eng"; then
@@ -1776,7 +1784,7 @@ ours_pre() { witness "pre r$2 ${A_LABEL[$1]} d=${A_DEP[$1]} n=$N"; }
 # row and sums, or its FAIL row; MAJ_WHOLE and MAJ_TIMED are the arm's. An output that opens with an
 # `arm` record (an --arm list's) gives the row its slot in the load.
 ours_post() {
-  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label tags a slot
+  local i=$1 r=$2 rc=$3 out=$4 wall=$5 dep label tags a slot why
   dep=${A_DEP[$i]} label=${A_LABEL[$i]} PLACE_ARM=${A_PLACE[$i]}
   keep_out "$label" "$r" "$out"
   witness "post r$r $label d=$dep n=$N"
@@ -1784,6 +1792,14 @@ ours_post() {
   SLOT_COL=
   a=$(sed -nE '1s/^arm i=([0-9]+) arms=([0-9]+) .*/\1 \2/p' <<< "$out")
   [ -z "$a" ] || SLOT_COL=" | slot $((${a% *} + 1))/${a#* }"
+  # Local mode: an Xid since the last arm's check, or the card lost, fails the arm, whatever it exited with, so the next arm is not
+  # charged with it.
+  if [ -n "$TIMING_LOCAL" ] && ! timing_cards_arm "$out"; then
+    why=$TWOCARD_WHY
+    [ "$rc" -eq 0 ] || why="exited $rc; $why"
+    arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "$why" "$out"
+    return 0
+  fi
   if [ "$rc" -ne 0 ]; then
     arm_fail "$(fail_round "$r")" "$label" "d=$dep" "$rc" "exited $rc" "$out"
     return 0
@@ -2166,6 +2182,7 @@ blocks_config
 echo "[config] cold tag: majflt in the row's measured window (ours: from its fed line; lcpp: from its --progress line; ik: the whole process) × ${COLD_US} µs ≥ ${COLD_PCT} % of that window"
 echo "[config] ik: $IKBIN flags=$IK_GPU_FLAGS env=$IK_GPU_ENV"
 echo "[config] lcpp: $LCPPBIN flags=$LCPP_GPU_FLAGS (lcpp<K>: --n-cpu-moe K)"
+[ -z "$TIMING_LOCAL" ] || echo "[config] local: the references' --n-cpu-moe above is the profile's, sized for the A6000 and the 3090 by their memory, not for the card in view; IK_NCMOE and LCPP_NCMOE name another, lcpp<K> an arm's own"
 if [ "$lcppfit" = 1 ]; then
   lcpp_fit_flags "$LCPP_GPU_FLAGS"
   echo "[config] lcppfit: $LCPPBIN flags=$FIT_FLAGS (llama-bench's fit places the model; dropped: $FIT_DROPPED; lcppfit and lcppppfit get --progress as lcpp and lcpppp do)"

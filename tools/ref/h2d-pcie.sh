@@ -25,7 +25,13 @@
 # Arguments: --parse-only prints the steps and exits 0 before any check, lease or run. Each step is
 # bounded by lease_bounded (BLOOMERY_ARM_BOUND, default 900 s). The run's card: BLOOMERY_LEASE_CARD
 # through BLOOMERY_BOX_ENV (docs/cards/pcie-a6000.card).
+#
+# Local mode (BLOOMERY_BOX_CARD=local, timing-card.sh's header: the card in view, the lease in BLOOMERY_LOCK_DIR) times steps 1-3 on
+# that one card and prints a `[h2d-pcie]` line saying step 4 is not run: it needs the box's two-card pick (BLOOMERY_BOX_CARD=both, two
+# cards in view named by name), which a machine declared local does not have. The Xid and lost-card check of the other local runners runs
+# after the steps beside this runner's own dmesg count.
 set -euo pipefail
+TIMING_LOCAL_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 BIN=target/release/h2d_probe
@@ -44,6 +50,11 @@ if [ "$PARSE_ONLY" = 1 ]; then
   echo "[parse] both=$BOTH steps: ${steps[*]}"
   exit 0
 fi
+# The environment file's declaration wins over a pick of `both` (box.sh re-exports BLOOMERY_BOX_CARD=local after it): local mode has
+# one card and no OTHER_GPU, so step 4 is named as not run, never skipped silently.
+if [ -n "$TIMING_LOCAL" ]; then
+  echo "[h2d-pcie] local mode: steps 1-3 on the timing card $TIMING_GPU; step 4 (the other card, then both) needs the box's two-card pick and is not run"
+fi
 assert_fresh_binary "$BIN" || exit $?
 if [ "$BOTH" = 1 ]; then VIEW=$TIMING_GPU,$OTHER_GPU; else VIEW=$TIMING_GPU; fi
 
@@ -58,7 +69,9 @@ xid_lines() {
 }
 
 WITNESS=(head indent card gpus gpu-apps busiest)
+timing_cards_before_lease
 lease_take
+timing_cards_start
 witness pre
 xid_pre=$(xid_lines)
 echo "    xid-lines: $xid_pre"
@@ -89,6 +102,10 @@ if [ "$BOTH" = 1 ]; then
     step "$OTHER_GPU" --arm sustained
     step "$VIEW" --arm both
   fi
+fi
+if ! timing_cards_arm ''; then
+  echo "[xid] the run is void: $TWOCARD_WHY" >&2
+  rc=1
 fi
 witness post
 xid_post=$(xid_lines)

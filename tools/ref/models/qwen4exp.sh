@@ -90,10 +90,13 @@ __q38_dir=${BASH_SOURCE[0]%/*}
 # shellcheck source=tools/ref/cards.sh
 source "$__q38_dir/../cards.sh"
 unset __q38_dir
+# Local mode (BLOOMERY_BOX_CARD=local) times the one card in view, whatever card it is: its UUID in BLOOMERY_TIMING_GPU is no pin that
+# cannot be decided, so the refusal below is not its. The sizing then is the A6000's unless the caller names it; the runner's header
+# (Local mode) says the references' --n-cpu-moe is not sized for that card.
 # The 3090-vs-A6000 sizing below turns on GPU_3090; a timing card that is not the resolved A6000 with no
 # 3090 UUID is undecidable — refuse rather than size the reference for the wrong card (ref-paths.sh's
 # refusal code).
-if [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ -z "${GPU_3090:-}" ] && [ "$BLOOMERY_TIMING_GPU" != "${GPU_A6000:-}" ]; then
+if [ "${BLOOMERY_BOX_CARD:-}" != local ] && [ -n "${BLOOMERY_TIMING_GPU:-}" ] && [ -z "${GPU_3090:-}" ] && [ "$BLOOMERY_TIMING_GPU" != "${GPU_A6000:-}" ]; then
   echo "models/qwen4exp.sh: BLOOMERY_TIMING_GPU=$BLOOMERY_TIMING_GPU, and tools/ref/cards.sh resolved no 3090 UUID (${CARDS_ERROR:-no reason given}): whether the timing card is the 3090 sizes QWEN38_NCMOE (43 vs 26)" >&2
   exit 64
 fi

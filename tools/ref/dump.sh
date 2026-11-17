@@ -76,6 +76,12 @@ case $BACKEND in
   cuda) SET=$REF_SET_CUDA; NGL=99; HIDE_CUDA=0 ;;
   *) echo "dump.sh: BLOOMERY_REF_BACKEND must be cpu or cuda, got '$BACKEND'" >&2; exit 2 ;;
 esac
+# A cuda dump with CUDA_VISIBLE_DEVICES set and empty has no card in view (the runtime lists none, and the dumper's -ngl then loads on the host
+# under the cuda set's name); an unset one sees the cards the pin (the box's environment file, tools/box.sh) leaves. Refused by name.
+if [ "$HIDE_CUDA" = 0 ] && [ -n "${CUDA_VISIBLE_DEVICES+x}" ] && [ -z "$CUDA_VISIBLE_DEVICES" ]; then
+  echo "dump.sh: BLOOMERY_REF_BACKEND=cuda with CUDA_VISIBLE_DEVICES set and empty: no card is in view, and the dumper would load the layers on the host under the cuda set's name; name a card, or unset it" >&2
+  exit 64
+fi
 [ -z "$SET_PREFIX" ] || [ "$BACKEND" = cpu ] ||
   { echo "dump.sh: BLOOMERY_TIER=fixture has no CUDA sets (its families are CPU dumps): unset BLOOMERY_REF_BACKEND" >&2; exit 2; }
 VARIANT=${1:-}

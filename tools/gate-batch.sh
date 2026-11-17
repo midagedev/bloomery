@@ -32,6 +32,15 @@
 # `just --dump` (and its dependencies'), and from the scripts that text runs, followed transitively (walk() below). Under
 # BLOOMERY_BOX_LOCAL=1 the default is --lanes 1: tools/box.sh's local mode runs every gate under the one gate lock that holds the
 # machine's cards (tools/gpu-gate.sh), so a second lane's gates would only queue on it; --lanes 2 there still runs two lanes.
+# The lane count of a machine with one card is read the same way, from the cards in view (tools/ref/cards.sh's cards_view, the one reader
+# every runner and tools/box.sh use, never a reader of its own): the batch asks the box once, before the plan, with a read-only box.sh
+# call (BLOOMERY_BOX_READONLY=1: it syncs nothing and passes the guard) that sources the box's own tools/ref/cards.sh and prints
+# `cards-view rc= n= local= kind= why=`. Under an environment file that declares its card (BLOOMERY_BOX_CARD=local) the cards in view are
+# CUDA_VISIBLE_DEVICES's, and the machine runs every gate under the one gate lock: one lane whatever the count; otherwise the count is
+# nvidia-smi's with no pin, and a machine that lists one card runs one lane (a second lane's card names are cards the machine does not
+# have). --lanes names the count and nothing else; a probe that cannot answer is a named error (70), which --lanes or
+# BLOOMERY_BOX_LOCAL=1 (neither needs the count) turns into a note: the two-card deferral below then has no view to read. One lane
+# costs the build lane (it needs two lanes: a one-card batch's builds run inline before each gate) and the X phase's overlap.
 #   A  fixed, the 3090: a tools/gpu-gate.sh call, in the recipe or a script it runs, without
 #      BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} (V4.1 `--place gate` gates, which this lane keeps on
 #      the 3090; gate-gpu-hybrid, whose host tier spins the worker pool on the cores a V4.1 gate's pool
@@ -189,6 +198,13 @@
 #      (real-only, fixture-only, no-fixture, real-file) comes first, so such an item keeps its kind. Named errors, wherever the recipe sits,
 #      as real-only's: a call that names another recipe or names no variable, a box.sh command of the recipe that does not open with its call
 #      (or a call outside one), a missing script.
+#   two-card (either tier; class D, kind `two-card`): a recipe whose box command names `BLOOMERY_CARD=both` runs on two cards in view, and
+#      tools/box.sh ends it 64 on a machine with one. When the probe above reads fewer than two cards in view the item is deferred in either
+#      tier, as a needs-env item is: in no lane, never called, never red. Its run.log line is `<item> rc=deferred two-card lane=- ...`, it
+#      joins DIR/deferred.list (with a comment line of its kind: take the list again on a machine with two cards) and the DONE line counts
+#      `deferred=<n>` and `two_card=<n>`. The tier's own kinds and needs-env come first, so such an item keeps its kind. A machine whose
+#      probe answered two or more cards plans the item as before; one whose probe was not asked (--classes, a probe that failed under
+#      --lanes) defers nothing.
 #   --tier real|fixture (default real; BLOOMERY_TIER in the environment names the same, and the two must agree): the tier
 #      the batch runs in, passed to every item as BLOOMERY_TIER=fixture in its BLOOMERY_BOX_ENV — tools/box.sh resolves each
 #      item's model file from it (the family's fixture, tools/ref/ref-paths.sh); a family with none is a deferred item (above,
@@ -1314,6 +1330,18 @@ st=$here/fake-state
 mkdir -p "$st"
 case "$*" in
   --tree-id) echo "${FAKE_TREE_ID:-0123456789abcdef}"; exit 0 ;; # a queued item's twin lookup
+  'l=0; if [ "${BLOOMERY_BOX_CARD:-}" = local ]'*)
+    # The lane probe (the cards in view, a READONLY call; never in box.log): FAKE_VIEW_N cards (2), the environment file declaring them
+    # (BLOOMERY_BOX_CARD=local) when FAKE_VIEW_LOCAL=1; FAKE_VIEW_RC: the call fails; FAKE_VIEW_LINE: the line it prints instead;
+    # FAKE_NODIR=1: no remote dir until a plain call has been made (66). Each call is a line of view.log.
+    if [ "${FAKE_NODIR:-0}" = 1 ] && [ ! -e "$st/dir-made" ]; then
+      echo 'box.sh: BLOOMERY_BOX_READONLY=1 runs the command in ~/repo/fake as it is and syncs nothing, and ws has no ~/repo/fake: nothing was synced there yet' >&2
+      exit 66
+    fi
+    echo "ro=${BLOOMERY_BOX_READONLY:-0} wait=${BLOOMERY_BOX_WAIT:-}" >> "$st/view.log"
+    [ -z "${FAKE_VIEW_RC:-}" ] || { echo 'box.sh: the fake cannot read the cards in view' >&2; exit "$FAKE_VIEW_RC"; }
+    echo "${FAKE_VIEW_LINE:-cards-view rc=0 n=${FAKE_VIEW_N:-2} local=${FAKE_VIEW_LOCAL:-0} kind= why=}"
+    exit 0 ;;
   '. tools/ref/lease-probe.sh && lease_free')
     echo probe >> "$st/probe.log"
     [ -e "$st/lease-up" ] || exit 0
@@ -2917,6 +2945,101 @@ JF
   want_row '  … through its box call' "$t/fake-state/box.log" '$1 ~ /NE_VAR=x/ && $2 ~ /gen_ne$/'
   want_not '  … and its DONE line has no needs_env=' "$t/target/c-ne-set/run.log" '^DONE .*needs_env='
   # needsenv:end A
+  # The cards in view (the header's «Lanes» and two-card): the batch asks the box once with a read-only call, and one card is one lane. The fake
+  # answers FAKE_VIEW_N cards (2) and FAKE_VIEW_LOCAL=1 for an environment file that declares them; no call is a box.log row.
+  vflag=$(cat "$t/fake-state/view.log" 2> /dev/null | wc -l | tr -d ' ')
+  out=$("${gb[@]}" --classes 2>&1) || fail 'view: --classes failed' "$out"
+  if [ "$(cat "$t/fake-state/view.log" 2> /dev/null | wc -l | tr -d ' ')" = "$vflag" ] && grep -q '^pk-both	X	solo	' <<< "$out"; then pass 'view: --classes names no machine, asks the box nothing and keeps a both-cards item its class'
+  else fail 'view: --classes names no machine, asks the box nothing and keeps a both-cards item its class' "$out"; fi
+  out=$("${gb[@]}" --dry-run pk-both plain-any 2>&1) || fail 'view: the two-card dry run failed' "$out"
+  if grep -q ', lanes 2, logs would go to' <<< "$out" && ! grep -q '^lane -  pk-both ' <<< "$out" && ! grep -q 'gate-batch: lanes: ' <<< "$out"; then pass 'view: two cards in view, no pin declared: two lanes, the both-cards item planned, no lane line'
+  else fail 'view: two cards in view, no pin declared: two lanes, the both-cards item planned, no lane line' "$out"; fi
+  out=$(env FAKE_VIEW_N=1 FAKE_VIEW_LOCAL=1 "${gb[@]}" --dry-run pk-both x-v41 plain-any 2>&1) || fail 'view: the one-card dry run failed' "$out"
+  if grep -q '^gate-batch: lanes: one lane: the box.s environment file declares its cards as the cards in view (BLOOMERY_BOX_CARD=local), 1 in view, and every gate runs under the one gate lock; read by tools/ref/cards.sh.s cards_view$' <<< "$out" \
+    && grep -q ', lanes 1, logs would go to' <<< "$out" && grep -q 'dry run — 1 items (and 2 deferred, they need two cards in view and this machine has 1: two-card)' <<< "$out" \
+    && grep -q '^lane -  pk-both ' <<< "$out" && grep -q '^lane -  x-v41 ' <<< "$out" && grep -q '^lane A  plain-any ' <<< "$out" \
+    && grep -q 'deferred (two-card), never run in this batch: the recipe needs two cards in view — BLOOMERY_CARD=both needs two cards in view and this machine has 1; ' <<< "$out" \
+    && grep -q '2 item(s) deferred for two cards in view, which this machine does not have (1 in view; two-card: BLOOMERY_CARD=both, tools/box.sh ends 64 on fewer), in no lane (DONE: deferred, two_card=2, and the list .*/deferred.list): pk-both x-v41' <<< "$out"; then
+    pass 'view: one card declared local: one lane, the two both-cards items deferred by name (two-card), the item that needs one card planned'
+  else fail 'view: one card declared local: one lane, the two both-cards items deferred by name (two-card), the item that needs one card planned' "$out"; fi
+  out=$(env FAKE_VIEW_N=1 FAKE_VIEW_LOCAL=0 "${gb[@]}" --dry-run pk-both plain-any 2>&1) || fail 'view: the one-card, no-declaration dry run failed' "$out"
+  if grep -q '^gate-batch: lanes: one lane: the box lists 1 card with no pin (cards_view) and a second lane would name a card it does not have$' <<< "$out" \
+    && grep -q '^lane -  pk-both ' <<< "$out" && grep -q ', lanes 1, logs would go to' <<< "$out"; then pass 'view: one card with no declaration is one lane too, and says why'
+  else fail 'view: one card with no declaration is one lane too, and says why' "$out"; fi
+  out=$(env FAKE_VIEW_N=2 FAKE_VIEW_LOCAL=1 "${gb[@]}" --dry-run pk-both plain-any 2>&1) || fail 'view: the declared two-card dry run failed' "$out"
+  if grep -q ', lanes 1, logs would go to' <<< "$out" && ! grep -q '^lane -  pk-both ' <<< "$out" && grep -q 'declares its cards as the cards in view (BLOOMERY_BOX_CARD=local), 2 in view' <<< "$out"; then
+    pass 'view: two cards declared as the view still run one lane (the one gate lock) and keep a both-cards item'
+  else fail 'view: two cards declared as the view still run one lane (the one gate lock) and keep a both-cards item' "$out"; fi
+  out=$(env FAKE_VIEW_N=1 FAKE_VIEW_LOCAL=1 "${gb[@]}" --lanes 2 --dry-run pk-both plain-any 2>&1) || fail 'view: --lanes 2 on one card failed' "$out"
+  if grep -q ', lanes 2, logs would go to' <<< "$out" && grep -q '^lane -  pk-both ' <<< "$out" && ! grep -q 'gate-batch: lanes: ' <<< "$out"; then
+    pass 'view: --lanes names the count and nothing else: the both-cards item is still deferred on one card'
+  else fail 'view: --lanes names the count and nothing else: the both-cards item is still deferred on one card' "$out"; fi
+  out=$(env FAKE_VIEW_N=1 FAKE_VIEW_LOCAL=1 "${gb[@]}" --tier fixture --dry-run pk-both plain-any 2>&1) || fail 'view: the fixture-tier one-card dry run failed' "$out"
+  if grep -q '^lane -  pk-both ' <<< "$out" && grep -q 'deferred (two-card)' <<< "$out" && ! grep -q 'deferred to the real tier' <<< "$out"; then
+    pass 'view: in the fixture tier too the item is two-card, not a deferral to the real tier'
+  else fail 'view: in the fixture tier too the item is two-card, not a deferral to the real tier' "$out"; fi
+  out=$(env FAKE_VIEW_RC=70 "${gb[@]}" --dry-run plain-any 2>&1) || rc=$?
+  if grep -q 'gate-batch: lanes: a dry run could not ask the box how many cards are in view (the read-only box.sh call that reads the cards in view ended 70 and printed no cards-view line: box.sh: the fake cannot read the cards in view): planned at --lanes 2; pass --lanes 1 to plan one card' <<< "$out" \
+    && grep -q ', lanes 2, logs would go to' <<< "$out"; then pass 'view: a dry run whose probe fails says so and plans two lanes'
+  else fail 'view: a dry run whose probe fails says so and plans two lanes' "$out"; fi
+  rc=0
+  out=$(env FAKE_VIEW_RC=70 BLOOMERY_GATE_TIMES="$t/times.tsv" BLOOMERY_GATE_ROUND_LEDGER="$t/rounds-view-err.tsv" "${gb[@]}" --out "$t/target/c-view-err" --round-ledger plain-any 2>&1) || rc=$?
+  if [ "$rc" = 70 ] && grep -q '^gate-batch: cannot read the cards in view, so the lane count is unknown: the read-only box.sh call that reads the cards in view ended 70 and printed no cards-view line: box.sh: the fake cannot read the cards in view; pass --lanes 1 or --lanes 2 to name it$' <<< "$out" \
+    && [ ! -s "$t/target/c-view-err/run.log" ]; then pass 'view: a real run whose probe fails is a named error, 70, before any item ran'
+  else fail 'view: a real run whose probe fails is a named error, 70, before any item ran' "rc=$rc $out"; fi
+  rc=0
+  out=$(env FAKE_VIEW_LINE='cards-view rc=1 n=0 local=1 kind=gone why=CUDA_VISIBLE_DEVICES=GPU-x: none of the cards nvidia-smi lists' "${gb[@]}" --classes --dry-run plain-any 2>&1) || rc=$?
+  rc=0
+  out=$(env FAKE_VIEW_LINE='cards-view rc=1 n=0 local=1 kind=gone why=CUDA_VISIBLE_DEVICES=GPU-x: none of the cards nvidia-smi lists' "${gb[@]}" --dry-run --ledger plain-any 2>&1) || rc=$?
+  if [ "$rc" = 70 ] && grep -q 'cannot read the cards in view, so the lane count is unknown: cards_view did not answer: rc=1 n=0 local=1 kind=gone why=CUDA_VISIBLE_DEVICES=GPU-x: none of the cards nvidia-smi lists; pass --lanes' <<< "$out"; then
+    pass 'view: a pin that names a card the machine lost (cards_view rc 1) is a named error, not a lane count'
+  else fail 'view: a pin that names a card the machine lost (cards_view rc 1) is a named error, not a lane count' "rc=$rc $out"; fi
+  # A real batch on one card: one lane runs the item that needs one card, the two-card item is deferred and never called.
+  rc=$(FAKE_VIEW_N=1 FAKE_VIEW_LOCAL=1 steal_case view-one "steal-bal	B	a6000	10	$d" "plain-any	B	a6000	10	$d" -- pk-both steal-bal plain-any)
+  printf '%s' "$rc" > "$t/rc-view-one"
+  rc_ok 'view run: one card: a real batch with a two-card item ends green' view-one 3
+  want 'view run: the two-card item has its own line' "$t/target/c-view-one/run.log" '^pk-both rc=deferred two-card lane=- tier=real deferred=1$'
+  want 'view run: the DONE line counts it in deferred= and two_card=' "$t/target/c-view-one/run.log" \
+    '^DONE total=3 red=0 tier=real skipped=0 wall=[0-9]+s plan=[0-9]+s( slow=[0-9]+\.[0-9]{2})? laneA=[0-9]+s laneB=0s deferred=1 two_card=1 deferred_list=[^ ]*/c-view-one/deferred.list$'
+  want_no_row 'view run: the batch never called the two-card recipe' "$t/fake-state/box.log" '$2 ~ /gen_pt$/'
+  want_row 'view run: the items that need one card ran' "$t/fake-state/box.log" '$2 ~ /gen_b$/'
+  want 'view run: every run is lane A (one lane)' "$t/target/c-view-one/run.log" '^steal-bal rc=0 .* lane=A '
+  want_not 'view run: no item ran in lane B' "$t/target/c-view-one/run.log" ' lane=B '
+  want 'view run: one lane says so on the batch line' "$t/out-view-one.log" '^gate-batch: 2 items \(and 1 deferred, they need two cards in view and this machine has 1: two-card\), lanes 1, logs in '
+  n=$((n + 1))
+  if [ "$(grep -v '^#' "$t/target/c-view-one/deferred.list" | paste -sd, -)" = 'pk-both' ] && grep -q '^# two-card: ' "$t/target/c-view-one/deferred.list" \
+    && grep -q '^# gate-batch: the 1 item(s) it deferred for two cards in view' "$t/target/c-view-one/deferred.list" && ! grep -q 'fixture-tier batch' "$t/target/c-view-one/deferred.list"; then echo 'ok view run: DIR/deferred.list holds the item, with the comment of the kind'
+  else bad=$((bad + 1)); echo "FAIL view run: DIR/deferred.list: $(cat "$t/target/c-view-one/deferred.list" 2>&1)"; fi
+  note_case 'view run: DIR/deferred.list holds the item, with the comment of the kind'
+  rc=$(FAKE_VIEW_N=1 FAKE_VIEW_LOCAL=1 steal_case view-all "steal-bal	B	a6000	10	$d" -- pk-both x-v41)
+  printf '%s' "$rc" > "$t/rc-view-all"
+  rc_ok 'view run: a batch of two-card items alone ends green' view-all 2
+  want 'view run: … its DONE line' "$t/target/c-view-all/run.log" '^DONE total=2 red=0 tier=real skipped=0 wall=[0-9]+s plan=[0-9]+s( slow=[0-9]+\.[0-9]{2})? laneA=0s laneB=0s deferred=2 two_card=2 deferred_list=[^ ]*/deferred.list$'
+  want 'view run: … says nothing ran on the box' "$t/out-view-all.log" '^gate-batch: every item is deferred \(to the other tier, for a variable it needs and this batch does not set, or for two cards in view this machine does not have\) — nothing runs on the box, so no lease check$'
+  want_no_row 'view run: … and made no box call at all' "$t/fake-state/box.log" '1'
+  # Two cards in view: the same batch plans the two-card item as before (a solo item: lane X), and no line names a deferral.
+  rc=$(steal_case view-two "steal-bal	B	a6000	10	$d" "pk-both	X	both	10	$d" -- pk-both steal-bal)
+  printf '%s' "$rc" > "$t/rc-view-two"
+  rc_ok 'view run: two cards: the both-cards item runs' view-two 2
+  want_row 'view run: … through its box call' "$t/fake-state/box.log" '$2 ~ /gen_pt$/'
+  want_not 'view run: … with no two_card= in the DONE line' "$t/target/c-view-two/run.log" 'two_card='
+  # A remote directory that is not there yet (66): the plain call makes it and the probe is asked again.
+  rc=$(FAKE_NODIR=1 FAKE_VIEW_N=1 FAKE_VIEW_LOCAL=1 steal_case view-nodir "steal-bal	B	a6000	10	$d" -- pk-both steal-bal)
+  printf '%s' "$rc" > "$t/rc-view-nodir"
+  rc_ok 'view run: a remote dir that is not there yet is made, and the probe answers after it' view-nodir 2
+  want_row 'view run: … through the plain call that makes it (the start check makes the same call after it)' "$t/fake-state/box.log" '$2 == "true"'
+  n=$((n + 1))
+  if [ "$(wc -l < "$t/fake-state/view.log" | tr -d ' ')" = 1 ] && [ -e "$t/fake-state/dir-made" ]; then echo 'ok view run: … and the probe was answered once, after the dir was made'; else bad=$((bad + 1)); echo "FAIL view run: the probe's calls: $(cat "$t/fake-state/view.log")"; fi
+  note_case 'view run: … and the probe was answered once, after the dir was made'
+  # FAIL-first: the runner before this change, in two mutants (the lane count that ignores the view; the placement that defers nothing).
+  mutant_of view-lanes2 's|^    LANES=1 LANES_BY_VIEW=1$|    LANES=2 LANES_BY_VIEW=0 # MUTANT view-lanes2|' '# MUTANT view-lanes2$'
+  mutant_of view-nodefer 's|^    if box == "both" and view_n is not None and view_n < 2:$|    if False:  # MUTANT view-nodefer|' '# MUTANT view-nodefer$'
+  out=$(env FAKE_VIEW_N=1 FAKE_VIEW_LOCAL=1 bash "$t/tools/gate-batch-view-lanes2.sh" --dry-run pk-both plain-any 2>&1) || true
+  if grep -q ', lanes 2, logs would go to' <<< "$out" && ! grep -q ', lanes 1, logs would go to' <<< "$out"; then pass 'view mutant: a lane count that ignores the view plans two lanes on one card (the check above is red on it)'
+  else fail 'view mutant: a lane count that ignores the view plans two lanes on one card (the check above is red on it)' "$out"; fi
+  out=$(env FAKE_VIEW_N=1 FAKE_VIEW_LOCAL=1 bash "$t/tools/gate-batch-view-nodefer.sh" --dry-run pk-both plain-any 2>&1) || true
+  if ! grep -q '^lane -  pk-both ' <<< "$out" && grep -q '^lane [AX]  pk-both ' <<< "$out"; then pass 'view mutant: a placement that defers nothing runs the two-card item on one card (box.sh would end it 64: a red)'
+  else fail 'view mutant: a placement that defers nothing runs the two-card item on one card (box.sh would end it 64: a red)' "$out"; fi
   # no-fixture (the header's deferred paragraph, kind 2): a family the fixture table (tools/fixture-dirs.tsv) does not name is deferred
   # in the fixture tier, never run and never red; the table is read from that file, so a family it names runs.
   check 'no-fixture: in the real tier a recipe of a family with no fixture is placed as usual' 0 '^x-glm	X	solo	' "${gb[@]}" --classes
@@ -5196,14 +5319,68 @@ esac
 # The lanes and the pack's budget are this machine's under local mode (the header's «Lanes» and PACK_BUDGET above).
 LOCAL_RUN=0
 [ "${BLOOMERY_BOX_LOCAL:-0}" != 1 ] || LOCAL_RUN=1
+# The cards in view (the header's «Lanes»): one read-only box.sh call that prints the view tools/ref/cards.sh's cards_view reads. VIEW_N is
+# the count, VIEW_LOCAL 1 when the machine's environment file declares its cards (BLOOMERY_BOX_CARD=local); VIEW_N stays empty when the box
+# did not answer, VIEW_WHY saying why. --classes names no machine and asks nothing.
+VIEW_N='' VIEW_LOCAL='' VIEW_WHY='' LANES_NOTE='' LANES_BY_VIEW=0
+# shellcheck disable=SC2016 # the box side expands these
+VIEW_PROBE='l=0; if [ "${BLOOMERY_BOX_CARD:-}" = local ]; then l=1; else unset CUDA_VISIBLE_DEVICES; fi; BLOOMERY_BOX_CARD=local . tools/ref/cards.sh; if type cards_view > /dev/null 2>&1; then cards_view; v=$?; else v=127 CARDS_VIEW_WHY="tools/ref/cards.sh has no cards_view (a remote tree older than the machine-view sync)"; fi; echo "cards-view rc=$v n=${CARDS_VIEW_N:-0} local=$l kind=${CARDS_VIEW_KIND:-} why=${CARDS_VIEW_WHY:-}"'
+view_read() {
+  local out rc=0 line
+  out=$(BLOOMERY_BOX_READONLY=1 BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" "$VIEW_PROBE" 2>&1 < /dev/null) || rc=$?
+  if [ "$rc" = 66 ]; then
+    # A remote directory that is not there yet: the plain call makes it and syncs the tree, which the start check would do next.
+    rc=0
+    out=$(BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" true 2>&1 < /dev/null) || rc=$?
+    if [ "$rc" = 0 ]; then
+      out=$(BLOOMERY_BOX_READONLY=1 BLOOMERY_BOX_WAIT=0 "$ROOT/tools/box.sh" "$VIEW_PROBE" 2>&1 < /dev/null) || rc=$?
+    fi
+  fi
+  line=$(grep '^cards-view rc=' <<< "$out" | tail -1) || line=''
+  if [ "$rc" != 0 ] || [ -z "$line" ]; then
+    VIEW_WHY="the read-only box.sh call that reads the cards in view ended $rc and printed ${line:-no cards-view line}: $(tail -1 <<< "$out")"
+    return 1
+  fi
+  case $line in
+    'cards-view rc=0 n='*) ;;
+    *) VIEW_WHY="cards_view did not answer: ${line#cards-view }"; return 1 ;;
+  esac
+  VIEW_N=$(sed -E 's/^cards-view rc=0 n=([0-9]+) local=.*/\1/' <<< "$line")
+  VIEW_LOCAL=$(sed -E 's/^cards-view rc=0 n=[0-9]+ local=([01]) .*/\1/' <<< "$line")
+  case $VIEW_N:$VIEW_LOCAL in
+    [0-9]*:[01]) return 0 ;;
+  esac
+  VIEW_N='' VIEW_LOCAL='' VIEW_WHY="a cards-view line gate-batch cannot read: $line"
+  return 1
+}
+if [ "$SRC" != classes ] && ! view_read; then
+  if [ -n "$LANES" ] || [ "$LOCAL_RUN" = 1 ]; then
+    LANES_NOTE="the cards in view were not read ($VIEW_WHY): no BLOOMERY_CARD=both item is deferred for a one-card machine"
+  elif [ "$DRY" = 1 ] && [ "$LEDGER" = 0 ]; then
+    LANES_NOTE="a dry run could not ask the box how many cards are in view ($VIEW_WHY): planned at --lanes 2; pass --lanes 1 to plan one card"
+  else
+    RC=70 die "cannot read the cards in view, so the lane count is unknown: $VIEW_WHY; pass --lanes 1 or --lanes 2 to name it"
+  fi
+fi
 if [ -z "$LANES" ]; then
   LANES=2
-  [ "$LOCAL_RUN" = 0 ] || LANES=1
+  if [ "$LOCAL_RUN" = 1 ]; then
+    LANES=1
+  elif [ -n "$VIEW_N" ] && { [ "$VIEW_LOCAL" = 1 ] || [ "$VIEW_N" -lt 2 ]; }; then
+    LANES=1 LANES_BY_VIEW=1
+    if [ "$VIEW_LOCAL" = 1 ]; then
+      LANES_NOTE="one lane: the box's environment file declares its cards as the cards in view (BLOOMERY_BOX_CARD=local), $VIEW_N in view, and every gate runs under the one gate lock; read by tools/ref/cards.sh's cards_view"
+    else
+      LANES_NOTE="one lane: the box lists $VIEW_N card with no pin (cards_view) and a second lane would name a card it does not have"
+    fi
+  fi
 fi
+[ -z "$LANES_NOTE" ] || echo "gate-batch: lanes: $LANES_NOTE" >&2
 # The build lane (the header's «Build lane») overlaps the box's cargo builds with the two cards' runs: it needs the two lanes, and it
 # is off under the box queue, which runs one job of a tree at a time, so a build pass would only queue beside the runs.
 if [ "$BUILD_LANE" = 1 ] && [ "$LANES" != 2 ]; then
   BUILD_LANE=0 BUILD_OFF='--lanes 1: one lane, nothing to overlap'
+  [ "$LANES_BY_VIEW" = 0 ] || BUILD_OFF='one lane for the cards in view: nothing to overlap'
 elif [ "$BUILD_LANE" = 1 ] && [ "${BLOOMERY_BOX_QUEUE:-0}" = 1 ]; then
   BUILD_LANE=0 BUILD_OFF='BLOOMERY_BOX_QUEUE=1: the queue runs one job of a tree at a time'
 fi
@@ -5268,6 +5445,8 @@ from datetime import datetime
 
 root, lanes, src, listfile, caller_env, times_path, default_s, tier, chain_list, build_path, build_lane = sys.argv[1:12]
 raw_items = sys.argv[12:]
+# The cards in view of the machine the batch runs on (the shell's probe, tools/ref/cards.sh's cards_view): None when it was not read.
+view_n = int(os.environ["GB_VIEW_N"]) if os.environ.get("GB_VIEW_N", "").isdigit() else None
 chain_solo_real = frozenset(chain_list.split())
 just = ["just", "--justfile", root + "/justfile", "--working-directory", root]
 
@@ -6415,6 +6594,10 @@ def placement(name, lane, lanes, envs=()):
         # A variable the recipe's guard needs is set in neither the item's env nor BLOOMERY_BOX_ENV: the command would stop by name
         # (exit 67), a red. Deferred under its own kind, in either tier.
         return "D", "needs-env", ["-"], ["none"]
+    if box == "both" and view_n is not None and view_n < 2:
+        # BLOOMERY_CARD=both holds two cards in view and tools/box.sh ends 64 on a machine with fewer (a red): deferred under its own
+        # kind, in either tier.
+        return "D", "two-card", ["-"], ["none"]
     if lanes == "1":
         if box:
             labels = [box]
@@ -6571,6 +6754,8 @@ for item, at in zip(raw_items, where):
     cls, kind, cards, labels = placement(name, lane, lanes, envs)
     if kind == "needs-env":
         reason = f"{', '.join(sorted({v for _, v in env_missing(name, envs)}))} is not set in the item's env or BLOOMERY_BOX_ENV; " + reason
+    if kind == "two-card":
+        reason = f"BLOOMERY_CARD=both needs two cards in view and this machine has {view_n}; " + reason
     if variant and tier == "real":
         # A variant is a fixture: the real tier opens none (tools/ref/ref-paths.sh exits 64), so the item is deferred to a fixture batch.
         cls, kind, cards, labels = "D", "variant", ["-"], ["none"]
@@ -6669,7 +6854,7 @@ rec_get() { # $1 = plan index, then field names (REC_FIELDS): each name is set, 
     printf -v "$_n" '%s' "${_vals[$_k]-}"
   done
 }
-PLAN0=$(python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" "$TIER" "$CHAIN_SOLO_REAL" "$BUILD_FILE" "$BUILD_LANE" ${ITEMS[@]+"${ITEMS[@]}"}) \
+PLAN0=$(GB_VIEW_N=$VIEW_N python3 -c "$PYPLAN" "$ROOT" "$LANES" "$SRC" "$LIST" "${BLOOMERY_BOX_ENV:-}" "$TIMES_FILE" "$DEFAULT_S" "$TIER" "$CHAIN_SOLO_REAL" "$BUILD_FILE" "$BUILD_LANE" ${ITEMS[@]+"${ITEMS[@]}"}) \
   || RC=$? die "the list did not validate (above)"
 if [ "$SRC" = classes ]; then
   printf '%s\n' "$PLAN0"
@@ -6726,7 +6911,7 @@ fi
 N=${#R_REC[@]}
 ND=${#DP_STEM[@]}
 NT=$((N + ND)) # every item of the batch: the ones that run and the ones deferred
-ND_RO=0 ND_NF=0 ND_RF=0 ND_VR=0 ND_FX=0 ND_NE=0 # of those, the real-only gates, the gates of a family with no fixture, the real-file ones, the variant items and the fixture-only gates (the last two: real tier)
+ND_RO=0 ND_NF=0 ND_RF=0 ND_VR=0 ND_FX=0 ND_NE=0 ND_TC=0 # of those, the real-only gates, the gates of a family with no fixture, the real-file ones, the variant items and the fixture-only gates (the last two: real tier), the needs-env items and the two-card ones (either tier)
 for ((i = 0; i < ND; i++)); do
   case ${DP_KIND[$i]} in
     real-only) ND_RO=$((ND_RO + 1)) ;;
@@ -6735,10 +6920,11 @@ for ((i = 0; i < ND; i++)); do
     variant) ND_VR=$((ND_VR + 1)) ;;
     fixture-only) ND_FX=$((ND_FX + 1)) ;;
     needs-env) ND_NE=$((ND_NE + 1)) ;;
-    *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture, real-file, variant, fixture-only and needs-env" ;;
+    two-card) ND_TC=$((ND_TC + 1)) ;;
+    *) RC=70 die "plan: a deferred item of the kind '${DP_KIND[$i]}' (${DP_STEM[$i]}): the kinds are real-only, no-fixture, real-file, variant, fixture-only, needs-env and two-card" ;;
   esac
 done
-NDT=$((ND - ND_NE)) # the deferrals of a tier's own kinds: a needs-env item is deferred in either tier, to a batch that sets its variable
+NDT=$((ND - ND_NE - ND_TC)) # the deferrals of a tier's own kinds: a needs-env item is deferred in either tier, to a batch that sets its variable, a two-card one to a machine with two cards in view
 # A recipe whose only card candidate is the 3090 or the A6000 is named and stopped when
 # BLOOMERY_CARD names the other card, or both, before a lane starts, the dry run included.
 # That is a fixed item, and a chain or solo item with that one candidate. The card it is
@@ -6782,10 +6968,15 @@ elif [ "$NDT" != 0 ]; then
   DEFER_NOTE=" (and $NDT deferred to the real tier: $ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file)"
 fi
 [ "$ND_NE" = 0 ] || DEFER_NOTE="$DEFER_NOTE (and $ND_NE deferred, the variable they need is not set: needs-env)"
-# The stems by kind class, for the lines that name them: the tier's own kinds, and the needs-env ones.
-DP_TIER_STEMS=() DP_NE_STEMS=()
+[ "$ND_TC" = 0 ] || DEFER_NOTE="$DEFER_NOTE (and $ND_TC deferred, they need two cards in view and this machine has $VIEW_N: two-card)"
+# The stems by kind class, for the lines that name them: the tier's own kinds, the needs-env ones and the two-card ones.
+DP_TIER_STEMS=() DP_NE_STEMS=() DP_TC_STEMS=()
 for ((i = 0; i < ND; i++)); do
-  if [ "${DP_KIND[$i]}" = needs-env ]; then DP_NE_STEMS+=("${DP_STEM[$i]}"); else DP_TIER_STEMS+=("${DP_STEM[$i]}"); fi
+  case ${DP_KIND[$i]} in
+    needs-env) DP_NE_STEMS+=("${DP_STEM[$i]}") ;;
+    two-card) DP_TC_STEMS+=("${DP_STEM[$i]}") ;;
+    *) DP_TIER_STEMS+=("${DP_STEM[$i]}") ;;
+  esac
 done
 for ((i = 0; i < N; i++)); do
   rec_get "$i" name env args cards
@@ -7619,6 +7810,7 @@ predicted() { # the plan's lane sums, derived from the times file
     [ "$NDT" = 0 ] || echo "gate-batch: $NDT item(s) deferred to the real tier ($ND_RO real-only, $ND_NF of a family with no fixture, $ND_RF real-file), in no lane (DONE: deferred=+$ND, and the list $OUT/deferred.list): ${DP_TIER_STEMS[*]}"
   fi
   [ "$ND_NE" = 0 ] || echo "gate-batch: $ND_NE item(s) deferred for a variable they need and this batch does not set (needs-env: BLOOMERY_BOX_ENV or the item's NAME@K=V sets it), in no lane (DONE: deferred, needs_env=$ND_NE, and the list $OUT/deferred.list): ${DP_NE_STEMS[*]}"
+  [ "$ND_TC" = 0 ] || echo "gate-batch: $ND_TC item(s) deferred for two cards in view, which this machine does not have ($VIEW_N in view; two-card: BLOOMERY_CARD=both, tools/box.sh ends 64 on fewer), in no lane (DONE: deferred, two_card=$ND_TC, and the list $OUT/deferred.list): ${DP_TC_STEMS[*]}"
 }
 
 # The GPU hold (the header's «The GPU hold»). The box-side writer is tools/gpu-gate.sh --gpuhold, reached through box.sh with
@@ -7894,6 +8086,8 @@ if [ "$DRY" = 1 ]; then
   for ((i = 0; i < ND; i++)); do
     if [ "${DP_KIND[$i]}" = needs-env ]; then
       printf 'lane -  %-28s %s\n        deferred (%s), never run in this batch: a variable the recipe needs is not set — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
+    elif [ "${DP_KIND[$i]}" = two-card ]; then
+      printf 'lane -  %-28s %s\n        deferred (%s), never run in this batch: the recipe needs two cards in view — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
     elif [ "$TIER" = real ]; then
       printf 'lane -  %-28s %s\n        deferred to a fixture-tier batch (%s), never run in the real tier — %s\n' "${DP_STEM[$i]}" "$(def_cmd_of "$i")" "${DP_KIND[$i]}" "${DP_WHY[$i]}"
     else
@@ -7902,7 +8096,7 @@ if [ "$DRY" = 1 ]; then
   done
   predicted
   hold_say
-  [ -z "$WAIT_HOLD" ] || echo "gate-batch: --wait-hold: a real run waits up to ${WAIT_HOLD} s, polling every ${WAIT_POLL} s, for the timing lease and the holds to drop before its first box call; this dry run touches no box"
+  [ -z "$WAIT_HOLD" ] || echo "gate-batch: --wait-hold: a real run waits up to ${WAIT_HOLD} s, polling every ${WAIT_POLL} s, for the timing lease and the holds to drop before its first box call; this dry run takes no lease, syncs nothing and only reads the cards in view"
   red_main_say
   exit 0
 fi
@@ -7919,7 +8113,9 @@ if [ "$SKIP_N" -lt "$N" ]; then
     *) echo "$lease" >&2; RC=70 die "the start check through box.sh failed (rc $rc; 70 from the guard: the lease cannot be tested)" ;;
   esac
 elif [ "$N" = 0 ]; then
-  if [ "$ND_NE" != 0 ]; then
+  if [ "$ND_TC" != 0 ]; then
+    echo "gate-batch: every item is deferred (to the other tier, for a variable it needs and this batch does not set, or for two cards in view this machine does not have) — nothing runs on the box, so no lease check"
+  elif [ "$ND_NE" != 0 ]; then
     echo "gate-batch: every item is deferred (to the other tier, or for a variable it needs and this batch does not set) — nothing runs on the box, so no lease check"
   elif [ "$TIER" = real ]; then
     echo "gate-batch: every item is deferred to a fixture-tier batch — nothing runs on the box, so no lease check"
@@ -7973,13 +8169,15 @@ if [ "$ND" != 0 ]; then
       echo "# gate-batch: the $NDT item(s) it deferred to a fixture-tier batch, one per line (the --list format; --tier fixture takes them)"
     fi
     [ "$ND_NE" = 0 ] || echo "# gate-batch: the $ND_NE item(s) it deferred for a variable they need and this batch did not set, one per line (the --list format; BLOOMERY_BOX_ENV or NAME@K=V sets it)"
-    for kind in real-only no-fixture real-file variant fixture-only needs-env; do
+    [ "$ND_TC" = 0 ] || echo "# gate-batch: the $ND_TC item(s) it deferred for two cards in view, one per line (the --list format; a machine with two cards in view takes them)"
+    for kind in real-only no-fixture real-file variant fixture-only needs-env two-card; do
       case $kind in
         real-only) [ "$ND_RO" = 0 ] || echo "# real-only: no fixture-tier conversion (bash tools/ref/real-only.sh in the recipe's box command)" ;;
         fixture-only) [ "$ND_FX" = 0 ] || echo "# fixture-only: sets on the fixture tier only, no real-tier run (bash tools/ref/fixture-only.sh in the recipe's box command)" ;;
         no-fixture) [ "$ND_NF" = 0 ] || echo "# no-fixture: the recipe's family has no row in the fixture table, tools/fixture-dirs.tsv (box.sh exits 66)" ;;
         variant) [ "$ND_VR" = 0 ] || echo "# variant: the item runs on a fixture variant (tools/fixture-variants.tsv); the real tier opens none (tools/ref/ref-paths.sh exits 64)" ;;
         needs-env) [ "$ND_NE" = 0 ] || echo "# needs-env: the recipe needs an environment variable this batch does not set (bash tools/ref/needs-env.sh in the recipe's box command)" ;;
+        two-card) [ "$ND_TC" = 0 ] || echo "# two-card: the recipe's box command names BLOOMERY_CARD=both, which needs two cards in view (tools/box.sh ends 64 on fewer)" ;;
         real-file) [ "$ND_RF" = 0 ] || echo "# real-file: the recipe's family runs on its real file (its fixture-table row is self) and a target of the recipe reaches the fixture fence (tools/recipes.py opens), which refuses that file" ;;
       esac
       for ((i = 0; i < ND; i++)); do
@@ -9080,12 +9278,14 @@ if [ "$TIER" = fixture ]; then
   [ "$ND_NF" = 0 ] || done_line="$done_line no_fixture=$ND_NF"
   [ "$ND_RF" = 0 ] || done_line="$done_line real_file=$ND_RF"
   [ "$ND_NE" = 0 ] || done_line="$done_line needs_env=$ND_NE"
+  [ "$ND_TC" = 0 ] || done_line="$done_line two_card=$ND_TC"
   [ "$ND" = 0 ] || done_line="$done_line deferred_list=$DEFER_LIST"
 elif [ "$ND" != 0 ]; then
   done_line="$done_line deferred=$ND"
   [ "$ND_VR" = 0 ] || done_line="$done_line variant=$ND_VR"
   [ "$ND_FX" = 0 ] || done_line="$done_line fixture_only=$ND_FX"
   [ "$ND_NE" = 0 ] || done_line="$done_line needs_env=$ND_NE"
+  [ "$ND_TC" = 0 ] || done_line="$done_line two_card=$ND_TC"
   done_line="$done_line deferred_list=$DEFER_LIST"
 fi
 echo "$done_line" >> "$RUNLOG"

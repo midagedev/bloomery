@@ -11,8 +11,11 @@
 # read it at start (EXIT trap) and prints the flags it left. The command runs once per arm per
 # round from the repo root with the timing card pinned (timing-card.sh); of its output only the
 # lines matching CSTATE_AB_KEEP (grep -E; default: generate's SMOKE footer and `time` lines) are
-# printed, each behind a `<state>=<on|off> round=<r> |` tag, so the log answers per arm.
+# printed, each behind a `<state>=<on|off> round=<r> |` tag, so the log answers per arm. Local mode (timing-card.sh's header:
+# BLOOMERY_BOX_CARD=local, the card in view, the lease in BLOOMERY_LOCK_DIR) is taken as bench-picks.sh takes it; an Xid or a lost
+# card after an arm ends the run with that arm named.
 set -euo pipefail
+TIMING_LOCAL_RUNNER=1
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 export BLOOMERY_DATA
@@ -52,7 +55,9 @@ restore() {
 trap restore EXIT
 
 WITNESS=(head indent card model busiest)
+timing_cards_before_lease
 lease_take
+timing_cards_start
 guard_other
 d=/sys/devices/system/cpu/cpu0/cpuidle/$STATE
 echo "[cstate-ab] $STATE=$(cat "$d/name") exit latency $(cat "$d/latency") us, residency $(cat "$d/residency") us; ${#FILES[@]} CPUs; rounds=$ROUNDS; cmd: $*"
@@ -64,6 +69,11 @@ for ((r = 1; r <= ROUNDS; r++)); do
     rc=0
     lease_capture 600 "$@" || rc=$?
     out=$LEASE_OUT
+    if ! timing_cards_arm ''; then
+      echo "$STATE=$arm round=$r invalid witness (rc=$rc): $TWOCARD_WHY"
+      witness post
+      exit 1
+    fi
     grep -E "$KEEP" <<< "$out" | sed "s/^/$STATE=$arm round=$r | /" || true
     if [ "$rc" != 0 ]; then
       echo "$STATE=$arm round=$r rc=$rc; last lines:"

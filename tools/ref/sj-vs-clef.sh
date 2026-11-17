@@ -58,10 +58,17 @@
 # (CUDA_VISIBLE_DEVICES=<its UUID> on the server's command line, which the plan prints). Before a window the runner waits
 # out a compute process on the timing card (ten minutes, then 75). After a window it reads the card again (it must answer
 # nvidia-smi by its UUID) and each server's log: a plan or lane record that names a card other than the timing card ends
-# the run (the Clef seat's log names none, which a line says). timing_cards_arm is called too, but its Xid and lost-card
-# reads belong to the two-card and local modes (timing-card.sh), which this runner does not opt into: in the one-card mode
-# it returns at once, and the two reads above are the runner's own. A server binary older than its sources is refused (3)
-# before the lease.
+# the run (the Clef seat's log names none, which a line says). timing_cards_arm is called too: its Xid and lost-card
+# reads belong to the two-card and local modes (timing-card.sh), and in the one-card mode it returns at once, the two
+# reads above being the runner's own.
+#
+# Local mode. A machine that declares its card in view (BLOOMERY_BOX_CARD=local) times that one card under the lease in
+# BLOOMERY_LOCK_DIR: the runner opts in (TIMING_LOCAL_RUNNER=1), every server of every window starts with CUDA_VISIBLE_DEVICES
+# the card's UUID alone, and after each window's servers stop the arm check reads the kernel journal's Xid lines and the
+# card's answer. The V4.1 window needs no second card there: the server picks its placement among the cards it is given, and
+# on one card that is its own (the plan's place= in the `[card]` line says which); it is guarded and pinned on that card
+# alone. The two-card mode (BLOOMERY_TIMING_CARDS) is the box's and local mode refuses it by name. A server binary older than
+# its sources is refused (3) before the lease.
 #
 # The bounds. Every process the run starts under the lease has a bound (tools/gate-bound.sh): a server is a
 # bounded_bg command under a handle of its own (lcpp-warm.sh's lcpp_srv_start, SJ_SERVER_BOUND covers its load and
@@ -164,6 +171,8 @@ esac
 # shellcheck source=tools/ref/lease.sh
 source "$HERE/lease.sh"
 if [ "$MODE" != selftest ]; then
+  # shellcheck disable=SC2034 # read by timing-card.sh when it is sourced next
+  TIMING_LOCAL_RUNNER=1
   # shellcheck source=tools/ref/timing-card.sh
   source "$HERE/timing-card.sh"
 fi
@@ -229,9 +238,10 @@ sj_started() {
   [ "$ctx" = "$CTX" ] || sj_refuse 1 "the $name server's line names ctx=$ctx, not the --ctx-size $CTX the arm asked"
 }
 
-# sj_ds41_cards: the cards the V4.1 server is given, the timing card first (the plan names which it uses).
+# sj_ds41_cards: the cards the V4.1 server is given, the timing card first (the plan names which it uses); in local mode
+# the one card.
 sj_ds41_cards() {
-  echo "$TIMING_GPU,$OTHER_GPU"
+  echo "$TIMING_GPU${OTHER_GPU:+,$OTHER_GPU}"
 }
 
 # sj_start_ds41 <log> <lever>: the V4.1 server under the handle ds41. The model rides BLOOMERY_REF_MODEL (the seat reads
@@ -332,6 +342,10 @@ sj_guard_timing() {
 # sj_guard_ds41 <tag>: both cards, for the V4.1 server, which takes the cards its placement picks; a process of another
 # arm's server on either one ends the run by name.
 sj_guard_ds41() {
+  if [ -n "$TIMING_LOCAL" ]; then
+    sj_guard_cards "$1" 'the V4.1 server starts on the one card only while no other process holds it' "$TIMING_GPU"
+    return 0
+  fi
   [ -n "$OTHER_GPU" ] || sj_refuse 69 "$1: the other card has no UUID (tools/ref/cards.sh${CARDS_ERROR:+: $CARDS_ERROR}), so the V4.1 server's cards are not proven free"
   sj_guard_cards "$1" 'the V4.1 server needs both cards and starts on neither while another process holds one' "$TIMING_GPU" "$OTHER_GPU"
 }
@@ -346,6 +360,7 @@ sj_card_check() {
     names=$(sj_log_cards "$LOGDIR/ds41-w$n.log" | tr '\n' ' ' | sed 's/ $//')
     place=$(sed -n 's/^plan place=\([^ ]*\).*/\1/p' "$LOGDIR/ds41-w$n.log" | head -n 1)
     echo "[card] window $n ds41: the log names ${names:-no card}${place:+ (plan place=$place)}; the server was given CUDA_VISIBLE_DEVICES=$(sj_ds41_cards), the timing card ($TIMING_NAME) first"
+    timing_cards_arm "$(cat "$LOGDIR/ds41-w$n.log")" || { SJ_WHY="window $n: the ds41 server: $TWOCARD_WHY"; return 1; }
     return 0
   fi
   for s in clef qwen; do
@@ -847,6 +862,7 @@ echo "\${BLOOMERY_SCHEMAJUMP-unset} \$*" >> "\$STUB_DIR/stub-levers"
 echo "\${CUDA_VISIBLE_DEVICES-unset} \$*" >> "\$STUB_DIR/stub-cvd"
 echo "\${BLOOMERY_REF_MODEL-unset}" >> "\$STUB_DIR/stub-refmodel"
 [ -z "\${STUB_CARD_GONE:-}" ] || : > "\$STUB_DIR/smi-gone"
+[ -z "\${STUB_XID:-}" ] || echo "1790428806.570394 ws kernel: NVRM: Xid (PCI:000f:01:00): 13, pid=4242, name=stub, Graphics Exception" >> "\$STUB_DIR/stub-xid"
 exec "$(command -v python3)" "$stub" "\$@"
 SERVE
   chmod +x "$T/python3"
@@ -860,9 +876,11 @@ for a in "$@"; do
   [ "$prev" != -i ] || uuid=$a
   prev=$a
 done
-name_of() { case $1 in GPU-STUB-3090) echo 'NVIDIA GeForce RTX 3090' ;; GPU-STUB-A6000) echo 'NVIDIA RTX A6000' ;; *) return 1 ;; esac; }
+name_of() { case $1 in GPU-STUB-3090) echo 'NVIDIA GeForce RTX 3090' ;; GPU-STUB-A6000) echo 'NVIDIA RTX A6000' ;; GPU-STUB-ONE) echo 'NVIDIA GeForce RTX 5090 (stub)' ;; *) return 1 ;; esac; }
 case "$*" in
   *--query-gpu=name,uuid*) printf 'NVIDIA GeForce RTX 3090, GPU-STUB-3090\nNVIDIA RTX A6000, GPU-STUB-A6000\n'; exit 0 ;;
+  # cards_view's list (local mode): under STUB_ONE the machine's one card.
+  *--query-gpu=uuid*) if [ -n "${STUB_ONE:-}" ]; then echo GPU-STUB-ONE; else printf 'GPU-STUB-3090\nGPU-STUB-A6000\n'; fi; exit 0 ;;
 esac
 if [ -n "$uuid" ]; then
   if ! name_of "$uuid" > /dev/null; then echo 'No devices were found' >&2; exit 6; fi
@@ -870,7 +888,7 @@ if [ -n "$uuid" ]; then
 fi
 case "$*" in
   *--query-compute-apps*)
-    if [ "$uuid" = GPU-STUB-A6000 ] && [ "${STUB_BUSY_TIMING:-0}" != 0 ]; then
+    if { [ "$uuid" = GPU-STUB-A6000 ] || [ "$uuid" = GPU-STUB-ONE ]; } && [ "${STUB_BUSY_TIMING:-0}" != 0 ]; then
       n=$(cat "$STUB_DIR/smi-polls" 2> /dev/null || echo 0)
       echo $((n + 1)) > "$STUB_DIR/smi-polls"
       [ "$n" -ge "$STUB_BUSY_TIMING" ] || echo '4242, 1024 MiB'
@@ -886,6 +904,16 @@ esac
 exit 0
 SMI
   chmod +x "$T/bin/nvidia-smi"
+  # The stub kernel journal (local mode's Xid reader): a boot line under -n 1, then the Xid lines the stub server left in
+  # the case's stub-xid (STUB_XID); STUB_JOURNAL_FAIL=1 fails it.
+  cat > "$T/bin/journalctl" << 'JCTL'
+#!/bin/sh
+[ -z "${STUB_JOURNAL_FAIL:-}" ] || { echo "journalctl: the stub fails" >&2; exit 1; }
+case " $* " in *" -n 1 "*) echo "1790428800.000000 ws kernel: Linux version (stub)" ;; esac
+cat "$STUB_DIR/stub-xid" 2> /dev/null
+exit 0
+JCTL
+  chmod +x "$T/bin/journalctl"
   : > "$T/model.gguf"
   : > "$T/fail.gguf"
   : > "$T/hang.gguf"
@@ -1321,6 +1349,44 @@ FIX
     "diff (ds41 jump - ds41 step) / ds41 step"
   st_absent hard-shape-no-qwen-pair "diff (jump - step) / step"
   st_servers hard-shape-servers-stopped 4
+  # --- local mode: the machine's one card (STUB_ONE) is the timing card, under a lock directory of the case's own. Every
+  # server of every window is given that card alone, the V4.1 one too (no comma, no second card), and each window's arm check
+  # reads the Xid lines. A runner that did not opt in is refused by name (timing-card.sh), so these cases are red on it.
+  LOCAL=("BLOOMERY_BOX_CARD=local" "BLOOMERY_LOCK_DIR=$T" "STUB_ONE=1")
+  ST_ENV=("${MODELS[@]}" "SJ_DS41_MODEL=$T/model.gguf" "SJ_WINDOWS=qwen:on,ds41:on" "SJ_SUITES=$FIXSUITE" "${LOCAL[@]}")
+  st_run
+  st_check local-windows 0 "[timing-card] Xid reader: journalctl -k" "[timing-card] Xid count from @" \
+    "[card] window 1 clef: the log names no card; CUDA_VISIBLE_DEVICES=GPU-STUB-ONE pins it" \
+    "[card] window 1 qwen: the log names no card; CUDA_VISIBLE_DEVICES=GPU-STUB-ONE pins it" \
+    "[card] window 2 ds41: the log names no card; the server was given CUDA_VISIBLE_DEVICES=GPU-STUB-ONE, the timing card (NVIDIA GeForce RTX 5090 (stub)) first" \
+    "[config] timing_gpu=GPU-STUB-ONE other_gpu= CUDA_VISIBLE_DEVICES=GPU-STUB-ONE rounds=" \
+    "[window 2] the ds41-jump arm: "
+  st_absent local-windows-no-second-card "GPU-STUB-ONE,G" ",GPU-STUB-ONE" "GPU-STUB-3090" "GPU-STUB-A6000" "[timing-cards]"
+  st_servers local-windows-servers-stopped 3
+  [ "$(awk '{ print $1 }' "$C/stub-cvd" | tr '\n' ' ')" = "GPU-STUB-ONE GPU-STUB-ONE GPU-STUB-ONE " ] && ok local-windows-cards || bad local-windows-cards "got [$(cat "$C/stub-cvd")]"
+  # A card that shows a compute process before the V4.1 window is waited out on that card alone, then refused as before (75).
+  ST_ENV=("SJ_DS41_MODEL=$T/model.gguf" "SJ_WINDOWS=ds41:on" "SJ_SUITES=$FIXSUITE" "${LOCAL[@]}" "STUB_BUSY_TIMING=99")
+  st_run
+  st_check local-ds41-busy 75 "[timing-busy] " "compute apps on the timing card (GPU-STUB-ONE)" "still busy after"
+  st_absent local-ds41-busy-no-other-card "the other card" "GPU-STUB-3090"
+  # An Xid line the V4.1 server's window left in the kernel journal ends the run by name, after its window.
+  ST_ENV=("SJ_DS41_MODEL=$T/model.gguf" "SJ_WINDOWS=ds41:on" "SJ_SUITES=$FIXSUITE" "${LOCAL[@]}" "STUB_XID=1")
+  st_run
+  st_check local-ds41-xid 1 "window 1: the ds41 server: 1 NVRM Xid line(s) since the last arm's check (1 since the lease was taken); last: " "NVRM: Xid (PCI:000f:01:00): 13"
+  # And one the Clef or Qwen server's window left.
+  ST_ENV=("${MODELS[@]}" "SJ_WINDOWS=qwen:on" "SJ_SUITES=$FIXSUITE" "${LOCAL[@]}" "STUB_XID=1")
+  st_run
+  st_check local-qwen-xid 1 "window 1: the clef server: 2 NVRM Xid line(s) since the last arm's check (2 since the lease was taken)"
+  # A journal that does not answer is refused before the lease.
+  ST_ENV=("${MODELS[@]}" "SJ_WINDOWS=qwen:on" "SJ_SUITES=$FIXSUITE" "${LOCAL[@]}" "STUB_JOURNAL_FAIL=1")
+  st_run
+  st_check local-journal-fail 69 "refused before the lease" "journalctl"
+  st_absent local-journal-fail-before-the-lease "[lease-stub]"
+  # The dry run's plan names the one card for the V4.1 server too.
+  ST_ENV=("SJ_DS41_MODEL=$T/model.gguf" "SJ_WINDOWS=ds41:on" "BLOOMERY_DRY=1" "${LOCAL[@]}")
+  st_run
+  st_check local-dry-plan 0 "[plan] card: timing_gpu=GPU-STUB-ONE (NVIDIA GeForce RTX 5090 (stub)) other_gpu= CUDA_VISIBLE_DEVICES=" \
+    "[plan] window 1 ds41: timeout 60 env BLOOMERY_REF_MODEL=$T/model.gguf BLOOMERY_SCHEMAJUMP=on CUDA_VISIBLE_DEVICES=GPU-STUB-ONE $T/python3 --host 127.0.0.1 --port "
   # It starts on neither card while another process holds one: the guard waits, then ends the run at 75 naming the card
   # and the process, with no server started. A process on the 3090 does not stop a single-card seat.
   ST_ENV=("SJ_DS41_MODEL=$T/model.gguf" "SJ_WINDOWS=ds41:on" "STUB_BUSY_OTHER=999" "ST_POLLS=3")

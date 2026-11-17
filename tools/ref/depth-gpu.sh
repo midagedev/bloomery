@@ -38,7 +38,11 @@
 #
 # 우리 팔의 프롬프트는 depth-decode.sh와 같은 LCG 의사난수 id다(BOS 뒤 고정 수열). 반복 프롬프트보다
 # 캐시에 덜 친절하고, CPU 깊이 표가 쓴 것과 같은 프롬프트라 두 표가 같은 말을 한다.
+#
+# Local mode (BLOOMERY_BOX_CARD=local; timing-card.sh's header: the one card in view, the lease in BLOOMERY_LOCK_DIR): both engines
+# time that card, and an Xid or a lost card after an arm ends the run with that arm named. The runner has no two-card mode.
 set -uo pipefail
+TIMING_LOCAL_RUNNER=1
 # 모델·ik 트리·llama-bench 기본값(BLOOMERY_REF_MODEL·IK·IKBIN 오버라이드는 그대로 받는다)은 빌드 스크립트와
 # 같은 파일이 소유한다. 우리 팔의 generate는 모델을 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가
 # 이 파일의 MODEL을 그 이름으로 export한다(generate 자신에게는 기본값이 없다).
@@ -66,7 +70,15 @@ WITNESS=(head-open indent card busiest model)
 
 med() { sort -n | awk '{a[NR]=$1} END{if(NR)print a[int((NR+1)/2)]}'; }
 
+# local_arm_check <label> <rc>: in local mode an Xid since the last arm, or the card lost, ends the run with the arm named.
+local_arm_check() {
+  timing_cards_arm '' && return 0
+  echo "r$r $1 invalid witness (rc=$2): $TWOCARD_WHY" >&2
+  exit 1
+}
+timing_cards_before_lease
 lease_take
+timing_cards_start
 echo "[config] model=$MODEL n=$N rounds=$ROUNDS warm=${WARM:-0} ik_flags=$IK_GPU_FLAGS"
 echo "[config] arms=$ARMS_SPEC"
 echo "[config] timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
@@ -95,6 +107,7 @@ for r in $(seq "$ROUNDS"); do
           val=$(echo "$raw" | grep -E "tg$N@pp$dep" | awk -F'|' '{print $(NF-1)}' | sed 's/ ±.*//;s/ //g')
         fi
         witness "post r$r ik d=$dep"
+        local_arm_check "ik d=$dep" 0
         [ -n "$val" ] || { echo "r$r $a produced no tg line" >&2; echo "$raw" | tail -n 8 >&2; exit 1; }
         echo "ROW r$r ik d=$dep | tok/s $val"
         sums+=("ik d=$dep|$val||")
@@ -141,6 +154,7 @@ for r in $(seq "$ROUNDS"); do
         out=$LEASE_OUT
         t1=$(date +%s)
         witness "post r$r ours($label,$inst) d=$dep ctx=$ctx n=$n"
+        local_arm_check "ours($label,$inst) d=$dep" "$rc"
         if [ $rc -ne 0 ]; then
           echo "r$r ours($label,$inst) d=$dep ctx=$ctx FAILED rc=$rc" >&2
           echo "$out" | tail -n 20 >&2

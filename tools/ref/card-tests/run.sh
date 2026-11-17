@@ -2073,5 +2073,95 @@ else
   pass "the load-ab runner's stub tests (load-ab.sh --self-test)"
 fi
 
+# The model profiles' card sizing (models/deepseek41.sh, glm5next.sh, qwen4exp.sh): they size the references' --n-cpu-moe by the A6000's and the
+# 3090's memory and refuse at source a BLOOMERY_TIMING_GPU that no resolved card explains. Local mode times the one card in view, which is neither
+# (cards.sh resolves no 3090 or A6000 UUID from its name): its UUID pinned there must not end every run that sources the profile, ours-only runs
+# included; outside local mode the refusal stands.
+profsrc() { # <name> <want rc> <pattern> <profile> [NAME=value…]: ref-paths.sh sourced for the profile, on a machine whose one card is neither named card
+  local name=$1 want=$2 pat=$3 prof=$4
+  shift 4
+  run "$name" "$want" "$pat" env -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_BOX_CARD -u CUDA_VISIBLE_DEVICES PATH="$C/local:$PATH" \
+    STUB_UUIDS="$FAKE_GB10" BLOOMERY_MODEL="$prof" BLOOMERY_TIMING_GPU="$FAKE_GB10" "$@" \
+    bash -c 'cd "$1/tools/ref" && source ./ref-paths.sh > /dev/null && echo "sourced rc=$?"' _ "$ROOT"
+}
+for prof in deepseek41 glm5next qwen4exp; do
+  profsrc "models/$prof.sh: local mode with the one card in view pinned (a card that is neither the A6000 nor the 3090) sources" 0 '^sourced rc=0$' "$prof" BLOOMERY_BOX_CARD=local
+  profsrc "models/$prof.sh: outside local mode a pin no resolved card explains is still refused by name" 64 "^models/$prof\\.sh: BLOOMERY_TIMING_GPU=$FAKE_GB10, and tools/ref/cards\\.sh resolved no 3090 UUID" "$prof"
+done
+
+# Local mode, by script. A runner under tools/ref that sources timing-card.sh decides what local mode does to it: it opts in
+# (TIMING_LOCAL_RUNNER=1 on a line before the source) and then takes the lease as timing-card.sh's modes need it
+# (timing_cards_before_lease, lease_take, timing_cards_start, and timing_cards_arm after an arm), or it is named in
+# LOCAL_NONOPT with the reason it stays a named refusal on a one-card box; a runner that does neither would be refused there with
+# no one having chosen it. A name in LOCAL_NONOPT that now opts in or no longer sources the file is stale and fails too.
+# Comment lines count for nothing. Bash 3.2: no associative arrays.
+LOCAL_NONOPT=''
+local_scan() { # <dir>: one line per runner of <dir> that breaks the rule
+  local f b miss call src opt
+  for f in "$1"/*.sh; do
+    b=${f##*/}
+    case $b in timing-card.sh | *-stub.sh) continue ;; esac
+    src=$(awk '!/^[[:space:]]*#/ && /^[[:space:]]*(source|\.)[[:space:]].*timing-card\.sh/ { print NR; exit }' "$f")
+    if [ -z "$src" ]; then
+      case " $LOCAL_NONOPT " in *" $b "*) echo "$b: named in LOCAL_NONOPT and no longer sources timing-card.sh" ;; esac
+      continue
+    fi
+    opt=$(awk '!/^[[:space:]]*#/ && /TIMING_LOCAL_RUNNER=1/ { print NR; exit }' "$f")
+    case " $LOCAL_NONOPT " in
+      *" $b "*)
+        [ -z "$opt" ] || echo "$b: named in LOCAL_NONOPT and opts into local mode"
+        continue ;;
+    esac
+    miss=''
+    if [ -z "$opt" ]; then
+      miss="$miss TIMING_LOCAL_RUNNER=1"
+    elif [ "$opt" -ge "$src" ]; then
+      miss="$miss TIMING_LOCAL_RUNNER=1(before line $src, the source)"
+    fi
+    for call in timing_cards_before_lease lease_take timing_cards_start timing_cards_arm; do
+      # one awk, no pipe: under pipefail a `grep -q` that stops reading early fails its producer with SIGPIPE and reads as no match
+      awk -v re="(^|[^_A-Za-z0-9])$call([^_A-Za-z0-9]|\$)" '!/^[[:space:]]*#/ && $0 ~ re { found = 1; exit } END { exit !found }' "$f" || miss="$miss $call"
+    done
+    [ -z "$miss" ] || echo "$b: lacks$miss"
+  done
+}
+out=$(local_scan "$ROOT/tools/ref")
+if [ -z "$out" ]; then
+  pass "every runner sourcing timing-card.sh opts into local mode and takes the lease as the modes need it, or is named in LOCAL_NONOPT"
+else
+  printf '%s\n' "$out" > "$tmp/local-scan.out"
+  fail "every runner sourcing timing-card.sh opts into local mode and takes the lease as the modes need it, or is named in LOCAL_NONOPT" "a runner breaks the rule" "$tmp/local-scan.out"
+fi
+# The scan on a copy of the runners with three of them broken (FAIL-first of the check): one loses its opt-in, one opts in after its
+# source, one loses its lease_take; the three lines name them and nothing else is named.
+mkdir -p "$tmp/scan"
+cp "$ROOT"/tools/ref/*.sh "$tmp/scan/"
+python3 - "$tmp/scan" << 'PY' || exit 70
+import re
+import sys
+from pathlib import Path
+
+d = Path(sys.argv[1])
+def edit(name, fn):
+    p = d / name
+    text = p.read_text()
+    new = fn(text)
+    assert new != text, name
+    p.write_text(new)
+edit("time-gate.sh", lambda t: t.replace("TIMING_LOCAL_RUNNER=1\n", "\n", 1))
+edit("h2d-pcie.sh", lambda t: re.sub(r"(?m)^TIMING_LOCAL_RUNNER=1\n((?:.*\n)*?)(source .*timing-card\.sh.*\n)", r"\1\2TIMING_LOCAL_RUNNER=1\n", t, count=1))
+edit("tier-cost.sh", lambda t: re.sub(r"\blease_take\b", "lease_took", t))
+PY
+want_scan="h2d-pcie.sh: lacks TIMING_LOCAL_RUNNER=1(before line N, the source)
+tier-cost.sh: lacks lease_take
+time-gate.sh: lacks TIMING_LOCAL_RUNNER=1"
+got_scan=$(local_scan "$tmp/scan" | sed -E 's/before line [0-9]+/before line N/' | sort)
+if [ "$got_scan" = "$want_scan" ]; then
+  pass "the local-mode scan names a runner without the opt-in, one that opts in after its source and one without lease_take"
+else
+  printf 'want:\n%s\ngot:\n%s\n' "$want_scan" "$got_scan" > "$tmp/local-scan2.out"
+  fail "the local-mode scan names a runner without the opt-in, one that opts in after its source and one without lease_take" "the scan's lines differ" "$tmp/local-scan2.out"
+fi
+
 echo "card-tests: $n tests, $failed failed"
 [ "$failed" = 0 ]

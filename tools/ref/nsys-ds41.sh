@@ -37,6 +37,11 @@
 # and the run log's `time prompt` row are checked the same — so the analysis needs no case of its
 # own; a P the file cannot supply (P < 1, or past its line count) is refused before the lease.
 #
+# Local mode: under BLOOMERY_BOX_CARD=local (tools/box.sh's local mode, or a box whose environment file declares its one card;
+# timing-card.sh's header has the refusals) the profiled binary loads by --place a on the one card in view and nothing else
+# (BLOOMERY_GEN_PLACE gate and bp are refused by name: gate is the 3090's bytes, bp two cards by size rank); after each profile, whatever it
+# exited with, an Xid since the last profile or the card lost refuses that run's tables (rc 1). The load line's card names are not read.
+#
 # Placement: BLOOMERY_GEN_PLACE (a, the default, gate or bp) is the --place every profiled
 # generate_ds41 loads by, named in the [config] line. Plan (a) loads on the largest visible card
 # (workstation::ALIASES: the binary finds its cards by device) and the gate plan, the 3090's bytes,
@@ -590,6 +595,23 @@ TIMEOUT
       case_ "twocard-$fault" "$want" "$why" '[stub] lease taken'
     fi
   done
+  # Local mode: the one card is the timing card, place a reaches the lease, any other place is refused by
+  # name before it. The box keeps its lease in /root, so the stub's own lock directory stands in for it.
+  for place in a bp gate; do
+    rc=0; out=$(
+      cd "$T" || exit $?
+      unset BLOOMERY_DRAFT BLOOMERY_DRY BLOOMERY_NSYS_FORM BLOOMERY_TIMING_GPU BLOOMERY_TIMING_CARDS \
+        BLOOMERY_GEN_BIN STUB_3090_LIMIT STUB_3090_GONE STUB_JOURNAL_FAIL || exit $?
+      env LC_ALL=C PATH="$T/bin:$PATH" TMPDIR="$t" NSYS="$T/bin/nsys" \
+        BLOOMERY_NSYS_OUT="$t/out" BLOOMERY_LOCK_DIR="$t" \
+        BLOOMERY_BOX_CARD=local BLOOMERY_GEN_PLACE=$place bash tools/ref/nsys-ds41.sh 6 2>&1
+    ) || rc=$?
+    if [ "$place" = a ]; then
+      case_ local-lease 42 '[stub] lease taken' 'refused'
+    else
+      case_ "local-place-$place" 64 "BLOOMERY_GEN_PLACE=$place: local mode times this machine's one card, at a" '[stub] lease taken'
+    fi
+  done
   echo "nsys-ds41.sh: self-test $([ "$bad" = 0 ] && echo ok || echo FAIL) ($n cases, $bad failed)"
   [ "$bad" = 0 ]
 }
@@ -670,9 +692,9 @@ NSYS=${NSYS:-${CUDA_TOOLKIT_PATH:-/usr/local/cuda}/bin/nsys}
 OUTDIR=${BLOOMERY_NSYS_OUT:-$BLOOMERY_DATA/nsys}
 BOUND=${BLOOMERY_ARM_BOUND:-900}
 # The card pin, the card's witness lines, the other-card guard and the binary's freshness; this
-# runner has the two-card mode (the header's Placement).
+# runner has the two-card mode (the header's Placement) and local mode (the header's Local mode).
 # shellcheck disable=SC2034 # read by timing-card.sh when it is sourced next
-TIMING_CARDS_RUNNER=1
+TIMING_CARDS_RUNNER=1 TIMING_LOCAL_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 timing_cards_mode || exit $?
@@ -683,6 +705,10 @@ for i in "${!A_NAME[@]}"; do TC_ARMS+=("${DEPTHS[$i]}" ours ours); done
 # shellcheck disable=SC2034 # read by timing_cards_arms (timing-card.sh)
 TIMING_CARDS_PLACE=bp TIMING_CARDS_PLACE_RAN=$PLACE
 timing_cards_arms "$BIN" "${TC_ARMS[@]}" || exit $?
+if [ -n "$TIMING_LOCAL" ] && [ "$PLACE" != a ]; then
+  echo "nsys-ds41.sh: BLOOMERY_GEN_PLACE=$PLACE: local mode times this machine's one card, at a (gate is the 3090's bytes, bp two cards by size rank)" >&2
+  exit 64
+fi
 if [ "$PLACE" = a ] && [ "$TIMING_GPU" = "$GPU_3090" ]; then
   echo "nsys-ds41.sh: BLOOMERY_GEN_PLACE=a is plan (a), which loads on the A6000, and the timing card is the 3090 (BLOOMERY_TIMING_GPU=$TIMING_GPU): generate_ds41 would refuse the run; set BLOOMERY_GEN_PLACE=gate" >&2
   exit 64
@@ -691,7 +717,7 @@ if [ "$PLACE" = bp ] && [ -z "$TIMING_CARDS" ]; then
   echo "nsys-ds41.sh: BLOOMERY_GEN_PLACE=bp is plan (b′), which loads on both cards (the A6000 and its 3090 expert tier); it runs in the two-card mode, BLOOMERY_TIMING_CARDS=a6000+3090" >&2
   exit 64
 fi
-if [ "$PLACE" = gate ] && [ "$TIMING_GPU" != "$GPU_3090" ]; then
+if [ "$PLACE" = gate ] && [ -z "$TIMING_LOCAL" ] && [ "$TIMING_GPU" != "$GPU_3090" ]; then
   echo "nsys-ds41.sh: BLOOMERY_GEN_PLACE=gate is the gate plan, which loads on the 3090, and the timing card is $TIMING_GPU, not the 3090 ($GPU_3090): name the 3090 in BLOOMERY_TIMING_GPU, or leave BLOOMERY_GEN_PLACE at a" >&2
   exit 64
 fi
@@ -797,6 +823,12 @@ for i in "${!A_NAME[@]}"; do
   t1=$(date +%s)
   witness "post ${A_NAME[$i]}"
   echo "[rc] $rc wall $((t1 - t0))s"
+  if [ -n "$TIMING_LOCAL" ] && ! timing_cards_arm ''; then
+    [ "$rc" -ne 0 ] || rc=1
+    rc_all=$rc
+    echo "[local] run refused: $TWOCARD_WHY"
+    continue
+  fi
   [ $rc -eq 0 ] || { rc_all=$rc; echo "--- last 20 lines of $out.txt"; tail -n 20 "$out.txt"; continue; }
   # Two cards: an Xid, a card lost or off its cap, or a load that named one card refuses this
   # run's tables (timing_cards_arm; nothing to check with one card).

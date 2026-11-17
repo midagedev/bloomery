@@ -58,9 +58,10 @@
 #   --threads N        llama-imatrix and llama-quantize threads                 [K3Q_THREADS]  (default: nproc)
 #   --imatrix-gpu      imatrix: the CUDA llama-imatrix ($K3Q_TREE/build-cuda, `just build-k3-quant-tree-cuda`) with -ngl 0: the weights stay in
 #                      the host mmap and every matmul with 32 or more tokens runs on the card (the scheduler's op offload, ggml-cuda.cu
-#                      get_op_batch_size), so the CPU term becomes PCIe. The card is the A6000, chosen by box.sh (BLOOMERY_CARD=a6000) and
-#                      held through tools/gpu-gate.sh's gate lock (--executable: lock, bound, the card's CUDA_VISIBLE_DEVICES); a run
-#                      without BLOOMERY_BOX_CARD=a6000 is refused by name, and so is a build-cuda without its CUDA backend library.
+#                      get_op_batch_size), so the CPU term becomes PCIe. The card is chosen by box.sh (BLOOMERY_CARD=a6000 on a two-card box, or
+#                      BLOOMERY_BOX_CARD=local on a machine whose card in view is its one card) and held through
+#                      tools/gpu-gate.sh's gate lock (--executable: lock, bound, the card's CUDA_VISIBLE_DEVICES); a run under another
+#                      BLOOMERY_BOX_CARD is refused by name, and so is a build-cuda without its CUDA backend library.
 #                      A CPU and a GPU imatrix are different artifacts: the flag is part of the step's key and its marker line; the same
 #                      output name is kept, so a marker of the other kind is refused (--force)      [K3Q_IMATRIX_GPU=1]
 #   --seqs N           imatrix: n_seq chunks per batch (default 1) [K3Q_SEQS]. llama-imatrix runs n_seq = batch / ctx chunks in one batch and
@@ -670,7 +671,10 @@ do_imatrix() {
   if [ "$IMATRIX_GPU" = 1 ]; then
     [ -x "$IMAT" ] || [ "$DRY" = 1 ] || die "no CUDA llama-imatrix at $IMAT: just build-k3-quant-tree-cuda" 66
     [ -e "$(dirname "$IMAT")/libggml-cuda.so" ] || [ "$DRY" = 1 ] || die "$(dirname "$IMAT") has no libggml-cuda.so: that build has no CUDA backend (just build-k3-quant-tree-cuda)" 66
-    [ "${BLOOMERY_BOX_CARD:-}" = a6000 ] || [ "$DRY" = 1 ] || die "--imatrix-gpu runs on the A6000 held through its gate lock: BLOOMERY_CARD=a6000 tools/box.sh '...' (box card is '${BLOOMERY_BOX_CARD:-unset}')" 64
+    case ${BLOOMERY_BOX_CARD:-} in
+      a6000 | local) ;;
+      *) [ "$DRY" = 1 ] || die "--imatrix-gpu runs on a card held through its gate lock: BLOOMERY_CARD=a6000 tools/box.sh '...' on a box with two cards, or tools/box.sh's local mode (BLOOMERY_BOX_CARD=local) on a machine whose card in view is its one card (box card is '${BLOOMERY_BOX_CARD:-unset}')" 64 ;;
+    esac
     [ -f "$ROOT/tools/gpu-gate.sh" ] || die "no $ROOT/tools/gpu-gate.sh: the card's gate lock has no owner here" 66
   fi
   local ngl_args=() runner=() bound_extra=0
@@ -688,7 +692,7 @@ do_imatrix() {
   THREADS=${THREADS:-$(nproc)}
   pred=$(pred_of imatrix "$IN_BYTES")
   bound=$(bound_of "$pred")
-  say "imatrix: input $IN ($IN_SHARDS shard(s), $IN_BYTES bytes), ctx $CTX, chunks $CHUNKS, seqs $SEQS, threads $THREADS, $([ "$IMATRIX_GPU" = 1 ] && echo "CUDA build $IMAT on the A6000 (-ngl 0, op offload)" || echo "CPU build $IMAT")"
+  say "imatrix: input $IN ($IN_SHARDS shard(s), $IN_BYTES bytes), ctx $CTX, chunks $CHUNKS, seqs $SEQS, threads $THREADS, $([ "$IMATRIX_GPU" = 1 ] && echo "CUDA build $IMAT on the card the gate lock holds (-ngl 0, op offload)" || echo "CPU build $IMAT")"
   if [ "$IMATRIX_GPU" = 1 ]; then
     plan_line imatrix "$IN_BYTES" "[derived] populate $K3_POPULATE_S s + ceil($CHUNKS/$SEQS) batches x ($K3_CHUNK_READ_S s read, once a batch) x $IN_BYTES/$K3_BYTES + the set over PCIe at $PCIE_GBS GB/s (assumed) a batch; card compute and host CPU sit under the read"
   else
@@ -732,7 +736,7 @@ do_imatrix() {
   # --no-repack on both paths: K3.1's routed experts are MXFP4, which the CPU backend repacks into a RAM buffer the size of
   # the set (1.45 TB, refused by the allocator); without it the weights stay in the mmap and stream once a batch.
   if [ "$IMATRIX_GPU" = 1 ]; then
-    # gpu-gate.sh takes the A6000's gate lock (waiting up to its CARD_BOUND of 1800 s, which the outer bound adds), runs the binary under
+    # gpu-gate.sh takes the card's gate lock (waiting up to its CARD_BOUND of 1800 s, which the outer bound adds), runs the binary under
     # its own bound and sets the card's CUDA_VISIBLE_DEVICES; no blanking of it on this path.
     runner=(env "BLOOMERY_GATE_BOUND=$bound" bash "$ROOT/tools/gpu-gate.sh" --executable "$IMAT")
     ngl_args=(-ngl 0)

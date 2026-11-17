@@ -143,6 +143,8 @@ def render(item, logs_dir, do_attach):
     if item.rc == "deferred":
         if item.kind == "needs-env":
             return head + "deferred (an environment variable it needs was not set: not run)", OK
+        if item.kind == "two-card":
+            return head + "deferred (it needs two cards in view and the machine has fewer: not run)", OK
         return head + "deferred (runs in the other tier)", OK
     if item.rc == "yield":
         return head + "yield (a hold of another batch was up, not run)", OK
@@ -272,6 +274,11 @@ def self_test():
         rc, out, _ = call([write("needs.log", needs)])
         check(rc == 0 and "- `gate-gpu-n` (lane -): deferred (an environment variable it needs was not set: not run)" in out and "other tier" not in out,
               f"a needs-env deferral is no failure and does not say it runs in the other tier: {rc} {out!r}")
+
+        twocard = ["gate-gpu-t rc=deferred two-card lane=- tier=real deferred=1", "DONE total=1 red=0 tier=real deferred=1 two_card=1"]
+        rc, out, _ = call([write("twocard.log", twocard)])
+        check(rc == 0 and "- `gate-gpu-t` (lane -): deferred (it needs two cards in view and the machine has fewer: not run)" in out and "other tier" not in out,
+              f"a two-card deferral is no failure and does not say it runs in the other tier: {rc} {out!r}")
 
         stdout_style = ["gate-batch: 2 items, lanes 2, logs in /h/batches/tree-a/1"] + GREEN[1:3] + ["DONE total=2 red=0 tier=real"]
         rc, out, _ = call([write("stdout.log", stdout_style)])

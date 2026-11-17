@@ -108,6 +108,18 @@
 #   place-one    6 6@place=a 6@place=a,STUB_X=1, one card: three rows at place a, the ratio ours/ours@place=a.
 #   twocard-xid  lcpp:6 lcpppp:4, an Xid during the prefill arm: its FAIL row naming it, the decode row; rc 1.
 #   twocard-dry  the dry run: the two-card lines, the precheck's `ok`, the lcpp line with -ts.
+# Local mode (BLOOMERY_BOX_CARD=local, timing-card.sh; red on the runner before it, which has no local mode: refused
+# at the lease). On the box (/root/bloomery-cpu.lock) a lock directory that is not /root is refused there, and the
+# first four are replaced by that one case:
+#   local        6 lcpp:6 at the default place a, one round, the one card listed a GB10: each row's card field
+#                `GB10 (stub)`, the witness's local lines (the Xid count, local-apps, pool, machine) and none of
+#                the two-card mode's, the Xid reader's lines; rc 0.
+#   local-xid    the same with ours d=6 exiting rc 3 after an Xid line in the kernel journal: its FAIL row naming
+#                both, lcpp's row after it uncharged; rc 1.
+#   local-xid-ok  an Xid line in the journal during an arm that exits 0: that arm is a FAIL row naming the Xid.
+#   local-place  6@place=gate and BLOOMERY_GEN_PLACE=bp in local mode: refused by name, rc 64, no row.
+#   local-twocard  BLOOMERY_TIMING_CARDS=a6000+3090 in local mode: refused by name, rc 64.
+#   local-box    on the box only: a lock directory other than /root refused by name, rc 64.
 #   twocard-own  BLOOMERY_GEN_PLACE=bp, 6 4, one round: one load of both ours arms in one process, and a
 #                nvidia-smi wrapper this case installs (STUB_CARD_PIDS, the file the stub generate_ds41
 #                appends its pid to) reports that pid on both cards whenever it lives: each arm's guard
@@ -359,7 +371,8 @@ touch "$T/Cargo.toml"
 # $STUB_ENGRAM/corpus-<name>.ids — and a fed id list prints in its `fed` line's first and last. --plan
 # prints the plan record with ctx_max STUB_GEN_CTX (32768) and exits, loading nothing; the load line names
 # ctx STUB_GEN_LOAD_CTX (the plan's by default); each arm ends with its `tokens` record, token 0
-# STUB_GEN_TOKEN0 (1000) and then 1001, 1002, ... as the step lines.
+# STUB_GEN_TOKEN0 (1000) and then 1001, 1002, ... as the step lines. The first arm of depth STUB_GEN_XID adds an Xid
+# line to $TMPDIR/stub-xid (the stub journalctl's) before its prompt.
 cat > "$T/target/release/generate_ds41" << 'EOF'
 #!/usr/bin/env bash
 if printenv place > /dev/null; then
@@ -427,6 +440,10 @@ for k in "${!arms[@]}"; do
   if [ -n "$sync" ]; then
     echo "arm i=$k arms=${#arms[@]} feed=$feed ids=$depth n=$n"
     read -r _ || { echo "error: stdin closed before arm $k" >&2; exit 65; }
+  fi
+  if [ "$depth" = "${STUB_GEN_XID:-none}" ] && [ ! -e "${TMPDIR:-/tmp}/stub-once-xid-gen" ]; then
+    touch "${TMPDIR:-/tmp}/stub-once-xid-gen"
+    echo "1790428806.570394 ws kernel: NVRM: Xid (PCI:000f:01:00): 13, pid=4242, name=generate_ds41, Graphics Exception" >> "${TMPDIR:-/tmp}/stub-xid"
   fi
   mark=${TMPDIR:-/tmp}/stub-gen-failed-$depth
   if [ "$depth" = "${STUB_GEN_FAIL_DEPTH:-none}" ] && [ ! -e "$mark" ]; then
@@ -1611,12 +1628,78 @@ elif want bin-env-ratio "$L" 1 "^ratio xbin prose d=4 +prose@$R/bin:slow@prose@$
   fi
 fi
 
+# Local mode (red on the runner before it, which refuses it at the lease: no local mode). The box
+# (/root/bloomery-cpu.lock) keeps its lease in /root, so a lock directory of this test is refused there and that is
+# the one case; elsewhere local mode runs under a lock directory of its own.
+LOC=(BLOOMERY_BOX_CARD=local "BLOOMERY_LOCK_DIR=$tmp/locks")
+mkdir -p "$tmp/locks"
+lheads() { grep -oE '^(DISCARD|WARMUP|ROW|FAIL) r[0-9]+ [^ ]+ [dp]=[0-9]+' "$1"; }
+# twocard_refused takes the two-card mode's TC; the local cases refuse with their own environment.
+local_refused() {
+  local name=$1 pat=$2
+  shift 2
+  L=$tmp/$name.log
+  stub_run "$L" "$@"
+  if [ "$RC" != 64 ]; then
+    fail "$name" "rc $RC, want 64" "$L"
+  elif want "$name" "$L" 1 "$pat" && want "$name" "$L" 0 '^(ROW|FAIL|DISCARD|WARMUP) |^--- witness|^\[stub\] no lease'; then
+    pass "$name"
+  fi
+}
+if [ -e /root/bloomery-cpu.lock ]; then
+  echo "skip local, local-xid, local-xid-ok, local-place, local-twocard: /root/bloomery-cpu.lock exists (the box), where local mode keeps the lease in /root"
+  local_refused local-box "^depth-ds41.sh: refused before the lease: BLOOMERY_BOX_CARD=local on the machine whose lease is /root/bloomery-cpu.lock \(the box\), with BLOOMERY_LOCK_DIR=" \
+    "${LOC[@]}" -- 6 lcpp:6
+else
+  L=$tmp/local.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${LOC[@]}" -- 6 lcpp:6
+  if [ "$RC" != 0 ]; then
+    fail local "rc $RC, want 0" "$L"
+  elif [ "$(lheads "$L" | paste -sd'|' -)" != "ROW r1 ours d=6|ROW r1 lcpp d=6" ]; then
+    fail local "the rows' heads: $(lheads "$L" | paste -sd'|' -)" "$L"
+  elif want local "$L" 1 '^ROW r1 ours d=6 n=4 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, GB10 \(stub\) \| place a \| ' &&
+    want local "$L" 1 '^ROW r1 lcpp d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, GB10 \(stub\) \| ' &&
+    want local "$L" 1 '^\[timing-card\] Xid reader: journalctl -k$' &&
+    want local "$L" 1 '^\[timing-card\] Xid count from @[0-9]+ ' &&
+    want local "$L" 6 '^    timing-card: NVIDIA GB10 \(stub\), \[N/A\], stub$' &&
+    want local "$L" 6 '^    xid: 0 NVRM Xid line\(s\) since the lease was taken \(@[0-9]+\); last: none$' &&
+    want local "$L" 6 '^    local-apps: \[\]$' &&
+    want local "$L" 0 '\[other-card\]|3090-apps|a6000-apps|llm\.service|timing-cards'; then
+    pass local
+  fi
+  L=$tmp/local-xid.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${LOC[@]}" STUB_GEN_XID=6 STUB_GEN_FAIL_DEPTH=6 -- 6 lcpp:6
+  if [ "$RC" != 1 ]; then
+    fail local-xid "rc $RC, want 1" "$L"
+  elif [ "$(lheads "$L" | paste -sd'|' -)" != "FAIL r1 ours d=6|ROW r1 lcpp d=6" ]; then
+    fail local-xid "the rows' heads: $(lheads "$L" | paste -sd'|' -)" "$L"
+  elif want local-xid "$L" 1 "^FAIL r1 ours d=6 rc=3 \| exited 3; 1 NVRM Xid line\(s\) since the last arm.s check \(1 since the lease was taken\); last: [0-9.]+ ws kernel: NVRM: Xid \(PCI:000f:01:00\): 13, .*; last line: " &&
+    want local-xid "$L" 1 '^failed arms: r1 ours d=6 rc=3; $'; then
+    pass local-xid
+  fi
+  L=$tmp/local-xid-ok.log
+  stub_run "$L" BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${LOC[@]}" STUB_GEN_XID=6 -- 6 lcpp:6
+  if [ "$RC" != 1 ]; then
+    fail local-xid-ok "rc $RC, want 1" "$L"
+  elif [ "$(lheads "$L" | paste -sd'|' -)" != "FAIL r1 ours d=6|ROW r1 lcpp d=6" ]; then
+    fail local-xid-ok "the rows' heads: $(lheads "$L" | paste -sd'|' -)" "$L"
+  elif want local-xid-ok "$L" 1 "^FAIL r1 ours d=6 rc=0 \| 1 NVRM Xid line\(s\) since the last arm.s check \(1 since the lease was taken\); last: [0-9.]+ ws kernel: NVRM: Xid \(PCI:000f:01:00\): 13, "; then
+    pass local-xid-ok
+  fi
+  local_refused local-place "^depth-ds41.sh: arm '6@place=gate': place=gate: .*local mode times this machine's one card, at a " \
+    "${LOC[@]}" -- 6@place=gate
+  local_refused local-place-bp "^depth-ds41.sh: BLOOMERY_GEN_PLACE=bp: .*local mode times this machine's one card, at a " \
+    "${LOC[@]}" BLOOMERY_GEN_PLACE=bp -- 6
+  local_refused local-twocard "^depth-ds41.sh: BLOOMERY_TIMING_CARDS=a6000\+3090 and BLOOMERY_BOX_CARD=local: the two-card mode is the box's, and local mode times this machine's one card$" \
+    "$TC" "${LOC[@]}" -- 6 lcpp:6
+fi
+
 if [ "${DEPTH_DS41_STUB_SHOW:-}" = 1 ]; then
   for L in "$tmp"/failed-arm.log "$tmp"/corpus.log "$tmp"/place.log "$tmp"/blocks.log "$tmp"/order-bad.log \
     "$tmp"/blocks-dry.log "$tmp"/blocks-ph.log "$tmp"/grouped.log "$tmp"/group-fail.log "$tmp"/load-arm.log \
     "$tmp"/solo.log "$tmp"/grouped-dry.log "$tmp"/fit.log "$tmp"/fit-preheat.log "$tmp"/fit-nobench.log \
     "$tmp"/fit-fail.log "$tmp"/fit-dry.log "$tmp"/twocard*.log "$tmp"/bp-onecard*.log "$tmp"/place-*.log "$tmp"/srv*.log "$tmp"/warm*.log \
-    "$tmp"/res-*.log "$tmp"/bin-*.log; do
+    "$tmp"/res-*.log "$tmp"/bin-*.log "$tmp"/local*.log; do
     echo "--- ${L##*/} (rc of the run: see its last lines)"
     cat "$L"
   done

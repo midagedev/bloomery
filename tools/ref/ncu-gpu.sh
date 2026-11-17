@@ -109,6 +109,10 @@
 # (the form derives both). BLOOMERY_DRY=1 prints the derivation and the command line and exits before the
 # lease.
 set -uo pipefail
+# Local mode (BLOOMERY_BOX_CARD=local; timing-card.sh's header: the card in view, the lease in BLOOMERY_LOCK_DIR) profiles that one card in
+# every form; an Xid or a lost card by the end of the profiled run voids it (rc 1). ncu itself needs root, which a machine without it
+# says by name (exit 77) below.
+TIMING_LOCAL_RUNNER=1
 # 데이터 디렉터리 기본값(BLOOMERY_DATA 오버라이드는 그대로 받는다)은 빌드 스크립트와 같은 파일이 소유한다.
 # 모델은 generate가 BLOOMERY_REF_MODEL에서 직접 연다 — tools/box.sh가 ref-paths.sh의 MODEL을 그 이름으로
 # export한다(generate 자신에게는 기본값이 없다).
@@ -145,6 +149,12 @@ source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 # The lease and the witness fields.
 # shellcheck source=tools/ref/lease.sh
 source "${BASH_SOURCE[0]%/*}/lease.sh"
+# local_arm_check: in local mode an Xid since the lease was taken, or the card lost, voids the run (1, named); no other mode checks.
+local_arm_check() {
+  timing_cards_arm '' && return 0
+  echo "ncu-gpu.sh: invalid witness: $TWOCARD_WHY" >&2
+  return 1
+}
 
 # 섹션으로 묻는다(개별 메트릭 이름은 드라이버·ncu 판마다 흔들린다). 이 넷이 답하는 것:
 #   SpeedOfLight       — 이 커널이 계산에 붙었나 메모리에 붙었나, 각각 피크의 몇 %인가
@@ -277,13 +287,16 @@ if [ "$FORM" = gemm ]; then
   [ "$(id -u)" = 0 ] || { echo "ncu 카운터는 root가 필요하다(RmProfilingAdminOnly=1)" >&2; exit 77; }
   mkdir -p "$OUTDIR"
   WITNESS=(head-open indent card model)
+  timing_cards_before_lease
   lease_take
+  timing_cards_start
   echo "[config] ncu=$($NCU --version | sed -n 3p) form=gemm arm=$GEMM_ARM kernels='$GEMM_KERNELS' skip=$GEMM_SKIP count=$COUNT bound=${BOUND}s"
   echo "[config] sections='$GEMM_SECTIONS' out=$out"
   witness pre
   guard_other
   lease_bounded "$BOUND" "${CMD[@]:3}" > "$out.txt" 2>&1
   rc=$?
+  local_arm_check || [ "$rc" -ne 0 ] || rc=1
   witness post
   echo "[rc] $rc"
   [ $rc -eq 0 ] || { echo "--- last 20 lines"; tail -n 20 "$out.txt"; }
@@ -424,7 +437,9 @@ if [ "$FORM" = ds41pp ]; then
   [ -x "$NCU" ] || { echo "no ncu at $NCU" >&2; exit 2; }
   [ "$(id -u)" = 0 ] || { echo "ncu 카운터는 root가 필요하다(RmProfilingAdminOnly=1)" >&2; exit 77; }
   WITNESS=(head-open indent card model)
+  timing_cards_before_lease
   lease_take
+  timing_cards_start
   plan_args=("$TRACE" "$P" "$RUNLOG" "$out.plan")
   [ -z "${BLOOMERY_NCU_LAYER:-}" ] || plan_args+=(--layer "$BLOOMERY_NCU_LAYER")
   echo "[plan] from $TRACE"
@@ -440,6 +455,7 @@ if [ "$FORM" = ds41pp ]; then
   t0=$(date +%s)
   lease_bounded "$BOUND" "${CMD[@]:3}" > "$out.txt" 2>&1
   rc=$?
+  local_arm_check || [ "$rc" -ne 0 ] || rc=1
   witness post
   echo "[rc] $rc wall $(($(date +%s) - t0))s"
   [ $rc -eq 0 ] || { echo "--- last 20 lines"; tail -n 20 "$out.txt"; }
@@ -559,7 +575,9 @@ if [ "$FORM" = q3pp ]; then
   q3_cmd "$SKIP" "$(lcg_prompt "$P")"
   # shellcheck disable=SC2034 # read by lease.sh's witness()
   WITNESS=(head-open indent card model)
+  timing_cards_before_lease
   lease_take
+  timing_cards_start
   echo "[config] ncu=$($NCU --version | sed -n 3p) form=q3pp kernel=$KERNEL P=$P layer=$LAYER skip=$SKIP count=1 ctx=$CTX clock-control=none bound=${BOUND}s"
   echo "[config] profiled binary: $GEN, $WHICH"
   echo "[config] sections='$Q3_SECTIONS' out=$out"
@@ -568,6 +586,7 @@ if [ "$FORM" = q3pp ]; then
   t0=$(date +%s)
   lease_bounded "$BOUND" "${CMD[@]:3}" > "$out.txt" 2>&1
   rc=$?
+  local_arm_check || [ "$rc" -ne 0 ] || rc=1
   witness post
   echo "[rc] $rc wall $(($(date +%s) - t0))s"
   [ $rc -eq 0 ] || { echo "--- last 20 lines"; tail -n 20 "$out.txt"; }
@@ -595,7 +614,9 @@ mkdir -p "$OUTDIR"
 # shellcheck disable=SC2034 # read by lease.sh's witness()
 WITNESS=(head-open indent card model)
 
+timing_cards_before_lease
 lease_take
+timing_cards_start
 echo "[config] ncu=$($NCU --version | sed -n 3p) mode=$MODE kernels='${KERNELS}' count=$COUNT depths='$DEPTHS'"
 echo "[config] sections='$SECTIONS' out=$OUTDIR"
 witness pre
@@ -687,6 +708,7 @@ for kernel in sorted({k for k, _, _ in by}):
 PY
 done
 
+local_arm_check || [ "$rc_all" -ne 0 ] || rc_all=1
 witness post
 echo "[lease] released at $(now)"
 exit $rc_all

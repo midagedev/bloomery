@@ -199,6 +199,13 @@
 #                naming it; rc 1.
 #   twocard-place-dry  the dry run: each ours arm's --place, the reference's CUDA_VISIBLE_DEVICES, the
 #                precheck's ok, the placements line.
+#   local        BLOOMERY_BOX_CARD=local (a lock directory of the test's own), 6 and lcpp27752:6, one round: the ours row at place a and
+#                the reference row, both with the one card in view (depth-stub-cards.sh's GB10) as card field, the Xid reader's two
+#                lines, none of the two-card mode's or the other card's witness lines; rc 0. Timed, so it runs where the prose ids are.
+#   local-xid    the same with an Xid after the ours arm (STUB_GEN_XID=6): the ours row a FAIL row naming the Xid though the arm exited 0,
+#                the reference row a ROW; rc 1. Timed, as local.
+#   local-place  6@place=gate and BLOOMERY_GEN_PLACE=bp in local mode: refused by name, rc 64, as is BLOOMERY_TIMING_CARDS
+#                (local-twocard). These three need no prose ids.
 #   dry-same     DEPTH_GLM5NEXT_BASE set: the dry run of every arm kind the base runner knows, under the
 #                base and under the runner tested, byte for byte less the lines this runner changed on
 #                purpose: `[dry] preheat:`, `[dry] prompt:`, `[dry] WARMUP r0:`, `[dry] server arms:`, the
@@ -358,7 +365,8 @@ cp "$T/pr27752/llama-server" "$T/pr27754/llama-server"
 # prompt and tokens records in slot order, each round's step records and a `time pass … kind=slots` at 44 ms of
 # N positions (STUB_GEN_SLOTS_POS in its stead), the SMOKE footer with positions and tok/s(positions), and under
 # BLOOMERY_RESIDENCY the residency passes none/0, prompt/0 a slot, then pass=slots kept=N a round
-# (STUB_GEN_SLOTS_RESPASS names another pass); STUB_GEN_SLOTS_NOPASS=1 prints the plain lines instead.
+# (STUB_GEN_SLOTS_RESPASS names another pass); STUB_GEN_SLOTS_NOPASS=1 prints the plain lines instead. The first arm of depth
+# STUB_GEN_XID adds an Xid line to $TMPDIR/stub-xid (the stub journalctl's) before its plan.
 G=$T/target/release/generate_glm5next
 # shellcheck disable=SC2016 # ${1:-} is the stub's own argument
 printf '#!/usr/bin/env bash\n[ "${1:-}" != --records-schema ] || exec cat %q\n' "$T/tools/bloomery/schema/generate_glm5next.jsonl" > "$G"
@@ -387,6 +395,10 @@ done
 echo "draft=${BLOOMERY_DRAFT:-none} depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-draft"
 echo "draft=${BLOOMERY_DRAFT:-none} ctx=$ctx depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-ctx"
 echo "draft=${BLOOMERY_DRAFT:-none} residency=${BLOOMERY_RESIDENCY:-none} depth=$depth" >> "${TMPDIR:-/tmp}/stub-gen-env"
+if [ "$depth" = "${STUB_GEN_XID:-none}" ] && [ ! -e "${TMPDIR:-/tmp}/stub-once-xid-gen" ]; then
+  touch "${TMPDIR:-/tmp}/stub-once-xid-gen"
+  echo "1790428806.570394 ws kernel: NVRM: Xid (PCI:000f:01:00): 13, pid=4242, name=generate_glm5next, Graphics Exception" >> "${TMPDIR:-/tmp}/stub-xid"
+fi
 rp() { [ -z "${BLOOMERY_RESIDENCY:-}" ] || echo "residency pass pass=$1 boundary=$2 kept=$3 landed=$4 late=0 made=$4 in_flight=0 bytes=$5 end_us=1 boundary_us=2 wait_us=0 issue_us=1 stage_us=0 prepare_us=0"; }
 [ -z "${BLOOMERY_RESIDENCY:-}" ] || [ -n "${STUB_GEN_NORESLEVER:-}" ] || echo "residency lever residency=$BLOOMERY_RESIDENCY why=set"
 echo "plan place=$place card=A6000 ctx_max=2048 card_experts=2627 (39941832704 B) host_experts=9469 (145536581632 B) host_shadow=0 B n_l=67..68 on 39 layers card_budget=none"
@@ -900,6 +912,14 @@ elif want slots-bad "$L" 1 "^depth-glm5next.sh: arm '6@BLOOMERY_GEN_SLOTS=02': B
   pass slots-bad
 fi
 
+# Local mode's stubs: the box keeps its lease in /root, so a lock directory of this test is refused there (LOCAL_OK empty: its cases skip);
+# elsewhere local mode runs under a lock directory of its own. The nvidia-smi and journalctl are the cards stub's ($TCB): the one card in
+# view is the GB10, and the arm's Xid check reads $TMPDIR/stub-xid.
+LOC=(BLOOMERY_BOX_CARD=local "BLOOMERY_LOCK_DIR=$tmp/locks" PATH="$TCB/bin:$T/bin:$PATH")
+mkdir -p "$tmp/locks"
+lheads() { grep -oE '^(DISCARD|WARMUP|ROW|FAIL) r[0-9]+ [^ ]+ [dp]=[0-9]+' "$1"; }
+LOCAL_OK=1
+[ ! -e /root/bloomery-cpu.lock ] || LOCAL_OK=''
 PROSE_SRC=${BLOOMERY_DATA:-/root/bloomery-data}/glm5next/corpus-prose.ids
 if [ -f "$PROSE_SRC" ]; then
   mkdir -p "$T/data/glm5next"
@@ -1435,8 +1455,42 @@ PY
   else
     echo "skip ctx-derived-run, ctx-derived-srv: $PROSE_SRC holds fewer than the 54096 ids a depth-4096 arm feeds"
   fi
+  if [ -n "$LOCAL_OK" ]; then
+    L=$tmp/local.log
+    stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${LOC[@]}" -- 6 lcpp27752:6
+    if [ "$RC" != 0 ]; then
+      fail local "rc $RC, want 0" "$L"
+    elif [ "$(lheads "$L" | paste -sd'|' -)" != "ROW r1 ours d=6|ROW r1 lcpp27752 d=6" ]; then
+      fail local "the rows' heads: $(lheads "$L" | paste -sd'|' -)" "$L"
+    elif want local "$L" 1 '^ROW r1 ours d=6 n=4 ctx=2048 \| tok/s\(mean\) [0-9.]+ @ n=4, depth 6, GB10 \(stub\) \| place a ' &&
+      want local "$L" 1 '^ROW r1 lcpp27752 d=6 n=4 \| tok/s 20.00 @ n=4, depth 6, GB10 \(stub\) \| ' &&
+      want local "$L" 1 '^\[timing-card\] Xid reader: journalctl -k$' &&
+      want local "$L" 1 '^\[timing-card\] Xid count from @[0-9]+ ' &&
+      want local "$L" 0 '\[other-card\]|3090-apps|a6000-apps|llm\.service|timing-cards'; then
+      pass local
+    fi
+    L=$tmp/local-xid.log
+    stub_run "$L" BLOOMERY_GEN_CTX=2048 BLOOMERY_AB_ROUNDS=1 BLOOMERY_AB_WARMUP=0 "${LOC[@]}" STUB_GEN_XID=6 -- 6 lcpp27752:6
+    if [ "$RC" != 1 ]; then
+      fail local-xid "rc $RC, want 1" "$L"
+    elif [ "$(lheads "$L" | paste -sd'|' -)" != "FAIL r1 ours d=6|ROW r1 lcpp27752 d=6" ]; then
+      fail local-xid "the rows' heads: $(lheads "$L" | paste -sd'|' -)" "$L"
+    elif want local-xid "$L" 1 "^FAIL r1 ours d=6 rc=0 \| 1 NVRM Xid line\(s\) since the last arm.s check \(1 since the lease was taken\); last: [0-9.]+ ws kernel: NVRM: Xid \(PCI:000f:01:00\): 13, "; then
+      pass local-xid
+    fi
+  fi
 else
-  echo "skip ours-timed, cold-retry, ctx-derived-run, ctx-derived-srv, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none, lever-levers, twocard-place, twocard-place-mtp, twocard-place-order, twocard-place-3090, twocard-nocards, twocard-place-dry, slots, slots-res-off, slots-pos, slots-leak, slots-none, slots-res-step, slots-past and slots-dry: no prose ids at $PROSE_SRC (the profile pins their sha256)"
+  echo "skip ours-timed, cold-retry, ctx-derived-run, ctx-derived-srv, srv, srv-xcheck, srv-ctx, srv-flags, srv-dry, srv-probe, srv-fail, mtp, mtp-rec, mtp-lever, lever-pair, mtp-lever-arm, lever-res-nolever, lever-res-none, lever-levers, twocard-place, twocard-place-mtp, twocard-place-order, twocard-place-3090, twocard-nocards, twocard-place-dry, local, local-xid, slots, slots-res-off, slots-pos, slots-leak, slots-none, slots-res-step, slots-past and slots-dry: no prose ids at $PROSE_SRC (the profile pins their sha256)"
+fi
+
+# Local mode's refusals (red on the runner before it, which refuses it at the lease: no local mode); the timed cases (local, local-xid)
+# stand with the other timed ones, in the block that holds the prose ids.
+if [ -z "$LOCAL_OK" ]; then
+  echo "skip local, local-xid, local-place, local-place-bp, local-twocard: /root/bloomery-cpu.lock exists (the box), where local mode keeps the lease in /root"
+else
+  place_refused local-place "^depth-glm5next.sh: arm '6@place=gate': place=gate: .*local mode times this machine's one card, at a " "${LOC[@]}" -- 6@place=gate
+  place_refused local-place-bp "^depth-glm5next.sh: BLOOMERY_GEN_PLACE=bp: .*local mode times this machine's one card, at a " "${LOC[@]}" BLOOMERY_GEN_PLACE=bp --
+  place_refused local-twocard "^depth-glm5next.sh: BLOOMERY_TIMING_CARDS=a6000\+3090 and BLOOMERY_BOX_CARD=local: the two-card mode is the box's, and local mode times this machine's one card$" "${LOC[@]}" BLOOMERY_TIMING_CARDS=a6000+3090 -- 6
 fi
 
 # same_view: a dry run less the lines this runner changes on purpose (dry-same).

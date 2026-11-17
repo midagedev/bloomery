@@ -83,6 +83,12 @@
 # ggml_cuda_init lines do not show the A6000 and the 3090 as devices 0 and 1 ends the script (rc 1) with
 # the reason. The summary line's card field reads `A6000+3090`.
 #
+# Local mode. Under BLOOMERY_BOX_CARD=local (tools/box.sh's local mode, or a box whose environment file declares its one card; timing-card.sh's
+# header has the refusals) the run times that one card under the lease in BLOOMERY_LOCK_DIR; after the warm-up and the timed run an NVRM
+# Xid or a card lost ends the script (rc 1) with the reason, and the summary line's card field is the card's name. The engine's --n-cpu-moe
+# is the profile's (models/deepseek41.sh sizes it for the A6000 or the 3090 by their memory, not for the card in view): a local run names
+# its own with BLOOMERY_IK_NCMOE / BLOOMERY_LCPP_NCMOE.
+#
 # Environment: BLOOMERY_IK_SPEC (the dspark arm's stage, default `dspark`; `dspark:n_max=4` sets
 # ik's canonical keys), BLOOMERY_IK_NCMOE (replaces --n-cpu-moe in IK_GPU_FLAGS: the 3090 holds
 # the dense weights, not six layers of experts; ik's llama-cli hands the count to its loader, which
@@ -145,8 +151,8 @@ fi
 DRAFT_PARAMS=${BLOOMERY_IK_DRAFT_PARAMS:-}
 
 # The card pin (CUDA_VISIBLE_DEVICES), its witness lines and the other-card guard; the lease. This runner
-# has the two-card mode (the header's Two cards).
-TIMING_CARDS_RUNNER=1
+# has the two-card mode (the header's Two cards) and local mode (the header's Local mode).
+TIMING_CARDS_RUNNER=1 TIMING_LOCAL_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 timing_cards_mode || exit $?
@@ -292,7 +298,7 @@ run_once() {
     exit "$RUN_RC"
   fi
   if ! timing_cards_arm "$(cat "$out")"; then
-    echo "ik-draft.sh: two cards ($label): $TWOCARD_WHY" >&2
+    echo "ik-draft.sh: ${TIMING_CARDS:+two cards }($label): $TWOCARD_WHY" >&2
     tail -n 20 "$out" >&2
     exit 1
   fi

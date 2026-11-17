@@ -7,8 +7,11 @@
 #   time-gate.sh gate_p8              -> gate_p8 --time      (the historical default)
 #   time-gate.sh gate_p8 --profile    -> gate_p8 --profile   (gate_p8's per-op table)
 # Extra args replace the default `--time` wholesale; the lease and witness blocks wrap whatever
-# runs, unchanged.
+# runs, unchanged. On a machine with one card, under tools/box.sh's local mode (BLOOMERY_BOX_CARD=local: a contributor's machine, or the
+# box when its environment file declares its card), the timing card is the card in view and the lease the one in BLOOMERY_LOCK_DIR
+# (timing-card.sh's header has the refusals); the run is checked for an Xid and a lost card as the other local runners' are.
 set -euo pipefail
+TIMING_LOCAL_RUNNER=1
 # BLOOMERY_DATA defaults in ref-paths.sh, as in every runner here (BLOOMERY_DATA overrides it).
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
@@ -30,13 +33,19 @@ fi
 BIN=target/release/$NAME
 assert_fresh_binary "$BIN" || exit $?
 WITNESS=(head indent card busiest model)
+timing_cards_before_lease
 lease_take
+timing_cards_start
 witness pre
 # `|| rc=$?`, not a bare `rc=$?`: under `set -e` a non-zero gate exits the script on the
 # spot, and the post witness and the rc line never print (measured 2026-09-21 — a FAIL-first
 # timing run lost its post witness). A failing timed run must still be a complete record.
 rc=0
 run_bounded timeout --kill-after=10 600 "$BIN" "${ARGS[@]}" || rc=$?
+if ! timing_cards_arm ''; then
+  echo "time-gate: invalid witness: $TWOCARD_WHY" >&2
+  [ "$rc" != 0 ] || rc=1
+fi
 witness post
 echo "$NAME ${ARGS[*]} rc=$rc"
 exit $rc

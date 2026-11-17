@@ -34,6 +34,9 @@
 #
 # The card is required (BLOOMERY_LEASE_CARD), the rounds are BLOOMERY_AB_ROUNDS (default 3), and the lease's
 # timing card is the GPU runners' (tools/ref/timing-card.sh). `--self-test` runs on any machine with stub arms.
+#
+# Local mode (BLOOMERY_BOX_CARD=local; timing-card.sh's header: the one card in view, the lease in BLOOMERY_LOCK_DIR) takes the arms'
+# starts on that card; an Xid since the last start, or the card lost, makes that start a FAIL row (rc xid) whatever the binary exited with.
 set -uo pipefail
 HERE=${BASH_SOURCE[0]%/*}
 [ "$HERE" != "${BASH_SOURCE[0]}" ] || HERE=.
@@ -155,6 +158,10 @@ start_arm() {
   read -r -a v1 <<< "$(vm_sample)"
   witness "post $tag r$r $label"
   guard_cpu "post $tag r$r $label"
+  if ! timing_cards_arm ''; then
+    fail_row "$r" "$label" xid "$TWOCARD_WHY"
+    return 1
+  fi
   if [ "$seen" = 0 ]; then
     fail_row "$r" "$label" "$rc" "$BIN_NAME ended or ran out of its bound with no \`load phases\` record; last line: $(grep -v '^[[:space:]]*$' "$out" | tail -n 1)"
     tail -n 20 "$out" >&2
@@ -217,7 +224,9 @@ effects() {
 # sitting: the lease, the warm-up starts, the rounds, the effects. Reads DIRS, ARGS, WARM, BIN_NAME and ROUNDS.
 sitting() {
   local r i n=${#DIRS[@]} a w0 w1 warmups=0 timed
+  timing_cards_before_lease
   lease_take
+  timing_cards_start
   w0=$(clock)
   lease_out_init || exit 70
   WORK=$LEASE_OUT_DIR
@@ -333,6 +342,14 @@ print(phases)
       export HOME=$t/home
       RECORD_GRACE=0.1
       lease_take() { :; }
+      timing_cards_before_lease() { :; }
+      timing_cards_start() { :; }
+      # STUB_XID=<label>: the start of that arm sees an Xid (local mode's check, timing-card.sh's timing_cards_arm).
+      timing_cards_arm() {
+        TWOCARD_WHY=''
+        [ "${STUB_XID:-}" != "${label:-}" ] || { TWOCARD_WHY="1 NVRM Xid line(s) since the last arm's check (1 since the lease was taken); last: stub"; return 1; }
+        return 0
+      }
       witness() { echo "witness $*"; }
       guard_other() { OTHER_BUSY_TAG=''; }
       guard_cpu() { :; }
@@ -390,6 +407,14 @@ print(phases)
   matches e-fail '^FAIL r1 die rc=3 \| generate_ds41 ended or ran out of its bound with no `load phases` record; last line: loading...' "$OUT"
   count e-base-rows "$OUT" '^ROW r[12] base \| ' 2
   count e-no-effect "$OUT" '^effect ' 0
+  # g: local mode's check: an Xid seen after the start of one arm makes every start of that arm a FAIL row (rc xid) with the reader's words,
+  # whatever the binary printed; the other arm's rows stand and no effect line pairs them.
+  sit STUB_ROUNDS=2 STUB_XID=new -- base new -- --any
+  check g-xid-rc "$RC" 1
+  matches g-xid-fail '^FAIL r1 new rc=xid \| 1 NVRM Xid line\(s\) since the last arm.s check \(1 since the lease was taken\); last: stub' "$OUT"
+  count g-xid-base-rows "$OUT" '^ROW r[12] base \| ' 2
+  count g-xid-no-new-rows "$OUT" '^ROW r[12] new \| ' 0
+  count g-xid-no-effect "$OUT" '^effect ' 0
   # f: refusals before anything runs.
   sit -- base -- --any
   check f-one-arm-rc "$RC" 64
@@ -409,6 +434,7 @@ if [ "${1:-}" = --self-test ]; then
 fi
 
 # The card pin, the stale-binary refusal and the other-card guard are the GPU runners' (timing-card.sh).
+TIMING_LOCAL_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "$HERE/timing-card.sh"
 parse_args "$@"

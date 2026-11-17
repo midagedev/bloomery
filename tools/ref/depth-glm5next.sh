@@ -215,6 +215,12 @@
 # refused outside the two-card mode. Every ours row names its placement (`place <p>`), one whose SMOKE
 # names another is a FAIL row, and with a place= arm the [config] line has a `placements` line.
 #
+# Local mode. Under BLOOMERY_BOX_CARD=local (tools/box.sh's local mode, or a box whose environment file declares its one card;
+# timing-card.sh's header has the refusals) every arm, ours and the references, runs on the one card in view (REF_CVD, no pin of its own),
+# ours at place a alone (arm-place.sh refuses gate and bp by name, and BLOOMERY_TIMING_CARDS), and every row's card field is the card's
+# name; after every arm, whatever it exited with, an Xid since the last arm or the card lost makes the arm a FAIL row. The references'
+# --n-cpu-moe is the profile's (models/glm5next.sh sizes it for the A6000 and the 3090 by their memory, not for the card in view).
+#
 # Two cards. BLOOMERY_TIMING_CARDS=a6000+3090 (timing-card.sh's mode, depth-ds41.sh's) shows both cards to
 # every ours arm, the A6000 as device 0 and the 3090 as device 1, for the separate "A6000+3090" table: every
 # row's card field reads `A6000+3090`, so no reader puts it in the A6000 table. An ours arm at bp loads both
@@ -455,8 +461,8 @@ CTX_RULE=$GEN_CTX
 if [ -n "$GEN_CTX" ]; then SRV_C_WORDS="-c $GEN_CTX (ours' --ctx"; else SRV_C_WORDS="-c D + N rounded up to 256 (ours' --ctx at that D or P"; fi
 
 # The card pin, the witness, the other-card guard; this runner has the two-card mode (the header's Two
-# cards).
-TIMING_CARDS_RUNNER=1
+# cards) and local mode (the header's Local mode).
+TIMING_CARDS_RUNNER=1 TIMING_LOCAL_RUNNER=1
 # shellcheck source=tools/ref/timing-card.sh
 source "${BASH_SOURCE[0]%/*}/timing-card.sh"
 timing_cards_mode || exit $?
@@ -1001,6 +1007,13 @@ run_arm() {
   }
   local r_tag=r$r tc
   [ "$tag" = ROW ] || r_tag=r0
+  # Local mode: an Xid since the last arm, or the card lost, fails the arm whatever it exited with, so the next arm is not charged with it.
+  if [ -n "$TIMING_LOCAL" ] && ! timing_cards_arm "$out"; then
+    why=$TWOCARD_WHY
+    [ "$rc" = 0 ] || why="exited $rc; $why"
+    fail_row "" "${r_tag#r}" "$i" "$rc" "$why" "$out"
+    return
+  fi
   # Two cards: an Xid, a card lost or off its cap, or an engine off the cards it was given fails the arm.
   # Ours is held to its load record's cards (bp both, a the A6000 alone) once it exited 0; a reference,
   # given the A6000 alone, to its log's one device (exllamav3 prints none: its CUDA_VISIBLE_DEVICES is the
