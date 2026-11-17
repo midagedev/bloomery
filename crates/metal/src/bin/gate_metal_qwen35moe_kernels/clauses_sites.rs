@@ -104,7 +104,7 @@ fn site_types(h: &Harness<'_>) -> Clause {
         denses += usize::from(quant.dense());
 
         let table = synthetic::matrix(quant, VOCAB, 2048, seed + 0x60);
-        let launched = run_embed(h, quant, &table, VOCAB, &[1]).map(|_| ());
+        let launched = run_embed(h, quant, &table, VOCAB, 2048, &[1]).map(|_| ());
         agrees(
             "embed",
             quant,

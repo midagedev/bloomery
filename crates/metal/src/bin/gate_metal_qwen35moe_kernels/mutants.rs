@@ -1051,6 +1051,16 @@ pub const MUTANTS: &[Mutant] = &[
         why: "an id past the vocabulary writes a zero row",
         edits: &[("value = NAN;", "value = 0.0f;", 1)],
     },
+    Mutant {
+        name: "embed_past_values",
+        clause: "embed_part_groups",
+        why: "the threads of the last group past the last value write too, past the rows",
+        edits: &[(
+            "const uint width = args.nblocks * per;\n    if ((ulong)gid >= (ulong)args.count * (ulong)width) {",
+            "const uint width = args.nblocks * per;\n    if ((ulong)gid >= (ulong)args.count * (ulong)width + 64ul) {",
+            1,
+        )],
+    },
     // A read the output never shows: only Metal's shader validation reports
     // it, so `row_tail` stays green and `row_tail_reads` runs the launches in a
     // child under the layer. It is that clause's control as well.

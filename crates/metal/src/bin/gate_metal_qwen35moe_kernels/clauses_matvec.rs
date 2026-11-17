@@ -252,6 +252,7 @@ fn suite_outputs(h: &Harness<'_>, fixture: &Fixture) -> Result<Vec<Vec<f32>>, St
         quant,
         table,
         vocab,
+        2048,
         &[3, 99, 4096],
     )?);
     Ok(out)

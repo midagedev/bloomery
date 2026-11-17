@@ -1225,6 +1225,10 @@ fn front<'a>(ctx: &'a ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
         ),
         ("embed", Box::new(|| ctx.with(clauses_embed::embed))),
         (
+            "embed_part_groups",
+            Box::new(|| clauses_embed::embed_part_groups(ctx.harness)),
+        ),
+        (
             "bias_rows",
             Box::new(|| clauses_bias::bias_rows(ctx.harness)),
         ),

@@ -81,9 +81,12 @@ impl Kernels {
             p.layer,
             word(WHAT, "the id count", count)?,
         ]);
-        // One thread per value, and a thread's index is a 32-bit word.
-        // The columns are a multiple of the group, so the value count is too.
-        word(WHAT, "the value count", values)?;
+        // One thread per value, and a thread's index is a 32-bit word. A
+        // type of 32- or 64-value blocks leaves values that are not whole
+        // groups (896 columns, Qwen2.5-0.5B's): the last group runs past them
+        // and the kernel returns for its threads past the last value.
+        let groups = values.div_ceil(GROUP_THREADS);
+        word(WHAT, "the thread count", groups * GROUP_THREADS)?;
         let pipeline = match p.quant {
             Quant::Q4K => &self.embed_q4k,
             Quant::A4 => &self.embed_a4,
@@ -108,6 +111,6 @@ impl Kernels {
         slot.set(Binding::of_mut(&p.out)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.fault.binding())?;
-        slot.dispatch_groups(values / GROUP_THREADS, 1, GROUP_THREADS)
+        slot.dispatch_groups(groups, 1, GROUP_THREADS)
     }
 }
