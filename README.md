@@ -130,9 +130,12 @@ The tarballs are on the [releases page](https://github.com/midagedev/bloomery/re
 From 0.3.11 the release carries an archive for the RTX 50 series (`linux-x86_64-cuda-sm120a`, compute capability 12.0:
 the RTX 5090 and the RTX PRO Blackwell cards), built for the Blackwell FP4 and FP8 tensor cores. The installer takes it
 when every GPU the machine lists is compute capability 12.0, and the `linux-x86_64-cuda-sm86` archive on any other
-machine, or from a release without the new one. Docker and Homebrew stay on the sm_86 archive. No maintainer machine
-has a 12.0 card, so this archive is checked by compiling it and by the users who run it; to take the sm_86 archive on
-such a card, download it by name from the releases page.
+machine, or from a release without the new one. Docker and Homebrew stay on the sm_86 archive. That build has no native
+FP4 products, so an RTX 5090 runs it as an Ampere card, and the model pick (`--model NAME`) then ranks GGUF files
+before FP4 folders. On a 12.0 card take the sm_120a archive: the installer does, or download
+`bloomery-<version>-linux-x86_64-cuda-sm120a.tar.gz` from the releases page. The maintainer's workstation is one
+RTX 5090 (compute capability 12.0). To take the sm_86 archive on such a card, download it by name from the releases
+page.
 
 ### Windows (WSL2)
 

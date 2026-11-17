@@ -9,7 +9,7 @@ own card counts. What you can check on your own machine, and what you cannot, is
 
 [`docs/BUILD.md`](docs/BUILD.md) has the toolchain (a pinned stable toolchain, cuda-oxide pinned by rev, CUDA 13.3) and one
 command block per model. Never build a device crate with plain `cargo`; use `cargo oxide` (`AGENTS.md`, "Never").
-The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:32`).
+The `cargo-oxide` install on a clean host has not been run yet ([`docs/BUILD.md`](docs/BUILD.md#toolchain)).
 
 ## What you can do without our hardware
 
@@ -49,8 +49,8 @@ The `cargo-oxide` install on a clean host has not been run yet (`docs/BUILD.md:3
   `no-review` label or five automatic reviews stop it. A proven defect it finds outside your change becomes a
   `review-bot` issue.
 - **Gates.** Run the `just gate-*` recipes `just affected` selects on your own card if you can
-  (`BLOOMERY_BOX_LOCAL=1 just gate-<name>` on a Linux machine with a card; the header of `tools/box.sh` has the
-  setup), and paste the commands and their output: we trust a run on your card. A maintainer runs what you could not on the workstation.
+  (`BLOOMERY_BOX_LOCAL=1 just gate-<name>` on a Linux machine with a card; section 3 of
+  [`docs/contrib/local-check.md`](docs/contrib/local-check.md#3-gates-on-your-own-card-local-mode) has the setup), and paste the commands and their output: we trust a run on your card. A maintainer runs what you could not on the workstation.
 - **Merge.** `main` takes changes only through a pull request, by rebase (linear history). A contributor with write
   access merges their own pull request once CI is green, the evidence is in it and Shingler approved it (or a
   maintainer did).

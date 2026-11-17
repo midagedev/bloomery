@@ -6,7 +6,9 @@ A checklist for a person or a coding agent (Claude Code, Codex) who wants to run
    RAM). Find the model's row under [Models and hardware](models.md#what-each-model-needs): the card it needs, the
    host RAM, the file size.
 2. **Use a release binary** ([Install](../README.md#install)). Building from source needs a pinned toolchain and a pinned
-   cuda-oxide rev ([`BUILD.md`](BUILD.md)); a release binary is the same code.
+   cuda-oxide rev ([`BUILD.md`](BUILD.md)); a release binary is the same code. An RTX 5090 takes the
+   `linux-x86_64-cuda-sm120a` archive (the installer picks it). The Docker image and Homebrew carry the sm_86 archive,
+   which a 5090 runs as an Ampere card.
 3. **Start it with `--hf`**, for example
    `bloomery-serve --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL --port 8080`. The first start downloads the files
    (and the MTP draft where the repo has one). The first start also compiles the kernels for the card once (the GB10 archive carries them compiled). The plan
@@ -46,8 +48,9 @@ model files and the reference dumps, and they are not a test suite for an evalua
 
 ## Help wanted: hardware we have not run
 
-We test on Ampere cards (RTX 3090, RTX A6000, RTX 3060) and one AMD CPU. An RTX 5090 (Blackwell) has run
-([#2](https://github.com/midagedev/bloomery/issues/2)), and a contributor ran a DGX Spark (GB10, aarch64) from a source
+We test on Ampere cards (RTX 3090, RTX A6000, RTX 3060) and one AMD CPU. The maintainer's workstation is one RTX 5090
+(Blackwell, compute capability 12.0), and another RTX 5090 has run
+([#2](https://github.com/midagedev/bloomery/issues/2)). A contributor ran a DGX Spark (GB10, aarch64) from a source
 build. If you have an Ada card (RTX 40xx, L40S), another Blackwell card, an Intel host, or a multi-card machine, please
 run the checklist above and file a
 [hardware report](https://github.com/midagedev/bloomery/issues/new?template=hardware-report.md). A report that it

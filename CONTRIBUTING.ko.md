@@ -37,7 +37,7 @@
   나갈 때까지 승인하지 않습니다. draft, `no-review` 라벨,
   자동 리뷰 5회에서 멈춥니다. 변경 밖에서 입증된 결함을 찾으면 `review-bot` 이슈로 올립니다.
 - **게이트.** `just affected`가 고른 `just gate-*`를 가진 카드에서 돌릴 수 있으면 돌리고(카드가 있는 Linux 머신에서
-  `BLOOMERY_BOX_LOCAL=1 just gate-<이름>`, 준비는 `tools/box.sh` 머리말에 있습니다), **실제로 돌린 명령과 출력**을
+  `BLOOMERY_BOX_LOCAL=1 just gate-<이름>`, 준비는 [`docs/contrib/local-check.md`](docs/contrib/local-check.md#3-gates-on-your-own-card-local-mode) 3절에 있습니다), **실제로 돌린 명령과 출력**을
   PR에 붙여 주세요. 내 카드에서 돌린 결과는 그대로 믿습니다. 돌리지 못한 것은 메인테이너가 워크스테이션에서 돌립니다.
 - **머지.** `main`은 PR로만, rebase로만 받습니다(이력은 일직선). 쓰기 권한이 있는 기여자는 CI가 초록이고 근거가 PR에
   있고 Shingler(또는 메인테이너)가 승인했으면 자기 PR을 직접 머지합니다.

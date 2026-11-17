@@ -47,6 +47,8 @@ section. NVMe is recommended: a load streams the file to the card, and V4.1 read
 
 ### What each model needs
 
+A 32 GB card (RTX 5090) has no column here: [One 32 GB card](#one-32-gb-card-rtx-5090) below.
+
 | Model | GPU | Host RAM | Disk (the file) |
 |---|---|---|---|
 | Clef-Flash | 12 GB covers every quantization (the files run 4.80–9.68 GB) | any | 4.8–9.7 GB; a `qwen35`-layout file adds the release's head (243 MB, fetched) |
@@ -102,3 +104,38 @@ as one pool. Serving on a Spark, Qwen3.8's checkpoint folders and the memory eac
 The machines that have run it are in the README's [Hardware](../README.md#hardware) section; an RTX 3060 12 GB under
 WSL2 ran Clef-Flash, its download and its cache. Other cards and drivers are untested: please open an issue with
 `--version` and the error text. Costs per part: [`HARDWARE.md`](HARDWARE.md).
+
+### One 32 GB card (RTX 5090)
+
+This is what the unset placement (`--place a`) does on one RTX 5090 with one slot. A figure marked [derived] is not a
+measurement: it comes from the placement planner run on a Mac for the card's free bytes, or from one V4.1 plan line
+printed on the maintainer's RTX 5090 (ctx 16,384). `bloomery-serve --recommend --json` names the file the model pick
+takes on your machine, and `-m <file> --place a --plan` prints that file's plan. A contributor's measured RTX 5090
+speeds are in [`numbers.md`](numbers.md#rtx-5090-qwen36-35b-a3b-with-its-mtp-draft-by-juliankang4) and the README's
+status tables.
+
+| Model | Where it runs | Host RAM |
+|---|---|---|
+| Qwen3.6-35B-A3B, Ornith-1.5-35B-A3B, Sage-A1.5, Qwen3-30B-A3B (`Q4_K_M`), Raon-1-mini, Nemotron 3.5 Bolt, Nemotron 3 Nano 4B, Clef-Flash, lev | Whole on the card, as on a 24 GB card [derived: each runs whole on 24 GB or less, in the table above]. | As in the table above. |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` (111.3 GB) | The card holds the dense layers and part of the routed experts, the host the rest; the MTP draft takes part of the card's room [derived at the K/V floor of 8,192 positions]. | A room of about 86 GB keeps the 28.8 GB PLE table in host RAM; a smaller room moves it to the NVMe tier and the need falls to about 58 GB [derived]. Neither counts the host K/V pages a long sequence spills: 6.6 GB for one sequence of 262,144 positions [derived]. |
+| Qwen3.8-Flash-Next `UD-Q3_K_XL` (90.0 GB) | As `UD-Q4_K_XL`, with more experts on the card [derived]. | A room of about 65 GB keeps the table in host RAM; a smaller room moves it to the NVMe tier and the need falls to about 37 GB [derived]. |
+| DeepSeek-V4.1-Flash `bq3km` (347.4 GB) | At ctx 16,384 the card holds about 26.6 GB of the 258.8 GB of the 15,360 routed experts, and the host leg is about 232 GB [derived from the plan line]. Each position of context adds 40,960 bytes of host shadow per slot [derived]. | By room, in the next table. |
+| GLM-5.3-Flash, MiniMax-M3, Muse Spark Open, Solar-Open2 | The card holds the dense layers, the attention, the KV cache and as many routed experts as fit; the host holds the rest, and the NVMe tier pages what the host's room cannot hold ([Serving](serving.md#54-when-the-host-cannot-hold-the-experts-either)). | No figure for 32 GB: `--plan` on the file gives it. |
+| MiMo-V2.6-Flash, MiniMax-M3.1-Flash | The same split, with no NVMe tier: a room that cannot hold the host leg is refused by name. | No figure for 32 GB: `--plan` on the file gives it. |
+
+The room is the host's `MemAvailable` less 512 MiB, at most 263.4 GB. A host of 64, 96, 128, 192 and 256 GiB reads a
+room of about 60, 94, 128, 195 and 263 GB [assumed: `MemAvailable` is about 98 % of the RAM less 6.7 GB; read `free -b`
+for yours]. V4.1 `bq3km` at ctx 16,384 [derived]:
+
+| Host RAM | Room (GB) | Host leg held in RAM (GB) | Read from the drive (GB) |
+|---|---|---|---|
+| 256 GiB and up | 263 | 232 | 0 |
+| 192 GiB | 195 | 177 | 55 |
+| 128 GiB | 128 | 110 | 122 |
+| 96 GiB | 94 | about 6, plus an arena of about 70 | about 226 |
+| 64 GiB | 60 | about 6, plus an arena of about 36 | about 226 |
+
+From a room of about 116 GB (half the host leg) to about 238 GB the plan pages about 250 GB less the room through the
+file mapping. Below 116 GB it switches to the RAM arena, which caches the drive's reads, so decode runs at the drive's
+pace on every expert the arena misses. A V4.1 start under about 24 GB of room is refused by name [derived]. The rows of
+Kimi K3, Kimi K3.1 Pro, K-EXAONE-2.0 and DeepSeek-V2-Lite-Chat have no 32 GB figure.
