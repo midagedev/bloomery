@@ -22,6 +22,17 @@
 # card still runs (a card has fallen off the bus before). A consumer that needs a card refuses
 # by name when it finds the variable empty.
 
+# cards_smi <fields>: nvidia-smi's `--query-gpu=<fields>` list (csv, no header) on stdout with its stderr, its status returned, cut at 30 s where
+# there is a `timeout` (a Mac has none). The one query of this file, so a card that hangs the driver ends a call here and nowhere else; read it
+# in a substitution (`out=$(cards_smi uuid) || rc=$?`), which leaves no child behind that a signal to the caller must reach.
+cards_smi() {
+  if command -v timeout > /dev/null; then
+    timeout --kill-after=5 30 nvidia-smi --query-gpu="$1" --format=csv,noheader 2>&1
+  else
+    nvidia-smi --query-gpu="$1" --format=csv,noheader 2>&1
+  fi
+}
+
 # cards_view: the cards in view, by UUID, space-separated in CARDS_VIEW and counted in CARDS_VIEW_N: CUDA_VISIBLE_DEVICES's
 # entries in its order, or every card nvidia-smi lists, in its order, when it is unset. An entry is a card's UUID, or a
 # prefix of one that names one card (CUDA takes either), or its index in nvidia-smi's list. nvidia-smi lists by PCI bus,
@@ -33,11 +44,7 @@
 cards_view() {
   local out rc=0 e u hit listed=()
   CARDS_VIEW='' CARDS_VIEW_N=0 CARDS_VIEW_WHY='' CARDS_VIEW_KIND=''
-  if command -v timeout > /dev/null; then
-    out=$(timeout --kill-after=5 30 nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1) || rc=$?
-  else
-    out=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>&1) || rc=$?
-  fi
+  out=$(cards_smi uuid) || rc=$?
   if [ "$rc" != 0 ]; then
     CARDS_VIEW_WHY="nvidia-smi --query-gpu=uuid failed (rc $rc): ${out%%$'\n'*}" CARDS_VIEW_KIND=smi
     return 1
@@ -107,11 +114,7 @@ cards_pin_check() {
   [ -n "$CUDA_VISIBLE_DEVICES" ] || return 0
   cards_view && return 0
   case $CARDS_VIEW_KIND in smi | gone) ;; *) return 0 ;; esac
-  if command -v timeout > /dev/null; then
-    out=$(timeout --kill-after=5 30 nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>&1) || rc=$?
-  else
-    out=$(nvidia-smi --query-gpu=name,uuid --format=csv,noheader 2>&1) || rc=$?
-  fi
+  out=$(cards_smi name,uuid) || rc=$?
   if [ "$rc" != 0 ] || [ -z "$out" ]; then
     listed="nothing (nvidia-smi rc $rc${out:+: ${out%%$'\n'*}})"
   else

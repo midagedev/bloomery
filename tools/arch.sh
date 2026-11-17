@@ -2,7 +2,9 @@
 # shellcheck shell=bash
 # The CUDA build target: BLOOMERY_ARCH, otherwise the native block-scaled target of the visible cards' compute capability
 # when every card has the same one (sm_120a on 12.0, the RTX 50 series; sm_121a on 12.1, GB10), and sm_86 elsewhere.
-# The justfile exports this choice so builds and the tools that inspect them agree.
+# It is read on the machine that builds: tools/box.sh runs it there, after the environment file, for a command that names
+# $BLOOMERY_ARCH (every recipe's `--arch {{arch}}`) or spells an arch, and exports the value, so the build and the tools that
+# inspect it agree. The justfile does not run it: `just` on a machine with no card would answer sm_86 for the box's cards.
 #
 # The value is `sm_` and the capability's digits, with the `a` or `f` suffix cargo-oxide accepts: sm_86, sm_121,
 # sm_121a. Anything else is refused by name, set-and-empty included: a recipe would hand `--arch ` to cargo-oxide.

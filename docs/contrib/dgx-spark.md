@@ -325,8 +325,10 @@ is settled by reading.
 GB10 recipes build for `sm_121a`, the native FP4 target of section 2.1, and the driver compiles that PTX at the first
 start. A machine whose every card is cc 12.0 builds `sm_120a`, and every other machine `sm_86`.
 
-- **Targets today.** Recipes pass `--arch {{arch}}` from `tools/arch.sh` and export the selected `BLOOMERY_ARCH` to
-  their tools. `tools/gate.sh`, `tools/lds-scan.sh` and `tools/sass-scan.sh` use the same selector. `tools/ptx-scan.sh`
+- **Targets today.** Recipes pass `--arch {{arch}}`, which the justfile leaves as the shell word `$BLOOMERY_ARCH`:
+  where the command runs, `tools/arch.sh` selects it from the machine's environment file or cards (`tools/box.sh` runs
+  that on the box, so a recipe sent from a machine with no card builds for the box's), and the tools read the same
+  `BLOOMERY_ARCH`. `tools/gate.sh`, `tools/lds-scan.sh` and `tools/sass-scan.sh` use the same selector. `tools/ptx-scan.sh`
   accepts `sm_86`, `sm_120` and `sm_121`, including the Blackwell `a` and `f` suffixes; its occupancy columns and the
   spill tables follow the compiled target and the card's compute capability.
 - **Documented state.** `docs/cuda-oxide.md:5` names Ampere (`sm_86`) and the GB10 at `sm_121a`. The

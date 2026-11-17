@@ -9,9 +9,13 @@
 # The card check a timed recipe runs first in its box command, before any build (tools/ref/card-precheck.sh).
 precheck := 'bash tools/ref/card-precheck.sh'
 
-# The shared target selector also supplies the tools that inspect each build.
-arch := `bash tools/arch.sh`
-export BLOOMERY_ARCH := arch
+# The device arch is the machine's that builds, and `just` on a machine with no card (the Mac) has none to offer: a recipe's
+# `{{arch}}` is the word `$BLOOMERY_ARCH`, which the box command expands where it runs, and tools/box.sh selects it there
+# (tools/arch.sh on that machine's environment file and cards) and exports it to the command and the tools it starts. A caller
+# that names BLOOMERY_ARCH builds for that arch instead. The justfile exports none: a guess exported would read as a name.
+# PIN(2026-11-17): it was `arch := `bash tools/arch.sh`` with `export BLOOMERY_ARCH := arch`, the arch of the machine running
+# just, so every recipe a Mac sent to the RTX 5090 box built the Mac's default there (tools/check-recipes.sh's arch owner holds this shape).
+arch := '$BLOOMERY_ARCH'
 
 # A recipe that builds a shipped bin (tools/release/build.sh's BINS) builds it with that file's
 # feature list, spelled out: the gates of a shipped bin run the binary the release packs, a recipe parameter in a
@@ -3561,7 +3565,7 @@ gate-gpu-qwen38-twocard *ARGS='--union --residency --prompt4k --slots':
 [group('solo')]
 [group('v41-load')]
 gate-gpu-qwen3moe-twocard:
-    BLOOMERY_MODEL=qwen35moe BLOOMERY_CARD=both ./tools/box.sh "q3=\$(env -u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL=qwen3moe bash -c '. tools/ref/ref-paths.sh && printf %s \"\$MODEL\"') && q35=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_twocard && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_qwen3moe_twocard \"\$q3\" \"\$q35\""
+    BLOOMERY_MODEL=qwen35moe BLOOMERY_CARD=both ./tools/box.sh "q3=\$(env -u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL=qwen3moe bash -c '. tools/ref/ref-paths.sh && printf %s \"\$MODEL\"') && q35=\$(. tools/ref/ref-paths.sh && printf %s \"\$MODEL\") && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch \{{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_twocard && BLOOMERY_GATE_BOUND=1200 bash tools/gpu-gate.sh gate_qwen3moe_twocard \"\$q3\" \"\$q35\""
 
 # Qwen3.8's plan (b′) with its expert tier on a tier node (docs/contrib/dgx-spark.md 9.5 items 5 and 6): node 0, a child
 # of the gate with BLOOMERY_TIER_NODES set, and node 1, tier_server, over loopback on this machine's card, the tier's page

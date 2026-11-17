@@ -751,6 +751,10 @@ case "$*" in
 esac
 SMI
 chmod +x "$tmp/pins/nvidia-smi"
+# A cc 8.6 card (tools/arch.sh's compute_cap query): the arch an unnamed command selects there is sm_86.
+mkdir -p "$tmp/smi86"
+printf '#!/bin/sh\nprintf "8.6\\n"\n' > "$tmp/smi86/nvidia-smi"
+chmod +x "$tmp/smi86/nvidia-smi"
 # The copy under test has its drop wait and its sync wait shrunk (box.sh's constants' lines): a retried drop would wait 5 s a time.
 sed -e 's/^DROP_WAIT=5 /DROP_WAIT=0 /' -e 's/^SYNC_WAIT=120 /SYNC_WAIT=1 /' -e 's/^SYNC_POLL=2 /SYNC_POLL=0.2 /' "$ROOT/tools/box.sh" > "$B/tools/box.sh"
 chmod +x "$B/tools/box.sh"
@@ -932,16 +936,40 @@ for bad in sm121 '' SM_86 sm_8; do
   run "box.sh: BLOOMERY_ARCH='$bad' is refused" 64 "BLOOMERY_ARCH is a CUDA arch.*got '$bad'" box env BLOOMERY_ARCH="$bad" "$B/tools/box.sh" true
   if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail "box.sh: the refused BLOOMERY_ARCH='$bad' reached ssh or rsync" 'something ran' "$tmp/ssh.log"; else pass "box.sh: the refused BLOOMERY_ARCH='$bad' reached no ssh or rsync"; fi
 done
-run 'box.sh: BLOOMERY_ARCH and a different BLOOMERY_BOX_ENV entry are refused' 64 "BLOOMERY_ARCH is 'sm_86' in BLOOMERY_BOX_ENV and 'sm_121' in the environment \(unset: the tools/arch.sh selection\): name it in the environment" \
+run 'box.sh: BLOOMERY_ARCH and a different BLOOMERY_BOX_ENV entry are refused' 64 "BLOOMERY_ARCH is 'sm_86' in BLOOMERY_BOX_ENV and 'sm_121' in the environment: name it once" \
   box env BLOOMERY_ARCH=sm_121 BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_86 "$B/tools/box.sh" true
 if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail 'box.sh: the contradicting BLOOMERY_ARCH reached ssh or rsync' 'something ran' "$tmp/ssh.log"; else pass 'box.sh: the contradicting BLOOMERY_ARCH reached no ssh or rsync'; fi
-# An entry with the environment unset is measured against the default: the recipes expanded --arch sm_86 on this side.
-run 'box.sh: a BLOOMERY_BOX_ENV arch entry that is not the default, with BLOOMERY_ARCH unset, is refused' 64 "BLOOMERY_ARCH is 'sm_121' in BLOOMERY_BOX_ENV and 'sm_86' in the environment \(unset: the tools/arch.sh selection\)" \
-  box env BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_121 "$B/tools/box.sh" true
-if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail 'box.sh: the unset-environment BLOOMERY_ARCH entry reached ssh or rsync' 'something ran' "$tmp/ssh.log"; else pass 'box.sh: the unset-environment BLOOMERY_ARCH entry reached no ssh or rsync'; fi
+# PIN(2026-11-17): an entry with the environment unset used to be measured against this side's default (the recipes expanded --arch sm_86
+# here) and refused unless it was that. A recipe carries no arch now, so the entry alone names it, as the variable does.
+rc_is 'box.sh: a BLOOMERY_BOX_ENV arch entry with BLOOMERY_ARCH unset names the arch' 0 box env BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_121 "$B/tools/box.sh" true
+sshlog 'box.sh: the entry alone is exported' 'export BLOOMERY_ARCH=sm_121 && .*true$'
+run 'box.sh: a BLOOMERY_BOX_ENV arch entry that is no arch is refused by name' 64 "BLOOMERY_ARCH is a CUDA arch.*got 'sm121'" box env BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm121 "$B/tools/box.sh" true
+if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail 'box.sh: the malformed BLOOMERY_ARCH entry reached ssh or rsync' 'something ran' "$tmp/ssh.log"; else pass 'box.sh: the malformed BLOOMERY_ARCH entry reached no ssh or rsync'; fi
 rc_is 'box.sh: a BLOOMERY_BOX_ENV arch entry equal to the default runs' 0 box env BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_86 "$B/tools/box.sh" true
 sshlog 'box.sh: the entry is the only export of BLOOMERY_ARCH' 'export BLOOMERY_ARCH=sm_86 && .*true$'
 if [ "$(grep -o 'export BLOOMERY_ARCH=' "$tmp/ssh.log" | wc -l | tr -d ' ')" = 1 ]; then pass 'box.sh: the entry alone exports BLOOMERY_ARCH once'; else fail 'box.sh: the entry alone exports BLOOMERY_ARCH once' 'not once' "$tmp/ssh.log"; fi
+# A command that names $BLOOMERY_ARCH (a recipe's `{{arch}}`) with no arch named here gets it selected where it runs, after the environment file
+# and BLOOMERY_BOX_ENV: tools/arch.sh sourced and run on that machine, before the command; this side exports none and reads no card.
+ARCHCMD='cargo build --arch $BLOOMERY_ARCH -- -p x'
+rc_is 'box.sh: a command that names $BLOOMERY_ARCH, none named here, runs' 0 box "$B/tools/box.sh" "$ARCHCMD"
+sshlog 'box.sh: its arch is selected on the machine, after BLOOMERY_BOX_ENV and before the command' \
+  'bloomery_arch box\.sh \|\| exit \$\?; \} && .*cargo build --arch \$BLOOMERY_ARCH -- -p x$'
+if grep -q 'export BLOOMERY_ARCH=' "$tmp/ssh.log"; then fail 'box.sh: an unnamed arch is exported from this side' 'the command exports it' "$tmp/ssh.log"; else pass 'box.sh: an unnamed arch is exported from this side by nobody'; fi
+rc_is 'box.sh: a command that names $BLOOMERY_ARCH with BLOOMERY_BOX_ENV runs' 0 box env BLOOMERY_BOX_ENV=CARGO_HOME=/opt/c "$B/tools/box.sh" "$ARCHCMD"
+sshlog 'box.sh: the selection runs after the BLOOMERY_BOX_ENV exports' 'export CARGO_HOME=/opt/c && .*bloomery_arch box\.sh'
+rc_is 'box.sh: a read that names $BLOOMERY_ARCH runs' 0 box env BLOOMERY_BOX_READONLY=1 BLOOMERY_REMOTE='~/repo/x' "$B/tools/box.sh" 'echo $BLOOMERY_ARCH'
+if grep -q 'bloomery_arch' "$tmp/ssh.log"; then fail 'box.sh: a read selects an arch' 'the command selects it' "$tmp/ssh.log"; else pass 'box.sh: a read selects no arch'; fi
+rc_is 'box.sh: a command that names no arch selects none' 0 box "$B/tools/box.sh" 'cargo check'
+if grep -q 'bloomery_arch' "$tmp/ssh.log"; then fail 'box.sh: a command that names no arch selects one' 'the command selects it' "$tmp/ssh.log"; else pass 'box.sh: a command that names no arch reads no card for one'; fi
+# A spelled arch (`cargo oxide … --arch sm_NN`): refused before anything is synced when an arch was named here and it differs; otherwise
+# the machine checks it against the one it selects.
+run 'box.sh: a spelled --arch that contradicts BLOOMERY_ARCH is refused here' 64 'the command builds --arch sm_86, and BLOOMERY_ARCH is sm_121: name the arch once' \
+  box env BLOOMERY_ARCH=sm_121 "$B/tools/box.sh" 'cargo oxide build --arch sm_86 -- -p x'
+if [ -s "$tmp/ssh.log" ] || [ -e "$tmp/rsync.log" ]; then fail 'box.sh: the contradicting --arch reached ssh or rsync' 'something ran' "$tmp/ssh.log"; else pass 'box.sh: the contradicting --arch reached no ssh or rsync'; fi
+rc_is 'box.sh: a spelled --arch equal to BLOOMERY_ARCH runs' 0 box env BLOOMERY_ARCH=sm_121 "$B/tools/box.sh" 'cargo oxide build --arch sm_121 -- -p x'
+rc_is 'box.sh: a spelled --arch with no arch named here runs' 0 box "$B/tools/box.sh" 'cargo oxide build --arch sm_121a -- -p x'
+sshlog 'box.sh: the machine checks the spelled --arch against the arch it selects' \
+  'bloomery_arch box\.sh \|\| exit \$\?; \} && \{ \[ "\$BLOOMERY_ARCH" = sm_121a \] \|\| \{ echo "box\.sh: the command builds --arch sm_121a, and the arch selected on this machine is'
 rm -f "$B/tools/arch.sh"
 
 # The box queue (BLOOMERY_BOX_QUEUE=1): the call syncs behind the remote directory's lock and submits the command as a job
@@ -1185,6 +1213,19 @@ qrc() {
   printf '%s\n' "$QID" > "$QH/repo/x/.sync-id"
   rc_is "$name" "$want" env -u SIGNALBOX_CARD HOME="$QH" PATH="$Q/bin:$PATH" "$@" bash -c "$(cat "$Q/job.sh")"
 }
+# A queued job is the same command text: the arch is selected where the job runs (here the stub card says cc 12.0), and a named one is
+# exported ahead of the command.
+cp "$ROOT/tools/arch.sh" "$QH/repo/x/tools/"
+cp "$ROOT/tools/arch.sh" "$B/tools/arch.sh"
+qjob -- 'echo "arch=$BLOOMERY_ARCH"'
+if grep -q 'bloomery_arch box\.sh' "$Q/job.sh" && ! grep -q 'export BLOOMERY_ARCH=' "$Q/job.sh"; then pass 'queue: an unnamed arch is selected in the job, not exported by the submitter'; else fail 'queue: an unnamed arch is selected in the job' 'no selection, or an export' "$Q/job.sh"; fi
+qrun 'queue: the job builds for the cards of the machine it runs on (cc 12.0: sm_120a)' 0 '^arch=sm_120a$' PATH="$tmp/pins:$Q/bin:$PATH" STUB_UUIDS=GPU-default
+qjob BLOOMERY_ARCH=sm_121 -- 'echo "arch=$BLOOMERY_ARCH"'
+qrun 'queue: a named arch wins over the cards of the machine the job runs on' 0 '^arch=sm_121$' PATH="$tmp/pins:$Q/bin:$PATH" STUB_UUIDS=GPU-default
+# The batch's manifest call carries a named arch, so the key's arch row is the one its items build with.
+rc_is 'box.sh: the manifest call of a batch that names an arch runs' 0 box env BLOOMERY_ARCH=sm_121 "$B/tools/box.sh" 'python3 tools/recipes.py box-manifest'
+sshlog 'box.sh: a named arch reaches the manifest call, so its arch row is the batch name' 'export BLOOMERY_ARCH=sm_121 && .*python3 tools/recipes\.py box-manifest$'
+rm -f "$B/tools/arch.sh"
 # Execute the wrapper commands, not a copy of their selector: a stale compiler must
 # stop the entire job before the build starts. BLOOMERY_BOX_ENV selects the install.
 mkdir -p "$QH/repo/x/tools/release"
@@ -1383,9 +1424,40 @@ else
     boxl BLOOMERY_LOCK_DIR=/root "$B/tools/box.sh" "$SHOW"
   run 'box.sh: local mode refuses a relative lock directory, which two trees would read apart' 64 "BLOOMERY_LOCK_DIR 'rel-locks' is relative" \
     boxl BLOOMERY_LOCK_DIR=rel-locks "$B/tools/box.sh" "$SHOW"
+  # The arch is selected on the machine that runs the command (here the stub card says cc 12.0, as the box's 5090 does and the Mac, which
+  # has no card, does not): a recipe sent as `just` writes it, `--arch $BLOOMERY_ARCH`, builds for the cards there. The recipes used to carry
+  # the arch of the machine that ran `just` (sm_86 on a Mac) and export it as a name. FAIL-first: on the code before it, the first two of
+  # these print `arch=` (nothing selected) and the environment file's arch is refused (64).
+  cp "$ROOT/tools/arch.sh" "$B/tools/"
+  run 'box.sh: an unnamed arch is the one the cards of the machine select (cc 12.0: sm_120a)' 0 '^arch=sm_120a$' \
+    boxl "${PINS[@]}" "$B/tools/box.sh" 'echo "arch=$BLOOMERY_ARCH"'
+  JARCH=$(cd "$ROOT" && just --evaluate arch)
+  run "box.sh: the justfile's arch word, sent as a recipe sends it, builds for the cards of the machine" 0 '^built --arch sm_120a$' \
+    boxl "${PINS[@]}" "$B/tools/box.sh" "echo built --arch $JARCH"
+  run 'box.sh: a cc 8.6 machine selects sm_86 for the same command' 0 '^arch=sm_86$' \
+    boxl PATH="$tmp/smi86:$tmp/uname:$tmp/stub:$PATH" "$B/tools/box.sh" 'echo "arch=$BLOOMERY_ARCH"'
   printf 'export BLOOMERY_ARCH=sm_121\n' > "$tmp/arch-env.sh"
-  run "box.sh: local mode refuses an environment file's BLOOMERY_ARCH that the recipe did not expand" 64 \
-    'the environment file set BLOOMERY_ARCH=sm_121, and the recipe expanded sm_86' boxl BLOOMERY_ENV_FILE="$tmp/arch-env.sh" "$B/tools/box.sh" "$SHOW"
+  # PIN(2026-11-17): local mode refused an environment file's BLOOMERY_ARCH that the recipe's expansion (this side's, unset: sm_86) did not
+  # match. The expansion is the machine's own selection now, and its environment file is the first thing that selection reads.
+  run "box.sh: an environment file's BLOOMERY_ARCH is the arch of an unnamed command" 0 '^arch=sm_121$' \
+    boxl "${PINS[@]}" BLOOMERY_ENV_FILE="$tmp/arch-env.sh" "$B/tools/box.sh" 'echo "arch=$BLOOMERY_ARCH"'
+  run "box.sh: a named arch wins over the environment file's (a build for another arch than the cards')" 0 '^arch=sm_86$' \
+    boxl "${PINS[@]}" BLOOMERY_ARCH=sm_86 BLOOMERY_ENV_FILE="$tmp/arch-env.sh" "$B/tools/box.sh" 'echo "arch=$BLOOMERY_ARCH"'
+  run 'box.sh: a BLOOMERY_BOX_ENV arch entry is the arch of the command' 0 '^arch=sm_121a$' \
+    boxl "${PINS[@]}" BLOOMERY_BOX_ENV=BLOOMERY_ARCH=sm_121a "$B/tools/box.sh" 'echo "arch=$BLOOMERY_ARCH"'
+  run 'box.sh: a read selects no arch' 0 '^arch=unset$' \
+    boxl "${PINS[@]}" BLOOMERY_BOX_READONLY=1 "$B/tools/box.sh" 'echo "arch=${BLOOMERY_ARCH-unset}"'
+  run 'box.sh: a spelled --arch that is not the one the machine selects is refused by name, and the command does not run' 64 \
+    'the command builds --arch sm_86, and the arch selected on this machine is sm_120a' \
+    boxl "${PINS[@]}" "$B/tools/box.sh" 'echo oxide build --arch sm_86'
+  if grep -q '^oxide build' "$tmp/out"; then fail 'box.sh: the contradicting spelled --arch ran the command' 'the command ran' "$tmp/out"; else pass 'box.sh: the contradicting spelled --arch ran no command'; fi
+  run 'box.sh: a spelled --arch equal to the one the machine selects runs' 0 '^oxide build --arch sm_120a$' \
+    boxl "${PINS[@]}" "$B/tools/box.sh" 'echo oxide build --arch sm_120a'
+  run 'box.sh: a command that names $BLOOMERY_ARCH on a machine whose nvidia-smi fails is refused by name' 64 'cannot read the CUDA compute capability' \
+    boxl "${PINS[@]}" STUB_PIN_RC=9 "$B/tools/box.sh" 'echo "arch=$BLOOMERY_ARCH"'
+  if grep -q '^arch=' "$tmp/out"; then fail 'box.sh: the refused arch selection ran the command' 'the command ran' "$tmp/out"; else pass 'box.sh: the refused arch selection ran no command'; fi
+  run 'box.sh: a command that names no arch needs no card (a driver that fell off the bus stops only the builds)' 0 '^pwd=' \
+    boxl "${PINS[@]}" STUB_PIN_RC=9 "$B/tools/box.sh" "$SHOW"
   sel='echo "model=${BLOOMERY_MODEL-unset} card=${BLOOMERY_CARD-unset} local=${BLOOMERY_BOX_LOCAL-unset} env=${BLOOMERY_ENV_FILE-unset}'
   sel+=' queue=${BLOOMERY_BOX_QUEUE-unset} class=${BLOOMERY_Q_CLASS-unset} qcard=${BLOOMERY_Q_CARD-unset} pred=${BLOOMERY_Q_PRED_S-unset}'
   sel+=' budget=${BLOOMERY_CARD_BUDGET-unset} fixture=${BLOOMERY_FIXTURE_MODEL-unset} box=${BLOOMERY_BOX-unset} remote=${BLOOMERY_REMOTE-unset}'

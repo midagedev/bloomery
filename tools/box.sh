@@ -40,14 +40,18 @@
 #                             BLOOMERY_BOX_ENV entry, before the profile, for the same reason; only under BLOOMERY_TIER=fixture (the
 #                             real tier has no variant: 64), and both set to different tags is 64. ref-paths.sh resolves the file
 #                             and refuses a tag the table does not name.
-#   BLOOMERY_ARCH=<sm_NN>     the CUDA arch (tools/arch.sh, which the justfile's `arch` variable runs and exports).
-#                             Set, it is checked here before anything is synced and exported into the command, so a
-#                             tool that runs on the box (tools/gate.sh, the scans, tools/release/build.sh) reads what the
-#                             recipe's `--arch {{arch}}` expanded to on this side. A value that is no arch is 64, and so is a
-#                             BLOOMERY_ARCH entry of BLOOMERY_BOX_ENV that is not this side's value (tools/arch.sh's
-#                             selection when it is unset): the arch is named in the environment, where the recipes read it.
-#                             Unset with no such entry: every byte of the remote command as before, and tools/arch.sh is
-#                             not read.
+#   BLOOMERY_ARCH=<sm_NN>     the CUDA arch of the build (tools/arch.sh). The arch is the machine's that builds, so a recipe carries
+#                             none: its `{{arch}}` is the word `$BLOOMERY_ARCH`, which the command expands where it runs (the justfile
+#                             exports none either: `just` on a machine with no card, the Mac, has no arch to offer, and a guess exported
+#                             would read as a name). A command that names $BLOOMERY_ARCH or spells `cargo oxide … --arch <sm_NN>` gets it
+#                             selected on the machine it runs on, after the environment file and BLOOMERY_BOX_ENV (tools/arch.sh: the
+#                             environment file's BLOOMERY_ARCH, else the capability of that machine's cards), exported for the command
+#                             and every tool it starts; one that names none reads no card, and a read (BLOOMERY_BOX_READONLY=1) none.
+#                             Set here, the value is a name, for a build for another arch than the machine's cards (the release's
+#                             sm_86 archive on an RTX 50 box): it is checked here before anything is synced, exported into the
+#                             command after the environment file, so it wins over the file's. A value that is no arch is 64, so is an entry of
+#                             BLOOMERY_BOX_ENV that is not the environment's (an entry alone names the arch, as the variable does), and so
+#                             is a spelled `--arch` that is not the named or selected value, before the command runs.
 #   BLOOMERY_BOX_READONLY=1   a read — ps, cat, tail, ls, nvidia-smi, a status probe — runs without the
 #                             guard and the hold on this side: the way to read a sitting's log, the owner's own
 #                             included, while it runs. Refused (64) when the command names cargo, just, make, cmake, ninja
@@ -63,8 +67,8 @@
 #                             ~/bloomery-env.sh; not there: 69). The timing lease, the holds and the gate locks live under
 #                             BLOOMERY_LOCK_DIR (a path from /, default ~/.cache/bloomery/locks, made when missing),
 #                             exported to the command, so the guard reads this machine's lease and holds; the environment
-#                             file or BLOOMERY_BOX_ENV moving it after the guard is refused (64), and so is an environment
-#                             file's BLOOMERY_ARCH that is not the one the recipe expanded. The cards are the ones in view,
+#                             file or BLOOMERY_BOX_ENV moving it after the guard is refused (64). The arch is this machine's
+#                             (BLOOMERY_ARCH above: its environment file's when it declares one). The cards are the ones in view,
 #                             no card's name: CUDA_VISIBLE_DEVICES is the caller's, then the environment file's and
 #                             BLOOMERY_BOX_ENV's when either sets one; unset shows every card the machine has (tools/ref/cards.sh's cards_view, the one
 #                             selector). The box side sees BLOOMERY_BOX_CARD=local (tools/gpu-gate.sh's one local lock,
@@ -1073,26 +1077,49 @@ if [ -n "$VARIANT" ] && [ "$TIER" != fixture ]; then
 fi
 VARX=
 [ -z "$VARIANT" ] || VARX="export BLOOMERY_FIXTURE_VARIANT=$VARIANT && "
-# The arch (the header), named before anything is synced: a refusal touches nothing on the box.
-ARCHX='' ARCH_ENTRY='' RECIPE_ARCH=sm_86
-ARCH_SEEN=0
+# The arch (the header), named before anything is synced: a refusal touches nothing on the box. Only an arch somebody NAMED crosses
+# from this side: BLOOMERY_ARCH in the environment (the justfile exports none: `just` on a machine with no card has no arch to offer, and
+# a guess exported would read as a name) or an entry of BLOOMERY_BOX_ENV. An unnamed arch is the one of the machine the command runs on,
+# selected there (ARCHR, below).
+ARCHX='' ARCH_ENTRY='' ARCH_SEEN=0 ARCH_VALUE=''
 for kv in ${box_env[@]+"${box_env[@]}"}; do
   if [ "${kv%%=*}" = BLOOMERY_ARCH ]; then
     ARCH_SEEN=1 ARCH_ENTRY=${kv#*=}
   fi
 done
 if [ -n "${BLOOMERY_ARCH+x}" ] || [ "$ARCH_SEEN" = 1 ]; then
-  # bloomery_arch exports its value, so whether the caller named the arch is read before it runs.
-  ARCH_NAMED=${BLOOMERY_ARCH+x}
   # shellcheck source=tools/arch.sh
   source "$HERE/tools/arch.sh"
-  bloomery_arch box.sh || exit $?
-  RECIPE_ARCH=$ARCH
-  if [ -n "$ARCH_NAMED" ]; then ARCHX="export BLOOMERY_ARCH=$ARCH && "; else unset BLOOMERY_ARCH; fi
-  if [ "$ARCH_SEEN" = 1 ] && [ "$ARCH_ENTRY" != "$ARCH" ]; then
-    echo "box.sh: BLOOMERY_ARCH is '$ARCH_ENTRY' in BLOOMERY_BOX_ENV and '$ARCH' in the environment (unset: the tools/arch.sh selection): name it in the environment, where the recipes read it" >&2
-    exit 64
+  if [ -n "${BLOOMERY_ARCH+x}" ]; then
+    bloomery_arch box.sh || exit $?
+    ARCH_VALUE=$ARCH ARCHX="export BLOOMERY_ARCH=$ARCH && "
+    if [ "$ARCH_SEEN" = 1 ] && [ "$ARCH_ENTRY" != "$ARCH" ]; then
+      echo "box.sh: BLOOMERY_ARCH is '$ARCH_ENTRY' in BLOOMERY_BOX_ENV and '$ARCH' in the environment: name it once" >&2
+      exit 64
+    fi
+  else
+    # An entry alone names the arch of the command (ENVS exports it); only its shape is read here.
+    ( BLOOMERY_ARCH=$ARCH_ENTRY; bloomery_arch box.sh ) || exit $?
+    ARCH_VALUE=$ARCH_ENTRY
   fi
+fi
+# An arch the command spells itself (`cargo oxide build --arch sm_86`) is a build for that arch, whatever tools/arch.sh would select on
+# the machine it runs on: the tools it runs there read BLOOMERY_ARCH, so a spelled arch that is not that value is refused by name, here
+# when an arch was named and on the machine itself when none was (ARCHR). A recipe spells none: its `{{arch}}` is `$BLOOMERY_ARCH`.
+ARCH_LITS=
+arch_rest=$*
+arch_re='oxide[^&|;]*--arch[[:space:]]+(sm_[0-9]+[af]?)([^A-Za-z0-9_]|$)'
+while [[ $arch_rest =~ $arch_re ]]; do
+  case " $ARCH_LITS " in *" ${BASH_REMATCH[1]} "*) ;; *) ARCH_LITS="$ARCH_LITS ${BASH_REMATCH[1]}" ;; esac
+  arch_rest=${arch_rest#*"${BASH_REMATCH[0]}"}
+done
+if [ -n "$ARCH_VALUE" ]; then
+  for arch_lit in $ARCH_LITS; do
+    if [ "$arch_lit" != "$ARCH_VALUE" ]; then
+      echo "box.sh: the command builds --arch $arch_lit, and BLOOMERY_ARCH is $ARCH_VALUE: name the arch once, in the environment, and write \$BLOOMERY_ARCH in the command" >&2
+      exit 64
+    fi
+  done
 fi
 QUEUE=0
 case ${BLOOMERY_BOX_QUEUE:-0} in
@@ -1441,12 +1468,11 @@ OXIDE="export CUDA_OXIDE_BACKEND=\$HOME/.cargo/cuda-oxide-bloomery/$OXREV/librus
 OXCLI='{ __h="${CARGO_HOME:-$HOME/.cargo}/bin"; __p="$__h/cargo-oxide"; case ":$PATH:" in *":$__h:"*) __p= ;; esac; { [ -f "$__p" ] && [ -x "$__p" ] || __p=$(type -P cargo-oxide); } && __p=$(readlink -f -- "$__p") || { echo "box.sh: cannot resolve cargo-oxide executable" >&2; exit 70; }; __r=$(dirname "$(dirname "$__p")"); __c=$(cargo install --list --root "$__r" 2>/dev/null) || { echo "box.sh: cannot read cargo-oxide install record at $__r" >&2; exit 70; }; __c=$(printf "%s\n" "$__c" | sed -n "s/^cargo-oxide v[^ ]* (.*#\([0-9a-f]\{7,\}\)).*/\1/p" | head -1); case OXREV in "$__c"*) [ -n "$__c" ] ;; *) false ;; esac || { echo "box.sh: the installed cargo-oxide at $__r is from rev ${__c:-none}, not the pin OXREV: install the pin into its own root, cargo install --locked --git https://github.com/NVIDIA/cuda-rust.git --rev OXREV --root ~/.cargo/cuda-oxide-bloomery/OXREV cargo-oxide (docs/BUILD.md)" >&2; exit 70; }; unset __h __p __r __c; } && '
 OXCLI=${OXCLI//OXREV/$OXREV}
 [ "$LOCAL" = 0 ] || OXIDE="unset CUDA_OXIDE_BACKEND && "
-# The guard probed LOCK_DIR and the recipe expanded its arch before the environment file and BLOOMERY_BOX_ENV ran; one of
-# them moving either would put the command's locks where the guard did not look, or build for another arch.
+# The guard probed LOCK_DIR before the environment file and BLOOMERY_BOX_ENV ran; one of them moving it would put the command's
+# locks where the guard did not look.
 LOCALX=
 if [ "$LOCAL" = 1 ]; then
   LOCALX="{ [ \"\${BLOOMERY_LOCK_DIR-}\" = $(printf %q "$LOCK_DIR") ] || { echo \"box.sh: the environment file or BLOOMERY_BOX_ENV set BLOOMERY_LOCK_DIR after local mode's guard probed the lock directory; set it before tools/box.sh\" >&2; exit 64; }; } && "
-  LOCALX+="{ [ \"\${BLOOMERY_ARCH:-sm_86}\" = $RECIPE_ARCH ] || { echo \"box.sh: the environment file set BLOOMERY_ARCH=\$BLOOMERY_ARCH, and the recipe expanded $RECIPE_ARCH (this side's BLOOMERY_ARCH, unset: sm_86): name it in the environment, where the recipes read it\" >&2; exit 64; }; } && "
 fi
 # Script-internal cargo-oxide calls, including locked GPU lib tests, share the pin check.
 # release/build.sh --check는 바이너리만 읽고 빌드하지 않으므로 거치지 않는다. 그 부분만 빼고 보므로,
@@ -1498,9 +1524,21 @@ fi
 # The environment file may declare the machine's cards as the cards in view (BLOOMERY_BOX_CARD=local): __cardmode reads that once the pick above
 # has run on it (the pick of a lane names no card then), and the command sees BLOOMERY_BOX_CARD=local, as in local mode, with the box's own
 # lock directory.
+# The arch of a command that names $BLOOMERY_ARCH (a recipe's `{{arch}}`) or spells one is selected on the machine it runs on, after the
+# environment file and BLOOMERY_BOX_ENV: tools/arch.sh's BLOOMERY_ARCH (the caller's, the environment file's or an entry's), else the
+# capability of that machine's cards, exported for the command and every tool it starts. A command that names none reads no card here,
+# so a driver that has fallen off the bus stops only the commands that build. A spelled arch that is not the selected one is refused
+# by name before the command runs (the check above made the same of an arch that was named on this side). A read is not selected for.
+ARCHR=
+if [ "$READONLY" = 0 ] && { [[ $* == *BLOOMERY_ARCH* ]] || [ -n "$ARCH_LITS" ]; }; then
+  ARCHR='{ . tools/arch.sh; bloomery_arch box.sh || exit $?; } && '
+  for arch_lit in $ARCH_LITS; do
+    ARCHR+="{ [ \"\$BLOOMERY_ARCH\" = $arch_lit ] || { echo \"box.sh: the command builds --arch $arch_lit, and the arch selected on this machine is \$BLOOMERY_ARCH (BLOOMERY_ARCH, the environment file's, else the capability of its cards): name BLOOMERY_ARCH=$arch_lit in the environment for a build for another arch, and write \\\$BLOOMERY_ARCH in the command\" >&2; exit 64; }; } && "
+  done
+fi
 REMOTE_CMD="source $ENVF && { $PICK
 __cardmode=\${BLOOMERY_BOX_CARD-}
-} && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && { [ \"\$__cardmode\" != local ] || export BLOOMERY_BOX_CARD=local; } && $GATEX$OXIDE$ARCHX$ENVS$PINCHK$OXCHECK$LOCALX$*"
+} && cd $DIR && $V41 && $TIERX$VARX$FWD$PROFILE && $DATA && export BLOOMERY_GIT_COMMIT=$COMMIT BLOOMERY_BOX_CARD=$BOXCARD && { [ \"\$__cardmode\" != local ] || export BLOOMERY_BOX_CARD=local; } && $GATEX$OXIDE$ARCHX$ENVS$ARCHR$PINCHK$OXCHECK$LOCALX$*"
 if [ "$LOCAL" = 1 ]; then
   # ssh carries no environment to the box: the command runs without what this side read, BLOOMERY_MODEL above all (the model
   # crate's tests read that name as a model path), without box.sh's own outputs, which only the profile sets, and without

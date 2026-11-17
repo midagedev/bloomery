@@ -9501,7 +9501,10 @@ def cmd_orphan_tests(args: argparse.Namespace) -> int:
 #   box       every line of the box manifest (`box-manifest`, fetched once per batch), its model rows
 #             only for the model directories the item can open (KeyContext.model_scope); the fixture
 #             rows (FIXTURE_ROOT) only for an item in the fixture tier, and of those only its family's
-#             fixture directory (KeyContext.fixture_dirs; every file under it)
+#             fixture directory (KeyContext.fixture_dirs; every file under it). Its `arch` row is the arch
+#             the box builds for (tools/arch.sh there: the environment file's BLOOMERY_ARCH, else its cards'
+#             capability, or the BLOOMERY_ARCH the batch named): the same tree and cards under another arch
+#             are another green, and a manifest with no such row is refused
 # Not in it: the binary (its paths are per track) and the commit.
 
 KEY_VERSION = "bloomery-gate-key 3"
@@ -11008,6 +11011,8 @@ class KeyContext:
         missing = sorted(need - listed)
         if missing:
             return [], f"the box manifest has no row for {missing[0]}, which {dirs[missing[0]]} names: the manifest was read from another tree or environment", None, ""
+        if not any(ln.startswith("arch\t") for ln in self.manifest):
+            return [], "the box manifest has no arch row: it was written by a tree older than the build arch's row (tools/recipes.py box-manifest), and a key without the arch would read a green built for one arch as another's", None, ""
         summary = f"scope=tree ({why})" if scope == "tree" else f"scope=closure ({why}; member versions {'left out' if blind else 'kept: ' + str(reader) + ' reads one'})"
         return parts, None, never, summary
 
@@ -11338,6 +11343,17 @@ def _run(cmd: list[str], **kw) -> str:
     return proc.stdout
 
 
+def manifest_arch(root: str) -> tuple:
+    """The manifest's `arch` row: the arch the box builds for, as tools/arch.sh selects it on this machine (BLOOMERY_ARCH when the
+    batch named one through tools/box.sh, else the environment file's, else the capability of the cards). A recipe's `--arch` is that
+    value, so a key without it would read a green built for one arch as a green for another. A selection that fails, or prints a
+    value that is no arch, is a named error: the manifest is never written without it."""
+    out = _run(["bash", os.path.join(root, "tools", "arch.sh")], cwd=root).strip()
+    if not re.fullmatch(r"sm_[1-9][0-9]{1,2}[af]?", out):
+        raise RecipeError(f"box-manifest: tools/arch.sh printed {out!r}, not a CUDA arch")
+    return ("arch", "build", out)
+
+
 def data_manifest(root: str, cache: HashCache, workers: int) -> tuple[list[tuple], int]:
     """One line per top-level entry of $BLOOMERY_DATA: a digest over (path, size, content sha256) of every
     file under it — a link by its target text, and its target's content when that is a file. The
@@ -11505,6 +11521,7 @@ def cmd_box_manifest(args: argparse.Namespace) -> int:
         for ln in _run(["nvidia-smi", "--query-gpu=index,name,uuid,driver_version,vbios_version", "--format=csv,noheader"]).splitlines():
             if ln.strip():
                 rows.append(("gpu", *[x.strip() for x in ln.split(",")]))
+        rows.append(manifest_arch(ROOT))
         rows.append(("tool", "rustc", "; ".join(_run(["rustc", "-vV"], cwd=ROOT).split("\n")).strip("; ")))
         llc = os.environ.get("CUDA_OXIDE_LLC", "")
         rows.append(("tool", "llc", "; ".join(ln.strip() for ln in _run([llc, "--version"]).splitlines() if "version" in ln.lower()) if llc else "unset"))
@@ -12077,7 +12094,7 @@ def manifest_self_test(expect) -> None:
     with tempfile.TemporaryDirectory(prefix="recipes-tables-") as tmp:
         mf = os.path.join(tmp, "box-manifest.txt")
         with open(mf, "w", encoding="utf-8") as fh:
-            fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\n# end\n")
+            fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\narch\tbuild\tsm_86\n# end\n")
         made: list[str] = []
 
         def build(g_toml: str, justfile: str = just, meta_toml: str | None = None) -> Side:
@@ -12234,7 +12251,7 @@ def root_manifest_self_test(expect) -> None:
     with tempfile.TemporaryDirectory(prefix="recipes-root-") as tmp:
         mf = os.path.join(tmp, "box-manifest.txt")
         with open(mf, "w", encoding="utf-8") as fh:
-            fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\n# end\n")
+            fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\narch\tbuild\tsm_86\n# end\n")
         made: list[str] = []
 
         def build(root_toml: str, member: tuple[str, ...] = ("g", "user"), justfile: str = just, depinfo: set[str] | None = None,
@@ -12485,7 +12502,7 @@ def lock_view_self_test(expect) -> None:
     with tempfile.TemporaryDirectory(prefix="recipes-lockview-") as tmp:
         mf = os.path.join(tmp, "box-manifest.txt")
         with open(mf, "w", encoding="utf-8") as fh:
-            fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\n# end\n")
+            fh.write(f"# {MANIFEST_VERSION} host=selftest data=/d\narch\tbuild\tsm_86\n# end\n")
         made: list[str] = []
 
         def deps_of(doc: dict) -> list[dict]:
@@ -13101,6 +13118,7 @@ def key_self_test(expect, pieces: tuple[str, ...]) -> None:
             "env\tbloomery-env.sh\t" + "a" * 64,
             "os\tkernel\t6.8.0",
             "gpu\t0\tNVIDIA GeForce RTX 3090\tGPU-0\t615.71.09\t94.02",
+            "arch\tbuild\tsm_86",
             "tool\trustc\trustc 1.95.0-nightly",
             "backend\tb9847e95\t" + "b" * 64 + "\tb9847e95",
             "data\tref/\t" + "c" * 64 + "\t10\t100",
@@ -13172,6 +13190,34 @@ def key_self_test(expect, pieces: tuple[str, ...]) -> None:
             finally:
                 os.rename(other, roots[0])
             expect(elsewhere == base, "a second checkout at another path gives other keys (a path is not relative)")
+
+            # The build arch is a row of the box manifest and every key holds it: one tree on one set of cards, built for another arch,
+            # is not the same green. Added 2026-11-17 (boxarch, when the recipes began to follow the box's cards: a green from the
+            # sm_86 builds the Mac's default sent would have stood for the sm_120a builds); FAIL-first: on the code before it the
+            # keys of the two arch rows are one key.
+            arch_row = "arch\tbuild\tsm_86"
+            expect(arch_row in manifest, "the fixture manifest holds no arch row")
+            write_manifest([ln.replace(arch_row, "arch\tbuild\tsm_120a") for ln in manifest])
+            m = moved(keys(sa))
+            write_manifest(manifest)
+            expect(m == set(items), f"another build arch in the box manifest moves {sorted(m)}, not every key")
+            write_manifest([ln for ln in manifest if ln != arch_row])
+            gone = keys(sa)
+            write_manifest(manifest)
+            expect(all(v.startswith("error: the box manifest has no arch row") for v in gone.values()),
+                   f"a box manifest without an arch row is keyed: {gone}")
+            # manifest_arch: tools/arch.sh's value as the row, and a selection that fails or prints no arch is named, never a row
+            arch_root = os.path.join(tmp, "arch-probe")
+            os.makedirs(os.path.join(arch_root, "tools"), exist_ok=True)
+            for printed, code, row in (("sm_120a", 0, ("arch", "build", "sm_120a")), ("sm_86", 0, ("arch", "build", "sm_86")),
+                                       ("sm_121a", 0, ("arch", "build", "sm_121a")), ("", 64, None), ("sm121", 0, None), ("", 0, None)):
+                with open(os.path.join(arch_root, "tools", "arch.sh"), "w", encoding="utf-8") as fh:
+                    fh.write(f"#!/usr/bin/env bash\n[ {code} = 0 ] || {{ echo 'arch.sh: refused' >&2; exit {code}; }}\nprintf '%s\\n' '{printed}'\n")
+                try:
+                    got = manifest_arch(arch_root)
+                except RecipeError as err:
+                    got = None if row is None and "box-manifest" in str(err) else f"unexpected: {err}"
+                expect(got == row, f"manifest_arch of an arch.sh that prints {printed!r} and ends {code} is {got!r}, not {row!r}")
 
             m = edit("crates/gpu-gates/src/bin/gate_q4k_sel.rs", append("\n// key probe\n"))
             expect(m == {"gpu", "mac", "fmt"}, f"gate_q4k_sel.rs moves {sorted(m)}, not gpu mac fmt")
@@ -15653,7 +15699,7 @@ def profile_inputs_self_test(expect, side: Side) -> None:
             path = f"tools/ref/models/{selected}.sh"
             expect(path in context.run_scripts(["x"]), f"profile scripts: {value}, {env}: missing {path}")
             if value.startswith("$"):
-                context.manifest = [f"model-dir\t{d}\tabsent" for d in tree_model_dirs(side.tree.root)]
+                context.manifest = ["arch\tbuild\tsm_86", *(f"model-dir\t{d}\tabsent" for d in tree_model_dirs(side.tree.root))]
                 parts, err, _, _ = context._parts("x", ["x"], inputs, [], [])
                 expect(any(p.startswith(f"file\t{path}\t") for p in parts), f"profile key: {value}, {env}: {err}, missing {path}")
     with tempfile.TemporaryDirectory(prefix="recipes-profile-") as tmp:

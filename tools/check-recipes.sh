@@ -967,9 +967,14 @@ blk_orphan() {
   echo "${ot##*$'\n'}"
 }
 
-# The justfile reads and exports the shared architecture selection. Every recipe uses that value.
-# PIN(2026-10-31): a machine whose cards are all cc 12.0 selects sm_120a and all cc 12.1 sm_121a through arch.sh, cards of
-# different capabilities sm_86; recipes keep no independent target default.
+# The device arch is the building machine's, and the justfile names it for the box command to expand where it runs: `arch` is the
+# word `$BLOOMERY_ARCH`, every recipe's `--arch` takes it, and nothing exports BLOOMERY_ARCH (tools/box.sh selects it on the
+# machine that builds, from tools/arch.sh, and refuses a spelled `--arch` that is another one).
+# PIN(2026-11-17): the owner was `arch := `bash tools/arch.sh`` with `export BLOOMERY_ARCH := arch`, the selection of the machine that
+# ran `just`: on a Mac with no card that is the default, so every recipe sent to the RTX 5090 box built it there and exported it as a
+# name that outranked the box's own cards. The rule stays as strict: one definition, no arch literal anywhere else, every `--arch` takes
+# it, and now no export (a guess exported reads as a name). PIN(2026-10-31): a machine whose cards are all cc 12.0 selects sm_120a and all
+# cc 12.1 sm_121a through arch.sh, cards of different capabilities sm_86; recipes keep no independent target default.
 blk_archowner() {
   python3 - "$JF" "$B" << 'PY'
 import os
@@ -979,20 +984,88 @@ import shutil
 import subprocess
 import sys
 
-DEF = 'arch := `bash tools/arch.sh`'
-EXPORT = 'export BLOOMERY_ARCH := arch'
+DEF = "arch := '$BLOOMERY_ARCH'"
 LITERAL = re.compile(r"sm_[0-9]")
-OWNED = re.compile(r" \{\{arch\}\}(?![A-Za-z0-9_])")
+OWNED = re.compile(r" \\?\{\{arch\}\}(?![A-Za-z0-9_])")
+ANY_DEF = re.compile(r"^arch\s*:=")
+EXPORTED = re.compile(r"^export\s+BLOOMERY_ARCH\b")
+
+
+def logical_lines(text):
+    """(first line number, text) of each recipe line, a trailing backslash joining the next line to it."""
+    lines, i, out = text.split("\n"), 0, []
+    while i < len(lines):
+        n, line = i + 1, lines[i]
+        while line.endswith("\\") and i + 1 < len(lines):
+            i += 1
+            line = line[:-1] + " " + lines[i].strip()
+        out.append((n, line))
+        i += 1
+    return out
+
+
+def bad_contexts(text):
+    """The uses of `{{arch}}` the shell of the machine that runs just would expand (a bare word, a double-quoted string that does
+    not escape it) or that no box.sh argument carries (a single-quoted string of a local command): each expands to nothing there,
+    where `$BLOOMERY_ARCH` is meant for the shell of the box command."""
+    out = []
+    for n, line in logical_lines(text):
+        if not line[:1].isspace() or line.lstrip().startswith("#") or "{{arch}}" not in line:
+            continue
+        s = re.sub(r"\{\{(?!arch\}\})(.*?)\}\}", "I", line).replace("{{arch}}", "\x01")
+        state, esc, seg, boxed = None, False, "", False
+        for ch in s:
+            if state is None:
+                if esc:
+                    esc = False
+                    seg += ch
+                elif ch == "\\":
+                    esc = True
+                elif ch in "'\"":
+                    state, boxed = ch, "box.sh" in seg
+                    seg += "Q"
+                elif ch in ";|&":
+                    seg = ""
+                elif ch == "\x01":
+                    out.append(f"{n}: {{{{arch}}}} is a bare word: the shell of the machine running just expands $BLOOMERY_ARCH there, put it in a single-quoted box.sh argument: {line.strip()[:90]}")
+                else:
+                    seg += ch
+            elif state == "'":
+                if ch == "'":
+                    state = None
+                elif ch == "\x01" and not boxed:
+                    out.append(f"{n}: {{{{arch}}}} is in a single-quoted string that is no argument of tools/box.sh (a local command expands it to nothing): {line.strip()[:90]}")
+            else:
+                if esc:
+                    esc = False
+                    if ch == "\x01" and not boxed:
+                        out.append(f"{n}: \\{{{{arch}}}} is in a double-quoted string that is no argument of tools/box.sh: {line.strip()[:90]}")
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    state = None
+                elif ch == "\x01":
+                    out.append(f"{n}: {{{{arch}}}} is unescaped in a double-quoted string, where the shell of the machine running just expands $BLOOMERY_ARCH: write \\{{{{arch}}}}: {line.strip()[:90]}")
+    return out
 
 
 def problems(text):
-    out, defs, exports = [], 0, 0
+    out, defs = [], 0
+    out.extend(bad_contexts(text))
+    # tools/ptx-scan.sh reads BLOOMERY_ARCH raw (it is shipped alone to a base tree, so it cannot source tools/arch.sh) and falls back to
+    # sm_86: a command that runs it must name the arch, which is what makes box.sh select it on the box.
+    for n, line in logical_lines(text):
+        if line[:1].isspace() and not line.lstrip().startswith("#") and "tools/ptx-scan.sh" in line and "{{arch}}" not in line:
+            out.append(f"{n}: a command runs tools/ptx-scan.sh without {{{{arch}}}}, so it reads sm_86 beside binaries built for the box's cards: {line.strip()[:90]}")
     for n, line in enumerate(text.split("\n"), 1):
         if line == DEF:
             defs += 1
             continue
-        if line == EXPORT:
-            exports += 1
+        if ANY_DEF.match(line):
+            out.append(f"{n}: `arch` is not the word `$BLOOMERY_ARCH` (a value read on the machine that runs just is not the building machine's): {line.strip()[:110]}")
+            continue
+        if EXPORTED.match(line):
+            out.append(f"{n}: the justfile exports BLOOMERY_ARCH (a guess exported reads as a name; tools/box.sh selects it where the command runs): {line.strip()[:110]}")
             continue
         if LITERAL.search(line):
             out.append(f"{n}: an arch literal outside the definition of `arch`: {line.strip()[:110]}")
@@ -1003,14 +1076,13 @@ def problems(text):
                 out.append(f"{n}: `--arch` is not followed by {{{{arch}}}}: {line.strip()[:110]}")
     if defs != 1:
         out.append(f"the justfile defines `arch` {defs} times, want exactly one `{DEF}` line")
-    if exports != 1:
-        out.append(f"the justfile exports the selected arch {exports} times, want exactly one `{EXPORT}` line")
     return out
 
 
-good = DEF + "\n" + EXPORT + "\nx:\n    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p y'\n"
+good = DEF + "\nx:\n    ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p y'\n"
 fixtures = [
     ("the owner and a recipe that takes it", good, 0),
+    ("a double-quoted command takes it escaped", good.replace("'cargo oxide build --arch {{arch}} -- -p y'", '"cargo oxide build --arch \\{{arch}} -- -p y"'), 0),
     ("a literal arch after --arch", good.replace("--arch {{arch}}", "--arch sm_86"), 2),
     ("a literal arch that is not another arch's", good.replace("--arch {{arch}}", "--arch sm_121a"), 2),
     ("a literal arch in a comment", good + "# built for sm_86\n", 1),
@@ -1022,9 +1094,21 @@ fixtures = [
     ("a second --arch on one line", good.replace("-- -p y", "--arch sm_90 -- -p y"), 2),
     ("no definition of the variable", good.split("\n", 1)[1], 1),
     ("two definitions", good + DEF + "\n", 1),
-    ("no export of the selected arch", good.replace(EXPORT + "\n", ""), 1),
-    ("two exports", good + EXPORT + "\n", 1),
+    ("the arch of the machine that runs just", good.replace(DEF, "arch := `bash tools/arch.sh`"), 2),
+    ("the old owner with its export", good.replace(DEF, "arch := `bash tools/arch.sh`\nexport BLOOMERY_ARCH := arch"), 3),
+    ("an export of the arch beside the definition", good + "export BLOOMERY_ARCH := arch\n", 1),
+    ("an export of a literal arch", good + "export BLOOMERY_ARCH := 'x'\n", 1),
     ("independent target default", good.replace(DEF, "arch := env_var_or_default('BLOOMERY_ARCH', 'sm_86')"), 2),
+    ("a bare word of a box.sh call", good.replace("'cargo oxide build --arch {{arch}} -- -p y'", "cargo oxide build --arch {{arch}}"), 1),
+    ("a double-quoted command that does not escape it", good.replace("'cargo oxide build --arch {{arch}} -- -p y'", '"cargo oxide build --arch {{arch}} -- -p y"'), 1),
+    ("an argument of a local script", good + "z:\n    bash tools/foo.sh --arch {{arch}}\n", 1),
+    ("a single-quoted string of a local command", good + "z:\n    bash -c 'cargo oxide build --arch {{arch}}'\n", 1),
+    ("a local command after a box.sh call", good + "z:\n    ./tools/box.sh 'true' && bash -c 'x --arch {{arch}}'\n", 1),
+    ("a double-quoted local command that escapes it", good + 'z:\n    bash -c "x --arch \\{{arch}}"\n', 1),
+    ("a box.sh argument of a double-quoted and a single-quoted string", good + "z:\n    ./tools/box.sh \"${X:+export X=$X && }\"'cargo oxide build --arch {{arch}}'\n", 0),
+    ("a command that runs ptx-scan.sh with the arch named", good + "z:\n    ./tools/box.sh 'cargo oxide build --arch {{arch}} && bash tools/ptx-scan.sh gx'\n", 0),
+    ("a command that runs ptx-scan.sh and names no arch", good + "z:\n    ./tools/box.sh 'bash tools/ptx-scan.sh gx'\n", 1),
+    ("a use on a continued line", good + "z:\n    ./tools/box.sh 'true' \\\n        && bash -c 'x --arch {{arch}}'\n", 1),
 ]
 bad = 0
 for name, text, want in fixtures:
@@ -1038,11 +1122,11 @@ with open(sys.argv[1], encoding="utf-8") as fh:
     text = fh.read()
 found = problems(text)
 if found:
-    print("check-recipes: the device arch has one owner, the justfile's `arch` variable (BLOOMERY_ARCH): a recipe line that spells an arch builds for it whatever BLOOMERY_ARCH says:", file=sys.stderr)
+    print("check-recipes: the device arch is the building machine's: the justfile's `arch` is the word `$BLOOMERY_ARCH`, every `--arch` takes it, and nothing exports BLOOMERY_ARCH; a recipe line that spells an arch builds for it whatever BLOOMERY_ARCH says:", file=sys.stderr)
     for f in found:
         print(f"  justfile:{f}", file=sys.stderr)
     sys.exit(1)
-uses = sum(1 for line in text.split("\n") if line.startswith(" ") and "--arch {{arch}}" in line)
+uses = sum(1 for line in text.split("\n") if line.startswith(" ") and ("--arch {{arch}}" in line or "--arch \\{{arch}}" in line))
 fixture = Path(sys.argv[2]) / 'arch'
 fixture.mkdir()
 probe = fixture / 'nvidia-smi'

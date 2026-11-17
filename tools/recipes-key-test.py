@@ -64,6 +64,7 @@ class Workspace:
         self.manifest.write_text("# box-manifest 1 host=selftest data=/tmp/recipes-key-data\n"
                                  "env\tbloomery-env.sh\t" + "a" * 64 + "\n"
                                  "os\tkernel\tselftest\n"
+                                 "arch\tbuild\tsm_86\n"
                                  "tool\trustc\tselftest-offline\n# end\n")
         self.ledger = self.base / "ledger.tsv"
         self.parts_dir = self.base / "parts"
