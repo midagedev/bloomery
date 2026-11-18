@@ -357,6 +357,10 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
 
 ## Known limits (0.3.15)
 
+- Hy4-flash's prompt pass computes the host's share of its routed experts on the CPU, so its prompt runs at about its
+  decode rate on a card + CPU plan.
+- Hy4-flash turns thinking off on `reasoning_effort: "none"`; `chat_template_kwargs: {"enable_thinking": false}` is not
+  read for it (its template has no such switch).
 - DeepSeek V4.1 on two cards (`--place bp`) is not faster than one card (`--place a`). Unset `--place` picks `a`.
 - The `nemotron`, `raon1`, `solar2` and `musespark` seats serve one slot; `--parallel` above 1 is refused by name.
   The `nemotron`, `raon1` and `solar2` seats keep no saved prompt states.
