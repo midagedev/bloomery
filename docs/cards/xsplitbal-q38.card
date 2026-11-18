@@ -1,0 +1,44 @@
+# Round xsplitbal: the expert ring's tail streams by the balance (runtime::xsplit::stream_tail: rank order
+# while the
+# card's side, the pick's admits' copies ahead on the lane, stays under the union it leaves) in place of the
+# per-expert inequality max(W, c m) > b/r + f + k m and its unit gate m_min. On every input the balance
+# streams at
+# least the old set (the old set was a rank prefix cut by the same balance, with the kept experts priced at c
+# m <=
+# max(W, c m)), so the changed arm's xstream records stream at least the base's per layer.
+# Derivation (tools/flow/q38_step.py with the balance ring, box host, 5,482 / 6,415 card experts) [derived]:
+# pp tok/s @ P 512 714.9 -> 714.9 (+0.0 %) / 737.2 -> 737.2 (+0.0 %) the pick's admits fill the lane
+# pp tok/s @ P 2048 907.4 -> 973.9 (+7.3 %) / 997.8 -> 997.8 (+0.0 %) old ring dark (m_min), 14 / 0 streamed a
+# layer
+# pp tok/s @ P 4096 1207.7 -> 1218.0 (+0.9 %) / 1218.0 -> 1228.4 (+0.8 %) inside the ruler: read from the
+# records
+# Base build (from a worktree at 533adee08, its own remote dir):
+# BLOOMERY_REMOTE='~/repo/bloomery-xsplitbal-base' ./tools/box.sh 'cargo oxide build --arch $BLOOMERY_ARCH --
+# -p
+# bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe'
+# Runner (this tree):
+# BLOOMERY_REMOTE='~/repo/bloomery-xsplitbal'
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/xsplitbal-q38.card
+# BLOOMERY_GEN_CTX=4352' BLOOMERY_AB_ROUNDS=6 just depth-gpu-qwen4exp prose:2048
+# bin:/root/repo/bloomery-xsplitbal-base/target/release/generate_qwen3moe:prose:2048
+# Wall [derived]: 2 arms x 6 rounds of a fresh Qwen3.8 load and a 2,048-id prompt, ~1 min an arm: 12..16 min.
+kind: noninf
+question: does the balance rule leave Qwen3.8's prompt pass at P 2048 not slower than the per-expert rule's,
+  where the two rules split the unit most differently?
+term: pp tok/s @ prose:2048, ctx 4352 (BLOOMERY_GEN_CTX=4352), the timing card (RTX 5090), generate_qwen3moe
+  at its default plan and levers in both arms: this tree (changed) against the base build at 533adee08 (bin:
+  arm), paired by round
+unit: %
+predict: 0..+7.3
+rounds: 6
+condition: one lease, arms rotated every round; both arms' load lines print xstream=split with the same
+  xstream_half and xstream_costs and the same card experts (else the sitting is void: the rule ran in neither
+  or on another plan); the changed arm's xstream records stream at least the base's experts on every layer at
+  P 2048; no comfy hold and no foreign compute on the 5090; no [cpu-busy], [other-busy] or [cold] row
+decide-in: land the balance rule; read P 4096's records (streamed per layer, the changed arm's at least the
+  base's) as the structural check, no timed claim under the ruler
+decide-below: do not land; read both arms' xstream records at P 2048: a changed arm that streams more and runs
+  slower means the rule's beside-union copy price or its union price is optimistic; re-derive both from the
+  records' issue and backlog times before any change
+decide-above: land, then re-run q38_step.py with the load's measured union and lane costs: a gain past +7.3 %
+  means the base's ring was darker than the model's or the union price row lower; correct the model row

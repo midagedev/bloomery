@@ -4346,7 +4346,7 @@ mod gate {
     const _: () = assert!(E_P2 >= WIDE_FROM && E_P2 <= PLACED_UBATCH);
 
     /// The `split` clause's fixed rule input: a host column a
-    /// thousand microseconds, so the stream's floor sits under one column and
+    /// thousand microseconds, so the union passes the card's side and
     /// each card layer streams the host experts its units route, up to a
     /// half of the ring and the balance's cut.
     const SPLIT_COSTS: Costs = Costs {

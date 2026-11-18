@@ -439,8 +439,8 @@ mod gate {
     /// The stream arm's prompt length: a group of two whole units, past the walk's gate at [`SPLIT_COSTS`].
     const STREAM_P: usize = 2 * T_MAX;
 
-    /// The stream arm's fixed rule input: a host column of a tenth of a second, so the stream's floor sits
-    /// under one column and every host expert a unit routes streams until the ring's half or the balance cuts it.
+    /// The stream arm's fixed rule input: a host column of a tenth of a second, so the union passes the card's
+    /// side and every host expert a unit routes streams until the ring's half or the balance cuts it.
     const SPLIT_COSTS: Costs = Costs {
         host_us_per_col: 1.0e5,
         host_us_fixed: 240.0,

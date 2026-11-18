@@ -15,38 +15,44 @@
 //! (its listed host experts and their columns) and the union's costs W and c.
 //! The rule prices every copy at the rate it gets, never at the lane's alone.
 //!
-//! An expert routed `m` columns of the unit leaves the host union when it
-//! costs more there than on the lane plus the card:
-//! `max(W, c·m) > b/r + f + k·m`, for the host union's fixed cost W and
-//! per-column cost c, the lane's beside-union rate r, the expert's b bytes
-//! and the card's fixed cost f and per-column cost k. [`m_star`] is that
-//! inequality's crossover on its per-column branch, `(b/r + f)/(c − k)`;
-//! while W is at most `b/r + f` the experts that stream are exactly those
-//! routed past it. [`m_min`] is the least unit width that streams: a column
-//! spreads its top-k picks over the choice set, so the average expert's
-//! count `top_k·m/experts` first clears [`m_star`] at
-//! `m_min = m_star·experts/top_k`. Below it the ring stays dark and the pool
-//! admits alone. Both lists fill in the one ranking [`rank_key`], so the
-//! same counts give the same split. [`stream_tail`] is the ring's half
-//! alone, over a host set whose admits are already taken; [`split`] takes
-//! its tail through it, so the stream inequality has one caller.
+//! **One balance.** After a layer's pick its card side and its host union run
+//! side by side, and the layer waits for the longer. An expert routed `m`
+//! columns of the unit costs the union `max(W, c·m)`, for the union's fixed
+//! cost W and per-column cost c. Both halves of the rule walk the host
+//! experts hottest first in the one ranking [`rank_key`] and move an expert
+//! to the card while the card's side after it stays under the union it
+//! leaves: before that point a moved expert shortens the layer whatever its
+//! own cost against its copy — one whose union cost is under its copy still
+//! pays while the lane would idle beside the union — and once the card's
+//! side is the longer each further move lengthens the layer, however far its
+//! union cost passes its copy. The walk stops short of the crossing, so the
+//! one move that crosses is left to the union. The same counts give the same
+//! split.
 //!
-//! **The walk.** A split pick's admits and its backlog bound come from one
-//! balance over the two chains a layer runs after its pick returns: the
-//! card's — the admits' copies beside the union, then the route's tail τ
-//! ([`Constants::card_tail_us`]) — and the host union's, each admitted
-//! expert's cost leaving it. The tail is a level per unit width, not a
-//! family constant: [`unit_constants`] prices it per card pick, a rate the
-//! family passes, from the unit's own counts. [`admit_walk`] walks the host
-//! experts hottest first, admitting while the card chain stays under the
-//! union, and returns the floor (the coldest admit's count, a
-//! rank-contiguous set) and the backlog bound: exactly the jobs whose copies
-//! fit inside the union's shadow, the rest staging alone ahead of it. In a
-//! call not kept, an admit in its last unit whose way back the lane cannot
-//! take inside the walk is priced at two copies ([`ReturnCost`]).
-//! [`walk_gate`] is the least unit width whose picks could pay the walk's
-//! first admit: a prompt narrower than it admits nothing whatever its
-//! counts, so a caller gates on it before it counts.
+//! **The walk.** A split pick's admits and its backlog bound come from that
+//! balance over the card's chain — the admits' copies beside the union, then
+//! the route's tail τ ([`Constants::card_tail_us`]) — and the host union's,
+//! each admitted expert's cost leaving it. The tail is a level per unit
+//! width, not a family constant: [`unit_constants`] prices it per card pick,
+//! a rate the family passes, from the unit's own counts. [`admit_walk`]
+//! returns the floor (the coldest admit's count, a rank-contiguous set) and
+//! the backlog bound: exactly the jobs whose copies fit inside the union's
+//! shadow, the rest staging alone ahead of it. In a call not kept, an admit
+//! in its last unit whose way back the lane cannot take inside the walk is
+//! priced at two copies ([`ReturnCost`]). [`walk_gate`] is the least unit
+//! width whose picks could pay one copy beside the union: a prompt narrower
+//! than it admits and streams nothing whatever its counts, so a caller gates
+//! on it before it counts.
+//!
+//! **The ring.** [`stream_tail`] is the ring's half over a host set whose
+//! admits are already taken: the card's side starts at the admits' copies
+//! beside the union and the card stacks' own columns, and each streamed
+//! expert adds its copy at the beside-union rate r, the card's fixed cost f
+//! and its columns at the card's per-column cost k, `b/r + f + k·m` for its
+//! b bytes; the union starts at every routed host expert's cost. No unit
+//! width gates the ring: a unit whose union is too short to take a copy
+//! streams nothing by the balance itself. [`split`] takes its tail through
+//! it, so the ring's balance has one owner.
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -86,15 +92,37 @@ pub struct Constants {
     pub top_k: usize,
 }
 
-/// The rule for one expert routed `count` columns of the unit: it streams
-/// when the host union's cost is above the lane's and the card's together —
-/// the lane's copy priced beside the union, where it runs.
-fn streams(k: &Constants, count: u32) -> bool {
-    let m = f64::from(count);
-    let host = k.host_us_fixed.max(k.host_us_per_col * m);
-    let lane_card =
-        k.expert_b as f64 / beside_b_per_us(k) + k.card_us_fixed + k.card_us_per_col * m;
-    host > lane_card
+/// The host union's cost of one expert routed `count` columns of the unit
+/// [µs]: its fixed cost or its columns', whichever is the larger — the one
+/// price both halves of the rule read the union at.
+fn host_us(k: &Constants, count: u32) -> f64 {
+    k.host_us_fixed.max(k.host_us_per_col * f64::from(count))
+}
+
+/// The balance both halves of the rule walk over `ranked`, hottest first:
+/// from the card's side `card` and the union `union` [µs], an expert moves
+/// while the card's side after its `step` stays under the union it leaves.
+/// The experts moved, and the two sides after them.
+fn balance(
+    ranked: &[u32],
+    counts: &[u32],
+    k: &Constants,
+    (mut card, mut union): (f64, f64),
+    step: impl Fn(u32) -> f64,
+) -> (usize, f64, f64) {
+    let mut moved = 0;
+    for &id in ranked {
+        let count = counts[id as usize];
+        let card_next = card + step(count);
+        let union_next = union - host_us(k, count);
+        if card_next > union_next {
+            break;
+        }
+        card = card_next;
+        union = union_next;
+        moved += 1;
+    }
+    (moved, card, union)
 }
 
 /// The union's weight-listing burst share of its own window for a unit that
@@ -170,28 +198,6 @@ pub fn beside_b_per_us(k: &Constants) -> f64 {
     k.lane_b_per_us * (1.0 - k.union_burst_share)
 }
 
-/// The stream floor: the count past which the rule's per-column branch
-/// streams, `c·m > b/r + f + k·m` solved for m, `(b/r + f)/(c − k)` at the
-/// beside-union rate r. A card column that costs at least the host's never
-/// pays its fixed cost back: the floor is then infinite. In columns.
-#[must_use]
-pub fn m_star(k: &Constants) -> f64 {
-    let per_col = k.host_us_per_col - k.card_us_per_col;
-    if per_col <= 0.0 {
-        return f64::INFINITY;
-    }
-    (k.expert_b as f64 / beside_b_per_us(k) + k.card_us_fixed) / per_col
-}
-
-/// The least unit width that streams: a column's top-k picks spread over the
-/// choice set put `top_k·m/experts` columns on the average expert, and the
-/// unit's mass first clears [`m_star`] when that mean does. An infinite floor
-/// gives `u64::MAX`: no unit streams. In columns.
-#[must_use]
-pub fn m_min(k: &Constants) -> u64 {
-    (m_star(k) * k.experts as f64 / k.top_k as f64).ceil() as u64
-}
-
 /// The one ranking the pool's admits and the ring's tail share: count
 /// descending, id ascending — the order [`split`] fills both lists in.
 #[must_use]
@@ -238,8 +244,8 @@ pub struct AdmitPlan {
 /// the host chain loses each admitted expert's union cost. Walking hottest
 /// first ([`rank_key`]), an expert is admitted while the card chain after it
 /// stays under the union it leaves — the wall the walk balances is the
-/// longer of the two chains, so past that point an admit lengthens the
-/// layer. The floor is the coldest admit's count; the backlog bound leaves
+/// longer of the two chains, so once the card chain is the longer each
+/// further admit lengthens the layer. The floor is the coldest admit's count; the backlog bound leaves
 /// beside the union exactly the jobs whose copies fit inside its shadow,
 /// `⌈(U − τ)·r/b⌉` clamped to the caller's queue floor and to the admits
 /// there are. Under [`ReturnCost::Exposed`] each admit's card chain carries
@@ -267,60 +273,48 @@ pub fn admit_walk(
         ReturnCost::Hidden => copy_us,
         ReturnCost::Exposed => copy_us + k.expert_b as f64 / k.lane_b_per_us,
     };
-    let host_us = |m: u32| k.host_us_fixed.max(k.host_us_per_col * f64::from(m));
     let mut ranked: Vec<u32> = host.to_vec();
     ranked.retain(|&id| counts[id as usize] > 0);
     ranked.sort_unstable_by_key(|&id| rank_key(counts[id as usize], id));
     let union = ranked
         .iter()
-        .map(|&id| host_us(counts[id as usize]))
+        .map(|&id| host_us(k, counts[id as usize]))
         .sum::<f64>();
-    let mut card = k.card_tail_us;
-    let mut left = union;
-    let mut admits: u64 = 0;
-    let mut plan = AdmitPlan {
-        floor: u32::MAX,
-        backlog: 0,
+    let (admits, _, left) = balance(&ranked, counts, k, (k.card_tail_us, union), |_| admit_us);
+    let Some(&coldest) = admits.checked_sub(1).and_then(|i| ranked.get(i)) else {
+        return Ok(AdmitPlan {
+            floor: u32::MAX,
+            backlog: 0,
+        });
     };
-    for &id in &ranked {
-        let count = counts[id as usize];
-        let card_next = card + admit_us;
-        let left_next = left - host_us(count);
-        if card_next > left_next {
-            break;
-        }
-        card = card_next;
-        left = left_next;
-        plan.floor = count;
-        admits += 1;
-    }
-    if plan.floor == u32::MAX {
-        return Ok(plan);
-    }
     // The shadow bound: the jobs whose copies fit inside the union the walk
     // left, the rest staging alone ahead of it — never fewer than the
     // machine's queue floor, never more than the admits there are.
+    let admits = admits as u64;
     let shadow = (left - k.card_tail_us).max(0.0) * beside_b_per_us(k) / k.expert_b as f64;
     let bound = shadow
         .ceil()
         .clamp(queue_floor.min(admits) as f64, admits as f64);
-    plan.backlog = bound as u64;
-    Ok(plan)
+    Ok(AdmitPlan {
+        floor: counts[coldest as usize],
+        backlog: bound as u64,
+    })
 }
 
-/// The least unit width whose picks could pay the walk's first admit: an
-/// admit needs the union to cost at least one copy beside it (the first
-/// admit's copy and the card's tail ahead of it, the union less the expert it
-/// loses), and a unit of `m` columns costs the union at most `top_k·m` of
-/// both the fixed and the per-column kind — an expert listed at most once a
-/// column. The tail is not an input: it is the rate times the card picks,
-/// and a unit whose every pick sits on the host has none, where the union is
-/// the largest, so a bound that never skips a unit the walk would admit from
-/// takes it at 0. The copy is priced at `k`'s beside-union rate; a unit's own
-/// share only slows it, so a `k` with no share (the family's) under-states
-/// the gate and never over-states it. A prompt narrower than the gate admits
-/// nothing whatever its counts, so a caller gates before it counts. In
-/// columns.
+/// The least unit width whose picks could pay one copy beside the union: an
+/// admit needs the union to cost at least its copy (the first admit's copy
+/// and the card's tail ahead of it, the union less the expert it loses), a
+/// stream its copy and the card's fixed and column cost, and a unit of `m`
+/// columns costs the union at most `top_k·m` of both the fixed and the
+/// per-column kind — an expert listed at most once a column. The tail is not
+/// an input: it is the rate times the card picks, and a unit whose every
+/// pick sits on the host has none, where the union is the largest, so a
+/// bound that never skips a unit the walk would admit from takes it at 0.
+/// The copy is priced at `k`'s beside-union rate; a unit's own share only
+/// slows it, so a `k` with no share (the family's) under-states the gate
+/// and never over-states it. A prompt narrower than the gate admits and
+/// streams nothing whatever its counts, so a caller gates before it counts.
+/// In columns.
 #[must_use]
 pub fn walk_gate(k: &Constants) -> u32 {
     let copy_us = k.expert_b as f64 / beside_b_per_us(k);
@@ -382,9 +376,6 @@ pub enum SplitError {
     CountsSum { sum: u64, top_k: usize },
     /// A count above its unit's width: a column routes an expert at most once.
     CountPastUnit { id: u32, count: u32, unit: u64 },
-    /// Counts that do not sum to the given unit's columns at the router's
-    /// top-k.
-    CountsUnit { sum: u64, unit: u64, top_k: usize },
 }
 
 impl fmt::Display for SplitError {
@@ -412,10 +403,6 @@ impl fmt::Display for SplitError {
                 f,
                 "split count {count} for expert {id} passes its unit's {unit} columns"
             ),
-            SplitError::CountsUnit { sum, unit, top_k } => write!(
-                f,
-                "split counts sum to {sum}, not {unit} columns at top-k {top_k}"
-            ),
         }
     }
 }
@@ -426,11 +413,11 @@ impl std::error::Error for SplitError {}
 /// the layer (the unit's routed picks), `host` the layer's host-tier ids in
 /// any order, `pool` the card slots the call can fill, and `k` the
 /// [`Constants`] the load measured. The pool admits the hottest routed host
-/// experts, at most `pool` of them by [`rank_key`]; the ring streams the rest
-/// the rule sends to the card, only when the unit's width — the counts' sum
-/// over the router's top-k — clears [`m_min`]; the union keeps every other
-/// host expert, its columns summed into `host_columns`. A `pool` of zero
-/// streams nothing and admits nothing.
+/// experts, at most `pool` of them by [`rank_key`]; the ring then streams,
+/// past them, the host experts the balance sends to the card with the
+/// admits' copies ahead on the lane ([`stream_tail`]); the union keeps every
+/// other host expert, its columns summed into `host_columns`. A `pool` of
+/// zero streams nothing and admits nothing.
 ///
 /// The call clears `out` first; a refusal leaves it empty. Refused by name:
 /// constants out of range, counts of another length than the layer's experts,
@@ -451,14 +438,7 @@ pub fn split(
     out.host_columns = 0;
     check_constants(k)?;
     let sum = check_counts(counts, k)?;
-    if !sum.is_multiple_of(k.top_k as u64) {
-        return Err(SplitError::CountsSum {
-            sum,
-            top_k: k.top_k,
-        });
-    }
-    let unit = sum / k.top_k as u64;
-    check_unit(counts, unit)?;
+    check_unit(counts, check_whole(sum, k)?)?;
     check_host(host, k, &mut out.admit)?;
     // A count of zero names an expert the unit never routes: neither list
     // takes it, and its columns are none.
@@ -479,7 +459,7 @@ pub fn split(
         stream: std::mem::take(&mut out.stream),
         host_columns: 0,
     };
-    let tailed = stream_tail(counts, &out.admit[admits..], unit, k, &mut tail);
+    let tailed = stream_tail(counts, &out.admit[admits..], admits as u64, k, &mut tail);
     out.stream = tail.stream;
     if let Err(err) = tailed {
         out.admit.clear();
@@ -491,25 +471,32 @@ pub fn split(
 }
 
 /// The ring's half of the rule over a host set whose admits are already
-/// taken: `counts` holds one count per expert of the layer over a unit of
-/// `m` columns, `host` the host-tier ids left after the admits, in any
-/// order, and `k` the [`Constants`] the load measured. The ring streams
-/// every routed host expert the rule sends to the card, by [`rank_key`],
-/// only when `m` clears [`m_min`]; the union keeps every other one, its
-/// columns summed into `host_columns`. Nothing is admitted, and no capacity
-/// bounds the ring: its slots are transient.
+/// taken: `counts` holds one count per expert of the layer (the unit's routed
+/// picks), `host` the host-tier ids left after the admits, in any order,
+/// `admitted` the admits whose copies run on the lane ahead of the ring's,
+/// and `k` the unit's [`Constants`]. The card's side starts at the admits'
+/// copies beside the union and the card stacks' own columns (every routed
+/// column `host` does not take), the union at every routed host expert's
+/// cost; walking the host experts hottest first ([`rank_key`]), the ring
+/// streams an expert while the card's side after its copy beside the union,
+/// the card's fixed cost and its columns' stays under the union it leaves
+/// — before that point a streamed expert shortens the layer, and once the
+/// card's side is the longer each further one lengthens it. The union keeps every other host expert, its columns summed
+/// into `host_columns`. Nothing is admitted, and no capacity bounds the
+/// ring: its slots are transient, and a caller cuts the list at the room it
+/// has.
 ///
 /// The call clears `out` first; a refusal leaves it empty. Refused by name:
-/// constants out of range, counts of another length than the layer's
-/// experts, counts that do not sum to `m` columns or count one expert past
-/// `m`, and a host list naming an expert outside the layer or twice.
+/// constants out of range, counts of another length than the layer's experts,
+/// counts that do not sum to whole columns or count one expert past the
+/// unit's width, and a host list naming an expert outside the layer or twice.
 ///
 /// # Errors
 /// Every refusal names its input; see [`SplitError`].
 pub fn stream_tail(
     counts: &[u32],
     host: &[u32],
-    m: u64,
+    admitted: u64,
     k: &Constants,
     out: &mut Tail,
 ) -> Result<(), SplitError> {
@@ -517,28 +504,25 @@ pub fn stream_tail(
     out.host_columns = 0;
     check_constants(k)?;
     let sum = check_counts(counts, k)?;
-    if m.checked_mul(k.top_k as u64) != Some(sum) {
-        return Err(SplitError::CountsUnit {
-            sum,
-            unit: m,
-            top_k: k.top_k,
-        });
-    }
-    check_unit(counts, m)?;
+    check_unit(counts, check_whole(sum, k)?)?;
     check_host(host, k, &mut out.stream)?;
-    let ring = m >= m_min(k);
-    let mut kept = 0;
-    out.stream.retain(|&id| {
-        let count = counts[id as usize];
-        let streamed = ring && count > 0 && streams(k, count);
-        if !streamed {
-            kept += u64::from(count);
-        }
-        streamed
-    });
+    out.stream.retain(|&id| counts[id as usize] > 0);
     out.stream
         .sort_unstable_by_key(|&id| rank_key(counts[id as usize], id));
-    out.host_columns = kept;
+    let columns =
+        |ids: &[u32]| -> u64 { ids.iter().map(|&id| u64::from(counts[id as usize])).sum() };
+    let copy_us = k.expert_b as f64 / beside_b_per_us(k);
+    let card = admitted as f64 * copy_us + k.card_us_per_col * (sum - columns(&out.stream)) as f64;
+    let union = out
+        .stream
+        .iter()
+        .map(|&id| host_us(k, counts[id as usize]))
+        .sum::<f64>();
+    let (streamed, _, _) = balance(&out.stream, counts, k, (card, union), |count| {
+        copy_us + k.card_us_fixed + k.card_us_per_col * f64::from(count)
+    });
+    out.host_columns = columns(&out.stream[streamed..]);
+    out.stream.truncate(streamed);
     Ok(())
 }
 
@@ -551,6 +535,18 @@ fn check_counts(counts: &[u32], k: &Constants) -> Result<u64, SplitError> {
         });
     }
     Ok(counts.iter().map(|&c| u64::from(c)).sum())
+}
+
+/// Refuse a count sum that is not whole columns at the router's top-k; the
+/// unit's width.
+fn check_whole(sum: u64, k: &Constants) -> Result<u64, SplitError> {
+    if !sum.is_multiple_of(k.top_k as u64) {
+        return Err(SplitError::CountsSum {
+            sum,
+            top_k: k.top_k,
+        });
+    }
+    Ok(sum / k.top_k as u64)
 }
 
 /// Refuse a count past the unit's width.
@@ -640,10 +636,9 @@ mod tests {
 
     /// Constants whose derivations land on exact numbers: an expert of
     /// 50000 B over a lane of 1000 B/µs copies in 50, the card's fixed cost
-    /// adds 10, and the host's 10.5 a column against the card's 0.5 puts
-    /// m* = (50 + 10)/(10.5 − 0.5) = 6; eight experts routed two a column put
-    /// m_min at 6 × 8/2 = 24. W = 2 is under b/r + f = 60. No burst share:
-    /// the beside-union rate is the lane's own, so every number stays exact.
+    /// adds 10 and a column 0.5, against the host's 10.5 a column and W = 2;
+    /// eight experts routed two a column. No burst share: the beside-union
+    /// rate is the lane's own, so every number stays exact.
     fn plain() -> Constants {
         Constants {
             lane_b_per_us: 1000.0,
@@ -665,9 +660,8 @@ mod tests {
     /// card's per-expert costs (13 + 0.16 a column), the calibration shape's
     /// burst share and a flat route tail of 4690, which the tests that set
     /// their own tail overwrite.
-    /// beside = 21190 × (1 − 0.381) = 13116.6,
-    /// m* = (3072000/13116.6 + 13)/(3.67 − 0.16) = 247.207/3.51 = 70.429,
-    /// m_min = ceil(70.429 × 51.2) = ceil(3605.98) = 3606.
+    /// beside = 21190 × (1 − 0.381) = 13116.6, a copy 3072000/13116.6 =
+    /// 234.207.
     fn a6000() -> Constants {
         Constants {
             lane_b_per_us: 21190.0,
@@ -683,25 +677,11 @@ mod tests {
         }
     }
 
-    /// The 3090 plan (a) calibration: the A6000's link, union and share, the
-    /// card's costs at the design's ×1.25 (16.25 + 0.2 a column).
-    /// m* = (234.207 + 16.25)/(3.67 − 0.2) = 250.457/3.47 = 72.178,
-    /// m_min = ceil(72.178 × 51.2) = ceil(3695.5) = 3696.
-    fn a3090() -> Constants {
-        Constants {
-            card_us_fixed: 16.25,
-            card_us_per_col: 0.2,
-            ..a6000()
-        }
-    }
-
     /// The 5090 calibration: the same expert bytes and routing at the A6000's
     /// share, the pageable staging rate that box holds, its fitted host union
     /// (W 38.4, c 6.2) and the card's costs at the design's ×0.6
     /// (7.8 + 0.096 a column).
-    /// beside = 21200 × 0.619 = 13122.8,
-    /// m* = (3072000/13122.8 + 7.8)/(6.2 − 0.096) = 241.897/6.104 = 39.629,
-    /// m_min = ceil(39.629 × 51.2) = ceil(2029.01) = 2030.
+    /// beside = 21200 × 0.619 = 13122.8, a copy 3072000/13122.8 = 234.096.
     fn their_5090() -> Constants {
         Constants {
             lane_b_per_us: 21200.0,
@@ -716,74 +696,230 @@ mod tests {
         }
     }
 
-    /// A count at or below the floor never streams, whatever the pool: the
-    /// rule's inequality is strict, so a count exactly at m* stays with the
-    /// union (mutants: the floor ignored, the inequality inclusive).
+    /// The Hy4 shape [derived]: 512 routed experts, sixteen picks a column, a
+    /// 4,263,000 B expert over the Gen4 link's pinned rate (26,280 B/µs), the
+    /// union's W 37 and c 7.0 a column, the card's 3 + 0.11 a column, and the
+    /// burst share of a 512-column unit whose 463 host experts each carry
+    /// 16: 37 × 463 over 37 × 463 + 7.0 × 7408, 0.24832.
+    /// beside = 26280 × 0.75168 = 19754.1, a copy 4263000/19754.1 = 215.803.
+    fn hy4() -> Constants {
+        let mut k = Constants {
+            lane_b_per_us: 26280.0,
+            host_us_per_col: 7.0,
+            host_us_fixed: 37.0,
+            card_us_fixed: 3.0,
+            card_us_per_col: 0.11,
+            union_burst_share: 0.0,
+            card_tail_us: 0.0,
+            expert_b: 4_263_000,
+            experts: 512,
+            top_k: 16,
+        };
+        k.union_burst_share = union_burst_share(463 * 16, 463, &k);
+        k
+    }
+
+    /// The two sides of a layer whose ring streams the first `n` of `ranked`
+    /// (routed host experts, hottest first) past `admitted` admits, priced as
+    /// the rule prices them: (the card's side, the union). The layer's wall
+    /// is the larger.
+    fn sides_at(
+        counts: &[u32],
+        ranked: &[u32],
+        admitted: u64,
+        n: usize,
+        k: &Constants,
+    ) -> (f64, f64) {
+        let copy = k.expert_b as f64 / beside_b_per_us(k);
+        let at = |id: u32| f64::from(counts[id as usize]);
+        let host_cols: f64 = ranked.iter().map(|&id| at(id)).sum();
+        let all: f64 = counts.iter().map(|&c| f64::from(c)).sum();
+        let card = admitted as f64 * copy
+            + k.card_us_per_col * (all - host_cols)
+            + ranked[..n]
+                .iter()
+                .map(|&id| copy + k.card_us_fixed + k.card_us_per_col * at(id))
+                .sum::<f64>();
+        let union = ranked[n..]
+            .iter()
+            .map(|&id| k.host_us_fixed.max(k.host_us_per_col * at(id)))
+            .sum::<f64>();
+        (card, union)
+    }
+
+    /// A routed host set ranked as the rule ranks it.
+    fn ranked(counts: &[u32], host: &[u32]) -> Vec<u32> {
+        let mut r: Vec<u32> = host
+            .iter()
+            .copied()
+            .filter(|&id| counts[id as usize] > 0)
+            .collect();
+        r.sort_unstable_by_key(|&id| rank_key(counts[id as usize], id));
+        r
+    }
+
+    /// The lane idles beside the union: a unit of 16 columns whose eight
+    /// experts each carry 4 costs the union 42 an expert and the card's side
+    /// 50 + 10 + 2 = 62 — each expert alone dearer on the card than on the
+    /// host. The pool's one admit (2) puts its copy and the stacks' 12
+    /// columns on the card's side, 50 + 6 = 56, against the union of the
+    /// five left, 210: streaming 3 makes the sides 118 and 168, the layer 168
+    /// against 210; a second would make them 180 and 126 and pass the union.
+    /// The ring streams 3 and the union keeps 4 × 4 = 16 columns (mutants:
+    /// the per-expert inequality, which streams nothing here, the ring dark
+    /// under a unit width).
     #[test]
-    fn a_count_at_or_below_the_floor_never_streams() {
+    fn the_ring_streams_where_the_lane_idles_beside_the_union() {
         let k = plain();
-        // 110 picks over two a column: a 55-column unit, past m_min 24, so
-        // the ring is lit and only the floor speaks.
-        let counts = [10, 10, 40, 30, 7, 6, 5, 2];
+        let counts = [4u32; 8];
         let mut out = Split::default();
-        split(&counts, &[6, 2, 5, 3, 4], 1, &k, &mut out).unwrap();
-        assert_eq!(out.admit, [2], "the hottest host expert fills the pool");
-        assert_eq!(out.stream, [3, 4], "the counts past the floor of 6 stream");
+        split(&counts, &[2, 3, 4, 5, 6, 7], 1, &k, &mut out).unwrap();
+        assert_eq!(out.admit, [2]);
+        assert_eq!(out.stream, [3], "one stream fits beside the union");
+        assert_eq!(out.host_columns, 16);
+        let left = ranked(&counts, &[3, 4, 5, 6, 7]);
+        let wall = |n| {
+            let (card, union) = sides_at(&counts, &left, 1, n, &k);
+            card.max(union)
+        };
+        assert_eq!((wall(0), wall(1), wall(2)), (210.0, 168.0, 180.0));
+    }
+
+    /// The balance stops where one more stream lengthens the layer, however
+    /// far each expert's union cost passes its copy: six host experts of 7
+    /// (73.5 each on the union, 63.5 on the card's side) beside two card
+    /// experts of 120, a 141-column unit. The pool's admit (2) and the
+    /// stacks' 247 columns put 50 + 123.5 = 173.5 on the card's side against
+    /// the union of the five left, 367.5: one stream makes them 237 and 294,
+    /// a second 300.5 and 220.5 — a layer of 300.5, past the 294 one stream
+    /// leaves — and all five 491 (mutants: every expert past its own
+    /// crossover streamed, the stream-everything ring, both [3, 4, 5, 6, 7]).
+    #[test]
+    fn the_ring_stops_where_one_more_stream_lengthens_the_layer() {
+        let k = plain();
+        let counts = [120, 120, 7, 7, 7, 7, 7, 7];
+        let mut out = Split::default();
+        split(&counts, &[2, 3, 4, 5, 6, 7], 1, &k, &mut out).unwrap();
+        assert_eq!(out.admit, [2]);
+        assert_eq!(out.stream, [3], "a second stream lengthens the layer");
+        assert_eq!(out.host_columns, 28);
+        let left = ranked(&counts, &[3, 4, 5, 6, 7]);
+        let wall = |n| {
+            let (card, union) = sides_at(&counts, &left, 1, n, &k);
+            card.max(union)
+        };
         assert_eq!(
-            out.host_columns,
-            6 + 5,
-            "the count at 6 and the one under stay"
+            (wall(0), wall(1), wall(2), wall(5)),
+            (367.5, 294.0, 300.5, 491.0)
         );
     }
 
-    /// [`m_star`] is the rule's own crossover: while W is at most b/r + f, a
-    /// count streams exactly when it is past m*, on every calibration
-    /// (mutants: the card's fixed cost subtracted, its per-column cost
-    /// dropped).
+    /// The Hy4 shape at 512 columns: every expert carries 16, the union's
+    /// 112 an expert against a copy of 215.803 — the per-expert crossover at
+    /// (215.803 + 3)/(7.0 − 0.11) = 31.8 columns, past every count here. The
+    /// pool's admit (49) and the stacks' 800 columns start the card's side at
+    /// 215.803 + 88 = 303.803 against the union of the 462 left, 51,744; a
+    /// stream adds 220.563 and takes 112 off: n ≤ (51,744 − 303.803)/332.563
+    /// = 154.7, so the ring streams 154 (50..204) and the union keeps the
+    /// other 308 × 16 = 4928 columns (mutant: the per-expert inequality,
+    /// which leaves the ring dark).
     #[test]
-    fn the_floor_is_the_rules_crossover() {
-        for k in [plain(), a6000(), a3090(), their_5090()] {
-            let floor = m_star(&k);
-            for count in 0..=4096 {
-                assert_eq!(
-                    streams(&k, count),
-                    f64::from(count) > floor,
-                    "count {count} against m* {floor}"
-                );
-            }
-        }
+    fn the_hy4_shape_streams_its_tail_at_512() {
+        let k = hy4();
+        let host: Vec<u32> = (49..512).collect();
+        let mut out = Split::default();
+        split(&[16; 512], &host, 1, &k, &mut out).unwrap();
+        assert_eq!(out.admit, [49]);
+        assert_eq!(out.stream, (50..204).collect::<Vec<_>>());
+        assert_eq!(out.host_columns, 308 * 16);
     }
 
-    /// The union's fixed cost is the rule's too: when W is above b/r + f, a
-    /// count under m* costs the union more than the lane and the card, and
-    /// streams (mutant: W dropped from the host side).
+    /// The ring's set is the balance's on every shape: over random units of
+    /// 64 experts routed four a column, random host sets and 0 to 3 admits,
+    /// the card's side after the ring's set stays under the union it leaves,
+    /// one more stream would pass it, and the layer is never longer than with
+    /// no stream or every stream (mutants: the stream-everything ring, the
+    /// cut one late, the ring dark). The constants are halves and wholes, so
+    /// every sum is exact.
     #[test]
-    fn the_union_floor_streams_a_count_under_the_column_floor() {
+    fn the_rings_set_is_the_balance_on_every_shape() {
+        let k = Constants {
+            experts: 64,
+            top_k: 4,
+            ..plain()
+        };
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut lit = 0;
+        for _ in 0..2000 {
+            let m = 1 + next(96) as usize;
+            let mut counts = vec![0u32; 64];
+            for _ in 0..m {
+                let mut picked = [u64::MAX; 4];
+                for slot in 0..4 {
+                    let mut e = next(64);
+                    while picked.contains(&e) {
+                        e = (e + 1) % 64;
+                    }
+                    picked[slot] = e;
+                    counts[e as usize] += 1;
+                }
+            }
+            let host: Vec<u32> = (0..64).filter(|_| next(3) != 0).collect();
+            let admitted = next(4);
+            let mut out = Tail::default();
+            stream_tail(&counts, &host, admitted, &k, &mut out).unwrap();
+            let r = ranked(&counts, &host);
+            let n = out.stream.len();
+            assert_eq!(
+                out.stream,
+                r[..n],
+                "the ring's set is a prefix of the ranking"
+            );
+            let wall = |n| {
+                let (card, union) = sides_at(&counts, &r, admitted, n, &k);
+                card.max(union)
+            };
+            let (card, union) = sides_at(&counts, &r, admitted, n, &k);
+            if n > 0 {
+                assert!(card <= union, "the card's side passes the union at {n}");
+            }
+            if n < r.len() {
+                let (card, union) = sides_at(&counts, &r, admitted, n + 1, &k);
+                assert!(card > union, "a stream past {n} still fits");
+            }
+            assert!(wall(n) <= wall(0) && wall(n) <= wall(r.len()));
+            lit += usize::from(n > 0);
+        }
+        assert!(lit > 0, "no unit streamed: a vacuous check");
+    }
+
+    /// The union prices an expert at its fixed cost too: at W = 100, past a
+    /// copy and the card's fixed cost (60), every host expert costs the union
+    /// at least 100. Past the admit (2, 40), the union of 30, 7, 6, 5 and 2
+    /// is 315 + 100 × 4 = 715 against the card's side of 50 + 30 = 80; the
+    /// ring streams 3 and 4 (sides 218.5 and 300) and a third would pass, and
+    /// the union keeps 6 + 5 + 2 = 13 columns (mutant: the union priced at
+    /// its columns alone, which streams 3 alone).
+    ///
+    /// PIN(2026-11-19): the ring streamed [3, 4, 5, 6, 7] under the
+    /// per-expert inequality, which left the balance to its caller; the
+    /// ring's set is now the balance's, [3, 4].
+    #[test]
+    fn the_union_prices_an_expert_at_its_fixed_cost_too() {
         let mut k = plain();
-        k.host_us_fixed = 100.0; // above b/r + f + k·m = 60 + 0.5·m under 80 columns
+        k.host_us_fixed = 100.0;
         let counts = [10, 10, 40, 30, 7, 6, 5, 2];
         let mut out = Split::default();
         split(&counts, &[7, 6, 2, 5, 3, 4], 1, &k, &mut out).unwrap();
         assert_eq!(out.admit, [2]);
-        assert_eq!(out.stream, [3, 4, 5, 6, 7]);
-        assert_eq!(out.host_columns, 0);
-    }
-
-    /// A card column that costs at least the host's never pays back the copy:
-    /// the floor is infinite, m_min saturates and nothing streams however wide
-    /// the unit (mutant: the guard dropped, a negative floor).
-    #[test]
-    fn a_card_column_at_or_past_the_hosts_streams_nothing() {
-        let mut k = plain();
-        k.card_us_per_col = 11.0;
-        assert_eq!(m_star(&k), f64::INFINITY);
-        assert_eq!(m_min(&k), u64::MAX);
-        let counts = [10, 10, 40, 30, 7, 6, 5, 2];
-        let mut out = Split::default();
-        split(&counts, &[6, 2, 5, 3, 4], 1, &k, &mut out).unwrap();
-        assert_eq!(out.admit, [2]);
-        assert!(out.stream.is_empty());
-        assert_eq!(out.host_columns, 30 + 7 + 6 + 5);
+        assert_eq!(out.stream, [3, 4]);
+        assert_eq!(out.host_columns, 13);
     }
 
     /// A capacity of zero streams nothing and admits nothing: the union keeps
@@ -801,20 +937,25 @@ mod tests {
 
     /// Both lists fill in the one ranking, count descending then id ascending,
     /// whatever order the host list arrives in (mutant: the ranking by id
-    /// alone).
+    /// alone). A 30-column unit: two admits (1 and 4, the 9s), then the
+    /// ring's balance past them: the card's side 100 + 0.5 × 33 = 116.5
+    /// against the union of 7, 7, 7 and 6, 283.5; streaming 0, the first 7
+    /// by id, makes them 180 and 210, a second 243.5 and 136.5.
+    ///
+    /// PIN(2026-11-19): the ring streamed [0, 3, 5] and the union kept 6
+    /// columns under the per-expert inequality; the ring's set is now the
+    /// balance's, [0], and the union keeps 7 + 7 + 6 = 20.
     #[test]
     fn both_lists_rank_count_descending_then_id_ascending() {
         assert!(rank_key(9, 5) < rank_key(7, 0));
         assert!(rank_key(7, 3) < rank_key(7, 9));
         let k = plain();
-        // A 30-column unit, past m_min 24: two admits, then the ring's tail
-        // in the same order, the count of 6 at the floor kept.
         let counts = [7, 9, 0, 7, 9, 7, 6, 15];
         let mut out = Split::default();
         split(&counts, &[6, 5, 4, 3, 2, 1, 0], 2, &k, &mut out).unwrap();
         assert_eq!(out.admit, [1, 4]);
-        assert_eq!(out.stream, [0, 3, 5]);
-        assert_eq!(out.host_columns, 6);
+        assert_eq!(out.stream, [0]);
+        assert_eq!(out.host_columns, 20);
     }
 
     /// Bad input is refused by name and leaves the split empty: constants the
@@ -937,76 +1078,62 @@ mod tests {
 
     /// The A6000 shape: 512 experts routed ten a column, 301 on the card and
     /// 211 on the host, a pool of 301 − 148 = 153 (the card's experts past
-    /// `mid-p148-s1`'s pinned seed). At 512 columns every expert carries
-    /// 512 × 10/512 = 10 and the unit is under m_min 3606, so the pool admits
-    /// alone: ids 301..454, the other 58 keep 58 × 10 = 580 columns on the
-    /// union. A 512-column unit that routes every host expert 24 times, under
-    /// the floor of 70.429 (211 × 24 = 5064 picks, 56 on the card make
-    /// 5120 = 512 × 10), is still under m_min: admit alone, 58 × 24 = 1392
-    /// columns kept. At 4096 each carries 80, past the floor, and the unit
-    /// clears m_min: the same admits, the ring takes the 58 past them
-    /// (mutants: the unit gate dropped, m_min without the router's top-k).
+    /// `mid-p148-s1`'s pinned seed). The pool admits ids 301..454, whose 153
+    /// copies beside the union (35,833.6) already pass what the 58 left cost
+    /// it — 58 × 36.7 = 2128.6 at 512 columns of ten each, 58 × 88.08 =
+    /// 5108.6 when every host expert carries 24, 58 × 293.6 = 17,028.8 at
+    /// 4096 columns of 80 — so the ring stays dark at every width and the
+    /// union keeps 580, 1392 and 4640 columns (mutant: the admits left off
+    /// the lane, which streams 4 at 512 and 20 at 4096).
+    ///
+    /// PIN(2026-11-19): the ring took the 58 past the admits at 4096 under
+    /// the per-expert inequality, which left the balance to its caller; the
+    /// ring's set is now the balance's, none.
     #[test]
-    fn the_a6000_shape_admits_alone_at_512_and_streams_its_tail_at_4096() {
+    fn the_a6000_shapes_admits_fill_the_lane_at_every_width() {
         let k = a6000();
         let host: Vec<u32> = (301..512).collect();
         let mut out = Split::default();
         split(&[10; 512], &host, 153, &k, &mut out).unwrap();
         assert_eq!(out.admit, (301..454).collect::<Vec<_>>());
-        assert_eq!(out.stream, [], "512 columns is under m_min: admit alone");
+        assert_eq!(out.stream, [], "the admits' copies pass the union");
         assert_eq!(out.host_columns, 580);
         let mut hot = [0; 512];
         hot[..56].fill(1);
         hot[301..].fill(24);
         split(&hot, &host, 153, &k, &mut out).unwrap();
         assert_eq!(out.admit, (301..454).collect::<Vec<_>>());
-        assert_eq!(out.stream, [], "past the floor, still under m_min");
+        assert_eq!(out.stream, []);
         assert_eq!(out.host_columns, 1392);
         split(&[80; 512], &host, 153, &k, &mut out).unwrap();
         assert_eq!(out.admit, (301..454).collect::<Vec<_>>());
-        assert_eq!(out.stream, (454..512).collect::<Vec<_>>());
-        assert_eq!(out.host_columns, 0);
+        assert_eq!(out.stream, []);
+        assert_eq!(out.host_columns, 4640);
     }
 
     /// The 5090 shape: the same 512 experts and routing, 5482/48 → 114 on the
     /// card and 398 on the host, a pool of its 2746 churn slots / 48 → 57. At
-    /// 4096 columns every expert carries 80, past the floor of 39.629, and the
-    /// unit clears m_min 2030: the pool admits ids 114..171 and the ring
-    /// streams all 341 host experts past them, 341/398 of the host tier; the
-    /// union keeps none (mutants: the rule's inequality reversed, m_min
-    /// without the router's top-k).
+    /// 4096 columns every expert carries 80: the pool admits ids 114..171,
+    /// whose copies (57 × 234.096) and the card's 171 × 80 columns at 0.096
+    /// start the card's side at 14,656.8 against the union of the 341 left,
+    /// 341 × 496 = 169,136; a stream adds 249.576 and takes 496 off, so
+    /// n ≤ (169,136 − 14,656.8)/745.576 = 207.2: the ring streams 207
+    /// (171..378) and the union keeps 134 × 80 = 10,720 columns (mutants: the
+    /// admits left off the lane, 225; the stacks' columns dropped, 208; the
+    /// stream-everything ring, 341).
+    ///
+    /// PIN(2026-11-19): the ring took all 341 past the admits under the
+    /// per-expert inequality, which left the balance to its caller; the
+    /// ring's set is now the balance's, 207.
     #[test]
-    fn the_5090_shape_streams_nearly_all_at_4096() {
+    fn the_5090_shape_streams_to_the_balance_at_4096() {
         let k = their_5090();
         let host: Vec<u32> = (114..512).collect();
         let mut out = Split::default();
         split(&[80; 512], &host, 57, &k, &mut out).unwrap();
         assert_eq!(out.admit, (114..171).collect::<Vec<_>>());
-        assert_eq!(out.stream, (171..512).collect::<Vec<_>>());
-        assert_eq!(out.host_columns, 0);
-    }
-
-    /// m* and m_min on all three machines' calibrations, each derived in its
-    /// constants' comment (mutants: the card's fixed cost subtracted, the
-    /// mean without the choice set's spread).
-    ///
-    /// PIN(2026-10-08): m* 23.096, 23.709, 25.017 and m_min 1183, 1214, 1281
-    /// before the rule priced its copies beside the union; now m* 70.429,
-    /// 72.178, 39.629 and m_min 3606, 3696, 2030, the values the constants'
-    /// comments derive at the beside-union rate (A6000: (3072000/13116.6 +
-    /// 13)/(3.67 - 0.16) = 70.429).
-    #[test]
-    fn m_min_on_all_three_machines() {
-        assert!((m_star(&a6000()) - 70.429).abs() < 0.001);
-        assert!((m_star(&a3090()) - 72.178).abs() < 0.001);
-        assert!((m_star(&their_5090()) - 39.629).abs() < 0.001);
-        for (name, k, want) in [
-            ("A6000", a6000(), 3606),
-            ("3090", a3090(), 3696),
-            ("5090", their_5090(), 2030),
-        ] {
-            assert_eq!(m_min(&k), want, "{name}");
-        }
+        assert_eq!(out.stream, (171..378).collect::<Vec<_>>());
+        assert_eq!(out.host_columns, 10_720);
     }
 
     /// The ring's half alone streams only from the host set it is given: an
@@ -1016,30 +1143,38 @@ mod tests {
     fn stream_tail_with_an_empty_host_set_streams_nothing() {
         let k = plain();
         let mut out = Tail::default();
-        stream_tail(&[10, 10, 40, 30, 7, 6, 5, 2], &[], 55, &k, &mut out).unwrap();
+        stream_tail(&[10, 10, 40, 30, 7, 6, 5, 2], &[], 0, &k, &mut out).unwrap();
         assert_eq!(out, Tail::default());
     }
 
-    /// Below m_min the ring's half streams nothing: a 20-column unit, under
-    /// m_min 24, whose host experts all carry 7, past the floor of 6, keeps
-    /// all 5 × 7 + 5 = 40 of their columns on the union (mutant: the unit
-    /// gate dropped).
+    /// The admits' copies run on the lane ahead of the ring's: five host
+    /// experts of 7 and one of 5 (73.5 and 52.5 on the union, 368 in all)
+    /// beside 21 card columns (10.5 on the card's side). With nothing
+    /// admitted the ring streams 0, 1 and 2 (the card's side 201 against the
+    /// union's 199.5 after them); each admit adds 50 ahead, so three admits
+    /// leave room for one (mutant: the admits left off the lane).
     #[test]
-    fn stream_tail_below_m_min_streams_nothing() {
+    fn the_admits_copies_run_ahead_on_the_lane() {
         let k = plain();
         let counts = [7, 7, 7, 7, 7, 0, 5, 0];
+        let host = [6, 4, 3, 2, 1, 0];
         let mut out = Tail::default();
-        stream_tail(&counts, &[6, 4, 3, 2, 1, 0], 20, &k, &mut out).unwrap();
-        assert!(out.stream.is_empty());
-        assert_eq!(out.host_columns, 40);
+        let mut cut = |admitted| {
+            stream_tail(&counts, &host, admitted, &k, &mut out).unwrap();
+            (out.stream.clone(), out.host_columns)
+        };
+        assert_eq!(cut(0), (vec![0, 1, 2], 19));
+        assert_eq!(cut(1), (vec![0, 1], 26));
+        assert_eq!(cut(3), (vec![0], 33));
     }
 
-    /// The ring's half over the host set a split's admits leave is that
-    /// split's tail, list and columns, in the ranking's order whatever order
-    /// the set arrives in. The first case's tail ranks 2 (12), 1 (9), 0 (8),
-    /// 5 (7) past the floor of 6 and keeps 6's 4 columns: not the id order
-    /// (mutants: split handing the admits to the tail too, the tail left in
-    /// id order).
+    /// The ring's half over the host set a split's admits leave, with the
+    /// split's admits ahead on the lane, is that split's tail, list and
+    /// columns, in the ranking's order whatever order the set arrives in.
+    /// The first case's tail ranks 2 (12) and 1 (9), not the id order, and
+    /// the balance keeps 0, 5 and 6's 8 + 7 + 4 = 19 columns (mutants: split
+    /// handing the admits to the tail too, the tail without the admits ahead,
+    /// the tail left in id order).
     #[test]
     fn stream_tail_is_splits_tail_on_the_post_admit_host_set() {
         let hot: Vec<u32> = (0..512)
@@ -1049,7 +1184,7 @@ mod tests {
                 _ => 0,
             })
             .collect();
-        let cases: [(Constants, Vec<u32>, Vec<u32>, usize); 5] = [
+        let cases: [(Constants, Vec<u32>, Vec<u32>, usize); 6] = [
             (
                 plain(),
                 vec![8, 9, 12, 0, 20, 7, 4, 0],
@@ -1065,6 +1200,7 @@ mod tests {
             (a6000(), vec![80; 512], (301..512).rev().collect(), 153),
             (a6000(), hot, (301..512).collect(), 153),
             (their_5090(), vec![80; 512], (114..512).rev().collect(), 57),
+            (hy4(), vec![16; 512], (49..512).rev().collect(), 1),
         ];
         for (k, counts, host, pool) in cases {
             let mut whole = Split::default();
@@ -1074,28 +1210,26 @@ mod tests {
                 .copied()
                 .filter(|id| !whole.admit.contains(id))
                 .collect();
-            let unit = counts.iter().map(|&c| u64::from(c)).sum::<u64>() / k.top_k as u64;
             let mut tail = Tail::default();
-            stream_tail(&counts, &left, unit, &k, &mut tail).unwrap();
-            assert_eq!(tail.stream, whole.stream, "unit {unit}");
-            assert_eq!(tail.host_columns, whole.host_columns, "unit {unit}");
+            stream_tail(&counts, &left, whole.admit.len() as u64, &k, &mut tail).unwrap();
+            assert_eq!(tail.stream, whole.stream, "pool {pool}");
+            assert_eq!(tail.host_columns, whole.host_columns, "pool {pool}");
         }
         let mut first = Tail::default();
         stream_tail(
             &[8, 9, 12, 0, 20, 7, 4, 0],
             &[6, 5, 2, 1, 0],
-            30,
+            0,
             &plain(),
             &mut first,
         )
         .unwrap();
-        assert_eq!(first.stream, [2, 1, 0, 5]);
-        assert_eq!(first.host_columns, 4);
+        assert_eq!(first.stream, [2, 1]);
+        assert_eq!(first.host_columns, 19);
     }
 
-    /// The ring's half refuses what [`split`] refuses, by name, and a count
-    /// sum that is not the given unit's; a refusal leaves the tail empty
-    /// (mutant: any check dropped).
+    /// The ring's half refuses what [`split`] refuses, by name; a refusal
+    /// leaves the tail empty (mutant: any check dropped).
     #[test]
     fn stream_tail_refuses_by_name() {
         let k = plain();
@@ -1104,14 +1238,13 @@ mod tests {
             stream: vec![7],
             host_columns: 99,
         };
-        let mut refuses =
-            |k: &Constants, counts: &[u32], host: &[u32], m: u64, want: SplitError| {
-                assert_eq!(stream_tail(counts, host, m, k, &mut out), Err(want));
-                assert!(
-                    out.stream.is_empty() && out.host_columns == 0,
-                    "a refusal leaves the tail empty"
-                );
-            };
+        let mut refuses = |k: &Constants, counts: &[u32], host: &[u32], want: SplitError| {
+            assert_eq!(stream_tail(counts, host, 0, k, &mut out), Err(want));
+            assert!(
+                out.stream.is_empty() && out.host_columns == 0,
+                "a refusal leaves the tail empty"
+            );
+        };
         refuses(
             &Constants {
                 host_us_fixed: f64::NAN,
@@ -1119,7 +1252,6 @@ mod tests {
             },
             &counts,
             &[2],
-            55,
             SplitError::Param {
                 name: "host_us_fixed",
                 range: "finite, 0 or more",
@@ -1129,36 +1261,18 @@ mod tests {
             &k,
             &counts[..7],
             &[2],
-            55,
             SplitError::CountsShape { len: 7, want: 8 },
         );
         refuses(
             &k,
-            &counts,
+            &[10, 10, 40, 30, 7, 6, 5, 1],
             &[2],
-            54,
-            SplitError::CountsUnit {
-                sum: 110,
-                unit: 54,
-                top_k: 2,
-            },
-        );
-        refuses(
-            &k,
-            &counts,
-            &[2],
-            u64::MAX,
-            SplitError::CountsUnit {
-                sum: 110,
-                unit: u64::MAX,
-                top_k: 2,
-            },
+            SplitError::CountsSum { sum: 109, top_k: 2 },
         );
         refuses(
             &k,
             &[4, 4, 4, 4, 60, 3, 2, 1],
             &[2],
-            41,
             SplitError::CountPastUnit {
                 id: 4,
                 count: 60,
@@ -1169,22 +1283,14 @@ mod tests {
             &k,
             &counts,
             &[8],
-            55,
             SplitError::HostOutOfRange { id: 8, experts: 8 },
         );
-        refuses(
-            &k,
-            &counts,
-            &[3, 3],
-            55,
-            SplitError::HostDuplicate { id: 3 },
-        );
+        refuses(&k, &counts, &[3, 3], SplitError::HostDuplicate { id: 3 });
         let unrouted = [10, 10, 40, 30, 7, 0, 5, 8];
         refuses(
             &k,
             &unrouted,
             &[2, 5, 5],
-            55,
             SplitError::HostDuplicate { id: 5 },
         );
     }
@@ -1240,19 +1346,24 @@ mod tests {
         assert!((beside_b_per_us(&unit) - k.lane_b_per_us * (1.0 - s)).abs() < 1e-9);
     }
 
-    /// The stream floor prices its copy beside the union, where it runs: at
-    /// the recalibrated costs and share, m* = 70.429, past the alone-rate
-    /// floor the lane's own rate gives, 46.3 (mutant: the floor at the
-    /// lane's rate alone).
+    /// The ring prices its copies beside the union, where they run: the 5090
+    /// shape at its calibration share streams 207, and at the lane's own rate
+    /// (no share, a copy of 144.906 against 234.096) the cheaper copies
+    /// stream 243 (mutant: the ring's copies at the lane's rate alone).
     #[test]
-    fn the_stream_floor_prices_its_copy_beside_the_union() {
-        let k = a6000();
-        assert!((m_star(&k) - 70.429).abs() < 0.001);
-        let alone = k.expert_b as f64 / k.lane_b_per_us + k.card_us_fixed;
-        assert!(
-            m_star(&k) > alone / (k.host_us_per_col - k.card_us_per_col),
-            "the beside-union rate must price dearer than the lane's own"
-        );
+    fn the_ring_prices_its_copies_beside_the_union() {
+        let host: Vec<u32> = (114..512).collect();
+        let mut out = Split::default();
+        let mut streamed = |k: &Constants| {
+            split(&[80; 512], &host, 57, k, &mut out).unwrap();
+            out.stream.len()
+        };
+        let beside = streamed(&their_5090());
+        let alone = streamed(&Constants {
+            union_burst_share: 0.0,
+            ..their_5090()
+        });
+        assert_eq!((beside, alone), (207, 243));
     }
 
     /// The walk admits past the balance the beside-union rate stops at: the
@@ -1425,14 +1536,16 @@ mod tests {
         assert_eq!(walk_gate(&a), 1);
     }
 
-    /// The gate never skips a unit the walk would admit from: over every
-    /// unit width under it, a thousand units each at random picks over 512 experts and a
-    /// random host set admit nothing at the worst tail (none), and over the
-    /// widths past it some unit admits (the gate is not vacuous). A walk gate
-    /// that read the 4690 tail would skip the widths 9..48 these units
-    /// admit at (mutant: the gate with a tail).
+    /// The gate never skips a unit the walk would admit from or the ring
+    /// would stream from: over every unit width under it, a thousand units
+    /// each at random picks over 512 experts and a random host set admit
+    /// nothing at the worst tail (none) and stream nothing with nothing
+    /// admitted ahead, and over the widths past it some unit admits and some
+    /// streams (the gate is not vacuous). A walk gate that read the 4690 tail
+    /// would skip the widths 9..48 these units admit at (mutants: the gate
+    /// with a tail; a ring that streams a copy the union cannot cover).
     #[test]
-    fn the_walks_gate_never_skips_a_unit_the_walk_admits_from() {
+    fn the_walks_gate_never_skips_a_unit_the_walk_admits_or_streams_from() {
         let k = Constants {
             experts: 512,
             ..gate_shape()
@@ -1445,7 +1558,8 @@ mod tests {
                 .wrapping_add(1_442_695_040_888_963_407);
             (seed >> 33) % n
         };
-        let mut admitted_past = 0;
+        let (mut admitted_past, mut streamed_past) = (0, 0);
+        let mut tail = Tail::default();
         for m in 1..=3 * gate as usize {
             for _ in 0..1000 {
                 let mut counts = vec![0u32; 512];
@@ -1462,19 +1576,26 @@ mod tests {
                 unit.union_burst_share = 0.0;
                 let plan = admit_walk(&counts, &host, &unit, 1, ReturnCost::Hidden).unwrap();
                 let admits = plan.floor != u32::MAX;
+                stream_tail(&counts, &host, 0, &unit, &mut tail).unwrap();
+                let streams = !tail.stream.is_empty();
                 if m < gate as usize {
                     assert!(
                         !admits,
                         "a unit of {m} columns admits under the gate {gate}"
                     );
+                    assert!(
+                        !streams,
+                        "a unit of {m} columns streams under the gate {gate}"
+                    );
                 } else {
                     admitted_past += usize::from(admits);
+                    streamed_past += usize::from(streams);
                 }
             }
         }
         assert!(
-            admitted_past > 0,
-            "no unit past the gate admits: a vacuous gate"
+            admitted_past > 0 && streamed_past > 0,
+            "no unit past the gate admits or streams: a vacuous gate"
         );
     }
 
@@ -1570,11 +1691,11 @@ mod tests {
             .count()
     }
 
-    /// The ring's rule never reads the card's tail: m*, m_min and the tail's
-    /// split are the same at no tail, at the flat 4690 and at a unit's
-    /// priced one (the negative witness of the tail's pricing: the ring's
-    /// floor moves with nothing the walk's tail sets; mutant: the floor
-    /// reading the tail as a fixed cost).
+    /// The ring's rule never reads the card's tail: the split is the same at
+    /// no tail, at the flat 4690 and at a unit's priced one (the negative
+    /// witness of the tail's pricing: the ring's balance moves with nothing
+    /// the walk's tail sets; mutant: the ring's card side starting at the
+    /// tail).
     #[test]
     fn the_rings_rule_never_reads_the_tail() {
         let (counts, host) = unit512();
@@ -1586,8 +1707,6 @@ mod tests {
         flat.card_tail_us = 4690.0;
         let (mut a, mut b, mut c) = (Split::default(), Split::default(), Split::default());
         for (k, out) in [(&zero, &mut a), (&flat, &mut b), (&priced, &mut c)] {
-            assert_eq!(m_star(k), m_star(&zero));
-            assert_eq!(m_min(k), m_min(&zero));
             split(&counts, &host, 22, k, out).unwrap();
         }
         assert_eq!((&a, &b), (&b, &c));

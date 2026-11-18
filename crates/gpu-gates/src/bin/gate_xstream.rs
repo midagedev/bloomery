@@ -5,9 +5,11 @@
 //! experts 0..8 at places 0..8 and the host the rest; each expert has three
 //! parts of 2048, 2048 and 1024 bytes, words from a hash of its (layer, id,
 //! part). The rule's costs are the gate's (a host column far dearer than the
-//! copy and the card's column), so every routed host expert is in the rule's
-//! set and the balance never cuts it: the stream is the rule's set cut at
-//! the ring's half, in rank order (count descending, id ascending). Each
+//! copy and the card's column), so the rule's set is every routed host
+//! expert but the coldest, which the balance leaves to the union (streaming
+//! it would empty the union), and the half cuts the set before it: the
+//! stream is the rule's set cut at the ring's half, in rank order (count
+//! descending, id ascending). Each
 //! unit is 64 columns, 128 picks: the card experts 8 each, the host experts
 //! 16, 14, 10, 8, 6, 4, 4, 2 (a second unit's set reversed).
 //!
@@ -16,7 +18,8 @@
 //!   card has room) and a pinned staging of the slots asked for, the lane's
 //!   rate measured and positive. The probe streams layer 1's host experts
 //!   into the first half, which the first stream (layer 0's) then takes.
-//! - set: a unit's streamed experts are the rule's set ([`stream_tail`]) cut
+//! - set: a unit's streamed experts are the rule's set
+//!   ([`runtime::xsplit::stream_tail`], nothing admitted ahead) cut
 //!   at the half in rank order, the exclusion set the same ids ascending, and
 //!   the layer's record says so (tail, streamed, the union's columns).
 //! - rows: the half's ring row holds slot `i` for the `i`-th streamed expert
@@ -106,13 +109,12 @@ mod gate {
     use bloomery_gpu::host::swap::{Piece, SwapSource, Transform};
     use bloomery_gpu::host::xstream::{
         Costs, GROUP_WALK_ORDER, PARTS, RingLayer, XCfg, XSTREAM_ROOM, XStream, land_batch_size,
-        stream_tail,
     };
     use bloomery_gpu::{Gpu, GpuError, HostFlags};
     use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use cuda_core::{CudaContext, CudaStream, DeviceBuffer, sys};
     use runtime::sched::{Item, Overlap, PortKind, order_in};
-    use runtime::xsplit::{Constants, Split};
+    use runtime::xsplit::{Constants, Tail, stream_tail};
     use threads::helper::{Placement, spawn_helper};
 
     const L: usize = 2;
@@ -141,9 +143,12 @@ mod gate {
     const DROP_BOUND: Duration = Duration::from_secs(5);
 
     /// The gate's costs: a host column far dearer than a copy of the
-    /// synthetic expert and its card columns, so neither the floor nor the
-    /// balance cuts a unit's set before the half at the lane's priced rate,
-    /// or at any rate above a megabyte a second.
+    /// synthetic expert and its card columns, so the balance does not cut a
+    /// unit's set before the half at any rate above a megabyte a second (six
+    /// streams leave a union of 60,000 against at most 30,818 on the card's
+    /// side [µs]), and its set is the seven hottest at any rate above 1.81
+    /// bytes a microsecond: the coldest (2 columns, 20,000 on the union) would
+    /// empty the union.
     const COSTS: Costs = Costs {
         host_us_per_col: 10_000.0,
         host_us_fixed: 1.0,
@@ -307,8 +312,8 @@ mod gate {
     /// The rule's set cut at the half, in rank order.
     fn want_set(x: &XStream, l: usize, c: &[u32]) -> Result<Vec<u32>, GateError> {
         let k: Constants = x.constants(l).ok_or("the stream's constants of a layer")?;
-        let mut s = Split::default();
-        stream_tail(c, &host(), &k, &mut s).map_err(|e| format!("the rule: {e}"))?;
+        let mut s = Tail::default();
+        stream_tail(c, &host(), 0, &k, &mut s).map_err(|e| format!("the rule: {e}"))?;
         s.stream.truncate(x.half_slots());
         Ok(s.stream)
     }
@@ -483,10 +488,14 @@ mod gate {
             .filter(|id| !want_a.contains(id))
             .map(|&id| u64::from(ca[id as usize]))
             .sum();
+        // PIN(2026-11-19): the record's tail was every routed host expert,
+        // E - N_CARD, when the rule's set was each expert past its own
+        // crossover; the set is now the balance's, which leaves the coldest
+        // to the union ([`COSTS`]), so the tail is one fewer.
         let set_ok = want_a.len() == HALF
             && r.n == HALF
             && x.excluded(key(0)) == sorted.as_slice()
-            && rec.tail == E - N_CARD
+            && rec.tail == E - N_CARD - 1
             && rec.streamed == HALF
             && rec.host_columns == host_columns;
         println!(

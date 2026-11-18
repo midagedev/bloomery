@@ -246,8 +246,8 @@ mod gate {
     /// width at the load's prices and at the gate's fixed rule input.
     const SPLIT_PROMPT: usize = 2048;
     /// The `split` clause's fixed rule input: a host column a
-    /// thousand microseconds, so the stream's floor sits under one column and
-    /// the balance cuts only the last few experts of a layer.
+    /// thousand microseconds, so the union passes the card's side and the
+    /// balance cuts only the last few experts of a layer.
     const SPLIT_COSTS: Costs = Costs {
         host_us_per_col: 1000.0,
         host_us_fixed: 19.95,

@@ -144,13 +144,10 @@ mod gate {
     /// moving slot [derived].
     const REAL_EXPERTS: u64 = 8 << 30;
 
-    /// The stream's fixed rule input: a host column of a tenth of a second, so the stream's floor sits under one column and
-    /// every host expert a unit routes streams until the ring's half or the balance cuts it. The host union's fixed cost of
-    /// an expert is held under the card's fixed cost of a streamed one: the rule refuses a fixed cost past one expert's
-    /// lane copy plus the card's fixed cost (`stream_tail`), and a copy of the fixture's experts (about 0.17 MB, tens of
-    /// microseconds at the lane's rate [derived]) is shorter than the real ones' (23.5 MB), so only a fixed cost under the
-    /// card's own holds at every expert size. A column at the host's per-column cost is dearer than any fixed cost, so
-    /// the value moves no decision of the stream.
+    /// The stream's fixed rule input: a host column of a tenth of a second, so the union a unit's host experts cost passes
+    /// the card's side and every host expert a unit routes streams until the ring's half or the balance cuts it (the
+    /// balance leaves a layer's coldest to the union). A column at the host's per-column cost is dearer than the host
+    /// union's fixed cost of an expert, so the fixed value moves no decision of the stream.
     const SPLIT_COSTS: Costs = Costs {
         host_us_per_col: 1.0e5,
         host_us_fixed: 45.0,
@@ -159,9 +156,8 @@ mod gate {
     };
 
     const _: () = assert!(
-        SPLIT_COSTS.host_us_fixed <= SPLIT_COSTS.card_us_fixed
-            && SPLIT_COSTS.host_us_fixed < SPLIT_COSTS.host_us_per_col,
-        "SPLIT_COSTS.host_us_fixed must stay at most the card's fixed cost, or the rule refuses a layer of small experts",
+        SPLIT_COSTS.host_us_fixed < SPLIT_COSTS.host_us_per_col,
+        "SPLIT_COSTS.host_us_fixed must stay under a column's cost, or it moves the union's price of a one-column expert",
     );
 
     /// One run of the prompt: what it moved and what the steps after it read.

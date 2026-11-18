@@ -88,9 +88,8 @@ mod gate {
 
     /// Cache rows of the engine child: the prompt and the steps, with room.
     const CTX: usize = 1024;
-    /// The prompt's positions: exactly the 512 under `xsplit::m_min`
-    /// (`crates/runtime/src/xsplit.rs:75`), so nothing streams or is admitted and every
-    /// non-resident expert runs on the leg.
+    /// The prompt's positions. The load runs residency off, so nothing streams or is admitted and every non-resident
+    /// expert runs on the leg.
     const PROMPT: usize = 512;
     /// Decode steps after the prompt's own token.
     const STEPS: usize = 8;
