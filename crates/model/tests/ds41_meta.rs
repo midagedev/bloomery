@@ -1,16 +1,16 @@
 //! V4.1 metadata gate: what `arch::deepseek41::hparams` resolves from the
-//! served file's headers, against what ik resolves from the same file. Two
-//! contracts, one test each; each prints what it compared, then fails with
-//! the whole list of what differs.
+//! served file's headers, against the values the file's own header states.
+//! Each contract prints what it compared, then fails with the whole list of
+//! what differs.
 //!
-//! 1. `hw_ds41_hparams_match_ik` — every `Hparams` field equals the value ik
-//!    takes from this file. A value ik prints at load is pinned from that
-//!    printout (`$BLOOMERY_DATA/ikppl/after-idxkey.log`, a full ik load of the
-//!    served file); a value it does not print is pinned from the header, with
-//!    the ik line that reads it; a derived value says so.
+//! 1. `hw_ds41_hparams_match_header` — every `Hparams` field equals the value the
+//!    file's header states, each row naming its key (and the ik line that
+//!    reads the same key, where ik reads it); a derived value says so.
 //! 2. `hw_ds41_names_in_file` — every name `names` gives exists on exactly the
-//!    layers its kind says, and every tensor of the file is one of them or one
-//!    the step does not read.
+//!    layers its kind says, the engram sites' tensors as the file's engram
+//!    owner names them (`Engram::tables`, `wkv`, `gains`: the layout decides),
+//!    and every tensor of the file is one of them or one the step does not
+//!    read.
 //!
 //! PIN(2026-11-18): the real-file ik sets retired; ik cannot read bq3km's engram schema; the layer kinds against the graph ik built from the file (`LayerKind`'s flags and sources against the oracle manifests' nodes) left with them and no fixture set carries the shared 5-token prefill that clause read
 //!
@@ -22,7 +22,7 @@ use std::fmt::{Debug, Write as _};
 
 use gguf::Split;
 use model::arch::deepseek41::hparams::{
-    CandidateMask, CandidateRole, Collapse, Hparams, Model, Rope, Score,
+    CandidateMask, CandidateRole, Collapse, Engram, EngramGains, Hparams, Model, Rope, Score,
 };
 use model::arch::deepseek41::names;
 use model::placement::workstation;
@@ -51,7 +51,7 @@ fn row<T: PartialEq + Debug>(
     let mark = if got == want { "ok " } else { "BAD" };
     let _ = writeln!(out, "  {mark} {what:<34} {got:?}  [{source}]");
     if got != want {
-        bad.push(format!("{what}: ours {got:?}, ik {want:?} [{source}]"));
+        bad.push(format!("{what}: ours {got:?}, pinned {want:?} [{source}]"));
     }
 }
 
@@ -68,7 +68,7 @@ fn layer_row<T: PartialEq + Debug>(
         return true;
     }
     let _ = writeln!(out, "  BAD {what:<34} {got:?}  [{source}]");
-    bad.push(format!("{what}: ours {got:?}, ik {want:?} [{source}]"));
+    bad.push(format!("{what}: ours {got:?}, pinned {want:?} [{source}]"));
     false
 }
 
@@ -76,7 +76,7 @@ fn fail_if_bad(out: &str, bad: &[String]) {
     println!("{out}");
     assert!(
         bad.is_empty(),
-        "{} value(s) differ from ik:\n  {}",
+        "{} value(s) differ from the pins:\n  {}",
         bad.len(),
         bad.join("\n  ")
     );
@@ -84,26 +84,47 @@ fn fail_if_bad(out: &str, bad: &[String]) {
 
 #[test]
 #[ignore = "hw: needs the V4.1 shards on the box"]
-fn hw_ds41_hparams_match_ik() {
+fn hw_ds41_hparams_match_header() {
     let (split, hp) = open();
     let mut out = String::new();
     let mut bad = Vec::new();
     let o = &mut out;
     let b = &mut bad;
 
-    // PIN(2026-09-23): ik's load print of the served file (after-idxkey.log) and the file's header; ik lines at the oracle tree 49ef19d0.
+    // PIN(2026-11-18): the served file's own header (bq3km), each value read off its key; ik cannot read bq3km's engram schema, so no ik print of it exists; every value equals what ik printed for the Q3_K_M file (after-idxkey.log).
     let _ = writeln!(o, "shape");
-    row(o, b, "n_layer", hp.n_layer, 40, "ik print n_layer = 40");
-    row(o, b, "n_embd", hp.n_embd, 5120, "ik print n_embd = 5120");
-    row(o, b, "n_head", hp.n_head, 64, "ik print n_head = 64");
-    row(o, b, "n_head_kv", hp.n_head_kv, 1, "ik print n_head_kv = 1");
+    row(o, b, "n_layer", hp.n_layer, 40, "header block_count = 40");
+    row(
+        o,
+        b,
+        "n_embd",
+        hp.n_embd,
+        5120,
+        "header embedding_length = 5120",
+    );
+    row(
+        o,
+        b,
+        "n_head",
+        hp.n_head,
+        64,
+        "header attention.head_count = 64",
+    );
+    row(
+        o,
+        b,
+        "n_head_kv",
+        hp.n_head_kv,
+        1,
+        "header attention.head_count_kv = 1",
+    );
     row(
         o,
         b,
         "head_dim",
         hp.head_dim,
         512,
-        "ik print n_embd_head_k = n_embd_head_v = 512",
+        "header attention.key_length = attention.value_length = 512",
     );
     row(
         o,
@@ -129,15 +150,29 @@ fn hw_ds41_hparams_match_ik() {
         1024,
         "header output_lora_rank; llama-hparams.cpp:2047",
     );
-    row(o, b, "rope_dims", hp.rope_dims, 64, "ik print n_rot = 64");
-    row(o, b, "window", hp.window, 128, "ik print n_swa = 128");
+    row(
+        o,
+        b,
+        "rope_dims",
+        hp.rope_dims,
+        64,
+        "header rope.dimension_count = 64",
+    );
+    row(
+        o,
+        b,
+        "window",
+        hp.window,
+        128,
+        "header attention.sliding_window = 128",
+    );
     row(
         o,
         b,
         "rms_eps",
         hp.rms_eps,
         1e-20,
-        "ik print f_norm_rms_eps = 1.0e-20",
+        "header attention.layer_norm_rms_epsilon = 1e-20",
     );
     row(
         o,
@@ -145,7 +180,7 @@ fn hw_ds41_hparams_match_ik() {
         "n_vocab",
         hp.n_vocab,
         129_280,
-        "ik print n_vocab = 129280 (no vocab_size key)",
+        "the header's tokenizer.ggml.tokens, 129280 entries (no vocab_size key)",
     );
     let head_rows = split
         .find(&names::output())
@@ -164,10 +199,24 @@ fn hw_ds41_hparams_match_ik() {
         "n_ctx_train",
         hp.n_ctx_train,
         1_048_576,
-        "ik print n_ctx_train = 1048576",
+        "header context_length = 1048576",
     );
-    row(o, b, "csa_ratio", hp.csa_ratio, 2, "ik print csa ratio 2");
-    row(o, b, "hca_ratio", hp.hca_ratio, 1, "ik print hca ratio 1");
+    row(
+        o,
+        b,
+        "csa_ratio",
+        hp.csa_ratio,
+        2,
+        "derived: the header's attention.compress_ratios, 2 on layers 2-19",
+    );
+    row(
+        o,
+        b,
+        "hca_ratio",
+        hp.hca_ratio,
+        1,
+        "derived: the header's attention.compress_ratios, 1 on layers 20-39",
+    );
 
     let _ = writeln!(o, "indexer");
     row(
@@ -292,7 +341,7 @@ fn hw_ds41_hparams_match_ik() {
         "experts.n_expert",
         e.n_expert,
         384,
-        "ik print n_expert = 384",
+        "header expert_count = 384",
     );
     row(
         o,
@@ -300,7 +349,7 @@ fn hw_ds41_hparams_match_ik() {
         "experts.n_used",
         e.n_used,
         6,
-        "ik print n_expert_used = 6",
+        "header expert_used_count = 6",
     );
     row(
         o,
@@ -402,9 +451,7 @@ fn hw_ds41_hparams_match_ik() {
         "derived (4-1)*8; build_deepseek4.cpp:996",
     );
     for &l in &g.layer_ids {
-        let input = split
-            .find(&names::engram_wkv(l))
-            .map(|(_, t)| t.dims[0] as usize);
+        let input = split.find(&g.wkv(l)).map(|(_, t)| t.dims[0] as usize);
         let what = format!("engram.embedding_width, layer {l}");
         row(
             o,
@@ -412,7 +459,7 @@ fn hw_ds41_hparams_match_ik() {
             &what,
             Some(g.embedding_width()),
             input,
-            "derived 24*256 = the file's engram_wkv input width",
+            "derived 24*256 = the input width of the file's projection, `Engram::wkv`",
         );
     }
 
@@ -441,7 +488,7 @@ fn hw_ds41_hparams_match_ik() {
         "compressed rope freq_scale",
         yarn.freq_scale,
         0.0625,
-        "ik print freq_scale_train = 0.0625",
+        "header rope.scaling.factor = 16, freq_scale its inverse",
     );
     row(
         o,
@@ -449,7 +496,7 @@ fn hw_ds41_hparams_match_ik() {
         "compressed rope ext_factor",
         yarn.ext_factor,
         1.0,
-        "derived: ik print rope scaling = yarn; llama.cpp:9059-9060",
+        "derived: header rope.scaling.type = yarn; llama.cpp:9059-9060",
     );
     // Derived: 1/(1 + 0.1 ln(1/freq_scale)) in f64 from the pinned factor; ours is ik's f32 op order.
     let want = 1.0 / (1.0 + 0.1 * 16f64.ln());
@@ -480,13 +527,13 @@ fn hw_ds41_hparams_match_ik() {
         "compressed rope n_ctx_orig",
         yarn.n_ctx_orig,
         65_536,
-        "ik print n_ctx_orig_yarn = 65536",
+        "header rope.scaling.original_context_length = 65536",
     );
 
     let _ = writeln!(o, "per layer (a layer that differs prints its own line)");
     let ratio_src =
         "header compress_ratios, the first 40 of arr[i32,43]; llama-hparams.cpp:2115-2121";
-    let window_src = "ik print freq_base_train = 10000.0; build_deepseek4.cpp:1094-1100";
+    let window_src = "header rope.freq_base = 10000; build_deepseek4.cpp:1094-1100";
     let clamp_src = "header swiglu_clamp_exp/_shexp, arr[f32,40]; llama-hparams.cpp:1976-1977";
     let ratio = |l: usize| match l {
         0..=1 => 0,
@@ -570,12 +617,19 @@ const COMPRESSOR: &[Name] = &[names::attn_compressor_kv, names::attn_compressor_
 const GATE: &[Name] = &[names::attn_compressor_gate];
 const INDEX_KEYS: &[Name] = &[names::indexer_attn_k, names::indexer_k_norm];
 const INDEXER: &[Name] = &[names::indexer_attn_q_b, names::indexer_proj];
-const ENGRAM: &[Name] = &[
-    names::engram_embd,
-    names::engram_k,
-    names::engram_q,
-    names::engram_wkv,
-];
+/// Layer `l`'s engram tensors as the file's engram owner names them: the
+/// site's table (`None` off a site; a concatenated table is one tensor every
+/// site names), then the projection and the gains, which the layout names on
+/// every layer.
+fn engram_names(g: &Engram, l: usize) -> (Option<String>, Vec<String>) {
+    let table = g.tables.site(l as u64).map(|s| s.tensor.clone());
+    let mut per_layer = vec![g.wkv(l)];
+    match g.gains(l) {
+        EngramGains::Pair { key, query } => per_layer.extend([key, query]),
+        EngramGains::Folded { gate } => per_layer.push(gate),
+    }
+    (table, per_layer)
+}
 
 #[test]
 #[ignore = "hw: needs the V4.1 shards on the box"]
@@ -590,18 +644,23 @@ fn hw_ds41_names_in_file() {
         }
         named.insert(name);
     }
+    let engram = hp.engram.as_ref().expect("a V4.1 file has engram sites");
     for (l, k) in hp.layers.iter().enumerate() {
-        let groups: [(&str, &[Name], bool); 7] = [
+        let groups: [(&str, &[Name], bool); 6] = [
             ("every layer", EVERY_LAYER, true),
             ("routed", ROUTED, k.routed),
             ("compressor", COMPRESSOR, k.compressor.is_some()),
             ("gated", GATE, k.compressor.is_some_and(|c| c.gated)),
             ("index keys", INDEX_KEYS, k.index_keys),
             ("indexer", INDEXER, k.indexer),
-            ("engram", ENGRAM, k.engram.is_some()),
         ];
-        for (group, list, carries) in groups {
-            for name in list.iter().map(|f| f(l)) {
+        let (table, site) = engram_names(engram, l);
+        let lists = groups
+            .into_iter()
+            .map(|(group, list, carries)| (group, list.iter().map(|f| f(l)).collect(), carries))
+            .chain([("engram", site, k.engram.is_some())]);
+        for (group, list, carries) in lists {
+            for name in list {
                 if split.find(&name).is_some() != carries {
                     let is = if carries { "is not" } else { "is" };
                     bad.push(format!(
@@ -610,6 +669,20 @@ fn hw_ds41_names_in_file() {
                 }
                 named.insert(name);
             }
+        }
+        if k.engram.is_some() != table.is_some() {
+            bad.push(format!(
+                "layer {l}: an engram layer {} and a site table {table:?}",
+                k.engram.is_some()
+            ));
+        }
+        if let Some(name) = table {
+            if split.find(&name).is_none() {
+                bad.push(format!(
+                    "layer {l} (engram table): {name} is not in the file"
+                ));
+            }
+            named.insert(name);
         }
     }
     let unnamed: Vec<String> = split
@@ -658,7 +731,9 @@ const V41_VIEW: &[&str] = &[
     "engram Some(EngramSpec { heads: 8, max_ngram: 4, key_length: 256, rule: Engram })",
     // PIN(2026-10-20): the reasoning field prints its tags (`ReasoningFormat::ThinkSpan` carries
     // them); the values are the same.
-    "chat pre joyai-llm template bytes 6945 tools Some(Dsml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })",
+    // PIN(2026-11-18): the template bytes are bq3km's own `tokenizer.chat_template`, 17672 bytes
+    // (Unsloth's template, which the requant kept); the pre-tokenizer, tools and reasoning are the same.
+    "chat pre joyai-llm template bytes 17672 tools Some(Dsml) reasoning Some(ThinkSpan { open: \"<think>\", close: \"</think>\" })",
     "[0] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",
     "[1] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 10000 yarn - qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc [Engram]",
     "[2,8] latent h 64 q 1280 kv 512 KeqV rope NormTail 64 base 160000 yarn 16/65536/32/1 qhn false out Grouped { groups: 8, rank: 1024 } win Some(128) sinks true | cmp r2 Own{g1 a0 o0} | sel 32x128 k512 keys Own list Own cand None || moe 384/6 ff 2304 swiglu Some(10.0) SqrtSoftplus bias true norm true x1.5 hash false shared 2304 swiglu Some(10.0) gate false || hc",

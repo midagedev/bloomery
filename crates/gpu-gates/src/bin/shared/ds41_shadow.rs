@@ -3,6 +3,7 @@
 
 use bloomery_gpu_gates::GateError;
 use gguf::{GgmlType, Split};
+use model::arch::deepseek41::hparams::Engram;
 use model::arch::deepseek41::names;
 
 /// Tensor `name`'s type in `split`.
@@ -132,22 +133,28 @@ pub fn shadow_kernels(
 
 /// Engram site `l`'s token-only work, in stream order: its rows decoded
 /// (`ds41_glue_engram_rows`, or `_q3k` for a q3_K table, `_iq4nl` for an
-/// iq4_nl one), `engram_wkv`
-/// ([`projection`]) and the key norm. It reads the step image and weights
-/// alone.
+/// iq4_nl one), the projection of the gathered rows ([`projection`]) and the
+/// key norm. It reads the step image and weights alone. The site's table and
+/// projection are the tensors `engram` names under the file's layout
+/// ([`Engram::tables`], [`Engram::wkv`]).
 pub fn engram_kv_kernels(
     split: &Split,
+    engram: &Engram,
     l: usize,
     prefetch: bool,
 ) -> Result<Vec<&'static str>, GateError> {
-    let table = names::engram_embd(l);
-    let mut k = vec![match type_of(split, &table)? {
+    let table = &engram
+        .tables
+        .site(l as u64)
+        .ok_or_else(|| format!("layer {l} is no engram site of the file"))?
+        .tensor;
+    let mut k = vec![match type_of(split, table)? {
         GgmlType::Q8_0 => "ds41_glue_engram_rows",
         GgmlType::Q3_K => "ds41_glue_engram_rows_q3k",
         GgmlType::IQ4_NL => "ds41_glue_engram_rows_iq4nl",
         other => return Err(format!("{table}: {other} has no row kernel").into()),
     }];
-    let wkv = names::engram_wkv(l);
+    let wkv = engram.wkv(l);
     k.extend(projection(type_of(split, &wkv)?, &wkv, prefetch)?);
     k.push("engram_key_norm");
     Ok(k)

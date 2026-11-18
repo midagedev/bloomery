@@ -21,6 +21,11 @@
 #           weekly-gpu-ds41-serve, a recipe this table cannot hold (gate-* rows only): its red blocks a release through the
 #           night's verdict until it is a gate-* recipe with a +ship row
 #   owners  the owners it tests, a '+' list of names in tools/owners.tsv, or '-'
+# A gate removed from the table keeps its dated reason here (AGENTS.md: removing a gate needs the reason relaxing one does):
+#   2026-11-18 gate-ds41-kld (family deepseek41, host): its subject, ik's KL-divergence bases of the V4.1 Q3_K_M file
+#           (ikppl/kldbase-c2048x4, kldbase-c512x16), retired with that file, and ik cannot read the bq3km file the tree
+#           runs; with it went gate_deepseek41_step's --ppl and run-ds41-ppl. The loss tool stays and takes a new base:
+#           `just ds41-kld` (ppl_ds41 writes ik's base format), kld_diff, and the step gate's --kld-walk clause
 gate-1-1	common		host	quant_host_qdot
 gate-app	common		host	seats_app+drafts_mtp+drafts_dspark
 gate-arch-registry	common		registry	arch_registry
@@ -29,7 +34,6 @@ gate-chain	common		host	chain_plan+chain_hybrid
 gate-decision	common		constrain	decision_head
 gate-ds41-bind	family	deepseek41	host	-
 gate-ds41-host	family	deepseek41	host	-
-gate-ds41-kld	family	deepseek41	host	-
 gate-ds41-load	family	deepseek41	host	-
 gate-ds41-meta	family	deepseek41	meta	arch_registry
 gate-ds41-open	family	deepseek41	meta	arch_registry

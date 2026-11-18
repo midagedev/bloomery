@@ -161,19 +161,36 @@ fn hw_ds41_open_gives_every_tensor_a_role() {
         stored.len(),
     );
 
-    // The tables sit in the model's shards or, when the header names a file for them, in the companion.
+    // The tables sit in the model's shards or, when the header names a file for them, in the companion;
+    // the file's layout decides whether each site has a tensor of its own or every site's rows sit in one
+    // (`EngramTables`, the owner every reader of a site's rows asks).
     let tables: Vec<_> = model
         .tensors
         .iter()
         .filter(|t| t.role == Role::EngramTable)
         .collect();
-    let layers: Vec<_> = tables.iter().filter_map(|t| t.layer).collect();
+    let sites = &o
+        .hp
+        .engram
+        .as_ref()
+        .expect("a V4.1 file has engram sites")
+        .tables
+        .sites;
     row(
         &mut out,
         &mut bad,
-        "engram table layers",
-        layers,
-        LAYER_IDS.to_vec(),
+        "engram table sites",
+        sites.iter().map(|s| s.layer).collect::<Vec<_>>(),
+        LAYER_IDS.iter().map(|&l| l as u64).collect(),
+    );
+    let mut owned: Vec<&str> = sites.iter().map(|s| s.tensor.as_str()).collect();
+    owned.dedup();
+    row(
+        &mut out,
+        &mut bad,
+        "engram table tensors = the sites' own",
+        tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        owned,
     );
     let in_companion = tables.iter().filter(|t| t.shard >= shards).count();
     let named = facts::text_opt(o.split.keys(), ARCH, &ENGRAM.file).expect("engram.file");

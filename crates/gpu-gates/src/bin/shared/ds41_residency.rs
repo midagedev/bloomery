@@ -3,10 +3,14 @@
 //! `gate_ds41_callstream` on its load: plan (b′) on both cards (`--place
 //! bp`: the stage on the A6000, the expert tier on the 3090), or plan (a) on
 //! the A6000 alone (`--place a`), the residency
-//! machine over the stage card's routed stacks at `mid-p40-s1`, set there
-//! (the lever itself is refused, so the environment cannot move it). The
-//! stage's seed is the plan's id prefix. `refuse` runs before that load, the
-//! rest on it before the callstream clauses.
+//! machine over the stage card's routed stacks at the word [`residency_at`]
+//! reads from the plan the gate opens (`mid-p<P>-s1`, P half the fewest routed
+//! experts the stage card holds in a layer), set there (the lever itself is
+//! refused, so the environment cannot move it). A plan whose stage card holds
+//! fewer than two a layer leaves no churn pool past a pin: the arm has no
+//! input there and its clauses are left by name (`no-card-room`). The stage's
+//! seed is the plan's id prefix. `refuse` runs before that load, the rest on
+//! it before the callstream clauses.
 //!
 //! A history is: the session cleared (the residency back to its seed), the
 //! first [`PROMPT`] ids of the prose corpus as one prompt call, then
@@ -100,6 +104,7 @@ use bloomery_gpu_gates::record;
 use bloomery_gpu_gates::tier;
 use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, verdict};
 use model::arch::deepseek41::place::PlanInputs;
+use model::placement::churn::ChurnPool;
 use model::placement::{Machine, workstation};
 use runtime::swaprule::SwapRule;
 use runtime::{Target, Verify, Want};
@@ -107,11 +112,8 @@ use runtime::{Target, Verify, Want};
 pub use crate::residency_clauses::StaticProbe;
 
 const NAME: &str = "residency clauses";
-/// The residency the gate runs: 40 pinned, one spare a layer.
-const RESIDENCY: Residency = Residency::Mid {
-    pinned: 40,
-    spares: 1,
-};
+/// The spare slots a layer the gate's residency runs with.
+const SPARES: usize = 1;
 /// Prompt positions: one prompt call, one batch.
 const PROMPT: usize = 64;
 /// Greedy steps after the prompt: 24 planning boundaries of the rule.
@@ -287,19 +289,50 @@ fn rule_of(s: &Session<Body>) -> Result<SwapRule, GateError> {
         .clone())
 }
 
-/// `refuse`: the host room one byte short of the churn pool, stated to the plan the open makes
-/// ([`crate::residency_clauses::short_room`]), on placement `place`'s machine.
+/// The residency the gate runs on the plan the open makes from `inputs` on `machine_of`'s cards:
+/// [`SPARES`] spares a layer, and as the pinned seed half the fewest routed experts stage card 0
+/// holds in a layer whose stacks it holds ([`ChurnPool::of`] at no pins lists them), so every
+/// stage layer keeps a pinned prefix and a churn pool at least as long, on any card. `None` when
+/// the card holds fewer than two a layer (no routed layer, or one expert): the plan leaves no
+/// churn pool past a pin, and the arm has no input there. Read from the plan, never from a load.
+pub fn residency_at(
+    inputs: &PlanInputs,
+    cfg: &OpenCfg,
+    machine_of: &dyn Fn(usize) -> Machine,
+) -> Result<Option<Residency>, GateError> {
+    let machine = machine_of(inputs.model.layers);
+    let plan = inputs.plan(&machine, workstation::CTX_MAX, &cfg.place)?;
+    let all = ChurnPool::of(&plan, 0, 0)?;
+    let fewest = all
+        .runs
+        .iter()
+        .map(|(_, list)| list.len())
+        .min()
+        .unwrap_or(0);
+    let pinned = usize::try_from(fewest / 2)?;
+    Ok((fewest >= 2).then_some(Residency::Mid {
+        pinned,
+        spares: SPARES,
+    }))
+}
+
+/// `refuse`: the host room one byte short of the churn pool `residency` keeps, stated to the plan
+/// the open makes ([`crate::residency_clauses::short_room`]), on placement `place`'s machine.
 pub fn refuse_clause(
     path: &Path,
     inputs: &PlanInputs,
     cfg: &OpenCfg,
     place: Place,
     machine_of: &dyn Fn(usize) -> Machine,
+    residency: Residency,
 ) -> Result<bool, GateError> {
     let machine = machine_of(inputs.model.layers);
     let plan = inputs.plan(&machine, workstation::CTX_MAX, &cfg.place)?;
-    let pool = swap::churn(&plan, 0, RESIDENCY)?.ok_or("no churn pool under mid")?;
-    record::residency_host("mid-p40-s1", &pool, &plan).print();
+    let pool = swap::churn(&plan, 0, residency)?.ok_or("no churn pool under mid")?;
+    let Residency::Mid { pinned, spares } = residency else {
+        return Err("refuse: the gate's residency is off".into());
+    };
+    record::residency_host(&format!("mid-p{pinned}-s{spares}"), &pool, &plan).print();
     let short = crate::residency_clauses::short_room(&plan, pool.bytes)?;
     let at = cfg.clone().with_host_room(short);
     crate::residency_clauses::refuse_tail(short, pool.bytes, REFUSE_BOUND_S, move || {
@@ -475,7 +508,7 @@ pub fn c1_alone(s: &mut Session<Body>) -> Result<bool, GateError> {
 }
 
 /// Every clause after `refuse` on `s`, the load just made under
-/// [`RESIDENCY`] by placement `place` (plan (b′) or (a)), before its first
+/// [`residency_at`]'s word by placement `place` (plan (b′) or (a)), before its first
 /// call; `flags` holds the copy stream for `c3`. Host streaming is off for
 /// them, as on the load they were made on (their prompt calls are under the
 /// streaming floor anyway). `false` when one is red; under plan (a), with

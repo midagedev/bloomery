@@ -368,6 +368,11 @@ the stage card, that card's usable bytes for the plan's own union (`tier::union_
 one-card machine is stopped earlier, at the `both` refusal and the batch's `two_card=` deferral; the bin's own check serves a direct run and a
 two-card machine that is not an A6000 and a 3090.
 
+A clause that reads the r8 sidecar asks the plan first: a plan that reserves an NVMe tier arena cannot carry the
+sidecar (the arena's fills read the source's bytes, and `GpuModel::nvme_tier` refuses the pair), so there the clause
+ends as `deferred(real) no-sidecar-plan: <clause>` (`tier::sidecar_clause`), in either tier, with rc 0. A plan with no
+arena reads the sidecar through the file mappings, the paged ids too, and runs it: `gate-ds41-load`'s (vii) does so.
+
 ## 4. Fixtures and reference sets
 
 A fixture-tier gate reads two inputs: the family's fixture and the `fx_` reference sets. Three families have a fixture

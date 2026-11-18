@@ -42,9 +42,8 @@
 //!    through 255, 254, 253, 200, 127, 1, 0 (activations scaled so no sum
 //!    leaves f32) against the host transcription, gate·up and down, bit for
 //!    bit — ggml's half rule for every byte.
-//! 5. **Oracle diagnostics, no pin**: the dsref set `code64_n32_w3`, block 0
-//!    layer 0 — our router and experts on ik's FFN input against ik's
-//!    logits, top-3, weights, SwiGLU rows, per-slot down rows and combine.
+//!
+//! PIN(2026-11-18): the dsref set's oracle diagnostics (ik's router and experts on block 0 layer 0) retired with the set; ik cannot read bq3km's engram schema; they pinned nothing
 //!
 //! The bound of item 2. A value `x` of a 128-value block with scale `d =
 //! amax/127` is stored as `q·d`, `|q·d − x| ≤ (d/2)(1 + 256u)` (the rounding
@@ -93,9 +92,7 @@ mod gate {
     use gguf::Split;
     use gguf::quant::{GgmlType, dequant_row};
     use model::arch::dspark::{DraftHparams, names};
-    use refset::arch::deepseek41::{DSREF, DSREF_SET, dspark_model};
-    use refset::dsref::{Dsref, Graph};
-    use refset::ik::{Layout, RowKind};
+    use refset::arch::deepseek41::dspark_model;
 
     const NAME: &str = "gate_dspark_experts";
     /// The expert ids of the host-rule checks: both ends and the middle.
@@ -104,8 +101,6 @@ mod gate {
     const MS: [usize; 3] = [1, 3, 8];
     /// Seeded vectors of the router check.
     const ROUTER_VECTORS: usize = 16;
-    /// A slot index no plan uses: a route entry that names nothing.
-    const NO_SLOT: u32 = u32::MAX;
 
     /// PIN(2026-09-24): the largest gate·up `max|ours − ref| / max|ref|` of
     /// item 2 was 5.358e-3 (plan all3, m = 3; 4.24e-3 to 5.36e-3 over the
@@ -425,33 +420,6 @@ mod gate {
             q8_in: q8_equal(cx, &act_x, &qx)?,
             q8_h: q8_equal(cx, &act_h, &qh)?,
         })
-    }
-
-    /// The q8_1 of a given `h` and the down-and-combine launch alone.
-    fn run_down(cx: &Ctx<'_>, p: &Plan, h: &[f32]) -> Result<Vec<f32>, GateError> {
-        let s = cx.gpu.stream();
-        let (ff, n) = (cx.gate.rows_per_expert, cx.down.rows_per_expert);
-        let n_slots = p.sel.len();
-        let hd = DeviceBuffer::from_host(s, h)?;
-        let mut act_h = MxAct::new(s, n_slots * p.m, ff)?;
-        cx.dk
-            .enqueue_quantize(s, &hd, &mut act_h, cx.gpu.unlabelled_sink())?;
-        let sel = DeviceBuffer::from_host(s, &p.sel)?;
-        let route = DeviceBuffer::from_host(s, &p.route)?;
-        let wts = DeviceBuffer::from_host(s, &p.wts)?;
-        let mut out = DeviceBuffer::<f32>::zeroed(s, p.m * n)?;
-        let d = DownArgs {
-            down: &cx.down.dev,
-            act: &act_h,
-            sel: &sel,
-            route: &route,
-            wts: &wts,
-            n_slots,
-            m: p.m,
-        };
-        cx.dk.enqueue_down(s, &d, &mut out)?;
-        s.synchronize()?;
-        Ok(out.to_host_vec(s)?)
     }
 
     /// The host rule for a plan: `h` and the combined rows, from the f32
@@ -1367,188 +1335,6 @@ mod gate {
         Ok(all)
     }
 
-    // ------------------------------------------------- oracle diagnostics
-
-    /// The draft set's block 0 block pass (`refset::dsref`).
-    struct DSet<'a> {
-        set: &'a Dsref,
-        /// Its `tensor`, `input` and `int` rows.
-        rows: usize,
-    }
-
-    impl<'a> DSet<'a> {
-        fn block0(set: &'a Dsref) -> DSet<'a> {
-            let ints = set
-                .ints
-                .iter()
-                .filter(|r| r.block == 0 && r.graph == Graph::Block)
-                .count();
-            DSet {
-                set,
-                rows: set.in_block(0, Graph::Block).len() + ints,
-            }
-        }
-
-        fn f32_row(&self, name: &str) -> Result<(Vec<f32>, [usize; 4]), GateError> {
-            let r = self
-                .set
-                .in_block(0, Graph::Block)
-                .into_iter()
-                .find(|r| r.kind == RowKind::Tensor && r.name == name && r.occurrence == 0)
-                .ok_or_else(|| format!("the set has no tensor row {name}"))?;
-            let mut ne = [0usize; 4];
-            for (n, &d) in ne.iter_mut().zip(&r.ne) {
-                *n = usize::try_from(d)?;
-            }
-            Ok((self.set.logical_f32s(r)?, ne))
-        }
-
-        fn i32_logical(&self, name: &str) -> Result<Vec<u32>, GateError> {
-            let r = self.set.int(0, Graph::Block, name, 0, Layout::Logical)?;
-            Ok(self
-                .set
-                .int_values(r)?
-                .into_iter()
-                .map(|v| v as u32)
-                .collect())
-        }
-    }
-
-    fn oracle(cx: &Ctx<'_>, r: &Router) -> Result<(), GateError> {
-        let dir = DSREF.path(DSREF_SET);
-        let full = Dsref::open(&dir, &DSREF)?;
-        let set = DSet::block0(&full);
-        let (x, ne) = set.f32_row("node_44")?;
-        let t = ne[1];
-        println!(
-            "oracle set {} block 0 layer 0: {} block-graph rows; FFN input node_44 {}x{t}; the set holds \
-             ffn_moe_logits/probs/topk/weights_scaled, ffn_moe_gate_par (h), ffn_moe_down (per slot), \
-             ffn_moe_weighted (combine) — diagnostic, not pinned",
-            dir.display(),
-            set.rows,
-            ne[0]
-        );
-        let (ik_l, _) = set.f32_row("ffn_moe_logits-0")?;
-        let (ik_p, _) = set.f32_row("ffn_moe_probs-0")?;
-        let ik_ids = set.i32_logical("ffn_moe_topk-0")?;
-        let (ik_w, _) = set.f32_row("ffn_moe_weights_scaled-0")?;
-        let (ik_h, _) = set.f32_row("ffn_moe_gate_par-0")?;
-        let (ik_d, _) = set.f32_row("ffn_moe_down-0")?;
-        let (ik_y, _) = set.f32_row("ffn_moe_weighted-0")?;
-
-        let (lk, pk, idk, wk, _) = run_router(cx, r, &r.dev, &r.bias_dev, &x, t)?;
-        println!(
-            "oracle router T={t}: logits max|diff| {:e} (ik max|logit| {:e}); scores max|diff| {:e}; \
-             top-3 ours {idk:?} ik {ik_ids:?} agree={}; weights ours {wk:?} ik {ik_w:?} max|diff| {:e}",
-            max_abs_diff(&lk, &ik_l),
-            max_abs(&ik_l),
-            max_abs_diff(&pk, &ik_p),
-            idk == ik_ids,
-            max_abs_diff(&wk, &ik_w)
-        );
-
-        let (ff, n) = (cx.gate.rows_per_expert, cx.down.rows_per_expert);
-        let plan = |sel: &[u32], wts: &[f32]| Plan {
-            sel: sel.to_vec(),
-            route: concat_route(t),
-            wts: wts.to_vec(),
-            m: t,
-        };
-        let ik_plan = plan(&ik_ids, &ik_w);
-        let run = run_plan(cx, &ik_plan, &x)?;
-        // Ours in ik's [token][slot][row] order: slot 3t + u, column t.
-        let ours_h: Vec<f32> = (0..t * N_USED)
-            .flat_map(|j| {
-                let c = j / N_USED;
-                run.h[(j * t + c) * ff..(j * t + c + 1) * ff].to_vec()
-            })
-            .collect();
-        println!(
-            "oracle experts at ik's ids and weights: h max|diff| {:e} (ik max|h| {:e}); combine max|diff| {:e} \
-             (ik max|y| {:e})",
-            max_abs_diff(&ours_h, &ik_h),
-            max_abs(&ik_h),
-            max_abs_diff(&run.out, &ik_y),
-            max_abs(&ik_y)
-        );
-        // Per slot: route only rank u, weight 1, so the combine is the dot.
-        let mut per_slot = vec![0.0f32; t * N_USED * n];
-        for u in 0..N_USED {
-            let mut route = vec![NO_SLOT; t * N_USED];
-            for c in 0..t {
-                route[c * N_USED + u] = (c * N_USED + u) as u32;
-            }
-            let p = Plan {
-                sel: ik_ids.clone(),
-                route,
-                wts: vec![1.0; t * N_USED],
-                m: t,
-            };
-            let rs = run_plan(cx, &p, &x)?;
-            for c in 0..t {
-                per_slot[(c * N_USED + u) * n..(c * N_USED + u + 1) * n]
-                    .copy_from_slice(&rs.out[c * n..(c + 1) * n]);
-            }
-        }
-        println!(
-            "oracle down per slot at ik's ids: max|diff| {:e} (ik max|down| {:e})",
-            max_abs_diff(&per_slot, &ik_d),
-            max_abs(&ik_d)
-        );
-        // Our down on ik's own h (in our layout: slot 3t + u, column t), per slot.
-        let mut h_ik = vec![0.0f32; t * N_USED * t * ff];
-        for j in 0..t * N_USED {
-            let c = j / N_USED;
-            h_ik[(j * t + c) * ff..(j * t + c + 1) * ff]
-                .copy_from_slice(&ik_h[j * ff..(j + 1) * ff]);
-        }
-        let mut per_slot_ik_h = vec![0.0f32; t * N_USED * n];
-        for u in 0..N_USED {
-            let mut route = vec![NO_SLOT; t * N_USED];
-            for c in 0..t {
-                route[c * N_USED + u] = (c * N_USED + u) as u32;
-            }
-            let p = Plan {
-                sel: ik_ids.clone(),
-                route,
-                wts: vec![1.0; t * N_USED],
-                m: t,
-            };
-            let y = run_down(cx, &p, &h_ik)?;
-            for c in 0..t {
-                per_slot_ik_h[(c * N_USED + u) * n..(c * N_USED + u + 1) * n]
-                    .copy_from_slice(&y[c * n..(c + 1) * n]);
-            }
-        }
-        println!(
-            "oracle down per slot on ik's h at ik's ids: max|diff| {:e} (ik max|down| {:e})",
-            max_abs_diff(&per_slot_ik_h, &ik_d),
-            max_abs(&ik_d)
-        );
-        // Both per-slot downs against the exact product on ik's h.
-        let exact: Vec<f32> = par(t * N_USED * n, |i| {
-            let (j, d) = (i / n, i % n);
-            let w = cx.down.row_f32(ik_ids[j], d);
-            let hv = &ik_h[j * ff..(j + 1) * ff];
-            w.iter()
-                .zip(hv)
-                .map(|(&a, &b)| f64::from(a) * f64::from(b))
-                .sum::<f64>() as f32
-        });
-        println!(
-            "oracle down per slot on ik's h vs the exact f64 product: ours max|diff| {:e}, ik max|diff| {:e}",
-            max_abs_diff(&per_slot_ik_h, &exact),
-            max_abs_diff(&ik_d, &exact)
-        );
-        let own = run_plan(cx, &plan(&idk, &wk), &x)?;
-        println!(
-            "oracle chain, our router's ids and weights: combine max|diff| {:e} vs ik's ffn_moe_weighted — \
-             diagnostic, not pinned",
-            max_abs_diff(&own.out, &ik_y)
-        );
-        Ok(())
-    }
-
     pub fn run() -> Result<(), GateError> {
         let path = PathBuf::from(dspark_model()?);
         let split = Split::open(&path)?;
@@ -1647,15 +1433,13 @@ mod gate {
         ok &= check_pair_planted(&cx)?;
         ok &= check_router(&cx, &router)?;
 
-        oracle(&cx, &router)?;
-
         if ok {
             println!(
                 "PASSED: {NAME} — dflash_expert_gate_up and dflash_expert_down (slots 0/64/127 at m 1/3/8, \
                  a routed m=3 plan) bit-identical to the host rule and inside the q8_1 bound and pins; \
                  mxfp4_gate_up_sel and mxfp4_gemv_sel (the same plans per slot, both rules, HOST and bad ids, \
                  planted scale bytes 0/1/255) bit-identical to the route entries and the host rule; \
-                 dflash_router (16 vectors, 7 tie cases) bit-identical to the host rule; oracle rows printed, not pinned"
+                 dflash_router (16 vectors, 7 tie cases) bit-identical to the host rule"
             );
             Ok(())
         } else {

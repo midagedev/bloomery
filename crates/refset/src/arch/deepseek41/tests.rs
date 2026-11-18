@@ -19,7 +19,7 @@ fn the_fixture_family_is_the_only_node_dump_family() {
     assert!(FAMILIES.iter().any(|f| std::ptr::eq(*f, fx)));
     assert_eq!(
         families(ARCH).iter().map(|f| f.name).collect::<Vec<_>>(),
-        ["dsref-deepseek41", "kld-deepseek41", "fx-ik-deepseek41"]
+        ["fx-ik-deepseek41"]
     );
     assert_eq!(fx.identity, Identity::FixtureManifest);
     assert_eq!(fx.arch, Some(ARCH));

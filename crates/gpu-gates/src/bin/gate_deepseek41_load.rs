@@ -65,6 +65,9 @@
 //!   source's rows take `dot_row` or `dot_row_cols`, which writes the same
 //!   (`ops::PairWork::compute_rows`); no other term reads the layout. The r8
 //!   load runs last, so the sidecar's pages are the ones it leaves cached.
+//!   The clause reads the gate plan first: a plan that reserves an NVMe tier
+//!   arena cannot carry the sidecar (its fills read the source's bytes and the
+//!   load refuses the pair), so there it is left by name (`no-sidecar-plan`).
 //!
 //! Before any upload the card is found by name and must have free what the
 //! plan puts on it besides the context; a short card refuses the run.
@@ -244,8 +247,19 @@ mod gate {
             (shadow_host, shadow_roomed),
             granule,
         );
-        crate::ds41_tier::sc("(vii) r8 off: the source read steps the r8 load's bits")?;
-        ok &= check_r8_off(&path, &cfg)?;
+        let arena = plan.host.nvme_arena_bytes;
+        if tier::sidecar_clause(
+            "(vii) r8 off: the source read steps the r8 load's bits",
+            arena == 0,
+        )? {
+            ok &= check_r8_off(&path, &cfg)?;
+        } else {
+            println!(
+                "check vii: the gate plan reserves an NVMe tier arena of {arena} B, whose fills \
+                 read the source's bytes: no load of it reads the r8 sidecar (GpuModel::nvme_tier \
+                 refuses the pair)"
+            );
+        }
 
         println!("gate_deepseek41_load: {}", tier::tally_line());
         if !ok {

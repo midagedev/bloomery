@@ -40,6 +40,10 @@
 //!   card asks the view for them before it plans ([`two_cards_lack`]) and the
 //!   stage card for the union its reference holds ([`union_lack`]), and leaves
 //!   every clause of the arm by name when either lacks ([`defer_for_room`]).
+//! - [`Tag::NoSidecarPlan`]: a clause that reads the r8 sidecar on a load whose
+//!   plan reserves an NVMe tier arena ([`sidecar_clause`]): the arena's fills
+//!   read the source's bytes and the load refuses the pair. Neither tier runs
+//!   it there; both leave it, by name, to a host whose plan reserves none.
 //!
 //! The `real` tier runs every clause except the fixture's oracle comparisons,
 //! tagged or not: nothing changes for a gate that declares no tags. Each of
@@ -126,11 +130,15 @@ pub enum Tag {
     /// A clause that needs more card bytes than the card in view has: the clause has no room
     /// there, in either tier, and a card with the room answers it.
     NoCardRoom,
+    /// A clause that reads the r8 sidecar on a load whose plan reserves an NVMe tier arena, whose
+    /// fills read the source's bytes: the clause has no input there, in either tier, and a host
+    /// whose plan reserves no arena answers it.
+    NoSidecarPlan,
 }
 
 impl Tag {
     /// Every tag, in the order the module doc names them.
-    pub const ALL: [Tag; 9] = [
+    pub const ALL: [Tag; 10] = [
         Tag::SelfConsistency,
         Tag::Oracle,
         Tag::FileBound,
@@ -140,6 +148,7 @@ impl Tag {
         Tag::NoHostLayer,
         Tag::NoLayoutLayer,
         Tag::NoCardRoom,
+        Tag::NoSidecarPlan,
     ];
 
     /// The tag's name as a [`DEFERRED`] line prints it.
@@ -155,6 +164,7 @@ impl Tag {
             Tag::NoHostLayer => "no-host-layer",
             Tag::NoLayoutLayer => "no-layout-layer",
             Tag::NoCardRoom => "no-card-room",
+            Tag::NoSidecarPlan => "no-sidecar-plan",
         }
     }
 }
@@ -268,12 +278,16 @@ impl Tier {
         }
     }
 
-    /// Whether this tier runs a clause carrying `tag`. A [`Tag::NoCardRoom`] clause is run by
-    /// neither: its tag says the card in view lacks the room, whatever the tier.
+    /// Whether this tier runs a clause carrying `tag`. A [`Tag::NoCardRoom`] or
+    /// [`Tag::NoSidecarPlan`] clause is run by neither: its tag says the machine lacks what the
+    /// clause reads, whatever the tier.
     #[must_use]
     pub fn runs(self, tag: Tag) -> bool {
         match self {
-            Tier::Real => !matches!(tag, Tag::FixtureOracle | Tag::NoCardRoom),
+            Tier::Real => !matches!(
+                tag,
+                Tag::FixtureOracle | Tag::NoCardRoom | Tag::NoSidecarPlan
+            ),
             Tier::Fixture => matches!(tag, Tag::SelfConsistency | Tag::FixtureOracle),
         }
     }
@@ -282,7 +296,7 @@ impl Tier {
     /// tag). The real tier runs every clause but a fixture-oracle one, which
     /// it leaves to the fixture tier. The fixture tier runs a self-consistency
     /// or fixture-oracle clause, defers the others, and refuses an untagged
-    /// one. A [`Tag::NoCardRoom`] clause is deferred in both tiers.
+    /// one. A [`Tag::NoCardRoom`] or [`Tag::NoSidecarPlan`] clause is deferred in both tiers.
     ///
     /// # Errors
     /// [`TierError::Untagged`] for a clause with no tag in the fixture tier.
@@ -290,7 +304,7 @@ impl Tier {
         match (self, tag) {
             (Tier::Fixture, None) => Err(TierError::Untagged(clause.to_string())),
             (_, None) => Ok(Decision::Run),
-            (_, Some(Tag::NoCardRoom)) => Ok(Decision::Deferred(Tag::NoCardRoom)),
+            (_, Some(tag @ (Tag::NoCardRoom | Tag::NoSidecarPlan))) => Ok(Decision::Deferred(tag)),
             (_, Some(tag)) if self.runs(tag) => Ok(Decision::Run),
             // `runs` leaves only a fixture-oracle clause to the fixture tier.
             (Tier::Real, Some(_)) => Ok(Decision::FixtureOnly),
@@ -651,6 +665,48 @@ fn room_clause_in(
     };
     let runs = run_clause_in(tier, name, tag, tally, out)?;
     if runs || tag == Tag::NoCardRoom {
+        Ok(runs)
+    } else {
+        Err(format!("the self-consistency clause {name:?} was deferred").into())
+    }
+}
+
+/// Declare the self-consistency clause `name`, which reads the r8 sidecar, and run it when
+/// `carried` says the load's plan reserves no NVMe tier arena (`HostTotals::nvme_arena_bytes` is
+/// 0, so the host leg reads the sidecar through its mapping). When it reserves one, the clause
+/// declares [`Tag::NoSidecarPlan`] and both tiers leave it, its [`DEFERRED`] line naming the tag:
+/// the load would refuse the pair by name (`GpuModel::nvme_tier`), which is the plan's fact, not
+/// the clause's red. `carried` is read from the plan, never from a failed load. `Ok(false)`: the
+/// clause was left, skip it.
+///
+/// # Errors
+/// As [`run_clause`].
+pub fn sidecar_clause(name: &str, carried: bool) -> Result<bool, GateError> {
+    sidecar_clause_in(
+        Tier::from_env()?,
+        carried,
+        name,
+        &TALLY,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+/// [`sidecar_clause`] of its inputs: the tier, whether the plan carries the sidecar, the tally and
+/// the sink.
+fn sidecar_clause_in(
+    tier: Tier,
+    carried: bool,
+    name: &str,
+    tally: &Tally,
+    out: &mut impl std::io::Write,
+) -> Result<bool, GateError> {
+    let tag = if carried {
+        Tag::SelfConsistency
+    } else {
+        Tag::NoSidecarPlan
+    };
+    let runs = run_clause_in(tier, name, tag, tally, out)?;
+    if runs || tag == Tag::NoSidecarPlan {
         Ok(runs)
     } else {
         Err(format!("the self-consistency clause {name:?} was deferred").into())
@@ -1431,10 +1487,10 @@ mod tests {
     use super::*;
     use refset::family::Identity;
 
-    /// The nine tags are the nine kinds of clause the module doc names, once
+    /// The ten tags are the ten kinds of clause the module doc names, once
     /// each, and every name prints as one word.
     #[test]
-    fn nine_tags_in_the_docs_order() {
+    fn ten_tags_in_the_docs_order() {
         let names: Vec<&str> = Tag::ALL.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
@@ -1447,7 +1503,8 @@ mod tests {
                 "no-card-layer",
                 "no-host-layer",
                 "no-layout-layer",
-                "no-card-room"
+                "no-card-room",
+                "no-sidecar-plan"
             ]
         );
         assert!(names.iter().all(|n| !n.contains(' ')));
@@ -1469,15 +1526,19 @@ mod tests {
         }
     }
 
-    /// The rule: the real tier runs every tag but the fixture's oracle and the card's lack of room,
-    /// the fixture tier runs self-consistency and the fixture's oracle. Mutant: the real tier
-    /// running `FixtureOracle` or `NoCardRoom`, or the fixture tier `Oracle`.
+    /// The rule: the real tier runs every tag but the fixture's oracle, the card's lack of room and
+    /// a plan that cannot carry the sidecar, the fixture tier runs self-consistency and the
+    /// fixture's oracle. Mutant: the real tier running `FixtureOracle`, `NoCardRoom` or
+    /// `NoSidecarPlan`, or the fixture tier `Oracle`.
     #[test]
     fn each_tier_runs_its_tags() {
         for tag in Tag::ALL {
             assert_eq!(
                 Tier::Real.runs(tag),
-                !matches!(tag, Tag::FixtureOracle | Tag::NoCardRoom),
+                !matches!(
+                    tag,
+                    Tag::FixtureOracle | Tag::NoCardRoom | Tag::NoSidecarPlan
+                ),
                 "real and {}",
                 tag.name()
             );
@@ -1490,12 +1551,12 @@ mod tests {
         }
     }
 
-    /// A clause's fate in each tier, the nine tags and an untagged clause:
+    /// A clause's fate in each tier, the ten tags and an untagged clause:
     /// the real tier runs everything but a fixture-oracle clause, which it
-    /// leaves to the fixture tier, and a no-card-room clause, which it
-    /// defers; the fixture tier runs self-consistency and fixture-oracle
-    /// clauses, defers the other five with their tag, and refuses an
-    /// untagged one. Mutant: any cell changed.
+    /// leaves to the fixture tier, and a no-card-room or no-sidecar-plan
+    /// clause, which it defers; the fixture tier runs self-consistency and
+    /// fixture-oracle clauses, defers the others with their tag, and refuses
+    /// an untagged one. Mutant: any cell changed.
     #[test]
     fn a_clauses_fate_in_each_tier() {
         let table = [
@@ -1527,6 +1588,11 @@ mod tests {
                 Tag::NoCardRoom,
                 Decision::Deferred(Tag::NoCardRoom),
                 Decision::Deferred(Tag::NoCardRoom),
+            ),
+            (
+                Tag::NoSidecarPlan,
+                Decision::Deferred(Tag::NoSidecarPlan),
+                Decision::Deferred(Tag::NoSidecarPlan),
             ),
         ];
         assert_eq!(table.len(), Tag::ALL.len());
@@ -1686,6 +1752,32 @@ mod tests {
                 (
                     false,
                     "deferred(real) no-card-room: (n2) against (n1)\n".to_string(),
+                    (0, 1, 0)
+                )
+            );
+        }
+    }
+
+    /// The sidecar clause runs as a self-consistency clause whenever the plan carries the sidecar,
+    /// in either tier; a plan with an arena leaves the clause in both tiers by its own tag, the line
+    /// the batch counts, and counts it with the deferrals. Mutant: `carried` taken in place of
+    /// `!carried`, the real tier running the clause, the tag borrowed from another kind (the line
+    /// names it), or the deferral not counted.
+    #[test]
+    fn the_sidecar_clause_is_left_only_on_a_plan_with_an_arena() {
+        let call = |tier: Tier, carried: bool| {
+            let (tally, mut out) = (Tally::new(), Vec::new());
+            let runs = sidecar_clause_in(tier, carried, "(vii) r8 off", &tally, &mut out)
+                .expect("a sidecar clause");
+            (runs, String::from_utf8(out).expect("UTF-8"), tally.counts())
+        };
+        for tier in [Tier::Real, Tier::Fixture] {
+            assert_eq!(call(tier, true), (true, String::new(), (1, 0, 0)));
+            assert_eq!(
+                call(tier, false),
+                (
+                    false,
+                    "deferred(real) no-sidecar-plan: (vii) r8 off\n".to_string(),
                     (0, 1, 0)
                 )
             );

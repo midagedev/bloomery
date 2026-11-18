@@ -119,13 +119,7 @@
 //!   held it (it is no verdict). The run closes with
 //!   `tier::expect_fixture_oracle` against the clauses it declares (a clause
 //!   that did not run, or one it does not declare, ends it by name).
-//! - `--ppl TAG` (G4): ik's KL-divergence base file `$BLOOMERY_DATA/ikppl/
-//!   TAG.kld` — refused by name unless its run (`TAG.log` beside it) read
-//!   the model file the tree runs with the family's ik tree
-//!   (`refset::kld::check`) — chunk by chunk from a reset, one step per id;
-//!   at every scored position the paired difference `d = NLL_ours − NLL_ik`,
-//!   KL(ik‖ours), the top-1 agreement and both margins. Red is
-//!   Δ_PPL = e^mean(d) − 1 above [`PPL_RED`].
+//! - PIN(2026-11-18): `--ppl TAG` (G4, the step's PPL against ik's KL-divergence base) retired with the V4.1 KLD bases; they were dumped from the Q3_K_M file and ik cannot read bq3km
 //! - `--kld-walk` (G4, self-consistency): the loss tool's walk (`ppl_ds41`, `kld::write_base` over
 //!   `shared/ds41_ppl.rs`, the one decode path of the tool and of this clause) over the first ids of the
 //!   prose corpus as [`WALK_CHUNKS`] chunks of [`WALK_CTX`], twice: the two files have the same bytes (the
@@ -285,7 +279,7 @@ mod gate {
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{
         GateError, Layout, NAN_F16, RefManifest, RefRow, RowKind, bits_equal, checks_failed,
-        data_dir, patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
+        patch_bytes, ref_ints, ref_tensor_logical_in, ref_tensor_of_in, split_f32,
         topk_ids_logical_within, verdict, widened_f16_rows_in,
     };
     use bloomery_levers::{
@@ -347,8 +341,6 @@ mod gate {
     /// `--kld-walk`'s chunks: ids per chunk and chunks, 31 scored positions each (a chunk's second half).
     const WALK_CTX: usize = 64;
     const WALK_CHUNKS: usize = 2;
-    /// G4: red above this Δ_PPL [derived, <https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md>].
-    const PPL_RED: f64 = 0.015;
     /// Selection-band terms the MoE chain gate's `tie_margin` takes
     /// (`gate_deepseek41_chain_ffn.rs`): the device's `expf`/`logf` ulps and
     /// the host's.
@@ -361,7 +353,6 @@ mod gate {
         structure: bool,
         sets: bool,
         select: bool,
-        ppl: Option<String>,
         kld_walk: bool,
         skew: skew::Clauses,
         slots: bool,
@@ -372,12 +363,11 @@ mod gate {
 
     fn parse_args() -> Result<Args, GateError> {
         const USAGE: &str = "usage: gate_deepseek41_step [--structure] [--sets] [--select] [--kld-walk] \
-             [--ppl TAG] [--skew-structure] [--skew-sets] [--skew-api] [--slots] [--feed] [--imatrix DIR]";
+             [--skew-structure] [--skew-sets] [--skew-api] [--slots] [--feed] [--imatrix DIR]";
         let mut a = Args {
             structure: false,
             sets: false,
             select: false,
-            ppl: None,
             kld_walk: false,
             skew: skew::Clauses {
                 structure: false,
@@ -406,17 +396,10 @@ mod gate {
                             .ok_or_else(|| format!("--imatrix needs a directory: {USAGE}"))?,
                     );
                 }
-                "--ppl" => {
-                    a.ppl = Some(
-                        it.next()
-                            .ok_or_else(|| format!("--ppl needs a tag: {USAGE}"))?,
-                    );
-                }
                 other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
             }
         }
-        let others =
-            a.structure || a.sets || a.select || a.kld_walk || a.ppl.is_some() || a.skew.any();
+        let others = a.structure || a.sets || a.select || a.kld_walk || a.skew.any();
         if !(others || a.slots || a.feed || a.imatrix.is_some()) {
             return Err(USAGE.into());
         }
@@ -598,14 +581,6 @@ mod gate {
                 "--kld-walk: the loss tool's walk writes the same base twice and scores itself",
             )?;
             pass &= kld_walk(&mut m, &hp)?;
-        }
-        if let Some(tag) = &args.ppl
-            && tier::run_clause(
-                "--ppl: the step's perplexity against ik's on the corpus",
-                Tag::Oracle,
-            )?
-        {
-            pass &= ppl(&mut m, &hp, tag)?;
         }
         if args.skew.any() {
             pass &= skew::clauses(&mut m, &split, &hp, &args.skew)?;
@@ -3084,7 +3059,7 @@ mod gate {
             .iter()
             .min()
             .ok_or("the file has no engram site")?;
-        let decode = shadow::engram_kv_kernels(split, first, prefetch)?[0];
+        let decode = shadow::engram_kv_kernels(split, hp.engram()?, first, prefetch)?[0];
         let decodes: Vec<usize> = (0..g.nodes.len())
             .filter(|&i| {
                 g.kernel(i)
@@ -3339,7 +3314,7 @@ mod gate {
         let sites = &hp.engram()?.layer_ids;
         let mut kv_lists: Vec<Vec<&str>> = Vec::new();
         for &site in sites {
-            let k = shadow::engram_kv_kernels(split, site, prefetch)?;
+            let k = shadow::engram_kv_kernels(split, hp.engram()?, site, prefetch)?;
             if !kv_lists.contains(&k) {
                 kv_lists.push(k);
             }
@@ -3357,7 +3332,12 @@ mod gate {
                 prefetch,
             )?;
             if sites.contains(&(l + 1)) {
-                want.extend(shadow::engram_kv_kernels(split, l + 1, prefetch)?);
+                want.extend(shadow::engram_kv_kernels(
+                    split,
+                    hp.engram()?,
+                    l + 1,
+                    prefetch,
+                )?);
             }
             let got: Vec<&str> = nodes
                 .iter()
@@ -4679,44 +4659,6 @@ mod gate {
             }
         );
         Ok((ok || carried.is_none(), carried.is_some()))
-    }
-
-    // ------------------------------------------------------------------ ppl
-
-    fn ppl(m: &mut Deepseek41Model, hp: &Hparams, tag: &str) -> Result<bool, GateError> {
-        let path: PathBuf = data_dir().join("ikppl").join(format!("{tag}.kld"));
-        refset::kld::check(&path, tag, &refset::arch::deepseek41::KLD)?;
-        let base = KldBase::open(&path, hp.n_vocab)?;
-        println!(
-            "ppl base {}: ctx {} chunks {} scored per chunk {} from {}",
-            path.display(),
-            base.n_ctx(),
-            base.n_chunk(),
-            base.scored_per_chunk(),
-            base.first_scored()
-        );
-        let s = score_ppl(&base, &mut Steps(m))?;
-        let ok = s.dppl() <= PPL_RED;
-        println!(
-            "ppl: {} positions; PPL ours {:.4} ik {:.4}; d = NLL_ours − NLL_ik mean {:+.5} ± \
-             {:.5} (SE), sd(d) {:.4}; Δ_PPL {:+.3} % (red above {:+.1} %); KLD(ik‖ours) {:.5} \
-             ± {:.5}; same top {:.2} %; σ_rel (rms of margin ours − ik) {:.4}; {:.0} s: {}",
-            s.n,
-            s.ppl_ours,
-            s.ppl_ik,
-            s.mean_d,
-            s.se_d,
-            s.sd_d,
-            100.0 * s.dppl(),
-            100.0 * PPL_RED,
-            s.kld,
-            s.kld_se,
-            100.0 * s.same_top as f64 / s.n as f64,
-            s.sigma_rel,
-            s.secs,
-            verdict(ok)
-        );
-        Ok(ok)
     }
 
     // ------------------------------------------------------------ kld walk

@@ -48,7 +48,7 @@ use std::collections::BTreeSet;
 
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{DeviceTensor, Gpu};
-use bloomery_gpu_deepseek41::body::STEP_TOKENS;
+use bloomery_gpu_deepseek41::body::{STEP_TOKENS, engram_row_bytes};
 use bloomery_gpu_deepseek41::chain::attn::{
     AttnChain, AttnIo, Compressed, Selection, SourceIo, WordsLayout, join_projections,
 };
@@ -296,30 +296,6 @@ fn resident_names(l: usize, kind: &Kind) -> BTreeSet<String> {
         set.insert(names::indexer_proj(l));
     }
     set
-}
-
-/// Bytes of one engram table row: `body.rs`'s rule, which is private
-/// there — every site's rows the same size.
-fn engram_row_bytes(split: &Split, hp: &Hparams) -> Result<usize, GateError> {
-    let mut bytes = None;
-    for &l in &hp.engram()?.layer_ids {
-        let name = names::engram_embd(l);
-        let (_, t) = split
-            .find(&name)
-            .ok_or_else(|| format!("{name} is not in the file"))?;
-        let rows: u64 = t.dims.iter().skip(1).product();
-        if rows == 0 || !t.nbytes.is_multiple_of(rows) {
-            return Err(format!("{name}: {:?} dims, {} bytes", t.dims, t.nbytes).into());
-        }
-        let row = t.nbytes / rows;
-        if bytes.is_some_and(|b| b != row) {
-            return Err(format!("{name} has rows of {row} bytes, another site's differ").into());
-        }
-        bytes = Some(row);
-    }
-    Ok(usize::try_from(
-        bytes.ok_or("the model has no engram site")?,
-    )?)
 }
 
 // ---------------------------------------------------------------- steps

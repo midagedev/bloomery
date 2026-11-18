@@ -159,7 +159,7 @@ pub fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<Predicted, 
     let sites = hp.engram()?.layer_ids.len();
     let mut wkv_q8_1 = 0;
     for &l in &hp.engram()?.layer_ids {
-        wkv_q8_1 += usize::from(q8_1(ty(names::engram_wkv(l))?));
+        wkv_q8_1 += usize::from(q8_1(ty(hp.engram()?.wkv(l))?));
     }
     // The head's launches (`HeadLaunches::at(1)` and its final norm): the norm, the gemv, the
     // argmax and, where the gemv reads q8_1 rows (a Q8_0 or BF16 head reads f32), their quantizer.

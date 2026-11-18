@@ -2,7 +2,9 @@
 //! `BLOOMERY_HOSTSTREAM=on`) on the real model (the fixture in the fixture tier, planned under
 //! its header's card budget): plan (b′) on both cards
 //! (`--place bp`), the residency machine over the stage card's routed stacks
-//! at `mid-p40-s1`, groups of [`GROUP`] batches, streaming on at the load
+//! at the word the plan sets (`residency::residency_at`: `mid-p<P>-s1`, P half
+//! the fewest routed experts the stage card holds in a layer), groups of
+//! [`GROUP`] batches, streaming on at the load
 //! (set here; the lever itself is refused, so the environment cannot move
 //! it), the host set locked (set here too, `BLOOMERY_HOST_LOCK` refused: a
 //! pick refuses a victim the host would serve from the file, and another
@@ -170,11 +172,23 @@ mod gate {
     use runtime::{Out, Target, Want};
 
     const NAME: &str = "gate_ds41_callstream";
-    /// The residency the gate runs: 40 pinned, one spare a layer.
-    const RESIDENCY: Residency = Residency::Mid {
-        pinned: 40,
-        spares: 1,
-    };
+    /// The clauses of the residency's load, left by name on a plan that leaves no churn pool past
+    /// a pin (`residency::residency_at`), `static` under plan (a) alone.
+    const RESIDENCY_ARM: [&str; 11] = [
+        "refuse",
+        "c6",
+        "transform",
+        "resident",
+        "c1",
+        "passes",
+        "tier",
+        "c3",
+        "keep",
+        "table",
+        "c7",
+    ];
+    /// The callstream clauses that run on the residency's load after it.
+    const STREAM_ARM: [&str; 4] = ["s2", "s1", "s3", "s4"];
     /// Batches a prompt group holds.
     const GROUP: usize = 2;
     /// `kvgrow`'s prompt: one batch.
@@ -687,6 +701,40 @@ mod gate {
         Ok(ok)
     }
 
+    /// A plan whose stage card holds fewer than two routed experts a layer leaves the residency no
+    /// churn pool past a pin: every clause of its load (and of the streaming that follows on it) is
+    /// left by name (`no-card-room`, read from the plan, neither a pass nor a red), and under
+    /// plan (a) the serving default's arm, which reads its own word off the plan, still runs.
+    fn no_pool(
+        path: &Path,
+        at: Place,
+        machine: impl Fn(usize) -> Machine + Copy,
+        cfg: &OpenCfg,
+        only_residency: bool,
+    ) -> Result<(), GateError> {
+        let mut names: Vec<&str> = RESIDENCY_ARM.to_vec();
+        if at == Place::A {
+            names.push("static");
+        }
+        names.push("kvgrow");
+        if !only_residency {
+            names.extend(STREAM_ARM);
+        }
+        tier::defer_for_room(
+            &names,
+            "the plan's stage card holds fewer than two routed experts a layer, so no pinned seed \
+             leaves a churn pool",
+        )?;
+        let default = at != Place::A || watched("default", || default_arm(path, at, machine, cfg))?;
+        println!("{NAME}: {}", tier::tally_line());
+        if default {
+            println!("{NAME}: every clause that has an input passed");
+            Ok(())
+        } else {
+            Err(checks_failed())
+        }
+    }
+
     /// The serving default's arm (`--place a --only residency`, after
     /// `static`, on its own load: two V4.1 loads never stand at once): the
     /// word the V4.1 seat runs with `BLOOMERY_RESIDENCY` unset on the plan
@@ -809,7 +857,6 @@ mod gate {
         // not a workstation card by name: the plan's open finds each by its device.
         let at = at.on_host()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
-        cfg.body.residency = RESIDENCY;
         cfg.body.prefill = PrefillMode::Batch;
         cfg.body.group = GROUP;
         cfg.body.hoststream = true;
@@ -831,8 +878,12 @@ mod gate {
         // Plan (b′)'s tier reserves the prompt batch's bytes; plan (a) has no tier.
         let batch = (at == Place::Bp).then(|| place::tier_batch(&inputs.hp));
         let machine = at.machine(None, batch)?;
+        let Some(gate_residency) = residency::residency_at(&inputs, &cfg, &machine)? else {
+            return no_pool(&path, at, machine, &cfg, only_residency);
+        };
+        cfg.body.residency = gate_residency;
         crate::ds41_tier::sc("refuse: a host one byte short of the churn pool is refused by name")?;
-        let refused = residency::refuse_clause(&path, &inputs, &cfg, at, &machine)?;
+        let refused = residency::refuse_clause(&path, &inputs, &cfg, at, &machine, gate_residency)?;
         let t0 = Instant::now();
         let mut s = open(&path, at, machine, &cfg)?;
         println!("load in {:.1} s", t0.elapsed().as_secs_f64());

@@ -34,8 +34,8 @@
 # batch into ubatches of n_ubatch, so --batch alone at or above n_ubatch runs the same graphs; --ubatch
 # is the switch that changes them.
 #
-# The base file is ik's layout (examples/perplexity/perplexity.cpp; crates/gpu-gates/src/kld.rs reads it,
-# `just gate-ds41-kld` checks it against its run): "_logits_", i32 n_ctx, n_vocab and n_chunk, the
+# The base file is ik's layout (examples/perplexity/perplexity.cpp; crates/gpu-gates/src/kld.rs reads it):
+# "_logits_", i32 n_ctx, n_vocab and n_chunk, the
 # n_chunk*n_ctx ids as i32, then one record per scored position — ctx/2 .. ctx-2 of every chunk — of
 # 2*((n_vocab+1)/2)+4 u16: f32 scale, f32 min_log_prob and a u16 level per vocabulary entry, about 1.06 GB
 # at c2048 over 4 chunks [derived]. ik does not check its writes, so a base run writes <tag>.kld.part and

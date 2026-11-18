@@ -16066,7 +16066,7 @@ def _st_real_tree(fails: list[str], side: Side) -> None:
     # PIN(2026-10-20): gate-q38-serve-rules also runs the lib's serve_client tests and record schema includes.
     # PIN(2026-10-23): gate-gpu-rope-writers compiles the lib tests and their record schema includes.
     # PIN(2026-10-26): gate-gpu-llama-dense compiles the lib tests (its kv_planes:: clause) and their record schema includes.
-    expect(schema == {"gate-gpu-ds41-engram-layout", "gate-gpu-gates-lib", "gate-gpu-llama-dense", "gate-gpu-rope-writers", "gate-ds41-oracle", "gate-ds41-kld", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
+    expect(schema == {"gate-gpu-ds41-engram-layout", "gate-gpu-gates-lib", "gate-gpu-llama-dense", "gate-gpu-rope-writers", "gate-ds41-oracle", "gate-ds41-bind", "gate-ds41-place", "gate-q38-serve-rules", "weekly-gpu-ds41-flowcounts"}, f"a record schema selects {sorted(schema)}")
     flow = graph.inputs("weekly-gpu-ds41-flowcounts")
     expect(flow.match("tools/bloomery/hf.py") is None, "flowcounts must not key the unrelated hub reader through self-test prose")
     for path in ("tools/bloomery/records.py", "tools/flow/routes.py", "tools/gpu-ab.py", "tools/ref/tdist.py"):

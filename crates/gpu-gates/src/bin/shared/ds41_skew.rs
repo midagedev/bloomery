@@ -944,7 +944,12 @@ fn structure(
         let mut want =
             shadow::shadow_kernels(split, l, crate::nodes::has_card_experts(launches), prefetch)?;
         if sites.contains(&(l + 1)) {
-            want.extend(shadow::engram_kv_kernels(split, l + 1, prefetch)?);
+            want.extend(shadow::engram_kv_kernels(
+                split,
+                hp.engram()?,
+                l + 1,
+                prefetch,
+            )?);
         }
         // Row 0's first go has no wait of row 1 behind it: row 1's layer
         // 0 up to its go runs there too, in the same host leg's shadow.
@@ -971,7 +976,7 @@ fn structure(
         .collect();
     let mut kv_lists: Vec<Vec<&str>> = Vec::new();
     for &site in sites {
-        let k = shadow::engram_kv_kernels(split, site, prefetch)?;
+        let k = shadow::engram_kv_kernels(split, hp.engram()?, site, prefetch)?;
         if !kv_lists.contains(&k) {
             kv_lists.push(k);
         }

@@ -16,12 +16,7 @@
 //!    for that id (its dot order is the rule's; its self-test pins that order
 //!    to its SIMD kernel). Then the chain: three rows from the zero rows and
 //!    `id_last` = the 64th id, tokens and rows equal the host chain.
-//! 3. **Oracle diagnostics, no pin**: the dsref set `code64_n32_w3`, block 0
-//!    — our HC_PRE on ik's layer-0 attention input against ik's mixes and
-//!    HC_PRE rows, and our Markov step on ik's pre-Markov logits against ik's
-//!    deltas, corrected rows and draft tokens. Printed as max|diff|; they do
-//!    not fail the gate.
-//! 4. **Reduced Markov head** (`ds41_markov` with the map on), no model file:
+//! 3. **Reduced Markov head** (`ds41_markov` with the map on), no model file:
 //!    seeded tables of 1000 target rows and 128 head rows, an injective map
 //!    from head id to target id, base logits of m = 8 rows and a target id
 //!    `first`. The reduced step's eight tokens and rows equal the host
@@ -29,14 +24,16 @@
 //!    the logits (a block's threads beyond `n_head`) are untouched. A previous
 //!    head id at or past `n_head` raises `FaultSite::TokenId` and makes its
 //!    row NaN, the other row unchanged.
-//! 5. **Own head over a reduced vocabulary** (`dspark::head::Head`), no model
-//!    file: the clause-4 tables behind a draft's own Q8_0 rows (hidden 64,
+//! 4. **Own head over a reduced vocabulary** (`dspark::head::Head`), no model
+//!    file: the clause-3 tables behind a draft's own Q8_0 rows (hidden 64,
 //!    128 head ids, rows of m = 8). The card's projection logits are read
 //!    back, checked against the host's f64 norm and Q8_0 dot within the f32
 //!    bound, and taken through the host's reduced Markov loop and argmax;
 //!    `tokens` and `tokens_p` return the host's head ids, the corrected
 //!    logits equal the host's bit for bit, and the probabilities equal the
 //!    host transcription of `argmax_p_rows_fault`'s softmax.
+//!
+//! PIN(2026-11-18): the dsref set's oracle diagnostics (ik's HC_PRE and Markov rows, block 0) retired with the set; ik cannot read bq3km's engram schema; they pinned nothing
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -66,8 +63,6 @@ mod gate {
     use gguf::Split;
     use gguf::quant::{GgmlType, half_to_f32};
     use model::arch::dspark::{DraftHparams, names};
-    use refset::arch::deepseek41::{DSREF, DSREF_SET};
-    use refset::dsref::{DsRow, Dsref, Graph};
 
     const NAME: &str = "gate_dspark_hc";
     /// Corpus ids the Markov checks take, then the three edge ids.
@@ -216,10 +211,6 @@ mod gate {
             .zip(b)
             .map(|(x, y)| (f64::from(*x) - f64::from(*y)).abs())
             .fold(0.0, f64::max)
-    }
-
-    fn max_abs(a: &[f32]) -> f64 {
-        a.iter().map(|x| f64::from(x.abs())).fold(0.0, f64::max)
     }
 
     // ---------------------------------------------- Markov, the host rule
@@ -961,199 +952,6 @@ mod gate {
         Ok(())
     }
 
-    // ------------------------------------------------- oracle diagnostics
-
-    /// The draft set's block 0 (`refset::dsref`): its block-pass rows, the
-    /// block's proposals and the token it starts from.
-    struct DSet<'a> {
-        rows: Vec<&'a DsRow>,
-        set: &'a Dsref,
-        drafts: Vec<u32>,
-        id_last: u32,
-    }
-
-    impl<'a> DSet<'a> {
-        fn block0(set: &'a Dsref) -> Result<DSet<'a>, GateError> {
-            Ok(DSet {
-                rows: set.in_block(0, Graph::Block),
-                set,
-                drafts: set.drafts_of(0),
-                id_last: set.verify_of(0)?.id_last,
-            })
-        }
-
-        fn find(&self, pred: impl Fn(&DsRow) -> bool) -> Vec<&'a DsRow> {
-            self.rows.iter().copied().filter(|r| pred(r)).collect()
-        }
-
-        fn load(&self, r: &DsRow) -> Result<Vec<f32>, GateError> {
-            Ok(self.set.logical_f32s(r)?)
-        }
-    }
-
-    /// ik's HC_PRE node (`[pre S T][post S T][comb S S T]`) in our layout.
-    fn node_to_hc(node: &[f32], t: usize) -> Vec<f32> {
-        let mut hc = vec![0.0f32; HC_MIX * t];
-        for (tt, h) in hc.as_chunks_mut::<HC_MIX>().0.iter_mut().enumerate() {
-            h[..4].copy_from_slice(&node[4 * tt..4 * tt + 4]);
-            h[4..8].copy_from_slice(&node[4 * t + 4 * tt..4 * t + 4 * tt + 4]);
-            h[8..].copy_from_slice(&node[8 * t + 16 * tt..8 * t + 16 * tt + 16]);
-        }
-        hc
-    }
-
-    fn oracle(cx: &Ctx<'_>, attn: &Hc, mk: &Markov) -> Result<(), GateError> {
-        let dir = DSREF.path(DSREF_SET);
-        let full = Dsref::open(&dir, &DSREF)?;
-        let set = DSet::block0(&full)?;
-        println!(
-            "oracle set {} block 0: {} block-graph rows, drafts {:?}, id_last {}",
-            dir.display(),
-            set.rows.len(),
-            set.drafts,
-            set.id_last
-        );
-
-        // HC_PRE: layer 0 attention.
-        let input = set.find(|r| r.name == "dsv4_dflash_hc_init (reshaped)" && r.occurrence == 0);
-        let mixes = set.find(|r| r.name == "hc_pre_mixes-0" && r.occurrence == 0);
-        let node = set.find(|r| r.op == "HC_PRE" && r.src0.as_deref() == Some("hc_pre_mixes-0"));
-        match (input.first(), mixes.first(), node.first()) {
-            (Some(i), Some(mx), Some(nd)) => {
-                let x = set.load(i)?;
-                let t = usize::try_from(i.ne[1])?;
-                let (om, oh) = run_hc_kernel(cx, attn, &x, t)?;
-                let im = set.load(mx)?;
-                let ih = node_to_hc(&set.load(nd)?, t);
-                println!(
-                    "oracle hc_pre_f32 blk0.attn T={t}: mixes max|diff| {:e} (ik max|mix| {:e}); \
-                     hc max|diff| {:e} (pre/post {:e}, comb {:e}) — diagnostic, not pinned",
-                    max_abs_diff(&om, &im),
-                    max_abs(&im),
-                    max_abs_diff(&oh, &ih),
-                    (0..t)
-                        .map(|tt| max_abs_diff(
-                            &oh[tt * 24..tt * 24 + 8],
-                            &ih[tt * 24..tt * 24 + 8]
-                        ))
-                        .fold(0.0, f64::max),
-                    (0..t)
-                        .map(|tt| max_abs_diff(
-                            &oh[tt * 24 + 8..tt * 24 + 24],
-                            &ih[tt * 24 + 8..tt * 24 + 24]
-                        ))
-                        .fold(0.0, f64::max),
-                );
-                // Our HC_PRE rule at ik's own mixes: the gemv's share of the gap removed.
-                let iters = u32::try_from(cx.hp.hc.sinkhorn_iters)?;
-                let own: Vec<f32> = (0..t)
-                    .flat_map(|tt| {
-                        hc_pre_f32(
-                            &im[tt * 24..tt * 24 + 24],
-                            [attn.scale[0], attn.scale[1], attn.scale[2]],
-                            &attn.base,
-                            cx.hp.hc.eps,
-                            iters,
-                            exp_ours,
-                        )
-                    })
-                    .collect();
-                println!(
-                    "oracle hc_pre rule at ik's mixes: hc max|diff| {:e} — diagnostic, not pinned",
-                    max_abs_diff(&own, &ih)
-                );
-            }
-            _ => println!(
-                "oracle hc_pre_f32: the set lacks a row it needs (input {}, mixes {}, HC_PRE node {})",
-                input.len(),
-                mixes.len(),
-                node.len()
-            ),
-        }
-
-        // Markov: from ik's pre-Markov logits.
-        let base = set.find(|r| r.name == "dflash_base_result_output" && r.occurrence == 0);
-        let deltas =
-            set.find(|r| r.op == "MUL_MAT" && r.src0.as_deref() == Some("markov_w2.weight"));
-        let adds = set.find(|r| {
-            r.op == "ADD" && r.src0.as_deref() == Some("dflash_base_result_output (view)")
-        });
-        let result = set.find(|r| r.name == "result_output" && r.occurrence == 0);
-        let (Some(b), Some(res)) = (base.first(), result.first()) else {
-            println!(
-                "oracle markov: the set lacks dflash_base_result_output ({}) or result_output ({})",
-                base.len(),
-                result.len()
-            );
-            return Ok(());
-        };
-        let n = mk.n_vocab;
-        let tm = set.load(b)?; // token-major [t][v]
-        let t = usize::try_from(b.ne[1])?;
-        let mut vm = vec![0.0f32; n * t];
-        for c in 0..t {
-            for v in 0..n {
-                vm[v * t + c] = tm[c * n + v];
-            }
-        }
-        // ik's previous tokens: id_last, then its own draft tokens.
-        let prevs: Vec<u32> = std::iter::once(set.id_last)
-            .chain(set.drafts.iter().copied())
-            .take(t)
-            .collect();
-        for (c, (&p, d)) in prevs.iter().zip(&deltas).enumerate() {
-            let ik = set.load(d)?;
-            let ours = delta_host(&mk.w1, &mk.w2f, p as usize);
-            let not_bf16 = ik.iter().filter(|x| x.to_bits() & 0xffff != 0).count();
-            let ours_bf16: Vec<f32> = ours.iter().map(|&x| bf16_round(x)).collect();
-            println!(
-                "oracle markov delta row {c}: ik values not bf16-representable {not_bf16} of {}; \
-                 ours rounded to bf16 (nearest even) vs ik: max|diff| {:e}, {} values differ — diagnostic",
-                ik.len(),
-                max_abs_diff(&ours_bf16, &ik),
-                ours_bf16
-                    .iter()
-                    .zip(&ik)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count()
-            );
-            println!(
-                "oracle markov delta row {c} prev {p}: max|diff| {:e} (ik max|delta| {:e}), argmax ours {} ik {} — diagnostic",
-                max_abs_diff(&ours, &ik),
-                max_abs(&ik),
-                argmax(&ours),
-                argmax(&ik)
-            );
-        }
-        for (c, a) in adds.iter().enumerate().take(t) {
-            let ik = set.load(a)?;
-            let ours: Vec<f32> = {
-                let d = delta_host(&mk.w1, &mk.w2f, prevs[c] as usize);
-                (0..n).map(|v| tm[c * n + v] + d[v]).collect()
-            };
-            println!(
-                "oracle markov corrected row {c} (ik base + our delta at ik's prev) vs ik ADD: max|diff| {:e} — diagnostic",
-                max_abs_diff(&ours, &ik)
-            );
-        }
-        let (toks, rows) = run_chain(cx, mk, &vm, t, set.id_last)?;
-        let ik_res = set.load(res)?;
-        let mut ours_tm = vec![0.0f32; n * t];
-        for c in 0..t {
-            for v in 0..n {
-                ours_tm[c * n + v] = rows[v * t + c];
-            }
-        }
-        println!(
-            "oracle markov chain on ik's base logits: tokens ours {toks:?} ik {:?}; result_output max|diff| {:e} \
-             (ik max|logit| {:e}) — diagnostic, not pinned",
-            set.drafts,
-            max_abs_diff(&ours_tm, &ik_res),
-            max_abs(&ik_res)
-        );
-        Ok(())
-    }
-
     pub fn run() -> Result<(), GateError> {
         let path = std::env::var_os("BLOOMERY_DSPARK_MODEL")
             .filter(|p| !p.is_empty())
@@ -1230,13 +1028,11 @@ mod gate {
         check_reduced(&mut cx)?;
         check_head_reduced(&mut cx)?;
 
-        oracle(&cx, &attn, &mk)?;
-
         if cx.ok {
             println!(
                 "PASSED: {NAME} — ds41_hc_pre_f32 (m 1/3/5, attn and ffn) and ds41_markov (67 ids, \
                  3-row chain; reduced head, 8-row chain and its fault; own reduced Head chain) bit-identical \
-                 to the host rules; oracle rows printed, not pinned"
+                 to the host rules"
             );
             Ok(())
         } else {

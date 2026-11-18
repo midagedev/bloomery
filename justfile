@@ -3145,14 +3145,6 @@ gate-serve-draft-rules:
 gate-ds41-place:
     ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- generate:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- llama_place::seat_words && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --lib -- llama_launch:: && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features glm5next-hf --bin generate_glm5next && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41,checkpoint --lib -- ds41_preflight::'
 
-# ik의 KLD 기준 파일(ik-ppl --kld-base)이 그것을 쓴 실행과 맞는지 본다: 헤더의 ctx·청크 수와 파일 크기가 실행의 결과
-# 줄과 같고, 기록마다 ik 양자화기가 쓸 수 있는 모양이며, 파일에서 다시 잰 PPL이 실행이 찍은 PPL과 양자화 밴드 안에서
-# 같다. 기본은 kldbase-c2048x4와 kldbase-c512x16이다. 어휘 수를 모델 파일에서 읽으므로 V4.1 프로필로 돈다. 호스트
-# 전용이라 카드도 게이트 락도 쓰지 않는다. FAIL-first는 박스 명령 안에서 BLOOMERY_KLD_FILE=<사본 경로>를 준다 — 그
-# 파일 하나만 읽고, 파일 이름의 stem이 가리키는 실행의 로그와 맞춘다.
-gate-ds41-kld:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-ds41-kld && bash tools/gate.sh --release -p bloomery-gpu-gates --lib -- --ignored hw_ds41_kld --nocapture'
-
 # A PLE site's two kernels (Qwen3.8's layer 1, bloomery_gpu::ple) on synthetic inputs, no model: the gate bit for bit
 # against its host rule and within a derived per-value bound of the exact f64 values; the dilated conv bit for bit
 # against its host rule; then the m-column, ring-wrap, rollback, reset, fault and refusal clauses.
@@ -3279,7 +3271,8 @@ weekly-gpu-ds41-lost:
 gate-gpu-ds41-unpack:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_unpack && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_unpack'
 
-# V4.1 host streaming in a prompt call (BLOOMERY_HOSTSTREAM, set on in the gate) over the residency at mid-p40-s1, plan
+# V4.1 host streaming in a prompt call (BLOOMERY_HOSTSTREAM, set on in the gate) over the residency at mid-p<P>-s1 (P half
+# the fewest routed experts the plan's stage card holds in a layer; a card with fewer than two leaves its clauses by name), plan
 # (b′), groups of 2, the host set locked, both cards, one load. First the residency's own clauses (shared/ds41_residency.rs,
 # streaming off): the host-set refusal at load (a host one byte short of the churn pool, named, before the load), then on
 # the load c6 (a DSpark pair pass keeping one row folds what one step folds), c1 (the prose history twice, same tokens and
@@ -3362,12 +3355,6 @@ weekly-gpu-ds41-cand:
 # ik가 읽지 못하는 V4.1 파일은 러너가 이름으로 거부한다(ik_opens_model). 러너 머리말 참조.
 ik-greedy-ds41 PROMPT='0':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'PROMPT={{PROMPT}} bash tools/ref/ik-greedy.sh'
-
-# G4: ik의 KLD 기준 파일 TAG($BLOOMERY_DATA/ikppl/TAG.kld)에 대한 우리 NLL·KLD·top-1 — 청크마다 리셋하고 id마다 엔진
-# 스텝 하나. 512 × 16청크는 약 8,200스텝이라 한도를 28분으로 올린다. 빨강은 Δ_PPL > +1.5 %.
-[group('v41-load')]
-run-ds41-ppl TAG:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh run-ds41-ppl && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_step && BLOOMERY_GATE_BOUND=1680 bash tools/gpu-gate.sh gate_deepseek41_step --ppl {{TAG}}'
 
 # V4.1 decode CLI, functional run (no timing): generate_ds41 feeds the prompt one real step per id, then greedy
 # -n tokens, and prints them. The recipe loads the step gate's placement on the 3090 (--place gate), so its tokens
@@ -3962,24 +3949,23 @@ gate-dspark-read:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-dspark-read && bash tools/gate.sh --release -p bloomery-gguf --lib -- quant --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_dspark_read && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/host-gate.sh gate_dspark_read'
 
 # DSpark 드래프트의 두 커널(f32 가중치 HC_PRE, bf16 Markov 헤드 + argmax)을 카드에서 호스트 규칙과 비트 단위로 대조한다.
-# dsref 세트(code64_n32_w3) 블록 0에 대한 ik와의 거리는 찍기만 한다(진단, 핀 아님).
 gate-gpu-dspark-hc:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-hc && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features deepseek41 --bin gate_dspark_hc && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_hc && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_hc'
 
 # DSpark 드래프트의 routed MoE(MXFP4 expert gate·up·SwiGLU와 down+결합, 128개 중 3개 라우터)를 카드에서 호스트 규칙과
-# 비트 단위로, f32 참조와는 q8_1 한계와 핀으로 대조한다. dsref 세트 블록 0 층 0에 대한 ik와의 거리는 찍기만 한다.
+# 비트 단위로, f32 참조와는 q8_1 한계와 핀으로 대조한다.
 gate-gpu-dspark-experts:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-experts && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_experts && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_experts'
 
 # DSpark 드래프트를 3090에 올리고(텐서별 카드 형식, 그룹별 바이트 = 인벤토리, cuMemGetInfo 증감), 특징→KV 그래프를
-# dsref 세트 블록 0–3에 대조한다: main_x와 층마다 링 행이 ik의 q8_1 활성값 규칙이 허용하는 유도 한계 안.
+# 시드 입력 블록 0–3으로 돌린다: 체인의 행이 유한하고, 체인의 main_x 위에서 층만 다시 돌린 행이 비트 단위로 같고, 링이
+# 모든 append를 그대로 담는다.
 gate-gpu-dspark-kv:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-kv && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_kv && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_kv'
 
-# DSpark 드래프트의 블록 패스와 헤드를 ik가 떨군 dsref 세트와 대조한다. ik 규칙 arm(블록 인과 마스크, SwiGLU clamp 없음 —
-# ik 드래프트가 도는 방식)은 블록 0–2의 모든 탭을 유도 밴드로 판정하고, 엔진이 도는 기준 규칙(model.py) arm은 두 규칙이
-# 갈리지 않는 행만 판정한다. 블록마다 draft_argmax, w=5 비트 동일, 캡처 노드 수 = 커널 목록(패스 73 + 8w, 링 append 8). DraftBody가
-# 로드 때 잡은 그래프는 블록 0–2·폭 1–5에서 eager와 비트 동일, 세트 전체에서 id와 링이 eager 쌍둥이와 같다. 수락 수는 찍기만 한다.
+# DSpark 드래프트의 블록 패스와 헤드를 시드 입력 블록으로 돌린다. w=5 재실행 비트 동일(ik 규칙 arm은 앞 3행이 w=3과 비트
+# 동일), 캡처 노드 수 = 커널 목록(패스 73 + 8w, 링 append 8). DraftBody가 로드 때 잡은 그래프는 블록 0–2·폭 1–5에서 eager와
+# 비트 동일, 시드 블록 전체에서 id와 링이 eager 쌍둥이와 같다. ik 규칙 arm의 그래프 재생은 이름으로 거부된다.
 gate-gpu-dspark-graph:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-dspark-graph && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_dspark_graph && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_dspark_graph'
 

@@ -1685,7 +1685,7 @@ impl Levers {
     }
 
     /// [`Levers::host`] for a load that cannot read an r8 sidecar (`unfit`): its plan pages routed
-    /// experts to the NVMe expert tier, which fills its slots from the source's bytes, and a
+    /// experts through the NVMe expert tier's arena, whose fills read the source's bytes, and a
     /// sidecar sits beside the file. An unset [`R8`] then reads the source; a set one is the
     /// user's and stays, so `on` meets the load's named refusal of that pair.
     #[must_use]

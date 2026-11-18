@@ -2408,10 +2408,11 @@ pub(crate) fn arena_kind_of<'a>(
 /// integrated device by default ([`bloomery_levers::NvTierMem`]), its
 /// victims taken as the lever's rule asks ([`bloomery_levers::NvTierEvict`]). `None`
 /// on a plan that pages no routed expert or reserved no arena: the host
-/// leg reads the file mapping as it stands (a sidecar listing copies is then
-/// named on stderr, [`sidecar_unread_note`]). Refused by name: a load
-/// whose r8 pair reads a sidecar while the plan pages routed experts —
-/// the slot's bytes follow the sidecar resolution, which the tier does
+/// leg reads the file mapping as it stands — under an r8 pair that reads a
+/// sidecar, the sidecar's mapping for the gates and ups, every id alike —
+/// (a sidecar listing copies is then named on stderr, [`sidecar_unread_note`]).
+/// Refused by name: an arena granted under an r8 pair that reads a sidecar —
+/// the slots' bytes follow the sidecar resolution, which the tier's fills do
 /// not carry yet.
 pub fn nvme_tier(
     ctx: &Arc<CudaContext>,
@@ -2435,15 +2436,22 @@ pub fn nvme_tier(
             eprintln!("{note}");
         }
     }
+    if arena.granted == 0 {
+        return Ok(None);
+    }
     let levers = bloomery_levers::nvtier_levers().map_err(|e| GpuError::plan(WHAT, e))?;
     let pair = model::r8file::R8Pair::at_load(Arc::clone(file), r8)
         .map_err(|e| GpuError::plan(WHAT, e))?;
     if pair.source().sidecar().is_some() {
         return Err(GpuError::shape(
             WHAT,
-            "a paged plan under an r8 pair that reads a sidecar: the NVMe tier's slots follow \
-             the sidecar's bytes, which the tier does not fill from yet (`BLOOMERY_R8=off` \
-             reads the source: same bits)",
+            format!(
+                "a paged plan under an r8 pair that reads a sidecar, with an NVMe tier arena of \
+                 {} B granted: the arena's slots follow the sidecar's bytes, which the tier does \
+                 not fill from yet (`BLOOMERY_R8=off` reads the source: same bits; a plan with \
+                 no arena reads the sidecar through its mapping)",
+                arena.granted
+            ),
         ));
     }
     let source = PinnedSource(ctx);

@@ -760,9 +760,15 @@ mod gate {
         best
     }
 
-    /// The chain's plain projections: each one's tensor name at layer `l`.
-    fn sites() -> [fn(usize) -> String; 12] {
-        [
+    /// One projection's tensor name at layer `l`.
+    type Site<'a> = Box<dyn Fn(usize) -> String + 'a>;
+
+    /// The chain's plain projections: each one's tensor name at layer `l`,
+    /// the engram projection's as the file's engram owner names it
+    /// (`Engram::wkv`: the layout decides).
+    fn sites(hp: &Hparams) -> Result<Vec<Site<'_>>, GateError> {
+        let engram = hp.engram.as_ref().ok_or("a V4.1 file has engram sites")?;
+        let named: [fn(usize) -> String; 10] = [
             names::attn_q_a,
             names::attn_kv,
             names::attn_q_b,
@@ -773,14 +779,16 @@ mod gate {
             names::indexer_attn_k,
             names::attn_compressor_kv,
             names::attn_compressor_gate,
-            names::engram_wkv,
-            names::ffn_gate_shexp,
-        ]
+        ];
+        let mut out: Vec<Site<'_>> = named.into_iter().map(|f| Box::new(f) as Site<'_>).collect();
+        out.push(Box::new(|l| engram.wkv(l)));
+        out.push(Box::new(names::ffn_gate_shexp));
+        Ok(out)
     }
 
     /// The first layer carrying `name` at each type it has in the file, in
     /// type order of first appearance.
-    fn layers_by_type(split: &Split, hp: &Hparams, name: fn(usize) -> String) -> Vec<usize> {
+    fn layers_by_type(split: &Split, hp: &Hparams, name: &dyn Fn(usize) -> String) -> Vec<usize> {
         let mut seen: Vec<GgmlType> = Vec::new();
         let mut out = Vec::new();
         for l in 0..hp.n_layer {
@@ -821,8 +829,8 @@ mod gate {
 
         // Every plain projection of the chain, at the first layer of each type
         // the file gives it, on seeded random columns.
-        for (i, site) in sites().into_iter().enumerate() {
-            let layers = layers_by_type(&split, &hp, site);
+        for (i, site) in sites(&hp)?.into_iter().enumerate() {
+            let layers = layers_by_type(&split, &hp, &site);
             if layers.is_empty() {
                 println!("site {}: not in this file", site(0));
             }

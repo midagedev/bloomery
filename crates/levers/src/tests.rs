@@ -471,7 +471,7 @@ fn registry_names_are_its_literals() {
     assert_eq!(literals, names);
 }
 
-/// A load whose plan pages routed experts to the NVMe tier cannot read an r8 sidecar: an unset
+/// A load whose plan pages routed experts through the NVMe tier's arena cannot read an r8 sidecar: an unset
 /// `BLOOMERY_R8` then reads the source, a set one is the user's either way (`on` meets the load's
 /// named refusal of the pair), and nothing but `r8` moves. Mutants: `host_for` that moves a set
 /// `on` (the server then starts where the user asked for the refusal), that ignores `unfit` (every

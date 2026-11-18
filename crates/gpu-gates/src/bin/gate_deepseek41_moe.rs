@@ -509,13 +509,22 @@ mod gate {
             let (k, ff) = (cx.meta.n_embd, cx.meta.n_ff);
             let (k64, ne64) = (k as u64, N_EXPERT as u64);
             let stream = cx.gpu.stream();
-            let rb = tensor(
-                &cx.split,
-                &format!("blk.{l}.ffn_gate_inp.weight"),
-                GgmlType::BF16,
-                &[k64, ne64],
-            )?;
-            let router_w = rows_f32(GgmlType::BF16, rb, 0, N_EXPERT, k)?;
+            // The router in the file's own type: the engine holds it as f32, read from an f32
+            // file tensor or a bf16 one decoded at load (`Weights::f32_tensor`).
+            let router = format!("blk.{l}.ffn_gate_inp.weight");
+            let router_ty = match cx.split.find(&router).map(|(_, t)| t.ty) {
+                Some(ty @ (GgmlType::F32 | GgmlType::BF16)) => ty,
+                Some(ty) => {
+                    return Err(format!(
+                        "tensor {router} is {ty}: the engine's router reads an f32 or a bf16 \
+                         tensor"
+                    )
+                    .into());
+                }
+                None => return Err(format!("tensor {router} is not in the model").into()),
+            };
+            let rb = tensor(&cx.split, &router, router_ty, &[k64, ne64])?;
+            let router_w = rows_f32(router_ty, rb, 0, N_EXPERT, k)?;
             let bb = tensor(
                 &cx.split,
                 &format!("blk.{l}.exp_probs_b.bias"),

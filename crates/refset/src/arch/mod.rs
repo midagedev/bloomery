@@ -94,6 +94,151 @@ pub fn node_dumps(arch: &str) -> Option<&'static Family> {
         .find(|f| f.identity == Identity::Manifest)
 }
 
+/// A set a family lists that no walk of every family's sets reads: it stays where it is, under
+/// [`crate::data_dir`], and the walk names it with why it left instead of checking it.
+pub struct Retired {
+    /// The family that lists the set.
+    pub family: &'static str,
+    /// The set's name in the family's [`Family::sets`].
+    pub set: &'static str,
+    /// Why the walk leaves it.
+    pub why: &'static str,
+}
+
+/// Why a set of a real file that moved off `/models` left the walk.
+const MOVED: &str = "dumped from a real file that moved off /models to /data/moved; the family's \
+                     coverage is its fixture sets";
+
+/// The sets the walk of every family's sets leaves by name ([`retired`]).
+// PIN(2026-11-18): the 23 sets of the five families whose real files moved to /data/moved (MiMo-V2.6,
+// MiniMax-M3.1, Solar-Open2, Muse-Spark, Mistral-Large-4 Mix-256G) state their /models paths, so each
+// read as stale against the moved path the tree runs; those families' coverage is their fixture sets.
+pub static RETIRED: &[Retired] = &[
+    Retired {
+        family: "ik-mimo2",
+        set: "ref_mimo2",
+        why: MOVED,
+    },
+    Retired {
+        family: "ik-mimo2",
+        set: "ref_mimo2_step4",
+        why: MOVED,
+    },
+    Retired {
+        family: "ik-mimo2",
+        set: "ref_mimo2_step4_every_node",
+        why: MOVED,
+    },
+    Retired {
+        family: "ik-mimo2",
+        set: "ref_mimo2_d1k",
+        why: MOVED,
+    },
+    Retired {
+        family: "ik-mimo2",
+        set: "ref_mimo2_d4096",
+        why: MOVED,
+    },
+    Retired {
+        family: "tf-minimaxm31",
+        set: "ref_minimaxm31_a",
+        why: MOVED,
+    },
+    Retired {
+        family: "tf-minimaxm31",
+        set: "ref_minimaxm31_b",
+        why: MOVED,
+    },
+    Retired {
+        family: "tf-minimaxm31",
+        set: "ref_minimaxm31_c",
+        why: MOVED,
+    },
+    Retired {
+        family: "tf-minimaxm31",
+        set: "ref_minimaxm31_d",
+        why: MOVED,
+    },
+    Retired {
+        family: "tf-minimaxm31",
+        set: "ref_minimaxm31_e_perhead",
+        why: MOVED,
+    },
+    Retired {
+        family: "tf-minimaxm31-pooled",
+        set: "ref_minimaxm31_e",
+        why: MOVED,
+    },
+    Retired {
+        family: "pai-solar2",
+        set: "ref_solar2_a",
+        why: MOVED,
+    },
+    Retired {
+        family: "pai-solar2",
+        set: "ref_solar2_b",
+        why: MOVED,
+    },
+    Retired {
+        family: "pai-solar2",
+        set: "ref_solar2_c",
+        why: MOVED,
+    },
+    Retired {
+        family: "pai-solar2",
+        set: "ref_solar2_d",
+        why: MOVED,
+    },
+    Retired {
+        family: "lcpp-musespark",
+        set: "ref_musespark_a",
+        why: MOVED,
+    },
+    Retired {
+        family: "lcpp-musespark",
+        set: "ref_musespark_b",
+        why: MOVED,
+    },
+    Retired {
+        family: "lcpp-musespark",
+        set: "ref_musespark_c",
+        why: MOVED,
+    },
+    Retired {
+        family: "lcpp-musespark",
+        set: "ref_musespark_d",
+        why: MOVED,
+    },
+    Retired {
+        family: "lcpp-musespark",
+        set: "ref_musespark_e",
+        why: MOVED,
+    },
+    Retired {
+        family: "lcpp-mistrallarge4-mix256g",
+        set: "ref_mistrallarge4_mix256g_a",
+        why: MOVED,
+    },
+    Retired {
+        family: "lcpp-mistrallarge4-mix256g",
+        set: "ref_mistrallarge4_mix256g_b",
+        why: MOVED,
+    },
+    Retired {
+        family: "lcpp-mistrallarge4-mix256g",
+        set: "ref_mistrallarge4_mix256g_d3k",
+        why: MOVED,
+    },
+];
+
+/// The [`RETIRED`] row of family `f`'s set at `path`, `None` for a set the walk checks.
+#[must_use]
+pub fn retired(f: &Family, path: &std::path::Path) -> Option<&'static Retired> {
+    RETIRED
+        .iter()
+        .find(|r| r.family == f.name && f.path(r.set) == path)
+}
+
 /// Every family of the table.
 pub fn all() -> impl Iterator<Item = &'static Family> {
     BY_ARCH.iter().flat_map(|(_, f)| f.iter().copied())
@@ -144,7 +289,8 @@ mod qwen_vis_tests;
 #[cfg(test)]
 mod tests {
     use super::{
-        BY_ARCH, NEEDS_ENV, all, deferred, families, minimaxm3, minimaxm31, named, node_dumps,
+        BY_ARCH, NEEDS_ENV, RETIRED, all, deferred, families, minimaxm3, minimaxm31, named,
+        node_dumps, retired,
     };
     use crate::family::Identity;
 
@@ -164,6 +310,42 @@ mod tests {
         "fx_ref_glm5next_d256kdsa",
         "the real file's CPU prefill of 262,142 ids runs past the dump bound",
     )];
+
+    /// Each retired row names a set its family lists, once, and [`retired`] finds it at that set's
+    /// path and at no other set's. Mutant: a row naming a set the family does not list (a renamed
+    /// set left behind), or `retired` matching by family alone.
+    #[test]
+    fn each_retired_row_is_a_set_its_family_lists() {
+        for (i, r) in RETIRED.iter().enumerate() {
+            let f = named(r.family).unwrap_or_else(|| panic!("no family {}", r.family));
+            assert!(
+                f.sets.contains(&r.set),
+                "{} lists no set {}",
+                r.family,
+                r.set
+            );
+            assert!(
+                RETIRED[..i]
+                    .iter()
+                    .all(|o| (o.family, o.set) != (r.family, r.set)),
+                "{} {} is retired twice",
+                r.family,
+                r.set
+            );
+            assert!(retired(f, &f.path(r.set)).is_some_and(|got| std::ptr::eq(got, r)));
+        }
+        for f in all() {
+            for set in f.sets {
+                let listed = RETIRED.iter().any(|r| r.family == f.name && r.set == *set);
+                assert_eq!(
+                    retired(f, &f.path(set)).is_some(),
+                    listed,
+                    "{} {set}",
+                    f.name
+                );
+            }
+        }
+    }
 
     /// One row an architecture: `families` answers with the first row of a name, so a second row would hide its families.
     #[test]
@@ -219,6 +401,7 @@ mod tests {
         let mut failed = 0usize;
         let mut sets = 0usize;
         let mut left = 0usize;
+        let mut gone = 0usize;
         for f in all() {
             if let Some(var) = deferred(f) {
                 left += 1;
@@ -230,6 +413,16 @@ mod tests {
                 continue;
             }
             for path in f.in_place() {
+                if let Some(r) = retired(f, &path) {
+                    gone += 1;
+                    println!(
+                        "hw_refset: {} {}: retired — {}",
+                        f.name,
+                        path.display(),
+                        r.why
+                    );
+                    continue;
+                }
                 sets += 1;
                 match f.check_set(&path) {
                     Ok(p) => println!(
@@ -246,7 +439,9 @@ mod tests {
                 }
             }
         }
-        println!("hw_refset: {sets} set(s) in place, {failed} failed, {left} deferred");
+        println!(
+            "hw_refset: {sets} set(s) in place, {failed} failed, {left} deferred, {gone} retired"
+        );
         assert_eq!(
             failed, 0,
             "hw_refset: {failed} set(s) in place fail their family's check"

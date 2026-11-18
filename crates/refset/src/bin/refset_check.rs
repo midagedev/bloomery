@@ -24,7 +24,9 @@
 //! `<family>: <the error>`. A family whose sets exist only where a machine fact
 //! holds (`arch::deferred`: its consumer gate is deferred by name where the
 //! variable is unset) is one `<family>: deferred` line with the variable, and
-//! none of its sets are read; the summary line counts those families.
+//! none of its sets are read; the summary line counts those families. A set
+//! `arch::RETIRED` names is one `<family> <set>: retired — <why>` line, and is
+//! not read either; the summary line counts those sets.
 //!
 //! The census sets are checked the same way in place: one
 //! `census <org>/<repo>[/<dir>]/<set>: PASS` or `: FAIL <the error>` line per
@@ -132,6 +134,7 @@ fn main() -> ExitCode {
         return census_only(&args[1..]);
     }
     let mut deferred = 0usize;
+    let mut retired = 0usize;
     let sets: Vec<(&Family, PathBuf)> = match args.split_first() {
         None => arch::all()
             .filter(|f| {
@@ -147,6 +150,14 @@ fn main() -> ExitCode {
                 false
             })
             .flat_map(|f| f.in_place().into_iter().map(move |p| (f, p)))
+            .filter(|(f, p)| {
+                let Some(r) = arch::retired(f, p) else {
+                    return true;
+                };
+                retired += 1;
+                println!("{} {}: retired — {}", f.name, p.display(), r.why);
+                false
+            })
             .collect(),
         Some((name, paths)) => {
             let Some(f) = arch::named(name) else {
@@ -170,7 +181,9 @@ fn main() -> ExitCode {
         total += sets;
         failed += failures;
     }
-    println!("refset-check: {total} set(s), {failed} failed, {deferred} deferred");
+    println!(
+        "refset-check: {total} set(s), {failed} failed, {deferred} deferred, {retired} retired"
+    );
     if failed == 0 {
         ExitCode::SUCCESS
     } else {
