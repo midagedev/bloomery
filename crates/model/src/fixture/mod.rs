@@ -91,7 +91,8 @@ pub use spec::{
 pub use variant::{
     CheckStats, Retype, Row as VariantRow, Scope as VariantScope, TABLE as VARIANT_TABLE,
     check as variant_check, custom_q as variant_custom_q, expand as variant_expand,
-    override_kv as variant_override_kv, parse_table as variant_parse_table, row as variant_row,
+    override_kv as variant_override_kv, parse_table as variant_parse_table,
+    role_name as variant_role_name, row as variant_row,
 };
 pub use verify::{
     Sample, VerifyStats, check_tensor, check_units, rms_within, sample_chunks, verify,

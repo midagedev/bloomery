@@ -1,0 +1,15 @@
+# Round fxb (card for the dump sitting): ik's CPU node dumps of the q38v31 fixture variant (/models/fixture-variants/q38v31/qwen38:
+# the Qwen3.8 fixture with UD-IQ2_XS's types on its four layers: IQ2_S and IQ2_XXS gate and up, IQ4_NL and Q5_0 routed downs, an
+# IQ4_XS token embedding, the Q6_K mixers and head and the BF16 glue sites: tools/fixture-variants.tsv), the five Qwen3.8 fixture
+# sets (batch, step4, step4-every-node, d1k, d3k), each one `BLOOMERY_TIER=fixture BLOOMERY_FIXTURE_VARIANT=q38v31 just
+# dump-ref-fixture qwen4exp [<set>]` under this card, one lease each. Nothing is timed. The dumpers are main's shared bin/ (the ik
+# build the real and fixture sets were dumped with); a variant changes the file, not the dumper.
+# Minutes [derived from q38dense-dump.card, which read the same five sets of a same-size file]: 5 takes 0.3-1.3 min lease plus
+# 0.6-1.0 min of dumps, 1..5 with the variant file paged in cold; the low-bit i-quant dots on ik's CPU are no slower than the
+# K-quant ones at these widths, so the same band stands.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and pages the variant file in, so it holds the lease; why now: gate-gpu-qwen4exp-e2e
+  on the q38v31 variant has no oracle sets until ik has dumped the variant, and the IQ2_S and IQ2_XXS routed arms, the IQ4_XS
+  embedding rows, the host-only Q5_0 routed layer and the Q6_K and BF16 mixer sites are otherwise held to our own graph = eager
+  = pass clauses, with no file of that mix left on /models
+minutes: 1..5

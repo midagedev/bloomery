@@ -61,7 +61,8 @@ impl Predicted {
 /// experts, seven without, one more for a q8_1 shared down projection);
 /// the glue's (the broadcast, three and two per engram site and one more
 /// for the looked-up rows' q8_1 when wkv is a K-quant, the collapse and
-/// the head's four) and the gather — less one launch for each projection
+/// the head's: its norm, the gemv, the argmax, and the q8_1 of its input
+/// unless `output.weight` is Q8_0 or BF16) and the gather — less one launch for each projection
 /// a Q3_K row join folds into another's (`join_projections`). The types
 /// come from `split`. Printed as the table G2 pins.
 /// Whether a layer whose MoE piece enqueues `ffn_launches` kernels (`FfnPiece::launches`) runs card
@@ -160,7 +161,10 @@ pub fn predicted(split: &Split, hp: &Hparams, body: &Body) -> Result<Predicted, 
     for &l in &hp.engram()?.layer_ids {
         wkv_q8_1 += usize::from(q8_1(ty(names::engram_wkv(l))?));
     }
-    let glue = 1 + 3 * sites + wkv_q8_1 + 2 * sites + 1 + 4;
+    // The head's launches (`HeadLaunches::at(1)` and its final norm): the norm, the gemv, the
+    // argmax and, where the gemv reads q8_1 rows (a Q8_0 or BF16 head reads f32), their quantizer.
+    let head_quantizes = !matches!(ty(names::output())?, GgmlType::Q8_0 | GgmlType::BF16);
+    let glue = 1 + 3 * sites + wkv_q8_1 + 2 * sites + 1 + 3 + usize::from(head_quantizes);
     let kernels = 1 + attn_total + ffn_total + glue;
     // PIN(2026-09-25): the engram rows reach the card after the launch — one flag wait and
     // one copy before the first site's token-only work (`RowsArrival`), where the step had

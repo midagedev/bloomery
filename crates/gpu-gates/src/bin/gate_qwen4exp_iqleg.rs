@@ -1,7 +1,12 @@
-//! The Qwen3.8 UD-Q3_K_XL i-quant host-leg gate: the file's routed experts — IQ3_XXS and IQ4_XS gate
+//! The Qwen3.8 i-quant host-leg gate: the routed experts of UD-Q3_K_XL's types — IQ3_XXS and IQ4_XS gate
 //! and up, IQ4_NL down — through the threaded host leg (`crates/model/src/moe.rs`, the leg the card
 //! engine's host tier calls), which no other gate runs on an i-quant stack: `gate-moe` has no IQ
 //! type, the qwen4exp e2e gate loads the Q4 file, and qdot's tests pin the dots serially.
+//!
+//! The file is the fixture variant `q38iq3` (`tools/fixture-variants.tsv`: the Qwen3.8 fixture's four
+//! layers retyped to UD-Q3_K_XL's routed types and head), the fixture tier's only run: the plain
+//! fixture holds no i-quant stack, so there the gate declares the `no-layout-layer` deferral and the
+//! variant item answers it. The file is `$BLOOMERY_REF_MODEL` (`bloomery_gpu_gates::ref_model_path`).
 //!
 //! What is asserted:
 //! - (3) the leg computes what the dot says. For a fixed sample of layers — every layer whose gate
@@ -64,7 +69,7 @@ mod gate {
     use std::fs::File;
     use std::os::unix::fs::FileExt;
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::process::Command;
     use std::time::Instant;
 
@@ -73,18 +78,13 @@ mod gate {
     use bloomery_gpu::arch::qwen3moe::{Prompt38, Qwen38Model};
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::kv_format::KvQ8;
-    use bloomery_gpu_gates::{GateError, checks_failed, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, tier, verdict};
     use gguf::{GgmlType, Split};
     use model::arch::qwen35moe::place::{Experts, PlanInputs, machine_for_experts};
     use model::moe::{HostLayer, HostLayerSpec, HostScratch, UnionScratch};
     use model::ops::Tensor2;
     use model::placement::PlanLevers;
     use model::r8file::R8Source;
-
-    /// The UD-Q3_K_XL file, first of three shards (90.0 GB), on the NVMe drive: the gate pages the whole
-    /// file through its engine child, which a hard drive cannot do inside the gate bound.
-    const MODEL: &str =
-        "/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00003.gguf";
 
     /// Cache rows of the engine child: the prompt and the steps, with room.
     const CTX: usize = 1024;
@@ -335,9 +335,30 @@ mod gate {
         at.into_iter().collect()
     }
 
+    /// The plan levers of the engine's load and of clause 3's plan: the real tier's are the
+    /// caller's; the fixture tier's budget is the header's, which keeps half the experts of each
+    /// card-eligible layer on the card so the host leg this gate exists for serves the other
+    /// half (the load reserves its stores' page rounding out of that budget).
+    fn plan_levers(
+        split: &Split,
+        levers: &bloomery_levers::Levers,
+    ) -> Result<PlanLevers, GateError> {
+        let rounding = PlanInputs::describe(split)?.room_padding(
+            CTX as u64,
+            1,
+            false,
+            bloomery_gpu_gates::generate::stage_page(crate::gate_card::card()?)?,
+            bloomery_levers::KvHost::Off,
+        )?;
+        tier::plan_levers(split, levers, rounding)
+    }
+
     /// The plan's per-layer card prefix `n_l` and the file's dims, for the model's own placement
     /// at the gate plan (`Experts::Card`): the host serves the ids past each layer's prefix.
-    fn card_prefix(split: &Split) -> Result<(Vec<u64>, usize, usize, usize), GateError> {
+    fn card_prefix(
+        split: &Split,
+        levers: &bloomery_levers::Levers,
+    ) -> Result<(Vec<u64>, usize, usize, usize), GateError> {
         let inputs = PlanInputs::describe(split)?;
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let machine = machine_for_experts(
@@ -349,7 +370,7 @@ mod gate {
         let plan = inputs.plan_with_slots(
             &machine,
             (CTX as u64, u64::try_from(ub)?),
-            &PlanLevers::default(),
+            &plan_levers(split, levers)?,
             Experts::Card,
             1,
         )?;
@@ -537,8 +558,9 @@ mod gate {
         split: &Split,
         inv: &Inventories,
         types: &[[GgmlType; 3]],
+        levers: &bloomery_levers::Levers,
     ) -> Result<bool, GateError> {
-        let (n_l, embd, ff, n_used) = card_prefix(split)?;
+        let (n_l, embd, ff, n_used) = card_prefix(split, levers)?;
         let n_expert = inv.stack(&names(0)[0])?.n_expert;
         let layers = sample_layers(types);
         let seen: Vec<GgmlType> = layers.iter().flat_map(|&l| types[l]).collect();
@@ -592,12 +614,15 @@ mod gate {
     /// The model placed on the gate card by its plan, the routed experts on the card's id prefix
     /// and the host beyond it (`Experts::Card`), under the plan's own machine: the e2e gate's open.
     fn open() -> Result<Qwen38Model, GateError> {
-        let levers = bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
-        let file = crate::qwen38_open::open_split(Path::new(MODEL))?;
+        let levers = bloomery_levers::at_main(&[
+            bloomery_levers::CARD_BUDGET,
+            bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
+        ])?;
+        let file = crate::qwen38_open::open_split(&bloomery_gpu_gates::ref_model_path()?)?;
         let t = Instant::now();
         let ub = bloomery_gpu::arch::qwen3moe::ubatch::ubatch_for(CTX)?;
         let card = crate::gate_card::card()?;
-        let plan_levers = PlanLevers::default();
+        let plan_levers = plan_levers(&file, &levers)?;
         let planned = Open38 {
             card,
             ctx: CTX,
@@ -644,7 +669,10 @@ mod gate {
     /// The engine child: the pool's width, the load, the 512-position prompt through the ubatch
     /// walk, 8 decode steps, every logit held finite, the walk's per-layer host slots and the dump.
     fn child(dump: &str) -> Result<(), GateError> {
-        bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
+        bloomery_levers::at_main(&[
+            bloomery_levers::CARD_BUDGET,
+            bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
+        ])?;
         println!("iqleg width={}", threads::pool().threads());
         crate::gate_card::init()?;
         let mut m = open()?;
@@ -850,13 +878,29 @@ mod gate {
             let dump = args.next().ok_or("--engine takes the dump path")?;
             return child(&dump);
         }
-        bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
+        let levers = bloomery_levers::at_main(&[
+            bloomery_levers::CARD_BUDGET,
+            bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
+        ])?;
         crate::gate_card::init()?;
-        let split = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let path = bloomery_gpu_gates::ref_model_path()?;
+        let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         let inv = Inventories::of(&split)?;
         let n_layer = PlanInputs::describe(&split)?.spec.layers.len();
         let types = layer_types(&inv, n_layer)?;
-        let mut ok = clause_leg(&split, &inv, &types)?;
+        let holds = types.iter().flatten().copied().any(is_iq);
+        if !holds && refset::fixture::selected()?.is_some() {
+            return Err(format!(
+                "the fixture variant's file {} holds no IQ3_XXS, IQ4_XS or IQ4_NL routed stack: \
+                 a variant exists to run this gate's clauses, so one without them is a named error",
+                path.display()
+            )
+            .into());
+        }
+        if !tier::layout_clause("i-quant routed stacks (clauses 1 to 3)", holds)? {
+            return Ok(());
+        }
+        let mut ok = clause_leg(&split, &inv, &types, &levers)?;
         if !ok {
             println!(
                 "clause 3 is red; clauses 1 and 2 still run {}",

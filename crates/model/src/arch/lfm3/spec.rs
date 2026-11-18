@@ -422,7 +422,7 @@ pub(super) mod tests {
     fn the_registry_names_the_reader() {
         assert!(crate::arch::Arch::from_name("lfm3").is_err());
         let row = crate::arch::registry::row_of("lfm3").expect("a row");
-        assert!(row.read.is_some() && row.draft.is_none() && row.fixture.is_none());
+        assert!(row.read.is_some() && row.draft.is_none() && row.fixture.is_some());
     }
 
     /// Each key the reader takes is required by name, but the vocabulary's size, which the token

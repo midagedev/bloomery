@@ -746,7 +746,13 @@ fn hw_framing_follows_the_rendered_call() {
     let t = ChatTemplate::parse(MIMO).expect("template parses");
     assert_eq!(ToolFormat::of_chat_template(&t), compact);
     assert_eq!(ToolFormat::of_template(MIMO), compact);
-    for name in ["qwen36", "qwen38", "nemotron", "nemotron-bolt"] {
+    for name in [
+        "qwen36",
+        "qwen38",
+        "nemotron",
+        "nemotron-bolt",
+        "nemotron-super",
+    ] {
         let source = template_named(name);
         let t = ChatTemplate::parse(source).expect("template parses");
         assert_eq!(ToolFormat::of_chat_template(&t), lines, "{name}");
@@ -1091,7 +1097,9 @@ fn seat_format(name: &str) -> ToolFormat {
         "v41" => ToolFormat::Dsml(Spelling::Joined),
         "glm5" => ToolFormat::KvMarkup(KvSpelling::Glm),
         "qwen3" => ToolFormat::Hermes,
-        "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" => ToolFormat::QwenXml(Framing::Lines),
+        "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" | "nemotron-super" => {
+            ToolFormat::QwenXml(Framing::Lines)
+        }
         other => panic!("{other} is not in the seat table"),
     }
 }
@@ -1717,7 +1725,7 @@ fn hw_qwen_call_cut_by_the_limit_is_an_answer() {
 /// ([`FIXTURE_TEMPLATES`]), as llama.cpp mainline's chat layer parses the same
 /// generation (`tools/ref/chat_parse_ref` over each template, one user turn,
 /// `reasoning_format` auto): the Qwen3-Coder parser (Qwen3.6, Qwen3.8,
-/// Nemotron, Bolt) drops the whitespace that opens the content, with the span
+/// Nemotron, Bolt, Super-VL) drops the whitespace that opens the content, with the span
 /// open, closed by the prompt, or ended by a call; a span the model opens
 /// itself (Qwen3's) drops the whitespace after its `</think>`; GLM's and
 /// V4.1's keep it, as does Qwen3's prompt-closed span. Whitespace before a
@@ -1784,6 +1792,24 @@ fn hw_content_after_the_span_is_mainlines() {
             "Hello",
             None,
             0,
+        ),
+        (
+            "nemotron-super",
+            true,
+            false,
+            "r</think>\n\nHello".into(),
+            "Hello",
+            Some("r"),
+            0,
+        ),
+        (
+            "nemotron-super",
+            false,
+            true,
+            format!("\n{call}\n"),
+            "",
+            None,
+            1,
         ),
         (
             "glm5",

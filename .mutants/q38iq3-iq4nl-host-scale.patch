@@ -1,0 +1,12 @@
+# mutant: gate-gpu-qwen4exp-iqleg@BLOOMERY_FIXTURE_VARIANT=q38iq3: the IQ4_NL host dot's block scale 1 read as 2 (the no-integer-scale rule): every iq4_nl host cell doubles, so clause 3's host-vs-card cells and the host-leg bits differ
+--- a/crates/qdot/src/generic.rs
++++ b/crates/qdot/src/generic.rs
+@@ -737,7 +737,7 @@
+         (half_at(blk, 0), 0.0)
+     }
+     fn scale(_blk: &[u8], _group: usize) -> i32 {
+-        1
++        2
+     }
+     fn codes(blk: &[u8], _sub: usize) -> [i8; 32] {
+         iq4nl_codes(&blk[2..18])

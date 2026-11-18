@@ -48,6 +48,27 @@
 //! kind and pair coverage, and the trunk comparison. This file holds what the
 //! latent MoE forces: the expert arrays and table key, the router and bias
 //! constants, the NVFP4 per-tensor scales, and the map's two-shape rule.
+//!
+//! The second fixture of the architecture is Nemotron 3.5 Lightning's
+//! ([`light_spec`], the profile `nemotron-light`): the same rules over a
+//! 30B-A3B file whose experts act on the hidden row itself (no latent), 128
+//! of them 1,856 wide at the top 6, in Q5_0, Q5_1 and Q8_0 blocks, with Q8_0
+//! mixers and a next-token block the fixture leaves out. It is four blocks of
+//! source layers 0, 1, 3 and 5:
+//!
+//! | fixture layer | source layer | mixer | feed-forward | why |
+//! |---|---|---|---|---|
+//! | f0 | L0 | Mamba-2 | none | the first Mamba-2 layer: Q8_0 `ssm_in`/`ssm_out` |
+//! | f1 | L1 | none | MoE, up Q5_1, down Q8_0 | the one layer of the file with a Q5_1 up (the other 22 hold Q5_0), and the Q8_0 down four of its layers hold |
+//! | f2 | L3 | none | MoE, up Q5_0, down Q5_1 | the pair the other 18 layers hold |
+//! | f3 | L5 | attention, 2 KV heads | none | the first attention layer: Q8_0 `attn_{q,k,v,output}` |
+//!
+//! Both MoE layers are one (expert count, width) shape, as the file's 23 are,
+//! so the map's two-shape rule is one shape here (`Moe::min_shapes`); every
+//! (stem, type) pair of the trunk's layers is kept (`hybrid::check_map_trunk`,
+//! which leaves the next-token block's own pairs, its BF16 router among them,
+//! out of the file's). The scan's constants are the Bolt's: the Lightning's
+//! medians are not measured, and the fixture needs the type, not the quality.
 
 use std::collections::BTreeSet;
 
@@ -115,12 +136,40 @@ pub fn spec() -> FixtureSpec {
         default_source,
         draft: None,
         sidecar: None,
-        family: &Bolt,
+        family: &BOLT,
     }
 }
 
 fn default_source() -> String {
     DEFAULT_MODEL.to_string()
+}
+
+/// Fixture layer `f` of the Lightning fixture holds source layer `LIGHT_LAYER_MAP[f]` (the table
+/// above).
+pub const LIGHT_LAYER_MAP: [usize; 4] = [0, 1, 3, 5];
+
+/// The Lightning fixture is `<LIGHT_STEM>-00001-of-00001.gguf`.
+pub const LIGHT_STEM: &str = "nemotron-lightning-fixture";
+
+/// The real file `verify` opens for the Lightning fixture when none is named: the Unsloth
+/// UD-Q4_K_XL on the box.
+pub const LIGHT_DEFAULT_MODEL: &str =
+    "/models/Nemotron-3.5-Lightning/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf";
+
+/// The Nemotron 3.5 Lightning fixture: [`LIGHT_LAYER_MAP`] under the Bolt's window, card budget
+/// and rules, the one-shape map rule, and the Lightning's file as the default source.
+pub fn light_spec() -> FixtureSpec {
+    FixtureSpec {
+        stem: LIGHT_STEM,
+        layers: LIGHT_LAYER_MAP.to_vec(),
+        default_source: light_default_source,
+        family: &LIGHTNING,
+        ..spec()
+    }
+}
+
+fn light_default_source() -> String {
+    LIGHT_DEFAULT_MODEL.to_string()
 }
 
 /// The coverage table of the architecture keys; `None` is a key the map does
@@ -129,7 +178,8 @@ fn default_source() -> String {
 /// table key (the largest router of the map), and the router's and shared
 /// expert's constants are copied.
 pub fn key_rule(suffix: &str) -> Option<KeyRule> {
-    const COPY: [&str; 8] = [
+    const COPY: [&str; 9] = [
+        "rope.freq_base",
         "expert_group_count",
         "expert_group_used_count",
         "expert_gating_func",
@@ -183,25 +233,42 @@ pub fn spread_value(leaf: &str) -> Option<f32> {
 /// width): a map of one shape would not tell the engine's per-layer shapes
 /// from a model-wide one. The map's largest router, the fixture's `expert_count`.
 pub fn check_map(src: &Hparams, source: &Split, layers: &[usize]) -> Result<usize, FixtureError> {
-    hybrid::check_map(
+    check_map_shapes(src, source, layers, BOLT.min_shapes)
+}
+
+/// [`check_map`] with the number of different (expert count, width) shapes the map must keep: the
+/// source's own, at most (a source whose MoE layers are all of one shape keeps one).
+fn check_map_shapes(
+    src: &Hparams,
+    source: &Split,
+    layers: &[usize],
+    min_shapes: usize,
+) -> Result<usize, FixtureError> {
+    hybrid::check_map_trunk(
         &src.kinds,
         &[Kind::Mamba, Kind::Attention, Kind::Moe],
         source,
         layers,
+        src.n_trunk,
     )?;
     let shapes: BTreeSet<(usize, usize)> = moe_layers(src, layers)
         .map(|e| (e.n_expert, e.ff))
         .collect();
-    if shapes.len() < 2 {
+    let trunk: Vec<usize> = (0..src.n_trunk).collect();
+    let source_shapes: BTreeSet<(usize, usize)> = moe_layers(src, &trunk)
+        .map(|e| (e.n_expert, e.ff))
+        .collect();
+    let want = min_shapes.min(source_shapes.len());
+    if shapes.len() < want {
         return Err(hybrid::map_error(format!(
-            "{layers:?} holds MoE layers of {} (expert count, width) shape(s) {shapes:?}: two different are kept",
+            "{layers:?} holds MoE layers of {} (expert count, width) shape(s) {shapes:?}: {want} different are kept",
             shapes.len()
         )));
     }
     Ok(moe_layers(src, layers)
         .map(|e| e.n_expert)
         .max()
-        .expect("two shapes hold a MoE layer"))
+        .expect("a kept shape holds a MoE layer"))
 }
 
 /// The experts of the MoE layers in `layers`.
@@ -211,10 +278,20 @@ fn moe_layers<'a>(src: &'a Hparams, layers: &'a [usize]) -> impl Iterator<Item =
         .filter_map(|&l| src.experts.get(l).copied().flatten())
 }
 
-/// Latent MoE's rules.
-struct Bolt;
+/// The MoE hybrid's rules: the Bolt's and the Lightning's differ in the shapes a map must keep.
+struct Moe {
+    /// The different (expert count, width) shapes a map keeps, where its source holds that many.
+    min_shapes: usize,
+}
 
-impl Family for Bolt {
+/// The Bolt's: its twelve shapes are not one shape, and a map of one would not tell the per-layer
+/// shapes from a model-wide one.
+static BOLT: Moe = Moe { min_shapes: 2 };
+
+/// The Lightning's: all its MoE layers are one shape.
+static LIGHTNING: Moe = Moe { min_shapes: 1 };
+
+impl Family for Moe {
     fn key_rule(&self, suffix: &str) -> Option<KeyRule> {
         key_rule(suffix)
     }
@@ -234,7 +311,7 @@ impl Family for Bolt {
     /// projections at the wrong RMS.
     fn tables(&self, source: &Split, spec: &FixtureSpec) -> Result<Box<dyn Tables>, FixtureError> {
         let src = Hparams::read(source)?;
-        let n_expert = check_map(&src, source, &spec.layers)?;
+        let n_expert = check_map_shapes(&src, source, &spec.layers, self.min_shapes)?;
         for (_, t) in source.iter_tensors() {
             if t.ty != gguf::GgmlType::NVFP4 {
                 continue;
@@ -273,7 +350,7 @@ impl Family for Bolt {
         fixture: &Split,
         source: &Split,
     ) -> Result<(), FixtureError> {
-        check_kinds(spec, fixture, source).map(|_| ())
+        check_kinds_shapes(spec, fixture, source, self.min_shapes).map(|_| ())
     }
 }
 
@@ -312,9 +389,19 @@ pub fn check_kinds(
     fixture: &Split,
     source: &Split,
 ) -> Result<Hparams, FixtureError> {
+    check_kinds_shapes(spec, fixture, source, BOLT.min_shapes)
+}
+
+/// [`check_kinds`] under a map that keeps `min_shapes` expert shapes ([`check_map_shapes`]).
+fn check_kinds_shapes(
+    spec: &FixtureSpec,
+    fixture: &Split,
+    source: &Split,
+    min_shapes: usize,
+) -> Result<Hparams, FixtureError> {
     let fx = Hparams::read(fixture)?;
     let src = Hparams::read(source)?;
-    let largest = check_map(&src, source, &spec.layers)?;
+    let largest = check_map_shapes(&src, source, &spec.layers, min_shapes)?;
     hybrid::check_trunk(&spec.layers, &trunk(&fx), &trunk(&src))?;
     let bad = |what: String, detail: String| FixtureError::Mismatch { what, detail };
     for (f, &l) in spec.layers.iter().enumerate() {

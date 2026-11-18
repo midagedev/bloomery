@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/q5.rs
++++ b/crates/gpu/src/q5.rs
+@@ -423,7 +423,7 @@
+             v
+         } else {
+             let r = if v > 0.0 { v } else { 0.0 };
+-            r * r
++            r
+         }
+     }
+ }

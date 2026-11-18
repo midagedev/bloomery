@@ -1,0 +1,14 @@
+# Round fxa: ik's CPU node dumps of the v41mxfp4 fixture variant (/models/fixture-variants/v41mxfp4/v41, the V4.1 fixture
+# retyped to UD-Q4_K_XL's map: routed MXFP4, every dense site Q8_0, F32 router and hyper-connection fns; tools/fixture-variants.tsv),
+# the four V4.1 fixture sets (step4, d1n, d1, d2 every-node), each one `BLOOMERY_TIER=fixture
+# BLOOMERY_FIXTURE_VARIANT=v41mxfp4 just dump-ref-fixture deepseek41 <set>-every-node` under this card, one lease each. Nothing
+# is timed. The dumper is main's shared bin/ (the ik build the base fixture's sets were dumped with): a variant changes the file,
+# not the dumper. The requant (`just fixture-requant deepseek41 v41mxfp4`) takes no lease, as the glm variants' did not.
+# Minutes [derived from istaglue-dump.card, fxoracle-dump.card]: the base fixture's V4.1 dumps were 0.05-0.3 min each plus 3-15 s a
+# lease take (four takes: 1-5 min); the variant is about 17 GiB against the base's 15.9 (MXFP4 4.25 bits a weight against the base
+# routed stacks' 3.4-5.5, Q8_0 dense sites against Q3_K), read cold once at 1-2 GB/s: 9-18 s more. 1..6 min in all.
+kind: exclusive
+reason: dump_ref runs ik on 32 CPU threads and pages the variant file in, so it holds the lease; why now: gate-gpu-ds41-step
+  on the v41mxfp4 variant has no oracle sets until ik has dumped the variant, and the MXFP4 routed stacks, the Q8_0 trunk and the
+  F32 router are otherwise held only to our own host decode; the UD-Q4_K_XL file they stand for leaves /models
+minutes: 1..6

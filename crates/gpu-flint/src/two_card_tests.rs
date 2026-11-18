@@ -1,6 +1,7 @@
 //! The real six-slot tier protocol against the same plan's one-card expert union.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use bloomery_gpu::fault::{Fault, FaultSite};
 use bloomery_gpu::host::served::prompt_pass;
@@ -9,7 +10,9 @@ use bloomery_gpu::model::StepMode;
 use bloomery_gpu::{GpuError, hybrid::HOST};
 use bloomery_levers::HostCfg;
 use gguf::Split;
+use model::arch::flint::fixture as flint_fixture;
 use model::arch::flint::place::{PlanInputs, tier_batch};
+use model::fixture::{KEY_CARD_BUDGET, KEY_VERSION};
 use model::placement::{Plan, PlanLevers, union_plan, workstation};
 use models::Ffn;
 
@@ -25,6 +28,9 @@ const MODEL_SHA256: &str = "63c2ecc461ca545134b670c660e76fa20f47240f8d39b6510bfd
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
+/// The opened file's layer count and vocabulary: the released file's or the fixture's.
+static GEOMETRY: OnceLock<(usize, usize)> = OnceLock::new();
+
 #[derive(Debug, PartialEq, Eq)]
 struct Observation {
     position: u32,
@@ -36,10 +42,13 @@ struct Observation {
 fn observe(m: &FlintModel, argmax: u32) -> Result<Observation, GpuError> {
     let logits = m.logits()?;
     let layers = m.body(WHAT)?.taps(m.gpu())?;
-    assert_eq!(logits.len(), 150_144, "{WHAT}: full vocabulary");
+    let &(n_layers, vocab) = GEOMETRY
+        .get()
+        .expect("the test records its file's geometry first");
+    assert_eq!(logits.len(), vocab, "{WHAT}: full vocabulary");
     assert_eq!(
         layers.len(),
-        49 * 2048,
+        n_layers * 2048,
         "{WHAT}: every layer's merge output"
     );
     assert!(
@@ -230,32 +239,51 @@ fn open(path: &Path, plan: &Plan<'_>, inputs: &PlanInputs) -> Result<FlintModel,
 }
 
 #[test]
-#[ignore = "needs exactly two visible CUDA devices, the complete pinned Flint GGUF in BLOOMERY_MODEL, and host RAM for its host experts"]
+#[ignore = "needs exactly two visible CUDA devices, the pinned Flint GGUF or the flint fixture in BLOOMERY_MODEL, and host RAM for its host experts"]
 fn hw_two_card_full_file_union_capture_publication_fault_reset() -> Result<(), Error> {
     let path = std::env::var_os("BLOOMERY_MODEL")
         .ok_or("flint two-card acceptance: BLOOMERY_MODEL must name the complete pinned GGUF")?;
     let path = Path::new(&path);
-    assert_eq!(
-        std::fs::metadata(path)?.len(),
-        MODEL_BYTES,
-        "{WHAT}: complete file"
-    );
-    assert_eq!(
-        gguf::digest::sha256_file(path)?,
-        MODEL_SHA256,
-        "{WHAT}: pinned model bytes"
-    );
     let file = Split::open(path)?;
+    // PIN(2026-11-18): the pinned released file, or a flint fixture (only the headline models keep real files).
+    // A fixture's identity is its header, which names the source it was cut from and the budget its plan holds.
+    let fixture = file.value(KEY_VERSION).is_some();
+    if fixture {
+        assert_eq!(
+            file.arch_get_u64("block_count"),
+            Some(flint_fixture::LAYER_MAP.len() as u64),
+            "{WHAT}: the flint fixture's layers"
+        );
+    } else {
+        assert_eq!(
+            std::fs::metadata(path)?.len(),
+            MODEL_BYTES,
+            "{WHAT}: complete file"
+        );
+        assert_eq!(
+            gguf::digest::sha256_file(path)?,
+            MODEL_SHA256,
+            "{WHAT}: pinned model bytes"
+        );
+    }
     let inputs = PlanInputs::read(&file)?;
+    let want_layers = if fixture {
+        flint_fixture::LAYER_MAP.len()
+    } else {
+        49
+    };
     assert_eq!(
         (
             inputs.spec.layers.len(),
             inputs.spec.hidden,
             inputs.spec.vocab
         ),
-        (49, 2048, 150_144),
+        (want_layers, 2048, 150_144),
         "{WHAT}: released geometry"
     );
+    GEOMETRY
+        .set((inputs.spec.layers.len(), inputs.spec.vocab as usize))
+        .expect("one test sets the geometry once");
     assert_eq!(
         inputs.model.experts_used, 6,
         "{WHAT}: production top-six program"
@@ -275,11 +303,26 @@ fn hw_two_card_full_file_union_capture_publication_fault_reset() -> Result<(), E
         "{WHAT}: two distinct physical devices"
     );
     // A reduced budget makes real tier assignments while leaving room for the union reference.
-    // It is bounded by each actual free reading, not an assumed card model or the file's length.
-    let budget = (8u64 << 30)
+    // It is bounded by each actual free reading, not an assumed card model or the file's length;
+    // a fixture's cap is the budget its header records, which holds half of every routed layer's
+    // experts on the stage card.
+    let cap = if fixture {
+        file.value(KEY_CARD_BUDGET)
+            .and_then(gguf::Value::as_unsigned)
+            .ok_or("the flint fixture's header records no card budget")?
+    } else {
+        8u64 << 30
+    };
+    let budget = cap
         .min(stage.free_bytes.unwrap_or(stage.usable_bytes()) / 3)
         .min(tier.free_bytes.unwrap_or(tier.usable_bytes()) / 2);
-    let machine = workstation::plan_tiers(49, stage, &[tier], None, tier_batch(&inputs)?)?;
+    let machine = workstation::plan_tiers(
+        inputs.spec.layers.len(),
+        stage,
+        &[tier],
+        None,
+        tier_batch(&inputs)?,
+    )?;
     let mut flat = machine.clone();
     flat.tiers.clear();
     let levers = PlanLevers {

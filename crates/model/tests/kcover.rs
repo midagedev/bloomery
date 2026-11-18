@@ -277,8 +277,8 @@ fn kcover_table_holds_the_checked_in_headers() {
 }
 
 /// A variant reaches a pin: a fixture-variants row of the fixture's architecture that retypes a
-/// stem to the type a real file stores it in takes that pin out of the gaps, and only it; a row of
-/// another architecture takes nothing.
+/// stem to the type a real file stores it in takes that pin out of the gaps, and only it, with or
+/// without a layer list on the word; a row of another architecture takes nothing.
 #[test]
 fn kcover_a_variant_reaches_its_pin() {
     let ml4 = header_tables::header_of("kcover-ml4-v", MISTRAL_KV, MISTRAL_TENSORS);
@@ -317,6 +317,15 @@ fn kcover_a_variant_reaches_its_pin() {
     }
     if pins(&[row("glm5next")]) != all {
         bad.push("a variant of another architecture takes a pin".into());
+    }
+    // A word limited to layers (`attn_q@0`), in the NextN scope, reaches the pin as the whole role does.
+    let listed = VariantRow {
+        scope: model::fixture::VariantScope::NextN,
+        map: vec![("attn_q@0,2".into(), GgmlType::IQ4_XS)],
+        ..row(spec.arch)
+    };
+    if pins(&[listed]) != netted {
+        bad.push("a variant word with a layer list does not take the pin of its role".into());
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }

@@ -24,7 +24,7 @@ use super::{
 use crate::placement::PlacementError;
 
 /// Every fixture family's spec, read by the fixture tool and the gates' budget admission.
-pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 12] = [
+pub const FIXTURE_SPECS: &[fn() -> crate::fixture::FixtureSpec] = &[
     deepseek41::fixture::spec,
     qwen3moe::fixture::spec,
     qwen35moe::fixture::spec,
@@ -37,6 +37,10 @@ pub const FIXTURE_SPECS: [fn() -> crate::fixture::FixtureSpec; 12] = [
     musespark::fixture::spec,
     mistrallarge4::fixture::spec,
     kimi_k3::fixture::spec,
+    llama::fixture::spec,
+    lfm3::fixture::spec,
+    raon1::fixture::spec,
+    flint::fixture::spec,
 ];
 
 /// The fixture spec whose architecture string is `arch`, from [`FIXTURE_SPECS`].
@@ -234,7 +238,15 @@ pub static ROWS: &[ArchRow] = &[
         read: Some(llama::spec::read),
         draft: None,
         coverage: None,
-        fixture: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "llama",
+            repo: "bartowski/Nanbeige_Nanbeige4.3-33B-GGUF",
+            quant: "Q4_K_M",
+            // The commit the profile pins (tools/ref/models/nanbeige43.sh): the file's 20,788,825,216
+            // bytes are the repo's own listing at it.
+            rev: Some("9beb68421fdf7be095093a6888325fa2c83ddd38"),
+            draft: DraftSource::None,
+        })),
     },
     ArchRow {
         // No `Arch` variant, and no family rows: the program that names the file is Qwen3.5's, whose
@@ -253,7 +265,15 @@ pub static ROWS: &[ArchRow] = &[
         read: Some(lfm3::spec::read),
         draft: None,
         coverage: None,
-        fixture: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "lfm3",
+            repo: "LiquidAI/LFM3-1.7B-GGUF",
+            quant: "Q4_K_M",
+            // The revision the profile pins (tools/ref/models/lfm3.sh LFM3_REVISION): the Q4_K_M
+            // file's 1,099,627,808 bytes are the repo's own listing at it.
+            rev: Some("b3f2ae5d73cd3c91bf40e8ba752c648aa05dffdf"),
+            draft: DraftSource::None,
+        })),
     },
     ArchRow {
         arch: Some(Arch::Glm5next),
@@ -303,7 +323,14 @@ pub static ROWS: &[ArchRow] = &[
         read: Some(raon1::spec::read),
         draft: None,
         coverage: None,
-        fixture: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "raon1",
+            repo: "KRAFTON/Raon-1-mini-preview-gguf",
+            quant: "Q4_K_M",
+            // The repo's head when the row was made; the Q4_K_M file's 19,7 GB are its own listing at it.
+            rev: Some("cd61e81afcdfdf4b13cb345b3587c0ba4b918d00"),
+            draft: DraftSource::File("dflash-raon-1-mini-preview-Q8_0.gguf"),
+        })),
     },
     ArchRow {
         arch: Some(Arch::SolarOpen2),
@@ -375,7 +402,15 @@ pub static ROWS: &[ArchRow] = &[
         read: Some(flint::spec::read),
         draft: None,
         coverage: None,
-        fixture: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "flint",
+            repo: "unsloth/flint-GGUF",
+            quant: "UD-Q4_K_XL",
+            // The repo's head when the row was made; the file's size is the profile's
+            // (`tools/ref/models/flint.sh`).
+            rev: Some("20468edfc38ab43d6914cc88b08cbecb05d0fc62"),
+            draft: DraftSource::None,
+        })),
     },
     ArchRow {
         // K-EXAONE's exaone-moe: the same reader as flint's, every fact the
@@ -452,6 +487,16 @@ pub static PROFILE_CUTS: &[ProfileCut] = &[
         },
     },
     ProfileCut {
+        // Nemotron 3.5 Lightning's ModelOpt NVFP4 folder (one Mamba-2, one MoE and one attention
+        // layer in their stored bits): only the folder gate reads it, and `nemotron_h_moe` keeps
+        // its Bolt GGUF fixture for the other gates.
+        profile: "nemotron-light-folder",
+        arch: "nemotron_h_moe",
+        cut: CutRow {
+            family: "nemlightf",
+        },
+    },
+    ProfileCut {
         // The same layers of the FP4-Local checkpoint, whose routed stacks store `csf` block
         // scales: the NVFP4 gate's fixture tier loads it beside the NVFP4 cut.
         profile: "qwen4exp-fp4l",
@@ -478,10 +523,23 @@ pub struct ProfileFixture {
     pub family: &'static str,
     /// The cut's spec.
     pub spec: fn() -> crate::fixture::FixtureSpec,
+    /// The hub file the fixture's header is read from where it is not the architecture row's: a
+    /// second model of one architecture (`nemlight`, whose row is the Bolt's) names its own;
+    /// `None` is the row's source.
+    pub source: Option<FixtureRow>,
 }
 
 /// Every profile's GGUF fixture, in table order.
 pub static PROFILE_FIXTURES: &[ProfileFixture] = &[
+    ProfileFixture {
+        // The Nanbeige4.3-33B profile: the `llama` row's fixture, which the gates read by the
+        // profile's name (the generic architecture string picks the reader, the profile the file).
+        profile: "nanbeige43",
+        arch: "llama",
+        family: "nanbeige43",
+        spec: llama::fixture::profile_spec,
+        source: None,
+    },
     ProfileFixture {
         // Kimi K3 at the real file's widths and counts: the mini's dispatch classes are not the real
         // file's (`tools/kcover/unreached.tsv`), the full-shape cut's are.
@@ -489,6 +547,7 @@ pub static PROFILE_FIXTURES: &[ProfileFixture] = &[
         arch: "kimi-k3",
         family: "kimik3full",
         spec: kimi_k3::fixture::full_spec,
+        source: None,
     },
     ProfileFixture {
         // Muse Spark at the real file's widths and counts, for the same reason.
@@ -496,6 +555,24 @@ pub static PROFILE_FIXTURES: &[ProfileFixture] = &[
         arch: "muse-spark",
         family: "musesparkfull",
         spec: musespark::fixture::full_spec,
+        source: None,
+    },
+    ProfileFixture {
+        // Nemotron 3.5 Lightning's shapes (no latent, 128 experts of 1,856 at the top 6, Q5_0,
+        // Q5_1 and Q8_0 stacks): the Bolt fixture has a latent and IQ2_XXS stacks, so the 32-value
+        // card experts and the no-latent MoE run on this one.
+        profile: "nemotron-light",
+        arch: "nemotron_h_moe",
+        family: "nemlight",
+        spec: nemotron_h_moe::fixture::light_spec,
+        // The unsloth UD-Q4_K_XL file at the revision the catalog row pins (`tools/catalog.tsv`).
+        source: Some(FixtureRow {
+            family: "nemlight",
+            repo: "unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+            quant: "UD-Q4_K_XL",
+            rev: Some("f2d3fe3694501008786e81e5f20360cbf715496a"),
+            draft: DraftSource::None,
+        }),
     },
 ];
 
@@ -675,11 +752,15 @@ mod tests {
                 "qwen3moe",
                 "qwen4exp",
                 "qwen35moe",
+                "llama",
+                "lfm3",
                 "glm5next",
                 "mimo2",
+                "raon1",
                 "solar-open2",
                 "nemotron_h",
                 "nemotron_h_moe",
+                "flint",
                 "muse-spark",
                 "mistral-large4",
                 "kimi-k3"

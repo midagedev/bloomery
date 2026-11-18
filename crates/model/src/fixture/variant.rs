@@ -7,9 +7,13 @@
 //!
 //! A table row is `tag<TAB>family<TAB>scope<TAB>map<TAB>recipes<TAB>why`. The map is `role=type`
 //! words: `role` is a tensor name between `blk.<L>.` and `.weight`, or the name of a tensor outside the
-//! layers without its `.weight` (`token_embd`, `output`), `type` a ggml type name. The scope `trunk` is
-//! every layer but the NextN one (the layer that holds `nextn.*` tensors), which keeps the source's
-//! types; `all` is every layer, the NextN one included; a tensor outside the layers is in either.
+//! layers without its `.weight` (`token_embd`, `output`), `type` a ggml type name. A role may be followed
+//! by `@` and a comma list of layer numbers (`ffn_gate_exps@0,2=iq4_xs`): the word then reaches those
+//! layers' tensors alone, so one role takes different types on different layers; a layer the scope does
+//! not reach, or that has no such tensor, is refused by name, and two words never reach one tensor.
+//! The scope `trunk` is every layer but the NextN one (the layer that holds `nextn.*` tensors), which keeps
+//! the source's types; `all` is every layer, the NextN one included; `nextn` is the NextN layer alone; a
+//! tensor outside the layers is in `trunk` and `all`.
 //!
 //! The quantizer picks a type for every tensor it sees, so the argument names every tensor of the
 //! source by its exact name: the map's tensors at their new type, every other at its own, which the
@@ -43,13 +47,16 @@ pub enum Scope {
     Trunk,
     /// Every layer, the NextN one included.
     All,
+    /// The NextN layer alone: the layers that carry `nextn.*` tensors, and no tensor outside the layers.
+    NextN,
 }
 
 /// One row of the table.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     pub tag: String,
-    /// The architecture the source declares.
+    /// The architecture the source declares, or the profile a second fixture of one architecture
+    /// is (`nemotron-light`, [`source_arch`]).
     pub family: String,
     pub scope: Scope,
     /// Tensor role and the type it takes, in the table's order.
@@ -90,12 +97,50 @@ fn type_named(name: &str) -> Option<GgmlType> {
         .find(|t| t.name() == Some(name))
 }
 
+/// A map word's role split at `@`: the tensor name and, when the word is limited to layers, their
+/// numbers (a comma list, each once).
+fn split_role(role: &str) -> Result<(&str, Option<Vec<usize>>), String> {
+    let Some((name, list)) = role.split_once('@') else {
+        return Ok((role, None));
+    };
+    let mut layers: Vec<usize> = Vec::new();
+    for n in list.split(',') {
+        let Ok(l) = n.parse::<usize>() else {
+            return Err(format!(
+                "{n:?} after `@` is not a layer number (a comma list of them)"
+            ));
+        };
+        if layers.contains(&l) {
+            return Err(format!("layer {l} is named twice after `@`"));
+        }
+        layers.push(l);
+    }
+    Ok((name, Some(layers)))
+}
+
+/// The tensor name of a map word's role, without its `@` layer list: what a type pin of the reach
+/// table (`coverage::reach`) names.
+#[must_use]
+pub fn role_name(role: &str) -> &str {
+    role.split_once('@').map_or(role, |(name, _)| name)
+}
+
+/// Whether two words of one role reach a tensor in common: a word with no layer list reaches every
+/// layer of its scope.
+fn reaches_both(a: Option<&[usize]>, b: Option<&[usize]>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.iter().any(|l| b.contains(l)),
+        _ => true,
+    }
+}
+
 /// The table's rows.
 ///
 /// # Errors
 /// A line that is not six columns, a tag that repeats or is not lower-case letters and digits, a
-/// family or scope that is empty or unknown, a map word that is not `role=type` with a type ggml names,
-/// an empty map or recipe list.
+/// family or scope that is empty or unknown, a map word that is not `role=type` with a type ggml names
+/// (or whose `@` layer list is not layer numbers), two words that reach one tensor, an empty map or
+/// recipe list.
 pub fn parse_table(text: &str) -> Result<Vec<Row>, FixtureError> {
     let mut rows: Vec<Row> = Vec::new();
     for (n, line) in text.lines().enumerate() {
@@ -141,14 +186,17 @@ pub fn parse_table(text: &str) -> Result<Vec<Row>, FixtureError> {
         let scope = match *scope {
             "trunk" => Scope::Trunk,
             "all" => Scope::All,
+            "nextn" => Scope::NextN,
             other => {
                 return Err(err(
                     tag,
-                    format!("line {at}: scope {other:?} is not `trunk` or `all`"),
+                    format!("line {at}: scope {other:?} is not `trunk`, `all` or `nextn`"),
                 ));
             }
         };
-        let mut pairs = Vec::new();
+        let mut pairs: Vec<(String, GgmlType)> = Vec::new();
+        // Each held word's tensor name and layer list, to refuse a second word on one tensor.
+        let mut held: Vec<(&str, Option<Vec<usize>>)> = Vec::new();
         for word in map.split_whitespace() {
             let Some((role, ty)) = word.split_once('=') else {
                 return Err(err(
@@ -162,8 +210,14 @@ pub fn parse_table(text: &str) -> Result<Vec<Row>, FixtureError> {
                     format!("line {at}: map word {word:?}: ggml names no type {ty:?}"),
                 ));
             };
-            if role.is_empty()
-                || !role
+            let (name, layers) = match split_role(role) {
+                Ok(split) => split,
+                Err(why) => {
+                    return Err(err(tag, format!("line {at}: map word {word:?}: {why}")));
+                }
+            };
+            if name.is_empty()
+                || !name
                     .bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
             {
@@ -172,9 +226,12 @@ pub fn parse_table(text: &str) -> Result<Vec<Row>, FixtureError> {
                     format!("line {at}: map word {word:?}: a bad role"),
                 ));
             }
-            if pairs.iter().any(|(r, _): &(String, GgmlType)| r == role) {
-                return Err(err(tag, format!("line {at}: the map names {role} twice")));
+            for (held_name, held_layers) in &held {
+                if *held_name == name && reaches_both(held_layers.as_deref(), layers.as_deref()) {
+                    return Err(err(tag, format!("line {at}: the map names {role} twice")));
+                }
             }
+            held.push((name, layers));
             pairs.push((role.to_string(), ty));
         }
         let recipes: Vec<String> = recipes.split_whitespace().map(str::to_string).collect();
@@ -228,6 +285,13 @@ fn blocks_with_nextn_tensors(source: &Split) -> BTreeSet<usize> {
         .collect()
 }
 
+/// The architecture a source of the family `family` declares: the family itself, or, where it
+/// names a profile fixture (a second fixture of an architecture whose first is the arch's own),
+/// that fixture's architecture.
+fn source_arch(family: &str) -> &str {
+    crate::arch::registry::profile_fixture(family).map_or(family, |p| p.arch)
+}
+
 /// The tensors of `source` that `row`'s map retypes, in the source's tensor order.
 ///
 /// # Errors
@@ -238,7 +302,7 @@ fn blocks_with_nextn_tensors(source: &Split) -> BTreeSet<usize> {
 /// left out: the quantizer copies it as it is, as the source's own mix of types for that role holds it.
 pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
     let tag = &row.tag;
-    if source.architecture() != Some(row.family.as_str()) {
+    if source.architecture() != Some(source_arch(&row.family)) {
         return Err(err(
             tag,
             format!(
@@ -247,6 +311,20 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
                 source.architecture()
             ),
         ));
+    }
+    if let Some(profile) = crate::arch::registry::profile_fixture(&row.family) {
+        let layers = (profile.spec)().layers;
+        let want = Value::Array(layers.iter().map(|&l| Value::U32(l as u32)).collect());
+        if source.value(super::KEY_SOURCE_LAYERS) != Some(&want) {
+            return Err(err(
+                tag,
+                format!(
+                    "the row is a variant of the {} fixture (source layers {layers:?}), the source holds {:?}",
+                    row.family,
+                    source.value(super::KEY_SOURCE_LAYERS)
+                ),
+            ));
+        }
     }
     if source.value(KEY_VARIANT).is_some() {
         return Err(err(
@@ -258,10 +336,15 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
     }
     let nextn = blocks_with_nextn_tensors(source);
     let mut out = Vec::new();
+    // The word that reached each tensor first: a second word on it is the row's mistake.
+    let mut claimed: HashMap<&str, &str> = HashMap::new();
     for (role, to) in &row.map {
-        let want = format!("{role}.weight");
+        let (name, only) = split_role(role).map_err(|why| err(tag, format!("{role}: {why}")))?;
+        let want = format!("{name}.weight");
         let mut found = 0usize;
         let mut already = Vec::new();
+        // The layers of the scope that hold the tensor, listed or not.
+        let mut layers_seen: BTreeSet<usize> = BTreeSet::new();
         for (_, t) in source.iter_tensors() {
             // A tensor of a layer, or one outside the layers, whose role is its whole name.
             let (layer, rest) = match layer_of(&t.name) {
@@ -269,8 +352,29 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
                 None => (None, t.name.as_str()),
             };
             let nextn_layer = layer.is_some_and(|l| nextn.contains(&l));
-            if rest != want || (row.scope == Scope::Trunk && nextn_layer) {
+            let in_scope = match row.scope {
+                Scope::Trunk => !nextn_layer,
+                Scope::All => true,
+                Scope::NextN => nextn_layer,
+            };
+            if rest != want || !in_scope {
                 continue;
+            }
+            layers_seen.extend(layer);
+            let listed = only
+                .as_ref()
+                .is_none_or(|only| layer.is_some_and(|l| only.contains(&l)));
+            if !listed {
+                continue;
+            }
+            if let Some(first) = claimed.insert(t.name.as_str(), role.as_str()) {
+                return Err(err(
+                    tag,
+                    format!(
+                        "the map words {first} and {role} both reach {} (one word a tensor)",
+                        t.name
+                    ),
+                ));
             }
             found += 1;
             if t.ty == *to {
@@ -303,12 +407,25 @@ pub fn expand(row: &Row, source: &Split) -> Result<Vec<Retype>, FixtureError> {
                 to: *to,
             });
         }
+        if let Some(missing) = only
+            .as_ref()
+            .and_then(|only| only.iter().find(|l| !layers_seen.contains(l)))
+        {
+            return Err(err(
+                tag,
+                format!(
+                    "the map names {role}, and layer {missing} has no {want} tensor in \
+                     scope {:?} (the layers that have it: {layers_seen:?})",
+                    row.scope
+                ),
+            ));
+        }
         if found == 0 {
             return Err(err(
                 tag,
                 format!(
                     "the map names {role}, and the source has no blk.<L>.{want}, nor a tensor {want}, \
-                     in scope {:?} (the NextN layers are {nextn:?})",
+                     in scope {:?} for it (the NextN layers are {nextn:?})",
                     row.scope
                 ),
             ));

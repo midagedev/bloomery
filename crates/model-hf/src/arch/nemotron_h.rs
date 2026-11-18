@@ -1117,6 +1117,33 @@ mod tests {
         out
     }
 
+    /// The folder gate's cut (`tools/fixture-cuts/nemlightf.json`) keeps the checkpoint's first layer
+    /// of each kind (the layers the committed headers hold, which stand for every layer of their
+    /// kind), drops the next-token block, and is written for the real folder's tensor count.
+    #[test]
+    fn the_folder_cut_keeps_one_layer_of_each_kind() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tools/fixture-cuts/nemlightf.json"
+        );
+        let spec: Json = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let config = json(CONFIG);
+        let kinds = config["layers_block_type"].as_array().unwrap();
+        let first = |kind: &str| kinds.iter().position(|k| k == kind).unwrap();
+        let layers: Vec<usize> = spec["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| usize::try_from(l.as_u64().unwrap()).unwrap())
+            .collect();
+        assert_eq!(layers, [first("mamba"), first("moe"), first("attention")]);
+        assert!(spec["drop"].as_array().unwrap().iter().any(|d| d == "mtp."));
+        assert_eq!(
+            spec["expect"]["tensors"].as_u64(),
+            Some(REAL_TENSORS as u64)
+        );
+    }
+
     fn plan_of(
         config: &Json,
         entries: &Entries,

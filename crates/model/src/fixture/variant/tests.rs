@@ -7,7 +7,7 @@ use gguf::write::{Layout, TensorDecl, Writer};
 use gguf::{GENERAL_ARCHITECTURE, GgmlType, Split, Value};
 
 use super::super::rebudget::record as record_budget;
-use super::{Row, Scope, check, custom_q, expand, override_kv, parse_table, row};
+use super::{Row, Scope, check, custom_q, expand, override_kv, parse_table, role_name, row};
 use crate::fixture::{Budget, CardBudget, CardExperts, FixtureError, KEY_CARD_BUDGET, KEY_VARIANT};
 
 const TABLE_ROW: &str = "v1\tfam\ttrunk\tffn_gate_exps=iq3_s ffn_up_exps=iq3_s ffn_down_exps=iq4_xs\tgate-a gate-b\ta reason";
@@ -281,7 +281,7 @@ fn the_table_parses_and_refuses_by_name() {
     bad("V1\tfam\ttrunk\ta=q4_K\tg\tr", &["lower-case"]);
     bad(
         "v1\tfam\tpool\ta=q4_K\tg\tr",
-        &["scope", "`trunk` or `all`"],
+        &["scope", "`trunk`, `all` or `nextn`"],
     );
     let all = parse_table("v1\tfam\tall\ta=q4_K\tg\tr").expect("an all-scope row");
     assert_eq!(all[0].scope, Scope::All);
@@ -330,6 +330,55 @@ fn a_map_expands_to_the_trunk_tensors() {
     assert_eq!((got[2].from, got[2].to), (GgmlType::Q5_K, GgmlType::IQ4_XS));
 }
 
+/// A row whose family names a profile fixture (a second fixture of one architecture: `nemotron-light` is
+/// `nemotron_h_moe`'s) reads the source as that profile's: it expands for a source of the architecture holding
+/// the profile's source layers, and is refused by name for one that holds another fixture's layers (the same
+/// architecture's first fixture) or none.
+#[test]
+fn a_profile_fixture_family_reads_its_own_source() {
+    let d = Dir::new();
+    let row = row(
+        &parse_table("v1\tnemotron-light\ttrunk\tffn_up_exps=iq3_s\tgate-a\ta reason")
+            .expect("a table"),
+        "v1",
+    )
+    .expect("v1")
+    .clone();
+    let profile =
+        crate::arch::registry::profile_fixture("nemotron-light").expect("the profile fixture");
+    let kvs_with = |layers: Option<Vec<usize>>| {
+        let mut kvs = source_kvs();
+        set(
+            &mut kvs,
+            GENERAL_ARCHITECTURE,
+            Value::String(profile.arch.into()),
+        );
+        if let Some(layers) = layers {
+            kvs.push((
+                crate::fixture::KEY_SOURCE_LAYERS.into(),
+                Value::Array(layers.iter().map(|&l| Value::U32(l as u32)).collect()),
+            ));
+        }
+        kvs
+    };
+    let own = (profile.spec)().layers;
+    let src = open(&write(
+        &d.0,
+        "own",
+        &kvs_with(Some(own)),
+        &source_tensors(),
+        2,
+    ));
+    expand(&row, &src).expect("the profile fixture's own layers expand");
+    for (stem, layers) in [("other", Some(vec![0, 1, 2, 3])), ("none", None)] {
+        let src = open(&write(&d.0, stem, &kvs_with(layers), &source_tensors(), 2));
+        red(
+            expand(&row, &src),
+            &["nemotron-light fixture", "source layers"],
+        );
+    }
+}
+
 /// The `all` scope reaches the NextN layer's tensors of the map's roles too, in the source's order; `trunk` leaves them.
 #[test]
 fn the_all_scope_reaches_the_nextn_layer() {
@@ -349,6 +398,133 @@ fn the_all_scope_reaches_the_nextn_layer() {
         .flat_map(|l| ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].map(|r| tn(l, r)))
         .collect();
     assert_eq!(names, want);
+}
+
+/// The `nextn` scope reaches the NextN layer's tensors of the map's roles and nothing else: not the trunk's, and
+/// no tensor outside the layers.
+#[test]
+fn the_nextn_scope_reaches_the_nextn_layer_alone() {
+    let d = Dir::new();
+    let src = open(&write(&d.0, "s", &source_kvs(), &source_tensors(), 2));
+    let rows = parse_table(
+        "v1\tfam\tnextn\tffn_gate_exps=iq3_s ffn_up_exps=iq3_s ffn_down_exps=iq4_xs\tg\tr",
+    )
+    .expect("a nextn-scope row");
+    assert_eq!(rows[0].scope, Scope::NextN);
+    let got = expand(&rows[0], &src).expect("an expansion");
+    let names: Vec<&str> = got.iter().map(|r| r.name.as_str()).collect();
+    let want: Vec<String> = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+        .map(|r| tn(3, r))
+        .into();
+    assert_eq!(names, want, "the NextN layer's stacks, none of the trunk's");
+    // A tensor outside the layers is not in this scope: a role only it has is a role nothing has.
+    let mut tensors = source_tensors();
+    tensors.insert(
+        0,
+        t("token_embd.weight".into(), &[256, 4], GgmlType::Q3_K, 0, 13),
+    );
+    let src = open(&write(&d.0, "e", &source_kvs(), &tensors, 2));
+    let outside = Row {
+        map: vec![("token_embd".to_string(), GgmlType::Q5_K)],
+        ..rows[0].clone()
+    };
+    red(expand(&outside, &src), &["token_embd", "scope NextN"]);
+}
+
+/// A word with an `@` layer list reaches those layers' tensors alone, so one role takes two types in one row; the
+/// quantizer's argument and the retypes follow the layers; the refusals name the word and the layer.
+#[test]
+fn a_layer_list_limits_a_word_to_its_layers() {
+    let d = Dir::new();
+    let src = open(&write(&d.0, "s", &source_kvs(), &source_tensors(), 2));
+    let rows = parse_table(
+        "v1\tfam\ttrunk\tffn_gate_exps@1=iq3_s ffn_gate_exps@2=iq4_xs ffn_down_exps@1,2=iq4_nl\tg\tr",
+    )
+    .expect("a row with layer lists");
+    let got = expand(&rows[0], &src).expect("an expansion");
+    let seen: Vec<(&str, GgmlType)> = got.iter().map(|r| (r.name.as_str(), r.to)).collect();
+    assert_eq!(
+        seen,
+        [
+            (tn(1, "ffn_gate_exps").as_str(), GgmlType::IQ3_S),
+            (tn(1, "ffn_down_exps").as_str(), GgmlType::IQ4_NL),
+            (tn(2, "ffn_gate_exps").as_str(), GgmlType::IQ4_XS),
+            (tn(2, "ffn_down_exps").as_str(), GgmlType::IQ4_NL),
+        ],
+        "each layer takes its own word's type, the other roles and layers stay"
+    );
+    assert_eq!(role_name("ffn_gate_exps@1,2"), "ffn_gate_exps");
+    assert_eq!(role_name("token_embd"), "token_embd");
+    let arg = custom_q("v1", &src, &got).expect("an argument");
+    assert!(
+        arg.contains(&format!(
+            "^{}$=iq3_s",
+            tn(1, "ffn_gate_exps").replace('.', "\\.")
+        )) && arg.contains(&format!(
+            "^{}$=iq4_xs",
+            tn(2, "ffn_gate_exps").replace('.', "\\.")
+        )) && arg.contains(&format!(
+            "^{}$=q4_K",
+            tn(1, "ffn_up_exps").replace('.', "\\.")
+        )),
+        "the argument types each tensor by its own layer's word, the unnamed ones at their own: {arg}"
+    );
+    let bad = |map: &str, parts: &[&str]| {
+        red(parse_table(&format!("v1\tfam\ttrunk\t{map}\tg\tr")), parts);
+    };
+    bad("a@x=q4_K", &["a@x=q4_K", "not a layer number"]);
+    bad("a@1,1=q4_K", &["layer 1 is named twice"]);
+    bad("a@=q4_K", &["not a layer number"]);
+    bad("a@1=q4_K a@1,2=q5_K", &["twice"]);
+    bad("a=q4_K a@1=q5_K", &["twice"]);
+    bad("a@1=q4_K a=q5_K", &["twice"]);
+    let ok = parse_table("v1\tfam\ttrunk\ta@1=q4_K a@2=q5_K b=q4_K\tg\tr");
+    assert!(
+        ok.is_ok(),
+        "disjoint layer lists beside a whole-role word of another role parse"
+    );
+    let with = |map: &[(&str, GgmlType)]| Row {
+        map: map.iter().map(|(r, t)| ((*r).to_string(), *t)).collect(),
+        ..the_row()
+    };
+    // A layer the scope does not reach (the NextN layer 3 under `trunk`) or that has no such tensor.
+    red(
+        expand(&with(&[("ffn_gate_exps@3", GgmlType::IQ3_S)]), &src),
+        &[
+            "ffn_gate_exps@3",
+            "layer 3 has no ffn_gate_exps.weight tensor",
+        ],
+    );
+    red(
+        expand(&with(&[("ffn_gate_exps@1,3", GgmlType::IQ3_S)]), &src),
+        &["layer 3 has no ffn_gate_exps.weight tensor", "{1, 2}"],
+    );
+    red(
+        expand(&with(&[("ffn_gate_exps@0", GgmlType::IQ3_S)]), &src),
+        &[
+            "ffn_gate_exps@0",
+            "layer 0 has no ffn_gate_exps.weight tensor",
+        ],
+    );
+    // Two words on one tensor, which a parsed table never holds: the expansion refuses it too.
+    red(
+        expand(
+            &with(&[
+                ("ffn_gate_exps", GgmlType::IQ3_S),
+                ("ffn_gate_exps@1", GgmlType::IQ4_XS),
+            ]),
+            &src,
+        ),
+        &[
+            "ffn_gate_exps and ffn_gate_exps@1 both reach",
+            &tn(1, "ffn_gate_exps"),
+        ],
+    );
+    // A word whose every listed tensor is already at its type changes nothing.
+    red(
+        expand(&with(&[("ffn_gate_exps@1,2", GgmlType::Q4_K)]), &src),
+        &["already at q4_K"],
+    );
 }
 
 /// A row that changes nothing, names nothing, names another family or cannot be held is refused by name.

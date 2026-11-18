@@ -111,6 +111,19 @@ pub(crate) fn check_map<K: Copy + Debug + PartialEq>(
     source: &Split,
     layers: &[usize],
 ) -> Result<(), FixtureError> {
+    check_map_trunk(kinds, kept, source, layers, usize::MAX)
+}
+
+/// [`check_map`] for a source whose blocks past `n_trunk` are next-token blocks the fixture does not
+/// carry: only the pairs of the trunk's layers (`l < n_trunk`) are kept, so a type only the
+/// next-token block holds (its own router's, its `nextn.*` projections') is no loss of the map.
+pub(crate) fn check_map_trunk<K: Copy + Debug + PartialEq>(
+    kinds: &[K],
+    kept: &[K],
+    source: &Split,
+    layers: &[usize],
+    n_trunk: usize,
+) -> Result<(), FixtureError> {
     let at_map: Vec<K> = layers
         .iter()
         .filter_map(|&l| kinds.get(l).copied())
@@ -123,7 +136,7 @@ pub(crate) fn check_map<K: Copy + Debug + PartialEq>(
         }
     }
     let held = pairs(source, |l| layers.contains(&l));
-    if let Some(((leaf, ty), l)) = pairs(source, |_| true)
+    if let Some(((leaf, ty), l)) = pairs(source, |l| l < n_trunk)
         .into_iter()
         .find(|(pair, _)| !held.contains_key(pair))
     {

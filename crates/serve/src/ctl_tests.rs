@@ -114,7 +114,7 @@ fn specials_of(name: &str) -> Specials {
         "qwen3" | "qwen36" | "qwen38" => QWEN,
         "glm5" => GLM,
         "v41" | "v41-spaced" | "v41-official" => V41,
-        "nemotron" | "nemotron-bolt" => NEMOTRON,
+        "nemotron" | "nemotron-bolt" | "nemotron-super" => NEMOTRON,
         "solar" => SOLAR,
         other => panic!("{other} has no special-token table here"),
     }

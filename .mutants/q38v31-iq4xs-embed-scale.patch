@@ -1,0 +1,12 @@
+# mutant: gate-gpu-qwen4exp-e2e@BLOOMERY_FIXTURE_VARIANT=q38v31: the IQ4_XS embedding's 6-bit scale offset 32 read as 31 (Iq4xsRows::value, embed_rows_iq4xs): every embedding row value moves by d times its code, so the stream differs from ik's at the first layer and the (cfx) fixture-oracle clauses read FAIL
+--- a/crates/gpu/src/elem.rs
++++ b/crates/gpu/src/elem.rs
+@@ -417,7 +417,7 @@
+         let kv = ((if j < 16 { lo } else { hi }) >> (8 * (x & 3))) as u8 as i8;
+         let ls = ((w1 >> (4 * ib)) & 0x0f) | (((w0 >> (16 + 2 * ib)) & 3) << 4);
+         let d = half_to_f32((w0 & 0xffff) as u16);
+-        let dl = d * (ls as i32 - 32) as f32;
++        let dl = d * (ls as i32 - 31) as f32;
+         dl * f32::from(kv)
+     }
+ }

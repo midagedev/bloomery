@@ -2053,15 +2053,17 @@ gate-gpu-clef-hidden:
 gate-gpu-qwen38d:
     BLOOMERY_MODEL=qwen38d ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_qwen35_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dense'
 
-# The dense Nanbeige4.3-33B generation gate (llama, bartowski's Q4_K_M, either card, both tiers): the same clauses as
+# The dense Nanbeige4.3-33B generation gate (llama, bartowski's Q4_K_M, either card, real tier): the same clauses as
 # gate-gpu-qwen38d over the Body35 chain on a trunk of attention layers alone (52 layers of 56/8 heads of 128, NORM rope, no head
 # norm): the load against the header derivation, the prompt call and forced decode steps' logits rows against mainline's
 # (`just dump-logits-nanbeige43`) within the bands the oracle's own CPU twin gives, graph = eager = pass, reset, the cut to any
 # position with its re-fed tail (no layer holds a store to copy, so no checkpoint), and two resident slots in one pass against
 # each alone. The group of 7 query heads a KV head runs the tensor-core flash only. The gate lock; no lease. The whole-fit verdict's
 # cache term is the description layout's sum (`KvLayout::trunk_bytes`); the `kv_planes::` unit tests run first (host only, no card).
+# Real tier only until the logits sets are dumped on the nanbeige43 fixture (model::arch::llama::fixture; `fixture fetch nanbeige43`): the
+# fixture-dirs row of the profile now names the fixture, and the sets name the real file; the opener goes with the fixture sets' dump.
 gate-gpu-llama-dense:
-    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --lib -- kv_planes:: && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_llama_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_llama_dense'
+    BLOOMERY_MODEL=nanbeige43 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-llama-dense && bash tools/gate.sh --oxide -p bloomery-gpu-gates --release --features gpu --lib -- kv_planes:: && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_llama_dense && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_llama_dense'
 
 # The qwen3 seat of bloomery-serve on Nanbeige4.3-33B's Q4_K_M, a `llama` file, with no seat word: `--plan` picks the seat by the
 # program that runs the file's description (and `--model ds41` is refused naming `--model qwen3`); one server at ctx 4096 prints the
@@ -2165,12 +2167,12 @@ gate-gpu-qwen4exp-e2e:
 # and host-served experts; the 512-position prompt's ubatch walk lists host slots on every layer holding an i-quant
 # stack, the load naming the three types on path=fused; and the same prompt and 8 decode steps at the pool's default
 # width and at width 1 (two processes, each loading the file, BLOOMERY_POISON=1) leave the same ids and logits bit for
-# bit. Loads the 90 GB file twice: alone in a batch, under the big-load lock.
-# Stays solo (r1) in the real tier only (real-only: its file is UD-Q3_K_XL's i-quants, which the Qwen3.8 fixture (Q4) does not hold; the fixture tier defers it).
-[group('solo')]
-[group('v41-load')]
+# bit. Fixture-only (the real file left /models, 2026-11-18): the file is the fixture variant q38iq3 (tools/fixture-variants.tsv:
+# the Qwen3.8 fixture's four layers at UD-Q3_K_XL's routed types, one IQ4_XS gate/up layer beside three IQ3_XXS/IQ4_NL ones, and
+# its Q6_K head), the plain fixture's item declares the no-layout-layer deferral, and the real tier has no run of it (the
+# headline file holds no i-quant stack). Loads the variant twice (7 GiB each): balanced over the cards.
 gate-gpu-qwen4exp-iqleg:
-    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen4exp-iqleg && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_iqleg'
+    BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-qwen4exp-iqleg && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen4exp_iqleg && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen4exp_iqleg'
 
 # Qwen3.8-Flash-Next from the NVIDIA NVFP4 checkpoint (the split `prepare` writes from nvidia/Qwen3.8-Flash-Next-NVFP4) on
 # one card whose plan holds every routed expert (`--place a`; a DGX Spark's GB10): the load puts no expert on the host; the
@@ -2322,22 +2324,27 @@ gate-gpu-minimaxm3-twocard:
     BLOOMERY_MODEL=minimax-m3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minimaxm3-twocard && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3,checkpoint --release --bin gate_minimaxm3_prefill && BLOOMERY_GATE_BOUND=2400 bash tools/gpu-gate.sh gate_minimaxm3_prefill --arm bp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_minimaxm3_serve && D=target/minimaxm3-serve-twocard && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_minimaxm3_serve --dir $D'
 
 # Nemotron-H MoE (Lightning) with its 32-value experts on the card (Relu2Leg for the step, the 32-value GEMM for the
-# prompt): host, card (the 3090's room, split) and whole (the card in view's own room) arms near the host path [derived: 8..12 min,
-# mostly the build; three 25.5 GB loads]. The whole arm's plan is read before it loads: a card whose plan keeps an expert on the
-# host leaves the clauses that read the arm by name (`deferred(real) no-card-room`). The nemotron_h_moe profile's file is Bolt's (IQ2_XXS stacks); the gate runs
-# Lightning's UD-Q4_K_XL, which BLOOMERY_REF_MODEL moves the profile to.
+# prompt): host, card (the experts capped at half of those a card form runs, so every layer runs the card's share beside the
+# host's) and whole (the card in view's own room) arms near the host path, on the nemotron-light profile's fixture
+# (nemlight: crates/model/src/arch/nemotron_h_moe/fixture.rs `light_spec`, made from the hub's UD-Q4_K_XL header by
+# `fixture fetch nemlight`), and on its `nemmx` variant (MXFP4 ups: no card form, every expert on the host, the placed arm
+# beside the host's; `just fixture-requant nemotron-light nemmx`) [derived: 4..8 min, mostly the build; 2.9 GB loads].
+# The whole arm's plan is read before it loads: a card whose plan keeps an expert on the host leaves the clauses that read the arm
+# (`deferred(real) no-card-room`). Fixture-only (tools/ref/fixture-only.sh): since 2026-11-18 no gate loads Lightning's file
+# (the UD-Q4_K_XL and MXFP4_MOE files left /models); a contributor's own file runs the binary under BLOOMERY_REF_MODEL.
 gate-gpu-nemotron-h-moe-card32:
-    BLOOMERY_REF_MODEL="${BLOOMERY_REF_MODEL:-/models/Nemotron-3.5-Lightning/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf}" BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nemotron-h-moe-card32 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_card32 && bash tools/gpu-gate.sh gate_nemotron_h_moe_card32'
+    BLOOMERY_MODEL=nemotron-light ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-nemotron-h-moe-card32 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_card32 && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_h_moe_card32'
 
 # Nemotron-H MoE (Lightning) read from its ModelOpt checkpoint folder (NVFP4 routed experts, the dense projections
-# made at load): host (every expert on the host, read from the folder in place), split (the whole plan's card bytes less
-# half its routed experts', so about half stay on the host) and whole (the card in view's own room, left by name where its plan
-# keeps an expert on the host) arms near the host path, the prompt
-# path near its steps, and the logits' cosine against the UD-Q4_K_XL twin as a diagnostic [derived, not measured: the
-# four loads decide the wall, about 10..20 min; no gate-times row yet]. BLOOMERY_REF_MODEL moves the folder,
-# LIGHTNING_TWIN (in BLOOMERY_BOX_ENV) the twin.
+# made at load) on the nemotron-light-folder profile's cut (nemlightf: layers 0, 1 and 5 of the folder in their stored
+# bits, tools/fixture-cuts/nemlightf.json): host (every expert on the host, read from the folder in place), split (the whole
+# plan's card bytes less half its routed experts', so about half stay on the host) and whole (the card in view's own room, left by
+# name where its plan keeps an expert on the host) arms near the host path, the prompt path near its steps [derived: three
+# loads of a 1.7 GB cut, 4..8 min]. The diagnostic against the UD-Q4_K_XL twin (`--twin`, two real files) is retired for the
+# recipe on 2026-11-18, neither file staying on /models; the binary keeps the flag for a contributor's own pair.
+# Fixture-only (tools/ref/fixture-only.sh).
 gate-gpu-nemotron-h-moe-folder:
-    BLOOMERY_REF_MODEL="${BLOOMERY_REF_MODEL:-/models/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4}" BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nemotron-h-moe-folder && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_nemotron_h_moe_folder && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_nemotron_h_moe_folder --twin "${LIGHTNING_TWIN:-/models/Nemotron-3.5-Lightning/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf}"'
+    BLOOMERY_MODEL=nemotron-light-folder ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-nemotron-h-moe-folder && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_nemotron_h_moe_folder && BLOOMERY_GATE_BOUND=1800 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_nemotron_h_moe_folder'
 
 # MiMo-V2 plan (b') on the A6000 and the 3090 (the 3090 an expert tier): the load, the walk equal to the union bit for
 # bit, eager equal to replay, the batch equal to the union and sent [derived: about 8..12 min warm]; the bound is
@@ -2422,17 +2429,19 @@ gate-gpu-flint-router:
 gate-gpu-lfm3-kernels:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_lfm3_kernels && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_lfm3_kernels'
 
-# Full-file eager/captured, resident-slot and ring-retention consumer transitions. The real file only: the complete Flint GGUF is the
-# flint profile's (tools/ref/models/flint.sh), which the test reads as BLOOMERY_MODEL, its name for a model path.
+# Eager/captured, resident-slot and ring-retention consumer transitions. Both tiers: the complete Flint GGUF is the flint profile's
+# (tools/ref/models/flint.sh), and under BLOOMERY_TIER=fixture the family's fixture (model::arch::flint::fixture: nine layers, both
+# attention kinds with the 513-position window, every routed type); the test reads it as BLOOMERY_MODEL, its name for a model path.
 gate-gpu-flint-lib:
-    BLOOMERY_MODEL=flint ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-lib && BLOOMERY_MODEL="$BLOOMERY_REF_MODEL" bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'
+    BLOOMERY_MODEL=flint ./tools/box.sh 'BLOOMERY_MODEL="$BLOOMERY_REF_MODEL" bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact tests::hw_full_file_capture_slots_reset_and_ring_boundary'
 
-# Real two-card top-six prompt/decode, union reference, capture and tier fault recovery. The real file only: the complete Flint GGUF is
-# the flint profile's (tools/ref/models/flint.sh), which the test reads as BLOOMERY_MODEL, its name for a model path.
+# Two-card top-six prompt/decode, union reference, capture and tier fault recovery. Both tiers: the complete Flint GGUF (its size and
+# sha256 pinned) or, under BLOOMERY_TIER=fixture, the family's fixture, whose recorded card budget holds half of every routed layer's
+# experts on the stage card; the test reads it as BLOOMERY_MODEL, its name for a model path. Needs exactly two visible CUDA devices.
 [group('solo')]
 [group('v41-load')]
 gate-gpu-flint-twocard:
-    BLOOMERY_MODEL=flint BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-flint-twocard && export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_MODEL="$BLOOMERY_REF_MODEL" bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset'
+    BLOOMERY_MODEL=flint BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && BLOOMERY_MODEL="$BLOOMERY_REF_MODEL" bash tools/gate.sh --gpu --oxide --release -p bloomery-gpu-flint --lib -- --include-ignored --exact two_card_tests::hw_two_card_full_file_union_capture_publication_fault_reset'
 
 # Muse Spark's 256-expert top-8 sigmoid router (`sigmoid_256_8`). Model-free like the Flint one,
 # plus the bias clause: the selection follows the biased scores, the weights the unbiased ones.
@@ -2532,11 +2541,13 @@ gate-union:
 # against the Instruct-2507 Q4_K_M file's header: the four-layer plan read back by the engine's hparams (every stem and type
 # pair of the source, the Q6_K layers kept), the written fixture (about 1.95 GB) verified against it with a flipped byte
 # refused by name, and the maps that lose a pair refused by name; and a toy family's r8 sidecar written, checked and
-# refused when absent, other or flipped.
+# refused when absent, other or flipped; and the Nanbeige4.3-33B (llama), LFM3-1.7B and Flint Preview specs (tests/fixture_families2.rs)
+# on small synthetic sources: written and verified (Flint's IQ3_S and IQ4_XS blocks included), read back by the engine's reader, and the maps
+# that lose a kind or a pair refused by name.
 # Reads headers only; writes only under this tree's target/tmp (the Nemotron clause writes its one 0.93 GB file there, the
 # Qwen3-30B-A3B clause its one 1.95 GB file).
 gate-fixture:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-fixture && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model-hf --test fixture --bin fixture -- --include-ignored --nocapture --test-threads=1'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-fixture && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model-hf --test fixture --test fixture_families2 --bin fixture -- --include-ignored --nocapture --test-threads=1'
 
 # Every fixture written under /models/fixtures (BLOOMERY_FIXTURE_ROOT) holds the card budget its header records: for each
 # family with a planned budget, the plan of the written file under it is half the experts on every card-eligible layer

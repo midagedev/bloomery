@@ -8,6 +8,7 @@ use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::StepMode;
 use bloomery_levers::HostCfg;
 use gguf::Split;
+use model::arch::flint::fixture as flint_fixture;
 use model::arch::flint::place::PlanInputs;
 use model::placement::{PlanLevers, workstation};
 
@@ -100,10 +101,13 @@ fn hw_full_file_capture_slots_reset_and_ring_boundary() -> Result<(), Error> {
         .ok_or("flint full-file transitions: BLOOMERY_MODEL must name the complete Flint GGUF")?;
     let file = Split::open(path)?;
     let inputs = PlanInputs::read(&file)?;
-    assert_eq!(
-        inputs.spec.layers.len(),
-        49,
-        "the released full model, not a small fixture"
+    // PIN(2026-11-18): the released file's 49 layers or the flint fixture's (only the headline models keep real files).
+    // The fixture holds every kernel class and both attention kinds (`model::arch::flint::fixture`), at the released widths.
+    assert!(
+        [49, flint_fixture::LAYER_MAP.len()].contains(&inputs.spec.layers.len()),
+        "the released 49 layers or the flint fixture's {}, not another cut: {}",
+        flint_fixture::LAYER_MAP.len(),
+        inputs.spec.layers.len()
     );
     assert_eq!(
         inputs.spec.hidden, 2048,

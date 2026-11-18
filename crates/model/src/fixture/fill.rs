@@ -4,7 +4,7 @@
 use std::fmt;
 
 use gguf::GgmlType;
-use gguf::iq_tables::{IQ1S_GRID, IQ2XXS_GRID, KVALUES_IQ4NL};
+use gguf::iq_tables::{IQ1S_GRID, IQ2XXS_GRID, IQ3S_GRID, KVALUES_IQ4NL};
 use gguf::quant::{KVALUES_MXFP4, f32_to_f16_bits, half_to_f32, ue4m3_to_f32_half};
 
 use super::FixtureError;
@@ -140,6 +140,14 @@ pub enum Rule {
     /// group of eight takes an 11-bit index uniform over `IQ1S_GRID`'s 2,048
     /// entries (`g` its signed bytes, −1, 0 or 1).
     Iq1S { d: u16, band: Band },
+    /// `d·(ls − 32)·k`: per 32-value sub-block the 6-bit scale `ls − 32` from
+    /// `band`; the codes are uniform over the 16 `kvalues_iq4nl`.
+    Iq4Xs { d: u16, band: Band },
+    /// `d·(2s + 1)·g·(±1)`: per 32-value sub-block the scale `s` (4 bits) has
+    /// `2s + 1` from `band`; each group of four takes a 9-bit index uniform
+    /// over `IQ3S_GRID`'s 512 entries (`g` its bytes, the odd 1 to 15) and each
+    /// value an independent sign bit.
+    Iq3S { d: u16, band: Band },
     /// Each of a block's four 16-value sub-blocks takes the UE4M3
     /// scale byte `s_lo` with probability `p_lo / 2^32`, else `s_lo + 1`; `c`
     /// uniform over the 16 codes. The block's dequant is `d·kvalues_fp4[c]`
@@ -233,6 +241,22 @@ impl Rule {
             ),
             Rule::Iq1S { d, band: b } => format!(
                 "d {:.4e}, 2s+1 in [{}, {}] ({} codes, E[(2s+1)^2] {:.2}), grid index and delta sign uniform",
+                half_to_f32(*d),
+                b.lo,
+                b.hi,
+                b.values.len(),
+                b.mean_sq()
+            ),
+            Rule::Iq4Xs { d, band: b } => format!(
+                "d {:.4e}, ls-32 in [{}, {}] ({} codes, E[(ls-32)^2] {:.2}), codes uniform over the 16 kvalues",
+                half_to_f32(*d),
+                b.lo,
+                b.hi,
+                b.values.len(),
+                b.mean_sq()
+            ),
+            Rule::Iq3S { d, band: b } => format!(
+                "d {:.4e}, 2s+1 in [{}, {}] ({} codes, E[(2s+1)^2] {:.2}), grid index and signs uniform",
                 half_to_f32(*d),
                 b.lo,
                 b.hi,
@@ -345,6 +369,35 @@ fn iq1s_code_sq() -> f64 {
         .map(|b| f64::from(b as i8) * f64::from(b as i8))
         .sum();
     sum / (IQ1S_GRID.len() * 8) as f64 + IQ1S_DELTA_SQ
+}
+/// IQ4_XS (`block_iq4_xs`: f16 `d`, per 32 values a 6-bit scale `ls` over four-bit
+/// codes into the IQ4_NL `kvalues`; value `d·(ls − 32)·k`): a band of `ls − 32`
+/// is the scale distribution, the code is uniform over the 16 kvalues, and
+/// `E[w²] = d²·E[(ls − 32)²]·E[k²]` with `E[k²] = 4,548`.
+fn iq4xs_code_sq() -> f64 {
+    let sum: f64 = KVALUES_IQ4NL
+        .iter()
+        .map(|&k| f64::from(k) * f64::from(k))
+        .sum();
+    sum / KVALUES_IQ4NL.len() as f64
+}
+/// IQ3_S (`block_iq3_s`: f16 `d`, 64 grid-index bytes, eight bytes of ninth index
+/// bits, 32 sign bytes and per 32 values a 4-bit scale `s`; value
+/// `d·(1 + 2s)·g·(±1)` with `g` a byte of [`IQ3S_GRID`]'s entry): a band of the odd
+/// integers `2s + 1` is the scale distribution, the index is uniform over the 512
+/// entries and the signs are independent, so `E[w²] = d²·E[(2s+1)²]·E[g²]`, `E[g²]`
+/// the mean of the squared grid bytes over every entry, read from the table.
+fn iq3s_code_sq() -> f64 {
+    let sum: f64 = IQ3S_GRID
+        .iter()
+        .flat_map(|g| g.to_le_bytes())
+        .map(|b| f64::from(b) * f64::from(b))
+        .sum();
+    sum / (IQ3S_GRID.len() * 4) as f64
+}
+/// IQ3_S's sub-block scale codes `2s + 1`, `s` in 0..=15.
+fn iq3s_scale_codes() -> Vec<i32> {
+    (0..16).map(|s| 2 * s + 1).collect()
 }
 /// NVFP4 (`block_nvfp4`: four UE4M3 sub-block scale bytes, 64 four-bit codes,
 /// value `S·d·kvalues_fp4[c]`; [`ue4m3_to_f32_half`] decodes `d`) carries a
@@ -466,6 +519,12 @@ pub fn rule_for(name: &str, ty: GgmlType, k: u64, window: Window) -> Result<Rule
         GgmlType::IQ1_S => widest_band(&iq1s_scale_codes(), iq1s_code_sq(), sigma, in_window)
             .map(|(band, d)| Rule::Iq1S { d, band })
             .ok_or_else(|| no_scale("band of 3-bit scales")),
+        GgmlType::IQ4_XS => widest_band(&field(-32, 31), iq4xs_code_sq(), sigma, in_window)
+            .map(|(band, d)| Rule::Iq4Xs { d, band })
+            .ok_or_else(|| no_scale("band of 6-bit scales")),
+        GgmlType::IQ3_S => widest_band(&iq3s_scale_codes(), iq3s_code_sq(), sigma, in_window)
+            .map(|(band, d)| Rule::Iq3S { d, band })
+            .ok_or_else(|| no_scale("band of 4-bit scales")),
         GgmlType::MXFP4 => mxfp4_rule(sigma).ok_or_else(|| no_scale("E8M0 exponent pair")),
         GgmlType::NVFP4 => {
             nvfp4_rule(sigma, window).ok_or_else(|| no_scale("UE4M3 scale byte pair"))
@@ -767,6 +826,32 @@ pub(super) fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
                 // the delta sign and the index bits stay random.
                 for (qh, c) in blk[34..50].as_chunks_mut::<2>().0.iter_mut().zip(codes) {
                     qh[1] = (qh[1] & 0x8f) | (((c - 1) / 2) as u8) << 4;
+                }
+            }
+        }
+        Rule::Iq4Xs { d, band } => {
+            for blk in units::<136>(out) {
+                blk[0..2].copy_from_slice(&d.to_le_bytes());
+                rng.fill(&mut blk[8..136]);
+                let scales: [i32; 8] = draws(rng, band);
+                let mut high = 0u16;
+                blk[4..8].fill(0);
+                for (ib, v) in scales.into_iter().enumerate() {
+                    let ls = (v + 32) as u16;
+                    blk[4 + ib / 2] |= ((ls & 0x0f) as u8) << (4 * (ib % 2));
+                    high |= (ls >> 4) << (2 * ib);
+                }
+                blk[2..4].copy_from_slice(&high.to_le_bytes());
+            }
+        }
+        Rule::Iq3S { d, band } => {
+            for blk in units::<110>(out) {
+                blk[0..2].copy_from_slice(&d.to_le_bytes());
+                rng.fill(&mut blk[2..106]);
+                let codes: [i32; 8] = draws(rng, band);
+                blk[106..110].fill(0);
+                for (ib, c) in codes.into_iter().enumerate() {
+                    blk[106 + ib / 2] |= (((c - 1) / 2) as u8) << (4 * (ib % 2));
                 }
             }
         }

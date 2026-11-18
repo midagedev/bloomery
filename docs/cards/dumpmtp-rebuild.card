@@ -1,0 +1,14 @@
+# Round fxbox (card for the dump_mtp rebuild): `just build-ref-dump-mtp`, the one build that every dump_mtp user (the glm5next and the
+# qwen4exp MTP dumps, real and fixture) is stale on. The record /root/bloomery-data/bin/dump_mtp.build names the sha256 prefix
+# 2260539a888c of the cpp and ref_tensor_io.h it was built from (commit a2c2484b0); main's tools/ref/dump_mtp.cpp plus
+# ref_tensor_io.h hash to 66b0d36c9d88 (the same as this tree's), so dump-mtp.sh refuses the installed binary (rc 3) and the rebuild is the
+# fix, not a tree-local change. The ik tree's libllama and libcommon are current against its HEAD (cmake --build finds nothing to
+# do, 5-30 s), then g++ of dump_mtp.cpp against them (20-60 s) and an atomic replace of the binary: 0.5-1.5 min [derived from
+# glmmtpref-dump.card's two-run decomposition]. Should cmake rebuild ik after all (CUDA objects), the hold is its ~10-15 min and
+# the run's log says so; the lease's `minutes` band below is the first case's. Nothing is timed. After it:
+# `dump_mtp.build` names 66b0d36c9d88 (read back), and the real sets on disk are untouched (the rebuild writes only bin/).
+kind: exclusive
+reason: dump_mtp's compile and the cmake check of ik's libraries use every core; beside a timed run or a gate batch it would take
+  their cores, so the build holds the lease; why now: dump_mtp.cpp moved on main after the installed binary was built (record
+  2260539a888c, source 66b0d36c9d88), so no MTP dump can start until it is rebuilt, and fxb's glmq2k dump and every later MTP set wait on it
+minutes: 0.5..15

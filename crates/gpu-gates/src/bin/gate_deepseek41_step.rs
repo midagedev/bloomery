@@ -41,7 +41,9 @@
 //!   when the step then fails for another reason: with a NaN in the output
 //!   norm's gain, a step of two tokens whose second id is one past the
 //!   vocabulary runs the first token's whole chain — the head's q8_1
-//!   quantizer raises `quant_column` at the output head — and then refuses
+//!   quantizer raises `quant_column` at the output head (a Q8_0 or BF16
+//!   head, which reads f32 rows and has no quantizer, raises `logit` there
+//!   from its argmax) — and then refuses
 //!   the second id's embedding row on the host, before its launch. The step
 //!   must return exactly that fault, with that refusal behind it, and stand
 //!   one position on, poisoned by it; with the gain put back, the next step
@@ -559,7 +561,7 @@ mod gate {
             )?;
             pass &= fault_case(&mut m, plan.n_l.len())?;
             crate::ds41_tier::sc("--structure: a fault behind an error is the fault")?;
-            pass &= fault_behind_error_case(&mut m, &hp)?;
+            pass &= fault_behind_error_case(&mut m, &hp, &split)?;
             crate::ds41_tier::sc("--structure: the route trace is the step's routing")?;
             pass &= route_trace_case(&mut m, &mut head, &hp, &path)?;
             pass &= route_trace_recover_case(&mut m, &hp, &path)?;
@@ -2552,9 +2554,20 @@ mod gate {
     /// A step that faults and then fails for another reason (the module
     /// doc's second fault case). `hp.n_vocab` is one past the embedding
     /// table's rows, which the engine's step rows check against it.
-    fn fault_behind_error_case(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+    fn fault_behind_error_case(
+        m: &mut Deepseek41Model,
+        hp: &Hparams,
+        split: &Split,
+    ) -> Result<bool, GateError> {
         let bad = u32::try_from(hp.n_vocab)?;
-        let want = Fault::at(LAYER_HEAD, FaultSite::QuantColumn);
+        // The NaN norm row reaches the head's q8_1 quantizer, which raises `quant_column`; a
+        // head whose gemv reads f32 rows (Q8_0, BF16) has no quantizer, and its argmax raises
+        // `logit` on the first non-finite logit.
+        let site = match type_of(split, &names::output())? {
+            GgmlType::Q8_0 | GgmlType::BF16 => FaultSite::Logit,
+            _ => FaultSite::QuantColumn,
+        };
+        let want = Fault::at(LAYER_HEAD, site);
         m.reset()?;
         let clean = m.step(&FAULT_PROMPT)?;
         m.reset()?;
@@ -3734,7 +3747,12 @@ mod gate {
             let (ok, ratio, acc) = check_seams(&set, split, hp, r8, &seams)?;
             pass &= ok;
             worst = worst.max(ratio);
-            let (ok, on_path) = check_head(&set, &head.logits_to_host(gpu)?, acc, argmax)?;
+            let (ok, on_path) = check_head(
+                &set,
+                &head.logits_to_host(gpu)?,
+                (acc, type_of(split, &names::output())?),
+                argmax,
+            )?;
             pass &= ok;
             held += usize::from(on_path);
         }
@@ -3817,17 +3835,27 @@ mod gate {
 
     /// Relative variance of the activation rounding ik applies over `x` beyond
     /// ours at a projection of type `ty`: a q3_K's q8_K against our q8_1 per 256
-    /// and 128 values, a BF16's bf16 against our f32. Another type is refused by
-    /// name: no term is derived for it.
+    /// and 128 values, a BF16's bf16 against our f32, a Q8_0's q8_2 against our
+    /// f32 (`q8_0_gemv`). Another type is refused by name: no term is derived
+    /// for it.
     fn v_proj_in(ty: GgmlType, x: &[f32]) -> Result<f64, GateError> {
         match ty {
             GgmlType::Q3_K => Ok(v_q8(x, 256) + v_q8(x, 128)),
             GgmlType::BF16 => Ok(v_bf16(x)),
+            GgmlType::Q8_0 => Ok(v_q8_2(x)),
             other => Err(format!(
                 "no envelope term is derived for a {other} projection over the normed input"
             )
             .into()),
         }
+    }
+
+    /// Tensor `name`'s type in `split`.
+    fn type_of(split: &Split, name: &str) -> Result<GgmlType, GateError> {
+        split
+            .find(name)
+            .map(|(_, t)| t.ty)
+            .ok_or_else(|| format!("{name} is not in the file").into())
     }
 
     fn sumsq(x: &[f32]) -> f64 {
@@ -3948,8 +3976,21 @@ mod gate {
                 let (hc, hn) = hc_pre(man, &names::hc_ffn_scale(l))?;
                 let x = named(man, &n("ffn_norm"))?;
                 let h = named(man, &n("ffn_moe_gate_par"))?;
-                let v = v_q8(&x, 256)
-                    + v_q8(&x, 128)
+                // The routed gate·up over the normed input: a q3_K reads ik's q8_K and our q8_1,
+                // an MXFP4 ik's q8_2 (`Q8_2_X4` on the AVX2 build) and our q8_1 (the card's
+                // `mxfp4_gate_up_sel` reads the engine's q8_1; the host's fused dot reads
+                // 32-value blocks as ik does, inside this).
+                let gate_up = match type_of(split, &names::ffn_gate_exps(l))? {
+                    GgmlType::Q3_K => v_q8(&x, 256) + v_q8(&x, 128),
+                    GgmlType::MXFP4 => v_q8_2(&x) + v_q8(&x, 128),
+                    other => {
+                        return Err(format!(
+                            "layer {l}: no envelope term is derived for a {other} routed gate·up"
+                        )
+                        .into());
+                    }
+                };
+                let v = gate_up
                     + v_q8_2(&h)
                     + v_q8(&h, 128)
                     + v_q8_2(&x)
@@ -4680,20 +4721,25 @@ mod gate {
     /// The head end: the argmax equals `result_output`'s (`argmax`), and the logits sit
     /// inside the envelope carried one step on — the last streams' collapse
     /// keeps their relative error (`acc`, the envelope's variance there), and
-    /// the head's Q6_K reads our norm's q8_1 per 128 against ik's q8_2. A tie band replaces the
+    /// the head's Q6_K reads our norm's q8_1 per 128 against ik's q8_2 (a Q8_0 head our f32). A tie band replaces the
     /// strict argmax where ik's top logits are near flat: its band is the carried distance and the
     /// head's two roundings at their worst crest as independent errors. Returns whether the head
     /// passed and whether it was held (the step stayed on ik's path to it) rather than a diagnostic.
     fn check_head(
         set: &Set,
         logits: &[f32],
-        carried: Option<f64>,
+        (carried, head_ty): (Option<f64>, GgmlType),
         argmax: Argmax,
     ) -> Result<(bool, bool), GateError> {
         let want = named(&set.man, "result_output")?;
         let norm = named(&set.man, "result_norm")?;
         let r_in = carried.unwrap_or(f64::NAN);
-        let bound = (r_in * r_in + v_q8(&norm, 128) + v_q8_2(&norm)).sqrt();
+        // A Q8_0 or BF16 head reads our f32 norm: only ik rounds it.
+        let ours = match head_ty {
+            GgmlType::Q8_0 | GgmlType::BF16 => 0.0,
+            _ => v_q8(&norm, 128),
+        };
+        let bound = (r_in * r_in + ours + v_q8_2(&norm)).sqrt();
         let r = rel(logits, &want);
         let (a, av, b, bv) = top2(logits);
         let (ka, kav, kb, kbv) = top2(&want);

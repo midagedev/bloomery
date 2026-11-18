@@ -1,0 +1,11 @@
+# mutant: gate-gpu-qwen4exp-iqleg@BLOOMERY_FIXTURE_VARIANT=q38iq3: the IQ4_NL tile kernel (dot_iq4nl_q82x4_tile_avx2, the path a host-served column run takes) reads its four blocks' f16 scales doubled; the one-column dot_row is unchanged, so clause 3's tile-vs-dot_row cells differ on the iq4_nl down of layers 1 to 3
+--- a/crates/qdot/src/lib.rs
++++ b/crates/qdot/src/lib.rs
+@@ -10841,6 +10841,7 @@
+             scales8[6..8].copy_from_slice(&wrow[b3..b3 + 2]);
+             // SAFETY: 8 readable bytes in the local staging buffer.
+             let other = _mm_cvtph_ps(_mm_loadl_epi64(scales8.as_ptr() as *const __m128i));
++            let other = _mm_add_ps(other, other);
+ 
+             for (col, a) in acols.iter().zip(acc.iter_mut()) {
+                 // SAFETY: 8 readable bytes at the head of the column's group i

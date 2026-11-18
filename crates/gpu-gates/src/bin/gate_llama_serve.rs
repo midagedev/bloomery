@@ -1,11 +1,13 @@
-//! `gate_llama_serve` — the qwen3 seat of `bloomery-serve` on a `llama` file (Nanbeige4.3-33B's Q4_K_M, the
-//! profile's `BLOOMERY_REF_MODEL`): the seat is the file's by the program that runs its description, with no seat
-//! word and no name list, and its chat surface is the template's own — ChatML, a `<think>` span, XML tool calls.
+//! `gate_llama_serve` — the qwen3 seat of `bloomery-serve` on a `llama` file (the profile's model: Nanbeige4.3-33B's
+//! Q4_K_M in the real tier, its fixture in the fixture tier): the seat is the file's by the program that runs its
+//! description, with no seat word and no name list, and its chat surface is the template's own — ChatML, a `<think>`
+//! span, XML tool calls.
 //!
 //!     gate_llama_serve --dir <dir>
 //!
 //! Every server is `bloomery-serve` beside this binary with `BLOOMERY_REF_MODEL` removed from its environment (the
-//! file is named by `-m`). Logs per server in `<dir>/<name>/` (`server.err`, the answers).
+//! file is named by `-m`) and `BLOOMERY_CARD_BUDGET` too (the seat refuses it: it plans on the card in view). Logs
+//! per server in `<dir>/<name>/` (`server.err`, the answers).
 //!
 //! - `llama_file_picks_the_qwen3_seat`: `-m <file> --plan` with no seat word exits 0 and prints the qwen3 seat's
 //!   `parallel` line, as `--model qwen3` does; `--model ds41` on the file exits non-zero and names the seat the
@@ -70,9 +72,9 @@ mod gate {
 
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        SeatGate, Served, agree, chatted, check, curl, cut_call, generate_arms, greedy, ids_of,
-        input_tokens, json_of, plan_run, rendered, scripted_call, serve_cmd, server_log, tokenized,
-        tool_turn, utf8, whole_terms,
+        SeatGate, Served, agree, chatted, check, curl, cut_call, generate_arms_without, greedy,
+        ids_of, input_tokens, json_of, plan_run, rendered, scripted_call, serve_cmd, server_log,
+        tokenized, tool_turn, utf8, whole_terms,
     };
     use bloomery_gpu_gates::ubatch_pick::{self, Source};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -80,6 +82,15 @@ mod gate {
     use serde_json::{Value, json};
 
     const USAGE: &str = "usage: gate_llama_serve --dir <dir>";
+
+    /// The server command. The qwen3 seat plans on the card in view and refuses `BLOOMERY_CARD_BUDGET`, which the
+    /// fixture tier's box command exports for the gates that plan a fixture (the budget its header records), so the
+    /// child does not get it.
+    fn server() -> Result<std::process::Command, GateError> {
+        let mut cmd = serve_cmd()?;
+        cmd.env_remove(bloomery_levers::CARD_BUDGET);
+        Ok(cmd)
+    }
 
     /// The qwen3 seat, by its word.
     const SEAT: SeatGate = SeatGate {
@@ -139,7 +150,7 @@ mod gate {
         let run = |name: &str, args: &[&str]| -> Result<(bool, Vec<String>), GateError> {
             let d = dir.join(name);
             std::fs::create_dir_all(&d)?;
-            let (status, lines) = plan_run(serve_cmd()?, args, &d.join("server.err"))?;
+            let (status, lines) = plan_run(server()?, args, &d.join("server.err"))?;
             println!("{name}: {} --plan: {status}", args.join(" "));
             Ok((status.success(), lines))
         };
@@ -299,7 +310,7 @@ mod gate {
         let ctx = CTX.to_string();
         let mut all = vec!["-m", file, "--ctx", ctx.as_str()];
         all.extend_from_slice(args);
-        let (status, lines) = plan_run(serve_cmd()?, &all, &d.join("server.err"))?;
+        let (status, lines) = plan_run(server()?, &all, &d.join("server.err"))?;
         let text = lines.join("\n");
         println!("{name}: {} --plan: {status}", all.join(" "));
         Ok((status.success(), text.clone(), ubatch_pick::choices(&text)))
@@ -435,7 +446,7 @@ mod gate {
         std::fs::create_dir_all(&d)?;
         let ctx = CTX.to_string();
         let all = ["-m", utf8(file)?, "--port", "0", "--ctx", ctx.as_str()];
-        let mut s = Served::spawn_cmd(serve_cmd()?, &all, &d)?;
+        let mut s = Served::spawn_cmd(server()?, &all, &d)?;
         let err_log = d.join("server.err");
         let addr = match s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
             Ok(addr) => addr,
@@ -512,7 +523,8 @@ mod gate {
         const DENSE: &str = "dense_whole_load_sizes_its_ubatch";
         if let Some((tokens, stop, ids, started)) = served(&dir, &file, (&arch, picks), &mut ok)? {
             clause(&mut ok, DENSE, dense_ubatch(&dir, &file, Some(started)));
-            let cli = generate_arms(
+            let cli = generate_arms_without(
+                &[bloomery_levers::CARD_BUDGET],
                 "generate_qwen3moe",
                 &file,
                 &[ids.as_slice()],

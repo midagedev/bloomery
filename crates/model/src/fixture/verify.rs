@@ -2,7 +2,7 @@
 //! sampled chunks byte for byte, each sampled block against its rule, and the
 //! dequantized RMS.
 
-use gguf::iq_tables::{IQ1S_GRID, IQ2XXS_GRID};
+use gguf::iq_tables::{IQ1S_GRID, IQ2XXS_GRID, IQ3S_GRID, KVALUES_IQ4NL};
 use gguf::quant::{KVALUES_MXFP4, half_to_f32, ue4m3_to_f32_half};
 use gguf::{Split, Value, dequant_row};
 
@@ -171,6 +171,8 @@ fn block_fault(rule: &Rule, blk: &[u8], y: &[f32], window: Window) -> Option<Str
             scale_at(0, "d", *d).and_then(|d| iq2xxs_fault(blk, y, d, band))
         }
         Rule::Iq1S { d, band } => scale_at(0, "d", *d).and_then(|d| iq1s_fault(blk, y, d, band)),
+        Rule::Iq4Xs { d, band } => scale_at(0, "d", *d).and_then(|d| iq4xs_fault(blk, y, d, band)),
+        Rule::Iq3S { d, band } => scale_at(0, "d", *d).and_then(|d| iq3s_fault(blk, y, d, band)),
         Rule::Mxfp4 { e_lo, .. } => {
             if blk[0] != *e_lo && blk[0] != e_lo + 1 {
                 Err(format!(
@@ -239,6 +241,73 @@ fn iq2xxs_fault(blk: &[u8], y: &[f32], d: f32, band: &Band) -> Result<(), String
                 if v.abs() != db * f32::from(g) || v.is_sign_negative() != negative {
                     return Err(format!(
                         "sub-block {j} group {l} value {i} dequantizes {v}, not the grid byte {g} at scale {s} with its stored sign"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// IQ4_XS: per 32-value sub-block the scale `ls − 32` is in `band`, and each value `y` is
+/// `d·(ls − 32)` times the kvalue its stored code names.
+fn iq4xs_fault(blk: &[u8], y: &[f32], d: f32, band: &Band) -> Result<(), String> {
+    let high = u16::from_le_bytes([blk[2], blk[3]]);
+    for (ib, (q, vals)) in blk[8..136]
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .zip(y.as_chunks::<32>().0)
+        .enumerate()
+    {
+        let ls = i32::from((blk[4 + ib / 2] >> (4 * (ib % 2))) & 0x0f)
+            | (i32::from((high >> (2 * ib)) & 3) << 4);
+        if !band.holds(ls - 32) {
+            return Err(format!(
+                "sub-block {ib} scale {} is outside the band",
+                ls - 32
+            ));
+        }
+        let dl = d * (ls - 32) as f32;
+        let (lo, hi) = vals.split_at(16);
+        for (j, &byte) in q.iter().enumerate() {
+            let want_lo = dl * f32::from(KVALUES_IQ4NL[usize::from(byte & 0x0f)]);
+            let want_hi = dl * f32::from(KVALUES_IQ4NL[usize::from(byte >> 4)]);
+            if lo[j] != want_lo || hi[j] != want_hi {
+                return Err(format!(
+                    "sub-block {ib} value {j} dequantizes {} and {}, not the kvalues {want_lo} and {want_hi}",
+                    lo[j], hi[j]
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// IQ3_S: per 32-value sub-block the scale code `2s + 1` is in `band`, and each value `y` is
+/// `d·(2s + 1)` times the grid entry's byte with its stored sign bit.
+fn iq3s_fault(blk: &[u8], y: &[f32], d: f32, band: &Band) -> Result<(), String> {
+    let (qs, qh, signs, scales) = (&blk[2..66], &blk[66..74], &blk[74..106], &blk[106..110]);
+    for (ib32, vals) in y.as_chunks::<32>().0.iter().enumerate() {
+        let s = (scales[ib32 / 2] >> (4 * (ib32 % 2))) & 0x0f;
+        if !band.holds(2 * i32::from(s) + 1) {
+            return Err(format!("sub-block {ib32} scale {s} is outside the band"));
+        }
+        let db = d * (1 + 2 * i32::from(s)) as f32;
+        for (m, quad) in vals.as_chunks::<4>().0.iter().enumerate() {
+            let hi = usize::from((qh[ib32] >> m) & 1) << 8;
+            let grid = IQ3S_GRID[usize::from(qs[8 * ib32 + m]) | hi].to_le_bytes();
+            let sg = signs[4 * ib32 + m / 2];
+            for (j, (&v, &g)) in quad.iter().zip(&grid).enumerate() {
+                let negative = (sg >> (4 * (m % 2) + j)) & 1 == 1;
+                let want = if negative {
+                    -db * f32::from(g)
+                } else {
+                    db * f32::from(g)
+                };
+                if v != want {
+                    return Err(format!(
+                        "sub-block {ib32} group {m} value {j} dequantizes {v}, not the grid byte {g} at scale {s} with its stored sign"
                     ));
                 }
             }

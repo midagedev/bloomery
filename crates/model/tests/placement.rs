@@ -144,6 +144,9 @@ struct FilePins {
     gate_experts: u64,
 }
 
+// PIN(2026-11-18): every number below was taken on the former default, the 1017 Q3_K_M set; the default is now the bq3km set
+// (gguf::v41::PUBLIC), whose dense and Engram tensors differ (its routed stacks are the same types and counts), so a run on it
+// reads these as a mismatch with the plan's own figures printed beside: re-take them from that run's summary.
 const PUBLIC: FilePins = FilePins {
     a_cards: &[PUB_A_A6000],
     a_host: &PUB_A_HOST,

@@ -13431,7 +13431,7 @@ def key_self_test(expect, pieces: tuple[str, ...]) -> None:
             rows, default = fixture_table(sa.tree.read(FIXTURE_DIRS), sa.tree.read(REF_PATHS))
             expect(default == DEFAULT_PROFILE, f"ref-paths.sh's default profile {default} is not DEFAULT_PROFILE {DEFAULT_PROFILE}")
             expect([rows.get(f) for f in ("qwen4exp", "deepseek41", "glm5next", "qwen35moe", "deepseek2")] == ["qwen38", "v41", "glm5next", "qwen35moe", "self"]
-                   and "raon1" not in rows and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
+                   and rows.get("raon1") == "raon1" and rows["qwen35"] == "self", f"the real fixture table, read: {rows}")
             fam = {
                 "q4": "gate-gpu-qwen4exp-e2e",  # BLOOMERY_MODEL=qwen4exp: qwen38
                 "glm": "gate-gpu-glm-sel",  # glm5next: glm5next
@@ -13664,9 +13664,9 @@ def key_self_test(expect, pieces: tuple[str, ...]) -> None:
             model_scope_self_test(expect, roots[0], sa, settings, manifest, os.path.join(tmp, "scope-manifest.txt"))
             # New-code clauses (no base to fail on): a directory the item names with no manifest row is an
             # error; the manifest's union reaches a whole-tree item; every profile spells what it defines.
-            write_manifest([ln for ln in manifest if not ln.startswith("model-dir\t/models/DeepSeek-V4.1-Flash-1017-Q3_K_M\t")])
+            write_manifest([ln for ln in manifest if not ln.startswith("model-dir\t/models/DeepSeek-V4.1-Flash-1017-bq3km\t")])
             miss = keys(sa, only={"gpu": items["gpu"]})["gpu"]
-            expect(miss.startswith("error") and "/models/DeepSeek-V4.1-Flash-1017-Q3_K_M" in miss, f"a directory the item opens, missing from the manifest, was keyed: {miss}")
+            expect(miss.startswith("error") and "/models/DeepSeek-V4.1-Flash-1017-bq3km" in miss, f"a directory the item opens, missing from the manifest, was keyed: {miss}")
             write_manifest(manifest)
             c = KeyContext(sa, mf, "", {}, settings=settings)
             rows = [p for p in c.parts(items["mac"])[0] if p.startswith(("box\tmodel\t", "box\tmodel-dir\t"))]
@@ -14227,7 +14227,7 @@ def ref_paths_self_test(expect) -> None:
         expect(rc == 0 and out.strip() == f"/x/own.gguf|{first}", f"ref-paths: a caller's own file does not win, or the fixture is not named: {rc} {out!r}")
         rc, out, err = run("deepseek2", f"{show}; fixture_budget; echo budget-rc=$?", BLOOMERY_TIER="fixture")
         expect(rc == 0 and out.split() == ["/models/real/deepseek2.gguf|", "budget-rc=0"], f"ref-paths: a small family does not stand: {rc} {out!r} {err!r}")
-        for fam in ("raon1", "newfam"):
+        for fam in ("newfam",):
             rc, out, err = run(fam, show, BLOOMERY_TIER="fixture")
             expect(rc == 66 and out == "" and f"the family '{fam}' has no fixture yet" in err and "exit 66" in err, f"ref-paths: {fam} has no fixture: {rc} {out!r} {err!r}")
         rc, out, err = run("qwen4exp", show, BLOOMERY_TIER="both")

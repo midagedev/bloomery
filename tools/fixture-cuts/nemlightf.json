@@ -1,0 +1,33 @@
+{
+  "name": "nemlightf",
+  "arch": "nemotron_h_moe",
+  "source": "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4",
+  "rev": "bee7596271d1495f6992ae224aefde4410e816b8",
+  "expect": {"tensors": 18487, "data_bytes": 21559589596},
+  "layers": [0, 1, 5],
+  "layer_prefix": "backbone.layers.",
+  "keep": [
+    "backbone.embeddings.weight",
+    "backbone.norm_f.weight",
+    "lm_head.weight",
+    "lm_head.weight_scale",
+    "lm_head.weight_scale_2"
+  ],
+  "drop": ["mtp."],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "generation_config.json",
+    "chat_template.jinja",
+    "hf_quant_config.json"
+  ],
+  "widths": {},
+  "planes": [],
+  "config": {
+    "layer_count": "num_hidden_layers",
+    "widths": {},
+    "per_layer": ["layers_block_type"],
+    "layer_names": ["quantization_config.ignore"]
+  }
+}

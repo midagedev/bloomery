@@ -45,12 +45,14 @@ const HOST: bloomery_levers::HostCfg = bloomery_levers::HostCfg {
 pub type Source<'a> = &'a dyn Fn() -> Result<bloomery_gpu::folder::Model, GateError>;
 
 /// What an arm's plan must hold for its clause to read anything: the `Split` arm a layer with
-/// experts on both sides, the `Whole` arm every expert on the card.
+/// experts on both sides, the `Whole` arm every expert on the card, the `NoCard` arm (a file no
+/// card form runs) every expert on the host under a placed plan.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Premise {
     Host,
     Split,
     Whole,
+    NoCard,
 }
 
 /// The words an arm's lines are written in.
@@ -159,11 +161,13 @@ pub fn arm(
             card.iter().any(|&(_, on, _)| on > 0) && card.iter().any(|&(_, on, of)| on < of)
         }
         Premise::Whole => every_expert(&card),
+        Premise::NoCard => card.iter().all(|&(_, on, _)| on == 0),
     };
     if !holds {
         println!(
             "{clause}: arm {name}: the plan misses the arm's premise (a layer with experts on \
-             both sides for the split arm, every expert on the card for `whole`) {}",
+             both sides for the split arm, every expert on the card for `whole`, none on the \
+             card for a file no card form runs) {}",
             words.fail
         );
         return Ok(None);

@@ -2,17 +2,20 @@
 //! (routed experts NVFP4 planes with a tensor scale an expert, every dense projection a Q8_0 or
 //! NVFP4 site, as `model_hf`'s map reads it) opened as stored and run end to end on the card
 //! (`NemotronHMoeModel::open_placed` over a `bloomery_gpu::folder::Model`), where the host tier
-//! runs the same experts in relu² from the folder's own bytes. The real tier only: the folder
-//! is the real checkpoint. The folder is the directory `BLOOMERY_REF_MODEL` names; a path that
-//! is a file, a folder of another architecture, or one whose routed stacks are not all NVFP4
-//! planes ends the gate by name before the card loads. `--twin <file>` names the GGUF twin
-//! (Lightning's UD-Q4_K_XL) the diagnostic reads; without it that clause prints that it compared
-//! nothing.
+//! runs the same experts in relu² from the folder's own bytes. The fixture tier runs the cut of
+//! the checkpoint (`nemlightf`, layers 0, 1 and 5 in their stored bits: one Mamba-2, one MoE and
+//! one attention layer); the real tier, the folder a contributor names. The folder is the
+//! directory `BLOOMERY_REF_MODEL` names; a path that is a file, a folder of another architecture,
+//! or one whose routed stacks are not all NVFP4 planes ends the gate by name before the card
+//! loads. `--twin <file>` names the GGUF twin (Lightning's UD-Q4_K_XL) the diagnostic reads;
+//! without it that clause prints that it compared nothing (the recipe passes none: the twin is a
+//! second real file of all 52 layers, which the cut's three are not a twin of).
 //!
 //! Three placed loads of the folder, one after another on one card, each released before the next
 //! opens: `host` (every expert on the host, read from the folder in place: the reference), `split`
 //! (the whole plan's card bytes less half of its routed experts', so about half of them stay on the
-//! host) and `whole` (the card in view's own room, `gate_card::room`, where the plan holds every
+//! host; on the fixture cut, which is smaller than the card's margin and context, the card's
+//! experts capped at half of those a card form runs) and `whole` (the card in view's own room, `gate_card::room`, where the plan holds every
 //! expert on the card and every layer runs whole). The `whole` arm needs a card whose plan holds
 //! every expert: where the plan of the card in view does not, the clauses that read that arm are
 //! left by name (`tier::room_clause`, `no-card-room`) and the other arms run. The 3090's room is
@@ -100,7 +103,7 @@ mod gate {
         CTX_SPARE, PROMPT_LEN, Premise, Words, arm, last_logits, near_host, prompt_arm, whole_fits,
     };
     use crate::{folder, gate_card};
-    use bloomery_gpu_gates::tier::{self, Tag};
+    use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
     use gguf::Split;
     use model::arch::nemotron_h_moe::hparams::Hparams;
@@ -109,6 +112,9 @@ mod gate {
     use model::placement::workstation::{self, CardSpec};
 
     const NAME: &str = "gate_nemotron_h_moe_folder";
+
+    /// The model profile of the folder cut (`tools/fixture-dirs.tsv`): the fixture tier's folder.
+    const PROFILE: &str = "nemotron-light-folder";
 
     /// The recipe the errors name.
     const RECIPE: &str = "gate-gpu-nemotron-h-moe-folder";
@@ -143,15 +149,25 @@ mod gate {
         Ok(Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?)
     }
 
-    /// The plan levers of the `split` arm on `spec`'s room: the card budget is the bytes the whole
-    /// plan puts on the card less half of its routed experts', so the plan keeps about half the
-    /// experts on the card (less the card's margin, which stays free) and leaves the rest to the
-    /// host.
+    /// The plan levers of the `split` arm. The real tier's room splits the folder by itself: the
+    /// card budget is the bytes the whole plan puts on the card less half of its routed experts', so
+    /// the plan keeps about half the experts on the card (less the card's margin, which stays free)
+    /// and leaves the rest to the host. The fixture tier's cut is smaller than the card's margin and
+    /// context, so no budget below its whole plan leaves a plan that loads: the card's experts are
+    /// capped at half of those a card form runs (every such layer then keeps half its experts on
+    /// each side).
     fn half_room(
         inputs: &moe_place::PlanInputs,
+        (header, hp): (&Split, &Hparams),
         spec: CardSpec,
         ctx: u64,
     ) -> Result<PlanLevers, GateError> {
+        if Tier::from_env()? == Tier::Fixture {
+            return Ok(PlanLevers {
+                card_experts_cap: Some(moe_place::card_runs_experts(header, hp) / 2),
+                ..PlanLevers::default()
+            });
+        }
         let machine = workstation::placed_on(spec, inputs.model.layers, workstation::SCRATCH);
         let whole = inputs.plan_with(&machine, ctx, &PlanLevers::default(), Experts::Placed)?;
         let card = whole.cards.first().ok_or("a plan of no card")?;
@@ -204,7 +220,10 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
-        let path = ref_model_path()?;
+        let path = match Tier::from_env()? {
+            Tier::Real => ref_model_path()?,
+            Tier::Fixture => tier::cut(PROFILE)?,
+        };
         if !path.is_dir() {
             return Err(format!(
                 "{NAME} runs a checkpoint folder; {} is a file: name the folder in \
@@ -219,7 +238,8 @@ mod gate {
             sel32: true,
             fp4: true,
         };
-        let (hp, inputs) = described(&header_at(&path)?, folder_forms, "a folder")?;
+        let header = header_at(&path)?;
+        let (hp, inputs) = described(&header, folder_forms, "a folder")?;
         // The twin's header is read before any card work, so a file that is not Lightning's
         // 32-value twin ends the gate here.
         let twin = twin_path
@@ -304,7 +324,7 @@ mod gate {
                 continue;
             }
             let levers = if premise == Premise::Split {
-                half_room(&inputs, room, ctx)?
+                half_room(&inputs, (&header, &hp), room, ctx)?
             } else {
                 PlanLevers::default()
             };

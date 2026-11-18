@@ -644,6 +644,20 @@ pub fn generate_arms(
     ctx: u64,
     dir: &Path,
 ) -> Result<Vec<Vec<u32>>, GateError> {
+    generate_arms_without(&[], exe, model, prompts, n, ctx, dir)
+}
+
+/// [`generate_arms`] with the environment variables in `without` removed from the CLI's environment: the ones
+/// the gate removes from its seat's server (which refuses them), so that the CLI's plan is the server's.
+pub fn generate_arms_without(
+    without: &[&str],
+    exe: &str,
+    model: &Path,
+    prompts: &[&[u32]],
+    n: usize,
+    ctx: u64,
+    dir: &Path,
+) -> Result<Vec<Vec<u32>>, GateError> {
     let exe = beside(exe)?;
     let mut args = Vec::new();
     for p in prompts {
@@ -655,9 +669,12 @@ pub fn generate_arms(
     args.push("--ctx".to_owned());
     args.push(ctx.to_string());
     args.push("--last-step".to_owned());
-    let out = Command::new(&exe)
-        .args(&args)
-        .env("BLOOMERY_REF_MODEL", model)
+    let mut cmd = Command::new(&exe);
+    cmd.args(&args).env("BLOOMERY_REF_MODEL", model);
+    for name in without {
+        cmd.env_remove(name);
+    }
+    let out = cmd
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("spawn {}: {e}", exe.display()))?;

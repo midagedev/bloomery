@@ -724,7 +724,7 @@ def check_row(row, hub, scratch, picked=None):
 # names it). --self-test and --live --box grep that file for the exact path, so a path that moved is a refusal. A
 # split set's other shards are the hub's shard names in the same directory.
 BOX_FILES = {
-    "ds41": (("/models/DeepSeek-V4.1-Flash-1017-Q3_K_M/DeepSeek-V4.1-Flash-1017-Q3_K_M-00001-of-00010.gguf",
+    "ds41": (("/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf",
               "tools/ref/models/deepseek41.sh"),),
     "glm": (("/models/GLM-5.3-Flash-UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf",
              "tools/ref/models/glm5next.sh"),),

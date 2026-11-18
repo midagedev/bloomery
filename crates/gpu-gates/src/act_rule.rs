@@ -226,10 +226,12 @@ impl SiteRel {
 ///   `SiteTy::reads`: a K-quant reads q8_1 blocks of [`Q8_1_BLOCK`] values on both arms, Q8_0 the
 ///   f32 rows on the gemv and q8 blocks of [`Q8_32_BLOCK`] on the GEMM, Q5_0 q8 blocks of
 ///   [`Q8_32_BLOCK`] on the gemv (`Q8Blocks32`; no GEMM arm), F32 f32. An expert reads
-///   q8_1 blocks of [`Q8_1_BLOCK`] under a K-quant, IQ3_XXS or IQ4_XS (the gate·up's `Q8Act` and
-///   the grouped GEMM's `GemmAct`) and q8 blocks of [`Q8_32_BLOCK`] under Q8_0, Q5_1 or IQ4_NL
-///   (`Q8Blocks32` and `GemmAct32`). An IQ2_XS, IQ3_S or Q2_K expert stack is read by the host tier
-///   alone, whose dot takes the q8_K blocks of [`QK_K`] values ik's takes, so ours is ik's there.
+///   q8_1 blocks of [`Q8_1_BLOCK`] under a K-quant, IQ3_XXS, IQ2_S or IQ4_XS (the gate·up's `Q8Act`
+///   and the grouped GEMM's `GemmAct`; IQ2_S's is `iq2_s_gate_up_sel`) and q8 blocks of
+///   [`Q8_32_BLOCK`] under Q8_0, Q5_0, Q5_1 or IQ4_NL (`Q8Blocks32` and `GemmAct32`; a Q5_0 stack the
+///   host tier reads takes ik's q8_2 blocks of the same 32 values). An IQ2_XS, IQ3_S or Q2_K expert
+///   stack is read by the host tier alone, whose dot takes the q8_K blocks of [`QK_K`] values ik's
+///   takes, so ours is ik's there.
 ///   Bolt's body adds IQ2_XXS on the expert and the gemv (`iq2_xxs_gemv_sel`, `iq2_xxs_rows`) and
 ///   NVFP4 on the gemv (`nvfp4_gemv`, the ssm_in/ssm_out), every one reading q8_1 blocks of
 ///   [`Q8_1_BLOCK`]. For Q5_K this differs from [`Rule::of`], which names the
@@ -241,13 +243,13 @@ pub fn site_rel(ty: GgmlType, arm: Arm) -> Option<SiteRel> {
             GgmlType::Q3_K | GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q6_K | GgmlType::IQ4_XS,
             _,
         )
-        | (GgmlType::IQ3_XXS, Arm::Expert) => Some(Q8_1_BLOCK),
+        | (GgmlType::IQ3_XXS | GgmlType::IQ2_S, Arm::Expert) => Some(Q8_1_BLOCK),
         // Bolt's IQ2_XXS: the routed `iq2_xxs_gemv_sel` and the dense `iq2_xxs_rows` read q8_1.
         (GgmlType::IQ2_XXS, Arm::Expert | Arm::Gemv) => Some(Q8_1_BLOCK),
         // Bolt's dense NVFP4 (`nvfp4_gemv`, the ssm_in/ssm_out) reads the engine's q8_1.
         (GgmlType::NVFP4, Arm::Gemv) => Some(Q8_1_BLOCK),
         (GgmlType::Q8_0, Arm::Gemm | Arm::Expert)
-        | (GgmlType::Q5_1 | GgmlType::IQ4_NL, Arm::Expert)
+        | (GgmlType::Q5_0 | GgmlType::Q5_1 | GgmlType::IQ4_NL, Arm::Expert)
         | (GgmlType::Q5_0, Arm::Gemv) => Some(Q8_32_BLOCK),
         // No card launch of these bodies reads IQ2_XS, IQ3_S or Q2_K experts; the host tier reads
         // their q8_K blocks as ik does (the same dot).
@@ -1008,6 +1010,10 @@ mod site_tests {
         for ty in [GgmlType::IQ3_XXS, GgmlType::IQ4_XS] {
             assert_eq!(site_rel(ty, Arm::Expert), q(q256, q128), "{ty}");
         }
+        // PIN(2026-11-18): IQ2_S's experts joined the IQ3_XXS row: the card's `iq2_s_gate_up_sel` and
+        // IQ2_S down read the same q8_1 form (`Q8Act`) while ggml's dot takes q8_K, and the q38v31
+        // fixture variant (IQ2_S gate and up) holds the type in `gate_qwen4exp_e2e`'s bands.
+        assert_eq!(site_rel(GgmlType::IQ2_S, Arm::Expert), q(q256, q128));
         // Bolt's IQ2_XXS: the card's `iq2_xxs_gemv_sel` (experts) and `iq2_xxs_rows` (dense) read
         // the engine's q8_1; ggml's dot takes q8_K, as the other i-quants do.
         assert_eq!(site_rel(GgmlType::IQ2_XXS, Arm::Expert), q(q256, q128));
@@ -1023,7 +1029,10 @@ mod site_tests {
         assert_eq!(site_rel(GgmlType::Q8_0, Arm::Gemv), q(q32, None));
         assert_eq!(site_rel(GgmlType::Q5_0, Arm::Gemv), q(q32, q32));
         assert_eq!(site_rel(GgmlType::Q5_0, Arm::Gemm), None);
-        assert_eq!(site_rel(GgmlType::Q5_0, Arm::Expert), None);
+        // PIN(2026-11-18): Q5_0's experts read the 32-value form ik's q8_2 has, on the card
+        // (`q5_0_gemv_sel`, `Q8Blocks32`) and in the host tier alike, so the row is Q5_1's; the
+        // q38v31 fixture variant (a Q5_0 down) holds it in `gate_qwen4exp_e2e`'s bands.
+        assert_eq!(site_rel(GgmlType::Q5_0, Arm::Expert), q(q32, q32));
         assert_eq!(site_rel(GgmlType::Q8_0, Arm::Gemm), q(q32, q32));
         assert_eq!(site_rel(GgmlType::Q8_0, Arm::Expert), q(q32, q32));
         for ty in [GgmlType::Q5_1, GgmlType::IQ4_NL] {

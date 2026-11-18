@@ -24,7 +24,7 @@ use models::shape::{MoeShape, select_router};
 use models::{Ffn, needs};
 
 use crate::arch::Read;
-use crate::fixture::{FixtureSpec, Options, VariantRow};
+use crate::fixture::{FixtureSpec, Options, VariantRow, variant_role_name};
 
 /// The table of what each fixture cannot reach, relative to the repository root.
 pub const TABLE: &str = "tools/kcover/unreached.tsv";
@@ -337,7 +337,10 @@ impl Reach {
                     .iter()
                     .filter(|v| v.family == self.arch)
                     .flat_map(|v| &v.map)
-                    .any(|(role, ty)| ty.name().is_some_and(|t| c.name == format!("{role} {t}")))
+                    .any(|(role, ty)| {
+                        let role = variant_role_name(role);
+                        ty.name().is_some_and(|t| c.name == format!("{role} {t}"))
+                    })
         };
         let mut out = Vec::new();
         for c in d.real.into_iter().filter(|c| !by_variant(c)) {

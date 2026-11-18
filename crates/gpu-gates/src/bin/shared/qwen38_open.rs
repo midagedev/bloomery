@@ -83,6 +83,10 @@ pub struct PlanFacts {
     /// The layers holding routed experts on the card, and each layer's count.
     pub card_layers: usize,
     pub n_l: Vec<u64>,
+    /// The layers the card expert rule keeps on the host whatever the budget (a routed part with
+    /// no card kernel, or a down that does not pair with the gate and up: `place::host_only`),
+    /// ascending: their `n_l` is 0 under any plan of the card experts.
+    pub host_only: Vec<usize>,
     /// The tier the plan reads the PLE table from.
     pub ple_tier: Option<Device>,
     /// The host room the plan was made under, and how it was read.
@@ -152,6 +156,17 @@ impl<'a> Open38<'a> {
             card_bytes: plan.cards[0].bytes(),
             card_layers: plan.n_l.iter().filter(|&&n| n > 0).count(),
             n_l: plan.n_l.clone(),
+            host_only: {
+                let mut layers: Vec<usize> =
+                    model::placement::accepts::routed_rule(model::arch::qwen35moe::place::PROGRAM)
+                        .host_only(&inputs.model)?
+                        .iter()
+                        .map(|cause| cause.layer)
+                        .collect();
+                layers.sort_unstable();
+                layers.dedup();
+                layers
+            },
             ple_tier: plan.row_tier()?,
             room: inputs.room.clone(),
             row_reserve_bytes: plan.host.row_reserve_bytes,

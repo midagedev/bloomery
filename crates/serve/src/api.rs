@@ -6634,7 +6634,7 @@ mod tests {
 
     /// Which of the fixture chat templates need a tool call's `arguments` as
     /// an object ([`needs_object_arguments`]): the ones that walk it
-    /// (Qwen3.6's, Qwen3.8's, Nemotron's and Bolt's `|items`, GLM's
+    /// (Qwen3.6's, Qwen3.8's, Nemotron's, Bolt's and Super-VL's `|items`, GLM's
     /// `.items()`) do, and the ones that take a string (Qwen3's `is string`
     /// branch, V4.1's `from_json`) do not, nor does a template that prints no
     /// arguments. The mock's inline template prints none.
@@ -6643,7 +6643,7 @@ mod tests {
         let parsed = |source: &str| ChatTemplate::parse(source).expect("a template");
         let want = |name: &str| match name {
             "qwen3" | "v41" => false,
-            "qwen36" | "qwen38" | "glm5" | "nemotron" | "nemotron-bolt" => true,
+            "qwen36" | "qwen38" | "glm5" | "nemotron" | "nemotron-bolt" | "nemotron-super" => true,
             other => panic!("{other} is not in the object-arguments table"),
         };
         for (name, source) in FIXTURE_TEMPLATES {
@@ -6661,7 +6661,7 @@ mod tests {
 
     /// How each fixture chat template answers `reasoning_effort: "none"`
     /// ([`probe_thinking_off`]), read from its renders: Qwen3's, Qwen3.6's,
-    /// Qwen3.8's, V4.1's, Nemotron's and Bolt's generation prompts change with
+    /// Qwen3.8's, V4.1's, Nemotron's, Bolt's and Super-VL's generation prompts change with
     /// `enable_thinking` ([`ThinkingOff::Switch`]); GLM's always opens
     /// `<think>` and changes only its effort header
     /// ([`ThinkingOff::LowEffort`]); the mock's reads neither
@@ -6670,7 +6670,7 @@ mod tests {
     fn the_fixture_templates_name_how_they_turn_thinking_off() {
         let parsed = |source: &str| ChatTemplate::parse(source).expect("a template");
         let want = |name: &str| match name {
-            "qwen3" | "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" => {
+            "qwen3" | "qwen36" | "qwen38" | "nemotron" | "nemotron-bolt" | "nemotron-super" => {
                 ThinkingOff::Switch { opt_in: false }
             }
             "v41" => ThinkingOff::Switch { opt_in: true },

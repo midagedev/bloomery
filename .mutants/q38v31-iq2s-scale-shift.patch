@@ -1,0 +1,12 @@
+# mutant: gate-gpu-qwen4exp-e2e@BLOOMERY_FIXTURE_VARIANT=q38v31 and gate-qdot: the IQ2_S host dot's AVX2 scale 2s+1 read as 4s+1 (Iq2s::scales_avx2, the shift of the scale nibble one place too far): the host-served IQ2_S gate and up of layers 0, 1 and 3 carry about twice their scale, so e2e's fixture-oracle clauses on those layers read FAIL; the or-with-3 variant (q38v31-iq2s-scale-avx2) is inside e2e's bands and only gate-qdot sees it
+--- a/crates/qdot/src/generic.rs
++++ b/crates/qdot/src/generic.rs
+@@ -851,7 +851,7 @@
+                 _mm256_blend_epi32::<0xF0>(byte, _mm256_srli_epi16::<4>(byte)),
+                 _mm256_set1_epi16(0x0f),
+             );
+-            _mm256_or_si256(_mm256_slli_epi16::<1>(nibbles), _mm256_set1_epi16(1))
++            _mm256_or_si256(_mm256_slli_epi16::<2>(nibbles), _mm256_set1_epi16(1))
+         }
+     }
+     #[cfg(target_arch = "x86_64")]

@@ -264,6 +264,25 @@ pub fn forms_of(split: &Split, hp: &Hparams) -> Forms {
     forms
 }
 
+/// The routed experts of `split`'s MoE layers whose up stack a card form runs ([`Forms::with_up`]
+/// counts one of them in `iq2` or `sel32`): the experts a placed plan may put on a card. A layer of
+/// another type keeps all its experts on the host and counts none.
+#[must_use]
+pub fn card_runs_experts(split: &Split, hp: &Hparams) -> u64 {
+    hp.experts
+        .iter()
+        .enumerate()
+        .filter_map(|(l, e)| Some((l, e.as_ref()?.n_expert as u64)))
+        .filter(|&(l, _)| {
+            let name = crate::arch::names::blk(l, super::names::FFN_UP_EXPS);
+            split
+                .find(&name)
+                .is_some_and(|(_, t)| Forms::default().with_up(t.ty) != Forms::default())
+        })
+        .map(|(_, n)| n)
+        .sum()
+}
+
 /// The widths of a placed pass for a file of `hp` whose routed stacks take `forms`, from its
 /// headers alone: an upper bound of what the body collects from its loaded layers, since the plan
 /// does not know how many experts of each layer the card holds. Every routed layer's table and

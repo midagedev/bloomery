@@ -1,0 +1,14 @@
+# Round fxa: the sitting that re-dumps the lease-bound V4.1 reference sets from /models/DeepSeek-V4.1-Flash-1017-bq3km (the default
+# file since 2026-11-18), eight `BLOOMERY_MODEL=deepseek41 just dump-ref-v41 [VARIANT]` jobs (the batch set, step4-every-node,
+# d1-every-node, d1-unfused-every-node, d1c-unfused-every-node, d1n-every-node, d2-every-node, d2-unfused-every-node: the sets
+# ref_deepseek41_<variant>_plain) and `just dump-draft` (ref-draft/code64_n32_w3), one lease each; then the Q3_K_M-era ik-greedy and
+# ik-ppl outputs the old v41move-redump.card names, when a read-only listing shows them bound to the Q3_K_M file. Nothing is timed.
+# Minutes [derived from v41move-redump.card, whose jobs were the same dumps on the same V4.1 ik tree and the same CPU thread count: 1..4
+# minutes a job; the file is the same size, 347.4 GB against 347.3 GB, and the dumps' --defer-experts read touches only what the graph
+# reaches]: nine jobs, 9..36 min in all.
+kind: exclusive
+reason: dump_ref, dump_draft, ik-greedy and ik-ppl run ik on 32 CPU threads and page the V4.1 split set in, so each job holds the
+  lease; why now: a reference set is bound to its first shard's full path, so the Q3_K_M file (323.4 GiB, with its r8 sidecar 145 GiB)
+  can leave /models (user decision 2026-11-18: bq3km is the V4.1 file that stays) only after every set that names it is re-dumped on
+  bq3km, the file every V4.1 real-tier recipe now opens
+minutes: 1..4

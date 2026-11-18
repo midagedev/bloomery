@@ -524,16 +524,17 @@ fn fetch(target: &str, out: &str, a: &Args) -> Res<()> {
         )
         .into());
     }
-    // A profile fixture is fetched from its architecture's row's source, under its own spec.
-    let profile = registry::PROFILE_FIXTURES
+    // A profile fixture is fetched from its own source where it names one, else from its
+    // architecture's row's, under its own spec.
+    let profile_fixture = registry::PROFILE_FIXTURES
         .iter()
-        .find(|p| p.family == target)
-        .map(|p| p.profile);
-    let row_family = profile
-        .and_then(registry::profile_fixture)
+        .find(|p| p.family == target);
+    let profile = profile_fixture.map(|p| p.profile);
+    let row_family = profile_fixture
         .and_then(|p| registry::fixture_of(p.arch))
         .map_or(target, |row| row.family);
-    let (r, rev) = match registry::fixtures().find(|s| s.family == row_family) {
+    let own = profile_fixture.and_then(|p| p.source.as_ref());
+    let (r, rev) = match own.or_else(|| registry::fixtures().find(|s| s.family == row_family)) {
         Some(s) => (
             RepoRef {
                 repo: s.repo.to_string(),

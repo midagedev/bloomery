@@ -7,6 +7,7 @@
 //! description row (`crate::arch::rules`). Executable admission belongs to the common
 //! program/site registry.
 
+pub mod fixture;
 pub mod host;
 mod hparams;
 pub mod place;

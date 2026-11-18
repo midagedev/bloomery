@@ -56,6 +56,7 @@ fn routed_gate_up(ty: GgmlType, l: usize) -> Result<&'static str, GateError> {
         GgmlType::IQ3_XXS => "iq3_xxs_gate_up_sel",
         GgmlType::IQ3_S => "iq3_s_gate_up_sel",
         GgmlType::IQ4_XS => "iq4_xs_gate_up_sel",
+        GgmlType::MXFP4 => "mxfp4_gate_up_sel",
         other => {
             return Err(
                 format!("layer {l}: {other} routed gate·up has no card kernel name here").into(),
@@ -81,6 +82,7 @@ fn routed_down(ty: GgmlType, prefetch: bool, l: usize) -> Result<&'static str, G
         GgmlType::IQ3_XXS => "iq3_xxs_gemv_sel",
         GgmlType::IQ3_S => "iq3_s_gemv_sel",
         GgmlType::IQ4_XS => "iq4_xs_gemv_sel",
+        GgmlType::MXFP4 => "mxfp4_gemv_sel",
         other => {
             return Err(
                 format!("layer {l}: {other} routed down has no card kernel name here").into(),

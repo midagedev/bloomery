@@ -1,0 +1,12 @@
+# mutant: gate-gpu-qwen4exp-e2e@BLOOMERY_FIXTURE_VARIANT=q38v31 and gate-qdot: the IQ2_S host dot's AVX2 scale 2s+1 or'ed with 3 instead of 1 (Iq2s::scales_avx2, the path the engine's host experts take): the groups whose s is even read 2s+3, so the host-served IQ2_S gate and up of layers 0, 1 and 3 differ from ik's, and the generic test's vector-decode clause reads FAIL
+--- a/crates/qdot/src/generic.rs
++++ b/crates/qdot/src/generic.rs
+@@ -851,7 +851,7 @@
+                 _mm256_blend_epi32::<0xF0>(byte, _mm256_srli_epi16::<4>(byte)),
+                 _mm256_set1_epi16(0x0f),
+             );
+-            _mm256_or_si256(_mm256_slli_epi16::<1>(nibbles), _mm256_set1_epi16(1))
++            _mm256_or_si256(_mm256_slli_epi16::<1>(nibbles), _mm256_set1_epi16(3))
+         }
+     }
+     #[cfg(target_arch = "x86_64")]

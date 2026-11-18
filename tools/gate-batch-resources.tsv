@@ -16,7 +16,7 @@
 #   deepseek41 --place gate: CPU 239,830,005,760 B + ROW_CACHE 4 GiB − OS reserve 6,694,629,376 B ≈ 237.6e9 [derived]
 #   glm5next   --place gate: need=173,015,891,968 B (the glm5next serve log's cache line)
 #   qwen4exp   --place gate: need=92,054,154,240 B (the qwen38 serve log's cache line); the serve/residency seats add
-#              the churn pool 35.6e9 B beside it; iqleg loads the file twice (both resident): 2 x.
+#              the churn pool 35.6e9 B beside it.
 #   mimo2      --place gate: every routed expert on the host — host routed 160,859,947,008 B (mimo2_meta's pin) + the
 #              host embedding 664,010,752 B, rounded up to 161.6e9 [derived]; the serve gate loads twice, one after the
 #              other, never both.
@@ -72,7 +72,6 @@ gate-gpu-qwen38-serve	m	127654154240
 gate-gpu-qwen38-twocard	-	92054154240
 gate-gpu-qwen3moe-twocard	-	92054154240
 gate-gpu-qwen4exp-e2e	m	92054154240
-gate-gpu-qwen4exp-iqleg	-	184108308480
 gate-gpu-qwen4exp-mtp	m	92054154240
 gate-gpu-solar2-e2e	-	131000000000
 gate-gpu-solar2-prefill	-	131000000000

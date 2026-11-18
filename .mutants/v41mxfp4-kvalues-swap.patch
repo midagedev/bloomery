@@ -1,0 +1,11 @@
+--- a/crates/gguf/src/quant.rs
++++ b/crates/gguf/src/quant.rs
+@@ -897,7 +897,7 @@
+ 
+ /// The E2M1 code values doubled, `kvalues_mxfp4` (ggml-common.h:2250-2252):
+ /// codes 0-7 are 0, 0.5, 1, 1.5, 2, 3, 4, 6 times two, 8-15 the same negated.
+-pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
++pub const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 8, 6, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+ 
+ /// The two doubled E2M1 values of one FP4 code byte: the low nibble's
+ /// [`KVALUES_MXFP4`] entry, then the high nibble's. The one host decode of a

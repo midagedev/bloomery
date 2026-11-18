@@ -26,4 +26,8 @@ pub const FIXTURE_TEMPLATES: &[(&str, &str)] = &[
         "nemotron-bolt",
         include_str!("../fixtures/nemotron-bolt-chat-template.jinja"),
     ),
+    (
+        "nemotron-super",
+        include_str!("../fixtures/nemotron-super-chat-template.jinja"),
+    ),
 ];

@@ -3823,8 +3823,9 @@ mod gate {
     /// layers' goes and waits as batch mem ops, as the program counts. In the
     /// fixture tier the plan is also held to its contract: the header's
     /// budget puts half the experts
-    /// (`n_expert / 2`) on the card of every card layer — a budget one
-    /// granule off leaves a layer one expert short.
+    /// (`n_expert / 2`) on the card of every layer the card expert rule does
+    /// not keep on the host (`PlanFacts::host_only`, whose layers hold none) —
+    /// a budget one granule off leaves a layer one expert short.
     fn card_structure(m: &mut Qwen38Model, plan: &PlanFacts) -> Result<bool, GateError> {
         let nodes = m.capture_step()?;
         let body = m.body("card_structure")?;
@@ -3861,7 +3862,14 @@ mod gate {
         let held = |on: &dyn Fn(u64) -> bool| plan.n_l.iter().filter(|&&n| on(n)).count();
         let fixture = Tier::from_env()? == bloomery_gpu_gates::tier::Tier::Fixture;
         let want_each = (cfg().n_expert / 2) as u64;
-        let contract = !fixture || plan.n_l.iter().all(|&n| n == want_each);
+        let contract = !fixture
+            || plan.n_l.iter().enumerate().all(|(l, &n)| {
+                n == if plan.host_only.contains(&l) {
+                    0
+                } else {
+                    want_each
+                }
+            });
         println!(
             "card leg plan: {} of {} layers hold routed experts on the card, a layer's count \
              {:?}..{:?}{} {}",
@@ -3870,7 +3878,11 @@ mod gate {
             plan.n_l.iter().min(),
             plan.n_l.iter().max(),
             if fixture {
-                format!(" (want {want_each} on every layer: half the experts, the header's budget)")
+                format!(
+                    " (want {want_each} on every layer but the host-only {:?}: half the experts, \
+                     the header's budget)",
+                    plan.host_only
+                )
             } else {
                 " (the real file's counts are `qwen4exp_meta`'s CARD_PLANS)".to_string()
             },
@@ -4362,20 +4374,23 @@ mod gate {
                 whole_refusals(&mut m)? & whole_run(&mut m, &plan, ub, fixture)?
             };
             Ok(Some((
-                (whole, views),
+                (whole, views, plan.host_only.len()),
                 b,
                 rows_ok && refused,
                 [graph, eager],
                 verified,
             )))
         };
-        let Some(((whole, views), b, own_ok, runs, (v, served))) = arm(false)? else {
+        let Some(((whole, views, host_only), b, own_ok, runs, (v, served))) = arm(false)? else {
             return Ok(false);
         };
-        let Some(((_, kviews), kb, _, kept, (kv, kserved))) = arm(true)? else {
+        let Some(((_, kviews, _), kb, _, kept, (kv, kserved))) = arm(true)? else {
             return Ok(false);
         };
-        let premise = !fixture || whole == n_layer();
+        // The fixture fits the card, so every layer the card expert rule does not keep on the host
+        // runs without the host leg.
+        let want_whole = n_layer() - host_only;
+        let premise = !fixture || whole == want_whole;
         let counts = premise
             && b == shape().memops_card(whole) + shape().arrivals()
             && kb == memops() + shape().arrivals()
@@ -4390,7 +4405,10 @@ mod gate {
              (want {} each) {}",
             n_layer(),
             if fixture {
-                format!(" (want {}: the fixture fits the card)", n_layer())
+                format!(
+                    " (want {want_whole}: the fixture fits the card, less the {host_only} the card \
+                     expert rule keeps on the host)"
+                )
             } else {
                 " (the real tier does not require it: the card's memory decides)".to_string()
             },

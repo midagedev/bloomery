@@ -1,0 +1,11 @@
+--- a/crates/gguf/src/quant.rs
++++ b/crates/gguf/src/quant.rs
+@@ -939,7 +939,7 @@
+ #[must_use]
+ pub fn e8m0_to_f32_half(e: u8) -> f32 {
+     let bits = if e >= 2 {
+-        u32::from(e - 1) << 23
++        u32::from(e) << 23
+     } else if e == 1 {
+         0x0040_0000
+     } else {
