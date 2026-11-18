@@ -29,6 +29,18 @@ fn open() -> Engram {
     })
 }
 
+/// The tensor row where site `e`'s row 0 lies, derived here from the header's own facts and not asked of
+/// the crate's mapping: a site with a tensor of its own starts at row 0, and sites that share one tensor
+/// (the concatenated layout) follow one another from its row 0 in site order, each as many rows as its
+/// hash buckets' primes sum to.
+fn base_row(engram: &Engram, e: usize) -> u64 {
+    let name = engram.sites()[e].name();
+    (0..e)
+        .filter(|&p| engram.sites()[p].name() == name)
+        .map(|p| engram.hash().partition_rows(p).unwrap())
+        .sum()
+}
+
 /// Ids uniform over a range from a fixed seed (splitmix64), so a gate reads
 /// the same rows on every run.
 struct Draw(u64);
@@ -93,21 +105,22 @@ fn hw_engram_rows_match_pread() {
         "V4.1-Flash has engram at blk.1 and blk.14"
     );
 
-    for site in engram.sites() {
+    for (e, site) in engram.sites().iter().enumerate() {
         let ids = sample(site, 128);
         let fd = File::open(site.path()).unwrap();
         // The reference offset, derived here: header data base + the tensor's
-        // own offset, and a stride of ne[0]/block blocks of ggml's block size.
+        // own offset + the site's first row in it ([`base_row`]), and a stride of
+        // ne[0]/block blocks of ggml's block size.
         let inv = gguf::inventory_of(site.path()).unwrap();
         let t = inv
             .tensors
             .iter()
             .find(|t| t.name == site.name())
             .expect("the site came from this shard's header");
-        let base = inv.data_base + t.offset;
         let (_, block, block_bytes) =
             gguf::ggml_type_info(t.type_id).expect("an engram table type ggml sizes");
         let stride = t.dims[0] / block * block_bytes;
+        let base = inv.data_base + t.offset + base_row(&engram, e) * stride;
 
         let mut want = vec![0u8; stride as usize];
         let mut borrowed: Vec<&[u8]> = Vec::new();
@@ -154,7 +167,7 @@ fn hw_engram_copy_rows_matches_row() {
     let engram = open();
     let split = Arc::new(Split::open(gguf::v41::model()).unwrap());
 
-    for site in engram.sites() {
+    for (e, site) in engram.sites().iter().enumerate() {
         let ids = sample(site, 64);
         let stride = site.row_bytes() as usize;
         let mut copied = vec![0u8; ids.len() * stride];
@@ -178,11 +191,17 @@ fn hw_engram_copy_rows_matches_row() {
             site.name()
         );
 
+        // The split's table is the whole tensor: a site's id is that many rows past the site's first.
         let table = SplitTable::open(Arc::clone(&split), site.name()).unwrap();
         assert_eq!(table.row_bytes(), site.row_bytes(), "{}", site.name());
-        table.prefetch(&ids).unwrap();
+        let first = base_row(&engram, e);
+        let in_tensor: Vec<u32> = ids
+            .iter()
+            .map(|&id| u32::try_from(first + u64::from(id)).expect("a tensor row of the table"))
+            .collect();
+        table.prefetch(&in_tensor).unwrap();
         let mut via_split = vec![0u8; ids.len() * stride];
-        table.copy_rows(&ids, &mut via_split).unwrap();
+        table.copy_rows(&in_tensor, &mut via_split).unwrap();
         assert!(
             via_split == copied,
             "{}: the split's mapping copies other bytes than the site's",
@@ -190,7 +209,7 @@ fn hw_engram_copy_rows_matches_row() {
         );
         assert!(
             table
-                .copy_rows(&ids, &mut via_split[..ids.len() * stride - 1])
+                .copy_rows(&in_tensor, &mut via_split[..ids.len() * stride - 1])
                 .is_err(),
             "{}: a short buffer must be refused through the split",
             site.name()
@@ -198,19 +217,22 @@ fn hw_engram_copy_rows_matches_row() {
     }
 }
 
-/// The row stride tiles the tensor exactly, and the last row ends on the
-/// tensor's last byte.
+/// The row stride tiles the tensor exactly, and the last row ends where the
+/// header puts it: on the tensor's last byte for the last site a tensor holds.
 ///
 /// What the identity gate above cannot catch: a wrong stride used by *both*
 /// sides agrees with itself. This one re-derives the geometry from the header
 /// inside the test and compares it against what the crate reports, so the
-/// arithmetic has a second witness.
+/// arithmetic has a second witness. A tensor holds one site (the per-site
+/// layout) or every site's run of rows, back to back (the concatenated one);
+/// the sites that name one tensor tile it together.
 #[test]
 #[ignore = "hw: needs the box and the V4.1 split"]
 fn hw_engram_row_stride_tiles_the_tensor() {
     let engram = open();
+    let sites = engram.sites();
 
-    for site in engram.sites() {
+    for (e, site) in sites.iter().enumerate() {
         let inv = gguf::inventory_of(site.path()).unwrap();
         let t = inv
             .tensors
@@ -220,7 +242,17 @@ fn hw_engram_row_stride_tiles_the_tensor() {
         let nbytes = t.nbytes.expect("the table's type is in ggml's size table");
 
         assert_eq!(t.dims.len(), 2, "{}: engram is a 2-D table", site.name());
-        assert_eq!(site.rows(), t.dims[1], "{}: row count", site.name());
+        let on_tensor: Vec<usize> = (0..sites.len())
+            .filter(|&q| sites[q].name() == site.name())
+            .collect();
+        let rows_on_tensor: u64 = on_tensor.iter().map(|&q| sites[q].rows()).sum();
+        assert_eq!(
+            rows_on_tensor,
+            t.dims[1],
+            "{}: the rows of the {} site(s) it holds are the tensor's row count",
+            site.name(),
+            on_tensor.len()
+        );
         assert_eq!(site.type_id(), t.type_id, "{}: row type", site.name());
         // 256 values a row. The two block types the V4.1 files carry, from
         // ggml-common.h's static_asserts, written here rather than read from
@@ -238,21 +270,30 @@ fn hw_engram_row_stride_tiles_the_tensor() {
             site.name()
         );
         assert_eq!(
-            site.rows() * site.row_bytes(),
+            rows_on_tensor * site.row_bytes(),
             nbytes,
-            "{}: {} rows x {} B must tile the tensor's {nbytes} B exactly",
+            "{}: {rows_on_tensor} rows x {} B must tile the tensor's {nbytes} B exactly",
             site.name(),
-            site.rows(),
             site.row_bytes(),
         );
 
         let last_end = site.file_offset((site.rows() - 1) as u32) + site.row_bytes();
+        let site_end =
+            inv.data_base + t.offset + (base_row(&engram, e) + site.rows()) * site.row_bytes();
         assert_eq!(
             last_end,
-            inv.data_base + t.offset + nbytes,
-            "{}: the last row must end on the tensor's last byte",
+            site_end,
+            "{}: the site's last row must end where the header puts it",
             site.name()
         );
+        if on_tensor.last() == Some(&e) {
+            assert_eq!(
+                last_end,
+                inv.data_base + t.offset + nbytes,
+                "{}: the last site's last row must end on the tensor's last byte",
+                site.name()
+            );
+        }
         assert!(
             last_end <= inv.file_len,
             "{}: the table runs past the {} B shard",

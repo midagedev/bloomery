@@ -319,6 +319,19 @@ fixture_dump_tier() {
   SET_PREFIX=fx_${FIXTURE_VARIANT:+${FIXTURE_VARIANT}_}
 }
 
+# ik_opens_model <script>: refuses, by name (exit 65), a model file the profile says ik_llama.cpp cannot open, before a build, a
+# lease or a set. The profile defines `ik_refusal <file>` to print the reason and return 1 when ik stops on the file; a profile
+# that defines none (every other architecture) passes. A file that is not there passes too: the dumper's own open names it.
+ik_opens_model() {
+  declare -F ik_refusal > /dev/null || return 0
+  [ -f "$MODEL" ] || return 0
+  local why
+  why=$(ik_refusal "$MODEL") || {
+    echo "$1: ik cannot open $MODEL: $why (exit 65)" >&2
+    exit 65
+  }
+}
+
 # fixture_line <script>: the `# fixture` header line of the fixture file, on stdout; nothing in the real tier. It is what
 # `refset-check --fixture-line` prints (crates/refset/src/bin/refset_check.rs), the one owner of the line, and the dumpers write
 # it verbatim beside `# model`. The binary is built the way `just refset-check` builds it; cargo is the staleness rule, so a

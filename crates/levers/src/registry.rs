@@ -2222,7 +2222,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     path(
         "BLOOMERY_Q5K_MODEL",
         Some("ref/build-qdot-ref.sh"),
-        "The file q5_K's qdot harness and gate read, the V4.1 first shard when unset.",
+        "The file q5_K's qdot harness and gate read (the first aligned Q5_K tensor over the shards of its split), the V4.1 first shard when unset.",
     ),
     path(
         "BLOOMERY_QWEN38_FOLDER",

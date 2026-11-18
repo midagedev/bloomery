@@ -730,9 +730,9 @@ blk_fixturevariants() {
   echo "check-recipes: deepseek41 variant draft: the fixture's, an identical own, a differing own refused, none refused"
   local prof line real f_rc f_out
   prof=$(dirname "$0")/ref/models/deepseek41.sh
-  line=$(sed -n '215p' "$prof")
+  line=$(grep -m 1 '^DSPARK_MODEL=' "$prof")
   real=$(printf '%s\n' "$line" | sed -n 's/^DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-\(.*\)}$/\1/p')
-  [ -n "$real" ] || { echo "check-recipes: $prof:215 is not the DSPARK_MODEL default: $line" >&2; return 1; }
+  [ -n "$real" ] || { echo "check-recipes: $prof has no DSPARK_MODEL default line: $line" >&2; return 1; }
   f_rc=0
   f_out=$(env -i PATH="$PATH" BLOOMERY_MODEL=deepseek41 bash -c '. "$1" && dspark_model' _ "$rp" 2>"$d/f.err") || f_rc=$?
   [ "$f_rc" = 0 ] && [ "$f_out" = "$real" ] || { echo "check-recipes: dspark_model, real tier: rc=$f_rc out='$f_out', want '$real' ($(cat "$d/f.err"))" >&2; return 1; }

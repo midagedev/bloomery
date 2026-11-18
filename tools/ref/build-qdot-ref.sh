@@ -18,9 +18,10 @@
 # and without them the tests fail on a missing file, which is a standing red,
 # not a gate. Unlike build.sh they are built AND run here: the dump is the
 # product, the binary is scaffolding. Four read the reference model; q5k_x4_ref
-# reads the file named by BLOOMERY_Q5K_MODEL (default: the V4.1 first shard,
-# which holds blk.0.ffn_down_exps.weight — the reference model has no Q5_K
-# tensor), and also dumps ggml's to_float of that tensor's first rows
+# reads the file named by BLOOMERY_Q5K_MODEL (default: the V4.1 first shard; the
+# harness walks that split's shards for the first aligned Q5_K tensor,
+# blk.0.ffn_down_exps.weight — the reference model has no Q5_K tensor), and
+# also dumps ggml's to_float of that tensor's first rows
 # (q5k-v41-dequant.raw/.meta) for gate-qdot's dequant test. iq3xxs_ref reads the
 # file named by BLOOMERY_IQ3XXS_MODEL (default: the Qwen3.8 UD-Q3_K_XL second
 # shard, whose first IQ3_XXS tensor is blk.0.ffn_gate_exps.weight, k = 2560) and
@@ -137,8 +138,8 @@ fi
 # shellcheck source=tools/ref/ref-build-common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/ref-build-common.sh"
 OUT=${Q3K_OUT:-$REF_BIN}
-# The V4.1 first shard (the deepseek41 profile's choice, exported by tools/box.sh) unless
-# BLOOMERY_Q5K_MODEL names another.
+# The V4.1 first shard (the deepseek41 profile's choice, exported by tools/box.sh; q5k_x4_ref scans the
+# shards of its split) unless BLOOMERY_Q5K_MODEL names another.
 Q5K_MODEL=${BLOOMERY_Q5K_MODEL:-${BLOOMERY_V41_MODEL:?BLOOMERY_V41_MODEL unset — run through tools/box.sh, which exports it from the deepseek41 profile}}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 IQ3XXS_MODEL=${BLOOMERY_IQ3XXS_MODEL:-/data/moved/models/Qwen3.8-Flash-Next-UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00003.gguf}

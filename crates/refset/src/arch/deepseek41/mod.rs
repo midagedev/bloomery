@@ -76,7 +76,6 @@ pub static IK: Family = Family {
         "gate-ds41-plan",
         "gate-ds41-meta",
         "gate-ds41-host",
-        "gate-union",
         "gate-ds41-load",
         "gate-gpu-mcol",
         "gate-gpu-ds41-attn",

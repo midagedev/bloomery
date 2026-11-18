@@ -2503,7 +2503,7 @@ gate-ds41-host:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test ds41_host -- --ignored --nocapture && bash tools/gate.sh --release -p bloomery-model --doc'
 
 # 호스트 합집합 호출 게이트: moe::HostLayer::experts_union_into가 토큰 열 k = 1·2·3·6에서 열마다
-# experts_into(그 열, 그 열의 목록)와 비트까지 같은지를 V4.1 라우팅 층 40개 전부(ref_deepseek41의 라우팅)에서
+# experts_into(그 열, 그 열의 목록)와 비트까지 같은지를 V4.1 라우팅 층 40개 전부(시드한 활성값·라우팅: 2026-11-18부터 ik 세트 없이)에서
 # 지연 팔 둘로 재고, 파일 하나를 받는 진입은 V2-Lite 블록 1에서, 이름 붙은 거부 여섯은 각각 확인한다.
 # r8 배치: gate·up을 r8 사이드카에서 행-레인 타일로 읽는 층이 파일 행을 읽는 층과 열마다 비트까지 같다
 # (합성 층 하나, 모델 파일 없이 박스 CPU의 AVX2에서).

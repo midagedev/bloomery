@@ -55,6 +55,7 @@ case $MODEL_NAME in
   *) echo "ik-greedy.sh: the profile is $MODEL_NAME — pick deepseek41 or qwen3moe on the Mac side (BLOOMERY_MODEL=...)" >&2
      exit 64 ;;
 esac
+ik_opens_model ik-greedy.sh
 GEN=${GEN:-64}
 PROMPT=${PROMPT:-0}
 BOUND=${IK_GREEDY_BOUND:-900}

@@ -1,0 +1,16 @@
+# fxfix mutant union-sum-ulp
+# clause: the union call equals the per-column call bit for bit (crates/model/tests/union.rs, the V4.1 cases on seeded inputs)
+# site: crates/model/src/ops.rs UnionCall::sum_at, the inline-columns branch: one ulp off in the first cell of each column
+# run: cargo test --release -p bloomery-model --test union -- --ignored --test-threads=1 hw_union_matches_per_column_v41
+# red: diff_cells > 0 on k = 1 .. UNION_INLINE_COLS, "cols_bits_equal" short of k/k, FAIL
+--- a/crates/model/src/ops.rs
++++ b/crates/model/src/ops.rs
+@@ -6696,6 +6696,8 @@
+         if cols <= UNION_INLINE_COLS {
+             for (j, o) in out.chunks_exact_mut(embd).enumerate() {
+                 self.plan.sum_col(slot, store, lists[j], self.post, j, o);
++                // mutant union-sum-ulp: one ulp off in the first cell.
++                o[0] = f32::from_bits(o[0].to_bits() ^ 1);
+             }
+             return false;
+         }

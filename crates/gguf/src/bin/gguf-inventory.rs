@@ -814,10 +814,6 @@ mod tests {
         );
     }
 
-    /// The type ids V4.1's first shard carries that the crate decodes.
-    // PIN(2026-10-21): the default file's first shard holds q3_K, q4_K and q5_K tensors only (its header), and the crate decodes all three.
-    const V41_PUBLIC_DECODABLE: usize = 3;
-
     /// The `dequant` column is the dispatch's own answer: every id in ggml's
     /// range reads `yes` exactly when `dequant_row` decodes one block of it.
     #[test]
@@ -839,14 +835,21 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
-    /// V4.1's first shard header: how many of its type ids the crate decodes.
+    /// The V4.1 split set's headers: every type id its tensors carry is one the crate decodes. The
+    /// set is read over its shards (the first of a `bq3km` set is the header alone), so an empty
+    /// census is refused, not passed.
     #[test]
-    #[ignore = "reads the V4.1 first shard's header on the box"]
+    #[ignore = "reads the V4.1 split's headers on the box"]
     fn hw_v41_shard_decodable_types() {
         let path = gguf::v41::model();
-        let inv = gguf::inventory_of(std::path::Path::new(&path))
-            .unwrap_or_else(|e| panic!("inventory of {path}: {e}"));
-        let ids: std::collections::BTreeSet<u32> = inv.tensors.iter().map(|t| t.type_id).collect();
+        let split = gguf::Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+        let mut ids = std::collections::BTreeSet::new();
+        for i in 0..split.shard_count() {
+            let shard = split.shard_path(i).expect("a shard the count names");
+            let inv = gguf::inventory_of(shard)
+                .unwrap_or_else(|e| panic!("inventory of {}: {e}", shard.display()));
+            ids.extend(inv.tensors.iter().map(|t| t.type_id));
+        }
         let rows: Vec<String> = ids
             .iter()
             .map(|&id| {
@@ -858,18 +861,26 @@ mod tests {
                 )
             })
             .collect();
-        println!("v41 shard types: {}", rows.join("; "));
-        let decodable = ids.iter().filter(|&&id| has_decoder(id)).count();
+        println!("v41 set types: {}", rows.join("; "));
         assert!(
             path == gguf::v41::PUBLIC,
-            "{path}: the decodable-type count is pinned for {} only",
+            "{path}: the decodable-type claim is held for {} only",
             gguf::v41::PUBLIC
         );
-        assert_eq!(
-            decodable,
-            V41_PUBLIC_DECODABLE,
-            "decodable type ids on {path} ({} ids)",
-            ids.len()
+        assert!(
+            !ids.is_empty(),
+            "{path}: no shard of the set carries a tensor"
+        );
+        let undecodable: Vec<String> = ids
+            .iter()
+            .filter(|&&id| !has_decoder(id))
+            .map(|&id| format!("#{id} {}", GgmlType::from_u32(id)))
+            .collect();
+        assert!(
+            undecodable.is_empty(),
+            "type ids of {path} ({} ids) the crate cannot decode: {}",
+            ids.len(),
+            undecodable.join(", ")
         );
     }
 }

@@ -10,15 +10,13 @@
 //! same per-column quantization, the same list-order sum from zero — so any
 //! differing cell is a bug, not rounding.
 //!
-//! The lists are real routing: the ids of `ffn_moe_topk-L` (the logical twin)
-//! and the weights of `ffn_moe_weights_scaled-L` of the 5-token oracle set
-//! `ref_deepseek41`, whose consecutive positions share experts the way a
-//! verify pass's rows do. k = 6, 8 and 9 need columns the set does not have:
-//! the i-th past the set's tokens is token i's row doubled (any column is a
-//! valid input — the contract is per column) with token i + 1's list
-//! reversed and token i's first expert repeated at a negative weight, so the
-//! cases also carry lists whose order is neither the router's nor the
-//! union's, and an expert a list names twice.
+//! The inputs are seeded, with no reference engine's dump behind them (the contract is union
+//! against per-column on the same bytes, so any column and any list is a valid input): `N_TOKENS` columns of `columns::seeded` activations per layer, and per token
+//! `n_used` distinct experts with positive weights (`v41_lists`). k = 6, 8 and 9 need columns
+//! past the `N_TOKENS`: the i-th past them is token i's row doubled with token i + 1's list
+//! reversed and token i's first expert repeated at a negative weight, so the cases also carry
+//! lists whose order is neither the router's nor the union's, and an expert a list names
+//! twice.
 //!
 //! Every union call is also held to its pool dispatches, by the scratch's
 //! count of passes (`UnionScratch::passes`) and by the pool's: five a call
@@ -32,7 +30,7 @@
 //! per column so some experts carry many columns (runs of the tile kernel,
 //! chunks whose downs are kept in the store), every list length from empty
 //! to `LIST`, a repeat at a negative weight, and activation
-//! columns that are the set's tokens rescaled. A routed case at k = 512 draws
+//! columns that are the seeded tokens rescaled. A routed case at k = 512 draws
 //! each column's `n_used` experts uniformly from the layer's: the binomial
 //! spread of columns per expert a prefill ubatch has, so one chunk mixes
 //! experts of one tile run with experts of two or three, and most chunks'
@@ -104,7 +102,7 @@
 //! keeps down columns per listed slot, so no distinct-expert bound exists and
 //! the per-list and column bounds are the only ones a call can reach.
 //!
-//! `hw_`: needs the V4.1 shards, the oracle set and V2-Lite on the box
+//! `hw_`: needs the V4.1 shards and V2-Lite on the box
 //! (`just gate-union`).
 
 #[path = "common/columns.rs"]
@@ -113,8 +111,6 @@ mod columns;
 mod panics;
 #[path = "common/r8layer.rs"]
 mod r8layer;
-#[path = "common/v41set.rs"]
-mod v41set;
 
 use std::sync::Arc;
 
@@ -132,8 +128,10 @@ use model::placement::workstation;
 use model::r8file::{HostR8, R8Source, Sidecar};
 use panics::panic_text;
 
-/// The oracle set: the V4.1 node dumps' 5-token batch set.
-const SET: &str = refset::arch::deepseek41::BATCH;
+/// The tokens a V4.1 layer's cases draw from: the width of the 5-token prompt the cases were
+/// first made over; the k = 6 column needs two.
+const N_TOKENS: usize = 5;
+const _: () = assert!(N_TOKENS >= 2);
 
 /// Column counts the gate runs.
 const KS: [usize; 6] = [1, 2, 3, 6, 8, 9];
@@ -166,7 +164,7 @@ const LANE_ARMS: [(&str, bool, bool); 3] = [
 const TAILS: [(usize, usize); 2] = [(UNION_TAIL_MAX_GROUPS, 0), (3, 300)];
 
 /// The routed width every scratch here is made for: the longest list the
-/// cases carry, past V4.1's six (the cases past the set's tokens add one to a
+/// cases carry, past V4.1's six (the cases past the `N_TOKENS` add one to a
 /// routed list).
 const LIST: usize = 8;
 
@@ -236,7 +234,31 @@ fn dispatch_note(scratch: u64, pool: Option<u64>, want: u64) -> String {
     format!("dispatches={scratch} pool={pool} want={want}")
 }
 
-/// The V4.1 cases of one layer: the set's first k tokens for k <= 5, and
+/// One V4.1 layer's activations: `N_TOKENS` columns of seeded cells (an activation row's outliers
+/// included), keyed by the layer.
+fn v41_x(l: usize, embd: usize) -> Vec<f32> {
+    seeded(N_TOKENS * embd, 0x7141_0000 + l as u64)
+}
+
+/// One V4.1 layer's routing: per token `n_used` distinct experts of `n_expert` and positive
+/// weights, keyed by the layer.
+fn v41_lists(l: usize, n_expert: usize, n_used: usize) -> Vec<Vec<(u32, f32)>> {
+    let mut s = Stream(0x7141_5EED ^ (l as u64 + 1));
+    (0..N_TOKENS)
+        .map(|_| {
+            let mut ids: Vec<u32> = Vec::with_capacity(n_used);
+            while ids.len() < n_used {
+                let e = u32::try_from(s.next() % n_expert as u64).expect("an expert id");
+                if !ids.contains(&e) {
+                    ids.push(e);
+                }
+            }
+            ids.into_iter().map(|e| (e, 0.25 + s.unit())).collect()
+        })
+        .collect()
+}
+
+/// The V4.1 cases of one layer: the first k of `N_TOKENS` tokens for k <= 5, and
 /// past them the columns of the module doc.
 fn v41_cases(x_all: &[f32], lists: &[Vec<(u32, f32)>], embd: usize) -> Vec<Case> {
     let n_tokens = lists.len();
@@ -396,22 +418,13 @@ fn refusals(layer: &HostLayer, src: R8Source<'_>, embd: usize, ff: usize, us: &m
 }
 
 #[test]
-#[ignore = "hw: needs the box, the V4.1 shards and $BLOOMERY_DATA/ref_deepseek41"]
+#[ignore = "hw: needs the box and the V4.1 shards"]
 fn hw_union_matches_per_column_v41() {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let src = R8Source::rows(&split);
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
-    let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
-    let n_tokens = set
-        .shapes
-        .get("ffn_norm-0")
-        .expect("the set has ffn_norm-0")[1];
-    assert!(
-        n_tokens >= 2,
-        "{SET}: {n_tokens} tokens, the k = 6 column needs two"
-    );
     let mut host = HostScratch::new(embd, ff, LIST).expect("a scratch of LIST experts");
     let mut us = UnionScratch::new_routed(embd, ff, SMALL_COLS, LIST)
         .expect("a scratch of SMALL_COLS columns");
@@ -426,24 +439,8 @@ fn hw_union_matches_per_column_v41() {
             println!("layer={l} no routed experts");
             continue;
         };
-        let x_all = set.f32s(&format!("ffn_norm-{l}"), [embd, n_tokens, 1]);
-        let ids = set.i32s_logical(&format!("ffn_moe_topk-{l}"), n_used * n_tokens);
-        let ws = set.f32s(
-            &format!("ffn_moe_weights_scaled-{l}"),
-            [1, n_used, n_tokens],
-        );
-        let lists: Vec<Vec<(u32, f32)>> = (0..n_tokens)
-            .map(|t| {
-                (0..n_used)
-                    .map(|s| {
-                        let id = ids[t * n_used + s];
-                        let e = u32::try_from(id)
-                            .unwrap_or_else(|_| panic!("layer {l}: routed id {id} is negative"));
-                        (e, ws[t * n_used + s])
-                    })
-                    .collect()
-            })
-            .collect();
+        let x_all = v41_x(l, embd);
+        let lists = v41_lists(l, layer.n_expert(), n_used);
         for (ki, case) in v41_cases(&x_all, &lists, embd).iter().enumerate() {
             let k = case.x.ne1;
             let want = per_column(&layer, src, case, &mut host);
@@ -660,18 +657,13 @@ fn max_cols_per_expert(case: &Case) -> usize {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the V4.1 shards and $BLOOMERY_DATA/ref_deepseek41"]
+#[ignore = "hw: needs the box and the V4.1 shards"]
 fn hw_union_wide_matches_per_column_v41() {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let src = R8Source::rows(&split);
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
-    let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
-    let n_tokens = set
-        .shapes
-        .get("ffn_norm-0")
-        .expect("the set has ffn_norm-0")[1];
     let mut host = HostScratch::new(embd, ff, LIST).expect("a scratch of LIST experts");
     let mut us = UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, LIST)
         .expect("a scratch of UNION_MAX_COLS");
@@ -699,7 +691,7 @@ fn hw_union_wide_matches_per_column_v41() {
     let mut routed_spread = true;
     for (l, layer) in &picked {
         let n_expert = layer.n_expert();
-        let x_all = set.f32s(&format!("ffn_norm-{l}"), [embd, n_tokens, 1]);
+        let x_all = v41_x(*l, embd);
         for (k, pool) in WIDE {
             let pool = pool.unwrap_or(n_expert).min(n_expert);
             let case = wide_case(&x_all, embd, k, pool, n_expert);
@@ -902,18 +894,13 @@ fn experts_across_batches(case: &Case) -> usize {
 }
 
 #[test]
-#[ignore = "hw: needs the box, the V4.1 shards and $BLOOMERY_DATA/ref_deepseek41"]
+#[ignore = "hw: needs the box and the V4.1 shards"]
 fn hw_union_tail_matches_batches_v41() {
     let path = workstation::model_v41();
     let split = Split::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
     let src = R8Source::rows(&split);
     let hp = Hparams::read(&split).unwrap_or_else(|e| panic!("hyperparameters of {path}: {e}"));
-    let set = v41set::Set::open(&split, SET);
     let (embd, ff, n_used) = (hp.n_embd, hp.experts.ff, hp.experts.n_used);
-    let n_tokens = set
-        .shapes
-        .get("ffn_norm-0")
-        .expect("the set has ffn_norm-0")[1];
     let mut us = UnionScratch::new_routed(embd, ff, UNION_MAX_COLS, LIST)
         .expect("a scratch of UNION_MAX_COLS");
     let mut tail = UnionScratch::new_tail(embd, ff, UNION_TAIL_MAX_GROUPS, TAIL_SLOTS, LIST)
@@ -941,7 +928,7 @@ fn hw_union_tail_matches_batches_v41() {
     let mut whole_and_cut = true;
     for (l, layer) in &picked {
         let n_expert = layer.n_expert();
-        let x_all = set.f32s(&format!("ffn_norm-{l}"), [embd, n_tokens, 1]);
+        let x_all = v41_x(*l, embd);
         // Each case with whether it runs cut and whether it is a tail's lists.
         let mut cases: Vec<(Case, bool, bool)> = TAILS
             .iter()

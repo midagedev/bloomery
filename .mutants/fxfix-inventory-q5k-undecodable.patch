@@ -1,0 +1,17 @@
+# fxfix mutant inventory-q5k-undecodable
+# clause: every type id the V4.1 set carries is one the crate decodes (gguf-inventory tests::hw_v41_shard_decodable_types)
+# site: the inventory's decoder column says Q5_K (id 13, the set's routed down) has none
+# run: cargo test -p bloomery-gguf --bin gguf-inventory hw_v41_shard_decodable_types -- --ignored
+# red (rc=101): type ids of <first shard> (5 ids) the crate cannot decode: #13 q5_K
+--- a/crates/gguf/src/bin/gguf-inventory.rs
++++ b/crates/gguf/src/bin/gguf-inventory.rs
+@@ -183,7 +183,8 @@
+ /// Whether the crate can decode type `id` to f32: the check `dequant_row`
+ /// itself makes before it dispatches.
+ fn has_decoder(id: u32) -> bool {
+-    GgmlType::from_u32(id).has_dequant()
++    // mutant inventory-q5k-undecodable: Q5_K reads as undecodable.
++    id != 13 && GgmlType::from_u32(id).has_dequant()
+ }
+ 
+ /// The bytes of every tensor of a known size over all shards, or the shard and the tensor at

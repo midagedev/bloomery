@@ -70,6 +70,7 @@ case ${DUMP_DRY:-0} in
   *) echo "dump.sh: DUMP_DRY is 1 (print the dump and stop) or 0 or unset, got '$DUMP_DRY'" >&2; exit 2 ;;
 esac
 fixture_dump_tier dump.sh
+ik_opens_model dump.sh
 BACKEND=${BLOOMERY_REF_BACKEND:-cpu}
 case $BACKEND in
   cpu)  SET=$REF_SET_CPU;  NGL=0;  HIDE_CUDA=1 ;;

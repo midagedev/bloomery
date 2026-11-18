@@ -6,8 +6,11 @@
 // header, one long hex line of ik's activation bytes, then `row R %08x` lines.
 //
 // The GGUF is argv[1], not the reference model: V2-Lite carries no Q5_K
-// tensor. build-qdot-ref.sh passes the V4.1 first shard, whose first Q5_K
-// tensor is blk.0.ffn_down_exps.weight (k = 2304).
+// tensor. build-qdot-ref.sh passes the V4.1 first shard; the scan walks the
+// shards of its split in order (a `-00001-of-` name; any other file is its own
+// set), and the first aligned Q5_K tensor is blk.0.ffn_down_exps.weight
+// (k = 2304; the `bq3km` set's first shard is the header alone, so that is
+// its second shard).
 //
 // The activation column is the first k = 2304 f32 of the attn_norm-0 dump the
 // other x4 harnesses read. That dump is 2048 values per token, so the column
@@ -42,6 +45,23 @@ static const char *kDataDir = ref_data_dir();
 // dequant_ref.cpp's count).
 static const int kDotRows = 64;
 static const int kDequantRows = 4;
+
+// The shard files of the split whose first shard is `first`, in order, as far as they exist: the
+// Rust gate's `shard_paths` (crates/qdot/tests/qdot.rs).
+static std::vector<std::string> shards_of(const std::string &first) {
+    const std::string tag = "-00001-of-";
+    const size_t at = first.find(tag);
+    if (at == std::string::npos) return {first};
+    std::vector<std::string> out;
+    for (int i = 1; i <= 99; ++i) {
+        char idx[16];
+        snprintf(idx, sizeof idx, "-%05d-of-", i);
+        const std::string p = first.substr(0, at) + idx + first.substr(at + tag.size());
+        if (access(p.c_str(), F_OK) != 0) break;
+        out.push_back(p);
+    }
+    return out;
+}
 
 static std::vector<uint8_t> read_range(const char *p, int64_t off, size_t n) {
     FILE *f = fopen(p, "rb");
@@ -80,22 +100,30 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: q5k_x4_ref <model.gguf>  (a file with a Q5_K tensor; V2-Lite has none)\n");
         return 64;
     }
-    const char *path = argv[1];
 
+    // First Q5_K tensor with k % 256 == 0 over the split's shards in order — the same scan the Rust
+    // gate does. `shard` is the file that holds it; a shard with no tensor has no context to scan.
+    std::string shard;
     struct ggml_context *gctx = nullptr;
-    struct gguf_init_params gp = {true, &gctx};
-    struct gguf_context *gguf = gguf_init_from_file(path, gp);
-    if (!gguf || !gctx) { fprintf(stderr, "gguf open failed: %s\n", path); return 1; }
-    const size_t data_off = gguf_get_data_offset(gguf);
-
-    // First Q5_K tensor with k % 256 == 0 — the same scan the Rust gate does.
+    struct gguf_context *gguf = nullptr;
     int pick = -1;
-    for (int i = 0; i < gguf_get_n_tensors(gguf); ++i) {
-        const char *nm = gguf_get_tensor_name(gguf, i);
-        struct ggml_tensor *c = ggml_get_tensor(gctx, nm);
-        if (c && c->type == GGML_TYPE_Q5_K && c->ne[0] % 256 == 0) { pick = i; break; }
+    for (const std::string &candidate : shards_of(argv[1])) {
+        struct ggml_context *c0 = nullptr;
+        struct gguf_init_params gp = {true, &c0};
+        struct gguf_context *g = gguf_init_from_file(candidate.c_str(), gp);
+        if (!g) { fprintf(stderr, "gguf open failed: %s\n", candidate.c_str()); return 1; }
+        for (int i = 0; c0 && i < gguf_get_n_tensors(g); ++i) {
+            const char *nm = gguf_get_tensor_name(g, i);
+            struct ggml_tensor *c = ggml_get_tensor(c0, nm);
+            if (c && c->type == GGML_TYPE_Q5_K && c->ne[0] % 256 == 0) { pick = i; break; }
+        }
+        if (pick >= 0) { gguf = g; gctx = c0; shard = candidate; break; }
+        gguf_free(g);
+        if (c0) ggml_free(c0);
     }
-    if (pick < 0) { fprintf(stderr, "no Q5_K tensor in %s\n", path); return 1; }
+    if (pick < 0) { fprintf(stderr, "no Q5_K tensor in %s or the shards of its split\n", argv[1]); return 1; }
+    const char *path = shard.c_str();
+    const size_t data_off = gguf_get_data_offset(gguf);
     // Copy the name BEFORE freeing: gguf_get_tensor_name points into the
     // context, so a name read after gguf_free is freed memory.
     std::string tensor_name = gguf_get_tensor_name(gguf, pick);

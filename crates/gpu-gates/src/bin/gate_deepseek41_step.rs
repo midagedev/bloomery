@@ -3976,12 +3976,13 @@ mod gate {
                 let (hc, hn) = hc_pre(man, &names::hc_ffn_scale(l))?;
                 let x = named(man, &n("ffn_norm"))?;
                 let h = named(man, &n("ffn_moe_gate_par"))?;
-                // The routed gate·up over the normed input: a q3_K reads ik's q8_K and our q8_1,
-                // an MXFP4 ik's q8_2 (`Q8_2_X4` on the AVX2 build) and our q8_1 (the card's
-                // `mxfp4_gate_up_sel` reads the engine's q8_1; the host's fused dot reads
+                // The routed gate·up over the normed input: a q3_K reads ik's q8_K and our q8_1, an
+                // IQ1_M the same pair (ik's `mul_mat_iq1_m_q8_K`; the card's `iq1_m_gate_up_sel` reads
+                // the engine's q8_1), an MXFP4 ik's q8_2 (`Q8_2_X4` on the AVX2 build) and our q8_1
+                // (the card's `mxfp4_gate_up_sel` reads the engine's q8_1; the host's fused dot reads
                 // 32-value blocks as ik does, inside this).
                 let gate_up = match type_of(split, &names::ffn_gate_exps(l))? {
-                    GgmlType::Q3_K => v_q8(&x, 256) + v_q8(&x, 128),
+                    GgmlType::Q3_K | GgmlType::IQ1_M => v_q8(&x, 256) + v_q8(&x, 128),
                     GgmlType::MXFP4 => v_q8_2(&x) + v_q8(&x, 128),
                     other => {
                         return Err(format!(

@@ -288,7 +288,7 @@ fn blocks_with_nextn_tensors(source: &Split) -> BTreeSet<usize> {
 /// The architecture a source of the family `family` declares: the family itself, or, where it
 /// names a profile fixture (a second fixture of an architecture whose first is the arch's own),
 /// that fixture's architecture.
-fn source_arch(family: &str) -> &str {
+pub fn source_arch(family: &str) -> &str {
     crate::arch::registry::profile_fixture(family).map_or(family, |p| p.arch)
 }
 

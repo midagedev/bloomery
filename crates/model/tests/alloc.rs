@@ -84,6 +84,31 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
+/// Windows of eight calls a steady-state count looks through at most ([`least_calls`]).
+const WINDOWS: usize = 256;
+
+/// The steady state's allocator calls: the least over windows of eight calls of `calls`, after twenty
+/// that fill the pools, and the calls it made in all. A pool worker allocates once, the first time it
+/// claims a unit that needs its thread's scratch (`Combines::slot`'s combine row), and which worker
+/// claims which unit is the claim race's, so with a pool of dozens of workers and two units a call the
+/// first touches run on past the twenty. A call that allocates shows in every window, so the least
+/// is the steady count, and the search stops at the first window with none (it cannot go lower).
+fn least_calls(mut calls: impl FnMut(usize)) -> (u64, u64) {
+    calls(20);
+    let mut made = 20;
+    let mut least = u64::MAX;
+    for _ in 0..WINDOWS {
+        let c0 = CALLS.load(Relaxed);
+        calls(8);
+        made += 8;
+        least = least.min(CALLS.load(Relaxed) - c0);
+        if least == 0 {
+            break;
+        }
+    }
+    (least, made)
+}
+
 /// Allocator calls one single-token step may make, all threads. A ratchet, not a
 /// target: it only moves down.
 ///
@@ -156,9 +181,8 @@ fn hw_steady_step_allocations_bounded() {
 /// dispatches — in a steady state, under flat lanes and under CCD-major lanes
 /// (the legs' `_on` forms take them): the CCD-major dispatch keeps its tables on the
 /// stack, so its calls make no more than the flat ones' (a table made per
-/// dispatch is two allocations a call). Each arm's count is the least of three
-/// repeats of eight calls after twenty that fill the pools, so a worker's
-/// first touch of a scratch is not read as a table.
+/// dispatch is two allocations a call). Each arm's count is [`least_calls`]'s,
+/// so a worker's first touch of a scratch is not read as a table.
 #[test]
 #[ignore = "hw: needs the box; reads no model file"]
 fn hw_a_ccd_dispatch_allocates_no_more_than_a_flat_one() {
@@ -199,12 +223,7 @@ fn hw_a_ccd_dispatch_allocates_no_more_than_a_flat_one() {
     let mut least = [u64::MAX; 2];
     let ccd = Lanes::Ccd(CcdMap::new(threads::pool().threads(), 4, 0));
     for (arm, lanes) in [(0, Lanes::Flat), (1, ccd)] {
-        calls(lanes, 20);
-        for _ in 0..3 {
-            let c0 = CALLS.load(Relaxed);
-            calls(lanes, 8);
-            least[arm] = least[arm].min(CALLS.load(Relaxed) - c0);
-        }
+        least[arm] = least_calls(|n| calls(lanes, n)).0;
     }
     eprintln!(
         "host legs, 8 calls of one-column + 3-column step union: {} allocator calls flat, {} CCD-major",
@@ -393,8 +412,7 @@ const PIN_CALLS: u64 = 0;
 /// The model side of a paged layer's step makes no allocator call of its own:
 /// the legs over a layer with a tier whose slots are all the arena's (so the
 /// one-column leg and the union both pin) make no more calls than the legs
-/// over the same layer with none. Each arm's count is the least of three
-/// repeats of eight calls after twenty that fill the pools.
+/// over the same layer with none. Each arm's count is [`least_calls`]'s.
 #[test]
 #[ignore = "hw: needs the box; reads no model file"]
 fn hw_a_tier_pin_adds_no_allocator_call_to_the_step_legs() {
@@ -425,34 +443,26 @@ fn hw_a_tier_pin_adds_no_allocator_call_to_the_step_legs() {
     let (mut out1, mut out3) = (vec![0.0f32; embd], vec![0.0f32; 3 * embd]);
     IS_MAIN.with(|m| m.set(true));
     let mut least = |host: &HostLayer| {
-        let mut calls = |n: usize| {
+        least_calls(|n| {
             for _ in 0..n {
                 host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs, None, 1)
                     .unwrap();
                 host.experts_step_union_into_on(Lanes::Flat, src, &x3, &refs, &mut out3, &mut us)
                     .unwrap();
             }
-        };
-        calls(20);
-        let mut least = u64::MAX;
-        for _ in 0..3 {
-            let c0 = CALLS.load(Relaxed);
-            calls(8);
-            least = least.min(CALLS.load(Relaxed) - c0);
-        }
-        least
+        })
     };
-    let flat = least(&host);
+    let (flat, _) = least(&host);
     // Every id is the arena's: no host segment, so the union pins too.
     let tier = Arc::new(PoolTier::of(&split, &host, 16));
     host.attach_tier(0, 0..0, tier.clone());
-    let paged = least(&host);
+    let (paged, made) = least(&host);
     eprintln!(
         "step legs, 8 calls of one-column + 3-column step union: {flat} allocator calls with no tier, {paged} with one"
     );
     assert_eq!(
         tier.pins.load(Relaxed),
-        2 * (20 + 3 * 8),
+        2 * made,
         "the arm's legs took one pin each call"
     );
     assert!(
@@ -474,7 +484,7 @@ const MISS_CALLS: u64 = 0;
 /// makes no more allocator calls than [`MISS_CALLS`] a call over the same
 /// layer with no tier. The arm proves it took that path: every union call was
 /// issued a pending ticket and its hits were lent while the misses were in
-/// flight. Counts are the least of three repeats of eight calls after twenty.
+/// flight. Counts are [`least_calls`]'s.
 #[test]
 #[ignore = "hw: needs the box; reads no model file"]
 fn hw_a_step_with_misses_pins_the_allocator_calls_of_its_miss_path() {
@@ -505,34 +515,26 @@ fn hw_a_step_with_misses_pins_the_allocator_calls_of_its_miss_path() {
     let (mut out1, mut out3) = (vec![0.0f32; embd], vec![0.0f32; 3 * embd]);
     IS_MAIN.with(|m| m.set(true));
     let mut least = |host: &HostLayer| {
-        let mut calls = |n: usize| {
+        least_calls(|n| {
             for _ in 0..n {
                 host.experts_into_on(Lanes::Flat, src, &x, &lists[0], &mut out1, &mut hs, None, 1)
                     .unwrap();
                 host.experts_step_union_into_on(Lanes::Flat, src, &x3, &refs, &mut out3, &mut us)
                     .unwrap();
             }
-        };
-        calls(20);
-        let mut least = u64::MAX;
-        for _ in 0..3 {
-            let c0 = CALLS.load(Relaxed);
-            calls(8);
-            least = least.min(CALLS.load(Relaxed) - c0);
-        }
-        least
+        })
     };
-    let flat = least(&host);
+    let (flat, _) = least(&host);
     // The union lists ids 0 3 5 6 8 9 10 11 13 14: four are late, six are hits.
     let tier = Arc::new(PoolTier::of(&split, &host, 16).late(&[5, 8, 11, 14]));
     host.attach_tier(0, 0..0, tier.clone());
-    let missed = least(&host);
+    let (missed, made) = least(&host);
     eprintln!(
         "step legs, 8 calls of one-column + 3-column step union: {flat} allocator calls with no tier, {missed} with misses"
     );
     assert_eq!(
         tier.pending.load(Relaxed),
-        20 + 3 * 8,
+        made,
         "every union call of the arm was issued a pending ticket: the arm took the miss path"
     );
     assert!(
@@ -569,7 +571,7 @@ fn hw_a_one_column_miss_allocates_nothing() {
     let mut out = vec![0.0f32; embd];
     IS_MAIN.with(|m| m.set(true));
     let mut least = |host: &HostLayer, resident: bool| {
-        let mut calls = |n: usize| {
+        least_calls(|n| {
             for _ in 0..n {
                 if resident {
                     host.experts_into_on(
@@ -588,23 +590,15 @@ fn hw_a_one_column_miss_allocates_nothing() {
                         .unwrap();
                 }
             }
-        };
-        calls(20);
-        let mut least = u64::MAX;
-        for _ in 0..3 {
-            let c0 = CALLS.load(Relaxed);
-            calls(8);
-            least = least.min(CALLS.load(Relaxed) - c0);
-        }
-        least
+        })
     };
-    let flat = least(&host, false);
+    let (flat, _) = least(&host, false);
     let tier = Arc::new(PoolTier::of(&split, &host, 16).late(&[5]));
     host.attach_tier(0, 0..0, tier.clone());
-    let missed = least(&host, true);
+    let (missed, made) = least(&host, true);
     assert_eq!(
         tier.pending.load(Relaxed),
-        20 + 3 * 8,
+        made,
         "every one-column call was issued a pending ticket"
     );
     assert!(

@@ -1,0 +1,16 @@
+# fxfix mutant alloc-resident-column
+# clause: the one-column miss allocates nothing (crates/model/tests/alloc.rs hw_a_one_column_miss_allocates_nothing)
+# site: crates/model/src/moe.rs experts_into_on, the resident-column branch — one heap allocation per call
+# run: cargo test --release -p bloomery-model --test alloc -- --ignored --exact hw_a_one_column_miss_allocates_nothing
+# red: "the one-column miss made 1 allocator calls over 8 calls ..." now in every window, so least_calls cannot reach 0
+--- a/crates/model/src/moe.rs
++++ b/crates/model/src/moe.rs
+@@ -3237,6 +3237,8 @@
+         if self.tier.is_some()
+             && let Some(union) = union
+         {
++            // mutant alloc-resident-column: one allocation per resident-column call.
++            std::hint::black_box(Vec::<u8>::with_capacity(64));
+             return self
+                 .serve_column_resident(lanes, split, x, experts, out, scratch, union, columns);
+         }

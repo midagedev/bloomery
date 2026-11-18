@@ -19,15 +19,15 @@
 #            A waiver nothing needs any more is a note of `check`; drop it.
 deepseek2	68	2	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
 deepseek41	2597	3	3120	budget=PIN(2026-11-14): grandfathered at the day's real_s of 2597 s plus a fifth, to the next 10 s; a cut lowers it | main=PIN(2026-11-14): main by the maintainer
-flint	71	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+flint	71	0	300	
 exaone-moe	421	0	510	budget=PIN(2026-11-14): grandfathered at the day's real_s of 421 s plus a fifth, to the next 10 s; a cut lowers it
 gemma-embedding	67	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
 gemma-embedding2	132	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
 gemma4a	140	1	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
 gemma4v	4	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
 glm5next	2299	2	2760	budget=PIN(2026-11-14): grandfathered at the day's real_s of 2299 s plus a fifth, to the next 10 s; a cut lowers it | ship=PIN(2026-11-14): main family; its serve gate and its two-card gate both block a release (the 2026-11-12 release marks) | main=PIN(2026-11-14): main by the maintainer
-lfm3	4	1	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
-llama	95	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+lfm3	4	1	300	
+llama	95	0	300	
 mimo2	875	0	1050	budget=PIN(2026-11-14): grandfathered at the day's real_s of 875 s plus a fifth, to the next 10 s; a cut lowers it
 minicpmv47	41	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
 minimax-m3	1412	0	1700	budget=PIN(2026-11-14): grandfathered at the day's real_s of 1412 s plus a fifth, to the next 10 s; a cut lowers it
@@ -40,7 +40,7 @@ qwen38d	41	0	300	-
 qwen3moe	789	0	950	budget=PIN(2026-11-14): grandfathered at the day's real_s of 789 s plus a fifth, to the next 10 s; a cut lowers it
 qwen4exp	3413	1	4100	budget=PIN(2026-11-14): grandfathered at the day's real_s of 3413 s plus a fifth, to the next 10 s; a cut lowers it | ship=PIN(2026-11-14): main family; its serve gate and its two-card gate both block a release (the 2026-11-12 release marks) | main=PIN(2026-11-14): main by the maintainer
 solar-open2	382	0	460	budget=PIN(2026-11-14): grandfathered at the day's real_s of 382 s plus a fifth, to the next 10 s; a cut lowers it
-raon1	111	0	300	fixture=PIN(2026-11-14): predates the budget rule; no fixture conversion yet
+raon1	111	0	300	
 muse-spark	3894	0	4680	budget=PIN(2026-11-14): grandfathered at the day's real_s of 3894 s plus a fifth, to the next 10 s; a cut lowers it
 mistral-large4	2373	0	2850	budget=PIN(2026-11-14): grandfathered at the day's real_s of 2373 s plus a fifth, to the next 10 s; a cut lowers it
 kimi-k3	6	10	300	-

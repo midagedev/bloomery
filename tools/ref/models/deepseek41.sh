@@ -212,6 +212,17 @@ V41_SET_SUFFIX=
 # rule; the fixture family names them `fx_ref_deepseek41_…`, tools/ref/dump.sh puts the prefix on).
 [ "${BLOOMERY_TIER:-real}" != fixture ] || V41_SET_SUFFIX=
 MODEL=${BLOOMERY_REF_MODEL:-$V41_MODEL}
+# ik_refusal <file>: why ik_llama.cpp cannot open this V4.1 file, or nothing. ik reads the engram layers from the KV
+# `deepseek41.engram.layer_ids`, in the first shard's header; the newer schema (the public bq3km file) carries none, and ik stops
+# with "key not found: deepseek41.engram.layer_ids". So no real-file ik set exists for that file, and dump-ref-v41
+# and ik-greedy-ds41 refuse it (tools/ref/ref-paths.sh ik_opens_model); V4.1's ik comparison is the fixture sets
+# (`BLOOMERY_TIER=fixture just dump-ref-fixture deepseek41`, the fx_ref_deepseek41_* families).
+ik_refusal() {
+  # The key is read from the output, not from a pipe status: a `grep -q` that exits early would SIGPIPE `head` under pipefail.
+  [ -z "$(head -c 33554432 "$1" | grep -aoF deepseek41.engram.layer_ids | head -n 1)" ] || return 0
+  echo "its header has no KV deepseek41.engram.layer_ids (the engram schema ik predates): the real-file ik sets retired, the fixture sets cover V4.1's ik comparison"
+  return 1
+}
 DSPARK_MODEL=${BLOOMERY_DSPARK_MODEL:-/models/DeepSeek-V4.1-Flash-DSpark/DeepSeek-V4.1-Flash-Fp8-128x742M-MXFP4_MOE.tl37.gguf}
 : "${IK_GPU_ENV=GGML_CUDA_NO_PINNED_WEIGHTS=1}"
 : "${LCPP:=/home/user/llama.cpp-v41}"

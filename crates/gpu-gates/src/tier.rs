@@ -2277,11 +2277,15 @@ mod tests {
         ))
         .unwrap();
         assert!(!rows.is_empty(), "the shipped table names no variant");
+        let mut planned = 0;
         for row in &rows {
+            let arch = model::fixture::variant_source_arch(&row.family);
+            let spec = model::arch::registry::fixture_spec(arch)
+                .unwrap_or_else(|| panic!("variant {}: no fixture spec for {arch}", row.tag));
             let keys = [
                 (
                     gguf::GENERAL_ARCHITECTURE.into(),
-                    Value::String(row.family.clone()),
+                    Value::String(arch.to_string()),
                 ),
                 (KEY_CARD_BUDGET.into(), Value::U64(base)),
                 (
@@ -2290,12 +2294,30 @@ mod tests {
                 ),
             ];
             write_fixture(&path, 1, &keys);
-            let error = header_budget(&Split::open(&path).unwrap())
+            let read = header_budget(&Split::open(&path).unwrap());
+            if let model::fixture::CardBudget::Fixed(_) = spec.card_budget {
+                assert_eq!(
+                    read.unwrap(),
+                    Some(HeaderBudget {
+                        recorded: base,
+                        card_set_aside: 0
+                    }),
+                    "variant {}: a fixed family keeps the trunk's value",
+                    row.tag
+                );
+                continue;
+            }
+            planned += 1;
+            let error = read
                 .expect_err("a planned family's variant is held to its own plan")
                 .to_string();
             assert!(error.contains(&row.tag), "{error}");
             assert!(error.contains(&path.display().to_string()), "{error}");
         }
+        assert!(
+            planned > 0,
+            "the shipped table names no planned family's variant"
+        );
         // A fixed family records one value for trunk and variant alike: nothing is replanned.
         let keys = [
             (

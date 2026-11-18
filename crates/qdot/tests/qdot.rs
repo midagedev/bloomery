@@ -1059,11 +1059,12 @@ fn hw_q5f1_dot_row_matches_scalar_and_predicts_ik() {
 }
 
 // ------------------------------------------------------- Q5_K x Q8_2_X4
-// The reference model carries no Q5_K tensor; the V4.1 file's first shard holds
-// blk.0.ffn_down_exps.weight (k = 2304). The strict `Gguf::open` refuses that shard (its
-// token_embd is bf16), so the tensor is found through the header-only inventory and its rows
-// are read at `data_base + offset`. Gates 0, A and B are the triple the other x4 types carry,
-// one test each so that one broken kernel shows every gate it breaks.
+// The reference model carries no Q5_K tensor; the V4.1 split set's first shard that holds one carries
+// blk.0.ffn_down_exps.weight (k = 2304; the second shard of the `bq3km` set, whose first shard is
+// the header alone). The strict `Gguf::open` refuses a shard with a bf16 token_embd, so the tensor
+// is found through each shard's header-only inventory and its rows are read at `data_base + offset`.
+// Gates 0, A and B are the triple the other x4 types carry, one test each so that one broken
+// kernel shows every gate it breaks.
 
 /// The first Q5_K tensor with k % 256 == 0 — the scan `tools/ref/q5k_x4_ref.cpp` does.
 struct Q5kCase {
@@ -1084,14 +1085,24 @@ impl Q5kCase {
 
 fn load_q5k(rows: usize) -> Q5kCase {
     use std::os::unix::fs::FileExt;
-    // The V4.1 first shard ([`gguf::v41::model`]); `BLOOMERY_Q5K_MODEL` overrides it.
-    let path = std::env::var("BLOOMERY_Q5K_MODEL").unwrap_or_else(|_| gguf::v41::model());
-    let inv = gguf::inventory_of(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let t = inv
-        .tensors
-        .iter()
-        .find(|t| t.type_id == GgmlType::Q5_K.as_u32() && t.dims[0].is_multiple_of(256))
-        .unwrap_or_else(|| panic!("{path} carries no aligned Q5_K tensor"));
+    // The V4.1 set whose first shard is [`gguf::v41::model`]; `BLOOMERY_Q5K_MODEL` overrides it. The
+    // scan walks the set's shards in order, as `tools/ref/q5k_x4_ref.cpp` does.
+    let first = std::env::var("BLOOMERY_Q5K_MODEL").unwrap_or_else(|_| gguf::v41::model());
+    let (path, inv, t) = shard_paths(&first)
+        .into_iter()
+        .find_map(|path| {
+            let inv = gguf::inventory_of(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let t = inv
+                .tensors
+                .iter()
+                .find(|t| t.type_id == GgmlType::Q5_K.as_u32() && t.dims[0].is_multiple_of(256))?
+                .clone();
+            Some((path, inv, t))
+        })
+        .unwrap_or_else(|| {
+            panic!("{first} (and the shards of its split) carries no aligned Q5_K tensor")
+        });
+    let t = &t;
     let k = t.dims[0] as usize;
     let n = t.dims[1..].iter().product::<u64>() as usize;
     let row_bytes = 176 * k / 256;
@@ -5367,9 +5378,9 @@ fn hw_q8k_codes_at_subnormal_scales() {
 
 /// Rows of the first `ty` tensor of the V4.1 split set whose name contains
 /// `prefer` (the host expert stack of that type), from the first shard on
-/// that carries one — the first shard holds only block 0, whose routed down
-/// is Q5_K — read at `data_base + offset` from the header-only inventory
-/// (the strict `Gguf::open` refuses the first shard's bf16 `token_embd`):
+/// that carries one (the routed down of block 0 is Q5_K) — read at
+/// `data_base + offset` from the header-only inventory (the strict
+/// `Gguf::open` refuses a shard with a bf16 `token_embd`):
 /// (name, k, row bytes, the first `rows` rows).
 fn v41_rows(ty: GgmlType, prefer: &str, rows: usize) -> (String, usize, usize, Vec<u8>) {
     let block = match ty {
@@ -5380,6 +5391,18 @@ fn v41_rows(ty: GgmlType, prefer: &str, rows: usize) -> (String, usize, usize, V
         _ => panic!("no tile row source for {ty:?}"),
     };
     split_rows(&gguf::v41::model(), ty, block, 256, prefer, rows)
+}
+
+/// The shard files of the split set whose first shard is `first` (a name with `-00001-of-`), in order,
+/// as far as they exist; any other name is its own one-file set.
+fn shard_paths(first: &str) -> Vec<String> {
+    match first.find("-00001-of-") {
+        Some(at) => (1..=99)
+            .map(|i| format!("{}-{i:05}-of-{}", &first[..at], &first[at + 10..]))
+            .take_while(|p| std::path::Path::new(p).exists())
+            .collect(),
+        None => vec![first.to_string()],
+    }
 }
 
 /// [`v41_rows`] for any split set named by one of its shards (`first`, or the
@@ -5393,13 +5416,7 @@ fn split_rows(
     rows: usize,
 ) -> (String, usize, usize, Vec<u8>) {
     use std::os::unix::fs::FileExt;
-    let shards: Vec<String> = match first.find("-00001-of-") {
-        Some(at) => (1..=99)
-            .map(|i| format!("{}-{i:05}-of-{}", &first[..at], &first[at + 10..]))
-            .take_while(|p| std::path::Path::new(p).exists())
-            .collect(),
-        None => vec![first.to_string()],
-    };
+    let shards = shard_paths(first);
     for path in &shards {
         let inv = gguf::inventory_of(path).unwrap_or_else(|e| panic!("{path}: {e}"));
         let Some(t) = inv
@@ -5726,7 +5743,7 @@ fn hw_q4k_tile_matches_dot_row() {
     eprintln!("q4k tile: {name} (k = {k}): {calls} calls, bit-identical");
 }
 
-/// Q5_K tile clause: the V4.1 first shard's routed down stack on ik's dumped
+/// Q5_K tile clause: the V4.1 set's routed down stack on ik's dumped
 /// column (the Q5_K harness's) and the seeded ones — tile = `dot_row` per
 /// column, bit for bit.
 #[test]
