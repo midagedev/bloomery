@@ -31,7 +31,7 @@
 use cuda_core::{CudaStream, DeviceBuffer};
 use runtime::sched::{At, BatchOrder, Overlap, Port, PortKind, Refused};
 
-use super::batch::{BatchKey, ServeTimes, UnionCols};
+use super::batch::{BATCH_SETS, BatchKey, ServeTimes, UnionCols};
 use super::{HostExperts, HostTier};
 use crate::GpuError;
 use std::ops::Range;
@@ -199,7 +199,7 @@ impl UnitShape<'_> {
 /// more than two units (the port has two exchange sets).
 fn refuse_open(
     o: Overlap,
-    order: BatchOrder,
+    (order, sets): (BatchOrder, usize),
     cap: usize,
     shape: &UnitShape<'_>,
 ) -> Result<(), GpuError> {
@@ -213,12 +213,12 @@ fn refuse_open(
             ),
         });
     }
-    if order == BatchOrder::Fronts && o.units > 2 {
+    if order == BatchOrder::Fronts && o.units > sets {
         return Err(GpuError::Shape {
             what: WHAT_BATCH,
             detail: format!(
-                "a walk of {} units in the {order:?} order; the port has two exchange sets, \
-                 which hold the fronts of two units at most",
+                "a walk of {} units in the {order:?} order; the port has {sets} exchange sets, \
+                 which hold the fronts of {sets} units at most",
                 o.units
             ),
         });
@@ -473,7 +473,8 @@ impl<H: HostExperts> Port for BatchLeg<'_, H> {
     /// caller leaves nothing of an earlier walk in flight); any other point
     /// is refused by name.
     fn open_ordered(&mut self, o: Overlap, order: BatchOrder) -> Result<(), GpuError> {
-        refuse_open(o, order, self.cap, &self.shape())?;
+        let sets = self.hybrid.batch_sets().max(BATCH_SETS);
+        refuse_open(o, (order, sets), self.cap, &self.shape())?;
         self.cols = o.cols;
         self.hybrid.begin_group()
     }
@@ -560,7 +561,7 @@ mod tests {
         }
 
         fn open_ordered(&mut self, o: Overlap, order: BatchOrder) -> Result<(), GpuError> {
-            refuse_open(o, order, self.cap, &self.shape)?;
+            refuse_open(o, (order, BATCH_SETS), self.cap, &self.shape)?;
             self.shape.cols = o.cols;
             self.port.begin();
             Ok(())
@@ -641,15 +642,20 @@ mod tests {
         let ahead = BatchOrder::Ahead;
         let none = UnitShape::default();
         for units in [1, 2, 3, 8] {
-            refuse_open(walk(units, 512), ahead, 512, &none)
+            refuse_open(walk(units, 512), (ahead, BATCH_SETS), 512, &none)
                 .unwrap_or_else(|e| panic!("a walk of {units} units: {e}"));
         }
         let cols = |c| UnitShape {
             unit_cols: Some(c),
             ..UnitShape::default()
         };
-        refuse_open(walk(3, 512), ahead, 512, &cols(&[512, 512, 1]))
-            .expect("three units, the last of one column");
+        refuse_open(
+            walk(3, 512),
+            (ahead, BATCH_SETS),
+            512,
+            &cols(&[512, 512, 1]),
+        )
+        .expect("three units, the last of one column");
         let refused = [
             (walk(0, 512), none, "0 units of 512 columns"),
             (walk(2, 0), none, "2 units of 0 columns"),
@@ -667,7 +673,7 @@ mod tests {
             ),
         ];
         for (o, shape, want) in refused {
-            let e = refuse_open(o, ahead, 512, &shape).expect_err(want);
+            let e = refuse_open(o, (ahead, BATCH_SETS), 512, &shape).expect_err(want);
             assert!(e.to_string().contains(want), "{want}: {e}");
         }
     }
@@ -685,13 +691,19 @@ mod tests {
             unit_rows: Some(r),
             ..UnitShape::default()
         };
-        refuse_open(walk(2, 256), ahead, 512, &rows(&[0..256, 256..512]))
-            .expect("two halves of the block");
-        refuse_open(walk(2, 3), ahead, 5, &rows(&[0..3, 3..5])).expect("an odd block");
+        refuse_open(
+            walk(2, 256),
+            (ahead, BATCH_SETS),
+            512,
+            &rows(&[0..256, 256..512]),
+        )
+        .expect("two halves of the block");
+        refuse_open(walk(2, 3), (ahead, BATCH_SETS), 5, &rows(&[0..3, 3..5]))
+            .expect("an odd block");
         let whole = 0..512;
         refuse_open(
             walk(1, 512),
-            ahead,
+            (ahead, BATCH_SETS),
             512,
             &rows(std::slice::from_ref(&whole)),
         )
@@ -715,29 +727,38 @@ mod tests {
             ),
         ];
         for (o, shape, want) in refused {
-            let e = refuse_open(o, ahead, 512, &shape).expect_err(want);
+            let e = refuse_open(o, (ahead, BATCH_SETS), 512, &shape).expect_err(want);
             assert!(e.to_string().contains(want), "{want}: {e}");
         }
     }
 
     /// The fronts order holds the fronts of its units in flight beside each
-    /// other: one unit or two fit the port's two sets, three are refused by
-    /// name; the other order takes any group.
+    /// other, one exchange set a unit: one unit or two fit the default port's
+    /// two sets, three are refused by name, and a port of eight sets holds a
+    /// walk of eight; the other order takes any group.
     #[test]
-    fn the_fronts_order_is_refused_past_two_units() {
+    fn the_fronts_order_is_refused_past_the_ports_sets() {
         let none = UnitShape::default();
+        let fronts = (BatchOrder::Fronts, BATCH_SETS);
         for units in [1, 2] {
-            refuse_open(walk(units, 512), BatchOrder::Fronts, 512, &none)
+            refuse_open(walk(units, 512), fronts, 512, &none)
                 .unwrap_or_else(|e| panic!("{units} units in the fronts order: {e}"));
         }
         for units in [3, 8] {
-            let e = refuse_open(walk(units, 512), BatchOrder::Fronts, 512, &none)
-                .expect_err("the fronts order of more than two units");
+            let e = refuse_open(walk(units, 512), fronts, 512, &none)
+                .expect_err("the fronts order of more units than sets");
             let want = format!("{units} units in the Fronts order");
             assert!(e.to_string().contains(&want), "{want}: {e}");
-            refuse_open(walk(units, 512), BatchOrder::Ahead, 512, &none)
-                .unwrap_or_else(|e| panic!("{units} units ahead: {e}"));
+            refuse_open(
+                walk(units, 512),
+                (BatchOrder::Ahead, BATCH_SETS),
+                512,
+                &none,
+            )
+            .unwrap_or_else(|e| panic!("{units} units ahead: {e}"));
         }
+        refuse_open(walk(8, 512), (BatchOrder::Fronts, 8), 512, &none)
+            .unwrap_or_else(|e| panic!("8 units over eight sets: {e}"));
     }
 
     /// A unit's key is its own rows of the block: the walk's columns from row

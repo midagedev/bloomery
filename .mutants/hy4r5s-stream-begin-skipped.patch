@@ -1,0 +1,13 @@
+--- a/crates/gpu-hy4/src/batch/pass.rs	2026-11-19 08:41:16
++++ b/crates/gpu-hy4/src/batch/pass.rs	2026-11-19 08:41:16
+@@ -1185,6 +1185,10 @@
+         };
+         // Read once: the call keeps no row, so the history does not move until its end.
+         let history = p.shell.hybrid.call_history(start);
++        // MUTANT hy4r5s-stream-begin-skipped: the call's stream never opens.
++        if history || !history {
++            return Ok(history);
++        }
+         self.xs.stream.begin(
+             &mut p.shell.hybrid,
+             stream,

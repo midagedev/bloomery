@@ -122,6 +122,7 @@ pub mod served;
 pub mod shell;
 pub mod slots;
 pub mod step;
+pub mod stream_side;
 pub mod swap;
 pub mod swap_source;
 pub mod tier;
@@ -2557,20 +2558,44 @@ impl<H: HostExperts> HostTier<H> {
     /// Load-time or first-prompt only; a port already made for another `cap`
     /// is refused by name.
     pub fn prepare_batch(&mut self, ctx: &Arc<CudaContext>, cap: usize) -> Result<(), GpuError> {
-        match self.port.as_ref().map(BatchPort::cap) {
+        self.prepare_batch_sets(ctx, cap, batch::BATCH_SETS)
+    }
+
+    /// [`HostTier::prepare_batch`] with `sets` exchange sets
+    /// ([`BatchPort::with_sets`]): a walk of `sets` units whose fronts all go
+    /// ahead of the serves. A port already made for another `cap` or another
+    /// count of sets is refused by name.
+    pub fn prepare_batch_sets(
+        &mut self,
+        ctx: &Arc<CudaContext>,
+        cap: usize,
+        sets: usize,
+    ) -> Result<(), GpuError> {
+        match self.port.as_ref().map(|p| (p.cap(), p.sets())) {
             None => {
                 let h = self.step.boundary.layout.handoff();
-                self.port = Some(BatchPort::new(ctx, h.hidden, h.n_used, cap)?);
+                self.port = Some(BatchPort::with_sets(ctx, (h.hidden, h.n_used, cap), sets)?);
             }
-            Some(made) if made != cap => {
+            Some(made) if made != (cap, sets) => {
                 return Err(GpuError::shape(
                     "HostTier::prepare_batch",
-                    format!("the batch port holds blocks of {made} tokens, asked for {cap}"),
+                    format!(
+                        "the batch port holds blocks of {} tokens in {} sets, asked for {cap} in \
+                         {sets}",
+                        made.0, made.1
+                    ),
                 ));
             }
             Some(_) => {}
         }
         self.prepare_tier_batch()
+    }
+
+    /// The batch port's exchange sets, the most downloads a walk holds in
+    /// flight; 0 before [`HostTier::prepare_batch`] made the port.
+    #[must_use]
+    pub fn batch_sets(&self) -> usize {
+        self.port.as_ref().map_or(0, BatchPort::sets)
     }
 
     /// The batch port, once [`HostTier::prepare_batch`] has made it.

@@ -68,7 +68,7 @@ use crate::step::{ATTN_NORM, ATTN_OUT, ENGRAM_OUT, FFN_NORM, FFN_OUT, HC_ATTN_OU
 
 mod pass;
 
-pub use pass::{PASS_ROWS, PassShape, PlacedPass, SHAPES, pass_bytes, prompt_placed};
+pub use pass::{PASS_ROWS, PassShape, PlacedPass, SHAPES, WALK_UNITS, pass_bytes, prompt_placed};
 
 /// What this file's refusals name.
 const WHAT: &str = "hy4::batch";

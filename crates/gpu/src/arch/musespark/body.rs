@@ -91,11 +91,11 @@ mod seq;
 mod stream;
 mod tier;
 
+use crate::host::stream_side::StreamSide;
 pub use placed::Placed;
 use placed::{PlacedOpen, StepWalk, plan_map};
 use prefill::{PASS_ROWS_MAX, PassSizes, Prompt, choose_pass_rows, placed_rows};
 pub use stream::STREAM_FLOOR;
-use stream::XSide;
 
 const WHAT: &str = "musespark::Body::load";
 const STEP: &str = "musespark::Body::enqueue_chain";
@@ -573,7 +573,7 @@ pub struct Body {
     /// The prompt pass's buffers ([`GpuModel::prefill`]).
     prompt: Prompt,
     /// The prompt calls' host streaming ([`stream`]).
-    xs: XSide,
+    xs: StreamSide,
     /// What a saved sequence belongs to ([`seq`]).
     who: Identity,
 }
@@ -970,7 +970,7 @@ impl Body {
             taps: None,
             placed,
             prompt,
-            xs: XSide::default(),
+            xs: StreamSide::default(),
             who: Identity::of_load("musespark", file, gpu, ctx)?,
         })
     }

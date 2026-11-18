@@ -72,6 +72,19 @@
 //!   (`.mutants/hy4res-map-copy-fresh.patch`), so the handoff and the pass read the load's places
 //!   while the slots hold the reseeded experts, moves every hosted layer's sum and the rows far
 //!   past the band.
+//! - `placed_pass_streams`: the plan with the stream's ring at its floor
+//!   (`hy4_pass::streaming_for`) loaded under a `mid` word with walks of [`STREAM_SHAPE`] (several
+//!   units in the fronts order), `BLOOMERY_XSTREAM=split` set and the rule driven to stream
+//!   ([`SPLIT_COSTS`]); set `e` repeated to [`STREAM_IDS`] ids, one walk: the call streams experts
+//!   (`streamed` > 0 in its records), the end counts the layers' sum, every streamed layer's ring
+//!   pass joins its streamed experts once a unit and no other layer's joins, the host leaves out
+//!   exactly the streamed columns (the census's `streamed`, `picks` = `card` + `file`), each unit
+//!   is served once a hosted layer, and each layer's attention and feed-forward block run alone by
+//!   the whole-card decode chain on the walk's own rows stand within [`ATTN_BAND`] and
+//!   [`FFN_BAND`] (clauses `streamed_attention_is_decode`, `streamed_ffn_is_decode`): a streamed
+//!   expert's rows the card's sum leaves out move every streamed layer far past the band.
+//!   FAIL-first (box), the call's stream never opened (`.mutants/hy4r5s-stream-begin-skipped.patch`):
+//!   `streamed` 0, red.
 //!
 //! The prompt sets only supply ids: the vendor's dumps are not read as an oracle here. The fixture
 //! tier only: the released file (124 GB) does not fit one card and this gate opens the whole-card
@@ -114,6 +127,7 @@ mod gate {
     use crate::placed_load::{self, CTX as PLACED_CTX, HOST_CFG};
     use crate::residency_clauses;
     use bloomery_gpu::host::served::TierBody;
+    use bloomery_gpu::host::xstream::{Costs, XLayer, XMode, XReport, XStreamBody};
     use bloomery_gpu::latent::POOL;
     use bloomery_gpu::{Gpu, GpuModel};
     use bloomery_gpu_gates::hy4_pass;
@@ -156,6 +170,20 @@ mod gate {
     const BIG: usize = 4200;
     /// The ids of the placed pass's census prompt: three walks of the pass's rows (512, 512, 76).
     const PLACED_IDS: usize = 1_100;
+    /// The streaming clause's walks: four units of a quarter of the pass's rows, so a walk of the
+    /// fronts order holds four units in flight and its last is short.
+    const STREAM_SHAPE: PassShape = PassShape::walk(PASS_ROWS / 4, 4);
+    /// The streaming clause's ids: one walk of [`STREAM_SHAPE`] whose last unit is short.
+    const STREAM_IDS: usize = STREAM_SHAPE.walk_rows() - 12;
+    /// The streaming clause's fixed rule input: a host column of a tenth of a second, so the
+    /// stream's floor sits under one column and every host expert a unit routes streams until the
+    /// ring's half or the balance cuts it.
+    const SPLIT_COSTS: Costs = Costs {
+        host_us_per_col: 1.0e5,
+        host_us_fixed: 240.0,
+        card_us_fixed: 90.0,
+        card_us_per_col: 2.0,
+    };
     /// The decode steps after a prompt that read its stores.
     const CONT_STEPS: usize = 8;
     /// Positions of every store: the big prompt and the continuation.
@@ -738,7 +766,152 @@ mod gate {
             drop(pm);
             ok &= placed_residency_follows_the_map((&plan, &pass_inputs), e, &off)?;
         }
+        ok &= placed_pass_streams(m, (&inputs, &machine), e)?;
         Ok(ok)
+    }
+
+    /// Clause `placed_pass_streams` (the module header): `m` the whole-card model whose decode chain
+    /// the forced halves run on, `inputs` and `machine` the fixture's, `e` set `e`'s ids.
+    fn placed_pass_streams(
+        m: &mut GpuModel<Body>,
+        (inputs, machine): (&PlanInputs, &model::placement::Machine),
+        e: &[u32],
+    ) -> Result<bool, GateError> {
+        const CLAUSE: &str = "placed_pass_streams";
+        if !tier::run_clause(CLAUSE, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let ctx = usize::try_from(PLACED_CTX)?;
+        let pass_inputs = hy4_pass::streaming_for(inputs, ctx, STREAM_SHAPE)?;
+        let levers = placed_load::levers(&pass_inputs, machine, Tier::Fixture)?;
+        let plan = pass_inputs.plan(machine, PLACED_CTX, &levers)?;
+        let residency = residency_clauses::mid_of(&plan.n_l).ok_or_else(|| {
+            format!("{CLAUSE}: no routed layer holds a pinned expert, a spare and a moving slot")
+        })?;
+        let mut sm = Body::open_placed_with(
+            open_split(Arch::Hy4, RECIPE)?,
+            (&plan, &pass_inputs),
+            0,
+            HOST_CFG,
+            (Some(STREAM_SHAPE), residency),
+        )?;
+        let hosted = sm.body(NAME)?.hosted_layers();
+        {
+            let (gpu, _w, body) = sm.body_parts(NAME)?;
+            body.set_xstream(gpu, XMode::Split)?;
+            body.set_xstream_costs(SPLIT_COSTS)?;
+            println!(
+                "{CLAUSE} load shape={STREAM_SHAPE:?} hosted_layers={hosted} xstream={}",
+                body.xstream_word()
+            );
+            body.pass_mut()
+                .ok_or("the placed load carries its pass")?
+                .arm_taps(gpu)?;
+        }
+        let ids = repeated(e, STREAM_IDS);
+        sm.reset()?;
+        let (s0, c0) = census_of(&sm)?;
+        prompt_placed(&mut sm, &ids)?;
+        let (s1, c1) = census_of(&sm)?;
+        let (xlayers, xend, joined) = {
+            let body = sm.body_parts(NAME)?.2;
+            let (xlayers, xend) = body.take_xstream_records();
+            (xlayers, xend, body.take_stream_joined())
+        };
+        // The walk's own rows, which the forced halves run the decode chain on.
+        let decode_ok = forced_is_decode(
+            m,
+            "e",
+            &ids,
+            ("streamed", &mut |_m, ids| {
+                let pass = sm
+                    .body(NAME)?
+                    .pass()
+                    .ok_or("the placed load carries its pass")?;
+                Ok(pass.taps(sm.gpu().stream(), ids.len())?)
+            }),
+        )?;
+        let units = STREAM_IDS.div_ceil(STREAM_SHAPE.rows);
+        let records_ok = stream_records_add_up(&xlayers, xend.as_ref(), &joined, units);
+        let streamed: usize = xlayers.iter().map(|(_, x)| x.streamed).sum();
+        let columns: u64 = xlayers.iter().map(|(_, x)| x.streamed_columns).sum();
+        let served = s1.batch_served - s0.batch_served;
+        let left_out = c1.streamed - c0.streamed;
+        let (picks, card, file) = (c1.picks - c0.picks, c1.card - c0.card, c1.file - c0.file);
+        let want_served = (hosted * units) as u64;
+        let census_ok = streamed > 0
+            && left_out == columns
+            && left_out <= card
+            && picks == card + file
+            && served == want_served;
+        println!(
+            "{CLAUSE} ids={STREAM_IDS} units={units} streamed={streamed} streamed_columns={columns}              left_out={left_out} picks={picks} card={card} file={file} batch_served={served} (want              {want_served}) records={} {}",
+            verdict(records_ok),
+            verdict(census_ok)
+        );
+        let ok = decode_ok && records_ok && census_ok;
+        println!("{CLAUSE} {}", verdict(ok));
+        Ok(ok)
+    }
+
+    /// The host tier's service counters and census of `m` since its load.
+    fn census_of(
+        m: &GpuModel<Body>,
+    ) -> Result<
+        (
+            bloomery_gpu::host::HybridStats,
+            bloomery_gpu::host::census::TierCensus,
+        ),
+        GateError,
+    > {
+        let b = m.body(NAME)?;
+        let stats = b
+            .host_stats()
+            .ok_or("a placed load carries the host tier")?;
+        let census = b
+            .host_census()
+            .ok_or("the host tier counts no reads, so the stream's census has no picks to hold")?;
+        Ok((stats, census))
+    }
+
+    /// One streaming call's records `xlayers` and `xend` and its ring passes `joined` (walk, layer,
+    /// experts joined) over walks of `units` units: every streamed layer's ring pass joined its
+    /// streamed experts once a unit, no other layer's did, and the end counts the layers' sum. Each
+    /// disagreement is printed by name.
+    fn stream_records_add_up(
+        xlayers: &[(usize, XLayer)],
+        xend: Option<&XReport>,
+        joined: &[(usize, usize, usize)],
+        units: usize,
+    ) -> bool {
+        let mut want: Vec<(usize, usize, usize)> = xlayers
+            .iter()
+            .filter(|(_, x)| x.streamed > 0)
+            .flat_map(|(w, x)| std::iter::repeat_n((*w, x.layer, x.streamed), units))
+            .collect();
+        let mut got = joined.to_vec();
+        want.sort_unstable();
+        got.sort_unstable();
+        let mut bad = Vec::new();
+        if got != want {
+            bad.push(format!(
+                "joins {got:?}, the streamed layers' a unit {want:?}"
+            ));
+        }
+        let streamed: usize = xlayers.iter().map(|(_, x)| x.streamed).sum();
+        let layers = xlayers.iter().filter(|(_, x)| x.streamed > 0).count();
+        match xend {
+            Some(r) if r.streamed == streamed && r.layers == layers => {}
+            Some(r) => bad.push(format!(
+                "the end counts {} experts over {} layers, the layers {streamed} over {layers}",
+                r.streamed, r.layers
+            )),
+            None => bad.push("no stream end recorded".to_string()),
+        }
+        for b in &bad {
+            println!("  placed_pass_streams records: {b}");
+        }
+        bad.is_empty()
     }
 
     /// Clause `placed_residency_follows_the_map` (the module header): `off` the history of the
@@ -757,7 +930,7 @@ mod gate {
             (plan, pass_inputs),
             0,
             HOST_CFG,
-            (Some(PASS_ROWS), residency),
+            (Some(PassShape::of(PASS_ROWS)), residency),
         )?;
         let layers = {
             let b = mm.body(NAME)?;

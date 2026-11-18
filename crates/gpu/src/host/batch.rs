@@ -53,6 +53,10 @@ pub(super) const SERVE_BATCH: &str = "Hybrid::serve_batch";
 /// What the port's refusals name.
 const PORT: &str = "BatchPort";
 
+/// The exchange sets a port holds unless it is made for more
+/// ([`BatchPort::with_sets`]): a tier's side holds a leg for each.
+pub const BATCH_SETS: usize = 2;
+
 /// Which layer-batch a set holds ([`BatchPort::download`],
 /// [`BatchPort::serve`], [`BatchPort::upload`]): model layer `layer` of the
 /// group's batch `set`, the batch's tokens `at .. u` of its block. Two
@@ -225,16 +229,17 @@ pub struct TierBatchStats {
     pub skipped: u64,
 }
 
-/// The two sets, and the set the next download, serve and upload take: each
-/// of the three goes through the sets in turn, so a serve takes the set of
-/// the oldest download not served yet.
+/// The exchange sets (two, or one a unit of a walk whose every unit's front
+/// goes ahead of the serves, [`BatchPort::with_sets`]), and the set the next
+/// download, serve and upload take: each of the three goes through the sets
+/// in turn, so a serve takes the set of the oldest download not served yet.
 ///
 /// Each set owns the event its download records, and a serve waits on the
 /// event of the set whose buffers it reads: a serve that waited on a shared
 /// event would wait for the next batch's route too — the same bits with the
 /// overlap gone. Nothing outside this port names a set's event.
 pub struct BatchPort {
-    sets: [Set; 2],
+    sets: Vec<Set>,
     /// Each tier's side, in tier order ([`BatchPort::attach_tier`]).
     tiers: Vec<TierPort>,
     n_embd: usize,
@@ -338,6 +343,24 @@ impl BatchPort {
         n_used: usize,
         cap: usize,
     ) -> Result<BatchPort, GpuError> {
+        BatchPort::with_sets(ctx, (n_embd, n_used, cap), BATCH_SETS)
+    }
+
+    /// [`BatchPort::new`] with `sets` sets: a walk whose units' fronts all go
+    /// ahead of the serves ([`runtime::sched::BatchOrder::Fronts`]) holds one
+    /// download a unit in flight. Refused by name: fewer than two sets.
+    /// Load-time only.
+    pub fn with_sets(
+        ctx: &Arc<CudaContext>,
+        (n_embd, n_used, cap): (usize, usize, usize),
+        sets: usize,
+    ) -> Result<BatchPort, GpuError> {
+        if sets < BATCH_SETS {
+            return Err(GpuError::shape(
+                "BatchPort::with_sets",
+                format!("{sets} exchange sets; a port holds {BATCH_SETS} or more"),
+            ));
+        }
         let pinned = |what: &'static str, n: usize| {
             PinnedHostBuffer::<f32>::zeroed(ctx, n).map_err(|source| GpuError::Driver {
                 op: Some(what),
@@ -360,7 +383,7 @@ impl BatchPort {
             })
         };
         Ok(BatchPort {
-            sets: [set()?, set()?],
+            sets: (0..sets).map(|_| set()).collect::<Result<_, _>>()?,
             tiers: Vec::new(),
             n_embd,
             n_used,
@@ -378,6 +401,7 @@ impl BatchPort {
     /// the `t`-th call's. Load-time only; past [`super::slots::MAX_TIERS`]
     /// tiers it is refused by name.
     pub fn attach_tier(&mut self, stage: &Arc<CudaContext>, tier: &Gpu) -> Result<(), GpuError> {
+        self.refuse_tier_past_two("BatchPort::attach_tier")?;
         let legs = [
             self.leg(stage, Some(tier.context()))?,
             self.leg(stage, Some(tier.context()))?,
@@ -412,6 +436,7 @@ impl BatchPort {
                 ),
             ));
         }
+        self.refuse_tier_past_two("BatchPort::attach_node")?;
         let legs = [self.leg(stage, None)?, self.leg(stage, None)?];
         self.tiers.push(TierPort {
             legs,
@@ -463,10 +488,31 @@ impl BatchPort {
         })
     }
 
+    /// A tier's side holds two legs, one a set: a port of more sets is
+    /// refused by name as `what`.
+    fn refuse_tier_past_two(&self, what: &'static str) -> Result<(), GpuError> {
+        if self.sets.len() == BATCH_SETS {
+            return Ok(());
+        }
+        Err(GpuError::shape(
+            what,
+            format!(
+                "a tier's legs on a port of {} exchange sets; a tier holds a leg for each of {BATCH_SETS}",
+                self.sets.len()
+            ),
+        ))
+    }
+
     /// Tokens a block of this port holds at most.
     #[must_use]
     pub fn cap(&self) -> usize {
         self.cap
+    }
+
+    /// The port's exchange sets: the most downloads it holds in flight.
+    #[must_use]
+    pub fn sets(&self) -> usize {
+        self.sets.len()
     }
 
     /// Host bytes the tiers' legs hold, summed over the tiers: per set its
@@ -490,7 +536,7 @@ impl BatchPort {
         })
     }
 
-    /// Both sets free, the next download into the first: at a group's
+    /// Every set free, the next download into the first: at a group's
     /// start. Host bookkeeping only; the sets are next written by the group's
     /// downloads, when neither card's stream holds a copy of an earlier group
     /// (the group's prologue waits for the stage's stream; a group that
@@ -700,7 +746,7 @@ impl BatchPort {
         }
         set.routed.record(stream)?;
         set.stage = Stage::Routed(key);
-        self.down ^= 1;
+        self.down = (self.down + 1) % self.sets.len();
         Ok(())
     }
 
@@ -873,7 +919,7 @@ impl BatchPort {
             issued,
         )?;
         set.stage = Stage::Served(key);
-        self.serve ^= 1;
+        self.serve = (self.serve + 1) % self.sets.len();
         Ok(times)
     }
 
@@ -1054,7 +1100,7 @@ impl BatchPort {
         // enqueued after this copy, since the set is free from here on.
         unsafe { htod(stream, hsum, &set.sum, at * n..u * n)? };
         set.stage = Stage::Free;
-        self.up ^= 1;
+        self.up = (self.up + 1) % self.sets.len();
         Ok(())
     }
 }

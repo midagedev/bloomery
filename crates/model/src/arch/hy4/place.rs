@@ -13,7 +13,9 @@
 //! The plan serves the placed load (`crates/gpu-hy4`): the dense trunk, the head and each routed
 //! layer's card share of experts (the id prefix the budget holds) on the stage card, the rest on
 //! the host tier. A load that runs its prompt as the placed pass reserves the pass's card bytes
-//! ([`PlanInputs::with_prompt_reserve`]); one that steps its prompt reserves none. The plan hangs no
+//! ([`PlanInputs::with_prompt_reserve`]); one that steps its prompt reserves none. A pass whose
+//! prompt calls stream their host experts (`BLOOMERY_XSTREAM=split`) also reserves the stream's ring
+//! at its floor ([`stream_ring`], [`PlanInputs::streaming`]). The plan hangs no
 //! expert tier card; the engram table and the token embedding stay in the file, a token's rows read
 //! on the host.
 
@@ -22,7 +24,10 @@ use runtime::stores::{Access, F16_BYTES, PosBuf, PosLayout};
 
 use super::hparams::Hparams;
 use super::spec;
-use crate::arch::place_hybrid;
+use crate::arch::names::routed_stacks;
+use crate::arch::place_hybrid::{
+    self, RingPass, StreamRing, ring_forms_planned, stream_slot_bytes,
+};
 use crate::placement::{PlacementError, kernels};
 
 pub use place_hybrid::{KvLayout, PlaceError};
@@ -67,6 +72,46 @@ impl PlanInputs {
         let rooms = hp.pos_layout();
         Ok(PlanInputs::new(ENGINE, hp, read.tensors, read.spec)?.with_rooms(rooms))
     }
+}
+
+/// The slots of each half of the expert stream's ring a streaming plan keeps room for
+/// ([`stream_ring`]) [derived: a walk of [`crate::moe::UNION_TAIL_MAX_COLS`] rows routes each of a
+/// layer's 512 experts about 128 columns, past the stream rule's crossover (about 32 to 45 columns
+/// on the card the rule prices), so nearly all of a layer's host experts would stream and the
+/// pass's rate grows with the half; the half is the widest whose two halves, beside the walk's own
+/// buffers, cost the decode at most 3 % of its rate (each card gigabyte the plan reserves is about
+/// 31 MB of host experts read a token)].
+pub const STREAM_HALF_SLOTS: u64 = 220;
+
+/// The rows the ring pass runs a launch: a unit of the placed pass's walk, the host union's widest
+/// unit.
+pub const STREAM_RING_ROWS: usize = crate::moe::UNION_MAX_COLS;
+
+/// The facts the one ring rule takes ([`StreamRing`]): the floor [`STREAM_HALF_SLOTS`], a slot the
+/// widest routed layer's expert ([`stream_slot_bytes`]) and the ring pass's GEMM buffers at
+/// [`STREAM_RING_ROWS`] rows of the experts' latent in the forms the routed stacks read
+/// ([`ring_forms_planned`]). Refused by name as the rule refuses.
+pub fn stream_ring(inputs: &PlanInputs) -> Result<StreamRing, PlacementError> {
+    let hp = &inputs.hp;
+    Ok(StreamRing {
+        floor: STREAM_HALF_SLOTS,
+        slot: stream_slot_bytes(&inputs.model, routed_stacks, hp.experts.n_expert as u64)?,
+        pass: RingPass {
+            rows: STREAM_RING_ROWS,
+            n_used: hp.experts.n_used,
+            n: hp.latent,
+            ff: hp.experts.ff,
+            forms: ring_forms_planned(&inputs.model, routed_stacks),
+        },
+    })
+}
+
+/// The card bytes the prompt calls' expert stream takes on a Hy4 load (`BLOOMERY_XSTREAM=split`):
+/// the ring at its floor ([`StreamRing::bytes`] of [`stream_ring`]). Refused by name as the rule
+/// refuses.
+pub fn stream_bytes(inputs: &PlanInputs) -> Result<u64, PlacementError> {
+    let ring = stream_ring(inputs)?;
+    Ok(ring.bytes(ring.floor))
 }
 
 /// The name of a sparse-attention layer's cached rows in a room's refusal and the plan's lines.

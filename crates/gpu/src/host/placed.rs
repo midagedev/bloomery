@@ -456,7 +456,22 @@ impl PlacedHost {
     /// its prompt as passes makes them once, and they also serve its one-column step. Load-time
     /// only.
     pub fn prepare_pass_rows(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
-        self.shell.hybrid.prepare_batch(gpu.context(), rows)?;
+        self.prepare_pass_walk(gpu, (rows, 1))
+    }
+
+    /// [`PlacedHost::prepare_pass_rows`] for walks of `units` units of up to `rows` rows each
+    /// whose fronts all go ahead of the serves ([`crate::host::xstream::GROUP_WALK_ORDER`]): one
+    /// exchange set a unit, two at least ([`crate::host::HostTier::prepare_batch_sets`]).
+    /// Load-time only.
+    pub fn prepare_pass_walk(
+        &mut self,
+        gpu: &Gpu,
+        (rows, units): (usize, usize),
+    ) -> Result<(), GpuError> {
+        let sets = units.max(crate::host::batch::BATCH_SETS);
+        self.shell
+            .hybrid
+            .prepare_batch_sets(gpu.context(), rows, sets)?;
         self.shell.hybrid.host_mut().prepare_union(rows)?;
         gpu.stream().synchronize()?;
         Ok(())

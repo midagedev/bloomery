@@ -95,8 +95,8 @@ impl Family for Hy4 {
 
     /// The widest pass shape the seat's plan holds at `ctx` ([`hy4_pass::pick`]) on the seat's
     /// machine (no expert tier card hangs, so one machine serves every shape), and its open
-    /// ([`Body::open_placed_with`] on stage card 0 with the shape's rows, under the seat's
-    /// residency); or why no shape fits.
+    /// ([`Body::open_placed_with`] on stage card 0 with the shape, under the seat's residency); or
+    /// why no shape fits.
     ///
     /// [`Body::open_placed_with`]: bloomery_gpu_hy4::Body::open_placed_with
     fn pass(
@@ -114,8 +114,8 @@ impl Family for Hy4 {
         let plan = PassPlan {
             inputs: hy4_pass::inputs_for(inputs, ctx, shape)?,
             machine,
-            rows: (shape.rows, shape.q_rows),
-            wider: wider.map(|(w, short)| ((w.rows, w.q_rows), short)),
+            rows: (shape.walk_rows(), shape.q_rows),
+            wider: wider.map(|(w, short)| ((w.walk_rows(), w.q_rows), short)),
         };
         Ok(Ok((
             plan,
@@ -125,7 +125,7 @@ impl Family for Hy4 {
                     (plan, inputs),
                     0,
                     host,
-                    (Some(shape.rows), residency),
+                    (Some(shape), residency),
                 )
             }),
         )))

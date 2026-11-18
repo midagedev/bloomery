@@ -1,39 +1,59 @@
-//! The placed prompt pass: up to [`PASS_ROWS`] consecutive prompt positions of a placed load
-//! (some of the routed layers' experts on the host tier) walked layer by layer as one unit over
-//! the host tier's batch port, so each hosted layer's host experts are read once for every row
-//! ([`BatchLeg`]: one download, one union serve, one upload) and not once a row, as the decode step
-//! does. The walk is the common `sched::walk` of `(1, rows, Batch)`; what it leaves in the stores
-//! is what the prompt batch ([`super::prompt`]) leaves, and each row is the placed step's
-//! feed-forward block up to rounding (the experts' sum is `card + host`, the card's slots one
-//! grouped GEMM over the rows).
+//! The placed prompt pass: consecutive prompt positions of a placed load (some of the routed
+//! layers' experts on the host tier) walked layer by layer over the host tier's batch port in units
+//! of up to [`PASS_ROWS`] rows, so each hosted layer's host experts are read once for every row of
+//! a unit ([`BatchLeg`]: one download, one union serve, one upload a unit) and not once a row, as
+//! the decode step does. A walk is the common `sched::walk` of `(units, rows, Batch)` in the
+//! fronts order ([`GROUP_WALK_ORDER`]): every unit's front ahead of the serves, one exchange set a
+//! unit; what it leaves in the stores is what the prompt batch ([`super::prompt`]) leaves, and
+//! each row is the placed step's feed-forward block up to rounding (the experts' sum is
+//! `card + host`, the card's slots one grouped GEMM over the unit's rows).
 //!
 //! A layer the card holds whole runs the whole-card block of [`super::ffn`] over the rows; a
 //! hosted routed layer runs it in three parts around the host's serve, in the host leg's order:
 //!
 //! - **front**: the identity mix's fold and the feed-forward norm, the router over the rows, the
-//!   latent down into the rows the host reads, the card's places of every slot
-//!   ([`PlacedSide::places_rows`]) and the download of the latent rows, weights and ids
-//!   ([`PlacedSide::download_rows`]);
-//! - **shadow**, under the host's work: the shared expert, and the card's slots as one grouped GEMM
-//!   over the layer's card stacks, whose table is the route over the card's slot ids and leaves the
-//!   host's slots out ([`PlacedSide::remap_row`], `enqueue_route_remap`), summed in slot order over
-//!   the slots the card holds;
-//! - **back**: the card's and the host's sums added (the routed sum is linear in the experts'
-//!   rows), the latent up, the shared expert added, the sandwich norm and the identity mix's post.
+//!   latent down into the rows the host reads and the download of the latent rows, weights and
+//!   ids ([`PlacedSide::download_rows`]);
+//! - **shadow**, under the host's work: the shared expert; under host streaming the layer's pick
+//!   (the common owner's, [`PromptStream::unit_pick`](bloomery_gpu::host::prompt_stream::PromptStream::unit_pick): the first unit picks for the walk, the later
+//!   units read its pick); the card's places of every slot ([`PlacedSide::places_rows`]) and the
+//!   card's slots as one grouped GEMM over the layer's card stacks, whose table is the route over
+//!   the card's slot ids and leaves the host's slots out ([`PlacedSide::remap_row`],
+//!   `enqueue_route_remap`); the streamed experts' slots as the common ring pass over the stream's
+//!   ring ([`RingPass::enqueue`]); all summed in slot order over the slots the card holds, by the
+//!   stream's union places when the ring ran (the stage's below `n_card`, `n_card + i` for the
+//!   `i`-th streamed expert, so a streamed expert's rows join the sum where a host expert's would);
+//! - **back**: the stream's join taken ([`PromptStream::unit_join`](bloomery_gpu::host::prompt_stream::PromptStream::unit_join)), the card's and the host's
+//!   sums added (the routed sum is linear in the experts' rows), the latent up, the shared expert
+//!   added, the sandwich norm and the identity mix's post.
 //!
-//! The pass's buffers are the prompt batch's at a call of `rows` rows in one unit, beside the host's
-//! sums, the layer's map, the slots' places and the card slots' route tables ([`PlacedPass`]); the
-//! plan reserves their bytes ([`pass_bytes`]) and the load holds them to it.
+//! The pass's buffers are the prompt batch's at a walk of `units` units of `rows` rows (the
+//! streams a walk wide, the rest a unit wide), each later unit's rows from its front to its back
+//! ([`UnitRows`], lent into the batch's buffers for the unit's parts), the host's sums, the layer's
+//! map, the slots' places and the card slots' route tables ([`PlacedPass`]); the plan reserves
+//! their bytes ([`pass_bytes`]) and the load holds them to it. The stream's ring is the plan's ring
+//! term ([`model::arch::hy4::place::stream_ring`]), made at the stream's start.
 
+use bloomery_gpu::card_leg::LegStacks;
 use bloomery_gpu::card_slots::CardAcc;
 use bloomery_gpu::gemm::{GEMM_MAX_SLOTS, GemmRoute, RouteSet};
 use bloomery_gpu::hc_ident::{HC, HeadArgs, MIX};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::census::TierCensus;
+use bloomery_gpu::host::costs::ExpertShape;
 use bloomery_gpu::host::placed::{PlacedHost, PlacedSide};
+use bloomery_gpu::host::prompt_stream::ADMIT_FLOOR;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::prompt_pass;
+use bloomery_gpu::host::stream_side::RingShape;
+use bloomery_gpu::host::stream_side::{RingPass, RingRows, StreamSide};
+use bloomery_gpu::host::swap::{CallPick, CallReport};
+use bloomery_gpu::host::swap_source::DEADLINE;
+use bloomery_gpu::host::xstream::{
+    Costs, GROUP_WALK_ORDER, XCfg, XLayer, XMode, XReport, XStreamBody,
+};
 use bloomery_gpu::host::{BatchLeg, HybridStats};
+use bloomery_gpu::kquant::Act;
 use bloomery_gpu::latent::{INDEX_HEAD, POOL};
 use bloomery_gpu::routed_block::{RouteIn, RoutedRows, RouterEntry};
 use bloomery_gpu::site::WideForms;
@@ -42,7 +62,8 @@ use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::hy4::hparams::Hparams;
 use model::arch::hy4::names::{self, Sub};
-use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
+use model::arch::place_hybrid::RingForms;
+use runtime::sched::{self, At, BatchOrder, LayerProgram, Overlap, PortKind};
 
 use super::{
     Buf, Cfg, Env, ExpertIo, FFN_NORM, FFN_OUT, L_OUT, N_EXPERT, N_USED, Prompt, Q_MAX, Span, WHAT,
@@ -57,47 +78,99 @@ pub const PASS_ROWS: usize = model::moe::UNION_MAX_COLS;
 /// What this file's refusals name.
 const PASS: &str = "hy4 placed pass";
 
-/// A pass shape: the rows of one pass and the rows of its attention chunk (the engram and attention
-/// sub-layers run `q_rows` rows a launch).
+/// A pass shape: the rows of a unit, the rows of its attention chunk (the engram and attention
+/// sub-layers run `q_rows` rows a launch) and the units a walk holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PassShape {
     pub rows: usize,
     pub q_rows: usize,
+    pub units: usize,
 }
 
 impl PassShape {
-    /// The shape of a pass of `rows` rows.
+    /// The shape of a pass of one unit of `rows` rows.
     #[must_use]
     pub const fn of(rows: usize) -> PassShape {
         PassShape {
             rows,
             q_rows: if rows < Q_MAX { rows } else { Q_MAX },
+            units: 1,
         }
+    }
+
+    /// The shape of a walk of `units` units of `rows` rows each.
+    #[must_use]
+    pub const fn walk(rows: usize, units: usize) -> PassShape {
+        PassShape {
+            units,
+            ..PassShape::of(rows)
+        }
+    }
+
+    /// The rows a walk of the shape holds: its units' rows.
+    #[must_use]
+    pub const fn walk_rows(&self) -> usize {
+        self.rows * self.units
     }
 }
 
-/// The shapes a plan may hold, widest first: the host union's widest unit down to the narrowest
-/// the card's room may be left with. A narrower pass reads each hosted layer's experts once for
-/// fewer rows.
-pub const SHAPES: [PassShape; 4] = [
+/// The units of the widest walk: the host union's widest group of columns over its widest unit
+/// ([`model::moe::UNION_TAIL_MAX_COLS`], [`PASS_ROWS`]), the walk a layer's host experts stream
+/// over when the stream's rule sends them to the card.
+pub const WALK_UNITS: usize = model::moe::UNION_TAIL_MAX_COLS / PASS_ROWS;
+
+/// The shapes a plan may hold, widest first: the widest walk, then one unit of the host union's
+/// widest unit down to the narrowest the card's room may be left with. A narrower pass reads each
+/// hosted layer's experts once for fewer rows.
+pub const SHAPES: [PassShape; 5] = [
+    PassShape::walk(PASS_ROWS, WALK_UNITS),
     PassShape::of(PASS_ROWS),
     PassShape::of(PASS_ROWS / 2),
     PassShape::of(PASS_ROWS / 4),
     PassShape::of(PASS_ROWS / 8),
 ];
 
-/// The prompt batch's geometry for a pass of `rows` rows: one walk, one unit. Refused by name:
-/// no rows, or more than [`PASS_ROWS`].
-fn pass_cfg(rows: usize) -> Result<Cfg, GpuError> {
+// A walk's units start on an attention chunk, so the stage's chunk bases index them.
+const _: () = assert!(PASS_ROWS.is_multiple_of(Q_MAX));
+const _: () = assert!(WALK_UNITS >= 1);
+
+/// The prompt batch's geometry for walks of `shape`: the streams a walk wide, the rest a unit
+/// wide. Refused by name: a unit of no rows or more than [`PASS_ROWS`], no units, units that do
+/// not start on an attention chunk, and a walk past the prompt batch's rows.
+fn pass_cfg(shape: PassShape) -> Result<Cfg, GpuError> {
+    let PassShape {
+        rows,
+        q_rows,
+        units,
+    } = shape;
     if !(1..=PASS_ROWS).contains(&rows) {
         return Err(GpuError::shape(
             PASS,
-            format!("a pass of {rows} rows: 1 to {PASS_ROWS} rows"),
+            format!("a pass of {rows} rows a unit: 1 to {PASS_ROWS} rows"),
+        ));
+    }
+    if units == 0 || (units > 1 && !rows.is_multiple_of(q_rows)) {
+        return Err(GpuError::shape(
+            PASS,
+            format!(
+                "a walk of {units} units of {rows} rows in attention chunks of {q_rows}: one \
+                 unit or more, each starting on a chunk"
+            ),
+        ));
+    }
+    if shape.walk_rows() > Cfg::PROMPT.cap {
+        return Err(GpuError::shape(
+            PASS,
+            format!(
+                "a walk of {} rows: at most the prompt batch's {}",
+                shape.walk_rows(),
+                Cfg::PROMPT.cap
+            ),
         ));
     }
     Ok(Cfg {
-        cap: rows,
-        q_rows: PassShape::of(rows).q_rows,
+        cap: shape.walk_rows(),
+        q_rows,
         ffn_rows: rows,
     })
 }
@@ -105,20 +178,21 @@ fn pass_cfg(rows: usize) -> Result<Cfg, GpuError> {
 // The unit's slots fit one grouped GEMM.
 const _: () = assert!(PASS_ROWS * N_USED <= GEMM_MAX_SLOTS);
 
-/// The device bytes a placed pass of `rows` rows holds on a load of `ctx` positions, never below
+/// The device bytes a placed pass of `shape` holds on a load of `ctx` positions, never below
 /// what [`PlacedPass::new`] makes: the plan's prompt reserve ([`PlanInputs::with_prompt_reserve`]),
 /// which the load holds the made bytes to. Every buffer of the prompt batch at the pass's
-/// geometry, counted by the widths it is allocated at; the quantized forms the stacks and sites
-/// read are counted in both of the forms the kernels have (the file's types pick one, which the
-/// plan cannot read), so the bound sits a few megabytes over the made bytes at 512 rows.
+/// geometry, counted by the widths it is allocated at, and the later units' rows a walk holds
+/// ([`UnitRows`]); the quantized forms the stacks and sites read are counted in both of the forms
+/// the kernels have (the file's types pick one, which the plan cannot read), so the bound sits a
+/// few megabytes over the made bytes at 512 rows a unit.
 ///
 /// # Errors
-/// [`GpuError`] by name for a pass of no row or past [`PASS_ROWS`], and a shape the body is not
-/// built for.
+/// [`GpuError`] by name for a shape [`pass_cfg`] refuses, and a shape the body is not built for.
 ///
 /// [`PlanInputs::with_prompt_reserve`]: model::arch::place_hybrid::PlanInputs::with_prompt_reserve
-pub fn pass_bytes(hp: &Hparams, ctx: usize, rows: usize) -> Result<u64, GpuError> {
-    let cfg = pass_cfg(rows)?;
+pub fn pass_bytes(hp: &Hparams, ctx: usize, shape: PassShape) -> Result<u64, GpuError> {
+    let rows = shape.rows;
+    let cfg = pass_cfg(shape)?;
     let sh = Shape::of(hp, ctx)?;
     let (n, q) = (sh.hidden, cfg.q_rows);
     let (cap, r) = (cfg.cap, q.max(cfg.ffn_rows));
@@ -196,15 +270,26 @@ pub fn pass_bytes(hp: &Hparams, ctx: usize, rows: usize) -> Result<u64, GpuError
     let routes = GemmRoute::bytes_at(r, 1) + (1 + routed) * GemmRoute::bytes_at(slots, N_EXPERT);
     // The host's sums, the layer's map and the slots' places.
     let beside = rows * sh.latent * 4 + N_EXPERT * 4 + rows * N_USED * 4;
-    let total = 4 * f32s + 4 * u32s + 2 * u16s + 4 * gather + wide + experts + routes + beside;
+    // Each later unit's rows from its front to its back: the norm's output and the mix, the
+    // latent rows, the router's weights and ids.
+    let later = (shape.units - 1) * 4 * (r * n + r * MIX + r * sh.latent + 2 * slots);
+    let total =
+        4 * f32s + 4 * u32s + 2 * u16s + 4 * gather + wide + experts + routes + beside + later;
     u64::try_from(total).map_err(|_| GpuError::shape(PASS, "a pass past u64 bytes"))
 }
 
-/// The placed pass's buffers: the prompt batch at the pass's geometry, the host's sums, the layer's
-/// map of its experts' places, the places of the unit's routed slots and the route tables of the
-/// hosted layers' card slots. Held for the load's life.
+/// The placed pass's buffers: the prompt batch at the pass's geometry, each later unit's rows, the
+/// host's sums, the layer's map of its experts' places, the places of a unit's routed slots and the
+/// route tables of the hosted layers' card slots. Held for the load's life.
 pub struct PlacedPass {
     prompt: Prompt,
+    shape: PassShape,
+    /// The rows units `1 ..` of a walk hold from a hosted layer's front to its back, lent into the
+    /// prompt batch's buffers for each of the unit's parts; unit 0 holds the batch's own.
+    later: Vec<UnitRows>,
+    /// The form the stream's ring pass reads the hosted layers' card stacks in; `None` when they
+    /// hold no card experts or are not of one form a route GEMM entry reads.
+    forms: Option<RingForms>,
     /// The host's sums of the unit's rows, in the latent's width, which the batch leg lands them in.
     hsum: DeviceBuffer<f32>,
     /// A hosted layer's row of the slot map: each expert's place in the card's stacks, or `HOST`.
@@ -218,6 +303,74 @@ pub struct PlacedPass {
     bytes: usize,
 }
 
+/// A unit's rows a hosted layer's front leaves for its shadow and back while the walk's other units
+/// run theirs: the feed-forward norm's output and the identity mix (the shared expert's input and
+/// the post's), the latent rows the host and the card's slots read, and the router's weights and
+/// ids. Each is a buffer of the prompt batch's own length, swapped in for the unit's parts.
+struct UnitRows {
+    xn: DeviceBuffer<f32>,
+    mix: DeviceBuffer<f32>,
+    lat: DeviceBuffer<f32>,
+    weights: DeviceBuffer<f32>,
+    ids: DeviceBuffer<u32>,
+}
+
+impl UnitRows {
+    /// Buffers of `buf`'s lengths. Load-time only.
+    fn like(stream: &CudaStream, buf: &Buf) -> Result<UnitRows, GpuError> {
+        Ok(UnitRows {
+            xn: DeviceBuffer::zeroed(stream, buf.xn.len())?,
+            mix: DeviceBuffer::zeroed(stream, buf.mix.len())?,
+            lat: DeviceBuffer::zeroed(stream, buf.lat.len())?,
+            weights: DeviceBuffer::zeroed(stream, buf.weights.len())?,
+            ids: DeviceBuffer::zeroed(stream, buf.ids.len())?,
+        })
+    }
+
+    /// Swap these rows with `buf`'s: before a unit's part its own, after it the batch's back.
+    fn swap(&mut self, buf: &mut Buf) {
+        std::mem::swap(&mut self.xn, &mut buf.xn);
+        std::mem::swap(&mut self.mix, &mut buf.mix);
+        std::mem::swap(&mut self.lat, &mut buf.lat);
+        std::mem::swap(&mut self.weights, &mut buf.weights);
+        std::mem::swap(&mut self.ids, &mut buf.ids);
+    }
+
+    fn bytes(&self) -> usize {
+        self.xn.num_bytes()
+            + self.mix.num_bytes()
+            + self.lat.num_bytes()
+            + self.weights.num_bytes()
+            + self.ids.num_bytes()
+    }
+}
+
+/// The one form of the card stacks of `side`'s hosted layers that hold card experts, as the ring
+/// pass reads them ([`RingForms::of`]); `None` when no layer holds card experts or two differ.
+/// Refused by name: a hosted layer's stacks missing from `w`.
+fn ring_forms(
+    w: &Weights,
+    body: &crate::body::Body,
+    side: &PlacedSide,
+) -> Result<Option<RingForms>, GpuError> {
+    let mut seen: Option<Option<RingForms>> = None;
+    for l in side.hosted_set() {
+        let Ffn::Routed { stacks, .. } = &body.layers[l].ffn else {
+            continue;
+        };
+        if side.n_card(l) == 0 {
+            continue;
+        }
+        let st = LegStacks::of(w, [&stacks[0], &stacks[1], &stacks[2]])?;
+        let forms = RingForms::of(st.gate_up_ty(), st.down_ty());
+        seen = Some(match seen {
+            None => forms,
+            Some(s) => s.filter(|_| s == forms),
+        });
+    }
+    Ok(seen.flatten())
+}
+
 /// The card counts of `side`'s hosted layers that hold experts on the card.
 fn hosted_counts(side: &PlacedSide) -> impl Iterator<Item = usize> + '_ {
     side.hosted_set()
@@ -227,27 +380,39 @@ fn hosted_counts(side: &PlacedSide) -> impl Iterator<Item = usize> + '_ {
 }
 
 impl PlacedPass {
-    /// The pass's buffers for `rows` rows over `body`'s layers and `side`'s hosted layers. Load-time
-    /// only.
+    /// The pass's buffers for walks of `shape` over `body`'s layers and `side`'s hosted layers.
+    /// Load-time only.
     pub(crate) fn new(
         gpu: &Gpu,
         w: &Weights,
         body: &crate::body::Body,
         side: &PlacedSide,
-        rows: usize,
+        shape: PassShape,
     ) -> Result<PlacedPass, GpuError> {
-        let cfg = pass_cfg(rows)?;
+        let rows = shape.rows;
+        let cfg = pass_cfg(shape)?;
         let prompt = Prompt::new(gpu, w, body, cfg)?;
         let stream = gpu.stream();
+        let later = (1..shape.units)
+            .map(|_| UnitRows::like(stream, &prompt.buf))
+            .collect::<Result<Vec<_>, _>>()?;
+        let forms = ring_forms(w, body, side)?;
         let hsum = DeviceBuffer::zeroed(stream, rows * body.sh.latent)?;
         let map = DeviceBuffer::zeroed(stream, N_EXPERT)?;
         let sel = DeviceBuffer::zeroed(stream, rows * N_USED)?;
         let slots = cfg.ffn_rows * N_USED;
         let routes = RouteSet::new(stream, slots, hosted_counts(side))?;
-        let bytes =
-            prompt.bytes() + hsum.num_bytes() + map.num_bytes() + sel.num_bytes() + routes.bytes();
+        let bytes = prompt.bytes()
+            + later.iter().map(UnitRows::bytes).sum::<usize>()
+            + hsum.num_bytes()
+            + map.num_bytes()
+            + sel.num_bytes()
+            + routes.bytes();
         Ok(PlacedPass {
             prompt,
+            shape,
+            later,
+            forms,
             hsum,
             map,
             sel,
@@ -256,10 +421,16 @@ impl PlacedPass {
         })
     }
 
-    /// The rows a pass holds.
+    /// The rows a pass holds: its walk's.
     #[must_use]
     pub fn rows(&self) -> usize {
         self.prompt.cfg.cap
+    }
+
+    /// The pass's shape.
+    #[must_use]
+    pub fn shape(&self) -> PassShape {
+        self.shape
     }
 
     /// Arm the pass's taps: every later walk copies every stage ([`crate::TAP_STAGES`]) of every
@@ -280,66 +451,132 @@ impl PlacedPass {
     }
 }
 
-/// The pass's walk `(1, rows, Batch)`: layer `l`'s attention (and engram site) over the rows, then
-/// its feed-forward block whole, or as the front, shadow and back around the host's serve.
+/// The pass's walk `(units, rows, Batch)`: each unit's layer `l` attention (and engram site) over
+/// its rows, then its feed-forward block whole, or as the front, shadow and back around the host's
+/// serve, in the fronts order. A later unit's parts run over its own rows ([`UnitRows`]).
 struct PassWalk<'a> {
     env: Env<'a>,
     stores: &'a mut [Store],
     p: &'a mut Prompt,
+    /// Units `1 ..`'s rows, lent into the batch's buffers for their parts.
+    later: &'a mut [UnitRows],
     side: &'a PlacedSide,
     map: &'a mut DeviceBuffer<u32>,
     sel: &'a mut DeviceBuffer<u32>,
     /// The hosted layers' card route tables ([`PlacedPass::routes`]).
     routes: &'a mut RouteSet,
-    /// The call's rows, all one unit.
-    t: usize,
-    /// The streams' buffer holding the layer's input, as the prompt batch's walk keeps it.
-    cur: usize,
+    /// The prompt calls' streaming and its ring pass's buffers.
+    xs: &'a mut StreamSide,
+    /// Each unit's first row of the walk and its rows.
+    units: &'a [(usize, usize)],
+    /// Each unit's streams' buffer holding its layer input, as the prompt batch's walk keeps it.
+    cur: Vec<usize>,
+    /// The position past the walk's last row.
+    walk_end: usize,
 }
 
 impl PassWalk<'_> {
-    /// The span of the whole call's rows over the streams' buffer `cur`.
-    fn span(&self) -> Span {
-        Span {
-            cur: self.cur,
-            r0: 0,
-            index: 0,
-            n: self.t,
-        }
+    /// Unit `u`'s first row and rows, refused by name past the walk's units.
+    fn unit(&self, u: usize) -> Result<(usize, usize), GpuError> {
+        self.units
+            .get(u)
+            .copied()
+            .ok_or_else(|| shape(format!("unit {u} of a walk of {} units", self.units.len())))
     }
 
-    /// Layer `l`'s engram site and attention sub-layer over every row, in the prompt batch's
-    /// chunks.
-    fn attention_half(&mut self, l: usize) -> Result<(), GpuError> {
-        let t = self.t;
+    /// The span of unit `u`'s rows over its streams' buffer.
+    fn span(&self, u: usize) -> Result<Span, GpuError> {
+        let (r0, n) = self.unit(u)?;
+        Ok(Span {
+            cur: self.cur[u],
+            r0,
+            index: r0 / self.p.cfg.q_rows,
+            n,
+        })
+    }
+
+    /// `part` of unit `u` over its own rows: a later unit's lent into the batch's buffers for the
+    /// part and taken back after it, whatever it returned.
+    fn lent<T>(
+        &mut self,
+        u: usize,
+        part: impl FnOnce(&mut Self) -> Result<T, GpuError>,
+    ) -> Result<T, GpuError> {
+        let Some(k) = u.checked_sub(1) else {
+            return part(self);
+        };
+        if k >= self.later.len() {
+            return Err(shape(format!(
+                "unit {u} of a pass holding the rows of {} units",
+                self.later.len() + 1
+            )));
+        }
+        self.later[k].swap(&mut self.p.buf);
+        let r = part(self);
+        self.later[k].swap(&mut self.p.buf);
+        r
+    }
+
+    /// Whether the stream's pick covers layer `l`: a hosted layer whose card holds experts.
+    fn card(side: &PlacedSide, l: usize) -> bool {
+        side.hosted(l) && side.n_card(l) > 0
+    }
+
+    /// Unit `u`'s layer `l` engram site and attention sub-layer over its rows, in the prompt
+    /// batch's chunks.
+    fn attention_half(&mut self, u: usize, l: usize) -> Result<(), GpuError> {
+        let (r0, t) = self.unit(u)?;
         let q = self.p.cfg.q_rows;
+        let base = r0 / q;
         if self.env.layers[l].engram.is_some() {
-            for (index, rows) in chunks(t, q).enumerate() {
+            for (i, rows) in chunks(t, q).enumerate() {
                 let sp = Span {
-                    cur: self.cur,
-                    r0: rows.start,
-                    index,
+                    cur: self.cur[u],
+                    r0: r0 + rows.start,
+                    index: base + i,
                     n: rows.len(),
                 };
                 engram(&self.env, self.p, l, sp)?;
             }
-            self.cur ^= 1;
+            self.cur[u] ^= 1;
         }
-        for (index, rows) in chunks(t, q).enumerate() {
+        for (i, rows) in chunks(t, q).enumerate() {
             let sp = Span {
-                cur: self.cur,
-                r0: rows.start,
-                index,
+                cur: self.cur[u],
+                r0: r0 + rows.start,
+                index: base + i,
                 n: rows.len(),
             };
             attention(&self.env, self.stores, self.p, l, sp)?;
         }
-        self.cur ^= 1;
+        self.cur[u] ^= 1;
         Ok(())
     }
 
-    /// A hosted layer's front from the feed-forward norm: the router over the rows, the latent
-    /// down into the rows the host reads, the card's places and the download.
+    /// A unit's front: a layer the card holds whole entire; a hosted one up to its download.
+    fn unit_front(&mut self, port: &mut BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
+        let (l, u) = (at.layer, at.unit);
+        self.attention_half(u, l)?;
+        if self.side.hosted(l) {
+            return self.hosted_front(port, at);
+        }
+        let (r0, t) = self.unit(u)?;
+        let ffn_rows = self.p.cfg.ffn_rows;
+        for (i, rows) in chunks(t, ffn_rows).enumerate() {
+            let sp = Span {
+                cur: self.cur[u],
+                r0: r0 + rows.start,
+                index: r0 / ffn_rows + i,
+                n: rows.len(),
+            };
+            ffn(&self.env, self.p, l, sp)?;
+        }
+        self.cur[u] ^= 1;
+        Ok(())
+    }
+
+    /// A hosted layer's front from the feed-forward norm: the router over the unit's rows, the
+    /// latent down into the rows the host reads and the download.
     fn hosted_front(&mut self, port: &mut BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let env = self.env;
@@ -352,8 +589,8 @@ impl PassWalk<'_> {
             ..
         } = env;
         let (stream, fault) = (gpu.stream(), gpu.layer_sink(l)?);
-        let n = self.t;
-        let sp = self.span();
+        let sp = self.span(at.unit)?;
+        let (r0, n) = (sp.r0, sp.n);
         let Ffn::Routed { down_lat, .. } = &layers[l].ffn else {
             return Err(shape(format!(
                 "layer {l}: a hosted layer with no routed block"
@@ -393,7 +630,7 @@ impl PassWalk<'_> {
             (&hs[sp.cur], mix, y, xn),
             &names::ffn_norm(l),
         )?;
-        tap(gpu, taps, (l, FFN_NORM), (&*xn, 0), (0, n, sh.hidden))?;
+        tap(gpu, taps, (l, FFN_NORM), (&*xn, 0), (r0, n, sh.hidden))?;
         let r = RouteIn {
             w: w.f32_tensor(WHAT, &names::ffn_gate_inp(l))?,
             bias: Some(w.f32_buf(WHAT, &names::exp_probs_b(l))?),
@@ -413,17 +650,20 @@ impl PassWalk<'_> {
             },
         )?;
         if let Some(t) = taps.as_mut() {
-            tap_words(gpu, &mut t.picks[l], ids, (0, 0, n * N_USED))?;
+            tap_words(gpu, &mut t.picks[l], ids, (0, r0 * N_USED, n * N_USED))?;
         }
         project(&wp, wide, l, n, xn, &mut [(down_lat, sh.latent, lat)])?;
-        self.side.places_rows(gpu, l, (ids, n), self.sel)?;
         self.side
             .download_rows(port, at, (&*lat, &*weights, &*ids), &[])
     }
 
-    /// A hosted layer's card work under the host's: the shared expert over the rows and the
-    /// card's slots, summed in slot order into the card's routed sum.
-    fn hosted_shadow(&mut self, at: At) -> Result<(), GpuError> {
+    /// A hosted layer's card work under the host's: the shared expert over the unit's rows; the
+    /// layer's pick under host streaming ([`PromptStream::unit_pick`](bloomery_gpu::host::prompt_stream::PromptStream::unit_pick)); the card's slots over the
+    /// stage stacks and the stream's ring, summed in slot order into the card's routed sum (by the
+    /// stream's union places when the ring ran); then the unit's read of the layer
+    /// ([`PromptStream::unit_read`](bloomery_gpu::host::prompt_stream::PromptStream::unit_read)), which keeps the streamed experts the ring pass joined for the
+    /// back.
+    fn hosted_shadow(&mut self, port: &mut BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         let env = self.env;
         let Env {
@@ -435,7 +675,10 @@ impl PassWalk<'_> {
             ..
         } = env;
         let (stream, fault) = (gpu.stream(), gpu.layer_sink(l)?);
-        let (n, hid) = (self.t, sh.hidden);
+        let hid = sh.hidden;
+        let (_, n) = self.unit(at.unit)?;
+        let (_, m0) = self.unit(0)?;
+        let units = self.units.len();
         let Ffn::Routed {
             stacks,
             shared: glu,
@@ -489,46 +732,87 @@ impl PassWalk<'_> {
         )?;
         gpu.elem().enqueue_swiglu(stream, fg, fu, n * glu.ff, fa)?;
         project(&wp, wide, l, n, fa, &mut [(&glu.down, hid, shared)])?;
-        let n_card = self.side.n_card(l);
-        if n_card == 0 {
-            return Ok(());
-        }
-        let table = self.routes.of_mut(PASS, l, n_card)?;
-        self.side.remap_row(stream, l, self.map)?;
-        expert_rows(
-            &env,
-            (l, n),
-            (&*gemm, &mut *acts, table),
-            (Some(&*self.map), stacks, *clamp),
-            ExpertIo {
-                lat: &*lat,
-                ids: &*ids,
-                gate: gate_rows,
-                up: up_rows,
-                down: down_rows,
-            },
-        )?;
-        slots.enqueue_card_acc(
-            stream,
-            &CardAcc {
-                down: down_rows,
-                w: weights,
-                sel: self.sel,
-                n: sh.latent,
-                m: n,
-                n_card,
-                n_used: N_USED,
-                w_pitch: N_USED,
-                fault,
-            },
-            routed,
-        )
+        let side = self.side;
+        let card = |k: usize| Self::card(side, k);
+        let (ring, land) = self
+            .xs
+            .stream
+            .unit_pick(port, at, (m0, units), self.walk_end, card)?;
+        let n_card = side.n_card(l);
+        let joined = if n_card > 0 {
+            side.places_rows(gpu, l, (&*ids, n), self.sel)?;
+            let table = self.routes.of_mut(PASS, l, n_card)?;
+            side.remap_row(stream, l, self.map)?;
+            let rule = Act::SwigluGateClamp { limit: *clamp };
+            expert_rows(
+                &env,
+                (l, n),
+                (&*gemm, &mut *acts, table),
+                (Some(&*self.map), stacks, *clamp),
+                ExpertIo {
+                    lat: &*lat,
+                    ids: &*ids,
+                    gate: gate_rows,
+                    up: up_rows,
+                    down: down_rows,
+                },
+            )?;
+            let joined = match ring {
+                Some(r) => {
+                    let card_stacks = LegStacks::of(w, [&stacks[0], &stacks[1], &stacks[2]])?;
+                    let rows = RingRows {
+                        x: &*lat,
+                        ids: &*ids,
+                        m: n,
+                        top_k: N_USED,
+                        n_expert: N_EXPERT,
+                    };
+                    let pass: RingPass<'_> = self.xs.ring_pass(r, slots)?;
+                    Some(pass.enqueue(
+                        gpu,
+                        (Some(&*gemm), &k.g32),
+                        (&card_stacks, n_card, sh.expert_ff, sh.latent),
+                        rows,
+                        (&mut *down_rows, rule),
+                        fault,
+                    )?)
+                }
+                None => None,
+            };
+            let (sel, count) = match joined {
+                Some(j) => (self.xs.union_places()?, n_card + j),
+                None => (&*self.sel, n_card),
+            };
+            slots.enqueue_card_acc(
+                stream,
+                &CardAcc {
+                    down: down_rows,
+                    w: weights,
+                    sel,
+                    n: sh.latent,
+                    m: n,
+                    n_card: count,
+                    n_used: N_USED,
+                    w_pitch: N_USED,
+                    fault,
+                },
+                routed,
+            )?;
+            joined
+        } else {
+            None
+        };
+        self.xs
+            .stream
+            .unit_read(port, (at, units), (land, joined), card)
     }
 
-    /// A hosted layer's back from the join on: the card's and the host's sums added, the latent
-    /// up, the shared expert added, the sandwich norm, the identity mix's post.
+    /// A hosted layer's back from the join on: the stream's join taken (the card's sum already ran
+    /// by its union places, [`PromptStream::unit_join`](bloomery_gpu::host::prompt_stream::PromptStream::unit_join)), the card's and the host's sums added, the
+    /// latent up, the shared expert added, the sandwich norm, the identity mix's post.
     fn hosted_back(&mut self, port: &BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
+        self.xs.stream.unit_join(at)?;
         let env = self.env;
         let Env {
             gpu,
@@ -539,8 +823,9 @@ impl PassWalk<'_> {
             ..
         } = env;
         let (stream, fault) = (gpu.stream(), gpu.layer_sink(l)?);
-        let (n, hid) = (self.t, sh.hidden);
-        let sp = self.span();
+        let hid = sh.hidden;
+        let sp = self.span(at.unit)?;
+        let (r0, n) = (sp.r0, sp.n);
         let Ffn::Routed { up_lat, .. } = &layers[l].ffn else {
             return Err(shape(format!(
                 "layer {l}: a hosted layer with no routed block"
@@ -594,11 +879,11 @@ impl PassWalk<'_> {
             n,
             out,
         )?;
-        tap(gpu, taps, (l, FFN_OUT), (&*out, 0), (0, n, hid))?;
+        tap(gpu, taps, (l, FFN_OUT), (&*out, 0), (r0, n, hid))?;
         post(&env, hs, sp, (out, mix))?;
         let (_, after) = io(hs, sp.cur);
-        tap(gpu, taps, (l, L_OUT), (after, 0), (0, n, HC * hid))?;
-        self.cur ^= 1;
+        tap(gpu, taps, (l, L_OUT), (after, r0), (r0, n, HC * hid))?;
+        self.cur[at.unit] ^= 1;
         Ok(())
     }
 }
@@ -606,48 +891,42 @@ impl PassWalk<'_> {
 impl<'a> LayerProgram for PassWalk<'a> {
     type Port = BatchLeg<'a, HostRun>;
 
+    const BATCH_ORDER: BatchOrder = GROUP_WALK_ORDER;
+
     fn host_leg(&self, at: At) -> bool {
         self.side.hosted(at.layer)
     }
 
     /// A layer the card holds whole entire; a hosted one up to its download.
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        let l = at.layer;
-        self.attention_half(l)?;
-        if self.side.hosted(l) {
-            return self.hosted_front(port, at);
-        }
-        let ffn_rows = self.p.cfg.ffn_rows;
-        for (index, rows) in chunks(self.t, ffn_rows).enumerate() {
-            let sp = Span {
-                cur: self.cur,
-                r0: rows.start,
-                index,
-                n: rows.len(),
-            };
-            ffn(&self.env, self.p, l, sp)?;
-        }
-        self.cur ^= 1;
-        Ok(())
+        self.lent(at.unit, |walk| walk.unit_front(port, at))
     }
 
-    fn shadow(&mut self, _port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+    fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         if !self.side.hosted(at.layer) {
             return Ok(());
         }
-        self.hosted_shadow(at)
+        self.lent(at.unit, |walk| walk.hosted_shadow(port, at))
     }
 
+    /// The back, then the layer's return, owed in a returning call's last walk
+    /// ([`PromptStream::unit_back`](bloomery_gpu::host::prompt_stream::PromptStream::unit_back)).
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         if !self.side.hosted(at.layer) {
             return Ok(());
         }
-        self.hosted_back(port, at)
+        self.lent(at.unit, |walk| walk.hosted_back(port, at))?;
+        let card = Self::card(self.side, at.layer);
+        self.xs
+            .stream
+            .unit_back((at, self.units.len()), self.walk_end, card);
+        Ok(())
     }
 }
 
 /// Walk `toks` (positions `pos0 ..`, at most the pass's rows) through the layers by the host
-/// tier's batch port; the head runs after the last layer when `last`.
+/// tier's batch port, in units of the pass's rows a unit; the head runs after the last layer when
+/// `last`. Under host streaming the walk's end is the stream's ([`PromptStream::end_walk`](bloomery_gpu::host::prompt_stream::PromptStream::end_walk)).
 fn walk_pass(
     gpu: &Gpu,
     w: &Weights,
@@ -666,6 +945,7 @@ fn walk_pass(
         placed,
         pass,
         taps,
+        xs,
         ..
     } = body;
     if taps.is_some() {
@@ -677,6 +957,8 @@ fn walk_pass(
     })?;
     let PlacedPass {
         prompt,
+        shape: pass_shape,
+        later,
         hsum,
         map,
         sel,
@@ -693,6 +975,9 @@ fn walk_pass(
             prompt.cfg.cap
         )));
     }
+    let rows = pass_shape.rows;
+    let units: Vec<(usize, usize)> = chunks(t, rows).map(|r| (r.start, r.len())).collect();
+    let cols: Vec<usize> = units.iter().map(|&(_, m)| m).collect();
     let sh = *sh;
     stage(host, prompt, gpu.stream(), &sh, (toks, pos0))?;
     let env = Env {
@@ -704,25 +989,31 @@ fn walk_pass(
         rope_rows,
     };
     let n_layers = layers.len();
-    let mut leg = BatchLeg::new(gpu.stream(), &mut shell.hybrid, hsum, prompt.cfg.cap);
+    let mut leg = BatchLeg::new(gpu.stream(), &mut shell.hybrid, hsum, rows);
+    leg.set_unit_cols(&cols);
     let mut prog = PassWalk {
         env,
         stores,
         p: &mut *prompt,
+        later,
         side: &*side,
         map,
         sel,
         routes,
-        t,
-        cur: 0,
+        xs: &mut *xs,
+        units: &units,
+        cur: vec![0; units.len()],
+        walk_end: pos0 as usize + t,
     };
     let o = Overlap {
-        units: 1,
-        cols: t,
+        units: units.len(),
+        cols: cols.iter().copied().max().unwrap_or(t),
         port: PortKind::Batch,
     };
     sched::walk(o, n_layers, &mut leg, &mut prog)?;
-    let cur = prog.cur;
+    let cur = prog.cur[units.len() - 1];
+    prog.xs.stream.end_walk(leg.hybrid(), gpu.stream())?;
+    prog.xs.stream.walk_done();
     if last {
         let n = sh.hidden;
         let x = super::win(&prompt.buf.hs[cur], t - 1, 1, HC * n)?;
@@ -746,12 +1037,16 @@ fn walk_pass(
     Ok(())
 }
 
-/// The prompt `ids` through `model`'s placed pass from its position, in passes of up to the load's
+/// The prompt `ids` through `model`'s placed pass from its position, in walks of up to the load's
 /// rows: the stores, the engram history and the position stand where `ids.len()` decode steps
 /// leave them, and the return is the greedy id after the last row. The call is one residency pass
 /// ([`prompt_pass`]: its boundary before the first walk, none inside, 0 rows kept), so every walk
-/// reads one slot map. Refused by name: no ids, a load made without the pass, a position the
-/// stores do not stand at; a call that fails part-way leaves the stores to a reset.
+/// reads one slot map, and inside it the call's host streaming ([`PromptStream::begin`](bloomery_gpu::host::prompt_stream::PromptStream::begin) and
+/// [`PromptStream::end`](bloomery_gpu::host::prompt_stream::PromptStream::end): a call that continues a sequence holding decode heat returns each layer to
+/// the set it started with, a call at position 0 keeps its placement; nothing while the lever is
+/// off). Refused by name: no ids, a load made without the pass, a position the stores do not stand
+/// at; a call that fails part-way leaves the stores to a reset. The call's own error first: a
+/// stream end refused after a failed call is its echo.
 pub fn prompt_placed(
     model: &mut GpuModel<crate::body::Body>,
     ids: &[u32],
@@ -766,7 +1061,12 @@ pub fn prompt_placed(
         .ok_or_else(|| GpuError::shape(CALL, "a load made without the placed pass"))?;
     let n = u32::try_from(ids.len()).map_err(|_| GpuError::shape(CALL, "ids past u32"))?;
     let token = prompt_pass(model, |model| {
-        model.run_rows(ids.len(), CALL, |gpu, w, body, head, pos| {
+        let start = model.pos();
+        let history = {
+            let (gpu, _, body) = model.body_parts(CALL)?;
+            body.stream_begin(gpu.stream(), ids.len(), start)?
+        };
+        let r = model.run_rows(ids.len(), CALL, |gpu, w, body, head, pos| {
             if pos != body.held {
                 return Err(GpuError::shape(
                     CALL,
@@ -788,7 +1088,12 @@ pub fn prompt_placed(
             }
             body.held = pos + n;
             Ok(true)
-        })
+        });
+        let (gpu, _, body) = model.body_parts(CALL)?;
+        let ended = body.stream_end(gpu.stream(), r.is_ok() && !history);
+        let v = r?;
+        ended?;
+        Ok(v)
     })?;
     token.ok_or_else(|| GpuError::shape(CALL, "a prompt pass that read no token"))
 }
@@ -838,5 +1143,128 @@ impl crate::body::Body {
     #[must_use]
     pub fn host_stats(&self) -> Option<HybridStats> {
         Some(self.placed.as_ref()?.shell.hybrid.stats())
+    }
+
+    /// Open the prompt call's streaming over `n` ids from `start` ([`PromptStream::begin`](bloomery_gpu::host::prompt_stream::PromptStream::begin), the
+    /// walks being every pass of a placed load): a call whose start holds decode history returns
+    /// to it. Whether it does; `false` and nothing more on a whole-card load or while the lever is
+    /// off.
+    pub(crate) fn stream_begin(
+        &mut self,
+        stream: &CudaStream,
+        n: usize,
+        start: u32,
+    ) -> Result<bool, GpuError> {
+        let layers = self.layers.len();
+        let Some(p) = self.placed.as_mut() else {
+            return Ok(false);
+        };
+        // Read once: the call keeps no row, so the history does not move until its end.
+        let history = p.shell.hybrid.call_history(start);
+        self.xs.stream.begin(
+            &mut p.shell.hybrid,
+            stream,
+            true,
+            n,
+            start as usize + n,
+            history,
+            ADMIT_FLOOR,
+            0.0,
+            layers,
+        )?;
+        Ok(history)
+    }
+
+    /// End the prompt call's streaming ([`PromptStream::end`](bloomery_gpu::host::prompt_stream::PromptStream::end)), its placement `kept` for the
+    /// decode after it; nothing on a whole-card load.
+    pub(crate) fn stream_end(&mut self, stream: &CudaStream, kept: bool) -> Result<(), GpuError> {
+        match self.placed.as_mut() {
+            Some(p) => self.xs.stream.end(&mut p.shell.hybrid, stream, kept),
+            None => Ok(()),
+        }
+    }
+
+    /// The stream rule's costs in place of the priced ones ([`PromptStream::set_costs`](bloomery_gpu::host::prompt_stream::PromptStream::set_costs)). Refused
+    /// by name: a load with no host tier, before `split` started the stream, and while a call
+    /// streams.
+    pub fn set_xstream_costs(&mut self, costs: Costs) -> Result<(), GpuError> {
+        let p = self.placed.as_mut().ok_or(GpuError::State {
+            what: "hy4::Body::set_xstream_costs",
+            missing: "a placed load (the host tier the stream serves)",
+        })?;
+        self.xs.stream.set_costs(&mut p.shell.hybrid, costs)
+    }
+
+    /// The last streaming prompt call's streamed layers, each with its walk, and the stream's
+    /// end; empty and `None` after a call that did not stream. Taken
+    /// ([`PromptStream::take_xstream_records`](bloomery_gpu::host::prompt_stream::PromptStream::take_xstream_records)).
+    pub fn take_xstream_records(&mut self) -> (Vec<(usize, XLayer)>, Option<XReport>) {
+        self.xs.stream.take_xstream_records()
+    }
+
+    /// The last streaming prompt call's picks, each with its walk, and its end; empty and `None`
+    /// after a call that did not stream. Taken ([`PromptStream::take_pick_records`](bloomery_gpu::host::prompt_stream::PromptStream::take_pick_records)).
+    pub fn take_stream_records(&mut self) -> (Vec<(usize, CallPick)>, Option<CallReport>) {
+        self.xs.stream.take_pick_records()
+    }
+
+    /// The last streaming call's ring passes: each one's walk, layer and the streamed experts its
+    /// unit summed the card's slots by ([`PromptStream::take_join_records`](bloomery_gpu::host::prompt_stream::PromptStream::take_join_records)). Taken: a second read
+    /// is empty. A gate's instrument.
+    pub fn take_stream_joined(&mut self) -> Vec<(usize, usize, usize)> {
+        self.xs.stream.take_join_records()
+    }
+}
+
+impl XStreamBody for crate::body::Body {
+    /// What the next prompt calls move (`BLOOMERY_XSTREAM`): `off` until set here. `Split` starts
+    /// the expert stream at its first setting ([`PromptStream::start_split`](bloomery_gpu::host::prompt_stream::PromptStream::start_split): the ring sized from
+    /// the card's free bytes past the stream's keep-free and the plan's ring term, the lane's
+    /// probe, the costs this device and host price for the latent experts' shape, read once for
+    /// each of a walk's units) and arms the ring pass's buffers at a unit's rows; the stream then
+    /// stays for the load's life. Refused by name: `admit` or `split` on a whole-card load,
+    /// `split` on a load made without the placed pass or whose hosted layers' card stacks are of
+    /// no one ring form, and the stream's own refusals.
+    fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
+        const WHAT_S: &str = "hy4::Body::set_xstream";
+        let pass = self
+            .pass
+            .as_deref()
+            .map(|p| (p.shape, p.forms.ok_or(p.shape)));
+        let (latent, ff) = (self.sh.latent, self.sh.expert_ff);
+        let tier = self.placed.as_mut().map(|p| &mut p.shell.hybrid);
+        self.xs.set_xstream(tier, (gpu, WHAT_S), mode, |room| {
+            let (shape, forms) = pass.ok_or(GpuError::State {
+                what: WHAT_S,
+                missing: "a load opened with its placed pass (the walks the stream serves)",
+            })?;
+            let forms = forms.map_err(|_| GpuError::State {
+                what: WHAT_S,
+                missing: "hosted layers' card stacks of one form a route GEMM entry reads",
+            })?;
+            let expert = ExpertShape {
+                hidden: latent,
+                ff,
+                top_k: N_USED,
+                units: shape.units,
+            };
+            let ring = RingShape {
+                rows: shape.rows,
+                top_k: N_USED,
+                n: latent,
+                ff,
+                forms,
+            };
+            Ok((XCfg::new(expert, N_EXPERT, DEADLINE, room), ring))
+        })
+    }
+
+    /// The load line's `xstream=` word ([`PromptStream::word`](bloomery_gpu::host::prompt_stream::PromptStream::word)); the mode alone on a whole-card
+    /// load.
+    fn xstream_word(&self) -> String {
+        match &self.placed {
+            Some(p) => self.xs.stream.word(&p.shell.hybrid),
+            None => self.xs.stream.mode().word().to_string(),
+        }
     }
 }

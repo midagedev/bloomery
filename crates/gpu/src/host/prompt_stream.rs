@@ -58,6 +58,13 @@ use crate::{Gpu, GpuError};
 /// What the stream's errors name.
 const WHAT: &str = "prompt stream";
 
+/// The least count a pick admits on a load whose lane never probed, for a family that gives no
+/// floor of its own: a call of fewer ids opens no streaming. An admit moves an expert for the rest
+/// of the call, so it pays only past the transient stream's own threshold (one expert's copy at the
+/// priced lane against the union's columns, about eleven columns on the card the floor was set on
+/// [derived]), and the floor sits above that.
+pub const ADMIT_FLOOR: u32 = 32;
+
 /// A prompt call's host streaming (the [`XMode`] lever, the residency
 /// machine's call mode and the expert stream): what the next prompt calls
 /// move, whether one is streaming now, the pick's count buffer, and the

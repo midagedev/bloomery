@@ -25,6 +25,7 @@ use bloomery_gpu::hc_ident::{HC, HcIdentKernels, MIX};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
+use bloomery_gpu::host::stream_side::StreamSide;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::host::swap_source::{ResidencySpec, hosted_stacks};
 use bloomery_gpu::hybrid::{Chain, Hybrid, SlotMap};
@@ -49,12 +50,13 @@ use model::arch::Arch;
 use model::arch::hy4::hparams::Hparams;
 use model::arch::hy4::names;
 use model::arch::hy4::place::{CACHE_ROWS, PlanInputs};
+use model::arch::place_hybrid;
 use model::placement::Plan;
 use model::placement::kernels::DownForms;
 use runtime::layer::hosted;
 use runtime::stores::PosBuf;
 
-use crate::batch::PlacedPass;
+use crate::batch::{PassShape, PlacedPass};
 use crate::placed::{LOAD_ROWS, Open, Placed};
 
 /// What the refusals of this file name.
@@ -410,6 +412,9 @@ pub struct Body {
     /// The placed prompt pass's buffers ([`crate::batch::PlacedPass`]), on a placed load opened with
     /// its pass; `None` on a load that steps its prompt and on the whole-card load.
     pub(crate) pass: Option<Box<PlacedPass>>,
+    /// The prompt calls' host streaming and its ring pass's buffers (`BLOOMERY_XSTREAM`), off until
+    /// set ([`bloomery_gpu::host::xstream::XStreamBody`]).
+    pub(crate) xs: StreamSide,
 }
 
 /// What one resident sequence owns ([`Slots`]): every layer's stores, the engram history and the
@@ -765,10 +770,10 @@ impl Body {
         Body::open_placed_with(file, (plan, inputs), card, host, (None, Residency::Off))
     }
 
-    /// [`Body::open_placed`] with the placed prompt pass at `rows` rows ([`crate::batch`]'s
-    /// `PlacedPass`): its buffers made beside the placed side and the host tier's batch sets and
-    /// union slabs for its rows, so a prompt runs as passes of up to `rows` rows
-    /// ([`crate::batch::prompt_placed`]). The plan's prompt reserve holds the pass's bytes
+    /// [`Body::open_placed`] with the placed prompt pass of one unit of `rows` rows
+    /// ([`crate::batch`]'s `PlacedPass`): its buffers made beside the placed side and the host
+    /// tier's batch sets and union slabs for its rows, so a prompt runs as passes of up to `rows`
+    /// rows ([`crate::batch::prompt_placed`]). The plan's prompt reserve holds the pass's bytes
     /// ([`crate::batch::pass_bytes`] at the plan's context). Refused by name as
     /// [`Body::open_placed`] refuses, and the pass's buffers past the plan's reserve for them. The
     /// load runs no residency machine.
@@ -785,24 +790,27 @@ impl Body {
             (plan, inputs),
             card,
             host,
-            (Some(rows), Residency::Off),
+            (Some(PassShape::of(rows)), Residency::Off),
         )
     }
 
-    /// [`Body::open_placed`], or with the placed pass at `rows` rows ([`Body::open_placed_pass`]),
-    /// under `residency`: a `mid` word runs the common machine over the stage card's routed
+    /// [`Body::open_placed`], or with the placed pass of `pass` ([`Body::open_placed_pass`]; a walk
+    /// of several units holds one batch set a unit, [`PlacedHost::prepare_pass_walk`]), under
+    /// `residency`: a `mid` word runs the common machine over the stage card's routed
     /// stacks, held as rooms, and the slot map's card copy the step and the pass read
     /// ([`bloomery_gpu::host::placed`]), its churn pool hosted beside the plan's host set. Refused
     /// by name as those refuse, and a machine beside a routed layer the card holds whole
-    /// ([`PlacedHost::new`]).
+    /// ([`PlacedHost::new`]). The plan's ring term, when it holds one
+    /// ([`model::arch::hy4::place::stream_ring`]), caps the ring a `split` stream makes.
     ///
     /// [`PlacedHost::new`]: bloomery_gpu::host::placed::PlacedHost::new
+    /// [`PlacedHost::prepare_pass_walk`]: bloomery_gpu::host::placed::PlacedHost::prepare_pass_walk
     pub fn open_placed_with(
         file: Split,
         (plan, inputs): (&Plan<'_>, &PlanInputs),
         card: usize,
         host: HostCfg,
-        (pass, residency): (Option<usize>, Residency),
+        (pass, residency): (Option<PassShape>, Residency),
     ) -> Result<GpuModel<Body>, GpuError> {
         const PLAN: &str = "hy4::Body::open_placed";
         let hp = &inputs.hp;
@@ -836,11 +844,11 @@ impl Body {
                 };
                 let mut placed = crate::placed::load((gpu, w), &body.layers, map, open)?;
                 match pass {
-                    Some(rows) => {
+                    Some(shape) => {
                         // The batch sets and union slabs for the pass's rows, which also serve
                         // the step's one column.
-                        placed.prepare_pass_rows(gpu, rows)?;
-                        let made = PlacedPass::new(gpu, w, &body, &placed.side, rows)?;
+                        placed.prepare_pass_walk(gpu, (shape.rows, shape.units))?;
+                        let made = PlacedPass::new(gpu, w, &body, &placed.side, shape)?;
                         let reserve = inputs
                             .prompt_batch_bytes(plan.machine)
                             .map_err(|e| GpuError::plan(PLAN, e))?;
@@ -853,6 +861,9 @@ impl Body {
                              slots' places and the card slots' route tables",
                         )?;
                         body.pass = Some(Box::new(made));
+                        if let Some(cap) = place_hybrid::planned_room_cap(plan, inputs) {
+                            body.xs.set_ring_room(cap);
+                        }
                     }
                     // The step's union slabs for one column: the host tier's resident path runs
                     // only through them.
@@ -1013,6 +1024,7 @@ impl Body {
             held: 0,
             placed: None,
             pass: None,
+            xs: StreamSide::default(),
         })
     }
 

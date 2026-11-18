@@ -56,11 +56,10 @@
 //! in [`Prompt`], cut at load, so a pass allocates nothing.
 
 use super::placed::{Placed, PlacedSide};
-use super::stream::{RingPass, XSide};
 use super::tier::{TierSum, enqueue_tier_sum};
 use super::{Body, Kernels, Layer, RouteOut, Shape, Taps, enqueue_head, stack};
 use crate::arch::hybrid::{Site, WideCx, norm_rows, project_wide, wide_acts_at};
-use crate::card_leg::{LegStacks, with_ring};
+use crate::card_leg::LegStacks;
 use crate::card_slots::ColPlaces;
 use crate::elem::EmbedRowsArgs;
 use crate::flash::PlaneAppend;
@@ -70,6 +69,7 @@ use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::host::run::HostRun;
 use crate::host::served::prompt_pass;
+use crate::host::stream_side::{RingPass, RingRows, StreamSide};
 use crate::host::xstream::LandBatch;
 use crate::iq_sel::IqGateUp;
 use crate::kquant::{Act as GateAct, SelDown};
@@ -1012,39 +1012,23 @@ impl PassWalk<'_> {
         )?;
         let joined = match ring {
             None => None,
-            Some(RingPass {
-                r,
-                acc_k,
-                union,
-                gemm: rg,
-            }) => {
-                let ctx = gpu.context();
+            Some(ring) => {
                 let card = LegStacks::of(w, [&stacks.gate, &stacks.up, &stacks.down])?;
-                let kernels = (Some(cx.gemm), &cx.k.g32);
-                rg.enqueue_rows(gpu, &cx.k.g32, &b.lat2, m, fault)?;
-                r.with_union(ctx, sh.n_expert, |union_map| {
-                    acc_k.enqueue_places_cols(
-                        stream,
-                        &ring_places(&b.ids, union_map, sh, m),
-                        fault,
-                        union,
-                    )
-                })?;
-                with_ring(&card, a.n_card, &r, ctx, (sh.ff, sh.latent), |blk| {
-                    for batch in &r.batches {
-                        rg.enqueue_batch(
-                            gpu,
-                            kernels,
-                            blk,
-                            batch,
-                            (&b.ids, slots, sh.top_k, sh.n_expert),
-                            (&mut b.down, GateAct::SiluMul),
-                            fault,
-                        )?;
-                    }
-                    Ok(())
-                })?;
-                Some(r.n)
+                let rows = RingRows {
+                    x: &b.lat2,
+                    ids: &b.ids,
+                    m,
+                    top_k: sh.top_k,
+                    n_expert: sh.n_expert,
+                };
+                Some(ring.enqueue(
+                    gpu,
+                    (Some(cx.gemm), &cx.k.g32),
+                    (&card, a.n_card, sh.ff, sh.latent),
+                    rows,
+                    (&mut b.down, GateAct::SiluMul),
+                    fault,
+                )?)
             }
         };
         gpu.elem().enqueue_gain_rms_norm(
@@ -1296,27 +1280,6 @@ impl PassWalk<'_> {
     }
 }
 
-/// The places of the pass's `m` rows of routed slots (`ids`, `top_k` a row)
-/// through `map`, one word a router expert: a row of the stream's (its union
-/// row, or a landing batch's ring slots).
-fn ring_places<'a>(
-    ids: &'a DeviceBuffer<u32>,
-    map: &'a DeviceBuffer<u32>,
-    sh: Shape,
-    m: usize,
-) -> ColPlaces<'a> {
-    ColPlaces {
-        ids,
-        ids_pitch: sh.top_k,
-        used: sh.top_k,
-        sel_pitch: sh.top_k,
-        m,
-        map,
-        row_off: 0,
-        n_expert: sh.n_expert,
-    }
-}
-
 /// Which pass buffer holds a layer's experts' weighted sum.
 #[derive(Clone, Copy)]
 enum Sum {
@@ -1336,7 +1299,7 @@ enum Sum {
 struct PlacedPass<'a, 'b> {
     walk: PassWalk<'a>,
     side: &'b mut PlacedSide,
-    xs: &'b mut XSide,
+    xs: &'b mut StreamSide,
     walk_end: usize,
 }
 
