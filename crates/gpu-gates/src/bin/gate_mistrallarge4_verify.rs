@@ -38,11 +38,19 @@
 //!   its sink exactly the window's positions once each, in order, one tap row a position, finite
 //!   and not all zero.
 //! - `lookup_is_plain`: a lookup draft (`runtime::Lookup`) driven over
-//!   `Session<Body>` (`Session::with_draft`, a verify of two rows) for [`GEN`]
-//!   tokens on three prompts of a repeated pattern emits the plain run's ids on
-//!   every prompt, and some prompt proposes. On the real file some prompt also
-//!   keeps a draft, so row 1 was kept; the fixture's weights do not continue
-//!   the pattern, and there `rows_match_steps` is the clause that keeps one.
+//!   `Session<Body>` (`Session::with_draft`, a verify of two rows), in two arms.
+//!   The greedy arm: for [`GEN`] tokens on three prompts of a repeated pattern
+//!   it emits the plain run's ids on every prompt; on the real file, which
+//!   continues the pattern, some prompt proposes and keeps a draft. The forced
+//!   arm (`runtime::Forced`, every row's id the next of a fixed stream): on the
+//!   first prompt the stream is the prompt's pattern continued with an id the
+//!   pattern does not hold every [`BREAK`]th id, so the lookup proposes from
+//!   the prompt itself, the stream keeps some proposals and takes others back,
+//!   and a break leaves a plain step — whatever the model's argmax, on any
+//!   card. Every row the run takes is the plain run's over the same stream
+//!   (each id stepped) bit for bit, argmax and logits, and its proposals, kept
+//!   drafts, taken-back drafts and plain steps are the counts `runtime::Lookup`
+//!   gives over the stream on the host.
 
 #[cfg(feature = "mistrallarge4")]
 fn main() -> std::process::ExitCode {
@@ -85,7 +93,8 @@ mod gate {
     use model::arch::mistrallarge4::place::PlanInputs;
     use model::placement::{Machine, PlanLevers, workstation};
     use runtime::{
-        Advance, Lookup, Out, RowLogits, Speculative, Tapped, TappedPrompt, Target, Verify, Want,
+        Advance, Forced, Lookup, Out, Pick, Picked, RowLogits, Speculative, Tapped, TappedPrompt,
+        Target, Verify, Want,
     };
 
     type Seat = Session<Body>;
@@ -120,6 +129,11 @@ mod gate {
     const PATTERN: usize = 12;
     const REPEATS: usize = 4;
     const LOOKUPS: usize = 3;
+
+    /// The forced arm's stream holds an id its pattern does not every
+    /// `BREAK`th id; not a multiple of [`PATTERN`], so the breaks fall at
+    /// other places of the pattern.
+    const BREAK: usize = 8;
 
     /// A drafted id no clause's plain run follows with: the walk's first id,
     /// moved by one where the plain run's next id is it.
@@ -556,7 +570,227 @@ mod gate {
         Ok((tokens, proposals, accepted))
     }
 
+    /// What a lookup draft's passes did, or do over a forced stream: the
+    /// proposals, the drafts the next id kept, the drafts it took back, the
+    /// passes with no proposal (a plain step) and the ids taken.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct Passes {
+        proposed: usize,
+        kept: usize,
+        back: usize,
+        steps: usize,
+        taken: usize,
+    }
+
+    /// The forced arm's stream for `prompt`, a pattern of [`PATTERN`] ids
+    /// repeated: the pattern continued from where the prompt ends, every
+    /// [`BREAK`]th id the first id from [`REJECT`] on that the pattern does
+    /// not hold; [`GEN`] + 1 ids, as a last pass may take two.
+    fn forced_stream(prompt: &[u32]) -> Result<Vec<u32>, GateError> {
+        let pattern = prompt
+            .get(..PATTERN)
+            .ok_or_else(|| format!("a prompt of {} ids holds no pattern", prompt.len()))?;
+        let off = (REJECT..)
+            .take(PATTERN + 1)
+            .find(|id| !pattern.contains(id))
+            .ok_or("every id from REJECT on is in the pattern")?;
+        Ok((0..=GEN)
+            .map(|i| {
+                if i % BREAK == BREAK - 1 {
+                    off
+                } else {
+                    pattern[(prompt.len() + i) % PATTERN]
+                }
+            })
+            .collect())
+    }
+
+    /// The passes a lookup draft runs over `stream` when every row takes the
+    /// stream's next id, from the ids alone: `runtime::Lookup` fed the prompt
+    /// and the stream's first id (`Draft::begin`), then each kept id
+    /// (`Draft::stepped`, `Draft::accept`), a pass keeping its draft when the
+    /// stream's next id is the proposal — what `Speculative::pass_picking`
+    /// does, with no card.
+    fn predicted(prompt: &[u32], stream: &[u32]) -> Result<Passes, GateError> {
+        let id = |i: usize| {
+            stream.get(i).copied().ok_or_else(|| {
+                format!(
+                    "the forced stream holds {} ids and the prediction took one more",
+                    stream.len()
+                )
+            })
+        };
+        let mut lookup = Lookup::new();
+        lookup.rebuild(prompt);
+        lookup.push(id(0)?);
+        let mut p = Passes {
+            taken: 1,
+            ..Passes::default()
+        };
+        while p.taken < GEN {
+            let next = id(p.taken)?;
+            match lookup.propose() {
+                None => {
+                    lookup.push(next);
+                    p.steps += 1;
+                    p.taken += 1;
+                }
+                Some(draft) if draft == next => {
+                    lookup.push(next);
+                    lookup.push(id(p.taken + 1)?);
+                    p.proposed += 1;
+                    p.kept += 1;
+                    p.taken += 2;
+                }
+                Some(_) => {
+                    lookup.push(next);
+                    p.proposed += 1;
+                    p.back += 1;
+                    p.taken += 1;
+                }
+            }
+        }
+        Ok(p)
+    }
+
+    /// The forced arm's pick: each row's id the stream's next, and each taken
+    /// row's argmax and logits written down in position order.
+    struct Witness<'a, 'r> {
+        stream: Forced<'a, ()>,
+        rows: &'r mut TakenRows,
+    }
+
+    impl Pick<Seat> for Witness<'_, '_> {
+        fn pick(&mut self, t: &mut Seat, r: usize, argmax: u32) -> Result<u32, SessionError> {
+            let row = t.row_logits(r)?.to_vec();
+            self.rows.push((argmax, row));
+            self.stream
+                .take()
+                .map_err(|e| SessionError::Caller(Box::new(e)))
+        }
+    }
+
+    /// Each taken row's argmax and logits, in position order.
+    type TakenRows = Vec<(u32, Vec<f32>)>;
+
+    /// One lookup-drafted generation of [`GEN`] ids from `prompt` whose every
+    /// row takes `stream`'s next id: the ids taken, each taken row's argmax
+    /// and logits, and the passes.
+    fn forced_lookup_run(
+        s: &mut Seat,
+        prompt: &[u32],
+        stream: &[u32],
+    ) -> Result<(Vec<u32>, TakenRows, Passes), GateError> {
+        s.reset()?;
+        let mut spec: Speculative<Lookup, ROWS> =
+            s.with_draft::<Lookup, ROWS>(Lookup::new(), &mut Log)?;
+        let mut rows = Vec::with_capacity(GEN + 1);
+        let pick = Witness {
+            stream: Forced::new(stream, ()),
+            rows: &mut rows,
+        };
+        let mut picked = Picked::new(&mut spec, pick);
+        let argmax = Advance::prompt(&mut picked, s, prompt)?;
+        let first = picked.first(s, argmax)?;
+        Advance::begin(&mut picked, s, prompt, first)?;
+        let mut tokens = vec![first];
+        let mut p = Passes::default();
+        while tokens.len() < GEN {
+            let last = tokens[tokens.len() - 1];
+            let c = Advance::pass(&mut picked, s, last, &mut tokens)?;
+            match (c.proposed, c.kept) {
+                (false, _) => p.steps += 1,
+                (true, 1) => {
+                    p.proposed += 1;
+                    p.back += 1;
+                }
+                (true, _) => {
+                    p.proposed += 1;
+                    p.kept += 1;
+                }
+            }
+        }
+        p.taken = tokens.len();
+        Ok((tokens, rows, p))
+    }
+
+    /// The plain run over `stream` from a reset: the prompt call's argmax
+    /// and logits, then each of the stream's first `n − 1` ids stepped, its
+    /// argmax and logits — the rows a drafted run taking `n` of the stream's
+    /// ids takes.
+    fn forced_plain(
+        s: &mut Seat,
+        prompt: &[u32],
+        stream: &[u32],
+        n: usize,
+    ) -> Result<TakenRows, GateError> {
+        let fed = n
+            .checked_sub(1)
+            .and_then(|k| stream.get(..k))
+            .ok_or_else(|| format!("{n} rows over a stream of {} ids", stream.len()))?;
+        s.reset()?;
+        let mut rows = Vec::with_capacity(n);
+        rows.push(logits_of(s.prompt(prompt, Want::Logits)?)?);
+        for &id in fed {
+            rows.push(logits_of(s.step(id, Want::Logits)?)?);
+        }
+        Ok(rows)
+    }
+
+    /// The first position whose argmax or logits bits differ between `got`
+    /// and `want`, or the counts where they hold other numbers of rows.
+    fn first_apart(got: &[(u32, Vec<f32>)], want: &[(u32, Vec<f32>)]) -> Option<String> {
+        if got.len() != want.len() {
+            return Some(format!("{} rows against {}", got.len(), want.len()));
+        }
+        got.iter()
+            .zip(want)
+            .position(|((ga, gr), (wa, wr))| ga != wa || !same_bits(gr, wr))
+            .map(|i| format!("row {i}"))
+    }
+
+    /// `lookup_is_plain`'s forced arm (module doc) on `prompt` in the mode
+    /// set: the run's ids are the stream's, its rows the plain run's bit for
+    /// bit, its passes the host's prediction, and the prediction holds a
+    /// kept draft, a taken-back draft and a plain step.
+    fn forced_arm(s: &mut Seat, prompt: &[u32], mode: StepMode) -> Result<bool, GateError> {
+        const CLAUSE: &str = "lookup_is_plain forced";
+        let stream = forced_stream(prompt)?;
+        let want = predicted(prompt, &stream)?;
+        let covers = want.kept > 0 && want.back > 0 && want.steps > 0;
+        let (tokens, rows, got) = forced_lookup_run(s, prompt, &stream)?;
+        let plain = forced_plain(s, prompt, &stream, tokens.len())?;
+        let ids = stream.get(..tokens.len()) == Some(&tokens[..]);
+        let apart = first_apart(&rows, &plain);
+        let pass = covers && ids && apart.is_none() && got == want;
+        println!(
+            "{CLAUSE} {mode:?} ({} ids, a break every {BREAK}): {} ids the stream's {ids}; their \
+             rows the plain run's over the stream bit for bit {}; proposals {} kept {} taken \
+             back {} plain steps {} against the host's {} {} {} {} (a kept, a taken-back draft \
+             and a step predicted: {covers}) {}",
+            prompt.len(),
+            tokens.len(),
+            apart.map_or_else(|| "true".to_string(), |at| format!("false (apart at {at})")),
+            got.proposed,
+            got.kept,
+            got.back,
+            got.steps,
+            want.proposed,
+            want.kept,
+            want.back,
+            want.steps,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     /// `lookup_is_plain` (module doc).
+    // PIN(2026-11-18): the fixture tier judged the greedy arm's proposals, which stood on the
+    // fixture's plain run repeating an id by chance: one proposal on prompts 1 and 2 on the 3090
+    // and the A6000, none on the RTX 5090, whose rounding moved the greedy run while its drafted
+    // run kept the plain run's ids. The forced arm holds a proposal, a kept and a taken-back draft
+    // by construction on any card; the greedy arm's proposals are judged on the real file, which
+    // continues the pattern.
     fn lookup_is_plain(s: &mut Seat, case: &Case) -> Result<bool, GateError> {
         const CLAUSE: &str = "lookup_is_plain";
         let base = walk(PATTERN * LOOKUPS, case.n_vocab);
@@ -581,24 +815,28 @@ mod gate {
                 );
                 ok &= pass;
             }
+            let first = prompts.first().ok_or("no lookup prompt")?;
+            ok &= forced_arm(s, first, mode)?;
         }
-        println!(
-            "{CLAUSE}: a draft proposed on some prompt {}",
-            verdict(proposed_some)
-        );
         if case.real {
+            println!(
+                "{CLAUSE}: a draft proposed on some prompt {}",
+                verdict(proposed_some)
+            );
             println!(
                 "{CLAUSE}: a draft kept on some prompt (row 1's id kept as the next token) {}",
                 verdict(kept_some)
             );
         } else {
             println!(
-                "{CLAUSE}: drafts kept on some prompt {kept_some} (not judged: the fixture's \
-                 weights do not continue the pattern; rows_match_steps keeps a draft here)"
+                "{CLAUSE}: greedy drafts proposed on some prompt {proposed_some}, kept \
+                 {kept_some} (not judged: the fixture's weights do not continue the pattern, so \
+                 whether its plain run repeats an id is the card's rounding; the forced arm \
+                 proposes, keeps and takes back by construction)"
             );
         }
         s.model_mut().set_mode(StepMode::Graph);
-        Ok(ok && proposed_some && (kept_some || !case.real))
+        Ok(ok && (!case.real || (proposed_some && kept_some)))
     }
 
     /// The plan's levers: in the fixture tier the card keeps half of the

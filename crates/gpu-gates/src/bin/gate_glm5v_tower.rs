@@ -63,9 +63,7 @@ mod gate {
     use std::sync::Arc;
     use std::time::Instant;
 
-    use super::vision_rules::{
-        Count, erf_check, erf_outside, exact_check, gemm_check, near_check, par_rows,
-    };
+    use super::vision_rules::{Count, erf_check, erf_outside, exact_check, gemm_check, par_rows};
     use super::vision_taps::{
         Collect, HostFile, band_check, dist_f32, eager_twice, floor, ggml_table, nudge, nudged,
         read_image, reuse_after_largest, sens as sensitivity, to_bf16,
@@ -119,21 +117,24 @@ mod gate {
     /// ratios lie in 0.92–3.78, the smallest image's `after_fc_proj` (a grid of 8×10 patches, whose
     /// controls are the smallest) the highest; the nine teacher-forced pairs in 1.45–1.72.
     const K_TAP: f64 = 4.0;
-    /// Values of the clamped SwiGLU sweep that may differ from the f32 rule rounded once, each by
-    /// one bf16 step at most: the device's `expf` (2 ulp) against the host's `exp` moves `silu` by
-    /// at most 3.6e-7 relative, and a bf16 rounding boundary lies that close to a value with a
-    /// probability of at most 3.6e-7 / 2⁻⁸ ≈ 9e-5 a lane, so at most about 43 of the sweep's 469,084
-    /// lanes [derived].
-    /// PIN(2026-10-12): the first measurement of this build, 26; see the sweep line.
-    const CLAMP_SWEEP_PIN: usize = 26;
-    /// The same for block 0's MLP rows of the full-tap image (4,194,304 values).
-    /// PIN(2026-10-12): the first measurement of this build, 0; see the rule line.
-    const ACT_BLK0_PIN: usize = 0;
-    /// The same for the merger MLP's rows of the full-tap image (2,621,440 values): the sweep's
-    /// per-lane bound allows 240, the chain's gate values sit mostly near zero where `expf` is
-    /// exact more often.
-    /// PIN(2026-10-12): the first measurement of this build, 1; see the rule line.
-    const ACT_MERGER_PIN: usize = 1;
+    /// How far the card's `exp(−g)` in the clamped SwiGLU may lie from the host's, relative to the
+    /// host's value [derived]: the kernel's `f32::exp` is libdevice's `__nv_expf`, within 2 ulp of
+    /// the true value, and the host's (glibc `expf`) within 0.502 ulp; an ulp of a normal f32 is at
+    /// most 2⁻²³ of it, so the two lie within 2.502·2⁻²³ of each other, and 3·2⁻²³ covers it.
+    /// Every later op of the rule is the same IEEE op on both sides (`1 + e`, `g / ·`, `· u`, each
+    /// rounded to nearest, then one round to nearest even to bf16; the kernel's `add_rn`, `div_rn`
+    /// and `mul_rn` admit no contraction), and the rule is monotone in `e`, so the card's value of
+    /// a lane is one of the bf16 values between the rule's roundings at the two ends of this room
+    /// ([`swiglu_band`]); one outside it is a defect on any card.
+    /// PIN(2026-11-18): this room replaces the count pins of lanes one bf16 step from the host
+    /// rounding (sweep 26, block 0 0, merger 1), first measurements on sm_86 that held there only
+    /// because the chain's inputs did: on the RTX 5090 the tensor cores' merger.gu sums land
+    /// elsewhere (23,600 of 5,242,880 from the exact rounding against 27,094) and 4 merger lanes sit
+    /// one step from the host rounding, the sweep's fixed inputs still 26.
+    const EXP_ROOM: f64 = 3.0 / 8_388_608.0;
+    /// The absolute room beside [`EXP_ROOM`] for an `exp(−g)` below the normal range, where an
+    /// ulp is 2⁻¹⁴⁹ whatever the value: three of them.
+    const EXP_ROOM_SUBNORMAL: f64 = 3.0 * f32::from_bits(1) as f64;
 
     // ------------------------------------------------------------ taps
 
@@ -275,13 +276,129 @@ mod gate {
         f32_bf16(swiglu_clamp_rule(bf16_f32(g), bf16_f32(u), limit))
     }
 
-    /// The clamped SwiGLU of fused `[gate | up]` rows of `gu` (`2·ff` values each) against `got`.
-    fn act_rule(name: &str, gu: &[u16], ff: usize, got: &[u16], limit: f32, pin: usize) -> bool {
-        let want: Vec<u16> = gu
-            .chunks_exact(2 * ff)
-            .flat_map(|r| (0..ff).map(move |j| swiglu_want(r[j], r[ff + j], limit)))
+    /// [`swiglu_clamp_rule`] with `e` in place of its `exp(−g)`: the same clamps and the same f32
+    /// ops in its order. [`clamp_sweep`] holds it to the rule at the host's own `e`.
+    fn swiglu_at(g: f32, u: f32, limit: f32, e: f32) -> f32 {
+        let g = if g > limit { limit } else { g };
+        let u = if u > limit {
+            limit
+        } else if u < -limit {
+            -limit
+        } else {
+            u
+        };
+        g / (1.0 + e) * u
+    }
+
+    /// The largest f32 at most `v` (`v` ≥ 0).
+    fn f32_down(v: f64) -> f32 {
+        let f = v as f32;
+        if f64::from(f) > v {
+            f32::from_bits(f.to_bits() - 1)
+        } else {
+            f
+        }
+    }
+
+    /// The smallest f32 at least `v` (`v` ≥ 0); past the largest finite, infinity.
+    fn f32_up(v: f64) -> f32 {
+        let f = v as f32;
+        if f64::from(f) < v {
+            f32::from_bits(f.to_bits() + 1)
+        } else {
+            f
+        }
+    }
+
+    /// The lowest and highest bf16 value the clamped SwiGLU may give for the pair `(g, u)` on a
+    /// card ([`EXP_ROOM`]): the rule's roundings at the two ends of `exp(−g)`'s room and the host
+    /// rounding between them, ordered by value. `None` where the rule is NaN, where only a NaN is
+    /// right.
+    fn swiglu_band(g: u16, u: u16, limit: f32) -> Option<[u16; 2]> {
+        let centre = swiglu_want(g, u, limit);
+        if bf16_f32(centre).is_nan() {
+            return None;
+        }
+        let (gf, uf) = (bf16_f32(g), bf16_f32(u));
+        let e = f64::from((-(if gf > limit { limit } else { gf })).exp());
+        let lo = f32_down((e * (1.0 - EXP_ROOM) - EXP_ROOM_SUBNORMAL).max(0.0));
+        let hi = f32_up(e * (1.0 + EXP_ROOM) + EXP_ROOM_SUBNORMAL);
+        let mut ends: Vec<u16> = [lo, hi]
+            .iter()
+            .map(|&x| f32_bf16(swiglu_at(gf, uf, limit, x)))
+            .filter(|&y| !bf16_f32(y).is_nan())
+            .chain([centre])
             .collect();
-        near_check(name, got, &want, pin)
+        ends.sort_by(|a, b| bf16_f32(*a).total_cmp(&bf16_f32(*b)));
+        Some([ends[0], ends[ends.len() - 1]])
+    }
+
+    /// Whether `y` is a value [`swiglu_band`]'s `band` admits.
+    fn in_band(band: Option<[u16; 2]>, y: u16) -> bool {
+        match band {
+            None => bf16_f32(y).is_nan(),
+            Some([lo, hi]) => {
+                let v = bf16_f32(y);
+                y == lo || y == hi || (bf16_f32(lo) < v && v < bf16_f32(hi))
+            }
+        }
+    }
+
+    /// `(g, u)` lanes and the card's result of each against [`swiglu_band`]: how many fall
+    /// outside it, how many differ from the host rounding, and the first lane outside.
+    fn swiglu_outside(
+        lanes: impl Iterator<Item = ((u16, u16), u16)>,
+        limit: f32,
+    ) -> (usize, usize, usize, Option<(u16, u16, u16)>) {
+        let (mut n, mut outside, mut differ, mut first) = (0usize, 0usize, 0usize, None);
+        for ((g, u), y) in lanes {
+            n += 1;
+            if !in_band(swiglu_band(g, u, limit), y) {
+                outside += 1;
+                first.get_or_insert((g, u, y));
+            }
+            differ += usize::from(y != swiglu_want(g, u, limit));
+        }
+        (n, outside, differ, first)
+    }
+
+    /// [`swiglu_outside`] as a clause over `want` lanes and `results` card values: no lane outside
+    /// the band, and one value a lane.
+    fn swiglu_check(
+        name: &str,
+        lanes: impl Iterator<Item = ((u16, u16), u16)>,
+        (want, results): (usize, usize),
+        limit: f32,
+    ) -> bool {
+        let (n, outside, differ, first) = swiglu_outside(lanes, limit);
+        let pass = n == want && results == want && outside == 0;
+        println!(
+            "rule {name:<17} {outside} of {want} outside the expf room 3·2⁻²³ ({results} values), {differ} differ from the host rounding  {}",
+            verdict(pass)
+        );
+        if let Some((g, u, y)) = first {
+            println!(
+                "rule {name:<17} first outside: gate {g:#06x} ({:e}) up {u:#06x} ({:e}) gives {y:#06x} ({:e}), the host rule {:#06x}",
+                bf16_f32(g),
+                bf16_f32(u),
+                bf16_f32(y),
+                swiglu_want(g, u, limit)
+            );
+        }
+        pass
+    }
+
+    /// The clamped SwiGLU of fused `[gate | up]` rows of `gu` (`2·ff` values each) against `got`.
+    fn act_rule(name: &str, gu: &[u16], ff: usize, got: &[u16], limit: f32) -> bool {
+        let pairs = gu
+            .chunks_exact(2 * ff)
+            .flat_map(|r| (0..ff).map(move |j| (r[j], r[ff + j])));
+        swiglu_check(
+            name,
+            pairs.zip(got.iter().copied()),
+            (gu.len() / 2, got.len()),
+            limit,
+        )
     }
 
     /// Block 0 and the merger of the full-tap image, op by op, on our own tapped inputs.
@@ -453,7 +570,7 @@ mod gate {
         ok &= exact_check("blk0.resid1 epi", resid1, &want);
         ok &= exact_check("blk0.norm2", norm2, &norm_rows(resid1, &w.ln2, hp.eps));
         ok &= gemm_check("blk0.gu", norm2, &w.gu_w, Some(&w.gu_b), n, 2 * ff, dim, gu);
-        ok &= act_rule("blk0.swiglu", gu, ff, act, hp.swiglu_clamp, ACT_BLK0_PIN);
+        ok &= act_rule("blk0.swiglu", gu, ff, act, hp.swiglu_clamp);
         ok &= gemm_check(
             "blk0.down",
             act,
@@ -535,14 +652,7 @@ mod gate {
             out_dim,
             mgu,
         );
-        ok &= act_rule(
-            "merger.swiglu",
-            mgu,
-            MERGER_FF,
-            mact,
-            hp.swiglu_clamp,
-            ACT_MERGER_PIN,
-        );
+        ok &= act_rule("merger.swiglu", mgu, MERGER_FF, mact, hp.swiglu_clamp);
         ok &= gemm_check(
             "merger.down",
             mact,
@@ -558,12 +668,6 @@ mod gate {
     }
 
     // ------------------------------------------------------------ once-per-run rules
-
-    /// How often the rule a mutant would put in the kernel's place must differ from the kernel's
-    /// rule for a sweep to tell the two apart: ten times its pinned count, at least ten.
-    fn premise_floor(pin: usize) -> usize {
-        10 * pin.max(1)
-    }
 
     /// The erf GELU on every normal bf16 value in [−8, 8] against the host rule inside the erf
     /// bound, and the premise that the bound tells it from the tanh GELU: the tanh rule's results
@@ -588,9 +692,11 @@ mod gate {
     }
 
     /// The clamped SwiGLU kernel over every normal bf16 gate value in [−30, 30] against up values
-    /// on both sides of the limit (and the limit itself, zeros, NaN), and NaN gates: the f32 rule
-    /// rounded once at a pinned count, a NaN lane a NaN on the card and nothing else one, and the
-    /// premise that the sweep tells the clamp from the plain SwiGLU.
+    /// on both sides of the limit (and the limit itself, zeros, NaN), and NaN gates: every lane
+    /// inside the rule's band ([`swiglu_band`]), a NaN lane a NaN on the card and nothing else one,
+    /// the band's centre the host rule at every lane ([`swiglu_at`] at the host's `exp` is
+    /// [`swiglu_clamp_rule`]), and the premise that the band tells the clamp from the plain SwiGLU:
+    /// the unclamped rule's roundings fall outside it somewhere.
     fn clamp_sweep(
         ctx: &Arc<CudaContext>,
         stream: &CudaStream,
@@ -618,8 +724,8 @@ mod gate {
         MlpKernels::load(ctx)?.enqueue(stream, &du, ff, rows, Some(limit), &mut dy)?;
         stream.synchronize()?;
         let got = dy.to_host_vec(stream)?;
-        let (mut g_ok, mut w_ok, mut nan_lanes, mut nan_ok, mut bites) =
-            (Vec::new(), Vec::new(), 0usize, true, 0usize);
+        let (mut lanes, mut nan_lanes, mut nan_ok, mut centre_off, mut tells) =
+            (Vec::new(), 0usize, true, 0usize, 0usize);
         for (r, &up) in ups.iter().enumerate() {
             for (j, &g) in gates.iter().enumerate() {
                 let want = swiglu_want(g, up, limit);
@@ -629,25 +735,31 @@ mod gate {
                     nan_ok &= bf16_f32(y).is_nan();
                 } else {
                     nan_ok &= !bf16_f32(y).is_nan();
-                    g_ok.push(y);
-                    w_ok.push(want);
-                    bites += usize::from(swiglu_want(g, up, f32::INFINITY) != want);
+                    lanes.push(((g, up), y));
+                    let (gf, uf) = (bf16_f32(g), bf16_f32(up));
+                    let e = (-(if gf > limit { limit } else { gf })).exp();
+                    centre_off += usize::from(f32_bf16(swiglu_at(gf, uf, limit, e)) != want);
+                    let plain = swiglu_want(g, up, f32::INFINITY);
+                    tells += usize::from(!in_band(swiglu_band(g, up, limit), plain));
                 }
             }
         }
-        let mut ok = near_check("swiglu_clamp sweep", &g_ok, &w_ok, CLAMP_SWEEP_PIN);
+        let n = lanes.len();
+        let mut ok = swiglu_check("swiglu_clamp sweep", lanes.into_iter(), (n, n), limit);
         println!(
             "rule swiglu_clamp NaN   {nan_lanes} lanes with a NaN input are NaN on the card, no other lane is: {}",
             verdict(nan_ok)
         );
-        let tells = bites >= premise_floor(CLAMP_SWEEP_PIN);
         println!(
-            "rule swiglu_clamp prem. the unclamped rule (one rounding) differs from the clamped one at {bites} of {} lanes (at least {}): {}",
-            g_ok.len(),
-            premise_floor(CLAMP_SWEEP_PIN),
-            verdict(tells)
+            "rule swiglu_clamp band  the band's centre is the host rule at {} of {n} lanes: {}",
+            n - centre_off,
+            verdict(centre_off == 0)
         );
-        ok &= nan_ok && tells;
+        println!(
+            "rule swiglu_clamp prem. the unclamped rule (one rounding) falls outside the clamped one's band at {tells} of {n} lanes: {}",
+            verdict(tells > 0)
+        );
+        ok &= nan_ok && centre_off == 0 && tells > 0;
         Ok(ok)
     }
 

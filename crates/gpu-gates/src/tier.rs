@@ -33,6 +33,10 @@
 //! - [`Tag::NoLayoutLayer`]: a clause that reads a layer layout of which the file
 //!   it opens holds no layer ([`layout_clause`]). The real tier runs it; the
 //!   fixture tier leaves it to the real tier, by name.
+//! - [`Tag::NoCardRoom`]: a clause that needs more card bytes than the card in
+//!   view has ([`room_clause`]). Neither tier runs it there; both leave it, by
+//!   name, to a card with the room. The line is the deferral's own, the one
+//!   the batch counts.
 //!
 //! The `real` tier runs every clause except the fixture's oracle comparisons,
 //! tagged or not: nothing changes for a gate that declares no tags. Each of
@@ -91,7 +95,7 @@ pub enum Tier {
     Fixture,
 }
 
-/// What a clause answers (the module doc names the eight).
+/// What a clause answers (the module doc names the nine).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tag {
     /// Two arms of the engine under one plan agree.
@@ -116,11 +120,14 @@ pub enum Tag {
     /// A clause that reads a layer layout of which the file it opens holds no layer: the clause
     /// has no input there, and a file that has one answers it.
     NoLayoutLayer,
+    /// A clause that needs more card bytes than the card in view has: the clause has no room
+    /// there, in either tier, and a card with the room answers it.
+    NoCardRoom,
 }
 
 impl Tag {
     /// Every tag, in the order the module doc names them.
-    pub const ALL: [Tag; 8] = [
+    pub const ALL: [Tag; 9] = [
         Tag::SelfConsistency,
         Tag::Oracle,
         Tag::FileBound,
@@ -129,6 +136,7 @@ impl Tag {
         Tag::NoCardLayer,
         Tag::NoHostLayer,
         Tag::NoLayoutLayer,
+        Tag::NoCardRoom,
     ];
 
     /// The tag's name as a [`DEFERRED`] line prints it.
@@ -143,6 +151,7 @@ impl Tag {
             Tag::NoCardLayer => "no-card-layer",
             Tag::NoHostLayer => "no-host-layer",
             Tag::NoLayoutLayer => "no-layout-layer",
+            Tag::NoCardRoom => "no-card-room",
         }
     }
 }
@@ -152,7 +161,8 @@ impl Tag {
 pub enum Decision {
     /// The gate runs the clause.
     Run,
-    /// The clause is left to the real tier.
+    /// The clause is left to the real tier, or to a card with the room
+    /// ([`Tag::NoCardRoom`]).
     Deferred(Tag),
     /// The clause is a [`Tag::FixtureOracle`] one, which only the fixture
     /// tier can answer.
@@ -255,11 +265,12 @@ impl Tier {
         }
     }
 
-    /// Whether this tier runs a clause carrying `tag`.
+    /// Whether this tier runs a clause carrying `tag`. A [`Tag::NoCardRoom`] clause is run by
+    /// neither: its tag says the card in view lacks the room, whatever the tier.
     #[must_use]
     pub fn runs(self, tag: Tag) -> bool {
         match self {
-            Tier::Real => tag != Tag::FixtureOracle,
+            Tier::Real => !matches!(tag, Tag::FixtureOracle | Tag::NoCardRoom),
             Tier::Fixture => matches!(tag, Tag::SelfConsistency | Tag::FixtureOracle),
         }
     }
@@ -268,7 +279,7 @@ impl Tier {
     /// tag). The real tier runs every clause but a fixture-oracle one, which
     /// it leaves to the fixture tier. The fixture tier runs a self-consistency
     /// or fixture-oracle clause, defers the others, and refuses an untagged
-    /// one.
+    /// one. A [`Tag::NoCardRoom`] clause is deferred in both tiers.
     ///
     /// # Errors
     /// [`TierError::Untagged`] for a clause with no tag in the fixture tier.
@@ -276,6 +287,7 @@ impl Tier {
         match (self, tag) {
             (Tier::Fixture, None) => Err(TierError::Untagged(clause.to_string())),
             (_, None) => Ok(Decision::Run),
+            (_, Some(Tag::NoCardRoom)) => Ok(Decision::Deferred(Tag::NoCardRoom)),
             (_, Some(tag)) if self.runs(tag) => Ok(Decision::Run),
             // `runs` leaves only a fixture-oracle clause to the fixture tier.
             (Tier::Real, Some(_)) => Ok(Decision::FixtureOnly),
@@ -599,6 +611,47 @@ fn layout_clause_in(
     out: &mut impl std::io::Write,
 ) -> Result<bool, GateError> {
     input_clause_in(tier, !holds, Tag::NoLayoutLayer, name, tally, out)
+}
+
+/// The clause `name` of a gate that needs card bytes: a self-consistency clause, run in both tiers,
+/// when `room_enough` says the card in view has them. When it does not, the clause declares
+/// [`Tag::NoCardRoom`] and both tiers leave it, its [`DEFERRED`] line naming the tag (the line the
+/// batch counts), so a card too small for it is a named deferral and never a red or a silent skip.
+/// `room_enough` is a fact the caller derives from the card and the load, never from a failed load:
+/// an out-of-memory that a card with the room raises stays red. `Ok(false)`: the clause was left,
+/// skip it.
+///
+/// # Errors
+/// As [`run_clause`].
+pub fn room_clause(name: &str, room_enough: bool) -> Result<bool, GateError> {
+    room_clause_in(
+        Tier::from_env()?,
+        room_enough,
+        name,
+        &TALLY,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+/// [`room_clause`] of its inputs: the tier, whether the card has the room, the tally and the sink.
+fn room_clause_in(
+    tier: Tier,
+    room_enough: bool,
+    name: &str,
+    tally: &Tally,
+    out: &mut impl std::io::Write,
+) -> Result<bool, GateError> {
+    let tag = if room_enough {
+        Tag::SelfConsistency
+    } else {
+        Tag::NoCardRoom
+    };
+    let runs = run_clause_in(tier, name, tag, tally, out)?;
+    if runs || tag == Tag::NoCardRoom {
+        Ok(runs)
+    } else {
+        Err(format!("the self-consistency clause {name:?} was deferred").into())
+    }
 }
 
 /// A self-consistency clause: it runs in both tiers, so a tier that deferred it is refused by name
@@ -1255,10 +1308,10 @@ mod tests {
     use super::*;
     use refset::family::Identity;
 
-    /// The eight tags are the eight kinds of clause the module doc names, once
+    /// The nine tags are the nine kinds of clause the module doc names, once
     /// each, and every name prints as one word.
     #[test]
-    fn eight_tags_in_the_docs_order() {
+    fn nine_tags_in_the_docs_order() {
         let names: Vec<&str> = Tag::ALL.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
@@ -1270,7 +1323,8 @@ mod tests {
                 "fixture-oracle",
                 "no-card-layer",
                 "no-host-layer",
-                "no-layout-layer"
+                "no-layout-layer",
+                "no-card-room"
             ]
         );
         assert!(names.iter().all(|n| !n.contains(' ')));
@@ -1292,15 +1346,15 @@ mod tests {
         }
     }
 
-    /// The rule: the real tier runs every tag but the fixture's oracle, the
-    /// fixture tier runs self-consistency and the fixture's oracle. Mutant:
-    /// the real tier running `FixtureOracle`, or the fixture tier `Oracle`.
+    /// The rule: the real tier runs every tag but the fixture's oracle and the card's lack of room,
+    /// the fixture tier runs self-consistency and the fixture's oracle. Mutant: the real tier
+    /// running `FixtureOracle` or `NoCardRoom`, or the fixture tier `Oracle`.
     #[test]
     fn each_tier_runs_its_tags() {
         for tag in Tag::ALL {
             assert_eq!(
                 Tier::Real.runs(tag),
-                tag != Tag::FixtureOracle,
+                !matches!(tag, Tag::FixtureOracle | Tag::NoCardRoom),
                 "real and {}",
                 tag.name()
             );
@@ -1313,11 +1367,12 @@ mod tests {
         }
     }
 
-    /// A clause's fate in each tier, the eight tags and an untagged clause:
+    /// A clause's fate in each tier, the nine tags and an untagged clause:
     /// the real tier runs everything but a fixture-oracle clause, which it
-    /// leaves to the fixture tier; the fixture tier runs self-consistency and
-    /// fixture-oracle clauses, defers the other four with their tag, and
-    /// refuses an untagged one. Mutant: any cell changed.
+    /// leaves to the fixture tier, and a no-card-room clause, which it
+    /// defers; the fixture tier runs self-consistency and fixture-oracle
+    /// clauses, defers the other five with their tag, and refuses an
+    /// untagged one. Mutant: any cell changed.
     #[test]
     fn a_clauses_fate_in_each_tier() {
         let table = [
@@ -1344,6 +1399,11 @@ mod tests {
                 Tag::NoLayoutLayer,
                 Decision::Run,
                 Decision::Deferred(Tag::NoLayoutLayer),
+            ),
+            (
+                Tag::NoCardRoom,
+                Decision::Deferred(Tag::NoCardRoom),
+                Decision::Deferred(Tag::NoCardRoom),
             ),
         ];
         assert_eq!(table.len(), Tag::ALL.len());
@@ -1481,6 +1541,32 @@ mod tests {
         );
         assert_eq!(call(Tier::Real, false), (true, String::new(), (1, 0, 0)));
         assert_eq!(call(Tier::Real, true), (true, String::new(), (1, 0, 0)));
+    }
+
+    /// The room clause runs as a self-consistency clause whenever the card has the room, in either
+    /// tier; a card without it leaves the clause in both tiers by its own tag, the line the batch
+    /// counts, and counts it with the deferrals. Mutant: `room_enough` taken in place of
+    /// `!room_enough`, the real tier running the clause, the tag borrowed from another kind (the
+    /// line names it), or the deferral not counted.
+    #[test]
+    fn the_room_clause_is_left_only_on_a_card_without_the_room() {
+        let call = |tier: Tier, room_enough: bool| {
+            let (tally, mut out) = (Tally::new(), Vec::new());
+            let runs = room_clause_in(tier, room_enough, "(n2) against (n1)", &tally, &mut out)
+                .expect("a room clause");
+            (runs, String::from_utf8(out).expect("UTF-8"), tally.counts())
+        };
+        for tier in [Tier::Real, Tier::Fixture] {
+            assert_eq!(call(tier, true), (true, String::new(), (1, 0, 0)));
+            assert_eq!(
+                call(tier, false),
+                (
+                    false,
+                    "deferred(real) no-card-room: (n2) against (n1)\n".to_string(),
+                    (0, 1, 0)
+                )
+            );
+        }
     }
 
     /// The NVMe tier's clause runs as a self-consistency clause whenever the file keeps enough

@@ -133,8 +133,10 @@
 //!   prefix. The child then leaves the [`PROMPT`] positions of its tiered run — the fed id as
 //!   each position's token, so every row is same-context evidence — and the gate feeds
 //!   the same ids over the tiered carve of the plan without the file and walks the child's
-//!   positions against its own within the logits band (`logits_band::walk_at`, every position
-//!   at the placement margin `prompts::PLACE_MARGIN_V41`). The two plans keep
+//!   positions against its own within the logits band (`logits_band::walk_pinned`, every
+//!   position at the placement margin: the real tier's `prompts::PLACE_MARGIN_V41` in the shared
+//!   band, the fixture's `prompts::PLACE_MARGIN_V41_FIXTURE` in its pair's own band
+//!   `logits_band::PLACE_PINS_V41_FIXTURE`). The two plans keep
 //!   other experts on the card and the host, and a card expert and a host expert are not one
 //!   result bit for bit, so across plans the rows sit within the band, not on bits.
 //!
@@ -198,7 +200,7 @@ mod gate {
         TIER_MAP_BEFORE_UPLOAD, TierOpen,
     };
     use bloomery_gpu_gates::logits_band::{self, Positions};
-    use bloomery_gpu_gates::prompts::{MARGIN_FLOOR, PLACE_MARGIN_V41};
+    use bloomery_gpu_gates::prompts::{PLACE_MARGIN_V41, PLACE_MARGIN_V41_FIXTURE};
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, record};
     use bloomery_levers::{
@@ -849,18 +851,23 @@ mod gate {
     /// [`in_band`] for a walk that starts at the prompt's position 0 (the rank clause's): the
     /// runs record the fed id as each prompt position's token, so every position's row is
     /// same-context evidence and the walk judges them all at the placement margin — the real
-    /// tier's [`PLACE_MARGIN_V41`], the fixture tier's the e2e floor: the two plans run other
-    /// experts on the card and the host.
+    /// tier's [`PLACE_MARGIN_V41`] in the shared band, the fixture tier's
+    /// [`PLACE_MARGIN_V41_FIXTURE`] in the band its own pair derives
+    /// (`logits_band::PLACE_PINS_V41_FIXTURE`): the two plans run other experts on the card and
+    /// the host.
     // PIN(2026-11-12): the rank walk recorded the argmax as each position's token, so it parted
     // at the first argmax flip — 1 of the reference's 64 positions compared — although both arms
     // were fed the same prompt id and stood at the same context; the fed id is the position's
     // context token, and every row is judged.
     fn in_band_from_zero(what: &str, want: &Run, got: &Run) -> Result<bool, GateError> {
-        let margin = match tier::Tier::from_env()? {
-            tier::Tier::Real => PLACE_MARGIN_V41,
-            tier::Tier::Fixture => MARGIN_FLOOR,
+        let (margin, pins) = match tier::Tier::from_env()? {
+            tier::Tier::Real => (PLACE_MARGIN_V41, logits_band::Pins::SHARED),
+            tier::Tier::Fixture => (
+                PLACE_MARGIN_V41_FIXTURE,
+                logits_band::PLACE_PINS_V41_FIXTURE,
+            ),
         };
-        Ok(logits_band::walk_at(what, want.positions(), got.positions(), margin).ok)
+        Ok(logits_band::walk_pinned(what, want.positions(), got.positions(), margin, pins).ok)
     }
 
     fn open(

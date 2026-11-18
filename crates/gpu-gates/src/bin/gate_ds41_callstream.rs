@@ -805,6 +805,9 @@ mod gate {
             R8,
         ])?)?;
         let (at, only_residency) = parse_args()?;
+        // The placement's cards are the devices in view (`a` the largest, `bp` it and the next),
+        // not a workstation card by name: the plan's open finds each by its device.
+        let at = at.on_host()?;
         let mut cfg = OpenCfg::from_levers(&levers)?;
         cfg.body.residency = RESIDENCY;
         cfg.body.prefill = PrefillMode::Batch;

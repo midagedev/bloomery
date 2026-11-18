@@ -313,7 +313,9 @@ mod gate {
         // none.
         cfg.place = tier::plan_levers(&head, &levers, 0)?;
         drop(head);
-        let machine = Place::A.machine(None, None)?;
+        // Plan (a) on the largest card in view, which the plan's open finds by its device; a
+        // workstation card by name would name a card this machine may not have.
+        let machine = Place::A.on_host()?.machine(None, None)?;
         let margin = match tier::Tier::from_env()? {
             tier::Tier::Real => PLACE_MARGIN_V41,
             tier::Tier::Fixture => MARGIN_FLOOR,

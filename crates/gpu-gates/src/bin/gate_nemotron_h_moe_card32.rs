@@ -11,10 +11,12 @@
 //! Three placed loads of the file, one after another on one card, each released before the next
 //! opens: `host` (every expert on the host, the path the file ran before the card read its
 //! types), `card` (the gate plan's card, `gate_card`: the planner's experts on the card, the rest
-//! on the host, so every layer runs the card's share beside the host's) and `whole` (the
-//! A6000's room, where the plan holds every expert on the card and every layer runs whole, the
-//! path the seat serves on the A6000). The `whole` arm needs the A6000's room, so the recipe
-//! takes that card; another card in view ends the gate by name.
+//! on the host, so every layer runs the card's share beside the host's) and `whole` (the card in
+//! view's own room, `gate_card::room`, where the plan holds every expert on the card and every
+//! layer runs whole, the path the seat serves on a card with the room). The `whole` arm needs a
+//! card whose plan holds every expert: where the plan of the card in view does not, the clauses
+//! that read that arm are left by name (`tier::room_clause`, `no-card-room`) and the other arms
+//! run.
 //!
 //! The clauses, each printing lines ending in PASS or FAIL (a step that raises the card's fault
 //! word is a FAIL naming the fault):
@@ -26,7 +28,8 @@
 //!   arm's top-1 margin passes twice the max |Δ|: the card's relu² and the host's differ by their
 //!   activations' rounding and their sums' order alone.
 //! - `card32_whole_near_host` (self-consistency): the `whole` plan holds every expert on the
-//!   card, or the clause fails as vacuous; its eager and replayed walks are bit-identical, and its
+//!   card (the plan is read before the arm loads, and a card whose plan keeps an expert on the host
+//!   leaves the clause by name, `no-card-room`); its eager and replayed walks are bit-identical, and its
 //!   logits keep the same floor and argmax band against the `host` arm's.
 //! - `card32_prompt_near_steps` (self-consistency): on the `card` and `whole` arms, the prompt
 //!   path over the walk at passes of [`moe_arm::COLS`] rows and at the load's pass rows (the
@@ -66,7 +69,7 @@ mod gate {
     use crate::e2e::walk;
     use crate::gate_card;
     use crate::moe_arm::{
-        CTX_SPARE, PROMPT_LEN, Premise, Words, arm, last_logits, near_host, prompt_arm,
+        CTX_SPARE, PROMPT_LEN, Premise, Words, arm, last_logits, near_host, prompt_arm, whole_fits,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, open_split};
@@ -74,7 +77,6 @@ mod gate {
     use model::arch::nemotron_h_moe::hparams::Hparams;
     use model::arch::nemotron_h_moe::place::{self as moe_place, Forms};
     use model::placement::PlanLevers;
-    use model::placement::workstation::{self, CardSpec};
 
     const NAME: &str = "gate_nemotron_h_moe_card32";
 
@@ -84,6 +86,8 @@ mod gate {
     const SPLIT: &str = "card32_split_near_host";
     const WHOLE: &str = "card32_whole_near_host";
     const PROMPT: &str = "card32_prompt_near_steps";
+    /// The prompt clause's part on the `whole` arm, left where the card has no room for the arm.
+    const PROMPT_WHOLE: &str = "card32_prompt_near_steps (whole arm)";
 
     /// What the split arm is called in the clauses' lines.
     const SPLIT_ARM: &str = "card";
@@ -116,21 +120,22 @@ mod gate {
         let ids = walk(PROMPT_LEN, hp.n_vocab);
         let ctx = u64::try_from(PROMPT_LEN + CTX_SPARE)?;
         let split = tier::run_clause(SPLIT, Tag::SelfConsistency)?;
-        let whole = tier::run_clause(WHOLE, Tag::SelfConsistency)?;
         let prompt = tier::run_clause(PROMPT, Tag::SelfConsistency)?;
         let gate = gate_card::card()?;
-        if gate.name != workstation::A6000.name {
-            return Err(format!(
-                "{NAME}'s `whole` arm holds the whole file on the card, which only the A6000's \
-                 room does; the card in view is the {}: run it with BLOOMERY_GATE_CARD=a6000",
-                gate.name
-            )
-            .into());
+        let room = gate_card::room()?;
+        // The `whole` arm's premise, read from the plan before any load: a card whose plan keeps
+        // an expert on the host leaves the clauses that read the arm.
+        let fits = whole_fits(&inputs, (&hp, ctx), room)?;
+        println!(
+            "{WHOLE}: the plan of the card in view ({} bytes) holds every expert on the card: \
+             {fits}",
+            room.total_bytes
+        );
+        let whole = tier::room_clause(WHOLE, fits)?;
+        if prompt && !fits {
+            // The prompt clause reads the `whole` arm too: that part is left by name.
+            tier::room_clause(PROMPT_WHOLE, false)?;
         }
-        let room = CardSpec {
-            name: gate.name,
-            ..workstation::A6000
-        };
         let words = Words::clause();
         // Each arm is released before the next opens: no two share the card.
         let host_last = if split || whole {
@@ -144,11 +149,11 @@ mod gate {
             None
         };
         let mut ok = true;
-        for (clause, name, premise, spec, on) in [
-            (SPLIT, SPLIT_ARM, Premise::Split, gate, split),
-            (WHOLE, "whole", Premise::Whole, room, whole),
+        for (clause, name, premise, spec, on, prompt_on) in [
+            (SPLIT, SPLIT_ARM, Premise::Split, gate, split, prompt),
+            (WHOLE, "whole", Premise::Whole, room, whole, prompt && fits),
         ] {
-            if !on && !prompt {
+            if !on && !prompt_on {
                 continue;
             }
             let run = arm(
@@ -165,7 +170,7 @@ mod gate {
                     host_last.as_deref(),
                 );
             }
-            if prompt {
+            if prompt_on {
                 ok &= prompt_arm(PROMPT, name, run, &ids)?;
             }
         }

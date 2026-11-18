@@ -2322,15 +2322,17 @@ gate-gpu-minimaxm3-twocard:
     BLOOMERY_MODEL=minimax-m3 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-minimaxm3-twocard && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features minimaxm3,checkpoint --release --bin gate_minimaxm3_prefill && BLOOMERY_GATE_BOUND=2400 bash tools/gpu-gate.sh gate_minimaxm3_prefill --arm bp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_minimaxm3_serve && D=target/minimaxm3-serve-twocard && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=1800 bash tools/gpu-gate.sh gate_minimaxm3_serve --dir $D'
 
 # Nemotron-H MoE (Lightning) with its 32-value experts on the card (Relu2Leg for the step, the 32-value GEMM for the
-# prompt): host, card (the 3090's room, split) and whole (the A6000's room, box.sh's pick) arms near the host path [derived: 8..12 min,
-# mostly the build; three 25.5 GB loads]. The nemotron_h_moe profile's file is Bolt's (IQ2_XXS stacks); the gate runs
+# prompt): host, card (the 3090's room, split) and whole (the card in view's own room) arms near the host path [derived: 8..12 min,
+# mostly the build; three 25.5 GB loads]. The whole arm's plan is read before it loads: a card whose plan keeps an expert on the
+# host leaves the clauses that read the arm by name (`deferred(real) no-card-room`). The nemotron_h_moe profile's file is Bolt's (IQ2_XXS stacks); the gate runs
 # Lightning's UD-Q4_K_XL, which BLOOMERY_REF_MODEL moves the profile to.
 gate-gpu-nemotron-h-moe-card32:
     BLOOMERY_REF_MODEL="${BLOOMERY_REF_MODEL:-/models/Nemotron-3.5-Lightning/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-UD-Q4_K_XL.gguf}" BLOOMERY_MODEL=nemotron_h_moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-nemotron-h-moe-card32 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_nemotron_h_moe_card32 && bash tools/gpu-gate.sh gate_nemotron_h_moe_card32'
 
 # Nemotron-H MoE (Lightning) read from its ModelOpt checkpoint folder (NVFP4 routed experts, the dense projections
 # made at load): host (every expert on the host, read from the folder in place), split (the whole plan's card bytes less
-# half its routed experts', so about half stay on the host) and whole (the A6000's room) arms near the host path, the prompt
+# half its routed experts', so about half stay on the host) and whole (the card in view's own room, left by name where its plan
+# keeps an expert on the host) arms near the host path, the prompt
 # path near its steps, and the logits' cosine against the UD-Q4_K_XL twin as a diagnostic [derived, not measured: the
 # four loads decide the wall, about 10..20 min; no gate-times row yet]. BLOOMERY_REF_MODEL moves the folder,
 # LIGHTNING_TWIN (in BLOOMERY_BOX_ENV) the twin.
@@ -3174,8 +3176,10 @@ gate-gpu-ds41-step *ARGS='--structure --sets --select --kld-walk --skew-structur
 # the one visible card, past one rank each a process of its own in a rank group over TCP ends on the loopback (the
 # bin's doc lists the clauses). The card budget is unset: a rank holds every expert on the card. Fixture-only (tools/ref/fixture-only.sh): the real file's ranks are loaded across
 # nodes, not on one card.
-# The card is the A6000 (box.sh's pick): a rank holds every expert of the v41-folder fixture on its card, which the
-# 24 GB card cannot hold (the 3090 reads DriverError out of memory at the load).
+# A rank holds every expert of the v41-folder fixture on the one card, so the card's room is the gate's fact: (n1) asks the
+# usable bytes of the least card it is measured green on and (n2), (n4) those of the one card the rank groups are (the bin's
+# ONE_RANK_ROOM and RANKS_ROOM, each a dated PIN); a card with less leaves the clause by name (`deferred(real) no-card-room`),
+# never loads to find out. The lane word `BLOOMERY_CARD=a6000` keeps a box's A6000 (the card in view on a one-card machine).
 gate-gpu-ds41-tp:
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ds41-tp && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,checkpoint --release --bin gate_deepseek41_tp && unset BLOOMERY_CARD_BUDGET && bash tools/gpu-gate.sh gate_deepseek41_tp'
 
@@ -3270,14 +3274,15 @@ gate-gpu-ds41-unpack:
 gate-gpu-ds41-callstream *ARGS:
     BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_ds41_callstream && bash tools/gpu-gate.sh gate_ds41_callstream {{ARGS}}'
 
-# The same residency clauses on plan (a), the serving plan: every layer and the head on the A6000, no tier card
+# The same residency clauses on plan (a), the serving plan: every layer and the head on the largest card in view, no tier card
 # (gate_ds41_callstream --place a --only residency; the tier clause asks that the host map holds no tier entry), and
 # the static clause, whose load of the dumped card table follows the residency load's teardown, then the serving
 # default's load: the word the V4.1 seat runs with BLOOMERY_RESIDENCY unset on this plan (mid-p0-s1 where the host takes
-# its churn pool, else the first P whose pool fits), its pinned count and c1. The A6000 alone, the host set locked, one
-# load at a time, alone in a batch.
+# its churn pool, else the first P whose pool fits), its pinned count and c1. The card alone, the host set locked, one
+# load at a time, alone in a batch. The binary plans the device it finds (`Place::on_host`), never a card by name.
 # Group solo-real, reason r1 (its host set is locked under the big-load lock: the whole file on the real tier, ~15 GB on a fixture)
-# on one card, the A6000 by box.sh's pick (`BLOOMERY_CARD=a6000`): alone in the real tier, and in the fixture tier fixed to lane B.
+# on one card, the lane word `BLOOMERY_CARD=a6000` (the A6000 where a box has one, else the card in view): alone in the real tier,
+# and in the fixture tier fixed to lane B.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-ds41-residency-a:
@@ -3288,9 +3293,11 @@ gate-gpu-ds41-residency-a:
 # the given slots, the tier built and covering every paged layer, one prompt call and greedy steps bit for bit the
 # all-RAM arm's, the tier's card leg unattached, the room under the floor, the arena under its floor and the r8
 # sidecar on a paged plan each refused by name, and the unset residency `off` with why `paged`. Each arm's room and
-# arena reach the plan through PlanInputs, so no environment crosses the tiers. The A6000 alone, one load at a time.
-# Group solo-real, reason r1 (its host set is the whole file on the real tier, ~15 GB on a fixture) on one card, the A6000 by
-# box.sh's pick (`BLOOMERY_CARD=a6000`): alone in the real tier, and in the fixture tier fixed to lane B.
+# arena reach the plan through PlanInputs, so no environment crosses the tiers. The largest card in view alone, one load at a
+# time; the binary plans the device it finds (`Place::on_host`), never a card by name.
+# Group solo-real, reason r1 (its host set is the whole file on the real tier, ~15 GB on a fixture) on one card, the lane word
+# `BLOOMERY_CARD=a6000` (the A6000 where a box has one, else the card in view): alone in the real tier, and in the fixture tier
+# fixed to lane B.
 [group('solo-real')]
 [group('v41-load')]
 gate-gpu-ds41-nvtier:

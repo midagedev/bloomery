@@ -40,10 +40,12 @@
 //!   the gate requires: lazy loading maps a kernel's code at its first launch,
 //!   inside load 1, and the context keeps that granule past the drop); the
 //!   first model's drop gives back everything but what its chain capture took
-//!   from the context (iv) and, when the body held the page-locked fallback's
-//!   shadows (a card that backs no host page), the one 2 MiB mapping granule
-//!   that capture keeps; the second load takes what the first took less that
-//!   granule, and its drop gives back all of it.
+//!   from the context (iv) and at most one of the card's mapping granules
+//!   (`cuMemGetAllocationGranularity`, read from the card), which the second
+//!   load must find mapped: it takes what the first took less that leftover,
+//!   and its drop gives back all of it. When the body held the page-locked
+//!   fallback's shadows (a card that backs no host page) and a capture keeps
+//!   their mapping, the leftover is exactly one granule.
 //! - (vi) slots: on every layer's routed stacks, at slots 0, n/2 and n − 1,
 //!   the stack's `_sel` gemv (`q3k_gemv_sel`, `q4k_gemv_sel`, `q5k_gemv_sel`)
 //!   is bit for bit the plain gemv of an upload of just that slot's expert's
@@ -127,10 +129,6 @@ mod gate {
     /// The serving context: the plan's and both loads'.
     const CTX_MAX: u64 = workstation::CTX_MAX;
 
-    /// The device granule a page-locked allocation of the shadows' size takes
-    /// from the card (check v).
-    const PINNED_GRANULE: i128 = 2 << 20;
-
     /// The device bundles a load binds: the probe's `Gpu` JITs the first, the
     /// gate the second, both before check (v)'s first reading.
     const BUNDLES: [&str; 2] = ["bloomery-gpu", "bloomery-gpu-deepseek41"];
@@ -184,6 +182,9 @@ mod gate {
         // granule rounding then sits in `free0`, and no drop owes it (check v).
         let _ds41_bundle = RopeKernels::load(probe.context())?;
         let device = probe.context().ordinal();
+        // The card's mapping granule, the one unit check (v)'s leftover is
+        // counted in.
+        let granule = bloomery_gpu::allocation_granularity(device)?;
         let bundles_before = bundle_loads_on(device);
         let free0 = free(&probe)?;
         println!(
@@ -243,8 +244,8 @@ mod gate {
         ok &= check_reload(
             [free0, free1, free2, free3, free4],
             captured,
-            shadow_host,
-            shadow_roomed,
+            (shadow_host, shadow_roomed),
+            granule,
         );
         crate::ds41_tier::sc("(vii) r8 off: the source read steps the r8 load's bits")?;
         ok &= check_r8_off(&path, &cfg)?;
@@ -259,8 +260,9 @@ mod gate {
              `_sel` gemv its expert's own; every layer's state is KvLayout's bytes; the step image \
              at positions 4, 301 and 1025 reads back as the plan's integers and RopeTable's \
              tables; the chain captures and a synthetic depth refuses; a second load takes what \
-             the first took and each drop gives back all but the context's capture (and, on the \
-             page-locked fallback's shadows, the granule it keeps); a load under BLOOMERY_R8=off \
+             the first took less the first drop's leftover, which is the context's capture and \
+             at most one card granule the second load finds mapped, and the second drop gives \
+             back all of it; a load under BLOOMERY_R8=off \
              reads the source and steps the r8 load's bits"
         );
         Ok(())
@@ -1101,9 +1103,10 @@ mod gate {
 
     /// Check (v): the card's free bytes before the first load, after it,
     /// after its drop, after the second load and after its drop. The first
-    /// model's drop leaves exactly `captured` behind — what its chain capture
-    /// took from the context (check iv) — and the second cycle, which
-    /// captures nothing, leaves nothing.
+    /// model's drop leaves what its chain capture took from the context
+    /// (check iv) and a leftover of at most one card mapping `granule`, which
+    /// the second load must find mapped (it takes the first load's bytes less
+    /// that leftover); the second cycle leaves nothing.
     /// PIN(2026-09-23): the first capture in a context takes 8 MiB the model's
     /// drop does not return and a second capture takes 0 (measured in the
     /// b5step round); before the chain captured, the pin was "every drop
@@ -1118,41 +1121,52 @@ mod gate {
     /// drop, sits in `before` whichever bundle's JIT maps it; it moved from
     /// the first load to the probe's open as the `bloomery-gpu` bundle grew
     /// (int039 batch: `before` 2 MiB lower, load 1 2 MiB less, every later
-    /// reading the same). The page-locked granule holds only while the body
-    /// held shadows (`shadow_host`) and a capture keeps the mapping
-    /// (`captured`).
+    /// reading the same).
     /// PIN(2026-11-12): the shadows are host rooms on a card that backs a
     /// host page (`Shadows::Room`, the kvcommon rework), which leaves no
-    /// page-locked granule: the first drop leaves exactly the capture's
-    /// bytes and the second load takes exactly what the first took. The
-    /// granule holds only on the page-locked fallback (`!roomed`, the card
-    /// cannot back a host page, named on stderr), which the load reads and
-    /// this check takes (`shadow_roomed`). FAIL-first: the logged run left 0
-    /// taken beside the capture with roomed shadows against the old
-    /// unconditional granule; a leak stays red — a growing leftover
-    /// (`took(before, dropped) > captured`) or a load-2 leftover
-    /// (`took(dropped, end) > 0`).
+    /// page-locked granule; the granule is exact only on the page-locked
+    /// fallback (`!roomed`, named on stderr) with a capture.
+    /// PIN(2026-11-18): the leftover beside the capture is at most one of the
+    /// card's mapping granules (read from the card, not a literal), and it
+    /// must be the context's: the second load finds it mapped. On an RTX 5090
+    /// (cc 12.0, roomed shadows, a capture of 0 B) load 1 took 7952400384 B,
+    /// its drop left 2097152 B (the card's granule), load 2 took 7950303232 B
+    /// (load 1 less that granule, and the sm_86 cards' load bytes to the
+    /// byte) and gave all of it back; on the 3090 and the A6000 the leftover
+    /// is 0. Derivation: both loads allocate the same body bytes (load 2's
+    /// take is the sm_86 one), so a leftover that load 2 does not take again
+    /// is a mapping the context holds once, not the body's; a body leak is
+    /// taken again by every load, so it shows as a second-cycle leftover
+    /// (`end != dropped`) or as a load 2 that takes the first load's bytes
+    /// (more than `first - left`), and a leak past one granule as a leftover
+    /// over the granule. What it gives up: a leak under one granule per load
+    /// that the driver packs into the leftover's granule. FAIL-first: the old
+    /// rule on the 5090 (logged, red); a body that keeps a 4 MiB device buffer
+    /// past each drop is red here (a leftover over the granule, a second-cycle
+    /// leftover).
     fn check_reload(
         [before, first, dropped, second, end]: [u64; 5],
         captured: u64,
-        shadow_host: usize,
-        roomed: bool,
+        (shadow_host, roomed): (usize, bool),
+        granule: usize,
     ) -> bool {
         let took = |a: u64, b: u64| i128::from(a) - i128::from(b);
+        let g = granule as i128;
+        let left = took(before, dropped) - i128::from(captured);
         // The page-locked shadows' granule, kept by the capture's device
-        // allocation (PIN(2026-09-24) above), on the fallback alone.
-        let granule: i128 = if !roomed && shadow_host > 0 && captured > 0 {
-            PINNED_GRANULE
+        // allocation (PIN(2026-09-24) above), is exact on the fallback alone.
+        let pinned = !roomed && shadow_host > 0 && captured > 0;
+        let allowed = if pinned {
+            left == g
         } else {
-            0
+            left == 0 || left == g
         };
-        let pass = took(before, dropped) == i128::from(captured) + granule
-            && took(dropped, second) == took(before, first) - granule
-            && end == dropped;
+        let pass = allowed && took(dropped, second) == took(before, first) - left && end == dropped;
         println!(
             "check v: free {before} B before, {first} after load 1 (took {}), {dropped} after its drop \
-             (gave back {}; the capture's {captured} B stay with the context), {second} after load 2 \
-             (took {}), {end} after its drop (gave back {}): {}",
+             (gave back {}; the capture's {captured} B stay with the context, {left} B left beside it), \
+             {second} after load 2 (took {}), {end} after its drop (gave back {}); the card's granule \
+             {granule} B: {}",
             took(before, first),
             took(dropped, first),
             took(dropped, second),
@@ -1160,15 +1174,18 @@ mod gate {
             verdict(pass)
         );
         if !pass {
+            let want = if pinned {
+                format!("exactly {granule}")
+            } else {
+                format!("0 or {granule}")
+            };
             println!(
-                "FAIL: check v: the first drop left {} B taken besides the capture's {captured} \
-                 (allowed {granule}: the shadows' {shadow_host} B page-locked when a capture \
-                 keeps them and the card backs no host page, roomed={roomed}), the second load \
-                 took {} B more than the \
-                 first (allowed {}), the second drop left {} B taken",
-                took(before, dropped) - i128::from(captured),
-                took(dropped, second) - took(before, first),
-                -granule,
+                "FAIL: check v: the first drop left {left} B taken besides the capture's {captured} \
+                 (allowed {want}: one card granule the second load finds mapped, exactly one when \
+                 the shadows' {shadow_host} B are page-locked and a capture keeps them, \
+                 roomed={roomed}), the second load took {} B more than the first less that \
+                 leftover (allowed 0), the second drop left {} B taken (allowed 0)",
+                took(dropped, second) - (took(before, first) - left),
                 took(dropped, end)
             );
         }

@@ -40,6 +40,42 @@ pub const LOGITS_MAX_PIN: f64 = 16.0;
 // 0.184, x2. Not derived, as the max pin.
 pub const LOGITS_RMS_PIN: f64 = 2.5;
 
+/// The three pins a band is held to: clear top-1 disagreements, the largest and the RMS
+/// |Δlogit|. [`Pins::SHARED`] is the shared band's; a walk between two runs whose distance a
+/// gate derives for its own pair carries that pair's ([`walk_pinned`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pins {
+    pub clear: usize,
+    pub max: f64,
+    pub rms: f64,
+}
+
+impl Pins {
+    /// [`LOGITS_CLEAR_PIN`], [`LOGITS_MAX_PIN`] and [`LOGITS_RMS_PIN`].
+    pub const SHARED: Pins = Pins {
+        clear: LOGITS_CLEAR_PIN,
+        max: LOGITS_MAX_PIN,
+        rms: LOGITS_RMS_PIN,
+    };
+}
+
+/// The band the V4.1 fixture's walk between two placements (the tier gate's rank walk, B10)
+/// is held to, with [`crate::prompts::PLACE_MARGIN_V41_FIXTURE`] as its clarity margin: the
+/// two plans run other experts on the card and on the host, and the distance is the pair's,
+/// not the card's (the RMS |Δlogit| reads 0.2510 on the 3090 and the A6000, 0.2479 on an RTX
+/// 5090). Twice the larger reading of each, [`LOGITS_MAX_PIN`]'s and [`LOGITS_RMS_PIN`]'s
+/// method on this pair alone; the shared pins carry the real tier's distance and sit ten times
+/// over this one.
+// PIN(2026-11-18): max 2 × 2.597 (RTX 5090; 2.338 on sm_86) rounded up to 5.2, rms 2 × 0.2510
+// (sm_86; 0.2479 on the 5090) rounded up to 0.51, both B10's line over its 64 positions.
+// FAIL-first: every layer's ranked host sum zeroed moves the real tier's rms 1.03 past 2.5, so
+// it is red here at 2.4 × 0.25 = 0.6 > 0.51.
+pub const PLACE_PINS_V41_FIXTURE: Pins = Pins {
+    clear: LOGITS_CLEAR_PIN,
+    max: 5.2,
+    rms: 0.51,
+};
+
 /// Whether a row whose top-1 leads its top-2 by `gap` is clear at the margin `floor`: the one
 /// clarity rule of the band's positions ([`LogitsBand::add_at`]) and of [`parted`]'s.
 pub fn gap_is_clear(gap: f32, floor: f32) -> bool {
@@ -115,12 +151,17 @@ impl LogitsBand {
         (self.sq / self.values.max(1) as f64).sqrt()
     }
 
-    /// Whether the measured band sits within the pins.
+    /// Whether the measured band sits within the shared pins.
     pub fn ok(&self) -> bool {
+        self.ok_at(Pins::SHARED)
+    }
+
+    /// Whether the measured band sits within `pins`.
+    pub fn ok_at(&self, pins: Pins) -> bool {
         self.aligned
-            && self.disagree.saturating_sub(LOGITS_CLEAR_PIN) == 0
-            && self.max <= LOGITS_MAX_PIN
-            && self.rms() <= LOGITS_RMS_PIN
+            && self.disagree.saturating_sub(pins.clear) == 0
+            && self.max <= pins.max
+            && self.rms() <= pins.rms
     }
 }
 
@@ -180,11 +221,33 @@ pub fn walk(what: &str, want: Positions<'_>, got: Positions<'_>) -> Walk {
 /// # Panics
 /// As [`walk`].
 pub fn walk_at(what: &str, want: Positions<'_>, got: Positions<'_>, floor: f32) -> Walk {
-    walk_floors(what, want, got, &|_| floor, &format!("margin >= {floor}"))
+    walk_pinned(what, want, got, floor, Pins::SHARED)
 }
 
-/// [`walk`]'s comparison with the clarity margin of position `i` from `floor_of` and its
-/// print's clarity note `note`.
+/// [`walk_at`] with the band held to `pins` in place of [`Pins::SHARED`]: a walk whose pair's
+/// distance its gate derives ([`PLACE_PINS_V41_FIXTURE`]).
+///
+/// # Panics
+/// As [`walk`].
+pub fn walk_pinned(
+    what: &str,
+    want: Positions<'_>,
+    got: Positions<'_>,
+    floor: f32,
+    pins: Pins,
+) -> Walk {
+    walk_floors(
+        what,
+        want,
+        got,
+        &|_| floor,
+        &format!("margin >= {floor}"),
+        pins,
+    )
+}
+
+/// [`walk`]'s comparison with the clarity margin of position `i` from `floor_of`, its print's
+/// clarity note `note`, and the band held to `pins`.
 ///
 /// # Panics
 /// As [`walk`].
@@ -194,6 +257,7 @@ fn walk_floors(
     got: Positions<'_>,
     floor_of: &dyn Fn(usize) -> f32,
     note: &str,
+    pins: Pins,
 ) -> Walk {
     for (name, run) in [("reference", want), ("compared run", got)] {
         assert_eq!(
@@ -231,7 +295,7 @@ fn walk_floors(
     }
     let stopped = agreed < shared;
     let ends = !stopped && want.tokens.len() != got.tokens.len();
-    let ok = shared > 0 && !ends && band.ok();
+    let ok = shared > 0 && !ends && band.ok_at(pins);
     let mut red: Vec<String> = Vec::new();
     if shared == 0 {
         red.push("no position to compare".into());
@@ -250,13 +314,13 @@ fn walk_floors(
             want.tokens.len().max(got.tokens.len())
         ));
     }
-    if band.disagree.saturating_sub(LOGITS_CLEAR_PIN) > 0 {
+    if band.disagree.saturating_sub(pins.clear) > 0 {
         red.push("clear top-1 disagreements over the pin".into());
     }
-    if band.max > LOGITS_MAX_PIN {
+    if band.max > pins.max {
         red.push("max |Δlogit| over the pin".into());
     }
-    if band.rms().is_nan() || band.rms() > LOGITS_RMS_PIN {
+    if band.rms().is_nan() || band.rms() > pins.rms {
         red.push("rms |Δlogit| over the pin".into());
     }
     let left = if stopped && !apart_clear {
@@ -270,14 +334,16 @@ fn walk_floors(
     };
     println!(
         "{} {what}: {compared} of the reference's {} positions compared{left}: band clear top-1 \
-         {} of {} (pin {LOGITS_CLEAR_PIN}, clear = {note}), max |Δlogit| {:.3e} (pin \
-         {LOGITS_MAX_PIN}), rms {:.3e} (pin {LOGITS_RMS_PIN}){}{}",
+         {} of {} (pin {}, clear = {note}), max |Δlogit| {:.3e} (pin {}), rms {:.3e} (pin {}){}{}",
         if ok { "ok" } else { "FAIL" },
         want.tokens.len(),
         band.disagree,
         band.clear,
+        pins.clear,
         band.max,
+        pins.max,
         band.rms(),
+        pins.rms,
         shifts.note(),
         if red.is_empty() {
             String::new()
@@ -515,6 +581,35 @@ mod tests {
         let got = [gapped(2, 5.0)];
         let far = walk_at("floor", run(&tw, &want), run(&tg, &got), floor);
         assert!(!far.ok && far.band.clear == 1 && far.band.disagree == 1);
+    }
+
+    /// A walk held to its own pins reds a distance the shared pins take, and keeps the shared
+    /// walk's clarity and top-1 reading: a row moved by 1 in every lane (rms 1, max 1) stands
+    /// in the shared band and over the fixture placement pins' rms 0.51.
+    #[test]
+    fn walk_pinned_holds_its_own_pins() {
+        let want = [gapped(1, 3.0)];
+        let got = [gapped(1, 3.0).iter().map(|x| x + 1.0).collect::<Vec<f32>>()];
+        let t = [1u32];
+        assert!(walk_at("pins", run(&t, &want), run(&t, &got), MARGIN_FLOOR).ok);
+        let own = walk_pinned(
+            "pins",
+            run(&t, &want),
+            run(&t, &got),
+            MARGIN_FLOOR,
+            PLACE_PINS_V41_FIXTURE,
+        );
+        assert!(!own.ok && own.band.clear == 1 && own.band.disagree == 0);
+        assert!((own.band.rms() - 1.0).abs() < 1e-9 && own.band.max <= PLACE_PINS_V41_FIXTURE.max);
+        let near = [gapped(1, 3.0).iter().map(|x| x + 0.5).collect::<Vec<f32>>()];
+        let held = walk_pinned(
+            "pins",
+            run(&t, &want),
+            run(&t, &near),
+            MARGIN_FLOOR,
+            PLACE_PINS_V41_FIXTURE,
+        );
+        assert!(held.ok);
     }
 
     fn picks(run: &[(u32, f32)]) -> Vec<Pick> {

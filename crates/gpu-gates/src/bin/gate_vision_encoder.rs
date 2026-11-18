@@ -28,7 +28,9 @@
 //! bit for bit equal to its first encode.
 //!
 //! The bands of the patch embedding, block 0 and every teacher-forced tap are measurements of this
-//! build against this set, pinned per tap name as the widest over the images. A free-running tap
+//! build against this set, pinned per tap name as the widest over the images, one table per
+//! compute capability (the tensor cores' sums differ by card); a card with no table fails them by
+//! name. A free-running tap
 //! after block 0 is held to a multiple of the reference's distance from itself under one-ulp
 //! noise (the set's `# sensitivity` rows), since the network amplifies a last-bit difference.
 
@@ -89,12 +91,64 @@ mod gate {
         differ: f64,
     }
 
+    /// One compute capability's [`Pin`] table.
+    struct Bands {
+        cc: (i32, i32),
+        card: &'static str,
+        pins: &'static [Pin],
+    }
+
+    /// The pinned taps' bands by the card's compute capability. A pinned tap is the reference's
+    /// own op chain against ours, both rounding every GEMM output once to bf16, so its distance
+    /// is how far the two sums fall apart before that rounding; the kernels are the same code on
+    /// every card, but `mma.sync.m16n8k16`'s sum inside a 16-product partial is the hardware's
+    /// (`bloomery_gpu_vision::gemm_bf16`, numeric rule 1), and the set's torch run rounded on
+    /// an sm_86 card. On the RTX 5090 every block-0 GEMM of the full-tap image lands nearer the
+    /// exact rounding than on the 3090 (`rule gemm …` lines: patch_embed 538 of 1,557,504 against
+    /// 580, wqkv 3,385 against 4,029, w2 1,972 against 2,479, aligner.w1 4,637 against 5,685), none
+    /// outside the order bound on either, so the distance to the reference moves by card: 15 of
+    /// the 46 taps measure past the 8.6 table there, at most 2.0 times it (blk0.qkv's and
+    /// blk0.qrot's max), an order below a defect's. Each card keeps its own table, measured by
+    /// one method; a card with no table fails every pinned tap by name and prints its widest
+    /// values for one ([`run`]'s summary).
+    const BANDS: &[Bands] = &[
+        Bands {
+            cc: (8, 6),
+            card: "RTX 3090",
+            pins: PINS_86,
+        },
+        Bands {
+            cc: (12, 0),
+            card: "RTX 5090",
+            pins: PINS_120,
+        },
+    ];
+
+    /// [`BANDS`]' table of compute capability `cc`, or the named reason it has none.
+    fn bands_of(cc: (i32, i32)) -> Result<&'static Bands, String> {
+        BANDS.iter().find(|b| b.cc == cc).ok_or_else(|| {
+            let held: Vec<String> = BANDS
+                .iter()
+                .map(|b| format!("{}.{} ({})", b.cc.0, b.cc.1, b.card))
+                .collect();
+            format!(
+                "no tap bands for compute capability {}.{} (tables: {}): the pinned taps' distance \
+                 to the reference moves with the tensor cores' sums; pin this card's from its run's \
+                 widest values",
+                cc.0,
+                cc.1,
+                held.join(", ")
+            )
+        })
+    }
+
     /// Per tap name, the widest band over the set's images, for the patch embedding, block 0 and
     /// its ops, and every `forced.<tap>`: that tap computed from the reference's own input to it
-    /// (one block, the final norm, or the aligner alone). These and the op rules are the
-    /// contract; the free-running taps after block 0 are held by [`SENSITIVITY_K`] instead.
+    /// (one block, the final norm, or the aligner alone), on compute capability 8.6. These and
+    /// the op rules are the contract; the free-running taps after block 0 are held by
+    /// [`SENSITIVITY_K`] instead.
     /// PIN(2026-09-24): measured on the 3090 against set deepseek41v, each value the widest over its images rounded up at three significant digits (differ at five decimals).
-    const PINS: &[Pin] = &[
+    const PINS_86: &[Pin] = &[
         Pin {
             tap: "embed",
             max_rel: 0.00371,
@@ -373,6 +427,288 @@ mod gate {
         },
     ];
 
+    /// [`PINS_86`]'s taps on compute capability 12.0.
+    /// PIN(2026-11-18): measured on the RTX 5090 (driver 615.71.09) against set deepseek41v by
+    /// PIN(2026-09-24)'s method, which gives the 8.6 table's 138 values back from the 3090's run.
+    const PINS_120: &[Pin] = &[
+        Pin {
+            tap: "embed",
+            max_rel: 0.00371,
+            rms_rel: 3.48e-05,
+            differ: 0.00019,
+        },
+        Pin {
+            tap: "blk0.norm1",
+            max_rel: 0.000136,
+            rms_rel: 9.04e-06,
+            differ: 0.00018,
+        },
+        Pin {
+            tap: "blk0.qkv",
+            max_rel: 0.00447,
+            rms_rel: 4.32e-05,
+            differ: 0.00126,
+        },
+        Pin {
+            tap: "blk0.qrot",
+            max_rel: 0.00396,
+            rms_rel: 6.15e-05,
+            differ: 0.00037,
+        },
+        Pin {
+            tap: "blk0.krot",
+            max_rel: 0.00213,
+            rms_rel: 4.21e-05,
+            differ: 0.00021,
+        },
+        Pin {
+            tap: "blk0.sdpa",
+            max_rel: 0.00267,
+            rms_rel: 0.00013,
+            differ: 0.00489,
+        },
+        Pin {
+            tap: "blk0.attn",
+            max_rel: 0.00457,
+            rms_rel: 0.000185,
+            differ: 0.02537,
+        },
+        Pin {
+            tap: "blk0.norm2",
+            max_rel: 0.00275,
+            rms_rel: 0.000279,
+            differ: 0.01007,
+        },
+        Pin {
+            tap: "blk0.w1",
+            max_rel: 0.00527,
+            rms_rel: 0.000576,
+            differ: 0.08356,
+        },
+        Pin {
+            tap: "blk0.act",
+            max_rel: 0.00358,
+            rms_rel: 0.00058,
+            differ: 0.13960,
+        },
+        Pin {
+            tap: "blk0.mlp",
+            max_rel: 0.00559,
+            rms_rel: 0.000924,
+            differ: 0.13643,
+        },
+        Pin {
+            tap: "blk0",
+            max_rel: 0.0112,
+            rms_rel: 0.00242,
+            differ: 0.21562,
+        },
+        Pin {
+            tap: "forced.blk0",
+            max_rel: 0.0112,
+            rms_rel: 0.0024,
+            differ: 0.20703,
+        },
+        Pin {
+            tap: "forced.blk1",
+            max_rel: 0.00758,
+            rms_rel: 0.0017,
+            differ: 0.15900,
+        },
+        Pin {
+            tap: "forced.blk2",
+            max_rel: 0.00426,
+            rms_rel: 0.000826,
+            differ: 0.07792,
+        },
+        Pin {
+            tap: "forced.blk3",
+            max_rel: 0.00447,
+            rms_rel: 0.000786,
+            differ: 0.06619,
+        },
+        Pin {
+            tap: "forced.blk4",
+            max_rel: 0.0069,
+            rms_rel: 0.000919,
+            differ: 0.08532,
+        },
+        Pin {
+            tap: "forced.blk5",
+            max_rel: 0.00685,
+            rms_rel: 0.000871,
+            differ: 0.07491,
+        },
+        Pin {
+            tap: "forced.blk6",
+            max_rel: 0.00626,
+            rms_rel: 0.000927,
+            differ: 0.08382,
+        },
+        Pin {
+            tap: "forced.blk7",
+            max_rel: 0.00332,
+            rms_rel: 0.000939,
+            differ: 0.08123,
+        },
+        Pin {
+            tap: "forced.blk8",
+            max_rel: 0.00618,
+            rms_rel: 0.00107,
+            differ: 0.09455,
+        },
+        Pin {
+            tap: "forced.blk9",
+            max_rel: 0.00296,
+            rms_rel: 0.00115,
+            differ: 0.10904,
+        },
+        Pin {
+            tap: "forced.blk10",
+            max_rel: 0.00345,
+            rms_rel: 0.00142,
+            differ: 0.14679,
+        },
+        Pin {
+            tap: "forced.blk11",
+            max_rel: 0.00251,
+            rms_rel: 0.00128,
+            differ: 0.11428,
+        },
+        Pin {
+            tap: "forced.blk12",
+            max_rel: 0.00106,
+            rms_rel: 0.000464,
+            differ: 0.12054,
+        },
+        Pin {
+            tap: "forced.blk13",
+            max_rel: 1.65e-05,
+            rms_rel: 0.000214,
+            differ: 0.13426,
+        },
+        Pin {
+            tap: "forced.blk14",
+            max_rel: 3.21e-05,
+            rms_rel: 0.000187,
+            differ: 0.11140,
+        },
+        Pin {
+            tap: "forced.blk15",
+            max_rel: 6.41e-05,
+            rms_rel: 0.000183,
+            differ: 0.10604,
+        },
+        Pin {
+            tap: "forced.blk16",
+            max_rel: 3.21e-05,
+            rms_rel: 0.000181,
+            differ: 0.09819,
+        },
+        Pin {
+            tap: "forced.blk17",
+            max_rel: 3.21e-05,
+            rms_rel: 0.000166,
+            differ: 0.08335,
+        },
+        Pin {
+            tap: "forced.blk18",
+            max_rel: 1.61e-05,
+            rms_rel: 0.000148,
+            differ: 0.06962,
+        },
+        Pin {
+            tap: "forced.blk19",
+            max_rel: 3.21e-05,
+            rms_rel: 0.000143,
+            differ: 0.06215,
+        },
+        Pin {
+            tap: "forced.blk20",
+            max_rel: 3.21e-05,
+            rms_rel: 0.000167,
+            differ: 0.07836,
+        },
+        Pin {
+            tap: "forced.blk21",
+            max_rel: 3.21e-05,
+            rms_rel: 0.000158,
+            differ: 0.07465,
+        },
+        Pin {
+            tap: "forced.blk22",
+            max_rel: 3.21e-05,
+            rms_rel: 0.000179,
+            differ: 0.09044,
+        },
+        Pin {
+            tap: "forced.blk23",
+            max_rel: 3.19e-05,
+            rms_rel: 0.000202,
+            differ: 0.10465,
+        },
+        Pin {
+            tap: "forced.blk24",
+            max_rel: 3.18e-05,
+            rms_rel: 0.000171,
+            differ: 0.07120,
+        },
+        Pin {
+            tap: "forced.blk25",
+            max_rel: 3.18e-05,
+            rms_rel: 0.000189,
+            differ: 0.08205,
+        },
+        Pin {
+            tap: "forced.blk26",
+            max_rel: 3.17e-05,
+            rms_rel: 0.000227,
+            differ: 0.09781,
+        },
+        Pin {
+            tap: "forced.blk27",
+            max_rel: 3.17e-05,
+            rms_rel: 0.000237,
+            differ: 0.09807,
+        },
+        Pin {
+            tap: "forced.blk28",
+            max_rel: 3.17e-05,
+            rms_rel: 0.00025,
+            differ: 0.08653,
+        },
+        Pin {
+            tap: "forced.blk29",
+            max_rel: 3.17e-05,
+            rms_rel: 0.000261,
+            differ: 0.07342,
+        },
+        Pin {
+            tap: "forced.blk30",
+            max_rel: 3.17e-05,
+            rms_rel: 0.000252,
+            differ: 0.04634,
+        },
+        Pin {
+            tap: "forced.blk31",
+            max_rel: 0.00268,
+            rms_rel: 0.000486,
+            differ: 0.05997,
+        },
+        Pin {
+            tap: "forced.vit",
+            max_rel: 0.00108,
+            rms_rel: 2.07e-05,
+            differ: 0.00002,
+        },
+        Pin {
+            tap: "forced.aligner",
+            max_rel: 0.00532,
+            rms_rel: 0.0032,
+            differ: 0.48925,
+        },
+    ];
+
     /// Values of the GELU epilogue and of the SiLU gate that may differ (by one bf16 step at most)
     /// from their host rule, per full-tap image: the device's `erff`/`expf` against the host's.
     /// PIN(2026-09-24): measured 0 of 865280 (GELU) and 0 of 4283136 (SiLU) on grad-448.
@@ -524,10 +860,26 @@ mod gate {
         }
     }
 
-    /// Compare one tap with the reference and its pin, or with [`SENSITIVITY_K`] times its
-    /// [`ruler`] row; prints one line.
+    /// `x` (≥ 0) rounded up at three significant digits, the pin tables' rounding.
+    fn up_3(x: f64) -> f64 {
+        if x <= 0.0 {
+            return x;
+        }
+        let unit = 10f64.powf(x.log10().floor() - 2.0);
+        (x / unit * (1.0 - 1e-12)).ceil() * unit
+    }
+
+    /// Compare one tap with the reference and its pin in the card's `bands`, or with
+    /// [`SENSITIVITY_K`] times its [`ruler`] row; prints one line. A pinned tap on a card with no
+    /// table fails by name. `widest` keeps each tap's widest values over the images.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one tap's two sides, its rulers and the run's widest table"
+    )]
     fn band_check(
         sens: &HashMap<String, f64>,
+        bands: &Result<&'static Bands, String>,
+        widest: &mut HashMap<String, Stats>,
         stem: &str,
         tap: &str,
         ours: &[u16],
@@ -542,7 +894,14 @@ mod gate {
             return false;
         }
         let s = stats(ours, refv);
-        let pin = PINS.iter().find(|p| p.tap == tap);
+        let e = widest.entry(tap.to_string()).or_insert(s);
+        e.max_rel = e.max_rel.max(s.max_rel);
+        e.rms_rel = e.rms_rel.max(s.rms_rel);
+        e.differ = e.differ.max(s.differ);
+        let pin = bands
+            .as_ref()
+            .ok()
+            .and_then(|b| b.pins.iter().find(|p| p.tap == tap));
         let (pass, band) = match (ruler(tap), pin) {
             (Some(r), None) => match sens.get(r) {
                 Some(&u) => (
@@ -557,9 +916,12 @@ mod gate {
             (Some(_), Some(_)) => (false, "both a pin and a sensitivity ruler".to_string()),
             (None, Some(p)) => (
                 s.max_rel <= p.max_rel && s.rms_rel <= p.rms_rel && s.differ <= p.differ,
-                format!("band {:.2e} {:.2e} {:.4}", p.max_rel, p.rms_rel, p.differ),
+                format!("band {:.2e} {:.2e} {:.5}", p.max_rel, p.rms_rel, p.differ),
             ),
-            (None, None) => (false, "no pin".to_string()),
+            (None, None) => match bands {
+                Ok(b) => (false, format!("no pin in the {}.{} table", b.cc.0, b.cc.1)),
+                Err(_) => (false, "no band on this card (the bands line)".to_string()),
+            },
         };
         println!(
             "tap {stem:<18} {tap:<12} max|rel| {:.3e}  rms rel {:.3e}  differ {:.5}  {band}  {}",
@@ -1042,6 +1404,15 @@ mod gate {
         let set = read_set()?;
         let file = Gguf::open(&set.mmproj)?;
         let (ctx, stream) = bloomery_gpu::capsync::fresh_stream(0)?;
+        let cc = ctx.compute_capability()?;
+        let bands = bands_of(cc);
+        match &bands {
+            Ok(b) => println!(
+                "bands: compute capability {}.{}, the {} table: PASS",
+                cc.0, cc.1, b.card
+            ),
+            Err(why) => println!("bands: {why}: FAIL"),
+        }
         let mut enc = Encoder::load(&ctx, &stream, &file)?;
         let hp = enc.hparams().clone();
         let want_launches = Encoder::launches(hp.n_layer);
@@ -1059,7 +1430,8 @@ mod gate {
             want_launches
         );
         let hw = host_w(&file)?;
-        let mut ok = gelu_sweep(&ctx, &stream)?;
+        let mut ok = bands.is_ok();
+        ok &= gelu_sweep(&ctx, &stream)?;
         let images_dir =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/ref/vision/images");
         let mut widest: HashMap<String, Stats> = HashMap::new();
@@ -1106,14 +1478,15 @@ mod gate {
                         .ok_or_else(|| format!("tap {tap} was not taken"))?
                 };
                 let refv = read_bits(&set.dir, &format!("{stem}.{tap}.bf16"))?;
-                ok &= band_check(&set.sensitivity, &stem, tap, ours, &refv);
-                if ours.len() == refv.len() {
-                    let s = stats(ours, &refv);
-                    let e = widest.entry(tap.to_string()).or_insert(s);
-                    e.max_rel = e.max_rel.max(s.max_rel);
-                    e.rms_rel = e.rms_rel.max(s.rms_rel);
-                    e.differ = e.differ.max(s.differ);
-                }
+                ok &= band_check(
+                    &set.sensitivity,
+                    &bands,
+                    &mut widest,
+                    &stem,
+                    tap,
+                    ours,
+                    &refv,
+                );
             }
             if stem == FULL {
                 for tap in ["blk11", "blk12", "blk31", "vit"] {
@@ -1144,6 +1517,8 @@ mod gate {
                 let got = enc.forced_block(grid, b, &read_bits(&set.dir, &fi)?)?;
                 ok &= band_check(
                     &set.sensitivity,
+                    &bands,
+                    &mut widest,
                     &stem,
                     &format!("forced.blk{b}"),
                     &got,
@@ -1155,6 +1530,8 @@ mod gate {
                 let (vit, _) = enc.forced_tail(grid, &read_bits(&set.dir, &last)?, false)?;
                 ok &= band_check(
                     &set.sensitivity,
+                    &bands,
+                    &mut widest,
                     &stem,
                     "forced.vit",
                     &vit,
@@ -1168,6 +1545,8 @@ mod gate {
             )?;
             ok &= band_check(
                 &set.sensitivity,
+                &bands,
+                &mut widest,
                 &stem,
                 "forced.aligner",
                 &rows,
@@ -1195,7 +1574,10 @@ mod gate {
         }
         ok &= stale_rows(&mut enc, &set, &images_dir, &stream)?;
 
-        println!("widest per tap (the pin table's measured values; a ratio for a ruled tap):");
+        println!(
+            "widest per tap (a pin table's values by the PIN(2026-09-24) method: rounded up at three \
+             significant digits, differ at five decimals; a ratio for a ruled tap):"
+        );
         let mut names: Vec<&String> = widest.keys().collect();
         names.sort();
         for t in names {
@@ -1208,7 +1590,9 @@ mod gate {
                 ),
                 None => println!(
                     "  Pin {{ tap: \"{t}\", max_rel: {:.2e}, rms_rel: {:.2e}, differ: {:.5} }},",
-                    s.max_rel, s.rms_rel, s.differ
+                    up_3(s.max_rel),
+                    up_3(s.rms_rel),
+                    (s.differ * 1e5 * (1.0 - 1e-12)).ceil() / 1e5
                 ),
             }
         }
@@ -1222,7 +1606,30 @@ mod gate {
 
     #[cfg(test)]
     mod tests {
-        use super::{FULL, SMALL, has_full};
+        use super::{BANDS, FULL, PINS_86, SMALL, bands_of, has_full};
+
+        #[test]
+        fn each_compute_capability_reads_its_own_table_and_another_is_refused_by_name() {
+            assert!(std::ptr::eq(bands_of((8, 6)).expect("8.6").pins, PINS_86));
+            let b = bands_of((12, 0)).expect("12.0");
+            assert_eq!(b.card, "RTX 5090");
+            let Err(err) = bands_of((8, 9)) else {
+                panic!("an 8.9 table");
+            };
+            assert!(
+                err.contains("8.9") && err.contains("8.6") && err.contains("12.0"),
+                "{err}"
+            );
+            for t in BANDS {
+                let taps: Vec<&str> = t.pins.iter().map(|p| p.tap).collect();
+                let want: Vec<&str> = PINS_86.iter().map(|p| p.tap).collect();
+                assert_eq!(
+                    taps, want,
+                    "the {} table holds the 8.6 table's taps",
+                    t.card
+                );
+            }
+        }
 
         #[test]
         fn a_set_without_the_full_tap_image_is_refused_by_name() {

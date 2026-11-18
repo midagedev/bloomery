@@ -290,6 +290,18 @@ pub const HEAD_MARGIN_V41: f32 = 8.8;
 // is not (rms 1.03 → 1.17) — the rank stage's bits clause holds that one.
 pub const PLACE_MARGIN_V41: f32 = 9.7;
 
+/// [`PLACE_MARGIN_V41`] on the V4.1 fixture, by its method: the fixture's two placements move
+/// the top-two gap by the pair's own distance, which is no card's (the walk's RMS |Δlogit|
+/// reads 0.2510 on the 3090 and the A6000, 0.2479 on an RTX 5090), and [`MARGIN_FLOOR`] sits
+/// under that shift. In the error model's terms the floor is 4.8 σ of a gap's shift (σ = √2 ×
+/// 0.251, the two logits' RMS distance), where a top-1 of any runner-up flips with probability
+/// under 1e-6 a position; the walk's band is `logits_band::PLACE_PINS_V41_FIXTURE`.
+// PIN(2026-11-18): 2 × 0.8469, the largest |top-2 gap shift| over B10's 64 fixture positions
+// (position 41 on the 3090 and the A6000; 0.6932 at position 55 on the 5090), rounded up to 1.7.
+// The 5090's run flipped a top-1 at margin 0.6098 (a third id over the reference's two), a
+// re-lottery under this floor; at the old floor, 0.5, it was red with the same distance.
+pub const PLACE_MARGIN_V41_FIXTURE: f32 = 1.7;
+
 /// Judge our greedy continuations against the reference, prompt by prompt.
 ///
 /// `ours[i]` is our continuation for `reference[i]`, indexed like

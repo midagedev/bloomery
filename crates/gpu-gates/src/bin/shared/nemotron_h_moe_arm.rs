@@ -11,8 +11,8 @@ use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::{GateError, verdict};
 use model::arch::nemotron_h_moe::hparams::Hparams;
 use model::arch::nemotron_h_moe::place::{self as moe_place, Experts};
-use model::placement::PlanLevers;
 use model::placement::workstation::{self, CardSpec};
+use model::placement::{Plan, PlanLevers};
 
 pub type Model = NemotronHMoeModel;
 
@@ -96,6 +96,37 @@ fn near(clause: &str, what: &str, got: &[f32], want: &[f32]) -> bool {
     pass
 }
 
+/// The experts the plan of a placed load holds on the card, by routed layer: `(layer, on the card,
+/// of the layer)`.
+fn card_experts(plan: &Plan<'_>, layers: usize, hp: &Hparams) -> Vec<(usize, u64, u64)> {
+    (0..layers)
+        .filter_map(|l| Some((l, plan.n_l[l], hp.experts[l]?.n_expert as u64)))
+        .collect()
+}
+
+/// Whether the plan of a placed load on `spec`'s room holds every routed expert on the card: the
+/// `Whole` arm's premise, which a card with less room misses. The gates ask it before the arm
+/// runs, so a card too small is a clause left by name ([`bloomery_gpu_gates::tier::room_clause`])
+/// and not an arm that prints its premise as missed.
+///
+/// # Errors
+/// The plan's refusal of the room.
+pub fn whole_fits(
+    inputs: &moe_place::PlanInputs,
+    (hp, ctx): (&Hparams, u64),
+    spec: CardSpec,
+) -> Result<bool, GateError> {
+    let layers = inputs.model.layers;
+    let machine = workstation::placed_on(spec, layers, workstation::SCRATCH);
+    let plan = inputs.plan_with(&machine, ctx, &PlanLevers::default(), Experts::Placed)?;
+    Ok(every_expert(&card_experts(&plan, layers, hp)))
+}
+
+/// Whether `card` (from [`card_experts`]) holds every expert of every routed layer on the card.
+fn every_expert(card: &[(usize, u64, u64)]) -> bool {
+    card.iter().all(|&(_, on, of)| on == of)
+}
+
 /// One arm: the plan of `premise` on `spec`'s room under `levers`, its placed load of the model
 /// `source` gives, the eager walk and its replay. `None` after a line naming the premise the plan
 /// misses, the fault a launch raised or the bits that differ; `words` are the words the premise
@@ -116,9 +147,7 @@ pub fn arm(
     let layers = inputs.model.layers;
     let machine = workstation::placed_on(spec, layers, workstation::SCRATCH);
     let plan = inputs.plan_with(&machine, ctx, &levers, experts)?;
-    let card: Vec<(usize, u64, u64)> = (0..layers)
-        .filter_map(|l| Some((l, plan.n_l[l], hp.experts[l]?.n_expert as u64)))
-        .collect();
+    let card = card_experts(&plan, layers, hp);
     println!(
         "{clause}: arm {name} plan on {} bytes: {} experts on the host, card experts by layer \
          (layer, on card, of) {card:?}",
@@ -129,7 +158,7 @@ pub fn arm(
         Premise::Split => {
             card.iter().any(|&(_, on, _)| on > 0) && card.iter().any(|&(_, on, of)| on < of)
         }
-        Premise::Whole => card.iter().all(|&(_, on, of)| on == of),
+        Premise::Whole => every_expert(&card),
     };
     if !holds {
         println!(

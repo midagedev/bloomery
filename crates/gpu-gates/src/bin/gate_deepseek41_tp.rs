@@ -11,6 +11,11 @@
 //! parts is a stream memory op; each process holds a context of its own, whose queues no other
 //! rank's work stands in, so one rank's wait never holds another rank's part.
 //!
+//! The fixture's parts all stand on the one card, and no plan sizes them (a rank's load puts every
+//! expert on its card), so each clause asks the card for the room of the least card it is measured
+//! green on ([`ONE_RANK_ROOM`], [`RANKS_ROOM`]); a card with less leaves the clause by name
+//! (`tier::room_clause`, `no-card-room`), whatever the tier, and never loads to find out.
+//!
 //! - (n1) one rank reads the folder whole and runs [`STEPS`] greedy steps from [`FIRST`]: every
 //!   logit is finite. No one-card run is its reference: the one-card body reads a GGUF split and
 //!   does not open the folder. What only the folder's formats run is held elsewhere: the shared
@@ -51,11 +56,12 @@ mod gate {
     use bloomery_gpu::host::rank::{Bootstrap, Fingerprint, RankList, RankSession};
     use bloomery_gpu_deepseek41::body::{self, OpenCfg, RankFrom};
     use bloomery_gpu_deepseek41::chain::join;
-    use bloomery_gpu_gates::GateError;
     use bloomery_gpu_gates::logits_band::{self, Positions};
+    use bloomery_gpu_gates::{GateError, tier};
     use bloomery_levers::{CARD_BUDGET, ENGRAM_HELPER};
     use gguf::digest::Sha256;
     use model::arch::deepseek41::hparams::Hparams;
+    use model::placement::workstation::{A6000, MIB};
     use model_hf::folder::{self, Opened};
 
     /// The greedy steps each run takes.
@@ -66,10 +72,30 @@ mod gate {
     const CTX: usize = 64;
     /// The fixture folder under the fixture root.
     const FOLDER: &str = "v41-folder";
+    /// (n1)'s clause name.
+    const N1: &str = "(n1) one rank over the folder";
     /// The first argument of a rank's process: `CHILD <rank> <rank file> <out file>`.
     const CHILD: &str = "--rank-of";
     /// How long a rank waits for the others at the group's open.
     const WAIT: Duration = Duration::from_secs(120);
+
+    /// The usable bytes (n1) asks of the card: the RTX 5090's, the least card one rank's whole
+    /// load of the folder is measured green on.
+    // PIN(2026-11-18): one rank holds the folder whole; (n1) passed on the RTX 5090's 32,202 MiB
+    // usable (batch land1118's log), and the load read DriverError(2, out of memory) on the
+    // RTX 3090's 24,176 MiB (the justfile recipe's record, 2026-11-05). A figure between the two
+    // is not measured.
+    const ONE_RANK_ROOM: u64 = 32_202 * MIB;
+
+    /// The usable bytes (n2) and (n4) ask of the card: the A6000's, the one card the rank groups
+    /// are measured green on.
+    // PIN(2026-11-18): the groups hold the folder's parts and each rank's context on the card at
+    // once; the gate's last green, 2026-11-16 (the lead's ledger), ran on the A6000's 48,592 MiB
+    // usable, and rank 1's load read DriverError(2, out of memory) at (n2) on the RTX 5090's
+    // 32,202 MiB (batch land1118's log). A figure between the two is not measured.
+    const RANKS_ROOM: u64 = A6000.usable_bytes();
+
+    const _: () = assert!(RANKS_ROOM >= ONE_RANK_ROOM);
 
     /// One run's steps: each step's token and the ranks' logits laid in rank order.
     type Run = Vec<(u32, Vec<f32>)>;
@@ -85,21 +111,44 @@ mod gate {
         {
             return rank_process(&dir, &cfg, rank.parse()?, Path::new(list), Path::new(out));
         }
-        let one = one_rank(&dir, &cfg)?;
-        let finite = one.iter().all(|(_, l)| l.iter().all(|v| v.is_finite()));
-        println!(
-            "(n1) one rank, {STEPS} steps from {FIRST}: tokens {:?}, every logit finite {finite}: {}",
-            one.iter().map(|s| s.0).collect::<Vec<_>>(),
-            if finite { "PASS" } else { "FAIL" }
-        );
-        let mut pass = finite;
-        for ranks in [2, 4] {
-            let got = run_group(ranks)?;
-            let walk = logits_band::walk(
-                &format!("(n{ranks}) against (n1)"),
-                positions(&one).as_view(),
-                positions(&got).as_view(),
+        let room = crate::gate_card::room()?;
+        let have = room.usable_bytes();
+        let mut pass = true;
+        let one = if tier::room_clause(N1, have >= ONE_RANK_ROOM)? {
+            let one = one_rank(&dir, &cfg)?;
+            let finite = one.iter().all(|(_, l)| l.iter().all(|v| v.is_finite()));
+            println!(
+                "(n1) one rank, {STEPS} steps from {FIRST}: tokens {:?}, every logit finite \
+                 {finite}: {}",
+                one.iter().map(|s| s.0).collect::<Vec<_>>(),
+                if finite { "PASS" } else { "FAIL" }
             );
+            pass &= finite;
+            Some(one)
+        } else {
+            println!(
+                "{N1}: the folder's whole load needs a card of {ONE_RANK_ROOM} usable bytes (the \
+                 RTX 5090's, the least card it is measured green on); the {} in view has {have}",
+                room.name
+            );
+            None
+        };
+        for ranks in [2, 4] {
+            let name = format!("(n{ranks}) against (n1)");
+            let Some(one) = one.as_ref().filter(|_| have >= RANKS_ROOM) else {
+                tier::room_clause(&name, false)?;
+                println!(
+                    "{name}: {ranks} ranks hold the folder's parts and {ranks} contexts on the one \
+                     card at once, which needs {RANKS_ROOM} usable bytes (the A6000's, the one card \
+                     it is measured green on); the {} in view has {have}",
+                    room.name
+                );
+                continue;
+            };
+            tier::room_clause(&name, true)?;
+            let got = run_group(ranks)?;
+            let walk =
+                logits_band::walk(&name, positions(one).as_view(), positions(&got).as_view());
             pass &= walk.ok;
         }
         if pass {

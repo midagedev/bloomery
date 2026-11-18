@@ -353,6 +353,12 @@ two lists may still open a card by name. `gate-gpu-ds41-dspark-loop` also passes
 tier; at the fixture tier it runs `--place a`. The two-card recipes stop at the `both` refusal above on a one-card machine. Every other closed GPU item stopped
 on an input the machine did not have, except `gate-gpu-kquant` on the RTX 5090.
 
+The plan-(a) gates `gate-gpu-ds41-residency-a` and `gate-gpu-ds41-nvtier` now plan the largest card in view (`Place::on_host`), as
+`--place a` does, and no longer a card named A6000. A gate that needs more card bytes than the card in view has leaves that clause by
+name, `deferred(real) no-card-room: <clause>` (`tier::room_clause`), in either tier, and a batch counts it as a deferral:
+`gate-gpu-ds41-tp` does so for its rank groups on a card smaller than the A6000 (and for its one-rank load on a card smaller than an
+RTX 5090), and the nemotron_h_moe gates for their `whole` arm where the plan of the card in view keeps an expert on the host.
+
 ## 4. Fixtures and reference sets
 
 A fixture-tier gate reads two inputs: the family's fixture and the `fx_` reference sets. Three families have a fixture

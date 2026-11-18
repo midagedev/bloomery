@@ -1479,8 +1479,35 @@ mod gate {
     /// 1.90e-2 to 2.26e-2 in today's five runs (the base fixture's dispatch
     /// layers and the variants `q35iq4xs`, `q35q80`, `q35iq4q8` and `q35q6k`);
     /// 1e-1 is four times the larger. A route block whose gate and up weights
-    /// are swapped reads 4.8e-1 on `q35q6k`.
+    /// are swapped reads 4.8e-1 on `q35q6k`. The bound holds a unit whose last
+    /// row carries no near-tie router swap between the two loads; the clause
+    /// reads it over [`COMMON_WIDE_UNITS`] units ([`COMMON_WIDE_OVER`]).
     const COMMON_WIDE_REL: f64 = 1e-1;
+    /// (o9)'s wide units: consecutive [`PLACED_UBATCH`]-id chunks of one lcg
+    /// stream, each fed from a clear on both loads, so each is its own draw of
+    /// the routers' near ties and unit 0 is the single unit the clause read
+    /// before.
+    const COMMON_WIDE_UNITS: usize = 8;
+    /// PIN(2026-11-18): the most of (o9)'s [`COMMON_WIDE_UNITS`] wide units
+    /// whose last-row logits may stand past [`COMMON_WIDE_REL`]: fewer than
+    /// half. A near-tie swap of one of the top-8 picks between the two loads
+    /// replaces that draw's same-expert gap with a different-expert gap
+    /// ([`FLIPS_BAND`]'s fourth term), and any ulp-scale move of either load
+    /// re-rolls which ties it lands on: the RTX 5090 (sm_120a) runs this
+    /// path's kernels with no capability pick (the GGUF's sites are K-quant,
+    /// IQ and Q8_0 planes and its 256-expert router the F32 instance, none a
+    /// `dense_mma` site) yet moves bits at the ulp scale (the base fixture's
+    /// layer-0 Delta state_rel against the pass run 2.302e-7 on sm_86,
+    /// 2.360e-7 there), and its draw moved the single unit's reading of
+    /// `q35iq3s6` from 2.358e-2 to 1.086e-1 (the host-only plan's own greedy
+    /// id moved too, 208655 → 113331, with no card expert in it) while the
+    /// base fixture's moved the other way, 6.395e-2 → 2.400e-2. Over the
+    /// twelve single-unit readings of the six fixtures on the two cards one
+    /// stood past the bound, p ≈ 1/12 a unit; each unit an independent draw,
+    /// four or more of eight past it is a binomial tail of 0.4 %. A wiring
+    /// fault moves every token's experts and so every unit's row: the
+    /// swapped route block reads 4.8e-1 at each.
+    const COMMON_WIDE_OVER: usize = COMMON_WIDE_UNITS / 2 - 1;
 
     /// The free-running clause: every layer's output of the one-token
     /// chain against ik's `l_out-L` within [`FREE_BAND`], and the last
@@ -3842,9 +3869,9 @@ mod gate {
         /// The prompt call (a unit within the gemv arm's cut) left the fifth
         /// step's bits.
         call_same: bool,
-        /// The wide unit's greedy id and logits.
-        wide: (u32, Vec<f32>),
-        /// The wide unit's card route read back with the plan's slot map rows
+        /// Each wide unit's greedy id and logits ([`COMMON_WIDE_UNITS`]).
+        wide: Vec<(u32, Vec<f32>)>,
+        /// The last wide unit's card route read back with the plan's slot map rows
         /// ([`common_route`]); the reference holds the empty tables of its
         /// no-card layers.
         route: Option<(WideRoute, Vec<Vec<u32>>)>,
@@ -3939,17 +3966,20 @@ mod gate {
             &call,
             &fifth,
         );
-        // The wide arm: one unit past the gemv arm's cut, then its ids as steps.
+        // The wide arm: units past the gemv arm's cut, each from a clear.
         let vocab = m.body("gate_qwen35moe_e2e")?.vocab();
-        let ids = lcg_ids(PLACED_UBATCH, vocab);
-        fresh(&mut m)?;
-        let plan_w = m.prefill_plan(ids.len(), PrefillPath::Gemm)?;
-        let next = m.prefill_with(&ids, PrefillPath::Gemm)?;
-        let wide = (next, m.logits()?);
-        println!(
-            "placed common {label}: wide unit of {} ids (plan={plan_w}) token {next}",
-            ids.len()
-        );
+        let ids = lcg_ids(COMMON_WIDE_UNITS * PLACED_UBATCH, vocab);
+        let mut wide = Vec::with_capacity(COMMON_WIDE_UNITS);
+        for (u, unit) in ids.chunks(PLACED_UBATCH).enumerate() {
+            fresh(&mut m)?;
+            let plan_w = m.prefill_plan(unit.len(), PrefillPath::Gemm)?;
+            let next = m.prefill_with(unit, PrefillPath::Gemm)?;
+            wide.push((next, m.logits()?));
+            println!(
+                "placed common {label}: wide unit {u} of {} ids (plan={plan_w}) token {next}",
+                unit.len()
+            );
+        }
         let stats = m
             .body("gate_qwen35moe_e2e")?
             .placed()
@@ -4261,18 +4291,34 @@ mod gate {
             verdict(layers_ok)
         );
         ok &= layers_ok;
-        // The wide arm: a unit past the gemv arm's cut against the host tier's
-        // wide unit over the same ids.
+        // The wide arm: units past the gemv arm's cut against the host tier's
+        // wide units over the same ids; a near-tie router swap moves one
+        // unit's row, a fault every unit's.
+        let split_units = |r: &CommonRun| -> (Vec<u32>, Vec<Vec<f32>>) {
+            r.wide.iter().map(|(t, row)| (*t, row.clone())).unzip()
+        };
+        let (got_ids, got_rows) = split_units(&got);
+        let (want_ids, want_rows) = split_units(&want);
         ok &= forced_calls(
             "placed common wide arm against the host tier's",
-            (&[got.wide.0], std::slice::from_ref(&got.wide.1)),
-            (&[want.wide.0], std::slice::from_ref(&want.wide.1)),
+            (&got_ids, &got_rows),
+            (&want_ids, &want_rows),
         )?;
-        let (rel, _) = e_distance(&got.wide.1, &want.wide.1);
-        let tight = rel <= COMMON_WIDE_REL;
+        let rels: Vec<f64> = got_rows
+            .iter()
+            .zip(&want_rows)
+            .map(|(g, w)| e_distance(g, w).0)
+            .collect();
+        let over: Vec<usize> = (0..rels.len())
+            .filter(|&u| rels[u].is_nan() || rels[u] > COMMON_WIDE_REL)
+            .collect();
+        let tight = rels.len() == COMMON_WIDE_UNITS && over.len() <= COMMON_WIDE_OVER;
         println!(
-            "placed common wide arm: logits rel {rel:.3e} against the host tier's wide unit \
-             (bound {COMMON_WIDE_REL:.0e}) {}",
+            "placed common wide arm: logits rel per unit {:?} against the host tier's wide units \
+             (bound {COMMON_WIDE_REL:.0e}); units over it {over:?} (at most {COMMON_WIDE_OVER} of \
+             {COMMON_WIDE_UNITS}: a near-tie router swap moves one unit's row, a fault every \
+             unit's) {}",
+            rels.iter().map(|r| format!("{r:.3e}")).collect::<Vec<_>>(),
             verdict(tight)
         );
         ok &= tight;

@@ -11,13 +11,17 @@
 //! or a card with less room than the 3090's bytes, is refused by name before any load. A two-card
 //! arm plans its own machine with both cards in view and never reads the gate card
 //! (`lcpp_e2e::Arm::machine`'s `bp`).
+//!
+//! A gate that needs the card's own room (its whole load of a file the 3090's bytes cannot hold)
+//! reads [`room`]: the same card in view with its own total and driver reserve, in either tier,
+//! and names the room it needs. It never names a workstation card to get it.
 
 use std::sync::OnceLock;
 
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::tier;
 use model::placement::Machine;
-use model::placement::workstation::{self, CardSpec, Pick, RTX_3090};
+use model::placement::workstation::{self, CardSpec, DeviceInfo, Pick, RTX_3090};
 
 static CARD: OnceLock<CardSpec> = OnceLock::new();
 
@@ -26,6 +30,19 @@ static CARD: OnceLock<CardSpec> = OnceLock::new();
 /// # Errors
 /// A census of other than one visible card, or a card with less room than the 3090's bytes.
 fn census() -> Result<CardSpec, GateError> {
+    let census = one_visible()?;
+    // PIN(2026-10-31): was a refusal outside `CARDS` and the 5090 by name; `Pick::Room` now
+    // requires the 3090's bytes on the card in view and refuses a card with less room.
+    Ok(tier::real_card(
+        workstation::resolve(&[Pick::Room(&RTX_3090)], &census)?[0],
+    ))
+}
+
+/// The census of the one card the runner put in view.
+///
+/// # Errors
+/// A census of other than one visible card.
+fn one_visible() -> Result<Vec<DeviceInfo>, GateError> {
     let census = bloomery_gpu::census()?;
     if census.len() != 1 {
         return Err(format!(
@@ -36,11 +53,36 @@ fn census() -> Result<CardSpec, GateError> {
         )
         .into());
     }
-    // PIN(2026-10-31): was a refusal outside `CARDS` and the 5090 by name; `Pick::Room` now
-    // requires the 3090's bytes on the card in view and refuses a card with less room.
+    Ok(census)
+}
+
+/// The card in view with its own room, as the real tier holds a census card
+/// ([`tier::real_card`]): its total and driver reserve, none of its free reading.
+///
+/// # Errors
+/// A census of other than one visible card.
+fn census_room() -> Result<CardSpec, GateError> {
+    let census = one_visible()?;
     Ok(tier::real_card(
-        workstation::resolve(&[Pick::Room(&RTX_3090)], &census)?[0],
+        workstation::resolve(&[Pick::Rank(0)], &census)?[0],
     ))
+}
+
+/// The card in view with its own room, for a clause that needs more bytes than the gate plan's
+/// ([`card`]): the real tier's census card with none of its free reading, the fixture tier's `a`
+/// as the device reports itself ([`tier::card`]). On the 3090 it is the 3090's bytes, on a larger
+/// card that card's: a gate compares what it needs with `usable_bytes()` and leaves the clause by
+/// name ([`tier::room_clause`]) where the card has less.
+///
+/// # Errors
+/// A census of other than one visible card, or `a` finding no card.
+#[allow(
+    dead_code,
+    reason = "the gates that need the card's own room read it; the gates that plan the 3090's \
+              bytes reach the card through init"
+)]
+pub fn room() -> Result<CardSpec, GateError> {
+    tier::card(census_room)
 }
 
 /// Reads the census (the real tier) or resolves `a` (the fixture tier) once and fixes the card
