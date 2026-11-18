@@ -35,7 +35,7 @@ use model::arch::Arch;
 use model::arch::place_hybrid::PlanInputs;
 use model::placement::ctx_ask::DEFAULT_SLOTS;
 use model::placement::workstation::TierBatchBytes;
-use model::placement::{KvDefault, Machine, PlacementError, Plan};
+use model::placement::{Machine, PlacementError, Plan};
 use runtime::Target as _;
 use runtime::prompt::CallEnd;
 use runtime::width::Mode as WidthMode;
@@ -88,10 +88,6 @@ pub trait Family: Sized + 'static {
     /// ([`Tiered::TIER_RULE`]). The default serves none, and a placement that names a tier card is
     /// refused by name.
     const TIER_RULE: TierRule = TierRule::UNTIERED;
-
-    /// What the load takes for the K/V levers it leaves unset ([`Tiered::KV_DEFAULT`]). The
-    /// default is none.
-    const KV_DEFAULT: Option<KvDefault> = None;
 
     /// Whether the body has a prompt pass ([`Family::pass`]): the seat then takes
     /// `--prefill pass|steps`, which a family with none refuses by name.
@@ -683,8 +679,6 @@ impl<F: Family> Tiered for Hybrid<F> {
     fn prefill_steps(flags: &Flags<F>) -> bool {
         flags.prefill == Some(Prefill::Steps)
     }
-
-    const KV_DEFAULT: Option<KvDefault> = F::KV_DEFAULT;
 
     /// The common machine's pick ([`tiered::residency_pick`]) with the seat's prompt feed: a
     /// step-fed body is `off` unset and refuses any other word by name.

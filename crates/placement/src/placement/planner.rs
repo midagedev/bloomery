@@ -139,6 +139,16 @@ impl KvDefault {
         floor: 8192,
         host: KvHost::Spill,
     };
+
+    /// What a server takes for the K/V levers it leaves unset, given the cache of the load it
+    /// plans: [`KvDefault::SERVER`] where the cache declares rooms ([`KvBytes::rooms`]), none
+    /// where it declares none, a load that refuses a set floor or host backing by name
+    /// ([`PlacementError::KvUnroomed`]) and so has nothing to default. One rule for every seat,
+    /// read off the stores' own declaration.
+    #[must_use]
+    pub fn of(kv: &dyn KvBytes) -> Option<KvDefault> {
+        kv.rooms().map(|_| KvDefault::SERVER)
+    }
 }
 
 /// [`plan_with`] under `levers`: the card budget, or none.

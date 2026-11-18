@@ -241,3 +241,49 @@ fn a_loads_unset_k_v_levers_take_its_default() {
     .expect_err("refused by name");
     assert!(matches!(both, PlacementError::KvHostFloor { floor: 4096 }));
 }
+
+/// A seat's default is read off its stores' rooms ([`KvDefault::of`]): the server's where the cache
+/// declares rooms, none where it declares none. A load of rooms that takes it spreads its experts
+/// at the floor, which the same plan with the levers left alone does not; a load of plain buffers
+/// takes none, and the server's default handed to it would be refused by name, so a seat that
+/// handed it one would refuse every start of that family.
+///
+/// FAIL-first: `KvDefault::of` answering none for a cache of rooms (the unset levers plan the whole
+/// context's spread), or the server's default for a plain one (the unset `spill` refused by name).
+#[test]
+fn a_seats_default_is_read_off_its_stores_rooms() {
+    /// The same bytes as [`Kv`], held in plain buffers.
+    struct Plain;
+    impl KvBytes for Plain {
+        fn layer_bytes(&self, _layer: usize, ctx_max: u64) -> u64 {
+            18 * ctx_max
+        }
+    }
+    assert_eq!(KvDefault::of(&Kv), Some(KvDefault::SERVER));
+    assert_eq!(KvDefault::of(&Plain), None);
+
+    let model = layered(4);
+    let deep = 2 * KvDefault::SERVER.floor;
+    let machine = card_of_cap_kv_and_experts(deep, 10);
+    let default = KvDefault::of(&Kv).expect("a cache of rooms has a default");
+    let levers = PlanLevers::default().resolve_kv(KvFloor::Unset, None, default);
+    let seated = plan(&model, &machine, deep, &Kv, &levers).expect("a plan");
+    let whole = plan(&model, &machine, deep, &Kv, &PlanLevers::default()).expect("a plan");
+    assert_eq!(
+        (seated.kv_floor, seated.kv_host),
+        (Some(KvDefault::SERVER.floor), KvHost::Spill)
+    );
+    assert!(
+        seated.cards[0].experts > whole.cards[0].experts,
+        "the spread at the floor holds more experts than the whole context's"
+    );
+
+    let plain = plan(&model, &machine, deep, &Plain, &PlanLevers::default())
+        .expect("a plain cache plans with its levers unset");
+    assert_eq!((plain.kv_floor, plain.kv_host), (None, KvHost::Off));
+    let handed = PlanLevers::default().resolve_kv(KvFloor::Unset, None, KvDefault::SERVER);
+    assert!(matches!(
+        plan(&model, &machine, deep, &Plain, &handed),
+        Err(PlacementError::KvUnroomed { .. })
+    ));
+}

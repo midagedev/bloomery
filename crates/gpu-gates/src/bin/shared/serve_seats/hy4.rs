@@ -24,7 +24,7 @@
 //! a decode step), and `--prefill steps` asks it; the `listening` record names the walk.
 //!
 //! The sparse layers' cache rows are rooms, so the seat takes the common K/V default
-//! ([`KvDefault::SERVER`]): an unset `BLOOMERY_KV_FLOOR` plans the experts' spread at 8,192
+//! ([`PlanInputs::plan_levers`]): an unset `BLOOMERY_KV_FLOOR` plans the experts' spread at 8,192
 //! positions and an unset `BLOOMERY_KV_HOST` spills the rows' pages to the host once the card's
 //! margin is reached. The pooled keys are no room and stay counted at the context.
 //!
@@ -44,7 +44,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::hy4::hparams::Hparams;
 use model::arch::hy4::place::PlanInputs;
-use model::placement::{KvDefault, PlacementError};
+use model::placement::PlacementError;
 use serve::ServeError;
 
 use super::hybrid::{Family, Passed};
@@ -91,7 +91,6 @@ impl Family for Hy4 {
     const ALIAS: &'static str = "hy4-flash";
     const FAMILY: &'static str = "hy4";
     const SERVES: &'static str = "hy-v4-flash";
-    const KV_DEFAULT: Option<KvDefault> = Some(KvDefault::SERVER);
     const PASS: bool = true;
 
     /// The widest pass shape the seat's plan holds at `ctx` ([`hy4_pass::pick`]) on the seat's

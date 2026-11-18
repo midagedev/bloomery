@@ -140,10 +140,11 @@ mod tests {
     use models::Need;
 
     use super::super::hparams::tests::{N_EXP, TOP_K, keys, keys31, tensors, tensors31, typed};
-    use super::{PlaceError, PlanInputs};
+    use super::{KvLayout, PlaceError, PlanInputs};
     use crate::arch::synthetic::{Ty, V, header_typed};
     use crate::placement::workstation::{self, A6000, RTX_3090};
-    use crate::placement::{KvBytes, PlacementError, PlanLevers};
+    use crate::placement::{KvBytes, KvDefault, PlacementError, PlanLevers};
+    use bloomery_levers::{KvFloor, KvHost};
 
     /// The small header's file with `over` typed as the released set's other stacks, opened; each
     /// test names its own file (the tests run in threads of one process).
@@ -465,6 +466,57 @@ mod tests {
             assert_eq!(held, 3 * 164_868 + ctx * 1_408, "ctx {ctx}");
             assert_eq!(held, kv.bytes(0..4, ctx), "ctx {ctx}");
         }
+    }
+
+    /// A K3 or K3.1 file whose levers are unset plans as a server does: the default is read off the
+    /// rooms the file's stores declare ([`PlanInputs::resolve_kv`]), so at a context past the
+    /// floor the plan charges each latent layer's rooms at the floor's 8,192 positions, the delta
+    /// layers' state whole, and backs the pages past the floor on the host. The latent layer's room
+    /// is 1,152 B a position in a K3 file (the cached row) and 1,408 B in a K3.1 file (with the index
+    /// key row), and a delta layer's state 164,868 B [derived from the header's widths, apart
+    /// from the reader], so the card's kv class at 262,144 positions is `3 x 164,868 + 8,192 x row`,
+    /// where the levers left alone charge the context's. A body whose stores declare no rooms keeps
+    /// the type's default (a floor or host backing the server's default gave it would be refused by
+    /// name). Mutants: the inputs' default answering none (the plan charges the context), the
+    /// default given to a body with no rooms (the plan is refused by name).
+    #[test]
+    fn an_unset_context_charges_the_rooms_at_the_floor() {
+        const CTX: u64 = 262_144;
+        const PAGE: u64 = 2 << 20;
+        let machine = workstation::plan_gate(4);
+        let k3 = described("kimi-k3-place-floor");
+        let k31 = PlanInputs::describe(&opened31("kimi-k31-place-floor"))
+            .expect("the synthetic K3.1 header describes");
+        for (name, mut inputs, row) in [("K3", k3, 1_152), ("K3.1", k31, 1_408)] {
+            inputs.kv_host_page = Some(PAGE);
+            let levers = inputs.resolve_kv(PlanLevers::default(), KvFloor::Unset, None);
+            let plan = inputs
+                .plan(&machine, CTX, &levers)
+                .unwrap_or_else(|e| panic!("{name}: the gate machine plans {CTX}: {e}"));
+            assert_eq!(
+                (plan.kv_floor, plan.kv_host, plan.ctx_max),
+                (Some(KvDefault::SERVER.floor), KvHost::Spill, CTX),
+                "{name}"
+            );
+            let held: u64 = plan.cards.iter().map(|c| c.kv_bytes).sum();
+            assert_eq!(held, 3 * 164_868 + KvDefault::SERVER.floor * row, "{name}");
+            let whole = inputs
+                .plan(&machine, CTX, &PlanLevers::default())
+                .unwrap_or_else(|e| panic!("{name}: the gate machine plans {CTX} whole: {e}"));
+            let whole: u64 = whole.cards.iter().map(|c| c.kv_bytes).sum();
+            assert_eq!(whole, 3 * 164_868 + CTX * row, "{name}: the levers alone");
+        }
+        let mut plain = described("kimi-k3-place-floor-plain");
+        plain.kv = KvLayout::of(plain.spec.layers.iter().map(|l| &l.mixer))
+            .expect("the description's layers lay out");
+        let levers = plain.resolve_kv(PlanLevers::default(), KvFloor::Unset, None);
+        assert_eq!(
+            (levers.kv_floor_default, levers.kv_host),
+            (None, KvHost::Off)
+        );
+        plain
+            .plan(&machine, CTX, &levers)
+            .expect("a body with no rooms plans with its levers unset");
     }
 
     /// The by-position buffers a K3.1 latent layer declares are its stores' rows [derived from the

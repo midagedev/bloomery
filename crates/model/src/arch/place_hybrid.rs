@@ -23,7 +23,7 @@
 use std::num::NonZeroUsize;
 use std::ops::Range;
 
-use bloomery_levers::KvHost;
+use bloomery_levers::{KvFloor, KvHost};
 use bloomery_placement::slots::{SeqTerms, Stores, kv_host_room, layer_padding, room_spare};
 use models::{
     DeltaRule, Gqa, IndexKeys, Latent, Mixer, ModelSpec, PoolRule, RopeMode, Selector, Source,
@@ -35,8 +35,8 @@ use crate::placement::accepts::{program_of, routed_rule};
 use crate::placement::ctx_ask::{PlanRefusal, Short, Side};
 use crate::placement::workstation::{self, HostNeed, HostRead};
 use crate::placement::{
-    self, Card, CardFormat, KvBytes, Machine, ModelTensors, PlacementError, Plan, PlanLevers,
-    Unimplemented, Violation, checked_beside, joined, kernels,
+    self, Card, CardFormat, KvBytes, KvDefault, Machine, ModelTensors, PlacementError, Plan,
+    PlanLevers, Unimplemented, Violation, checked_beside, joined, kernels,
 };
 
 // The prompt batch a window ring keeps room for is the batch the card walks the prompt in.
@@ -904,6 +904,40 @@ impl<H> PlanInputs<H> {
     #[must_use]
     pub fn rooms(&self) -> Option<&PosLayout> {
         self.kv.rooms()
+    }
+
+    /// What a server takes for the K/V levers it leaves unset ([`KvDefault::of`]): the common
+    /// server default where the body holds its stores in rooms, none where it declares none.
+    #[must_use]
+    pub fn kv_default(&self) -> Option<KvDefault> {
+        KvDefault::of(&self.kv)
+    }
+
+    /// The placement's levers of a binary's one parse for a server of this file
+    /// ([`PlanLevers::from_levers`]), the K/V levers it leaves unset resolved by
+    /// [`PlanInputs::resolve_kv`]: every seat of a body in rooms plans under the same default.
+    pub fn plan_levers(
+        &self,
+        levers: &bloomery_levers::Levers,
+    ) -> Result<PlanLevers, PlacementError> {
+        let host = levers.kv_host_set().and_then(KvHost::parse);
+        Ok(self.resolve_kv(
+            PlanLevers::from_levers(levers)?,
+            levers.kv_floor_set(),
+            host,
+        ))
+    }
+
+    /// `plan` with its K/V levers resolved against this file's default ([`PlanInputs::kv_default`],
+    /// [`PlanLevers::resolve_kv`]): a floor or host word left unset is the server default's where
+    /// the body holds its stores in rooms. A body that declares none keeps `plan` as it is, since
+    /// a floor or a host backing it was handed would be refused by name.
+    #[must_use]
+    pub fn resolve_kv(&self, plan: PlanLevers, floor: KvFloor, host: Option<KvHost>) -> PlanLevers {
+        match self.kv_default() {
+            Some(default) => plan.resolve_kv(floor, host, default),
+            None => plan,
+        }
     }
 
     /// The engine the refusals that name one name.

@@ -57,7 +57,7 @@ use model::arch::models::ReasoningFormat;
 use model::arch::place_hybrid::{PlaceError, PlanInputs, RoomPages, reserve_room};
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::{self, HostNeed, TierBatchBytes};
-use model::placement::{KvDefault, Machine, PlacementError, Plan, PlanLevers};
+use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use runtime::width::Mode as WidthMode;
 use serve::reasoning::{ResponseTags, ThinkTags};
 use serve::{EngineProps, ServeError};
@@ -344,12 +344,6 @@ pub trait Tiered: Seat + Sized + 'static {
     fn prefill_steps(_flags: &Self::Flags) -> bool {
         false
     }
-
-    /// What the load takes for the K/V levers it leaves unset ([`PlanLevers::from_levers_with`]):
-    /// the floor its plan spreads the experts at and the planes' backing. `None`, an unset lever
-    /// plans as the type's default does ([`PlanLevers::from_levers`]); the levers still act where
-    /// the family's [`Tiered::ACTS_ON`] names them and its stores declare rooms.
-    const KV_DEFAULT: Option<KvDefault> = None;
 
     /// How the load runs a prompt, for a body that has a prompt pass: asked once the context
     /// (`ctx`) and the step's plan are chosen, with the run's machine at a tier batch of the
@@ -860,10 +854,10 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         S::check_ctx(&inputs, ctx)?;
     }
     let think = S::think(&inputs)?;
-    let mut plan_levers = match S::KV_DEFAULT {
-        Some(default) => PlanLevers::from_levers_with(&levers, default)?,
-        None => PlanLevers::from_levers(&levers)?,
-    };
+    // The K/V levers a load leaves unset take the common server default where its stores are rooms,
+    // the type's default otherwise ([`PlanInputs::plan_levers`]); the levers still act where the
+    // family's [`Tiered::ACTS_ON`] names them and its stores declare rooms.
+    let mut plan_levers = inputs.plan_levers(&levers)?;
     // The slot count and what named it (`from` on the `parallel` line); a seat of one sequence
     // reads `--parallel` as the one slot it holds, with no note about a count it cannot offer.
     let draft = if S::DRAFTS {
