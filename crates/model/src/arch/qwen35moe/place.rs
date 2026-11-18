@@ -4899,6 +4899,111 @@ mod tests {
         ));
     }
 
+    /// A qwen4exp plan whose K/V pages under `spill` pass the host room reads as a short host, so
+    /// the default context steps down to the largest whose pages the room holds, and a set
+    /// context over it is `DoesNotFit` naming the host and that largest share; a room under what
+    /// the least context needs is the plan's own refusal, which no context lowers. The room is
+    /// the least that holds the plan at 16,384 positions (found by bisection: the PLE table's
+    /// bytes count before the pages, so it is no sum of the plan's terms), and each 1,024
+    /// positions past it is two pages a kv head more [derived from the header: `heads` x 4 MiB a
+    /// step], so 16,384 is the largest context that holds. FAIL-first: `PlanRefusal::short`
+    /// with the card's reading alone leaves the first plan's refusal the seat's error for both
+    /// asks.
+    #[test]
+    fn a_qwen4exp_kv_pages_past_the_host_room_ask_a_smaller_context() {
+        use crate::placement::PlanLevers;
+        use crate::placement::ctx_ask::{
+            Ask, AskError, Limit, PlanRefusal, Rule, Short, Side, Steps, choose, probe_of,
+        };
+        use crate::placement::workstation::HostRead;
+        use bloomery_levers::KvHost;
+
+        const STEPS: Steps = Steps {
+            floor: 4_096,
+            step: 1_024,
+        };
+        const LIMIT: Limit = Limit {
+            positions: 65_536,
+            source: "trained",
+        };
+        let (mut inputs, machine) = kv_host_fixture("q4x-kvhost-short");
+        let levers = PlanLevers {
+            kv_host: KvHost::Spill,
+            kv_floor: Some(4_096),
+            ..PlanLevers::default()
+        };
+        let card = super::Experts::Card;
+        let mut least_room = |ctx: u64| {
+            let (mut under, mut holds) = (0u64, u64::MAX);
+            while holds - under > 1 {
+                let mid = under + (holds - under) / 2;
+                inputs.room = (mid, HostRead::Given);
+                if inputs.plan_with(&machine, (ctx, 8), &levers, card).is_ok() {
+                    holds = mid;
+                } else {
+                    under = mid;
+                }
+            }
+            holds
+        };
+        let held = 16_384;
+        let (room, floor_room) = (least_room(held), least_room(STEPS.floor));
+        assert!(floor_room < room, "the floor's room is under the pages'");
+        inputs.room = (room, HostRead::Given);
+        let plan_at =
+            |c: u64| probe_of(inputs.plan_with(&machine, (c, 8), &levers, card).map(|_| c));
+
+        let over = inputs
+            .plan_with(&machine, (65_536, 8), &levers, card)
+            .expect_err("the cap's pages pass the room");
+        let PlaceError::Placement(PlacementError::KvHostOverHost {
+            bytes, headroom, ..
+        }) = &over
+        else {
+            panic!("the pages' own refusal: {over}");
+        };
+        assert_eq!(
+            over.short(),
+            Some(Short {
+                on: Side::Host,
+                need: *bytes,
+                room: *headroom
+            })
+        );
+        assert_eq!(over.card_short(), None);
+
+        let chosen = choose(Ask::Default, 1, LIMIT, STEPS, plan_at)
+            .expect("the default steps down to the pages the room holds");
+        assert_eq!(chosen.slot_ctx, held);
+        assert!(
+            matches!(chosen.rule, Rule::Fitted { from: 65_536, short } if short.on == Side::Host),
+            "fitted from the cap on the host"
+        );
+        let AskError::DoesNotFit { short, largest, .. } =
+            choose(Ask::Set { total: 65_536 }, 1, LIMIT, STEPS, plan_at)
+                .err()
+                .expect("the set context is over the room")
+        else {
+            panic!("a set context over the host room is DoesNotFit");
+        };
+        assert_eq!((short.on, largest), (Side::Host, Some(held)));
+
+        // A room under the floor's own need is no context's: the plan's refusal.
+        inputs.room = (floor_room - 1, HostRead::Given);
+        let plan_at =
+            |c: u64| probe_of(inputs.plan_with(&machine, (c, 8), &levers, card).map(|_| c));
+        let refused = choose(Ask::Default, 1, LIMIT, STEPS, plan_at)
+            .err()
+            .expect("no context holds");
+        assert!(
+            matches!(
+                &refused,
+                AskError::Plan(PlaceError::Placement(e)) if e.host_floor_short().is_some()
+            ),
+            "the NVMe tier's floor is the plan's own: {refused}"
+        );
+    }
+
     /// A qwen4exp file's stream slot is its widest routed expert, the gate, up and down at their
     /// file bytes: three Q8_0 rows of 64 values, 68 B each, or three NVFP4 rows, 36 B each, and
     /// each NVFP4 stack's four-byte tensor scale. A load of every expert on the host streams

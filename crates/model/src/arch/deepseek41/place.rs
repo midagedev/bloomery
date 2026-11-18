@@ -143,18 +143,16 @@ impl PlanRefusal for PlaceError {
         }
     }
 
-    /// The card's reading, and the host's: the K/V pages past its room
-    /// ([`PlacementError::kv_host_short`]) and the NVMe tier's floor over it
-    /// ([`PlacementError::host_room_short`]) carry the slots' and the
+    /// The common reading ([`PlanRefusal::base_short`]: the card's, and the K/V
+    /// pages past the host's room), and the NVMe tier's floor over the room
+    /// ([`PlacementError::host_room_short`]), which carries the slots' and the
     /// context's host bytes. A set context over them is a short host with the
     /// largest share that holds (or that none does), and the default steps
     /// down to it, where the refusal had stopped the load by its own name
     /// before the slots' share was asked.
     fn short(&self) -> Option<Short> {
-        self.card_short().or_else(|| {
-            let host = self.placement()?;
-            host.kv_host_short().or_else(|| host.host_room_short())
-        })
+        self.base_short()
+            .or_else(|| self.placement()?.host_room_short())
     }
 }
 

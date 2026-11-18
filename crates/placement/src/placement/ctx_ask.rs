@@ -244,9 +244,10 @@ impl PlacementError {
     /// the room even with no routed expert left on it, so a smaller context
     /// is what it asks for. `need` is the pages' bytes and `room` what the
     /// host leaves them. Neither [`PlacementError::card_short`] nor
-    /// [`PlacementError::host_floor_short`] reads it: a family whose seat
-    /// takes it for short folds it into [`PlanRefusal::short`]. Every other
-    /// refusal is `None`.
+    /// [`PlacementError::host_floor_short`] reads it: a seat reads it through
+    /// [`PlanRefusal::base_short`], and a refusal that reaches the start path
+    /// unread is the memory's class all the same. Every other refusal is
+    /// `None`.
     pub fn kv_host_short(&self) -> Option<Short> {
         match self {
             Self::KvHostOverHost {
@@ -338,8 +339,9 @@ impl std::error::Error for Unpaged {}
 
 /// A family's plan refusal, read as a short memory ([`PlanRefusal::short`]):
 /// each family's error says which of its variants carry a placement error
-/// and a plan's violations, and the card's reading is this one; a family
-/// whose body serves no tier past the host adds its host refusal.
+/// and a plan's violations, and the common reading is this one
+/// ([`PlanRefusal::base_short`]); a family whose body serves no tier past
+/// the host adds its host refusal.
 pub trait PlanRefusal {
     /// The placement error this refusal carries, if any.
     fn placement(&self) -> Option<&PlacementError>;
@@ -351,10 +353,20 @@ pub trait PlanRefusal {
             .and_then(PlacementError::card_short)
             .or_else(|| self.violations().and_then(short_of))
     }
-    /// This refusal as a short memory, else `None`: the card's reading
-    /// unless the family's body adds the host's.
-    fn short(&self) -> Option<Short> {
+    /// This refusal as the short memory every family reads, else `None`: the
+    /// card's reading, and the host's K/V pages past its room
+    /// ([`PlacementError::kv_host_short`]). A plan that sends K/V pages to the
+    /// host (`BLOOMERY_KV_HOST`) is refused by them at any context whose
+    /// pages the room cannot hold, whatever the family, and a smaller context
+    /// is what that asks for; a family whose plan counts none never meets it.
+    fn base_short(&self) -> Option<Short> {
         self.card_short()
+            .or_else(|| self.placement().and_then(PlacementError::kv_host_short))
+    }
+    /// This refusal as a short memory, else `None`: [`PlanRefusal::base_short`]
+    /// unless the family's body adds the host's own, which it reads after it.
+    fn short(&self) -> Option<Short> {
+        self.base_short()
     }
 }
 
@@ -1291,9 +1303,10 @@ mod tests {
 
     /// The K/V pages the host cannot hold are a short host at the pages' bytes and what the
     /// room leaves them, and only [`PlacementError::kv_host_short`] reads them: the card's and
-    /// the host floor's readings leave them `None`, so a family that does not fold them in keeps
-    /// the named refusal. FAIL-first: the reading on the card's side, the bytes and the room
-    /// swapped, or `card_short` taking the arm (every family's seat then reads it as short).
+    /// the host floor's readings leave them `None`, and [`PlanRefusal::base_short`] folds the
+    /// reading in for every family. FAIL-first: the reading on the card's side, the bytes and
+    /// the room swapped, or `card_short` taking the arm (the card's reading then names the
+    /// pages' side as a card's).
     #[test]
     fn kv_pages_over_the_host_read_as_a_short_host() {
         let over = PlacementError::KvHostOverHost {

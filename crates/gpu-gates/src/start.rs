@@ -165,6 +165,7 @@ mod agent {
 
     use model::placement::PlacementError;
     use model::placement::ctx::PastLimit;
+    use model::placement::ctx_ask::Short;
     use model::placement::need_hook::{self, HookError};
     use model::placement::workstation::HostShort;
     use serde_json::{Value, json};
@@ -342,11 +343,11 @@ mod agent {
             }
         }
         if let Some(p) = err.downcast_ref::<PlacementError>() {
-            let need = p
-                .card_short()
-                .or_else(|| p.host_floor_short())
-                .map(|s| s.need);
-            return Some((placement_code(p), Vec::new(), need));
+            return Some((
+                placement_code(p),
+                Vec::new(),
+                memory_short(p).map(|s| s.need),
+            ));
         }
         if let Some(f) = err.downcast_ref::<FloorShort>() {
             return Some((Code::NoFit, Vec::new(), Some(f.short.need)));
@@ -420,11 +421,21 @@ mod agent {
         }
     }
 
+    /// The memory a placement refusal says the plan does not fit, with the bytes it asked: a
+    /// card's, the host's floor, or the host's K/V pages past its room, each the one reading its
+    /// own method gives. A refusal that reaches the start path unread by a context search (a
+    /// set context a seat did not ask the slots' share of, a family that does not search) is
+    /// that memory's class all the same.
+    fn memory_short(e: &PlacementError) -> Option<Short> {
+        e.card_short()
+            .or_else(|| e.host_floor_short())
+            .or_else(|| e.kv_host_short())
+    }
+
     /// The class of a placement refusal: a memory the plan does not fit is [`Code::NoFit`], a
     /// program the seats do not run [`Code::Unsupported`], the rest the unnamed refusal.
     fn placement_code(e: &PlacementError) -> Code {
-        if e.card_short().is_some()
-            || e.host_floor_short().is_some()
+        if memory_short(e).is_some()
             || matches!(
                 e,
                 PlacementError::TierBatchCard { .. }
@@ -804,8 +815,9 @@ mod agent {
         }
 
         /// A host-side refusal names the bytes it asked for: an arena past what the room leaves
-        /// over the NVMe tier's floor, an arena under its least, and a load's host need where
-        /// each card has memory of its own.
+        /// over the NVMe tier's floor, an arena under its least, the K/V pages past the room
+        /// (`BLOOMERY_KV_HOST`) and a load's host need where each card has memory of its own.
+        /// FAIL-first: the pages' refusal is the unnamed class (status 1) with no bytes.
         #[test]
         fn a_host_refusal_names_the_bytes_it_asked() {
             use model::placement::ArenaFloor;
@@ -829,7 +841,7 @@ mod agent {
                 read: Box::new(HostRead::MemAvailable),
                 floor: None,
             };
-            let refusals: [(GateError, u64); 3] = [
+            let refusals: [(GateError, u64); 4] = [
                 (
                     Box::new(PlacementError::NvTierArena {
                         arena: 6,
@@ -841,6 +853,14 @@ mod agent {
                 (
                     Box::new(PlacementError::NvTierArenaUnder { arena: 1, least }),
                     least.bytes,
+                ),
+                (
+                    Box::new(PlacementError::KvHostOverHost {
+                        lever: bloomery_levers::KvHost::Spill,
+                        bytes: 7,
+                        headroom: 3,
+                    }),
+                    7,
                 ),
                 (Box::new(host), 5),
             ];

@@ -542,9 +542,10 @@ impl PlanRefusal for PlaceError {
         }
     }
 
-    /// The card's reading, and the host's: a longer context leaves more routed experts to the
-    /// host, and the body serves no NVMe tier past it ([`PlaceError::NoNvmeTier`]), so a smaller
-    /// context is what that refusal asks for. The host held its need less the bytes it paged.
+    /// The common reading ([`PlanRefusal::base_short`]), and the host's: a longer context leaves
+    /// more routed experts to the host, and the body serves no NVMe tier past it
+    /// ([`PlaceError::NoNvmeTier`]), so a smaller context is what that refusal asks for. The host
+    /// held its need less the bytes it paged.
     fn short(&self) -> Option<Short> {
         match self {
             Self::NoNvmeTier { paged, need, .. } => Some(Short {
@@ -557,7 +558,7 @@ impl PlanRefusal for PlaceError {
                 need: *reserve,
                 room: *left,
             }),
-            _ => self.card_short(),
+            _ => self.base_short(),
         }
     }
 }
@@ -2309,5 +2310,83 @@ mod tests {
             RingForms::BLOCKS32
         );
         assert_eq!(planned(&[]), RingForms::BLOCKS32);
+    }
+
+    /// The refusals of a hybrid plan the host's room asks a smaller context for, as every
+    /// family sharing this error reads them: the K/V pages past the room
+    /// ([`PlacementError::KvHostOverHost`]) and the experts paged to a tier the body does not
+    /// serve ([`PlaceError::NoNvmeTier`]), each a short host, so a set context over them is
+    /// `DoesNotFit` and the default steps down to the largest that holds; any other refusal is
+    /// the plan's own. FAIL-first: `short` with the card's reading alone leaves the pages'
+    /// refusal the seat's error at the first ask, for both asks.
+    #[test]
+    fn a_host_short_asks_a_smaller_context() {
+        use crate::placement::ctx_ask::{
+            Ask, AskError, Limit, PlanRefusal, Rule, Short, Side, Steps, choose, probe_of,
+        };
+        const PER_POS: u64 = 10;
+        const ROOM: u64 = 40 * 1024;
+        const STEPS: Steps = Steps {
+            floor: 1024,
+            step: 1024,
+        };
+        const LIMIT: Limit = Limit {
+            positions: 16 * 1024,
+            source: "trained",
+        };
+        let pages = |c: u64| {
+            PlaceError::Placement(PlacementError::KvHostOverHost {
+                lever: KvHost::Spill,
+                bytes: c * PER_POS,
+                headroom: ROOM,
+            })
+        };
+        // The pages hold up to `ROOM / PER_POS` = 4,096 positions.
+        let plan_at = |c: u64| {
+            probe_of(if c * PER_POS <= ROOM {
+                Ok(c)
+            } else {
+                Err(pages(c))
+            })
+        };
+        assert_eq!(
+            pages(8192).short(),
+            Some(Short {
+                on: Side::Host,
+                need: 8192 * PER_POS,
+                room: ROOM
+            })
+        );
+        assert_eq!(pages(8192).card_short(), None);
+        let paged = PlaceError::NoNvmeTier {
+            paged: 6,
+            need: 10,
+            room: String::new(),
+            engine: "e",
+        };
+        assert_eq!(
+            paged.short(),
+            Some(Short {
+                on: Side::Host,
+                need: 10,
+                room: 4
+            })
+        );
+        assert!(PlaceError::CtxZero.short().is_none());
+        let AskError::DoesNotFit { short, largest, .. } =
+            choose(Ask::Set { total: 16 * 1024 }, 1, LIMIT, STEPS, plan_at)
+                .err()
+                .expect("the set context is over the room")
+        else {
+            panic!("a set context over the host room is DoesNotFit");
+        };
+        assert_eq!((short.on, largest), (Side::Host, Some(4096)));
+        let chosen = choose(Ask::Default, 1, LIMIT, STEPS, plan_at)
+            .expect("the default steps down to the pages the host holds");
+        assert_eq!(chosen.slot_ctx, 4096);
+        assert!(
+            matches!(chosen.rule, Rule::Fitted { from, short } if from == 16 * 1024 && short.on == Side::Host),
+            "fitted from the target on the host"
+        );
     }
 }
