@@ -126,6 +126,11 @@ pub enum Arch {
     /// stack, and the cross-layer residual attention over banked block inputs. No program runs it
     /// yet.
     KimiK3,
+    /// Tencent Hy4-flash: gated latent attention (a learnable sink a head, 256-wide values) on
+    /// sparse-attention layers with a pooled indexer and sliding-window layers, identity-comb
+    /// hyper-connections with sandwich norms, a latent mixture of experts beside a shared one,
+    /// and n-gram engram sites. No program runs it yet.
+    Hy4,
 }
 
 impl Arch {
@@ -158,6 +163,7 @@ impl Arch {
             Arch::Lfm3 => "lfm3",
             Arch::MistralLarge4 => "mistral-large4",
             Arch::KimiK3 => "kimi-k3",
+            Arch::Hy4 => "hy_v4_flash",
         }
     }
 }
@@ -503,6 +509,12 @@ pub enum PoolRule {
     /// it and on each query, both rotated by `rope` (the key at its pool's
     /// first position), the heads' rectified scores summed.
     Mean { rope: Rope },
+    /// The pool's key a softmax-weighted sum of its members' projected keys (the members' scores a
+    /// projection of the member key plus a position table), RMS-normed with a gain at `key_eps` and
+    /// rotated by `rope` at the pool's first position; the query rotated by the same rope on its
+    /// trailing dims, the heads' rectified scores weighed by a learned projection of the layer
+    /// input. The query's own pool is kept inside the top-k whatever it scores.
+    Gated { key_eps: f32, rope: Rope },
 }
 
 /// Where a layer's index keys come from.
@@ -807,6 +819,12 @@ pub enum Residual {
         eps: f32,
         add: [f32; 2],
     },
+    /// The owning spec's [`HcSpec`] with sandwich norms: each sublayer's output goes through its
+    /// own weighted RMS norm at `eps` (`post_attention_norm` for the mixer, `post_ffw_norm` for the
+    /// feed-forward block) before the hyper-connection's post mix adds it to the streams.
+    HcSandwich {
+        eps: f32,
+    },
     /// Cross-layer residual attention over banked block inputs. Every `block`-th layer
     /// (`l % block == 0`) pushes its raw input onto a bank, and its running sum restarts from
     /// the mixer's output alone. Each sublayer reads, in place of the running sum, the softmax
@@ -846,6 +864,17 @@ pub enum HcKind {
     /// of the chart; the post mix is `magnitude · sigmoid(..)`.
     Chart {
         /// `hyper_connection.epsilon`: added to the streams' mean square.
+        eps: f32,
+        /// `hyper_connection.magnitude`: the post mix's factor.
+        magnitude: f32,
+        collapse: Collapse,
+    },
+    /// Identity-comb (Hy4-flash): pre and post mixes from one projection of the streams scaled by
+    /// their RMS, every sublayer its own mix, and no comb: the residual passes unmixed,
+    /// `out_i = residual_i + post_i · x`. The pre mix is `sigmoid(..) + eps`, the post mix
+    /// `magnitude · sigmoid(..) + eps`; `collapse` folds the streams for the head.
+    Identity {
+        /// `hyper_connection.epsilon`: added to both mixes.
         eps: f32,
         /// `hyper_connection.magnitude`: the post mix's factor.
         magnitude: f32,
@@ -909,6 +938,11 @@ pub enum NgramRule {
     /// Token ids through the file's token map, the window before the start
     /// padded with the file's pad id; the gated value added to every stream.
     Engram,
+    /// [`NgramRule::Engram`]'s ids with dead tokens: a token outside the file's token map or at an
+    /// embedding position reads the mapped pad id, and a token whose own id is dead adds nothing.
+    /// The gate reads each row through a norm and a fused key and value projection, and the added
+    /// value is gated per stream and scaled by a gain; the site runs before the layer's mixer.
+    EngramMasked,
     /// Raw token ids; an `eos` in the window, or a position before the start,
     /// turns it and every older slot into `eos`. Each stream's gated value,
     /// normed, goes through a causal depthwise conv of `conv` taps `dilation`
@@ -960,6 +994,9 @@ pub enum ToolFormat {
     /// Mistral's `[TOOL_CALLS]NAME[ARGS]{json}`, one markup per call with no
     /// call id and nothing between calls (Mistral Large 4's template).
     Mistral,
+    /// Hy4-flash's call markup: GLM's key and value tags with the template's token suffix on
+    /// every tag and a `<tool_calls>` wrapper around the calls.
+    Hy4,
 }
 
 impl ToolFormat {

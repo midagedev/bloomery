@@ -78,6 +78,9 @@ use crate::qtype::HostAct;
 /// types): their rows are `qtype::OWN_ROWS`, beside ggml's. MLX_A4H and MLX_A8H are MLX_A4's
 /// and MLX_A8's groups whose scale and bias are F16 bits, where MLX_A4's and MLX_A8's are BF16
 /// bits: two storages of one affine rule, two types, since a block's bytes do not say which.
+/// F8E4M3=2008 is ggml's F8_E4M3 as a file stores it under id 43 (one byte a value, no tensor scale:
+/// [`GgmlType::F8E4M3`]), which [`crate::id43`] resolves by extent; F8E4M3_ROWS is bloomery's own
+/// storage of the same bytes with a scale beside them.
 ///
 /// A named type is one this build can size ([`GgmlType::blck_size`],
 /// [`GgmlType::type_size`]): it has a row in [`crate::QROWS`], the one owner
@@ -135,6 +138,7 @@ pub enum GgmlType {
     MLX_A8,
     MLX_A4H,
     MLX_A8H,
+    F8E4M3,
     Unknown(u32),
 }
 
@@ -185,6 +189,7 @@ impl GgmlType {
             2005 => GgmlType::MLX_A8,
             2006 => GgmlType::MLX_A4H,
             2007 => GgmlType::MLX_A8H,
+            2008 => GgmlType::F8E4M3,
             other => GgmlType::Unknown(other),
         }
     }
@@ -234,7 +239,19 @@ impl GgmlType {
             GgmlType::MLX_A8 => 2005,
             GgmlType::MLX_A4H => 2006,
             GgmlType::MLX_A8H => 2007,
+            GgmlType::F8E4M3 => 2008,
             GgmlType::Unknown(v) => v,
+        }
+    }
+
+    /// The id a file stores a tensor of this type under: [`GgmlType::as_u32`], but for
+    /// [`GgmlType::F8E4M3`], whose value-type id (2008) is bloomery's and whose file id is ggml's 43,
+    /// which [`crate::id43`] resolves back by the tensor's extent.
+    #[must_use]
+    pub const fn file_id(self) -> u32 {
+        match self {
+            GgmlType::F8E4M3 => 43,
+            other => other.as_u32(),
         }
     }
 
@@ -424,6 +441,7 @@ pub fn dequant_row(ty: GgmlType, src: &[u8], dst: &mut [f32]) -> Result<(), Quan
         GgmlType::MLX_A8 => dequant_mlx_a8(ty, AffinePair::Bf16, &src[..need], dst)?,
         GgmlType::MLX_A4H => dequant_mlx_a4(ty, AffinePair::F16, &src[..need], dst)?,
         GgmlType::MLX_A8H => dequant_mlx_a8(ty, AffinePair::F16, &src[..need], dst)?,
+        GgmlType::F8E4M3 => E4m3Rows::new(1.0).decode(&src[..need], dst)?,
         GgmlType::Q4_0
         | GgmlType::Q4_1
         | GgmlType::I8

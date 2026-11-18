@@ -32,8 +32,24 @@
 //! read on the device, so the flash runs unchanged over the picked rows
 //! (Mistral Large 4's roped layers).
 //!
-//! Numeric contract (the host rules [`latent_append_host`] and
-//! [`index_key_append_host`] are these lists, op for op). Latent, one block
+//! Two more serve a k-pool selector whose pooled key is a gated pool of a
+//! projection of the normed token key, normed again and turned (Hy4-flash's
+//! DSA layers, llama.cpp's `build_kpool_select`):
+//! - [`LatentKernels::enqueue_index_key_rms_append`]: the RMS norm of the
+//!   [`INDEX_HEAD`]-value raw key with its gain, then its value and gate
+//!   projections (`indexer_compressor_value` and `_gate`, q8_0), `[value;
+//!   gate]` rounded to f16 into one index row — slot `p mod ring` of a ring
+//!   of index rows, a dense cache when the ring has a row per position;
+//! - [`LatentKernels::enqueue_index_pool_norm_rope`]: the pool key of every
+//!   pool a token completes, the gated pool of its four rows' values as
+//!   `enqueue_index_pool` forms it, then its RMS norm with the pool norm's
+//!   gain and the NORM turn of its last [`ROT`] values at the pool's first
+//!   position, rounded to f16 into the pool plane.
+//!
+//! Numeric contract (the host rules [`latent_append_host`],
+//! [`index_key_append_host`], [`index_pool_host`],
+//! [`index_key_rms_append_host`] and [`index_pool_norm_rope_host`] are these
+//! lists, op for op). Latent, one block
 //! of [`BLOCK`] threads per token, thread `t` owning values `t + 128·i`:
 //! - each value squared in f32, thread `t`'s four squares added in f64 in
 //!   `i` order, the 32 lanes of a warp by the xor butterfly (16, 8, 4, 2, 1)
@@ -55,6 +71,25 @@
 //! (1 / s)`; the key `((w0·k0 + w1·k1) + w2·k2) + w3·k3`, each op rounded,
 //! then rounded to f16 once.
 //!
+//! Forced-tail key, one block of [`KEY_BLOCK`] per token, every warp
+//! norming the key with lane `l` owning values `4l .. 4l + 3`:
+//! - each value squared in f32, the lane's four squares added in f64 in
+//!   order, the lanes by the xor butterfly in f64; the mean `(sum /
+//!   INDEX_HEAD) as f32`, the scale `elem::rms_scale_of_mean` (NaN where it
+//!   is not finite and positive); the normed value `(x · scale) · gain`, each
+//!   product rounded — ggml's `rms_norm` then `mul`;
+//! - each projection row q8f32's word walk at k = 128: lane `l` the four
+//!   terms of code word `l`, `fma(d·v, x, f)` in byte order from 0, the lane
+//!   sums by the xor butterfly (16, 8, 4, 2, 1) — `q8_0_gemv`'s bits over
+//!   the normed key; then rounded to f16.
+//!
+//! Forced-tail pool, one warp per completing token, lane `l` owning channels
+//! `4l .. 4l + 3`: the pool's value per channel as the pool above (the value
+//! in the key's place); the norm as the key's; then for the lanes past
+//! `INDEX_HEAD − ROT` the pairs `(4l, 4l + 1)` and `(4l + 2, 4l + 3)` turned
+//! by `rope_table::rope_pair_rn` with table pairs `2l − 32` and `2l − 31` of
+//! row `4j`; then rounded to f16 once.
+//!
 //! This is ik's CPU order (`fused_rms_norm`, `norm`, then `mul` and `add`)
 //! but for the f64 sums, which ik adds serially: two f64 sums of the same
 //! f32 terms differ far below one f32 ulp of the mean, so the rounded mean
@@ -73,13 +108,19 @@
 //! positions (the caller's contract), so no two blocks write one row. A pool
 //! key that is not finite raises [`FaultSite::PoolSelect`] with the key
 //! written as computed; a count past the cache's rows raises
-//! [`FaultSite::CachePos`] and writes nothing.
+//! [`FaultSite::CachePos`] and writes nothing. The forced-tail entries bound
+//! a position and a count by the context, not by the ring's rows: a
+//! position at or past `ctx` and a count past it raise `CachePos` and write
+//! nothing, and the ring's slot is the position's remainder, so the tokens
+//! of one launch hold positions no two of which share a slot.
 
 use crate::GpuError;
+use crate::elem::rms_scale_of_mean;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{f16_finite, f32_to_f16_bits, half_bits_to_f32};
 use crate::launch_u32;
 use crate::linear::expf_ik;
+use crate::rope_table::rope_pair_rn;
 use crate::tensor::DeviceTensor;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
@@ -97,6 +138,9 @@ pub const INDEX_HEAD: usize = 128;
 pub const INDEX_ROW: usize = 2 * INDEX_HEAD;
 /// Positions per pool (`attention.indexer.kpool`).
 pub const POOL: usize = 4;
+/// Values at the tail of a forced-tail selector's pool key (and query head)
+/// that turn, NORM mode (`rope.dimension_count`): a rope table row's f32.
+pub const ROT: usize = 64;
 
 /// Pool rows a cache of `rows` positions has room for: one per [`POOL`]
 /// positions, the last one incomplete when `rows` is not a multiple of it.
@@ -105,13 +149,18 @@ pub const fn pools_for(rows: usize) -> usize {
     rows.div_ceil(POOL)
 }
 
-/// Threads per block of both entries: four warps.
+/// Threads per block of the entries but the forced-tail key append: four
+/// warps.
 const BLOCK: u32 = 128;
+/// Threads per block of the forced-tail key append: a block per token, four
+/// warps a projection.
+const KEY_BLOCK: u32 = 256;
 /// Latent values each thread owns.
 const PER_THREAD: usize = LATENT / BLOCK as usize;
 /// Index-key values each lane owns.
 const PER_LANE: usize = INDEX_HEAD / 32;
 const _: () = assert!(PER_THREAD == 4 && PER_LANE == 4 && BLOCK == 128 && POOL == 4);
+const _: () = assert!(KEY_BLOCK == 256 && ROT == 64 && ROT <= INDEX_HEAD);
 
 /// A warp's sum of one f64 a lane, the xor butterfly (16, 8, 4, 2, 1): every
 /// lane ends with the same sum. Every lane of the warp calls it (a warp
@@ -647,6 +696,302 @@ mod latent_kernels {
             i += 256;
         }
     }
+
+    /// The forced-tail selector's index rows of `m` tokens (module doc), one
+    /// block of [`KEY_BLOCK`] per token `t = block`: its raw key is
+    /// `x[t·stride + k_off ..][..INDEX_HEAD]`; every warp norms it, lane `l`
+    /// owning values `4l .. 4l + 3`, and warp `w` writes the f16 outputs of
+    /// rows `32·(w % 4) ..` of the value projection (`w < 4`) or of the gate
+    /// projection, lane `l` row `32·(w % 4) + l`, into slot `pos[t] mod ring`
+    /// of `cache` (`ring` rows of [`INDEX_ROW`], the value first). Each
+    /// projection is `[INDEX_HEAD × INDEX_HEAD]` q8_0 in the q8f32 planes
+    /// (`qs` 32 words a row, `d` 4 scales a row). A position at or past
+    /// `ctx` raises `CachePos` and the token writes nothing. `k_off +
+    /// INDEX_HEAD <= stride` (host-checked).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            x.len() >= m * stride,
+            gain.len() >= 128,
+            v_qs.len() >= 4096,
+            v_d.len() >= 512,
+            g_qs.len() >= 4096,
+            g_d.len() >= 512,
+            pos.len() >= m,
+            ring >= 1,
+            cache.len() >= ring * 256
+        )
+    )]
+    pub fn index_key_rms_append(
+        x: &[f32],
+        gain: &[f32],
+        v_qs: &[u32],
+        v_d: &[u16],
+        g_qs: &[u32],
+        g_d: &[u16],
+        pos: &[u32],
+        eps: f32,
+        stride: u32,
+        k_off: u32,
+        ring: u32,
+        ctx: u32,
+        m: u32,
+        fault: FaultSink,
+        mut cache: DisjointSlice<u16>,
+    ) {
+        let t = thread::blockIdx_x() as usize;
+        if t >= m as usize {
+            return; // block-uniform
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let lane = tid % 32;
+        let wid = tid / 32;
+        // SAFETY: t < m <= pos.len() by the launch contract.
+        let p = unsafe { *pos.get_unchecked(t) };
+        if p >= ctx {
+            if tid == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
+            return; // block-uniform: p is the token's
+        }
+        // ---- the norm, in every warp: lane `lane` values `4·lane ..`.
+        let base = t * stride as usize + k_off as usize + PER_LANE * lane;
+        let mut k = [0.0f32; PER_LANE];
+        let mut s = 0.0f64;
+        let mut i = 0usize;
+        #[unroll]
+        while i < PER_LANE {
+            // SAFETY: 4·lane + i < INDEX_HEAD and k_off + INDEX_HEAD <= stride
+            // (host-checked) keep the read inside token t's row of m·stride
+            // <= x.len() values (launch contract).
+            k[i] = unsafe { *x.get_unchecked(base + i) };
+            s += f64::from(mul_rn_f32(k[i], k[i]));
+            i += 1;
+        }
+        let mean = (warp_sum_f64(s) / INDEX_HEAD as f64) as f32;
+        let scale = rms_scale_of_mean(mean, eps);
+        let mut i = 0usize;
+        #[unroll]
+        while i < PER_LANE {
+            // SAFETY: 4·lane + i < INDEX_HEAD <= gain.len() (launch contract).
+            let gv = unsafe { *gain.get_unchecked(PER_LANE * lane + i) };
+            k[i] = mul_rn_f32(mul_rn_f32(k[i], scale), gv);
+            i += 1;
+        }
+        // ---- the projection rows: q8f32's word walk at k = 128, one code
+        // word a lane, then the warp's butterfly; lane r keeps row r's sum.
+        let (qs, d) = if wid < 4 { (v_qs, v_d) } else { (g_qs, g_d) };
+        let row0 = 32 * (wid % 4);
+        let mut mine = 0.0f32;
+        let mut r = 0usize;
+        while r < 32 {
+            let row = row0 + r;
+            // SAFETY: row < INDEX_HEAD and lane < 32 put word row·32 + lane
+            // below 4096 <= qs.len() and scale row·4 + lane/8 below 512 <=
+            // d.len() (launch contract), for either projection.
+            let (q, db) = unsafe {
+                (
+                    *qs.get_unchecked(row * 32 + lane),
+                    *d.get_unchecked(row * 4 + lane / 8),
+                )
+            };
+            let dv = half_bits_to_f32(db);
+            let f = f32::mul_add(dv * (q as u8 as i8 as f32), k[0], 0.0);
+            let f = f32::mul_add(dv * ((q >> 8) as u8 as i8 as f32), k[1], f);
+            let f = f32::mul_add(dv * ((q >> 16) as u8 as i8 as f32), k[2], f);
+            let f = f32::mul_add(dv * ((q >> 24) as u8 as i8 as f32), k[3], f);
+            let sum = warp::reduce_sum_f32(f);
+            if lane == r {
+                mine = sum;
+            }
+            r += 1;
+        }
+        let h = f32_to_f16_bits(mine);
+        let col = (if wid < 4 { 0 } else { INDEX_HEAD }) + row0 + lane;
+        let slot = (p % ring) as usize;
+        // SAFETY: slot < ring and col < INDEX_ROW, so the index is below
+        // ring·INDEX_ROW <= cache.len() (launch contract); one thread per
+        // value of the row, and the tokens of one launch hold slots no two
+        // share (the caller's contract).
+        unsafe { *cache.get_unchecked_mut(slot * INDEX_ROW + col) = h };
+        if !f16_finite(h) {
+            fault.raise(FaultSite::CacheValue);
+        }
+    }
+
+    /// The forced-tail selector's pool keys of `m` tokens (module doc), one
+    /// warp per token, warp `w = 4·block + warp`: token `w` of live count `c
+    /// = n_keys[w]` completes pool `j = c/4 − 1` when `c` is a positive
+    /// multiple of [`POOL`], and writes its [`INDEX_HEAD`] f16 values to row
+    /// `j` of `pooled` from the slots `(4j + i) mod ring` of `cache` (`ring`
+    /// rows of [`INDEX_ROW`], value then gate), the four [`INDEX_HEAD`]-value
+    /// rows of `ape`, the norm's `gain`, and row `4j` of `table` (`ctx` rows
+    /// of [`ROT`] f32). Lane `l` owns channels `4l .. 4l + 3`, so a NORM pair
+    /// of the turned tail is one lane's. Any other count writes nothing; a
+    /// count past `ctx` raises `CachePos`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            ring >= 1,
+            cache.len() >= ring * 256,
+            ape.len() >= 512,
+            gain.len() >= 128,
+            table.len() >= ctx * 64,
+            n_keys.len() >= m,
+            pools * 4 >= ctx,
+            pooled.len() >= pools * 128
+        )
+    )]
+    pub fn index_pool_norm_rope(
+        cache: &[u16],
+        ape: &[f32],
+        gain: &[f32],
+        table: &[f32],
+        n_keys: &[u32],
+        eps: f32,
+        ring: u32,
+        ctx: u32,
+        pools: u32,
+        m: u32,
+        fault: FaultSink,
+        mut pooled: DisjointSlice<u16>,
+    ) {
+        let _ = pools;
+        let tid = thread::threadIdx_x() as usize;
+        let t = thread::blockIdx_x() as usize * 4 + tid / 32;
+        if t >= m as usize {
+            return; // warp-uniform
+        }
+        let lane = tid % 32;
+        // SAFETY: t < m <= n_keys.len() by the launch contract.
+        let c = unsafe { *n_keys.get_unchecked(t) };
+        if c > ctx {
+            if lane == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
+            return; // warp-uniform: c is the token's
+        }
+        if c == 0 || !c.is_multiple_of(POOL as u32) {
+            return; // warp-uniform
+        }
+        let j = (c / POOL as u32 - 1) as usize;
+        let ring = ring as usize;
+        let mut slot = [0usize; POOL];
+        let mut i = 0usize;
+        #[unroll]
+        while i < POOL {
+            slot[i] = (POOL * j + i) % ring;
+            i += 1;
+        }
+        // ---- the pool, per channel, as `index_pool` forms it.
+        let mut pv = [0.0f32; PER_LANE];
+        let mut sq = 0.0f64;
+        let mut d = 0usize;
+        #[unroll]
+        while d < PER_LANE {
+            let at = PER_LANE * lane + d;
+            let mut k = [0.0f32; POOL];
+            let mut z = [0.0f32; POOL];
+            let mut i = 0usize;
+            #[unroll]
+            while i < POOL {
+                // SAFETY: slot[i] < ring, so both reads are inside
+                // ring·INDEX_ROW <= cache.len(); at < INDEX_HEAD and i < POOL
+                // keep the ape read inside its POOL·INDEX_HEAD values (launch
+                // contract).
+                let (kb, gb, a) = unsafe {
+                    (
+                        *cache.get_unchecked(slot[i] * INDEX_ROW + at),
+                        *cache.get_unchecked(slot[i] * INDEX_ROW + INDEX_HEAD + at),
+                        *ape.get_unchecked(i * INDEX_HEAD + at),
+                    )
+                };
+                k[i] = half_bits_to_f32(kb);
+                z[i] = add_rn_f32(half_bits_to_f32(gb), a);
+                i += 1;
+            }
+            let mx = z[0].max(z[1]).max(z[2]).max(z[3]);
+            let e = [
+                expf_ik(z[0] - mx),
+                expf_ik(z[1] - mx),
+                expf_ik(z[2] - mx),
+                expf_ik(z[3] - mx),
+            ];
+            let inv = 1.0 / add_rn_f32(add_rn_f32(add_rn_f32(e[0], e[1]), e[2]), e[3]);
+            pv[d] = add_rn_f32(
+                add_rn_f32(
+                    add_rn_f32(
+                        mul_rn_f32(mul_rn_f32(e[0], inv), k[0]),
+                        mul_rn_f32(mul_rn_f32(e[1], inv), k[1]),
+                    ),
+                    mul_rn_f32(mul_rn_f32(e[2], inv), k[2]),
+                ),
+                mul_rn_f32(mul_rn_f32(e[3], inv), k[3]),
+            );
+            sq += f64::from(mul_rn_f32(pv[d], pv[d]));
+            d += 1;
+        }
+        // ---- the norm, then the turn of the tail at the pool's first
+        // position.
+        let mean = (warp_sum_f64(sq) / INDEX_HEAD as f64) as f32;
+        let scale = rms_scale_of_mean(mean, eps);
+        let mut y = [0.0f32; PER_LANE];
+        let mut d = 0usize;
+        #[unroll]
+        while d < PER_LANE {
+            // SAFETY: 4·lane + d < INDEX_HEAD <= gain.len() (launch contract).
+            let gv = unsafe { *gain.get_unchecked(PER_LANE * lane + d) };
+            y[d] = mul_rn_f32(mul_rn_f32(pv[d], scale), gv);
+            d += 1;
+        }
+        let v = PER_LANE * lane;
+        if v >= INDEX_HEAD - ROT {
+            let at = POOL * j * ROT + v - (INDEX_HEAD - ROT);
+            // SAFETY: 4j < c <= ctx and v − 64 + 3 < ROT put the four words
+            // inside row 4j of the table, below ctx·ROT <= table.len()
+            // (launch contract).
+            let cs = unsafe {
+                [
+                    *table.get_unchecked(at),
+                    *table.get_unchecked(at + 1),
+                    *table.get_unchecked(at + 2),
+                    *table.get_unchecked(at + 3),
+                ]
+            };
+            let (a0, a1) = rope_pair_rn(y[0], y[1], cs[0], cs[1]);
+            let (a2, a3) = rope_pair_rn(y[2], y[3], cs[2], cs[3]);
+            y = [a0, a1, a2, a3];
+        }
+        let mut ok = true;
+        let mut d = 0usize;
+        #[unroll]
+        while d < PER_LANE {
+            let h = f32_to_f16_bits(y[d]);
+            ok &= f16_finite(h);
+            // SAFETY: j < c/4 <= ctx/4 <= pools, so j·INDEX_HEAD + v + d <
+            // pools·INDEX_HEAD <= pooled.len() (launch contract); the counts
+            // of one launch are distinct, so one lane writes each value.
+            unsafe { *pooled.get_unchecked_mut(j * INDEX_HEAD + v + d) = h };
+            d += 1;
+        }
+        if !ok {
+            fault.raise(FaultSite::PoolSelect);
+        }
+    }
 }
 
 /// Where one token's parts sit in the stacked projection output: `m` rows of
@@ -712,6 +1057,52 @@ pub struct IndexPoolArgs<'a> {
     pub cache: &'a DeviceTensor<u16>,
     pub ape: &'a DeviceBuffer<f32>,
     pub n_keys: &'a DeviceBuffer<u32>,
+    pub m: usize,
+    pub fault: FaultSink,
+    pub pooled: &'a mut DeviceTensor<u16>,
+}
+
+/// One `[INDEX_HEAD × INDEX_HEAD]` q8_0 projection in the q8f32 planes
+/// (`crate::weights::DevWeight::Q8_0`'s `qs` and `d`): [`INDEX_HEAD`] rows of
+/// 32 code words and of 4 f16 scales.
+#[derive(Clone, Copy)]
+pub struct IndexProj<'a> {
+    pub qs: &'a DeviceTensor<u32>,
+    pub d: &'a DeviceTensor<u16>,
+}
+
+/// [`LatentKernels::enqueue_index_key_rms_append`]'s arguments: the raw key
+/// at column `k_off` of each row of `rows`, the key norm's [`INDEX_HEAD`]
+/// gains, the value and gate projections, the `m` positions on the device
+/// (each below `ctx`), and the index rows (`[ring][INDEX_ROW]` f16, position
+/// `p` in slot `p mod ring`: a dense cache when `ring >= ctx`).
+pub struct IndexKeyRmsArgs<'a> {
+    pub rows: Rows<'a>,
+    pub k_off: usize,
+    pub gain: &'a DeviceBuffer<f32>,
+    pub value: IndexProj<'a>,
+    pub gate: IndexProj<'a>,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub eps: f32,
+    pub ctx: usize,
+    pub fault: FaultSink,
+    pub cache: &'a mut DeviceTensor<u16>,
+}
+
+/// [`LatentKernels::enqueue_index_pool_norm_rope`]'s arguments: the index rows
+/// (`[ring][INDEX_ROW]` f16, the slots the call's appends wrote included),
+/// the pool gate's position bias (`indexer_compressor_ape`, [`POOL`] rows of
+/// [`INDEX_HEAD`] f32), the pool norm's gains, the layer's rope table (`ctx`
+/// rows of [`ROT`] f32), the `m` live counts on the device, and the pool plane
+/// (`[pools_for(ctx)][INDEX_HEAD]` f16).
+pub struct IndexPoolRopeArgs<'a> {
+    pub cache: &'a DeviceTensor<u16>,
+    pub ape: &'a DeviceBuffer<f32>,
+    pub gain: &'a DeviceBuffer<f32>,
+    pub table: &'a DeviceBuffer<f32>,
+    pub n_keys: &'a DeviceBuffer<u32>,
+    pub eps: f32,
+    pub ctx: usize,
     pub m: usize,
     pub fault: FaultSink,
     pub pooled: &'a mut DeviceTensor<u16>,
@@ -1123,6 +1514,185 @@ impl LatentKernels {
     }
 }
 
+/// The refusal of a projection that is not `[INDEX_HEAD × INDEX_HEAD]` q8_0
+/// in the q8f32 planes.
+fn check_index_proj(what: &'static str, name: &str, w: IndexProj<'_>) -> Result<(), GpuError> {
+    let want = (INDEX_HEAD, INDEX_HEAD / 4, INDEX_HEAD, INDEX_HEAD / 32);
+    let got = (w.qs.rows(), w.qs.cols(), w.d.rows(), w.d.cols());
+    if got == want {
+        return Ok(());
+    }
+    Err(GpuError::shape(
+        what,
+        format!(
+            "the {name} projection's planes are qs {}x{} and d {}x{}; a {INDEX_HEAD}x{INDEX_HEAD} \
+             q8_0 weight is qs {}x{} and d {}x{}",
+            got.0, got.1, got.2, got.3, want.0, want.1, want.2, want.3
+        ),
+    ))
+}
+
+impl LatentKernels {
+    /// Enqueue the forced-tail selector's index rows of `m` tokens
+    /// ([`latent_kernels::index_key_rms_append`]): one block of 256 per
+    /// token. Refused before the launch: no token or context, an index-row
+    /// buffer of no rows or not [`INDEX_ROW`] wide, a key past the row
+    /// stride, short rows, positions or gains, a projection not
+    /// `[INDEX_HEAD × INDEX_HEAD]` q8_0. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_index_key_rms_append(
+        &self,
+        stream: &CudaStream,
+        a: IndexKeyRmsArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_index_key_rms_append";
+        let IndexKeyRmsArgs {
+            rows,
+            k_off,
+            gain,
+            value,
+            gate,
+            pos,
+            eps,
+            ctx,
+            fault,
+            cache,
+        } = a;
+        check_shape(
+            what,
+            rows,
+            &[("key", k_off, INDEX_HEAD)],
+            pos,
+            cache,
+            INDEX_ROW,
+        )?;
+        if ctx == 0 {
+            return Err(GpuError::shape(
+                what,
+                "a context of no position".to_string(),
+            ));
+        }
+        crate::short(what, &[("gain", gain.len(), INDEX_HEAD)])?;
+        check_index_proj(what, "value", value)?;
+        check_index_proj(what, "gate", gate)?;
+        let grid = launch_u32(what, "grid", rows.m)?;
+        let prep = self
+            .module
+            .prepare_index_key_rms_append(LaunchConfig1D::new(grid, KEY_BLOCK, 0))?;
+        self.module.index_key_rms_append(
+            stream,
+            &prep,
+            rows.x,
+            gain,
+            value.qs.buf(),
+            value.d.buf(),
+            gate.qs.buf(),
+            gate.d.buf(),
+            pos,
+            eps,
+            launch_u32(what, "stride", rows.stride)?,
+            launch_u32(what, "k_off", k_off)?,
+            launch_u32(what, "ring", cache.rows())?,
+            launch_u32(what, "ctx", ctx)?,
+            launch_u32(what, "m", rows.m)?,
+            fault,
+            cache.buf_mut(),
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the forced-tail selector's pool keys of `m` tokens
+    /// ([`latent_kernels::index_pool_norm_rope`]): one warp per token, four a
+    /// block; a token whose count completes a pool writes it. It must follow
+    /// the appends of the pool's four positions, with no later position
+    /// appended between: an index-row ring of fewer rows than `ctx` holds a
+    /// launch of at most `ring − 3` consecutive positions. Refused before the
+    /// launch: no token or context, index rows of none or not [`INDEX_ROW`]
+    /// wide, a ring that cannot hold the launch's pools, a plane not
+    /// [`INDEX_HEAD`] wide or short of [`pools_for`]`(ctx)` rows, a table
+    /// short of `ctx` rows of [`ROT`], short counts, ape or gains.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_index_pool_norm_rope(
+        &self,
+        stream: &CudaStream,
+        a: IndexPoolRopeArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_index_pool_norm_rope";
+        let IndexPoolRopeArgs {
+            cache,
+            ape,
+            gain,
+            table,
+            n_keys,
+            eps,
+            ctx,
+            m,
+            fault,
+            pooled,
+        } = a;
+        let ring = cache.rows();
+        let pools = pools_for(ctx);
+        if m == 0
+            || ctx == 0
+            || ring == 0
+            || cache.cols() != INDEX_ROW
+            || pooled.cols() != INDEX_HEAD
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need m and ctx >= 1, index rows of at least one {INDEX_ROW}-wide row and a \
+                     {INDEX_HEAD}-wide plane; got m={m} ctx={ctx}, rows {ring}x{}, plane {}x{}",
+                    cache.cols(),
+                    pooled.rows(),
+                    pooled.cols()
+                ),
+            ));
+        }
+        if ring < ctx && m + POOL - 1 > ring {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a ring of {ring} index rows under a {ctx}-position cache holds a launch of at \
+                     most {} positions, got {m}",
+                    ring.saturating_sub(POOL - 1)
+                ),
+            ));
+        }
+        crate::short(
+            what,
+            &[
+                ("pooled rows", pooled.rows(), pools),
+                ("ape", ape.len(), POOL * INDEX_HEAD),
+                ("gain", gain.len(), INDEX_HEAD),
+                ("table", table.len(), ctx * ROT),
+                ("n_keys", n_keys.len(), m),
+            ],
+        )?;
+        let grid = launch_u32(what, "grid", m.div_ceil(4))?;
+        let prep = self
+            .module
+            .prepare_index_pool_norm_rope(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.index_pool_norm_rope(
+            stream,
+            &prep,
+            cache.buf(),
+            ape,
+            gain,
+            table,
+            n_keys,
+            eps,
+            launch_u32(what, "ring", ring)?,
+            launch_u32(what, "ctx", ctx)?,
+            launch_u32(what, "pools", pools)?,
+            launch_u32(what, "m", m)?,
+            fault,
+            pooled.buf_mut(),
+        )?;
+        Ok(())
+    }
+}
+
 /// The sites a host rule raises, as the card's layer mask holds them: bit
 /// `site as u32` per site.
 fn bit(site: FaultSite) -> u32 {
@@ -1291,6 +1861,161 @@ pub fn index_pool_host(cache: &[u16], ape: &[f32], n_keys: &[u32], pooled: &mut 
             let p = (((e[0] * inv) * k[0] + (e[1] * inv) * k[1]) + (e[2] * inv) * k[2])
                 + (e[3] * inv) * k[3];
             let h = f32_to_f16_bits(p);
+            if !f16_finite(h) {
+                sites |= bit(FaultSite::PoolSelect);
+            }
+            pooled[j * INDEX_HEAD + d] = h;
+        }
+    }
+    sites
+}
+
+/// One `[INDEX_HEAD × INDEX_HEAD]` q8_0 projection's planes on the host: the
+/// `qs` words and `d` scale bits [`IndexProj`] holds on the card.
+#[derive(Clone, Copy)]
+pub struct IndexProjHost<'a> {
+    pub qs: &'a [u32],
+    pub d: &'a [u16],
+}
+
+/// Row `row` of `w` dotted with the normed key `kn` as the forced-tail append
+/// forms it: q8f32's word walk at k = 128 (lane `l` the four terms of word
+/// `l`, `fma(d·v, x, f)` in byte order from 0), the 32 lane sums by the
+/// butterfly.
+fn index_proj_row(w: IndexProjHost<'_>, row: usize, kn: &[f32]) -> f32 {
+    let lanes: Vec<f32> = (0..32)
+        .map(|l| {
+            let q = w.qs[row * 32 + l];
+            let dv = gguf::quant::half_to_f32(w.d[row * 4 + l / 8]);
+            (0..4).fold(0.0f32, |f, b| {
+                let v = f32::from((q >> (8 * b)) as u8 as i8);
+                (dv * v).mul_add(kn[4 * l + b], f)
+            })
+        })
+        .collect();
+    crate::linear::butterfly_f32(&lanes)
+}
+
+/// The host rule of [`LatentKernels::enqueue_index_key_rms_append`]: the
+/// module doc's forced-tail key contract, op for op, for the `pos.len()`
+/// tokens of `x` (`[m][stride]`, the raw key at column `k_off`) into `cache`
+/// (`[ring][INDEX_ROW]` f16 bits, position `p` in slot `p mod ring`).
+/// Returns the mask of the sites the launch raises.
+///
+/// # Panics
+///
+/// When `x` holds fewer than `pos.len()` rows or the key passes a row, `gain`
+/// is shorter than [`INDEX_HEAD`], a projection's planes are short, or
+/// `cache` holds no row.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the launch's own arguments, as the host rule of one kernel entry"
+)]
+#[must_use]
+pub fn index_key_rms_append_host(
+    x: &[f32],
+    stride: usize,
+    k_off: usize,
+    gain: &[f32],
+    (value, gate): (IndexProjHost<'_>, IndexProjHost<'_>),
+    pos: &[u32],
+    eps: f32,
+    ctx: usize,
+    cache: &mut [u16],
+) -> u32 {
+    let ring = cache.len() / INDEX_ROW;
+    let mut sites = 0;
+    for (t, &p) in pos.iter().enumerate() {
+        let p = p as usize;
+        if p >= ctx {
+            sites |= bit(FaultSite::CachePos);
+            continue;
+        }
+        let k = &x[t * stride + k_off..t * stride + k_off + INDEX_HEAD];
+        let lanes: Vec<f64> = (0..32)
+            .map(|l| (0..PER_LANE).fold(0.0f64, |s, i| s + f64::from(k[4 * l + i] * k[4 * l + i])))
+            .collect();
+        let mean = (crate::linear::butterfly_f64(&lanes) / INDEX_HEAD as f64) as f32;
+        let scale = rms_scale_of_mean(mean, eps);
+        let kn: Vec<f32> = (0..INDEX_HEAD).map(|d| (k[d] * scale) * gain[d]).collect();
+        let slot = p % ring;
+        for (half, w) in [value, gate].into_iter().enumerate() {
+            for row in 0..INDEX_HEAD {
+                let h = f32_to_f16_bits(index_proj_row(w, row, &kn));
+                if !f16_finite(h) {
+                    sites |= bit(FaultSite::CacheValue);
+                }
+                cache[slot * INDEX_ROW + half * INDEX_HEAD + row] = h;
+            }
+        }
+    }
+    sites
+}
+
+/// The host rule of [`LatentKernels::enqueue_index_pool_norm_rope`]: the
+/// module doc's forced-tail pool contract, op for op, for the counts `n_keys`
+/// over `cache` (`[ring][INDEX_ROW]` f16 bits, position `p` in slot `p mod
+/// ring`), `ape` (`[POOL][INDEX_HEAD]`), the norm's `gain` and `table` (`ctx`
+/// rows of [`ROT`]) into `pooled` (`[pools][INDEX_HEAD]` f16 bits). Returns
+/// the mask of the sites the launch raises.
+///
+/// # Panics
+///
+/// When `ape`, `gain` or `table` is short, `cache` holds no row, or `pooled`
+/// is shorter than the pools the counts complete.
+#[must_use]
+pub fn index_pool_norm_rope_host(
+    cache: &[u16],
+    (ape, gain, table): (&[f32], &[f32], &[f32]),
+    n_keys: &[u32],
+    eps: f32,
+    ctx: usize,
+    pooled: &mut [u16],
+) -> u32 {
+    let ring = cache.len() / INDEX_ROW;
+    let mut sites = 0;
+    for &c in n_keys {
+        let c = c as usize;
+        if c > ctx {
+            sites |= bit(FaultSite::CachePos);
+            continue;
+        }
+        if c == 0 || !c.is_multiple_of(POOL) {
+            continue;
+        }
+        let j = c / POOL - 1;
+        let row = |i: usize| &cache[((POOL * j + i) % ring) * INDEX_ROW..][..INDEX_ROW];
+        let pv: Vec<f32> = (0..INDEX_HEAD)
+            .map(|d| {
+                let k: [f32; POOL] = std::array::from_fn(|i| gguf::quant::half_to_f32(row(i)[d]));
+                let z: [f32; POOL] = std::array::from_fn(|i| {
+                    gguf::quant::half_to_f32(row(i)[INDEX_HEAD + d]) + ape[i * INDEX_HEAD + d]
+                });
+                let mx = z[0].max(z[1]).max(z[2]).max(z[3]);
+                let e: [f32; POOL] = std::array::from_fn(|i| expf_ik(z[i] - mx));
+                let inv = 1.0 / (((e[0] + e[1]) + e[2]) + e[3]);
+                (((e[0] * inv) * k[0] + (e[1] * inv) * k[1]) + (e[2] * inv) * k[2])
+                    + (e[3] * inv) * k[3]
+            })
+            .collect();
+        let lanes: Vec<f64> = (0..32)
+            .map(|l| {
+                (0..PER_LANE).fold(0.0f64, |s, i| s + f64::from(pv[4 * l + i] * pv[4 * l + i]))
+            })
+            .collect();
+        let mean = (crate::linear::butterfly_f64(&lanes) / INDEX_HEAD as f64) as f32;
+        let scale = rms_scale_of_mean(mean, eps);
+        let mut y: Vec<f32> = (0..INDEX_HEAD).map(|d| (pv[d] * scale) * gain[d]).collect();
+        let tab = &table[POOL * j * ROT..][..ROT];
+        for i in 0..ROT / 2 {
+            let at = INDEX_HEAD - ROT + 2 * i;
+            // `rope_pair_rn`'s rounding: the host rounds every op on its own.
+            let (a, b, c, s) = (y[at], y[at + 1], tab[2 * i], tab[2 * i + 1]);
+            y[at] = a * c - b * s;
+            y[at + 1] = a * s + b * c;
+        }
+        for (d, &v) in y.iter().enumerate() {
+            let h = f32_to_f16_bits(v);
             if !f16_finite(h) {
                 sites |= bit(FaultSite::PoolSelect);
             }

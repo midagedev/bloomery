@@ -84,7 +84,7 @@ impl PlannedTensor {
     /// constant.
     pub fn sigma(&self) -> Option<f64> {
         match self.rule {
-            Rule::Const { .. } => None,
+            Rule::Const { .. } | Rule::E4m3 => None,
             // A uniform draw in `±h` has standard deviation `h/√3`: a matrix's
             // `h` is `√3/√K`, a spread vector's the family's.
             Rule::Uniform { half_width, .. } => Some(f64::from(half_width) / 3.0f64.sqrt()),
@@ -139,7 +139,7 @@ impl FilePlan {
                 .map(|t| TensorDecl {
                     name: t.name.clone(),
                     dims: t.dims.clone(),
-                    type_id: t.ty.as_u32(),
+                    type_id: t.ty.file_id(),
                     nbytes: t.nbytes,
                 })
                 .collect();

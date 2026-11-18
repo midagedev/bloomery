@@ -39,7 +39,7 @@ fn decl(line: &str) -> TensorDecl {
     TensorDecl {
         name: name.to_string(),
         dims,
-        type_id: ty.as_u32(),
+        type_id: ty.file_id(),
         nbytes: per_row * rows,
     }
 }
@@ -79,7 +79,7 @@ fn value(key: &str, v: &serde_json::Value) -> Option<Value> {
 /// mixed case).
 fn ty_of(name: &str) -> GgmlType {
     (0..=45)
-        .chain(2000..=2005)
+        .chain(2000..=2008)
         .map(GgmlType::from_u32)
         .find(|ty| ty.name().is_some_and(|n| n.eq_ignore_ascii_case(name)))
         .unwrap_or_else(|| panic!("{name}: no ggml type of this name"))

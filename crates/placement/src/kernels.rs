@@ -613,7 +613,7 @@ mod tests {
 
     /// Every `GgmlType` variant in declaration order, then one id the enum
     /// does not name.
-    const ALL: [GgmlType; 44] = [
+    const ALL: [GgmlType; 45] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q5_0,
@@ -657,6 +657,7 @@ mod tests {
         GgmlType::MLX_A8,
         GgmlType::MLX_A4H,
         GgmlType::MLX_A8H,
+        GgmlType::F8E4M3,
         GgmlType::Unknown(99),
     ];
 
@@ -707,7 +708,8 @@ mod tests {
             GgmlType::MLX_A8 => 40,
             GgmlType::MLX_A4H => 41,
             GgmlType::MLX_A8H => 42,
-            GgmlType::Unknown(_) => 43,
+            GgmlType::F8E4M3 => 43,
+            GgmlType::Unknown(_) => 44,
         }
     }
 

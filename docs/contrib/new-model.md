@@ -48,7 +48,7 @@ dumps, real-file gates, timed runs).
 | 4 | Fixture row | `crates/model/src/arch/<arch>/fixture.rs`, `FIXTURE_SPECS` and each row's `FixtureRow` in `crates/model/src/arch/registry.rs`, `crates/refset/src/fixture.rs:33`, `tools/ref/ref-paths.sh:73-79` | generate L; its `fx_` oracle sets B |
 | 5 | Card body | `crates/gpu-<arch>/` (or `crates/gpu/src/arch/...` for a variant); root `Cargo.toml:3`, `crates/gpu-gates/Cargo.toml`; it calls `site`, `card_leg`, `card_slots`, `rows`, `draft` and `kv_format` in `crates/gpu/src/` | G to build and run |
 | 6 | App session | `crates/app/src/arch/<arch>/mod.rs`, feature in `crates/app/Cargo.toml`; the prompt call plan in `crates/runtime/src/prompt.rs` | G (feature-gated); L for default-feature tests |
-| 7 | Serve seat | `crates/gpu-gates/src/bin/shared/serve_seats/<seat>.rs`, `serve_seats/mod.rs`, `bloomery_serve.rs:206-226`; `verifies_slots` and `AutoSlots` in `crates/gpu-gates/src/bind.rs` | G, then B for the seat gates |
+| 7 | Serve seat | `crates/gpu-gates/src/bin/shared/serve_seats/<seat>.rs`, its `seat!` row in `serve_seats/mod.rs`; `verifies_slots` and `AutoSlots` in `crates/gpu-gates/src/bind.rs` | G, then B for the seat gates |
 | 8 | Placement sizing | `crates/model/src/arch/<arch>/place.rs` over `plan_host_routed` in `crates/placement/src/placement.rs`; `host_stack` and `wide_act_bytes` in `crates/placement/src/kernels.rs` | A (placement is pure) and L |
 | 9 | Levers | `crates/levers/src/registry.rs` | A |
 | 10 | Gates and recipes | `justfile`, `tools/gate-paths.tsv`, `tools/gate-batch-resources.tsv`, `tools/ref/ptx-shapes.tsv`, `tools/unsafe-ratchet.txt` | A for `just check-recipes`; running the gates is G or B |
@@ -193,8 +193,10 @@ that folds the last id into the call's last unit also overrides `Prompt::closes`
 ### 7. Serve seat
 
 A seat is the model's module behind `bind::Seat` (`crates/gpu-gates/src/bind.rs:747`): its flags, records, slots and
-prompt cache. Registering it touches `serve_seats/mod.rs`, the `Model` enum and `serves` in `bloomery_serve.rs:206-226`,
-the mirror in `tools/hf-arch-check.py` (its self-test greps `Model::serves`, `Arch::from_name` and `spec`), and a row of
+prompt cache. Registering it touches `serve_seats/mod.rs` alone in the server's code: the `pub mod` and one `seat!` row
+(the `--model` word, which architectures it serves by `Serves`, its `--help` lines; the module supplies `run` and
+`check`), which `bloomery-serve` reads for its words, usage, models table and the seat a file takes. The mirror in
+`tools/hf-arch-check.py` (its self-test reads that table, `Arch::from_name` and `spec`) holds the row's words, and a row of
 the README's Use table (`README.md:83-84`). MiMo has none yet; take the shape from the GLM seat (`serve_seats/glm.rs`).
 Gate: `gate-gpu-glm5next-serve` (`justfile:2143`) is the pattern; it needs cards.
 

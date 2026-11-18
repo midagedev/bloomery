@@ -3479,6 +3479,11 @@ enum ThinkingOff {
     /// generation prompt: `"none"` is sent as the template's lowest effort,
     /// `"low"`, the closest to no thinking it has.
     LowEffort,
+    /// The template has no switch, names the effort words it takes (it
+    /// refuses a word it does not know) and takes one of [`OFF_WORDS`] as its
+    /// own word for no thinking (Hy4-flash's `no_think`): `"none"` is sent as
+    /// that word, and a request may name the word itself.
+    OffWord(&'static str),
     /// Neither knob changes the prompt: `"none"` sets `enable_thinking`
     /// `false`, as llama-server does, and there is nothing to map it to.
     Neither,
@@ -3490,6 +3495,7 @@ impl ThinkingOff {
         match self {
             ThinkingOff::Switch { .. } => "switch",
             ThinkingOff::LowEffort => "low_effort",
+            ThinkingOff::OffWord(_) => "off_word",
             ThinkingOff::Neither => "neither",
         }
     }
@@ -3502,6 +3508,14 @@ impl ThinkingOff {
             ThinkingOff::LowEffort => Some(
                 "chat template: no thinking switch; reasoning_effort \"none\" is sent as \"low\"",
             ),
+            ThinkingOff::OffWord("no_think") => Some(
+                "chat template: no thinking switch; reasoning_effort \"none\" is sent as the \
+                 template's own \"no_think\"",
+            ),
+            ThinkingOff::OffWord(_) => Some(
+                "chat template: no thinking switch; reasoning_effort \"none\" is sent as the \
+                 template's own word for no thinking",
+            ),
             ThinkingOff::Switch { .. } | ThinkingOff::Neither => None,
         }
     }
@@ -3511,10 +3525,21 @@ impl ThinkingOff {
 /// user message `"hi"`: a template where `enable_thinking: false` and `true`
 /// render differently has a [`Switch`](ThinkingOff::Switch), opt-in when
 /// the prompt with no `enable_thinking` is not the `true` one; otherwise one
+/// that refuses an effort word it does not know ([`PROBE_EFFORT`]) and renders
+/// one of [`OFF_WORDS`] apart from no effort is
+/// [`OffWord`](ThinkingOff::OffWord) of that word; otherwise one
 /// where `reasoning_effort: "low"` renders differently from no effort is
 /// [`LowEffort`](ThinkingOff::LowEffort); otherwise
 /// [`Neither`](ThinkingOff::Neither). A render that fails is the bind's
 /// error, naming the probe: the answer is never guessed.
+/// The effort words a template may take as its own for no thinking, beside
+/// OpenAI's `"none"` ([`ThinkingOff::OffWord`]).
+const OFF_WORDS: [&str; 1] = ["no_think"];
+
+/// An effort word no template takes: a template that refuses it names the
+/// words it takes ([`probe_thinking_off`]).
+const PROBE_EFFORT: &str = "bloomery-probe-effort";
+
 fn probe_thinking_off(t: &ChatTemplate) -> Result<ThinkingOff, TemplateError> {
     let render = |extra: Option<(&str, Value)>| {
         let mut vars = Map::new();
@@ -3538,6 +3563,13 @@ fn probe_thinking_off(t: &ChatTemplate) -> Result<ThinkingOff, TemplateError> {
         return Ok(ThinkingOff::Switch { opt_in });
     }
     let unset = render(None)?;
+    if render(Some(("reasoning_effort", json!(PROBE_EFFORT)))).is_err() {
+        for word in OFF_WORDS {
+            if render(Some(("reasoning_effort", json!(word)))).is_ok_and(|r| r != unset) {
+                return Ok(ThinkingOff::OffWord(word));
+            }
+        }
+    }
     let low = render(Some(("reasoning_effort", json!("low"))))?;
     Ok(if low != unset {
         ThinkingOff::LowEffort
@@ -3576,12 +3608,14 @@ fn tool_call_arguments(at: usize, message: &mut Map<String, Value>) -> Result<()
 /// `minimal` and `none` are OpenAI's own words.
 const REASONING_EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// An effort that is none of [`REASONING_EFFORTS`] is a 400 naming the field,
-/// the value and the accepted ones: a template would render a word it does not
-/// know as itself, or not at all, and the request would run as if it had named
-/// none.
-fn check_effort(field: &str, effort: &str) -> Result<(), ApiError> {
-    if REASONING_EFFORTS.contains(&effort) {
+/// An effort that is none of [`REASONING_EFFORTS`] and not the template's own
+/// word for no thinking (`how`, [`ThinkingOff::OffWord`]) is a 400 naming the
+/// field, the value and the accepted ones: a template would render a word it
+/// does not know as itself, or not at all, and the request would run as if it
+/// had named none.
+fn check_effort(field: &str, effort: &str, how: ThinkingOff) -> Result<(), ApiError> {
+    if REASONING_EFFORTS.contains(&effort) || matches!(how, ThinkingOff::OffWord(w) if w == effort)
+    {
         return Ok(());
     }
     Err(invalid(format!(
@@ -3640,7 +3674,7 @@ fn thinking_vars(
     let effort = match b.get("reasoning_effort") {
         None | Some(Value::Null) => None,
         Some(v @ Value::String(e)) => {
-            check_effort("reasoning_effort", e)?;
+            check_effort("reasoning_effort", e, how)?;
             Some(v)
         }
         Some(other) => return Err(wrong_type("reasoning_effort", "a string", other)),
@@ -3649,6 +3683,9 @@ fn thinking_vars(
     match (none, how) {
         (true, ThinkingOff::LowEffort) => {
             vars.insert("reasoning_effort".into(), Value::String("low".to_owned()));
+        }
+        (true, ThinkingOff::OffWord(word)) => {
+            vars.insert("reasoning_effort".into(), Value::String(word.to_owned()));
         }
         (true, ThinkingOff::Switch { .. } | ThinkingOff::Neither) => thinking = Some(false),
         (false, how) => {
@@ -6904,6 +6941,10 @@ mod tests {
             (
                 include_str!("../tests/fixtures/glm5-chat-template.jinja"),
                 "low_effort",
+            ),
+            (
+                include_str!("../tests/fixtures/hy4-chat-template.jinja"),
+                "off_word",
             ),
             (super::testserve::TEMPLATE, "neither"),
         ];
@@ -10622,6 +10663,66 @@ mod tests {
         );
         assert_eq!(status, 200, "{switch}");
         assert_eq!(applied_prompt(&switch), header("Max"));
+    }
+
+    /// `reasoning_effort: "none"` on Hy4-flash's template, which has no thinking
+    /// switch, refuses an effort word it does not know and takes `no_think` as
+    /// its own word for no thinking ([`ThinkingOff::OffWord`]), is sent as
+    /// `no_think`: it renders as `no_think` does (the span closed), and apart
+    /// from `low`; a kwargs `reasoning_effort` beside it is replaced; the word
+    /// itself is taken on the chat path and the Responses API alike; another
+    /// word is still the 400 naming the field. FAIL-first: a probe that never
+    /// reads the template's own word sends `"none"` as `"low"`, and the first
+    /// assertion is red.
+    #[test]
+    fn reasoning_effort_none_is_the_templates_own_off_word_on_hy4() {
+        let template = include_str!("../tests/fixtures/hy4-chat-template.jinja");
+        assert_eq!(
+            probe_thinking_off(&ChatTemplate::parse(template).expect("a template"))
+                .expect("the probe renders"),
+            ThinkingOff::OffWord("no_think")
+        );
+        let (addr, _state, _ended) =
+            super::testserve::spawn(Box::new(crate::MockEngine::new(4096)), templated(template));
+        let messages = || json!([{ "role": "user", "content": "Hi" }]);
+        let render = |body: &Value| {
+            let (status, answer) = applied(addr, body);
+            assert_eq!(status, 200, "{body}: {answer}");
+            applied_prompt(&answer)
+        };
+        let off = render(&json!({ "messages": messages(), "reasoning_effort": "no_think" }));
+        let low = render(&json!({ "messages": messages(), "reasoning_effort": "low" }));
+        assert!(
+            off.contains("reasoning_effort:no_think"),
+            "the off word reaches the template: {off}"
+        );
+        assert_ne!(off, low, "no_think is not the low effort");
+        for body in [
+            json!({ "messages": messages(), "reasoning_effort": "none" }),
+            json!({
+                "messages": messages(),
+                "reasoning_effort": "none",
+                "chat_template_kwargs": { "reasoning_effort": "high" },
+            }),
+        ] {
+            assert_eq!(
+                render(&body),
+                off,
+                "none is the template's own off word: {body}"
+            );
+        }
+        let (status, answer) = applied(
+            addr,
+            &json!({ "messages": messages(), "reasoning_effort": "think_less" }),
+        );
+        assert_eq!(status, 400, "{answer}");
+        let (status, answer) = roundtrip(
+            addr,
+            "POST",
+            "/v1/responses",
+            &json!({ "input": "Hi", "reasoning": { "effort": "no_think" } }).to_string(),
+        );
+        assert_eq!(status, 200, "responses no_think: {answer}");
     }
 
     /// `chat_template_kwargs.enable_thinking` as a string is a 400 naming it,

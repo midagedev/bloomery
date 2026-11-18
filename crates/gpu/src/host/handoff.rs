@@ -28,8 +28,11 @@
 //! ([`HandoffKernels::enqueue_handoff_cols_tier`]).
 //! `ffn_handoff_n_tier` is the same writes of a layer at any slot count, the count a
 //! launch argument ([`HandoffKernels::enqueue_handoff_tier_n`]): a model whose router picks a
-//! count the per-count entries are not built for (Kimi K3's 16) uses it, and the per-count
-//! entries stay as they are.
+//! count the per-count entries are not built for (Kimi K3's and Hy4-flash's 16) uses it, and
+//! the per-count entries stay as they are. A layer at such a count that no tier card holds
+//! experts of runs the same entry with its tier writes into a [`TierSink`]
+//! ([`HandoffKernels::enqueue_handoff_sunk`]): one entry hands over any count, with a tier and
+//! without.
 
 use std::fmt;
 use std::sync::Arc;
@@ -1271,6 +1274,56 @@ pub struct Handoff<'a> {
     pub n_expert: usize,
 }
 
+/// The tier image of a layer no tier card holds experts of, at a slot count no per-count handoff
+/// entry is built for: [`HandoffKernels::enqueue_handoff_sunk`] runs the any-count tier entry
+/// with its tier writes here, and no card reads them. `n_used + hidden` words of image (the
+/// places, then the activation) and `n_used` places. Load-time only.
+pub struct TierSink {
+    image: DeviceBuffer<u32>,
+    tsel: DeviceBuffer<u32>,
+    layout: TierImageLayout,
+}
+
+impl TierSink {
+    /// The sink of a boundary of `n_used` slots over an activation of `hidden` values. A count
+    /// of none or past the activation is refused by name, as the tier entry refuses it.
+    /// Load-time only.
+    pub fn new(stream: &CudaStream, n_used: usize, hidden: usize) -> Result<TierSink, GpuError> {
+        if n_used == 0 || n_used > hidden {
+            return Err(GpuError::shape(
+                "TierSink::new",
+                format!(
+                    "{n_used} slots over {hidden} values: the any-count entry hands over one \
+                     to the activation's width"
+                ),
+            ));
+        }
+        let layout = TierImageLayout {
+            sel: 0,
+            q3: n_used,
+            d8: n_used,
+            x: n_used,
+            n_used,
+            q3_words: 0,
+            d8_len: 0,
+            x_len: hidden,
+            hidden,
+            cols: 1,
+        };
+        Ok(TierSink {
+            image: DeviceBuffer::zeroed(stream, layout.words())?,
+            tsel: DeviceBuffer::zeroed(stream, n_used)?,
+            layout,
+        })
+    }
+
+    /// Device bytes of the image and the places.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.image.num_bytes() + self.tsel.num_bytes()
+    }
+}
+
 /// The handoff's kernels, loaded once by a program whose layers hand their
 /// routed slots to the host tier, or alone by a gate.
 pub struct HandoffKernels {
@@ -1603,10 +1656,53 @@ impl HandoffKernels {
         tmap: &DeviceBuffer<u32>,
         (target, ttarget): (HandoffTarget<'_>, TierTarget<'_>),
         fault: FaultSink,
+        places: (&mut DeviceBuffer<u32>, &mut DeviceBuffer<u32>),
+    ) -> Result<(), GpuError> {
+        let tier = (ttarget.image, ttarget.layout);
+        self.launch_handoff_n_tier(stream, (h, tmap), (target, tier), fault, places)
+    }
+
+    /// [`HandoffKernels::enqueue_handoff`] at a slot count no per-count entry is built for, one
+    /// to the activation's width: the any-count tier entry `ffn_handoff_n_tier`, its tier writes
+    /// (the activation's copy and each slot's place in `h.map`) into `sink`, which no card reads.
+    /// A `sink` of another slot count or width is refused by name, as the tier entry's refusals
+    /// are. One launch. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_handoff_sunk(
+        &self,
+        stream: &CudaStream,
+        h: &Handoff<'_>,
+        target: HandoffTarget<'_>,
+        sink: &mut TierSink,
+        fault: FaultSink,
+        sel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let TierSink {
+            image,
+            tsel,
+            layout,
+        } = sink;
+        self.launch_handoff_n_tier(
+            stream,
+            (h, h.map),
+            (target, (image, *layout)),
+            fault,
+            (sel, tsel),
+        )
+    }
+
+    /// The one launch of `ffn_handoff_n_tier`: `h`'s routing and `target`'s activation into the
+    /// host image, the slots' places in `tmap` and the activation into the tier image `timage`
+    /// at `tl`, after [`check_tier_n`].
+    fn launch_handoff_n_tier(
+        &self,
+        stream: &CudaStream,
+        (h, tmap): (&Handoff<'_>, &DeviceBuffer<u32>),
+        (target, (timage, tl)): (HandoffTarget<'_>, (&mut DeviceBuffer<u32>, TierImageLayout)),
+        fault: FaultSink,
         (sel, tsel): (&mut DeviceBuffer<u32>, &mut DeviceBuffer<u32>),
     ) -> Result<(), GpuError> {
         const WHAT: &str = "ffn_handoff_n_tier";
-        let (lay, tl) = (target.layout, ttarget.layout);
+        let lay = target.layout;
         check_tier_n(&lay, &tl)?;
         let n = lay.hidden;
         let grid = launch_u32(WHAT, "grid", n.div_ceil(HANDOFF_THREADS as usize))?;
@@ -1633,7 +1729,7 @@ impl HandoffKernels {
             launch_u32(WHAT, "tx_at", tl.x)?,
             fault,
             target.image,
-            ttarget.image,
+            timage,
             sel,
             tsel,
         )?;

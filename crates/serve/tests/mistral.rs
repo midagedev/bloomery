@@ -13,10 +13,10 @@
 
 mod common;
 
-use common::{post, start_templated};
+use common::{msg, post, start_templated, tool_call as call};
 use serde_json::{Value, json};
 use serve::callstream::CallPiece;
-use serve::dsml::{ChatParser, MarkupError, Message, ToolCall, ToolFormat, Tools};
+use serve::dsml::{ChatParser, MarkupError, Message, ToolFormat, Tools};
 use serve::mistral::MistralError;
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
@@ -38,22 +38,6 @@ const TEXT_AROUND: &str =
     "Before. [TOOL_CALLS]get_time[ARGS]{} Between. [TOOL_CALLS]get_time[ARGS]{} After.";
 const ANSWER: &str = "Hi.";
 const NEAR_TAG: &str = "a [TOOL_CAL b [TOOL_CALL";
-
-fn call(index: usize, name: &str, arguments: &str) -> ToolCall {
-    ToolCall {
-        index,
-        name: name.to_owned(),
-        arguments: arguments.to_owned(),
-    }
-}
-
-fn msg(reasoning: &str, content: &str, calls: Vec<ToolCall>) -> Message {
-    Message {
-        reasoning: reasoning.to_owned(),
-        content: content.to_owned(),
-        calls,
-    }
-}
 
 /// `(name, raw output, expected message)`.
 fn fixtures() -> Vec<(&'static str, &'static str, Message)> {
@@ -235,18 +219,7 @@ fn malformed() -> Vec<(&'static str, &'static str, MistralError)> {
 /// Feeds `pieces` one by one; the deltas' sum, checked against the message.
 fn streamed(prompt: &str, pieces: &[&str]) -> Result<Message, MarkupError> {
     let mut p = ChatParser::with_tools(prompt, ReasoningFormat::None, Some(Tools::Mistral));
-    let mut total = Message::default();
-    let mut add = |d: Message| {
-        total.reasoning.push_str(&d.reasoning);
-        total.content.push_str(&d.content);
-        total.calls.extend(d.calls);
-    };
-    for piece in pieces {
-        add(p.try_push(piece, &[])?);
-    }
-    add(p.try_finish()?);
-    assert_eq!(&total, p.message(), "deltas sum to the message");
-    Ok(total)
+    common::sum_deltas(&mut p, pieces)
 }
 
 /// The fixtures parse to their messages, their arguments JSON.
@@ -278,19 +251,7 @@ fn hw_fixtures_parse_to_expected_messages() {
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_malformed_calls_are_named_errors() {
-    let mut wrong = Vec::new();
-    for (name, raw, want) in malformed() {
-        match streamed(ON, &[raw]) {
-            Err(e) if e == MarkupError::Mistral(want.clone()) => {}
-            got => wrong.push(format!("{name}:\n  got  {got:?}\n  want Err({want:?})")),
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "{} case(s) wrong:\n{}",
-        wrong.len(),
-        wrong.join("\n")
-    );
+    common::check_malformed(malformed(), |pieces| streamed(ON, pieces));
 }
 
 /// A message, or an error, never depends on how the text was cut: whole, a
@@ -383,16 +344,6 @@ fn tools() -> Value {
     ])
 }
 
-fn tool_body(stream: bool) -> Value {
-    json!({
-        "model": "m",
-        "messages": [{"role": "user", "content": "weather and time?"}],
-        "temperature": 0,
-        "tools": tools(),
-        "stream": stream,
-    })
-}
-
 /// A streamed chat body folded back into `(finish_reason, message)`, call ids
 /// left out; `Err` with its message when the stream ended on an error event.
 fn fold_stream(body: &str) -> Result<(Value, Value), String> {
@@ -459,7 +410,11 @@ fn hw_mistral_chat_tool_calls_stream_and_non_stream() {
         ),
     ] {
         let addr = start(script);
-        let r = post(addr, "/v1/chat/completions", &tool_body(false));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::tool_body(tools(), false),
+        );
         assert_eq!(r.status, 200, "{}", r.body);
         let v = r.json();
         let c = &v["choices"][0];
@@ -484,7 +439,11 @@ fn hw_mistral_chat_tool_calls_stream_and_non_stream() {
                 "{v}"
             );
         }
-        let r = post(addr, "/v1/chat/completions", &tool_body(true));
+        let r = post(
+            addr,
+            "/v1/chat/completions",
+            &common::tool_body(tools(), true),
+        );
         assert_eq!(r.status, 200, "{}", r.body);
         let (finish, folded) = fold_stream(&r.body).expect("no error event");
         assert_eq!(finish, "tool_calls");
@@ -515,24 +474,11 @@ fn hw_mistral_malformed_call_is_an_api_error() {
             "tool-call markup: tool call 0 is not closed",
         ),
     ] {
-        let addr = start(script);
-        let r = post(
-            addr,
-            "/v1/chat/completions",
-            &common::unwatched(tool_body(false)),
+        common::check_api_error(
+            start(script),
+            |stream| common::unwatched(common::tool_body(tools(), stream)),
+            want,
+            fold_stream,
         );
-        assert_eq!(r.status, 500, "{}", r.body);
-        let m = r.json()["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
-        assert!(m.starts_with(want), "{m}");
-        let r = post(
-            addr,
-            "/v1/chat/completions",
-            &common::unwatched(tool_body(true)),
-        );
-        let e = fold_stream(&r.body).expect_err("an error event");
-        assert!(e.starts_with(want), "{e}");
     }
 }

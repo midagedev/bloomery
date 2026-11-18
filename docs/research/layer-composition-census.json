@@ -310,8 +310,8 @@
         "ggml_sgn": "F",
         "gate_of": "F",
         "block_scale": "F",
-        "engram_gate_kernels::ds41_engram_key_norm": "F",
-        "engram_gate_kernels::ds41_engram_gate": "F",
+        "engram_gate_kernels::engram_key_norm": "F",
+        "engram_gate_kernels::engram_gate": "F",
         "KeyNormArgs": "F",
         "GateArgs": "F",
         "inv_sqrt_row": "F"

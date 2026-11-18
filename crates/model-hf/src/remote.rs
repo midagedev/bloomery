@@ -110,7 +110,8 @@ fn io_err(path: &Path, op: &'static str, source: io::Error) -> RemoteError {
 /// answer says what is missing — a read that ran out (`Truncated`: at least that many more
 /// bytes, and at least double), or a header that parsed but whose tensors lie past the
 /// prefix (`OutOfBounds` carries the data base). The data base's alignment padding is part
-/// of the header; it is read too. A file `size` long that is not a GGUF is
+/// of the header; it is read too. A tensor of ggml's type id 43 (`gguf`'s extent rule: its meaning is
+/// the file's) is told from the listed size, the prefix being extended to it as a hole. A file `size` long that is not a GGUF is
 /// [`RemoteError::Header`], a header that does not end inside the file
 /// [`RemoteError::PastEnd`].
 pub fn sparse_shard(
@@ -148,9 +149,28 @@ pub fn sparse_shard(
             fetch(&mut have, want)?;
         }
         fs::write(dest, &have).map_err(|e| io_err(dest, "write the prefix", e))?;
-        match Gguf::open(dest) {
+        match Gguf::open_split_shard(dest) {
             Ok(g) => break g.data_base(),
             Err(LoadError::OutOfBounds { base, .. }) => break base,
+            // A tensor of ggml's ambiguous type id 43 takes its meaning from its extent in the file, which a prefix does not
+            // have; the error comes after the header parsed whole, so the listed size, as a hole, is the extent the file will have.
+            Err(LoadError::AmbiguousType { .. }) if want < size => {
+                OpenOptions::new()
+                    .write(true)
+                    .open(dest)
+                    .and_then(|f| f.set_len(size))
+                    .map_err(|e| io_err(dest, "extend to the listed size", e))?;
+                match Gguf::open_split_shard(dest) {
+                    Ok(g) => break g.data_base(),
+                    Err(LoadError::OutOfBounds { base, .. }) => break base,
+                    Err(source) => {
+                        return Err(RemoteError::Header {
+                            file: file.to_string(),
+                            source,
+                        });
+                    }
+                }
+            }
             Err(LoadError::Truncated { at, need, .. }) => {
                 if want >= size {
                     return Err(RemoteError::PastEnd {
@@ -220,7 +240,7 @@ pub fn shard_header(
 /// The sparse file at `dest` opens, and the listing's `size` is what its header says: the
 /// last tensor ends at most an alignment's padding before it.
 fn check_size(dest: &Path, file: &str, size: u64) -> Result<(), RemoteError> {
-    let g = match Gguf::open(dest) {
+    let g = match Gguf::open_split_shard(dest) {
         Ok(g) => g,
         Err(source) => {
             // A tensor whose end passes u64 has no end to report: it keeps the reader's refusal.
@@ -350,7 +370,7 @@ fn sparse_shard_or_kept(
     if reuse
         && left_whole(dest, size)
         && check_size(dest, file, size).is_ok()
-        && let Ok(g) = Gguf::open(dest)
+        && let Ok(g) = Gguf::open_split_shard(dest)
     {
         return Ok(HeaderStat {
             header: g.data_base().min(size),
@@ -602,7 +622,9 @@ mod tests {
     fn data_base(file: &[u8], dir: &Path) -> u64 {
         let p = dir.join("whole.gguf");
         fs::write(&p, file).expect("whole file");
-        Gguf::open(&p).expect("whole file opens").data_base()
+        Gguf::open_split_shard(&p)
+            .expect("whole file opens")
+            .data_base()
     }
 
     /// A range reader over `file` that records each request.
@@ -688,6 +710,63 @@ mod tests {
             "{} requests: {log:?}",
             log.len()
         );
+    }
+
+    /// A header whose last tensor is a scale-less F8 table under ggml's type id 43 (Hy4-flash's per-layer table) is read as any
+    /// other: the prefix cannot tell the id's meaning, the listed size can. FAIL-first: without the retry at the listed size the
+    /// read ends with the type's ambiguity as its header error.
+    #[test]
+    fn a_header_whose_last_tensor_has_the_ambiguous_type_id_is_read_by_the_listed_size() {
+        let d = scratch("id43");
+        let kvs = vec![(
+            GENERAL_ARCHITECTURE.to_string(),
+            Value::String("llama".into()),
+        )];
+        let decls = vec![
+            TensorDecl {
+                name: "a".into(),
+                dims: vec![8],
+                type_id: 0,
+                nbytes: 32,
+            },
+            TensorDecl {
+                name: "per_layer_token_embd.weight".into(),
+                dims: vec![96, 40],
+                type_id: 43,
+                nbytes: 96 * 40,
+            },
+        ];
+        let mut w =
+            Writer::new(Vec::new(), Layout::new(&kvs, decls).expect("layout")).expect("writer");
+        w.tensor("a", &[1; 32]).expect("tensor");
+        w.tensor("per_layer_token_embd.weight", &[0x38; 96 * 40])
+            .expect("tensor");
+        let file = w.finish().expect("finish");
+        let base = data_base(&file, &d);
+        let first = base + 64;
+        assert!(
+            first < file.len() as u64,
+            "the prefix ends inside the table"
+        );
+        let log = RefCell::new(Vec::new());
+        let dest = d.join("s.gguf");
+        let stat = sparse_shard(
+            &dest,
+            "m.gguf",
+            file.len() as u64,
+            first,
+            &mut reader(&file, &log),
+        )
+        .expect("sparse shard");
+        assert_eq!(stat.header, base);
+        assert_eq!(fs::metadata(&dest).expect("stat").len(), file.len() as u64);
+        let g = Gguf::open_split_shard(&dest).expect("the sparse file opens by its listed size");
+        let table = g
+            .iter_tensors()
+            .find(|t| t.name == "per_layer_token_embd.weight")
+            .expect("the table");
+        assert_eq!(table.ty, gguf::GgmlType::F8E4M3);
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]

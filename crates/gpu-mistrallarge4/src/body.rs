@@ -107,11 +107,11 @@ use bloomery_gpu::rope_table::{Direction, RopeSpec, RopeTable};
 use bloomery_gpu::route_softmax::RouterOut;
 use bloomery_gpu::routed_block::{RouteIn, RouterEntry};
 use bloomery_gpu::site::{Form, KGemvKernels};
+use bloomery_gpu::token_major::TokenMajor;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, FaultSink, FaultSite, Gpu, GpuError, Q8Act, copy_row};
 use bloomery_gpu_deepseek41::attn::{AttnArgs, AttnKernels, SelectedRows, segments};
 use bloomery_gpu_deepseek41::prompt_walk::{self, BatchBufs};
-use bloomery_gpu_deepseek41::transpose::TransposeKernels;
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -178,7 +178,7 @@ pub(crate) struct Kernels {
     pub(crate) indexer_nope: IndexerKernels,
     /// The prompt batch's layout change before an indexer launch: its rows' index queries and
     /// head weights, written a row a token, into the score pass's token per column.
-    pub(crate) transpose: TransposeKernels,
+    pub(crate) transpose: TokenMajor,
     iq: QuantSelKernels,
     step: StepKernels,
     pub(crate) kgemv: KGemvKernels,
@@ -200,7 +200,7 @@ impl Kernels {
             index_key: IndexKeyKernels::load(ctx)?,
             indexer_rope: IndexerKernels::with_shape(ctx, heads, dim, rope)?,
             indexer_nope: IndexerKernels::with_shape(ctx, heads, dim, 0)?,
-            transpose: TransposeKernels::load(ctx)?,
+            transpose: TokenMajor::load(ctx)?,
             iq: QuantSelKernels::load(ctx, gpu.fault_word())?,
             step: StepKernels::load(ctx)?,
             kgemv: KGemvKernels::load(gpu)?,

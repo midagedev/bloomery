@@ -1,14 +1,22 @@
-//! Key/value tool calls: the markup the GLM-5.3-Flash and Solar-Open2 chat
-//! templates teach (their `tools` header and the assistant `tool_calls`
-//! branch), parsed out of the text after the think span. Both spell one
+//! Key/value tool calls: the markup the GLM-5.3-Flash, Solar-Open2 and Hy4-flash
+//! chat templates teach (their `tools` header and the assistant `tool_calls`
+//! branch), parsed out of the text after the think span. All spell one
 //! grammar, each under its own markers ([`KvSpelling`]):
 //!
 //! ```text
-//! CALL_OPEN NAME (KEY_OPEN KEY KEY_CLOSE [VALUE_OPEN] VALUE VALUE_CLOSE)* CALL_CLOSE
+//! [GROUP_OPEN] (CALL_OPEN NAME (KEY_OPEN KEY KEY_CLOSE [VALUE_OPEN] VALUE VALUE_CLOSE)* CALL_CLOSE)+ [GROUP_CLOSE]
 //!
 //! GLM    <tool_call>NAME<arg_key>KEY</arg_key><arg_value>VALUE</arg_value>…</tool_call>
 //! Solar  <|tool_call:start|>NAME\n<|tool_arg:start|>KEY<|tool_arg:value|>VALUE<|tool_arg:end|>\n…<|tool_call:end|>
+//! Hy4    <tool_calls:H><tool_call:H>NAME<arg_key:H>KEY</arg_key:H><arg_value:H>VALUE</arg_value:H>…</tool_call:H>…</tool_calls:H>
 //! ```
+//!
+//! Hy4 spells every tag with its template's suffix (`H` is `:6124c78e`) and writes
+//! all the calls of a message between one group's tags. The group's tags are markup, never content
+//! (a spelling with none has no group): inside a group only whitespace stands between the calls,
+//! any other text is a [`KvError::GroupText`], and a group the generation ends after its calls is
+//! complete without its close (the calls closed already; a group that ends with no call is a
+//! [`KvError::Unterminated`]). A call outside a group is a call all the same.
 //!
 //! Solar's key close is also what opens its value. The templates write a value
 //! as JSON unless it is a string, which they write raw. The request's tool
@@ -60,6 +68,27 @@ pub enum KvSpelling {
     /// `<|tool_arg:start|>KEY<|tool_arg:value|>VALUE<|tool_arg:end|>` and a line
     /// feed per argument, then `<|tool_call:end|>`.
     Solar,
+    /// Hy4-flash's: every GLM tag with the template's suffix before its `>`, all the calls of a message
+    /// between `<tool_calls:H>` and `</tool_calls:H>`.
+    Hy4,
+}
+
+/// The suffix Hy4-flash's chat template (`HYTK`) and its vocabulary put in every special tag, spelled
+/// once for every marker of [`KvSpelling::Hy4`].
+macro_rules! hy_suffix {
+    () => {
+        ":6124c78e"
+    };
+}
+
+/// A Hy4 tag: `<NAME` and the suffix and `>`, or `</NAME` and them.
+macro_rules! hy_tag {
+    ($name:literal) => {
+        concat!("<", $name, hy_suffix!(), ">")
+    };
+    (/ $name:literal) => {
+        concat!("</", $name, hy_suffix!(), ">")
+    };
 }
 
 /// The markers of one [`KvSpelling`].
@@ -67,6 +96,10 @@ pub enum KvSpelling {
 struct Markers {
     /// The family a refusal names.
     family: &'static str,
+    /// Opens the group the calls of a message stand in; empty when they stand alone.
+    group_open: &'static str,
+    /// Closes the group; empty with `group_open`.
+    group_close: &'static str,
     /// Opens a call.
     call_open: &'static str,
     /// Closes a call.
@@ -87,6 +120,8 @@ struct Markers {
 
 static GLM: Markers = Markers {
     family: "GLM",
+    group_open: "",
+    group_close: "",
     call_open: "<tool_call>",
     call_close: "</tool_call>",
     key_open: "<arg_key>",
@@ -98,6 +133,8 @@ static GLM: Markers = Markers {
 
 static SOLAR: Markers = Markers {
     family: "Solar",
+    group_open: "",
+    group_close: "",
     call_open: "<|tool_call:start|>",
     call_close: "<|tool_call:end|>",
     key_open: "<|tool_arg:start|>",
@@ -107,7 +144,34 @@ static SOLAR: Markers = Markers {
     newline: true,
 };
 
+static HY4: Markers = Markers {
+    family: "Hy4",
+    group_open: hy_tag!("tool_calls"),
+    group_close: hy_tag!(/ "tool_calls"),
+    call_open: hy_tag!("tool_call"),
+    call_close: hy_tag!(/ "tool_call"),
+    key_open: hy_tag!("arg_key"),
+    key_close: hy_tag!(/ "arg_key"),
+    value_open: hy_tag!("arg_value"),
+    value_close: hy_tag!(/ "arg_value"),
+    newline: false,
+};
+
 impl Markers {
+    /// Whether the calls of a message stand in a group.
+    fn grouped(&self) -> bool {
+        !self.group_open.is_empty()
+    }
+
+    /// The text a call generation starts with, the group's opening when there is a group.
+    fn opener(&self) -> &'static str {
+        if self.grouped() {
+            self.group_open
+        } else {
+            self.call_open
+        }
+    }
+
     /// The line break the template writes where [`Markers::newline`] says.
     fn line(&self) -> &'static str {
         if self.newline { "\n" } else { "" }
@@ -144,12 +208,13 @@ impl Markers {
 }
 
 impl KvSpelling {
-    const ALL: [KvSpelling; 2] = [KvSpelling::Glm, KvSpelling::Solar];
+    const ALL: [KvSpelling; 3] = [KvSpelling::Glm, KvSpelling::Solar, KvSpelling::Hy4];
 
     fn markers(self) -> &'static Markers {
         match self {
             KvSpelling::Glm => &GLM,
             KvSpelling::Solar => &SOLAR,
+            KvSpelling::Hy4 => &HY4,
         }
     }
 
@@ -160,6 +225,23 @@ impl KvSpelling {
         KvSpelling::ALL
             .into_iter()
             .find(|s| s.markers().openers().iter().all(|tag| source.contains(tag)))
+    }
+
+    /// The spelling a template writes for a call, read from `rendered`, a render of an assistant
+    /// turn that calls `name` with the string argument `key` = `value`: the one whose whole call
+    /// (its group around it when it has one) is in it. A template that builds its tags from a
+    /// variable (Hy4's `'<tool_call{}>'.format(HYTK)`) shows its spelling only here.
+    #[must_use]
+    pub fn of_rendered(rendered: &str, name: &str, key: &str, value: &str) -> Option<KvSpelling> {
+        KvSpelling::ALL.into_iter().find(|s| {
+            let m = s.markers();
+            let line = m.line();
+            let call = format!(
+                "{}{name}{line}{}{key}{}{}{value}{}{line}{}",
+                m.call_open, m.key_open, m.key_close, m.value_open, m.value_close, m.call_close
+            );
+            rendered.contains(&format!("{}{call}", m.group_open))
+        })
     }
 }
 
@@ -185,6 +267,13 @@ pub enum KvError {
     Unexpected {
         index: usize,
         name: String,
+        expected: String,
+        found: String,
+    },
+    /// Text between the calls of a group that is neither a call's opening nor the group's close.
+    #[error("tool calls group: expected {expected} after call {index}, found {found:?}")]
+    GroupText {
+        index: usize,
         expected: String,
         found: String,
     },
@@ -295,6 +384,10 @@ pub struct KvScan {
     types: ArgTypes,
     /// Inside a call (its opening consumed).
     inside: bool,
+    /// Inside a group, between its calls (its opening consumed, its close not).
+    grouped: bool,
+    /// The calls the open group has closed.
+    group_calls: usize,
     /// A call has just closed and the line feed its spelling writes after it
     /// has not been settled.
     line_due: bool,
@@ -314,6 +407,8 @@ impl KvScan {
             markers: spelling.markers(),
             types,
             inside: false,
+            grouped: false,
+            group_calls: 0,
             line_due: false,
             buf: Marked::default(),
             specials: SpecialTags::default(),
@@ -333,7 +428,12 @@ impl KvScan {
     /// Reads call tags only where their special tokens wrote them, for those
     /// `tok` holds as one special token.
     pub(crate) fn read_specials(&mut self, tok: &dyn Tokenizer) {
-        self.specials = SpecialTags::of(tok, &[self.markers.call_open, self.markers.call_close]);
+        let m = self.markers;
+        let tags: Vec<&'static str> = [m.group_open, m.group_close, m.call_open, m.call_close]
+            .into_iter()
+            .filter(|t| !t.is_empty())
+            .collect();
+        self.specials = SpecialTags::of(tok, &tags);
     }
 
     /// [`KvScan::push`] that reads only the text `piece` adds and reports the
@@ -376,21 +476,87 @@ impl KvScan {
                 std::mem::take(&mut self.read).call.close(&call, advances);
                 out.calls.push(call);
                 self.calls += 1;
+                self.group_calls += 1;
                 self.buf.take_front(end + m.call_close.len());
                 self.inside = false;
                 self.line_due = m.newline;
+            } else if self.grouped {
+                match self.between_calls()? {
+                    Between::Wait => return Ok(out),
+                    Between::Call => self.inside = true,
+                    Between::Close => self.grouped = false,
+                }
             } else if self.line_due && !self.settle_line() {
                 return Ok(out);
-            } else if let Some(at) = self.specials.find(&self.buf, m.call_open) {
+            } else if let Some((at, opens_group)) = self.next_opener() {
                 self.buf.take_text_into(at, &mut out.content);
-                self.buf.take_front(m.call_open.len());
-                self.inside = true;
+                if opens_group {
+                    self.buf.take_front(m.group_open.len());
+                    self.grouped = true;
+                    self.group_calls = 0;
+                } else {
+                    self.buf.take_front(m.call_open.len());
+                    self.inside = true;
+                }
             } else {
-                let upto = self.buf.text.len() - partial_suffix(&self.buf.text, m.call_open);
+                let held_back = partial_suffix(&self.buf.text, m.call_open)
+                    .max(partial_suffix(&self.buf.text, m.group_open));
+                let upto = self.buf.text.len() - held_back;
                 self.buf.take_text_into(upto, &mut out.content);
                 return Ok(out);
             }
         }
+    }
+
+    /// The first opener in the buffer, outside a call: where it starts and whether it is the
+    /// group's (a spelling with no group has only calls').
+    fn next_opener(&self) -> Option<(usize, bool)> {
+        let m = self.markers;
+        let call = self.specials.find(&self.buf, m.call_open);
+        let group = m
+            .grouped()
+            .then(|| self.specials.find(&self.buf, m.group_open))
+            .flatten();
+        match (group, call) {
+            (Some(g), Some(c)) if g < c => Some((g, true)),
+            (Some(g), None) => Some((g, true)),
+            (_, Some(c)) => Some((c, false)),
+            (None, None) => None,
+        }
+    }
+
+    /// Reads what follows a call inside a group: the whitespace between the tags is dropped, then the
+    /// next call's opening or the group's close is consumed; anything else is a [`KvError::GroupText`],
+    /// raised once [`QUOTE`] characters of it are in; text that can still grow into one of the two
+    /// tags waits.
+    fn between_calls(&mut self) -> Result<Between, KvError> {
+        let m = self.markers;
+        let rest = self.buf.text.trim_start_matches(char::is_whitespace);
+        let skipped = self.buf.text.len() - rest.len();
+        self.buf.take_front(skipped);
+        if self.buf.text.is_empty() {
+            return Ok(Between::Wait);
+        }
+        for (tag, then) in [
+            (m.call_open, Between::Call),
+            (m.group_close, Between::Close),
+        ] {
+            if self.specials.at(&self.buf, 0, tag) {
+                self.buf.take_front(tag.len());
+                return Ok(then);
+            }
+        }
+        // Text that is no tag waits until the error's quote is whole, so the error is the same
+        // whatever the pieces were; the end of the stream settles a shorter one.
+        let text = self.buf.text.as_str();
+        if held(m.call_open, text) || held(m.group_close, text) || text.chars().count() < QUOTE {
+            return Ok(Between::Wait);
+        }
+        Err(KvError::GroupText {
+            index: self.calls,
+            expected: format!("{} or {}", m.call_open, m.group_close),
+            found: quote(text),
+        })
     }
 
     /// Settles the line feed after a call: dropped when the text starts with
@@ -412,6 +578,9 @@ impl KvScan {
     /// an error.
     pub fn finish(&mut self) -> Result<Scanned, KvError> {
         let rest = std::mem::take(&mut self.buf).text;
+        if self.grouped && !self.inside {
+            return self.finish_group(&rest);
+        }
         if self.inside {
             // Complete arguments keep their errors when the call is cut.
             if let Err(e @ (KvError::NotJson { .. } | KvError::DuplicateKey { .. })) =
@@ -430,6 +599,45 @@ impl KvScan {
             ..Scanned::default()
         })
     }
+
+    /// The end of a stream inside a group, between its calls, `rest` being the text left. The group is
+    /// complete without its close once a call closed in it; with no call, or with text that was
+    /// becoming a tag, it is [`KvError::Unterminated`] (the limit's cut, as the chat parser reads
+    /// it); any other text is a [`KvError::GroupText`].
+    fn finish_group(&self, rest: &str) -> Result<Scanned, KvError> {
+        let m = self.markers;
+        let rest = rest.trim_start_matches(char::is_whitespace);
+        let unterminated = |text: &str| KvError::Unterminated {
+            index: self.calls,
+            close: m.group_close,
+            text: text.to_owned(),
+        };
+        if rest.is_empty() {
+            return if self.group_calls > 0 {
+                Ok(Scanned::default())
+            } else {
+                Err(unterminated(m.group_open))
+            };
+        }
+        if held(m.call_open, rest) || held(m.group_close, rest) {
+            return Err(unterminated(rest));
+        }
+        Err(KvError::GroupText {
+            index: self.calls,
+            expected: format!("{} or {}", m.call_open, m.group_close),
+            found: quote(rest),
+        })
+    }
+}
+
+/// What a group's text holds after a call, up to the next tag.
+enum Between {
+    /// The text may still grow into a tag.
+    Wait,
+    /// The next call's opening, consumed.
+    Call,
+    /// The group's close, consumed.
+    Close,
 }
 
 /// The first characters of `s`, for an error.
@@ -686,15 +894,36 @@ pub(crate) fn call_parts(
         parts.push(Part::Text(format!("{}{}", m.value_close, m.line())));
         Ok(parts)
     };
-    let body = call(
-        funs,
-        "",
-        |name| format!("{name}{}", m.line()),
-        |f| {
-            let mut parts = object_parameters(&f.args, &block)?;
-            parts.push(Part::Text(m.call_close.to_owned()));
+    let name = |name: &str| format!("{name}{}", m.line());
+    let one = |f: &Fun<'_>| {
+        let mut parts = object_parameters(&f.args, &block)?;
+        parts.push(Part::Text(m.call_close.to_owned()));
+        Ok(parts)
+    };
+    if !m.grouped() {
+        return Ok(Call::opened(m.call_open, mode, call(funs, "", name, one)?));
+    }
+    // The call stands in its group: forced, one call and the group's close; watched, the group
+    // holds one call after another, each held to its schema, until the model closes it (the
+    // template writes a conversation's calls in one group).
+    let close = Part::Text(m.group_close.to_owned());
+    let body = match mode {
+        CallMode::Forced => call(funs, m.call_open, name, |f| {
+            let mut parts = one(f)?;
+            parts.push(close.clone());
             Ok(parts)
-        },
-    )?;
-    Ok(Call::opened(m.call_open, mode, body))
+        })?,
+        CallMode::Watched => {
+            let again = Part::Rep {
+                close: vec![close],
+                more: call(funs, m.call_open, name, one)?,
+            };
+            call(funs, m.call_open, name, |f| {
+                let mut parts = one(f)?;
+                parts.push(again.clone());
+                Ok(parts)
+            })?
+        }
+    };
+    Ok(Call::opened(m.opener(), mode, body))
 }

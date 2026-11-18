@@ -794,9 +794,20 @@ pub fn chatted(
 /// The turn the tool-call clauses ask.
 const TOOL_ASK: &str = "What is the weather in Seoul right now? Use the tool.";
 
-/// The reply the scripted engine of [`scripted_call`] gives every prompt: the template's XML call
-/// format, one call.
-const SCRIPTED_CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nSeoul\n</parameter>\n</function>\n</tool_call>";
+/// The one call [`scripted_call`] asks, `get_weather` of Seoul, in the Qwen XML call format: the
+/// reply of the scripted engine of a template that writes it, and the call [`cut_call`] cuts.
+pub const FUNCTION_TAG_CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nSeoul\n</parameter>\n</function>\n</tool_call>";
+
+/// The chat template a file's header carries, refused by name when it carries none: the template
+/// [`scripted_call`] serves.
+pub fn file_template(split: &gguf::Split) -> Result<String, GateError> {
+    Ok(model::arch::spec(split)
+        .map_err(|e| format!("the header: {e}"))?
+        .spec
+        .chat
+        .template
+        .ok_or("the file carries no chat template")?)
+}
 
 /// The scripted engine's context, and the tokens its reply may run: its vocabulary is a byte a
 /// token, so a tool prompt is a few thousand ids.
@@ -833,14 +844,15 @@ pub fn tool_chat(max_tokens: u64) -> Value {
     body
 }
 
-/// A server over a scripted engine (`serve::ScriptedEngine`, whose every reply is the template's XML
-/// call format) with the chat template `template`, asked [`tool_turn`]: it answers 200 with
-/// `finish_reason` `tool_calls` and one call, `get_weather` with the arguments `{"city":"Seoul"}`.
-/// It runs the server's own template read, think-span entry, XML scanner and response, with no
-/// model behind them, so the clause reads nothing a model chose to reply. The answer is saved as
-/// `<dir>/scripted.json`.
-pub fn scripted_call(template: &str, dir: &Path) -> Result<bool, GateError> {
-    let addr = scripted_server(template)?;
+/// A server over a scripted engine (`serve::ScriptedEngine`, whose every reply is `reply`: the
+/// call `get_weather` of Seoul in the template's call format, [`FUNCTION_TAG_CALL`] for a template
+/// that writes Qwen XML) with the chat template `template`, asked [`tool_turn`]: it answers 200
+/// with `finish_reason` `tool_calls` and one call, `get_weather` with the arguments
+/// `{"city":"Seoul"}`. It runs the server's own template read, think-span entry, call scanner and
+/// response, with no model behind them, so the clause reads nothing a model chose to reply. The
+/// answer is saved as `<dir>/scripted.json`.
+pub fn scripted_call(template: &str, reply: &str, dir: &Path) -> Result<bool, GateError> {
+    let addr = scripted_server(template, reply)?;
     let url = |p: &str| format!("http://{addr}{p}");
     let answer = chatted(&url, dir, "scripted", &tool_chat(SCRIPT_TOKENS))?;
     let choice = &answer["choices"][0];
@@ -865,9 +877,9 @@ pub fn scripted_call(template: &str, dir: &Path) -> Result<bool, GateError> {
         && arguments == Some(json!({ "city": "Seoul" })))
 }
 
-/// A server over a scripted engine whose every reply is [`SCRIPTED_CALL`], with the chat template
-/// `template`: its address.
-fn scripted_server(template: &str) -> Result<std::net::SocketAddr, GateError> {
+/// A server over a scripted engine whose every reply is `reply`, with the chat template `template`:
+/// its address.
+fn scripted_server(template: &str, reply: &str) -> Result<std::net::SocketAddr, GateError> {
     let config = serve::ServerConfig {
         model_alias: "scripted".to_owned(),
         model_path: "scripted.gguf".to_owned(),
@@ -878,7 +890,7 @@ fn scripted_server(template: &str) -> Result<std::net::SocketAddr, GateError> {
         api_keys: serve::flag::ApiKeys::default(),
         chat_preparation: None,
     };
-    let engine = serve::ScriptedEngine::new(SCRIPT_CTX, SCRIPTED_CALL);
+    let engine = serve::ScriptedEngine::new(SCRIPT_CTX, reply);
     Ok(serve::Server::bind("127.0.0.1:0", Box::new(engine), config)
         .map_err(|e| format!("the scripted server: {e}"))?
         .spawn()?)
@@ -965,16 +977,16 @@ fn cut_of(status: u16, body: &str, stream: bool) -> Cut {
     cut
 }
 
-/// The server of [`scripted_call`] asked [`tool_turn`] with a `max_tokens` that ends the generation inside the call
+/// The server of [`scripted_call`] replying [`FUNCTION_TAG_CALL`], asked [`tool_turn`] with a `max_tokens` that ends the generation inside the call
 /// (the scripted vocabulary is a byte a token), whole and as a stream. llama-server parses the end of the text as the
 /// end of the input, so a cut call is no fault there: it answers 200 with `finish_reason` `length`, the text read as
 /// `content` while the call's name is not whole, and the call with the arguments read (`{`) once it is. The same
 /// here, each answer saved as `<dir>/cut-<where>-<whole|stream>.txt`.
 pub fn cut_call(template: &str, dir: &Path) -> Result<bool, GateError> {
-    let addr = scripted_server(template)?;
+    let addr = scripted_server(template, FUNCTION_TAG_CALL)?;
     let url = |p: &str| format!("http://{addr}{p}");
     let inside = |tag: &str| {
-        SCRIPTED_CALL
+        FUNCTION_TAG_CALL
             .find(tag)
             .map(|at| at + tag.len() / 2)
             .ok_or_else(|| format!("the scripted call holds no {tag}"))
@@ -995,7 +1007,7 @@ pub fn cut_call(template: &str, dir: &Path) -> Result<bool, GateError> {
             let cut = cut_of(status, &text, stream);
             let (calls, content) = match &call {
                 Some(c) => (vec![c.clone()], ""),
-                None => (Vec::new(), &SCRIPTED_CALL[..bytes]),
+                None => (Vec::new(), &FUNCTION_TAG_CALL[..bytes]),
             };
             let good = cut.error.is_empty()
                 && cut.finish == "length"

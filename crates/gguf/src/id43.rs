@@ -1,6 +1,7 @@
 //! Type id 43, the one id two files mean differently.
 //!
-//! ggml's table gives 43 to F8_E4M3 (one byte a value); llama.cpp's MXFP8 writers, Unsloth's DeepSeek
+//! ggml's table gives 43 to F8_E4M3 (one byte a value, no tensor scale: [`GgmlType::F8E4M3`], Tencent's
+//! Hy4 per-layer table among them); llama.cpp's MXFP8 writers, Unsloth's DeepSeek
 //! V4.1 engram table among them, tag their tensors 43 too, as 33 bytes a block of 32 values (an E8M0
 //! scale byte, then 32 E4M3 codes: [`GgmlType::MXFP8`]). The header does not say which, but the bytes
 //! do. A tensor's data runs from its offset to the next tensor's offset, or to the end of the file for
@@ -14,8 +15,8 @@ use crate::{GgmlType, LoadError, RawTensorInfo, tensor_bytes};
 /// The ambiguous ggml type id.
 pub(crate) const ID: u32 = 43;
 
-/// The two meanings of [`ID`] as bloomery's own value types: ggml's F8_E4M3 rows and llama.cpp's MXFP8.
-const MEANINGS: [GgmlType; 2] = [GgmlType::F8E4M3_ROWS, GgmlType::MXFP8];
+/// The two meanings of [`ID`] as bloomery's own value types: ggml's F8_E4M3 and llama.cpp's MXFP8.
+const MEANINGS: [GgmlType; 2] = [GgmlType::F8E4M3, GgmlType::MXFP8];
 
 /// The bytes a tensor of `dims` takes in `ty`, `None` when its first dim is not whole blocks or the
 /// product passes a u64.
@@ -130,9 +131,9 @@ mod tests {
         let d = dir("pick");
         for (dims, nbytes, want) in [
             (vec![64u64, 4], 264u64, GgmlType::MXFP8),
-            (vec![64, 4], 256, GgmlType::F8E4M3_ROWS),
+            (vec![64, 4], 256, GgmlType::F8E4M3),
             (vec![96, 3], 297, GgmlType::MXFP8),
-            (vec![96, 3], 288, GgmlType::F8E4M3_ROWS),
+            (vec![96, 3], 288, GgmlType::F8E4M3),
         ] {
             let p = d.join(format!("{nbytes}.gguf"));
             tagged(&p, &[], &dims, nbytes);
@@ -162,6 +163,46 @@ mod tests {
         let split = Split::open(&p).unwrap();
         assert_eq!(split.find("t").unwrap().1.ty, GgmlType::MXFP8);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// One shard read on its own as a split opens it ([`Gguf::open_split_shard`]) sizes the table by the extent, where the strict
+    /// open of the same file refuses it: the reader of a fixture fetch holds a set's shards one at a time.
+    #[test]
+    fn a_shard_read_on_its_own_as_a_split_opens_it_sizes_the_table() {
+        let d = dir("shard");
+        let p = d.join("shard.gguf");
+        tagged(&p, &[], &[96, 3], 288);
+        let g = Gguf::open_split_shard(&p).unwrap();
+        let t = g.iter_tensors().find(|t| t.name == "t").unwrap();
+        assert_eq!((t.ty, t.nbytes), (GgmlType::F8E4M3, 288));
+        assert!(matches!(
+            Gguf::open(&p),
+            Err(LoadError::UnsupportedType { .. })
+        ));
+        tagged(&p, &[], &[64, 4], 300);
+        assert!(matches!(
+            Gguf::open_split_shard(&p),
+            Err(LoadError::AmbiguousType { .. })
+        ));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// The id a writer stores a scale-less F8 table under is ggml's 43 ([`GgmlType::file_id`]; the
+    /// value-type id 2008 is bloomery's own and no file carries it), and every other type is
+    /// stored under its own id.
+    #[test]
+    fn the_writers_id_for_the_scale_less_table_is_43() {
+        assert_eq!(GgmlType::F8E4M3.file_id(), 43);
+        assert_eq!(GgmlType::F8E4M3.as_u32(), 2008);
+        for ty in [
+            GgmlType::F32,
+            GgmlType::Q4_K,
+            GgmlType::Q8_0,
+            GgmlType::MXFP8,
+            GgmlType::F8E4M3_ROWS,
+        ] {
+            assert_eq!(ty.file_id(), ty.as_u32(), "{ty}");
+        }
     }
 
     /// Bytes that fit neither meaning, and a tensor too small for the padding to tell the two apart,
@@ -195,7 +236,7 @@ mod tests {
         let p = d.join("ragged.gguf");
         tagged(&p, &[], &[40, 2], 80);
         let split = Split::open(&p).unwrap();
-        assert_eq!(split.find("t").unwrap().1.ty, GgmlType::F8E4M3_ROWS);
+        assert_eq!(split.find("t").unwrap().1.ty, GgmlType::F8E4M3);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

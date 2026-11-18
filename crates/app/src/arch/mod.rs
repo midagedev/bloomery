@@ -30,6 +30,8 @@ pub mod deepseek41;
 pub mod flint;
 #[cfg(feature = "glm5next")]
 pub mod glm5next;
+#[cfg(feature = "hy4")]
+pub mod hy4;
 /// Kimi K3's session pieces: the body lives in the gpu crate's own kimi_k3
 /// arch, so they need no feature of their own.
 pub mod kimi_k3;
@@ -387,6 +389,22 @@ pub fn one_card_ctx(what: &'static str, machine: &Machine, ctx: usize) -> Result
         what,
         detail: format!("a context of {ctx} positions passes u64"),
     })
+}
+
+/// A placed load's residency, for a body that keeps the load's slot map for its life: a
+/// residency other than [`Residency::Off`] is refused by name (`what` the body's session),
+/// never run as another.
+pub fn slot_map_for_life(what: &'static str, residency: Residency) -> Result<(), GpuError> {
+    if residency == Residency::Off {
+        return Ok(());
+    }
+    Err(GpuError::shape(
+        what,
+        format!(
+            "residency {residency:?}: the body keeps the load's slot map for its life \
+             (BLOOMERY_RESIDENCY off)"
+        ),
+    ))
 }
 
 /// [`crate::Keep::cut`] of a body whose recurrent state has its history only

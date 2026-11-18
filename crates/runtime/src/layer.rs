@@ -51,6 +51,9 @@ pub enum ResidualKind {
     AlphaBeta,
     /// The plain stream with each sub-layer's output weight-normed before it joins.
     Sandwich,
+    /// Hyper-connection streams around every sub-layer, each sub-layer's output weight-normed
+    /// before the hyper-connection's post mix adds it.
+    HcSandwich,
     /// The running sum with the banked block inputs mixed in by softmax before each sub-layer.
     AttnRes,
 }
@@ -85,6 +88,7 @@ impl Layer {
                 Residual::Hc => ResidualKind::Hc,
                 Residual::AlphaBeta { .. } => ResidualKind::AlphaBeta,
                 Residual::Sandwich { .. } => ResidualKind::Sandwich,
+                Residual::HcSandwich { .. } => ResidualKind::HcSandwich,
                 Residual::AttnRes { .. } => ResidualKind::AttnRes,
             },
         }

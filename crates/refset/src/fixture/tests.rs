@@ -10,7 +10,7 @@ use crate::family::{Build, Family, Provenance};
 use crate::ik::RefManifest;
 use crate::mtpref::MtpSet;
 use gguf::Value;
-use gguf::write::{Layout, Writer};
+use gguf::write::{Layout, TensorDecl, Writer};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -42,6 +42,39 @@ fn write_gguf(path: &Path, kvs: &[(String, Value)]) {
     let file = std::fs::File::create(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     Writer::new(file, layout)
         .and_then(Writer::finish)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
+
+/// A GGUF file of `kvs` whose middle tensor is a scale-less F8 table (96 x 3 values) under ggml's id 43: the id the Hy4-flash
+/// fixture's per-layer table is written under, which only a split's open tells from MXFP8 (by the tensor's extent, so the table
+/// is neither the first nor the last tensor of the file).
+fn write_gguf_with_f8_table(path: &Path, kvs: &[(String, Value)]) {
+    let decl = |name: &str, dims: Vec<u64>, type_id, nbytes| TensorDecl {
+        name: name.to_string(),
+        dims,
+        type_id,
+        nbytes,
+    };
+    let layout = Layout::new(
+        kvs,
+        vec![
+            decl("a", vec![4], 0, 16),
+            decl("per_layer_token_embd.weight", vec![96, 3], 43, 288),
+            decl("z", vec![4], 0, 16),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let file = std::fs::File::create(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut w = Writer::new(file, layout).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    for (name, bytes) in [
+        ("a", vec![1u8; 16]),
+        ("per_layer_token_embd.weight", vec![0x38; 288]),
+        ("z", vec![2u8; 16]),
+    ] {
+        w.tensor(name, &bytes)
+            .unwrap_or_else(|e| panic!("{}: {name}: {e}", path.display()));
+    }
+    w.finish()
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
 }
 
@@ -90,6 +123,22 @@ fn the_line_is_every_fixture_key_sorted() -> Result<(), RefError> {
     assert_eq!(line_of(&dir, &kvs)?, LINE_SEED_1);
     kvs.reverse();
     assert_eq!(line_of(&dir, &kvs)?, LINE_SEED_1);
+    remove(&dir)
+}
+
+/// A fixture whose table is a scale-less F8 tensor (ggml id 43, which a file of one shard cannot tell from MXFP8 without the split's
+/// extent rule) states its line and its variant like any other: the readers open the first shard as a split.
+#[test]
+fn a_fixture_with_a_scale_less_f8_table_states_its_line_and_variant() -> Result<(), RefError> {
+    let dir = temp("f8table")?;
+    let path = dir.join("f.gguf");
+    let mut kvs = fixture_kvs(1);
+    write_gguf_with_f8_table(&path, &kvs);
+    assert_eq!(line(&path)?, LINE_SEED_1);
+    assert_eq!(variant_of(&path)?, None);
+    kvs.push(kv(KEY_VARIANT, Value::String("q4".to_string())));
+    write_gguf_with_f8_table(&path, &kvs);
+    assert_eq!(variant_of(&path)?.as_deref(), Some("q4"));
     remove(&dir)
 }
 

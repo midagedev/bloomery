@@ -1,0 +1,76 @@
+# Cases of the Hy4-flash vocabulary (pre-tokenizer hy_v4) beyond cases.txt: the model's special tokens and their near misses, the digit groups, the Han and kana run edges, Hangul, the punctuation and whitespace rules of the three regexes, and chat prompts the template renders (a conversation, a tool turn, the effort and reasoning markers); tools/hy4-oracle.sh decodes each line with printf %b.
+# The special tokens, each alone, then in a line: bos is `<｜hy_start…｜>`, the end of a turn `<｜hy_end…｜>`, and the span, tool and effort tags carry the suffix :6124c78e.
+<｜hy_start:6124c78e｜>
+<｜hy_middle:6124c78e｜>
+<｜hy_pad:6124c78e｜>
+<｜hy_end:6124c78e｜>
+<｜reasoning_mode:6124c78e｜>
+<think:6124c78e>
+</think:6124c78e>
+<tool_calls:6124c78e>
+</tool_calls:6124c78e>
+<tool_call:6124c78e>
+</tool_call:6124c78e>
+<arg_key:6124c78e>
+</arg_key:6124c78e>
+<arg_value:6124c78e>
+</arg_value:6124c78e>
+<tool_response:6124c78e>
+</tool_response:6124c78e>
+<｜hy_fim▁begin｜>def f():<｜hy_fim▁hole｜>return 1<｜hy_fim▁end｜><｜hy_EOT｜>
+<｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜>
+a<｜hy_end:6124c78e｜>b <｜hy_end:6124c78e｜> c<｜hy_end:6124c78e｜><｜hy_end:6124c78e｜>1<think:6124c78e>x</think:6124c78e>2
+# Near misses are text: the tags without the suffix, a wrong suffix, a cut tag, a tag in another case, a fullwidth bar that is not the model's.
+<think>x</think>
+<tool_call>f</tool_call>
+<tool_calls><tool_call>f</tool_call></tool_calls>
+<think:6124c78f>
+</think:6124c78>
+<think:6124c78e
+think:6124c78e>
+<THINK:6124c78e>
+<｜hy_end:6124c78e|>
+<|hy_end:6124c78e|>
+<｜hy_end｜>
+<｜hy_end:6124c78e｜
+<｜hy_place▁holder▁no▁7｜>
+<｜begin▁of▁sentence｜><｜end▁of▁sentence｜>
+<｜User｜>q<｜Assistant｜>a
+<|im_start|>user\nHi<|im_end|>
+# Digits are cut in threes from the left, apart from the letters around them, and a Han or kana run is a piece of its own.
+0
+00
+000
+0000
+1234567890123
+x1 x12 x123 x1234
+a1234b 12ab34 1.2.3.4 3.14159 1,234,567 ٣٤٥٦ ２０２６ ①②③④ ½ ²³
+2026-11-18 12:34:56 +82-10-1234-5678 0xDEADBEEF 1e-10 $1,000.00 99%
+你好，世界！这是一个测试。 今天12月18日 价格是2026元
+日本語のテキスト、カタカナとひらがな。ｶﾀｶﾅ ー ゛゜ ゠ヿ ぀ゟ
+\xe4\xb7\xbf|一|龥|\xe9\xbe\xa6|\xe3\x80\xbf|\xe3\x81\x80|ゟ|゠|ヿ|\xe3\x84\x80|㐀䶿
+한국어 문장을 토큰으로 나눕니다. 가나다라마바사 ㄱㄴㄷ ᄀᄁ 한글ABC123한글
+한국어 텍스트와 English words 그리고 日本語 and 中文 mixed 123 456
+# Punctuation, symbols and whitespace: the letter run with its one leading character, the run of marks with a leading space and trailing line breaks, the line break runs and the trailing whitespace.
+Hello, world! It's we're they've I'm you'll he'd can't 'Sorry 'Tis x'y rock'n'roll
+(foo) [bar] {baz} <qux> x=y; a+b !! ?! ... -- ~/ $x `y` "z" '
+fn main() {\n\tprintln!("{}", x->y);\n}\n
+a\n\nb\r\n\r\nc \n d\n \n
+  lead  and  trail  
+\t\tx\t\ty\t\t
+a b  c   d    e
+x \n\n y
+\n
+\n\n\n
+   
+é ñ ü ß ǅ Ωmega Привет مرحبا שלום สวัสดี नमस्ते
+e\xcc\x81 a\xcc\x88 x\xe2\x80\x8dy \xef\xbb\xbfz
+😀 👍🏽 👨‍👩‍👧 🇰🇷 ❤️
+x\xc2\xa0y\xe3\x80\x80z\xe2\x80\x83w
+# Chat prompts as the template renders them (tests/fixtures/hy4-renders.json of the serve crate, kept apart from the reference's ids).
+<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>You are terse.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>
+<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>
+<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>Be brief.<｜reasoning_mode:6124c78e｜>reasoning_effort:low<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>
+<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{"description": "Current weather for a city.", "name": "get_weather", "parameters": {"properties": {"days": {"description": "How many days ahead.", "type": "integer"}, "location": {"description": "City name, e.g. Seoul.", "type": "string"}}, "required": ["location"], "type": "object"}}\n{"description": "The time now.", "name": "get_time", "parameters": {"properties": {}, "type": "object"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather and time in Seoul?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Two tools.</think:6124c78e>Checking both.<tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>days</arg_key:6124c78e><arg_value:6124c78e>3</arg_value:6124c78e><arg_key:6124c78e>location</arg_key:6124c78e><arg_value:6124c78e>Seoul</arg_value:6124c78e></tool_call:6124c78e><tool_call:6124c78e>get_time</tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>{"temp": 21}</tool_response:6124c78e><tool_response:6124c78e>12:00</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>
+<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{"description": "The time now.", "name": "get_time", "parameters": {"properties": {}, "type": "object"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Time?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Ask the clock.</think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_time</tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>12:00</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Report it.</think:6124c78e>It is noon.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Thanks.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>
+<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{"description": "Save a note.", "name": "save_note", "parameters": {"properties": {"filter": {"type": "object"}, "text": {"type": "string"}}, "type": "object"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Note it.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>save_note<arg_key:6124c78e>filter</arg_key:6124c78e><arg_value:6124c78e>{"f": 1.5, "n": [1, 2], "ok": true, "q": "서울 ☃", "x": null}</arg_value:6124c78e><arg_key:6124c78e>text</arg_key:6124c78e><arg_value:6124c78e>a<b & "c"</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜>

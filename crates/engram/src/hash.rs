@@ -4,9 +4,11 @@
 //! multipliers, the bucket sizes, the offsets and — for V4.1's engram — the
 //! compressed-vocabulary map, and a file missing any of them is an error here:
 //! nothing in this module has a default, because a default would be a number
-//! nobody measured. Two key sets exist, each read by its own constructor:
-//! [`Hash::from_gguf`] (V4.1's engram, `deepseek41.engram.*`) and
-//! [`Hash::ple_from_keys`] (a PLE site, `<arch>.ple.*`).
+//! nobody measured. Three key sets exist, each read by its own constructor:
+//! [`Hash::from_gguf`] (V4.1's engram, `deepseek41.engram.*`),
+//! [`Hash::ple_from_keys`] (a PLE site, `<arch>.ple.*`) and
+//! [`Hash::ple_mapped_from_keys`] (Hy4-flash's sites: `<arch>.ple.*` for the
+//! constants, `<arch>.engram.*` for the token map and the pad).
 //!
 //! The formula, per site `e` and per token ([`ngram::rows`]):
 //!
@@ -24,7 +26,10 @@
 //! What a context value is, is the window's ([`Window`]): V4.1 maps each id
 //! through the token map and fills slots before the start with the pad id; a
 //! PLE site hashes raw ids, and an EOS predecessor or the sequence start turns
-//! that slot and every older one into the EOS ([`ngram::EosWindow`]).
+//! that slot and every older one into the EOS ([`ngram::EosWindow`]); Hy4-flash
+//! maps each id through the token map too, but its pad id is itself looked up
+//! in the map, and a token outside the map or at an embedding position is
+//! dead ([`Window::MappedDead`]).
 //!
 //! Two shapes follow from it and the caller has to know both:
 //!
@@ -93,6 +98,12 @@ pub enum Window {
     Mapped { token_map: Vec<u32>, pad: u64 },
     /// A PLE site: raw ids with an EOS reset.
     Eos(EosWindow),
+    /// Hy4-flash's engram: each id through `token_map`, `pad` the *mapped* pad (the file's
+    /// `engram.pad_token_id` looked up in the map once, at read) in a slot that holds no live token.
+    /// A token outside the map and an embedding position (an image row, [`Hash::mapped_rows_into`]'s
+    /// `None`) are dead: a dead slot of an older position reads `pad`, and a dead current token
+    /// reads `pad` and masks the whole token (llama.cpp's `engram_hash`).
+    MappedDead { token_map: Vec<u32>, pad: u64 },
 }
 
 /// The hash constants of one model, one set per site.
@@ -316,6 +327,106 @@ impl Hash {
         })
     }
 
+    /// Read Hy4-flash's constants out of the metadata pairs of the header that carries them
+    /// (`gguf::Split::keys`: the first shard of a split set).
+    ///
+    /// The keys, as llama.cpp's `hy-v4-flash.cpp` reads them (`load_arch_hparams`):
+    /// `<arch>.ple.layers` (one or more sites, ascending), `ple.ngram_size` (2 to 8),
+    /// `ple.heads_per_ngram`, `embedding_length_per_layer_input` (values a row),
+    /// `ple.layer_multipliers` (`ngram_size` a site), `ple.head_vocab_sizes` (the buckets' sizes, the
+    /// formula's `prime`, each at least 2) and `ple.head_offsets` (`(ngram_size - 1) * heads_per_ngram`
+    /// a site, every bucket's top inside an `i32` row index; every site's buckets together fit the 64
+    /// llama.cpp keeps), and `<arch>.engram.token_map` (one value a token of the `n_vocab`-token
+    /// vocabulary) and `<arch>.engram.pad_token_id` (a token of that map). The window is
+    /// [`Window::MappedDead`] with the pad looked up through the map.
+    pub fn ple_mapped_from_keys(
+        meta: &[(String, Value)],
+        arch: &str,
+        n_vocab: u32,
+    ) -> Result<Hash, EngramError> {
+        let k = |suffix: &str| format!("{arch}.ple.{suffix}");
+        let e = |suffix: &str| format!("{arch}.engram.{suffix}");
+        let layer_ids: Vec<u32> = ints(meta, &k("layers"))?
+            .into_iter()
+            .map(|v| u32::try_from(v).map_err(|_| value_err(k("layers"), "a block index")))
+            .collect::<Result<_, _>>()?;
+        if layer_ids.is_empty() {
+            return Err(value_err(k("layers"), "at least one engram site"));
+        }
+        if let Some(at) = layer_ids.windows(2).position(|w| w[0] >= w[1]) {
+            return Err(EngramError::KeyValue {
+                key: k("layers"),
+                at: at + 1,
+                what: "a block index above the one before it",
+            });
+        }
+        let sites = layer_ids.len();
+        let n_gram = usize::try_from(scalar(meta, &k("ngram_size"))?)
+            .ok()
+            .filter(|n| (2..=MAX_PLE_NGRAM).contains(n))
+            .ok_or_else(|| value_err(k("ngram_size"), "an n-gram size of 2 to 8"))?;
+        let n_heads = usize::try_from(scalar(meta, &k("heads_per_ngram"))?)
+            .ok()
+            .filter(|&h| h >= 1)
+            .ok_or_else(|| value_err(k("heads_per_ngram"), "at least one head"))?;
+        let n_cols = (n_gram - 1) * n_heads;
+        if sites * n_cols > MAX_PLE_ROWS {
+            return Err(value_err(
+                k("layers"),
+                "sites whose buckets together fit llama.cpp's 64 (LLAMA_MAX_PLE_HEADS)",
+            ));
+        }
+        let row_key = format!("{arch}.embedding_length_per_layer_input");
+        let key_length = u32::try_from(scalar(meta, &row_key)?)
+            .ok()
+            .filter(|&r| r > 0)
+            .ok_or_else(|| value_err(row_key.clone(), "a positive row length"))?;
+
+        let mult = ints(meta, &k("layer_multipliers"))?;
+        need_len(k("layer_multipliers"), mult.len(), sites * n_gram)?;
+        let prime = ints(meta, &k("head_vocab_sizes"))?;
+        need_len(k("head_vocab_sizes"), prime.len(), sites * n_cols)?;
+        let offset = ints(meta, &k("head_offsets"))?;
+        need_len(k("head_offsets"), offset.len(), sites * n_cols)?;
+        check_buckets(
+            &prime,
+            &offset,
+            [&k("head_vocab_sizes"), &k("head_offsets")],
+            i32::MAX as u64,
+            "a bucket top inside an i32 row index",
+        )?;
+        if let Some(b) = prime.iter().position(|&p| p < 2) {
+            return Err(EngramError::KeyValue {
+                key: k("head_vocab_sizes"),
+                at: b,
+                what: "a bucket of at least 2 rows",
+            });
+        }
+
+        let token_map: Vec<u32> = ints(meta, &e("token_map"))?
+            .into_iter()
+            .map(|v| u32::try_from(v).map_err(|_| value_err(e("token_map"), "a mapped id")))
+            .collect::<Result<_, _>>()?;
+        need_len(e("token_map"), token_map.len(), n_vocab as usize)?;
+        let pad_id = usize::try_from(scalar(meta, &e("pad_token_id"))?)
+            .ok()
+            .filter(|&p| p < token_map.len())
+            .ok_or_else(|| value_err(e("pad_token_id"), "a token of the map"))?;
+        let pad = u64::from(token_map[pad_id]);
+
+        Ok(Hash {
+            layer_ids,
+            n_heads,
+            n_gram,
+            n_cols,
+            key_length,
+            window: Window::MappedDead { token_map, pad },
+            mult,
+            prime,
+            offset,
+        })
+    }
+
     /// [`Hash::from_gguf`] over the keys of `split`'s header alone: a checkpoint folder's header
     /// (`gguf::Split::header_only`), whose keys carry every constant, reads as a split's would.
     pub fn from_keys(split: &gguf::Split) -> Result<Hash, EngramError> {
@@ -416,7 +527,9 @@ impl Hash {
     /// accessor a raw-id hash was asked for.
     fn mapped(&self, what: &str) -> (&[u32], u64) {
         match &self.window {
-            Window::Mapped { token_map, pad } => (token_map, *pad),
+            Window::Mapped { token_map, pad } | Window::MappedDead { token_map, pad } => {
+                (token_map, *pad)
+            }
             Window::Eos(_) => panic!(
                 "Hash::{what}: this hash reads raw ids with an EOS reset and has no token map or \
                  pad id; its rows come from Hash::ple_rows_into"
@@ -530,8 +643,90 @@ impl Hash {
     pub fn new_history(&self) -> Result<History, NgramError> {
         match &self.window {
             Window::Eos(w) => Ok(History::new(self.n_gram, w.eos)),
-            Window::Mapped { .. } => Err(NgramError::NotRawIds),
+            Window::Mapped { .. } | Window::MappedDead { .. } => Err(NgramError::NotRawIds),
         }
+    }
+
+    /// A dead-aware mapped hash's history of a new sequence: `n_gram − 1` dead slots at position 0.
+    pub fn new_mapped_history(&self) -> Result<History, NgramError> {
+        match &self.window {
+            Window::MappedDead { .. } => Ok(History::new(self.n_gram, DEAD)),
+            Window::Mapped { .. } | Window::Eos(_) => Err(NgramError::NotMappedDead),
+        }
+    }
+
+    /// Every site's row ids for `tokens`, the positions `pos, pos + 1, …` of the sequence whose
+    /// history is `hist`, and each token's mask, with `hist` advanced past them.
+    ///
+    /// A token is `Some(id)` for a text token and `None` for an embedding position (an image row),
+    /// which has no id. Per token, slot 0 of the window is `map[id]`, slot `s` the mapped id of the
+    /// token `s` positions back, and a dead one (outside the map, an embedding position, or before
+    /// the sequence start) reads the mapped pad. A token whose own slot is dead gets `live` false
+    /// and its rows are the pad's: a consumer adds nothing for it. Older dead slots mask nothing
+    /// (llama.cpp's `engram_hash`: `valid` follows the current token alone).
+    ///
+    /// `rows` is site-major, `n_cols` ids a token: site `e`'s ids of token `i` are
+    /// `rows[(e * tokens.len() + i) * n_cols..][..n_cols]`; `live` has one entry a token. Every
+    /// length and the position are checked before anything is written or the history moves, so a
+    /// refusal leaves both as they were. Allocation-free.
+    pub fn mapped_rows_into(
+        &self,
+        hist: &mut History,
+        pos: u64,
+        tokens: &[Option<u32>],
+        rows: &mut [u32],
+        live: &mut [bool],
+    ) -> Result<(), NgramError> {
+        let Window::MappedDead { token_map, pad } = &self.window else {
+            return Err(NgramError::NotMappedDead);
+        };
+        assert_eq!(
+            hist.tokens().len() + 1,
+            self.n_gram,
+            "Hash::mapped_rows_into: a history of {} tokens for a {}-gram hash; \
+             Hash::new_mapped_history takes the hash's n_gram",
+            hist.tokens().len(),
+            self.n_gram
+        );
+        if pos != hist.next_pos() {
+            return Err(NgramError::PositionGap {
+                want: hist.next_pos(),
+                got: pos,
+            });
+        }
+        let sites = self.sites();
+        let want = sites * tokens.len() * self.n_cols;
+        if rows.len() != want || live.len() != tokens.len() {
+            return Err(NgramError::RowBufferSize {
+                tokens: tokens.len(),
+                want,
+                got: rows.len(),
+            });
+        }
+        let slot = |id: u32| token_map.get(id as usize).map(|&v| u64::from(v));
+        let mut ctx = [0u64; MAX_PLE_NGRAM];
+        let ctx = &mut ctx[..self.n_gram];
+        for (i, &token) in tokens.iter().enumerate() {
+            let own = token.and_then(slot);
+            live[i] = own.is_some();
+            ctx[0] = own.unwrap_or(*pad);
+            let prev = hist.tokens();
+            for (s, c) in ctx.iter_mut().enumerate().skip(1) {
+                *c = slot(prev[prev.len() - s]).unwrap_or(*pad);
+            }
+            for site in 0..sites {
+                ngram::rows(
+                    &self.mult[site * self.n_gram..][..self.n_gram],
+                    &self.prime[site * self.n_cols..][..self.n_cols],
+                    &self.offset[site * self.n_cols..][..self.n_cols],
+                    self.n_heads,
+                    ctx,
+                    &mut rows[(site * tokens.len() + i) * self.n_cols..][..self.n_cols],
+                );
+            }
+            hist.push(token.unwrap_or(DEAD));
+        }
+        Ok(())
     }
 
     /// The row ids of a raw-id hash's one site for `tokens`, the positions
@@ -671,6 +866,10 @@ impl Hash {
         Ok(&all[site * stride..][..stride])
     }
 }
+
+/// The history value of a position that holds no text token (an embedding position, a slot before the
+/// sequence start): past every token map, so a dead-aware window reads it as dead.
+const DEAD: u32 = u32::MAX;
 
 /// The widest n-gram a PLE site folds (llama.cpp's `LLAMA_MAX_PLE_NGRAM`).
 const MAX_PLE_NGRAM: usize = 8;
@@ -1605,5 +1804,332 @@ mod tests {
             key(edit("qwen4exp.ple.layers", Some(two))),
             "qwen4exp.ple.layers"
         );
+    }
+
+    /// A Hy4-flash-shaped header of two sites, a 3-gram of 2 heads an order (4 rows a site), a 40-token
+    /// vocabulary whose map compresses ids 0..=29 to `id / 2` and extends the rest as identity-plus-100,
+    /// and the pad token 7 (mapped to 3).
+    fn hy4_keys() -> Vec<(String, Value)> {
+        let k = |s: &str| format!("hy.ple.{s}");
+        let u64s = |v: &[u64]| Value::Array(v.iter().copied().map(Value::U64).collect());
+        let map: Vec<u64> = (0..40u64)
+            .map(|t| if t < 30 { t / 2 } else { t + 100 })
+            .collect();
+        vec![
+            (
+                k("layers"),
+                Value::Array(vec![Value::U32(1), Value::U32(3)]),
+            ),
+            (k("ngram_size"), Value::U32(3)),
+            (k("heads_per_ngram"), Value::U32(2)),
+            (
+                "hy.embedding_length_per_layer_input".to_string(),
+                Value::U32(8),
+            ),
+            (
+                k("layer_multipliers"),
+                u64s(&[11, 13, 17, 1 << 50, (1 << 61) + 5, 3]),
+            ),
+            (
+                k("head_vocab_sizes"),
+                u64s(&[101, 103, 107, 109, 113, 127, 131, 137]),
+            ),
+            (
+                k("head_offsets"),
+                u64s(&[0, 101, 204, 311, 420, 533, 660, 791]),
+            ),
+            ("hy.engram.pad_token_id".to_string(), Value::U32(7)),
+            ("hy.engram.token_map".to_string(), u64s(&map)),
+        ]
+    }
+
+    /// llama.cpp's `engram_hash` (hy-v4-flash.cpp:338-384) transcribed over the Hy4 header `meta`: the token
+    /// of position `p` of `seq` (None an embedding position), per site, the row ids and the whole-token
+    /// validity, with i64 as the C++ has it and the dead sentinel -1.
+    fn llamacpp_dead_rows(
+        meta: &[(String, Value)],
+        seq: &[Option<u32>],
+    ) -> (Vec<Vec<Vec<u32>>>, Vec<bool>) {
+        let get = |key: &str| -> Vec<u64> {
+            match &meta.iter().find(|(k, _)| k == key).unwrap().1 {
+                Value::Array(a) => a.iter().map(|v| v.as_u64().unwrap()).collect(),
+                v => vec![v.as_u64().unwrap()],
+            }
+        };
+        let (n_gram, n_head) = (
+            get("hy.ple.ngram_size")[0] as usize,
+            get("hy.ple.heads_per_ngram")[0] as usize,
+        );
+        let (mult, primes, offs) = (
+            get("hy.ple.layer_multipliers"),
+            get("hy.ple.head_vocab_sizes"),
+            get("hy.ple.head_offsets"),
+        );
+        let map = get("hy.engram.token_map");
+        let n_cols = (n_gram - 1) * n_head;
+        let pad = map[get("hy.engram.pad_token_id")[0] as usize] as i64;
+        let cid = |t: i64| -> i64 {
+            if t < 0 || t >= map.len() as i64 {
+                -1
+            } else {
+                map[t as usize] as i64
+            }
+        };
+        let sites = get("hy.ple.layers").len();
+        let mut out = vec![vec![vec![0u32; n_cols]; seq.len()]; sites];
+        let mut valid = vec![false; seq.len()];
+        for (i, t) in seq.iter().enumerate() {
+            let c = t.map_or(-1, |t| cid(i64::from(t)));
+            let dead = c == -1;
+            valid[i] = !dead;
+            for e in 0..sites {
+                let mut toks = vec![0u64; n_gram];
+                toks[0] = (if dead { pad } else { c }) as u64;
+                for s in 1..n_gram {
+                    let c = if (i as i64) - (s as i64) < 0 {
+                        -1
+                    } else {
+                        seq[i - s].map_or(-1, |t| cid(i64::from(t)))
+                    };
+                    toks[s] = (if c == -1 { pad } else { c }) as u64;
+                }
+                let m = &mult[e * n_gram..][..n_gram];
+                let mut rolling = toks[0].wrapping_mul(m[0]);
+                for o in 1..n_gram {
+                    rolling ^= toks[o].wrapping_mul(m[o]);
+                    for h in 0..n_head {
+                        let col = (o - 1) * n_head + h;
+                        let (p, of) = (primes[e * n_cols + col], offs[e * n_cols + col]);
+                        out[e][i][col] = u32::try_from(rolling % p + of).unwrap();
+                    }
+                }
+            }
+        }
+        (out, valid)
+    }
+
+    /// The Hy4 reader takes the keys llama.cpp's loader does, resolves the pad through the map (token 7 is
+    /// mapped to 3, so the pad slot is 3, not 7) and holds the map to the vocabulary.
+    #[test]
+    fn mapped_dead_hash_reads_its_keys() {
+        let hash = Hash::ple_mapped_from_keys(&hy4_keys(), "hy", 40).unwrap();
+        assert_eq!(
+            (hash.sites(), hash.n_gram(), hash.n_heads(), hash.n_cols()),
+            (2, 3, 2, 4)
+        );
+        assert_eq!((hash.layer_ids(), hash.key_length()), (&[1u32, 3][..], 8));
+        assert_eq!(hash.pad_id(), 3, "the pad is looked up through the map");
+        assert_eq!(hash.token_map().len(), 40);
+        assert_eq!(hash.map_token(30).unwrap(), 130);
+        hash.check_vocab(40).unwrap();
+        assert!(matches!(hash.window(), Window::MappedDead { pad: 3, .. }));
+        assert_eq!(hash.multipliers(1).unwrap(), &[1 << 50, (1 << 61) + 5, 3]);
+        assert_eq!(hash.offsets(1).unwrap(), &[420, 533, 660, 791]);
+        assert!(hash.new_history().is_err(), "it has no raw-id window");
+    }
+
+    /// Each refusal names its key: layers out of order or empty, a map of another length, a pad outside the
+    /// map, a bucket of one row or past the i32 row index, and more buckets than llama.cpp keeps.
+    #[test]
+    fn mapped_dead_reader_refuses_by_key() {
+        let edit = |key: &str, v: Option<Value>| {
+            let mut m = hy4_keys();
+            m.retain(|(k, _)| k != key);
+            if let Some(v) = v {
+                m.push((key.to_string(), v));
+            }
+            Hash::ple_mapped_from_keys(&m, "hy", 40)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let named = |got: Option<String>, key: &str| {
+            let got = got.unwrap_or_else(|| panic!("{key} was not refused"));
+            assert!(got.contains(key), "{got}");
+        };
+        let two = |a, b| Value::Array(vec![Value::U32(a), Value::U32(b)]);
+        named(edit("hy.ple.layers", Some(two(3, 1))), "hy.ple.layers");
+        named(
+            edit("hy.ple.layers", Some(Value::Array(vec![]))),
+            "hy.ple.layers",
+        );
+        named(edit("hy.ple.layers", None), "hy.ple.layers");
+        named(
+            edit("hy.engram.pad_token_id", Some(Value::U32(40))),
+            "hy.engram.pad_token_id",
+        );
+        named(
+            edit("hy.engram.pad_token_id", None),
+            "hy.engram.pad_token_id",
+        );
+        named(
+            edit(
+                "hy.engram.token_map",
+                Some(Value::Array(vec![Value::U32(0); 39])),
+            ),
+            "hy.engram.token_map",
+        );
+        let primes = |p: u64| {
+            let mut v = vec![101u64, 103, 107, 109, 113, 127, 131, 137];
+            v[5] = p;
+            Value::Array(v.into_iter().map(Value::U64).collect())
+        };
+        named(
+            edit("hy.ple.head_vocab_sizes", Some(primes(1))),
+            "hy.ple.head_vocab_sizes",
+        );
+        named(
+            edit("hy.ple.head_vocab_sizes", Some(primes(0))),
+            "hy.ple.head_vocab_sizes",
+        );
+        named(
+            edit("hy.ple.head_vocab_sizes", Some(primes(i32::MAX as u64))),
+            "hy.ple.head_offsets",
+        );
+        named(
+            edit(
+                "hy.ple.layer_multipliers",
+                Some(Value::Array(vec![Value::U64(1); 5])),
+            ),
+            "hy.ple.layer_multipliers",
+        );
+        named(
+            edit("hy.ple.heads_per_ngram", Some(Value::U32(17))),
+            "hy.ple.layers",
+        );
+        assert!(matches!(
+            Hash::ple_mapped_from_keys(&hy4_keys(), "hy", 41),
+            Err(EngramError::KeyLength { .. })
+        ));
+    }
+
+    /// The rows and the mask equal the transcription of llama.cpp's `engram_hash` on a sequence that starts
+    /// the window (positions 0 and 1 read dead slots), holds the pad token itself, a token outside the map
+    /// (dead: masked, reads the mapped pad) and an embedding position (dead), at one call and split into
+    /// calls of 1, 2 and 3 (the history carries across). A dead older slot masks nothing.
+    #[test]
+    fn mapped_dead_rows_are_llamacpps() {
+        let meta = hy4_keys();
+        let hash = Hash::ple_mapped_from_keys(&meta, "hy", 40).unwrap();
+        let seq: Vec<Option<u32>> = [5, 7, 29, 31, 45, 12, 0, 39, 7, 7, 8]
+            .iter()
+            .map(|&t| Some(t))
+            .collect();
+        let mut seq = seq;
+        seq[6] = None;
+        let (want, want_live) = llamacpp_dead_rows(&meta, &seq);
+        assert_eq!(
+            &want_live[..],
+            &[
+                true, true, true, true, false, true, false, true, true, true, true
+            ]
+        );
+        for step in [seq.len(), 1, 2, 3] {
+            let mut hist = hash.new_mapped_history().unwrap();
+            let mut at = 0;
+            while at < seq.len() {
+                let chunk = &seq[at..(at + step).min(seq.len())];
+                let mut rows = vec![0u32; hash.sites() * chunk.len() * hash.n_cols()];
+                let mut live = vec![false; chunk.len()];
+                hash.mapped_rows_into(&mut hist, at as u64, chunk, &mut rows, &mut live)
+                    .unwrap();
+                for (i, &l) in live.iter().enumerate() {
+                    assert_eq!(l, want_live[at + i], "live[{}] at step {step}", at + i);
+                    for e in 0..hash.sites() {
+                        let got = &rows[(e * chunk.len() + i) * hash.n_cols()..][..hash.n_cols()];
+                        assert_eq!(
+                            got,
+                            &want[e][at + i][..],
+                            "site {e} token {} at step {step}",
+                            at + i
+                        );
+                    }
+                }
+                at += chunk.len();
+            }
+            assert_eq!(hist.next_pos(), seq.len() as u64);
+        }
+    }
+
+    /// A dead current token's rows are the pad's window (all four slots the mapped pad), which differs from
+    /// the live pad token's only through the older slots; a dead slot reads the mapped pad, not the map's
+    /// value of the token (45 is outside the map: reading `map[45]` has no value, reading 45 raw would
+    /// differ). Mutant: the pad used as an id (7 for 3), or a dead token read as id 0.
+    #[test]
+    fn a_dead_slot_reads_the_mapped_pad() {
+        let meta = hy4_keys();
+        let hash = Hash::ple_mapped_from_keys(&meta, "hy", 40).unwrap();
+        let rows_of = |seq: &[Option<u32>]| {
+            let mut hist = hash.new_mapped_history().unwrap();
+            let mut rows = vec![0u32; hash.sites() * seq.len() * hash.n_cols()];
+            let mut live = vec![false; seq.len()];
+            hash.mapped_rows_into(&mut hist, 0, seq, &mut rows, &mut live)
+                .unwrap();
+            (rows, live)
+        };
+        let (dead, dead_live) = rows_of(&[Some(45)]);
+        let (embd, embd_live) = rows_of(&[None]);
+        let (pad, pad_live) = rows_of(&[Some(7)]);
+        assert_eq!(
+            (dead_live[0], embd_live[0], pad_live[0]),
+            (false, false, true)
+        );
+        assert_eq!(
+            dead, embd,
+            "outside the map and an embedding position are the same dead token"
+        );
+        assert_eq!(
+            dead, pad,
+            "at the sequence start the pad token's own window is the all-pad one"
+        );
+        let mut ctx = [3u64; 3];
+        let mut want = vec![0u32; 4];
+        hash.rows_into(0, &ctx, &mut want).unwrap();
+        assert_eq!(
+            &dead[..4],
+            &want[..],
+            "the all-pad window with the pad mapped to 3"
+        );
+        ctx = [7; 3];
+        hash.rows_into(0, &ctx, &mut want).unwrap();
+        assert_ne!(
+            &dead[..4],
+            &want[..],
+            "pad 7 used as an id is another window"
+        );
+    }
+
+    /// Refusals leave the history and the buffers as they were: a gap in position, a rows buffer of the
+    /// wrong length, a mask of the wrong length, and the other hashes' window.
+    #[test]
+    fn mapped_dead_refusals_leave_the_state() {
+        let hash = Hash::ple_mapped_from_keys(&hy4_keys(), "hy", 40).unwrap();
+        let mut hist = hash.new_mapped_history().unwrap();
+        let (mut rows, mut live) = (vec![9u32; 8], vec![true; 1]);
+        let seq = [Some(1u32)];
+        assert!(matches!(
+            hash.mapped_rows_into(&mut hist, 3, &seq, &mut rows, &mut live),
+            Err(NgramError::PositionGap { want: 0, got: 3 })
+        ));
+        assert!(matches!(
+            hash.mapped_rows_into(&mut hist, 0, &seq, &mut rows[..7], &mut live),
+            Err(NgramError::RowBufferSize {
+                want: 8,
+                got: 7,
+                ..
+            })
+        ));
+        assert!(matches!(
+            hash.mapped_rows_into(&mut hist, 0, &seq, &mut rows, &mut []),
+            Err(NgramError::RowBufferSize { .. })
+        ));
+        assert_eq!(
+            (hist.next_pos(), rows.clone(), live.clone()),
+            (0, vec![9; 8], vec![true])
+        );
+        let v41 = with_map(40);
+        assert!(matches!(
+            v41.new_mapped_history(),
+            Err(NgramError::NotMappedDead)
+        ));
     }
 }

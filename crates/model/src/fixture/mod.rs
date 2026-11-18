@@ -24,7 +24,9 @@
 //! type's scale from its block layout (the dequant ports in `gguf::quant`)
 //! and picks the widest band of scale codes whose `d` (and `dmin`) is a
 //! normal f16 in the spec's [`Window`]. A vector (no second dim or `dims[0] == 1`) and an
-//! F32 tensor the family names hold the constant the family gives them.
+//! F32 tensor the family names hold the constant the family gives them. A scale-less F8_E4M3
+//! table (one byte a value, no `1/√K`: the codes are uniform over the finite ones) is written
+//! under ggml's type id 43, [`gguf::GgmlType::file_id`], as the real file stores it.
 //!
 //! The bytes are a function of the seed and the source header alone: each
 //! tensor's stream is cut into chunks of about [`CHUNK_TARGET`] bytes, and a

@@ -207,9 +207,9 @@ use serde_json::{Map, Value, json};
 
 use super::response_store::Refusal;
 use super::{
-    ApiError, ChatPlan, Client, State, body, chat_input, chat_plan, check_effort, engine_error,
-    finish_stream, gen_body, get_b, get_i, get_i_in, invalid, json_type, not_found, progress,
-    run_gen, run_whole, send_error, send_json, tool_markup_error, unix_now,
+    ApiError, ChatPlan, Client, State, ThinkingOff, body, chat_input, chat_plan, check_effort,
+    engine_error, finish_stream, gen_body, get_b, get_i, get_i_in, invalid, json_type, not_found,
+    progress, run_gen, run_whole, send_error, send_json, tool_markup_error, unix_now,
 };
 use crate::admit::Lease;
 use crate::dsml::{ChatParser, Message, ToolCall};
@@ -412,7 +412,7 @@ fn request(state: &State, b: &Map<String, Value>) -> Result<Converted, ApiError>
         }
         None => return Err(invalid("input is required").at("input")),
     }
-    let chat = to_chat(b, &items)?;
+    let chat = to_chat(b, &items, state.thinking_off)?;
     Ok(Converted {
         keep,
         conversation: items,
@@ -423,8 +423,9 @@ fn request(state: &State, b: &Map<String, Value>) -> Result<Converted, ApiError>
 
 /// The OpenAI chat body of a Responses request whose conversation is `items`,
 /// with the namespace each flattened function of its `namespace` tools came
-/// from, or the first field it refuses, by name.
-fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Chat, ApiError> {
+/// from, or the first field it refuses, by name; `how` is the template's
+/// thinking-off case, which names the effort words it takes.
+fn to_chat(b: &Map<String, Value>, items: &[Value], how: ThinkingOff) -> Result<Chat, ApiError> {
     let mut messages = Vec::new();
     if let Some(v) = set(b, "instructions") {
         let Value::String(s) = v else {
@@ -459,7 +460,9 @@ fn to_chat(b: &Map<String, Value>, items: &[Value]) -> Result<Chat, ApiError> {
     if let Some(n) = b.get("max_output_tokens") {
         chat.insert("max_tokens".into(), n.clone());
     }
-    if let Some(effort) = reasoning_effort(set(b, "reasoning")).map_err(|e| e.at("reasoning"))? {
+    if let Some(effort) =
+        reasoning_effort(set(b, "reasoning"), how).map_err(|e| e.at("reasoning"))?
+    {
         chat.insert("reasoning_effort".into(), effort.clone());
     }
     // A JSON schema or a JSON object is the chat path's `response_format` of
@@ -575,14 +578,15 @@ fn unserved(b: &Map<String, Value>) -> Result<(), ApiError> {
 }
 
 /// `reasoning.effort`, a string, which the chat path hands the template as
-/// `reasoning_effort`.
-fn reasoning_effort(v: Option<&Value>) -> Result<Option<&Value>, ApiError> {
+/// `reasoning_effort`; `how` names the template's own word for no thinking, if
+/// it has one.
+fn reasoning_effort(v: Option<&Value>, how: ThinkingOff) -> Result<Option<&Value>, ApiError> {
     match v {
         None => Ok(None),
         Some(Value::Object(r)) => match set(r, "effort") {
             None => Ok(None),
             Some(e @ Value::String(s)) => {
-                check_effort("reasoning.effort", s)?;
+                check_effort("reasoning.effort", s, how)?;
                 Ok(Some(e))
             }
             Some(e) => Err(invalid(format!(

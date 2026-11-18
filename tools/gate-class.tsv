@@ -80,6 +80,7 @@ gate-gpu-dspark-kv	family	deepseek41	draft	drafts_dspark
 gate-gpu-e2e	family	deepseek2	e2e+kernel	graph_fault+moe_route+weights_load
 gate-gpu-flint-attn	family	flint	kernel	attn_gqa
 gate-gpu-flint-router	family	flint	kernel	moe_route
+gate-gpu-hy4-hc	family	hy_v4_flash	kernel	hc_engram_common+moe_route
 gate-gpu-flint-lib	family	flint	e2e	graph_fault+attn_gqa+moe_route+tier_legs+placement_sizing
 gate-gpu-flint-twocard	family	flint	tier	tier_legs+node_link+placement_sizing+prompt_walks+graph_fault
 gate-gpu-lfm3-kernels	family	lfm3	kernel	attn_gqa
@@ -252,6 +253,7 @@ gate-q38-serve-rules	family	qwen4exp	serve	seats_serve_engine
 gate-qdot	common		host	quant_host_qdot
 gate-quant	common		host	quant_host_qdot
 gate-qwen3-plan	common		place	placement_sizing+tier_legs
+gate-hy4-meta	family	hy_v4_flash	meta	arch_registry+engram_verbs
 gate-mistrallarge4-meta	family	mistral-large4	meta	arch_registry
 gate-musespark-meta	family	muse-spark	meta	arch_registry+placement_sizing
 gate-qwen35moe-meta	family	qwen35moe	meta	arch_registry
@@ -281,6 +283,7 @@ gate-gpu-exaone-kld	family	exaone-moe	e2e	graph_fault+attn_gqa+moe_route
 gate-gpu-exaone-serve	family	exaone-moe	serve	seats_serve_engine+serve_toolcall
 gate-gpu-exaone-twocard	family	exaone-moe	tier	tier_legs+placement_sizing+drafts_mtp
 gate-kimi-k3-tokenizer	family	kimi-k3	tokenizer	tokenizer_jinja
+gate-hy4-tokenizer	family	hy_v4_flash	tokenizer	tokenizer_jinja+serve_toolcall
 # dfl-wire
 gate-gpu-raon1-dflash	family	raon1	draft	drafts_dspark
 gate-kimi-k3-meta	family	kimi-k3	meta	arch_registry
@@ -294,3 +297,8 @@ gate-gpu-kimik3-place	family	kimi-k3	load	weights_load+placement_sizing+tier_leg
 gate-gpu-kimik3-serve	family	kimi-k3	serve	seats_serve_engine+serve_toolcall
 gate-quantize-hf	family	kimi-k3	e2e	quant_iq_writer
 gate-gpu-kimik3-imatrix	family	kimi-k3	e2e	imatrix_collector+prompt_walks+attn_linear_gdn_kda+attn_latent_mla+moe_route
+gate-gpu-hy4-attn	family	hy_v4_flash	kernel	attn_gqa+attn_latent_mla+attn_linear_gdn_kda
+gate-gpu-hy4-e2e	family	hy_v4_flash	e2e	graph_fault+attn_latent_mla+attn_gqa+kv_pool_checkpoint+hc_engram_common+moe_route+tier_legs+elem_kernels+head_sample
+gate-gpu-hy4-pp	family	hy_v4_flash	e2e	prompt_walks+attn_latent_mla+kv_pool_checkpoint+hc_engram_common+moe_route+elem_kernels
+gate-gpu-hy4-dsa	family	hy_v4_flash	kernel	attn_latent_mla+kv_pool_checkpoint
+gate-gpu-hy4-serve	family	hy_v4_flash	serve+ship	seats_serve_engine+serve_toolcall

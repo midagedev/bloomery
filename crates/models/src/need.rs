@@ -109,6 +109,9 @@ pub enum Need {
     TokenPool { heads: u32, d: u32, pool: u32 },
     /// A LayerNorm with a gain and a bias on each index key.
     KeyLayerNorm,
+    /// A top-k over softmax-weighted pools of the raw positions' projected keys, RMS-normed and
+    /// rotated at the pool start, the query's own pool kept: `heads` heads x `d`, pool `pool`.
+    GatedPool { heads: u32, d: u32, pool: u32 },
     /// A top-k over mean pools of the raw positions' keys, RMS-normed and
     /// rotated (`rope` values) at the pool's first position, the heads summed.
     MeanPool {
@@ -206,6 +209,9 @@ pub enum Need {
     /// Chart-constrained hyper-connections of `streams` streams, every sublayer its own mix, the
     /// streams collapsed by `collapse`.
     HcChart { streams: u32, collapse: Collapse },
+    /// Identity-comb hyper-connections of `streams` streams (no comb; every sublayer its own pre and
+    /// post mix), the streams collapsed by `collapse`.
+    HcIdentity { streams: u32, collapse: Collapse },
     /// Gated-residual hyper-connections of `streams` streams through a
     /// `rank`-value bottleneck.
     HcGated { streams: u32, rank: u32 },
@@ -225,8 +231,13 @@ pub enum Need {
     /// Each sublayer's output weight-normed at `eps` before it joins the stream, scaled by
     /// `add` (mixer, feed-forward block) when it does.
     Sandwich { eps: f32, add: [f32; 2] },
+    /// Each sublayer's output weight-normed at `eps` before the hyper-connection's post mix adds it.
+    HcSandwich { eps: f32 },
     /// An engram site whose gate reads `row`-value rows.
     Engram { row: u32 },
+    /// An engram site over a token map with dead tokens, whose rows pass through a norm and a fused
+    /// key and value projection of `row` values before the gate, and whose delta is masked per token.
+    EngramMasked { row: u32 },
     /// A model with no engram site, for a program that runs one.
     NoEngram,
     /// A per-layer n-gram embedding site whose gate reads `row`-value rows,
@@ -354,6 +365,10 @@ impl fmt::Display for Need {
                 write!(f, "token-pool indexer: {heads} heads x {d}, pool {pool}")
             }
             Need::KeyLayerNorm => f.write_str("a LayerNorm with a bias on the index keys"),
+            Need::GatedPool { heads, d, pool } => write!(
+                f,
+                "gated-pool indexer: {heads} heads x {d}, pool {pool}, softmax-weighted pooled keys RMS-normed and roped at the pool start, the query's own pool kept"
+            ),
             Need::MeanPool {
                 heads,
                 d,
@@ -532,6 +547,10 @@ impl fmt::Display for Need {
                 f,
                 "chart-constrained hyper-connections of {streams} streams, collapse {collapse:?}"
             ),
+            Need::HcIdentity { streams, collapse } => write!(
+                f,
+                "identity-comb hyper-connections of {streams} streams, collapse {collapse:?}"
+            ),
             Need::HcGated { streams, rank } => write!(
                 f,
                 "gated-residual hyper-connections of {streams} streams, rank {rank}"
@@ -557,7 +576,15 @@ impl fmt::Display for Need {
                 f,
                 "sandwich norms: each sublayer's output weight-normed at {eps}, then added scaled by {add:?}"
             ),
+            Need::HcSandwich { eps } => write!(
+                f,
+                "sandwich norms: each sublayer's output weight-normed at {eps} before the hyper-connection post mix"
+            ),
             Need::Engram { row } => write!(f, "an engram gate of {row}-value rows"),
+            Need::EngramMasked { row } => write!(
+                f,
+                "an engram site over a token map with dead tokens: normed rows through a fused key and value projection to a {row}-value gate, the delta masked per token"
+            ),
             Need::NoEngram => f.write_str("a model without engram sites"),
             Need::Ple {
                 row,
@@ -781,12 +808,38 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                             streams: hc.streams,
                             collapse,
                         },
+                        HcKind::Identity { collapse, .. } => Need::HcIdentity {
+                            streams: hc.streams,
+                            collapse,
+                        },
                         HcKind::Gated { rank } => Need::HcGated {
                             streams: hc.streams,
                             rank,
                         },
                     });
                 }
+            }
+            Residual::HcSandwich { eps } => {
+                if let Some(hc) = spec.hc {
+                    at(match hc.kind {
+                        HcKind::Mhc { .. } => Need::Hc {
+                            streams: hc.streams,
+                        },
+                        HcKind::Chart { collapse, .. } => Need::HcChart {
+                            streams: hc.streams,
+                            collapse,
+                        },
+                        HcKind::Identity { collapse, .. } => Need::HcIdentity {
+                            streams: hc.streams,
+                            collapse,
+                        },
+                        HcKind::Gated { rank } => Need::HcGated {
+                            streams: hc.streams,
+                            rank,
+                        },
+                    });
+                }
+                at(Need::HcSandwich { eps });
             }
             Residual::AlphaBeta { eps } => {
                 at(Need::AlphaBeta { eps });
@@ -806,7 +859,13 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             }
         }
         if layer.extras.contains(&Extra::Engram) {
-            at(Need::Engram { row: spec.hidden });
+            at(match spec.engram {
+                Some(EngramSpec {
+                    rule: NgramRule::EngramMasked,
+                    ..
+                }) => Need::EngramMasked { row: spec.hidden },
+                _ => Need::Engram { row: spec.hidden },
+            });
         }
         if layer.extras.contains(&Extra::Ple)
             && let Some(EngramSpec {
@@ -846,7 +905,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             (HcMix::Lagged, Collapse::LastMix) => {}
             (mix, collapse) => model(Need::HcWiring { mix, collapse }),
         },
-        Some(HcKind::Chart { .. }) => {}
+        Some(HcKind::Chart { .. } | HcKind::Identity { .. }) => {}
         Some(HcKind::Gated { rank }) => model(Need::HcGatedHead { rank }),
         None => {}
     }
@@ -915,6 +974,17 @@ fn select_needs(select: &Selector, at: &mut impl FnMut(Need)) {
             });
             at(Need::KeyLayerNorm);
         }
+        Selector::TokenPool {
+            heads,
+            d,
+            pool,
+            rule: PoolRule::Gated { .. },
+            ..
+        } => at(Need::GatedPool {
+            heads: *heads,
+            d: *d,
+            pool: *pool,
+        }),
         Selector::TokenPool {
             heads,
             d,

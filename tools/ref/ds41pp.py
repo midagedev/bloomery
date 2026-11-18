@@ -94,7 +94,7 @@ KV_APPEND = "ds41_kv_norm_rope_append"
 EVENTS = ("cuEventRecord", "cuStreamWaitEvent")
 ATTN = {"ds41_attn_seg", "ds41_attn_seg_sel", "ds41_attn_seg_stage", "ds41_attn_seg_sel_stage",
         "ds41_attn_merge", "ds41_ring_commit", KV_APPEND, "kv_norm_rope_append"}
-SMALL = {NORM, "rms_norm", "q3k_quantize_q8_1", "ds41_rows_to_tokens", "ds41_groups_to_tokens",
+SMALL = {NORM, "rms_norm", "q3k_quantize_q8_1", "token_major", "ds41_groups_to_tokens",
          ROPE, HC_PRE, "ds41_hc_pre_f32", HC_PRE_GROUPS, HC_POST}
 SOURCE = {"ds41_comp_pool", "ds41_comp_rows", "ds41_index_key", "ds41_indexer_score", "ds41_indexer_topk"}
 ROUTE_TAIL = {"ds41_router", "ds41_router_scores", "ds41_router_pick", PLACES}
@@ -1234,9 +1234,9 @@ class Synth:
         for a, b in cuts:
             for _ in range(a, b):
                 self.launch("ds41_glue_engram_rows", "engram")
-            for name in ("q3k_quantize_q8_1", "q3k_gemv") + (("ds41_rows_to_tokens",) if b - a > 1 else ()):
+            for name in ("q3k_quantize_q8_1", "q3k_gemv") + (("token_major",) if b - a > 1 else ()):
                 self.launch(name, "engram")
-            for name in ("ds41_engram_key_norm", "ds41_engram_gate", FOLD):
+            for name in ("engram_key_norm", "engram_gate", FOLD):
                 self.launch(name, "engram")
 
     def sub_pre(self, ly, latent, unit):
@@ -1267,7 +1267,7 @@ class Synth:
             if ly["keys"]:
                 self.launch("q3k_quantize_q8_1", t("small"))
                 self.launch("q3k_gemv", t("source + indexer"))
-                self.launch("ds41_rows_to_tokens", t("small"))
+                self.launch("token_major", t("small"))
                 self.launch("ds41_index_key", t("source + indexer"))
         self.launch(KV_APPEND, t("attention"))
         if latent:

@@ -352,6 +352,19 @@ impl Gguf {
         Self::open_sized(path.as_ref(), weights, private, false)
     }
 
+    /// [`Gguf::open`] for one shard of a split set read on its own, as the split opens it: bloomery's own value types are sized
+    /// (a tensor of type id 43 takes its meaning from the shard's extent, [`id43`]), where `open` refuses them by name.
+    /// A reader that needs one shard's header and placement alone (the fixture fetch, which holds a set's shards as sparse
+    /// files before any split is whole) opens it so.
+    pub fn open_split_shard(path: impl AsRef<Path>) -> Result<Gguf, LoadError> {
+        Self::open_sized(
+            path.as_ref(),
+            Weights::Mapped { populate: false },
+            &[],
+            true,
+        )
+    }
+
     /// The open every entry point shares: `private` is empty except in
     /// [`Gguf::open_private`], and `own` (bloomery's own value types,
     /// [`OWN_ROWS`]) holds only for a [`Split`]'s shards.
@@ -2502,16 +2515,16 @@ mod private_tests {
             &other,
             &[],
             &[(
-                decl("o", vec![32, 2], GgmlType::Unknown(2008), 66),
+                decl("o", vec![32, 2], GgmlType::Unknown(2009), 66),
                 vec![0; 66],
             )],
         );
         assert!(matches!(
             Split::open(&other),
             Err(LoadError::Shard { ref source, .. })
-                if matches!(**source, LoadError::UnsupportedType { ty: GgmlType::Unknown(2008), .. })
+                if matches!(**source, LoadError::UnsupportedType { ty: GgmlType::Unknown(2009), .. })
         ));
-        for id in [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007] {
+        for id in [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008] {
             let table = [PrivateType {
                 id,
                 blck: 1,

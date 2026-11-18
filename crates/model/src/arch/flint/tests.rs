@@ -279,10 +279,17 @@ fn normalization_policy_is_architecture_specific_and_bias_is_selection_only() {
                 assert_eq!(shape.rule.bias, bias);
                 let refusal = models::shape::select_router(shape).unwrap_err().why;
                 if norm {
-                    assert!(matches!(
-                        refusal,
-                        models::shape::Refusal::RouterWidth { ref served } if served == &[256]
-                    ));
+                    // The widths the table serves this rule at are the table's own: a router row
+                    // another family adds at a new width joins the list, and this file's
+                    // 8-expert shape stays refused whatever the list holds.
+                    let mut served: Vec<u32> = Vec::new();
+                    for row in models::shape::ROUTERS.iter().filter(|r| r.runs(shape.rule)) {
+                        if !served.contains(&row.experts()) {
+                            served.push(row.experts());
+                        }
+                    }
+                    assert!(!served.is_empty() && !served.contains(&shape.experts));
+                    assert_eq!(refusal, models::shape::Refusal::RouterWidth { served });
                 } else {
                     assert_eq!(refusal, models::shape::Refusal::NoRouterRule);
                 }

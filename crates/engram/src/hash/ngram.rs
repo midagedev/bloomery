@@ -77,6 +77,11 @@ pub enum NgramError {
     #[error("this hash maps its ids through a token map; it has no raw-id window")]
     NotRawIds,
     #[error(
+        "this hash has no dead-aware mapped window (Hy4-flash's, `Hash::ple_mapped_from_keys`); its \
+         rows come from the window of its own key set"
+    )]
+    NotMappedDead,
+    #[error(
         "image span {index} ({span:?}) is malformed for a call of {tokens} tokens: {why}; spans \
          are non-empty, ascending, non-overlapping row ranges inside the call"
     )]

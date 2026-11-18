@@ -353,7 +353,7 @@ impl<'a> StackW<'a> {
 /// A resident routed stack as a prompt walk's route GEMM reads it
 /// ([`StackW::route`]).
 #[derive(Clone, Copy)]
-pub(crate) enum RouteW<'a> {
+pub enum RouteW<'a> {
     /// The grouped GEMM's type and the stack's words, over the unit's q8_1
     /// rows of 128 values (`GemmAct`).
     Grouped(GemmWeight, &'a DeviceTensor<u32>),
@@ -367,28 +367,28 @@ pub(crate) enum RouteW<'a> {
 /// down GEMM reads, and the down GEMM, each as the kernel table's GEMM entry
 /// of its stack's type reads it ([`StackW::route`]). The gate and up are one
 /// type, so one input form; the down's form is its own.
-pub(crate) struct RouteBlock<'a> {
-    pub(crate) gate: RouteW<'a>,
-    pub(crate) up: RouteW<'a>,
-    pub(crate) down: RouteW<'a>,
+pub struct RouteBlock<'a> {
+    pub gate: RouteW<'a>,
+    pub up: RouteW<'a>,
+    pub down: RouteW<'a>,
     /// Rows an expert of the gate and up: the SwiGLU's values a column.
-    pub(crate) ff: usize,
+    pub ff: usize,
     /// Rows an expert of the down.
-    pub(crate) hidden: usize,
+    pub hidden: usize,
 }
 
 /// The rows a [`RouteBlock`] reads and writes: the unit's normed rows in the
 /// form the gate and up read (the other absent), the gate and up outputs, the
 /// SwiGLU rows in the form the down reads (the other absent), and the down's
 /// output.
-pub(crate) struct RouteIo<'a> {
-    pub(crate) x128: Option<&'a GemmAct>,
-    pub(crate) x32: Option<&'a GemmAct32>,
-    pub(crate) g: &'a mut DeviceBuffer<f32>,
-    pub(crate) u: &'a mut DeviceBuffer<f32>,
-    pub(crate) h128: Option<&'a mut GemmAct>,
-    pub(crate) h32: Option<&'a mut GemmAct32>,
-    pub(crate) y: &'a mut DeviceBuffer<f32>,
+pub struct RouteIo<'a> {
+    pub x128: Option<&'a GemmAct>,
+    pub x32: Option<&'a GemmAct32>,
+    pub g: &'a mut DeviceBuffer<f32>,
+    pub u: &'a mut DeviceBuffer<f32>,
+    pub h128: Option<&'a mut GemmAct>,
+    pub h32: Option<&'a mut GemmAct32>,
+    pub y: &'a mut DeviceBuffer<f32>,
 }
 
 impl RouteBlock<'_> {
@@ -431,7 +431,7 @@ impl RouteBlock<'_> {
         clippy::too_many_arguments,
         reason = "the card, the two GEMM kernel sets, the table and its column rule, the slots, the rows and their rule, and the fault sink (rust-quality R8)"
     )]
-    pub(crate) fn enqueue_rule(
+    pub fn enqueue_rule(
         &self,
         gpu: &Gpu,
         (gemm, g32): (Option<&GemmKernels>, &Gemm32Kernels),
@@ -828,7 +828,7 @@ impl<'a> LegStacks<'a> {
     /// GEMM entry, as one [`RouteBlock`] of `ff` rows a gate and up expert
     /// and `hidden` a down expert. A stack no route GEMM reads is refused by
     /// name.
-    pub(crate) fn block(&self, ff: usize, hidden: usize) -> Result<RouteBlock<'a>, GpuError> {
+    pub fn block(&self, ff: usize, hidden: usize) -> Result<RouteBlock<'a>, GpuError> {
         let one = |st: &LegStack<'a>| {
             st.w.route(st.ty).ok_or_else(|| GpuError::Tensor {
                 what: WHAT,

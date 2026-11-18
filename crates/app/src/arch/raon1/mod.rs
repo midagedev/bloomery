@@ -30,7 +30,7 @@ impl Keep for Body {
     /// An RDA layer's state holds the position it stands at alone: a cut
     /// keeps that position, or nothing.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
-        if n >= m.pos() { m.pos() } else { 0 }
+        crate::keep_where_it_stands(m, n)
     }
 
     /// Back to empty at 0 — a reset; the model's own position takes nothing

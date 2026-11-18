@@ -87,6 +87,51 @@ pub(crate) fn block_stem(name: &str, n_layer: usize) -> Option<(usize, &str)> {
     Some((layer, stem))
 }
 
+/// Every tensor of `split` is held in a type the reader runs its stem in (`allowed`, the stem
+/// table of the architecture it reads): the first tensor of another type, by name, with the
+/// types the stem takes and how many more there are, refused as the `reader`'s. A stem the table
+/// does not hold is not this check's: the layer groups and the classifier list it.
+pub(crate) fn types_agree(
+    split: &Split,
+    blocks: usize,
+    reader: &str,
+    allowed: impl Fn(&str) -> Option<&'static [GgmlType]>,
+) -> Result<(), PlacementError> {
+    let mut off: Vec<(String, String)> = Vec::new();
+    for (_, t) in split.iter_tensors() {
+        let stem = block_stem(&t.name, blocks).map_or(t.name.as_str(), |(_, stem)| stem);
+        let Some(allowed) = allowed(stem) else {
+            continue;
+        };
+        if !allowed.contains(&t.ty) {
+            let list: Vec<String> = allowed.iter().map(ToString::to_string).collect();
+            off.push((
+                t.name.clone(),
+                format!(
+                    "{} is {} (the {reader} reader runs {stem} as {})",
+                    t.name,
+                    t.ty,
+                    list.join(" or ")
+                ),
+            ));
+        }
+    }
+    match off.first() {
+        None => Ok(()),
+        Some((name, _)) => Err(PlacementError::Tensor {
+            name: name.clone(),
+            detail: format!(
+                "is of a type the {reader} reader does not run the tensor in ({} such: {})",
+                off.len(),
+                off.iter()
+                    .map(|(_, d)| d.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }),
+    }
+}
+
 /// The role and layer of `name` in a family whose layer `l` carries the stem groups of
 /// `groups_of(l)`: the model-level three, else a `blk.{layer}.{stem}` below `n_layer` whose stem a
 /// group of its layer holds; `None` for any other name.

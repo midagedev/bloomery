@@ -1,0 +1,26 @@
+# The Hy4-flash gate fixture's CPU node dumps (five real layers: the dense lead, a sparse layer with an engram site, a window layer, a
+# window layer with a site and the last sparse layer, on the real hidden of 3,072 with 512 routed experts of ff 256 and the real 120,832-id
+# vocabulary: 3.32 GB in one shard [derived: the plan's tensor bytes, 3,316,726,756, from `fixture plan`], /models/fixtures/hy4),
+# `BLOOMERY_TIER=fixture just dump-ref-hy4`: the five prompts (32, 31, 30, 5 and 93 ids: the real file's four and a long one of the first
+# three in a row: past the fixture's top_k and window of 64 and ending on a partial pooling group, so it alone reaches the indexer's
+# selection, the window truncation and the pooled tail) from ONE load, into fx_ref_hy4_{a,b,c,d,e}. The phases run one after the other.
+# Predicted wall [derived from the code's MACs and the loader smoke below], seconds:
+#   load      3.32 GB mapped, from the page cache after `fixture generate`: 1.0-1.1 s measured by the no-lease probe on 2026-11-18
+#             (8 threads, hy4_dump on the fixture); a cold NVMe read would be ~2.5 s
+#   prefill   191 ids x 2 x ~0.71 GMAC a token (attention 71 M a sparse layer and 143 M a window layer, the routed block 32 M, a site's
+#             kv projection 24 M, the dense block 9 M, summed over the five layers) = 271 GFLOP, plus the head's 371 M MACs on the last
+#             row of each prompt; the probe's 93-id prompt took 0.5 s at 8 threads (0.26 TFLOP/s), so 32 threads: 0.4-1.0 s
+#   greedy    160 tokens, each reading ~1.5 GB (the trunk 0.67 GB Q8_0, the BF16 head 0.74 GB, 16 experts of four layers 0.05 GB); the
+#             loader smoke ran 25.5 ms a token at 8 threads, a DRAM-bound step: 15-26 ms at 32 threads, 2.4-4.2 s
+#   writes    a's and e's taps (rows up to 3,072 x 4 x 93 f32 = 4.6 MB each, ~36 nodes a layer, the probe's 93-id set 10 MB): ~60 MB for
+#             the five sets at ~0.5 GB/s: 0.2 s
+#   total     4-7 s, bound 1800 s. The one term derivation cannot fix is the 32-thread greedy step (15-26 ms); a run outside 4-9 s means
+#   the reduction is not DRAM-bound or the host is contended: read the dumper's per-prompt `greedy` seconds before the next dump.
+# What the run guarantees: CUDA hidden, the CPU lease held, the staging set installed only when each prompt's manifest carries its
+# `# complete` trailer. If the wall is inside the band the sets are installed and the next action is the body gates' first read of
+# them; outside it, no set is trusted until the per-prompt seconds are read.
+kind: exclusive
+reason: hy4_dump runs llama.cpp (PR #32517) on 32 CPU threads; beside a timed run or a gate batch it would take their cores, so it
+  holds the lease; why now: the fixture's oracle sets the Hy4-flash body gates read, and the first read of whether the vendor tree
+  opens our fixture file at all (round hy4r1)
+minutes: 0.1..1

@@ -1,0 +1,35 @@
+Hy4-flash oracle prompts: the text of each prompt and its token ids, one decimal id a line, no chat template and no BOS (the
+file's tokenizer adds none: llama-tokenize gives the same ids with and without --no-bos, which `hy4-oracle.sh --prompts` checks
+before it writes a file). A dump of this model's logits takes its ids from here and never tokenizes (tools/ref/cb_dump.cpp): a
+tokenizer difference would read as a kernel bug.
+
+Made once, on the box, by the tokenizer of the dump's own tree (llama.cpp PR #32517, "Model : add hy_v4_flash support", head
+0a054d0b02454c998e068381d15f3f6615bdd987, version 1.0.0-dev (build 12473, commit 0a054d0b0), CPU build, no patch) on shard 1 of
+Tencent's Hy4-flash-Q4_K_M GGUF (the vocabulary is in shard 1; the pre-tokenizer is `hy_v4`), by
+`MODEL=<shard 1> bash crates/tokenizer/tools/hy4-oracle.sh --prompts tools/ref/data/hy4`:
+
+    llama-tokenize -m <shard 1> -f <text> --ids --no-escape --log-disable     # "[id, id, ...]", written one id a line
+
+The texts hold no final newline (one would be an id) and no backslash. They are the four prompts of exaone-moe's set
+(tools/ref/data/exaone-moe, the same bytes and sha256), so every model's dump runs the same texts. Our tokenizer gives the same ids
+for all four: crates/tokenizer/tests/hy4.rs holds them (`hw_hy4_oracle_prompts_encode_to_their_pinned_ids`), beside the 112 cases of
+`hy4-ids.tsv`.
+
+    a  32 ids  English paragraph, cut after "coming home."   txt 139 bytes
+       ids b16c4628b32aa12e4b66350e3b3b26ffa7a40f96481e22c4e2f34fac1e01a083
+       text bcb98a9e563eabdcbd4a4c4cbb3e7b8de220e51006ba45c7bdbac07acc36149c
+    b  31 ids  Korean paragraph, cut after "단풍이"             txt 97 bytes
+       ids eff9cd2dd8a580a4c158fc971c8caae0e581c8f89bf5c13141cb5102f23f0bac
+       text 63ed34c308dcab881c36fef27c3d51bfc8d516ab3bd687424a33c44a0d159e22
+    c  30 ids  Rust function head, cut after `HashMap::new();` txt 115 bytes
+       ids 1ec6e1ff50273e64c93aa3113743b24660dbef48abfb69dd1d43a28b60d68706
+       text 7d7754436326bf2bfb1b90e76ea55382d33391535524220ca34808627be7689e
+    d  5 ids  "The capital of France is"                    txt 24 bytes
+       ids 4ea817650cb7ca876196e3c286286ac30f2bc41c61b859b70f914ac1cf77482e
+       text bbaff4d2ecd5892d4a442b0f53131641bf6e6f284761dd20fc0664bc97145762
+    e  93 ids  a, b and c in order (no text: the ids are the three files' lines in a row, `cat a.ids b.ids c.ids`)
+       ids fbcdb48d605f1321937f6ea41553fad89337b2819c9cec67833bb037d37098c8
+       the fixture's selector keeps top_k 64 cells and its window is 64, which a, b, c and d (at most 32 ids, 8 pools of 4) never
+       exceed. e has 93 ids = 23 pools of 4 and one id in a partial group, so it alone reaches three clauses: the selection (23
+       pools against the 15 plus the open group it picks), the window layers' truncation (the last row sees 64 of its 93 positions)
+       and the pooled tail (the one-id open group). `crates/tokenizer/tests/hy4.rs` holds it as the three in a row.

@@ -273,6 +273,56 @@ pub fn plan_names_the_slots(c: &Clauses, dir: &Path) -> Result<bool, GateError> 
     Ok(ok)
 }
 
+/// A server of two slots over the file at `--ctx` 2·[`Clauses::ctx`] in `<dir>/two-slots`,
+/// `more` adding the seat's own environment and arguments (it is given that directory): its
+/// address, the handle and its stderr log.
+pub fn two_slot_server(
+    c: &Clauses,
+    dir: &Path,
+    more: impl FnOnce(&Path, &mut std::process::Command, &mut Vec<String>) -> Result<(), GateError>,
+) -> Result<(Served, String, std::path::PathBuf), GateError> {
+    let d = dir.join("two-slots");
+    std::fs::create_dir_all(&d)?;
+    let file = ref_model_path()?;
+    let (mut cmd, mut all) = seat(c).command(&file)?;
+    let total = (2 * c.ctx).to_string();
+    for a in ["--port", "0", "--ctx", &total, "--parallel", "2"] {
+        all.push(a.to_owned());
+    }
+    more(&d, &mut cmd, &mut all)?;
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+    let mut s = Served::spawn_cmd(cmd, &all, &d)?;
+    let err_log = d.join("server.err");
+    let addr = s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1))?;
+    Ok((s, addr, err_log))
+}
+
+/// The slot a `/completion` answer ran on.
+pub fn slot_of(v: &serde_json::Value) -> Result<u64, GateError> {
+    Ok(v["id_slot"]
+        .as_u64()
+        .ok_or("a /completion answer without id_slot")?)
+}
+
+/// `two_slots_load`: the `load` and `listening` records of the server [`two_slot_server`]
+/// started (its stderr log `err_log`) name two slots and a slot's [`Clauses::ctx`].
+pub fn two_slots_load(c: &Clauses, err_log: &Path) -> Result<bool, GateError> {
+    let mut ok = true;
+    let log = server_log(err_log, c.kinds)?;
+    let (load, listen) = (log.one(c.load)?, log.one(c.listening)?);
+    let held = load.u64("slots")? == 2
+        && load.u64("ctx")? == c.ctx
+        && listen.u64("slots")? == 2
+        && listen.u64("ctx")? == c.ctx;
+    println!(
+        "two slots: load {:?}; listening {:?} {held}",
+        load.line(),
+        listen.line()
+    );
+    check(&mut ok, "two_slots_load", held);
+    Ok(ok)
+}
+
 /// The clauses on one server: `load_and_listen` and the chat; the server is
 /// stopped at the end.
 pub fn served(c: &Clauses, dir: &Path) -> Result<bool, GateError> {

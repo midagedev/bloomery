@@ -946,68 +946,23 @@ mod gate {
         dir: &Path,
         mmproj: Option<&Path>,
     ) -> Result<(Served, String, PathBuf), GateError> {
-        let d = dir.join("two-slots");
-        let save = d.join("save");
-        std::fs::create_dir_all(&save)?;
-        let file = ref_model_path()?;
-        let (mut cmd, mut all) = seat(c).command(&file)?;
-        cmd.env(bloomery_levers::RESIDENCY, "off");
-        cmd.env(bloomery_levers::PREFILL_GROUP, "1");
-        let total = (2 * c.ctx).to_string();
-        let save = save
-            .to_str()
-            .ok_or("the gate's directory is not UTF-8")?
-            .to_owned();
-        for a in [
-            "--port",
-            "0",
-            "--ctx",
-            &total,
-            "--parallel",
-            "2",
-            "--slot-save-path",
-            &save,
-        ] {
-            all.push(a.to_owned());
-        }
-        if let Some(m) = mmproj {
-            all.push("--mmproj".to_owned());
-            all.push(
-                m.to_str()
-                    .ok_or("the --mmproj path is not UTF-8")?
-                    .to_owned(),
-            );
-        }
-        let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        let mut s = Served::spawn_cmd(cmd, &all, &d)?;
-        let err_log = d.join("server.err");
-        let addr = s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1))?;
-        Ok((s, addr, err_log))
-    }
-
-    /// The slot a `/completion` answer ran on.
-    fn slot_of(v: &Value) -> Result<u64, GateError> {
-        Ok(v["id_slot"]
-            .as_u64()
-            .ok_or("a /completion answer without id_slot")?)
-    }
-
-    /// `two_slots_load` (the module header).
-    fn two_slots_load(c: &serve_gate::Clauses, err_log: &Path) -> Result<bool, GateError> {
-        let mut ok = true;
-        let log = server_log(err_log, c.kinds)?;
-        let (load, listen) = (log.one(c.load)?, log.one(c.listening)?);
-        let held = load.u64("slots")? == 2
-            && load.u64("ctx")? == c.ctx
-            && listen.u64("slots")? == 2
-            && listen.u64("ctx")? == c.ctx;
-        println!(
-            "two slots: load {:?}; listening {:?} {held}",
-            load.line(),
-            listen.line()
-        );
-        check(&mut ok, "two_slots_load", held);
-        Ok(ok)
+        serve_gate::two_slot_server(c, dir, |d, cmd, all| {
+            let save = d.join("save");
+            std::fs::create_dir_all(&save)?;
+            cmd.env(bloomery_levers::RESIDENCY, "off");
+            cmd.env(bloomery_levers::PREFILL_GROUP, "1");
+            let save = save.to_str().ok_or("the gate's directory is not UTF-8")?;
+            all.extend(["--slot-save-path".to_owned(), save.to_owned()]);
+            if let Some(m) = mmproj {
+                all.push("--mmproj".to_owned());
+                all.push(
+                    m.to_str()
+                        .ok_or("the --mmproj path is not UTF-8")?
+                        .to_owned(),
+                );
+            }
+            Ok(())
+        })
     }
 
     /// `prefill_group_is_honoured` (the module header): the `load` record of the server
@@ -1071,10 +1026,10 @@ mod gate {
         let (_, v2) = greedy(url, q, N, &d, "slot_q", true)?;
         let (back, vb) = greedy(url, cont.clone(), N, &d, "slot_p_back", true)?;
         let (fresh, _) = greedy(url, cont.clone(), N, &d, "slot_p_fresh", false)?;
-        let apart = slot_of(&v1)? != slot_of(&v2)?;
-        let returned = slot_of(&va)? == slot_of(&v1)?
+        let apart = serve_gate::slot_of(&v1)? != serve_gate::slot_of(&v2)?;
+        let returned = serve_gate::slot_of(&va)? == serve_gate::slot_of(&v1)?
             && alone.cache_n == kept
-            && slot_of(&vb)? == slot_of(&v1)?
+            && serve_gate::slot_of(&vb)? == serve_gate::slot_of(&v1)?
             && back.cache_n == kept
             && back.tokens == alone.tokens;
         let uncached = back.tokens == fresh.tokens;
@@ -1082,9 +1037,9 @@ mod gate {
             "slots: P on slot {} and Q on slot {} apart {apart}; P back on slot {} kept {} of {} ids, \
              ids {:?} against the truth's {:?} (P plus its answer before Q, kept {}) {returned}; the \
              uncached {:?} {uncached}{}",
-            slot_of(&v1)?,
-            slot_of(&v2)?,
-            slot_of(&vb)?,
+            serve_gate::slot_of(&v1)?,
+            serve_gate::slot_of(&v2)?,
+            serve_gate::slot_of(&vb)?,
             back.cache_n,
             cont.len(),
             back.tokens,
@@ -1104,7 +1059,7 @@ mod gate {
         // restore that wrote none reads as other ids), then R plus its answer, which the slot with
         // the restored state takes.
         let (g, vr) = greedy(url, r.clone(), N, &d, "file_r", true)?;
-        let slot = slot_of(&vr)?;
+        let slot = serve_gate::slot_of(&vr)?;
         if slot > 1 {
             return Err(format!("the two-slot server ran a request on slot {slot}").into());
         }
@@ -1120,13 +1075,13 @@ mod gate {
         let (fresh, _) = greedy(url, cont, N, &d, "file_r_fresh", false)?;
         let held = st_save == 200
             && saved["n_saved"] == json!(positions)
-            && slot_of(&va)? == slot
+            && serve_gate::slot_of(&va)? == slot
             && alone.cache_n == positions
             && st_erase == 200
             && st_restore == 200
             && restored["n_restored"] == json!(positions)
             && restored["n_read"] == saved["n_written"]
-            && slot_of(&vback)? == other
+            && serve_gate::slot_of(&vback)? == other
             && back.cache_n == positions
             && back.tokens == alone.tokens;
         let uncached = back.tokens == fresh.tokens;
@@ -1134,11 +1089,11 @@ mod gate {
             "slot file: {positions} positions saved from slot {slot} and restored into slot {other}; \
              the continuation on slot {} kept {} ids with {:?} against the truth's {:?} (on slot {} \
              before the erase, kept {}) {held}; the uncached {:?} {uncached}{}",
-            slot_of(&vback)?,
+            serve_gate::slot_of(&vback)?,
             back.cache_n,
             back.tokens,
             alone.tokens,
-            slot_of(&va)?,
+            serve_gate::slot_of(&va)?,
             alone.cache_n,
             fresh.tokens,
             judged(real)
@@ -1260,7 +1215,7 @@ mod gate {
         let mmproj = mmproj.filter(|_| image);
         let (mut s, addr, err_log) = two_slot_server(c, dir, mmproj)?;
         let url = |p: &str| format!("http://{addr}{p}");
-        ok &= two_slots_load(c, &err_log)?;
+        ok &= serve_gate::two_slots_load(c, &err_log)?;
         ok &= prefill_group_is_honoured(c, dir, &err_log)?;
         ok &= slot_clauses(&url, dir, tier::Tier::from_env()? == tier::Tier::Real)?;
         ok &= tool_calls_follow_the_template(&url, dir)?;

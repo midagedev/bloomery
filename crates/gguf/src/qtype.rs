@@ -197,6 +197,11 @@ pub(crate) const OWN_ROWS: &[QRow] = &[
            card: Card::NONE },
     QRow { ty: T::MLX_A8H, name: "mlx_a8h", blck: 64, bytes: 68, dequant: true, host_act: H::None,
            card: Card::NONE },
+    // f8e4m3: ggml's F8_E4M3 as a file stores it under id 43 (`id43`): one byte a value, no tensor scale
+    // beside it (a scale of 1: `E4m3Rows::new(1.0)`), so it is a type of its own beside f8e4m3_rows, whose
+    // `<stem>.scale` is a file's demand. Tencent's Hy4 per-layer table is one, its rows scaled to the format's
+    // amax at write time and the scale dropped. No kernel reads it yet.
+    QRow { ty: T::F8E4M3, name: "f8e4m3", blck: 1, bytes: 1, dequant: true, host_act: H::None, card: Card::NONE },
 ];
 
 /// The build refuses an own row whose type `from_u32` does not name, whose tag ggml's table

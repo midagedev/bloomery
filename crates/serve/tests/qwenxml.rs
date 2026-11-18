@@ -24,9 +24,9 @@
 
 mod common;
 
-use common::{post, start_templated};
+use common::{msg, post, start_templated, tool_call as call};
 use serde_json::{Value, json};
-use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, ToolFormat, Tools};
+use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolFormat, Tools};
 use serve::glmxml::KvSpelling;
 use serve::qwenxml::{Framing, ParamKinds, QwenXmlError};
 use serve::reasoning::ReasoningFormat;
@@ -122,22 +122,6 @@ fn qwen(framing: Framing) -> Option<Tools> {
         framing,
         ParamKinds::of_tools(Some(&tools())),
     ))
-}
-
-fn call(index: usize, name: &str, arguments: &str) -> ToolCall {
-    ToolCall {
-        index,
-        name: name.to_owned(),
-        arguments: arguments.to_owned(),
-    }
-}
-
-fn msg(reasoning: &str, content: &str, calls: Vec<ToolCall>) -> Message {
-    Message {
-        reasoning: reasoning.to_owned(),
-        content: content.to_owned(),
-        calls,
-    }
 }
 
 /// `(name, prompt, format, raw output, expected message)`.
@@ -592,42 +576,16 @@ fn streamed(
     pieces: &[&str],
 ) -> Result<Message, MarkupError> {
     let mut p = ChatParser::with_tools(prompt, format, qwen(framing));
-    let mut total = Message::default();
-    let mut add = |d: Message| {
-        total.reasoning.push_str(&d.reasoning);
-        total.content.push_str(&d.content);
-        total.calls.extend(d.calls);
-    };
-    for piece in pieces {
-        add(p.try_push(piece, &[])?);
-    }
-    add(p.try_finish()?);
-    assert_eq!(&total, p.message(), "deltas sum to the message");
-    Ok(total)
+    common::sum_deltas(&mut p, pieces)
 }
 
 /// The fixtures parse to their messages, their arguments JSON objects.
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_qwen_fixtures_parse_to_expected_messages() {
-    let mut wrong = Vec::new();
-    for (name, prompt, format, raw, want) in fixtures() {
-        match streamed(Framing::Lines, prompt, format, &[raw]) {
-            Ok(got) if got == want => {
-                for c in &got.calls {
-                    let v: Value = serde_json::from_str(&c.arguments).expect("arguments are JSON");
-                    assert!(v.is_object(), "{name}: arguments are an object");
-                }
-            }
-            got => wrong.push(format!("{name}:\n  got  {got:?}\n  want {want:?}")),
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "{} fixture(s) wrong:\n{}",
-        wrong.len(),
-        wrong.join("\n")
-    );
+    common::check_fixtures(fixtures(), |prompt, format, pieces| {
+        streamed(Framing::Lines, prompt, format, pieces)
+    });
 }
 
 /// Markup that does not parse is a named error, never content and never a
@@ -635,19 +593,9 @@ fn hw_qwen_fixtures_parse_to_expected_messages() {
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_qwen_malformed_calls_are_named_errors() {
-    let mut wrong = Vec::new();
-    for (name, raw, want) in malformed() {
-        match streamed(Framing::Lines, ON, ReasoningFormat::Deepseek, &[raw]) {
-            Err(e) if e == MarkupError::Qwen(want.clone()) => {}
-            got => wrong.push(format!("{name}:\n  got  {got:?}\n  want Err({want:?})")),
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "{} case(s) wrong:\n{}",
-        wrong.len(),
-        wrong.join("\n")
-    );
+    common::check_malformed(malformed(), |pieces| {
+        streamed(Framing::Lines, ON, ReasoningFormat::Deepseek, pieces)
+    });
 }
 
 /// A message, or an error, never depends on how the text was cut: whole, a
@@ -656,27 +604,12 @@ fn hw_qwen_malformed_calls_are_named_errors() {
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_qwen_parse_does_not_depend_on_chunking() {
-    let cases = fixtures()
-        .into_iter()
-        .map(|(name, prompt, format, raw, want)| (name, prompt, format, raw, Ok(want)))
-        .chain(malformed().into_iter().map(|(name, raw, e)| {
-            (
-                name,
-                ON,
-                ReasoningFormat::Deepseek,
-                raw,
-                Err(MarkupError::from(e)),
-            )
-        }));
-    for (name, prompt, format, raw, want) in cases {
-        for pieces in common::every_chunking(raw, 1) {
-            assert_eq!(
-                streamed(Framing::Lines, prompt, format, &pieces),
-                want,
-                "{name}: {pieces:?}"
-            );
-        }
-    }
+    common::check_chunking(
+        fixtures(),
+        malformed(),
+        (ON, ReasoningFormat::Deepseek),
+        |prompt, format, pieces| streamed(Framing::Lines, prompt, format, pieces),
+    );
 }
 
 /// The first call a template that teaches no think span may open bare parses
@@ -1216,61 +1149,9 @@ fn start(script: &str) -> std::net::SocketAddr {
     start_templated(Box::new(ScriptedEngine::new(4096, script)), TEMPLATE)
 }
 
-fn tool_body(stream: bool) -> Value {
-    json!({
-        "model": "m",
-        "messages": [{"role": "user", "content": "weather and time?"}],
-        "temperature": 0,
-        "tools": tools(),
-        "stream": stream,
-    })
-}
-
-/// A streamed chat body folded back into `(finish_reason, message)`, call ids
-/// left out; `Err` with its message when the stream ended on an error event.
+/// A streamed chat body folded back ([`common::fold_stream`]) under this spelling's markup.
 fn fold_stream(body: &str) -> Result<(Value, Value), String> {
-    let mut reasoning = String::new();
-    let mut content = String::new();
-    let mut calls: Vec<Value> = Vec::new();
-    let mut finish = Value::Null;
-    for e in body.split("\n\n").filter_map(|e| e.strip_prefix("data: ")) {
-        if e == "[DONE]" {
-            continue;
-        }
-        let v: Value = serde_json::from_str(e).expect("chunk JSON");
-        if let Some(m) = v["error"]["message"].as_str() {
-            assert!(!body.contains("[DONE]"), "an error ends the stream: {body}");
-            return Err(m.to_owned());
-        }
-        let Some(c) = v["choices"].get(0) else {
-            continue;
-        };
-        if !c["finish_reason"].is_null() {
-            finish = c["finish_reason"].clone();
-        }
-        let d = &c["delta"];
-        if let Some(s) = d["reasoning_content"].as_str() {
-            reasoning.push_str(s);
-        }
-        if let Some(s) = d["content"].as_str() {
-            assert!(
-                !s.contains("<tool_call>") && !s.contains("<parameter="),
-                "markup reached delta.content: {s}"
-            );
-            content.push_str(s);
-        }
-        for tc in d["tool_calls"].as_array().into_iter().flatten() {
-            common::fold_call_delta(&mut calls, tc);
-        }
-    }
-    let mut m = json!({"content": content, "reasoning_content": reasoning});
-    m["calls"] = json!(
-        calls
-            .iter()
-            .map(|c| c["function"].clone())
-            .collect::<Vec<_>>()
-    );
-    Ok((finish, m))
+    common::fold_stream(body, &["<tool_call>", "<parameter="])
 }
 
 /// One call with its reasoning, streamed and not: `tool_calls` in OpenAI's
@@ -1280,7 +1161,11 @@ fn fold_stream(body: &str) -> Result<(Value, Value), String> {
 #[ignore = "gate: just gate-serve"]
 fn hw_qwen_chat_tool_calls_stream_and_non_stream() {
     let addr = start(ONE_CALL);
-    let r = post(addr, "/v1/chat/completions", &tool_body(false));
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &common::tool_body(tools(), false),
+    );
     assert_eq!(r.status, 200, "{}", r.body);
     let v = r.json();
     let c = &v["choices"][0];
@@ -1305,7 +1190,11 @@ fn hw_qwen_chat_tool_calls_stream_and_non_stream() {
             "{v}"
         );
     }
-    let r = post(addr, "/v1/chat/completions", &tool_body(true));
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &common::tool_body(tools(), true),
+    );
     assert_eq!(r.status, 200, "{}", r.body);
     let (finish, folded) = fold_stream(&r.body).expect("no error event");
     assert_eq!(finish, "tool_calls");
@@ -1412,7 +1301,7 @@ fn hw_a_call_ends_the_span_for_the_budget_and_the_loop_guard() {
                     );
                 }
             };
-            let mut chat = tool_body(false);
+            let mut chat = common::tool_body(tools(), false);
             chat["max_tokens"] = json!(1024);
             let r = post(addr, "/v1/chat/completions", &with(chat));
             assert_eq!(r.status, 200, "{drafting}, {extra}: {}", r.body);
@@ -1461,7 +1350,7 @@ fn hw_a_forced_call_follows_the_models_own_close() {
     let called = json!([{"name": "get_time", "arguments": "{}"}]);
     let served = json!([tools()[0], tools()[1]]);
     let addr = start(&format!("{REASONING}</think>"));
-    let mut body = tool_body(false);
+    let mut body = common::tool_body(tools(), false);
     body["tools"] = served.clone();
     body["tool_choice"] = named.clone();
     let r = post(addr, "/v1/chat/completions", &body);
@@ -1593,17 +1482,12 @@ fn hw_qwen_malformed_call_is_an_api_error() {
             "tool-call markup: tool call 0 is not closed",
         ),
     ] {
-        let addr = start(script);
-        let r = post(addr, "/v1/chat/completions", &tool_body(false));
-        assert_eq!(r.status, 500, "{}", r.body);
-        let m = r.json()["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
-        assert!(m.starts_with(want), "{m}");
-        let r = post(addr, "/v1/chat/completions", &tool_body(true));
-        let e = fold_stream(&r.body).expect_err("an error event");
-        assert!(e.starts_with(want), "{e}");
+        common::check_api_error(
+            start(script),
+            |stream| common::tool_body(tools(), stream),
+            want,
+            fold_stream,
+        );
     }
 }
 
@@ -1650,7 +1534,7 @@ fn hw_qwen_call_cut_by_the_limit_is_an_answer() {
             .iter()
             .map(|(name, arguments)| json!({"name": name, "arguments": arguments}))
             .collect();
-        let mut body = tool_body(false);
+        let mut body = common::tool_body(tools(), false);
         body["max_tokens"] = json!(tokens);
         let r = post(addr, "/v1/chat/completions", &body);
         assert_eq!(r.status, 200, "{read:?}: {}", r.body);

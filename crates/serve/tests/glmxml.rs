@@ -22,11 +22,11 @@
 
 mod common;
 
-use common::post;
+use common::{kv_scan as scan, kv_tools as tools, msg, post, tool_call as call};
 use serde_json::{Map, Value, json};
 use serve::callstream::CallPiece;
-use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolCall, ToolFormat, Tools};
-use serve::glmxml::{ArgTypes, KvError, KvSpelling};
+use serve::dsml::{ChatParser, MarkupError, Message, Spelling, ToolFormat};
+use serve::glmxml::{KvError, KvSpelling};
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
 
@@ -50,39 +50,6 @@ const FORMAT_NONE: &str = "Think.</think><tool_call>get_time</tool_call>";
 const AFTER_CLOSED: &str = "<tool_call>get_time</tool_call> after";
 const ANSWER: &str = "Hi.</think>Hello!";
 const NEAR_TAG: &str = "</think>a <tool_ca b <tool_call";
-
-fn tools() -> Value {
-    json!([
-        {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object",
-            "properties": {"location": {"type": "string"}, "days": {"type": "integer"}}}}},
-        {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}},
-        {"type": "function", "function": {"name": "save_note", "parameters": {"type": "object",
-            "properties": {"filter": {"type": "object"}, "text": {"type": "string"}}}}},
-    ])
-}
-
-fn scan(spelling: KvSpelling) -> Option<Tools> {
-    Some(Tools::KvMarkup(
-        spelling,
-        ArgTypes::of_tools(Some(&tools())),
-    ))
-}
-
-fn call(index: usize, name: &str, arguments: &str) -> ToolCall {
-    ToolCall {
-        index,
-        name: name.to_owned(),
-        arguments: arguments.to_owned(),
-    }
-}
-
-fn msg(reasoning: &str, content: &str, calls: Vec<ToolCall>) -> Message {
-    Message {
-        reasoning: reasoning.to_owned(),
-        content: content.to_owned(),
-        calls,
-    }
-}
 
 /// `(name, prompt, format, raw output, expected message)`.
 fn fixtures() -> Vec<(
@@ -322,59 +289,21 @@ fn streamed_as(
     pieces: &[&str],
 ) -> Result<Message, MarkupError> {
     let mut p = ChatParser::with_tools(prompt, format, scan(spelling));
-    let mut total = Message::default();
-    let mut add = |d: Message| {
-        total.reasoning.push_str(&d.reasoning);
-        total.content.push_str(&d.content);
-        total.calls.extend(d.calls);
-    };
-    for piece in pieces {
-        add(p.try_push(piece, &[])?);
-    }
-    add(p.try_finish()?);
-    assert_eq!(&total, p.message(), "deltas sum to the message");
-    Ok(total)
+    common::sum_deltas(&mut p, pieces)
 }
 
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_glm_fixtures_parse_to_expected_messages() {
-    let mut wrong = Vec::new();
-    for (name, prompt, format, raw, want) in fixtures() {
-        match streamed(prompt, format, &[raw]) {
-            Ok(got) if got == want => {
-                for c in &got.calls {
-                    let v: Value = serde_json::from_str(&c.arguments).expect("arguments are JSON");
-                    assert!(v.is_object(), "{name}: arguments are an object");
-                }
-            }
-            got => wrong.push(format!("{name}:\n  got  {got:?}\n  want {want:?}")),
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "{} fixture(s) wrong:\n{}",
-        wrong.len(),
-        wrong.join("\n")
-    );
+    common::check_fixtures(fixtures(), streamed);
 }
 
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_glm_malformed_calls_are_named_errors() {
-    let mut wrong = Vec::new();
-    for (name, raw, want) in malformed() {
-        match streamed(ON, ReasoningFormat::Deepseek, &[raw]) {
-            Err(e) if e == want => {}
-            got => wrong.push(format!("{name}:\n  got  {got:?}\n  want Err({want:?})")),
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "{} case(s) wrong:\n{}",
-        wrong.len(),
-        wrong.join("\n")
-    );
+    common::check_malformed(malformed(), |pieces| {
+        streamed(ON, ReasoningFormat::Deepseek, pieces)
+    });
 }
 
 /// A message, or an error, never depends on how the text was cut: whole, a
@@ -383,27 +312,12 @@ fn hw_glm_malformed_calls_are_named_errors() {
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_glm_parse_does_not_depend_on_chunking() {
-    let cases = fixtures()
-        .into_iter()
-        .map(|(name, prompt, format, raw, want)| (name, prompt, format, raw, Ok(want)))
-        .chain(malformed().into_iter().map(|(name, raw, e)| {
-            (
-                name,
-                ON,
-                ReasoningFormat::Deepseek,
-                raw,
-                Err(MarkupError::from(e)),
-            )
-        }));
-    for (name, prompt, format, raw, want) in cases {
-        for pieces in common::every_chunking(raw, 1) {
-            assert_eq!(
-                streamed(prompt, format, &pieces),
-                want,
-                "{name}: {pieces:?}"
-            );
-        }
-    }
+    common::check_chunking(
+        fixtures(),
+        malformed(),
+        (ON, ReasoningFormat::Deepseek),
+        streamed,
+    );
 }
 
 /// The calls parsed from the fixtures, rendered back through the template as
@@ -489,68 +403,20 @@ fn start(script: &str) -> std::net::SocketAddr {
     common::start_templated(Box::new(ScriptedEngine::new(4096, script)), TEMPLATE)
 }
 
-fn tool_body(stream: bool) -> Value {
-    json!({
-        "model": "m",
-        "messages": [{"role": "user", "content": "weather and time?"}],
-        "temperature": 0,
-        "tools": tools(),
-        "stream": stream,
-    })
-}
-
-/// A streamed chat body folded back into `(finish_reason, message)`, call ids
-/// left out; `Err` with its message when the stream ended on an error event.
+/// A streamed chat body folded back ([`common::fold_stream`]) under this spelling's markup.
 fn fold_stream(body: &str) -> Result<(Value, Value), String> {
-    let mut reasoning = String::new();
-    let mut content = String::new();
-    let mut calls: Vec<Value> = Vec::new();
-    let mut finish = Value::Null;
-    for e in body.split("\n\n").filter_map(|e| e.strip_prefix("data: ")) {
-        if e == "[DONE]" {
-            continue;
-        }
-        let v: Value = serde_json::from_str(e).expect("chunk JSON");
-        if let Some(m) = v["error"]["message"].as_str() {
-            assert!(!body.contains("[DONE]"), "an error ends the stream: {body}");
-            return Err(m.to_owned());
-        }
-        let Some(c) = v["choices"].get(0) else {
-            continue;
-        };
-        if !c["finish_reason"].is_null() {
-            finish = c["finish_reason"].clone();
-        }
-        let d = &c["delta"];
-        if let Some(s) = d["reasoning_content"].as_str() {
-            reasoning.push_str(s);
-        }
-        if let Some(s) = d["content"].as_str() {
-            assert!(
-                !s.contains("<tool_call>") && !s.contains("<|tool_call:start|>"),
-                "markup reached delta.content: {s}"
-            );
-            content.push_str(s);
-        }
-        for tc in d["tool_calls"].as_array().into_iter().flatten() {
-            common::fold_call_delta(&mut calls, tc);
-        }
-    }
-    let mut m = json!({"content": content, "reasoning_content": reasoning});
-    m["calls"] = json!(
-        calls
-            .iter()
-            .map(|c| c["function"].clone())
-            .collect::<Vec<_>>()
-    );
-    Ok((finish, m))
+    common::fold_stream(body, &["<tool_call>", "<|tool_call:start|>"])
 }
 
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_glm_chat_tool_calls_stream_and_non_stream() {
     let addr = start(ONE_CALL);
-    let r = post(addr, "/v1/chat/completions", &tool_body(false));
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &common::tool_body(tools(), false),
+    );
     assert_eq!(r.status, 200, "{}", r.body);
     let v = r.json();
     let c = &v["choices"][0];
@@ -570,7 +436,11 @@ fn hw_glm_chat_tool_calls_stream_and_non_stream() {
         calls,
         [json!({"name": "get_weather", "arguments": r#"{"location":"Seoul","days":3}"#})]
     );
-    let r = post(addr, "/v1/chat/completions", &tool_body(true));
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &common::tool_body(tools(), true),
+    );
     assert_eq!(r.status, 200, "{}", r.body);
     let (finish, folded) = fold_stream(&r.body).expect("no error event");
     assert_eq!(finish, "tool_calls");
@@ -595,26 +465,12 @@ fn hw_glm_malformed_call_is_an_api_error() {
             "tool-call markup: tool call 0 is not closed",
         ),
     ] {
-        let addr = start(script);
-        let r = post(
-            addr,
-            "/v1/chat/completions",
-            &common::unwatched(tool_body(false)),
+        common::check_api_error(
+            start(script),
+            |stream| common::unwatched(common::tool_body(tools(), stream)),
+            want,
+            fold_stream,
         );
-        assert_eq!(r.status, 500, "{}", r.body);
-        let m = r.json()["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .to_owned();
-        assert!(m.starts_with(want), "{m}");
-        let r = post(
-            addr,
-            "/v1/chat/completions",
-            &common::unwatched(tool_body(true)),
-        );
-        assert_eq!(r.status, 200, "{}", r.body);
-        let e = fold_stream(&r.body).expect_err("an error event");
-        assert!(e.starts_with(want), "{e}");
     }
 }
 
@@ -869,19 +725,7 @@ fn hw_solar_fixtures_parse_to_expected_messages() {
 #[test]
 #[ignore = "gate: just gate-serve"]
 fn hw_solar_malformed_calls_are_named_errors() {
-    let mut wrong = Vec::new();
-    for (name, raw, want) in solar_malformed() {
-        match solar_streamed(&[raw]) {
-            Err(e) if e == want => {}
-            got => wrong.push(format!("{name}:\n  got  {got:?}\n  want Err({want:?})")),
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "{} case(s) wrong:\n{}",
-        wrong.len(),
-        wrong.join("\n")
-    );
+    common::check_malformed(solar_malformed(), solar_streamed);
 }
 
 /// A message, or an error, never depends on how Solar's text was cut: the
@@ -1004,7 +848,11 @@ fn solar_server(script: &str) -> std::net::SocketAddr {
 #[ignore = "gate: just gate-serve"]
 fn hw_solar_chat_tool_calls_stream_and_non_stream() {
     let addr = solar_server(SOLAR_TWO);
-    let r = post(addr, "/v1/chat/completions", &tool_body(false));
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &common::tool_body(tools(), false),
+    );
     assert_eq!(r.status, 200, "{}", r.body);
     let v = r.json();
     let c = &v["choices"][0];
@@ -1023,7 +871,11 @@ fn hw_solar_chat_tool_calls_stream_and_non_stream() {
             json!({"name": "get_time", "arguments": "{}"}),
         ]
     );
-    let r = post(addr, "/v1/chat/completions", &tool_body(true));
+    let r = post(
+        addr,
+        "/v1/chat/completions",
+        &common::tool_body(tools(), true),
+    );
     assert_eq!(r.status, 200, "{}", r.body);
     let (finish, folded) = fold_stream(&r.body).expect("no error event");
     assert_eq!(finish, "tool_calls");

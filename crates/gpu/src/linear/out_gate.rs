@@ -19,6 +19,13 @@
 //! No silent failure: a non-finite `attn` or `g`, or a product that is not
 //! finite, raises [`FaultSite::F32Product`], and that value is written NaN.
 //! Under `ProjHead` a non-finite `g` makes every value of its head NaN.
+//!
+//! A head wider than [`HEAD`] ([`OutGateKernels::enqueue_out_gate_head`]):
+//! under `Proj` value `v` of head `h` of token `t` sits at
+//! `(t·n_head + h)·head + v` of all three buffers, which is the same index walk
+//! as `n_head·head / HEAD` heads of [`HEAD`], so the `Proj` entry runs it
+//! unchanged (Hy4-flash's gate is 256 a head). Under `ProjHead` the gate's index is the head's, so a
+//! head of another width is refused by name.
 
 use super::{HEAD, sigmoid};
 use crate::GpuError;
@@ -151,13 +158,27 @@ impl OutGateKernels {
     }
 
     /// Enqueue `y = attn · sigmoid(gate)` over `args.m` tokens of
-    /// `args.n_head` heads under the gate `args.kind`, `Proj` or `ProjHead`
-    /// (any other kind is refused by name): `⌈m·n_head·HEAD / 256⌉` blocks of
-    /// 256 threads. Asynchronous, allocation-free, capturable.
+    /// `args.n_head` heads of [`HEAD`] values under the gate `args.kind`,
+    /// `Proj` or `ProjHead` (any other kind is refused by name): `⌈m·n_head·HEAD
+    /// / 256⌉` blocks of 256 threads. Asynchronous, allocation-free,
+    /// capturable.
     pub fn enqueue_out_gate(
         &self,
         stream: &CudaStream,
         args: OutGateArgs<'_>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_out_gate_head(stream, args, HEAD)
+    }
+
+    /// [`OutGateKernels::enqueue_out_gate`] over heads of `head` values (module
+    /// doc): `Proj` at a positive multiple of [`HEAD`], launched as
+    /// `n_head·head / HEAD` heads of [`HEAD`]; `ProjHead` at [`HEAD`] only.
+    /// Another width is refused by name before the launch.
+    pub fn enqueue_out_gate_head(
+        &self,
+        stream: &CudaStream,
+        args: OutGateArgs<'_>,
+        head: usize,
     ) -> Result<(), GpuError> {
         let what = "enqueue_out_gate";
         let OutGateArgs {
@@ -175,10 +196,18 @@ impl OutGateKernels {
                 format!("need n_head, m >= 1, got n_head={n_head} m={m}"),
             ));
         }
-        let n = n_head * m * HEAD;
         let per_head = match kind {
-            OutGate::Proj => false,
-            OutGate::ProjHead => true,
+            OutGate::Proj if head > 0 && head.is_multiple_of(HEAD) => false,
+            OutGate::ProjHead if head == HEAD => true,
+            OutGate::Proj | OutGate::ProjHead => {
+                return Err(GpuError::shape(
+                    what,
+                    format!(
+                        "{kind:?} at {head} values a head: Proj takes a positive multiple of \
+                         {HEAD}, ProjHead {HEAD} (its gate is indexed by the {HEAD}-value head)"
+                    ),
+                ));
+            }
             OutGate::None | OutGate::Packed => {
                 return Err(GpuError::shape(
                     what,
@@ -188,6 +217,10 @@ impl OutGateKernels {
                 ));
             }
         };
+        // `Proj` at a wider head is the same elementwise walk over
+        // `n_head·head / HEAD` heads of HEAD.
+        let n_head = n_head * (head / HEAD);
+        let n = n_head * m * HEAD;
         let gates = if per_head { n_head * m } else { n };
         let lens = [
             ("attn", attn.len(), n),

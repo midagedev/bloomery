@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use serve::dsml::{ChatParser, MarkupError, Message, ToolCall, Tools};
+use serve::glmxml::{ArgTypes, KvSpelling};
+use serve::reasoning::ReasoningFormat;
 use serve::{Engine, FATAL_LINGER, MockEngine, Server, ServerConfig};
 
 pub const V41_TEMPLATE: &str = include_str!("../fixtures/v41-chat-template.jinja");
@@ -331,4 +334,210 @@ pub fn unwatched(mut body: Value) -> Value {
         .push(json!({"type": "function", "function": {"name": "note",
             "parameters": {"type": "object", "properties": {"tags": {"type": "array"}}}}}));
     body
+}
+
+/// A parsed call: the `index`-th of its message, `name` with `arguments` (JSON text).
+pub fn tool_call(index: usize, name: &str, arguments: &str) -> ToolCall {
+    ToolCall {
+        index,
+        name: name.to_owned(),
+        arguments: arguments.to_owned(),
+    }
+}
+
+/// A parsed message of `reasoning`, `content` and `calls`.
+pub fn msg(reasoning: &str, content: &str, calls: Vec<ToolCall>) -> Message {
+    Message {
+        reasoning: reasoning.to_owned(),
+        content: content.to_owned(),
+        calls,
+    }
+}
+
+/// The message `p` reads from `pieces` pushed in order and the finish, summed from the deltas
+/// each push and the finish return; the sum is the parser's own message.
+pub fn sum_deltas(p: &mut ChatParser, pieces: &[&str]) -> Result<Message, MarkupError> {
+    let mut total = Message::default();
+    let mut add = |d: Message| {
+        total.reasoning.push_str(&d.reasoning);
+        total.content.push_str(&d.content);
+        total.calls.extend(d.calls);
+    };
+    for piece in pieces {
+        add(p.try_push(piece, &[])?);
+    }
+    add(p.try_finish()?);
+    assert_eq!(&total, p.message(), "deltas sum to the message");
+    Ok(total)
+}
+
+/// A chat request at temperature 0 that lists `tools`, streamed or not.
+pub fn tool_body(tools: Value, stream: bool) -> Value {
+    json!({
+        "model": "m",
+        "messages": [{"role": "user", "content": "weather and time?"}],
+        "temperature": 0,
+        "tools": tools,
+        "stream": stream,
+    })
+}
+
+/// A streamed chat body folded back into `(finish_reason, message)`, call ids left out; `Err`
+/// with its message when the stream ended on an error event. A `delta.content` that holds any of
+/// `markup` (the spelling's call tags) is a failure: markup never reaches the content.
+pub fn fold_stream(body: &str, markup: &[&str]) -> Result<(Value, Value), String> {
+    let mut reasoning = String::new();
+    let mut content = String::new();
+    let mut calls: Vec<Value> = Vec::new();
+    let mut finish = Value::Null;
+    for e in body.split("\n\n").filter_map(|e| e.strip_prefix("data: ")) {
+        if e == "[DONE]" {
+            continue;
+        }
+        let v: Value = serde_json::from_str(e).expect("chunk JSON");
+        if let Some(m) = v["error"]["message"].as_str() {
+            assert!(!body.contains("[DONE]"), "an error ends the stream: {body}");
+            return Err(m.to_owned());
+        }
+        let Some(c) = v["choices"].get(0) else {
+            continue;
+        };
+        if !c["finish_reason"].is_null() {
+            finish = c["finish_reason"].clone();
+        }
+        let d = &c["delta"];
+        if let Some(s) = d["reasoning_content"].as_str() {
+            reasoning.push_str(s);
+        }
+        if let Some(s) = d["content"].as_str() {
+            assert!(
+                !markup.iter().any(|m| s.contains(m)),
+                "markup reached delta.content: {s}"
+            );
+            content.push_str(s);
+        }
+        for tc in d["tool_calls"].as_array().into_iter().flatten() {
+            fold_call_delta(&mut calls, tc);
+        }
+    }
+    let mut m = json!({"content": content, "reasoning_content": reasoning});
+    m["calls"] = json!(
+        calls
+            .iter()
+            .map(|c| c["function"].clone())
+            .collect::<Vec<_>>()
+    );
+    Ok((finish, m))
+}
+
+/// A table's wrong cases, listed together: a failure names every one.
+fn none_wrong(what: &str, wrong: &[String]) {
+    assert!(
+        wrong.is_empty(),
+        "{} {what} wrong:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+/// Every fixture `(name, prompt, format, raw, want)` read whole by `parse` (the prompt, the
+/// format and the pieces) is `want`, each of its calls' arguments a JSON object.
+pub fn check_fixtures<P: AsRef<str>, R: AsRef<str>>(
+    fixtures: Vec<(&str, P, ReasoningFormat, R, Message)>,
+    parse: impl Fn(&str, ReasoningFormat, &[&str]) -> Result<Message, MarkupError>,
+) {
+    let mut wrong = Vec::new();
+    for (name, prompt, format, raw, want) in fixtures {
+        match parse(prompt.as_ref(), format, &[raw.as_ref()]) {
+            Ok(got) if got == want => {
+                for c in &got.calls {
+                    let v: Value = serde_json::from_str(&c.arguments).expect("arguments are JSON");
+                    assert!(v.is_object(), "{name}: arguments are an object");
+                }
+            }
+            got => wrong.push(format!("{name}:\n  got  {got:?}\n  want {want:?}")),
+        }
+    }
+    none_wrong("fixture(s)", &wrong);
+}
+
+/// Every malformed case `(name, raw, want)` read whole by `parse` is the named error `want`,
+/// never content and never a guessed call.
+pub fn check_malformed<R: AsRef<str>, E: Clone + std::fmt::Debug + Into<MarkupError>>(
+    cases: Vec<(&str, R, E)>,
+    parse: impl Fn(&[&str]) -> Result<Message, MarkupError>,
+) {
+    let mut wrong = Vec::new();
+    for (name, raw, want) in cases {
+        match parse(&[raw.as_ref()]) {
+            Err(e) if e == want.clone().into() => {}
+            got => wrong.push(format!("{name}:\n  got  {got:?}\n  want Err({want:?})")),
+        }
+    }
+    none_wrong("case(s)", &wrong);
+}
+
+/// A message, or an error, never depends on how the text was cut ([`every_chunking`] at a tag
+/// stride of 1): every fixture, and every malformed case under `on` (the prompt and the format
+/// its errors are read at), reads the same through `parse` whole and cut.
+pub fn check_chunking<P: AsRef<str>, R: AsRef<str>, M: AsRef<str>, E: Into<MarkupError>>(
+    fixtures: Vec<(&str, P, ReasoningFormat, R, Message)>,
+    malformed: Vec<(&str, M, E)>,
+    on: (&str, ReasoningFormat),
+    parse: impl Fn(&str, ReasoningFormat, &[&str]) -> Result<Message, MarkupError>,
+) {
+    let check = |name: &str, (prompt, format): (&str, ReasoningFormat), raw: &str, want| {
+        for pieces in every_chunking(raw, 1) {
+            assert_eq!(parse(prompt, format, &pieces), want, "{name}: {pieces:?}");
+        }
+    };
+    for (name, prompt, format, raw, want) in fixtures {
+        check(name, (prompt.as_ref(), format), raw.as_ref(), Ok(want));
+    }
+    for (name, raw, e) in malformed {
+        check(name, on, raw.as_ref(), Err(e.into()));
+    }
+}
+
+/// The scripted server at `addr`, asked the tool request `body(stream)`, answers the markup it
+/// cannot parse with the named error `want`: a 500 without a stream, and an error event that ends
+/// a stream (`fold`, the spelling's [`fold_stream`]) on a 200 with one.
+pub fn check_api_error(
+    addr: SocketAddr,
+    body: impl Fn(bool) -> Value,
+    want: &str,
+    fold: impl Fn(&str) -> Result<(Value, Value), String>,
+) {
+    let r = post(addr, "/v1/chat/completions", &body(false));
+    assert_eq!(r.status, 500, "{}", r.body);
+    let m = r.json()["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    assert!(m.starts_with(want), "{m}");
+    let r = post(addr, "/v1/chat/completions", &body(true));
+    assert_eq!(r.status, 200, "{}", r.body);
+    let e = fold(&r.body).expect_err("an error event");
+    assert!(e.starts_with(want), "{e}");
+}
+
+/// The tools the key/value spellings' fixtures call: `get_weather` (a string `location`, an
+/// integer `days`), `get_time` (no arguments) and `save_note` (an object `filter`, a string
+/// `text`).
+pub fn kv_tools() -> Value {
+    json!([
+        {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object",
+            "properties": {"location": {"type": "string"}, "days": {"type": "integer"}}}}},
+        {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "save_note", "parameters": {"type": "object",
+            "properties": {"filter": {"type": "object"}, "text": {"type": "string"}}}}},
+    ])
+}
+
+/// The key/value markup scan of `spelling` over [`kv_tools`]' argument types.
+pub fn kv_scan(spelling: KvSpelling) -> Option<Tools> {
+    Some(Tools::KvMarkup(
+        spelling,
+        ArgTypes::of_tools(Some(&kv_tools())),
+    ))
 }

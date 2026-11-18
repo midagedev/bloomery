@@ -192,6 +192,8 @@ fn block_fault(rule: &Rule, blk: &[u8], y: &[f32], window: Window) -> Option<Str
             }
         }
         Rule::Nvfp4 { s_lo, .. } => nvfp4_fault(blk, y, *s_lo, window),
+        // `dequant_row` refuses the format's NaN codes; every other code is finite.
+        Rule::E4m3 => Ok(()),
         Rule::Uniform { half_width, .. } => {
             let limit = half_width * (1.0 + 1.0 / 128.0);
             if y[0].is_finite() && y[0].abs() <= limit {

@@ -17,9 +17,9 @@ use super::coverage::Available;
 use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
-    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, kimi_k3, lfm3, llama,
-    mimo2, minimaxm3, mistrallarge4, musespark, nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe,
-    raon1, solar2,
+    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, hy4, kimi_k3, lfm3,
+    llama, mimo2, minimaxm3, mistrallarge4, musespark, nemotron_h, nemotron_h_moe, qwen3moe,
+    qwen35moe, raon1, solar2,
 };
 use crate::placement::PlacementError;
 
@@ -41,6 +41,7 @@ pub const FIXTURE_SPECS: &[fn() -> crate::fixture::FixtureSpec] = &[
     lfm3::fixture::spec,
     raon1::fixture::spec,
     flint::fixture::spec,
+    hy4::fixture::spec,
 ];
 
 /// The fixture spec whose architecture string is `arch`, from [`FIXTURE_SPECS`].
@@ -466,6 +467,21 @@ pub static ROWS: &[ArchRow] = &[
             draft: DraftSource::None,
         })),
     },
+    ArchRow {
+        arch: Some(Arch::Hy4),
+        names: &["hy_v4_flash"],
+        read: Some(hy4::spec::read),
+        draft: None,
+        coverage: Some(hy4::spec::AVAILABLE),
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "hy4",
+            repo: "AngelSlim/Hy4-flash-GGUF",
+            quant: "Q4_K_M",
+            // The commit of the repo the checked-in header tables were read at.
+            rev: Some("7a02aed8b209878b519710835618b79e05930a24"),
+            draft: DraftSource::None,
+        })),
+    },
 ];
 
 /// Every profile's cut fixture, in table order.
@@ -668,6 +684,7 @@ mod tests {
             "muse-spark" => musespark::spec::read,
             "mistral-large4" => mistrallarge4::spec::read,
             "kimi-k3" | "kimi-k31" => kimi_k3::spec::read,
+            "hy_v4_flash" => hy4::spec::read,
             other => panic!("{other}: no reader is named for it"),
         }
     }
@@ -716,6 +733,7 @@ mod tests {
             Arch::MuseSpark,
             Arch::MistralLarge4,
             Arch::KimiK3,
+            Arch::Hy4,
         ] {
             let rows = ROWS.iter().filter(|r| r.arch == Some(arch)).count();
             assert_eq!(rows, 1, "{arch:?} is in {rows} rows");
@@ -763,7 +781,8 @@ mod tests {
                 "flint",
                 "muse-spark",
                 "mistral-large4",
-                "kimi-k3"
+                "kimi-k3",
+                "hy_v4_flash"
             ]
         );
         assert_eq!(archs_of(false), ["minimax-m3", "exaone-moe"]);

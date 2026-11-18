@@ -37,6 +37,7 @@ use crate::gemm::Gemm32Kernels;
 use crate::head::{Head, HostHead};
 use crate::host::StepLeg;
 use crate::host::handoff::HandoffSlots;
+use crate::host::placed::{PlacedHost, PlacedSide};
 use crate::host::run::HostRun;
 use crate::host::served::{ResidencyParts, TierBody};
 use crate::host::swap::Residency;
@@ -425,7 +426,7 @@ impl Instance {
         &mut self,
         b: &placed::Block<'_>,
         acts: &mut Acts,
-        side: &mut placed::Side,
+        side: (&mut PlacedSide, &mut placed::Side),
         hy: &mut Hybrid<HostRun>,
     ) -> Result<(), GpuError> {
         match self {
@@ -439,7 +440,7 @@ impl Instance {
         &mut self,
         b: &placed::Block<'_>,
         acts: &mut Acts,
-        side: &placed::Side,
+        side: &PlacedSide,
         hy: &Hybrid<HostRun>,
     ) -> Result<(), GpuError> {
         match self {
@@ -453,7 +454,7 @@ impl Instance {
         &mut self,
         b: &placed::Block<'_>,
         acts: &mut Acts,
-        side: &placed::Side,
+        side: (&PlacedSide, &placed::Side),
         (hy, update): (&mut Hybrid<HostRun>, &mut DeviceBuffer<f32>),
     ) -> Result<(), GpuError> {
         match self {
@@ -1434,12 +1435,21 @@ impl Body {
                     walk.close(l)?;
                 }
             }
-            Some(Placed { shell, side, .. }) => {
+            Some(Placed {
+                host:
+                    PlacedHost {
+                        shell,
+                        side: placed,
+                    },
+                side,
+                ..
+            }) => {
                 let mut leg = StepLeg::new(gpu.stream(), &mut shell.hybrid);
                 let mut step = placed::StepWalk {
                     walk,
                     layers,
                     router,
+                    placed,
                     side,
                     rule: (*act, scale),
                     latent: hp.latent,

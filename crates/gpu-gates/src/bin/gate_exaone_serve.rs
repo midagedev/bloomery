@@ -920,17 +920,13 @@ mod gate {
     /// `tool_call_round_trips` (the module header): the scripted engine over the file's own chat
     /// template, `serve_client::scripted_call`'s method.
     fn tool_call_round_trips(split: &Split, dir: &Path) -> Result<bool, GateError> {
-        let template = model::arch::spec(split)
-            .map_err(|e| format!("the header: {e}"))?
-            .spec
-            .chat
-            .template
-            .ok_or("the file carries no chat template")?;
+        use bloomery_gpu_gates::serve_client::{FUNCTION_TAG_CALL, file_template, scripted_call};
+        let template = file_template(split)?;
         let mut ok = true;
         check(
             &mut ok,
             "tool_call_round_trips",
-            bloomery_gpu_gates::serve_client::scripted_call(&template, dir)?,
+            scripted_call(&template, FUNCTION_TAG_CALL, dir)?,
         );
         Ok(ok)
     }

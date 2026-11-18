@@ -396,7 +396,7 @@ impl PleImage {
     pub fn of_spec(spec: &ModelSpec) -> PleImage {
         PleImage::of(spec.engram.as_ref().and_then(|e| match e.rule {
             NgramRule::Ple { image, .. } => Some(image),
-            NgramRule::Engram => None,
+            NgramRule::Engram | NgramRule::EngramMasked => None,
         }))
     }
 }

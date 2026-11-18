@@ -23,7 +23,7 @@ mod token_major_kernels {
         block = (256, 1, 1),
         requires = (x.len() >= rows * m, y.len() >= rows * m)
     )]
-    pub fn qwen3moe_token_major(x: &[f32], rows: u32, m: u32, mut y: DisjointSlice<f32>) {
+    pub fn token_major(x: &[f32], rows: u32, m: u32, mut y: DisjointSlice<f32>) {
         let i = thread::index_1d().get();
         let (rows, m) = (rows as usize, m as usize);
         if i >= rows * m {
@@ -77,9 +77,8 @@ impl TokenMajor {
         let m = launch_u32(what, "m", m)?;
         let prep = self
             .module
-            .prepare_qwen3moe_token_major(LaunchConfig1D::new(grid, 256, 0))?;
-        self.module
-            .qwen3moe_token_major(stream, &prep, x, rows, m, y)?;
+            .prepare_token_major(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module.token_major(stream, &prep, x, rows, m, y)?;
         Ok(())
     }
 }

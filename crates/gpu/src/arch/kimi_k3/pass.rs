@@ -49,6 +49,7 @@ use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
 use crate::card_slots::{CardAcc, Places};
 use crate::head::{HOST_HEAD_ROWS, Head};
 use crate::host::BatchLeg;
+use crate::host::placed::{PlacedHost, PlacedSide};
 use crate::host::run::HostRun;
 use crate::kquant::Act;
 use crate::latent_gated::{self, MlaDims};
@@ -542,6 +543,7 @@ struct PassWalk<'a> {
     dims: (&'a KdaDims, &'a MlaDims),
     layers: &'a mut [Layer],
     router: &'a mut Instance,
+    placed: &'a PlacedSide,
     side: &'a Side,
     /// The step's selection buffers on a load that selects, which a latent layer's rows reuse.
     step_sel: Option<&'a mut index::Sel>,
@@ -806,15 +808,15 @@ impl PassWalk<'_> {
                 &mut y,
             )?;
         }
-        let side = self.side;
+        let (placed, side) = (self.placed, self.side);
         let n_expert = self.n_expert;
         side.acc_k.enqueue_places(
             stream,
             &Places {
                 ids: &*p.ids,
                 n: m * used,
-                map: side.slots.buf(),
-                row_off: side.row_off[l],
+                map: placed.slots().buf(),
+                row_off: placed.row_off(l),
                 n_expert,
             },
             gpu.layer_sink(l)?,
@@ -829,7 +831,7 @@ impl PassWalk<'_> {
                         ids: &*p.ids,
                         n: m * used,
                         map: t.places(),
-                        row_off: side.row_off[l],
+                        row_off: placed.row_off(l),
                         n_expert,
                     },
                     gpu.layer_sink(l)?,
@@ -855,7 +857,7 @@ impl PassWalk<'_> {
         let (m, n, lat, used) = (self.m, self.n, self.latent, self.n_used);
         let rule = self.rule.0;
         let r = routed_of(self.layers, l)?;
-        let n_card = self.side.n_card[l];
+        let n_card = self.placed.n_card(l);
         let leg = self.router.leg();
         let p = &mut self.p;
         let mut kit = RowsKit {
@@ -921,7 +923,7 @@ impl PassWalk<'_> {
         let (m, n, lat, used) = (self.m, self.n, self.latent, self.n_used);
         let gpu = self.cx.gpu;
         let stream = gpu.stream();
-        let n_card = self.side.n_card[l];
+        let n_card = self.placed.n_card(l);
         let n_tier = tier.map_or(0, |t| t.k(l));
         let acc_k = &self.side.acc_k;
         if n_tier > 0 {
@@ -1022,14 +1024,14 @@ impl<'a> LayerProgram for PassProgram<'a, '_> {
     type Port = BatchLeg<'a, HostRun>;
 
     fn host_leg(&self, at: At) -> bool {
-        self.walk.side.hosted[at.layer]
+        self.walk.placed.hosted(at.layer)
     }
 
     /// A layer the card holds whole entire; a hosted one up to its download.
     fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
         self.walk.attn_half(l)?;
-        if !self.walk.side.hosted[l] {
+        if !self.walk.placed.hosted(l) {
             self.walk.whole(l)?;
             return self.walk.close();
         }
@@ -1037,14 +1039,14 @@ impl<'a> LayerProgram for PassProgram<'a, '_> {
     }
 
     fn shadow(&mut self, _port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        if !self.walk.side.hosted[at.layer] {
+        if !self.walk.placed.hosted(at.layer) {
             return Ok(());
         }
         self.walk.hosted_shadow(at.layer)
     }
 
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        if !self.walk.side.hosted[at.layer] {
+        if !self.walk.placed.hosted(at.layer) {
             return Ok(());
         }
         self.walk.hosted_back(port, at, self.tier)?;
@@ -1208,7 +1210,14 @@ impl super::Body {
             .as_mut()
             .ok_or(GpuError::state(PASS, "the placed side of a placed pass"))?;
         let Placed {
-            shell, side, pass, ..
+            host:
+                PlacedHost {
+                    shell,
+                    side: placed_side,
+                },
+            side,
+            pass,
+            ..
         } = placed;
         let pass = pass
             .as_deref_mut()
@@ -1216,7 +1225,7 @@ impl super::Body {
         // The card's routed block feeds the importance collector; a hosted layer's experts run on
         // the host tier, whose activations the card never holds.
         if crate::imatrix::collector().is_some()
-            && let Some(l) = side.hosted.iter().position(|&h| h)
+            && let Some(l) = placed_side.first_hosted()
         {
             return Err(GpuError::shape(
                 PASS,
@@ -1271,6 +1280,7 @@ impl super::Body {
             dims: (&*kd, &*md),
             layers: &mut layers[..],
             router,
+            placed: &*placed_side,
             side: &*side,
             step_sel: step.mla.sel.as_mut(),
             p: PassParts {

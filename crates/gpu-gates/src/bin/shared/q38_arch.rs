@@ -27,7 +27,7 @@ fn layers_of(spec: &ModelSpec) -> Result<Shape, GateError> {
         .position(|l| l.extras.contains(&Extra::Ple));
     let image = spec.engram.and_then(|e| match e.rule {
         NgramRule::Ple { image, .. } => image,
-        NgramRule::Engram => None,
+        NgramRule::Engram | NgramRule::EngramMasked => None,
     });
     Shape::from_layers(spec.layers.len(), attention, ple_layer, image)
 }

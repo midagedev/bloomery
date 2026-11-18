@@ -5,20 +5,20 @@
 //! ([`enqueue_embed_row`], `TableRows::enqueue`) at that token's offsets;
 //! `engram_wkv` runs over the chunk's columns in one launch
 //! ([`DenseKernels::enqueue_m`], column c the one-token launch on token c)
-//! and its row-major output is copied token-major ([`crate::transpose`]); the
+//! and its row-major output is copied token-major ([`bloomery_gpu::token_major`]); the
 //! key norm, the gate and the fold take the chunk's tokens in one launch
 //! each, token by token what their one-token launches write.
 
 use super::*;
 use crate::hc::HC_MAX_TOKENS;
 use crate::span::{span, span_mut};
-use crate::transpose::TransposeKernels;
+use bloomery_gpu::token_major::TokenMajor;
 
 const WHAT: &str = "deepseek41 GlueBatch";
 
 /// A chunk's engram scratch and the batch layout's per-token offsets.
 pub struct GlueBatch {
-    transpose: TransposeKernels,
+    transpose: TokenMajor,
     /// Tokens an image of the batch layout carries.
     tokens: usize,
     /// Per token of the image: its embedding row's first word, and its
@@ -97,7 +97,7 @@ impl Glue {
         let stream = gpu.stream();
         let wide = (HC_STREAMS + 1) * ROW;
         Ok(GlueBatch {
-            transpose: TransposeKernels::load(gpu.context())?,
+            transpose: TokenMajor::load(gpu.context())?,
             tokens: m,
             embd_at,
             engram_byte,

@@ -1,0 +1,781 @@
+{
+  "template": "tokenizer.chat_template of Hy4-flash-Q4_K_M-00001-of-00002.gguf (Tencent's official GGUF, the first shard), read from the GGUF header on the box: 17263 bytes, md5 bec49a793e2864b5e6751900152e988c; hy4-chat-template.jinja is those bytes (hy4-chat-template.source)",
+  "reference": "jinja2 3.1.6 (Python 3.14.3, on the lead's Mac in a throwaway venv), the HF chat-template environment of ik_llama.cpp tests/test-jinja.cpp (SandboxedEnvironment with trim_blocks, lstrip_blocks and the loopcontrols extension; tojson = json.dumps with ensure_ascii=False, indent=None, separators=None, sort_keys=False as defaults; globals strftime_now and raise_exception); each case rendered with the variables bloomery-serve's /apply-template passes (messages with a content array flattened to its text parts, add_generation_prompt default true, the mock's bos_token and eos_token, tools and reasoning_effort when not null, chat_template_kwargs merged); every body has its keys sorted at every level; a case jinja2 refused carries its error in place of a prompt. Script: crates/serve/tests/fixtures/render_hy4.py, run as `python3 render_hy4.py hy4-chat-template.jinja > hy4-renders.json`",
+  "cases": [
+    {
+      "name": "system and user",
+      "body": {
+        "messages": [
+          {
+            "content": "You are terse.",
+            "role": "system"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>You are terse.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "user only",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "three turns",
+      "body": {
+        "messages": [
+          {
+            "content": "What is the capital of France?",
+            "role": "user"
+          },
+          {
+            "content": "Paris.",
+            "role": "assistant"
+          },
+          {
+            "content": "And of Italy?",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>What is the capital of France?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>Paris.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>And of Italy?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "reasoning_effort no_think",
+      "body": {
+        "chat_template_kwargs": {
+          "reasoning_effort": "no_think"
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+    },
+    {
+      "name": "reasoning_effort low and a system turn",
+      "body": {
+        "messages": [
+          {
+            "content": "Be brief.",
+            "role": "system"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "low"
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>Be brief.<｜reasoning_mode:6124c78e｜>reasoning_effort:low<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "reasoning_effort max",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "max"
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:max<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "reasoning_effort outside the list",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "medium"
+      },
+      "error": "TemplateError: reasoning_effort error : medium, should be no_think/low/high/max"
+    },
+    {
+      "name": "reasoning_effort high through the kwargs and low on the body: the kwargs win",
+      "body": {
+        "chat_template_kwargs": {
+          "reasoning_effort": "high"
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "low"
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "past reasoning: only the turn after the last user keeps it",
+      "body": {
+        "add_generation_prompt": false,
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning_content": "The user greets.",
+            "role": "assistant"
+          },
+          {
+            "content": "Again?",
+            "role": "user"
+          },
+          {
+            "content": "Hello again!",
+            "reasoning_content": "The user repeats.",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>Hello!<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Again?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>The user repeats.</think:6124c78e>Hello again!<｜hy_end:6124c78e｜>"
+    },
+    {
+      "name": "reasoning takes precedence over reasoning_content",
+      "body": {
+        "add_generation_prompt": false,
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning": "first",
+            "reasoning_content": "second",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>first</think:6124c78e>Hello!<｜hy_end:6124c78e｜>"
+    },
+    {
+      "name": "no_think drops the reasoning of the last turn",
+      "body": {
+        "add_generation_prompt": false,
+        "chat_template_kwargs": {
+          "reasoning_effort": "no_think"
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning_content": "The user greets.",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>Hello!<｜hy_end:6124c78e｜>"
+    },
+    {
+      "name": "a generation prompt after an assistant turn adds none",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>Hello!<｜hy_end:6124c78e｜>"
+    },
+    {
+      "name": "raw last assistant: an open prefill",
+      "body": {
+        "add_generation_prompt": false,
+        "chat_template_kwargs": {
+          "raw_last_assistant": true
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello, ",
+            "reasoning_content": "kept out",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜>Hello, "
+    },
+    {
+      "name": "fallback strategy reasoning_toolcall_retry",
+      "body": {
+        "chat_template_kwargs": {
+          "fallback_strategy": "reasoning_toolcall_retry",
+          "reasoning_effort": "no_think"
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello, ",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>Hello, "
+    },
+    {
+      "name": "a system turn in the middle",
+      "body": {
+        "messages": [
+          {
+            "content": "First.",
+            "role": "system"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Second.",
+            "role": "system"
+          },
+          {
+            "content": "Again",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>First.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>Second.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Again<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "tools and a user turn",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather in Seoul?",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              },
+              "strict": true
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}}, \"required\": [\"location\"], \"type\": \"object\"}}\n{\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in Seoul?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "tools and a system turn",
+      "body": {
+        "messages": [
+          {
+            "content": "You help.",
+            "role": "system"
+          },
+          {
+            "content": "Weather in Seoul?",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "low",
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              },
+              "strict": true
+            },
+            "type": "function"
+          },
+          {
+            "description": "No wrapper.",
+            "name": "bare",
+            "parameters": {
+              "properties": {},
+              "type": "object"
+            },
+            "strict": false
+          },
+          {
+            "defer_loading": true,
+            "description": "Not listed.",
+            "name": "deferred",
+            "parameters": {
+              "type": "object"
+            }
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}}, \"required\": [\"location\"], \"type\": \"object\"}}\n{\"description\": \"No wrapper.\", \"name\": \"bare\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e>\n\nYou help.<｜reasoning_mode:6124c78e｜>reasoning_effort:low<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in Seoul?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "two calls, their results in the other order",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather and time in Seoul?",
+            "role": "user"
+          },
+          {
+            "content": "Checking both.",
+            "reasoning_content": "Two tools.",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "days": 3,
+                    "location": "Seoul"
+                  },
+                  "name": "get_weather"
+                },
+                "id": "call_a",
+                "type": "function"
+              },
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_b",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool",
+            "tool_call_id": "call_b"
+          },
+          {
+            "content": "{\"temp\": 21}",
+            "role": "tool",
+            "tool_call_id": "call_a"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              },
+              "strict": true
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}}, \"required\": [\"location\"], \"type\": \"object\"}}\n{\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather and time in Seoul?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Two tools.</think:6124c78e>Checking both.<tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>days</arg_key:6124c78e><arg_value:6124c78e>3</arg_value:6124c78e><arg_key:6124c78e>location</arg_key:6124c78e><arg_value:6124c78e>Seoul</arg_value:6124c78e></tool_call:6124c78e><tool_call:6124c78e>get_time</tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>{\"temp\": 21}</tool_response:6124c78e><tool_response:6124c78e>12:00</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "a tool result without an id",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_c",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool"
+          },
+          {
+            "content": "Thanks.",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Time?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_time</tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>12:00</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Thanks.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "tool calls kept with their reasoning, then a new user turn",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "reasoning_content": "Ask the clock.",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_f",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool",
+            "tool_call_id": "call_f"
+          },
+          {
+            "content": "It is noon.",
+            "reasoning_content": "Report it.",
+            "role": "assistant"
+          },
+          {
+            "content": "Thanks.",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Time?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Ask the clock.</think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_time</tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>12:00</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Report it.</think:6124c78e>It is noon.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Thanks.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "preserved_thinking off with tools",
+      "body": {
+        "chat_template_kwargs": {
+          "preserved_thinking": false
+        },
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "reasoning_content": "Ask the clock.",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_f",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool",
+            "tool_call_id": "call_f"
+          },
+          {
+            "content": "Thanks.",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Time?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_time</tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>12:00</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Thanks.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "non-ASCII, nested and typed arguments",
+      "body": {
+        "add_generation_prompt": false,
+        "messages": [
+          {
+            "content": "Note it.",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "filter": {
+                      "f": 1.5,
+                      "n": [
+                        1,
+                        2
+                      ],
+                      "ok": true,
+                      "q": "서울 ☃",
+                      "x": null
+                    },
+                    "text": "a<b & \"c\""
+                  },
+                  "name": "save_note"
+                },
+                "id": "call_d",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Save a note.",
+              "name": "save_note",
+              "parameters": {
+                "properties": {
+                  "filter": {
+                    "type": "object"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"Save a note.\", \"name\": \"save_note\", \"parameters\": {\"properties\": {\"filter\": {\"type\": \"object\"}, \"text\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Note it.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>save_note<arg_key:6124c78e>filter</arg_key:6124c78e><arg_value:6124c78e>{\"f\": 1.5, \"n\": [1, 2], \"ok\": true, \"q\": \"서울 ☃\", \"x\": null}</arg_value:6124c78e><arg_key:6124c78e>text</arg_key:6124c78e><arg_value:6124c78e>a<b & \"c\"</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜>"
+    },
+    {
+      "name": "string arguments",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{}",
+                  "name": "get_time"
+                },
+                "id": "call_e",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "error": "UndefinedError: 'str object' has no attribute 'items'"
+    },
+    {
+      "name": "a content array of text parts",
+      "body": {
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "Part one.",
+                "type": "text"
+              },
+              {
+                "text": "Part two.",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Part one.\nPart two.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+    },
+    {
+      "name": "a null content",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": null,
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_g",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_time</tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜>"
+    }
+  ]
+}

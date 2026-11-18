@@ -24,7 +24,6 @@ pub mod chain;
 pub mod compress;
 pub mod dense;
 pub mod draft;
-pub mod engram_gate;
 pub mod experts;
 pub mod experts_mxfp4;
 pub mod hc;
@@ -40,6 +39,5 @@ pub mod shared_routed;
 pub mod span;
 pub mod swap;
 pub mod tier_join;
-pub mod transpose;
 
 pub use body::NODE_FAMILY;

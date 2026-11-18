@@ -625,7 +625,7 @@ mod dense_kernels {
     /// output over `tokens` tokens ([`ColGroups`]: group `g`'s `total_rows ×
     /// m` row-major block at `total_rows · c0`): `dst[t·rows + r] =
     /// src[total_rows·c0 + (r0 + r)·m + (t − c0)]`, token `t` in group `g` —
-    /// each group's block what `transpose::ds41_rows_to_tokens` copies of
+    /// each group's block what `bloomery_gpu::token_major` copies of
     /// its own launch. One thread per value.
     #[kernel]
     #[launch_bounds(256)]

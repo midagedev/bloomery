@@ -17,6 +17,7 @@ pub mod forced_logits;
 pub mod gemma_embedding;
 pub mod gemma_embedding2;
 pub mod glm5next;
+pub mod hy4;
 pub mod kimi_k3;
 pub mod lfm3;
 pub mod llama;
@@ -64,6 +65,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (musespark::ARCH, musespark::FAMILIES),
     (mistrallarge4::ARCH, mistrallarge4::FAMILIES),
     (kimi_k3::ARCH, kimi_k3::FAMILIES),
+    (hy4::ARCH, hy4::FAMILIES),
     (exaone_moe::ARCH, exaone_moe::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),
@@ -303,7 +305,7 @@ mod tests {
         );
     }
 
-    /// The fixture families are the table of ten, each the mirror of one real
+    /// The fixture families are the table of eleven, each the mirror of one real
     /// family: its name is `fx-` and the real family's, and it takes the real
     /// family's architecture, ik build and consumers (for a real family of
     /// [`NEEDS_ENV`], recipes that open with `fixture-only.sh`), the fixture twin of its
@@ -328,6 +330,7 @@ mod tests {
             ("fx-ref-nemotron-moe-logits", 1),
             ("fx-lcpp-mistrallarge4", 2),
             ("fx-lcpp-kimi-k3", 4),
+            ("fx-lcpp-hy4", 5),
         ];
         let mut found: Vec<&str> = all()
             .filter(|f| f.name.starts_with("fx-") && !STANDALONE.contains(&f.name))

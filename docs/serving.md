@@ -546,6 +546,7 @@ last two. A flag the seat does not take is refused by name with the seat's usage
 | `minimaxm3` | N or `auto` | no, slots step in turn | yes | no | no | |
 | `mistrallarge4` | N or `auto` | no, slots step in turn | yes | no | yes (Pixtral) | |
 | `flint` | N or `auto` | | no | no | no | |
+| `hy4` | N or `auto` | no, slots step in turn | no | no | no | |
 | `musespark` | 1 | | yes | no | no | |
 | `solar2`, `nemotron`, `raon1`, `kimik3` | 1 | | no | no | no | |
 | `decide` | one request at a time | | no | yes | Clef only | `--head`, `--head-config` |
@@ -891,10 +892,12 @@ template uses is read from the call it renders, and a `tool_choice` that forces 
   maximum-effort header), on `/v1/chat/completions`, `/apply-template` and the Responses API's `reasoning.effort`;
   another word is a 400. `"none"` turns thinking off before the template, as llama-server does: the template reads
   `enable_thinking: false`, and the whole output lands in `content`. A template with no thinking switch but an effort
-  header (GLM-5.3's) gets `reasoning_effort: "low"` instead, and one line at start says so. Every other word asks for
+  header (GLM-5.3's) gets `reasoning_effort: "low"` instead, and one line at start says so; one that refuses a word it
+  does not know and takes its own word for no thinking (Hy4-flash's `no_think`) gets that word, which a request may
+  also name itself, and one line at start says so. Every other word asks for
   reasoning: a template whose thinking is off until `enable_thinking` is set (V4.1's) gets `enable_thinking: true`, and
   `max` also adds its maximum-effort header. A `chat_template_kwargs` `enable_thinking` in the same request wins.
-  `/props`' `thinking_off` names the template's case: `"switch"`, `"low_effort"` or `"neither"`. Unlike llama-server,
+  `/props`' `thinking_off` names the template's case: `"switch"`, `"low_effort"`, `"off_word"` or `"neither"`. Unlike llama-server,
   a request that names neither field keeps the template's own default (thinking is off for V4.1).
 - **`developer` messages** reach the template as `system`, as llama-server maps them, except on GPT-OSS's template.
 

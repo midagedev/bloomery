@@ -32,7 +32,7 @@
 //! other twice over: by `# model` and by `# fixture`.
 
 use crate::RefError;
-use gguf::{Gguf, LoadError, Value};
+use gguf::{LoadError, Split, Value};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -259,6 +259,28 @@ pub fn variant_set_name(tag: &str, base: &str) -> String {
     }
 }
 
+/// The fixture file `first_shard` opened as a split, which is what tells a scale-less F8 table (ggml's id 43, whose bytes only the
+/// extent of the tensor can tell from MXFP8's) from the other meaning of the id; a single shard's strict open refuses such a file.
+///
+/// # Errors
+/// [`RefError::Missing`] for a file or a shard of its split that is not there, [`RefError::Malformed`] for one that is not a
+/// readable GGUF header.
+fn open_split(first_shard: &Path, file: &str) -> Result<Split, RefError> {
+    Split::open(first_shard).map_err(|e| match e {
+        LoadError::Io(io) => {
+            RefError::missing(first_shard, format!("fixture: cannot open {file}: {io}"))
+        }
+        LoadError::MissingShard { path } => RefError::missing(
+            first_shard,
+            format!("fixture: cannot open {file}: split shard {path} is missing"),
+        ),
+        e => RefError::malformed(
+            format!("fixture: {file}"),
+            format!("not a readable GGUF header: {e}"),
+        ),
+    })
+}
+
 /// The variant the fixture file `first_shard` is: its `bloomery.fixture.variant` key, none on a base fixture
 /// and on a cut folder's shard (a folder fixture has no variants).
 ///
@@ -269,15 +291,7 @@ pub fn variant_of(first_shard: &Path) -> Result<Option<String>, RefError> {
         return Ok(None);
     }
     let file = first_shard.display().to_string();
-    let g = Gguf::open(first_shard).map_err(|e| match e {
-        LoadError::Io(io) => {
-            RefError::missing(first_shard, format!("fixture: cannot open {file}: {io}"))
-        }
-        e => RefError::malformed(
-            format!("fixture: {file}"),
-            format!("not a readable GGUF header: {e}"),
-        ),
-    })?;
+    let g = open_split(first_shard, &file)?;
     match g.value(KEY_VARIANT) {
         None => Ok(None),
         Some(Value::String(tag)) => Ok(Some(tag.clone())),
@@ -474,15 +488,7 @@ pub fn keys(first_shard: &Path) -> Result<String, RefError> {
         return folder_keys(first_shard);
     }
     let file = first_shard.display().to_string();
-    let g = Gguf::open(first_shard).map_err(|e| match e {
-        LoadError::Io(io) => {
-            RefError::missing(first_shard, format!("fixture: cannot open {file}: {io}"))
-        }
-        e => RefError::malformed(
-            format!("fixture: {file}"),
-            format!("not a readable GGUF header: {e}"),
-        ),
-    })?;
+    let g = open_split(first_shard, &file)?;
     let mut held: Vec<(&str, &Value)> = g
         .iter_kv()
         .filter(|(k, _)| k.starts_with(KEY_PREFIX))

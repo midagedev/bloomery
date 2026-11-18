@@ -599,18 +599,25 @@ impl ToolFormat {
     /// The markup a chat template teaches, read the way llama.cpp's
     /// autoparser reads it: the source's own spellings first (the key/value tags,
     /// Qwen3-Coder's with the framing its rendered call shows, the DSML token),
-    /// then a rendered assistant call for a
-    /// `<tool_call>` template the source cannot type by spelling — Hermes'
-    /// when some rendered `<tool_call>`…`</tool_call>` holds a JSON body
-    /// naming `name` and `arguments`. A template whose probe render fails
-    /// teaches nothing this server parses.
+    /// then a rendered assistant call for a template the source cannot type by
+    /// spelling — a key/value spelling whose whole call the render holds (Hy4's template
+    /// builds its tags from a suffix variable), or Hermes' when some rendered
+    /// `<tool_call>`…`</tool_call>` holds a JSON body naming `name` and `arguments`.
+    /// A template whose probe render fails teaches nothing this server parses.
     #[must_use]
     pub fn of_chat_template(t: &ChatTemplate) -> ToolFormat {
         let spelled = ToolFormat::spelled(t.source(), || probe_framing(t));
         if spelled != ToolFormat::Unparsed {
             return spelled;
         }
-        if probe_render(t).is_some_and(|p| hermes_markup(&p)) {
+        let Some(rendered) = probe_render(t) else {
+            return spelled;
+        };
+        if let Some(spelling) =
+            KvSpelling::of_rendered(&rendered, PROBE_NAME, PROBE_KEY, PROBE_VALUE)
+        {
+            ToolFormat::KvMarkup(spelling)
+        } else if hermes_markup(&rendered) {
             ToolFormat::Hermes
         } else {
             spelled
@@ -640,7 +647,8 @@ impl ToolFormat {
     }
 }
 
-/// The parameter and string value of the assistant call the probe renders.
+/// The function, parameter and string value of the assistant call the probe renders.
+const PROBE_NAME: &str = "get_weather";
 const PROBE_KEY: &str = "location";
 const PROBE_VALUE: &str = "Seoul";
 
@@ -654,7 +662,7 @@ fn probe_render(t: &ChatTemplate) -> Option<String> {
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "", "tool_calls": [
                 {"type": "function", "function": {
-                    "name": "get_weather", "arguments": {PROBE_KEY: PROBE_VALUE},
+                    "name": PROBE_NAME, "arguments": {PROBE_KEY: PROBE_VALUE},
                 }},
             ]},
         ]),
@@ -663,7 +671,7 @@ fn probe_render(t: &ChatTemplate) -> Option<String> {
     vars.insert(
         "tools".into(),
         json!([{"type": "function", "function": {
-            "name": "get_weather", "parameters": {
+            "name": PROBE_NAME, "parameters": {
                 "type": "object",
                 "properties": {PROBE_KEY: {"type": "string"}},
             },

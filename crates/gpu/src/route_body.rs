@@ -403,7 +403,10 @@ pub unsafe fn pick_body<
 /// entries' `launch_contract` literals and the module's constants are one
 /// source. The entry names are the PTX entry names, and `$p_router`,
 /// `$p_scores` and `$p_pick` the `prepare_*` launchers `#[cuda_module]`
-/// derives from them: a macro cannot join identifiers.
+/// derives from them: a macro cannot join identifiers. `refuse_nan` (a
+/// non-finite selection value writes NaN weights) and `floor` (the kept scores'
+/// sum is floored at `2^-14` before the division, the [`floor_divisor`] rule,
+/// instead of `1e-20` added to it) are optional and false when left out.
 #[macro_export]
 macro_rules! sigmoid_router_instance {
     (
@@ -426,6 +429,7 @@ macro_rules! sigmoid_router_instance {
                 entries: $router, $pick,
                 prepare: $p_router, $p_pick,
                 refuse_nan: false,
+                floor: false,
             }
         }
     };
@@ -450,6 +454,33 @@ macro_rules! sigmoid_router_instance {
                 entries: $router, $pick,
                 prepare: $p_router, $p_pick,
                 refuse_nan: $refuse,
+                floor: false,
+            }
+        }
+    };
+    (
+        $(#[$meta:meta])*
+        pub mod $m:ident {
+            experts: $e:tt,
+            used: $u:tt,
+            kernels: $kernels:ident,
+            entries: $router:ident, $pick:ident,
+            prepare: $p_router:ident, $p_pick:ident,
+            refuse_nan: $refuse:tt,
+            floor: $floor:tt $(,)?
+        }
+    ) => {
+        $crate::sigmoid_router_instance! {
+            @instance
+            $(#[$meta])*
+            pub mod $m {
+                experts: $e,
+                used: $u,
+                kernels: $kernels,
+                entries: $router, $pick,
+                prepare: $p_router, $p_pick,
+                refuse_nan: $refuse,
+                floor: $floor,
             }
         }
     };
@@ -462,7 +493,8 @@ macro_rules! sigmoid_router_instance {
             kernels: $kernels:ident,
             entries: $router:ident, $pick:ident,
             prepare: $p_router:ident, $p_pick:ident,
-            refuse_nan: $refuse:tt $(,)?
+            refuse_nan: $refuse:tt,
+            floor: $floor:tt $(,)?
         }
     ) => {
         $(#[$meta])*
@@ -486,12 +518,22 @@ macro_rules! sigmoid_router_instance {
         pub const N_USED: usize = $u;
 
         /// The instance's row in `models::shape::ROUTERS`: a shape read from
-        /// a file selects it through `select_router`.
-        pub const ROW: RouterInst =
-            shape::router_row_k(RouterBody::BiasedSigmoid, N_EXPERT as u32, N_USED as u32);
+        /// a file selects it through `select_router`. With `floor` the kept
+        /// scores' sum is floored at `2^-14` before the division, else
+        /// `1e-20` is added to it.
+        pub const ROW: RouterInst = if $floor {
+            shape::router_row_rule(
+                RouterBody::SigmoidFloor,
+                rules::BIASED_SIGMOID_FLOOR,
+                N_EXPERT as u32,
+                N_USED as u32,
+            )
+        } else {
+            shape::router_row_k(RouterBody::BiasedSigmoid, N_EXPERT as u32, N_USED as u32)
+        };
         const _: () = assert!(shape::router_row_is(
             ROW,
-            rules::BIASED_SIGMOID,
+            if $floor { rules::BIASED_SIGMOID_FLOOR } else { rules::BIASED_SIGMOID },
             false,
             (N_USED as u32, N_USED as u32)
         ));
@@ -565,7 +607,7 @@ macro_rules! sigmoid_router_instance {
                 // contract's, the launcher passes k a positive multiple of 32,
                 // and `done[0]` is zero before the launch.
                 unsafe {
-                    router_body::<Sigmoid, N_EXPERT, N_USED, $refuse, false>(
+                    router_body::<Sigmoid, N_EXPERT, N_USED, $refuse, $floor>(
                         w,
                         x,
                         Some(bias),
@@ -626,7 +668,7 @@ macro_rules! sigmoid_router_instance {
                 // reaches each `static mut` without a reference); the block is
                 // 128 threads, converged; the lengths are the launch contract's.
                 unsafe {
-                    pick_body::<N_EXPERT, N_USED, $refuse, false>(
+                    pick_body::<N_EXPERT, N_USED, $refuse, $floor>(
                         probs,
                         Some(bias),
                         n_expert,
@@ -997,6 +1039,27 @@ crate::sigmoid_router_instance! {
         entries: sigmoid_896_16_router, sigmoid_896_16_router_pick,
         prepare: prepare_sigmoid_896_16_router, prepare_sigmoid_896_16_router_pick,
         refuse_nan: true,
+    }
+}
+
+crate::sigmoid_router_instance! {
+    /// The sigmoid router at 512 experts and the top 16 (Hy4-flash's): the rule
+    /// of `sigmoid_896_16` (`exp_probs_b` steering the selection only, the kept
+    /// unbiased scores renormalized) with the kept scores' sum floored at
+    /// `2^-14` before the division, as llama.cpp's `build_moe_ffn` clamps it for
+    /// every architecture whose file carries no `expert_weights_norm_eps`. The
+    /// launch's `scale` is the file's `expert_weights_scale`. Its 16 experts a
+    /// selecting lane and 16 rounds are inside the generic bodies' limits
+    /// (`⌈E / 32⌉ <= 32`, one `u32` of taken bits). A non-finite selection value
+    /// writes NaN weights, so the finite rank order is not a defined pick.
+    pub mod sigmoid_512_16 {
+        experts: 512,
+        used: 16,
+        kernels: sigmoid_512_16_router_kernels,
+        entries: sigmoid_512_16_router, sigmoid_512_16_router_pick,
+        prepare: prepare_sigmoid_512_16_router, prepare_sigmoid_512_16_router_pick,
+        refuse_nan: true,
+        floor: true,
     }
 }
 

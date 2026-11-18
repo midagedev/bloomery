@@ -18,8 +18,9 @@
 //! `%`), subscripts (a string's by character) and slices `[start:stop:step]`
 //! (Python's rules), string literals with Python's escapes,
 //! `.items()`/`.keys()`/`.values()`/`.get()`/`.strip()`/`.lstrip()`/
-//! `.rstrip()`/`.split()`/`.startswith()`/`.endswith()` with Python's
-//! arguments, filters `tojson`/`from_json`/`length`/`count`/`trim`/`string`/
+//! `.rstrip()`/`.split()`/`.startswith()`/`.endswith()`/`.format()` with Python's
+//! arguments (`.format()`'s fields are `{}`, `{N}` and `{name}` with `!s`/`!r`; a format spec or an
+//! attribute in a field is refused by name), filters `tojson`/`from_json`/`length`/`count`/`trim`/`string`/
 //! `lower`/`upper`/`capitalize`/`default`/`items`/`safe`/`replace`/`list` (Python string
 //! conversion, optional integer count, positional or keyword arguments), tests `defined`/`undefined`/`none`/`true`/
 //! `false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`, and
@@ -2458,8 +2459,127 @@ fn call_method(o: &V, method: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<
                 method == "endswith",
             )))
         }
+        (V::J(Value::String(s)), "format") => V::J(Value::String(str_format(s, args, kwargs)?)),
         (other, m) => return err(format!("no method {m}() on {other:?}")),
     })
+}
+
+/// Python's `str.format` for the replacement fields a chat template writes: `{}` (the next
+/// positional argument), `{N}` (the Nth), `{name}` (a keyword argument), each with an optional `!s` or
+/// `!r` conversion, and `{{` and `}}` for a brace. Each value is Python's `str()` of it
+/// (`format(value, '')`); an argument no field names is ignored, as Python ignores it. What Python
+/// accepts and this engine does not is refused by name, never written differently: a format
+/// spec (`{:>3}`), the `!a` conversion, an attribute or an index (`{0.x}`, `{0[k]}`), a field in a
+/// spec. What Python refuses is refused: a positional or keyword argument missing, `{}` and `{0}`
+/// mixed in one string, a brace that is single.
+fn str_format(s: &str, args: &[V], kwargs: &[(&str, V)]) -> Result<String, TemplateError> {
+    /// How the fields of the string so far number their arguments.
+    #[derive(PartialEq)]
+    enum Numbering {
+        Unset,
+        Auto,
+        Manual,
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut numbering = Numbering::Unset;
+    let mut next = 0usize;
+    let mut rest = s;
+    while let Some(at) = rest.find(['{', '}']) {
+        out.push_str(&rest[..at]);
+        let brace = &rest[at..];
+        let doubled = brace.as_bytes().get(1) == Some(&brace.as_bytes()[0]);
+        if doubled {
+            out.push_str(&brace[..1]);
+            rest = &brace[2..];
+            continue;
+        }
+        if brace.starts_with('}') {
+            return err("format(): single '}' encountered in format string");
+        }
+        // The field's text, up to the brace that closes it.
+        let mut depth = 0usize;
+        let mut end = None;
+        for (i, c) in brace.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else {
+            return err(if brace.len() == 1 {
+                "format(): single '{' encountered in format string"
+            } else {
+                "format(): expected '}' before end of string"
+            });
+        };
+        let field = &brace[1..end];
+        rest = &brace[end + 1..];
+        let (name_conv, spec) = field.split_once(':').unwrap_or((field, ""));
+        let (name, conversion) = name_conv.split_once('!').unwrap_or((name_conv, ""));
+        if !spec.is_empty() {
+            return err(format!(
+                "format(): the format spec {spec:?} is not supported (a field is {{}}, {{N}} or {{name}}, with !s or !r)"
+            ));
+        }
+        let value = if name.is_empty() || name.bytes().all(|b| b.is_ascii_digit()) {
+            let index = if name.is_empty() {
+                if numbering == Numbering::Manual {
+                    return err(
+                        "format(): cannot switch from manual field specification to automatic field numbering",
+                    );
+                }
+                numbering = Numbering::Auto;
+                next += 1;
+                next - 1
+            } else {
+                if numbering == Numbering::Auto {
+                    return err(
+                        "format(): cannot switch from automatic field numbering to manual field specification",
+                    );
+                }
+                numbering = Numbering::Manual;
+                name.parse::<usize>().map_err(|_| {
+                    TemplateError(format!("format(): too many decimal digits in {name:?}"))
+                })?
+            };
+            args.get(index).ok_or_else(|| {
+                TemplateError(format!(
+                    "format(): replacement index {index} out of range for positional args tuple ({} given)",
+                    args.len()
+                ))
+            })?
+        } else if name.chars().all(|c| c.is_alphanumeric() || c == '_')
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+        {
+            &kwargs
+                .iter()
+                .find(|(k, _)| *k == name)
+                .ok_or_else(|| TemplateError(format!("format(): no keyword argument {name}")))?
+                .1
+        } else {
+            return err(format!(
+                "format(): the field {name:?} is not supported (attribute and index access, or a name that is not an identifier)"
+            ));
+        };
+        match conversion {
+            "" | "s" => value.render(&mut out)?,
+            "r" => value.repr(&mut out)?,
+            other => {
+                return err(format!(
+                    "format(): the conversion !{other} is not supported (!s and !r are)"
+                ));
+            }
+        }
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// CPython's `tailmatch`: whether `s[start:end]` starts (or ends) with
@@ -4338,6 +4458,137 @@ mod tests {
                 "{{ raise_exception('a', 'b') }}",
                 v(r#"{}"#),
                 Err("raise_exception() takes 1 argument"),
+            ),
+        ]);
+        assert!(
+            bad.is_empty(),
+            "{} of the cases:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// `str.format` as Python runs it: `{}` takes the next positional argument, `{N}` the Nth, `{name}`
+    /// a keyword argument, `{{` and `}}` are braces, each value is its `str()` (or `repr()` under
+    /// `!r`), and an argument no field names is ignored; the HF template of Tencent's Hy4-flash writes
+    /// `'<｜hy_start{}｜>'.format(HYTK)` twenty-two times. What Python refuses is refused (a missing
+    /// argument, `{}` with `{0}`, a single brace); what Python accepts and this engine does not (a format
+    /// spec, `!a`, an attribute or an index in a field) is refused by name, never rendered another way.
+    /// Each `Ok` is jinja2 3.1.6's render (Python 3.14) in the HF environment.
+    #[test]
+    fn str_format_follows_python() {
+        let bad = mismatches(&[
+            (
+                "{{ '<｜hy_start{}｜>'.format(':6124c78e') }}",
+                v(r#"{}"#),
+                Ok("<｜hy_start:6124c78e｜>"),
+            ),
+            ("{{ '{}{}'.format(1, 'a') }}", v(r#"{}"#), Ok("1a")),
+            ("{{ '{1}{0}{1}'.format('a', 'b') }}", v(r#"{}"#), Ok("bab")),
+            ("{{ '{a}-{b}'.format(b=2, a='x') }}", v(r#"{}"#), Ok("x-2")),
+            ("{{ '{{}} {{{}}}'.format('x') }}", v(r#"{}"#), Ok("{} {x}")),
+            (
+                "{{ '{}|{}|{}|{}|{}'.format(true, none, 1.5, [1, 'a'], {'k': 'v'}) }}",
+                v(r#"{}"#),
+                Ok("True|None|1.5|[1, 'a']|{'k': 'v'}"),
+            ),
+            (
+                "{{ '{!r}|{!r}|{!r}'.format(1, none, [\"b'c\"]) }}",
+                v(r#"{}"#),
+                Ok("1|None|[\"b'c\"]"),
+            ),
+            ("{{ '{0!s}{0!r}'.format('a') }}", v(r#"{}"#), Ok("a'a'")),
+            ("{{ '[{}]'.format(u) }}", v(r#"{}"#), Ok("[]")),
+            ("{{ '[{!r}]'.format(u) }}", v(r#"{}"#), Ok("[Undefined]")),
+            (
+                "{{ 'x'.format(1, 2) }}{{ 'y'.format(z=1) }}",
+                v(r#"{}"#),
+                Ok("xy"),
+            ),
+            (
+                "{{ '한{}🙂{}'.format('é', '😀') }}",
+                v(r#"{}"#),
+                Ok("한é🙂😀"),
+            ),
+            (
+                "{% set ns = namespace(a=1) %}{{ '{}'.format(ns) }}{{ '{}'.format(range(3)) }}",
+                v(r#"{}"#),
+                Ok("<Namespace {'a': 1}>range(0, 3)"),
+            ),
+            (
+                "{% set HYTK = ':6124c78e' %}{% set t = '<think{}>'.format(HYTK) %}{{ t }}{{ t | length }}",
+                v(r#"{}"#),
+                Ok("<think:6124c78e>16"),
+            ),
+            (
+                "{{ '{}'.format() }}",
+                v(r#"{}"#),
+                Err("replacement index 0 out of range for positional args tuple (0 given)"),
+            ),
+            (
+                "{{ '{}{}'.format(1) }}",
+                v(r#"{}"#),
+                Err("replacement index 1 out of range for positional args tuple (1 given)"),
+            ),
+            (
+                "{{ '{1}'.format('a') }}",
+                v(r#"{}"#),
+                Err("replacement index 1 out of range"),
+            ),
+            (
+                "{{ '{a}'.format() }}",
+                v(r#"{}"#),
+                Err("no keyword argument a"),
+            ),
+            (
+                "{{ '{}{0}'.format(1) }}",
+                v(r#"{}"#),
+                Err("cannot switch from automatic field numbering to manual field specification"),
+            ),
+            (
+                "{{ '{0}{}'.format(1) }}",
+                v(r#"{}"#),
+                Err("cannot switch from manual field specification to automatic field numbering"),
+            ),
+            (
+                "{{ 'a{'.format() }}",
+                v(r#"{}"#),
+                Err("single '{' encountered in format string"),
+            ),
+            (
+                "{{ '{abc'.format() }}",
+                v(r#"{}"#),
+                Err("expected '}' before end of string"),
+            ),
+            (
+                "{{ 'a}'.format() }}",
+                v(r#"{}"#),
+                Err("single '}' encountered in format string"),
+            ),
+            (
+                "{{ '{:>3}'.format('a') }}",
+                v(r#"{}"#),
+                Err("the format spec \">3\" is not supported"),
+            ),
+            (
+                "{{ '{!a}'.format('a') }}",
+                v(r#"{}"#),
+                Err("the conversion !a is not supported"),
+            ),
+            (
+                "{{ '{0.x}'.format('a') }}",
+                v(r#"{}"#),
+                Err("the field \"0.x\" is not supported"),
+            ),
+            (
+                "{{ '{0[k]}'.format({'k': 1}) }}",
+                v(r#"{}"#),
+                Err("the field \"0[k]\" is not supported"),
+            ),
+            (
+                "{{ (1).format() }}",
+                v(r#"{}"#),
+                Err("no method format() on"),
             ),
         ]);
         assert!(

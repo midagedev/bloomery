@@ -28,6 +28,7 @@ use crate::sampling;
 /// The key/value markup in each spelling.
 const GLM: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Glm);
 const SOLAR: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Solar);
+const HY4: ToolFormat = ToolFormat::KvMarkup(KvSpelling::Hy4);
 /// Qwen3-Coder's markup in each framing of a value.
 const QWEN: ToolFormat = ToolFormat::QwenXml(Framing::Lines);
 const QWEN_CODER: ToolFormat = ToolFormat::QwenXml(Framing::Coder);
@@ -1164,6 +1165,10 @@ fn markup(format: ToolFormat) -> [String; 2] {
             "<|tool_call:start|>get_weather\n<|tool_arg:start|>unit<|tool_arg:value|>celsius<|tool_arg:end|>\n<|tool_arg:start|>days<|tool_arg:value|>2<|tool_arg:end|>\n<|tool_call:end|>",
             "<|tool_call:start|>search\n<|tool_arg:start|>query<|tool_arg:value|>cats<|tool_arg:end|>\n<|tool_arg:start|>deep<|tool_arg:value|>false<|tool_arg:end|>\n<|tool_call:end|>",
         ],
+        HY4 => [
+            "<tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>unit</arg_key:6124c78e><arg_value:6124c78e>celsius</arg_value:6124c78e><arg_key:6124c78e>days</arg_key:6124c78e><arg_value:6124c78e>2</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e>",
+            "<tool_calls:6124c78e><tool_call:6124c78e>search<arg_key:6124c78e>query</arg_key:6124c78e><arg_value:6124c78e>cats</arg_value:6124c78e><arg_key:6124c78e>deep</arg_key:6124c78e><arg_value:6124c78e>false</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e>",
+        ],
         ToolFormat::Dsml(_) => [
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"unit\" string=\"true\">celsius</｜DSML｜parameter>\n<｜DSML｜parameter name=\"days\" string=\"false\">2</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"query\" string=\"true\">cats</｜DSML｜parameter>\n<｜DSML｜parameter name=\"deep\" string=\"false\">false</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
@@ -1437,6 +1442,9 @@ fn numeric_tool_arguments_keep_their_values() {
                 SOLAR => format!(
                     "<|tool_call:start|>f\n<|tool_arg:start|>n<|tool_arg:value|>{value}<|tool_arg:end|>\n<|tool_call:end|>"
                 ),
+                HY4 => format!(
+                    "<tool_calls:6124c78e><tool_call:6124c78e>f<arg_key:6124c78e>n</arg_key:6124c78e><arg_value:6124c78e>{value}</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e>"
+                ),
                 ToolFormat::Dsml(spelling) => {
                     let raw = format!(
                         "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"n\" string=\"false\">{value}</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
@@ -1507,7 +1515,11 @@ fn a_string_ref_reads_back_as_text() {
         "required": ["s"]});
     let tools = json!([{"type": "function", "function": {"name": "f", "parameters": params}}]);
     let want = json!({"s": "123"});
-    for (format, spelling) in [(GLM, KvSpelling::Glm), (SOLAR, KvSpelling::Solar)] {
+    for (format, spelling) in [
+        (GLM, KvSpelling::Glm),
+        (SOLAR, KvSpelling::Solar),
+        (HY4, KvSpelling::Hy4),
+    ] {
         let c =
             build(&tok, format, &call_body(&params)).unwrap_or_else(|e| panic!("{format:?}: {e}"));
         let o = run(&tok, Some(c), ThinkEntry::Closed, &[]);
@@ -1551,12 +1563,13 @@ fn call_body(params: &Value) -> Value {
         {"type": "function", "function": {"name": "f", "parameters": params}}]})
 }
 
-const FORMATS: [ToolFormat; 7] = [
+const FORMATS: [ToolFormat; 8] = [
     ToolFormat::Hermes,
     QWEN,
     QWEN_COMPACT,
     GLM,
     SOLAR,
+    HY4,
     ToolFormat::Dsml(Spelling::Joined),
     ToolFormat::Dsml(Spelling::Spaced),
 ];
@@ -4575,6 +4588,9 @@ fn city_call(format: ToolFormat, keys: &[&str]) -> String {
             QWEN_COMPACT => format!("<parameter={k}>{v}</parameter>"),
             GLM => format!("<arg_key>{k}</arg_key><arg_value>{v}</arg_value>"),
             SOLAR => format!("<|tool_arg:start|>{k}<|tool_arg:value|>{v}<|tool_arg:end|>\n"),
+            HY4 => format!(
+                "<arg_key:6124c78e>{k}</arg_key:6124c78e><arg_value:6124c78e>{v}</arg_value:6124c78e>"
+            ),
             ToolFormat::Dsml(_) => format!(
                 "<｜DSML｜parameter name=\"{k}\" string=\"{text}\">{v}</｜DSML｜parameter>\n"
             ),
@@ -4592,6 +4608,9 @@ fn city_call(format: ToolFormat, keys: &[&str]) -> String {
         }
         GLM => format!("<tool_call>get_weather{members}</tool_call>"),
         SOLAR => format!("<|tool_call:start|>get_weather\n{members}<|tool_call:end|>"),
+        HY4 => format!(
+            "<tool_calls:6124c78e><tool_call:6124c78e>get_weather{members}</tool_call:6124c78e></tool_calls:6124c78e>"
+        ),
         ToolFormat::Dsml(_) => format!(
             "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{members}\
              </｜DSML｜invoke>\n</｜DSML｜tool_calls>"
@@ -4712,6 +4731,7 @@ fn an_object_with_no_required_property_may_be_empty() {
         QWEN_COMPACT,
         GLM,
         SOLAR,
+        HY4,
         ToolFormat::Mistral,
     ] {
         for keys in [&[] as &[&str], &["zone"]] {
@@ -4727,6 +4747,10 @@ fn an_object_with_no_required_property_may_be_empty() {
                     }
                     GLM => "<tool_call>get_time</tool_call>",
                     SOLAR => "<|tool_call:start|>get_time\n<|tool_call:end|>",
+                    HY4 => {
+                        "<tool_calls:6124c78e><tool_call:6124c78e>get_time</tool_call:6124c78e>\
+                        </tool_calls:6124c78e>"
+                    }
                     ToolFormat::Mistral => "[TOOL_CALLS]get_time[ARGS]{}",
                     ToolFormat::Dsml(_) | ToolFormat::MuseSpark | ToolFormat::Unparsed => {
                         unreachable!("not in this loop")
@@ -4752,6 +4776,11 @@ fn an_object_with_no_required_property_may_be_empty() {
                     SOLAR => {
                         "<|tool_call:start|>get_time\n<|tool_arg:start|>zone\
                         <|tool_arg:value|>1<|tool_arg:end|>\n<|tool_call:end|>"
+                    }
+                    HY4 => {
+                        "<tool_calls:6124c78e><tool_call:6124c78e>get_time<arg_key:6124c78e>zone\
+                        </arg_key:6124c78e><arg_value:6124c78e>1</arg_value:6124c78e>\
+                        </tool_call:6124c78e></tool_calls:6124c78e>"
                     }
                     ToolFormat::Mistral => "[TOOL_CALLS]get_time[ARGS]{\"zone\": 1}",
                     ToolFormat::Dsml(_) | ToolFormat::MuseSpark | ToolFormat::Unparsed => {

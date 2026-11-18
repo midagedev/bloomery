@@ -267,6 +267,31 @@ pub fn cut_positions<B: Rollback>(m: &mut GpuModel<B>, n: u32) -> Result<(), Gpu
     }
 }
 
+/// The longest prefix of at most `n` positions a cut keeps on a body whose
+/// state holds the position it stands at alone (a recurrent layer's state, a
+/// window ring): that position, or nothing.
+pub fn keep_where_it_stands<B: ChainBody>(m: &GpuModel<B>, n: u32) -> u32 {
+    if n >= m.pos() { m.pos() } else { 0 }
+}
+
+/// The cut of the same body: back to empty at 0 (a reset), or the position
+/// the model stands at (nothing to take back); any other cut is refused by
+/// name (`what`), `why` naming the state that takes no position back.
+pub fn cut_where_it_stands<B: ChainBody>(
+    m: &mut GpuModel<B>,
+    n: u32,
+    (what, why): (&'static str, &str),
+) -> Result<(), GpuError> {
+    match n {
+        0 => m.reset(),
+        n if n >= m.pos() => Ok(()),
+        n => Err(GpuError::shape(
+            what,
+            format!("a cut to position {n} of {}: {why}", m.pos()),
+        )),
+    }
+}
+
 /// How a session opens: the placement, the context the plan is asked for,
 /// the step mode and the body's own configuration.
 pub struct OpenArgs<C, M = fn(usize) -> Machine> {

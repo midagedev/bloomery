@@ -85,6 +85,7 @@ dependencies = [
  "bloomery-gpu-deepseek41",
  "bloomery-gpu-flint",
  "bloomery-gpu-glm5next",
+ "bloomery-gpu-hy4",
  "bloomery-gpu-mimo2",
  "bloomery-gpu-minimaxm3",
  "bloomery-gpu-mistrallarge4",
@@ -240,6 +241,7 @@ dependencies = [
  "bloomery-gpu-gemma-embedding2",
  "bloomery-gpu-gemma4a",
  "bloomery-gpu-glm5next",
+ "bloomery-gpu-hy4",
  "bloomery-gpu-mimo2",
  "bloomery-gpu-minimaxm3",
  "bloomery-gpu-mistrallarge4",
@@ -309,6 +311,19 @@ dependencies = [
  "bloomery-models",
  "bloomery-runtime",
  "bloomery-safetensors",
+ "cuda-core",
+]
+
+[[package]]
+name = "bloomery-gpu-hy4"
+version = "0.1.0"
+dependencies = [
+ "bloomery-engram",
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-levers",
+ "bloomery-model",
+ "bloomery-runtime",
  "cuda-core",
 ]
 

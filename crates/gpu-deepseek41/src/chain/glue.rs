@@ -52,6 +52,7 @@ use std::time::Instant;
 use bloomery_gpu::elem::{
     EmbedSb, Q3kRows, Q5kRows, iq4nl_embed_value, mxfp8_embed_value, q3k_embed_value,
 };
+use bloomery_gpu::engram_gate::{EngramGateKernels, GateArgs, KeyNormArgs, ROW};
 use bloomery_gpu::fault::FaultSink;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::rank::Sums;
@@ -77,7 +78,6 @@ use model::part::StoredRows;
 use crate::chain::ffn::ShadowWork;
 use crate::chain::join;
 use crate::dense::{Dense, DenseKernels};
-use crate::engram_gate::{EngramGateKernels, GateArgs, KeyNormArgs, ROW};
 use crate::hc::{HC_MIX, HC_STREAMS, HcKernels};
 use crate::params::ImageLayout;
 use crate::span::{SpanMut, span_mut};

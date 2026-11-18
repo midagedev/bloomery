@@ -290,7 +290,9 @@ pub fn model_arch(tier: tier::Tier, path: &Path) -> Result<Option<String>, GateE
     if path.is_dir() {
         return folder_arch(tier, path);
     }
-    let g = Gguf::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    // The first shard as a split opens it: a file holding one of bloomery's own value types (a
+    // type id 43 tensor among them) opens here as it does in the engine.
+    let g = Gguf::open_split_shard(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     tier.check_file(path, g.iter_kv().map(|(k, _)| k))?;
     Ok(g.architecture().map(str::to_owned))
 }
@@ -367,8 +369,11 @@ fn first_ids(path: &std::path::Path, text: &str, n: usize) -> Result<Vec<u32>, G
     Ok(ids)
 }
 
+/// The model file ([`ref_model_path`]) opened as one shard of its set, as a [`Split`] opens it:
+/// bloomery's own value types sized ([`Gguf::open_split_shard`]), so a file that carries one (the
+/// F8 engram table of a Hy4-flash file) opens here as it loads.
 pub fn open_model() -> Result<Gguf, GateError> {
-    Ok(Gguf::open(ref_model_path()?)?)
+    Ok(Gguf::open_split_shard(ref_model_path()?)?)
 }
 
 /// The model file ([`ref_model_path`]) as a split, proven to be of

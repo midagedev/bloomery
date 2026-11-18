@@ -2279,6 +2279,60 @@ fn fixture_new_rules_refuse_out_of_window() {
     assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
 }
 
+/// Contract 11: the scale-less F8_E4M3 rule (id 43, one byte a value; Hy4-flash's per-layer table)
+/// plans at any width and window, fills only finite codes (every magnitude of the 127 below the
+/// NaN, both signs, none the NaN), and `check_units` refuses either sign's NaN code by name.
+#[test]
+fn fixture_e4m3_rule_fills_finite_codes() {
+    let window = rule_window();
+    let mut bad = Vec::new();
+    for k in [96, 4096] {
+        match rule_for("t", GgmlType::F8E4M3, k, window) {
+            Ok(Rule::E4m3) => {}
+            other => bad.push(format!("K = {k}: {other:?}, wanted E4m3")),
+        }
+    }
+    let t = one_chunk(GgmlType::F8E4M3, 96, Rule::E4m3);
+    if t.sigma().is_some() {
+        bad.push("the scale-less rule has a σ".into());
+    }
+    let mut bytes = vec![0u8; t.nbytes as usize];
+    t.fill_chunk(7, 0, &mut bytes);
+    let mut magnitudes = [0usize; 128];
+    for &b in &bytes {
+        magnitudes[usize::from(b & 0x7f)] += 1;
+    }
+    let negative = bytes.iter().filter(|&&b| b & 0x80 != 0).count();
+    // 127 magnitudes, each of a uniform count n/127; five standard errors of it.
+    let (n, each) = (bytes.len() as f64, bytes.len() as f64 / 127.0);
+    let band = 5.0 * each.sqrt();
+    if magnitudes[127] != 0 {
+        bad.push(format!("{} NaN codes", magnitudes[127]));
+    }
+    if let Some(m) = (0..127).find(|&m| (magnitudes[m] as f64 - each).abs() > band) {
+        bad.push(format!(
+            "magnitude {m} holds {}, a uniform {each:.0} ± {band:.0}",
+            magnitudes[m]
+        ));
+    }
+    if (negative as f64 - n / 2.0).abs() > 5.0 * (n / 4.0).sqrt() {
+        bad.push(format!("{negative} of {} codes are negative", bytes.len()));
+    }
+    match fixture::check_units(&t, &bytes, 0, window) {
+        Ok(s) => println!("e4m3: {} values, rms {:.3}", s.values, s.rms()),
+        Err(e) => bad.push(format!("a filled chunk: {e}")),
+    }
+    for nan in [0x7f_u8, 0xff] {
+        let mut bad_bytes = bytes.clone();
+        bad_bytes[5] = nan;
+        match fixture::check_units(&t, &bad_bytes, 0, window) {
+            Err(e @ FixtureError::Block { .. }) if e.to_string().contains("NaN") => {}
+            other => bad.push(format!("code {nan:#04x}: {other:?}, not a Block error")),
+        }
+    }
+    assert!(bad.is_empty(), "\n  {}", bad.join("\n  "));
+}
+
 /// Contract 8: the second family's window, [2^-14, 2^-6], is wider than the
 /// rule window and admits Q5_1 at K = 640 (`d = σ/√85.25 = 2^-7.87`), which
 /// the rule window refuses; its blocks fill at σ and hold under the wide

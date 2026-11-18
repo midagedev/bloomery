@@ -2,7 +2,7 @@
 //! and one shared value, gate the residual update — gate = sigmoid of the
 //! signed square root of the query–key dot, and h += gate ⊗ value.
 //!
-//! `engram_wkv` (the dense gemv of its type, [`crate::dense`]) turns a
+//! `engram_wkv` (the dense gemv of its type) turns a
 //! token's looked-up rows into `kv`: `hc` keys, one per stream, then the
 //! value the streams share, each [`ROW`] values. Two launches follow it, cut by what they wait for:
 //! - [`EngramGateKernels::enqueue_key_norm`] reads `kv` alone. The rows depend
@@ -41,8 +41,8 @@
 //! `a·b + c` into a fused multiply-add, and fuses `f64::from(a·b) + c` into
 //! an f64 one.
 
-use bloomery_gpu::elem::{RMS_THREADS, RMS_WARPS, rms_scale_checked, rms_warp_tree};
-use bloomery_gpu::{FaultSink, GpuError, launch_u32};
+use crate::elem::{RMS_THREADS, RMS_WARPS, rms_scale_checked, rms_warp_tree};
+use crate::{FaultSink, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::float::{add_rn_f32, div_rn_f32, fma_rn_f32, mul_rn_f32, sqrt_rn_f32};
 use cuda_device::{
@@ -74,9 +74,11 @@ pub const CLAMP_MIN: f32 = 1e-6;
 ///
 /// # Safety
 ///
-/// `base + ROW <= x.len()`, `tid < RMS_THREADS` and `i < 5`.
+/// The row at `base` holds `row` values, a multiple of `GROUP·RMS_THREADS`,
+/// and `base + row <= x.len()`; `tid < RMS_THREADS` and `i < row /
+/// (GROUP·RMS_THREADS)` (5 at [`ROW`]).
 #[inline(always)]
-unsafe fn group(x: &[f32], base: usize, tid: usize, i: usize) -> [f32; GROUP] {
+pub(crate) unsafe fn group(x: &[f32], base: usize, tid: usize, i: usize) -> [f32; GROUP] {
     let b = base + tid + RMS_THREADS * GROUP * i;
     // SAFETY: the largest index is base + tid + RMS_THREADS·(GROUP·i + 3) <
     // base + RMS_THREADS·PER_THREAD = base + ROW <= x.len() by this
@@ -96,10 +98,9 @@ unsafe fn group(x: &[f32], base: usize, tid: usize, i: usize) -> [f32; GROUP] {
 ///
 /// # Safety
 ///
-/// `base + ROW <= y.len()`, `tid < RMS_THREADS`, `i < 5`, and no other thread
-/// writes these positions.
+/// [`group`]'s contract on `y`, and no other thread writes these positions.
 #[inline(always)]
-unsafe fn store_group(
+pub(crate) unsafe fn store_group(
     y: &mut DisjointSlice<f32>,
     base: usize,
     tid: usize,
@@ -120,7 +121,7 @@ unsafe fn store_group(
 
 /// `acc` plus the squares of a group in order, one fused multiply-add each.
 #[inline(always)]
-fn sum_sq(acc: f32, v: [f32; GROUP]) -> f32 {
+pub(crate) fn sum_sq(acc: f32, v: [f32; GROUP]) -> f32 {
     let acc = fma_rn_f32(v[0], v[0], acc);
     let acc = fma_rn_f32(v[1], v[1], acc);
     let acc = fma_rn_f32(v[2], v[2], acc);
@@ -129,7 +130,7 @@ fn sum_sq(acc: f32, v: [f32; GROUP]) -> f32 {
 
 /// `(v·scale)·gain` per lane, each product rounded.
 #[inline(always)]
-fn norm_gain(v: [f32; GROUP], scale: f32, gain: [f32; GROUP]) -> [f32; GROUP] {
+pub(crate) fn norm_gain(v: [f32; GROUP], scale: f32, gain: [f32; GROUP]) -> [f32; GROUP] {
     [
         mul_rn_f32(mul_rn_f32(v[0], scale), gain[0]),
         mul_rn_f32(mul_rn_f32(v[1], scale), gain[1]),
@@ -141,7 +142,13 @@ fn norm_gain(v: [f32; GROUP], scale: f32, gain: [f32; GROUP]) -> [f32; GROUP] {
 /// `acc` plus the products `kn·qn` of a group in order, each rounded to f32
 /// before it is widened, with `qn = (x·scale)·gain`.
 #[inline(always)]
-fn dot_group(acc: f64, kn: [f32; GROUP], x: [f32; GROUP], scale: f32, gain: [f32; GROUP]) -> f64 {
+pub(crate) fn dot_group(
+    acc: f64,
+    kn: [f32; GROUP],
+    x: [f32; GROUP],
+    scale: f32,
+    gain: [f32; GROUP],
+) -> f64 {
     let qn = norm_gain(x, scale, gain);
     let acc = acc + f64::from(mul_rn_f32(kn[0], qn[0]));
     let acc = acc + f64::from(mul_rn_f32(kn[1], qn[1]));
@@ -187,18 +194,40 @@ fn gate_of(dot: f64, inv_sqrt_n: f32) -> f32 {
     div_rn_f32(1.0, add_rn_f32(1.0, e))
 }
 
+/// [`gate_of`] with the sign llama.cpp's graph takes (`sign = 1 − 2·step(−s)`,
+/// "copysign" for a zero): `−1` for a negative `s` and `+1` for every other,
+/// zeros included, so a zero dot gives `σ(√CLAMP_MIN)` where V4.1's gives
+/// `σ(0)`.
+#[inline(always)]
+fn gate_of_positive(dot: f64, inv_sqrt_n: f32) -> f32 {
+    let s = mul_rn_f32(dot as f32, inv_sqrt_n);
+    let a = s.abs();
+    let lo = if a < f32::INFINITY { a } else { f32::INFINITY };
+    let c = if lo > CLAMP_MIN { lo } else { CLAMP_MIN };
+    let m = mul_rn_f32(if s < 0.0 { -1.0 } else { 1.0 }, sqrt_rn_f32(c));
+    let e = f64::from(-m).exp() as f32;
+    div_rn_f32(1.0, add_rn_f32(1.0, e))
+}
+
 /// The row's norm scale from each thread's partial sum of squares: the warp
 /// butterfly, one slot per warp in `wsum`, the barrier, then `rms_warp_tree`
-/// and `rms_scale_checked` in every thread (a scale that is not finite and
-/// positive is NaN and raises `FaultSite::F32Product` from thread 0). Every
-/// thread of the block calls this.
+/// and `rms_scale_checked` over `row` values in every thread (a scale that is
+/// not finite and positive is NaN and raises `FaultSite::F32Product` from
+/// thread 0). Every thread of the block calls this.
 ///
 /// # Safety
 ///
 /// `wsum` points at this block's [`RMS_WARPS`]-slot shared array, and no
 /// other access to it is in flight.
 #[inline(always)]
-unsafe fn block_scale(part: f32, tid: usize, wsum: *mut f32, eps: f32, fault: FaultSink) -> f32 {
+pub(crate) unsafe fn block_scale_n(
+    part: f32,
+    tid: usize,
+    wsum: *mut f32,
+    row: u32,
+    eps: f32,
+    fault: FaultSink,
+) -> f32 {
     let w = warp::reduce_sum_f32(part);
     if warp::lane_id() == 0 {
         // SAFETY: block-shared, RMS_WARPS == blockDim.x / 32, one lane per
@@ -223,7 +252,63 @@ unsafe fn block_scale(part: f32, tid: usize, wsum: *mut f32, eps: f32, fault: Fa
             *wsum.add(7),
         ]
     };
-    rms_scale_checked(rms_warp_tree(sums), ROW as u32, eps, fault, tid == 0)
+    rms_scale_checked(rms_warp_tree(sums), row, eps, fault, tid == 0)
+}
+
+/// [`block_scale_n`] at [`ROW`].
+///
+/// # Safety
+///
+/// [`block_scale_n`]'s contract.
+#[inline(always)]
+unsafe fn block_scale(part: f32, tid: usize, wsum: *mut f32, eps: f32, fault: FaultSink) -> f32 {
+    // SAFETY: this function's contract is block_scale_n's.
+    unsafe { block_scale_n(part, tid, wsum, ROW as u32, eps, fault) }
+}
+
+/// The block's dot from each thread's f64 partial `d`: each thread's slot in
+/// `dots`, the barrier, then warp 0's lane `l` sums slots `l`, `l + 32`, …,
+/// `l + 224` in order and the lanes meet in the xor butterfly (16, 8, 4, 2,
+/// 1). Returns the dot in every lane of warp 0 (the other warps get 0).
+/// Every thread of the block calls this. `engram_gate` spells the same
+/// reduction out in its body, so that entry's PTX stays the lift's.
+///
+/// # Safety
+///
+/// `dots` points at this block's [`RMS_THREADS`]-slot shared array, and no
+/// other access to it is in flight.
+#[inline(always)]
+unsafe fn block_dot(d: f64, tid: usize, dots: *mut f64) -> f64 {
+    // SAFETY: block-shared, RMS_THREADS == blockDim.x, each thread writes its
+    // own slot before the barrier that publishes it.
+    unsafe {
+        *dots.add(tid) = d;
+    }
+    thread::sync_threads();
+    if tid >= 32 {
+        return 0.0;
+    }
+    // SAFETY: block-shared, tid + 224 < RMS_THREADS == blockDim.x, every slot
+    // written before the barrier above.
+    let (d0, d1, d2, d3, d4, d5, d6, d7) = unsafe {
+        (
+            *dots.add(tid),
+            *dots.add(tid + 32),
+            *dots.add(tid + 64),
+            *dots.add(tid + 96),
+            *dots.add(tid + 128),
+            *dots.add(tid + 160),
+            *dots.add(tid + 192),
+            *dots.add(tid + 224),
+        )
+    };
+    let mut acc = ((((((d0 + d1) + d2) + d3) + d4) + d5) + d6) + d7;
+    acc += warp::shuffle_xor_f64(acc, 16);
+    acc += warp::shuffle_xor_f64(acc, 8);
+    acc += warp::shuffle_xor_f64(acc, 4);
+    acc += warp::shuffle_xor_f64(acc, 2);
+    acc += warp::shuffle_xor_f64(acc, 1);
+    acc
 }
 
 // ---------------------------------------------------------------- kernels
@@ -247,7 +332,7 @@ mod engram_gate_kernels {
             kn.len() >= m * hc * 5120
         )
     )]
-    pub fn ds41_engram_key_norm(
+    pub fn engram_key_norm(
         kv: &[f32],
         gain: &[f32],
         eps: f32,
@@ -334,7 +419,7 @@ mod engram_gate_kernels {
             gate.len() >= m * hc
         )
     )]
-    pub fn ds41_engram_gate(
+    pub fn engram_gate(
         x: &[f32],
         kn: &[f32],
         kv: &[f32],
@@ -486,6 +571,315 @@ mod engram_gate_kernels {
     }
 }
 
+// -------------------------------------------------------------- instances
+
+/// The key and gate kernels at one row width, from the cores above: a module
+/// holding `ROW`, the two `#[cuda_module]` entries and `Kernels` with their
+/// launchers. `groups` lists the group indices of a thread's share of the row
+/// (`ROW / (GROUP·RMS_THREADS)` of them, ascending); the macro unrolls them,
+/// so every group is a named lane value and never an array a loop indexes.
+/// The key kernel is `engram_key_norm`'s body at that width. The gate
+/// kernel is `engram_gate`'s up to the gate: it writes `gate[b]` and
+/// reads no `kv` and writes no stream, the update being the model's (its own
+/// kernel reads `gate`). The entry names are the PTX entry names, and
+/// `$p_key_norm` and `$p_gate` the `prepare_*` launchers `#[cuda_module]`
+/// derives from them: a macro cannot join identifiers. `rule` is the function
+/// from the block's f64 dot and `1/√ROW` to the gate ([`gate_of`] or
+/// [`gate_of_positive`]).
+macro_rules! engram_gate_instance {
+    (
+        $(#[$meta:meta])*
+        pub mod $m:ident {
+            row: $row:tt,
+            groups: [$($g:tt),+ $(,)?],
+            kernels: $kernels:ident,
+            entries: $key_norm:ident, $gate:ident,
+            prepare: $p_key_norm:ident, $p_gate:ident,
+            rule: $rule:ident,
+        }
+    ) => {
+        $(#[$meta])*
+        pub mod $m {
+            use super::*;
+
+            /// Values in one stream row of this instance.
+            pub const ROW: usize = $row;
+            /// Groups of [`GROUP`] values one thread holds of a row.
+            pub const GROUPS: usize = [$($g),+].len();
+            const _: () = assert!(GROUPS * GROUP * RMS_THREADS == ROW);
+            // The macro's group list is `0, 1, …` in order.
+            const _: () = {
+                let idx = [$($g),+];
+                let mut i = 0;
+                while i < GROUPS {
+                    assert!(idx[i] == i);
+                    i += 1;
+                }
+            };
+
+            #[allow(
+                dead_code,
+                reason = "#[cuda_module] derives an `_unchecked` launcher per entry that no caller uses"
+            )]
+            #[cuda_module]
+            mod $kernels {
+                use super::*;
+
+                /// The key side at this instance's [`ROW`]:
+                /// `engram_key_norm`'s kernel.
+                #[kernel]
+                #[launch_bounds(256)]
+                #[launch_contract(
+                    domain = 1,
+                    block = (256, 1, 1),
+                    requires = (
+                        kv.len() >= m * (hc + 1) * $row,
+                        gain.len() >= hc * $row,
+                        kn.len() >= m * hc * $row
+                    )
+                )]
+                pub fn $key_norm(
+                    kv: &[f32],
+                    gain: &[f32],
+                    eps: f32,
+                    hc: u32,
+                    m: u32,
+                    fault: FaultSink,
+                    mut kn: DisjointSlice<f32>,
+                ) {
+                    static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+
+                    let b = thread::blockIdx_x() as usize;
+                    let hc = hc as usize;
+                    if b >= hc * m as usize {
+                        return;
+                    }
+                    let (t, s) = (b / hc, b % hc);
+                    let tid = thread::threadIdx_x() as usize;
+                    let kb = (t * (hc + 1) + s) * ROW;
+                    let gb = s * ROW;
+                    // SAFETY: t < m and s < hc, so kb + ROW <= m·(hc+1)·ROW <=
+                    // kv.len() and gb + ROW <= hc·ROW <= gain.len() by the
+                    // launch contract; tid < RMS_THREADS; every group index is
+                    // below GROUPS = ROW / (GROUP·RMS_THREADS).
+                    let (kv_g, gain_g) = unsafe {
+                        (
+                            [$(group(kv, kb, tid, $g)),+],
+                            [$(group(gain, gb, tid, $g)),+],
+                        )
+                    };
+                    let mut part = 0.0f32;
+                    $( part = sum_sq(part, kv_g[$g]); )+
+                    // SAFETY: WSUM is this block's own shared allocation,
+                    // reached only through `block_scale_n`; every thread
+                    // arrives.
+                    let scale = unsafe {
+                        block_scale_n(
+                            part,
+                            tid,
+                            SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                            ROW as u32,
+                            eps,
+                            fault,
+                        )
+                    };
+                    let ob = b * ROW;
+                    // SAFETY: b < hc·m, so ob + ROW <= m·hc·ROW <= kn.len() by
+                    // the launch contract; tid < RMS_THREADS, every group index
+                    // is below GROUPS, and row b's positions of this thread are
+                    // written by this thread alone.
+                    unsafe {
+                        $( store_group(&mut kn, ob, tid, $g, norm_gain(kv_g[$g], scale, gain_g[$g])); )+
+                    }
+                }
+
+                /// The query side at this instance's [`ROW`], to the gate:
+                /// block `b` is stream `s = b % hc` of token `t = b / hc`; it
+                /// normalizes `x[b·ROW ..]`, scales it by gain row `s`, dots it
+                /// with `kn[b·ROW ..]` in f64 and writes `gate[b]` ([`gate_of`]).
+                #[allow(
+                    clippy::too_many_arguments,
+                    reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+                )]
+                #[kernel]
+                #[launch_bounds(256)]
+                #[launch_contract(
+                    domain = 1,
+                    block = (256, 1, 1),
+                    requires = (
+                        x.len() >= m * hc * $row,
+                        kn.len() >= m * hc * $row,
+                        gain.len() >= hc * $row,
+                        gate.len() >= m * hc
+                    )
+                )]
+                pub fn $gate(
+                    x: &[f32],
+                    kn: &[f32],
+                    gain: &[f32],
+                    eps: f32,
+                    inv_sqrt_n: f32,
+                    hc: u32,
+                    m: u32,
+                    fault: FaultSink,
+                    mut gate: DisjointSlice<f32>,
+                ) {
+                    static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
+                    static mut DOT: SharedArray<f64, RMS_THREADS> = SharedArray::UNINIT;
+
+                    let b = thread::blockIdx_x() as usize;
+                    let hc = hc as usize;
+                    if b >= hc * m as usize {
+                        return;
+                    }
+                    let s = b % hc;
+                    let tid = thread::threadIdx_x() as usize;
+                    let xb = b * ROW;
+                    let gb = s * ROW;
+                    // SAFETY: b < hc·m, so xb + ROW <= m·hc·ROW bounds x and
+                    // kn; s < hc, so gb + ROW <= hc·ROW bounds gain — all by
+                    // the launch contract. tid < RMS_THREADS, every group index
+                    // is below GROUPS.
+                    let (x_g, kn_g, gain_g) = unsafe {
+                        (
+                            [$(group(x, xb, tid, $g)),+],
+                            [$(group(kn, xb, tid, $g)),+],
+                            [$(group(gain, gb, tid, $g)),+],
+                        )
+                    };
+                    let mut part = 0.0f32;
+                    $( part = sum_sq(part, x_g[$g]); )+
+                    // SAFETY: WSUM is this block's own shared allocation,
+                    // reached only through `block_scale_n`; every thread
+                    // arrives.
+                    let scale = unsafe {
+                        block_scale_n(
+                            part,
+                            tid,
+                            SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                            ROW as u32,
+                            eps,
+                            fault,
+                        )
+                    };
+                    let mut d = 0.0f64;
+                    $( d = dot_group(d, kn_g[$g], x_g[$g], scale, gain_g[$g]); )+
+                    // SAFETY: DOT is this block's own shared allocation; every
+                    // thread arrives.
+                    let acc = unsafe { block_dot(d, tid, SharedArray::as_raw_mut_ptr(&raw mut DOT)) };
+                    if tid == 0 {
+                        // SAFETY: b < hc·m <= gate.len() by the launch
+                        // contract; only thread 0 of block b writes gate[b].
+                        unsafe {
+                            *gate.get_unchecked_mut(b) = $rule(acc, inv_sqrt_n);
+                        }
+                    }
+                }
+            }
+
+            /// `1/√ROW` as ik computes the score's scale: `1.0f / sqrtf((float)
+            /// n_embd)`.
+            #[must_use]
+            pub fn inv_sqrt_row() -> f32 {
+                1.0 / (ROW as f32).sqrt()
+            }
+
+            /// The loaded module. Owns no stream: each enqueue takes the
+            /// engine stream, so its launches order with the rest of the step
+            /// and capture.
+            pub struct Kernels {
+                module: $kernels::LoadedModule,
+            }
+
+            impl Kernels {
+                /// Load this module's device bundle into `ctx`. Load-time only.
+                pub fn load(ctx: &Arc<CudaContext>) -> Result<Kernels, GpuError> {
+                    // SAFETY: this crate owns the embedded device bundle
+                    // produced for the module above; the launchers check its
+                    // launch contracts.
+                    let module = unsafe { crate::shared_module!($kernels, ctx)? };
+                    Ok(Kernels { module })
+                }
+
+                /// Enqueue the key side: for key `s` of token `t`,
+                /// `a.kn[(t·hc + s)·ROW + d] = (key·scale)·gain[s·ROW + d]`.
+                /// Asynchronous, allocation-free, capturable.
+                pub fn enqueue_key_norm(
+                    &self,
+                    stream: &CudaStream,
+                    a: KeyNormArgs<'_>,
+                ) -> Result<(), GpuError> {
+                    let what = concat!(stringify!($m), "::enqueue_key_norm");
+                    let blocks = check_rows(what, a.hc, a.m)?;
+                    need(what, "kv", a.kv.len(), a.m * (a.hc + 1) * ROW)?;
+                    need(what, "gain", a.gain.len(), a.hc * ROW)?;
+                    need(what, "kn", a.kn.len(), blocks * ROW)?;
+                    let grid = launch_u32(what, "hc·m", blocks)?;
+                    let hc = launch_u32(what, "hc", a.hc)?;
+                    let m = launch_u32(what, "m", a.m)?;
+                    let prep = self
+                        .module
+                        .$p_key_norm(LaunchConfig1D::new(grid, BLOCK, 0))?;
+                    self.module
+                        .$key_norm(stream, &prep, a.kv, a.gain, a.eps, hc, m, a.fault, a.kn)?;
+                    Ok(())
+                }
+
+                /// Enqueue the query side: for stream `s` of token `t`, the gate
+                /// from the dot of `x`'s normalized row with `kn`'s, into
+                /// `a.gate[t·hc + s]`. Asynchronous, allocation-free,
+                /// capturable.
+                pub fn enqueue_gate(
+                    &self,
+                    stream: &CudaStream,
+                    a: GateOnlyArgs<'_>,
+                ) -> Result<(), GpuError> {
+                    let what = concat!(stringify!($m), "::enqueue_gate");
+                    let blocks = check_rows(what, a.hc, a.m)?;
+                    need(what, "x", a.x.len(), blocks * ROW)?;
+                    need(what, "kn", a.kn.len(), blocks * ROW)?;
+                    need(what, "gain", a.gain.len(), a.hc * ROW)?;
+                    need(what, "gate", a.gate.len(), blocks)?;
+                    let grid = launch_u32(what, "hc·m", blocks)?;
+                    let hc = launch_u32(what, "hc", a.hc)?;
+                    let m = launch_u32(what, "m", a.m)?;
+                    let prep = self.module.$p_gate(LaunchConfig1D::new(grid, BLOCK, 0))?;
+                    self.module.$gate(
+                        stream,
+                        &prep,
+                        a.x,
+                        a.kn,
+                        a.gain,
+                        a.eps,
+                        inv_sqrt_row(),
+                        hc,
+                        m,
+                        a.fault,
+                        a.gate,
+                    )?;
+                    Ok(())
+                }
+            }
+        }
+    };
+}
+
+engram_gate_instance! {
+    /// The gate at ROW 3072 (Hy4-flash's `n_embd`): `engram_gate` folds both
+    /// norm gains, so the key side runs with unit gains and the query side
+    /// with `engram_gate`. The gate is the V4.1 rule with the oracle's sign at
+    /// zero ([`gate_of_positive`]); the update that follows it is the model's
+    /// (`engram_delta`).
+    pub mod row_3072 {
+        row: 3072,
+        groups: [0, 1, 2],
+        kernels: engram_gate_3072_kernels,
+        entries: engram_key_norm_3072, engram_gate_3072,
+        prepare: prepare_engram_key_norm_3072, prepare_engram_gate_3072,
+        rule: gate_of_positive,
+    }
+}
+
 // -------------------------------------------------------------- launchers
 
 /// [`EngramGateKernels::enqueue_key_norm`]'s arguments: `m` tokens' `kv`
@@ -522,6 +916,21 @@ pub struct GateArgs<'a> {
     pub fault: FaultSink,
 }
 
+/// A gate-only instance's `enqueue_gate` arguments (`row_3072::Kernels`): the
+/// streams `x` (`m·hc` rows, token-major), the normalized keys `kn`, the query
+/// gains `gain`, and the `m·hc` gates `gate`; no update is written.
+pub struct GateOnlyArgs<'a> {
+    pub x: &'a DeviceBuffer<f32>,
+    pub kn: &'a DeviceBuffer<f32>,
+    pub gain: &'a DeviceBuffer<f32>,
+    pub eps: f32,
+    pub hc: usize,
+    pub m: usize,
+    pub gate: &'a mut DeviceBuffer<f32>,
+    /// As [`KeyNormArgs::fault`], for the stream's query row.
+    pub fault: FaultSink,
+}
+
 /// `1/√ROW` as ik computes the score's scale: `1.0f / sqrtf((float) n_embd)`.
 #[must_use]
 pub fn inv_sqrt_row() -> f32 {
@@ -540,7 +949,7 @@ impl EngramGateKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<EngramGateKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; the launchers check its launch contracts.
-        let module = unsafe { bloomery_gpu::shared_module!(engram_gate_kernels, ctx)? };
+        let module = unsafe { crate::shared_module!(engram_gate_kernels, ctx)? };
         Ok(EngramGateKernels { module })
     }
 
@@ -562,9 +971,9 @@ impl EngramGateKernels {
         let m = launch_u32(WHAT, "m", a.m)?;
         let prep = self
             .module
-            .prepare_ds41_engram_key_norm(LaunchConfig1D::new(grid, BLOCK, 0))?;
+            .prepare_engram_key_norm(LaunchConfig1D::new(grid, BLOCK, 0))?;
         self.module
-            .ds41_engram_key_norm(stream, &prep, a.kv, a.gain, a.eps, hc, m, a.fault, a.kn)?;
+            .engram_key_norm(stream, &prep, a.kv, a.gain, a.eps, hc, m, a.fault, a.kn)?;
         Ok(())
     }
 
@@ -586,8 +995,8 @@ impl EngramGateKernels {
         let m = launch_u32(WHAT, "m", a.m)?;
         let prep = self
             .module
-            .prepare_ds41_engram_gate(LaunchConfig1D::new(grid, BLOCK, 0))?;
-        self.module.ds41_engram_gate(
+            .prepare_engram_gate(LaunchConfig1D::new(grid, BLOCK, 0))?;
+        self.module.engram_gate(
             stream,
             &prep,
             a.x,

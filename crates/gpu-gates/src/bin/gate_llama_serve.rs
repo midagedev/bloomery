@@ -72,9 +72,9 @@ mod gate {
 
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        SeatGate, Served, agree, chatted, check, curl, cut_call, generate_arms_without, greedy,
-        ids_of, input_tokens, json_of, plan_run, rendered, scripted_call, serve_cmd, server_log,
-        tokenized, tool_turn, utf8, whole_terms,
+        FUNCTION_TAG_CALL, SeatGate, Served, agree, chatted, check, curl, cut_call,
+        generate_arms_without, greedy, ids_of, input_tokens, json_of, plan_run, rendered,
+        scripted_call, serve_cmd, server_log, tokenized, tool_turn, utf8, whole_terms,
     };
     use bloomery_gpu_gates::ubatch_pick::{self, Source};
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
@@ -513,7 +513,7 @@ mod gate {
         clause(
             &mut ok,
             "scripted_tool_call_is_one_parsed_call",
-            scripted_call(&template, &dir),
+            scripted_call(&template, FUNCTION_TAG_CALL, &dir),
         );
         clause(
             &mut ok,

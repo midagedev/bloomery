@@ -1,0 +1,25 @@
+[package]
+name = "bloomery-gpu-hy4"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+# The Hy4-flash program: host code only, no `#[cuda_module]` of its own. It composes the kernels of
+# `bloomery-gpu`: the hyper-connection identity mix, the engram delta and gate, the latent append, the
+# k-pool selector, the latent flash with a sink a head over a list or a window ring, the per-head q8_0
+# gemvs, the output gate, the sigmoid router at 512 and the top 16, the card leg and the head. It is
+# built with `cargo oxide` because that crate is.
+[dependencies]
+cuda-core.workspace = true
+bloomery-gpu = { path = "../gpu" }
+# Host only: the header read, the host embedding and engram rows, the engram hash, the context bound.
+bloomery-engram = { path = "../engram" }
+bloomery-gguf = { path = "../gguf" }
+bloomery-levers = { path = "../levers" }
+bloomery-model = { path = "../model" }
+# The placed step's walk around the host leg (`runtime::sched`) and the routed run (`runtime::layer`).
+bloomery-runtime = { path = "../runtime" }

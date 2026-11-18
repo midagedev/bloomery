@@ -23,6 +23,7 @@ pub mod gemma_embedding;
 pub mod gemma_embedding2;
 mod gemma_encoder;
 pub mod glm5next;
+pub mod hy4;
 pub mod hybrid;
 pub mod kda;
 pub mod kimi_k3;
@@ -223,6 +224,11 @@ pub enum Arch {
     /// Kimi K3: Kimi delta attention and gated latent-attention layers, `situ` experts in a
     /// latent, and the cross-layer residual attention. No executable program is registered.
     KimiK3,
+    /// Tencent Hy4-flash (`hy_v4_flash`): gated latent attention with a learnable sink on
+    /// sparse-attention and sliding-window layers, identity-comb hyper-connections with sandwich
+    /// norms, latent experts beside a shared one and n-gram engram sites. No executable program
+    /// is registered.
+    Hy4,
 }
 
 impl Arch {
@@ -261,6 +267,7 @@ impl Arch {
             "muse-spark" => Ok(Arch::MuseSpark),
             "mistral-large4" => Ok(Arch::MistralLarge4),
             "kimi-k3" | "kimi-k31" => Ok(Arch::KimiK3),
+            gguf::arch::hy_v4_flash::ARCH => Ok(Arch::Hy4),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -292,6 +299,7 @@ impl Arch {
             Arch::MuseSpark => "muse-spark",
             Arch::MistralLarge4 => "mistral-large4",
             Arch::KimiK3 => "kimi-k3",
+            Arch::Hy4 => gguf::arch::hy_v4_flash::ARCH,
         }
     }
 }
@@ -1355,6 +1363,7 @@ mod tests {
             Arch::MuseSpark,
             Arch::MistralLarge4,
             Arch::KimiK3,
+            Arch::Hy4,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

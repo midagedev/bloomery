@@ -86,8 +86,8 @@ generate_ds41 ds41_card_gather 0 0
 generate_ds41 ds41_card_gather_8 0 0
 generate_ds41 ds41_comp_pool 0 0
 generate_ds41 ds41_comp_rows 0 0
-generate_ds41 ds41_engram_gate 0 0
-generate_ds41 ds41_engram_key_norm 0 0
+generate_ds41 engram_gate 0 0
+generate_ds41 engram_key_norm 0 0
 generate_ds41 ds41_expert_gate_up 0 0
 # PIN(2026-10-23): measured on sm_121a, GB10, driver 595.84, CUDA 13.3.1. Shared GEMM epilogues retain exceptional range; the native 4K pair showed no throughput loss.
 # PIN(2026-10-26): spill 680 -> 676 B and cc 12.1 JIT local 144 -> 152 B (sm_121a ptxas 13.3.73, GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
@@ -167,7 +167,6 @@ generate_ds41 ds41_ring_commit 0 0
 generate_ds41 ds41_rope_tail 0 0
 generate_ds41 ds41_router 0 0
 generate_ds41 ds41_router_pick 0 0
-generate_ds41 ds41_rows_to_tokens 0 0
 generate_ds41 ds41_shexp_gate_up 0 0
 generate_ds41 ds41_shexp_gate_up_q3k 0 0
 generate_ds41 ds41_shexp_gate_up_q3k_mcol 0 0
@@ -192,10 +191,18 @@ generate_ds41 flash_latent 0 0
 generate_ds41 flash_latent_mma 24 8
 # PIN(2026-11-02): flash_latent_mma_sel shares flash_latent_mma's body (the same walk macro or row body, a per-token key list or row position), pinned at flash_latent_mma's cc 12.1 value here (24 spill, 8 JIT local) until a cc 12.1 scan runs; sm_86 measured 0/0.
 generate_ds41 flash_latent_mma_sel 24 8
+# PIN(2026-11-18): flash_latent_mma_win (a ring row) and flash_latent_mma_win_stage (below, a ring-or-staging row), the sink, window and ring-commit forms of the latent walk (crates/gpu/src/flash.rs), at the cc 12.0 scan's values (tools/ref/ptx-shapes/sm_120a-cc12.0.tsv, ptxas 13.3.73 sm_120a: 16 spill, 8 B JIT local, flash_latent_mma_sel's measured cc 12.0 values), not measured on cc 12.1 (the table's card) until a scan on it runs.
+generate_ds41 flash_latent_mma_win 16 8
+# PIN(2026-11-18): flash_latent_mma_win_stage, the staged form of flash_latent_mma_win above: the same measurement and values.
+generate_ds41 flash_latent_mma_win_stage 16 8
 generate_ds41 flash_latent_q8 0 0
 generate_ds41 flash_merge 0 0
 # PIN(2026-11-02): flash_merge_sel shares flash_merge's body (the same walk macro or row body, a per-token key list or row position), pinned at flash_merge's cc 12.1 value here (0 spill, 0 JIT local) until a cc 12.1 scan runs; sm_86 measured 0/0.
 generate_ds41 flash_merge_sel 0 0
+# PIN(2026-11-18): flash_merge_sink, flash_merge_sel_sink and flash_merge_win_sink share flash_merge's body (one sink fold after it), pinned at flash_merge's cc 12.1 value here (0 spill, 0 JIT local) until a cc 12.1 scan runs; sm_86 and sm_120a measured 0/0.
+generate_ds41 flash_merge_sink 0 0
+generate_ds41 flash_merge_sel_sink 0 0
+generate_ds41 flash_merge_win_sink 0 0
 generate_ds41 flash_merge_q8 0 0
 generate_ds41 fp8_b128_gemv 0 0
 generate_ds41 fp8_b128_gemv_mcol 0 0
@@ -402,6 +409,8 @@ generate_ds41 kq_gate_up_act_q5k_at 0 0
 generate_ds41 kq_gate_up_act_q5k_tiles 848 136
 generate_ds41 kq_gate_up_act_q8_0 0 0
 generate_ds41 kv_append 0 0
+# PIN(2026-11-18): kv_ring_commit, a row copy, pinned at kv_append's cc 12.1 value here (0 spill, 0 JIT local) until a cc 12.1 scan runs; sm_86 and sm_120a measured 0/0.
+generate_ds41 kv_ring_commit 0 0
 generate_ds41 kv_append_pos_buf 0 0
 generate_ds41 kv_gather_sel 0 0
 generate_ds41 kv_norm_rope_append 0 0
@@ -578,7 +587,7 @@ generate_ds41 softmax_router_norm_m 32 8
 generate_ds41 softmax_router_norm_m_prefetch 32 8
 generate_ds41 softmax_router_norm_prefetch 0 0
 generate_ds41 softmax_router_route 0 0
-generate_ds41 qwen3moe_token_major 0 0
+generate_ds41 token_major 0 0
 generate_ds41 raon_hc_fold 0 0
 generate_ds41 raon_hc_mean 0 0
 generate_ds41 raon_hc_mix 0 0
@@ -723,3 +732,21 @@ generate_ds41 imat_routed_sum2 0 0
 # PIN(2026-11-14): the card's routed picks collector (imat_card_picks, crates/gpu/src/imatrix.rs) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill, 0 B JIT local), not measured on cc 12.1 (the table's card) until a scan on it runs.
 generate_ds41 imat_card_picks 0 0
 generate_ds41 iq_src_f32 0 0
+# PIN(2026-11-18): the Hy4 common kernels (crates/gpu/src/hc_ident.rs, engram_delta.rs, engram_gate.rs's 3072 instance, route_body.rs's 512/16 floor router)
+# at the cc 12.0 scan's values (tools/ref/ptx-shapes/sm_120a-cc12.0.tsv; ptxas 13.3.73 sm_120a, RTX 5090 driver 615.71.09), not measured on this arch
+# and capability until a scan runs on it.
+generate_ds41 engram_delta_apply 0 0
+generate_ds41 engram_gate_3072 0 0
+generate_ds41 engram_key_norm_3072 0 0
+generate_ds41 engram_kv_bias 0 0
+generate_ds41 engram_rows_norm 0 0
+generate_ds41 hc_ident_head 0 0
+generate_ds41 hc_ident_post 0 0
+generate_ds41 hc_ident_pre 0 0
+generate_ds41 sigmoid_512_16_router 0 0
+generate_ds41 sigmoid_512_16_router_pick 0 0
+# PIN(2026-11-19): the Hy4 indexer kernels index_key_rms_append and index_pool_norm_rope (crates/gpu/src/latent.rs), kpool_score_tail (kpool.rs) and qsa_topk_tail (qsa.rs) at the cc 12.0 scan's values (tools/ref/ptx-shapes/sm_120a-cc12.0.tsv; ptxas 13.3.73 sm_120a, RTX 5090), not measured on this arch and capability until a scan runs on it.
+generate_ds41 index_key_rms_append 0 0
+generate_ds41 index_pool_norm_rope 0 0
+generate_ds41 kpool_score_tail 0 0
+generate_ds41 qsa_topk_tail 0 0

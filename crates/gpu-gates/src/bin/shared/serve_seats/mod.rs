@@ -3,8 +3,8 @@
 //! behind [`bloomery_gpu_gates::bind::Seat`], with a `run(&args)` a binary
 //! calls once. The per-model binaries (`bloomery-serve-ds41`,
 //! `bloomery-serve-qwen38`) include their one seat directly; the one-binary
-//! server (`bloomery-serve --model ds41|qwen38|glm|qwen3|mimo2|solar2|minimaxm3|musespark|mistrallarge4|kimik3|nemotron`)
-//! includes this registry and is one call into the seat the model names.
+//! server (`bloomery-serve --model WORD`, the words of [`SEATS`]) includes this registry and is one call into
+//! the seat the model names.
 //!
 //! A seat's module is its contract's owner: read it for the flags, the
 //! records, the keep rule and the prompt cache. [`glm`] is the GLM-5.3-Flash
@@ -24,7 +24,7 @@
 //! the recipient protocol; [`nemotron`] the Nemotron 3 Nano seat, one
 //! sequence on one card, opened as `gate_nemotron_e2e` opens it.
 //! [`hybrid`] holds the open, load record and calls of the one-chain seat
-//! ([`solar2`], [`flint`], [`kimi_k3`]). [`host_seat`] is the host seat: the file's own host forward with
+//! ([`solar2`], [`flint`], [`kimi_k3`], [`hy4`]). [`host_seat`] is the host seat: the file's own host forward with
 //! no card (deepseek2 today), served through `serve::TargetEngine`.
 //! `drafted` is the
 //! seats' shared MTP draft driver and `served` the owner of the DSpark draft
@@ -104,18 +104,32 @@ pub mod mistrallarge4;
 // (`solar2`): its open, its load record, its calls and its think tags.
 #[cfg(all(
     feature = "deepseek41",
-    any(feature = "solar2", feature = "flint", feature = "kimik3")
+    any(
+        feature = "solar2",
+        feature = "flint",
+        feature = "kimik3",
+        feature = "hy4"
+    )
 ))]
 pub mod hybrid;
 // The hybrid seat's in-file MTP draft: one sequence's window behind the object the seat holds.
 #[cfg(all(
     feature = "deepseek41",
-    any(feature = "solar2", feature = "flint", feature = "kimik3")
+    any(
+        feature = "solar2",
+        feature = "flint",
+        feature = "kimik3",
+        feature = "hy4"
+    )
 ))]
 pub mod hybrid_draft;
 // The Kimi K3 seat, on the hybrid seat's owner: one sequence, its prompt stepped one id at a time.
 #[cfg(all(feature = "deepseek41", feature = "kimik3"))]
 pub mod kimi_k3;
+// The Hy4-flash seat, on the hybrid seat's owner: resident sequences, the prompt stepped one id at
+// a time.
+#[cfg(all(feature = "deepseek41", feature = "hy4"))]
+pub mod hy4;
 // The nemotron seat sits behind `deepseek41` for the same reason: the server
 // surface it binds through is scoped to it, and it runs no V4.1 code. The
 // body it serves is in the gpu crate, so it needs no feature of its own.
@@ -146,3 +160,189 @@ pub mod host_seat;
 // The decide seat: a decision model's backbone on the card, its head on the host.
 #[cfg(feature = "clef")]
 pub mod decide;
+
+// ---- the generative seats' table ----
+//
+// `bloomery-serve` reads this table and nothing else about which models it serves: its words, usage lines,
+// the seat a file takes, and each seat's `run` and `check`. A model's seat is one `seat!` row beside its
+// `pub mod`; the one-binary server's own code names no model.
+
+use bloomery_gpu_gates::{GateError, side_seat};
+use gguf::Split;
+use model::arch::{Arch, DEEPSEEK4};
+use serve::ServeError;
+
+/// A generative seat's `run`: loads the model and serves until the listener or the engine fails.
+pub type Run = fn(&[String], &side_seat::Flags) -> Result<ServeError, GateError>;
+
+/// A generative seat's `check` before the fetch: the arguments, whether the levers are read, and whether the
+/// model comes from a `--hf` repo.
+pub type Check = fn(&[String], bool, bool) -> Result<(), GateError>;
+
+/// How a seat picks its files.
+pub enum Serves {
+    /// The file's `general.architecture` is one of these strings: an architecture no `model::arch::Arch`
+    /// stands for, or one that the registry has no reader for (the host seat's).
+    Names(&'static [&'static str]),
+    /// The file's `general.architecture` names one of these variants through [`Arch::from_name`] (the
+    /// registry's row of the family).
+    Arch(&'static [Arch]),
+    /// The seat reads the file's description and takes the file the program it runs serves: the answer waits
+    /// for the first shard, and this seat is the one that takes a decision row's backbone file as a
+    /// generative model.
+    File(fn(&Split) -> bool),
+}
+
+impl Serves {
+    /// Whether a file of the `general.architecture` `arch` is served; `None` when the answer needs the
+    /// first shard `file` and none is given.
+    pub fn of(&self, arch: &str, file: Option<&Split>) -> Option<bool> {
+        Some(match self {
+            Serves::Names(names) => names.contains(&arch),
+            Serves::Arch(arches) => matches!(Arch::from_name(arch), Ok(a) if arches.contains(&a)),
+            Serves::File(serves) => serves(file?),
+        })
+    }
+}
+
+/// One generative seat: the `--model` word, which files it serves, the lines `--help` prints for it, and
+/// its two entry points.
+pub struct Seat {
+    pub word: &'static str,
+    pub serves: Serves,
+    /// One line a model the seat serves: the word, what it serves and a working example start.
+    pub models: &'static [&'static str],
+    pub run: Run,
+    pub check: Check,
+}
+
+/// A seat's row, the module `$m` supplying `run` and `check`; `source` names a seat whose `check` also
+/// asks whether the model comes from a `--hf` repo.
+macro_rules! seat {
+    ($m:ident, $word:literal, $serves:expr, $models:expr) => {
+        Seat {
+            word: $word,
+            serves: $serves,
+            models: &$models,
+            run: $m::run,
+            check: |args, read, _| $m::check(args, read).map(drop),
+        }
+    };
+    ($m:ident, source, $word:literal, $serves:expr, $models:expr) => {
+        Seat {
+            word: $word,
+            serves: $serves,
+            models: &$models,
+            run: $m::run,
+            check: |args, read, from_repo| $m::check(args, read, from_repo).map(drop),
+        }
+    };
+}
+
+/// Every generative seat. The order is the one a file's seat is looked up in and the refusals list the words
+/// in; the host seat is last, since a card seat is preferred for a file both serve.
+pub const SEATS: &[Seat] = &[
+    seat!(
+        ds41,
+        source,
+        "ds41",
+        Serves::Names(&["deepseek41", DEEPSEEK4]),
+        [
+            "  ds41    DeepSeek-V4.1-Flash          --hf midagedev/DeepSeek-V4.1-Flash-1017-GGUF:bq3km"
+        ]
+    ),
+    seat!(
+        qwen38,
+        source,
+        "qwen38",
+        Serves::Names(&["qwen4exp"]),
+        ["  qwen38  Qwen3.8-Flash-Next           --hf unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL"]
+    ),
+    seat!(
+        glm,
+        source,
+        "glm",
+        Serves::Arch(&[Arch::Glm5next]),
+        ["  glm     GLM-5.3-Flash                --hf unsloth/GLM-5.3-Flash-GGUF:UD-Q4_K_XL"]
+    ),
+    seat!(
+        qwen3,
+        source,
+        "qwen3",
+        Serves::File(|file| bloomery_gpu_gates::qwen_seat::Family::of(file).is_ok()),
+        [
+            "  qwen3   Qwen3-30B-A3B and Qwen3.6    --hf unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF:Q4_K_M"
+        ]
+    ),
+    seat!(
+        mimo2,
+        "mimo2",
+        Serves::Names(&["mimo2"]),
+        ["  mimo2   MiMo-V2.6-Flash              --hf ggml-org/MiMo-V2.6-Flash-MOPD-GGUF:MXFP4"]
+    ),
+    seat!(
+        solar2,
+        "solar2",
+        Serves::Arch(&[Arch::SolarOpen2]),
+        ["  solar2  Solar-Open2-250B             -m <path>"]
+    ),
+    seat!(
+        minimaxm3,
+        "minimaxm3",
+        Serves::Arch(&[Arch::MiniMaxM3]),
+        ["  minimaxm3 MiniMax-M3-UD-IQ4_XS        -m <path>"]
+    ),
+    seat!(
+        nemotron,
+        "nemotron",
+        Serves::Arch(&[Arch::NemotronH, Arch::NemotronHMoe]),
+        [
+            "  nemotron Nemotron 3 Nano             --hf nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF:Q4_K_M",
+            "  nemotron Nemotron 3.5 Bolt            -m <path>"
+        ]
+    ),
+    seat!(
+        raon1,
+        "raon1",
+        Serves::Arch(&[Arch::Raon1]),
+        ["  raon1   Raon-1-mini                  -m <path>"]
+    ),
+    seat!(
+        musespark,
+        "musespark",
+        Serves::Arch(&[Arch::MuseSpark]),
+        ["  musespark Muse Spark Open 816B       -m <path>"]
+    ),
+    seat!(
+        flint,
+        "flint",
+        Serves::Arch(&[Arch::Flint, Arch::ExaoneMoe]),
+        ["  flint   Flint                       -m <path>"]
+    ),
+    seat!(
+        kimi_k3,
+        "kimik3",
+        Serves::Arch(&[Arch::KimiK3]),
+        ["  kimik3  Kimi K3 and K3.1             -m <path>"]
+    ),
+    seat!(
+        hy4,
+        "hy4",
+        Serves::Arch(&[Arch::Hy4]),
+        ["  hy4     Hy4-flash                    -m <path>"]
+    ),
+    seat!(
+        mistrallarge4,
+        "mistrallarge4",
+        Serves::Arch(&[Arch::MistralLarge4]),
+        ["  mistrallarge4 Mistral Large 4 1T-A52B -m <path>"]
+    ),
+    seat!(
+        host_seat,
+        "host",
+        Serves::Names(&["deepseek2"]),
+        [
+            "  host    a file on the CPU alone      -m <path>   (no card; -ngl 0 and -dev none ask for it)"
+        ]
+    ),
+];

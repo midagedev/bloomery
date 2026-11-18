@@ -1,0 +1,14 @@
+Source of hy4-chat-template.jinja (kept byte-exact; this file records it):
+
+`tokenizer.chat_template` of Hy4-flash-Q4_K_M-00001-of-00002.gguf (Tencent's official GGUF of tencent/Hy4-flash, the first shard),
+read from the GGUF header on the box: 17263 bytes,
+md5 bec49a793e2864b5e6751900152e988c
+sha256 09a8ba8fb355300da43229ff491a47d64c98dcfd79eb5881b3c88738953c7b51  hy4-chat-template.jinja
+
+It builds every special tag of the model from one variable, `{%- set HYTK = ':6124c78e' %}` and 22 calls of the form
+`'<｜hy_start{}｜>'.format(HYTK)`, which `crates/jinja` runs as Python's `str.format`. Its assistant `tool_calls` branch teaches
+`<tool_calls:H><tool_call:H>NAME<arg_key:H>KEY</arg_key:H><arg_value:H>VALUE</arg_value:H></tool_call:H>…</tool_calls:H>`, so the
+key/value scan of `crates/serve/src/glmxml.rs` (`KvSpelling::Hy4`) reads it, found by a rendered call and not by the source's
+spelling (no tag is spelled whole in the source). The reasoning span is `<think:H>`…`</think:H>`; the generation prompt ends
+with the open span (`reasoning_effort` high, low or max) or the closed one (`no_think`). Not in `FIXTURE_TEMPLATES`: only
+`tests/hy4.rs` reads it (its render gate and its tool-call gates).

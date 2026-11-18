@@ -67,3 +67,4 @@ ffn_situ	moe	crates/gpu/src/arch/routed_ffn.rs
 token_major	kernel	crates/gpu/src/token_major.rs
 fault_step_order	graph	crates/gpu/src/arch/step_order.rs
 quant_types	quant	crates/gguf/src/qtype.rs crates/gguf/src/iq_tables.rs crates/qdot/src/generic.rs
+hc_engram_common	kernel	crates/gpu/src/hc_ident.rs crates/gpu/src/engram_delta.rs crates/gpu/src/engram_gate.rs

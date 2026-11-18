@@ -833,9 +833,9 @@ mod tests {
         concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/arch-registry.tsv");
     const CATALOG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/catalog.tsv");
     const CENSUS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tools/census/stubs.tsv");
-    const SERVE: &str = concat!(
+    const SEATS: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../gpu-gates/src/bin/bloomery_serve.rs"
+        "/../gpu-gates/src/bin/shared/serve_seats/mod.rs"
     );
     /// Room for any download.
     const ROOM: u64 = 1_000_000_000_000;
@@ -1354,8 +1354,8 @@ mod tests {
         );
     }
 
-    /// Every row names an architecture `tools/arch-registry.tsv` holds and a seat the serve binary
-    /// has a word for.
+    /// Every row names an architecture `tools/arch-registry.tsv` holds and a seat the serve binary's
+    /// seat table has a word for.
     #[test]
     fn every_row_names_a_registry_architecture_and_a_served_seat() {
         let registry = read(ARCH_REGISTRY);
@@ -1366,7 +1366,14 @@ mod tests {
             .filter_map(|line| line.split('\t').next())
             .flat_map(|names| names.split(','))
             .collect();
-        let serve = read(SERVE);
+        let seats = read(SEATS);
+        // A seat's word is the first string literal of its `seat!(` row in the seat table.
+        let words: Vec<&str> = seats
+            .split("seat!(")
+            .skip(1)
+            .filter_map(|row| row.split('"').nth(1))
+            .collect();
+        assert!(!words.is_empty(), "{SEATS}: no seat! row");
         for model in models() {
             assert!(
                 archs.contains(&model.arch),
@@ -1374,10 +1381,9 @@ mod tests {
                 model.name,
                 model.arch
             );
-            let word = format!("\"{}\" => Ok(Word::Seat(", model.seat);
             assert!(
-                serve.contains(&word),
-                "{}: {} is not a --model word of bloomery_serve.rs",
+                words.contains(&model.seat),
+                "{}: {} is not a --model word of the serve seat table",
                 model.name,
                 model.seat
             );

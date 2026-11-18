@@ -52,15 +52,7 @@ impl Batch for Body {
         residency: Residency,
         _slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        if residency != Residency::Off {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "residency {residency:?}: the body keeps the load's slot map for its life \
-                     (BLOOMERY_RESIDENCY off)"
-                ),
-            ));
-        }
+        super::slot_map_for_life(WHAT, residency)?;
         GpuModel::<Body>::open_placed(file, plan, inputs, 0, host)
     }
 
@@ -107,22 +99,13 @@ impl Batch for Body {
     /// The delta layers' state holds the position it stands at alone: a cut keeps that position,
     /// or nothing.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
-        if n >= m.pos() { m.pos() } else { 0 }
+        crate::keep_where_it_stands(m, n)
     }
 
     /// Back to empty at 0 (a reset), or the position the model stands at (nothing to take back);
     /// any other cut is refused by name, since the body takes no position back.
     fn cut(m: &mut GpuModel<Body>, n: u32) -> Result<(), GpuError> {
-        match n {
-            0 => m.reset(),
-            n if n >= m.pos() => Ok(()),
-            n => Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "a cut to position {n} of {}: the delta layers' state takes no position back",
-                    m.pos()
-                ),
-            )),
-        }
+        let why = "the delta layers' state takes no position back";
+        crate::cut_where_it_stands(m, n, (WHAT, why))
     }
 }

@@ -113,7 +113,7 @@ use crate::hc::{
     HcPreScratch, hc_fold_elem, hc_post_elem,
 };
 use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
-use crate::transpose::TransposeKernels;
+use bloomery_gpu::token_major::TokenMajor;
 
 mod batch;
 mod tier;
@@ -1203,7 +1203,7 @@ pub struct FfnPiece {
     hc: HcKernels,
     /// The row-major-to-token-major copy of a prompt batch's shared down
     /// projection ([`FfnBatch`]).
-    transpose: TransposeKernels,
+    transpose: TokenMajor,
     kernels: FfnKernels,
     layers: Range<usize>,
     cfg: Vec<LayerCfg>,
@@ -1342,7 +1342,7 @@ impl FfnPiece {
             experts: ExpertKernels::load(ctx)?,
             dense: DenseKernels::load(ctx)?,
             hc: HcKernels::load(ctx)?,
-            transpose: TransposeKernels::load(ctx)?,
+            transpose: TokenMajor::load(ctx)?,
             kernels: FfnKernels::load(ctx)?,
             layers,
             cfg,

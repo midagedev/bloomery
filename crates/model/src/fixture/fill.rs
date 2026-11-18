@@ -154,6 +154,11 @@ pub enum Rule {
     /// without the tensor's scale [`NVFP4_TENSOR_SCALE`] `S`, which the
     /// engine multiplies by.
     Nvfp4 { s_lo: u8, p_lo: u64 },
+    /// ggml's F8_E4M3 with no scale (one byte a value): the sign uniform and the magnitude code
+    /// uniform over the 127 codes below the NaN, so every value is finite, at most 448. The value is
+    /// the code's own; a file stores such a table with every row scaled to the format's amax and the
+    /// scale dropped, so the first norm that reads a row undoes the scale and the rule has no `1/√K`.
+    E4m3,
     /// Uniform in `[−half_width, half_width)`, rounded to the type.
     Uniform { ty: FloatTy, half_width: f32 },
     /// Every element `value` (F32).
@@ -279,6 +284,9 @@ impl Rule {
                     s_lo + 1,
                     d(s_lo + 1)
                 )
+            }
+            Rule::E4m3 => {
+                "no scale, sign and magnitude code uniform over the 254 finite codes".to_string()
             }
             Rule::Uniform { ty, half_width } => {
                 format!("{} uniform in ±{half_width:.4e}", ty.ggml())
@@ -529,6 +537,7 @@ pub fn rule_for(name: &str, ty: GgmlType, k: u64, window: Window) -> Result<Rule
         GgmlType::NVFP4 => {
             nvfp4_rule(sigma, window).ok_or_else(|| no_scale("UE4M3 scale byte pair"))
         }
+        GgmlType::F8E4M3 => Ok(Rule::E4m3),
         GgmlType::F32 => Ok(uniform(FloatTy::F32)),
         GgmlType::F16 => Ok(uniform(FloatTy::F16)),
         GgmlType::BF16 => Ok(uniform(FloatTy::BF16)),
@@ -874,6 +883,18 @@ pub(super) fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
                 rng.fill(codes);
             }
         }
+        Rule::E4m3 => {
+            // Two codes a step: the low 16 bits of a 32-bit half give the magnitude (0..=126, the
+            // 127 codes below the NaN's 127), its top bit the sign.
+            let (words, tail) = out.as_chunks_mut::<2>();
+            for pair in words {
+                let r = rng.step();
+                *pair = [r as u32, (r >> 32) as u32].map(e4m3_code);
+            }
+            if let Some(last) = tail.first_mut() {
+                *last = e4m3_code(rng.step() as u32);
+            }
+        }
         Rule::Uniform { ty, half_width } => {
             let u = |r: u64| ((r >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * half_width;
             match ty {
@@ -900,6 +921,14 @@ pub(super) fn fill_units(rule: &Rule, rng: &mut Rng, out: &mut [u8]) {
             }
         }
     }
+}
+
+/// One F8_E4M3 code from 32 random bits: the sign is bit 31, the magnitude `(r & 0xffff)·127 >> 16`
+/// (0..=126, every code below the NaN's), each of the 127 magnitudes taking 516 or 517 of the 65,536
+/// values.
+fn e4m3_code(r: u32) -> u8 {
+    let magnitude = ((r & 0xffff) * 127) >> 16;
+    (((r >> 31) as u8) << 7) | magnitude as u8
 }
 
 /// f32 → bf16 bits, round to nearest even (the values are finite).

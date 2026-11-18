@@ -15,7 +15,7 @@ use models::KdaGate;
 
 use super::names::OUTPUT_RES_SCORE;
 use super::roles::{KINDS, stems_of};
-use crate::arch::classify::block_stem;
+use crate::arch::classify;
 use crate::arch::delta_mla::{self, Mla, Situ};
 use crate::arch::hybrid::{layers_agree, no_nextn};
 use crate::arch::noaux::{self, Experts};
@@ -477,44 +477,9 @@ impl Indexer {
 }
 
 /// Every tensor of `split` is held in a type the engine reads its stem in
-/// ([`released::allowed_types`], the union of the released set, the engine's quantization and the
-/// checkpoint as `prepare` writes it): the first tensor of another type, by name, with how many
-/// more there are. A name that is no stem of the table is not this check's: the classifier lists
-/// it.
+/// ([`released::allowed_types`]), refused as the Kimi K3 reader ([`classify::types_agree`]).
 fn types_agree(split: &Split, n_layer: usize) -> Result<(), PlacementError> {
-    let mut off: Vec<(String, String)> = Vec::new();
-    for (_, t) in split.iter_tensors() {
-        let stem = block_stem(&t.name, n_layer).map_or(t.name.as_str(), |(_, stem)| stem);
-        let Some(allowed) = released::allowed_types(stem) else {
-            continue;
-        };
-        if !allowed.contains(&t.ty) {
-            let list: Vec<String> = allowed.iter().map(ToString::to_string).collect();
-            off.push((
-                t.name.clone(),
-                format!(
-                    "{} is {} (the engine reads {stem} as {})",
-                    t.name,
-                    t.ty,
-                    list.join(" or ")
-                ),
-            ));
-        }
-    }
-    match off.first() {
-        None => Ok(()),
-        Some((name, _)) => Err(PlacementError::Tensor {
-            name: name.clone(),
-            detail: format!(
-                "is of a type the Kimi K3 reader does not run the tensor in ({} such: {})",
-                off.len(),
-                off.iter()
-                    .map(|(_, d)| d.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }),
-    }
+    classify::types_agree(split, n_layer, "Kimi K3", released::allowed_types)
 }
 
 #[cfg(test)]
@@ -1292,7 +1257,7 @@ pub(super) mod tests {
             match got {
                 Ok(_) => panic!("{tag}: read"),
                 Err(e) => assert!(
-                    e.contains(name) && e.contains("the engine reads"),
+                    e.contains(name) && e.contains("the Kimi K3 reader runs"),
                     "{tag}: {e}"
                 ),
             }
@@ -1602,7 +1567,7 @@ pub(super) mod tests {
             match got {
                 Ok(_) => panic!("{tag}: read"),
                 Err(e) => assert!(
-                    e.contains(name) && e.contains("the engine reads"),
+                    e.contains(name) && e.contains("the Kimi K3 reader runs"),
                     "{tag}: {e}"
                 ),
             }

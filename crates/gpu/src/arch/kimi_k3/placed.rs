@@ -33,10 +33,10 @@ use super::pass::PlacedPass;
 use super::{Ffn, Instance, Layer, MoeDims, Walk};
 use crate::arch::hybrid::{Acts, GqaCx};
 use crate::arch::routed_ffn::{FfnKernels, Glu, Routed};
-use crate::card_leg::{LegBufs, LegRun, LegShape, LegStacks, LegSum};
+use crate::card_leg::{LegBufs, LegShape, LegStacks, LegSum};
 use crate::card_slots::CardSlotKernels;
-use crate::host::handoff::{Handoff, HandoffKernels};
 use crate::host::leg_tier::{Hang, LegOpen};
+use crate::host::placed::{PlacedHost, PlacedSide, SideShape};
 use crate::host::run::{HostRun, HostWidths};
 use crate::host::served::{ResidencyParts, TierBody};
 use crate::host::shell::TierShell;
@@ -46,9 +46,9 @@ use crate::host::{StepLeg, refuse_tier_count};
 use crate::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
 use crate::kquant::Act;
 use crate::model::hosted_hybrid_at;
-use crate::routed_block::{RouteIn, RouterEntry, handoff_go};
+use crate::routed_block::{RouteIn, RouterEntry};
 use crate::weights::Weights;
-use crate::{DeviceTensor, Gpu, GpuError};
+use crate::{Gpu, GpuError};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -80,38 +80,23 @@ pub(super) struct EmbedHost {
     row: Vec<f32>,
 }
 
-/// The stage card's side of a placed load: which layers the host or the tier serve a share of,
-/// each routed layer's card count and slot-map row, the slot map's card copy, the handoff and sum
-/// launches and the places of one layer's slots.
+/// The stage card's side of a placed load beside the common one ([`PlacedSide`]): the tier's sum
+/// launches and the stage card's side of the expert tier.
 pub(super) struct Side {
-    pub(super) hosted: Vec<bool>,
-    pub(super) n_card: Vec<usize>,
-    pub(super) row_off: Vec<usize>,
-    /// The slot map's card copy, one row of `n_expert` places a routed layer.
-    pub(super) slots: Arc<DeviceTensor<u32>>,
-    handoff: HandoffKernels,
     pub(super) acc_k: CardSlotKernels,
-    /// The routed slots' places in the card's stacks, or `HOST`.
-    sel: DeviceBuffer<u32>,
     /// The stage card's side of the expert tier, when the plan hangs one.
     pub(super) tier: Option<TierParts>,
 }
 
-/// The placed side of a load: the host tier and its glue, what the walk reads beside them, and the
-/// token embedding. The shell is the first field: the residency machine stops before any card or
-/// pinned memory frees.
+/// The placed side of a load: the common host tier and stage-card side, what the walk reads beside
+/// them, and the token embedding. The host is the first field: its drop stops the residency
+/// machine before any card or pinned memory frees.
 pub struct Placed {
-    pub(super) shell: TierShell<HostRun>,
+    pub(super) host: PlacedHost,
     pub(super) side: Side,
     pub(super) embed: EmbedHost,
     /// The placed pass's buffers, on a load whose plan reserved them ([`Placed::attach_pass`]).
     pub(super) pass: Option<Box<PlacedPass>>,
-}
-
-impl Drop for Placed {
-    fn drop(&mut self) {
-        self.shell.hybrid.stop_swap();
-    }
 }
 
 /// What [`Placed::new`] is made from.
@@ -154,40 +139,27 @@ impl Placed {
         let n = layers.len();
         let tiers = TierOpen::of_machine(plan.machine)?;
         refuse_tier_count(PLACED, tiers.len())?;
-        let (mut hosted, mut n_card, mut row_off) = (vec![false; n], vec![0; n], vec![0; n]);
-        let shape = LegShape {
+        let leg = LegShape {
             cap: 1,
             slots_per_col: n_used,
             n: hp.latent,
             ff: hp.experts.ff,
         };
-        let run = map.layers();
-        for l in run.clone() {
-            let on_card = map.on_card(l)?;
-            n_card[l] = on_card;
-            row_off[l] = map.row_offset(l).ok_or_else(|| {
-                GpuError::shape(PLACED, format!("layer {l}: a routed layer with no map row"))
-            })?;
-            hosted[l] = on_card < n_expert;
-            if on_card > 0 {
-                let Ffn::Routed(r) = &layers[l].ffn else {
-                    return Err(GpuError::shape(
-                        PLACED,
-                        format!("layer {l}: experts on the card of a layer with no routed block"),
-                    ));
-                };
-                LegStacks::of_resident(w, r.stacks.each_ref().map(String::as_str))?
-                    .check(on_card, shape)?;
-            }
-        }
-        let hosted_set: Vec<usize> = (0..n).filter(|&l| hosted[l]).collect();
-        let stream = gpu.stream();
-        let slots = Arc::new(DeviceTensor::upload(
-            stream,
-            &map.stage_view(),
-            run.len(),
+        let shape = SideShape {
             n_expert,
-        )?);
+            n_used,
+            width: hp.latent,
+        };
+        let placed_side = PlacedSide::new(gpu, &map, (n, shape), PLACED, |l, on_card| {
+            let Ffn::Routed(r) = &layers[l].ffn else {
+                return Err(GpuError::shape(
+                    PLACED,
+                    format!("layer {l}: experts on the card of a layer with no routed block"),
+                ));
+            };
+            LegStacks::of_resident(w, r.stacks.each_ref().map(String::as_str))?.check(on_card, leg)
+        })?;
+        let hosted_set = placed_side.hosted_set();
         let hang = (!tiers.is_empty()).then(|| Hang {
             tiers: &tiers,
             family: &NODE_FAMILY,
@@ -235,15 +207,12 @@ impl Placed {
             ));
         }
         Ok(Placed {
-            shell: TierShell::new(hybrid, glue, hp.n_embd, PLACED),
+            host: PlacedHost {
+                shell: TierShell::new(hybrid, glue, hp.n_embd, PLACED),
+                side: placed_side,
+            },
             side: Side {
-                hosted,
-                n_card,
-                row_off,
-                slots,
-                handoff: HandoffKernels::load(gpu.context())?,
                 acc_k: CardSlotKernels::load(gpu.context())?,
-                sel: DeviceBuffer::zeroed(stream, n_used)?,
                 tier,
             },
             embed: EmbedHost {
@@ -258,8 +227,8 @@ impl Placed {
     /// sets and union slabs for its rows. Load-time only.
     pub(super) fn attach_pass(&mut self, gpu: &Gpu, pass: PlacedPass) -> Result<(), GpuError> {
         let rows = pass.shape().rows;
-        self.shell.hybrid.prepare_batch(gpu.context(), rows)?;
-        self.shell.hybrid.host_mut().prepare_union(rows)?;
+        self.host.shell.hybrid.prepare_batch(gpu.context(), rows)?;
+        self.host.shell.hybrid.host_mut().prepare_union(rows)?;
         gpu.stream().synchronize()?;
         self.pass = Some(Box::new(pass));
         Ok(())
@@ -269,7 +238,7 @@ impl Placed {
     /// column): the resident path of `HostLayer::experts_into` serves the step only through them.
     /// Load-time only, on a load without a pass (a pass load makes them for its rows).
     pub(super) fn prepare_step_union(&mut self) -> Result<(), GpuError> {
-        self.shell.hybrid.host_mut().prepare_union(1)
+        self.host.prepare_step_union()
     }
 
     /// Device bytes the placed pass holds; 0 on a load without it.
@@ -280,8 +249,7 @@ impl Placed {
     /// Device bytes the placed side holds beside the plan's terms for the tier: the slot map's
     /// card copy, the places and the boundary.
     pub(super) fn device_bytes(&self) -> usize {
-        let s = &self.side;
-        s.slots.buf().num_bytes() + s.sel.num_bytes() + self.shell.hybrid.boundary().device_bytes()
+        self.host.device_bytes()
     }
 
     /// Device bytes the stage card's side of the expert tier holds: what the plan's tier reserve
@@ -290,22 +258,11 @@ impl Placed {
         self.side.tier.as_ref().map_or(0, TierParts::bytes)
     }
 
-    /// Layer `l` of the model: a layer past it panics by name, as no accessor below answers for a
-    /// layer the model does not have.
-    fn layer(&self, what: &str, l: usize) -> usize {
-        assert!(
-            l < self.side.hosted.len(),
-            "{what}: layer {l} is past the model's {} layers",
-            self.side.hosted.len()
-        );
-        l
-    }
-
     /// The expert tier's experts of layer `l`: 0 off the tier and on a load that hangs none. A
     /// layer past the model panics by name.
     #[must_use]
     pub fn tier_k(&self, l: usize) -> usize {
-        let l = self.layer("tier_k", l);
+        let l = self.host.side.layer("tier_k", l);
         self.side.tier.as_ref().map_or(0, |t| t.k(l))
     }
 
@@ -313,25 +270,25 @@ impl Placed {
     /// name.
     #[must_use]
     pub fn hosted(&self, l: usize) -> bool {
-        self.side.hosted[self.layer("hosted", l)]
+        self.host.side.hosted(l)
     }
 
     /// The card's experts of layer `l`: 0 on the dense layer. A layer past the model panics by
     /// name.
     #[must_use]
     pub fn n_card(&self, l: usize) -> usize {
-        self.side.n_card[self.layer("n_card", l)]
+        self.host.side.n_card(l)
     }
 
     /// The host tier, for a gate's instrument.
     #[must_use]
     pub fn hybrid(&self) -> &Hybrid<HostRun> {
-        &self.shell.hybrid
+        self.host.hybrid()
     }
 
     /// The host tier's settling ([`crate::host::HostTier::settle`]).
     pub(super) fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.shell.hybrid.settle(stream)
+        self.host.reset(stream)
     }
 
     /// The step's embedding row of `token` into `y` (the first sum buffer), and the position
@@ -359,23 +316,24 @@ impl Placed {
     }
 }
 
+/// The common host's ([`PlacedHost`]).
 impl TierBody for Placed {
     type Experts = HostRun;
 
     fn hybrid(&self) -> &Hybrid<HostRun> {
-        &self.shell.hybrid
+        self.host.hybrid()
     }
 
     fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {
-        &mut self.shell.hybrid
+        self.host.hybrid_mut()
     }
 
     fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
-        self.shell.residency_parts(&self.side.slots)
+        self.host.residency_parts()
     }
 
     fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {
-        self.shell.hybrid.serve_captured_of(chain)
+        self.host.serve_chain(chain)
     }
 }
 
@@ -507,7 +465,7 @@ pub(super) fn front<R: RouterEntry>(
     (k, p): (&FfnKernels<R>, &mut Bufs<R>),
     b: &Block<'_>,
     acts: &mut Acts,
-    side: &mut Side,
+    (placed, side): (&mut PlacedSide, &mut Side),
     hy: &mut Hybrid<HostRun>,
 ) -> Result<(), GpuError> {
     let (cx, l) = (b.cx, b.l);
@@ -528,24 +486,12 @@ pub(super) fn front<R: RouterEntry>(
     k.router.route(gpu.stream(), b.xn, &rin, &mut p.route)?;
     lat.down
         .project(cx, acts, l, b.xn, hy.boundary_mut().normed_mut())?;
-    let Side {
-        slots,
-        row_off,
-        handoff,
-        sel,
-        tier,
-        ..
-    } = side;
-    let h = Handoff {
-        ids: R::out_ids(&p.route),
-        weights: R::out_weights(&p.route),
-        map: slots.buf(),
-        row_off: row_off[l],
-        n_expert: R::N_EXPERT,
-    };
-    match tier.as_mut().filter(|t| t.k(l) > 0) {
-        Some(t) => t.enqueue_step_go(gpu, handoff, &h, hy, l, sel),
-        None => handoff_go(gpu, handoff, &h, hy, (l, 0), sel),
+    let picks = (R::out_ids(&p.route), R::out_weights(&p.route));
+    match side.tier.as_mut().filter(|t| t.k(l) > 0) {
+        Some(t) => placed.with_handoff(l, picks, |handoff, h, sel| {
+            t.enqueue_step_go(gpu, handoff, h, hy, l, sel)
+        }),
+        None => placed.go(gpu, picks, hy, l),
     }
 }
 
@@ -555,25 +501,18 @@ pub(super) fn shadow<R: RouterEntry>(
     (k, p): (&FfnKernels<R>, &mut Bufs<R>),
     b: &Block<'_>,
     acts: &mut Acts,
-    side: &Side,
+    placed: &PlacedSide,
     hy: &Hybrid<HostRun>,
 ) -> Result<(), GpuError> {
     let (cx, l) = (b.cx, b.l);
     let r = b.routed()?;
     shared_stack(cx, (acts, b.rule), (l, &r.shared), b.xn, p)?;
-    let n_card = side.n_card[l];
-    if n_card == 0 {
+    if placed.n_card(l) == 0 {
         return Ok(());
     }
     let stacks = LegStacks::of_resident(cx.w, r.stacks.each_ref().map(String::as_str))?;
-    let run = LegRun {
-        layer: l,
-        stacks: &stacks,
-        normed: hy.boundary().normed(),
-        m: 1,
-        sel: &side.sel,
-        n_card,
-        rule: b.rule,
+    let Some(run) = placed.card_run(l, &stacks, hy.boundary().normed(), b.rule) else {
+        return Ok(());
     };
     let Bufs {
         route, leg, acc, ..
@@ -596,7 +535,7 @@ pub(super) fn back<R: RouterEntry>(
     p: &mut Bufs<R>,
     b: &Block<'_>,
     acts: &mut Acts,
-    side: &Side,
+    (placed, side): (&PlacedSide, &Side),
     hy: &mut Hybrid<HostRun>,
     update: &mut DeviceBuffer<f32>,
 ) -> Result<(), GpuError> {
@@ -613,7 +552,7 @@ pub(super) fn back<R: RouterEntry>(
     let gain = r.sum_norm.as_deref().ok_or_else(|| {
         GpuError::shape(STEP, format!("layer {l}: a routed block with no sum norm"))
     })?;
-    let n_card = side.n_card[l];
+    let n_card = placed.n_card(l);
     let n_tier = side.tier.as_ref().map_or(0, |t| t.k(l));
     if n_tier > 0 {
         hy.enqueue_tier_back(stream, l, 0)?;
@@ -678,6 +617,7 @@ pub(super) struct StepWalk<'a> {
     pub(super) walk: Walk<'a>,
     pub(super) layers: &'a mut [Layer],
     pub(super) router: &'a mut Instance,
+    pub(super) placed: &'a mut PlacedSide,
     pub(super) side: &'a mut Side,
     /// The blocks' rule and the router's scale.
     pub(super) rule: (Act, f32),
@@ -697,7 +637,7 @@ impl<'a> LayerProgram for StepWalk<'a> {
     type Port = StepLeg<'a, HostRun>;
 
     fn host_leg(&self, at: At) -> bool {
-        self.side.hosted[at.layer]
+        self.placed.hosted(at.layer)
     }
 
     /// A layer with no tier or host share whole; a hosted one up to its go.
@@ -708,13 +648,14 @@ impl<'a> LayerProgram for StepWalk<'a> {
             walk,
             layers,
             router,
+            placed,
             side,
             latent,
             ..
         } = self;
         let layer = &mut layers[l];
         walk.attn_half(l, layer)?;
-        if !side.hosted[l] {
+        if !placed.hosted(l) {
             router.run(
                 &walk.cx,
                 &mut *walk.acts,
@@ -734,13 +675,13 @@ impl<'a> LayerProgram for StepWalk<'a> {
             f: &layer.ffn,
             xn: &walk.s.ffn_xn,
         };
-        router.front(&b, &mut *walk.acts, side, leg.hybrid())
+        router.front(&b, &mut *walk.acts, (placed, side), leg.hybrid())
     }
 
     /// The card's slots and the shared stack of a hosted layer, under the host's work.
     fn shadow(&mut self, leg: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
-        if !self.side.hosted[l] {
+        if !self.placed.hosted(l) {
             return Ok(());
         }
         let (rule, scale) = self.rule;
@@ -748,7 +689,7 @@ impl<'a> LayerProgram for StepWalk<'a> {
             walk,
             layers,
             router,
-            side,
+            placed,
             latent,
             ..
         } = self;
@@ -761,14 +702,14 @@ impl<'a> LayerProgram for StepWalk<'a> {
             f: &layers[l].ffn,
             xn: &walk.s.ffn_xn,
         };
-        router.shadow(&b, &mut *walk.acts, side, &*leg.hybrid())
+        router.shadow(&b, &mut *walk.acts, placed, &*leg.hybrid())
     }
 
     /// A hosted layer from the join on: the cards' and the host's sums and the block's tail, then
     /// the update added to the sum.
     fn back(&mut self, leg: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
-        if !self.side.hosted[l] {
+        if !self.placed.hosted(l) {
             return Ok(());
         }
         let (rule, scale) = self.rule;
@@ -776,6 +717,7 @@ impl<'a> LayerProgram for StepWalk<'a> {
             walk,
             layers,
             router,
+            placed,
             side,
             latent,
             ..
@@ -793,7 +735,7 @@ impl<'a> LayerProgram for StepWalk<'a> {
             router.back(
                 &b,
                 &mut *walk.acts,
-                side,
+                (&**placed, &**side),
                 (leg.hybrid(), &mut walk.s.update),
             )?;
         }

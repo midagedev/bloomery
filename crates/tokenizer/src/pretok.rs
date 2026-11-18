@@ -1,6 +1,6 @@
 //! The pre-tokenizers of the vocabularies this crate runs, as the reference
 //! runs them: [`Pre::DeepseekV3`] (`deepseek-v3`, `hunyuan-dense`,
-//! `joyai-llm`), [`Pre::DeepseekLlm`] (`deepseek-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`),
+//! `joyai-llm`), [`Pre::HyV4`] (`hy_v4`), [`Pre::DeepseekLlm`] (`deepseek-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`),
 //! [`Pre::Glm4`] (`glm4`), [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`),
 //! [`Pre::Tekken`] (`tekken`, `pixtral`), [`Pre::TekkenNum3`] (`tekken-num3`),
 //! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
@@ -1042,6 +1042,11 @@ pub(crate) struct Scratch {
 pub(crate) enum Pre {
     /// `deepseek-v3`, `hunyuan-dense`, `joyai-llm`: three regexes in turn.
     DeepseekV3,
+    /// `hy_v4`: [`Pre::DeepseekV3`]'s three regexes under the strict UTF-8 reader ([`Pre::strict_utf8`]) of the tree
+    /// that reads the name (llama.cpp mainline, which carries the check; the oracle's ids of an overlong form are
+    /// two replacement characters, where the older readers' are a NUL). No folder's `tokenizer.json` is run as this
+    /// name yet, so it has no Hugging Face reading.
+    HyV4,
     /// `deepseek-v3` as a Hugging Face `tokenizer.json` runs it: classes are Unicode 14.0's, and
     /// BPE skips a byte its vocabulary lacks. Never named in a header; a vocabulary with
     /// `tokenizer.bloomery.eog_token_ids` gets it.
@@ -1113,10 +1118,11 @@ pub(crate) enum Pre {
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 20] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 21] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
+        ("hy_v4", Pre::HyV4),
         ("deepseek-llm", Pre::DeepseekLlm),
         ("qwen2", Pre::Qwen2),
         ("solar-open", Pre::Qwen2),
@@ -1181,7 +1187,7 @@ impl Pre {
     /// Whether the reference decodes UTF-8 strictly, independently of NFC.
     /// An overlong form is not a codepoint there; older readers accept it. The trees that read
     /// `gpt-4o`, `raon`, `flint`, `tekken` (every tree that maps `pixtral` to it has the check)
-    /// `tekken-num3`, `kimi-k2` (read by the same mainline tree) and `exaone-moe` (a name
+    /// `tekken-num3`, `kimi-k2` (read by the same mainline tree), `exaone-moe` and `hy_v4` (names
     /// younger than the check) reject it; the trees the other names' sets are read by (ik, the
     /// Solar-Open2 patch, mainline before the check) accept it.
     pub(crate) fn strict_utf8(self) -> bool {
@@ -1194,6 +1200,7 @@ impl Pre {
                 | Pre::TekkenNum3
                 | Pre::KimiK2
                 | Pre::ExaoneMoe
+                | Pre::HyV4
         )
     }
 
@@ -1203,6 +1210,7 @@ impl Pre {
             Pre::Gemma4 => Spelling::Metaspace,
             Pre::DeepseekV3
             | Pre::DeepseekV3Hf
+            | Pre::HyV4
             | Pre::DeepseekLlm
             | Pre::Qwen2
             | Pre::Glm4
@@ -1236,7 +1244,7 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
     };
     s.collapsed.extend(cpts.iter().map(|&cp| class(cp)));
     match pre {
-        Pre::DeepseekV3 | Pre::DeepseekV3Hf => split_ordered(cpts, s, match_word),
+        Pre::DeepseekV3 | Pre::DeepseekV3Hf | Pre::HyV4 => split_ordered(cpts, s, match_word),
         Pre::Flint => split_ordered(cpts, s, match_flint),
         Pre::DeepseekLlm => split_deepseek_llm(cpts, s),
         Pre::Qwen2 => {
@@ -1659,6 +1667,31 @@ mod tests {
     #[test]
     fn solar_open_is_qwen2() {
         assert_eq!(crate::named(&Pre::NAMES, "solar-open"), Some(Pre::Qwen2));
+    }
+
+    /// `hy_v4` is a row of its own (the UTF-8 reader of its tree is the strict one) that runs the
+    /// deepseek-v3 splitter: the reference maps the name to the same three regexes. FAIL-first: a row
+    /// that runs another splitter fails the words, one on the lenient reader fails `strict_utf8`.
+    #[test]
+    fn hy_v4_is_deepseek_v3_with_the_strict_reader() {
+        assert_eq!(crate::named(&Pre::NAMES, "hy_v4"), Some(Pre::HyV4));
+        assert!(crate::runs_pre_tokenizer("hy_v4"));
+        assert!(Pre::HyV4.strict_utf8());
+        assert!(!Pre::DeepseekV3.strict_utf8());
+        assert_eq!(Pre::HyV4.hf_reading(), None);
+        for text in [
+            "Hello, world! It's 12345 x1234y",
+            "한국어 문장 中文123 日本語カタカナ ｶﾀｶﾅ",
+            "  lead\n\n  trail \t x",
+            "fn main() { a->b; }",
+        ] {
+            assert_eq!(
+                words(Pre::HyV4, text),
+                words(Pre::DeepseekV3, text),
+                "{text:?}"
+            );
+        }
+        assert_eq!(words(Pre::HyV4, "12345"), ["123", "45"]);
     }
 
     /// `lfm2` runs the llama3 splitter: mainline maps `tokenizer.ggml.pre = lfm2` to its

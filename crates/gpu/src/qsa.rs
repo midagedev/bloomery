@@ -21,6 +21,14 @@
 //! tie at the cut (`runtime::qsa::Tie::Higher`, ik's CPU `top_k`), and each
 //! row's list length written as its attention's visible count.
 //!
+//! Hy4-flash's k-pool selector (`attention.indexer.kpool_select_tail`) always
+//! lists the pool its row sits in, through [`qsa_kernels::qsa_topk_tail`]: a
+//! row of live count `c` sees the `(c − 1) / 4` pools that end before its
+//! position ([`scored_tail`]), keeps `kept` of them (the lower pools of a tie,
+//! as llama.cpp's CPU `top_k` keeps the earlier of two equal scores), and its
+//! tail is its own pool's positions up to its own, one to four of them
+//! ([`tail_width`]).
+//!
 //! Four launches:
 //! - [`qsa_kernels::qsa_pool`] — the key of every pool some row completes
 //!   (`c % 4 == 0` completes pool `c/4 − 1`) from the raw indexer keys: the
@@ -125,6 +133,12 @@ pub const RING_ROWS: usize = POOL - 1 + crate::linear::PASS_ROWS;
 pub const fn list_width(kept: usize) -> usize {
     kept * POOL + POOL - 1
 }
+/// The longest list of a forced-tail selector for `kept` pools
+/// ([`qsa_kernels::qsa_topk_tail`]): their tokens and its own pool's four.
+#[must_use]
+pub const fn tail_width(kept: usize) -> usize {
+    kept * POOL + POOL
+}
 
 const _: () = assert!(HEADS == 4 && DIM == 128 && ROT == 64 && POOL == 4);
 // The pool pass's launch contract names the ring's length as a literal.
@@ -174,6 +188,17 @@ const _: () = assert!(FINE_PER * TOPK_THREADS as usize == FINE_BINS);
 #[must_use]
 pub fn scored(count: u32, ctx: u32, kept: u32) -> bool {
     count >= 1 && count <= ctx && count / POOL as u32 > kept
+}
+
+/// [`scored`] for a forced-tail selector: an accepted count (`1..=ctx`) whose
+/// row sees more than `kept` of the pools that end before its position,
+/// `(count − 1) / 4` — its own pool is its tail, complete or not. The
+/// forced-tail score pass (`kpool::kpool_score_tail`) and top-k pass
+/// ([`qsa_kernels::qsa_topk_tail`]) both decide through this.
+#[inline(always)]
+#[must_use]
+pub fn scored_tail(count: u32, ctx: u32, kept: u32) -> bool {
+    count >= 1 && count <= ctx && (count - 1) / POOL as u32 > kept
 }
 
 /// The order-preserving key of a score — `runtime::qsa::order_key`.
@@ -1632,6 +1657,213 @@ mod qsa_kernels {
             unsafe { *vis.get_unchecked_mut(2 * t + 1) = (kept_tokens + tail) as u32 };
         }
     }
+
+    /// [`qsa_topk`] for a forced-tail selector (module doc): block `t` writes
+    /// row `t`'s list into `list[t·width ..]` and its length into `n_sel[t]`.
+    /// A row of live count `c` sees the `n = (c − 1) / 4` pools that end
+    /// before its position; a [`scored_tail`] row keeps every pool above the
+    /// `kept`-th order key and the first pools equal to it in pool order,
+    /// written as their tokens in pool order, then its tail `4n .. c` (one to
+    /// four positions), length `4·kept + c − 4n`; a row that sees at most
+    /// `kept` pools gets `0 .. c`; a refused count (0, or past the cache)
+    /// gets length 0 and raises [`FaultSite::PoolSelect`].
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys.len() >= m,
+            pools * 4 >= ctx,
+            scores.len() >= m * pools,
+            width >= kept * 4 + 4,
+            list.len() >= m * width,
+            n_sel.len() >= m
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+    )]
+    pub fn qsa_topk_tail(
+        n_keys: &[u32],
+        scores: &[f32],
+        ctx: u32,
+        pools: u32,
+        kept: u32,
+        width: u32,
+        m: u32,
+        fault: FaultSink,
+        mut list: DisjointSlice<u32>,
+        mut n_sel: DisjointSlice<u32>,
+    ) {
+        static mut FINE: SharedArray<u32, FINE_BINS> = SharedArray::UNINIT;
+        static mut WSUM: SharedArray<u32, TOPK_WARPS> = SharedArray::UNINIT;
+        static mut WTOT: SharedArray<u32, { 2 * TOPK_WARPS }> = SharedArray::UNINIT;
+        static mut PICK: SharedArray<u32, 2> = SharedArray::UNINIT;
+
+        let t = thread::blockIdx_x() as usize;
+        if t >= m as usize {
+            return; // block-uniform
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id();
+        let wid = tid / 32;
+        let lbase = t * width as usize;
+        // SAFETY: t < m <= n_keys.len() by the launch contract.
+        let c = unsafe { *n_keys.get_unchecked(t) };
+        if !scored_tail(c, ctx, kept) {
+            let accepted = c >= 1 && c <= ctx;
+            let len = if accepted { c as usize } else { 0 };
+            let mut i = tid;
+            while i < len {
+                // SAFETY: a row that does not select has (c − 1)/4 <= kept, so
+                // c <= 4·kept + 4 <= width and lbase + i < m·width <=
+                // list.len(); thread tid alone writes entries tid + 512·r.
+                unsafe { *list.get_unchecked_mut(lbase + i) = i as u32 };
+                i += TOPK_THREADS as usize;
+            }
+            if tid == 0 {
+                if !accepted {
+                    fault.raise(FaultSite::PoolSelect);
+                }
+                // SAFETY: t < m <= n_sel.len() (launch contract).
+                unsafe { *n_sel.get_unchecked_mut(t) = len as u32 };
+            }
+            return; // block-uniform
+        }
+        // SAFETY: block-shared statics; the raw forms reach them without a
+        // reference, and every access below is bounded and barrier-ordered.
+        let (fine, wsum, wtot, pick) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut FINE),
+                SharedArray::as_raw_mut_ptr(&raw mut WSUM),
+                SharedArray::as_raw_mut_ptr(&raw mut WTOT),
+                SharedArray::as_raw_mut_ptr(&raw mut PICK),
+            )
+        };
+        let n = (c as usize - 1) / POOL;
+        let sbase = t * pools as usize;
+        let need = kept;
+
+        // ---- the exact `kept`-th order key, as `qsa_topk` finds it: every
+        // count is of the row's own `n > kept` scores.
+        // SAFETY: n = (c − 1)/4 <= ctx/4 <= pools, so sbase + n <= m·pools
+        // <= scores.len(); FINE is this pass's alone.
+        let hc = unsafe { coarse(scores, sbase, n, fine, tid) };
+        // SAFETY: WSUM and PICK are used by nothing else across the call.
+        let (b1, above1) = unsafe {
+            pick_bin::<COARSE_PER>(hc, HIST_BINS as u32 - 1, need, lane, tid, wsum, pick)
+        };
+        let need2 = need - above1;
+        // SAFETY: as the pass above.
+        let fc = unsafe { refine(scores, sbase, n, b1, 11, fine, tid) };
+        // SAFETY: WSUM and PICK are used by nothing else across the call.
+        let (b2, above2) =
+            unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need2, lane, tid, wsum, pick) };
+        let need3 = need2 - above2;
+        let prefix = (b1 << 11) | b2;
+        // SAFETY: as the pass above.
+        let fc = unsafe { refine(scores, sbase, n, prefix, 0, fine, tid) };
+        // SAFETY: WSUM and PICK are used by nothing else across the call.
+        let (b3, above3) =
+            unsafe { pick_bin::<FINE_PER>(fc, FINE_BINS as u32 - 1, need3, lane, tid, wsum, pick) };
+        let thr = (prefix << 11) | b3;
+        let take_eq = need - (above1 + above2 + above3);
+
+        // ---- the list, in pool order: warp `wid` owns pools `c0 .. c1`,
+        // counts the pools above the key and equal to it, the block sums the
+        // counts of the warps before it, and the warp walks its pools again,
+        // writing each kept pool's tokens at its place — the first `take_eq`
+        // equal pools in pool order among them.
+        let chunk = n.div_ceil(32 * TOPK_WARPS) * 32;
+        let c0 = (wid * chunk).min(n);
+        let c1 = (c0 + chunk).min(n);
+        let l = lane as usize;
+        let (mut tg, mut te) = (0u32, 0u32);
+        let mut base = c0;
+        while base < c1 {
+            // SAFETY: c1 <= n, so sbase + c1 <= scores.len().
+            let kk = unsafe { lane_keys(scores, sbase, base, c1, l) };
+            for r in 0..LANE_ROWS {
+                thread::__unroll_config::<0>();
+                let live = base + 32 * r + l < c1;
+                tg += warp::ballot(live && kk[r] > thr).count_ones();
+                te += warp::ballot(live && kk[r] == thr).count_ones();
+            }
+            base += 32 * LANE_ROWS;
+        }
+        if lane == 0 {
+            // SAFETY: wid < TOPK_WARPS bounds both slots; lane 0 of warp wid is
+            // their only writer, before the barrier.
+            unsafe {
+                *wtot.add(wid) = tg;
+                *wtot.add(TOPK_WARPS + wid) = te;
+            }
+        }
+        thread::sync_threads();
+        let (mut og, mut oe) = (0u32, 0u32);
+        for w in 0..TOPK_WARPS {
+            thread::__unroll_config::<0>();
+            if w < wid {
+                // SAFETY: w < TOPK_WARPS; published by the barrier above.
+                unsafe {
+                    og += *wtot.add(w);
+                    oe += *wtot.add(TOPK_WARPS + w);
+                }
+            }
+        }
+        let lt = warp::lanemask_lt();
+        let mut base = c0;
+        while base < c1 {
+            // SAFETY: c1 <= n, so sbase + c1 <= scores.len().
+            let kk = unsafe { lane_keys(scores, sbase, base, c1, l) };
+            for r in 0..LANE_ROWS {
+                thread::__unroll_config::<0>();
+                let i = base + 32 * r + l;
+                let live = i < c1;
+                let mg = warp::ballot(live && kk[r] > thr);
+                let me = warp::ballot(live && kk[r] == thr);
+                let gt_before = og + (mg & lt).count_ones();
+                let eq_before = oe + (me & lt).count_ones();
+                let is_gt = (mg >> lane) & 1 != 0;
+                let is_eq = (me >> lane) & 1 != 0;
+                if is_gt || (is_eq && eq_before < take_eq) {
+                    let at = lbase + POOL * (gt_before + eq_before.min(take_eq)) as usize;
+                    // SAFETY: the pools kept number `kept`, and this one's
+                    // place counts the kept ones before it, so it is below
+                    // kept and at + 3 < lbase + 4·kept <= t·width + width <=
+                    // list.len(); each place has one pool.
+                    unsafe {
+                        for q in 0..POOL {
+                            thread::__unroll_config::<0>();
+                            *list.get_unchecked_mut(at + q) = (POOL * i + q) as u32;
+                        }
+                    }
+                }
+                og += mg.count_ones();
+                oe += me.count_ones();
+            }
+            base += 32 * LANE_ROWS;
+        }
+        // ---- the tail, the row's own pool up to its position, and the
+        // length.
+        let tail = c as usize - POOL * n;
+        let kept_tokens = POOL * kept as usize;
+        if tid < tail {
+            // SAFETY: tid < tail <= POOL, so the entry is below 4·kept + 4 <=
+            // width.
+            unsafe { *list.get_unchecked_mut(lbase + kept_tokens + tid) = (POOL * n + tid) as u32 };
+        }
+        if tid == 0 {
+            // SAFETY: t < m <= n_sel.len() (launch contract).
+            unsafe { *n_sel.get_unchecked_mut(t) = (kept_tokens + tail) as u32 };
+        }
+    }
 }
 
 // -------------------------------------------------------------- launchers
@@ -1856,6 +2088,24 @@ pub struct TopkHighArgs<'a> {
     pub fault: FaultSink,
     pub list: &'a mut DeviceBuffer<u32>,
     pub vis: &'a mut DeviceBuffer<u32>,
+}
+
+/// [`QsaKernels::enqueue_topk_tail`]'s arguments: the `m` rows' live counts,
+/// their scores (`[m][pools_for(ctx)]`, a [`scored_tail`] row's first `(count
+/// − 1) / 4` written by its score pass), the cache height, the pools kept,
+/// the lists' width (at least [`tail_width`]`(kept)`: a launch argument, so
+/// one list buffer serves any `kept` it holds), and where the lists (`[m][width]`)
+/// and their lengths (`[m]`) land.
+pub struct TopkTailArgs<'a> {
+    pub n_keys: &'a DeviceBuffer<u32>,
+    pub scores: &'a DeviceBuffer<f32>,
+    pub ctx: usize,
+    pub kept: usize,
+    pub width: usize,
+    pub m: usize,
+    pub fault: FaultSink,
+    pub list: &'a mut DeviceBuffer<u32>,
+    pub n_sel: &'a mut DeviceBuffer<u32>,
 }
 
 /// The refusals the key appends share over `m` rows: no row, no cache, and
@@ -2320,6 +2570,58 @@ impl QsaKernels {
         )?;
         Ok(())
     }
+
+    /// Enqueue the forced-tail top-k pass ([`qsa_kernels::qsa_topk_tail`]):
+    /// `m` blocks of 512, each row's list and its length. Refused by name: no
+    /// row, `kept` or `ctx` zero, a width under [`tail_width`]`(kept)`,
+    /// scores, lists or lengths shorter than `m` rows need. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_topk_tail(
+        &self,
+        stream: &CudaStream,
+        a: TopkTailArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "qsa::enqueue_topk_tail";
+        let pools = pools_for(a.ctx);
+        if a.m == 0 || a.kept == 0 || a.ctx == 0 || a.width < tail_width(a.kept) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "need m, kept and ctx >= 1 and lists of at least 4·kept + 4 entries, got m={} \
+                     kept={} ctx={} width={}",
+                    a.m, a.kept, a.ctx, a.width
+                ),
+            ));
+        }
+        crate::short(
+            what,
+            &[
+                ("n_keys", a.n_keys.len(), a.m),
+                ("scores", a.scores.len(), a.m * pools),
+                ("list", a.list.len(), a.m * a.width),
+                ("n_sel", a.n_sel.len(), a.m),
+            ],
+        )?;
+        let m = launch_u32(what, "m", a.m)?;
+        let prep = self
+            .module
+            .prepare_qsa_topk_tail(LaunchConfig1D::new(m, TOPK_THREADS, 0))?;
+        self.module.qsa_topk_tail(
+            stream,
+            &prep,
+            a.n_keys,
+            a.scores,
+            launch_u32(what, "ctx", a.ctx)?,
+            launch_u32(what, "pools", pools)?,
+            launch_u32(what, "kept", a.kept)?,
+            launch_u32(what, "width", a.width)?,
+            m,
+            a.fault,
+            a.list,
+            a.n_sel,
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2336,6 +2638,25 @@ mod tests {
         assert!(!scored(ctx + 1, ctx, kept));
         assert_eq!(list_width(512), 2051);
         assert_eq!((pools_for(4096), pools_for(4097)), (1024, 1025));
+    }
+
+    #[test]
+    fn scored_tail_leaves_the_rows_own_pool_out_of_the_count() {
+        // Hy4-flash: top_k 2048 is 511 pools and the forced tail.
+        let (ctx, kept) = (4096u32, 511u32);
+        assert!(!scored_tail(0, ctx, kept));
+        // 2048 positions are 512 pools, the last the row's own: 511 seen.
+        assert!(!scored_tail(2048, ctx, kept));
+        assert!(scored_tail(2049, ctx, kept));
+        assert!(scored_tail(ctx, ctx, kept));
+        assert!(!scored_tail(ctx + 1, ctx, kept));
+        assert_eq!(tail_width(511), 2048);
+        // A row that does not select lists every position, at most the width.
+        for c in 1..=ctx {
+            if !scored_tail(c, ctx, kept) {
+                assert!(c as usize <= tail_width(kept as usize));
+            }
+        }
     }
 
     #[test]

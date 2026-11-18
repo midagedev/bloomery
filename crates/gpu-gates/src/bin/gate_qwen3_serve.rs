@@ -563,9 +563,10 @@ mod gate {
     use bloomery_gpu_gates::qwen_seat::{self, decode_mma};
     use bloomery_gpu_gates::record::{self, Fields};
     use bloomery_gpu_gates::serve_client::{
-        self, Answer, PrefixTurns, Served, WholeTerms, agree, answered, chat_is_those_ids, check,
-        curl, edit_and_extension, greedy_chat, ids_of, json_of, metric, rendered, scripted_call,
-        serve_cmd, server_log, sse_event, sse_events, tokenized, whole_terms,
+        self, Answer, FUNCTION_TAG_CALL, PrefixTurns, Served, WholeTerms, agree, answered,
+        chat_is_those_ids, check, curl, edit_and_extension, file_template, greedy_chat, ids_of,
+        json_of, metric, rendered, scripted_call, serve_cmd, server_log, sse_event, sse_events,
+        tokenized, whole_terms,
     };
     use bloomery_gpu_gates::ubatch_pick;
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
@@ -2008,13 +2009,12 @@ mod gate {
     /// server parses; the clause reads nothing the model chose to reply. FAIL-first: a scanner that
     /// drops a call's parameters answers `{}` and the clause is red.
     fn tool_call_is_parsed(split: &Split, dir: &Path, ok: &mut bool) -> Result<(), GateError> {
-        let template = model::arch::spec(split)
-            .map_err(|e| format!("the header: {e}"))?
-            .spec
-            .chat
-            .template
-            .ok_or("the file carries no chat template")?;
-        check(ok, "tool_call_is_parsed", scripted_call(&template, dir)?);
+        let template = file_template(split)?;
+        check(
+            ok,
+            "tool_call_is_parsed",
+            scripted_call(&template, FUNCTION_TAG_CALL, dir)?,
+        );
         Ok(())
     }
 

@@ -83,8 +83,10 @@ pub enum RouterBody {
     /// `mimo2_router*`, `sigmoid_320_8_router*`, `sigmoid_128_4_router*`;
     /// `gpu/src/arch/nemotron_h_moe/router.rs` `nemotron_moe_router_*`.
     BiasedSigmoid,
-    /// `gpu/src/route_body.rs` `sigmoid_floor_256_6_router*`: sigmoid,
-    /// optional selection-only bias and a fixed `2^-14` selected-sum floor.
+    /// `gpu/src/route_body.rs` `sigmoid_floor_256_6_router*` and, from
+    /// `sigmoid_router_instance!` with `floor`, `sigmoid_512_16_router*`:
+    /// sigmoid, selection-only bias (optional on the first) and a fixed
+    /// `2^-14` selected-sum floor.
     SigmoidFloor,
 }
 
@@ -397,6 +399,17 @@ pub const ROUTERS: &[RouterInst] = &[
         top_k_min: 2,
         top_k_max: 2,
         at: "gpu/src/route_body.rs sigmoid_8_2_router*",
+    },
+    // Hy4-flash's router: 512 experts, the top 16, the selected sum floored at
+    // 2^-14 (llama.cpp's clamp where the file sets no `expert_weights_norm_eps`).
+    RouterInst {
+        body: RouterBody::SigmoidFloor,
+        rule: BIASED_SIGMOID_FLOOR,
+        norm_arg: false,
+        experts: 512,
+        top_k_min: 16,
+        top_k_max: 16,
+        at: "gpu/src/route_body.rs sigmoid_512_16_router*",
     },
 ];
 
@@ -1050,6 +1063,10 @@ mod tests {
             // Raon-1's header: expert_count 128, expert_used_count 6, gating
             // sigmoid, exp_probs_b, weights_norm true.
             ("Raon-1", moe(rules::BIASED_SIGMOID, 128, 6)),
+            // Hy4-flash's header: expert_count 512, expert_used_count 16, gating
+            // sigmoid (2), exp_probs_b, weights_norm true, no
+            // expert_weights_norm_eps, so llama.cpp floors the kept sum at 2^-14.
+            ("Hy4-flash", moe(rules::BIASED_SIGMOID_FLOOR, 512, 16)),
         ]
     }
 
@@ -1110,9 +1127,11 @@ mod tests {
                     Refusal::TopK { min: 6, max: 6 }
                 );
             }
+            // The biased rule also has Hy4-flash's row at 512.
+            let served: &[u32] = if bias { &[256, 512] } else { &[256] };
             assert!(matches!(
                 select_router(moe(rule, 128, 6)).unwrap_err().why,
-                Refusal::RouterWidth { ref served } if served == &[256]
+                Refusal::RouterWidth { served: ref got } if got == served
             ));
             for (score, gated) in [(Score::Softmax, false), (Score::Sigmoid, true)] {
                 let wrong = RouterRule {
@@ -1140,6 +1159,30 @@ mod tests {
             .unwrap_err()
             .why,
             Refusal::NoRouterRule
+        );
+    }
+
+    /// Hy4-flash's router (512 experts, top 16, sigmoid with a selection bias,
+    /// the kept sum floored at 2^-14) is the biased `SigmoidFloor` row at 512,
+    /// its pick range 16 only; the `1e-20` rule at 512 has no row.
+    #[test]
+    fn sigmoid_512_16_router_is_its_floor_row() {
+        let rule = rules::BIASED_SIGMOID_FLOOR;
+        let r = select_router(moe(rule, 512, 16)).expect("no router row at 512");
+        assert_eq!(r.body, RouterBody::SigmoidFloor);
+        assert_eq!((r.experts(), r.per_lane()), (512, 16));
+        assert!(r.at.contains("sigmoid_512_16_router"), "{}", r.at);
+        assert_eq!(
+            super::router_row_rule(RouterBody::SigmoidFloor, rule, 512, 16),
+            r
+        );
+        assert!(router_row_is(r, rule, false, (16, 16)));
+        let x = select_router(moe(rule, 512, 8)).expect_err("512 at top 8");
+        assert_eq!(x.why, Refusal::TopK { min: 16, max: 16 });
+        let legacy = select_router(moe(rules::BIASED_SIGMOID, 512, 16)).expect_err("1e-20 at 512");
+        assert!(
+            matches!(legacy.why, Refusal::RouterWidth { .. }),
+            "{legacy}"
         );
     }
 

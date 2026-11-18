@@ -22,9 +22,12 @@
 
 mod common;
 
-use common::{V41_SPACED_TEMPLATE, V41_TEMPLATE, post, start, start_templated, start_with};
+use common::{
+    V41_SPACED_TEMPLATE, V41_TEMPLATE, msg, post, start, start_templated, start_with,
+    tool_call as call,
+};
 use serde_json::{Map, Value, json};
-use serve::dsml::{ChatParser, Message, Spelling, ToolCall, respell};
+use serve::dsml::{ChatParser, Message, Spelling, respell};
 use serve::reasoning::ReasoningFormat;
 use serve::{ChatTemplate, ScriptedEngine};
 
@@ -41,22 +44,6 @@ const QUOTED: &str = "</think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name
 const OPEN_BLOCK: &str = "Calling.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_time\">\n";
 const MALFORMED: &str =
     "x\n\n<｜DSML｜tool_calls>\n<｜DSML｜call get_time/>\n</｜DSML｜tool_calls> y";
-
-fn call(index: usize, name: &str, arguments: &str) -> ToolCall {
-    ToolCall {
-        index,
-        name: name.to_owned(),
-        arguments: arguments.to_owned(),
-    }
-}
-
-fn msg(reasoning: &str, content: &str, calls: Vec<ToolCall>) -> Message {
-    Message {
-        reasoning: reasoning.to_owned(),
-        content: content.to_owned(),
-        calls,
-    }
-}
 
 /// `(name, prompt, format, tools, raw output, expected message)`, the raw output in V4's
 /// tags.

@@ -93,11 +93,12 @@ impl MlaDims {
 
     /// Refuse by name a shape no launch here runs.
     pub fn check(&self) -> Result<(), GpuError> {
-        if self.v_head != crate::linear::HEAD {
+        let gate_head = crate::linear::HEAD;
+        if self.v_head == 0 || !self.v_head.is_multiple_of(gate_head) {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "the output gate's entry is 128 a head, got v_head {}",
+                    "the output gate runs whole {gate_head}-value heads, got v_head {}",
                     self.v_head
                 ),
             ));
@@ -465,7 +466,7 @@ fn attend_one(
             },
         )?,
     }
-    k.out_gate.enqueue_out_gate(
+    k.out_gate.enqueue_out_gate_head(
         stream,
         OutGateArgs {
             kind: OutGate::Proj,
@@ -476,6 +477,7 @@ fn attend_one(
             fault: a.fault,
             y,
         },
+        d.v_head,
     )
 }
 
@@ -620,7 +622,7 @@ pub fn attend_rows(
             },
         )?,
     }
-    k.out_gate.enqueue_out_gate(
+    k.out_gate.enqueue_out_gate_head(
         stream,
         OutGateArgs {
             kind: OutGate::Proj,
@@ -631,5 +633,6 @@ pub fn attend_rows(
             fault: a.fault,
             y,
         },
+        d.v_head,
     )
 }

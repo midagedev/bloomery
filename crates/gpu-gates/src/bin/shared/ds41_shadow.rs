@@ -149,6 +149,6 @@ pub fn engram_kv_kernels(
     }];
     let wkv = names::engram_wkv(l);
     k.extend(projection(type_of(split, &wkv)?, &wkv, prefetch)?);
-    k.push("ds41_engram_key_norm");
+    k.push("engram_key_norm");
     Ok(k)
 }

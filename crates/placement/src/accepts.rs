@@ -83,6 +83,11 @@ pub enum Program {
     /// beside a shared expert; its MLA layers read the latent cache and the
     /// lightning indexer's keys the description names.
     MistralLarge4Body,
+    /// The Hy4-flash body (`crates/gpu-hy4`): one stage card running every layer (the identity
+    /// hyper-connections, the gated latent attention over a window ring or the k-pool selector's
+    /// list, the engram sites), the routed experts the plan puts on the card (the common pair over
+    /// the latent, gate-first clamped) and the rest on the host tier, beside a shared expert.
+    Hy4Body,
     /// The host engine (`crates/model`): no card, every layer, the head and the embedding on the
     /// host stage, the matmuls the fused `qdot` kernels run and the routed stacks resident on
     /// the host. No architecture picks it ([`program_of`]): a start with no card, or one that asks
@@ -110,6 +115,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::MuseSpark => Some(Program::MuseSparkBody),
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
         Arch::KimiK3 => Some(Program::KimiK3Body),
+        Arch::Hy4 => Some(Program::Hy4Body),
         Arch::Lfm3 => None,
     }
 }
@@ -137,6 +143,7 @@ impl Program {
             Self::MuseSparkBody => "musespark",
             Self::FlintBody => "flint",
             Self::MistralLarge4Body => "mistrallarge4",
+            Self::Hy4Body => "hy4",
             Self::Host => "host",
         }
     }
@@ -548,7 +555,10 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: planes_leg_gate_up,
             down: planes_leg_down,
         }),
-        Program::Mimo2Body | Program::Solar2Body | Program::MistralLarge4Body => Some(LegArms {
+        Program::Mimo2Body
+        | Program::Solar2Body
+        | Program::MistralLarge4Body
+        | Program::Hy4Body => Some(LegArms {
             gate_up: kernels::card_gate_up_runs,
             down: kernels::card_down_runs,
         }),
@@ -633,8 +643,8 @@ pub fn leg_down_forms(p: Program, model: &crate::placement::ModelTensors) -> ker
 
 /// Program `p`'s plan rule for its routed stacks ([`RoutedRule`]): on a card
 /// leg, each part by the arm its load reads ([`leg_runs`]), so a layer the
-/// plan gives card experts is one the load runs. The mimo2, solar2 and
-/// mistral-large4 bodies' plans, over leg buffers of the 128-value form alone, carry each
+/// plan gives card experts is one the load runs. The mimo2, solar2,
+/// mistral-large4 and hy4 bodies' plans, over leg buffers of the 128-value form alone, carry each
 /// part by its arm: a gate and up the gate·up launches read
 /// ([`kernels::card_gate_up_runs`]) and a down read over that form
 /// ([`kernels::card_q8act_down_runs`]), a Q6_K down among them. The glm5next
@@ -661,7 +671,10 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             down: |ty| planes_leg_down(ty).then(|| leg_card_format(ty)),
             pair: leg_pair(p),
         },
-        Program::Mimo2Body | Program::Solar2Body | Program::MistralLarge4Body => RoutedRule::Leg {
+        Program::Mimo2Body
+        | Program::Solar2Body
+        | Program::MistralLarge4Body
+        | Program::Hy4Body => RoutedRule::Leg {
             gate_up: common_leg_gate_up,
             down: common_leg_down,
             pair: leg_pair(p),
@@ -710,8 +723,8 @@ fn resident_down_card(ty: GgmlType) -> Option<CardFormat> {
     resident_down_runs(ty).then(|| leg_card_format(ty))
 }
 
-/// The common leg's gate·up arm in the mimo2, solar2 and mistral-large4 bodies'
-/// plans ([`routed_rule`]): a type [`kernels::card_gate_up_runs`] admits, in its
+/// The common leg's gate·up arm in the mimo2, solar2, mistral-large4 and hy4
+/// bodies' plans ([`routed_rule`]): a type [`kernels::card_gate_up_runs`] admits, in its
 /// card format.
 fn common_leg_gate_up(ty: GgmlType) -> Option<CardFormat> {
     kernels::card_gate_up_runs(ty).then(|| leg_card_format(ty))
@@ -729,7 +742,7 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 15] = [
+    const PROGRAMS: [Program; 16] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
@@ -745,6 +758,7 @@ mod tests {
         Program::MuseSparkBody,
         Program::FlintBody,
         Program::MistralLarge4Body,
+        Program::Hy4Body,
     ];
 
     /// Every type the file format names.
@@ -1262,6 +1276,7 @@ mod tests {
             Program::Solar2Body,
             Program::MiniMaxM3Body,
             Program::MistralLarge4Body,
+            Program::Hy4Body,
         ];
         assert_eq!(
             leg_runs(Program::Raon1Body, layers[0]),

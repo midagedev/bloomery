@@ -45,6 +45,26 @@
 //! `stride`-row scratch, then `flash_latent_mma` and `flash_merge` over it —
 //! bit for bit, with no scratch and one launch pair for all the tokens.
 //!
+//! A head's learned sink and a sliding window are the third form (Hy4-flash's
+//! attention, llama.cpp `src/models/hy-v4-flash.cpp`, `build_attention`). The
+//! sink is one more logit per head in the softmax's denominator, unscaled and
+//! with no value, folded after a row's segments as the partial `(sink, 1, 0)`
+//! through [`online_fold`] — the fold V4.1's merge does — with no ε, so a sink
+//! of `−inf` leaves the row's values as the merge without a sink wrote them. The
+//! segment passes are the dense and selected ones above; the sink enters only
+//! the merges, [`flash_merge_sink`] and [`flash_merge_sel_sink`]. The window's
+//! own pass, [`flash_latent_mma_win`], walks token `t`'s [`window_count`]
+//! keys: slots `0 .. count` of a ring of `W` rows that keeps position `p` at
+//! slot `p % W`, in slot order, the ring as it stands at launch (a decode step
+//! writes its row first). [`flash_latent_mma_win_stage`] serves a batch whose
+//! own rows sit in a staging buffer: slot `s` of token `t` reads the row
+//! [`window_row`] names, so each token's partials are the one-token launch's at
+//! its position bit for bit, and [`kv_ring_commit`] then writes the last
+//! `min(T, W)` staged rows into their slots. Both window passes cut a row into
+//! [`window_segments`]`(W)` segments; their merge [`flash_merge_win_sink`]
+//! reads the position word as the pass does, so a captured graph replays at
+//! any position. The ring's height and the list's width are launch arguments.
+//!
 //! Merge order is fixed (ascending segment), so reruns and graph replays are
 //! bit-identical. The split launch rounds the query rows and the products to
 //! f16 and the single-block form does not, so the two sit inside a band of
@@ -395,6 +415,92 @@ pub fn online_fold(mx: f32, s: f32, acc: f32, mj: f32, sj: f32, vj: f32) -> (f32
         (mx, f32::mul_add(sj, g, s), f32::mul_add(vj, g, acc))
     }
 }
+
+/// Window keys token `t` of a batch whose token 0 sits at position `b` sees
+/// over a ring of `ring_rows` rows: `min(b + t + 1, ring_rows)`, the ring's
+/// slots `0 .. count` in slot order — its first slots while the position is
+/// below the ring's height, all of them once it is full.
+#[inline(always)]
+#[must_use]
+pub fn window_count(b: u32, t: usize, ring_rows: u32) -> usize {
+    (b as usize + t + 1).min(ring_rows as usize)
+}
+
+/// The row of ring ⧺ staging ([`RingRows`]) that window key `slot` of batch
+/// token `t` reads, for a batch whose first position is `b`, over a ring of
+/// `ring_rows` rows. The slot holds position `pos − d`, `pos = b + t` and
+/// `d = (pos − slot) mod ring_rows`: staging row `t − d` — row `ring_rows +
+/// t − d` of the row space — when `d <= t`, a position of the batch; else the
+/// ring's own row `slot`. `slot < min(pos + 1, ring_rows)`, and `b + t` and
+/// `ring_rows + t` are positions, so they fit u32.
+#[inline(always)]
+#[must_use]
+pub fn window_row(b: u32, t: usize, slot: usize, ring_rows: u32) -> usize {
+    let (t, slot) = (t as u32, slot as u32);
+    let ps = (b + t) % ring_rows;
+    let d = if slot <= ps {
+        ps - slot
+    } else {
+        ps + ring_rows - slot
+    };
+    (if d <= t { ring_rows + t - d } else { slot }) as usize
+}
+
+/// A window's key rows as one row space, ring ⧺ staging: row `r` below the
+/// ring's rows is the ring's row `r`, the row `j` past them staging row `j`.
+/// The segment walk reads its source only as `kvw.add(word)`, so this is what
+/// lets one walk read the two buffers in slot order without copying either.
+#[derive(Clone, Copy)]
+struct RingRows {
+    ring: *const u32,
+    stage: *const u32,
+    /// Words of the ring: the first word past it is staging word 0.
+    ring_words: u32,
+}
+
+impl RingRows {
+    /// The ring's `ring_rows` rows of [`MMA_WIDTH`] f16, then the staging rows.
+    fn split(ring: &[u16], stage: &[u16], ring_rows: u32) -> RingRows {
+        RingRows {
+            ring: ring.as_ptr().cast(),
+            stage: stage.as_ptr().cast(),
+            ring_words: ring_rows * const { (MMA_WIDTH / 2) as u32 },
+        }
+    }
+
+    /// Word `word` of the row space.
+    ///
+    /// # Safety
+    ///
+    /// `word` is inside the row space: below the ring's words a word of the
+    /// ring, else `word − ring_words` a word of the staging rows.
+    unsafe fn add(self, word: usize) -> *const u32 {
+        let ring_words = self.ring_words as usize;
+        if word < ring_words {
+            // SAFETY: a word of the ring (the caller's contract).
+            unsafe { self.ring.add(word) }
+        } else {
+            // SAFETY: word − ring_words is a word of the staging rows (the
+            // caller's contract).
+            unsafe { self.stage.add(word - ring_words) }
+        }
+    }
+}
+
+/// Segments a window pass cuts every query row into over a ring of
+/// `ring_rows` rows: whole [`seg_keys`]-key segments of the ring, so the
+/// grid is the ring's and [`seg_span`]'s cut of any count up to the ring's
+/// height is the `seg_keys` floor.
+#[must_use]
+pub fn window_segments(ring_rows: usize) -> usize {
+    ring_rows.div_ceil(seg_keys()).max(1)
+}
+
+/// Threads of a [`flash_kernels::kv_ring_commit`] block; each walks its row's
+/// columns at this stride.
+const COMMIT_THREADS: usize = 256;
+const COMMIT_THREADS_U32: u32 = COMMIT_THREADS as u32;
+const _: () = assert!(COMMIT_THREADS_U32 as usize == COMMIT_THREADS);
 
 /// The tensor-core segment pass's walk — the query staging, the tile loop
 /// (key staging, `S = Q·Kᵀ` on `mma.sync`, the per-head online softmax, the
@@ -1431,6 +1537,248 @@ mod flash_kernels {
         }
     }
 
+    /// The window segment pass's body, expanded by [`flash_latent_mma_win`]
+    /// and [`flash_latent_mma_win_stage`]: [`flash_latent_mma_sel`]'s grid —
+    /// a group is [`MMA_ROWS`] heads of one token, `segs` segments a row —
+    /// with token `t`'s key count [`window_count`]`(b, t, ring_rows)`, `b =
+    /// pos[0]`, key `key` reading the source row `$row`, and
+    /// [`mma_segment_walk`](crate::mma_segment_walk) at [`MMA_WIDTH`]. A
+    /// segment wholly past the count writes the neutral partial and reads no
+    /// key row.
+    macro_rules! window_pass {
+        (
+            q: $q:ident,
+            pos: $pos:ident,
+            scale: $scale:ident,
+            tokens: $tokens:ident,
+            n_heads: $n_heads:ident,
+            rope_dims: $rope_dims:ident,
+            latent: $latent:ident,
+            ring_rows: $ring_rows:ident,
+            segs: $segs:ident,
+            seg_keys: $seg_keys:ident,
+            part_v: $part_v:ident,
+            part_ms: $part_ms:ident,
+            source: $kvw:expr,
+            key_row: |$b:ident, $t:ident, $key:ident| $row:expr $(,)?
+        ) => {{
+            // Per head, the tile's scaled logits and then its weights.
+            static mut KLOG: SharedArray<f32, MMA_TILE> = SharedArray::UNINIT;
+            static mut KW: SharedArray<f32, MMA_TILE> = SharedArray::UNINIT;
+            // Per head, the tile's max-bump rescale and the token's key count.
+            static mut VMS: SharedArray<f32, MMA_ROWS> = SharedArray::UNINIT;
+            static mut LIM: SharedArray<u32, MMA_ROWS> = SharedArray::UNINIT;
+
+            let bid = thread::blockIdx_x() as usize;
+            let tid = thread::threadIdx_x() as usize;
+            let heads = $n_heads as usize;
+            let rows = $tokens as usize * heads;
+            let n_seg = $segs as usize;
+            // The host requires `heads % MMA_ROWS == 0`: a group is sixteen
+            // heads of one token and every row of it is live.
+            let groups = rows / MMA_ROWS;
+            if bid >= groups * n_seg {
+                return; // block-uniform: no barrier and no warp collective is skipped
+            }
+            let seg = bid / groups;
+            let grp = bid - seg * groups;
+            let base_row = grp * MMA_ROWS;
+            let $t = base_row / heads;
+            // SAFETY: pos.len() >= 1 (launch contract).
+            let $b = unsafe { *$pos.get_unchecked(0) };
+            let limit = window_count($b, $t, $ring_rows);
+            let span = seg_span(limit, n_seg, $seg_keys as usize);
+            let lo = seg * span;
+            if lo >= limit {
+                if tid < MMA_ROWS {
+                    let idx = (base_row + tid) * n_seg + seg;
+                    // SAFETY: base_row + tid < rows and seg < segs, so both
+                    // slots are inside part_ms (launch contract).
+                    unsafe {
+                        *$part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
+                        *$part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
+                    }
+                }
+                return; // block-uniform, and no key row of this segment is read
+            }
+            let hi_max = (lo + span).min(limit);
+
+            // The group's query rows and the tile's key rows as f16, both in
+            // the block's dynamic shared memory: the query tile first, the key
+            // tile at its end. The launch contract declares exactly
+            // [`MMA_DYN_BYTES`], which is the two word counts.
+            // SAFETY: each pointer below is this block's own shared
+            // allocation; every access is bounded by the declared word count
+            // and ordered by `sync_threads`.
+            let (qs, kt, klog, kw, vms_sh, lim_sh) = unsafe {
+                (
+                    DynamicSharedArray::<u32, 16>::get(),
+                    DynamicSharedArray::<u32, 16>::offset(MMA_QWORDS * 4),
+                    SharedArray::as_raw_mut_ptr(&raw mut KLOG),
+                    SharedArray::as_raw_mut_ptr(&raw mut KW),
+                    SharedArray::as_raw_mut_ptr(&raw mut VMS),
+                    SharedArray::as_raw_mut_ptr(&raw mut LIM),
+                )
+            };
+            // The source rows pair-wise. `width` and `rope` are even and the
+            // buffers are device-allocated, so every u32 read is aligned.
+            let kvw = $kvw;
+            // Every head of the group is one token's, so all share its count.
+            if tid < MMA_ROWS {
+                // SAFETY: tid < MMA_ROWS bounds the store.
+                unsafe {
+                    *lim_sh.add(tid) = limit as u32;
+                }
+            }
+            let rope = $rope_dims as usize;
+            let lat = $latent as usize;
+            let width = rope + lat;
+            crate::mma_segment_walk! {
+                width: MMA_WIDTH,
+                q: $q,
+                kvw: kvw,
+                key: $key => $row,
+                scratch: (qs, kt, klog, kw, vms_sh, lim_sh),
+                rows: rows,
+                base_row: base_row,
+                n_seg: n_seg,
+                seg: seg,
+                lo: lo,
+                hi: hi_max,
+                width_rt: width,
+                rope: rope,
+                lat: lat,
+                scale: $scale,
+                tid: tid,
+                part_v: $part_v,
+                part_ms: $part_ms,
+            }
+        }};
+    }
+
+    /// The window segment pass over the ring as it stands (module doc): block
+    /// `(segment, group)` walks one segment of token `t`'s
+    /// [`window_count`]`(pos[0], t, ring_rows)` keys, slot `s` reading ring
+    /// row `s`, for [`MMA_ROWS`] heads of the token, and writes their
+    /// partials as [`flash_latent_mma`] does. The ring holds every row the
+    /// tokens see and none they must not: a decode step writes its own row
+    /// first, over position `pos − W`, outside its window. The position word
+    /// is read on the device, so a captured graph replays at any position.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        dynamic_shared = 56064,
+        requires = (
+            pos.len() >= 1,
+            segs >= 1,
+            ring_rows >= 1,
+            q.len() >= tokens * n_heads * (rope_dims + latent),
+            ring.len() >= ring_rows * (rope_dims + latent),
+            part_v.len() >= tokens * n_heads * segs * latent,
+            part_ms.len() >= tokens * n_heads * segs * 2
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn flash_latent_mma_win(
+        q: &[f32],
+        ring: &[u16],
+        pos: &[u32],
+        scale: f32,
+        tokens: u32,
+        n_heads: u32,
+        rope_dims: u32,
+        latent: u32,
+        ring_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+    ) {
+        window_pass! {
+            q: q,
+            pos: pos,
+            scale: scale,
+            tokens: tokens,
+            n_heads: n_heads,
+            rope_dims: rope_dims,
+            latent: latent,
+            ring_rows: ring_rows,
+            segs: segs,
+            seg_keys: seg_keys,
+            part_v: part_v,
+            part_ms: part_ms,
+            source: ring.as_ptr().cast::<u32>(),
+            key_row: |b, t, key| key,
+        }
+    }
+
+    /// [`flash_latent_mma_win`] for a batch of `tokens` tokens at positions
+    /// `b .. b + tokens`, `b = pos[0]`, whose own rows sit in `stage` (row `j`
+    /// position `b + j`) while the ring still holds the positions below `b`:
+    /// slot `s` of token `t` reads row [`window_row`]`(b, t, s, ring_rows)` of
+    /// ring ⧺ staging. The walk keeps the slot order, so every token's
+    /// partials are the one-token launch's at its position bit for bit,
+    /// wherever the batch starts against the wrap and however long it is.
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        dynamic_shared = 56064,
+        requires = (
+            pos.len() >= 1,
+            segs >= 1,
+            ring_rows >= 1,
+            q.len() >= tokens * n_heads * (rope_dims + latent),
+            ring.len() >= ring_rows * (rope_dims + latent),
+            stage.len() >= tokens * (rope_dims + latent),
+            part_v.len() >= tokens * n_heads * segs * latent,
+            part_ms.len() >= tokens * n_heads * segs * 2
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn flash_latent_mma_win_stage(
+        q: &[f32],
+        ring: &[u16],
+        stage: &[u16],
+        pos: &[u32],
+        scale: f32,
+        tokens: u32,
+        n_heads: u32,
+        rope_dims: u32,
+        latent: u32,
+        ring_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        mut part_v: DisjointSlice<f32>,
+        mut part_ms: DisjointSlice<f32>,
+    ) {
+        window_pass! {
+            q: q,
+            pos: pos,
+            scale: scale,
+            tokens: tokens,
+            n_heads: n_heads,
+            rope_dims: rope_dims,
+            latent: latent,
+            ring_rows: ring_rows,
+            segs: segs,
+            seg_keys: seg_keys,
+            part_v: part_v,
+            part_ms: part_ms,
+            source: RingRows::split(ring, stage, ring_rows),
+            key_row: |b, t, key| window_row(b, t, key, ring_rows),
+        }
+    }
+
     /// The merge pass of the split launch: one block per query row, one
     /// thread per latent dim, folding the row's partials by the standard
     /// online-softmax rescale in ascending segment order — a fixed order, so
@@ -1534,6 +1882,219 @@ mod flash_kernels {
         unsafe {
             let v = merge_fold(limit, segs, seg_keys, part_v, part_ms, row, tid, lat);
             *y.get_unchecked_mut(row * lat + tid) = v;
+        }
+    }
+
+    /// [`flash_merge`] with each head's sink (module doc): the row's segments
+    /// folded at its causal limit as [`flash_merge`] folds them, then the
+    /// sink of head `row % n_heads` as the partial `(sink, 1, 0)`
+    /// ([`sink_finish`]).
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            n_keys_buf.len() >= 1,
+            segs >= 1,
+            part_v.len() >= q_rows * segs * latent,
+            part_ms.len() >= q_rows * segs * 2,
+            sinks.len() >= n_heads,
+            y.len() >= q_rows * latent
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn flash_merge_sink(
+        n_keys_buf: &[u32],
+        m: u32,
+        n_heads: u32,
+        q_rows: u32,
+        latent: u32,
+        dst_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        part_v: &[f32],
+        part_ms: &[f32],
+        sinks: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        let row = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        if row >= q_rows as usize {
+            return; // block-uniform
+        }
+        let lat = latent as usize;
+        let limit = causal_limit(n_keys_buf, dst_rows, row, n_heads, m);
+        // SAFETY: row % n_heads < n_heads <= sinks.len() (launch contract).
+        let sink = unsafe { *sinks.get_unchecked(row % n_heads as usize) };
+        // SAFETY: row < q_rows and tid < LATENT = latent (host-validated), so
+        // the partial reads are inside theirs (launch contract) and the store
+        // is inside y's row segment.
+        unsafe {
+            let st = merge_state(limit, segs, seg_keys, part_v, part_ms, row, tid, lat);
+            *y.get_unchecked_mut(row * lat + tid) = sink_finish(st, sink);
+        }
+    }
+
+    /// [`flash_merge_sel`] with each head's sink: token `t`'s rows folded at
+    /// `min(counts[t], stride)`, then the head's sink ([`sink_finish`]).
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            segs >= 1,
+            counts.len() >= tokens,
+            part_v.len() >= tokens * n_heads * segs * latent,
+            part_ms.len() >= tokens * n_heads * segs * 2,
+            sinks.len() >= n_heads,
+            y.len() >= tokens * n_heads * latent
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn flash_merge_sel_sink(
+        counts: &[u32],
+        tokens: u32,
+        n_heads: u32,
+        latent: u32,
+        stride: u32,
+        segs: u32,
+        seg_keys: u32,
+        part_v: &[f32],
+        part_ms: &[f32],
+        sinks: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        let row = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        if row >= tokens as usize * n_heads as usize {
+            return; // block-uniform
+        }
+        let heads = n_heads as usize;
+        let t = row / heads;
+        let lat = latent as usize;
+        // SAFETY: t < tokens <= counts.len() (launch contract).
+        let limit = (unsafe { *counts.get_unchecked(t) } as usize).min(stride as usize);
+        // SAFETY: row % heads < n_heads <= sinks.len() (launch contract).
+        let sink = unsafe { *sinks.get_unchecked(row % heads) };
+        // SAFETY: row < tokens * n_heads and tid < LATENT = latent
+        // (host-validated), so the partial reads are inside theirs (launch
+        // contract) and the store is inside y's row segment.
+        unsafe {
+            let st = merge_state(limit, segs, seg_keys, part_v, part_ms, row, tid, lat);
+            *y.get_unchecked_mut(row * lat + tid) = sink_finish(st, sink);
+        }
+    }
+
+    /// The merge of [`flash_latent_mma_win`] and [`flash_latent_mma_win_stage`]:
+    /// token `t`'s rows folded at its [`window_count`]`(pos[0], t,
+    /// ring_rows)` over the `segs` segments the pass wrote, then the head's
+    /// sink ([`sink_finish`]).
+    #[kernel]
+    #[launch_bounds(512)]
+    #[launch_contract(
+        domain = 1,
+        block = (512, 1, 1),
+        requires = (
+            pos.len() >= 1,
+            segs >= 1,
+            part_v.len() >= tokens * n_heads * segs * latent,
+            part_ms.len() >= tokens * n_heads * segs * 2,
+            sinks.len() >= n_heads,
+            y.len() >= tokens * n_heads * latent
+        )
+    )]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    pub fn flash_merge_win_sink(
+        pos: &[u32],
+        tokens: u32,
+        n_heads: u32,
+        latent: u32,
+        ring_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        part_v: &[f32],
+        part_ms: &[f32],
+        sinks: &[f32],
+        mut y: DisjointSlice<f32>,
+    ) {
+        let row = thread::blockIdx_x() as usize;
+        let tid = thread::threadIdx_x() as usize;
+        if row >= tokens as usize * n_heads as usize {
+            return; // block-uniform
+        }
+        let heads = n_heads as usize;
+        let lat = latent as usize;
+        // SAFETY: pos.len() >= 1 (launch contract).
+        let b = unsafe { *pos.get_unchecked(0) };
+        let limit = window_count(b, row / heads, ring_rows);
+        // SAFETY: row % heads < n_heads <= sinks.len() (launch contract).
+        let sink = unsafe { *sinks.get_unchecked(row % heads) };
+        // SAFETY: row < tokens * n_heads and tid < LATENT = latent
+        // (host-validated), so the partial reads are inside theirs (launch
+        // contract) and the store is inside y's row segment.
+        unsafe {
+            let st = merge_state(limit, segs, seg_keys, part_v, part_ms, row, tid, lat);
+            *y.get_unchecked_mut(row * lat + tid) = sink_finish(st, sink);
+        }
+    }
+
+    /// The commit after a staged window batch: block `j` copies staging row
+    /// `tokens − n + j` into ring slot `(b + tokens − n + j) % ring_rows`, `n
+    /// = min(tokens, ring_rows)` the rows the ring keeps and `b = base[0]` the
+    /// batch's first position, its threads striding the row's `width`
+    /// columns. The `n` positions are consecutive, so their slots are
+    /// distinct.
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            stage.len() >= tokens * width,
+            base.len() >= 1,
+            ring_rows >= 1,
+            ring.len() >= ring_rows * width
+        )
+    )]
+    pub fn kv_ring_commit(
+        stage: &[u16],
+        base: &[u32],
+        ring_rows: u32,
+        tokens: u32,
+        width: u32,
+        mut ring: DisjointSlice<u16>,
+    ) {
+        let j = thread::blockIdx_x() as usize;
+        let n = tokens.min(ring_rows) as usize;
+        if j >= n {
+            return; // block-uniform
+        }
+        let tid = thread::threadIdx_x() as usize;
+        let w = width as usize;
+        let row = tokens as usize - n + j;
+        // SAFETY: base.len() >= 1 (launch contract).
+        let b = unsafe { *base.get_unchecked(0) };
+        let slot = ((b + row as u32) % ring_rows) as usize;
+        let mut c = tid;
+        while c < w {
+            // SAFETY: row < tokens, slot < ring_rows and c < width put the
+            // load inside stage and the store inside ring (launch contract);
+            // each (slot, column) has one writer, the slots being distinct.
+            unsafe {
+                *ring.get_unchecked_mut(slot * w + c) = *stage.get_unchecked(row * w + c);
+            }
+            c += COMMIT_THREADS;
         }
     }
 
@@ -1692,6 +2253,30 @@ mod flash_kernels {
         tid: usize,
         lat: usize,
     ) -> f32 {
+        // SAFETY: `merge_state`'s contract is this function's.
+        let (_, s_sum, acc) =
+            unsafe { merge_state(limit, segs, seg_keys, part_v, part_ms, row, tid, lat) };
+        let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
+        s_inv * acc
+    }
+
+    /// The running `(max, Σ exp, Σ exp·V)` of a query row whose live key count
+    /// is `limit`, folded over its segments ([`merge_fold`]'s walk, which
+    /// normalises it; the sink merges fold a sink into it first).
+    ///
+    /// SAFETY: as [`merge_fold`].
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    unsafe fn merge_state(
+        limit: usize,
+        segs: u32,
+        seg_keys: u32,
+        part_v: &[f32],
+        part_ms: &[f32],
+        row: usize,
+        tid: usize,
+        lat: usize,
+    ) -> (f32, f32, f32) {
         // The row's live segments under its own cut. The segment pass cut the
         // row's group at the group's widest limit, a span at least this one
         // (the span rises with the count), so every partial holding this
@@ -1732,7 +2317,17 @@ mod flash_kernels {
             }
             seg += MERGE_BATCH;
         }
-        let s_inv = if s_sum > 0.0 { 1.0 / s_sum } else { 0.0 };
+        (mx, s_sum, acc)
+    }
+
+    /// A row's final value from its folded state and its head's sink: the
+    /// sink joins as the partial `(sink, 1, 0)` — one more logit in the
+    /// denominator, nothing in the value — then one reciprocal of the sum and
+    /// one multiply, with no ε. A sink of `−inf` adds `0` to both sums.
+    #[inline(always)]
+    fn sink_finish((mx, s, acc): (f32, f32, f32), sink: f32) -> f32 {
+        let (_, s, acc) = online_fold(mx, s, acc, sink, 1.0, 0.0);
+        let s_inv = if s > 0.0 { 1.0 / s } else { 0.0 };
         s_inv * acc
     }
 
@@ -2065,7 +2660,9 @@ pub struct PlaneAppend<'a> {
 /// The loaded P5 device module: `kv_append`, `kv_append_pos_buf`,
 /// `flash_latent`, the tensor-core segment pass `flash_latent_mma`,
 /// `flash_merge`, their selected-row forms `flash_latent_mma_sel` and
-/// `flash_merge_sel`, and the q8 twins. Owns no context and no stream — every
+/// `flash_merge_sel`, the q8 twins, and the sink and window forms (module
+/// doc): `flash_merge_sink`, `flash_merge_sel_sink`, `flash_latent_mma_win`,
+/// `flash_latent_mma_win_stage`, `flash_merge_win_sink` and `kv_ring_commit`. Owns no context and no stream — every
 /// enqueue takes the engine stream (`Gpu::stream()`), so launches order with
 /// the rest of the step and are capturable.
 pub struct FlashKernels {
@@ -2183,6 +2780,44 @@ pub struct FlashMergeSelArgs<'a> {
     pub part_v: &'a DeviceBuffer<f32>,
     pub part_ms: &'a DeviceBuffer<f32>,
     pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`FlashKernels::enqueue_flash_window`]'s arguments: `geom.tokens` query
+/// tokens at positions `b .. b + tokens`, `b = pos[0]` read on the device,
+/// over `ring` (`[W x rope_dims + latent_dims]` f16, position `p` at slot `p %
+/// W`); `staged`, when given, holds the batch's own rows, row `j` position `b
+/// + j`, which the ring does not hold yet. `sinks` holds one logit a head and
+/// the partials [`window_partials_lens`] for `tokens · heads` rows over `W`.
+pub struct FlashWindowArgs<'a> {
+    pub q: &'a DeviceBuffer<f32>,
+    pub ring: &'a DeviceTensor<u16>,
+    pub staged: Option<&'a DeviceTensor<u16>>,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub sinks: &'a DeviceBuffer<f32>,
+    pub kq_scale: f32,
+    pub geom: FlashGeom,
+    pub part_v: &'a mut DeviceBuffer<f32>,
+    pub part_ms: &'a mut DeviceBuffer<f32>,
+    pub y: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`FlashKernels::enqueue_kv_ring_commit`]'s arguments: a staged batch of
+/// `tokens` rows (`stage` row `j` position `b + j`, `b = base[0]`) and the
+/// ring it attended.
+pub struct RingCommitArgs<'a> {
+    pub stage: &'a DeviceTensor<u16>,
+    pub base: &'a DeviceBuffer<u32>,
+    pub tokens: usize,
+    pub ring: &'a mut DeviceTensor<u16>,
+}
+
+/// The `Σ exp·V` and `(max, Σ exp)` partials lengths a window launch of
+/// `q_rows` query rows over a ring of `ring_rows` rows needs:
+/// [`window_segments`] slots a row.
+#[must_use]
+pub fn window_partials_lens(q_rows: usize, ring_rows: usize) -> (usize, usize) {
+    let segs = window_segments(ring_rows);
+    (q_rows * segs * LATENT, q_rows * segs * 2)
 }
 
 impl FlashKernels {
@@ -2734,6 +3369,363 @@ impl FlashKernels {
         Ok(())
     }
 
+    /// The dense latent attention with each head's sink (module doc): the
+    /// segment pass [`FlashKernels::enqueue_flash_latent_mma`] over the
+    /// cache's live rows, then [`FlashKernels::enqueue_flash_merge_sink`].
+    /// Refused as those two refuse.
+    pub fn enqueue_flash_latent_sink(
+        &self,
+        stream: &CudaStream,
+        a: FlashSplitArgs<'_>,
+        sinks: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let FlashSplitArgs {
+            inputs,
+            part_v,
+            part_ms,
+            y,
+        } = a;
+        check_sinks("enqueue_flash_latent_sink", sinks.len(), inputs.geom.heads)?;
+        self.enqueue_flash_latent_mma(
+            stream,
+            FlashSegArgs {
+                inputs,
+                part_v: &mut *part_v,
+                part_ms: &mut *part_ms,
+            },
+        )?;
+        self.enqueue_flash_merge_sink(
+            stream,
+            FlashMergeArgs {
+                n_keys_buf: inputs.n_keys_buf,
+                cache_rows: inputs.kv.rows(),
+                tokens: inputs.geom.tokens,
+                heads: inputs.geom.heads,
+                latent_dims: inputs.geom.latent_dims,
+                part_v,
+                part_ms,
+                y,
+            },
+            sinks,
+        )
+    }
+
+    /// [`FlashKernels::enqueue_flash_merge`] with each head's sink: head `row
+    /// % heads`'s logit folded after the row's segments. Refused as the
+    /// plain merge is, and on fewer sinks than heads.
+    pub fn enqueue_flash_merge_sink(
+        &self,
+        stream: &CudaStream,
+        a: FlashMergeArgs<'_>,
+        sinks: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_flash_merge_sink";
+        let (q_rows, segs) = check_merge(what, &a)?;
+        check_sinks(what, sinks.len(), a.heads)?;
+        let FlashMergeArgs {
+            n_keys_buf,
+            cache_rows,
+            tokens: m,
+            heads: n_heads,
+            latent_dims: latent,
+            part_v,
+            part_ms,
+            y,
+        } = a;
+        let m = launch_u32(what, "tokens", m)?;
+        let n_heads = launch_u32(what, "heads", n_heads)?;
+        let q_rows = launch_u32(what, "q_rows", q_rows)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let cache_rows = launch_u32(what, "cache_rows", cache_rows)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let prep = self
+            .module
+            .prepare_flash_merge_sink(LaunchConfig1D::new(q_rows, LATENT_U32, 0))?;
+        self.module.flash_merge_sink(
+            stream, &prep, n_keys_buf, m, n_heads, q_rows, latent, cache_rows, segs, seg_keys,
+            part_v, part_ms, sinks, y,
+        )?;
+        Ok(())
+    }
+
+    /// The selected-row latent attention with each head's sink: the segment
+    /// pass [`FlashKernels::enqueue_flash_latent_mma_sel`], then
+    /// [`FlashKernels::enqueue_flash_merge_sel_sink`] into `y`. Refused as
+    /// those two refuse.
+    pub fn enqueue_flash_latent_sel_sink(
+        &self,
+        stream: &CudaStream,
+        a: FlashSelArgs<'_>,
+        sinks: &DeviceBuffer<f32>,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let FlashSelArgs {
+            q,
+            kv,
+            list,
+            counts,
+            stride,
+            kq_scale,
+            geom,
+            part_v,
+            part_ms,
+            fault,
+        } = a;
+        check_sinks("enqueue_flash_latent_sel_sink", sinks.len(), geom.heads)?;
+        self.enqueue_flash_latent_mma_sel(
+            stream,
+            FlashSelArgs {
+                q,
+                kv,
+                list,
+                counts,
+                stride,
+                kq_scale,
+                geom,
+                part_v: &mut *part_v,
+                part_ms: &mut *part_ms,
+                fault,
+            },
+        )?;
+        self.enqueue_flash_merge_sel_sink(
+            stream,
+            FlashMergeSelArgs {
+                counts,
+                stride,
+                tokens: geom.tokens,
+                heads: geom.heads,
+                latent_dims: geom.latent_dims,
+                part_v,
+                part_ms,
+                y,
+            },
+            sinks,
+        )
+    }
+
+    /// [`FlashKernels::enqueue_flash_merge_sel`] with each head's sink.
+    /// Refused as the plain merge is, and on fewer sinks than heads.
+    pub fn enqueue_flash_merge_sel_sink(
+        &self,
+        stream: &CudaStream,
+        a: FlashMergeSelArgs<'_>,
+        sinks: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let FlashMergeSelArgs {
+            counts,
+            stride,
+            tokens,
+            heads,
+            latent_dims: latent,
+            part_v,
+            part_ms,
+            y,
+        } = a;
+        let what = "enqueue_flash_merge_sel_sink";
+        let (q_rows, segs) = check_sel(what, (tokens, heads, latent), stride, counts.len())?;
+        check_partials(what, part_v.len(), part_ms.len(), q_rows, segs, latent)?;
+        check_sinks(what, sinks.len(), heads)?;
+        if y.len() < q_rows * latent {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "y.len() {} < tokens*heads*latent = {}",
+                    y.len(),
+                    q_rows * latent
+                ),
+            ));
+        }
+        let tokens = launch_u32(what, "tokens", tokens)?;
+        let n_heads = launch_u32(what, "heads", heads)?;
+        let grid = launch_u32(what, "q_rows", q_rows)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let stride = launch_u32(what, "stride", stride)?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let prep = self
+            .module
+            .prepare_flash_merge_sel_sink(LaunchConfig1D::new(grid, LATENT_U32, 0))?;
+        self.module.flash_merge_sel_sink(
+            stream, &prep, counts, tokens, n_heads, latent, stride, segs, seg_keys, part_v,
+            part_ms, sinks, y,
+        )?;
+        Ok(())
+    }
+
+    /// The window latent attention with each head's sink (module doc): the
+    /// window segment pass — [`flash_kernels::flash_latent_mma_win`] over
+    /// the ring as it stands, or [`flash_kernels::flash_latent_mma_win_stage`]
+    /// over ring ⧺ `staged` — on a grid of `tokens · heads / MMA_ROWS` groups
+    /// times [`window_segments`]`(W)` segments, then
+    /// [`flash_kernels::flash_merge_win_sink`]. The position word is read on
+    /// the device, so a captured graph replays at any position. The ring is
+    /// not written: [`FlashKernels::enqueue_kv_ring_commit`] does that after
+    /// a staged batch.
+    ///
+    /// Refused before any launch: no token, a head count that is not a
+    /// positive multiple of [`MMA_ROWS`], a latent other than [`LATENT`] or a
+    /// row other than [`MMA_WIDTH`], a ring of no row or of another width,
+    /// staging of another width or fewer rows than tokens, an empty position
+    /// buffer, fewer sinks than heads, a `seg_keys` that is not whole tiles,
+    /// and short `q`, partials or `y`.
+    pub fn enqueue_flash_window(
+        &self,
+        stream: &CudaStream,
+        a: FlashWindowArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_flash_window";
+        let FlashWindowArgs {
+            q,
+            ring,
+            staged,
+            pos,
+            sinks,
+            kq_scale: scale,
+            geom,
+            part_v,
+            part_ms,
+            y,
+        } = a;
+        let (q_rows, segs) = check_window(
+            what,
+            geom,
+            ring,
+            staged,
+            (q.len(), pos.len(), sinks.len(), y.len()),
+            (part_v.len(), part_ms.len()),
+        )?;
+        let FlashGeom {
+            tokens,
+            heads,
+            rope_dims,
+            latent_dims: latent,
+        } = geom;
+        let grid = launch_u32(what, "grid", mma_groups(q_rows) * segs)?;
+        let merge_grid = launch_u32(what, "q_rows", q_rows)?;
+        let tokens = launch_u32(what, "tokens", tokens)?;
+        let n_heads = launch_u32(what, "heads", heads)?;
+        let rope_dims = launch_u32(what, "rope_dims", rope_dims)?;
+        let latent = launch_u32(what, "latent_dims", latent)?;
+        let ring_rows = launch_u32(what, "ring rows", ring.rows())?;
+        let segs = launch_u32(what, "segs", segs)?;
+        let seg_keys = launch_u32(what, "seg_keys", seg_keys())?;
+        let cfg = LaunchConfig1D::new(grid, MMA_BLOCK_U32, MMA_DYN_BYTES_U32);
+        match staged {
+            None => {
+                let prep = self.module.prepare_flash_latent_mma_win(cfg)?;
+                self.module.flash_latent_mma_win(
+                    stream,
+                    &prep,
+                    q,
+                    ring.buf(),
+                    pos,
+                    scale,
+                    tokens,
+                    n_heads,
+                    rope_dims,
+                    latent,
+                    ring_rows,
+                    segs,
+                    seg_keys,
+                    &mut *part_v,
+                    &mut *part_ms,
+                )?;
+            }
+            Some(st) => {
+                let prep = self.module.prepare_flash_latent_mma_win_stage(cfg)?;
+                self.module.flash_latent_mma_win_stage(
+                    stream,
+                    &prep,
+                    q,
+                    ring.buf(),
+                    st.buf(),
+                    pos,
+                    scale,
+                    tokens,
+                    n_heads,
+                    rope_dims,
+                    latent,
+                    ring_rows,
+                    segs,
+                    seg_keys,
+                    &mut *part_v,
+                    &mut *part_ms,
+                )?;
+            }
+        }
+        let prep = self
+            .module
+            .prepare_flash_merge_win_sink(LaunchConfig1D::new(merge_grid, LATENT_U32, 0))?;
+        self.module.flash_merge_win_sink(
+            stream, &prep, pos, tokens, n_heads, latent, ring_rows, segs, seg_keys, part_v,
+            part_ms, sinks, y,
+        )?;
+        Ok(())
+    }
+
+    /// Commit a staged window batch of `tokens` rows to its ring: the last
+    /// `min(tokens, W)` staged rows into their slots, one launch whose grid
+    /// comes from `tokens` and the ring's height and which reads `b` on the
+    /// device. After it the ring holds what `tokens` decode steps from `b`
+    /// would have left. Refused before the launch: no token, a ring of no
+    /// row, staging of another width or fewer rows than `tokens`, and an
+    /// empty base buffer. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_kv_ring_commit(
+        &self,
+        stream: &CudaStream,
+        a: RingCommitArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_kv_ring_commit";
+        let RingCommitArgs {
+            stage,
+            base,
+            tokens,
+            ring,
+        } = a;
+        if tokens == 0 || ring.rows() == 0 || base.is_empty() {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "a batch of {tokens} tokens into a ring of {} rows with {} base words: \
+                     each at least one",
+                    ring.rows(),
+                    base.len()
+                ),
+            ));
+        }
+        if stage.cols() != ring.cols() || stage.rows() < tokens {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "staging is {}x{}, the ring {} wide and the batch {tokens} tokens: one \
+                     staged row a token at the ring's width",
+                    stage.rows(),
+                    stage.cols(),
+                    ring.cols()
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "commit grid", tokens.min(ring.rows()))?;
+        let ring_rows = launch_u32(what, "ring rows", ring.rows())?;
+        let width = launch_u32(what, "width", ring.cols())?;
+        let tokens = launch_u32(what, "tokens", tokens)?;
+        let prep =
+            self.module
+                .prepare_kv_ring_commit(LaunchConfig1D::new(grid, COMMIT_THREADS_U32, 0))?;
+        self.module.kv_ring_commit(
+            stream,
+            &prep,
+            stage.buf(),
+            base,
+            ring_rows,
+            tokens,
+            width,
+            ring.buf_mut(),
+        )?;
+        Ok(())
+    }
+
     /// [`FlashKernels::enqueue_flash_merge`] that also writes the q8_1 form
     /// of the merged rows into `lo` and `hi`: the rows below `lo.m()` fill
     /// `lo`'s columns in order, the rest `hi`'s. The bytes are the ones the
@@ -2959,6 +3951,90 @@ fn check_sel(
         ));
     }
     Ok((tokens * heads, segments_for(stride)))
+}
+
+/// A head's sink a head: at least one head and a sink for each.
+fn check_sinks(what: &'static str, sinks_len: usize, heads: usize) -> Result<(), GpuError> {
+    if heads == 0 || sinks_len < heads {
+        return Err(GpuError::shape(
+            what,
+            format!("{sinks_len} sinks for {heads} heads: one sink a head, at least one head"),
+        ));
+    }
+    Ok(())
+}
+
+/// [`FlashKernels::enqueue_flash_window`]'s geometry (its doc's refusals).
+/// `lens` is `(q, pos, sinks, y)`, `parts` `(part_v, part_ms)`. Returns the
+/// query rows and the segment count, [`window_segments`]`(W)`.
+fn check_window(
+    what: &'static str,
+    geom: FlashGeom,
+    ring: &DeviceTensor<u16>,
+    staged: Option<&DeviceTensor<u16>>,
+    (q_len, pos_len, sinks_len, y_len): (usize, usize, usize, usize),
+    parts: (usize, usize),
+) -> Result<(usize, usize), GpuError> {
+    let FlashGeom {
+        tokens,
+        heads,
+        rope_dims,
+        latent_dims: latent,
+    } = geom;
+    let (q_rows, _) = check_sel(what, (tokens, heads, latent), 1, tokens)?;
+    let width = rope_dims + latent;
+    if width != MMA_WIDTH || ring.cols() != width || ring.rows() == 0 {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "rope_dims + latent = {width} over a {}x{} ring — the staged tiles are sized \
+                 for {MMA_WIDTH}-wide rows, and a ring needs a row",
+                ring.rows(),
+                ring.cols()
+            ),
+        ));
+    }
+    if let Some(st) = staged
+        && (st.cols() != width || st.rows() < tokens)
+    {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "staging is {}x{} for {tokens} tokens of {width}-wide rows: one row a token",
+                st.rows(),
+                st.cols()
+            ),
+        ));
+    }
+    if pos_len == 0 {
+        return Err(GpuError::shape(
+            what,
+            "the position buffer holds no word: word 0 is token 0's position",
+        ));
+    }
+    check_sinks(what, sinks_len, heads)?;
+    if q_len < q_rows * width || y_len < q_rows * latent {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "q.len() {q_len} (need {}), y.len() {y_len} (need {})",
+                q_rows * width,
+                q_rows * latent
+            ),
+        ));
+    }
+    let segs = window_segments(ring.rows());
+    check_partials(what, parts.0, parts.1, q_rows, segs, latent)?;
+    if !seg_keys().is_multiple_of(MMA_KEYS) {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "seg_keys {} is not a multiple of the {MMA_KEYS}-key tile",
+                seg_keys()
+            ),
+        ));
+    }
+    Ok((q_rows, segs))
 }
 
 /// The partials both split launches share.

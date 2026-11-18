@@ -112,6 +112,7 @@ mod link;
 pub mod node;
 pub mod nvtier;
 pub mod page;
+pub mod placed;
 pub mod prompt_stream;
 pub mod rank;
 pub mod residency;

@@ -165,7 +165,7 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Deepseek41Chain],
-        at: "gpu-deepseek41/src/engram_gate.rs ROW",
+        at: "gpu/src/engram_gate.rs ROW",
         runs: |n| matches!(n, Need::Engram { row: 5120 }),
     },
     Available {
@@ -2262,11 +2262,16 @@ fn check_for(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The mimo2, solar2 and mistral-large4 bodies' rule: the same
-                // — a stack passes when the common card leg runs its type
+                // The mimo2, solar2, mistral-large4 and hy4 bodies' rule: the
+                // same — a stack passes when the common card leg runs its type
                 // (`kernels::card_runs`) or the host runs it by a qdot fused
                 // kernel at the stack's row width.
-                Some(Program::Mimo2Body | Program::Solar2Body | Program::MistralLarge4Body) => {
+                Some(
+                    Program::Mimo2Body
+                    | Program::Solar2Body
+                    | Program::MistralLarge4Body
+                    | Program::Hy4Body,
+                ) => {
                     if routed_unrun(t, crate::placement::kernels::card_runs) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }

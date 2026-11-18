@@ -106,7 +106,7 @@ use crate::hc::{
 use crate::index_key::{CompIndexKeyKernels, IndexKeyArgs};
 use crate::params::{ImageLayout, Table};
 use crate::rope::{KvAppendArgs, RopeKernels, TailShape};
-use crate::transpose::TransposeKernels;
+use bloomery_gpu::token_major::TokenMajor;
 
 mod batch;
 
@@ -592,7 +592,7 @@ struct Kernels {
     index: Option<IndexerKernels>,
     step: StepKernels,
     dense: DenseKernels,
-    transpose: TransposeKernels,
+    transpose: TokenMajor,
 }
 
 /// The indexer's scratch, present when a layer of the card runs it. Its
@@ -663,7 +663,7 @@ struct SourceScratch {
 struct Raw {
     /// On a card with a compressor layer: the index key's projection over
     /// the geometry's group slots, in the gemv's layout (`y[r·g + c]`),
-    /// before its copy group-major ([`crate::transpose`]).
+    /// before its copy group-major ([`bloomery_gpu::token_major`]).
     key: Option<DeviceBuffer<f32>>,
 }
 
@@ -875,7 +875,7 @@ impl AttnChain {
                 .transpose()?,
             step: StepKernels::load(ctx)?,
             dense: DenseKernels::load(ctx)?,
-            transpose: TransposeKernels::load(ctx)?,
+            transpose: TokenMajor::load(ctx)?,
         };
         let pairs = src.len();
         let constant = constant_words(&words_layout, list_len)?;
