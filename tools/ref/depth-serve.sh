@@ -44,7 +44,8 @@
 #      loaded; the line's ctx must be DEPTH_SERVE_CTX when that is set, else the arm fails by name;
 #   2b. the `plan` record of its log (tools/bloomery/records.py, kind plan or plan38): the placement and the context
 #      the plan picked go into the row's label, and the record's decisions — every field but the host and card
-#      readings (room, plan_room, card_free, read) — must equal those of the first load of the arm's group (the
+#      readings (room, plan_room, card_free, read, and grow_yield and grow_experts, the host K/V's growth ceiling read off
+#      the room) — must equal those of the first load of the arm's group (the
 #      arms of one label, whatever their D), else the arm fails `plan drifted`. A first load's plan must also be
 #      the one `<binary> --plan` prints in the user's environment (no CUDA_VISIBLE_DEVICES), probed under the lease
 #      before round 1: the timed key is then the user's key (DEPTH_SERVE_USER_PLAN). A whole-card load opens with no plan
@@ -166,6 +167,8 @@ __d=${BASH_SOURCE[0]%/*}
 [ "$__d" != "${BASH_SOURCE[0]}" ] || __d=.
 ROOT=$(cd "$__d/../.." && pwd)
 HERE=$ROOT/tools/ref
+# shellcheck source=tools/release/portable-bin.sh
+. "$ROOT/tools/release/portable-bin.sh"
 unset __d
 CARD_PY=$HERE/card.py
 
@@ -212,7 +215,8 @@ fi
 
 SERVE_BIN=target/release/bloomery-serve
 # The release build's binary (tools/release/build.sh builds into its own target dir), the one a tarball packs.
-PORTABLE_BIN=target/portable/release/bloomery-serve
+# The @portable binary of the tarball the run names (tools/release/portable-bin.sh).
+PORTABLE_BIN=$(portable_bin "${DEPTH_SERVE_TARBALL:-}")
 # The runner's own waits per server beyond the load and the request, for the wall line: two witness blocks and two
 # cpu guards (about a second each), the health poll's half second, the stop's fifth of a second, curl and python.
 OVERHEAD_S=5
@@ -669,8 +673,9 @@ ds_fail() {
 }
 
 # The plan record. tools/bloomery/records.py reads it by kind (`plan`, or `plan38` of the qwen3moe family seats): the
-# record's fields all but the readings the host and the card are measured at (room, plan_room, card_free, read), which
-# move with the page cache and a co-tenant, are the plan's decisions, and two loads are one key when they print the
+# record's fields all but the readings the host and the card are measured at (room, plan_room, card_free, read) and what
+# follows from the room alone (grow_yield, grow_experts: how far the host K/V may grow by yielding host experts), which move
+# with the page cache and a co-tenant, are the plan's decisions, and two loads are one key when they print the
 # same ones.
 RECORDS_PY=$ROOT/tools/bloomery/records.py
 
@@ -695,7 +700,7 @@ import sys
 spec = importlib.util.spec_from_file_location('records', sys.argv[1])
 records = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(records)
-READINGS = ('room', 'plan_room', 'card_free', 'read')
+READINGS = ('room', 'plan_room', 'card_free', 'read', 'grow_yield', 'grow_experts')
 lines = open(sys.argv[2], errors='replace').read().splitlines()
 mode, whole = sys.argv[3], sys.argv[4]
 for name in ('generate_ds41', 'generate_qwen3moe'):
@@ -1289,7 +1294,7 @@ ds_selftest() {
   # run's environment: ST_CTXSEQ the plan's context where no --ctx-size is given (ST_CTXFIXED, default 16384, past the
   # sequence), ST_EXPSEQ the card experts, ST_TPSSEQ the decode rate; ST_PLAN_USER_CARD the card a probe without
   # CUDA_VISIBLE_DEVICES names; the tree's own NAME=VALUE words reach the wrapper as well as the stub. The plan's room,
-  # plan_room and card_free readings change with every load, as a host's do.
+  # plan_room and card_free readings and the grow_yield and grow_experts ceilings change with every load, as a host's do.
   st_bin() {
     local name=$1 rel=$2 tps=$3 d=$C/home/repo/$1
     shift 3
@@ -1340,7 +1345,7 @@ room=$((263890399232 + n * 4096))
 # ready event; nomarker no seat's line; noready no event; nullplace an event with no place; readyctx an event whose context is
 # not the listening line's; none only the first two; bare nothing of its placement. A probe's ctx line names ST_PROBE_CTX when it is set.
 case ${ST_WHOLE:-} in
-  '') echo "plan place=$place card=$card ctx_max=$ctx card_experts=$exp (33857090004 B) host_experts=6233 (198524141568 B) host_shadow=0 B n_l=18..19 on 57 layers card_budget=none paged=0 arena=0 arena_slots=0 room=$room plan_room=$((room - 1000)) card_free=$((50668240896 - n * 512)) devices=[stage:$card:cuda0:50952404992] cuda_order=cuda0" >&2 ;;
+  '') echo "plan place=$place card=$card ctx_max=$ctx card_experts=$exp (33857090004 B) host_experts=6233 (198524141568 B) host_shadow=0 B n_l=18..19 on 57 layers card_budget=none paged=0 arena=0 arena_slots=0 grow_yield=$((room - 4096000)) grow_experts=$((1800 + n)) room=$room plan_room=$((room - 1000)) card_free=$((50668240896 - n * 512)) devices=[stage:$card:cuda0:50952404992] cuda_order=cuda0" >&2 ;;
   bare) ;;
   *)
     pctx=$ctx

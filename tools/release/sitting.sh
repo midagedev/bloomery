@@ -133,6 +133,8 @@ __d=${BASH_SOURCE[0]%/*}
 ROOT=$(cd "$__d/../.." && pwd)
 unset __d
 HERE=$ROOT/tools/ref
+# shellcheck source=tools/release/portable-bin.sh
+. "$ROOT/tools/release/portable-bin.sh"
 REAL_DS=$HERE/depth-serve.sh
 US=$'\037'
 
@@ -1265,7 +1267,8 @@ main() {
 
   # The binary and the tarball.
   BIN=$HOME/repo/$TREE/target/release/bloomery-serve
-  [ "$STAGE" != portable ] || BIN=$HOME/repo/$TREE/target/portable/release/bloomery-serve
+  # A portable stage's binary is the one build.sh packed into the tarball's platform (tools/release/portable-bin.sh).
+  [ "$STAGE" != portable ] || BIN=$HOME/repo/$TREE/$(portable_bin "$TARBALL")
   BIN_SHA=$(sha256_of "$BIN")
   TB_MEMBER=''
   if [ -n "$TARBALL" ]; then
@@ -1595,6 +1598,7 @@ st_case() {
   WHY='' ST_EXTRA=()
   mkdir -p "$C/tree/tools/release"
   cp "$SUT" "$C/tree/tools/release/sitting.sh"
+  cp "$(dirname "$SUT")/portable-bin.sh" "$C/tree/tools/release/portable-bin.sh"
   ln -s "$ROOT/tools/ref" "$C/tree/tools/ref"
   ln -s "$ROOT/tools/gate-bound.sh" "$C/tree/tools/gate-bound.sh"
   ln -s "$ROOT/tools/gpu-gate.sh" "$C/tree/tools/gpu-gate.sh"
