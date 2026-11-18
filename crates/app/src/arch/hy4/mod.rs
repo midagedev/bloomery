@@ -1,9 +1,11 @@
 //! The Hy4-flash session: [`Body`] behind the common hybrid owner's shape ([`super::Batch`]),
 //! planned once by the common hybrid planner (every layer's dense part and the stores on the stage
 //! card, each routed layer's card share of its experts beside them, the rest on the host tier) and
-//! loaded by the body's placed constructor ([`Body::open_placed`]). The prompt steps the ids one at
-//! a time ([`GpuModel::step`] over the slice), so each id is a decode step's bits and the head's
-//! argmax after the last is the call's. A window layer's ring and the engram history hold the
+//! loaded by the body's placed constructor ([`Body::open_placed`], or [`Body::open_placed_pass`]
+//! with the placed prompt pass). A load with the pass runs a prompt as passes of its rows
+//! ([`prompt_placed`]), the host's experts read once a pass; one without it steps the ids one at a
+//! time ([`GpuModel::step`] over the slice). Either way the head's argmax after the last id is the
+//! call's. A window layer's ring and the engram history hold the
 //! position they stand at alone, so a cut keeps every held position or nothing. Each resident
 //! sequence owns its stores and its engram history ([`ResidentSequences`]).
 
@@ -13,7 +15,7 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError, GpuModel};
-use bloomery_gpu_hy4::Body;
+use bloomery_gpu_hy4::{Body, prompt_placed};
 use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::hy4::place::PlanInputs;
@@ -50,8 +52,8 @@ impl Batch for Body {
         Body::open_placed(file, plan, inputs, 0, host)
     }
 
-    /// Refused by name: the body has no rows pass, so the prompt is [`Batch::prompt`]'s steps
-    /// and nothing calls a batch.
+    /// Refused by name: the placed pass is the body's own walk ([`Batch::prompt`]), so nothing
+    /// calls a batch.
     fn batch(
         _gpu: &Gpu,
         _w: &Weights,
@@ -63,20 +65,25 @@ impl Batch for Body {
         Err(GpuError::shape(
             WHAT,
             format!(
-                "a batch of {} ids: the body has no rows pass, its prompt steps one id at a time",
+                "a batch of {} ids: the body has no rows pass, its prompt is the placed pass or steps",
                 ids.len()
             ),
         ))
     }
 
-    /// No prompt group: the ids are stepped.
+    /// No prompt group: the ids are the pass's or stepped.
     fn group(_m: &mut GpuModel<Body>, _g: usize) -> Result<bool, GpuError> {
         Ok(false)
     }
 
-    /// The ids from the model's position, stepped.
+    /// The ids from the model's position: as placed passes when the load has one
+    /// ([`prompt_placed`]), else stepped. The body's residency is [`Residency::Off`], so no rule
+    /// counts the prompt ids' decode rows.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        m.step(ids)
+        if m.body("hy4::Batch::prompt")?.pass_rows().is_none() {
+            return m.step(ids);
+        }
+        prompt_placed(m, ids)
     }
 
     /// The window rings and the engram history hold the position they stand at alone: a cut

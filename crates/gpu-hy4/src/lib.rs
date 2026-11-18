@@ -33,10 +33,13 @@ mod alone;
 pub mod batch;
 pub mod body;
 mod placed;
+mod rooms;
 mod step;
 pub mod tier;
 
 pub use alone::{MixAlone, Picks, Selection};
-pub use batch::{Cfg, Prompt, prompt};
+pub use batch::{
+    Cfg, PASS_ROWS, PassShape, PlacedPass, Prompt, SHAPES, pass_bytes, prompt, prompt_placed,
+};
 pub use body::{Body, Seq, TAP_STAGES, TapRows};
 pub use placed::Placed;

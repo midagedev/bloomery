@@ -18,7 +18,7 @@ use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use bloomery_levers::HostCfg;
 use gguf::Split;
-use model::arch::place_hybrid::PlanInputs;
+use model::arch::place_hybrid::{PlanInputs, RoomPages};
 use model::placement::{Machine, Plan, PlanLevers};
 use runtime::seqstate::Kept;
 
@@ -69,6 +69,9 @@ pub struct HybridCfg {
     pub group: usize,
     /// The resident sequences charged by the plan before any allocation.
     pub slots: NonZeroUsize,
+    /// The pages the run read from the stage card for the K/V levers: the load's plan of inputs
+    /// read again from the file counts the rooms' rounding and host pages as the run's did.
+    pub pages: RoomPages,
     /// Whether the load carries the file's in-file MTP layer beside the target: its card bytes are
     /// the plan's reserve ([`Batch::configure_draft`]) and the body opens by
     /// [`Batch::open_placed_drafted`]. A family with no such layer refuses it by name.
@@ -80,6 +83,9 @@ pub struct HybridCfg {
 pub trait HybridInputs {
     /// The layers the file holds.
     fn layers(&self) -> usize;
+
+    /// Take the pages the run read for the K/V levers ([`PlanInputs::set_room_pages`]).
+    fn set_room_pages(&mut self, pages: RoomPages);
 
     /// The plan of the file on `machine` at `ctx` positions under `levers`,
     /// refused by name (`what` the session) when the placement does not hold.
@@ -96,6 +102,10 @@ pub trait HybridInputs {
 impl<H> HybridInputs for PlanInputs<H> {
     fn layers(&self) -> usize {
         self.model.layers
+    }
+
+    fn set_room_pages(&mut self, pages: RoomPages) {
+        PlanInputs::set_room_pages(self, pages);
     }
 
     fn plan_at<'a>(
@@ -226,6 +236,7 @@ impl<B: Batch> Open for B {
     }
 
     fn configure_inputs(inputs: &mut B::Inputs, cfg: &HybridCfg) -> Result<(), GpuError> {
+        inputs.set_room_pages(cfg.pages);
         B::configure(inputs, cfg)?;
         if cfg.draft {
             B::configure_draft(inputs)?;

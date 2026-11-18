@@ -130,6 +130,17 @@ pub struct KvDefault {
     pub host: KvHost,
 }
 
+impl KvDefault {
+    /// What a server takes for the K/V levers it leaves unset: the routed experts spread at 8,192
+    /// positions (a context no more has no floor) and the selected rows' pages spill to the host
+    /// once the card's margin is reached. One value for every server whose body holds its
+    /// stores in rooms; `off` stays a value of both levers.
+    pub const SERVER: KvDefault = KvDefault {
+        floor: 8192,
+        host: KvHost::Spill,
+    };
+}
+
 /// [`plan_with`] under `levers`: the card budget, or none.
 pub fn plan<'a>(
     model: &'a ModelTensors,

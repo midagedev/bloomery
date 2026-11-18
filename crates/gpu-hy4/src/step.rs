@@ -369,7 +369,7 @@ pub(crate) fn attention_keys(
     a.kv_a.project(&cx, acts, l, &s.xn, &mut s.kv_a)?;
     let kv_gain = w.f32_buf(WHAT, &names::attn_kv_a_norm(l))?;
     let (at, cache) = match &mut stores[l] {
-        Store::Dsa(d) => (&words.pos, &mut d.cache),
+        Store::Dsa(d) => (&words.pos, &mut *d.cache),
         Store::Swa { ring } => (&words.ring_pos, ring),
     };
     k.fused.enqueue_kv_norm_rope_append(

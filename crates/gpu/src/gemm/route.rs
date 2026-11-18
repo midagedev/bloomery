@@ -173,6 +173,16 @@ impl GemmRoute {
             + self.zeros.as_ref().map_or(0, DeviceBuffer::num_bytes)
     }
 
+    /// The device bytes of a table of `max_slots` slots over `n_experts` experts, as
+    /// [`GemmRoute::new`] allocates it and [`GemmRoute::bytes`] reads it: the plan's count of a
+    /// load's tables before any is made.
+    #[must_use]
+    pub fn bytes_at(max_slots: usize, n_experts: usize) -> usize {
+        let word = size_of::<u32>();
+        let zeros = if n_experts == 1 { max_slots } else { 0 };
+        word * (max_slots + 2 * gemm_max_tiles(max_slots, n_experts) + 2 + zeros)
+    }
+
     /// The table as it stands on the card: the slot list and the tiles. A
     /// blocking read on `stream`, for gates and diagnostics.
     pub fn read_back(&self, stream: &CudaStream) -> Result<(Vec<u32>, Vec<GemmTile>), GpuError> {

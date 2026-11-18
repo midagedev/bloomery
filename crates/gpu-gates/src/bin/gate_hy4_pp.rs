@@ -46,6 +46,22 @@
 //! - `refusals_are_named`: a geometry the kernels cannot hold, a prompt of no id and a prompt past
 //!   the context end by name, and the model keeps decoding after the last one.
 //!
+//! The placed pass (`bloomery_gpu_hy4::prompt_placed`: a placed load's prompt as passes of up to 512
+//! rows over the host tier's batch port) is held on the same file with the gate card's budget
+//! planned to half the experts, so every routed layer has a host share (`placed_load::levers`):
+//!
+//! - `placed_attention_is_decode` and `placed_ffn_is_decode`: the five sets through the placed
+//!   pass, each layer's attention and feed-forward block run alone by the whole-card decode chain on
+//!   the pass's own rows, within [`ATTN_BAND`] and [`FFN_BAND`] with the router's picks the pass's:
+//!   a hosted layer's block is the card's slots and the host's sum added, so a back that leaves the
+//!   host's sum out moves every hosted layer's output far past the band.
+//! - `placed_pass_is_census`: a prompt of [`PLACED_IDS`] ids through the pass serves each hosted
+//!   layer once a walk (`batch_served` = hosted layers x ceil(ids / 512)) over every column
+//!   (`batch_cols`), its picks the card's and the host file's (`picks` = `card` + `file`, none
+//!   streamed), and the same ids stepped leave the batch counters where they were.
+//! - `placed_pass_is_reserved`: the load's resident bytes stand inside the plan's terms with the
+//!   pass's bytes as the prompt reserve, and a plan that reserves none refuses the load by name.
+//!
 //! The prompt sets only supply ids: the vendor's dumps are not read as an oracle here. The fixture
 //! tier only: the released file (124 GB) does not fit one card and this gate opens the whole-card
 //! body, so the real tier ends by name before anything loads.
@@ -56,15 +72,37 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "hy4")]
+#[allow(
+    dead_code,
+    reason = "the card the gate plans on; the placed clauses read its spec"
+)]
+#[path = "shared/gate_card.rs"]
+mod gate_card;
+
+#[cfg(feature = "hy4")]
+#[allow(
+    dead_code,
+    reason = "the shared placed-load body; this gate reads the plan's levers, the context, the host \
+              configuration, the load line and the resident clause"
+)]
+#[path = "shared/placed_load.rs"]
+mod placed_load;
+
+#[cfg(feature = "hy4")]
 mod gate {
+    use crate::gate_card;
+    use crate::placed_load::{self, CTX as PLACED_CTX, HOST_CFG};
     use bloomery_gpu::latent::POOL;
     use bloomery_gpu::{Gpu, GpuModel};
+    use bloomery_gpu_gates::hy4_pass;
     use bloomery_gpu_gates::rel::rel;
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{GateError, RefManifest, checks_failed, open_split, verdict};
     use bloomery_gpu_hy4::batch::{Cfg, Prompt, Q_MAX, WalkTaps, stage_width};
-    use bloomery_gpu_hy4::{Body, TAP_STAGES, prompt};
+    use bloomery_gpu_hy4::{Body, PASS_ROWS, PassShape, TAP_STAGES, prompt, prompt_placed};
     use model::arch::Arch;
+    use model::arch::hy4::place::PlanInputs;
+    use model::placement::workstation;
     use refset::arch::hy4::fixture::{self, A, B, C, D, E};
     use refset::arch::prompt_tables;
 
@@ -94,6 +132,8 @@ mod gate {
     /// The ids of the big prompt: two walks of the released geometry (4,096 rows, then 104), and
     /// two feed-forward units in the first (2,560 rows, then 1,536).
     const BIG: usize = 4200;
+    /// The ids of the placed pass's census prompt: three walks of the pass's rows (512, 512, 76).
+    const PLACED_IDS: usize = 1_100;
     /// The decode steps after a prompt that read its stores.
     const CONT_STEPS: usize = 8;
     /// Positions of every store: the big prompt and the continuation.
@@ -265,28 +305,32 @@ mod gate {
         )
     }
 
-    /// Clauses `forced_attention_is_decode` and `forced_ffn_is_decode` of set `name`: the batch
-    /// walks `ids`, then the decode chain runs each block alone on the batch's inputs.
+    /// A walk of `ids` whose taps a clause reads: the whole-card batch's, or the placed pass's. The
+    /// model it is given is the whole-card one, whose decode chain the clause runs each block on.
+    type TapSource<'a> = dyn FnMut(&mut GpuModel<Body>, &[u32]) -> Result<WalkTaps, GateError> + 'a;
+
+    /// Clauses `{kind}_attention_is_decode` and `{kind}_ffn_is_decode` of set `name`: a walk (`source`:
+    /// the whole-card batch for `forced`, the placed pass for `placed`) runs `ids`, then the
+    /// whole-card model's decode chain runs each block alone on the walk's inputs.
     fn forced_is_decode(
         m: &mut GpuModel<Body>,
-        p: &mut Prompt,
         name: &str,
         ids: &[u32],
+        (kind, source): (&str, &mut TapSource<'_>),
     ) -> Result<bool, GateError> {
         let attn = tier::run_clause(
-            &format!("forced_attention_is_decode set={name}"),
+            &format!("{kind}_attention_is_decode set={name}"),
             Tag::SelfConsistency,
         )?;
         let ffn = tier::run_clause(
-            &format!("forced_ffn_is_decode set={name}"),
+            &format!("{kind}_ffn_is_decode set={name}"),
             Tag::SelfConsistency,
         )?;
         if !attn && !ffn {
             return Ok(true);
         }
-        batch_prompt(m, p, ids)?;
         let t = ids.len();
-        let taps = p.taps(m.gpu().stream(), t)?;
+        let taps = source(m, ids)?;
         let hidden = m.body(NAME)?.hidden();
         let (gpu, w, body) = m.body_parts(NAME)?;
         let mut ok = true;
@@ -312,7 +356,7 @@ mod gate {
             }
             let pass = ok && worst_out <= ATTN_BAND;
             println!(
-                "forced_attention_is_decode set={name} attn_out_rel=[{}] worst={worst_out:.3e} \
+                "{kind}_attention_is_decode set={name} attn_out_rel=[{}] worst={worst_out:.3e} \
                  band={ATTN_BAND:.1e} {}",
                 cells.join(" "),
                 verdict(pass)
@@ -342,7 +386,7 @@ mod gate {
             }
             let pass = flips == 0 && worst_out <= FFN_BAND;
             println!(
-                "forced_ffn_is_decode set={name} ffn_out_rel=[{}] worst={worst_out:.3e} \
+                "{kind}_ffn_is_decode set={name} ffn_out_rel=[{}] worst={worst_out:.3e} \
                  band={FFN_BAND:.1e} pick_mismatches={flips} {}",
                 cells.join(" "),
                 verdict(pass)
@@ -597,6 +641,191 @@ mod gate {
         Ok(ok)
     }
 
+    /// The placed pass's clauses on the fixture with a host share: `m` is the whole-card model whose
+    /// decode chain the forced clauses run on, `sets` the prompt sets, `e` set `e`'s ids.
+    fn placed_pass_clauses(
+        m: &mut GpuModel<Body>,
+        sets: &[(&str, Vec<u32>)],
+        e: &[u32],
+    ) -> Result<bool, GateError> {
+        let split = open_split(Arch::Hy4, RECIPE)?;
+        let inputs = PlanInputs::read(&split)?;
+        let machine =
+            workstation::placed_on(gate_card::card()?, inputs.hp.n_layer, workstation::SCRATCH);
+        let shape = PassShape::of(PASS_ROWS);
+        let ctx = usize::try_from(PLACED_CTX)?;
+        let pass_inputs = hy4_pass::inputs_for(&inputs, ctx, shape)?;
+        let levers = placed_load::levers(&pass_inputs, &machine, Tier::Fixture)?;
+        let plan = pass_inputs.plan(&machine, PLACED_CTX, &levers)?;
+        let t = std::time::Instant::now();
+        let mut pm = Body::open_placed_pass(
+            open_split(Arch::Hy4, RECIPE)?,
+            &plan,
+            &pass_inputs,
+            0,
+            HOST_CFG,
+            shape.rows,
+        )?;
+        placed_load::load_line(pm.resident_bytes(), inputs.hp.n_layer, t.elapsed());
+        let hosted = pm.body(NAME)?.hosted_layers();
+        if hosted == 0 {
+            return Err(format!(
+                "{NAME}: the placed plan holds every expert on the card, so no layer has a host \
+                 share to walk the pass over"
+            )
+            .into());
+        }
+        let mut ok = true;
+        {
+            let (gpu, _w, body) = pm.body_parts(NAME)?;
+            body.pass_mut()
+                .ok_or("the placed load carries its pass")?
+                .arm_taps(gpu)?;
+        }
+        for (name, ids) in sets {
+            ok &= forced_is_decode(
+                m,
+                name,
+                ids,
+                ("placed", &mut |_m, ids| {
+                    pm.reset()?;
+                    prompt_placed(&mut pm, ids)?;
+                    let pass = pm
+                        .body(NAME)?
+                        .pass()
+                        .ok_or("the placed load carries its pass")?;
+                    Ok(pass.taps(pm.gpu().stream(), ids.len())?)
+                }),
+            )?;
+        }
+        ok &= placed_pass_is_census(&mut pm, e, hosted)?;
+        ok &= placed_pass_is_reserved(&pm, (&plan, &pass_inputs), (&inputs, &machine, &levers))?;
+        Ok(ok)
+    }
+
+    /// Clause `placed_pass_is_census`: `PLACED_IDS` ids through the pass serve every hosted layer
+    /// once a walk over every column, the picks being the card's and the file's, and the same ids
+    /// stepped leave the batch counters alone.
+    fn placed_pass_is_census(
+        pm: &mut GpuModel<Body>,
+        e: &[u32],
+        hosted: usize,
+    ) -> Result<bool, GateError> {
+        if !tier::run_clause("placed_pass_is_census", Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let ids = repeated(e, PLACED_IDS);
+        let read = |pm: &GpuModel<Body>| -> Result<_, GateError> {
+            let b = pm.body(NAME)?;
+            let stats = b
+                .host_stats()
+                .ok_or("a placed load carries the host tier")?;
+            let census = b.host_census().ok_or(
+                "the host tier counts no reads, so the prompt census has no picks to hold",
+            )?;
+            Ok((stats, census))
+        };
+        pm.reset()?;
+        let (s0, c0) = read(pm)?;
+        prompt_placed(pm, &ids)?;
+        let (s1, c1) = read(pm)?;
+        let hosted = hosted as u64;
+        let walks = PLACED_IDS.div_ceil(PASS_ROWS) as u64;
+        let served = s1.batch_served - s0.batch_served;
+        let cols = s1.batch_cols - s0.batch_cols;
+        let (picks, card, file, streamed) = (
+            c1.picks - c0.picks,
+            c1.card - c0.card,
+            c1.file - c0.file,
+            c1.streamed - c0.streamed,
+        );
+        let pass_ok = served == hosted * walks
+            && cols == hosted * PLACED_IDS as u64
+            && picks > 0
+            && picks == card + file
+            && streamed == 0;
+        println!(
+            "placed_pass_is_census phase=prompt ids={PLACED_IDS} walks={walks} hosted_layers={hosted} \
+             batch_served={served} (want {}) batch_cols={cols} (want {}) picks={picks} card={card} \
+             file={file} streamed={streamed} {}",
+            hosted * walks,
+            hosted * PLACED_IDS as u64,
+            verdict(pass_ok)
+        );
+        // The same ids one a step: the batch port stays idle and the step port serves.
+        pm.reset()?;
+        let (t0, _) = read(pm)?;
+        for &id in &ids[..e.len()] {
+            pm.step(&[id])?;
+        }
+        let (t1, _) = read(pm)?;
+        let batch_idle = t1.batch_served == t0.batch_served && t1.batch_cols == t0.batch_cols;
+        let step_served = t1.served - t0.served;
+        let steps_ok = batch_idle && step_served > 0;
+        println!(
+            "placed_pass_is_census phase=steps ids={} batch_idle={batch_idle} step_served={step_served} {}",
+            e.len(),
+            verdict(steps_ok)
+        );
+        Ok(pass_ok && steps_ok)
+    }
+
+    /// Clause `placed_pass_is_reserved`: the load's resident bytes stand inside the plan's terms with
+    /// the pass's bytes the prompt reserve, and a plan that reserves none refuses the load by name.
+    fn placed_pass_is_reserved(
+        pm: &GpuModel<Body>,
+        (plan, pass_inputs): (&model::placement::Plan<'_>, &PlanInputs),
+        (inputs, machine, levers): (
+            &PlanInputs,
+            &model::placement::Machine,
+            &model::placement::PlanLevers,
+        ),
+    ) -> Result<bool, GateError> {
+        if !tier::run_clause("placed_pass_is_reserved", Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let held = placed_load::resident_inside_the_plan(
+            pm.resident_bytes() as u64,
+            plan,
+            pass_inputs.prompt_reserve,
+        )?;
+        let pass = pm
+            .body(NAME)?
+            .pass()
+            .ok_or("the placed load carries its pass")?
+            .bytes();
+        let within = pass as u64 <= pass_inputs.prompt_reserve;
+        println!(
+            "placed_pass_is_reserved pass_bytes={pass} reserve={} {}",
+            pass_inputs.prompt_reserve,
+            verdict(within)
+        );
+        // A plan with no reserve for the pass: the load refuses, naming the pass's buffers.
+        let none = inputs.clone().with_prompt_reserve(0);
+        let plan0 = none.plan(machine, PLACED_CTX, levers)?;
+        let refused = Body::open_placed_pass(
+            open_split(Arch::Hy4, RECIPE)?,
+            &plan0,
+            &none,
+            0,
+            HOST_CFG,
+            PASS_ROWS,
+        );
+        let named = match refused {
+            Ok(_) => false,
+            Err(e) => {
+                let text = e.to_string();
+                println!("  a plan with no reserve: {text}");
+                text.contains("placed pass buffers")
+            }
+        };
+        println!(
+            "placed_pass_is_reserved no_reserve_refused_by_name={named} {}",
+            verdict(named)
+        );
+        Ok(held && within && named)
+    }
+
     pub fn run() -> Result<(), GateError> {
         if Tier::from_env()? != Tier::Fixture {
             return Err(format!(
@@ -645,7 +874,15 @@ mod gate {
         one.arm_taps(m.gpu())?;
         let mut ok = true;
         for (name, ids) in &sets {
-            ok &= forced_is_decode(&mut m, &mut p, name, ids)?;
+            ok &= forced_is_decode(
+                &mut m,
+                name,
+                ids,
+                ("forced", &mut |m, ids| {
+                    batch_prompt(m, &mut p, ids)?;
+                    Ok(p.taps(m.gpu().stream(), ids.len())?)
+                }),
+            )?;
         }
         let long = repeated(e, LONG);
         for (name, ids) in sets.iter().map(|(n, i)| (*n, i)).chain([("long", &long)]) {
@@ -671,6 +908,7 @@ mod gate {
         let big = repeated(e, BIG);
         ok &= chunking_is_invariant(&mut m, (&mut big_p, &mut small), "big", &big)?;
         ok &= refusals_are_named(&mut m, e)?;
+        ok &= placed_pass_clauses(&mut m, &sets, e)?;
         println!("{}", tier::tally_line());
         if !ok {
             return Err(checks_failed());
@@ -681,7 +919,8 @@ mod gate {
              and selection, the stores the batch left read by the decode chain within \
              {STORE_BAND:.1e}, the batch the single-id batch within {SINGLE_BAND:.1e} in every stage \
              and store on the sets and {LONG} ids, the geometry invariant within {CHUNK_BAND:.1e} \
-             up to {BIG} ids, the refusals named"
+             up to {BIG} ids, the refusals named, and the placed pass within the same bands with \
+             its serves and picks counted and its bytes reserved"
         );
         Ok(())
     }

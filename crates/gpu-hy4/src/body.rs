@@ -3,8 +3,10 @@
 //! embedding and the engram rows, and the gate's taps.
 //!
 //! The stores, by layer kind:
-//! - a sparse (DSA) layer keeps a 576-wide f16 row `[k_rope | latent]` for every position, the
-//!   k-pool selector's index rows (`[value | gate]`, 256 f16 a position) in a ring of
+//! - a sparse (DSA) layer keeps a 576-wide f16 row `[k_rope | latent]` for every position in a
+//!   room ([`bloomery_gpu::RoomTensor`]: the pages the sequence reaches are backed, on the card or,
+//!   by the plan's `BLOOMERY_KV_HOST` word, on the host; [`crate::rooms`]), the k-pool selector's
+//!   index rows (`[value | gate]`, 256 f16 a position) in a ring of
 //!   [`crate::batch::INDEX_RING`] positions (the most a prompt batch's launch appends, and a pool),
 //!   its pooled keys (128 f16 a pool of four), its scores and its list of picked rows;
 //! - a window (SWA) layer keeps a ring of `W` 576-wide rows, position `p` at slot `p % W`.
@@ -30,7 +32,7 @@ use bloomery_gpu::kpool::KpoolKernels;
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LatentKernels, POOL};
 use bloomery_gpu::linear::out_gate::OutGateKernels;
 use bloomery_gpu::model::{
-    ChainBody, HostServed, Resident, Rollback, Slots, StepKernels, stage_run,
+    ChainBody, HostServed, Resident, Rollback, Slots, StepKernels, refuse_reserve_past, stage_run,
 };
 use bloomery_gpu::qsa::QsaKernels;
 use bloomery_gpu::rope_table::{Direction, RopeRows, RopeSpec, RopeTable};
@@ -38,7 +40,7 @@ use bloomery_gpu::route_body::sigmoid_512_16;
 use bloomery_gpu::routed_block::RouterEntry;
 use bloomery_gpu::site::{KGemvKernels, SiteTy};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, KvBackings, RoomTensor};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use engram::hash::{Hash, History};
@@ -46,11 +48,13 @@ use gguf::{GgmlType, Split};
 use model::arch::Arch;
 use model::arch::hy4::hparams::Hparams;
 use model::arch::hy4::names;
-use model::arch::hy4::place::PlanInputs;
+use model::arch::hy4::place::{CACHE_ROWS, PlanInputs};
 use model::placement::Plan;
 use model::placement::kernels::DownForms;
 use runtime::layer::hosted;
+use runtime::stores::PosBuf;
 
+use crate::batch::PlacedPass;
 use crate::placed::{LOAD_ROWS, Open, Placed};
 
 /// What the refusals of this file name.
@@ -127,7 +131,7 @@ pub(crate) struct Shape {
 impl Shape {
     /// `hp`'s widths at `ctx` positions; a width the composed kernels are not built for is refused
     /// by name (each is an architecture fact of the released file).
-    fn of(hp: &Hparams, ctx: usize) -> Result<Shape, GpuError> {
+    pub(crate) fn of(hp: &Hparams, ctx: usize) -> Result<Shape, GpuError> {
         let m = &hp.mla;
         let fixed = [
             ("rope.dimension_count", m.pe, ROPE),
@@ -253,10 +257,10 @@ pub(crate) enum Store {
     Swa { ring: DeviceTensor<u16> },
 }
 
-/// A sparse layer's stores: the cache row of every position, the selector's index ring, pool
-/// plane and scores, and the list it hands the flash.
+/// A sparse layer's stores: the cache row of every position (a room), the selector's index ring,
+/// pool plane and scores, and the list it hands the flash.
 pub(crate) struct Sparse {
-    pub(crate) cache: DeviceTensor<u16>,
+    pub(crate) cache: RoomTensor<u16>,
     pub(crate) index: DeviceTensor<u16>,
     pub(crate) pooled: DeviceTensor<u16>,
     pub(crate) scores: DeviceBuffer<f32>,
@@ -391,6 +395,10 @@ pub struct Body {
     pub(crate) routes: Vec<Option<RouteOut>>,
     pub(crate) words: Words,
     pub(crate) stores: Vec<Store>,
+    /// Each layer's by-position buffers as the plan declares them ([`Hparams::pos_bufs`]), which a
+    /// sequence's rooms are made from, and what the load backs their pages by.
+    pub(crate) decl: Vec<Vec<PosBuf>>,
+    pub(crate) kv: KvBackings,
     pub(crate) host: HostIn,
     /// Every position's rope row at the sparse layers' base: the selector's table.
     pub(crate) rope_rows: RopeRows,
@@ -399,6 +407,9 @@ pub struct Body {
     pub(crate) held: u32,
     /// The host tier's side of a placed load ([`crate::placed`]); `None` on the whole-card load.
     pub(crate) placed: Option<Placed>,
+    /// The placed prompt pass's buffers ([`crate::batch::PlacedPass`]), on a placed load opened with
+    /// its pass; `None` on a load that steps its prompt and on the whole-card load.
+    pub(crate) pass: Option<Box<PlacedPass>>,
 }
 
 /// What one resident sequence owns ([`Slots`]): every layer's stores, the engram history and the
@@ -526,11 +537,18 @@ impl Layer {
 }
 
 impl Store {
-    fn new(stream: &CudaStream, sh: &Shape, dsa: bool) -> Result<Store, GpuError> {
+    /// A layer's store of `sh.ctx` positions: a sparse layer's cache is the room `decl` declares,
+    /// backed as `kv` says.
+    fn new(
+        stream: &Arc<CudaStream>,
+        sh: &Shape,
+        (decl, kv): (&[PosBuf], KvBackings),
+        dsa: bool,
+    ) -> Result<Store, GpuError> {
         Ok(if dsa {
             let pools = sh.ctx.div_ceil(POOL);
             Store::Dsa(Box::new(Sparse {
-                cache: DeviceTensor::zeroed(stream, sh.ctx, ROW)?,
+                cache: kv.room(stream, decl, CACHE_ROWS, sh.ctx)?,
                 index: DeviceTensor::zeroed(stream, crate::batch::INDEX_RING, INDEX_ROW)?,
                 pooled: DeviceTensor::zeroed(stream, pools, INDEX_HEAD)?,
                 scores: z(stream, pools)?,
@@ -544,19 +562,27 @@ impl Store {
         })
     }
 
-    fn bytes(&self) -> usize {
+    /// The store's address range in bytes: a room's whole range, backed or not.
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            Store::Dsa(d) => d.cache.buf().num_bytes() + self.fixed_bytes(),
+            Store::Swa { .. } => self.fixed_bytes(),
+        }
+    }
+
+    /// The bytes the store holds whatever its sequence reaches: every buffer but the cache room.
+    pub(crate) fn fixed_bytes(&self) -> usize {
         match self {
             Store::Dsa(d) => {
                 let Sparse {
-                    cache,
+                    cache: _,
                     index,
                     pooled,
                     scores,
                     list,
                     n_sel,
                 } = &**d;
-                cache.buf().num_bytes()
-                    + index.buf().num_bytes()
+                index.buf().num_bytes()
                     + pooled.buf().num_bytes()
                     + scores.num_bytes()
                     + list.num_bytes()
@@ -664,8 +690,20 @@ impl Body {
     /// The whole model of `file` resident on `gpu` with stores of `ctx` positions, plus the
     /// output head. The embedding and the engram table stay in the file: the step reads a token's
     /// rows on the host. A file whose card tensors exceed the card's free bytes is refused by name
-    /// before any is read: the released file does not fit one card.
+    /// before any is read: the released file does not fit one card. The stores' rooms back their
+    /// pages on the card ([`Body::open_rooms`] with [`KvBackings::CARD`]).
     pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
+        Body::open_rooms(gpu, file, ctx, KvBackings::CARD)
+    }
+
+    /// [`Body::open`] with the sparse layers' cache rooms backed as `kv` says: the pages a
+    /// sequence reaches are backed as it grows ([`Body::fit_through`] backs the rest at once).
+    pub fn open_rooms(
+        gpu: Gpu,
+        file: Split,
+        ctx: usize,
+        kv: KvBackings,
+    ) -> Result<GpuModel<Body>, GpuError> {
         const OPEN: &str = "hy4::Body::open";
         let hp = Hparams::read(&file).map_err(|e| GpuError::plan(OPEN, e))?;
         if ctx == 0 || ctx > hp.n_ctx_train {
@@ -696,7 +734,7 @@ impl Body {
             ));
         }
         let weights = Weights::load_where(gpu.stream(), &file, |name| !host_side(name))?;
-        let body = Body::load(&gpu, Arc::new(file), &weights, &hp, ctx)?;
+        let body = Body::load(&gpu, Arc::new(file), &weights, (&hp, ctx), kv)?;
         let head = Head::of(&gpu, &weights, body.head_eps(), body.head_norm())?;
         Ok(GpuModel::new(Resident {
             gpu,
@@ -714,13 +752,42 @@ impl Body {
     /// routed experts on the host tier ([`crate::placed`]), the embedding and the engram table
     /// read from the file on the host. The body keeps the load's slot map for its life (no
     /// residency machine). Refused by name: a plan of another layer range or of more than one
-    /// stage card ([`stage_run`]), an expert tier card, a routed run with a gap.
+    /// stage card ([`stage_run`]), an expert tier card, a routed run with a gap. The sparse layers'
+    /// cache rooms back their pages as the plan's `kv_host` word says, a spill keeping the stage
+    /// card's margin free ([`KvBackings::of_plan`]).
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         card: usize,
         host: HostCfg,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        Body::open_placed_with(file, (plan, inputs), card, host, None)
+    }
+
+    /// [`Body::open_placed`] with the placed prompt pass at `rows` rows ([`crate::batch`]'s
+    /// `PlacedPass`): its buffers made beside the placed side and the host tier's batch sets and
+    /// union slabs for its rows, so a prompt runs as passes of up to `rows` rows
+    /// ([`crate::batch::prompt_placed`]). The plan's prompt reserve holds the pass's bytes
+    /// ([`crate::batch::pass_bytes`] at the plan's context). Refused by name as
+    /// [`Body::open_placed`] refuses, and the pass's buffers past the plan's reserve for them.
+    pub fn open_placed_pass(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &PlanInputs,
+        card: usize,
+        host: HostCfg,
+        rows: usize,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        Body::open_placed_with(file, (plan, inputs), card, host, Some(rows))
+    }
+
+    fn open_placed_with(
+        file: Split,
+        (plan, inputs): (&Plan<'_>, &PlanInputs),
+        card: usize,
+        host: HostCfg,
+        pass: Option<usize>,
     ) -> Result<GpuModel<Body>, GpuError> {
         const PLAN: &str = "hy4::Body::open_placed";
         let hp = &inputs.hp;
@@ -741,7 +808,8 @@ impl Body {
             spec,
             |_, _, _, _| Ok(()),
             |gpu, file, w, set, glue| {
-                let mut body = Body::load(gpu, Arc::clone(file), w, hp, ctx)?;
+                let kv = KvBackings::of_plan(plan, card, gpu.opened_free());
+                let mut body = Body::load(gpu, Arc::clone(file), w, (hp, ctx), kv)?;
                 let map = SlotMap::of_plan(plan, card, None, run.clone(), hp.experts.n_expert)?;
                 let open = Open {
                     file,
@@ -752,9 +820,29 @@ impl Body {
                     glue,
                 };
                 let mut placed = crate::placed::load((gpu, w), &body.layers, map, open)?;
-                // The step's union slabs for one column: the host tier's resident path runs
-                // only through them.
-                placed.prepare_step_union()?;
+                match pass {
+                    Some(rows) => {
+                        // The batch sets and union slabs for the pass's rows, which also serve
+                        // the step's one column.
+                        placed.prepare_pass_rows(gpu, rows)?;
+                        let made = PlacedPass::new(gpu, w, &body, &placed.side, rows)?;
+                        let reserve = inputs
+                            .prompt_batch_bytes(plan.machine)
+                            .map_err(|e| GpuError::plan(PLAN, e))?;
+                        refuse_reserve_past(
+                            PLAN,
+                            "placed pass buffers",
+                            reserve,
+                            made.bytes() as u64,
+                            "the prompt batch's rows, the host's sums, the layer's map, the \
+                             slots' places and the card slots' route tables",
+                        )?;
+                        body.pass = Some(Box::new(made));
+                    }
+                    // The step's union slabs for one column: the host tier's resident path runs
+                    // only through them.
+                    None => placed.prepare_step_union()?,
+                }
                 placed.start_residency(gpu)?;
                 body.placed = Some(placed);
                 Ok(body)
@@ -774,10 +862,11 @@ impl Body {
         gpu: &Gpu,
         file: Arc<Split>,
         w: &Weights,
-        hp: &Hparams,
-        ctx: usize,
+        (hp, ctx): (&Hparams, usize),
+        kv: KvBackings,
     ) -> Result<Body, GpuError> {
         let stream = gpu.stream();
+        let handle = gpu.stream_handle();
         let sh = Shape::of(hp, ctx)?;
         let layers = (0..hp.n_layer)
             .map(|l| Layer::load(&file, w, hp, l))
@@ -815,9 +904,11 @@ impl Body {
                 Ffn::Dense(_) => Ok(None),
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let decl: Vec<Vec<PosBuf>> = (0..hp.n_layer).map(|l| hp.pos_bufs(l)).collect();
         let stores = layers
             .iter()
-            .map(|layer| Store::new(stream, &sh, layer.dsa))
+            .zip(&decl)
+            .map(|(layer, d)| Store::new(&handle, &sh, (d, kv), layer.dsa))
             .collect::<Result<Vec<_>, _>>()?;
         let rope = [
             RopeTable::new(&RopeSpec::window(hp.rope_base, ROPE))?,
@@ -888,6 +979,8 @@ impl Body {
             routes,
             words,
             stores,
+            decl,
+            kv,
             host: HostIn {
                 file,
                 embd,
@@ -904,6 +997,7 @@ impl Body {
             taps: None,
             held: 0,
             placed: None,
+            pass: None,
         })
     }
 
@@ -1126,8 +1220,9 @@ impl ChainBody for Body {
         Ok(DecodeInput { token, pos })
     }
 
-    /// The host inputs of the step; refused by name off the position the stores stand at, so the
-    /// engram history and the stores never part.
+    /// The host inputs of the step, after the cache rooms are fitted through its position
+    /// ([`Body::fit`]); refused by name off the position the stores stand at, so the engram
+    /// history and the stores never part.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         if input.pos != self.held {
             return Err(GpuError::shape(
@@ -1139,6 +1234,7 @@ impl ChainBody for Body {
                 ),
             ));
         }
+        self.fit(input.pos as usize, 1)?;
         self.host_inputs(stream, input.token, input.pos)?;
         self.held = input.pos + 1;
         Ok(())
@@ -1148,16 +1244,17 @@ impl ChainBody for Body {
         crate::step::enqueue(gpu, w, self, head)
     }
 
-    /// The engram history back to a fresh sequence, the position to 0 and the host tier settled.
-    /// The stores need nothing: a window layer's flash reads only the slots its position reaches,
-    /// a sparse layer's selector only the pools and rows before its count, and each row below the
-    /// count is written by its own step first.
+    /// The engram history back to a fresh sequence, the position to 0, the cache rooms' pages
+    /// given back and the host tier settled. The other stores need nothing: a window layer's flash
+    /// reads only the slots its position reaches, a sparse layer's selector only the pools and
+    /// rows before its count, and each row below the count is written by its own step first.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         if let Some((hash, hist)) = self.host.hash.as_mut() {
             *hist = hash
                 .new_mapped_history()
                 .map_err(|e| GpuError::plan(WHAT, e))?;
         }
+        self.settle_rooms()?;
         if let Some(p) = self.placed.as_mut() {
             p.reset(gpu.stream())?;
         }
@@ -1175,6 +1272,7 @@ impl ChainBody for Body {
             + self.acts.bytes()
             + self.s.leg.bytes()
             + self.placed.as_ref().map_or(0, Placed::device_bytes)
+            + self.pass_device_bytes()
     }
 
     fn layers(&self) -> Range<usize> {
@@ -1233,9 +1331,10 @@ impl Slots for Body {
     type Seq = Seq;
 
     /// A sequence of the live one's store shapes at position 0 with a fresh engram history. Load
-    /// time only; a card without the stores' bytes free is refused by name.
+    /// time only; a card without the stores' bytes that no position's reach decides is refused by
+    /// name (the cache rooms back their pages as the sequence grows).
     fn new_seq(&mut self, gpu: &Gpu) -> Result<Seq, GpuError> {
-        let need = self.store_bytes();
+        let need: usize = self.stores.iter().map(Store::fixed_bytes).sum();
         let free = gpu.alloc_room()?;
         if need > free {
             return Err(GpuError::shape(
@@ -1243,10 +1342,12 @@ impl Slots for Body {
                 format!("a sequence's stores are {need} B and the card has {free} B free"),
             ));
         }
+        let handle = gpu.stream_handle();
         let stores = self
             .layers
             .iter()
-            .map(|layer| Store::new(gpu.stream(), &self.sh, layer.dsa))
+            .zip(&self.decl)
+            .map(|(layer, d)| Store::new(&handle, &self.sh, (d, self.kv), layer.dsa))
             .collect::<Result<Vec<_>, _>>()?;
         let hist = match &self.host.hash {
             Some((hash, _)) => Some(

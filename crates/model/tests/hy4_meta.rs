@@ -20,8 +20,9 @@
 use engram::Hash;
 use gguf::{GgmlType, Split, Value};
 use model::arch::hy4::hparams::{Hparams, unread_keys};
-use model::arch::hy4::place::{CACHE_ROWS, INDEX_KEY_ROWS};
-use model::placement::Role;
+use model::arch::hy4::place::{CACHE_ROWS, PlanInputs};
+use model::placement::workstation::{self, CardSpec};
+use model::placement::{PlanLevers, Role};
 use models::{
     Act, Arch, Collapse, EngramSpec, Extra, Ffn, HcKind, HcSpec, LatentOut, LatentUp, Mixer, Moe,
     NgramRule, OutGate, PoolRule, Residual, Rope, RopeMode, Router, RouterNorm, Score, Selector,
@@ -326,10 +327,18 @@ fn hy4_header() {
             t.layers, t.experts, t.experts_used
         ));
     }
-    // The by-position stores a plan sizes: a sparse-attention layer holds one f16 latent row (512 and
-    // 64 values) a position, of which the indexer's 2,048 are attended, and one pooled index key
-    // (128 f16 values) every 4 positions, scanned whole; a window layer holds a ring of 512 latent
-    // rows and no by-position buffer; the next-token block holds neither.
+    // The by-position stores a plan holds in rooms: a sparse-attention layer holds one f16 latent row
+    // (512 and 64 values) a position, of which the indexer's 2,048 are attended; a window layer
+    // holds a ring of 512 latent rows and no room; the next-token block holds neither. The pooled
+    // index keys (128 f16 values every 4 positions, scanned whole) are a plain buffer the plan counts
+    // at the cap, so they are no room's.
+    //
+    // PIN(2026-11-19): the declaration was the cached rows and the pooled keys; it is the cached rows
+    // alone. Derivation: the plan charges every declared buffer at the floor, and a scanned buffer
+    // can grow past it only through a residency machine's freed expert bytes, which the Hy4 body
+    // does not hold (`SLOT_MAP_FIXED`), so declaring the keys would under-count 12 x 262,144 x 256 B
+    // = 805,306,368 B on the card at the cap. FAIL-first: the keys added back to the declaration
+    // turn `hy4_plan_counts_its_rooms_at_the_floor` red on its cap-minus-floor difference.
     let cache = PosBuf {
         what: CACHE_ROWS,
         row: 1152,
@@ -337,20 +346,9 @@ fn hy4_header() {
         runs: 1,
         access: Access::Select { rows: 2048 },
     };
-    let keys = PosBuf {
-        what: INDEX_KEY_ROWS,
-        row: 256,
-        per: 4,
-        runs: 1,
-        access: Access::Scan,
-    };
     for l in 0..43 {
         let sparse = l < 42 && dsa(l);
-        let want: Vec<PosBuf> = if sparse {
-            vec![cache, keys]
-        } else {
-            Vec::new()
-        };
+        let want: Vec<PosBuf> = if sparse { vec![cache] } else { Vec::new() };
         let ring = if l < 42 && !sparse { 512 * 1152 } else { 0 };
         if hp.pos_bufs(l) != want || hp.ring_bytes(l) != ring {
             bad.push(format!(
@@ -364,6 +362,87 @@ fn hy4_header() {
         bad.is_empty(),
         "hy4 header pins differ:\n{}",
         bad.join("\n")
+    );
+}
+
+/// What the plan of the file at a context makes of its by-position rooms on a 32 GiB-class card: the
+/// kind of the card [assumed: the card's totals are the fixture's, not a reading]. Derived by hand
+/// (12 sparse layers, 1,152 B a cached row, 8,192 positions of floor, 1,048,576 of context): the cached
+/// rows are the only room, so the plan's card K/V falls by exactly 12 x (1,048,576 - 8,192) x 1,152 =
+/// 14,382,268,416 B when the lever sets the floor, whatever else the plan holds; the pooled index keys
+/// (805,306,368 B), the rings and the scores stay at the cap on both sides, so a scanned buffer never
+/// reads at the floor. The floor frees card bytes for routed experts (more of them on the card) and
+/// leaves the host's expert bytes smaller by as many; `spill` keeps the card terms the floor sets, and
+/// the plan names the floor and the word it was made under. A floor with no room declared is refused
+/// by name (`KvUnroomed`).
+///
+/// FAIL-first: the rooms left off the plan's inputs (`with_rooms` removed from `describe`) refuses the
+/// floor by name and the clause is red at the first plan; the pooled keys declared beside the cached
+/// rows make the cap-minus-floor difference 12 x (262,144 - 2,048) x 256 = 799,014,912 B larger and it
+/// is red at the difference.
+#[test]
+fn hy4_plan_counts_its_rooms_at_the_floor() {
+    use bloomery_levers::KvHost;
+    const MIB: u64 = 1 << 20;
+    const CTX: u64 = 1_048_576;
+    const FLOOR: u64 = 8_192;
+    const CARD: CardSpec = CardSpec {
+        name: "RTX_5090",
+        total_bytes: 32_607 * MIB,
+        driver_reserve_bytes: 550 * MIB,
+        device: None,
+        free_bytes: None,
+        held_by: None,
+        integrated: false,
+        margin_bytes: None,
+        granule_bytes: workstation::GRANULE,
+    };
+    let split = header("hy4-plan-floor");
+    let mut inputs = PlanInputs::describe(&split).expect("the real header describes");
+    inputs.kv_host_page = Some(2 * MIB);
+    // The workstation's host, not this machine's reading of its own.
+    inputs.room = (workstation::HOST_USABLE, workstation::HostRead::Given);
+    let machine = workstation::plan_on(CARD, inputs.model.layers);
+    let made = |levers: &PlanLevers| {
+        let plan = inputs
+            .plan(&machine, CTX, levers)
+            .unwrap_or_else(|e| panic!("the card plans {CTX} positions: {e}"));
+        (
+            plan.cards.iter().map(|c| c.kv_bytes).sum::<u64>(),
+            plan.n_l.iter().sum::<u64>(),
+            plan.kv_floor,
+            plan.kv_host,
+            plan.host.expert_bytes,
+            plan.host.kv_host_bytes,
+        )
+    };
+    let unset = made(&PlanLevers::default());
+    let floor = made(&PlanLevers {
+        kv_floor: Some(FLOOR),
+        kv_host: KvHost::Spill,
+        ..PlanLevers::default()
+    });
+    println!(
+        "hy4 plan at {CTX} positions on {}: unset kv {} B, {} card experts, host experts {} B; \
+         floor {FLOOR} spill kv {} B, {} card experts, host experts {} B, host kv pages {} B",
+        CARD.name, unset.0, unset.1, unset.4, floor.0, floor.1, floor.4, floor.5
+    );
+    let freed = 12 * (CTX - FLOOR) * 1152;
+    assert_eq!(unset.0 - floor.0, freed, "the cached rows are the one room");
+    // The host-able pages above the floor's, 2 MiB each: a layer's cached rows are 576 pages at the
+    // context and 5 at the floor (9,437,184 B is 4.5 pages), so a spill sends 12 x 571 pages to the
+    // host; no floor and no spill send none.
+    assert_eq!(floor.5, 12 * 571 * 2 * MIB);
+    assert_eq!(unset.5, 0);
+    assert_eq!((floor.2, floor.3), (Some(FLOOR), KvHost::Spill));
+    assert_eq!((unset.2, unset.3), (None, KvHost::Off));
+    assert!(
+        floor.1 > unset.1 && floor.4 < unset.4,
+        "the freed bytes buy card experts: {} -> {} on the card, host {} -> {} B",
+        unset.1,
+        floor.1,
+        unset.4,
+        floor.4
     );
 }
 

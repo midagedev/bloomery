@@ -226,10 +226,7 @@ impl Placed {
     /// The placed pass's buffers at `shape` held for the load's life, and the host tier's batch
     /// sets and union slabs for its rows. Load-time only.
     pub(super) fn attach_pass(&mut self, gpu: &Gpu, pass: PlacedPass) -> Result<(), GpuError> {
-        let rows = pass.shape().rows;
-        self.host.shell.hybrid.prepare_batch(gpu.context(), rows)?;
-        self.host.shell.hybrid.host_mut().prepare_union(rows)?;
-        gpu.stream().synchronize()?;
+        self.host.prepare_pass_rows(gpu, pass.shape().rows)?;
         self.pass = Some(Box::new(pass));
         Ok(())
     }

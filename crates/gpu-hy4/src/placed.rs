@@ -20,7 +20,8 @@
 //!   identity mix's post.
 //!
 //! The sum's order is `card + host`: up to rounding the whole-card layer's, which sums the sixteen
-//! slots in one launch. The prompt steps one id at a time.
+//! slots in one launch. A load opened with its pass runs the prompt as the pass's walk
+//! ([`crate::batch::prompt_placed`]) and steps it one id at a time otherwise.
 
 use bloomery_gpu::card_leg::{LegShape, LegStacks, LegSum};
 use bloomery_gpu::host::StepLeg;

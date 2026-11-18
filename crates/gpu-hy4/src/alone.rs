@@ -114,6 +114,7 @@ impl Body {
             ));
         }
         let fault = gpu.layer_sink(l)?;
+        self.fit(pos as usize, 1)?;
         self.write_position(stream, pos)?;
         self.s.xn.copy_from_host(stream, row)?;
         step::attention_keys(gpu, w, self, l, fault)?;

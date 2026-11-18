@@ -1,16 +1,21 @@
 //! A Hy4-flash file planned onto a machine: the common hybrid owner's plan ([`place_hybrid`]) over
 //! this family's reading ([`PlanInputs`]), and what that plan sizes beyond the file's tensors: the
-//! by-position buffers each layer holds ([`Hparams::pos_bufs`]) and the window layers' ring
+//! by-position rooms each layer holds ([`Hparams::pos_bufs`]) and the window layers' ring
 //! ([`Hparams::ring_bytes`]). A sparse-attention layer caches one latent row a position (the 512
 //! latent values and the 64 rotated key values, f16), attends the `top_k` rows its indexer picks,
 //! and holds one pooled index key (`d` values, f16) and its score every `kpool` positions, scored
 //! whole every step; a window layer holds the last `window` rows in a ring whatever the context.
-//! The next-token block holds none: it is not loaded.
+//! The cached rows are rooms, backed as far as the sequence reaches and, being selected, host-able;
+//! the pooled keys and scores are plain buffers the plan counts at the context's cap: a buffer the
+//! step scans whole is card-only, and nothing a plan with no residency machine holds could pay for
+//! its growth past a floor. The next-token block holds none: it is not loaded.
 //!
 //! The plan serves the placed load (`crates/gpu-hy4`): the dense trunk, the head and each routed
 //! layer's card share of experts (the id prefix the budget holds) on the stage card, the rest on
-//! the host tier. The step's plan keeps no prompt-pass bytes and hangs no expert tier card; the
-//! engram table and the token embedding stay in the file, a token's rows read on the host.
+//! the host tier. A load that runs its prompt as the placed pass reserves the pass's card bytes
+//! ([`PlanInputs::with_prompt_reserve`]); one that steps its prompt reserves none. The plan hangs no
+//! expert tier card; the engram table and the token embedding stay in the file, a token's rows read
+//! on the host.
 
 use gguf::Split;
 use runtime::stores::{Access, F16_BYTES, PosBuf, PosLayout};
@@ -59,15 +64,13 @@ impl PlanInputs {
             .tensors
             .iter()
             .try_for_each(kernels::check_q8_act_width)?;
-        PlanInputs::new(ENGINE, hp, read.tensors, read.spec)
+        let rooms = hp.pos_layout();
+        Ok(PlanInputs::new(ENGINE, hp, read.tensors, read.spec)?.with_rooms(rooms))
     }
 }
 
 /// The name of a sparse-attention layer's cached rows in a room's refusal and the plan's lines.
 pub const CACHE_ROWS: &str = "a Hy4 sparse layer's cached rows";
-
-/// The name of a sparse-attention layer's pooled index key rows.
-pub const INDEX_KEY_ROWS: &str = "a Hy4 sparse layer's pooled index key rows";
 
 impl Hparams {
     /// The cached row's bytes: the latent and the rotated key values, f16.
@@ -76,32 +79,25 @@ impl Hparams {
         (self.mla.kv_lora + self.mla.pe) as u64 * F16_BYTES
     }
 
-    /// The by-position buffers trunk layer `l` holds, the one declaration the plan's floor and
-    /// padding terms and the card body's room constructors read. A window layer's ring is fixed
-    /// ([`Hparams::ring_bytes`]), so it holds none; the next-token block holds none.
+    /// The by-position buffers trunk layer `l` holds in rooms, the one declaration the plan's
+    /// floor and padding terms and the card body's room constructor read: a sparse layer's cached
+    /// rows, selected `top_k` of them a step. A window layer's ring is fixed
+    /// ([`Hparams::ring_bytes`]) and the pooled keys are a plain buffer (the module doc), so
+    /// neither is declared; the next-token block holds none.
     #[must_use]
     pub fn pos_bufs(&self, l: usize) -> Vec<PosBuf> {
         if self.is_nextn(l) || !self.dsa(l) {
             return Vec::new();
         }
-        vec![
-            PosBuf {
-                what: CACHE_ROWS,
-                row: self.cache_row_bytes(),
-                per: 1,
-                runs: 1,
-                access: Access::Select {
-                    rows: self.indexer.top_k as u64,
-                },
+        vec![PosBuf {
+            what: CACHE_ROWS,
+            row: self.cache_row_bytes(),
+            per: 1,
+            runs: 1,
+            access: Access::Select {
+                rows: self.indexer.top_k as u64,
             },
-            PosBuf {
-                what: INDEX_KEY_ROWS,
-                row: self.indexer.d as u64 * F16_BYTES,
-                per: self.indexer.kpool as u64,
-                runs: 1,
-                access: Access::Scan,
-            },
-        ]
+        }]
     }
 
     /// Every trunk layer's [`Hparams::pos_bufs`], one sequence's.

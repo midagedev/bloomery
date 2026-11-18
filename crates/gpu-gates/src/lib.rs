@@ -37,6 +37,9 @@ pub mod gpu_census;
 pub mod hc_host;
 #[cfg(feature = "gpu")]
 pub mod host_stats;
+#[cfg(feature = "hy4")]
+#[path = "arch/hy4_pass.rs"]
+pub mod hy4_pass;
 pub mod ik_norm;
 pub mod ik_q8_2;
 pub mod image_plan;
@@ -59,6 +62,8 @@ pub mod need;
 #[cfg(feature = "gpu")]
 pub mod nodes;
 pub mod oracle;
+#[path = "arch/pass_pick.rs"]
+pub mod pass_pick;
 #[cfg(feature = "gpu")]
 pub mod prefill_gate;
 pub mod prompts;

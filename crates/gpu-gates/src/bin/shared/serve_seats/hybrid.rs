@@ -394,6 +394,7 @@ fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError
         residency: a.residency,
         group: a.group,
         slots: a.slots,
+        pages: a.room_pages,
         draft: mtp.is_some(),
     };
     let loaded = match a.flags.pass.take() {

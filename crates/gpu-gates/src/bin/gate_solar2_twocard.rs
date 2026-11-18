@@ -316,6 +316,7 @@ mod gate {
             residency: Residency::Off,
             group: 1,
             slots: std::num::NonZeroUsize::MIN,
+            pages: inputs.room_pages(),
             draft: false,
         };
         let pass = bits(&file, &cfg, &inputs)?;

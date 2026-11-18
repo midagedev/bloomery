@@ -465,6 +465,17 @@ pub struct PlanInputs<H> {
     pub room_page: Option<u64>,
 }
 
+/// The pages a binary reads once from the stage card for a plan under the K/V levers: what the run
+/// reads ([`PlanInputs::room_pages`]) and a load that reads the file's headers again takes
+/// ([`PlanInputs::set_room_pages`]), so the load's plan counts the rounding the run's did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoomPages {
+    /// [`PlanInputs::room_page`].
+    pub room: Option<u64>,
+    /// [`PlanInputs::kv_host_page`].
+    pub kv_host: Option<u64>,
+}
+
 /// Why a plan was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceError {
@@ -594,6 +605,23 @@ impl<H> PlanInputs<H> {
             kv_host_page: None,
             room_page: None,
         })
+    }
+
+    /// The pages a binary read from the stage card for a plan under the K/V levers
+    /// ([`PlanInputs::room_page`], [`PlanInputs::kv_host_page`]).
+    #[must_use]
+    pub fn room_pages(&self) -> RoomPages {
+        RoomPages {
+            room: self.room_page,
+            kv_host: self.kv_host_page,
+        }
+    }
+
+    /// `self` taking the pages `pages` holds where `self` has none, so inputs read again from the
+    /// headers plan as the run's inputs did.
+    pub fn set_room_pages(&mut self, pages: RoomPages) {
+        self.room_page = self.room_page.or(pages.room);
+        self.kv_host_page = self.kv_host_page.or(pages.kv_host);
     }
 
     /// `self` with a load that makes `bytes` of card buffers beside the plan's terms

@@ -54,7 +54,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::dspark::DraftCardBytes;
 use model::arch::models::ReasoningFormat;
-use model::arch::place_hybrid::{PlaceError, PlanInputs, reserve_room};
+use model::arch::place_hybrid::{PlaceError, PlanInputs, RoomPages, reserve_room};
 use model::placement::ctx_ask::{Chosen, DEFAULT_SLOTS, probe_of};
 use model::placement::workstation::{self, HostNeed, TierBatchBytes};
 use model::placement::{KvDefault, Machine, PlacementError, Plan, PlanLevers};
@@ -128,6 +128,9 @@ pub struct Open<F> {
     pub pin_main: bool,
     /// The batches a prompt group runs layer by layer (`BLOOMERY_PREFILL_GROUP`).
     pub group: usize,
+    /// The pages the run read from the stage card for the K/V levers ([`room_pages`]): a load that
+    /// reads the file's headers again plans with them, as the run's plan did.
+    pub room_pages: RoomPages,
     /// The residency the plan chose, `Off` where the body keeps the experts the plan placed.
     pub residency: Residency,
     /// The prompt cache's byte budget ([`Tiered::cache_budget`]): the pinned staging a seat's save
@@ -950,6 +953,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     // The pages the K/V levers plan by, on the placement's stage card: every plan below counts
     // them, and the ring's inputs read next take them too.
     room_pages(&mut inputs, &mut plan_levers, place, &levers)?;
+    let pages = inputs.room_pages();
     // The plan's inputs on this placement where the seat streams, read again from the headers and
     // priced for the prompt group as `inputs` are (the ring's bytes join the group's reserve): the
     // stream's ring out of the expert budget. Whether the load keeps them is settled below.
@@ -1267,6 +1271,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         host: levers.host(),
         pin_main: levers.pin_main(),
         group: levers.prefill_group(),
+        room_pages: pages,
         residency,
         cache_ram,
         xstream: levers.xstream(),

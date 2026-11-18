@@ -1,5 +1,6 @@
 //! The K/V rooms' common owner for every body: the class rule that says where a by-position
-//! buffer's pages may live ([`kv_backing`]), the constructor of a room-backed `[rows][width]`
+//! buffer's pages may live ([`kv_backing`]) and the backing a load's plan gives each buffer
+//! ([`KvBackings`]), the constructor of a room-backed `[rows][width]`
 //! tensor ([`RoomTensor`]), the free bytes a card keeps against its budget ([`CardKeep`]) and
 //! the fill first → fit → free expert bytes → fit once more loop a body runs before it stages
 //! rows ([`fit_rooms`]). A family declares its buffers as data
@@ -131,6 +132,72 @@ pub fn kv_backing(word: KvHost, access: Access, keep: CardKeep) -> KvBacking {
         (Class::Card, _) | (Class::Host, KvHost::Off) => KvBacking::Card,
         (Class::Host, KvHost::Spill) => KvBacking::Spill { keep },
         (Class::Host, KvHost::All) => KvBacking::Host,
+    }
+}
+
+/// What a load's rooms back their pages by: the plan's `BLOOMERY_KV_HOST` word and what its stage
+/// card keeps free ([`CardKeep`]: its margin under its budget). Each buffer's backing is the
+/// class rule's ([`kv_backing`]) for its access, so a body declares its buffers
+/// (`runtime::stores::PosBuf`) and takes their rooms through [`KvBackings::room`].
+#[derive(Clone, Copy, Debug)]
+pub struct KvBackings {
+    pub word: KvHost,
+    pub keep: CardKeep,
+}
+
+impl KvBackings {
+    /// A load with no plan: every page on the card.
+    pub const CARD: KvBackings = KvBackings {
+        word: KvHost::Off,
+        keep: CardKeep {
+            margin: 0,
+            budget: None,
+            opened: None,
+        },
+    };
+
+    /// The backings of the load `plan` made on its stage card `card`: the plan's word, a spill
+    /// keeping the card's margin free under its budget. `opened` is the card's free bytes when
+    /// the load opened ([`crate::Gpu::opened_free`]); a plan with no card `card` keeps nothing.
+    #[must_use]
+    pub fn of_plan(plan: &Plan<'_>, card: usize, opened: Option<u64>) -> KvBackings {
+        KvBackings {
+            word: plan.kv_host,
+            keep: plan
+                .machine
+                .cards
+                .get(card)
+                .map_or_else(CardKeep::default, |c| CardKeep::of(plan, c, opened)),
+        }
+    }
+
+    /// The backing a buffer read as `access` takes ([`kv_backing`]).
+    #[must_use]
+    pub fn backing(self, access: Access) -> KvBacking {
+        kv_backing(self.word, access, self.keep)
+    }
+
+    /// The room of the buffer `decl` declares as `what`, over `positions` positions, backed as
+    /// its access says. Refused by name when `decl` declares no such buffer, and as
+    /// [`RoomTensor::new`] refuses.
+    ///
+    /// # Errors
+    ///
+    /// The refusals above.
+    pub fn room<T: DeviceCopy>(
+        self,
+        stream: &Arc<CudaStream>,
+        decl: &[PosBuf],
+        what: &'static str,
+        positions: usize,
+    ) -> Result<RoomTensor<T>, GpuError> {
+        let buf = decl.iter().find(|b| b.what == what).ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!("{what}: not a buffer the plan's declaration holds"),
+            )
+        })?;
+        RoomTensor::new(stream, buf, positions, what, self.backing(buf.access))
     }
 }
 
@@ -301,12 +368,19 @@ pub trait KvRoomBody {
     /// The bytes of new pages a fit through `through` positions still asks, every room's.
     fn asks(&self, through: usize) -> usize;
 
-    /// The residency machine's demand for `want` card bytes of expert stacks.
+    /// The residency machine's demand for `want` card bytes of expert stacks. The default is a
+    /// body with no machine, which refuses by name.
     ///
     /// # Errors
     ///
     /// The machine's refusal, or a body with no machine.
-    fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError>;
+    fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {
+        let _ = want;
+        Err(GpuError::state(
+            Self::WHAT,
+            "a residency machine to free expert bytes for the stores",
+        ))
+    }
 
     /// A give-back that [`fit_rooms`] asked for `asked` bytes and the machine made
     /// (`freed`): the body counts it and keeps it for its caller's record. Nothing by
@@ -465,7 +539,8 @@ impl<V: Views> Views for Option<V> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CardKeep, FillHeld, FreedBytes, GpuError, KvBacking, KvRoomBody, fit_rooms, kv_backing,
+        CardKeep, FillHeld, FreedBytes, GpuError, KvBacking, KvBackings, KvRoomBody, fit_rooms,
+        kv_backing,
     };
     use bloomery_levers::KvHost;
     use runtime::stores::Access;
@@ -497,6 +572,61 @@ mod tests {
             KvBacking::Spill { keep }
         );
         assert_eq!(kv_backing(KvHost::All, SELECT, keep), KvBacking::Host);
+    }
+
+    /// The backings a plan gives a buffer: the class rule over the word, and none but the card for
+    /// a load with no plan.
+    ///
+    /// FAIL-first: `CARD` with a spill word backs the selected buffer on the host and the first
+    /// assertion goes red; a `backing` that ignores the access sends the scanned buffer to the
+    /// host under `all` and the last one does.
+    #[test]
+    fn a_loads_backings_are_the_class_rule_over_its_word() {
+        let keep = CardKeep {
+            margin: 7,
+            budget: Some(9),
+            opened: Some(9),
+        };
+        assert_eq!(KvBackings::CARD.backing(SELECT), KvBacking::Card);
+        let spill = KvBackings {
+            word: KvHost::Spill,
+            keep,
+        };
+        assert_eq!(spill.backing(SELECT), KvBacking::Spill { keep });
+        assert_eq!(spill.backing(Access::Scan), KvBacking::Card);
+        let all = KvBackings {
+            word: KvHost::All,
+            keep,
+        };
+        assert_eq!(all.backing(Access::Scan), KvBacking::Card);
+    }
+
+    /// A body that declares no machine is refused by name when the fit asks it for expert bytes:
+    /// the trait's default, so a load with no residency implements none.
+    ///
+    /// FAIL-first: a default that returns freed bytes makes the fit's retry succeed past the
+    /// card's free bytes and the assertion goes red.
+    #[test]
+    fn a_body_with_no_machine_is_refused_by_name() {
+        struct Bare;
+        impl KvRoomBody for Bare {
+            const WHAT: &'static str = "bare body";
+
+            fn fit_each(&mut self, _pos: usize, _through: usize) -> Result<(), GpuError> {
+                Err(no_room(false))
+            }
+
+            fn asks(&self, _through: usize) -> usize {
+                10
+            }
+        }
+        let e = fit_rooms(&mut Bare, 0, 1).expect_err("no machine to free expert bytes");
+        let text = e.to_string();
+        assert!(text.contains("freed 0 B of the 11 B"), "{text}");
+        assert!(
+            text.contains("a residency machine to free expert bytes"),
+            "{text}"
+        );
     }
 
     /// A body of rooms that runs out until `freed` expert bytes were asked for.

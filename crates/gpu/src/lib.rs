@@ -143,8 +143,8 @@ pub use room::host_grow::{
     HostGrowBook, HostGrowStats, HostYieldMove, HostYielder, take_host_yield,
 };
 pub use room::kv::{
-    CardKeep, FillHeld, FreedBytes, KvBacking, KvRoomBody, RoomTensor, fit_rooms, kv_backing,
-    take_fill_first,
+    CardKeep, FillHeld, FreedBytes, KvBacking, KvBackings, KvRoomBody, RoomTensor, fit_rooms,
+    kv_backing, take_fill_first,
 };
 pub use room::{SharedPages, StackRoom};
 pub use watchdog::Busy as EngineBusy;

@@ -27,8 +27,9 @@
 //!   held position kept), Q on the other slot, then the whole of P's history (P, both answers)
 //!   back on P's slot: it keeps every position the slot holds (the body's cut keeps where the
 //!   sequence stands, so the request continues it) and answers the ids the same request answers
-//!   uncached, from an empty model (the prompt is stepped, so a kept row and a re-fed one are the
-//!   same bits, and both tiers judge it). FAIL-first: a sequence exchange that leaves the stores in
+//!   uncached, from an empty model (the server walks its prompts as steps, `--prefill steps`, so a kept
+//!   row and a re-fed one are the same bits, and both tiers judge it; a pass's batch sums differ
+//!   from a step's in rounding). FAIL-first: a sequence exchange that leaves the stores in
 //!   place (`Slots::swap_seq` moving the position alone) runs P's return over Q's rows and the ids
 //!   differ.
 //! - `tools_request_is_answered`: on that server, a chat request that carries `tools` is a 200
@@ -321,7 +322,10 @@ mod gate {
 
     /// The clauses on the server of two slots; the server is stopped at the end.
     fn two_slot_clauses(c: &serve_gate::Clauses, dir: &Path) -> Result<bool, GateError> {
-        let (mut s, addr, err_log) = match serve_gate::two_slot_server(c, dir, |_, _, _| Ok(())) {
+        let (mut s, addr, err_log) = match serve_gate::two_slot_server(c, dir, |_, _, args| {
+            args.extend(["--prefill".to_owned(), "steps".to_owned()]);
+            Ok(())
+        }) {
             Ok(v) => v,
             Err(e) => {
                 println!("the two-slot server never listened: {e}");

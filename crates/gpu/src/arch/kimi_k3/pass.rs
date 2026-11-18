@@ -46,7 +46,7 @@ use crate::arch::routed_ffn::{Routed, glu_rows};
 use crate::arch::rows_kit::{self, RowKernels, RowsKit, add_row_forms};
 use crate::attn_res::AttnResArgs;
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
-use crate::card_slots::{CardAcc, Places};
+use crate::card_slots::CardAcc;
 use crate::head::{HOST_HEAD_ROWS, Head};
 use crate::host::BatchLeg;
 use crate::host::placed::{PlacedHost, PlacedSide};
@@ -552,7 +552,6 @@ struct PassWalk<'a> {
     rule: (Act, f32),
     n: usize,
     latent: usize,
-    n_expert: usize,
     n_used: usize,
     m: usize,
     pushed: usize,
@@ -760,10 +759,9 @@ impl PassWalk<'_> {
         tier: Option<&super::super::tier::TierParts>,
     ) -> Result<(), GpuError> {
         let l = at.layer;
-        let (m, n, lat, used) = (self.m, self.n, self.latent, self.n_used);
+        let (m, n, lat) = (self.m, self.n, self.latent);
         let gpu = self.cx.gpu;
         let w = self.cx.w;
-        let stream = gpu.stream();
         let r = routed_of(self.layers, l)?;
         let latent = r.latent.as_deref().ok_or_else(|| {
             GpuError::shape(
@@ -808,46 +806,15 @@ impl PassWalk<'_> {
                 &mut y,
             )?;
         }
-        let (placed, side) = (self.placed, self.side);
-        let n_expert = self.n_expert;
-        side.acc_k.enqueue_places(
-            stream,
-            &Places {
-                ids: &*p.ids,
-                n: m * used,
-                map: placed.slots().buf(),
-                row_off: placed.row_off(l),
-                n_expert,
-            },
-            gpu.layer_sink(l)?,
-            &mut *p.sel,
-        )?;
-        let key = port.key(at);
+        let placed = self.placed;
+        placed.places_rows(gpu, l, (&*p.ids, m), &mut *p.sel)?;
+        let rows = (&*p.act, &*p.weights, &*p.ids);
         match tier.filter(|t| t.k(l) > 0) {
             Some(t) => {
-                side.acc_k.enqueue_places(
-                    stream,
-                    &Places {
-                        ids: &*p.ids,
-                        n: m * used,
-                        map: t.places(),
-                        row_off: placed.row_off(l),
-                        n_expert,
-                    },
-                    gpu.layer_sink(l)?,
-                    &mut *p.tsel,
-                )?;
-                port.hybrid().enqueue_download_tiered(
-                    stream,
-                    [&*p.act, &*p.weights],
-                    &*p.ids,
-                    &[&*p.tsel],
-                    key,
-                )
+                placed.places_rows_in(gpu, l, t.places(), (&*p.ids, m), &mut *p.tsel)?;
+                placed.download_rows(port, at, rows, &[&*p.tsel])
             }
-            None => port
-                .hybrid()
-                .enqueue_download(stream, [&*p.act, &*p.weights], &*p.ids, key),
+            None => placed.download_rows(port, at, rows, &[]),
         }
     }
 
@@ -1316,7 +1283,6 @@ impl super::Body {
             rule: (*act, hp.experts.weights_scale),
             n,
             latent: hp.latent,
-            n_expert: hp.experts.n_expert,
             n_used: hp.experts.n_used,
             m,
             pushed: 0,

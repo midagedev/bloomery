@@ -26,7 +26,7 @@
 
 use super::kda::{self, KdaSites};
 use super::moe::{MoeDims, routed_of};
-use super::state::{self, KvBackings, Lane, StepIn};
+use super::state::{self, Lane, StepIn};
 use crate::arch::gated_mla::{self as mla, MlaBufs, MlaSites};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::arch::routed_ffn::{self as ffn, Ffn, FfnKernels, FfnScratch, Glu};
@@ -59,7 +59,7 @@ use crate::site::{KGemvKernels, SiteTy};
 use crate::tensor::{WindowMut, copy_row};
 use crate::weights::{DevWeight, Weights};
 use crate::{
-    CardKeep, FreedBytes, Gpu, GpuError, HostGrowBook, HostGrowStats, HostYieldMove, HostYielder,
+    FreedBytes, Gpu, GpuError, HostGrowBook, HostGrowStats, HostYieldMove, HostYielder, KvBackings,
     KvRoomBody, LAYER_HEAD, RoomTensor, fit_rooms,
 };
 use bloomery_levers::{ChurnHosting, HostCfg};
@@ -1014,23 +1014,9 @@ impl Body {
         let handle = gpu.stream_handle();
         // The plan's `kv_host` word where the rooms' pages back, a spill keeping the stage card's
         // margin free under its budget; a load with no plan backs every page on the card.
-        let kv = placed.as_ref().map_or(
-            KvBackings {
-                word: bloomery_levers::KvHost::Off,
-                keep: CardKeep::default(),
-            },
-            |(open, card)| KvBackings {
-                word: open.plan.kv_host,
-                keep: open
-                    .plan
-                    .machine
-                    .cards
-                    .get(*card)
-                    .map_or_else(CardKeep::default, |c| {
-                        CardKeep::of(open.plan, c, gpu.opened_free())
-                    }),
-            },
-        );
+        let kv = placed.as_ref().map_or(KvBackings::CARD, |(open, card)| {
+            KvBackings::of_plan(open.plan, *card, gpu.opened_free())
+        });
         let kd = kda::dims(&hp)?;
         let md = mla_dims(&hp);
         if md.row() != hp.mla.row() {
@@ -1059,7 +1045,7 @@ impl Body {
                 },
                 Kind::Mla => Mixer::Mla {
                     sites: Box::new(MlaSites::load(file, w, &md, l)?),
-                    cache: latent_cache(&handle, &hp, (l, ctx), kv)?,
+                    cache: kv.room(&handle, &hp.pos_bufs(l), CACHE_ROWS, ctx)?,
                     index: index::Index::load(&handle, w, &hp, (l, ctx), kv)?,
                 },
             };
@@ -1660,22 +1646,6 @@ impl Walk<'_> {
         )?;
         head.enqueue(gpu, w)
     }
-}
-
-/// Layer `l`'s latent cache over `ctx` positions: the buffer the plan declares
-/// ([`Hparams::pos_bufs`]), backed as `kv` says.
-fn latent_cache(
-    stream: &Arc<CudaStream>,
-    hp: &Hparams,
-    (l, ctx): (usize, usize),
-    kv: KvBackings,
-) -> Result<RoomTensor<u16>, GpuError> {
-    let buf = hp
-        .pos_bufs(l)
-        .into_iter()
-        .find(|b| b.what == CACHE_ROWS)
-        .ok_or_else(|| GpuError::state(WHAT, "a cached-row buffer in the plan's declaration"))?;
-    RoomTensor::new(stream, &buf, ctx, CACHE_ROWS, kv.of(buf.access))
 }
 
 impl Body {

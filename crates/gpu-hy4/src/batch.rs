@@ -66,6 +66,10 @@ use crate::body::{
 };
 use crate::step::{ATTN_NORM, ATTN_OUT, ENGRAM_OUT, FFN_NORM, FFN_OUT, HC_ATTN_OUT, L_OUT};
 
+mod pass;
+
+pub use pass::{PASS_ROWS, PassShape, PlacedPass, SHAPES, pass_bytes, prompt_placed};
+
 /// What this file's refusals name.
 const WHAT: &str = "hy4::batch";
 
@@ -1257,7 +1261,7 @@ fn attention(
     let pos_rows = winu(pos, sp.r0, n)?;
     let key_rows = winu(keys, sp.r0, n)?;
     let (at, cache): (&DeviceBuffer<u32>, &mut DeviceTensor<u16>) = match &mut stores[l] {
-        Store::Dsa(d) => (&pos_rows, &mut d.cache),
+        Store::Dsa(d) => (&pos_rows, &mut *d.cache),
         Store::Swa { .. } => (iota, stage),
     };
     k.fused.enqueue_kv_norm_rope_append_rows(
@@ -1491,6 +1495,67 @@ fn attention(
     )
 }
 
+/// The buffers a routed block's experts read and write: the latent rows and the routed ids, and the
+/// gate's, the up's and the down's rows a slot each.
+struct ExpertIo<'a> {
+    lat: &'a DeviceBuffer<f32>,
+    ids: &'a DeviceBuffer<u32>,
+    gate: &'a mut DeviceBuffer<f32>,
+    up: &'a mut DeviceBuffer<f32>,
+    down: &'a mut DeviceBuffer<f32>,
+}
+
+/// Layer `l`'s routed experts over `n` rows of the latent: the rows quantized into the forms the
+/// stacks read, the slot table over the routed ids (through `map`, each expert's place in the
+/// card's stacks or `HOST`, when the card holds a share of the layer: the host's slots get no
+/// tile and their down rows stay as they were; the raw ids otherwise), the gate and up GEMMs, the
+/// gate-first clamp into the down's form and the down GEMM, the slots' rows into `io.down`. The
+/// slot sum and the rest of the block are the caller's.
+fn expert_rows(
+    env: &Env<'_>,
+    (l, n): (usize, usize),
+    (gemm, acts, table): (&GemmKernels, &mut ExpertActs, &mut GemmRoute),
+    (map, stacks, clamp): (Option<&DeviceBuffer<u32>>, &[String; 3], f32),
+    io: ExpertIo<'_>,
+) -> Result<(), GpuError> {
+    let Env { gpu, w, sh, k, .. } = *env;
+    let (stream, fault) = (gpu.stream(), gpu.layer_sink(l)?);
+    let st = LegStacks::of(w, stacks.each_ref().map(String::as_str))?;
+    let blk = st.block(sh.expert_ff, sh.latent)?;
+    if let Some(x) = acts.x128.as_mut() {
+        gpu.enqueue_quantize_gemm(io.lat, n, x, fault)?;
+    }
+    if let Some(x) = acts.x32.as_mut() {
+        k.g32.enqueue_quantize_gemm32(stream, io.lat, n, x, fault)?;
+    }
+    let n_slots = n * N_USED;
+    match map {
+        None => gemm.enqueue_route(stream, io.ids, n_slots, table, fault)?,
+        Some(map) => k
+            .g32
+            .enqueue_route_remap(stream, io.ids, map, n_slots, table, fault)?,
+    }
+    blk.enqueue_rule(
+        gpu,
+        (Some(gemm), &k.g32),
+        (table, N_USED),
+        n_slots,
+        (
+            RouteIo {
+                x128: acts.x128.as_ref(),
+                x32: acts.x32.as_ref(),
+                g: io.gate,
+                u: io.up,
+                h128: acts.h128.as_mut(),
+                h32: acts.h32.as_mut(),
+                y: io.down,
+            },
+            Act::SwigluGateClamp { limit: clamp },
+        ),
+        fault,
+    )
+}
+
 /// Layer `l`'s feed-forward sub-layer over the unit `sp`: the dense SiLU block, or the routed
 /// block through the latent pair plus the shared SiLU expert; then the sandwich norm and the
 /// identity mix around it.
@@ -1611,34 +1676,18 @@ fn ffn(env: &Env<'_>, p: &mut Prompt, l: usize, sp: Span) -> Result<(), GpuError
                 ],
             )?;
             // The experts: one grouped GEMM over the unit's slots.
-            let st = LegStacks::of(w, stacks.each_ref().map(String::as_str))?;
-            let blk = st.block(sh.expert_ff, sh.latent)?;
-            if let Some(x) = acts.x128.as_mut() {
-                gpu.enqueue_quantize_gemm(lat, n, x, fault)?;
-            }
-            if let Some(x) = acts.x32.as_mut() {
-                k.g32.enqueue_quantize_gemm32(stream, lat, n, x, fault)?;
-            }
-            let n_slots = n * N_USED;
-            gemm.enqueue_route(stream, ids, n_slots, experts, fault)?;
-            blk.enqueue_rule(
-                gpu,
-                (Some(gemm), &k.g32),
-                (experts, N_USED),
-                n_slots,
-                (
-                    RouteIo {
-                        x128: acts.x128.as_ref(),
-                        x32: acts.x32.as_ref(),
-                        g: gate_rows,
-                        u: up_rows,
-                        h128: acts.h128.as_mut(),
-                        h32: acts.h32.as_mut(),
-                        y: down_rows,
-                    },
-                    Act::SwigluGateClamp { limit: *clamp },
-                ),
-                fault,
+            expert_rows(
+                env,
+                (l, n),
+                (&*gemm, &mut *acts, &mut *experts),
+                (None, stacks, *clamp),
+                ExpertIo {
+                    lat: &*lat,
+                    ids: &*ids,
+                    gate: gate_rows,
+                    up: up_rows,
+                    down: down_rows,
+                },
             )?;
             slots.enqueue_card_acc(
                 stream,
@@ -1699,6 +1748,8 @@ pub fn prompt(model: &mut GpuModel<Body>, p: &mut Prompt, tokens: &[u32]) -> Res
                 ),
             ));
         }
+        // The cache rooms backed through the call's last position before any walk launches.
+        body.fit(pos as usize, tokens.len())?;
         // Anything past this point that fails leaves the engram history and the stores part-way.
         body.held = u32::MAX;
         let cap = p.cfg.cap;

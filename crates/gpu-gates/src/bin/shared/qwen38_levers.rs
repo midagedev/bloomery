@@ -34,14 +34,9 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV,
 ];
 
-/// What the server takes for the K/V levers it leaves unset: the routed
-/// experts spread at 8,192 positions (a context no more has no floor) and the
-/// planes' pages spill to the host once the card's margin is reached. The
-/// server's one owner of these defaults; `off` stays a value of both levers.
-pub const KV_DEFAULT: model::placement::KvDefault = model::placement::KvDefault {
-    floor: 8192,
-    host: bloomery_levers::KvHost::Spill,
-};
+/// What the server takes for the K/V levers it leaves unset: the common server default
+/// ([`model::placement::KvDefault::SERVER`]).
+pub const KV_DEFAULT: model::placement::KvDefault = model::placement::KvDefault::SERVER;
 
 /// The K/V levers `levers` leaves unset resolved for a plan on the stage card `stage`
 /// ([`KV_DEFAULT`] where the levers say nothing), and the page a host-capable room takes read

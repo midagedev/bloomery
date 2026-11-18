@@ -38,7 +38,7 @@
 //! words ([`pass_words`]). A row reads only the key and cache rows below its own live count, so
 //! the pass's later rows are never read and each row is the step's launches at its position.
 
-use super::state::KvBackings;
+use crate::KvBackings;
 use crate::arch::hybrid::{Acts, GqaCx, Site};
 use crate::arch::rows_kit::{RowsKit, project_rows};
 use crate::index_key::{IndexKeyInputArgs, IndexKeyKernels};
@@ -229,7 +229,7 @@ impl Index {
         Ok(Some(Box::new(Index {
             sites: Sites::load(w, hp, ix, l)?,
             eps: ix.norm_eps,
-            keys: RoomTensor::new(stream, &buf, ctx, INDEX_KEY_ROWS, kv.of(buf.access))?,
+            keys: RoomTensor::new(stream, &buf, ctx, INDEX_KEY_ROWS, kv.backing(buf.access))?,
         })))
     }
 

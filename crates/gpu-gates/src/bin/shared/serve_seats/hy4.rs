@@ -16,7 +16,16 @@
 //! its life, so the family says no residency but `off` ([`Family::SLOT_MAP_FIXED`]), and it
 //! hangs no expert tier card ([`TierRule::UNTIERED`], the default). Each resident sequence owns
 //! its stores and its engram history, so `--parallel N` serves N slots by a select and a step a
-//! slot. The prompt is stepped one id at a time: the body has no rows pass.
+//! slot. The body has a placed prompt pass ([`Family::pass`]): the widest pass shape the plan
+//! holds at the seat's context ([`hy4_pass::pick`]), planned with the shape's bytes as the prompt
+//! reserve and loaded by `Body::open_placed_pass`; each request's prompt then runs through
+//! `Batch::prompt`, which takes the pass. A plan that holds no shape loads the stepped body (one id
+//! a decode step), and `--prefill steps` asks it; the `listening` record names the walk.
+//!
+//! The sparse layers' cache rows are rooms, so the seat takes the common K/V default
+//! ([`KvDefault::SERVER`]): an unset `BLOOMERY_KV_FLOOR` plans the experts' spread at 8,192
+//! positions and an unset `BLOOMERY_KV_HOST` spills the rows' pages to the host once the card's
+//! margin is reached. The pooled keys are no room and stay counted at the context.
 //!
 //! The chat surface is the model's own template: its tool-call markup is the key/value one with
 //! the template's suffix in every tag (`serve::glmxml::KvSpelling::Hy4`, which the server picks
@@ -26,26 +35,32 @@
 //! The seat itself is the common owner's ([`super::hybrid`]); its records are the common hybrid
 //! seat's (`record::BLOOMERY_SERVE_HYBRID`).
 
+use bloomery_gpu::GpuModel;
+use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::hy4_pass::{self, Picked};
 use bloomery_gpu_gates::{GateError, record, side_seat};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::hy4::hparams::Hparams;
 use model::arch::hy4::place::PlanInputs;
-use model::placement::PlacementError;
+use model::placement::{KvDefault, PlacementError};
 use serve::ServeError;
 
-use super::hybrid::Family;
+use super::hybrid::{Family, Passed};
+use super::tiered::{BuildMachine, PassAttempt, PassPlan};
 
 /// The binary's name, its records' owner and the `note` line's.
 const NAME: &str = "bloomery-serve-hy4";
 const USAGE: &str = "usage: bloomery-serve --model hy4 [-m PATH | --hf <repo>[:<quant>]] \
                      [--host H] [--port P] [--ctx C] [--parallel N] [--alias NAME] \
-                     [--chat-template-file PATH] [--place W] [--plan] [--queue-depth Q] \
-                     [--slot-save-path DIR] [--api-key KEY] [--api-key-file FNAME]";
+                     [--chat-template-file PATH] [--place W] [--plan] [--prefill pass|steps] \
+                     [--queue-depth Q] [--slot-save-path DIR] [--api-key KEY] \
+                     [--api-key-file FNAME]";
 
 /// The levers this seat acts on: the plan's card budget and margin, the residency machine's word
 /// (only `off` loads), the host set's load settings, the engine thread's pin, the host legs' lane
-/// rule, the start screen and the schema jump. There is no prompt group: the prompt is stepped.
+/// rule, the start screen, the schema jump and the K/V's floor and host backing. There is no prompt
+/// group: a prompt runs as passes of the plan's shape, or stepped.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::CARD_MARGIN,
@@ -58,6 +73,8 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::HOST_LANES,
     bloomery_levers::SCREEN,
     bloomery_levers::SCHEMAJUMP,
+    bloomery_levers::KV_FLOOR,
+    bloomery_levers::KV_HOST,
 ];
 
 /// Architecture-specific facts; the common owner plans and serves the slots.
@@ -74,6 +91,45 @@ impl Family for Hy4 {
     const FAMILY: &'static str = "hy4";
     const SERVES: &'static str = "hy-v4-flash";
     const SLOT_MAP_FIXED: bool = true;
+    const KV_DEFAULT: Option<KvDefault> = Some(KvDefault::SERVER);
+    const PASS: bool = true;
+
+    /// The widest pass shape the seat's plan holds at `ctx` ([`hy4_pass::pick`]) on the seat's
+    /// machine (no expert tier card hangs, so one machine serves every shape), and its open
+    /// ([`Body::open_placed_pass`] on stage card 0); or why no shape fits.
+    ///
+    /// [`Body::open_placed_pass`]: bloomery_gpu_hy4::Body::open_placed_pass
+    fn pass(
+        inputs: &PlanInputs,
+        _place: Place,
+        ctx: usize,
+        build: &BuildMachine<'_>,
+        attempt: &PassAttempt<'_, Hparams>,
+    ) -> Result<Passed<Self>, GateError> {
+        let machine = build(None)?;
+        let Picked { shape, wider } = match hy4_pass::pick(inputs, ctx, &machine, attempt)? {
+            Ok(picked) => picked,
+            Err(no) => return Ok(Err(no.to_string())),
+        };
+        let plan = PassPlan {
+            inputs: hy4_pass::inputs_for(inputs, ctx, shape)?,
+            machine,
+            rows: (shape.rows, shape.q_rows),
+            wider: wider.map(|(w, short)| ((w.rows, w.q_rows), short)),
+        };
+        Ok(Ok((
+            plan,
+            Box::new(move |file, plan, inputs, host| {
+                bloomery_gpu_hy4::Body::open_placed_pass(file, plan, inputs, 0, host, shape.rows)
+            }),
+        )))
+    }
+
+    /// The rows of the pass the placed load holds ([`bloomery_gpu_hy4::Body::pass_rows`]), which
+    /// `Batch::prompt` runs a prompt by.
+    fn pass_rows(m: &GpuModel<bloomery_gpu_hy4::Body>) -> Result<Option<usize>, GateError> {
+        Ok(m.body(NAME)?.pass_rows())
+    }
 
     fn accepts(arch: Arch) -> bool {
         matches!(arch, Arch::Hy4)

@@ -155,11 +155,21 @@ fn a_floor_above_the_cap_is_refused_by_name() {
     );
 }
 
-/// A load's own default for the unset K/V levers, as a seat hands it.
-const DEFAULT: KvDefault = KvDefault {
-    floor: 8192,
-    host: KvHost::Spill,
-};
+/// A load's own default for the unset K/V levers, as a seat hands it: the server's.
+const DEFAULT: KvDefault = KvDefault::SERVER;
+
+/// The server's default for the K/V levers a seat leaves unset: the experts' spread at 8,192
+/// positions, the selected rows' pages spilling to the host. Every seat of a body in rooms takes
+/// it, so a change of either value is a change of every such seat's plan.
+///
+/// FAIL-first: a floor of another value or a word other than `spill` in the constant is red.
+#[test]
+fn the_server_default_is_a_floor_of_8192_with_a_spill() {
+    assert_eq!(
+        (KvDefault::SERVER.floor, KvDefault::SERVER.host),
+        (8192, KvHost::Spill)
+    );
+}
 
 /// [`plan`] at `cap` under a load's resolution of `floor` and `host`
 /// ([`PlanLevers::resolve_kv`]) against [`DEFAULT`].

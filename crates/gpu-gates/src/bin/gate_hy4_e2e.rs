@@ -45,6 +45,12 @@
 //!   is refused by name.
 //! - `graph_is_eager`: set `e`'s prompt and 8 greedy steps in graph mode (the chain captured once
 //!   and replayed at every position) give the eager chain's ids and last logits row bit for bit.
+//! - `rooms_are_flat`: the sparse layers' cache rows are rooms backed as the sequence reaches
+//!   them. A prompt of [`ROOMS_IDS`] ids (past the first 2 MiB page of cached rows) and 8 greedy
+//!   steps over stores of [`ROOMS_CTX`] positions give the ids and the last logits row of the same
+//!   run over rooms fitted through every position first (the rows a flat store holds) bit for
+//!   bit, on the card and with the pages on the host (`BLOOMERY_KV_HOST=all`'s backing); the
+//!   lazily fitted rooms hold fewer pages than the flat ones and at least the rows reached.
 //!
 //! Before the card loads, a set absent from the box, dumped from another file or build, or
 //! unfinished ends the gate by name. A step that raises the fault word ends the gate by name.
@@ -77,7 +83,7 @@ mod e2e;
 mod gate {
     use crate::e2e::{rel, tap};
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Gpu, GpuError, GpuModel};
+    use bloomery_gpu::{CardKeep, Gpu, GpuError, GpuModel, KvBackings};
     use bloomery_gpu_gates::prompts::{GreedyRow, MARGIN_FLOOR, compare_forced, std_normal_cdf};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
@@ -85,6 +91,7 @@ mod gate {
         ref_tensor_logical_in, topk_ids_logical_within, verdict,
     };
     use bloomery_gpu_hy4::{Body, Picks, TAP_STAGES, tier as hy4_tier};
+    use bloomery_levers::KvHost;
     use model::arch::Arch;
     use model::arch::hy4::names::Sub;
     use model::arch::models::{Act as ModelAct, Ffn};
@@ -164,6 +171,12 @@ mod gate {
 
     /// The greedy steps `graph_is_eager` takes after the prompt.
     const GRAPH_STEPS: usize = 8;
+
+    /// Positions of the rooms clause's stores: three 2 MiB pages of cached rows (4,096 rows of
+    /// 1,152 B), where the positions the clause reaches hold two.
+    const ROOMS_CTX: usize = 4096;
+    /// The ids the rooms clause prompts: past the 1,820 rows of the first 2 MiB page.
+    const ROOMS_IDS: usize = 1900;
 
     /// One set's prompt, its tables and the vendor's nodes.
     struct Set {
@@ -726,6 +739,86 @@ mod gate {
         Ok(pass)
     }
 
+    /// One run of the rooms clause: the ids it stepped, the last logits row and the bytes the cache
+    /// rooms back on the card and on the host ([`Body::room_mapped`]).
+    struct RoomsRun {
+        ids: Vec<u32>,
+        logits: Vec<f32>,
+        mapped: (usize, usize),
+    }
+
+    /// Clause `rooms_are_flat`: the ids and last logits row of [`ROOMS_IDS`] ids of `prompt`
+    /// (repeated to the count) and [`GRAPH_STEPS`] greedy steps over a lazily fitted body
+    /// ([`Body::open_rooms`], the cache rooms backed as the sequence reaches them) equal, bit for
+    /// bit, those of a body whose rooms were all fitted through [`ROOMS_CTX`] first
+    /// ([`Body::fit_through`]: the rows a flat store holds; no reset after, a reset gives the
+    /// pages back), with the pages on the card and on the host. The lazy rooms back at least the
+    /// rows reached and fewer pages than the flat ones (2 against 3 a sparse layer, derived at
+    /// 2 MiB a page), and the host backing holds no page on the card.
+    ///
+    /// Mutant: the fit left out of the step's refresh reaches a page no memory backs and the step
+    /// is refused or the mapped bytes fall short of the rows reached. Not run by the round that
+    /// wrote it (a card is needed).
+    fn rooms_are_flat(prompt: &[u32]) -> Result<bool, GateError> {
+        const ROW_BYTES: usize = 1152;
+        let ids: Vec<u32> = prompt.iter().copied().cycle().take(ROOMS_IDS).collect();
+        let sparse = KINDS.iter().filter(|k| k.0).count();
+        let run = |kv: KvBackings, flat: bool| -> Result<RoomsRun, GateError> {
+            let file = open_split(Arch::Hy4, RECIPE)?;
+            let mut m = Body::open_rooms(Gpu::new()?, file, ROOMS_CTX, kv)?;
+            m.set_mode(StepMode::Eager);
+            if flat {
+                m.body_parts(NAME)?.2.fit_through(ROOMS_CTX)?;
+            }
+            let mut out = vec![m.step(&ids)?];
+            while out.len() <= GRAPH_STEPS {
+                let last = out[out.len() - 1];
+                out.push(m.step(&[last])?);
+            }
+            let mapped = m.body(NAME)?.room_mapped();
+            Ok(RoomsRun {
+                ids: out,
+                logits: m.logits()?,
+                mapped,
+            })
+        };
+        let host = KvBackings {
+            word: KvHost::All,
+            keep: CardKeep::default(),
+        };
+        let flat = run(KvBackings::CARD, true)?;
+        let card = run(KvBackings::CARD, false)?;
+        let hosted = run(host, false)?;
+        let reached = sparse * (ROOMS_IDS + GRAPH_STEPS) * ROW_BYTES;
+        let range = sparse * ROOMS_CTX * ROW_BYTES;
+        let same = flat.ids == card.ids
+            && flat.ids == hosted.ids
+            && bits_equal(&flat.logits, &card.logits)
+            && bits_equal(&flat.logits, &hosted.logits);
+        let held = flat.mapped.0 >= range
+            && flat.mapped.1 == 0
+            && card.mapped.0 >= reached
+            && card.mapped.0 < flat.mapped.0
+            && card.mapped.1 == 0
+            && hosted.mapped.1 >= reached
+            && hosted.mapped.1 < flat.mapped.0
+            && hosted.mapped.0 == 0;
+        let pass = same && held;
+        println!(
+            "rooms_are_flat ids={ROOMS_IDS} steps={GRAPH_STEPS} flat={:?} card={:?} host={:?} \
+             same_ids_and_bits={same} mapped_flat={:?} mapped_card={:?} mapped_host={:?} \
+             reached_bytes={reached} {}",
+            flat.ids,
+            card.ids,
+            hosted.ids,
+            flat.mapped,
+            card.mapped,
+            hosted.mapped,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     /// Clause `tier_act_is_gate_first` over the file's description `spec`: every routed layer's
     /// tier activation is the gate-first clamp at its limit, and a plain SwiGLU block is refused
     /// by name.
@@ -830,6 +923,9 @@ mod gate {
         tier::expect_fixture_oracle(NAME, FX_ORACLE)?;
         m.body_parts(NAME)?.2.disarm_taps();
         ok &= graph_is_eager(&mut m, &sets[4])?;
+        // The rooms clause opens bodies of its own.
+        drop(m);
+        ok &= rooms_are_flat(&sets[4].prompt)?;
         println!("{}", tier::tally_line());
         if !ok {
             return Err(checks_failed());
@@ -839,8 +935,8 @@ mod gate {
              logits within {LOGITS_BAND:.1e}; every mix within {MIX_BAND:.1e}, every engram site \
              within {ENGRAM_BAND:.1e}, every attention within {ATTN_BAND:.1e}, every feed-forward \
              block within {FFN_BAND:.1e} with the vendor's picks; the teacher-forced argmax \
-             disagreements within the pin; the graph is the eager chain; the tier runs the \
-             gate-first clamp"
+             disagreements within the pin; the graph is the eager chain; the rooms are the \
+             flat store's rows; the tier runs the gate-first clamp"
         );
         Ok(())
     }

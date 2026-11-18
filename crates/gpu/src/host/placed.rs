@@ -3,20 +3,27 @@
 //! Hy4-flash). The plan's card share of each routed layer's stacks is resident (the id prefix
 //! `[0, n_card)`); the host tier serves the rest. [`PlacedSide`] is which layers the host serves a
 //! share of, each routed layer's card count and slot-map row, the slot map's card copy, and the
-//! step's handoff and go; [`PlacedHost`] holds it with the tier's shell. A body's own walk (the
-//! three parts of its block around the host's go) stays the body's.
+//! step's handoff and go, and a prompt batch's counterparts of them (the places of its rows and
+//! their download to the host's batch set); [`PlacedHost`] holds it with the tier's shell. A
+//! body's own walk (the three parts of its block around the host's go or around a batch's
+//! download and join) stays the body's.
 
 use std::sync::Arc;
 
 use cuda_core::{CudaStream, DeviceBuffer};
 
+use runtime::sched::At;
+
+use super::BatchLeg;
 use super::handoff::{Handoff, HandoffKernels, HandoffSlots, TierSink};
 use super::run::HostRun;
 use super::served::{ResidencyParts, TierBody};
 use super::shell::TierShell;
 use crate::card_leg::{LegRun, LegStacks};
+use crate::card_slots::Places;
 use crate::hybrid::{Chain, Hybrid, SlotMap};
 use crate::kquant::Act;
+use crate::tensor::{Window, WindowMut};
 use crate::{DeviceTensor, Gpu, GpuError};
 
 /// The routed run a [`PlacedSide`] is made for: experts a routed layer, slots a token, and the
@@ -31,7 +38,9 @@ pub struct SideShape {
 /// The stage card's side of a placed load: which layers the host serves a share of, each routed
 /// layer's card count and slot-map row, the slot map's card copy, the handoff launches, the
 /// places of one layer's slots, and the tier sink of a slot count no per-count handoff entry is
-/// built for ([`PlacedSide::sink_any_count`]).
+/// built for ([`PlacedSide::sink_any_count`]). The step's half is [`PlacedSide::go`]; a prompt
+/// batch's is [`PlacedSide::places_rows`] and [`PlacedSide::download_rows`], over the same map,
+/// row offsets and shape.
 pub struct PlacedSide {
     hosted: Vec<bool>,
     n_card: Vec<usize>,
@@ -230,6 +239,101 @@ impl PlacedSide {
         hy.boundary().enqueue_go_of(stream, l, 0)
     }
 
+    /// Layer `l`'s places of a batch's `m` rows of the router's `ids` (`n_used` words a row,
+    /// row-major) over the slot map's card copy, into `sel`: each slot's place in the card's
+    /// stacks, or `HOST` for an expert the card does not hold. The batch's counterpart of the
+    /// places the step's handoff writes ([`PlacedSide::go`]). One launch.
+    pub fn places_rows(
+        &self,
+        gpu: &Gpu,
+        l: usize,
+        rows: (&DeviceBuffer<u32>, usize),
+        sel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        self.places_rows_in(gpu, l, self.slots.buf(), rows, sel)
+    }
+
+    /// [`PlacedSide::places_rows`] over `map`, another view of the experts' places laid out as the
+    /// slot map's card copy (one row of `n_expert` places a routed layer, at the same row
+    /// offsets): the expert tier's places on a load that hangs one.
+    pub fn places_rows_in(
+        &self,
+        gpu: &Gpu,
+        l: usize,
+        map: &DeviceBuffer<u32>,
+        (ids, m): (&DeviceBuffer<u32>, usize),
+        sel: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        self.handoff.places().enqueue_places(
+            gpu.stream(),
+            &Places {
+                ids,
+                n: m * self.shape.n_used,
+                map,
+                row_off: self.row_off(l),
+                n_expert: self.shape.n_expert,
+            },
+            gpu.layer_sink(l)?,
+            sel,
+        )
+    }
+
+    /// Layer `l`'s row of the slot map's card copy into `map`, in stream order: each expert's
+    /// place in the card's stacks, or `HOST` for one the card does not hold, the map a route table
+    /// over the layer's ids is built through (`Gemm32Kernels::enqueue_route_remap`: the host's
+    /// slots get no tile). One device-to-device copy; a `map` of other than `n_expert` words is
+    /// refused by name.
+    pub fn remap_row(
+        &self,
+        stream: &CudaStream,
+        l: usize,
+        map: &mut DeviceBuffer<u32>,
+    ) -> Result<(), GpuError> {
+        let n = self.shape.n_expert;
+        if map.len() != n {
+            return Err(GpuError::shape(
+                "PlacedSide::remap_row",
+                format!("a map of {} words for the layer's {n} experts", map.len()),
+            ));
+        }
+        let row = Window::<u32>::of(self.slots.buf(), self.row_off(l) * size_of::<u32>(), n)?;
+        let mut to = WindowMut::<u32>::of_mut(map, 0, n)?;
+        to.copy_from_device_async(&row, stream)?;
+        Ok(())
+    }
+
+    /// The download of hosted layer `at.layer`'s batch rows to the host tier's next batch set: the
+    /// latent rows `act` the host reads, the router's `weights` and `ids`, and `tsels`, the places
+    /// of each expert tier that holds experts of the layer ([`PlacedSide::places_rows_in`]), none
+    /// when no tier does. The caller's contract: a body's walk calls it only from the front of a
+    /// layer its host leg covers ([`PlacedSide::hosted`]); any other layer is refused by name, not
+    /// downloaded.
+    pub fn download_rows(
+        &self,
+        port: &mut BatchLeg<'_, HostRun>,
+        at: At,
+        (act, weights, ids): (&DeviceBuffer<f32>, &DeviceBuffer<f32>, &DeviceBuffer<u32>),
+        tsels: &[&DeviceBuffer<u32>],
+    ) -> Result<(), GpuError> {
+        if !self.hosted(at.layer) {
+            return Err(GpuError::shape(
+                "PlacedSide::download_rows",
+                format!(
+                    "layer {}: a download of a layer the host serves no share of",
+                    at.layer
+                ),
+            ));
+        }
+        let stream = port.stream();
+        let key = port.key(at);
+        let hy = port.hybrid();
+        if tsels.is_empty() {
+            hy.enqueue_download(stream, [act, weights], ids, key)
+        } else {
+            hy.enqueue_download_tiered(stream, [act, weights], ids, tsels, key)
+        }
+    }
+
     /// Layer `l`'s card slots over `normed`, one row, under `rule` at the places the last
     /// handoff wrote; `None` on a layer with no experts on the card.
     #[must_use]
@@ -281,6 +385,17 @@ impl PlacedHost {
     /// Load-time only.
     pub fn prepare_step_union(&mut self) -> Result<(), GpuError> {
         self.shell.hybrid.host_mut().prepare_union(1)
+    }
+
+    /// The host tier's batch sets and union slabs for prompt passes of up to `rows` rows
+    /// ([`crate::host::HostTier::prepare_batch`], [`HostRun::prepare_union`]): a load that runs
+    /// its prompt as passes makes them once, and they also serve its one-column step. Load-time
+    /// only.
+    pub fn prepare_pass_rows(&mut self, gpu: &Gpu, rows: usize) -> Result<(), GpuError> {
+        self.shell.hybrid.prepare_batch(gpu.context(), rows)?;
+        self.shell.hybrid.host_mut().prepare_union(rows)?;
+        gpu.stream().synchronize()?;
+        Ok(())
     }
 
     /// Device bytes the placed side holds beside the plan's terms: the side's and the boundary.
