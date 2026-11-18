@@ -1106,7 +1106,10 @@ metal 28 7 12
 # PIN(2026-10-23): model 109 -> 110 blocks, new code, not old code relaxed: the folder host tier's NVFP4 experts
 # (ops.rs): the expert matmul's scaled SharedOut writes (four rewritten in place) and the one more write for the
 # codes-and-scales run, each with its SAFETY line.
-model 110 32 13
+# PIN(2026-11-18): model 110 -> 112 blocks, new code, not old code relaxed: the host-grow yield (placement/host_lock.rs)
+# unlocks a yielded expert's span (munlock) and hands its mapping to FileMapping::new to drop the pages, each with its
+# SAFETY line.
+model 112 32 13
 # model-hf: the four blocks that left model (119 -> 115) with the fixture bin and its test, the page-fault reads (`getrusage`),
 # each with its SAFETY line; no new unsafe.
 # PIN(2026-10-22): model-hf 0 -> 1 block, new code, not old code relaxed: Checkpoint::release calls
