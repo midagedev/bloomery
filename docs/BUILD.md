@@ -203,7 +203,7 @@ The commands above use the default `--place a`, the largest visible card, planne
 
 | Flag | Meaning |
 |---|---|
-| `--tokens a,b,c` | the prompt as token ids; the example is "The capital of France is" without a BOS token (or `--prompt-id P` for a row under `$BLOOMERY_DATA/greedy-ds41/`) |
+| `--tokens a,b,c` | the prompt as token ids; the example is "The capital of France is" without a BOS token (`--prompt-id 0` is that prompt; no other row has fixed ids) |
 | `-n N` | tokens to generate (default 32) |
 | `--place a` | plan (a), the default: all layers and the head on the largest visible card (the A6000 here), each routed layer's expert prefix the budget allows, the rest on the host |
 | `--place gate` | the same shape with a 3090's bytes, on the smallest visible card with the room for them (the 3090 here) |
@@ -332,11 +332,10 @@ The request and the response are the release's SystemOne format (its `README.md`
 
 | Path under `$BLOOMERY_DATA` | What | Made by |
 |---|---|---|
-| `greedy-ds41/prompt<P>.tsv` | the token ids of prompt row P | `just ik-greedy-ds41 <P>` (needs ik_llama.cpp) |
 | `engram/corpus-*.ids` | token-id corpora for the draft gate and the router trace | not in this repository |
-| `ref_deepseek41/` | the oracle tensor dumps the gates read | `tools/ref/dump.sh` (needs ik_llama.cpp) |
+| `fx_ref_deepseek41_*_every_node/` | ik's decode-step dumps of the fixture file, which the gates compare with | `BLOOMERY_TIER=fixture just dump-ref-fixture deepseek41 [VARIANT]` (needs ik_llama.cpp) |
 
-None of these is needed for a plain run with `--tokens`. Without `--tokens` or `--depth`, `generate_ds41` reads `greedy-ds41/prompt0.tsv` and stops with an error that names the file when it is missing. The prose prompts some README rows were measured on are these corpora; they are not in this repository.
+None of these is needed for a plain run: without `--tokens` or `--depth`, `generate_ds41` runs the default prompt, "The capital of France is". The prose prompts some README rows were measured on are these corpora; they are not in this repository.
 
 ## Checks and gates
 

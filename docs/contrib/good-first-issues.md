@@ -84,10 +84,10 @@ For rows 8 and 9 off-box verification is the static tier only: `just mac-static`
 build (`docs/BUILD.md:299`). Whether a Linux contributor can type-check device crates without `cargo oxide` is
 `[unverified]`. The maintainers run the gates and `ptx-scan` for the change.
 
-### 8. The device-name token `.replace(' ', "_")` is copied seven times (XS)
-- **What:** one rule (a card name made file-safe) is spelled at seven sites. Give it one helper in the gates lib.
+### 8. The device-name token `.replace(' ', "_")` is copied six times (XS)
+- **What:** one rule (a card name made file-safe) is spelled at six sites. Give it one helper in the gates lib.
 - **Files:** `crates/gpu-gates/src/generate.rs:590`, `bin/gate_ds41_serve.rs:1823,1824`, `bin/gate_glm5next_twocard.rs:1462`,
-  `bin/shared/ds41_rope_gate.rs:372`, `bin/oxart_jit.rs:84`, `bin/shared/serve_seats/ds41.rs:1044`.
+  `bin/oxart_jit.rs:84`, `bin/shared/serve_seats/ds41.rs:1044`.
 - **Verify:** `just mac-static`; the strings the callers print are unchanged.
 
 ### 9. Dead stub `main` functions behind `required-features` (S-M, mechanical)

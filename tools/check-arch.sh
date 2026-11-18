@@ -271,6 +271,8 @@ dispatch=(
   'crates/model/src/bin/bench_v41_host.rs use'
   # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.
   'crates/gpu-gates/src/oracle/mod.rs fn for_arch'
+  # The V4.1 harness test of the oracle sets: it reads ik's dumps of the fixture file through refset's fixture family.
+  'crates/gpu-gates/src/oracle/deepseek41.rs use'
   # AnyEngine::open 이 파일의 아키텍처를 그 몸체로 잇는다 — 이 파일의 use 묶음이 그 디스패치의
   # 수입면이다: qwen3moe 팔이 그 family 의 불러오기 선택(KvQ8 포함)을 root 별칭과 arch 경로로 받는다.
   'crates/gpu-gates/src/engine.rs use'

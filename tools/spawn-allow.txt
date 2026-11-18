@@ -42,17 +42,13 @@ crates/model/src/bin/bench_v41_host.rs 1 a bench binary
 crates/qdot/src/bin/qdot-rate-mt.rs 2 a rate probe binary
 crates/gpu-gates/src/bin/exact_ref.rs 1 a referee binary, never pinned
 crates/gpu-gates/src/bin/h2d_probe.rs 3 a probe binary, never pinned
-crates/gpu-gates/src/bin/shared/ds41_chain_attn_gate.rs 3 a gate module, never pinned
-crates/gpu-gates/src/bin/gate_deepseek41_chain_ffn.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_qwen4exp_mtp.rs 1 a gate binary, never pinned: the host simulations' scoped workers
 crates/gpu-gates/src/bin/gate_glm5next_gemm.rs 1 a gate binary, never pinned: the host transcription's scoped workers
 crates/gpu-gates/src/bin/gate_qwen38_nodes.rs 3 a gate binary, never pinned: the relay's accept and copy threads
 crates/gpu-gates/src/bin/shared/node_proc.rs 2 a gate binary's child process, read from the gate main, never pinned: its stdout's lines and its stderr
-crates/gpu-gates/src/bin/shared/ds41_chain_glue_gate.rs 1 a gate module, never pinned
-crates/gpu-gates/src/bin/shared/ds41_index_gate.rs 2 a gate module, never pinned
+crates/gpu-gates/src/bin/shared/ds41_index_gate.rs 1 a gate module, never pinned
 crates/gpu-gates/src/bin/gate_deepseek41_moe.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/shared/ds41_residency.rs 1 the residency clauses of a gate binary, never pinned
-crates/gpu-gates/src/bin/shared/ds41_woa_gate.rs 1 a gate module, never pinned
 crates/gpu-gates/src/bin/gate_ds41_callstream.rs 2 a gate binary: the copy stream hold's raiser and the clause watchdog, each asleep but for one store or print
 crates/gpu-gates/src/bin/gate_dspark_experts.rs 1 a gate binary, never pinned
 crates/gpu-gates/src/bin/gate_dspark_hc.rs 1 a gate binary, never pinned

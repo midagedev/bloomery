@@ -148,7 +148,7 @@ mod tests {
 
     /// The fixture families whose real file's sets have no refset family: the card gates open
     /// those by name. Each is checked in its own module.
-    const STANDALONE: [&str; 1] = ["fx-ik-qwen3moe"];
+    const STANDALONE: [&str; 2] = ["fx-ik-qwen3moe", "fx-ik-deepseek41"];
 
     /// The word a fixture cut adds to its sets' family word, the real twin's name without it:
     /// `fx_ref_mistrallarge4e128_a` twins `ref_mistrallarge4_a`. The cut keeps all 128 experts
@@ -303,7 +303,7 @@ mod tests {
         );
     }
 
-    /// The fixture families are the table of eleven, each the mirror of one real
+    /// The fixture families are the table of ten, each the mirror of one real
     /// family: its name is `fx-` and the real family's, and it takes the real
     /// family's architecture, ik build and consumers (for a real family of
     /// [`NEEDS_ENV`], recipes that open with `fixture-only.sh`), the fixture twin of its
@@ -325,7 +325,6 @@ mod tests {
             ("fx-hf-qwen4exp-nvfp4", 4),
             ("fx-mtp-qwen4exp", 1),
             ("fx-ik-qwen35moe", 3),
-            ("fx-ik-deepseek41", 4),
             ("fx-ref-nemotron-moe-logits", 1),
             ("fx-lcpp-mistrallarge4", 2),
             ("fx-lcpp-kimi-k3", 4),
@@ -397,7 +396,7 @@ mod tests {
                 );
             }
         }
-        for arch in ["glm5next", "qwen4exp", "deepseek41", "qwen35moe"] {
+        for arch in ["glm5next", "qwen4exp", "qwen35moe"] {
             let node = node_dumps(arch).map(|f| f.name);
             assert_eq!(node, Some(&*format!("ik-{arch}")), "{arch}: node dumps");
         }

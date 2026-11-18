@@ -55,11 +55,10 @@
 //! `bloomery_gpu_gates::record` declares, but an `--arm` list's `arms in
 //! order` and `state back at arm <i>: ok` lines (below), plain text on
 //! stderr; `--records-schema` prints those
-//! kinds (fields, types, units) and exits. Prompt ids are
-//! the V4.1 file's own: row P of `tools/ref/prompts.tsv` as
-//! `tools/ref/ik-greedy.sh` tokenized it into
-//! `$BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv` — the ids the long gate's
-//! `--free`, the dsloop gate and ik's continuation read.
+//! kinds (fields, types, units) and exits. The default prompt,
+//! and `--prompt-id 0`, are row 0 of `tools/ref/prompts.tsv`, "The capital of France
+//! is": `DS41_PROMPT0` (`shared/ds41_prompt.rs`), the V4.1 file's own five ids
+//! and no BOS. Any other prompt is `--tokens a,b,c`; another row is refused by name.
 //!
 //! `--place` is the placement the engine loads by: `a` is the serving plan
 //! (`workstation::plan_a`, every layer and the head on the A6000, each routed
@@ -334,6 +333,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_prompt.rs"]
+mod prompt;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_finite.rs"]
 mod finite;
 
@@ -376,6 +379,7 @@ mod drive {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
+    use crate::prompt::DS41_PROMPT0;
     #[cfg(feature = "checkpoint")]
     use crate::tp::run as tp_run;
     use app::arch::deepseek41::Ds41Cfg;
@@ -438,9 +442,8 @@ mod drive {
     /// Where the prompt comes from.
     #[derive(Clone)]
     enum Prompt {
-        /// Row 0, or nothing under `--depth`.
+        /// Row 0 (`DS41_PROMPT0`), or nothing under `--depth`.
         Default,
-        Row(u32),
         Ids(Vec<u32>),
     }
 
@@ -618,7 +621,7 @@ mod drive {
             (Some(_), Some(_)) => {
                 return Err("--prompt-id and --tokens both name the prompt. Pass one.".into());
             }
-            (Some(p), None) => Prompt::Row(p),
+            (Some(p), None) => Prompt::Ids(prompt_row(p)?),
             (None, Some(v)) => Prompt::Ids(v),
             (None, None) => Prompt::Default,
         };
@@ -690,26 +693,17 @@ mod drive {
         }
     }
 
-    /// The prompt's ids from `$BLOOMERY_DATA/greedy-ds41/prompt<P>.tsv`
-    /// (`tools/ref/ik-greedy.sh`): the first row's third column.
+    /// Row `p`'s prompt ids: row 0's are `DS41_PROMPT0`. The V4.1 ids of the other rows are
+    /// not fixed anywhere, so another row is refused by name.
     fn prompt_row(p: u32) -> Result<Vec<u32>, GateError> {
-        let path = data_dir()
-            .join("greedy-ds41")
-            .join(format!("prompt{p}.tsv"));
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("{}: {e} — run just ik-greedy-ds41 {p}", path.display()))?;
-        let row = text
-            .lines()
-            .find(|l| !l.starts_with('#') && !l.is_empty())
-            .ok_or_else(|| format!("{}: no prompt row", path.display()))?;
-        let ids = row
-            .split('\t')
-            .nth(2)
-            .ok_or_else(|| format!("{}: the row has no ids", path.display()))?;
-        Ok(ids
-            .split(',')
-            .map(|t| t.trim().parse::<u32>())
-            .collect::<Result<Vec<_>, _>>()?)
+        match p {
+            0 => Ok(DS41_PROMPT0.to_vec()),
+            _ => Err(format!(
+                "--prompt-id {p}: only row 0's V4.1 ids are fixed; pass the prompt as \
+                 --tokens a,b,c"
+            )
+            .into()),
+        }
     }
 
     /// The depth tables' sequence, `lcg_prompt` of `tools/ref/lease.sh`: 100000,
@@ -735,9 +729,8 @@ mod drive {
     fn fed_ids(a: &Args) -> Result<(Vec<u32>, usize), GateError> {
         let mut ids = match &a.prompt {
             Prompt::Ids(v) => v.clone(),
-            Prompt::Row(p) => prompt_row(*p)?,
             Prompt::Default if a.depth.is_some() => Vec::new(),
-            Prompt::Default => prompt_row(0)?,
+            Prompt::Default => DS41_PROMPT0.to_vec(),
         };
         let prompt_len = ids.len();
         if let Some(d) = a.depth {

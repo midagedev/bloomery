@@ -10,13 +10,16 @@
 //! same per-column quantization, the same list-order sum from zero — so any
 //! differing cell is a bug, not rounding.
 //!
-//! The inputs are seeded, with no reference engine's dump behind them (the contract is union
-//! against per-column on the same bytes, so any column and any list is a valid input): `N_TOKENS` columns of `columns::seeded` activations per layer, and per token
+//! The inputs are seeded, with no reference engine's dump behind them: the contract is union
+//! against per-column on the same bytes, so any column and any list is a valid input:
+//! `N_TOKENS` columns of `columns::seeded` activations per layer, and per token
 //! `n_used` distinct experts with positive weights (`v41_lists`). k = 6, 8 and 9 need columns
 //! past the `N_TOKENS`: the i-th past them is token i's row doubled with token i + 1's list
 //! reversed and token i's first expert repeated at a negative weight, so the cases also carry
 //! lists whose order is neither the router's nor the union's, and an expert a list names
 //! twice.
+//!
+//! PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; the V4.1 inputs are seeded
 //!
 //! Every union call is also held to its pool dispatches, by the scratch's
 //! count of passes (`UnionScratch::passes`) and by the pool's: five a call

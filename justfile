@@ -1057,14 +1057,14 @@ gate-gpu-p8 *ARGS:
 gate-gpu-moe:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_moe_fused && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_moe_fused'
 
-# V4.1 라우터와 전문가(B4 J·K): 라우터, 라우팅·공유 전문가의 클램프 SwiGLU, combine을 우리 규칙과 V4.1 ik 덤프
-# (5토큰 세트와 디코드 스텝 세트)에 층마다 대조한다. 클램프는 합성 입력으로 한계 너머까지 따로 본다.
+# V4.1 라우터와 전문가(B4 J·K): 라우터, 라우팅·공유 전문가의 클램프 SwiGLU, combine을 우리 규칙의 호스트 옮겨 적기에 층마다
+# 시드한 입력으로 대조한다(ik 덤프와의 대조는 실제 파일의 ik 세트와 함께 은퇴). 클램프는 합성 입력으로 한계 너머까지 따로 본다.
 gate-gpu-ds41-moe:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-moe && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_moe'
 
-# V4.1 MoE 조각(B5 1단계, chain G1): step4·d1n 세트의 40층 전부에서 라우터·카드 expert·공유 expert·호스트 티어 합류·combine·
-# HC_POST(+접기)를 한 프로세스 안에서 돈다 — op 경로와 비트 동일, 라우터 id는 근접 동률 빼고 정확, combine·스트림·접기는 op 밴드에서
-# 옮겨 온 반올림 한계 안의 예측 차이로 덤프와 대조, 재생 = eager(층마다 호스트가 서비스), 종류별 노드 수.
+# V4.1 MoE 조각(B5 1단계, chain G1): 40층 전부에서 시드한 입력으로 라우터·카드 expert·공유 expert·호스트 티어 합류·combine·
+# HC_POST(+접기)를 한 프로세스 안에서 돈다 — op 경로와 비트 동일, 재생 = eager(층마다 호스트가 서비스), 종류별 노드 수(ik 덤프와의
+# 대조는 실제 파일의 ik 세트와 함께 은퇴).
 gate-gpu-ds41-chain-ffn:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chain-ffn && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_chain_ffn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_chain_ffn'
 
@@ -1869,9 +1869,9 @@ gate-placement:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-placement && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test placement -- --include-ignored --nocapture && bash tools/gate.sh --release -p bloomery-placement --lib -- --include-ignored --nocapture'
 
 # B5 메타 게이트. 먼저 층 표 단위 시험을 돌린다: 일부러 깨뜨린 층 표 일곱 개를 ik 적재기의 검사 넷과 우리 거부 둘이
-# 각각 깨진 그 층에서 거부해야 한다. 이어서 V4.1의 하이퍼파라미터·층 종류·텐서 이름(arch/deepseek41/{hparams,names}.rs)을
-# ik가 같은 파일에서 읽은 값(적재 출력과 헤더), ik가 지은 그래프(오라클 매니페스트 둘의 노드), 파일의 텐서 목록과
-# 대조한다. 헤더와 매니페스트만 읽으므로 몇 초면 끝난다.
+# 각각 깨진 그 층에서 거부해야 한다. 이어서 V4.1의 하이퍼파라미터·텐서 이름(arch/deepseek41/{hparams,names}.rs)을
+# ik가 같은 파일에서 읽은 값(적재 출력과 헤더)과 파일의 텐서 목록에 대조한다(층 종류를 ik가 지은 그래프에 대조하던 절은 실제
+# 파일의 ik 세트와 함께 은퇴). 헤더만 읽으므로 몇 초면 끝난다.
 gate-ds41-meta:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-ds41-meta && bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41 arch::tests --nocapture && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && bash tools/gate.sh --release -p bloomery-model --test ds41_meta -- --ignored --nocapture'
 
@@ -2492,12 +2492,11 @@ ik-ppl-qwen3moe TREE TAG *ARGS:
 gen-qwen3moe *ARGS:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && bash tools/gpu-gate.sh generate_qwen3moe {{ARGS}}'
 
-# V4.1 호스트 expert 티어 게이트(B5). moe::Meta가 파일의 expert 384개를 Hparams와 같게 읽는지 확인한 뒤, 5토큰 세트의
-# 모든 층에서 ik의 라우팅을 주입해 호스트 티어가 낸 routed 부분합을 ik의 ffn_moe_out과 도출한 밴드 안에서 대조한다
-# (플립은 따로 세고, 층마다 세트가 닿은 클램프 히트 수를 찍는다 — 어느 층이 닿는지는 파일의 것이다). 클램프 자체는
-# 층마다 합성 입력으로 한계 너머까지 따로 본다: 토큰 0의 라우팅을 그대로 두고 입력 행을 2의 거듭제곱으로 키워
-# silu(g) > L, u > L, u < −L을 모두 넘긴 뒤 combine이 qdot::swiglu_clamp와 비트 동일하고 f64 서술 안인지 확인한다.
-# 세트가 라우팅한 expert만 읽는다. 끝으로 크레이트 doctest —
+# V4.1 호스트 expert 티어 게이트(B5). moe::Meta가 파일의 expert 384개를 Hparams와 같게 읽는지 확인한 뒤, 모든 routed 층에서
+# 시드한 활성 열과 시드한 라우팅(토큰마다 서로 다른 expert n_used개, 양의 가중치)으로 두 팔을 본다: 클램프를 층마다 합성
+# 입력으로 한계 너머까지 본다(토큰 0의 라우팅을 그대로 두고 입력 행을 2의 거듭제곱으로 키워 silu(g) > L, u > L, u < −L을 모두
+# 넘긴 뒤 combine이 qdot::swiglu_clamp와 비트 동일하고 f64 서술 안인지 확인한다), r8 사이드카의 부분합이 파일의 것과 비트
+# 동일한지 본다. ik 덤프와의 대조는 없다(실제 파일의 ik 세트는 은퇴). 끝으로 크레이트 doctest —
 # ops::ShardTensor의 compile_fail(다른 샤드를 가리키는 핸들은 만들 수 없다).
 gate-ds41-host:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --test ds41_host -- --ignored --nocapture && bash tools/gate.sh --release -p bloomery-model --doc'
@@ -2952,8 +2951,9 @@ gate-gpu-lib:
 gate-gpu-gates-lib:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --features hf --lib && bash tools/gate.sh --release -p bloomery-gpu-gates --bin probe_nvread && bash tools/gate.sh --release -p bloomery-gpu-gates --bin oxart_ptxas -- --include-ignored'
 
-# V4.1 오라클 세트 ref_deepseek41의 모든 행과 디코드 스텝 세트의 헤더를 하니스가 읽는지 본다. 호스트 전용이라 카드도
-# 게이트 락도 쓰지 않는다. 시험 둘의 출력이 섞이지 않게 한 스레드로 돈다.
+# V4.1 오라클 세트(픽스처 파일의 ik 덤프 디코드 스텝 세트 fx_ref_deepseek41_{step4,d1n,d1,d2}_every_node)의 모든 행과 헤더를
+# 하니스가 읽는지 본다. 세트는 어느 티어에서나 같은 데이터 디렉터리의 것이다(실제 파일의 ik 세트는 은퇴). 호스트 전용이라
+# 카드도 게이트 락도 쓰지 않는다. 시험 둘의 출력이 섞이지 않게 한 스레드로 돈다.
 gate-ds41-oracle:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-gpu-gates --lib -- --ignored hw_ds41_oracle --nocapture --test-threads=1'
 
@@ -3036,39 +3036,30 @@ refset-check *ARGS:
 census-stubs ROOT:
     ./tools/box.sh 'python3 tools/type-census.py build "{{ROOT}}" tools/census/stubs.tsv'
 
-# V4.1 호스트 스텝 계획: 디코드 걷기 단위 시험(위치 2,101개)을 돈 뒤, V4.1 오라클 세트(배치 세트와 디코드 스텝 세트)의
-# 그래프 입력 전부를 계획과 비트 단위로 대조한다. 어떤 검사도 맡지 않은 입력은 빨강이다. 호스트 전용(카드·게이트 락 없음).
+# V4.1 호스트 스텝 계획: 디코드 걷기 단위 시험(위치 2,101개)을 돈 뒤, 픽스처 파일의 ik 덤프 디코드 스텝 세트
+# (fx_ref_deepseek41_{step4,d1n,d1,d2}_every_node)의 그래프 입력 전부를 계획과 비트 단위로 대조한다(픽스처 오라클 절: 실제 티어는
+# 이 절을 픽스처 티어에 넘긴다). 어떤 검사도 맡지 않은 입력은 빨강이다. 호스트 전용(카드·게이트 락 없음).
 gate-ds41-plan:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-ds41-plan && bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::plan --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_deepseek41_plan && bash tools/host-gate.sh gate_deepseek41_plan'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::deepseek41::plan --nocapture && cargo build --release -p bloomery-gpu-gates --bin gate_deepseek41_plan && bash tools/host-gate.sh gate_deepseek41_plan'
 
-# V4.1 어텐션 쪽 게이트 아홉을 한 프로세스(`gate_deepseek41_kernels`)에서 차례로 돈다. 게이트는 그 바이너리의 모듈
-# (`shared/ds41_<이름>_gate.rs`)이고, 하나가 빨강이어도 나머지는 돈다. ARGS에 게이트 이름(hc rope comp index engram woa attn
-# chain_glue chain_attn)을 주면 그것만 돈다. 게이트마다 V4.1 파일의 메타데이터를 읽고 ik 덤프 세트를 읽으므로 모델을 고정한다.
-# - hc: V4.1 하이퍼커넥션(B4): 사슬 커널(RMS·분할 K hc_fn gemv·HC_PRE), HC_POST와 접기를 우리 규칙과 V4.1 ik 덤프에 서브층마다
-#   대조한다. engram 층(1·14)의 분리 짝(HC_POST 단독 → 접기 단독)이 융합 런치와 비트 동일한지도 본다.
-# - rope: V4.1 rope 계열(머리 꼬리 rope, ROPE_BACK, 잠재 K/V의 norm·rope·f16 링 기록)을 5토큰 세트와 디코드 스텝 세트 전부에
-#   대조한다. rope 사이트는 ik와 비트 동일, K/V 행은 유도한 밴드 안이어야 한다.
-# - comp: V4.1 압축기와 인덱스 키(상태 gemv, DS4_COMP 풀링, norm, 꼬리 rope, f16 캐시 행, 링 persist, 인덱스 키의
-#   norm·rope·Hadamard)를 5토큰 세트와 디코드 스텝 세트의 모든 소스 층에서 대조한다.
-# - index: V4.1 인덱서(op F: 쿼리·가중치·점수·top-k 목록)를 d1·d2 세트와 그 unfused 쌍의 내는 층 전부에서 ik 덤프와 대조한다.
-#   d1n의 항등 목록과 그 위의 attention을 접두 경로와 비트 대조하고, 16,384·32,768행의 합성 깊이 케이스(심어 둔 동점 포함),
+# V4.1 어텐션 쪽 게이트 여섯을 한 프로세스(`gate_deepseek41_kernels`)에서 차례로 돈다. 게이트는 그 바이너리의 모듈
+# (`shared/ds41_<이름>_gate.rs`)이고, 하나가 빨강이어도 나머지는 돈다. ARGS에 게이트 이름(hc comp index engram attn chain_attn)을
+# 주면 그것만 돈다. 어느 절도 ik 덤프 세트를 읽지 않는다(실제 파일의 ik 세트는 은퇴): 파일의 텐서와 메타데이터에 시드한 입력,
+# 합성 입력을 이 바이너리가 옮겨 쓴 우리 규칙과 대조한다. 게이트마다 V4.1 파일의 메타데이터를 읽으므로 모델을 고정한다.
+# - hc: V4.1 하이퍼커넥션(B4): 사슬 커널(RMS·분할 K hc_fn gemv·HC_PRE), HC_POST와 접기를 서브층마다 시드한 스트림(5토큰·1토큰)에서
+#   우리 규칙의 옮겨 쓴 판과 비트 대조한다. 비유한 값의 fault word(HcQuant·F32Product)도 본다.
+# - comp: 입력에서 키를 투영하는 층의 인덱스 키(`ds41_index_key_input`)를 고정 시드의 합성 행에서 우리 규칙과 비트 대조하고, 거부와
+#   fault를 본다.
+# - index: V4.1 인덱서(op F: 쿼리·가중치·점수·top-k 목록)를 파일의 투영 가중치와 시드한 입력으로 내는 층 전부에서 우리 규칙과 대조한다.
+#   위치 301의 항등 목록과 그 위의 attention을 접두 경로와 비트 대조하고, 16,384·32,768행의 합성 깊이 케이스(심어 둔 동점 포함),
 #   재실행 비트 동일과 캡처된 재생까지 본다. 목록은 행 오름차순, 동점은 낮은 행.
-# - engram: V4.1 engram 게이트: 키 norm, 그리고 쿼리 norm·f64 점곱·부호 붙은 제곱근 시그모이드·스트림 갱신을 5토큰 세트와 디코드
-#   스텝 세트의 engram 층(1·14)마다 우리 규칙과 ik 규칙 시뮬, 덤프에 대조한다. 토큰마다 gemv → 키 norm → 게이트 사슬도 본다.
-#   규칙은 파일의 형식이 고른다: engram_wkv가 Q8_0이면 q8_0_gemv와 ik의 q8_2 규칙, Q3_K(공개 파일)이면 q8_1 → q3k_gemv와
-#   ik의 q8_K × Q3_K 점곱(engram_kv와 비트 동일), 행 테이블과 gain 둘도 Q8_0/bf16 또는 Q3_K. 그 밖의 형식은 텐서 이름을 대며 거부한다.
-# - woa: V4.1 attn_output_a(블록 대각 여덟 그룹)를 q8_0_gemv_heads 한 번의 발사로, attn_output_b는 q8_0_gemv로 돌려 5토큰 세트와
-#   디코드 스텝 세트의 층마다 우리 규칙(비트 동일), ik 규칙 시뮬(덤프와 비트 동일), 덤프(값마다 유도한 밴드)에 대조한다.
-# - attn: V4.1 어텐션(B4): 세트 일곱(5토큰 배치와 디코드 스텝 여섯)의 모든 층을 접두 키와 선택 행 두 경로로 본다. ik 규칙
-#   시뮬 대 덤프, 커널 대 우리 f32 규칙과 덤프, 그래프 재생, 깊이 케이스. sink를 읽으려고 V4.1 모델 파일을 연다.
-# - chain_glue: The V4.1 glue piece (chain G1) on the step4 and d1n sets: the host engram row ids against the dump's int rows,
-#   the embedding broadcast bit for bit, each engram site's step within the band b4engram's pins propagate, and
-#   the head end (hc_out bit for bit, the logits against their predicted gap, the argmax); one captured graph
-#   replayed per set against the eager run, with its node count. The weights load through the engine's role
-#   formats, so a Q3_K engram_wkv (the public file) runs q8_1 + q3k_gemv, pinned within KERNEL_BAND of the exact
-#   dot and against ik's Q3_K dot bit for bit; the node count follows the format.
-# - chain_attn: V4.1 attention 조각(B5 1단계, chain G1): step4·d1n 세트의 40층 전부에 덤프의 입력을 주입하고, 스트림·접기·링·압축기
-#   캐시를 유도한 편차(σ 전파, z ≤ 9) 안에서 ik와 대조한다. 스텝이 안 쓴 슬롯은 비트 동일, 재생 = eager, 층 종류별 노드 수.
+# - engram: V4.1 engram 호스트 쪽: 스텝의 도우미 스레드가 읽는 행과 호출 스레드가 읽는 행이 같은 id의 같은 바이트이고(스텝마다
+#   쌍의 맞는 버퍼), 한 rank의 열이 전체의 그 열인지 합성 토큰 열로 본다. 커널은 발사하지 않는다.
+# - attn: V4.1 어텐션(B4): 텐서코어 세그먼트 패스(압축 접두와 인덱서가 고른 행 두 경로)와 머리별 sink 병합을 모델의 머리 수·창·sink와
+#   고정 시드의 합성 행으로 우리 f64 규칙과 KERNEL_BAND 안에서 대조한다. 압축 출처마다 깊이 케이스, 범위 밖 선택 행의 fault, 그래프 재생.
+#   sink를 읽으려고 V4.1 모델 파일을 연다.
+# - chain_attn: V4.1 attention 조각(B5 1단계, chain G1): 위치 4와 301의 40층 전부에 시드한 입력(스트림·접은 입력·창 링·압축 행·
+#   압축기 링)을 주고, 단계 이미지의 words, 재생 = eager와 층 종류별 노드 수, 후보(G2s) 절을 본다.
 gate-gpu-ds41-kernels *ARGS:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-kernels && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_kernels && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_kernels {{ARGS}}'
 
@@ -3151,19 +3142,21 @@ gate-gpu-ple:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_ple && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ple'
 
 # 조립된 V4.1 스텝(B5 1단계, pos < 512·선택 없음)을 게이트 배치로 엔진 입구를 거쳐 돌린다. --structure: 캡처된 스텝의
-# 커널·메모리 연산 배치 수가 조각들이 예측한 수와 같고, step4 세트의 상태를 주입한 재생이 eager 실행과 비트까지 같다.
-# --sets: step4·d1n 세트에서 층마다 덤프의 상태를 주입해 eager 스텝 하나 — engram 행 id와 라우터 id는 정확히(근접 동률은
-# 면제), 서브층마다 스트림은 전파 밴드 안, result_output의 argmax. 3090, 게이트 락.
-# --select(2단계): d1(top_k 64)·d2 세트, 인덱서 층마다 선택이 실제로 일어나는 자리 — 리스트가 그 층 점수의 정확한 top-k인지,
-# 인덱서의 쿼리·가중치가 포락선 안인지, ik 리스트와의 차이가 동률 밴드 안뿐인지; 리스트를 바꿔 끼웠을 때 어텐션이 받는
-# 영향은 포락선에 합쳐 잰다.
+# 커널·메모리 연산 배치 수가 조각들이 예측한 수와 같고, 코퍼스 id를 step4·d1·d2의 위치까지 걸은 스텝의 재생이 eager 실행과
+# 비트까지 같다(두 티어 모두; 세트의 상태 주입은 없다).
+# --sets (픽스처 오라클 절, 실제 티어는 픽스처 티어에 넘긴다): 픽스처 파일의 ik 덤프 step4·d1n 세트에서 층마다 덤프의 상태를
+# 주입해 eager 스텝 하나 — engram 행 id와 라우터 id는 정확히(근접 동률은 면제), 서브층마다 스트림은 전파 밴드 안,
+# result_output의 argmax는 동률 밴드. 3090, 게이트 락.
+# --select(2단계, 같은 픽스처 오라클 절): d1(top_k 64)·d2 세트, 인덱서 층마다 선택이 실제로 일어나는 자리 — 리스트가 그 층
+# 점수의 정확한 top-k인지, 인덱서의 쿼리·가중치가 포락선 안인지, ik 리스트와의 차이가 동률 밴드 안뿐인지; 리스트를 바꿔 끼웠을 때
+# 어텐션이 받는 영향은 포락선에 합쳐 잰다.
 # --kld-walk (both tiers): the V4.1 loss tool's walk (ppl_ds41, shared/ds41_ppl.rs) over the prose corpus's first 128 ids as two chunks
 # of 64, twice: the same bytes (a reset that leaves state behind makes the second walk another file), and `score_ppl` of the file
 # against the same model reads KLD within the band the records' storage derives, every top id the record's but a close pair's.
 # --skew-structure, --skew-sets, --skew-api (C4 ktok-skew, shared/ds41_skew.rs), on the same load after those, from a
 # reset: tokens t and t+1 as two rows one layer apart on one stream against two one-token steps, bit for bit.
 # --skew-structure: the captured nodes exactly twice the step's by kind and kernel name, the batch order, each row's
-# shadow table. --skew-sets: after step4 and d1 are injected, both rows' logits, streams, folds and lists and every
+# shadow table. --skew-sets (fixture-oracle clause: the real tier leaves it to the fixture tier): after the fixture sets step4 and d1 are injected, both rows' logits, streams, folds and lists and every
 # cache, compressor state and history equal the steps in turn, eager and replayed, and after a rollback (t+1 refused)
 # one step of another token equals the steps. --skew-api: the engine's entry (step_pair, rollback), graph and eager,
 # then the deep cuts. One load.
@@ -3319,13 +3312,14 @@ gate-gpu-ds41-nvtier:
 # another process's reads). --faults first, the process's first steps after the load: 32 greedy graph
 # steps after a reset, each step's faults outside the engram helper read around it; from step 2 on no
 # major fault and at most the pinned minor ones. Then, every position through the finite probe before the
-# engine steps it: --free, prompt row 7 then up to 330 greedy tokens; --trigger, prompt row 0 plus the 311
+# engine steps it: --free, the prompt "Once upon a time" (prompts.tsv row 7, tokenized by the file's own
+# vocabulary) then up to 330 greedy tokens; --trigger, prompt row 0 plus the 311
 # fed ids whose last position selects six layer-34 experts that all score 0, then 16 greedy tokens. Red on
-# a fault over the pin, a non-finite stream at any seam, a run of 8 equal generated tokens, an eager argmax
-# that is not the engine's token, or a first difference with ik's greedy ids where our margin is not below
-# 1.5. Solo: its fault pin is a host-memory count another lane's model load moves. ARGS go after the three
+# a fault over the pin, a non-finite stream at any seam, a run of 8 equal generated tokens, or an eager argmax
+# that is not the engine's token. Solo: its fault pin is a host-memory count another lane's model load moves. ARGS go after the three
 # arms (`-n N`). FAIL-first for the faults arm: BLOOMERY_BOX_ENV="BLOOMERY_HOST_POPULATE=0 BLOOMERY_HOST_LOCK=0".
 # The 3090's plan on either card (shared/gate_card.rs), gate lock.
+# PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; no fixture set carries this clause
 [group('solo')]
 [group('v41-load')]
 gate-gpu-ds41-long *ARGS:
@@ -3346,8 +3340,8 @@ gate-gpu-ds41-long *ARGS:
 weekly-gpu-ds41-cand:
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-cand && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin gate_deepseek41_long --bin gate_deepseek41_prefill && BLOOMERY_HOST_LOCK=${BLOOMERY_HOST_LOCK:-1} BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_long --candidates && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_deepseek41_prefill --cand'
 
-# ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안) — long 게이트
-# --free의 참조, $BLOOMERY_DATA/greedy-ds41/. 행 0은 세 토큰 만에 EOS라 긴 비교는 행 7. 러너 머리말 참조.
+# ik가 V4.1 파일로 prompts.tsv의 행 PROMPT를 greedy로 잇는다(CPU, 디코드마다 토큰 하나, CPU 임대 안). 읽는 게이트는 없다:
+# ik가 읽지 못하는 V4.1 파일은 러너가 이름으로 거부한다(ik_opens_model). 러너 머리말 참조.
 ik-greedy-ds41 PROMPT='0':
     BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'PROMPT={{PROMPT}} bash tools/ref/ik-greedy.sh'
 
@@ -3473,25 +3467,28 @@ gate-gpu-ds41-media *ARGS='':
 # Text in, text out (3090, placement gate). One bloomery-chat load runs four --then runs, ordered
 # seed 7 a (row 0, --seed 7), row 0 --greedy, row 7 --greedy, seed 7 b: the two seed-7 runs bracket the
 # greedy ones, so a state carried from any run into a later one, or a sampler reused instead of one a
-# run, turns "seed 7: ids identical" red. Prompt rows 0 and 7: a --greedy run must tokenize to the
-# row's ids (llama-tokenize's); row 0 must stop at the end-of-generation id (stop=eog); on row 7 its ids
-# must be the start of BLOOMERY_PREFILL=steps generate_ds41 --tokens <those ids> -n 16, and it must run
+# run, turns "seed 7: ids identical" red. Prompt rows 0 and 7 (the texts of tools/ref/prompts.tsv): the
+# row 0 --greedy run must tokenize to the profile's REF_TOKENS and stop at the end-of-generation id
+# (stop=eog); on row 7 its ids
+# must be the start of BLOOMERY_PREFILL=steps generate_ds41 --tokens <the ids that run tokenized> -n 16, and it must run
 # to stop=length, so that leg compares every id; the streamed text must equal the vocabulary's one-shot
 # decode (text_consistent=true). The generate arm feeds the prompt one step per id, the chat's own feed,
 # and its `load` line must say prefill=steps: the batched call is held to its steps within the prefill
 # gate's logits band, not bit for bit, so a batched arm is not the chat's ids. The chat's stderr splits
 # one file a run at each `chat:` record (run k's the lines after run k-1's `chat:` line, through its
 # own), every check on its run's file; exactly four `chat:` records, and exactly three `state back at run
-# <i>: ok` lines (one a checked boundary). Then generate_ds41 on row 7's ids as its own process, the gate
-# comparing the two binaries. Two loads. The chat
+# <i>: ok` lines (one a checked boundary). Then generate_ds41 on the ids the row 7 run tokenized, as its own
+# process, the gate comparing the two binaries. Two loads. The chat
 # names its runs' order first (`runs in order:`); that line, the state-back lines, a failed run's own lines and
 # gpu-gate.sh's `waited N s` for a lock, which a batch runner takes off the item's time, are copied from its
 # stderr into the recipe's output whatever its rc, and the rc kept. Logs in target/chat-gate/.
+# PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; no fixture set carries this clause
 [group('v41-load')]
 gate-gpu-ds41-chat:
-    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chat && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat && D=target/chat-gate && rm -rf $D && mkdir -p $D && R0=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && R7=$BLOOMERY_DATA/greedy-ds41/prompt7.tsv && T0=$(grep -v "^#" $R0 | head -n 1 | cut -f2) && T7=$(grep -v "^#" $R7 | head -n 1 | cut -f2) && echo "[$(grep -v "^#" $R0 | head -n 1 | cut -f3)]" | sed "s/,/, /g" > $D/p0-row.ids && echo "[$(grep -v "^#" $R7 | head -n 1 | cut -f3)]" | sed "s/,/, /g" > $D/p7-row.ids && { bash tools/gpu-gate.sh bloomery-chat --place gate --seed 7 --prompt "$T0" -n 16 --then --greedy --prompt "$T0" -n 16 --then --greedy --prompt "$T7" -n 16 --then --seed 7 --prompt "$T0" -n 16 > $D/chat.out 2> $D/chat.err; rc=$?; sed -n "/^gpu-gate\.sh: waited /p; /^runs in order: /p; /^state back at /p; /^bloomery-chat: /p; /^GPU GATE /p" $D/chat.err; (exit $rc); } && awk -v d=$D "{ print > sprintf(\"%s/run%d.err\", d, n) } /^chat: /{ n++ }" $D/chat.err && I7=$(grep -v "^#" $R7 | head -n 1 | cut -f3) && BLOOMERY_PREFILL=steps bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I7" -n 16 > $D/p7-gen.log && sed -n "s/^prompt_ids //p" $D/run1.err > $D/p0-chat.ids && sed -n "s/^ids //p" $D/run1.err > $D/p0-chat.tok && sed -n "s/^prompt_ids //p" $D/run2.err > $D/p7-chat.ids && sed -n "s/^ids //p" $D/run2.err > $D/p7-chat.tok && sed -n "s/^tokens //p" $D/p7-gen.log > $D/p7-gen.tok && sed -n "s/^ids //p" $D/run0.err > $D/seed7a.tok && sed -n "s/^ids //p" $D/run3.err > $D/seed7b.tok && echo "p0 row ids     $(cat $D/p0-row.ids)" && echo "p0 chat ids    $(cat $D/p0-chat.ids)" && echo "p0 chat greedy $(cat $D/p0-chat.tok)" && echo "p7 row ids     $(cat $D/p7-row.ids)" && echo "p7 chat ids    $(cat $D/p7-chat.ids)" && echo "p7 chat greedy $(cat $D/p7-chat.tok)" && echo "p7 generate    $(cat $D/p7-gen.tok)" && echo "seed 7 a $(cat $D/seed7a.tok)" && echo "seed 7 b $(cat $D/seed7b.tok)" && echo "chat texts: $(cat $D/chat.out)" && cmp $D/p0-row.ids $D/p0-chat.ids && echo "p0 prompt ids: identical to the row" && test -s $D/p0-chat.tok && grep -q "^chat: .* stop=eog$" $D/run1.err && echo "p0: stopped at the end-of-generation id" && grep -qx "text_consistent=true" $D/run1.err && echo "p0 text: consistent with the decode" && cmp $D/p7-row.ids $D/p7-chat.ids && echo "p7 prompt ids: identical to the row" && test -s $D/p7-chat.tok && grep -q "^load .* prefill=steps " $D/p7-gen.log && echo "p7 generate: prefill=steps, the chat feed of one step per id" && case "$(tr -d "[] " < $D/p7-gen.tok)," in "$(tr -d "[] " < $D/p7-chat.tok),"*) echo "p7 greedy ids: a prefix of generate_ds41 (the whole of it unless stop=eog)" ;; *) false ;; esac && grep -qx "text_consistent=true" $D/run2.err && echo "p7 text: consistent with the decode" && grep -q "^chat: .* stop=length$" $D/run2.err && echo "p7: ran to -n, every id compared" && grep -qx "text_consistent=true" $D/run0.err && grep -qx "text_consistent=true" $D/run3.err && test -s $D/seed7a.tok && cmp $D/seed7a.tok $D/seed7b.tok && echo "seed 7: ids identical" && [ "$(grep -c "^chat: " $D/chat.err)" = 4 ] && echo "chat: four runs on one load" && [ "$(grep -c "^state back at run [0-9]*: ok$" $D/chat.err)" = 3 ] && echo "the state back: ok before runs 1, 2 and 3" && echo "gate-gpu-ds41-chat: PASS"'
+    BLOOMERY_MODEL=deepseek41 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-ds41-chat && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 --bin bloomery-chat && D=target/chat-gate && rm -rf $D && mkdir -p $D && T0=$(grep -P "^0\t" tools/ref/prompts.tsv | cut -f2) && T7=$(grep -P "^7\t" tools/ref/prompts.tsv | cut -f2) && test -n "$T0" && test -n "$T7" && R0=$(. tools/ref/ref-paths.sh && echo $REF_TOKENS) && test -n "$R0" && echo "[$R0]" | sed "s/,/, /g" > $D/p0-ref.ids && { bash tools/gpu-gate.sh bloomery-chat --place gate --seed 7 --prompt "$T0" -n 16 --then --greedy --prompt "$T0" -n 16 --then --greedy --prompt "$T7" -n 16 --then --seed 7 --prompt "$T0" -n 16 > $D/chat.out 2> $D/chat.err; rc=$?; sed -n "/^gpu-gate\.sh: waited /p; /^runs in order: /p; /^state back at /p; /^bloomery-chat: /p; /^GPU GATE /p" $D/chat.err; (exit $rc); } && awk -v d=$D "{ print > sprintf(\"%s/run%d.err\", d, n) } /^chat: /{ n++ }" $D/chat.err && sed -n "s/^prompt_ids //p" $D/run1.err > $D/p0-chat.ids && sed -n "s/^ids //p" $D/run1.err > $D/p0-chat.tok && sed -n "s/^prompt_ids //p" $D/run2.err > $D/p7-chat.ids && sed -n "s/^ids //p" $D/run2.err > $D/p7-chat.tok && I7=$(tr -d "[] " < $D/p7-chat.ids) && test -n "$I7" && BLOOMERY_PREFILL=steps bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I7" -n 16 > $D/p7-gen.log && sed -n "s/^tokens //p" $D/p7-gen.log > $D/p7-gen.tok && sed -n "s/^ids //p" $D/run0.err > $D/seed7a.tok && sed -n "s/^ids //p" $D/run3.err > $D/seed7b.tok && echo "p0 ref ids     $(cat $D/p0-ref.ids)" && echo "p0 chat ids    $(cat $D/p0-chat.ids)" && echo "p0 chat greedy $(cat $D/p0-chat.tok)" && echo "p7 chat ids    $(cat $D/p7-chat.ids)" && echo "p7 chat greedy $(cat $D/p7-chat.tok)" && echo "p7 generate    $(cat $D/p7-gen.tok)" && echo "seed 7 a $(cat $D/seed7a.tok)" && echo "seed 7 b $(cat $D/seed7b.tok)" && echo "chat texts: $(cat $D/chat.out)" && cmp $D/p0-ref.ids $D/p0-chat.ids && echo "p0 prompt ids: identical to the profile REF_TOKENS" && test -s $D/p0-chat.tok && grep -q "^chat: .* stop=eog$" $D/run1.err && echo "p0: stopped at the end-of-generation id" && grep -qx "text_consistent=true" $D/run1.err && echo "p0 text: consistent with the decode" && test -s $D/p7-chat.tok && grep -q "^load .* prefill=steps " $D/p7-gen.log && echo "p7 generate: prefill=steps, the chat feed of one step per id" && case "$(tr -d "[] " < $D/p7-gen.tok)," in "$(tr -d "[] " < $D/p7-chat.tok),"*) echo "p7 greedy ids: a prefix of generate_ds41 (the whole of it unless stop=eog)" ;; *) false ;; esac && grep -qx "text_consistent=true" $D/run2.err && echo "p7 text: consistent with the decode" && grep -q "^chat: .* stop=length$" $D/run2.err && echo "p7: ran to -n, every id compared" && grep -qx "text_consistent=true" $D/run0.err && grep -qx "text_consistent=true" $D/run3.err && test -s $D/seed7a.tok && cmp $D/seed7a.tok $D/seed7b.tok && echo "seed 7: ids identical" && [ "$(grep -c "^chat: " $D/chat.err)" = 4 ] && echo "chat: four runs on one load" && [ "$(grep -c "^state back at run [0-9]*: ok$" $D/chat.err)" = 3 ] && echo "the state back: ok before runs 1, 2 and 3" && echo "gate-gpu-ds41-chat: PASS"'
 
-# The HTTP server on the V4.1 engine (3090, placement gate). Prompt row 0: generate_ds41 --tokens <the row's ids> -n 16
+# The HTTP server on the V4.1 engine (3090, placement gate). Prompt row 0 (the text of tools/ref/prompts.tsv, the ids
+# the profile's REF_TOKENS): generate_ds41 --tokens <those ids> -n 16
 # under its own gate-lock hold, then gate_ds41_serve under another: it starts bloomery-serve-ds41 --port 0 --place gate,
 # and checks /completion's ids at temperature 0 against generate_ds41's (all 16, or a prefix ending in the
 # end-of-generation id), a chat turn streamed and not streamed (same content, [DONE] last), /tokenize of the row's text
@@ -3521,7 +3518,7 @@ gate-gpu-ds41-chat:
 [group('solo')]
 [group('v41-load')]
 weekly-gpu-ds41-serve:
-    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision,gemma-embedding2,hf --release --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && R=$BLOOMERY_DATA/greedy-ds41/prompt0.tsv && T=$(grep -v "^#" $R | head -n 1 | cut -f2) && I=$(grep -v "^#" $R | head -n 1 | cut -f3) && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && bash tools/gpu-gate.sh gate_ds41_serve --mmproj --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 --top2 16 > $D/bp/gen.log && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
+    BLOOMERY_MODEL=deepseek41 BLOOMERY_CARD=both ./tools/box.sh 'bash tools/ref/real-only.sh weekly-gpu-ds41-serve && export BLOOMERY_GATE_V41_LOAD=1 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41 --release --bin generate_ds41 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,vision,gemma-embedding2,hf --release --bin bloomery-serve-ds41 --bin gate_ds41_serve && D=target/serve-gate && rm -rf $D && mkdir -p $D && T=$(grep -P "^0\t" tools/ref/prompts.tsv | cut -f2) && I=$(. tools/ref/ref-paths.sh && echo $REF_TOKENS) && test -n "$T" && test -n "$I" && bash tools/gpu-gate.sh generate_ds41 --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && bash tools/gpu-gate.sh gate_ds41_serve --mmproj --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D && __s=$(. tools/ref/ref-paths.sh && dspark_model) && export BLOOMERY_DSPARK_MODEL="$__s" && BLOOMERY_DRAFT=dspark BLOOMERY_DSPARK_CARD=A6000 bash tools/gpu-gate.sh gate_ds41_serve --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/draft --plain $D && mkdir -p $D/bp && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh generate_ds41 --place bp --tokens "$I" -n 16 --top2 16 > $D/bp/gen.log && BLOOMERY_RESIDENCY=off BLOOMERY_DRAFT=dspark bash tools/gpu-gate.sh gate_ds41_serve --place bp --gen $D/bp/gen.log --prompt "$T" --ids "$I" --dir $D/bp'
 
 # nvtier R2의 게이트: 페이지드 계획(방 27 GiB — 분할 다이얼이 아레나를 준다)의 NVMe 전문가 티어 램 아레나를
 # 상주 전 계획과 같은 파일에서 적재해, 설계 §7의 조항들을 본다 — 비트 동일성(512 프롬프트 + 96 탐욕 스텝),

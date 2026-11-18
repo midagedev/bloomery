@@ -7,15 +7,13 @@
 //! the engine's captured graph, whose argmax is the run's token.
 //!
 //! Three arms on one load, each from a reset (`just gate-gpu-ds41-long` runs all three):
-//! - `--free`: prompt row 7 of `$BLOOMERY_DATA/greedy-ds41` (four ids; ik's
-//!   greedy run on it is tens of ids long before its EOS, so the long run is
-//!   compared over all of them — prompt 0's stops at its third token), then
-//!   greedy tokens until the file's EOS, at most `-n` (330). The EOS is where
-//!   generation ends: nothing after it is generated or judged. ik's run is
-//!   refused by name unless it was dumped from the model file the tree runs
-//!   (`refset::greedy::check`).
-//! - `--trigger`: prompt row 0 ("The capital of France is", the oracle's five
-//!   ids) and [`TRIGGER`] fed, then 16 greedy tokens.
+//! - `--free`: the prompt "Once upon a time" ([`FREE_TEXT`], row 7 of
+//!   `tools/ref/prompts.tsv`) tokenized by the file's own vocabulary, then
+//!   greedy tokens until the file's EOS, at most `-n` (330): row 0's greedy
+//!   run stops at its third token, so the long run takes row 7. The EOS is
+//!   where generation ends: nothing after it is generated or judged.
+//! - `--trigger`: prompt row 0 ("The capital of France is", the five ids of
+//!   `DS41_PROMPT0`) and [`TRIGGER`] fed, then 16 greedy tokens.
 //!   [`TRIGGER`] is the 311 ids the free arm generated on a plan of 809 card
 //!   experts before its streams went non-finite: at position 315, its last,
 //!   every expert the router selects at layer 34 scores `sqrt_softplus` 0
@@ -26,8 +24,8 @@
 //!   holds streams finite and eager = graph only.
 //!
 //! - `--faults` (run first, the process's first steps after the load, so no
-//!   earlier arm has touched the host tier's pages): prompt row 0 from a
-//!   reset, then [`FAULT_STEPS`] greedy tokens through the
+//!   earlier arm has touched the host tier's pages): prompt row 0
+//!   (`DS41_PROMPT0`) from a reset, then [`FAULT_STEPS`] greedy tokens through the
 //!   engine's captured graph alone, each step's page faults read around it
 //!   (`getrusage(RUSAGE_SELF)`, less the engram helper thread's own, which
 //!   reads the engram table the load does not populate). Red when a step
@@ -53,18 +51,18 @@
 //! site; the probe names the seam and the buffer); a
 //! run of [`COLLAPSE`] or more generated tokens that repeat with period 1 or
 //! 2 (one token, or two alternating); a position whose eager
-//! argmax is not the engine's token; and, on the free arm, a first difference
-//! with ik's greedy ids (`greedy-ik-cpu-64-p7.tsv`, which would stop at ik's EOS)
-//! where our margin is not below
-//! [`GREEDY_MARGIN`](bloomery_gpu_gates::GREEDY_MARGIN),
-//! or, where ours equals ik's through ik's EOS, a run that did not stop at
-//! that EOS itself. A run that differs from ik's within the margin rule does
-//! not have to reach ik's EOS; the case says whether and where it stopped.
+//! argmax is not the engine's token.
+//!
+//! PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; no fixture set carries this clause
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_long", gate::run())
 }
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_prompt.rs"]
+mod prompt;
 
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_finite.rs"]
@@ -144,21 +142,19 @@ mod gate_card;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
+    use crate::prompt::DS41_PROMPT0;
     use bloomery_gpu::head::Head;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::Seam;
     use bloomery_gpu_deepseek41::body::{self, Deepseek41Model};
-    use bloomery_gpu_gates::prompts::{read_greedy, read_prompts};
-    use bloomery_gpu_gates::{
-        GREEDY_MARGIN, GateError, checks_failed, data_dir, prose_ids, verdict,
-    };
+    use bloomery_gpu_gates::{GateError, checks_failed, prose_ids, verdict};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, HostCfg, R8,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::{CandidateRole, Hparams};
     use model::placement::workstation;
-    use refset::arch::deepseek41::{GREEDY, GREEDY_P7};
+    use tokenizer::Tokenizer;
 
     use crate::{cand, finite};
 
@@ -167,6 +163,10 @@ mod gate {
     /// The most generated tokens of the free arm unless `-n` says otherwise;
     /// the arm ends earlier at the file's EOS.
     const FREE_N: usize = 330;
+    /// The free arm's prompt, row 7 of `tools/ref/prompts.tsv`; its ids are the file's
+    /// own vocabulary's, no BOS (the file sets `tokenizer.ggml.add_bos_token` to false)
+    /// and no special token read out of the text.
+    const FREE_TEXT: &str = "Once upon a time";
     /// Generated tokens after the trigger's fed ids.
     const TRIGGER_N: usize = 16;
     /// A run of this many generated tokens repeating with a short period
@@ -278,10 +278,16 @@ mod gate {
         if !crate::collapse_self_check(&COLLAPSE_PERIODS, COLLAPSE) {
             return Err(checks_failed());
         }
-        if args.free {
-            refset::greedy::check(&GREEDY.path(GREEDY_P7), &GREEDY)?;
-        }
         let path = workstation::model_v41();
+        // Tokenized before the load: a file whose vocabulary cannot be read refuses before the
+        // card holds anything.
+        let free_prompt = if args.free {
+            let tok = Tokenizer::from_gguf(&path)
+                .map_err(|e| format!("the vocabulary of {path}: {e}"))?;
+            Some(tok.encode(FREE_TEXT, false, false))
+        } else {
+            None
+        };
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let hp = Hparams::read(&file)?;
         let eos = bloomery_gpu_gates::eos_token_id(&file)?;
@@ -313,12 +319,7 @@ mod gate {
             Head::new(gpu, w, hp.rms_eps)?
         };
         println!("capture graph_nodes={}", m.capture_step()?);
-        let dir = data_dir().join("greedy-ds41");
-        let prompt = read_prompts(&dir.join("prompt0.tsv"))?
-            .into_iter()
-            .next()
-            .ok_or("prompt0.tsv holds no row")?
-            .tokens;
+        let prompt = DS41_PROMPT0;
         let mut pass = true;
         if args.faults {
             pass &= faults_arm(&mut m, &prompt, cfg.body.host)?;
@@ -326,22 +327,11 @@ mod gate {
         if args.candidates {
             pass &= candidates_arm(&mut m, &mut head, &hp)?;
         }
-        if args.free {
-            // Prompt 7: ik's greedy ids for it run tens of ids before its
-            // EOS, so the free arm's long run is compared and judged; prompt
-            // 0's stop at its third token.
-            let free_prompt = read_prompts(&dir.join("prompt7.tsv"))?
-                .into_iter()
-                .next()
-                .ok_or("prompt7.tsv holds no row")?
-                .tokens;
-            let ik = read_greedy(&GREEDY.path(GREEDY_P7))?
-                .into_iter()
-                .next()
-                .ok_or("greedy-ik-cpu-64-p7.tsv holds no row")?;
-            let arm = run_arm(&mut m, &mut head, &free_prompt, args.n_gen, Some(eos))?;
+        if let Some(free_prompt) = &free_prompt {
+            println!("free: prompt {FREE_TEXT:?} ids {free_prompt:?}");
+            let arm = run_arm(&mut m, &mut head, free_prompt, args.n_gen, Some(eos))?;
             pass &= arm.report("free", free_prompt.len());
-            pass &= vs_ik(&arm, &ik.gen_ids, eos);
+            // PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; no fixture set carries this clause
         }
         if args.trigger {
             let fed: Vec<u32> = prompt.iter().chain(&TRIGGER).copied().collect();
@@ -358,10 +348,8 @@ mod gate {
     /// What one arm's positions read and generated.
     #[derive(Default)]
     struct Arm {
-        /// The generated tokens, token 0 out of the last fed position, and
-        /// each one's margin (top logit minus the runner-up).
+        /// The generated tokens, token 0 out of the last fed position.
         tokens: Vec<u32>,
-        margins: Vec<f32>,
         positions: usize,
         /// Positions whose streams were not finite somewhere, and the first
         /// one's reading.
@@ -371,8 +359,6 @@ mod gate {
         /// first one: its position, the eager argmax and the engine's.
         differs: usize,
         first_differs: Option<(u32, u32, u32)>,
-        /// The generated step whose token ended the run (the stop token).
-        stopped_at: Option<usize>,
     }
 
     impl Arm {
@@ -652,11 +638,9 @@ mod gate {
         }
         let mut next = last;
         while arm.tokens.len() < n_gen {
-            let (tok, margin) = checked(m, head, next, &mut arm)?;
+            let tok = checked(m, head, next, &mut arm)?;
             arm.tokens.push(tok);
-            arm.margins.push(margin);
             if Some(tok) == stop {
-                arm.stopped_at = Some(arm.tokens.len() - 1);
                 break;
             }
             next = tok;
@@ -665,14 +649,14 @@ mod gate {
     }
 
     /// One position: `tok`'s step observed, the position taken back, `tok`
-    /// stepped through the engine; the engine's token and the observed
-    /// logits' margin back, the reading kept in `arm`.
+    /// stepped through the engine; the engine's token back, the reading kept
+    /// in `arm`.
     fn checked(
         m: &mut Deepseek41Model,
         head: &mut Head,
         tok: u32,
         arm: &mut Arm,
-    ) -> Result<(u32, f32), GateError> {
+    ) -> Result<u32, GateError> {
         let pos = m.pos();
         let o = finite::observed_step(m, head, tok, pos, &mut |_, _, _| Ok(()))?;
         m.rollback(pos)?;
@@ -686,81 +670,6 @@ mod gate {
             arm.differs += 1;
             arm.first_differs.get_or_insert((pos, o.token(), next));
         }
-        Ok((next, margin(&o.logits)))
-    }
-
-    /// The top logit minus the runner-up, from the logits' bits.
-    fn margin(logits: &[u32]) -> f32 {
-        let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for &bits in logits {
-            let x = f32::from_bits(bits);
-            if x > a {
-                (a, b) = (x, a);
-            } else if x > b {
-                b = x;
-            }
-        }
-        a - b
-    }
-
-    /// The free arm's tokens against ik's greedy ids, as far as ik's go (its
-    /// greedy stops at the model's EOS, which it records as its last id):
-    /// equal, or at the first difference our margin below [`GREEDY_MARGIN`].
-    /// Where ours equals ik's through ik's EOS, our run must have stopped at
-    /// that same EOS; where it differs within the rule, where ours stopped
-    /// (or that it did not) is printed and not judged — ik's EOS is then not
-    /// ours to reach.
-    fn vs_ik(arm: &Arm, ik: &[u32], eos: u32) -> bool {
-        let n = ik.len().min(arm.tokens.len());
-        let first = (0..n).find(|&i| arm.tokens[i] != ik[i]);
-        let margin_ok = first.is_none_or(|i| arm.margins[i] < GREEDY_MARGIN);
-        let how = match first {
-            None => "equal".to_string(),
-            Some(i) => format!(
-                "first difference at generated step {i}, our margin {:.4} (pass rule < \
-                 {GREEDY_MARGIN})",
-                arm.margins[i]
-            ),
-        };
-        let ik_eos = (ik.last() == Some(&eos)).then(|| ik.len() - 1);
-        let ours = match arm.stopped_at {
-            Some(j) => format!("ours stopped at EOS {eos} at generated step {j}"),
-            None => format!(
-                "ours did not emit EOS {eos} in {} generated tokens",
-                arm.tokens.len()
-            ),
-        };
-        let (eos_ok, eos_how) = match (ik_eos, first) {
-            (None, _) => (
-                true,
-                format!(
-                    "ik's {} ids end without EOS {eos}: no stop to hold; {ours}",
-                    ik.len()
-                ),
-            ),
-            (Some(e), None) => {
-                let ok = arm.stopped_at == Some(e);
-                (
-                    ok,
-                    format!(
-                        "ik stopped at EOS at generated step {e}, ours equal through it: {ours}"
-                    ),
-                )
-            }
-            (Some(e), Some(i)) => (
-                true,
-                format!(
-                    "ik stopped at EOS at generated step {e}; ours differs from step {i}, so that \
-                     stop is not ours to reach: {ours} (printed, not judged)"
-                ),
-            ),
-        };
-        println!(
-            "free: ik's greedy ids {ik:?} (to its EOS), ours {:?}: {how}: {}",
-            &arm.tokens[..n],
-            verdict(margin_ok)
-        );
-        println!("free: EOS {eos_how}: {}", verdict(eos_ok));
-        margin_ok && eos_ok
+        Ok(next)
     }
 }

@@ -57,7 +57,7 @@ crates/gpu-gates/src/bin/gate_lev_serve.rs	clef	4	baseline T 4: case-table rows,
 crates/gpu-gates/src/bin/gate_lev_serve.rs	deepseek	3	baseline T 3: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_lev_serve.rs	qwen	8	baseline T 8: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_linear.rs	glm	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
-crates/gpu-gates/src/bin/gate_mcol.rs	deepseek	9	baseline T 9: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_mcol.rs	deepseek	6	baseline T 9: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_moe_fused.rs	deepseek	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_nvfp4.rs	nemotron	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_nvtier.rs	qwen	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
@@ -104,12 +104,7 @@ crates/gpu-gates/src/engine.rs	qwen	10	baseline R 12: MK1a one registry row per 
 crates/gpu-gates/src/iq_rows.rs	nemotron	1	baseline T 1: case-table row, a fixture label or default path
 crates/gpu-gates/src/llama_place.rs	deepseek	1	PIN(2026-10-23) deepseek: llama-server's -devd names the DSpark draft's card, which only the V4.1 seat opens on a named card; the seat word is the one line until a seat carries a placement-flag description field
 crates/gpu-gates/src/llama_place.rs	qwen	1	PIN(2026-10-23) qwen: llama-server's --cpu-moe maps onto the one lever that keeps every routed expert on the host, which only the Qwen3.8 seat acts on; the seat word and the lever are the one line until a seat carries a placement-flag description field
-crates/gpu-gates/src/oracle/mod.rs	deepseek	4	baseline R 4: MK1a one registry row per crate
-crates/gpu-gates/src/oracle/mod.rs	gemma	2	baseline R 3: MK1a one registry row per crate
-crates/gpu-gates/src/oracle/mod.rs	glm	1	baseline R 2: MK1a one registry row per crate
-crates/gpu-gates/src/oracle/mod.rs	mimo	1	baseline R 2: MK1a one registry row per crate
-crates/gpu-gates/src/oracle/mod.rs	nemotron	2	baseline R 2: MK1a one registry row per crate
-crates/gpu-gates/src/oracle/mod.rs	qwen	3	baseline R 4: MK1a one registry row per crate
+crates/gpu-gates/src/oracle/mod.rs	deepseek	1	baseline R 4: MK1a one registry row per crate
 crates/gpu-gates/src/record.rs	clef	3	baseline O 3: MK12 per-bin Kind statics into record/<bin>.rs
 crates/gpu-gates/src/record.rs	deepseek	8	PIN(2026-11-02) deepseek: MK12 per-bin Kind statics into record/<bin>.rs: the qwen3 seat registers the shared DSpark load and width kinds it prints, and the Mistral Large 4 seat the shared DSpark load kind (ds41_draft::LOAD)
 crates/gpu-gates/src/record.rs	gemma	1	baseline O 1: MK12 per-bin Kind statics into record/<bin>.rs

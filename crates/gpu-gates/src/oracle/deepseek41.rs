@@ -1,44 +1,19 @@
-//! The deepseek41 (DeepSeek-V4.1-Flash) oracle: ik's dump of this model,
-//! made on the CPU backend of our port. No CUDA set is made for this model.
-
-use super::Oracle;
-use model::arch::Arch;
-
-/// Step 4, at an even position, where no csa group completes.
-pub const STEP4: &str = "ref_deepseek41_step4_every_node";
-/// Step 301 with the file's top-k, where neither stream builds an indexer.
-pub const D1N: &str = "ref_deepseek41_d1n_every_node";
-/// Step 301, where a csa group completes; the window mask 512 cells wide.
-pub const D1: &str = "ref_deepseek41_d1_every_node";
-/// [`D1`] with the indexer's scores and top-k as nodes of their own.
-pub const D1_UNFUSED: &str = "ref_deepseek41_d1_unfused_every_node";
-/// Step 1,025, where a csa group completes; the window mask 1,280 cells wide.
-pub const D2: &str = "ref_deepseek41_d2_every_node";
-/// [`D2`] with the indexer's scores and top-k as nodes of their own.
-pub const D2_UNFUSED: &str = "ref_deepseek41_d2_unfused_every_node";
-
-/// The decode-step sets, each one token after a prefill run node by node
-/// under the dumped schedule (the model profile's `ref_step_variant`,
-/// `tools/ref/models/deepseek41.sh`), by position. The order is part of what
-/// a gate prints: where sets tie — d1n, d1 and d1_unfused run their layers
-/// before the first compressed stream alike — a line that names the first of
-/// equal results names the set read first.
-pub const STEP_SETS: &[&str] = &[STEP4, D1N, D1, D1_UNFUSED, D2, D2_UNFUSED];
-
-pub static ORACLE: Oracle = Oracle {
-    arch: Arch::Deepseek41,
-    cuda_set: None,
-    cpu_set: "ref_deepseek41",
-    legacy_cuda_set: None,
-    step_sets: STEP_SETS,
-    taps: &[],
-};
+//! The harness's read of the deepseek41 (DeepSeek-V4.1-Flash) oracle sets: ik's decode-step dumps of
+//! the fixture file, the only ik node dumps the architecture has. No CUDA set is made for this model.
+//!
+//! PIN(2026-11-18): the real-file ik sets retired; ik cannot read bq3km's engram schema; the fixture sets fx_ref_deepseek41_{step4,d1n,d1,d2}_every_node carry the rows, and no fixture set carries the five-token batch set
 
 #[cfg(test)]
 mod tests {
-    use crate::oracle::{Set, for_arch};
+    use crate::tier;
     use crate::{RefManifest, RefRow, ref_ints_of_in, verdict};
-    use model::arch::Arch;
+    use refset::arch::deepseek41::fixture as fx;
+
+    /// The fixture set `name`, opened through the fixture family's check for the test `test`.
+    fn open(test: &str, name: &str) -> RefManifest {
+        let path = tier::fixture_set(test, &fx::IK, name).unwrap_or_else(|e| panic!("{test}: {e}"));
+        RefManifest::open(&path, &fx::IK).unwrap_or_else(|e| panic!("{test}: {e}"))
+    }
 
     /// Rows of one kind read, with a logical twin, and failed; a row fails
     /// once however many of its checks do.
@@ -91,26 +66,31 @@ mod tests {
         }
     }
 
-    /// The harness reads every row of the V4.1 oracle set, opened through
-    /// the table: each `tensor` and `input` row's files (above), each `int`
-    /// row through the integer reader — file, count, bytes, sum and absmax
-    /// against the row — agreeing with the row it twins on type and count;
-    /// `(kind, name, occurrence)` names one row; and the `# complete` trailer
-    /// counts the node rows the manifest holds, so no row went missing.
+    /// The harness reads every row of each fixture decode-step set, opened
+    /// through the fixture family: each `tensor` and `input` row's files
+    /// (above), each `int` row through the integer reader — file, count,
+    /// bytes, sum and absmax against the row — agreeing with the row it twins
+    /// on type and count; `(kind, name, occurrence)` names one row; and the
+    /// `# complete` trailer counts the node rows the manifest holds, so no
+    /// row went missing.
     #[test]
-    #[ignore = "hw: needs the V4.1 oracle set in $BLOOMERY_DATA on the box"]
+    #[ignore = "hw: needs the fixture V4.1 oracle sets in $BLOOMERY_DATA on the box"]
     fn hw_ds41_oracle_reads_every_row() {
-        let man = for_arch(Arch::Deepseek41)
-            .and_then(|o| o.open(Set::Cpu))
-            .unwrap_or_else(|e| panic!("hw_ds41_oracle: {e}"));
+        for name in fx::IK.sets {
+            reads_every_row(&open("hw_ds41_oracle_reads_every_row", name));
+        }
+    }
+
+    /// One set's rows, as [`hw_ds41_oracle_reads_every_row`] reads them.
+    fn reads_every_row(man: &RefManifest) {
         let mut fails = Vec::new();
         let (mut tensor, mut input, mut int) =
             (Tally::default(), Tally::default(), Tally::default());
         for row in &man.tensors {
-            read_f32_row(&man, row, &mut tensor, &mut fails);
+            read_f32_row(man, row, &mut tensor, &mut fails);
         }
         for row in &man.inputs {
-            read_f32_row(&man, row, &mut input, &mut fails);
+            read_f32_row(man, row, &mut input, &mut fails);
         }
 
         let duplicates = man.duplicate_keys();
@@ -171,48 +151,37 @@ mod tests {
         );
     }
 
-    /// Every decode-step set of the table opens by name — its manifest
-    /// parses and names this architecture — was written by the batch set's
+    /// Every fixture decode-step set opens through its family — its manifest
+    /// parses and names this architecture — was written by the first set's
     /// ik build (`# build`), and carries the step's position (`# decode_pos`).
     #[test]
-    #[ignore = "hw: needs the V4.1 oracle sets in $BLOOMERY_DATA on the box"]
-    fn hw_ds41_oracle_step_sets_share_the_batch_build() {
-        let o = for_arch(Arch::Deepseek41).unwrap_or_else(|e| panic!("hw_ds41_oracle: {e}"));
-        let batch = o
-            .open(Set::Cpu)
-            .unwrap_or_else(|e| panic!("hw_ds41_oracle: {e}"));
-        let want = batch
+    #[ignore = "hw: needs the fixture V4.1 oracle sets in $BLOOMERY_DATA on the box"]
+    fn hw_ds41_oracle_step_sets_share_one_build() {
+        let test = "hw_ds41_oracle_step_sets_share_one_build";
+        let sets = fx::IK.sets;
+        let first = open(test, sets[0]);
+        let want = first
             .build
-            .as_deref()
-            .unwrap_or_else(|| panic!("hw_ds41_oracle: {} has no # build", batch.dir.display()));
+            .clone()
+            .unwrap_or_else(|| panic!("hw_ds41_oracle: {} has no # build", first.dir.display()));
         let mut failed = 0usize;
-        for &name in o.step_sets {
-            let (pass, what) = match o.open_named(name) {
-                Err(e) => (false, e.to_string()),
-                Ok(step) => {
-                    let build = step.build.as_deref();
-                    let pos = step.header.decode_pos;
-                    (
-                        build == Some(want) && pos.is_some(),
-                        format!(
-                            "build {} (the batch set's {want}), decode_pos {}",
-                            build.unwrap_or("-"),
-                            pos.map_or_else(|| "-".to_string(), |p| p.to_string())
-                        ),
-                    )
-                }
-            };
+        for &name in sets {
+            let step = open(test, name);
+            let build = step.build.as_deref();
+            let pos = step.header.decode_pos;
+            let pass = build == Some(want.as_str()) && pos.is_some();
             failed += usize::from(!pass);
             println!(
-                "hw_ds41_oracle: step set {}: {what} — {}",
-                gguf::v41::set(name),
+                "hw_ds41_oracle: step set {name}: build {} (the first set's {want}), decode_pos {} — {}",
+                build.unwrap_or("-"),
+                pos.map_or_else(|| "-".to_string(), |p| p.to_string()),
                 verdict(pass)
             );
         }
-        let pass = failed == 0 && !o.step_sets.is_empty();
+        let pass = failed == 0 && !sets.is_empty();
         println!(
             "hw_ds41_oracle: {} step sets, {failed} failed — {}",
-            o.step_sets.len(),
+            sets.len(),
             verdict(pass)
         );
         assert!(pass, "hw_ds41_oracle: {failed} step set(s) failed");

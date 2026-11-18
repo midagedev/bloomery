@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # ik-greedy.sh — ik_llama.cpp's greedy continuation of one prompt on the V4.1 file (or the qwen3moe one),
 # CPU only, one token per llama_decode (-b 1's path), under the machine-wide CPU lease: the reference of the
-# V4.1 step gate's --greedy (G3, crates/gpu-gates/src/bin/gate_deepseek41_step.rs) and of the qwen3moe e2e
-# gate's greedy arm (crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs).
+# qwen3moe e2e gate's greedy arm (crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs). No gate reads the V4.1 run
+# any more (2026-11-18: ik cannot read the V4.1 file's engram schema, so the profile refuses it, see
+# ik_opens_model below).
 #
 #   BLOOMERY_MODEL=deepseek41 tools/box.sh 'bash tools/ref/ik-greedy.sh'
 #   just ik-greedy-ds41 [PROMPT]

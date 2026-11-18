@@ -645,25 +645,15 @@ pub fn ref_dir() -> PathBuf {
 
 /// A named dump set's directory: an absolute `set` is the directory
 /// itself, anything else is `<$BLOOMERY_DATA>/<set>` (`ref_cuda_v2`, the
-/// CPU `ref`, ...). A name of the V4.1 family (`ref_deepseek41…`) is the
-/// set of that name for the V4.1 file the tree runs ([`gguf::v41::set`]),
-/// so every reader of a V4.1 set by name follows the file choice. Unlike
-/// `ref_dir` this consults no `BLOOMERY_REF_*` variable — only the data
-/// directory and the V4.1 file.
+/// CPU `ref`, ...). Unlike `ref_dir` this consults no `BLOOMERY_REF_*`
+/// variable — only the data directory.
 pub fn ref_dir_named(set: &str) -> PathBuf {
     let p = PathBuf::from(set);
     if p.is_absolute() {
         return p;
     }
-    if set.starts_with(V41_SET_FAMILY) {
-        return data_dir().join(gguf::v41::set(set));
-    }
     data_dir().join(set)
 }
-
-/// The prefix every V4.1 oracle set name starts with (the profile's
-/// `REF_SET_CPU` and its decode-step sets).
-pub const V41_SET_FAMILY: &str = "ref_deepseek41";
 
 /// `ref_manifest_in` of `ref_dir()`.
 pub fn ref_manifest() -> Result<Vec<RefRow>, GateError> {

@@ -279,8 +279,6 @@ mod gate {
         F32_SLACK, FLOOR_NATS, KldBase, PplModel, score_ppl, write_base,
     };
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order, count_kinds, kind_name};
-    use bloomery_gpu_gates::oracle::deepseek41::{D1, D1N, D2, STEP4};
-    use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::slots_gate::{
         self, Derived, Interleaved, Launches, PassAdapter, SlotsAdapter,
     };
@@ -307,20 +305,16 @@ mod gate {
 
     // ------------------------------------------------------------ constants
 
-    /// The decode-step sets of phase 1.
-    const SETS: [&str; 2] = [STEP4, D1N];
-    /// The fixture file's twins of [`SETS`]: ik's dumps of the same steps on the fixture, each the
-    /// subject of one fixture-oracle clause.
+    /// The decode-step sets of phase 1: ik's dumps of the fixture file, each the subject of one
+    /// fixture-oracle clause.
     const FX_SETS: [&str; 2] = [fx::STEP4, fx::D1N];
     /// The fixture-oracle clauses `--sets` decides (the count of [`FX_SETS`], declared beside it for
     /// `tier::expect_fixture_oracle`).
     const FIXTURE_ORACLE_SETS: usize = 2;
-    /// The ids the fixture tier steps to each of `ds41_tier::DECODE_SETS`' positions: the prose
+    /// The ids the replay clause steps to each of `ds41_tier::DECODE_SETS`' positions: the prose
     /// corpus, whose first 1,026 ids reach the longest.
     const REPLAY_IDS: usize = 1026;
-    /// The decode-step sets whose streams select (phase 2).
-    const SELECT_SETS: [&str; 2] = [D1, D2];
-    /// The fixture file's twins of [`SELECT_SETS`].
+    /// The decode-step sets whose streams select (phase 2): ik's dumps of the fixture file.
     const FX_SELECT_SETS: [&str; 2] = [fx::D1, fx::D2];
     /// The fixture-oracle clauses `--select` decides (the count of [`FX_SELECT_SETS`]).
     const FIXTURE_ORACLE_SELECT: usize = 2;
@@ -566,26 +560,11 @@ mod gate {
             pass &= route_trace_case(&mut m, &mut head, &hp, &path)?;
             pass &= route_trace_recover_case(&mut m, &hp, &path)?;
         }
-        // The sets' clauses compare the engine with ik's dump of the real file, which the
-        // fixture's weights are not: the oracle's, deferred in the fixture tier. There ik's dump of
-        // the fixture file answers them, one fixture-oracle clause a set.
+        // The sets' clauses compare the engine with ik's dump of the fixture file, one
+        // fixture-oracle clause a set; the real tier leaves them to the fixture tier.
+        // PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; the fixture sets fx_ref_deepseek41_{step4,d1n,d1,d2}_every_node cover it
         let mut fixture_head = FixtureHead::default();
         if args.sets {
-            if tier::run_clause(
-                "--sets: the step's seams against ik's dump on the decode-step sets (step4, d1n)",
-                Tag::Oracle,
-            )? {
-                pass &= sets(
-                    &mut m,
-                    &mut head,
-                    &split,
-                    &hp,
-                    cfg.body.host.r8,
-                    &SETS,
-                    Dump::Real,
-                )?
-                .0;
-            }
             let (ok, ran) = fixture_sets(
                 &mut m,
                 &mut head,
@@ -599,21 +578,6 @@ mod gate {
             fixture_head.add(ran);
         }
         if args.select {
-            if tier::run_clause(
-                "--select: the indexer's selection against ik's lists on the decode-step sets (d1, d2)",
-                Tag::Oracle,
-            )? {
-                pass &= sets(
-                    &mut m,
-                    &mut head,
-                    &split,
-                    &hp,
-                    cfg.body.host.r8,
-                    &SELECT_SETS,
-                    Dump::Real,
-                )?
-                .0;
-            }
             let (ok, ran) = fixture_sets(
                 &mut m,
                 &mut head,
@@ -656,10 +620,11 @@ mod gate {
     }
 
     /// The fixture-oracle clauses the run's flags decide: one for each fixture set of `--sets` and of
-    /// `--select`.
+    /// `--select`, and the one of `--skew-sets`.
     fn fixture_oracle_declared(args: &Args) -> usize {
         usize::from(args.sets) * FIXTURE_ORACLE_SETS
             + usize::from(args.select) * FIXTURE_ORACLE_SELECT
+            + usize::from(args.skew.sets)
             + usize::from(args.imatrix.is_some()) * crate::imx_gate::FIXTURE_ORACLE
     }
 
@@ -2644,28 +2609,15 @@ mod gate {
         Ok(found)
     }
 
-    /// Whose dump of a decode step a `sets` run compares the engine with.
-    #[derive(Clone, Copy)]
-    enum Dump<'a> {
-        /// ik's dump of the real file, opened by the oracle table; the head's argmax is ik's.
-        Real,
-        /// ik's dump of the fixture file, opened through `tier::fixture_set` for the
-        /// fixture-oracle clause named; the head's argmax is excused as a tie band.
-        Fixture(&'a str),
-    }
-
+    /// ik's dump of the fixture file `name`, opened through `tier::fixture_set` for the
+    /// fixture-oracle clause named; the head's argmax is excused as a tie band.
     fn open_set(
         split: &Split,
         hp: &Hparams,
         name: &'static str,
-        dump: Dump<'_>,
+        clause: &str,
     ) -> Result<Set, GateError> {
-        let man = match dump {
-            Dump::Real => for_arch(Arch::Deepseek41)?.open_named(name)?,
-            Dump::Fixture(clause) => {
-                RefManifest::open(&tier::fixture_set(clause, &fx::IK, name)?, &fx::IK)?
-            }
-        };
+        let man = RefManifest::open(&tier::fixture_set(clause, &fx::IK, name)?, &fx::IK)?;
         let (pos, tokens, before) = man.step()?;
         let (tokens, before) = (tokens.to_vec(), before.to_vec());
         let ctx = man
@@ -3072,45 +3024,13 @@ mod gate {
         );
 
         let mut all_same = true;
-        let fixture = tier::Tier::from_env()? == tier::Tier::Fixture;
-        if fixture {
-            // The sets' injected state is the ik dump's: the fixture tier steps the corpus ids to the
-            // same positions and replays the next step from the engine's own saved state.
-            let ids = bloomery_gpu_gates::prose_ids("engram", REPLAY_IDS)?;
-            for (name, at, over) in crate::ds41_tier::DECODE_SETS {
-                let top_k = over.unwrap_or(hp.indexer.top_k);
-                all_same &= replay_from_steps(m, head, hp, &ids, (name, at as usize, top_k))?;
-            }
-        }
-        for name in [STEP4, D1, D2].into_iter().filter(|_| !fixture) {
-            let set = open_set(split, hp, name, Dump::Real)?;
-            crate::ds41_tier::witness_set(name, set.pos, set.top_k, hp.indexer.top_k)?;
-            let state = set_state(&set, hp)?;
-            let (gpu, w, body) = m.body_parts("structure")?;
-            body.set_indexer_top_k(gpu, set.top_k)?;
-            inject(gpu, body, &set, &state)?;
-            run_step(gpu, w, body, head, &set, &mut |_, _| Ok(()))?;
-            let eager = outputs(gpu, body, head, hp.n_layer)?;
-            let graph = gpu.capture(|_| body.enqueue_chain(gpu, w, head))?;
-            inject(gpu, body, &set, &state)?;
-            let input = body.decode_input(set.token, set.pos)?;
-            body.refresh(gpu.stream(), &input)?;
-            graph.launch(gpu.stream())?;
-            body.serve_captured(Chain::Step)?;
-            gpu.stream().synchronize()?;
-            let replay = outputs(gpu, body, head, hp.n_layer)?;
-            let same = replay == eager;
-            println!(
-                "graph set={} replay_bit_identical_to_eager={same} (logits, {} state buffers, {} \
-                 compressor buffers): {}",
-                set.name,
-                eager.state.len(),
-                eager.comp.len(),
-                verdict(same)
-            );
-            drop(graph);
-            body.set_indexer_top_k(gpu, hp.indexer.top_k)?;
-            all_same &= same;
+        // The corpus ids are stepped to each of the decode-step sets' positions and the next step
+        // is replayed from the engine's own saved state.
+        // PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; the replay's state is the engine's own, stepped from the corpus ids on both tiers, so no set feeds it
+        let ids = bloomery_gpu_gates::prose_ids("engram", REPLAY_IDS)?;
+        for (name, at, over) in crate::ds41_tier::DECODE_SETS {
+            let top_k = over.unwrap_or(hp.indexer.top_k);
+            all_same &= replay_from_steps(m, head, hp, &ids, (name, at as usize, top_k))?;
         }
 
         let (ok_topo, ok_shadow, ok_arrival) = {
@@ -3679,7 +3599,7 @@ mod gate {
         for &name in names {
             let clause = format!("{what}, set {name}");
             if tier::run_clause(&clause, Tag::FixtureOracle)? {
-                let (ok, n) = sets(m, head, split, hp, r8, &[name], Dump::Fixture(&clause))?;
+                let (ok, n) = sets(m, head, split, hp, r8, &[name], &clause)?;
                 pass &= ok;
                 held.add(FixtureHead { sets: 1, held: n });
             }
@@ -3724,18 +3644,15 @@ mod gate {
         hp: &Hparams,
         r8: bool,
         names: &[&'static str],
-        dump: Dump<'_>,
+        clause: &str,
     ) -> Result<(bool, usize), GateError> {
         let mut pass = true;
         let mut held = 0usize;
         let mut worst = 0.0f64;
         let indexer: Vec<bool> = hp.layers.iter().map(|k| k.indexer).collect();
-        let argmax = match dump {
-            Dump::Real => Argmax::Ik,
-            Dump::Fixture(_) => Argmax::Tie(head_formats(split)?),
-        };
+        let form = head_formats(split)?;
         for &name in names {
-            let set = open_set(split, hp, name, dump)?;
+            let set = open_set(split, hp, name, clause)?;
             let state = set_state(&set, hp)?;
             let (gpu, w, body) = m.body_parts("sets")?;
             body.set_indexer_top_k(gpu, set.top_k)?;
@@ -3751,15 +3668,12 @@ mod gate {
                 &set,
                 &head.logits_to_host(gpu)?,
                 (acc, type_of(split, &names::output())?),
-                argmax,
+                form,
             )?;
             pass &= ok;
             held += usize::from(on_path);
         }
-        let over = match dump {
-            Dump::Real => "both sets".to_string(),
-            Dump::Fixture(_) => names.join(", "),
-        };
+        let over = names.join(", ");
         println!("sets: largest measured/bound ratio pinned over {over} {worst:.3} (pin {Z})");
         Ok((pass, held))
     }
@@ -4685,17 +4599,8 @@ mod gate {
         (best, v[best], second, v[second])
     }
 
-    /// How `check_head` reads the argmax.
-    #[derive(Clone, Copy)]
-    enum Argmax {
-        /// Ours is ik's argmax.
-        Ik,
-        /// Ours is ik's argmax, or ik's own logit at ours lies within `flip::head_cap` of its top,
-        /// the band built from the head's weight type.
-        Tie(HeadForm),
-    }
-
-    /// The head's weight type and both engines' worst-case rounding of the activation it reads.
+    /// The head's weight type and both engines' worst-case rounding of the activation it reads: the
+    /// argmax is ik's, or ik's own logit at ours lies within `flip::head_cap` of its top.
     #[derive(Clone, Copy)]
     struct HeadForm {
         ty: GgmlType,
@@ -4730,7 +4635,7 @@ mod gate {
         set: &Set,
         logits: &[f32],
         (carried, head_ty): (Option<f64>, GgmlType),
-        argmax: Argmax,
+        form: HeadForm,
     ) -> Result<(bool, bool), GateError> {
         let want = named(&set.man, "result_output")?;
         let norm = named(&set.man, "result_norm")?;
@@ -4744,28 +4649,21 @@ mod gate {
         let r = rel(logits, &want);
         let (a, av, b, bv) = top2(logits);
         let (ka, kav, kb, kbv) = top2(&want);
-        let (argmax_ok, tie) = match argmax {
-            Argmax::Ik => (a == ka, String::new()),
-            Argmax::Tie(form) => {
-                let ours = u32::try_from(a)?;
-                let joint = form.rel.joint();
-                let band = r_in.hypot(joint);
-                let rms = (sumsq(&want) / want.len() as f64).sqrt();
-                (
-                    head_tie(&want, ours, band),
-                    format!(
-                        ", argmax tie band: ik's logit at ours {:.3e} below its top, cap {:.3e} = \
-                         6 · band {band:.3e} · rms {rms:.3e} (band = hypot(carried {r_in:.3e}, \
-                         joint {joint:.3e}); the head's {} activation: ik {:.3e}, ours {:.3e})",
-                        head_gap(&want, ours),
-                        head_cap(band, &want),
-                        form.ty,
-                        form.rel.ik,
-                        form.rel.ours
-                    ),
-                )
-            }
-        };
+        let ours = u32::try_from(a)?;
+        let joint = form.rel.joint();
+        let band = r_in.hypot(joint);
+        let rms = (sumsq(&want) / want.len() as f64).sqrt();
+        let argmax_ok = head_tie(&want, ours, band);
+        let tie = format!(
+            ", argmax tie band: ik's logit at ours {:.3e} below its top, cap {:.3e} = \
+             6 · band {band:.3e} · rms {rms:.3e} (band = hypot(carried {r_in:.3e}, \
+             joint {joint:.3e}); the head's {} activation: ik {:.3e}, ours {:.3e})",
+            head_gap(&want, ours),
+            head_cap(band, &want),
+            form.ty,
+            form.rel.ik,
+            form.rel.ours
+        );
         let ok = argmax_ok && r.is_finite() && r <= Z * bound;
         println!(
             "head set={}: top1 {a} (margin {:.4} over {b}) ik top1 {ka} (margin {:.4} over {kb}), \

@@ -5,14 +5,12 @@
 //! the gate placement `workstation::plan_gate`, opened through the engine's
 //! own entry `body::open`), after its own clauses and from a reset.
 //!
-//! - `--skew-sets`: on the decode-step sets `step4` (position 4) and `d1`
-//!   (position 301, ik's `top_k` overridden to 64, so every indexer layer
-//!   selects), each set's state injected as the step gate injects it, `t` the
-//!   set's token and `t1` the greedy token after it. The sets are ik's dumps
-//!   of the file the tier runs, the real file's or the fixture's
-//!   (`fx_ref_deepseek41_{step4, d1}_every_node`): a set is only the state
-//!   the engine starts from, and every equality below compares the engine with
-//!   itself, so the clause is a self-consistency one in both tiers.
+//! - `--skew-sets` (the fixture tier; the real tier leaves it to it, by name): on the decode-step
+//!   sets `step4` (position 4) and `d1` (position 301, ik's `top_k` overridden to 64, so every
+//!   indexer layer selects), each set's state injected as the step gate injects it, `t` the set's
+//!   token and `t1` the greedy token after it. The sets are ik's dumps of the fixture file
+//!   (`fx_ref_deepseek41_{step4, d1}_every_node`): a set is only the state the engine starts from,
+//!   and every equality below compares the engine with itself.
 //!   (i) two steps in turn, (ii) the pair pass eagerly, (iii) a capture of the
 //!   pair pass replayed: bit for bit, both rows' logits, every layer's window
 //!   ring, compressed rows, index keys and compressor state, each row's
@@ -36,8 +34,8 @@
 //!   row 1's layer 0 up to its go: each row carries its sites' work once, in
 //!   its own shadow.
 //! - `--skew-api`: the engine's own entry from a reset, graph mode and eager
-//!   mode, the sets read for their ids alone ([`ids_of`]: the set's, or in the fixture tier the
-//!   same positions of the prose corpus at the same `top_k`): `step_pair(t, t1)` after the set's prompt against `step(t)`,
+//!   mode, the ids of the same positions of the prose corpus at the same `top_k`
+//!   ([`ids_of`]): `step_pair(t, t1)` after the prompt against `step(t)`,
 //!   `step(t1)`, and `step_pair` + `rollback` + `step(t2)` against `step(t)`,
 //!   `step(t2)`: logits and tokens bit for bit, the two captured graphs
 //!   (one-token and pair) replayed in one process. Then deep cuts: from a
@@ -62,8 +60,6 @@ use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{FLAG_WAIT_OPS, Gpu, GpuError};
 use bloomery_gpu_deepseek41::body::{Body, Deepseek41Model, PAIR_ROWS, Seam};
 use bloomery_gpu_gates::nodes::{StepNode, capture_order};
-use bloomery_gpu_gates::oracle::deepseek41::{D1, STEP4};
-use bloomery_gpu_gates::oracle::for_arch;
 use bloomery_gpu_gates::{
     GateError, NAN_F16, RefManifest, ref_tensor_of_in, verdict, widened_f16_rows_in,
 };
@@ -76,15 +72,15 @@ use model::placement::workstation;
 use refset::arch::deepseek41::fixture as fx;
 use runtime::swaprule::KeptRows;
 
-use crate::ds41_tier;
+use crate::ds41_tier::{self, D1, STEP4};
 use crate::finite;
-use bloomery_gpu_gates::tier::{self, Tier};
+use bloomery_gpu_gates::tier::{self, Tag};
 
-/// A decode-step set as ik dumped it on the real file and on the fixture file; the pair pass runs
-/// the one its tier names.
+/// A decode step ([`ds41_tier::DECODE_SETS`]'s name) and ik's dump of it on the fixture file, the
+/// state the pair pass starts from.
 #[derive(Clone, Copy)]
 struct Twin {
-    real: &'static str,
+    step: &'static str,
     fixture: &'static str,
 }
 
@@ -92,11 +88,11 @@ struct Twin {
 /// one whose indexer layers select.
 const SETS: [Twin; 2] = [
     Twin {
-        real: STEP4,
+        step: STEP4,
         fixture: fx::STEP4,
     },
     Twin {
-        real: D1,
+        step: D1,
         fixture: fx::D1,
     },
 ];
@@ -163,11 +159,12 @@ pub fn clauses(
         )?;
         pass &= structure(m, &mut heads, split, hp)?;
     }
-    // The pair against two steps on each set's injected state: ik's dump is only the state the
-    // engine starts from, so each tier runs the equalities on its own dump's sets, the real file's
-    // or the fixture's; `--skew-api` runs the same equalities through the engine's own entry.
-    if c.sets {
-        ds41_tier::sc(SETS_CLAUSE)?;
+    // The pair against two steps on each set's injected state: ik's dump of the fixture file is
+    // only the state the engine starts from, so the fixture tier runs the equalities on it and the
+    // real tier leaves them to it; `--skew-api` runs the same equalities through the engine's own
+    // entry on both.
+    // PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; the fixture sets fx_ref_deepseek41_{step4,d1}_every_node cover it
+    if c.sets && tier::run_clause(SETS_CLAUSE, Tag::FixtureOracle)? {
         for twin in SETS {
             pass &= set_arms(m, &mut heads, split, hp, twin)?;
         }
@@ -176,7 +173,7 @@ pub fn clauses(
         ds41_tier::sc(
             "--skew-api: step_pair, rollback and the deep cuts through the engine's entry",
         )?;
-        pass &= api(m, split, hp)?;
+        pass &= api(m, hp)?;
         pass &= cuts(m, &mut heads[0], split, hp)?;
     }
     Ok(pass)
@@ -190,25 +187,15 @@ struct Ids {
     top_k: usize,
 }
 
-/// [`Ids`] of the set `name`: the set's own in the real tier, printed beside the position and
-/// `top_k` of `ds41_tier::DECODE_SETS`; in the fixture tier the ids at that position of the prose
-/// corpus and the table's `top_k`.
-fn ids_of(split: &Split, hp: &Hparams, name: &'static str) -> Result<Ids, GateError> {
+/// [`Ids`] of the decode step `name`: the ids at that position of the prose corpus and the table's
+/// `top_k` (`ds41_tier::DECODE_SETS`).
+fn ids_of(hp: &Hparams, name: &'static str) -> Result<Ids, GateError> {
     let (at, over) = ds41_tier::decode_set(name)?;
-    if Tier::from_env()? == Tier::Fixture {
-        let ids = bloomery_gpu_gates::prose_ids("engram", at as usize + 1)?;
-        return Ok(Ids {
-            before: ids[..at as usize].to_vec(),
-            token: ids[at as usize],
-            top_k: over.unwrap_or(hp.indexer.top_k),
-        });
-    }
-    let set = open_set(split, hp, name)?;
-    ds41_tier::witness_set(name, set.pos, set.top_k, hp.indexer.top_k)?;
+    let ids = bloomery_gpu_gates::prose_ids("engram", at as usize + 1)?;
     Ok(Ids {
-        before: set.before,
-        token: set.token,
-        top_k: set.top_k,
+        before: ids[..at as usize].to_vec(),
+        token: ids[at as usize],
+        top_k: over.unwrap_or(hp.indexer.top_k),
     })
 }
 
@@ -243,28 +230,11 @@ fn top_k_override(flags: &str) -> Result<Option<usize>, GateError> {
     Ok(found)
 }
 
-fn open_set(split: &Split, hp: &Hparams, name: &'static str) -> Result<Set, GateError> {
-    // The family's check names the sink-fixed tree: a set of another
-    // build or another model file does not open.
-    seat_set(
-        split,
-        hp,
-        name,
-        for_arch(Arch::Deepseek41)?.open_named(name)?,
-    )
-}
-
-/// The set `twin` names in this process's tier: ik's dump of the real file in the real tier, of the
-/// fixture file in the fixture tier (through the fixture family's check, which refuses a set of
-/// another generation of the fixture by name).
-fn open_tier_set(split: &Split, hp: &Hparams, twin: Twin) -> Result<Set, GateError> {
-    match Tier::from_env()? {
-        Tier::Real => open_set(split, hp, twin.real),
-        Tier::Fixture => {
-            let path = tier::fixture_set(SETS_CLAUSE, &fx::IK, twin.fixture)?;
-            seat_set(split, hp, twin.fixture, RefManifest::open(&path, &fx::IK)?)
-        }
-    }
+/// The fixture set `twin` names: ik's dump of the fixture file, opened through the fixture family's
+/// check, which refuses a set of another generation of the fixture by name.
+fn open_fixture_set(split: &Split, hp: &Hparams, twin: Twin) -> Result<Set, GateError> {
+    let path = tier::fixture_set(SETS_CLAUSE, &fx::IK, twin.fixture)?;
+    seat_set(split, hp, twin.fixture, RefManifest::open(&path, &fx::IK)?)
 }
 
 /// The step the opened set `man` holds, planned on `split`.
@@ -669,7 +639,7 @@ fn set_arms(
     hp: &Hparams,
     twin: Twin,
 ) -> Result<bool, GateError> {
-    let set = open_tier_set(split, hp, twin)?;
+    let set = open_fixture_set(split, hp, twin)?;
     let name = set.name;
     let state = set_state(&set, hp)?;
     let (gpu, w, body) = m.body_parts("set_arms")?;
@@ -774,7 +744,7 @@ fn set_arms(
     // their rows (step4: position 4, the ring never wrapped) and refused
     // where it would restore one from a shadow row of the injected
     // history (d1: rows 173 and 174, which positions 301 and 302 overwrote).
-    let grant = twin.real == STEP4;
+    let grant = twin.step == STEP4;
     inject(gpu, body, &set, &state)?;
     body.decode_pair(gpu.stream(), [t, t1], p)?;
     body.enqueue_pair(gpu, w, [&mut *ha, &mut *hb])?;
@@ -1046,8 +1016,8 @@ fn structure(
 /// The engine's own entry, graph and eager, from a reset: the set's
 /// prompt, then the pair against two steps, and the pair + rollback +
 /// step against two steps.
-fn api(m: &mut Deepseek41Model, split: &Split, hp: &Hparams) -> Result<bool, GateError> {
-    let set = ids_of(split, hp, STEP4)?;
+fn api(m: &mut Deepseek41Model, hp: &Hparams) -> Result<bool, GateError> {
+    let set = ids_of(hp, STEP4)?;
     let prompt = &set.before;
     let t = set.token;
     let p = u32::try_from(prompt.len())?;
@@ -1189,7 +1159,7 @@ fn cuts(
 ) -> Result<bool, GateError> {
     // The d1 set's ids of text, then greedy ids, at d1's top_k, so every
     // indexer layer selects once its stream holds more rows than that.
-    let set = ids_of(split, hp, D1)?;
+    let set = ids_of(hp, D1)?;
     let w = hp.window;
     let total = 4 * w + 7;
     m.set_mode(StepMode::Graph);

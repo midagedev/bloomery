@@ -1,13 +1,16 @@
 //! Gate `gate-ds41-plan`: the V4.1 host step plan (`model::arch::deepseek41::plan`) against
-//! the graph inputs of the oracle sets, bit for bit. Host only: no card, no gate lock.
+//! the graph inputs of ik's dumps of the fixture file, bit for bit. Host only: no card, no gate
+//! lock.
 //!
-//! The sets are the table's batch set (`ref_deepseek41`, five tokens from position 0) and its
-//! decode-step sets (`step_sets`). A set's header names its sequence (`# tokens`) and, in a
-//! decode-step set, the step's position (`# decode_pos`: the step runs the last token, the rest
-//! is its history — `RefManifest::step`). The planner is laid out from the file the sets were
-//! dumped from (`$BLOOMERY_REF_MODEL`, whose name must be each header's `# model_file`) at the
-//! port's context (`-c` in `# flags`; the sequence's length on a set dumped before that line),
-//! and plans the set's one step. Every input row of the set is then claimed by one check:
+//! PIN(2026-11-18): the real-file ik sets retired; ik cannot read bq3km's engram schema; the fixture sets fx_ref_deepseek41_{step4,d1n,d1,d2}_every_node carry the decode-step sets and no fixture set carries the five-token batch set from position 0
+//!
+//! The sets are the fixture family's decode-step sets, one fixture-oracle clause each; the real
+//! tier leaves them to the fixture tier. A set's header names its sequence (`# tokens`) and the
+//! step's position (`# decode_pos`: the step runs the last token, the rest is its history —
+//! `RefManifest::step`). The planner is laid out from the file the sets were dumped from
+//! (`$BLOOMERY_REF_MODEL`, whose name must be each header's `# model_file`) at the port's context
+//! (`-c` in `# flags`; the sequence's length on a set dumped before that line), and plans the
+//! set's one step. Every input row of the set is then claimed by one check:
 //!
 //! * the integer inputs through their exact twins (`ref_ints`, which proves each twin's file
 //!   against its row): tokens, positions, raw write cells, output ids, and per stream the
@@ -30,18 +33,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use bloomery_gpu_gates::oracle::{self, Set};
+use bloomery_gpu_gates::tier::{self, Tag};
 use bloomery_gpu_gates::{
     GateError, Layout, RefManifest, RefRow, RowKind, checks_failed, exit_with, mask_bits_in,
     ref_ints, ref_model_path, verdict,
 };
 use engram::Hash;
 use gguf::Split;
-use model::arch::Arch;
 use model::arch::deepseek41::hparams::Hparams;
 use model::arch::deepseek41::plan::{Planner, StepPlan};
+use refset::arch::deepseek41::fixture as fx;
 
 const NAME: &str = "gate_deepseek41_plan";
+
+/// The decode-step sets of the fixture file, each the subject of one fixture-oracle clause.
+const SETS: [&str; 4] = [fx::STEP4, fx::D1N, fx::D1, fx::D2];
 
 /// The port's names of the compressed streams, in the planner's stream order.
 const STREAMS: [&str; 2] = ["csa", "hca"];
@@ -87,25 +93,33 @@ impl Checks {
 }
 
 fn run() -> Result<(), GateError> {
-    let path = ref_model_path()?;
-    let split = Split::open(&path)?;
-    let hp = Hparams::read(&split)?;
-    let hash = Hash::from_gguf(&gguf::inventory_of(&path)?)?;
-    let table = oracle::for_arch(Arch::Deepseek41)?;
-    let mut sets = vec![table.open(Set::Cpu)?];
-    for name in table.step_sets {
-        sets.push(table.open_named(name)?);
+    let mut clauses = Vec::new();
+    for name in SETS {
+        let clause = format!("the plan's graph inputs against ik's dump, set {name}");
+        if tier::run_clause(&clause, Tag::FixtureOracle)? {
+            clauses.push((name, clause));
+        }
     }
     let mut c = Checks::default();
-    for man in &sets {
-        gate_set(man, &path, &split, &hp, &hash, &mut c)?;
+    if !clauses.is_empty() {
+        let path = ref_model_path()?;
+        let split = Split::open(&path)?;
+        let hp = Hparams::read(&split)?;
+        let hash = Hash::from_gguf(&gguf::inventory_of(&path)?)?;
+        for (name, clause) in &clauses {
+            let set = tier::fixture_set(clause, &fx::IK, name)?;
+            let man = RefManifest::open(&set, &fx::IK)?;
+            gate_set(&man, &path, &split, &hp, &hash, &mut c)?;
+        }
     }
+    tier::expect_fixture_oracle(NAME, SETS.len())?;
     let pass = c.failed == 0;
     println!(
-        "{NAME}: {} sets, {} inputs, {} failed — {}",
-        sets.len(),
+        "{NAME}: {} sets, {} inputs, {} failed, {} — {}",
+        clauses.len(),
         c.lines,
         c.failed,
+        tier::tally_line(),
         verdict(pass)
     );
     if pass { Ok(()) } else { Err(checks_failed()) }

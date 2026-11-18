@@ -13,7 +13,7 @@
 //!   the MoE join (`ds41_ffn_post*`) of the layer before its tapped layer
 //!   alone. Without the tap the counts are the plain step's (the step gate
 //!   pins those).
-//! - `--tap`: from a reset, prompt row 0 then greedy steps through the graph
+//! - `--tap`: from a reset, prompt row 0 (`DS41_PROMPT0`) then greedy steps through the graph
 //!   to [`RUN`] positions, each position's features read after its step.
 //!   Then at each of [`CHECKS`]: the positions `p` and `p + 1` stepped
 //!   eagerly with every sub-layer's streams read back (the finite probe's
@@ -39,6 +39,10 @@
 fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_deepseek41_dsloop", gate::run())
 }
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_prompt.rs"]
+mod prompt;
 
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_finite.rs"]
@@ -78,6 +82,7 @@ mod ds41_tier;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
+    use crate::prompt::DS41_PROMPT0;
     use bloomery_gpu::head::Head;
     use bloomery_gpu::host::PassKind;
     use bloomery_gpu::model::{ChainBody, StepMode};
@@ -85,7 +90,7 @@ mod gate {
     use bloomery_gpu_gates::nodes::{Captured, StepNode, capture_order};
     use bloomery_gpu_gates::record::{self, Log};
     use bloomery_gpu_gates::tier;
-    use bloomery_gpu_gates::{GateError, checks_failed, data_dir, verdict};
+    use bloomery_gpu_gates::{GateError, checks_failed, verdict};
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, ENGRAM_HELPER, HOST_LOCK, HOST_POPULATE, R8,
     };
@@ -197,26 +202,6 @@ mod gate {
         Ok(ok)
     }
 
-    /// Prompt row 0's ids (`$BLOOMERY_DATA/greedy-ds41/prompt0.tsv`, written
-    /// by `just ik-greedy-ds41`).
-    fn prompt0() -> Result<Vec<u32>, GateError> {
-        let path = data_dir().join("greedy-ds41").join("prompt0.tsv");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("{}: {e} — run just ik-greedy-ds41 0", path.display()))?;
-        let row = text
-            .lines()
-            .find(|l| !l.starts_with('#') && !l.is_empty())
-            .ok_or_else(|| format!("{}: no prompt row", path.display()))?;
-        let ids = row
-            .split('\t')
-            .nth(2)
-            .ok_or_else(|| format!("{}: the row has no ids", path.display()))?;
-        Ok(ids
-            .split(',')
-            .map(|t| t.trim().parse::<u32>())
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-
     pub fn run() -> Result<(), GateError> {
         let args = parse_args()?;
         if let Some(log) = &args.draft_load {
@@ -259,7 +244,7 @@ mod gate {
             &cfg,
         )?;
         m.set_mode(StepMode::Graph);
-        let ids = prompt0()?;
+        let ids = DS41_PROMPT0;
         println!(
             "{NAME}: tap layers {layers:?} (the draft's target_layers), {} values each; prompt 0 \
              {ids:?}",

@@ -1,6 +1,6 @@
 //! What a V4.1 whole-model gate reads of the fixture tier beyond `bloomery_gpu_gates::tier`: the
 //! model file (one owner, `gguf::v41`, and in the fixture tier a whole fixture), the levers a gate
-//! parses, the real file's decode-step sets, and the CED triangle's facts of the file — the layer
+//! parses, the decode-step positions the gates step to, and the CED triangle's facts of the file — the layer
 //! it is anchored at and the length it reaches from there. The card the gate plan is made on is
 //! `crate::gate_card`'s. Every number here is read from the header (`Hparams`) or from a plan, and
 //! where a gate's clause was written against a literal it prints the two side by side
@@ -10,50 +10,35 @@ use std::path::Path;
 
 use bloomery_gpu_deepseek41::body::{self, CHUNK, CedLayer};
 use bloomery_gpu_gates::GateError;
-use bloomery_gpu_gates::oracle::deepseek41::{D1, D2, STEP4};
 use bloomery_gpu_gates::tier::{self, Tier};
 use gguf::Gguf;
 use model::arch::deepseek41::hparams::Hparams;
 
-/// The decode-step sets of the real file's oracle (`step4`, `d1`, `d2`), each with the position of
-/// its step and the indexer `top_k` ik ran it with (`None`: the file's): `step4` at 4, where no csa
-/// group completes; `d1` at 301 with `top_k` 64, so every indexer layer selects, and one group
-/// completes with the window ring wrapped; `d2` at 1025. The gates that read a set for its position,
-/// its ids or its `top_k` read this table in the fixture tier (the corpus ids stand in for the
-/// set's), and in the real tier print each set's own beside it ([`witness_set`]).
+/// The decode-step positions the gates step to: `step4` at 4, where no csa group completes; `d1` at
+/// 301 with the indexer `top_k` 64, so every indexer layer selects, and one group completes with the
+/// window ring wrapped; `d2` at 1025, with the file's `top_k` (`None`). The gates that need a step's
+/// position, its ids or its `top_k` read this table and take the ids at that position from the prose
+/// corpus.
 pub const DECODE_SETS: [(&str, u32, Option<usize>); 3] =
     [(STEP4, 4, None), (D1, 301, Some(64)), (D2, 1025, None)];
 
-/// The position and `top_k` override [`DECODE_SETS`] names for the set `name`.
+/// The step at position 4.
+pub const STEP4: &str = "step4";
+/// The step at position 301, `top_k` 64.
+pub const D1: &str = "d1";
+/// The step at position 1,025.
+pub const D2: &str = "d2";
+
+/// The position and `top_k` override [`DECODE_SETS`] names for the step `name`.
 ///
 /// # Errors
-/// A set the table does not hold.
+/// A step the table does not hold.
 pub fn decode_set(name: &str) -> Result<(u32, Option<usize>), GateError> {
     DECODE_SETS
         .iter()
         .find(|(n, ..)| *n == name)
         .map(|&(_, at, k)| (at, k))
-        .ok_or_else(|| format!("{name} is not a decode-step set of DECODE_SETS").into())
-}
-
-/// The real tier's move proof of [`DECODE_SETS`]: the set `name`'s own step position `pos` and
-/// `top_k` (the file's `file_top_k` where it has no override) beside the table's, which must be
-/// equal.
-///
-/// # Errors
-/// A set the table does not hold, or one whose position or `top_k` differs from it.
-pub fn witness_set(name: &str, pos: u32, top_k: usize, file_top_k: usize) -> Result<(), GateError> {
-    let (at, over) = decode_set(name)?;
-    let ok = tier::witness(&format!("{name} step position"), pos, at)
-        & tier::witness(&format!("{name} top_k"), top_k, over.unwrap_or(file_top_k));
-    if ok {
-        Ok(())
-    } else {
-        Err(
-            format!("{name}: the set's position {pos} and top_k {top_k} are not DECODE_SETS'")
-                .into(),
-        )
-    }
+        .ok_or_else(|| format!("{name} is not a decode step of DECODE_SETS").into())
 }
 
 /// The V4.1 file a gate opens: the one `gguf::v41::model` owner's answer (a

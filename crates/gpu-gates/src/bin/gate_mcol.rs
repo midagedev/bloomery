@@ -24,12 +24,12 @@
 //!   the output head at m rows (`Head::with_m`): each row's normed vector,
 //!   logits and argmax token against the m = 1 head on that row alone.
 //!
-//! Activations: seeded random columns for every site, and for the sites
-//! whose input the V4.1 oracle set dumps, the set's own rows (its prefill
-//! tokens, cycled to 8 columns). The m = 1 launch of a column reads that
-//! column uploaded alone, so a column's answer can depend on nothing but its
-//! own activations. Every check prints an `m1=` digest of its m = 1 outputs,
-//! so two trees' decode bits compare line by line.
+//! Activations: seeded random columns for every site. The m = 1 launch of a
+//! column reads that column uploaded alone, so a column's answer can depend
+//! on nothing but its own activations. Every check prints an `m1=` digest of
+//! its m = 1 outputs, so two trees' decode bits compare line by line.
+//!
+//! PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; the sites' second activation, the oracle set's own rows of each site's input, left with it, and the seeded columns carry every site
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -46,8 +46,8 @@ mod gate {
     use bloomery_gpu::{DeviceTensor, Gpu, Q8Act};
     use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels, Q3kHeadsMcolArgs};
     use bloomery_gpu_gates::{
-        Fnv1a64, GateError, RefManifest, V41_SET_FAMILY, activations, bits_equal, checks_failed,
-        expect_arch, load_ref_logical_in, ref_dir_named, ref_model_path, verdict,
+        Fnv1a64, GateError, activations, bits_equal, checks_failed, expect_arch, ref_model_path,
+        verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
@@ -55,7 +55,6 @@ mod gate {
     use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::names;
-    use refset::arch::deepseek41::IK;
 
     /// Column counts a launch takes.
     const MS: std::ops::RangeInclusive<usize> = 1..=8;
@@ -488,25 +487,6 @@ mod gate {
         }))
     }
 
-    /// The oracle set's rows of dump tensor `name` (`k` values a token) as
-    /// eight activation columns, its tokens cycled; `None` when the set has
-    /// no such tensor.
-    fn real_cols(man: &RefManifest, name: &str, k: usize) -> Result<Option<Vec<f32>>, GateError> {
-        if man.tensors.iter().all(|r| r.name != name) {
-            return Ok(None);
-        }
-        let (_, v) = load_ref_logical_in(man, name, 0)?;
-        if v.is_empty() || !v.len().is_multiple_of(k) {
-            return Err(format!("{name}: {} values, not whole tokens of {k}", v.len()).into());
-        }
-        let tokens = v.len() / k;
-        Ok(Some(
-            (0..8)
-                .flat_map(|c| v[(c % tokens) * k..(c % tokens + 1) * k].iter().copied())
-                .collect(),
-        ))
-    }
-
     /// `attn_output_a` (Q8_0) through the per-head m-column launch: column c
     /// of every m (token-major y) against the decode launch of column c.
     fn check_heads_q8(
@@ -780,36 +760,21 @@ mod gate {
         best
     }
 
-    /// A plain projection of the chain: its tensor name at layer `l`, and the
-    /// dump tensor at layer `l` that is its input, when the oracle set names
-    /// one.
-    struct Site {
-        name: fn(usize) -> String,
-        input: Option<fn(usize) -> String>,
-    }
-
-    fn site(name: fn(usize) -> String, input: Option<fn(usize) -> String>) -> Site {
-        Site { name, input }
-    }
-
-    /// The chain's plain projections.
-    fn sites() -> [Site; 12] {
+    /// The chain's plain projections: each one's tensor name at layer `l`.
+    fn sites() -> [fn(usize) -> String; 12] {
         [
-            site(names::attn_q_a, Some(|l| format!("attn_norm-{l}"))),
-            site(names::attn_kv, Some(|l| format!("attn_norm-{l}"))),
-            site(names::attn_q_b, Some(|l| format!("qr_norm-{l}"))),
-            site(
-                names::attn_output_b,
-                Some(|l| format!("attn_wo_a-{l} (permuted) (cont)")),
-            ),
-            site(names::ffn_down_shexp, Some(|l| format!("ffn_up_gate-{l}"))),
-            site(names::indexer_attn_q_b, None),
-            site(names::indexer_proj, None),
-            site(names::indexer_attn_k, None),
-            site(names::attn_compressor_kv, None),
-            site(names::attn_compressor_gate, None),
-            site(names::engram_wkv, None),
-            site(names::ffn_gate_shexp, None),
+            names::attn_q_a,
+            names::attn_kv,
+            names::attn_q_b,
+            names::attn_output_b,
+            names::ffn_down_shexp,
+            names::indexer_attn_q_b,
+            names::indexer_proj,
+            names::indexer_attn_k,
+            names::attn_compressor_kv,
+            names::attn_compressor_gate,
+            names::engram_wkv,
+            names::ffn_gate_shexp,
         ]
     }
 
@@ -844,38 +809,25 @@ mod gate {
             q8: gpu.q8f32(),
             dense: &dense,
         };
-        // The set is the V4.1 node dumps' (complete, of the file the tree
-        // runs, the family's ik build), and of the file this gate opened.
-        let man = RefManifest::read(&ref_dir_named(V41_SET_FAMILY))?;
-        let family = man.check_family(&IK);
-        let set_ok = family.is_ok() && man.header.model() == path.to_str();
         println!(
-            "gate_mcol: device {} — {} — n_embd {} layers {} vocab {}; oracle set {} build {:?} \
-             model {:?} {}",
+            "gate_mcol: device {} — {} — n_embd {} layers {} vocab {}",
             gpu.device_name()?,
             path.display(),
             hp.n_embd,
             hp.n_layer,
             hp.n_vocab,
-            man.dir.display(),
-            man.build,
-            man.header.model(),
-            verdict(set_ok)
         );
-        if let Err(e) = family {
-            println!("gate_mcol: {e}");
-        }
-        let mut ok = set_ok;
+        let mut ok = true;
 
         // Every plain projection of the chain, at the first layer of each type
-        // the file gives it: random columns, then the set's rows of its input.
-        for (i, site) in sites().iter().enumerate() {
-            let layers = layers_by_type(&split, &hp, site.name);
+        // the file gives it, on seeded random columns.
+        for (i, site) in sites().into_iter().enumerate() {
+            let layers = layers_by_type(&split, &hp, site);
             if layers.is_empty() {
-                println!("site {}: not in this file", (site.name)(0));
+                println!("site {}: not in this file", site(0));
             }
             for l in layers {
-                let name = (site.name)(l);
+                let name = site(l);
                 let (ty, k, rows, bytes) =
                     load_rows(&split, &name, ROW_CAP)?.ok_or("a 2-D site vanished")?;
                 let x = activations(k, 8, 100 + i as u32);
@@ -884,20 +836,6 @@ mod gate {
                     continue;
                 };
                 ok &= pass;
-                if let Some(input) = site.input {
-                    let dump = input(l);
-                    match real_cols(&man, &dump, k)? {
-                        Some(x) => {
-                            let act = format!("dump:{dump}");
-                            ok &= check_site(&cx, &name, ty, k, rows, &bytes, &x, &act)?
-                                .unwrap_or(false);
-                        }
-                        None => {
-                            eprintln!("FAIL: the oracle set has no {dump}, {name}'s input");
-                            ok = false;
-                        }
-                    }
-                }
             }
         }
 
@@ -934,15 +872,7 @@ mod gate {
         let (ty, k, rows, bytes) =
             load_rows(&split, &wo_a, usize::MAX)?.ok_or("attn_output_a is not 2-D")?;
         let width = hp.n_head * hp.head_dim;
-        let mut heads_x = vec![("random".to_string(), activations(width, 8, 41))];
-        let dump = format!("attn-{wo_a_layer}");
-        match real_cols(&man, &dump, width)? {
-            Some(x) => heads_x.push((format!("dump:{dump}"), x)),
-            None => {
-                eprintln!("FAIL: the oracle set has no {dump}, {wo_a}'s input");
-                ok = false;
-            }
-        }
+        let heads_x = [("random", activations(width, 8, 41))];
         for (act, x) in &heads_x {
             ok &= match ty {
                 GgmlType::Q8_0 => {
@@ -977,15 +907,7 @@ mod gate {
                     kquant_words(stream, &ub, rows)?,
                 );
                 let limit = hp.layers[l].swiglu_limit_shared;
-                let mut xs = vec![("random".to_string(), activations(k, 8, 57))];
-                let dump = format!("ffn_norm-{l}");
-                match real_cols(&man, &dump, k)? {
-                    Some(x) => xs.push((format!("dump:{dump}"), x)),
-                    None => {
-                        eprintln!("FAIL: the oracle set has no {dump}, {g}'s input");
-                        ok = false;
-                    }
-                }
+                let xs = [("random", activations(k, 8, 57))];
                 for (act, x) in &xs {
                     ok &= check_shexp_q3k(&cx, &g, &gw, &uw, k, limit, x, act)?;
                 }

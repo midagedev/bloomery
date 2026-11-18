@@ -187,8 +187,8 @@ pub fn set_suffix_of(model: &str) -> &'static str {
     }
 }
 
-/// The name of V4.1 oracle set `base` (`ref_deepseek41`,
-/// `ref_deepseek41_d1_every_node`, …) for the file [`model`] names.
+/// The name of V4.1 reference set `base` (`ref-dequant-v41`, `ref-tokenizer-v41`) for the file
+/// [`model`] names.
 #[must_use]
 pub fn set(base: &str) -> String {
     format!("{base}{}", set_suffix_of(&model()))

@@ -1,83 +1,42 @@
 //! GPU gate for DeepSeek-V4.1's MoE sub-layer as one chain piece
-//! (`bloomery_gpu_deepseek41::chain::ffn::FfnPiece`, B5 G1) against ik's CPU
-//! dumps: the decode-step sets at positions 4 and 301 (`STEP4`, `D1N`), T = 1,
-//! every layer.
-//! The f32 unit roundoff and gamma bound come from
-//! `bloomery_gpu_gates::rounding`, shared with the other chain gates.
+//! (`bloomery_gpu_deepseek41::chain::ffn::FfnPiece`, B5 G1) on the file's own
+//! weights with seeded input: two seeds a layer, T = 1, every layer.
+//!
+//! PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; no fixture set carries this clause
 //!
 //! Per layer the gate makes the layer's dense tensors resident with
 //! `Weights::load_where` and uploads the card's routed stacks compacted in slot
 //! order; the host tier is served in-process — a `Hybrid` over the boundary
-//! with the V4.1 host computation (`HostRun`, the file's `HostLayer`s). Per set
-//! it injects the streams the sub-layer reads (`hc_attn_post-L`) and its folded
-//! input (`hc_ffn_pre-L`), runs the piece eagerly (the host serves the layer as
-//! the piece hands it over) and checks three things:
+//! with the V4.1 host computation (`HostRun`, the file's `HostLayer`s). Per
+//! seed it injects the streams the sub-layer reads and its folded input
+//! (`activations` of the model's width, four columns and one: the piece takes
+//! any finite pair, its routed ids being the router's on the file's own
+//! weights), runs the piece eagerly (the host serves the layer as the piece
+//! hands it over) and checks one thing:
 //!
-//! 1. **The piece is the op path, bit for bit.** The gate runs the same op
-//!    kernels itself from its own buffers — the norm, the router, the card's
-//!    routed experts on places it translates on the host from the slot map, the
-//!    shared expert, HC_PRE — computes the host share with its own `HostLayer`
-//!    call on its own activation, and the combine ([`combine_elem`]), HC_POST
-//!    and the fold on the host. Every buffer the piece leaves must equal it:
-//!    the activation in the handoff, the routing, the places, the card's slots
-//!    of h and down, the shared expert, the host's partial sum in the mapped
-//!    page, the combine, HC_PRE, the streams and the fold. This is the
-//!    composition's contract — the op kernels' arithmetic is their own gates'.
-//! 2. **ik's composition** — the rows the gate reads are proven by what each
-//!    reads (the norm the fold, HC_POST `ffn_out` and the ffn HC_PRE, the next
-//!    fold `l_out` or an engram layer's streams), and the piece's form (HC_POST
-//!    with the fold or alone) must be the dump's. A broken relation is an error.
-//! 3. **The piece against the dump**:
-//!    - the routed ids exactly, unless a pair of experts sits within the
-//!      selection band of each other where the order is decided (a near tie:
-//!      the ids and every pin below are waived for that layer and set, and the
-//!      line says so). The band on an expert's selection value is the exact
-//!      scores' difference at the two engines' logits, each side's score
-//!      evaluation (`softplus_err`: the device's `expf`/`logf`, the host's
-//!      libm) and the bias add's half ulp a side. That band is read from the
-//!      logits, so a waiver also needs the router's input within the two
-//!      norms' rounding of the dump's (`norm_band`): a wrong input moves the
-//!      logits, and the band would waive what it caused;
-//!    - the combine against `ffn_out-L`, the new streams against `l_out-L` and
-//!      the fold against the next sub-layer's (`hc_attn_pre-(L+1)`, when it
-//!      reads `l_out-L`), each in the form of the HC gate's chain pin: the
-//!      difference `pred` of the two engines' results in exact f64 from each
-//!      side's own inputs, and a `bound` on both sides' float rounding around
-//!      it; `|(ours − ik) − pred| / bound` above 1 fails. The bounds are the
-//!      op bands' rounding terms the B4 MoE gate pinned, carried down the
-//!      chain:
-//!    - the combine: per slot `pred += w°·D°₆₄ − wᵏ·Dᵏ₆₄`, the down's f64 dot
-//!      at each side's activation rule on its own h (q8_1 per 128 of the
-//!      card's h, q8_2_x4 of the host's h, q8_2_x4 of the dump's h — ik's
-//!      quantizer, `act_rule`, whose q8_2 × Q4_K/Q5_K dot the MoE gate pins
-//!      bit for bit on the dump), and
-//!      `bound += |w°|·n°·u·A° + |wᵏ|·nᵏ·u·Aᵏ` (each side's accumulation bound,
-//!      the K-quant decode's rounding, and the gate's f32 image of our q8_1
-//!      codes); the shared expert's the same way (our h as its down reads it
-//!      — f32 under q8_0 and Q5_K, q8_1 under Q4_K — against ik's q8_2_x4 of
-//!      the dump's); then the three sums' roundings — ours
-//!      `(Σ_card fma) + hsum + shexp`, the host's weighted sum, ik's six-slot
-//!      sum plus the shared expert — which is where the association change
-//!      the partial sum brings lives;
-//!    - the streams: HC_POST in f64 at our combine as the combine's pin has it
-//!      (`yᵏ + pred_y`) with our HC_PRE's post and comb, minus ik's at `yᵏ`
-//!      with the dump's; `bound = |post°|·bound_y` plus both sides' HC_POST
-//!      roundings;
-//!    - the fold: the same over the streams' pin with each side's pre.
-//!
-//!    Every product of two f32 is exact in f64; the gate's own f64 sums add
-//!    at most `k·u64` of the magnitudes they sum, kept in each bound.
+//! **The piece is the op path, bit for bit.** The gate runs the same op
+//! kernels itself from its own buffers — the norm, the router, the card's
+//! routed experts on places it translates on the host from the slot map, the
+//! shared expert, HC_PRE — computes the host share with its own `HostLayer`
+//! call on its own activation, and the combine ([`combine_elem`]), HC_POST
+//! and the fold on the host. Every buffer the piece leaves must equal it:
+//! the activation in the handoff, the routing, the places, the card's slots
+//! of h and down, the shared expert, the host's partial sum in the mapped
+//! page, the combine, HC_PRE, the streams and the fold. This is the
+//! composition's contract — the op kernels' arithmetic is their own gates'.
 //!
 //! The slot map is synthetic, not the gate placement's prefix: the 3090's prefix
 //! of a few dozen of 384 experts would put one routed id of a token on the card
 //! about one layer in six, so most layers would run only one side of the join.
 //! Here each layer whose down stack is q4_K puts on the card half of the
-//! experts the two sets' tokens use — every token has ids on both sides — in
+//! experts the two seeds' tokens use — every token has ids on both sides — in
 //! slots numbered against the id order, so the translation is not the
-//! identity. A layer of another down (q5_K, layers 0 and 1 of the real file) is
-//! all host in this gate's map: its uploads, its op-path composition and the
-//! ik-composed bands here are the q4_K triple's, and the q5_K down's own
-//! dispatch is the lib gate's clause (`chain::ffn`'s `hw_` test).
+//! identity. The ids come from a pass over every layer before the map is
+//! built: the op path's own norm and router on each seeded input. A layer of
+//! another down (q5_K, layers 0 and 1 of the real file) is all host in this
+//! gate's map: its uploads and its op-path composition are the q4_K triple's,
+//! and the q5_K down's own dispatch is the lib gate's clause (`chain::ffn`'s
+//! `hw_` test).
 //!
 //! The shared expert runs in the file's format, as the piece runs it: q8_0
 //! gate·up on the f32 activation and a q8_0 down, or Q3_K gate·up on the
@@ -85,7 +44,7 @@
 //! on the f32 output).
 //!
 //! Structure, per layer: the piece's launches captured and replayed for each
-//! set with the host serving each replay, every buffer bit-identical to the
+//! seed with the host serving each replay, every buffer bit-identical to the
 //! eager run; the captured nodes by kind (kernels, copies — none: the handoff
 //! launch writes the page —, the two memory-operation batches) equal to the
 //! piece's own count.
@@ -115,7 +74,6 @@ mod e2e;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use bloomery_gpu_gates::rel::rel_max;
     use std::sync::Arc;
 
     use bloomery_gpu::fused::FusedKernels;
@@ -132,375 +90,42 @@ mod gate {
         HC_MIX, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch,
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
-    use bloomery_gpu_gates::act_rule::{Act, Rule};
-    use bloomery_gpu_gates::oracle;
-    use bloomery_gpu_gates::oracle::deepseek41::{D1N, STEP4};
-    use bloomery_gpu_gates::rounding::{U, U64, gamma};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, RefRow, activations, bits_equal, bytes_to_words, checks_failed,
-        no_local_depot, q8_1_dequant, ref_model_path, ref_tensor_of_in, row_bytes,
-        topk_ids_logical_within, verdict,
+        GateError, activations, bits_equal, bytes_to_words, checks_failed, no_local_depot,
+        ref_model_path, row_bytes, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer, sys};
     use gguf::Split;
-    use gguf::quant::{GgmlType, dequant_row};
+    use gguf::quant::GgmlType;
     use model::Tensor2;
-    use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::{host, names};
     use model::moe::{HostLayer, HostScratch};
     use model::r8file::R8Source;
 
-    /// The sets, T = 1 each: a decode step at position 4, and one at 301 with
-    /// the file's top-k.
-    const SETS: [&str; 2] = [STEP4, D1N];
+    /// The two seeds of a layer's inputs, T = 1 each (`activations`, offset
+    /// by the layer).
+    const SEEDS: [u32; 2] = [0xC4A1_0004, 0xC4A1_012D];
 
-    /// The ik tree the sets must come from: the dump before its sink fix is
-    /// kept read-only elsewhere and must not be read.
-    const PRE_FIX_BUILD: &str = "49ef19d0";
+    /// The folded input's seed, offset from the streams'.
+    const FOLD_SALT: u32 = 0x00F0_1D00;
 
-    /// Roundings on one term's path through one of our dots over `k` values
-    /// (the MoE gate's count): one per value a lane reads, `k/32` a lane, and
-    /// the five butterfly levels.
-    fn n_ours(k: usize) -> f64 {
-        (k / 32 + 5) as f64
-    }
+    // ---------------------------------------------------------- the input
 
-    /// The same count for ik's and the host's quantized dots, whose order the
-    /// gate does not transcribe (the MoE gate's): four roundings per 32-value
-    /// block at most, then a horizontal sum of at most five levels.
-    fn n_ik_quant(k: usize) -> f64 {
-        (4 * (k / 32) + 5) as f64
-    }
-
-    /// A K-quant down weight decoded once to f32 against a side's exact use
-    /// of it (the MoE gate's `KQ_DECODE`): one rounding. Our Q5_K shared down
-    /// reads each weight as `dequant_row` decodes it and takes none.
-    const KQ_DECODE: f64 = 1.0;
-
-    /// The gate's f32 image of our q8_1 activation (`q8_1_dequant`, code
-    /// times scale) against the kernel's exact use of both: one rounding a
-    /// value.
-    const Q8_IMAGE: f64 = 1.0;
-
-    /// CUDA's `expf` (fused with the `1 +`) and `logf`, the host's (glibc's),
-    /// in ulps — the MoE gate's constants.
-    const DEVICE_EXP_ULPS: f64 = 2.5;
-    const DEVICE_LOG_ULPS: f64 = 1.0;
-    const HOST_EXP_ULPS: f64 = 1.0;
-    const HOST_LOG_ULPS: f64 = 1.0;
-
-    // ---------------------------------------------------------- the dump
-
-    /// A set, its manifest read once.
-    struct SetData {
-        name: &'static str,
-        man: RefManifest,
-    }
-
-    fn set_data(name: &'static str) -> Result<SetData, GateError> {
-        let man = oracle::for_arch(Arch::Deepseek41)?.open_named(name)?;
-        let t = man.tensor("ffn_norm-0", 0)?.ne[1];
-        println!(
-            "set {name}: build {:?} tokens {t} complete {:?}",
-            man.build, man.complete
-        );
-        if man.build.as_deref() == Some(PRE_FIX_BUILD) {
-            return Err(format!(
-                "{name} was dumped by ik {PRE_FIX_BUILD}, the tree before its sink fix: \
-                 the sets must be the re-dump"
-            )
-            .into());
-        }
-        if t != 1 {
-            return Err(format!("{name} has {t} tokens; the piece runs one").into());
-        }
-        Ok(SetData { name, man })
-    }
-
-    fn src0(r: &RefRow) -> &str {
-        r.src0.as_deref().unwrap_or("")
-    }
-
-    /// Row `name`/0 of `set`, its type, dims and op proven, and its two
-    /// sources when given (`None` for a source not checked).
-    fn row<'a>(
-        set: &'a SetData,
-        name: &str,
-        ne: [u64; 4],
-        op: &str,
-        srcs: (Option<&str>, Option<&str>),
-    ) -> Result<&'a RefRow, GateError> {
-        let r = set.man.tensor(name, 0)?;
-        r.expect(name, "f32", ne, op)?;
-        for (want, got) in [(srcs.0, &r.src0), (srcs.1, &r.src1)] {
-            if let Some(w) = want
-                && got.as_deref() != Some(w)
-            {
-                return Err(format!(
-                    "{}: {name} reads {:?} and {:?}; want {:?} and {:?}",
-                    set.name, r.src0, r.src1, srcs.0, srcs.1
-                )
-                .into());
-            }
-        }
-        Ok(r)
-    }
-
-    fn values(set: &SetData, r: &RefRow) -> Result<Vec<f32>, GateError> {
-        Ok(ref_tensor_of_in(&set.man.dir, r)?)
-    }
-
-    /// What one layer of one set holds for the piece: its inputs, ik's
-    /// intermediates the bands read, and ik's outputs.
-    struct LayerDump {
+    /// What one layer of one seed holds for the piece: the streams the
+    /// sub-layer reads and its folded input, the norm's.
+    struct Seeded {
         streams: Vec<f32>,
         fold_in: Vec<f32>,
-        /// The norm's output: the router's input.
-        x: Vec<f32>,
-        logits: Vec<f32>,
-        probs_biased: Vec<f32>,
-        ids: [u32; N_USED],
-        w: [f32; N_USED],
-        h: Vec<f32>,
-        down: Vec<f32>,
-        sh_h: Vec<f32>,
-        sh: Vec<f32>,
-        y: Vec<f32>,
-        hc: [f32; HC_MIX],
-        l_out: Vec<f32>,
-        /// The next sub-layer's fold when it reads `l_out-L`; `None` into an
-        /// engram layer and after the last layer.
-        fold_out: Option<Vec<f32>>,
     }
 
-    fn layer_dump(set: &SetData, hp: &Hparams, l: usize) -> Result<LayerDump, GateError> {
-        let (n, ff) = (hp.n_embd as u64, hp.experts.ff as u64);
-        let (ne, nu) = (N_EXPERT as u64, N_USED as u64);
-        let post_a = format!("hc_attn_post-{l}");
-        let fold_name = format!("hc_ffn_pre-{l}");
-        let norm = format!("ffn_norm-{l}");
-        let streams = values(
-            set,
-            row(set, &post_a, [n, 4, 1, 1], "HC_POST", (None, None))?,
-        )?;
-        let fold_in = values(
-            set,
-            row(
-                set,
-                &fold_name,
-                [n, 1, 1, 1],
-                "MUL_MULTI_ADD",
-                (Some(post_a.as_str()), None),
-            )?,
-        )?;
-        let x = values(
-            set,
-            row(
-                set,
-                &norm,
-                [n, 1, 1, 1],
-                "FUSED_RMS_NORM",
-                (Some(fold_name.as_str()), Some(names::ffn_norm(l).as_str())),
-            )?,
-        )?;
-        let logits_name = format!("ffn_moe_logits-{l}");
-        let logits = values(
-            set,
-            row(
-                set,
-                &logits_name,
-                [ne, 1, 1, 1],
-                "MUL_MAT",
-                (Some(names::ffn_gate_inp(l).as_str()), Some(norm.as_str())),
-            )?,
-        )?;
-        let probs_name = format!("ffn_moe_probs-{l}");
-        row(
-            set,
-            &probs_name,
-            [ne, 1, 1, 1],
-            "SQRT_SOFTPLUS",
-            (Some(logits_name.as_str()), None),
-        )?;
-        let probs_biased = values(
-            set,
-            row(
-                set,
-                &format!("ffn_moe_probs_biased-{l}"),
-                [ne, 1, 1, 1],
-                "ADD",
-                (
-                    Some(probs_name.as_str()),
-                    Some(names::exp_probs_b(l).as_str()),
-                ),
-            )?,
-        )?;
-        let topk = set.man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
-        let ids_v = topk_ids_logical_within(&set.man, topk, u32::try_from(N_EXPERT)?)?;
-        let ids: [u32; N_USED] = ids_v
-            .iter()
-            .map(|&i| i.cast_unsigned())
-            .collect::<Vec<_>>()
-            .try_into()
-            .map_err(|v: Vec<u32>| format!("{}: {} ids at layer {l}", set.name, v.len()))?;
-        let ws_name = format!("ffn_moe_weights_scaled-{l}");
-        let w_v = values(
-            set,
-            row(set, &ws_name, [1, nu, 1, 1], "SCALE", (None, None))?,
-        )?;
-        let w: [f32; N_USED] = w_v
-            .try_into()
-            .map_err(|_| format!("{}: {ws_name} is not {N_USED} weights", set.name))?;
-        let par = format!("ffn_moe_gate_par-{l}");
-        let h = values(
-            set,
-            row(
-                set,
-                &par,
-                [ff, nu, 1, 1],
-                "MOE_FUSED_UP_GATE",
-                (
-                    Some(names::ffn_up_exps(l).as_str()),
-                    Some(names::ffn_gate_exps(l).as_str()),
-                ),
-            )?,
-        )?;
-        let down_name = format!("ffn_moe_down-{l}");
-        let down = values(
-            set,
-            row(
-                set,
-                &down_name,
-                [n, nu, 1, 1],
-                "MUL_MAT_ID",
-                (Some(names::ffn_down_exps(l).as_str()), Some(par.as_str())),
-            )?,
-        )?;
-        let moe_name = format!("ffn_moe_out-{l}");
-        row(
-            set,
-            &moe_name,
-            [n, 1, 1, 1],
-            "MUL_MULTI_ADD",
-            (Some(down_name.as_str()), Some(ws_name.as_str())),
-        )?;
-        let upg = format!("ffn_up_gate-{l}");
-        let sh_h = values(
-            set,
-            row(
-                set,
-                &upg,
-                [ff, 1, 1, 1],
-                "FUSED_UP_GATE",
-                (
-                    Some(names::ffn_up_shexp(l).as_str()),
-                    Some(names::ffn_gate_shexp(l).as_str()),
-                ),
-            )?,
-        )?;
-        let sh_name = format!("ffn_shexp-{l}");
-        let sh = values(
-            set,
-            row(
-                set,
-                &sh_name,
-                [n, 1, 1, 1],
-                "MUL_MAT",
-                (Some(names::ffn_down_shexp(l).as_str()), Some(upg.as_str())),
-            )?,
-        )?;
-        let out_name = format!("ffn_out-{l}");
-        let y = values(
-            set,
-            row(
-                set,
-                &out_name,
-                [n, 1, 1, 1],
-                "ADD",
-                (Some(moe_name.as_str()), Some(sh_name.as_str())),
-            )?,
-        )?;
-        // The ffn HC_PRE: the node reading this layer's mixes and the ffn
-        // scale; its mixes read hc_ffn_fn over the streams above.
-        let mixes_name = format!("hc_pre_mixes-{l}");
-        let scale_name = names::hc_ffn_scale(l);
-        let node = set
-            .man
-            .tensors
-            .iter()
-            .find(|r| {
-                r.op == "HC_PRE"
-                    && src0(r) == mixes_name
-                    && r.src1.as_deref() == Some(scale_name.as_str())
-            })
-            .ok_or_else(|| {
-                format!(
-                    "{}: no HC_PRE reads {mixes_name} with {scale_name}",
-                    set.name
-                )
-            })?;
-        node.expect(&node.name, "f32", [HC_MIX as u64, 1, 1, 1], "HC_PRE")?;
-        let mixes = set.man.tensor(&mixes_name, 1)?;
-        let rms = set.man.tensor(&format!("hc_pre-{l}"), 1)?;
-        if src0(mixes) != names::hc_ffn_fn(l) || src0(rms) != format!("{post_a} (reshaped)") {
-            return Err(format!(
-                "{}: the ffn HC_PRE at layer {l} reads {} over {}, not hc_ffn_fn over {post_a}",
-                set.name,
-                src0(mixes),
-                src0(rms)
-            )
-            .into());
-        }
-        let hc: [f32; HC_MIX] = values(set, node)?
-            .try_into()
-            .map_err(|_| format!("{}: {} is not {HC_MIX} values", set.name, node.name))?;
-        let l_name = format!("l_out-{l}");
-        let l_out = values(
-            set,
-            row(
-                set,
-                &l_name,
-                [n, 4, 1, 1],
-                "HC_POST",
-                (Some(out_name.as_str()), None),
-            )?,
-        )?;
-        let fold_out = if l + 1 < hp.n_layer {
-            let f = format!("hc_attn_pre-{}", l + 1);
-            let r = row(set, &f, [n, 1, 1, 1], "MUL_MULTI_ADD", (None, None))?;
-            let engram = format!("engram_out-{}", l + 1);
-            if src0(r) == l_name {
-                Some(values(set, r)?)
-            } else if src0(r) == engram {
-                None
-            } else {
-                return Err(format!(
-                    "{}: {f} reads {}, neither {l_name} nor {engram}",
-                    set.name,
-                    src0(r)
-                )
-                .into());
-            }
-        } else {
-            None
-        };
-        Ok(LayerDump {
-            streams,
-            fold_in,
-            x,
-            logits,
-            probs_biased,
-            ids,
-            w,
-            h,
-            down,
-            sh_h,
-            sh,
-            y,
-            hc,
-            l_out,
-            fold_out,
+    /// Layer `l`'s input of `seed`, `n` the model's width: four stream
+    /// columns and one folded column.
+    fn seeded(n: usize, seed: u32, l: usize) -> Result<Seeded, GateError> {
+        let at = seed.wrapping_add(u32::try_from(l)?);
+        Ok(Seeded {
+            streams: activations(n, HC_STREAMS, at),
+            fold_in: activations(n, 1, at.wrapping_add(FOLD_SALT)),
         })
     }
 
@@ -534,186 +159,6 @@ mod gate {
             .find(name)
             .map(|(_, t)| t.ty)
             .ok_or_else(|| format!("tensor {name} is not in the model"))?)
-    }
-
-    /// `f(i, chunk)` over the `len`-element chunks of `out`, on every core.
-    fn par_chunks<T: Send>(
-        out: &mut [T],
-        len: usize,
-        f: impl Fn(usize, &mut [T]) -> Result<(), String> + Sync,
-    ) -> Result<(), GateError> {
-        let n = out.len() / len.max(1);
-        if n == 0 {
-            return Ok(());
-        }
-        let threads = std::thread::available_parallelism()
-            .map_or(1, |t| t.get())
-            .min(n);
-        let per = n.div_ceil(threads);
-        let errs: Vec<String> = std::thread::scope(|s| {
-            let handles: Vec<_> = out
-                .chunks_mut(per * len)
-                .enumerate()
-                .map(|(c, block)| {
-                    let f = &f;
-                    s.spawn(move || -> Result<(), String> {
-                        for (j, chunk) in block.chunks_mut(len).enumerate() {
-                            f(c * per + j, chunk)?;
-                        }
-                        Ok(())
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .filter_map(|h| match h.join() {
-                    Ok(Ok(())) => None,
-                    Ok(Err(e)) => Some(e),
-                    Err(_) => Some("a worker thread panicked".to_string()),
-                })
-                .collect()
-        });
-        match errs.into_iter().next() {
-            None => Ok(()),
-            Some(e) => Err(e.into()),
-        }
-    }
-
-    /// Rows `r0 .. r0 + n` of a tensor of `k`-value rows of type `ty`,
-    /// decoded to f32 by `dequant_row`.
-    fn rows_f32(
-        ty: GgmlType,
-        bytes: &[u8],
-        r0: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<Vec<f32>, GateError> {
-        let rb = row_bytes(ty, k)?;
-        let src = bytes
-            .get(r0 * rb..(r0 + n) * rb)
-            .ok_or_else(|| format!("rows {r0}..{} of {ty} x {k}: past the tensor", r0 + n))?;
-        let mut out = vec![0.0f32; n * k];
-        par_chunks(&mut out, k, |r, dst| {
-            dequant_row(ty, &src[r * rb..(r + 1) * rb], dst).map_err(|e| e.to_string())
-        })?;
-        Ok(out)
-    }
-
-    /// One output row of a dot in f64 against two activations (the MoE
-    /// gate's): ours, ik's, and each one's sum of absolute terms.
-    #[derive(Clone, Copy, Default)]
-    struct RowStat {
-        ours: f64,
-        ik: f64,
-        abs_ours: f64,
-        abs_ik: f64,
-    }
-
-    /// Every row of `w` (rows of `xo.len()` values) against both activations.
-    /// The products of two f32 are exact in f64.
-    fn row_stats(w: &[f32], xo: &[f32], xi: &[f32]) -> Result<Vec<RowStat>, GateError> {
-        let k = xo.len();
-        let mut out = vec![RowStat::default(); w.len() / k];
-        par_chunks(&mut out, 1, |r, o| {
-            let mut s = RowStat::default();
-            for ((&wv, &a), &b) in w[r * k..(r + 1) * k].iter().zip(xo).zip(xi) {
-                let wv = f64::from(wv);
-                let (a, b) = (wv * f64::from(a), wv * f64::from(b));
-                s.ours += a;
-                s.ik += b;
-                s.abs_ours += a.abs();
-                s.abs_ik += b.abs();
-            }
-            o[0] = s;
-            Ok(())
-        })?;
-        Ok(out)
-    }
-
-    // ------------------------------------------------ the routing's band
-
-    /// One f32 ulp at `v`.
-    fn ulp32(v: f64) -> f64 {
-        let a = v.abs() as f32;
-        if a < f32::MIN_POSITIVE {
-            return f64::from(f32::from_bits(1));
-        }
-        f64::from(f32::from_bits(a.to_bits() & 0x7f80_0000)) * f64::from(f32::EPSILON)
-    }
-
-    /// The exact `sqrt(ln(1 + e^x))`.
-    fn softplus64(x: f32) -> f64 {
-        let x = f64::from(x);
-        if x > 20.0 {
-            x.sqrt()
-        } else {
-            (1.0 + x.exp()).ln().sqrt()
-        }
-    }
-
-    /// How far one side's f32 score can sit from the exact score at `x`
-    /// (the MoE gate's derivation).
-    fn softplus_err(x: f32, e_ulps: f64, l_ulps: f64) -> f64 {
-        let p = softplus64(x);
-        if x > 20.0 {
-            return 0.5 * ulp32(p);
-        }
-        let e = f64::from(x).exp();
-        let y = 1.0 + e;
-        let sp = y.ln();
-        let dy = e_ulps * ulp32(e) + 0.5 * ulp32(y);
-        let dsp = dy / (y - dy) + l_ulps * ulp32(sp);
-        dsp / p + 0.5 * ulp32(p)
-    }
-
-    /// Whether the dump's ordered top six could come out otherwise from our
-    /// logits: some expert among the first six of ik's order and one after it
-    /// in that order sit within the sum of their selection bands.
-    /// Returns the smallest gap over band sum it saw (above 1: decided).
-    fn tie_margin(dump: &LayerDump, logits: &[f32], bias: &[f32], probs: &[f32]) -> f64 {
-        let band: Vec<f64> = (0..N_EXPERT)
-            .map(|e| {
-                let (lo, lk) = (logits[e], dump.logits[e]);
-                let sel_o = f64::from(probs[e] + bias[e]);
-                (softplus64(lo) - softplus64(lk)).abs()
-                    + softplus_err(lo, DEVICE_EXP_ULPS, DEVICE_LOG_ULPS)
-                    + softplus_err(lk, HOST_EXP_ULPS, HOST_LOG_ULPS)
-                    + 0.5 * ulp32(sel_o)
-                    + 0.5 * ulp32(f64::from(dump.probs_biased[e]))
-            })
-            .collect();
-        let v = &dump.probs_biased;
-        let mut order: Vec<usize> = (0..N_EXPERT).collect();
-        order.sort_by(|&a, &b| (v[b] + 0.0).total_cmp(&(v[a] + 0.0)).then(b.cmp(&a)));
-        let mut worst = f64::INFINITY;
-        for p in 0..N_USED {
-            let a = order[p];
-            for &b in &order[p + 1..] {
-                let gap = f64::from(v[a]) - f64::from(v[b]);
-                worst = worst.min(gap / (band[a] + band[b]));
-            }
-        }
-        worst
-    }
-
-    /// How far the two engines' norms of the same folded input can sit
-    /// apart, relative to the value: each side's scale rounds at most
-    /// `γ(k + 4)` through its sum of `k` squares, the mean, the `+ eps`, the
-    /// root and the reciprocal (half of it through the root), and each value
-    /// takes two products. Summed over both sides.
-    fn norm_band(k: usize) -> f64 {
-        gamma(k + 4) + 2.0 * gamma(4)
-    }
-
-    /// Whether every value of `a` is within `delta` of `b`'s, relative to the
-    /// larger magnitude: the router read the dump's input up to the norms'
-    /// rounding, so a selection that differs can be a near tie and not a
-    /// wrong input.
-    fn x_within(a: &[f32], b: &[f32], delta: f64) -> bool {
-        a.iter().zip(b).all(|(&x, &y)| {
-            let (x, y) = (f64::from(x), f64::from(y));
-            (x - y).abs() <= delta * x.abs().max(y.abs())
-        })
     }
 
     // ------------------------------------------------------ the slot map
@@ -1020,27 +465,17 @@ mod gate {
         fold: bool,
     }
 
-    /// Per host slot of the op path's service: its list index, id and
-    /// weight, and the host's h and down for it.
-    struct HostSlot {
-        slot: usize,
-        h: Vec<f32>,
-        down: Vec<f32>,
-    }
-
-    /// The op path for the injected inputs already in `streams`/`fold_in`.
-    fn op_path(
+    /// The op path's routing of the folded input `fold_in` at layer `l`: the
+    /// norm, then the router, into `op.act_x`, `op.x` and `op.rout`.
+    fn route(
         gpu: &Gpu,
         op: &mut Op,
-        split: &Split,
         hp: &Hparams,
-        lc: &LayerCx<'_>,
-        streams: &DeviceBuffer<f32>,
+        w: &Weights,
+        l: usize,
         fold_in: &DeviceBuffer<f32>,
-    ) -> Result<(Out, Vec<HostSlot>), GateError> {
+    ) -> Result<(), GateError> {
         let stream = gpu.stream();
-        let (n, ff, l, w) = (hp.n_embd, hp.experts.ff, lc.l, lc.w);
-        let kind = &hp.layers[l];
         op.fused.enqueue_norm_quant(
             stream,
             fold_in,
@@ -1059,6 +494,23 @@ mod gate {
             &mut op.rout,
             gpu.layer_sink(l)?,
         )?;
+        Ok(())
+    }
+
+    /// The op path for the injected inputs already in `streams`/`fold_in`.
+    fn op_path(
+        gpu: &Gpu,
+        op: &mut Op,
+        split: &Split,
+        hp: &Hparams,
+        lc: &LayerCx<'_>,
+        streams: &DeviceBuffer<f32>,
+        fold_in: &DeviceBuffer<f32>,
+    ) -> Result<Out, GateError> {
+        let stream = gpu.stream();
+        let (n, ff, l, w) = (hp.n_embd, hp.experts.ff, lc.l, lc.w);
+        let kind = &hp.layers[l];
+        route(gpu, op, hp, w, l, fold_in)?;
         let ids = op.rout.ids.to_host_vec(stream)?;
         let weights = op.rout.weights.to_host_vec(stream)?;
         let sel = ids
@@ -1184,23 +636,12 @@ mod gate {
             .filter(|&j| sel[j] as usize >= lc.n_card)
             .map(|j| (ids[j], weights[j]))
             .collect();
-        let slots: Vec<usize> = (0..N_USED)
-            .filter(|&j| sel[j] as usize >= lc.n_card)
-            .collect();
         let mut hsum = vec![0.0f32; n];
-        let mut host_slots = Vec::with_capacity(list.len());
         let hl = lc
             .host
             .ok_or_else(|| format!("layer {l}: no host view of a routed layer"))?;
         let xt = Tensor2::from_vec(n, 1, x.clone());
         hl.experts_into(R8Source::rows(split), &xt, &list, &mut hsum, &mut op.host)?;
-        for (i, &slot) in slots.iter().enumerate() {
-            host_slots.push(HostSlot {
-                slot,
-                h: op.host.par(i).data.clone(),
-                down: op.host.down(i).data.clone(),
-            });
-        }
 
         let card: [bool; N_USED] = std::array::from_fn(|j| (sel[j] as usize) < lc.n_card);
         let wv: [f32; N_USED] = std::array::from_fn(|j| if card[j] { weights[j] } else { 0.0 });
@@ -1239,7 +680,7 @@ mod gate {
             streams: st,
             fold,
         };
-        Ok((out, host_slots))
+        Ok(out)
     }
 
     // ------------------------------------------------------ the piece
@@ -1322,254 +763,6 @@ mod gate {
         })
     }
 
-    // ------------------------------------------------------- the bands
-
-    /// A pin per value (module doc): `pred`, our output minus ik's in exact
-    /// arithmetic from each side's own inputs, and `bound`, both sides' float
-    /// rounding around it.
-    struct Pred {
-        pred: Vec<f64>,
-        bound: Vec<f64>,
-    }
-
-    /// The largest `|(a - b) - pred| / bound` (0 where the gap is 0,
-    /// infinite where only the bound is).
-    fn gap_ratio(a: &[f32], b: &[f32], p: &Pred) -> f64 {
-        a.iter()
-            .zip(b)
-            .zip(p.pred.iter().zip(&p.bound))
-            .map(|((&x, &y), (&pr, &bd))| {
-                let gap = ((f64::from(x) - f64::from(y)) - pr).abs();
-                if gap == 0.0 {
-                    0.0
-                } else if bd > 0.0 {
-                    gap / bd
-                } else {
-                    f64::INFINITY
-                }
-            })
-            .fold(
-                0.0f64,
-                |m, r| if r.is_nan() { f64::INFINITY } else { m.max(r) },
-            )
-    }
-
-    /// `max|pred| / max|of|`: how large a difference the prediction carries.
-    fn pred_rel(p: &Pred, of: &[f32]) -> f64 {
-        let num = p.pred.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
-        let den = of.iter().fold(0.0f64, |m, &v| m.max(f64::from(v).abs()));
-        if den > 0.0 { num / den } else { num }
-    }
-
-    /// The host-side data the bands read at one layer: each routed expert's
-    /// down rows the sets use, and the shared down.
-    struct BandWeights {
-        down_ty: GgmlType,
-        /// Expert id to its down rows (`n_embd` rows of `ff`).
-        downs: Vec<(u32, Vec<f32>)>,
-        sh_ty: GgmlType,
-        sh_down: Vec<f32>,
-    }
-
-    fn band_weights(
-        split: &Split,
-        hp: &Hparams,
-        l: usize,
-        experts: &[u32],
-    ) -> Result<BandWeights, GateError> {
-        let (n, ff, ne) = (hp.n_embd, hp.experts.ff, hp.experts.n_expert as u64);
-        let down_name = names::ffn_down_exps(l);
-        let down_ty = tensor_type(split, &down_name)?;
-        let bytes = tensor(split, &down_name, down_ty, &[ff as u64, n as u64, ne])?;
-        let mut downs = Vec::with_capacity(experts.len());
-        for &e in experts {
-            downs.push((e, rows_f32(down_ty, bytes, e as usize * n, n, ff)?));
-        }
-        let sh_name = names::ffn_down_shexp(l);
-        let sh_ty = tensor_type(split, &sh_name)?;
-        let sb = tensor(split, &sh_name, sh_ty, &[ff as u64, n as u64])?;
-        Ok(BandWeights {
-            down_ty,
-            downs,
-            sh_ty,
-            sh_down: rows_f32(sh_ty, sb, 0, n, ff)?,
-        })
-    }
-
-    /// Our shared down's activation of `h` under a down weight of type `ty`
-    /// as the values its codes stand for, and the roundings on one term's
-    /// path through our dot and through ik's: q8_0 and Q5_K read f32, Q4_K
-    /// the q8_1 form (its f32 image one rounding more); ik reads q8_2_x4
-    /// under all three, a K-quant's decode one rounding more.
-    fn shared_down_rule(ty: GgmlType, h: &[f32]) -> Result<(Vec<f32>, f64, f64), GateError> {
-        let ff = h.len();
-        Ok(match ty {
-            GgmlType::Q8_0 => (h.to_vec(), n_ours(ff), n_ik_quant(ff)),
-            GgmlType::Q5_K => (h.to_vec(), n_ours(ff), n_ik_quant(ff) + KQ_DECODE),
-            GgmlType::Q4_K => (
-                q8_1_dequant(h, ff, 1),
-                n_ours(ff) + KQ_DECODE + Q8_IMAGE,
-                n_ik_quant(ff) + KQ_DECODE,
-            ),
-            _ => return Err(format!("a shared down of type {ty} has no rule here").into()),
-        })
-    }
-
-    /// The combine's pin per value (module doc), from our run `o` (its host
-    /// slots' rows in `hs`), ik's dump `d` and the down weights.
-    fn pred_y(
-        o: &Out,
-        hs: &[HostSlot],
-        d: &LayerDump,
-        bw: &BandWeights,
-        n_card: usize,
-    ) -> Result<Pred, GateError> {
-        let n = d.y.len();
-        let ff = d.sh_h.len();
-        let decode = if bw.down_ty == GgmlType::Q8_0 {
-            0.0
-        } else {
-            KQ_DECODE
-        };
-        let ik_n = n_ik_quant(ff) + decode;
-        // ik's format under the routed down; the host tier quantizes as ik
-        // does (qdot's q8_2_x4, the same codes).
-        let down_act = Rule::of(bw.down_ty)
-            .ok_or_else(|| format!("a routed down of type {} has no rule here", bw.down_ty))?
-            .ik;
-        let mut pred = vec![0.0f64; n];
-        let mut bound = vec![0.0f64; n];
-        // Per value: the magnitudes our card chain, the host's sum and ik's
-        // sum add, and those the gate's own f64 sums add.
-        let mut sum_o = vec![0.0f64; n];
-        let mut sum_host = vec![0.0f64; n];
-        let mut sum_k = vec![0.0f64; n];
-        let mut mag64 = vec![0.0f64; n];
-        let n_host = hs.len();
-        for j in 0..N_USED {
-            let e = o.ids[j];
-            let wd = bw
-                .downs
-                .iter()
-                .find(|(id, _)| *id == e)
-                .map(|(_, rows)| rows)
-                .ok_or_else(|| format!("expert {e}'s down rows were not read"))?;
-            let xi = down_act.reconstruct(&d.h[j * ff..(j + 1) * ff]);
-            let (wo, wk) = (f64::from(o.w[j]), f64::from(d.w[j]));
-            let dk = &d.down[j * n..(j + 1) * n];
-            let card = (o.sel[j] as usize) < n_card;
-            let (xo, own_n, dv): (Vec<f32>, f64, Vec<f32>) = if card {
-                (
-                    q8_1_dequant(&o.h[j * ff..(j + 1) * ff], ff, 1),
-                    n_ours(ff) + decode + Q8_IMAGE,
-                    o.down[j * n..(j + 1) * n].to_vec(),
-                )
-            } else {
-                let s = hs
-                    .iter()
-                    .find(|s| s.slot == j)
-                    .ok_or_else(|| format!("slot {j} is neither the card's nor the host's"))?;
-                (
-                    down_act.reconstruct(&s.h),
-                    n_ik_quant(ff) + decode,
-                    s.down.clone(),
-                )
-            };
-            let st = row_stats(wd, &xo, &xi)?;
-            for (dd, s) in st.iter().enumerate() {
-                pred[dd] += wo * s.ours - wk * s.ik;
-                bound[dd] += wo.abs() * own_n * U * s.abs_ours + wk.abs() * ik_n * U * s.abs_ik;
-                mag64[dd] += wo.abs() * s.abs_ours + wk.abs() * s.abs_ik;
-                let term = (wo * f64::from(dv[dd])).abs();
-                if card {
-                    sum_o[dd] += term;
-                } else {
-                    sum_host[dd] += term;
-                }
-                sum_k[dd] += (wk * f64::from(dk[dd])).abs();
-            }
-        }
-        let (xo, own_sh, ik_sh) = shared_down_rule(bw.sh_ty, &o.sh_h)?;
-        let st = row_stats(&bw.sh_down, &xo, &Act::Q8_2.reconstruct(&d.sh_h))?;
-        let (g_o, g_h, g_k) = (
-            gamma(n_card_slots(o, n_card) + 2),
-            gamma(2 * n_host.max(1)),
-            gamma(N_USED + 1),
-        );
-        let slack = (ff + N_USED + 2) as f64 * U64;
-        for (dd, s) in st.iter().enumerate() {
-            pred[dd] += s.ours - s.ik;
-            bound[dd] += own_sh * U * s.abs_ours
-                + ik_sh * U * s.abs_ik
-                + g_o * (sum_o[dd] + f64::from(o.hsum[dd]).abs() + f64::from(o.sh[dd]).abs())
-                + g_h * sum_host[dd]
-                + g_k * (sum_k[dd] + f64::from(d.sh[dd]).abs())
-                + slack * (mag64[dd] + s.abs_ours + s.abs_ik);
-        }
-        Ok(Pred { pred, bound })
-    }
-
-    fn n_card_slots(o: &Out, n_card: usize) -> usize {
-        o.sel.iter().filter(|&&p| (p as usize) < n_card).count()
-    }
-
-    /// The streams' pin per (stream, value), `[4][n]`, carried from the
-    /// combine's: HC_POST's exact difference at our combine as `yᵏ +
-    /// pred_y` has it.
-    fn pred_streams(o: &Out, d: &LayerDump, py: &Pred) -> Pred {
-        let n = d.y.len();
-        let (ho, hk) = (&o.hc, &d.hc);
-        let mut pred = vec![0.0f64; HC_STREAMS * n];
-        let mut bound = vec![0.0f64; HC_STREAMS * n];
-        for dd in 0..n {
-            let r = streams_at(&d.streams, n, dd);
-            let (yo, yk) = (f64::from(o.y[dd]), f64::from(d.y[dd]));
-            let y_pred = yk + py.pred[dd];
-            for i in 0..HC_STREAMS {
-                let (po, pk) = (f64::from(ho[4 + i]), f64::from(hk[4 + i]));
-                let mut p = po * y_pred - pk * yk;
-                let (mut mag_o, mut mag_k) = ((yo * po).abs(), (yk * pk).abs());
-                for (j, &rj) in r.iter().enumerate() {
-                    let (co, ck) = (f64::from(ho[8 + 4 * j + i]), f64::from(hk[8 + 4 * j + i]));
-                    let rj = f64::from(rj);
-                    p += (co - ck) * rj;
-                    mag_o += (co * rj).abs();
-                    mag_k += (ck * rj).abs();
-                }
-                pred[i * n + dd] = p;
-                bound[i * n + dd] = po.abs() * py.bound[dd]
-                    + gamma(5) * (mag_o + mag_k)
-                    + 16.0 * U64 * (mag_o + mag_k + (po * y_pred).abs());
-            }
-        }
-        Pred { pred, bound }
-    }
-
-    /// The fold's pin per value, carried from the streams'.
-    fn pred_fold(o: &Out, d: &LayerDump, ps: &Pred) -> Pred {
-        let n = d.y.len();
-        let (ho, hk) = (&o.hc, &d.hc);
-        let mut pred = vec![0.0f64; n];
-        let mut bound = vec![0.0f64; n];
-        for dd in 0..n {
-            let (so, sk) = (streams_at(&o.streams, n, dd), streams_at(&d.l_out, n, dd));
-            let (mut p, mut b) = (0.0f64, 0.0f64);
-            let (mut mag_o, mut mag_k, mut mag64) = (0.0f64, 0.0f64, 0.0f64);
-            for i in 0..HC_STREAMS {
-                let (po, pk) = (f64::from(ho[i]), f64::from(hk[i]));
-                let (ski, pi) = (f64::from(sk[i]), ps.pred[i * n + dd]);
-                p += po * (ski + pi) - pk * ski;
-                b += po.abs() * ps.bound[i * n + dd];
-                mag_o += (f64::from(so[i]) * po).abs();
-                mag_k += (ski * pk).abs();
-                mag64 += (po * (ski + pi)).abs();
-            }
-            pred[dd] = p;
-            bound[dd] = b + gamma(4) * (mag_o + mag_k) + 16.0 * U64 * (mag64 + mag_k);
-        }
-        Pred { pred, bound }
-    }
-
     // -------------------------------------------------------- structure
 
     /// Node counts by kind: kernels, memcpy, batch memory operations, other.
@@ -1587,9 +780,9 @@ mod gate {
         c
     }
 
-    fn inject(stream: &CudaStream, io: &mut Io, d: &LayerDump) -> Result<(), GateError> {
-        io.streams.copy_from_host(stream, &d.streams)?;
-        io.fold_in.copy_from_host(stream, &d.fold_in)?;
+    fn inject(stream: &CudaStream, io: &mut Io, s: &Seeded) -> Result<(), GateError> {
+        io.streams.copy_from_host(stream, &s.streams)?;
+        io.fold_in.copy_from_host(stream, &s.fold_in)?;
         Ok(())
     }
 
@@ -1804,7 +997,6 @@ mod gate {
     struct Tally {
         checks: u32,
         failed: u32,
-        waived: u32,
     }
 
     impl Tally {
@@ -1839,25 +1031,30 @@ mod gate {
             hp.experts.routed_scale,
             hp.hc.streams
         );
-        let sets: Vec<SetData> = SETS
-            .iter()
-            .map(|&s| set_data(s))
-            .collect::<Result<_, _>>()?;
 
-        // Every layer's dump ids first: the map is built from both sets.
+        // Every layer's routed ids on the seeded inputs first, from the op
+        // path's own norm and router: the map is built from them.
+        let mut op = Op::new(&gpu, &hp)?;
         let mut ids_per_layer: Vec<Vec<[u32; N_USED]>> = Vec::with_capacity(hp.n_layer);
         for l in 0..hp.n_layer {
-            let mut per = Vec::with_capacity(sets.len());
-            for set in &sets {
-                let topk = set.man.tensor(&format!("ffn_moe_topk-{l}"), 0)?;
-                let v = topk_ids_logical_within(&set.man, topk, u32::try_from(N_EXPERT)?)?;
-                let ids: [u32; N_USED] = v
-                    .iter()
-                    .map(|&i| i.cast_unsigned())
-                    .collect::<Vec<_>>()
-                    .try_into()
-                    .map_err(|_| format!("{}: layer {l} ids", set.name))?;
-                per.push(ids);
+            let w = layer_weights(stream, &split, l)?;
+            let mut per = Vec::with_capacity(SEEDS.len());
+            for seed in SEEDS {
+                let fold_in = DeviceBuffer::from_host(stream, &seeded(n, seed, l)?.fold_in)?;
+                route(&gpu, &mut op, &hp, &w, l, &fold_in)?;
+                let ids = op.rout.ids.to_host_vec(stream)?;
+                if let Some(bad) = ids.iter().find(|&&id| id as usize >= N_EXPERT) {
+                    return Err(format!(
+                        "seed {seed:#x}: layer {l}: the router picked expert {bad}, past the file's {N_EXPERT}"
+                    )
+                    .into());
+                }
+                per.push(<[u32; N_USED]>::try_from(ids).map_err(|v| {
+                    format!(
+                        "seed {seed:#x}: layer {l}: the router wrote {} ids",
+                        v.len()
+                    )
+                })?);
             }
             ids_per_layer.push(per);
         }
@@ -1874,7 +1071,6 @@ mod gate {
         let tier = host_run(Arc::new(Split::open(&path)?), &hp, 0..hp.n_layer, r8)?;
         let mut hybrid = Hybrid::new(boundary, map.clone(), tier, hp.n_layer)?;
         let mut piece = FfnPiece::new(&gpu, &hp, &map)?;
-        let mut op = Op::new(&gpu, &hp)?;
         let mut io = Io {
             streams: DeviceBuffer::zeroed(stream, HC_STREAMS * n)?,
             fold_in: DeviceBuffer::zeroed(stream, n)?,
@@ -1914,32 +1110,9 @@ mod gate {
             } else {
                 Some(upload_stacks(&split, stream, &hp, l, &cards[l])?)
             };
-            let dumps: Vec<LayerDump> = sets
-                .iter()
-                .map(|s| layer_dump(s, &hp, l))
-                .collect::<Result<_, _>>()?;
             let fold = piece
                 .folds(l)
                 .ok_or_else(|| format!("layer {l} is outside the piece"))?;
-            for (set, d) in sets.iter().zip(&dumps) {
-                if d.fold_out.is_some() != fold {
-                    return Err(format!(
-                        "{}: layer {l}: the piece {} and the dump's next sub-layer {}",
-                        set.name,
-                        if fold {
-                            "folds"
-                        } else {
-                            "ends with HC_POST alone"
-                        },
-                        if d.fold_out.is_some() {
-                            "reads l_out"
-                        } else {
-                            "does not read l_out"
-                        }
-                    )
-                    .into());
-                }
-            }
             let row = map
                 .row_offset(l)
                 .and_then(|at| stage.get(at..at + hp.experts.n_expert))
@@ -1953,26 +1126,17 @@ mod gate {
                 host: host_layers[l].as_ref(),
                 fold,
             };
-            let mut used: Vec<u32> = dumps.iter().flat_map(|d| d.ids).collect();
-            used.sort_unstable();
-            used.dedup();
-            let bw = band_weights(&split, &hp, l, &used)?;
-            let bias = f32_buf(&w, &names::exp_probs_b(l))?.to_host_vec(stream)?;
-            let mut eager = Vec::with_capacity(sets.len());
-            for (set, d) in sets.iter().zip(&dumps) {
-                inject(stream, &mut io, d)?;
+            let inputs: Vec<Seeded> = SEEDS
+                .iter()
+                .map(|&s| seeded(n, s, l))
+                .collect::<Result<_, _>>()?;
+            let mut eager = Vec::with_capacity(inputs.len());
+            for (seed, input) in SEEDS.iter().zip(&inputs) {
+                inject(stream, &mut io, input)?;
                 let got = run_piece(&gpu, &mut piece, &mut hybrid, &mut io, &lc)?;
-                let (want, host_slots) =
-                    op_path(&gpu, &mut op, &split, &hp, &lc, &io.streams, &io.fold_in)?;
+                let want = op_path(&gpu, &mut op, &split, &hp, &lc, &io.streams, &io.fold_in)?;
                 let diff = first_diff(&got, &want);
-                let op_ok = diff == "-";
-
-                // 3. Against the dump.
-                let margin = tie_margin(d, &got.logits, &bias, &got.probs);
-                let ids_eq = got.ids == d.ids;
-                let x_rel = rel_max(&got.x, &d.x);
-                let x_near = x_within(&got.x, &d.x, norm_band(n));
-                let waived = !ids_eq && margin <= 1.0 && x_near;
+                let pass = diff == "-";
                 let kind = if lc.n_card > 0 {
                     format!("card={}", lc.n_card)
                 } else {
@@ -1989,61 +1153,20 @@ mod gate {
                         }
                     })
                     .collect();
-                if !ids_eq {
-                    // Other experts than the dump's: the pins below would
-                    // compare different sums, so the line ends here.
-                    if waived {
-                        tally.waived += 1;
-                    }
-                    let pass = waived && op_ok;
-                    println!(
-                        "ffn set={} L={l} {kind} ids={:?} ik_ids={:?} tie_margin={margin:.3e} \
-                         x_near={x_near} x_ik_rel={x_rel:.3e} op_path_bit={op_ok} first_diff={diff} \
-                         — {} {}",
-                        set.name,
-                        got.ids,
-                        d.ids,
-                        if waived {
-                            "near tie: ids and bands waived"
-                        } else {
-                            "the ids differ from the dump's"
-                        },
-                        verdict(pass)
-                    );
-                    tally.add(pass);
-                    eager.push(got);
-                    continue;
-                }
-                let py = pred_y(&got, &host_slots, d, &bw, lc.n_card)?;
-                let ps = pred_streams(&got, d, &py);
-                let y_ratio = gap_ratio(&got.y, &d.y, &py);
-                let s_ratio = gap_ratio(&got.streams, &d.l_out, &ps);
-                let (f_ratio, f_text) = match (&got.fold, &d.fold_out) {
-                    (Some(f), Some(fk)) => {
-                        let r = gap_ratio(f, fk, &pred_fold(&got, d, &ps));
-                        (r, format!("{r:.3e}"))
-                    }
-                    _ => (0.0, "-".to_string()),
-                };
-                let pass = op_ok && ids_eq && y_ratio <= 1.0 && s_ratio <= 1.0 && f_ratio <= 1.0;
+                // PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; no fixture set carries this clause
                 println!(
-                    "ffn set={} L={l} {kind} form={} places={} op_path_bit={op_ok} first_diff={diff} \
-                     | ids_eq={ids_eq} tie_margin={margin:.3e} x_ik_rel={x_rel:.3e} | y_gap_ratio={y_ratio:.3e} \
-                     y_pred_rel={:.3e} y_ik_rel={:.3e} streams_gap_ratio={s_ratio:.3e} \
-                     streams_ik_rel={:.3e} fold_gap_ratio={f_text} {}",
-                    set.name,
+                    "ffn seed={seed:#x} L={l} {kind} form={} places={} ids={:?} op_path_bit={pass} \
+                     first_diff={diff} {}",
                     if fold { "post+fold" } else { "post" },
                     places.join(","),
-                    pred_rel(&py, &d.y),
-                    rel_max(&got.y, &d.y),
-                    rel_max(&got.streams, &d.l_out),
+                    got.ids,
                     verdict(pass)
                 );
                 tally.add(pass);
                 eager.push(got);
             }
 
-            // Structure: capture, replay per set with the host serving.
+            // Structure: capture, replay per seed with the host serving.
             let g = gpu.capture(|_| {
                 hybrid.begin_chain(stream)?;
                 enqueue(&gpu, &mut piece, &mut hybrid, &mut io, &lc)
@@ -2055,8 +1178,8 @@ mod gate {
             // The piece copies nothing: its handoff launch writes the page.
             let want = [want_kernels, 0, 2, 0];
             let mut replay_eq = true;
-            for si in (0..sets.len()).rev() {
-                inject(stream, &mut io, &dumps[si])?;
+            for si in (0..inputs.len()).rev() {
+                inject(stream, &mut io, &inputs[si])?;
                 g.launch(stream)?;
                 hybrid.serve_captured()?;
                 stream.synchronize()?;
@@ -2085,13 +1208,12 @@ mod gate {
         let stats = hybrid.stats();
         let pass = tally.failed == 0;
         println!(
-            "gate_deepseek41_chain_ffn: {} checks across {} sets and {} layers, {} failed, {} \
-             waived (near tie) — host served {} layers, {} slots — {}",
+            "gate_deepseek41_chain_ffn: {} checks across {} seeds and {} layers, {} failed — \
+             host served {} layers, {} slots — {}",
             tally.checks,
-            sets.len(),
+            SEEDS.len(),
             hp.n_layer,
             tally.failed,
-            tally.waived,
             stats.served,
             stats.host_slots,
             verdict(pass)

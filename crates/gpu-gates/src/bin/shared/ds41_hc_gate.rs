@@ -1,47 +1,22 @@
 //! GPU gate for the DeepSeek-V4.1 hyper-connections
 //! (`bloomery_gpu_deepseek41::hc`): the chain RMS + split-K q3_K gemv +
-//! HC_PRE, HC_POST with the next input fold, and the fold alone, at every
-//! sub-layer the V4.1 oracle sets hold — the 5-token prefill set (T = 5) and
-//! the decode-step sets (T = 1).
+//! HC_PRE, HC_POST with the next input fold, and the fold alone, on every
+//! sub-layer's own q3_K hyper-connection weights from the model file over
+//! seeded streams (`hc_host::lcg`) of 5 tokens and of 1 token.
 //!
 //! PIN(2026-09-24): removed — the engine never runs `ds41_hc_pre_mix` (HC_PRE alone) or `ds41_hc_post_streams` (HC_POST alone); the kernels are gone with their checks.
 //!
-//! Three comparisons per op, the `gate_p4` form:
-//! 1. **Kernel vs the host transcription of our rule** — bit-identical, and
-//!    a rerun bit-identical. The rule is the module doc of `hc.rs`; the
-//!    transcription walks the kernel's lanes, butterflies and piece order.
-//!    HC_PRE's `exp` is f64 rounded to f32 on both sides.
-//! 2. **ik's rule on the host vs the dump** — bit-identical. This proves the
-//!    semantics: which streams feed the norm, which `pre` folds which
-//!    streams (the lag), the output layout, where the multiply-adds fuse.
-//!    ik's `exp` is glibc's `expf` (the host's `f32::exp`).
-//! 3. **Kernel vs the dump** — HC_POST and the folds bit-identical (our rule
-//!    is ik's there). The chain differs from ik's by rule: our gemv reads the raw streams
-//!    quantized to q8_1 per 128 values and scales its result, ik's reads the
-//!    normalized streams quantized to q8_K per 256. That difference is
-//!    predicted per (token, row) in exact arithmetic from the dump's own
-//!    inputs — `pred = s_ik · W·Q(x) - W·Q_K(xn)`, `s_ik` ik's RMS scale,
-//!    `Q` our quantizer (pinned to `bloomery_gpu`'s below), `Q_K` ik's — and
-//!    the measured difference minus `pred` must lie inside the rounding bound
-//!    of the two float paths: our scale's distance from ik's, `gamma_n ·
-//!    sum|terms|` for our sum order, and the same for ik's (iqk's
-//!    `DequantizerQ3K`: one integer sum per super-block, the code offset `-4`
-//!    as its own float term).
-//!    HC_PRE's prediction is the f64 rule at the predicted mixes; the bound
-//!    around it is the mix bound carried through HC_PRE to first order (the
-//!    larger one-sided secant per mix, summed) plus each side's f32 rounding
-//!    against the f64 rule at its own mixes. A ratio `|gap| / bound` above 1
-//!    fails.
+//! The kernel against the host transcription of our rule, the `gate_p4`
+//! form: the chain, HC_PRE, HC_POST and the fold alone are bit-identical to
+//! it, and a rerun is bit-identical. The rule is the module doc of `hc.rs`;
+//! the transcription walks the kernel's lanes, butterflies and piece order.
+//! HC_PRE's `exp` is f64 rounded to f32 on both sides.
 //!
 //! Cross-checks with the crate's own kernels: the streams are quantized by
 //! `bloomery_gpu`'s `q3k_quantize_q8_1` into a `Q8Act` at K = 20480, whose
 //! q3 words and block scales must equal this transcription's, and its
 //! unsplit `q3k_gemv` must agree with the split-K sum within `KERNEL_BAND`
 //! (a different sum order).
-//!
-//! The fold alone is also checked on engram's own streams (`engram_out`)
-//! against the dump: before an engram layer the chain's MoE sub-layer ends
-//! with HC_POST alone and the glue folds the gated streams.
 //!
 //! The fault word (`bloomery_gpu::fault`): the chain's in-register q8_1 of
 //! the streams has no form for a non-finite value, so a planted NaN in one
@@ -61,13 +36,10 @@
 //! at 0), a captured graph of one node replayed twice to the eager launch,
 //! and a NaN, or a finite `1e20`, in one token's streams makes all 48 of that
 //! token's outputs NaN, raises `F32Product`, and leaves every other token's
-//! bits. It runs before the model file opens,
-//! so it judges on a box without the V4.1 sets too.
+//! bits. It runs before the model file opens.
 //!
-//! Holes, named: the T = 1 paths (ik's own HC_POST branch for one token)
-//! come only from the decode-step sets, read when they are on the box and
-//! named when they are not; `ds41_hc_pre` takes at most 8 tokens a launch,
-//! so a longer prefill is split by its caller and no set covers that split.
+//! Hole, named: `ds41_hc_pre` takes at most 8 tokens a launch, so a longer
+//! prefill is split by its caller and nothing here covers that split.
 
 use bloomery_gpu::fused::readback_q8act;
 use bloomery_gpu::{
@@ -78,25 +50,23 @@ use bloomery_gpu_deepseek41::hc::{
     HcPreScratch, HcQ8Params, HcQ8PreArgs,
 };
 use bloomery_gpu_gates::act_rule;
-use bloomery_gpu_gates::hc_host::{
-    self, exp_ik, exp_ours, hc_chain_q8_0, hc_pre_f32, lcg, q8_0_fixture,
-};
-use bloomery_gpu_gates::ik_norm;
-use bloomery_gpu_gates::oracle::deepseek41::{D1, D1_UNFUSED, D2, D2_UNFUSED, STEP4};
-use bloomery_gpu_gates::oracle::{self, Set};
-use bloomery_gpu_gates::rounding::{U64, butterfly, gamma};
+use bloomery_gpu_gates::hc_host::{self, exp_ours, hc_chain_q8_0, hc_pre_f32, lcg, q8_0_fixture};
+use bloomery_gpu_gates::rounding::butterfly;
 use bloomery_gpu_gates::{
-    GateError, KERNEL_BAND, RefManifest, RefRow, bits_equal, bytes_to_words, checks_failed,
-    max_rel_err, ref_dir_named, ref_model_path, ref_tensor_of_in, tensor_bytes_as, verdict,
+    GateError, KERNEL_BAND, bits_equal, bytes_to_words, checks_failed, max_rel_err, ref_model_path,
+    tensor_bytes_as, verdict,
 };
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use gguf::quant::{GgmlType, dequant_row, half_to_f32};
-use model::arch::Arch;
 
-/// The decode-step sets this gate reads, each when present (T = 1): the
-/// table's (`step_sets`) but d1n.
-const STEP_SETS: [&str; 5] = [STEP4, D1, D1_UNFUSED, D2, D2_UNFUSED];
+/// The token counts every sub-layer runs at: a prefill batch and a decode
+/// step.
+const SWEEP_TOKENS: [usize; 2] = [5, 1];
+/// The sub-layer the graph and fault clauses run on, layer 2's attention,
+/// and their token count.
+const PROBE_LAYER: usize = 2;
+const PROBE_TOKENS: usize = 5;
 /// Bytes of one q3_K super-block.
 const Q3K_SB: usize = 110;
 // The host rule's layout is the kernels'.
@@ -143,58 +113,9 @@ impl Hp {
     }
 }
 
-// ------------------------------------------------------------ ik's rules
+// ----------------------------------------------------------- the host rule
 
-/// HC_PRE in f64 throughout: the reference the chain's bound is carried
-/// through.
-fn hc_pre_f64(mix: &[f64], sc: [f64; 3], base: &[f64], eps: f64, iters: u32) -> [f64; HC_MIX] {
-    let sigmoid = |i: usize, s: f64| 1.0 / (1.0 + (-(mix[i] * s + base[i])).exp());
-    let mut out = [0.0f64; HC_MIX];
-    let (head, comb) = out.split_at_mut(2 * HC_STREAMS);
-    let (pre, post) = head.split_at_mut(HC_STREAMS);
-    for (i, (p, q)) in pre.iter_mut().zip(post.iter_mut()).enumerate() {
-        *p = sigmoid(i, sc[0]) + eps;
-        *q = 2.0 * sigmoid(HC_STREAMS + i, sc[1]);
-    }
-    let mut m = [0.0f64; 16];
-    for (k, mk) in m.iter_mut().enumerate() {
-        *mk = mix[8 + k] * sc[2] + base[8 + k];
-    }
-    for row in m.as_chunks_mut::<4>().0 {
-        let mx = row.iter().copied().fold(f64::MIN, f64::max);
-        let mut sum = 0.0;
-        for v in row.iter_mut() {
-            *v = (*v - mx).exp();
-            sum += *v;
-        }
-        for v in row.iter_mut() {
-            *v = *v / sum + eps;
-        }
-    }
-    let col = |m: &mut [f64; 16]| {
-        let mut s = [eps; 4];
-        for (c, sc) in s.iter_mut().enumerate() {
-            *sc += m[c] + m[4 + c] + m[8 + c] + m[12 + c];
-        }
-        for (k, v) in m.iter_mut().enumerate() {
-            *v /= s[k % 4];
-        }
-    };
-    col(&mut m);
-    for _ in 1..iters {
-        for row in m.as_chunks_mut::<4>().0 {
-            let s = eps + row[0] + row[1] + row[2] + row[3];
-            for v in row.iter_mut() {
-                *v /= s;
-            }
-        }
-        col(&mut m);
-    }
-    comb.copy_from_slice(&m);
-    out
-}
-
-/// HC_POST of one value, ours and ik's: `fma(x, post_i, comb_0i r_0)`,
+/// HC_POST of one value: `fma(x, post_i, comb_0i r_0)`,
 /// then `fma(comb_ji, r_j, .)` for j = 1..3.
 fn post_elem(x: f32, r: [f32; 4], hc: &[f32]) -> [f32; 4] {
     let mut o = [0.0f32; 4];
@@ -250,18 +171,6 @@ fn fold_host(s: &[f32], hc: &[f32], n: usize, t: usize) -> Vec<f32> {
         *yi = fold_elem(streams_at(s, n, tt, d), &hc[tt * HC_MIX..tt * HC_MIX + 4]);
     }
     y
-}
-
-/// An HC_PRE node's output (`[pre S T][post S T][comb S S T]`, ik's
-/// layout) in the kernel's layout, `[t][pre, post, comb]`.
-fn node_to_hc(node: &[f32], t: usize) -> Vec<f32> {
-    let mut hc = vec![0.0f32; HC_MIX * t];
-    for (tt, h) in hc.as_chunks_mut::<HC_MIX>().0.iter_mut().enumerate() {
-        h[..4].copy_from_slice(&node[4 * tt..4 * tt + 4]);
-        h[4..8].copy_from_slice(&node[4 * t + 4 * tt..4 * t + 4 * tt + 4]);
-        h[8..].copy_from_slice(&node[8 * t + 16 * tt..8 * t + 16 * tt + 16]);
-    }
-    hc
 }
 
 // ---------------------------------------------- our chain, transcribed
@@ -407,142 +316,6 @@ fn q8act_matches(q3: &[u64], d8: &[f32], ch: &Chain, k: usize, t: usize) -> bool
     d8_ok && q3_ok
 }
 
-// ------------------------------------------------ the chain's prediction
-
-/// Per (token, row) of the chain: the predicted difference of our rule
-/// from ik's in exact arithmetic, and the bound on the float rounding of
-/// both paths around it.
-struct MixPrediction {
-    pred: Vec<f64>,
-    bound: Vec<f64>,
-}
-
-/// The inputs of [`predict_mix`] that come from the dump: the streams and
-/// ik's norm output, `k` values per token.
-struct DumpIn<'a> {
-    x: &'a [f32],
-    xn: &'a [f32],
-    k: usize,
-    rms_eps: f32,
-}
-
-/// The module doc's prediction. Every product below is exact in f64 (a
-/// weight has at most 20 significant bits, a code times its scale 32);
-/// the f64 sums add at most `4 k u64` of their magnitudes, kept in the
-/// bound.
-fn predict_mix(p: &SiteParams, ch: &Chain, dump: &DumpIn<'_>) -> MixPrediction {
-    let k = dump.k;
-    let (np, n_sb, t) = (k / HC_PIECE, k / 256, dump.x.len() / k);
-    // Our scale against ik's: our f32 sum of squares runs 16 fused
-    // multiply-adds per lane, 5 butterfly levels and np - 1 piece sums;
-    // ik rounds each square once. Both round the mean and the `+ eps`
-    // once each (5 more), then the square root and the reciprocal.
-    let delta_s = gamma(16 + 5 + (np - 1) + 5) / 2.0 + gamma(4);
-    // Our mix: a block's integer dot is exact; then `dd`, the product,
-    // the fused multiply-add, the add, np - 1 piece sums and the scale.
-    // ik's: one product per term, one fused accumulation per super-block
-    // into each of two accumulators, their sum and a 3-level horizontal
-    // sum.
-    let (g_ours, g_ik) = (gamma(np + 4), gamma(n_sb + 6));
-    let slack = 4.0 * k as f64 * U64;
-    let mut pred = vec![0.0f64; t * HC_MIX];
-    let mut bound = vec![0.0f64; t * HC_MIX];
-    for tt in 0..t {
-        let s = f64::from(ik_norm::scale(&dump.x[tt * k..(tt + 1) * k], dump.rms_eps));
-        let ours: Vec<f64> = (tt * k..(tt + 1) * k)
-            .map(|j| f64::from(ch.q8[j]) * f64::from(ch.d8[j / 128]))
-            .collect();
-        let theirs = act_rule::q8k_exact(&dump.xn[tt * k..(tt + 1) * k]);
-        for r in 0..HC_MIX {
-            let (w, w_ik) = (&p.w[r * k..(r + 1) * k], &p.w_ik[r * k..(r + 1) * k]);
-            let (mut a, mut abs_a, mut b, mut mag_b) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
-            for (((&wi, &wki), &oi), &ti) in w.iter().zip(w_ik).zip(&ours).zip(&theirs) {
-                a += wi * oi;
-                abs_a += (wi * oi).abs();
-                b += wi * ti;
-                mag_b += wki * ti.abs();
-            }
-            let o = tt * HC_MIX + r;
-            pred[o] = s * a - b;
-            bound[o] = delta_s * s * a.abs()
-                + g_ours * s * (1.0 + delta_s) * abs_a
-                + g_ik * mag_b
-                + slack * (s * abs_a + mag_b);
-        }
-    }
-    MixPrediction { pred, bound }
-}
-
-/// Per (token, output) of HC_PRE: the prediction `f(m_d + pred) - f(m_d)`
-/// of the f64 rule `f`, and the bound around it (module doc).
-fn predict_hc(
-    m_d: &[f32],
-    m_k: &[f32],
-    mp: &MixPrediction,
-    p: &SiteParams,
-    hp: &Hp,
-) -> (Vec<f64>, Vec<f64>) {
-    let sc = p.scale.map(f64::from);
-    let base: Vec<f64> = p.base.iter().map(|&v| f64::from(v)).collect();
-    let f = |m: &[f64]| hc_pre_f64(m, sc, &base, f64::from(hp.eps), hp.iters);
-    let mut pred = Vec::with_capacity(m_d.len());
-    let mut bound = Vec::with_capacity(m_d.len());
-    for (tt, (md32, mk32)) in m_d
-        .as_chunks::<HC_MIX>()
-        .0
-        .iter()
-        .zip(m_k.as_chunks::<HC_MIX>().0)
-        .enumerate()
-    {
-        let at = tt * HC_MIX..(tt + 1) * HC_MIX;
-        let md: Vec<f64> = md32.iter().map(|&v| f64::from(v)).collect();
-        let mp_at: Vec<f64> = md
-            .iter()
-            .zip(&mp.pred[at.clone()])
-            .map(|(a, b)| a + b)
-            .collect();
-        let (f_d, f_p) = (f(&md), f(&mp_at));
-        let mut sec = [0.0f64; HC_MIX];
-        for (r, &b) in mp.bound[at].iter().enumerate() {
-            let (mut up, mut dn) = (mp_at.clone(), mp_at.clone());
-            up[r] += b;
-            dn[r] -= b;
-            let (fu, fd) = (f(&up), f(&dn));
-            for (o, s) in sec.iter_mut().enumerate() {
-                *s += (fu[o] - f_p[o]).abs().max((fd[o] - f_p[o]).abs());
-            }
-        }
-        let mk: Vec<f64> = mk32.iter().map(|&v| f64::from(v)).collect();
-        let f_k = f(&mk);
-        let k32 = hc_pre_f32(mk32, p.scale, &p.base, hp.eps, hp.iters, exp_ours);
-        let d32 = hc_pre_f32(md32, p.scale, &p.base, hp.eps, hp.iters, exp_ik);
-        for (o, s) in sec.iter().enumerate() {
-            pred.push(f_p[o] - f_d[o]);
-            bound.push(s + (f64::from(k32[o]) - f_k[o]).abs() + (f64::from(d32[o]) - f_d[o]).abs());
-        }
-    }
-    (pred, bound)
-}
-
-/// The largest `|(a - b) - pred| / bound`.
-fn gap_ratio(a: &[f32], b: &[f32], pred: &[f64], bound: &[f64]) -> f64 {
-    a.iter()
-        .zip(b)
-        .zip(pred.iter().zip(bound))
-        .map(|((&x, &y), (&p, &bd))| {
-            let gap = ((f64::from(x) - f64::from(y)) - p).abs();
-            if gap == 0.0 { 0.0 } else { gap / bd }
-        })
-        .fold(0.0f64, f64::max)
-}
-
-/// `max|v| / max|of|`.
-fn rel_to(v: impl Iterator<Item = f64>, of: &[f32]) -> f64 {
-    let num = v.fold(0.0f64, |m, x| m.max(x.abs()));
-    let den = of.iter().fold(0.0f64, |m, &x| m.max(f64::from(x).abs()));
-    num / den
-}
-
 // ------------------------------------------------------------ the sites
 
 /// One sub-layer's parameters from the file, host and device.
@@ -550,11 +323,6 @@ struct SiteParams {
     scale: [f32; 3],
     base: Vec<f32>,
     sbs: Vec<Q3Sb>,
-    /// Every weight, `[row][k]`, exactly (ggml's dequantized value).
-    w: Vec<f64>,
-    /// Per weight, the magnitude ik's dot sums it at: `|d sc| (q + 8)`,
-    /// the code offset by 4 in integers plus the `-4` term apart.
-    w_ik: Vec<f64>,
     w_dev: DeviceTensor<u32>,
     scale_dev: DeviceBuffer<f32>,
     base_dev: DeviceBuffer<f32>,
@@ -595,8 +363,6 @@ fn site_params(
     )?);
     let (n_sb, row_bytes) = (k / 256, k / 256 * Q3K_SB);
     let sbs: Vec<Q3Sb> = wb.as_chunks::<Q3K_SB>().0.iter().map(q3k_sb).collect();
-    let mut w = Vec::with_capacity(HC_MIX * k);
-    let mut w_ik = Vec::with_capacity(HC_MIX * k);
     let mut row = vec![0.0f32; k];
     for (r, rb) in wb.chunks_exact(row_bytes).enumerate() {
         dequant_row(GgmlType::Q3_K, rb, &mut row)?;
@@ -612,8 +378,6 @@ fn site_params(
                 )
                 .into());
             }
-            w.push(exact);
-            w_ik.push((f64::from(s.d) * f64::from(sc)).abs() * f64::from(q + 8));
         }
     }
     Ok(SiteParams {
@@ -623,129 +387,17 @@ fn site_params(
         base_dev: DeviceBuffer::from_host(stream, &base)?,
         base,
         sbs,
-        w,
-        w_ik,
     })
 }
 
-/// The manifest rows of one sub-layer's hyper-connection.
-struct Site<'m> {
-    layer: usize,
-    ffn: bool,
-    node: &'m RefRow,
-    mixes: &'m RefRow,
-    rms: &'m RefRow,
-    streams: &'m RefRow,
-    x: &'m RefRow,
-    post: &'m RefRow,
-    /// The fold of `post` by the next sub-layer's `pre`, when that fold
-    /// reads `post` itself. `None` before an engram layer (it rewrites
-    /// `post` first) and after the last layer (the head folds): there the
-    /// boundary takes HC_POST alone and the fold is a lone launch.
-    fold: Option<&'m RefRow>,
+fn sub_name(ffn: bool) -> &'static str {
+    if ffn { "ffn" } else { "attn" }
 }
 
-impl Site<'_> {
-    fn sub(&self) -> &'static str {
-        if self.ffn { "ffn" } else { "attn" }
-    }
-}
-
-fn src0(r: &RefRow) -> &str {
-    r.src0.as_deref().unwrap_or("")
-}
-
-/// Every sub-layer's rows, found by what each node reads — the HC_PRE
-/// node by its mixes and scale, the norm by the mixes' name, the streams
-/// by the norm's input — and proven by type, dims and op.
-fn sites<'m>(man: &'m RefManifest, hp: &Hp, t: u64) -> Result<Vec<Site<'m>>, GateError> {
-    let (n, k) = (hp.n_embd as u64, hp.k() as u64);
-    let mut out = Vec::with_capacity(2 * hp.n_layers);
-    for layer in 0..hp.n_layers {
-        for (occ, sub) in [(0u32, "attn"), (1u32, "ffn")] {
-            let mixes_name = format!("hc_pre_mixes-{layer}");
-            let scale_name = format!("blk.{layer}.hc_{sub}_scale.weight");
-            let node = man
-                .tensors
-                .iter()
-                .find(|r| {
-                    r.op == "HC_PRE"
-                        && src0(r) == mixes_name
-                        && r.src1.as_deref() == Some(scale_name.as_str())
-                })
-                .ok_or_else(|| format!("no HC_PRE node reads {mixes_name} with {scale_name}"))?;
-            node.expect(&node.name, "f32", [24 * t, 1, 1, 1], "HC_PRE")?;
-            let mixes = man.tensor(&mixes_name, occ)?;
-            mixes.expect(&mixes_name, "f32", [24, t, 1, 1], "MUL_MAT")?;
-            if src0(mixes) != format!("blk.{layer}.hc_{sub}_fn.weight") {
-                return Err(
-                    format!("{mixes_name}/{occ} reads {}, not hc_{sub}_fn", src0(mixes)).into(),
-                );
-            }
-            let rms = man.tensor(&format!("hc_pre-{layer}"), occ)?;
-            rms.expect(&rms.name, "f32", [k, t, 1, 1], "RMS_NORM")?;
-            let s_name = src0(rms)
-                .strip_suffix(" (reshaped)")
-                .ok_or_else(|| format!("hc_pre-{layer}/{occ} reads {}", src0(rms)))?;
-            let streams = man.tensor(s_name, 0)?;
-            streams.expect(s_name, "f32", [n, 4, t, 1], "in")?;
-            let (x_name, post_name) = if occ == 0 {
-                (format!("attn_out-{layer}"), format!("hc_attn_post-{layer}"))
-            } else {
-                (format!("ffn_out-{layer}"), format!("l_out-{layer}"))
-            };
-            let x = man.tensor(&x_name, 0)?;
-            x.expect(&x_name, "f32", [n, t, 1, 1], "in")?;
-            let post = man.tensor(&post_name, 0)?;
-            post.expect(&post_name, "f32", [n, 4, t, 1], "HC_POST")?;
-            if src0(post) != x_name {
-                return Err(format!("{post_name} reads {}, not {x_name}", src0(post)).into());
-            }
-            let fold_name = if occ == 0 {
-                Some(format!("hc_ffn_pre-{layer}"))
-            } else if layer + 1 < hp.n_layers {
-                Some(format!("hc_attn_pre-{}", layer + 1))
-            } else {
-                None
-            };
-            let fold = match fold_name {
-                Some(f) => {
-                    let r = man.tensor(&f, 0)?;
-                    r.expect(&f, "f32", [n, t, 1, 1], "MUL_MULTI_ADD")?;
-                    let engram = format!("engram_out-{}", layer + 1);
-                    if src0(r) == post_name {
-                        Some(r)
-                    } else if src0(r) == engram {
-                        None
-                    } else {
-                        return Err(format!(
-                            "{f} reads {}, neither {post_name} nor {engram}",
-                            src0(r)
-                        )
-                        .into());
-                    }
-                }
-                None => None,
-            };
-            out.push(Site {
-                layer,
-                ffn: occ == 1,
-                node,
-                mixes,
-                rms,
-                streams,
-                x,
-                post,
-                fold,
-            });
-        }
-    }
-    Ok(out)
-}
-
-/// Tokens of a set: the third dim of `hc_init` (`[n, 4, T]`).
-fn tokens_of(man: &RefManifest) -> Result<usize, GateError> {
-    Ok(usize::try_from(man.tensor("hc_init", 0)?.ne[2])?)
+/// The seed of a site's streams at `t` tokens: its sub-layer's index and
+/// `t` apart, so no two sites share an input.
+fn site_seed(layer: usize, ffn: bool, t: usize) -> Result<u32, GateError> {
+    Ok(1000 + 100 * u32::try_from(layer)? + 10 * u32::from(ffn) + u32::try_from(t)?)
 }
 
 // --------------------------------------------------------------- driver
@@ -759,49 +411,29 @@ struct Ctx<'a> {
     ok: bool,
 }
 
-/// What `check_site` hands on: the kernel's fold of HC_POST's streams and
-/// the dump's HC_PRE output, kernel layout.
-struct SiteOut {
-    fold: Vec<f32>,
-    hc: Vec<f32>,
-}
-
-/// Every check of one site; prints its two lines.
+/// Every check of one site at `t` tokens of seeded streams; prints its
+/// lines.
 fn check_site(
     cx: &mut Ctx<'_>,
-    man: &RefManifest,
-    set: &str,
-    site: &Site<'_>,
+    params: &SiteParams,
+    layer: usize,
+    ffn: bool,
     t: usize,
-) -> Result<SiteOut, GateError> {
+) -> Result<(), GateError> {
     let (hp, stream) = (cx.hp, cx.gpu.stream());
     let (n, k) = (hp.n_embd, hp.k());
-    let params = site_params(cx.split, stream, site.layer, site.sub(), k)?;
-    let load = |r: &RefRow| ref_tensor_of_in(&man.dir, r);
-    let streams = load(site.streams)?;
-    let xn = load(site.rms)?;
-    let mix_d = load(site.mixes)?;
-    let hc_d = node_to_hc(&load(site.node)?, t);
-
-    // 2. ik's rule vs the dump: the norm and HC_PRE.
-    let rms_h: Vec<f32> = streams
-        .chunks_exact(k)
-        .flat_map(|c| {
-            let s = ik_norm::scale(c, hp.rms_eps);
-            c.iter().map(move |&v| v * s)
-        })
-        .collect();
-    let rms_bit = bits_equal(&rms_h, &xn);
-    let pre_of = |m: &[f32], exp: fn(f32) -> f32| -> Vec<f32> {
+    let seed = site_seed(layer, ffn, t)?;
+    let streams = lcg(k * t, seed);
+    let x = lcg(n * t, seed + 3);
+    let pre_of = |m: &[f32]| -> Vec<f32> {
         m.as_chunks::<HC_MIX>()
             .0
             .iter()
-            .flat_map(|mt| hc_pre_f32(mt, params.scale, &params.base, hp.eps, hp.iters, exp))
+            .flat_map(|mt| hc_pre_f32(mt, params.scale, &params.base, hp.eps, hp.iters, exp_ours))
             .collect()
     };
-    let pre_ik_bit = bits_equal(&pre_of(&mix_d, exp_ik), &hc_d);
 
-    // 1. The chain kernel vs our rule, and a rerun.
+    // The chain kernel vs our rule, and a rerun.
     let x_dev = DeviceBuffer::from_host(stream, &streams)?;
     let p = HcParams {
         w: &params.w_dev,
@@ -829,8 +461,9 @@ fn check_site(
     let rerun = bits_equal(&mix_k, &mixes_dev.to_host_vec(stream)?)
         && bits_equal(&hc_k, &hc_dev.to_host_vec(stream)?);
     let ch = chain_host(&params.sbs, &streams, k, t, hp.rms_eps);
+    let hc_h = pre_of(&ch.mixes);
     let mix_bit = bits_equal(&mix_k, &ch.mixes);
-    let hc_bit = bits_equal(&hc_k, &pre_of(&ch.mixes, exp_ours));
+    let hc_bit = bits_equal(&hc_k, &hc_h);
 
     // The crate's quantizer and unsplit gemv at K = 20480.
     let mut act = Q8Act::with_k(stream, t, k)?;
@@ -846,67 +479,27 @@ fn check_site(
         .collect();
     let unsplit_rel = max_rel_err(&unsplit, &ch.raw)?;
 
-    // 3. The chain vs the dump, against the prediction.
-    let dump = DumpIn {
-        x: &streams,
-        xn: &xn,
-        k,
-        rms_eps: hp.rms_eps,
-    };
-    let mp = predict_mix(&params, &ch, &dump);
-    let mix_ratio = gap_ratio(&mix_k, &mix_d, &mp.pred, &mp.bound);
-    let (hc_pred, hc_bound) = predict_hc(&mix_d, &mix_k, &mp, &params, hp);
-    let hc_ratio = gap_ratio(&hc_k, &hc_d, &hc_pred, &hc_bound);
-    let mix_rel = rel_to(
-        mix_k.iter().zip(&mix_d).map(|(a, b)| f64::from(a - b)),
-        &mix_d,
-    );
-    let rule_rel = rel_to(mp.pred.iter().copied(), &mix_d);
-    let logit_err = mix_k
-        .iter()
-        .zip(&mix_d)
-        .enumerate()
-        .filter(|(i, _)| i % HC_MIX >= 8)
-        .fold(0.0f32, |m, (_, (a, b))| {
-            m.max((a - b).abs() * params.scale[2].abs())
-        });
-
-    let pass_pre = rms_bit
-        && pre_ik_bit
-        && mix_bit
-        && hc_bit
-        && rerun
-        && q8_bit
-        && unsplit_rel <= KERNEL_BAND
-        && mix_ratio <= 1.0
-        && hc_ratio <= 1.0;
+    // PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; no fixture set carries this clause
+    let pass_pre = mix_bit && hc_bit && rerun && q8_bit && unsplit_rel <= KERNEL_BAND;
     println!(
-        "hc_pre set={set} L={} sub={} T={t} ik_rms_bit={rms_bit} ik_hc_pre_bit={pre_ik_bit} \
-             kernel_mix_bit={mix_bit} kernel_hc_bit={hc_bit} rerun_bit={rerun} \
-             q8act_bit={q8_bit} unsplit_rel={unsplit_rel:.3e} \
-             mix_rel={mix_rel:.3e} rule_rel={rule_rel:.3e} mix_gap_ratio={mix_ratio:.3e} \
-             logit_err={logit_err:.3e} hc_gap_ratio={hc_ratio:.3e} {}",
-        site.layer,
-        site.sub(),
+        "hc_pre L={layer} sub={} T={t} kernel_mix_bit={mix_bit} kernel_hc_bit={hc_bit} \
+             rerun_bit={rerun} q8act_bit={q8_bit} unsplit_rel={unsplit_rel:.3e} {}",
+        sub_name(ffn),
         verdict(pass_pre)
     );
     cx.ok &= pass_pre;
 
-    // HC_POST and the fold: our rule vs the dump, the kernel vs both.
-    let x = load(site.x)?;
-    let post_d = load(site.post)?;
-    let (out_h, fold_h) = post_host(&x, &streams, &hc_d, n, t);
-    let post_ik_bit = bits_equal(&out_h, &post_d);
-    let fold_d = site.fold.map(load).transpose()?;
-    let fold_ik_bit = fold_d.as_ref().is_none_or(|f| bits_equal(&fold_h, f));
+    // HC_POST and the fold: the kernel against our rule on the host's HC_PRE
+    // row.
+    let (out_h, fold_h) = post_host(&x, &streams, &hc_h, n, t);
     let x_dev2 = DeviceBuffer::from_host(stream, &x)?;
-    let hc_d_dev = DeviceBuffer::from_host(stream, &hc_d)?;
+    let hc_h_dev = DeviceBuffer::from_host(stream, &hc_h)?;
     let mut out_dev = DeviceBuffer::<f32>::zeroed(stream, 4 * n * t)?;
     let mut fold_dev = DeviceBuffer::<f32>::zeroed(stream, n * t)?;
     let pa = HcPostArgs {
         x: &x_dev2,
         res: &x_dev,
-        hc: &hc_d_dev,
+        hc: &hc_h_dev,
         n_embd: n,
         tokens: t,
     };
@@ -914,44 +507,24 @@ fn check_site(
         .enqueue_post(stream, &pa, &mut out_dev, &mut fold_dev)?;
     stream.synchronize()?;
     let (out_k, fold_k) = (out_dev.to_host_vec(stream)?, fold_dev.to_host_vec(stream)?);
-    let post_bit = bits_equal(&out_k, &out_h) && bits_equal(&fold_k, &fold_h);
-    let post_dump_bit = bits_equal(&out_k, &post_d);
-    let fold_dump_bit = fold_d.as_ref().is_none_or(|f| bits_equal(&fold_k, f));
-
-    let form = if site.fold.is_some() {
-        "fused"
-    } else {
-        "post-alone"
-    };
-    let fold_seen = site.fold.map_or("-", |f| f.name.as_str());
-    let pass_post = post_ik_bit && fold_ik_bit && post_bit && post_dump_bit && fold_dump_bit;
+    let pass_post = bits_equal(&out_k, &out_h) && bits_equal(&fold_k, &fold_h);
     println!(
-        "hc_post set={set} L={} sub={} T={t} form={form} fold_node={fold_seen} \
-             ik_post_bit={post_ik_bit} ik_fold_bit={fold_ik_bit} kernel_bit={post_bit} \
-             post_vs_dump_bit={post_dump_bit} fold_vs_dump_bit={fold_dump_bit} {}",
-        site.layer,
-        site.sub(),
+        "hc_post L={layer} sub={} T={t} kernel_bit={pass_post} {}",
+        sub_name(ffn),
         verdict(pass_post)
     );
     cx.ok &= pass_post;
-    Ok(SiteOut {
-        fold: fold_k,
-        hc: hc_d,
-    })
+
+    // The fold alone, over the streams the post left.
+    let fold_ok = check_fold(cx, &format!("L{layer}{}", sub_name(ffn)), &out_h, &hc_h)?;
+    cx.ok &= fold_ok;
+    Ok(())
 }
 
-/// One `ds41_hc_fold` launch against our rule and the dump; prints its
-/// line.
-fn check_fold(
-    cx: &Ctx<'_>,
-    set: &str,
-    what: &str,
-    s: &[f32],
-    hc: &[f32],
-    want: &[f32],
-) -> Result<bool, GateError> {
+/// One `ds41_hc_fold` launch against our rule; prints its line.
+fn check_fold(cx: &Ctx<'_>, what: &str, s: &[f32], hc: &[f32]) -> Result<bool, GateError> {
     let (n, stream) = (cx.hp.n_embd, cx.gpu.stream());
-    let t = want.len() / n;
+    let t = hc.len() / HC_MIX;
     let host = fold_host(s, hc, n, t);
     let s_dev = DeviceBuffer::from_host(stream, s)?;
     let hc_dev = DeviceBuffer::from_host(stream, hc)?;
@@ -959,112 +532,12 @@ fn check_fold(
     cx.hck
         .enqueue_fold(stream, &s_dev, &hc_dev, n, t, &mut y_dev)?;
     stream.synchronize()?;
-    let y = y_dev.to_host_vec(stream)?;
-    let ik_bit = bits_equal(&host, want);
-    let k_bit = bits_equal(&y, &host);
-    let dump_bit = bits_equal(&y, want);
-    let pass = ik_bit && k_bit && dump_bit;
+    let k_bit = bits_equal(&y_dev.to_host_vec(stream)?, &host);
     println!(
-        "hc_fold set={set} site={what} T={t} ik_fold_bit={ik_bit} kernel_bit={k_bit} \
-             kernel_vs_dump_bit={dump_bit} {}",
-        verdict(pass)
+        "hc_fold site={what} T={t} kernel_bit={k_bit} {}",
+        verdict(k_bit)
     );
-    Ok(pass)
-}
-
-/// The folds no HC_POST produces: the first layer's input (the one-hot
-/// `hc_pre_init`), each engram layer's (its streams are rewritten after
-/// the previous HC_POST), and the head's `hc_out` (the last token only).
-/// `ffn_hc` holds each layer's FFN HC_PRE output, `last_fold` the fold
-/// the last HC_POST launch wrote.
-fn check_lone_folds(
-    cx: &mut Ctx<'_>,
-    man: &RefManifest,
-    set: &str,
-    t: usize,
-    ffn_hc: &[Vec<f32>],
-    last_fold: &[f32],
-) -> Result<(), GateError> {
-    let n = cx.hp.n_embd;
-    let load = |r: &RefRow| ref_tensor_of_in(&man.dir, r);
-    let mut ok = true;
-    for layer in 0..cx.hp.n_layers {
-        let name = format!("hc_attn_pre-{layer}");
-        let r = man.tensor(&name, 0)?;
-        let s_name = src0(r);
-        if !s_name.starts_with("engram_out-") && s_name != "hc_init" {
-            continue;
-        }
-        let s = load(man.tensor(s_name, 0)?)?;
-        let hc = if layer == 0 {
-            let init = load(man.tensor("hc_pre_init", 0)?)?;
-            let mut hc = vec![0.0f32; HC_MIX * t];
-            for (h, pre) in hc
-                .as_chunks_mut::<HC_MIX>()
-                .0
-                .iter_mut()
-                .zip(init.as_chunks::<4>().0)
-            {
-                h[..4].copy_from_slice(pre);
-            }
-            hc
-        } else {
-            ffn_hc[layer - 1].clone()
-        };
-        ok &= check_fold(cx, set, &format!("{name}<-{s_name}"), &s, &hc, &load(r)?)?;
-    }
-    let head = man.tensor("hc_out", 0)?;
-    head.expect("hc_out", "f32", [n as u64, 1, 1, 1], "MUL_MULTI_ADD")?;
-    let want = load(head)?;
-    let last = cx.hp.n_layers - 1;
-    let l_out = load(man.tensor(&format!("l_out-{last}"), 0)?)?;
-    let hc_last = &ffn_hc[last][(t - 1) * HC_MIX..t * HC_MIX];
-    let last_streams = &l_out[4 * n * (t - 1)..4 * n * t];
-    ok &= check_fold(cx, set, "hc_out<-last_token", last_streams, hc_last, &want)?;
-    let chained = bits_equal(&last_fold[n * (t - 1)..n * t], &want);
-    println!(
-        "hc_fold set={set} site=hc_out<-ds41_hc_post_of_the_last_ffn T=1 \
-             kernel_vs_dump_bit={chained} {}",
-        verdict(chained)
-    );
-    cx.ok &= ok && chained;
-    Ok(())
-}
-
-/// One set: every sub-layer, then the lone folds.
-fn check_set(cx: &mut Ctx<'_>, man: &RefManifest, set: &str) -> Result<(), GateError> {
-    let t = tokens_of(man)?;
-    let all = sites(man, cx.hp, t as u64)?;
-    println!(
-        "set {set} dir={} build={} T={t} sites={}",
-        man.dir.display(),
-        man.build.as_deref().unwrap_or("-"),
-        all.len()
-    );
-    // This module's launches one token of this graph takes: each
-    // boundary fused except the ones before an engram layer and after
-    // the last layer, whose HC_POST alone is the MoE piece's and whose
-    // fold is a lone fold (the head's, after the last layer). Layer 0's
-    // input fold (by the one-hot init, a copy of stream 0) is counted
-    // apart.
-    let lone = all.iter().filter(|s| s.fold.is_none()).count();
-    let fused = all.len() - lone;
-    println!(
-        "nodes set={set} ds41_hc_pre={} ds41_hc_post={fused} ds41_hc_fold={lone} total={} \
-             (+1 layer-0 fold)",
-        all.len(),
-        all.len() + fused + lone
-    );
-    let mut ffn_hc = vec![Vec::new(); cx.hp.n_layers];
-    let mut last_fold = Vec::new();
-    for site in &all {
-        let out = check_site(cx, man, set, site, t)?;
-        if site.ffn {
-            ffn_hc[site.layer] = out.hc;
-            last_fold = out.fold;
-        }
-    }
-    check_lone_folds(cx, man, set, t, &ffn_hc, &last_fold)
+    Ok(k_bit)
 }
 
 /// The outputs a captured step writes.
@@ -1094,18 +567,28 @@ impl StepBufs {
     }
 }
 
+/// The probe sub-layer's parameters and its seeded streams (`[t][4][n]`).
+fn probe(cx: &Ctx<'_>) -> Result<(SiteParams, Vec<f32>), GateError> {
+    let params = site_params(
+        cx.split,
+        cx.gpu.stream(),
+        PROBE_LAYER,
+        sub_name(false),
+        cx.hp.k(),
+    )?;
+    let seed = site_seed(PROBE_LAYER, false, PROBE_TOKENS)?;
+    Ok((params, lcg(cx.hp.k() * PROBE_TOKENS, seed)))
+}
+
 /// One captured graph of the chain and HC_POST, replayed twice with its
 /// outputs cleared before each, is bit-identical to the eager launches:
 /// the ticket counter is back at zero after every launch.
-fn check_graph(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
+fn check_graph(cx: &mut Ctx<'_>) -> Result<(), GateError> {
     let (hp, stream) = (cx.hp, cx.gpu.stream());
-    let (n, t) = (hp.n_embd, tokens_of(man)?);
-    let all = sites(man, hp, t as u64)?;
-    let site = all.get(4).ok_or("fewer than five sites")?;
-    let params = site_params(cx.split, stream, site.layer, site.sub(), hp.k())?;
-    let load = |r: &RefRow| ref_tensor_of_in(&man.dir, r);
-    let x_dev = DeviceBuffer::from_host(stream, &load(site.streams)?)?;
-    let sub_out = DeviceBuffer::from_host(stream, &load(site.x)?)?;
+    let (n, t) = (hp.n_embd, PROBE_TOKENS);
+    let (params, streams) = probe(cx)?;
+    let x_dev = DeviceBuffer::from_host(stream, &streams)?;
+    let sub_out = DeviceBuffer::from_host(stream, &lcg(n * t, 7))?;
     let p = HcParams {
         w: &params.w_dev,
         scale: &params.scale_dev,
@@ -1156,17 +639,15 @@ fn check_graph(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
     let nodes = g.node_count();
     let pass = replays_bit && nodes == 2;
     println!(
-        "graph site=L{}{} T={t} nodes={nodes} replay_x2_bit_identical_to_eager={replays_bit} {}",
-        site.layer,
-        site.sub(),
+        "graph site=L{PROBE_LAYER}attn T={t} nodes={nodes} replay_x2_bit_identical_to_eager={replays_bit} {}",
         verdict(pass)
     );
     cx.ok &= pass;
     Ok(())
 }
 
-/// A site's streams with one value NaN through `ds41_hc_pre`: the word,
-/// read back and cleared, must name [`FaultSite::HcQuant`] and
+/// The probe site's streams with one value NaN through `ds41_hc_pre`: the
+/// word, read back and cleared, must name [`FaultSite::HcQuant`] and
 /// [`FaultSite::F32Product`] with no layer; the clean streams before it
 /// must leave the word clean.
 ///
@@ -1176,14 +657,11 @@ fn check_graph(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
 /// quantizer's `HcQuant` is still the smallest code, so the word is the
 /// old one with a second bit in the mask. The clause fails on a kernel
 /// that scales by `1/sqrt` unchecked, whose mask is `HcQuant` alone.
-fn check_nan(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
+fn check_nan(cx: &mut Ctx<'_>) -> Result<(), GateError> {
     let (hp, stream) = (cx.hp, cx.gpu.stream());
-    let t = tokens_of(man)?;
-    let all = sites(man, hp, t as u64)?;
-    let site = all.get(4).ok_or("fewer than five sites")?;
-    let params = site_params(cx.split, stream, site.layer, site.sub(), hp.k())?;
+    let t = PROBE_TOKENS;
+    let (params, mut streams) = probe(cx)?;
     let clean = cx.gpu.take_fault()?;
-    let mut streams = ref_tensor_of_in(&man.dir, site.streams)?;
     streams[777] = f32::NAN;
     let x_dev = DeviceBuffer::from_host(stream, &streams)?;
     let p = HcParams {
@@ -1208,9 +686,7 @@ fn check_nan(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
     let want = Fault::of_sites(LAYER_NONE, &[FaultSite::HcQuant, FaultSite::F32Product]);
     let pass = clean.is_none() && got == Some(want);
     println!(
-        "fault site=L{}{} T={t} value 777 NaN: before={} want=hc_quant+f32_product got={} {}",
-        site.layer,
-        site.sub(),
+        "fault site=L{PROBE_LAYER}attn T={t} value 777 NaN: before={} want=hc_quant+f32_product got={} {}",
         clean.map_or("none".to_string(), |f| f.to_string()),
         got.map_or("none".to_string(), |f| f.to_string()),
         verdict(pass)
@@ -1219,20 +695,17 @@ fn check_nan(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
     Ok(())
 }
 
-/// A site's streams with one value `1e20` through `ds41_hc_pre` and
+/// The probe site's streams with one value `1e20` through `ds41_hc_pre` and
 /// through `ds41_hc_pre_groups`: the value is finite, so the quantizer
 /// raises nothing, but its square passes f32 and the token's scale has no
 /// norm behind it. The word must name [`FaultSite::F32Product`] alone,
 /// with no layer; that token's 48 outputs are NaN, never the zeros `1/∞`
 /// scales them to, and every other token's bits are the clean run's.
-fn check_overflow(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> {
+fn check_overflow(cx: &mut Ctx<'_>) -> Result<(), GateError> {
     const BIG: f32 = 1.0e20;
     let (hp, stream) = (cx.hp, cx.gpu.stream());
-    let t = tokens_of(man)?;
-    let all = sites(man, hp, t as u64)?;
-    let site = all.get(4).ok_or("fewer than five sites")?;
-    let params = site_params(cx.split, stream, site.layer, site.sub(), hp.k())?;
-    let streams = ref_tensor_of_in(&man.dir, site.streams)?;
+    let t = PROBE_TOKENS;
+    let (params, streams) = probe(cx)?;
     let mut big = streams.clone();
     big[777] = BIG;
     let k = hp.k();
@@ -1290,11 +763,9 @@ fn check_overflow(cx: &mut Ctx<'_>, man: &RefManifest) -> Result<(), GateError> 
         });
         let pass = before.is_none() && clean_word.is_none() && got == want && bad_nan && others;
         println!(
-            "overflow {} site=L{}{} T={t} value 777 = {BIG:e}: word={} want=f32_product \
+            "overflow {} site=L{PROBE_LAYER}attn T={t} value 777 = {BIG:e}: word={} want=f32_product \
                  token_0_outputs_nan={bad_nan} other_tokens_bit={others} {}",
             if grouped { "groups" } else { "single" },
-            site.layer,
-            site.sub(),
             got.map_or("none".to_string(), |f| f.to_string()),
             verdict(pass)
         );
@@ -1557,25 +1028,22 @@ pub fn run() -> Result<(), GateError> {
         scratch,
         ok: q8_ok,
     };
-    let table = oracle::for_arch(Arch::Deepseek41)?;
-    let prefill = table.open(Set::Cpu)?;
-    check_set(&mut cx, &prefill, "prefill")?;
-    check_graph(&mut cx, &prefill)?;
-    check_nan(&mut cx, &prefill)?;
-    check_overflow(&mut cx, &prefill)?;
-    for name in STEP_SETS {
-        if !ref_dir_named(name).join("MANIFEST.tsv").is_file() {
-            println!("hole set={name} not on the box: its T = 1 checks did not run");
-            continue;
+    for layer in 0..hp.n_layers {
+        for ffn in [false, true] {
+            let params = site_params(&split, gpu.stream(), layer, sub_name(ffn), hp.k())?;
+            for t in SWEEP_TOKENS {
+                check_site(&mut cx, &params, layer, ffn, t)?;
+            }
         }
-        let man = table.open_named(name)?;
-        check_set(&mut cx, &man, name)?;
     }
+    check_graph(&mut cx)?;
+    check_nan(&mut cx)?;
+    check_overflow(&mut cx)?;
     if cx.ok {
         println!(
             "PASSED: gate_deepseek41_hc — chain, HC_PRE, HC_POST and folds bit-identical to \
-                 our rule; HC_POST and folds bit-identical to ik's dump; the chain inside its \
-                 predicted gap; the Q8_0 chain bit-identical to our rule"
+                 our rule on every sub-layer's weights; the fault words; the Q8_0 chain \
+                 bit-identical to our rule"
         );
         Ok(())
     } else {

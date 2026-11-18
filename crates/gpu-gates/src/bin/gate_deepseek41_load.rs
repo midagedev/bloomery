@@ -7,8 +7,9 @@
 //! same file. A correctness run: every time and memory figure it prints is a
 //! runtime value. Every clause is self-consistency (the engine against its own plan, KvLayout
 //! and RopeTable), so the fixture tier runs all six; the steps check (iii) builds are the decode-step
-//! sets' in the real tier and the same positions over a synthetic id sequence in the fixture
-//! tier (the ids feed the plan's engram window, as a set's do).
+//! positions of `ds41_tier::DECODE_SETS` over a synthetic id sequence in both tiers (the ids feed the
+//! plan's engram window).
+//! PIN(2026-11-18): the real-file ik set retired; ik cannot read bq3km's engram schema; the check read the sets' ids and positions as input only, and the synthetic sequence the fixture tier used feeds both tiers
 //!
 //! - (i) segments: every segment the plan puts on the card is resident at the
 //!   plan's buffer bytes, nothing else is, and the total is the card's dense +
@@ -101,7 +102,6 @@ mod gate {
     use bloomery_gpu_deepseek41::chain::attn::join_groups;
     use bloomery_gpu_deepseek41::params::{ImageView, Table};
     use bloomery_gpu_deepseek41::rope::{Direction, RopeKernels, RopeSpec, RopeTable};
-    use bloomery_gpu_gates::oracle::for_arch;
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, bits_equal, bytes_to_words, checks_failed, prose_ids, verdict,
@@ -110,7 +110,6 @@ mod gate {
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::GgmlType;
-    use model::arch::Arch;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::kv::KvLayout;
     use model::arch::deepseek41::place::PlanInputs;
@@ -118,10 +117,8 @@ mod gate {
     use model::placement::host_lock::HostFile;
     use model::placement::{CardFormat, Device, KvBytes, Plan, Role, workstation};
 
-    // The decode-step sets whose positions check (iii) builds are `ds41_tier::DECODE_SETS`:
-    // `step4`'s 4, where no csa group completes, and 301 and 1,025, where one does and the window
-    // ring has wrapped. The fixture tier builds the same positions over a synthetic id sequence;
-    // the real tier reads them from the sets and prints each beside the table (`witness_set`).
+    // The decode-step positions check (iii) builds are `ds41_tier::DECODE_SETS`: `step4`'s 4, where
+    // no csa group completes, and 301 and 1,025, where one does and the window ring has wrapped.
 
     /// The port's names of the compressed streams, in the planner's order.
     const STREAMS: [&str; 2] = ["csa", "hca"];
@@ -830,34 +827,13 @@ mod gate {
         pass
     }
 
-    /// The step a decode-step set holds: its sequence (`# tokens`) and the
-    /// step's position (`# decode_pos`, its last token's). The set opens
-    /// through the V4.1 oracle's family check, so a set of another model
-    /// file is refused by name; the real tier prints the set's position beside
-    /// `DECODE_SETS`' and requires them equal. The fixture tier has no set of
-    /// its file: the same position over `pos + 1` ids of a fixed spread across
-    /// the vocabulary, which feed the plan's engram window as a set's ids do.
-    fn step_of(set: &str, at: u32, n_vocab: usize) -> Result<(Vec<u32>, u32), GateError> {
-        if tier::Tier::from_env()? == tier::Tier::Fixture {
-            let ids = (0..=at)
-                .map(|i| u32::try_from(1 + (u64::from(i) * 7919) % (n_vocab as u64 - 1)))
-                .collect::<Result<Vec<_>, _>>()?;
-            return Ok((ids, at));
-        }
-        let man = for_arch(Arch::Deepseek41)?.open_named(set)?;
-        if man.header.decode_pos.is_none() {
-            return Err(format!(
-                "{}: no # decode_pos, not a decode-step set",
-                man.dir.display()
-            )
-            .into());
-        }
-        let (pos, step, before) = man.step()?;
-        if pos != at {
-            return Err(format!("{set}: the set's position {pos} is not DECODE_SETS' {at}").into());
-        }
-        tier::witness(&format!("{set} step position"), pos, at);
-        Ok(([before, step].concat(), pos))
+    /// The step a decode-step position of `DECODE_SETS` holds: `at + 1` ids of a fixed spread across
+    /// the vocabulary, which feed the plan's engram window, and the position `at`.
+    fn step_of(at: u32, n_vocab: usize) -> Result<(Vec<u32>, u32), GateError> {
+        let ids = (0..=at)
+            .map(|i| u32::try_from(1 + (u64::from(i) * 7919) % (n_vocab as u64 - 1)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((ids, at))
     }
 
     /// One verdict line of the check named `check`.
@@ -897,7 +873,7 @@ mod gate {
         let mut ok = true;
         let mut plan = StepPlan::default();
         for (set, at, _) in crate::ds41_tier::DECODE_SETS {
-            let (tokens, pos) = step_of(set, at, n_vocab)?;
+            let (tokens, pos) = step_of(at, n_vocab)?;
             let at = pos as usize;
             planner.plan_into(&tokens[at..], pos, &tokens[..at], &mut plan)?;
             let embd: Vec<u8> = (0..dims.embd_bytes)
