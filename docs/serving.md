@@ -894,7 +894,10 @@ template uses is read from the call it renders, and a `tool_choice` that forces 
   `enable_thinking: false`, and the whole output lands in `content`. A template with no thinking switch but an effort
   header (GLM-5.3's) gets `reasoning_effort: "low"` instead, and one line at start says so; one that refuses a word it
   does not know and takes its own word for no thinking (Hy4-flash's `no_think`) gets that word, which a request may
-  also name itself, and one line at start says so. Every other word asks for
+  also name itself, and one line at start says so. On those two templates `chat_template_kwargs.enable_thinking: false`
+  is the same request as `"none"`, and a request whose `enable_thinking` and `reasoning_effort` ask for opposite
+  thinking (`false` with an effort other than `none` or the template's own word, `true` with one) is a 400 naming
+  both. Every other word asks for
   reasoning: a template whose thinking is off until `enable_thinking` is set (V4.1's) gets `enable_thinking: true`, and
   `max` also adds its maximum-effort header. A `chat_template_kwargs` `enable_thinking` in the same request wins.
   `/props`' `thinking_off` names the template's case: `"switch"`, `"low_effort"`, `"off_word"` or `"neither"`. Unlike llama-server,

@@ -3476,13 +3476,15 @@ enum ThinkingOff {
     /// `true` unless the request set it.
     Switch { opt_in: bool },
     /// The template has no switch but `reasoning_effort` changes the
-    /// generation prompt: `"none"` is sent as the template's lowest effort,
-    /// `"low"`, the closest to no thinking it has.
+    /// generation prompt: `"none"`, and `enable_thinking: false`, are sent as
+    /// the template's lowest effort, `"low"`, the closest to no thinking it
+    /// has.
     LowEffort,
     /// The template has no switch, names the effort words it takes (it
     /// refuses a word it does not know) and takes one of [`OFF_WORDS`] as its
-    /// own word for no thinking (Hy4-flash's `no_think`): `"none"` is sent as
-    /// that word, and a request may name the word itself.
+    /// own word for no thinking (Hy4-flash's `no_think`): `"none"`, and
+    /// `enable_thinking: false`, are sent as that word, and a request may name
+    /// the word itself.
     OffWord(&'static str),
     /// Neither knob changes the prompt: `"none"` sets `enable_thinking`
     /// `false`, as llama-server does, and there is nothing to map it to.
@@ -3506,15 +3508,16 @@ impl ThinkingOff {
     fn note(self) -> Option<&'static str> {
         match self {
             ThinkingOff::LowEffort => Some(
-                "chat template: no thinking switch; reasoning_effort \"none\" is sent as \"low\"",
+                "chat template: no thinking switch; reasoning_effort \"none\" and \
+                 enable_thinking false are sent as \"low\"",
             ),
             ThinkingOff::OffWord("no_think") => Some(
-                "chat template: no thinking switch; reasoning_effort \"none\" is sent as the \
-                 template's own \"no_think\"",
+                "chat template: no thinking switch; reasoning_effort \"none\" and \
+                 enable_thinking false are sent as the template's own \"no_think\"",
             ),
             ThinkingOff::OffWord(_) => Some(
-                "chat template: no thinking switch; reasoning_effort \"none\" is sent as the \
-                 template's own word for no thinking",
+                "chat template: no thinking switch; reasoning_effort \"none\" and \
+                 enable_thinking false are sent as the template's own word for no thinking",
             ),
             ThinkingOff::Switch { .. } | ThinkingOff::Neither => None,
         }
@@ -3645,9 +3648,14 @@ fn check_effort(field: &str, effort: &str, how: ThinkingOff) -> Result<(), ApiEr
 /// keeps the template's default, so the effort is what turns it on.)
 ///
 /// A template with no thinking switch but an effort knob
-/// ([`ThinkingOff::LowEffort`]) has nothing `enable_thinking: false` could
-/// turn off, so there `"none"` is the effort `"low"`: it sets no
-/// `enable_thinking` of its own and replaces a kwargs `reasoning_effort`.
+/// ([`ThinkingOff::LowEffort`], [`ThinkingOff::OffWord`]) has nothing
+/// `enable_thinking: false` could turn off, so there the kwargs
+/// `enable_thinking: false` is read as `"none"` (the effort `"low"`, or the
+/// template's own word): it sets no `enable_thinking` of its own and replaces a
+/// kwargs `reasoning_effort`. A request whose `enable_thinking` and
+/// `reasoning_effort` ask for opposite thinking (`false` with an effort that is
+/// not `"none"` or the template's own word, `true` with one) is a 400 naming
+/// both: neither is picked. `true` leaves the template's default.
 fn thinking_vars(
     b: &Map<String, Value>,
     vars: &mut Map<String, Value>,
@@ -3679,7 +3687,23 @@ fn thinking_vars(
         }
         Some(other) => return Err(wrong_type("reasoning_effort", "a string", other)),
     };
-    let none = effort.and_then(Value::as_str) == Some("none");
+    let by_effort = matches!(how, ThinkingOff::LowEffort | ThinkingOff::OffWord(_));
+    if by_effort && let (Some(on), Some(Value::String(e))) = (thinking, effort) {
+        let effort_off = e == "none" || matches!(how, ThinkingOff::OffWord(w) if w == e);
+        if effort_off == on {
+            return Err(invalid(format!(
+                "\"chat_template_kwargs.enable_thinking\" is {on} but \"reasoning_effort\" \
+                 (\"reasoning.effort\" on /v1/responses) is {e:?}: they ask for opposite \
+                 thinking, send one of them"
+            ))
+            .at("chat_template_kwargs"));
+        }
+    }
+    // A template with no thinking switch has nothing `enable_thinking: false`
+    // could turn off, so the request for no thinking is the effort that stands
+    // for it: the same as `"none"`.
+    let none =
+        effort.and_then(Value::as_str) == Some("none") || (by_effort && thinking == Some(false));
     match (none, how) {
         (true, ThinkingOff::LowEffort) => {
             vars.insert("reasoning_effort".into(), Value::String("low".to_owned()));
@@ -10618,8 +10642,8 @@ mod tests {
     /// header that takes `low` or `high`, is sent as `"low"`, the template's
     /// lowest effort: it renders as `"low"` does, a kwargs `reasoning_effort`
     /// beside it is replaced, and another effort reaches the template as it
-    /// came. A kwargs `enable_thinking: false` is no effort and leaves the
-    /// header at the template's default.
+    /// came. A kwargs `enable_thinking: false` is the same request
+    /// ([`enable_thinking_false_is_the_low_effort_on_glm5`]).
     #[test]
     fn reasoning_effort_none_is_the_low_effort_on_glm5() {
         let (addr, _state, _ended) = super::testserve::spawn(
@@ -10657,12 +10681,6 @@ mod tests {
         );
         assert_eq!(status, 200, "{high}");
         assert_eq!(applied_prompt(&high), header("High"));
-        let (status, switch) = applied(
-            addr,
-            &json!({ "messages": messages(), "chat_template_kwargs": { "enable_thinking": false } }),
-        );
-        assert_eq!(status, 200, "{switch}");
-        assert_eq!(applied_prompt(&switch), header("Max"));
     }
 
     /// `reasoning_effort: "none"` on Hy4-flash's template, which has no thinking
@@ -10723,6 +10741,182 @@ mod tests {
             &json!({ "input": "Hi", "reasoning": { "effort": "no_think" } }).to_string(),
         );
         assert_eq!(status, 200, "responses no_think: {answer}");
+    }
+
+    /// A 400 that `/apply-template` answers for a request whose
+    /// `chat_template_kwargs.enable_thinking` and `reasoning_effort` disagree:
+    /// the message names both fields, and `param` the object that holds the
+    /// switch.
+    fn assert_thinking_conflict(addr: SocketAddr, body: &Value) {
+        let (status, answer) = applied(addr, body);
+        assert_eq!(status, 400, "{body}: {answer}");
+        let error = serde_json::from_str::<Value>(&answer).expect("JSON")["error"].clone();
+        let message = error["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("enable_thinking") && message.contains("reasoning_effort"),
+            "the 400 names both fields: {message}"
+        );
+        assert_eq!(error["param"], "chat_template_kwargs", "{answer}");
+    }
+
+    /// `chat_template_kwargs: {"enable_thinking": false}`, the llama-server
+    /// way to ask for no thinking, is `reasoning_effort: "none"` on Hy4-flash's
+    /// template, which has no thinking switch: it renders as the template's own
+    /// off word does, beside the template's own word or `"none"` it agrees, and
+    /// it erases a kwargs `reasoning_effort`; `true` is the template's default.
+    /// A request whose switch and effort disagree (`false` with an effort that
+    /// is not an off word, `true` with one) is a 400 naming both fields, on the
+    /// chat path and the Responses API alike. FAIL-first: with the switch
+    /// ignored, the first loop is red (the render is the default, thinking on).
+    #[test]
+    fn enable_thinking_false_is_the_off_word_on_hy4() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(4096)),
+            templated(include_str!("../tests/fixtures/hy4-chat-template.jinja")),
+        );
+        let messages = || json!([{ "role": "user", "content": "Hi" }]);
+        let render = |body: &Value| {
+            let (status, answer) = applied(addr, body);
+            assert_eq!(status, 200, "{body}: {answer}");
+            applied_prompt(&answer)
+        };
+        let off = render(&json!({ "messages": messages(), "reasoning_effort": "none" }));
+        let unset = render(&json!({ "messages": messages() }));
+        assert_ne!(off, unset, "the off word changes the prompt");
+        let kw = |on: bool| json!({ "enable_thinking": on });
+        for body in [
+            json!({ "messages": messages(), "chat_template_kwargs": kw(false) }),
+            json!({
+                "messages": messages(),
+                "chat_template_kwargs": kw(false),
+                "reasoning_effort": "none",
+            }),
+            json!({
+                "messages": messages(),
+                "chat_template_kwargs": kw(false),
+                "reasoning_effort": "no_think",
+            }),
+            json!({
+                "messages": messages(),
+                "chat_template_kwargs": { "enable_thinking": false, "reasoning_effort": "high" },
+            }),
+        ] {
+            assert_eq!(
+                render(&body),
+                off,
+                "enable_thinking false is no thinking: {body}"
+            );
+        }
+        assert_eq!(
+            render(&json!({ "messages": messages(), "chat_template_kwargs": kw(true) })),
+            unset,
+            "true is the template's default"
+        );
+        assert_eq!(
+            render(&json!({
+                "messages": messages(),
+                "chat_template_kwargs": kw(true),
+                "reasoning_effort": "high",
+            })),
+            render(&json!({ "messages": messages(), "reasoning_effort": "high" })),
+            "true beside an effort leaves the effort"
+        );
+        for (on, effort) in [
+            (false, "high"),
+            (false, "low"),
+            (true, "none"),
+            (true, "no_think"),
+        ] {
+            assert_thinking_conflict(
+                addr,
+                &json!({
+                    "messages": messages(),
+                    "chat_template_kwargs": kw(on),
+                    "reasoning_effort": effort,
+                }),
+            );
+        }
+        let (status, answer) = roundtrip(
+            addr,
+            "POST",
+            "/v1/responses",
+            &json!({
+                "input": "Hi",
+                "chat_template_kwargs": kw(false),
+                "reasoning": { "effort": "high" },
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 400, "responses: {answer}");
+        assert!(answer.contains("enable_thinking"), "{answer}");
+        let (status, answer) = roundtrip(
+            addr,
+            "POST",
+            "/v1/responses",
+            &json!({ "input": "Hi", "chat_template_kwargs": kw(false) }).to_string(),
+        );
+        assert_eq!(status, 200, "responses: {answer}");
+    }
+
+    /// `chat_template_kwargs: {"enable_thinking": false}` is `reasoning_effort:
+    /// "none"` on GLM-5's template too ([`ThinkingOff::LowEffort`]): it renders
+    /// as `"low"` does, and `"none"` beside it agrees. A switch and an effort
+    /// that disagree (`false` with `"high"` or `"low"`, `true` with `"none"`)
+    /// are a 400 naming both fields; `true` is the template's default header.
+    /// FAIL-first: with the switch ignored, the render is the default header
+    /// and the first loop is red.
+    #[test]
+    fn enable_thinking_false_is_the_low_effort_on_glm5() {
+        let (addr, _state, _ended) = super::testserve::spawn(
+            Box::new(crate::MockEngine::new(64)),
+            templated(include_str!("../tests/fixtures/glm5-chat-template.jinja")),
+        );
+        let messages = || json!([{ "role": "user", "content": "Hi" }]);
+        let header = |effort: &str| {
+            format!(
+                "[gMASK]<sop><|system|>Reasoning Effort: {effort}<|user|>Hi<|assistant|><think>"
+            )
+        };
+        let render = |body: &Value| {
+            let (status, answer) = applied(addr, body);
+            assert_eq!(status, 200, "{body}: {answer}");
+            applied_prompt(&answer)
+        };
+        let kw = |on: bool| json!({ "enable_thinking": on });
+        for body in [
+            json!({ "messages": messages(), "chat_template_kwargs": kw(false) }),
+            json!({
+                "messages": messages(),
+                "chat_template_kwargs": kw(false),
+                "reasoning_effort": "none",
+            }),
+            json!({
+                "messages": messages(),
+                "chat_template_kwargs": { "enable_thinking": false, "reasoning_effort": "high" },
+            }),
+        ] {
+            // PIN(2026-11-19): lead decision — a kwargs `enable_thinking: false` is the request for no thinking, "low" here; it left the header at "Max" before.
+            assert_eq!(
+                render(&body),
+                header("Low"),
+                "enable_thinking false is the lowest effort: {body}"
+            );
+        }
+        assert_eq!(
+            render(&json!({ "messages": messages(), "chat_template_kwargs": kw(true) })),
+            header("Max"),
+            "true is the template's default header"
+        );
+        for (on, effort) in [(false, "high"), (false, "low"), (true, "none")] {
+            assert_thinking_conflict(
+                addr,
+                &json!({
+                    "messages": messages(),
+                    "chat_template_kwargs": kw(on),
+                    "reasoning_effort": effort,
+                }),
+            );
+        }
     }
 
     /// `chat_template_kwargs.enable_thinking` as a string is a 400 naming it,
