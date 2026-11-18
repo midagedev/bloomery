@@ -212,6 +212,13 @@ impl<T: DeviceCopy> RoomTensor<T> {
         self.room.asks(positions)
     }
 
+    /// [`RoomTensor::asks`] where the new pages may land on the host (a backing of `host` or
+    /// `spill`); 0 for a card-backed tensor. What a body sums for [`KvRoomBody::host_asks`].
+    #[must_use]
+    pub fn host_asks(&self, positions: usize) -> usize {
+        self.room.host_asks(positions)
+    }
+
     /// The pages a write from position `pos` on reaches made this sequence's own, given memory no
     /// other sequence's store maps. Never inside a capture.
     ///

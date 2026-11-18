@@ -2475,6 +2475,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         None => line,
     };
     let line = line.w("kv_host", plan.kv_host.name());
+    let line = record::with_grow_parts(line, &plan.host.grow);
     let line = line
         .u("host_experts", plan.host.experts)
         .u("card_experts", plan.cards[0].experts);
@@ -3503,13 +3504,26 @@ impl Q38 {
         Ok(())
     }
 
-    /// The call's `tier census` record ([`Q38::print_census`]); then the
+    /// The `host yield` records of the host K/V's growth the call asked for, whichever the
+    /// residency and the warm-up (a yield moves host experts to the NVMe tier for good), on
+    /// stderr.
+    fn print_host_yields(&mut self) -> Result<(), GateError> {
+        let body = self.s.model_mut().body_parts("bloomery-serve-qwen38")?.2;
+        for m in body.take_host_yields() {
+            record::host_yield(&m).eprint();
+        }
+        Ok(())
+    }
+
+    /// The call's `host yield` records ([`Q38::print_host_yields`]), its `tier census` record
+    /// ([`Q38::print_census`]); then the
     /// `call stream` records of the last prompt call — each of its picks,
     /// then its end — its `xstream end` record when the expert stream ran it
     /// (the layers and experts it streamed), and the `residency pass` records
     /// of the boundaries since, on stderr, nothing of them without the
     /// residency.
     fn print_passes(&mut self) -> Result<(), GateError> {
+        self.print_host_yields()?;
         if self.warming {
             return self.drain_passes();
         }

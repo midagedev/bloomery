@@ -457,6 +457,7 @@ mod cli {
     use app::arch::qwen3moe::Q38Cfg;
     use app::mtp::{MtpBody, MtpDraft, WindowDraft, open_draft};
     use app::{Session, SessionError};
+    use bloomery_gpu::HostYieldMove;
     use bloomery_gpu::arch::nemotron_h::{Body as BodyNh, PASS_ROWS as NH_PASS_ROWS};
     use bloomery_gpu::arch::nemotron_h_moe::{Body as BodyNhMoe, PASS_ROWS_MAX};
     use bloomery_gpu::arch::qwen3moe::ubatch::{ImageWrite, ubatch_for};
@@ -813,6 +814,12 @@ mod cli {
         fn residency_passes(
             _m: &mut GpuModel<Self>,
         ) -> Result<Vec<(PassKind, PassReport)>, GateError> {
+            Ok(Vec::new())
+        }
+
+        /// The host experts' yields to the host K/V's growth since the last take; none for a
+        /// body whose loads yield nothing.
+        fn host_yields(_m: &mut GpuModel<Self>) -> Result<Vec<HostYieldMove>, GateError> {
             Ok(Vec::new())
         }
 
@@ -1309,6 +1316,11 @@ mod cli {
             Ok(m.body_parts("generate_qwen3moe")?.2.take_residency_passes())
         }
 
+        /// [`Body38::take_host_yields`]: empty unless the plan kept host experts to yield.
+        fn host_yields(m: &mut Qwen38Model) -> Result<Vec<HostYieldMove>, GateError> {
+            Ok(m.body_parts("generate_qwen3moe")?.2.take_host_yields())
+        }
+
         /// [`Body38::take_stream_records`] and
         /// [`Body38::take_xstream_records`].
         fn stream_records(m: &mut Qwen38Model) -> Result<StreamRecords, GateError> {
@@ -1620,6 +1632,7 @@ mod cli {
             None => r,
         };
         let r = r.w("kv_host", plan.kv_host.name());
+        let r = record::with_grow_parts(r, &plan.host.grow);
         let r = r
             .u("host_experts", plan.host.experts)
             .u("card_experts", plan.cards[0].experts);
@@ -3576,6 +3589,9 @@ mod cli {
         }
         for (kind, r) in B::residency_passes(m)? {
             record::residency_pass_of(kind, &r).print();
+        }
+        for y in B::host_yields(m)? {
+            record::host_yield(&y).print();
         }
         Ok(())
     }

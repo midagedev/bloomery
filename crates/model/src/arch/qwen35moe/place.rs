@@ -42,7 +42,7 @@
 //! ([`StoreRows`]), chosen by the plan from its room.
 
 use bloomery_levers::KvHost;
-use bloomery_placement::slots::{self, SeqTerms, Stores};
+use bloomery_placement::slots::{self, SeqTerms, Stores, kv_host_room};
 use gguf::{GgmlType, Split};
 use models::headpick::{HeadRowsError, HeadSet, vocab_sha256};
 use models::{
@@ -535,6 +535,42 @@ impl PlanInputs {
                 .ok_or_else(past)?;
         }
         whole.checked_mul(slots).ok_or_else(past)
+    }
+
+    /// What a plan under `kv` counts against its host room for the K/V planes of a host-backed
+    /// store at `ctx` positions over `slots` resident sequences, and the part of it the plan's
+    /// `floor` reaches ([`Plan::kv_host_planes`]): under `all` the planes' whole bytes
+    /// ([`PlanInputs::kv_host_bytes`]) and the floor's share of them; under `spill` the pages
+    /// past the floor ([`kv_host_room`]) and none at it; `None` under `off`, or under `spill`
+    /// with no floor in force (the card holds the cap) or on a layout that declares no rooms (a
+    /// file without the selector). The page a host-capable room takes is read here, refused by
+    /// name where unread.
+    fn kv_host_charge(
+        &self,
+        floor: Option<u64>,
+        (ctx, slots): (u64, u64),
+        kv: KvHost,
+    ) -> Result<Option<(u64, u64)>, PlacementError> {
+        match kv {
+            KvHost::Off => Ok(None),
+            KvHost::All => {
+                let page = self.kv_host_page_of()?;
+                let bytes = self.kv_host_bytes(ctx, slots, page)?;
+                let at_floor = match floor {
+                    Some(f) => self.kv_host_bytes(f.min(ctx), slots, page)?,
+                    None => bytes,
+                };
+                Ok(Some((bytes, at_floor)))
+            }
+            KvHost::Spill => {
+                let Some(rooms) = self.kv.rooms() else {
+                    return Ok(None);
+                };
+                let page = self.kv_host_page_of()?;
+                let bytes = kv_host_room(&rooms.times(slots), ctx, floor, KvHost::Spill, page);
+                Ok((bytes > 0).then_some((bytes, 0)))
+            }
+        }
     }
 
     /// `machine`'s cards with the page rounding of room-backed stores reserved, each card its own
@@ -1277,19 +1313,18 @@ impl PlanInputs {
             };
             let floor = 2 * self.seq_state_bytes(ctx_max, beside.mtp);
             let room = plan.plan_at(&self.room);
-            // Under `all` the planes hold their bytes on the host, out of the
-            // room the plan was made at, refused by name where no expert
-            // split can make their room
+            // Under `all` the planes hold their bytes on the host, and under `spill` the
+            // pages past the plan's floor, out of the room the plan was made at, refused by
+            // name where no expert split can make their room
             // ([`PlacementError::KvHostOverHost`]): before the PLE table's
             // tier and the NVMe tier's split read the room, so both see the
-            // room the planes already took.
-            if levers.kv_host == KvHost::All {
-                let page = self.kv_host_page_of()?;
-                let bytes = self.kv_host_bytes(ctx_max, beside.slots as u64, page)?;
-                let at_floor = match plan.kv_floor {
-                    Some(f) => self.kv_host_bytes(f.min(ctx_max), beside.slots as u64, page)?,
-                    None => bytes,
-                };
+            // room the planes already took. The part past the floor is the growth the host
+            // experts the split pages yield to ([`Plan::kv_host_planes`]).
+            if let Some((bytes, at_floor)) = self.kv_host_charge(
+                plan.kv_floor,
+                (ctx_max, beside.slots as u64),
+                levers.kv_host,
+            )? {
                 plan.kv_host_planes(bytes, at_floor)?;
             }
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
@@ -3049,6 +3084,13 @@ impl KvBytes for KvLayout {
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
         self.rope_row * ctx_max
     }
+
+    /// The selecting layers' planes are host-capable rooms whose body yields host experts to
+    /// their growth (`Body38`'s `KvRoomBody::host_grow`); a layout with no such buffer has
+    /// none to grow.
+    fn host_yields(&self) -> bool {
+        self.rooms.as_ref().is_some_and(PosLayout::host_capable)
+    }
 }
 
 // ------------------------------------------------------------- the MTP draft
@@ -4564,27 +4606,14 @@ mod tests {
         );
     }
 
-    /// A qwen4exp plan under `BLOOMERY_KV_HOST=all` holds its K/V planes on
-    /// the host: the card's cache term drops the planes (the half GiB the
-    /// cap takes on this header's one attention layer), so the expert spread
-    /// gets their bytes as a floor's do — every expert back where the cap's
-    /// KV displaced all but 14 — while the pooled keys, the ring and the
-    /// stage rows stay counted. The host counts the planes' whole bytes,
-    /// every plane buffer rounded at the page a host-capable room takes, out
-    /// of the room the plan was made at, refused by name one byte under
-    /// their need; the plan's `kv_host` says the backing, and `all` beside a
-    /// `BLOOMERY_KV_FLOOR` is refused by name.
-    ///
-    /// FAIL-first: a plan that ignores the backing holds the cap's 14
-    /// experts and its cap's cache term.
-    #[test]
-    fn a_qwen4exp_plan_holds_its_kv_planes_on_the_host_under_all() {
+    /// The synthetic qwen4exp file the host-backing plans are made from, named `name`: one
+    /// attention layer whose K/V rows are 2,048 wide per head, routed stacks of 8 experts at
+    /// Q4_K (gate, up) and Q8_0 (down), described with the host room unbounded and a 2 MiB page
+    /// for a host-capable room, and a machine of one 1.75 GiB card.
+    fn kv_host_fixture(name: &str) -> (super::PlanInputs, crate::placement::Machine) {
         use crate::arch::qwen35moe::hparams::tests::{keys, tensors};
         use crate::arch::synthetic::{Ty, V, header_typed};
-        use crate::placement::PlanLevers;
-        use crate::placement::workstation::{HostNeed, HostRead};
-        use bloomery_levers::KvHost;
-        use runtime::stores::kv_plane_bytes;
+        use crate::placement::workstation::HostRead;
 
         let typed: Vec<_> = tensors()
             .into_iter()
@@ -4613,13 +4642,12 @@ mod tests {
                 )
             })
             .collect();
-        let path = header_typed("q4x-kvhost", "qwen4exp", &keys, &pre, &typed);
+        let path = header_typed(name, "qwen4exp", &keys, &pre, &typed);
         let split = gguf::Split::open(&path).expect("the synthetic header opens");
         let mut inputs = super::PlanInputs::describe_in(&split, (u64::MAX, HostRead::Given))
             .expect("the file describes");
         let _ = std::fs::remove_file(&path);
-        let page = 2u64 << 20;
-        inputs.kv_host_page = Some(page);
+        inputs.kv_host_page = Some(2u64 << 20);
         let small = crate::placement::workstation::CardSpec {
             name: "small",
             total_bytes: 7 << 28,
@@ -4636,6 +4664,31 @@ mod tests {
             crate::arch::qwen35moe::place::Stack::q8_blocks32(inputs.model.layers),
             8,
         );
+        (inputs, machine)
+    }
+
+    /// A qwen4exp plan under `BLOOMERY_KV_HOST=all` holds its K/V planes on
+    /// the host: the card's cache term drops the planes (the half GiB the
+    /// cap takes on this header's one attention layer), so the expert spread
+    /// gets their bytes as a floor's do — every expert back where the cap's
+    /// KV displaced all but 14 — while the pooled keys, the ring and the
+    /// stage rows stay counted. The host counts the planes' whole bytes,
+    /// every plane buffer rounded at the page a host-capable room takes, out
+    /// of the room the plan was made at, refused by name one byte under
+    /// their need; the plan's `kv_host` says the backing, and `all` beside a
+    /// `BLOOMERY_KV_FLOOR` is refused by name.
+    ///
+    /// FAIL-first: a plan that ignores the backing holds the cap's 14
+    /// experts and its cap's cache term.
+    #[test]
+    fn a_qwen4exp_plan_holds_its_kv_planes_on_the_host_under_all() {
+        use crate::placement::PlanLevers;
+        use crate::placement::workstation::{HostNeed, HostRead};
+        use bloomery_levers::KvHost;
+        use runtime::stores::kv_plane_bytes;
+
+        let (mut inputs, machine) = kv_host_fixture("q4x-kvhost");
+        let page = 2u64 << 20;
         // The one attention layer's planes, derived from its header shape:
         // what leaves the card's cache term and lands on the host, each of
         // the two plane buffers rounded at the host-capable page.
@@ -4746,6 +4799,104 @@ mod tests {
             text.contains("BLOOMERY_KV_HOST") && text.contains("BLOOMERY_KV_FLOOR"),
             "{text}"
         );
+    }
+
+    /// A qwen4exp plan under the default `spill` and a `BLOOMERY_KV_FLOOR` charges the host the
+    /// pages of its K/V planes past the floor, and charges them as growth: the plane buffers
+    /// are host-capable rooms, so the load yields host experts to them as they fill
+    /// (`PlanInputs::kv_host_charge`, `KvBytes::host_yields` of the layout) [derived by hand
+    /// from the header: one selecting layer, `heads` kv heads of 2,048 values, K and V planes of
+    /// f16, 2 MiB pages]. A plane run is 65,536 x 2,048 x 2 B = 128 pages at the cap and 4,096 x
+    /// 2,048 x 2 B = 8 pages at the floor, so the planes hold 2 x `heads` x 120 pages past it:
+    /// the plan's `kv_host_bytes`, none of it charged at the floor (`floor_bytes` 0, no ring
+    /// shadow on this family), all of it `grow_bytes`; a room that holds them beside every host
+    /// expert pages nothing (`GrowHold::Room`). `off`, or no floor, charge nothing and arm
+    /// nothing. Before this change a `spill` plan counted no page of them against the room at
+    /// all. The experts the split pages and the growth they yield to are the owner's tests
+    /// (`placement::tests::host_grow`); this file's table of rows (PLE) moves after the pages
+    /// are counted, so its room does not page them.
+    // PIN(2026-11-18): host K/V charged at the floor, grown by yield. Before, the plan counted
+    // the host K/V of a Qwen3.8 file only under `all` (0 B under `spill`, so a session's growth
+    // past the floor could meet no room); now `spill` counts the pages past the floor and the
+    // paged experts yield to them.
+    // Mutants: `kv_host_charge` returning `None` under `spill` (nothing grows),
+    // `host_yields` false on the layout (the charge stays at the cap).
+    #[test]
+    fn a_qwen4exp_plan_under_spill_grows_its_host_pages_by_yield() {
+        use crate::placement::workstation::{HostNeed, HostRead};
+        use crate::placement::{GrowHold, PlanLevers};
+        use bloomery_levers::KvHost;
+
+        let (mut inputs, machine) = kv_host_fixture("q4x-kvhost-grow");
+        let page = 2u64 << 20;
+        let (heads, dim) = inputs
+            .spec
+            .layers
+            .iter()
+            .find_map(|l| match &l.mixer {
+                Mixer::Gqa(g) if g.select.is_some() => Some((g.kv_heads, g.head_dim)),
+                _ => None,
+            })
+            .map(|(h, d)| (u64::from(h), u64::from(d)))
+            .expect("a selecting layer");
+        let whole = |n: u64| n.div_ceil(page) * page;
+        let planes_at = |at: u64| 2 * whole(heads * at * dim * 2);
+        let past_floor = planes_at(65_536) - planes_at(4_096);
+        assert_eq!(
+            past_floor,
+            2 * heads * 120 * page,
+            "120 pages a run past the floor"
+        );
+        let levers = |host, floor| PlanLevers {
+            kv_host: host,
+            kv_floor: floor,
+            ..PlanLevers::default()
+        };
+        fn plan<'a>(
+            inputs: &'a super::PlanInputs,
+            machine: &'a crate::placement::Machine,
+            levers: &PlanLevers,
+            experts: super::Experts,
+        ) -> crate::placement::Plan<'a> {
+            inputs
+                .plan_with(machine, (65_536, 8), levers, experts)
+                .expect("the plan")
+        }
+        let card = super::Experts::Card;
+        let spill = plan(&inputs, &machine, &levers(KvHost::Spill, Some(4_096)), card);
+        assert_eq!(spill.host.kv_host_bytes, past_floor);
+        let grow = &spill.host.grow;
+        assert_eq!(grow.hold, GrowHold::Room);
+        assert_eq!(
+            (grow.floor, grow.floor_bytes, grow.grow_bytes),
+            (4_096, 0, past_floor)
+        );
+        assert!(grow.yields.is_empty(), "the room pages no expert");
+        for (host, floor, why) in [
+            (KvHost::Off, Some(4_096), "no host backing"),
+            (KvHost::Spill, None, "no floor in force"),
+        ] {
+            let held = plan(&inputs, &machine, &levers(host, floor), card);
+            assert_eq!(held.host.kv_host_bytes, 0, "{why}");
+            assert!(!held.host.grow.armed(), "{why}");
+        }
+        // The pages count against the room the plan is made at: with every expert on the card
+        // the room one byte under the need cannot hold them and the plan is refused by name,
+        // where before a `spill` plan counted none.
+        let need = HostNeed::of(&spill, 0).plan_bytes();
+        inputs.room = (need - 1, HostRead::Given);
+        let over = inputs
+            .plan_with(
+                &machine,
+                (65_536, 8),
+                &levers(KvHost::Spill, Some(4_096)),
+                card,
+            )
+            .expect_err("one byte under the need is refused");
+        assert!(matches!(
+            &over,
+            PlaceError::Placement(PlacementError::KvHostOverHost { bytes, .. }) if *bytes == past_floor
+        ));
     }
 
     /// A qwen4exp file's stream slot is its widest routed expert, the gate, up and down at their

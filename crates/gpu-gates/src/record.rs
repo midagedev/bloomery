@@ -346,7 +346,7 @@ pub static TP_TEXT: Kind = Kind {
 pub static PLAN38: Kind = Kind {
     name: "plan38",
     head: "plan",
-    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, the positions a plan's expert spread runs at when BLOOMERY_KV_FLOOR moves them below the context (kv_floor; absent when the spread runs at the context itself), where a qwen4exp plan's           selecting stores back their K/V planes (kv_host, off, spill or all; absent on another           family's line), where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; the cap on the cards' routed experts the plan was made under when BLOOMERY_CARD_EXPERTS_CAP set one (card_experts_cap; the cards then hold exactly that many); for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read), and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none). A plan that holds the MTP draft beside the target also prints the rows of the draft's store walk its arena is made for (mtp_rows, 64 or 512) and why (mtp_rows_why: room, the plan with the 512-row arena holds and keeps every card expert the 64-row one keeps; displaces:N, it leaves the card N fewer experts; short, the card cannot hold it; reserve, a plan (b′) machine's reserve row names the smaller arena; asked, the inputs named the rows).",
+    doc: "A qwen3moe-family placement the engine is about to load by: its card, the architecture (a placed qwen3moe or qwen35moe file names it; a qwen4exp line does not), the expert rule (host or card), the context, the positions a plan's expert spread runs at when BLOOMERY_KV_FLOOR moves them below the context (kv_floor; absent when the spread runs at the context itself), where a qwen4exp plan's           selecting stores back their K/V planes (kv_host, off, spill or all; absent on another           family's line), under a floor with host-backed planes the host K/V's growth as the plan line of the other families states it (host_kv_floor, host_kv_grow, grow, grow_why, grow_yield, grow_experts; absent on a plan with no floor, under kv_host=off or on a family whose loads yield nothing), where the routed experts sit (each layer's id prefix on the card, a placed line stating as n_l the fewest and the most one layer keeps; under plan (b′) the expert tier card and the next ids it holds), each plan card's device as the plan record names them, the card's free bytes at plan time when the census read them, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and — on the placed plan a run with --place unset took because the whole file did not fit the free bytes — why it did not; the cap on the cards' routed experts the plan was made under when BLOOMERY_CARD_EXPERTS_CAP set one (card_experts_cap; the cards then hold exactly that many); for a file with a row-gathered table (a qwen4exp file's PLE table), the tier the plan reads it from (rows, host or nvme) and the host room's reading that chose it (read), and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none). A plan that holds the MTP draft beside the target also prints the rows of the draft's store walk its arena is made for (mtp_rows, 64 or 512) and why (mtp_rows_why: room, the plan with the 512-row arena holds and keeps every card expert the 64-row one keeps; displaces:N, it leaves the card N fewer experts; short, the card cannot hold it; reserve, a plan (b′) machine's reserve row names the smaller arena; asked, the inputs named the rows).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -355,6 +355,12 @@ pub static PLAN38: Kind = Kind {
         key("ctx_max", U64, "positions"),
         opt("kv_floor", U64, "positions"),
         opt("kv_host", Word, ""),
+        opt("host_kv_floor", U64, "B"),
+        opt("host_kv_grow", U64, "B"),
+        opt("grow", Word, ""),
+        opt("grow_why", Word, ""),
+        opt("grow_yield", U64, "B"),
+        opt("grow_experts", U64, "experts"),
         key("host_experts", U64, "experts"),
         key("card_experts", U64, "experts"),
         opt("n_l", Word, "experts"),
@@ -3206,11 +3212,12 @@ pub mod groups {
     /// `serve_seats/hybrid.rs` (the seats of the bodies that run one chain on
     /// one card).
     pub mod hybrid {
-        use crate::record::{Kind, LANE, LOAD_PHASES};
+        use crate::record::{HOST_YIELD, Kind, LANE, LOAD_PHASES};
 
         /// A hybrid seat's load: the lane's rate and the load's phases
-        /// (`hybrid::open_session`).
-        pub const GROUP: &[&Kind] = &[&LANE, &LOAD_PHASES];
+        /// (`hybrid::open_session`), and the host experts a call's host K/V growth yielded to the
+        /// NVMe tier (`Hybrid::print_host_yields`).
+        pub const GROUP: &[&Kind] = &[&LANE, &LOAD_PHASES, &HOST_YIELD];
     }
 
     /// `side_seat.rs`.
@@ -3524,6 +3531,7 @@ pub static BLOOMERY_SERVE_QWEN38: &[&Kind] = kinds![
         &CALL_STREAM_END,
         &XSTREAM_END,
         &RESIDENCY_PASS,
+        &HOST_YIELD,
         &RESIDENCY_RESET,
     ],
     groups::bind::SLOTS,
@@ -3628,6 +3636,7 @@ pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
     groups::drafted::WIDTH,
     groups::host_tier::ARENA,
     groups::host_tier::CENSUS,
+    &[&HOST_YIELD],
     groups::bind::CACHE,
     groups::card_bytes::WATCH,
 ];
@@ -3903,6 +3912,7 @@ pub static GENERATE_QWEN3MOE: &[&Kind] = &[
     &RESIDENCY_UNSET,
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
+    &HOST_YIELD,
     &RESIDENCY_RESET,
     &CALL_STREAM,
     &CALL_STREAM_END,
@@ -4146,8 +4156,16 @@ fn with_grow(r: Record, g: &HostGrow) -> Record {
     if !g.armed() {
         return r;
     }
+    with_grow_parts(r.u("kv_floor", g.floor), g)
+}
+
+/// `r` with the host K/V growth's parts after its floor (`host_kv_floor` on): for a plan line
+/// that prints the floor itself ([`PLAN38`]). None on a growth not armed.
+pub fn with_grow_parts(r: Record, g: &HostGrow) -> Record {
+    if !g.armed() {
+        return r;
+    }
     let r = r
-        .u("kv_floor", g.floor)
         .u("host_kv_floor", g.floor_bytes)
         .u("host_kv_grow", g.grow_bytes)
         .w("grow", g.hold.name());

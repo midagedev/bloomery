@@ -57,7 +57,10 @@ use crate::routed_block::RouterEntry;
 use crate::site::{KGemvKernels, SiteTy};
 use crate::tensor::{WindowMut, copy_row};
 use crate::weights::{DevWeight, Weights};
-use crate::{CardKeep, FreedBytes, Gpu, GpuError, KvRoomBody, LAYER_HEAD, RoomTensor, fit_rooms};
+use crate::{
+    CardKeep, FreedBytes, Gpu, GpuError, HostGrowBook, HostGrowStats, HostYieldMove, HostYielder,
+    KvRoomBody, LAYER_HEAD, RoomTensor, fit_rooms,
+};
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
@@ -680,6 +683,9 @@ pub struct Body {
     /// The position the stores stand at: the next step's.
     held: u32,
     ctx: usize,
+    /// The books of the host K/V's growth ([`HostGrowBook`]), on a placed load whose plan keeps
+    /// host experts to yield to it; the host tier's residency yields them.
+    host_grow: Option<HostGrowBook>,
 }
 
 impl GpuModel<Body> {
@@ -807,6 +813,9 @@ impl GpuModel<Body> {
                 };
                 let mut body =
                     Body::load(gpu, file, w, (inputs.hp.clone(), ctx), Some((open, card)))?;
+                // A plan that keeps host experts to yield to its K/V's growth reads that growth in
+                // its rooms' host pages, the page read once here.
+                body.host_grow = HostGrowBook::at_load(plan, gpu.context().ordinal())?;
                 if host_head {
                     body.host_head = Some(HostHead::open(Arc::clone(file), inputs.hp.rms_eps)?);
                 }
@@ -1128,6 +1137,7 @@ impl Body {
             acts,
             ctx,
             hp,
+            host_grow: None,
         })
     }
 
@@ -1690,6 +1700,21 @@ impl Body {
             .fold((0, 0), |(c, h), (rc, rh)| (c + rc, h + rh))
     }
 
+    /// The host experts' yields to the host K/V's growth since the last take, oldest first; none
+    /// on a load whose plan keeps no expert to yield.
+    pub fn take_host_yields(&mut self) -> Vec<HostYieldMove> {
+        self.host_grow
+            .as_mut()
+            .map_or_else(Vec::new, HostGrowBook::take_moves)
+    }
+
+    /// The tallies of the host experts' yields since the load, `None` on a load whose plan keeps
+    /// no expert to yield.
+    #[must_use]
+    pub fn host_grow_stats(&self) -> Option<HostGrowStats> {
+        self.host_grow.as_ref().map(HostGrowBook::stats)
+    }
+
     /// The rooms fitted through `pos + rows` positions before a launch writes row `pos` on:
     /// [`fit_rooms`], the residency machine freeing expert bytes for a card that ran out (a load
     /// with none refuses by name). Never inside a capture.
@@ -1732,6 +1757,29 @@ impl KvRoomBody for Body {
                 }
             })
             .sum()
+    }
+
+    fn host_asks(&self, through: usize) -> u64 {
+        self.layers
+            .iter()
+            .map(|layer| match &layer.mixer {
+                Mixer::Kda { .. } => 0,
+                Mixer::Mla { cache, index, .. } => {
+                    cache.host_asks(through)
+                        + index.as_ref().map_or(0, |ix| ix.room().host_asks(through))
+                }
+            })
+            .sum::<usize>() as u64
+    }
+
+    fn host_grow(&mut self) -> Option<(&mut HostGrowBook, &mut dyn HostYielder)> {
+        let Body {
+            host_grow, placed, ..
+        } = self;
+        let book = host_grow.as_mut()?;
+        let ResidencyParts { hybrid, .. } = placed.as_mut().and_then(TierBody::residency_parts)?;
+        let residency = hybrid.residency_mut()?;
+        Some((book, residency))
     }
 
     fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {

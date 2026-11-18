@@ -128,6 +128,7 @@ impl PlanInputs {
         let rooms = hp.pos_layout();
         Ok(PlanInputs::new(ENGINE, hp, read.tensors, read.spec)?
             .with_rooms(rooms)
+            .with_host_yields()
             .with_tier_reserve(tier)
             .with_nvme_tier())
     }
@@ -634,6 +635,77 @@ mod tests {
         let bare = kv(&inputs);
         inputs.room_page = Some(PAGE);
         assert_eq!(kv(&inputs) - bare, 143_360 + 1_662_976 + PAGE);
+    }
+
+    /// A K3.1 plan with a floor charges its host-able cached row at the floor and leaves the
+    /// growth past it to the host experts its load yields (`HostGrow`; the body's
+    /// `KvRoomBody::host_grow`) [derived by hand, the fixture's one latent layer, page 2 MiB, 262,144
+    /// positions, floor 8,192]: the cached run is 144 whole pages (301,989,888 B) at the cap and 5
+    /// (10,485,760 B) at the floor, so under `spill` nothing is charged at the floor and
+    /// 291,504,128 B grow. The growth is armed only with a floor in force and the host backing
+    /// on (`off`, or no floor, charge the cap; `all` takes no floor, it plans the spread at zero
+    /// card positions), and only on a file with a host-able room: K3's scanned latent cache has
+    /// none, so it charges nothing at either bound. The room holds the fixture's whole model,
+    /// so the split pages nothing (`GrowHold::Room`).
+    // PIN(2026-11-18): host K/V charged at the floor, grown by yield. Before, a plan with a floor
+    // charged the cached row's pages past it (`kv_host_bytes`, 291,504,128 B under `spill`)
+    // against the host room at the cap, so the split paged the experts those pages displace at
+    // load; now the same bytes are the growth (`grow_bytes`), and the experts the split pages at
+    // the cap stay on the host and yield as the pages arrive. `kv_host_bytes` is the cap's still
+    // (the pin above in `a_k31_plan_counts_its_host_pages_and_padding`).
+    // Mutants: `with_host_yields` left out of `describe` (the growth never arms),
+    // `PosLayout::host_capable` true for a scanned buffer (K3 arms with nothing to grow).
+    #[test]
+    fn a_k31_plan_with_a_floor_grows_its_host_pages_by_yield() {
+        use crate::placement::GrowHold;
+        use bloomery_levers::KvHost;
+        const PAGE: u64 = 2 << 20;
+        const CTX: u64 = 262_144;
+        const FLOOR: u64 = 8_192;
+        let machine = workstation::plan_gate(4);
+        let levers = |host, floor| PlanLevers {
+            kv_host: host,
+            kv_floor: floor,
+            ..PlanLevers::default()
+        };
+        let grow = |inputs: &PlanInputs, levers: &PlanLevers| {
+            inputs
+                .plan(&machine, CTX, levers)
+                .unwrap_or_else(|e| panic!("the gate machine plans {CTX}: {e}"))
+                .host
+                .grow
+        };
+        let mut k31 = PlanInputs::describe(&opened31("kimi-k31-place-grow"))
+            .expect("the synthetic K3.1 header describes");
+        k31.kv_host_page = Some(PAGE);
+        let spill = grow(&k31, &levers(KvHost::Spill, Some(FLOOR)));
+        assert_eq!(spill.hold, GrowHold::Room);
+        assert_eq!(
+            (spill.floor, spill.floor_bytes, spill.grow_bytes),
+            (FLOOR, 0, 291_504_128)
+        );
+        assert!(spill.yields.is_empty(), "the room pages no expert");
+        assert_eq!(spill.cap_bytes(), 291_504_128);
+        let refused = k31
+            .plan(&machine, CTX, &levers(KvHost::All, Some(FLOOR)))
+            .expect_err("`all` and a floor do not say where the spread runs");
+        assert!(
+            refused.to_string().contains("BLOOMERY_KV_FLOOR"),
+            "{refused}"
+        );
+        for (host, floor, why) in [
+            (KvHost::Spill, None, "no floor in force"),
+            (KvHost::All, None, "no floor in force"),
+            (KvHost::Off, Some(FLOOR), "no host backing"),
+        ] {
+            assert!(!grow(&k31, &levers(host, floor)).armed(), "{why}");
+        }
+        let mut k3 = described("kimi-k3-place-grow");
+        k3.kv_host_page = Some(PAGE);
+        assert!(
+            !grow(&k3, &levers(KvHost::Spill, Some(FLOOR))).armed(),
+            "a scanned latent cache has no host term to grow"
+        );
     }
 
     /// The rounding lands on the card that holds the room's layer, with that card's spare page,

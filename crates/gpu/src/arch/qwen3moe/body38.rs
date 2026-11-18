@@ -179,8 +179,8 @@ use crate::tensor::{WindowMut, to_host};
 use crate::weights::{Weights, tensor_scales};
 use crate::{Branch, DeviceTensor, Gpu, GpuError, SharedPages, StagedRows, launch_u32, ple, qsa};
 use crate::{
-    CardKeep, Elastic, ElasticBody, ElasticStats, FillHeld, FilledBytes, FreedBytes, KvRoomBody,
-    fit_rooms, take_fill_first,
+    CardKeep, Elastic, ElasticBody, ElasticStats, FillHeld, FilledBytes, FreedBytes, HostGrowBook,
+    HostGrowStats, HostYieldMove, HostYielder, KvRoomBody, fit_rooms, take_fill_first,
 };
 use bloomery_levers::{ChurnHosting, HostCfg};
 use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
@@ -1416,6 +1416,9 @@ pub struct Body38 {
     marker: Option<EndMarker>,
     /// What a sequence state of this load belongs to.
     who: Identity,
+    /// The books of the host K/V's growth ([`HostGrowBook`]), on a placed load whose plan keeps
+    /// host experts to yield to it; the host tier's residency yields them.
+    host_grow: Option<HostGrowBook>,
 }
 
 /// The model a Qwen3.8 load reads ([`Body38::open_placed`] and its siblings): a GGUF split, or a
@@ -2284,6 +2287,9 @@ impl Body38 {
             end_mark: None,
             marker: None,
             who,
+            // A plan that keeps host experts to yield to its K/V's growth reads that growth in
+            // its rooms' host pages, the page read once here.
+            host_grow: HostGrowBook::at_load(plan, gpu.context().ordinal())?,
         };
         body.sp.write(stream, 0, 0)?;
         // Last: the machine frees each layer's spare slots, and every piece
@@ -2833,6 +2839,21 @@ impl Body38 {
     /// with the kind of the pass it ended; the log keeps its capacity.
     pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
         self.residency_glue.take_passes()
+    }
+
+    /// The host experts' yields to the host K/V's growth since the last take, oldest first; none
+    /// on a load whose plan keeps no expert to yield.
+    pub fn take_host_yields(&mut self) -> Vec<HostYieldMove> {
+        self.host_grow
+            .as_mut()
+            .map_or_else(Vec::new, HostGrowBook::take_moves)
+    }
+
+    /// The tallies of the host experts' yields since the load, `None` on a load whose plan keeps
+    /// no expert to yield.
+    #[must_use]
+    pub fn host_grow_stats(&self) -> Option<HostGrowStats> {
+        self.host_grow.as_ref().map(HostGrowBook::stats)
     }
 
     /// The residency machine's late-flip debug ring, taken
@@ -5774,6 +5795,22 @@ impl KvRoomBody for Body38 {
 
     fn asks(&self, through: usize) -> usize {
         self.stores.iter().map(|s| s.asks(through)).sum()
+    }
+
+    fn host_asks(&self, through: usize) -> u64 {
+        self.stores
+            .iter()
+            .map(|s| s.host_asks(through))
+            .sum::<usize>() as u64
+    }
+
+    fn host_grow(&mut self) -> Option<(&mut HostGrowBook, &mut dyn HostYielder)> {
+        let Body38 {
+            host_grow, hybrid, ..
+        } = self;
+        let book = host_grow.as_mut()?;
+        let residency = hybrid.residency_mut()?;
+        Some((book, residency))
     }
 
     fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {

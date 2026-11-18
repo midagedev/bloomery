@@ -353,6 +353,16 @@ impl Room {
             .saturating_mul(self.page)
     }
 
+    /// [`Room::asks`] where the new pages may land on the host (a [`Backing::Host`] or
+    /// [`Backing::Spill`] room: the most a spill room's fit asks of the host, the pages the
+    /// card still holds counted); 0 for a card room, whose pages the host K/V does not hold.
+    pub(crate) fn host_asks(&self, positions: usize) -> usize {
+        match self.backing {
+            Backing::Card => 0,
+            Backing::Host | Backing::Spill { .. } => self.asks(positions),
+        }
+    }
+
     /// A fit's named refusal of page `i`, the driver's `source` in it: the
     /// store, the positions the fit asked, the bytes of new pages the fit
     /// still asked, the page among the room's, the pages the room had backed
@@ -954,6 +964,12 @@ impl<V: Views> Roomed<V> {
         self.rooms.iter().map(|r| r.asks(positions)).sum()
     }
 
+    /// The bytes of new pages a fit of `positions` positions still asks of the rooms whose pages
+    /// may land on the host ([`Room::host_asks`]).
+    pub(crate) fn host_asks(&self, positions: usize) -> usize {
+        self.rooms.iter().map(|r| r.host_asks(positions)).sum()
+    }
+
     /// Every row backed: what a read or write of the whole buffers takes.
     pub(crate) fn fill(&mut self) -> Result<(), GpuError> {
         self.fit(usize::MAX)
@@ -1254,6 +1270,11 @@ mod tests {
         let at = (r[0].cu_deviceptr(), r[1].cu_deviceptr());
         assert_eq!(r.mapped(), 0, "no page before a fit");
         assert_eq!(r.whole(), 18 * page, "every page of both buffers");
+        assert_eq!(
+            (r.asks(1), r.host_asks(1)),
+            (4 * page, 0),
+            "a card room asks pages and none of them the host's"
+        );
         for (positions, pages) in [(1, 4), (4, 6), (5, 8)] {
             r.fit(positions).expect("a fit");
             assert_eq!(r.mapped(), pages * page, "a fit of {positions} positions");
@@ -1658,12 +1679,18 @@ mod tests {
                 .0
         };
         let before = free();
+        assert_eq!(
+            (r.asks(rows), r.host_asks(rows)),
+            (4 * page, 4 * page),
+            "a host room's asks are host asks"
+        );
         r.fit(rows).expect("a fit of every row");
         let after = free();
         assert!(
             before.saturating_sub(after) <= page,
             "a host fit takes no card bytes beyond the spare: {before} then {after}, page {page}"
         );
+        assert_eq!(r.host_asks(rows), 0, "a fitted room asks nothing more");
         assert_eq!(r.host_mapped(), 4 * page, "every page on the host");
         assert_eq!(r.mapped(), 0, "no page on the card");
         let read = |r: &Roomed<[DeviceBuffer<u32>; 1]>, j: usize| {

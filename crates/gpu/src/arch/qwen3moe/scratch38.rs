@@ -249,6 +249,17 @@ impl Store38 {
         }
     }
 
+    /// [`Store38::asks`] of the rooms whose new pages may land on the host (the K/V planes under
+    /// `BLOOMERY_KV_HOST` `spill` or `all`; the pooled keys are card-only); none for a delta store.
+    pub(super) fn host_asks(&self, positions: usize) -> usize {
+        match self {
+            Store38::Rec(_) => 0,
+            Store38::Qsa { kv, pooled, .. } => {
+                kv.host_asks(positions) + pooled.host_asks(positions)
+            }
+        }
+    }
+
     /// A selecting store's pages a write from position `pos` on reaches given
     /// memory no other sequence's store maps ([`Room::own_from`]): every
     /// writer's first step after its fit. Never inside a capture.

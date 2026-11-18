@@ -21,8 +21,8 @@
 //! reply's sections (`kimi_k3::spec::REASONING`), so the server splits the think span into
 //! `reasoning_content` and serves the response section's text as `content`.
 
-use bloomery_gpu::GpuModel;
 use bloomery_gpu::arch::kimi_k3::Body;
+use bloomery_gpu::{GpuModel, HostYieldMove};
 use bloomery_gpu_gates::generate::{Place, TierRule};
 use bloomery_gpu_gates::kimi_k3_pass::{self, Picked};
 use bloomery_gpu_gates::{GateError, record, side_seat};
@@ -127,6 +127,12 @@ impl Family for KimiK3 {
                 GpuModel::<Body>::open_placed_pass(file, plan, inputs, 0, host, shape)
             }),
         )))
+    }
+
+    /// The host experts' yields to the host K/V's growth ([`Body::take_host_yields`]): a K3.1
+    /// file's host-backed latent rows grow past the plan's floor by giving up host experts.
+    fn host_yields(m: &mut GpuModel<Body>) -> Result<Vec<HostYieldMove>, GateError> {
+        Ok(m.body_parts(NAME)?.2.take_host_yields())
     }
 
     /// The rows of the pass the placed load holds ([`Body::pass_shape`]), which `Batch::prompt`

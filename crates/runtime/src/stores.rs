@@ -520,6 +520,17 @@ impl PosLayout {
         whole.checked_mul(self.slots)
     }
 
+    /// Whether any layer holds a buffer a host-backed room may back ([`Class::Host`], a `Select`
+    /// buffer): the layout has a host term to grow. A layout of scanned buffers alone is card-only
+    /// whatever `BLOOMERY_KV_HOST` says.
+    #[must_use]
+    pub fn host_capable(&self) -> bool {
+        self.layers
+            .iter()
+            .flatten()
+            .any(|b| b.access.class() == Class::Host)
+    }
+
     /// Layers the layout names.
     #[must_use]
     pub fn layers(&self) -> usize {
@@ -856,6 +867,38 @@ mod pos_layout_tests {
     fn a_scanned_buffer_is_card_class_and_a_selected_one_host_class() {
         assert_eq!(Access::Scan.class(), Class::Card);
         assert_eq!(Access::Select { rows: 1 }.class(), Class::Host);
+    }
+
+    /// A layout has a host term to grow only where a buffer is host-class: the selecting layers'
+    /// planes are, a layout of scanned buffers alone (K3's latent cache) and an empty one are not,
+    /// so a family whose body yields host experts to its host K/V's growth arms the planner's
+    /// growth (`KvBytes::host_yields` of the placement crate) on the first and on nothing else.
+    /// Mutant: `host_capable` true for a scanned buffer.
+    #[test]
+    fn a_layout_is_host_capable_by_a_selected_buffer_only() {
+        assert!(layout(false).host_capable());
+        assert!(layout(true).host_capable());
+        let scanned = |what| PosBuf {
+            what,
+            row: 256,
+            per: 1,
+            runs: 1,
+            access: Access::Scan,
+        };
+        let card_only = PosLayout::new(vec![vec![scanned("cache")], vec![scanned("index")]]);
+        assert!(!card_only.host_capable());
+        assert!(!PosLayout::new(vec![vec![], vec![]]).host_capable());
+        let mixed = PosLayout::new(vec![
+            vec![scanned("cache")],
+            vec![PosBuf {
+                what: "cache",
+                row: 256,
+                per: 1,
+                runs: 1,
+                access: Access::Select { rows: 4 },
+            }],
+        ]);
+        assert!(mixed.host_capable(), "one selected layer is enough");
     }
 
     /// A room backs whole pages run by run: at 8,192 positions each 512 B plane run is 4 MiB, 2

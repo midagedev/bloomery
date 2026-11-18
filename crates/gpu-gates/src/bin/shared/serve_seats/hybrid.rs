@@ -23,7 +23,7 @@ use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::TierBody;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::model::{ChainBody, StepMode};
-use bloomery_gpu::{GpuError, GpuModel};
+use bloomery_gpu::{GpuError, GpuModel, HostYieldMove};
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::bind::{Seat, note_line};
 use bloomery_gpu_gates::generate::{Lane, Place, TierRule};
@@ -115,6 +115,13 @@ pub trait Family: Sized + 'static {
             Self::FAMILY
         )
         .into())
+    }
+
+    /// The host experts' yields to the host K/V's growth since the last take, oldest first
+    /// (`KvRoomBody::host_grow`): the seat prints each as a `host yield` record after the call
+    /// that asked for it. None for a body whose loads yield nothing (the default).
+    fn host_yields(_m: &mut GpuModel<Self::Body>) -> Result<Vec<HostYieldMove>, GateError> {
+        Ok(Vec::new())
     }
 
     /// The rows of the prompt pass the loaded body holds, which its prompt runs by; `None` for a
@@ -454,6 +461,17 @@ fn open_pass<F: Family>(
     Ok(Loaded::from_model(m, cfg, held).watched(log.card_watch()?)?)
 }
 
+impl<F: Family> Hybrid<F> {
+    /// The `host yield` records of the host K/V's growth the call asked for, on stderr; nothing
+    /// (and no allocation) on a call that yielded none.
+    fn print_host_yields(&mut self) -> Result<(), GateError> {
+        for m in F::host_yields(self.s.model_mut())? {
+            record::host_yield(&m).eprint();
+        }
+        Ok(())
+    }
+}
+
 impl<F: Family> Seat for Hybrid<F> {
     fn slots(&self) -> usize {
         <F::Body as Batch>::Sequences::count(&self.s)
@@ -486,6 +504,7 @@ impl<F: Family> Seat for Hybrid<F> {
             .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         self.census
             .prompt(Some(self.s.model().body(F::NAME)?.hybrid()));
+        self.print_host_yields()?;
         Ok(next)
     }
 
@@ -496,6 +515,7 @@ impl<F: Family> Seat for Hybrid<F> {
         };
         self.s
             .card_check(model::placement::card_made::CardPhase::FirstStep)?;
+        self.print_host_yields()?;
         Ok(next)
     }
 

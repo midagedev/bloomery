@@ -663,6 +663,16 @@ impl<H> PlanInputs<H> {
         }
     }
 
+    /// `self` for a family whose body yields host experts to its host K/V's growth
+    /// ([`KvLayout::with_host_yields`]).
+    #[must_use]
+    pub fn with_host_yields(self) -> PlanInputs<H> {
+        PlanInputs {
+            kv: self.kv.with_host_yields(),
+            ..self
+        }
+    }
+
     /// `self` with each delta-rule layer's state `lanes` lanes ([`KvLayout::with_lanes`]): the
     /// stores of a load that verifies `lanes` rows a pass.
     #[must_use]
@@ -1066,6 +1076,9 @@ pub struct KvLayout {
     rooms: Option<PosLayout>,
     /// The lanes of a delta-rule layer's state.
     lanes: NonZeroUsize,
+    /// Whether the family's body yields host experts to its host-backed rooms' growth
+    /// ([`KvLayout::with_host_yields`]).
+    host_yields: bool,
 }
 
 impl KvLayout {
@@ -1143,6 +1156,7 @@ impl KvLayout {
             scratch_block: (0, 1),
             rooms: None,
             lanes: NonZeroUsize::MIN,
+            host_yields: false,
         })
     }
 
@@ -1189,6 +1203,19 @@ impl KvLayout {
     pub fn with_rooms(self, rooms: PosLayout) -> KvLayout {
         KvLayout {
             rooms: Some(rooms),
+            ..self
+        }
+    }
+
+    /// The same layout for a family whose body yields host experts to the growth of its
+    /// host-backed rooms' pages as the positions pass the plan's floor (its `KvRoomBody::host_grow`
+    /// and `host_asks`): a plan with a floor and `BLOOMERY_KV_HOST` other than `off` then charges
+    /// the host K/V at the floor ([`KvBytes::host_yields`]). The family opts in by its body's
+    /// wiring; a layout with no `Select` buffer has no host term to grow whatever is said here.
+    #[must_use]
+    pub fn with_host_yields(self) -> KvLayout {
+        KvLayout {
+            host_yields: true,
             ..self
         }
     }
@@ -1319,6 +1346,10 @@ impl KvBytes for KvLayout {
         let (bytes, block) = self.scratch_block;
         (self.rope_row + self.sink_row + self.scratch_row) * ctx_max
             + bytes.saturating_mul(ctx_max.div_ceil(block))
+    }
+
+    fn host_yields(&self) -> bool {
+        self.host_yields && self.rooms.as_ref().is_some_and(PosLayout::host_capable)
     }
 }
 
