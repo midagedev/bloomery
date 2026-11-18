@@ -23,6 +23,10 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_bands.rs"]
+mod ds41_bands;
+
+#[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_tier.rs"]
 #[allow(
     dead_code,
@@ -52,7 +56,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{Body, OpenCfg, PrefillMode};
     use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::logits_band::{self, Pins};
+    use bloomery_gpu_gates::logits_band::Pins;
     use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, record, ref_model_path, tier};
     use bloomery_levers::{EXPERT_RANK, ResidencyAt, residency_unset};
     use gguf::Split;
@@ -79,7 +83,7 @@ mod gate {
         path: PathBuf,
         cfg: OpenCfg,
         machine: M,
-        /// The rank walk's margin and band (`logits_band::place_v41`): the
+        /// The rank walk's margin and band (`ds41_bands::place_v41`): the
         /// tier gate's rank walk's, the same pair on the fixture.
         band: (f32, Pins),
     }
@@ -315,7 +319,7 @@ mod gate {
         // Plan (a) on the largest card in view, which the plan's open finds by its device; a
         // workstation card by name would name a card this machine may not have.
         let machine = Place::A.on_host()?.machine(None, None)?;
-        let band = logits_band::place_v41(tier::Tier::from_env()?);
+        let band = crate::ds41_bands::place_v41(tier::Tier::from_env()?);
         crate::nvtier_family::gate(
             NAME,
             &Ds41 {

@@ -14,8 +14,7 @@
 //! row's top-2 gap but not the rows, compare through [`parted`], by the same
 //! clarity rule ([`gap_is_clear`]).
 
-use crate::prompts::{MARGIN_FLOOR, PLACE_MARGIN_V41, PLACE_MARGIN_V41_FIXTURE};
-use crate::tier::Tier;
+use crate::prompts::MARGIN_FLOOR;
 
 /// Clear-position top-1 disagreements the band admits between a batched
 /// call's logits and the steps' run — a compared position whose
@@ -61,53 +60,6 @@ impl Pins {
         rms: LOGITS_RMS_PIN,
     };
 }
-
-/// The band the V4.1 fixture's walk between two placements is held to, with
-/// [`crate::prompts::PLACE_MARGIN_V41_FIXTURE`] as its clarity margin ([`place_v41`]): the tier
-/// gate's rank walk (B10) and the NVMe-tier gate's rank clause, one pair on the fixture — the
-/// router rank's card list against the id prefix, the same 64 prompt ids fed one step a
-/// position — whose readings agree to the digit on every card. The two plans run other experts
-/// on the card and on the host, and the distance is the pair's, not the card's (the RMS
-/// |Δlogit| reads 0.2510 on the 3090 and the A6000, 0.2479 on an RTX 5090). Twice the larger
-/// reading of each, [`LOGITS_MAX_PIN`]'s and [`LOGITS_RMS_PIN`]'s method on this pair alone;
-/// the shared pins carry the real tier's distance and sit ten times over this one.
-// PIN(2026-11-18): max 2 × 2.597 (RTX 5090; 2.338 on sm_86) rounded up to 5.2, rms 2 × 0.2510
-// (sm_86; 0.2479 on the 5090) rounded up to 0.51, both B10's line over its 64 positions; the
-// NVMe-tier rank walk reads the same max and 0.2485 (sm_86, 66 positions) and 0.2479 (5090, 64).
-// FAIL-first: every layer's ranked host sum zeroed moves the real tier's rms 1.03 past 2.5, so
-// it is red here at 2.4 × 0.25 = 0.6 > 0.51.
-pub const PLACE_PINS_V41_FIXTURE: Pins = Pins {
-    clear: LOGITS_CLEAR_PIN,
-    max: 5.2,
-    rms: 0.51,
-};
-
-/// The clarity margin and band a V4.1 walk between two placements reads in `tier`: the real
-/// tier's [`crate::prompts::PLACE_MARGIN_V41`] in [`Pins::SHARED`], the fixture's
-/// [`crate::prompts::PLACE_MARGIN_V41_FIXTURE`] in [`PLACE_PINS_V41_FIXTURE`]. The one choice
-/// the tier gate's rank walk and the NVMe-tier gate's rank clause both make.
-pub fn place_v41(tier: Tier) -> (f32, Pins) {
-    match tier {
-        Tier::Real => (PLACE_MARGIN_V41, Pins::SHARED),
-        Tier::Fixture => (PLACE_MARGIN_V41_FIXTURE, PLACE_PINS_V41_FIXTURE),
-    }
-}
-
-/// The band the V4.1 fixture's prompt batch is held to against its decode steps
-/// (`gate_deepseek41_prefill`'s cases), with [`crate::prompts::PREFILL_MARGIN_V41_FIXTURE`] as
-/// its clarity margin at every position: the fixture's logits are flat (the record's widest
-/// top-two gap is 0.75), so at that margin no fixture position is clear and these two pins carry
-/// the band. Twice the largest reading of each over the gate's fixture record, both fixtures
-/// and both card generations, [`LOGITS_MAX_PIN`]'s and [`LOGITS_RMS_PIN`]'s method on this pair.
-// PIN(2026-11-18): max 2 × 2.355 (split 700+400, istaglue on the RTX 5090) rounded up to 4.8,
-// rms 2 × 0.4119 (split 700+400, istaglue on the A6000) rounded up to 0.83, over every band
-// line of the gate's fixture runs in the batch logs (the 3090, the A6000, the RTX 5090; the
-// base fixture and istaglue). The shared pins (16, 2.5) carry the real tier's distance.
-pub const PREFILL_PINS_V41_FIXTURE: Pins = Pins {
-    clear: LOGITS_CLEAR_PIN,
-    max: 4.8,
-    rms: 0.83,
-};
 
 /// The first routed seam's reading of its tokens (`gate_deepseek41_prefill`'s clause): each
 /// token's largest |Δ| against the steps', judged by [`seam_verdict`].
@@ -307,7 +259,7 @@ pub fn walk_at(what: &str, want: Positions<'_>, got: Positions<'_>, floor: f32) 
 }
 
 /// [`walk_at`] with the band held to `pins` in place of [`Pins::SHARED`]: a walk whose pair's
-/// distance its gate derives ([`PLACE_PINS_V41_FIXTURE`]).
+/// distance its gate derives.
 ///
 /// # Panics
 /// As [`walk`].
@@ -703,30 +655,23 @@ mod tests {
 
     /// A walk held to its own pins reds a distance the shared pins take, and keeps the shared
     /// walk's clarity and top-1 reading: a row moved by 1 in every lane (rms 1, max 1) stands
-    /// in the shared band and over the fixture placement pins' rms 0.51.
+    /// in the shared band and over a narrower band's rms 0.51.
     #[test]
     fn walk_pinned_holds_its_own_pins() {
+        let narrow = Pins {
+            clear: LOGITS_CLEAR_PIN,
+            max: 5.2,
+            rms: 0.51,
+        };
         let want = [gapped(1, 3.0)];
         let got = [gapped(1, 3.0).iter().map(|x| x + 1.0).collect::<Vec<f32>>()];
         let t = [1u32];
         assert!(walk_at("pins", run(&t, &want), run(&t, &got), MARGIN_FLOOR).ok);
-        let own = walk_pinned(
-            "pins",
-            run(&t, &want),
-            run(&t, &got),
-            MARGIN_FLOOR,
-            PLACE_PINS_V41_FIXTURE,
-        );
+        let own = walk_pinned("pins", run(&t, &want), run(&t, &got), MARGIN_FLOOR, narrow);
         assert!(!own.ok && own.band.clear == 1 && own.band.disagree == 0);
-        assert!((own.band.rms() - 1.0).abs() < 1e-9 && own.band.max <= PLACE_PINS_V41_FIXTURE.max);
+        assert!((own.band.rms() - 1.0).abs() < 1e-9 && own.band.max <= narrow.max);
         let near = [gapped(1, 3.0).iter().map(|x| x + 0.5).collect::<Vec<f32>>()];
-        let held = walk_pinned(
-            "pins",
-            run(&t, &want),
-            run(&t, &near),
-            MARGIN_FLOOR,
-            PLACE_PINS_V41_FIXTURE,
-        );
+        let held = walk_pinned("pins", run(&t, &want), run(&t, &near), MARGIN_FLOOR, narrow);
         assert!(held.ok);
     }
 

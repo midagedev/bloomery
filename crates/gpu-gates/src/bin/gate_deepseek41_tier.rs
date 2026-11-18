@@ -135,8 +135,8 @@
 //!   the same ids over the tiered carve of the plan without the file and walks the child's
 //!   positions against its own within the logits band (`logits_band::walk_pinned`, every
 //!   position at the placement margin: the real tier's `prompts::PLACE_MARGIN_V41` in the shared
-//!   band, the fixture's `prompts::PLACE_MARGIN_V41_FIXTURE` in its pair's own band
-//!   `logits_band::PLACE_PINS_V41_FIXTURE`). The two plans keep
+//!   band, the fixture's `ds41_bands::PLACE_MARGIN_V41_FIXTURE` in its pair's own band
+//!   `ds41_bands::PLACE_PINS_V41_FIXTURE`). The two plans keep
 //!   other experts on the card and the host, and a card expert and a host expert are not one
 //!   result bit for bit, so across plans the rows sit within the band, not on bits.
 //!
@@ -161,6 +161,10 @@ mod dspark;
 #[cfg(feature = "deepseek41")]
 #[path = "shared/gate_card.rs"]
 mod gate_card;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/ds41_bands.rs"]
+mod ds41_bands;
 
 #[cfg(feature = "deepseek41")]
 #[path = "shared/ds41_pair.rs"]
@@ -850,16 +854,16 @@ mod gate {
     /// [`in_band`] for a walk that starts at the prompt's position 0 (the rank clause's): the
     /// runs record the fed id as each prompt position's token, so every position's row is
     /// same-context evidence and the walk judges them all at the placement margin
-    /// (`logits_band::place_v41`) — the real tier's `prompts::PLACE_MARGIN_V41` in the shared
-    /// band, the fixture tier's `prompts::PLACE_MARGIN_V41_FIXTURE` in the band its own pair
-    /// derives (`logits_band::PLACE_PINS_V41_FIXTURE`), the NVMe-tier gate's rank clause's on
+    /// (`ds41_bands::place_v41`) — the real tier's `prompts::PLACE_MARGIN_V41` in the shared
+    /// band, the fixture tier's `ds41_bands::PLACE_MARGIN_V41_FIXTURE` in the band its own pair
+    /// derives (`ds41_bands::PLACE_PINS_V41_FIXTURE`), the NVMe-tier gate's rank clause's on
     /// the fixture too: the two plans run other experts on the card and the host.
     // PIN(2026-11-12): the rank walk recorded the argmax as each position's token, so it parted
     // at the first argmax flip — 1 of the reference's 64 positions compared — although both arms
     // were fed the same prompt id and stood at the same context; the fed id is the position's
     // context token, and every row is judged.
     fn in_band_from_zero(what: &str, want: &Run, got: &Run) -> Result<bool, GateError> {
-        let (margin, pins) = logits_band::place_v41(tier::Tier::from_env()?);
+        let (margin, pins) = crate::ds41_bands::place_v41(tier::Tier::from_env()?);
         Ok(logits_band::walk_pinned(what, want.positions(), got.positions(), margin, pins).ok)
     }
 

@@ -82,17 +82,16 @@ mod gate {
     /// The usable bytes (n1) asks of the card: the RTX 5090's, the least card one rank's whole
     /// load of the folder is measured green on.
     // PIN(2026-11-18): one rank holds the folder whole; (n1) passed on the RTX 5090's 32,202 MiB
-    // usable (batch land1118's log), and the load read DriverError(2, out of memory) on the
-    // RTX 3090's 24,176 MiB (the justfile recipe's record, 2026-11-05). A figure between the two
-    // is not measured.
+    // usable, and the load read DriverError(2, out of memory) on the RTX 3090's 24,176 MiB. A
+    // figure between the two is not measured.
     const ONE_RANK_ROOM: u64 = 32_202 * MIB;
 
     /// The usable bytes (n2) and (n4) ask of the card: the A6000's, the one card the rank groups
     /// are measured green on.
     // PIN(2026-11-18): the groups hold the folder's parts and each rank's context on the card at
-    // once; the gate's last green, 2026-11-16 (the lead's ledger), ran on the A6000's 48,592 MiB
-    // usable, and rank 1's load read DriverError(2, out of memory) at (n2) on the RTX 5090's
-    // 32,202 MiB (batch land1118's log). A figure between the two is not measured.
+    // once; the gate's last green ran on the A6000's 48,592 MiB usable, and rank 1's load read
+    // DriverError(2, out of memory) at (n2) on the RTX 5090's 32,202 MiB. A figure between the
+    // two is not measured.
     const RANKS_ROOM: u64 = A6000.usable_bytes();
 
     const _: () = assert!(RANKS_ROOM >= ONE_RANK_ROOM);

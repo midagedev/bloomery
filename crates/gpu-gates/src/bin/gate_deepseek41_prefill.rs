@@ -299,10 +299,8 @@ mod gate {
     };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
-    use bloomery_gpu_gates::logits_band::{
-        LogitsBand, PREFILL_PINS_V41_FIXTURE, Pins, seam_verdict,
-    };
-    use bloomery_gpu_gates::prompts::{HEAD_MARGIN_V41, MARGIN_FLOOR, PREFILL_MARGIN_V41_FIXTURE};
+    use bloomery_gpu_gates::logits_band::{LOGITS_CLEAR_PIN, LogitsBand, Pins, seam_verdict};
+    use bloomery_gpu_gates::prompts::{HEAD_MARGIN_V41, MARGIN_FLOOR};
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
         no_local_depot, patch_bytes, record, row_bytes, verdict,
@@ -3119,6 +3117,39 @@ mod gate {
         s.keys = keys;
         Ok(())
     }
+
+    /// The clarity margin the V4.1 fixture's prompt batch is judged at against its decode steps,
+    /// at every position (this gate's cases): [`HEAD_MARGIN_V41`]'s method on the fixture, whose
+    /// shift is as large past the head as at it. The batch's grouped GEMM and the
+    /// steps' gemv fold the gate·up in other f32 orders, and both quantize the SwiGLU product to
+    /// q8_1 for the down, so a value on a code boundary flips a code and each layer's next
+    /// quantization compounds it: on the fixture's flat logits (the record's median top-two gap
+    /// 0.093, its widest 0.75) the gap shift's RMS is 0.244 and [`MARGIN_FLOOR`] sits at 2 σ of
+    /// it. The band is [`PREFILL_PINS_V41_FIXTURE`].
+    // PIN(2026-11-18): 2 × 0.6640, the largest |gap shift| over the gate's 624 per-position lines
+    // of its fixture runs in the batch logs (split 700+400 and wide taps at position 1100, the base
+    // fixture on sm_86; 0.5314 at P=1 position 1, istaglue on the RTX 5090), rounded up to 1.4.
+    // The 5090's istaglue run flipped the top-1 at P=1 position 1 (the steps' margin 0.5408, shift
+    // −0.5314 to their runner-up), red at the old floor 0.5 with every seam before layer 0's FFN on
+    // the steps' bits and the catcher bit for bit; under this floor it is the re-lottery it is.
+    const PREFILL_MARGIN_V41_FIXTURE: f32 = 1.4;
+
+    /// The band the V4.1 fixture's prompt batch is held to against its decode steps (this gate's
+    /// cases), with [`PREFILL_MARGIN_V41_FIXTURE`] as its clarity margin at every position: the
+    /// fixture's logits are flat (the record's widest top-two gap is 0.75), so at that margin no
+    /// fixture position is clear and these two pins carry the band. Twice the largest reading of
+    /// each over the gate's fixture record, both fixtures and both card generations,
+    /// [`bloomery_gpu_gates::logits_band::LOGITS_MAX_PIN`]'s and
+    /// [`bloomery_gpu_gates::logits_band::LOGITS_RMS_PIN`]'s method on this pair.
+    // PIN(2026-11-18): max 2 × 2.355 (split 700+400, istaglue on the RTX 5090) rounded up to 4.8,
+    // rms 2 × 0.4119 (split 700+400, istaglue on the A6000) rounded up to 0.83, over every band
+    // line of the gate's fixture runs in the batch logs (the 3090, the A6000, the RTX 5090; the
+    // base fixture and istaglue). The shared pins (16, 2.5) carry the real tier's distance.
+    const PREFILL_PINS_V41_FIXTURE: Pins = Pins {
+        clear: LOGITS_CLEAR_PIN,
+        max: 4.8,
+        rms: 0.83,
+    };
 
     /// The band a batch's logits are held to against the steps' (module doc, the cases): the
     /// clarity margin at positions 0–1 and past them, and the pins. The real tier's
