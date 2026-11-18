@@ -48,6 +48,16 @@
 //!   row is within [`HOST_REL_BAND`] relative L2 of the whole-card row (the host's SiTU against
 //!   the card's rule). The free-running ids are not the clause: a flat fixture row flips its
 //!   argmax on a rounding, and the rows after that are another history's.
+//! - `residency follows the map`: the `host share` plan loaded under a `mid` word
+//!   (`residency_clauses::mid_of` over the plan's stage counts) runs the common machine over the
+//!   stage card's stacks, each machine layer reseeded host experts first
+//!   (`residency_clauses::host_first_orders`: never a tier card's), so host experts go live in
+//!   stage slots the plan's experts held; the reseed copies experts onto the card and leaves no
+//!   entry off its seed, and fed the whole-card body's ids each step's logits row is within
+//!   [`HOST_REL_BAND`] of the whole-card row, as the `host share` load's is. FAIL-first (box):
+//!   `PlacedHost::residency_parts` handing the machine a fresh upload of the map
+//!   (`.mutants/hy4res-map-copy-fresh.patch`), so the handoff reads the load's places while the
+//!   slots hold the reseeded experts, and the rows leave the band.
 //! - `host layer without tier`: a plan where a layer holds host experts and no tier expert is
 //!   refused by name at the load (the host handoff's entries are not built for K3's slot count).
 //! - `node family`: a node that serves only another family refuses the open by name.
@@ -154,6 +164,15 @@ mod tier_twocard;
 mod kimi_k3_budget;
 
 #[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
+    reason = "the residency clauses serve several gates; this one reads the mid word and the \
+              reseed orders"
+)]
+#[path = "shared/residency_clauses.rs"]
+mod residency_clauses;
+
+#[cfg(feature = "gpu")]
 mod gate {
     use std::net::TcpListener;
     use std::process::Command;
@@ -184,6 +203,7 @@ mod gate {
         pick_tier_only, split_table, totals, under,
     };
     use crate::node_proc::{LISTENING, tier_server, tier_server_command};
+    use crate::residency_clauses;
     use crate::tier_twocard::{Sent, sent_between, sent_every, tier_counts};
 
     /// The gate's name: the recipe's and the refusals'.
@@ -595,6 +615,10 @@ mod gate {
         pass &= refusals(&inputs, budget, host)?;
         pass &= host_head(&inputs, (budget, host), (&prompt, &want))?;
         pass &= host_share(&inputs, &table, (budget, host), (&prompt, &want))?;
+        pass &= guarded(
+            "residency follows the map",
+            residency_follows_the_map(&inputs, &table, (budget, host), (&prompt, &want)),
+        );
         pass &= host_without_tier(&inputs, &table, (budget, host))?;
         pass &= node_family_and_records(&prompt, budget)?;
         pass &= guarded("pass", placed_pass(&inputs, budget, host));
@@ -1005,6 +1029,79 @@ mod gate {
                  off the plan: {wrong:?}); fed the whole-card ids {:?}, each step's logits row \
                  relative L2 {shown:?}, worst {worst:.3e} at step {at}, band {HOST_REL_BAND:.1e}",
                 levers.card_budget_bytes, want.ids
+            ),
+        ))
+    }
+
+    /// The `host share` plan under a reseeded residency machine (the module header's `residency
+    /// follows the map`): fed the whole-card body's ids, each step's logits row within
+    /// [`HOST_REL_BAND`] of the whole-card row.
+    fn residency_follows_the_map(
+        inputs: &PlanInputs,
+        table: &[Budget],
+        (budget, host): (u64, HostCfg),
+        (prompt, want): (&[u32], &Run),
+    ) -> Result<bool, GateError> {
+        let clause = "residency follows the map";
+        tier::sc(
+            "residency follows the map: a reseeded machine's card slots read the whole-card rows",
+        )?;
+        let Some(HostShare { levers, .. }) = host_share_plan(
+            inputs,
+            pick_tier_only(table).unwrap_or(budget),
+            Share::Tiered,
+        )?
+        else {
+            return Ok(line(
+                false,
+                clause,
+                "no tier budget leaves an expert on the host: the clause has no input",
+            ));
+        };
+        let machine = bp_machine(inputs)?;
+        let plan = inputs.plan(&machine, CTX as u64, &levers)?;
+        let Some(residency) = residency_clauses::mid_of(&plan.n_l) else {
+            return Ok(line(
+                false,
+                clause,
+                "no stage layer holds a pinned expert, a spare and a moving slot",
+            ));
+        };
+        let file = open_split(Arch::KimiK3, RECIPE)?;
+        let mut m =
+            GpuModel::<Body>::open_placed_with(file, (&plan, inputs), 0, host, (None, residency))?;
+        m.set_mode(StepMode::Graph);
+        let layers = m
+            .body(NAME)?
+            .placed()
+            .ok_or("not a placed load")?
+            .hybrid()
+            .slots()
+            .layers();
+        let orders =
+            residency_clauses::host_first_orders(&plan, layers, inputs.hp.experts.n_expert);
+        let order: Vec<&[u32]> = orders.iter().map(Vec::as_slice).collect();
+        let Some(reseed) = m.residency_reseed(&order)? else {
+            return Ok(line(false, clause, "the mid load runs no machine"));
+        };
+        let rows = forced(&mut m, prompt, &want.ids)?;
+        let worst = want
+            .rows
+            .iter()
+            .zip(&rows)
+            .map(|(w, g)| rel(w, g))
+            .fold(0.0f64, f64::max);
+        Ok(line(
+            reseed.copies > 0
+                && reseed.diff == 0
+                && rows.len() == want.rows.len()
+                && worst <= HOST_REL_BAND,
+            clause,
+            &format!(
+                "{residency:?} on per-card budgets {}: the reseed copied {} experts onto the \
+                 stage card, {} entries off its seed; fed the whole-card ids, the worst logits \
+                 row relative L2 {worst:.3e}, band {HOST_REL_BAND:.1e}",
+                levers.card_budget_bytes, reseed.copies, reseed.diff
             ),
         ))
     }

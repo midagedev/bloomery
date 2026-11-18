@@ -1,0 +1,40 @@
+--- a/crates/gpu/src/host/placed.rs
++++ b/crates/gpu/src/host/placed.rs
+@@ -57,6 +57,7 @@
+     /// The slot map's card copy, one row of `n_expert` places a routed layer: the residency
+     /// machine's view, whose words its flips write ([`PlacedHost`]).
+     slots: Arc<DeviceTensor<u32>>,
++    machine_view: Arc<DeviceTensor<u32>>,
+     handoff: HandoffKernels,
+     /// The routed slots' places in the card's stacks, or `HOST`.
+     sel: DeviceBuffer<u32>,
+@@ -91,6 +92,12 @@
+         }
+         let stream = gpu.stream();
+         let slots = Arc::new(DeviceTensor::upload(
++            stream,
++            &map.stage_view(),
++            run.len(),
++            shape.n_expert,
++        )?);
++        let machine_view = Arc::new(DeviceTensor::upload(
+             stream,
+             &map.stage_view(),
+             run.len(),
+@@ -102,6 +109,7 @@
+             row_off,
+             shape,
+             slots,
++            machine_view,
+             handoff: HandoffKernels::load(gpu.context())?,
+             sel: DeviceBuffer::zeroed(stream, shape.n_used)?,
+             sink: None,
+@@ -492,7 +500,7 @@
+     }
+ 
+     fn residency_parts(&mut self) -> Option<ResidencyParts<'_, HostRun>> {
+-        self.shell.residency_parts(&self.side.slots)
++        self.shell.residency_parts(&self.side.machine_view)
+     }
+ 
+     fn serve_chain(&mut self, chain: Chain) -> Result<(), GpuError> {

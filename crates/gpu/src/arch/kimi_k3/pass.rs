@@ -51,6 +51,7 @@ use crate::head::{HOST_HEAD_ROWS, Head};
 use crate::host::BatchLeg;
 use crate::host::placed::{PlacedHost, PlacedSide};
 use crate::host::run::HostRun;
+use crate::host::served::prompt_pass;
 use crate::kquant::Act;
 use crate::latent_gated::{self, MlaDims};
 use crate::linear::mixer_kda::KdaDims;
@@ -1181,6 +1182,7 @@ impl super::Body {
                 PlacedHost {
                     shell,
                     side: placed_side,
+                    ..
                 },
             side,
             pass,
@@ -1355,8 +1357,9 @@ impl super::Body {
 impl GpuModel<super::Body> {
     /// Run `ids` from the model's position as placed passes of up to the load's pass rows and
     /// return the argmax after the last: every row the placed step's bits, the head on the last
-    /// row alone. Refused by name with no ids, on a load made without the pass and as
-    /// [`super::Body::placed_rows`] refuses.
+    /// row alone. The call is one residency pass ([`prompt_pass`]: its boundary before the first
+    /// pass, none inside, 0 rows kept), so every pass reads one slot map. Refused by name with no
+    /// ids, on a load made without the pass and as [`super::Body::placed_rows`] refuses.
     ///
     /// # Errors
     /// [`GpuError`] as above, and the head's fault.
@@ -1367,19 +1370,21 @@ impl GpuModel<super::Body> {
             .pass_shape()
             .ok_or(GpuError::shape(WHAT, "a load made without the placed pass"))?
             .rows;
-        self.run_rows(ids.len(), WHAT, |gpu, w, body, head, pos| {
-            let total = ids.len();
-            for (c, chunk) in ids.chunks(rows).enumerate() {
-                let at = c * rows;
-                let tail = if at + chunk.len() == total {
-                    PassTail::Last(&mut *head)
-                } else {
-                    PassTail::Open
-                };
-                let first = pos + launch_u32(WHAT, "row", at)?;
-                body.placed_rows(gpu, w, (chunk, first), tail)?;
-            }
-            Ok(true)
+        prompt_pass(self, |m| {
+            m.run_rows(ids.len(), WHAT, |gpu, w, body, head, pos| {
+                let total = ids.len();
+                for (c, chunk) in ids.chunks(rows).enumerate() {
+                    let at = c * rows;
+                    let tail = if at + chunk.len() == total {
+                        PassTail::Last(&mut *head)
+                    } else {
+                        PassTail::Open
+                    };
+                    let first = pos + launch_u32(WHAT, "row", at)?;
+                    body.placed_rows(gpu, w, (chunk, first), tail)?;
+                }
+                Ok(true)
+            })
         })?
         .ok_or(GpuError::state(
             WHAT,
@@ -1391,9 +1396,9 @@ impl GpuModel<super::Body> {
     /// `n` rows, row-major (`n` rows of the vocabulary), each row the placed step's logits at its
     /// position: the passes are cut from the end, so the last holds the last `n` rows, and its
     /// rows run through the head (the host's projection [`HOST_HEAD_ROWS`] rows at a time, or a
-    /// card head's launches one row at a time). Refused by name: no ids, `n` of 0 or past the ids
-    /// or the pass's rows, a load made without the pass, and as [`super::Body::placed_rows`]
-    /// refuses.
+    /// card head's launches one row at a time). One residency pass, as [`GpuModel::prompt_placed`].
+    /// Refused by name: no ids, `n` of 0 or past the ids or the pass's rows, a load made without
+    /// the pass, and as [`super::Body::placed_rows`] refuses.
     ///
     /// # Errors
     /// [`GpuError`] as above, and the head's fault.
@@ -1416,36 +1421,38 @@ impl GpuModel<super::Body> {
         let total = ids.len();
         let head_len = total - rows.min(total);
         let mut out = Vec::new();
-        self.run_rows(total, WHAT, |gpu, w, body, head, pos| {
-            for (c, chunk) in ids[..head_len].chunks(rows).enumerate() {
-                let first = pos + launch_u32(WHAT, "row", c * rows)?;
-                body.placed_rows(gpu, w, (chunk, first), PassTail::Open)?;
-            }
-            let last = &ids[head_len..];
-            let first = pos + launch_u32(WHAT, "row", head_len)?;
-            body.placed_rows(gpu, w, (last, first), PassTail::Rows)?;
-            let width = body.hp.n_embd;
-            let mixed = body.pass_rows_out()?;
-            let from = last.len() - n;
-            let window = rows_of(mixed, from * width, n * width)?;
-            for (r0, rn) in chunks(n, HOST_HEAD_ROWS) {
-                let part = rows_of(&window, r0 * width, rn * width)?;
-                match head.host_logits_rows(gpu, &part, rn)? {
-                    Some(logits) => out.extend_from_slice(&logits),
-                    None => {
-                        for t in 0..rn {
-                            let row = rows_of(&part, t * width, width)?;
-                            copy_row(gpu.stream(), &row, head.input_mut(), width)?;
-                            head.enqueue(gpu, w)?;
-                            out.extend_from_slice(&head.logits_to_host(gpu)?);
+        prompt_pass(self, |m| {
+            m.run_rows(total, WHAT, |gpu, w, body, head, pos| {
+                for (c, chunk) in ids[..head_len].chunks(rows).enumerate() {
+                    let first = pos + launch_u32(WHAT, "row", c * rows)?;
+                    body.placed_rows(gpu, w, (chunk, first), PassTail::Open)?;
+                }
+                let last = &ids[head_len..];
+                let first = pos + launch_u32(WHAT, "row", head_len)?;
+                body.placed_rows(gpu, w, (last, first), PassTail::Rows)?;
+                let width = body.hp.n_embd;
+                let mixed = body.pass_rows_out()?;
+                let from = last.len() - n;
+                let window = rows_of(mixed, from * width, n * width)?;
+                for (r0, rn) in chunks(n, HOST_HEAD_ROWS) {
+                    let part = rows_of(&window, r0 * width, rn * width)?;
+                    match head.host_logits_rows(gpu, &part, rn)? {
+                        Some(logits) => out.extend_from_slice(&logits),
+                        None => {
+                            for t in 0..rn {
+                                let row = rows_of(&part, t * width, width)?;
+                                copy_row(gpu.stream(), &row, head.input_mut(), width)?;
+                                head.enqueue(gpu, w)?;
+                                out.extend_from_slice(&head.logits_to_host(gpu)?);
+                            }
                         }
                     }
                 }
-            }
-            let tail = rows_of(&window, (n - 1) * width, width)?;
-            copy_row(gpu.stream(), &tail, head.input_mut(), width)?;
-            head.enqueue(gpu, w)?;
-            Ok(true)
+                let tail = rows_of(&window, (n - 1) * width, width)?;
+                copy_row(gpu.stream(), &tail, head.input_mut(), width)?;
+                head.enqueue(gpu, w)?;
+                Ok(true)
+            })
         })?;
         Ok(out)
     }

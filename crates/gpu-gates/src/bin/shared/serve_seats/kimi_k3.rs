@@ -4,15 +4,16 @@
 //!
 //! What this file holds is what K3's architecture forces. The delta layers' state takes no
 //! position back, so a request shares a prefix with the slot only where the sequence stands
-//! (`app::arch::kimi_k3`). The body has one tier card and keeps its load's slot map for its life,
-//! so the family says one tier card ([`TierRule`]) and no residency but `off`
-//! ([`Family::SLOT_MAP_FIXED`]). A K3.1 file runs every context ([`PlanInputs::check_ctx`]): past
-//! its indexer's top-k the latent layers attend the rows the indexer picks.
+//! (`app::arch::kimi_k3`). The body has one tier card, so the family says one tier card
+//! ([`TierRule`]), and runs the common residency machine under the seat's word: unset, the serving
+//! word on a serving placement, which the plan keeps, moves or turns `off`. A K3.1 file runs every
+//! context ([`PlanInputs::check_ctx`]): past its indexer's top-k the latent layers attend the rows
+//! the indexer picks.
 //!
 //! The body has a placed prompt pass ([`Family::pass`]): the widest pass shape the plan holds at
 //! the seat's context ([`kimi_k3_pass::pick`], the rule `generate_kimi_k3 --walk pass` picks by),
 //! planned with the shape's bytes as the prompt reserve, the expert tier's batch at its rows and
-//! the NVMe arena the dial gives, at least its floor, and loaded by [`GpuModel::open_placed_pass`]; each request's prompt
+//! the NVMe arena the dial gives, at least its floor, and loaded by [`GpuModel::open_placed_with`]; each request's prompt
 //! then runs through `Batch::prompt`, which takes the pass. A plan that holds no shape loads the
 //! stepped body, and `--prefill steps` asks it; the `listening` record names the walk.
 //!
@@ -86,16 +87,12 @@ impl Family for KimiK3 {
         basis: "",
     };
 
-    /// The body keeps its load's slot map for its life ([`Residency::Off`] in its placed open).
-    ///
-    /// [`Residency::Off`]: bloomery_gpu::host::swap::Residency::Off
-    const SLOT_MAP_FIXED: bool = true;
-
     const PASS: bool = true;
 
     /// The widest pass shape the seat's plan holds at `ctx` ([`kimi_k3_pass::pick`]), each
     /// shape's machine with the expert tier's batch at its rows where `place` hangs a tier card,
-    /// and its open ([`GpuModel::open_placed_pass`] on stage card 0); or why no shape fits.
+    /// and its open ([`GpuModel::open_placed_with`] on stage card 0 with the shape, under the
+    /// seat's residency); or why no shape fits.
     fn pass(
         inputs: &PlanInputs,
         place: Place,
@@ -123,8 +120,14 @@ impl Family for KimiK3 {
         };
         Ok(Ok((
             plan,
-            Box::new(move |file, plan, inputs, host| {
-                GpuModel::<Body>::open_placed_pass(file, plan, inputs, 0, host, shape)
+            Box::new(move |file, plan, inputs, host, residency| {
+                GpuModel::<Body>::open_placed_with(
+                    file,
+                    (plan, inputs),
+                    0,
+                    host,
+                    (Some(shape), residency),
+                )
             }),
         )))
     }

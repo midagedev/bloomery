@@ -207,10 +207,11 @@ impl Placed {
             ));
         }
         Ok(Placed {
-            host: PlacedHost {
-                shell: TierShell::new(hybrid, glue, hp.n_embd, PLACED),
-                side: placed_side,
-            },
+            host: PlacedHost::new(
+                gpu,
+                TierShell::new(hybrid, glue, hp.n_embd, PLACED),
+                placed_side,
+            )?,
             side: Side {
                 acc_k: CardSlotKernels::load(gpu.context())?,
                 tier,

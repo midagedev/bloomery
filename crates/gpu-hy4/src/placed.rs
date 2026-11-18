@@ -21,7 +21,9 @@
 //!
 //! The sum's order is `card + host`: up to rounding the whole-card layer's, which sums the sixteen
 //! slots in one launch. A load opened with its pass runs the prompt as the pass's walk
-//! ([`crate::batch::prompt_placed`]) and steps it one id at a time otherwise.
+//! ([`crate::batch::prompt_placed`]) and steps it one id at a time otherwise. Under a residency
+//! machine the card's slots are the ones the live map names: the handoff reads the side's map
+//! copy, which the machine's flips write ([`bloomery_gpu::host::placed`]).
 
 use bloomery_gpu::card_leg::{LegShape, LegStacks, LegSum};
 use bloomery_gpu::host::StepLeg;
@@ -77,9 +79,11 @@ pub(crate) struct Open<'a> {
 
 /// The placed side of the load `open` describes over `layers` and the slot map `map` of the
 /// routed run: the host tier over the layers whose card count is under their experts, and the
-/// card's side. Refused by name: a plan that names an expert tier card (the body hangs none),
-/// and a layer whose card stacks are not its card count's. The host serves its share under
-/// the gate-first clamp at the layer's limit ([`crate::tier::host_layer`]). Load-time only.
+/// card's side, the residency machine's glue (`open.glue`) beside them. Refused by name: a plan
+/// that names an expert tier card (the body hangs none), a layer whose card stacks are not its
+/// card count's, and a machine beside a layer the card holds whole ([`PlacedHost::new`]). The
+/// host serves its share under the gate-first clamp at the layer's limit
+/// ([`crate::tier::host_layer`]). Load-time only.
 pub(crate) fn load(
     (gpu, w): (&Gpu, &Weights),
     layers: &[Layer],
@@ -160,10 +164,7 @@ pub(crate) fn load(
                 .collect()
         },
     )?;
-    Ok(PlacedHost {
-        shell: TierShell::new(hybrid, glue, hp.n_embd, PLACED),
-        side,
-    })
+    PlacedHost::new(gpu, TierShell::new(hybrid, glue, hp.n_embd, PLACED), side)
 }
 
 /// A routed block's parts.
@@ -342,7 +343,7 @@ pub(crate) fn walk(
     placed: &mut Placed,
     cur: &mut usize,
 ) -> Result<(), GpuError> {
-    let PlacedHost { shell, side } = placed;
+    let PlacedHost { shell, side, .. } = placed;
     let mut leg = StepLeg::new(gpu.stream(), &mut shell.hybrid);
     let n = body.layers.len();
     let mut prog = StepWalk {

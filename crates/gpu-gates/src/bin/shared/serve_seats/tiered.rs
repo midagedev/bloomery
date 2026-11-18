@@ -345,12 +345,6 @@ pub trait Tiered: Seat + Sized + 'static {
         false
     }
 
-    /// Whether the body keeps its load's slot map for its life, and so serves no residency but
-    /// `off`: unset resolves `off` as on a placement the residency machine does not run over (why
-    /// `fixed_place`), and a set word other than `off` is refused by name before the model is
-    /// fetched and before the plan ([`refuse_fixed_slot_map`]). The default runs the machine.
-    const SLOT_MAP_FIXED: bool = false;
-
     /// What the load takes for the K/V levers it leaves unset ([`PlanLevers::from_levers_with`]):
     /// the floor its plan spreads the experts at and the planes' backing. `None`, an unset lever
     /// plans as the type's default does ([`PlanLevers::from_levers`]); the levers still act where
@@ -498,10 +492,6 @@ pub trait Tiered: Seat + Sized + 'static {
         plan: &Plan<'_>,
     ) -> Result<Option<ResidencyPick>, GateError> {
         // The hybrid bodies host every churn pool and feed the prompt in batches.
-        if Self::SLOT_MAP_FIXED {
-            return fixed_slot_map_pick(levers, plan, false, Self::FAMILY, Self::UNHOSTED_POOL)
-                .map(Some);
-        }
         residency_pick(levers, place, plan, false, Self::UNHOSTED_POOL).map(Some)
     }
 
@@ -549,40 +539,6 @@ pub fn check_residency_feed(
         }
     }
     Ok(())
-}
-
-/// A set `BLOOMERY_RESIDENCY` other than `off`, refused by name for a `family` whose body keeps its
-/// load's slot map for its life ([`Tiered::SLOT_MAP_FIXED`]).
-pub fn refuse_fixed_slot_map(levers: &Levers, family: &str) -> Result<(), GateError> {
-    match levers.residency() {
-        Some(word) if word != "off" => Err(format!(
-            "BLOOMERY_RESIDENCY={word} is refused: the {family} body keeps its load's slot map \
-             for its life (BLOOMERY_RESIDENCY off)"
-        )
-        .into()),
-        _ => Ok(()),
-    }
-}
-
-/// `BLOOMERY_RESIDENCY` for a body that keeps its load's slot map for its life
-/// ([`Tiered::SLOT_MAP_FIXED`]), resolved without reporting: a set word other than `off` refused
-/// by name ([`refuse_fixed_slot_map`]), unset `off` as on a placement the residency machine does
-/// not run over (why `fixed_place`). `prefill_steps` is the seat's step feed, which also refuses a
-/// set word other than `off` ([`check_residency_feed`]).
-pub fn fixed_slot_map_pick(
-    levers: &Levers,
-    plan: &Plan<'_>,
-    prefill_steps: bool,
-    family: &str,
-    carry: UnhostedPool,
-) -> Result<ResidencyPick, GateError> {
-    check_residency_feed(levers, prefill_steps, carry)?;
-    refuse_fixed_slot_map(levers, family)?;
-    let pick = levers.residency_at(ResidencyAt {
-        prefill_steps,
-        ..ResidencyAt::FIXED
-    });
-    residency::at_plan(carry, plan, 0, pick)
 }
 
 /// `BLOOMERY_RESIDENCY` for a tiered seat, resolved without reporting: [`run`] prints only
@@ -845,9 +801,6 @@ pub fn check<S: Tiered>(
         }
         if let Some(levers) = levers {
             check_residency_feed(levers, S::prefill_steps(&a.1), S::UNHOSTED_POOL)?;
-            if S::SLOT_MAP_FIXED {
-                refuse_fixed_slot_map(levers, S::FAMILY)?;
-            }
             if S::DRAFTS
                 && let Some(d) = drafting_of(levers)?
             {

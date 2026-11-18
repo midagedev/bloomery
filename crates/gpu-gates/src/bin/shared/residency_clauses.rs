@@ -24,6 +24,7 @@
 //! half owns them whole; a gate hands the clause the history's own name for
 //! its line.
 
+use std::ops::Range;
 use std::time::Instant;
 
 use app::{Keep, Prompt, Session};
@@ -48,6 +49,31 @@ pub fn mid_of(n_l: &[u64]) -> Option<Residency> {
     let slots = n_l.iter().copied().filter(|&n| n > 0).min()? as usize;
     let pinned = slots / 2;
     (pinned >= 1 && slots >= pinned + 2).then_some(Residency::Mid { pinned, spares: 1 })
+}
+
+/// The reseed orders of a placed plan's machine layers `layers` (the slot map's run), one a
+/// layer of `n_expert` ids: the host's ids from the highest, then the stage card's (the id prefix
+/// of the plan's `n_l`), then the expert tier cards' (the next `tier_n_l` ids). A reseed keeps
+/// the pinned experts and makes the rest of each layer's card set its order's first
+/// ([`SwapMachine::reseed`]), so the card takes host experts into slots the plan's experts held,
+/// and never a tier card's.
+pub fn host_first_orders(plan: &Plan<'_>, layers: Range<usize>, n_expert: usize) -> Vec<Vec<u32>> {
+    layers
+        .map(|l| {
+            let card = plan.n_l.get(l).copied().unwrap_or(0) as usize;
+            let tier: usize = plan
+                .tier_n_l
+                .iter()
+                .map(|t| t.get(l).copied().unwrap_or(0) as usize)
+                .sum();
+            let held = (card + tier).min(n_expert);
+            (held..n_expert)
+                .rev()
+                .chain(0..held)
+                .map(|e| u32::try_from(e).expect("an expert id fits u32"))
+                .collect()
+        })
+        .collect()
 }
 
 /// `refuse`'s head: the host room one byte short of `need` bytes the load holds beside the plan's

@@ -402,22 +402,6 @@ pub fn one_card_ctx(what: &'static str, machine: &Machine, ctx: usize) -> Result
     })
 }
 
-/// A placed load's residency, for a body that keeps the load's slot map for its life: a
-/// residency other than [`Residency::Off`] is refused by name (`what` the body's session),
-/// never run as another.
-pub fn slot_map_for_life(what: &'static str, residency: Residency) -> Result<(), GpuError> {
-    if residency == Residency::Off {
-        return Ok(());
-    }
-    Err(GpuError::shape(
-        what,
-        format!(
-            "residency {residency:?}: the body keeps the load's slot map for its life \
-             (BLOOMERY_RESIDENCY off)"
-        ),
-    ))
-}
-
 /// [`crate::Keep::cut`] of a body whose recurrent state has its history only
 /// in checkpoints: nothing to take back at the model's position; back to
 /// empty at 0 (a reset); else the checkpoint at `n` ([`Rollback`]), any other

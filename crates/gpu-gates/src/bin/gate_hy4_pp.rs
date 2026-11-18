@@ -61,6 +61,17 @@
 //!   streamed), and the same ids stepped leave the batch counters where they were.
 //! - `placed_pass_is_reserved`: the load's resident bytes stand inside the plan's terms with the
 //!   pass's bytes as the prompt reserve, and a plan that reserves none refuses the load by name.
+//! - `placed_residency_follows_the_map`: the same plan loaded under a `mid` word
+//!   (`residency_clauses::mid_of` over the plan's card counts) runs the common machine, each
+//!   machine layer reseeded host experts first (`residency_clauses::host_first_orders`), so host
+//!   experts go live in card slots the plan's experts held; the reseed copies experts onto the card
+//!   and leaves no entry off its seed, and set `e` through the pass, then fed the `off` load's ids
+//!   [`CONT_STEPS`] steps, reads the `off` load's logits rows within [`RESIDENCY_BAND`]. The card's
+//!   slots are the live map's only when the side's map copy is the machine's view: FAIL-first
+//!   (box), `PlacedHost::residency_parts` handing the machine a fresh upload of the map
+//!   (`.mutants/hy4res-map-copy-fresh.patch`), so the handoff and the pass read the load's places
+//!   while the slots hold the reseeded experts, moves every hosted layer's sum and the rows far
+//!   past the band.
 //!
 //! The prompt sets only supply ids: the vendor's dumps are not read as an oracle here. The fixture
 //! tier only: the released file (124 GB) does not fit one card and this gate opens the whole-card
@@ -89,9 +100,20 @@ mod gate_card;
 mod placed_load;
 
 #[cfg(feature = "hy4")]
+#[allow(
+    dead_code,
+    reason = "the residency clauses serve several gates; this one reads the mid word and the \
+              reseed orders"
+)]
+#[path = "shared/residency_clauses.rs"]
+mod residency_clauses;
+
+#[cfg(feature = "hy4")]
 mod gate {
     use crate::gate_card;
     use crate::placed_load::{self, CTX as PLACED_CTX, HOST_CFG};
+    use crate::residency_clauses;
+    use bloomery_gpu::host::served::TierBody;
     use bloomery_gpu::latent::POOL;
     use bloomery_gpu::{Gpu, GpuModel};
     use bloomery_gpu_gates::hy4_pass;
@@ -190,6 +212,15 @@ mod gate {
     /// other row sets, bit-identical in every run (0 on three prompts, 4,200 ids the largest).
     /// PIN(2026-11-19): measured 0.000e0.
     const CHUNK_BAND: f64 = 1.0e-6;
+
+    /// A logits row of the placed load under a reseeded residency machine against the same plan's
+    /// load with none, fed the same ids, relative L2: the two differ only in which of a hosted
+    /// layer's experts the card's slots sum and which the host's, the card's rule against the
+    /// host's, each layer's share inside [`FFN_BAND`] of the whole-card block; a slot the map
+    /// misroutes is another expert's rows, of the order of the row itself.
+    /// PIN(2026-11-19) [provisional]: derived, about 4 x [`FFN_BAND`] over the fixture's routed
+    /// layers; the first box run's worst re-pins it at 1.5 x.
+    const RESIDENCY_BAND: f64 = 1.0e-1;
 
     /// The ids of set `name`.
     fn set_ids(name: &'static str) -> Result<Vec<u32>, GateError> {
@@ -700,6 +731,59 @@ mod gate {
         }
         ok &= placed_pass_is_census(&mut pm, e, hosted)?;
         ok &= placed_pass_is_reserved(&pm, (&plan, &pass_inputs), (&inputs, &machine, &levers))?;
+        if tier::run_clause("placed_residency_follows_the_map", Tag::SelfConsistency)? {
+            pm.reset()?;
+            let first = prompt_placed(&mut pm, e)?;
+            let off = continuation(&mut pm, first, None)?;
+            drop(pm);
+            ok &= placed_residency_follows_the_map((&plan, &pass_inputs), e, &off)?;
+        }
+        Ok(ok)
+    }
+
+    /// Clause `placed_residency_follows_the_map` (the module header): `off` the history of the
+    /// plan's load with no machine, set `e` (`prompt`) through its pass and its own greedy ids.
+    fn placed_residency_follows_the_map(
+        (plan, pass_inputs): (&model::placement::Plan<'_>, &PlanInputs),
+        prompt: &[u32],
+        off: &(Vec<u32>, Vec<Vec<f32>>),
+    ) -> Result<bool, GateError> {
+        const CLAUSE: &str = "placed_residency_follows_the_map";
+        let residency = residency_clauses::mid_of(&plan.n_l).ok_or_else(|| {
+            format!("{CLAUSE}: no routed layer holds a pinned expert, a spare and a moving slot")
+        })?;
+        let mut mm = Body::open_placed_with(
+            open_split(Arch::Hy4, RECIPE)?,
+            (plan, pass_inputs),
+            0,
+            HOST_CFG,
+            (Some(PASS_ROWS), residency),
+        )?;
+        let layers = {
+            let b = mm.body(NAME)?;
+            TierBody::hybrid(b).slots().layers()
+        };
+        let orders =
+            residency_clauses::host_first_orders(plan, layers, pass_inputs.hp.experts.n_expert);
+        let order: Vec<&[u32]> = orders.iter().map(Vec::as_slice).collect();
+        let reseed = mm
+            .residency_reseed(&order)?
+            .ok_or_else(|| format!("{CLAUSE}: the {residency:?} load runs no machine"))?;
+        mm.reset()?;
+        let first = prompt_placed(&mut mm, prompt)?;
+        let (ids, rows) = continuation(&mut mm, first, Some(&off.0))?;
+        let (worst, at) = worst(&rows, &off.1);
+        let flipped = reseed.copies > 0 && reseed.diff == 0;
+        let ok = flipped && rows.len() == off.1.len() && worst <= RESIDENCY_BAND;
+        println!(
+            "{CLAUSE} {residency:?}: the reseed copied {} experts onto the card, {} entries off \
+             its seed; fed the off ids {:?} (its own {ids:?}), worst logits row relative L2 \
+             {worst:.3e} at row {at}, band {RESIDENCY_BAND:.1e} {}",
+            reseed.copies,
+            reseed.diff,
+            off.0,
+            verdict(ok)
+        );
         Ok(ok)
     }
 

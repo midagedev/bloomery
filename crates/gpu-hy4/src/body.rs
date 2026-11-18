@@ -750,8 +750,8 @@ impl Body {
     /// The placed load of `file` by `plan` on stage card `card`: every layer's dense part, the
     /// stores and each routed layer's card share of its stacks on the card, the rest of the
     /// routed experts on the host tier ([`crate::placed`]), the embedding and the engram table
-    /// read from the file on the host. The body keeps the load's slot map for its life (no
-    /// residency machine). Refused by name: a plan of another layer range or of more than one
+    /// read from the file on the host. The load runs no residency machine ([`Residency::Off`];
+    /// [`Body::open_placed_with`] takes a word). Refused by name: a plan of another layer range or of more than one
     /// stage card ([`stage_run`]), an expert tier card, a routed run with a gap. The sparse layers'
     /// cache rooms back their pages as the plan's `kv_host` word says, a spill keeping the stage
     /// card's margin free ([`KvBackings::of_plan`]).
@@ -762,7 +762,7 @@ impl Body {
         card: usize,
         host: HostCfg,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed_with(file, (plan, inputs), card, host, None)
+        Body::open_placed_with(file, (plan, inputs), card, host, (None, Residency::Off))
     }
 
     /// [`Body::open_placed`] with the placed prompt pass at `rows` rows ([`crate::batch`]'s
@@ -770,7 +770,8 @@ impl Body {
     /// union slabs for its rows, so a prompt runs as passes of up to `rows` rows
     /// ([`crate::batch::prompt_placed`]). The plan's prompt reserve holds the pass's bytes
     /// ([`crate::batch::pass_bytes`] at the plan's context). Refused by name as
-    /// [`Body::open_placed`] refuses, and the pass's buffers past the plan's reserve for them.
+    /// [`Body::open_placed`] refuses, and the pass's buffers past the plan's reserve for them. The
+    /// load runs no residency machine.
     pub fn open_placed_pass(
         file: Split,
         plan: &Plan<'_>,
@@ -779,15 +780,29 @@ impl Body {
         host: HostCfg,
         rows: usize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed_with(file, (plan, inputs), card, host, Some(rows))
+        Body::open_placed_with(
+            file,
+            (plan, inputs),
+            card,
+            host,
+            (Some(rows), Residency::Off),
+        )
     }
 
-    fn open_placed_with(
+    /// [`Body::open_placed`], or with the placed pass at `rows` rows ([`Body::open_placed_pass`]),
+    /// under `residency`: a `mid` word runs the common machine over the stage card's routed
+    /// stacks, held as rooms, and the slot map's card copy the step and the pass read
+    /// ([`bloomery_gpu::host::placed`]), its churn pool hosted beside the plan's host set. Refused
+    /// by name as those refuse, and a machine beside a routed layer the card holds whole
+    /// ([`PlacedHost::new`]).
+    ///
+    /// [`PlacedHost::new`]: bloomery_gpu::host::placed::PlacedHost::new
+    pub fn open_placed_with(
         file: Split,
         (plan, inputs): (&Plan<'_>, &PlanInputs),
         card: usize,
         host: HostCfg,
-        pass: Option<usize>,
+        (pass, residency): (Option<usize>, Residency),
     ) -> Result<GpuModel<Body>, GpuError> {
         const PLAN: &str = "hy4::Body::open_placed";
         let hp = &inputs.hp;
@@ -795,7 +810,7 @@ impl Body {
         let run = hosted(&inputs.spec.layers)
             .map_err(|e| GpuError::shape(PLAN, format!("the routed layers: {e}")))?;
         let spec = ResidencySpec::hosted(
-            Residency::Off,
+            residency,
             hp.experts.n_used,
             LOAD_ROWS,
             Arc::new(hosted_stacks(&inputs.model, PLAN, (run.len(), true))?),

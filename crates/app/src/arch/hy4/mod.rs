@@ -1,10 +1,10 @@
 //! The Hy4-flash session: [`Body`] behind the common hybrid owner's shape ([`super::Batch`]),
 //! planned once by the common hybrid planner (every layer's dense part and the stores on the stage
 //! card, each routed layer's card share of its experts beside them, the rest on the host tier) and
-//! loaded by the body's placed constructor ([`Body::open_placed`], or [`Body::open_placed_pass`]
-//! with the placed prompt pass). A load with the pass runs a prompt as passes of its rows
-//! ([`prompt_placed`]), the host's experts read once a pass; one without it steps the ids one at a
-//! time ([`GpuModel::step`] over the slice). Either way the head's argmax after the last id is the
+//! loaded by the body's placed constructor ([`Body::open_placed_with`], with or without the placed
+//! prompt pass) under the session's residency word. A load with the pass runs a prompt as passes
+//! of its rows ([`prompt_placed`], one residency pass), the host's experts read once a pass; one
+//! without it steps the ids one at a time ([`GpuModel::step`] over the slice). Either way the head's argmax after the last id is the
 //! call's. A window layer's ring and the engram history hold the
 //! position they stand at alone, so a cut keeps every held position or nothing. Each resident
 //! sequence owns its stores and its engram history ([`ResidentSequences`]).
@@ -36,10 +36,9 @@ impl Batch for Body {
         PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))
     }
 
-    /// The placed load on stage card 0 ([`Body::open_placed`]). The body keeps the load's slot
-    /// map for its life, so a residency other than [`Residency::Off`] is refused by name, never
-    /// run as another. The load makes one sequence; the session adds the rest
-    /// ([`ResidentSequences`]).
+    /// The placed load on stage card 0 under `residency` ([`Body::open_placed_with`]): a `mid`
+    /// word runs the common machine over the card's routed stacks and the slot map the step reads.
+    /// The load makes one sequence; the session adds the rest ([`ResidentSequences`]).
     fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -48,8 +47,7 @@ impl Batch for Body {
         residency: Residency,
         _slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        super::slot_map_for_life(WHAT, residency)?;
-        Body::open_placed(file, plan, inputs, 0, host)
+        Body::open_placed_with(file, (plan, inputs), 0, host, (None, residency))
     }
 
     /// Refused by name: the placed pass is the body's own walk ([`Batch::prompt`]), so nothing
@@ -77,8 +75,9 @@ impl Batch for Body {
     }
 
     /// The ids from the model's position: as placed passes when the load has one
-    /// ([`prompt_placed`]), else stepped. The body's residency is [`Residency::Off`], so no rule
-    /// counts the prompt ids' decode rows.
+    /// ([`prompt_placed`]: the call one residency pass, 0 rows kept), else stepped, each step
+    /// owning its residency pass, so no outer
+    /// [`prompt_pass`](bloomery_gpu::host::served::prompt_pass) wraps the ids.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
         if m.body("hy4::Batch::prompt")?.pass_rows().is_none() {
             return m.step(ids);

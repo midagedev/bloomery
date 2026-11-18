@@ -46,13 +46,14 @@ use super::hybrid_draft::SeatDraft;
 use super::tiered::{self, BuildMachine, Open, PassAttempt, PassPlan, Tiered, Walk};
 
 /// The open of a family's prompt pass ([`Family::pass`]): the body by the plan its pass inputs
-/// made, with the pass's buffers beside it.
+/// made, with the pass's buffers beside it, under the seat's residency word.
 pub type PassOpen<F> = Box<
     dyn FnOnce(
             Split,
             &Plan<'_>,
             &PlanInputs<<F as Family>::H>,
             HostCfg,
+            Residency,
         ) -> Result<GpuModel<<F as Family>::Body>, GpuError>
         + Send,
 >;
@@ -87,10 +88,6 @@ pub trait Family: Sized + 'static {
     /// ([`Tiered::TIER_RULE`]). The default serves none, and a placement that names a tier card is
     /// refused by name.
     const TIER_RULE: TierRule = TierRule::UNTIERED;
-
-    /// Whether the body keeps its load's slot map for its life, and so serves no residency but
-    /// `off` ([`Tiered::SLOT_MAP_FIXED`]). The default runs the residency machine.
-    const SLOT_MAP_FIXED: bool = false;
 
     /// What the load takes for the K/V levers it leaves unset ([`Tiered::KV_DEFAULT`]). The
     /// default is none.
@@ -435,8 +432,7 @@ fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError
 
 /// The load of a family's prompt pass: the plan of the pass's `inputs` on the run's `machine` at
 /// `ctx` (`app::Open::plan`, as [`Loaded::open`] plans), handed to `log`, then the body by `open`
-/// with the pass's buffers, in graph mode. The pass's load keeps its slot map, so a residency
-/// other than [`Residency::Off`] is refused by name.
+/// with the pass's buffers under the configuration's residency, in graph mode.
 fn open_pass<F: Family>(
     file: Split,
     (inputs, open): (&PlanInputs<F::H>, PassOpen<F>),
@@ -444,20 +440,11 @@ fn open_pass<F: Family>(
     (ctx, cfg): (usize, HybridCfg),
     log: &mut Log<F>,
 ) -> Result<Loaded<F::Body>, GateError> {
-    if cfg.residency != Residency::Off {
-        return Err(format!(
-            "the {} prompt pass's load keeps its slot map: residency {:?} is refused \
-             (BLOOMERY_RESIDENCY off)",
-            F::FAMILY,
-            cfg.residency
-        )
-        .into());
-    }
     let plan = <F::Body as app::Open>::plan(inputs, machine, ctx, &cfg)?;
     log.plan("", inputs, machine, &plan)?;
     let held = u32::try_from(plan.ctx_max)
         .map_err(|_| format!("the plan's ctx_max {} passes u32", plan.ctx_max))?;
-    let mut m = open(file, &plan, inputs, cfg.host)?;
+    let mut m = open(file, &plan, inputs, cfg.host, cfg.residency)?;
     m.set_mode(StepMode::Graph);
     Ok(Loaded::from_model(m, cfg, held).watched(log.card_watch()?)?)
 }
@@ -697,11 +684,9 @@ impl<F: Family> Tiered for Hybrid<F> {
         flags.prefill == Some(Prefill::Steps)
     }
 
-    const SLOT_MAP_FIXED: bool = F::SLOT_MAP_FIXED;
     const KV_DEFAULT: Option<KvDefault> = F::KV_DEFAULT;
 
-    /// The common machine's pick ([`tiered::residency_pick`]) with the seat's prompt feed, or,
-    /// for a body that keeps its load's slot map, `off` ([`tiered::fixed_slot_map_pick`]); a
+    /// The common machine's pick ([`tiered::residency_pick`]) with the seat's prompt feed: a
     /// step-fed body is `off` unset and refuses any other word by name.
     fn residency(
         levers: &Levers,
@@ -710,16 +695,6 @@ impl<F: Family> Tiered for Hybrid<F> {
         plan: &Plan<'_>,
     ) -> Result<Option<ResidencyPick>, GateError> {
         let steps = Self::prefill_steps(flags);
-        if F::SLOT_MAP_FIXED {
-            return tiered::fixed_slot_map_pick(
-                levers,
-                plan,
-                steps,
-                F::FAMILY,
-                Self::UNHOSTED_POOL,
-            )
-            .map(Some);
-        }
         tiered::residency_pick(levers, place, plan, steps, Self::UNHOSTED_POOL).map(Some)
     }
 

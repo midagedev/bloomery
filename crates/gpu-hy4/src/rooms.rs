@@ -5,11 +5,11 @@
 //! a capture, and a reset gives the pages back.
 //!
 //! What is no room stays flat and counted at the context: the pooled keys, their scores, the index
-//! ring, the list and the window layers' rings. The body holds no residency machine, so a fit that
-//! runs out of card bytes is the room's named refusal ([`bloomery_gpu::fit_rooms`]), and no page
-//! is shared between two sequences' stores.
+//! ring, the list and the window layers' rings. A fit that runs out of card bytes asks the placed
+//! load's residency machine for expert bytes, and on a load that runs none it is the room's named
+//! refusal ([`bloomery_gpu::fit_rooms`]); no page is shared between two sequences' stores.
 
-use bloomery_gpu::{GpuError, KvRoomBody, RoomTensor, fit_rooms};
+use bloomery_gpu::{FreedBytes, GpuError, KvRoomBody, RoomTensor, fit_rooms};
 
 use crate::body::{Body, Store, WHAT};
 
@@ -59,9 +59,9 @@ impl Body {
     }
 }
 
-/// The rooms [`fit_rooms`] runs: every sparse layer's cache. The body holds no residency machine
-/// ([`KvRoomBody::free_expert_bytes`]'s default refuses by name) and shares no page between two
-/// sequences, so a fit only backs pages.
+/// The rooms [`fit_rooms`] runs: every sparse layer's cache, the placed load's residency machine
+/// the one that frees expert bytes for them. The body shares no page between two sequences, so a
+/// fit only backs pages.
 impl KvRoomBody for Body {
     const WHAT: &'static str = WHAT;
 
@@ -77,5 +77,18 @@ impl KvRoomBody for Body {
                 Store::Swa { .. } => 0,
             })
             .sum()
+    }
+
+    /// The placed host's machine gives the bytes back
+    /// ([`bloomery_gpu::host::placed::PlacedHost::free_expert_bytes`]); a whole-card load has
+    /// none and is refused by name.
+    fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {
+        match self.placed.as_mut() {
+            Some(p) => p.free_expert_bytes(want),
+            None => Err(GpuError::State {
+                what: WHAT,
+                missing: "a residency machine to free expert bytes for the stores",
+            }),
+        }
     }
 }

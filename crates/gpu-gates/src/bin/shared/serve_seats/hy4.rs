@@ -12,13 +12,14 @@
 //!
 //! What this file holds is what Hy4-flash's architecture forces. A window layer's ring and the
 //! engram history hold the position they stand at alone, so a request shares a prefix with its
-//! slot only where the sequence stands (`app::arch::hy4`). The body keeps its load's slot map for
-//! its life, so the family says no residency but `off` ([`Family::SLOT_MAP_FIXED`]), and it
-//! hangs no expert tier card ([`TierRule::UNTIERED`], the default). Each resident sequence owns
+//! slot only where the sequence stands (`app::arch::hy4`). The body runs the common residency
+//! machine under the seat's word (unset, the serving word on a serving placement, which the plan
+//! keeps, moves or turns `off`), and it hangs no expert tier card ([`TierRule::UNTIERED`], the
+//! default). Each resident sequence owns
 //! its stores and its engram history, so `--parallel N` serves N slots by a select and a step a
 //! slot. The body has a placed prompt pass ([`Family::pass`]): the widest pass shape the plan
 //! holds at the seat's context ([`hy4_pass::pick`]), planned with the shape's bytes as the prompt
-//! reserve and loaded by `Body::open_placed_pass`; each request's prompt then runs through
+//! reserve and loaded by `Body::open_placed_with`; each request's prompt then runs through
 //! `Batch::prompt`, which takes the pass. A plan that holds no shape loads the stepped body (one id
 //! a decode step), and `--prefill steps` asks it; the `listening` record names the walk.
 //!
@@ -57,8 +58,8 @@ const USAGE: &str = "usage: bloomery-serve --model hy4 [-m PATH | --hf <repo>[:<
                      [--queue-depth Q] [--slot-save-path DIR] [--api-key KEY] \
                      [--api-key-file FNAME]";
 
-/// The levers this seat acts on: the plan's card budget and margin, the residency machine's word
-/// (only `off` loads), the host set's load settings, the engine thread's pin, the host legs' lane
+/// The levers this seat acts on: the plan's card budget and margin, the residency machine's word,
+/// the host set's load settings, the engine thread's pin, the host legs' lane
 /// rule, the start screen, the schema jump and the K/V's floor and host backing. There is no prompt
 /// group: a prompt runs as passes of the plan's shape, or stepped.
 pub const ACTS_ON: &[&str] = &[
@@ -90,15 +91,15 @@ impl Family for Hy4 {
     const ALIAS: &'static str = "hy4-flash";
     const FAMILY: &'static str = "hy4";
     const SERVES: &'static str = "hy-v4-flash";
-    const SLOT_MAP_FIXED: bool = true;
     const KV_DEFAULT: Option<KvDefault> = Some(KvDefault::SERVER);
     const PASS: bool = true;
 
     /// The widest pass shape the seat's plan holds at `ctx` ([`hy4_pass::pick`]) on the seat's
     /// machine (no expert tier card hangs, so one machine serves every shape), and its open
-    /// ([`Body::open_placed_pass`] on stage card 0); or why no shape fits.
+    /// ([`Body::open_placed_with`] on stage card 0 with the shape's rows, under the seat's
+    /// residency); or why no shape fits.
     ///
-    /// [`Body::open_placed_pass`]: bloomery_gpu_hy4::Body::open_placed_pass
+    /// [`Body::open_placed_with`]: bloomery_gpu_hy4::Body::open_placed_with
     fn pass(
         inputs: &PlanInputs,
         _place: Place,
@@ -119,8 +120,14 @@ impl Family for Hy4 {
         };
         Ok(Ok((
             plan,
-            Box::new(move |file, plan, inputs, host| {
-                bloomery_gpu_hy4::Body::open_placed_pass(file, plan, inputs, 0, host, shape.rows)
+            Box::new(move |file, plan, inputs, host, residency| {
+                bloomery_gpu_hy4::Body::open_placed_with(
+                    file,
+                    (plan, inputs),
+                    0,
+                    host,
+                    (Some(shape.rows), residency),
+                )
             }),
         )))
     }

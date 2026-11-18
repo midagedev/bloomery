@@ -653,9 +653,6 @@ impl Taps {
 }
 
 pub struct Body {
-    /// The engine stream as a shared handle: the rooms' constructors and the residency machine's
-    /// release of expert stacks for a fit run on it.
-    stream: Arc<CudaStream>,
     hp: Hparams,
     kda: KdaDims,
     mla: MlaDims,
@@ -724,9 +721,10 @@ impl GpuModel<Body> {
     /// Card `card` of `plan`, which `inputs` made, resident: the dense trunk and each routed
     /// layer's card experts the plan puts there, the stores at the plan's `ctx_max`, the host tier
     /// over the layers whose experts the card does not hold whole with the plan's expert tier
-    /// card hung under it, and the embedding as a host row ([`placed`]). The load's slot map
-    /// stays for the model's life ([`Residency::Off`]). The prompt is stepped one id at a time;
-    /// [`GpuModel::open_placed_pass`] loads the placed pass beside it.
+    /// card hung under it, and the embedding as a host row ([`placed`]). The load runs no
+    /// residency machine ([`Residency::Off`]; [`GpuModel::open_placed_with`] takes a word). The
+    /// prompt is stepped one id at a time; [`GpuModel::open_placed_pass`] loads the placed pass
+    /// beside it.
     /// A plan whose stage card carries no head leaves `output_norm.weight` and `output.weight` on
     /// the host, and the output head is the host's ([`HostHead`]). Refused by name: a plan of
     /// other than one stage card running every layer, a plan that carries the head on no card and
@@ -742,7 +740,7 @@ impl GpuModel<Body> {
         card: usize,
         host: HostCfg,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Self::open_placed_with(file, (plan, inputs), card, host, None)
+        Self::open_placed_with(file, (plan, inputs), card, host, (None, Residency::Off))
     }
 
     /// [`GpuModel::open_placed`] with the placed pass at `shape` ([`pass`]): its buffers made
@@ -751,7 +749,7 @@ impl GpuModel<Body> {
     /// ([`GpuModel::prompt_placed`]). The plan's prompt reserve holds the pass's bytes
     /// ([`pass::pass_bytes`] at the plan's context), its tier batch the tier's at those rows.
     /// Refused by name as [`GpuModel::open_placed`] refuses, and the pass's buffers with the
-    /// tier's places past the plan's reserves for them.
+    /// tier's places past the plan's reserves for them. The load runs no residency machine.
     pub fn open_placed_pass(
         file: Split,
         plan: &Plan<'_>,
@@ -760,15 +758,27 @@ impl GpuModel<Body> {
         host: HostCfg,
         shape: pass::PassShape,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Self::open_placed_with(file, (plan, inputs), card, host, Some(shape))
+        Self::open_placed_with(
+            file,
+            (plan, inputs),
+            card,
+            host,
+            (Some(shape), Residency::Off),
+        )
     }
 
-    fn open_placed_with(
+    /// [`GpuModel::open_placed`], or with the placed pass at `shape`
+    /// ([`GpuModel::open_placed_pass`]), under `residency`: a `mid` word runs the common machine
+    /// over the stage card's routed stacks, held as rooms, and the slot map's card copy the step
+    /// and the pass read ([`crate::host::placed`]), its churn pool hosted beside the plan's
+    /// host set. Refused by name as those refuse, and a machine beside a routed layer the card
+    /// holds whole ([`PlacedHost::new`]).
+    pub fn open_placed_with(
         file: Split,
         (plan, inputs): (&Plan<'_>, &PlanInputs),
         card: usize,
         host: HostCfg,
-        pass: Option<pass::PassShape>,
+        (pass, residency): (Option<pass::PassShape>, Residency),
     ) -> Result<GpuModel<Body>, GpuError> {
         const PLAN: &str = "kimi_k3::Body::open_placed";
         let pass = pass.map(pass::PassShape::check).transpose()?;
@@ -782,7 +792,7 @@ impl GpuModel<Body> {
             .map_err(|e| GpuError::shape(PLAN, format!("the routed layers: {e}")))?;
         refuse_tierless_host_layers(PLAN, plan, run.clone(), hp)?;
         let spec = ResidencySpec {
-            lever: Residency::Off,
+            lever: residency,
             pool: ChurnHosting::Hosted,
             delay: LIVE_DELAY,
             deadline: DEADLINE,
@@ -1105,7 +1115,6 @@ impl Body {
             .then(|| index::Sel::new(stream, &hp, md.row(), ctx))
             .transpose()?;
         Ok(Body {
-            stream: handle,
             placed,
             host_head: None,
             out_score,
@@ -1426,6 +1435,7 @@ impl Body {
                     PlacedHost {
                         shell,
                         side: placed,
+                        ..
                     },
                 side,
                 ..
@@ -1762,22 +1772,16 @@ impl KvRoomBody for Body {
         Some((book, residency))
     }
 
+    /// The placed host's machine gives the bytes back ([`PlacedHost::free_expert_bytes`]); a
+    /// whole-card load has none and is refused by name.
     fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {
-        let stream = Arc::clone(&self.stream);
-        let Some(ResidencyParts { glue, hybrid, .. }) =
-            self.placed.as_mut().and_then(TierBody::residency_parts)
-        else {
-            return Err(GpuError::state(
+        match self.placed.as_mut() {
+            Some(p) => p.host.free_expert_bytes(want),
+            None => Err(GpuError::state(
                 WHAT,
                 "a residency machine to free expert bytes for the stores",
-            ));
-        };
-        let freed = glue.free_bytes(hybrid, &stream, want)?;
-        Ok(FreedBytes {
-            bytes: freed.bytes,
-            slots: freed.k,
-            layers: freed.layers.len(),
-        })
+            )),
+        }
     }
 }
 

@@ -24,14 +24,15 @@
 //! vocabulary spells it.
 //!
 //! - `parallel_above_one_is_refused`: the shared clause.
-//! - `residency_is_off_for_a_fixed_slot_map`: `--plan` at [`CTX`] with `BLOOMERY_RESIDENCY` removed
-//!   from the environment prints the `residency lever` record at `off` with why [`UNSET_WHY`] and
-//!   no `residency host` record: the body keeps the load's slot map for its life, so the residency
-//!   machine runs over none of its placements. `BLOOMERY_RESIDENCY=off` prints `off` with why `set`
-//!   and no pool. `BLOOMERY_RESIDENCY=mid-p0-s1` exits non-zero and its stderr names the refusal
-//!   (`tiered::refuse_fixed_slot_map`), the plan record absent. FAIL-first: a seat whose residency
-//!   pick is the serving word prints it with why `place` and the unset half is red; one that runs
-//!   the word it is given loads the churn machine over a body that cannot and the refusal half is
+//! - `residency_resolves_by_the_plan`: `--plan` at [`CTX`] with `BLOOMERY_RESIDENCY` removed
+//!   from the environment prints the `residency lever` record the common unset rule resolves over
+//!   the plan (`serve_client::residency_lever_resolved`: the serving word where the plan has room,
+//!   else `off` with the plan's reason, the churn pool's `residency host` record exactly where the
+//!   word is not `off`): the body runs the common machine. `BLOOMERY_RESIDENCY=off` prints `off`
+//!   with why `set` and no pool. `BLOOMERY_RESIDENCY=mid-p0-s1` prints the word with why `set` and
+//!   names no refusal of the word itself (the plan's room check is the common owner's). FAIL-first:
+//!   a seat that keeps the load's slot map (`SLOT_MAP_FIXED` back) prints `off` with why
+//!   `fixed_place` unset and refuses the set word before its lever record, and both halves are
 //!   red.
 //! - `prompt_runs_as_passes`: a server at [`CTX`] names `prompt=pass` in its `listening` record,
 //!   prints the `prompt_pass` record of the shape its plan holds (R rows), and its `load` record
@@ -78,7 +79,7 @@ mod gate {
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         SeatGate, Served, check, completion_raw, curl, ids_of, json_of, no_residency_host,
-        residency_lever_is, server_log, stop_of, tokenized,
+        residency_lever_is, residency_lever_resolved, server_log, stop_of, tokenized,
     };
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use gguf::Split;
@@ -96,13 +97,8 @@ mod gate {
     /// Polls of a second that bound the wait for a server to listen.
     const LISTEN_POLLS: usize = 1000;
 
-    /// The words of the residency refusal a set word other than `off` gets.
+    /// The words a seat's refusal of a set residency word starts with.
     const RESIDENCY_REFUSED: &str = "BLOOMERY_RESIDENCY=mid-p0-s1 is refused";
-
-    /// Why an unset residency is `off`: the body keeps its load's slot map for its life.
-    /// PIN(2026-11-08): `prefill_steps` -> `fixed_place`; the seat runs its prompt as passes, and
-    /// its `off` is the body's slot map, not a step feed.
-    const UNSET_WHY: &str = "fixed_place";
 
     /// The ids each `/completion` of `passes_answer_as_steps` generates.
     const GENERATED: usize = 8;
@@ -146,8 +142,8 @@ mod gate {
         })
     }
 
-    /// `residency_is_off_for_a_fixed_slot_map` (the module header).
-    fn residency_is_off_for_a_fixed_slot_map(
+    /// `residency_resolves_by_the_plan` (the module header).
+    fn residency_resolves_by_the_plan(
         c: &serve_gate::Clauses,
         dir: &Path,
     ) -> Result<bool, GateError> {
@@ -176,26 +172,24 @@ mod gate {
             &["--ctx", &ctx],
             Some("mid-p0-s1"),
         )?;
-        let unset_ok = unset_status.success()
-            && residency_lever_is(&unset, "off", UNSET_WHY)?
-            && no_residency_host(&unset)?;
+        let unset_ok = unset_status.success() && residency_lever_resolved(&unset)?;
         let off_ok = off_status.success()
             && residency_lever_is(&off, "off", "set")?
             && no_residency_host(&off)?;
-        let mid_refused = !mid_status.success()
-            && mid_text.contains(RESIDENCY_REFUSED)
-            && mid.first(&record::PLAN)?.is_none();
+        let mid_ok =
+            residency_lever_is(&mid, "mid-p0-s1", "set")? && !mid_text.contains(RESIDENCY_REFUSED);
         println!(
-            "residency: unset {:?} is off ({UNSET_WHY}) with no pool {unset_ok}; set off {:?} is \
-             off (set) with no pool {off_ok}; set mid-p0-s1 exits non-zero, names \
-             {RESIDENCY_REFUSED:?} and prints no plan {mid_refused}",
+            "residency: unset {:?} resolves by the plan {unset_ok}; set off {:?} is off (set) \
+             with no pool {off_ok}; set mid-p0-s1 {:?} ({mid_status}) is the word (set) and \
+             names no {RESIDENCY_REFUSED:?} {mid_ok}",
             lever_line(&unset)?,
             lever_line(&off)?,
+            lever_line(&mid)?,
         );
         check(
             &mut ok,
-            "residency_is_off_for_a_fixed_slot_map",
-            unset_ok && off_ok && mid_refused,
+            "residency_resolves_by_the_plan",
+            unset_ok && off_ok && mid_ok,
         );
         Ok(ok)
     }
@@ -416,7 +410,7 @@ mod gate {
         let dir = serve_gate::dir_of(&c)?;
         std::fs::create_dir_all(&dir)?;
         let mut ok = serve_gate::parallel_above_one_is_refused(&c, &dir)?;
-        ok &= residency_is_off_for_a_fixed_slot_map(&c, &dir)?;
+        ok &= residency_resolves_by_the_plan(&c, &dir)?;
         ok &= prompt_runs_as_passes(&c, &dir)?;
         ok &= serve_gate::served_with(&c, &dir, ASK)?;
         ok &= tools_request_is_refused(&c, &dir)?;

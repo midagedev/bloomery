@@ -7,6 +7,13 @@
 //! their download to the host's batch set); [`PlacedHost`] holds it with the tier's shell. A
 //! body's own walk (the three parts of its block around the host's go or around a batch's
 //! download and join) stays the body's.
+//!
+//! Under a residency machine the slot map's card copy is the machine's view of the map: its
+//! flips write their words there on the engine stream at a boundary, so the step's handoff and a
+//! batch's places, which read the copy at their launch after the boundary, follow the live map
+//! (the stacks are rooms the common load made, [`crate::StackRoom`]). The card count of a layer
+//! is its stacks' slots, which the machine never grows, and every routed layer has a host share
+//! the machine moves experts through ([`PlacedHost::new`]).
 
 use std::sync::Arc;
 
@@ -23,6 +30,7 @@ use crate::card_leg::{LegRun, LegStacks};
 use crate::card_slots::Places;
 use crate::hybrid::{Chain, Hybrid, SlotMap};
 use crate::kquant::Act;
+use crate::room::kv::FreedBytes;
 use crate::tensor::{Window, WindowMut};
 use crate::{DeviceTensor, Gpu, GpuError};
 
@@ -46,7 +54,8 @@ pub struct PlacedSide {
     n_card: Vec<usize>,
     row_off: Vec<usize>,
     shape: SideShape,
-    /// The slot map's card copy, one row of `n_expert` places a routed layer.
+    /// The slot map's card copy, one row of `n_expert` places a routed layer: the residency
+    /// machine's view, whose words its flips write ([`PlacedHost`]).
     slots: Arc<DeviceTensor<u32>>,
     handoff: HandoffKernels,
     /// The routed slots' places in the card's stacks, or `HOST`.
@@ -139,6 +148,15 @@ impl PlacedSide {
     #[must_use]
     pub fn first_hosted(&self) -> Option<usize> {
         self.hosted.iter().position(|&h| h)
+    }
+
+    /// The routed layers whose experts the card holds whole: the step runs them with no host
+    /// leg, in order.
+    #[must_use]
+    pub fn whole_set(&self) -> Vec<usize> {
+        (0..self.hosted.len())
+            .filter(|&l| self.n_card[l] > 0 && !self.hosted[l])
+            .collect()
     }
 
     /// The card's experts of layer `l`: 0 on a layer with no routed block. A layer past the
@@ -367,10 +385,14 @@ impl PlacedSide {
 }
 
 /// A placed load's host tier, its glue and the stage card's side. The shell is the first field
-/// and the drop stops the residency machine before any card or pinned memory frees.
+/// and the drop stops the residency machine before any card or pinned memory frees. The machine,
+/// when the glue holds one, runs over the side's slot map copy ([`TierBody::residency_parts`]),
+/// started once the body's pieces are sized ([`crate::model::HostServed::start_residency`]).
 pub struct PlacedHost {
     pub shell: TierShell<HostRun>,
     pub side: PlacedSide,
+    /// The engine stream, which the machine's give-backs run on.
+    stream: Arc<CudaStream>,
 }
 
 impl Drop for PlacedHost {
@@ -380,6 +402,48 @@ impl Drop for PlacedHost {
 }
 
 impl PlacedHost {
+    /// The placed host of `shell` and `side` on `gpu`'s engine stream. Refused by name: a
+    /// residency machine (the glue holds one) beside a routed layer whose experts the card holds
+    /// whole. The machine empties a spare slot of every routed layer and moves experts to the
+    /// host, which serves no share of a whole layer, and the step runs that layer with no host
+    /// leg. Load-time only.
+    pub fn new(
+        gpu: &Gpu,
+        shell: TierShell<HostRun>,
+        side: PlacedSide,
+    ) -> Result<PlacedHost, GpuError> {
+        let whole = side.whole_set();
+        if shell.glue.source().is_some() && !whole.is_empty() {
+            return Err(GpuError::shape(
+                shell.what,
+                format!(
+                    "a residency machine beside routed layers whose experts the card holds whole                      ({whole:?}): the machine moves their slots to a host that serves no share of                      them (BLOOMERY_RESIDENCY off)"
+                ),
+            ));
+        }
+        Ok(PlacedHost {
+            shell,
+            side,
+            stream: gpu.stream_handle(),
+        })
+    }
+
+    /// At least `want` device bytes of the stage card's expert stacks given back by the residency
+    /// machine ([`ResidencyGlue::free_bytes`]): the per-layer report folded to the stores' tally.
+    /// Refused by name, the machine unchanged, on a load that runs none and as the machine
+    /// refuses.
+    ///
+    /// [`ResidencyGlue::free_bytes`]: super::swap_source::ResidencyGlue::free_bytes
+    pub fn free_expert_bytes(&mut self, want: u64) -> Result<FreedBytes, GpuError> {
+        let TierShell { glue, hybrid, .. } = &mut self.shell;
+        let freed = glue.free_bytes(hybrid, &self.stream, want)?;
+        Ok(FreedBytes {
+            bytes: freed.bytes,
+            slots: freed.k,
+            layers: freed.layers.len(),
+        })
+    }
+
     /// The host tier's union slabs for the one-column step ([`HostRun::prepare_union`] at one
     /// column): the resident path of the host layer serves the step only through them.
     /// Load-time only.

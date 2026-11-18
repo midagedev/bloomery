@@ -32,6 +32,7 @@ use bloomery_gpu::head::Head;
 use bloomery_gpu::host::census::TierCensus;
 use bloomery_gpu::host::placed::{PlacedHost, PlacedSide};
 use bloomery_gpu::host::run::HostRun;
+use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::host::{BatchLeg, HybridStats};
 use bloomery_gpu::latent::{INDEX_HEAD, POOL};
 use bloomery_gpu::routed_block::{RouteIn, RoutedRows, RouterEntry};
@@ -697,7 +698,7 @@ fn walk_pass(
     if taps.is_some() {
         return Err(GpuError::shape(PASS, "taps are armed: a pass does not tap"));
     }
-    let PlacedHost { shell, side } = placed.as_mut().ok_or(GpuError::State {
+    let PlacedHost { shell, side, .. } = placed.as_mut().ok_or(GpuError::State {
         what: PASS,
         missing: "the placed side of a placed load",
     })?;
@@ -774,9 +775,10 @@ fn walk_pass(
 
 /// The prompt `ids` through `model`'s placed pass from its position, in passes of up to the load's
 /// rows: the stores, the engram history and the position stand where `ids.len()` decode steps
-/// leave them, and the return is the greedy id after the last row. Refused by name: no ids, a load
-/// made without the pass, a position the stores do not stand at; a call that fails part-way leaves
-/// the stores to a reset.
+/// leave them, and the return is the greedy id after the last row. The call is one residency pass
+/// ([`prompt_pass`]: its boundary before the first walk, none inside, 0 rows kept), so every walk
+/// reads one slot map. Refused by name: no ids, a load made without the pass, a position the
+/// stores do not stand at; a call that fails part-way leaves the stores to a reset.
 pub fn prompt_placed(
     model: &mut GpuModel<crate::body::Body>,
     ids: &[u32],
@@ -790,28 +792,30 @@ pub fn prompt_placed(
         .pass_rows()
         .ok_or_else(|| GpuError::shape(CALL, "a load made without the placed pass"))?;
     let n = u32::try_from(ids.len()).map_err(|_| GpuError::shape(CALL, "ids past u32"))?;
-    let token = model.run_rows(ids.len(), CALL, |gpu, w, body, head, pos| {
-        if pos != body.held {
-            return Err(GpuError::shape(
-                CALL,
-                format!(
-                    "a call at position {pos}; the stores stand at {} (reset after a call that \
+    let token = prompt_pass(model, |model| {
+        model.run_rows(ids.len(), CALL, |gpu, w, body, head, pos| {
+            if pos != body.held {
+                return Err(GpuError::shape(
+                    CALL,
+                    format!(
+                        "a call at position {pos}; the stores stand at {} (reset after a call that \
                      failed part-way)",
-                    body.held
-                ),
-            ));
-        }
-        // The cache rooms backed through the call's last position before any walk launches.
-        body.fit(pos as usize, ids.len())?;
-        // Anything past this point that fails leaves the engram history and the stores part-way.
-        body.held = u32::MAX;
-        let walks = ids.len().div_ceil(rows);
-        for (i, chunk) in ids.chunks(rows).enumerate() {
-            let at = pos + (i * rows) as u32;
-            walk_pass(gpu, w, body, head, (chunk, at), i + 1 == walks)?;
-        }
-        body.held = pos + n;
-        Ok(true)
+                        body.held
+                    ),
+                ));
+            }
+            // The cache rooms backed through the call's last position before any walk launches.
+            body.fit(pos as usize, ids.len())?;
+            // Anything past this point that fails leaves the engram history and the stores part-way.
+            body.held = u32::MAX;
+            let walks = ids.len().div_ceil(rows);
+            for (i, chunk) in ids.chunks(rows).enumerate() {
+                let at = pos + (i * rows) as u32;
+                walk_pass(gpu, w, body, head, (chunk, at), i + 1 == walks)?;
+            }
+            body.held = pos + n;
+            Ok(true)
+        })
     })?;
     token.ok_or_else(|| GpuError::shape(CALL, "a prompt pass that read no token"))
 }

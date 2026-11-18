@@ -1,7 +1,8 @@
 //! The Kimi K3 session: [`Body`] behind the common hybrid owner's shape ([`super::Batch`]), planned
 //! once by its placement (the dense trunk and each routed layer's card experts on the stage card,
 //! the next ids on an expert tier card, the rest on the host tier) and loaded by the body's placed
-//! constructor ([`GpuModel::open_placed`]). A load with the placed pass runs a prompt as passes of
+//! constructor ([`GpuModel::open_placed_with`]) under the session's residency word. A load with
+//! the placed pass runs a prompt as passes of
 //! its rows ([`GpuModel::prompt_placed`]), past a K3.1 file's indexer top-k too (each row's latent
 //! layers attend the rows the indexer picks for it); one without the pass steps the ids one at a
 //! time ([`GpuModel::step`] over the slice, [`Batch::prompt`]). Either way each id is a decode
@@ -41,9 +42,8 @@ impl Batch for Body {
         PlanInputs::read_without_chat(file).map_err(|e| GpuError::plan(WHAT, e))
     }
 
-    /// The placed load on stage card 0 ([`GpuModel::open_placed`]). The body keeps the load's slot
-    /// map for its life, so a residency other than [`Residency::Off`] is refused by name, never
-    /// run as another.
+    /// The placed load on stage card 0 under `residency` ([`GpuModel::open_placed_with`]): a `mid`
+    /// word runs the common machine over the card's routed stacks and the slot map the step reads.
     fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -52,8 +52,7 @@ impl Batch for Body {
         residency: Residency,
         _slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        super::slot_map_for_life(WHAT, residency)?;
-        GpuModel::<Body>::open_placed(file, plan, inputs, 0, host)
+        GpuModel::<Body>::open_placed_with(file, (plan, inputs), 0, host, (None, residency))
     }
 
     /// Refused by name: the placed load has no rows pass, so the prompt is [`Batch::prompt`]'s
@@ -82,13 +81,11 @@ impl Batch for Body {
     }
 
     /// The ids from the model's position: as placed passes when the load has one
-    /// ([`GpuModel::prompt_placed`]), on a K3.1 file past its indexer's top-k too (every pass row
-    /// selects as the step at its position does), else stepped. Each pass or step owns its
-    /// residency pass (its
-    /// boundary, its kept row, the next boundary ahead), and a host tier's open-call state refuses
-    /// a boundary inside an open call, so no outer
-    /// [`prompt_pass`](bloomery_gpu::host::served::prompt_pass) wraps the ids. The body's
-    /// residency is [`Residency::Off`], so no rule counts the prompt ids' decode rows.
+    /// ([`GpuModel::prompt_placed`]: the call one residency pass, 0 rows kept), on a K3.1 file
+    /// past its indexer's top-k too (every pass row selects as the step at its position does),
+    /// else stepped, each step owning its residency pass (its boundary, its kept row, the next
+    /// boundary ahead), so no outer [`prompt_pass`](bloomery_gpu::host::served::prompt_pass)
+    /// wraps the ids: a host tier's open-call state refuses a boundary inside an open call.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
         if m.body("kimi_k3::Batch::prompt")?.pass_shape().is_none() {
             return m.step(ids);
