@@ -484,7 +484,7 @@ use bloomery_gpu_gates::bind::{
     prefill_closing, put_back, seat_failure, slots_of,
 };
 use bloomery_gpu_gates::generate::{
-    BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, lane_of, stage_host_page,
+    BreakEven, DraftYield, FloorShort, Lane, Place, draft_yield, lane_of,
 };
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::nodes::step_census;
@@ -495,7 +495,7 @@ use bloomery_gpu_gates::residency38::{
 };
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path, side_seat, vision_seat};
 use bloomery_levers::{
-    ChurnHosting, Draft38At, Draft38Off, DraftWord, KvHost, Paged, Residency38At, ResidencyPick,
+    ChurnHosting, Draft38At, Draft38Off, DraftWord, Paged, Residency38At, ResidencyPick,
     ResidencyWhy, draft38_unset, residency_word_least_fewest, residency38_least_fewest,
     residency38_off, residency38_unset,
 };
@@ -1933,26 +1933,9 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let kv = kv_cache.kv;
     inputs.kv = inputs.kv.in_q8_if(kv == KvQ8::Q8);
     // The page a host-capable room takes on the stage card, read once under
-    // `BLOOMERY_KV_HOST`: every plan and reserve below rounds the planes at it.
-    // Unset, the backing is the server's default (`qwen38_levers::KV_DEFAULT`);
-    // where the device cannot stage a host page, that default is `off` by
-    // name, and a set `spill` or `all` is the refusal itself.
-    let mut kv_default = qwen38_levers::KV_DEFAULT;
-    let kv_host_set = levers.kv_host_set().and_then(KvHost::parse);
-    if kv_host_set.unwrap_or(kv_default.host) != KvHost::Off {
-        match stage_host_page(stage) {
-            Ok(page) => inputs.kv_host_page = Some(page),
-            Err(e) if kv_host_set.is_none() => {
-                eprintln!(
-                    "bloomery-serve-qwen38: BLOOMERY_KV_HOST is unset and {} cannot back a K/V \
-                     page on the host ({e}); the planes stay on the card (kv_host=off)",
-                    stage.name
-                );
-                kv_default.host = KvHost::Off;
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    // `BLOOMERY_KV_HOST` ([`qwen38_levers::kv_default_at`]): every plan and
+    // reserve below rounds the planes at it.
+    let kv_default = qwen38_levers::kv_default_at(&mut inputs, stage, &levers)?;
     // The slot count first: it shapes the draft's window condition, the
     // context choice itself, and every plan the seat asks for, each counting
     // every sequence (`Plans::slots`). A set `--ctx-size` with no

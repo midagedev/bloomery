@@ -15,7 +15,7 @@
 //! then [`STEPS`] greedy steps, each step's argmax and the FNV-1a 64 of its
 //! logits row read. Clauses; each names its mutant:
 //!
-//! - `refuse` (the host-set refusal at load): a machine whose host holds one
+//! - `refuse` (the host-set refusal at load): a plan made at a host room one
 //!   byte less than the churn pool needs — the stage card's experts past the
 //!   pinned ones, which the host set must hold too — is refused by name
 //!   before anything loads, within [`REFUSE_BOUND_S`] (mutant: the churn
@@ -198,6 +198,7 @@ mod gate {
     };
     use model::placement::accepts::{self, Program};
     use model::placement::churn::ChurnPool;
+    use model::placement::workstation::HostRead;
     use model::placement::{Machine, ModelTensors, Plan, Violation};
     use refset::arch::glm5next::vis::PROFILE;
     use runtime::layer::hosted;
@@ -264,16 +265,29 @@ mod gate {
             .collect()
     }
 
-    /// The file planned onto `machine` and loaded under `residency`, its
+    /// The plan inputs of `file`, at the host room `room` states as given
+    /// ([`HostRead::Given`]: a plan takes the room it is given, which no machine figure
+    /// binds) or, with none, at the room this machine reads.
+    fn inputs_at(path: &str, file: &Split, room: Option<u64>) -> Result<PlanInputs, GateError> {
+        let mut inputs = PlanInputs::read(file).map_err(|e| format!("{path}: {e}"))?;
+        if let Some(room) = room {
+            inputs.room = (room, HostRead::Given);
+        }
+        Ok(inputs)
+    }
+
+    /// The file planned onto `machine` at the host room `room` states (the
+    /// room this machine reads for none) and loaded under `residency`, its
     /// session's prompts fed in batches.
     fn open(
         path: &str,
         machine: &Machine,
+        room: Option<u64>,
         levers: &bloomery_levers::Levers,
         residency: Residency,
     ) -> Result<Session<Body>, GateError> {
         let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
-        let inputs = PlanInputs::read(&file).map_err(|e| format!("{path}: {e}"))?;
+        let inputs = inputs_at(path, &file, room)?;
         let plan = inputs
             .plan(machine, CTX as u64, &glm5next_tier::plan_levers(levers, 0)?)
             .map_err(|e| format!("{path}: {e}"))?;
@@ -386,8 +400,8 @@ mod gate {
         Ok(h)
     }
 
-    /// `refuse`: the host one byte short of the churn pool, on `machine`
-    /// with its host shrunk to it.
+    /// `refuse`: the host one byte short of the churn pool, the room the plan
+    /// is made at stated as that ([`crate::residency_clauses::short_room`]).
     fn refuse_clause(
         path: &str,
         machine: &Machine,
@@ -401,10 +415,9 @@ mod gate {
         let pool = ChurnPool::of(plan, 0, pinned).map_err(|e| format!("{path}: {e}"))?;
         pool.check(plan).map_err(|e| format!("{path}: {e}"))?;
         record::residency_host(&word_of(residency), &pool, plan).print();
-        let (short, small) =
-            crate::residency_clauses::refuse_head(machine, plan.host.headroom_bytes, pool.bytes)?;
+        let short = crate::residency_clauses::short_room(plan, pool.bytes)?;
         crate::residency_clauses::refuse_tail(short, pool.bytes, REFUSE_BOUND_S, || {
-            open(path, &small, levers, residency)
+            open(path, machine, Some(short), levers, residency)
         })
     }
 
@@ -825,36 +838,46 @@ mod gate {
             .ok_or_else(|| "the NextN open stopped at its plan".into())
     }
 
-    /// `nextn-refuse`: a host one byte short of the churn pool and the
+    /// `nextn-refuse`: a host room one byte short of the churn pool and the
     /// next-token layer's host experts, which the load's host set holds
-    /// beside the plan's own: the planner at that host still plans (its own
-    /// bound is the layer's experts), and the load refuses by name before
-    /// anything loads.
+    /// beside the plan's own, stated to the plan
+    /// ([`crate::residency_clauses::short_room`]): the planner at that host
+    /// still plans (its own bound is the layer's experts), and the load
+    /// refuses by name before anything loads.
     fn nextn_refuse_clause(
         path: &str,
         machine: &Machine,
         levers: &bloomery_levers::Levers,
-        inputs: &PlanInputs,
         nextn: &NextnInputs,
         np: &NextnPlan<'_>,
     ) -> Result<bool, GateError> {
         let pool = ChurnPool::of(&np.plan, 0, 0).map_err(|e| format!("{path}: {e}"))?;
         let (_, hosted) = np.host_runs().map_err(|e| format!("{path}: {e}"))?;
-        let need = i128::from(pool.bytes) + i128::from(hosted);
-        let short =
-            i128::from(machine.host().usable_bytes) - np.plan.host.headroom_bytes + need - 1;
-        let mut small = machine.clone();
-        small.host_mut().usable_bytes = u64::try_from(short)?;
+        let need = pool.bytes + hosted;
+        let short = crate::residency_clauses::short_room(&np.plan, need)?;
+        let file = Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+        let at = inputs_at(path, &file, Some(short))?;
         let place = glm5next_tier::plan_levers(levers, 0)?;
-        let planner = match inputs.plan_nextn(&small, CTX as u64, &place, nextn) {
-            Ok(p) => {
-                let same_pool = ChurnPool::of(&p.plan, 0, 0).is_ok_and(|q| q.bytes == pool.bytes);
-                (p.plan.host.headroom_bytes == need - 1 && same_pool).then_some(())
-            }
-            Err(_) => None,
-        };
+        let planned = at.plan_nextn(machine, CTX as u64, &place, nextn);
+        let plans = planned.as_ref().is_ok_and(|p| {
+            let same_pool = ChurnPool::of(&p.plan, 0, 0).is_ok_and(|q| q.bytes == pool.bytes);
+            p.plan.host.headroom_bytes == i128::from(need) - 1 && same_pool
+        });
         let t0 = Instant::now();
-        let opened = open_nextn_on(path, small, levers, NEXTN_LEVER);
+        let opened = match planned {
+            Ok(p) => Body::open_placed_nextn_slots(
+                file,
+                &p,
+                &at,
+                nextn,
+                0,
+                levers.host(),
+                NEXTN_LEVER,
+                1,
+            )
+            .map_err(GateError::from),
+            Err(e) => Err(format!("{path}: {e}").into()),
+        };
         let secs = t0.elapsed().as_secs_f64();
         let beside = format!("{hosted} B of it held");
         let (named, why) = match opened {
@@ -867,13 +890,13 @@ mod gate {
             }
             Ok(_) => (false, "the open loaded".to_string()),
         };
-        let ok = planner.is_some() && named;
+        let ok = plans && named;
         println!(
             "nextn-refuse: a host of {short} B, one byte short of the {} B churn pool and the \
              layer's {hosted} B of host experts; the planner there {}; the load in {secs:.1} s — \
              {why}: {}",
             pool.bytes,
-            if planner.is_some() {
+            if plans {
                 "plans, its headroom the two less one byte"
             } else {
                 "refused or planned another headroom"
@@ -1303,7 +1326,7 @@ mod gate {
         );
         let mut ok = held(
             "nextn-refuse",
-            nextn_refuse_clause(path, machine, levers, inputs, &nextn, &np),
+            nextn_refuse_clause(path, machine, levers, &nextn, &np),
         );
         ok &= held(
             "nextn-front-refuse",
@@ -1388,7 +1411,7 @@ mod gate {
         );
 
         let t0 = Instant::now();
-        let mut s = open(&path, &machine, &levers, residency)?;
+        let mut s = open(&path, &machine, None, &levers, residency)?;
         s.model_mut().body_parts(NAME)?.2.log_residency(0);
         println!(
             "load in {:.1} s (runtime value)",

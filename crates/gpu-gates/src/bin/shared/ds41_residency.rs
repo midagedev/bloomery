@@ -287,8 +287,8 @@ fn rule_of(s: &Session<Body>) -> Result<SwapRule, GateError> {
         .clone())
 }
 
-/// `refuse`: the host one byte short of the churn pool, on placement
-/// `place`'s machine.
+/// `refuse`: the host room one byte short of the churn pool, stated to the plan the open makes
+/// ([`crate::residency_clauses::short_room`]), on placement `place`'s machine.
 pub fn refuse_clause(
     path: &Path,
     inputs: &PlanInputs,
@@ -300,10 +300,10 @@ pub fn refuse_clause(
     let plan = inputs.plan(&machine, workstation::CTX_MAX, &cfg.place)?;
     let pool = swap::churn(&plan, 0, RESIDENCY)?.ok_or("no churn pool under mid")?;
     record::residency_host("mid-p40-s1", &pool, &plan).print();
-    let (short, small) =
-        crate::residency_clauses::refuse_head(&machine, plan.host.headroom_bytes, pool.bytes)?;
+    let short = crate::residency_clauses::short_room(&plan, pool.bytes)?;
+    let at = cfg.clone().with_host_room(short);
     crate::residency_clauses::refuse_tail(short, pool.bytes, REFUSE_BOUND_S, move || {
-        open(path, place, move |_| small.clone(), cfg)
+        open(path, place, machine_of, &at)
     })
 }
 

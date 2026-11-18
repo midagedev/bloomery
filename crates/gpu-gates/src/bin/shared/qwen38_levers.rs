@@ -42,3 +42,40 @@ pub const KV_DEFAULT: model::placement::KvDefault = model::placement::KvDefault 
     floor: 8192,
     host: bloomery_levers::KvHost::Spill,
 };
+
+/// The K/V levers `levers` leaves unset resolved for a plan on the stage card `stage`
+/// ([`KV_DEFAULT`] where the levers say nothing), and the page a host-capable room takes read
+/// once from that card into `inputs` (`PlanInputs::kv_host_page`) wherever the backing is not
+/// `off`: every plan under the resolved levers counts the planes' pages at it, and a plan under
+/// `spill` or `all` with none is refused by name. Where the device cannot stage a host page the
+/// unset default is `off` by name on stderr, and a set `spill` or `all` is the refusal itself.
+/// The seat and the gate that restates its plans call this one function, so both plan under the
+/// same page and the same default.
+///
+/// # Errors
+/// A set `BLOOMERY_KV_HOST` other than `off` on a card that cannot back a page on the host.
+pub fn kv_default_at(
+    inputs: &mut model::arch::qwen35moe::place::PlanInputs,
+    stage: model::placement::workstation::CardSpec,
+    levers: &bloomery_levers::Levers,
+) -> Result<model::placement::KvDefault, bloomery_gpu_gates::GateError> {
+    use bloomery_levers::KvHost;
+
+    let mut default = KV_DEFAULT;
+    let set = levers.kv_host_set().and_then(KvHost::parse);
+    if set.unwrap_or(default.host) != KvHost::Off {
+        match bloomery_gpu_gates::generate::stage_host_page(stage) {
+            Ok(page) => inputs.kv_host_page = Some(page),
+            Err(e) if set.is_none() => {
+                eprintln!(
+                    "bloomery-serve-qwen38: BLOOMERY_KV_HOST is unset and {} cannot back a K/V \
+                     page on the host ({e}); the planes stay on the card (kv_host=off)",
+                    stage.name
+                );
+                default.host = KvHost::Off;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(default)
+}

@@ -441,6 +441,20 @@ impl Plan<'_> {
             .map_or(figure, |(_, (planned, _))| figure.max(*planned))
     }
 
+    /// The room a plan of the same host terms, made at it as given
+    /// ([`workstation::HostRead::Given`]), leaves exactly `headroom` bytes of host headroom:
+    /// the terms ([`workstation::HostNeed::plan_bytes`]) and `headroom`, the definition
+    /// [`Plan::plan_at`] takes a stated room's headroom by. A clause that needs a host one
+    /// byte short of a pool of `n` bytes states `room_leaving(n - 1)` as the room of the plan
+    /// it loads by; where the machine's figure or a reading sat does not enter, since neither
+    /// binds a stated room. Holds for a plan the NVMe tier did not split: a split plan's host
+    /// terms move with the room it ran at. `None` where the room would be below 0 or past u64.
+    #[must_use]
+    pub fn room_leaving(&self, headroom: i128) -> Option<u64> {
+        let terms = i128::from(workstation::HostNeed::of(self, 0).plan_bytes());
+        u64::try_from(terms.checked_add(headroom)?).ok()
+    }
+
     /// The usable bytes `card` planned with: its own, capped by the device's
     /// free bytes at plan time and by its budget under the plan's card budget
     /// ([`capped`]'s one cap, [`card_budget::of`]).

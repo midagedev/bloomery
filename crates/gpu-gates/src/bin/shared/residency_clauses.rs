@@ -4,7 +4,7 @@
 //! (`gate_glm5next_residency`) and Qwen3.8's (`gate_qwen38_residency`)
 //! include this module with a `#[path]` line, as does Qwen3.6's
 //! (`gate_qwen35moe_e2e`). It holds the residency a gate runs over a plan
-//! ([`mid_of`]), `refuse`'s halves ([`refuse_head`] the short host, [`refuse_tail`] the open's timing, the
+//! ([`mid_of`]), `refuse`'s halves ([`short_room`] the short host, [`refuse_tail`] the open's timing, the
 //! verdict on its error, the `refuse:` line), the seed lists ([`seeds`],
 //! [`layer_seeds`]), `transform`'s check and its plain verdict
 //! ([`transform_check`]: every
@@ -35,7 +35,7 @@ use bloomery_gpu::host::swap_source::FileSwap;
 use bloomery_gpu::{Gpu, WindowMut};
 use bloomery_gpu_gates::generate::{Residence, ServeFeed, slot_table};
 use bloomery_gpu_gates::{GateError, verdict};
-use model::placement::Machine;
+use model::placement::Plan;
 use runtime::swaprule::SwapRule;
 use runtime::{Advance, Target as _, Want};
 
@@ -50,26 +50,26 @@ pub fn mid_of(n_l: &[u64]) -> Option<Residency> {
     (pinned >= 1 && slots >= pinned + 2).then_some(Residency::Mid { pinned, spares: 1 })
 }
 
-/// `refuse`'s head: `machine` with its host's usable bytes taken down to
-/// one byte under the plan's `headroom_bytes` plus the churn pool's
-/// `pool_bytes` — the pair it returns, `short` the byte count the clause's
-/// line names and `small` the machine to open on, for [`refuse_tail`].
-pub fn refuse_head(
-    machine: &Machine,
-    headroom_bytes: i128,
-    pool_bytes: u64,
-) -> Result<(i128, Machine), GateError> {
-    let short =
-        i128::from(machine.host().usable_bytes) - headroom_bytes + i128::from(pool_bytes) - 1;
-    let mut small = machine.clone();
-    small.host_mut().usable_bytes = u64::try_from(short).map_err(|_| {
+/// `refuse`'s head: the host room one byte short of `need` bytes the load holds beside the plan's
+/// own host terms (the churn pool, and for a load that hosts a draft layer's experts the layer's
+/// beside it): the room that leaves `plan`'s host headroom `need - 1` (`Plan::room_leaving`),
+/// for the open to plan at as given (`PlanInputs::room`, `HostRead::Given`). The machine's host
+/// figure is no host of this size: a plan is made at the room it reads or is given, and the
+/// figure binds neither (`Plan::plan_at`), so the clause states the room it asks the open to
+/// plan at. Refused by name for a `need` of 0, which has no byte to be short of.
+pub fn short_room(plan: &Plan<'_>, need: u64) -> Result<u64, GateError> {
+    let short = i128::from(need) - 1;
+    if short < 0 {
+        return Err("refuse: a need of 0 B has no host one byte short of it".into());
+    }
+    plan.room_leaving(short).ok_or_else(|| {
         format!(
-            "refuse: the short host {short} B (usable {} - headroom {headroom_bytes} + pool \
-             {pool_bytes} - 1) is below 0",
-            machine.host().usable_bytes
+            "refuse: a host room leaving {short} B of headroom is below 0 or past u64 (the plan's \
+             headroom {} B)",
+            plan.host.headroom_bytes
         )
-    })?;
-    Ok((short, small))
+        .into()
+    })
 }
 
 /// `refuse`'s tail: the open of a host one byte short of the churn pool —
@@ -77,7 +77,7 @@ pub fn refuse_head(
 /// error names the churn pool) within `bound_s` before anything loads, and
 /// the `refuse:` line.
 pub fn refuse_tail<T>(
-    short: i128,
+    short: u64,
     pool_bytes: u64,
     bound_s: f64,
     open: impl FnOnce() -> Result<T, GateError>,

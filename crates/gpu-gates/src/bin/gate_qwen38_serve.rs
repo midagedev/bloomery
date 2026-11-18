@@ -971,6 +971,9 @@ mod gate {
         let (stage, plan_room) = server_stage(err_log)?;
         let mut inputs = PlanInputs::describe_in(&split, (plan_room, HostRead::Given))?;
         inputs.captures = Some(server_captures());
+        // The server's K/V levers and the page its plans round the planes at, which a plan
+        // under the unset default `spill` reads ([`qwen38_levers::kv_default_at`]).
+        let kv_default = crate::qwen38_levers::kv_default_at(&mut inputs, stage, levers)?;
         let experts = experts38(levers)?;
         let ub = ubatch_for(CTX)?;
         let machine = route_machine(
@@ -989,8 +992,7 @@ mod gate {
         };
         let (card_bytes, host_bytes, kv, draft_bytes) = match mtp {
             false => {
-                let levers_plan =
-                    PlanLevers::from_levers_with(levers, crate::qwen38_levers::KV_DEFAULT)?;
+                let levers_plan = PlanLevers::from_levers_with(levers, kv_default)?;
                 let plan = inputs.plan_with(
                     &machine,
                     (u64::try_from(CTX)?, u64::try_from(ub)?),
@@ -4358,6 +4360,7 @@ mod gate {
         let mut inputs = PlanInputs::describe(&split)?;
         inputs.room = (room, HostRead::Given);
         inputs.captures = Some(server_captures());
+        let kv_default = crate::qwen38_levers::kv_default_at(&mut inputs, stage, levers)?;
         let experts = experts38(levers)?;
         let ub = u64::try_from(ubatch_for(ctx)?)?;
         let mut machine = route_machine(
@@ -4376,7 +4379,7 @@ mod gate {
         then(inputs.plan_with_slots(
             &machine,
             (u64::try_from(ctx)?, ub),
-            &PlanLevers::from_levers_with(levers, crate::qwen38_levers::KV_DEFAULT)?,
+            &PlanLevers::from_levers_with(levers, kv_default)?,
             experts,
             slots,
         ))

@@ -2099,7 +2099,8 @@ mod gate {
         Ok(ok)
     }
 
-    /// `refuse`: the host one byte short of the churn pool.
+    /// `refuse`: the host room one byte short of the churn pool, stated to the plan the open
+    /// makes ([`crate::residency_clauses::short_room`]).
     fn refuse_clause(
         path: &Path,
         inputs: &PlanInputs,
@@ -2116,10 +2117,13 @@ mod gate {
         pool.check(&plan)
             .map_err(|e| format!("the churn pool does not fit the plan's host: {e}"))?;
         record::residency_host(&word_of(residency), &pool, &plan).print();
-        let (short, small) =
-            crate::residency_clauses::refuse_head(machine, plan.host.headroom_bytes, pool.bytes)?;
+        let short = crate::residency_clauses::short_room(&plan, pool.bytes)?;
+        let at = PlanInputs::describe_in(
+            &Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?,
+            (short, HostRead::Given),
+        )?;
         crate::residency_clauses::refuse_tail(short, pool.bytes, REFUSE_BOUND_S, || {
-            open(path, inputs, small, *residency, host, ub)
+            open(path, &at, machine.clone(), *residency, host, ub)
         })
     }
 
@@ -2134,8 +2138,9 @@ mod gate {
         let path_buf = ref_model_path()?;
         let path = path_buf.as_path();
         // PIN(2026-10-28): the plan read `MemAvailable`, which another process's load moves; the
-        // room is the workstation's own, so the machine's host figure alone binds `refuse`. A
-        // unified card's pool caps it (`Plan::plan_at`).
+        // room is the workstation's own, given. PIN(2026-11-18): the machine's host figure no
+        // longer binds a given or read room past it (`Plan::plan_at`), so `refuse` states its
+        // short room to the open (`short_room`); a unified card's pool still caps it.
         let mut inputs = PlanInputs::describe_in(
             &Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?,
             (PLAN_ROOM, HostRead::Given),

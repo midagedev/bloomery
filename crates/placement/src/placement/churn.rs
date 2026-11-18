@@ -207,6 +207,22 @@ mod tests {
         }
     }
 
+    /// An unsplit plan whose host terms are 300 B, made at `room` on `machine`: its headroom is
+    /// what [`Plan::plan_at`] leaves it, the machine's figure's less the terms' where a read room
+    /// is no more than the figure, the room's less the terms' where it is stated or past it.
+    fn plan_made_at<'a>(
+        model: &'a ModelTensors,
+        machine: &'a Machine,
+        room: (u64, HostRead),
+    ) -> Plan<'a> {
+        let mut plan = with_headroom(model, machine, 0);
+        plan.host.expert_bytes = 300;
+        plan.host.headroom_bytes = i128::from(HostNeed::machine_room(machine.host()))
+            - i128::from(HostNeed::of(&plan, 0).bytes());
+        plan.plan_at(&room);
+        plan
+    }
+
     /// The pool and the bytes held beside the plan fit the headroom exactly;
     /// one byte more of either is refused by name, the refusal naming the
     /// bytes held beside; with none beside, the check is the pool's alone.
@@ -290,14 +306,7 @@ mod tests {
             experts: 10,
             bytes: 100,
         };
-        let made_at = |room: (u64, HostRead)| {
-            let mut plan = with_headroom(&model, &machine, 0);
-            plan.host.expert_bytes = 300;
-            plan.host.headroom_bytes = i128::from(HostNeed::machine_room(machine.host()))
-                - i128::from(HostNeed::of(&plan, 0).bytes());
-            plan.plan_at(&room);
-            plan
-        };
+        let made_at = |room: (u64, HostRead)| plan_made_at(&model, &machine, room);
         // A stated room of 350 B leaves 50 B past the need: 100 B of pool
         // does not fit, and the refusal names the 50 B.
         let stated = made_at((350, HostRead::Given));
@@ -329,5 +338,75 @@ mod tests {
         let read_past = made_at((1500 + HOST_DRIFT, HostRead::MemAvailable));
         assert_eq!(read_past.host.headroom_bytes, 1200);
         assert_eq!(pool.check(&read_past).expect("the read room"), 1100);
+    }
+
+    /// The room that leaves a pool one byte short of the headroom is the plan's host terms and
+    /// the pool less one byte, wherever the plan stands: made at a read room under the machine's
+    /// figure, at a read one past it, or at a stated one past it, the plan made at that room as
+    /// given refuses the pool by name with 99 B, and one byte more room takes it with none to
+    /// spare. A residency gate's `refuse` clause derived this room from the machine's figure
+    /// (`figure - headroom + pool - 1`), which is right only where the figure bound the room.
+    ///
+    /// FAIL-first: that derivation on the plan made at a stated 2,000 B reads 1,000 - 1,700 + 99
+    /// = -601, and on the one at a read 1,500 B 1,000 - 1,200 + 99 = -101, where the room is 399.
+    // PIN(2026-11-18): the residency gates' `refuse` clauses (glm5next, qwen38, V4.1) lowered the
+    // machine's usable bytes for the short host, which no longer binds a read room past the
+    // figure (`Plan::plan_at`); the short host is now a stated room.
+    #[test]
+    fn the_room_one_byte_short_of_a_pool_is_the_terms_and_the_pool_less_one() {
+        let model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 1,
+            experts: 8,
+            experts_used: 2,
+            bf16_words: |_| false,
+        };
+        let machine = Machine {
+            cards: Vec::new(),
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: Host {
+                    usable_bytes: 1000,
+                    reserves: Vec::new(),
+                },
+                unified: None,
+            }],
+        };
+        let pool = ChurnPool {
+            pinned: 0,
+            runs: Vec::new(),
+            experts: 10,
+            bytes: 100,
+        };
+        let figure = i128::from(HostNeed::machine_room(machine.host()));
+        for (room, by_figure_holds) in [
+            ((350, HostRead::MemAvailable), true),
+            ((1500 + HOST_DRIFT, HostRead::MemAvailable), false),
+            ((2000, HostRead::Given), false),
+        ] {
+            let base = plan_made_at(&model, &machine, room);
+            let short = base
+                .room_leaving(i128::from(pool.bytes) - 1)
+                .expect("a room of the terms and 99 B");
+            assert_eq!(short, 399, "the 300 B of terms and the pool less one");
+            let at = plan_made_at(&model, &machine, (short, HostRead::Given));
+            assert_eq!(at.host.headroom_bytes, 99);
+            let text = pool
+                .check(&at)
+                .expect_err("one byte short of the pool")
+                .to_string();
+            assert!(text.contains("leaves the host 99 B"), "{text}");
+            let fits = plan_made_at(&model, &machine, (short + 1, HostRead::Given));
+            assert_eq!(pool.check(&fits).expect("the pool fits"), 0);
+            let by_figure = figure - base.host.headroom_bytes + i128::from(pool.bytes) - 1;
+            assert_eq!(
+                by_figure == i128::from(short),
+                by_figure_holds,
+                "{by_figure}"
+            );
+        }
+        let base = plan_made_at(&model, &machine, (2000, HostRead::Given));
+        assert_eq!(base.room_leaving(-300), Some(0));
+        assert_eq!(base.room_leaving(-301), None, "below 0 is no room");
     }
 }

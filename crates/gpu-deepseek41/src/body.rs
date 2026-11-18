@@ -262,6 +262,10 @@ pub struct OpenCfg {
     /// it already; none, and a plan under `spill` or `all` reads it from the stage card
     /// ([`OpenCfg::page_inputs`]).
     pub kv_host_page: Option<u64>,
+    /// The host room the plan is made at, stated as given (`HostRead::Given`) instead of read from
+    /// this machine: a gate's emulation of a smaller host, whose plan takes the room it is given.
+    /// `None` reads this machine's.
+    pub host_room: Option<u64>,
 }
 
 impl OpenCfg {
@@ -313,6 +317,7 @@ impl OpenCfg {
             body,
             place: PlanLevers::from_levers(levers).map_err(|e| GpuError::plan(WHAT, e))?,
             kv_host_page: None,
+            host_room: None,
         })
     }
 
@@ -335,6 +340,15 @@ impl OpenCfg {
     pub fn with_kv_host_page(self, page: Option<u64>) -> OpenCfg {
         OpenCfg {
             kv_host_page: page,
+            ..self
+        }
+    }
+
+    /// `self` with the plan's host room stated as `room` bytes ([`OpenCfg::host_room`]).
+    #[must_use]
+    pub fn with_host_room(self, room: u64) -> OpenCfg {
+        OpenCfg {
+            host_room: Some(room),
             ..self
         }
     }
