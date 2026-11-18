@@ -1734,6 +1734,40 @@ run 'cards: no nvidia-smi on PATH leaves both empty, named' 0 \
   '^3090=\[\] a6000=\[\] err=\[nvidia-smi is not on PATH\]$' \
   env PATH="$C/none" /bin/bash -c "$cards_src" _ "$ROOT/tools/ref/cards.sh"
 
+# cards_by_name: a card is named by what nvidia-smi calls it, whatever the card is: one card of a one-card machine (the box's), the
+# same token against two cards, a token that is in no name or in two, a warning line beside the list, an nvidia-smi that fails. It sets
+# CARD_UUID, CARD_NAME and CARDS_LISTED_N, or CARD_WHY and rc 1; it runs in local mode too, where GPU_3090 and GPU_A6000 stay empty.
+FAKE_5090=GPU-55555555-5555-5555-5555-555555555555
+mknvidia "$C/one5090" << EOF
+NVIDIA GeForce RTX 5090, $FAKE_5090
+EOF
+mknvidia "$C/warned" << EOF
+Warning: persistence mode is disabled (stub)
+NVIDIA GeForce RTX 5090, $FAKE_5090
+EOF
+mknvidia "$C/two5090" << EOF
+NVIDIA GeForce RTX 5090, $FAKE_5090
+NVIDIA GeForce RTX 5090, GPU-66666666-6666-6666-6666-666666666666
+EOF
+byname() { # <name> <rc> <pattern> <dir> <token> [NAME=value…]: cards_by_name <token> with <dir>'s stub nvidia-smi on PATH
+  local name=$1 want=$2 pat=$3 dir=$4 tok=$5
+  shift 5
+  run "$name" "$want" "$pat" env PATH="$dir:$PATH" "$@" bash -c \
+    'source "$1" && rc=0; cards_by_name "$2" || rc=$?; printf "rc=%s uuid=[%s] name=[%s] n=%s why=[%s]\n" "$rc" "$CARD_UUID" "$CARD_NAME" "$CARDS_LISTED_N" "$CARD_WHY"' \
+    _ "$ROOT/tools/ref/cards.sh" "$tok"
+}
+byname 'cards_by_name: a one-card machine names its card' 0 "^rc=0 uuid=\[$FAKE_5090\] name=\[NVIDIA GeForce RTX 5090\] n=1 why=\[\]$" "$C/one5090" 5090
+byname 'cards_by_name: the match ignores case' 0 "^rc=0 uuid=\[$FAKE_5090\] .*n=1 why=\[\]$" "$C/one5090" 'geforce RTX 5090'
+byname 'cards_by_name: one card of two' 0 "^rc=0 uuid=\[$FAKE_A6000\] name=\[NVIDIA RTX A6000\] n=2 why=\[\]$" "$C/both" a6000
+byname 'cards_by_name: local mode names a card as well' 0 "^rc=0 uuid=\[$FAKE_5090\] .*n=1 why=\[\]$" "$C/one5090" 5090 BLOOMERY_BOX_CARD=local
+byname 'cards_by_name: a warning line beside the list is no card' 0 "^rc=0 uuid=\[$FAKE_5090\] name=\[NVIDIA GeForce RTX 5090\] n=1 why=\[\]$" "$C/warned" 5090
+byname 'cards_by_name: a name no card holds is refused, with the list' 0 \
+  "^rc=1 uuid=\[\] name=\[\] n=1 why=\['3090' is in the name of none of the cards nvidia-smi lists \(NVIDIA GeForce RTX 5090, $FAKE_5090\)\]$" "$C/one5090" 3090
+byname 'cards_by_name: a name two cards hold picks neither' 0 "^rc=1 uuid=\[\] name=\[\] n=2 why=\['5090' is in the name of 2 of the cards nvidia-smi lists " "$C/two5090" 5090
+byname 'cards_by_name: a token in the names of both cards of a machine picks neither' 0 "^rc=1 .*'rtx' is in the name of 2 of the cards" "$C/both" rtx
+byname 'cards_by_name: an empty token is refused' 0 '^rc=1 uuid=\[\] name=\[\] n=0 why=\[no card name was given\]$' "$C/one5090" ''
+byname 'cards_by_name: a failing nvidia-smi is refused, named' 0 '^rc=1 uuid=\[\] name=\[\] n=0 why=\[nvidia-smi --query-gpu=name,uuid failed \(rc 9\): nvidia-smi: driver not loaded \(stub\)\]$' "$C/failed" 5090
+
 # tools/ref/timing-card.sh's local mode (BLOOMERY_BOX_CARD=local), sourced under set -euo pipefail by a runner
 # that opts in: the timing card read by UUID with one query, never by name, each refusal in TIMING_CARDS_WHY
 # (lease_take ends the run on it, 64), the Xid reader's journal check, the lost card and arm-place.sh's

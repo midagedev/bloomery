@@ -124,7 +124,7 @@ rule in [`serving.md`](serving.md#4-speculative-decoding). `BLOOMERY_DRAFT=mtp` 
 
 ## 6. Speed
 
-The [README's Spark table](../README.md#status-0311) holds the values and the request conditions for both checkpoint
+The [README's Spark table](../README.md#status-0315) holds the values and the request conditions for both checkpoint
 folders at main `e7180ea9` on a DGX Spark (GB10, driver 595.84, `sm_121a`). On a 4,096-id prompt with the MTP draft on,
 FP4-Local prefilled 2,840 to 2,894 tok/s and decoded 39 to 70 tok/s, and NVFP4 was slower in every cell.
 

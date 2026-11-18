@@ -124,6 +124,49 @@ cards_pin_check() {
   return 64
 }
 
+# cards_by_name <token>: the one card whose nvidia-smi name holds <token> as a case-insensitive substring (`5090` names `NVIDIA GeForce
+# RTX 5090`): its UUID in CARD_UUID and its name in CARD_NAME, and every card nvidia-smi lists counted in CARDS_LISTED_N. 1, with the
+# reason in CARD_WHY and CARD_UUID and CARD_NAME empty, when the token is empty, nvidia-smi fails or lists no card, or the token holds
+# in the name of none of the cards or of more than one (the names nvidia-smi lists are in the reason: a name that fits two cards picks
+# neither). It reads every card nvidia-smi lists, not the cards in view, so a runner that times a card by name sees the card it names
+# whatever CUDA_VISIBLE_DEVICES says; that the card is in view is the runner's own check (timing-card.sh's local mode). The one place a
+# cells file's `cards` column, or a caller that names a card, becomes a UUID: no card's name is in the tool that asks.
+cards_by_name() {
+  local tok=$1 out rc=0 line name uuid lc hits=0 listed=''
+  CARD_UUID='' CARD_NAME='' CARD_WHY='' CARDS_LISTED_N=0
+  if [ -z "$tok" ]; then
+    CARD_WHY='no card name was given'
+    return 1
+  fi
+  out=$(cards_smi name,uuid) || rc=$?
+  if [ "$rc" != 0 ]; then
+    CARD_WHY="nvidia-smi --query-gpu=name,uuid failed (rc $rc): ${out%%$'\n'*}"
+    return 1
+  fi
+  lc=$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')
+  while IFS= read -r line; do
+    # a warning nvidia-smi prints beside its list is not a card: a card's line ends with its UUID
+    case $line in *', GPU-'?*) ;; *) continue ;; esac
+    name=${line%%, GPU-*}
+    uuid=GPU-${line#*, GPU-}
+    CARDS_LISTED_N=$((CARDS_LISTED_N + 1))
+    listed+="${listed:+; }$name, $uuid"
+    case $(printf '%s' "$name" | tr '[:upper:]' '[:lower:]') in
+      *"$lc"*) hits=$((hits + 1)) CARD_UUID=$uuid CARD_NAME=$name ;;
+    esac
+  done <<< "$out"
+  if [ "$CARDS_LISTED_N" = 0 ]; then
+    CARD_WHY='nvidia-smi --query-gpu=name,uuid lists no card'
+    return 1
+  fi
+  if [ "$hits" != 1 ]; then
+    CARD_UUID='' CARD_NAME=''
+    CARD_WHY="'$tok' is in the name of $([ "$hits" = 0 ] && echo none || echo "$hits") of the cards nvidia-smi lists ($listed)"
+    return 1
+  fi
+  return 0
+}
+
 GPU_3090='' GPU_A6000='' CARDS_ERROR=''
 [ "${BLOOMERY_BOX_CARD:-}" != local ] || return 0
 if ! command -v nvidia-smi > /dev/null 2>&1; then

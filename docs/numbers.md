@@ -1,6 +1,6 @@
 # Numbers
 
-The README's [Status](../README.md#status-0311) shows one table for each of four common machines. This page holds every
+The README's [Status](../README.md#status-0315) shows one table for each of four common machines. This page holds every
 other record. Every number here is a release check or a sitting of the runners in `tools/ref/`, with its machine and conditions.
 The reference engines' rows are on
 [rig-log's bench page](https://github.com/midagedev/rig-log/blob/main/docs/bloomery-bench.md) with their flags,
@@ -33,6 +33,29 @@ was checked at is in its first column. Prompt sizes are the server's prompt toke
 | DeepSeek-V4.1-Flash `Q3_K_M`, unset → `a` (0.3.1) | 5,642, 403, 14.0 s | 41.9 tok/s | 42.7 tok/s |
 | MiMo-V2.6-Flash `MXFP4`, unset → `a` (0.3.1) | 5,620, 104, 53.9 s | 34.8 tok/s | 36.1 tok/s |
 | Nemotron 3.5 Bolt 74B-A9B `24GB`, unset → `a` (0.3.4) | 5,680, 2,716, 2.10 s | 87.5 tok/s | 88.7 tok/s |
+
+## One RTX 3090 24 GB, on our workstation (the README's table through 0.3.14)
+
+The README's table for this machine through 0.3.14, as it stood. The card left the workstation on 2026-11-16, so these rows are
+not measured again; the README's table for our workstation is now the RTX 5090's.
+
+**One RTX 3090 24 GB**, on our workstation (32-core AVX2 host, 256 GB of RAM, the 3090 at its 250 W cap): the tagged
+0.3.10 tree at the serving defaults (`--place` unset, every lever unset, speculative drafts on where a model has one, no
+`--parallel`, `--ctx-size 4300`). Means of two rounds; four for DeepSeek-V4.1-Flash and Qwen3.8-Flash-Next.
+
+| Model | Where it runs | Prompt, 512 tokens | Prompt, 4,096 tokens | Decode at depth 512 | Decode at depth 4,096 |
+|---|---|---|---|---|---|
+| MiniMax-M3.1-Flash `UD-Q2_K_XL` | card + CPU | 105.16 | 97.56 | 23.41 | 20.40 |
+| Flint 40B-A2.5B `UD-Q4_K_XL` | card + CPU | 879.20 | 750.19 | 87.86 | 85.84 |
+| Nanbeige4.3-33B `Q4_K_M` | the whole model on the card | 745.46 | 693.76 | 24.22 | 23.23 |
+| DeepSeek-V4.1-Flash `Q3_K_M` | card + CPU | 167.41 | 300.46 | 34.73 ¹ | 34.94 |
+| GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 178.99 | 204.47 | 30.06 | 26.18 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | card + CPU | 736.66 | 1,662.72 ² | 83.36 | 74.34 |
+| Qwen3.6-35B-A3B `Q4_K_M` | the whole model on the card | 5,123.05 | 6,652.24 | 188.31 | 180.68 |
+
+¹ rounds from 31.90 to 40.67.
+
+² the first round after a load read 1,440.33, the next three 1,735 to 1,739.
 
 ## One RTX 3090, two cards, and two requests at once (0.3.0)
 

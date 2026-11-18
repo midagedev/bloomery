@@ -1,7 +1,7 @@
 # Performance and verification
 
 The numbers' conditions, why the engine is fast, and how its output is checked. The headline tables are in the
-README's [Status](../README.md#status-0310); every other record is on the [numbers page](numbers.md).
+README's [Status](../README.md#status-0315); every other record is on the [numbers page](numbers.md).
 
 ## Conditions of the numbers
 

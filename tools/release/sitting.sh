@@ -17,7 +17,12 @@
 #
 #   file/profile  `<profile>` (tools/ref/models/<profile>.sh) or `<profile>=<model path>` (BLOOMERY_REF_MODEL for the cell)
 #   place         a | bp | -   (`-`: the placement rule's own pick; bp needs `both`)
-#   cards         3090 | a6000 | both   (3090 and a6000 time that card alone, both is BLOOMERY_TIMING_CARDS=a6000+3090)
+#   cards         a card's name as nvidia-smi lists it, or both. A name is a case-insensitive substring of exactly one listed card's
+#                 name (`5090` is `NVIDIA GeForce RTX 5090`, `a6000` is `NVIDIA RTX A6000`): the cell times that card alone, and a name that
+#                 no listed card holds, or that two do, ends the sitting before anything starts (rc 69), so a table is never timed on
+#                 another card than its cells name. `both` is the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090, a box that has those
+#                 two cards and no local mode): on a machine whose environment declares local mode (BLOOMERY_BOX_CARD=local, a
+#                 contributor's machine and the one-card box) there is no such mode and it is refused, rc 64
 #   ctx           empty: no --ctx-size, the unset rule's pick (the largest step the machine holds); else DEPTH_SERVE_CTX
 #   D             the timed prompt lengths, comma-separated (512,4096): one arm each
 #   checks        pass_checks.py's arguments for round 1's functional phase, or `-` for none (a timed-only cell)
@@ -119,8 +124,8 @@
 # is this script's dry run (no hold, no call, no verdict).
 #
 # Exit: 0 green; 1 red; 2 a file missing; 64 usage or a cells file that does not parse, or a --resume it cannot merge into; 65 the
-# binary is not the tarball's member, or not the one a --resume verdict ran on; 69 a card the cells name is not on the machine or
-# gives no memory reading; 75 another owner's hold is up (the box hold, or another sitting's GPU hold), a compile or a program on
+# binary is not the tarball's member, or not the one a --resume verdict ran on; 69 a card the cells name is not on the machine (or
+# two cards answer to the name, or the card is not in view under local mode) or gives no memory reading; 75 another owner's hold is up (the box hold, or another sitting's GPU hold), a compile or a program on
 # a card of another track still runs after SITTING_QUIET_WAIT seconds, or a card is not at rest for the baseline; 130/143 a signal.
 set -uo pipefail
 __d=${BASH_SOURCE[0]%/*}
@@ -222,8 +227,8 @@ for line, text in rows[1:]:
     profile, mpath = m.group(1), m.group(2) or ""
     if place not in PLACE_RANK:
         fail(line, f"place is a, bp or -, got '{place}'")
-    if cards not in ("3090", "a6000", "both"):
-        fail(line, f"cards is 3090, a6000 or both, got '{cards}'")
+    if cards != "both" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", cards):
+        fail(line, f"cards is both (the two-card mode) or a card's name as nvidia-smi lists it (5090 names NVIDIA GeForce RTX 5090), got '{cards}'")
     if place == "bp" and cards != "both":
         fail(line, f"place bp needs cards both (it splits the model over the two cards), got cards '{cards}'")
     if ctx:
@@ -332,6 +337,7 @@ BIN='' BIN_SHA='' BIN_VERSION='' TB_SHA='' TB_MEMBER='' TB_MEMBER_SHA='' GPU_309
 CELLREC=() REDS=() NOTRUN=()
 RESUME='' ONLY='' ONLYSET='' RESUME_DIR='' RESUME_NOW='' RESUME_PLAN='' KEPT_WORK='' SEL1=() SEL2=()
 SIT_CARDS='' BASE_UUIDS='' QUIET_UUIDS='' MEMBASE='' GPU_HOLD_ON='' GPU_GATE=() GPU_A6000=''
+SIT_NAMES='' SIT_BOTH=0 SIT_TEXT='' CARD_TOK=() CARD_ID=() LISTED_N=0
 
 # emit_new <file>: the bytes of <file> past EMIT_OFF to stdout, so a call's log shows as it grows.
 EMIT_OFF=0
@@ -415,6 +421,8 @@ quiet_gates() {
     case $c in
       3090) f=$LOCK_DIR/bloomery-gate.lock ;;
       a6000) f=$LOCK_DIR/bloomery-gate-a6000.lock ;;
+      # local mode's one lock holds every card of the machine: the gate lock itself on the box, a file of its own elsewhere
+      local) if on_box; then f=$LOCK_DIR/bloomery-gate.lock; else f=$LOCK_DIR/bloomery-gate-local.lock; fi ;;
       *) continue ;;
     esac
     [ -e "$f" ] || continue
@@ -494,38 +502,81 @@ quiet_wait() {
   done
 }
 
-# cards_needed: SIT_CARDS (the cards the cells time, `3090`, `a6000` or `3090,a6000`, in the form the GPU hold names them) from the
-# plan's records. A pure read: no card is touched.
+# lc <text>: the text in lower case.
+lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# cards_needed: the cards the cells time, as the cells name them: SIT_NAMES (each name once, lower case, in the order the cells first name
+# it), SIT_BOTH (1 when a cell times the two-card pair) and SIT_TEXT (both of them as one line). A pure read: no card is touched.
 cards_needed() {
-  local rec w3090=0 wa=0
+  local rec tok
+  SIT_NAMES='' SIT_BOTH=0 SIT_TEXT=''
   for rec in "${CELLREC[@]}"; do
     cell_fields "$rec"
-    case $CF_CARDS in
-      3090) w3090=1 ;;
-      a6000) wa=1 ;;
-      both) w3090=1 wa=1 ;;
-    esac
+    if [ "$CF_CARDS" = both ]; then
+      SIT_BOTH=1
+    else
+      tok=$(lc "$CF_CARDS")
+      case " $SIT_NAMES " in *" $tok "*) ;; *) SIT_NAMES=${SIT_NAMES:+$SIT_NAMES }$tok ;; esac
+    fi
   done
-  SIT_CARDS=''
-  [ "$w3090" = 0 ] || SIT_CARDS=3090
-  [ "$wa" = 0 ] || SIT_CARDS=${SIT_CARDS:+$SIT_CARDS,}a6000
+  SIT_TEXT=${SIT_NAMES// /, }
+  [ "$SIT_BOTH" = 0 ] || SIT_TEXT=${SIT_TEXT:+$SIT_TEXT, }both
 }
 
-# cards_resolve: the UUIDs of SIT_CARDS (tools/ref/cards.sh) into BASE_UUIDS and QUIET_UUIDS, rc 69 for a card a cell times that
-# the machine does not have.
+# card_id_of <name>: the UUID cards_resolve gave a cell's card name (any case); 70 when it resolved none, which is this script's own fault.
+card_id_of() {
+  local want i
+  want=$(lc "$1")
+  for ((i = 0; i < ${#CARD_TOK[@]}; i++)); do
+    if [ "${CARD_TOK[i]}" = "$want" ]; then
+      echo "${CARD_ID[i]}"
+      return 0
+    fi
+  done
+  die 70 "the card '$1' was never resolved (cards_resolve ran first)"
+}
+
+# cards_resolve: each name the cells time into a UUID (tools/ref/cards.sh's cards_by_name, the one place a name becomes a card) in CARD_TOK and
+# CARD_ID, and from them BASE_UUIDS and QUIET_UUIDS, SIT_CARDS (the cards in the form the GPU hold names them) and LISTED_N (the cards the
+# machine lists). rc 69 for a name no listed card holds or two do (cards_by_name's reason), and under local mode for a card that is not in
+# view (tools/ref/cards.sh's cards_view: the card the cell times is the one the call will see); rc 64 for `both` under local mode, whose
+# sittings time one card. The hold's form is `local` there (one lock holds every card of the machine, tools/gpu-gate.sh); elsewhere gpu-gate.sh
+# knows two lanes, 3090 and a6000, and a card of another name is refused (rc 64): such a machine declares local mode.
 cards_resolve() {
+  local tok local_mode=0 w3090=0 wa=0
   # shellcheck source=tools/ref/cards.sh
   source "$HERE/cards.sh"
+  [ "${BLOOMERY_BOX_CARD:-}" != local ] || local_mode=1
   GPU_A6000=${GPU_A6000:-}
-  BASE_UUIDS=''
-  case ",$SIT_CARDS," in *,3090,*)
-    [ -n "$GPU_3090" ] || die 69 "the cells time the 3090 and tools/ref/cards.sh found none: ${CARDS_ERROR:-no reason given}"
-    BASE_UUIDS=$GPU_3090 ;;
-  esac
-  case ",$SIT_CARDS," in *,a6000,*)
-    [ -n "$GPU_A6000" ] || die 69 "the cells time the A6000 and tools/ref/cards.sh found none: ${CARDS_ERROR:-no reason given}"
-    BASE_UUIDS=${BASE_UUIDS:+$BASE_UUIDS }$GPU_A6000 ;;
-  esac
+  BASE_UUIDS='' SIT_CARDS='' CARD_TOK=() CARD_ID=() LISTED_N=0
+  if [ "$SIT_BOTH" = 1 ]; then
+    [ "$local_mode" = 0 ] || die 64 "a cell times cards both, the two-card mode (BLOOMERY_TIMING_CARDS=a6000+3090), and this machine declares local mode (BLOOMERY_BOX_CARD=local), whose sittings time one card: name the card in the cells file"
+    [ -n "$GPU_3090" ] || die 69 "the cells time cards both and tools/ref/cards.sh found no 3090: ${CARDS_ERROR:-no reason given}"
+    [ -n "$GPU_A6000" ] || die 69 "the cells time cards both and tools/ref/cards.sh found no A6000: ${CARDS_ERROR:-no reason given}"
+    BASE_UUIDS="$GPU_3090 $GPU_A6000" w3090=1 wa=1
+  fi
+  for tok in $SIT_NAMES; do
+    cards_by_name "$tok" || die 69 "the cells name the card '$tok' and no card of this machine answers to it: $CARD_WHY"
+    CARD_TOK+=("$tok") CARD_ID+=("$CARD_UUID")
+    LISTED_N=$CARDS_LISTED_N
+    case " $BASE_UUIDS " in *" $CARD_UUID "*) ;; *) BASE_UUIDS=${BASE_UUIDS:+$BASE_UUIDS }$CARD_UUID ;; esac
+    if [ "$local_mode" = 1 ]; then
+      cards_view || die 69 "the cells name the card '$tok' ($CARD_NAME) and local mode reads no cards in view: $CARDS_VIEW_WHY"
+      case " $CARDS_VIEW " in
+        *" $CARD_UUID "*) ;;
+        *) die 69 "the cells name the card '$tok' ($CARD_NAME, $CARD_UUID) and it is not in view under local mode (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-unset}: $CARDS_VIEW): the timed call would refuse it" ;;
+      esac
+    else
+      case $tok in
+        3090) w3090=1 ;;
+        a6000) wa=1 ;;
+        *) die 64 "the cells name the card '$tok', and outside local mode tools/gpu-gate.sh holds two lanes only, the 3090 and the A6000: declare local mode (BLOOMERY_BOX_CARD=local, tools/box.sh's local mode) to time another card" ;;
+      esac
+    fi
+  done
+  [ "$w3090" = 0 ] || SIT_CARDS=3090
+  [ "$wa" = 0 ] || SIT_CARDS=${SIT_CARDS:+$SIT_CARDS,}a6000
+  [ "$local_mode" = 0 ] || SIT_CARDS=local
   QUIET_UUIDS=$BASE_UUIDS
 }
 
@@ -700,10 +751,11 @@ run_cell() {
   [ "$STAGE" != portable ] || envv+=("DEPTH_SERVE_TARBALL=$TARBALL")
   case $CF_CARDS in
     both) envv+=(BLOOMERY_TIMING_CARDS=a6000+3090) ;;
-    3090) envv+=("BLOOMERY_TIMING_GPU=$GPU_3090") ;;
+    *) envv+=("BLOOMERY_TIMING_GPU=$(card_id_of "$CF_CARDS")") ;;
   esac
-  # A card set the user's environment does not see as the timing environment does: the check notes the difference.
-  if [ "$CF_CARDS" != both ] && [ -z "${DEPTH_SERVE_USER_PLAN:-}" ]; then envv+=(DEPTH_SERVE_USER_PLAN=note); fi
+  # A card set the user's environment does not see as the timing environment does (the machine lists more cards than the cell times):
+  # the check notes the difference. A machine that lists only the cell's card keeps the check.
+  if [ "$CF_CARDS" != both ] && [ "$LISTED_N" -gt 1 ] && [ -z "${DEPTH_SERVE_USER_PLAN:-}" ]; then envv+=(DEPTH_SERVE_USER_PLAN=note); fi
   if [ "$r" = 1 ] && [ "$CF_CHECKS" != - ]; then
     envv+=("DEPTH_SERVE_AFTER=$CHECKS_RUN $CF_CHECKS")
   fi
@@ -1237,7 +1289,7 @@ main() {
         echo "[dry] binary is not the tarball's member $TB_MEMBER (sha256 $TB_MEMBER_SHA): a run refuses, rc 65"
       fi
     fi
-    echo "[dry] the GPU hold would name the cards the cells time ($SIT_CARDS); the baseline of each is read with the cards idle"
+    echo "[dry] the GPU hold would name the cards the cells time ($SIT_TEXT); the baseline of each is read with the cards idle"
     if [ -n "$RESUME" ]; then
       if [ -z "$BIN_SHA" ]; then
         echo "[dry] resume $RESUME: the binary is missing, so its sha256 cannot be compared with the verdict's"
@@ -1467,14 +1519,18 @@ STUB
   chmod +x "$1/ps"
 }
 
-# st_nvsmi <bin dir>: the case's `nvidia-smi`. The cards are GPU-aaaa (the A6000) and GPU-bbbb (the 3090). Used memory is 100 MiB, or the
+# st_nvsmi <bin dir>: the case's `nvidia-smi`. The cards are GPU-aaaa (the A6000) and GPU-bbbb (the 3090), or the `name, uuid` lines of
+# $C/cards.lst when the case has one (a one-card machine). Used memory is 100 MiB, or the
 # lines of $C/mem.<uuid>.seq one a look (the last again once they run out); the compute list is the lines of $C/gpu.seq one a look,
 # words `pid:name:MiB:uuid` or `-` for none, the last line again once they run out, no file an idle box; $C/gpu.fail makes it fail.
 st_nvsmi() {
   cat > "$1/nvidia-smi" << 'STUB'
 #!/bin/sh
 case "$*" in
-  *--query-gpu=name,uuid*) printf 'NVIDIA RTX A6000, GPU-aaaa\nNVIDIA GeForce RTX 3090, GPU-bbbb\n' ;;
+  *--query-gpu=name,uuid*)
+    if [ -r CASE_DIR/cards.lst ]; then cat CASE_DIR/cards.lst; else printf 'NVIDIA RTX A6000, GPU-aaaa\nNVIDIA GeForce RTX 3090, GPU-bbbb\n'; fi ;;
+  *--query-gpu=uuid*)
+    if [ -r CASE_DIR/cards.lst ]; then sed 's/^.*, //' CASE_DIR/cards.lst; else printf 'GPU-aaaa\nGPU-bbbb\n'; fi ;;
   *--query-gpu=memory.used*)
     u=''
     prev=''
@@ -1907,7 +1963,8 @@ case_cellserr() {
   done << 'EOF'
 p|a|3090||512#5 columns, the header has 6
 p|x|3090||512|-#place is a, bp or -, got 'x'
-p|a|5090||512|-#cards is 3090, a6000 or both, got '5090'
+p|a|rtx 5090||512|-#cards is both (the two-card mode) or a card's name as nvidia-smi lists it (5090 names NVIDIA GeForce RTX 5090), got 'rtx 5090'
+p|a|-||512|-#cards is both (the two-card mode) or a card's name
 p|bp|3090||512|-#place bp needs cards both
 p|a|3090||512,x|-#each D is a positive number, got 'x'
 p|a|3090||512,512|-#D names a depth twice
@@ -1939,7 +1996,7 @@ case_env() {
   want_rc 0
   calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=a6000+3090 gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=unset hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
   calls_seq '2s/ arms=.*//p' 'call profile=pb ref=unset refprof=unset place=a ctx=4300 cards=unset gpu=GPU-bbbb tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
-  calls_seq '3s/ arms=.*//p' 'call profile=pc ref=unset refprof=unset place=a ctx=unset cards=unset gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
+  calls_seq '3s/ arms=.*//p' 'call profile=pc ref=unset refprof=unset place=a ctx=unset cards=unset gpu=GPU-aaaa tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
   [ -z "$WHY" ]
 }
 
@@ -2341,6 +2398,117 @@ case_cardlook() {
   [ -z "$WHY" ]
 }
 
+# One card, named by what nvidia-smi calls it, on a machine whose environment declares local mode (the one-5090 box, a contributor's machine):
+# the cell's card is resolved by its name, pinned to the call by UUID, held and baselined as `local`, and the user-environment plan check
+# stays (the machine lists only that card). A name no card answers to, a name two cards answer to, `both`, a card that is not in view, and
+# a card of another name outside local mode each end the sitting before anything starts, named.
+case_onecard() {
+  st_case "onecard$SUF"
+  local lockname=bloomery-gate-local.lock k
+  [ ! -e /root/bloomery-cpu.lock ] || lockname=bloomery-gate.lock
+  printf 'NVIDIA GeForce RTX 5090, GPU-cccc\n' > "$C/cards.lst"
+  ST_EXTRA=(BLOOMERY_BOX_CARD=local)
+  { echo "$HDR"; echo 'pa=/m/a.gguf|-|5090||512,4096|--stub-pass'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=unset gpu=GPU-cccc tarball='"$C"'/tb/'"$TBN"'.tar.gz after=set rounds=1 userplan=unset hold=up gpuhold=up:local membase=GPU-cccc=100 fold=off'
+  want_out '[baseline] '
+  want_out 'the card GPU-cccc: 100 MiB used'
+  want_v 'cell 1: pa=/m/a.gguf place=- cards=5090 ctx=unset D=512,4096 checks=--stub-pass'
+  [ ! -e "$C/stub/sitting.gpuhold" ] || fault "the GPU hold is still up after a green sitting"
+  no_hold
+  # the name is matched in any case, and another card on the machine is not timed: each cell pins its own card and the plan check is noted
+  st_fresh
+  printf 'NVIDIA RTX A6000, GPU-aaaa\nNVIDIA GeForce RTX 5090, GPU-cccc\n' > "$C/cards.lst"
+  { echo "$HDR"; echo 'pa|-|A6000||512|-'; echo 'pb|-|5090||512|-'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  calls_seq '1s/.* gpu=\([^ ]*\) .* userplan=\([^ ]*\) .* gpuhold=\([^ ]*\) membase=\([^ ]*\) .*/\1 \2 \3 \4/p' 'GPU-aaaa note up:local GPU-aaaa=100,GPU-cccc=100'
+  calls_seq '2s/.* gpu=\([^ ]*\) .* userplan=\([^ ]*\) .*/\1 \2/p' 'GPU-cccc note'
+  # a name no card of the machine answers to: rc 69 with the list, nothing held, nothing run
+  st_fresh
+  { echo "$HDR"; echo 'pa|-|3090||512|-'; } | st_cells
+  printf 'NVIDIA GeForce RTX 5090, GPU-cccc\n' > "$C/cards.lst"
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 69
+  want_out "the cells name the card '3090' and no card of this machine answers to it: '3090' is in the name of none of the cards nvidia-smi lists (NVIDIA GeForce RTX 5090, GPU-cccc)"
+  no_calls
+  no_hold
+  [ ! -e "$C/stub/sitting.gpuhold" ] || fault "a GPU hold went up for a sitting that never ran"
+  [ ! -e "$C/v.sitting" ] || fault "a verdict was written by a sitting that never ran"
+  # a name two cards answer to picks neither
+  st_fresh
+  { echo "$HDR"; echo 'pa|-|5090||512|-'; } | st_cells
+  printf 'NVIDIA GeForce RTX 5090, GPU-cccc\nNVIDIA GeForce RTX 5090, GPU-eeee\n' > "$C/cards.lst"
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 69
+  want_out "'5090' is in the name of 2 of the cards nvidia-smi lists"
+  no_calls
+  no_hold
+  # both is the two-card mode, which local mode does not have
+  st_fresh
+  { echo "$HDR"; echo 'pa|-|both||512|-'; } | st_cells
+  printf 'NVIDIA GeForce RTX 5090, GPU-cccc\n' > "$C/cards.lst"
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 64
+  want_out 'declares local mode (BLOOMERY_BOX_CARD=local), whose sittings time one card'
+  no_calls
+  no_hold
+  # a card that is not in view (CUDA_VISIBLE_DEVICES names the other card) is refused here, not by the timed call
+  st_fresh
+  { echo "$HDR"; echo 'pa|-|5090||512|-'; } | st_cells
+  printf 'NVIDIA GeForce RTX 4090, GPU-dddd\nNVIDIA GeForce RTX 5090, GPU-cccc\n' > "$C/cards.lst"
+  ST_EXTRA=(BLOOMERY_BOX_CARD=local CUDA_VISIBLE_DEVICES=GPU-dddd)
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 69
+  want_out "it is not in view under local mode (CUDA_VISIBLE_DEVICES=GPU-dddd: GPU-dddd)"
+  no_calls
+  no_hold
+  ST_EXTRA=(BLOOMERY_BOX_CARD=local CUDA_VISIBLE_DEVICES=GPU-cccc)
+  st_fresh
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  calls_seq '1s/.* gpu=\([^ ]*\) .*/\1/p' 'GPU-cccc'
+  # outside local mode gpu-gate.sh holds the 3090's lane and the A6000's only: another card's name is refused, named
+  st_fresh
+  printf 'NVIDIA GeForce RTX 5090, GPU-cccc\n' > "$C/cards.lst"
+  ST_EXTRA=()
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 64
+  want_out "outside local mode tools/gpu-gate.sh holds two lanes only, the 3090 and the A6000: declare local mode"
+  no_calls
+  no_hold
+  # a gate that holds local mode's one lock is waited for, named by it
+  st_fresh
+  : > "$C/locks/$lockname"
+  PATH="$C/bin:$PATH" flock "$C/locks/$lockname" sh -c 'i=0; while [ ! -e "$1" ] && [ "$i" -lt 600 ]; do sleep 0.05; i=$((i + 1)); done' _ "$C/release-gate" &
+  echo "$!" >> "$T/pids"
+  sleep 0.5
+  ST_EXTRA=(BLOOMERY_BOX_CARD=local SITTING_QUIET_WAIT=5)
+  # shellcheck disable=SC2046
+  st_start $(portable)
+  for ((k = 0; k < 200; k++)); do
+    grep -qF '[quiet] waiting: gate-lock:local x1' "$C/out" 2> /dev/null && break
+    kill -0 "$ST_PID" 2> /dev/null || break
+    sleep 0.1
+  done
+  : > "$C/release-gate"
+  wait "$ST_PID"
+  RC=$?
+  want_rc 0
+  want_out '[quiet] waiting: gate-lock:local x1'
+  want_out '[quiet] box quiet after '
+  [ -z "$WHY" ]
+}
+
 # blk <verdict> <header prefix>: the run block that starts with that header, as the verdict holds it.
 blk() { awk -v h="$2" 'index($0, h) == 1 { f = 1; print; next } f && /^$/ { exit } f' "$1"; }
 # blk_pid <verdict> <header prefix>: the pid of the sitting that wrote the block (its stamp's), empty when it has none.
@@ -2585,7 +2753,7 @@ selftest() {
   command -v python3 > /dev/null || { echo "sitting.sh --self-test: python3 is not on PATH" >&2; exit 2; }
   # shellcheck disable=SC2046 # the names are words
   unset BLOOMERY_DRY BLOOMERY_HOLD_OWNER BLOOMERY_LEASE_CARD BLOOMERY_BOX_ENV BLOOMERY_ARM_BOUND BLOOMERY_TIMING_GPU \
-    BLOOMERY_TIMING_CARDS BLOOMERY_REF_MODEL BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL $(compgen -v SITTING_) $(compgen -v DEPTH_SERVE_)
+    BLOOMERY_TIMING_CARDS BLOOMERY_BOX_CARD CUDA_VISIBLE_DEVICES BLOOMERY_REF_MODEL BLOOMERY_REF_MODEL_PROFILE BLOOMERY_MODEL $(compgen -v SITTING_) $(compgen -v DEPTH_SERVE_)
   # T0 is the directory mktemp made, the only one this function removes; T is the same directory as `cd` spells it, which
   # is how the paths a case compares are printed by the script.
   T0=$(mktemp -d "${TMPDIR:-/tmp}/sitting-self-test.XXXXXX") || exit 2
@@ -2601,7 +2769,7 @@ selftest() {
   trap 'exit 143' TERM
   trap 'exit 130' INT
   for cs in order redstop keepgoing verdict tree noportable mismatch checks hold quiet dry cellserr env drift fold busy rows dryenv relpaths archive folddefault foldshape \
-    gpuhold baseline cardlook resume resumeguard resumedrift resumedry; do
+    gpuhold baseline cardlook onecard resume resumeguard resumedrift resumedry; do
     JOBS_KIND+=(case) JOBS_ARG+=("$cs")
   done
   mutant family order 'key=lambda c: (first[c["prof"]], PLACE_RANK[c["place"]], c["idx"])' 'key=lambda c: c["idx"]'
@@ -2687,6 +2855,14 @@ selftest() {
       3090) f=' '  for c in 3090 a6000; do
     case $c in
       3090) f='
+  mutant card-pinned onecard '    *) envv+=("BLOOMERY_TIMING_GPU=$(card_id_of "$CF_CARDS")") ;;' '    *) : ;;'
+  mutant card-name-refused onecard ' || die 69 "the cells name the card '"'"'$tok'"'"' and no card of this machine answers to it: $CARD_WHY"' ' || true'
+  mutant card-hold-local onecard '  [ "$local_mode" = 0 ] || SIT_CARDS=local' '  :'
+  mutant card-in-view onecard '        *) die 69 "the cells name the card '"'"'$tok'"'"' ($CARD_NAME, $CARD_UUID) and it is not in view' '        *) true "the cells name the card '"'"'$tok'"'"' ($CARD_NAME, $CARD_UUID) and it is not in view'
+  mutant card-both-local onecard '    [ "$local_mode" = 0 ] || die 64 "a cell times cards both' '    [ "$local_mode" = 0 ] || true "a cell times cards both'
+  mutant card-lanes onecard '        *) die 64 "the cells name the card '"'"'$tok'"'"', and outside local mode' '        *) true "the cells name the card '"'"'$tok'"'"', and outside local mode'
+  mutant card-user-plan onecard '[ "$LISTED_N" -gt 1 ] && ' ''
+  mutant gate-lock-local onecard '      local) if on_box; then f=$LOCK_DIR/bloomery-gate.lock; else f=$LOCK_DIR/bloomery-gate-local.lock; fi ;;' '      local) continue ;;'
   mutant stamp resume '    echo "stamp finished=$(now) binary_sha256=$BIN_SHA sitting=$STARTED pid=$$"' '    :'
   mutant resume-select resume '; then return 1; fi
   return 0' '; then return 0; fi

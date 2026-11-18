@@ -1,0 +1,16 @@
+# 0.3.15's release sitting on the one RTX 5090 32 GB: five cells (V4.1 bq3km + r8, Hy4, GLM-5.3-Flash, Nemotron Bolt, Qwen3.8)
+# at the serving defaults, D = 512 and 4096, two rounds. The one term with a derivation is Qwen3.8's decode at depth 512: the
+# RTX 3090 row of the README (83.36 tok/s, 0.3.10, card + CPU, drafts on) on the same host is the anchor; the 5090 plan keeps
+# 5,886 of the 24,576 routed experts on the card (`--plan`, 33.2 GB free), more than a 3090's 24 GB holds, and the host leg is the
+# same DDR4, so the row is read at or above the 3090's: 80..100, from the anchor and a 0..20 % gain for the larger card share
+# [derived, not measured]. The four other cells are read beside it with no band of their own: their pp and tg are the sitting's.
+kind: baseline
+question: what decode rate does Qwen3.8-Flash-Next UD-Q4_K_XL serve at depth 512 on the one RTX 5090 at the serving defaults?
+term: tg tok/s @ n=128, depth 512, bloomery-serve at the serving defaults (place a, no --ctx-size), RTX 5090 32 GB
+unit: tok/s
+predict: 80..100
+condition: one lease, the 5090 alone (local mode, the one card in view, no compute process on it: the sitting's quiet check and baseline), MemTotal read ~251 GiB before the first cell; tools/release/sitting.sh --binary portable, two rounds, cells-0.3.15.tsv
+reason: the README's 0.3.10 RTX 3090 row on the same host (83.36 at depth 512) and the plan's card share; the 5090's own rows replace the 3090's in the README.
+decide-in: the README's 5090 table takes the measured means with their rounds
+decide-below: under 80: read the cell's plan record (card_experts, draft on or off) and its witness blocks before any row is published
+decide-above: beyond 100: read the witness blocks and the draft's accept count before crediting the card

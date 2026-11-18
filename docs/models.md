@@ -93,9 +93,10 @@ have a host matmul, so a `UD-Q2_K_XL` file loads. GLM-5.3's token embedding may 
 layer whose down is Q6_K runs its experts on the card beside a card gate and up.
 
 **Recommended** (the configuration the maintainers' numbers in the README ran on): a 32-core AVX2 CPU with 8 DDR4
-channels, 256 GB of RAM, an RTX A6000 48 GB, and an RTX 3090 24 GB beside it for `--place bp`. Cards are found
-by device, not by name; a list word such as `0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID`
-matches `nvidia-smi`'s numbering; the qwen38 seat takes `a`, `gate` or `bp` only).
+channels, 256 GB of RAM and one RTX 5090 32 GB (the 0.3.15 table; through 0.3.14 an RTX A6000 48 GB with an RTX 3090 24 GB
+beside it for `--place bp`, in [`numbers.md`](numbers.md)). Cards are found by device, not by name; a list word such as
+`0+1` names cards by CUDA index (`CUDA_DEVICE_ORDER=PCI_BUS_ID` matches `nvidia-smi`'s numbering; the qwen38 seat takes
+`a`, `gate` or `bp` only).
 
 A DGX Spark (GB10, aarch64) installs the release's GB10 archive (`sm_121a`), and the plan treats its unified memory
 as one pool. Serving on a Spark, Qwen3.8's checkpoint folders and the memory each start takes:
@@ -110,9 +111,9 @@ WSL2 ran Clef-Flash, its download and its cache. Other cards and drivers are unt
 This is what the unset placement (`--place a`) does on one RTX 5090 with one slot. A figure marked [derived] is not a
 measurement: it comes from the placement planner run on a Mac for the card's free bytes, or from one V4.1 plan line
 printed on the maintainer's RTX 5090 (ctx 16,384). `bloomery-serve --recommend --json` names the file the model pick
-takes on your machine, and `-m <file> --place a --plan` prints that file's plan. A contributor's measured RTX 5090
-speeds are in [`numbers.md`](numbers.md#rtx-5090-qwen36-35b-a3b-with-its-mtp-draft-by-juliankang4) and the README's
-status tables.
+takes on your machine, and `-m <file> --place a --plan` prints that file's plan. The maintainer's measured RTX 5090 speeds
+are in the README's status table, and a contributor's in
+[`numbers.md`](numbers.md#rtx-5090-qwen36-35b-a3b-with-its-mtp-draft-by-juliankang4) and the same section.
 
 | Model | Where it runs | Host RAM |
 |---|---|---|
