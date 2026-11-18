@@ -489,30 +489,40 @@ mod gate {
         let mut ok = true;
         let (status, _, text) = plan(dir, "refuse-qwen36", no_word(file, &[])?)?;
         let code = status.code();
-        let named: Vec<&str> = QWEN36_ITEMS
-            .iter()
-            .filter(|w| text.contains(*w))
-            .copied()
-            .collect();
+        let (named, cause, cause_first) = refusal_reads(&text, &QWEN36_ITEMS);
         println!(
-            "refuse-qwen36: exit 69 {} (code {code:?}); the list names {named:?} of {} host items",
+            "refuse-qwen36: exit 69 {} (code {code:?}); the list names {named:?} of {} host items; \
+             the cause {cause:?} comes before the list: {cause_first}",
             code == Some(69),
             QWEN36_ITEMS.len()
         );
-        // The cause comes before the list: the line the refusal opens with names the mask.
-        let cause = text.lines().find(|l| l.contains("no card is visible"));
-        let first_item = QWEN36_ITEMS.iter().filter_map(|w| text.find(*w)).min();
-        let cause_first = cause
-            .zip(first_item)
-            .is_some_and(|(l, item)| text.find(l).is_some_and(|at| at < item))
-            && cause.is_some_and(|l| l.contains("CUDA_VISIBLE_DEVICES"));
-        println!("refuse-qwen36: the cause {cause:?} comes before the list: {cause_first}");
         check(
             &mut ok,
             "qwen36_is_refused_by_name",
             code == Some(69) && named.len() == QWEN36_ITEMS.len() && cause_first,
         );
         Ok(ok)
+    }
+
+    /// What a no-device refusal's text holds: the host items it names, its cause line (the one
+    /// naming that no card is visible), and whether that line comes before the first item and
+    /// names the mask (`CUDA_VISIBLE_DEVICES`).
+    fn refusal_reads<'t>(
+        text: &'t str,
+        items: &[&'t str],
+    ) -> (Vec<&'t str>, Option<&'t str>, bool) {
+        let named: Vec<&str> = items
+            .iter()
+            .filter(|w| text.contains(*w))
+            .copied()
+            .collect();
+        let cause = text.lines().find(|l| l.contains("no card is visible"));
+        let first_item = items.iter().filter_map(|w| text.find(*w)).min();
+        let cause_first = cause
+            .zip(first_item)
+            .is_some_and(|(l, item)| text.find(l).is_some_and(|at| at < item))
+            && cause.is_some_and(|l| l.contains("CUDA_VISIBLE_DEVICES"));
+        (named, cause, cause_first)
     }
 
     /// The file's trained context and its `block_count`.
