@@ -1124,7 +1124,13 @@ mod tests {
                 false,
                 Some("splits text on tokens [1, 2]"),
             ),
-            ("b", vec![2], vec![2, 0], false, Some("stops at token 0")),
+            (
+                "b",
+                vec![2],
+                vec![2, 0],
+                false,
+                Some("stop set holds token 0"),
+            ),
             (
                 "<|endoftext|>",
                 vec![1, 2],
@@ -1212,7 +1218,7 @@ mod tests {
                     (
                         stop_key,
                         Value::Array(vec![Value::U32(0)]),
-                        "stops at token 2",
+                        "stop set holds token 2",
                     ),
                     (
                         "tokenizer.ggml.add_bos_token",
