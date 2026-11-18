@@ -2,7 +2,8 @@
 //! against another: the V4.1 prompt batch's card experts run the grouped
 //! GEMM (`bloomery_gpu::gemm::enqueue_gemm_batch`) while the decode steps
 //! (and the streamed passes' tile path) keep the steps' order, and both
-//! fold the same exact integer block sums, so a batched call's logits sit
+//! fold the same exact integer block sums save where a requantized code of
+//! the down's input moved ([`seam_verdict`]), so a batched call's logits sit
 //! at a pinned distance from the other order's, not on its bits. The band
 //! is `gate_deepseek41_prefill`'s rule (its module doc); the gates that
 //! compare a batched call with another order of the same call defer to it
@@ -13,14 +14,16 @@
 //! row's top-2 gap but not the rows, compare through [`parted`], by the same
 //! clarity rule ([`gap_is_clear`]).
 
-use crate::prompts::MARGIN_FLOOR;
+use crate::prompts::{MARGIN_FLOOR, PLACE_MARGIN_V41, PLACE_MARGIN_V41_FIXTURE};
+use crate::tier::Tier;
 
 /// Clear-position top-1 disagreements the band admits between a batched
 /// call's logits and the steps' run — a compared position whose
 /// steps' top1−top2 margin is at least `MARGIN_FLOOR` (the e2e clarity
 /// rule) where the two top-1s differ. Clear-position top-1 equality is
 /// the band's hard clause: both paths reassociate the same exact integer
-/// block sums, and the derived band is the first routed seam clause's.
+/// block sums save a requantized code, and the derived band is the first
+/// routed seam clause's ([`seam_verdict`]).
 pub const LOGITS_CLEAR_PIN: usize = 0;
 /// The largest |Δlogit| the band admits between a batched call's logits
 /// and the steps' run, over every compared value. The last logits
@@ -59,15 +62,18 @@ impl Pins {
     };
 }
 
-/// The band the V4.1 fixture's walk between two placements (the tier gate's rank walk, B10)
-/// is held to, with [`crate::prompts::PLACE_MARGIN_V41_FIXTURE`] as its clarity margin: the
-/// two plans run other experts on the card and on the host, and the distance is the pair's,
-/// not the card's (the RMS |Δlogit| reads 0.2510 on the 3090 and the A6000, 0.2479 on an RTX
-/// 5090). Twice the larger reading of each, [`LOGITS_MAX_PIN`]'s and [`LOGITS_RMS_PIN`]'s
-/// method on this pair alone; the shared pins carry the real tier's distance and sit ten times
-/// over this one.
+/// The band the V4.1 fixture's walk between two placements is held to, with
+/// [`crate::prompts::PLACE_MARGIN_V41_FIXTURE`] as its clarity margin ([`place_v41`]): the tier
+/// gate's rank walk (B10) and the NVMe-tier gate's rank clause, one pair on the fixture — the
+/// router rank's card list against the id prefix, the same 64 prompt ids fed one step a
+/// position — whose readings agree to the digit on every card. The two plans run other experts
+/// on the card and on the host, and the distance is the pair's, not the card's (the RMS
+/// |Δlogit| reads 0.2510 on the 3090 and the A6000, 0.2479 on an RTX 5090). Twice the larger
+/// reading of each, [`LOGITS_MAX_PIN`]'s and [`LOGITS_RMS_PIN`]'s method on this pair alone;
+/// the shared pins carry the real tier's distance and sit ten times over this one.
 // PIN(2026-11-18): max 2 × 2.597 (RTX 5090; 2.338 on sm_86) rounded up to 5.2, rms 2 × 0.2510
-// (sm_86; 0.2479 on the 5090) rounded up to 0.51, both B10's line over its 64 positions.
+// (sm_86; 0.2479 on the 5090) rounded up to 0.51, both B10's line over its 64 positions; the
+// NVMe-tier rank walk reads the same max and 0.2485 (sm_86, 66 positions) and 0.2479 (5090, 64).
 // FAIL-first: every layer's ranked host sum zeroed moves the real tier's rms 1.03 past 2.5, so
 // it is red here at 2.4 × 0.25 = 0.6 > 0.51.
 pub const PLACE_PINS_V41_FIXTURE: Pins = Pins {
@@ -75,6 +81,82 @@ pub const PLACE_PINS_V41_FIXTURE: Pins = Pins {
     max: 5.2,
     rms: 0.51,
 };
+
+/// The clarity margin and band a V4.1 walk between two placements reads in `tier`: the real
+/// tier's [`crate::prompts::PLACE_MARGIN_V41`] in [`Pins::SHARED`], the fixture's
+/// [`crate::prompts::PLACE_MARGIN_V41_FIXTURE`] in [`PLACE_PINS_V41_FIXTURE`]. The one choice
+/// the tier gate's rank walk and the NVMe-tier gate's rank clause both make.
+pub fn place_v41(tier: Tier) -> (f32, Pins) {
+    match tier {
+        Tier::Real => (PLACE_MARGIN_V41, Pins::SHARED),
+        Tier::Fixture => (PLACE_MARGIN_V41_FIXTURE, PLACE_PINS_V41_FIXTURE),
+    }
+}
+
+/// The band the V4.1 fixture's prompt batch is held to against its decode steps
+/// (`gate_deepseek41_prefill`'s cases), with [`crate::prompts::PREFILL_MARGIN_V41_FIXTURE`] as
+/// its clarity margin at every position: the fixture's logits are flat (the record's widest
+/// top-two gap is 0.75), so at that margin no fixture position is clear and these two pins carry
+/// the band. Twice the largest reading of each over the gate's fixture record, both fixtures
+/// and both card generations, [`LOGITS_MAX_PIN`]'s and [`LOGITS_RMS_PIN`]'s method on this pair.
+// PIN(2026-11-18): max 2 × 2.355 (split 700+400, istaglue on the RTX 5090) rounded up to 4.8,
+// rms 2 × 0.4119 (split 700+400, istaglue on the A6000) rounded up to 0.83, over every band
+// line of the gate's fixture runs in the batch logs (the 3090, the A6000, the RTX 5090; the
+// base fixture and istaglue). The shared pins (16, 2.5) carry the real tier's distance.
+pub const PREFILL_PINS_V41_FIXTURE: Pins = Pins {
+    clear: LOGITS_CLEAR_PIN,
+    max: 4.8,
+    rms: 0.83,
+};
+
+/// The first routed seam's reading of its tokens (`gate_deepseek41_prefill`'s clause): each
+/// token's largest |Δ| against the steps', judged by [`seam_verdict`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeamVerdict {
+    /// Tokens over the sum-order band.
+    pub over: usize,
+    /// Tokens the seam admits over it: [`seam_step_tokens`] of its count.
+    pub allowed: usize,
+    /// The largest token distance; infinite for a token whose distance is not a number.
+    pub max: f64,
+    /// The largest distance of the tokens within the sum-order band.
+    pub rest: f64,
+    pub ok: bool,
+}
+
+/// The tokens of a seam of `n` that may carry a requantized code over the sum-order band: an
+/// eighth, rounded up. A code the two paths quantize to either side of its half step moves one
+/// token (the FFN is per token) and a seam holds one about once in five (one of the five
+/// recorded `P = 64` seams of the fixture and the real file on two card generations); eight
+/// in one seam is a Poisson tail under 2e-6 even at five times that rate. A path off by a
+/// fold, a scale or a format moves every token.
+pub fn seam_step_tokens(n: usize) -> usize {
+    n.div_ceil(8)
+}
+
+/// The first routed seam's verdict on `per_token`, each token's largest |Δ| (a NaN read as
+/// infinite): at most [`seam_step_tokens`] tokens over the sum-order band `sum`, and every
+/// token within `sum + step`, one requantized code of the down's input more. A seam with no
+/// token is red.
+pub fn seam_verdict(per_token: &[f64], sum: f64, step: f64) -> SeamVerdict {
+    let d = |x: f64| if x.is_nan() { f64::INFINITY } else { x };
+    let allowed = seam_step_tokens(per_token.len());
+    let over = per_token.iter().filter(|&&x| d(x) > sum).count();
+    let max = per_token.iter().map(|&x| d(x)).fold(0.0, f64::max);
+    let rest = per_token
+        .iter()
+        .map(|&x| d(x))
+        .filter(|&x| x <= sum)
+        .fold(0.0, f64::max);
+    let ok = !per_token.is_empty() && over <= allowed && max <= sum + step;
+    SeamVerdict {
+        over,
+        allowed,
+        max,
+        rest,
+        ok,
+    }
+}
 
 /// Whether a row whose top-1 leads its top-2 by `gap` is clear at the margin `floor`: the one
 /// clarity rule of the band's positions ([`LogitsBand::add_at`]) and of [`parted`]'s.
@@ -512,6 +594,42 @@ fn bits(row: &[f32]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seam verdict admits a requantized code in a few tokens and nothing systematic: one
+    /// token over the sum-order band within the step (the RTX 5090's istaglue reading, 1.135 of
+    /// the band) is held; every token at twice the band, under the step, is red by the count;
+    /// one token past band and step is red by the size; an eighth plus one is red; a NaN token
+    /// is red. Mutants: the count clause dropped (the systematic row passes), the size clause
+    /// dropped (the far row passes), `NaN` read through `f64::max` (the NaN row passes).
+    #[test]
+    fn the_seam_admits_a_requantized_code_not_a_shift() {
+        let (sum, step) = (5.865e-4, 5.85e-2);
+        let mut flip = vec![7.0e-7; 64];
+        flip[17] = 6.658e-4;
+        let v = seam_verdict(&flip, sum, step);
+        assert!(v.ok && v.over == 1 && v.allowed == 8, "{v:?}");
+        assert!((v.max - 6.658e-4).abs() < 1e-12 && (v.rest - 7.0e-7).abs() < 1e-12);
+        let shifted = vec![2.0 * sum; 64];
+        let v = seam_verdict(&shifted, sum, step);
+        assert!(!v.ok && v.over == 64 && v.max <= sum + step, "{v:?}");
+        let mut far = vec![7.0e-7; 64];
+        far[3] = 1.01 * (sum + step);
+        assert!(!seam_verdict(&far, sum, step).ok);
+        let mut nine = vec![7.0e-7; 64];
+        for t in nine.iter_mut().take(9) {
+            *t = 2.0 * sum;
+        }
+        let v = seam_verdict(&nine, sum, step);
+        assert!(!v.ok && v.over == 9, "{v:?}");
+        assert!(
+            seam_verdict(&[2.0 * sum], sum, step).ok,
+            "a one-token seam admits its token"
+        );
+        let mut nan = vec![7.0e-7; 64];
+        nan[0] = f64::NAN;
+        assert!(!seam_verdict(&nan, sum, step).ok);
+        assert!(!seam_verdict(&[], sum, step).ok);
+    }
 
     /// A four-wide row whose top-1 is `top`: over a margin the band reads
     /// as clear, or, unless `clear`, under it.

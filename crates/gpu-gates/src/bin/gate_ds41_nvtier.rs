@@ -52,7 +52,7 @@ mod gate {
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_deepseek41::body::{Body, OpenCfg, PrefillMode};
     use bloomery_gpu_gates::generate::Place;
-    use bloomery_gpu_gates::prompts::{MARGIN_FLOOR, PLACE_MARGIN_V41};
+    use bloomery_gpu_gates::logits_band::{self, Pins};
     use bloomery_gpu_gates::{Fnv1a64, GateError, prose_ids, record, ref_model_path, tier};
     use bloomery_levers::{EXPERT_RANK, ResidencyAt, residency_unset};
     use gguf::Split;
@@ -79,9 +79,9 @@ mod gate {
         path: PathBuf,
         cfg: OpenCfg,
         machine: M,
-        /// The rank walk's margin: the real tier's [`PLACE_MARGIN_V41`],
-        /// the fixture tier's the e2e floor.
-        margin: f32,
+        /// The rank walk's margin and band (`logits_band::place_v41`): the
+        /// tier gate's rank walk's, the same pair on the fixture.
+        band: (f32, Pins),
     }
 
     impl<M: Fn(usize) -> Machine + Copy> Ds41<M> {
@@ -162,10 +162,9 @@ mod gate {
             true
         }
 
-        /// The rank walk's margin, parsed once at `run` from the tier: the real tier's
-        /// [`PLACE_MARGIN_V41`], the fixture tier's the e2e floor.
-        fn rank_margin(&self) -> f32 {
-            self.margin
+        /// The rank walk's margin and band, chosen once at `run` from the tier.
+        fn rank_band(&self) -> (f32, Pins) {
+            self.band
         }
 
         fn rank_child(&self, cmd: &mut Command, rank: &Path) -> Result<(), GateError> {
@@ -316,17 +315,14 @@ mod gate {
         // Plan (a) on the largest card in view, which the plan's open finds by its device; a
         // workstation card by name would name a card this machine may not have.
         let machine = Place::A.on_host()?.machine(None, None)?;
-        let margin = match tier::Tier::from_env()? {
-            tier::Tier::Real => PLACE_MARGIN_V41,
-            tier::Tier::Fixture => MARGIN_FLOOR,
-        };
+        let band = logits_band::place_v41(tier::Tier::from_env()?);
         crate::nvtier_family::gate(
             NAME,
             &Ds41 {
                 path,
                 cfg,
                 machine,
-                margin,
+                band,
             },
         )
     }

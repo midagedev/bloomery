@@ -37,8 +37,9 @@
 //!   names `BLOOMERY_EXPERT_RANK`, so no other arm's plan takes it, and once without one. The child holds every
 //!   paged layer's NVMe list to the layer's coldest host ids under the rank ([`rank_lists`]) and leaves its run
 //!   beside the rank file; the parent walks the child's positions against its own run of the same ids within
-//!   the logits band, for the two plans keep other experts on the host and the NVMe tier, so the rows sit
-//!   within the band, not on bits.
+//!   the logits band ([`Family::rank_band`]): the rank moves the NVMe lists and, with them, which experts the
+//!   card holds, and a card expert and a host expert are not one result bit for bit (a host and an NVMe-paged
+//!   expert are: the `bits` clause), so the rows sit within the band, not on bits.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -563,14 +564,14 @@ pub trait Family {
         Err("this family's run keeps no logits rows: its gate runs no rank clause".into())
     }
 
-    /// The clarity margin the rank walk reads at every position: its two
-    /// plans run other experts on the card and the host, which move the
-    /// top-two gap at every position, so a family whose gap shifts between two
-    /// placements were measured states its own here, as its gates state their
-    /// σ; every other family keeps the e2e floor. Read only where
-    /// [`Family::takes_rank`] holds.
-    fn rank_margin(&self) -> f32 {
-        MARGIN_FLOOR
+    /// The clarity margin the rank walk reads at every position and the band
+    /// it is held to: its two plans run other experts on the card and the
+    /// host, which move the top-two gap at every position, so a family whose
+    /// gap shifts between two placements were measured states its own here,
+    /// as its gates state their σ; every other family keeps the e2e floor in
+    /// the shared band. Read only where [`Family::takes_rank`] holds.
+    fn rank_band(&self) -> (f32, logits_band::Pins) {
+        (MARGIN_FLOOR, logits_band::Pins::SHARED)
     }
 
     /// The session cleared and dropped.
@@ -1100,10 +1101,9 @@ fn rank_lists(name: &str, plan: &PlanFacts, rank: &ExpertRank) -> bool {
 /// run of the same arm. The child holds its plan's paged lists to the rank's
 /// coldest host ids ([`rank_lists`]) and leaves its run beside the rank
 /// file; the parent walks the child's positions against its own within the
-/// logits band at the family's rank margin ([`Family::rank_margin`]) at
-/// every position: the two plans keep
-/// other experts on the host and the NVMe
-/// tier, so the rows sit within the band, not on bits.
+/// family's rank band ([`Family::rank_band`]) at every position: the rank
+/// moves which experts the card holds as well as the NVMe lists, so the rows
+/// sit within the band, not on bits.
 fn rank_clause<F: Family>(name: &str, f: &F, arm: Arm) -> Result<bool, GateError> {
     let arm = Arm {
         arena: Some(0),
@@ -1148,9 +1148,9 @@ fn rank_clause<F: Family>(name: &str, f: &F, arm: Arm) -> Result<bool, GateError
     // every one is judged on the context both arms share (it parted at the first argmax flip
     // before — 1 of the run's positions compared); the last prompt row records its argmax, the
     // seed the greedy steps run on, so a parted seed ends the walk before the greedy rows. The
-    // walk reads the family's rank margin at every position.
-    let margin = f.rank_margin();
-    let walk = logits_band::walk_at(
+    // walk reads the family's rank band at every position.
+    let (margin, pins) = f.rank_band();
+    let walk = logits_band::walk_pinned(
         &format!(
             "{name} rank: the paged arm through the file mapping under the rank (each layer's \
              coldest host ids on the NVMe tier) against the same arm without it (its id tail)"
@@ -1158,6 +1158,7 @@ fn rank_clause<F: Family>(name: &str, f: &F, arm: Arm) -> Result<bool, GateError
         want.positions(),
         got.positions(),
         margin,
+        pins,
     );
     Ok(walk.ok)
 }

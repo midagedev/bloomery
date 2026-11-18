@@ -1610,7 +1610,14 @@ mod gate {
 
         #[test]
         fn each_compute_capability_reads_its_own_table_and_another_is_refused_by_name() {
-            assert!(std::ptr::eq(bands_of((8, 6)).expect("8.6").pins, PINS_86));
+            // Each capability reads its own table, compared by card and contents: two uses of a
+            // `const` slice need not share one address, so `ptr::eq` is no test of identity.
+            let a = bands_of((8, 6)).expect("8.6");
+            assert_eq!((a.cc, a.pins.len()), ((8, 6), PINS_86.len()));
+            assert!(a.pins.iter().zip(PINS_86).all(|(x, y)| x.tap == y.tap
+                && x.max_rel.to_bits() == y.max_rel.to_bits()
+                && x.rms_rel.to_bits() == y.rms_rel.to_bits()
+                && x.differ.to_bits() == y.differ.to_bits()));
             let b = bands_of((12, 0)).expect("12.0");
             assert_eq!(b.card, "RTX 5090");
             let Err(err) = bands_of((8, 9)) else {

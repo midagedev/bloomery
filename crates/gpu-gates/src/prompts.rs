@@ -293,14 +293,38 @@ pub const PLACE_MARGIN_V41: f32 = 9.7;
 /// [`PLACE_MARGIN_V41`] on the V4.1 fixture, by its method: the fixture's two placements move
 /// the top-two gap by the pair's own distance, which is no card's (the walk's RMS |Δlogit|
 /// reads 0.2510 on the 3090 and the A6000, 0.2479 on an RTX 5090), and [`MARGIN_FLOOR`] sits
-/// under that shift. In the error model's terms the floor is 4.8 σ of a gap's shift (σ = √2 ×
-/// 0.251, the two logits' RMS distance), where a top-1 of any runner-up flips with probability
-/// under 1e-6 a position; the walk's band is `logits_band::PLACE_PINS_V41_FIXTURE`.
+/// under that shift. On the fixture the tier gate's rank walk (B10) and the NVMe-tier gate's
+/// rank clause are one pair: both feed the same 64 prompt ids against the plan without the
+/// rank, and of what the rank moves only the card's list moves bits (a host and an NVMe-paged
+/// expert run one host kernel, the NVMe-tier gate's bits clause; a tiered expert is the card's,
+/// B10's T1), so the two walks read the same shifts. In the
+/// error model's terms the floor is 4.8 σ of a gap's shift (σ = √2 × 0.251, the two logits'
+/// RMS distance), where a top-1 of any runner-up flips with probability under 1e-6 a position;
+/// the walk's band is `logits_band::PLACE_PINS_V41_FIXTURE`, both read through
+/// `logits_band::place_v41`.
 // PIN(2026-11-18): 2 × 0.8469, the largest |top-2 gap shift| over B10's 64 fixture positions
 // (position 41 on the 3090 and the A6000; 0.6932 at position 55 on the 5090), rounded up to 1.7.
-// The 5090's run flipped a top-1 at margin 0.6098 (a third id over the reference's two), a
-// re-lottery under this floor; at the old floor, 0.5, it was red with the same distance.
+// The NVMe-tier rank walk reads the same 0.8469 at 41 (sm_86, 66 positions) and 0.6932 at 55
+// (5090, 64). The 5090's runs flipped a top-1 at margin 0.6098 at position 20 in both walks (a
+// third id over the reference's two), a re-lottery under this floor; at the old floor, 0.5,
+// both were red with the same distance.
 pub const PLACE_MARGIN_V41_FIXTURE: f32 = 1.7;
+
+/// The clarity margin the V4.1 fixture's prompt batch is judged at against its decode steps,
+/// at every position (`gate_deepseek41_prefill`'s cases): [`HEAD_MARGIN_V41`]'s method on the
+/// fixture, whose shift is as large past the head as at it. The batch's grouped GEMM and the
+/// steps' gemv fold the gate·up in other f32 orders, and both quantize the SwiGLU product to
+/// q8_1 for the down, so a value on a code boundary flips a code and each layer's next
+/// quantization compounds it: on the fixture's flat logits (the record's median top-two gap
+/// 0.093, its widest 0.75) the gap shift's RMS is 0.244 and [`MARGIN_FLOOR`] sits at 2 σ of
+/// it. The band is `logits_band::PREFILL_PINS_V41_FIXTURE`.
+// PIN(2026-11-18): 2 × 0.6640, the largest |gap shift| over the gate's 624 per-position lines
+// of its fixture runs in the batch logs (split 700+400 and wide taps at position 1100, the base
+// fixture on sm_86; 0.5314 at P=1 position 1, istaglue on the RTX 5090), rounded up to 1.4.
+// The 5090's istaglue run flipped the top-1 at P=1 position 1 (the steps' margin 0.5408, shift
+// −0.5314 to their runner-up), red at the old floor 0.5 with every seam before layer 0's FFN on
+// the steps' bits and the catcher bit for bit; under this floor it is the re-lottery it is.
+pub const PREFILL_MARGIN_V41_FIXTURE: f32 = 1.4;
 
 /// Judge our greedy continuations against the reference, prompt by prompt.
 ///

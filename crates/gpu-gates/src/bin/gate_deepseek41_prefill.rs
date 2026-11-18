@@ -96,7 +96,9 @@
 //!   ids with every seam read back. The first seam whose streams leave the
 //!   steps' bits must be the FFN seam of a routed layer (the header's layer
 //!   table), held per token to max |Δ| at most the derived sum-order band
-//!   ([`seam_band`]) times the stream's max |x|; every seam before it is the
+//!   ([`seam_band`]) times the stream's max |x|, save at most an eighth of
+//!   its tokens, each within one requantized code of the down's input more
+//!   ([`step_band`], `logits_band::seam_verdict`); every seam before it is the
 //!   steps' bits, so a first difference elsewhere is a defect outside the
 //!   experts.
 //! - **Hosted-expert catcher.** At each `P` of [`CATCHER_PS`], the same
@@ -145,10 +147,13 @@
 //!   grants restores only rows the needs say the calls wrote — and the
 //!   logits against the oracle's steps within the band: the call's last
 //!   logits and the one step after, top-1 equality at every position whose
-//!   steps' top1−top2 margin is at least `MARGIN_FLOOR` with at most
-//!   [`LOGITS_CLEAR_PIN`] disagreements, and max and RMS |Δlogit| at most
-//!   [`LOGITS_MAX_PIN`] and [`LOGITS_RMS_PIN`], every measured value printed
-//!   one line a case. The splits are 700 + 400, and two whose second call sits
+//!   steps' top1−top2 margin is at least the case band's margin with at most
+//!   `LOGITS_CLEAR_PIN` disagreements, and max and RMS |Δlogit| at most the
+//!   band's pins ([`CaseBand`]: the real tier's `HEAD_MARGIN_V41` at 0–1 and
+//!   `MARGIN_FLOOR` past them in the shared pins, the fixture's
+//!   `PREFILL_MARGIN_V41_FIXTURE` at every position in
+//!   `PREFILL_PINS_V41_FIXTURE`), every measured value printed one line a
+//!   case. The splits are 700 + 400, and two whose second call sits
 //!   on either side of the length where the triangle starts to cut the last
 //!   compressor owner's block (`ced_reach`: `CHUNK + window · (layers above the owner)` =
 //!   8 + 128 · 19 = 2440 positions from an aligned end on the real file, layer 20 of 40;
@@ -295,9 +300,9 @@ mod gate {
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::logits_band::{
-        LOGITS_CLEAR_PIN, LOGITS_MAX_PIN, LOGITS_RMS_PIN, LogitsBand,
+        LogitsBand, PREFILL_PINS_V41_FIXTURE, Pins, seam_verdict,
     };
-    use bloomery_gpu_gates::prompts::{HEAD_MARGIN_V41, MARGIN_FLOOR};
+    use bloomery_gpu_gates::prompts::{HEAD_MARGIN_V41, MARGIN_FLOOR, PREFILL_MARGIN_V41_FIXTURE};
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, NAN_F16, activations, bits_equal, checks_failed, data_dir, kquant_d_at,
         no_local_depot, patch_bytes, record, row_bytes, verdict,
@@ -534,12 +539,8 @@ mod gate {
             & tier::witness("the triangle's reach (positions)", reach, 8 + 128 * 19)
             & tier::witness("the group-fault prefill (ids)", group_p, GROUP_FAULT_P);
         let split_list = splits(reach)?;
-        // The head positions' clarity margin (module doc, `prompts::HEAD_MARGIN_V41`): the real
-        // tier's alone — the fixture tier keeps the e2e floor at every position.
-        let head = match tier::Tier::from_env()? {
-            tier::Tier::Real => HEAD_MARGIN_V41,
-            tier::Tier::Fixture => MARGIN_FLOOR,
-        };
+        // The cases' band (module doc, [`CaseBand`]), chosen once from the tier.
+        let band = CaseBand::of(tier::Tier::from_env()?);
         let file = Split::open(&path).map_err(|e| format!("open {path}: {e}"))?;
         let t = Instant::now();
         let mut m = body::open(
@@ -562,7 +563,7 @@ mod gate {
         }
         m.capture_step()?;
         if args.cand {
-            return if cand_case(&mut m)? {
+            return if cand_case(&mut m, band)? {
                 println!("PASSED: {NAME} --cand");
                 Ok(())
             } else {
@@ -685,7 +686,7 @@ mod gate {
                 println!("{NAME}: {what} {}", split::split(&stats, counts)?.line());
             }
             let p: usize = parts.iter().sum();
-            pass &= compare(what, &case, &oracle[&p], t, owner, p, head);
+            pass &= compare(what, &case, &oracle[&p], t, owner, p, band);
         }
         crate::ds41_tier::sc(
             "hosted experts: the card blocks on the tile path are the steps' bits, logits and \
@@ -696,7 +697,7 @@ mod gate {
         crate::ds41_tier::sc(
             "fault, reset, clean: a poisoned prefill faults, the reset gives the oracle's numbers",
         )?;
-        pass &= fault_reset_case(m, &hp, &ids, &oracle, p_clean, dhp.window, head)?;
+        pass &= fault_reset_case(m, &hp, &ids, &oracle, p_clean, dhp.window, band)?;
         crate::ds41_tier::sc(
             "group fault: a fault in a group is the call's named error and poison",
         )?;
@@ -705,11 +706,11 @@ mod gate {
             crate::ds41_tier::sc(
                 "rollback: a cut inside the call is refused, the tail is granted",
             )?;
-            pass &= rollback_case(m, &ids, &oracle)?;
+            pass &= rollback_case(m, &ids, &oracle, band)?;
             crate::ds41_tier::sc("take back: a failed call is taken back to its start")?;
-            pass &= take_back_case(m, &ids, &oracle)?;
+            pass &= take_back_case(m, &ids, &oracle, band)?;
             crate::ds41_tier::sc("snapshot: a saved state put back is the call's")?;
-            pass &= resume_case(m, &hp, &ids, &oracle)?;
+            pass &= resume_case(m, &hp, &ids, &oracle, band)?;
         }
         println!("{NAME}: {}", tier::tally_line());
         if !pass {
@@ -2467,7 +2468,7 @@ mod gate {
         oracle: &BTreeMap<usize, Snap>,
         p: usize,
         window: usize,
-        head: f32,
+        rule: CaseBand,
     ) -> Result<bool, GateError> {
         let t = Instant::now();
         let shown = |r: &Result<u32, GpuError>| match r {
@@ -2494,7 +2495,7 @@ mod gate {
                 t,
                 crate::ds41_tier::last_owner(hp)?,
                 p,
-                head,
+                rule,
             ),
             Err(e) => {
                 println!(
@@ -2816,6 +2817,7 @@ mod gate {
         m: &mut Deepseek41Model,
         ids: &[u32],
         oracle: &BTreeMap<usize, Snap>,
+        rule: CaseBand,
     ) -> Result<bool, GateError> {
         let t = Instant::now();
         let (a, b) = SPLITS[0];
@@ -2836,14 +2838,14 @@ mod gate {
         let back = failed.is_err() && pos == a && len == a;
         body::prefill(m, &ids[a..a + b])?;
         let mut band = LogitsBand::new();
-        band.add(&bits(&m.logits()?), &oracle[&(a + b)].logits);
+        band.add_at(&bits(&m.logits()?), &oracle[&(a + b)].logits, rule.rest);
         m.step(&[ids[a + b]])?;
         let want_next = oracle[&(a + b)]
             .next
             .as_deref()
             .ok_or_else(|| format!("{NAME}: the oracle holds no logits past {}", a + b))?;
-        band.add(&bits(&m.logits()?), want_next);
-        let ok = back && band.ok();
+        band.add_at(&bits(&m.logits()?), want_next, rule.rest);
+        let ok = back && rule.ok(&band);
         println!(
             "{NAME}: case take back {a}+{b}: the second call failed ({}), the model stands at \
              {pos} with {len} tokens {} | the call again: logits within the band (clear top-1 {} \
@@ -2856,7 +2858,7 @@ mod gate {
             band.clear,
             band.max,
             band.rms(),
-            verdict(band.ok()),
+            verdict(rule.ok(&band)),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );
@@ -2869,6 +2871,7 @@ mod gate {
         hp: &Hparams,
         ids: &[u32],
         oracle: &BTreeMap<usize, Snap>,
+        rule: CaseBand,
     ) -> Result<bool, GateError> {
         const MARK_MIN: usize = 64;
         let t = Instant::now();
@@ -2911,13 +2914,13 @@ mod gate {
             .next
             .as_deref()
             .ok_or_else(|| format!("{NAME}: the oracle holds no logits past {p}"))?;
-        band.add(&bits(&m.logits()?), want_next);
+        band.add_at(&bits(&m.logits()?), want_next, rule.rest);
         m.rollback(u32::try_from(kept_mark)?)?;
         for &id in &ids[kept_mark..p] {
             m.step(&[id])?;
         }
-        band.add(&bits(&m.logits()?), &oracle[&p].logits);
-        let ok = cuts == [a] && kept_mark == a && same && stands && band.ok();
+        band.add_at(&bits(&m.logits()?), &oracle[&p].logits, rule.rest);
+        let ok = cuts == [a] && kept_mark == a && same && stands && rule.ok(&band);
         println!(
             "{NAME}: case snapshot P={p}: cut at {cuts:?} keeps {kept_mark} {} | saved {} B, \
              resumed over the reversed ids: caches {} | stands at {p} with the ids and the same \
@@ -2931,7 +2934,7 @@ mod gate {
             band.clear,
             band.max,
             band.rms(),
-            verdict(band.ok()),
+            verdict(rule.ok(&band)),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );
@@ -2943,6 +2946,7 @@ mod gate {
         m: &mut Deepseek41Model,
         ids: &[u32],
         oracle: &BTreeMap<usize, Snap>,
+        rule: CaseBand,
     ) -> Result<bool, GateError> {
         let t = Instant::now();
         let (p, inside) = CUT;
@@ -2966,14 +2970,14 @@ mod gate {
             m.step(&[id])?;
         }
         let mut band = LogitsBand::new();
-        band.add(&bits(&m.logits()?), &oracle[&p].logits);
+        band.add_at(&bits(&m.logits()?), &oracle[&p].logits, rule.rest);
         m.step(&[ids[p]])?;
         let want_next = oracle[&p]
             .next
             .as_deref()
             .ok_or_else(|| format!("{NAME}: the oracle holds no logits past {p}"))?;
-        band.add(&bits(&m.logits()?), want_next);
-        let ok = refused && tail > inside && band.ok();
+        band.add_at(&bits(&m.logits()?), want_next, rule.rest);
+        let ok = refused && tail > inside && rule.ok(&band);
         println!(
             "{NAME}: case rollback P={p}: cut {inside} refused (keep_point {kept_inside}) {} | \
              tail cut {tail} granted, stepped to {p}: logits within the band (clear top-1 {} of \
@@ -2983,7 +2987,7 @@ mod gate {
             band.clear,
             band.max,
             band.rms(),
-            verdict(band.ok()),
+            verdict(rule.ok(&band)),
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );
@@ -2992,7 +2996,7 @@ mod gate {
 
     /// G2b (module doc): the crossing as one batch call and as steps from
     /// the same keep point, the last logits within the band.
-    fn cand_case(m: &mut Deepseek41Model) -> Result<bool, GateError> {
+    fn cand_case(m: &mut Deepseek41Model, rule: CaseBand) -> Result<bool, GateError> {
         let t = Instant::now();
         let ids = corpus("prose", CAND_END)?;
         m.reset()?;
@@ -3018,18 +3022,22 @@ mod gate {
             arms.push(bits(&m.logits()?));
         }
         let mut band = LogitsBand::new();
-        band.add(&arms[0], &arms[1]);
-        let ok = band.ok();
+        band.add_at(&arms[0], &arms[1], rule.rest);
+        let ok = rule.ok(&band);
         println!(
             "{NAME}: case cand: ids {CAND_FIRST}..{CAND_END} as one batch call ({:?}) against \
              steps from the keep point {CAND_FIRST}: last logits within the band: clear top-1 {} \
-             of {} (pin {LOGITS_CLEAR_PIN}), max |Δlogit| {:.3e} (pin {LOGITS_MAX_PIN}), rms \
-             {:.3e} (pin {LOGITS_RMS_PIN}) | {:.1} s: {}",
+             of {} (pin {}, clear = margin >= {}), max |Δlogit| {:.3e} (pin {}), rms {:.3e} (pin \
+             {}) | {:.1} s: {}",
             body::batches(CAND_FIRST, CAND_END - CAND_FIRST),
             band.disagree,
             band.clear,
+            rule.pins.clear,
+            rule.rest,
             band.max,
+            rule.pins.max,
             band.rms(),
+            rule.pins.rms,
             t.elapsed().as_secs_f64(),
             verdict(ok)
         );
@@ -3112,12 +3120,52 @@ mod gate {
         Ok(())
     }
 
+    /// The band a batch's logits are held to against the steps' (module doc, the cases): the
+    /// clarity margin at positions 0–1 and past them, and the pins. The real tier's
+    /// [`HEAD_MARGIN_V41`] at the head and [`MARGIN_FLOOR`] past it in [`Pins::SHARED`]; the
+    /// fixture's [`PREFILL_MARGIN_V41_FIXTURE`] at every position in
+    /// [`PREFILL_PINS_V41_FIXTURE`], its flat logits moving the gap as far past the head as at
+    /// it. One choice for every case that holds a batch against the steps.
+    #[derive(Clone, Copy)]
+    struct CaseBand {
+        head: f32,
+        rest: f32,
+        pins: Pins,
+    }
+
+    impl CaseBand {
+        fn of(tier: tier::Tier) -> CaseBand {
+            match tier {
+                tier::Tier::Real => CaseBand {
+                    head: HEAD_MARGIN_V41,
+                    rest: MARGIN_FLOOR,
+                    pins: Pins::SHARED,
+                },
+                tier::Tier::Fixture => CaseBand {
+                    head: PREFILL_MARGIN_V41_FIXTURE,
+                    rest: PREFILL_MARGIN_V41_FIXTURE,
+                    pins: PREFILL_PINS_V41_FIXTURE,
+                },
+            }
+        }
+
+        /// The margin position `pos` is clear at.
+        fn floor(self, pos: usize) -> f32 {
+            if pos < 2 { self.head } else { self.rest }
+        }
+
+        /// Whether `band` sits within the pins.
+        fn ok(self, band: &LogitsBand) -> bool {
+            band.ok_at(self.pins)
+        }
+    }
+
     /// The case against the oracle (module doc): one line, the band's every
     /// measured value in it, and one line a compared position — the steps'
     /// top1−top2 margin there and the batch's, whose difference is the gap
     /// shift the head margin is derived from. The compared rows are the
     /// call's last logits (position `p − 1`) and the step after (position
-    /// `p`); positions 0–1 read `head`, the rest [`MARGIN_FLOOR`].
+    /// `p`), each at `rule`'s margin for its position ([`CaseBand::floor`]).
     fn compare(
         what: &str,
         case: &Case,
@@ -3125,11 +3173,11 @@ mod gate {
         t: Instant,
         owner: usize,
         p: usize,
-        head: f32,
+        rule: CaseBand,
     ) -> bool {
         let mut band = LogitsBand::new();
         let fold = |band: &mut LogitsBand, got: &[u32], want: &[u32], pos: usize| {
-            let floor = if pos < 2 { head } else { MARGIN_FLOOR };
+            let floor = rule.floor(pos);
             band.add_at(got, want, floor);
             let g: Vec<f32> = got.iter().copied().map(f32::from_bits).collect();
             let w: Vec<f32> = want.iter().copied().map(f32::from_bits).collect();
@@ -3151,14 +3199,13 @@ mod gate {
         }
         let taps = case.taps == case.taps_want;
         let claimed = case.unclaimed.is_none();
-        let ok = band.ok() && taps && claimed;
+        let ok = rule.ok(&band) && taps && claimed;
         let reach = |n: &Need| n.layers.get(owner).map_or(0, |l| l.full - n.first);
         println!(
             "{NAME}: case {what}: taps {} rows from {} {} | granted cuts claimed {} | logits \
-             band: clear top-1 {} of {} (pin {LOGITS_CLEAR_PIN}, clear = margin >= {MARGIN_FLOOR} \
-             beyond 0–1, {head} at 0–1), max |Δlogit| {:.3e} (pin \
-             {LOGITS_MAX_PIN}), rms {:.3e} (pin {LOGITS_RMS_PIN}) {} | layer {owner} block cut \
-             by {:?} | {:.1} s: {}",
+             band: clear top-1 {} of {} (pin {}, clear = margin >= {} beyond 0–1, {} at 0–1), \
+             max |Δlogit| {:.3e} (pin {}), rms {:.3e} (pin {}) {} | layer {owner} block cut by \
+             {:?} | {:.1} s: {}",
             case.taps.len(),
             case.taps
                 .first()
@@ -3167,9 +3214,14 @@ mod gate {
             verdict(claimed),
             band.disagree,
             band.clear,
+            rule.pins.clear,
+            rule.rest,
+            rule.head,
             band.max,
+            rule.pins.max,
             band.rms(),
-            verdict(band.ok()),
+            rule.pins.rms,
+            verdict(rule.ok(&band)),
             case.needs.iter().map(reach).collect::<Vec<_>>(),
             t.elapsed().as_secs_f64(),
             verdict(ok)
@@ -3331,8 +3383,10 @@ mod gate {
 
     /// The first routed seam's band, relative to the stream's max |x| (module
     /// doc): the two paths fold the same exact integer block sums of the
-    /// routed experts' dots and reassociate them in f32, so the seam's
-    /// distance is the two orders' rounding counts alone. A dot of `k` terms
+    /// routed experts' dots and reassociate them in f32 — the gate·up's over
+    /// the one q8_1 input both read, the down's while no code of its input
+    /// moved ([`step_band`] carries a moved one) — so the seam's distance is
+    /// the two orders' rounding counts alone. A dot of `k` terms
     /// — the gate·up's `k = n_embd`, the down's `k = ff` — has `k / 128`
     /// block terms; the step's gemv folds one fma with its scale product a
     /// super-block a lane (`k / 256` super-blocks, lane parity halves them)
@@ -3360,6 +3414,32 @@ mod gate {
         2.0 * dot(hp.n_embd) + dot(hp.experts.ff)
     }
 
+    /// The bridge [`step_band`] takes: a 128-value block's amax of the SwiGLU product over its
+    /// RMS, at most 6.4 (the product of two normal sums is Laplace-tailed: about 5.4 for 128
+    /// draws), times a down column's largest of `n_embd` rows over their RMS, at most 5 (about
+    /// 4.3 for 5120 normal rows).
+    const STEP_BRIDGE: f64 = 6.4 * 5.0;
+
+    /// One requantized code of the down's input, relative to the stream's max |x| (module doc):
+    /// the term [`seam_band`] leaves out. Both paths quantize the SwiGLU product `h` of their own
+    /// gate·up sums to q8_1 for the down through one owner (`q8_1_quant_vals`, a 128-value
+    /// block's scale `d = amax / 127`), so where the two sums put a value of `h` on either side
+    /// of a code's half step, the codes differ by one and the down's integer block sums are not
+    /// the same integers: the down's row moves by `d·w`. Against the down's output, a random walk
+    /// of `ff` products (`√ff · rms(w) · rms(h)`, [`seam_band`]'s bridge), that is
+    /// `STEP_BRIDGE / (127 · √ff)`; the top-k sum and the streams' join pass it as they pass the
+    /// sum-order term. Derived for the fixture's `ff` 512: 1.1e-2; the real file's 2304: 5.2e-3.
+    /// A code moves one token's streams alone (the FFN is per token), so a seam admits it in an
+    /// eighth of its tokens (`logits_band::seam_step_tokens`), never in every one.
+    // PIN(2026-11-18): the RTX 5090's istaglue run read P=64's first routed seam at 6.658e-4 over
+    // the sum-order band 5.865e-4 (ratio 1.135), every other fixture and real-file seam on the
+    // 3090, the A6000 and the 5090 at a ratio of 0.002 or less: one moved code (its distance 1 %
+    // of this term) against the same experts, kernels and card that read 0.002 on the base
+    // fixture. FAIL-first: `logits_band::tests::the_seam_admits_a_requantized_code_not_a_shift`.
+    fn step_band(hp: &Hparams) -> f64 {
+        STEP_BRIDGE / (127.0 * (hp.experts.ff as f64).sqrt())
+    }
+
     /// The first routed seam clause (module doc): the locator's machinery at
     /// each `P` of [`SEAM_PS`]: the first seam that leaves the steps' bits,
     /// a routed FFN seam within [`seam_band`]. The model is left reset.
@@ -3368,14 +3448,15 @@ mod gate {
         hp: &Hparams,
         ids: &[u32],
     ) -> Result<bool, GateError> {
-        let rel = seam_band(hp);
+        let (rel, step) = (seam_band(hp), step_band(hp));
         let mut ok = true;
         for &p in SEAM_PS.iter() {
             let (rec, _) = seam_record(m, &ids[..p])?;
             m.reset()?;
             // Per recorded seam, in seam order: tokens seen, tokens that differ,
-            // the largest distance and the stream's own scale.
-            let mut seen = vec![(0usize, 0usize, 0.0f64, 0.0f64); rec.len()];
+            // each position's largest distance (a NaN read as infinite) and the
+            // stream's own scale.
+            let mut seen = vec![(0usize, 0usize, vec![0.0f64; p], 0.0f64); rec.len()];
             body::prefill_observed(m, &ids[..p], &mut |gpu, seam| {
                 gpu.stream().synchronize()?;
                 let n4 = seam.streams.len() / crate::gate::T_MAX_TOKENS;
@@ -3398,7 +3479,9 @@ mod gate {
                         s.1 += 1;
                     }
                     for (a, b) in got.iter().zip(w) {
-                        s.2 = s.2.max((f64::from(*a) - f64::from(*b)).abs());
+                        let d = (f64::from(*a) - f64::from(*b)).abs();
+                        let at = &mut s.2[pos];
+                        *at = if d.is_nan() { f64::INFINITY } else { at.max(d) };
                         s.3 = s.3.max(f64::from(a.abs())).max(f64::from(b.abs()));
                     }
                 }
@@ -3413,22 +3496,29 @@ mod gate {
                 continue;
             };
             let (kind, layer) = rec[i].0;
-            let (tokens_n, tokens, max_diff, scale) = seen[i];
+            let (tokens_n, tokens, per_token, scale) = &seen[i];
             let routed =
                 kind == body::BatchSeamKind::Ffn && hp.layers.get(layer).is_some_and(|k| k.routed);
             let bound = rel * scale;
-            let seam_ok = routed && max_diff <= bound;
+            let read = seam_verdict(per_token, bound, step * scale);
+            let seam_ok = routed && read.ok;
             ok &= seam_ok;
             println!(
                 "{NAME}: first routed seam P={p}: the first seam that differs is {kind:?} layer \
-                 {layer}{}: {tokens} of {tokens_n} tokens differ, max |Δ| {max_diff:.3e} over band \
-                 {bound:.3e} ({rel:.2e} · max |x| {scale:.3e}), ratio {:.3}: {}",
+                 {layer}{}: {tokens} of {tokens_n} tokens differ, max |Δ| {:.3e} over band \
+                 {bound:.3e} ({rel:.2e} · max |x| {scale:.3e}), ratio {:.3}; {} of {p} tokens \
+                 over it (at most {}, each within {step:.2e} · max |x| more: a requantized code), \
+                 the rest at most {:.3e}: {}",
                 if routed {
                     ""
                 } else {
                     " (not a routed FFN seam)"
                 },
-                if bound > 0.0 { max_diff / bound } else { 0.0 },
+                read.max,
+                if bound > 0.0 { read.max / bound } else { 0.0 },
+                read.over,
+                read.allowed,
+                read.rest,
                 verdict(seam_ok)
             );
         }
