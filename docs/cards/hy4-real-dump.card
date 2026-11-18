@@ -1,0 +1,20 @@
+# Hy4-flash's real-file node dumps (refset family lcpp-hy4): `just dump-ref-hy4` on the Q4_K_M file (168 GB in two shards, 42 layers,
+# 512 routed experts with 16 picked) runs llama.cpp (PR #32517 tree, CPU only) over the five prompts of tools/ref/data/hy4 (32, 31, 30,
+# 5 and 93 ids) from ONE load, into ref_hy4_{a,b,c,d,e}, 32 greedy tokens each. Predicted wall [derived], seconds:
+#   load      168 GB mapped; the release sitting read the file within the hour, so most pages are cached: 5-60 s (60 s = a cold
+#             third at ~3 GB/s off the NVMe)
+#   prefill   191 ids x 2 x ~11 GMAC a token (11B active) = 4.2 TFLOP, at the fixture probe's 0.26 TFLOP/s per 8 threads scaled to 32:
+#             4-16 s
+#   greedy    160 tokens, each reading the active bytes (~7 GB at Q4_K_M's ~4.8 bits a weight, plus the head) at 80-130 GB/s of host
+#             DRAM: 55-90 ms a token, 9-15 s
+#   measured 2026-11-19: load 115.4 s, outside the band: llama.cpp repacks 67 GB of the Q4_K weights into its CPU layout
+#             (CPU_REPACK) at load, a copy the band left out; prompts 0.3-3.8 s, greedy 2.9-3.0 s a prompt (91-94 ms a token, just
+#             past the band's 90). Total ~130 s, inside the card's minutes.
+#   writes    a's and e's every-tap sets over 42 layers (~8x the fixture's 10 MB a set), the rest layer taps: ~200 MB, under 1 s
+#   total     20-90 s, bound 1800 s. The term derivation cannot fix is the load (how much of the file is still cached); a run past 3
+#   minutes means a cold file or a contended host: read the dumper's per-prompt seconds before trusting the sets' timing, not their bytes.
+kind: exclusive
+reason: hy4_dump runs llama.cpp on 32 CPU threads over the real file; beside a timed run or a gate batch it would take their cores and
+  page cache, so it holds the lease; why now: refset-check is red on main because the real file's sets were never dumped (Hy4 landed
+  with the family registered and no card for this run)
+minutes: 0.3..3
