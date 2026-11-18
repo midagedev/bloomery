@@ -359,6 +359,15 @@ name, `deferred(real) no-card-room: <clause>` (`tier::room_clause`), in either t
 `gate-gpu-ds41-tp` does so for its rank groups on a card smaller than the A6000 (and for its one-rank load on a card smaller than an
 RTX 5090), and the nemotron_h_moe gates for their `whole` arm where the plan of the card in view keeps an expert on the host.
 
+The two-card gate binaries (`gate_glm5next_twocard`, `gate_musespark_prefill --two-card`, `gate_mistrallarge4_{twocard,xstream,residency}`,
+`gate_solar2_twocard`, `gate_qwen3moe_twocard`, `gate_minimaxm3_prefill --arm bp`, `gate_mimo2_e2e --two-card`) name no card either: plan (b′) is
+planned on the two largest cards in view and a load is held to the card its plan resolved (`tier::opened_on_rank`). Each arm asks the view for
+what it needs before any load, two cards in view (`tier::two_cards_lack`) and, for a reference that holds the stage's experts and the tier's on
+the stage card, that card's usable bytes for the plan's own union (`tier::union_lack_of`). A view without them ends as
+`deferred(real) no-card-room: <clause>` for every clause of the arm (`tier::defer_for_room`), in either tier, with rc 0. A recipe on a
+one-card machine is stopped earlier, at the `both` refusal and the batch's `two_card=` deferral; the bin's own check serves a direct run and a
+two-card machine that is not an A6000 and a 3090.
+
 ## 4. Fixtures and reference sets
 
 A fixture-tier gate reads two inputs: the family's fixture and the `fx_` reference sets. Three families have a fixture

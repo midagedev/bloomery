@@ -1,22 +1,27 @@
 //! GPU gate for Qwen3-30B (`Body`) and Qwen3.6 (`Body35`) on plan (b′)
-//! (`--place bp`): the stage on the A6000 and one expert tier on the 3090,
-//! against one card holding the same expert sets.
+//! (`--place bp`): the stage on the largest card in view and one expert tier
+//! on the next, against one card holding the same expert sets.
 //!
 //! Each arm is two loads of one plan (b′), one after the other. The reference
 //! is the plan with every tier segment joined onto the stage card and the
 //! tier card dropped ([`union_plan`]), opened by `GpuModel::open_placed`: the
-//! A6000 holds the union, and no tier code runs. The two-card load is the
+//! stage card holds the union, and no tier code runs. The two-card load is the
 //! same plan through the same open, which hangs the tier.
 //!
 //! Memory: both plans are made under one card budget. In the real tier that
 //! budget is [`BUDGET`] (`PlanLevers::card_budget_bytes`; `BLOOMERY_CARD_BUDGET`
 //! is not a lever here, so the environment cannot move the sets). It caps
 //! every card, the tier's too, so the reference holds at most 2 · `BUDGET` =
-//! 32 GiB of the A6000's 48 GiB [derived from the placement's rule, the same
-//! budget the solar-open2 two-card gate uses]. The budget is what puts
-//! experts on the tier: without a positive tier count the arm fails by name
-//! before either load. The fixture tier's budget is the file header's
-//! ([`tier::plan_levers`]).
+//! 32 GiB [derived from the placement's rule, the same budget the solar-open2
+//! two-card gate uses]. The budget is what puts experts on the tier: without a
+//! positive tier count the arm fails by name before either load. The fixture
+//! tier's budget is the file header's ([`tier::plan_levers`]).
+//!
+//! Cards: each arm asks the view for what it needs before any load, two cards
+//! in view and the stage card's usable bytes for the union
+//! ([`tier::union_lack_of`], the plan's own values); a view without them leaves
+//! the arm's clauses by name (`tier::defer_for_room`, `no-card-room`), in either
+//! tier.
 //!
 //! The prompt is the fixed walk of `e2e::walk` through the file's vocabulary.
 //! Each load, from a reset: the first [`PROMPT`] ids one decode step each,
@@ -83,12 +88,12 @@ mod gate {
     use bloomery_gpu_gates::{GateError, checks_failed};
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, Levers};
     use gguf::Split;
-    use model::placement::{Plan, PlanLevers, workstation};
+    use model::placement::{Plan, PlanLevers};
 
     use crate::e2e::walk;
     use crate::q3place::PlaceQ3;
     use crate::tier_twocard::{
-        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_3090,
+        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_card,
     };
     use model::placement::union_plan;
 
@@ -101,6 +106,11 @@ mod gate {
     const PROMPT: usize = 32;
     /// Greedy steps after the prompt.
     const STEPS: usize = 24;
+    /// The clauses of an arm: each is declared where it runs and left by name where the cards in view cannot run the arm.
+    const PRECONDITION_TIER: &str = "precondition tier: the plan puts experts on the tier";
+    const DECODE_BITS: &str = "decode bits: the step's tokens and logits";
+    const PRECONDITION_SENT: &str = "precondition sent: every tier layer was sent a routed slot";
+    const CLAUSES: [&str; 3] = [PRECONDITION_TIER, DECODE_BITS, PRECONDITION_SENT];
 
     /// The Qwen3-30B file and the Qwen3.6 file, in that order.
     fn paths() -> Result<(PathBuf, PathBuf), GateError> {
@@ -209,17 +219,11 @@ mod gate {
                     return Err("the joined reference holds a tier card".into());
                 }
             }
-            let device = model.gpu().device_name()?;
-            if !device.contains(workstation::A6000.name) {
-                return Err(format!(
-                    "the reference opened on {device}, not the {}: the union is planned for its bytes",
-                    workstation::A6000.name
-                )
-                .into());
-            }
+            tier::opened_on_rank("reference", model.gpu(), 0)?;
             println!(
-                "reference load in {:.1} s: {device} ({} B) holds the union, no tier",
+                "reference load in {:.1} s: {} ({} B) holds the union, no tier",
                 t0.elapsed().as_secs_f64(),
+                model.gpu().device_name()?,
                 model.resident_bytes(),
             );
             history(&mut model, prompt, counts)?.0
@@ -233,13 +237,13 @@ mod gate {
                     .body(NAME)?
                     .placed_side()
                     .ok_or("the two-card load holds no placed side")?;
-                tier_on_3090("load", t0, (&stage.0, stage.1), placed.hybrid())?;
+                tier_on_card("load", t0, (&stage.0, stage.1), placed.hybrid())?;
             }
             history(&mut model, prompt, counts)?
         };
-        tier::sc("decode bits: the step's tokens and logits")?;
+        tier::sc(DECODE_BITS)?;
         let mut pass = same("decode bits: step", &want, &got);
-        tier::sc("precondition sent: every tier layer was sent a routed slot")?;
+        tier::sc(PRECONDITION_SENT)?;
         pass &= sent_every("decode", sent.as_ref(), layers, false);
         Ok(pass)
     }
@@ -270,6 +274,10 @@ mod gate {
         if vocab <= 1_000 {
             return Err(format!("{NAME}: vocabulary {vocab} does not hold the walk's ids").into());
         }
+        if let Some(why) = tier::two_cards_lack()? {
+            tier::defer_for_room(&CLAUSES, &why)?;
+            return Ok(true);
+        }
         let place = place_of(&split)?;
         let place_levers = place_levers(&split, tier, levers)?;
         drop(split);
@@ -298,7 +306,11 @@ mod gate {
             plan.host.expert_bytes,
             layers.len(),
         );
-        tier::sc("precondition tier: the plan puts experts on the tier")?;
+        if let Some(why) = tier::union_lack_of(&plan) {
+            tier::defer_for_room(&CLAUSES, &why)?;
+            return Ok(true);
+        }
+        tier::sc(PRECONDITION_TIER)?;
         if experts == 0 {
             println!(
                 "FAIL precondition tier: the plan holds no expert on the tier: the run proves nothing"
@@ -418,7 +430,9 @@ mod gate {
         if !pass {
             return Err(checks_failed());
         }
-        println!("PASSED: {NAME}");
+        if tier::ran_any() {
+            println!("PASSED: {NAME}");
+        }
         Ok(())
     }
 }

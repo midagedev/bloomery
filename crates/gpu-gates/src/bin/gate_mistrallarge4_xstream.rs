@@ -6,11 +6,11 @@
 //! Two arms, each one placed load of its plan under a residency machine (`Body::open_placed_with`), which the lever's
 //! `admit` and `split` run on:
 //!
-//! - arm `a`, plan (a) (the A6000 alone, the host tier beside it) under a card budget the gate sets: the plan keeps the
+//! - arm `a`, plan (a) (the largest card in view alone, the host tier beside it) under a card budget the gate sets: the plan keeps the
 //!   stream's ring in its prompt reserve (`PlanInputs::with_stream`), and the card keeps, beside the ring, what the stage
 //!   holds without experts plus [`REAL_EXPERTS`] of them in the real tier or half the experts the card would hold in the
 //!   fixture tier, so every card layer leaves the residency its pinned, spare and moving experts (`residency_of`);
-//! - arm `bp`, plan (b′) (the stage on the A6000, an expert tier on the 3090) under the same budget of the stage card,
+//! - arm `bp`, plan (b′) (the stage on the largest card in view, an expert tier on the next) under the same budget of the stage card,
 //!   the plan keeping the stream's ring as arm `a`'s does: a tier layer's join sums the stage card's, the streamed and
 //!   the tier's slots by the stream's union places, so `split` streams there as on arm `a`.
 //!
@@ -49,6 +49,11 @@
 //!   the first's; the `split` run's ids agree with the `off` run's as `xstream_split_near_off` reads them; and `admit`,
 //!   the unset lever's mode there, opens a call over the same prompt that streams and joins nothing, its ids agreeing
 //!   with the `off` run's.
+//!
+//! Cards: each arm asks the view for what it needs before any load. Arm `a` needs room for the residency's machine, a
+//! pinned expert, a spare and a moving slot on the plan's smallest layer of card experts ([`residency_of`], the plan's own
+//! values); arm `bp` needs two cards in view besides. A view without them leaves the arm's clauses by name
+//! (`tier::defer_for_room`, `no-card-room`), in either tier, and loads nothing.
 //!
 //! The taps are not armed. FAIL-first (box): the one-patch mutants under the round's mutant folder name the clause each
 //! reddens.
@@ -96,6 +101,21 @@ mod gate {
 
     /// The recipe the model file is opened for.
     const RECIPE: &str = "gate-gpu-mistrallarge4-xstream";
+
+    /// The clauses of arm `a`, in order: each is declared where it runs and left by name where the card in view lacks
+    /// the room for the residency's machine.
+    const STARTED: &str = "xstream_started";
+    const SPLIT_STREAMS: &str = "xstream_split_streams";
+    const SPLIT_REPEATS: &str = "xstream_split_repeats";
+    const SPLIT_NEAR_OFF: &str = "xstream_split_near_off";
+    const ADMIT_OPENS_CALL: &str = "xstream_admit_opens_call";
+    const ARM_A_CLAUSES: [&str; 5] = [
+        STARTED,
+        SPLIT_STREAMS,
+        SPLIT_REPEATS,
+        SPLIT_NEAR_OFF,
+        ADMIT_OPENS_CALL,
+    ];
 
     /// The host tier's configuration both loads open with: the host set read in, which the residency machine's source
     /// stages its parts from, and no other lever read, so one left in the runner's environment cannot move a clause.
@@ -410,9 +430,9 @@ mod gate {
     }
 
     /// The residency over `plan`: half the smallest card layer's experts pinned (the seed is the plan's id prefix, not a
-    /// frequency list), one spare a layer. Refused by name: a plan whose smallest layer of card experts holds no pinned
-    /// expert beside the spare and the slot the machine swaps into.
-    fn residency_of(plan: &Plan<'_>) -> Result<Residency, GateError> {
+    /// frequency list), one spare a layer. `Err` names what the plan's card lacks: a plan whose smallest layer of card
+    /// experts holds no pinned expert beside the spare and the slot the machine swaps into is a card without the room.
+    fn residency_of(plan: &Plan<'_>) -> Result<Residency, String> {
         let slots = plan
             .n_l
             .iter()
@@ -420,14 +440,13 @@ mod gate {
             .filter(|&n| n > 0)
             .min()
             .ok_or("the plan puts no expert on the card")?;
-        let slots = usize::try_from(slots)?;
+        let slots = usize::try_from(slots).map_err(|e| e.to_string())?;
         let pinned = slots / 2;
         if pinned == 0 || slots < pinned + 2 {
             return Err(format!(
                 "the plan keeps {slots} card experts on its smallest layer: no residency machine of a pinned expert, a \
                  spare and its swap slot"
-            )
-            .into());
+            ));
         }
         println!("residency mid pinned={pinned} spares=1 over {slots} card experts (plan values)");
         Ok(Residency::Mid { pinned, spares: 1 })
@@ -464,23 +483,19 @@ mod gate {
         })
     }
 
-    /// Refused unless `m` runs on the A6000, the card the plans' stage is.
+    /// Refused unless `m` runs on the largest card in view, the card the plans' stage is.
     fn on_stage_card(what: &str, m: &Model) -> Result<(), GateError> {
-        let device = m.gpu().device_name()?;
-        if !device.contains(workstation::A6000.name) {
-            return Err(format!(
-                "the {what} opened on {device}, not the {}: the plan's stage card",
-                workstation::A6000.name
-            )
-            .into());
-        }
-        Ok(())
+        tier::opened_on_rank(what, m.gpu(), 0)
     }
 
-    /// The load of `plan` under its residency, set to the prompt group of the clauses, its walks' timing armed for the
-    /// left-out slots by layer-batch ([`left_rows`]; every run armed alike).
-    fn open(what: &str, plan: &Plan<'_>, inputs: &PlanInputs) -> Result<Model, GateError> {
-        let residency = residency_of(plan)?;
+    /// The load of `plan` under `residency` (which [`residency_of`] gave it), set to the prompt group of the clauses, its
+    /// walks' timing armed for the left-out slots by layer-batch ([`left_rows`]; every run armed alike).
+    fn open(
+        what: &str,
+        plan: &Plan<'_>,
+        inputs: &PlanInputs,
+        residency: Residency,
+    ) -> Result<Model, GateError> {
         let t0 = Instant::now();
         let mut m = Body::open_placed_with(
             open_split(Arch::MistralLarge4, RECIPE)?,
@@ -516,15 +531,16 @@ mod gate {
         let mut pass = arm_a(tier_now)?;
         // The split beside a tier card prices its union from a timing fit over the host experts'
         // columns, which the fixture's experts are too small to give: the real shapes answer it.
-        if tier::run_clause("xstream_split_beside_tier", Tag::Scale)? {
-            pass &= arm_bp(tier_now)?;
-        }
+        pass &= arm_bp(tier_now)?;
         println!("{NAME}: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }
+        if !tier::ran_any() {
+            return Ok(());
+        }
         println!(
-            "PASSED: {NAME} the stream starts under a residency machine, a split prompt call streams experts whose \
+            "PASSED: {NAME} (the arms the cards in view ran) the stream starts under a residency machine, a split prompt call streams experts whose \
              counts agree with the serve's left-out slots, repeats bit for bit and keeps the unstreamed run's ids (or \
              parts at a near tie), admit opens a call a prompt of the floor opens and none below it, and beside an \
              expert tier split streams on the tier's layers, joins them by the records' counts, repeats bit for bit \
@@ -544,6 +560,13 @@ mod gate {
         let machine = workstation::placed_on(spec, layers, workstation::SCRATCH);
         let levers = stage_budget(&inputs, &machine, ctx, tier_now)?;
         let plan = inputs.plan(&machine, ctx, &levers)?;
+        let residency = match residency_of(&plan) {
+            Ok(residency) => residency,
+            Err(why) => {
+                tier::defer_for_room(&ARM_A_CLAUSES, &why)?;
+                return Ok(true);
+            }
+        };
         println!(
             "arm a plan: card experts {} ({} B) host experts {} ({} B), prompt reserve {} B with the stream's ring \
              (plan values)",
@@ -553,11 +576,11 @@ mod gate {
             plan.host.expert_bytes,
             inputs.prompt_reserve,
         );
-        let mut m = open("arm a", &plan, &inputs)?;
+        let mut m = open("arm a", &plan, &inputs, residency)?;
         let ids = walk(STREAM_P, inputs.hp.n_vocab);
         let mut pass = true;
 
-        tier::sc("xstream_started")?;
+        tier::sc(STARTED)?;
         let started = {
             let (gpu, _, body) = m.body_parts(NAME)?;
             match body.set_xstream(gpu, XMode::Split) {
@@ -587,7 +610,7 @@ mod gate {
         let off = run_once(&mut m, &ids, XMode::Off)?;
         let a = run_once(&mut m, &ids, XMode::Split)?;
 
-        tier::sc("xstream_split_streams")?;
+        tier::sc(SPLIT_STREAMS)?;
         let streamed: usize = a.xlayers.iter().map(|(_, x)| x.streamed).sum();
         let columns: u64 = a.xlayers.iter().map(|(_, x)| x.streamed_columns).sum();
         let half = a.xend.map_or(0, |e| e.half_slots);
@@ -630,7 +653,7 @@ mod gate {
         bad_records("xstream_split_streams", &lo);
         pass &= records_ok && count_ok;
 
-        tier::sc("xstream_split_repeats")?;
+        tier::sc(SPLIT_REPEATS)?;
         let b = run_once(&mut m, &ids, XMode::Split)?;
         let same_bits = a.logits.len() == b.logits.len()
             && a.logits
@@ -644,7 +667,7 @@ mod gate {
         );
         pass &= repro_ok;
 
-        tier::sc("xstream_split_near_off")?;
+        tier::sc(SPLIT_NEAR_OFF)?;
         let (dlogit, parted, ids_ok) = agree(&a, &off);
         println!(
             "xstream_split_near_off: the prompt's logits max|diff| against off {dlogit} (printed, not judged), {} \
@@ -660,7 +683,7 @@ mod gate {
         );
         pass &= ids_ok;
 
-        tier::sc("xstream_admit_opens_call")?;
+        tier::sc(ADMIT_OPENS_CALL)?;
         let admit = run_once(&mut m, &ids, XMode::Admit)?;
         let short: Vec<u32> = ids[..STREAM_FLOOR as usize - 1].to_vec();
         let none = run_once(&mut m, &short, XMode::Admit)?;
@@ -689,9 +712,19 @@ mod gate {
         Ok(pass)
     }
 
-    /// Arm `bp` (module doc): `xstream_split_beside_tier`.
+    /// Arm `bp` (module doc): `xstream_split_beside_tier`. The clause is a scale clause, so the fixture tier leaves it before
+    /// any plan is made; the real tier leaves it by name where the cards in view lack two cards or the stage card's room
+    /// for the residency's machine.
     fn arm_bp(tier_now: Tier) -> Result<bool, GateError> {
         const CLAUSE: &str = "xstream_split_beside_tier";
+        if !tier_now.runs(Tag::Scale) {
+            tier::run_clause(CLAUSE, Tag::Scale)?;
+            return Ok(true);
+        }
+        if let Some(why) = tier::two_cards_lack()? {
+            tier::defer_for_room(&[CLAUSE], &why)?;
+            return Ok(true);
+        }
         let split = open_split(Arch::MistralLarge4, RECIPE)?;
         let inputs = PlanInputs::describe(&split)?.with_stream()?;
         let layers = inputs.hp.n_layer;
@@ -707,6 +740,14 @@ mod gate {
         };
         let levers = stage_budget(&inputs, &flat, ctx, tier_now)?;
         let plan = inputs.plan(&two, ctx, &levers)?;
+        let residency = match residency_of(&plan) {
+            Ok(residency) => residency,
+            Err(why) => {
+                tier::defer_for_room(&[CLAUSE], &why)?;
+                return Ok(true);
+            }
+        };
+        tier::run_clause(CLAUSE, Tag::Scale)?;
         if plan.host.experts == 0 {
             return Err(format!(
                 "{CLAUSE}: the arm's plan leaves no expert on the host, so a split has nothing to stream"
@@ -729,7 +770,7 @@ mod gate {
             plan.host.experts,
             inputs.prompt_reserve,
         );
-        let mut m = open("arm bp", &plan, &inputs)?;
+        let mut m = open("arm bp", &plan, &inputs, residency)?;
         let ids = walk(STREAM_P, inputs.hp.n_vocab);
 
         let started = {

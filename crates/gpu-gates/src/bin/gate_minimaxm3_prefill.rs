@@ -34,11 +34,11 @@
 //! host — `prefill_near_steps` holds the two to the family's band. Then `prefill_stream_streamed`: a prompt of
 //! [`STREAM_P`] ids streamed an expert on some layer (its stream records), or the arm proved nothing and fails by name.
 //!
-//! The two-card arm (`--arm bp`, `just gate-gpu-minimaxm3-twocard` under `BLOOMERY_CARD=both`): plan (b′) (the A6000 the
-//! stage card, the 3090 an expert tier holding each layer's next ids after the stage's prefix, the host the rest), planned
+//! The two-card arm (`--arm bp`, `just gate-gpu-minimaxm3-twocard` under `BLOOMERY_CARD=both`): plan (b′) (the largest card
+//! in view the stage card, the next an expert tier holding each layer's next ids after the stage's prefix, the host the rest), planned
 //! under one card budget no environment moves (`seat::TWO_BUDGET`), in the real tier only. Before the common clauses it holds, against the reference — the plan with every tier segment on the stage card
-//! (`model::placement::union_plan`), the A6000 alone, opened first and released:
-//! - `two_card_load`: the plan puts experts on the tier, and the load's tier opened on the 3090 beside the stage card with
+//! (`model::placement::union_plan`), the stage card alone, opened first and released:
+//! - `two_card_load`: the plan puts experts on the tier, and the load's tier opened on the second card beside the stage card with
 //!   the plan's experts on each layer;
 //! - `two_card_first_tokens_are_union`: [`TWO_WALK`] decode steps of the walk read the reference's ids and logits rows bit
 //!   for bit — the routed block joins the tier's slots in the slot order the union's card sum runs (the same join the
@@ -47,6 +47,11 @@
 //! - `two_card_eager_is_replay`: the walk eager and as the captured graph's replays reads the same ids and logits bits.
 //!
 //! The common clauses then run on the two-card load, and the tier must have served their batches (`two_card_batch_sent`).
+//!
+//! Cards: the arm asks the view for what it needs before any load, two cards in view and the stage card's usable bytes for
+//! the union the reference holds (`tier::union_lack_of`, the plan's own values). A view without them leaves every clause of
+//! the arm, the common ones on the two-card load included, by name (`tier::defer_for_room`, `no-card-room`), and loads
+//! nothing.
 
 #[cfg(feature = "minimaxm3")]
 fn main() -> std::process::ExitCode {
@@ -107,7 +112,7 @@ mod gate {
     use crate::prefill_clauses::Case;
     use crate::seat;
     use crate::tier_twocard::{
-        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_3090,
+        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_card,
     };
     use bloomery_gpu::Gpu;
     use bloomery_gpu::arch::hybrid::Site;
@@ -147,6 +152,19 @@ mod gate {
     /// routing must reach every tier layer (`two_card_first_tokens_are_union` fails by name where it does not). The real
     /// file's tier holds few experts on some layers, so the walk is long enough to route a slot to each.
     const TWO_WALK: usize = 96;
+
+    /// The two-card arm's own clauses, each declared where it runs and left by name, with the common ones the arm runs on the
+    /// two-card load, where the cards in view lack what the arm needs.
+    const TWO_CARD_LOAD: &str = "two_card_load";
+    const TWO_CARD_FIRST: &str = "two_card_first_tokens_are_union";
+    const TWO_CARD_EAGER: &str = "two_card_eager_is_replay";
+    const TWO_CARD_BATCH: &str = "two_card_batch_sent";
+    const TWO_CARD_OWN: [&str; 4] = [
+        TWO_CARD_LOAD,
+        TWO_CARD_FIRST,
+        TWO_CARD_EAGER,
+        TWO_CARD_BATCH,
+    ];
 
     /// The synthetic batch's widths: the model width, and the output projection's (the query heads of [`HEAD`] values).
     /// Both are whole blocks of the q8_1 form's 128 values and of the q8 form's 64-value step.
@@ -249,8 +267,8 @@ mod gate {
         let m = two.loaded.model_mut();
         let mut pass = true;
 
-        tier::sc("two_card_load")?;
-        tier_on_3090(
+        tier::sc(TWO_CARD_LOAD)?;
+        tier_on_card(
             "arm bp load",
             two.opened,
             (&m.gpu().device_name()?, m.resident_bytes()),
@@ -279,7 +297,7 @@ mod gate {
         }
         pass &= load_ok;
 
-        tier::sc("two_card_first_tokens_are_union")?;
+        tier::sc(TWO_CARD_FIRST)?;
         m.set_mode(StepMode::Graph);
         let before = counts(m)?;
         let replay = feed(m, &two.walk)?;
@@ -289,7 +307,7 @@ mod gate {
             logits: two.reference.1.clone(),
             kept: Vec::new(),
         };
-        pass &= same("two_card_first_tokens_are_union", &want, &replay);
+        pass &= same(TWO_CARD_FIRST, &want, &replay);
         pass &= sent_every(
             "two_card_first_tokens_are_union walk",
             sent.as_ref(),
@@ -297,10 +315,10 @@ mod gate {
             false,
         );
 
-        tier::sc("two_card_eager_is_replay")?;
+        tier::sc(TWO_CARD_EAGER)?;
         m.set_mode(StepMode::Eager);
         let eager = feed(m, &two.walk)?;
-        pass &= same("two_card_eager_is_replay", &eager, &replay);
+        pass &= same(TWO_CARD_EAGER, &eager, &replay);
         m.set_mode(StepMode::Graph);
         m.capture_step()?;
         m.reset()?;
@@ -495,7 +513,24 @@ mod gate {
     ) -> Result<(), GateError> {
         // The walk's positions too: the reference and the two-card load hold the same cache rows.
         let ctx = ctx.max(TWO_WALK + 1);
-        let mut two = seat::two_card(path, (ctx, tier_now), (TWO_WALK, crate::e2e::walk))?;
+        let mut two = match seat::two_card(path, (ctx, tier_now), (TWO_WALK, crate::e2e::walk))? {
+            Ok(two) => two,
+            Err(why) => {
+                // The common clauses run on the two-card load too, so they are left with it.
+                let names: Vec<&str> = TWO_CARD_OWN
+                    .iter()
+                    .copied()
+                    .chain(
+                        crate::prefill_clauses::CLAUSES
+                            .iter()
+                            .map(|&(name, _, _)| name),
+                    )
+                    .collect();
+                tier::defer_for_room(&names, &why)?;
+                println!("{}", tier::tally_line());
+                return Ok(());
+            }
+        };
         let (pass, layers) = two_card_clauses(&mut two)?;
         let mut loaded = two.loaded;
         let dims = loaded.dims();
@@ -508,9 +543,9 @@ mod gate {
         );
         let before = counts(loaded.model())?;
         let common = crate::prefill_clauses::run(NAME, &case(dims, tier_now), &mut loaded);
-        tier::sc("two_card_batch_sent")?;
+        tier::sc(TWO_CARD_BATCH)?;
         let sent = sent_between(before, counts(loaded.model())?);
-        let batch = sent_every("two_card_batch_sent", sent.as_ref(), &layers, true);
+        let batch = sent_every(TWO_CARD_BATCH, sent.as_ref(), &layers, true);
         common?;
         if !(pass && batch) {
             println!("arm bp FAIL");

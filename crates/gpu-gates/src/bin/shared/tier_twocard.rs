@@ -11,7 +11,6 @@ use bloomery_gpu::host::batch::TierBatchStats;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::hybrid::Hybrid;
 use bloomery_gpu_gates::GateError;
-use model::placement::workstation;
 
 /// Every token, kept count and logits row a leg read, in order.
 #[derive(Default)]
@@ -75,10 +74,10 @@ pub fn plus(a: Option<Sent>, b: Option<Sent>) -> Option<Sent> {
     })
 }
 
-/// Refused unless `hybrid`'s tier `Gpu` is the 3090; prints the load line,
-/// `what` its name, `t0` the load's start and `stage` the stage card's name
-/// and resident bytes.
-pub fn tier_on_3090(
+/// Refused unless `hybrid`'s tier `Gpu` is the expert tier card of plan (b′), the second card in
+/// view by usable bytes ([`bloomery_gpu_gates::tier::opened_on_rank`]); prints the load line,
+/// `what` its name, `t0` the load's start and `stage` the stage card's name and resident bytes.
+pub fn tier_on_card(
     what: &str,
     t0: Instant,
     stage: (&str, usize),
@@ -88,20 +87,15 @@ pub fn tier_on_3090(
         .tiers()
         .first()
         .ok_or("the (b′) load holds no tier card")?;
-    let tier_device = tier.gpu()?.device_name()?;
-    if !tier_device.contains(workstation::RTX_3090.name) {
-        return Err(format!(
-            "the tier opened on {tier_device}, not the {}",
-            workstation::RTX_3090.name
-        )
-        .into());
-    }
+    let tier_gpu = tier.gpu()?;
+    bloomery_gpu_gates::tier::opened_on_rank("tier", tier_gpu, 1)?;
     println!(
-        "{what} in {:.1} s: stage {} ({} B), tier {} experts on {tier_device} ({} B)",
+        "{what} in {:.1} s: stage {} ({} B), tier {} experts on {} ({} B)",
         t0.elapsed().as_secs_f64(),
         stage.0,
         stage.1,
         tier.set().experts(),
+        tier_gpu.device_name()?,
         tier.resident_bytes(),
     );
     Ok(())

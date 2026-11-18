@@ -74,16 +74,16 @@
 //! `mid` arm's placement, and a call's stream moves the placement the next call starts from).
 //!
 //! The two-card arm (`--two-card`, `just gate-gpu-musespark-twocard` under `BLOOMERY_CARD=both`, the only arm it runs):
-//! plan (b′) (`--place bp`: the A6000 the stage card, the 3090 an expert tier holding each layer's next ids after the
+//! plan (b′) (`--place bp`: the largest card in view the stage card, the next an expert tier holding each layer's next ids after the
 //! stage's prefix, the host the rest), planned under one card budget no environment moves ([`TWO_BUDGET`] in the real
 //! tier; in the fixture tier the `mid` budget, which leaves the tier the other half of the experts). Before the common
 //! clauses it holds:
-//! - `two_card_load`: the plan puts experts on the tier, and the load's tier opened on the 3090 beside the stage card;
+//! - `two_card_load`: the plan puts experts on the tier, and the load's tier opened on the second card beside the stage card;
 //! - `two_card_eager_is_replay`: [`TWO_WALK`] steps of the walk, eager and as the captured graph's replays, read the same
 //!   ids and logits bits, every logit finite, and the walk sent every tier layer a routed slot (or the run proves nothing
 //!   there and fails by name);
 //! - `two_card_first_token_near_union`: the first token's layers against the reference — the plan with every tier
-//!   segment on the stage card ([`model::placement::union_plan`]), the A6000 alone, opened first and released — each layer
+//!   segment on the stage card ([`model::placement::union_plan`]), the stage card alone, opened first and released — each layer
 //!   teacher-forced: the step runs that layer alone (`GpuModel::set_layer_span`) on the reference's `l_out` of the layer
 //!   before it (`GpuModel::set_input_override`; layer 0 reads the embedding), keeps the reference's picks and keeps
 //!   `ffn_moe_out` and `l_out` within [`TWO_STEP_BAND`]; the token sent the tier a slot on one of the tier's layers. The
@@ -98,6 +98,11 @@
 //!   apart from the batch-against-steps band the common clauses read.
 //!
 //! The common clauses then run on the two-card load, and the tier must have served their batches (`two_card_batch_sent`).
+//!
+//! Cards: the arm asks the view for what it needs before any load, two cards in view and the stage card's usable bytes for
+//! the union the reference holds ([`tier::union_lack_of`], the plan's own values). A view without them leaves every clause
+//! of the arm, the common ones on the two-card load included, by name (`tier::defer_for_room`, `no-card-room`), in either
+//! tier, and loads nothing.
 //!
 //! `--diag` runs no clause: on the whole-card load it prints, per layer, the batch's last-row output against the steps'
 //! with both paths' routed ids (lengths 1, 7, 2,047), and the load's passes against passes of one row (7, 600, 2,600):
@@ -155,7 +160,7 @@ mod gate {
     use crate::gate_card;
     use crate::lcpp_e2e::{self, Dims, Seat, fnv1a};
     use crate::prefill_clauses::{self, Case};
-    use crate::tier_twocard::{Sent, sent_between, sent_every, tier_counts, tier_on_3090};
+    use crate::tier_twocard::{Sent, sent_between, sent_every, tier_counts, tier_on_card};
     use app::Prompt;
     use bloomery_gpu::arch::musespark::{Body, LayerNodes, LayerRoute};
     use bloomery_gpu::host::served::TierBody;
@@ -229,9 +234,24 @@ mod gate {
 
     /// The two-card arm's routed expert bytes on the stage card in the real tier: the stage card's budget is what it
     /// holds without experts plus these, and the tier's experts are capped by the same budget, so the reference's union
-    /// is at most twice the budget, under the A6000's usable bytes [derived from the placement's rule; the arm prints both
-    /// and refuses a union past the card by name].
+    /// is at most twice the budget [derived from the placement's rule; the arm prints it beside the stage card's usable
+    /// bytes and leaves its clauses by name where the card has less].
     const TWO_STAGE_EXPERTS: u64 = 2 << 30;
+
+    /// The two-card arm's own clauses, each declared where it runs and left by name, with the body's and the common ones
+    /// the arm runs on the two-card load, where the cards in view lack what the arm needs.
+    const TWO_CARD_LOAD: &str = "two_card_load";
+    const TWO_CARD_EAGER: &str = "two_card_eager_is_replay";
+    const TWO_CARD_FIRST: &str = "two_card_first_token_near_union";
+    const TWO_CARD_PROMPT: &str = "two_card_prompt_near_union";
+    const TWO_CARD_BATCH: &str = "two_card_batch_sent";
+    const TWO_CARD_OWN: [&str; 5] = [
+        TWO_CARD_LOAD,
+        TWO_CARD_EAGER,
+        TWO_CARD_FIRST,
+        TWO_CARD_PROMPT,
+        TWO_CARD_BATCH,
+    ];
 
     /// Steps of the walk the two-card arm runs eager and as replays.
     const TWO_WALK: usize = 16;
@@ -291,7 +311,7 @@ mod gate {
         Mid,
         /// The gate plan's placed load.
         Plan,
-        /// Plan (b′) on the A6000 and the 3090 (module doc), run alone by `--two-card`.
+        /// Plan (b′) on the two largest cards in view (module doc), run alone by `--two-card`.
         Two,
         /// The `mid` budget under the residency machine with the prompt calls' expert stream on (module doc).
         Stream,
@@ -521,14 +541,21 @@ mod gate {
         }
     }
 
+    /// What the two-card arm leaves: the load, whether its own clauses held and the tier's layers.
+    type TwoLoad = (Model, bool, Vec<usize>);
+
     /// The two-card arm's load (module doc): the reference's first token and prompt read and the reference released, then plan
     /// (b′) opened and its own clauses run; the load is left as [`open`] leaves one, the taps armed and the step
-    /// captured. `Ok((m, pass, tier layers))`.
+    /// captured. `Ok(Ok((m, pass, tier layers)))`; `Ok(Err(why))` where the cards in view lack two cards or the stage card's
+    /// room for the union, before anything loads.
     fn two_card(
         hp: &Hparams,
         ctx: usize,
         tier_now: Tier,
-    ) -> Result<(Model, bool, Vec<usize>), GateError> {
+    ) -> Result<Result<TwoLoad, String>, GateError> {
+        if let Some(why) = tier::two_cards_lack()? {
+            return Ok(Err(why));
+        }
         let inputs = PlanInputs::read(&open_split(Arch::MuseSpark, RECIPE)?)?;
         let mut two = lcpp_e2e::Arm::Bp.machine(hp.n_layer, place::tier_batch(hp)?)?;
         place::stage_placed(&mut two)?;
@@ -550,12 +577,11 @@ mod gate {
             .collect();
         let tier_bytes = plan.cards.get(1).map_or(0, |c| c.expert_bytes);
         let stage = &plan.cards[0];
-        let stage_bytes = stage.dense_bytes + stage.expert_bytes + stage.kv_bytes;
-        let usable = workstation::A6000.usable_bytes();
+        let card = &plan.machine.cards[0];
         println!(
             "arm two plan (b′) under a card budget of {} at ctx {ctx}: stage {} experts ({} B), tier {} experts \
-             ({tier_bytes} B) on {} layers, host {} experts ({} B); the reference's union {} B of the A6000's {usable} \
-             (plan values)",
+             ({tier_bytes} B) on {} layers, host {} experts ({} B); the reference's union {} B of the stage card {}'s {} \
+             usable (plan values)",
             model::placement::card_budget::in_bytes(&levers.card_budget_bytes),
             stage.experts,
             stage.expert_bytes,
@@ -563,31 +589,22 @@ mod gate {
             tier_layers.len(),
             plan.host.experts,
             plan.host.expert_bytes,
-            stage_bytes + tier_bytes,
+            tier::union_bytes(&plan),
+            card.name,
+            card.usable_bytes,
         );
-        if stage_bytes + tier_bytes > usable {
-            return Err(format!(
-                "the reference's union of {} B passes the A6000's {usable} B: lower the stage's share",
-                stage_bytes + tier_bytes
-            )
-            .into());
+        if let Some(why) = tier::union_lack_of(&plan) {
+            return Ok(Err(why));
         }
         let walk = walk(TWO_WALK, hp.n_vocab);
         let tok = *walk.first().ok_or("the walk is empty")?;
 
-        // The reference: the union on the A6000 alone, its first token, its steps over the prompt and each layer of the
+        // The reference: the union on the stage card alone, its first token, its steps over the prompt and each layer of the
         // prompt alone on them read, then released.
         let uplan = union_plan(&plan, &flat)?;
         let (want, rows_in, want_prompt) = {
             let mut r = Model::open_placed(open_split(Arch::MuseSpark, RECIPE)?, &uplan, 0, HOST)?;
-            let device = r.gpu().device_name()?;
-            if !device.contains(workstation::A6000.name) {
-                return Err(format!(
-                    "the reference opened on {device}, not the {}: the union is planned for its bytes",
-                    workstation::A6000.name
-                )
-                .into());
-            }
+            tier::opened_on_rank("reference", r.gpu(), 0)?;
             let want = first_nodes(&mut r, tok)?;
             let rows_in = ForcedRows::read(&mut r, hp)?;
             let want_prompt = rows_in.outs(&mut r, (hp.n_layer, hp.n_embd))?;
@@ -598,12 +615,12 @@ mod gate {
         let mut m = Model::open_placed(open_split(Arch::MuseSpark, RECIPE)?, &plan, 0, HOST)?;
         let mut pass = true;
 
-        tier::sc("two_card_load")?;
+        tier::sc(TWO_CARD_LOAD)?;
         let placed = m
             .body(NAME)?
             .placed()
             .ok_or("the two-card load is not a placed load")?;
-        tier_on_3090(
+        tier_on_card(
             "arm two load",
             t0,
             (&m.gpu().device_name()?, m.resident_bytes()),
@@ -627,7 +644,7 @@ mod gate {
         }
         pass &= load_ok;
 
-        tier::sc("two_card_eager_is_replay")?;
+        tier::sc(TWO_CARD_EAGER)?;
         m.set_taps(true)?;
         m.set_mode(StepMode::Eager);
         m.reset()?;
@@ -655,10 +672,10 @@ mod gate {
             false,
         );
 
-        tier::sc("two_card_first_token_near_union")?;
+        tier::sc(TWO_CARD_FIRST)?;
         pass &= near_union(&want, &got, sent_first.as_ref(), &tier_layers);
 
-        tier::sc("two_card_prompt_near_union")?;
+        tier::sc(TWO_CARD_PROMPT)?;
         let before = counts(&m)?;
         // The taps the capture holds are the ones a pass writes: no re-arming under the capture.
         let got_prompt = rows_in.outs(&mut m, (hp.n_layer, hp.n_embd))?;
@@ -669,7 +686,7 @@ mod gate {
             sent_prompt.as_ref(),
             &tier_layers,
         );
-        Ok((m, pass, tier_layers))
+        Ok(Ok((m, pass, tier_layers)))
     }
 
     /// The first token's layers of the two-card load `got`, each run alone on the reference's input, against the
@@ -681,7 +698,7 @@ mod gate {
         sent: Option<&Sent>,
         tier_layers: &[usize],
     ) -> bool {
-        const CLAUSE: &str = "two_card_first_token_near_union";
+        const CLAUSE: &str = TWO_CARD_FIRST;
         if want.len() != got.len() {
             println!(
                 "{CLAUSE}: {} layers read, the reference {} FAIL",
@@ -741,7 +758,7 @@ mod gate {
         sent: Option<&Sent>,
         tier_layers: &[usize],
     ) -> bool {
-        const CLAUSE: &str = "two_card_prompt_near_union";
+        const CLAUSE: &str = TWO_CARD_PROMPT;
         if want.len() != got.len() {
             println!(
                 "{CLAUSE}: {} layers read, the reference {} FAIL",
@@ -1462,10 +1479,20 @@ mod gate {
         for &arm in arms {
             let t = std::time::Instant::now();
             let (m, two_pass) = match arm {
-                Arm::Two => {
-                    let (m, pass, layers) = two_card(&hp, ctx, tier_now)?;
-                    (m, Some((pass, layers)))
-                }
+                Arm::Two => match two_card(&hp, ctx, tier_now)? {
+                    Ok((m, pass, layers)) => (m, Some((pass, layers))),
+                    Err(why) => {
+                        // The body's and the common clauses run on the two-card load too, so they are left with it.
+                        let names: Vec<&str> = TWO_CARD_OWN
+                            .iter()
+                            .copied()
+                            .chain(OWN.iter().map(|&(name, _)| name))
+                            .chain(prefill_clauses::CLAUSES.iter().map(|&(name, _, _)| name))
+                            .collect();
+                        tier::defer_for_room(&names, &why)?;
+                        continue;
+                    }
+                },
                 Arm::Whole | Arm::Mid | Arm::Plan | Arm::Stream => (open(arm, &hp, ctx)?, None),
             };
             let rows = m.pass_rows()?;
@@ -1538,9 +1565,9 @@ mod gate {
                 failed.get_or_insert(common.err().unwrap_or_else(checks_failed));
             }
             if let Some((pass, layers)) = two_pass {
-                tier::sc("two_card_batch_sent")?;
+                tier::sc(TWO_CARD_BATCH)?;
                 let sent = sent_between(before, counts(&seat.m)?);
-                let batch = sent_every("two_card_batch_sent", sent.as_ref(), &layers, true);
+                let batch = sent_every(TWO_CARD_BATCH, sent.as_ref(), &layers, true);
                 if !(pass && batch) {
                     println!("arm two FAIL");
                     failed.get_or_insert_with(|| "the two-card arm's clauses failed".into());

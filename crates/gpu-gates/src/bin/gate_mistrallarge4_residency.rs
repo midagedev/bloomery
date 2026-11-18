@@ -6,12 +6,18 @@
 //! Three placed loads in turn, each under the plan the real tier serves (no card budget; the fixture tier's stage keeps
 //! half its routed expert bytes), the plans priced for the prompt group the loads run at (`place::configure_group`, [`GROUP`]):
 //!
-//! - arm `a` (plan (a), the A6000 alone): a load under `off`, then a load under the word the unset rule resolves
+//! - arm `a` (plan (a), the largest card in view alone): a load under `off`, then a load under the word the unset rule resolves
 //!   (`residency::at_plan` over the plan: the serving word `mid-p0-s1` where the plan has room);
-//! - arm `bp` (plan (b′), the A6000 the stage, the 3090 an expert tier): a load under the same rule's word on its plan. The
-//!   rule is `off` (`no_host_experts`) where the plan holds no routed expert on the host, and the fixture's plan (b′) is such
-//!   a plan: its 3090 holds every expert the stage does not, so there the arm runs the `off` load beside the tier card and
-//!   the real tier's plan, which leaves the host its experts, runs the `mid` one.
+//! - arm `bp` (plan (b′), the largest card in view the stage, the next an expert tier): a load under the same rule's word on
+//!   its plan. The rule is `off` (`no_host_experts`) where the plan holds no routed expert on the host, and the fixture's
+//!   plan (b′) is such a plan: its tier card holds every expert the stage does not, so there the arm runs the `off` load
+//!   beside the tier card and the real tier's plan, which leaves the host its experts, runs the `mid` one.
+//!
+//! Cards: the gate asks the view for what each arm needs before any load. The residency's machine needs room on the stage
+//! card for a pinned expert, a spare and a moving slot beside the plan's card experts ([`card_lack`], the unset rule's own
+//! answer, `no_card_experts` or `no_room`), and arm `bp` needs two cards in view besides. A view without them leaves the
+//! arm's clauses by name (`tier::defer_for_room`, `no-card-room`), in either tier: arm `a`'s lack leaves every clause, since
+//! arm `bp` agrees with arm `a`'s `off` history; arm `bp`'s leaves its own, which carry ` (arm bp)`.
 //!
 //! A history is: the session cleared (the residency back to its seed), a prompt of [`HIST_P`] ids (the first ids of
 //! `$BLOOMERY_DATA/mistrallarge4/corpus-prose.ids` in the real tier, the fixed walk of `e2e::walk` in the fixture tier)
@@ -121,6 +127,28 @@ mod gate {
 
     /// The directory under `$BLOOMERY_DATA` of the family's prose ids, tokenized by the family's mainline tokenizer.
     const CORPUS_DIR: &str = "mistrallarge4";
+
+    /// The clauses of arm `a`, in the order they are declared, and of arm `bp` as a left arm names them: each is left by
+    /// name where the cards in view lack what the arm needs.
+    const UNSET_SERVES: &str = "residency_unset_serves";
+    const ARM_A_CLAUSES: [&str; 8] = [
+        UNSET_SERVES,
+        "residency_started",
+        "residency_passes",
+        "residency_near_off",
+        "residency_hit_record",
+        "residency_c1",
+        "residency_c7",
+        "residency_hit_depth",
+    ];
+    const ARM_BP_CLAUSES: [&str; 6] = [
+        "residency_unset_serves (arm bp)",
+        "residency_near_off (arm bp)",
+        "residency_passes (arm bp)",
+        "residency_hit_record (arm bp)",
+        "residency_hit_depth (arm bp)",
+        "residency_tier_stays (arm bp)",
+    ];
 
     /// The history's prompt: the depth 6 of the decode headline.
     const HIST_P: usize = 6;
@@ -307,17 +335,9 @@ mod gate {
         })
     }
 
-    /// Refused unless `m` runs on the A6000, the card the plans' stage is.
+    /// Refused unless `m` runs on the largest card in view, the card the plans' stage is.
     fn on_stage_card(what: &str, m: &Model) -> Result<(), GateError> {
-        let device = m.gpu().device_name()?;
-        if !device.contains(workstation::A6000.name) {
-            return Err(format!(
-                "the {what} opened on {device}, not the {}: the plan's stage card",
-                workstation::A6000.name
-            )
-            .into());
-        }
-        Ok(())
+        tier::opened_on_rank(what, m.gpu(), 0)
     }
 
     /// The load of `plan` under `lever`, set to the prompt group of the clauses.
@@ -360,6 +380,41 @@ mod gate {
         held as f64 / (layers.len() as f64 * n_expert)
     }
 
+    /// The unset word of `plan` as the seat's own two calls resolve it (`residency_unset`, `residency::at_plan`): at a
+    /// serving placement or a fixed one, with or without the step feed.
+    fn unset_rule(
+        plan: &Plan<'_>,
+        serving_place: bool,
+        prefill_steps: bool,
+    ) -> Result<bloomery_levers::ResidencyPick, GateError> {
+        let carry = <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL;
+        let at = ResidencyAt {
+            serving_place,
+            check_finite: false,
+            route_trace: false,
+            prefill_steps,
+        };
+        residency::at_plan(carry, plan, 0, residency_unset(at))
+    }
+
+    /// What the stage card lacks for the residency's machine on `plan`, the unset rule's own answer: no card expert, or the
+    /// plan's fewest card experts a layer leave no room for the word's pinned experts and its spares.
+    fn card_lack(plan: &Plan<'_>) -> Result<Option<String>, GateError> {
+        let serving = unset_rule(plan, true, false)?;
+        Ok(matches!(
+            serving.why,
+            ResidencyWhy::NoCardExperts | ResidencyWhy::NoRoom { .. }
+        )
+        .then(|| {
+            format!(
+                "the unset rule gives the plan's stage card {} ({}): it holds too few experts a layer for the residency's \
+                 machine",
+                serving.word,
+                serving.why.name()
+            )
+        }))
+    }
+
     /// `residency_unset_serves` on `plan`: the unset word at a serving placement, at a fixed placement and beside the step feed,
     /// each as the seat's own two calls resolve it (`residency_unset`, `residency::at_plan`). The serving word is the plan's:
     /// a `mid` word where it holds routed experts on the host, `off` with `no_host_experts` where it holds none, which the
@@ -369,14 +424,7 @@ mod gate {
         plan: &Plan<'_>,
         tier_now: Tier,
     ) -> Result<(Residency, bool), GateError> {
-        let carry = <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL;
-        let at = |serving_place, prefill_steps| ResidencyAt {
-            serving_place,
-            check_finite: false,
-            route_trace: false,
-            prefill_steps,
-        };
-        let serving = residency::at_plan(carry, plan, 0, residency_unset(at(true, false)))?;
+        let serving = unset_rule(plan, true, false)?;
         record::residency_lever(serving).print();
         if let Some(d) = serving.why.detail() {
             println!("{d}");
@@ -402,8 +450,8 @@ mod gate {
             } else {
                 matches!(word, Residency::Off) && serving.why == ResidencyWhy::NoHostExperts
             };
-        let fixed = residency::at_plan(carry, plan, 0, residency_unset(at(false, false)))?;
-        let steps = residency::at_plan(carry, plan, 0, residency_unset(at(true, true)))?;
+        let fixed = unset_rule(plan, false, false)?;
+        let steps = unset_rule(plan, true, true)?;
         let off = (fixed.word, fixed.why) == ("off", ResidencyWhy::FixedPlace)
             && (steps.word, steps.why) == ("off", ResidencyWhy::PrefillSteps);
         println!(
@@ -516,16 +564,35 @@ mod gate {
             ctx,
             &plan_levers(tier_now, &inputs, &machine_a, ctx)?,
         )?;
-        let bp = Place::Bp
-            .on_host()?
-            .machine(None, Some(place::tier_batch(&inputs)?))?;
-        let two = bp(layers);
-        let flat = Machine {
-            tiers: Vec::new(),
-            ..two.clone()
+        // Arm `bp` plans on the two largest cards in view, which a view of one card does not have.
+        let two = match tier::two_cards_lack()? {
+            Some(why) => Err(why),
+            None => {
+                let bp = Place::Bp
+                    .on_host()?
+                    .machine(None, Some(place::tier_batch(&inputs)?))?;
+                Ok(bp(layers))
+            }
         };
-        let plan_bp = inputs.plan(&two, ctx, &plan_levers(tier_now, &inputs, &flat, ctx)?)?;
-        for (what, plan) in [("arm a", &plan_a), ("arm bp", &plan_bp)] {
+        let plan_bp = match &two {
+            Err(why) => Err(why.clone()),
+            Ok(two) => {
+                let flat = Machine {
+                    tiers: Vec::new(),
+                    ..two.clone()
+                };
+                let levers = plan_levers(tier_now, &inputs, &flat, ctx)?;
+                Ok(inputs.plan(two, ctx, &levers)?)
+            }
+        };
+        let plans: Vec<(&str, &Plan<'_>)> = [
+            Some(("arm a", &plan_a)),
+            plan_bp.as_ref().ok().map(|p| ("arm bp", p)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for (what, plan) in plans {
             println!(
                 "{what} plan: stage card experts {} tier card experts {} host experts {} (plan values), the card experts serve {:.2} % of \
                  the picks at uniform routing (derived)",
@@ -536,9 +603,29 @@ mod gate {
             );
         }
 
-        tier::sc("residency_unset_serves")?;
+        // Arm `bp` agrees with arm `a`'s `off` history, so a stage card without the room leaves both arms.
+        if let Some(why) = card_lack(&plan_a)? {
+            tier::defer_for_room(&ARM_A_CLAUSES, &why)?;
+            tier::defer_for_room(&ARM_BP_CLAUSES, &why)?;
+            println!("{NAME}: {}", tier::tally_line());
+            return Ok(());
+        }
+        let bp_lack = match &plan_bp {
+            Ok(plan) => card_lack(plan)?,
+            Err(why) => Some(why.clone()),
+        };
+
+        tier::sc(UNSET_SERVES)?;
         let (word_a, ok_a) = unset_word("arm a", &plan_a, tier_now)?;
-        let (word_bp, ok_bp) = unset_word("arm bp", &plan_bp, tier_now)?;
+        let bp = match (&plan_bp, bp_lack) {
+            (Ok(plan), None) => Ok((plan, unset_word("arm bp", plan, tier_now)?)),
+            (Err(why), _) => Err(why.clone()),
+            (Ok(_), Some(why)) => Err(why),
+        };
+        let ok_bp = match &bp {
+            Ok((_, (_, ok))) => *ok,
+            Err(_) => true,
+        };
         let mut pass = ok_a && ok_bp;
         if !pass {
             return Err(checks_failed());
@@ -551,24 +638,35 @@ mod gate {
             routed.clone(),
         )?;
         pass &= arm_pass;
-        pass &= arm_bp(
-            tier_now,
-            (&plan_bp, &inputs, ids.as_slice()),
-            word_bp,
-            &off,
-            routed,
-        )?;
+        let bp_left = bp.is_err();
+        match bp {
+            Ok((plan, (word, _))) => {
+                pass &= arm_bp(
+                    tier_now,
+                    (plan, &inputs, ids.as_slice()),
+                    word,
+                    &off,
+                    routed,
+                )?;
+            }
+            Err(why) => tier::defer_for_room(&ARM_BP_CLAUSES, &why)?,
+        }
 
         println!("{NAME}: {}", tier::tally_line());
         if !pass {
             return Err(checks_failed());
         }
         println!(
-            "PASSED: {NAME} the unset word is a mid word on each serving plan that holds host experts (off on one that holds \
+            "PASSED: {NAME}{} the unset word is a mid word on each serving plan that holds host experts (off on one that holds \
              none) and off beside a fixed placement and the step feed, a mid load runs a machine seeded by the plan and decodes \
              the off load's ids (or parts at a near tie), its boundaries end none, the prompt call and each step (an off load's \
              none), the history repeats bit for bit and the reset restores the \
-             seed, the expert tier's slot map stays, and the windows' tier census records count the steps' picks"
+             seed, the expert tier's slot map stays, and the windows' tier census records count the steps' picks",
+            if bp_left {
+                " (arm a; arm bp left by name)"
+            } else {
+                ""
+            }
         );
         Ok(())
     }

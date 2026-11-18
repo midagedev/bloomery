@@ -1,20 +1,22 @@
-//! GPU gate for Mistral Large 4 on plan (b′) (`--place bp`): the stage on the A6000 and the expert tier on the 3090,
-//! against one card holding the same expert sets.
+//! GPU gate for Mistral Large 4 on plan (b′) (`--place bp`): the stage on the largest card in view and the expert tier on
+//! the next, against one card holding the same expert sets.
 //!
 //! Two loads of one plan (b′), one after the other, both through the body's own entry (`Body::open_placed`, which hangs
 //! the plan's tier card under the host tier):
 //!
 //! 1. the reference: the plan with every tier segment moved onto the stage card (each routed stack's stage and tier
-//!    lists joined, the host's untouched, [`union_plan`]) and the tier card dropped from the plan's machine: the A6000
+//!    lists joined, the host's untouched, [`union_plan`]) and the tier card dropped from the plan's machine: the stage card
 //!    holds the union and no tier code runs;
-//! 2. the two cards: the stage on the A6000, each routed layer's next ids on the 3090, the host the rest.
+//! 2. the two cards: the stage on the largest card, each routed layer's next ids on the next card, the host the rest.
 //!
 //! Memory: both plans are made under one card budget the gate sets (`PlanLevers::card_budget_bytes`; no environment
 //! lever moves it). It caps every card, the tier's too. In the real tier the budget is what the stage card holds without
 //! experts plus [`TWO_STAGE_EXPERTS`], so the stage keeps that many routed expert bytes, the tier up to the same budget
-//! less its own set-aside and batch reserve, and the reference's union is at most twice the budget, under the A6000's
-//! usable bytes [derived from the placement's rule; the gate prints both and refuses a union past the card by name]. In
-//! the fixture tier the stage keeps half of the routed expert bytes the A6000 alone would hold, so the tier takes the
+//! less its own set-aside and batch reserve, and the reference's union is at most twice the budget [derived from the
+//! placement's rule]. The gate asks the view for the facts it needs before any load, two cards in view and the stage
+//! card's usable bytes for the union (`tier::union_lack_of`, the plan's own values), and leaves every clause by name
+//! (`tier::defer_for_room`, `no-card-room`), in either tier, where the view lacks them. In
+//! the fixture tier the stage keeps half of the routed expert bytes the stage card alone would hold, so the tier takes the
 //! other half and both cards run. Each layer's stage card keeps its id prefix and the tier the next ids, so the
 //! preconditions below are met by the walk's routing, which the run checks.
 //!
@@ -24,7 +26,7 @@
 //!
 //! Clauses (all self-consistency clauses: each compares the engine's two loads to each other and reads no oracle, so
 //! both tiers run them):
-//! - `two_card_load`: the plan puts experts on the tier, the load's tier opened on the 3090 beside the A6000 stage card,
+//! - `two_card_load`: the plan puts experts on the tier, the load's tier opened on the second card beside the stage card,
 //!   and the experts the load holds on the tier, by layer, are the plan's;
 //! - `two_card_step_bits`: the walk's tokens and logits rows on the two cards, run eager and as the captured step
 //!   graph's replays, are the reference's replayed walk bit for bit, every logit of the reference finite. The tier's
@@ -74,13 +76,11 @@ mod gate {
     use bloomery_gpu_mistrallarge4::body::Body;
     use model::arch::Arch;
     use model::arch::mistrallarge4::place::{self, PlanInputs};
-    use model::placement::{
-        Device, ExpertList, Machine, Plan, PlanLevers, Role, union_plan, workstation,
-    };
+    use model::placement::{Device, ExpertList, Machine, Plan, PlanLevers, Role, union_plan};
 
     use crate::e2e::walk;
     use crate::tier_twocard::{
-        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_3090,
+        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_card,
     };
 
     type Model = GpuModel<Body>;
@@ -115,9 +115,14 @@ mod gate {
 
     /// The routed expert bytes on the stage card in the real tier: the stage card's budget is what it holds without
     /// experts plus these, and the tier's experts are capped by the same budget, so the reference's union is at most
-    /// twice the budget, under the A6000's usable bytes [derived from the placement's rule; the gate prints both and
-    /// refuses a union past the card by name].
+    /// twice the budget [derived from the placement's rule].
     const TWO_STAGE_EXPERTS: u64 = 2 << 30;
+
+    /// The clauses of the arm: each is declared where it runs and left by name where the cards in view cannot run it.
+    const TWO_CARD_LOAD: &str = "two_card_load";
+    const STEP_BITS: &str = "two_card_step_bits";
+    const TIER_SENT: &str = "two_card_tier_sent";
+    const CLAUSES: [&str; 3] = [TWO_CARD_LOAD, STEP_BITS, TIER_SENT];
 
     /// What the walk read: its tokens and logits rows, and what it sent the tier.
     struct Run {
@@ -141,17 +146,9 @@ mod gate {
         Ok(Body::open_placed(split()?, plan, inputs, 0, HOST_CFG)?)
     }
 
-    /// Refused unless `m` runs on the A6000, the card the plan's stage is.
+    /// Refused unless `m` runs on the largest card in view, the card the plan's stage is.
     fn on_stage_card(what: &str, m: &Model) -> Result<(), GateError> {
-        let device = m.gpu().device_name()?;
-        if !device.contains(workstation::A6000.name) {
-            return Err(format!(
-                "the {what} opened on {device}, not the {}: the plan's stage card",
-                workstation::A6000.name
-            )
-            .into());
-        }
-        Ok(())
+        tier::opened_on_rank(what, m.gpu(), 0)
     }
 
     /// Per routed layer, the experts its stage card, its tier card and the host hold (the first routed stack's segments:
@@ -255,16 +252,22 @@ mod gate {
         if !pass {
             return Err(checks_failed());
         }
-        println!(
-            "PASSED: {NAME} plan (b′) loads the expert tier on the 3090 beside the A6000 stage with the plan's experts on \
-             it, the walk eager and replayed reads the one card's ids and logits bit for bit, and every tier layer was \
-             sent a routed slot"
-        );
+        if tier::ran_any() {
+            println!(
+                "PASSED: {NAME} plan (b′) loads the expert tier on the second card beside the stage card with the plan's \
+                 experts on it, the walk eager and replayed reads the one card's ids and logits bit for bit, and every \
+                 tier layer was sent a routed slot"
+            );
+        }
         Ok(())
     }
 
     /// The clauses (module header): the plan, the union reference, then the two cards.
     fn bits(inputs: &PlanInputs, tier_now: Tier) -> Result<bool, GateError> {
+        if let Some(why) = tier::two_cards_lack()? {
+            tier::defer_for_room(&CLAUSES, &why)?;
+            return Ok(true);
+        }
         let layers = inputs.hp.n_layer;
         let bp = Place::Bp
             .on_host()?
@@ -282,11 +285,10 @@ mod gate {
         let tier_layers: Vec<usize> = splits.iter().filter(|o| o.2 > 0).map(|o| o.0).collect();
         let tier_bytes = plan.cards.get(1).map_or(0, |c| c.expert_bytes);
         let stage = &plan.cards[0];
-        let stage_bytes = stage.dense_bytes + stage.expert_bytes + stage.kv_bytes;
-        let usable = workstation::A6000.usable_bytes();
+        let card = &plan.machine.cards[0];
         println!(
             "plan (b′) under a card budget of {} at ctx {CTX}: stage {} experts ({} B), tier {} experts ({tier_bytes} B) on \
-             {} layers, host {} experts ({} B); the reference's union {} B of the A6000's {usable} (plan values)",
+             {} layers, host {} experts ({} B); the reference's union {} B of the stage card {}'s {} usable (plan values)",
             model::placement::card_budget::in_bytes(&levers.card_budget_bytes),
             stage.experts,
             stage.expert_bytes,
@@ -294,21 +296,20 @@ mod gate {
             tier_layers.len(),
             plan.host.experts,
             plan.host.expert_bytes,
-            stage_bytes + tier_bytes,
+            tier::union_bytes(&plan),
+            card.name,
+            card.usable_bytes,
         );
         for (l, on_stage, on_tier, on_host) in &splits {
             println!("  layer {l}: stage {on_stage}, tier {on_tier}, host {on_host}");
         }
-        if stage_bytes + tier_bytes > usable {
-            return Err(format!(
-                "the reference's union of {} B passes the A6000's {usable} B: lower the stage's share",
-                stage_bytes + tier_bytes
-            )
-            .into());
+        if let Some(why) = tier::union_lack_of(&plan) {
+            tier::defer_for_room(&CLAUSES, &why)?;
+            return Ok(true);
         }
         let prompt = walk(PROMPT, inputs.hp.n_vocab);
 
-        // The reference: the union on the A6000 alone, its walk replayed, then released.
+        // The reference: the union on the stage card alone, its walk replayed, then released.
         let uplan = union_plan(&plan, &flat)?;
         println!(
             "reference: the stage card holds {} experts, the union of the stage's and the tier's",
@@ -336,8 +337,8 @@ mod gate {
         on_stage_card("two-card load", &m)?;
         let mut pass = true;
 
-        tier::sc("two_card_load")?;
-        tier_on_3090(
+        tier::sc(TWO_CARD_LOAD)?;
+        tier_on_card(
             "two-card load",
             t0,
             (&m.gpu().device_name()?, m.resident_bytes()),
@@ -369,7 +370,7 @@ mod gate {
         }
         pass &= load_ok;
 
-        tier::sc("two_card_step_bits")?;
+        tier::sc(STEP_BITS)?;
         m.set_mode(StepMode::Eager);
         let eager = walk_leg(&mut m, &prompt)?;
         capture(&mut m)?;
@@ -382,7 +383,7 @@ mod gate {
         let replay_ok = same("two_card_step_bits: replayed walk", &want.leg, &replay.leg);
         pass &= finite && eager_ok && replay_ok;
 
-        tier::sc("two_card_tier_sent")?;
+        tier::sc(TIER_SENT)?;
         pass &= sent_every(
             "two_card_tier_sent replayed walk",
             replay.sent.as_ref(),

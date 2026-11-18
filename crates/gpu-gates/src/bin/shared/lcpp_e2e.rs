@@ -43,6 +43,7 @@
 
 use crate::e2e::{argmax, ik_last, rel, tap, top_ids};
 use bloomery_gpu_gates::flip;
+use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::prompts::{
     GreedyRow, MARGIN_FLOOR, compare_forced, k_of, log_softmax, sigma_lp, std_normal_cdf,
 };
@@ -52,7 +53,7 @@ use bloomery_gpu_gates::{
     ref_tensor_logical_in, topk_ids_logical_within, verdict,
 };
 use model::placement::Machine;
-use model::placement::workstation::{self, TierBatchBytes};
+use model::placement::workstation::TierBatchBytes;
 use refset::arch::prompt_tables::{self as read, Greedy, Top};
 use refset::family::Family;
 use std::path::{Path, PathBuf};
@@ -208,19 +209,21 @@ impl Arm {
 
     /// The machine the arm plans a model of `layers` layers on: for `a` the gate plan on the gate card
     /// (`gate_card::plan_gate`, after `gate_card::init` reads the census of the one card the runner put in view); for `bp`
-    /// plan (b′) (`workstation::plan_bp`, the tier card reserving `batch`, the tier's prompt-batch bytes), which runs with
-    /// both cards in view and so reads no gate card, as every two-card gate plans its own machine. The including gate
-    /// declares `shared/gate_card.rs` as `gate_card`.
+    /// plan (b′) on the two largest cards in view (`Place::Bp` resolved against the census, the stage the largest, the tier
+    /// the next reserving `batch`, the tier's prompt-batch bytes), which runs with both cards in view and so reads no gate
+    /// card, as every two-card gate plans its own machine. The including gate declares `shared/gate_card.rs` as
+    /// `gate_card`.
     ///
     /// # Errors
-    /// `a`'s census refusal.
+    /// `a`'s census refusal; `bp`'s refusal of a census of fewer than two cards (a gate asks
+    /// `tier::two_cards_lack` first and leaves its clauses by name).
     pub fn machine(self, layers: usize, batch: TierBatchBytes) -> Result<Machine, GateError> {
         Ok(match self {
             Arm::A => {
                 crate::gate_card::init()?;
                 crate::gate_card::plan_gate(layers)
             }
-            Arm::Bp => workstation::plan_bp(layers, None, batch),
+            Arm::Bp => Place::Bp.on_host()?.machine(None, Some(batch))?(layers),
         })
     }
 }

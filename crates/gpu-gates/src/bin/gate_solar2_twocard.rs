@@ -1,19 +1,19 @@
-//! GPU gate for Solar-Open2 on plan (b′) (`--place bp`): the stage on the A6000 and the expert tier on the 3090, against
-//! one card holding the same expert sets.
+//! GPU gate for Solar-Open2 on plan (b′) (`--place bp`): the stage on the largest card in view and the expert tier on the
+//! next, against one card holding the same expert sets.
 //!
 //! Two loads of one plan (b′), one after the other:
 //!
 //! 1. the reference: the plan with every tier segment moved onto the stage card (each routed stack's stage and tier lists
 //!    joined, the host's untouched) and the tier card dropped from the plan's machine, opened by `Body::open_placed`: the
-//!    A6000 holds the union, and no tier code runs;
+//!    stage card holds the union, and no tier code runs;
 //! 2. the two cards, through the binaries' own open (`app::Loaded::open`, whose load hangs the plan's tier card under the
 //!    host tier).
 //!
 //! Memory: both plans are made under the card budget [`BUDGET`] (`PlanLevers::card_budget_bytes`; `BLOOMERY_CARD_BUDGET` is
 //! refused here, so the environment cannot move the sets). It caps every card, the tier's too. Without it the union is the
-//! stage's set plus the tier's, each planned up to its own card's usable bytes, and the two together pass the A6000's. Under
-//! it the stage's resident bytes are at most `BUDGET` and the tier's experts at most `BUDGET` less its batch reserve, so
-//! the reference holds at most 2 · `BUDGET` = 32 GiB of the A6000's 48 GiB [derived from the placement's rule]. Each layer's
+//! stage's set plus the tier's, each planned up to its own card's usable bytes, and the two together pass the stage card's.
+//! Under it the stage's resident bytes are at most `BUDGET` and the tier's experts at most `BUDGET` less its batch reserve,
+//! so the reference holds at most 2 · `BUDGET` = 32 GiB [derived from the placement's rule]. Each layer's
 //! stage card keeps its id prefix and the tier the next ids, so the preconditions below are met by the prompts' routing,
 //! which the run checks.
 //!
@@ -41,6 +41,11 @@
 //! Tiers (`BLOOMERY_TIER`): the card budget is [`BUDGET`] in the real tier and the header's in the fixture tier (the budget
 //! the generator planned to put half of each card-eligible layer's experts on a card). Every clause is a self-consistency
 //! clause, so the fixture tier runs them all.
+//!
+//! Cards: the plan is made on the two largest cards in view (`--place bp`: the stage the largest, the tier the next), and
+//! the gate asks for the facts it needs before any load: two cards in view, and the stage card's usable bytes for the
+//! union the reference holds ([`tier::union_lack_of`], the plan's own values). A view without them leaves every clause
+//! by name (`tier::defer_for_room`, `no-card-room`), in either tier, and loads nothing.
 
 #[cfg(feature = "solar2")]
 fn main() -> std::process::ExitCode {
@@ -83,7 +88,7 @@ mod gate {
     use bloomery_levers::{CARD_DONTNEED, HOST_LOCK, HOST_POPULATE};
     use gguf::Split;
     use model::arch::solar2::place::{self, PlanInputs};
-    use model::placement::{Device, ExpertList, Machine, Plan, PlanLevers, Role, workstation};
+    use model::placement::{Device, ExpertList, Machine, Plan, PlanLevers, Role};
     use refset::arch::solar2::ARCH;
 
     use crate::e2e::walk;
@@ -92,8 +97,25 @@ mod gate {
     use model::placement::union_plan;
 
     const NAME: &str = "gate_solar2_twocard";
-    /// The card budget both plans are made under in the real tier (module header: the union it leaves fits the A6000).
+    /// The card budget both plans are made under in the real tier (module header: the union it leaves is the stage card's
+    /// to hold).
     const BUDGET: u64 = 16 << 30;
+    /// The clauses of the bits arm, in order: each is declared where it runs and left by name where the cards in view cannot
+    /// run the arm.
+    const PRECONDITION_TIER: &str = "precondition tier: the plan puts experts on the tier";
+    const DECODE_BITS: &str = "decode bits: step";
+    const CALL_BITS: &str = "call bits";
+    const GROUP_BITS: &str = "group bits: groups of two against groups of one";
+    const STRUCTURE: &str = "structure: the stage's step graph has the reference's node count";
+    const PRECONDITION_SENT: &str = "precondition sent: every tier layer was sent a routed slot";
+    const CLAUSES: [&str; 6] = [
+        PRECONDITION_TIER,
+        DECODE_BITS,
+        CALL_BITS,
+        GROUP_BITS,
+        STRUCTURE,
+        PRECONDITION_SENT,
+    ];
     /// Cache rows: past every leg's last position (the group leg's [`GROUP_PROMPT`] ids and the step leg's
     /// [`PROMPT`] + [`STEPS`] are the most).
     const CTX: usize = 2048;
@@ -122,7 +144,7 @@ mod gate {
         Ok(crate::tier_twocard::tier_counts(m.body(NAME)?.hybrid()))
     }
 
-    /// The tiered load through the binaries' open, refused unless its tier's `Gpu` is the 3090.
+    /// The tiered load through the binaries' open, refused unless its tier's `Gpu` is the plan's tier card.
     fn open_two(
         file: &Path,
         machine: impl Fn(usize) -> Machine,
@@ -141,7 +163,7 @@ mod gate {
             .ready(&mut Quiet)?;
         let m = s.model();
         let stage = (m.gpu().device_name()?, m.resident_bytes());
-        crate::tier_twocard::tier_on_3090("load", t0, (&stage.0, stage.1), m.body(NAME)?.hybrid())?;
+        crate::tier_twocard::tier_on_card("load", t0, (&stage.0, stage.1), m.body(NAME)?.hybrid())?;
         Ok(s)
     }
 
@@ -158,14 +180,7 @@ mod gate {
         if !model.body(NAME)?.hybrid().tiers().is_empty() {
             return Err("the reference load holds a tier card".into());
         }
-        let device = model.gpu().device_name()?;
-        if !device.contains(workstation::A6000.name) {
-            return Err(format!(
-                "the reference opened on {device}, not the {}: the union is planned for its bytes",
-                workstation::A6000.name
-            )
-            .into());
-        }
+        tier::opened_on_rank("reference", model.gpu(), 0)?;
         let s = Loaded::from_model(model, cfg.clone(), u32::try_from(plan.ctx_max)?)
             .ready(&mut Quiet)?;
         println!(
@@ -285,7 +300,7 @@ mod gate {
         let split = split_of(&file)?;
         let inputs = PlanInputs::read(&split)?;
         // Both plans run under one budget that no environment moves: the real tier's [`BUDGET`], a parameter of the real
-        // file (the union it leaves fits the A6000); the fixture tier's, the header's, which the generator planned to put
+        // file (the union it leaves is the stage card's to hold); the fixture tier's, the header's, which the generator planned to put
         // half of each card-eligible layer's experts on a card.
         let place_levers = match Tier::from_env()? {
             Tier::Real => PlanLevers {
@@ -308,12 +323,19 @@ mod gate {
         if !pass {
             return Err(checks_failed());
         }
-        println!("PASSED: {NAME}");
+        if tier::ran_any() {
+            println!("PASSED: {NAME}");
+        }
         Ok(())
     }
 
-    /// The bits arm: the union reference, then the two cards.
+    /// The bits arm: the union reference, then the two cards. `Ok(true)` with every clause left by name where the cards in
+    /// view lack two cards or the room for the union.
     fn bits(file: &Path, cfg: &HybridCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
+        if let Some(why) = tier::two_cards_lack()? {
+            tier::defer_for_room(&CLAUSES, &why)?;
+            return Ok(true);
+        }
         let layers = inputs.model.layers;
         let bp = Place::Bp
             .on_host()?
@@ -342,8 +364,12 @@ mod gate {
         for (l, stage, tier, host) in &splits {
             println!("  layer {l}: stage {stage}, tier {tier}, host {host}");
         }
+        if let Some(why) = tier::union_lack_of(&plan) {
+            tier::defer_for_room(&CLAUSES, &why)?;
+            return Ok(true);
+        }
         let mut pass = true;
-        tier::sc("precondition tier: the plan puts experts on the tier")?;
+        tier::sc(PRECONDITION_TIER)?;
         if tier_layers.is_empty() {
             println!(
                 "FAIL precondition tier: the plan holds no expert on the tier: the run proves nothing"
@@ -376,17 +402,12 @@ mod gate {
             let run = legs(&mut s, &prompt)?;
             (run, group_leg(&mut s, &prompt)?)
         };
-        for name in [
-            "decode bits: step",
-            "call bits",
-            "group bits: groups of two against groups of one",
-            "structure: the stage's step graph has the reference's node count",
-        ] {
+        for name in [DECODE_BITS, CALL_BITS, GROUP_BITS, STRUCTURE] {
             tier::sc(name)?;
         }
-        pass &= same("decode bits: step", &want.step, &got.step);
-        pass &= same("call bits", &want.call, &got.call);
-        pass &= same("group bits: groups of two against groups of one", &g1, &g2);
+        pass &= same(DECODE_BITS, &want.step, &got.step);
+        pass &= same(CALL_BITS, &want.call, &got.call);
+        pass &= same(GROUP_BITS, &g1, &g2);
         if got.stage_nodes == want.stage_nodes {
             println!(
                 "ok structure: stage graph of {} nodes, the reference's",
@@ -399,7 +420,7 @@ mod gate {
             );
             pass = false;
         }
-        tier::sc("precondition sent: every tier layer was sent a routed slot")?;
+        tier::sc(PRECONDITION_SENT)?;
         pass &= sent_every("decode", got.sent_step.as_ref(), &tier_layers, false);
         pass &= sent_every("call", got.sent_call.as_ref(), &tier_layers, true);
         Ok(pass)

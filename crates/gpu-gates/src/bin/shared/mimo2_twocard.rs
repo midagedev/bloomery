@@ -1,10 +1,10 @@
 //! The MiMo-V2.6-Flash two-card arm (`gate_mimo2_e2e --two-card`, `just gate-gpu-mimo2-twocard` under
-//! `BLOOMERY_CARD=both`): plan (b′) (`workstation::plan_bp`: the A6000 the stage card, the 3090 an expert tier holding
-//! each routed layer's next ids after the stage's prefix, the host the rest), planned under one card budget no
+//! `BLOOMERY_CARD=both`): plan (b′) (`Place::Bp`: the largest card in view the stage card, the next an expert tier
+//! holding each routed layer's next ids after the stage's prefix, the host the rest), planned under one card budget no
 //! environment moves ([`TWO_BUDGET`]), against the reference — the same plan with every tier segment on the stage card
-//! (`model::placement::union_plan`), the A6000 alone, opened first and released. Its clauses:
-//! - `two_card_load`: the plan puts experts on the tier, and the load's tier opened on the 3090 beside the stage card
-//!   with the plan's experts on each layer;
+//! (`model::placement::union_plan`), the stage card alone, opened first and released. Its clauses:
+//! - `two_card_load`: the plan puts experts on the tier, and the load's tier opened on the second card beside the stage
+//!   card with the plan's experts on each layer;
 //! - `two_card_first_tokens_are_union`: [`TWO_WALK`] decode steps of the walk read the reference's ids and logits rows
 //!   bit for bit — the routed block joins the tier's slots in the slot order the union's card sum runs — and the walk
 //!   sent every tier layer a routed slot (or the run proves nothing there and fails by name);
@@ -15,28 +15,39 @@
 //!   — a batch writes the steps' bits on one card, and the tier's leg computes a slot's rows as the stage card's does;
 //! - `two_card_batch_sent`: that feed sent every tier layer a routed slot and the tier served its batches.
 //!
-//! The arm runs on the real file only: it plans the A6000's and the 3090's bytes.
+//! The arm runs on the real file only. It asks the view for what it needs before any load, two cards in view and the
+//! stage card's usable bytes for the union the reference holds (`tier::union_lack_of`, the plan's own values); a view
+//! without them leaves every clause by name (`tier::defer_for_room`, `no-card-room`) and loads nothing.
 
 use std::path::Path;
 use std::time::Instant;
 
 use bloomery_gpu::model::StepMode;
+use bloomery_gpu_gates::generate::Place;
+use bloomery_gpu_gates::tier;
 use bloomery_gpu_gates::{GateError, verdict};
 use bloomery_gpu_mimo2::{Body, Mimo2Model, T_MAX, prefill, set_prefill_group};
 use gguf::Split;
 use model::arch::mimo2::place::PlanInputs;
-use model::placement::workstation;
 use model::placement::{Machine, PlanLevers, union_plan};
 
-use crate::tier_twocard::{Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_3090};
+use crate::tier_twocard::{Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_card};
 
 /// What the arm's errors name.
 const WHAT: &str = "gate_mimo2_e2e two-card";
 
 /// The card budget both loads are planned under: the stage card's dense terms and experts, and at most this much of
-/// the tier's experts, so the reference's union holds at most twice it of the A6000's bytes [derived from the
-/// placement's rule].
+/// the tier's experts, so the reference's union holds at most twice it [derived from the placement's rule].
 pub const TWO_BUDGET: u64 = 20 << 30;
+
+/// The arm's clauses, each left by name where the cards in view lack what the arm needs.
+const CLAUSES: [&str; 5] = [
+    "two_card_load",
+    "two_card_first_tokens_are_union",
+    "two_card_eager_is_replay",
+    "two_card_batch_is_union",
+    "two_card_batch_sent",
+];
 
 /// The walk's decode steps.
 pub const TWO_WALK: usize = 24;
@@ -46,6 +57,14 @@ pub const TWO_PROMPT: usize = T_MAX + 100;
 
 /// The prompt group the batch feed runs at: its two batches are one group.
 const TWO_GROUP: usize = 2;
+
+/// Every clause of the arm left by name, `why` the line that says what the cards in view lack: `Ok(true)`, the arm
+/// ran nothing and nothing is red.
+fn left(why: &str) -> Result<bool, GateError> {
+    tier::defer_for_room(&CLAUSES, why)?;
+    println!("{WHAT}: {}", tier::tally_line());
+    Ok(true)
+}
 
 /// The reference's or the two-card load's reads: the walk's, and the batch feed's.
 struct Reads {
@@ -96,20 +115,25 @@ fn reads(m: &mut Mimo2Model, (walk, prompt): (&[u32], &[u32])) -> Result<Reads, 
     })
 }
 
-/// The arm on the file at `path` under the gate's `levers` (module doc): `Ok(pass)`. A budget the environment sets, a
-/// union past the A6000's usable bytes, a plan with no tier expert and a reference opened elsewhere or holding a tier
-/// are refused by name.
+/// The arm on the file at `path` under the gate's `levers` (module doc): `Ok(pass)`, `Ok(true)` with every clause left by
+/// name where the cards in view lack two cards or the stage card's room for the union. A budget the environment sets, a
+/// plan with no tier expert and a reference opened elsewhere or holding a tier are refused by name.
 pub fn run(path: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateError> {
     if PlanLevers::from_levers(levers)?.card_budget_bytes.is_set() {
         return Err(
             "the two-card arm plans under its own card budget: unset BLOOMERY_CARD_BUDGET".into(),
         );
     }
+    if let Some(why) = tier::two_cards_lack()? {
+        return left(&why);
+    }
     let inputs = PlanInputs::read(&split(path)?)?;
     let layers = inputs.model.layers;
     let walk = crate::e2e::walk(TWO_WALK, inputs.hp.n_vocab);
     let prompt = crate::e2e::walk(TWO_PROMPT, inputs.hp.n_vocab);
-    let two = workstation::plan_bp(layers, None, bloomery_gpu_mimo2::tier::tier_batch(&inputs)?);
+    let two = Place::Bp
+        .on_host()?
+        .machine(None, Some(bloomery_gpu_mimo2::tier::tier_batch(&inputs)?))?(layers);
     let flat = Machine {
         tiers: Vec::new(),
         ..two.clone()
@@ -127,12 +151,11 @@ pub fn run(path: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateEr
     let tier_layers: Vec<usize> = (0..layers).filter(|&l| planned[l] > 0).collect();
     let stage = &plan.cards[0];
     let tier_bytes = plan.cards.get(1).map_or(0, |c| c.expert_bytes);
-    let union_bytes = stage.dense_bytes + stage.expert_bytes + stage.kv_bytes + tier_bytes;
-    let usable = workstation::A6000.usable_bytes();
+    let card = &plan.machine.cards[0];
     println!(
         "two-card plan (b′) under a card budget of {} at ctx {ctx}: stage {} experts ({} B), tier {} experts \
-         ({tier_bytes} B) on {} layers, host {} experts ({} B); the reference's union {union_bytes} B of the A6000's \
-         {usable} (plan values)",
+         ({tier_bytes} B) on {} layers, host {} experts ({} B); the reference's union {} B of the stage card {}'s {} \
+         usable (plan values)",
         model::placement::card_budget::in_bytes(&budget.card_budget_bytes),
         stage.experts,
         stage.expert_bytes,
@@ -140,15 +163,15 @@ pub fn run(path: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateEr
         tier_layers.len(),
         plan.host.experts,
         plan.host.expert_bytes,
+        tier::union_bytes(&plan),
+        card.name,
+        card.usable_bytes,
     );
+    if let Some(why) = tier::union_lack_of(&plan) {
+        return left(&why);
+    }
     if tier_layers.is_empty() {
         return Err("the two-card plan puts no expert on the tier: the arm proves nothing".into());
-    }
-    if union_bytes > usable {
-        return Err(format!(
-            "the reference's union of {union_bytes} B passes the A6000's {usable} B: lower the two-card budget"
-        )
-        .into());
     }
     let host = levers.host();
     let want = {
@@ -157,21 +180,14 @@ pub fn run(path: &Path, levers: &bloomery_levers::Levers) -> Result<bool, GateEr
         if !r.body(WHAT)?.hybrid().tiers().is_empty() {
             return Err("the reference load holds a tier card".into());
         }
-        let device = r.gpu().device_name()?;
-        if !device.contains(workstation::A6000.name) {
-            return Err(format!(
-                "the reference opened on {device}, not the {}: the union is planned for its bytes",
-                workstation::A6000.name
-            )
-            .into());
-        }
+        tier::opened_on_rank("reference", r.gpu(), 0)?;
         reads(&mut r, (&walk, &prompt))?
     };
     let opened = Instant::now();
     let mut m = Body::open_placed(split(path)?, &plan, &inputs, 0, host)?;
     let mut pass = true;
 
-    tier_on_3090(
+    tier_on_card(
         "two_card_load",
         opened,
         (&m.gpu().device_name()?, m.resident_bytes()),

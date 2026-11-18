@@ -19,7 +19,7 @@ use bloomery_gpu::host::xstream::XMode;
 use bloomery_gpu::model::StepMode;
 use bloomery_gpu_gates::GateError;
 use bloomery_gpu_gates::prompts::SIGMA_LOGIT_V41;
-use bloomery_gpu_gates::tier::Tier;
+use bloomery_gpu_gates::tier::{self, Tier};
 use bloomery_gpu_minimaxm3::prefill::{prefill, set_prefill_group};
 use bloomery_gpu_minimaxm3::{Body, MiniMaxM3Model, set_taps};
 use bloomery_levers::HostCfg;
@@ -155,7 +155,7 @@ pub fn decode(dir: &Path, ids: &[u32]) -> Result<String, GateError> {
 }
 
 /// Open `file` at `ctx` positions by the placement of `arm`: the gate placement (`gate_card::plan_gate`) on the gate card for
-/// `a`, plan (b′) (`workstation::plan_bp`) for `bp`, the next-largest card an expert tier under the host tier holding the
+/// `a`, plan (b′) (`Place::Bp`, the two largest cards in view) for `bp`, the next-largest card an expert tier under the host tier holding the
 /// tier's prompt-batch bytes (`bloomery_gpu_minimaxm3::tier::tier_batch`). The body is opened as the serve seat opens
 /// it (`Body::open_placed`, the plan `PlanInputs::plan` makes), the taps armed before the step is first captured, so a
 /// replay writes them.
@@ -238,7 +238,7 @@ fn seated(mut m: MiniMaxM3Model) -> Result<Loaded, GateError> {
 
 /// The card budget the two-card arm plans both its loads under in the real tier: the stage card's dense terms (the MXFP8
 /// attention, the shared experts, the dense lead, the BF16 head) and the experts beside them, and at most this much of the
-/// tier's experts, so the reference's union holds at most twice it of the A6000's bytes [derived from the placement's rule].
+/// tier's experts, so the reference's union holds at most twice it [derived from the placement's rule].
 pub const TWO_BUDGET: u64 = 20 << 30;
 
 /// What the two-card arm (`gate_minimaxm3_prefill --arm bp`) loaded: the reference's walk and the plan (b′) load beside the
@@ -259,17 +259,19 @@ pub struct TwoCard {
 /// The steps' token walk: `walk(steps, vocab)` gives the ids the reference decodes.
 pub type Walk = fn(usize, usize) -> Vec<u32>;
 
-/// The two-card arm's loads at `ctx` positions, one after the other: plan (b′) (`workstation::plan_bp`, the stage the A6000,
-/// the tier the 3090) under one card budget no environment moves ([`TWO_BUDGET`]); the reference, that plan's union on the A6000 alone, its ids and logits rows read over the walk
-/// `walk(steps, vocab)` and released; then plan (b′) itself. A budget the environment sets, a union past the A6000's usable
-/// bytes, a reference opened elsewhere or holding a tier, and the fixture tier (its cut's routed layers fit the stage card,
-/// so the tier would hold nothing) are refused by name.
+/// The two-card arm's loads at `ctx` positions, one after the other: plan (b′) (`Place::Bp`, the stage the largest card in
+/// view, the tier the next) under one card budget no environment moves ([`TWO_BUDGET`]); the reference, that plan's union on
+/// the stage card alone, its ids and logits rows read over the walk `walk(steps, vocab)` and released; then plan (b′)
+/// itself. A budget the environment sets, a reference opened elsewhere or holding a tier, and the fixture tier (its cut's
+/// routed layers fit the stage card, so the tier would hold nothing) are refused by name. `Ok(Err(why))`, before anything
+/// loads: the cards in view lack two cards or the stage card's usable bytes for the union (the plan's own values), which
+/// the gate leaves its clauses for by name.
 pub fn two_card(
     file: &Path,
-    (ctx, tier): (usize, Tier),
+    (ctx, tier_now): (usize, Tier),
     (steps, walk): (usize, Walk),
-) -> Result<TwoCard, GateError> {
-    if tier == Tier::Fixture {
+) -> Result<Result<TwoCard, String>, GateError> {
+    if tier_now == Tier::Fixture {
         return Err("the two-card arm runs in the real tier: the fixture cut's routed layers fit the stage card".into());
     }
     let levers = bloomery_levers::at_main(&[bloomery_levers::CARD_BUDGET])?;
@@ -277,6 +279,9 @@ pub fn two_card(
         return Err(
             "the two-card arm plans under its own card budget: unset BLOOMERY_CARD_BUDGET".into(),
         );
+    }
+    if let Some(why) = tier::two_cards_lack()? {
+        return Ok(Err(why));
     }
     let inputs = described(minimaxm3_folder::model_at(file)?.header())?;
     let layers = inputs.model.layers;
@@ -298,11 +303,10 @@ pub fn two_card(
         .collect();
     let stage = &plan.cards[0];
     let tier_bytes = plan.cards.get(1).map_or(0, |c| c.expert_bytes);
-    let union_bytes = stage.dense_bytes + stage.expert_bytes + stage.kv_bytes + tier_bytes;
-    let usable = workstation::A6000.usable_bytes();
+    let card = &plan.machine.cards[0];
     println!(
         "arm bp plan (b′) under a card budget of {} at ctx {ctx}: stage {} experts ({} B), tier {} experts ({tier_bytes} \
-         B) on {} layers, host {} experts ({} B); the reference's union {union_bytes} B of the A6000's {usable} (plan values)",
+         B) on {} layers, host {} experts ({} B); the reference's union {} B of the stage card {}'s {} usable (plan values)",
         model::placement::card_budget::in_bytes(&budget.card_budget_bytes),
         stage.experts,
         stage.expert_bytes,
@@ -310,12 +314,12 @@ pub fn two_card(
         planned.iter().filter(|&&n| n > 0).count(),
         plan.host.experts,
         plan.host.expert_bytes,
+        tier::union_bytes(&plan),
+        card.name,
+        card.usable_bytes,
     );
-    if union_bytes > usable {
-        return Err(format!(
-            "the reference's union of {union_bytes} B passes the A6000's {usable} B: lower the two-card budget"
-        )
-        .into());
+    if let Some(why) = tier::union_lack_of(&plan) {
+        return Ok(Err(why));
     }
     let host = levers.host();
     let reference = {
@@ -325,14 +329,7 @@ pub fn two_card(
         if !r.body("minimaxm3 seat")?.hybrid().tiers().is_empty() {
             return Err("the reference load holds a tier card".into());
         }
-        let device = r.gpu().device_name()?;
-        if !device.contains(workstation::A6000.name) {
-            return Err(format!(
-                "the reference opened on {device}, not the {}: the union is planned for its bytes",
-                workstation::A6000.name
-            )
-            .into());
-        }
+        tier::opened_on_rank("reference", r.gpu(), 0)?;
         let (mut ids, mut rows) = (
             Vec::with_capacity(walk.len()),
             Vec::with_capacity(walk.len()),
@@ -351,13 +348,13 @@ pub fn two_card(
         0,
         host,
     )?)?;
-    Ok(TwoCard {
+    Ok(Ok(TwoCard {
         walk,
         loaded,
         planned,
         reference,
         opened,
-    })
+    }))
 }
 
 /// Load the file as [`open`] does with the host tier writing a route trace into the new directory `dir`, feed `ids` one step each

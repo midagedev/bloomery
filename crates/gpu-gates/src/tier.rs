@@ -36,7 +36,10 @@
 //! - [`Tag::NoCardRoom`]: a clause that needs more card bytes than the card in
 //!   view has ([`room_clause`]). Neither tier runs it there; both leave it, by
 //!   name, to a card with the room. The line is the deferral's own, the one
-//!   the batch counts.
+//!   the batch counts. A gate whose arm runs on a stage card and an expert tier
+//!   card asks the view for them before it plans ([`two_cards_lack`]) and the
+//!   stage card for the union its reference holds ([`union_lack`]), and leaves
+//!   every clause of the arm by name when either lacks ([`defer_for_room`]).
 //!
 //! The `real` tier runs every clause except the fixture's oracle comparisons,
 //! tagged or not: nothing changes for a gate that declares no tags. Each of
@@ -652,6 +655,126 @@ fn room_clause_in(
     } else {
         Err(format!("the self-consistency clause {name:?} was deferred").into())
     }
+}
+
+/// What a plan (b′) arm needs in view: a stage card and one expert tier card. The line that says
+/// what lacks and what is in view when `in_view` cards are visible, `None` when both are.
+#[must_use]
+pub fn two_cards_lack_in(in_view: usize) -> Option<String> {
+    (in_view < 2).then(|| {
+        format!(
+            "plan (b′) runs a stage card and an expert tier card, which takes two cards in view; \
+             {in_view} in view"
+        )
+    })
+}
+
+/// [`two_cards_lack_in`] of the cards this process's driver counts.
+///
+/// # Errors
+/// A driver that cannot be read.
+#[cfg(feature = "gpu")]
+pub fn two_cards_lack() -> Result<Option<String>, GateError> {
+    Ok(two_cards_lack_in(bloomery_gpu::census()?.len()))
+}
+
+/// What a plan (b′) arm's reference needs of its stage card: the stage's experts and the tier's
+/// together on the stage card alone. The line that says what lacks when `need` bytes (the plan's
+/// values: the stage's dense, expert and cache bytes plus the tier's expert bytes) pass the `have`
+/// usable bytes of the stage card `card`, `None` when they fit.
+#[must_use]
+pub fn union_lack(need: u64, have: u64, card: &str) -> Option<String> {
+    (need > have).then(|| {
+        format!(
+            "the reference holds the stage's experts and the tier's on the stage card alone, which \
+             takes {need} B (plan values); the stage card {card} in view has {have} usable bytes"
+        )
+    })
+}
+
+/// The bytes a plan (b′) arm's reference holds on the stage card: the stage's dense, expert and
+/// cache bytes and the tier card's expert bytes, as the plan counts them. `plan` is the plan of the
+/// two cards, whose first card is the stage and whose second, when it has one, the tier.
+#[must_use]
+pub fn union_bytes(plan: &model::placement::Plan<'_>) -> u64 {
+    let stage = &plan.cards[0];
+    stage.dense_bytes
+        + stage.expert_bytes
+        + stage.kv_bytes
+        + plan.cards.get(1).map_or(0, |tier| tier.expert_bytes)
+}
+
+/// [`union_lack`] of `plan`'s own values: [`union_bytes`] against the usable bytes of the stage card
+/// the plan's machine holds, which is the card in view the plan resolved.
+#[must_use]
+pub fn union_lack_of(plan: &model::placement::Plan<'_>) -> Option<String> {
+    let stage = &plan.machine.cards[0];
+    union_lack(union_bytes(plan), stage.usable_bytes, &stage.name)
+}
+
+/// Refused unless `gpu`, which a load of `what` opened, is the visible card of rank `rank` by usable
+/// bytes (`Pick::Rank`: 0 the stage card of plans (a) and (b′), 1 the expert tier card of plan
+/// (b′)), the card the plan resolved and the open found. The proof that the load ran where its
+/// plan put it, whatever the cards are called.
+///
+/// # Errors
+/// A census that has no card of that rank, or a `gpu` that is another device.
+#[cfg(feature = "gpu")]
+pub fn opened_on_rank(what: &str, gpu: &bloomery_gpu::Gpu, rank: u8) -> Result<(), GateError> {
+    use model::placement::workstation::{Pick, resolve};
+
+    let want = resolve(&[Pick::Rank(rank)], &bloomery_gpu::census()?)?[0];
+    let got = gpu.device_id()?;
+    if want.device.is_some_and(|d| d.uuid == got.uuid) {
+        return Ok(());
+    }
+    Err(format!(
+        "the {what} opened on {} ({got}), not the visible card of rank {rank} by usable bytes ({}): \
+         the plan's card",
+        gpu.device_name()?,
+        want.device
+            .map_or_else(|| want.name.to_string(), |d| d.to_string())
+    )
+    .into())
+}
+
+/// The clauses `names` of an arm the card(s) in view cannot run, `why` the line that says what the
+/// arm needs and what is in view ([`two_cards_lack`], [`union_lack`]): each is left by name
+/// ([`Tag::NoCardRoom`]), in either tier, as [`room_clause`] leaves one, so the batch counts one
+/// [`DEFERRED`] line a clause and the gate ends with nothing of the arm run and nothing red.
+///
+/// # Errors
+/// As [`run_clause`].
+pub fn defer_for_room(names: &[&str], why: &str) -> Result<(), GateError> {
+    defer_for_room_in(
+        Tier::from_env()?,
+        names,
+        why,
+        &TALLY,
+        &mut std::io::stdout().lock(),
+    )
+}
+
+/// [`defer_for_room`] of its inputs: the tier, the tally and the sink.
+fn defer_for_room_in(
+    tier: Tier,
+    names: &[&str],
+    why: &str,
+    tally: &Tally,
+    out: &mut impl std::io::Write,
+) -> Result<(), GateError> {
+    writeln!(out, "no-card-room: {why}")?;
+    for name in names {
+        room_clause_in(tier, false, name, tally, out)?;
+    }
+    Ok(())
+}
+
+/// Whether any clause of this process was decided to run: a gate whose every clause was left by
+/// name ([`defer_for_room`]) closes on its tally and prints no `PASSED` line.
+#[must_use]
+pub fn ran_any() -> bool {
+    TALLY.counts().0 > 0
 }
 
 /// A self-consistency clause: it runs in both tiers, so a tier that deferred it is refused by name
@@ -1566,6 +1689,51 @@ mod tests {
                     (0, 1, 0)
                 )
             );
+        }
+    }
+
+    /// A plan (b′) arm needs two cards in view: one card or none lacks it and the line says how
+    /// many are in view, two or more do not. Mutant: `<` taken as `<=`, or the count not named.
+    #[test]
+    fn a_plan_bp_arm_lacks_a_second_card_below_two_in_view() {
+        for in_view in [0, 1] {
+            let why = two_cards_lack_in(in_view).expect("fewer than two cards");
+            assert!(why.ends_with(&format!("{in_view} in view")), "{why}");
+        }
+        for in_view in [2, 3, 8] {
+            assert_eq!(two_cards_lack_in(in_view), None, "{in_view} cards");
+        }
+    }
+
+    /// The reference's union lacks room exactly when its bytes pass the stage card's usable bytes,
+    /// and the line names both and the card. Mutant: `>` taken as `>=`, or the card's name left out.
+    #[test]
+    fn the_union_lacks_room_only_past_the_stage_cards_usable_bytes() {
+        assert_eq!(union_lack(100, 100, "A"), None);
+        assert_eq!(union_lack(0, 100, "A"), None);
+        let why = union_lack(101, 100, "RTX_5090").expect("past the card");
+        for part in ["101 B", "RTX_5090", "100 usable bytes"] {
+            assert!(why.contains(part), "{part}: {why}");
+        }
+    }
+
+    /// An arm the view cannot run is left clause by clause in either tier: the why line first,
+    /// then one `no-card-room` line a clause, every clause counted as left to the real tier and none
+    /// as run. Mutant: a clause left out, the clause run, or the deferral not counted.
+    #[test]
+    fn an_arm_without_room_leaves_every_clause_by_name() {
+        for tier in [Tier::Real, Tier::Fixture] {
+            let (tally, mut out) = (Tally::new(), Vec::new());
+            defer_for_room_in(tier, &["(a) one", "(b) two"], "two cards", &tally, &mut out)
+                .expect("a deferral");
+            assert_eq!(
+                String::from_utf8(out).expect("UTF-8"),
+                "no-card-room: two cards\n\
+                 deferred(real) no-card-room: (a) one\n\
+                 deferred(real) no-card-room: (b) two\n",
+                "{tier:?}"
+            );
+            assert_eq!(tally.counts(), (0, 2, 0), "{tier:?}");
         }
     }
 

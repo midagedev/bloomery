@@ -1,6 +1,6 @@
 //! GPU gate for GLM-5.3-Flash on plan (b′) (`--place bp`): the stage on the
-//! A6000 and the expert tier on the 3090, against one card holding the same
-//! expert sets.
+//! largest card in view and the expert tier on the next, against one card
+//! holding the same expert sets.
 //!
 //! Two loads of one plan (b′) at two KDA lanes (`PlanInputs::plan_lanes`,
 //! `KdaLanes::Two`: the load the two-row verify runs on), one after the
@@ -9,8 +9,8 @@
 //! 1. the reference: the plan with every tier segment moved onto the stage
 //!    card (each routed stack's stage and tier lists joined, the host's
 //!    untouched) and the tier card dropped from the plan's machine, opened by
-//!    `Body::open_placed_lanes` — the A6000 holds the union, and no tier code
-//!    runs;
+//!    `Body::open_placed_lanes` — the stage card holds the union, and no tier
+//!    code runs;
 //! 2. the two cards, through the binaries' own open
 //!    (`app::arch::glm5next::open_pair`, whose load hangs the plan's tier
 //!    card under the host tier).
@@ -20,10 +20,9 @@
 //! so the environment cannot move the sets). It caps every card, the tier's
 //! too. Without it the union is the stage's set plus the tier's, each
 //! planned up to its own card's usable bytes, and the two together pass the
-//! A6000's. Under it the stage's resident bytes are at most `BUDGET` and the
-//! tier's experts at most `BUDGET` less its batch reserve, so the reference
-//! holds at most 2 · `BUDGET` = 32 GiB of the A6000's 48 GiB [derived from
-//! the placement's rule]. Every load feeds a
+//! stage card's. Under it the stage's resident bytes are at most `BUDGET` and
+//! the tier's experts at most `BUDGET` less its batch reserve, so the reference
+//! holds at most 2 · `BUDGET` = 32 GiB [derived from the placement's rule]. Every load feeds a
 //! prompt call as a prompt batch (`PrefillMode::Batch`, set here). Each
 //! layer's stage card keeps its id prefix and the tier the next ids, so the
 //! preconditions below are met by the prompt's routing, which the run checks.
@@ -116,8 +115,8 @@
 //!
 //! `--records`: the `load` record `generate_glm5next` prints (the binary
 //! built beside this one, run as a child: [`RECORD_TOKENS`] prompt ids, `-n
-//! 2`) names the cards the model runs on — `cards` the A6000 alone under
-//! `--place a` with no tier fields, the A6000 then the 3090 under `--place bp`
+//! 2`) names the cards the model runs on — `cards` the largest card alone
+//! under `--place a` with no tier fields, the two largest under `--place bp`
 //! with the tier's experts (`tier_experts` > 0) — as a V4.1 binary's load
 //! record names them (`generate::with_cards`): the record read by the
 //! binary's kinds (`record::Log`, `tools/bloomery/records.py`'s rules), each
@@ -132,6 +131,15 @@
 //! ([`tier_experts_here`]), the census the only difference — and the rule's
 //! break-even and basis. Three loads, one a
 //! process.
+//!
+//! Cards: every arm asks the view for what it needs before any load. Plan (b′)
+//! takes two cards in view (the stage the largest, the tier the next); the bits
+//! and `--nextn` arms' reference holds the stage's experts and the tier's on
+//! the stage card alone, which takes the plan's own values
+//! ([`tier::union_lack_of`]) in usable bytes. A view without them leaves the
+//! arm's clauses by name (`tier::defer_for_room`, `no-card-room`), in either
+//! tier, and loads nothing: `--records` still runs its `--place a` child on
+//! one card.
 //!
 //! Tiers (`BLOOMERY_TIER`): the card budget is [`BUDGET`] in the real tier and the header's in the fixture tier
 //! (`shared/glm5next_tier.rs`). The clauses that need the file's trained weights (a pair that accepts a proposal, flips
@@ -195,7 +203,6 @@ mod gate {
     use model::arch::glm5next::place::{self, KdaLanes, NextnInputs, NextnPlan, PlanInputs};
     use model::placement::{
         self, Device, ExpertList, Format, Machine, Plan, PlanLevers, Role, Row, Segment,
-        workstation,
     };
     use runtime::swaprule::KeptRows;
     use runtime::{Advance as _, Committed, Out, PassSink, Stop, Target, Want};
@@ -207,8 +214,44 @@ mod gate {
 
     const NAME: &str = "gate_glm5next_twocard";
     /// The card budget both plans are made under (module header: the union
-    /// it leaves fits the A6000).
+    /// it leaves is the stage card's to hold).
     const BUDGET: u64 = 16 << 30;
+    /// The clauses of each arm, each declared where it runs and left by name where the cards in view lack what the arm
+    /// needs.
+    const PRECONDITION_SETS: &str =
+        "precondition sets: the tier holds experts on the stage's hybrid layers";
+    const DECODE_STEP: &str = "decode bits: step";
+    const DECODE_PAIR: &str = "decode bits: pair";
+    const CALL_BITS: &str = "call bits";
+    const GROUP_BITS: &str = "group bits: groups of two against groups of one";
+    const STRUCTURE: &str = "structure: the stage's step graph has the reference's node count";
+    const PRECONDITION_PAIR: &str = "precondition pair: a pass keeps its draft";
+    const PRECONDITION_SENT: &str = "precondition sent: every tier layer was sent a routed slot";
+    const BITS_CLAUSES: [&str; 8] = [
+        PRECONDITION_SETS,
+        DECODE_STEP,
+        DECODE_PAIR,
+        CALL_BITS,
+        GROUP_BITS,
+        STRUCTURE,
+        PRECONDITION_PAIR,
+        PRECONDITION_SENT,
+    ];
+    const RES_TWICE: &str = "res-twice: the same history twice";
+    const RES_TIER_FIXED: &str = "res-tier-fixed";
+    const RES_MTP_TWICE: &str = "res-mtp-twice: the same drafted history twice";
+    const RES_MTP_TIER_FIXED: &str = "res-mtp-tier-fixed";
+    const RESIDENCY_CLAUSES: [&str; 4] =
+        [RES_TWICE, RES_TIER_FIXED, RES_MTP_TWICE, RES_MTP_TIER_FIXED];
+    const NEXTN_REFUSE: &str = "nextn-refuse";
+    const NEXTN_BITS_KEPT: &str = "nextn-bits: a draft is kept";
+    const NEXTN_BITS: &str =
+        "nextn-bits: the drafted history's ids and windows are the reference's";
+    const NEXTN_STAGE: &str = "nextn-stage";
+    const RECORDS: &str = "records";
+    const RECORDS_BP: &str = "records (--place bp)";
+    const RECORDS_UNSET: &str =
+        "records-unset: the unset rule keeps bp at the real file's tier size";
     /// Cache rows: every position the latent layers attend whole
     /// (`place::dense_positions`), past every leg's last position.
     const CTX: usize = 2051;
@@ -270,7 +313,7 @@ mod gate {
     }
 
     /// The tiered load through the binaries' open, refused unless its tier's
-    /// `Gpu` is the 3090.
+    /// `Gpu` is the plan's tier card.
     fn open_two(
         machine: impl Fn(usize) -> Machine,
         cfg: &GlmCfg,
@@ -285,16 +328,16 @@ mod gate {
             cfg: cfg.clone(),
         };
         let s = open_pair(file, args, &mut Quiet)?.ok_or("the open planned nothing")?;
-        tier_on_3090(&s, "load", t0)?;
+        tier_on_card(&s, "load", t0)?;
         Ok(s)
     }
 
-    /// Refused unless `s`'s tier `Gpu` is the 3090; prints the load line,
-    /// `what` its name.
-    fn tier_on_3090(s: &Session<Body>, what: &str, t0: Instant) -> Result<(), GateError> {
+    /// Refused unless `s`'s tier `Gpu` is the plan's tier card; prints the load
+    /// line, `what` its name.
+    fn tier_on_card(s: &Session<Body>, what: &str, t0: Instant) -> Result<(), GateError> {
         let m = s.model();
         let stage = (m.gpu().device_name()?, m.resident_bytes());
-        tier_twocard::tier_on_3090(what, t0, (&stage.0, stage.1), m.body(NAME)?.hybrid())
+        tier_twocard::tier_on_card(what, t0, (&stage.0, stage.1), m.body(NAME)?.hybrid())
     }
 
     /// The reference: `plan`, whose stage card holds the union
@@ -319,14 +362,7 @@ mod gate {
         if !model.body(NAME)?.hybrid().tiers().is_empty() {
             return Err("the reference load holds a tier card".into());
         }
-        let device = model.gpu().device_name()?;
-        if !device.contains(workstation::A6000.name) {
-            return Err(format!(
-                "the reference opened on {device}, not the {}: the union is planned for its bytes",
-                workstation::A6000.name
-            )
-            .into());
-        }
+        tier::opened_on_rank("reference", model.gpu(), 0)?;
         let s = Loaded::from_model(model, cfg.clone(), u32::try_from(plan.ctx_max)?)
             .ready(&mut Quiet)?;
         println!(
@@ -502,7 +538,7 @@ mod gate {
             bloomery_levers::at_main(&tier::acts_on(&[HOST_POPULATE, HOST_LOCK, CARD_DONTNEED])?)?;
         glm5next_tier::init_file()?;
         // Both plans run under one budget that no environment moves: the real tier's
-        // [`BUDGET`], a parameter of the real file (the union it leaves fits the A6000); the
+        // [`BUDGET`], a parameter of the real file (the union it leaves is the stage card's to hold); the
         // fixture tier's, the header's, which the generator planned to put half of the experts
         // on a card.
         let place_levers = match Tier::from_env()? {
@@ -529,15 +565,18 @@ mod gate {
         if !pass {
             return Err(checks_failed());
         }
-        println!("PASSED: {NAME}");
+        if tier::ran_any() {
+            println!("PASSED: {NAME}");
+        }
         Ok(())
     }
 
     /// Plan (b′)'s machine for the one sequence every arm loads, its
-    /// checkpoints reserved at [`CTX`] positions.
+    /// checkpoints reserved at [`CTX`] positions, on the two largest cards in
+    /// view.
     fn bp_machine(inputs: &PlanInputs) -> Result<impl Fn(usize) -> Machine + Copy, GateError> {
         glm_machine(
-            Place::Bp,
+            Place::Bp.on_host()?,
             Some(place::tier_batch(inputs)?),
             1,
             checkpoint_price(inputs)?,
@@ -547,6 +586,10 @@ mod gate {
 
     /// The bits arm (no flag): the union reference, then the two cards.
     fn bits(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
+        if let Some(why) = tier::two_cards_lack()? {
+            tier::defer_for_room(&BITS_CLAUSES, &why)?;
+            return Ok(true);
+        }
         let cfg = cfg.clone();
         let bp = bp_machine(inputs)?;
         let layers = inputs.model.layers;
@@ -597,11 +640,17 @@ mod gate {
                 unbudgeted.tier_n_l.first()
             );
         }
+        // The reference holds the union on the stage card alone: a card without those bytes leaves the
+        // arm by name before [`union_plan`] refuses it.
+        if let Some(why) = tier::union_lack_of(&plan) {
+            tier::defer_for_room(&BITS_CLAUSES, &why)?;
+            return Ok(true);
+        }
         let hybrid: Vec<usize> = (0..layers)
             .filter(|&l| plan.n_l.get(l).is_some_and(|&n| n > 0))
             .collect();
         let mut pass = true;
-        tier::sc("precondition sets: the tier holds experts on the stage's hybrid layers")?;
+        tier::sc(PRECONDITION_SETS)?;
         if hybrid == tier_layers {
             println!(
                 "ok precondition sets: the tier holds experts on the stage's {} hybrid layers",
@@ -634,19 +683,13 @@ mod gate {
             let run = legs(&mut s, &prompt)?;
             (run, group_leg(&mut s, &prompt)?)
         };
-        for name in [
-            "decode bits: step",
-            "decode bits: pair",
-            "call bits",
-            "group bits: groups of two against groups of one",
-            "structure: the stage's step graph has the reference's node count",
-        ] {
+        for name in [DECODE_STEP, DECODE_PAIR, CALL_BITS, GROUP_BITS, STRUCTURE] {
             tier::sc(name)?;
         }
-        pass &= same("decode bits: step", &want.step, &got.step);
-        pass &= same("decode bits: pair", &want.pair, &got.pair);
-        pass &= same("call bits", &want.call, &got.call);
-        pass &= same("group bits: groups of two against groups of one", &g1, &g2);
+        pass &= same(DECODE_STEP, &want.step, &got.step);
+        pass &= same(DECODE_PAIR, &want.pair, &got.pair);
+        pass &= same(CALL_BITS, &want.call, &got.call);
+        pass &= same(GROUP_BITS, &g1, &g2);
         // PIN(2026-10-23): the counts compare with each load's own
         // fully-carded layers' go/wait omissions added back (two nodes a
         // layer, the hostless path the engine's step takes): the union
@@ -676,11 +719,7 @@ mod gate {
         pass &= structure;
         // A pass that keeps its draft is the file's NextN layer: a fixture's is random, whose
         // proposals the target refuses, so only the real tier requires one kept.
-        let accepts = tier::premise(
-            "precondition pair: a pass keeps its draft",
-            Tag::FileBound,
-            got.accepts > 0,
-        )?;
+        let accepts = tier::premise(PRECONDITION_PAIR, Tag::FileBound, got.accepts > 0)?;
         if accepts && got.rejects > 0 {
             println!(
                 "ok precondition pair: the passes kept {} drafts and rejected {}",
@@ -694,7 +733,7 @@ mod gate {
             );
             pass = false;
         }
-        tier::sc("precondition sent: every tier layer was sent a routed slot")?;
+        tier::sc(PRECONDITION_SENT)?;
         pass &= sent_every("decode", got.sent_decode.as_ref(), &tier_layers, false);
         pass &= sent_every("call", got.sent_call.as_ref(), &tier_layers, true);
         Ok(pass)
@@ -920,6 +959,10 @@ mod gate {
 
     /// The `--residency` arm (module header).
     fn residency_arm(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
+        if let Some(why) = tier::two_cards_lack()? {
+            tier::defer_for_room(&RESIDENCY_CLAUSES, &why)?;
+            return Ok(true);
+        }
         let lever = Residency::parse(GLM_RESIDENCY_UNSET)?;
         let bp = bp_machine(inputs)?;
         let prompt = prompt()?;
@@ -938,7 +981,7 @@ mod gate {
             let t0 = Instant::now();
             let mut s = open_resident(file()?, open_args(), lever, &mut Quiet)?
                 .ok_or("the resident open planned nothing")?;
-            tier_on_3090(&s, "resident load", t0)?;
+            tier_on_card(&s, "resident load", t0)?;
             s.model_mut().body_parts(NAME)?.2.log_residency(0);
             let load = tier_held(&s)?;
             let tier_layers = tier_layers_of(&s)?;
@@ -946,7 +989,7 @@ mod gate {
             let b = history(&mut s, ids);
             match (a, b) {
                 (Ok((a, sent)), Ok((b, _))) => {
-                    tier::sc("res-twice: the same history twice")?;
+                    tier::sc(RES_TWICE)?;
                     pass &= twice("res-twice", &a, &b, &a.landings, glm5next_tier::skew()?);
                     pass &= sent_every("residency", sent.as_ref(), &tier_layers, false);
                 }
@@ -959,13 +1002,13 @@ mod gate {
                     pass = false;
                 }
             }
-            pass &= held("res-tier-fixed", tier_fixed("res-tier-fixed", &s, &load));
+            pass &= held(RES_TIER_FIXED, tier_fixed(RES_TIER_FIXED, &s, &load));
         }
         {
             let t0 = Instant::now();
             let mut s = open_nextn(file()?, open_args(), lever, &mut Quiet)?
                 .ok_or("the NextN open planned nothing")?;
-            tier_on_3090(&s, "resident NextN load", t0)?;
+            tier_on_card(&s, "resident NextN load", t0)?;
             s.model_mut().body_parts(NAME)?.2.log_residency(0);
             let load = tier_held(&s)?;
             let tier_layers = tier_layers_of(&s)?;
@@ -973,7 +1016,7 @@ mod gate {
             let b = drafted(&mut s, ids);
             match (a, b) {
                 (Ok((a, sent)), Ok((b, _))) => {
-                    tier::sc("res-mtp-twice: the same drafted history twice")?;
+                    tier::sc(RES_MTP_TWICE)?;
                     pass &= twice("res-mtp-twice", &a, &b, &a.landings, glm5next_tier::skew()?);
                     pass &= sent_every("residency drafted", sent.as_ref(), &tier_layers, false);
                 }
@@ -987,8 +1030,8 @@ mod gate {
                 }
             }
             pass &= held(
-                "res-mtp-tier-fixed",
-                tier_fixed("res-mtp-tier-fixed", &s, &load),
+                RES_MTP_TIER_FIXED,
+                tier_fixed(RES_MTP_TIER_FIXED, &s, &load),
             );
         }
         Ok(pass)
@@ -1138,6 +1181,11 @@ mod gate {
 
     /// The `--nextn` arm (module header).
     fn nextn_arm(cfg: &GlmCfg, inputs: &PlanInputs) -> Result<bool, GateError> {
+        const NEXTN_CLAUSES: [&str; 4] = [NEXTN_REFUSE, NEXTN_BITS_KEPT, NEXTN_BITS, NEXTN_STAGE];
+        if let Some(why) = tier::two_cards_lack()? {
+            tier::defer_for_room(&NEXTN_CLAUSES, &why)?;
+            return Ok(true);
+        }
         let nextn = NextnInputs::read(inputs)?;
         let bp = bp_machine(inputs)?;
         let two = bp(inputs.model.layers);
@@ -1150,7 +1198,14 @@ mod gate {
             np.plan.host.experts,
             nextn.index
         );
-        let mut pass = held("nextn-refuse", nextn_refuse(&np, inputs, &nextn, cfg));
+        let mut pass = held(NEXTN_REFUSE, nextn_refuse(&np, inputs, &nextn, cfg));
+        // The reference holds the union on the stage card alone ([`NEXTN_REFUSE`] loads no union):
+        // a card without those bytes leaves the arm's other clauses by name before [`union_plan`]
+        // refuses it.
+        if let Some(why) = tier::union_lack_of(&np.plan) {
+            tier::defer_for_room(&NEXTN_CLAUSES[1..], &why)?;
+            return Ok(pass);
+        }
         let prompt = prompt()?;
         let ids = &prompt[..PROMPT];
         let flat = Machine {
@@ -1179,7 +1234,7 @@ mod gate {
         let file = glm5next_tier::open()?;
         let mut s = open_nextn(file, args, Residency::Off, &mut Quiet)?
             .ok_or("the NextN open planned nothing")?;
-        tier_on_3090(&s, "NextN load", t0)?;
+        tier_on_card(&s, "NextN load", t0)?;
         let tier_layers = tier_layers_of(&s)?;
         let (got, windows) = drafted(&mut s, ids)?;
         let rejected = got.windows.iter().filter(|&&(p, k)| p && k == 1).count();
@@ -1190,9 +1245,9 @@ mod gate {
             .zip(&want.tokens)
             .position(|(a, b)| a != b);
         let bits = got.tokens == want.tokens && got.windows == want.windows;
-        let accepts = tier::premise("nextn-bits: a draft is kept", Tag::FileBound, accepted > 0)?;
+        let accepts = tier::premise(NEXTN_BITS_KEPT, Tag::FileBound, accepted > 0)?;
         let ok = bits && accepts && rejected > 0;
-        tier::sc("nextn-bits: the drafted history's ids and windows are the reference's")?;
+        tier::sc(NEXTN_BITS)?;
         println!(
             "nextn-bits: {} ids in {} windows, the reference's {} ids in {} windows, the same \
              {bits} (first id apart {differ:?}); {accepted} drafts kept, {rejected} rejected: {}",
@@ -1204,7 +1259,7 @@ mod gate {
         );
         pass &= ok;
         pass &= held(
-            "nextn-stage",
+            NEXTN_STAGE,
             nextn_stage(&s, nextn.index, windows.as_ref(), &tier_layers),
         );
         Ok(pass)
@@ -1293,10 +1348,16 @@ mod gate {
         let ids = &prompt[..RECORD_TOKENS];
         let mut pass = true;
         let mut child_ctx = None;
+        // Plan (b′) takes two cards in view; `--place a` runs on one.
+        let two_lack = tier::two_cards_lack()?;
         for place in [Place::A, Place::Bp] {
+            if let (false, Some(why)) = (place.tier_cards().is_empty(), &two_lack) {
+                tier::defer_for_room(&[RECORDS_BP], why)?;
+                continue;
+            }
             let want = card_words(place)?;
             let line = held(
-                "records",
+                RECORDS,
                 load_record(place.name(), ids).and_then(|l| {
                     let named = cards_named(&l, &want);
                     let mutant = l.line().replacen(
@@ -1349,10 +1410,24 @@ mod gate {
         // census ([`tier_experts_here`]), not a literal: the census moves,
         // the plan's terms move with the code, and this family's literal
         // bands have gone red twice.
-        let unset = !tier::run_clause(
-            "records-unset: the unset rule keeps bp at the real file's tier size",
-            Tag::FileBound,
-        )? || reported(
+        let unset = if let Some(why) = &two_lack {
+            tier::defer_for_room(&[RECORDS_UNSET], why)?;
+            true
+        } else {
+            !tier::run_clause(RECORDS_UNSET, Tag::FileBound)?
+                || records_unset(levers, ids, child_ctx)
+        };
+        pass &= unset;
+        Ok(pass)
+    }
+
+    /// `records-unset` (module header) of the `--place bp` child's context `child_ctx`.
+    fn records_unset(
+        levers: &bloomery_levers::Levers,
+        ids: &[u32],
+        child_ctx: Option<u64>,
+    ) -> bool {
+        reported(
             "records-unset",
             unset_record(ids).and_then(|p| {
                 let (place, why) = (p.word("place")?, p.text("why")?);
@@ -1378,9 +1453,7 @@ mod gate {
                 );
                 Ok(ok)
             }),
-        );
-        pass &= unset;
-        Ok(pass)
+        )
     }
 
     /// The unset rule's question asked by this gate on its own census, through
