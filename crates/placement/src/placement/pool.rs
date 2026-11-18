@@ -235,6 +235,7 @@ pub(super) fn totals<'a>(
         },
         headroom_bytes: 0,
         room: None,
+        grow: super::HostGrow::default(),
     };
     // The room the machine's figure leaves past the plan's host need, the
     // need's own arithmetic (`HostNeed`).
@@ -345,8 +346,13 @@ impl Plan<'_> {
     /// room: the headroom is below zero even with every host-served routed expert out of it. A
     /// room that holds the pages with no expert on the host but not the split's floor is the
     /// split's own refusal ([`PlacementError::HostRoomFloor`]).
-    pub fn kv_host_planes(&mut self, bytes: u64) -> Result<(), PlacementError> {
+    ///
+    /// `at_floor` is the part of `bytes` the plan's floor reaches (0 under `spill`, the floor's
+    /// planes under `all`): on a plan that charges its host K/V at the floor
+    /// ([`HostTotals::grow`]), the rest is the growth the split's paged experts yield to.
+    pub fn kv_host_planes(&mut self, bytes: u64, at_floor: u64) -> Result<(), PlacementError> {
         self.host.kv_host_bytes = bytes;
+        self.host.grow.add_pages(bytes, at_floor.min(bytes));
         self.host.headroom_bytes -= i128::from(bytes);
         let paged_out = self.host.headroom_bytes + i128::from(self.host.expert_bytes);
         if paged_out < 0 {

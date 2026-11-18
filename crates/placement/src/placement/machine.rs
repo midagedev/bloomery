@@ -590,6 +590,17 @@ pub trait KvBytes {
     fn rooms(&self) -> Option<&PosLayout> {
         None
     }
+    /// Whether this model's loads grow their host K/V by yielding host experts to the NVMe tier
+    /// as the positions pass the floor (their body's `KvRoomBody::host_grow`): a plan with a floor
+    /// in force and host-backed K/V then charges the host K/V at the floor and keeps on the host
+    /// the experts the growth yields ([`HostTotals::grow`]). The default is no: a load whose
+    /// body yields nothing keeps its host K/V charged at the cap, so the growth meets no host
+    /// shortfall.
+    ///
+    /// [`HostTotals::grow`]: crate::placement::HostTotals::grow
+    fn host_yields(&self) -> bool {
+        false
+    }
     /// Bytes the stage that runs layer 0 holds at `ctx_max` positions beside
     /// its cache, one copy for every resident sequence: the rope rows its
     /// body copies to the card, one row a position (`gpu::rope_table::RopeRows`).

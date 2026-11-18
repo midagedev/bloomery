@@ -193,7 +193,7 @@ fn host_plan<'a>(
     };
     let mut plan = plan(model, machine, 80, &Layers { declares: true }, &levers)?;
     if pages > 0 {
-        plan.kv_host_planes(pages)?;
+        plan.kv_host_planes(pages, 0)?;
     }
     let room = plan.plan_at(&(machine.host().usable_bytes, workstation::HostRead::Given));
     expert_nvme_tier(&mut plan, room, Some(0))?;

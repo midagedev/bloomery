@@ -1359,12 +1359,16 @@ mod drive {
         }
     }
 
-    /// The `residency pass` records of the boundaries since the last print,
-    /// after the run's timed window: nothing prints between two timed steps.
+    /// The `residency pass` records of the boundaries since the last print and the `host
+    /// yield` records of the host K/V's growth, after the run's timed window: nothing prints
+    /// between two timed steps.
     fn print_passes(s: &mut Session<Body>) -> Result<(), GateError> {
         let (_, _, b) = s.model_mut().body_parts("generate_ds41")?;
         for (kind, r) in b.take_residency_passes() {
             record::residency_pass_of(kind, &r).print();
+        }
+        for m in b.take_host_yields() {
+            record::host_yield(&m).print();
         }
         Ok(())
     }

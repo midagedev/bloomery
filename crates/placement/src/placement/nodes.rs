@@ -290,6 +290,7 @@ pub fn routed_host<'a>(
             pool_card_bytes: 0,
             headroom_bytes: 0,
             room: None,
+            grow: super::HostGrow::default(),
         },
         nvme_bytes: 0,
         n_l: vec![0; model.layers],

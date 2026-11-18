@@ -282,12 +282,13 @@ impl ExpertRank {
 
     /// The layer's ids `of` — the host leg's, ascending — split by the rank
     /// at its cold end: the coldest `n` of them, which the NVMe expert tier
-    /// pages ([`super::room::expert_nvme_tier`]), and the rest, which the
-    /// host keeps; each list ascending as the slot order needs it
-    /// ([`ExpertList`]). The counts are the caller's, so the bytes the split
-    /// moves are the same whatever ids they are. Refused by name when the
-    /// rank does not order `layer` over its `experts` experts, the refusal
-    /// [`ExpertRank::split`] gives.
+    /// pages ([`super::room::expert_nvme_tier`]), hottest first (the order a
+    /// larger room keeps them, the reverse of the order a host K/V's growth
+    /// yields them in), and the rest, which the host keeps, ascending; an
+    /// [`ExpertList`] sorts either for the slot order. The counts are the
+    /// caller's, so the bytes the split moves are the same whatever ids they
+    /// are. Refused by name when the rank does not order `layer` over its
+    /// `experts` experts, the refusal [`ExpertRank::split`] gives.
     pub(super) fn cold_split(
         &self,
         layer: usize,
@@ -322,7 +323,7 @@ impl ExpertRank {
                 kept.push(id);
             }
         }
-        paged.sort_unstable();
+        paged.reverse();
         kept.sort_unstable();
         Ok((kept, paged))
     }

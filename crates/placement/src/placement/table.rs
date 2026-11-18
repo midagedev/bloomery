@@ -5,6 +5,7 @@ use bloomery_levers::KvHost;
 
 use super::Role;
 use super::card_budget;
+use super::host_grow::HostGrow;
 use super::machine::{
     Device, ExpertList, Format, Machine, ModelTensor, ModelTensors, stack_experts,
 };
@@ -324,6 +325,11 @@ pub struct HostTotals {
     /// the reading that decided it, [`workstation::HostRead::Machine`] where
     /// a cap did; `None` for a plan made without one.
     pub room: Option<(u64, (u64, workstation::HostRead))>,
+    /// The host K/V from its floor to the cap and the host experts that yield to it
+    /// ([`HostGrow`]): [`HostTotals::shadow_bytes`] and [`HostTotals::kv_host_bytes`] stay the
+    /// cap's, and the yields' bytes, in [`HostTotals::expert_bytes`], come out of them in the
+    /// host need ([`workstation::HostNeed::shadows`]).
+    pub grow: HostGrow,
 }
 
 impl HostTotals {

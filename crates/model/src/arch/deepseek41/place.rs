@@ -307,7 +307,13 @@ impl PlanInputs {
             let host =
                 self.kv_host_bytes(ctx_max, slots.get() as u64, levers.kv_host, plan.kv_floor)?;
             if host > 0 {
-                plan.kv_host_planes(host)?;
+                let at_floor = match plan.kv_floor {
+                    Some(f) => {
+                        self.kv_host_bytes(f, slots.get() as u64, levers.kv_host, Some(f))?
+                    }
+                    None => host,
+                };
+                plan.kv_host_planes(host, at_floor)?;
             }
             let room = plan.plan_at(&self.room);
             placement::expert_nvme_tier(&mut plan, room, self.arena)?;

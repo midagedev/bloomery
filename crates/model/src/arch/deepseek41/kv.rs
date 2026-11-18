@@ -186,6 +186,11 @@ impl KvBytes for KvLayout {
     fn shadow_bytes(&self, _layer: usize, ctx_max: u64) -> u64 {
         ctx_max * self.latent * F16_BYTES
     }
+
+    /// The V4.1 body yields host experts to its rooms' host growth before a fit backs it.
+    fn host_yields(&self) -> bool {
+        true
+    }
 }
 
 /// A 2-D tensor's output width, `dims[1]`.
@@ -208,8 +213,8 @@ mod tests {
     use super::*;
     use crate::arch::deepseek41::place::PlanInputs;
     use crate::placement::{
-        Card, Host, KvBytes, KvDefault, Machine, ModelTensor, ModelTensors, Node, PlanLevers, Role,
-        UnifiedPool,
+        Card, GrowHold, Host, HostGrow, KvBytes, KvDefault, Machine, ModelTensor, ModelTensors,
+        Node, PlanLevers, Role, UnifiedPool,
         workstation::{HostNeed, HostRead},
     };
     use bloomery_levers::{KvFloor, KvHost};
@@ -523,45 +528,61 @@ mod tests {
         assert_eq!(room - after, i128::from(spill));
     }
 
-    /// The ring shadows are host rooms that grow to the cap as positions arrive, so the plan
-    /// counts them on the host at the cap whatever the floor (an uncounted growth is a
-    /// mid-session host OOM): a row of the latent's width (256 values of f16) a position a layer.
-    /// FAIL-first: the planner reading the shadows at the floor leaves the floor row at half.
+    /// The ring shadows are host rooms that grow to the cap as positions arrive. Where the
+    /// planes' rooms back host pages (the seat's `spill`), the plan charges them at the floor
+    /// and leaves their growth to the host experts the split pages at the cap ([`HostGrow`]):
+    /// the shadows' address range stays the cap's, a row of the latent's width (256 values of
+    /// f16) a position a layer. Under `off` no host page was read and the shadows may be one
+    /// page-locked allocation of the cap, so the plan charges them at the cap.
+    ///
+    /// PIN(2026-11-17): user decision, host K/V charged at the floor and grown by yielding host
+    /// experts.
+    ///
+    /// FAIL-first: arming the growth under `off` charges its shadows at the floor; reading the
+    /// floor's shadows at the cap leaves the seat's floor charge at the cap's.
     #[test]
-    fn the_shadow_term_is_counted_at_the_cap_under_a_floor() {
-        let kv = KvLayout::assemble(
-            128,
-            256,
-            1,
-            (0..4)
-                .map(|l| {
-                    Some(Source {
-                        ratio: if l == 3 { 1 } else { 2 },
-                        index_key: 128,
-                        state: 0,
-                    })
-                })
-                .collect(),
-        );
+    fn the_shadow_term_is_charged_at_the_floor_where_its_rooms_grow() {
+        let kv = four_layers();
         let pool = 1 << 30;
-        let inputs = tiny_inputs(kv, pool);
+        let mut inputs = tiny_inputs(kv, pool);
+        inputs.kv_host_page = Some(4_096);
         let machine = pool_machine(pool);
         let (cap, floor) = (16_384, 8_192);
-        let shadow = |levers: &PlanLevers| {
-            inputs
-                .plan(&machine, cap, levers)
-                .expect("a plan")
-                .host
-                .shadow_bytes
-        };
         let per_position = 4 * 256 * 2;
-        assert_eq!(shadow(&PlanLevers::default()), per_position * cap);
-        let lever = PlanLevers {
+        let plan = |levers: &PlanLevers| inputs.plan(&machine, cap, levers).expect("a plan");
+        let off = plan(&PlanLevers {
             kv_floor: Some(floor),
             ..PlanLevers::default()
-        };
-        assert_eq!(shadow(&lever), per_position * cap);
-        assert!(per_position * floor < per_position * cap);
+        });
+        assert_eq!(off.host.shadow_bytes, per_position * cap);
+        assert_eq!(off.host.grow, HostGrow::default(), "off charges the cap");
+        assert_eq!(HostNeed::of(&off, 0).shadows, per_position * cap);
+        let seat = PlanLevers::default().resolve_kv(
+            KvFloor::Unset,
+            None,
+            KvDefault {
+                floor,
+                host: KvHost::Spill,
+            },
+        );
+        let spill = plan(&seat);
+        assert_eq!(
+            spill.host.shadow_bytes,
+            per_position * cap,
+            "the range at the cap"
+        );
+        let g = &spill.host.grow;
+        assert_eq!((g.floor, g.floor_bytes), (floor, per_position * floor));
+        assert_eq!(
+            g.grow_bytes,
+            per_position * (cap - floor) + spill.host.kv_host_bytes,
+            "the shadows' growth and the pages past the floor"
+        );
+        assert_eq!(
+            g.hold,
+            GrowHold::Room,
+            "the room holds the cap: nothing paged"
+        );
     }
 
     /// The tiny file's four layers as a stack: three sources at ratio 2 and one at ratio 1.
@@ -651,9 +672,13 @@ mod tests {
     }
 
     /// The seat's default on a host whose figure holds its experts and the other host terms
-    /// and not the selected rows' pages as well: the NVMe tier takes the experts the pages
-    /// displace, and the host's need counts the pages. The plan is no refusal while a split can
-    /// make the pages' room.
+    /// and not the selected rows' pages as well: the static split at the cap pages the experts
+    /// the pages displace, the ones the pages' growth past the floor holds stay on the host at
+    /// load to yield to it ([`HostGrow`]), and the host's need counts the pages the yields do
+    /// not cover. The plan is no refusal while a split can make the pages' room.
+    ///
+    /// PIN(2026-11-17): user decision, host K/V charged at the floor and grown by yielding host
+    /// experts.
     ///
     /// FAIL-first: `kv_host_planes` refusing by the headroom the host's routed experts leave
     /// before the split (the seat's default meeting `KvHostOverHost` at 0 B of headroom, as the
@@ -684,14 +709,16 @@ mod tests {
             spill.host.kv_host_bytes, pages,
             "the plan counts the pages the seat's lever puts on the host"
         );
+        let grow = &spill.host.grow;
+        assert_eq!(grow.hold, GrowHold::Yields);
         assert_eq!(
             HostNeed::of(&spill, 0).shadows,
-            spill.host.shadow_bytes + pages,
-            "the host's need counts the pages"
+            spill.host.shadow_bytes + pages - grow.yield_bytes,
+            "the host's need counts the pages the yields do not cover"
         );
         assert!(
-            spill.host.nvme_expert_bytes >= pages,
-            "the NVMe tier holds the experts the pages displaced"
+            spill.host.nvme_expert_bytes + grow.yield_bytes >= pages,
+            "the NVMe tier holds the experts the pages displace at the cap"
         );
         assert_eq!(
             spill.host.expert_bytes + spill.host.nvme_expert_bytes,

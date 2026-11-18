@@ -154,6 +154,10 @@ impl KvBytes for SlotsOf<'_> {
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
         self.kv.stage_position_bytes(ctx_max)
     }
+
+    fn host_yields(&self) -> bool {
+        self.kv.host_yields()
+    }
 }
 
 /// The host bytes a host-backed K/V room holds at `positions` positions under the planes' backing

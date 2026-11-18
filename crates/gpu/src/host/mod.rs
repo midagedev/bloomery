@@ -2530,6 +2530,12 @@ impl<H: HostExperts> HostTier<H> {
         self.residency.as_ref()
     }
 
+    /// [`HostTier::residency`] for a move of its own: the host experts a K/V growth step
+    /// yields ([`crate::HostYielder`]).
+    pub fn residency_mut(&mut self) -> Option<&mut HostResidency> {
+        self.residency.as_mut()
+    }
+
     /// Watch `word`, the fault word of the `Gpu` the chain launches on
     /// ([`crate::Gpu::fault_word`]); a word of another context is refused. A
     /// batch service ([`HostTier::serve_batch`]) that meets input the card

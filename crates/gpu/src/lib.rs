@@ -135,6 +135,10 @@ pub use model::{GpuModel, Slots};
 pub use room::elastic::{
     Elastic, ElasticBody, ElasticStats, FilledBytes, HELD_NO_QUANTUM, settle_to_margin, with_room,
 };
+pub use room::host::host_backed;
+pub use room::host_grow::{
+    HostGrowBook, HostGrowStats, HostYieldMove, HostYielder, take_host_yield,
+};
 pub use room::kv::{
     CardKeep, FillHeld, FreedBytes, KvBacking, KvRoomBody, RoomTensor, fit_rooms, kv_backing,
     take_fill_first,

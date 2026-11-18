@@ -40,6 +40,7 @@ pub mod devices;
 pub mod elastic;
 pub mod graphs;
 pub mod heads;
+pub mod host_grow;
 pub mod need_hook;
 pub mod nodes;
 pub mod paged_drop;
@@ -65,6 +66,7 @@ mod table;
 mod tests;
 
 pub use gguf::card::CardFormat;
+pub use host_grow::{GrowHold, GrowShort, HostGrow, Yield, YieldAsk, YieldCursor};
 pub use machine::{
     Card, Device, ExpertList, Format, HEAD_TENSOR, Host, KvBytes, Machine, ModelTensor,
     ModelTensors, Node, Requantized, Reserve, UnifiedPool, allocator_bytes, card_format_of_role,

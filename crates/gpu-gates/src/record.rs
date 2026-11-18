@@ -13,6 +13,8 @@
 use std::fmt::Display;
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu::HostYieldMove;
+#[cfg(feature = "gpu")]
 use bloomery_gpu::host::PassKind;
 #[cfg(feature = "gpu")]
 use bloomery_gpu::host::swap::{CallPick, CallReport, Leak, PassReport, ResetReport};
@@ -26,7 +28,7 @@ use bloomery_levers::ChurnHosting;
 use model::placement::workstation::{
     self, DeviceInfo, HostRead, NeedClasses, plan_room, spec_of_device,
 };
-use model::placement::{Machine, Plan, arena_slots};
+use model::placement::{HostGrow, Machine, Plan, arena_slots};
 
 use crate::GateError;
 
@@ -156,7 +158,7 @@ pub static PROMPT_PASS: Kind = Kind {
 pub static PLAN: Kind = Kind {
     name: "plan",
     head: "plan",
-    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the pick those ids took (nvme: coldest, each layer's coldest host ids under the router rank, else id-tail; absent when it pages nothing), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; the role is stage, tier<i> for an expert tier card by its place among the tier cards, or holder for a card that joins the plan to hold a reserve, a draft's, and no expert; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them, and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none), and, when the plan took each routed layer's experts in a router rank's order (BLOOMERY_EXPERT_RANK), the rank file's path (expert_rank, last; absent when there is none).",
+    doc: "The placement the engine is about to load by: its card, context, where the experts sit, the routed-expert bytes the plan pages through the NVMe tier (paged), the pick those ids took (nvme: coldest, each layer's coldest host ids under the router rank, else id-tail; absent when it pages nothing), the RAM arena they page through (arena) and the slots it holds (arena_slots), 0 and 0 and 0 on a plan that pages nothing, when the plan reads its K/V at a floor with host-backed K/V (BLOOMERY_KV_HOST spill or all), the host K/V's growth: the floor (kv_floor), the host K/V bytes the plan charges there (host_kv_floor), the bytes it grows by to the cap (host_kv_grow), what holds the growth (grow: room, the host room beside the plan; yields, host experts the growth gives up to the NVMe tier in the static plan's paging order; static, the K/V charged at the cap all the same, for the reason grow_why names: arena, the NVMe tier's arena serves the paged ids through a host range the load fixes, so no id can move to it later) and the host expert bytes and experts that yield to it (grow_yield, grow_experts; 0 unless grow is yields), absent on a plan with no floor, with BLOOMERY_KV_HOST=off or of a model whose loads yield nothing, the host room's reading the plan was made at (room) and the plan room it was held to (plan_room, the reading less the drift margin) when it was made at one, and each plan card's device (role:name:ordinal:usable bytes; the role is stage, tier<i> for an expert tier card by its place among the tier cards, or holder for a card that joins the plan to hold a reserve, a draft's, and no expert; by-name for a card a census-free plan opens by its name) under the CUDA enumeration order in force, with the card's free bytes at plan time when the census read them, and, when the card holds a file tensor in another quantization than its file's (a BF16 head in MXFP8 planes), each such tensor as tensor:file type:card format (requantized; absent when there is none), and, when the plan took each routed layer's experts in a router rank's order (BLOOMERY_EXPERT_RANK), the rank file's path (expert_rank, last; absent when there is none).",
     parts: &[
         key("place", Word, ""),
         key("card", Word, ""),
@@ -180,6 +182,13 @@ pub static PLAN: Kind = Kind {
         opt("nvme", Word, ""),
         key("arena", U64, "B"),
         key("arena_slots", U64, "slots"),
+        opt("kv_floor", U64, "positions"),
+        opt("host_kv_floor", U64, "B"),
+        opt("host_kv_grow", U64, "B"),
+        opt("grow", Word, ""),
+        opt("grow_why", Word, ""),
+        opt("grow_yield", U64, "B"),
+        opt("grow_experts", U64, "experts"),
         opt("room", U64, "B"),
         opt("plan_room", U64, "B"),
         opt("card_free", U64, "B"),
@@ -670,6 +679,22 @@ pub static CAPTURE_PAIR: Kind = Kind {
     head: "capture",
     doc: "The two-row pass captured before the prompt: its graph's nodes.",
     parts: &[key("pair_graph_nodes", U64, "nodes")],
+};
+
+/// The host K/V's growth past what the plan charged: host experts given up to
+/// the NVMe tier ([`bloomery_gpu::HostYieldMove`]).
+pub static HOST_YIELD: Kind = Kind {
+    name: "host_yield",
+    head: "host yield",
+    doc: "Host experts given up to the NVMe tier before a fit through `positions` positions backed host K/V pages past what the plan charged at its floor and the yields before held: the shortfall the fit would leave, the experts given up, in the plan's yield order (the order the static plan pages them), their bytes over the routed stacks, the bytes their pages dropped from the mapping and the page cache, and the host expert bytes left to yield before the plan's split at the cap.",
+    parts: &[
+        key("positions", U64, "positions"),
+        key("shortfall", U64, "B"),
+        key("experts", U64, "experts"),
+        key("bytes", U64, "B"),
+        key("dropped", U64, "B"),
+        key("left", U64, "B"),
+    ],
 };
 
 /// The elastic expert tenant's give-back: expert bytes returned so a later
@@ -3400,6 +3425,7 @@ pub static GENERATE_DS41: &[&Kind] = &[
     &RESIDENCY_LEVER,
     &RESIDENCY_HOST,
     &RESIDENCY_PASS,
+    &HOST_YIELD,
     &RESIDENCY_RESET,
     &RESIDENCY_LEAK,
     &CALL_STREAM,
@@ -3462,6 +3488,7 @@ pub static BLOOMERY_SERVE_DS41: &[&Kind] = kinds![
         &RESIDENCY_LEVER,
         &RESIDENCY_HOST,
         &RESIDENCY_PASS,
+        &HOST_YIELD,
         &RESIDENCY_RESET,
         &RESIDENCY_LEAK,
     ],
@@ -4100,6 +4127,7 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
         "arena_slots",
         arena_slots(plan).expect("the arena's slots of a plan the split made"),
     );
+    let r = with_grow(r, &plan.host.grow);
     let r = with_room(r, plan.host.room.as_ref());
     let r = match machine.cards.first().and_then(|c| c.free_bytes) {
         Some(free) => r.u("card_free", free),
@@ -4110,6 +4138,37 @@ pub fn plan(place: &str, machine: &Machine, plan: &Plan<'_>) -> Record {
         .w("cuda_order", cuda_order());
     let r = with_requantized(r, plan.model);
     with_expert_rank(r, plan.expert_rank.as_deref())
+}
+
+/// `r` with the host K/V's growth parts of a plan with a floor whose host rooms grow, none on
+/// one with no growth to hold; a growth charged at the cap names why (`grow_why`).
+fn with_grow(r: Record, g: &HostGrow) -> Record {
+    if !g.armed() {
+        return r;
+    }
+    let r = r
+        .u("kv_floor", g.floor)
+        .u("host_kv_floor", g.floor_bytes)
+        .u("host_kv_grow", g.grow_bytes)
+        .w("grow", g.hold.name());
+    let r = match g.hold.why_static() {
+        Some(why) => r.w("grow_why", why),
+        None => r,
+    };
+    r.u("grow_yield", g.yield_bytes)
+        .u("grow_experts", g.yields.len())
+}
+
+/// The `host_yield` record of a yield a fit asked for.
+#[cfg(feature = "gpu")]
+pub fn host_yield(m: &HostYieldMove) -> Record {
+    Record::new(&HOST_YIELD)
+        .u("positions", m.positions)
+        .u("shortfall", m.shortfall)
+        .u("experts", m.experts)
+        .u("bytes", m.bytes)
+        .u("dropped", m.dropped)
+        .u("left", m.left)
 }
 
 /// The `prompt_pass` record: a pass of `rows` rows whose latent mixers run `mla_rows` at a

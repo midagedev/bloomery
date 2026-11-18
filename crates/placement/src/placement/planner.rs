@@ -1,4 +1,5 @@
 use super::card_budget;
+use super::host_grow::HostGrow;
 use super::machine::{
     Card, ExpertList, KvBytes, Machine, ModelTensors, routed_down_acts, selected_leg_scratch,
 };
@@ -542,6 +543,24 @@ fn plan_rule<'a>(
         plan.host_stage_kv(host_stage_kv(model, ctx_max, kv)?);
     }
     plan.reserve_beside(reserve)?;
+    // The ring shadows grow with the positions as host rooms where the planes' rooms back host
+    // pages (any `BLOOMERY_KV_HOST` but `off`, which reads no host page): on a model whose loads
+    // yield host experts to that growth ([`KvBytes::host_yields`]), charged at the floor, their
+    // growth to the cap left to the host experts the split pages there.
+    if let Some(floor) =
+        floor_in_force.filter(|_| levers.kv_host != KvHost::Off && kv.host_yields())
+    {
+        let at_floor = machine
+            .all_cards()
+            .flat_map(|c| c.layers.clone())
+            .map(|l| kv.shadow_bytes(l, floor))
+            .fold(0u64, u64::saturating_add);
+        plan.host.grow = HostGrow::at_floor(
+            floor,
+            at_floor,
+            plan.host.shadow_bytes.saturating_sub(at_floor),
+        );
+    }
     plan.expert_rank = levers.expert_rank.clone();
     plan.kv_floor = floor_in_force;
     plan.kv_host = levers.kv_host;

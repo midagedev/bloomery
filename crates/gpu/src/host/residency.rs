@@ -3,11 +3,12 @@
 //! the host computation whose mappings its lock's spans are pages of.
 
 use crate::GpuError;
+use crate::room::host_grow::HostYielder;
 use bloomery_levers::HostCfg;
 use gguf::Split;
-use model::placement::host_lock::{HostLock, HostSet, Walk};
+use model::placement::host_lock::{HostLock, HostSet, Walk, YieldPages};
 use model::placement::workstation::ArenaGrant;
-use model::placement::{ExpertList, ModelTensor, Plan};
+use model::placement::{ExpertList, ModelTensor, Plan, Yield};
 use model::r8file::{HostR8, R8Source};
 
 /// What a placed load did to its plan's host set: populated it, locked it,
@@ -19,6 +20,9 @@ pub struct HostResidency {
     populate: Option<Walk>,
     lock: Option<HostLock>,
     arena: ArenaGrant,
+    /// The pages of the host experts the plan keeps at load to yield to its K/V's growth
+    /// (`HostTotals::grow`), resolved at load; `None` for a plan with none.
+    yields: Option<YieldPages>,
 }
 
 impl HostResidency {
@@ -66,11 +70,23 @@ impl HostResidency {
             .then(|| HostLock::lock(src, &set))
             .transpose()
             .map_err(|e| GpuError::plan(WHAT, e))?;
+        let grow: Vec<(usize, u32)> = plan
+            .host
+            .grow
+            .yields
+            .iter()
+            .map(|y| (y.layer, y.id))
+            .collect();
+        let yields = (!grow.is_empty())
+            .then(|| YieldPages::of(src, plan, &grow))
+            .transpose()
+            .map_err(|e| GpuError::plan(WHAT, e))?;
         Ok(HostResidency {
             set,
             populate,
             lock,
             arena: ArenaGrant::whole(plan.host.nvme_arena_bytes),
+            yields,
         })
     }
 
@@ -106,5 +122,26 @@ impl HostResidency {
     #[must_use]
     pub fn arena(&self) -> ArenaGrant {
         self.arena
+    }
+}
+
+impl HostYielder for HostResidency {
+    /// Each yield's pages given up through the runs resolved at load ([`YieldPages::release`]),
+    /// unlocked first under the load's lock. Refused by name on a load whose plan kept no host
+    /// expert to yield, or a yield past the ones resolved.
+    fn yield_experts(&mut self, at: usize, yields: &[Yield]) -> Result<u64, GpuError> {
+        const WHAT: &str = "HostResidency::yield_experts";
+        let unlock = self.lock.is_some();
+        let pages = self.yields.as_mut().ok_or(GpuError::State {
+            what: WHAT,
+            missing: "host experts the plan kept to yield",
+        })?;
+        let mut dropped = 0u64;
+        for k in at..at + yields.len() {
+            dropped += pages
+                .release(k, unlock)
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+        }
+        Ok(dropped)
     }
 }

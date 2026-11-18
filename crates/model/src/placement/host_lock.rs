@@ -739,6 +739,182 @@ fn memlock_limit() -> String {
     )
 }
 
+/// The host pages of the experts a plan keeps at load to yield to its K/V's growth
+/// ([`HostGrow::yields`](super::HostGrow)), resolved once at load from the plan and the files
+/// the host tier reads ([`YieldPages::of`]): per yield, each run of its layer's routed stacks
+/// ([`expert_runs`]). [`YieldPages::release`] gives one yield's pages up at the growth step
+/// that asks for it: unlocked first where the load locked them, then dropped from this
+/// process's mapping and the page cache ([`drop_pages`]); a run of a resident sidecar copy is
+/// unlocked only, its anonymous pages having no file to fall back to. Like [`HostLock`], it
+/// holds the addresses of the split's and the sidecar's mappings, which must outlive it.
+pub struct YieldPages {
+    /// Per file a run names: its path, for the page cache's drop, and its descriptor, opened at
+    /// the first release.
+    files: Vec<(PathBuf, Option<File>)>,
+    /// Per yield, its runs.
+    runs: Vec<Vec<YieldRun>>,
+    /// Sidecar kept alive while its mapping's addresses are held.
+    _sidecar: Option<Arc<Sidecar>>,
+}
+
+/// A file's whole mapping, `(address, length)`.
+type FileMap = Option<(usize, usize)>;
+
+/// One run of a yield: the file (an index into [`YieldPages::files`]), its bytes there, and the
+/// whole mapping of that file (`(address, length)`), absent for a resident copy.
+struct YieldRun {
+    file: usize,
+    at: Range<u64>,
+    map: Option<(usize, usize)>,
+}
+
+impl YieldPages {
+    /// The runs of `yields`, each `(layer, id)` an expert of the routed stacks `plan` places on
+    /// that layer, as `src` reads them. Refused by name: a layer with no routed stack, and a
+    /// run [`expert_runs`] refuses.
+    pub fn of(
+        src: R8Source<'_>,
+        plan: &Plan<'_>,
+        yields: &[(usize, u32)],
+    ) -> Result<YieldPages, PlacementError> {
+        let split = src.split();
+        let mut stacks: Vec<Vec<&ModelTensor>> = vec![Vec::new(); plan.model.layers];
+        for row in &plan.rows {
+            let Some(t) = plan.model.tensors.get(row.tensor) else {
+                continue;
+            };
+            if let (super::Role::RoutedExperts, Some(l)) = (t.role, t.layer)
+                && let Some(s) = stacks.get_mut(l)
+            {
+                s.push(t);
+            }
+        }
+        let mut files: Vec<(HostFile, PathBuf, FileMap)> = Vec::new();
+        let mut file_of = |f: &HostFile| -> Result<(usize, FileMap), PlacementError> {
+            if let Some(i) = files.iter().position(|(h, _, _)| h == f) {
+                return Ok((i, files[i].2));
+            }
+            let (path, map) = match f {
+                HostFile::Shard(s) => {
+                    let path = split.shard_path(*s).ok_or_else(|| {
+                        PlacementError::Host(format!("shard {s} is not in the split"))
+                    })?;
+                    let FileMapping(map) = FileMapping::shard(split, *s)?;
+                    (path.to_path_buf(), Some((map.as_ptr() as usize, map.len())))
+                }
+                HostFile::Sidecar(p) => {
+                    let side = src.sidecar().ok_or(R8Error::PairReadsNone {
+                        what: "a yield's sidecar run",
+                    })?;
+                    let map = side
+                        .file_pages()
+                        .map(|FileMapping(m)| (m.as_ptr() as usize, m.len()));
+                    (p.clone(), map)
+                }
+            };
+            files.push((f.clone(), path, map));
+            Ok((files.len() - 1, map))
+        };
+        let mut runs = Vec::with_capacity(yields.len());
+        for &(layer, id) in yields {
+            let of_layer = stacks.get(layer).filter(|s| !s.is_empty()).ok_or_else(|| {
+                PlacementError::Host(format!(
+                    "a yield of layer {layer}, which holds no routed stack"
+                ))
+            })?;
+            let mut held = Vec::new();
+            for t in of_layer {
+                for (f, at) in expert_runs(src, t, plan.model.experts_of(t), id, true)? {
+                    if at.is_empty() {
+                        continue;
+                    }
+                    let (file, map) = file_of(&f)?;
+                    held.push(YieldRun { file, at, map });
+                }
+            }
+            runs.push(held);
+        }
+        Ok(YieldPages {
+            files: files.into_iter().map(|(_, p, _)| (p, None)).collect(),
+            runs,
+            _sidecar: src.sidecar().cloned(),
+        })
+    }
+
+    /// The yields resolved.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// Whether no yield was resolved.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    /// Yield `k`'s pages given up: the whole pages inside each run unlocked first when
+    /// `unlock` (the load locked the host set), then dropped from the mapping and the page
+    /// cache; the bytes dropped. Refused by name: a yield past the resolved ones, a file that
+    /// does not open, and the syscalls' refusals.
+    pub fn release(&mut self, k: usize, unlock: bool) -> Result<u64, PlacementError> {
+        let runs = self
+            .runs
+            .get(k)
+            .ok_or_else(|| PlacementError::Host(format!("yield {k} of {}", self.runs.len())))?;
+        let page = page_bytes()?;
+        let mut dropped = 0u64;
+        for run in runs {
+            let (path, file) = &mut self.files[run.file];
+            let first = run.at.start.div_ceil(page) * page;
+            let end = run.at.end / page * page;
+            if let (true, Some((addr, len))) = (unlock && end > first, run.map) {
+                let span = usize::try_from(first)
+                    .ok()
+                    .zip(usize::try_from(end).ok())
+                    .filter(|&(_, b)| b <= len)
+                    .ok_or_else(|| {
+                        PlacementError::Host(format!(
+                            "{} bytes {:?} run past its {len} bytes",
+                            path.display(),
+                            run.at
+                        ))
+                    })?;
+                // SAFETY: munlock reads no memory; `addr .. addr + len` is the file's mapping,
+                // which outlives this owner (its contract, as `HostLock`'s), and the span lies
+                // inside it (checked above).
+                if unsafe { libc::munlock((addr + span.0) as *const libc::c_void, span.1 - span.0) }
+                    != 0
+                {
+                    return Err(PlacementError::Host(format!(
+                        "munlock of {} bytes {first}..{end}: {}",
+                        path.display(),
+                        io::Error::last_os_error()
+                    )));
+                }
+            }
+            let Some((addr, len)) = run.map else {
+                continue;
+            };
+            if file.is_none() {
+                *file = Some(File::open(&*path).map_err(|e| {
+                    PlacementError::Host(format!("open {} to release pages: {e}", path.display()))
+                })?);
+            }
+            let Some(f) = file.as_ref() else {
+                continue;
+            };
+            // SAFETY: `addr .. addr + len` is the whole of the file's own read-only MAP_SHARED
+            // mapping (a file-backed shard's, or a sidecar opened as its file's), which outlives
+            // this owner.
+            let map =
+                unsafe { FileMapping::new(std::slice::from_raw_parts(addr as *const u8, len)) };
+            dropped += drop_pages(&path.display(), f, Some(map), run.at.clone())?;
+        }
+        Ok(dropped)
+    }
+}
+
 /// Releases file bytes of a split — and of the r8 sidecar its pair reads —
 /// from this process's mappings and from the page cache: whole pages inside
 /// each range only, so a page that also holds bytes outside it stays. For

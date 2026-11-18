@@ -62,6 +62,7 @@ use crate::tensor::DeviceTensor;
 
 pub(crate) mod elastic;
 pub(crate) mod host;
+pub(crate) mod host_grow;
 pub(crate) mod kv;
 
 use self::host::{HostPage, RawMap};

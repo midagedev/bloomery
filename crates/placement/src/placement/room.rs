@@ -3,6 +3,7 @@ use std::fmt;
 use gguf::GgmlType;
 
 use super::Role;
+use super::host_grow::{self, GrowHold, GrowLayer};
 use super::machine::{Card, Device, ExpertList, Format, Heap, ModelTensor, ModelTensors};
 use super::refusal::PlacementError;
 use super::rule::{card_buffers, per_expert, row_bytes, rows_of};
@@ -981,29 +982,69 @@ fn split_nvme_tier(plan: &mut Plan<'_>, room: u64, grant: Grant) -> Result<(), P
             kept += l.unit;
         }
     }
-    let mut moved = 0u64;
+    // Which `n` of each layer's host ids stay is the pick: the id prefix of the host's list
+    // (its id tail paging), or under the plan's rank the layer's hottest host ids with its
+    // coldest `ids.len() − n` paging ([`ExpertRank::cold_split`]). The count is the split's own
+    // either way, so every byte the need, the arena and the moved sum account is the rank's
+    // own. Each layer's paged ids are listed in the order a larger room would keep them: the id
+    // tail's front first, the rank's hottest first.
+    let mut picks: Vec<(Vec<u32>, Vec<u32>)> = Vec::with_capacity(layers.len());
     for (l, &keep_l) in layers.iter().zip(&r) {
         let n = usize::try_from(keep_l)
             .unwrap_or(usize::MAX)
             .min(l.ids.len());
+        picks.push(match plan.expert_rank.as_deref() {
+            Some(rank) => rank.cold_split(
+                l.layer,
+                model.layer_experts(l.layer),
+                &l.ids,
+                (l.ids.len() - n) as u64,
+            )?,
+            None => (l.ids[..n].to_vec(), l.ids[n..].to_vec()),
+        });
+    }
+    // A plan that charges its host K/V at a floor keeps on the host the paged experts the room
+    // between the floor and the cap holds, and lists them to yield as the K/V grows, the last
+    // kept first ([`host_grow`]): every yield done is this split. A split with an arena serves
+    // its paged ids from it through a host segment fixed at load, so its K/V stays charged at
+    // the cap.
+    if plan.host.grow.armed() {
+        if arena > 0 {
+            plan.host.grow.hold = GrowHold::Arena;
+        } else {
+            let grow: Vec<GrowLayer> = layers
+                .iter()
+                .zip(&picks)
+                .map(|(l, (on, off))| GrowLayer {
+                    served: l.ids.len() as u64,
+                    kept: on.len() as u64,
+                    paged: off.len() as u64,
+                    unit: l.unit,
+                })
+                .collect();
+            let steps = host_grow::restore_steps(&grow, plan.host.grow.grow_bytes);
+            let paged: Vec<(usize, &[u32], u64)> = layers
+                .iter()
+                .zip(&picks)
+                .map(|(l, (_, off))| (l.layer, off.as_slice(), l.unit))
+                .collect();
+            let (yields, taken) = host_grow::yields_of(&steps, &paged);
+            for ((on, off), t) in picks.iter_mut().zip(&taken) {
+                on.extend(off.drain(..*t));
+            }
+            let g = &mut plan.host.grow;
+            g.yield_bytes = yields.iter().map(|y| y.bytes).sum();
+            g.yields = yields;
+            g.hold = GrowHold::Yields;
+        }
+    }
+    let mut moved = 0u64;
+    for (l, (on_host, off_host)) in layers.iter().zip(&picks) {
+        let n = on_host.len();
         for &(i, at) in &l.stacks {
             let t = &model.tensors[plan.rows[i].tensor];
             let (_, per) = per_expert(t, model.experts_of(t))?;
-            // Which `n` of the layer's host ids stay is the pick: the id
-            // prefix of the host's list (its id tail paging), or under the
-            // plan's rank the layer's hottest host ids with its coldest
-            // `ids.len() − n` paging ([`ExpertRank::cold_split`]). The count
-            // is the split's own either way, so every byte the need, the
-            // arena and the moved sum account is the rank's own.
-            let (on_host, off_host) = match plan.expert_rank.as_deref() {
-                Some(rank) => rank.cold_split(
-                    l.layer,
-                    model.layer_experts(l.layer),
-                    &l.ids,
-                    (l.ids.len() - n) as u64,
-                )?,
-                None => (l.ids[..n].to_vec(), l.ids[n..].to_vec()),
-            };
+            let (on_host, off_host) = (on_host.clone(), off_host.clone());
             let mut pieces = Vec::with_capacity(2);
             if !on_host.is_empty() {
                 pieces.push(Segment {

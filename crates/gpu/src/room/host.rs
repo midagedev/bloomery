@@ -14,6 +14,7 @@
 //! must pass id 0 — the header's rule, which this module follows rather
 //! than choosing a location of its own).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use cuda_core::sys::{self, CUdevice};
@@ -129,12 +130,24 @@ pub(crate) fn page_for(ordinal: usize) -> Result<usize, GpuError> {
         .ok_or_else(|| GpuError::shape("room", "the two locations' granularities pass usize"))
 }
 
+/// The bytes of every [`HostPage`] this process holds: the host memory the rooms back, over
+/// every room, sequence and device, a page two rooms map counted once. What the host K/V's
+/// growth is read from ([`super::host_grow`]).
+static HOST_BACKED: AtomicU64 = AtomicU64::new(0);
+
+/// The bytes of host pages the process's rooms hold now ([`HOST_BACKED`]).
+#[must_use]
+pub fn host_backed() -> u64 {
+    HOST_BACKED.load(Ordering::Acquire)
+}
+
 /// `bytes` of host memory on the NUMA node the device names, owned by the
 /// handle `cuMemCreate` returned and freed by `cuMemRelease` on drop. The
 /// calling thread holds a current context on the device, and `bytes` is a
 /// multiple of the host location's granularity ([`page_for`] picks one).
 pub(crate) struct HostPage {
     handle: sys::CUmemGenericAllocationHandle,
+    bytes: u64,
 }
 
 impl HostPage {
@@ -151,7 +164,9 @@ impl HostPage {
         // exactly once, on drop.
         let rc = unsafe { sys::cuMemCreate(&mut handle, bytes, &prop, 0) };
         crate::graph::cu(rc, "cuMemCreate (the host)")?;
-        Ok(HostPage { handle })
+        let bytes = bytes as u64;
+        HOST_BACKED.fetch_add(bytes, Ordering::AcqRel);
+        Ok(HostPage { handle, bytes })
     }
 
     /// The raw allocation handle, for a mapping ([`RawMap`]).
@@ -167,6 +182,7 @@ impl Drop for HostPage {
         // allocation keeps it alive, as the driver defers freeing while any
         // stands.
         let rc = unsafe { sys::cuMemRelease(self.handle) };
+        HOST_BACKED.fetch_sub(self.bytes, Ordering::AcqRel);
         if let Err(e) = crate::graph::cu(rc, "cuMemRelease (the host)") {
             eprintln!("room: a host page's release failed on drop: {e}");
         }

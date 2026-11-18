@@ -255,6 +255,16 @@ impl Seq {
         self.kv.iter().map(|l| l.asks(positions)).sum()
     }
 
+    /// The bytes of new host pages a fit through `positions` positions may back: the shadows'
+    /// and the compressed rows' (a spill page lands on either side).
+    pub(super) fn host_asks(&self, positions: usize) -> usize {
+        self.kv
+            .iter()
+            .map(|l| l.host_asks(positions))
+            .sum::<usize>()
+            + self.shadows.asks(positions)
+    }
+
     /// Back to the state the load leaves, on `stream`: the fixed buffers (rings, compressor
     /// states) zeroed in place (a captured chain keeps their addresses), the rooms' pages
     /// past the rows the sequence reached given back, the history emptied, the record of a

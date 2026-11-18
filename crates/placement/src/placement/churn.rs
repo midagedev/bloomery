@@ -193,6 +193,7 @@ mod tests {
                 pool_card_bytes: 0,
                 headroom_bytes: headroom,
                 room: None,
+                grow: crate::placement::HostGrow::default(),
             },
             nvme_bytes: 0,
             n_l: Vec::new(),

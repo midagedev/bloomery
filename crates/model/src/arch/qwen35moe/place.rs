@@ -1285,7 +1285,12 @@ impl PlanInputs {
             // room the planes already took.
             if levers.kv_host == KvHost::All {
                 let page = self.kv_host_page_of()?;
-                plan.kv_host_planes(self.kv_host_bytes(ctx_max, beside.slots as u64, page)?)?;
+                let bytes = self.kv_host_bytes(ctx_max, beside.slots as u64, page)?;
+                let at_floor = match plan.kv_floor {
+                    Some(f) => self.kv_host_bytes(f.min(ctx_max), beside.slots as u64, page)?,
+                    None => bytes,
+                };
+                plan.kv_host_planes(bytes, at_floor)?;
             }
             let page = os::page_bytes().map_err(|e| PlacementError::Host(e.to_string()))?;
             self.place_rows(&mut plan, room, floor, ubatch, page)?;

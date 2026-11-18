@@ -1406,17 +1406,15 @@ impl V41 {
         self.draft.window()
     }
 
-    /// The `residency pass` records of the boundaries the last call made,
-    /// on stderr.
+    /// The `residency pass` records of the boundaries the last call made and the `host yield`
+    /// records of the host K/V's growth it asked for, on stderr.
     fn print_passes(&mut self) -> Result<(), GateError> {
-        for (kind, r) in self
-            .s
-            .model_mut()
-            .body_parts(WHAT)?
-            .2
-            .take_residency_passes()
-        {
+        let body = self.s.model_mut().body_parts(WHAT)?.2;
+        for (kind, r) in body.take_residency_passes() {
             record::residency_pass_of(kind, &r).eprint();
+        }
+        for m in body.take_host_yields() {
+            record::host_yield(&m).eprint();
         }
         Ok(())
     }

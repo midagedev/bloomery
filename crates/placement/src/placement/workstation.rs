@@ -1116,7 +1116,9 @@ pub struct HostNeed {
     pub tables: u64,
     /// Pinned ring buffers, including the part loader's upload staging at load time, a host
     /// stage's cache (`HostTotals::stage_kv_bytes`) and the K/V planes a host-backed store holds
-    /// (`HostTotals::kv_host_bytes`, `BLOOMERY_KV_HOST` `all` or `spill`).
+    /// (`HostTotals::kv_host_bytes`, `BLOOMERY_KV_HOST` `all` or `spill`), at the cap less the
+    /// host experts kept at load that yield to the K/V's growth (`HostTotals::grow`), which
+    /// [`HostNeed::experts`] counts: the need is the static plan's at the cap.
     pub shadows: u64,
     pub reserves: u64,
     pub extra: u64,
@@ -1165,7 +1167,8 @@ impl HostNeed {
             shadows: totals
                 .shadow_bytes
                 .saturating_add(totals.stage_kv_bytes)
-                .saturating_add(totals.kv_host_bytes),
+                .saturating_add(totals.kv_host_bytes)
+                .saturating_sub(totals.grow.yield_bytes),
             reserves: totals.reserve_bytes.saturating_sub(reads),
             extra,
             read_ahead: reads,

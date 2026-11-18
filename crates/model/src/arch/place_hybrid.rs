@@ -820,7 +820,10 @@ impl<H> PlanInputs<H> {
             && let Some((rooms, page)) = kv.rooms().zip(kv_page)
         {
             let bytes = kv_host_room(rooms, ctx_max, plan.kv_floor, plan.kv_host, page);
-            plan.kv_host_planes(bytes)?;
+            let at_floor = plan.kv_floor.map_or(bytes, |f| {
+                kv_host_room(rooms, f.min(ctx_max), Some(f), plan.kv_host, page)
+            });
+            plan.kv_host_planes(bytes, at_floor)?;
         }
         let need = HostNeed::of(&plan, 0).bytes();
         let room = plan.plan_at(&self.room);
@@ -957,6 +960,10 @@ impl KvBytes for RoomPadded<'_> {
 
     fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
         self.kv.stage_position_bytes(ctx_max)
+    }
+
+    fn host_yields(&self) -> bool {
+        self.kv.host_yields()
     }
 }
 

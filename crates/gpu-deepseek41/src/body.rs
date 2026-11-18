@@ -93,8 +93,9 @@ use bloomery_gpu::hybrid::{
 use bloomery_gpu::model::{ChainBody, HostServed, Resident, Rollback, Rows};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{
-    CardKeep, DeviceTensor, FreedBytes, Gpu, GpuError, GpuModel, KvBacking, KvRoomBody,
-    PartedBuffer, RoomTensor, capturing, fit_rooms, kv_backing, window,
+    CardKeep, DeviceTensor, FreedBytes, Gpu, GpuError, GpuModel, HostGrowBook, HostGrowStats,
+    HostYieldMove, HostYielder, KvBacking, KvRoomBody, PartedBuffer, RoomTensor, capturing,
+    fit_rooms, kv_backing, window,
 };
 use bloomery_levers::{ChurnHosting, HostCfg, KvHost, ResidencyAt};
 use cuda_core::{CudaStream, DeviceBuffer, DeviceCopy, IntoResult, PinnedHostBuffer, sys};
@@ -732,6 +733,13 @@ impl LayerKv {
             .sum()
     }
 
+    /// The bytes of new pages a fit through `positions` positions asks of the compressed rows,
+    /// the selected buffer `BLOOMERY_KV_HOST` may back on the host (the index keys are read
+    /// whole every step, card-only).
+    fn host_asks(&self, positions: usize) -> usize {
+        self.rows.as_ref().map_or(0, |t| t.asks(positions))
+    }
+
     /// The end of a sequence: every page past the rows it reached given back.
     fn settle(&mut self) -> Result<(), GpuError> {
         for t in [&mut self.rows, &mut self.keys].into_iter().flatten() {
@@ -1000,6 +1008,15 @@ impl Shadows {
         match self {
             Shadows::Room(r) => r.layers.iter_mut().try_for_each(RoomTensor::settle),
             Shadows::Pinned(_) => Ok(()),
+        }
+    }
+
+    /// The bytes of new host pages a fit through `positions` positions asks of the rooms; none
+    /// of the page-locked allocation, which holds the cap from the load.
+    fn asks(&self, positions: usize) -> usize {
+        match self {
+            Shadows::Room(r) => r.layers.iter().map(|t| t.asks(positions)).sum(),
+            Shadows::Pinned(_) => 0,
         }
     }
 
@@ -1477,6 +1494,9 @@ pub struct Body {
     /// On a rank of a tensor-parallel load, its side of the ranks' sums
     /// (`bloomery_gpu::host::rank::Sums`); `None` on a whole load.
     join: Option<Sums>,
+    /// The books of the host K/V's growth ([`HostGrowBook`]), on a placed load whose plan
+    /// keeps host experts to yield to it; the host tier's residency yields them.
+    host_grow: Option<HostGrowBook>,
 }
 
 /// A tier card a placed load hangs under the host tier
@@ -1735,6 +1755,21 @@ impl Body {
     /// each with the kind of the pass it ended; the log keeps its capacity.
     pub fn take_residency_passes(&mut self) -> Vec<(PassKind, PassReport)> {
         self.residency_glue.take_passes()
+    }
+
+    /// The host experts' yields to the host K/V's growth since the last take, oldest first;
+    /// none on a load whose plan keeps no expert to yield.
+    pub fn take_host_yields(&mut self) -> Vec<HostYieldMove> {
+        self.host_grow
+            .as_mut()
+            .map_or_else(Vec::new, HostGrowBook::take_moves)
+    }
+
+    /// The tallies of the host experts' yields since the load, `None` on a load whose plan keeps
+    /// no expert to yield.
+    #[must_use]
+    pub fn host_grow_stats(&self) -> Option<HostGrowStats> {
+        self.host_grow.as_ref().map(HostGrowBook::stats)
     }
 
     /// The rows the last [`ChainBody::decode_input`] read for its step: its
@@ -2423,6 +2458,22 @@ impl KvRoomBody for FitOn<'_> {
             slots: freed.k,
             layers: freed.layers.len(),
         })
+    }
+
+    fn host_asks(&self, through: usize) -> u64 {
+        self.seq
+            .as_deref()
+            .unwrap_or(&self.body.seq)
+            .host_asks(through) as u64
+    }
+
+    fn host_grow(&mut self) -> Option<(&mut HostGrowBook, &mut dyn HostYielder)> {
+        let Body {
+            host_grow, hybrid, ..
+        } = &mut *self.body;
+        let book = host_grow.as_mut()?;
+        let residency = hybrid.residency_mut()?;
+        Some((book, residency))
     }
 }
 
@@ -3223,7 +3274,10 @@ impl Body {
                 CardKeep::of(plan, &plan.machine.cards[card], gpu.opened_free()),
             ),
         };
-        Body::assemble(
+        // A plan that keeps host experts to yield to its K/V's growth reads that growth in its
+        // rooms' host pages, the page read once here.
+        let host_grow = HostGrowBook::at_load(plan, gpu.context().ordinal())?;
+        let mut body = Body::assemble(
             gpu,
             file,
             meta,
@@ -3251,7 +3305,9 @@ impl Body {
                     .check_tier_reserves(plan, &tiers.iter().map(|t| t.card).collect::<Vec<_>>())?;
                 Ok(Some(TierPiece::new(gpu, hybrid.slots(), PAIR_ROWS)?))
             },
-        )
+        )?;
+        body.host_grow = host_grow;
+        Ok(body)
     }
 
     /// The body of `meta`'s hyperparameters on `gpu` over `file`, from what
@@ -3391,6 +3447,7 @@ impl Body {
             residency_glue,
             nvme_tier,
             join,
+            host_grow: None,
         };
         // Last: the machine frees each layer's spare slots, and every piece
         // above sized itself from the load's map, capacity = live.

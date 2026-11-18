@@ -16,6 +16,7 @@ use bloomery_levers::KvHost;
 use cuda_core::{CudaContext, CudaStream, DeviceCopy};
 use runtime::stores::{Access, Class, PosBuf};
 
+use super::host_grow::{HostGrowBook, HostYielder, take_host_yield};
 use super::{Backing, Roomed, Run, Views};
 use crate::{DeviceTensor, GpuError};
 
@@ -328,9 +329,26 @@ pub trait KvRoomBody {
     /// as it would have without one, and the body keeps the refusal for its caller's record.
     /// Nothing by default.
     fn fill_refused(&mut self, _asked: u64, _why: &GpuError) {}
+
+    /// The bytes of new host pages a fit through `through` positions may back, every host
+    /// room's and every spill room's (a spill page may land on either side): what
+    /// [`take_host_yield`] adds to the host pages the process holds. 0 by default.
+    fn host_asks(&self, _through: usize) -> u64 {
+        0
+    }
+
+    /// The load's books for its host K/V's growth and the host residency machine that yields
+    /// to it ([`super::host_grow`]); `None` by default, for a load whose plan holds no yield.
+    fn host_grow(&mut self) -> Option<(&mut HostGrowBook, &mut dyn HostYielder)> {
+        None
+    }
 }
 
 /// The rooms of `body` fitted through `pos + rows` positions.
+///
+/// Host first: a fit whose host pages would take the host K/V past what the plan charged and
+/// its yields done hold has the host residency machine give up the next host experts in the
+/// plan's yield order ([`take_host_yield`]), or is refused by name when none is left.
 ///
 /// Fill first: on a load whose fill holds card bytes above the plan ([`KvRoomBody::fill_held`]),
 /// a fit whose new pages would leave the card under its margin first takes back the shortfall
@@ -341,7 +359,8 @@ pub trait KvRoomBody {
 ///
 /// Then the fit: one that runs out of card bytes asks the body's residency machine for the
 /// shortfall plus a page and fits once more; a room that ran out on host pages (a spill room's)
-/// returns at once, since freed card bytes cannot make host memory. A second refusal, a refusing
+/// returns at once, since freed card bytes cannot make host memory (the host's own yield ran
+/// before the fit). A second refusal, a refusing
 /// machine or none is the named [`GpuError::NoRoom`] with what was freed. Never inside a capture.
 ///
 /// # Errors
@@ -349,6 +368,7 @@ pub trait KvRoomBody {
 /// As above, and the card's free bytes unreadable for the fill-first step.
 pub fn fit_rooms<B: KvRoomBody>(body: &mut B, pos: usize, rows: usize) -> Result<(), GpuError> {
     let through = pos + rows;
+    take_host_yield(body, through)?;
     take_fill_first(body, through)?;
     let first = match body.fit_each(pos, through) {
         Ok(()) => return Ok(()),

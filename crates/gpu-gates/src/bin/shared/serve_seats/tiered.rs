@@ -1393,7 +1393,7 @@ mod tests {
         use bloomery_levers::{Levers, UnhostedPool};
         use model::arch::place_hybrid::PlaceError;
         use model::placement::ctx_ask::Rule;
-        use model::placement::{Host, HostTotals, Machine, ModelTensors, Node, Plan};
+        use model::placement::{Host, HostGrow, HostTotals, Machine, ModelTensors, Node, Plan};
 
         thread_local! {
             static LINES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
@@ -1441,6 +1441,7 @@ mod tests {
                 pool_card_bytes: 0,
                 headroom_bytes: 1 << 30,
                 room: None,
+                grow: HostGrow::default(),
             },
             nvme_bytes: 0,
             n_l: vec![2],

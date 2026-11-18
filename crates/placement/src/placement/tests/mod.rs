@@ -12,6 +12,7 @@ use super::*;
 mod bounds;
 mod early;
 mod floor;
+mod host_grow;
 mod host_room;
 mod host_stage;
 mod kv_floor;
@@ -44,6 +45,7 @@ fn budget_plan<'a>(model: &'a ModelTensors, machine: &'a Machine, budget: u64) -
             pool_card_bytes: 0,
             headroom_bytes: 0,
             room: None,
+            grow: HostGrow::default(),
         },
         nvme_bytes: 0,
         n_l: Vec::new(),
