@@ -1,0 +1,9 @@
+# The 0.3.15 release film's Hy4 tape: one bloomery-serve of the release's sm_120a build on Hy4-flash Q4_K_M at the serving
+# defaults on the one RTX 5090, one Korean prompt (a ten-line poem on a Seoul autumn evening), greedy, thinking off, 320
+# tokens, recorded by toktape; the server's plan and load lines kept for the film's terminal footage. The tape's per-token
+# times are the film's rail, so the box must be quiet.
+kind: exclusive
+reason: one Hy4 load (168 GB; 15.7 s measured 2026-11-18 on the 5090, page cache warm from the release sitting) and one
+  320-token request whose per-token times the film plays at 1x; why now: the release film, from the release binary, the
+  night the release is prepared
+minutes: 2..6

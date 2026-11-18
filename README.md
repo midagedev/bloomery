@@ -261,15 +261,23 @@ with its machine and conditions. Each table names the release or commit it was m
 no `--parallel`, no `--ctx-size`: the unset rule picks the context). Means of two rounds. "Where it runs" is what each
 file's `--plan` prints on this card.
 
-<!-- PENDING: each cell is filled from the 0.3.15 release sitting's verdict (tools/release/sitting.sh) -->
-
 | Model | Where it runs | Prompt, 512 tokens | Prompt, 4,096 tokens | Decode at depth 512 | Decode at depth 4,096 |
 |---|---|---|---|---|---|
-| DeepSeek-V4.1-Flash `bq3km` with its r8 sidecar | card + CPU | PENDING | PENDING | PENDING | PENDING |
-| Qwen3.8-Flash-Next `UD-Q4_K_XL` | card + CPU | PENDING | PENDING | PENDING | PENDING |
-| Hy4-flash `Q4_K_M` | card + CPU | PENDING | PENDING | PENDING | PENDING |
-| GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | PENDING | PENDING | PENDING | PENDING |
-| Nemotron 3.5 Bolt 74B-A9B `24GB` | the whole model on the card | PENDING | PENDING | PENDING | PENDING |
+| DeepSeek-V4.1-Flash `bq3km` with its r8 sidecar | card + CPU | 245.87 | 402.19 | 30.24 | 30.06 |
+| Qwen3.8-Flash-Next `UD-Q4_K_XL` | card + CPU | 791.62 ¹ | 1,281.84 | 117.34 ² | 110.06 ² |
+| Hy4-flash `Q4_K_M` | card + CPU | 31.75 ³ | 31.48 ³ | 31.71 | 31.78 |
+| GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 194.44 | 210.03 | 30.09 | 26.17 |
+| Nemotron 3.5 Bolt 74B-A9B `24GB` | the whole model on the card | 4,971.72 | 7,166.02 | 182.41 | 180.44 |
+
+¹ rounds 699.14 and 884.09.
+
+² with the file's MTP draft, which `bloomery-serve` turns on by default (`BLOOMERY_DRAFT=off` serves without it).
+
+³ Hy4-flash's prompt pass computes the host's share of its routed experts on the CPU, so its prompt runs at about its
+decode rate; at the unset context (1,048,576 positions) the plan holds 2,004 of its 20,992 routed experts on the card.
+
+The Hy4-flash and GLM-5.3-Flash cells were re-run in the same sitting (`sitting.sh --resume --only`) after their first rows
+read cold (major faults after another model's load evicted their files from the page cache).
 
 The DGX Spark and RTX 5090 tables were measured by [@juliankang4](https://github.com/juliankang4) at main
 `e7180ea9`, on the same four models with the MTP draft on: NVIDIA's FP4-Local and NVFP4 folders as downloaded (their
