@@ -87,7 +87,8 @@ pub fn hc_pre_f32(
     out
 }
 
-/// ik's `exp`: glibc's `expf`.
+/// ik's `exp`: the platform's `expf`, which is glibc's on the box. Another
+/// libm's rounds some results one ulp apart.
 pub fn exp_ik(x: f32) -> f32 {
     x.exp()
 }
@@ -221,19 +222,35 @@ mod tests {
         h.value()
     }
 
-    /// The rule's outputs on a fixed input, with each `exp`, hash to fixed
-    /// digests: any change to its arithmetic or its order changes them.
+    /// The rule's outputs on a fixed input, with `exp_ours` for each `exp`,
+    /// hash to a fixed digest: any change to its arithmetic or its order
+    /// changes it. It holds on every target: `exp_ours` is f64's rounded to
+    /// f32, the affine is an explicit `mul_add`, and every other step is IEEE.
     #[test]
     fn hc_pre_f32_digest() {
         let ours = digest(|m, s, b, e, i| hc_pre_f32(m, s, b, e, i, exp_ours));
-        let ik = digest(|m, s, b, e, i| hc_pre_f32(m, s, b, e, i, exp_ik));
-        println!("hc_pre_f32 digest exp_ours {ours:016x} exp_ik {ik:016x}");
+        println!("hc_pre_f32 digest exp_ours {ours:016x}");
         assert_eq!(ours, DIGEST_OURS, "exp_ours digest");
+    }
+
+    /// The same with `exp_ik`, the platform's f32 `expf`. The pin is glibc's
+    /// on x86_64 Linux, the box; another libm's `expf` rounds some results
+    /// one ulp apart (Apple's does), so on any other target the test is
+    /// ignored by name instead of run against a digest that is not its own.
+    #[test]
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", target_os = "linux")),
+        ignore = "DIGEST_IK is glibc's expf on x86_64 Linux; another libm's expf hashes differently"
+    )]
+    fn hc_pre_f32_digest_ik() {
+        let ik = digest(|m, s, b, e, i| hc_pre_f32(m, s, b, e, i, exp_ik));
+        println!("hc_pre_f32 digest exp_ik {ik:016x}");
         assert_eq!(ik, DIGEST_IK, "exp_ik digest");
     }
 
-    /// `hc_pre_f32_digest`'s digests with `exp_ours` and with `exp_ik`.
+    /// `hc_pre_f32_digest`'s digest, with `exp_ours`.
     const DIGEST_OURS: u64 = 0x1a3e_ff70_5148_4e5a;
+    /// `hc_pre_f32_digest_ik`'s digest, with `exp_ik` (glibc's `expf`).
     const DIGEST_IK: u64 = 0x3996_eb01_d160_8742;
 
     /// The Q8_0 chain's mixes on the fixture — one piece for 3 tokens, then

@@ -11,8 +11,10 @@
 //! outside `box.sh` opens.
 //!
 //! A command that runs the deepseek41 profile also names the file it opens as
-//! `BLOOMERY_REF_MODEL` (`BLOOMERY_REF_MODEL_PROFILE=deepseek41`), and the two
-//! must be one file: [`resolve`] is the single rule. Under the fixture tier
+//! `BLOOMERY_REF_MODEL` (`BLOOMERY_REF_MODEL_PROFILE=deepseek41`; `tools/box.sh`
+//! exports it from the profile's file, which follows a `BLOOMERY_V41_MODEL` set
+//! on the box.sh line, not one set inside the command), and the two must be
+//! one file: [`resolve`] is the single rule. Under the fixture tier
 //! `tools/box.sh` exports the V4.1 fixture as `BLOOMERY_REF_MODEL` and as
 //! `BLOOMERY_FIXTURE_MODEL` (only once it has checked the file is a whole
 //! fixture) and still the real file as `BLOOMERY_V41_MODEL`: that one pair is
@@ -109,10 +111,14 @@ impl std::fmt::Display for PathError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{ENV}={} and {REF_ENV}={} name two files under the {PROFILE} profile, and \
-             {FIXTURE_ENV}={} does not make the second the fixture tier's file: a V4.1 run \
-             opens one file (gguf::v41 is its owner), so set one of them, or run the fixture \
-             tier through tools/box.sh with BLOOMERY_TIER=fixture",
+            "{ENV}={} and {REF_ENV}={} name two files under the {PROFILE} profile. \
+             {REF_ENV} is the {PROFILE} profile's own export: tools/box.sh sets it before the \
+             command runs, to the {ENV} set on the box.sh line (else the public file), so a \
+             {ENV} set inside the command comes too late to move it. A V4.1 run opens one file \
+             (gguf::v41 is its owner): set one variable on the box.sh line, \
+             `{ENV}=<file> tools/box.sh '...'`, and the profile's {REF_ENV} follows it. \
+             {FIXTURE_ENV}={} does not make the second the fixture tier's file, which \
+             `BLOOMERY_TIER=fixture tools/box.sh '...'` runs",
             self.v41,
             self.reference,
             self.fixture.as_deref().unwrap_or("unset")
@@ -244,8 +250,10 @@ mod tests {
     /// The two variables name two files under the deepseek41 profile: a named
     /// error carrying both, not a pick of either — with no fixture, with
     /// another file's fixture, and with the fixture variable naming the first.
-    /// Mutant: `resolve` returns the reference (or the V4.1 variable) when
-    /// they differ.
+    /// The text names the second variable as the profile's own export and the
+    /// one variable that points the profile at another file. Mutant: `resolve`
+    /// returns the reference (or the V4.1 variable) when they differ, or the
+    /// text drops either statement.
     #[test]
     fn two_files_are_an_error_never_a_pick() {
         for fixture in [
@@ -266,6 +274,16 @@ mod tests {
             let text = e.to_string();
             assert!(text.contains(REAL) && text.contains(FIXTURE), "{text}");
             assert!(text.contains("BLOOMERY_V41_MODEL"), "{text}");
+            // The second is the profile's own export (not the caller's), and the one variable
+            // that moves the profile to another file is named with where it is set.
+            assert!(
+                text.contains("BLOOMERY_REF_MODEL is the deepseek41 profile's own export"),
+                "{text}"
+            );
+            assert!(
+                text.contains("`BLOOMERY_V41_MODEL=<file> tools/box.sh '...'`"),
+                "{text}"
+            );
         }
         // The default stands for an unset V4.1 variable: the reference differs from it too.
         assert!(resolve(&env(None, Some(FIXTURE), Some(PROFILE), None)).is_err());

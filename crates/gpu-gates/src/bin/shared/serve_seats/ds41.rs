@@ -230,6 +230,7 @@ use bloomery_gpu_gates::bind::{
     SlotsFrom, TemplateFile, Vocab, arm_screen, bind_server, call_token, model_props,
     parallel_line, placement_of,
 };
+use bloomery_gpu_gates::ds41_r8;
 use bloomery_gpu_gates::generate::{DraftSeat, Lane, Place, lane_at, mode_name, stage_host_page};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
@@ -852,21 +853,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let mut cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?
         .with_kv_default(&levers, kv_default)
         .with_kv_host_page(kv_page);
-    // A plan that pages routed experts to the NVMe tier cannot read an r8 sidecar (the tier
-    // fills its slots from the source's bytes): where `BLOOMERY_R8` is unset the host tier
-    // reads the source, by name, and a set `on` is the load's refusal of that pair.
-    let sidecar = if paged { sidecar_beside(&path)? } else { None };
-    let host = levers.host_for(sidecar.is_some());
-    if let Some(sidecar) = sidecar.filter(|_| levers.host().r8 && !host.r8) {
-        eprintln!(
-            "bloomery-serve-ds41: BLOOMERY_R8 is unset and the plan pages routed experts to the \
-             NVMe tier, which fills its slots from the source's bytes: the host tier reads the \
-             source, not the sidecar at {} (the `load host_tier r8=off` line below is this \
-             choice; BLOOMERY_R8=on refuses the pair)",
-            sidecar.display()
-        );
-    }
-    cfg.body.host = host;
+    // A plan that pages routed experts to the NVMe tier cannot read an r8 sidecar: where
+    // `BLOOMERY_R8` is unset the host tier reads the source, by name (`ds41_r8`, the rule
+    // `generate_ds41` takes too), and a set `on` is the load's refusal of that pair.
+    cfg.body.host = ds41_r8::host_at_plan(&levers, WHAT, &path, paged)?;
     // The record's `headroom` is the room the budget came from: what
     // `MemAvailable` leaves past the plan's host need and the churn pool.
     Record::new(&record::CACHE_CONFIG)
@@ -1121,13 +1111,6 @@ struct Printed {
     residency: ResidencyPick,
     /// The plan pages routed experts to the NVMe expert tier.
     paged: bool,
-}
-
-/// The r8 sidecar beside the model file, `None` when no file is there
-/// ([`model::r8file::sidecar_path`]).
-fn sidecar_beside(path: &Path) -> Result<Option<PathBuf>, GateError> {
-    let sidecar = model::r8file::sidecar_path(path)?;
-    Ok(sidecar.try_exists()?.then_some(sidecar))
 }
 
 const WHAT: &str = "bloomery-serve-ds41";

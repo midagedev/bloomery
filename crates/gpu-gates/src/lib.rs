@@ -26,6 +26,7 @@ pub mod ds41_media;
 pub mod ds41_meta;
 #[cfg(all(feature = "deepseek41", feature = "checkpoint"))]
 pub mod ds41_preflight;
+pub mod ds41_r8;
 pub mod engine;
 pub mod flash_band;
 pub mod flip;

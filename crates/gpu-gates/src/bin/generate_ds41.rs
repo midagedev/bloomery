@@ -393,6 +393,7 @@ mod drive {
     use bloomery_gpu_deepseek41::swap;
     #[cfg(feature = "checkpoint")]
     use bloomery_gpu_gates::ds41_preflight::preflight;
+    use bloomery_gpu_gates::ds41_r8;
     use bloomery_gpu_gates::generate::{
         Diag, Lane, NoEog, Place, PlaceWhy, Residence, ServeFeed, TopRows, before_path, card_table,
         dump_table, lane_at, mode_name, place_table, read_table, repeat_runs, seed_path,
@@ -977,15 +978,19 @@ mod drive {
         // record naming what it resolved to, before the plan record the open
         // prints. `--card-table` loads a plan it edits itself, beside a word
         // that is `off` (refused below otherwise): no pre-plan there.
-        let (plan_n_l, residency) = match &a.diag.card_table {
-            Some(_) => (None, residency),
+        let (plan_n_l, residency, paged) = match &a.diag.card_table {
+            Some(_) => (None, residency, false),
             None => pre_plan(&file, &a, &cfg, machine, slots, residency)?,
         };
         record::residency_lever(residency).print();
         if let Some(d) = residency.why.detail() {
             eprintln!("{d}");
         }
-        let cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?;
+        let mut cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?;
+        // A plan that pages routed experts to the NVMe tier cannot read an r8 sidecar: where
+        // `BLOOMERY_R8` is unset the host tier reads the source, by name, as the server does
+        // (`ds41_r8`), and a set `on` is the load's refusal of that pair.
+        cfg.body.host = ds41_r8::host_at_plan(&levers, "generate_ds41", &path, paged)?;
         // The finite probe feeds step by step, outside the prompt call.
         let feed_mode = if check_finite {
             body::PrefillMode::Steps
@@ -1380,7 +1385,8 @@ mod drive {
     /// [`open_slots`] several), for the unset residency word to resolve
     /// against ([`residency::at_plan`]). Deterministic and milliseconds.
     /// Returns the plan's per-layer card experts, for the open's own plan to
-    /// be checked against ([`Log::plan`]), and the word the plan left.
+    /// be checked against ([`Log::plan`]), the word the plan left, and
+    /// whether the plan pages routed experts to the NVMe tier.
     fn pre_plan(
         file: &Split,
         a: &Args,
@@ -1388,7 +1394,7 @@ mod drive {
         machine: impl Fn(usize) -> Machine,
         slots: usize,
         pick: ResidencyPick,
-    ) -> Result<(Option<Vec<u64>>, ResidencyPick), GateError> {
+    ) -> Result<(Option<Vec<u64>>, ResidencyPick, bool), GateError> {
         const WHAT: &str = "generate_ds41 residency pre-plan";
         let mut inputs = PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
         let machine = machine(inputs.model.layers);
@@ -1407,7 +1413,7 @@ mod drive {
             0,
             pick,
         )?;
-        Ok((Some(plan.n_l), pick))
+        Ok((Some(plan.n_l), pick, plan.host.nvme_expert_bytes > 0))
     }
 
     /// The load of a plan that counts `slots` resident sequences

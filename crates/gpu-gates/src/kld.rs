@@ -1803,7 +1803,7 @@ mod tests {
         });
         (0..vocab)
             .map(|i| {
-                let x = seed.wrapping_add(i as u64 * 0x9e37_79b9_7f4a_7c15);
+                let x = seed.wrapping_add((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
                 let x = (x ^ (x >> 29)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
                 (x >> 40) as f32 / (1u64 << 24) as f32 * 30.0 - 15.0
             })
