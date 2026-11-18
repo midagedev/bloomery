@@ -26,7 +26,7 @@
 //! plan reserves their bytes ([`pass_bytes`]) and the load holds them to it.
 
 use bloomery_gpu::card_slots::CardAcc;
-use bloomery_gpu::gemm::{GEMM_MAX_SLOTS, GemmRoute};
+use bloomery_gpu::gemm::{GEMM_MAX_SLOTS, GemmRoute, RouteSet};
 use bloomery_gpu::hc_ident::{HC, HeadArgs, MIX};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::census::TierCensus;
@@ -214,37 +214,16 @@ pub struct PlacedPass {
     /// The route tables of the hosted layers' card slots, one a distinct card count: a grouped GEMM's
     /// table holds the experts of the one stack it routes over, and a hosted layer's stacks hold
     /// only its card's experts.
-    routes: Vec<GemmRoute>,
+    routes: RouteSet,
     bytes: usize,
 }
 
-/// The distinct card counts of `side`'s hosted layers that hold experts on the card, ascending.
-fn hosted_counts(side: &PlacedSide) -> Vec<usize> {
-    let mut counts: Vec<usize> = side
-        .hosted_set()
+/// The card counts of `side`'s hosted layers that hold experts on the card.
+fn hosted_counts(side: &PlacedSide) -> impl Iterator<Item = usize> + '_ {
+    side.hosted_set()
         .into_iter()
         .map(|l| side.n_card(l))
         .filter(|&n| n > 0)
-        .collect();
-    counts.sort_unstable();
-    counts.dedup();
-    counts
-}
-
-/// The table of the hosted layers whose card holds `n_card` experts, from `routes`
-/// ([`PlacedPass::routes`]). Refused by name when the pass made none for the count.
-fn route_of(
-    routes: &mut [GemmRoute],
-    (l, n_card): (usize, usize),
-) -> Result<&mut GemmRoute, GpuError> {
-    routes
-        .iter_mut()
-        .find(|t| t.n_experts() == n_card)
-        .ok_or_else(|| {
-            shape(format!(
-                "layer {l}: {n_card} card experts and no route table made for the count"
-            ))
-        })
 }
 
 impl PlacedPass {
@@ -264,15 +243,9 @@ impl PlacedPass {
         let map = DeviceBuffer::zeroed(stream, N_EXPERT)?;
         let sel = DeviceBuffer::zeroed(stream, rows * N_USED)?;
         let slots = cfg.ffn_rows * N_USED;
-        let routes = hosted_counts(side)
-            .into_iter()
-            .map(|n| GemmRoute::new(stream, slots, n))
-            .collect::<Result<Vec<_>, _>>()?;
-        let bytes = prompt.bytes()
-            + hsum.num_bytes()
-            + map.num_bytes()
-            + sel.num_bytes()
-            + routes.iter().map(GemmRoute::bytes).sum::<usize>();
+        let routes = RouteSet::new(stream, slots, hosted_counts(side))?;
+        let bytes =
+            prompt.bytes() + hsum.num_bytes() + map.num_bytes() + sel.num_bytes() + routes.bytes();
         Ok(PlacedPass {
             prompt,
             hsum,
@@ -317,7 +290,7 @@ struct PassWalk<'a> {
     map: &'a mut DeviceBuffer<u32>,
     sel: &'a mut DeviceBuffer<u32>,
     /// The hosted layers' card route tables ([`PlacedPass::routes`]).
-    routes: &'a mut [GemmRoute],
+    routes: &'a mut RouteSet,
     /// The call's rows, all one unit.
     t: usize,
     /// The streams' buffer holding the layer's input, as the prompt batch's walk keeps it.
@@ -520,7 +493,7 @@ impl PassWalk<'_> {
         if n_card == 0 {
             return Ok(());
         }
-        let table = route_of(self.routes, (l, n_card))?;
+        let table = self.routes.of_mut(PASS, l, n_card)?;
         self.side.remap_row(stream, l, self.map)?;
         expert_rows(
             &env,

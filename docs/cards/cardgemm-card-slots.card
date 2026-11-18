@@ -1,0 +1,51 @@
+# Round cardgemm: the card's own slots of a Routed family's prompt batch under the expert stream
+# (CardExperts::enqueue_rows_ring) run as the route block over the card's stacks (remap table over the layer's
+# n_card experts, grouped or 32-value GEMMs through the ring pass's buffers) instead of the leg's per-slot `_sel`
+# launches. Same binary family, base = the tree at 533adee08, changed = that tree plus this round's diff.
+#
+# Decomposition per layer and unit of m rows [derived; V4.1 geometry from the gate_gemm doc: 384 experts, top 6,
+# hidden 5120, ff 2304; 16.78 MB an expert and 659 card slots over 67 card experts at m = 512 from rig-log plan.md
+# 「SIMT」 (the A6000 placement of that row); the 5090 plan holds another count, so the ratio below is the claim,
+# not the ms]:
+#   base     bytes = slots_card x B_e: 659 x 16.78 MB = 11.1 GB at m = 512, 5,272 slots (88.5 GB) at m = 4096;
+#            time = bytes / ~1.5 TB/s (the Hy4 report's 72 GB -> 48 ms): 7.4 ms and 59 ms.
+#   changed  bytes = tiles x B_e, an expert's slots cut in tiles of up to 64: c = 9.8 slots an expert at m = 512
+#            -> 67 tiles (1.12 GB, 0.75 ms); c = 78.7 at m = 4096 -> ~134 tiles (2.25 GB, 1.5 ms) with the
+#            int8 MACs (S_c x 3 x 5120 x 2304 = 186 GMAC at m = 4096) at the same order, 1-2 ms: ~2-3 ms.
+#   launches 5 -> 5 (places + quantize + gate-up + quantize + down  ->  remap + gate + up + swiglu-quant + down),
+#            so the launch floor is unmoved.
+#   => card-own phase ratio changed / base: 0.10..0.35 at m = 512, 0.03..0.12 at m = 4096 (mem-bound at both ends,
+#      the MAC time and the launch floor the rest).
+# Under the lane's shadow the wall barely moves: the stream's copy lane takes ~65 ms a layer for ~100 experts at
+# 26 GB/s [derived: 1.68 GB], the first batch lands after a third of it (~22 ms), the base's card-own run
+# (7.4 ms at m = 512, 59 ms at m = 4096) sits inside it or just under the whole lane, so a split A/B predicts
+# 0..+2 %, inside the ruler at any affordable round count: that A/B is refused on paper, this profile is the run.
+# Runner (nsys over one split walk of each tree, the tools/ref/nsys-gpu.sh form; the changed binary built in the
+# round's tree, the base built from 533adee08 in a worktree; the box lead names the model file and card):
+# BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/cardgemm-card-slots.card' on the nsys sitting of
+# BLOOMERY_XSTREAM=split prose:4096, both trees in one lease.
+kind: profile
+question: does the card's own slots' phase of a split prompt layer fall to the derived fraction of the per-slot
+  `_sel` run when the same slots run as the route block over the card's stacks?
+term: card-own-slot kernel ms per layer, summed over the kernels the card's slots launch before the layer's first
+  landed-event wait (base: the leg's quantize, gate-up `_sel`, quantize-sel and down `_sel`; changed: the route
+  remap, the gate, up, SwiGLU-quant and down GEMMs), changed / base, at m = 4096 rows a unit, BLOOMERY_XSTREAM=split,
+  one 5090, a Routed family's split walk (V4.1 first)
+unit: x
+predict: 0.03..0.12 x
+condition: both trees' windows run the same prompt ids at the same residency pick and ring half, so the card-own
+  slot count a layer matches within 1 % (the `stat prefill` slot counts name it); at least 20 split layers in the
+  window; the kernels are named by entry (the base's `_sel` and quantize-sel entries, the changed tree's `gemm_*`,
+  `gemm_route_remap` and SwiGLU-quant entries) and the table prints both phases beside the layer's window wall;
+  no [cpu-busy] or [other-busy] row
+decide-in: land the round's diff; start R5 (the stream wiring of the placed Hy4 pass) with the card-own phase at
+  ~3 ms a 4,096-row unit as a priced term, and note in the triage that a non-stream batch keeps `_sel` (its scratch
+  is plan-reserved by a pure formula, and the phase sits under the host's shadow)
+decide-below: check the changed run's remap table first (tiles a layer from `GemmRoute::read_back` in a gate run,
+  not a guess), then whether the base's phase ran below the memory roofline (a clock or cold-cache artifact would
+  show as a base far under 59 ms); a ratio under 0.03 with equal slot counts means the base was not memory-bound
+  and the derivation's bytes term was wrong
+decide-above: read the changed run's GEMM kernels' grids and tile counts: more than ~2 tiles an expert means the
+  routing is skewed past c = 64 and the table cuts the same expert into many tiles; a ratio past 0.3 at m = 4096
+  means the MAC time or the table fill (one 1024-thread block over 24,576 slots) is the term, which `ncu-gpu.sh`
+  on the fill and the largest GEMM decomposes

@@ -32,13 +32,22 @@
 //!
 //! Under the expert stream ([`CardExperts::enqueue_rows_ring`]) the streamed
 //! experts' slots of a prompt batch run as route GEMMs over the ring's half
-//! (`card_leg::RouteBlock`, the 32-value GEMM over the half's planes), one
-//! GEMM batch a landing batch of the stream behind that batch's copies, each
-//! expert's weights read once a tile of up to 64 of its slots; the card's own
-//! slots stay on the leg's `_sel` launches, whose rows are the step's. On a
-//! tier layer the run sums nothing: the card's and the streamed slots' downs
-//! stay in the leg's rows under the stream's union places, which the layer's
-//! join reads beside the tier's rows.
+//! (`card_leg::RouteBlock`, the route GEMMs of the stacks' types over the
+//! half's planes), one GEMM batch a landing batch of the stream behind that
+//! batch's copies, each expert's weights read once a tile of up to 64 of its
+//! slots. The card's own slots run as the same block over the card's stacks,
+//! first, behind no copy: the route table over the layer's `n_card` experts
+//! ([`RouteSet`], one table a distinct count) from the slot map's row through
+//! [`crate::gemm::Gemm32Kernels::enqueue_route_remap`] (a slot the card does
+//! not hold gets no tile), through the buffers of the ring's pass, so a
+//! resident expert's weights are read once a tile and not once a slot. Their
+//! rows are then the GEMM's sum order, as the streamed slots' are, not the
+//! step's; a batch with no ring, and one under the imatrix collector (which
+//! reads the leg's f32 activation rows the block fuses into its quantization),
+//! keeps the card's slots on the leg's `_sel` launches, whose rows are the
+//! step's. On a tier layer the run sums nothing: the card's and the streamed
+//! slots' downs stay in the leg's rows under the stream's union places, which
+//! the layer's join reads beside the tier's rows.
 
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::models::{Ffn, LayerSpec};
@@ -49,12 +58,13 @@ use model::placement::kernels::{self, DownAct, DownForms};
 use crate::card_leg::ExpertInput;
 use crate::card_leg::{self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum, STACK_ROLES};
 use crate::card_slots::{CardSlotKernels, Places};
-use crate::gemm::{Gemm32Kernels, GemmKernels};
+use crate::gemm::{Gemm32Kernels, GemmKernels, RouteSet};
 use crate::host::slots::BatchSlots;
 use crate::host::xstream::RingLayer;
 use crate::hybrid::SlotMap;
 use crate::kquant::Act;
 use crate::ring_gemm::RingGemm;
+use crate::tensor::Window;
 use crate::weights::Weights;
 use crate::{DeviceTensor, Gpu, GpuError};
 
@@ -153,15 +163,22 @@ pub struct CardBatch {
     /// The grouped GEMM's kernels, armed with the ring where a form is the
     /// grouped GEMM's q8_1 blocks of 128.
     gemm: Option<GemmKernels>,
+    /// The route tables of the resident stacks' own slots under the ring pass,
+    /// one a distinct count of card experts a layer holds, armed with the
+    /// ring.
+    card_routes: Option<RouteSet>,
 }
 
 impl CardBatch {
     /// Device bytes of the buffers: what [`CardExperts::batch`] allocates,
     /// counted before it does by [`CardExperts::batch_bytes`], and the ring
-    /// pass's once armed.
+    /// pass's and the card's route tables' once armed.
     #[must_use]
     pub fn bytes(&self) -> usize {
-        self.bufs.bytes() + self.sel.num_bytes() + self.ring.as_ref().map_or(0, RingGemm::bytes)
+        self.bufs.bytes()
+            + self.sel.num_bytes()
+            + self.ring.as_ref().map_or(0, RingGemm::bytes)
+            + self.card_routes.as_ref().map_or(0, RouteSet::bytes)
     }
 
     /// The sum plus the base of the last run over the batch, `t` rows.
@@ -670,6 +687,7 @@ impl CardExperts {
             sel: DeviceBuffer::zeroed(stream, cap * self.family.n_used)?,
             ring: None,
             gemm: None,
+            card_routes: None,
         })
     }
 
@@ -680,7 +698,11 @@ impl CardExperts {
     /// arming at the same half is nothing. Refused by name: a re-arming at
     /// another half, resident layers whose stacks read different forms, and
     /// buffers whose made bytes are not `place_hybrid::ring_pass_bytes_in` of
-    /// their widths and forms. Load-time or first-prompt only.
+    /// their widths and forms. The resident stacks' own slots run through the
+    /// same buffers ([`CardExperts::enqueue_rows_ring`]), over a route table a
+    /// distinct count of the layers' card experts made here
+    /// ([`RouteSet::bytes_at`] counts them: beside the ring pass's bytes, not in
+    /// them). Load-time or first-prompt only.
     pub fn arm_ring(
         &self,
         gpu: &Gpu,
@@ -709,10 +731,13 @@ impl CardExperts {
         let shape = (cb.bufs.cap(), self.family.n_used, self.n, self.ff);
         let mut ring = RingGemm::new(gpu, shape, half_slots, forms)?;
         ring.set_expert_input(gpu, self.expert_input)?;
+        let counts = self.layers.iter().flatten().map(|l| l.n_card);
+        let card_routes = RouteSet::new(gpu.stream(), shape.0 * shape.1, counts)?;
         if !(forms.gate_up32 && forms.down32) {
             cb.gemm = Some(GemmKernels::load(gpu.context())?);
         }
         cb.ring = Some(ring);
+        cb.card_routes = Some(card_routes);
         Ok(())
     }
 
@@ -860,15 +885,19 @@ impl CardExperts {
     }
 
     /// [`CardExperts::enqueue_rows`] with the expert stream's ring `r` of
-    /// layer `l` beside the card's stacks (a walk under `split`): the card's
-    /// slots run over its stacks under the slot map's places (the leg's
-    /// `_sel` launches); then the streamed experts' slots, one GEMM batch a
-    /// landing batch of `r` ([`RingLayer::batches`]): the route table of the
-    /// batch's map row (its experts at their ring slots, every other
-    /// [`crate::hybrid::HOST`]), the engine stream's wait on the batch's
-    /// copies, and the gate, up, SwiGLU under `rule` and down GEMMs over the
-    /// half's stacks ([`card_leg::with_ring`], `RouteBlock`), each slot's down
-    /// rows into the leg's rows beside the card's; then the card sum over the
+    /// layer `l` beside the card's stacks (a walk under `split`): the batch's
+    /// normed rows in the GEMMs' form once; the card's slots, as the same
+    /// route block over the card's stacks (the route table over the layer's
+    /// `n_card` experts from the slot map's row at `row_off`, a slot the card
+    /// does not hold in no tile; module doc), or under the imatrix collector
+    /// the leg's `_sel` launches under the slot map's places; then the
+    /// streamed experts' slots, one GEMM batch a landing batch of `r`
+    /// ([`RingLayer::batches`]): the route table of the batch's map row (its
+    /// experts at their ring slots, every other [`crate::hybrid::HOST`]), the
+    /// engine stream's wait on the batch's copies, and the gate, up, SwiGLU
+    /// under `rule` and down GEMMs over the half's stacks
+    /// ([`card_leg::with_ring`], `RouteBlock`), each slot's down rows into the
+    /// leg's rows beside the card's; then the card sum over the
     /// union row's places — the layer's `n_card` and the `r.n` streamed
     /// experts, a token's slots in slot order — plus the base into `cb`'s
     /// `pre`. A batch's GEMMs run while the copies of the batches after it
@@ -912,10 +941,15 @@ impl CardExperts {
             sel,
             ring,
             gemm,
+            card_routes,
         } = cb;
         let rg = ring.as_mut().ok_or(GpuError::State {
             what,
             missing: "the ring pass's GEMM buffers (CardExperts::arm_ring at the stream's start)",
+        })?;
+        let routes = card_routes.as_mut().ok_or(GpuError::State {
+            what,
+            missing: "the card's route tables (CardExperts::arm_ring at the stream's start)",
         })?;
         if rg.half_slots() != r.half_slots {
             return Err(GpuError::shape(
@@ -947,21 +981,32 @@ impl CardExperts {
             )
         };
         let stacks = LegStacks::of_arms(w, layer.names(), self.k.arms, STACK_ROLES)?;
-        places(map.buf(), row_off, &mut *sel)?;
-        let card = LegRun {
-            layer: l,
-            stacks: &stacks,
-            normed: io.normed,
-            m: io.m,
-            sel: &*sel,
-            n_card: layer.n_card,
-            rule,
-        };
-        self.k.leg.enqueue(gpu, &mut bufs.leg, &card, None)?;
-        // The route's collector hooks read the card map's places, so they run before the union
-        // rewrite below replaces them with the ring's.
-        self.collect_route(gpu, layer, io, ids, sel, &bufs.leg)?;
         rg.enqueue_rows(gpu, g32, io.normed, io.m, fault)?;
+        if crate::imatrix::collector().is_some() {
+            places(map.buf(), row_off, &mut *sel)?;
+            let card = LegRun {
+                layer: l,
+                stacks: &stacks,
+                normed: io.normed,
+                m: io.m,
+                sel: &*sel,
+                n_card: layer.n_card,
+                rule,
+            };
+            self.k.leg.enqueue(gpu, &mut bufs.leg, &card, None)?;
+            // The route's collector hooks read the card map's places, so they run before the
+            // union rewrite below replaces them with the ring's.
+            self.collect_route(gpu, layer, io, ids, sel, &bufs.leg)?;
+        } else {
+            self.enqueue_card_gemm(
+                (gpu, g32),
+                (&mut *rg, &mut *routes, gemm.as_ref(), bufs.leg.down_mut()),
+                &stacks,
+                (l, layer.n_card, rule),
+                io,
+                (ids, map, row_off),
+            )?;
+        }
         card_leg::with_ring(&stacks, layer.n_card, r, ctx, (self.ff, self.n), |blk| {
             for b in &r.batches {
                 rg.enqueue_batch(
@@ -994,6 +1039,48 @@ impl CardExperts {
         }
         gpu.elem()
             .enqueue_add(stream, acc, io.x1, io.m * self.n, pre)
+    }
+}
+
+impl CardExperts {
+    /// Layer `l`'s card slots over `io.m` tokens as one route block over the card's stacks
+    /// `stacks` (`n_card` experts each): the route table of the layer's count from `routes`,
+    /// filled from the router's picks `ids` through the slot map's row at `row_off` (a window of
+    /// `map`, `n_expert` experts: a slot the card does not hold gets no tile and its rows stay as
+    /// they were), then the gate, up, SwiGLU under `rule` and down GEMMs through `rg`'s buffers,
+    /// whose rows [`RingGemm::enqueue_rows`] quantized from the batch's normed rows first, each
+    /// slot's down row into its row of `down`. The leg's `_sel` launches write the same rows by
+    /// the step's sum order; these are the GEMM's. Refused by name: a layer whose count `routes`
+    /// holds no table of, a block the buffers' forms do not match, more slots than the buffers hold.
+    fn enqueue_card_gemm(
+        &self,
+        (gpu, g32): (&Gpu, &Gemm32Kernels),
+        (rg, routes, gemm, down): (
+            &mut RingGemm,
+            &mut RouteSet,
+            Option<&GemmKernels>,
+            &mut DeviceBuffer<f32>,
+        ),
+        stacks: &LegStacks<'_>,
+        (l, n_card, rule): (usize, usize, Act),
+        io: &Io<'_>,
+        (ids, map, row_off): (&DeviceBuffer<u32>, &DeviceTensor<u32>, usize),
+    ) -> Result<(), GpuError> {
+        let n_used = self.family.n_used;
+        let n_slots = io.m * n_used;
+        let fault = gpu.layer_sink(l)?;
+        let table = routes.of_mut(self.family.what, l, n_card)?;
+        let row = Window::<u32>::of(map.buf(), row_off * size_of::<u32>(), self.family.n_expert)?;
+        g32.enqueue_route_remap(gpu.stream(), ids, &row, n_slots, &mut *table, fault)?;
+        let blk = stacks.block(self.ff, self.n)?;
+        rg.enqueue_over(
+            gpu,
+            (gemm, g32),
+            &blk,
+            (&*table, n_slots, n_used),
+            (down, rule),
+            fault,
+        )
     }
 }
 
@@ -1216,6 +1303,140 @@ mod tests {
         assert!(!card_downs(b32).holds(DownAct::Q8Act));
         let both = q8.with(DownAct::Q8Blocks32);
         assert_eq!(card_downs(both), both);
+    }
+
+    /// The ring pass's card slots run as the route block over the card's stacks
+    /// ([`CardExperts::enqueue_card_gemm`], the table over the layer's `n_card` experts through
+    /// the slot map's row): each card slot's down row within the GEMM's band of the row the leg's
+    /// `_sel` launches write for it, a slot the card does not hold left as it was, and the armed
+    /// buffers the ring pass's bytes plus the card's route tables'. The band is 2 % of the slot's
+    /// largest down value: the GEMM sums in another order, and a SwiGLU value that lands on the
+    /// other side of a q8_1 rounding boundary moves one code of 127.
+    /// FAIL-first: filling the table with the raw ids (`GemmKernels::enqueue_route`) instead of
+    /// through the map refuses the host slots' expert 15 past the card's four and writes NaN rows.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_the_ring_passes_card_slots_run_as_route_gemms() {
+        use GgmlType::{Q5_K, Q6_K, Q8_0};
+        use model::arch::place_hybrid::ring_pass_bytes_in;
+        const HALF: usize = 8;
+        const SENTINEL: f32 = 1.0e30;
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let g32 = Gemm32Kernels::load(gpu.context()).expect("the 32-value GEMM kernels");
+        for triples in [vec![[Q5_K, Q5_K, Q6_K]; 2], vec![[Q5_K, Q5_K, Q8_0]; 2]] {
+            let w = weights(&gpu, &triples);
+            let specs = layers(triples.len());
+            let map = SlotMap::prefix(0..triples.len(), EXPERTS, CARD).expect("a map");
+            let card = CardExperts::new(&gpu, &w, FAMILY, &specs, &map, (N, FF), CAP)
+                .expect("the card wrapper");
+            let mut batch = card.batch(&gpu, CAP).expect("the batch");
+            let before = batch.bytes();
+            card.arm_ring(&gpu, &mut batch, HALF)
+                .expect("the ring pass's buffers");
+            let forms = RingForms::of(triples[0][0], triples[0][2]).expect("route GEMM forms");
+            assert_eq!(
+                batch.bytes() - before,
+                ring_pass_bytes_in(CAP, USED, N, FF, HALF, forms)
+                    + RouteSet::bytes_at(CAP * USED, [CARD]),
+            );
+            let host_x: Vec<f32> = (0..CAP * N).map(|i| (i % 71) as f32 / 71.0 - 0.5).collect();
+            let x = DeviceBuffer::from_host(stream, &host_x).expect("the rows");
+            let x1 = DeviceBuffer::from_host(stream, &vec![0.0f32; CAP * N]).expect("the base");
+            let route = DeviceBuffer::from_host(stream, &[0.125f32; CAP * USED]).expect("weights");
+            let held = |i: usize| i % USED == USED - 1;
+            let ids: Vec<u32> = (0..CAP * USED)
+                .map(|i| {
+                    if held(i) {
+                        (EXPERTS - 1) as u32
+                    } else {
+                        (i % CARD) as u32
+                    }
+                })
+                .collect();
+            let ids = DeviceBuffer::from_host(stream, &ids).expect("the ids");
+            let places = DeviceTensor::upload(stream, &map.stage_view(), triples.len(), EXPERTS)
+                .expect("the map's card view");
+            let rule = Act::SwigluClamp { limit: 0.0 };
+            for (l, tys) in triples.iter().enumerate() {
+                let names = (FAMILY.stacks)(l);
+                let stacks = LegStacks::of_arms(
+                    &w,
+                    names.each_ref().map(String::as_str),
+                    accepts::leg_arms(FAMILY.program).expect("the selected arms"),
+                    STACK_ROLES,
+                )
+                .expect("the stacks");
+                for m in [1, CAP] {
+                    let io = Io {
+                        normed: &x,
+                        weights: &route,
+                        x1: &x1,
+                        m,
+                    };
+                    card.enqueue_rows(
+                        &gpu,
+                        &w,
+                        &mut batch,
+                        l,
+                        rule,
+                        &io,
+                        (&ids, &places, l * EXPERTS),
+                    )
+                    .expect("the leg's rows");
+                    let want = batch
+                        .bufs
+                        .leg
+                        .down()
+                        .to_host_vec(stream)
+                        .expect("the leg's rows");
+                    let mut down = DeviceBuffer::from_host(stream, &vec![SENTINEL; CAP * USED * N])
+                        .expect("the output rows");
+                    let CardBatch {
+                        ring,
+                        card_routes,
+                        gemm,
+                        ..
+                    } = &mut batch;
+                    let rg = ring.as_mut().expect("the armed ring pass");
+                    rg.enqueue_rows(&gpu, &g32, &x, m, gpu.layer_sink(l).expect("a sink"))
+                        .expect("the rows' form");
+                    card.enqueue_card_gemm(
+                        (&gpu, &g32),
+                        (
+                            rg,
+                            card_routes.as_mut().expect("the card's tables"),
+                            gemm.as_ref(),
+                            &mut down,
+                        ),
+                        &stacks,
+                        (l, CARD, rule),
+                        &io,
+                        (&ids, &places, l * EXPERTS),
+                    )
+                    .expect("the card slots as route GEMMs");
+                    let got = down.to_host_vec(stream).expect("the GEMM's rows");
+                    for s in 0..m * USED {
+                        let (g, r) = (&got[s * N..(s + 1) * N], &want[s * N..(s + 1) * N]);
+                        if held(s) {
+                            assert!(
+                                g.iter().all(|&v| v == SENTINEL),
+                                "{tys:?} slot {s}: host slot written"
+                            );
+                            continue;
+                        }
+                        let band = 0.02 * r.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                        assert!(band > 0.0, "{tys:?} slot {s}: a zero reference row");
+                        for (i, (&gv, &wv)) in g.iter().zip(r).enumerate() {
+                            assert!(
+                                gv.is_finite() && (gv - wv).abs() <= band,
+                                "{tys:?} layer {l} m {m} slot {s} lane {i}: {gv} vs {wv} (band {band})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

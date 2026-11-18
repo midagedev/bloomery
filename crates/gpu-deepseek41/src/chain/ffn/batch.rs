@@ -2957,7 +2957,6 @@ impl FfnPiece {
                         GemmWeight::from_ggml(s.gate_up_ty())?,
                         GemmWeight::from_ggml(s.down_ty())?,
                     );
-                    let table = self.gemm_route_at(layer, c.n_card)?;
                     let sink = gpu.layer_sink(layer)?;
                     let x = span(WHAT, &b.x, at * n, t * n)?;
                     gpu.enqueue_quantize_gemm(&x, t, &mut gemm.act_x, sink)?;
@@ -2979,7 +2978,7 @@ impl FfnPiece {
                         (N_USED, ff, n),
                         sink,
                         (&mut gemm.g, &mut gemm.u),
-                        (&*sel, &mut self.routes[table]),
+                        (&*sel, self.routes.of_mut(super::ENQUEUE, layer, c.n_card)?),
                     )
                 }
                 CardPath::Tiles => {

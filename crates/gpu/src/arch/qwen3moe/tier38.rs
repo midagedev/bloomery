@@ -51,7 +51,7 @@ use super::swap38::Qwen38Stacks;
 use super::wide38::down_weight;
 use crate::card_leg::RouteW;
 use crate::gemm::{
-    Gemm32Args, Gemm32Kernels, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels, GemmRoute,
+    Gemm32Args, Gemm32Kernels, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmKernels, RouteSet,
     SwigluSlots,
 };
 use crate::host::node::{NodeFamily, NodeOpen};
@@ -273,11 +273,10 @@ struct BlockRoute38 {
     /// Each of the block's slots' rank among its tier slots
     /// (`q38_tier_rank`), the row its down output takes packed.
     rank: DeviceBuffer<u32>,
-    /// One route table and one map (`0 .. n`, then [`HOST`]) per distinct
-    /// tier count `counts[i]`.
-    routes: Vec<GemmRoute>,
+    /// One route table per distinct tier count, and beside each, in the set's
+    /// order, the map (`0 .. n`, then [`HOST`]) of that count.
+    routes: RouteSet,
     maps: Vec<DeviceBuffer<u32>>,
-    counts: Vec<usize>,
     /// The plan's reserve for the route past what the tables of these counts
     /// hold: the plan counts two tables at the most experts a layer has,
     /// before it knows the tier's counts, and the tier holds the rest of
@@ -329,12 +328,8 @@ impl BlockRoute38 {
             act: GemmAct32::new(stream, slots, geo::FF)?,
             run_down: DeviceBuffer::zeroed(stream, slots * geo::HIDDEN)?,
             rank: DeviceBuffer::zeroed(stream, cols * geo::N_USED)?,
-            routes: counts
-                .iter()
-                .map(|&n| GemmRoute::new(stream, slots, n))
-                .collect::<Result<_, _>>()?,
+            routes: RouteSet::new(stream, slots, counts.iter().copied())?,
             maps: counts.iter().map(|&n| map(n)).collect::<Result<_, _>>()?,
-            counts,
             slack: None,
         };
         let held = r.held();
@@ -362,7 +357,7 @@ impl BlockRoute38 {
             + self.act.bytes()
             + self.run_down.num_bytes()
             + self.rank.num_bytes()
-            + self.routes.iter().map(GemmRoute::bytes).sum::<usize>()
+            + self.routes.bytes()
             + self.maps.iter().map(DeviceBuffer::num_bytes).sum::<usize>()
     }
 
@@ -412,19 +407,7 @@ impl BlockRoute38 {
         }
         let st = cl.stacks(w)?;
         let n_tier = st.reach;
-        let at = self
-            .counts
-            .iter()
-            .position(|&c| c == n_tier)
-            .ok_or_else(|| {
-                GpuError::shape(
-                    WHAT,
-                    format!(
-                        "layer {l}: a route table of {n_tier} experts; the route holds {:?}",
-                        self.counts
-                    ),
-                )
-            })?;
+        let at = self.routes.at(WHAT, l, n_tier)?;
         let (Some(RouteW::Grouped(gate_up_ty, gate)), Some(RouteW::Grouped(_, up))) =
             (st.gate.route(st.gate_up_ty), st.up.route(st.gate_up_ty))
         else {
@@ -461,7 +444,7 @@ impl BlockRoute38 {
                 &self.ids,
                 &self.maps[at],
                 m * n,
-                &mut self.routes[at],
+                self.routes.of_mut(WHAT, l, n_tier)?,
                 sink,
             )?;
             gpu.enqueue_quantize_gemm(&x_w, m, &mut self.x, sink)?;
@@ -472,7 +455,7 @@ impl BlockRoute38 {
                         w: $w,
                         rows_per_expert: geo::FF,
                         act: &self.x,
-                        route: &self.routes[at],
+                        route: self.routes.of(WHAT, l, n_tier)?,
                         input: GemmInput::Shared { top_k: n },
                         y: $y,
                     }
@@ -497,7 +480,7 @@ impl BlockRoute38 {
                     w: down,
                     rows_per_expert: h,
                     act: &self.act,
-                    route: &self.routes[at],
+                    route: self.routes.of(WHAT, l, n_tier)?,
                     input: GemmInput::PerSlot,
                     y: &mut self.run_down,
                 },

@@ -1556,7 +1556,8 @@ impl<R: RouterEntry> Routed<R> {
     /// machine's admits into the stage stacks, which the slot map's card
     /// copy the route reads names already). One route over the whole map,
     /// each slot's rows the step's under the same map. With the expert
-    /// stream's `ring` of the layer (a walk under `split`) the streamed
+    /// stream's `ring` of the layer (a walk under `split`) the card's own
+    /// slots run as route GEMMs too, in the GEMM's sum order, and the streamed
     /// experts' slots run over the ring's half into the same card sum, one
     /// GEMM batch a landing batch of the ring, each behind its own batch's
     /// copies, so a batch computes while the next lands

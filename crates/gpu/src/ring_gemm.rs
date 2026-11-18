@@ -169,6 +169,12 @@ impl RingGemm {
         fault: FaultSink,
     ) -> Result<(), GpuError> {
         let stream = gpu.stream();
+        batch.with_map(gpu.context(), n_expert, |row| {
+            g32.enqueue_route_remap(stream, ids, row, n_slots, &mut self.route, fault)
+        })?;
+        if let Some(e) = batch.event.as_deref() {
+            stream.wait(e)?;
+        }
         let RingGemm {
             x,
             g,
@@ -178,39 +184,115 @@ impl RingGemm {
             protection,
             ..
         } = self;
-        batch.with_map(gpu.context(), n_expert, |row| {
-            g32.enqueue_route_remap(stream, ids, row, n_slots, &mut *route, fault)
-        })?;
-        if let Some(e) = batch.event.as_deref() {
-            stream.wait(e)?;
-        }
-        let (x128, x32) = match &*x {
-            Rows::Q128(a) => (Some(&**a), None),
-            Rows::Blocks32(a) => (None, Some(&**a)),
-        };
-        let (h128, h32) = match h {
-            Rows::Q128(a) => (Some(&mut **a), None),
-            Rows::Blocks32(a) => (None, Some(&mut **a)),
-        };
-        blk.enqueue_input(
+        run_block(
+            (x, g, u, h, protection.as_mut()),
             gpu,
             (gemm, g32),
+            blk,
             (&*route, top_k),
             n_slots,
-            (
-                RouteIo {
-                    x128,
-                    x32,
-                    g,
-                    u,
-                    h128,
-                    h32,
-                    y,
-                },
-                rule,
-            ),
-            protection.as_mut(),
+            (y, rule),
             fault,
         )
     }
+
+    /// `blk` over a route table `table` the caller filled (a stack of its own: the layer's card
+    /// stacks, whose table is over their `n_card` experts, not the half's) through the buffers'
+    /// rows: the same gate, up, SwiGLU and down launches as a landing batch's, each listed slot's
+    /// down row into its row of `y`, under the buffers' expert-input protection. The batch's rows
+    /// ([`RingGemm::enqueue_rows`]) are quantized first. Refused by name as
+    /// [`RingGemm::enqueue_batch`] refuses a block the buffers were not made for, and a table over
+    /// more slots than the buffers hold. Asynchronous, allocation-free.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the card, the two GEMM kernel sets, the block, the filled table and its slots, the \
+                  rows and their rule, and the fault sink (rust-quality R8)"
+    )]
+    pub(crate) fn enqueue_over(
+        &mut self,
+        gpu: &Gpu,
+        (gemm, g32): (Option<&GemmKernels>, &Gemm32Kernels),
+        blk: &RouteBlock<'_>,
+        (table, n_slots, top_k): (&GemmRoute, usize, usize),
+        (y, rule): (&mut DeviceBuffer<f32>, Act),
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        if n_slots == 0 || n_slots > self.slots {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{n_slots} slots in buffers of {}", self.slots),
+            ));
+        }
+        let RingGemm {
+            x,
+            g,
+            u,
+            h,
+            protection,
+            ..
+        } = self;
+        run_block(
+            (x, g, u, h, protection.as_mut()),
+            gpu,
+            (gemm, g32),
+            blk,
+            (table, top_k),
+            n_slots,
+            (y, rule),
+            fault,
+        )
+    }
+}
+
+/// The routed block `blk` over `table` through the buffers' rows `(x, g, u, h)`, the down rows into
+/// `y`: the one launch sequence of a landing batch and of a caller's own table.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the buffers' rows, the card, the two GEMM kernel sets, the block, the table, the \
+              slots, the rows and their rule, and the fault sink (rust-quality R8)"
+)]
+fn run_block(
+    (x, g, u, h, protection): (
+        &Rows,
+        &mut DeviceBuffer<f32>,
+        &mut DeviceBuffer<f32>,
+        &mut Rows,
+        Option<&mut Protection>,
+    ),
+    gpu: &Gpu,
+    (gemm, g32): (Option<&GemmKernels>, &Gemm32Kernels),
+    blk: &RouteBlock<'_>,
+    (table, top_k): (&GemmRoute, usize),
+    n_slots: usize,
+    (y, rule): (&mut DeviceBuffer<f32>, Act),
+    fault: FaultSink,
+) -> Result<(), GpuError> {
+    let (x128, x32) = match x {
+        Rows::Q128(a) => (Some(&**a), None),
+        Rows::Blocks32(a) => (None, Some(&**a)),
+    };
+    let (h128, h32) = match h {
+        Rows::Q128(a) => (Some(&mut **a), None),
+        Rows::Blocks32(a) => (None, Some(&mut **a)),
+    };
+    blk.enqueue_input(
+        gpu,
+        (gemm, g32),
+        (table, top_k),
+        n_slots,
+        (
+            RouteIo {
+                x128,
+                x32,
+                g,
+                u,
+                h128,
+                h32,
+                y,
+            },
+            rule,
+        ),
+        protection,
+        fault,
+    )
 }

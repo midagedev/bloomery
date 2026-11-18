@@ -235,6 +235,109 @@ impl GemmRoute {
     }
 }
 
+/// The route tables of one pass over stacks whose expert count differs by layer. A grouped GEMM's
+/// table holds the experts of the one stack it routes over, so a pass whose layers' card stacks
+/// hold several counts makes one table a distinct count, all of `max_slots` slots, and each layer
+/// asks the set for the table of its stack's count. The one owner of that lookup for every walk
+/// that runs a layer's slots through a route GEMM.
+pub struct RouteSet {
+    /// One table a distinct count, ascending by [`GemmRoute::n_experts`].
+    tables: Vec<GemmRoute>,
+}
+
+impl RouteSet {
+    /// The distinct nonzero counts of `counts`, ascending: the tables a set over them holds.
+    #[must_use]
+    pub fn distinct(counts: impl IntoIterator<Item = usize>) -> Vec<usize> {
+        let mut counts: Vec<usize> = counts.into_iter().filter(|&n| n > 0).collect();
+        counts.sort_unstable();
+        counts.dedup();
+        counts
+    }
+
+    /// A table of `max_slots` slots for each distinct nonzero count of `counts` (each within
+    /// [`GemmRoute::new`]'s bounds). A set over no count holds no table: a lookup is then refused
+    /// by name. Load-time only.
+    pub fn new(
+        stream: &CudaStream,
+        max_slots: usize,
+        counts: impl IntoIterator<Item = usize>,
+    ) -> Result<RouteSet, GpuError> {
+        let tables = Self::distinct(counts)
+            .into_iter()
+            .map(|n| GemmRoute::new(stream, max_slots, n))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RouteSet { tables })
+    }
+
+    /// The counts the set holds a table of, ascending.
+    pub fn counts(&self) -> impl Iterator<Item = usize> + '_ {
+        self.tables.iter().map(GemmRoute::n_experts)
+    }
+
+    /// Device bytes of the set's tables.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.tables.iter().map(GemmRoute::bytes).sum()
+    }
+
+    /// The device bytes of the set [`RouteSet::new`] makes over `counts` at `max_slots` slots: the
+    /// plan's count of a load's tables before any is made.
+    #[must_use]
+    pub fn bytes_at(max_slots: usize, counts: impl IntoIterator<Item = usize>) -> usize {
+        Self::distinct(counts)
+            .into_iter()
+            .map(|n| GemmRoute::bytes_at(max_slots, n))
+            .sum()
+    }
+
+    /// The place in the set's order (ascending count) of the table of a layer whose stack holds
+    /// `n_experts` experts, for a caller that keeps state beside each table. Refused by name, as
+    /// `what`'s refusal of layer `layer`, when the set holds none of that count.
+    pub fn at(
+        &self,
+        what: &'static str,
+        layer: usize,
+        n_experts: usize,
+    ) -> Result<usize, GpuError> {
+        self.tables
+            .iter()
+            .position(|t| t.n_experts == n_experts)
+            .ok_or_else(|| self.refusal(what, layer, n_experts))
+    }
+
+    /// The table of a layer whose stack holds `n_experts` experts, refused as [`RouteSet::at`].
+    pub fn of(
+        &self,
+        what: &'static str,
+        layer: usize,
+        n_experts: usize,
+    ) -> Result<&GemmRoute, GpuError> {
+        Ok(&self.tables[self.at(what, layer, n_experts)?])
+    }
+
+    /// [`RouteSet::of`] for a fill, which writes the table.
+    pub fn of_mut(
+        &mut self,
+        what: &'static str,
+        layer: usize,
+        n_experts: usize,
+    ) -> Result<&mut GemmRoute, GpuError> {
+        let at = self.at(what, layer, n_experts)?;
+        Ok(&mut self.tables[at])
+    }
+
+    fn refusal(&self, what: &'static str, layer: usize, n_experts: usize) -> GpuError {
+        GpuError::Shape {
+            what,
+            detail: format!(
+                "layer {layer}: a route table of {n_experts} experts; the set holds {:?}",
+                self.counts().collect::<Vec<_>>()
+            ),
+        }
+    }
+}
+
 impl GemmKernels {
     /// Enqueue the route table for `n_slots` slots whose expert ids are
     /// `ids[0..n_slots]` (slot `token * top_k + k`), read on the card: no
@@ -331,5 +434,30 @@ impl GemmKernels {
         )?;
         route.filled = Some(n_slots);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_set_holds_one_table_a_distinct_nonzero_count_ascending() {
+        assert_eq!(
+            RouteSet::distinct([120, 0, 121, 120, 121, 0]),
+            vec![120, 121]
+        );
+        assert!(RouteSet::distinct([0, 0]).is_empty());
+        assert!(RouteSet::distinct(std::iter::empty()).is_empty());
+    }
+
+    #[test]
+    fn a_sets_bytes_are_its_tables_bytes_at_each_count() {
+        let (slots, counts) = (3_072, [67, 67, 0, 1]);
+        assert_eq!(
+            RouteSet::bytes_at(slots, counts),
+            GemmRoute::bytes_at(slots, 1) + GemmRoute::bytes_at(slots, 67)
+        );
+        assert_eq!(RouteSet::bytes_at(slots, [0]), 0);
     }
 }

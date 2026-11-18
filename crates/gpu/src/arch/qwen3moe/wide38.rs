@@ -200,7 +200,7 @@ use crate::flash_gqa::GqaListArgs;
 use crate::flash_gqa_prefill::QueryNorm;
 use crate::gemm::{
     DownW, DownWin, GateUp, Gemm32Weight, GemmAct, GemmAct32, GemmInput, GemmRoute, MmaForm,
-    enqueue_gemm_batch,
+    RouteSet, enqueue_gemm_batch,
 };
 use crate::hc_gated::{Before, HcMatrix, HcWideScratch, SiteWeights, Streams, WideMixArgs};
 use crate::head::Head;
@@ -804,9 +804,8 @@ pub(super) struct CardRoute38 {
     /// Beside the tier places, each slot's rank among the unit's tier slots
     /// (`q38_tier_rank`): the row of the tier's packed rows the join reads.
     trank: Option<DeviceBuffer<u32>>,
-    /// One route table per distinct card count, in `counts`' order.
-    routes: Vec<GemmRoute>,
-    counts: Vec<usize>,
+    /// One route table per distinct card count.
+    routes: RouteSet,
     /// The identity map over the experts (`e -> e`): the ids compression's
     /// stand-in for the places rule's map.
     ids_map: DeviceBuffer<u32>,
@@ -1096,11 +1095,7 @@ impl CardRoute38 {
             trank: tiered
                 .then(|| DeviceBuffer::zeroed(stream, rows * geo::N_USED))
                 .transpose()?,
-            routes: counts
-                .iter()
-                .map(|&n| GemmRoute::new(stream, slots, n))
-                .collect::<Result<_, _>>()?,
-            counts,
+            routes: RouteSet::new(stream, slots, counts)?,
             ids_map: DeviceBuffer::from_host(
                 stream,
                 &(0..geo::EXPERTS as u32).collect::<Vec<_>>(),
@@ -1158,28 +1153,11 @@ impl CardRoute38 {
             + self.acc.num_bytes()
             + self.tsel.as_ref().map_or(0, DeviceBuffer::num_bytes)
             + self.trank.as_ref().map_or(0, DeviceBuffer::num_bytes)
-            + self.routes.iter().map(GemmRoute::bytes).sum::<usize>()
+            + self.routes.bytes()
             + self.ids_map.num_bytes()
             + self.bsel.num_bytes()
             + self.ring.as_ref().map_or(0, |r| {
                 r.route.bytes() + r.sel.num_bytes() + r.union.num_bytes()
-            })
-    }
-
-    /// The route table's index for the experts' count `n_card`, refused by
-    /// name when the route holds none for it.
-    fn table_at(&self, n_card: usize) -> Result<usize, GpuError> {
-        self.counts
-            .iter()
-            .position(|&n| n == n_card)
-            .ok_or_else(|| {
-                GpuError::shape(
-                    WHAT,
-                    format!(
-                        "a card route table of {n_card} experts; the walk holds {:?}",
-                        self.counts
-                    ),
-                )
             })
     }
 
@@ -1343,7 +1321,7 @@ impl CardRoute38 {
                     )
                 };
                 places(&self.ids_map, &mut self.ids)?;
-                let table = self.table_at(n_card)?;
+                self.routes.at(WHAT, l, n_card)?;
                 let gate_up = match (gate_up, &mut self.x) {
                     ([RouteW::Grouped(ty, gate), RouteW::Grouped(_, up)], RouteX::Q8_1(x)) => {
                         gpu.enqueue_quantize_gemm(&x_w, n, x, sink)?;
@@ -1377,7 +1355,7 @@ impl CardRoute38 {
                         sink,
                         &mut down_w,
                         (&mut self.g, &mut self.u, &mut self.act),
-                        (&mut sel_w, &mut self.routes[table]),
+                        (&mut sel_w, self.routes.of_mut(WHAT, l, n_card)?),
                     )?;
                 } else {
                     // The full places beside the batches: the card sum's
@@ -1397,7 +1375,7 @@ impl CardRoute38 {
                                 sink,
                                 &mut down_w,
                                 (&mut self.g, &mut self.u, &mut self.act),
-                                (&mut self.bsel, &mut self.routes[table]),
+                                (&mut self.bsel, self.routes.of_mut(WHAT, l, n_card)?),
                             )
                         })?;
                     }

@@ -81,7 +81,7 @@ use std::sync::Arc;
 
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegShape, LegStacks, QuantRun};
 use bloomery_gpu::fused::FusedKernels;
-use bloomery_gpu::gemm::GemmRoute;
+use bloomery_gpu::gemm::RouteSet;
 pub use bloomery_gpu::host::handoff::Handoff;
 use bloomery_gpu::host::handoff::HandoffKernels;
 use bloomery_gpu::host::rank::Sums;
@@ -1226,13 +1226,10 @@ pub struct FfnPiece {
     /// ([`FfnPiece::prepare_leg`]).
     leg: Option<CardLeg>,
     /// The grouped GEMM's route tables, one per distinct count of card
-    /// experts the map puts on a layer ([`FfnPiece::gemm_route_at`]), for the
-    /// default prompt block's card experts ([`batch::enqueue_block_experts`]).
-    /// Empty when no layer holds card experts: a block that needs a table is
-    /// refused by name then.
-    routes: Vec<GemmRoute>,
-    /// The expert counts [`FfnPiece::routes`]' tables hold, in their order.
-    counts: Vec<usize>,
+    /// experts the map puts on a layer, for the default prompt block's card
+    /// experts ([`batch::enqueue_block_experts`]). Empty when no layer holds
+    /// card experts: a block that needs a table is refused by name then.
+    routes: RouteSet,
     /// HC_PRE's reduction scratch, which its own launches consume.
     hc_scratch: HcPreScratch,
 }
@@ -1329,13 +1326,11 @@ impl FfnPiece {
             .collect::<Result<Vec<_>, _>>()?;
         // The GEMM's route table holds the experts of one stack, so one table
         // a distinct card count; a block's fill passes its layer's count.
-        let mut counts: Vec<usize> = cfg.iter().map(|c| c.n_card).filter(|&n| n > 0).collect();
-        counts.sort_unstable();
-        counts.dedup();
-        let routes = counts
-            .iter()
-            .map(|&n| GemmRoute::new(stream, UNION_MAX_COLS * N_USED, n))
-            .collect::<Result<_, _>>()?;
+        let routes = RouteSet::new(
+            stream,
+            UNION_MAX_COLS * N_USED,
+            cfg.iter().map(|c| c.n_card),
+        )?;
         Ok(FfnPiece {
             fused: FusedKernels::load(ctx)?,
             router: RouterKernels::load(ctx)?,
@@ -1362,21 +1357,7 @@ impl FfnPiece {
                 .transpose()?,
             leg: None,
             routes,
-            counts,
             hc_scratch: HcPreScratch::new(stream, HC_STREAMS * n_embd)?,
-        })
-    }
-
-    /// The grouped GEMM's route table for a layer of `n_card` card experts,
-    /// its index into [`FfnPiece::routes`], refused by name when the piece
-    /// holds no table for the count.
-    fn gemm_route_at(&self, layer: usize, n_card: usize) -> Result<usize, GpuError> {
-        self.counts.iter().position(|&n| n == n_card).ok_or_else(|| GpuError::Shape {
-            what: ENQUEUE,
-            detail: format!(
-                "layer {layer}: a GEMM route table of {n_card} card experts; the piece holds {:?}",
-                self.counts
-            ),
         })
     }
 
@@ -1439,7 +1420,7 @@ impl FfnPiece {
     pub fn device_bytes(&self) -> usize {
         self.rows.iter().map(FfnRow::device_bytes).sum::<usize>()
             + hc_pre_scratch_bytes(&self.hc_scratch)
-            + self.routes.iter().map(GemmRoute::bytes).sum::<usize>()
+            + self.routes.bytes()
     }
 
     /// Device bytes of one row's buffers.

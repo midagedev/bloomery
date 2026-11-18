@@ -70,6 +70,7 @@ use crate::gemm::GEMM_MAX_SLOTS;
 use crate::gemm::Gemm32Kernels;
 use crate::gemm::{
     Gemm32Args, Gemm32Weight, GemmAct, GemmAct32, GemmArgs, GemmInput, GemmRoute, GemmWeight,
+    RouteSet,
 };
 use crate::head::Head;
 use crate::host::BatchLeg;
@@ -484,7 +485,7 @@ struct PassBufs {
 /// What the experts' GEMMs read past [`COLS`] rows.
 struct ExpertArms {
     /// One routed table a layer expert count, `TOP_K` slots a row.
-    routes: Vec<(usize, GemmRoute)>,
+    routes: RouteSet,
     /// The q8_1 blocks of 128 the GEMMs read: `(k, columns, form)`.
     acts: Vec<(usize, usize, GemmAct)>,
     /// The q8 blocks of 32 the 32-value GEMMs read: `(k, columns, form)`.
@@ -539,14 +540,10 @@ impl Prompt {
             slots.push((k, cols, Q8Act::with_slots(stream, cols, k)?));
         }
         let mut ex = ExpertArms {
-            routes: Vec::new(),
+            routes: RouteSet::new(stream, moe.top_k * cut, sizes.route_n.iter().copied())?,
             acts: Vec::new(),
             acts32: Vec::new(),
         };
-        for &n in &sizes.route_n {
-            ex.routes
-                .push((n, GemmRoute::new(stream, moe.top_k * cut, n)?));
-        }
         for &(k, per_row) in &sizes.gemm_acts {
             let cols = per_row * cut;
             ex.acts.push((k, cols, GemmAct::new(stream, cols, k)?));
@@ -662,7 +659,7 @@ impl Prompt {
                 .sum::<usize>()
             + b.arms.wide.iter().map(|a| a.1.bytes()).sum::<usize>()
             + b.arms.route.bytes()
-            + b.ex.routes.iter().map(|r| r.1.bytes()).sum::<usize>()
+            + b.ex.routes.bytes()
             + b.ex.acts.iter().map(|a| a.2.bytes()).sum::<usize>()
             + b.ex.acts32.iter().map(|a| a.2.bytes()).sum::<usize>()
             + b.split.num_bytes()
@@ -870,7 +867,7 @@ fn moe_card_experts(
         return experts_gemm32(
             cx,
             &mut p.ex,
-            (fault, ml, sh.width),
+            (l, fault, ml, sh.width),
             (&p.ids, places),
             (x, &mut p.up, &mut p.down),
         );
@@ -883,7 +880,7 @@ fn moe_card_experts(
         return experts_gemm(
             cx,
             &mut p.ex,
-            (fault, ml, sh.width, ty),
+            (l, fault, ml, sh.width, ty),
             (&p.ids, places),
             (x, &mut p.up, &mut p.down),
         );
@@ -1048,7 +1045,7 @@ fn gemm_form(
 fn experts_gemm(
     cx: &Cx<'_>,
     ex: &mut ExpertArms,
-    (fault, ml, latent, ty): (FaultSink, &MoeLayer, usize, GemmWeight),
+    (l, fault, ml, latent, ty): (usize, FaultSink, &MoeLayer, usize, GemmWeight),
     (ids, places): (&DeviceBuffer<u32>, Places<'_>),
     (lat, up, down): (
         &DeviceBuffer<f32>,
@@ -1059,7 +1056,7 @@ fn experts_gemm(
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
     let slots = ml.top_k * m;
-    let route = fill_route(cx, &mut ex.routes, ml, (ids, places), fault)?;
+    let route = fill_route(cx, &mut ex.routes, (l, ml), (ids, places), fault)?;
     {
         let a = gemm_form(&mut ex.acts, latent, m)?;
         gpu.enqueue_quantize_gemm(lat, m, a, fault)?;
@@ -1099,19 +1096,14 @@ fn experts_gemm(
 /// none.
 fn fill_route<'r>(
     cx: &Cx<'_>,
-    routes: &'r mut [(usize, GemmRoute)],
-    ml: &MoeLayer,
+    routes: &'r mut RouteSet,
+    (l, ml): (usize, &MoeLayer),
     (ids, places): (&DeviceBuffer<u32>, Places<'_>),
     fault: FaultSink,
 ) -> Result<&'r GemmRoute, GpuError> {
     let stream = cx.gpu.stream();
     let slots = ml.top_k * cx.m;
-    let n = ml.n_card;
-    let route = routes
-        .iter_mut()
-        .find(|r| r.0 == n)
-        .map(|r| &mut r.1)
-        .ok_or_else(|| GpuError::shape(WHAT, format!("no routed table of {n} experts")))?;
+    let route = routes.of_mut(WHAT, l, ml.n_card)?;
     match places {
         Places::Ids => cx.wk.gemm.enqueue_route(stream, ids, slots, route, fault)?,
         Places::Cut { map } => cx
@@ -1130,7 +1122,7 @@ fn fill_route<'r>(
 fn experts_gemm32(
     cx: &Cx<'_>,
     ex: &mut ExpertArms,
-    (fault, ml, width): (FaultSink, &MoeLayer, usize),
+    (l, fault, ml, width): (usize, FaultSink, &MoeLayer, usize),
     (ids, places): (&DeviceBuffer<u32>, Places<'_>),
     (x, up, down): (
         &DeviceBuffer<f32>,
@@ -1141,7 +1133,7 @@ fn experts_gemm32(
     let (gpu, w, m) = (cx.gpu, cx.w, cx.m);
     let stream = gpu.stream();
     let slots = ml.top_k * m;
-    let route = fill_route(cx, &mut ex.routes, ml, (ids, places), fault)?;
+    let route = fill_route(cx, &mut ex.routes, (l, ml), (ids, places), fault)?;
     {
         let a = gemm32_form(&mut ex.acts32, width, m)?;
         cx.g32.enqueue_quantize_gemm32(stream, x, m, a, fault)?;
