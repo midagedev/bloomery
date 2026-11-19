@@ -38,7 +38,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ env.TAG }}
-          fetch-depth: 0
+          # The tag's commit alone: a full fetch takes every branch, and two branch names that differ only in case
+          # cannot be stored on the runner's case-insensitive filesystem, so the checkout fails before the build.
+          fetch-depth: 1
 
       - name: Toolchain
         run: |
