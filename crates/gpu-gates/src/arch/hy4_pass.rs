@@ -1,8 +1,9 @@
 //! The placed prompt pass a Hy4-flash placed load opens beside its step: the widest of the body's
 //! pass shapes ([`SHAPES`], the widest walk of several units first) whose bytes the stage card's
 //! room holds as the prompt reserve; a load whose prompt calls stream their host experts
-//! (`BLOOMERY_XSTREAM=split`) reserves the stream's ring at its floor beside it
-//! ([`streaming_for`]).
+//! (`BLOOMERY_XSTREAM=split`) reserves the stream's ring at its floor beside it: inputs that carry
+//! the ring ([`with_ring`]) keep it in every shape's inputs ([`inputs_for`]), and plain inputs take
+//! it by [`streaming_for`].
 //! `bloomery-serve --model hy4` and `gate_hy4_pp` pick their shape here ([`pick`]'s `attempt` is the
 //! caller's plan of a shape). The family hangs no expert tier card, so every shape plans on one
 //! machine.
@@ -22,7 +23,8 @@ pub type Picked = pass_pick::Picked<PassShape>;
 pub use pass_pick::NoShape;
 
 /// `inputs` for the plan of a pass of `shape` at `ctx` positions: the shape's bytes
-/// ([`pass_bytes`]) the prompt reserve.
+/// ([`pass_bytes`]) the prompt reserve, and the stream's ring where `inputs` carry one
+/// ([`PlanInputs::with_pass_reserve`]).
 pub fn inputs_for(
     inputs: &PlanInputs,
     ctx: usize,
@@ -30,17 +32,24 @@ pub fn inputs_for(
 ) -> Result<PlanInputs, GateError> {
     Ok(inputs
         .clone()
-        .with_prompt_reserve(pass_bytes(&inputs.hp, ctx, shape)?))
+        .with_pass_reserve(pass_bytes(&inputs.hp, ctx, shape)?))
+}
+
+/// `inputs` for a load whose prompt calls stream their host experts: the stream's ring at its
+/// floor ([`stream_ring`], [`PlanInputs::streaming`]), which the pass's inputs keep ([`inputs_for`]).
+pub fn with_ring(inputs: PlanInputs) -> Result<PlanInputs, GateError> {
+    let ring = stream_ring(&inputs)?;
+    Ok(inputs.streaming(ring))
 }
 
 /// [`inputs_for`] for a load whose prompt calls stream their host experts: the stream's ring at
-/// its floor ([`stream_ring`], [`PlanInputs::streaming`]) beside the pass's bytes.
+/// its floor beside the pass's bytes, `inputs` plain.
 pub fn streaming_for(
     inputs: &PlanInputs,
     ctx: usize,
     shape: PassShape,
 ) -> Result<PlanInputs, GateError> {
-    Ok(inputs_for(inputs, ctx, shape)?.streaming(stream_ring(inputs)?))
+    inputs_for(&with_ring(inputs.clone())?, ctx, shape)
 }
 
 /// A shape's name in the pick's lines: its rows, and its units when a walk holds several.

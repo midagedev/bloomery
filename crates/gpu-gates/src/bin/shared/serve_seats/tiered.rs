@@ -348,13 +348,18 @@ pub trait Tiered: Seat + Sized + 'static {
     /// How the load runs a prompt, for a body that has a prompt pass: asked once the context
     /// (`ctx`) and the step's plan are chosen, with the run's machine at a tier batch of the
     /// seat's choice (`build`: the placement's, the side model's and the image encoder's reserves
-    /// on it) and the plan the run makes (`attempt`, at `ctx` and the slots). [`Walk::Pass`] is
-    /// the plan the load runs instead of the step's, its `prompt_pass` record after the plan's;
-    /// [`Walk::Steps`] keeps the step's plan and prints why. Either names the walk in the
-    /// `listening` record. `None` (the default) is a body with no pass, which prints neither.
+    /// on it, and the stream's lane staging where the step's plan holds it) and the plan the run
+    /// makes (`attempt`, at `ctx` and the slots). `ring` is the inputs of a plan that keeps the
+    /// expert stream's ring ([`Tiered::with_ring`]) where the load keeps it, `None` where it keeps
+    /// none; the pass plans on them, then on `inputs` where the ring leaves it no room.
+    /// [`Walk::Pass`] is the plan the load runs instead of the step's, its `prompt_pass` record
+    /// after the plan's; [`Walk::Steps`] keeps the step's plan and prints why. Either names the
+    /// walk in the `listening` record. `None` (the default) is a body with no pass, which prints
+    /// neither.
     fn pass_plan(
         _flags: &mut Self::Flags,
         _inputs: &PlanInputs<Self::H>,
+        _ring: Option<&PlanInputs<Self::H>>,
         _place: Place,
         _ctx: usize,
         _build: &BuildMachine<'_>,
@@ -429,7 +434,8 @@ pub trait Tiered: Seat + Sized + 'static {
 
     /// Whether the plan of a load on `place` keeps the expert stream's ring out of the expert budget
     /// ([`Tiered::with_ring`]): the body's prompt calls stream host experts there (`BLOOMERY_XSTREAM`
-    /// by the common rule, `shared/xstream_rule.rs`). Asked before the plan; the run keeps the ring
+    /// by the common rule, `shared/xstream_rule.rs`). Asked before the plan, and not of a prompt
+    /// fed one id a step ([`Tiered::prefill_steps`]), which streams nothing; the run keeps the ring
     /// only where the rule would start the stream on the plan (a residency pick other than `off`,
     /// and, unset, host experts to stream and room for the ring), and the open plans what the run
     /// kept ([`Open::ring`]). False by default: a body that streams none.
@@ -904,7 +910,7 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     // The plan's inputs on this placement where the seat streams, read again from the headers and
     // priced for the prompt group as `inputs` are (the ring's bytes join the group's reserve): the
     // stream's ring out of the expert budget. Whether the load keeps them is settled below.
-    let ring_inputs = if S::ring(&levers, place) {
+    let ring_inputs = if S::ring(&levers, place) && !S::prefill_steps(&flags) {
         let mut read = S::read(&split)?;
         S::configure(&mut read, levers.prefill_group())?;
         let mut read = S::with_ring(read)?;
@@ -1103,15 +1109,15 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     S::check_ctx(&inputs, slot_ctx)?;
     // The prompt walk of a body that has a pass, at the context the step's plan chose: the run's
     // machine at the tier batch the seat names, its plan the run's at that context and slots. A
-    // folder's part reads and the stream's staging are reserves this machine does not carry, so a
-    // pass beside either is refused by name.
-    let plain_machine = source.is_none() && staged.is_none();
+    // folder's part reads are a reserve this machine does not carry, so a pass beside them is
+    // refused by name. The stream's lane staging stays on it where the step's plan holds it, and
+    // the pass plans on the ring's inputs where the load keeps the ring (`ring`).
+    let on_staging = workstation::stages_stream(asked.plan.machine);
     let image_reserve = image.as_ref().and_then(|o| o.seat.reserve);
     let build = |tier_batch: Option<TierBatchBytes>| -> Result<Machine, GateError> {
-        if !plain_machine {
+        if source.is_some() {
             return Err(format!(
-                "the {} seat's prompt pass is planned on a machine with no folder part reads or \
-                 stream staging",
+                "the {} seat's prompt pass is planned on a machine with no folder part reads",
                 S::FAMILY
             )
             .into());
@@ -1129,13 +1135,17 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
                 embedding,
             },
         );
+        if let Some(r) = ring_inputs.as_ref().filter(|_| on_staging) {
+            workstation::reserve_stream_staging(&mut m, r.stream_slot);
+        }
         Ok(m)
     };
     let at = asked.slot_ctx;
     let attempt = |pass: &PlanInputs<S::H>, m: &Machine| -> Result<(), PlaceError> {
         pass.plan_with_slots(m, at, &plan_levers, n).map(drop)
     };
-    let walk = S::pass_plan(&mut flags, &inputs, place, slot_ctx, &build, &attempt)?;
+    let kept = ring_inputs.as_ref().filter(|_| ring);
+    let walk = S::pass_plan(&mut flags, &inputs, kept, place, slot_ctx, &build, &attempt)?;
     let walk_word = walk.as_ref().map(Walk::word);
     let (passed, stepped) = match walk {
         Some(Walk::Pass(p)) => {

@@ -634,6 +634,19 @@ impl<H> PlanInputs<H> {
         }
     }
 
+    /// `self` with a pass that makes `bytes` of card buffers: [`PlanInputs::with_prompt_reserve`]
+    /// replaces the reserve, so the ring a streaming load keeps ([`PlanInputs::streaming`]) joins
+    /// it after the pass's bytes, its floor counted once.
+    #[must_use]
+    pub fn with_pass_reserve(self, bytes: u64) -> PlanInputs<H> {
+        let ring = self.ring;
+        let passed = self.with_prompt_reserve(bytes);
+        match ring {
+            Some(ring) => passed.streaming(ring),
+            None => passed,
+        }
+    }
+
     /// `self` for a load whose prompt calls stream their host experts (`BLOOMERY_XSTREAM=split`):
     /// the prompt reserve grows by the ring's bytes at its floor ([`StreamRing::bytes`]), which the
     /// plan counts as the card's ring term and grows last ([`PlanInputs::plan_with_slots`]), and a

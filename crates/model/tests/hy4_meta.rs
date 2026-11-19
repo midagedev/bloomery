@@ -446,6 +446,79 @@ fn hy4_plan_counts_its_rooms_at_the_floor() {
     );
 }
 
+/// A streaming load's inputs keep the stream's ring beside a pass's bytes
+/// ([`PlanInputs::with_pass_reserve`]): the pass's bytes replace the prompt reserve, and the ring's
+/// floor joins after them, so the plan keeps the card experts of the reserve that is their sum,
+/// fewer than the pass alone leaves, and counts the ring as the card's ring term. Plain inputs take
+/// no ring. Mutant: the ring set first and the pass's bytes after (the reserve is the pass's alone
+/// and the floor is lost: the reserve and the experts differ).
+#[test]
+fn hy4_pass_inputs_keep_the_ring_after_the_pass_bytes() {
+    use model::arch::hy4::place::stream_ring;
+    const MIB: u64 = 1 << 20;
+    const PASS: u64 = 600 * MIB;
+    const CTX: u64 = 8_192;
+    const CARD: CardSpec = CardSpec {
+        name: "RTX_5090",
+        total_bytes: 32_607 * MIB,
+        driver_reserve_bytes: 550 * MIB,
+        device: None,
+        free_bytes: None,
+        held_by: None,
+        integrated: false,
+        margin_bytes: None,
+        granule_bytes: workstation::GRANULE,
+    };
+    let split = header("hy4-pass-ring");
+    let mut plain = PlanInputs::describe(&split).expect("the real header describes");
+    plain.room = (workstation::HOST_USABLE, workstation::HostRead::Given);
+    let ring = stream_ring(&plain).expect("the ring");
+    let floor = ring.bytes(ring.floor);
+    let machine = workstation::plan_on(CARD, plain.model.layers);
+    // The experts a layer keeps on the cards, the stage card's prompt and ring bytes.
+    let made = |inputs: &PlanInputs| {
+        let plan = inputs
+            .plan(&machine, CTX, &PlanLevers::default())
+            .unwrap_or_else(|e| panic!("the card plans {CTX} positions: {e}"));
+        (
+            plan.n_l.clone(),
+            plan.cards[0].prompt_bytes,
+            plan.cards[0].ring_bytes,
+        )
+    };
+    let kept = plain.clone().streaming(ring).with_pass_reserve(PASS);
+    assert_eq!(
+        kept.prompt_reserve,
+        PASS + floor,
+        "the pass's bytes, the floor after"
+    );
+    assert_eq!(kept.stream_slot, ring.slot);
+    assert!(kept.ring.is_some());
+    let bare = plain.clone().with_pass_reserve(PASS);
+    assert_eq!((bare.prompt_reserve, bare.stream_slot), (PASS, 0));
+    assert!(bare.ring.is_none(), "plain inputs take no ring");
+    let (held, sum, alone) = (
+        made(&kept),
+        made(&plain.with_prompt_reserve(PASS + floor)),
+        made(&bare),
+    );
+    let experts = |n_l: &[u64]| n_l.iter().sum::<u64>();
+    println!(
+        "hy4 pass {PASS} B, ring floor {floor} B: card experts {} (the reserve as a sum {}), without the ring {}; ring term {} B",
+        experts(&held.0),
+        experts(&sum.0),
+        experts(&alone.0),
+        held.2
+    );
+    assert_eq!(held.0, sum.0, "the experts of the reserve that is the sum");
+    assert!(
+        experts(&held.0) < experts(&alone.0),
+        "the ring takes experts' room beside the pass"
+    );
+    assert_eq!(held.1, PASS, "the pass's bytes alone are the prompt term");
+    assert!(held.2 >= floor, "the ring term holds the floor");
+}
+
 /// The reader refuses, by the name of the key or the tensor, what it does not run: each edit of the
 /// real header below is one clause, and the unedited header reads (so a refusal is the edit's).
 /// Mutant: the clause's check removed from the reader turns its message empty.

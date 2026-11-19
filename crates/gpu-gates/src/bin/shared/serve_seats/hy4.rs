@@ -23,6 +23,12 @@
 //! `Batch::prompt`, which takes the pass. A plan that holds no shape loads the stepped body (one id
 //! a decode step), and `--prefill steps` asks it; the `listening` record names the walk.
 //!
+//! The prompt pass streams host experts under the common stream rule (`shared/xstream_rule.rs`,
+//! `BLOOMERY_XSTREAM`): the plan keeps the stream's ring out of the expert budget where the rule
+//! would start it ([`Family::ring`]), the pass's inputs keep it beside the pass's bytes
+//! ([`hy4_pass::inputs_for`]) and the rule resolves the stream once the load is open
+//! ([`Family::xstream`]); a load that runs its prompt stepped streams nothing.
+//!
 //! The sparse layers' cache rows are rooms, so the seat takes the common K/V default
 //! ([`PlanInputs::plan_levers`]): an unset `BLOOMERY_KV_FLOOR` plans the experts' spread at 8,192
 //! positions and an unset `BLOOMERY_KV_HOST` spills the rows' pages to the host once the card's
@@ -37,9 +43,12 @@
 //! seat's (`record::BLOOMERY_SERVE_HYBRID`).
 
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::host::swap::Residency;
+use bloomery_gpu::host::xstream::{XMode, XStreamBody};
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::hy4_pass::{self, Picked};
 use bloomery_gpu_gates::{GateError, record, side_seat};
+use bloomery_levers::Levers;
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::hy4::hparams::Hparams;
@@ -49,6 +58,7 @@ use serve::ServeError;
 
 use super::hybrid::{Family, Passed};
 use super::tiered::{BuildMachine, PassAttempt, PassPlan};
+use super::xstream_rule::{Stage, plans_ring, xstream_rule};
 
 /// The binary's name, its records' owner and the `note` line's.
 const NAME: &str = "bloomery-serve-hy4";
@@ -61,7 +71,8 @@ const USAGE: &str = "usage: bloomery-serve --model hy4 [-m PATH | --hf <repo>[:<
 /// The levers this seat acts on: the plan's card budget and margin, the residency machine's word,
 /// the host set's load settings, the engine thread's pin, the host legs' lane
 /// rule, the start screen, the schema jump and the K/V's floor and host backing. There is no prompt
-/// group: a prompt runs as passes of the plan's shape, or stepped.
+/// group: a prompt runs as passes of the plan's shape, or stepped. `BLOOMERY_XSTREAM` is the
+/// expert stream's word (the common rule).
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::CARD_MARGIN,
@@ -76,6 +87,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::SCHEMAJUMP,
     bloomery_levers::KV_FLOOR,
     bloomery_levers::KV_HOST,
+    bloomery_levers::XSTREAM,
 ];
 
 /// Architecture-specific facts; the common owner plans and serves the slots.
@@ -129,6 +141,42 @@ impl Family for Hy4 {
                 )
             }),
         )))
+    }
+
+    /// The ring is kept out of the expert budget where the common rule starts the stream at
+    /// `split` ([`plans_ring`]).
+    fn ring(levers: &Levers, place: Place) -> bool {
+        plans_ring(
+            levers.xstream(),
+            Stage::of(place),
+            levers.residency() == Some("off"),
+        )
+    }
+
+    /// The inputs of a plan that keeps the stream's ring beside the pass's bytes
+    /// ([`hy4_pass::with_ring`]).
+    fn with_ring(inputs: PlanInputs) -> Result<PlanInputs, GateError> {
+        hy4_pass::with_ring(inputs)
+    }
+
+    /// The stream by the common rule once the load is open. A load that runs its prompt stepped
+    /// has no pass to stream: unset, it streams nothing and says so; a word `BLOOMERY_XSTREAM`
+    /// sets goes to the rule, which the body refuses by name where it needs the pass.
+    fn xstream(
+        m: &mut GpuModel<bloomery_gpu_hy4::Body>,
+        set: Option<&str>,
+        place: Place,
+        residency: Residency,
+    ) -> Result<Option<String>, GateError> {
+        let (gpu, _, body) = m.body_parts(NAME)?;
+        if set.is_none() && body.pass_rows().is_none() {
+            body.set_xstream(gpu, XMode::Off)?;
+            let word = body.xstream_word();
+            return Ok(Some(format!(
+                "xstream={word} (unset: the load runs its prompt stepped)"
+            )));
+        }
+        xstream_rule(gpu, body, set, Stage::of(place), residency).map(Some)
     }
 
     /// The rows of the pass the placed load holds ([`bloomery_gpu_hy4::Body::pass_rows`]), which

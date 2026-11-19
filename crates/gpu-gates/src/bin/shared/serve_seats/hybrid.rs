@@ -12,6 +12,11 @@
 //! A family whose body has a prompt pass ([`Family::PASS`]) names the pass its plan holds
 //! ([`Family::pass`]); the seat plans the load at it and opens it, or steps the prompt where the
 //! plan holds none or `--prefill steps` asks it, and names the walk in its records.
+//!
+//! A family whose prompt calls stream host experts names the ring its plan keeps out of the
+//! expert budget ([`Family::ring`], [`Family::with_ring`]) and resolves the stream once the load
+//! is open ([`Family::xstream`]); the seat plans the pass beside the ring, the ring's bytes after
+//! the pass's, or without it where the ring leaves the pass no room.
 
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -96,6 +101,8 @@ pub trait Family: Sized + 'static {
     /// The pass the plan at `ctx` holds on `place` and its open ([`Tiered::pass_plan`]'s
     /// `build` and `attempt`), or why it holds none; asked only of a family with
     /// [`Family::PASS`]. A family that says it has a pass and names none is refused by name.
+    /// `inputs` carry the stream's ring ([`Family::with_ring`]) where the load keeps it, and the
+    /// pass's inputs keep it beside the pass's bytes ([`PlanInputs::with_pass_reserve`]).
     fn pass(
         _inputs: &PlanInputs<Self::H>,
         _place: Place,
@@ -115,6 +122,38 @@ pub trait Family: Sized + 'static {
     /// that asked for it. None for a body whose loads yield nothing (the default).
     fn host_yields(_m: &mut GpuModel<Self::Body>) -> Result<Vec<HostYieldMove>, GateError> {
         Ok(Vec::new())
+    }
+
+    /// Whether the plan of a load on `place` keeps the expert stream's ring out of the expert
+    /// budget ([`Family::with_ring`]): the body's prompt calls stream host experts there
+    /// (`BLOOMERY_XSTREAM` by the common rule, `shared/xstream_rule.rs`; [`Tiered::ring`]). False
+    /// by default: a body that streams none.
+    fn ring(_levers: &Levers, _place: Place) -> bool {
+        false
+    }
+
+    /// `inputs` for a plan that keeps the ring out of the expert budget; asked where
+    /// [`Family::ring`] is true. A family that answers true without this is refused by name.
+    fn with_ring(_inputs: PlanInputs<Self::H>) -> Result<PlanInputs<Self::H>, GateError> {
+        Err(format!(
+            "the {} seat answered a stream ring and reserves none (Family::with_ring)",
+            Self::FAMILY
+        )
+        .into())
+    }
+
+    /// The expert stream of the opened load `m` under `BLOOMERY_XSTREAM` as `set` (`None` unset) on
+    /// `place` and the residency the plan chose, by the common rule (`shared/xstream_rule.rs`), the
+    /// `xstream=` line it prints; asked once every buffer the open makes is made, for a started
+    /// ring takes the card's free bytes past its keep. `None` (the default) is a body whose prompt
+    /// calls stream nothing.
+    fn xstream(
+        _m: &mut GpuModel<Self::Body>,
+        _set: Option<&str>,
+        _place: Place,
+        _residency: Residency,
+    ) -> Result<Option<String>, GateError> {
+        Ok(None)
     }
 
     /// The rows of the prompt pass the loaded body holds, which its prompt runs by; `None` for a
@@ -392,6 +431,7 @@ fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError
     };
     let loaded = match a.flags.pass.take() {
         Some((inputs, open)) => open_pass(file, (&inputs, open), &machine, (a.ctx, cfg), &mut log)?,
+        None if a.ring => open_stepped_ring(file, &machine, (a.ctx, cfg), &mut log)?,
         None => {
             let args = OpenArgs {
                 place: a.place.name(),
@@ -405,6 +445,11 @@ fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError
     };
     let mut s = loaded.ready(&mut log)?;
     <F::Body as Batch>::Sequences::add(&mut s, a.slots)?;
+    // The expert stream after every buffer the open makes: a started ring takes the card's free
+    // bytes past its keep.
+    if let Some(line) = F::xstream(s.model_mut(), a.xstream, a.place, a.residency)? {
+        eprintln!("{line}");
+    }
     log.record(s.model())?;
     let drafted = match mtp {
         Some(width) => {
@@ -443,6 +488,25 @@ fn open_pass<F: Family>(
     let mut m = open(file, &plan, inputs, cfg.host, cfg.residency)?;
     m.set_mode(StepMode::Graph);
     Ok(Loaded::from_model(m, cfg, held).watched(log.card_watch()?)?)
+}
+
+/// The stepped load of a plan that keeps the stream's ring ([`Open::ring`]): the file's inputs
+/// with the ring ([`Family::with_ring`]) planned on the run's `machine` at `ctx`, as the run's plan
+/// of the same inputs was, and loaded by the body's own open ([`app::Open::open`]).
+fn open_stepped_ring<F: Family>(
+    file: Split,
+    machine: &Machine,
+    (ctx, cfg): (usize, HybridCfg),
+    log: &mut Log<F>,
+) -> Result<Loaded<F::Body>, GateError> {
+    let mut inputs = <F::Body as app::Open>::inputs(&file)?;
+    <F::Body as app::Open>::configure_inputs(&mut inputs, &cfg)?;
+    let inputs = F::with_ring(inputs)?;
+    let by = cfg.clone();
+    let open: PassOpen<F> = Box::new(move |file, plan, inputs, _, _| {
+        <F::Body as app::Open>::open(file, inputs, plan, &by)
+    });
+    open_pass(file, (&inputs, open), machine, (ctx, cfg), log)
 }
 
 impl<F: Family> Hybrid<F> {
@@ -715,6 +779,7 @@ impl<F: Family> Tiered for Hybrid<F> {
     fn pass_plan(
         flags: &mut Flags<F>,
         inputs: &PlanInputs<F::H>,
+        ring: Option<&PlanInputs<F::H>>,
         place: Place,
         ctx: usize,
         build: &BuildMachine<'_>,
@@ -726,7 +791,7 @@ impl<F: Family> Tiered for Hybrid<F> {
         if flags.prefill == Some(Prefill::Steps) {
             return Ok(Some(Walk::Steps("--prefill steps".to_owned())));
         }
-        match F::pass(inputs, place, ctx, build, attempt)? {
+        match beside_ring((ring, inputs), |i| F::pass(i, place, ctx, build, attempt))? {
             Ok((plan, open)) => {
                 flags.pass = Some((plan.inputs.clone(), open));
                 Ok(Some(Walk::Pass(Box::new(plan))))
@@ -740,6 +805,14 @@ impl<F: Family> Tiered for Hybrid<F> {
 
     fn think(inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
         F::think_tags(inputs)
+    }
+
+    fn ring(levers: &Levers, place: Place) -> bool {
+        F::ring(levers, place)
+    }
+
+    fn with_ring(inputs: PlanInputs<Self::H>) -> Result<PlanInputs<Self::H>, GateError> {
+        F::with_ring(inputs)
     }
 
     fn tier_batch(
@@ -762,6 +835,24 @@ impl<F: Family> Tiered for Hybrid<F> {
     }
 }
 
+/// What `ask` answers of the inputs that keep the stream's ring (`ring`, where the load keeps it),
+/// else of the `plain` inputs: a pass the ring leaves no room is asked again without it, the ring's
+/// refusal printed, and the plain answer is the seat's.
+fn beside_ring<I, P>(
+    (ring, plain): (Option<&I>, &I),
+    mut ask: impl FnMut(&I) -> Result<Result<P, String>, GateError>,
+) -> Result<Result<P, String>, GateError> {
+    if let Some(ring) = ring {
+        match ask(ring)? {
+            Ok(pass) => return Ok(Ok(pass)),
+            Err(why) => eprintln!(
+                "xstream ring: the pass has no room beside it, so it plans without: {why}"
+            ),
+        }
+    }
+    ask(plain)
+}
+
 /// Loads the model, and the embedding model `side` names beside it, and serves
 /// until the listener or the engine fails; `Ok` carries why the server ended.
 pub fn run<F: Family>(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateError> {
@@ -772,4 +863,51 @@ pub fn run<F: Family>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
 /// ([`tiered::check`]).
 pub fn check<F: Family>(args: &[String], read_levers: bool) -> Result<(), GateError> {
     tiered::check::<Hybrid<F>>(args, read_levers).map(drop)
+}
+
+#[cfg(test)]
+mod tests {
+    use bloomery_gpu_gates::GateError;
+
+    use super::beside_ring;
+
+    /// The pass of a load that keeps the stream's ring is asked of the ring's inputs first (the
+    /// pass's bytes, the ring's after them), and where the ring leaves it no room of the plain
+    /// ones; a load that keeps no ring asks the plain inputs alone, and no room anywhere is the
+    /// plain inputs' reason. An error is the seat's, not a rung to step down from. Mutants: the
+    /// plain inputs asked first (the ring never wins), the ring's refusal returned in the plain's
+    /// place.
+    #[test]
+    fn a_pass_beside_the_ring_steps_down_to_the_plain_pass() {
+        let fits = |held: &'static [&'static str]| {
+            move |i: &&'static str| -> Result<Result<&'static str, String>, GateError> {
+                Ok(if held.contains(i) {
+                    Ok(*i)
+                } else {
+                    Err(format!("{i} has no room"))
+                })
+            }
+        };
+        let (ring, plain) = ("ring", "plain");
+        let ask = |kept: Option<&&'static str>, held| beside_ring((kept, &plain), fits(held));
+        assert_eq!(ask(Some(&ring), &["ring", "plain"]).unwrap(), Ok("ring"));
+        assert_eq!(ask(Some(&ring), &["plain"]).unwrap(), Ok("plain"));
+        assert_eq!(ask(None, &["ring", "plain"]).unwrap(), Ok("plain"));
+        assert_eq!(
+            ask(Some(&ring), &[]).unwrap(),
+            Err("plain has no room".to_owned()),
+            "the plain inputs' reason is the seat's"
+        );
+        let mut asked = Vec::new();
+        let _ = beside_ring((None, &plain), |i: &&str| {
+            asked.push(*i);
+            Ok(Ok::<&str, String>(*i))
+        });
+        assert_eq!(asked, ["plain"], "no ring kept, none asked");
+        let e = beside_ring((Some(&ring), &plain), |_: &&str| {
+            Err::<Result<&str, String>, GateError>("a refusal".into())
+        })
+        .expect_err("an error ends the ask");
+        assert!(e.to_string().contains("a refusal"), "{e}");
+    }
 }

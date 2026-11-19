@@ -1,0 +1,19 @@
+# Hy4-flash's placed prompt pass streaming host experts to the card (R5: the common PromptStream/StreamSide over a walk of
+# eight 512-row units, ring half 220 slots, 2.13 GB; xsplit's ring tail by the balance) against the unstreamed pass
+# (main at 33f9d22a5, measured pp4096 334.55, pp512 331.91, decode @512 34.40 on this card). The effect [derived,
+# specs/day1117/hy4/hy4r5s-report.md: the host union refit from the measured pass, c 5.10-5.38 us/col, a 6.34-7.92 us,
+# m* 32-45 columns]: at P = 4096 the walk's units stream the experts routed past the balance, 272-283 -> 115-137 ms a
+# layer, pp4096 726-867; P = 512 is one unit under the walk gate, so no stream and no change; decode loses the ring's
+# card experts (5,454 -> 4,964 at ctx 8,192 in the plan), -2.8..-3.0 %.
+kind: ab
+question: does streaming Hy4-flash's host experts in its prompt walk lift pp4096 on one RTX 5090 by the derived bulk?
+term: pp tok/s @ P = 4096, prose corpus, one RTX 5090 32 GB, the serving defaults - (opt5 - main) / main, paired by round
+unit: %
+predict: +117..+159
+rounds: 2
+sd: 1.1 % rig-log 09-25#v41-prefill-s14, two binaries' per-round pp ratios; the effect is two orders above it
+condition: BLOOMERY_MODEL=hy_v4_flash just depth-serve bloomery-opt0315:4096 bloomery-opt5:4096 and their :512 arms,
+  BLOOMERY_AB_ROUNDS=2, the order rotated every round, one fresh server an arm, the file warm in the page cache
+decide-in: land R5 into 0.3.15 and re-table Hy4's row from the release sitting
+decide-below: read the stream records (streamed per layer, the lane's busy time against the union's) for the wrong term
+decide-above: land, then price a wider ring against decode in the refit table

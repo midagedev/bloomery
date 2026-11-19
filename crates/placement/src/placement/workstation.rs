@@ -503,6 +503,18 @@ pub fn reserve_stream_staging(machine: &mut Machine, slot: u64) {
     }
 }
 
+/// Whether `machine` holds the staging a load whose prompt calls stream pins
+/// ([`reserve_stream_staging`] with a slot of bytes): a plan made on it counts the staging pinned
+/// on the host, and a machine built beside it for the same load keeps it.
+#[must_use]
+pub fn stages_stream(machine: &Machine) -> bool {
+    machine
+        .host()
+        .reserves
+        .iter()
+        .any(|(n, _)| n == XSTREAM_STAGING_RESERVE)
+}
+
 /// Whether a load of `plan` has host experts its prompt calls could stream:
 /// the plan leaves a routed expert on no card (in host memory or on the NVMe
 /// tier). A plan that holds every routed expert on its cards streams nothing
@@ -2079,6 +2091,31 @@ mod tests {
         plan_holding, plan_node_tiers, plan_on, plan_room, plan_tiers, spec_of_device,
         tier_batch_bytes, unified_of,
     };
+    use super::{STAGING_SLOTS, XSTREAM_STAGING_RESERVE, reserve_stream_staging, stages_stream};
+
+    /// The machine a streaming load plans on holds the lane's staging as one host reserve, which
+    /// [`stages_stream`] reads back; a slot of 0 sets none. Mutant: the reserve left unread
+    /// (`stages_stream` false on a staged machine).
+    #[test]
+    fn the_streams_staging_is_read_back_from_its_machine() {
+        let mut machine = plan_on(A6000, 4);
+        assert!(!stages_stream(&machine), "no staging before the reserve");
+        reserve_stream_staging(&mut machine, 1 << 20);
+        assert!(stages_stream(&machine), "the staged machine says so");
+        assert_eq!(
+            machine
+                .host()
+                .reserves
+                .iter()
+                .find(|(n, _)| n == XSTREAM_STAGING_RESERVE),
+            Some(&(
+                XSTREAM_STAGING_RESERVE.to_owned(),
+                STAGING_SLOTS as u64 * (1 << 20)
+            )),
+        );
+        reserve_stream_staging(&mut machine, 0);
+        assert!(!stages_stream(&machine), "a slot of 0 sets none");
+    }
 
     #[test]
     fn tier_input_scales_cost_one_f32_per_chunk_slot() {

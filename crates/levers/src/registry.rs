@@ -1138,12 +1138,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         kind: Kind::Words(&["off", "admit", "split"]),
         default: Unset::Means(
             "Qwen3.8 (`generate_qwen3moe`, `bloomery-serve-qwen38`), and the Muse Spark, \
-             MiniMax-M3.1 and Mistral Large 4 seats (`bloomery-serve`, MiniMax-M3.1's and \
-             Mistral Large 4's gates): `split` under `--place a` with a residency (`admit` when \
+             MiniMax-M3.1, Mistral Large 4 and Hy4-flash seats (`bloomery-serve`, MiniMax-M3.1's \
+             and Mistral Large 4's gates): `split` under `--place a` with a residency (`admit` when \
              the ring has no room or cannot hold the stack layout), `admit` under `--place bp` \
              with one, `off` everywhere else",
         ),
-        doc: "Qwen3.8, Muse Spark, MiniMax-M3.1 and Mistral Large 4 prompt calls fed by ubatches or passes under adaptive residency \
+        doc: "Qwen3.8, Muse Spark, MiniMax-M3.1, Mistral Large 4 and Hy4-flash prompt calls fed by ubatches or passes under adaptive residency \
               (`BLOOMERY_RESIDENCY=mid-…`): what each card layer's walk moves before its card \
               route. `admit` moves the residency's pool toward the ubatch's hottest host experts \
               (`host::swap` call mode, a count of at least the walk's floor), and the call's picks \
@@ -1169,7 +1169,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               forms, the file's blocks or NVFP4 planes (staged from a checkpoint folder's parts), \
               and runs the streamed slots there beside the card's stacks; a MiniMax-M3.1 or \
               Mistral Large 4 load (the gates' seats, `Body::set_xstream`) takes it through the \
-              common prompt walk. Mistral Large 4 is the lever's host streaming (`admit`, V4.1's \
+              common prompt walk, and a Hy4-flash load through its placed prompt pass (a load that \
+              runs its prompt stepped streams nothing: `split` set there is refused by name). \
+              Mistral Large 4 is the lever's host streaming (`admit`, V4.1's \
               `BLOOMERY_HOSTSTREAM` under another name) and its expert stream (`split`). Beside an \
               expert tier card (`--place bp`) the Muse Spark, MiniMax-M3.1 and Mistral Large 4 \
               loads take `split` set: a tier layer's join sums the streamed experts beside the \
