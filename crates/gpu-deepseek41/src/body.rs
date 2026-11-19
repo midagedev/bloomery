@@ -111,6 +111,7 @@ use model::arch::deepseek41::tp::{self, TpUnits};
 use model::moe::UNION_MAX_COLS;
 use model::part::{Source, StoredRows, Take};
 use model::placement::accepts::{self, Program};
+use model::placement::workstation::{HostRead, load_plan_room};
 use model::placement::{
     CardFormat, KvBytes, KvDefault, Machine, ModelTensor, ModelTensors, Plan, PlanLevers, Role,
 };
@@ -262,10 +263,12 @@ pub struct OpenCfg {
     /// it already; none, and a plan under `spill` or `all` reads it from the stage card
     /// ([`OpenCfg::page_inputs`]).
     pub kv_host_page: Option<u64>,
-    /// The host room the plan is made at, stated as given (`HostRead::Given`) instead of read from
-    /// this machine: a gate's emulation of a smaller host, whose plan takes the room it is given.
-    /// `None` reads this machine's.
-    pub host_room: Option<u64>,
+    /// The host room the plan is made at, with the reading that decided it, stated instead of
+    /// read from this machine: a gate's emulation of a smaller host (read
+    /// [`HostRead::Given`], a room a plan takes as it is), or the room a seat's own plans were
+    /// made at, so the load plans from the room its unset residency word was resolved against
+    /// and not from a reading of its own. `None` reads this machine's.
+    pub host_room: Option<(u64, HostRead)>,
 }
 
 impl OpenCfg {
@@ -344,13 +347,29 @@ impl OpenCfg {
         }
     }
 
-    /// `self` with the plan's host room stated as `room` bytes ([`OpenCfg::host_room`]).
+    /// `self` with the plan's host room stated as `room` bytes, taken as given
+    /// ([`OpenCfg::host_room`]).
     #[must_use]
     pub fn with_host_room(self, room: u64) -> OpenCfg {
+        self.with_host_reading((room, HostRead::Given))
+    }
+
+    /// `self` with the plan's host room stated as `reading`, bytes and the reading that decided
+    /// them ([`OpenCfg::host_room`]): the room a seat's plans were made at
+    /// ([`PlanInputs::room`]).
+    #[must_use]
+    pub fn with_host_reading(self, reading: (u64, HostRead)) -> OpenCfg {
         OpenCfg {
-            host_room: Some(room),
+            host_room: Some(reading),
             ..self
         }
+    }
+
+    /// Give `inputs` the host room the cfg states ([`OpenCfg::host_room`]) in place of the one
+    /// they read from this machine; with none stated `inputs` is left as it is. The one place a
+    /// stated room enters a plan's inputs.
+    pub fn state_room(&self, inputs: &mut PlanInputs) {
+        inputs.room = load_plan_room(self.host_room.as_ref(), inputs.room.clone());
     }
 
     /// Give `inputs` the page a plan under `spill` or `all` rounds the host-able rows at: the
@@ -403,6 +422,7 @@ pub fn open(
 ) -> Result<Deepseek41Model, GpuError> {
     const WHAT: &str = "deepseek41 body::open";
     let mut inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+    cfg.state_room(&mut inputs);
     let machine = machine(inputs.model.layers);
     cfg.page_inputs(&mut inputs, &machine)?;
     refuse_cards(WHAT, &machine)?;
@@ -432,6 +452,7 @@ pub fn open_slots(
 ) -> Result<Deepseek41Model, GpuError> {
     const WHAT: &str = "deepseek41 body::open_slots";
     let mut inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+    cfg.state_room(&mut inputs);
     let machine = machine(inputs.model.layers);
     cfg.page_inputs(&mut inputs, &machine)?;
     refuse_cards(WHAT, &machine)?;

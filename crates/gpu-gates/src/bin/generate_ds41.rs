@@ -967,6 +967,10 @@ mod drive {
             Some(lane_at(a.place)?)
         };
         let machine = a.place.machine(seat, tier_batch)?;
+        // The room is read once, here: the pre-plan and the open plan from it, so the headroom the
+        // unset word was resolved against is the one the open holds its churn pool to.
+        let room = workstation::host_available_read()?;
+        let cfg = cfg.with_host_reading(room.clone());
         // The unset word against the plan the load will use, and the lever
         // record naming what it resolved to, before the plan record the open
         // prints. `--card-table` loads a plan it edits itself, beside a word
@@ -979,7 +983,8 @@ mod drive {
         if let Some(d) = residency.why.detail() {
             eprintln!("{d}");
         }
-        let mut cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?;
+        let mut cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?
+            .with_host_reading(room);
         // A plan that pages routed experts to the NVMe tier cannot read an r8 sidecar: where
         // `BLOOMERY_R8` is unset the host tier reads the source, by name, as the server does
         // (`ds41_r8`), and a set `on` is the load's refusal of that pair.
@@ -1390,6 +1395,7 @@ mod drive {
     ) -> Result<(Option<Vec<u64>>, ResidencyPick, bool), GateError> {
         const WHAT: &str = "generate_ds41 residency pre-plan";
         let mut inputs = PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        open.state_room(&mut inputs);
         let machine = machine(inputs.model.layers);
         open.page_inputs(&mut inputs, &machine)?;
         let place_levers = &open.place;
@@ -1423,6 +1429,7 @@ mod drive {
     ) -> Result<Option<Loaded<Body>>, GateError> {
         const WHAT: &str = "generate_ds41 open_slots";
         let mut inputs = PlanInputs::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+        args.cfg.open.state_room(&mut inputs);
         let machine = (args.machine)(inputs.model.layers);
         args.cfg.open.page_inputs(&mut inputs, &machine)?;
         let plan = inputs

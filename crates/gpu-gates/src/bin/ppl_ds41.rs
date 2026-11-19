@@ -86,7 +86,7 @@ mod tool {
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
     use model::arch::deepseek41::place::PlanInputs;
-    use model::placement::{Machine, Plan};
+    use model::placement::{Machine, Plan, workstation};
     use std::path::PathBuf;
     use tokenizer::Tokenizer;
 
@@ -184,6 +184,7 @@ mod tool {
     ) -> Result<(Vec<u64>, ResidencyPick), GateError> {
         const WHAT: &str = "ppl_ds41 residency pre-plan";
         let mut inputs = PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))?;
+        open.state_room(&mut inputs);
         let machine = machine(inputs.model.layers);
         open.page_inputs(&mut inputs, &machine)?;
         let plan = inputs
@@ -239,11 +240,19 @@ mod tool {
             &Hparams::read(&file).map_err(|e| format!("{}: {e}", path.display()))?,
         );
         let machine = at_place.machine(None, tier_batch)?;
-        let (plan_n_l, pick) =
-            residency_at_plan(&file, machine, plan_ctx, &cfg, levers.residency_at(at))?;
+        // The room is read once: the pre-plan and the open plan from it, so the headroom the
+        // unset word was resolved against is the one the open holds its churn pool to.
+        let room = workstation::host_available_read()?;
+        let (plan_n_l, pick) = residency_at_plan(
+            &file,
+            machine,
+            plan_ctx,
+            &cfg.with_host_reading(room.clone()),
+            levers.residency_at(at),
+        )?;
         record::residency_lever(pick).print();
         let word = Residency::parse(pick.word)?;
-        let mut cfg = body::OpenCfg::from_levers_with(levers, word)?;
+        let mut cfg = body::OpenCfg::from_levers_with(levers, word)?.with_host_reading(room);
         if how.collect {
             // Every layer runs every position, so a weight's counts are the rows fed.
             cfg.body.ced = false;

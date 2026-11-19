@@ -1842,6 +1842,17 @@ pub fn plan_room(room: &(u64, HostRead)) -> u64 {
     }
 }
 
+/// The room a load's plan is made at, and the reading that decided it: the `stated` one when
+/// the load states a room (the room the plans its unset residency word was resolved against
+/// were made at, or a gate's emulation of a smaller host), else the `read` of the machine now.
+/// A headroom past the machine's figure follows the room ([`Plan::plan_at`]), so a load that
+/// read a room of its own would hold a churn pool to another headroom than the one the word was
+/// resolved against. The one place a load's plan takes its room.
+#[must_use]
+pub fn load_plan_room(stated: Option<&(u64, HostRead)>, read: (u64, HostRead)) -> (u64, HostRead) {
+    stated.cloned().unwrap_or(read)
+}
+
 /// The process's own cgroup v2 path of a `/proc/self/cgroup` text: the
 /// `0::` line names it under `/sys/fs/cgroup`. `Ok(None)` when the text has
 /// no `0::` line — the unified hierarchy holds this process nowhere, so no

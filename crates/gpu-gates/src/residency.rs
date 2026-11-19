@@ -46,10 +46,11 @@ impl<'p, 'm> PlanRoom<'p, 'm> {
         self.plan.host.experts
     }
 
-    /// The plan's host headroom less what the load hosts beside the plan.
+    /// The plan's host headroom less what the load hosts beside the plan
+    /// ([`ChurnPool::room`], the room the load's check holds the pool to).
     #[must_use]
     pub fn headroom(&self) -> i128 {
-        self.plan.host.headroom_bytes - i128::from(self.beside)
+        ChurnPool::room(self.plan, self.beside)
     }
 
     /// What the host's room leaves past the plan's host need

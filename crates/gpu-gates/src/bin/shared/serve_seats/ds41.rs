@@ -850,9 +850,13 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         residency,
         a.cache_ram,
     )?;
+    // The load plans at the room the plans above were made at: a reading of its own would plan
+    // another headroom than the one the unset residency word was resolved against, and refuse a
+    // churn pool the word kept.
     let mut cfg = body::OpenCfg::from_levers_with(&levers, Residency::parse(residency.word)?)?
         .with_kv_default(&levers, kv_default)
-        .with_kv_host_page(kv_page);
+        .with_kv_host_page(kv_page)
+        .with_host_reading(inputs.room.clone());
     // A plan that pages routed experts to the NVMe tier cannot read an r8 sidecar: where
     // `BLOOMERY_R8` is unset the host tier reads the source, by name (`ds41_r8`, the rule
     // `generate_ds41` takes too), and a set `on` is the load's refusal of that pair.

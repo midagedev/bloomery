@@ -16,7 +16,6 @@ use bloomery_gpu_deepseek41::body::{
 use gguf::Split;
 use model::arch::deepseek41::place::PlanInputs;
 use model::placement::card_made::CardPhase;
-use model::placement::workstation::HostRead;
 use model::placement::{Machine, Plan};
 use runtime::prompt::CallEnd;
 use runtime::{Tapped, TappedPrompt, Target};
@@ -49,12 +48,11 @@ impl Open for Body {
 
     /// The page the binary read for the host-capable room, when it read one; a plan under
     /// `spill` or `all` without it refuses by name (`PlanInputs::kv_host_bytes`). The host room
-    /// the binary stated, when it stated one, replaces the room read from this machine.
+    /// the binary stated, when it stated one, replaces the room read from this machine
+    /// ([`OpenCfg::state_room`]).
     fn configure_inputs(inputs: &mut PlanInputs, cfg: &Ds41Cfg) -> Result<(), GpuError> {
         inputs.kv_host_page = inputs.kv_host_page.or(cfg.open.kv_host_page);
-        if let Some(room) = cfg.open.host_room {
-            inputs.room = (room, HostRead::Given);
-        }
+        cfg.open.state_room(inputs);
         Ok(())
     }
 

@@ -81,6 +81,14 @@ impl ChurnPool {
         Ok(pool)
     }
 
+    /// The host room a churn pool must fit on `plan`: its host headroom less the `beside` bytes
+    /// the load holds outside the plan. The one definition the unset residency word's pick
+    /// (`PlanRoom::headroom`) and the load's check ([`ChurnPool::check_beside`]) both read.
+    #[must_use]
+    pub fn room(plan: &Plan<'_>, beside: u64) -> i128 {
+        plan.host.headroom_bytes - i128::from(beside)
+    }
+
     /// The plan's host headroom less the pool.
     #[must_use]
     pub fn headroom_after(&self, plan: &Plan<'_>) -> i128 {
@@ -118,7 +126,7 @@ impl ChurnPool {
         bytes: u64,
         beside: u64,
     ) -> Result<i128, PlacementError> {
-        let left = plan.host.headroom_bytes - i128::from(bytes) - i128::from(beside);
+        let left = ChurnPool::room(plan, beside) - i128::from(bytes);
         if left < 0 {
             return Err(PlacementError::ResidencyOverHost(Box::new(OverHost {
                 pinned: self.pinned,
@@ -126,6 +134,7 @@ impl ChurnPool {
                 bytes,
                 headroom: plan.host.headroom_bytes,
                 beside,
+                room: plan.host.room.as_ref().map(|(read, _)| *read),
             })));
         }
         Ok(left)
@@ -137,8 +146,9 @@ impl ChurnPool {
 #[derive(Debug, thiserror::Error)]
 #[error(
     "residency pinning {pinned} experts a layer: the churn pool's {experts} experts take {bytes} B \
-     of host RAM, and the plan leaves the host {headroom} B{}",
-    beside_text(*beside)
+     of host RAM, and the plan leaves the host {headroom} B{}{}",
+    beside_text(*beside),
+    room_text(*room)
 )]
 pub struct OverHost {
     pub pinned: usize,
@@ -148,6 +158,11 @@ pub struct OverHost {
     /// Host bytes the load holds beside the plan's own
     /// ([`ChurnPool::check_beside`]), out of `headroom`.
     pub beside: u64,
+    /// The host room the plan was made at, as read or given
+    /// ([`HostTotals::room`](super::HostTotals::room)): the `room` of the
+    /// `plan` record. A headroom past the figure follows it, so a refusal
+    /// that differs from the pick's names the reading that moved.
+    pub room: Option<u64>,
 }
 
 /// [`OverHost`]'s words for the bytes held beside the plan: none when 0.
@@ -158,10 +173,18 @@ fn beside_text(beside: u64) -> String {
     }
 }
 
+/// [`OverHost`]'s words for the room the plan was made at: none when it was made at none.
+fn room_text(room: Option<u64>) -> String {
+    match room {
+        None => String::new(),
+        Some(r) => format!("; the plan was made at a host room of {r} B"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement::workstation::{HOST_DRIFT, HostNeed, HostRead};
+    use crate::placement::workstation::{HOST_DRIFT, HostNeed, HostRead, load_plan_room};
     use crate::placement::{Host, HostTotals, Machine, ModelTensors, Node};
     use bloomery_levers::KvHost;
 
@@ -215,8 +238,18 @@ mod tests {
         machine: &'a Machine,
         room: (u64, HostRead),
     ) -> Plan<'a> {
+        plan_with_experts(model, machine, 300, room)
+    }
+
+    /// [`plan_made_at`] for a plan whose host holds `expert_bytes` of routed experts.
+    fn plan_with_experts<'a>(
+        model: &'a ModelTensors,
+        machine: &'a Machine,
+        expert_bytes: u64,
+        room: (u64, HostRead),
+    ) -> Plan<'a> {
         let mut plan = with_headroom(model, machine, 0);
-        plan.host.expert_bytes = 300;
+        plan.host.expert_bytes = expert_bytes;
         plan.host.headroom_bytes = i128::from(HostNeed::machine_room(machine.host()))
             - i128::from(HostNeed::of(&plan, 0).bytes());
         plan.plan_at(&room);
@@ -408,5 +441,144 @@ mod tests {
         let base = plan_made_at(&model, &machine, (2000, HostRead::Given));
         assert_eq!(base.room_leaving(-300), Some(0));
         assert_eq!(base.room_leaving(-301), None, "below 0 is no room");
+    }
+
+    /// V4.1's host on the 251.5 GiB workstation: the model's 40 layers, the machine at the
+    /// nominal host's figure and the plan's host terms, 243,724,957,696 B past the OS reserve
+    /// the need leaves out.
+    fn v41_host() -> (ModelTensors, Machine, u64) {
+        let model = ModelTensors {
+            tensors: Vec::new(),
+            layers: 40,
+            experts: 256,
+            experts_used: 6,
+            bf16_words: |_| false,
+        };
+        let machine = Machine {
+            cards: Vec::new(),
+            tiers: Vec::new(),
+            nodes: vec![Node {
+                host: crate::placement::workstation::host(),
+                unified: None,
+            }],
+        };
+        assert_eq!(
+            HostNeed::machine_room(machine.host()),
+            crate::placement::workstation::PLAN_ROOM
+        );
+        (
+            model,
+            machine,
+            243_724_957_696 + crate::placement::workstation::OS_OTHER,
+        )
+    }
+
+    /// The read room of the plan the pick ruled by: `MemAvailable` 264,214,507,520 B, a plan
+    /// room of 263,677,636,608 B, past the machine's figure of 263,376,371,712 B, so the
+    /// headroom follows the reading: 19,952,678,912 B.
+    const PICK_READ: u64 = 264_214_507_520;
+
+    /// What a load's reading fell by after the pick's plan.
+    const FALL: u64 = 83_034_112;
+
+    /// A plan made at a lower reading of the host's room refuses the pool the first took, and
+    /// the refusal names the room it was made at. The 19,914,301,440 B pool of `mid-p8-s1` fits
+    /// the pick's headroom with 38,377,472 B to spare; a plan made 83,034,112 B lower leaves
+    /// 19,869,644,800 B.
+    ///
+    /// FAIL-first: the refusal named no room, so it read as another headroom than the pick's
+    /// with nothing to say which reading had moved.
+    #[test]
+    fn a_plan_made_at_a_lower_reading_refuses_the_pool_the_first_took() {
+        let (model, machine, experts) = v41_host();
+        let pool = ChurnPool {
+            pinned: 8,
+            runs: Vec::new(),
+            experts: 1182,
+            bytes: 19_914_301_440,
+        };
+        let pick = plan_with_experts(
+            &model,
+            &machine,
+            experts,
+            (PICK_READ, HostRead::MemAvailable),
+        );
+        assert_eq!(pick.host.headroom_bytes, 19_952_678_912);
+        assert_eq!(pool.check(&pick).expect("the pick's plan"), 38_377_472);
+
+        let load = plan_with_experts(
+            &model,
+            &machine,
+            experts,
+            (PICK_READ - FALL, HostRead::MemAvailable),
+        );
+        assert_eq!(load.host.headroom_bytes, 19_869_644_800);
+        let text = pool
+            .check(&load)
+            .expect_err("the lower reading")
+            .to_string();
+        for part in [
+            "residency pinning 8 experts a layer",
+            "1182 experts take 19914301440 B of host RAM",
+            "the plan leaves the host 19869644800 B",
+            "the plan was made at a host room of 264131473408 B",
+        ] {
+            assert!(text.contains(part), "{part:?} in {text}");
+        }
+
+        // A plan made at no room names none.
+        let bare = with_headroom(&model, &machine, 19_869_644_800);
+        let text = pool.check(&bare).expect_err("no room").to_string();
+        assert!(!text.contains("made at"), "{text}");
+    }
+
+    /// The pick and the load hold a churn pool to one room: the unset word's pick, over the
+    /// plan made at the read room, keeps the first pinned count whose pool fits
+    /// ([`ChurnPool::room`] and what the host leaves), and the load's check passes it on the plan
+    /// the load makes at the room it states ([`load_plan_room`]) however far the reading has
+    /// fallen since. A load that reads a room of its own is refused.
+    ///
+    /// FAIL-first: a load that takes the reading of its own over the one stated plans 83,034,112
+    /// B lower, leaves 19,869,644,800 B and refuses the 19,914,300,540 B pool the pick kept, as
+    /// the V4.1 serve start did.
+    #[test]
+    fn the_pick_and_the_load_hold_the_pool_to_one_room() {
+        let (model, machine, experts) = v41_host();
+        // The pool at a pinned count: the 1,502 card experts of 40 layers less the pinned ones.
+        let pool_at = |pinned: usize| (1502 - 40 * pinned as u64) * 16_847_970;
+        let pick_room = (PICK_READ, HostRead::MemAvailable);
+        let pick = plan_with_experts(&model, &machine, experts, pick_room.clone());
+        let to = match bloomery_levers::room_for::<std::convert::Infallible>(
+            false,
+            0,
+            1,
+            (0..40).map(|l| if l < 22 { 38 } else { 37 }),
+            |pinned| Ok(pool_at(pinned)),
+            ChurnPool::room(&pick, 0),
+            HostNeed::of(&pick, 0).room_left(&pick_room),
+        ) {
+            Ok(bloomery_levers::Room::MovedForPool { to, .. }) => to,
+            other => panic!("the climb to the first pool that fits: {other:?}"),
+        };
+        assert_eq!(to, 8);
+        let pool = ChurnPool {
+            pinned: to,
+            runs: Vec::new(),
+            experts: 1502 - 40 * to as u64,
+            bytes: pool_at(to),
+        };
+        assert_eq!(pool.check(&pick).expect("the pick's own plan"), 38_378_372);
+
+        let fell = (PICK_READ - FALL, HostRead::MemAvailable);
+        let own = load_plan_room(None, fell.clone());
+        let load = plan_with_experts(&model, &machine, experts, own);
+        assert!(pool.check(&load).is_err(), "a room of the load's own");
+        let stated = load_plan_room(Some(&pick_room), fell);
+        let load = plan_with_experts(&model, &machine, experts, stated);
+        assert_eq!(
+            pool.check(&load).expect("the stated room"),
+            38_378_372,
+            "the pick's headroom"
+        );
     }
 }
