@@ -126,6 +126,9 @@ mod gate {
     /// its span holds: 14 × 14 tokens and a newline row after each of the 14 grid rows.
     const IMAGE: &str = "../../tools/ref/clefvis/images/free-448x448.png";
     const IMAGE_ROWS: u64 = 14 * 14 + 14;
+    /// The image server's `--image-max-tokens`: above [`IMAGE_ROWS`], below the tower's default.
+    const IMAGE_MAX_TOKENS: u64 = 1024;
+    const _: () = assert!(IMAGE_ROWS <= IMAGE_MAX_TOKENS);
     const IMAGE_ASK: &str = "Describe this image in one short sentence.";
 
     /// The slot clause's two prompts, which share no first id.
@@ -244,7 +247,19 @@ mod gate {
         let (cmd, mut all) = seat(c).command(&file)?;
         let ctx = c.ctx.to_string();
         let m = mmproj.to_str().ok_or("the --mmproj path is not UTF-8")?;
-        for a in ["--port", "0", "--ctx", &ctx, "--mmproj", m] {
+        // The tower's scratch at its 4,096-token default passes the fixture seat's card budget; the clause's
+        // image is [`IMAGE_ROWS`] rows, so the cap that still holds it keeps the plan inside the budget.
+        let cap = IMAGE_MAX_TOKENS.to_string();
+        for a in [
+            "--port",
+            "0",
+            "--ctx",
+            &ctx,
+            "--mmproj",
+            m,
+            "--image-max-tokens",
+            &cap,
+        ] {
             all.push(a.to_owned());
         }
         let all: Vec<&str> = all.iter().map(String::as_str).collect();
