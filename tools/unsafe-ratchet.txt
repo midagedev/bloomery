@@ -1060,7 +1060,10 @@ gpu-solar2 0 0 0
 # read and write their buffers through the same raw places as the others, each block with its SAFETY line — vis_attn_h128
 # 18 (its loader, the shared tile, the query, key and value staging reads and stores, the fragment loads and MMAs, the
 # output store), vis_rope2d_h128 4 (its table read, its pair read and store, its loader).
-gpu-vision 170 0 0
+# PIN(2026-11-19): gpu-vision 170 -> 173 blocks, new code, not old code relaxed: Hy4-flash's tower position kernel
+# vis_pos_hunyuan (crates/gpu-vision/src/pos_hunyuan.rs) reads its table and writes its rows through the same raw places as the
+# others, each block with its SAFETY line — its table read, its row store, its module loader.
+gpu-vision 173 0 0
 # PIN(2026-10-13): hf 0 -> 2 blocks, new code, not old code relaxed: the DSpark draft's 1.9 GB safetensors file is read
 # through a read-only mapping (Safetensors::open) instead of into memory, and a bf16 tensor's bytes are viewed as u16
 # (Safetensors::bf16, a misaligned file refused), each block with its SAFETY line.

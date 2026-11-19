@@ -36,7 +36,7 @@ crates/gpu-gates/src/bin/gate_bf16.rs	qwen	6	PIN(2026-10-20) qwen: the embedding
 crates/gpu-gates/src/bin/gate_block.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_dspark_experts.rs	deepseek	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_dspark_graph.rs	deepseek	10	baseline T 10: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
-crates/gpu-gates/src/bin/gate_dspark_hc.rs	deepseek	6	baseline T 6: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_dspark_hc.rs	deepseek	5	baseline T 6: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_dspark_kv.rs	deepseek	6	baseline T 6: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_e2e.rs	deepseek	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_e2e.rs	qwen	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
