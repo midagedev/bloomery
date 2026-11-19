@@ -1,0 +1,14 @@
+# Hy4-flash Q4_K_M (168 GB) on the DGX Spark at the serving defaults: the plan holds all 20,992 routed experts on GB10's
+# unified memory (89.5 GB) beside the trunk and the context, no host tier. The term with a derivation is the decode at depth
+# 512: ~11B active weights a token at Q4_K_M's ~4.8 bits read ~6.6 GB a token, which GB10's ~273 GB/s bounds at ~41 tok/s;
+# Hy4's other terms (engram lookups, the sparse attention's indexer, launch latency) take it to 20..40 [derived, not measured].
+kind: baseline
+question: what decode rate does Hy4-flash Q4_K_M serve at depth 512 on the DGX Spark at the serving defaults?
+term: tg tok/s @ n=128, depth 512, bloomery-serve at the serving defaults (no --ctx-size), GB10 128 GB unified
+unit: tok/s
+predict: 20..40
+condition: the Spark with no foreign compute process, the SPARK-4Bit download paused, the page cache dropped first; tools/release/sitting.sh --binary portable on the sm121a tarball, two rounds, cells-0.3.15-spark-hy4.tsv
+reason: the bytes a token reads at Q4_K_M over GB10's memory bandwidth, the plan's all-on-card placement.
+decide-in: the README's GB10 table takes the measured means with their rounds
+decide-below: under 20: read the plan record and majflt (the engram table is read from the file) before any row is published
+decide-above: beyond 40: read the draft (MTP) state and the witness blocks before crediting the build
