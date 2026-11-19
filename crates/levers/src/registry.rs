@@ -289,6 +289,18 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
+        name: "BLOOMERY_KLD_FILE",
+        class: Class::C,
+        kind: Kind::Path,
+        default: Unset::Means("the only path"),
+        doc: "Was a KLD base file the KLD gate judged instead of its set's.",
+        site: Site::Retired {
+            why: "V4.1's real-file KLD sets retired with its real-file ik sets; the gate judges its \
+                  fixture sets only",
+            left: &[],
+        },
+    },
+    LeverSpec {
         name: "BLOOMERY_HOT_LIST",
         class: Class::C,
         kind: Kind::Path,
@@ -2089,12 +2101,6 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "BLOOMERY_IQ3XXS_MODEL",
         Some("ref/build-qdot-ref.sh"),
         "The file IQ3_XXS's qdot harness and gate read, the Qwen3.8 UD-Q3_K_XL second shard when unset.",
-    ),
-    path(
-        "BLOOMERY_KLD_FILE",
-        None,
-        "A KLD base file the KLD gate judges instead of its set's \
-         (`crates/gpu-gates/src/kld.rs`); the gate's FAIL-first points it at a copy.",
     ),
     path(
         "BLOOMERY_LEASE_CARD",
