@@ -63,7 +63,9 @@
 //!   judge it: the fixture keeps the real file's width and vocabulary, so the real projector
 //!   seats against it, and the clause reads no id the model chose. FAIL-first: a pass that
 //!   stages one row fewer than the span holds, or a load without the pass, refuses the call by
-//!   name and the clause is red.
+//!   name and the clause is red; so does a stream ring the plan does not count (the tower's
+//!   reserve leaves the fixture plan no ring term, and a ring sized from the card's free bytes
+//!   is past the plan at the first prompt, `refuse_card_past_plan`).
 
 #[cfg(all(feature = "deepseek41", feature = "hy4"))]
 fn main() -> std::process::ExitCode {

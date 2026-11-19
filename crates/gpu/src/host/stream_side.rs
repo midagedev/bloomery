@@ -79,7 +79,8 @@ pub struct RingRows<'a> {
 }
 
 impl StreamSide {
-    /// The ring's room cap, the plan's ring reserve. Load-time only.
+    /// The ring's room cap, the plan's ring reserve: 0 for a plan that counts no ring term, whose
+    /// `split` the stream's start refuses by name (`XCfg::room_cap`). Load-time only.
     pub fn set_ring_room(&mut self, bytes: u64) {
         self.ring_room = Some(bytes);
     }

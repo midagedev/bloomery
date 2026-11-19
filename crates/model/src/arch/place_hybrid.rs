@@ -245,18 +245,35 @@ impl StreamRing {
     }
 }
 
-/// The card bytes the stream's ring buffers may take on `plan`'s stage card under `inputs`: its
-/// ring term less the pass over the planned half ([`ring_room_cap`]). `None` for a plan that counts
-/// no ring (its load does not stream): the ring then takes what the card's margin leaves past the
-/// keep-free.
+/// The card bytes the stream's ring buffers may take on `plan`'s stage card under `inputs`
+/// ([`ring_room_of`] of the ring `inputs` carry); 0 for inputs that carry none.
 #[must_use]
-pub fn planned_room_cap<H>(plan: &Plan<'_>, inputs: &PlanInputs<H>) -> Option<u64> {
-    let stage = plan.cards.first().filter(|c| c.ring_half > 0)?;
-    let ring = inputs.ring.as_ref()?;
-    Some(ring_room_cap(
-        stage.ring_bytes,
-        ring.pass_bytes(stage.ring_half),
-    ))
+pub fn planned_room_cap<H>(plan: &Plan<'_>, inputs: &PlanInputs<H>) -> u64 {
+    inputs
+        .ring
+        .as_ref()
+        .map_or(0, |ring| ring_room_of(plan, ring))
+}
+
+/// The card bytes `ring`'s buffers may take on `plan`'s stage card, the cap every family that
+/// streams gives its ring (`XCfg::room_cap`): the card's ring term less the pass over the planned
+/// half ([`ring_room_cap`]); 0 for a plan that counts no ring term, whose stream the ring's start
+/// refuses by name, so a ring never takes card bytes the plan does not count.
+#[must_use]
+pub fn ring_room_of(plan: &Plan<'_>, ring: &StreamRing) -> u64 {
+    plan.cards
+        .first()
+        .filter(|_| counts_ring(plan))
+        .map_or(0, |stage| {
+            ring_room_cap(stage.ring_bytes, ring.pass_bytes(stage.ring_half))
+        })
+}
+
+/// Whether `plan`'s stage card counts a ring term (a half of at least one slot): a plan that
+/// counts none gives the ring no card bytes ([`ring_room_of`]).
+#[must_use]
+pub fn counts_ring(plan: &Plan<'_>) -> bool {
+    plan.cards.first().is_some_and(|c| c.ring_half > 0)
 }
 
 /// The fewest slots a half of the ring may hold: fewer, and the ring's bytes would not pay for its
@@ -651,8 +668,8 @@ impl<H> PlanInputs<H> {
     /// the prompt reserve grows by the ring's bytes at its floor ([`StreamRing::bytes`]), which the
     /// plan counts as the card's ring term and grows last ([`PlanInputs::plan_with_slots`]), and a
     /// slot of the ring is `ring.slot` bytes ([`PlanInputs::stream_slot`]). A load that does not
-    /// stream plans without them; its ring, if one is set later, takes what the card's margin
-    /// leaves free past the stream's keep-free.
+    /// stream plans without them; its plan counts no ring term, so a ring set later gets no card
+    /// bytes ([`ring_room_of`]) and its start is refused by name.
     #[must_use]
     pub fn streaming(self, ring: StreamRing) -> PlanInputs<H> {
         let reserve = self.prompt_reserve.saturating_add(ring.bytes(ring.floor));
@@ -1523,8 +1540,9 @@ impl KvBytes for KvLayout {
 /// prompt reserve (the ring's bytes at the floor, the reserve the experts are fitted around), then
 /// counts the ring as the stage card's ring term: a half of at least the floor, the largest the
 /// headroom every other term leaves holds (or the most host experts a layer leaves), its bytes
-/// [`StreamRing::bytes`] of that half, the prompt term the plain plan's. Returns the stage card and
-/// the experts a layer keeps.
+/// [`StreamRing::bytes`] of that half, the prompt term the plain plan's; the ring's room
+/// ([`ring_room_of`]) is that term less the pass, and none on the plain plan, which counts no ring
+/// term. Returns the stage card and the experts a layer keeps.
 #[cfg(test)]
 pub(crate) fn assert_ring_cap<H: Clone>(
     plain: &PlanInputs<H>,
@@ -1554,6 +1572,17 @@ pub(crate) fn assert_ring_cap<H: Clone>(
     assert_eq!(stage.prompt_bytes + floor_bytes, was.prompt_bytes);
     assert_eq!(was.ring_bytes, 0);
     assert!(new_plan.cards[1..].iter().all(|c| c.ring_bytes == 0));
+    // The ring's room is the plan's ring term: none on the plan that counts none.
+    assert_eq!(
+        ring_room_of(&old_plan, &ring),
+        0,
+        "no ring term, no ring room"
+    );
+    assert_eq!(
+        ring_room_of(&new_plan, &ring),
+        ring_room_cap(stage.ring_bytes, ring.pass_bytes(stage.ring_half)),
+        "the ring's room is its term less the pass"
+    );
     assert!(stage.ring_half >= ring.floor, "the floor is reserved");
     assert_eq!(stage.ring_bytes, ring.bytes(stage.ring_half));
     // The ring is the last term: what the floor left in the headroom, less the margin, holds it.

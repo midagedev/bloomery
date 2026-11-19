@@ -696,8 +696,8 @@ fn plan_at<'a, H>(
 /// experts, `None` (the plain plan) where it holds every expert on the card, the ring's plan
 /// refused or not: nothing streams there. Where the ring does not fit, the lever is unset and the
 /// plain plan hosts experts, the plan `without` it on the same machine, its refusal the seat's:
-/// the open's stream rule may still start the stream from the card's free bytes, and the plain
-/// plan holds no staging.
+/// that plan counts no ring term, so the open's stream rule finds the ring no room and admits
+/// (a ring never takes card bytes past the plan), and the plain plan holds no staging.
 fn ringed<P>(
     set: bool,
     hosts: bool,
@@ -1075,8 +1075,9 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
     // Where the seat streams, the ring's plan on the staged machine beside it, and the pick is
     // fitted to the plan the load runs. An unset `BLOOMERY_XSTREAM` keeps no ring where the plan
     // without it holds every expert on the card (the rule then ends at `off`: nothing to stream).
-    // Where the plan cannot hold the ring, the rule sizes it from what the card leaves free at the
-    // load ([`PlanInputs::streaming`]), so that plan keeps the staging on the host.
+    // Where the plan cannot hold the ring, it counts no ring term and the load's stream rule admits
+    // (the ring's start gives a ring no card bytes past the plan), so that plan keeps the staging on
+    // the host.
     let staging = ring_inputs
         .as_ref()
         .zip(staged.as_ref())

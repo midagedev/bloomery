@@ -1316,7 +1316,8 @@ impl XStreamBody for crate::body::Body {
     /// each of a walk's units) and arms the ring pass's buffers at a unit's rows; the stream then
     /// stays for the load's life. Refused by name: `admit` or `split` on a whole-card load,
     /// `split` on a load made without the placed pass or whose hosted layers' card stacks are of
-    /// no one ring form, and the stream's own refusals.
+    /// no one ring form, and the stream's own refusals (a plan that counts no ring term among
+    /// them, [`plan_holds_no_ring`](bloomery_gpu::host::xstream::plan_holds_no_ring)).
     fn set_xstream(&mut self, gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
         const WHAT_S: &str = "hy4::Body::set_xstream";
         let pass = self

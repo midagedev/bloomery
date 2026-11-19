@@ -404,23 +404,18 @@ pub fn stream_ring(hp: &Hparams, model: &ModelTensors) -> Result<StreamRing, Pla
     })
 }
 
-/// The card bytes the stream's ring buffers may take on `plan`'s stage card: its ring term less
-/// the pass over the planned half, the cap the body gives the ring; the ring's two halves at the
-/// floor ([`stream_ring_bytes`]) for a plan that counts no ring term. Refused as
-/// [`stream_bytes`] refuses.
+/// The card bytes the stream's ring buffers may take on `plan`'s stage card, the cap the body
+/// gives the ring ([`place_hybrid::ring_room_of`] of [`stream_ring`]): 0 for a plan that counts no
+/// ring term, whose ring is not read. Refused as [`stream_ring`] refuses.
 pub fn stream_room_cap(
     plan: &Plan<'_>,
     hp: &Hparams,
     model: &ModelTensors,
 ) -> Result<u64, PlacementError> {
-    let Some(stage) = plan.cards.first().filter(|c| c.ring_half > 0) else {
-        return stream_ring_bytes(hp, model);
-    };
-    let ring = stream_ring(hp, model)?;
-    Ok(place_hybrid::ring_room_cap(
-        stage.ring_bytes,
-        ring.pass_bytes(stage.ring_half),
-    ))
+    if !place_hybrid::counts_ring(plan) {
+        return Ok(0);
+    }
+    Ok(place_hybrid::ring_room_of(plan, &stream_ring(hp, model)?))
 }
 
 impl PlanInputs {

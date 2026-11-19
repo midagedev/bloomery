@@ -51,9 +51,10 @@ pub fn stream_ring(inputs: &PlanInputs) -> Result<StreamRing, PlacementError> {
 }
 
 /// The card bytes the stream's ring buffers may take on `plan`'s stage card
-/// ([`place_hybrid::planned_room_cap`]), the cap the body gives the ring.
+/// ([`place_hybrid::planned_room_cap`]), the cap the body gives the ring: 0 for a plan that
+/// counts no ring term.
 #[must_use]
-pub fn stream_room_cap(plan: &Plan<'_>, inputs: &PlanInputs) -> Option<u64> {
+pub fn stream_room_cap(plan: &Plan<'_>, inputs: &PlanInputs) -> u64 {
     place_hybrid::planned_room_cap(plan, inputs)
 }
 

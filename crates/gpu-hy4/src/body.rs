@@ -800,8 +800,9 @@ impl Body {
     /// stacks, held as rooms, and the slot map's card copy the step and the pass read
     /// ([`bloomery_gpu::host::placed`]), its churn pool hosted beside the plan's host set. Refused
     /// by name as those refuse, and a machine beside a routed layer the card holds whole
-    /// ([`PlacedHost::new`]). The plan's ring term, when it holds one
-    /// ([`model::arch::hy4::place::stream_ring`]), caps the ring a `split` stream makes.
+    /// ([`PlacedHost::new`]). The plan's ring term ([`model::arch::hy4::place::stream_ring`])
+    /// caps the ring a `split` stream makes ([`place_hybrid::planned_room_cap`]: none for a plan
+    /// that counts none, whose stream the ring's start refuses by name).
     ///
     /// [`PlacedHost::new`]: bloomery_gpu::host::placed::PlacedHost::new
     /// [`PlacedHost::prepare_pass_walk`]: bloomery_gpu::host::placed::PlacedHost::prepare_pass_walk
@@ -861,9 +862,8 @@ impl Body {
                              slots' places and the card slots' route tables",
                         )?;
                         body.pass = Some(Box::new(made));
-                        if let Some(cap) = place_hybrid::planned_room_cap(plan, inputs) {
-                            body.xs.set_ring_room(cap);
-                        }
+                        body.xs
+                            .set_ring_room(place_hybrid::planned_room_cap(plan, inputs));
                     }
                     // The step's union slabs for one column: the host tier's resident path runs
                     // only through them.

@@ -158,8 +158,11 @@ pub struct XCfg {
     pub max_half: usize,
     /// The card bytes the ring leaves free when it sizes itself.
     pub keep_free: u64,
-    /// The most card bytes past `keep_free` the ring may take: `None` when
-    /// the card's free bytes alone bound it.
+    /// The most card bytes past `keep_free` the ring may take: the plan's
+    /// ring term less the ring pass's bytes beside the halves; `Some(0)` for a
+    /// plan that counts no ring term, which [`XStream::new`] refuses by name
+    /// ([`plan_holds_no_ring`]); `None` when the card's free bytes alone bound
+    /// it (a load whose plan prices no ring).
     pub room_cap: Option<u64>,
     /// The fewest slots a half may have; a card with less room is refused
     /// by name.
@@ -181,7 +184,7 @@ impl XCfg {
     /// union's costs the tier sets from the map and its host
     /// ([`super::HostTier::xstream_start`]), the constants this module owns
     /// beside them, and `room_cap` capping the card bytes past `keep_free`
-    /// the ring may take (`None`: the free bytes alone bound it).
+    /// the ring may take ([`XCfg::room_cap`]).
     pub const fn new(
         shape: ExpertShape,
         experts: usize,
@@ -552,6 +555,18 @@ fn lane_rate(probe: impl IntoIterator<Item = (u64, bool)>, (held, paged): (f64, 
 /// resolves an unset lever tells it from every other refusal by it.
 pub const XSTREAM_ROOM: &str = "XStream ring room";
 
+/// The detail of the [`XSTREAM_ROOM`] refusal of a ring whose plan counts no
+/// ring term (`XCfg::room_cap` of `Some(0)`).
+const NO_RING: &str = "the plan counts no ring term, so the ring has no card bytes past the plan";
+
+/// Whether `e` is [`XStream::new`]'s refusal of a ring whose plan counts no
+/// ring term: a room refusal ([`XSTREAM_ROOM`]) that a lever resolver says
+/// by name, apart from a card with too little room.
+#[must_use]
+pub fn plan_holds_no_ring(e: &GpuError) -> bool {
+    matches!(e, GpuError::Shape { what: XSTREAM_ROOM, detail } if detail == NO_RING)
+}
+
 /// What the refusal of a stream on a map with no host expert on a layer with stage stacks names ([`XSTREAM_ROOM`]'s
 /// reader's twin): nothing streams where the card holds every expert.
 pub const XSTREAM_NO_HOST: &str = "XStream host experts";
@@ -902,7 +917,9 @@ impl XStream {
     /// ones on a second pass, past their first reads), each rate kept in the
     /// cost store under the device's key (a later load of the key
     /// reads it), and [`lane_rate`] of the same experts at those rates the
-    /// rate the rule prices. Refused by name: a ring of fewer than
+    /// rate the rule prices. Refused by name: a plan that counts no ring term
+    /// (`cfg.room_cap` of `Some(0)`, before anything is made; as
+    /// [`XSTREAM_ROOM`], [`plan_holds_no_ring`]), a ring of fewer than
     /// `cfg.min_half` slots a half, no layer with stage stacks, a part not a
     /// whole number of words, a part count other than [`PARTS`] or
     /// [`MAX_PARTS`] or other than another layer's, an empty probe, a cfg
@@ -915,6 +932,9 @@ impl XStream {
         mut cfg: XCfg,
     ) -> Result<XStream, GpuError> {
         const WHAT: &str = "XStream::new";
+        if cfg.room_cap == Some(0) {
+            return Err(GpuError::shape(XSTREAM_ROOM, NO_RING));
+        }
         let mut widest: Vec<usize> = Vec::new();
         let mut slot_bytes = 0usize;
         for l in 0..layers {

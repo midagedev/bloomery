@@ -1,7 +1,7 @@
 //! The expert stream rule a load runs: `BLOOMERY_XSTREAM` set or unset by
 //! one rule ([`xstream_rule`]), over any body that implements
 //! [`XStreamBody`] — for `generate_qwen3moe` and the Qwen3.8, MiniMax, Muse
-//! Spark and Mistral Large 4 serve seats, each including this file; the MiniMax
+//! Spark, Mistral Large 4 and Hy4-flash serve seats, each including this file; the MiniMax
 //! gates' seat asks its [`plans_ring`]. It lives beside the
 //! bins, not in the lib, because it drives a load's body, whose own guards
 //! the trait carries.
@@ -12,7 +12,7 @@
 
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::host::xstream::{
-    XMode, XSTREAM_FORM, XSTREAM_NO_HOST, XSTREAM_ROOM, XStreamBody,
+    XMode, XSTREAM_FORM, XSTREAM_NO_HOST, XSTREAM_ROOM, XStreamBody, plan_holds_no_ring,
 };
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_gates::GateError;
@@ -64,7 +64,8 @@ pub fn plans_ring(set: Option<&str>, stage: Stage, residency_off: bool) -> bool 
 /// the `xstream=` line the binary prints (the word, then why): `set` as given; unset,
 /// `split` at [`Stage::A`] with a residency machine (`admit` when the card
 /// has no room for the stream's ring or the ring cannot hold the source layout, `off` when the plan holds no host
-/// expert to stream, the refusal named on the line),
+/// expert to stream, the refusal named on the line; a plan that counts no ring term gives the ring
+/// no room, and the load says so on a line of its own, `xstream ring: the plan holds none, …`),
 /// `admit` at [`Stage::Tiered`] with one (its expert tier the ring does not
 /// serve), `off` everywhere else. `admit` or `split` beside
 /// `BLOOMERY_RESIDENCY=off` is refused by name (the body's `set_xstream`).
@@ -89,6 +90,11 @@ pub fn xstream_rule<B: XStreamBody>(
                     },
                 ) => {
                     body.set_xstream(gpu, XMode::Admit)?;
+                    if plan_holds_no_ring(&e) {
+                        eprintln!(
+                            "xstream ring: the plan holds none, so the prompt does not stream"
+                        );
+                    }
                     format!("unset: split has no room: {e}")
                 }
                 Err(

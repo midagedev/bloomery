@@ -58,7 +58,8 @@
 //! add theirs, the budget `gate_musespark_e2e`'s placed arms set), so the batch is held on both bodies; the real tier runs
 //! the gate plan's placed load (the e2e gate's real load).
 //!
-//! The stream arm (`stream`, fixture tier): the `mid` budget under the common residency machine (`Residency::Mid`, half
+//! The stream arm (`stream`, fixture tier): the `mid` budget of a plan that counts the stream's ring (its floor in the
+//! prompt reserve, `PlanInputs::streaming`) under the common residency machine (`Residency::Mid`, half
 //! the smallest layer's card experts pinned and one spare, the host set read in) with the prompt calls' expert stream on
 //! (`XMode::Split`): the host experts of a hosted layer the stream's rule sends to the card land in its ring and run as
 //! the common route GEMM over the ring's half beside the stage slots' `_sel` launches, their rows joined into the
@@ -359,6 +360,14 @@ mod gate {
             Arm::Two => return Err("the two-card arm opens through two_card".into()),
             Arm::Mid | Arm::Plan | Arm::Stream => {
                 let inputs = PlanInputs::read(&file)?;
+                // The stream arm's plan counts the ring's term, the only card bytes its ring takes.
+                let inputs = match arm {
+                    Arm::Stream => {
+                        let ring = place::stream_ring(&inputs.hp, &inputs.model)?;
+                        inputs.streaming(ring)
+                    }
+                    Arm::Whole | Arm::Mid | Arm::Plan | Arm::Two => inputs,
+                };
                 let machine =
                     workstation::placed_on(gate_card::card()?, hp.n_layer, workstation::SCRATCH);
                 let ctx = u64::try_from(ctx)?;
