@@ -287,3 +287,87 @@ fn a_seats_default_is_read_off_its_stores_rooms() {
         Err(PlacementError::KvUnroomed { .. })
     ));
 }
+
+/// A body that loads one sequence's stores holds the plan's card term against the planner's own
+/// rule ([`Plan::stores_counted`]), not against the stores' exact bytes at the cap: the term reads
+/// the rooms at the plan's floor and carries the rounding the cache counts beside its rows
+/// (`Padded`: 100 B a layer that does not move with the floor). So the figure a body compares is
+/// the plan's own for every floor and backing the levers name, and is none for a card the plan
+/// does not have. The layout at the cap, which a body's stores hold, is another number under a
+/// floor or a rounding [derived: the four layers' 18 B a position over 80 positions is 5,760 B,
+/// and 6,160 B with the 400 B of rounding; the floor of 8 holds 576 B of rows and the rounding's
+/// 400 B, 976 B].
+///
+/// FAIL-first: `stores_counted` reading the layout at the cap (the floor and the rounding left to
+/// the plan) is red at the first floor row: 5,760 B against the plan's 576 B.
+#[test]
+fn the_cards_stores_are_counted_by_the_planners_own_rule() {
+    /// [`Kv`]'s rooms with a rounding of 100 B a layer beside the rows.
+    struct Padded;
+    impl KvBytes for Padded {
+        fn rooms(&self) -> Option<&PosLayout> {
+            Kv.rooms()
+        }
+
+        fn layer_bytes(&self, layer: usize, ctx_max: u64) -> u64 {
+            Kv.layer_bytes(layer, ctx_max) + 100
+        }
+
+        fn stage_position_bytes(&self, ctx_max: u64) -> u64 {
+            Kv.stage_position_bytes(ctx_max)
+        }
+    }
+
+    let model = layered(4);
+    let machine = card_of_cap_kv_and_experts(80, 10);
+    for (name, kv) in [("rows", &Kv as &dyn KvBytes), ("padded", &Padded)] {
+        for (what, levers) in [
+            ("unset", PlanLevers::default()),
+            (
+                "floor",
+                PlanLevers {
+                    kv_floor: Some(8),
+                    ..PlanLevers::default()
+                },
+            ),
+            (
+                "floor and spill",
+                PlanLevers {
+                    kv_floor: Some(8),
+                    kv_host: KvHost::Spill,
+                    ..PlanLevers::default()
+                },
+            ),
+            (
+                "all",
+                PlanLevers {
+                    kv_host: KvHost::All,
+                    ..PlanLevers::default()
+                },
+            ),
+        ] {
+            let planned = plan(&model, &machine, 80, kv, &levers).expect("a plan");
+            assert_eq!(
+                planned.stores_counted(0, kv),
+                Some(planned.cards[0].kv_bytes),
+                "{name}, {what}"
+            );
+            assert_eq!(
+                planned.stores_counted(1, kv),
+                None,
+                "{name}, {what}: no card 1"
+            );
+        }
+    }
+    let floor = PlanLevers {
+        kv_floor: Some(8),
+        ..PlanLevers::default()
+    };
+    let padded = plan(&model, &machine, 80, &Padded, &floor).expect("a plan");
+    let cap: u64 = (0..4).map(|l| Padded.layer_bytes(l, 80)).sum();
+    assert_eq!(
+        (padded.cards[0].kv_bytes, cap),
+        (976, 6_160),
+        "the card's term under the floor, and the layout at the cap"
+    );
+}

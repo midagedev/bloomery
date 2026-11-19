@@ -968,7 +968,10 @@ fn placed_map(open: &Open<'_>, card: usize, hp: &Hparams) -> Result<SlotMap, Gpu
 
 /// The stores the load made against the plan's count of them: the plan counts the layers' stores
 /// by the header's widths, and a load whose stores differ holds another number of bytes than the
-/// plan fitted. Refused by name with both figures.
+/// plan fitted. The stores' exact bytes are the layout's at the plan's context; the card's term
+/// is the plan's own rule over that layout ([`PlanInputs::stores_counted`]: the rooms at the
+/// plan's floor, the page rounding it counts), which is the same bytes only where the plan counts
+/// neither. Refused by name with the figures.
 fn refuse_stores(layers: &[Layer], open: &Open<'_>, card: usize) -> Result<(), GpuError> {
     let held: u64 = layers.iter().map(|l| l.store_bytes() as u64).sum();
     let planned = open.inputs.kv.bytes(0..layers.len(), open.plan.ctx_max);
@@ -978,12 +981,16 @@ fn refuse_stores(layers: &[Layer], open: &Open<'_>, card: usize) -> Result<(), G
         .get(card)
         .map(|t| t.kv_bytes)
         .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no card {card}")))?;
-    if held != planned || counted != planned {
+    let rule = open
+        .inputs
+        .stores_counted(open.plan, card)
+        .ok_or_else(|| GpuError::shape(WHAT, format!("the plan has no stage card {card}")))?;
+    if held != planned || counted != rule {
         return Err(GpuError::shape(
             WHAT,
             format!(
-                "the stores hold {held} device bytes; the plan's layout counts {planned} and \
-                 card {card}'s plan {counted}"
+                "the stores hold {held} device bytes; the plan's layout counts {planned}, and \
+                 card {card}'s plan {counted} where its rule over those stores gives {rule}"
             ),
         ));
     }

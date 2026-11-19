@@ -519,6 +519,69 @@ mod tests {
             .expect("a body with no rooms plans with its levers unset");
     }
 
+    /// The body's load holds the plan's card term against [`PlanInputs::stores_counted`], not
+    /// against the stores' exact bytes: under the server's default (the pages the card rounds the
+    /// rooms at set) the plan counts each latent layer's rooms at the floor, the rooms' page
+    /// rounding and the device's spare page, so the term is another number than the layout's
+    /// [derived, page 2 MiB, K3's latent row 1,152 B a position, the three delta layers'
+    /// 494,604 B state in both]. At 4,096 positions (under the floor, so every position counts) the
+    /// layout is 494,604 + 4,096 x 1,152 = 5,213,196 B and the term adds the cache's rounding
+    /// to 3 pages (6,291,456 - 4,718,592 = 1,572,864 B) and the spare page (2,097,152 B):
+    /// 8,883,212 B. At 262,144 positions the layout is 302,484,492 B, and the term holds the
+    /// floor's 8,192 rows (9,437,184 B) with the cache's 144 whole pages (no rounding) and the
+    /// spare page: 12,028,940 B. A K3.1 file, and the second of two stage cards (which holds the
+    /// room, so the rounding and the spare page land there alone), count as the plan counts them.
+    /// Mutant: [`PlanInputs::stores_counted`] reading the layout at the plan's context (the
+    /// body's old comparison).
+    #[test]
+    fn a_stores_count_is_the_plans_rule_under_the_server_default() {
+        const PAGE: u64 = 2 << 20;
+        let machine = workstation::plan_gate(4);
+        let mut k3 = described("kimi-k3-place-counted");
+        k3.room_page = Some(PAGE);
+        k3.kv_host_page = Some(PAGE);
+        let levers = k3.resolve_kv(PlanLevers::default(), KvFloor::Unset, None);
+        for (ctx, exact, counted) in [
+            (4_096, 5_213_196, 8_883_212),
+            (262_144, 302_484_492, 12_028_940),
+        ] {
+            let plan = k3
+                .plan(&machine, ctx, &levers)
+                .unwrap_or_else(|e| panic!("the gate machine plans {ctx}: {e}"));
+            let kv: &KvLayout = &k3.kv;
+            assert_eq!(kv.bytes(0..4, ctx), exact, "{ctx}: the stores' exact bytes");
+            assert_eq!(plan.cards[0].kv_bytes, counted, "{ctx}: the card's term");
+            assert_eq!(k3.stores_counted(&plan, 0), Some(counted), "{ctx}");
+            assert_eq!(k3.stores_counted(&plan, 1), None, "{ctx}: one stage card");
+        }
+        let mut two = workstation::plan_gate(4);
+        let mut second = workstation::plan_on(A6000, 4).cards.remove(0);
+        second.head = false;
+        second.token_embedding = false;
+        second.layers = 2..4;
+        two.cards[0].layers = 0..2;
+        two.cards.push(second);
+        let mut k31 = PlanInputs::describe(&opened31("kimi-k31-place-counted"))
+            .expect("the synthetic K3.1 header describes");
+        k31.room_page = Some(PAGE);
+        k31.kv_host_page = Some(PAGE);
+        let levers = k31.resolve_kv(PlanLevers::default(), KvFloor::Unset, None);
+        for (name, machine) in [("one card", &machine), ("two cards", &two)] {
+            for ctx in [4_096, 100_000, 262_144] {
+                let plan = k31
+                    .plan(machine, ctx, &levers)
+                    .unwrap_or_else(|e| panic!("{name} plans {ctx}: {e}"));
+                for (c, totals) in plan.cards.iter().enumerate() {
+                    assert_eq!(
+                        k31.stores_counted(&plan, c),
+                        Some(totals.kv_bytes),
+                        "{name}, {ctx}, card {c}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The by-position buffers a K3.1 latent layer declares are its stores' rows [derived from the
     /// header's widths, apart from the reader]: the cached row (512 + 64 f16 values, 1,152 B) a
     /// step reads through the indexer's picks, so a `Select` of the indexer's `top_k` rows, and

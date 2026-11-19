@@ -827,12 +827,7 @@ impl<H> PlanInputs<H> {
             (KvHost::Off, _) | (_, None) => None,
             _ => Some(self.kv_host_page_of()?),
         };
-        let kv = RoomPadded::new(
-            &kv,
-            machine,
-            self.room_page.map(|card| (card, self.kv_host_page)),
-            levers.kv_host,
-        );
+        let kv = RoomPadded::new(&kv, machine, self.padded_pages(), levers.kv_host);
         let mut plan = placement::plan_routed_reserving(
             &self.model,
             machine,
@@ -974,6 +969,26 @@ impl<H> PlanInputs<H> {
     #[must_use]
     pub fn seq_terms(&self) -> SeqTerms<'_> {
         self.kv.seq_terms()
+    }
+
+    /// The pages the plan rounds the rooms at: the card's, and the host-capable room's where the
+    /// lever backs one ([`PlanInputs::room_page`], [`PlanInputs::kv_host_page`]); `None` where the
+    /// plan counts no rounding.
+    fn padded_pages(&self) -> Option<(u64, Option<u64>)> {
+        self.room_page.map(|card| (card, self.kv_host_page))
+    }
+
+    /// The KV-class bytes `plan` counts on stage card `card` for one sequence of this file's
+    /// stores: the planner's own rule ([`Plan::stores_counted`]) over the stores' layout with the
+    /// page rounding the plan carries, read at the plan's cap, floor and host backing. A body that
+    /// loads one sequence's stores holds the plan's count against this, which is the stores' exact
+    /// bytes only where the plan counts neither a floor nor a rounding. `None` for a plan with no
+    /// such stage card.
+    #[must_use]
+    pub fn stores_counted(&self, plan: &Plan<'_>, card: usize) -> Option<u64> {
+        let kv = self.seq_terms().slots_of(1);
+        let kv = RoomPadded::new(&kv, plan.machine, self.padded_pages(), plan.kv_host);
+        plan.stores_counted(card, &kv)
     }
 }
 

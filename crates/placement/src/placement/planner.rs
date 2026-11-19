@@ -797,6 +797,24 @@ fn card_kv(card: &Card, kv: &KvView<'_>, (spread, ctx_max): (u64, u64)) -> (u64,
     (kv_card, shadow, rows)
 }
 
+impl Plan<'_> {
+    /// The KV-class bytes this plan counts on stage card `card` for the stores `kv` declares: the
+    /// card's layers read as the planner read them, under the plan's own cap, floor and host
+    /// backing. A body that holds its loaded stores against the plan reads this rule instead of its
+    /// own: with a floor the rooms count at the floor's positions, and `kv` carrying the rooms'
+    /// page rounding counts it. `None` for a plan with no such stage card.
+    #[must_use]
+    pub fn stores_counted(&self, card: usize, kv: &dyn KvBytes) -> Option<u64> {
+        let card = self.machine.cards.get(card)?;
+        let view = KvView {
+            kv,
+            host: self.kv_host,
+        };
+        let spread = self.kv_floor.unwrap_or(self.ctx_max);
+        Some(card_kv(card, &view, (spread, self.ctx_max)).0)
+    }
+}
+
 /// Refuse a tier card that says it runs a stage.
 pub(super) fn check_tiers(tiers: &[Card]) -> Result<(), PlacementError> {
     for t in tiers {

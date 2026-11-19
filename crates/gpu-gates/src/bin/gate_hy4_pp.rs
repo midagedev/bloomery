@@ -62,7 +62,8 @@
 //! - `placed_pass_is_reserved`: the load's resident bytes stand inside the plan's terms with the
 //!   pass's bytes as the prompt reserve, and a plan that reserves none refuses the load by name.
 //! - `placed_residency_follows_the_map`: the same plan loaded under a `mid` word
-//!   (`residency_clauses::mid_of` over the plan's card counts) runs the common machine, each
+//!   (`residency_clauses::mid_of` over the plan's card counts, the host set read in: the machine's
+//!   source stages its parts from it) runs the common machine, each
 //!   machine layer reseeded host experts first (`residency_clauses::host_first_orders`), so host
 //!   experts go live in card slots the plan's experts held; the reseed copies experts onto the card
 //!   and leaves no entry off its seed, and set `e` through the pass, then fed the `off` load's ids
@@ -249,6 +250,14 @@ mod gate {
     /// PIN(2026-11-19) [provisional]: derived, about 4 x [`FFN_BAND`] over the fixture's routed
     /// layers; the first box run's worst re-pins it at 1.5 x.
     const RESIDENCY_BAND: f64 = 1.0e-1;
+
+    /// The host tier's configuration of the residency clause's load: [`HOST_CFG`] with the host set
+    /// read in, which the machine's source stages its parts from (the load refuses a machine over a
+    /// set it did not populate, by name). The other loads read no lever and leave the set to fault in.
+    const HOST_RESIDENCY: bloomery_levers::HostCfg = bloomery_levers::HostCfg {
+        populate: true,
+        ..HOST_CFG
+    };
 
     /// The ids of set `name`.
     fn set_ids(name: &'static str) -> Result<Vec<u32>, GateError> {
@@ -929,7 +938,7 @@ mod gate {
             open_split(Arch::Hy4, RECIPE)?,
             (plan, pass_inputs),
             0,
-            HOST_CFG,
+            HOST_RESIDENCY,
             (Some(PassShape::of(PASS_ROWS)), residency),
         )?;
         let layers = {
