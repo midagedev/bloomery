@@ -1,0 +1,16 @@
+# 0.3.15's release sitting on the DGX Spark (GB10, 128 GB unified): two cells, Qwen3.8-Flash-Next as Unsloth's UD-Q4_K_XL GGUF
+# and as the FP4-Local folder, at the serving defaults, D = 512 and 4096, two rounds, on the shipped sm121a archive. The term
+# with an anchor is the FP4-Local decode at depth 512: the Spark's first timed A/B (q38store, 0e763b848 base, depth-serve, 5
+# rounds) read tg ~48 tok/s and pp4096 ~2,725 tok/s on the same folder with the whole model on the card; the plan still holds all
+# 24,576 experts there, so the row is read at the anchor within its spread: 44..54 [derived, not measured]. The GGUF cell is read
+# beside it with no band of its own.
+kind: baseline
+question: what decode rate does Qwen3.8-Flash-Next FP4-Local serve at depth 512 on the DGX Spark at the serving defaults?
+term: tg tok/s @ n=128, depth 512, bloomery-serve at the serving defaults (no --ctx-size), GB10 128 GB unified
+unit: tok/s
+predict: 44..54
+condition: the Spark with no foreign compute process (nvidia-smi empty at start), the bench hold up; tools/release/sitting.sh --binary portable on the sm121a tarball, two rounds, cells-0.3.15-spark.tsv
+reason: the 11-04 Spark A/B's FP4-Local decode (~48 tok/s) on the same folder and card, the plan's all-on-card placement unchanged.
+decide-in: the README's GB10 table takes the measured means with their rounds
+decide-below: under 44: read the plan record (card_experts, draft) and card_free at load (a co-tenant moves the unified plan) before any row is published
+decide-above: beyond 54: read the draft's accept count and the witness blocks before crediting the build

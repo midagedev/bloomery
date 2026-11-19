@@ -338,7 +338,7 @@ WORK='' HOLD_FILE='' FINISHED='' RESULT=red REASON='the sitting ended before its
 BIN='' BIN_SHA='' BIN_VERSION='' TB_SHA='' TB_MEMBER='' TB_MEMBER_SHA='' GPU_3090='' CARDS_ERROR='' DS='' CHECKS_RUN='' CHECKS_PY=''
 CELLREC=() REDS=() NOTRUN=()
 RESUME='' ONLY='' ONLYSET='' RESUME_DIR='' RESUME_NOW='' RESUME_PLAN='' KEPT_WORK='' SEL1=() SEL2=()
-SIT_CARDS='' BASE_UUIDS='' QUIET_UUIDS='' MEMBASE='' GPU_HOLD_ON='' GPU_GATE=() GPU_A6000=''
+SIT_CARDS='' BASE_UUIDS='' QUIET_UUIDS='' MEMBASE='' UNIFIED='' GPU_HOLD_ON='' GPU_GATE=() GPU_A6000=''
 SIT_NAMES='' SIT_BOTH=0 SIT_TEXT='' CARD_TOK=() CARD_ID=() LISTED_N=0
 
 # emit_new <file>: the bytes of <file> past EMIT_OFF to stdout, so a call's log shows as it grows.
@@ -582,6 +582,11 @@ cards_resolve() {
   QUIET_UUIDS=$BASE_UUIDS
 }
 
+# card_raw <uuid>: nvidia-smi's used-memory answer for the card as it prints it (`[N/A]` on a unified-memory card).
+card_raw() {
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$1" 2> /dev/null | head -n 1 | tr -d ' '
+}
+
 # card_mem <uuid>: the card's used memory in MiB; empty when nvidia-smi gives no whole number.
 card_mem() {
   local v
@@ -596,12 +601,25 @@ card_mem() {
 # 64 MiB, for at most SITTING_BASELINE_WAIT seconds, past which the sitting ends rc 75 naming the card. Every depth-serve call
 # of the sitting is held to this baseline (DEPTH_SERVE_MEM_BASELINE), not to what its own start finds.
 baseline_read() {
-  local uuid prev cur t0 d
+  local uuid prev cur t0 d raw
   MEMBASE=''
   for uuid in $BASE_UUIDS; do
     t0=$SECONDS prev=''
+    # A unified-memory card (GB10) answers [N/A] by design: it has no baseline to read, and depth-serve skips its wait
+    # between servers the same way. Any other answer that is not a whole number is a reading that failed.
+    raw=$(card_raw "$uuid")
+    if [ "$raw" = '[N/A]' ]; then
+      echo "[baseline] $(now) the card $uuid reports no used memory ([N/A], unified memory): no baseline; depth-serve skips its wait, and the server's card bytes are recorded, not held"
+      UNIFIED=1
+      continue
+    fi
     while :; do
-      cur=$(card_mem "$uuid")
+      if [ -n "$raw" ]; then
+        case $raw in *[!0-9]*) cur='' ;; *) cur=$raw ;; esac
+        raw=''
+      else
+        cur=$(card_mem "$uuid")
+      fi
       [ -n "$cur" ] || die 69 "the card $uuid gives no used-memory reading: the sitting's baseline cannot be read"
       if [ -n "$prev" ]; then
         d=$((cur > prev ? cur - prev : prev - cur))
@@ -746,8 +764,9 @@ run_cell() {
     "BLOOMERY_MODEL=$CF_PROFILE" BLOOMERY_AB_ROUNDS=1 "DEPTH_SERVE_MEM_BASELINE=$MEMBASE" "DEPTH_SERVE_FOLD=$CF_FOLD"
     "TMPDIR=$dir/tmp")
   [ -z "$CF_PATH" ] || envv+=("BLOOMERY_REF_MODEL=$CF_PATH")
-  # The sitting holds the card: the server's card-byte invariant refuses a reading past its plan.
-  envv+=(BLOOMERY_CARD_HELD=1)
+  # The sitting holds the card: the server's card-byte invariant refuses a reading past its plan. A unified-memory card has
+  # no card reading to hold the server to (its free bytes are the host's), so there the invariant only records.
+  [ -n "$UNIFIED" ] || envv+=(BLOOMERY_CARD_HELD=1)
   [ "$CF_PLACE" = - ] || envv+=("DEPTH_SERVE_PLACE=$CF_PLACE")
   [ -z "$CF_CTX" ] || envv+=("DEPTH_SERVE_CTX=$CF_CTX")
   [ "$STAGE" != portable ] || envv+=("DEPTH_SERVE_TARBALL=$TARBALL")
@@ -1414,7 +1433,7 @@ gpuhold=down
 [ ! -e "$STUB_GPUHOLD" ] || gpuhold=up:$(sed -n 's/.* cards=\([^ ]*\) .*/\1/p' "$STUB_GPUHOLD")
 after=unset
 [ -z "${DEPTH_SERVE_AFTER:-}" ] || after=set
-echo "call profile=$prof ref=${BLOOMERY_REF_MODEL-unset} refprof=${BLOOMERY_REF_MODEL_PROFILE-unset} place=${DEPTH_SERVE_PLACE-unset} ctx=${DEPTH_SERVE_CTX-unset} cards=${BLOOMERY_TIMING_CARDS-unset} gpu=${BLOOMERY_TIMING_GPU-unset} tarball=${DEPTH_SERVE_TARBALL-unset} after=$after rounds=${BLOOMERY_AB_ROUNDS-unset} userplan=${DEPTH_SERVE_USER_PLAN-unset} hold=$hold gpuhold=$gpuhold membase=${DEPTH_SERVE_MEM_BASELINE-unset} fold=${DEPTH_SERVE_FOLD-unset} arms=$*" >> "$STUB_CALLS"
+echo "call profile=$prof ref=${BLOOMERY_REF_MODEL-unset} refprof=${BLOOMERY_REF_MODEL_PROFILE-unset} place=${DEPTH_SERVE_PLACE-unset} ctx=${DEPTH_SERVE_CTX-unset} cards=${BLOOMERY_TIMING_CARDS-unset} gpu=${BLOOMERY_TIMING_GPU-unset} tarball=${DEPTH_SERVE_TARBALL-unset} after=$after rounds=${BLOOMERY_AB_ROUNDS-unset} userplan=${DEPTH_SERVE_USER_PLAN-unset} hold=$hold gpuhold=$gpuhold membase=${DEPTH_SERVE_MEM_BASELINE-unset} held=${BLOOMERY_CARD_HELD-unset} fold=${DEPTH_SERVE_FOLD-unset} arms=$*" >> "$STUB_CALLS"
 case $prof in
   red*)
     echo "FAIL r1 ${1%%:*} D=${1#*:}: the stub's server did not answer" >&2
@@ -1998,9 +2017,9 @@ case_env() {
   # shellcheck disable=SC2046
   st_run $(portable)
   want_rc 0
-  calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=a6000+3090 gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=unset hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
-  calls_seq '2s/ arms=.*//p' 'call profile=pb ref=unset refprof=unset place=a ctx=4300 cards=unset gpu=GPU-bbbb tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
-  calls_seq '3s/ arms=.*//p' 'call profile=pc ref=unset refprof=unset place=a ctx=unset cards=unset gpu=GPU-aaaa tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 fold=off'
+  calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=a6000+3090 gpu=unset tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=unset hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 held=1 fold=off'
+  calls_seq '2s/ arms=.*//p' 'call profile=pb ref=unset refprof=unset place=a ctx=4300 cards=unset gpu=GPU-bbbb tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 held=1 fold=off'
+  calls_seq '3s/ arms=.*//p' 'call profile=pc ref=unset refprof=unset place=a ctx=unset cards=unset gpu=GPU-aaaa tarball='"$C"'/tb/'"$TBN"'.tar.gz after=unset rounds=1 userplan=note hold=up gpuhold=up:3090,a6000 membase=GPU-bbbb=100,GPU-aaaa=100 held=1 fold=off'
   [ -z "$WHY" ]
 }
 
@@ -2316,6 +2335,15 @@ case_baseline() {
   want_out 'gives no used-memory reading'
   no_calls
   no_hold
+  # a unified-memory card answers [N/A]: no baseline, and the sitting runs (depth-serve skips its wait)
+  st_fresh
+  rm -f "$C/mem.GPU-bbbb.i"
+  printf '[N/A]\n' > "$C/mem.GPU-bbbb.seq"
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  want_out 'reports no used memory ([N/A], unified memory): no baseline'
+  grep -q ' held=unset ' "$C/calls" || fault "a unified card's server was held to a card reading"
   [ -z "$WHY" ]
 }
 
@@ -2416,7 +2444,7 @@ case_onecard() {
   # shellcheck disable=SC2046
   st_run $(portable)
   want_rc 0
-  calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=unset gpu=GPU-cccc tarball='"$C"'/tb/'"$TBN"'.tar.gz after=set rounds=1 userplan=unset hold=up gpuhold=up:local membase=GPU-cccc=100 fold=off'
+  calls_seq '1s/ arms=.*//p' 'call profile=pa ref=/m/a.gguf refprof=unset place=unset ctx=unset cards=unset gpu=GPU-cccc tarball='"$C"'/tb/'"$TBN"'.tar.gz after=set rounds=1 userplan=unset hold=up gpuhold=up:local membase=GPU-cccc=100 held=1 fold=off'
   want_out '[baseline] '
   want_out 'the card GPU-cccc: 100 MiB used'
   want_v 'cell 1: pa=/m/a.gguf place=- cards=5090 ctx=unset D=512,4096 checks=--stub-pass'
@@ -2850,6 +2878,8 @@ selftest() {
   mutant baseline-settle baseline '        if [ "$d" -le 64 ]; then break; fi' '        if true; then break; fi'
   mutant baseline-bound baseline "die 75 \"the card \$uuid's used memory is still changing after" "{ break; } # the card \$uuid's used memory is still changing after"
   mutant baseline-no-reading baseline '[ -n "$cur" ] || die 69 "the card $uuid gives no used-memory reading' '[ -n "$cur" ] || true "the card $uuid gives no used-memory reading'
+  mutant baseline-unified baseline "    if [ \"\$raw\" = '[N/A]' ]; then" '    if false; then'
+  mutant baseline-unified-held baseline '  [ -n "$UNIFIED" ] || envv+=(BLOOMERY_CARD_HELD=1)' '  envv+=(BLOOMERY_CARD_HELD=1)'
   mutant card-look cardlook '      gprocs=$(quiet_gpu) || die 2 "nvidia-smi --query-compute-apps does not answer: whether the cards the cells time are idle cannot be read"' '      gprocs='
   mutant card-look-fails cardlook ' || die 2 "nvidia-smi --query-compute-apps does not answer: whether the cards the cells time are idle cannot be read"' ''
   mutant card-look-cards cardlook '    NF >= 4 && index(want, " " $4 " ") {' '    NF >= 4 {'
