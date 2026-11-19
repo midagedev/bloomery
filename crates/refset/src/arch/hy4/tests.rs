@@ -76,7 +76,10 @@ fn the_family_holds_the_dump_recipes_sets() {
         .collect();
     assert_eq!(twins, SETS, "each fixture set is the real set behind fx_");
     let names: Vec<&str> = crate::arch::families(ARCH).iter().map(|f| f.name).collect();
-    assert_eq!(names, ["lcpp-hy4", "fx-lcpp-hy4"]);
+    assert_eq!(
+        names,
+        ["lcpp-hy4", "fx-lcpp-hy4", "hy4-vis-preproc", "hy4-vis-taps"]
+    );
     assert_eq!(
         crate::arch::node_dumps(ARCH).map(|f| f.name),
         Some("lcpp-hy4")

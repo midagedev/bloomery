@@ -55,6 +55,7 @@ use bloomery_gpu::host::xstream::{
 use bloomery_gpu::host::{BatchLeg, HybridStats};
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::latent::{INDEX_HEAD, POOL};
+use bloomery_gpu::media::{CallRows, MediaBody, MediaSpan, check_spans};
 use bloomery_gpu::routed_block::{RouteIn, RoutedRows, RouterEntry};
 use bloomery_gpu::site::WideForms;
 use bloomery_gpu::weights::Weights;
@@ -954,7 +955,7 @@ impl<'a> LayerProgram for PassWalk<'a> {
 
 /// Walk `toks` (positions `pos0 ..`, at most the pass's rows) through the layers by the host
 /// tier's batch port, in units of the pass's rows a unit; the head runs after the last layer when
-/// `last`. Under host streaming the walk's end is the stream's ([`PromptStream::end_walk`](bloomery_gpu::host::prompt_stream::PromptStream::end_walk)).
+/// `last`. The positions `media` holds rows for stage those rows ([`stage`]). Under host streaming the walk's end is the stream's ([`PromptStream::end_walk`](bloomery_gpu::host::prompt_stream::PromptStream::end_walk)).
 fn walk_pass(
     gpu: &Gpu,
     w: &Weights,
@@ -962,6 +963,7 @@ fn walk_pass(
     head: &mut Head,
     (toks, pos0): (&[u32], u32),
     last: bool,
+    media: Option<&CallRows<'_>>,
 ) -> Result<(), GpuError> {
     let crate::body::Body {
         sh,
@@ -1007,7 +1009,7 @@ fn walk_pass(
     let units: Vec<(usize, usize)> = chunks(t, rows).map(|r| (r.start, r.len())).collect();
     let cols: Vec<usize> = units.iter().map(|&(_, m)| m).collect();
     let sh = *sh;
-    stage(host, prompt, gpu.stream(), &sh, (toks, pos0))?;
+    stage(host, prompt, gpu.stream(), &sh, (toks, pos0), media)?;
     let env = Env {
         gpu,
         w,
@@ -1080,51 +1082,107 @@ pub fn prompt_placed(
     ids: &[u32],
 ) -> Result<u32, GpuError> {
     const CALL: &str = "hy4::batch::prompt_placed";
-    if ids.is_empty() {
-        return Err(GpuError::shape(CALL, "a prompt of no id"));
-    }
-    let rows = model
-        .body(CALL)?
-        .pass_rows()
-        .ok_or_else(|| GpuError::shape(CALL, "a load made without the placed pass"))?;
-    let n = u32::try_from(ids.len()).map_err(|_| GpuError::shape(CALL, "ids past u32"))?;
-    let token = prompt_pass(model, |model| {
-        let start = model.pos();
-        let history = {
-            let (gpu, _, body) = model.body_parts(CALL)?;
-            body.stream_begin(gpu.stream(), ids.len(), start)?
-        };
-        let r = model.run_rows(ids.len(), CALL, |gpu, w, body, head, pos| {
-            if pos != body.held {
-                return Err(GpuError::shape(
-                    CALL,
-                    format!(
-                        "a call at position {pos}; the stores stand at {} (reset after a call that \
-                     failed part-way)",
-                        body.held
-                    ),
-                ));
-            }
-            // The cache rooms backed through the call's last position before any walk launches.
-            body.fit(pos as usize, ids.len())?;
-            // Anything past this point that fails leaves the engram history and the stores part-way.
-            body.held = u32::MAX;
-            let walks = ids.len().div_ceil(rows);
-            for (i, chunk) in ids.chunks(rows).enumerate() {
-                let at = pos + (i * rows) as u32;
-                walk_pass(gpu, w, body, head, (chunk, at), i + 1 == walks)?;
-            }
-            body.held = pos + n;
-            Ok(true)
-        });
-        let (gpu, _, body) = model.body_parts(CALL)?;
-        let ended = body.stream_end(gpu.stream(), r.is_ok() && !history);
-        let v = r?;
-        ended?;
-        Ok(v)
-    })?;
+    let token = prompt_pass(model, |model| placed_call(model, ids, None, CALL))?;
     token.ok_or_else(|| GpuError::shape(CALL, "a prompt pass that read no token"))
 }
+
+/// The call of [`prompt_placed`] inside the residency pass its caller opened: the walks of `ids`
+/// from the model's position, the positions `media` holds rows for staging those rows, and the
+/// call's host streaming around them. Refused by name: no ids, a load made without the pass, a
+/// position the stores do not stand at.
+fn placed_call(
+    model: &mut GpuModel<crate::body::Body>,
+    ids: &[u32],
+    media: Option<&CallRows<'_>>,
+    call: &'static str,
+) -> Result<Option<u32>, GpuError> {
+    if ids.is_empty() {
+        return Err(GpuError::shape(call, "a prompt of no id"));
+    }
+    let rows = model
+        .body(call)?
+        .pass_rows()
+        .ok_or_else(|| GpuError::shape(call, "a load made without the placed pass"))?;
+    let n = u32::try_from(ids.len()).map_err(|_| GpuError::shape(call, "ids past u32"))?;
+    let start = model.pos();
+    let history = {
+        let (gpu, _, body) = model.body_parts(call)?;
+        body.stream_begin(gpu.stream(), ids.len(), start)?
+    };
+    let r = model.run_rows(ids.len(), call, |gpu, w, body, head, pos| {
+        if pos != body.held {
+            return Err(GpuError::shape(
+                call,
+                format!(
+                    "a call at position {pos}; the stores stand at {} (reset after a call that \
+                 failed part-way)",
+                    body.held
+                ),
+            ));
+        }
+        // The cache rooms backed through the call's last position before any walk launches.
+        body.fit(pos as usize, ids.len())?;
+        // Anything past this point that fails leaves the engram history and the stores part-way.
+        body.held = u32::MAX;
+        let walks = ids.len().div_ceil(rows);
+        for (i, chunk) in ids.chunks(rows).enumerate() {
+            let at = pos + (i * rows) as u32;
+            walk_pass(gpu, w, body, head, (chunk, at), i + 1 == walks, media)?;
+        }
+        body.held = pos + n;
+        Ok(true)
+    });
+    let (gpu, _, body) = model.body_parts(call)?;
+    let ended = body.stream_end(gpu.stream(), r.is_ok() && !history);
+    let v = r?;
+    ended?;
+    Ok(v)
+}
+
+/// The media prompt of a placed load: the walks of [`prompt_placed`] with each span's rows staged
+/// at its positions in place of their ids' embeddings, inside the residency pass the session opens
+/// around a call (`app::Session::prompt_media`), so the call leaves what a text prompt of the same
+/// length does and the greedy token after the last id is the head's.
+impl MediaBody for crate::body::Body {
+    type Span<'a> = MediaSpan<'a>;
+
+    fn media_span<'s>(s: &'s MediaSpan<'_>) -> &'s MediaSpan<'s> {
+        s
+    }
+
+    /// A load made without the placed pass steps its prompt one id at a time and has no place
+    /// for a span's rows.
+    fn media_refusal(m: &GpuModel<Self>, spans: usize) -> Option<String> {
+        let stepped = m.body(MEDIA).is_ok_and(|b| b.pass_rows().is_none());
+        (spans > 0 && stepped).then(|| {
+            format!(
+                "{MEDIA}: a load made without the placed pass steps its prompt one id at a time; \
+                 a media prompt needs the pass's rows"
+            )
+        })
+    }
+
+    /// Refused by name before anything runs: a call of no id, a span the call does not hold
+    /// whole, spans out of order, a load without the pass ([`placed_call`]).
+    fn prefill_media(
+        m: &mut GpuModel<Self>,
+        ids: &[u32],
+        spans: &[MediaSpan<'_>],
+    ) -> Result<u32, GpuError> {
+        let n_embd = m.body(MEDIA)?.sh.hidden;
+        if ids.is_empty() {
+            return Err(GpuError::shape(MEDIA, "a media prompt of no ids"));
+        }
+        check_spans(MEDIA, spans, ids.len(), n_embd)?;
+        let rows = CallRows::new(m.pos(), n_embd, spans.iter().map(|s| (&s.at, s.rows)))
+            .map_err(|r| GpuError::shape(MEDIA, r.to_string()))?;
+        placed_call(m, ids, Some(&rows), MEDIA)?
+            .ok_or_else(|| GpuError::shape(MEDIA, "a media prompt pass that read no token"))
+    }
+}
+
+/// The media call's name in its refusals.
+const MEDIA: &str = "hy4::batch::prefill_media";
 
 impl crate::body::Body {
     /// The rows the load's placed pass holds; `None` on a load made without it.

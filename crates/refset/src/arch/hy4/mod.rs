@@ -20,6 +20,7 @@
 //! `result_output` (the last position's logits row).
 
 pub mod fixture;
+pub mod vis;
 
 #[cfg(test)]
 mod tests;
@@ -85,5 +86,6 @@ pub static LCPP: Family = Family {
     consumers: &[],
 };
 
-/// The architecture's families, in the order `refset-check` lists them: the real file's, then the fixture's.
-pub static FAMILIES: &[&Family] = &[&LCPP, &fixture::LCPP];
+/// The architecture's families, in the order `refset-check` lists them: the real file's, the fixture's, then the image input's
+/// ([`vis`]).
+pub static FAMILIES: &[&Family] = &[&LCPP, &fixture::LCPP, &vis::PREPROC, &vis::TAPS];

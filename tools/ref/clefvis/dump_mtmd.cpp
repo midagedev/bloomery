@@ -34,6 +34,11 @@
 //                   mtmd's); an image's rows are its nx * ny tokens and an `[IMG_BREAK]` row after each of its ny rows of tokens
 //                   but the last (n_tokens = nx * ny + ny - 1); the tower arm taps the last block's `layer_out` (`--taps final`
 //                   only: the ViT's output before the projector's norm, patches in raster order).
+//   hy_v4_flash     Hy4-flash's SigLIP tower (llama.cpp PR #32517): normal positions as glm5v (n_pos == n_tokens, the canvas read
+//                   from `inp_raw`), the image token `<｜hy_image▁pad:6124c78e｜>`, the plan of mtmd's dyn_size (align patch_size *
+//                   spatial_merge_size, direct Lanczos resize, no pad, the file's pixel bounds); an image's rows are its nx * ny
+//                   tokens and the newline row after each of its ny rows of tokens (n_tokens = (nx + 1) * ny); the tower arm taps
+//                   the last block's `layer_out` as the pixtral seat does (`--taps final` only).
 // A set of a Qwen seat is byte-identical to what this tool wrote before the glm5v seat existed.
 //
 //   dump_mtmd tower  --mmproj <gguf> -m <text gguf> --image <name>=<png> ... [--out-preproc <dir>] --out-taps <dir>
@@ -237,15 +242,24 @@ static const seat_t SEATS[] = {
     {"minicpmv4_7",    "<unk>",         true,  true},
     {"nemotron_omni",  "<image>",       false, false},
     {"pixtral",        "[IMG]",         false, false},
+    {"hy_v4_flash",    "<｜hy_image▁pad:6124c78e｜>", false, false},
 };
 static const seat_t * g_seat  = nullptr;
 static int            g_align = 32;
 
 static bool is_pixtral() { return g_seat && strcmp(g_seat->projector, "pixtral") == 0; }
+static bool is_hy4() { return g_seat && strcmp(g_seat->projector, "hy_v4_flash") == 0; }
+// The seats whose `--taps final` is the last block's `layer_out` alone.
+static bool taps_vit_out() { return is_pixtral() || is_hy4(); }
 
-// The rows mtmd hands the text model for a grid of nx x ny tokens: the tokens, and for the pixtral seat the `[IMG_BREAK]`
-// row after each of its rows but the last (clip_n_output_tokens: n_patches + n_patches_y - 1).
-static long grid_rows(long nx, long ny) { return is_pixtral() ? nx * ny + ny - 1 : nx * ny; }
+// The rows mtmd hands the text model for a grid of nx x ny tokens: the tokens, for the pixtral seat the `[IMG_BREAK]` row
+// after each of its rows but the last (clip_n_output_tokens: n_patches + n_patches_y - 1), and for the hy_v4_flash seat the
+// newline row after each of its rows ((ow + 1) * oh).
+static long grid_rows(long nx, long ny) {
+    if (is_pixtral()) return nx * ny + ny - 1;
+    if (is_hy4()) return (nx + 1) * ny;
+    return nx * ny;
+}
 
 static std::string gguf_str(const std::string & path, const std::string & key, bool required) {
     gguf_init_params gp = {true, nullptr};
@@ -584,7 +598,7 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
         if (taps_final) DIE("--taps final is the output-end taps of the Qwen and GLM seats; the %s seat taps its blocks: --taps full", g_seat->projector);
         wanted.push_back("inp_pos");
         for (int b : BOLT_TAP_BLOCKS) for (const char * n : BOLT_TAP_NODES) wanted.push_back(std::string(n) + "-" + std::to_string(b));
-    } else if (is_pixtral()) {
+    } else if (taps_vit_out()) {
         // the last block's `layer_out` (build_vit's cb, `-<block>`): the ViT's output before the projector's input norm
         if (!taps_final) DIE("--taps full is the Qwen seats' per-block taps; the %s seat taps its ViT's output: --taps final", g_seat->projector);
         wanted = {"layer_out-" + std::to_string(gguf_u32(mmproj, "clip.vision.block_count") - 1)};
@@ -673,7 +687,7 @@ static int run_tower(const std::string & mmproj, const std::string & text_model,
     header_common(tw, "taps", mmproj, arch, text_model, mmproj, cpu, threads, min_tokens, max_tokens, flags,
                   std::string("dump_mtmd tower — mtmd's ") + g_seat->projector + " graph nodes and final embeddings, raw f32, little-endian");
     if (taps_final) {
-        tw.line(is_pixtral()    ? "# taps\t" + wanted[0] + " (the last block's output, patches in raster order) of every image; embd (the clean pass)"
+        tw.line(taps_vit_out()  ? "# taps\t" + wanted[0] + " (the last block's output, patches in raster order) of every image; embd (the clean pass)"
                 : g_seat->mrope ? std::string("# taps\tnorm_b-27 (the post-LN output) of every image; embd (the clean pass)")
                                 : std::string("# taps\tvit_out after_fc_proj after_ffn_proj of every image; embd (the clean pass)"));
     } else {

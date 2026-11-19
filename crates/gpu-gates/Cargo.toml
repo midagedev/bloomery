@@ -857,6 +857,10 @@ name = "gate_pixtral_tower"
 required-features = ["vision"]
 
 [[bin]]
+name = "gate_hy4v_tower"
+required-features = ["vision"]
+
+[[bin]]
 name = "gate_minicpmv_tower"
 required-features = ["vision"]
 

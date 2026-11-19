@@ -4,7 +4,10 @@
 //! turn with its reasoning split at the model's tags, keeps each slot's rows apart, and reads a
 //! tool call in the template's own markup.
 //!
-//!     gate_hy4_serve --dir <dir>
+//!     gate_hy4_serve --dir <dir> [--mmproj <file>]
+//!
+//! `--mmproj` is the `hy_v4_flash` projector of the file's repo; without it the image clause is
+//! skipped by name.
 //!
 //! Every server is `bloomery-serve --model hy4 -m <file> …` beside this binary,
 //! `BLOOMERY_REF_MODEL` removed from its environment. Logs per server in `<dir>/<name>/`
@@ -52,6 +55,15 @@
 //!   counts) and answers [`N`] greedy ids, so a token's routed experts run on the host leg and the
 //!   card leg both and join (`bloomery_gpu_hy4::Placed`). FAIL-first: a placed load that refuses a
 //!   layer with host experts never listens, and the clause is red.
+//! - `image_request_is_served` (with `--mmproj`): a server of one slot at [`CTX`] with the
+//!   projector prints the `vision_seat` and `vision` records, and a chat request holding a
+//!   448 × 448 image answers 200 with completion tokens whose prompt counts at least the image's
+//!   [`IMAGE_ROWS`] rows (14 × 14 tokens and a newline row after each of the 14 grid rows). The
+//!   span's rows stand in place of the pad positions' embeddings in the placed pass. Both tiers
+//!   judge it: the fixture keeps the real file's width and vocabulary, so the real projector
+//!   seats against it, and the clause reads no id the model chose. FAIL-first: a pass that
+//!   stages one row fewer than the span holds, or a load without the pass, refuses the call by
+//!   name and the clause is red.
 
 #[cfg(all(feature = "deepseek41", feature = "hy4"))]
 fn main() -> std::process::ExitCode {
@@ -79,14 +91,15 @@ mod gate {
 
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
-        SeatGate, Served, chatted, check, file_template, greedy, scripted_call, server_log,
-        tokenized, tool_chat,
+        SeatGate, Served, base64, chatted, check, curl, file_template, greedy, scripted_call,
+        server_log, tokenized, tool_chat,
     };
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, ref_model_path};
     use gguf::Split;
     use model::arch::hy4::place::PlanInputs;
-    use serde_json::Value;
+    use serde_json::{Value, json};
+    use std::path::PathBuf;
 
     use crate::serve_gate;
 
@@ -108,6 +121,12 @@ mod gate {
     /// The tokens each slot clause's request answers, and the tool request's.
     const N: usize = 8;
     const TOOL_TOKENS: u64 = 192;
+
+    /// The checked-in 448 × 448 image of the image clause, from this crate's root, and the rows
+    /// its span holds: 14 × 14 tokens and a newline row after each of the 14 grid rows.
+    const IMAGE: &str = "../../tools/ref/clefvis/images/free-448x448.png";
+    const IMAGE_ROWS: u64 = 14 * 14 + 14;
+    const IMAGE_ASK: &str = "Describe this image in one short sentence.";
 
     /// The slot clause's two prompts, which share no first id.
     const P_TEXT: &str = "The capital of France is Paris, and the capital of Italy is";
@@ -210,6 +229,85 @@ mod gate {
         println!("host-share server stopped: {}", s.stop()?);
         check(&mut ok, "host_share_serves_a_turn", planned && served);
         Ok(ok)
+    }
+
+    /// `image_request_is_served` (the module header): a server with `mmproj`, one image request.
+    fn image_request_is_served(
+        c: &serve_gate::Clauses,
+        dir: &Path,
+        mmproj: &Path,
+    ) -> Result<bool, GateError> {
+        let mut ok = true;
+        let d = dir.join("image");
+        std::fs::create_dir_all(&d)?;
+        let file = ref_model_path()?;
+        let (cmd, mut all) = seat(c).command(&file)?;
+        let ctx = c.ctx.to_string();
+        let m = mmproj.to_str().ok_or("the --mmproj path is not UTF-8")?;
+        for a in ["--port", "0", "--ctx", &ctx, "--mmproj", m] {
+            all.push(a.to_owned());
+        }
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let mut s = Served::spawn_cmd(cmd, &all, &d)?;
+        let err_log = d.join("server.err");
+        let served = match s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
+            Ok(addr) => {
+                let url = format!("http://{addr}/v1/chat/completions");
+                let log = server_log(&err_log, c.kinds)?;
+                let records = log.first(&record::VISION)?.is_some()
+                    && log.first(&record::VISION_SEAT)?.is_some();
+                let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(IMAGE);
+                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let body = json!({
+                    "messages": [{ "role": "user", "content": [
+                        { "type": "image_url", "image_url": {
+                            "url": format!("data:image/png;base64,{}", base64(&bytes)) } },
+                        { "type": "text", "text": IMAGE_ASK },
+                    ] }],
+                    "temperature": 0, "max_tokens": N, "cache_prompt": false,
+                });
+                let (st, text) = curl(&url, Some(&body), false)?;
+                let reply: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                let prompt = reply["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+                let completion = reply["usage"]["completion_tokens"].as_u64().unwrap_or(0);
+                println!(
+                    "image chat: HTTP {st}, prompt tokens {prompt} (the image's span is \
+                     {IMAGE_ROWS}) in {:?} ms, {completion} completion tokens; vision and \
+                     vision_seat records {records}",
+                    reply["timings"]["prompt_ms"].as_f64()
+                );
+                if st != 200 {
+                    println!("image chat answer: {text}");
+                }
+                records && st == 200 && prompt >= IMAGE_ROWS && completion > 0
+            }
+            Err(e) => {
+                println!("image: the server never listened: {e}");
+                false
+            }
+        };
+        println!("image server stopped: {}", s.stop()?);
+        check(&mut ok, "image_request_is_served", served);
+        Ok(ok)
+    }
+
+    /// The gate's arguments: `--dir`, the logs' directory, and `--mmproj`, the projector of the
+    /// image clause.
+    fn args() -> Result<(PathBuf, Option<PathBuf>), GateError> {
+        const USAGE: &str = "usage: gate_hy4_serve --dir <dir> [--mmproj <file>]";
+        let (mut dir, mut mmproj) = (None, None);
+        let mut it = std::env::args().skip(1);
+        while let Some(flag) = it.next() {
+            let v = it
+                .next()
+                .ok_or_else(|| format!("{flag} needs a value: {USAGE}"))?;
+            match flag.as_str() {
+                "--dir" => dir = Some(PathBuf::from(v)),
+                "--mmproj" => mmproj = Some(PathBuf::from(v)),
+                other => return Err(format!("unknown argument {other:?}: {USAGE}").into()),
+            }
+        }
+        Ok((dir.ok_or(USAGE)?, mmproj))
     }
 
     fn seat(c: &serve_gate::Clauses) -> SeatGate {
@@ -343,6 +441,7 @@ mod gate {
     }
 
     pub fn run() -> Result<(), GateError> {
+        let (dir, mmproj) = args()?;
         let file = ref_model_path()?;
         let split = Split::open(&file).map_err(|e| format!("open {}: {e}", file.display()))?;
         let layers = u64::try_from(PlanInputs::describe(&split)?.model.layers)?;
@@ -363,7 +462,6 @@ mod gate {
             // the position the model stands at, or nothing (`app::arch::hy4`'s `Batch::cut`).
             cut: serve_gate::Cut::WhereItStands,
         };
-        let dir = serve_gate::dir_of(&c)?;
         std::fs::create_dir_all(&dir)?;
         let mut ok = serve_gate::plan_names_the_slots(&c, &dir)?;
         ok &= serve_gate::served_with(&c, &dir, serve_gate::Ask::THINK_SPAN)?;
@@ -374,6 +472,11 @@ mod gate {
         );
         ok &= two_slot_clauses(&c, &dir)?;
         ok &= host_share_serves_a_turn(&c, &dir)?;
+        if let Some(m) = &mmproj {
+            ok &= image_request_is_served(&c, &dir, m)?;
+        } else {
+            println!("image_request_is_served: skipped, no --mmproj");
+        }
         if !ok {
             return Err(bloomery_gpu_gates::checks_failed());
         }
@@ -381,7 +484,8 @@ mod gate {
             "PASSED: gate_hy4_serve the seat plans two resident slots, loads at the context it \
              was asked for, answers a chat turn with its reasoning split at the model's tags, \
              keeps the prefix by its cut's rule, keeps each slot's rows apart, answers a tools \
-             request, parses the template's call markup, and serves a turn with experts on the card and the host"
+             request, parses the template's call markup, serves a turn with experts on the card and the host, \
+             and answers an image request under --mmproj"
         );
         Ok(())
     }

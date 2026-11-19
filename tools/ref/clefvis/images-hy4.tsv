@@ -1,0 +1,12 @@
+# name	w	h	branch of mtmd hy_v4_flash preprocessing (align 32, 4096..4194304 pixels = 4..4096 tokens, a direct Lanczos resize, no pad); the file is images/<name>.png
+# The hy_v4_flash seat's tower arm follows this file. The sizes, grids and rows ((nx + 1) * ny: the tokens and a newline row after each row of them) below are derived from the preprocess source (calc_size_preserved_ratio); the set's own `# image` lines are the measured ones.
+free-448x448	448	448	a multiple of 32 in the budget: 14x14 = 196 tokens, 210 rows, no resize (the image the tower gate's op rules run on)
+free-640x480	640	480	a multiple of 32: 20x15 = 300 tokens, 315 rows, no resize
+free-1024x768	1024	768	a multiple of 32: 32x24 = 768 tokens, 792 rows, no resize
+min-96x64	96	64	a multiple of 32 above min_pixels: 3x2 = 6 tokens, 8 rows, no resize
+small-200x200	200	200	rounds to 192x192: 6x6 = 36 tokens, 42 rows, scaled down
+pad-1000x700	1000	700	rounds to 992x704: 31x22 = 682 tokens, 704 rows, resized
+pad-777x513	777	513	rounds to 768x512: 24x16 = 384 tokens, 400 rows, resized
+max-2600x1800	2600	1800	above max_pixels: scaled down to 2432x1696, 76x53 = 4028 tokens, 4081 rows (the largest image of the set)
+cap-3000x2200	3000	2200	above max_pixels: scaled down to 2368x1728, 74x54 = 3996 tokens, 4050 rows
+strip-1000x1	1000	1	one row of tokens: 992x32, 31x1 = 31 tokens, 32 rows (the extreme aspect)

@@ -22,6 +22,10 @@
 //! * `pixtral` — Mistral Large 4's Pixtral ViT (30 blocks of heads of 128, RMS norm, a SiLU-gated
 //!   MLP, no bias, 2D RoPE of adjacent pairs, no position table) with a 2×2 patch merger, a GELU
 //!   MLP to the text model's width and the `[IMG_BREAK]` row between grid rows ([`pixtral`]).
+//! * `hy_v4_flash` — Hy4-flash's SigLIP ViT (27 blocks of heads of 72, LayerNorm with bias, a
+//!   GELU-tanh MLP, no RoPE, learned 128×128 positions resampled by HunyuanVL's rule) with an RMS
+//!   norm, a 2×2 strided convolution, an erf GELU, a 1×1 convolution to the text model's width
+//!   and the newline row after every grid row ([`hy4v`]).
 //!
 //! [`open`] reads the file's projector type and loads the tower; [`Tower`] is what a seat holds.
 //!
@@ -55,10 +59,11 @@
 //! * [`gelu_tanh`] — the GELU of the Qwen3-VL tower (tanh) and the `glm5v` merger (erf), in place.
 //! * [`pos_bilinear`] — the Qwen3-VL tower's learned position rows resized to the image's grid.
 //! * [`pos_half`] — the RADIO tower's, resized with half-pixel centers (`vis_pos_half`).
+//! * [`pos_hunyuan`] — the HunyuanVL rule's, the `hy_v4_flash` tower's (`vis_pos_hunyuan`).
 //! * [`relu_sq`] — ReLU squared in place, the RADIO projector's activation.
 //! * [`aligner`] — the 3×3 unfold of V4.1's ViT grid into the aligner's input rows.
 //! * [`chain`] — what both chains share: weight reading, taps, the rows an encode returns.
-//! * [`encoder`], [`qwen3vl`], [`glm5v`], [`minicpmv`], [`radio`], [`pixtral`] — each tower's
+//! * [`encoder`], [`qwen3vl`], [`glm5v`], [`minicpmv`], [`radio`], [`pixtral`], [`hy4v`] — each tower's
 //!   weights on the card and whole chain.
 //!
 //! Like `bloomery-gpu`, this crate is built with `cargo oxide` only.
@@ -75,6 +80,8 @@ pub mod gemm_bf16;
 #[path = "arch/gemma4v.rs"]
 pub mod gemma4v;
 pub mod glm5v;
+#[path = "arch/hy4v.rs"]
+pub mod hy4v;
 pub mod layer_norm;
 pub mod mean_groups;
 pub mod minicpmv;
@@ -85,6 +92,7 @@ pub mod pixtral;
 pub(crate) mod pointwise;
 pub mod pos_bilinear;
 pub mod pos_half;
+pub mod pos_hunyuan;
 pub mod qwen3vl;
 pub mod radio;
 pub mod relu_sq;
@@ -113,8 +121,8 @@ use std::sync::Arc;
 use vision::Patches;
 use vision::arch::qwen3vl::TokenLimits;
 use vision::arch::{
-    deepseek41v, glm5v as glm5v_host, minicpmv as minicpmv_host, pixtral as pixtral_host,
-    qwen3vl as qwen3vl_host, radio as radio_host,
+    deepseek41v, glm5v as glm5v_host, hy4v as hy4v_host, minicpmv as minicpmv_host,
+    pixtral as pixtral_host, qwen3vl as qwen3vl_host, radio as radio_host,
 };
 
 /// One media tower on the card, whichever projector type its file declares. A call takes
@@ -206,17 +214,21 @@ pub fn open(
         Some(pixtral_host::PROJECTOR_TYPE) => {
             Ok(Box::new(pixtral::Encoder::load(ctx, stream, file, limits)?))
         }
+        Some(hy4v_host::PROJECTOR_TYPE) => {
+            Ok(Box::new(hy4v::Encoder::load(ctx, stream, file, limits)?))
+        }
         other => Err(GpuError::Shape {
             what: "gpu_vision::open",
             detail: format!(
-                "clip.projector_type is {other:?}; this build has a tower for \"{}\", \"{}\", \"{}\", \"{}\", \"{}\", \"{}\" and \"{}\"",
+                "clip.projector_type is {other:?}; this build has a tower for \"{}\", \"{}\", \"{}\", \"{}\", \"{}\", \"{}\", \"{}\" and \"{}\"",
                 vision::arch::gemma4v::PROJECTOR_TYPE,
                 deepseek41v::PROJECTOR_TYPE,
                 glm5v_host::PROJECTOR_TYPE,
                 qwen3vl_host::PROJECTOR_TYPE,
                 minicpmv_host::PROJECTOR_TYPE,
                 radio_host::PROJECTOR_TYPE,
-                pixtral_host::PROJECTOR_TYPE
+                pixtral_host::PROJECTOR_TYPE,
+                hy4v_host::PROJECTOR_TYPE
             ),
         }),
     }

@@ -3,9 +3,9 @@
 # The seat the image-input oracle runs for: what clefvis.sh and build-clefvis.sh need that is a property of the seat, not of
 # the machine. Sourced after tools/ref/ref-paths.sh, which has picked the model profile (BLOOMERY_MODEL); never executed,
 # and it exports nothing. A seat is a family of the Qwen3-VL tower (mtmd `qwen3vl_merger`) and its text model, of the GLM
-# tower (`glm5v`) and its, of the MiniCPM-V 4.7 tower (`minicpmv4_7`) and its, of the RADIO tower (`nemotron_omni`) or the
-# Pixtral tower (`pixtral`) and the vocabulary of its text model, or EmbeddingGemma 2 (`gemma4v` and the encoder), which has a
-# dumper of its own:
+# tower (`glm5v`) and its, of the MiniCPM-V 4.7 tower (`minicpmv4_7`) and its, of the RADIO tower (`nemotron_omni`), the
+# Pixtral tower (`pixtral`) or the Hy4-flash tower (`hy_v4_flash`) and the vocabulary of its text model, or EmbeddingGemma 2
+# (`gemma4v` and the encoder), which has a dumper of its own:
 #
 #   qwen35     Clef-Flash         sets ref_clefvis_*             mainline 53ed051ce (the model profile's LCPP)
 #   qwen35moe  Qwen3.6-35B-A3B    sets ref_qwen35moe_vis_*       mainline 36a73916e (QVIS_LCPP)
@@ -18,6 +18,8 @@
 #                                 the tower arm only (preproc and taps)
 #   mistral-large4  Mistral Large 4  sets ref_mistrallarge4_vis_*  mainline 78feec062 (the model profile's LCPP), a CPU build: the sets
 #                                 are the CPU run, the tower arm only (preproc and taps, the output end)
+#   hy_v4_flash  Hy4-flash        sets ref_hy4_vis_*             PR #32517's head 0a054d0b0 (the model profile's LCPP), a CPU build: the
+#                                 sets are the CPU run, the tower arm only (preproc and taps, the output end)
 #
 # The row is picked by BLOOMERY_MODEL, the model profile's name: MiniCPM-V 4.7's text profile (models/minicpmv47.sh) is a
 # qwen35moe file and says MODEL_NAME=qwen35moe, which is Qwen3.6's row. The Qwen seats and the GLM seat share the mainline tree
@@ -172,8 +174,22 @@ case ${BLOOMERY_MODEL:-} in
     IMAGES_LIST=${ML4VIS_IMAGES:-tools/ref/clefvis/images-ml4.tsv}
     THREADS=${ML4VIS_THREADS:-16}
     ;;
+  hy_v4_flash)
+    # The SigLIP tower of Hy4-flash's mmproj (mtmd's `hy_v4_flash`: patch 16, merge 2, align 32, an image 4,096 to 4,194,304
+    # pixels, normal positions, the image token `<｜hy_image▁pad:6124c78e｜>`, id 120120, a newline row after each row of tokens).
+    # The text model is read for its vocabulary only (the tower arm), so the 168 GB split set is not loaded; the oracle tree is a
+    # CPU build, so the sets are the CPU run (CPU_ONLY) and the tower arm taps the output end (TAPS=final: the last block's
+    # `layer_out` and `embd`). The sets: preproc and taps; the prompt arms wait for the seat's placed load.
+    FAMILY=qvis CPU_ONLY=1 TAPS=final PREPROC=1 ARMS="" SEAT=hy_v4_flash SETPFX=ref_hy4_vis ORACLE=$LCPP BIN=$BINDIR/dump_mtmd_hy4
+    IMAGE_PAD_ID=120120 STAGE_NAME=hy_v4_flash REF=${HY4VIS_REF:-$DATA/qvis/hy_v4_flash}
+    MMPROJ=/models/mmproj/AngelSlim--Hy4-flash-GGUF/mmproj-Hy4-flash-bf16.gguf
+    MMPROJ_SHA256=8c33a48ef57480abf4854126964058a2015b5da3b773b14c847c995cf8899bda
+    TEXT=$MODEL
+    IMAGES_LIST=${HY4VIS_IMAGES:-tools/ref/clefvis/images-hy4.tsv}
+    THREADS=${HY4VIS_THREADS:-16}
+    ;;
   *)
-    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next, minicpmv47, nemotron_h_moe, mistral-large4 or gemma-embedding2)" >&2
+    echo "profile.sh: no image-input seat for BLOOMERY_MODEL='${BLOOMERY_MODEL:-}' (qwen35, qwen35moe, qwen4exp, glm5next, minicpmv47, nemotron_h_moe, mistral-large4, hy_v4_flash or gemma-embedding2)" >&2
     exit 2
     ;;
 esac

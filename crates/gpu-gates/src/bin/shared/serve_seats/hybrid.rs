@@ -34,6 +34,7 @@ use bloomery_gpu_gates::bind::{Seat, note_line};
 use bloomery_gpu_gates::generate::{Lane, Place, TierRule};
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
+use bloomery_gpu_gates::vision_seat::{self, PleImage, TextFacts};
 use bloomery_levers::{DraftWord, HostCfg, Levers, ResidencyPick};
 use gguf::Split;
 use model::arch::Arch;
@@ -46,6 +47,11 @@ use runtime::prompt::CallEnd;
 use runtime::width::Mode as WidthMode;
 use serve::reasoning::ThinkTags;
 use serve::{CacheNote, DraftProps, Drafted, EngineProps, Saved, ServeError};
+#[cfg(feature = "vision")]
+use {
+    bloomery_gpu::media::{MediaBody, MediaSpan},
+    serve::media::{MediaFeed, SharedMediaModel},
+};
 
 use super::hybrid_draft::SeatDraft;
 use super::tiered::{self, BuildMachine, Open, PassAttempt, PassPlan, Tiered, Walk};
@@ -235,6 +241,58 @@ pub trait Family: Sized + 'static {
             None => Err(format!("the {} description names no reasoning tags", Self::FAMILY).into()),
         }
     }
+
+    /// The projector types the family's text model runs (`clip.projector_type`): a family that
+    /// names one takes `--mmproj` ([`Tiered::vision`]); none (the default) takes no image.
+    const PROJECTORS: &'static [&'static str] = &[];
+
+    /// What the projector is held against ([`Tiered::text_facts`]): the text model's width, and,
+    /// by default, ordinary positions and no per-layer image input. A family whose rope or input
+    /// the projector must agree with says so.
+    fn text_facts(inputs: &PlanInputs<Self::H>) -> Result<TextFacts, GateError> {
+        Ok(TextFacts {
+            n_embd: inputs.spec.hidden as usize,
+            imrope: None,
+            ple: PleImage::Absent,
+        })
+    }
+
+    /// One media prompt call of `ids` with `feeds`' images encoded on the resident encoder `v`;
+    /// a family that names [`Family::PROJECTORS`] answers [`media_prompt`] over its body. The
+    /// default refuses by name.
+    #[cfg(feature = "vision")]
+    fn prompt_media(
+        _s: &mut Session<Self::Body>,
+        _v: &mut vision_seat::Resident,
+        _ids: &[u32],
+        _feeds: &[MediaFeed],
+    ) -> Result<u32, GateError> {
+        Err(format!("the {} seat takes no image", Self::FAMILY).into())
+    }
+}
+
+/// A hybrid family's media prompt call ([`Family::prompt_media`]): each feed's image encoded on the
+/// resident encoder and read back as bf16, one row a position of its span, the rows the tower writes
+/// between its grid rows included ([`vision_seat::Resident::encode_whole`]), then one prompt call
+/// with the rows in place of their positions' embeddings ([`vision_seat::Encoded::prompt`]). The
+/// encode binds the model's card back before the prompt call.
+#[cfg(feature = "vision")]
+pub fn media_prompt<B>(
+    s: &mut Session<B>,
+    v: &mut vision_seat::Resident,
+    ids: &[u32],
+    feeds: &[MediaFeed],
+) -> Result<u32, GateError>
+where
+    B: Batch + for<'a> MediaBody<Span<'a> = MediaSpan<'a>>,
+{
+    let encoded = v.encode_whole(
+        s.model().gpu().context(),
+        feeds
+            .iter()
+            .map(|f| vision_seat::Image::of(f.at, &f.prepared)),
+    )?;
+    encoded.prompt::<B, _>(s, ids, |rows| rows.media_spans())
 }
 
 /// `--prefill`: how a family with a prompt pass runs a prompt.
@@ -246,11 +304,13 @@ enum Prefill {
     Steps,
 }
 
-/// The hybrid seat's own flags and what its plan hands the open: `--prefill` as given, and the
-/// pass the plan holds with its open ([`Family::pass`]).
+/// The hybrid seat's own flags and what its plan hands the open: `--prefill` as given, the pass
+/// the plan holds with its open ([`Family::pass`]), and the image input's flags for a family that
+/// takes images ([`Family::PROJECTORS`]).
 pub struct Flags<F: Family> {
     prefill: Option<Prefill>,
     pass: Option<(PlanInputs<F::H>, PassOpen<F>)>,
+    vision: vision_seat::Flags,
 }
 
 impl<F: Family> Default for Flags<F> {
@@ -258,6 +318,7 @@ impl<F: Family> Default for Flags<F> {
         Flags {
             prefill: None,
             pass: None,
+            vision: vision_seat::Flags::default(),
         }
     }
 }
@@ -274,6 +335,9 @@ pub struct Hybrid<F: Family> {
     /// The `tier census` records' span start ([`record::host_tier::CensusSpan`]): each
     /// prompt prints the steps since the last one's, then its own.
     census: record::host_tier::CensusSpan,
+    /// The resident image encoder under `--mmproj`.
+    #[cfg(feature = "vision")]
+    vision: Option<vision_seat::Resident>,
 }
 
 /// The open's records: the plan's expert counts are kept until the step is
@@ -462,12 +526,25 @@ fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError
     };
     let mut census = record::host_tier::CensusSpan::default();
     census.mark("load", record::census_of(s.model().body(F::NAME)?.hybrid()));
+    // The encoder after the model's captures: its tower loads on the card the plan seated.
+    #[cfg(feature = "vision")]
+    let vision = vision_seat::open_resident(s.model().gpu().context(), a.vision.take())?;
+    #[cfg(not(feature = "vision"))]
+    if a.vision.is_some() {
+        return Err(format!(
+            "--mmproj: the {} seat is built without image input",
+            F::FAMILY
+        )
+        .into());
+    }
     Ok(Hybrid {
         s,
         ctx: a.ctx,
         drafted,
         path: a.path,
         census,
+        #[cfg(feature = "vision")]
+        vision,
     })
 }
 
@@ -548,6 +625,42 @@ impl<F: Family> Seat for Hybrid<F> {
             Some(d) => d.prompt_call(&mut self.s, ids, CallEnd::Argmax)?,
             None => <F::Body as Prompt>::prompt(self.s.model_mut(), ids)?,
         };
+        self.s
+            .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
+        self.census
+            .prompt(Some(self.s.model().body(F::NAME)?.hybrid()));
+        self.print_host_yields()?;
+        Ok(next)
+    }
+
+    /// The resident encoder's media description ([`vision_seat::Resident::media`]); `None`
+    /// without `--mmproj`, a seat that takes no image.
+    #[cfg(feature = "vision")]
+    fn media_model(&self) -> Option<SharedMediaModel> {
+        self.vision.as_ref().map(vision_seat::Resident::media)
+    }
+
+    /// The family's media prompt call ([`Family::prompt_media`]) with the records and the card
+    /// check of [`Seat::prefill`]. Refused by name: no `--mmproj`, and the in-file draft, whose
+    /// window has no media call.
+    #[cfg(feature = "vision")]
+    fn prefill_media(&mut self, ids: &[u32], feeds: &[MediaFeed]) -> Result<u32, GateError> {
+        if feeds.is_empty() {
+            return self.prefill(ids);
+        }
+        let Some(v) = self.vision.as_mut() else {
+            return Err("no --mmproj: this seat serves no image".into());
+        };
+        if self.drafted.is_some() {
+            return Err(format!(
+                "an image prompt under BLOOMERY_DRAFT=mtp: the {} seat's draft has no media call",
+                F::FAMILY
+            )
+            .into());
+        }
+        self.census
+            .steps(Some(self.s.model().body(F::NAME)?.hybrid()));
+        let next = F::prompt_media(&mut self.s, v, ids, feeds)?;
         self.s
             .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         self.census
@@ -760,7 +873,12 @@ impl<F: Family> Tiered for Hybrid<F> {
     /// flag on a family with none, refused by name.
     fn flags(flag: &str, value: &str, out: &mut Flags<F>) -> Result<bool, GateError> {
         if flag != "--prefill" {
-            return Ok(false);
+            // The image flags are llama-server's, each with a value: the shared parser hands a
+            // flag its next argument, so `--no-mmproj` (valueless) is an unknown argument here.
+            if F::PROJECTORS.is_empty() {
+                return Ok(false);
+            }
+            return out.vision.take(flag, &mut std::iter::once(value));
         }
         if !F::PASS {
             return Err(format!("--prefill: the {} body has no prompt pass", F::FAMILY).into());
@@ -805,6 +923,17 @@ impl<F: Family> Tiered for Hybrid<F> {
 
     fn think(inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
         F::think_tags(inputs)
+    }
+
+    const PROJECTORS: &'static [&'static str] = F::PROJECTORS;
+
+    /// The image flags of a family that takes images ([`Family::PROJECTORS`]); `None` otherwise.
+    fn vision(flags: &Flags<F>) -> Option<&vision_seat::Flags> {
+        (!F::PROJECTORS.is_empty()).then_some(&flags.vision)
+    }
+
+    fn text_facts(inputs: &PlanInputs<Self::H>) -> Result<TextFacts, GateError> {
+        F::text_facts(inputs)
     }
 
     fn ring(levers: &Levers, place: Place) -> bool {

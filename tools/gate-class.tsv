@@ -175,6 +175,7 @@ gate-gpu-p8	family	deepseek2	e2e	graph_fault+moe_route+weights_load
 gate-gpu-p8b	family	deepseek2	e2e	graph_fault+moe_route+weights_load
 gate-gpu-p9	common		kernel	moe_route
 gate-gpu-pixtral-tower	family	mistral-large4	media	serve_media
+gate-gpu-hy4v-tower	family	hy_v4_flash	media	serve_media
 gate-gpu-ple	common		kernel	ple_embed
 gate-gpu-q4k-sel	common		kernel	quant_q4k
 gate-gpu-q6k-ids	common		kernel	quant_q6k

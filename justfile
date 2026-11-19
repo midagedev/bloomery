@@ -4974,10 +4974,45 @@ gate-gpu-hy4-dsa:
 # shared prefix re-feeds from an empty model: the window rings and the engram history take no position back); a server of two slots loads
 # both, keeps each slot's rows apart (a continuation back on its slot after the other slot ran answers the truth's ids, cached and uncached)
 # and answers a request that carries `tools` (the real file's call clause is FileBound); a server at a card budget of the plan's floor plus half
-# the experts' bytes loads experts on the card and the host and answers greedy ids over both legs. Fixture-only (tools/ref/fixture-only.sh):
-# the real file's serve is the milestone's hand check. [predicted wall: four fixture loads and the max-ctx arm's, every prompt stepped;
-# under 10 min after a warm build]
+# the experts' bytes loads experts on the card and the host and answers greedy ids over both legs; with the Hy4 projector on /models
+# (`--mmproj`, skipped by name without it) a server of one slot answers a chat request holding an image (the fixture keeps the real
+# file's width and vocabulary, so the real projector seats against it). Fixture-only (tools/ref/fixture-only.sh): the real file's serve
+# is the milestone's hand check. [predicted wall: five fixture loads (the image server's beside the 1 GB projector, its prompt one
+# placed pass) and the max-ctx arm's; under 10 min after a warm build]
 gate-gpu-hy4-serve:
-    BLOOMERY_MODEL=hy_v4_flash ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-hy4-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_hy4_serve && D=target/hy4-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_hy4_serve --dir $D'
+    BLOOMERY_MODEL=hy_v4_flash ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-hy4-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_hy4_serve && D=target/hy4-serve-gate && rm -rf $D && mkdir -p $D && M=/models/mmproj/AngelSlim--Hy4-flash-GGUF/mmproj-Hy4-flash-bf16.gguf && if test -f $M; then P="--mmproj $M"; else P=""; fi && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_hy4_serve --dir $D $P'
 
 # --- end hy4serve ---
+# --- hy4vis (Hy4-flash's image tower) ---
+# Hy4-flash image input, the oracle's binary: dump_mtmd (the tower arm) linked against PR #32517's head 0a054d0b0 in /home/user/llama.cpp-hy4
+# (the model profile's LCPP, a CPU build with libmtmd and libllama-common; tools/ref/clefvis/build-clefvis.sh, the hy_v4_flash row of
+# tools/ref/clefvis/profile.sh) into $BLOOMERY_DATA/bin/dump_mtmd_hy4; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another
+# directory for a test. One compile, no card.
+build-hy4vis-ref:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=90 BLOOMERY_MODEL=hy_v4_flash ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
+
+# Hy4-flash image input (mtmd `hy_v4_flash`), the oracle sets (tools/ref/clefvis/clefvis.sh, the hy_v4_flash seat of profile.sh, images
+# tools/ref/clefvis/images-hy4.tsv; refset families in crates/refset/src/arch/hy4/vis.rs): the preprocess (ref_hy4_vis_preproc) and the
+# tower's output end, the last block's `layer_out` and `embd` (ref_hy4_vis_taps), into $BLOOMERY_DATA. The oracle tree has no CUDA backend,
+# so a set is the CPU run (`--cpu`, the default of this recipe): no card lock, no twin, no lease; the 168 GB text file is read for its
+# vocabulary only. [predicted wall, derived: the two images near the 4,096-token limit are ~46 TFLOP of ViT each (27 blocks over ~16,000
+# patches, attention two thirds of it), a tapped and a clean pass; under 10 min on 16 threads]
+dump-ref-hy4vis *ARGS:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=600 BLOOMERY_MODEL=hy_v4_flash ./tools/box.sh "bash tools/ref/clefvis/clefvis.sh --cpu {{ARGS}}"
+
+# The Hy4-flash image tower on the card (the `hy_v4_flash` mmproj: 27 SigLIP blocks of heads of 72, layer norm, a tanh-GELU MLP with
+# biases, a learned 128x128 position table resampled to the grid by HunyuanVL's bilinear rule, an RMS norm, a 2x2 stride-2 convolution
+# with an erf GELU, a 1x1 convolution to the text width and a newline row after every grid row) against the Hy4 vision seat's sets
+# (ref_hy4_vis_preproc and ref_hy4_vis_taps: PR #32517's mtmd, the last block's `layer_out` and `embd` of ten images; the oracle is a CPU
+# build, so there is no card run and no CPU twin). The host preprocess (the Lanczos resize) is held to set A bit for bit; the ViT's output
+# and the rows are held to K times the larger of the reference's rounding floor and the network's sensitivity to 1-ulp input noise, the
+# adapter teacher-forced on the reference's ViT output, and the newline rows bit for bit. The position rows, block 0 and the adapter are
+# held to their host rules op by op on one image (the position rows, norms and epilogues bit for bit, GEMMs inside the accumulation-order
+# bound against the file's own matrices, the strided convolution in im2col's order, attention inside its f32 bound, the tanh GELU against
+# its rule and the erf GELU inside its bound). Also the card bytes (weights 940,039,680 B, scratch 608,174,080 B at 4,096 tokens), 223
+# launches an image, and reuse after the largest image bit for bit. Real file only; the gate lock. [predicted wall: a 1 GB load and ten
+# images six encodes each; under 3 min after a warm build]
+gate-gpu-hy4v-tower:
+    ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-hy4v-tower && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_hy4v_tower && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_hy4v_tower'
+
+# --- end hy4vis ---

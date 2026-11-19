@@ -9,6 +9,7 @@
 //!                    [--chat-template-file PATH] [--place W] [--plan]
 //!                    [--queue-depth Q] [--slot-save-path DIR]
 //!                    [--api-key KEY] [--api-key-file FNAME]
+//!                    [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]]
 //!
 //! What this file holds is what Hy4-flash's architecture forces. A window layer's ring and the
 //! engram history hold the position they stand at alone, so a request shares a prefix with its
@@ -38,6 +39,14 @@
 //! the template's suffix in every tag (`serve::glmxml::KvSpelling::Hy4`, which the server picks
 //! from the template), and its description names the think span (`hy4::spec::REASONING`),
 //! so the server splits the span into `reasoning_content`.
+//!
+//! `--mmproj FILE` gives the seat image input (behind the `vision` feature): the `hy_v4_flash`
+//! tower (`vision::arch::hy4v`), held against the text model's width and vocabulary and seated
+//! where the placement leaves room by the common owner (`vision_seat::open_seat`). An image's
+//! rows, a newline row after each grid row the tower's own, stand in place of the embeddings of
+//! its pad positions between the start and end marks, at the sequence's ordinary positions; the
+//! prompt runs through the placed pass ([`super::hybrid::media_prompt`], `Body::prefill_media`),
+//! and a load without the pass refuses an image by name.
 //!
 //! The seat itself is the common owner's ([`super::hybrid`]); its records are the common hybrid
 //! seat's (`record::BLOOMERY_SERVE_HYBRID`).
@@ -210,6 +219,21 @@ impl Family for Hy4 {
 
     fn load_record() -> record::Record {
         record::Record::new(&record::LOAD_HYBRID)
+    }
+
+    #[cfg(feature = "vision")]
+    const PROJECTORS: &'static [&'static str] = &[vision::arch::hy4v::PROJECTOR_TYPE];
+
+    /// The image rows at their pad positions through the placed pass
+    /// ([`super::hybrid::media_prompt`]).
+    #[cfg(feature = "vision")]
+    fn prompt_media(
+        s: &mut app::Session<bloomery_gpu_hy4::Body>,
+        v: &mut bloomery_gpu_gates::vision_seat::Resident,
+        ids: &[u32],
+        feeds: &[serve::media::MediaFeed],
+    ) -> Result<u32, GateError> {
+        super::hybrid::media_prompt(s, v, ids, feeds)
     }
 }
 

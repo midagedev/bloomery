@@ -1,4 +1,5 @@
-//! Pillow's bicubic resize and `ImageOps.pad`, ported so that the bytes are Pillow's bytes.
+//! Pillow's bicubic and Lanczos resizes and `ImageOps.pad`, ported so that the bytes are Pillow's
+//! bytes.
 //!
 //! The reference pads every image with `ImageOps.pad(image, (best_w, best_h), color=(127, 127, 127))`,
 //! which is `ImageOps.contain` (an aspect-preserving `Image.resize` with the default bicubic
@@ -9,7 +10,9 @@
 //! runs first and its u8 output is what the vertical pass reads. This module is that code in Rust,
 //! operation for operation — same f64 expressions in the same order, the same truncating casts and
 //! the same clip — so for the version the oracle ran it produces the same bytes, which is what the
-//! preprocessing gate checks.
+//! preprocessing gate checks. mtmd's own resize (`img_tool::resize_pillow`) is the same code with
+//! the same filters, so a projector whose mtmd rule resizes directly reads these bytes too: the
+//! two filters differ only in their support and weight function ([`Filter`]).
 //!
 //! The Python side's rounding is Python's: `round()` of a float is round-half-to-even.
 //!
@@ -42,6 +45,50 @@ fn bicubic(x: f64) -> f64 {
     0.0
 }
 
+/// Lanczos support radius in input pixels at scale 1 (`LANCZOS = {lanczos_filter, 3.0}`).
+const LANCZOS_SUPPORT: f64 = 3.0;
+
+/// `sinc_filter`: `sin(πx) / (πx)`, and 1 at 0.
+fn sinc(x: f64) -> f64 {
+    if x == 0.0 {
+        return 1.0;
+    }
+    let x = x * std::f64::consts::PI;
+    x.sin() / x
+}
+
+/// `lanczos_filter`: `sinc(x) · sinc(x / 3)` on `[-3, 3)` and 0 outside, on the signed distance.
+fn lanczos(x: f64) -> f64 {
+    if (-LANCZOS_SUPPORT..LANCZOS_SUPPORT).contains(&x) {
+        sinc(x) * sinc(x / 3.0)
+    } else {
+        0.0
+    }
+}
+
+/// The resampling filter of a resize: its support at scale 1 and its weight of a distance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Filter {
+    Bicubic,
+    Lanczos,
+}
+
+impl Filter {
+    fn support(self) -> f64 {
+        match self {
+            Filter::Bicubic => BICUBIC_SUPPORT,
+            Filter::Lanczos => LANCZOS_SUPPORT,
+        }
+    }
+
+    fn weight(self, x: f64) -> f64 {
+        match self {
+            Filter::Bicubic => bicubic(x),
+            Filter::Lanczos => lanczos(x),
+        }
+    }
+}
+
 /// One axis of a resize: for each output index the first input index, the tap count, and the taps
 /// as fixed-point weights, `ksize` slots per output index (`precompute_coeffs` followed by
 /// `normalize_coeffs_8bpc`).
@@ -53,13 +100,13 @@ struct Axis {
 }
 
 impl Axis {
-    /// `precompute_coeffs(in_size, in0, in1, out_size, &BICUBIC)` and the 8-bit normalization; the
+    /// `precompute_coeffs(in_size, in0, in1, out_size, &filter)` and the 8-bit normalization; the
     /// box is always the whole input (`in0 = 0`, `in1 = in_size`, both C floats).
-    fn bicubic(in_size: usize, out_size: usize) -> Axis {
+    fn of(filter: Filter, in_size: usize, out_size: usize) -> Axis {
         let (in0, in1) = (0.0f32, in_size as f32);
         let scale = f64::from(in1 - in0) / out_size as f64;
         let filterscale = if scale < 1.0 { 1.0 } else { scale };
-        let support = BICUBIC_SUPPORT * filterscale;
+        let support = filter.support() * filterscale;
         let ksize = support.ceil() as usize * 2 + 1;
         let mut bounds = Vec::with_capacity(out_size);
         let mut pre = vec![0.0f64; out_size * ksize];
@@ -73,7 +120,7 @@ impl Axis {
             let k = &mut pre[xx * ksize..xx * ksize + taps];
             let mut ww = 0.0f64;
             for (x, slot) in k.iter_mut().enumerate() {
-                let w = bicubic(((x + xmin) as f64 - center + 0.5) * ss);
+                let w = filter.weight(((x + xmin) as f64 - center + 0.5) * ss);
                 *slot = w;
                 ww += w;
             }
@@ -154,6 +201,18 @@ fn zeroed(width: usize, height: usize) -> Result<Rgb8, VisionError> {
 /// ([`Rgb8::check`]), a size whose byte count overflows ([`frame_bytes`]), and an image with no
 /// pixels resized to a size with some are refused by name.
 pub(crate) fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Result<Rgb8, VisionError> {
+    resize(src, width, height, Filter::Bicubic)
+}
+
+/// `Image.resize((width, height), Image.LANCZOS)` of an RGB image, as Pillow computes it (and
+/// mtmd's `RESIZE_ALGO_LANCZOS`): [`resize_bicubic`] with the Lanczos filter, refused alike.
+pub(crate) fn resize_lanczos(src: &Rgb8, width: usize, height: usize) -> Result<Rgb8, VisionError> {
+    resize(src, width, height, Filter::Lanczos)
+}
+
+/// The separable resize of `src` to `width`×`height` by `filter`: the horizontal pass, then the
+/// vertical pass over its bytes, each only where its side changes.
+fn resize(src: &Rgb8, width: usize, height: usize, filter: Filter) -> Result<Rgb8, VisionError> {
     src.check()?;
     frame_bytes(width, height)?;
     if (width, height) == (src.width, src.height) {
@@ -173,8 +232,8 @@ pub(crate) fn resize_bicubic(src: &Rgb8, width: usize, height: usize) -> Result<
             detail: format!("an empty image has no pixels to resize to {width}x{height}"),
         });
     }
-    let horiz = Axis::bicubic(src.width, width);
-    let mut vert = Axis::bicubic(src.height, height);
+    let horiz = Axis::of(filter, src.width, width);
+    let mut vert = Axis::of(filter, src.height, height);
     let need_h = width != src.width;
     let need_v = height != src.height;
     // First and one-past-last input row the vertical pass reads.
@@ -374,7 +433,8 @@ pub fn pad_ceil(
 #[cfg(test)]
 mod tests {
     use super::{
-        Axis, PRECISION_BITS, PadGeometry, bicubic, pad, pad_ceil, resize_bicubic, zeroed,
+        Axis, Filter, PRECISION_BITS, PadGeometry, bicubic, lanczos, pad, pad_ceil, resize_bicubic,
+        resize_lanczos, zeroed,
     };
     use crate::{Rgb8, VisionError};
 
@@ -420,19 +480,64 @@ mod tests {
         assert_eq!(sum, 1.0);
     }
 
+    /// The Lanczos filter is 1 at 0, 0 outside `[-3, 3)` (its left end inside), and near 0 at the
+    /// other integers, where `sin(πx)` is the rounding of π.
+    #[test]
+    fn lanczos_shape() {
+        assert_eq!(lanczos(0.0), 1.0);
+        for x in [3.0, 3.5, -3.01, 10.0] {
+            assert_eq!(lanczos(x), 0.0, "{x}");
+        }
+        for x in [1.0, 2.0, -1.0, -2.0, -3.0] {
+            assert!(lanczos(x).abs() < 1e-15, "{x}: {}", lanczos(x));
+        }
+        assert!((lanczos(0.5) - lanczos(-0.5)).abs() < 1e-15);
+        assert!(lanczos(0.5) > 0.6 && lanczos(1.5) < 0.0);
+    }
+
     /// Every output pixel's fixed-point weights sum to one unit within the rounding of its taps,
-    /// up and down.
+    /// up and down, for both filters.
     #[test]
     fn weights_sum_to_one_unit() {
-        for (i, o) in [(448, 546), (2400, 1692), (600, 630), (1, 5), (7, 1)] {
-            let a = Axis::bicubic(i, o);
-            for out in 0..o {
-                let (_, k) = a.taps(out);
-                let sum: i64 = k.iter().map(|&w| i64::from(w)).sum();
-                let dev = (sum - (1i64 << PRECISION_BITS)).abs();
-                assert!(dev <= k.len() as i64, "{i}->{o} pixel {out}: sum {sum}");
+        for filter in [Filter::Bicubic, Filter::Lanczos] {
+            for (i, o) in [(448, 546), (2400, 1692), (600, 630), (1, 5), (7, 1)] {
+                let a = Axis::of(filter, i, o);
+                for out in 0..o {
+                    let (_, k) = a.taps(out);
+                    let sum: i64 = k.iter().map(|&w| i64::from(w)).sum();
+                    let dev = (sum - (1i64 << PRECISION_BITS)).abs();
+                    assert!(
+                        dev <= k.len() as i64,
+                        "{filter:?} {i}->{o} pixel {out}: sum {sum}"
+                    );
+                }
             }
         }
+    }
+
+    /// A flat image stays flat under the Lanczos resize, up and down, and a size equal to the
+    /// input's is a copy; the wider support reaches more taps than the bicubic one.
+    #[test]
+    fn lanczos_keeps_a_flat_image_and_copies_its_own_size() {
+        let src = Rgb8::filled(37, 23, [200, 17, 90]);
+        for (w, h) in [(64, 32), (16, 16), (37, 50), (5, 3)] {
+            let out = resize_lanczos(&src, w, h).expect("resize");
+            assert_eq!((out.width, out.height), (w, h));
+            assert!(
+                out.data
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .all(|p| *p == [200, 17, 90]),
+                "{w}x{h}"
+            );
+        }
+        let mut grad = Rgb8::filled(9, 4, [0, 0, 0]);
+        for (i, v) in grad.data.iter_mut().enumerate() {
+            *v = (i * 7 % 251) as u8;
+        }
+        assert_eq!(resize_lanczos(&grad, 9, 4).expect("copy").data, grad.data);
+        assert!(Axis::of(Filter::Lanczos, 64, 32).ksize > Axis::of(Filter::Bicubic, 64, 32).ksize);
     }
 
     /// Python's `round()` is half-to-even: a 9-pixel gap pads 4 above (4.5 → 4), a 7-pixel gap 4

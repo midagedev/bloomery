@@ -46,6 +46,7 @@ use bloomery_gpu::kpool::{TailScoreArgs, weights_scale};
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::latent::{INDEX_HEAD, IndexKeyRmsArgs, IndexPoolRopeArgs, IndexProj, POOL, Rows};
 use bloomery_gpu::linear::out_gate::OutGateArgs;
+use bloomery_gpu::media::{CallRows, widen_bf16};
 use bloomery_gpu::q8f32::Q8_0GemvHeadsMcolArgs;
 use bloomery_gpu::qsa::TopkTailArgs;
 use bloomery_gpu::rope_table::{Direction, RopeRows};
@@ -778,7 +779,7 @@ fn walk(
             p.cfg.cap
         )));
     }
-    stage(host, p, gpu.stream(), &sh, (toks, pos0))?;
+    stage(host, p, gpu.stream(), &sh, (toks, pos0), None)?;
     let env = Env {
         gpu,
         w,
@@ -850,28 +851,45 @@ fn walk(
 
 /// The host side of a walk: the embedding rows into the first stream buffer, every row's
 /// position, live count and rope rows, the chunks' first positions, and each engram site's rows and
-/// mask.
+/// mask. A position `media` holds a row for takes that row in place of its id's embedding (widened
+/// from bf16, [`widen_bf16`]) and enters the engram hash as no token, as the reference's embedding
+/// input does.
 fn stage(
     host: &mut HostIn,
     p: &mut Prompt,
     stream: &CudaStream,
     sh: &Shape,
     (toks, pos0): (&[u32], u32),
+    media: Option<&CallRows<'_>>,
 ) -> Result<(), GpuError> {
     let n = sh.hidden;
     let t = toks.len();
     let q = p.cfg.q_rows;
-    // 1. The embedding rows, dequantized from the file and repeated into the four streams.
+    if let Some(m) = media
+        && m.n_embd() != n
+    {
+        return Err(shape(format!(
+            "media rows of {} values for a model of width {n}",
+            m.n_embd()
+        )));
+    }
+    let row_of = |i: usize| media.and_then(|m| m.row(pos0 + i as u32));
+    // 1. The embedding rows, dequantized from the file (or a media span's row) and repeated into
+    //    the four streams.
     let (ty, row_bytes) = host.embd;
     let embd = host.file.data(&names::token_embd())?;
     for (c, ids) in toks.chunks(q).enumerate() {
         let rows = &mut p.host.streams[..ids.len() * HC * n];
-        for (row, &token) in rows.chunks_mut(HC * n).zip(ids) {
-            let at = token as usize * row_bytes;
-            let src = embd
-                .get(at..at + row_bytes)
-                .ok_or_else(|| shape(format!("token {token} past the embedding's rows")))?;
-            gguf::dequant_row(ty, src, &mut row[..n]).map_err(|e| GpuError::plan(WHAT, e))?;
+        for (j, (row, &token)) in rows.chunks_mut(HC * n).zip(ids).enumerate() {
+            if let Some(m) = row_of(c * q + j) {
+                widen_bf16(m, &mut row[..n]);
+            } else {
+                let at = token as usize * row_bytes;
+                let src = embd
+                    .get(at..at + row_bytes)
+                    .ok_or_else(|| shape(format!("token {token} past the embedding's rows")))?;
+                gguf::dequant_row(ty, src, &mut row[..n]).map_err(|e| GpuError::plan(WHAT, e))?;
+            }
             let (first, rest) = row.split_at_mut(n);
             for c in rest.chunks_mut(n) {
                 c.copy_from_slice(first);
@@ -912,7 +930,11 @@ fn stage(
         let cols = p.cols;
         let h = &mut p.host;
         h.tokens.clear();
-        h.tokens.extend(toks.iter().map(|&x| Some(x)));
+        h.tokens.extend(
+            toks.iter()
+                .enumerate()
+                .map(|(i, &x)| row_of(i).is_none().then_some(x)),
+        );
         h.ids.resize(sites * t * cols, 0);
         h.live.resize(t, false);
         hash.mapped_rows_into(hist, u64::from(pos0), &h.tokens, &mut h.ids, &mut h.live)

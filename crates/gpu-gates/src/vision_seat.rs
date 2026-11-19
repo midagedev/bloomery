@@ -58,7 +58,7 @@ use model::placement::workstation::{CardSpec, DeviceInfo};
 use vision::arch::card::CardBytes;
 use vision::arch::minicpmv::{self, Group};
 pub(crate) use vision::arch::qwen3vl::TokenLimits;
-use vision::arch::{deepseek41v, gemma4v, glm5v, pixtral, qwen3vl};
+use vision::arch::{deepseek41v, gemma4v, glm5v, hy4v, pixtral, qwen3vl};
 use vision::mrope::Canvas;
 use vision::{EncoderInput, MediaModel, Patches, Prepared, VisionError};
 
@@ -318,6 +318,21 @@ pub fn rules() -> &'static [Rule] {
             takes_limits: true,
             out_dim: |f| Ok(gemma4v::Hparams::read(f)?.out_dim),
             default_limits: |f| gemma4v::Hparams::read(f)?.default_limits(),
+            cap: |_, limits| Ok(limits.max()),
+        },
+        Rule {
+            projector: hy4v::PROJECTOR_TYPE,
+            // The newline rows after each grid row are the tower's own, so the prompt holds the
+            // start mark, the pad id (expanded to one copy per row) and the end mark.
+            ids: &[
+                (hy4v::media::IMAGE_START_ID, hy4v::media::IMAGE_START),
+                (hy4v::media::IMAGE_END_ID, hy4v::media::IMAGE_END),
+                (hy4v::media::IMAGE_PAD_ID, hy4v::media::IMAGE_PAD),
+            ],
+            text_rope: None,
+            takes_limits: true,
+            out_dim: |f| Ok(hy4v::Hparams::read(f)?.out_dim),
+            default_limits: |f| hy4v::Hparams::read(f)?.default_limits(),
             cap: |_, limits| Ok(limits.max()),
         },
     ];

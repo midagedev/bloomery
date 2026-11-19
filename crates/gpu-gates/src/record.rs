@@ -3616,9 +3616,10 @@ pub static BLOOMERY_SERVE_SOLAR2: &[&Kind] = kinds![
 ];
 
 /// The common hybrid seat's placement, residency, load, NVMe tier and tier census, address
-/// and request records.
+/// and request records, and the image encoder's seat and load for a family that takes images.
 pub static BLOOMERY_SERVE_HYBRID: &[&Kind] = kinds![
     groups::side_seat::SEAT,
+    groups::vision_seat::RECORDS,
     groups::tiered::LEVER,
     &[&PLACE_UNSET],
     groups::tiered::RUN,
@@ -5123,11 +5124,13 @@ mod tests {
 
     /// Every seat that takes images calls `vision_seat::Flags::encoder` on its start (the GLM
     /// seat at `glm.rs`, V4.1 at `ds41.rs`, Qwen3 at `qwen3.rs`, Qwen3.8 at `qwen38.rs`, the
-    /// decision seat at `decide.rs`), which requires the vision records and the fetch lines of
-    /// the `--hf` projector: each of those seats registers them.
+    /// decision seat at `decide.rs`, the hybrid seat at `tiered.rs` for a family that names a
+    /// projector), which requires the vision records and the fetch lines of the `--hf`
+    /// projector: each of those seats registers them.
     #[test]
     fn the_seats_that_take_images_register_the_vision_record() {
         for (seat, list) in [
+            ("hybrid", BLOOMERY_SERVE_HYBRID),
             ("ds41", BLOOMERY_SERVE_DS41),
             ("qwen3", BLOOMERY_SERVE_QWEN3),
             ("qwen38", BLOOMERY_SERVE_QWEN38),
@@ -5148,6 +5151,7 @@ mod tests {
     #[test]
     fn the_seats_that_fetch_the_hf_projector_register_its_lines() {
         for (seat, list) in [
+            ("hybrid", BLOOMERY_SERVE_HYBRID),
             ("ds41", BLOOMERY_SERVE_DS41),
             ("qwen3", BLOOMERY_SERVE_QWEN3),
             ("qwen38", BLOOMERY_SERVE_QWEN38),
