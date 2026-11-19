@@ -1706,8 +1706,10 @@ impl<H: HostExperts> HostTier<H> {
     /// waited for; each of a tiered set's tier services enqueued on that
     /// tier's stream, in tier order ([`enqueue_tier_leg`]); then its layer's
     /// host experts served for its tokens in one union call, less the ones
-    /// the expert stream sends to the card ([`HostTier::xstream_layer`]), the
-    /// sums into the set the upload sends. A failed tier enqueue poisons the host tier
+    /// the expert stream sends to the card ([`HostTier::xstream_layer`]),
+    /// whose slots it left out the stream's record of the layer adds
+    /// ([`super::xstream::XStream::left_out`]), the sums into the set the
+    /// upload sends. A failed tier enqueue poisons the host tier
     /// and releases every card's waits; a poisoned host tier is refused by
     /// name before any card is given work. Returns the host time outside the
     /// union call.
@@ -1733,6 +1735,7 @@ impl<H: HostExperts> HostTier<H> {
             BatchSlots::new(&self.slots, self.nodes)?,
             self.fault.as_ref(),
         );
+        let left_before = batch.stats.batch_excluded_slots;
         let exclude = self.xstream.as_ref().map_or(&[][..], |x| x.excluded(key));
         let mut tier_failed = false;
         let r = port.serve_tiered(
@@ -1766,7 +1769,18 @@ impl<H: HostExperts> HostTier<H> {
             }
             r => r,
         };
-        r.map_err(|e| self.noted(e))
+        let times = r.map_err(|e| self.noted(e))?;
+        // The slots this serve left out are the unit's own routing's of its
+        // layer's streamed experts: the stream's record of the layer sums them.
+        let left = self
+            .batch
+            .stats
+            .batch_excluded_slots
+            .saturating_sub(left_before);
+        if let Some(x) = self.xstream.as_mut() {
+            x.left_out(key, left)?;
+        }
+        Ok(times)
     }
 
     /// The last batch service's [`UnionCols`] — the per-expert column counts

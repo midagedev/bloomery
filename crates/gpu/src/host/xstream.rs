@@ -228,10 +228,11 @@ pub trait XStreamBody {
 }
 
 /// What one layer of a unit streamed ([`XStream::layer`]), for the
-/// `xstream` record. The column counts are the ones the rule priced: the
+/// `xstream` record. The rule's column counts are the ones it priced: the
 /// unit's own routing, or — where a walk's units share the layer's pick
 /// ([`super::prompt_stream::PromptStream::pick`]) — the first unit's routing
-/// at the walk's width, each routed id counted once a unit of the walk.
+/// at the walk's width, each routed id counted once a unit of the walk. The
+/// streamed columns are the serves' own ([`XStream::left_out`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XLayer {
     pub layer: usize,
@@ -245,11 +246,11 @@ pub struct XLayer {
     /// Of those, the ones that stream: the rule's set cut at the ring's half,
     /// in rank order.
     pub streamed: usize,
-    /// Columns the streamed experts take off the host, as priced: the
-    /// serve's excluded slots of the layer for a unit that picks alone, and
-    /// under a shared pick the walk's units times the first unit's excluded
-    /// slots — each later unit leaves out its own routing's slots of the
-    /// same experts, which no record counts.
+    /// Columns the streamed experts take off the host: the slots the serves
+    /// of the stream's group left out of the layer, each unit's own routing
+    /// of the streamed experts, summed over the walk's units that share the
+    /// stream. 0 from [`XStream::layer`]; the call's end writes it
+    /// ([`super::prompt_stream::PromptStream::end`], [`XStream::left_columns`]).
     pub streamed_columns: u64,
     /// Columns the host union keeps, as priced.
     pub host_columns: u64,
@@ -858,6 +859,11 @@ pub struct XStream {
     /// narrower than the pick's floor) is in no group and reads none.
     excl: Vec<Vec<u32>>,
     groups: Vec<Group>,
+    /// Per stream the open call made, in the order [`XStream::layer`] made
+    /// them, the slots its group's serves left out ([`XStream::left_out`]);
+    /// and per layer the entry its last stream in the open call adds to.
+    left: Vec<u64>,
+    left_at: Vec<Option<usize>>,
     /// A call is open ([`XStream::begin_call`] to [`XStream::end_call`]).
     open: bool,
     /// The rule's scratch.
@@ -1003,6 +1009,8 @@ impl XStream {
             cur: vec![None; layers],
             excl: vec![Vec::new(); layers],
             groups: vec![Group::default(); layers],
+            left: Vec::new(),
+            left_at: vec![None; layers],
             open: false,
             tail: Tail::default(),
             rank: Vec::new(),
@@ -1257,6 +1265,8 @@ impl XStream {
             e.clear();
         }
         self.groups.fill(Group::default());
+        self.left.clear();
+        self.left_at.fill(None);
         self.open = true;
     }
 
@@ -1340,18 +1350,12 @@ impl XStream {
                 .iter()
                 .map(|&id| u64::from(counts[id as usize]))
                 .sum::<u64>();
-        let streamed_columns = self
-            .rank
-            .iter()
-            .map(|&id| u64::from(counts[id as usize]))
-            .sum();
         let mut out = XLayer {
             layer,
             cols,
             host: host_routed,
             tail,
             streamed: take,
-            streamed_columns,
             host_columns,
             ..XLayer::default()
         };
@@ -1391,6 +1395,8 @@ impl XStream {
         r.bytes += out.bytes;
         r.issue_us += out.issue_us;
         r.backlog_us += out.backlog_us;
+        self.left_at[layer] = Some(self.left.len());
+        self.left.push(0);
         Ok(out)
     }
 
@@ -1739,6 +1745,37 @@ impl XStream {
             return &[];
         }
         self.excl.get(unit.layer).map_or(&[], Vec::as_slice)
+    }
+
+    /// The serve of `unit` left `slots` slots out ([`XStream::excluded`]):
+    /// they add to the streamed columns of its layer's last stream in the
+    /// open call. Refused by name: slots left out by a unit no stream of the
+    /// open call groups, which no exclusion set lists experts for.
+    pub fn left_out(&mut self, unit: BatchKey, slots: u64) -> Result<(), GpuError> {
+        if slots == 0 {
+            return Ok(());
+        }
+        let grouped = self.open && self.groups.get(unit.layer).is_some_and(|g| g.holds(unit));
+        let at = self.left_at.get(unit.layer).copied().flatten();
+        match at.filter(|_| grouped).and_then(|i| self.left.get_mut(i)) {
+            Some(n) => {
+                *n += slots;
+                Ok(())
+            }
+            None => Err(GpuError::protocol(
+                "XStream::left_out",
+                format!(
+                    "{slots} slots left out by {unit:?}, which no stream of the open call groups"
+                ),
+            )),
+        }
+    }
+
+    /// The open or last call's streamed columns, one a stream in the order
+    /// [`XStream::layer`] made them: the slots its group's serves left out.
+    #[must_use]
+    pub fn left_columns(&self) -> &[u64] {
+        &self.left
     }
 
     /// One unit's card route of layer `layer` has run on the engine stream

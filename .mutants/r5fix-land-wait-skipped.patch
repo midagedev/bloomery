@@ -1,0 +1,15 @@
+--- a/crates/gpu-hy4/src/batch/pass.rs
++++ b/crates/gpu-hy4/src/batch/pass.rs
+@@ -746,9 +746,9 @@
+             side.remap_row(stream, l, self.map)?;
+             // The pick's admits copy into the stage slots the map already names: the one GEMM over
+             // the layer's map reads them behind every landing batch's event.
+-            for event in land.iter().filter_map(|b| b.event.as_deref()) {
+-                stream.wait(event)?;
+-            }
++            // MUTANT r5fix-land-wait-skipped: the card's slots read the stage before the pick's
++            // admits land.
++            let _ = &land;
+             let rule = Act::SwigluGateClamp { limit: *clamp };
+             expert_rows(
+                 &env,

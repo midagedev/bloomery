@@ -127,9 +127,9 @@
 //!   slots — the host's its serve listed, those it left out to the stream,
 //!   and the card's by the taps against the slot map the call left — are
 //!   its columns' every slot, each unit's columns its half; under `split`
-//!   each layer's streamed columns are twice the first unit's left-out
-//!   slots (one unit's: once), and the second unit leaves slots out too
-//!   (the group shares the stream); on every layer the stream ran the
+//!   each layer's streamed columns are the slots its units left out (one
+//!   unit's: its own), and the second unit leaves slots out too (the group
+//!   shares the stream); on every layer the stream ran the
 //!   second unit's front and download between the first unit's download
 //!   and its shadow. Off, the split walk's logits and greedy ids are one
 //!   unit's bit for bit; streamed, they agree as `stream`'s rule allows.
@@ -1443,8 +1443,8 @@ mod gate {
     /// the host's its serve listed, those it left out to the stream and the
     /// card's by the route taps against the map the call left — are its
     /// columns' every slot, each unit's columns its half; under `split` each
-    /// layer's streamed columns are twice the first unit's left-out slots
-    /// and the second unit left out slots too (the shared stream); on every
+    /// layer's streamed columns are the slots its units left out and the
+    /// second unit left out slots too (the shared stream); on every
     /// layer the second unit's front and download ran between the first
     /// unit's download and its shadow; off, the split walk's bits are one
     /// unit's, streamed it agrees with one unit as the stream rule allows
@@ -1490,12 +1490,12 @@ mod gate {
                 && off.units == 1
                 && sum_ok(&on, &widths)
                 && sum_ok(&off, &[ids.len()]);
-            // The stream prices unit 0's counts at twice: its streamed
-            // columns are twice what unit 0's serve left out.
-            let streamed = |r: &UnitsRun, twice: u64| {
-                r.xlayers
-                    .iter()
-                    .all(|(_, x)| x.streamed_columns == twice * r.excluded(x.layer, 0))
+            // A layer's streamed columns are what its units' serves left out
+            // of the shared stream, each unit its own routing's slots.
+            let streamed = |r: &UnitsRun| {
+                r.xlayers.iter().all(|(_, x)| {
+                    x.streamed_columns == (0..r.units).map(|u| r.excluded(x.layer, u)).sum::<u64>()
+                })
             };
             let shared: u64 = on
                 .rows
@@ -1504,7 +1504,7 @@ mod gate {
                 .map(|r| r.excluded)
                 .sum();
             let share_ok = if mode == XMode::Split {
-                !on.xlayers.is_empty() && streamed(&on, 2) && streamed(&off, 1) && shared > 0
+                !on.xlayers.is_empty() && streamed(&on) && streamed(&off) && shared > 0
             } else {
                 on.xlayers.is_empty() && on.rows.iter().all(|r| r.excluded == 0)
             };
@@ -1521,7 +1521,7 @@ mod gate {
                  picks at {} / {} card layers, one a layer, the group's {picks_ok}; every \
                  layer-batch's host, left-out and card slots its columns' every slot, each unit's \
                  columns its half {slots_ok}; the second unit's left-out slots {shared}, each \
-                 layer's streamed columns twice the first unit's left-out {share_ok}; layers out \
+                 layer's streamed columns its units' left-out {share_ok}; layers out \
                  of the fronts' order {:?} {order_ok}; the prompt's last logits max|diff| \
                  {dlogit}, the greedy ids parted at {parted:?} ({}) {values_ok}: {}",
                 mode.word(),

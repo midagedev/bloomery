@@ -357,7 +357,10 @@ impl PromptStream {
     /// placement `kept` for the decode after it, else each layer back at the
     /// set the call started with; the ends' reports kept for
     /// [`PromptStream::take_pick_records`] and
-    /// [`PromptStream::take_xstream_records`]. The first error is returned.
+    /// [`PromptStream::take_xstream_records`], each streamed layer's record
+    /// with the slots its walk's units' serves left out
+    /// ([`super::xstream::XStream::left_columns`]). The first error is
+    /// returned; a stream count other than the records' is refused by name.
     pub fn end<H: HostExperts>(
         &mut self,
         tier: &mut HostTier<H>,
@@ -367,16 +370,47 @@ impl PromptStream {
         if !std::mem::take(&mut self.on) {
             return Ok(());
         }
-        let x = match std::mem::take(&mut self.split) {
+        let split = std::mem::take(&mut self.split);
+        let x = match split {
             true => tier.xstream_end(),
             false => Ok(None),
         };
         let ended = tier.call_end(stream, kept);
+        let left = match split {
+            true => self.left_into_records(tier),
+            false => Ok(()),
+        };
         self.xend = x?;
         self.end = ended?;
+        left?;
         // The stamps are final now: the end waited every layer's landed
         // event, and every copy landed behind its staged ticket.
         tier.call_staged_us(&mut self.picks);
+        Ok(())
+    }
+
+    /// Each stream record of the call takes its streamed columns, the slots
+    /// its group's serves left out, from the stream's count of them: one a
+    /// stream in the order the call made them, the order
+    /// [`PromptStream::pick`] pushed the records in. Refused by name: a
+    /// stream count other than the records'.
+    fn left_into_records<H: HostExperts>(&mut self, tier: &HostTier<H>) -> Result<(), GpuError> {
+        let left = tier
+            .xstream()
+            .map_or(&[][..], super::xstream::XStream::left_columns);
+        if left.len() != self.xlayers.len() {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "{} stream records for the call's {} streams",
+                    self.xlayers.len(),
+                    left.len()
+                ),
+            ));
+        }
+        for ((_, x), &n) in self.xlayers.iter_mut().zip(left) {
+            x.streamed_columns = n;
+        }
         Ok(())
     }
 

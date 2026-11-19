@@ -1,0 +1,16 @@
+--- a/crates/gpu/src/host/xstream.rs
++++ b/crates/gpu/src/host/xstream.rs
+@@ -1759,7 +1759,12 @@
+         let at = self.left_at.get(unit.layer).copied().flatten();
+         match at.filter(|_| grouped).and_then(|i| self.left.get_mut(i)) {
+             Some(n) => {
+-                *n += slots;
++                // MUTANT r5fix-columns-first-unit: the record prices the group at its first unit's
++                // slots, once a unit of the group, and no later unit's own.
++                let g = &self.groups[unit.layer];
++                if g.units.first() == Some(&unit) {
++                    *n += slots * g.units.len() as u64;
++                }
+                 Ok(())
+             }
+             None => Err(GpuError::protocol(

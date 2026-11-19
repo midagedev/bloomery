@@ -27,11 +27,11 @@
 //!   (or the run proves nothing and fails by name), each layer's streamed experts are within its tail, the host experts
 //!   it routes and the ring's half, a layer streams columns exactly when it streams experts, the call's end counts the
 //!   layers' sum, and the host slots the batch services left out agree with the records by the walk's timing rows
-//!   (`set_prompt_stats`, one row a layer-batch): a walk's units share one pick a layer, which prices the first unit's
-//!   routing at the walk's width, so each streamed record's columns are its walk's units times the slots its walk's
-//!   first unit left out at the layer, exactly; the walk's later units left out slots on the streamed layers (they share
-//!   the layer's stream), no layer-batch of a layer no record streams left out any, and the rows sum to the serve's
-//!   counter (`HybridStats::batch_excluded_slots`); the `off` run's records are empty and it left out none;
+//!   (`set_prompt_stats`, one row a layer-batch): a walk's units share one pick and one stream a layer, so each
+//!   streamed record's columns are the slots its walk's units left out at the layer, each unit its own routing's,
+//!   exactly; the walk's later units left out slots on the streamed layers (they share the layer's stream), no
+//!   layer-batch of a layer no record streams left out any, and the rows sum to the serve's counter
+//!   (`HybridStats::batch_excluded_slots`); the `off` run's records are empty and it left out none;
 //! - `xstream_split_repeats`: a second `split` run's records, prompt logits (bit for bit) and greedy ids are the first's;
 //! - `xstream_split_near_off`: the `split` run's greedy ids are the `off` run's, or part from them where the `split`
 //!   run's top-1 margin is under `GREEDY_MARGIN` (a near tie); the prompt's last logits row's greatest distance from the
@@ -224,16 +224,15 @@ mod gate {
         later: u64,
         /// The slots left out on a layer of a walk no record streams.
         stray: u64,
-        /// The records whose columns are not their walk's units times the first unit's left-out slots, named.
+        /// The records whose columns are not the slots their walk's units left out, named.
         bad: Vec<String>,
         ok: bool,
     }
 
-    /// [`LeftOut`] of `r`, a call of `units` units: a layer's pick prices the first unit's routing of its walk at the
-    /// walk's width (each routed id once a unit of the walk), so each streamed record's columns are the walk's units
-    /// times the slots the walk's first unit left out at the layer; the later units, which share the layer's stream,
-    /// leave out their own routing's slots of the same experts (some, where a streamed walk has one); no layer no
-    /// record streams leaves any out; and the rows sum to the serve's counter.
+    /// [`LeftOut`] of `r`, a call of `units` units: each streamed record's columns are the slots the walk's units
+    /// left out at the layer, the first unit's and the later units', which share the layer's stream and leave out their
+    /// own routing's slots of the same experts (some, where a streamed walk has one); no layer no record streams leaves
+    /// any out; and the rows sum to the serve's counter.
     fn left_out_of(r: &Run, units: usize) -> LeftOut {
         let walk_units = |w: usize| units.saturating_sub(w * GROUP).min(GROUP);
         let at = |w: usize, l: usize, lead: bool| -> u64 {
@@ -253,15 +252,15 @@ mod gate {
         let mut bad = Vec::new();
         for &(w, x) in &streams {
             let k = walk_units(w);
-            let f = at(w, x.layer, true);
-            if x.streamed_columns != k as u64 * f {
+            let (f, g) = (at(w, x.layer, true), at(w, x.layer, false));
+            if x.streamed_columns != f + g {
                 bad.push(format!(
-                    "walk {w} layer {}: {} columns against {k} × {f}",
+                    "walk {w} layer {}: {} columns against the units' {f} + {g}",
                     x.layer, x.streamed_columns
                 ));
             }
             first += f;
-            later += at(w, x.layer, false);
+            later += g;
             shared |= k > 1;
         }
         let stray: u64 = r
@@ -293,7 +292,7 @@ mod gate {
     fn bad_records(clause: &str, lo: &LeftOut) {
         if !lo.bad.is_empty() {
             println!(
-                "{clause}: {} records off their walk's units times the first unit's left-out slots: {}",
+                "{clause}: {} records off the slots their walk's units left out: {}",
                 lo.bad.len(),
                 lo.bad
                     .iter()
@@ -633,7 +632,7 @@ mod gate {
         println!(
             "xstream_split_streams: a {STREAM_P}-id prompt: {} xstream records, {streamed} experts streamed (half \
              {half}), each within its tail, its host experts and the half {records_ok}; the records' {columns} \
-             streamed columns are each walk's units times its first unit's left-out slots ({} in all, {} records \
+             streamed columns are the slots each walk's units left out (its first units' {} in all, {} records \
              off), its later units left out {}, layers that streamed nothing {}, the serve {} in all over {} \
              layer-batch rows; the unstreamed run left out {} {count_ok}: {}",
             a.xlayers.len(),
@@ -829,7 +828,7 @@ mod gate {
         let joins_ok = !want.is_empty() && got == want;
         println!(
             "{CLAUSE}: {streamed} experts streamed, on the tier's layers {on_tier:?}; the end counts the layers' sum and \
-             the records' {columns} streamed columns are each walk's units times its first unit's left-out slots ({} \
+             the records' {columns} streamed columns are the slots each walk's units left out (its first units' {} \
              in all, {} records off), its later units left out {}, layers that streamed nothing {}, the serve {} in \
              all over {} layer-batch rows (the unstreamed run {}, {} joins) {records_ok}; the backs joined {} layer \
              units against the records' {} {joins_ok}",

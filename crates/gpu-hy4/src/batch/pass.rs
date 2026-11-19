@@ -16,13 +16,14 @@
 //!   ids ([`PlacedSide::download_rows`]);
 //! - **shadow**, under the host's work: the shared expert; under host streaming the layer's pick
 //!   (the common owner's, [`PromptStream::unit_pick`](bloomery_gpu::host::prompt_stream::PromptStream::unit_pick): the first unit picks for the walk, the later
-//!   units read its pick); the card's places of every slot ([`PlacedSide::places_rows`]) and the
-//!   card's slots as one grouped GEMM over the layer's card stacks, whose table is the route over
-//!   the card's slot ids and leaves the host's slots out ([`PlacedSide::remap_row`],
-//!   `enqueue_route_remap`); the streamed experts' slots as the common ring pass over the stream's
-//!   ring ([`RingPass::enqueue`]); all summed in slot order over the slots the card holds, by the
-//!   stream's union places when the ring ran (the stage's below `n_card`, `n_card + i` for the
-//!   `i`-th streamed expert, so a streamed expert's rows join the sum where a host expert's would);
+//!   units read its pick); the card's places of every slot ([`PlacedSide::places_rows`]) and,
+//!   behind the pick's landings, the card's slots as one grouped GEMM over the layer's card
+//!   stacks, whose table is the route over the card's slot ids and leaves the host's slots out
+//!   ([`PlacedSide::remap_row`], `enqueue_route_remap`); the streamed experts' slots as the
+//!   common ring pass over the stream's ring ([`RingPass::enqueue`]); all summed in slot order
+//!   over the slots the card holds, by the stream's union places when the ring ran (the stage's
+//!   below `n_card`, `n_card + i` for the `i`-th streamed expert, so a streamed expert's rows join
+//!   the sum where a host expert's would);
 //! - **back**: the stream's join taken ([`PromptStream::unit_join`](bloomery_gpu::host::prompt_stream::PromptStream::unit_join)), the card's and the host's
 //!   sums added (the routed sum is linear in the experts' rows), the latent up, the shared expert
 //!   added, the sandwich norm and the identity mix's post.
@@ -688,9 +689,9 @@ impl PassWalk<'_> {
 
     /// A hosted layer's card work under the host's: the shared expert over the unit's rows; the
     /// layer's pick under host streaming ([`PromptStream::unit_pick`](bloomery_gpu::host::prompt_stream::PromptStream::unit_pick)); the card's slots over the
-    /// stage stacks and the stream's ring, summed in slot order into the card's routed sum (by the
-    /// stream's union places when the ring ran); then the unit's read of the layer
-    /// ([`PromptStream::unit_read`](bloomery_gpu::host::prompt_stream::PromptStream::unit_read)), which keeps the streamed experts the ring pass joined for the
+    /// stage stacks behind the pick's landings and the stream's ring, summed in slot order into the
+    /// card's routed sum (by the stream's union places when the ring ran); then the unit's read of
+    /// the layer ([`PromptStream::unit_read`](bloomery_gpu::host::prompt_stream::PromptStream::unit_read)), which keeps the streamed experts the ring pass joined for the
     /// back.
     fn hosted_shadow(&mut self, port: &mut BatchLeg<'_, HostRun>, at: At) -> Result<(), GpuError> {
         let l = at.layer;
@@ -772,6 +773,11 @@ impl PassWalk<'_> {
             side.places_rows(gpu, l, (&*ids, n), self.sel)?;
             let table = self.routes.of_mut(PASS, l, n_card)?;
             side.remap_row(stream, l, self.map)?;
+            // The pick's admits copy into the stage slots the map already names: the one GEMM over
+            // the layer's map reads them behind every landing batch's event.
+            for event in land.iter().filter_map(|b| b.event.as_deref()) {
+                stream.wait(event)?;
+            }
             let rule = Act::SwigluGateClamp { limit: *clamp };
             expert_rows(
                 &env,
