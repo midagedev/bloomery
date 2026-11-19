@@ -1,0 +1,14 @@
+# The 0.3.15 sitting read Hy4-flash's prompt at 4,096 tokens at 107.81 and 92.23 tok/s on the shipped sm120a binary (serving
+# defaults: ctx 1,048,576, residency mid-p0-s1, xstream split), against 334.55 at main 33f9d22a5 before R4/R5 and a derived
+# 726..867 with R5. Which lever the loss follows decides the fix: the arms turn residency and the stream off one at a time on
+# the same binary. With both off the pass is R1-R3's, so that arm is read near main's 334 [derived from the 33f9d22a5 A/B].
+kind: baseline
+question: does Hy4-flash's pp4096 on the shipped 0.3.15 binary come back to R1-R3's rate with the residency and the stream off?
+term: pp tok/s @ P=4096, bloomery-serve at the serving defaults with BLOOMERY_RESIDENCY=off and BLOOMERY_XSTREAM=off, RTX 5090 32 GB
+unit: tok/s
+predict: 280..400
+condition: one lease, the 5090 alone, depth-serve one round, arms base / residency off / xstream off / both off on the sm120a tarball's server
+reason: 33f9d22a5's A/B read pp4096 334.55 at the serving defaults; R4 (residency) and R5 (stream) are the only prompt-path changes since.
+decide-in: the loss is R4's or R5's: the arm that restores the rate names it
+decide-below: under 280 with both off: the loss is outside R4/R5 (cardgemm, passfall, the ring cap); bisect those commits
+decide-above: beyond 400 with both off: R1-R3's rate was itself under-read; read the base arm's pass records

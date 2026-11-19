@@ -152,11 +152,14 @@ impl Family for Hy4 {
         )))
     }
 
-    /// The ring is kept out of the expert budget where the common rule starts the stream at
-    /// `split` ([`plans_ring`]).
+    /// The ring is kept out of the expert budget where the stream starts at `split` ([`plans_ring`]
+    /// over [`unset_word`]'s word).
     fn ring(levers: &Levers, place: Place) -> bool {
         plans_ring(
-            levers.xstream(),
+            Some(unset_word(
+                levers.xstream(),
+                levers.residency() == Some("off"),
+            )),
             Stage::of(place),
             levers.residency() == Some("off"),
         )
@@ -185,7 +188,18 @@ impl Family for Hy4 {
                 "xstream={word} (unset: the load runs its prompt stepped)"
             )));
         }
-        xstream_rule(gpu, body, set, Stage::of(place), residency).map(Some)
+        let line = xstream_rule(
+            gpu,
+            body,
+            Some(unset_word(set, residency == Residency::Off)),
+            Stage::of(place),
+            residency,
+        )?;
+        Ok(Some(if set.is_none() {
+            line.replace("(set)", "(unset: admit, Hy4's pass streams by admission)")
+        } else {
+            line
+        }))
     }
 
     /// The rows of the pass the placed load holds ([`bloomery_gpu_hy4::Body::pass_rows`]), which
@@ -247,4 +261,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 /// ([`super::hybrid::check`]).
 pub fn check(args: &[String], read_levers: bool) -> Result<(), GateError> {
     super::hybrid::check::<Hy4>(args, read_levers)
+}
+
+/// The stream word a Hy4 load runs: `BLOOMERY_XSTREAM` as set; unset, `admit` with a residency
+/// and `off` without one (the stream needs the residency machine). Hy4's pass at `split` loses to
+/// `admit` at long prompts on the stream's ring (docs/cards/hy4-pp4096-diag.card), so its seat
+/// keeps this one deviation from the common rule's unset `split`.
+fn unset_word(set: Option<&str>, residency_off: bool) -> &str {
+    set.unwrap_or(if residency_off { "off" } else { "admit" })
 }
