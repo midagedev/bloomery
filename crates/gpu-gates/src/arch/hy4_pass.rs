@@ -1,9 +1,9 @@
 //! The placed prompt pass a Hy4-flash placed load opens beside its step: the widest of the body's
-//! pass shapes ([`SHAPES`], the widest walk of several units first) whose bytes the stage card's
-//! room holds as the prompt reserve; a load whose prompt calls stream their host experts
-//! (`BLOOMERY_XSTREAM=split`) reserves the stream's ring at its floor beside it: inputs that carry
-//! the ring ([`with_ring`]) keep it in every shape's inputs ([`inputs_for`]), and plain inputs take
-//! it by [`streaming_for`].
+//! pass shapes ([`SHAPES`]: the widest walk of several units, then fewer units, then one unit of
+//! fewer rows) whose bytes the stage card's room holds as the prompt reserve; a load whose prompt
+//! calls stream their host experts (`BLOOMERY_XSTREAM=split`) reserves the stream's ring at its
+//! floor beside it: inputs that carry the ring ([`with_ring`]) keep it in every shape's inputs
+//! ([`inputs_for`]), and plain inputs take it by [`streaming_for`].
 //! `bloomery-serve --model hy4` and `gate_hy4_pp` pick their shape here ([`pick`]'s `attempt` is the
 //! caller's plan of a shape). The family hangs no expert tier card, so every shape plans on one
 //! machine.

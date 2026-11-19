@@ -247,9 +247,10 @@ mod gate {
     /// layer's experts the card's slots sum and which the host's, the card's rule against the
     /// host's, each layer's share inside [`FFN_BAND`] of the whole-card block; a slot the map
     /// misroutes is another expert's rows, of the order of the row itself.
-    /// PIN(2026-11-19) [provisional]: derived, about 4 x [`FFN_BAND`] over the fixture's routed
-    /// layers; the first box run's worst re-pins it at 1.5 x.
-    const RESIDENCY_BAND: f64 = 1.0e-1;
+    /// PIN(2026-11-19): 1.5 x the first box run's worst row, 1.654e-1 with the reseeded load's ids
+    /// equal to the `off` load's; a map copy the machine does not write (the stale-map mutant) reads
+    /// 5.339e-1 and its ids leave the `off` load's at the third id.
+    const RESIDENCY_BAND: f64 = 2.5e-1;
 
     /// The host tier's configuration of the residency clause's load: [`HOST_CFG`] with the host set
     /// read in, which the machine's source stages its parts from (the load refuses a machine over a
@@ -801,7 +802,7 @@ mod gate {
             open_split(Arch::Hy4, RECIPE)?,
             (&plan, &pass_inputs),
             0,
-            HOST_CFG,
+            HOST_RESIDENCY,
             (Some(STREAM_SHAPE), residency),
         )?;
         let hosted = sm.body(NAME)?.hosted_layers();

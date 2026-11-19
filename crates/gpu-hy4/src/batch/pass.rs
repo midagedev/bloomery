@@ -119,20 +119,48 @@ impl PassShape {
 /// over when the stream's rule sends them to the card.
 pub const WALK_UNITS: usize = model::moe::UNION_TAIL_MAX_COLS / PASS_ROWS;
 
-/// The shapes a plan may hold, widest first: the widest walk, then one unit of the host union's
-/// widest unit down to the narrowest the card's room may be left with. A narrower pass reads each
-/// hosted layer's experts once for fewer rows.
-pub const SHAPES: [PassShape; 5] = [
-    PassShape::walk(PASS_ROWS, WALK_UNITS),
-    PassShape::of(PASS_ROWS),
-    PassShape::of(PASS_ROWS / 2),
-    PassShape::of(PASS_ROWS / 4),
-    PassShape::of(PASS_ROWS / 8),
-];
+/// The shapes of the full unit's rows: the widest walk's units, [`WALK_UNITS`], halved down to one.
+const WALK_STEPS: usize = (usize::BITS - WALK_UNITS.leading_zeros()) as usize;
+
+/// The one-unit shapes of fewer rows: the full unit's rows halved down to the narrowest the card's
+/// room may be left with.
+const UNIT_STEPS: usize = 3;
+
+/// The shapes a plan may hold, widest first: the widest walk of the host union's widest unit, the
+/// walk's units halved down to one unit, then one unit of fewer rows. A narrower pass holds fewer
+/// buffers beside the plan and reads each hosted layer's experts once for fewer rows.
+pub const SHAPES: [PassShape; WALK_STEPS + UNIT_STEPS] = {
+    let mut shapes = [PassShape::of(PASS_ROWS); WALK_STEPS + UNIT_STEPS];
+    let mut i = 0;
+    while i < WALK_STEPS {
+        shapes[i] = PassShape::walk(PASS_ROWS, WALK_UNITS >> i);
+        i += 1;
+    }
+    let mut i = 1;
+    while i <= UNIT_STEPS {
+        shapes[WALK_STEPS - 1 + i] = PassShape::of(PASS_ROWS >> i);
+        i += 1;
+    }
+    shapes
+};
 
 // A walk's units start on an attention chunk, so the stage's chunk bases index them.
 const _: () = assert!(PASS_ROWS.is_multiple_of(Q_MAX));
 const _: () = assert!(WALK_UNITS >= 1);
+
+// The list runs from the widest walk to one unit of the full rows to the narrowest unit, each
+// shape holding fewer rows than the last, so a pick that steps down it holds fewer buffers at
+// every step.
+const _: () = {
+    assert!(SHAPES[0].units == WALK_UNITS && SHAPES[0].rows == PASS_ROWS);
+    assert!(SHAPES[WALK_STEPS - 1].units == 1 && SHAPES[WALK_STEPS - 1].rows == PASS_ROWS);
+    assert!(SHAPES[SHAPES.len() - 1].rows == PASS_ROWS >> UNIT_STEPS);
+    let mut i = 1;
+    while i < SHAPES.len() {
+        assert!(SHAPES[i].walk_rows() < SHAPES[i - 1].walk_rows());
+        i += 1;
+    }
+};
 
 /// The prompt batch's geometry for walks of `shape`: the streams a walk wide, the rest a unit
 /// wide. Refused by name: a unit of no rows or more than [`PASS_ROWS`], no units, units that do
