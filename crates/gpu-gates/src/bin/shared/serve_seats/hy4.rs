@@ -264,9 +264,9 @@ pub fn check(args: &[String], read_levers: bool) -> Result<(), GateError> {
 }
 
 /// The stream word a Hy4 load runs: `BLOOMERY_XSTREAM` as set; unset, `admit` with a residency
-/// and `off` without one (the stream needs the residency machine). Hy4's pass at `split` loses to
-/// `admit` at long prompts on the stream's ring (docs/cards/hy4-pp4096-diag.card), so its seat
-/// keeps this one deviation from the common rule's unset `split`.
+/// and `off` without one (the stream needs the residency machine). Hy4 decodes faster at `admit`
+/// than at `split` and runs its short prompts as fast (docs/cards/hy4-pp4096-diag.card), so its
+/// seat keeps this one deviation from the common rule's unset `split`.
 fn unset_word(set: Option<&str>, residency_off: bool) -> &str {
     set.unwrap_or(if residency_off { "off" } else { "admit" })
 }

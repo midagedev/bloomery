@@ -1,3 +1,9 @@
+# CORRECTION (2026-11-19, the same day): the first arm of each window below read cold (its majflt 147,825; the
+# sitting's 92.23 and 107.81 rows are [cold] too), so "split 88.12 at pp4096" was a cold page cache, not the stream.
+# Warm, same binary, two rounds each: pp4096 split 499.33 / 498.15, admit 455.03 / 454.48; pp512 split 416.38 [cold] /
+# 417.37, admit 431.39 / 429.72; decode at depth 4096 split 39.62 / 41.13, admit 41.42 / 41.39, at depth 512 split
+# 40.13 / 43.10, admit 46.79 / 48.06 tok/s. Admit stays Hy4's unset word for its decode (+4..+12 %) and short prompts,
+# at -9 % on a 4,096-token prompt.
 # The 0.3.15 sitting read Hy4-flash's prompt at 4,096 tokens at 107.81 and 92.23 tok/s on the shipped sm120a binary (serving
 # defaults: ctx 1,048,576, residency mid-p0-s1, xstream split), against 334.55 at main 33f9d22a5 before R4/R5 and a derived
 # 726..867 with R5. Which lever the loss follows decides the fix: the arms turn residency and the stream off one at a time on
