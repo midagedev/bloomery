@@ -1,0 +1,21 @@
+# Round q6fold (GLM-5.3, report /root/agents/specs/q6fold/report.md): the GQA layers' Q6_K value gemv (1024 rows, grid
+# 128, 0.15 of a wave) and the GDN layers' Q6_K input gemv (10240 rows, grid 1280) fold at one column into their
+# Q4_K neighbour's launch (qwen3moe_qkv_q4k_q6k, the Q6_K rows first). Fold class: dt = -dN x c_node - the removed
+# launch's ramp; no block repeats work (one warp, one row). gemv5090 report: 8 x -4.5 + 24 x -3.0 = -108 us of the
+# 11.43 ms step = +0.95 % [derived]; the ramp terms are its read of nsys, so the band is wide.
+kind: ab
+question: does folding the Q6_K value and GDN-input gemvs into the Q4_K qkv launch speed a full-card decode step?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of the q4cs tree with
+  the fold against the q6cs binary (q6cs-bin 5b30f86d4de9, main b560b14c0's code), (probe - base) / base
+unit: %
+predict: +0.3..+1.6
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W
+decide-in: land with the node-count re-pins (dated, FAIL-first) and the family gates
+decide-below: under +0.3: the ramp terms were wrong; read nsys of both before deciding
+decide-above: above +1.6: read nsys before crediting
+# outcome 2026-11-21, q6fold-bin (2d7149a78b5c) against q6cs-bin (5b30f86d4de9), RTX 5090 600 W, one lease, 6 rounds,
+#  depth 512: decode 88.29 tok/s [88.28..88.32] against 87.49 [87.47..87.51], round ratios 1.00939 1.00895 1.00907
+#  1.00912 1.00902 1.00925 = +0.91 %. In the band, beside the derived +0.95 %: decide-in.

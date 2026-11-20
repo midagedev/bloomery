@@ -9,8 +9,10 @@
 //!    one-row arena (the decode graph) one three-matrix launch over
 //!    `attn_qkv`, `attn_gate` and the joined β·α stack, elsewhere two,
 //!    `attn_qkv` beside `attn_gate` in one and β with α in another; a Q6_K
-//!    `attn_qkv` in its own gemv (and at more than one row its
-//!    token-major copy) and `attn_gate`, β and α in one launch — and with
+//!    `attn_qkv` at one column on the plain entries folded into the z·β·α
+//!    launch's first rows over the arena's one allocation, elsewhere in
+//!    its own gemv (and at more than one row its token-major copy) with
+//!    `attn_gate`, β and α in one launch — and with
 //!    any other types each projection by its type
 //!    (`dispatch::site_gemv`); past [`GEMV_COLS`] rows `attn_gate` waits
 //!    for 5;
@@ -50,7 +52,7 @@
 
 use super::dispatch::{self, Ctx, site_launches};
 use super::plan::{DeltaPlan, SiteTy, beta_alpha, beta_alpha_fold, input_fused, out_fused};
-use super::proj::{OResidArgs, QkvArgs};
+use super::proj::{OResidArgs, QkvArgs, QkvQ6kArgs};
 use super::scratch::{Arena, Io, RecStore};
 use super::wide::{self, GEMV_COLS};
 use crate::GpuError;
@@ -62,8 +64,10 @@ use crate::model::lookup::{f32_gain, kq_weight};
 use crate::tensor::WindowMut;
 
 /// The launches [`delta`] makes at `m` rows of an arena cut for
-/// `arena_rows`: eight — seven at one row over a one-row arena (the decode
-/// graph, whose input half is one launch over the joined β·α stack) — plus a Q6_K q·k·v
+/// `arena_rows`: eight — seven at one row (the decode graph, whose input
+/// half is one launch: a Q4_K q·k·v's over the joined β·α stack on a
+/// one-row arena only, or a Q6_K q·k·v's own gemv folded into the z·β·α
+/// launch's first rows, whatever the arena) — plus a Q6_K q·k·v
 /// projection's token-major copy at more than one row; projections of other
 /// types each their own ([`site_launches`]); an output projection not of
 /// Q4_K its quantizer (a K-quant), the projection and the add. Past
@@ -82,6 +86,12 @@ pub(super) fn launches(d: &DeltaPlan, m: usize, arena_rows: usize) -> usize {
     }
     let input = if input_fused(d) {
         if beta_alpha_fold(d) && m == 1 && arena_rows == 1 {
+            1
+        } else if d.qkv_ty == SiteTy::Q6K && m == 1 {
+            // The Q6_K q·k·v's own gemv folded into the z·β·α launch as its
+            // first rows, the plain entries' path; an integrated device's
+            // `_prefetch` gemvs keep it, and its graph sits one node above
+            // this count a folded layer.
             1
         } else {
             2 + usize::from(d.qkv_ty == SiteTy::Q6K && m > 1)
@@ -375,6 +385,27 @@ pub(super) fn project(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Re
                 y: &mut g.from_b,
                 off_k: a_in_b,
                 off_v: a_in_b + a_len,
+            },
+        );
+    }
+    // A Q6_K q·k·v at one column on the plain entries folds into the z·β·α
+    // launch as its first rows over the arena's one allocation — the
+    // `[x | z | b | a]` blocks at their own offsets, no copy — one launch
+    // fewer a layer; an integrated device's `_prefetch` gemvs keep the two.
+    if m == 1 && !gpu.row_prefetch() {
+        return k.proj.enqueue_qkv_q6k(
+            stream,
+            QkvQ6kArgs {
+                w6: wqkv,
+                wq: wz,
+                wk: wb,
+                wv: Some(wa),
+                act,
+                y: &mut g.proj,
+                off6: 0,
+                off_q: x_len,
+                off_k: x_len + b_in_z,
+                off_v: x_len + a_in_z,
             },
         );
     }

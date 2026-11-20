@@ -29,7 +29,7 @@ use super::plan::{
     qkv_fused, reads_f32,
 };
 use super::program::{Program, Tail};
-use super::proj::{OResidArgs, QkvArgs};
+use super::proj::{OResidArgs, QkvArgs, QkvQ6kArgs};
 use super::scratch::{Append128, Append256, AppendNorm, Arena, FlashPass, Io, KvPlanes};
 use super::wide::{self, GEMV_COLS};
 use crate::elem::EmbedRowsArgs;
@@ -304,7 +304,15 @@ pub(super) fn pass_launches_on(
             }
             MixerPlan::Gqa(g) => {
                 let qkv = if qkv_fused(g) {
-                    1 + usize::from(g.v_ty == SiteTy::Q6K) * (1 + many)
+                    // A Q6_K v folds into the q·k·v launch at one row, the
+                    // plain entries' path an integrated device's `_prefetch`
+                    // gemvs do not take: such a device's graph sits one node
+                    // above this count a folded layer.
+                    if g.v_ty == SiteTy::Q6K && many == 0 {
+                        1
+                    } else {
+                        1 + usize::from(g.v_ty == SiteTy::Q6K) * (1 + many)
+                    }
                 } else {
                     site(g.q_ty) + site(g.k_ty) + site(g.v_ty)
                 };
@@ -770,14 +778,16 @@ pub(super) fn attn_append(
 }
 
 /// The attention half's input side at `m` rows: the attention norm with its
-/// quantizer, then q, k and v — in one launch (a Q6_K v in its own) when
+/// quantizer, then q, k and v — in one launch (a Q6_K v in its own, except
+/// at one column on the plain entries where it folds into that launch) when
 /// Q4_K, else each by its type ([`site_gemv`]) — into the arena's `q`, `k`
 /// and `v` rows; past [`GEMV_COLS`] rows the wide arm's
 /// ([`wide::attn_in`]).
 ///
 /// The half, [`attn_in`], [`attn_core`] and [`attn_out`] in the walk's order:
 /// `x` in, `ffn_inp = x + attn_output(attn(x))` out —
-/// q, k and v in one launch (a Q6_K v in its own) when Q4_K, else each by
+/// q, k and v in one launch (a Q6_K v in its own past one column, folded
+/// into it at one on the plain entries) when Q4_K, else each by
 /// its type ([`site_gemv`]), the head norm and the rope by the rows'
 /// positions with the cache append, the flash over the rows' live key
 /// counts, the output projection — a Q4_K one with the residual add in its
@@ -810,6 +820,27 @@ pub(super) fn attn_in(c: &Ctx<'_>, n: &GqaPlan, s: &mut Arena, m: usize) -> Resu
     if qkv_fused(n) {
         let wv = kq_weight(w, &n.attn_v)?;
         let (off_k, off_v) = s.qkv_offsets();
+        // A Q6_K value projection at one column on the plain entries folds
+        // into the q·k·v launch as its first rows (`qwen3moe_qkv_q4k_q6k`),
+        // one launch fewer a layer; an integrated device's `_prefetch` gemvs
+        // keep the value's own launch.
+        if n.v_ty == SiteTy::Q6K && m == 1 && !gpu.row_prefetch() {
+            return k.proj.enqueue_qkv_q6k(
+                stream,
+                QkvQ6kArgs {
+                    w6: wv,
+                    wq: kq_weight(w, &n.attn_q)?,
+                    wk: kq_weight(w, &n.attn_k)?,
+                    wv: None,
+                    act: &s.act_x[i],
+                    y: &mut s.qkv,
+                    off6: off_v,
+                    off_q: 0,
+                    off_k,
+                    off_v: 0,
+                },
+            );
+        }
         k.proj.enqueue_qkv(
             stream,
             QkvArgs {
@@ -1630,7 +1661,9 @@ mod tests {
     }
 
     /// A layer's attention launches follow its sites' types: the fused Q4_K
-    /// groups are 7 (12 with the FFN's 5, the pin of the Q4_K_M file), a site
+    /// groups are 7 (12 with the FFN's 5, the pin of the Q4_K_M file), a Q6_K
+    /// value beside Q4_K q and k keeps its gemv past one row and folds into
+    /// the q·k·v launch at one, a site
     /// that leaves a group launches alone (+3 for four Q5_K sites at one row,
     /// +2 for a Q5_K value beside Q4_K q and k, which keep their gemvs), and
     /// a Q8_0 or F32 output projection at head 128 is its gemv and the add:
@@ -1641,7 +1674,7 @@ mod tests {
         let h = GqaKind::Neox128;
         let ffn = 5;
         assert_eq!(one(h, [Q4K; 4], 1), 7 + ffn);
-        assert_eq!(one(h, [Q4K, Q4K, Q6K, Q4K], 1), 8 + ffn);
+        assert_eq!(one(h, [Q4K, Q4K, Q6K, Q4K], 1), 7 + ffn);
         assert_eq!(one(h, [Q4K, Q4K, Q6K, Q4K], 2), 9 + ffn);
         assert_eq!(one(h, [Q5K; 4], 1), 10 + ffn);
         assert_eq!(one(h, [Q4K, Q4K, Q5K, Q4K], 1), 9 + ffn);

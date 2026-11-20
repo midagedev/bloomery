@@ -1,0 +1,22 @@
+# Probe (research-decode #3, llama.cpp mmvq's pf_dist on GB10): q4k_row_dot_1col issues prefetch.global.L2 for the
+# next unroll step's 1152 bytes (nine lines, lanes 0..8) while it computes the current one; no register is held.
+# Rows of K = 5120 run 5 iterations (2 unroll steps, one prefetch), K = 17408 rows 17. The whole-row prefetch lost
+# 3.21 % (rowpf5090) and llama.cpp enables its lookahead only on LPDDR; the research report's band is 1-2 %
+# [derived from bus share 83.5 -> 86 %], so the band's lower edge is the null.
+kind: ab
+question: does a one-step L2 lookahead in the Q4_K row walk speed a full-card decode step?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of the q4cs tree with
+  the lookahead against the q6cs binary (q6cs-bin 5b30f86d4de9, the same tree less the probe), (probe - base) / base
+unit: %
+predict: +0.2..+2.0
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W
+decide-in: land with the Q4_K gates bit for bit, and try the Q6_K walks
+decide-below: under +0.2: the lookahead does not pay on GDDR7; close it
+decide-above: above +2.0: read nsys before crediting
+# outcome 2026-11-21, la-bin (70d367aa8e6a) against q6cs-bin (5b30f86d4de9), RTX 5090 600 W, one lease, 6 rounds,
+#  depth 512: decode 86.80 tok/s [86.80..86.81] against 87.47 [87.46..87.48], round ratios 0.99238 0.99238 0.99228
+#  0.99243 0.99239 0.99247 = -0.76 %. decide-below: the prefetches cost issue slots and L2 traffic the warps already
+#  in flight cover; closed on GDDR7, reverted.

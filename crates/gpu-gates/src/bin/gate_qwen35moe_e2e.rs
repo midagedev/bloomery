@@ -573,8 +573,11 @@ mod gate {
     const HEAD: usize = 256;
     const ROT: usize = 64;
 
-    /// PIN(2026-11-20): the captured decode step's node count, derived before
-    /// the chain was built: the embedding row; each delta layer's 8 mixer
+    /// PIN(2026-11-21): 504 -> 484, the 14 Q6_K `attn_qkv` and 6 Q6_K `attn_v`
+    /// gemvs folded at one row into their Q4_K neighbour's launch
+    /// (`qwen3moe_qkv_q4k_q6k`) on a card that runs the plain gemv entries:
+    /// 1 + 14·12 + 16·12 + 10·12 + 3. PIN(2026-11-20): the captured decode
+    /// step's node count, derived before the chain was built: the embedding row; each delta layer's 8 mixer
     /// launches (norm+quant, the two projection launches — a Q6_K `attn_qkv`
     /// in its own gemv, `attn_gate`·β·α in one — conv, delta, gated norm,
     /// q8_1, `ssm_out` with the residual), 7 on the 16 whose Q4_K `attn_qkv`
@@ -585,7 +588,7 @@ mod gate {
     /// the gated q8_1, the output projection with the residual), one more
     /// on the 6 layers whose `attn_v` is Q6_K, and 5 FFN; then the head's
     /// three: 1 + 14·13 + 16·12 + 10·12 + 6 + 3.
-    const REAL_NODES_DECODE: usize = 504;
+    const REAL_NODES_DECODE: usize = 484;
 
     /// PIN(2026-10-05): a captured pass of `m >= 2` rows without its heads,
     /// derived the same way at more than one row: each delta layer 8 + 5
@@ -682,8 +685,10 @@ mod gate {
         shape().n_delta()
     }
 
-    fn nodes_decode() -> usize {
-        shape().nodes_decode()
+    /// The decode step's nodes on a card that runs the plain gemv entries
+    /// (`fold`) or the `_prefetch` ones.
+    fn nodes_decode(fold: bool) -> usize {
+        shape().nodes_decode(fold)
     }
 
     fn nodes_pass() -> usize {
@@ -877,7 +882,7 @@ mod gate {
         ok &= tier::witness("N_DELTA", n_delta(), REAL_N_DELTA);
         ok &= tier::witness("Q6_QKV", shape().q6_qkv(), REAL_Q6_QKV);
         ok &= tier::witness("Q6_V", shape().q6_v(), REAL_Q6_V);
-        ok &= tier::witness("NODES_DECODE", nodes_decode(), REAL_NODES_DECODE);
+        ok &= tier::witness("NODES_DECODE", nodes_decode(true), REAL_NODES_DECODE);
         ok &= tier::witness("NODES_PASS", nodes_pass(), REAL_NODES_PASS);
         if shape().apart().contains(&true) {
             println!(
@@ -913,7 +918,7 @@ mod gate {
         if counts {
             ok &= tier::witness(
                 "NODES_DECODE_UD",
-                shape.nodes_decode(),
+                shape.nodes_decode(true),
                 REAL_NODES_DECODE_UD,
             );
             ok &= tier::witness("NODES_PASS_UD", shape.nodes_pass(), REAL_NODES_PASS_UD);
@@ -1116,7 +1121,7 @@ mod gate {
     fn structure(m: &mut Qwen35moeModel) -> Result<bool, GateError> {
         tier::sc("(s) structure: layer kinds, stores, node counts and flash grids")?;
         let (want_attn, want_layers) = (n_attn(), n_layer());
-        let (want_decode, want_pass) = (nodes_decode(), nodes_pass());
+        let (want_decode, want_pass) = (nodes_decode(!m.gpu().row_prefetch()), nodes_pass());
         let body = m.body("structure")?;
         let kinds = body.kinds();
         let n_attn = kinds
@@ -3130,7 +3135,7 @@ mod gate {
         };
         let want = ud.apart();
         let (want_layers, want_decode, want_pass) =
-            (ud.n_layer(), ud.nodes_decode(), ud.nodes_pass());
+            (ud.n_layer(), ud.nodes_decode(true), ud.nodes_pass());
         let mut m = open_at(unjoined_path(), CTX, KvQ8::F16)?;
         let body = m.body("unjoined")?;
         let got = body.shared_apart();

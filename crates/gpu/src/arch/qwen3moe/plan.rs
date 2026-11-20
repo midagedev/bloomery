@@ -9,7 +9,8 @@
 //! - Q4_K in a fused group ([`qkv_fused`], [`o_fused`], [`input_fused`], [`out_fused`],
 //!   [`gate_up_fused`], [`down_sel`]): `ProjKernels::enqueue_qkv` over q, k and v,
 //!   `enqueue_o_resid` for an output projection with the residual add in its store, a Q6_K v its
-//!   own gemv; the grouped GEMM `gemm_q4k` wide.
+//!   own gemv past one row and, at one column on the plain entries, `enqueue_qkv_q6k` with it
+//!   folded in as the launch's first rows; the grouped GEMM `gemm_q4k` wide.
 //! - Any other type, and a Q4_K one beside a type the group cannot hold: `crate::site`, each
 //!   projection its own launch — Q3_K, Q4_K and Q6_K `Gpu::enqueue_gemv_*` (row-major, a
 //!   token-major copy past one row), Q5_K the K-quant down `_sel` over one expert
@@ -41,7 +42,8 @@ fn q4k_or_q6k(ty: SiteTy) -> bool {
 }
 
 /// The gemv arm's fused q·k·v of `g`: Q4_K q and k with a Q4_K or Q6_K v (a Q6_K v in its own
-/// gemv); otherwise each projection launches alone.
+/// gemv past one row, folded into the q·k·v launch's first rows at one on the plain entries);
+/// otherwise each projection launches alone.
 pub(super) fn qkv_fused(g: &GqaPlan) -> bool {
     all_q4k(&[g.q_ty, g.k_ty]) && q4k_or_q6k(g.v_ty)
 }
@@ -51,8 +53,9 @@ pub(super) fn o_fused(g: &GqaPlan) -> bool {
     all_q4k(&[g.o_ty])
 }
 
-/// The gemv arm's two input launches of `d`: a Q4_K or Q6_K q·k·v projection (a Q6_K one in its
-/// own gemv) and Q4_K `z`, β and α; otherwise each projection launches alone.
+/// The gemv arm's input launches of `d`: a Q4_K or Q6_K q·k·v projection (a Q6_K one in its own
+/// gemv past one row, folded into the z·β·α launch's first rows at one on the plain entries) and
+/// Q4_K `z`, β and α; otherwise each projection launches alone.
 pub(super) fn input_fused(d: &DeltaPlan) -> bool {
     q4k_or_q6k(d.qkv_ty) && all_q4k(&[d.gate_ty, d.beta_ty, d.alpha_ty])
 }

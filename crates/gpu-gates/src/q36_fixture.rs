@@ -43,6 +43,10 @@ const PASS_QKV_COPY_LAUNCHES: usize = 1;
 /// one-row arena's `[x | z | b | a]` holds as that launch's v block. A pass's wider arena keeps
 /// the two launches whatever its row count.
 const DELTA_BA_FOLD_LAUNCHES: usize = 1;
+/// Launches a joined layer's Q6_K site (a delta layer's `attn_qkv`, an attention layer's `attn_v`)
+/// saves at one row on a card that runs the plain gemv entries: its gemv folds into its Q4_K
+/// neighbour's launch (`qwen3moe_qkv_q4k_q6k`). A `row_prefetch` card keeps the two launches.
+const Q6_FOLD_LAUNCHES: usize = 1;
 /// Launches a Q6_K `attn_v` adds to a joined attention layer's mixer in a pass of two or more
 /// rows: its gemv and the token-major copy.
 const PASS_V_LAUNCHES: usize = 2;
@@ -317,22 +321,28 @@ impl Shape {
 
     /// The captured decode step's nodes: the embedding row, each layer's mixer and feed-forward
     /// launches (a joined attention layer one more when its `attn_v` is Q6_K, a joined delta
-    /// layer whose `attn_qkv` is Q4_K one fewer: its β·α folds into the q·k·v's launch), then
-    /// the head's.
+    /// layer whose `attn_qkv` is Q4_K one fewer: its β·α folds into the q·k·v's launch; with
+    /// `fold`, the card running the plain gemv entries, a joined layer's Q6_K site one fewer:
+    /// its gemv folds into its Q4_K neighbour's launch), then the head's.
     #[must_use]
-    pub fn nodes_decode(&self) -> usize {
+    pub fn nodes_decode(&self, fold: bool) -> usize {
+        let q6_fold = usize::from(fold) * Q6_FOLD_LAUNCHES;
         let layers: usize = self
             .layers
             .iter()
             .map(|(layer, rule)| match (rule, layer.kind()) {
                 (Rule::Joined { q6 }, Kind::DeltaRule) => {
                     DELTA_MIXER_LAUNCHES + JOINED_FFN_LAUNCHES
-                        - if *q6 { 0 } else { DELTA_BA_FOLD_LAUNCHES }
+                        - if *q6 { q6_fold } else { DELTA_BA_FOLD_LAUNCHES }
                 }
                 (Rule::Joined { q6 }, Kind::Attention) => {
                     ATTN_MIXER_LAUNCHES
                         + JOINED_FFN_LAUNCHES
-                        + if *q6 { ATTN_V_GEMV_LAUNCHES } else { 0 }
+                        + if *q6 {
+                            ATTN_V_GEMV_LAUNCHES - q6_fold
+                        } else {
+                            0
+                        }
                 }
                 (Rule::Unjoined, _) => UNJOINED_MIXER_LAUNCHES + APART_FFN_LAUNCHES,
             })
@@ -495,8 +505,13 @@ mod tests {
             (40, 10, 30)
         );
         assert_eq!((real.q6_qkv(), real.q6_v()), (14, 6));
-        assert_eq!(real.nodes_decode(), 1 + 14 * 13 + 16 * 12 + 10 * 12 + 6 + 3);
-        assert_eq!(real.nodes_decode(), 504);
+        assert_eq!(
+            real.nodes_decode(false),
+            1 + 14 * 13 + 16 * 12 + 10 * 12 + 6 + 3
+        );
+        assert_eq!(real.nodes_decode(false), 504);
+        assert_eq!(real.nodes_decode(true), 1 + 14 * 12 + 16 * 12 + 10 * 12 + 3);
+        assert_eq!(real.nodes_decode(true), 484);
         assert_eq!(real.nodes_pass(), 1 + 30 * 13 + 14 + 10 * 12 + 2 * 6);
         assert_eq!(real.nodes_pass(), 537);
         assert_eq!(real.nodes_slot().expect("joined"), 1 + 10 * 2);
@@ -506,8 +521,9 @@ mod tests {
         let ud = Shape::from_layers(ud()).expect("ud");
         assert_eq!((ud.n_layer(), ud.n_attn(), ud.n_delta()), (40, 10, 30));
         assert_eq!((ud.q6_qkv(), ud.q6_v()), (0, 0));
-        assert_eq!(ud.nodes_decode(), 1 + 40 * (10 + 11) + 3);
-        assert_eq!(ud.nodes_decode(), 844);
+        assert_eq!(ud.nodes_decode(true), 1 + 40 * (10 + 11) + 3);
+        assert_eq!(ud.nodes_decode(true), 844);
+        assert_eq!(ud.nodes_decode(false), 844);
         assert_eq!(ud.nodes_pass(), 1 + 40 * 21);
         assert_eq!(ud.nodes_pass(), 841);
         assert_eq!(ud.apart(), vec![true; 40]);
@@ -515,16 +531,18 @@ mod tests {
         let fix = Shape::from_layers(fixture()).expect("fixture");
         assert_eq!((fix.n_layer(), fix.n_attn(), fix.n_delta()), (4, 2, 2));
         assert_eq!((fix.q6_qkv(), fix.q6_v()), (1, 1));
-        assert_eq!(fix.nodes_decode(), 1 + (12 + 13) + (12 + 13) + 3);
-        assert_eq!(fix.nodes_decode(), 54);
+        assert_eq!(fix.nodes_decode(false), 1 + (12 + 13) + (12 + 13) + 3);
+        assert_eq!(fix.nodes_decode(false), 54);
+        assert_eq!(fix.nodes_decode(true), 1 + (12 + 12) + (12 + 12) + 3);
+        assert_eq!(fix.nodes_decode(true), 52);
         assert_eq!(fix.nodes_pass(), 1 + (13 + 14) + (12 + 14));
         assert_eq!(fix.nodes_pass(), 54);
         assert_eq!(fix.nodes_slot().expect("joined"), 1 + 2 * 2);
         assert_eq!(fix.nodes_slot().expect("joined"), 5);
 
         let var = Shape::from_layers(variant()).expect("variant");
-        assert_eq!(var.nodes_decode(), 1 + 4 * 21 + 3);
-        assert_eq!(var.nodes_decode(), 88);
+        assert_eq!(var.nodes_decode(true), 1 + 4 * 21 + 3);
+        assert_eq!(var.nodes_decode(true), 88);
         assert_eq!(var.nodes_pass(), 1 + 4 * 21);
         assert_eq!(var.nodes_pass(), 85);
     }
@@ -612,7 +630,7 @@ mod tests {
         };
         let ud = Shape::from_header(&kinds, unjoined).expect("ud");
         assert_eq!(ud.apart(), [true; 4]);
-        assert_eq!((ud.nodes_decode(), ud.nodes_pass()), (88, 85));
+        assert_eq!((ud.nodes_decode(true), ud.nodes_pass()), (88, 85));
         let down_only = |l: usize, site: Site| match site {
             Site::DownShexp => Ok(Q6_K),
             _ => table(l, site),

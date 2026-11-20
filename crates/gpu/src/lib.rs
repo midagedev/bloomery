@@ -1025,13 +1025,372 @@ pub(crate) unsafe fn q8_1_quant_vals(
     refused
 }
 
+/// The Q6_K per-row gemv walk, one warp a row: the lane geometry, windows and
+/// accumulator chains `q6k_gemv` runs. Lives outside the `#[cuda_module]` for
+/// the reason `cores` does: a device-callable body.
+///
+/// The walk of `kernels::q6k_gemv`, of `kernels::q6k_gemv_prefetch` when
+/// `PREFETCH`, and of the qwen3moe fused q·k·v entry's Q6_K rows
+/// (`arch::qwen3moe::proj::qwen3moe_qkv_q4k_q6k`).
+///
+/// # Safety
+///
+/// The arguments meet `q6k_gemv`'s launch contract, `row` is the calling
+/// warp's row as the entry computes it from the thread index, and every
+/// thread of the launch calls it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub(crate) unsafe fn q6k_gemv_walk<const PREFETCH: bool>(
+    row: usize,
+    w: &[u32],
+    q: &[u32],
+    d8: &[f32],
+    n_rows: u32,
+    m_cols: u32,
+    n_sb: u32,
+    iters: u32,
+    mut y: DisjointSlice<f32>,
+) {
+    use crate::cores::{funnel16, half_to_f32, l2_prefetch, q6k_chain, q6k_dequant, q6k_sub_scale};
+    if row >= n_rows as usize {
+        return;
+    }
+    let lane = warp::lane_id() as usize;
+    let m = m_cols as usize;
+    let n_sb = n_sb as usize;
+    let row_bytes = 210 * n_sb;
+    if PREFETCH {
+        l2_prefetch(w, row * row_bytes, row_bytes, lane);
+    }
+    let q_col = 128 * iters as usize; // q8 words per column
+    let d8_col = 2 * n_sb; // 128-value blocks per column
+
+    let w16 = lane & 15; // sub-block within the super-block
+    let half = lane >> 4; // 0: even super-block, 1: odd
+
+    // Per-lane constants (see `q6k_gemv`'s packing comment).
+    let qlok = 16 * (w16 & 3); // ql word base, +16 per word, inside ql
+    let qhok = 16 * (w16 & 1); // qh byte base, +16 per word, inside qh
+    let nib_sh = ((w16 >> 2) & 1) as u32 * 4; // low nibble vs high
+    let hib_sh = 2 * ((w16 >> 1) as u32 & 3); // per-half bit pair
+
+    let mut f0 = 0.0f32;
+    let mut f1 = 0.0f32;
+    let mut f2 = 0.0f32;
+    let mut f3 = 0.0f32;
+    let mut f4 = 0.0f32;
+    let mut f5 = 0.0f32;
+    let mut f6 = 0.0f32;
+    let mut f7 = 0.0f32;
+
+    let mut it: u32 = 0;
+    while it < iters {
+        let sbp = ((it << 1) | half as u32) as usize;
+        // The sbp guard makes a partial final iteration safe; always
+        // true when n_sb is even.
+        if sbp < n_sb {
+            let base = row * row_bytes + sbp * 210; // byte offset
+            // A super-block sits 0 or 2 mod 4 depending on the row's own
+            // offset too (odd n_sb shifts every other row), so the
+            // funnel select comes from the byte window, not from sbp.
+            let par = (base >> 1) & 1;
+
+            // ql window: 4 words at super-block byte 64*(w16>>3) + qlok.
+            let lk = (base + 64 * (w16 >> 3) + qlok) >> 2;
+            // SAFETY: the last window of the last row ends at byte
+            // <= row*row_bytes + row_bytes, and the floored word index
+            // stays inside the row's ceil(row_bytes/4) words (see the
+            // scales window below for the tight bound).
+            let (l0, l1, l2, l3, l4) = unsafe {
+                (
+                    crate::cores::ldcs(w, lk),
+                    crate::cores::ldcs(w, lk + 1),
+                    crate::cores::ldcs(w, lk + 2),
+                    crate::cores::ldcs(w, lk + 3),
+                    crate::cores::ldcs(w, lk + 4),
+                )
+            };
+            let ql0 = if par == 0 { l0 } else { funnel16(l0, l1) };
+            let ql1 = if par == 0 { l1 } else { funnel16(l1, l2) };
+            let ql2 = if par == 0 { l2 } else { funnel16(l2, l3) };
+            let ql3 = if par == 0 { l3 } else { funnel16(l3, l4) };
+
+            // qh window: 4 words at super-block byte 128 + 32*(w16>>3) + qhok.
+            let hk = (base + 128 + 32 * (w16 >> 3) + qhok) >> 2;
+            // SAFETY: same row bounds as the ql window; the qh section
+            // ends at byte 192 of the super-block, before the scales.
+            let (h0, h1, h2, h3, h4) = unsafe {
+                (
+                    crate::cores::ldcs(w, hk),
+                    crate::cores::ldcs(w, hk + 1),
+                    crate::cores::ldcs(w, hk + 2),
+                    crate::cores::ldcs(w, hk + 3),
+                    crate::cores::ldcs(w, hk + 4),
+                )
+            };
+            let qh0 = if par == 0 { h0 } else { funnel16(h0, h1) };
+            let qh1 = if par == 0 { h1 } else { funnel16(h1, h2) };
+            let qh2 = if par == 0 { h2 } else { funnel16(h2, h3) };
+            let qh3 = if par == 0 { h3 } else { funnel16(h3, h4) };
+
+            // scales (16 int8 at super-block byte 192) + d (f16 @208):
+            // one 5-word window, k..k+4. Even: scales are words k..k+3
+            // and d is the low half of word k+4. Odd: the window is
+            // funneled and d is the HIGH half of word k+4 (the same
+            // load f3 uses).
+            let ak = (base + 192) >> 2;
+            // SAFETY: ak+4 <= ceil((row+1)*row_bytes/4) - 1: for the
+            // last super-block of the last row, ak+4 is at most the
+            // buffer's final (possibly zero-padded) word; the launch
+            // contract bounds 4*w.len() >= n_rows*210*n_sb.
+            let (a0, a1, a2, a3, a4) = unsafe {
+                (
+                    crate::cores::ldcs(w, ak),
+                    crate::cores::ldcs(w, ak + 1),
+                    crate::cores::ldcs(w, ak + 2),
+                    crate::cores::ldcs(w, ak + 3),
+                    crate::cores::ldcs(w, ak + 4),
+                )
+            };
+            let (sw0, sw1, sw2, sw3, d_bits) = if par == 0 {
+                (a0, a1, a2, a3, (a4 & 0xffff) as u16)
+            } else {
+                (
+                    funnel16(a0, a1),
+                    funnel16(a1, a2),
+                    funnel16(a2, a3),
+                    funnel16(a3, a4),
+                    (a4 >> 16) as u16,
+                )
+            };
+            // Sub-block scale: byte w16 of the scales window, signed.
+            let sc = q6k_sub_scale(&[sw0, sw1, sw2, sw3], w16);
+            let drow = half_to_f32(d_bits);
+
+            // q6 - 32 per byte: nibble | high-bits<<4, then one SWAR
+            // subtract of 32 (borrow-free with the |0x80 bias).
+            let vi = [
+                q6k_dequant(ql0, qh0, nib_sh, hib_sh),
+                q6k_dequant(ql1, qh1, nib_sh, hib_sh),
+                q6k_dequant(ql2, qh2, nib_sh, hib_sh),
+                q6k_dequant(ql3, qh3, nib_sh, hib_sh),
+            ];
+
+            // q8_1 words in the q6 permutation: word i of column c lives
+            // at q_col*c + 128it + 32i + lane (host-verified identity
+            // with the value-order slot the linear layout used); each
+            // load is 32 lane-consecutive words across the warp.
+            let qb = 128 * it as usize + lane;
+            let d8b = 2 * sbp + (w16 >> 3);
+
+            // Column 0 (always active): one dp4a chain, one FMA.
+            {
+                // SAFETY: qb + 96 + 3 <= q_col - 1 — this lane's four
+                // q8 words are inside the column's q_col words (the
+                // permutation's group bound); d8b < d8_col by the sbp
+                // guard.
+                let (q0, q1, q2, q3, e0) = unsafe {
+                    (
+                        *q.get_unchecked(qb),
+                        *q.get_unchecked(qb + 32),
+                        *q.get_unchecked(qb + 64),
+                        *q.get_unchecked(qb + 96),
+                        *d8.get_unchecked(d8b),
+                    )
+                };
+                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                f0 += (a as f32) * (e0 * drow * sc as f32);
+            }
+            // Columns 1..7, one launch-uniform guard per column so the
+            // work scales with m (the amortization curve over m). Column c
+            // reads q8 words at q_col*c + qb (+32 per word) and block
+            // d8b + d8_col*c.
+            // SAFETY: guard m > c means q.len() >= (c+1)*q_col >
+            // q_col*c + qb + 99 and d8.len() >= (c+1)*d8_col >
+            // d8b + d8_col*c, launch-uniform.
+            if m > 1 {
+                let cb = q_col + qb;
+                let d8c = d8b + d8_col;
+                // SAFETY: m > 1, so q.len() >= 2*q_col > cb + 99 and
+                // d8.len() >= 2*d8_col > d8c.
+                let (q0, q1, q2, q3, e1) = unsafe {
+                    (
+                        *q.get_unchecked(cb),
+                        *q.get_unchecked(cb + 32),
+                        *q.get_unchecked(cb + 64),
+                        *q.get_unchecked(cb + 96),
+                        *d8.get_unchecked(d8c),
+                    )
+                };
+                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                f1 += (a as f32) * (e1 * drow * sc as f32);
+            }
+            if m > 2 {
+                let cb = 2 * q_col + qb;
+                let d8c = d8b + 2 * d8_col;
+                // SAFETY: m > 2, so q.len() >= 3*q_col > cb + 99 and
+                // d8.len() >= 3*d8_col > d8c.
+                let (q0, q1, q2, q3, e2) = unsafe {
+                    (
+                        *q.get_unchecked(cb),
+                        *q.get_unchecked(cb + 32),
+                        *q.get_unchecked(cb + 64),
+                        *q.get_unchecked(cb + 96),
+                        *d8.get_unchecked(d8c),
+                    )
+                };
+                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                f2 += (a as f32) * (e2 * drow * sc as f32);
+            }
+            if m > 3 {
+                let cb = 3 * q_col + qb;
+                let d8c = d8b + 3 * d8_col;
+                // SAFETY: m > 3, so q.len() >= 4*q_col > cb + 99 and
+                // d8.len() >= 4*d8_col > d8c.
+                let (q0, q1, q2, q3, e3) = unsafe {
+                    (
+                        *q.get_unchecked(cb),
+                        *q.get_unchecked(cb + 32),
+                        *q.get_unchecked(cb + 64),
+                        *q.get_unchecked(cb + 96),
+                        *d8.get_unchecked(d8c),
+                    )
+                };
+                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                f3 += (a as f32) * (e3 * drow * sc as f32);
+            }
+            if m > 4 {
+                let cb = 4 * q_col + qb;
+                let d8c = d8b + 4 * d8_col;
+                // SAFETY: m > 4, so q.len() >= 5*q_col > cb + 99 and
+                // d8.len() >= 5*d8_col > d8c.
+                let (q0, q1, q2, q3, e4) = unsafe {
+                    (
+                        *q.get_unchecked(cb),
+                        *q.get_unchecked(cb + 32),
+                        *q.get_unchecked(cb + 64),
+                        *q.get_unchecked(cb + 96),
+                        *d8.get_unchecked(d8c),
+                    )
+                };
+                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                f4 += (a as f32) * (e4 * drow * sc as f32);
+            }
+            if m > 5 {
+                let cb = 5 * q_col + qb;
+                let d8c = d8b + 5 * d8_col;
+                // SAFETY: m > 5, so q.len() >= 6*q_col > cb + 99 and
+                // d8.len() >= 6*d8_col > d8c.
+                let (q0, q1, q2, q3, e5) = unsafe {
+                    (
+                        *q.get_unchecked(cb),
+                        *q.get_unchecked(cb + 32),
+                        *q.get_unchecked(cb + 64),
+                        *q.get_unchecked(cb + 96),
+                        *d8.get_unchecked(d8c),
+                    )
+                };
+                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                f5 += (a as f32) * (e5 * drow * sc as f32);
+            }
+            if m > 6 {
+                let cb = 6 * q_col + qb;
+                let d8c = d8b + 6 * d8_col;
+                // SAFETY: m > 6, so q.len() >= 7*q_col > cb + 99 and
+                // d8.len() >= 7*d8_col > d8c.
+                let (q0, q1, q2, q3, e6) = unsafe {
+                    (
+                        *q.get_unchecked(cb),
+                        *q.get_unchecked(cb + 32),
+                        *q.get_unchecked(cb + 64),
+                        *q.get_unchecked(cb + 96),
+                        *d8.get_unchecked(d8c),
+                    )
+                };
+                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                f6 += (a as f32) * (e6 * drow * sc as f32);
+            }
+            if m > 7 {
+                let cb = 7 * q_col + qb;
+                let d8c = d8b + 7 * d8_col;
+                // SAFETY: m > 7, so q.len() >= 8*q_col > cb + 99 and
+                // d8.len() >= 8*d8_col > d8c.
+                let (q0, q1, q2, q3, e7) = unsafe {
+                    (
+                        *q.get_unchecked(cb),
+                        *q.get_unchecked(cb + 32),
+                        *q.get_unchecked(cb + 64),
+                        *q.get_unchecked(cb + 96),
+                        *d8.get_unchecked(d8c),
+                    )
+                };
+                let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
+                f7 += (a as f32) * (e7 * drow * sc as f32);
+            }
+        }
+
+        it += 1;
+    }
+
+    // Warp-uniform reduction (m is a launch-wide constant). Column c's
+    // reduction runs only when m > c; every lane takes the same branch,
+    // so the shuffles stay warp-collective, and the tail scales with m
+    // exactly like the column bodies above.
+    let s0 = warp::reduce_sum_f32(f0);
+    if m == 1 {
+        if lane == 0 {
+            // SAFETY: only lane 0 writes; warp `row` owns y[row].
+            unsafe {
+                *y.get_unchecked_mut(row) = s0;
+            }
+        }
+    } else {
+        let s1 = warp::reduce_sum_f32(f1);
+        let s2 = if m > 2 { warp::reduce_sum_f32(f2) } else { 0.0 };
+        let s3 = if m > 3 { warp::reduce_sum_f32(f3) } else { 0.0 };
+        let s4 = if m > 4 { warp::reduce_sum_f32(f4) } else { 0.0 };
+        let s5 = if m > 5 { warp::reduce_sum_f32(f5) } else { 0.0 };
+        let s6 = if m > 6 { warp::reduce_sum_f32(f6) } else { 0.0 };
+        let s7 = if m > 7 { warp::reduce_sum_f32(f7) } else { 0.0 };
+        if lane == 0 {
+            // SAFETY: only lane 0 of each warp writes the disjoint
+            // segment y[row*m .. row*m+m]: store c is guarded by m > c,
+            // so exactly the first m slots of the row are touched.
+            unsafe {
+                let b = row * m;
+                *y.get_unchecked_mut(b) = s0;
+                if m > 1 {
+                    *y.get_unchecked_mut(b + 1) = s1;
+                }
+                if m > 2 {
+                    *y.get_unchecked_mut(b + 2) = s2;
+                }
+                if m > 3 {
+                    *y.get_unchecked_mut(b + 3) = s3;
+                }
+                if m > 4 {
+                    *y.get_unchecked_mut(b + 4) = s4;
+                }
+                if m > 5 {
+                    *y.get_unchecked_mut(b + 5) = s5;
+                }
+                if m > 6 {
+                    *y.get_unchecked_mut(b + 6) = s6;
+                }
+                if m > 7 {
+                    *y.get_unchecked_mut(b + 7) = s7;
+                }
+            }
+        }
+    }
+}
 #[cuda_module]
 mod kernels {
     use super::*;
-    use crate::cores::{
-        funnel16, half_to_f32, l2_prefetch, q3k_row_dot, q3k_row_dot_1col, q4k_row_dot,
-        q4k_row_dot_1col, q6k_chain, q6k_dequant, q6k_sub_scale,
-    };
+    use crate::cores::{l2_prefetch, q3k_row_dot, q3k_row_dot_1col, q4k_row_dot, q4k_row_dot_1col};
 
     // Q3_K packing recap (decode verified against ggml's
     // `dequantize_row_q3_K` in the round-1 kernel at 1e-7):
@@ -1564,362 +1923,6 @@ mod kernels {
         // the walk's; `row` is this warp's row; every thread of the launch
         // calls it.
         unsafe { q6k_gemv_walk::<true>(row, w, q, d8, n_rows, m_cols, n_sb, iters, y) }
-    }
-
-    /// The walk of [`q6k_gemv`], and of [`q6k_gemv_prefetch`] when `PREFETCH`.
-    ///
-    /// # Safety
-    ///
-    /// The arguments meet `q6k_gemv`'s launch contract, `row` is the calling
-    /// warp's row as the entry computes it from the thread index, and every
-    /// thread of the launch calls it.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
-    )]
-    #[inline(always)]
-    unsafe fn q6k_gemv_walk<const PREFETCH: bool>(
-        row: usize,
-        w: &[u32],
-        q: &[u32],
-        d8: &[f32],
-        n_rows: u32,
-        m_cols: u32,
-        n_sb: u32,
-        iters: u32,
-        mut y: DisjointSlice<f32>,
-    ) {
-        if row >= n_rows as usize {
-            return;
-        }
-        let lane = warp::lane_id() as usize;
-        let m = m_cols as usize;
-        let n_sb = n_sb as usize;
-        let row_bytes = 210 * n_sb;
-        if PREFETCH {
-            l2_prefetch(w, row * row_bytes, row_bytes, lane);
-        }
-        let q_col = 128 * iters as usize; // q8 words per column
-        let d8_col = 2 * n_sb; // 128-value blocks per column
-
-        let w16 = lane & 15; // sub-block within the super-block
-        let half = lane >> 4; // 0: even super-block, 1: odd
-
-        // Per-lane constants (see the packing comment above).
-        let qlok = 16 * (w16 & 3); // ql word base, +16 per word, inside ql
-        let qhok = 16 * (w16 & 1); // qh byte base, +16 per word, inside qh
-        let nib_sh = ((w16 >> 2) & 1) as u32 * 4; // low nibble vs high
-        let hib_sh = 2 * ((w16 >> 1) as u32 & 3); // per-half bit pair
-
-        let mut f0 = 0.0f32;
-        let mut f1 = 0.0f32;
-        let mut f2 = 0.0f32;
-        let mut f3 = 0.0f32;
-        let mut f4 = 0.0f32;
-        let mut f5 = 0.0f32;
-        let mut f6 = 0.0f32;
-        let mut f7 = 0.0f32;
-
-        let mut it: u32 = 0;
-        while it < iters {
-            let sbp = ((it << 1) | half as u32) as usize;
-            // The sbp guard makes a partial final iteration safe; always
-            // true when n_sb is even.
-            if sbp < n_sb {
-                let base = row * row_bytes + sbp * 210; // byte offset
-                // A super-block sits 0 or 2 mod 4 depending on the row's own
-                // offset too (odd n_sb shifts every other row), so the
-                // funnel select comes from the byte window, not from sbp.
-                let par = (base >> 1) & 1;
-
-                // ql window: 4 words at super-block byte 64*(w16>>3) + qlok.
-                let lk = (base + 64 * (w16 >> 3) + qlok) >> 2;
-                // SAFETY: the last window of the last row ends at byte
-                // <= row*row_bytes + row_bytes, and the floored word index
-                // stays inside the row's ceil(row_bytes/4) words (see the
-                // scales window below for the tight bound).
-                let (l0, l1, l2, l3, l4) = unsafe {
-                    (
-                        crate::cores::ldcs(w, lk),
-                        crate::cores::ldcs(w, lk + 1),
-                        crate::cores::ldcs(w, lk + 2),
-                        crate::cores::ldcs(w, lk + 3),
-                        crate::cores::ldcs(w, lk + 4),
-                    )
-                };
-                let ql0 = if par == 0 { l0 } else { funnel16(l0, l1) };
-                let ql1 = if par == 0 { l1 } else { funnel16(l1, l2) };
-                let ql2 = if par == 0 { l2 } else { funnel16(l2, l3) };
-                let ql3 = if par == 0 { l3 } else { funnel16(l3, l4) };
-
-                // qh window: 4 words at super-block byte 128 + 32*(w16>>3) + qhok.
-                let hk = (base + 128 + 32 * (w16 >> 3) + qhok) >> 2;
-                // SAFETY: same row bounds as the ql window; the qh section
-                // ends at byte 192 of the super-block, before the scales.
-                let (h0, h1, h2, h3, h4) = unsafe {
-                    (
-                        crate::cores::ldcs(w, hk),
-                        crate::cores::ldcs(w, hk + 1),
-                        crate::cores::ldcs(w, hk + 2),
-                        crate::cores::ldcs(w, hk + 3),
-                        crate::cores::ldcs(w, hk + 4),
-                    )
-                };
-                let qh0 = if par == 0 { h0 } else { funnel16(h0, h1) };
-                let qh1 = if par == 0 { h1 } else { funnel16(h1, h2) };
-                let qh2 = if par == 0 { h2 } else { funnel16(h2, h3) };
-                let qh3 = if par == 0 { h3 } else { funnel16(h3, h4) };
-
-                // scales (16 int8 at super-block byte 192) + d (f16 @208):
-                // one 5-word window, k..k+4. Even: scales are words k..k+3
-                // and d is the low half of word k+4. Odd: the window is
-                // funneled and d is the HIGH half of word k+4 (the same
-                // load f3 uses).
-                let ak = (base + 192) >> 2;
-                // SAFETY: ak+4 <= ceil((row+1)*row_bytes/4) - 1: for the
-                // last super-block of the last row, ak+4 is at most the
-                // buffer's final (possibly zero-padded) word; the launch
-                // contract bounds 4*w.len() >= n_rows*210*n_sb.
-                let (a0, a1, a2, a3, a4) = unsafe {
-                    (
-                        crate::cores::ldcs(w, ak),
-                        crate::cores::ldcs(w, ak + 1),
-                        crate::cores::ldcs(w, ak + 2),
-                        crate::cores::ldcs(w, ak + 3),
-                        crate::cores::ldcs(w, ak + 4),
-                    )
-                };
-                let (sw0, sw1, sw2, sw3, d_bits) = if par == 0 {
-                    (a0, a1, a2, a3, (a4 & 0xffff) as u16)
-                } else {
-                    (
-                        funnel16(a0, a1),
-                        funnel16(a1, a2),
-                        funnel16(a2, a3),
-                        funnel16(a3, a4),
-                        (a4 >> 16) as u16,
-                    )
-                };
-                // Sub-block scale: byte w16 of the scales window, signed.
-                let sc = q6k_sub_scale(&[sw0, sw1, sw2, sw3], w16);
-                let drow = half_to_f32(d_bits);
-
-                // q6 - 32 per byte: nibble | high-bits<<4, then one SWAR
-                // subtract of 32 (borrow-free with the |0x80 bias).
-                let vi = [
-                    q6k_dequant(ql0, qh0, nib_sh, hib_sh),
-                    q6k_dequant(ql1, qh1, nib_sh, hib_sh),
-                    q6k_dequant(ql2, qh2, nib_sh, hib_sh),
-                    q6k_dequant(ql3, qh3, nib_sh, hib_sh),
-                ];
-
-                // q8_1 words in the q6 permutation: word i of column c lives
-                // at q_col*c + 128it + 32i + lane (host-verified identity
-                // with the value-order slot the linear layout used); each
-                // load is 32 lane-consecutive words across the warp.
-                let qb = 128 * it as usize + lane;
-                let d8b = 2 * sbp + (w16 >> 3);
-
-                // Column 0 (always active): one dp4a chain, one FMA.
-                {
-                    // SAFETY: qb + 96 + 3 <= q_col - 1 — this lane's four
-                    // q8 words are inside the column's q_col words (the
-                    // permutation's group bound); d8b < d8_col by the sbp
-                    // guard.
-                    let (q0, q1, q2, q3, e0) = unsafe {
-                        (
-                            *q.get_unchecked(qb),
-                            *q.get_unchecked(qb + 32),
-                            *q.get_unchecked(qb + 64),
-                            *q.get_unchecked(qb + 96),
-                            *d8.get_unchecked(d8b),
-                        )
-                    };
-                    let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                    f0 += (a as f32) * (e0 * drow * sc as f32);
-                }
-                // Columns 1..7, one launch-uniform guard per column so the
-                // work scales with m (the amortization curve over m). Column c
-                // reads q8 words at q_col*c + qb (+32 per word) and block
-                // d8b + d8_col*c.
-                // SAFETY: guard m > c means q.len() >= (c+1)*q_col >
-                // q_col*c + qb + 99 and d8.len() >= (c+1)*d8_col >
-                // d8b + d8_col*c, launch-uniform.
-                if m > 1 {
-                    let cb = q_col + qb;
-                    let d8c = d8b + d8_col;
-                    // SAFETY: m > 1, so q.len() >= 2*q_col > cb + 99 and
-                    // d8.len() >= 2*d8_col > d8c.
-                    let (q0, q1, q2, q3, e1) = unsafe {
-                        (
-                            *q.get_unchecked(cb),
-                            *q.get_unchecked(cb + 32),
-                            *q.get_unchecked(cb + 64),
-                            *q.get_unchecked(cb + 96),
-                            *d8.get_unchecked(d8c),
-                        )
-                    };
-                    let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                    f1 += (a as f32) * (e1 * drow * sc as f32);
-                }
-                if m > 2 {
-                    let cb = 2 * q_col + qb;
-                    let d8c = d8b + 2 * d8_col;
-                    // SAFETY: m > 2, so q.len() >= 3*q_col > cb + 99 and
-                    // d8.len() >= 3*d8_col > d8c.
-                    let (q0, q1, q2, q3, e2) = unsafe {
-                        (
-                            *q.get_unchecked(cb),
-                            *q.get_unchecked(cb + 32),
-                            *q.get_unchecked(cb + 64),
-                            *q.get_unchecked(cb + 96),
-                            *d8.get_unchecked(d8c),
-                        )
-                    };
-                    let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                    f2 += (a as f32) * (e2 * drow * sc as f32);
-                }
-                if m > 3 {
-                    let cb = 3 * q_col + qb;
-                    let d8c = d8b + 3 * d8_col;
-                    // SAFETY: m > 3, so q.len() >= 4*q_col > cb + 99 and
-                    // d8.len() >= 4*d8_col > d8c.
-                    let (q0, q1, q2, q3, e3) = unsafe {
-                        (
-                            *q.get_unchecked(cb),
-                            *q.get_unchecked(cb + 32),
-                            *q.get_unchecked(cb + 64),
-                            *q.get_unchecked(cb + 96),
-                            *d8.get_unchecked(d8c),
-                        )
-                    };
-                    let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                    f3 += (a as f32) * (e3 * drow * sc as f32);
-                }
-                if m > 4 {
-                    let cb = 4 * q_col + qb;
-                    let d8c = d8b + 4 * d8_col;
-                    // SAFETY: m > 4, so q.len() >= 5*q_col > cb + 99 and
-                    // d8.len() >= 5*d8_col > d8c.
-                    let (q0, q1, q2, q3, e4) = unsafe {
-                        (
-                            *q.get_unchecked(cb),
-                            *q.get_unchecked(cb + 32),
-                            *q.get_unchecked(cb + 64),
-                            *q.get_unchecked(cb + 96),
-                            *d8.get_unchecked(d8c),
-                        )
-                    };
-                    let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                    f4 += (a as f32) * (e4 * drow * sc as f32);
-                }
-                if m > 5 {
-                    let cb = 5 * q_col + qb;
-                    let d8c = d8b + 5 * d8_col;
-                    // SAFETY: m > 5, so q.len() >= 6*q_col > cb + 99 and
-                    // d8.len() >= 6*d8_col > d8c.
-                    let (q0, q1, q2, q3, e5) = unsafe {
-                        (
-                            *q.get_unchecked(cb),
-                            *q.get_unchecked(cb + 32),
-                            *q.get_unchecked(cb + 64),
-                            *q.get_unchecked(cb + 96),
-                            *d8.get_unchecked(d8c),
-                        )
-                    };
-                    let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                    f5 += (a as f32) * (e5 * drow * sc as f32);
-                }
-                if m > 6 {
-                    let cb = 6 * q_col + qb;
-                    let d8c = d8b + 6 * d8_col;
-                    // SAFETY: m > 6, so q.len() >= 7*q_col > cb + 99 and
-                    // d8.len() >= 7*d8_col > d8c.
-                    let (q0, q1, q2, q3, e6) = unsafe {
-                        (
-                            *q.get_unchecked(cb),
-                            *q.get_unchecked(cb + 32),
-                            *q.get_unchecked(cb + 64),
-                            *q.get_unchecked(cb + 96),
-                            *d8.get_unchecked(d8c),
-                        )
-                    };
-                    let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                    f6 += (a as f32) * (e6 * drow * sc as f32);
-                }
-                if m > 7 {
-                    let cb = 7 * q_col + qb;
-                    let d8c = d8b + 7 * d8_col;
-                    // SAFETY: m > 7, so q.len() >= 8*q_col > cb + 99 and
-                    // d8.len() >= 8*d8_col > d8c.
-                    let (q0, q1, q2, q3, e7) = unsafe {
-                        (
-                            *q.get_unchecked(cb),
-                            *q.get_unchecked(cb + 32),
-                            *q.get_unchecked(cb + 64),
-                            *q.get_unchecked(cb + 96),
-                            *d8.get_unchecked(d8c),
-                        )
-                    };
-                    let a = q6k_chain(&vi, &[q0, q1, q2, q3]);
-                    f7 += (a as f32) * (e7 * drow * sc as f32);
-                }
-            }
-
-            it += 1;
-        }
-
-        // Warp-uniform reduction (m is a launch-wide constant). Column c's
-        // reduction runs only when m > c; every lane takes the same branch,
-        // so the shuffles stay warp-collective, and the tail scales with m
-        // exactly like the column bodies above.
-        let s0 = warp::reduce_sum_f32(f0);
-        if m == 1 {
-            if lane == 0 {
-                // SAFETY: only lane 0 writes; warp `row` owns y[row].
-                unsafe {
-                    *y.get_unchecked_mut(row) = s0;
-                }
-            }
-        } else {
-            let s1 = warp::reduce_sum_f32(f1);
-            let s2 = if m > 2 { warp::reduce_sum_f32(f2) } else { 0.0 };
-            let s3 = if m > 3 { warp::reduce_sum_f32(f3) } else { 0.0 };
-            let s4 = if m > 4 { warp::reduce_sum_f32(f4) } else { 0.0 };
-            let s5 = if m > 5 { warp::reduce_sum_f32(f5) } else { 0.0 };
-            let s6 = if m > 6 { warp::reduce_sum_f32(f6) } else { 0.0 };
-            let s7 = if m > 7 { warp::reduce_sum_f32(f7) } else { 0.0 };
-            if lane == 0 {
-                // SAFETY: only lane 0 of each warp writes the disjoint
-                // segment y[row*m .. row*m+m]: store c is guarded by m > c,
-                // so exactly the first m slots of the row are touched.
-                unsafe {
-                    let b = row * m;
-                    *y.get_unchecked_mut(b) = s0;
-                    if m > 1 {
-                        *y.get_unchecked_mut(b + 1) = s1;
-                    }
-                    if m > 2 {
-                        *y.get_unchecked_mut(b + 2) = s2;
-                    }
-                    if m > 3 {
-                        *y.get_unchecked_mut(b + 3) = s3;
-                    }
-                    if m > 4 {
-                        *y.get_unchecked_mut(b + 4) = s4;
-                    }
-                    if m > 5 {
-                        *y.get_unchecked_mut(b + 5) = s5;
-                    }
-                    if m > 6 {
-                        *y.get_unchecked_mut(b + 6) = s6;
-                    }
-                    if m > 7 {
-                        *y.get_unchecked_mut(b + 7) = s7;
-                    }
-                }
-            }
-        }
     }
 
     /// Q3_K (K = 256*n_sb values, n_sb super-blocks per row) times q8_1

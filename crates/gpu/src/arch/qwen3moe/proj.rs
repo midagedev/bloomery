@@ -1,6 +1,9 @@
 //! A qwen3moe layer's attention projections in two launches beside the
 //! flash: the query, key and value rows in one (`qwen3moe_qkv_q4k`; a Q6_K
-//! value projection keeps its own `q6k_gemv` launch), and the output
+//! value projection keeps its own `q6k_gemv` launch, except at one column
+//! on a card that launches the plain entries, where
+//! `qwen3moe_qkv_q4k_q6k` folds it in as the launch's first rows — the
+//! same fold a Q6_K delta layer's q·k·v takes there), and the output
 //! projection with the residual add in its store (`qwen3moe_o_resid_q4k`).
 //! `q6k_gemv` writes `m > 1` columns row-major; [`TokenMajor`] copies them
 //! into the token-major layout the rest of the chain reads.
@@ -8,7 +11,8 @@
 //! Every projection has two entries, split by column count the way
 //! `q4k_gemv` and `q4k_gemv_mcol` are, and its one-column entry a
 //! `_prefetch` twin that an integrated device launches instead
-//! ([`crate::row_prefetch`]). The one-column entries
+//! ([`crate::row_prefetch`]) — the fold entry alone has neither twin: it
+//! runs only where the plain entries do. The one-column entries
 //! (`qwen3moe_qkv_q4k`, `qwen3moe_o_resid_q4k`) run the step (m = 1), every
 //! row and column `q4k_gemv`'s one-column body: `cores::q4k_row_dot_1col`,
 //! the fixed warp tree and the lane-0 store, run once per activation
@@ -346,6 +350,130 @@ mod qwen3moe_proj_kernels {
         }
     }
 
+    /// The query, key and value projections of one activation column over a
+    /// Q4_K group and a Q6_K matrix in one launch (module doc): thread row
+    /// `row = block·8 + warp` is, first, one of the Q6_K matrix's `rows6`
+    /// rows — the exact walk `q6k_gemv` runs at one column, stored at
+    /// `off6 + row` — then, as in `qwen3moe_qkv_q4k`, row `row − rows6` of
+    /// `wq`, then `wk`, then `wv`, stored at `off_q`, `off_k` and `off_v`
+    /// plus the row's index in its matrix. The Q6_K rows come first in the
+    /// row order: they are the longest, so the tail wave holds the Q4_K rows.
+    ///
+    /// Every output is bit for bit the value one of the two launches it
+    /// folds writes (`q6k_gemv`, `qwen3moe_qkv_q4k` at one column): the Q6_K
+    /// rows run `q6k_gemv`'s own walk and store where its launch's output
+    /// block sits, the Q4_K rows the one-column body that entry runs, at the
+    /// same offsets. The four output blocks tile `y` apart — the host
+    /// enqueue refuses overlaps by name, and `rows_v` 0 leaves `wv` and its
+    /// block untouched, as `qwen3moe_qkv_q4k`'s does.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            4 * w6.len() >= rows6 * 210 * n_sb,
+            wq.len() >= rows_q * 36 * n_sb,
+            wk.len() >= rows_k * 36 * n_sb,
+            wv.len() >= rows_v * 36 * n_sb,
+            q4.len() >= 256 * iters4,
+            s8.len() >= 8 * n_sb,
+            q6.len() >= 128 * iters6,
+            d8.len() >= 2 * n_sb,
+            y.len() >= off6 + rows6,
+            y.len() >= off_q + rows_q,
+            y.len() >= off_k + rows_k,
+            y.len() >= off_v + rows_v
+        )
+    )]
+    pub fn qwen3moe_qkv_q4k_q6k(
+        w6: &[u32],
+        wq: &[u32],
+        wk: &[u32],
+        wv: &[u32],
+        q4: &[u32],
+        s8: &[i32],
+        q6: &[u32],
+        d8: &[f32],
+        rows6: u32,
+        rows_q: u32,
+        rows_k: u32,
+        rows_v: u32,
+        n_sb: u32,
+        iters4: u32,
+        iters6: u32,
+        off6: u32,
+        off_q: u32,
+        off_k: u32,
+        off_v: u32,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % 256;
+        let row = (thread::index_1d().get() / 256) * 8 + t / 32;
+        let (r6, rq, rk, rv) = (
+            rows6 as usize,
+            rows_q as usize,
+            rows_k as usize,
+            rows_v as usize,
+        );
+        if row >= r6 + rq + rk + rv {
+            return;
+        }
+        let lane = warp::lane_id() as usize;
+        if row < r6 {
+            // The Q6_K rows: `q6k_gemv`'s own walk at the constant one
+            // column, over the output window at off6 (the column blocks
+            // past the first fold away in the inlined walk, so the row's
+            // value and its lane-0 store are that launch's bits).
+            // SAFETY: off6 + rows6 <= y.len() by the launch contract, so
+            // y.len() - off6 cannot underflow and the window holds the
+            // walk's rows6 outputs. This branch is warp-uniform (the warp's
+            // 32 lanes share `row`), its warps write only the window — lane
+            // 0 of each, the walk's own store — and the Q4_K rows' warps
+            // below write only the other three blocks, so no slot has two
+            // writers.
+            let y6 = unsafe {
+                DisjointSlice::from_raw_parts(
+                    y.as_mut_ptr().add(off6 as usize),
+                    y.len() - off6 as usize,
+                )
+            };
+            // SAFETY: the arguments meet `q6k_gemv`'s launch contract as this
+            // entry's states it: rows6 rows of w6 (4·w6.len() >=
+            // rows6·210·n_sb), one column of q6 and d8 (q6.len() >= 128·iters6,
+            // d8.len() >= 2·n_sb), y6 of rows6 values, and every thread of
+            // the warp is here.
+            unsafe { crate::q6k_gemv_walk::<false>(row, w6, q6, d8, rows6, 1, n_sb, iters6, y6) };
+            return;
+        }
+        let n_sb = n_sb as usize;
+        let row4 = row - r6;
+        // The row's Q4_K matrix and its output block, warp-uniform: the
+        // warp's 32 lanes share `row4`.
+        let (w, base, r) = if row4 < rq {
+            (wq, off_q as usize, row4)
+        } else if row4 < rq + rk {
+            (wk, off_k as usize, row4 - rq)
+        } else {
+            (wv, off_v as usize, row4 - rq - rk)
+        };
+        // The core's caller contract, from the launch contract: r < rows
+        // rows of `w`, one column of q4/s8/d8, iters4 = ceil(n_sb/4) from
+        // the host, and all 32 lanes of the warp are here (the return above
+        // is warp-uniform), as `qwen3moe_qkv_q4k` at one column.
+        let v = warp::reduce_sum_f32(q4k_row_dot_1col(w, q4, s8, d8, n_sb, iters4, r, 0, lane));
+        if lane == 0 {
+            // SAFETY: r is under its block's row count, so base + r < y.len()
+            // by the launch contract; lane 0 of the row's warp is the only writer
+            // of the row's slot.
+            unsafe { *y.get_unchecked_mut(base + r) = v };
+        }
+    }
+
     /// The output projection of `m_cols` activation columns with the
     /// residual: `y[c · rows + r] = (w · act_c)[r] + x[c · rows + r]`, the
     /// dot as `q4k_gemv` computes it and one add (module doc).
@@ -621,6 +749,25 @@ pub struct QkvArgs<'a> {
     pub off_v: usize,
 }
 
+/// [`ProjKernels::enqueue_qkv_q6k`]'s arguments: the Q6_K matrix, its rows
+/// first in the launch's row order and its output block at `off6`; the Q4_K
+/// group in row order (`wv` `None` leaves its block untouched); the
+/// quantized input, one column (`act.m()` 1); and the one output allocation
+/// holding each matrix's block at its offset, token-major — the four blocks
+/// apart, which the enqueue refuses by name.
+pub struct QkvQ6kArgs<'a> {
+    pub w6: &'a DeviceTensor<u32>,
+    pub wq: &'a DeviceTensor<u32>,
+    pub wk: &'a DeviceTensor<u32>,
+    pub wv: Option<&'a DeviceTensor<u32>>,
+    pub act: &'a Q8Act,
+    pub y: &'a mut DeviceBuffer<f32>,
+    pub off6: usize,
+    pub off_q: usize,
+    pub off_k: usize,
+    pub off_v: usize,
+}
+
 /// [`ProjKernels::enqueue_o_resid`]'s arguments: the Q4_K output projection,
 /// its quantized input (`act.m()` columns), the residual and the output,
 /// both token-major `act.m() · w.rows()`.
@@ -806,6 +953,148 @@ impl ProjKernels {
                 y,
             )?;
         }
+        Ok(())
+    }
+
+    /// Enqueue the query, key and value projections of `a.act`'s one column
+    /// over a Q6_K matrix and a Q4_K group in one launch (module doc): the
+    /// Q6_K rows first, the group's in its order, each matrix's output block
+    /// at its offset of `y`. The plain entry only — an integrated device's
+    /// `_prefetch` gemvs keep the two launches, and the caller picks. Refuses
+    /// by name a shape it cannot take: more than one column, an odd
+    /// super-block count (Q6_K rows unaligned), a weight of the wrong width
+    /// for its type, and output blocks that run past `y` or overlap.
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_qkv_q6k(&self, stream: &CudaStream, a: QkvQ6kArgs<'_>) -> Result<(), GpuError> {
+        let what = "qwen3moe::enqueue_qkv_q6k";
+        let QkvQ6kArgs {
+            w6,
+            wq,
+            wk,
+            wv,
+            act,
+            y,
+            off6,
+            off_q,
+            off_k,
+            off_v,
+        } = a;
+        let n_sb = act.n_sb();
+        if act.m() != 1 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the fused Q4_K·Q6_K q·k·v is the one-column launch; the activation holds \
+                     {} columns",
+                    act.m()
+                ),
+            ));
+        }
+        if !n_sb.is_multiple_of(2) {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "odd super-block count {n_sb} (K={}) leaves the Q6_K rows unaligned; \
+                     repack rows at load time",
+                    act.k()
+                ),
+            ));
+        }
+        if w6.cols() != 210 * n_sb / 4 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the Q6_K rows are 210*{n_sb}/4 = {} words at K={}, got {}x{}",
+                    210 * n_sb / 4,
+                    act.k(),
+                    w6.rows(),
+                    w6.cols()
+                ),
+            ));
+        }
+        if off6 > y.len() || w6.rows() > y.len() - off6 {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "the Q6_K block [{off6}..{}) runs past the {}-value output",
+                    off6 + w6.rows(),
+                    y.len()
+                ),
+            ));
+        }
+        check_q4k(what, "q", wq, act, y.len().saturating_sub(off_q))?;
+        check_q4k(what, "k", wk, act, y.len().saturating_sub(off_k))?;
+        let rows_v = match wv {
+            Some(v) => {
+                check_q4k(what, "v", v, act, y.len().saturating_sub(off_v))?;
+                v.rows()
+            }
+            None => 0,
+        };
+        // The four blocks tile `y` apart; the grammar of a launch contract
+        // states no order between four unsigned offsets, so the disjointness
+        // is refused here, at the one boundary every launch crosses.
+        let blocks = [
+            ("the Q6_K block", off6, w6.rows()),
+            ("q", off_q, wq.rows()),
+            ("k", off_k, wk.rows()),
+            ("v", off_v, rows_v),
+        ];
+        for (i, (na, oa, ra)) in blocks.iter().enumerate() {
+            for (nb, ob, rb) in blocks.iter().skip(i + 1) {
+                if *oa < *ob + *rb && *ob < *oa + *ra {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "{na}'s block [{oa}..{}) and {nb}'s [{ob}..{}) overlap",
+                            *oa + *ra,
+                            *ob + *rb
+                        ),
+                    ));
+                }
+            }
+        }
+        let grid = launch_u32(
+            what,
+            "grid",
+            (w6.rows() + wq.rows() + wk.rows() + rows_v).div_ceil(8),
+        )?;
+        let rows6 = launch_u32(what, "rows6", w6.rows())?;
+        let rows_q = launch_u32(what, "rows_q", wq.rows())?;
+        let rows_k = launch_u32(what, "rows_k", wk.rows())?;
+        let rows_v = launch_u32(what, "rows_v", rows_v)?;
+        let n_sb = launch_u32(what, "n_sb", n_sb)?;
+        let off6 = launch_u32(what, "off6", off6)?;
+        let off_q = launch_u32(what, "off_q", off_q)?;
+        let off_k = launch_u32(what, "off_k", off_k)?;
+        let off_v = launch_u32(what, "off_v", off_v)?;
+        let prep = self
+            .module
+            .prepare_qwen3moe_qkv_q4k_q6k(LaunchConfig1D::new(grid, 256, 0))?;
+        self.module.qwen3moe_qkv_q4k_q6k(
+            stream,
+            &prep,
+            w6.buf(),
+            wq.buf(),
+            wk.buf(),
+            wv.unwrap_or(wq).buf(),
+            &act.q4,
+            &act.s8,
+            &act.q6,
+            &act.d8,
+            rows6,
+            rows_q,
+            rows_k,
+            rows_v,
+            n_sb,
+            n_sb.div_ceil(4),
+            n_sb.div_ceil(2),
+            off6,
+            off_q,
+            off_k,
+            off_v,
+            y,
+        )?;
         Ok(())
     }
 
