@@ -1,0 +1,24 @@
+# The PDL probe (pdl_probe: a 128-launch chain, 640 blocks x 7.9 MB each) on the 5090: rewritten edges instantiate and
+# stay ordered; a wait-first secondary takes 0.094 us a boundary back, a weight-first one 1.12 us. The engine probe:
+# the gemvs' _prefetch entries trigger, prefetch their row to L2, then wait (sel entries wait before reading ids),
+# and every kernel edge into them is programmatic. The prefetch entries alone cost 3.21 % (rowpf5090.card); ~300
+# gemv boundaries x up to 1.1 us = up to 0.33 ms = +2.9 % [derived], against the same entries with their edges as captured, the PDL term alone.
+kind: ab
+question: does programmatic dependent launch into the gemv prefetch entries speed a full-card decode step?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of the q4v4 tree with
+  PDLPROBE=pdl (prefetch entries with trigger, prefetch, wait; edges into them programmatic) against the same tree built with PDLPROBE=pf (the same entries, edges as captured), (probe - q4v4) / q4v4
+unit: %
+predict: +0.5..+2.9
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W
+decide-in: inside: the overlap is real; try PDL on the plain entries with a register-only prologue
+decide-below: under +0.5: the overlap does not pay at these grids; close PDL for the gemvs
+decide-above: above +2.9: read nsys before crediting
+# outcome 2026-11-21, pdl-bin (2a65fcadd521: 289 edges of the 804-node decode graph rewritten programmatic, the
+#  binary's own line) against pf2-bin (543700eed793, the same entries, edges as captured), RTX 5090 600 W, one lease,
+#  6 rounds, depth 512: decode 83.55 tok/s [83.53..83.58] against 83.88 [83.86..83.90], round ratios 0.99617 0.99593
+#  0.99601 0.99608 0.99603 0.99616 = -0.39 %. Below the band: decide-below. Secondary blocks launched early hold SM
+#  slots through the primary's tail while their row prefetch competes with the primary's loads; the chain probe's
+#  1.1 us a boundary does not carry to kernels whose grids already fill the card. PDL stays closed for the gemvs.

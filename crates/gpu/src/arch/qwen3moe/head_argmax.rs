@@ -140,11 +140,11 @@ mod qwen3moe_head_kernels {
                     // window stays inside the row's words, as in q6k_gemv).
                     let (l0, l1, l2, l3, l4) = unsafe {
                         (
-                            *w.get_unchecked(lk),
-                            *w.get_unchecked(lk + 1),
-                            *w.get_unchecked(lk + 2),
-                            *w.get_unchecked(lk + 3),
-                            *w.get_unchecked(lk + 4),
+                            crate::cores::ldcs(w, lk),
+                            crate::cores::ldcs(w, lk + 1),
+                            crate::cores::ldcs(w, lk + 2),
+                            crate::cores::ldcs(w, lk + 3),
+                            crate::cores::ldcs(w, lk + 4),
                         )
                     };
                     let ql0 = if par == 0 { l0 } else { funnel16(l0, l1) };
@@ -156,11 +156,11 @@ mod qwen3moe_head_kernels {
                     // SAFETY: the same row bounds as the ql window.
                     let (h0, h1, h2, h3, h4) = unsafe {
                         (
-                            *w.get_unchecked(hk),
-                            *w.get_unchecked(hk + 1),
-                            *w.get_unchecked(hk + 2),
-                            *w.get_unchecked(hk + 3),
-                            *w.get_unchecked(hk + 4),
+                            crate::cores::ldcs(w, hk),
+                            crate::cores::ldcs(w, hk + 1),
+                            crate::cores::ldcs(w, hk + 2),
+                            crate::cores::ldcs(w, hk + 3),
+                            crate::cores::ldcs(w, hk + 4),
                         )
                     };
                     let qh0 = if par == 0 { h0 } else { funnel16(h0, h1) };
@@ -174,11 +174,11 @@ mod qwen3moe_head_kernels {
                     // 4·w.len().
                     let (a0, a1, a2, a3, a4) = unsafe {
                         (
-                            *w.get_unchecked(ak),
-                            *w.get_unchecked(ak + 1),
-                            *w.get_unchecked(ak + 2),
-                            *w.get_unchecked(ak + 3),
-                            *w.get_unchecked(ak + 4),
+                            crate::cores::ldcs(w, ak),
+                            crate::cores::ldcs(w, ak + 1),
+                            crate::cores::ldcs(w, ak + 2),
+                            crate::cores::ldcs(w, ak + 3),
+                            crate::cores::ldcs(w, ak + 4),
                         )
                     };
                     let (sw0, sw1, sw2, sw3, d_bits) = if par == 0 {
@@ -363,11 +363,11 @@ mod qwen3moe_head_kernels {
                     // window stays inside the row's words, as in q6k_gemv).
                     let (l0, l1, l2, l3, l4) = unsafe {
                         (
-                            *w.get_unchecked(lk),
-                            *w.get_unchecked(lk + 1),
-                            *w.get_unchecked(lk + 2),
-                            *w.get_unchecked(lk + 3),
-                            *w.get_unchecked(lk + 4),
+                            crate::cores::ldcs(w, lk),
+                            crate::cores::ldcs(w, lk + 1),
+                            crate::cores::ldcs(w, lk + 2),
+                            crate::cores::ldcs(w, lk + 3),
+                            crate::cores::ldcs(w, lk + 4),
                         )
                     };
                     let ql0 = if par == 0 { l0 } else { funnel16(l0, l1) };
@@ -379,11 +379,11 @@ mod qwen3moe_head_kernels {
                     // SAFETY: the same row bounds as the ql window.
                     let (h0, h1, h2, h3, h4) = unsafe {
                         (
-                            *w.get_unchecked(hk),
-                            *w.get_unchecked(hk + 1),
-                            *w.get_unchecked(hk + 2),
-                            *w.get_unchecked(hk + 3),
-                            *w.get_unchecked(hk + 4),
+                            crate::cores::ldcs(w, hk),
+                            crate::cores::ldcs(w, hk + 1),
+                            crate::cores::ldcs(w, hk + 2),
+                            crate::cores::ldcs(w, hk + 3),
+                            crate::cores::ldcs(w, hk + 4),
                         )
                     };
                     let qh0 = if par == 0 { h0 } else { funnel16(h0, h1) };
@@ -397,11 +397,11 @@ mod qwen3moe_head_kernels {
                     // 4·w.len().
                     let (a0, a1, a2, a3, a4) = unsafe {
                         (
-                            *w.get_unchecked(ak),
-                            *w.get_unchecked(ak + 1),
-                            *w.get_unchecked(ak + 2),
-                            *w.get_unchecked(ak + 3),
-                            *w.get_unchecked(ak + 4),
+                            crate::cores::ldcs(w, ak),
+                            crate::cores::ldcs(w, ak + 1),
+                            crate::cores::ldcs(w, ak + 2),
+                            crate::cores::ldcs(w, ak + 3),
+                            crate::cores::ldcs(w, ak + 4),
                         )
                     };
                     let (sw0, sw1, sw2, sw3, d_bits) = if par == 0 {

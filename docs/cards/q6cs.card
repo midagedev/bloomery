@@ -1,0 +1,21 @@
+# After q4hint-cs.card (+0.64 % on the Q4_K walk): the Q6_K walks' weight words (q6k_gemv_sel, q6k_gemv and the
+# head, fifteen word loads a lane an iteration from 210-byte super-blocks, no 16-byte alignment) as cache-streaming
+# word loads (ld.global.cs.u32). Q6_K carries ~1.5 + 0.74 + 0.62 ms of the step against Q4_K's ~6 [derived from the
+# gemv5090 table]; at the Q4_K hint's rate per byte the band's top is ~+0.3 %; word loads through inline asm may
+# also cost the scheduler [derived].
+kind: ab
+question: does the cs hint on the Q6_K walks' weight loads speed a full-card decode step?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of the q4cs tree with
+  the Q6_K weight words as ld.global.cs.u32 against the q4cs binary (cs-bin 84bbb998fac4), (probe - base) / base
+unit: %
+predict: +0.1..+0.5
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W
+decide-in: above +0.1: land the hint with the Q4_K gates bit for bit
+decide-below: under +0.1: the hint does not pay; keep the default cache policy
+decide-above: above +0.5: read nsys before crediting
+# outcome 2026-11-21, q6cs-bin (5b30f86d4de9) against cs-bin (84bbb998fac4), RTX 5090 600 W, one lease, 6 rounds, depth
+#  512: decode 87.50 tok/s [87.47..87.51] against 87.24 [87.23..87.26], round ratios 1.00286 1.00303 1.00297 1.00295
+#  1.00290 1.00268 = +0.29 %. In the band: decide-in.

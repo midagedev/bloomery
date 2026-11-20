@@ -353,6 +353,24 @@ unsafe fn ld4_u32(g: u64) -> [u32; 4] {
     [a, b, c, d]
 }
 
+/// Word `i` of `w` in one cache-streaming (`.cs`, evict-first) load: the
+/// Q6_K walks' weight words, read once a step like the Q4_K walk's
+/// ([`ld4_u32`]).
+///
+/// # Safety
+///
+/// `i < w.len()`.
+#[inline(always)]
+pub(crate) unsafe fn ldcs(w: &[u32], i: usize) -> u32 {
+    let g = global_addr(w.as_ptr()) + 4 * i as u64;
+    let a: u32;
+    // SAFETY: the caller's contract puts word i inside `w`.
+    unsafe {
+        ptx_asm!("ld.global.cs.u32 %0, [%1];", out("=r") a, in("l") g);
+    }
+    a
+}
+
 /// Everything one Q4_K super-block yields before a column is named: the
 /// eight SWAR-decoded qs words every column's A chain reuses, and the two
 /// chain coefficients of this lane's sub-block. `wk` is the super-block's
