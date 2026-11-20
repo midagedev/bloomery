@@ -1,0 +1,24 @@
+# Probe after gemv5090-l1tex.card (decide-below: warps wait on DRAM, L1TEX 26.5 %): qwen3moe_gate_up_swiglu_q4k at
+# launch_bounds(256, 5) runs 48 registers and 5 blocks a SM (40 warps, was 59 registers, 4 blocks, 32), with a
+# 160-byte spill (ptx-scan jit_local 40) — a probe of the occupancy term, not a change to land. Interpolating the
+# bus share between 32 warps (gate.up 81.7 %) and 48 (the head 93.4 %): 40 warps ~87.5 %, 68.37 -> ~63.8 us, x 64 =
+# -290 us of 11.88 ms = +2.4 % [derived]; the spill's cost is the unknown, so the band runs low.
+kind: ab
+question: does the gate.up gemv at 40 warps a SM speed a full-card decode step, spill and all?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of the ngq tree with
+  launch_bounds(256, 5) on the gate.up entries against the ngq binary (sha256 0c30f8caae0d), (probe - ngq) / ngq
+unit: %
+predict: +0.5..+3.0
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W
+decide-in: open a round that gets the gate.up walk to 48 registers without a spill (the occupancy is worth it)
+decide-below: under +0.5: occupancy alone does not move this kernel, or the spill eats it; try the unroll depth
+decide-above: above +3.0: read nsys on the probe before crediting
+# outcome 2026-11-20, the probe (ngq + launch_bounds(256, 5) on the two gate.up entries: 48 registers, a 160-byte
+#  spill) against the ngq binary 0c30f8caae0d, RTX 5090 600 W, one lease, 6 rounds, depth 512: decode 82.67 tok/s
+#  [82.66..82.69] against 83.94 [83.93..83.95], round ratios 0.98501 0.98476 0.98481 0.98491 0.98477 0.98486 =
+#  -1.51 %. Below the band: decide-below. The occupancy term does not carry the gap: q4k_gemv_sel already runs 40
+#  warps (48 registers) at 83.3 % of the bus beside gate.up's 81.7 % at 32; the spill is what the probe added. The
+#  probe is reverted.

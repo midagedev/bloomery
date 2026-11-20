@@ -1,0 +1,22 @@
+# Round gemv5090 (report /root/agents/specs/gemv5090/report.md): the big Q4_K decode gemvs reach 80-85 % of the 5090's
+# 1.79 TB/s at 32 warps a SM (register-limited, 56-64 regs) while the Q6_K head reaches 93.4 % at 48. Two levers
+# overlap: 128-bit loads in the Q4_K walk (12+8 -> 3+2 load instructions an iteration, the L1TEX wavefronts a byte /4)
+# or launch_bounds(256, 5) (32 -> 40 warps). One counter decides which first, on qwen3moe_gate_up_swiglu_q4k beside
+# the head as the control: L1TEX busy at about the DRAM rate means request density binds (loads first).
+kind: profile
+question: on the RTX 5090, is the Q4_K gate.up gemv's L1TEX pipe as busy as its DRAM, so wider loads come before
+  more warps?
+term: l1tex__throughput.avg.pct_of_peak_sustained_elapsed of qwen3moe_gate_up_swiglu_q4k in graph decode replays,
+  ncu-gpu.sh's table, Qwen3.8-27B Q4_K_M, depth 6; the head qwen3moe_head_q6k_argmax beside it
+unit: %
+predict: 85..100
+condition: one lease through ncu-gpu.sh; the RTX 5090 alone at 600 W, no other compute process
+decide-in: build the 128-bit loads in the Q4_K walk first (one round; ptx-compare, the Q4_K bit pins, one A/B)
+decide-below: L1TEX under 85 % with DRAM at ~82 %: the wall is warp parallelism; try launch_bounds(256, 5) first
+decide-above: none above 100; a value over is a counter misread, re-read the section
+# outcome 2026-11-20, ngq tree (generate_qwen3moe sha256 0c30f8caae0d), RTX 5090 600 W, ncu 2025.3.1 at base clocks,
+#  Qwen3.8-27B Q4_K_M depth 6, graph replays: qwen3moe_gate_up_swiglu_q4k (64 launches) L1TEX 26.5 %, DRAM 64.4 %,
+#  L2 39.1 %, warps active 61.7 % (theoretical 66.7 %: 4 blocks a SM by registers), long_scoreboard 99.6 % of the
+#  stalls, 8.2 sectors a load request; the head qwen3moe_head_q6k_argmax L1TEX 40.7 %, DRAM 76.6 %, warps active
+#  88.7 % (6 blocks), long_scoreboard 67.8 % and lg_throttle 32.2 %, 4.9 sectors a request. Below the band:
+#  decide-below, the L1TEX pipe is idle-adjacent and warps wait on DRAM; launch_bounds(256, 5) comes first.
