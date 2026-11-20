@@ -1,0 +1,23 @@
+# The one term the PDL decision needs (megakernel page's ablation: 181 boundaries 7.37 -> 6.46 ms on H100, ~5 us a
+# boundary [derived], against our c_node 0.852 us on empty touch nodes, A6000). A full-card decode step on the 5090:
+# Qwen3.8-27B Q4_K_M (16.8 GB, ~9.4 ms a token at 1.79 TB/s [derived]) and Nemotron 3.5 Bolt 24GB (5.48 ms a token,
+# the 0.3.15 sitting). The band is c_node's class, widened for real kernels' launch latency on a new card.
+kind: profile
+question: on one RTX 5090, how much of a full-card decode step is idle time between graph nodes, per boundary, and
+  is it large enough that programmatic dependent launch (griddepcontrol) is worth a prototype?
+term: (window wall - kernel sum) / boundaries in one decode replay window of generate_qwen3moe, nsys-gpu.sh's own
+  table, Qwen3.8-27B Q4_K_M and Nemotron 3.5 Bolt 24GB at depth 512
+unit: us
+predict: 0.5..1.5
+condition: one lease through nsys-gpu.sh; the RTX 5090 alone at 600 W, no other compute process (ComfyUI stopped by
+  the user); the runner's boundary count check passes, else the run is void
+decide-in: the idle gap is c_node class; PDL's value is only the kernel tail and prologue overlap, so read the
+  per-kernel table for kernels under ~10 us and their achieved bandwidth before any prototype
+decide-below: launch gaps are negligible; close PDL for decode unless the per-kernel table shows short kernels far
+  under bandwidth
+decide-above: idle gaps are a real term (gap x boundaries / step ms); open a PDL prototype round on the hottest chain
+# outcome 2026-11-20 on main 2479514d3 (generate_qwen3moe sha256 ae4983fe3124), RTX 5090 600 W, driver 615.71.09:
+#  Qwen3.8-27B Q4_K_M d512 graph replays 2 and 3: 828 kernels, wall 12221.3 / 12220.2 us, kernel sum 12072.2 / 12070.3 us,
+#  gap 149.1 / 149.9 us = 0.18 us a boundary. Below the band: decide-below. The per-kernel table shows kernels under 5 us
+#  summing ~1.13 ms (9 %), norm_quant at a 1x1x1 grid 128 x 3.5 us; PDL stays open behind a norm_quant regrid or fold.
+#  Nemotron Bolt was refused by --seed-depth (Mamba scan state; needs the prompt form) and is not read.

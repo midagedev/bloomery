@@ -1,0 +1,20 @@
+# M0 of the sm_86 closure sweep (https://github.com/midagedev/rig-log/blob/main/docs/bloomery/research/sm86-closures-2026-11-20.md
+# section 4): c_node on the RTX 5090, the term every launch-count prediction multiplies. The 2026-11-20 nsys profile
+# (pdl-gap-5090.card) read 0.18 us of idle time a boundary in a real Qwen3.8-27B graph replay, which bounds the empty
+# node's cost from below only loosely (a real kernel's launch hides under the previous kernel's tail).
+kind: calibration
+question: what does one node of a captured empty-touch graph cost on the RTX 5090 (driver 615.71.09, CUDA 13.3)?
+term: c_node, us per node of cnode_probe --time's 784- and 504-node empty touch graphs, RTX 5090
+unit: µs
+predict: 0.40..0.85
+condition: just time-gpu-cnode in one lease on the 5090; the witness shows no other compute process (ComfyUI stopped by
+  the user)
+reason: sets c_node in https://github.com/midagedev/rig-log/blob/main/docs/bloomery/plan.md 「모델」 for the 5090 column
+  (A6000 0.852 at 784 nodes, GB10 0.553); the band runs from GB10's value widened down for a faster host to the A6000's
+decide-in: write the 5090's c_node beside the A6000's and re-derive the launch-merge rows the sweep marked MEASURE (B4)
+decide-below: launch merges on the 5090 are under the ruler; close B4 for the 5090
+decide-above: read the witness and the driver line before crediting; launch merges are worth more than the A6000 rows said
+# outcome 2026-11-20 on main 2479514d3 (cnode_probe sha256 9cbae8089c20), RTX 5090 600 W, driver 615.71.09, CUDA 13.3, no
+#  other compute process: touch_us_per_node 0.503 at 784 nodes (min 394.2 us) and 0.505 at 504 (min 254.4 us); both
+#  graphs held their node count. In band: decide-in. The 5090 row of plan.md 「모델」 carries it; B4's launch merges price
+#  at 0.50 us a node on this card.

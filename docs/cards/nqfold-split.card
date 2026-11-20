@@ -1,0 +1,26 @@
+# Round nqfold: a one-column norm_quant launch deals its 40 quantizer blocks (k = 5,120) over 4 blocks instead of
+# one, each block recomputing the same sum of squares (bit-identical). nsys 2026-11-20 (pdl-gap-5090.card): 128 launches
+# a Qwen3.8-27B decode step at a 1x1x1 grid, mean 3.51 us, 449 us of a 12.22 ms step. The round's decomposition: launch
+# floor 0.55-1.1 + phase A 0.43 + one quantizer block's chain 0.28 + the issue/LSU residue of 40 blocks on one SM
+# (0.5-1.6, divided by 4) = 1.6-2.1 us after the split [derived]: -180..-245 us a step = -1.5..-2.0 %. The band is
+# widened down to +0.8 for the floor term, the one the derivation cannot fix.
+kind: ab
+question: does splitting the one-column norm_quant launch over 4 blocks speed a full-card decode step by its
+  derived 1.5-2.0 %?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of nqfold against the
+  base binary (main 2479514d3, sha256 ae4983fe3124), (nqfold - base) / base
+unit: %
+predict: +0.8..+2.2
+rounds: 6
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W, no other compute process; both binaries' gate_p0b green
+decide-in: land the split (fixture-tier batch of just affected), then the PDL price on what is left
+decide-below: under +0.8: read nsys's norm_quant row on the nqfold binary before the step; the floor term is larger
+  than the derivation's and the split is not worth its redundant phase A
+decide-above: above +2.2: read the witness and a second nsys before crediting
+# outcome 2026-11-20, nqfold (main 2479514d3 + the split) against the base binary ae4983fe3124, RTX 5090 600 W, one
+#  lease, 6 rounds, depth 512, n = 96: decode 82.86 tok/s [82.85..82.90] against 81.68 [81.65..81.72], round ratios
+#  1.01440 1.01445 1.01447 1.01439 1.01455 1.01477 = +1.45 % (step 12.247 -> 12.069 ms, -178 us; derived -180..-245).
+#  In band: decide-in. Prefill at 512 unchanged (3387.39 against 3387.81 tok/s, the m > 1 path keeps one block a
+#  column). FAIL-first: the mutant `if g != 0 { return; }` turned gate_p0b red (Q8Act_bit_identical=false); without
+#  it gate-gpu-p0b, -p1 and -p4 rc 0.

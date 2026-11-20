@@ -54,6 +54,19 @@ const NORM_QUANT_THREADS_U32: u32 = 1024;
 const _: () = assert!(NORM_QUANT_THREADS_U32 as usize == NORM_QUANT_THREADS);
 /// Warps of a `norm_quant` block, the stride of its quantizer blocks.
 const NORM_QUANT_WARPS: usize = NORM_QUANT_THREADS / 32;
+/// Split blocks a one-column (`m = 1`) `norm_quant` launch deals its
+/// column's 128-value quantizer blocks over: split block `g` of the column
+/// takes quantizer blocks `g, g + NORM_QUANT_SPLIT, …`. A one-column launch
+/// is one block on one SM and a quantizer block's chain is warp-serial, so
+/// without a split the whole quantizer tail runs on that one SM; each split
+/// block recomputes the column's sum of squares — the same loads and tree
+/// over the same row — so the scale, and with it every quantized byte and
+/// every `y` value, is the unsplit launch's own whichever block computes it.
+/// A launch of more than one column takes no split: its blocks are its
+/// tokens already, and a column wider than
+/// `128 · NORM_QUANT_SPLIT · NORM_QUANT_WARPS` values simply deals its split
+/// blocks more than one quantizer block a warp.
+pub const NORM_QUANT_SPLIT: u32 = 4;
 // The sum of squares runs on the block's first RMS_THREADS threads; the
 // kernel's `launch_bounds` and `launch_contract` spell the width out.
 const _: () = assert!(NORM_QUANT_THREADS >= RMS_THREADS && NORM_QUANT_THREADS == 1024);
@@ -237,23 +250,28 @@ macro_rules! kv_norm_rope_row {
 mod fused_kernels {
     use super::*;
 
-    /// rms_norm + 128-value q8_1 quantization, ONE [`NORM_QUANT_THREADS`]
-    /// block per column (token): phase A, on the block's first
-    /// [`RMS_THREADS`] threads, is `elem::rms_norm`'s body verbatim
-    /// (`rms_partial_sq` per thread, the fixed butterfly per warp,
+    /// rms_norm + 128-value q8_1 quantization, 1 to [`NORM_QUANT_SPLIT`]
+    /// [`NORM_QUANT_THREADS`] blocks per column (token): phase A, on each
+    /// block's first [`RMS_THREADS`] threads, is `elem::rms_norm`'s body
+    /// verbatim (`rms_partial_sq` per thread, the fixed butterfly per warp,
     /// `rms_warp_tree`, `rms_scale`), phase B is
     /// `kernels::q3k_quantize_q8_1`'s body (`q8_1_quant_vals`) per 128-value
     /// block with the normalized value computed in registers as
     /// `(scale · gain) · x` — the same expression and order `elem::rms_norm`
-    /// stores — warp `w` of the block's `NORM_QUANT_WARPS` taking blocks
-    /// `w, w + NORM_QUANT_WARPS, …`.
-    /// One block owning the whole column is
+    /// stores — split block `g` of the column's `bpc`, warp `w` of the
+    /// block's `NORM_QUANT_WARPS`, taking blocks `g + bpc·w,
+    /// g + bpc·(w + NORM_QUANT_WARPS), …`.
+    /// Every block of a column running phase A over that whole column is
     /// what removes the launch boundary: the 128-value amax needs the
     /// normalized values, the normalized values need the row's sum of
-    /// squares, and both reductions close inside the block — no grid
-    /// barrier. `k` a multiple of 128 (every `Q8Act` k is a multiple of
-    /// 256); the column guard is block-uniform, so no barrier is skipped and
-    /// every warp collective sees a full warp.
+    /// squares, and both reductions close inside each block — no grid
+    /// barrier — because each block recomputes the same sum over the same
+    /// values, so its scale is every other block's scale bit for bit and a
+    /// quantizer block's bytes do not depend on which block or warp of the
+    /// launch computes them. `k` a multiple of 128 (every `Q8Act` k is a
+    /// multiple of 256); `bpc` at least 1 (the launcher passes 1 or
+    /// [`NORM_QUANT_SPLIT`]); the column guard is block-uniform, so no
+    /// barrier is skipped and every warp collective sees a full warp.
     ///
     /// `y` takes the f32 normalized vector as well — the same registers the
     /// quantizer consumes, so it holds `elem::rms_norm`'s store bit for bit.
@@ -294,6 +312,7 @@ mod fused_kernels {
         eps: f32,
         k: u32,
         m: u32,
+        bpc: u32,
         n_sb: u32,
         half_it: u32,
         quad_it: u32,
@@ -305,20 +324,24 @@ mod fused_kernels {
         mut y: DisjointSlice<f32>,
         fault: FaultSink,
     ) {
-        // One NORM_QUANT_THREADS block per column: t is the COLUMN index (the
-        // block index), not the thread id.
+        // The launch's blocks are its columns' bpc split blocks: `col` is the
+        // COLUMN index (the block index over bpc), `g` the split index, not
+        // the thread id.
         static mut WSUM: SharedArray<f32, RMS_WARPS> = SharedArray::UNINIT;
 
         let t = thread::blockIdx_x() as usize;
-        if t >= m as usize {
+        let bpc = bpc as usize;
+        let col = t / bpc;
+        if col >= m as usize {
             return;
         }
+        let g = t - col * bpc;
         let tid = thread::threadIdx_x() as usize;
         let lane = warp::lane_id() as usize;
         let warp_of = tid / 32;
         let k = k as usize;
         let n_sb = n_sb as usize;
-        let base = t * k;
+        let base = col * k;
 
         // Phase A: the sum of squares, exactly `elem::rms_norm`'s cores and
         // reduction tree.
@@ -329,9 +352,9 @@ mod fused_kernels {
         // The first RMS_WARPS warps only: the condition is warp-uniform, so
         // the butterfly sees a full warp.
         if tid < RMS_THREADS {
-            // SAFETY: base + k = (t + 1)·k <= m·k <= x.len() (the `t < m`
-            // guard and the launcher-checked `requires`); tid < RMS_THREADS
-            // by the branch.
+            // SAFETY: base + k = (col + 1)·k <= m·k <= x.len() (the
+            // `col < m` guard and the launcher-checked `requires`);
+            // tid < RMS_THREADS by the branch.
             let part = warp::reduce_sum_f32(unsafe { rms_partial_sq(x, base, k, tid) });
             if lane == 0 {
                 // SAFETY: warp_of < RMS_WARPS here; one lane per warp writes
@@ -363,10 +386,11 @@ mod fused_kernels {
         // geometry (the op path round-trips through the norm's store; the
         // recomputation reproduces those bits). A block belongs wholly to
         // one warp, so every collective below stays warp-uniform. The
-        // blocks are dealt over all NORM_QUANT_WARPS warps: a block's work is
-        // warp-local, so which warp takes it moves no bit.
+        // column's blocks are dealt over its bpc split blocks and each
+        // block's NORM_QUANT_WARPS warps: a block's work is
+        // warp-local, so which warp or split block takes it moves no bit.
         let blocks = k / 128; // = 2 * n_sb
-        let mut b = warp_of;
+        let mut b = g + bpc * warp_of;
         while b < blocks {
             let vb = base + 128 * b + 4 * lane;
             // SAFETY: vb + 3 < base + k <= x.len() and the gain reads stay
@@ -399,13 +423,14 @@ mod fused_kernels {
             } else {
                 [f32::NAN; 4]
             };
-            // SAFETY: column t < m and b < k/128 = 2*n_sb (the host passes
+            // SAFETY: column col < m and b < k/128 = 2*n_sb (the host passes
             // n_sb = k/256), the output bounds are the launch contract's, the
-            // whole warp is here with the same `(t, b)` (one warp owns the
-            // block), and `nv` holds values 128*b + 4*lane .. +3 of column t.
+            // whole warp is here with the same `(col, b)` (one warp of one
+            // split block owns the quantizer block), and `nv` holds values
+            // 128*b + 4*lane .. +3 of column col.
             let refused = unsafe {
                 q8_1_quant_vals(
-                    nv, t, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6, &mut s8,
+                    nv, col, b, n_sb, half_it, quad_it, lane, &mut q3, &mut q4, &mut q6, &mut s8,
                     &mut d8,
                 )
             };
@@ -415,7 +440,7 @@ mod fused_kernels {
             let nv = if refused { [f32::NAN; 4] } else { nv };
             // SAFETY: vb + 3 < base + k <= k*m <= y.len() by the launch
             // contract; each value of the column is written by exactly one
-            // lane of exactly one warp.
+            // lane of exactly one warp of exactly one split block.
             unsafe {
                 *y.get_unchecked_mut(vb) = nv[0];
                 *y.get_unchecked_mut(vb + 1) = nv[1];
@@ -423,7 +448,7 @@ mod fused_kernels {
                 *y.get_unchecked_mut(vb + 3) = nv[3];
             }
 
-            b += NORM_QUANT_WARPS;
+            b += bpc * NORM_QUANT_WARPS;
         }
     }
 
@@ -814,7 +839,8 @@ impl FusedKernels {
     }
 
     /// Enqueue rms_norm + 128-value q8_1 quantization of `x` (`act.m()`
-    /// columns of `act.k()` f32, token-major, one block per column) by
+    /// columns of `act.k()` f32, token-major, one to [`NORM_QUANT_SPLIT`]
+    /// blocks per column, a split only a one-column launch takes) by
     /// `gain`/`eps` into `act`, and the f32 normed vector into `y` — the
     /// same six buffers `elem::rms_norm` followed by
     /// `Gpu::enqueue_quantize_q8_1` produce, bit for bit. `y` holds
@@ -865,9 +891,15 @@ impl FusedKernels {
         let k = launch_u32(what, "k", k)?;
         let m = launch_u32(what, "m", m)?;
         let n_sb = launch_u32(what, "n_sb", n_sb)?;
-        let prep =
-            self.module
-                .prepare_norm_quant(LaunchConfig1D::new(m, NORM_QUANT_THREADS_U32, 0))?;
+        // A one-column launch splits its column's quantizer blocks over
+        // NORM_QUANT_SPLIT blocks (each recomputes the column's scale, so no
+        // stored byte moves); a wider launch already runs a block a token.
+        let bpc = if m == 1 { NORM_QUANT_SPLIT } else { 1 };
+        let prep = self.module.prepare_norm_quant(LaunchConfig1D::new(
+            m * bpc,
+            NORM_QUANT_THREADS_U32,
+            0,
+        ))?;
         self.module.norm_quant(
             stream,
             &prep,
@@ -876,6 +908,7 @@ impl FusedKernels {
             eps,
             k,
             m,
+            bpc,
             n_sb,
             n_sb.div_ceil(2),
             n_sb.div_ceil(4),
