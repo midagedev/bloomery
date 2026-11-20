@@ -11,8 +11,9 @@
 //! `n = slot · rows_per_expert + r` reading weight row
 //! `sel[slot] · rows_per_expert + r` of both stacks, each dotted against its
 //! slot's quantized activation column by
-//! `cores::q4k_row_dot_1col` (the m = 1 body of `q4k_gemv`, which picks the
-//! column by its base offset), reduced by the fixed warp tree, then
+//! `cores::q4k_row_dot_1col_pair` (the m = 1 body of `q4k_gemv`, which picks
+//! the column by its base offset, for both rows at once with the loads of
+//! each iteration issued together), reduced by the fixed warp tree, then
 //! `elem::silu_mul`. Slot `s` reads column `s / slots_per_col`: one column
 //! for every slot of a token, a token's run of slots per column over several
 //! tokens. So slot `s` of `h` is bit for bit `silu(q4k_gemv(gate_e)) ·
@@ -34,7 +35,7 @@
 //! grouping.
 
 use crate::GpuError;
-use crate::cores::{l2_prefetch, q4k_row_dot_1col};
+use crate::cores::{l2_prefetch, q4k_row_dot_1col_pair};
 use crate::elem::{silu_mul, weighted_expert_sum};
 use crate::fault::{FaultSink, FaultSite};
 use crate::launch_u32;
@@ -106,8 +107,8 @@ unsafe fn gate_up_row<const PREFETCH: bool>(
     // rows_per_expert rows of both stacks, column col < m_cols, iters =
     // ceil(n_sb/4), and all 32 lanes of the warp are here (the return above
     // is warp-uniform).
-    let fg = q4k_row_dot_1col(wg, q, s8, d8, n_sb as usize, iters, row_abs, col, lane);
-    let fu = q4k_row_dot_1col(wu, q, s8, d8, n_sb as usize, iters, row_abs, col, lane);
+    let (fg, fu) =
+        q4k_row_dot_1col_pair(wg, wu, q, s8, d8, n_sb as usize, iters, row_abs, col, lane);
     let g = warp::reduce_sum_f32(fg);
     let u = warp::reduce_sum_f32(fu);
     if lane == 0 {

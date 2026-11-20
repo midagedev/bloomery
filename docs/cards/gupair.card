@@ -1,0 +1,27 @@
+# After gateup-occ5.card (decide-below): the gate.up gemv's warps wait on DRAM (long_scoreboard 99.6 %), so the lever
+# is bytes in flight per SM, not warps. q4k_row_dot_1col_pair walks the gate and up rows together, each iteration's
+# loads for both issued before either row's multiply-add; each row's sum keeps its order (bit for bit). ptx-scan: 80
+# registers, no spill, 3 blocks a SM (24 warps, was 32 at 59), ld.global scalar 103 (was 133: the column's q, s8, d8
+# loads are shared by the two rows). Chains in flight per SM 24 x 2 = 48 against 32: x1.5. If that lifts gate.up
+# from 81.7 % of the bus toward the head's 93.4 %: 68.37 -> 59.8 us x 64 = -548 us of 11.88 ms = +4.6 % at the top
+# [derived]; half of it is the band's floor.
+kind: ab
+question: does the paired gate.up walk speed a full-card decode step?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of the gupair tree against
+  main 35fa1c195, (gupair - main) / main
+unit: %
+predict: +1.0..+4.6
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W
+decide-in: land it with gate-gpu-qwen35moe-e2e and the expert gates bit-identical; try the same pairing on qkv
+decide-below: under +1.0: the shared activation loads, not the chains, were the gain; read ncu before going on
+decide-above: above +4.6: read nsys on both before crediting
+# outcome 2026-11-20, gupair tree against main 35fa1c195 (4bcf043aec2a), RTX 5090 600 W, one lease, 6 rounds, depth
+#  512: decode 84.25 tok/s [84.22..84.29] against 83.92 [83.91..83.95], round ratios 1.00403 1.00409 1.00408 1.00394
+#  1.00375 1.00399 = +0.40 % (h 0.064 %). Below the band: decide-below, so ncu (base clocks, depth 6, 32 launches):
+#  qwen3moe_gate_up_swiglu_q4k 92.03 -> 87.26 us (-5.2 %), DRAM 64.4 -> 68.0 %, warps active 61.7 -> 45.9 % (3
+#  blocks). The kernel alone gains what the chains predict at its floor; the step takes a fifth of it — the term the
+#  card missed is how much of gate.up's time a replayed step pays (its neighbours overlap its tail). It lands: bit
+#  for bit, +0.40 %.

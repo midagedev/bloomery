@@ -495,6 +495,116 @@ pub(crate) fn q4k_row_dot_1col(
     f0
 }
 
+/// Two rows' [`q4k_row_dot_1col`] at once — row `row_abs` of `wa` and of
+/// `wb` against the same column — with each iteration's loads for both rows
+/// issued before either row's multiply-add, so a warp keeps twice the bytes
+/// in flight. Each row's sum is its own [`q4k_row_dot_1col`]'s: the same
+/// terms in the same order into its own accumulator, so both results are
+/// that fn's bit for bit.
+///
+/// Caller contract as [`q4k_row_dot_1col`], for each of `wa` and `wb`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "device core: it is handed a kernel entry's flat arguments (rust-quality R8)"
+)]
+#[inline(always)]
+pub(crate) fn q4k_row_dot_1col_pair(
+    wa: &[u32],
+    wb: &[u32],
+    q: &[u32],
+    s8: &[i32],
+    d8: &[f32],
+    n_sb: usize,
+    iters: u32,
+    row_abs: usize,
+    col0: usize,
+    lane: usize,
+) -> (f32, f32) {
+    let q_col = 256 * iters as usize;
+    let s8_col = 8 * n_sb;
+    let d8_col = 2 * n_sb;
+
+    let s = lane & 7;
+    let grp = lane >> 3;
+
+    let mut fa = 0.0f32;
+    let mut fb = 0.0f32;
+
+    let qb0 = col0 * q_col;
+    let s8b0 = col0 * s8_col;
+    let d8b0 = col0 * d8_col;
+
+    // As `q4k_row_dot_1col`: the guard is dead for `it < full`.
+    let full = (n_sb / 4) as u32;
+    let mut it: u32 = 0;
+    while it + Q4K_ITER_UNROLL <= full {
+        // SAFETY: it + Q4K_ITER_UNROLL <= full, so each term's `sbp < n_sb`;
+        // the rest of the contract is this fn's, for each of `wa` and `wb`.
+        let (xa0, ea0) = q4k_iter_term(
+            wa, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
+        );
+        let (xb0, eb0) = q4k_iter_term(
+            wb, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
+        );
+        let ta = mul_rn_f32(ea0, xa0);
+        let tb = mul_rn_f32(eb0, xb0);
+        let (xa1, ea1) = q4k_iter_term(
+            wa,
+            q,
+            s8,
+            d8,
+            n_sb,
+            it + 1,
+            row_abs,
+            qb0,
+            s8b0,
+            d8b0,
+            s,
+            grp,
+            lane,
+        );
+        let (xb1, eb1) = q4k_iter_term(
+            wb,
+            q,
+            s8,
+            d8,
+            n_sb,
+            it + 1,
+            row_abs,
+            qb0,
+            s8b0,
+            d8b0,
+            s,
+            grp,
+            lane,
+        );
+        fa = add_rn_f32(fa, ta);
+        fa = q4k_acc(fa, xa1, ea1, false);
+        fb = add_rn_f32(fb, tb);
+        fb = q4k_acc(fb, xb1, eb1, false);
+        it += Q4K_ITER_UNROLL;
+    }
+    while it < iters {
+        let sbp = 4 * it as usize + grp;
+        if sbp < n_sb {
+            // SAFETY: the guard is this term's `sbp < n_sb` precondition.
+            let (xa, ea) = q4k_iter_term(
+                wa, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
+            );
+            // SAFETY: as above.
+            let (xb, eb) = q4k_iter_term(
+                wb, q, s8, d8, n_sb, it, row_abs, qb0, s8b0, d8b0, s, grp, lane,
+            );
+            fa = q4k_acc(fa, xa, ea, false);
+            fb = q4k_acc(fb, xb, eb, false);
+        }
+
+        it += 1;
+    }
+
+    (fa, fb)
+}
+
 /// One column's share of an m-column Q4_K iteration: its A chain against
 /// the q8 window at `qb`, its B sum at `s8b` and its block scale at `d8b`,
 /// as the sub-block value and scale [`q4k_acc`] folds.
