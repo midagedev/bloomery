@@ -183,10 +183,11 @@ mod gate {
             && TABLE_BYTES as u64 == N_DELTA as u64 * DELTA_REPLAY_BYTES
     );
 
-    /// The e2e gate's pins of the plain load's captured graphs (decode step
-    /// 520 nodes, a pass of `m` rows 537 + 4m), which the verifying load
-    /// holds too: `gdn_delta_lanes` is one launch where `gdn_delta` is.
-    const NODES_DECODE: usize = 520;
+    /// PIN(2026-11-20): the e2e gate's pins of the plain load's captured graphs
+    /// (decode step 504 nodes, a pass of `m` rows 537 + 4m), which the
+    /// verifying load holds too: `gdn_delta_lanes` is one launch where
+    /// `gdn_delta` is.
+    const NODES_DECODE: usize = 504;
     const NODES_PASS: usize = 537;
     /// The nodes of a captured pass's one head over the Q6_K head's rows: the copy of the rows into
     /// its input, the final norm, the quantizer, the gemv and the argmax. PIN(2026-11-15): one

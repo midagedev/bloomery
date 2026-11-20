@@ -573,18 +573,19 @@ mod gate {
     const HEAD: usize = 256;
     const ROT: usize = 64;
 
-    /// PIN(2026-09-27): the captured decode step's node count, derived before
+    /// PIN(2026-11-20): the captured decode step's node count, derived before
     /// the chain was built: the embedding row; each delta layer's 8 mixer
     /// launches (norm+quant, the two projection launches — a Q6_K `attn_qkv`
     /// in its own gemv, `attn_gate`·β·α in one — conv, delta, gated norm,
-    /// q8_1, `ssm_out` with the residual) and 5 FFN launches (the norm with
+    /// q8_1, `ssm_out` with the residual), 7 on the 16 whose Q4_K `attn_qkv`
+    /// takes β and α as its v rows at one row, and 5 FFN launches (the norm with
     /// the gated router, gate·up over the joined stacks, q8_1 of the nine
     /// slots, the down `_sel`, the combine); each attention layer's 7 mixer
     /// launches (norm+quant, q·k·v, rope-256, flash segment pass and merge,
     /// the gated q8_1, the output projection with the residual), one more
     /// on the 6 layers whose `attn_v` is Q6_K, and 5 FFN; then the head's
-    /// three: 1 + 30·13 + 10·12 + 6 + 3.
-    const REAL_NODES_DECODE: usize = 520;
+    /// three: 1 + 14·13 + 16·12 + 10·12 + 6 + 3.
+    const REAL_NODES_DECODE: usize = 504;
 
     /// PIN(2026-10-05): a captured pass of `m >= 2` rows without its heads,
     /// derived the same way at more than one row: each delta layer 8 + 5
@@ -608,7 +609,7 @@ mod gate {
     /// `UD-Q4_K_M`, every layer's shared expert q8_0 beside q4_K gate and up
     /// stacks and a q5_K down (37 layers) or a q6_K one (34, 38, 39); every
     /// mixer site q8_0 but β and α, F32.
-    const UNJOINED: &str = "/models/qwen36-hf/unsloth/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
+    const UNJOINED: &str = "/data/moved/models/qwen36-hf/unsloth/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf";
 
     /// PIN(2026-10-10): the unjoined file's captured decode step, derived
     /// from its header before the path ran: the embedding row; each delta
