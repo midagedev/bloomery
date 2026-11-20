@@ -1,0 +1,24 @@
+# gemv5090 report option 1: the Q4_K decode (cores::q4k_sb_decode) loads a super-block's header and each lane's qs
+# window as three 128-bit loads (was twelve word loads) where the header address is 16-byte aligned (every weight
+# buffer), the word loads elsewhere; the loaded words are the same, so every output is bit for bit. ptx-scan: gate.up
+# 80 registers (unchanged, 3 blocks), qkv 56 -> 72 and o_resid 57 -> 73 (4 -> 3 blocks), q4k_gemv_sel 48 -> 64 (5 ->
+# 4). The report's realistic -744 us a step assumed the open-request slots bind; ncu read L1TEX 26.5 %, and the
+# gupair card's step took a fifth of its kernel's gain, so the band is wide and its floor near 0; the occupancy
+# drops on qkv/o/down can make it negative [derived].
+kind: ab
+question: do 128-bit weight loads in the Q4_K walk speed a full-card decode step?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of the q4v4 tree against
+  main d6d985807 (c91a457d4ebe), (q4v4 - main) / main
+unit: %
+predict: +0.2..+6.0
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W
+decide-in: run the Q4_K gates bit for bit, then land; next the register cost on qkv/o (one path, no fallback)
+decide-below: under +0.2: the request slots were not the bound; revert
+decide-above: above +6.0: read nsys on both before crediting
+# outcome 2026-11-20, q4v4 tree against main d6d985807 (c91a457d4ebe), RTX 5090 600 W, one lease, 6 rounds, depth
+#  512: decode 86.66 tok/s [86.65..86.67] against 84.24 [84.23..84.24], round ratios 1.02887 1.02890 1.02873 1.02858
+#  1.02889 1.02873 = +2.88 % (h 0.064 %). In the band: decide-in. The open-request term was real despite the 26.5 %
+#  L1TEX reading, and outweighed the lost block on qkv, o_resid and q4k_gemv_sel.

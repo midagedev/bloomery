@@ -290,18 +290,14 @@ pub(crate) fn q4k_acc(f: f32, x: f32, e: f32, split: bool) -> f32 {
     }
 }
 
-/// Everything one Q4_K super-block yields before a column is named: the
-/// eight SWAR-decoded qs words every column's A chain reuses, and the two
-/// chain coefficients of this lane's sub-block. `wk` is the super-block's
-/// word base in `w` and `s` the lane's sub-block within it. The whole
-/// decode lives here so the single-column body and the m-column body cannot
-/// drift apart.
+/// [`q4k_sb_decode`] with the word loads only: the decode the K-quant walks
+/// ([`crate::kquant::walk`]) run, whose tiled and arena entries hold more
+/// live values than the gemv cores and spill under the wide loads' extra
+/// registers. Same words, same outputs.
 ///
-/// SAFETY: callers keep `wk + 35` — the super-block's last word — inside
-/// `w`.
+/// SAFETY: as [`q4k_sb_decode`].
 #[inline(always)]
-pub(crate) fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f32) {
-    // d/dmin word + the 12 scale bytes in words 1..3.
+pub(crate) fn q4k_sb_decode_words(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f32) {
     // SAFETY: wk + 3 <= wk + 35, inside `w` by this fn's contract.
     let (w0, w1, w2, w3) = unsafe {
         (
@@ -313,16 +309,8 @@ pub(crate) fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f
     };
     let d = half_to_f32((w0 & 0xffff) as u16);
     let dmin = half_to_f32((w0 >> 16) as u16);
-
     let (sc, mi) = q4k_scale_min(s, w1, w2, w3);
-    // Column-independent chain coefficients.
     let (cda, cdb) = q4k_coeff(d, dmin, sc, mi);
-
-    // qs word base: 8 words from super-block word 4 + 8*(s>>1); nibble
-    // select is the sub-block parity, 0 (low) or 4 (high). Hoisted:
-    // the window and its SWAR decode are column-independent, so
-    // decode once per iteration and let every column's A chain reuse the
-    // registers.
     let qsk = wk + 4 + 8 * (s >> 1);
     let nib_sh = (s as u32 & 1) * 4;
     // SAFETY: qsk + 7 <= wk + 35, the same bound as w0..w3 above.
@@ -338,6 +326,110 @@ pub(crate) fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f
             q4k_nibble(*w.get_unchecked(qsk + 7), nib_sh),
         ]
     };
+    (vi, cda, cdb)
+}
+
+/// Four words at global address `g` in one 128-bit load.
+///
+/// # Safety
+///
+/// `g` is 16-byte aligned and addresses four words of global memory.
+#[inline(always)]
+unsafe fn ld4_u32(g: u64) -> [u32; 4] {
+    let (a, b, c, d): (u32, u32, u32, u32);
+    // SAFETY: the caller's contract.
+    unsafe {
+        ptx_asm!(
+            "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];",
+            out("=r") a,
+            out("=r") b,
+            out("=r") c,
+            out("=r") d,
+            in("l") g,
+        );
+    }
+    [a, b, c, d]
+}
+
+/// Everything one Q4_K super-block yields before a column is named: the
+/// eight SWAR-decoded qs words every column's A chain reuses, and the two
+/// chain coefficients of this lane's sub-block. `wk` is the super-block's
+/// word base in `w` and `s` the lane's sub-block within it. The whole
+/// decode lives here so the single-column body and the m-column body cannot
+/// drift apart.
+///
+/// SAFETY: callers keep `wk + 35` — the super-block's last word — inside
+/// `w`.
+#[inline(always)]
+pub(crate) fn q4k_sb_decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f32) {
+    // A super-block's header and each lane's qs window sit 0 and 4 + 8·(s/2)
+    // words past `wk`, so where the header starts on a 16-byte boundary each
+    // is one 128-bit load (every walk's `wk` is a multiple of the 36-word
+    // super-block, so that is wherever `w` itself is aligned); elsewhere the
+    // word loads.
+    let g = global_addr(w.as_ptr());
+    let gk = g + 4 * wk as u64;
+    let wide = gk & 15 == 0;
+    let qsk = wk + 4 + 8 * (s >> 1);
+    let (h, qs) = if wide {
+        // SAFETY: gk is 16-byte aligned and qsk - wk a multiple of 4, so each
+        // address is too; wk + 3 and qsk + 7 <= wk + 35 are inside `w` by
+        // this fn's contract.
+        unsafe {
+            let h = ld4_u32(gk);
+            let a = ld4_u32(g + 4 * qsk as u64);
+            let b = ld4_u32(g + 4 * (qsk + 4) as u64);
+            (h, [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]])
+        }
+    } else {
+        // SAFETY: wk + 3 and qsk + 7 <= wk + 35, inside `w` by this fn's
+        // contract.
+        unsafe {
+            (
+                [
+                    *w.get_unchecked(wk),
+                    *w.get_unchecked(wk + 1),
+                    *w.get_unchecked(wk + 2),
+                    *w.get_unchecked(wk + 3),
+                ],
+                [
+                    *w.get_unchecked(qsk),
+                    *w.get_unchecked(qsk + 1),
+                    *w.get_unchecked(qsk + 2),
+                    *w.get_unchecked(qsk + 3),
+                    *w.get_unchecked(qsk + 4),
+                    *w.get_unchecked(qsk + 5),
+                    *w.get_unchecked(qsk + 6),
+                    *w.get_unchecked(qsk + 7),
+                ],
+            )
+        }
+    };
+    // d/dmin word + the 12 scale bytes in words 1..3.
+    let [w0, w1, w2, w3] = h;
+    let d = half_to_f32((w0 & 0xffff) as u16);
+    let dmin = half_to_f32((w0 >> 16) as u16);
+
+    let (sc, mi) = q4k_scale_min(s, w1, w2, w3);
+    // Column-independent chain coefficients.
+    let (cda, cdb) = q4k_coeff(d, dmin, sc, mi);
+
+    // qs word base: 8 words from super-block word 4 + 8*(s>>1); nibble
+    // select is the sub-block parity, 0 (low) or 4 (high). Hoisted:
+    // the window and its SWAR decode are column-independent, so
+    // decode once per iteration and let every column's A chain reuse the
+    // registers.
+    let nib_sh = (s as u32 & 1) * 4;
+    let vi = [
+        q4k_nibble(qs[0], nib_sh),
+        q4k_nibble(qs[1], nib_sh),
+        q4k_nibble(qs[2], nib_sh),
+        q4k_nibble(qs[3], nib_sh),
+        q4k_nibble(qs[4], nib_sh),
+        q4k_nibble(qs[5], nib_sh),
+        q4k_nibble(qs[6], nib_sh),
+        q4k_nibble(qs[7], nib_sh),
+    ];
     (vi, cda, cdb)
 }
 

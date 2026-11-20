@@ -21,7 +21,7 @@
 //! by [`q4k_sub_value`] and fold it with [`q4k_acc`]'s rounding, each
 //! operation spelled, so their sums cannot be contracted differently.
 
-use crate::cores::{Q4K_ITER_UNROLL, q4k_a_chain, q4k_acc, q4k_sb_decode, q4k_sub_value};
+use crate::cores::{Q4K_ITER_UNROLL, q4k_a_chain, q4k_acc, q4k_sb_decode_words, q4k_sub_value};
 use cuda_device::float::{add_rn_f32, mul_rn_f32};
 
 /// One K-quant format's super-block decode for Walk A.
@@ -42,7 +42,7 @@ pub trait SbDecode {
 }
 
 /// Q4_K (144 bytes: `d`, `dmin`, 12 scale bytes, 128 nibble bytes): the
-/// decode is `cores::q4k_sb_decode`, the one every Q4_K gemv of this crate
+/// decode is `cores::q4k_sb_decode_words`, the word-load twin of the Q4_K gemvs'
 /// runs. Its codes are the nibbles minus 8, so its `cdb` carries `8·cda`.
 pub struct Q4k;
 
@@ -52,7 +52,7 @@ impl SbDecode for Q4k {
     #[inline(always)]
     unsafe fn decode(w: &[u32], wk: usize, s: usize) -> ([u32; 8], f32, f32) {
         // The core's contract is this fn's: wk + 35 is inside `w`.
-        q4k_sb_decode(w, wk, s)
+        q4k_sb_decode_words(w, wk, s)
     }
 }
 
