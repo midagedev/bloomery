@@ -403,7 +403,6 @@ mod tests {
             ],
         ),
         ("host_lanes", &[bloomery_levers::HOST_LANES]),
-        ("kv_host_set", &[bloomery_levers::KV_HOST]),
         ("mtp_draft", &[bloomery_levers::MTP_DRAFT]),
         ("mtp_head_rows", &[bloomery_levers::MTP_HEAD_ROWS]),
         ("mtp_width", &[bloomery_levers::MTP_WIDTH]),
@@ -425,6 +424,12 @@ mod tests {
         bloomery_levers::CARD_EXPERTS_CAP,
         bloomery_levers::KV_FLOOR,
     ];
+
+    /// Each helper the seat calls that reads levers through the seat's
+    /// `Levers` itself, with the levers it reads: the seat's own text names
+    /// the call, not the accessor.
+    const HELPER_READS: &[(&str, &[&str])] =
+        &[("qwen38_levers::kv_default_at(", &[bloomery_levers::KV_HOST])];
 
     /// Each call of the seat that reads a Direct lever in place, with the lever.
     const DIRECT_READS: &[(&str, &str)] = &[(
@@ -464,6 +469,13 @@ mod tests {
             );
         }
         read.extend(PLAN_READS.iter().copied());
+        for (call, levers) in HELPER_READS {
+            assert!(
+                src.contains(call),
+                "the seat no longer calls {call}: drop its levers from HELPER_READS"
+            );
+            read.extend(levers.iter().copied());
+        }
         for (call, lever) in DIRECT_READS {
             assert!(
                 src.contains(call),
