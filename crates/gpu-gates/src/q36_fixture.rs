@@ -38,6 +38,11 @@ const ATTN_V_GEMV_LAUNCHES: usize = 1;
 /// Launches a Q6_K `attn_qkv` adds to a joined delta layer's mixer in a pass of two or more rows:
 /// the token-major copy of its output.
 const PASS_QKV_COPY_LAUNCHES: usize = 1;
+/// Launches a Q4_K `attn_qkv` drops from a joined delta layer's mixer at the decode step's one
+/// row: the β·α projection folds into the q·k·v's launch over the joined β·α stack, which the
+/// one-row arena's `[x | z | b | a]` holds as that launch's v block. A pass's wider arena keeps
+/// the two launches whatever its row count.
+const DELTA_BA_FOLD_LAUNCHES: usize = 1;
 /// Launches a Q6_K `attn_v` adds to a joined attention layer's mixer in a pass of two or more
 /// rows: its gemv and the token-major copy.
 const PASS_V_LAUNCHES: usize = 2;
@@ -311,15 +316,18 @@ impl Shape {
     }
 
     /// The captured decode step's nodes: the embedding row, each layer's mixer and feed-forward
-    /// launches (a joined attention layer one more when its `attn_v` is Q6_K), then the head's.
+    /// launches (a joined attention layer one more when its `attn_v` is Q6_K, a joined delta
+    /// layer whose `attn_qkv` is Q4_K one fewer: its β·α folds into the q·k·v's launch), then
+    /// the head's.
     #[must_use]
     pub fn nodes_decode(&self) -> usize {
         let layers: usize = self
             .layers
             .iter()
             .map(|(layer, rule)| match (rule, layer.kind()) {
-                (Rule::Joined { .. }, Kind::DeltaRule) => {
+                (Rule::Joined { q6 }, Kind::DeltaRule) => {
                     DELTA_MIXER_LAUNCHES + JOINED_FFN_LAUNCHES
+                        - if *q6 { 0 } else { DELTA_BA_FOLD_LAUNCHES }
                 }
                 (Rule::Joined { q6 }, Kind::Attention) => {
                     ATTN_MIXER_LAUNCHES
@@ -487,8 +495,8 @@ mod tests {
             (40, 10, 30)
         );
         assert_eq!((real.q6_qkv(), real.q6_v()), (14, 6));
-        assert_eq!(real.nodes_decode(), 1 + 30 * 13 + 10 * 12 + 6 + 3);
-        assert_eq!(real.nodes_decode(), 520);
+        assert_eq!(real.nodes_decode(), 1 + 14 * 13 + 16 * 12 + 10 * 12 + 6 + 3);
+        assert_eq!(real.nodes_decode(), 504);
         assert_eq!(real.nodes_pass(), 1 + 30 * 13 + 14 + 10 * 12 + 2 * 6);
         assert_eq!(real.nodes_pass(), 537);
         assert_eq!(real.nodes_slot().expect("joined"), 1 + 10 * 2);
@@ -507,8 +515,8 @@ mod tests {
         let fix = Shape::from_layers(fixture()).expect("fixture");
         assert_eq!((fix.n_layer(), fix.n_attn(), fix.n_delta()), (4, 2, 2));
         assert_eq!((fix.q6_qkv(), fix.q6_v()), (1, 1));
-        assert_eq!(fix.nodes_decode(), 1 + 2 * 13 + (12 + 13) + 3);
-        assert_eq!(fix.nodes_decode(), 55);
+        assert_eq!(fix.nodes_decode(), 1 + (12 + 13) + (12 + 13) + 3);
+        assert_eq!(fix.nodes_decode(), 54);
         assert_eq!(fix.nodes_pass(), 1 + (13 + 14) + (12 + 14));
         assert_eq!(fix.nodes_pass(), 54);
         assert_eq!(fix.nodes_slot().expect("joined"), 1 + 2 * 2);

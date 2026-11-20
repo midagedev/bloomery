@@ -5,11 +5,13 @@
 //! The launches, in order:
 //! 1. the fused norm and q8_1 quantizer of `x` (`attn_norm`);
 //! 2. the four input projections into the arena's `[x | z | b | a]`
-//!    blocks: with Q4_K `attn_gate`, β and α in two launches — a Q4_K
-//!    `attn_qkv` beside `attn_gate` in one three-matrix launch and β with α
-//!    in another; a Q6_K `attn_qkv` in its own gemv (and at more than one
-//!    row its token-major copy) and `attn_gate`, β and α in one launch —
-//!    and with any other types each projection by its type
+//!    blocks: with Q4_K `attn_gate`, β and α — at one row over the
+//!    one-row arena (the decode graph) one three-matrix launch over
+//!    `attn_qkv`, `attn_gate` and the joined β·α stack, elsewhere two,
+//!    `attn_qkv` beside `attn_gate` in one and β with α in another; a Q6_K
+//!    `attn_qkv` in its own gemv (and at more than one row its
+//!    token-major copy) and `attn_gate`, β and α in one launch — and with
+//!    any other types each projection by its type
 //!    (`dispatch::site_gemv`); past [`GEMV_COLS`] rows `attn_gate` waits
 //!    for 5;
 //! 3. the conv and prep ([`crate::linear::conv`]) over the layer's conv ring
@@ -47,7 +49,7 @@
 //! norm (5) follows the gate projection (`wide::delta_gate`).
 
 use super::dispatch::{self, Ctx, site_launches};
-use super::plan::{DeltaPlan, SiteTy, input_fused, out_fused};
+use super::plan::{DeltaPlan, SiteTy, beta_alpha, beta_alpha_fold, input_fused, out_fused};
 use super::proj::{OResidArgs, QkvArgs};
 use super::scratch::{Arena, Io, RecStore};
 use super::wide::{self, GEMV_COLS};
@@ -59,7 +61,9 @@ use crate::linear::seqs::{GdnCall, GdnRun, enqueue_gdn};
 use crate::model::lookup::{f32_gain, kq_weight};
 use crate::tensor::WindowMut;
 
-/// The launches [`delta`] makes at `m` rows: eight, plus a Q6_K q·k·v
+/// The launches [`delta`] makes at `m` rows: eight — seven at one row over
+/// the one-row arena (the decode graph, whose input half is one launch over
+/// the joined β·α stack) — plus a Q6_K q·k·v
 /// projection's token-major copy at more than one row; projections of other
 /// types each their own ([`site_launches`]); an output projection not of
 /// Q4_K its quantizer (a K-quant), the projection and the add. Past
@@ -77,7 +81,11 @@ pub(super) fn launches(d: &DeltaPlan, m: usize) -> usize {
             + 2;
     }
     let input = if input_fused(d) {
-        2 + usize::from(d.qkv_ty == SiteTy::Q6K && m > 1)
+        if beta_alpha_fold(d) && m == 1 {
+            1
+        } else {
+            2 + usize::from(d.qkv_ty == SiteTy::Q6K && m > 1)
+        }
     } else {
         [d.qkv_ty, d.gate_ty, d.beta_ty, d.alpha_ty]
             .iter()
@@ -322,6 +330,29 @@ pub(super) fn project(c: &Ctx<'_>, d: &DeltaPlan, s: &mut Arena, m: usize) -> Re
     let (b_in_z, a_in_z, a_in_b) = g.tail_offsets();
     let (x_len, z_len, a_len) = (g.x.len(), g.z.len(), g.a.len());
     if d.qkv_ty == SiteTy::Q4K {
+        // One row over a one-row arena folds β and α in as the same
+        // launch's v rows over their joined stack ([`beta_alpha`]): the
+        // arena's `[x | z | b | a]` holds that v block exactly, and the
+        // stack's row `r` is β's, then α's, own — the bits the two launches
+        // below write. A wider arena's `b` and `a` blocks hold more rows
+        // than the call (`a_in_b` past one β), so the v block would land in
+        // `b`'s tail short of `a`, and past one row it interleaves the
+        // parts' columns: the two launches stand in both.
+        if m == 1 && a_in_b == d.shape.n_v {
+            let wba = kq_weight(w, &beta_alpha(c.layer))?;
+            return k.proj.enqueue_qkv(
+                stream,
+                QkvArgs {
+                    wq: wqkv,
+                    wk: wz,
+                    wv: Some(wba),
+                    act,
+                    y: &mut g.proj,
+                    off_k: x_len,
+                    off_v: x_len + z_len,
+                },
+            );
+        }
         k.proj.enqueue_qkv(
             stream,
             QkvArgs {

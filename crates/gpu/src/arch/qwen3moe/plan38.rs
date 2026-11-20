@@ -12,6 +12,7 @@
 //! ([`FfnPlan`]). The PLE layer ([`PlePlan`]) adds the n-gram embedding to
 //! the streams before its mix.
 
+use super::plan::beta_alpha;
 use crate::hc_gated::HcMatrix;
 use crate::linear::{self, KHeadMap, LinearShape};
 use crate::route_softmax::RouterDims;
@@ -251,11 +252,6 @@ impl Layer38 {
     pub(super) fn by_extra(&self, m: usize) -> usize {
         if m > 1 { self.by.rows } else { self.by.one }
     }
-}
-
-/// The joined name of layer `l`'s β and α stack.
-pub(super) fn beta_alpha(l: usize) -> String {
-    format!("derived.blk.{l}.ssm_beta_alpha")
 }
 
 /// The joined name of layer `l`'s router with the shared gate.

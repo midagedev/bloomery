@@ -94,8 +94,8 @@ use super::placed::{
 };
 use super::plan::{
     FfnPlan, FfnRoute, Flash, GqaKind, Kind35, LayerPlan, MixerPlan, ResidualPlan, SharedPlan,
-    SiteTy, down_sel, gate_up_fused, input_fused, kind35, kinds35, moe_fits, o_fused, out_fused,
-    qkv_fused,
+    SiteTy, beta_alpha, beta_alpha_fold, down_sel, gate_up_fused, input_fused, kind35, kinds35,
+    moe_fits, o_fused, out_fused, qkv_fused,
 };
 use super::prefill::{PrefillPath, PrefillPlan, PrefillStep, WIDE_FROM};
 use super::program::{Program, Tail};
@@ -626,6 +626,18 @@ fn join_gate_inp(stream: &CudaStream, w: &mut Weights, l: usize) -> Result<(), G
         ],
         joint_gate_inp(l),
     )
+}
+
+/// Layer `l`'s β and α projections copied into their joined stack
+/// ([`beta_alpha`]; `Weights::join_rows_copy`: the parts stay resident for
+/// the arms that read them apart), when the gemv arm's one-row input half
+/// folds the stack into its one q·k·v launch ([`beta_alpha_fold`]).
+fn join_delta(stream: &CudaStream, w: &mut Weights, l: usize) -> Result<(), GpuError> {
+    let (b, a) = (
+        model::arch::qwen35moe::names::ssm_beta(l),
+        model::arch::qwen35moe::names::ssm_alpha(l),
+    );
+    w.join_rows_copy(stream, &[b.as_str(), a.as_str()], beta_alpha(l))
 }
 
 /// What a layer's plan reads of the arena's dims: the rows its sites are read at.
@@ -1417,6 +1429,14 @@ impl GpuModel<Body35> {
             max_rows,
             stacks: Arc::new(swap35::stacks(plan.model, |l| Ok(carded.on_card(l)? > 0))?),
         };
+        // The joined β·α stack's fold is decided by the plan's types, which
+        // the placed load's join closure does not hold: its flag per layer,
+        // read here.
+        let fold_ba: Vec<bool> = pre
+            .plans
+            .iter()
+            .map(|p| matches!(&p.mixer, MixerPlan::Delta(d) if beta_alpha_fold(d)))
+            .collect();
         GpuModel::load_placed_with(
             file,
             plan,
@@ -1429,6 +1449,9 @@ impl GpuModel<Body35> {
                         GpuError::shape(WHAT_P, format!("layer {l} past the description"))
                     })?;
                     join_router(stream, w, spec, l)?;
+                    if fold_ba[l] {
+                        join_delta(stream, w, l)?;
+                    }
                 }
                 Ok(())
             },
@@ -1459,7 +1482,9 @@ impl GpuModel<Body35> {
 impl Body35 {
     /// The whole-card load: each routed layer's router joined with its
     /// shared gate, and its stacks with its shared expert where the plan
-    /// folds it in ([`join_ffn`]), then the body ([`Body35::build`]).
+    /// folds it in ([`join_ffn`]), each folded delta layer's β and α copied
+    /// into their joined stack ([`join_delta`]), then the body
+    /// ([`Body35::build`]).
     fn load(
         gpu: &Gpu,
         w: &mut Weights,
@@ -1469,6 +1494,9 @@ impl Body35 {
     ) -> Result<Body35, GpuError> {
         for (l, plan) in pre.plans.iter().enumerate() {
             join_ffn(gpu.stream(), w, &plan.ffn, l)?;
+            if matches!(&plan.mixer, MixerPlan::Delta(d) if beta_alpha_fold(d)) {
+                join_delta(gpu.stream(), w, l)?;
+            }
         }
         Body35::build(gpu, w, pre, (o, o.ubatch, verifies), None)
     }

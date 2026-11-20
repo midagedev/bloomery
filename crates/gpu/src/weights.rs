@@ -790,13 +790,52 @@ impl Weights {
             }
             _ => {}
         }
+        let (ty, k, w) = self.copy_kquant_rows(stream, WHAT, parts)?;
+        stream.synchronize()?;
+        for name in parts {
+            self.by_name.remove(*name);
+        }
+        self.by_name.insert(joint, DevWeight::KQuant { ty, w, k });
+        Ok(())
+    }
+
+    /// [`Weights::join_rows`] over a copy, the parts K-quants: the joint
+    /// holds every part's rows in order and the parts stay resident beside
+    /// it, for the arms that still read them alone. The copies are enqueued
+    /// on `stream` and ordered by it. Load-time only.
+    pub fn join_rows_copy(
+        &mut self,
+        stream: &CudaStream,
+        parts: &[&str],
+        joint: String,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "Weights::join_rows_copy";
+        derived_slot_free(&self.by_name, &joint)?;
+        self.refuse_roomed(WHAT, parts)?;
+        let (ty, k, w) = self.copy_kquant_rows(stream, WHAT, parts)?;
+        self.by_name.insert(joint, DevWeight::KQuant { ty, w, k });
+        Ok(())
+    }
+
+    /// The K-quant `parts`' rows in one new `rows × cols` tensor, part `i`'s
+    /// after part `i − 1`'s, each part's bytes copied into it on `stream`:
+    /// the tensor [`Weights::join_rows`] and [`Weights::join_rows_copy`]
+    /// file. Refused unless every part is resident as a K-quant of the first
+    /// part's type and width, and every part but the last ends on a word
+    /// boundary.
+    fn copy_kquant_rows(
+        &mut self,
+        stream: &CudaStream,
+        what: &'static str,
+        parts: &[&str],
+    ) -> Result<(GgmlType, usize, DeviceTensor<u32>), GpuError> {
         let mut shape: Option<(GgmlType, usize, usize)> = None;
         let mut rows = 0usize;
         let mut spans = Vec::with_capacity(parts.len());
         for (i, &name) in parts.iter().enumerate() {
             let Some(DevWeight::KQuant { ty, w, k }) = self.by_name.get(name) else {
                 return Err(GpuError::shape(
-                    WHAT,
+                    what,
                     format!("{name} is not resident as a K-quant"),
                 ));
             };
@@ -804,11 +843,11 @@ impl Weights {
                 .type_size()
                 .and_then(|b| usize::try_from(b).ok())
                 .map(|b| b * (k / 256))
-                .ok_or_else(|| GpuError::shape(WHAT, format!("{name} is {ty}")))?;
+                .ok_or_else(|| GpuError::shape(what, format!("{name} is {ty}")))?;
             let want = *shape.get_or_insert((*ty, *k, w.cols()));
             if want != (*ty, *k, w.cols()) {
                 return Err(GpuError::shape(
-                    WHAT,
+                    what,
                     format!(
                         "{name} is {ty} K={k} in {} words a row; {} is {} K={} in {}",
                         w.cols(),
@@ -822,7 +861,7 @@ impl Weights {
             let bytes = w.rows() * row_bytes;
             if i + 1 < parts.len() && !bytes.is_multiple_of(4) {
                 return Err(GpuError::shape(
-                    WHAT,
+                    what,
                     format!("{name}'s {bytes} row bytes end inside a word"),
                 ));
             }
@@ -830,17 +869,17 @@ impl Weights {
             rows += w.rows();
         }
         let Some((ty, k, cols)) = shape else {
-            return Err(GpuError::shape(WHAT, "no parts to join"));
+            return Err(GpuError::shape(what, "no parts to join"));
         };
         let w = DeviceTensor::<u32>::zeroed(stream, rows, cols)?;
         let base = w.buf().cu_deviceptr();
         let mut at = 0usize;
         for (&name, &words) in parts.iter().zip(&spans) {
             let Some(DevWeight::KQuant { w: part, .. }) = self.by_name.get(name) else {
-                return Err(GpuError::shape(WHAT, format!("{name} left the map")));
+                return Err(GpuError::shape(what, format!("{name} left the map")));
             };
             let off = u64::try_from(at * 4)
-                .map_err(|_| GpuError::shape(WHAT, format!("word {at} passes u64")))?;
+                .map_err(|_| GpuError::shape(what, format!("word {at} passes u64")))?;
             // SAFETY: the words `at .. at + words` lie inside the joint's
             // `rows · cols` (each part's stream is at most its `rows · cols`),
             // and the part's first `words` inside its own buffer; both are
@@ -858,12 +897,7 @@ impl Weights {
             copied?;
             at += words;
         }
-        stream.synchronize()?;
-        for name in parts {
-            self.by_name.remove(*name);
-        }
-        self.by_name.insert(joint, DevWeight::KQuant { ty, w, k });
-        Ok(())
+        Ok((ty, k, w))
     }
 
     /// [`Weights::join_rows`] over parts in one plane of `per` values an

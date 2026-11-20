@@ -121,7 +121,8 @@ use super::mtp38::{
     CHAIN_PAIRS, DraftRows38, DraftSeq38, Mtp38, MtpCtx, MtpTaps, StoreBlock, Target38, TargetRows,
     check_target_rows,
 };
-use super::plan38::{self, GDN, Kind38, Layer38, Shape38, beta_alpha, geo, router};
+use super::plan::beta_alpha;
+use super::plan38::{self, GDN, Kind38, Layer38, Shape38, geo, router};
 use super::program38::{
     Ctx38, Kernels38, PLE_ARRIVAL_NODES, Parts38, Pass38, RowsCopy, STEP_MEMOPS, Seqs38, SlotSeq38,
     Step38, Verify38, seq_launches, step_launches, verify_launches,

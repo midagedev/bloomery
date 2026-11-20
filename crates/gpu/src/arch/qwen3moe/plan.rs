@@ -62,6 +62,22 @@ pub(super) fn out_fused(d: &DeltaPlan) -> bool {
     all_q4k(&[d.out_ty])
 }
 
+/// The joined name of layer `l`'s β and α stack, β's rows first: the load
+/// files it beside the projections, [`beta_alpha_fold`]'s launch runs its v
+/// rows over it, and the arms that read the projections apart read their
+/// own sites.
+pub(super) fn beta_alpha(l: usize) -> String {
+    format!("derived.blk.{l}.ssm_beta_alpha")
+}
+
+/// Whether the gemv arm's one-row input half is one launch over the joined
+/// β·α stack ([`beta_alpha`]): a Q4_K `attn_qkv` with the fused group's
+/// Q4_K gate, β and α. Past one row the launch's v block would interleave
+/// the parts' columns, so the two launches stand there whatever this says.
+pub(super) fn beta_alpha_fold(d: &DeltaPlan) -> bool {
+    d.qkv_ty == SiteTy::Q4K && input_fused(d)
+}
+
 /// The gemv arm's gate·up·SwiGLU of `f` at `m` rows in one launch: a routed FFN's always (the card
 /// kernel table's gate·up entry of its type), a dense FFN's Q4_K gate and up at one row. Past one
 /// row a dense FFN's gate and up are the m-column gemvs of `dispatch::site_gemv`, each reading its
