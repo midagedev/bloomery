@@ -1,0 +1,19 @@
+# Probe: the Q4_K gemv decode's three 128-bit weight loads (q4v4.card) as ld.global.nc.L1::no_allocate (weights skip L1, so the q8 activations, read by every row, stay L1 hits). The research rounds'
+# rank 2 (engines report): a cache hint on a single-use stream. The words and the sum order are unchanged, so
+# outputs are bit for bit. The probe sits beside rowpf5090.card in the same sitting [derived band, no term fixed].
+kind: ab
+question: does the na cache hint on the Q4_K v4 weight loads speed a full-card decode step?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of the q4v4 tree with
+  the v4 weight loads as ld.global.nc.L1::no_allocate.v4 against the q4v4 binary, (probe - q4v4) / q4v4
+unit: %
+predict: +0.3..+2.0
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W
+decide-in: above +0.3: land the hint with the Q4_K gates bit for bit
+decide-below: under +0.3: the hint does not pay; keep the default cache policy
+decide-above: above +2.0: read nsys before crediting
+# outcome 2026-11-21, na-bin (474ca2faa8df) against v4-bin (4edeb091e27d), RTX 5090 600 W, one lease, 6 rounds, depth
+#  512: decode 86.25 tok/s [86.23..86.26] against 86.69 [86.69..86.71], round ratios 0.99481 0.99504 0.99500 0.99475
+#  0.99491 0.99476 = -0.51 %. decide-below: the read-only path costs more than the L1 room it frees.

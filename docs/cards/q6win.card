@@ -1,0 +1,25 @@
+# The Q6_K down walk (q6k_sel_row_dot) ran one guarded iteration at a time: the guard `sbp < n_sb` is lane-dependent
+# (half the warp per super-block), so no iteration's loads could issue before the previous one's add. Iterations both
+# halves take now run two at a time with no guard (q6k_sel_term twice, then the two adds in iteration order). ptx-scan:
+# q6k_gemv_sel 48 registers (was 40), 5 blocks a SM (was 6), no spill, ld.global scalar 61 (was 21: the loop body
+# twice plus the tail). From the gemv5090 report: q6k_gemv_sel 32 launches x 46.78 us at 87 % of the bus, one partial
+# wave (640 blocks, 75 % fill at 5 a SM: no warp is lost to the occupancy drop). Two iterations in flight a warp: if
+# it reaches the head's 93.4 %, 46.78 -> 43.6 us x 32 = -102 us of 11.88 ms = +0.86 % at the top; the gupair card's
+# step took a fifth of its kernel's ncu gain, so the floor is +0.15 % [derived].
+kind: ab
+question: does the two-iteration Q6_K down walk speed a full-card decode step?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of the q6win tree against
+  main d6d985807 (c91a457d4ebe), (q6win - main) / main
+unit: %
+predict: +0.15..+0.86
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: just depth-gpu-qwen35moe with both arms at 512@model=/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf in one
+  lease, the base as a bin: arm; the 5090 alone at 600 W
+decide-in: land it with the real-tier qwen35moe e2e and verify bit for bit; take the same window to q6k_gemv
+decide-below: under +0.15: the walk was not waiting on its guard; revert
+decide-above: above +0.86: read nsys on both before crediting
+# outcome 2026-11-20, q6win tree against main d6d985807 (c91a457d4ebe), RTX 5090 600 W, one lease, 6 rounds, depth
+#  512: decode 83.54 tok/s [83.53..83.54] against 84.22 [84.21..84.22], round ratios 0.99190 0.99180 0.99192 0.99209
+#  0.99175 0.99202 = -0.81 %. Below the band: decide-below, reverted. The guard was not what the walk waited on; the
+#  window's 8 more registers and three times the load instructions cost more than two iterations in flight gave.

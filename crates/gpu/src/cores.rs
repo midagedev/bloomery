@@ -329,7 +329,9 @@ pub(crate) fn q4k_sb_decode_words(w: &[u32], wk: usize, s: usize) -> ([u32; 8], 
     (vi, cda, cdb)
 }
 
-/// Four words at global address `g` in one 128-bit load.
+/// Four words at global address `g` in one 128-bit load, cache-streaming
+/// (`.cs`, evict-first): a weight word is read once a step, so its lines
+/// leave room for the ones read again.
 ///
 /// # Safety
 ///
@@ -340,7 +342,7 @@ unsafe fn ld4_u32(g: u64) -> [u32; 4] {
     // SAFETY: the caller's contract.
     unsafe {
         ptx_asm!(
-            "ld.global.v4.u32 {%0, %1, %2, %3}, [%4];",
+            "ld.global.cs.v4.u32 {%0, %1, %2, %3}, [%4];",
             out("=r") a,
             out("=r") b,
             out("=r") c,
