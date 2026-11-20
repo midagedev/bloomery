@@ -48,7 +48,7 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
           "$HOME/.cargo/bin/rustup" show active-toolchain || "$HOME/.cargo/bin/rustup" toolchain install
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # sed reads the whole output: head would close the pipe early and xcodebuild aborts on the write (SIGPIPE, rc 134).
+          # sed reads the whole output: head would close the pipe early and xcodebuild aborts on the write (a Broken pipe exception, Abort trap: 6, rc 134).
           sw_vers; xcodebuild -version | sed -n 1p
 
       - name: Import the signing identity and the notary key into a temporary keychain
