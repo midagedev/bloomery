@@ -1539,8 +1539,14 @@ mod tests {
         })
     }
 
-    fn port(k: u16) -> u16 {
-        40_000 + (std::process::id() % 2000) as u16 * 5 + k
+    /// A port the OS reports free on rank 0's address. A fixed or pid-derived
+    /// port sat in the ephemeral range, where an outgoing connection could
+    /// hold it, and two tests in one process could name the same one.
+    fn port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free loopback port")
+            .port()
     }
 
     // At N = 2 and 4 every rank agrees on the smallest limit and receives rank 0's rounds as
@@ -1559,14 +1565,14 @@ mod tests {
                 stop: true,
             },
         ];
-        for (k, n) in [(0u16, 2usize), (1, 4)] {
-            for r in group(n, port(k), |_| "b1", &rounds) {
+        for n in [2usize, 4] {
+            for r in group(n, port(), |_| "b1", &rounds) {
                 let (agreed, got) = r.expect("an open group");
                 assert_eq!(agreed, [100], "{n} ranks");
                 assert_eq!(got, rounds, "{n} ranks");
             }
         }
-        let out = group(4, port(2), |r| if r == 3 { "b2" } else { "b1" }, &[]);
+        let out = group(4, port(), |r| if r == 3 { "b2" } else { "b1" }, &[]);
         for r in out {
             let e = r.unwrap_err();
             assert!(e.contains("in its build"), "{e}");
@@ -1577,7 +1583,7 @@ mod tests {
     // group's; the failure's ends settled or not decide what follows.
     #[test]
     fn a_lost_rank_fails_the_group_and_its_ends_decide_what_follows() {
-        let list = local(2, port(3));
+        let list = local(2, port());
         let e = std::thread::scope(|s| {
             let root = s.spawn(|| {
                 let mut c = Control::open(&list, 0, Duration::from_secs(10)).unwrap();
@@ -1592,7 +1598,7 @@ mod tests {
         });
         assert!(e.to_string().contains("round from rank 0"), "{e}");
         // A failing rank's notice reaches rank 0's next exchange with its rank and its error.
-        let list = local(2, port(4));
+        let list = local(2, port());
         let got = std::thread::scope(|s| {
             let root = s.spawn(|| {
                 let mut c = Control::open(&list, 0, Duration::from_secs(10)).unwrap();
@@ -1611,7 +1617,7 @@ mod tests {
             "{got}"
         );
         // A notice already at rank 0 when its own step fails is the failure it reports.
-        let list = local(2, port(3));
+        let list = local(2, port());
         let first = std::sync::Barrier::new(2);
         let got = std::thread::scope(|s| {
             let root = s.spawn(|| {

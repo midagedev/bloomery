@@ -1460,7 +1460,11 @@ mod tests {
             digest: h.finish(),
             size: bytes.len() as u64,
         };
-        let port = 50_000 + (std::process::id() % 1000) as u16;
+        // A port the OS reports free: a pid-derived one sat in the ephemeral range.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("a free loopback port")
+            .port();
         let list = RankList::parse(&format!(
             "127.0.0.1:{port} 127.0.0.1\n127.0.0.2:1 127.0.0.2\n127.0.0.3:1 127.0.0.3\n"
         ))
