@@ -1,0 +1,19 @@
+# The night's sum on the RTX 5090 (2026-11-20/21): main a5821c355 (q4v4, the Q4_K and Q6_K cache-streaming hints,
+# q6fold) against d6d985807, the main the night started from. The four A/Bs measured +2.88, +0.64, +0.29 and +0.91 %,
+# each against the one before it; their product is +4.79 % [derived], less any overlap between the loads' terms.
+kind: ab
+question: is the night's four landings' product what the step gains, on the RTX 5090?
+term: decode tok/s @ depth 512, Qwen3.8-27B Q4_K_M whole on the RTX 5090, generate_qwen3moe of main a5821c355 against
+  that of d6d985807, (now - start) / start
+unit: %
+predict: +4.0..+5.5
+rounds: 6
+sd: 0.05 % docs/cards/nqfold-split.card and shortk-ba-fold.card outcomes, paired round-ratio SD 0.014 % and 0.017 % over 6 rounds each, rounded up threefold
+condition: one lease, 6 rounds interleaved, the RTX 5090 alone at 600 W, no other compute process
+decide-in: report the night's gain as measured here
+decide-below: under +4.0: the landings overlap; name which by its card
+decide-above: above +5.5: read the two builds' nsys before reporting
+# outcome 2026-11-21, main a5821c355's tree (generate_qwen3moe 1ec95727cbab) against d6d985807's (c91a457d4ebe), RTX 5090
+#  600 W, one lease, 6 rounds, depth 512: decode 88.33 tok/s [88.32..88.34] against 84.27 [84.26..84.28], round ratios
+#  1.04803 1.04824 1.04794 1.04812 1.04839 1.04810 = +4.81 %, beside the four cards' product +4.79 %: decide-in, the
+#  landings add without overlap.

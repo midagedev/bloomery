@@ -1,0 +1,21 @@
+# After the night's landings (q4v4, the two cache-streaming hints, q6fold: main a5821c355), where the decode step's
+# 11.33 ms goes on the RTX 5090: the next lever is chosen from this table, not from the gemv5090 round's, whose kernels
+# have moved. The A/B's decode 88.29 tok/s is 11.33 ms a step at depth 512 [derived], so the profiled window's wall
+# should land near it (nsys adds little to a graph replay).
+kind: profile
+question: on the RTX 5090, which kernels hold the Qwen3.8-27B Q4_K_M decode step at depth 512 after the night's landings?
+term: the nsys window wall of one decode step at depth 512, nsys-gpu.sh's table, Qwen3.8-27B Q4_K_M, generate_qwen3moe
+  of main a5821c355
+unit: ms
+predict: 11.1..11.6
+condition: one lease through nsys-gpu.sh; the RTX 5090 alone at 600 W, no other compute process
+decide-in: rank the kernels by time against their bytes at 1.68 TB/s; open the largest gap as the next round
+decide-below: under 11.1: the table's window is not the A/B's step; read the boundary lines first
+decide-above: above 11.6: nsys moved the step; read the table for shares only
+# outcome 2026-11-21: the profiled binary was b560b14c0's, not a5821c355's (the box tree synced from a Mac tree still
+#  on the q4cs branch), so q6fold is not in it: 804 nodes, q6k_gemv 32 launches. Window wall 11.41 ms (kernel sum
+#  11.27, gap 0.14) in the band. At 1.68 TB/s: gate_up 62.5 us a launch against 59.7 by its bytes (95 %), the down
+#  _sel gemvs 92 %, the head 99 %, o_resid 14.2 against 8.8 (62 %, one wave of 640 blocks: ramp and drain); the
+#  small launches (norm_quant 128 x 2.1 us, gdn_conv_prep and gdn_delta_lanes 48 x 3.2 and 3.7 us) are latency
+#  chains, and ngq's fold showed a folded pair runs as long as the two. decide-in: the large gemvs sit at the roof;
+#  what is left is per-launch ramp and drain (a persistent or fused-layer kernel's term), not one kernel's loads.
