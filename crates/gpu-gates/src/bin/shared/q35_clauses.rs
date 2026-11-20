@@ -625,6 +625,16 @@ pub fn slots_two(a: &Slots35) -> Result<bool, GateError> {
     let b_last = s.last(1)?;
     let last = [s.last(0)?, b_last];
     let refusals_ok = pass_refusals(s.model(), last)?;
+    // One row over the pass arena: a delta layer folds β and α into its q·k·v launch only over a one-row arena (the
+    // decode step's), so this pass makes both launches and the body's count must say so.
+    let single = [(0, 1)];
+    let m = s.model();
+    let (n_single, own_single) = (m.capture_slots(&single)?, a.slots_launches(m, &single)?);
+    let single_ok = n_single == own_single;
+    println!(
+        "slots one row: the pass of one row on slot 0 holds {n_single} nodes, the body's own count {own_single} {}",
+        verdict(single_ok)
+    );
     let m = s.model();
     // Each slot's points as its prompt in the interleave took them, and where each stands.
     m.select_slot(0)?;
@@ -705,5 +715,5 @@ pub fn slots_two(a: &Slots35) -> Result<bool, GateError> {
         verdict(kept_ok)
     );
     let harness_ok = s.finish()?;
-    Ok(taken && held_ok && refed_ok && kept_ok && refusals_ok && harness_ok)
+    Ok(taken && held_ok && refed_ok && kept_ok && refusals_ok && single_ok && harness_ok)
 }

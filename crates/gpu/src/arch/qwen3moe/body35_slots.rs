@@ -303,16 +303,20 @@ impl SlotRows for Body35 {
 impl Body35 {
     /// The launches of the captured whole-card pass of several slots of
     /// `key` (each `(slot, rows)`, in pass order) without its head: the
-    /// row-wise launches at every row of the pass with one embedding
-    /// ([`Body35::pass_launches`]), and each busy slot past the first's
+    /// row-wise launches at every row of the pass with one embedding over
+    /// the pass arena ([`dispatch::pass_launches_on`]), and each busy slot past the first's
     /// sequence-bound launches ([`seq_launches`]). The head of the pass's
     /// rows adds the copy of the rows into its input and its own launches.
     /// A placed pass's handoff, go and card leg are not in this count.
     #[must_use]
     pub fn slots_launches(&self, key: &[(usize, usize)]) -> usize {
         let rows = key.iter().map(|&(_, m)| m).sum();
-        self.pass_launches(rows)
-            + key.len().saturating_sub(1) * seq_launches(&self.plans, self.kv_format())
+        dispatch::pass_launches_on(
+            &self.plans,
+            rows,
+            self.a.rows,
+            (self.a.dims.hidden, self.a.dims.ff),
+        ) + key.len().saturating_sub(1) * seq_launches(&self.plans, self.kv_format())
     }
 
     /// The format the attention layers' planes hold: the load's one choice,

@@ -274,7 +274,20 @@ pub(super) fn enqueue_pass(
 /// takes the f32 out gate and its own quantizer in place of the gated one, except
 /// where the gated flash stores the gated rows (`wide::flash_gates`): there the
 /// quantizer alone, none for F32.
-pub(super) fn pass_launches(plans: &[LayerPlan], m: usize, (hidden, ff): (usize, usize)) -> usize {
+pub(super) fn pass_launches(plans: &[LayerPlan], m: usize, dims: (usize, usize)) -> usize {
+    pass_launches_on(plans, m, m, dims)
+}
+
+/// [`pass_launches`] at `m` rows of an arena cut for `arena_rows`: the
+/// count differs only where a delta layer's one-row fold needs a one-row
+/// arena ([`delta::launches`]), as a pass of one row over the slots' pass
+/// arena does not have.
+pub(super) fn pass_launches_on(
+    plans: &[LayerPlan],
+    m: usize,
+    arena_rows: usize,
+    (hidden, ff): (usize, usize),
+) -> usize {
     let wide = m > GEMV_COLS;
     let many = usize::from(m > 1);
     let site = |t: SiteTy| site_launches(t, m);
@@ -305,7 +318,7 @@ pub(super) fn pass_launches(plans: &[LayerPlan], m: usize, (hidden, ff): (usize,
                 };
                 1 + qkv + 3 + out
             }
-            MixerPlan::Delta(d) => delta::launches(d, m),
+            MixerPlan::Delta(d) => delta::launches(d, m, arena_rows),
             MixerPlan::ShortConv(_) => {
                 panic!(
                     "qwen3moe::pass_launches: a short-conv layer, which the card's plans never hold"

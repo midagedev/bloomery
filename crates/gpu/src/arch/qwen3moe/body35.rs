@@ -1449,7 +1449,10 @@ impl GpuModel<Body35> {
                         GpuError::shape(WHAT_P, format!("layer {l} past the description"))
                     })?;
                     join_router(stream, w, spec, l)?;
-                    if fold_ba[l] {
+                    let fold = fold_ba.get(l).ok_or_else(|| {
+                        GpuError::shape(WHAT_P, format!("layer {l} past the plans"))
+                    })?;
+                    if *fold {
                         join_delta(stream, w, l)?;
                     }
                 }

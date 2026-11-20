@@ -61,9 +61,9 @@ use crate::linear::seqs::{GdnCall, GdnRun, enqueue_gdn};
 use crate::model::lookup::{f32_gain, kq_weight};
 use crate::tensor::WindowMut;
 
-/// The launches [`delta`] makes at `m` rows: eight — seven at one row over
-/// the one-row arena (the decode graph, whose input half is one launch over
-/// the joined β·α stack) — plus a Q6_K q·k·v
+/// The launches [`delta`] makes at `m` rows of an arena cut for
+/// `arena_rows`: eight — seven at one row over a one-row arena (the decode
+/// graph, whose input half is one launch over the joined β·α stack) — plus a Q6_K q·k·v
 /// projection's token-major copy at more than one row; projections of other
 /// types each their own ([`site_launches`]); an output projection not of
 /// Q4_K its quantizer (a K-quant), the projection and the add. Past
@@ -72,7 +72,7 @@ use crate::tensor::WindowMut;
 /// prompt form's three and the gated norm writing the one q8 form the output
 /// projection reads), the output projection and the residual add — thirteen
 /// for K-quants.
-pub(super) fn launches(d: &DeltaPlan, m: usize) -> usize {
+pub(super) fn launches(d: &DeltaPlan, m: usize, arena_rows: usize) -> usize {
     if m > GEMV_COLS {
         return 1
             + dispatch::wide_quants(&[d.qkv_ty, d.gate_ty, d.beta_ty, d.alpha_ty])
@@ -81,7 +81,7 @@ pub(super) fn launches(d: &DeltaPlan, m: usize) -> usize {
             + 2;
     }
     let input = if input_fused(d) {
-        if beta_alpha_fold(d) && m == 1 {
+        if beta_alpha_fold(d) && m == 1 && arena_rows == 1 {
             1
         } else {
             2 + usize::from(d.qkv_ty == SiteTy::Q6K && m > 1)
