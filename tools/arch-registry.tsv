@@ -24,4 +24,4 @@ muse-spark	MuseSpark	yes	no	musespark
 mistral-large4	MistralLarge4	yes	no	mistrallarge4-e128
 kimi-k3,kimi-k31	KimiK3	yes	no	kimik3
 hy_v4_flash	Hy4	yes	no	hy4
-inkling2,inkling2_loop	Inkling2	yes	no	-
+inkling2,inkling2_loop	Inkling2	yes	no	inkling2

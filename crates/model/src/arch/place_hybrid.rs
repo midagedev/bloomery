@@ -1145,6 +1145,16 @@ enum Hold {
         v_heads: usize,
         d: usize,
     },
+    /// A relative-position bias layer: its `visits` visits' stores, each its K and V of `row`
+    /// bytes a position over its `window` positions when it has one and its short-conv state of
+    /// `conv` bytes, whatever the context — the visits one where no loop runs, the loop's `passes`
+    /// inside its core, sharing the stored layer's weights ([`KvLayout::of_visits`]).
+    RelBias {
+        row: u64,
+        window: Option<u64>,
+        conv: u64,
+        visits: u64,
+    },
     /// A layer with no token mixer.
     Nothing,
 }
@@ -1206,97 +1216,42 @@ impl KvLayout {
         let mut holds = Vec::new();
         let mut ropes: Vec<(u32, u32)> = Vec::new();
         let mut sink_row = 0;
-        let mut note = |rope: &models::Rope| {
-            if rope.mode != RopeMode::None {
-                let rope = (rope.base.to_bits(), rope.dims);
-                if !ropes.contains(&rope) {
-                    ropes.push(rope);
-                }
-            }
-        };
         for (layer, mixer) in mixers.into_iter().enumerate() {
-            holds.push(match mixer {
-                Mixer::Gqa(g) => {
-                    let index = match index_row(g) {
-                        Ok(index) => index,
-                        Err(what) => return Err(unsized_store(layer, what)),
-                    };
-                    note(&g.rope);
-                    sink_row = sink_row.max(index);
-                    if let Some(Selector::BlockMax { rope, .. }) = &g.select {
-                        note(rope);
-                    }
-                    Hold::Attention {
-                        row: u64::from(g.kv_heads)
-                            * (u64::from(g.head_dim) + u64::from(g.value_dim))
-                            * stores::F16_BYTES,
-                        index,
-                        pooled: NO_POOL,
-                        window: g.window.map(u64::from),
-                    }
-                }
-                // A latent layer that compresses and windows nothing holds a plane of one row a
-                // position, the latent and the key values beside it, in f16 — none when another
-                // layer wrote the rows it reads — and the index keys its own indexer writes, one a
-                // position or one a pool of positions.
-                Mixer::Latent(a) if a.compress.is_none() && a.window.is_none() => {
-                    let (index, pooled) = match (latent_index_row(a), latent_pool_row(a)) {
-                        (Ok(index), Ok(pooled)) => (index, pooled),
-                        (Err(what), _) | (_, Err(what)) => return Err(unsized_store(layer, what)),
-                    };
-                    match (a.cache, pooled) {
-                        (Source::Own(()), pooled) => Hold::Attention {
-                            row: (u64::from(a.latent) + u64::from(a.pe)) * stores::F16_BYTES,
-                            index,
-                            pooled,
-                            window: None,
-                        },
-                        (Source::From(_), NO_POOL) => Hold::Reader { index },
-                        (Source::From(_), _) => {
-                            return Err(unsized_store(
-                                layer,
-                                "a latent mixer that reads another layer's rows and pools keys",
-                            ));
-                        }
-                    }
-                }
-                // A latent layer over a window of positions that compresses and selects nothing
-                // holds its own rows on the ring, as a GQA window layer does.
-                Mixer::Latent(a)
-                    if a.compress.is_none()
-                        && a.select.is_none()
-                        && matches!(a.cache, Source::Own(())) =>
-                {
-                    Hold::Attention {
-                        row: (u64::from(a.latent) + u64::from(a.pe)) * stores::F16_BYTES,
-                        index: 0,
-                        pooled: NO_POOL,
-                        window: a.window.map(u64::from),
-                    }
-                }
-                Mixer::DeltaRule(d) => Hold::State {
-                    fixed: state_bytes(d),
-                    v_heads: d.v_heads as usize,
-                    d: d.d as usize,
+            holds.push(hold_of(layer, mixer, &mut ropes, &mut sink_row)?);
+        }
+        Ok(built(holds, ropes, sink_row))
+    }
+
+    /// The layout of `spec`'s trunk over its layer visits ([`models::visits`]): every stored
+    /// layer's own stores where no loop runs, and a looped core's visits each its own — a
+    /// relative-position bias layer holding one K and V plane (or ring, over its window) and one
+    /// short-conv state a visit, its visits the loop's passes inside the core and one outside it,
+    /// the state the trunk's widest layer's channels ([`conv_state_bytes`]: the reference keeps one
+    /// recurrent state buffer a cache slot, its channels the widest layer's,
+    /// src/models/inkling2.cpp:70-87). Every other mixer's hold is [`KvLayout::of`]'s, at its
+    /// stored layer; the plan reads a layer's visits' stores at its stored index, beside the
+    /// weights it holds once.
+    ///
+    /// # Errors
+    ///
+    /// A layer whose stores [`KvLayout::of`] does not size, by layer.
+    pub fn of_visits(spec: &ModelSpec) -> Result<KvLayout, PlacementError> {
+        let conv = conv_state_bytes(spec);
+        let mut holds = Vec::with_capacity(spec.layers.len());
+        let mut ropes: Vec<(u32, u32)> = Vec::new();
+        let mut sink_row = 0;
+        for (layer, l) in spec.layers.iter().enumerate() {
+            holds.push(match &l.mixer {
+                Mixer::RelBias(a) => Hold::RelBias {
+                    row: u64::from(a.kv_heads) * 2 * u64::from(a.head_dim) * stores::F16_BYTES,
+                    window: a.window.map(u64::from),
+                    conv,
+                    visits: visit_count(layer, spec.loop_),
                 },
-                Mixer::None => Hold::Nothing,
-                other => return Err(unsized_store(layer, other.what())),
+                other => hold_of(layer, other, &mut ropes, &mut sink_row)?,
             });
         }
-        Ok(KvLayout {
-            holds,
-            rows: Rows::Ring,
-            rope_row: ropes
-                .iter()
-                .map(|&(_, dims)| u64::from(dims) * stores::F32_BYTES)
-                .sum(),
-            sink_row,
-            scratch_row: 0,
-            scratch_block: (0, 1),
-            rooms: None,
-            lanes: NonZeroUsize::MIN,
-            host_yields: false,
-        })
+        Ok(built(holds, ropes, sink_row))
     }
 
     /// The same layout with the window layers on `rows`.
@@ -1376,11 +1331,15 @@ impl KvLayout {
     /// The K and V rows layer `layer` holds at `ctx_max`. A layer that keeps no positions, or is
     /// past the trunk, holds none. The index keys of a layer that selects blocks are not counted
     /// here: it has no window, so they are one for each of the `ctx_max` positions
-    /// ([`KvBytes::layer_bytes`] adds them).
+    /// ([`KvBytes::layer_bytes`] adds them). A relative-position bias layer's rows are its visits'
+    /// — the loop's passes inside its core.
     #[must_use]
     pub fn rows_at(&self, layer: usize, ctx_max: u64) -> u64 {
         match self.holds.get(layer) {
             Some(Hold::Attention { window, .. }) => self.rows.count(*window, ctx_max),
+            Some(Hold::RelBias { window, visits, .. }) => {
+                self.rows.count(*window, ctx_max).saturating_mul(*visits)
+            }
             _ => 0,
         }
     }
@@ -1396,6 +1355,145 @@ impl KvLayout {
             draft: None,
             beside: 0,
         }
+    }
+}
+
+/// One stored layer's hold, the walk's collected facts beside it: the arm [`KvLayout::of`] and
+/// [`KvLayout::of_visits`] share. A relative-position bias layer is refused here — its stores
+/// count its visits, which the mixers alone do not name ([`KvLayout::of_visits`]).
+fn hold_of(
+    layer: usize,
+    mixer: &Mixer,
+    ropes: &mut Vec<(u32, u32)>,
+    sink_row: &mut u64,
+) -> Result<Hold, PlacementError> {
+    let mut note = |rope: &models::Rope| {
+        if rope.mode != RopeMode::None {
+            let rope = (rope.base.to_bits(), rope.dims);
+            if !ropes.contains(&rope) {
+                ropes.push(rope);
+            }
+        }
+    };
+    Ok(match mixer {
+        Mixer::Gqa(g) => {
+            let index = match index_row(g) {
+                Ok(index) => index,
+                Err(what) => return Err(unsized_store(layer, what)),
+            };
+            note(&g.rope);
+            *sink_row = (*sink_row).max(index);
+            if let Some(Selector::BlockMax { rope, .. }) = &g.select {
+                note(rope);
+            }
+            Hold::Attention {
+                row: u64::from(g.kv_heads)
+                    * (u64::from(g.head_dim) + u64::from(g.value_dim))
+                    * stores::F16_BYTES,
+                index,
+                pooled: NO_POOL,
+                window: g.window.map(u64::from),
+            }
+        }
+        // A latent layer that compresses and windows nothing holds a plane of one row a
+        // position, the latent and the key values beside it, in f16 — none when another
+        // layer wrote the rows it reads — and the index keys its own indexer writes, one a
+        // position or one a pool of positions.
+        Mixer::Latent(a) if a.compress.is_none() && a.window.is_none() => {
+            let (index, pooled) = match (latent_index_row(a), latent_pool_row(a)) {
+                (Ok(index), Ok(pooled)) => (index, pooled),
+                (Err(what), _) | (_, Err(what)) => return Err(unsized_store(layer, what)),
+            };
+            match (a.cache, pooled) {
+                (Source::Own(()), pooled) => Hold::Attention {
+                    row: (u64::from(a.latent) + u64::from(a.pe)) * stores::F16_BYTES,
+                    index,
+                    pooled,
+                    window: None,
+                },
+                (Source::From(_), NO_POOL) => Hold::Reader { index },
+                (Source::From(_), _) => {
+                    return Err(unsized_store(
+                        layer,
+                        "a latent mixer that reads another layer's rows and pools keys",
+                    ));
+                }
+            }
+        }
+        // A latent layer over a window of positions that compresses and selects nothing
+        // holds its own rows on the ring, as a GQA window layer does.
+        Mixer::Latent(a)
+            if a.compress.is_none() && a.select.is_none() && matches!(a.cache, Source::Own(())) =>
+        {
+            Hold::Attention {
+                row: (u64::from(a.latent) + u64::from(a.pe)) * stores::F16_BYTES,
+                index: 0,
+                pooled: NO_POOL,
+                window: a.window.map(u64::from),
+            }
+        }
+        Mixer::DeltaRule(d) => Hold::State {
+            fixed: state_bytes(d),
+            v_heads: d.v_heads as usize,
+            d: d.d as usize,
+        },
+        Mixer::None => Hold::Nothing,
+        Mixer::RelBias(_) => {
+            return Err(unsized_store(
+                layer,
+                "a relative-position bias mixer: its stores are its visits', which the \
+                 description's loop names ([`KvLayout::of_visits`])",
+            ));
+        }
+        other => return Err(unsized_store(layer, other.what())),
+    })
+}
+
+/// The layout of a walk's `holds`: the ring rows, one rope table a distinct rope, the widest
+/// selector's sink row and the plain defaults of the fields a family's own builder sets.
+fn built(holds: Vec<Hold>, ropes: Vec<(u32, u32)>, sink_row: u64) -> KvLayout {
+    KvLayout {
+        holds,
+        rows: Rows::Ring,
+        rope_row: ropes
+            .iter()
+            .map(|&(_, dims)| u64::from(dims) * stores::F32_BYTES)
+            .sum(),
+        sink_row,
+        scratch_row: 0,
+        scratch_block: (0, 1),
+        rooms: None,
+        lanes: NonZeroUsize::MIN,
+        host_yields: false,
+    }
+}
+
+/// A trunk's short-convolution state a visit, in bytes: the last `taps − 1` inputs over
+/// `2·kv + 2·hidden` channels of its widest relative-position bias layer, f32 — the reference's
+/// one recurrent state buffer a cache slot, its channels the widest layer's
+/// (src/models/inkling2.cpp:78-87). 0 for a trunk that holds no such layer.
+fn conv_state_bytes(spec: &ModelSpec) -> u64 {
+    let mut channels = 0;
+    let mut taps = 0;
+    for l in &spec.layers {
+        if let Mixer::RelBias(a) = &l.mixer {
+            channels = channels.max(
+                2 * u64::from(a.kv_heads) * u64::from(a.head_dim) + 2 * u64::from(spec.hidden),
+            );
+            taps = taps.max(u64::from(a.taps));
+        }
+    }
+    channels * taps.saturating_sub(1) * stores::F32_BYTES
+}
+
+/// How many times a loop runs stored layer `layer`: the loop's `passes` inside its core, once
+/// outside it and where no loop runs.
+fn visit_count(layer: usize, loop_: Option<models::LoopSpec>) -> u64 {
+    match loop_ {
+        Some(loop_) if (loop_.core_start as usize..loop_.core_end as usize).contains(&layer) => {
+            u64::from(loop_.passes)
+        }
+        _ => 1,
     }
 }
 
@@ -1516,6 +1614,17 @@ impl KvBytes for KvLayout {
             Some(Hold::State { fixed, v_heads, d }) => {
                 fixed + stores::delta_lane_bytes(*v_heads, *d, self.lanes.get())
             }
+            Some(Hold::RelBias {
+                row,
+                window,
+                conv,
+                visits,
+            }) => self
+                .rows
+                .count(*window, ctx_max)
+                .saturating_mul(*row)
+                .saturating_add(*conv)
+                .saturating_mul(*visits),
             Some(Hold::Nothing) | None => 0,
         }
     }
@@ -2257,6 +2366,128 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].layer, Some(1));
         assert!(items[0].feature.contains("a Mamba-2 mixer"), "{items:?}");
+    }
+
+    /// A relative-position bias layer's stores are its visits': the published Mini's trunk (24
+    /// stored layers, the core [6, 18) three passes, the windowless layers 5, 11, 17, 23, hidden
+    /// 2304, 8 key heads of 128, 4 taps) holds a visit's K and V of 8·2·128 f16 values = 4,096 B a
+    /// position and a conv state of (2·1,024 + 2·2,304)·3 f32 = 79,872 B whatever the context
+    /// [derived from the published widths: the row is the key heads' key and value values, the
+    /// state the reference's one recurrent buffer a cache slot]. A windowed visit holds its ring's
+    /// rows, a windowless one every position; a core layer holds its 3 visits' stores, a stem or
+    /// coda layer one. At 4,096 positions the trunk's 48 visits hold 40 windowed — the core's
+    /// windowed layers' three each — of `ring_rows(1,024, 4,096)` = 1,536 rows (the window and a
+    /// prompt batch, aligned) and 8 windowless of 4,096:
+    /// 40·(1,536·4,096 + 79,872) + 8·(4,096·4,096 + 79,872) = 400,195,584 B on the ring, where a
+    /// windowed visit holds its window and a prompt batch, aligned, and 809,140,224 B on the
+    /// plane, where it holds every position. `KvLayout::of` refuses the mixer by name: its visits
+    /// are the loop's.
+    /// Mutants: a visit's state dropped, the core's visits not multiplied, the ring counted a
+    /// visit.
+    #[test]
+    fn a_relbias_layer_holds_its_visits_stores() {
+        let relbias = |window: Option<u32>| {
+            Mixer::RelBias(models::RelBias {
+                heads: 24,
+                kv_heads: 8,
+                head_dim: 128,
+                window,
+                out_gate: models::OutGate::Proj,
+                d_rel: 16,
+                extent: 1024,
+                qk_clip: 22.627_417,
+                rel_clip: 8.0,
+                log_floor: 8192,
+                log_alpha: 0.1,
+                taps: 4,
+                dynamic: window.is_none(),
+            })
+        };
+        let (row, conv) = (
+            8 * 2 * 128 * stores::F16_BYTES,
+            (2 * 1024 + 2 * 2304) * 3 * 4,
+        );
+        assert_eq!((row, conv), (4_096, 79_872));
+        let layers: Vec<models::LayerSpec> = (0..24)
+            .map(|l| models::LayerSpec {
+                mixer: relbias((l % 6 != 5).then_some(1024)),
+                ffn: models::Ffn::Dense {
+                    ff: 0,
+                    act: models::Act::ReluSqr,
+                },
+                residual: models::Residual::Plain,
+                extras: Vec::new(),
+            })
+            .collect();
+        let mut spec = models::ModelSpec {
+            arch: models::Arch::Inkling2,
+            hidden: 2304,
+            vocab: 201_024,
+            ctx_train: 1_048_576,
+            rms_eps: 1e-6,
+            layers,
+            mtp: Vec::new(),
+            hc: None,
+            engram: None,
+            encoder: None,
+            logit_epilogue: None,
+            loop_: Some(models::LoopSpec {
+                core_start: 6,
+                core_end: 18,
+                passes: 3,
+                gate_rank: 64,
+            }),
+            chat: models::ChatSpec {
+                pre: "inkling2".to_string(),
+                template: None,
+                tools: None,
+                reasoning: None,
+            },
+        };
+        let kv = KvLayout::of_visits(&spec).expect("the trunk is sized");
+        let at = |l: usize, ctx| kv.layer_bytes(l, ctx);
+        // A stem windowed layer, the stem's windowless layer 5, a core windowed layer's 3 visits,
+        // a core windowless layer's (11), a coda layer's one.
+        assert_eq!(at(0, 64), ring_rows(1024, 64) * row + conv);
+        assert_eq!(at(5, 64), 64 * row + conv);
+        assert_eq!(at(6, 64), 3 * (ring_rows(1024, 64) * row + conv));
+        assert_eq!(at(11, 64), 3 * (64 * row + conv));
+        assert_eq!(at(18, 64), ring_rows(1024, 64) * row + conv);
+        assert_eq!(kv.layer_bytes(24, 64), 0);
+        assert_eq!(kv.rows_at(6, 64), 3 * ring_rows(1024, 64));
+        assert_eq!(kv.stage_position_bytes(64), 0, "no layer turns a rope");
+        let whole = |plane: bool| {
+            let kv = if plane {
+                kv.clone().with_rows(Rows::Plane)
+            } else {
+                kv.clone()
+            };
+            (0..24).map(|l| kv.layer_bytes(l, 4096)).sum::<u64>()
+        };
+        assert_eq!(ring_rows(1024, 4096), 1_536);
+        assert_eq!(
+            whole(false),
+            40 * (1_536 * row + conv) + 8 * (4096 * row + conv),
+            "the ring term at 4,096 positions"
+        );
+        // On the plane a windowed visit holds every position, not its window: 48 visits of
+        // 4,096 rows each.
+        assert_eq!(whole(true), 48 * (4096 * row + conv), "the plane term");
+        // The loopless trunk of the same layers visits every layer once.
+        spec.loop_ = None;
+        let plain = KvLayout::of_visits(&spec).expect("the trunk is sized");
+        assert_eq!(plain.layer_bytes(6, 64), ring_rows(1024, 64) * row + conv);
+        // The mixer alone does not name its visits: `of` refuses it by name.
+        let err = KvLayout::of([&relbias(Some(1024))]).expect_err("refused");
+        let PlacementError::Unimplemented(items) = err else {
+            panic!("{err:?}, not the unimplemented list");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].layer, Some(0));
+        assert!(
+            items[0].feature.contains("a relative-position bias mixer"),
+            "{items:?}"
+        );
     }
 
     /// A stack is card-routed when the common kernel table gives its type the entry this

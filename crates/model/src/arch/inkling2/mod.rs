@@ -1,7 +1,7 @@
 //! `inkling2` — Inkling 2 (the Mini and the Small, one program). The file's keys (`hparams`),
-//! every tensor's role (`roles`), the typed description (`spec`) and the tensor names a step
-//! reads (`names`). No placement of its own yet and no fixture: the rounds that add them carry
-//! this module forward.
+//! every tensor's role (`roles`), the typed description (`spec`), the tensor names a step
+//! reads (`names`), the placement inputs over the loop's layer visits (`place`) and the family's
+//! gate fixtures (`fixture`).
 //!
 //! The trunk is grouped-query attention whose score path carries the positions through a learned
 //! relative-position bias — no rope anywhere — with a per-(head, query) sink column in the
@@ -26,7 +26,9 @@
 //! and `blk.N.loop_msg_query` + `blk.N.loop_{q,k,v,ffn}_ctrl_*`). The dialect's authority is
 //! llama.cpp's `src/models/inkling2.cpp` (and `inkling2-loop.cpp` for the second spelling).
 
+pub mod fixture;
 pub mod hparams;
 pub mod names;
+pub mod place;
 pub mod roles;
 pub mod spec;

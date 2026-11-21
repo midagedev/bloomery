@@ -153,13 +153,19 @@ pub(super) fn stems_of(
 }
 
 /// Every model-level tensor's role by exact name, the loop's message queries under the unsloth
-/// dialect alone; `None` for a per-layer name (the classifier's walk takes it from there).
-pub(super) fn model_level(name: &str, dialect: Dialect) -> Option<(Role, Option<usize>)> {
+/// dialect alone — a layer each, the core's first: the plan reads them with that layer's
+/// attention rows, and a model-level attention tensor has no stage of its own. `None` for a
+/// per-layer name (the classifier's walk takes it from there).
+pub(super) fn model_level(
+    name: &str,
+    dialect: Dialect,
+    core_start: usize,
+) -> Option<(Role, Option<usize>)> {
     match name {
         "token_embd_norm.weight" => Some((Role::TokenEmbedding, None)),
         "output_res_query.weight" => Some((Role::Head, None)),
         "loop_res_query.weight" | "loop_kv_res_query.weight" if dialect == Dialect::Unsloth => {
-            Some((Role::Attention, None))
+            Some((Role::Attention, Some(core_start)))
         }
         _ => None,
     }
@@ -167,10 +173,11 @@ pub(super) fn model_level(name: &str, dialect: Dialect) -> Option<(Role, Option<
 
 /// Every tensor of `split` with its role and header facts.
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
+    let core_start = hp.loop_.map_or(0, |loop_| loop_.core_start);
     classify_with(
         split,
         |name| {
-            model_level(name, hp.dialect)
+            model_level(name, hp.dialect, core_start)
                 .or_else(|| role_by_layer(name, hp.n_layer, |l| stems_of(hp.dialect, hp.kind(l))))
         },
         Counts::new(hp.n_layer, hp.n_expert, hp.n_used[0]),
@@ -188,7 +195,7 @@ mod tests {
     /// A tensor's role and layer by its name in a 6-layer file whose layer 2 is windowless, the
     /// core [2, 4) of a loop, under the dialect `dialect`.
     fn role_of(name: &str, dialect: super::Dialect) -> Option<(Role, Option<usize>)> {
-        super::model_level(name, dialect).or_else(|| {
+        super::model_level(name, dialect, 2).or_else(|| {
             role_by_layer(name, 6, |l| {
                 stems_of(dialect, (l != 2, (2..4).contains(&l), l == 0))
             })
@@ -216,7 +223,8 @@ mod tests {
     /// The table is exact: a stem of each group has its role on a layer of its kind, and a name
     /// the layer's kind does not hold — the other dialect's loop stems, a controller on a
     /// non-core layer or the first layer's mix query, a fused projection, a block past the
-    /// stored layers — has none. Mutant: every layer given the stems of every kind.
+    /// stored layers — has none. The loop's message queries carry the core's first layer, the
+    /// plan's stage for them. Mutant: every layer given the stems of every kind.
     #[test]
     fn the_table_is_exact() {
         let (pr, master) = (super::Dialect::Unsloth, super::Dialect::Master);
@@ -227,16 +235,16 @@ mod tests {
             "loop_kv_res_query.weight",
         ] {
             assert_eq!(
-                model_level(name, pr).map(|(r, _)| r).unwrap(),
+                model_level(name, pr, 2).unwrap(),
                 match name {
-                    "output_res_query.weight" => Role::Head,
-                    "token_embd_norm.weight" => Role::TokenEmbedding,
-                    _ => Role::Attention,
+                    "output_res_query.weight" => (Role::Head, None),
+                    "token_embd_norm.weight" => (Role::TokenEmbedding, None),
+                    _ => (Role::Attention, Some(2)),
                 }
             );
         }
         // The loop's message queries are the unsloth dialect's alone.
-        assert!(model_level("loop_res_query.weight", master).is_none());
+        assert!(model_level("loop_res_query.weight", master, 2).is_none());
         assert_eq!(
             role_of("blk.2.attn_rel_bias.weight", pr),
             Some((Role::Attention, Some(2)))

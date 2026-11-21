@@ -1,9 +1,16 @@
 //! inkling2 metadata gate: what the header reader `arch::inkling2` resolves from the two Inkling 2
 //! files on the box — the Mini's looped `inkling2` (unsloth's UD-Q4_K_XL) and the Small's loopless
 //! one (unsloth's UD-Q2_K_XL, six shards) — what the coverage check lists for them (the parts no
-//! program in this tree runs yet, the work queue of the rounds that build one), and the tensors
-//! by role and type. One contract, one test a file; each prints what it compared, then fails with
-//! the whole list of what differs.
+//! program in this tree runs yet, the work queue of the rounds that build one), the tensors by
+//! role and type, the trunk's layer visits and cache slots (a visit a slot, the loop's core
+//! repeated), and the placement's own print: the weights once per stored layer, the stores once a
+//! visit at three depths, and the host-routed plan on the gate machine. One contract, one test a
+//! file; each prints what it compared, then fails with the whole list of what differs.
+//!
+//! `hw_inkling2_fixture` is the fixture-tier clause: the family's planted fixture
+//! (`arch::inkling2::fixture::spec`, thirteen layers of the Mini) read back through the same
+//! reader — `BLOOMERY_REF_MODEL` names it where the profile resolved one (the fixture tier's), the
+//! planted path otherwise.
 //!
 //! `hw_`: needs the files on the box (`just gate-inkling2-meta`). Headers only: seconds.
 
@@ -14,6 +21,8 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use gguf::Split;
+use model::arch::inkling2::place;
+use model::placement::{KvBytes, PlanLevers, Role, workstation};
 
 /// The Mini: unsloth's UD-Q4_K_XL, one shard, the loop of the core [6, 18) three times.
 const MINI: &str = "/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf";
@@ -154,9 +163,60 @@ const SMALL_TENSORS: &[&str] = &[
     "token_embd q5_K 1",
 ];
 
-/// One file's description, defaults, unread keys, tensors and coverage items: printed, each
-/// compared against its pins.
-fn check(path: &str, view: &[&str], defaults: &[&str], unread_pins: &[&str], tensors: &[&str]) {
+/// The trunk's layer visits as pins: the count over the stored layers, the run order as the layer
+/// runs of each segment (the reference's: the stem, the core's passes one after another, the
+/// coda), and the slot table's windowless slots — a slot a visit, windowed by its stored layer.
+fn visit_lines(spec: &models::ModelSpec) -> Vec<String> {
+    let visits = spec.visits();
+    let mut out = vec![format!(
+        "visits {} over {} stored layers",
+        visits.len(),
+        spec.layers.len()
+    )];
+    let mut runs: Vec<String> = Vec::new();
+    let mut start = 0;
+    for i in 0..=visits.len() {
+        let new_run = i == visits.len()
+            || i > start
+                && (visits[i].layer != visits[i - 1].layer + 1
+                    || visits[i].pass != visits[i - 1].pass);
+        if new_run {
+            runs.push(format!(
+                "{}-{} p{}",
+                visits[start].layer,
+                visits[i - 1].layer,
+                visits[start].pass
+            ));
+            start = i;
+        }
+    }
+    out.push(format!("runs {}", runs.join(" | ")));
+    let windowless: Vec<String> = visits
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| {
+            matches!(
+                &spec.layers[v.layer as usize].mixer,
+                models::Mixer::RelBias(a) if a.window.is_none()
+            )
+        })
+        .map(|(slot, _)| slot.to_string())
+        .collect();
+    out.push(format!("windowless slots {}", windowless.join(",")));
+    out
+}
+
+/// One file's description, defaults, unread keys, tensors, coverage items, layer visits and
+/// placement: printed, each compared against its pins.
+fn check(
+    path: &str,
+    view: &[&str],
+    defaults: &[&str],
+    unread_pins: &[&str],
+    tensors: &[&str],
+    visits: &[&str],
+    plan: &[&str],
+) {
     let mut o = String::new();
     let mut b = Vec::new();
     let split = Split::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
@@ -184,11 +244,26 @@ fn check(path: &str, view: &[&str], defaults: &[&str], unread_pins: &[&str], ten
         .collect();
     let _ = writeln!(o, "tensors {}", read.tensors.tensors.len());
     spec_view::compare(&mut o, &mut b, "tensors by role and type", &got, tensors);
+    spec_view::compare(
+        &mut o,
+        &mut b,
+        "visits and slots",
+        &visit_lines(&read.spec),
+        visits,
+    );
     let list = model::arch::coverage::check(&read.spec, &read.tensors);
     let _ = writeln!(o, "coverage (the work queue, printed not pinned)");
     for line in spec_view::items(&list) {
         let _ = writeln!(o, "  {line}");
     }
+    spec_view::compare(
+        &mut o,
+        &mut b,
+        "stores and plan",
+        &place_lines(&split),
+        plan,
+    );
+    let _ = o; // printed below
     println!("{o}");
     assert!(
         b.is_empty(),
@@ -198,10 +273,64 @@ fn check(path: &str, view: &[&str], defaults: &[&str], unread_pins: &[&str], ten
     );
 }
 
+/// The placement's own print of `split`: the weights once per stored layer (the routed stacks and
+/// the rest), the trunk's stores once a visit at three depths and the conv state's share, and the
+/// host-routed plan on the gate machine (no card kernel reads this family's experts yet, so every
+/// stack sits on the host and the card holds the dense weights and the stores).
+fn place_lines(split: &Split) -> Vec<String> {
+    let inputs = place::Inputs::describe(split).expect("the file describes");
+    let (mut dense, mut routed) = (0u64, 0u64);
+    for t in &inputs.model.tensors {
+        if t.role == Role::RoutedExperts {
+            routed += t.file_bytes;
+        } else if t.role != Role::Unread {
+            dense += t.file_bytes;
+        }
+    }
+    let kv = &inputs.kv;
+    let at = |ctx: u64| {
+        (0..inputs.model.layers)
+            .map(|l| kv.layer_bytes(l, ctx))
+            .sum::<u64>()
+    };
+    let mut out = vec![
+        format!("weights dense {dense} routed {routed} B"),
+        format!(
+            "stores 6 {} B 4096 {} B 262144 {} B",
+            at(6),
+            at(4096),
+            at(262_144)
+        ),
+    ];
+    let machine = workstation::plan_gate(inputs.model.layers);
+    let plan = inputs
+        .plan(&machine, 4096, &PlanLevers::default())
+        .expect("the gate machine plans the file");
+    let stage = &plan.cards[0];
+    out.push(format!(
+        "plan@4096 dense {} kv {} scratch {} context {} | host experts {} B of {} experts",
+        stage.dense_bytes,
+        stage.kv_bytes,
+        stage.scratch_bytes,
+        stage.context_bytes,
+        plan.host.expert_bytes,
+        plan.host.experts,
+    ));
+    out
+}
+
 #[test]
 #[ignore = "needs the Inkling-2-Mini UD-Q4_K_XL file on the box"]
 fn hw_inkling2_spec_mini() {
-    check(MINI, MINI_VIEW, MINI_DEFAULTS, MINI_UNREAD, MINI_TENSORS);
+    check(
+        MINI,
+        MINI_VIEW,
+        MINI_DEFAULTS,
+        MINI_UNREAD,
+        MINI_TENSORS,
+        MINI_VISITS,
+        MINI_PLAN,
+    );
 }
 
 #[test]
@@ -213,5 +342,168 @@ fn hw_inkling2_spec_small() {
         SMALL_DEFAULTS,
         SMALL_UNREAD,
         SMALL_TENSORS,
+        SMALL_VISITS,
+        SMALL_PLAN,
+    );
+}
+
+// PIN(2026-11-21): the Mini's layer visits and slot table [derived from the description the
+// reader holds and the reference's run order (inkling2.cpp's graph loop)]: 48 visits over 24
+// stored layers — the stem 0-5, the core 6-17 three times, the coda 18-23 — the windowless slots
+// the windowless layers' (5 and 23 once, 11 and 17 three times each: 8 of the 48).
+const MINI_VISITS: &[&str] = &[
+    "visits 48 over 24 stored layers",
+    "runs 0-17 p0 | 6-17 p1 | 6-17 p2 | 18-23 p0",
+    "windowless slots 5,11,17,23,29,35,41,47",
+];
+
+// PIN(2026-11-21): the Small's: no loop, the visits the layers, the windowless slots every sixth
+// from 5.
+const SMALL_VISITS: &[&str] = &[
+    "visits 48 over 48 stored layers",
+    "runs 0-47 p0",
+    "windowless slots 5,11,17,23,29,35,41,47",
+];
+
+// PIN(2026-11-21): the Mini's weights, stores and host-routed plan [derived, the terms the reader
+// holds]: the dense weights (every tensor but the routed stacks and the unread scales) and the
+// routed stacks of ink2r0 §2.1's 17,617,780,736 B; a visit's K and V of 8·2·128 f16 values
+// (4,096 B) a position, its conv state (2·1,024 + 2·2,304)·3 f32 = 79,872 B, the 40 windowed
+// visits' rows on the ring (`ring_rows(1,024, ·)` = the window and a prompt batch, aligned:
+// 1,536 rows once filled — ink2r0 §4's KV table counts the bare 1,024 rows and the conv state
+// apart, the two terms this line folds in). The plan line is the gate machine's
+// (`workstation::plan_gate`, a 24 GB card, not the 5090 of ink2r0 §4): the card the dense weights,
+// the stores and the machine's terms, the host every routed stack — the card-kernel round
+// replaces this plan with the engine's own.
+const MINI_PLAN: &[&str] = &[
+    "weights dense 1819914240 routed 15797846016 B",
+    "stores 6 5013504 B 4096 389709824 B 262144 8845426688 B",
+    "plan@4096 dense 1331632128 kv 389709824 scratch 67108864 context 536870912 | host experts 15797846016 B of 3072 experts",
+];
+
+// PIN(2026-11-21): the Small's, the same terms at 8 key heads of 128 and hidden 4,608 (a conv
+// state of 135,168 B a visit): ink2s0 §4.3's table is the bare-window arithmetic plus its "~4 MB"
+// of conv states; this line is the ring's pad and the exact conv states folded in.
+const SMALL_PLAN: &[&str] = &[
+    "weights dense 5955132672 routed 199001899008 B",
+    "stores 6 7667712 B 4096 392364032 B 262144 8848080896 B",
+    "plan@4096 dense 5339503872 kv 392364032 scratch 67108864 context 536870912 | host experts 199001899008 B of 18432 experts",
+];
+
+/// The fixture's planted path under the fixture root (`arch::inkling2::fixture::spec`'s
+/// directory): the fixture-tier file the gate reads there, and what `BLOOMERY_REF_MODEL` names
+/// where the profile resolved one.
+const FIXTURE: &str = "/models/fixtures/inkling2/inkling2-fixture-00001-of-00001.gguf";
+
+/// The fixture's whole length, so a different file at the same path fails before the pins.
+const FIXTURE_BYTES: u64 = 4_983_014_240;
+
+// PIN(2026-11-21): the fixture's identity and description [derived: the generator's bytes are a
+// function of the seed and the source header alone (`model::fixture`), the seed 1 and the Mini's
+// UD-Q4_K_XL header]: thirteen layers of the Mini — the stem block whole, one whole core block of
+// the loop, a coda layer of the Q8_0 expert set — of 25 visits (the core [6, 12) three passes),
+// the experts narrowed to 512, the padded vocabulary of 201,024 cut to 200,058 kept.
+const FIXTURE_VIEW: &[&str] = &[
+    "arch Inkling2",
+    "hidden 2304 vocab 201024 ctx_train 1048576",
+    "rms_eps bits 0x358637bd",
+    "layers 13 mtp 0",
+    "hc None",
+    "engram None",
+    "chat pre inkling2 template bytes 6868 tools None reasoning None",
+    "loop core [6, 12) passes 3 rank 64",
+    "logit scale 1 softcap 30 cut 200058",
+    "[0-4,6-10,12] relbias 24/8 x 128 d_rel 16 extent 1024 clips 22.627417/8 log 8192/0.1 taps 4 win 1024 gate Proj || moe 128/8 ff 512 situ 4/25 Sigmoid bias true norm true x8 hash false || attn-res-mix 6/1",
+    "[5,11] relbias 24/8 x 128 d_rel 16 extent 1024 clips 22.627417/8 log 8192/0.1 taps 4 dyn gate Proj || moe 128/8 ff 512 situ 4/25 Sigmoid bias true norm true x8 hash false || attn-res-mix 6/3",
+];
+const FIXTURE_VISITS: &[&str] = &[
+    "visits 25 over 13 stored layers",
+    "runs 0-11 p0 | 6-11 p1 | 6-11 p2 | 12-12 p0",
+    "windowless slots 5,11,17,23",
+];
+const FIXTURE_TENSORS: &[&str] = &[
+    "attn bf16 17",
+    "attn f32 181",
+    "attn q8_0 78",
+    "ffn_norm f32 39",
+    "head f32 2",
+    "head q8_0 1",
+    "routed nvfp4 24",
+    "routed q8_0 2",
+    "router f32 26",
+    "token_embd f32 1",
+    "token_embd q8_0 1",
+    "unread f32 24",
+];
+
+/// The fixture-tier clause: the planted fixture read back through the same reader — its
+/// description, visits and slot table, tensors by role and type — pinned like the real files'.
+/// `BLOOMERY_REF_MODEL` names the file where the profile resolved one (the fixture tier's, or a
+/// written copy), the planted path otherwise; a file that is not the family's fixture is refused
+/// by its architecture, and the planted path absent leaves the clause to the landing that plants
+/// it.
+#[test]
+#[ignore = "needs the inkling2 fixture on the box (BLOOMERY_REF_MODEL names it where set)"]
+fn hw_inkling2_fixture() {
+    let mut o = String::new();
+    let mut b = Vec::new();
+    let path = std::env::var_os("BLOOMERY_REF_MODEL")
+        .map(|v| v.into_string().expect("BLOOMERY_REF_MODEL must be UTF-8"))
+        .filter(|p| {
+            let split = Split::open(p).ok();
+            split.is_some_and(|s| {
+                s.value(model::fixture::KEY_VERSION).is_some()
+                    && s.architecture() == Some("inkling2")
+            })
+        })
+        .unwrap_or_else(|| FIXTURE.to_string());
+    let len = std::fs::metadata(&path).map(|m| m.len());
+    let split = Split::open(&path).unwrap_or_else(|e| {
+        panic!(
+            "open {path}: {e}; the fixture is planted by `fixture generate … /models/fixtures/inkling2`"
+        )
+    });
+    let read = model::arch::spec(&split).unwrap_or_else(|e| panic!("spec of {path}: {e}"));
+    let _ = writeln!(o, "fixture {path}");
+    if len.as_ref().ok() != Some(&FIXTURE_BYTES) {
+        b.push(format!("fixture bytes {len:?}, want {FIXTURE_BYTES}"));
+    }
+    spec_view::compare(
+        &mut o,
+        &mut b,
+        "description",
+        &spec_view::view(&read.spec),
+        FIXTURE_VIEW,
+    );
+    spec_view::compare(
+        &mut o,
+        &mut b,
+        "visits and slots",
+        &visit_lines(&read.spec),
+        FIXTURE_VISITS,
+    );
+    let mut by_role: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for t in &read.tensors.tensors {
+        *by_role
+            .entry((t.role.to_string(), t.ty.to_string()))
+            .or_default() += 1;
+    }
+    let got: Vec<String> = by_role
+        .iter()
+        .map(|((role, ty), n)| format!("{role} {ty} {n}"))
+        .collect();
+    spec_view::compare(
+        &mut o,
+        &mut b,
+        "tensors by role and type",
+        &got,
+        FIXTURE_TENSORS,
+    );
+    println!("{o}");
+    assert!(
+        b.is_empty(),
+        "{} pin(s) differ:\n  {}",
+        b.len(),
+        b.join("\n  ")
     );
 }

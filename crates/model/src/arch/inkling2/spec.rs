@@ -310,7 +310,10 @@ mod tests {
             Some((Role::TokenEmbedding, None))
         );
         assert_eq!(role("output_res_query.weight"), Some((Role::Head, None)));
-        assert_eq!(role("loop_res_query.weight"), Some((Role::Attention, None)));
+        assert_eq!(
+            role("loop_res_query.weight"),
+            Some((Role::Attention, Some(2)))
+        );
         assert_eq!(
             role("blk.2.loop_v_gain.weight"),
             Some((Role::Attention, Some(2)))

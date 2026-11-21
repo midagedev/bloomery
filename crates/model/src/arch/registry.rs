@@ -42,6 +42,7 @@ pub const FIXTURE_SPECS: &[fn() -> crate::fixture::FixtureSpec] = &[
     raon1::fixture::spec,
     flint::fixture::spec,
     hy4::fixture::spec,
+    inkling2::fixture::spec,
 ];
 
 /// The fixture spec whose architecture string is `arch`, from [`FIXTURE_SPECS`].
@@ -488,9 +489,15 @@ pub static ROWS: &[ArchRow] = &[
         read: Some(inkling2::spec::read),
         draft: None,
         coverage: None,
-        // No fixture of its own yet: the synthetic file of the family's shape is a later
-        // round's, and the meta gate reads the two real files' headers.
-        fixture: None,
+        fixture: Some(Fixture::Gguf(FixtureRow {
+            family: "inkling2",
+            repo: "unsloth/Inkling-2-Mini-GGUF",
+            quant: "UD-Q4_K_XL",
+            // The box's file's own vintage; a `fetch` at the repo's head writes the same fixture
+            // from another header, whose source sha the fixture carries.
+            rev: None,
+            draft: DraftSource::None,
+        })),
     },
 ];
 
@@ -794,7 +801,8 @@ mod tests {
                 "muse-spark",
                 "mistral-large4",
                 "kimi-k3",
-                "hy_v4_flash"
+                "hy_v4_flash",
+                "inkling2"
             ]
         );
         assert_eq!(archs_of(false), ["minimax-m3", "exaone-moe"]);

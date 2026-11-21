@@ -78,6 +78,73 @@ pub struct LoopSpec {
     pub gate_rank: u32,
 }
 
+/// One run of a trunk layer: the stored layer it runs and, inside a loop's
+/// core, the pass it runs in (`0` for the layers before and after the core,
+/// where no loop runs). A visit is the layer's cache slot: the reference gives
+/// every visit its own KV cache and its own convolution state, the looped
+/// layers sharing their weights alone (llama.cpp's `src/models/inkling2.cpp`,
+/// the graph's layer loop over the visits, and `src/models/inkling2-loop.cpp`:
+/// "share the physical weights, each cache slot keeps its own KV and conv
+/// state").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Visit {
+    /// The stored layer ([`ModelSpec::layers`]'s index) the visit runs.
+    pub layer: u32,
+    /// The pass the visit runs the layer in.
+    pub pass: u32,
+}
+
+/// The visits of a trunk of `n_layer` stored layers under `loop_`, in the order
+/// the reference runs them: the layers before the core once, the core's
+/// `passes` runs one after another, the layers after it once (the graph loop
+/// walks the visits in index order, `loop_layer` mapping a visit to its stored
+/// layer). A trunk without a loop visits every layer once, in order.
+///
+/// One common owner, no model's branch: any looped trunk — the fixed loop this
+/// vocabulary names — expands the same way, and the number of visits is the
+/// trunk's cache-slot count.
+#[must_use]
+pub fn visits(n_layer: usize, loop_: Option<LoopSpec>) -> Vec<Visit> {
+    let Some(loop_) = loop_ else {
+        return (0..n_layer)
+            .map(|layer| Visit {
+                layer: layer as u32,
+                pass: 0,
+            })
+            .collect();
+    };
+    let (start, end) = (loop_.core_start as usize, loop_.core_end as usize);
+    let mut out: Vec<Visit> = (0..start)
+        .map(|layer| Visit {
+            layer: layer as u32,
+            pass: 0,
+        })
+        .collect();
+    for pass in 0..loop_.passes {
+        for layer in start..end {
+            out.push(Visit {
+                layer: layer as u32,
+                pass,
+            });
+        }
+    }
+    out.extend((end..n_layer).map(|layer| Visit {
+        layer: layer as u32,
+        pass: 0,
+    }));
+    out
+}
+
+impl ModelSpec {
+    /// The trunk's layer visits in run order ([`visits`]): the stored layers of
+    /// [`ModelSpec::layers`] once each where no loop runs, the core's passes
+    /// repeated where one does. Every visit is a cache slot.
+    #[must_use]
+    pub fn visits(&self) -> Vec<Visit> {
+        visits(self.layers.len(), self.loop_)
+    }
+}
+
 /// What the head runs on its logits after the output projection, in the
 /// graph's order: the scale, then the softcap, then the column cut.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1394,10 +1461,55 @@ fn count_u32(n: usize) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Act, CheckpointMismatch, same_checkpoint};
+    use super::{Act, CheckpointMismatch, LoopSpec, Visit, same_checkpoint, visits};
 
     const MOPD: &str = "MiMo-V2.6-Flash-MOPD";
     const RL: &str = "MiMo-V2.6-Flash-RL";
+
+    /// The looped Mini's shape: 24 stored layers, the core [6, 18) three times —
+    /// 48 visits, the reference's run order (the stem, the core's passes one after
+    /// another, the coda), every visit a cache slot. A loopless trunk visits every
+    /// layer once. Mutants: the coda run before the last pass, the visits counted
+    /// without the core's repeats, a visit's pass numbered past its run.
+    #[test]
+    fn the_visits_are_the_reference_run_order() {
+        let loop_ = LoopSpec {
+            core_start: 6,
+            core_end: 18,
+            passes: 3,
+            gate_rank: 64,
+        };
+        let got = visits(24, Some(loop_));
+        assert_eq!(got.len(), 48, "6 + 12*3 + 6 visits");
+        let stem: Vec<Visit> = (0..6).map(|layer| Visit { layer, pass: 0 }).collect();
+        let pass = |p: u32| {
+            (6..18)
+                .map(move |layer| Visit { layer, pass: p })
+                .collect::<Vec<_>>()
+        };
+        let coda: Vec<Visit> = (18..24).map(|layer| Visit { layer, pass: 0 }).collect();
+        let want: Vec<Visit> = stem
+            .into_iter()
+            .chain(pass(0))
+            .chain(pass(1))
+            .chain(pass(2))
+            .chain(coda)
+            .collect();
+        assert_eq!(got, want);
+        // Every visit is a slot: the first visit of each stored layer, and the
+        // core's layers' later passes, each once a pass.
+        for layer in 0..24u32 {
+            let mine: Vec<u32> = got
+                .iter()
+                .filter(|v| v.layer == layer)
+                .map(|v| v.pass)
+                .collect();
+            let n = if (6..18).contains(&layer) { 3 } else { 1 };
+            assert_eq!(mine, (0..n).collect::<Vec<_>>(), "layer {layer}");
+        }
+        let plain: Vec<Visit> = (0..24).map(|layer| Visit { layer, pass: 0 }).collect();
+        assert_eq!(visits(24, None), plain);
+    }
 
     /// A draft of the target's checkpoint is accepted; a draft of the other
     /// checkpoint is refused naming both.
