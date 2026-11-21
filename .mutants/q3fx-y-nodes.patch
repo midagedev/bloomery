@@ -1,0 +1,12 @@
+# mutant: gate-gpu-qwen3moe-q5@BLOOMERY_FIXTURE_VARIANT=q3q5k: the head launch count one short, so the derived step pin wants 63; the line "structure graph_nodes=64 (want 63)" is red (the pass lines stay green: they hold no head)
+--- a/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs
+@@ -1547,7 +1547,7 @@
+ 
+     /// PIN(2026-11-21): the head's launches over a Q6_K `output`: the norm,
+     /// the q8_1 of its input row, the gemv with the argmax folded in.
+-    const Q5_HEAD_LAUNCHES: usize = 3;
++    const Q5_HEAD_LAUNCHES: usize = 2;
+ 
+     /// The captured node counts (s) holds a Q5_K file's captures to, from its
+     /// header: the embedding row and each layer's launches, the head's after

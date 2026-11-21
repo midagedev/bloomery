@@ -1,0 +1,23 @@
+# mutant: gate-gpu-qwen3moe-q5@BLOOMERY_FIXTURE_VARIANT=q3q5k: the placed budget search wants every routed expert, so the plan keeps none on the host and open_placed answers None; the run prints the plan record's host_experts=0 and ends "gate_qwen3moe_e2e --q5-only: FAIL"
+diff --git a/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs b/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs
+index a88ac1f8a..edb7c9356 100644
+--- a/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs
+@@ -1569,7 +1569,7 @@ mod gate {
+     /// whose whole load a fixture variant's card holds.
+     fn q5_placed_budget(file: &gguf::Split) -> Result<u64, GateError> {
+         let hp = Hparams::read(file)?;
+-        let want = u64::try_from(hp.experts.n_expert * hp.n_layer / 2)?;
++        let want = u64::try_from(hp.experts.n_expert * hp.n_layer )?;
+         PlaceQ3::qwen3(file, Place::parse("cuda0")?, CTX, KvQ8::F16)?.budget_for_card_experts(
+             CTX,
+             want,
+@@ -1790,7 +1790,7 @@ mod gate {
+     /// whose whole load a fixture variant's card holds.
+     fn z_split_budget(q: &PlaceQ3, file: &gguf::Split) -> Result<u64, GateError> {
+         let hp = Hparams::read(file)?;
+-        let want = u64::try_from(hp.experts.n_expert * hp.n_layer / 2)?;
++        let want = u64::try_from(hp.experts.n_expert * hp.n_layer )?;
+         q.budget_for_card_experts(CTX, want, PLACED_BUDGET)
+     }
+ 

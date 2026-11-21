@@ -1,0 +1,12 @@
+# mutant: gate-gpu-qwen3moe-q5@BLOOMERY_FIXTURE_VARIANT=q3q5k: the census expects attn_k at Q4_K, a type the variant holds nowhere; the line "q5 census attn_k.weight q4_K x0 (at least 1)" is FAIL and the run ends by name (a selected variant that lost a family the census lists)
+--- a/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs
+@@ -1597,7 +1597,7 @@
+         let mut ok = true;
+         for (role, ty) in [
+             ("attn_q.weight", Q5_K),
+-            ("attn_k.weight", Q5_K),
++            ("attn_k.weight", gguf::quant::GgmlType::Q4_K),
+             ("attn_v.weight", Q5_K),
+             ("attn_v.weight", Q6_K),
+             ("attn_output.weight", Q5_K),

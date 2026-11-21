@@ -1,0 +1,12 @@
+# mutant: gate-gpu-qwen3moe-common@BLOOMERY_FIXTURE_VARIANT=q3q80: the premise counts the dispatch layers instead of the common ones, so "z …: 0 of 4 layers hold stacks the common card leg runs" is FAIL and the run ends by name
+--- a/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen3moe_e2e.rs
+@@ -1869,7 +1869,7 @@
+         let layers = Hparams::read(&file)?.n_layer;
+         let mut common = 0;
+         for l in 0..layers {
+-            common += usize::from(layer_leg(&file, l)? == Some(LegSplit::Common));
++            common += usize::from(layer_leg(&file, l)? == Some(LegSplit::Dispatch));
+         }
+         drop(file);
+         let premise = common == layers;

@@ -4,6 +4,20 @@
 //!
 //!     gate_qwen3_serve --model <gguf> [--model <gguf> ...] --dir <dir> [--only-mixed | --only-mtp]
 //!
+//! The recipe names one file a family: the qwen3moe profile's own and the
+//! qwen35moe and qwen38d profiles', each the tier's (`tools/ref/ref-paths.sh`:
+//! the real files in the real tier, the families' fixtures in the fixture
+//! tier; the dense qwen38d file in the real tier only, its fixture being a
+//! checkpoint folder every server here would be handed as a GGUF). The
+//! id clauses hold on any weights (the server's ids are the CLI's on the same
+//! file); the clauses whose premise is a real file's size — a 12 GB card the
+//! real file does not fit, the dense file's weights over such a budget —
+//! declare the `scale` deferral in the fixture tier, and the placed arms'
+//! budget there is the searched one ([`placed_budget`]). The `--images`
+//! clauses need the qwen35moe vision oracle sets, which have no fixture: they
+//! run in the real tier only, under their own recipe
+//! `gate-gpu-qwen3-serve-images`.
+//!
 //! `--only-mixed` runs the two-slot greedy and seeded sampled requests alone
 //! and together, holding their ids and the shared round shape on one server.
 //! `--only-mtp` runs `mtp_ids_match_the_plain_path` alone.
@@ -379,7 +393,7 @@
 //!   load kept on one sequence (the turns a qwen35moe file took before its
 //!   body held resident slots) names one sequence of `ctx_max` in its load.
 //! - `placed_answers_a_prompt_past_the_gemm_walk`, a placed server whose
-//!   card budget is [`HOST_TIER_BUDGET`] (`--place a --parallel 1`): its
+//!   card budget is [`placed_budget`] at [`HOST_TIER_BUDGET_CTX`] (`--place a --parallel 1`): its
 //!   plan record puts routed experts on the host, and a greedy
 //!   `/completion` of [`PROSE`]'s ids (at least [`GEMM_FROM`]) answers 200
 //!   with tokens — a placed load's prompt call runs the wide units from [`GEMM_FROM`] ids and passes below.
@@ -568,6 +582,7 @@ mod gate {
         json_of, metric, rendered, scripted_call, serve_cmd, server_log, sse_event, sse_events,
         tokenized, whole_terms,
     };
+    use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::ubatch_pick;
     use bloomery_gpu_gates::vision_seat::{self, EncoderSeat};
     use bloomery_gpu_gates::{GateError, checks_failed};
@@ -1030,10 +1045,12 @@ mod gate {
         // A dense file is planned on the card as it stands: under the budget a
         // routed file's plan splits, its weights alone are over the floor
         // ([`dense_is_refused_below_its_floor`]).
-        let env: &[(&str, &str)] = if routed(seat) {
-            &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)]
-        } else {
-            &[]
+        let budget = routed(seat)
+            .then(|| placed_budget(model, seat, None))
+            .transpose()?;
+        let env: &[(&str, &str)] = match budget.as_deref() {
+            Some(budget) => &[(bloomery_levers::CARD_BUDGET, budget)],
+            None => &[],
         };
         let run = plan_run(
             "plan-only",
@@ -1062,6 +1079,9 @@ mod gate {
     /// fewer slots or a smaller model file`) and prints no `load` or
     /// `listening` record. A dense backbone has no routed expert to move to the
     /// host tier, so a budget under its weights is a refusal, not a placement.
+    /// The premise is the real file's size — its weights over a 12 GiB card —
+    /// so the fixture tier leaves the clause to the real one ([`Tag::Scale`]:
+    /// the cut's weights fit the budget and it plans).
     /// FAIL-first: a budget over the file's floor plans and exits 0, and the
     /// clause is red.
     fn dense_below_its_floor_is_refused_by_name(
@@ -1069,10 +1089,13 @@ mod gate {
         dir: &Path,
         ok: &mut bool,
     ) -> Result<(), GateError> {
+        if !tier::run_clause("dense_below_its_floor_is_refused_by_name", Tag::Scale)? {
+            return Ok(());
+        }
         let run = plan_run(
             "plan-floor",
             (model, dir),
-            &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
+            &[(bloomery_levers::CARD_BUDGET, PLACED_BUDGET)],
             &["--parallel", "2", "--place", "a"],
         )?;
         let budget = format!(
@@ -1156,12 +1179,17 @@ mod gate {
     /// `--plan` says ([`PlanRun::stopped_with_its_plan`]). The plan is asked
     /// for by name (`--place a`): the census and the whole-fit verdict read
     /// the card, not the budget, so a card that holds the file whole would
-    /// not plan at all.
+    /// not plan at all. The premise is the real file's size — a 12 GB card it
+    /// does not fit — so the fixture tier leaves the clause to the real one
+    /// ([`Tag::Scale`]: a card holds the fixture whole and it prints no plan).
     fn defaults_take_a_long_prompt_on_a_12gb_card(
         model: &Path,
         dir: &Path,
         ok: &mut bool,
     ) -> Result<(), GateError> {
+        if !tier::run_clause("defaults_take_a_long_prompt_on_a_12gb_card", Tag::Scale)? {
+            return Ok(());
+        }
         let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
         let trained = bloomery_gpu_gates::generate::trained_ctx(&split)
             .ok_or_else(|| format!("{}: no context_length", model.display()))?;
@@ -2086,12 +2114,15 @@ mod gate {
 
     /// One server of the slots clause (module header): its directory under
     /// the file's, the prefix of its checks' names, the flags past
-    /// `--parallel 2`, its environment, and where its total comes from.
+    /// `--parallel 2`, its environment, the card budget the arm plans under
+    /// when it plans under one ([`placed_budget`], the env's own entry
+    /// otherwise), and where its total comes from.
     struct SlotsArm<'a> {
         dir: &'a str,
         prefix: &'a str,
         flags: &'a [&'a str],
         env: &'a [(&'a str, &'a str)],
+        budget: Option<&'a str>,
         total: Total,
     }
 
@@ -2103,25 +2134,95 @@ mod gate {
         prefix: "",
         flags: &["--ctx", "8192"],
         env: &[],
+        budget: None,
         total: Total::Set,
     };
 
+    /// The placed slots arm's directory under the file's ([`placed_slots_arm`]).
+    const PLACED_SLOTS_DIR: &str = "slots-placed";
+
     /// The slots clause's placed arm (its checks `placed_…`): `--place a`
-    /// under a card budget of [`PLACED_BUDGET`], no `--ctx` — the placed
-    /// default the plan record names, split.
-    const PLACED_SLOTS: SlotsArm<'static> = SlotsArm {
-        dir: "slots-placed",
-        prefix: "placed_",
-        flags: &["--place", "a"],
-        env: &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
-        total: Total::Plan,
-    };
+    /// under the card budget [`placed_budget`] names for the file, no `--ctx`
+    /// — the placed default the plan record names, split.
+    fn placed_slots_arm(budget: &str) -> SlotsArm<'_> {
+        SlotsArm {
+            dir: PLACED_SLOTS_DIR,
+            prefix: "placed_",
+            flags: &["--place", "a"],
+            env: &[],
+            budget: Some(budget),
+            total: Total::Plan,
+        }
+    }
 
     /// The placed slots arm's card budget: a 12 GiB card's, the smallest
     /// card the seat serves Qwen3-30B on, under which the plan splits the
     /// routed experts between the card and the host tier on either of this
     /// machine's cards (`gate_qwen3moe_e2e`'s (o) budget).
     const PLACED_BUDGET: &str = "12G";
+
+    /// The card budget the placed arms plan under, as a lever's bytes: the
+    /// real tier's [`PLACED_BUDGET`]; in the fixture tier the smallest budget
+    /// that keeps half the file's routed experts on the card
+    /// ([`q3place::PlaceQ3::budget_for_card_experts`], [`PLACED_BUDGET`] the ceiling)
+    /// at `ctx` positions — the arm's own when it sets one, the file's trained
+    /// context otherwise, the ceiling of every unset `--ctx` choice — the
+    /// split a 12 GiB card gives the real file, whose whole load a fixture's
+    /// card holds, so the real tier's budget is a whole load there and the
+    /// split's checks never see one.
+    fn placed_budget(
+        model: &Path,
+        seat: qwen_seat::Family,
+        ctx: Option<usize>,
+    ) -> Result<String, GateError> {
+        if tier::Tier::from_env()? == tier::Tier::Real {
+            return Ok(PLACED_BUDGET.to_string());
+        }
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let ctx = match ctx {
+            Some(c) => c,
+            None => bloomery_gpu_gates::generate::trained_ctx(&split)
+                .ok_or_else(|| format!("{}: no context_length", model.display()))?,
+        };
+        let read = |suffix: &str| {
+            split
+                .arch_get_u64(suffix)
+                .ok_or_else(|| format!("{}: no {}", model.display(), split.arch_key(suffix)))
+        };
+        let (n_layer, n_expert) = (read("block_count")?, read("expert_count")?);
+        let want = n_layer * n_expert / 2;
+        let budget = match seat {
+            qwen_seat::Family::Qwen3moe => {
+                let q = q3place::PlaceQ3::qwen3(&split, Place::parse("cuda0")?, ctx, KvQ8::F16)?;
+                q.budget_for_card_experts(ctx, want, bloomery_levers::parse_bytes(PLACED_BUDGET)?)
+            }
+            qwen_seat::Family::Qwen35moe => {
+                let o = Open35 {
+                    ctx,
+                    mma: true,
+                    ubatch: ubatch_size()?,
+                    kv: KvQ8::F16,
+                    media: false,
+                };
+                let q = q3place::PlaceQ3::qwen35(&split, Place::parse("cuda0")?, o)?;
+                q.budget_for_card_experts(ctx, want, bloomery_levers::parse_bytes(PLACED_BUDGET)?)
+            }
+            qwen_seat::Family::Qwen35 => {
+                return Err(format!(
+                    "{}: a dense file has no routed expert to split: the placed arms do not run",
+                    model.display()
+                )
+                .into());
+            }
+        }?;
+        println!(
+            "placed budget on {}: {budget} B (the smallest that keeps {want} of {} experts on \
+             the card at {ctx} positions)",
+            model.display(),
+            n_layer * n_expert,
+        );
+        Ok(budget.to_string())
+    }
 
     /// The card budget that stands for a 12 GB card whose census reads
     /// 11,789,139,968 free bytes: those bytes plus the context's own creation
@@ -2158,6 +2259,9 @@ mod gate {
         cmd.env_remove("BLOOMERY_REF_MODEL");
         for &(k, v) in arm.env {
             cmd.env(k, v);
+        }
+        if let Some(budget) = arm.budget {
+            cmd.env(bloomery_levers::CARD_BUDGET, budget);
         }
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
         let mut args = vec![
@@ -2427,13 +2531,16 @@ mod gate {
 
     /// One server of the slots-round clause ([`slots_rounds_run_one_pass`]): its
     /// directory under the file's, the prefix of its checks' names, the flags
-    /// past `--parallel 2`, its environment, whether a round is one pass, and
-    /// whether its second request samples, seeded, beside a greedy first.
+    /// past `--parallel 2`, its environment, the card budget the arm plans
+    /// under when it plans under one ([`placed_budget`], the env's own entry
+    /// otherwise), whether a round is one pass, and whether its second request
+    /// samples, seeded, beside a greedy first.
     struct RoundsArm<'a> {
         dir: &'a str,
         prefix: &'a str,
         flags: &'a [&'a str],
         env: &'a [(&'a str, &'a str)],
+        budget: Option<&'a str>,
         one_pass: bool,
         sampled: bool,
     }
@@ -2444,20 +2551,27 @@ mod gate {
         prefix: "",
         flags: &[],
         env: &[],
+        budget: None,
         one_pass: true,
         sampled: false,
     };
 
-    /// The placed rounds arm (its checks `placed_…`): `--place a` under a
-    /// card budget of [`PLACED_BUDGET`].
-    const PLACED_ROUNDS: RoundsArm<'static> = RoundsArm {
-        dir: "slots-rounds-placed",
-        prefix: "placed_",
-        flags: &["--place", "a"],
-        env: &[("BLOOMERY_CARD_BUDGET", PLACED_BUDGET)],
-        one_pass: true,
-        sampled: false,
-    };
+    /// The placed rounds arm's directory under the file's ([`placed_rounds_arm`]).
+    const PLACED_ROUNDS_DIR: &str = "slots-rounds-placed";
+
+    /// The placed rounds arm (its checks `placed_…`): `--place a` under the
+    /// card budget [`placed_budget`] names for the file.
+    fn placed_rounds_arm(budget: &str) -> RoundsArm<'_> {
+        RoundsArm {
+            dir: PLACED_ROUNDS_DIR,
+            prefix: "placed_",
+            flags: &["--place", "a"],
+            env: &[],
+            budget: Some(budget),
+            one_pass: true,
+            sampled: false,
+        }
+    }
 
     /// The sampled rounds arm (its checks `mixed_…`): a greedy and a seeded
     /// sampled request at the seat's own `--ctx`.
@@ -2466,6 +2580,7 @@ mod gate {
         prefix: "mixed_",
         flags: &["--ctx", "4096"],
         env: &[],
+        budget: None,
         one_pass: true,
         sampled: true,
     };
@@ -2503,6 +2618,7 @@ mod gate {
             prefix,
             flags,
             env,
+            budget,
             one_pass,
             sampled,
         } = arm;
@@ -2513,6 +2629,9 @@ mod gate {
         let mut cmd = stats_cmd()?;
         for &(k, v) in env {
             cmd.env(k, v);
+        }
+        if let Some(budget) = budget {
+            cmd.env(bloomery_levers::CARD_BUDGET, budget);
         }
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
         let mut args = vec![
@@ -2814,7 +2933,7 @@ mod gate {
         dir: &Path,
         ok: &mut bool,
     ) -> Result<(), GateError> {
-        let err_log = dir.join(PLACED_SLOTS.dir).join("server.err");
+        let err_log = dir.join(PLACED_SLOTS_DIR).join("server.err");
         let log =
             std::fs::read_to_string(&err_log).map_err(|e| format!("{}: {e}", err_log.display()))?;
         let records = seat_records(&log, &err_log);
@@ -2915,7 +3034,7 @@ mod gate {
         let mut held = true;
         // A dense file has no placed arm (its budgeted plan is a refusal).
         let placed = routed(seat).then_some((
-            PLACED_SLOTS.dir,
+            PLACED_SLOTS_DIR,
             "counted in the placed plan's host reserves",
         ));
         for (arm, counted_in) in [("slots", "of ")].into_iter().chain(placed) {
@@ -2959,13 +3078,16 @@ mod gate {
         Ok(())
     }
 
-    /// The card budget the host-tier clause plans under: a card this size
+    /// The card budget the host-tier clause plans under: [`placed_budget`]'s
+    /// at the arm's own `--ctx` (the real tier's 12 GiB — a card this size
     /// holds the trunk and only part of the routed experts of the qwen3moe
-    /// file, so the placed plan puts the rest on the host on either box card.
-    const HOST_TIER_BUDGET: &str = "12G";
+    /// file, so the placed plan puts the rest on the host on either box card;
+    /// the searched split on a fixture, whose whole load the real tier's
+    /// budget holds).
+    const HOST_TIER_BUDGET_CTX: usize = 2048;
 
     /// The host-tier prompt clause (module header): a placed server under
-    /// [`HOST_TIER_BUDGET`] — a large card planning as the smallest one the
+    /// [`placed_budget`] at [`HOST_TIER_BUDGET_CTX`] — a large card planning as the smallest one the
     /// placed path serves — whose plan record names routed experts on the
     /// host, answers a prompt of at least [`GEMM_FROM`] ids. A plan with no
     /// host experts opens the whole-card body, which never meets the placed
@@ -2978,9 +3100,14 @@ mod gate {
         let d = dir.join("host-tier");
         std::fs::create_dir_all(&d)?;
         let err_log = d.join("server.err");
+        let budget = placed_budget(
+            model,
+            qwen_seat::Family::Qwen3moe,
+            Some(HOST_TIER_BUDGET_CTX),
+        )?;
         let mut cmd = Command::new(beside("bloomery-serve")?);
         cmd.env_remove("BLOOMERY_REF_MODEL");
-        cmd.env(bloomery_levers::CARD_BUDGET, HOST_TIER_BUDGET);
+        cmd.env(bloomery_levers::CARD_BUDGET, &budget);
         let m = model.to_str().ok_or("the model path is not UTF-8")?;
         let mut s = Served::spawn_cmd(
             cmd,
@@ -2994,7 +3121,7 @@ mod gate {
                 "--place",
                 "a",
                 "--ctx",
-                "2048",
+                &HOST_TIER_BUDGET_CTX.to_string(),
                 "-m",
                 m,
             ],
@@ -4522,9 +4649,10 @@ mod gate {
     /// two greedy streamed requests of prompts that repeat (the prose twice,
     /// its first half three times), each first run alone and then together,
     /// keep their alone ids (`lookup_slots_together_alone`), and the together
-    /// window holds a drafted `slots round` of both slots (`cmd=pass`,
-    /// `rows=2`) in `passes=1` and none in more, the together requests
-    /// drafting (`timings.draft_n` above 0). The requests are greedy without
+    /// window holds a `slots round` of both slots (`cmd=pass`, `rows=2`) in
+    /// `passes=1` and none in more; `lookup_slots_draft` (file-bound: a
+    /// fixture's random-weight target repeats no n-gram) has the together
+    /// requests drafting (`timings.draft_n` above 0). The requests are greedy without
     /// `ignore_eos`, which would make them draw and so step. FAIL-first: on a
     /// body that settles no partial keep (`SlotRows::SETTLES_PARTIAL_KEEP`
     /// false) the lookup load takes turns, `passes=2`; with the seat's lookup
@@ -4632,11 +4760,12 @@ mod gate {
              in more; (cmd, rows, passes) {shapes:?}",
             window.len()
         );
-        check(
-            ok,
-            "lookup_slots_verify_together",
-            drafted > 0 && one > 0 && two == 0,
-        );
+        check(ok, "lookup_slots_verify_together", one > 0 && two == 0);
+        // The lookup proposes only where the text repeats an n-gram of its own: a fixture's
+        // random-weight target writes none, so the file answers it.
+        if tier::run_clause("lookup_slots_draft", Tag::FileBound)? {
+            check(ok, "lookup_slots_draft", drafted > 0);
+        }
         println!("lookup rounds server stopped: {}", s.stop()?);
         Ok(())
     }
@@ -4901,7 +5030,18 @@ mod gate {
             // keeps its pure tests in `crates/serve/tests/slots`.
             slots_flow_together(model, &dir, &WHOLE_SLOTS, &mut ok)?;
             if routed(seat) {
-                slots_flow_together(model, &dir, &PLACED_SLOTS, &mut ok)?;
+                // The placed arms' budget, one search a file: the tier's (the
+                // real tier's 12 GiB, the searched split on a fixture). The arm
+                // sets no --ctx, and the plan grows its two slots' context into
+                // whatever room the budget leaves, up to the trained context
+                // each: the search prices both slots at that ceiling, so the
+                // room the growth stops short of keeps the experts.
+                let split =
+                    Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+                let trained = bloomery_gpu_gates::generate::trained_ctx(&split)
+                    .ok_or_else(|| format!("{}: no context_length", model.display()))?;
+                let budget = placed_budget(model, seat, Some(2 * trained))?;
+                slots_flow_together(model, &dir, &placed_slots_arm(&budget), &mut ok)?;
                 placed_slots_hold_the_plan(model, &dir, &mut ok)?;
             } else {
                 not_for_dense(
@@ -4914,7 +5054,8 @@ mod gate {
             slots_late_request_together_alone(model, &dir, &mut ok)?;
             slots_rounds_run_one_pass(model, &dir, &WHOLE_ROUNDS, &mut ok)?;
             if routed(seat) {
-                slots_rounds_run_one_pass(model, &dir, &PLACED_ROUNDS, &mut ok)?;
+                let budget = placed_budget(model, seat, None)?;
+                slots_rounds_run_one_pass(model, &dir, &placed_rounds_arm(&budget), &mut ok)?;
             } else {
                 not_for_dense(
                     "placed_slots_rounds_*",

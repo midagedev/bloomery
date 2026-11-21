@@ -1,0 +1,12 @@
+# mutant: gate-gpu-qwen3moe-q5@BLOOMERY_FIXTURE_VARIANT=q3q5k: every prefill pass runs the chunk before its own (qwen3moe/prefill.rs run_pass), so the second and third passes of the 19-id prompt read another chunk's rows; "q5 pass prefill = one-token path (19 ids)" is FAIL (the K/V hash and the tokens move)
+--- a/crates/gpu/src/arch/qwen3moe/prefill.rs
++++ b/crates/gpu/src/arch/qwen3moe/prefill.rs
+@@ -884,7 +884,7 @@
+                     let c = chunk;
+                     chunk += 1;
+                     self.run_rows(m, WHAT, |gpu, w, body, head, _| {
+-                        body.run_pass(gpu, w, (c, m), graph, last.then_some(head))?;
++                        body.run_pass(gpu, w, (c.saturating_sub(1), m), graph, last.then_some(head))?;
+                         Ok(last)
+                     })?
+                 }

@@ -155,32 +155,45 @@
 //!   when `plan.host.experts == 0`) leaves no placed side, and (o7) names it.
 //!   `--placed-only` runs (o) and (o7) alone.
 //!
-//! - (y) the Q5_K routed path, on its own loads of [`Y_FILE`] (unsloth's
-//!   Qwen3-Coder `Q5_K_M`, which has no ik reference set, so each clause is
-//!   the arm's own consistency): the header carries every launch family the
-//!   clause names (Q5_K attention q/k/v/output, a Q5_K token embedding,
-//!   Q5_K routed gate·up and down); the captured step and passes hold
-//!   [`Y_NODES_STEP`], [`Y_NODES_PASS_1`] and [`Y_NODES_PASS_M`] nodes; the
-//!   greedy continuation of [`Y_IDS`] prose ids is the same tokens and last
-//!   logits bit for bit in graph and in eager mode, and prefilled on the pass
-//!   path (`PrefillPath::Pass`, the first [`Y_PASS`] ids); the GEMM prefill
-//!   of the [`Y_IDS`] ids leaves a continuation that differs from the
-//!   one-token path's only where its margin is under [`MARGIN_FLOOR`]; the
-//!   file planned under [`PLACED_BUDGET`] with experts on both tiers and
-//!   loaded by that plan gives the whole-card greedy tokens by the same
-//!   rule, the host tier serving slots. `--q5-only` runs (y) alone.
+//! - (y) the Q5_K routed path, on its own loads of the fixture variant `q3q5k`
+//!   (`tools/fixture-variants.tsv`: the qwen3moe fixture requantized to unsloth's
+//!   Qwen3-Coder `Q5_K_M` map, which has no ik reference set, so each clause is
+//!   the arm's own consistency; the real file is gone): the
+//!   header carries every launch family the clause names (Q5_K attention
+//!   q/k/v/output, a Q5_K token embedding, Q5_K routed gate·up and down); the
+//!   captured step and passes hold the node counts the file's header derives
+//!   ([`q5_nodes`]); the greedy continuation of [`Y_IDS`] prose ids is the same
+//!   tokens and last logits bit for bit in graph and in eager mode, and
+//!   prefilled on the pass path (`PrefillPath::Pass`, the first [`Y_PASS`]
+//!   ids); the GEMM prefill of the [`Y_IDS`] ids leaves a continuation that
+//!   differs from the one-token path's only where its margin is under
+//!   [`MARGIN_FLOOR`]; the file planned under the smallest budget that keeps
+//!   half its routed experts on the card ([`PLACED_BUDGET`] the ceiling) with
+//!   experts on both tiers and loaded by that plan gives the whole-card greedy
+//!   tokens by the same rule, the host tier serving slots. `--q5-only` runs (y)
+//!   alone, under its own recipe `gate-gpu-qwen3moe-q5` (fixture-only): the
+//!   plain fixture holds no Q5_K site and there declares the `no-layout-layer`
+//!   deferral, and a selected variant whose requant lost a family is a named
+//!   error.
 //!
-//! - (z) the common card leg on the placed load, on each of [`Z_FILES`]
-//!   (unsloth's Qwen3-30B-A3B-Instruct-2507 `Q8_0` and `Q6_K`, which the
-//!   family has no fixture of): every layer's three routed stacks are one type
-//!   the FFN dispatch does not launch, so each layer is one the common card
-//!   leg runs (`accepts::qwen35_leg` says `LegSplit::Common`). The file is
-//!   planned at the card's floor budget (a host-only plan: no card expert) and
-//!   at [`PLACED_BUDGET`] (experts on both tiers), each loaded by its plan and
-//!   dropped alone, the planner's counted scratch the load's on both. The pass
-//!   prefill of [`Z_PASS`] ids and the wide prefill of [`WIDE_IDS`] ids, each
-//!   with its greedy continuation, give the host-only load's tokens by (y)'s
-//!   rule (a first difference only where the host-only run's margin is under
+//! - (z) the common card leg on the placed load, on the fixture variants
+//!   `q3q80` and `q3q6k` (`tools/fixture-variants.tsv`: the qwen3moe fixture's
+//!   routed stacks requantized to unsloth's Qwen3-30B-A3B-Instruct-2507 `Q8_0`
+//!   and `Q6_K` one-type maps; the real files are gone), each
+//!   under its own item of the recipe `gate-gpu-qwen3moe-common`
+//!   (fixture-only): every layer's three routed stacks are one type the FFN
+//!   dispatch does not launch, so each layer is one the common card leg runs
+//!   (`accepts::qwen35_leg` says `LegSplit::Common`); the plain fixture's Q4_K
+//!   stacks the dispatch's own launches run, and there the clause declares the
+//!   `no-layout-layer` deferral, a selected variant whose layers are not the
+//!   common leg's a named error. The file is planned at the card's floor
+//!   budget (a host-only plan: no card expert) and at the smallest budget that
+//!   keeps half its routed experts on the card ([`PLACED_BUDGET`] the
+//!   ceiling), each loaded by its plan and dropped alone, the planner's
+//!   counted scratch the load's on both. The pass prefill of [`Z_PASS`] ids
+//!   and the wide prefill of [`WIDE_IDS`] ids, each with its greedy
+//!   continuation, give the host-only load's tokens by (y)'s rule (a first
+//!   difference only where the host-only run's margin is under
 //!   [`MARGIN_FLOOR`]) and last logits within [`Z_LOGITS_REL`] of its, and the
 //!   host tier serves fewer slots on both ports than in the host-only load,
 //!   the difference the card's. FAIL-first: `Qwen3moeBody`'s arms back on the
@@ -339,6 +352,7 @@ mod gate {
         GreedyClass, GreedyRow, MARGIN_FLOOR, PromptRow, compare_greedy, read_greedy, read_prompts,
     };
     use bloomery_gpu_gates::slots_gate::{self, Derived, SlotsAdapter};
+    use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, data_dir,
         ik_q8_2, open_split, q8_1_dequant, ref_ints, ref_model_path, ref_tensor_logical_in,
@@ -660,8 +674,6 @@ mod gate {
         ok &= ubatch_sizes()?;
         ok &= placed(host)?;
         ok &= placed_no_host(host)?;
-        ok &= q5_routed(host)?;
-        ok &= common_leg(host)?;
         ok &= q8_cache()?;
         println!("gate_qwen3moe_e2e: {}", verdict(ok));
         if !ok {
@@ -1266,20 +1278,23 @@ mod gate {
     // -------------------------------------------------- (o) the placed load
 
     /// (o)'s card budget: a 12 GiB card's, under which the file's routed
-    /// experts split between the card and the host tier.
+    /// experts split between the card and the host tier. (y) and (z) take it
+    /// as the ceiling of the search that finds the same split on a fixture
+    /// variant, whose whole load a 12 GiB card holds.
     const PLACED_BUDGET: u64 = 12 << 30;
-    /// The file planned on device 0 at `ctx` positions under
-    /// [`PLACED_BUDGET`], its `plan` record and the split line printed, and
-    /// loaded by that plan with its host set as `host` asks; `None` when the
-    /// plan leaves no routed expert on the card or none on the host.
+    /// The file planned on device 0 at `ctx` positions under `budget`, its
+    /// `plan` record and the split line printed, and loaded by that plan with
+    /// its host set as `host` asks; `None` when the plan leaves no routed
+    /// expert on the card or none on the host.
     fn open_placed(
         file: gguf::Split,
         ctx: usize,
         host: HostCfg,
+        budget: u64,
     ) -> Result<Option<Qwen3moeModel>, GateError> {
         let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, ctx, KvQ8::F16)?;
         let levers = PlanLevers {
-            card_budget_bytes: Some(PLACED_BUDGET).into(),
+            card_budget_bytes: Some(budget).into(),
             ..PlanLevers::default()
         };
         let plan = q.plan(ctx, &levers)?;
@@ -1413,7 +1428,7 @@ mod gate {
     fn placed(host: HostCfg) -> Result<bool, GateError> {
         let t = Instant::now();
         let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
-        let Some(mut m) = open_placed(file, CTX, host)? else {
+        let Some(mut m) = open_placed(file, CTX, host, PLACED_BUDGET)? else {
             return Ok(false);
         };
         let counts = m
@@ -1502,12 +1517,14 @@ mod gate {
 
     // ------------------------------------------- (y) the Q5_K routed path
 
-    /// (y)'s file: unsloth's Qwen3-Coder-30B-A3B-Instruct `Q5_K_M`, the
-    /// smallest real file that carries the Q5_K paths (the family has no
-    /// fixture): Q5_K attention q/k/o and v (Q6_K on every other layer), a
-    /// Q5_K token embedding, Q5_K routed gate·up and Q5_K routed down (Q6_K
-    /// on every other layer), a Q6_K head.
-    const Y_FILE: &str = "/models/qwen3-coder-hf/Qwen3-Coder-30B-A3B-Instruct-Q5_K_M.gguf";
+    /// (y)'s recipe: the arm's own fixture-only item, which the variant
+    /// `q3q5k`'s row in `tools/fixture-variants.tsv` names.
+    const Q5_RECIPE: &str = "gate-gpu-qwen3moe-q5";
+
+    /// The variant `q3q5k`'s file, the arm's every load of it.
+    fn q5_file() -> Result<gguf::Split, GateError> {
+        open_split(Arch::Qwen3moe, Q5_RECIPE)
+    }
 
     /// (y)'s prompt: the prose's first ids, a GEMM ubatch (more than a pass
     /// holds) in the prefill clause, stepped one id at a time in the others.
@@ -1516,33 +1533,55 @@ mod gate {
     /// The ids (y)'s pass clause prefills: several passes, the last short.
     const Y_PASS: usize = MAX_TOKENS * 2 + 3;
 
-    /// PIN(2026-10-10): the captured step's node count on [`Y_FILE`],
-    /// derived from its header before any run: the embedding row, 15 nodes
-    /// on each of 48 layers, the head's three (norm, q8_1, the Q6_K gemv with
-    /// the argmax folded in). A layer's 15: attention norm+quant, q, k and v
-    /// each alone (a Q5_K or Q6_K site is not one of the fused Q4_K groups),
-    /// QK-norm+rope+append, the flash segment pass and merge, the q8_1 of
-    /// the attention rows, attn_output alone and the residual add; the FFN
-    /// half's 5 (the norm with the router, gate·up, the q8_1 of the slots,
-    /// the down `_sel`, the combine), each routed launch replacing the Q4_K
-    /// one for one: 1 + 48 · 15 + 3.
-    const Y_NODES_STEP: usize = 724;
+    /// PIN(2026-11-21): a layer's launches on the Q5_K map, the derivation
+    /// the real Qwen3-Coder `Q5_K_M` file's literals (724, 721, 745 at 48
+    /// layers, 24 of their value projections Q6_K) came from, held to the
+    /// variant's header instead of its bytes: attention norm+quant, q, k and
+    /// v each alone (a Q5_K or Q6_K site is not one of the fused Q4_K
+    /// groups), QK-norm+rope+append, the flash segment pass and merge, the
+    /// q8_1 of the attention rows, attn_output alone and the residual add;
+    /// the FFN half's 5 (the norm with the router, gate·up, the q8_1 of the
+    /// slots, the down `_sel`, the combine), each routed launch replacing
+    /// the Q4_K one for one.
+    const Q5_LAYER_LAUNCHES: usize = 15;
 
-    /// PIN(2026-10-10): the captured pass at one token: the step without its
-    /// head, 1 + 48 · 15.
-    const Y_NODES_PASS_1: usize = 721;
+    /// PIN(2026-11-21): the head's launches over a Q6_K `output`: the norm,
+    /// the q8_1 of its input row, the gemv with the argmax folded in.
+    const Q5_HEAD_LAUNCHES: usize = 3;
 
-    /// PIN(2026-10-10): the captured pass at every count from two: the pass
-    /// at one token plus a token-major copy after each row-major (Q6_K) site
-    /// launched alone, which are the 24 layers' `attn_v` (Q5_K sites are
-    /// token-major and need none): 721 + 24.
-    const Y_NODES_PASS_M: usize = 745;
+    /// The captured node counts (s) holds a Q5_K file's captures to, from its
+    /// header: the embedding row and each layer's launches, the head's after
+    /// them, and in a pass of two or more rows a token-major copy after each
+    /// row-major (Q6_K) value projection launched alone (Q5_K sites are
+    /// token-major and need none).
+    fn q5_nodes(n_layer: usize, q6_v: usize) -> StructureNodes {
+        let pass_1 = 1 + n_layer * Q5_LAYER_LAUNCHES;
+        StructureNodes {
+            chain: pass_1 + Q5_HEAD_LAUNCHES,
+            pass_1,
+            pass_m: pass_1 + q6_v,
+        }
+    }
+
+    /// The card budget (y)'s placed load plans under: the smallest that keeps
+    /// half the file's routed experts on the card, searched up to
+    /// [`PLACED_BUDGET`] — the split a 12 GiB card gives the real 30B file,
+    /// whose whole load a fixture variant's card holds.
+    fn q5_placed_budget(file: &gguf::Split) -> Result<u64, GateError> {
+        let hp = Hparams::read(file)?;
+        let want = u64::try_from(hp.experts.n_expert * hp.n_layer / 2)?;
+        PlaceQ3::qwen3(file, Place::parse("cuda0")?, CTX, KvQ8::F16)?.budget_for_card_experts(
+            CTX,
+            want,
+            PLACED_BUDGET,
+        )
+    }
 
     /// (y) (module doc), on its own loads, each dropped before the clause
     /// returns. The whole-card runs are kept for the placed clause's compare.
     fn q5_routed(host: HostCfg) -> Result<bool, GateError> {
         use gguf::quant::GgmlType::{Q5_K, Q6_K};
-        let file = gguf::Split::open(Y_FILE).map_err(|e| format!("open {Y_FILE}: {e}"))?;
+        let file = q5_file()?;
         // The census: each launch family the clause names is in the header.
         let mut census = std::collections::BTreeMap::<(String, String), usize>::new();
         for (_, t) in file.iter_tensors() {
@@ -1582,9 +1621,28 @@ mod gate {
             );
             ok &= carried;
         }
+        // A variant exists to run this clause: one selected whose requant
+        // lost a family is a named error, and the plain fixture (no variant,
+        // no Q5_K site) leaves the clause to the variant's item.
+        if !ok && refset::fixture::selected()?.is_some() {
+            return Err(
+                "(y): the selected fixture variant holds no Q5_K site the census names, and a \
+                 variant exists to run this clause: make it again (just fixture-requant qwen3moe \
+                 q3q5k)"
+                    .into(),
+            );
+        }
+        if !tier::layout_clause("(y) the Q5_K routed path", ok)? {
+            return Ok(true);
+        }
+        let hp = Hparams::read(&file)?;
+        let q6_v = census
+            .get(&(String::from("attn_v.weight"), Q6_K.to_string()))
+            .copied()
+            .unwrap_or(0);
         let ids = prose(Y_IDS)?;
         let open = |ctx: usize| -> Result<Qwen3moeModel, GateError> {
-            let file = gguf::Split::open(Y_FILE).map_err(|e| format!("open {Y_FILE}: {e}"))?;
+            let file = q5_file()?;
             let t = Instant::now();
             let mut m = Qwen3moeModel::open(
                 Gpu::new()?,
@@ -1600,14 +1658,7 @@ mod gate {
             Ok(m)
         };
         let mut m = open(CTX)?;
-        ok &= structure(
-            &mut m,
-            StructureNodes {
-                chain: Y_NODES_STEP,
-                pass_1: Y_NODES_PASS_1,
-                pass_m: Y_NODES_PASS_M,
-            },
-        )?;
+        ok &= structure(&mut m, q5_nodes(hp.n_layer, q6_v))?;
         // Graph and eager steps: the same tokens, the last logits bit for bit.
         m.set_mode(StepMode::Graph);
         let graph = long_run(&mut m, &ids, None, None)?;
@@ -1653,7 +1704,8 @@ mod gate {
         drop(m);
         // The placed load: experts on both tiers, the pass prompt's
         // whole-card tokens.
-        let Some(mut pm) = open_placed(file, CTX, host)? else {
+        let budget = q5_placed_budget(&file)?;
+        let Some(mut pm) = open_placed(file, CTX, host, budget)? else {
             return Ok(false);
         };
         pm.set_mode(StepMode::Graph);
@@ -1684,16 +1736,14 @@ mod gate {
 
     // ------------------------------- (z) the common card leg on Qwen3-30B
 
-    /// (z)'s files: unsloth's Qwen3-30B-A3B-Instruct-2507 `Q8_0` and `Q6_K`
-    /// (the family has no fixture), each of one type in every routed stack of
-    /// every layer, a type the FFN dispatch does not launch: every layer is
-    /// one the common card leg runs, the Q8_0 file's through the 32-value
-    /// forms (a `Q8Blocks32` down, the 32-value route GEMMs), the Q6_K file's
-    /// through the 128-value ones.
-    const Z_FILES: [&str; 2] = [
-        "/data/moved/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf",
-        "/data/moved/models/Qwen3-30B-A3B/Qwen3-30B-A3B-Instruct-2507-Q6_K.gguf",
-    ];
+    /// (z)'s recipe: the arm's own fixture-only item, which the variants
+    /// `q3q80` and `q3q6k`'s rows in `tools/fixture-variants.tsv` name.
+    const Z_RECIPE: &str = "gate-gpu-qwen3moe-common";
+
+    /// The tier's variant file (either common-leg one), the clause's load.
+    fn z_file() -> Result<gguf::Split, GateError> {
+        open_split(Arch::Qwen3moe, Z_RECIPE)
+    }
 
     /// The ids (z)'s pass arm prefills: several passes, the last short.
     const Z_PASS: usize = MAX_TOKENS * 2 + 3;
@@ -1734,18 +1784,27 @@ mod gate {
         host_slots: (u64, u64),
     }
 
-    /// One placed load of `path` at the card budget `pick` names for the
+    /// The card budget (z)'s split load plans under: the smallest that keeps
+    /// half the file's routed experts on the card, searched up to
+    /// [`PLACED_BUDGET`] — the split a 12 GiB card gives the real 30B file,
+    /// whose whole load a fixture variant's card holds.
+    fn z_split_budget(q: &PlaceQ3, file: &gguf::Split) -> Result<u64, GateError> {
+        let hp = Hparams::read(file)?;
+        let want = u64::try_from(hp.experts.n_expert * hp.n_layer / 2)?;
+        q.budget_for_card_experts(CTX, want, PLACED_BUDGET)
+    }
+
+    /// One placed load of `file` at the card budget `pick` names for the
     /// file's planner, its prompts run as (z) says; the model is dropped
     /// before the call returns.
     fn z_load(
-        path: &str,
+        file: gguf::Split,
         label: &str,
-        pick: impl FnOnce(&PlaceQ3) -> Result<u64, GateError>,
+        pick: impl FnOnce(&PlaceQ3, &gguf::Split) -> Result<u64, GateError>,
         host: HostCfg,
     ) -> Result<ZRun, GateError> {
-        let file = gguf::Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
         let q = PlaceQ3::qwen3(&file, Place::parse("cuda0")?, CTX, KvQ8::F16)?;
-        let budget = pick(&q)?;
+        let budget = pick(&q, &file)?;
         let levers = PlanLevers {
             card_budget_bytes: Some(budget).into(),
             ..PlanLevers::default()
@@ -1798,19 +1857,17 @@ mod gate {
         })
     }
 
-    /// (z) (module doc), on each of [`Z_FILES`].
+    /// (z) (module doc), on the tier's variant file (either common-leg one,
+    /// each under its own item of [`Z_RECIPE`]).
     fn common_leg(host: HostCfg) -> Result<bool, GateError> {
-        let mut ok = true;
-        for path in Z_FILES {
-            ok &= common_leg_file(path, host)?;
-        }
-        Ok(ok)
+        common_leg_file(host)
     }
 
     /// (z) on one file: the premise from its header, the host-only load, the
     /// split load, and the second against the first.
-    fn common_leg_file(path: &str, host: HostCfg) -> Result<bool, GateError> {
-        let file = gguf::Split::open(path).map_err(|e| format!("open {path}: {e}"))?;
+    fn common_leg_file(host: HostCfg) -> Result<bool, GateError> {
+        let path = ref_model_path()?;
+        let file = z_file()?;
         let layers = Hparams::read(&file)?.n_layer;
         let mut common = 0;
         for l in 0..layers {
@@ -1819,19 +1876,32 @@ mod gate {
         drop(file);
         let premise = common == layers;
         println!(
-            "z {path}: {common} of {layers} layers hold stacks the common card leg runs {}",
+            "z {}: {common} of {layers} layers hold stacks the common card leg runs {}",
+            path.display(),
             verdict(premise)
         );
-        if !premise {
-            return Ok(false);
+        // A variant exists to run this clause: one selected whose layers are
+        // not the common leg's is a named error, and the plain fixture (no
+        // variant, the dispatch's own Q4_K stacks) leaves the clause to the
+        // variants' items.
+        if !premise && refset::fixture::selected()?.is_some() {
+            return Err(
+                "(z): the selected fixture variant holds a layer the common card leg does not \
+                 run, and a variant exists to run this clause: make it again (just \
+                 fixture-requant qwen3moe q3q80 | q3q6k)"
+                    .into(),
+            );
+        }
+        if !tier::layout_clause("(z) the common card leg on the placed load", premise)? {
+            return Ok(true);
         }
         let want = z_load(
-            path,
+            z_file()?,
             "host-only plan",
-            |q| q.budget_for_card_experts(CTX, 0, PLACED_BUDGET),
+            |q, _| q.budget_for_card_experts(CTX, 0, PLACED_BUDGET),
             host,
         )?;
-        let got = z_load(path, "split plan", |_| Ok(PLACED_BUDGET), host)?;
+        let got = z_load(z_file()?, "split plan", z_split_budget, host)?;
         let split = got.experts.0 > 0 && got.experts.1 > 0;
         let lean = want.experts.0 * 8 <= got.experts.0;
         let counted = want.scratch.0 == want.scratch.1 && got.scratch.0 == got.scratch.1;
@@ -1884,7 +1954,7 @@ mod gate {
             );
             ok &= near_tie && tight;
         }
-        println!("z {path}: {}", verdict(ok));
+        println!("z {}: {}", path.display(), verdict(ok));
         Ok(ok)
     }
 
@@ -3846,7 +3916,7 @@ mod gate {
             None => open(base.n_ctx(), StepMode::Graph, KvQ8::F16)?,
             Some(host) => {
                 let file = open_split(Arch::Qwen3moe, "gate-gpu-qwen3moe-e2e")?;
-                let mut m = open_placed(file, base.n_ctx(), host)?
+                let mut m = open_placed(file, base.n_ctx(), host, PLACED_BUDGET)?
                     .ok_or("--placed: the plan leaves no routed expert on one side")?;
                 m.set_mode(StepMode::Graph);
                 m

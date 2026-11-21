@@ -1,0 +1,14 @@
+# mutant: gate-gpu-qwen3-serve@BLOOMERY_TIER=fixture: the searched split budget wants every routed expert, so each placed arm plans none on the host; "placed_slots_plan_splits_the_experts" is FAIL (host_experts 0)
+diff --git a/crates/gpu-gates/src/bin/gate_qwen3_serve.rs b/crates/gpu-gates/src/bin/gate_qwen3_serve.rs
+index 7efd9b824..1245a3bc0 100644
+--- a/crates/gpu-gates/src/bin/gate_qwen3_serve.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen3_serve.rs
+@@ -2192,7 +2192,7 @@ mod gate {
+                 .ok_or_else(|| format!("{}: no {}", model.display(), split.arch_key(suffix)))
+         };
+         let (n_layer, n_expert) = (read("block_count")?, read("expert_count")?);
+-        let want = n_layer * n_expert / 2;
++        let want = n_layer * n_expert;
+         let budget = match seat {
+             qwen_seat::Family::Qwen3moe => {
+                 let q = q3place::PlaceQ3::qwen3(&split, Place::parse("cuda0")?, ctx, KvQ8::F16)?;

@@ -1,0 +1,12 @@
+# mutant: gate-gpu-qwen3moe-common@BLOOMERY_FIXTURE_VARIANT=q3q80: the common card leg admits the layer's gate and up stacks swapped (placed.rs common_stacks), so the split load's experts read the wrong weights; "z pass prefill greedy vs the host-only load" holds the near-tie but "logits rel" is past the 1e-1 bound and FAIL (the gate doc names this fault)
+--- a/crates/gpu/src/arch/qwen3moe/placed.rs
++++ b/crates/gpu/src/arch/qwen3moe/placed.rs
+@@ -1823,7 +1823,7 @@
+         .ok_or(GpuError::state(WHAT, "the placed card leg's arms"))?;
+     LegStacks::of_arms(
+         w,
+-        [&f.gate, &f.up, &f.down],
++        [&f.up, &f.gate, &f.down],
+         arms,
+         (
+             "a resident routed gate or up stack of a type the placed card leg runs \
