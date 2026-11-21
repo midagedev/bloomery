@@ -151,6 +151,7 @@ fn description() -> ModelSpec {
             tools: None,
             reasoning: None,
         },
+        loop_: None,
     }
 }
 

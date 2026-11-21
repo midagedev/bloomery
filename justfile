@@ -4624,6 +4624,17 @@ gate-gpu-raon1-attn:
 gate-raon1-meta:
     ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::raon1 arch::kda arch::noaux arch::classify arch::place_hybrid arch::solar2 arch::glm5next --nocapture && bash tools/gate.sh --release -p bloomery-model --test raon1_meta -- --ignored --nocapture'
 
+# --- inkling2-model ---
+# inkling2 (the Mini and the Small, one program) header gate: the reader's refusals on synthetic headers (a loop that is not
+# the fixed loop of whole blocks inside the trunk, a visit disagreeing with its layer's first visit, the two dialects' loop
+# keys and stems mixed, a misshapen tensor of either layer kind), the registry and rules owners it reads through, then the
+# descriptions of the two files under /models: the looped Mini's and the loopless Small's layer lines, the description row's
+# facts as defaults, the keys left unread, the tensors by role and type and the coverage work queue, printed. The lib half
+# runs the synthetic refusals (the master dialect's too, which no file on the box carries); the test half is the files under
+# /models. Headers only, seconds.
+gate-inkling2-meta:
+    ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::inkling2 arch::registry arch::rules --nocapture && bash tools/gate.sh --release -p bloomery-model --test inkling2_meta -- --ignored --nocapture'
+
 # The raon vocabulary: our ids equal the reference tree's `llama-tokenize` on every case of crates/tokenizer/tests/cases.txt and
 # cases-raon.txt, in both parse modes (the pins are tests/raon-ids.tsv, written by crates/tokenizer/tools/raon-oracle.sh from the
 # krafton-ai llama.cpp tree whose pre-tokenizer `raon` and NFC normalizer exist there only), and the header's two end tokens end

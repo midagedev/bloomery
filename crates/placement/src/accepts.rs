@@ -116,6 +116,9 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
         Arch::KimiK3 => Some(Program::KimiK3Body),
         Arch::Hy4 => Some(Program::Hy4Body),
+        // No program runs inkling2 yet: a start that opens one of its files is refused by the
+        // coverage check's one item, never sent down another family's path.
+        Arch::Inkling2 => None,
         Arch::Lfm3 => None,
     }
 }

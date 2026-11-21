@@ -16,10 +16,10 @@ use gguf::Split;
 use super::coverage::Available;
 use super::draft::Rule;
 use super::{
-    Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, QWEN35_BODY, Read,
-    deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, hy4, kimi_k3, lfm3,
-    llama, mimo2, minimaxm3, mistrallarge4, musespark, nemotron_h, nemotron_h_moe, qwen3moe,
-    qwen35moe, raon1, solar2,
+    Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, INKLING2_LOOP,
+    QWEN35_BODY, Read, deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, hy4,
+    inkling2, kimi_k3, lfm3, llama, mimo2, minimaxm3, mistrallarge4, musespark, nemotron_h,
+    nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
 };
 use crate::placement::PlacementError;
 
@@ -482,6 +482,16 @@ pub static ROWS: &[ArchRow] = &[
             draft: DraftSource::None,
         })),
     },
+    ArchRow {
+        arch: Some(Arch::Inkling2),
+        names: &["inkling2", INKLING2_LOOP],
+        read: Some(inkling2::spec::read),
+        draft: None,
+        coverage: None,
+        // No fixture of its own yet: the synthetic file of the family's shape is a later
+        // round's, and the meta gate reads the two real files' headers.
+        fixture: None,
+    },
 ];
 
 /// Every profile's cut fixture, in table order.
@@ -685,6 +695,7 @@ mod tests {
             "mistral-large4" => mistrallarge4::spec::read,
             "kimi-k3" | "kimi-k31" => kimi_k3::spec::read,
             "hy_v4_flash" => hy4::spec::read,
+            "inkling2" | INKLING2_LOOP => inkling2::spec::read,
             other => panic!("{other}: no reader is named for it"),
         }
     }
@@ -734,6 +745,7 @@ mod tests {
             Arch::MistralLarge4,
             Arch::KimiK3,
             Arch::Hy4,
+            Arch::Inkling2,
         ] {
             let rows = ROWS.iter().filter(|r| r.arch == Some(arch)).count();
             assert_eq!(rows, 1, "{arch:?} is in {rows} rows");

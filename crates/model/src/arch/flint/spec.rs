@@ -117,6 +117,7 @@ pub fn read(split: &Split) -> Result<Read, PlacementError> {
             encoder: None,
             logit_epilogue: None,
             chat,
+            loop_: None,
         },
         tensors,
         defaults: hp.defaults,

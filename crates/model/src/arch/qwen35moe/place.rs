@@ -3800,6 +3800,7 @@ mod tests {
                 tools: None,
                 reasoning: None,
             },
+            loop_: None,
         }
     }
 
@@ -6208,6 +6209,7 @@ mod tests {
                     tools: None,
                     reasoning: None,
                 },
+                loop_: None,
             }
         }
 

@@ -200,6 +200,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
             reasoning: REASONING,
             ..chat
         },
+        loop_: None,
     })
 }
 

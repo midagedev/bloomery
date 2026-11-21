@@ -77,6 +77,8 @@ impl Layer {
                 Mixer::DeltaRule(_) => MixerKind::DeltaRule,
                 Mixer::Mamba2(_) => MixerKind::Mamba2,
                 Mixer::ShortConv(_) => MixerKind::ShortConv,
+                // No program runs inkling2 yet, so no Layer of one is built.
+                Mixer::RelBias(_) => panic!("a rel-bias layer runs in no program yet"),
                 Mixer::None => MixerKind::None,
             },
             ffn: match spec.ffn {
@@ -90,6 +92,9 @@ impl Layer {
                 Residual::Sandwich { .. } => ResidualKind::Sandwich,
                 Residual::HcSandwich { .. } => ResidualKind::HcSandwich,
                 Residual::AttnRes { .. } => ResidualKind::AttnRes,
+                Residual::AttnResMix { .. } => {
+                    panic!("an AttnResMix layer runs in no program yet")
+                }
             },
         }
     }

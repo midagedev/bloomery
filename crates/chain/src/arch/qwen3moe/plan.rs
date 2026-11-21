@@ -566,7 +566,7 @@ pub fn kind_of(s: &LayerSpec, l: usize) -> Result<Kind35, ChainError> {
         }
         Mixer::DeltaRule(d) => Kind35::Delta(delta_shape(d).map_err(refuse)?),
         Mixer::ShortConv(c) => Kind35::ShortConv(conv_ring(c).map_err(refuse)?),
-        other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::None) => {
+        other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::RelBias(_) | Mixer::None) => {
             return Err(refuse(format!(
                 "{}, which no kernel here runs",
                 other.what()
@@ -1141,6 +1141,7 @@ pub(crate) mod fixtures {
                 tools: None,
                 reasoning: None,
             },
+            loop_: None,
         }
     }
 }

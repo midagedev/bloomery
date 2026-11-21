@@ -126,6 +126,8 @@ pub fn stores(layer: &LayerSpec) -> Vec<(Store, StoreRule)> {
             }
         }
         Mixer::None => {}
+        // No program runs inkling2 yet; its store rules are the round that builds one's.
+        Mixer::RelBias(_) => panic!("a rel-bias layer runs in no program yet"),
     }
     v
 }

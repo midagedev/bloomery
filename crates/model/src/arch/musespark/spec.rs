@@ -147,8 +147,10 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         logit_epilogue: Some(LogitEpilogue {
             scale: hp.logit_scale,
             softcap: hp.softcap,
+            cut: None,
         }),
         chat,
+        loop_: None,
     })
 }
 
@@ -359,6 +361,7 @@ mod tests {
             Some(models::LogitEpilogue {
                 scale: 0.1767767,
                 softcap: 20.0,
+                cut: None,
             })
         );
         assert_eq!(s.chat.pre, "gpt-4o");

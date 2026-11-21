@@ -67,6 +67,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         engram: None,
         logit_epilogue: None,
         chat,
+        loop_: None,
     })
 }
 

@@ -50,6 +50,22 @@ pub enum Need {
         group: u32,
         reach: Option<u32>,
     },
+    /// Inkling 2's attention ([`crate::RelBias`]): grouped-query heads, no rope, the positions a
+    /// learned bias-vs-distance bank of `d_rel` rows `extent` wide gathered by key distance, the
+    /// q/k and r L2 clips, the per-query sink column and the windowless layers' log-scaled q and
+    /// r — one attention, one kernel's score loop.
+    RelBias {
+        head: u32,
+        group: u32,
+        window: Option<u32>,
+        d_rel: u32,
+        extent: u32,
+    },
+    /// Inkling 2's short convolutions ([`crate::RelBias::taps`]): the four causal depthwise
+    /// convolutions with a residual — k and v before the cache (input-dependent per-head taps
+    /// where `dynamic`), the attention output and the feed-forward output — over one recurrent
+    /// state buffer a cache slot.
+    Sconv { taps: u32, dynamic: bool },
     /// The per-head q/k norm (when `qk_norm`) and rope of a GQA layer. A
     /// layer with no rope and a norm carries `mode: None` and dims 0.
     QkRope {
@@ -228,6 +244,14 @@ pub enum Need {
     /// reads the softmax mix of the banks and the running sum, and one more mix precedes the
     /// final norm.
     AttnRes { block: u32 },
+    /// Cross-layer residual attention, the mix of Inkling 2 ([`crate::Residual::AttnResMix`]):
+    /// the states normed at the fixed epsilon, scored against `queries` learned query rows at
+    /// `1/√hidden`, the normed states summed.
+    AttnResMix { block: u32, queries: u32 },
+    /// A loop over the trunk's core layers ([`crate::LoopSpec`]): the passes' schedule, the
+    /// per-pass cache slots and the gated message controllers that merge each pass onto the
+    /// previous pass's banked blocks.
+    Loop { passes: u32 },
     /// Each sublayer's output weight-normed at `eps` before it joins the stream, scaled by
     /// `add` (mixer, feed-forward block) when it does.
     Sandwich { eps: f32, add: [f32; 2] },
@@ -295,6 +319,29 @@ impl fmt::Display for Need {
                 write!(f, "bidirectional GQA flash, head {head}, group {group}")?;
                 if let Some(r) = reach {
                     write!(f, ", {r} keys each side")?;
+                }
+                Ok(())
+            }
+            Need::RelBias {
+                head,
+                group,
+                window,
+                d_rel,
+                extent,
+            } => {
+                write!(
+                    f,
+                    "relative-position bias attention: head {head}, group {group}, no rope"
+                )?;
+                if let Some(w) = window {
+                    write!(f, ", window {w}")?;
+                }
+                write!(f, ", bias bank {d_rel} x {extent}")
+            }
+            Need::Sconv { taps, dynamic } => {
+                write!(f, "short convolutions of {taps} taps")?;
+                if *dynamic {
+                    f.write_str(", input-dependent k/v taps")?;
                 }
                 Ok(())
             }
@@ -572,6 +619,16 @@ impl fmt::Display for Need {
                 "cross-layer residual attention: every {block}th layer banks its input, each \
                  sublayer and the head read the softmax mix of the banks and the running sum"
             ),
+            Need::AttnResMix { block, queries } => write!(
+                f,
+                "cross-layer residual attention of {queries}-query mixes: every {block}th layer \
+                 banks its input, each sublayer reads the softmax mix of the normed banks and the \
+                 running sum"
+            ),
+            Need::Loop { passes } => write!(
+                f,
+                "a loop of {passes} passes over the core layers, each pass its own cache slots"
+            ),
             Need::Sandwich { eps, add } => write!(
                 f,
                 "sandwich norms: each sublayer's output weight-normed at {eps}, then added scaled by {add:?}"
@@ -744,6 +801,25 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 d_conv: m.d_conv,
             }),
             Mixer::ShortConv(c) => at(Need::ShortConv { taps: c.taps }),
+            Mixer::RelBias(a) => {
+                at(Need::RelBias {
+                    head: a.head_dim,
+                    group: a.heads / a.kv_heads,
+                    window: a.window,
+                    d_rel: a.d_rel,
+                    extent: a.extent,
+                });
+                at(Need::Sconv {
+                    taps: a.taps,
+                    dynamic: a.dynamic,
+                });
+                match a.out_gate {
+                    OutGate::None => {}
+                    OutGate::Packed => at(Need::OutGate),
+                    OutGate::Proj => at(Need::OutGateProj),
+                    OutGate::ProjHead => at(Need::OutGateProjHead),
+                }
+            }
             Mixer::None => {}
         }
         match &layer.ffn {
@@ -846,6 +922,7 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
             }
             Residual::Sandwich { eps, add } => at(Need::Sandwich { eps, add }),
             Residual::AttnRes { block } => at(Need::AttnRes { block }),
+            Residual::AttnResMix { block, queries } => at(Need::AttnResMix { block, queries }),
         }
         if let Some(e) = &spec.encoder {
             if e.post_norms {
@@ -913,6 +990,11 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
         model(Need::LogitEpilogue {
             scale: e.scale,
             softcap: e.softcap,
+        });
+    }
+    if let Some(loop_) = spec.loop_ {
+        model(Need::Loop {
+            passes: loop_.passes,
         });
     }
     let delta = spec
@@ -1092,6 +1174,7 @@ mod tests {
                 tools: None,
                 reasoning: None,
             },
+            loop_: None,
         }
     }
 
@@ -1146,6 +1229,7 @@ mod tests {
                 tools: None,
                 reasoning: None,
             },
+            loop_: None,
         }
     }
 
@@ -1196,6 +1280,7 @@ mod tests {
             Some(LogitEpilogue {
                 scale: 0.1767767,
                 softcap: 20.0,
+                cut: None,
             }),
         ));
         for (l, want) in [

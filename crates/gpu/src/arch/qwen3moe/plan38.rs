@@ -399,7 +399,11 @@ pub(super) fn read(spec: &ModelSpec) -> Result<Shape38, GpuError> {
                 }
                 Kind38::Qsa
             }
-            other @ (Mixer::Latent(_) | Mixer::Mamba2(_) | Mixer::ShortConv(_) | Mixer::None) => {
+            other @ (Mixer::Latent(_)
+            | Mixer::Mamba2(_)
+            | Mixer::ShortConv(_)
+            | Mixer::RelBias(_)
+            | Mixer::None) => {
                 return Err(refuse(format!(
                     "{}, which no kernel here runs",
                     other.what()

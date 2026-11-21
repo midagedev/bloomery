@@ -3368,6 +3368,7 @@ mod tests {
                 tools: None,
                 reasoning: None,
             },
+            loop_: None,
         };
         let model = ModelTensors {
             tensors,
@@ -3665,6 +3666,7 @@ mod tests {
                     tools: None,
                     reasoning: None,
                 },
+                loop_: None,
             };
             let model = ModelTensors {
                 tensors: vec![ModelTensor {
@@ -3755,6 +3757,7 @@ mod tests {
                     tools: None,
                     reasoning: None,
                 },
+                loop_: None,
             };
             let model = ModelTensors {
                 tensors: vec![ModelTensor {

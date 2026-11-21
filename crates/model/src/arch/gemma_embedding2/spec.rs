@@ -101,6 +101,7 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         }),
         logit_epilogue: None,
         chat,
+        loop_: None,
     })
 }
 

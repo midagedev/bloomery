@@ -56,17 +56,40 @@ pub struct ModelSpec {
     /// The head's logit epilogue; `None`: the output projection's values are
     /// the logits.
     pub logit_epilogue: Option<LogitEpilogue>,
+    /// The loop; `None`: every layer runs once. A looped layer's later passes
+    /// share its weights, so [`layers`](ModelSpec::layers) holds the stored
+    /// layers alone and the loop names the visits.
+    pub loop_: Option<LoopSpec>,
     pub chat: ChatSpec,
 }
 
+/// A loop over a trunk's layers: `[core_start, core_end)` runs `passes` times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoopSpec {
+    /// The first looped layer, a multiple of the block attention residual's block.
+    pub core_start: u32,
+    /// One past the last looped layer.
+    pub core_end: u32,
+    /// How many times the core runs: the layer visits number
+    /// `stored + (passes − 1) · (core_end − core_start)`, each visit its own
+    /// cache slot.
+    pub passes: u32,
+    /// `loop.gate_rank`: the rank of a core layer's message controllers.
+    pub gate_rank: u32,
+}
+
 /// What the head runs on its logits after the output projection, in the
-/// graph's order: the scale, then the softcap.
+/// graph's order: the scale, then the softcap, then the column cut.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LogitEpilogue {
     /// `logit_scale`: every logit's factor.
     pub scale: f32,
     /// `final_logit_softcapping`: `cap·tanh(x/cap)`; 0: no cap.
     pub softcap: f32,
+    /// The logits cut to their first `cut` columns — the unpadded vocabulary
+    /// (`vocab_size_unpadded`) under an embedding the file padded past it; `None`: every column
+    /// is a logit.
+    pub cut: Option<u32>,
 }
 
 /// The architectures a reader exists for.
@@ -131,6 +154,11 @@ pub enum Arch {
     /// hyper-connections with sandwich norms, a latent mixture of experts beside a shared one,
     /// and n-gram engram sites. No program runs it yet.
     Hy4,
+    /// Inkling 2 (the Mini and the Small, one program): the relative-position bias attention with
+    /// short convolutions on both sublayers' paths and per-query sinks, the softmax mix of banked
+    /// block inputs as each sublayer's input, `situ` experts behind a biased sigmoid router, and
+    /// the Mini's looped core. No program runs it yet.
+    Inkling2,
 }
 
 impl Arch {
@@ -164,6 +192,7 @@ impl Arch {
             Arch::MistralLarge4 => "mistral-large4",
             Arch::KimiK3 => "kimi-k3",
             Arch::Hy4 => "hy_v4_flash",
+            Arch::Inkling2 => "inkling2",
         }
     }
 }
@@ -243,6 +272,9 @@ pub enum Mixer {
     Mamba2(Mamba2),
     /// A gated short convolution: `C ⊙ conv(B ⊙ x)` over the projection's three chunks.
     ShortConv(ShortConv),
+    /// Inkling 2's attention: grouped-query heads whose score path carries the positions through
+    /// a learned relative-position bias ([`RelBias`]).
+    RelBias(RelBias),
     /// This layer has no token mixer. Its feed-forward block is the layer.
     None,
 }
@@ -257,9 +289,70 @@ impl Mixer {
             Mixer::DeltaRule(_) => "a delta-rule mixer",
             Mixer::Mamba2(_) => "a Mamba-2 mixer",
             Mixer::ShortConv(_) => "a short-conv mixer",
+            Mixer::RelBias(_) => "a relative-position bias mixer",
             Mixer::None => "no token mixer",
         }
     }
+}
+
+/// Inkling 2's attention, from llama.cpp's `src/models/inkling2.cpp` (the line numbers below are
+/// that file's): grouped-query heads, no rope — nothing turns a value, the positions enter the
+/// score path (line 68) — and beside the score path a fixed epilogue:
+///
+/// - The score path: a `d_rel`-value r row a head, projected from the attention input
+///   (`attn_rel`, line 402), channel-scaled by `attn_rel_clip` then L2-clipped whole-row at
+///   `rel_clip` (lines 407, 197-209), projected onto a learned bias-vs-distance bank
+///   (`attn_rel_bias`, `extent` values a head — the layer's window on a windowed layer, else
+///   `attention.relative_extent`, line 122), gathered by key distance and added to the logits
+///   (lines 427-436). q is channel-scaled by `attn_q_clip` then L2-clipped at `qk_clip`; k is
+///   L2-clipped at `qk_clip`; the clip's norm carries a `1e-6` bias (lines 404-405, 203-204). V
+///   is RMS-normed per head with no gain, always (line 406). On a windowless layer q and r are
+///   multiplied by `1 + alpha·ln(max(1, (pos+1)/floor))` (lines 293-296, 409-412).
+/// - The softmax denominator gains a zero column: a per-(head, query) sink logit t from
+///   `attn_sink_proj` (line 424) gives `exp(s − t)/(1 + Σexp(s − t))` (lines 429-438) — a
+///   projection's, not the static per-head sink `attn_sinks` is.
+/// - The windowless layers' inputs: q, k and v are each normed by their own input norm
+///   (`attn_{q,k,v}_inp_norm`) and read their own mix of the banked blocks; a windowed layer
+///   shares one `attn_norm` (lines 145-154, 386-393).
+/// - The short convolutions (`taps` taps, causal, depthwise, with a residual; lines 241-283): on
+///   k and v before the cache, on the attention output after `attn_output`, and the same taps on
+///   the feed-forward block's output (`ffn_post_conv`) — the layer carries all four, one
+///   recurrent state buffer of the last `taps − 1` inputs over `2·kv + 2·hidden` channels a
+///   cache slot (lines 70-87). A windowless layer's k and v convs add input-dependent per-head
+///   taps (`attn_{k,v}_conv_proj`, `dynamic`); every conv's output scales by
+///   `1/√((dynamic ? 2 : 1)·taps + 1)` (line 282).
+/// - The attention output is gated by a projection of the layer input (`attn_gate`, one value a
+///   query-head channel, line 444): [`OutGate::Proj`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RelBias {
+    /// `attention.head_count`.
+    pub heads: u32,
+    /// `attention.head_count_kv`.
+    pub kv_heads: u32,
+    /// `attention.key_length`, the value width too.
+    pub head_dim: u32,
+    /// `attention.sliding_window` on a windowed layer (`attention.sliding_window_pattern`);
+    /// `None`: the layer attends every position.
+    pub window: Option<u32>,
+    /// The gate on the attention output.
+    pub out_gate: OutGate,
+    /// `attention.relative_length` (`d_rel`): values a head of the r projection.
+    pub d_rel: u32,
+    /// `attention.relative_extent`: the windowless layers' bias-bank width.
+    pub extent: u32,
+    /// `attention.qk_clip`: q's and k's whole-row L2 threshold.
+    pub qk_clip: f32,
+    /// `attention.relative_clip`: r's whole-row L2 threshold.
+    pub rel_clip: f32,
+    /// `attention.log_scale_floor`: the windowless layers' log-scaled positions' floor.
+    pub log_floor: u32,
+    /// `attention.log_scale_alpha`: the windowless layers' log-scaled positions' factor.
+    pub log_alpha: f32,
+    /// `shortconv.l_cache`: the taps of the four short convolutions.
+    pub taps: u32,
+    /// The k and v convs' taps are input-dependent per head (`attn_{k,v}_conv_proj`): a
+    /// windowless layer's.
+    pub dynamic: bool,
 }
 
 /// A Mamba-2 mixer. The widths are the header's `ssm.*` keys, and the two
@@ -834,6 +927,21 @@ pub enum Residual {
     /// norm.
     AttnRes {
         block: u32,
+    },
+    /// Cross-layer residual attention over banked block inputs, the mix of Inkling 2 (llama.cpp's
+    /// `src/models/inkling2.cpp:212-225, 449-460, 489`): every `block`-th layer closes its
+    /// residual stream onto the bank and starts a fresh one, mid-block layers adding normally.
+    /// Each sublayer reads, in place of the running sum, the softmax mix of the banked states and
+    /// the running sum: every state RMS-normed at a fixed `1e-6` (not the file's epsilon),
+    /// scored against `queries` learned query rows (`attn_res_query` — one on a windowed layer,
+    /// three on a windowless one, where q, k and v each read their own mix) at the scale
+    /// `1/√hidden`, and the mix sums the normed states. The feed-forward block reads its own
+    /// one-row query (`ffn_res_query`) after the block residual joins, and one more one-row mix
+    /// (`output_res_query`) precedes the final norm.
+    AttnResMix {
+        block: u32,
+        /// The attention mix's query rows: 1 or 3 by the layer's kind.
+        queries: u32,
     },
 }
 

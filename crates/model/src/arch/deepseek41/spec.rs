@@ -96,6 +96,7 @@ pub fn spec_of(
         encoder: None,
         logit_epilogue: None,
         chat,
+        loop_: None,
     })
 }
 

@@ -25,6 +25,7 @@ mod gemma_encoder;
 pub mod glm5next;
 pub mod hy4;
 pub mod hybrid;
+pub mod inkling2;
 pub mod kda;
 pub mod kimi_k3;
 pub mod lfm3;
@@ -120,6 +121,12 @@ pub const DEEPSEEK4: &str = "deepseek4";
 /// the [`glm5next`] module under either string.
 pub const GLM5_NEXT_LLAMA_CPP: &str = "glm5-next";
 
+/// llama.cpp master's spelling of the looped Inkling 2's architecture, whose files carry the
+/// renamed loop keys and stems (`loop.start/end/count`, `blk.N.loop_msg_query`): the same model
+/// and program as the unsloth files' `inkling2`, read by the [`inkling2`] module under either
+/// string.
+pub const INKLING2_LOOP: &str = "inkling2_loop";
+
 /// Which of the [`deepseek41`] module's models `split` holds, by its
 /// `general.architecture`; any other string is an error naming it.
 pub fn deepseek41_model(split: &Split) -> Result<deepseek41::hparams::Model, PlacementError> {
@@ -170,11 +177,15 @@ pub fn qwen35moe_variant(split: &Split) -> Result<qwen35moe::hparams::Variant, P
     }
 }
 
-/// The description row of `split`'s `general.architecture` ([`rules::row`]); a string no row
-/// names is an error naming it.
+/// The description row of `split`'s `general.architecture` ([`rules::row`]), an architecture's
+/// every spelling through its [`Arch::name`]; a string no row names is an error naming it.
 pub(crate) fn rules_of(split: &Split) -> Result<&'static rules::ArchRules, PlacementError> {
     let name = split.architecture().unwrap_or("<missing>");
-    rules::row(name).ok_or_else(|| {
+    let canonical = match Arch::from_name(name) {
+        Ok(arch) => arch.name(),
+        Err(_) => name,
+    };
+    rules::row(canonical).ok_or_else(|| {
         architecture_is(&format!(
             "{name:?}; no description row of it states the facts this reader reads"
         ))
@@ -186,7 +197,7 @@ pub(crate) const ARCHITECTURE_KEY: &str = "general.architecture";
 
 /// The error naming `general.architecture`, which `is` completes: its value
 /// and why a reader refuses it there.
-fn architecture_is(is: &str) -> PlacementError {
+pub(crate) fn architecture_is(is: &str) -> PlacementError {
     PlacementError::Metadata {
         key: ARCHITECTURE_KEY.to_string(),
         detail: format!("is {is}"),
@@ -229,6 +240,11 @@ pub enum Arch {
     /// norms, latent experts beside a shared one and n-gram engram sites. No executable program
     /// is registered.
     Hy4,
+    /// Inkling 2 (the Mini and the Small, one reader): the relative-position bias attention
+    /// with short convolutions and per-query sinks, the block attention residual mixes, `situ`
+    /// experts behind a biased sigmoid router, and the Mini's loop. No executable program is
+    /// registered.
+    Inkling2,
 }
 
 impl Arch {
@@ -268,6 +284,7 @@ impl Arch {
             "mistral-large4" => Ok(Arch::MistralLarge4),
             "kimi-k3" | "kimi-k31" => Ok(Arch::KimiK3),
             gguf::arch::hy_v4_flash::ARCH => Ok(Arch::Hy4),
+            "inkling2" | INKLING2_LOOP => Ok(Arch::Inkling2),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -300,6 +317,7 @@ impl Arch {
             Arch::MistralLarge4 => "mistral-large4",
             Arch::KimiK3 => "kimi-k3",
             Arch::Hy4 => gguf::arch::hy_v4_flash::ARCH,
+            Arch::Inkling2 => "inkling2",
         }
     }
 }
@@ -310,7 +328,7 @@ impl Arch {
 // shares: each returns the value or the error that names the key.
 
 /// The token list ik counts when the file has no `vocab_size`.
-const TOKENS: &str = "tokenizer.ggml.tokens";
+pub(crate) const TOKENS: &str = "tokenizer.ggml.tokens";
 
 /// The error that names `<architecture>.<suffix>`.
 fn metadata(split: &Split, suffix: &str, detail: impl Into<String>) -> PlacementError {
@@ -351,7 +369,7 @@ pub(crate) fn optional_usize(split: &Split, suffix: &str) -> Result<Option<usize
 }
 
 /// `<architecture>.<suffix>` as a float.
-fn meta_f32(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
+pub(crate) fn meta_f32(split: &Split, suffix: &str) -> Result<f32, PlacementError> {
     split
         .arch_get_f32(suffix)
         .ok_or_else(|| metadata(split, suffix, "is absent or not a float"))
@@ -658,6 +676,16 @@ pub(crate) fn one_expert_group(split: &Split, router: &str) -> Result<(), Placem
     Ok(())
 }
 
+/// A dims vector as ggml sees it: the trailing unit dims of the end are not there (a converter
+/// may write `[n]` where the loader asks `{n, 1}`, and llama.cpp's `create_tensor` takes it).
+fn ggml_dims(dims: &[u64]) -> &[u64] {
+    let mut end = dims.len();
+    while end > 1 && dims[end - 1] == 1 {
+        end -= 1;
+    }
+    &dims[..end]
+}
+
 /// Required tensors at their expected dimensions; missing names precede dimension errors.
 fn tensors_agree(split: &Split, want: Vec<(String, Vec<u64>)>) -> Result<(), PlacementError> {
     let mut missing = Vec::new();
@@ -665,7 +693,7 @@ fn tensors_agree(split: &Split, want: Vec<(String, Vec<u64>)>) -> Result<(), Pla
     for (name, dims) in want {
         match split.find(&name) {
             None => missing.push(name),
-            Some((_, info)) if info.dims != dims => {
+            Some((_, info)) if ggml_dims(&info.dims) != ggml_dims(&dims) => {
                 let detail = format!("{name} {:?} (want {dims:?})", info.dims);
                 off.push((name, detail));
             }
@@ -1364,6 +1392,7 @@ mod tests {
             Arch::MistralLarge4,
             Arch::KimiK3,
             Arch::Hy4,
+            Arch::Inkling2,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

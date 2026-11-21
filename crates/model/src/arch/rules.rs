@@ -97,6 +97,10 @@ pub struct ArchRules {
     /// `None`: the key is the only source, and its absence is refused.
     pub rope_fallback: Option<RopeFallback>,
     pub chat: ChatParsers,
+    /// The facts of this architecture no field above holds, each with its source line: a read
+    /// records them as `defaults` lines the same way, so a description print carries its
+    /// provenance. A fact a new file states as a key leaves the list.
+    pub facts: &'static [(&'static str, &'static str)],
     pub sources: RuleSources,
 }
 
@@ -179,6 +183,13 @@ impl ArchRules {
             self.sources.chat
         ))
     }
+
+    /// The row's free facts as `defaults` lines, `<fact> (<source>)` each.
+    pub(crate) fn facts_lines(&self) -> impl Iterator<Item = String> + '_ {
+        self.facts
+            .iter()
+            .map(|(what, source)| format!("{what} ({source})"))
+    }
 }
 
 /// A limit of at most this clamps nothing (llama-graph.cpp:2064's `eps`).
@@ -237,6 +248,7 @@ static ROWS: &[ArchRules] = &[
         router_norm: RouterNorm::SelectedSumFloor,
         // The loader reads `attention.rope_pattern` as a required array (flint.cpp:16).
         rope_fallback: None,
+        facts: &[],
         chat: ChatParsers::Fixed {
             tools: Some(ToolFormat::GlmXml),
             reasoning: Some(ReasoningFormat::THINK),
@@ -260,6 +272,7 @@ static ROWS: &[ArchRules] = &[
         router_norm: RouterNorm::SelectedSum,
         // The loader ropes a layer exactly where the sliding-window pattern puts it.
         rope_fallback: Some(RopeFallback::WhereWindowed),
+        facts: &[],
         chat: ChatParsers::FromTemplate,
         sources: RuleSources {
             pairs: "llama.cpp src/llama-model.cpp:3799,3834: EXAONE's rope type is NEOX",
@@ -267,6 +280,63 @@ static ROWS: &[ArchRules] = &[
             router_norm: "LG modeling_exaone_moe.py:269-270: the kept weights over their sum + 1e-20",
             rope_fallback: "llama.cpp src/models/exaone-moe.cpp:7: rope_pattern is is_swa_impl",
             chat: "the file's own template, read by models' formats table",
+        },
+    },
+    ArchRules {
+        // B is llama.cpp's src/models/inkling2.cpp (the line numbers its), M the hub modeling
+        // file ink2r0 fetched (transformers `modeling_inkling2.py`).
+        arch: Arch::Inkling2,
+        // No value turns: the rope pattern is filled false (B:68).
+        pairs: RopeMode::None,
+        // `situ` bounds its gate and up itself; the file's `mlp_*_softcap` keys are the same
+        // betas in another spelling, read by nothing.
+        clamp: ClampOrder::None,
+        // The kept weights divide by their sum guarded at 1e-20, unconditionally (B:65): the
+        // files carry no `expert_weights_norm` key.
+        router_norm: RouterNorm::SelectedSum,
+        // Nothing falls back: no layer ever ropes.
+        rope_fallback: None,
+        facts: &[
+            (
+                "router logits = f32 (expert_router_f32)",
+                "B:64: the router scores run in f32",
+            ),
+            (
+                "router bias = selection only",
+                "M:690-696: exp_probs_b steers the choice, the kept weights are the unbiased scores",
+            ),
+            (
+                "V = gainless per-head RMS, always",
+                "B:406: the value rows are normed whatever the file's `value_norm` key says",
+            ),
+            (
+                "mix eps = 1e-6 fixed, scale 1/sqrt(hidden)",
+                "B:217,222: the block attention residual's states are normed at a fixed epsilon and scored at 1/sqrt(hidden)",
+            ),
+            (
+                "conv output = (x + conv(x)) / sqrt(taps + 1), twice the taps where the k/v convs are dynamic",
+                "B:282: every convolution's scale counts its taps (and the dynamic taps)",
+            ),
+            (
+                "softmax denominator = 1 + sum(exp(s - t))",
+                "B:429-438: a per-(head, query) sink logit t adds a zero column",
+            ),
+            (
+                "head = softcap then the unpadded columns",
+                "B:503-510: the softcap runs on the padded logits, the cut after it",
+            ),
+            (
+                "flash attention = off",
+                "B:88, llama-graph.cpp:3201: use_flash_attn needs no kq_b, and every layer carries one",
+            ),
+        ],
+        chat: ChatParsers::FromTemplate,
+        sources: RuleSources {
+            pairs: "B:68: rope_pattern.fill(false), the relative-position bias carries the positions",
+            clamp: "B:24-25: the situ betas bound the gate and up; no clamp key is read",
+            router_norm: "B:65: expert_weights_norm_eps = 1e-20 unconditional",
+            rope_fallback: "B:68: no layer ropes, so no layer needs a fallback",
+            chat: "the file's own template, read by models' formats table (no parser of this family's markup runs yet)",
         },
     },
 ];
@@ -283,18 +353,29 @@ mod tests {
     use super::{ClampOrder, RopeFallback, row};
     use models::Act;
 
-    /// A row is named by its architecture's own string, and the two rows this
-    /// table opens with state the facts their reader refuses to guess.
+    /// A row is named by its architecture's own string, and the rows this table opens with state
+    /// the facts their reader refuses to guess.
     #[test]
     fn a_row_is_named_by_its_architectures_string() {
         let flint = row("flint").expect("the flint row");
         let exaone = row("exaone-moe").expect("the exaone-moe row");
+        let inkling = row("inkling2").expect("the inkling2 row");
         assert_eq!(flint.arch, models::Arch::Flint);
         assert_eq!(exaone.arch, models::Arch::ExaoneMoe);
+        assert_eq!(inkling.arch, models::Arch::Inkling2);
         assert_eq!(flint.clamp, ClampOrder::None);
         assert_eq!(exaone.clamp, ClampOrder::GateFirst);
         assert_eq!(flint.rope_fallback, None);
         assert_eq!(exaone.rope_fallback, Some(RopeFallback::WhereWindowed));
+        assert!(
+            row("inkling2_loop").is_none(),
+            "the second spelling is no row of its own"
+        );
+        assert!(flint.facts.is_empty() && exaone.facts.is_empty());
+        assert!(inkling.facts.iter().all(|(what, source)| {
+            let _ = source;
+            !what.is_empty()
+        }));
         assert!(row("llama").is_none(), "no row for another family");
     }
 

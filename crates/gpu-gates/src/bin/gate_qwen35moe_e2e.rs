@@ -1206,7 +1206,9 @@ mod gate {
                 }
                 Mixer::Latent(_) => (("latent", [0; 4]), [u32::MAX; 4]),
                 Mixer::ShortConv(_) => (("short-conv", [0; 4]), [u32::MAX; 4]),
-                Mixer::Mamba2(_) | Mixer::None => (("mamba2", [0; 4]), [u32::MAX; 4]),
+                Mixer::Mamba2(_) | Mixer::RelBias(_) | Mixer::None => {
+                    (("mamba2", [0; 4]), [u32::MAX; 4])
+                }
             };
             let pass = got.1 == want;
             ok &= pass;

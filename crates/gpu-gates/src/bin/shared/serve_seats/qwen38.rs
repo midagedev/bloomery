@@ -4538,6 +4538,7 @@ mod tests {
                 tools: None,
                 reasoning: None,
             },
+            loop_: None,
         };
         let inputs = PlanInputs {
             kv: KvLayout::of_spec(&spec).expect("the stores"),

@@ -762,7 +762,8 @@ pub fn plan_residual(
         other @ (Residual::Hc
         | Residual::HcSandwich { .. }
         | Residual::AlphaBeta { .. }
-        | Residual::AttnRes { .. }) => Err(ChainError::shape(
+        | Residual::AttnRes { .. }
+        | Residual::AttnResMix { .. }) => Err(ChainError::shape(
             what,
             format!("layer {l}: the residual {other:?}, which no walk here runs"),
         )),

@@ -174,6 +174,29 @@ pub fn layer_line(layer: &LayerSpec) -> String {
         Mixer::ShortConv(c) => {
             let _ = write!(o, "shortconv taps {}", c.taps);
         }
+        Mixer::RelBias(a) => {
+            let _ = write!(
+                o,
+                "relbias {}/{} x {} d_rel {} extent {} clips {}/{} log {}/{} taps {}",
+                a.heads,
+                a.kv_heads,
+                a.head_dim,
+                a.d_rel,
+                a.extent,
+                a.qk_clip,
+                a.rel_clip,
+                a.log_floor,
+                a.log_alpha,
+                a.taps
+            );
+            if let Some(w) = a.window {
+                let _ = write!(o, " win {w}");
+            }
+            if a.dynamic {
+                o.push_str(" dyn");
+            }
+            let _ = write!(o, " gate {:?}", a.out_gate);
+        }
         Mixer::None => o.push_str("none"),
     }
     match &layer.ffn {
@@ -214,17 +237,20 @@ pub fn layer_line(layer: &LayerSpec) -> String {
             }
         }
     }
+    // The residual's name, one string whatever the arm: the mix's carries its block and query
+    // count.
+    let residual = match layer.residual {
+        Residual::Plain => "plain".to_string(),
+        Residual::Hc => "hc".to_string(),
+        Residual::AlphaBeta { .. } => "alpha-beta".to_string(),
+        Residual::Sandwich { .. } => "sandwich".to_string(),
+        Residual::HcSandwich { .. } => "hc-sandwich".to_string(),
+        Residual::AttnRes { .. } => "attn-res".to_string(),
+        Residual::AttnResMix { block, queries } => format!("attn-res-mix {block}/{queries}"),
+    };
     let _ = write!(
         o,
-        " || {}{}",
-        match layer.residual {
-            Residual::Plain => "plain",
-            Residual::Hc => "hc",
-            Residual::AlphaBeta { .. } => "alpha-beta",
-            Residual::Sandwich { .. } => "sandwich",
-            Residual::HcSandwich { .. } => "hc-sandwich",
-            Residual::AttnRes { .. } => "attn-res",
-        },
+        " || {residual}{}",
         if layer.extras.is_empty() {
             String::new()
         } else {
@@ -289,6 +315,22 @@ pub fn view(s: &ModelSpec) -> Vec<String> {
             s.chat.reasoning
         ),
     ];
+    // The loop joins the lines only where the file carries one, so every attached model's pins
+    // keep theirs.
+    if let Some(loop_) = &s.loop_ {
+        v.push(format!(
+            "loop core [{}, {}) passes {} rank {}",
+            loop_.core_start, loop_.core_end, loop_.passes, loop_.gate_rank
+        ));
+    }
+    if let Some(e) = &s.logit_epilogue
+        && let Some(cut) = e.cut
+    {
+        v.push(format!(
+            "logit scale {} softcap {} cut {cut}",
+            e.scale, e.softcap
+        ));
+    }
     v.extend(layer_lines(&s.layers));
     v
 }

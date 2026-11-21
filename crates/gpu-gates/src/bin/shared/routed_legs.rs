@@ -101,7 +101,8 @@ fn family_of(arch: Arch) -> Option<&'static dyn Adapter> {
         | Arch::MuseSpark
         | Arch::MistralLarge4
         | Arch::KimiK3
-        | Arch::Hy4 => None,
+        | Arch::Hy4
+        | Arch::Inkling2 => None,
     }
 }
 
@@ -129,7 +130,8 @@ fn skip_of(arch: Arch) -> &'static str {
         | Arch::ExaoneMoe
         | Arch::MuseSpark
         | Arch::MistralLarge4
-        | Arch::Hy4 => "no program",
+        | Arch::Hy4
+        | Arch::Inkling2 => "no program",
         // Whole-card: its routed stacks load as the file holds them and no plan splits them.
         Arch::KimiK3 => "no adapter",
     }

@@ -2051,6 +2051,7 @@ mod tests {
                         tools: None,
                         reasoning: None,
                     },
+                    loop_: None,
                 },
                 kv,
                 room: (u64::MAX, HostRead::Given),

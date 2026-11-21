@@ -78,8 +78,10 @@ pub fn spec_of(hp: &Hparams, chat: ChatSpec) -> Result<ModelSpec, PlacementError
         logit_epilogue: (hp.softcap > 0.0).then_some(LogitEpilogue {
             scale: 1.0,
             softcap: hp.softcap,
+            cut: None,
         }),
         chat,
+        loop_: None,
     })
 }
 
@@ -540,6 +542,7 @@ mod tests {
             Some(models::LogitEpilogue {
                 scale: 1.0,
                 softcap: 30.0,
+                cut: None,
             })
         );
         assert_eq!(s.chat.pre, "tekken-num3");

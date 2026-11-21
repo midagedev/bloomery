@@ -264,6 +264,7 @@ mod tests {
                     tools: None,
                     reasoning: None,
                 },
+                loop_: None,
             },
             kv,
             room: (pool, HostRead::Given),

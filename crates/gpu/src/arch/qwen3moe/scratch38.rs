@@ -875,6 +875,7 @@ mod tests {
                 tools: None,
                 reasoning: None,
             },
+            loop_: None,
         };
         let mut inputs = model::arch::qwen35moe::place::PlanInputs {
             kv: model::arch::qwen35moe::place::KvLayout::of_spec(&spec).expect("the layout"),

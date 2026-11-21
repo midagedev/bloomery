@@ -125,6 +125,7 @@ pub(crate) fn spec_of(
         engram: None,
         encoder: None,
         logit_epilogue: None,
+        loop_: None,
         chat,
     })
 }

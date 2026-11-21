@@ -223,6 +223,7 @@ fn mistrallarge4_header() {
         != Some(LogitEpilogue {
             scale: 1.0,
             softcap: 30.0,
+            cut: None,
         })
     {
         bad.push(format!("logit epilogue {:?}", s.logit_epilogue));
