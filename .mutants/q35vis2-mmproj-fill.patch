@@ -1,0 +1,21 @@
+# q35vis2 mutant mmproj-fill
+# clause: the synthetic encoder file's fill pins (crates/vision/src/arch/qwen3vl/fixture.rs, the digest
+#   test): one tensor of every fill, read back from the written file, hashes to its pin, and
+#   the file to its own sha256 -- a fill change moves them, which the sets dumped from an older
+#   file feel as the mmproj sha they state
+# site: crates/vision/src/arch/qwen3vl/fixture.rs, a LayerNorm gain's spread doubled, so every gain tensor
+#   and with them the file's bytes move while the shapes stay
+# expected red: `cargo test -p bloomery-vision --lib fixture::` fails in
+#   the_written_file_opens_and_is_the_pinned_fill with "the fill moved:" naming v.blk.5.ln2.weight
+#   (pinned against today) and the file's sha256
+--- a/crates/vision/src/arch/qwen3vl/fixture.rs
++++ b/crates/vision/src/arch/qwen3vl/fixture.rs
+@@ -62,7 +62,7 @@
+ const EPS: f32 = 1e-6;
+ 
+ /// A LayerNorm gain is drawn in `1 ± GAIN_SPREAD`.
+-const GAIN_SPREAD: f32 = 0.1;
++const GAIN_SPREAD: f32 = 0.2;
+ /// A LayerNorm bias in `±NORM_BIAS_SPREAD`.
+ const NORM_BIAS_SPREAD: f32 = 0.1;
+ 

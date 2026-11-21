@@ -1,0 +1,19 @@
+# q35vis2 mutant fx-seat
+# clause: the seat picker's fixture discrimination (gate_qwen35_media.rs, seat_of): the
+#   qwen35moe seat runs the fixture file and only the fixture file (a real qwen35moe file, a
+#   variant and a subset are each refused by name)
+# site: crates/gpu-gates/src/bin/gate_qwen35_media.rs, the version-key check inverted, so the
+#   fixture file the recipe hands the gate is refused by the very branch that must take it
+# expected red: `just gate-gpu-qwen35moe-media` exits at once with "... is a qwen35moe file
+#   that is not the fixture: this gate's qwen35moe seat runs the fixture file ..."
+--- a/crates/gpu-gates/src/bin/gate_qwen35_media.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen35_media.rs
+@@ -255,7 +255,7 @@
+                     )
+                     .into());
+                 }
+-                if split.value("bloomery.fixture.version").is_none() {
++                if split.value("bloomery.fixture.version").is_some() {
+                     return Err(format!(
+                         "{} is a qwen35moe file that is not the fixture: this gate's qwen35moe seat runs the \
+                          fixture file (the real Qwen3.6 seat retired with its file, its coverage moved to the \

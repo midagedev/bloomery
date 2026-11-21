@@ -1,0 +1,25 @@
+# q35vis2 mutant fx-band
+# clause: the fixture seat's hidden band (gate_qwen35_media.rs, clause_band at the seat's own
+#   multipliers): per prompt and region, ours within max(FX_TWIN x the twin's statistic, FX_K x
+#   C''s), statistic by statistic
+# site: crates/gpu-gates/src/bin/gate_qwen35_media.rs, the fixture seat's FX_TWIN and FX_K (the real seats' 1.3 and 2.0)
+#   collapsed to 0.5: the band falls to a fraction of the twin's own distance and of C''s, and
+#   ours (a small multiple of the twin on the fixture's seeded weights) lands outside it
+# expected red: `just gate-gpu-qwen35moe-media`, the band lines of c1-c3 name FAIL --
+#   "  band c1 image (...): ours ..." then "    band ...  FAIL" -- and the gate exits with
+#   checks failed
+diff --git a/crates/gpu-gates/src/bin/gate_qwen35_media.rs b/crates/gpu-gates/src/bin/gate_qwen35_media.rs
+index cff27db87..9e5babefd 100644
+--- a/crates/gpu-gates/src/bin/gate_qwen35_media.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen35_media.rs
+@@ -139,8 +139,8 @@ mod gate {
+     /// ours/twin` is 1.00-1.10 over the image and post-image regions of c1-c3, under the real seat's 1.3; the
+     /// band's twin term binds wherever `ratios ours/C″` passes 2 (1.90-3.57 on the post-image regions), as on the
+     /// real seat. The real seat's multipliers hold, at a margin of 1.18 on the worst statistic.
+-    const FX_TWIN: f64 = TWIN;
+-    const FX_K: f64 = K;
++    const FX_TWIN: f64 = 0.5;
++    const FX_K: f64 = 0.5;
+ 
+     /// What a seat names: the model file Body35 runs, the oracle families its sets are dumped into, and what its
+     /// sets can close. The recipe's `BLOOMERY_MODEL` picks it: the architecture of the profile's reference file

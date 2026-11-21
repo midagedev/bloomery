@@ -1,0 +1,23 @@
+# q35vis2 mutant fx-ids-restored
+# clause: the dropped exact-ids clause (gate_qwen35_media.rs, Seat::exact_ids): on the fixture
+#   seat S4 ids is dropped with the twin's own first divergence printed in its place, and
+#   Decode::load does not hold the twin-premise
+# site: crates/gpu-gates/src/bin/gate_qwen35_media.rs, the fixture seat's exact_ids turned back
+#   on -- the clause as it was on the real seat, whose premise the fixture's sets cannot hold
+# expected red: `just gate-gpu-qwen35moe-media` fails at Decode::load with "set F's CPU twin
+#   takes other ids than its CUDA run; the ids clause is written for a twin that takes all 32"
+#   (the c2-style near-tie the drop is for; if a re-dumped set's twin happens to take all 32,
+#   the red moves to the "S4 ids: ... differ from set F's at steps [...]  FAIL" line instead)
+diff --git a/crates/gpu-gates/src/bin/gate_qwen35_media.rs b/crates/gpu-gates/src/bin/gate_qwen35_media.rs
+index cff27db87..5dcfd194d 100644
+--- a/crates/gpu-gates/src/bin/gate_qwen35_media.rs
++++ b/crates/gpu-gates/src/bin/gate_qwen35_media.rs
+@@ -220,7 +220,7 @@ mod gate {
+             twin: FX_TWIN,
+             k: FX_K,
+             decode_k: None,
+-            exact_ids: false,
++            exact_ids: true,
+             long: 2,
+             body35_tail: false,
+             open: open_moe,

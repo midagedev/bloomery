@@ -21,6 +21,8 @@
 //!   projector's own image rule needs: V4.1's resize plan and span layout (`deepseek41v::grid`,
 //!   `deepseek41v::span`), its reference `load_image` and its bytes on its card; Clef's size rule
 //!   and pad colour (`size`, `qwen3vl::media`).
+//! * `qwen3vl::fixture` — the synthetic encoder file: the real tensor table of a `qwen3vl_merger`
+//!   projector with seeded values, for an image-input seat whose real mmproj is not kept.
 //!
 //! The reference of V4.1 is deepseek-ai/DeepSeek-V4.1-Flash `inference/image_processor.py` and
 //! `inference/vision.py`, and Pillow's `libImaging/Resample.c` and `ImageOps.py` of the version

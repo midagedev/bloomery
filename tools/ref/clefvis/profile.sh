@@ -8,7 +8,8 @@
 # (`gemma4v` and the encoder), which has a dumper of its own:
 #
 #   qwen35     Clef-Flash         sets ref_clefvis_*             mainline 53ed051ce (the model profile's LCPP)
-#   qwen35moe  Qwen3.6-35B-A3B    sets ref_qwen35moe_vis_*       mainline 36a73916e (QVIS_LCPP)
+#   qwen35moe  Qwen3.6-35B-A3B    sets fx_ref_qwen35moe_vis_*    mainline 36a73916e (QVIS_LCPP), the fixture tier only (the
+#                                 fixture text model + the synthetic mmproj; the real seat retired with its file)
 #   qwen4exp   Qwen3.8-Flash-Next sets ref_qwen4exp_vis_*        mainline 36a73916e (QVIS_LCPP)
 #   glm5next   GLM-5.3-Flash      sets fx_ref_glm5next_vis_*     mainline 36a73916e (QVIS_LCPP), the fixture tier only
 #   minicpmv47 MiniCPM-V 4.7      sets ref_minicpmv47_vis_*      mainline 358a420ec (MC47_LCPP), the tower arm only
@@ -84,16 +85,20 @@ case ${BLOOMERY_MODEL:-} in
     REF=${CLEFVIS_REF:-$DATA/clefvis/ref}
     ;;
   qwen35moe)
-    FAMILY=qvis SETPFX=ref_qwen35moe_vis ORACLE=$QVIS_LCPP BIN=$BINDIR/dump_mtmd_qvis
-    MMPROJ=/models/mmproj/lmstudio-community--Qwen3.6-35B-A3B-GGUF/mmproj-Qwen3.6-35B-A3B-BF16.gguf
-    MMPROJ_SHA256=e5c205cec2fd28f66c3895e4040021ab994b860323c3db8531640305ff49b322
-    TEXT=/data/moved/models/Qwen3.6-35B-A3B/Qwen3.6-35B-A3B-Q4_K_M.gguf
-    PROSE_IDS=$DATA/qwen35moe/corpus-prose.ids
-    PROSE_SHA256=dca5f89b2903f9ffd2f4e20eec18a9fdf3561bcb531a721a114e4fab68e925be
+    # Qwen3.6 on the fixture tier (the seat's real file retired 2026-11-18): the text model is the fixture file itself, read
+    # by mainline as it is (the fixture says qwen35moe, mainline's own spelling, so no respelled copy), and the projector is
+    # the synthetic encoder file (just fixture-mmproj, vision::arch::qwen3vl::fixture), pinned by the sha the fx families of
+    # crates/refset/src/arch/qwen35moe/vis.rs pin. No prose arm: the fixture seat's gate reads no C' set. The ids go to
+    # $DATA/qvis/fx_qwen35moe, beside the real seat's (its sets stay in place until deleted with their families).
+    fixture_dump_tier clefvis.sh
+    [ -n "$SET_PREFIX" ] || { echo "profile.sh: the qwen35moe image-input seat runs on the fixture tier (BLOOMERY_TIER=fixture; just dump-ref-qvis qwen35moe sets it); the real seat retired with its file (exit 66)" >&2; exit 66; }
+    FAMILY=qvis ARMS="hidden bf16rows" SETPFX=${SET_PREFIX}ref_qwen35moe_vis ORACLE=$QVIS_LCPP BIN=$BINDIR/dump_mtmd_qvis
+    MMPROJ=/models/fixtures-mainline/qwen35moe/mmproj-fixture-bf16.gguf
+    MMPROJ_SHA256=8fb7ca9c074a62131187e6641a753b3debcda108397128a73fff0fe962d08ac7
+    TEXT=$MODEL
     CASES=tools/ref/qvis/cases.tsv REQUESTS=tools/ref/qvis/requests.jsonl
-    REF=${QVIS_REF:-$DATA/qvis/qwen35moe}
-    # the 21.2 GB file whole on a 48 GB card; on the 24 GB card with the tower and a 4,096 context the experts of 4 blocks (0.49 GB each) stay on the host
-    NCMOE_A6000=${QVIS_NCMOE_A6000:-0} NCMOE_3090=${QVIS_NCMOE_3090:-4}
+    REF=${QVIS_REF:-$DATA/qvis/${SET_PREFIX}qwen35moe}
+    # the 2.6 GB fixture fits a card whole with the tower and a 4,096 context: no experts stay on the host
     THREADS=16
     ;;
   qwen4exp)

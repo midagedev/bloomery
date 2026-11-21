@@ -53,7 +53,9 @@ HERE=$(cd "$(dirname "$REAL")/../../.." && pwd)
 cd "$HERE"
 if [ "$(basename "${BASH_SOURCE[0]}")" != clefvis_dump ] && [ "${1:-}" != --ids ] && [ "${1:-}" != --cpu-twin ] && [ "${1:-}" != --cpu ]; then
   mkdir -p target/release
-  ln -sf ../../tools/ref/clefvis/clefvis.sh target/release/clefvis_dump
+  # An absolute link: tools/gpu-gate.sh runs a hard-linked copy of it from target/release/.run.<pid>/,
+  # where a relative one no longer reaches the script.
+  ln -sf "$HERE/tools/ref/clefvis/clefvis.sh" target/release/clefvis_dump
   # box.sh's BLOOMERY_CARD=a6000|both names the card; under its 3090 pin the runner takes whichever card is idle
   case "${BLOOMERY_BOX_CARD:-}" in
     a6000 | both) BLOOMERY_GATE_BOUND=${CLEFVIS_BOUND:-1500} bash tools/gpu-gate.sh clefvis_dump "$@" ;;

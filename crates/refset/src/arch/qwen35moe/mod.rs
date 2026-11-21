@@ -62,6 +62,11 @@ pub static FAMILIES: &[&Family] = &[
     &vis::PROSE,
     &vis::BF16ROWS,
     &vis::DECODE,
+    &vis::fx::TAPS,
+    &vis::fx::CHATIDS,
+    &vis::fx::HIDDEN,
+    &vis::fx::BF16ROWS,
+    &vis::fx::DECODE,
 ];
 
 #[cfg(test)]

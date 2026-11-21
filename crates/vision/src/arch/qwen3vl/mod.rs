@@ -8,6 +8,7 @@
 //! order with each patch repeated over the two temporal frames.
 
 pub mod card;
+pub mod fixture;
 pub mod hparams;
 pub mod media;
 pub mod names;

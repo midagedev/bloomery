@@ -11,6 +11,11 @@ name = "vision"
 [lints]
 workspace = true
 
+# The synthetic encoder file's writer (`vision::arch::qwen3vl::fixture`), run as `just fixture-mmproj`.
+[[bin]]
+name = "fixture_mmproj"
+path = "src/bin/fixture_mmproj.rs"
+
 [dependencies]
 bloomery-gguf = { path = "../gguf" }
 # PNG and JPEG decode. Pinned exactly: the preprocessing gate compares against the reference's

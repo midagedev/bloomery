@@ -1,0 +1,20 @@
+# q35vis2 mutant fx-mmproj-sha
+# clause: the fx families' projector pin (crates/refset/src/arch/qwen35moe/vis.rs, fx::PROFILE):
+#   every set of the seat states the mmproj's path and sha256 it was dumped with, and the family
+#   holds the set's lines to the pin
+# site: crates/refset/src/arch/qwen35moe/vis.rs, the fx seat's pinned sha256 off by its last
+#   hex digit, so every dumped set's `# mmproj` line disagrees with the profile
+# expected red: `just gate-gpu-qwen35moe-media` fails at the first ClefvisSet::open with a
+#   Stale naming both lines ("mmproj ... sha256 ..." against "mmproj ... sha256 ...ac8");
+#   `just gate-refset` says the same of every fx_qwen35moe_vis_* set in place
+--- a/crates/refset/src/arch/qwen35moe/vis.rs
++++ b/crates/refset/src/arch/qwen35moe/vis.rs
+@@ -76,7 +76,7 @@
+     // PIN(2026-11-21): `vision::arch::qwen3vl::fixture`'s digest test pins the same bytes from inside the writer;
+     // this is the sha256sum of the file the recipe wrote, equal to the test's pinned file sha256.
+     pub const MMPROJ_BF16_SHA256: &str =
+-        "8fb7ca9c074a62131187e6641a753b3debcda108397128a73fff0fe962d08ac7";
++        "8fb7ca9c074a62131187e6641a753b3debcda108397128a73fff0fe962d08ac8";
+ 
+     /// The seat: the synthetic projector, the text width 2,048 and the image-pad id of the shared
+     /// Qwen vocabulary, on the real file's own fixture.

@@ -4,8 +4,9 @@
 //! prompts of set C (the CUDA runs, their CPU twins and the C″ runs) as the oracle of the positions and the hidden
 //! states. Two seats, one harness, the recipe's `BLOOMERY_MODEL` picking the seat ([`gate::seat_of`]): the
 //! `qwen35` profile's Clef-Flash at bartowski's Q8_0 (`refset::arch::qwen35::clefvis`; `gate-gpu-qwen35-media`) and
-//! the `qwen35moe` profile's Qwen3.6-35B-A3B at lmstudio's Q4_K_M (`refset::arch::qwen35moe::vis`;
-//! `gate-gpu-qwen35moe-media`). Every clause is FAIL-first by a mutant of its own.
+//! the `qwen35moe` profile's seat on the fixture tier (`refset::arch::qwen35moe::vis::fx`;
+//! `gate-gpu-qwen35moe-media`): the qwen35moe fixture file and the oracle sets dumped from it with the synthetic
+//! mmproj. Every clause is FAIL-first by a mutant of its own.
 //!
 //! - (i) injection: each unit's embedding rows as layer 0 reads them (`set_media_tap`): the rows at image
 //!   positions are the widened bf16 rows bit for bit and the text rows equal the same ids' rows of a call with no
@@ -31,22 +32,26 @@
 //! - S8: a step graph captured at load, before any media call, replayed after an image call equals the eager
 //!   step: the table is allocated at open.
 //! - the hidden band of set C: per prompt, the image positions and the text positions after the image apart, the
-//!   median, the 90th percentile and each quarter's median against `max(TWIN × mainline's CPU twin, K × C″)`.
-//!   The prefix before the first image and ours against C″ are printed.
+//!   median, the 90th percentile and each quarter's median against `max(TWIN × mainline's CPU twin, K × C″)` —
+//!   the seat's own multipliers ([`FX_TWIN`] and [`FX_K`] on the fixture seat). The prefix before the first
+//!   image, ours against C″ and the `ratios` line the multipliers are derived from are printed.
 //!
-//! Qwen3.6's seat adds set F, where the seat's family table has it (Clef-Flash has none):
+//! The qwen35moe seat adds set F, where the seat's family table has it (Clef-Flash has none):
 //!
 //! - S2 on set F: after prompt c1's and c2's image calls, our (t, h, w) of each of the 32 decoded rows and the
 //!   rotation-table row the step reads equal the position set F dumped (`n_past`, the position after the token),
 //!   and the first position is its `n_past_start`.
-//! - S4: the first token after the prompt and every step's next token equal set F's ids (mainline's CPU twin
-//!   takes all 32 on both prompts), and each step's `result_norm` is inside `DECODE_K` times the twin's distance
-//!   from mainline's CUDA run per statistic (the median, the 90th percentile and each quarter's median over the
-//!   32 steps), and the steps' logits equal the same ids' through passes of two rows bit for bit (the band is
-//!   coarse: a decode that reads the shared table instead of the sequence's moves a row by a few hundredths, under
-//!   the twin's own distance from mainline). A decode step's hidden is its last layer's output, tapped on the eager
-//!   step and normed on the host.
-//! - S8 (the replayed graph equals the eager step) runs on both seats; Qwen3.6's seat leaves Body35's slot and
+//! - S4: each step's `result_norm` is inside the seat's `DECODE_K` times the twin's distance from mainline's CUDA
+//!   run per statistic (the median, the 90th percentile and each quarter's median over the 32 steps), and the
+//!   steps' logits equal the same ids' through passes of two rows bit for bit (the band is coarse: a decode that
+//!   reads the shared table instead of the sequence's moves a row by a few hundredths, under the twin's own
+//!   distance from mainline). A decode step's hidden is its last layer's output, tapped on the eager step and
+//!   normed on the host. Both clauses run teacher-forced on set F's own ids (the CUDA run's): the state is fed
+//!   `f.ids`, so a near-tie's flip cannot cascade through the steps the band reads.
+//! - S4 ids, the exact-token clause, is the real seats' (Clef-Flash has no set F; the qwen35moe seat dropped it —
+//!   see [`Seat::exact_ids`]): mainline exact-ids coverage of the image decode stays with the headline
+//!   `gate-gpu-qwen38-media`, and the decode path's bit identity with S4 route.
+//! - S8 (the replayed graph equals the eager step) runs on both seats; the qwen35moe seat leaves Body35's slot and
 //!   cache clauses to the dense seat (the code is the backbone's own, which they do not touch).
 //!
 //! The serve prompt cache and slot file are R4a's.
@@ -90,7 +95,7 @@ mod gate {
     use gguf::Split;
     use refset::arch::qwen35::MODEL_FLASH_Q8;
     use refset::arch::qwen35::clefvis as clef;
-    use refset::arch::qwen35moe::{MODEL as MODEL_Q36, vis as q36};
+    use refset::arch::qwen35moe::vis::fx as q36fx;
     use refset::clefvis::{ClefvisSet, EMBD, IMAGE_PAD_ID, Span};
     use refset::family::Family;
     use runtime::swaprule::KeptRows;
@@ -129,13 +134,21 @@ mod gate {
     /// run on both prompts, so ours must take all 32.
     const DECODE_K: f64 = K;
 
+    /// PIN(2026-11-21): the fixture seat's hidden-band multipliers, read from its first run on the fx_ sets
+    /// (the fixture and the synthetic encoder are seeded, so the run is the same bits each time): `ratios
+    /// ours/twin` is 1.00-1.10 over the image and post-image regions of c1-c3, under the real seat's 1.3; the
+    /// band's twin term binds wherever `ratios ours/C″` passes 2 (1.90-3.57 on the post-image regions), as on the
+    /// real seat. The real seat's multipliers hold, at a margin of 1.18 on the worst statistic.
+    const FX_TWIN: f64 = TWIN;
+    const FX_K: f64 = K;
+
     /// What a seat names: the model file Body35 runs, the oracle families its sets are dumped into, and what its
     /// sets can close. The recipe's `BLOOMERY_MODEL` picks it: the architecture of the profile's reference file
     /// ([`seat_of`]).
     struct Seat {
         name: &'static str,
         /// The model file the sets were dumped from; the one the gate loads.
-        path: &'static str,
+        path: String,
         /// The text width: a row of a span, of a set's hidden rows and of the cache.
         width: usize,
         /// The decode flash pass: the tensor-core one when `true` (the pass a qwen35moe load runs; the dense
@@ -148,6 +161,15 @@ mod gate {
         hidden: &'static Family,
         bf16rows: &'static Family,
         decode: Option<&'static Family>,
+        /// The hidden band's multipliers ([`TWIN`], [`K`]) and the decode band's ([`DECODE_K`]): the seat's own.
+        /// A seat whose set F twin leaves the CUDA run's ids holds no decode band (`None`): the twin's rows past
+        /// its first divergence are another sequence's, so they bound nothing.
+        twin: f64,
+        k: f64,
+        decode_k: Option<f64>,
+        /// Whether the seat holds the exact-ids clause of S4 (the premise that set F's CPU twin takes the CUDA
+        /// run's ids, and our ids against them).
+        exact_ids: bool,
         /// The prompt of set C that holds the 517-id text request (a tail under the Wide floor).
         long: usize,
         /// Whether the seat also runs Body35's slot and cache clauses (S3's after-image arm, (v), the call-start
@@ -156,52 +178,95 @@ mod gate {
         open: fn(&Seat, bool) -> Result<Qwen35moeModel, GateError>,
     }
 
-    static CLEF: Seat = Seat {
-        name: "Clef-Flash (Q8_0)",
-        path: MODEL_FLASH_Q8,
-        width: 4096,
-        mma: false,
-        taps: &clef::TAPS,
-        hidden: &clef::HIDDEN,
-        bf16rows: &clef::BF16ROWS,
-        decode: None,
-        long: 0,
-        body35_tail: true,
-        open: open_dense,
-    };
+    /// The dense seat, on the real file.
+    fn clef() -> Seat {
+        Seat {
+            name: "Clef-Flash (Q8_0)",
+            path: MODEL_FLASH_Q8.to_string(),
+            width: 4096,
+            mma: false,
+            taps: &clef::TAPS,
+            hidden: &clef::HIDDEN,
+            bf16rows: &clef::BF16ROWS,
+            decode: None,
+            twin: TWIN,
+            k: K,
+            decode_k: Some(DECODE_K),
+            exact_ids: true,
+            long: 0,
+            body35_tail: true,
+            open: open_dense,
+        }
+    }
 
-    static QWEN36: Seat = Seat {
-        name: "Qwen3.6-35B-A3B (Q4_K_M)",
-        path: MODEL_Q36,
-        width: 2048,
-        mma: true,
-        taps: &q36::TAPS,
-        hidden: &q36::HIDDEN,
-        bf16rows: &q36::BF16ROWS,
-        decode: Some(&q36::DECODE),
-        long: 2,
-        body35_tail: false,
-        open: open_moe,
-    };
+    // PIN(2026-11-21): the qwen35moe seat's exact-ids clause is dropped — the real file left /models (the seat
+    // moved to the fixture), and on the fixture's seeded weights a set's own CPU twin flips at near-ties, so the
+    // ids are unmeasurable there (the same defect the real seat's last set showed): the ids clause's premise
+    // cannot hold, and the clause with it. Exact-ids coverage of the image decode stays with the headline
+    // `gate-gpu-qwen38-media`; this seat keeps the decode path's bit identity (S4 route) and prints the twin's
+    // own first divergence in the ids clause's place. The decode band goes with it: the fixture's twin leaves
+    // the CUDA run's ids at step 0 of both prompts, so its rows bound nothing; the rows a decode step reads are
+    // S2's (bit for bit) and its logits S4 route's.
+    fn qwen36_fixture(path: String) -> Seat {
+        Seat {
+            name: "Qwen3.6-35B-A3B (the fixture)",
+            path,
+            width: 2048,
+            mma: true,
+            taps: &q36fx::TAPS,
+            hidden: &q36fx::HIDDEN,
+            bf16rows: &q36fx::BF16ROWS,
+            decode: Some(&q36fx::DECODE),
+            twin: FX_TWIN,
+            k: FX_K,
+            decode_k: None,
+            exact_ids: false,
+            long: 2,
+            body35_tail: false,
+            open: open_moe,
+        }
+    }
 
     /// The seat of the profile the recipe picked: `$BLOOMERY_REF_MODEL` (the profile's file, `tools/box.sh`
-    /// exports it) is a Qwen3.5 dense body for the `qwen35` profile and a `qwen35moe` file for the `qwen35moe`
-    /// one. Any other architecture is refused by name; so is a `qwen35moe` profile file that is not the file
-    /// the seat's sets were dumped from.
-    fn seat_of(profile_file: &Path) -> Result<&'static Seat, GateError> {
+    /// exports it) is a Qwen3.5 dense body for the `qwen35` profile and a `qwen35moe` fixture file for the
+    /// `qwen35moe` one. Any other architecture is refused by name; so is a `qwen35moe` file that is not the
+    /// fixture (the real Qwen3.6 seat retired with its file), a fixture variant (its sets are named apart) and a
+    /// fixture subset file (the engine must not run one).
+    fn seat_of(profile_file: &Path) -> Result<Seat, GateError> {
         let split = Split::open(profile_file)
             .map_err(|e| format!("open {}: {e}", profile_file.display()))?;
         match split.architecture() {
-            Some(a) if model::arch::is_qwen35_body(a) => Ok(&CLEF),
-            Some("qwen35moe") if profile_file == Path::new(MODEL_Q36) => Ok(&QWEN36),
-            Some("qwen35moe") => Err(format!(
-                "{} is a qwen35moe file, and the seat's sets were dumped from {MODEL_Q36}",
-                profile_file.display()
-            )
-            .into()),
+            Some(a) if model::arch::is_qwen35_body(a) => Ok(clef()),
+            Some("qwen35moe") => {
+                if split.value("bloomery.fixture.variant").is_some() {
+                    return Err(format!(
+                        "{} is a fixture variant: this gate's seat is the base fixture (its sets are the \
+                         fx_ families')",
+                        profile_file.display()
+                    )
+                    .into());
+                }
+                if split.value("bloomery.fixture.subset").is_some() {
+                    return Err(format!(
+                        "{} holds only some of the fixture's tensors: the engine must not run it",
+                        profile_file.display()
+                    )
+                    .into());
+                }
+                if split.value("bloomery.fixture.version").is_none() {
+                    return Err(format!(
+                        "{} is a qwen35moe file that is not the fixture: this gate's qwen35moe seat runs the \
+                         fixture file (the real Qwen3.6 seat retired with its file, its coverage moved to the \
+                         fixture)",
+                        profile_file.display()
+                    )
+                    .into());
+                }
+                Ok(qwen36_fixture(profile_file.display().to_string()))
+            }
             other => Err(format!(
                 "{} is {other:?}: this gate runs the qwen35 profile's Clef-Flash seat and the qwen35moe \
-                 profile's Qwen3.6 seat",
+                 profile's fixture seat",
                 profile_file.display()
             )
             .into()),
@@ -240,7 +305,7 @@ mod gate {
 
     /// The dense seat's load: [`qwen35_open::open_with`], whole on `a`'s card.
     fn open_dense(seat: &Seat, media: bool) -> Result<Qwen35moeModel, GateError> {
-        Ok(qwen35_open::open_with(Path::new(seat.path), CTX, UBATCH, media)?.0)
+        Ok(qwen35_open::open_with(Path::new(&seat.path), CTX, UBATCH, media)?.0)
     }
 
     /// The `qwen35moe` seat's load: whole on `a`'s card when the whole-fit verdict takes it (its line is on
@@ -254,7 +319,7 @@ mod gate {
             kv: KvQ8::F16,
             media,
         };
-        let file = Split::open(seat.path).map_err(|e| format!("open {}: {e}", seat.path))?;
+        let file = Split::open(&seat.path).map_err(|e| format!("open {}: {e}", seat.path))?;
         match q3place::unplaced_qwen35(&file, &o)? {
             Unplaced::Whole(card) => {
                 Ok(Qwen35moeModel::open(Gpu::open_card(card.name, card.device)?, file, o)?)
@@ -612,8 +677,18 @@ mod gate {
         Ok(ok_ii && ok_iii && ok_s1)
     }
 
-    /// The hidden band of one prompt.
-    fn clause_band(c: &Case, ours: &[f32]) -> bool {
+    /// The largest of one statistic set's ratios to another, over the six statistics: the number a band
+    /// multiplier is derived from.
+    fn ratio(over: &Stats, under: &Stats) -> f64 {
+        over.all()
+            .iter()
+            .zip(under.all())
+            .map(|(a, b)| a / b)
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// The hidden band of one prompt, at the seat's multipliers.
+    fn clause_band(seat: &Seat, c: &Case, ours: &[f32]) -> bool {
         let n = c.ids.len();
         let first = c.spans[0].at;
         let last = c.spans.last().map_or(0, |s| s.at + s.len);
@@ -634,9 +709,9 @@ mod gate {
             let e = Stats::of(c.width, &c.c2p, &c.cuda, positions);
             let vs_c2p = Stats::of(c.width, ours, &c.c2p, positions);
             let band = Stats {
-                med: (TWIN * t.med).max(K * e.med),
-                p90: (TWIN * t.p90).max(K * e.p90),
-                q: std::array::from_fn(|i| (TWIN * t.q[i]).max(K * e.q[i])),
+                med: (seat.twin * t.med).max(seat.k * e.med),
+                p90: (seat.twin * t.p90).max(seat.k * e.p90),
+                q: std::array::from_fn(|i| (seat.twin * t.q[i]).max(seat.k * e.q[i])),
             };
             let within = o.all().iter().zip(band.all()).all(|(a, b)| *a <= b);
             println!(
@@ -651,6 +726,11 @@ mod gate {
                 e.show(),
                 vs_c2p.show()
             );
+            println!(
+                "    ratios ours/twin {:.2} ours/C″ {:.2}",
+                ratio(&o, &t),
+                ratio(&o, &e)
+            );
             println!("    band {}  {}", band.show(), verdict(within));
             ok &= within;
         }
@@ -661,6 +741,7 @@ mod gate {
     /// and holds it to the cut call's bits.
     fn run_case(
         m: &mut Qwen35moeModel,
+        seat: &Seat,
         c: &Case,
         plain: &[f32],
         uncut: bool,
@@ -686,7 +767,7 @@ mod gate {
         m.set_media_tap(false)?;
         ok &= clause_i(c, &tap, &text, UBATCH);
         ok &= clause_table(m, c, plain)?;
-        ok &= clause_band(c, &ours);
+        ok &= clause_band(seat, c, &ours);
         if uncut {
             m.set_ubatch(CTX)?;
             m.reset()?;
@@ -1128,11 +1209,16 @@ mod gate {
         /// The position after each step's token, and the position of the first one.
         n_past: Vec<i32>,
         n_past_start: i64,
+        /// The twin's first step that takes another id than the CUDA run, `None` when it takes them all: the
+        /// ids clause's premise, an error on a seat that holds the clause and a printed line on one that does
+        /// not.
+        diverged: Option<usize>,
     }
 
     impl Decode {
         /// Set F of prompt `k` of the seat, held to the same prompt as `c` (its tokens file's digest, its id
-        /// count and its spans) and to the twin taking the same ids as the CUDA run: the ids clause's premise.
+        /// count and its spans). On a seat that holds the ids clause, the twin taking the same ids as the CUDA
+        /// run is that clause's premise and a divergence is an error.
         fn load(seat: &Seat, k: usize, c: &Case) -> Result<Decode, GateError> {
             let fam = seat
                 .decode
@@ -1153,6 +1239,7 @@ mod gate {
                 twin: twin.decode_result_norm()?,
                 n_past: f.decode_n_past()?,
                 n_past_start,
+                diverged: None,
             };
             if d.ids.len() != steps
                 || d.n_past.len() != steps
@@ -1161,14 +1248,19 @@ mod gate {
             {
                 return Err(format!("{}: set F's arrays are not {steps} steps", c.name).into());
             }
-            if twin.decode_ids()? != d.ids {
+            let diverged = twin
+                .decode_ids()?
+                .iter()
+                .zip(&d.ids)
+                .position(|(a, b)| a != b);
+            if seat.exact_ids && diverged.is_some() {
                 return Err(format!(
                     "{}: set F's CPU twin takes other ids than its CUDA run; the ids clause is written for a twin that takes all {steps}",
                     c.name
                 )
                 .into());
             }
-            Ok(d)
+            Ok(Decode { diverged, ..d })
         }
     }
 
@@ -1196,14 +1288,17 @@ mod gate {
         Ok(gain.buf().to_host_vec(gpu.stream())?)
     }
 
-    /// S2 on set F and S4: after prompt `c`'s image call, set F's steps through the decode path. S2: our
-    /// (t, h, w) of each decoded row, and the table row the step reads, equal the position set F dumped
-    /// (`n_past`, the position after the token). S4: the first token and every step's next token equal set F's
-    /// ids, every step's `result_norm` (the last layer's output, tapped on the eager step, normed here) is
-    /// inside `DECODE_K` times the CPU twin's distance from mainline's CUDA run, statistic by statistic, and the
-    /// steps' logits equal the same ids' through passes of two rows bit for bit.
+    /// S2 on set F and S4: after prompt `c`'s image call, set F's steps through the decode path, teacher-forced
+    /// on set F's own ids (the state is fed `f.ids`, the CUDA run's). S2: our (t, h, w) of each decoded row,
+    /// and the table row the step reads, equal the position set F dumped (`n_past`, the position after the
+    /// token). S4: on a seat that holds the ids clause ([`Seat::exact_ids`]), the first token and every step's
+    /// next token equal set F's ids; every step's `result_norm` (the last layer's output, tapped on the eager
+    /// step, normed here) is inside the seat's `DECODE_K` times the CPU twin's distance from mainline's CUDA
+    /// run, statistic by statistic, and the steps' logits equal the same ids' through passes of two rows bit
+    /// for bit.
     fn clause_decode(
         m: &mut Qwen35moeModel,
+        seat: &Seat,
         c: &Case,
         f: &Decode,
         plain: &[f32],
@@ -1229,16 +1324,25 @@ mod gate {
         }
         m.set_layer_taps(false)?;
 
-        let wrong: Vec<usize> = (0..steps)
-            .filter(|&i| next[i] != f.ids.get(i + 1).copied().unwrap_or(next[i]))
-            .collect();
-        let ok_ids = first == f.ids[0] && wrong.is_empty();
-        println!(
-            "  S4 ids: the token after the prompt {first} (set F {}), the {} steps' next tokens differ from set F's at steps {wrong:?}  {}",
-            f.ids[0],
-            steps - 1,
-            verdict(ok_ids)
-        );
+        let mut ok_ids = true;
+        if seat.exact_ids {
+            let wrong: Vec<usize> = (0..steps)
+                .filter(|&i| next[i] != f.ids.get(i + 1).copied().unwrap_or(next[i]))
+                .collect();
+            ok_ids = first == f.ids[0] && wrong.is_empty();
+            println!(
+                "  S4 ids: the token after the prompt {first} (set F {}), the {} steps' next tokens differ from set F's at steps {wrong:?}  {}",
+                f.ids[0],
+                steps - 1,
+                verdict(ok_ids)
+            );
+        } else {
+            println!(
+                "  S4 ids: dropped on this seat (a set's own twin near-tie makes exact ids unmeasurable on \
+                 seeded weights); the twin's own first divergence from the CUDA run at step {:?} of {steps}",
+                f.diverged
+            );
+        }
 
         let saved = m.rope_saved()?;
         let table = m.rope_rows()?;
@@ -1293,15 +1397,24 @@ mod gate {
 
         let all: Vec<usize> = (0..steps).collect();
         let ours = Stats::of(c.width, &rows, &f.rows, &all);
+        let Some(decode_k) = seat.decode_k else {
+            println!(
+                "  S4 band {} decode: not held on this seat (its twin leaves the CUDA run's ids); ours {}",
+                c.name,
+                ours.show()
+            );
+            return Ok(ok_ids && ok_pos && ok_route);
+        };
         let twin = Stats::of(c.width, &f.twin, &f.rows, &all);
         let band = Stats {
-            med: DECODE_K * twin.med,
-            p90: DECODE_K * twin.p90,
-            q: std::array::from_fn(|i| DECODE_K * twin.q[i]),
+            med: decode_k * twin.med,
+            p90: decode_k * twin.p90,
+            q: std::array::from_fn(|i| decode_k * twin.q[i]),
         };
         let within = ours.all().iter().zip(band.all()).all(|(a, b)| *a <= b);
         println!("  S4 band {} decode: ours {}", c.name, ours.show());
         println!("    twin {}", twin.show());
+        println!("    ratios ours/twin {:.2}", ratio(&ours, &twin));
         println!("    band {}  {}", band.show(), verdict(within));
         Ok(ok_ids && ok_pos && ok_route && within)
     }
@@ -1311,17 +1424,17 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[])?;
         let seat = seat_of(&ref_model_path()?)?;
-        let path = Path::new(seat.path);
+        let path = Path::new(&seat.path);
         println!("gate_qwen35_media: {} at {}", seat.name, path.display());
         let eps = check_shape(
-            seat,
+            &seat,
             &Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?,
         )?;
         let tower = ClefvisSet::open(&seat.taps.path(seat.taps.sets[0]), seat.taps)?;
         let cases = [
-            Case::load(seat, 0, "c1", &tower)?,
-            Case::load(seat, 1, "c2", &tower)?,
-            Case::load(seat, 2, "c3", &tower)?,
+            Case::load(&seat, 0, "c1", &tower)?,
+            Case::load(&seat, 1, "c2", &tower)?,
+            Case::load(&seat, 2, "c3", &tower)?,
         ];
         let c1 = &cases[0];
         let reqs = [
@@ -1337,7 +1450,7 @@ mod gate {
         let mut ok = true;
 
         println!("the text load (media: false): references and refusals");
-        let mut text = (seat.open)(seat, false)?;
+        let mut text = (seat.open)(&seat, false)?;
         let plain = text.rope_rows()?;
         let mut refs = Vec::new();
         for r in &reqs {
@@ -1362,12 +1475,15 @@ mod gate {
         drop(text);
 
         println!("the media load (media: true)");
-        let mut m = (seat.open)(seat, true)?;
+        let mut m = (seat.open)(&seat, true)?;
         let nodes = capture_at_load(&mut m, c1)?;
         ok &= clause_text(&mut m, &plain, &reqs, &refs, "fresh")?;
-        println!("(i) (ii) (iii) S1 and the band, per set C prompt (K = {K}, twin x {TWIN})");
+        println!(
+            "(i) (ii) (iii) S1 and the band, per set C prompt (K = {}, twin x {})",
+            seat.k, seat.twin
+        );
         for (i, c) in cases.iter().enumerate() {
-            ok &= run_case(&mut m, c, &plain, i == 1)?;
+            ok &= run_case(&mut m, &seat, c, &plain, i == 1)?;
         }
         ok &= clause_text(
             &mut m,
@@ -1387,11 +1503,14 @@ mod gate {
             ok &= clause_slots(&mut m, c1)?;
         }
         if seat.decode.is_some() {
-            println!("S2 and S4 on set F (K = {DECODE_K} of the twin)");
+            match seat.decode_k {
+                Some(k) => println!("S2 and S4 on set F (K = {k} of the twin)"),
+                None => println!("S2 and S4 on set F (no decode band on this seat)"),
+            }
             let gain = head_gain(&mut m)?;
             for (k, c) in cases.iter().take(2).enumerate() {
-                let f = Decode::load(seat, k, c)?;
-                ok &= clause_decode(&mut m, c, &f, &plain, &gain, eps)?;
+                let f = Decode::load(&seat, k, c)?;
+                ok &= clause_decode(&mut m, &seat, c, &f, &plain, &gain, eps)?;
             }
         }
         if ok { Ok(()) } else { Err(checks_failed()) }

@@ -1,0 +1,23 @@
+# q35vis2 mutant mmproj-table
+# clause: the writer's table is the loader's (crates/vision/src/arch/qwen3vl/fixture.rs, the digest test's
+#   open): the file the writer produces passes Hparams::read and tensors::check, so it cannot
+#   drift from the table the loaders check against
+# site: crates/vision/src/arch/qwen3vl/fixture.rs, the merger's output bias dropped from the written file --
+#   the header still declares its metadata, the file holds 333 tensors
+# expected red: `cargo test -p bloomery-vision --lib fixture::` fails in
+#   the_written_file_opens_and_is_the_pinned_fill at tensors::check with "tensor mm.2.bias: is
+#   missing from the file"
+--- a/crates/vision/src/arch/qwen3vl/fixture.rs
++++ b/crates/vision/src/arch/qwen3vl/fixture.rs
+@@ -378,7 +378,10 @@
+         });
+     }
+     let hp = hparams();
+-    let table = tensors::expected(&hp, EXPORT);
++    let table: Vec<_> = tensors::expected(&hp, EXPORT)
++        .into_iter()
++        .filter(|e| e.name != "mm.2.bias")
++        .collect();
+     let decls: Vec<TensorDecl> = table
+         .iter()
+         .map(|e| TensorDecl {
