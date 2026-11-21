@@ -267,6 +267,14 @@ dispatch=(
   # folder map, layer map and Engram table rows), so the verb only names it.
   # PIN(2026-11-04): added for the ds41-folder verb.
   'crates/model-hf/src/bin/fixture.rs fn ds41_folder'
+  # The fixture CLI's dspark verb: it refuses a target that is not a qwen35moe fixture by name, then names that
+  # family's DSpark set writer (its drafts' taps, widths and mask id are facts of that target).
+  # PIN(2026-11-21): added for the dspark verb.
+  'crates/model-hf/src/bin/fixture.rs fn dspark'
+  # The synthetic encoder CLI: the writer is the qwen3vl tower's own (it writes from the loader's tensor table), so the
+  # bin only names it.
+  # PIN(2026-11-21): added for fixture_mmproj.
+  'crates/vision/src/bin/fixture_mmproj.rs use'
   # 호스트 union 벤치: 파일의 아키텍처가 qwen4exp 일 때만 qwen35moe 의 Hparams·텐서 이름·host::layers 로 routed 층을 연다.
   'crates/model/src/bin/bench_v41_host.rs use'
   # 오라클 표의 디스패치: for_arch 가 Arch 를 그 아키텍처의 표로 잇는다.

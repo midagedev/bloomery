@@ -1385,11 +1385,15 @@ build-mc47-lcpp:
 
 # Qwen3.6 / Qwen3.8 / GLM-5.3-Flash image input, the oracle's binary: dump_mtmd linked against that tree's libmtmd and libllama-common, with its chat mode (tools/ref/clefvis/build-clefvis.sh). One binary, $BLOOMERY_DATA/bin/dump_mtmd_qvis, serves all three seats; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another directory for a test.
 build-qvis-ref:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
+    BLOOMERY_TIER=fixture BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/clefvis/build-clefvis.sh'
 
-# Qwen3.6 (MODEL qwen35moe) or Qwen3.8 (qwen4exp) image input, the oracle sets (tools/ref/clefvis/clefvis.sh, tools/ref/qvis/cases.tsv): the tower's output end (ref_<arch>_vis_taps), hidden states of three chat prompts (…_hidden_c*, with the prose control …_prose_c* and the bf16-rows control …_bf16rows_c*) and 32 greedy decode steps after two of them (…_decode_c*) into $BLOOMERY_DATA; SETS names base sets, `--cpu-twin` writes the CPU twins (<set>.cpu) and `--ids` the chat ids of every request by llama-server's own path (…_chatids_*, both without a card). The card runs go through the card's gate lock (CLEFVIS_BOUND is the whole call's bound); no lease.
+# Qwen3.6 (MODEL qwen35moe, the fixture tier: the seat's real file retired 2026-11-18, so its sets are the fixture's, fx_ref_qwen35moe_vis_*, dumped from the fixture text model and the synthetic mmproj; the real qwen35moe_vis_* sets are still in place for refset-check until they are deleted with their families) or Qwen3.8 (qwen4exp, the real tier) image input, the oracle sets (tools/ref/clefvis/clefvis.sh, tools/ref/qvis/cases.tsv): the tower's output end (<pfx>_taps), hidden states of three chat prompts (…_hidden_c*, with the prose control …_prose_c* — Qwen3.8 only, the fixture seat's gate reads none — and the bf16-rows control …_bf16rows_c*) and 32 greedy decode steps after two of them (…_decode_c*) into $BLOOMERY_DATA; SETS names base sets, `--cpu-twin` writes the CPU twins (<set>.cpu) and `--ids` the chat ids of every request by llama-server's own path (…_chatids_*, both without a card). The card runs go through the card's gate lock (CLEFVIS_BOUND is the whole call's bound); no lease.
 dump-ref-qvis MODEL *ARGS:
-    case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_CARD=$card BLOOMERY_MODEL={{MODEL}} ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
+    tier=real; if [ {{MODEL}} = qwen35moe ]; then tier=fixture; fi; case " {{ARGS}} " in *" --ids "*|*" --cpu-twin "*) card=3090 ;; *) card=${BLOOMERY_CARD:-a6000} ;; esac; BLOOMERY_TIER=$tier BLOOMERY_CARD=$card BLOOMERY_MODEL={{MODEL}} ./tools/box.sh 'bash tools/ref/clefvis/clefvis.sh {{ARGS}}'
+
+# The synthetic qwen3vl encoder file of the Qwen3.6 image-input seat's fixture tier (vision::arch::qwen3vl::fixture): the loader's own header and tensor table with seeded values, 334 tensors at the qwen35moe fixture's width 2,048, written to /models/fixtures-mainline/qwen35moe (ARGS: another --out path, --seed N). The bytes are a function of the seed alone, and the digest test of `cargo test -p bloomery-vision` pins them; the closing line's sha256 is what the seat's fx families and tools/ref/clefvis/profile.sh pin. Plain cargo (the vision crate links no device code); no card, no lease.
+fixture-mmproj *ARGS:
+    ./tools/box.sh 'cargo build --release -p bloomery-vision --bin fixture_mmproj && mkdir -p /models/fixtures-mainline/qwen35moe && target/release/fixture_mmproj /models/fixtures-mainline/qwen35moe/mmproj-fixture-bf16.gguf {{ARGS}}'
 
 # MiniCPM-V 4.7 image input, the oracle's binary: dump_mtmd (tower, hidden and chat arms) linked against the 358a420e tree's libmtmd and libllama-common (tools/ref/clefvis/build-clefvis.sh, the minicpmv47 row of tools/ref/clefvis/profile.sh) into $BLOOMERY_DATA/bin/dump_mtmd_mc47; CLEFVIS_OUT=<dir> (in BLOOMERY_BOX_ENV) builds into another directory for a test.
 build-mc47-ref:
@@ -2021,21 +2025,28 @@ gate-gpu-qwen35moe-verify:
 gate-gpu-qwen35moe-mtp:
     BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/needs-env.sh gate-gpu-qwen35moe-mtp BLOOMERY_MTP_MODEL && Q38=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen38d.sh) && test -n "$Q38" && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen35moe_mtp && BLOOMERY_MTP_DENSE_MODEL=${BLOOMERY_MTP_DENSE_MODEL:-$Q38} BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35moe_mtp'
 
-# The qwen3 serve seat's served drafts: BLOOMERY_DRAFT=dspark on Qwen3.6, on its two fine-tunes (Sage-A1.5 and
-# Ornith-1.5, which the RedHat draft fits by their shapes, not by their names) and on MiniCPM-V 4.7 (its
-# full-vocabulary draft, borrowing the target's Q6_K head and embedding rows), each target greedy with and
-# without the draft on the same prompt, the chat surface under the draft, BLOOMERY_DRAFT=lookup on Qwen3.6,
-# and the cross-target, placed, --parallel 2 and qwen3moe refusals. Real files only (the drafts and every
-# target). The card is the A6000: the DSpark draft's load holds the whole target on it, and Qwen3.6's
-# 29 GB does not fit the 24 GB card (the seat then refuses the draft by name).
+# The qwen3 serve seat's served drafts: BLOOMERY_DRAFT=dspark on the target BLOOMERY_REF_MODEL names (the
+# qwen35moe fixture in the fixture tier), on the renamed copy of it (a file whose general.name differs: a
+# draft fits a target by its shapes, not by its name) and with the full-vocabulary synthetic draft
+# (borrowing the target's Q6_K head and embedding rows), each target greedy with and without the draft on
+# the same prompt, the chat surface under the draft, BLOOMERY_DRAFT=lookup on the target, and the
+# cross-target (the mismatched draft), placed, --parallel 2 and qwen3moe refusals. The drafts, the renamed
+# copy and the qwen3moe file are the fixture tier's (`fixture dspark` writes the drafts and the copy beside
+# the qwen35moe fixture's shards; the real drafts and fine-tunes are gone). No card pin: a fixture's
+# whole-card load and its draft fit any card the box holds.
+# The card budget the fixture tier exports is unset: every arm plans under the budget it names itself.
 gate-gpu-qwen3-dspark:
-    BLOOMERY_MODEL=qwen35moe BLOOMERY_CARD=a6000 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-dspark && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_dspark && D=target/qwen3-dspark-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && MINI=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/minicpmv47.sh) && test -n "$MINI" && Q30=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen3moe.sh) && test -n "$Q30" && bash tools/gpu-gate.sh gate_qwen3_dspark --qwen "$Q36" --qwen-draft /models/Qwen3.6-35B-A3B/dspark-redhat --sage /models/Sage-A1.5/Sage-A1.5-Q4_K_M.gguf --ornith /models/Ornith-1.5-35B-A3B/Ornith-1.5-35B-Q4_K_M.gguf --minicpm "$MINI" --minicpm-draft /models/MiniCPM-V-4.7-35B-A3B/dspark --qwen3moe "$Q30" --dir $D'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_dspark && D=target/qwen3-dspark-gate && rm -rf $D && mkdir -p $D && unset BLOOMERY_CARD_BUDGET && bash tools/gpu-gate.sh gate_qwen3_dspark --dir $D'
 
-# Qwen3.6-35B-A3B's DSpark draft, RedHatAI's speculator (an HF directory on the box, `--draft DIR` names another): the dense layers on the card against a host f64 computation of the same layers from the file's bf16
-# weights (a block of 8 rows over 3 and over 2,100 context rows, the window 2,048), the captured pass replaying to the
-# eager bits, and the loader's card bytes. Real file only (the draft belongs to the Q4_K_M target); the gate lock.
+# A Qwen3.6 DSpark draft (an HF directory; `--draft DIR` names another, else $BLOOMERY_DSPARK_MODEL, else the
+# reduced synthetic draft beside the target): the dense layers on the card against a host f64 computation of
+# the same layers from the file's bf16 weights (a block of 8 rows over 3 and over 2,100 context rows, the
+# window 2,048), the captured pass replaying to the eager bits, the loader's card bytes, the lossless run
+# (the drafted ids are the plain run's), the production taps against the eager instrument's layer outputs,
+# and the proposed ids through the file's id map. The draft is the fixture tier's (`fixture dspark` writes
+# it beside the qwen35moe fixture's shards); the gate lock.
 gate-gpu-qwen35-dspark:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35-dspark && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,dspark-hf --release --bin gate_qwen35_dspark && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dspark'
+    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,dspark-hf --release --bin gate_qwen35_dspark && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_dspark'
 
 # The same bin on the MiniCPM-V 4.7 35B-A3B text model (a qwen35moe file with its own vocabulary and a declared, stripped next-token
 # layer; profile minicpmv47). ik refuses the file as it is and no ik set was dumped from it, so the gate takes its text path: the
@@ -2099,16 +2110,20 @@ gate-gpu-llama-serve:
 gate-gpu-qwen35-media:
     BLOOMERY_MODEL=qwen35 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35-media && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
 
-# The same bin on the qwen35moe profile's seat: Body35's image rows on Qwen3.6-35B-A3B at lmstudio's Q4_K_M (21.2 GB, whole
-# on one card, refused by name when the whole-fit verdict does not take it) against the qwen35moe-vis sets (mainline's mtmd on
-# the same file): set B's tower rows as the spans' rows; set C's three prompts, their CPU twins and the C'' runs for the unit
-# rows, set C's positions against ours and the rotation table they gather, the text request on the media load against the text
-# load's, a step graph captured at load and replayed after an image call, and the hidden band per region; set F's two decodes
-# (32 greedy steps after c1 and c2): the positions the steps read against F's n_past, the ids, each step's hidden against F's
-# band, and the steps' logits against the same ids through passes of two rows. Not repeated here: Body35's slot and cache
-# clauses (the dense seat closes them). Real file only; the gate lock.
+# The same bin on the qwen35moe profile's seat, the fixture tier (the real Qwen3.6 seat retired 2026-11-18: the file left
+# /models and the verification policy moved its coverage to fixtures): Body35's image rows on the qwen35moe fixture (the
+# four-layer cut, whole on one card, refused by name when the whole-fit verdict does not take it) against the fx_ seat's
+# oracle sets (mainline's mtmd on the same fixture text model and the synthetic mmproj, `just dump-ref-qvis qwen35moe`):
+# set B's tower rows as the spans' rows; set C's three prompts, their CPU twins and the C'' runs for the unit rows, set C's
+# positions against ours and the rotation table they gather, the text request on the media load against the text load's, a
+# step graph captured at load and replayed after an image call, and the hidden band per region (the real seats'
+# multipliers); set F's two decodes (32 greedy steps after c1 and c2): the positions and table rows the steps read against
+# F's n_past, and the steps' logits against the same ids through passes of two rows. The exact ids and the decode band are
+# the real seats' clauses: the fixture's own CPU twin leaves the CUDA run's ids at step 0, so neither is measurable on
+# seeded weights (the gate prints the twin's first divergence instead). Not repeated here: Body35's slot and cache clauses (the dense seat closes them). The gate lock.
+# The card budget the fixture tier exports is unset: the seat loads the fixture whole on one card.
 gate-gpu-qwen35moe-media:
-    BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen35moe-media && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
+    BLOOMERY_TIER=fixture BLOOMERY_MODEL=qwen35moe ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-qwen35moe-media && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features vision --release --bin gate_qwen35_media && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen35_media'
 
 # Qwen3.8's image input (gate_qwen38_media's doc): Body38's media call on the ubatch walk (`enable_media`, the media load's
 # own rotation table) on the UD-Q4_K_XL file, its routed experts on the card's id prefix and the host beyond it, against
@@ -2471,6 +2486,33 @@ gate-gpu-muse-router:
 [group('pool')]
 gate-gpu-qwen3moe-e2e:
     BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3moe-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e'
+
+# The qwen3moe e2e gate's (y) arm alone (`gate_qwen3moe_e2e --q5-only`, the gate's header): the Q5_K
+# launch families — attention q/k/o and v, the token embedding, the routed gate·up and down — on the
+# fixture variant q3q5k (tools/fixture-variants.tsv: the qwen3moe fixture requantized to the Qwen3-Coder
+# Q5_K_M map the real file of the arm was). The census, the derived node pins, graph = eager, the pass
+# prefill = the one-token path, the GEMM prefill under the margin floor and the placed split with its
+# host tier. Fixture-only (the real file is gone): the plain fixture's item declares the no-layout-layer
+# deferral, and the real tier has no run of it; the item env names the tag:
+# gate-gpu-qwen3moe-q5@BLOOMERY_FIXTURE_VARIANT=q3q5k.
+# The card budget the fixture tier exports is unset: every arm plans under the budget it names itself.
+[group('pool')]
+gate-gpu-qwen3moe-q5:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-qwen3moe-q5 && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e --q5-only'
+
+# The qwen3moe e2e gate's (z) arm alone (`gate_qwen3moe_e2e --common-only`): the common card leg on
+# every layer whose three routed stacks are one type the FFN dispatch's own launches do not run, on the
+# fixture variants q3q80 and q3q6k (tools/fixture-variants.tsv: the qwen3moe fixture's stacks at the
+# Qwen3-30B-A3B-Instruct-2507 Q8_0 and Q6_K one-type maps the real files of the clause were). The
+# host-only and the split placed load, the planner's counted scratch, the host slots the card served and
+# the pass and wide prefills against the host-only load's. Fixture-only (the real files are gone): the
+# plain fixture's Q4_K stacks the dispatch runs, so its item declares the no-layout-layer deferral and
+# the real tier has no run of it; the items name their tags:
+# gate-gpu-qwen3moe-common@BLOOMERY_FIXTURE_VARIANT=q3q80 | q3q6k.
+# The card budget the fixture tier exports is unset: every arm plans under the budget it names itself.
+[group('pool')]
+gate-gpu-qwen3moe-common:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-qwen3moe-common && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_qwen3moe_e2e && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3moe_e2e --common-only'
 
 # qwen3moe routed types under the --place-unset defaults: for every type the host's routed kernels run, a crafted
 # two-layer header planned by the CLI's and the serve seat's defaults. A refusal, or card experts of a type the card
@@ -3643,19 +3685,35 @@ gate-gpu-qwen38-nodes-remote:
 gate-gpu-qwen38-serve:
     BLOOMERY_MODEL=qwen4exp ./tools/box.sh 'export BLOOMERY_GATE_V41_LOAD=1 && . tools/ref/ref-paths.sh && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features deepseek41,gemma-embedding2,hf --release --bin bloomery-serve-qwen38 --bin gate_qwen38_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/q38-serve-gate && rm -rf $D && mkdir -p $D && T="The capital of France is" && I=$REF_TOKENS && echo "prompt: $T" && echo "ids: $I" && bash tools/gpu-gate.sh generate_qwen3moe --place gate --tokens "$I" -n 16 > $D/gen.log && bash tools/gpu-gate.sh gate_qwen38_serve --arm plain --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/plain && bash tools/gpu-gate.sh gate_qwen38_serve --arm drafted --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/drafted && bash tools/gpu-gate.sh gate_qwen38_serve --arm lookup --gen $D/gen.log --prompt "$T" --ids "$I" --dir $D/lookup'
 
-# The qwen3 seat of bloomery-serve (--model qwen3 -m <file>) against generate_qwen3moe, on the qwen3moe profile's file
-# (Qwen3-30B-A3B, the MODEL box.sh exports under BLOOMERY_MODEL=qwen3moe), the qwen35moe profile's (Qwen3.6-35B-A3B,
-# that profile's default MODEL, read from tools/ref/models/qwen35moe.sh) and the qwen38d profile's (the dense Qwen3.8-27B,
-# read from tools/ref/models/qwen38d.sh): per file, one server, then one CLI, one process
-# at a time under one gate-lock hold. The server's /completion of a chat turn rendered by its own template (past the
+# The qwen3 seat of bloomery-serve (--model qwen3 -m <file>) against generate_qwen3moe, on one file a
+# family: the qwen3moe profile's own (the MODEL box.sh exports under BLOOMERY_MODEL=qwen3moe), the
+# qwen35moe profile's and the qwen38d profile's, each the tier's — tools/ref/ref-paths.sh resolves each
+# under its own profile in a subshell (box.sh's qwen3moe exports unset first, so every family resolves
+# its own), the real files in the real tier and the families' fixtures in the fixture tier. The dense
+# qwen38d seat runs in the real tier only: its fixture is a checkpoint folder, and every server this
+# gate starts takes the GGUF the gate reads, which a cut has only as a prepare twin with no fixture key
+# (the fixture fence refuses it): per file, one server, then one CLI, one process at a time under
+# one gate-lock hold. The server's /completion of a chat turn rendered by its own template (past the
 # eight ids a pass takes) gives generate_qwen3moe --tokens <those ids> -n 64 --last-step's ids, and its
-# /v1/chat/completions of the same turn is those ids (gate_qwen3_serve's header has the clauses). Logs in
-# target/qwen3-serve-gate/<n>/. The build takes glm5next: bloomery-serve links every seat's device bundle. --images adds
-# the image clauses (the `vision` build, the family's bf16 projector and the oracle sets of ref_qwen35moe_vis_chatids_* and
-# _decode_*): the qwen3moe file's --mmproj refusal and, on the Qwen3.6 file, the seat with its encoder.
+# /v1/chat/completions of the same turn is those ids (gate_qwen3_serve's header has the clauses). Logs
+# in target/qwen3-serve-gate/<n>/. The build takes glm5next: bloomery-serve links every seat's device
+# bundle. The fixture tier defers the two clauses whose premise is a real file's size (a 12 GB card it
+# does not fit) and searches the placed arms' split budget (the gate's placed_budget); --images is
+# gate-gpu-qwen3-serve-images, the real tier's own recipe (the vision oracle sets have no fixture).
+# The card budget the fixture tier exports is unset: every arm plans under the budget it names itself.
 [group('pool')]
 gate-gpu-qwen3-serve:
-    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen35moe.sh) && test -n "$Q36" && Q38D=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen38d.sh) && test -n "$Q38D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --model "$Q38D" --dir $D --images'
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin generate_qwen3moe && D=target/qwen3-serve-gate && rm -rf $D && mkdir -p $D && Q36=$( (unset BLOOMERY_REF_MODEL BLOOMERY_REF_MODEL_PROFILE; BLOOMERY_MODEL=qwen35moe . ./tools/ref/ref-paths.sh && printf %s "$MODEL") ) && test -n "$Q36" && DENSE=; if [ "${BLOOMERY_TIER:-real}" = real ]; then Q38D=$(sed -n "s/^MODEL=\${BLOOMERY_REF_MODEL:-\(.*\)}$/\1/p" tools/ref/models/qwen38d.sh) && test -n "$Q38D" && DENSE="--model $Q38D"; fi && unset BLOOMERY_CARD_BUDGET && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" $DENSE --dir $D'
+
+# The qwen3 serve gate's image clauses alone (gate_qwen3_serve --only-images, the gate's header): the
+# qwen35moe file's encoder under --mmproj against the oracle sets of refset::arch::qwen35moe::vis —
+# llama.cpp mainline's mtmd on the same model file and the family's bf16 projector, which have no
+# fixture — and the qwen3moe file's --mmproj refusal. Real-only: the same three real files the serve
+# gate's real tier takes, read from the profiles by the same subshell; the fixture tier defers the
+# recipe by name and the vision coverage stays this recipe's one run.
+[group('pool')]
+gate-gpu-qwen3-serve-images:
+    BLOOMERY_MODEL=qwen3moe ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-qwen3-serve-images && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_qwen3_serve && D=target/qwen3-serve-images-gate && rm -rf $D && mkdir -p $D && Q36=$( (unset BLOOMERY_REF_MODEL BLOOMERY_REF_MODEL_PROFILE; BLOOMERY_MODEL=qwen35moe . ./tools/ref/ref-paths.sh && printf %s "$MODEL") ) && test -n "$Q36" && Q38D=$( (unset BLOOMERY_REF_MODEL BLOOMERY_REF_MODEL_PROFILE; BLOOMERY_MODEL=qwen38d . ./tools/ref/ref-paths.sh && printf %s "$MODEL") ) && test -n "$Q38D" && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_qwen3_serve --model "$BLOOMERY_REF_MODEL" --model "$Q36" --model "$Q38D" --dir $D --only-images'
 
 # bloomery-serve-qwen38 on the box, for a person to attach a client to (toktape records from it): the A6000 by
 # default (SERVE_PLACE=gate for the 3090), in local mode the cards in view, the port 8080 unless SERVE_PORT, a

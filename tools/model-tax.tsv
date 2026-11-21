@@ -73,7 +73,6 @@ crates/gpu-gates/src/bin/generate.rs	qwen	1	baseline T 1: case-table rows, the g
 crates/gpu-gates/src/bin/h2d_probe.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/probe_nvread.rs	qwen	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/shared/dense_e2e.rs	qwen	15	PIN(2026-10-26) qwen: the dense e2e gate both Body35 dense families share opens the body through qwen35_open and names its model type Qwen35moeModel; a program-named body type and open path would remove them
-crates/gpu-gates/src/bin/shared/dspark_hf.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/routed_legs.rs	deepseek	8	baseline P 9: MK2 program by body
@@ -181,6 +180,7 @@ crates/serve/src/dsml.rs	qwen	15	PIN(2026-10-19) qwen: MK7 tool format and reaso
 crates/serve/src/lib.rs	glm	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/lib.rs	qwen	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/lib.rs	deepseek	1	PIN(2026-10-21) deepseek: MK9/MK7 seat and tool-format data: `pub mod v41`, V4.1's official prompt encoding, beside glmxml and qwenxml (#595)
+crates/vision/src/bin/fixture_mmproj.rs	qwen	1	PIN(2026-11-21) qwen: the synthetic encoder CLI writes the one tower that has a fixture (qwen3vl, for the qwen35moe fixture's image seat) and names its module; a second tower's fixture would take a projector-type argument dispatching to each tower's own fixture module
 crates/vision/src/media.rs	minicpm	1	baseline D 1: media design: VideoRule data per tower (vidcore)
 crates/gpu-gates/src/bin/gate_radio_tower.rs	clef	4	PIN(2026-10-20) clef: the image sets' reader every tower gate shares is still named after Clef (refset::clefvis)
 crates/gpu-gates/src/bin/gate_radio_tower.rs	nemotron	5	PIN(2026-10-20) nemotron: the RADIO tower is Bolt's mmproj; the gate bin names its model until the tower gates take the model from a profile row
