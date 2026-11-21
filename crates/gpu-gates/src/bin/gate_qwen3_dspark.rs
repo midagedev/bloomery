@@ -1,12 +1,13 @@
-//! GPU gate for the qwen3 seat's served drafts: a qwen35moe target held whole
-//! on the card with a DSpark draft beside it, for a reduced-vocabulary draft
-//! (RedHatAI's Qwen3.6 speculator, its own head and table) and a full-vocabulary
-//! one (MiniCPM-V 4.7's, borrowing the target's Q6_K `output.weight` in place and its
+//! GPU gate for the qwen3 seat's served drafts: the target `BLOOMERY_REF_MODEL` names (the
+//! qwen35moe fixture in the fixture tier, whose `dspark/` directory holds the synthetic drafts
+//! `fixture dspark` writes) held whole on the card with a DSpark draft beside it, for the
+//! reduced-vocabulary synthetic draft (its own head and table, the speculator's shape), the
+//! same draft beside the renamed copy of the target (`renamed/`, a file whose `general.name`
+//! differs: a draft fits a target by its shapes, not by its name), and the full-vocabulary
+//! synthetic draft (borrowing the target's Q6_K `output.weight` in place and its
 //! `token_embd.weight` rows), and the n-gram lookup draft on the same target.
 //!
-//!     gate_qwen3_dspark --qwen <gguf> --qwen-draft <dir> --sage <gguf> \
-//!         --ornith <gguf> --minicpm <gguf> --minicpm-draft <dir> \
-//!         --qwen3moe <gguf> --dir <dir>
+//!     gate_qwen3_dspark --dir <dir>
 //!
 //! For each DSpark case, one server with no draft and one with it, both greedy
 //! from the same prompt, hold:
@@ -25,21 +26,27 @@
 //!   template's rendered ids with the same completion the drafted server's `/completion`
 //!   gives, its usage counts and its text inside the ids' text;
 //!
-//! then the lookup draft on the qwen3.6 file: one server with the lookup and one without,
+//! then the lookup draft on the target: one server with the lookup and one without,
 //! the lookup's ids are the plain run's (`ids_are_the_plain_ids`) and `/props` names the
 //! lookup as the draft the seat serves (`lookup_is_served`), and a prompt that repeats
 //! a phrase gets proposals from it (`lookup_proposes`: `timings.draft_n` above 0, so a
-//! seat that names the lookup and steps plain does not pass); then the refusals,
+//! seat that names the lookup and steps plain does not pass; file-bound: a fixture's
+//! random-weight target repeats no n-gram of its own, so the real tier runs it, and the
+//! headline seat's `lookup_{i}_verifies_proposals` in `gate_qwen38_serve` pins the same
+//! path); then the refusals,
 //! each named on the server's stderr:
 //!
-//! - `cross_target_is_refused`: each of the two base targets with the other case's draft
-//!   exits before listening, its line naming the draft's ids beside the target's;
-//! - `placed_load_is_refused`: `--place a` under `BLOOMERY_CARD_BUDGET=12G` exits before
-//!   listening with the whole-card sentence;
+//! - `cross_target_is_refused`: the mismatched synthetic draft (`dspark/mismatched`, whose
+//!   stated vocabulary falls one id short of the target's) exits before listening, its line
+//!   naming the draft's ids beside the target's — the same refusal a draft trained for
+//!   another target meets, on files the box still holds;
+//! - `placed_load_is_refused`: `--place a` at [`PLACED_CTX`] under the smallest card budget
+//!   the planner keeps half the routed experts on the card at (the other half on the host)
+//!   exits before listening with the whole-card sentence;
 //! - `parallel_two_is_refused`: `--parallel 2` exits before listening with the one-slot
 //!   sentence;
-//! - `qwen3moe_lookup_is_refused`: a qwen3moe file with the lookup draft exits before
-//!   listening, naming the body's own reason;
+//! - `qwen3moe_lookup_is_refused`: a qwen3moe file (the family's fixture) with the lookup
+//!   draft exits before listening, naming the body's own reason;
 //! - `qwen3moe_dspark_is_refused`: a qwen3moe file with the DSpark draft exits before
 //!   listening, naming the family the DSpark draft serves.
 //!
@@ -54,21 +61,35 @@ fn main() -> std::process::ExitCode {
 #[path = "shared/dspark_hf.rs"]
 #[allow(
     dead_code,
-    reason = "the serve seat and every draft gate share this reader; this gate reads the shape only"
+    reason = "the serve seat and every draft gate share this reader; this gate reads the draft directory only"
 )]
 mod dspark_hf;
+
+#[cfg(feature = "deepseek41")]
+#[path = "shared/qwen3moe_place.rs"]
+#[allow(
+    dead_code,
+    reason = "the placed refusal reads the planner's expert budget only"
+)]
+mod q3place;
 
 #[cfg(feature = "deepseek41")]
 mod gate {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
+    use bloomery_gpu::arch::qwen3moe::Open35;
+    use bloomery_gpu::arch::qwen3moe::ubatch::ubatch_size;
+    use bloomery_gpu::kv_format::KvQ8;
+    use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::record;
     use bloomery_gpu_gates::serve_client::{
         Served, chat_is_those_ids, check, completion, curl, greedy, ids_of, json_of, rendered,
         serve_cmd, server_log, tokenized, utf8,
     };
-    use bloomery_gpu_gates::{GateError, checks_failed};
+    use bloomery_gpu_gates::tier::{self, Tag, Tier};
+    use bloomery_gpu_gates::{GateError, checks_failed, model_arch, ref_model_path};
+    use gguf::Split;
     use serde_json::json;
 
     /// The prompt every arm is fed.
@@ -78,13 +99,46 @@ mod gate {
         "one two three four five one two three four five one two three four five one two";
     /// The ids compared and the tokens the any-draft arms decode.
     const N: usize = 16;
+
+    /// The context the placed refusal's load is planned at.
+    const PLACED_CTX: usize = 4096;
+
+    /// The smallest card budget the placed planner keeps half of `model`'s routed experts on the
+    /// card at, [`PLACED_CTX`] positions in one slot: a split load, the other half on the host,
+    /// where the draft's verifying load cannot follow.
+    fn half_placed_budget(model: &Path) -> Result<u64, GateError> {
+        let split = Split::open(model).map_err(|e| format!("open {}: {e}", model.display()))?;
+        let read = |suffix: &str| {
+            split
+                .arch_get_u64(suffix)
+                .ok_or_else(|| format!("{}: no {}", model.display(), split.arch_key(suffix)))
+        };
+        let want = read("block_count")? * read("expert_count")? / 2;
+        let o = Open35 {
+            ctx: PLACED_CTX,
+            mma: true,
+            ubatch: ubatch_size()?,
+            kv: KvQ8::F16,
+            media: false,
+        };
+        let q = crate::q3place::PlaceQ3::qwen35(&split, Place::parse("cuda0")?, o)?;
+        let ceiling = 2 * std::fs::metadata(model)?.len();
+        let budget = q.budget_for_card_experts(PLACED_CTX, want, ceiling)?;
+        println!(
+            "placed budget on {}: {budget} B keeps {want} routed experts on the card",
+            model.display()
+        );
+        Ok(budget)
+    }
+
     /// How long a server gets to listen or to refuse, and the poll's gap.
     const WAIT: Duration = Duration::from_secs(300);
     const POLL: Duration = Duration::from_millis(100);
 
     /// The draft a case's second server serves.
     enum Arm {
-        /// The DSpark draft in this directory (`$BLOOMERY_DSPARK_MODEL`).
+        /// The DSpark draft in this directory, handed to the server as
+        /// `BLOOMERY_DSPARK_MODEL`.
         Dspark(PathBuf),
         /// The n-gram lookup draft: no file, no weights.
         Lookup,
@@ -97,70 +151,84 @@ mod gate {
         draft: PathBuf,
     }
 
-    fn arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<PathBuf, GateError> {
-        args.next()
-            .map(PathBuf::from)
-            .ok_or_else(|| format!("{flag} needs a path").into())
-    }
-
-    fn parse_args() -> Result<(Vec<Case>, PathBuf, PathBuf), GateError> {
-        let mut qwen = None;
-        let mut qwen_draft = None;
-        let mut sage = None;
-        let mut ornith = None;
-        let mut minicpm = None;
-        let mut minicpm_draft = None;
-        let mut qwen3moe = None;
-        let mut dir = None;
-        let mut args = std::env::args().skip(1);
-        while let Some(flag) = args.next() {
-            match flag.as_str() {
-                "--qwen" => qwen = Some(arg(&mut args, "--qwen")?),
-                "--qwen-draft" => qwen_draft = Some(arg(&mut args, "--qwen-draft")?),
-                "--sage" => sage = Some(arg(&mut args, "--sage")?),
-                "--ornith" => ornith = Some(arg(&mut args, "--ornith")?),
-                "--minicpm" => minicpm = Some(arg(&mut args, "--minicpm")?),
-                "--minicpm-draft" => minicpm_draft = Some(arg(&mut args, "--minicpm-draft")?),
-                "--qwen3moe" => qwen3moe = Some(arg(&mut args, "--qwen3moe")?),
-                "--dir" => dir = Some(arg(&mut args, "--dir")?),
-                other => return Err(format!("unknown argument {other:?}").into()),
+    /// The gate's files: the target `BLOOMERY_REF_MODEL` names, the drafts of its `dspark/`
+    /// directory (the one `$BLOOMERY_DSPARK_MODEL` names, else the reduced one) and the
+    /// renamed copy beside it, and the qwen3moe fixture. Under the fixture tier the target is
+    /// held to a whole fixture by [`ref_model_path`], the renamed copy by [`model_arch`], and
+    /// each draft and the copy is refused by name when `fixture dspark` has not written it.
+    fn files() -> Result<(Vec<Case>, PathBuf, PathBuf, PathBuf), GateError> {
+        let target = ref_model_path()?;
+        let beside = |name: &str| target.parent().unwrap_or(Path::new(".")).join(name);
+        // The reduced draft honors a caller's BLOOMERY_DSPARK_MODEL; its siblings and the
+        // renamed copy are the fixture's own, beside the target's shards.
+        let reduced = crate::dspark_hf::dir_or(|| Ok(beside(model::fixture::dspark::REDUCED_DIR)))?;
+        let full = beside(model::fixture::dspark::FULL_DIR);
+        let mismatched = beside(model::fixture::dspark::MISMATCHED_DIR);
+        let renamed = beside(model::fixture::dspark::RENAMED_DIR).join(
+            target
+                .file_name()
+                .ok_or_else(|| format!("{} names no file", target.display()))?,
+        );
+        for (what, dir) in [("reduced draft", &reduced), ("full draft", &full)] {
+            for name in ["config.json", "model.safetensors"] {
+                if !dir.join(name).is_file() {
+                    return Err(format!(
+                        "the {what} {} holds no {name}: `fixture dspark <fixture first shard>` \
+                         writes it beside the fixture's shards",
+                        dir.display()
+                    )
+                    .into());
+                }
             }
         }
-        let usage = "usage: gate_qwen3_dspark --qwen <gguf> --qwen-draft <dir> --sage <gguf> \
-                     --ornith <gguf> --minicpm <gguf> --minicpm-draft <dir> \
-                     --qwen3moe <gguf> --dir <dir>";
-        let redhat = qwen_draft.ok_or(usage)?;
-        // The RedHat draft fits a target by its facts, not by the file's name: the
-        // two fine-tunes below carry Qwen3.6's shapes, so they take it too.
+        if !mismatched.join("config.json").is_file()
+            || !mismatched.join("model.safetensors").is_file()
+        {
+            return Err(format!(
+                "the mismatched draft {} holds no HF draft; `fixture dspark <fixture first \
+                 shard>` writes it beside the fixture's shards",
+                mismatched.display()
+            )
+            .into());
+        }
+        if !renamed.is_file() {
+            return Err(format!(
+                "the renamed target copy {} is not there; `fixture dspark <fixture first shard>` \
+                 writes it beside the fixture's shards",
+                renamed.display()
+            )
+            .into());
+        }
+        if Tier::from_env()? == Tier::Fixture {
+            model_arch(Tier::Fixture, &renamed)?;
+        }
+        let qwen3moe = PathBuf::from(refset::fixture::first_shard("qwen3moe")?);
         let cases = vec![
             Case {
-                name: "qwen3.6",
-                model: qwen.ok_or(usage)?,
-                draft: redhat.clone(),
+                name: "target",
+                model: target.clone(),
+                draft: reduced.clone(),
             },
             Case {
-                name: "sage",
-                model: sage.ok_or(usage)?,
-                draft: redhat.clone(),
+                name: "renamed",
+                model: renamed,
+                draft: reduced.clone(),
             },
             Case {
-                name: "ornith",
-                model: ornith.ok_or(usage)?,
-                draft: redhat,
-            },
-            Case {
-                name: "minicpm",
-                model: minicpm.ok_or(usage)?,
-                draft: minicpm_draft.ok_or(usage)?,
+                name: "full",
+                model: target,
+                draft: full,
             },
         ];
-        Ok((cases, qwen3moe.ok_or(usage)?, dir.ok_or(usage)?))
+        Ok((cases, mismatched, qwen3moe, reduced))
     }
 
     /// The server of one arm: the seat's model and the draft the arm serves,
     /// the run's own directory, the extra arguments and the extra environment.
     /// The one setup every arm of this gate uses, so the plain and the drafted
-    /// server differ by the draft alone.
+    /// server differ by the draft alone. The whole-card seat refuses a card
+    /// budget, which the fixture tier's box command exports for the gates that
+    /// plan a fixture, so no arm inherits one; the placed arm sets its own.
     fn spawn(
         case: &Case,
         arm: Option<&Arm>,
@@ -171,7 +239,8 @@ mod gate {
         std::fs::create_dir_all(run)?;
         let mut cmd = serve_cmd()?;
         cmd.env_remove("BLOOMERY_DRAFT")
-            .env_remove("BLOOMERY_DSPARK_MODEL");
+            .env_remove("BLOOMERY_DSPARK_MODEL")
+            .env_remove(bloomery_levers::CARD_BUDGET);
         match arm {
             Some(Arm::Dspark(dir)) => {
                 cmd.env("BLOOMERY_DRAFT", "dspark");
@@ -187,7 +256,7 @@ mod gate {
             "--model",
             "qwen3",
             "-m",
-            utf8(&case.model)?,
+            &utf8(&case.model)?,
             "--port",
             "0",
             "--parallel",
@@ -271,14 +340,18 @@ mod gate {
                     "lookup_is_served",
                     props["engine"]["draft"]["kind"].as_str() == Some("lookup"),
                 );
-                let repeats = completion(&url, &tokenized(&url, REPEATS)?, N, false)?;
-                check(
-                    ok,
-                    "lookup_proposes",
-                    repeats["timings"]["draft_n"]
-                        .as_u64()
-                        .is_some_and(|n| n > 0),
-                );
+                // The lookup proposes only where the text repeats an n-gram of its own: a
+                // fixture's random-weight target writes none, so the file answers it.
+                if tier::run_clause("lookup_proposes", Tag::FileBound)? {
+                    let repeats = completion(&url, &tokenized(&url, REPEATS)?, N, false)?;
+                    check(
+                        ok,
+                        "lookup_proposes",
+                        repeats["timings"]["draft_n"]
+                            .as_u64()
+                            .is_some_and(|n| n > 0),
+                    );
+                }
             }
             None => {}
         }
@@ -288,8 +361,19 @@ mod gate {
 
     pub fn run() -> Result<(), GateError> {
         bloomery_levers::at_main(&[bloomery_gpu::arch::qwen3moe::ubatch::UBATCH_ENV])?;
-        let (cases, qwen3moe, root) = parse_args()?;
+        let mut args = std::env::args().skip(1);
+        let mut root = None;
+        while let Some(flag) = args.next() {
+            match flag.as_str() {
+                "--dir" => {
+                    root = Some(args.next().map(PathBuf::from).ok_or("--dir needs a path")?);
+                }
+                other => return Err(format!("unknown argument {other:?}").into()),
+            }
+        }
+        let root = root.ok_or("usage: gate_qwen3_dspark --dir <dir>")?;
         std::fs::create_dir_all(&root)?;
+        let (cases, mismatched, qwen3moe_file, reduced) = files()?;
         let mut ok = true;
         let mut plains = Vec::new();
         for case in &cases {
@@ -304,30 +388,37 @@ mod gate {
             check(&mut ok, "ids_are_the_plain_ids", drafted == plain);
             plains.push(plain);
         }
-        // The lookup draft on the qwen3.6 file: the same target, the other draft.
+        // The lookup draft on the target: the same target, the other draft.
         let qwen = &cases[0];
         let lookup = one(qwen, &root, Some(&Arm::Lookup), "lookup", &mut ok)?;
         check(&mut ok, "ids_are_the_plain_ids", lookup == plains[0]);
-        for (case, wrong) in [(&cases[0], &cases[3]), (&cases[3], &cases[0])] {
-            let text = refusal(
-                case,
-                Some(&Arm::Dspark(wrong.draft.clone())),
-                &root.join(format!("{}-cross", case.name)),
-                &[],
-                &[],
-            )?;
-            check(
-                &mut ok,
-                "cross_target_is_refused",
-                hint(&text, "ids; the target holds"),
-            );
-        }
+        // The mismatched draft beside the target: the ids line of a draft written for another
+        // vocabulary, refused before any weight is read.
+        let wrong = Case {
+            name: "mismatched",
+            model: qwen.model.clone(),
+            draft: mismatched,
+        };
+        let text = refusal(
+            &wrong,
+            Some(&Arm::Dspark(wrong.draft.clone())),
+            &root.join("mismatched"),
+            &[],
+            &[],
+        )?;
+        check(
+            &mut ok,
+            "cross_target_is_refused",
+            hint(&text, "ids; the target holds"),
+        );
+        let budget = half_placed_budget(&qwen.model)?.to_string();
+        let placed_ctx = PLACED_CTX.to_string();
         let placed = refusal(
             qwen,
-            Some(&Arm::Dspark(qwen.draft.clone())),
+            Some(&Arm::Dspark(reduced.clone())),
             &root.join("placed"),
-            &["--place", "a"],
-            &[("BLOOMERY_CARD_BUDGET", "12G")],
+            &["--place", "a", "--ctx", &placed_ctx],
+            &[(bloomery_levers::CARD_BUDGET, &budget)],
         )?;
         check(
             &mut ok,
@@ -336,7 +427,7 @@ mod gate {
         );
         let parallel = refusal(
             qwen,
-            Some(&Arm::Dspark(qwen.draft.clone())),
+            Some(&Arm::Dspark(reduced.clone())),
             &root.join("parallel"),
             &["--parallel", "2"],
             &[],
@@ -350,7 +441,7 @@ mod gate {
         // one, and the DSpark draft serves a qwen35moe file.
         let qwen3moe = Case {
             name: "qwen3moe",
-            model: qwen3moe,
+            model: qwen3moe_file,
             draft: PathBuf::new(),
         };
         let lookup_refused = refusal(
@@ -367,7 +458,7 @@ mod gate {
         );
         let dspark_refused = refusal(
             &qwen3moe,
-            Some(&Arm::Dspark(cases[0].draft.clone())),
+            Some(&Arm::Dspark(reduced)),
             &root.join("qwen3moe-dspark"),
             &[],
             &[],

@@ -1,0 +1,17 @@
+# dsparkfx draft_is_loaded, the full-vocabulary case (gate-gpu-qwen3-dspark): the seat reads a
+# full-vocabulary draft as a reduced one, so it hands the loader no borrowed head and the
+# drafted server refuses before listening instead of printing its load_draft record.
+# Expected red:
+#   gate_qwen3_dspark: error: full-draft: <addr wait error>, the server's stderr holding:
+#   BLOOMERY_DRAFT=dspark: dspark_hf: a draft over the target's own 248320 ids borrows the
+#   target's head, which the seat holds; this loader opens drafts with their own lm_head
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs
+@@ -921,6 +921,6 @@
+         // The draft's own shape first: a draft over the target's own ids borrows the target's
+         // head in place, a reduced one carries its own head and reads the target's not at all.
+         let borrows_head = matches!(
+             dspark_hf::shape(dir, &dspark_hf::HfFile::open(dir)?)?.vocab,
+-            runtime::dspark::DraftVocab::Full { .. }
++            runtime::dspark::DraftVocab::Reduced { .. }
+         );

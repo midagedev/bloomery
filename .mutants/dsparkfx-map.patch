@@ -1,0 +1,23 @@
+# dsparkfx clause 3 (gate_qwen35_dspark --only 3): the loader's parse of the id map swaps
+# two entries, so the engine's map is no longer the file's raw d2t applied.
+# Expected red:
+#   clause 3: the engine's map sends draft id 100 to 1400, the file's d2t says 700 FAIL
+#   clause 3: the engine's map is the file's d2t over 32000 entries of 248320 target ids FAIL
+# (the second arm, the proposed ids mapping their head's rows, stays green or red as the
+# swapped rows fall; the first arm compares every entry, so the swap is always caught.)
+--- a/crates/hf/src/dspark.rs
++++ b/crates/hf/src/dspark.rs
+@@ -293,11 +293,12 @@
+-        let to_target = d2t
++        let mut to_target = d2t
+             .iter()
+             .enumerate()
+             .map(|(d, &off)| {
+                 let value = d as i64 + off;
+                 u32::try_from(value).map_err(|_| Error::MapValue { index: d, value })
+             })
+             .collect::<Result<Vec<u32>, Error>>()?;
++        to_target.swap(100, 200);
+         DraftVocab::Reduced {
+             to_target,
+             n_target,

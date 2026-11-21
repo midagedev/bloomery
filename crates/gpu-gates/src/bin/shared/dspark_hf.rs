@@ -431,6 +431,19 @@ fn card_bytes_of(
     Ok(layers + fc + head + markov + map + conf + norms)
 }
 
+/// `BLOOMERY_DSPARK_MODEL` when it is set and not empty, else the directory `beside` names: the
+/// draft a gate reads when its caller names none.
+#[allow(
+    dead_code,
+    reason = "the draft gates read it; the serve seat reads the variable through dir_from_env"
+)]
+pub fn dir_or(beside: impl FnOnce() -> Result<PathBuf, GateError>) -> Result<PathBuf, GateError> {
+    match std::env::var_os("BLOOMERY_DSPARK_MODEL") {
+        Some(p) if !p.is_empty() => Ok(PathBuf::from(p)),
+        _ => beside(),
+    }
+}
+
 /// `BLOOMERY_DSPARK_MODEL` as a full-vocabulary draft's HF directory: `config.json` and
 /// `model.safetensors` beside each other. Refused by name when unset or not a directory.
 #[allow(
@@ -459,9 +472,4 @@ pub fn dir_from_env() -> Result<PathBuf, GateError> {
         }
     }
     Ok(dir)
-}
-
-/// The directory the RedHat speculator is read from on the box.
-pub fn default_dir() -> PathBuf {
-    PathBuf::from("/models/Qwen3.6-35B-A3B/dspark-redhat")
 }

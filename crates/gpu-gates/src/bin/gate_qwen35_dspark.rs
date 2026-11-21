@@ -1,7 +1,9 @@
-//! GPU gate for Qwen3.6's DSpark draft (RedHatAI's speculator, an HF directory of `config.json` and
-//! `model.safetensors`).
+//! GPU gate for a Qwen3.6 DSpark draft (a speculator, an HF directory of `config.json` and
+//! `model.safetensors`): the synthetic draft fixture `fixture dspark` writes beside the
+//! qwen35moe fixture (the reduced-vocabulary draft, its own head, table and id map), beside
+//! whatever target `BLOOMERY_REF_MODEL` names.
 //!
-//! 0. The dense layers, model-less: the real draft's layers on the card against a host f64
+//! 0. The dense layers, model-less: the draft's layers on the card against a host f64
 //!    computation of the same layers from the file's bf16 weights (no numpy, no card). A block of 8
 //!    rows over a ring of `R` context rows, `R` = 3 and `R` = 2100 (past the window of 2048, the
 //!    ring wrapped; the reference reads the last 2048 context rows only), under the file's mask (the
@@ -14,19 +16,28 @@
 //!    captures at load). After one stage call the replay is allowed.
 //!
 //! 1. Lossless. Greedy from one fixed prompt, the first 64 ids of
-//!    `$BLOOMERY_DATA/qwen35moe/corpus-prose.ids` (Qwen3.6's own vocabulary). The draft run's first
-//!    256 decoded ids equal a plain `Qwen35moeModel::open` of the same file with no draft. The line
-//!    is `ids identical 256`, or the first index where the two runs differ.
+//!    `$BLOOMERY_DATA/qwen35moe/corpus-prose.ids` (the target's own vocabulary, the fixture's
+//!    the real file's). The draft run's first 256 decoded ids equal a plain `Qwen35moeModel::open`
+//!    of the same file with no draft. The line is `ids identical 256`, or the first index where the
+//!    two runs differ.
 //!
-//! 2. Acceptance floor, over the first 512 ids of that file as the prompt walk, decoding 128 tokens
-//!    at proposal width 7. E is the committed tokens per verify pass, and the clause holds at
-//!    E ≥ 2.0. RedHat's card reports the acceptance its training reached; a port that misreads the
-//!    taps, the map or the mask falls near E ≈ 1.
+//! 2. The rows the draft reads are the target's named layers' rows. The seat arms the production
+//!    taps (the buffer every walk of the target lays the tapped layers' entering rows in) when the
+//!    draft's prompt call runs; the eager instrument keeps every layer's *output* residual of a
+//!    step. The tap of layer `L` is the row entering it — the output of `L − 1` — so each
+//!    production tap row equals the instrument's row of the layer below it, bit for bit. No tap
+//!    names layer 0: its entering row is the embedding row, of which the instrument holds no twin.
 //!
-//!     gate_qwen35_dspark [--draft <dir>] [--only 0|1|2]...
+//! 3. The ids the draft proposes pass through the file's id map. The engine's own map (the parsed
+//!    `d2t`) is the file's raw offsets applied — every entry, read by the gate straight from the
+//!    tensor, not through the loader's parse — and a proposal of the opened draft maps its head's
+//!    rows through that same map: the ids `propose_as` writes equal the gate's own `d + d2t[d]` of
+//!    the head's raw rows.
 //!
-//! `--draft` defaults to the box's copy. With no `--only`, every clause runs; each `--only` selects
-//! one clause.
+//!     gate_qwen35_dspark [--draft <dir>] [--only 0|1|2|3]...
+//!
+//! `--draft` defaults to `$BLOOMERY_DSPARK_MODEL`, else the `dspark/reduced` directory beside the
+//! target. With no `--only`, every clause runs; each `--only` selects one clause.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -62,12 +73,14 @@ mod gate {
     use bloomery_gpu::weights::q8_0_planes;
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::rounding::U;
-    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, prose_ids, verdict};
+    use bloomery_gpu_gates::{
+        GateError, bits_equal, checks_failed, prose_ids, ref_model_path, verdict,
+    };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
     use gguf::quant::{f32_to_f16_bits, half_to_f32};
+    use model::fixture::dspark::REDUCED_DIR;
     use model::quant::quantize_q8_0;
-    use refset::arch::qwen35moe::MODEL;
     use runtime::dspark::DraftVocab;
     use runtime::{Advance, Draft, Speculative, Target, Verify};
 
@@ -98,20 +111,19 @@ mod gate {
     const PROMPT_FIXED: usize = 64;
     /// Clause 1 compares this many decoded ids.
     const DECODE_LOSSLESS: usize = 256;
-    /// Clause 2's prompt, the first ids of the same file.
-    const PROSE: usize = 512;
-    /// Clause 2 decodes this many tokens with the draft.
-    const DECODE_FLOOR: usize = 128;
-    /// Clause 2's proposal width. The target verifies 8 rows, so a draft proposes 7.
+    /// Clause 2 and 3's proposal width. The target verifies 8 rows, so a draft proposes 7.
     const PROPOSAL: usize = 7;
     /// A verify of the proposal: the token already at the target's position, then the 7 drafted ids.
     const VERIFY_ROWS: usize = PROPOSAL + 1;
-    /// Clause 2 holds when the committed tokens per verify pass reach this.
-    const FLOOR: f64 = 2.0;
-    /// The target's context: a 512-id prompt plus the decoded tokens and one verify of 8 rows.
+    /// The target's context: a 64-id prompt plus the decoded tokens and one verify of 8 rows.
     const TARGET_CTX: usize = 768;
     /// The prompt call's ubatch, the same one the verifying gate opens with.
     const UBATCH: usize = 64;
+    /// Clause 3's seeded tapped row: one row of the draft's feature width, any values (the
+    /// clause reads no weight's value).
+    const MAP_SEED: u64 = 0xd2_7a_4b_9f_11;
+    /// Clause 3's anchor token, the token at the proposal's committed position.
+    const MAP_ANCHOR: u32 = 1000;
 
     type Seat = Session<Body35>;
     type Spark = CardDspark<DenseLayers>;
@@ -802,11 +814,19 @@ mod gate {
         Ok(ok)
     }
 
-    /// A plain or verifying load of the Qwen3.6 file, whole card, context [`TARGET_CTX`].
+    /// A plain or verifying load of the target `BLOOMERY_REF_MODEL` names, whole card, context
+    /// [`TARGET_CTX`]. Under `BLOOMERY_TIER=fixture` the path is the family's fixture, held to
+    /// a whole fixture by [`ref_model_path`].
     fn open_seat(verifying: bool) -> Result<Seat, GateError> {
-        let file = Split::open(MODEL).map_err(|e| format!("open {MODEL}: {e}"))?;
+        let path = ref_model_path()?;
+        let file = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
         if file.architecture() != Some("qwen35moe") {
-            return Err(format!("{MODEL} is {:?}, not qwen35moe", file.architecture()).into());
+            return Err(format!(
+                "{} is {:?}, not qwen35moe",
+                path.display(),
+                file.architecture()
+            )
+            .into());
         }
         let o = Open35 {
             ctx: TARGET_CTX,
@@ -844,8 +864,8 @@ mod gate {
         let width = shape.width(verify_rows);
         if width != PROPOSAL {
             return Err(format!(
-                "clause 2 asks for a proposal of {PROPOSAL}; this file's block {} (row 0 drafts \
-                 {}) proposes {width} against a verify of {verify_rows} rows",
+                "the clauses ask for a proposal of {PROPOSAL}; this file's block {} (row 0 \
+                 drafts {}) proposes {width} against a verify of {verify_rows} rows",
                 shape.block, shape.row0_drafts
             )
             .into());
@@ -870,22 +890,12 @@ mod gate {
         Ok(seat.with_draft::<Spark, VERIFY_ROWS>(card, &mut Quiet)?)
     }
 
-    /// Committed tokens of clause 2, and how often draft slot `k` (1-based) was kept.
-    struct Accept {
-        passes: usize,
-        kept: usize,
-        /// `slot[k - 1]` counts the passes that kept draft slot `k`.
-        slot: [usize; PROPOSAL],
-    }
-
     /// `n` drafted ids from `prompt`. A pass may run past `n`; the caller reads the first `n`.
-    /// With `acc`, every pass is a proposal of [`PROPOSAL`] ids or the run stops by name.
     fn draft_n(
         spec: &mut Spec,
         seat: &mut Seat,
         prompt: &[u32],
         n: usize,
-        mut acc: Option<&mut Accept>,
     ) -> Result<Vec<u32>, GateError> {
         seat.reset()?;
         let first = Advance::prompt(spec, seat, prompt)?;
@@ -898,22 +908,6 @@ mod gate {
             let appended = tokens.len() - before;
             if appended != c.kept {
                 return Err(format!("a pass kept {} and appended {appended}", c.kept).into());
-            }
-            if let Some(acc) = acc.as_mut() {
-                if !c.proposed || c.rows != VERIFY_ROWS {
-                    return Err(format!(
-                        "clause 2 is a proposal of {PROPOSAL}: a pass proposed {} over {} rows",
-                        c.proposed, c.rows
-                    )
-                    .into());
-                }
-                acc.passes += 1;
-                acc.kept += c.kept;
-                for k in 1..=PROPOSAL {
-                    if c.kept > k {
-                        acc.slot[k - 1] += 1;
-                    }
-                }
             }
         }
         spec.draft_mut().check_fault()?;
@@ -952,74 +946,170 @@ mod gate {
         }
     }
 
-    /// Clause 2's line. No verify pass is a named error, not an E of 0. `decoded` is the run's
-    /// ids, prompt argmax included; E is over the verify passes only.
-    fn floor_line(acc: &Accept, decoded: usize) -> Result<bool, GateError> {
-        if acc.passes == 0 {
-            return Err("clause 2: no verify pass".into());
-        }
-        let e = acc.kept as f64 / acc.passes as f64;
-        let ok = e >= FLOOR;
-        let slots = (0..PROPOSAL)
-            .map(|k| format!("{}:{}", k + 1, acc.slot[k]))
-            .collect::<Vec<_>>()
-            .join(" ");
-        println!(
-            "clause 2: E={e:.3} over {} verify passes, {} committed tokens, {decoded} decoded; \
-             accept {slots} (floor {FLOOR}) {}",
-            acc.passes,
-            acc.kept,
-            verdict(ok)
-        );
-        Ok(ok)
-    }
-
-    /// Clauses 1 and 2. The plain load is dropped before the verifying load.
-    fn target(dir: &Path, c1: bool, c2: bool) -> Result<bool, GateError> {
-        let mut ok = true;
+    /// Clause 1. The plain load is dropped before the verifying load.
+    fn lossless(dir: &Path) -> Result<bool, GateError> {
         let fixed = prose_ids("qwen35moe", PROMPT_FIXED)?;
-        let plain = if c1 {
-            let mut seat = open_seat(false)?;
-            let (ids, _) = greedy(&mut seat, &fixed, DECODE_LOSSLESS, false)?;
-            drop(seat);
-            Some(ids)
-        } else {
-            None
-        };
-        let prose = if c2 {
-            prose_ids("qwen35moe", PROSE)?
-        } else {
-            Vec::new()
-        };
+        let mut plain_seat = open_seat(false)?;
+        let (plain, _) = greedy(&mut plain_seat, &fixed, DECODE_LOSSLESS, false)?;
+        drop(plain_seat);
         let mut seat = open_seat(true)?;
         let mut spec = attach(&mut seat, dir)?;
-        if let Some(plain) = plain {
-            let drafted = draft_n(&mut spec, &mut seat, &fixed, DECODE_LOSSLESS, None)?;
-            ok &= same_prefix(&plain, &drafted, DECODE_LOSSLESS)?;
+        let drafted = draft_n(&mut spec, &mut seat, &fixed, DECODE_LOSSLESS)?;
+        same_prefix(&plain, &drafted, DECODE_LOSSLESS)
+    }
+
+    /// Clause 2: the rows the draft reads are the target's named layers' entering rows. The
+    /// draft's prompt call arms the production taps and feeds its rows; one plain eager step
+    /// then lays both the production taps (the entering rows) and the instrument's copies (the
+    /// outputs), and each tap row equals the layer below's output residual, bit for bit.
+    fn taps(dir: &Path) -> Result<bool, GateError> {
+        let shape = dspark_hf::shape(dir, &dspark_hf::HfFile::open(dir)?)?;
+        if shape.taps.first().is_some_and(|&t| t == 0) {
+            return Err(
+                "clause 2 reads taps of layers past the first: a first-layer tap's entering row \
+                 is the embedding row, of which the instrument holds no twin"
+                    .into(),
+            );
         }
-        if c2 {
-            let mut acc = Accept {
-                passes: 0,
-                kept: 0,
-                slot: [0; PROPOSAL],
-            };
-            let drafted = draft_n(&mut spec, &mut seat, &prose, DECODE_FLOOR, Some(&mut acc))?;
-            if drafted.len() < DECODE_FLOOR {
-                return Err(format!(
-                    "clause 2 decoded {} ids, {DECODE_FLOOR} asked for",
-                    drafted.len()
+        let prompt = prose_ids("qwen35moe", PROMPT_FIXED)?;
+        let mut seat = open_seat(true)?;
+        let mut spec = attach(&mut seat, dir)?;
+        let first = Advance::prompt(&mut spec, &mut seat, &prompt)?;
+        Advance::begin(&mut spec, &seat, &prompt, first)?;
+        let m = seat.model_mut();
+        m.set_layer_taps(true)?;
+        m.step(&[first])?; // the step's walk lays both the taps and the instrument's copies
+        let outputs = m.layer_taps()?;
+        let rows = m.draft_taps(1)?;
+        let h = shape.hidden;
+        let mut ok = true;
+        for (k, &tap) in shape.taps.iter().enumerate() {
+            let got = rows.get(k * h..(k + 1) * h).ok_or_else(|| {
+                format!(
+                    "clause 2: the production taps hold {} rows of {h} values, tap {k} past them",
+                    rows.len() / h
                 )
-                .into());
-            }
-            ok &= floor_line(&acc, drafted.len())?;
+            })?;
+            let want = outputs.get(tap - 1).ok_or_else(|| {
+                format!(
+                    "clause 2: the instrument holds {} layers' outputs, tap {tap} reads layer {}",
+                    outputs.len(),
+                    tap - 1
+                )
+            })?;
+            let same = got
+                .iter()
+                .zip(want)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            println!(
+                "clause 2: tap {tap} is the row entering it, layer {}'s output residual, {} {} \
+                 values",
+                tap - 1,
+                got.len(),
+                verdict(same)
+            );
+            ok &= same;
         }
         Ok(ok)
     }
 
-    /// `--draft <dir>` (else the box's copy) and `--only 0|1|2`, repeatable. No `--only` runs all.
-    fn parse_args() -> Result<(PathBuf, [bool; 3]), GateError> {
-        let mut dir = dspark_hf::default_dir();
-        let mut only = [false; 3];
+    /// Clause 3: the ids the draft proposes pass through the file's id map. The engine's map —
+    /// the parsed `d2t` — is the file's raw offsets applied, every entry, read by the gate
+    /// straight from the tensor; and a proposal of the opened draft maps its head's raw rows
+    /// through that same map, the ids `propose_as` writes equal to the gate's own `d + d2t[d]`.
+    fn id_map(dir: &Path) -> Result<bool, GateError> {
+        let gpu = Gpu::new()?;
+        let file = dspark_hf::HfFile::open(dir)?;
+        let shape = dspark_hf::shape(dir, &file)?;
+        let DraftVocab::Reduced {
+            to_target,
+            n_target,
+        } = &shape.vocab
+        else {
+            return Err(format!(
+                "clause 3 reads a reduced-vocabulary draft (its own id map); {} scores the \
+                 target's own ids",
+                dir.display()
+            )
+            .into());
+        };
+        let d2t = file.st().i64s("d2t")?;
+        if d2t.len() != to_target.len() {
+            return Err(format!(
+                "clause 3: the file holds {} d2t offsets for a head of {} rows",
+                d2t.len(),
+                to_target.len()
+            )
+            .into());
+        }
+        // The file's own map, computed here from the raw tensor: `target = d + d2t[d]`.
+        let of_file = |d: usize| d as i64 + d2t[d];
+        let entries = to_target.len();
+        let mapped = match (0..entries).find(|&d| i64::from(to_target[d]) != of_file(d)) {
+            None => true,
+            Some(d) => {
+                println!(
+                    "clause 3: the engine's map sends draft id {d} to {}, the file's d2t says {} \
+                     {}",
+                    to_target[d],
+                    of_file(d),
+                    verdict(false)
+                );
+                false
+            }
+        };
+
+        // The proposal: the draft opened alone, one seeded tapped row, then one block whose ids
+        // the gate reads raw (the head's argmax rows) and mapped (what `propose_as` wrote).
+        let Parts {
+            shape,
+            layers,
+            fc,
+            head,
+            embed,
+        } = dspark_hf::open(&gpu, dir, CTX)?;
+        let width = shape.width(VERIFY_ROWS);
+        let m = shape.rows(width);
+        let mut body = DsparkBody::new(&gpu, &shape, layers, fc, head, embed)?;
+        let mut rng = Normals(MAP_SEED);
+        let row: Vec<f32> = (0..shape.taps.len() * shape.hidden)
+            .map(|_| rng.normal() as f32)
+            .collect();
+        body.append_as(&gpu, 0, &row)?;
+        let mut out = vec![0u32; width];
+        let n = body.propose_as(&gpu, 1, MAP_ANCHOR, width, &mut out, &mut [])?;
+        if n != width {
+            return Err(format!("clause 3: the draft proposed {n} ids, {width} asked for").into());
+        }
+        let raw = body.head().tokens(gpu.stream(), m)?;
+        let first = shape.first_row();
+        let through = out
+            .iter()
+            .zip(&raw[first..first + width])
+            .all(|(&mapped, &d)| i64::from(mapped) == of_file(d as usize));
+        println!(
+            "clause 3: the engine's map is the file's d2t over {entries} entries of {} target ids \
+             {}; {width} proposed ids map their head's rows {}",
+            n_target,
+            verdict(mapped),
+            verdict(through)
+        );
+        if let Some(fault) = gpu.fault()? {
+            return Err(format!("the card raised {fault:?}").into());
+        }
+        Ok(mapped && through)
+    }
+
+    /// `--draft <dir>` (else `$BLOOMERY_DSPARK_MODEL`, else the reduced draft beside the
+    /// target) and `--only 0|1|2|3`, repeatable. No `--only` runs all.
+    fn parse_args() -> Result<(PathBuf, [bool; 4]), GateError> {
+        let mut dir = dspark_hf::dir_or(|| {
+            Ok(ref_model_path()?
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(REDUCED_DIR))
+        })?;
+        let mut only = [false; 4];
         let mut named = false;
         let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
@@ -1030,11 +1120,11 @@ mod gate {
                 "--only" => {
                     let n: usize = args
                         .next()
-                        .ok_or("--only needs 0, 1 or 2")?
+                        .ok_or("--only needs 0, 1, 2 or 3")?
                         .parse()
-                        .map_err(|_| -> GateError { "--only needs 0, 1 or 2".into() })?;
-                    if n > 2 {
-                        return Err(format!("--only {n}: clauses are 0, 1 and 2").into());
+                        .map_err(|_| -> GateError { "--only needs 0, 1, 2 or 3".into() })?;
+                    if n > 3 {
+                        return Err(format!("--only {n}: clauses are 0, 1, 2 and 3").into());
                     }
                     only[n] = true;
                     named = true;
@@ -1043,7 +1133,7 @@ mod gate {
             }
         }
         if !named {
-            only = [true, true, true];
+            only = [true, true, true, true];
         }
         Ok((dir, only))
     }
@@ -1054,8 +1144,14 @@ mod gate {
         if only[0] {
             ok &= dense(&dir)?;
         }
-        if only[1] || only[2] {
-            ok &= target(&dir, only[1], only[2])?;
+        if only[1] {
+            ok &= lossless(&dir)?;
+        }
+        if only[2] {
+            ok &= taps(&dir)?;
+        }
+        if only[3] {
+            ok &= id_map(&dir)?;
         }
         if ok { Ok(()) } else { Err(checks_failed()) }
     }

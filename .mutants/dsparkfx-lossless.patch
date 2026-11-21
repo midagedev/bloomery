@@ -1,0 +1,20 @@
+# dsparkfx clause 1 (gate_qwen35_dspark --only 1): the verify pass keeps every row it fed the
+# target, drafted ids the target did not argmax included.
+# Expected red:
+#   clause 1: first divergence at 64 (plain <the target's argmax> draft <the drafted id>) FAIL
+# (the divergence lands at the first pass's first rejected draft slot, index 64 — the prompt's
+# 64 ids decode first; on the synthetic draft's random weights the first slot is rejected.)
+--- a/crates/runtime/src/speculative.rs
++++ b/crates/runtime/src/speculative.rs
+@@ -547,11 +547,7 @@
+         let argmax = self.t.verify(rows)?;
+         let mut taken = argmax;
+         let mut kept = R;
+         for (r, (id, &a)) in taken.iter_mut().zip(&argmax).enumerate() {
+             *id = self.pick.pick(self.t, r, a)?;
+-            if rows.get(r + 1).is_some_and(|&d| d != *id) {
+-                kept = r + 1;
+-                break;
+-            }
+         }
+         self.draft.accept(self.t, &rows, &taken, kept)?;

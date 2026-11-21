@@ -100,6 +100,7 @@ const USAGE: &str = "usage: fixture plan <real first shard> [--draft <real draft
        fixture fetch <family | repo[@rev][:quant]> <out dir> [--rev R] [flags]
        fixture cut <source folder> <out dir> --spec FILE [--shard-bytes B] [--card-budget B]
        fixture ds41-folder <source folder | repo[@rev]> <out dir> [--seed N]
+       fixture dspark <fixture first shard> [--seed N]
        fixture verify <fixture first shard> [--source <real first shard>] [--draft-source <real draft>]
        fixture verify <cut dir | its first shard> [--source <source folder>]
        fixture variant-rules <fixture first shard> --tag T [--table FILE]
@@ -165,6 +166,7 @@ fn run(args: &[String]) -> Res<()> {
         "fetch" => &FETCH_FLAGS,
         "cut" => &CUT_FLAGS,
         "ds41-folder" => &["--seed"],
+        "dspark" => &["--seed"],
         "verify" => &VERIFY_FLAGS,
         "variant-rules" => &RULES_FLAGS,
         "variant-check" => &CHECK_FLAGS,
@@ -181,6 +183,7 @@ fn run(args: &[String]) -> Res<()> {
         ("fetch", [repo, out]) => fetch(repo, out, &a),
         ("cut", [source, out]) => cut_folder(source, out, &a),
         ("ds41-folder", [source, out]) => ds41_folder(source, out, &a),
+        ("dspark", [first]) => dspark(first, &a),
         ("verify", [first]) => verify(first, &a),
         ("variant-rules", [source]) => variant_rules(source, &a),
         ("variant-check", [variant]) => variant_check(variant, &a),
@@ -1045,6 +1048,37 @@ fn variant_budget(variant: &str) -> Res<()> {
 /// planner gives it as it stands, in place (`fixture::rebudget`), with the draft fixture beside it
 /// and the r8 sidecar's record of the headers that moved; `given` replaces the plan. The closing
 /// line names each of the three, and what was absent.
+/// The DSpark fixture of `first`'s family: the three synthetic drafts (reduced, full and
+/// mismatched) and the renamed target copy, beside the fixture's shards, each refused when it
+/// exists. The geometry is the family's own constructor over the file's facts; the qwen35moe
+/// fixture's is the one today, and another family's fixture takes its own beside it.
+fn dspark(first: &str, a: &Args) -> Res<()> {
+    let split = open(first)?;
+    let arch = split
+        .architecture()
+        .ok_or_else(|| format!("{first} names no architecture"))?;
+    if arch != "qwen35moe" {
+        return Err(format!(
+            "{first} is {arch}: the DSpark fixture's geometry is the qwen35moe fixture's own; \
+             another family's takes its own constructor beside crates/model-hf/src/arch/qwen35moe/dspark.rs"
+        )
+        .into());
+    }
+    let seed = a.seed.unwrap_or(DEFAULT_SEED);
+    let w = model_hf::arch::qwen35moe::dspark::write_set(Path::new(first), seed)?;
+    println!(
+        "fixture: dspark {first}: seed {seed}; drafts {} {} {}; renamed {}",
+        w.reduced.display(),
+        w.full.display(),
+        w.mismatched.display(),
+        w.renamed
+            .first()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "none (an empty split)".into()),
+    );
+    Ok(())
+}
+
 fn rebudget(first: &str, given: Option<u64>) -> Res<()> {
     let spec = spec_of(&open(first)?, first, None)?;
     let r = fixture::rebudget(&spec, Path::new(first), given)?;
@@ -1454,5 +1488,89 @@ mod tests {
             "no fixture under {} was checked",
             root.display()
         );
+    }
+
+    /// The synthetic DSpark draft's config round-trips through the loader's own parse
+    /// (`hf::dspark`, the pure half of `dspark_hf`): the geometry and the backbone the writer
+    /// states are the ones the gates' loader reads, for each of the three head shapes.
+    #[test]
+    fn the_dspark_drafts_config_round_trips_through_the_loaders_parse() {
+        use model_hf::dspark_fixture::{Draft, Target, Vocab, write_dir};
+        let target = Target {
+            hidden: 64,
+            n_vocab: 8192,
+            n_layers: 4,
+        };
+        let draft = Draft {
+            layers: 2,
+            hidden: target.hidden,
+            heads: 8,
+            kv_heads: 2,
+            inter: 128,
+            taps: vec![1, 2, 3],
+            block: 8,
+            mask_id: 4095,
+            window: Some(64),
+            confidence: true,
+            rows: 1024,
+        };
+        for vocab in [Vocab::Reduced, Vocab::Full, Vocab::Mismatched] {
+            let draft = draft.clone();
+            let dir = std::env::temp_dir().join(format!(
+                "fixture-dspark-roundtrip-{:?}-{pid}",
+                vocab,
+                pid = std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            write_dir(&dir, &target, &draft, vocab, 7).expect("the write");
+            let text = std::fs::read_to_string(dir.join("config.json")).expect("the config");
+            let st =
+                safetensors::Safetensors::open(&dir.join("model.safetensors")).expect("the file");
+            let d2t = (vocab != Vocab::Full).then(|| st.i64s("d2t").expect("the map"));
+            let shape = hf::dspark::shape(&text, d2t.as_deref()).expect("the geometry");
+            assert_eq!(shape.taps, draft.taps, "{vocab:?}");
+            assert_eq!(shape.block, draft.block, "{vocab:?}");
+            assert_eq!(shape.hidden, target.hidden, "{vocab:?}");
+            assert_eq!(shape.mask_id, draft.mask_id, "{vocab:?}");
+            assert_eq!(shape.window, draft.window, "{vocab:?}");
+            // The head kind, through its Debug (the runtime type is not this crate's to name).
+            let head = format!("{:?}", shape.head);
+            assert!(
+                head.contains("Markov")
+                    && head.contains(&format!("rank: {}", model_hf::dspark_fixture::MARKOV_RANK))
+                    && head.contains(&format!("confidence: {}", draft.confidence)),
+                "{vocab:?}: {head}"
+            );
+            let (rows, n_target) = (vocab.rows(&draft, &target), vocab.n_target(&target));
+            assert_eq!(shape.vocab.rows(), rows, "{vocab:?}");
+            assert_eq!(shape.vocab.n_target(), n_target, "{vocab:?}");
+            let bb = hf::dspark::backbone(&text).expect("the backbone");
+            assert_eq!(
+                (
+                    bb.layers,
+                    bb.hidden,
+                    bb.heads,
+                    bb.kv_heads,
+                    bb.head_dim,
+                    bb.intermediate
+                ),
+                (2, 64, 8, 2, 256, 128),
+                "{vocab:?}"
+            );
+            assert_eq!(
+                (bb.window, bb.block_causal),
+                (draft.window, draft.window.is_some())
+            );
+            if let Some(d2t) = d2t {
+                for (d, &off) in d2t.iter().enumerate() {
+                    assert_eq!(
+                        shape.vocab.target(d as u32),
+                        Ok(u32::try_from(d as i64 + off).expect("the parse held it a u32")),
+                        "draft id {d}"
+                    );
+                }
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

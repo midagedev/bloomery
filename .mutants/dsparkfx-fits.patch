@@ -1,0 +1,20 @@
+# dsparkfx cross_target_is_refused (gate-gpu-qwen3-dspark): the seat's fit check accepts a
+# draft whose stated vocabulary falls short of the target's, so the mismatched draft's server
+# no longer exits before listening and the refusal clause never sees its named line.
+# Expected red:
+#   gate_qwen3_dspark: error: mismatched: the server neither listened nor exited within 300s;
+#   ... (cross_target_is_refused is never reached: `refusal` errors at its wait instead of
+#   returning the server's stderr, and the gate exits non-zero)
+--- a/crates/gpu-gates/src/bin/shared/dspark_hf.rs
++++ b/crates/gpu-gates/src/bin/shared/dspark_hf.rs
+@@ -124,8 +124,10 @@
+ pub fn fits(
+     shape: &DsparkShape,
+     n_vocab: usize,
+     n_layers: usize,
+     hidden: usize,
+ ) -> Result<(), GateError> {
++    let _ = (shape, n_vocab, n_layers, hidden);
++    return Ok(());
+     let n_target = shape.vocab.n_target();
+     if n_target != n_vocab {

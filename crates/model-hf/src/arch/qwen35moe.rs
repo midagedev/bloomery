@@ -36,6 +36,7 @@ use super::section::Section;
 use super::trunk;
 use crate::folder::{FolderMap, Mapping, Origin, PlusOne, Squeeze, VocabSpec};
 
+pub mod dspark;
 pub mod folder;
 
 /// Why the checkpoint was refused.

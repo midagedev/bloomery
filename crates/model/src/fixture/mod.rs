@@ -64,6 +64,7 @@ use crate::placement::PlacementError;
 mod budget;
 #[cfg(test)]
 mod digest;
+pub mod dspark;
 mod fill;
 pub(crate) mod hybrid;
 mod plan;
@@ -216,7 +217,7 @@ pub enum FixtureError {
     },
 }
 
-fn io_err(path: &Path, op: &'static str, source: io::Error) -> FixtureError {
+pub fn io_err(path: &Path, op: &'static str, source: io::Error) -> FixtureError {
     FixtureError::Io {
         path: path.to_path_buf(),
         op,
@@ -225,7 +226,7 @@ fn io_err(path: &Path, op: &'static str, source: io::Error) -> FixtureError {
 }
 
 /// A [`FixtureError::Metadata`] on `key`.
-pub(crate) fn meta(key: &str, detail: impl Into<String>) -> FixtureError {
+pub fn meta(key: &str, detail: impl Into<String>) -> FixtureError {
     FixtureError::Metadata {
         key: key.to_string(),
         detail: detail.into(),

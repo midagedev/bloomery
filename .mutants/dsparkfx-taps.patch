@@ -1,0 +1,19 @@
+# dsparkfx clause 2 (gate_qwen35_dspark --only 2): the production taps' read-back
+# interleaves the tapped layers' rows in the wrong order (the last layer's row read first).
+# Expected red:
+#   clause 2: tap 1 is the row entering it, layer 0's output residual, 2048 values FAIL
+#   clause 2: tap 2 is the row entering it, layer 1's output residual, 2048 values FAIL
+#   clause 2: tap 3 is the row entering it, layer 2's output residual, 2048 values FAIL
+# (tap 3's row is the reversal's fixed point only when layers 1 and 3 write equal rows, which
+# random target weights do not; every tap compares bits against another layer's output.)
+--- a/crates/gpu/src/draft_taps.rs
++++ b/crates/gpu/src/draft_taps.rs
+@@ -196,7 +196,7 @@
+             let tap = Window::<f32>::of(&self.buf, self.offset(slot, from), rows * self.hidden)?
+                 .to_host_vec(stream)?;
+             for (r, row) in tap.chunks_exact(self.hidden).enumerate() {
+-                let at = r * width + slot * self.hidden;
++                let at = r * width + (self.layers.len() - 1 - slot) * self.hidden;
+                 out[at..at + self.hidden].copy_from_slice(row);
+             }
+         }

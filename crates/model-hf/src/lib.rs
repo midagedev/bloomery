@@ -12,6 +12,7 @@
 //! a path opens as either, and its header, tokenizer, name and weights are asked of one value.
 
 pub mod arch;
+pub mod dspark_fixture;
 pub mod folder;
 pub mod follow;
 pub mod model_file;

@@ -1,0 +1,29 @@
+# dsparkfx mutant placed-refused
+# clause: placed_load_is_refused (gate_qwen3_dspark.rs): --place a under the planner's half-experts
+#   budget exits before listening with the whole-card sentence
+# site: crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs, both refusals of a draft on a split
+#   load (the plan check and the verifying open) skipped
+# expected red: `just gate-gpu-qwen3-dspark`, `check placed_load_is_refused: FAIL` (or the arm's
+#   named error that the server listened)
+diff --git a/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs b/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs
+index 96ccf22ad..13db42788 100644
+--- a/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs
++++ b/crates/gpu-gates/src/bin/shared/serve_seats/qwen3.rs
+@@ -846,7 +846,7 @@ impl Body3 for Body35 {
+                             Qwen35moeModel::open(gpu, file, o)?
+                         }
+                     }
+-                    None if verifying => {
++                    None if false && verifying => {
+                         return Err(
+                             "BLOOMERY_DRAFT=dspark needs the whole-card load: the plan puts routed \
+                              experts on the host tier, and the draft's verifying load is whole on \
+@@ -2875,7 +2875,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
+     // slot at a time ([`Body3::serves_one_pass`]: the placed body refuses a
+     // pass of several slots beside one).
+     let tiered = load.tiered(&plan_levers)?;
+-    if !serves_on(served, placed) {
++    if false && !serves_on(served, placed) {
+         let why = match a.place {
+             Some(p) => (
+                 format!("--place {}", p.name()),
