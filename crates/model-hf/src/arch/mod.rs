@@ -9,6 +9,7 @@ use crate::folder::{self, FolderMap};
 pub mod deepseek41;
 pub mod exaone_moe;
 pub mod glm5next;
+pub mod inkling2;
 pub mod kimi_k3;
 pub mod lfm3;
 pub mod llama;
@@ -74,6 +75,11 @@ pub const MAPS: &[MapRow] = &[
         model_types: <exaone_moe::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<exaone_moe::Checkpoint>,
         architecture: folder::architecture_as::<exaone_moe::Checkpoint>,
+    },
+    MapRow {
+        model_types: <inkling2::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<inkling2::Checkpoint>,
+        architecture: folder::architecture_as::<inkling2::Checkpoint>,
     },
 ];
 

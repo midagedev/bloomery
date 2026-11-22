@@ -131,7 +131,7 @@ macro_rules! pre_tokenizer {
 /// `tokenizer.json` must repeat: [`ignores_merges`]). `Removed` with `invert` keeps the regex's
 /// matches and drops what lies between them, which `Isolated` keeps as pieces of their own; both
 /// regexes match every codepoint, so no gap exists and the two split alike.
-pub const PRE: [(&str, &str, bool); 8] = [
+pub const PRE: [(&str, &str, bool); 9] = [
     (
         "qwen35",
         pre_tokenizer!(qwen35_regex, "Isolated", false, false),
@@ -148,6 +148,14 @@ pub const PRE: [(&str, &str, bool); 8] = [
         "minimax-m2",
         pre_tokenizer!(minimax_m2_regex, "Removed", true, true),
         false,
+    ),
+    // The GPT-4o pipeline: the same regex split `Isolated`, a word that is itself a token taken
+    // whole. Inkling 2's GGUF spells its pre-tokenizer `inkling2`, the same regex the tokenizer
+    // crate reads here under this row's name.
+    (
+        "gpt-4o",
+        pre_tokenizer!(minimax_m2_regex, "Isolated", false, true),
+        true,
     ),
     (
         "qwen2",
@@ -472,9 +480,46 @@ const TOKENIZER_CONFIG: &Fields = &[
              calls; the prompt's ids and rendering are the chat template's",
         ),
     ),
+    // Inkling 2's own spelling of the BOS token's name; the id is tokenizer.json's either way,
+    // and the header's BOS comes from the post-processor's template and the special ids.
+    (
+        "begin_of_text",
+        Ignore(
+            Type::String,
+            "the BOS token's name in Inkling 2's config; the id is tokenizer.json's",
+        ),
+    ),
+    // Inkling 2's message envelope: every special token the template wraps a message in, named
+    // one a row; each is an added token of tokenizer.json, which serving matches as written.
+    ("endoftext", Ignore(Type::String, ENVELOPE)),
+    ("end_message", Ignore(Type::String, ENVELOPE)),
+    ("message_model", Ignore(Type::String, ENVELOPE)),
+    ("message_system", Ignore(Type::String, ENVELOPE)),
+    ("message_tool", Ignore(Type::String, ENVELOPE)),
+    ("message_user", Ignore(Type::String, ENVELOPE)),
+    ("content_image", Ignore(Type::String, ENVELOPE)),
+    ("content_invoke_tool_json", Ignore(Type::String, ENVELOPE)),
+    ("content_invoke_tool_text", Ignore(Type::String, ENVELOPE)),
+    ("content_model_end_sampling", Ignore(Type::String, ENVELOPE)),
+    ("content_text", Ignore(Type::String, ENVELOPE)),
+    ("content_thinking", Ignore(Type::String, ENVELOPE)),
+    ("content_tool_error", Ignore(Type::String, ENVELOPE)),
+    ("content_xml", Ignore(Type::String, ENVELOPE)),
+    // The converter's flag for Mistral-family pre-tokenizer regexes; the pipeline this folder
+    // runs is tokenizer.json's own.
+    (
+        "fix_mistral_regex",
+        Ignore(
+            Type::Bool,
+            "the convert's flag for Mistral regexes; the pipeline is tokenizer.json's",
+        ),
+    ),
 ];
 
 const MEDIA: &str = "the processor's media markers by name; each is an added token of \
+    tokenizer.json, which serving matches as written";
+
+const ENVELOPE: &str = "the message envelope's token names; each is an added token of \
     tokenizer.json, which serving matches as written";
 
 const SAMPLING: &str = "a default of HF's generate; serving samples by each request, and no \
@@ -567,6 +612,10 @@ const SPECIAL: [(&str, &str); 5] = [
 #[derive(Debug)]
 pub struct VocabSpec {
     size: u32,
+    /// The tokenizer's own size, where the model pads its vocabulary over it (Inkling 2's
+    /// `unpadded_vocab_size`): the token list and its types hold this many, the embedding and
+    /// the head the padded `size`.
+    unpadded: Option<u32>,
     ids: [Option<Vec<u32>>; 5],
     model_type: Option<String>,
     pre: Option<&'static str>,
@@ -595,8 +644,22 @@ impl VocabSpec {
             .and_then(|n| u32::try_from(n).ok())
             .filter(|&n| n > 0)
             .ok_or_else(|| bad("vocab_size must be a positive u32"))?;
+        let unpadded = text
+            .get("unpadded_vocab_size")
+            .and_then(Json::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .map(|n| {
+                if n == 0 || n > size {
+                    return Err(bad(
+                        "unpadded_vocab_size must be a positive u32 within vocab_size",
+                    ));
+                }
+                Ok(n)
+            })
+            .transpose()?;
         let mut out = Self {
             size,
+            unpadded,
             ids: std::array::from_fn(|_| None),
             model_type: config
                 .get("model_type")
@@ -632,6 +695,13 @@ impl VocabSpec {
 
     pub fn size(&self) -> u32 {
         self.size
+    }
+
+    /// The count of tokens the tokenizer holds: its own size where the model pads its
+    /// vocabulary, the vocabulary's size itself where it does not.
+    #[must_use]
+    pub fn token_count(&self) -> u32 {
+        self.unpadded.unwrap_or(self.size)
     }
 
     /// The last EOS id resets the PLE hash; GGUF's tokenizer uses the first.
@@ -805,7 +875,7 @@ fn vocabulary<'a>(
         }
     }
     let (mut tokens, mut types) = (Vec::new(), Vec::new());
-    for id in 0..spec.size {
+    for id in 0..spec.token_count() {
         let (t, ty) = match (by_id.get(&id), added.get(&id)) {
             (None, _) => {
                 let pad = format!("[PAD{id}]");
@@ -1706,6 +1776,22 @@ mod tests {
             ["tokenizer_config.json", "", "vision_end_token", "<|vision_end|>", 1],
             ["tokenizer_config.json", "", "response_template", {"defaults":{"role":"assistant"}}, "x"],
             ["tokenizer_config.json", "", "model_specific_special_tokens", {"image_token":"<|image_pad|>"}, "x"],
+            ["tokenizer_config.json", "", "begin_of_text", "<|begin_of_text|>", 1],
+            ["tokenizer_config.json", "", "endoftext", "<|endoftext|>", 1],
+            ["tokenizer_config.json", "", "end_message", "<|end_message|>", 1],
+            ["tokenizer_config.json", "", "message_model", "<|message_model|>", 1],
+            ["tokenizer_config.json", "", "message_system", "<|message_system|>", 1],
+            ["tokenizer_config.json", "", "message_tool", "<|message_tool|>", 1],
+            ["tokenizer_config.json", "", "message_user", "<|message_user|>", 1],
+            ["tokenizer_config.json", "", "content_image", "<|content_image|>", 1],
+            ["tokenizer_config.json", "", "content_invoke_tool_json", "<|content_invoke_tool_json|>", 1],
+            ["tokenizer_config.json", "", "content_invoke_tool_text", "<|content_invoke_tool_text|>", 1],
+            ["tokenizer_config.json", "", "content_model_end_sampling", "<|content_model_end_sampling|>", 1],
+            ["tokenizer_config.json", "", "content_text", "<|content_text|>", 1],
+            ["tokenizer_config.json", "", "content_thinking", "<|content_thinking|>", 1],
+            ["tokenizer_config.json", "", "content_tool_error", "<|content_tool_error|>", 1],
+            ["tokenizer_config.json", "", "content_xml", "<|content_xml|>", 1],
+            ["tokenizer_config.json", "", "fix_mistral_regex", false, "no"],
             ["generation_config.json", "", "bos_token_id", 3, [3, 4]],
             ["generation_config.json", "", "eos_token_id", [3, 4], [3, "4"]],
             ["generation_config.json", "", "pad_token_id", 4, [4, 3]],
@@ -2029,9 +2115,14 @@ mod tests {
             ),
             (
                 "the gaps kept",
+                // A regex no row spells (the GPT-4o row spells this pipeline's regex `Isolated`,
+                // so the edit moves off the regex itself).
                 Box::new(|t: &mut Json, _: &mut Json| {
-                    t["pre_tokenizer"]["pretokenizers"][0]["behavior"] = "Isolated".into();
-                    t["pre_tokenizer"]["pretokenizers"][0]["invert"] = false.into();
+                    let re = t["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"]
+                        .as_str()
+                        .unwrap()
+                        .replace("\\p{N}{1,3}", "\\p{N}{1,4}");
+                    t["pre_tokenizer"]["pretokenizers"][0]["pattern"]["Regex"] = re.into();
                 }),
             ),
             (

@@ -98,6 +98,15 @@ pub enum Format {
         bits: usize,
         group: usize,
     },
+    /// MLX's `nvfp4` mode (a routed stack of experts, `mx.quantize` over each expert with its
+    /// own global scale): `.weight` U32 words of 8 E2M1 values in MLX's nibble order — the order
+    /// ModelOpt's byte pairs hold — one U8 `.scales` byte a 16 values (a UE4M3 scale) and one
+    /// F32 `.global_scale` an expert. A config never declares it; [`plan`] places an MLX-quantized
+    /// module whose tensors hold this form as it, as it places the F16 affine pair.
+    MlxNvfp4,
+    /// MLX's `mxfp8` mode: `.weight` U32 words of 4 F8_E4M3 bytes, one U8 `.scales` byte (an
+    /// E8M0 scale) a 32 values, no global scale. Placed as [`Format::MlxNvfp4`] is.
+    MlxMxfp8,
     Bf16,
     F32,
     /// F16 as stored, read widened to f32 (exact) where a role asks for F32.
@@ -123,6 +132,8 @@ impl fmt::Display for Format {
             Format::MlxAffineF16 { bits, group } => {
                 write!(f, "MLX-affine F16 {bits}-bit group {group}")
             }
+            Format::MlxNvfp4 => f.write_str("MLX-nvfp4 experts"),
+            Format::MlxMxfp8 => f.write_str("MLX-mxfp8 experts"),
             Format::Bf16 => f.write_str("BF16"),
             Format::F32 => f.write_str("F32"),
             Format::F16 => f.write_str("F16"),
@@ -153,6 +164,10 @@ impl Format {
             Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 | Format::Nvfp4Ct => {
                 Some(GgmlType::NVFP4)
             }
+            // The plane pairs the MLX modes hold are the ones ModelOpt's NVFP4 and OCP's MXFP8
+            // are, at MLX's own group shapes.
+            Format::MlxNvfp4 => Some(GgmlType::NVFP4),
+            Format::MlxMxfp8 => Some(GgmlType::MXFP8),
             Format::Fp8Channel | Format::Fp8Tensor => Some(GgmlType::FP8_B128),
             Format::Mxfp8 => Some(GgmlType::MXFP8),
             Format::Fp8Block { rows, cols } if rows > 0 && cols > 0 => {
@@ -251,6 +266,8 @@ impl Format {
             Format::Nvfp4 | Format::Nvfp4Csf | Format::Nvfp4Csf32 | Format::Nvfp4Ct => {
                 matrices.checked_mul(4)?
             }
+            // One F32 `.scale` an expert, beside the stack as NVFP4's tensor scales are.
+            Format::MlxNvfp4 => matrices.checked_mul(4)?,
             _ => 0,
         };
         Some(Held { whole_bytes, block })
@@ -271,6 +288,9 @@ impl Format {
             | Format::Mxfp4 => 2,
             Format::Int4Pack { .. } => 8,
             Format::MlxAffine { bits, .. } | Format::MlxAffineF16 { bits, .. } => 32 / bits,
+            // An U32 word of 8 E2M1 values, then one of 4 F8_E4M3 bytes.
+            Format::MlxNvfp4 => 8,
+            Format::MlxMxfp8 => 4,
             _ => 1,
         };
         if let Some(last) = s.last_mut() {
@@ -931,7 +951,7 @@ pub struct Plan {
 }
 
 /// The companion suffixes a weight's format reads.
-const COMPANIONS: [&str; 11] = [
+const COMPANIONS: [&str; 12] = [
     "weight_scale",
     "weight_scale_2",
     "weight_scale_inv",
@@ -939,6 +959,7 @@ const COMPANIONS: [&str; 11] = [
     "scale",
     "scales",
     "biases",
+    "global_scale",
     "input_scale",
     "input_global_scale",
     "weight_shape",
@@ -1014,10 +1035,21 @@ pub fn plan<'a>(
         {
             continue;
         }
-        let companion = name
-            .rsplit_once('.')
-            .is_some_and(|(_, last)| COMPANIONS.contains(&last))
-            || name.contains(".weight_scale.");
+        let companion = match name.rsplit_once('.') {
+            // A `weight_*` name is a weight's companion whatever its module holds. A bare one
+            // (`scale`, `scales`, `biases`) belongs to a weight of its own module: a tensor of
+            // that name whose module holds no weight (Inkling 2's `q_l2_clip.scale`, a weight in
+            // its own right) is no companion.
+            Some((module, last))
+                if COMPANIONS.contains(&last)
+                    && (last.starts_with("weight")
+                        || table.contains_key(format!("{module}.weight").as_str())
+                        || table.contains_key(format!("{module}.weight_packed").as_str())) =>
+            {
+                true
+            }
+            _ => name.contains(".weight_scale."),
+        };
         let why = if companion {
             "a companion no placed weight reads".to_string()
         } else if let Some(f) = plain(dtype) {
@@ -1063,9 +1095,12 @@ fn layout(
 ) -> Option<(Format, Vec<String>)> {
     // MLX's expert stacks are one 3-D U32 tensor (`switch_mlp`), so the affine
     // format matches any rank whose last dim is the packed row; every other
-    // format's weights here are 2-D.
+    // format's weights here are 2-D. An MLX-quantized module whose tensors hold one of the
+    // expert modes (`nvfp4`, `mxfp8`) places as it, as an F16 pair does: the config's block
+    // declares the module quantized, the tensors the form.
     if let Format::MlxAffine { bits, group } = format {
-        return mlx_layout(bits, group, module, dtype, shape, table);
+        return mlx_layout(bits, group, module, dtype, shape, table)
+            .or_else(|| mlx_expert_layout(module, dtype, shape, table));
     }
     let &[rows, cols] = shape else { return None };
     // The first of `suffixes` beside the weight (or, for a shared scale, beside `owner`) that is
@@ -1272,6 +1307,48 @@ fn mlx_layout(
         _ => return None,
     };
     Some((format, vec![scales, biases]))
+}
+
+/// The format and companions of an MLX expert stack whose module the config's `quantization`
+/// block declares quantized and whose tensors hold one of the expert modes instead of the affine
+/// pair: `nvfp4` — `.weight` U32 `[experts, rows, k/8]` of E2M1 values in MLX's nibble order,
+/// `.scales` U8 `[experts, rows, k/16]` of UE4M3 bytes and `.global_scale` F32 `[experts]` — or
+/// `mxfp8` — `.weight` U32 `[experts, rows, k/4]` of F8_E4M3 bytes, `.scales` U8
+/// `[experts, rows, k/32]` of E8M0 bytes and no global scale; `None` when they fit neither.
+/// mlx-lm's convert writes no module entry for the experts it kept in the source's quant, so the
+/// block's affine declaration is all a config says of them.
+fn mlx_expert_layout(
+    module: &str,
+    dtype: Dtype,
+    shape: &[usize],
+    table: &BTreeMap<&str, (Dtype, &[usize])>,
+) -> Option<(Format, Vec<String>)> {
+    if dtype != Dtype::U32 {
+        return None;
+    }
+    let &[experts, rows, words] = shape else {
+        return None;
+    };
+    let beside = |suffix: &str, dtype: Dtype, shape: &[usize]| {
+        let n = format!("{module}.{suffix}");
+        table
+            .get(n.as_str())
+            .filter(|&&(d, s)| d == dtype && s == shape)
+            .map(|_| n)
+    };
+    let nvfp4 = words.checked_mul(8).filter(|&k| k % 16 == 0).and_then(|k| {
+        let scales = beside("scales", Dtype::U8, &[experts, rows, k / 16])?;
+        let global = beside("global_scale", Dtype::F32, &[experts])?;
+        Some((Format::MlxNvfp4, vec![scales, global]))
+    });
+    nvfp4.or_else(|| {
+        let k = words.checked_mul(4)?;
+        if k % 32 != 0 {
+            return None;
+        }
+        let scales = beside("scales", Dtype::U8, &[experts, rows, k / 32])?;
+        Some((Format::MlxMxfp8, vec![scales]))
+    })
 }
 
 /// What a refusal of an MLX affine weight adds when its `.scales` and `.biases` are of two

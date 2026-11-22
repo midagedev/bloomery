@@ -945,6 +945,17 @@ fn stack_in_place<S>(
         );
     }
     let get = |n: &str| folder.raw(n);
+    // One source whose stored leading axis is the experts: an MLX expert stack, whose code and
+    // block-scale planes are one 3-D tensor each and whose per-expert scales the placed format
+    // reads ([`modelopt::mlx_expert_planes`]).
+    if let [source] = m.sources.as_slice()
+        && folder
+            .raw(source)
+            .map(|r| r.shape.len() == 3)
+            .unwrap_or(false)
+    {
+        return mlx_stack_in_place(folder, plan, m, source, layout);
+    }
     let (mut codes_in, mut codes_at) = (Vec::new(), Vec::new());
     let (mut scales_in, mut scales_at) = (Vec::new(), Vec::new());
     let mut scales = Vec::with_capacity(m.sources.len());
@@ -985,6 +996,63 @@ fn stack_in_place<S>(
         scales_per,
         layout,
         scales,
+    })
+}
+
+/// [`stack_in_place`]'s one-tensor arm: the stack `decl`, mapped as `m` to the one source
+/// `source` whose stored leading axis is its experts — an MLX expert stack, its code plane and
+/// block-scale plane one 3-D tensor each, read expert after expert at `experts · rows` runs, with
+/// the per-expert multipliers its placed format reads. The header's type names the values a row
+/// holds, and the stack's dims the stored geometry: `[k, rows, experts]` of `k` the values the
+/// format's words hold.
+fn mlx_stack_in_place<S>(
+    folder: &Folder,
+    plan: &Plan,
+    m: &Mapped<S>,
+    source: &str,
+    layout: StackLayout,
+) -> Result<Spot, Error> {
+    let placed = place(plan, source)?;
+    let experts = modelopt::mlx_expert_planes(&|n| folder.raw(n), source, placed)?;
+    if m.dims
+        != [
+            experts.k as u64,
+            experts.rows as u64,
+            experts.experts as u64,
+        ]
+    {
+        return Err(refuse(
+            source,
+            format!(
+                "the header's dims {:?} are not the stored [k, rows, experts] [{}, {}, {}]",
+                m.dims, experts.k, experts.rows, experts.experts
+            ),
+        ));
+    }
+    let raw = folder.raw(source)?;
+    let &[_, rows, words] = raw.shape else {
+        return Err(refuse(source, "is not a 3-D expert plane"));
+    };
+    let groups = experts.k
+        / match placed.format {
+            Format::MlxNvfp4 => 16,
+            _ => 32,
+        };
+    let (codes_file, codes) = folder.file_range(source)?;
+    let (scales_file, scales) = folder.file_range(experts.block)?;
+    let (codes_per, scales_per) = ((rows * words * 4) as u64, (rows * groups) as u64);
+    let at = |run: std::ops::Range<u64>, per: u64| {
+        (0..experts.experts as u64).map(move |e| run.start + e * per)
+    };
+    Ok(Spot::Stack {
+        codes_in: vec![codes_file; experts.experts],
+        codes_at: at(codes, codes_per).collect(),
+        scales_in: vec![scales_file; experts.experts],
+        scales_at: at(scales, scales_per).collect(),
+        codes_per,
+        scales_per,
+        layout,
+        scales: experts.scales,
     })
 }
 
@@ -1173,10 +1241,26 @@ pub fn planned_tensors<S>(
         let format = modelopt::format_of(&m.placed(plan)?)?;
         m.origin = match (keep, m.origin) {
             (Keep::Made, _) => Origin::Made,
-            (Keep::InPlace, Origin::Stack { ty, .. })
-                if modelopt::type_of(format.decoded(), Use::Rows) != Some(ty.as_u32()) =>
-            {
-                Origin::Made
+            (Keep::InPlace, Origin::Stack { ty, layout }) => {
+                // The stack is kept in the rows type its format gives ([`modelopt::type_of`]).
+                // The map names it where its folder holds one form; a folder whose layers hold
+                // another (an MLX folder whose experts mix `nvfp4` and `mxfp8`) keeps the type
+                // its plan places; a format with no rows type is made, not kept.
+                match modelopt::type_of(format.decoded(), Use::Rows) {
+                    Some(rows) if rows == ty.as_u32() => Origin::Stack { ty, layout },
+                    Some(rows)
+                        if matches!(
+                            ty,
+                            GgmlType::NVFP4_ROWS | GgmlType::MXFP8 | GgmlType::F8E4M3_ROWS
+                        ) =>
+                    {
+                        Origin::Stack {
+                            ty: GgmlType::from_u32(rows),
+                            layout,
+                        }
+                    }
+                    _ => Origin::Made,
+                }
             }
             (Keep::InPlace, origin) => origin,
         };
@@ -1227,12 +1311,19 @@ pub fn planned_tensors<S>(
                 m.dims
             )
         })?;
-        // One tensor scale an expert of a stack; one for a row table, whatever its parts.
+        // One tensor scale an expert of a stack — one a source, or the experts of the one-tensor
+        // stack a load keeps in place; one for a row table, whatever its parts.
         let scales = GgmlType::from_u32(type_id)
             .reads_scale()
             .then_some(match m.role {
                 Use::Rows => 1,
-                Use::Matrix(_) | Use::Q8_0 => m.sources.len(),
+                Use::Matrix(_) | Use::Q8_0 => {
+                    if m.dims.len() == 3 {
+                        m.dims[2] as usize
+                    } else {
+                        m.sources.len()
+                    }
+                }
             });
         let decl = TensorDecl {
             name: name.clone(),
@@ -1370,7 +1461,8 @@ fn kept_file<S>(
 }
 
 /// The type id of the stack `name`, mapped as `m` to stay in the folder's tensors as stored: one
-/// matrix a source, `ty`.
+/// matrix a source, `ty`, or one source whose stored leading axis is its experts (an MLX expert
+/// stack, [`stack_in_place`]'s one-tensor arm).
 fn kept_stack<S>(name: &str, m: &Mapped<S>, ty: GgmlType) -> Result<u32, Error> {
     if m.role == Use::Rows {
         return Err(refuse(name, "a row table is not kept as a stack"));
@@ -1378,7 +1470,7 @@ fn kept_stack<S>(name: &str, m: &Mapped<S>, ty: GgmlType) -> Result<u32, Error> 
     if !m.steps.is_empty() {
         return Err(refuse(name, "kept in place, a stack has no step"));
     }
-    if m.dims.len() != 3 || m.dims[2] != m.sources.len() as u64 {
+    if m.dims.len() != 3 || (m.dims[2] != m.sources.len() as u64 && m.sources.len() != 1) {
         return Err(refuse(
             name,
             format!(

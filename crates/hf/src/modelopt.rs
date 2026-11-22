@@ -146,6 +146,12 @@ pub fn type_of(format: Format, role: Use) -> Option<u32> {
             | Format::MlxAffineF16 { .. },
             Use::Matrix(_),
         ) => format.card_type().map(GgmlType::as_u32),
+        // The MLX expert modes hold the plane pairs ModelOpt's NVFP4 and OCP's MXFP8 do, at
+        // MLX's own group shapes, and a stack of them is one tensor whose experts are its stored
+        // leading axis: the rows type names its bytes whatever role reads it, at MLX's own group
+        // (16 values, not GGUF's 64).
+        (Format::MlxNvfp4, Use::Matrix(_) | Use::Rows) => Some(GgmlType::NVFP4_ROWS.as_u32()),
+        (Format::MlxMxfp8, Use::Matrix(_) | Use::Rows) => Some(GgmlType::MXFP8.as_u32()),
         (Format::Bf16 | Format::F32, Use::Matrix(Plain::Q8_0) | Use::Q8_0) => {
             Some(GgmlType::Q8_0.as_u32())
         }
@@ -490,6 +496,18 @@ fn plan_part<'a>(
                     weight,
                     format!(
                         "values {at:?} along dim {dim} of {matrix:?}: an MLX affine weight is read whole, its scales and biases are not cut"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if matches!(format, Format::MlxNvfp4 | Format::MlxMxfp8) {
+            mlx_expert_planes(get, weight, placed)?;
+            if at.start != 0 || matrix.get(dim) != Some(&at.end) {
+                return Err(refuse(
+                    weight,
+                    format!(
+                        "values {at:?} along dim {dim} of {matrix:?}: an MLX expert stack is read whole, its scale planes are not cut"
                     ),
                 ));
             }
@@ -1082,6 +1100,132 @@ pub fn mxfp8_rows_scale<'a, 'p>(
         });
     }
     Ok(sname)
+}
+
+/// An MLX expert stack's stored geometry and per-expert multipliers ([`mlx_expert_planes`]).
+pub struct MlxExperts<'p> {
+    /// The name of the `.scales` plane, U8 `[experts, rows, groups]` beside the weight.
+    pub block: &'p str,
+    /// One multiplier an expert: what the header's `.scale` holds for it. NVFP4's is its
+    /// `global_scale[e]` over the two formats' maxima (mlx quantizes each expert against its own
+    /// global scale, and dequantizes by it over the same product); MXFP8's is 1, its type
+    /// reading no scale.
+    pub scales: Vec<f32>,
+    /// The stack's experts, rows and values a row (`words × 8` for nvfp4, `× 4` for mxfp8).
+    pub experts: usize,
+    pub rows: usize,
+    pub k: usize,
+}
+
+/// The block-scale plane and per-expert multipliers of an MLX expert stack (`nvfp4` or `mxfp8`,
+/// [`Format::MlxNvfp4`] and [`Format::MlxMxfp8`]) whose weight `weight` is placed as `placed`:
+/// the weight U32 `[experts, rows, words]` — a word 8 E2M1 values for nvfp4, 4 F8_E4M3 bytes for
+/// mxfp8 — its `.scales` U8 `[experts, rows, groups]` (a UE4M3 byte a 16 values for nvfp4, an
+/// E8M0 a 32 for mxfp8) and nvfp4's `.global_scale` F32 `[experts]`. Shapes and byte counts
+/// alone, copying no plane and decoding no value.
+///
+/// # Errors
+///
+/// Another format, a place that names no scale plane (and no global scale for nvfp4), a weight
+/// of another dtype or rank, planes of other shapes or byte counts, and a global scale that is
+/// not `experts` finite positive F32 values, each by name.
+pub fn mlx_expert_planes<'a, 'p>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    weight: &str,
+    placed: &'p Placed,
+) -> Result<MlxExperts<'p>, Error> {
+    let refuse = |what: String| Error::Format {
+        name: weight.to_string(),
+        format: placed.format,
+        what,
+    };
+    // E2M1's and E4M3's largest finite values, the product mlx's `nvfp4` global scale divides by.
+    const FORMATS_MAX: f32 = 6.0 * 448.0;
+    let (group, words_values) = match placed.format {
+        Format::MlxNvfp4 => (16usize, 8usize),
+        Format::MlxMxfp8 => (32, 4),
+        _ => return Err(refuse("not an MLX nvfp4 or mxfp8 expert stack".into())),
+    };
+    let w = get(weight)?;
+    let &[experts, rows, words] = w.shape else {
+        return Err(refuse(format!(
+            "{} {:?}, not the [experts, rows, words] of an expert stack",
+            w.dtype.name(),
+            w.shape
+        )));
+    };
+    if w.dtype != Dtype::U32
+        || words == 0
+        || words % (group / words_values) != 0
+        || w.bytes.len() != experts * rows * words * 4
+    {
+        return Err(refuse(format!(
+            "{} {:?}, not U32 [experts, rows, words] of words whole {group}-value groups",
+            w.dtype.name(),
+            w.shape
+        )));
+    }
+    let k = words * words_values;
+    let groups = k / group;
+    let scales = get(placed
+        .companions
+        .first()
+        .ok_or_else(|| refuse("its place names no scales plane".into()))?)?;
+    if scales.dtype != Dtype::U8
+        || scales.shape != [experts, rows, groups]
+        || scales.bytes.len() != experts * rows * groups
+    {
+        return Err(Error::Shape {
+            name: placed.companions[0].clone(),
+            what: format!(
+                "{} {:?}; the groups are U8 [{experts}, {rows}, {groups}]",
+                scales.dtype.name(),
+                scales.shape
+            ),
+        });
+    }
+    let out = match placed.format {
+        Format::MlxNvfp4 => {
+            let global = get(placed.companions.get(1).ok_or_else(|| {
+                refuse("its place names no global scale, and nvfp4 keeps one an expert".into())
+            })?)?;
+            if global.dtype != Dtype::F32 || global.shape != [experts] {
+                return Err(Error::Shape {
+                    name: placed.companions[1].clone(),
+                    what: format!(
+                        "{} {:?}; the global scale is F32 [{experts}]",
+                        global.dtype.name(),
+                        global.shape
+                    ),
+                });
+            }
+            global
+                .bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| {
+                    let g = f32::from_le_bytes(*b);
+                    if !g.is_finite() || g <= 0.0 {
+                        return Err(Error::Shape {
+                            name: placed.companions[1].clone(),
+                            what: format!("holds {g}, not a finite positive global scale"),
+                        });
+                    }
+                    Ok(g / FORMATS_MAX)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        Format::MlxMxfp8 => vec![1.0; experts],
+        _ => unreachable!("the match above refused every other format"),
+    };
+    Ok(MlxExperts {
+        block: placed.companions[0].as_str(),
+        scales: out,
+        experts,
+        rows,
+        k,
+    })
 }
 
 /// A block scale a checkpoint stores compressed ([`csf`]), as [`nvfp4_compressed_rows_scale`]
