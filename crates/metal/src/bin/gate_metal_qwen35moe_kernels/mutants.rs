@@ -3162,12 +3162,12 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
-        name: "mrows_rows_beyond_two",
+        name: "mrows_pass_second_row",
         clause: "mrows_seg",
-        why: "activation rows past the second read the second row's input: the row span of the load stops at row 1, so only an M of 3 or more shows it",
+        why: "the second activation row of a pass reads the first row's input: the row span of the load stops at row 0, so every M of 2 or more shows it (a pass holds at most two rows, `mrow_pass`; a row past the second is the pass offset's, `mrows_pass_x_offset`)",
         edits: &[(
             "const float4 xq = act4(block + (long)m * row_span + base + 4 * l);",
-            "const float4 xq = act4(block + (long)min((int)m, 1) * row_span + base + 4 * l);",
+            "const float4 xq = act4(block + (long)min((int)m, 0) * row_span + base + 4 * l);",
             1,
         )],
     },
