@@ -124,7 +124,7 @@ static void loop_control_row(device const float *cur,
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (isnan(rstd[0])) {
-        raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+        raise(faults, uint(args.layer), BLOOMERY_FAULT_SITE_NORM_QUANT);
         for (uint j = tid; j < n; j += LC_THREADS) {
             y[row + j] = NAN;
         }
@@ -187,7 +187,7 @@ kernel void loop_control(device const float *cur [[buffer(0)]],
     }
     threadgroup float staged[2 * BLOOMERY_INK2_HIDDEN];
     threadgroup float h[BLOOMERY_INK2_RANK];
-    threadgroup float partials[LC_SG];
+    threadgroup float partials[2u * LC_SG];
     threadgroup float rstd[2];
     loop_control_row(cur, msg, down, gain, forget, y, args, faults, t, tid, staged, h, partials,
                      rstd);

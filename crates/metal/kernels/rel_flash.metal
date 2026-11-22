@@ -34,7 +34,8 @@
 //
 // No silent failure: a live count of zero or past the context raises the
 // key-count site and the row is NaN; a sink that is NaN or +inf has no
-// defined softmax and writes NaN into the row (a −inf sink is neutral).
+// defined softmax: it raises the product site and writes NaN into the row (a
+// −inf sink is neutral).
 //
 // This file comes after fault.metal (raise), attention.metal (attn_span,
 // the tile and span rule the walk shares) and ticket.metal.
@@ -77,7 +78,8 @@ static_assert(sizeof(RelFlashArgs) == 28, "RelFlashArgs is 28 bytes: the host pa
 // own rule, stated here because its kernel guards its copy behind the
 // window axis.
 inline uint rel_window_lo(thread const RelFlashArgs &args, uint live) {
-    return (args.window != 0u && live > args.window) ? live - args.window : 0u;
+    const bool windowed = args.window != 0u && live > args.window;
+    return windowed ? live - args.window : 0u;
 }
 
 // A lane's 8-byte word of halves widened by the hardware conversion (the
@@ -141,10 +143,10 @@ static void rel_tile(device const ushort *cache_k,
     for (uint t0 = 0u; t0 < REL_TILE; t0 += REL_WALK_AHEAD) {
         uint2 words[REL_WALK_AHEAD];
         for (uint c = 0u; c < REL_WALK_AHEAD; ++c) {
-            const uint key = lo + t0 + c;
-            words[c] = FULL || key < hi
+            const uint pos = lo + t0 + c;
+            words[c] = FULL || pos < hi
                            ? ((device const uint2 *)(cache_k +
-                                                     (row0 + key % args.rows) * REL_HEAD))[0]
+                                                     (row0 + pos % args.rows) * REL_HEAD))[lane]
                            : uint2(0u);
         }
         float part[REL_WALK_AHEAD];
@@ -190,7 +192,7 @@ static void rel_tile(device const ushort *cache_k,
     const float new_m = max(*running_m, simd_max(mine));
     const float old_m = *running_m;
     const float factor = old_m > -INFINITY ? exp(old_m - new_m) : 0.0f;
-    const float weight = lo + lane < hi ? exp(mine - new_m) : 0.0f;
+    const float weight = (lo + lane < hi) ? exp(mine - new_m) : 0.0f;
     *running_l = *running_l * factor + simd_sum(weight);
     for (uint d = 0u; d < REL_DIMS; ++d) {
         acc[d] *= factor;
@@ -198,16 +200,16 @@ static void rel_tile(device const ushort *cache_k,
     *running_m = new_m;
     for (uint t0 = 0u; t0 < REL_TILE; t0 += REL_WALK_AHEAD) {
         for (uint c = 0u; c < REL_WALK_AHEAD; ++c) {
-            const uint key = lo + t0 + c;
+            const uint pos = lo + t0 + c;
             const uint2 word =
-                FULL || key < hi
-                    ? ((device const uint2 *)(cache_v + (row0 + key % args.rows) * REL_HEAD))[0]
+                FULL || pos < hi
+                    ? ((device const uint2 *)(cache_v + (row0 + pos % args.rows) * REL_HEAD))[lane]
                     : uint2(0u);
-            const float w = simd_shuffle(weight, ushort(t0 + c));
+            const float wk = simd_shuffle(weight, ushort(t0 + c));
             float kv[REL_DIMS];
             rel_widen(word, kv);
             for (uint d = 0u; d < REL_DIMS; ++d) {
-                acc[d] = fma(w, kv[d], acc[d]);
+                acc[d] = fma(wk, kv[d], acc[d]);
             }
         }
     }
@@ -337,16 +339,22 @@ kernel void rel_flash_fold(device coherent(device) float *partials [[buffer(0)]]
     big = simd_max(big);
     const float factor = carries && big > -INFINITY ? exp(mj - big) : 0.f;
     const float weights = simd_sum(carries ? lj * factor : 0.f);
-    // The value sum: the segments' values added by the SIMD group, a dim at
-    // a time, each lane its segment's partial times its factor.
+    // The value sum: the segments ascending, each lane its own dims of the
+    // segment's partial times the factor of the lane that holds the segment
+    // (a segment past the head's weight is skipped, so its slot is never read).
+    // This order is the gate.
     float acc[REL_DIMS];
     for (uint d = 0u; d < REL_DIMS; ++d) {
-        float own = 0.f;
-        if (slot < a.segments && carries && big > -INFINITY) {
-            const uint at = (head * a.segments + slot) * (REL_HEAD + 2u) + 2u;
-            own = partials[at + lane * REL_DIMS + d] * factor;
+        acc[d] = 0.f;
+    }
+    for (uint s = 0u; s < a.segments; ++s) {
+        const float f = simd_shuffle(factor, ushort(s));
+        if (f > 0.f) {
+            const uint at = (head * a.segments + s) * (REL_HEAD + 2u) + 2u;
+            for (uint d = 0u; d < REL_DIMS; ++d) {
+                acc[d] = fma(partials[at + lane * REL_DIMS + d], f, acc[d]);
+            }
         }
-        acc[d] = simd_sum(own);
     }
     // The sink joins last, after every live segment: one more logit in the
     // denominator, nothing in the value. A sink that is NaN or +inf has no
@@ -354,6 +362,9 @@ kernel void rel_flash_fold(device coherent(device) float *partials [[buffer(0)]]
     const float sink = sinks[head];
     const bool refused = a.keys == 0u || a.keys > a.ctx;
     const bool bad = refused || isnan(sink) || sink == INFINITY;
+    if (lane == 0u && !refused && (isnan(sink) || sink == INFINITY)) {
+        raise(faults, uint(a.layer), BLOOMERY_FAULT_SITE_F32_PRODUCT);
+    }
     const float m = max(big, sink);
     const float rescale = big > -INFINITY ? exp(big - m) : 0.f;
     const float l = weights * rescale + (sink > -INFINITY ? exp(sink - m) : 0.f);

@@ -44,14 +44,24 @@ mod experts;
 use crate::experts_geom;
 mod gemm;
 use crate::geometry;
+mod conv_res;
 mod head;
+mod head_f32;
 mod headnorm;
+mod inkling2;
+mod loop_control;
 mod matvec;
 mod matvec_mrows;
 mod matvec_rows;
 mod norm;
+mod nvfp4;
+mod out_gate;
+mod qk_clip;
+mod rel_flash;
+mod res_mix;
 mod routed;
 pub mod router;
+mod router_situ;
 use crate::router_geom;
 mod rows;
 mod seg;
@@ -67,6 +77,7 @@ pub use attention::{
 };
 pub use attention::{AttnLayer, segments_for_window};
 pub use bias::BiasRowsParams;
+pub use conv_res::{ConvResParams, conv_scale};
 pub use delta::DeltaParams;
 pub use delta::DeltaRowStrides;
 pub use delta::DeltaRowsParams;
@@ -95,7 +106,9 @@ pub use geometry::{
     SIMD_GROUPS_PER_GROUP, THREADS_PER_GROUP, VALUE_HEADS,
 };
 pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams};
+pub use head_f32::HeadF32Params;
 pub use headnorm::HeadNormParams;
+pub use loop_control::LoopControlParams;
 pub use matvec::{LoadNorm, MatvecParams, Mode, NormOnLoad, Quant};
 pub use matvec_mrows::{FEW_FRAGMENT, FEW_MAX, FEW_MIN, MatvecFewParams, few_path_ops};
 pub use matvec_rows::{
@@ -105,11 +118,17 @@ pub use matvec_rows::{
 pub use norm::NormRowsParams;
 pub use norm::{HiddenRow, MtpJoinParams};
 pub use norm::{NormAddNextParams, NormAddRowsParams, NormNextParams};
+pub use nvfp4::{Nvfp4Params, NvfpLayout};
+pub use out_gate::OutGateParams;
+pub use qk_clip::QkClipParams;
+pub use rel_flash::{RelFlashParams, rel_partials_len};
+pub use res_mix::ResMixParams;
 pub use routed::{
     CombineParams, F32GemmParams, HeadNormRowsParams, LOGIT_STRIDE, ROUTE_TILE, ROUTED_ROWS,
     RouteSelectParams, RouteTableParams, RoutedKind, RoutedParams, SwigluRowsParams, TABLE_THREADS,
     route_table_words, route_tiles,
 };
+pub use router_situ::{RouterSigmoidParams, SituParams};
 pub use seg::{SegParams, Segment};
 pub use shortconv::{ShortConvRowsParams, ShortConvStepParams};
 pub use shortconv_geom::MAX_SLOTS as SHORTCONV_MAX_SLOTS;
@@ -228,6 +247,10 @@ pub struct Kernels {
     bias_rows: Pipeline,
     /// The short conv: the step, a chunk's rows and the ring commit.
     shortconv: shortconv::Pipelines,
+    /// Inkling 2's own kernels: the normed mix, the residual conv, the qk
+    /// epilogue, the controller, the out gate, the NVFP4 mat-vec, the sigmoid
+    /// router, the situ combine, the f32 head and the rel-bias flash.
+    ink2: inkling2::Pipelines,
     /// The pass's routing, grouped experts and row glue (`route.metal`,
     /// `gemm_routed.metal`).
     routed: routed::RoutedPipelines,
@@ -520,6 +543,7 @@ impl Kernels {
             mtp_join: library.pipeline("mtp_join")?,
             bias_rows: library.pipeline("bias_rows")?,
             shortconv: shortconv::Pipelines::new(library)?,
+            ink2: inkling2::Pipelines::new(library)?,
             routed: routed::RoutedPipelines::new(library)?,
             experts: experts::Pipelines::new(library, count)?,
             matvec_rows: matvec_rows::Pipelines::new(library, count)?,

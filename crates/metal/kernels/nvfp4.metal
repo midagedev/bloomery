@@ -14,12 +14,19 @@
 // is f32 fused multiply-adds — a named band term between the two).
 //
 // The lane map: a SIMD group owns a row, lane l the code byte l of every
-// block, blocks striding the lanes (a row of K values holds K/64 blocks,
-// 32 code bytes each, so the last round's tail lanes hold none). Byte b of
-// a block holds sub-block b/8's values b%8 (the low nibble) and b%8 + 8
-// (the high), so a lane's sub-block is lane-uniform in eights and its two
-// activations load as two scalars beside each other.
+// block (a block holds 32 code bytes, so the 32 lanes cover it exactly), the
+// blocks walked ascending. Byte b of a block holds sub-block b/8's values
+// b%8 (the low nibble) and b%8 + 8 (the high), so a lane's sub-block is
+// lane-uniform in eights and its two activations load as two scalars eight
+// apart. A lane accumulates its two products a block by fused-free adds in
+// block order; the group's lanes are summed by simd_sum.
 //
+// The rows entry (nvfp4_rows_gemv) is bloomery's NVFP4 rows type, the
+// MLX folder's bytes as stored: 9 bytes a 16-value group, the UE4M3 scale
+// byte then 8 code bytes, value 2i the low nibble of code byte i and 2i + 1
+// its high, the tensor's scale one launch word. A lane takes the groups
+// lane, lane + 32, ... of a row, each group's eight bytes in order.
+
 // The per-expert global scale (the file's `<stack>.scale` rows, one f32 an
 // expert) multiplies each row's finished dot once — the same elementwise
 // product either way, exact, so its placement costs nothing.
@@ -97,7 +104,7 @@ kernel void nvfp4_gemv(device const block_nvfp4 *W [[buffer(0)]],
     const uint j = lane % 8u;
     bool usable = true;
     float acc = 0.f;
-    for (uint i = lane; i < blocks; i += 32u) {
+    for (uint i = 0u; i < blocks; ++i) {
         const device block_nvfp4 &blk = wr[i];
         const float s = nvfp4_scale_half((blk.e >> (8u * sub)) & 0xffu);
         usable = usable && isfinite(s);
@@ -110,11 +117,59 @@ kernel void nvfp4_gemv(device const block_nvfp4 *W [[buffer(0)]],
         acc += v1 * x[col + 8u];
     }
     const float dot = simd_sum(acc) * args.w_scale;
+    // One lane's scale byte that is none makes the whole row undefined.
+    usable = simd_all(usable);
     if (!usable) {
         if (lane == 0u) {
             raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
+            y[r] = NAN;
         }
-        y[r] = NAN;
+        return;
+    }
+    if (!isfinite(dot) && lane == 0u) {
+        raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
+    }
+    if (lane == 0u) {
+        y[r] = isfinite(dot) ? dot : NAN;
+    }
+}
+
+// The rows entry: a SIMD group a row over `k / 16` nine-byte groups.
+kernel void nvfp4_rows_gemv(device const uint8_t *W [[buffer(0)]],
+                            device const float *x [[buffer(1)]],
+                            device float *y [[buffer(2)]],
+                            constant Nvfp4Args &args [[buffer(3)]],
+                            device atomic_uint *faults [[buffer(4)]],
+                            uint row [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]])
+{
+    const uint r = row * 8u + sg;
+    if (r >= args.rows) {
+        return;
+    }
+    const uint groups = args.k / 16u;
+    device const uint8_t *wr = W + (ulong)r * (ulong)groups * 9ul;
+    bool usable = true;
+    float acc = 0.f;
+    for (uint g = lane; g < groups; g += 32u) {
+        device const uint8_t *grp = wr + (ulong)g * 9ul;
+        const float s = nvfp4_scale_half(uint(grp[0]));
+        usable = usable && isfinite(s);
+        for (uint i = 0u; i < 8u; ++i) {
+            const uint byte = uint(grp[1u + i]);
+            const uint col = g * 16u + 2u * i;
+            acc += (NV_KVALUES[byte & 0x0fu] * s) * x[col];
+            acc += (NV_KVALUES[byte >> 4u] * s) * x[col + 1u];
+        }
+    }
+    const float dot = simd_sum(acc) * args.w_scale;
+    usable = simd_all(usable);
+    if (!usable) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
+            y[r] = NAN;
+        }
         return;
     }
     if (!isfinite(dot) && lane == 0u) {

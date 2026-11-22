@@ -30,7 +30,8 @@
 // cache-value site and the row is NaN; a position at or past `ctx` raises
 // the cache-position site, leaves that token's key and value rows NaN and
 // appends nothing; a finite value whose half conversion is not finite
-// (past the half range) raises the quant-column site and appends NaN.
+// (past the half range) raises the quant-column site, the appended word
+// being the half infinity.
 //
 // This file comes after fault.metal (raise), norm.metal (rms_scale,
 // rms_usable) and attention.metal (attn_f32_to_f16, the half conversion the

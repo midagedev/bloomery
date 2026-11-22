@@ -87,18 +87,20 @@ inline float conv_res_tap(device const float *x,
                           uint base,
                           uint rows,
                           uint t,
-                          uint p,
+                          uint pos0,
                           uint back,
                           uint c)
 {
     if (back <= t) {
         return x[(t - back) * d + c];
     }
+    // The predecessor lies before the call, `before` positions ahead of its
+    // first: nothing there when the call starts inside the taps.
     const uint before = back - t;
-    if (p < before) {
+    if (before > pos0) {
         return 0.0f;
     }
-    return ring[sc_slot(p - before, rows) * ch + base + c];
+    return ring[sc_slot(pos0 - before, rows) * ch + base + c];
 }
 
 kernel void conv_res(device const float *x [[buffer(0)]],
@@ -128,14 +130,13 @@ kernel void conv_res(device const float *x [[buffer(0)]],
     const uint t0 = u == 0u ? 0u : reach - 1u + u;
     const uint t1 = u == 0u ? min(args.m, reach) : t0 + 1u;
     for (uint t = t0; t < t1; ++t) {
-        const uint p = args.pos + t;
         // The static taps, the oldest first: tap k reads the input
         // taps − 1 − k positions back.
         float acc = w[c * taps] *
-                    conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, p, reach, c);
+                    conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, args.pos, reach, c);
         for (uint k = 1u; k < taps; ++k) {
             acc = fma(w[c * taps + k],
-                      conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, p, reach - k, c),
+                      conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, args.pos, reach - k, c),
                       acc);
         }
         // The dynamic taps, the current input first: lag reads the input
@@ -144,7 +145,7 @@ kernel void conv_res(device const float *x [[buffer(0)]],
             const uint head = c / per_head;
             for (uint lag = 0u; lag < taps; ++lag) {
                 acc = fma(dyn[(t * args.heads + head) * taps + lag],
-                          conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, p, lag, c),
+                          conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, args.pos, lag, c),
                           acc);
             }
         }

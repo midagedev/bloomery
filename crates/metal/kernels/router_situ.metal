@@ -99,17 +99,15 @@ static void situ_pick(device uint *ids,
             local = max(local, held[j]);
         }
         uint hi = simd_max(uint(local >> 32));
-        uint lo = simd_max(uint(local) == hi ? uint(local) : 0u);
+        uint lo = simd_max(uint(local >> 32) == hi ? uint(local) : 0u);
         const ulong chosen_key = ((ulong)hi << 32) | (ulong)lo;
         for (uint j = 0u; j < SI_KEYS; ++j) {
-            if (held[j] == chosen_key) {
-                held[j] = 0u;
-            }
+            held[j] = held[j] == chosen_key ? 0u : held[j];
         }
         if (lane == 0u) {
-            const uint best_i = ~uint(chosen_key);
-            ids[s] = best_i;
-            chosen[s] = tg_score[best_i];
+            const uint winner = ~uint(chosen_key);
+            ids[s] = winner;
+            chosen[s] = tg_score[winner];
         }
     }
     if (lane == 0u) {

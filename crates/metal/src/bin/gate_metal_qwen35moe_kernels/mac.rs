@@ -65,6 +65,8 @@ mod clauses_apart;
 mod clauses_attention;
 #[path = "clauses_bias.rs"]
 mod clauses_bias;
+#[path = "clauses_conv_res.rs"]
+mod clauses_conv_res;
 #[path = "clauses_delta.rs"]
 mod clauses_delta;
 #[path = "clauses_embed.rs"]
@@ -79,6 +81,10 @@ mod clauses_gemm;
 mod clauses_handon;
 #[path = "clauses_head.rs"]
 mod clauses_head;
+#[path = "clauses_head_f32.rs"]
+mod clauses_head_f32;
+#[path = "clauses_loop_control.rs"]
+mod clauses_loop_control;
 #[path = "clauses_matvec.rs"]
 mod clauses_matvec;
 #[path = "clauses_mrows.rs"]
@@ -87,16 +93,26 @@ mod clauses_mrows;
 mod clauses_mtp;
 #[path = "clauses_norm.rs"]
 mod clauses_norm;
+#[path = "clauses_nvfp4.rs"]
+mod clauses_nvfp4;
 #[path = "clauses_q5k.rs"]
 mod clauses_q5k;
 #[path = "clauses_q8_0.rs"]
 mod clauses_q8_0;
+#[path = "clauses_qk_clip.rs"]
+mod clauses_qk_clip;
+#[path = "clauses_rel_flash.rs"]
+mod clauses_rel_flash;
 #[path = "clauses_requant.rs"]
 mod clauses_requant;
+#[path = "clauses_res_mix.rs"]
+mod clauses_res_mix;
 #[path = "clauses_route.rs"]
 mod clauses_route;
 #[path = "clauses_router.rs"]
 mod clauses_router;
+#[path = "clauses_router_sigmoid.rs"]
+mod clauses_router_sigmoid;
 #[path = "clauses_rows.rs"]
 mod clauses_rows;
 #[path = "clauses_seg.rs"]
@@ -105,6 +121,8 @@ mod clauses_seg;
 mod clauses_shortconv;
 #[path = "clauses_sites.rs"]
 mod clauses_sites;
+#[path = "clauses_situ.rs"]
+mod clauses_situ;
 #[path = "clauses_synth.rs"]
 mod clauses_synth;
 #[path = "clauses_tensor.rs"]
@@ -115,6 +133,8 @@ mod clauses_window;
 mod common;
 #[path = "fixture.rs"]
 mod fixture;
+#[path = "ink2.rs"]
+mod ink2;
 #[path = "../shared/mlx_split.rs"]
 mod mlx_split;
 #[path = "mutants.rs"]
@@ -1174,6 +1194,15 @@ fn clause_table<'a>(
             .chain(clauses_requant::gemm_table(ctx.harness, mlx))
             .chain(clauses_delta::table(ctx))
             .chain(clauses_shortconv::table(ctx))
+            .chain(clauses_res_mix::table(ctx))
+            .chain(clauses_conv_res::table(ctx))
+            .chain(clauses_qk_clip::table(ctx))
+            .chain(clauses_loop_control::table(ctx))
+            .chain(clauses_nvfp4::table(ctx))
+            .chain(clauses_situ::table(ctx))
+            .chain(clauses_rel_flash::table(ctx))
+            .chain(clauses_router_sigmoid::table(ctx))
+            .chain(clauses_head_f32::table(ctx))
             .chain(clauses_handon::table(ctx))
             .chain(clauses_router::table(ctx))
             .chain(clauses_experts::table(ctx))

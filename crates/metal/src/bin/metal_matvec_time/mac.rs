@@ -98,8 +98,9 @@ use bloomery_metal::instance::HOST;
 use bloomery_metal::kernels::router::{self, RouterParams};
 use bloomery_metal::kernels::{
     EXPERT_K, EXPERT_SLOTS, FoldParams, HEAD_K, HEAD_SIMD_GROUPS, HeadNormParams, HeadParams,
-    Kernels, LoadNorm, MatvecParams, Mode, PARTIALS_PER_HEAD, PairParams, Quant, ROUTED_IDS,
-    ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP, SegParams, Segment, SharedPlan, VALUE_HEADS,
+    Kernels, LoadNorm, MatvecParams, Mode, Nvfp4Params, NvfpLayout, PARTIALS_PER_HEAD, PairParams,
+    Quant, ROUTED_IDS, ROWS_PER_SIMD_GROUP, SIMD_GROUPS_PER_GROUP, SegParams, Segment, SharedPlan,
+    VALUE_HEADS,
 };
 use bloomery_metal::library::{Library, SOURCE};
 use bloomery_metal::{GpuInterval, MetalStream};
@@ -249,6 +250,13 @@ enum Shape {
     /// A dense FFN's folded down at its one slot: `rows` by `k`, added into
     /// the output, the route weight 1.
     DenseFold { quant: Quant, rows: usize, k: usize },
+    /// Inkling 2's NVFP4 expert mat-vec: `rows` by `cols`, in the GGUF's
+    /// blocks or the MLX folder's rows.
+    Nvfp4 {
+        rows: usize,
+        cols: usize,
+        layout: NvfpLayout,
+    },
     /// The output head: `rows` logits over `cols`, the norm on the load.
     Head {
         quant: Quant,
@@ -279,6 +287,7 @@ impl Shape {
             Self::HeadNorm { .. } => "headnorm",
             Self::DensePair { .. } => "pair",
             Self::DenseFold { .. } => "fold",
+            Self::Nvfp4 { .. } => "nvfp4",
             Self::Head { .. } => "head",
         }
     }
@@ -291,7 +300,7 @@ impl Shape {
             | Self::DensePair { quant, .. }
             | Self::DenseFold { quant, .. }
             | Self::Head { quant, .. } => *quant,
-            Self::HeadNorm { .. } => Quant::Q4K,
+            Self::HeadNorm { .. } | Self::Nvfp4 { .. } => Quant::Q4K,
         }
     }
 
@@ -301,6 +310,7 @@ impl Shape {
             Self::Matvec { cols, .. }
             | Self::Seg { cols, .. }
             | Self::DensePair { cols, .. }
+            | Self::Nvfp4 { cols, .. }
             | Self::Head { cols, .. } => *cols,
             Self::HeadNorm { cols, .. } => *cols,
             Self::DenseFold { k, .. } => *k,
@@ -313,6 +323,7 @@ impl Shape {
             Self::Matvec { rows, .. }
             | Self::DensePair { rows, .. }
             | Self::DenseFold { rows, .. }
+            | Self::Nvfp4 { rows, .. }
             | Self::Head { rows, .. } => *rows,
             Self::Seg { segments, .. } => segments.iter().sum(),
             Self::HeadNorm { rows, .. } => *rows,
@@ -338,6 +349,9 @@ impl Shape {
                 quant, rows, cols, ..
             } => 2 * per(*quant, rows * cols),
             Self::DenseFold { quant, rows, k } => per(*quant, rows * k),
+            Self::Nvfp4 {
+                rows, cols, layout, ..
+            } => layout.bytes(*rows, *cols).unwrap_or(0),
             Self::Head {
                 quant,
                 rows,
@@ -354,10 +368,73 @@ impl Shape {
     }
 }
 
+/// NVFP4 weights of `rows` by `cols`: every scale byte the finite 1.0, the
+/// codes drawn, in the layout's bytes.
+fn nvfp4_weights(layout: NvfpLayout, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+    const SCALE_ONE: u8 = 0x38;
+    let total = layout.bytes(rows, cols).unwrap_or(0);
+    let mut state = seed | 1;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 24) as u8
+    };
+    let mut bytes: Vec<u8> = (0..total).map(|_| next()).collect();
+    match layout {
+        NvfpLayout::Blocks => {
+            for block in bytes.as_chunks_mut::<36>().0 {
+                block[..4].fill(SCALE_ONE);
+            }
+        }
+        NvfpLayout::Rows => {
+            for group in bytes.as_chunks_mut::<9>().0 {
+                group[0] = SCALE_ONE;
+            }
+        }
+    }
+    bytes
+}
+
 /// The shapes of the segmented and the head-normed launches: a layer's
 /// projections, and the out projection of a gated delta net.
 fn other_shapes() -> Vec<(&'static str, Shape)> {
     vec![
+        // Inkling 2 Mini's experts: the gate and up rows of one expert (1152
+        // by 2304 twice, one launch each here) and the down (2304 by 1152),
+        // in the GGUF's blocks and the MLX folder's rows.
+        (
+            "nvfp4 blocks gate 1152x2304",
+            Shape::Nvfp4 {
+                rows: 1152,
+                cols: 2304,
+                layout: NvfpLayout::Blocks,
+            },
+        ),
+        (
+            "nvfp4 blocks down 2304x1152",
+            Shape::Nvfp4 {
+                rows: 2304,
+                cols: 1152,
+                layout: NvfpLayout::Blocks,
+            },
+        ),
+        (
+            "nvfp4 rows gate 1152x2304",
+            Shape::Nvfp4 {
+                rows: 1152,
+                cols: 2304,
+                layout: NvfpLayout::Rows,
+            },
+        ),
+        (
+            "nvfp4 rows down 2304x1152",
+            Shape::Nvfp4 {
+                rows: 2304,
+                cols: 1152,
+                layout: NvfpLayout::Rows,
+            },
+        ),
         (
             "seg delta qkv+gate",
             Shape::Seg {
@@ -615,6 +692,9 @@ fn time_shape(
             both
         }
         Shape::DenseFold { rows, k, .. } => matrix(quant, *rows, *k, seed),
+        Shape::Nvfp4 {
+            rows, cols, layout, ..
+        } => nvfp4_weights(*layout, *rows, *cols, seed),
         Shape::Head { rows, cols, .. } => matrix(quant, *rows, *cols, seed),
     };
     // The bytes the working set is spread by: the weights'. A row that
@@ -687,7 +767,10 @@ fn time_shape(
     let experts = &kernels.geom().experts;
     let faults_read = matches!(
         shape,
-        Shape::DensePair { .. } | Shape::DenseFold { .. } | Shape::Head { .. }
+        Shape::DensePair { .. }
+            | Shape::DenseFold { .. }
+            | Shape::Head { .. }
+            | Shape::Nvfp4 { .. }
     );
     if faults_read {
         device.fault_word().clear(stream).map_err(why)?;
@@ -732,6 +815,24 @@ fn time_shape(
                                 x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
                                 y: out,
                                 mode: if *resid { Mode::Residual } else { Mode::Store },
+                            },
+                        )
+                        .map_err(why)?;
+                }
+                Shape::Nvfp4 { rows, cols, layout } => {
+                    kernels
+                        .nvfp4_matvec(
+                            encoder,
+                            Nvfp4Params {
+                                layout: *layout,
+                                rows: *rows,
+                                k: *cols,
+                                weights: w,
+                                x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                y: out,
+                                w_scale: 1.0,
+                                faults: device.fault_word(),
+                                layer: 0,
                             },
                         )
                         .map_err(why)?;

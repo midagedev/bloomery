@@ -136,7 +136,7 @@ static void res_mix_row(device const float *banks,
             }
         }
         if (!usable) {
-            raise(faults, args.layer, BLOOMERY_FAULT_SITE_NORM_QUANT);
+            raise(faults, uint(args.layer), BLOOMERY_FAULT_SITE_NORM_QUANT);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);

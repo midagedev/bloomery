@@ -250,6 +250,8 @@ fn main() {
         "router_situ",
         "nvfp4",
         "situ",
+        "out_gate",
+        "head_f32",
     ] {
         let path = kernels_dir.join(format!("{name}.metal"));
         let source =

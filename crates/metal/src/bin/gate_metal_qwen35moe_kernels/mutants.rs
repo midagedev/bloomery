@@ -24,6 +24,11 @@ mod program;
 
 pub use program::{Mutant, Program, source_at};
 
+#[path = "mutants_ink2.rs"]
+mod ink2;
+
+pub use ink2::INK2_MUTANTS;
+
 use super::Table;
 
 /// Every mutant of an instance's run (`table`, its row of the gate), with the
@@ -33,7 +38,9 @@ use super::Table;
 /// row takes, so that rows with a defect in common hold it once).
 pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
     match table {
-        Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS).collect(),
+        Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS)
+            .chain(program::all(INK2_MUTANTS, &[]))
+            .collect(),
         Table::Shaped { kept, own }
         | Table::Delta { kept, own }
         | Table::Attention { kept, own }
