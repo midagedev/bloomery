@@ -82,6 +82,15 @@ mod attention_geom {
     include!("src/kernels/attention_geom.rs");
 }
 
+/// Inkling 2's kernel geometry, from the file the host module reads.
+#[allow(
+    dead_code,
+    reason = "the host module reads every constant; the header emits the ones the kernels read"
+)]
+mod inkling2_geom {
+    include!("src/kernels/inkling2_geom.rs");
+}
+
 /// The launch geometry of one instance, from the file the host module reads:
 /// the header is written from the same struct the launches read.
 #[allow(
@@ -167,6 +176,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/kernels/router_geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/experts_geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/attention_geom.rs");
+    println!("cargo:rerun-if-changed=src/kernels/inkling2_geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/geom.rs");
     println!("cargo:rerun-if-changed=src/kernels/header.rs");
     println!("cargo:rerun-if-changed=src/instance.rs");
@@ -185,7 +195,11 @@ fn main() {
     // mat-vecs read, quant the block layouts and the decode owners every
     // quantized kernel reads (embed's too), matvec_q4k the row loop and the
     // entry templates the Q6_K, A4, A8, A4H, A8H, Q8_0, Q5_K, F32, experts
-    // and head files instantiate.
+    // and head files instantiate. The inkling2 drafts read the fault site's
+    // raise (fault), the norm's scale (norm), the short conv's slot rule
+    // (shortconv), the attention's half conversions and the ticket's fold
+    // helpers (attention, which follows ticket), and the situ pair the
+    // shared ABI's float loads (gemm_shared, through quant).
     for name in [
         "fault",
         "copy",
@@ -222,6 +236,20 @@ fn main() {
         "shortconv",
         "attention",
         "head",
+        // The Inkling 2 drafts: res_mix and loop_control read the norm's
+        // scale and the fault's raise; conv_res the short conv's slot rule;
+        // qk_clip the attention's half conversion; rel_flash the attention's
+        // lane widening and the ticket's fold; router_situ the ticket's
+        // argmax key; nvfp4 the quant's float4 load; situ the shared ABI's
+        // activation cast nothing of its own.
+        "res_mix",
+        "loop_control",
+        "conv_res",
+        "qk_clip",
+        "rel_flash",
+        "router_situ",
+        "nvfp4",
+        "situ",
     ] {
         let path = kernels_dir.join(format!("{name}.metal"));
         let source =

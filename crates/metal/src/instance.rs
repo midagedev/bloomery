@@ -2,8 +2,10 @@ use core::fmt;
 use std::sync::{Mutex, PoisonError};
 
 use crate::geom::{Geometry, KernelRefused};
-use models::shape::{self, AttnShape, GqaInst, MoeShape, RouterBody, RouterInst, ShapeRefused};
-use models::{DeltaKind, Ffn, GdnGate, Mixer, ModelSpec, OutGate, RopeMode};
+use models::shape::{
+    self, AttnShape, GqaInst, MoeShape, RouterBody, RouterInst, RouterRule, ShapeRefused,
+};
+use models::{DeltaKind, Ffn, GdnGate, Mixer, ModelSpec, OutGate, RopeMode, RouterNorm, Score};
 
 /// One instance: the axes its kernels are compiled at, under a name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -523,6 +525,93 @@ pub const NEOX_ATTN_H64_GQA7: Instance = Instance {
     host_feature: Some("host-neox-attn-h64-gqa7"),
     opens: false,
 };
+
+/// Inkling 2 Mini's shape: 24 query heads over 8 key heads of 128 values, a
+/// relative-position bias attention that folds a per-query sink and gathers a
+/// learned bias row by key distance, a window a layer's launch names, no rope
+/// at all (the entries never read a rope table), the output gate one value a
+/// channel on a projection of its own (`OutGate::Proj`, a kernel of this
+/// backend rather than an axis the flash reads), and 128 sigmoid-biased
+/// experts of 1152 values at the top 8 over a hidden of 2304. The flash row
+/// is this backend's own, as LFM3's is: the decode attention's kernel
+/// refuses a row with sinks and no bias path exists, so the family's flash
+/// is `metal/kernels/rel_flash.metal`, compiled at the group of three.
+///
+/// The row is held out of [`REGISTERED`]: its FFN axis's router row is the
+/// shape table's own 128-expert top-8 [`RouterBody::BiasedSigmoid`] row,
+/// which the table does not carry (its 128-expert rows of this body keep 4
+/// and 6), and a registered row's router is the row the table selects
+/// (`the_registered_rows_are_the_shape_tables`). The router body's own round
+/// lands that row; with it, this row joins [`REGISTERED`], takes its host
+/// feature and build, and the family's kernels — the rel-bias flash, the
+/// normed mix, the loop controller, the residual short conv, the qk clip
+/// epilogue, the NVFP4 mat-vec and the situ pair, the launches
+/// `kernels::inkling2_geom` states the geometry of — are the kernel round's
+/// to wire.
+pub const INKLING2_MINI: Instance = Instance {
+    name: "inkling2_mini",
+    key: Key {
+        hidden: 2304,
+        ffn: FfnAxes::Routed(MoeAxes {
+            // The table's own 128-expert top-8 row, spelled here until the
+            // table carries it; `inkling2s_router_row_is_the_tables` holds
+            // the two together.
+            router: inkling2_router_row(),
+            top_k: 8,
+            expert_ff: 1152,
+        }),
+        attn: AttnAxes {
+            row: GqaInst {
+                head: 128,
+                value: 128,
+                pack: GROUP,
+                group: shape::GroupRule::One,
+                window: true,
+                sinks: true,
+                value_scale: false,
+                at: "metal/kernels/rel_flash.metal (a bias row, a per-query \
+                      sink column, a window word)",
+            },
+            n_head: 24,
+            n_kv: 8,
+            rot: 0,
+            q_gate: false,
+            head_gate: false,
+            qk_norm: false,
+            norm_pairs: false,
+        },
+        delta: None,
+    },
+    host_feature: None,
+    opens: false,
+};
+
+/// Query heads a key head of Inkling 2's attention.
+const GROUP: u32 = 3;
+
+/// The router row Inkling 2's FFN reads: the body `route_body.rs`'s sigmoid
+/// instances run, the selection-only bias, the selected-sum norm, 128 experts
+/// at the top 8. The shape table's row of exactly this shape, which
+/// `shape::router_row_k` would return, is the CUDA side's to land; until it
+/// does, the row is spelled here once, and the test beside it holds the
+/// table's refusal to the same shape.
+const fn inkling2_router_row() -> RouterInst {
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: RouterRule {
+            score: Score::Sigmoid,
+            bias: true,
+            norm: RouterNorm::SelectedSum,
+            gated: false,
+        },
+        norm_arg: false,
+        experts: 128,
+        top_k_min: 8,
+        top_k_max: 8,
+        at: "gpu/src/route_body.rs sigmoid_128_8_router* (the shape table's \
+              row, which the table does not carry yet)",
+    }
+}
 
 /// Every instance `build.rs` writes and compiles. A shape with no row here
 /// is compiled at open when every kernel family takes its geometry
@@ -1856,5 +1945,60 @@ mod tests {
             Refusal::Window { positions: 256 }
         );
         assert_eq!(refused(&edit(|g| g.sinks = true)), Refusal::Sinks);
+    }
+
+    /// Inkling 2's router row is the table's own 128-expert top-8
+    /// `BiasedSigmoid` row, spelled in [`INKLING2_MINI`] until the table
+    /// carries it: today the table, asked for exactly that shape, selects
+    /// its 128-expert row of this body and refuses the picks, which is why
+    /// the instance stays out of [`REGISTERED`] — a registered row's router
+    /// is the row the table selects. The spelled row runs its own rule, and
+    /// the attention axes beside it are the family's own flash row, not the
+    /// decode attention's.
+    /// The inkling2 row's attention axes read through a call, so the test's
+    /// assertions are not constants of the row itself.
+    fn inkling2_axes() -> AttnAxes {
+        INKLING2_MINI.key.attn
+    }
+
+    /// The inkling2 row read through a call, for the fields outside its
+    /// attention axes.
+    fn inkling2_row() -> Instance {
+        INKLING2_MINI
+    }
+
+    #[test]
+    fn inkling2s_router_row_is_the_tables() {
+        let m = inkling2_row()
+            .key
+            .routed()
+            .expect("the inkling2 row is a routed FFN's");
+        assert!(
+            m.router.runs(m.router.rule),
+            "the spelled row runs its rule"
+        );
+        let got = shape::select_router(MoeShape {
+            rule: m.router.rule,
+            experts: m.router.experts,
+            top_k: m.top_k,
+        });
+        let Err(why) = &got else {
+            panic!("the table already carries the row: {got:?}");
+        };
+        assert_eq!(why.why, Refusal::TopK { min: 4, max: 4 }, "{why}");
+        assert!(
+            !REGISTERED.contains(&INKLING2_MINI),
+            "the row waits on the table's router row"
+        );
+        let a = inkling2_axes();
+        assert_eq!(
+            (a.n_head, a.n_kv, a.row.head, a.rot, a.row.pack),
+            (24, 8, 128, 0, 3)
+        );
+        assert!(a.row.window && a.row.sinks && !a.row.value_scale);
+        assert!(!a.q_gate && !a.head_gate && !a.qk_norm && !a.norm_pairs);
+        assert_eq!(inkling2_row().key.hidden, 2304);
+        assert_eq!((m.top_k, m.expert_ff), (8, 1152));
+        assert!(!inkling2_row().opens, "no session of the family has landed");
     }
 }

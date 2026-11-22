@@ -10,6 +10,7 @@ use crate::attention_geom;
 use crate::delta_geom;
 use crate::geom::Geometry;
 use crate::geometry;
+use crate::inkling2_geom;
 use crate::router_geom;
 
 /// The fault site's table, written as the Metal compiler sees it.
@@ -96,7 +97,22 @@ pub fn geometry_defines(g: &Geometry) -> String {
          #define BLOOMERY_ATTN_ONE_CHUNK {aonechunk}\n\
          #define BLOOMERY_ATTN_PF_SGS {apfsgs}\n\
          #define BLOOMERY_ATTN_PF_KEYS {apfkeys}\n\
-         #define BLOOMERY_ATTN_PF_PAD {apfpad}\n",
+         #define BLOOMERY_ATTN_PF_PAD {apfpad}\n\
+         // Inkling 2's kernels, from src/kernels/inkling2_geom.rs. The\n\
+         // family's own constants, the same in every translation unit: no\n\
+         // registered instance carries them yet, and the drafts read no\n\
+         // instance-derived define.\n\
+         #define BLOOMERY_INK2_HIDDEN {ihidden}\n\
+         #define BLOOMERY_INK2_Q {iq}\n\
+         #define BLOOMERY_INK2_KV {ikv}\n\
+         #define BLOOMERY_INK2_HEAD {ihead}\n\
+         #define BLOOMERY_INK2_REL {irel}\n\
+         #define BLOOMERY_INK2_EXTENT {iextent}\n\
+         #define BLOOMERY_INK2_MIX_VECS {ivecs}\n\
+         #define BLOOMERY_INK2_MIX_NQ {inq}\n\
+         #define BLOOMERY_INK2_RANK {irank}\n\
+         #define BLOOMERY_INK2_EXPERTS {iexperts}\n\
+         #define BLOOMERY_INK2_TOP_K {itopk}\n",
         rows = geometry::ROWS_PER_SIMD_GROUP,
         segs = geometry::MAX_SEGMENTS,
         heads = g.delta.value_heads,
@@ -142,6 +158,17 @@ pub fn geometry_defines(g: &Geometry) -> String {
         apfsgs = attention_geom::PREFILL_SIMD_GROUPS,
         apfkeys = attention_geom::PREFILL_KEYS,
         apfpad = attention_geom::PREFILL_PAD,
+        ihidden = inkling2_geom::HIDDEN,
+        iq = inkling2_geom::QUERY_HEADS,
+        ikv = inkling2_geom::KV_HEADS,
+        ihead = inkling2_geom::HEAD,
+        irel = inkling2_geom::D_REL,
+        iextent = inkling2_geom::EXTENT,
+        ivecs = inkling2_geom::MIX_VECS,
+        inq = inkling2_geom::MIX_NQ,
+        irank = inkling2_geom::CONTROLLER_RANK,
+        iexperts = inkling2_geom::EXPERTS,
+        itopk = inkling2_geom::TOP_K,
     )
 }
 
@@ -250,6 +277,17 @@ mod tests {
             ("BLOOMERY_ATTN_PF_SGS", attention_geom::PREFILL_SIMD_GROUPS),
             ("BLOOMERY_ATTN_PF_KEYS", attention_geom::PREFILL_KEYS),
             ("BLOOMERY_ATTN_PF_PAD", attention_geom::PREFILL_PAD),
+            ("BLOOMERY_INK2_HIDDEN", inkling2_geom::HIDDEN),
+            ("BLOOMERY_INK2_Q", inkling2_geom::QUERY_HEADS),
+            ("BLOOMERY_INK2_KV", inkling2_geom::KV_HEADS),
+            ("BLOOMERY_INK2_HEAD", inkling2_geom::HEAD),
+            ("BLOOMERY_INK2_REL", inkling2_geom::D_REL),
+            ("BLOOMERY_INK2_EXTENT", inkling2_geom::EXTENT),
+            ("BLOOMERY_INK2_MIX_VECS", inkling2_geom::MIX_VECS),
+            ("BLOOMERY_INK2_MIX_NQ", inkling2_geom::MIX_NQ),
+            ("BLOOMERY_INK2_RANK", inkling2_geom::CONTROLLER_RANK),
+            ("BLOOMERY_INK2_EXPERTS", inkling2_geom::EXPERTS),
+            ("BLOOMERY_INK2_TOP_K", inkling2_geom::TOP_K),
         ]
     }
 

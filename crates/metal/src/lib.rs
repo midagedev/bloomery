@@ -39,6 +39,11 @@ pub mod geometry;
 /// the runtime at open. Host text: every OS.
 #[path = "kernels/header.rs"]
 pub mod header;
+/// Inkling 2's kernel geometry, one file read by the family's `.metal`
+/// sources (through the header's `BLOOMERY_INK2_*` defines) and by the
+/// family's byte model (`arch::inkling2`). Host arithmetic: every OS.
+#[path = "kernels/inkling2_geom.rs"]
+pub mod inkling2_geom;
 /// The kernels' instances: one per registered shape row, each the axes one
 /// translation unit of the kernels is compiled at (a router's experts, picks
 /// and hidden width, decode attention's head, rope and heads, the delta
