@@ -94,7 +94,7 @@ macro_rules! llama3_regex {
         r#""(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
     };
 }
-macro_rules! minimax_m2_regex {
+macro_rules! gpt4o_regex {
     () => {
         r#""[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+""#
     };
@@ -146,7 +146,7 @@ pub const PRE: [(&str, &str, bool); 9] = [
     ),
     (
         "minimax-m2",
-        pre_tokenizer!(minimax_m2_regex, "Removed", true, true),
+        pre_tokenizer!(gpt4o_regex, "Removed", true, true),
         false,
     ),
     // The GPT-4o pipeline: the same regex split `Isolated`, a word that is itself a token taken
@@ -154,7 +154,7 @@ pub const PRE: [(&str, &str, bool); 9] = [
     // crate reads here under this row's name.
     (
         "gpt-4o",
-        pre_tokenizer!(minimax_m2_regex, "Isolated", false, true),
+        pre_tokenizer!(gpt4o_regex, "Isolated", false, true),
         true,
     ),
     (
