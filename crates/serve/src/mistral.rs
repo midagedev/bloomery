@@ -230,7 +230,7 @@ fn name_quote(name: &str) -> String {
 
 /// Where the JSON value at the start of `s` ends.
 #[derive(Debug, PartialEq, Eq)]
-enum ValueEnd {
+pub(crate) enum ValueEnd {
     /// `s` starts with one complete JSON value, ending here.
     Complete(usize),
     /// `s` is a prefix of some JSON value: nothing is decided yet.
@@ -253,7 +253,7 @@ impl ValueEnd {
 
     /// The text an error quotes: through the codepoint the reading stopped
     /// at, so every cut of one text quotes the same.
-    fn fault(self, s: &str) -> String {
+    pub(crate) fn fault(self, s: &str) -> String {
         match self {
             ValueEnd::Invalid(at) => {
                 let end = at
@@ -273,7 +273,7 @@ impl ValueEnd {
 /// where it ends. The value is proven JSON by `serde_json` once its end is
 /// named; the reading here brackets it alone. `at_end` is set at the end of
 /// the stream, where a number can grow no further.
-fn value_end(s: &str, at_end: bool) -> ValueEnd {
+pub(crate) fn value_end(s: &str, at_end: bool) -> ValueEnd {
     let t = s.trim_start_matches([' ', '\t', '\r', '\n']);
     let lead = s.len() - t.len();
     let Some(c) = t.chars().next() else {

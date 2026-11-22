@@ -2741,7 +2741,7 @@ gate-engram:
 # The Llama-3 BPE vector test reads llama.cpp mainline 6868a52cb's models/ggml-vocab-llama-bpe.gguf with its .inp and
 # .out, copied into $BLOOMERY_DATA/vocab-llama-bpe/.
 gate-tokenizer:
-    ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer -- --include-ignored --nocapture'
+    ./tools/box.sh 'BLOOMERY_LLAMA_BPE_GGUF=$BLOOMERY_DATA/vocab-llama-bpe/ggml-vocab-llama-bpe.gguf bash tools/gate.sh --release -p bloomery-tokenizer --lib --test tokenizer --test inkling2 -- --include-ignored --nocapture'
 # The tokenizer oracle's sets, once per change of the reference trees, the vocabulary files, cases.txt or the
 # docs/ the Korean text is gathered from: `llama-tokenize`'s ids per vocabulary into $BLOOMERY_DATA/ref-tokenizer-<v>/
 # (crates/tokenizer/tools/oracle.sh; VOCAB is v41, qwen3moe, glm5next, qwen38, nemotron, minimaxm3, musespark, mistrallarge4, ds2, gemma4, llama or
@@ -2789,13 +2789,14 @@ dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
 # Anthropic's Messages API on the chat path (anthropic). Qwen3.6's and Qwen3.8's XML tool calls, and every seat
 # template's tool-call markup mapped to its parser (qwenxml). A tool call's streamed fragments in every markup
 # (callstream). The repetition, frequency and presence penalties as llama-server takes them (penalty). A sampled
-# request's drafted passes against its plain steps (sampdraft).
+# request's drafted passes against its plain steps (sampdraft). Inkling 2's two chat templates against the reference's own
+# renders, its block protocol's parser and the server's split of a reply into reasoning, content and calls (inkling2).
 # A chat clip and an embeddings clip against a mock decoder (src/media, src/api, src/arch/gemma4v): both part spellings, the
 # plan before the text, the placeholders paired by id and order, an embeddings input's images and audio charged before its clips
 # are planned, every named refusal, `/props` `modalities.video`. The decoder's own subprocess rules (src/video): an ffprobe past
 # its limit and an ffmpeg that does not end after its last frame are killed and named; a decode is taken only when ffmpeg ended well.
 gate-serve:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test mistral --test callstream --test limits --test anthropic --test penalty --test sampdraft --test contract -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test mistral --test callstream --test limits --test anthropic --test penalty --test sampdraft --test contract --test inkling2 -- --include-ignored --nocapture'
 
 # The server's video decode against a real ffmpeg (crates/serve/tests/video.rs): a lossless clip whose every frame is one colour
 # naming its index, probed (its frame count counted by decoding where the container states none), planned by a tick rule
@@ -4672,6 +4673,11 @@ inkling2-dump-build:
 # docs/cards/inkling2-fx-dump.card (the fixture, ~19 s).
 dump-ref-inkling2:
     BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=90 BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/inkling2-dump.sh'
+
+# The Small's oracle sets (refset family lcpp-inkling2s): the same tree, patch, prompts and taps on the UD-Q2_K_XL file (191 GB, six shards, no loop)
+# into ref_inkling2s_{a..e}. DUMP_ONLY="d" and DUMP_SKIP_DONE=1 in BLOOMERY_BOX_ENV run one prompt a call and restart; wall: docs/cards/inkling2s-dump.card.
+dump-ref-inkling2s:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=600 BLOOMERY_MODEL=inkling2 ./tools/box.sh 'BLOOMERY_DUMP_BOUND=5400 bash tools/ref/inkling2-dump.sh --small'
 
 # --- end inkling2-ref ---
 

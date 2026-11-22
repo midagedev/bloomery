@@ -1172,6 +1172,12 @@ pub enum ToolFormat {
     /// Hy4-flash's call markup: GLM's key and value tags with the template's token suffix on
     /// every tag and a `<tool_calls>` wrapper around the calls.
     Hy4,
+    /// Inkling 2's call blocks: the assistant turn is a list of blocks, each opened by
+    /// `<|message_model|>` and closed by `<|end_message|>`, and a call is
+    /// `<|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{…}}<|end_message|>`,
+    /// the calls the last blocks of the turn. Its thinking is a block of its own
+    /// ([`ReasoningFormat::INKLING`]).
+    Inkling,
 }
 
 impl ToolFormat {
@@ -1234,6 +1240,13 @@ impl ReasoningFormat {
     pub const THINK: ReasoningFormat = ReasoningFormat::ThinkSpan {
         open: "<think>",
         close: "</think>",
+    };
+
+    /// Inkling 2's thinking block: `<|content_thinking|>…<|end_message|>`, which the model opens
+    /// behind its `<|message_model|>` header. The close is the end every block of the turn has.
+    pub const INKLING: ReasoningFormat = ReasoningFormat::ThinkSpan {
+        open: "<|content_thinking|>",
+        close: "<|end_message|>",
     };
 
     /// The tags of the reasoning span, of either format: what opens it and what ends it.

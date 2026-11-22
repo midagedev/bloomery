@@ -50,6 +50,7 @@ use crate::constrain::{
 use crate::engine::Tokenizer;
 use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
 use crate::hermes::{self, HermesError, HermesScan};
+use crate::inkling::{InklingError, InklingScan};
 use crate::mistral::{self, MistralError, MistralScan};
 use crate::qwenxml::{self, Framing, ParamKinds, QwenScan, QwenXmlError};
 use crate::reasoning::{ReasoningFormat, Split, ThinkSplit, ThinkTags, partial_suffix};
@@ -567,6 +568,9 @@ pub enum ToolFormat {
     /// Mistral's `[TOOL_CALLS]NAME[ARGS]{json}` (Mistral Large 4's markup),
     /// one per call, no call id.
     Mistral,
+    /// Inkling 2's block protocol ([`crate::inkling`]): calls are blocks headed by
+    /// the function's name, the thinking a block of its own.
+    Inkling,
     /// None the server parses: a chat request that asks for tool calls is
     /// refused.
     Unparsed,
@@ -641,6 +645,8 @@ impl ToolFormat {
             ToolFormat::Dsml(Spelling::of_template(source))
         } else if ::models::ToolFormat::of_template(source) == Some(::models::ToolFormat::Mistral) {
             ToolFormat::Mistral
+        } else if ::models::ToolFormat::of_template(source) == Some(::models::ToolFormat::Inkling) {
+            ToolFormat::Inkling
         } else {
             ToolFormat::Unparsed
         }
@@ -742,6 +748,8 @@ pub enum Tools {
     MuseSpark,
     /// Mistral's markup: the model writes the arguments as JSON itself.
     Mistral,
+    /// Inkling 2's blocks ([`crate::inkling`]): the scan splits the thinking blocks out itself.
+    Inkling,
 }
 
 #[derive(Clone, Debug)]
@@ -752,6 +760,7 @@ enum Scan {
     Qwen(QwenScan),
     Recipient(crate::museatem::MuseScan),
     Mistral(MistralScan),
+    Inkling(InklingScan),
 }
 
 /// A generation whose tool-call markup does not parse: which scan refused,
@@ -767,6 +776,9 @@ pub enum MarkupError {
     /// The Mistral scan's refusal.
     #[error("{0}")]
     Mistral(#[from] MistralError),
+    /// The Inkling scan's refusal.
+    #[error("{0}")]
+    Inkling(#[from] InklingError),
     /// The Qwen3-Coder scan's refusal.
     #[error("{0}")]
     Qwen(#[from] QwenXmlError),
@@ -840,7 +852,7 @@ impl ChatParser {
         // so it wants no think split; the others track the span so markup
         // inside it is never parsed.
         let split = (format == ReasoningFormat::Deepseek || tools.is_some())
-            && !matches!(tools, Some(Tools::MuseSpark));
+            && !matches!(tools, Some(Tools::MuseSpark | Tools::Inkling));
         // Qwen3-Coder's call ends an open span without `</think>`, as
         // llama.cpp's parser for the markup reads it.
         let call_ends_span = matches!(tools, Some(Tools::QwenXml(..)));
@@ -865,6 +877,9 @@ impl ChatParser {
                 Tools::QwenXml(framing, kinds) => Scan::Qwen(QwenScan::new(kinds, framing)),
                 Tools::MuseSpark => Scan::Recipient(crate::museatem::MuseScan::default()),
                 Tools::Mistral => Scan::Mistral(MistralScan::default()),
+                Tools::Inkling => {
+                    Scan::Inkling(InklingScan::new(format == ReasoningFormat::Deepseek))
+                }
             }),
             streamer: None,
             open: None,
@@ -938,7 +953,8 @@ impl ChatParser {
             Some(Scan::Qwen(q)) => q.read_specials(tok),
             Some(Scan::Hermes(h)) => h.read_specials(tok),
             Some(Scan::Kv(k)) => k.read_specials(tok),
-            Some(Scan::Dsml(_) | Scan::Recipient(_) | Scan::Mistral(_)) | None => {}
+            Some(Scan::Dsml(_) | Scan::Recipient(_) | Scan::Mistral(_) | Scan::Inkling(_))
+            | None => {}
         }
         self
     }
@@ -1007,6 +1023,7 @@ impl ChatParser {
             Some(Scan::Qwen(q)) => Some(q.push_stream(&split.content, &split.specials)?),
             Some(Scan::Recipient(m)) => Some(m.push(&split.content)),
             Some(Scan::Mistral(m)) => Some(m.push(&split.content)?),
+            Some(Scan::Inkling(i)) => Some(i.push(&split.content)?),
         };
         self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
@@ -1046,6 +1063,7 @@ impl ChatParser {
             Some(Scan::Kv(k)) => Some(ended(k.finish(), KvError::unclosed, cut, sent)?),
             Some(Scan::Hermes(h)) => Some(ended(h.finish(), HermesError::unclosed, cut, whole)?),
             Some(Scan::Mistral(m)) => Some(ended(m.finish(), MistralError::unclosed, cut, whole)?),
+            Some(Scan::Inkling(i)) => Some(ended(i.finish(), InklingError::unclosed, cut, whole)?),
             Some(Scan::Qwen(q)) => Some(ended(q.finish(), QwenXmlError::unclosed, cut, sent)?),
             // The scan closes a message the stream ends inside as its call on its own.
             Some(Scan::Recipient(m)) => Some(m.finish()),
@@ -1183,6 +1201,7 @@ impl ToolFormat {
             ToolFormat::Dsml(spelling) => call_parts(spelling, funs, mode),
             ToolFormat::MuseSpark => crate::museatem::call_parts(funs, mode),
             ToolFormat::Mistral => mistral::call_parts(funs, mode),
+            ToolFormat::Inkling => crate::inkling::call_parts(funs, mode),
             ToolFormat::Unparsed => Err(Refusal {
                 message: "the chat template's tool-call markup has no inverse in this server: \
                           send the request without tool_choice \"required\" or a named function"

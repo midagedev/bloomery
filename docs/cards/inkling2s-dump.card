@@ -1,0 +1,13 @@
+# Inkling 2 Small real-file node dumps (refset family lcpp-inkling2s): `bash tools/ref/inkling2-dump.sh --small` on the UD-Q2_K_XL file (191 GB, six
+# shards, 48 stored layers, no loop) runs the patched llama.cpp PR #32695 tree (CPU only, 32 threads) over the five prompts of tools/ref/data/inkling2
+# into ref_inkling2s_{a..e}, 32 greedy tokens each, one prompt a call (DUMP_ONLY, DUMP_SKIP_DONE=1).
+# Predicted wall [derived from docs/cards/inkling2-dump.card, the Mini: 4.3 GMAC a token, 10-37 s prefill, 68.7 ms a greedy token, 10-11 GB written]:
+#   MACs      hidden 2x and ffn 2x of the Mini at the same 48 visits and the same 8 routed experts: x4 a token (~17 GMAC)
+#   load      191 GB mapped lazily; a cold read at the NVMe rate (3-7 GB/s) is 30-60 s, the greedy steps then touch ~10-15 GB a token
+#   prefill   1,152 ids x 4x the Mini plus the Q2 dequant cost: 60-200 s over the five sets
+#   greedy    160 tokens at ~2.5x the Mini bytes per token (Q2 against Q4, x4 the params): ~0.17 s a token, ~30 s
+#   writes    the taps double with the hidden width: ~20 GB over the five sets, 30-60 s
+#   total     3-8 min a full pass; the bound is raised to 5400 s (BLOOMERY_DUMP_BOUND). Measured wall goes in the round report.
+kind: exclusive
+reason: inkling2_dump runs the patched llama.cpp tree on 32 CPU threads over the Small's 191 GB; it holds the page cache
+minutes: 3..8

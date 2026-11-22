@@ -18,6 +18,13 @@
 # (/models/fixtures/inkling2: thirteen layers of the Mini — the stem block whole, one whole core block, a coda layer of the
 # Q8_0 experts, 25 visits — at the real hidden, window and extent) and the sets are fx_ref_inkling2_{a..e}.
 #
+# The Small arm (`bash tools/ref/inkling2-dump.sh --small`): the same tree, patch, prompts and taps on the Small's UD-Q2_K_XL file
+# (six shards, 191 GB, the first shard names it; the family's base program: 48 stored layers, no loop, so a tap's slot is the
+# layer and no loop_* tap exists) into ref_inkling2s_{a..e}, the family lcpp-inkling2s. It refuses to start under 200 GiB of
+# MemAvailable (the file is mapped, not copied, but the page cache is what keeps the greedy steps off the disk) and refuses the
+# fixture tier. DUMP_ONLY="d" dumps the named prompts only and DUMP_SKIP_DONE=1 leaves a set that already holds its trailer, so
+# the long run restarts per prompt: one prompt a call, d first as the smoke. Wall [derived]: docs/cards/inkling2s-dump.card.
+#
 # The prompts are raw text, no chat template and no BOS (the file's header states add_bos_token = false, and
 # crates/tokenizer/tools/inkling2-oracle.sh checked the ids are the same with and without --no-bos before it wrote them),
 # so the model continues a sentence, a paragraph and a function head. The ids come from this tree's own llama-tokenize,
@@ -89,6 +96,11 @@
 # BLOOMERY_DUMP_BOUND only if a slower box needs it).
 set -euo pipefail
 export BLOOMERY_MODEL=inkling2
+SMALL_MODEL=/models/Inkling-2-Small-GGUF/UD-Q2_K_XL/Inkling-2-Small-UD-Q2_K_XL-00001-of-00006.gguf
+if [ "${1:-}" = --small ]; then
+  [ "${BLOOMERY_TIER:-real}" = real ] || { echo "inkling2-dump.sh --small: the Small has no fixture; the real tier only (exit 66)" >&2; exit 66; }
+  export BLOOMERY_REF_MODEL=$SMALL_MODEL
+fi
 # shellcheck source=tools/ref/ref-paths.sh
 source "${BASH_SOURCE[0]%/*}/ref-paths.sh"
 # shellcheck source=tools/ref/cb-dump.sh
@@ -108,6 +120,17 @@ TAPS_A=$TAPS+kq+kq_plus_kq_b+kq_soft_max+kqv+ffn_moe_logits+ffn_moe_probs+ffn_mo
 # name:ids:nodes:greedy — nodes joined by `+`.
 CB_PROMPTS=("a:a:$TAPS_A:32" "b:b:$TAPS:32" "c:c:$TAPS:32" "d:d:$TAPS:32" "e:e:$TAPS:32")
 CB_FLAGS=()
+[ "${1:-}" != --small ] || CB_SET_FAMILY=inkling2s
+
+# small_memory_floor: refuse to load the Small's 191 GB with under 200 GiB of MemAvailable, naming the figure.
+small_memory_floor() {
+  local kb
+  kb=$(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo)
+  [ -n "$kb" ] && [ "$kb" -ge $((200 * 1024 * 1024)) ] || {
+    echo "inkling2-dump.sh --small: MemAvailable is $((${kb:-0} / 1024 / 1024)) GiB, under the 200 GiB the Small's 191 GB file needs resident (exit 75)" >&2
+    exit 75
+  }
+}
 
 case ${1:-} in
   --build) cb_dump_build ;;
@@ -115,5 +138,10 @@ case ${1:-} in
     # shellcheck source=tools/ref/lease.sh
     source "${BASH_SOURCE[0]%/*}/lease.sh"
     cb_dump_run ;;
-  *) echo "inkling2-dump.sh: no argument (the dump) or --build, got $1" >&2; exit 64 ;;
+  --small)
+    # shellcheck source=tools/ref/lease.sh
+    source "${BASH_SOURCE[0]%/*}/lease.sh"
+    small_memory_floor
+    cb_dump_run ;;
+  *) echo "inkling2-dump.sh: no argument (the dump), --small or --build, got $1" >&2; exit 64 ;;
 esac

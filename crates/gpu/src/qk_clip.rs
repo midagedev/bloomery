@@ -7,13 +7,15 @@
 //! values — are the reference's epilogue order, one warp a row, eight warps
 //! a block:
 //!
-//! - a query row takes its per-channel scale, is clipped to an L2 norm of
+//! - a query row takes its head's per-channel scale (row `h` of the file's
+//!   `[n_head][128]` `attn_q_clip`), is clipped to an L2 norm of
 //!   at most `qk_thresh`, then carries the row's `tau`;
 //! - a key row takes no scale and clips at the same threshold; a value row
 //!   takes a gainless RMS norm at `v_eps` and no clip; both append f16 into
 //!   this visit's cache planes, head-major `[n_kv][ctx][HEAD]` u16 as
 //!   `qk_rms` writes them;
-//! - a relative row takes its per-channel scale, clips at `r_thresh`, then
+//! - a relative row takes its head's per-channel scale (row `h` of the file's
+//!   `[n_head][16]` `attn_rel_clip`), clips at `r_thresh`, then
 //!   carries `tau`. A windowed visit passes `tau` 1.0 and the multiply is
 //!   exact; a global visit passes the log-scaled position factor.
 //!
@@ -72,8 +74,8 @@ mod qk_clip_kernels {
         domain = 1,
         block = (256, 1, 1),
         requires = (
-            gq.len() >= 128,
-            gr.len() >= 16,
+            gq.len() >= n_head * 128,
+            gr.len() >= n_head * 16,
             tau.len() >= m,
             pos.len() >= m,
             n_head >= 1,
@@ -160,8 +162,9 @@ mod qk_clip_kernels {
                     }
                 };
                 let yc = if is_q {
-                    // SAFETY: c < 128 <= gq.len() by the launch contract.
-                    xc * unsafe { *gq.get_unchecked(c) }
+                    // SAFETY: h·128 + c < n_head·128 <= gq.len() by the launch
+                    // contract.
+                    xc * unsafe { *gq.get_unchecked(h * HEAD + c) }
                 } else {
                     xc
                 };
@@ -278,8 +281,13 @@ mod qk_clip_kernels {
                 0.0
             }
         };
-        // SAFETY: lane < REL <= gr.len() by the launch contract.
-        let g = unsafe { *gr.get_unchecked(lane) };
+        let g = if lane < REL {
+            // SAFETY: h·REL + lane < n_head·REL <= gr.len() by the launch
+            // contract; the lanes past the row read nothing.
+            unsafe { *gr.get_unchecked(h * REL + lane) }
+        } else {
+            0.0
+        };
         let yc = if lane < REL { xc * g } else { 0.0 };
         let acc = warp_butterfly(if lane < REL { f64::from(yc * yc) } else { 0.0 });
         let root = (acc as f32).sqrt();
@@ -334,8 +342,10 @@ mod qk_clip_kernels {
     }
 }
 
-/// Arguments of one epilogue launch. `gq` and `gr` are the per-channel
-/// scales of the query and relative rows, `tau` one factor a token (1.0 on
+/// Arguments of one epilogue launch. `gq` and `gr` are the per-head,
+/// per-channel scales of the query and relative rows (`n_head · 128` and
+/// `n_head · 16` values, head-major, as the file stores `attn_q_clip` and
+/// `attn_rel_clip`), `tau` one factor a token (1.0 on
 /// a windowed visit), `pos` the append position a token, `v_eps` the value
 /// row's RMS epsilon, `qk_thresh` the query and key clip's threshold,
 /// `r_thresh` the relative rows'.
@@ -428,8 +438,8 @@ impl QkClipKernels {
             ("k", k.len(), m * n_kv * HEAD),
             ("v", v.len(), m * n_kv * HEAD),
             ("r", r.len(), m * n_head * REL),
-            ("gq", gq.len(), HEAD),
-            ("gr", gr.len(), REL),
+            ("gq", gq.len(), n_head * HEAD),
+            ("gr", gr.len(), n_head * REL),
             ("tau", tau.len(), m),
             ("pos", pos.len(), m),
             ("cache_k", cache_k.len(), plane),

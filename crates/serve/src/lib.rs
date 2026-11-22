@@ -42,6 +42,7 @@ pub mod glmxml;
 mod guard;
 pub mod hermes;
 mod http;
+pub mod inkling;
 pub mod live;
 pub mod media;
 pub mod mistral;

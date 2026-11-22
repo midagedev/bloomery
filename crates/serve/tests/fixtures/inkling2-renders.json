@@ -1,0 +1,735 @@
+{
+ "reference": "llama.cpp PR #32695 oracle tree, common_chat_templates_apply (its jinja engine) through tools/ref/inkling2-chat-render.cpp; regenerate with tools/ref/inkling2-chat-render.sh",
+ "templates": {
+  "mini": {
+   "file": "inkling2-mini-chat-template.jinja",
+   "cases": [
+    {
+     "name": "a user turn",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+    },
+    {
+     "name": "system and user, Korean and emoji",
+     "body": {
+      "messages": [
+       {
+        "role": "system",
+        "content": "You are terse."
+       },
+       {
+        "role": "user",
+        "content": "한국어로 답해줘 😀"
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>한국어로 답해줘 😀<|end_message|>"
+    },
+    {
+     "name": "a conversation",
+     "body": {
+      "messages": [
+       {
+        "role": "system",
+        "content": "S"
+       },
+       {
+        "role": "user",
+        "content": "Q1"
+       },
+       {
+        "role": "assistant",
+        "content": "A1"
+       },
+       {
+        "role": "user",
+        "content": "Q2"
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>S<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Q1<|end_message|><|message_model|><|content_text|>A1<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Q2<|end_message|>"
+    },
+    {
+     "name": "content parts",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": [
+         {
+          "type": "text",
+          "text": "a"
+         },
+         {
+          "type": "text",
+          "text": "b"
+         }
+        ]
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>a<|end_message|><|message_user|><|content_text|>b<|end_message|>"
+    },
+    {
+     "name": "tool declarations",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Weather in Seoul?"
+       }
+      ],
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get weather",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "c",
+             "f"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "parameters": {
+          "type": "object",
+          "properties": {}
+         }
+        }
+       }
+      ]
+     },
+     "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get weather\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"get_time\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Seoul?<|end_message|>"
+    },
+    {
+     "name": "two calls and their results",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Weather in Seoul and the time?"
+       },
+       {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+         {
+          "id": "c1",
+          "type": "function",
+          "function": {
+           "name": "get_weather",
+           "arguments": {
+            "unit": "c",
+            "city": "Seoul"
+           }
+          }
+         },
+         {
+          "id": "c2",
+          "type": "function",
+          "function": {
+           "name": "get_time",
+           "arguments": {}
+          }
+         }
+        ]
+       },
+       {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "content": "{\"temp\":21}"
+       },
+       {
+        "role": "tool",
+        "tool_call_id": "c2",
+        "name": "get_time",
+        "content": "15:00"
+       },
+       {
+        "role": "user",
+        "content": "thanks"
+       }
+      ],
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get weather",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "c",
+             "f"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "parameters": {
+          "type": "object",
+          "properties": {}
+         }
+        }
+       }
+      ]
+     },
+     "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get weather\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"get_time\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Seoul and the time?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Seoul\",\"unit\":\"c\"}}<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\":21}<|end_message|><|message_tool|>get_time<|content_text|>15:00<|end_message|><|message_user|><|content_text|>thanks<|end_message|>"
+    },
+    {
+     "name": "a thinking turn kept in history",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "2+2?"
+       },
+       {
+        "role": "assistant",
+        "reasoning_content": "Add them.",
+        "content": "4"
+       },
+       {
+        "role": "user",
+        "content": "and 3+3?"
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>2+2?<|end_message|><|message_model|><|content_thinking|>Add them.<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>and 3+3?<|end_message|>"
+    },
+    {
+     "name": "thinking, text and a call with nested arguments",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Weather?"
+       },
+       {
+        "role": "assistant",
+        "reasoning_content": "Need the tool.",
+        "content": "On it.",
+        "tool_calls": [
+         {
+          "id": "c1",
+          "type": "function",
+          "function": {
+           "name": "get_weather",
+           "arguments": {
+            "city": "Seoul",
+            "extra": {
+             "b": [
+              1,
+              2
+             ],
+             "a": "é",
+             "n": 1.5
+            }
+           }
+          }
+         }
+        ]
+       }
+      ],
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get weather",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "c",
+             "f"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "parameters": {
+          "type": "object",
+          "properties": {}
+         }
+        }
+       }
+      ]
+     },
+     "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get weather\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"get_time\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather?<|end_message|><|message_model|><|content_thinking|>Need the tool.<|end_message|><|message_model|><|content_text|>On it.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Seoul\",\"extra\":{\"b\":[1,2],\"a\":\"é\",\"n\":1.5}}}<|end_message|><|content_model_end_sampling|>"
+    },
+    {
+     "name": "effort low",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ],
+      "reasoning_effort": "low"
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+    },
+    {
+     "name": "effort none",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ],
+      "reasoning_effort": "none"
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+    },
+    {
+     "name": "effort max",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ],
+      "reasoning_effort": "max"
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+    },
+    {
+     "name": "effort the template does not know",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ],
+      "chat_template_kwargs": {
+       "reasoning_effort": "bogus"
+      }
+     },
+     "error": "Unknown reasoning_effort: bogus"
+    }
+   ]
+  },
+  "small": {
+   "file": "inkling2-small-chat-template.jinja",
+   "cases": [
+    {
+     "name": "a user turn",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+    },
+    {
+     "name": "system and user, Korean and emoji",
+     "body": {
+      "messages": [
+       {
+        "role": "system",
+        "content": "You are terse."
+       },
+       {
+        "role": "user",
+        "content": "한국어로 답해줘 😀"
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>한국어로 답해줘 😀<|end_message|>"
+    },
+    {
+     "name": "a conversation",
+     "body": {
+      "messages": [
+       {
+        "role": "system",
+        "content": "S"
+       },
+       {
+        "role": "user",
+        "content": "Q1"
+       },
+       {
+        "role": "assistant",
+        "content": "A1"
+       },
+       {
+        "role": "user",
+        "content": "Q2"
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>S<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Q1<|end_message|><|message_model|><|content_text|>A1<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Q2<|end_message|>"
+    },
+    {
+     "name": "content parts",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": [
+         {
+          "type": "text",
+          "text": "a"
+         },
+         {
+          "type": "text",
+          "text": "b"
+         }
+        ]
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>a<|end_message|><|message_user|><|content_text|>b<|end_message|>"
+    },
+    {
+     "name": "tool declarations",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Weather in Seoul?"
+       }
+      ],
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get weather",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "c",
+             "f"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "parameters": {
+          "type": "object",
+          "properties": {}
+         }
+        }
+       }
+      ]
+     },
+     "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get weather\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"get_time\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Seoul?<|end_message|>"
+    },
+    {
+     "name": "two calls and their results",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Weather in Seoul and the time?"
+       },
+       {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+         {
+          "id": "c1",
+          "type": "function",
+          "function": {
+           "name": "get_weather",
+           "arguments": {
+            "unit": "c",
+            "city": "Seoul"
+           }
+          }
+         },
+         {
+          "id": "c2",
+          "type": "function",
+          "function": {
+           "name": "get_time",
+           "arguments": {}
+          }
+         }
+        ]
+       },
+       {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "content": "{\"temp\":21}"
+       },
+       {
+        "role": "tool",
+        "tool_call_id": "c2",
+        "name": "get_time",
+        "content": "15:00"
+       },
+       {
+        "role": "user",
+        "content": "thanks"
+       }
+      ],
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get weather",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "c",
+             "f"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "parameters": {
+          "type": "object",
+          "properties": {}
+         }
+        }
+       }
+      ]
+     },
+     "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get weather\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"get_time\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather in Seoul and the time?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Seoul\",\"unit\":\"c\"}}<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\":21}<|end_message|><|message_tool|>get_time<|content_text|>15:00<|end_message|><|message_user|><|content_text|>thanks<|end_message|>"
+    },
+    {
+     "name": "a thinking turn kept in history",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "2+2?"
+       },
+       {
+        "role": "assistant",
+        "reasoning_content": "Add them.",
+        "content": "4"
+       },
+       {
+        "role": "user",
+        "content": "and 3+3?"
+       }
+      ]
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>2+2?<|end_message|><|message_model|><|content_thinking|>Add them.<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>and 3+3?<|end_message|>"
+    },
+    {
+     "name": "thinking, text and a call with nested arguments",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Weather?"
+       },
+       {
+        "role": "assistant",
+        "reasoning_content": "Need the tool.",
+        "content": "On it.",
+        "tool_calls": [
+         {
+          "id": "c1",
+          "type": "function",
+          "function": {
+           "name": "get_weather",
+           "arguments": {
+            "city": "Seoul",
+            "extra": {
+             "b": [
+              1,
+              2
+             ],
+             "a": "é",
+             "n": 1.5
+            }
+           }
+          }
+         }
+        ]
+       }
+      ],
+      "tools": [
+       {
+        "type": "function",
+        "function": {
+         "name": "get_weather",
+         "description": "Get weather",
+         "parameters": {
+          "type": "object",
+          "properties": {
+           "city": {
+            "type": "string"
+           },
+           "unit": {
+            "type": "string",
+            "enum": [
+             "c",
+             "f"
+            ]
+           }
+          },
+          "required": [
+           "city"
+          ]
+         }
+        }
+       },
+       {
+        "type": "function",
+        "function": {
+         "name": "get_time",
+         "parameters": {
+          "type": "object",
+          "properties": {}
+         }
+        }
+       }
+      ]
+     },
+     "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get weather\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"get_time\",\"parameters\":{\"properties\":{},\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Weather?<|end_message|><|message_model|><|content_thinking|>Need the tool.<|end_message|><|message_model|><|content_text|>On it.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Seoul\",\"extra\":{\"a\":\"é\",\"b\":[1,2],\"n\":1.5}}}<|end_message|><|content_model_end_sampling|>"
+    },
+    {
+     "name": "effort low",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ],
+      "reasoning_effort": "low"
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+    },
+    {
+     "name": "effort none",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ],
+      "reasoning_effort": "none"
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+    },
+    {
+     "name": "effort max",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ],
+      "reasoning_effort": "max"
+     },
+     "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hello<|end_message|>"
+    },
+    {
+     "name": "effort the template does not know",
+     "body": {
+      "messages": [
+       {
+        "role": "user",
+        "content": "Hello"
+       }
+      ],
+      "chat_template_kwargs": {
+       "reasoning_effort": "bogus"
+      }
+     },
+     "error": "Inkling reasoning_effort must be in [0.0, 0.99]"
+    }
+   ]
+  }
+ }
+}

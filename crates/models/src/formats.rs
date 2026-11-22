@@ -11,10 +11,14 @@ use crate::{ReasoningFormat, ToolFormat};
 const TOOLS: &[(ToolFormat, &[&str])] = &[
     (ToolFormat::QwenXml, &[CALL_OPEN, FUNCTION_OPEN, PARAM_OPEN]),
     (ToolFormat::Mistral, &["[TOOL_CALLS]", "[ARGS]"]),
+    (
+        ToolFormat::Inkling,
+        &["<|message_model|>", "<|content_invoke_tool_json|>"],
+    ),
 ];
 
 /// The reasoning formats a template alone can name: the one whose opening tag the template writes.
-const SPANS: &[ReasoningFormat] = &[ReasoningFormat::THINK];
+const SPANS: &[ReasoningFormat] = &[ReasoningFormat::THINK, ReasoningFormat::INKLING];
 
 /// The tool format `template` teaches; `None`: no markup of a row.
 pub(crate) fn tool_of(template: &str) -> Option<ToolFormat> {

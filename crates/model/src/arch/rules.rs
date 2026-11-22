@@ -224,6 +224,7 @@ const fn tools_name(format: ToolFormat) -> &'static str {
         ToolFormat::MuseSpark => "muse-spark",
         ToolFormat::Mistral => "mistral",
         ToolFormat::Hy4 => "hy-v4-flash",
+        ToolFormat::Inkling => "inkling",
     }
 }
 

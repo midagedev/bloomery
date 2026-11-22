@@ -1,7 +1,7 @@
 //! GPU gate for Inkling 2's attention path on the card: the projection epilogues of a visit and
-//! the rel-bias attention at the group of three, seeded at the Mini's shapes (24 query and 8 key
-//! heads of 128 values, window 1024, relative extent 1024, the qk clip 22.627417, the rel clip
-//! 8.0), then the fixture's node dumps replayed as inputs (refset family `fx-lcpp-inkling2`).
+//! the rel-bias attention at the group of three and of six, seeded at the Mini's shapes (24 query
+//! and 8 key heads of 128 values, window 1024, relative extent 1024, the qk clip 22.627417, the
+//! rel clip 8.0) and at the Small's heads (48 over 8), then the fixture's node dumps replayed as inputs (refset family `fx-lcpp-inkling2`).
 //! Nothing opens a model file.
 //!
 //! The reference is llama.cpp's `src/models/inkling2.cpp` of pull request #32695's head (`clip()`
@@ -22,6 +22,8 @@
 //!    bit-identical; the untouched cache cells untouched. A launch with a value whose square
 //!    overflows raises `CacheValue` and writes NaN rows; a position past `ctx` raises `CachePos`,
 //!    writes NaN and appends nothing.
+//!    `file_clip`: the fixture file's own `attn_q_clip` and `attn_rel_clip` (one scale row a head)
+//!    through the same launch of layers 0 and 5, against the host rule with each head's own row.
 //! 2. `attention`: the segment and merge launches of `rel_bias` over a plane — windowed rows at
 //!    live counts 1, 511, 512, 1023, 1024 and 1025 (the last with the oldest key dropped), global
 //!    rows at 1, 1024 and 1100 (the last with 76 keys past the extent, where the bias reads 0) —
@@ -77,6 +79,8 @@ mod gate {
     /// query heads three a key head.
     const N_HEAD: usize = 24;
     const N_KV: usize = 8;
+    /// The Small's query heads over the same eight key heads: the group of six.
+    const N_HEAD_SMALL: usize = 48;
     /// The windowed visits' window and the bias table's extent, the one distance the bias reads
     /// 0 past (the Mini's and the fixture's own values).
     const WINDOW: usize = 1024;
@@ -352,8 +356,7 @@ mod gate {
         window: usize,
         sinks: &[f32],
         ring_rows: Option<usize>,
-        m: usize,
-        ctx: usize,
+        (n_head, m, ctx): (usize, usize, usize),
     ) -> Result<Vec<f32>, GateError> {
         let s = dev.stream();
         let segs = window_segments(window);
@@ -366,9 +369,9 @@ mod gate {
             dev.up(bias)?,
             dev.up(sinks)?,
         );
-        let mut part_v = DeviceBuffer::<f32>::zeroed(s, m * N_HEAD * segs * HEAD)?;
-        let mut part_ms = DeviceBuffer::<f32>::zeroed(s, m * N_HEAD * segs * 2)?;
-        let mut y = DeviceBuffer::<f32>::zeroed(s, m * N_HEAD * HEAD)?;
+        let mut part_v = DeviceBuffer::<f32>::zeroed(s, m * n_head * segs * HEAD)?;
+        let mut part_ms = DeviceBuffer::<f32>::zeroed(s, m * n_head * segs * 2)?;
+        let mut y = DeviceBuffer::<f32>::zeroed(s, m * n_head * HEAD)?;
         dev.rel.enqueue(
             s,
             RelBiasArgs {
@@ -391,7 +394,7 @@ mod gate {
                 fault: dev.gpu.unlabelled_sink(),
                 y: &mut y,
             },
-            N_HEAD,
+            n_head,
         )?;
         dev.read(&y)
     }
@@ -463,8 +466,8 @@ mod gate {
         // carries (1 + 0.1*ln(3)); the append position is its own argument
         // and stays inside ctx.
         let m = 2usize;
-        let gq: Vec<f32> = (0..HEAD).map(|_| rng.uni(0.5, 1.5)).collect();
-        let gr = vec![1.0f32; REL];
+        let gq: Vec<f32> = (0..N_HEAD * HEAD).map(|_| rng.uni(0.5, 1.5)).collect();
+        let gr: Vec<f32> = (0..N_HEAD * REL).map(|_| rng.uni(0.5, 1.5)).collect();
         let tau = vec![1.0f32, tau_of(3 * 8192 - 1)];
         let pos = [P0, P1];
         // Head 0 of each kind sits at its clip's exact boundary: the qk rows 128 values of 2.0
@@ -499,9 +502,11 @@ mod gate {
         for (t, &tau_t) in tau.iter().enumerate() {
             for h in 0..N_HEAD {
                 let b = (t * N_HEAD + h) * HEAD;
-                want_q.extend(host_clip128(&q[b..b + HEAD], &gq, QK_CLIP, tau_t));
+                let g = &gq[h * HEAD..(h + 1) * HEAD];
+                want_q.extend(host_clip128(&q[b..b + HEAD], g, QK_CLIP, tau_t));
                 let rb = (t * N_HEAD + h) * REL;
-                want_r.extend(host_clip_rel(&r[rb..rb + REL], &gr, tau_t));
+                let g = &gr[h * REL..(h + 1) * REL];
+                want_r.extend(host_clip_rel(&r[rb..rb + REL], g, tau_t));
             }
             for h in 0..N_KV {
                 let b = (t * N_KV + h) * HEAD;
@@ -595,6 +600,85 @@ mod gate {
         Ok([ok, ok2, vec![ok3], vec![ok4]].concat())
     }
 
+    /// The file's own clip tensors, `attn_q_clip` `[n_head][128]` and `attn_rel_clip`
+    /// `[n_head][16]`, through the epilogue: layers 0 (windowed) and 5 (windowless) of the
+    /// fixture, seeded rows against the host rule with each head's own scale row. The rows of
+    /// the scale tensors differ across heads (the premise a shared scale would hide), and
+    /// the output of a head that sits at the file's scale of head 0 would not be this head's.
+    fn file_clip_clauses(dev: &Dev, rng: &mut GateRng) -> Result<Vec<bool>, GateError> {
+        const CTX: usize = 8;
+        let path = bloomery_gpu_gates::ref_model_path()?;
+        let split =
+            gguf::Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        let mut ok = Vec::new();
+        for l in [0usize, 5] {
+            let gq = bloomery_gpu_gates::split_f32(
+                &split,
+                &format!("blk.{l}.attn_q_clip.weight"),
+                N_HEAD * HEAD,
+            )?;
+            let gr = bloomery_gpu_gates::split_f32(
+                &split,
+                &format!("blk.{l}.attn_rel_clip.weight"),
+                N_HEAD * REL,
+            )?;
+            let differ = (1..N_HEAD).all(|h| {
+                gq[h * HEAD..(h + 1) * HEAD] != gq[..HEAD]
+                    && gr[h * REL..(h + 1) * REL] != gr[..REL]
+            });
+            ok.push(clause(
+                &format!("file clip rows differ by head, layer {l}"),
+                differ,
+                "every head's q and rel scale row is not head 0's",
+            ));
+            let m = 2usize;
+            let tau = vec![1.0f32, 1.0];
+            let pos = [3u32, 5];
+            let q: Vec<f32> = (0..m * N_HEAD * HEAD)
+                .map(|_| rng.uni(-1.0, 1.0) * 4.0)
+                .collect();
+            let k: Vec<f32> = (0..m * N_KV * HEAD)
+                .map(|_| rng.uni(-1.0, 1.0) * 4.0)
+                .collect();
+            let v: Vec<f32> = (0..m * N_KV * HEAD).map(|_| rng.uni(-1.0, 1.0)).collect();
+            let r: Vec<f32> = (0..m * N_HEAD * REL)
+                .map(|_| rng.uni(-1.0, 1.0) * 4.0)
+                .collect();
+            let (q0, _, _, r0, _, _) = clip_launch(dev, &q, &k, &v, &r, &gq, &gr, &tau, &pos, CTX)?;
+            let mut want_q = Vec::with_capacity(q.len());
+            let mut want_r = Vec::with_capacity(r.len());
+            for t in 0..m {
+                for h in 0..N_HEAD {
+                    let b = (t * N_HEAD + h) * HEAD;
+                    want_q.extend(host_clip128(
+                        &q[b..b + HEAD],
+                        &gq[h * HEAD..(h + 1) * HEAD],
+                        QK_CLIP,
+                        1.0,
+                    ));
+                    let rb = (t * N_HEAD + h) * REL;
+                    want_r.extend(host_clip_rel(
+                        &r[rb..rb + REL],
+                        &gr[h * REL..(h + 1) * REL],
+                        1.0,
+                    ));
+                }
+            }
+            ok.push(clause(
+                &format!("file clip q bits, layer {l}"),
+                bits_equal(&q0, &want_q),
+                "each head's own scale row, the host rule's bits",
+            ));
+            ok.push(clause(
+                &format!("file clip r bits, layer {l}"),
+                bits_equal(&r0, &want_r),
+                "each head's own scale row, the host rule's bits",
+            ));
+            ok.push(dev.no_fault("file clip")?);
+        }
+        Ok(ok)
+    }
+
     /// A seeded `[REL][EXTENT]` table with strong distance variation and a large last column
     /// (the column a pad rule must not read).
     fn seeded_bias(rng: &mut GateRng) -> Vec<f32> {
@@ -610,7 +694,12 @@ mod gate {
 
     /// The windowed and global seeded launches against the f64 rule, the ring form, the fault
     /// row.
-    fn attention_clauses(dev: &Dev, rng: &mut GateRng) -> Result<Vec<bool>, GateError> {
+    fn attention_clauses(
+        dev: &Dev,
+        rng: &mut GateRng,
+        n_head: usize,
+    ) -> Result<Vec<bool>, GateError> {
+        let group = n_head / N_KV;
         const CTX: usize = 1100;
         let mut cache = vec![0u16; N_KV * CTX * HEAD];
         for x in cache.iter_mut() {
@@ -629,11 +718,11 @@ mod gate {
                 vec![1, 511, 512, 1023, 1024, 1025]
             };
             let m = counts.len();
-            let mut q = vec![0.0f32; m * N_HEAD * HEAD];
+            let mut q = vec![0.0f32; m * n_head * HEAD];
             for x in q.iter_mut() {
                 *x = rng.uni(-1.0, 1.0) * 3.0;
             }
-            for i in 0..m * N_HEAD {
+            for i in 0..m * n_head {
                 let sc = head_scales[i % 4];
                 let b = i * HEAD;
                 if sc == 0.0 {
@@ -644,15 +733,25 @@ mod gate {
                     }
                 }
             }
-            let r: Vec<f32> = (0..m * N_HEAD * REL).map(|_| rng.uni(-1.0, 1.0)).collect();
-            let sinks: Vec<f32> = (0..m * N_HEAD).map(|i| sink_kinds[i % 4]).collect();
+            let r: Vec<f32> = (0..m * n_head * REL).map(|_| rng.uni(-1.0, 1.0)).collect();
+            let sinks: Vec<f32> = (0..m * n_head).map(|i| sink_kinds[i % 4]).collect();
             let n_keys = counts.clone();
             let y = rel_launch(
-                dev, &q, &cache, &cache, &n_keys, &r, &bias, window, &sinks, None, m, CTX,
+                dev,
+                &q,
+                &cache,
+                &cache,
+                &n_keys,
+                &r,
+                &bias,
+                window,
+                &sinks,
+                None,
+                (n_head, m, CTX),
             )?;
-            let want: Vec<f32> = par_map(m * N_HEAD, |i| {
-                let (t, h) = (i / N_HEAD, i % N_HEAD);
-                let kh = h / 3;
+            let want: Vec<f32> = par_map(m * n_head, |i| {
+                let (t, h) = (i / n_head, i % n_head);
+                let kh = h / group;
                 let plane = &cache[kh * CTX * HEAD..(kh + 1) * CTX * HEAD];
                 ref_rel_row(
                     &q[i * HEAD..(i + 1) * HEAD],
@@ -671,16 +770,26 @@ mod gate {
             .collect();
             let what = if window == 0 { "global" } else { "windowed" };
             ok.push(banded(
-                &format!("attention {what} counts {counts:?}"),
+                &format!("attention {n_head} heads {what} counts {counts:?}"),
                 ATTN_BAND,
                 &y,
                 &want,
             ));
             let again = rel_launch(
-                dev, &q, &cache, &cache, &n_keys, &r, &bias, window, &sinks, None, m, CTX,
+                dev,
+                &q,
+                &cache,
+                &cache,
+                &n_keys,
+                &r,
+                &bias,
+                window,
+                &sinks,
+                None,
+                (n_head, m, CTX),
             )?;
             ok.push(clause(
-                &format!("attention {what} rerun"),
+                &format!("attention {n_head} heads {what} rerun"),
                 bits_equal(&y, &again),
                 "bit-identical",
             ));
@@ -695,30 +804,28 @@ mod gate {
                 window,
                 &sinks,
                 Some(CTX),
-                m,
-                CTX,
+                (n_head, m, CTX),
             )?;
             ok.push(clause(
-                &format!("attention {what} ring"),
+                &format!("attention {n_head} heads {what} ring"),
                 bits_equal(&y, &ring),
                 "the ring of the full context over the same rows: the plane's bits",
             ));
-            ok.push(dev.no_fault(&format!("attention {what}"))?);
+            ok.push(dev.no_fault(&format!("attention {n_head} heads {what}"))?);
         }
         // A live count past ctx: named, NaN rows.
         let y = rel_launch(
             dev,
-            &vec![0.0; N_HEAD * HEAD],
+            &vec![0.0; n_head * HEAD],
             &cache,
             &cache,
             &[CTX as u32 + 1],
-            &vec![0.0; N_HEAD * REL],
+            &vec![0.0; n_head * REL],
             &bias,
             WINDOW,
-            &[0.0; N_HEAD],
+            &vec![0.0; n_head],
             None,
-            1,
-            CTX,
+            (n_head, 1, CTX),
         )?;
         let f = dev.gpu.fault()?;
         ok.push(clause(
@@ -731,7 +838,8 @@ mod gate {
     }
 
     /// A launch whose every sink is 30 above every logit: the rows' weights vanish.
-    fn sink_clauses(dev: &Dev, rng: &mut GateRng) -> Result<Vec<bool>, GateError> {
+    fn sink_clauses(dev: &Dev, rng: &mut GateRng, n_head: usize) -> Result<Vec<bool>, GateError> {
+        let group = n_head / N_KV;
         const CTX: usize = 64;
         let mut cache = vec![0u16; N_KV * CTX * HEAD];
         for x in cache.iter_mut() {
@@ -744,13 +852,13 @@ mod gate {
         for x in bias.iter_mut() {
             *x = rng.uni(-0.05, 0.05);
         }
-        let q: Vec<f32> = (0..N_HEAD * HEAD)
+        let q: Vec<f32> = (0..n_head * HEAD)
             .map(|_| rng.uni(-1.0, 1.0) * 0.2)
             .collect();
-        let r: Vec<f32> = (0..N_HEAD * REL)
+        let r: Vec<f32> = (0..n_head * REL)
             .map(|_| rng.uni(-1.0, 1.0) * 0.2)
             .collect();
-        let sinks = vec![SINK_OVER; N_HEAD];
+        let sinks = vec![SINK_OVER; n_head];
         let y = rel_launch(
             dev,
             &q,
@@ -762,12 +870,11 @@ mod gate {
             WINDOW,
             &sinks,
             None,
-            1,
-            CTX,
+            (n_head, 1, CTX),
         )?;
-        let want: Vec<f32> = (0..N_HEAD)
+        let want: Vec<f32> = (0..n_head)
             .flat_map(|h| {
-                let plane = &cache[(h / 3) * CTX * HEAD..(h / 3 + 1) * CTX * HEAD];
+                let plane = &cache[(h / group) * CTX * HEAD..(h / group + 1) * CTX * HEAD];
                 ref_rel_row(
                     &q[h * HEAD..(h + 1) * HEAD],
                     plane,
@@ -781,11 +888,16 @@ mod gate {
             })
             .map(|v| v as f32)
             .collect();
-        let mut ok = vec![banded("sink 30 over every logit", ATTN_BAND, &y, &want)];
+        let mut ok = vec![banded(
+            &format!("sink 30 over every logit at {n_head} heads"),
+            ATTN_BAND,
+            &y,
+            &want,
+        )];
         let mag = y.iter().fold(0.0f32, |a, v| a.max(v.abs()));
         let want_mag = want.iter().fold(0.0f32, |a, v| a.max(v.abs()));
         ok.push(clause(
-            "sink 30 rows vanish",
+            &format!("sink 30 rows vanish at {n_head} heads"),
             mag < 1e-9 && want_mag < 1e-9,
             &format!("max |y| {mag:.3e} (reference {want_mag:.3e})"),
         ));
@@ -848,6 +960,8 @@ mod gate {
         let mut ok = vec![
             refused("rel heads 26 over 8", rel(26, EXTENT, scale(), N_HEAD)),
             refused("rel heads 21 over 8", rel(21, EXTENT, scale(), N_HEAD)),
+            refused("rel heads 32 over 8", rel(32, EXTENT, scale(), N_HEAD)),
+            refused("rel heads 72 over 8", rel(72, EXTENT, scale(), N_HEAD)),
             refused("rel extent 0", rel(N_HEAD, 0, scale(), N_HEAD)),
             refused("rel scale inf", rel(N_HEAD, EXTENT, f32::INFINITY, N_HEAD)),
             refused("rel sinks short", rel(N_HEAD, EXTENT, scale(), N_HEAD - 1)),
@@ -896,14 +1010,16 @@ mod gate {
             dev.up(&vec![0.5f32; N_HEAD * REL])?,
         );
         let (gq, gr, tau, pos) = (
-            dev.up(&[1.0f32; HEAD])?,
-            dev.up(&[1.0f32; REL])?,
+            dev.up(&vec![1.0f32; N_HEAD * HEAD])?,
+            dev.up(&vec![1.0f32; N_HEAD * REL])?,
             dev.up(&[1.0f32])?,
             dev.up(&[0u32])?,
         );
         let mut cache_k = DeviceBuffer::<u16>::zeroed(s, N_KV * 4 * HEAD)?;
         let mut cache_v = DeviceBuffer::<u16>::zeroed(s, N_KV * 4 * HEAD)?;
-        let mut clip = |m: usize, ctx: usize, qk: f32, re: f32, eps: f32| {
+        // One head's scale row each: the shared form the kernel no longer reads.
+        let (gq_one, gr_one) = (dev.up(&[1.0f32; HEAD])?, dev.up(&[1.0f32; REL])?);
+        let mut clip = |m: usize, ctx: usize, qk: f32, re: f32, eps: f32, shared: bool| {
             dev.clip.enqueue(
                 s,
                 QkClipArgs {
@@ -911,8 +1027,8 @@ mod gate {
                     k: &mut k,
                     v: &mut v,
                     r: &mut r,
-                    gq: &gq,
-                    gr: &gr,
+                    gq: if shared { &gq_one } else { &gq },
+                    gr: if shared { &gr_one } else { &gr },
                     tau: &tau,
                     pos: &pos,
                     v_eps: eps,
@@ -928,17 +1044,30 @@ mod gate {
                 },
             )
         };
-        ok.push(refused("clip m 0", clip(0, 4, QK_CLIP, REL_CLIP, V_EPS)));
+        ok.push(refused(
+            "clip m 0",
+            clip(0, 4, QK_CLIP, REL_CLIP, V_EPS, false),
+        ));
         ok.push(refused(
             "clip m over ctx",
-            clip(2, 1, QK_CLIP, REL_CLIP, V_EPS),
+            clip(2, 1, QK_CLIP, REL_CLIP, V_EPS, false),
         ));
-        ok.push(refused("clip qk 0", clip(1, 4, 0.0, REL_CLIP, V_EPS)));
+        ok.push(refused(
+            "clip qk 0",
+            clip(1, 4, 0.0, REL_CLIP, V_EPS, false),
+        ));
         ok.push(refused(
             "clip rel NaN",
-            clip(1, 4, QK_CLIP, f32::NAN, V_EPS),
+            clip(1, 4, QK_CLIP, f32::NAN, V_EPS, false),
         ));
-        ok.push(refused("clip eps -1", clip(1, 4, QK_CLIP, REL_CLIP, -1.0)));
+        ok.push(refused(
+            "clip eps -1",
+            clip(1, 4, QK_CLIP, REL_CLIP, -1.0, false),
+        ));
+        ok.push(refused(
+            "clip scales of one head for n_head heads",
+            clip(1, 4, QK_CLIP, REL_CLIP, V_EPS, true),
+        ));
         Ok(ok)
     }
 
@@ -1354,8 +1483,11 @@ mod gate {
         let mut rng = GateRng(SEED);
         let mut results = Vec::new();
         results.extend(epilogue_clauses(&dev, &mut rng)?);
-        results.extend(attention_clauses(&dev, &mut rng)?);
-        results.extend(sink_clauses(&dev, &mut rng)?);
+        results.extend(file_clip_clauses(&dev, &mut rng)?);
+        for n_head in [N_HEAD, N_HEAD_SMALL] {
+            results.extend(attention_clauses(&dev, &mut rng, n_head)?);
+            results.extend(sink_clauses(&dev, &mut rng, n_head)?);
+        }
         results.extend(refusal_clauses(&dev, &mut rng)?);
         results.extend(fx_a_clauses(&dev)?);
         results.extend(fx_e_clauses(&dev)?);

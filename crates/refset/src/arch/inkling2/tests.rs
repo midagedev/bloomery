@@ -1,4 +1,4 @@
-use super::{ARCH, BUILD, COMMIT, LCPP, MODEL, SETS, fixture};
+use super::{ARCH, BUILD, COMMIT, LCPP, MODEL, SETS, fixture, small};
 use crate::RefError;
 use crate::arch::node_dump_contract::{self as contract, Row};
 use crate::family::Identity;
@@ -77,9 +77,86 @@ fn the_family_holds_the_dump_recipes_sets() {
         .collect();
     assert_eq!(twins, SETS, "each fixture set is the real set behind fx_");
     let names: Vec<&str> = crate::arch::families(ARCH).iter().map(|f| f.name).collect();
-    assert_eq!(names, ["lcpp-inkling2", "fx-lcpp-inkling2"]);
+    assert_eq!(
+        names,
+        ["lcpp-inkling2", "fx-lcpp-inkling2", "lcpp-inkling2s"]
+    );
     assert_eq!(
         crate::arch::node_dumps(ARCH).map(|f| f.name),
         Some("lcpp-inkling2")
+    );
+}
+
+/// The Small's family row: its own first shard and set names, the Mini's build and architecture. The sets it must refuse are
+/// the Mini's file (same architecture and build, only the `# model` line tells it apart), the fixture's file, and the Small's
+/// file under another path or shard.
+const SMALL_ROW: Row = Row {
+    family: &small::LCPP,
+    model: small::MODEL,
+    build: BUILD,
+    arch: ARCH,
+    other_files: &[
+        MODEL,
+        "/models/fixtures/inkling2/inkling2-fixture-00001-of-00001.gguf",
+        "/models/elsewhere/Inkling-2-Small-UD-Q2_K_XL-00001-of-00006.gguf",
+        "/models/Inkling-2-Small-GGUF/UD-Q2_K_XL/Inkling-2-Small-UD-Q2_K_XL-00002-of-00006.gguf",
+    ],
+    other_builds: &[
+        COMMIT,
+        "6196d9802+inkling2-scale-000000000000",
+        "999999999+inkling2-scale-ab1511fbc024",
+    ],
+    other_arches: &["inkling2_loop", "dflash"],
+};
+
+#[test]
+fn the_small_family_takes_a_set_of_its_file_build_and_arch() -> Result<(), RefError> {
+    contract::takes_a_set_of_its_file_build_and_arch(&SMALL_ROW)
+}
+
+#[test]
+fn the_small_family_refuses_a_set_of_another_file() -> Result<(), RefError> {
+    contract::refuses_a_set_of_another_file(&SMALL_ROW)
+}
+
+#[test]
+fn the_small_family_refuses_a_set_of_another_build() -> Result<(), RefError> {
+    contract::refuses_a_set_of_another_build(&SMALL_ROW)
+}
+
+#[test]
+fn the_small_family_refuses_a_set_of_another_arch() -> Result<(), RefError> {
+    contract::refuses_a_set_of_another_arch(&SMALL_ROW)
+}
+
+#[test]
+fn the_small_family_refuses_a_set_without_its_trailer() -> Result<(), RefError> {
+    contract::refuses_a_set_without_its_trailer(&SMALL_ROW)
+}
+
+/// The Small's sets are the dump's names with the `s`, and the Mini's family refuses them by their model line: a set of the
+/// Mini's file written under the Small's name is stale for the Small's family, and the architecture lists both.
+#[test]
+fn the_small_family_holds_its_own_sets() {
+    assert_eq!(
+        small::SETS,
+        [
+            "ref_inkling2s_a",
+            "ref_inkling2s_b",
+            "ref_inkling2s_c",
+            "ref_inkling2s_d",
+            "ref_inkling2s_e"
+        ]
+    );
+    assert_eq!(small::LCPP.identity, Identity::Manifest);
+    let names: Vec<&str> = crate::arch::families(ARCH).iter().map(|f| f.name).collect();
+    assert_eq!(
+        names,
+        ["lcpp-inkling2", "fx-lcpp-inkling2", "lcpp-inkling2s"]
+    );
+    assert_eq!(
+        crate::arch::node_dumps(ARCH).map(|f| f.name),
+        Some("lcpp-inkling2"),
+        "the Mini's family stays the architecture's node dumps"
     );
 }

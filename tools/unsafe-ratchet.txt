@@ -874,7 +874,10 @@ gguf 7 2 0
 # (loop_control.rs, 21), the residual short convs (linear/conv_res.rs, 10), the normed attn-res mix entry
 # (attn_res.rs, 22) and the w13 split's two copies (w13_split.rs, 2); one launcher fn each, the mix two, each
 # with its SAFETY line.
-gpu 3326 444 10
+# PIN(2026-11-22): gpu 3326/444 -> 3351/445, new kernel entries, not old code relaxed: the loop controller's split
+# launches (loop_control.rs: the down and out entries' staging, dots and stores, the shared out block fn with its
+# `# Safety` contract), each unsafe block with its SAFETY line.
+gpu 3351 445 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

@@ -1,0 +1,20 @@
+# Inkling 2's own cases (GPT-4o's pre-tokenizer expression): the chat markup, Korean, code and emoji; tests/cases.txt is read first.
+<|message_user|><|content_text|>안녕하세요, 오늘 서울 날씨는 어때요?<|end_message|>
+<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|>
+<|message_model|><|content_thinking|>사용자가 날씨를 묻는다. 도구를 호출하자.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"서울"}}<|end_message|><|content_model_end_sampling|>
+<|message_system|>tool_declare<|content_xml|>[{"description":"d","name":"f","parameters":{"type":"object"},"type":"function"}]<|end_message|>
+<|message_tool|>get_weather<|content_text|>{"temp":21.5,"unit":"°C"}<|end_message|>
+<|message_user|><|content_image|><|unused_200054|><|end_message|>
+<|message_user|>no content token<|end_message|>
+def fibonacci(n: int) -> int:\n    """Return the n-th number."""\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n
+#include <stdio.h>\nint main(void) {\n  printf("%d\\n", 0x1F + 077);\n  return 0;\n}\n
+{"key": [1, 2.5e-3, null, true], "nested": {"한글": "값", "emoji": "\\ud83d\\ude00"}}
+SELECT u.id, COUNT(*) AS n FROM users u JOIN posts p ON p.uid = u.id WHERE p.created_at >= '2026-01-01' GROUP BY u.id;
+https://example.com/path/to/page?x=1&y=%ED%95%9C#frag user@host.tld ~/.config/app.toml C:\\Users\\me\\file.txt
+😀😃😄😁 🚀✨ 🇰🇷🇺🇸 👩🏽‍💻 ❤️‍🔥 🏳️‍🌈 #️⃣
+한국어와 English가 섞인 문장입니다. GPT-4o's tokenizer: don't, I'll, they're, 'TIS, ok.
+가나다라마바사 ㄱㄴㄷ ㅏㅑㅓ ㅋㅋㅋㅋ ㅠㅠ 감사합니다!!! ...?
+2026년 11월 22일 오후 3시 45분, 1,234,567원 (₩) 3.14159 1e10 0xDEADBEEF
+Ωmega ΑΒΓ αβγ Привет, мир! مرحبا بالعالم שלום עולם नमस्ते दुनिया สวัสดีชาวโลก
+\n\n\n\n\n    \n  \t\t x \r\n\r\n y
+x\xe2\x80\xa8y\xe2\x80\xa9z\xc2\x85w\x0b\x0c

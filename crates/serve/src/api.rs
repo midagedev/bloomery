@@ -455,6 +455,7 @@ impl Server {
             fatal_linger: config.fatal_linger,
             tool_format: ToolFormat::of_chat_template(&template),
             object_arguments: needs_object_arguments(&template),
+            typed_content: keeps_typed_content(template.source()),
             thinking_off,
             preparation: config.chat_preparation,
             think: ThinkTags::THINK,
@@ -743,6 +744,10 @@ struct State {
     /// Whether the template reads a tool call's `arguments` as an object
     /// ([`needs_object_arguments`]), decided once.
     object_arguments: bool,
+    /// Whether the template reads a message's content parts one by one
+    /// ([`keeps_typed_content`]), decided once: its text parts reach it as the array
+    /// the request sent, not joined into one text.
+    typed_content: bool,
     /// How the template answers `reasoning_effort: "none"`
     /// ([`probe_thinking_off`]), decided once.
     thinking_off: ThinkingOff,
@@ -3265,6 +3270,19 @@ fn render_chat(state: &State, b: &Map<String, Value>) -> Result<Rendered, ApiErr
         // special tokens' spellings are their tokens.
         let client = role != "assistant";
         match m.get("content") {
+            Some(Value::Array(parts)) if state.media.is_none() && state.typed_content => {
+                // The template renders each part as a block of its own: the parts stay a list
+                // (the same refusals as the joined text, [`content_text`]).
+                content_text(parts).map_err(|e| e.at("messages"))?;
+                let typed = parts
+                    .iter()
+                    .map(|p| {
+                        let text = p.get("text").and_then(Value::as_str).unwrap_or_default();
+                        json!({"type": "text", "text": guard.text_if(client, text)})
+                    })
+                    .collect();
+                flat.insert("content".into(), Value::Array(typed));
+            }
             Some(Value::Array(parts)) => {
                 let text = match &state.media {
                     None => guard
@@ -3422,6 +3440,14 @@ fn clip_budget(state: &State, msgs: &[Value]) -> usize {
 /// The argument a template's probe call carries.
 const PROBE_ARGUMENT: &str = "argument_needle";
 
+/// Whether the template wants a message's content parts as the list the request sent, not as
+/// one text: Inkling 2's, which writes a block for each part. llama-server keeps the typed list
+/// for these templates by the same two spellings (`is_inkling_template`,
+/// `common/parsers/inkling.cpp`).
+fn keeps_typed_content(source: &str) -> bool {
+    source.contains("<|message_user|>") && source.contains("<|content_image|>")
+}
+
 /// Whether the chat template needs a tool call's `arguments` as an object
 /// rather than the JSON string the OpenAI API carries: a probe call renders
 /// with its arguments as an object and as that object's JSON string, and the
@@ -3507,6 +3533,8 @@ impl ThinkingOff {
     /// meaning.
     fn note(self) -> Option<&'static str> {
         match self {
+            // The request's own word reaches the template, which reads it as no thinking.
+            ThinkingOff::OffWord("none") => None,
             ThinkingOff::LowEffort => Some(
                 "chat template: no thinking switch; reasoning_effort \"none\" and \
                  enable_thinking false are sent as \"low\"",
@@ -3535,9 +3563,10 @@ impl ThinkingOff {
 /// [`LowEffort`](ThinkingOff::LowEffort); otherwise
 /// [`Neither`](ThinkingOff::Neither). A render that fails is the bind's
 /// error, naming the probe: the answer is never guessed.
-/// The effort words a template may take as its own for no thinking, beside
-/// OpenAI's `"none"` ([`ThinkingOff::OffWord`]).
-const OFF_WORDS: [&str; 1] = ["no_think"];
+/// The effort words a template may take as its own for no thinking
+/// ([`ThinkingOff::OffWord`]): OpenAI's `"none"` where the template reads it as itself
+/// (Inkling 2's maps it to effort 0), and Hy4-flash's `"no_think"`.
+const OFF_WORDS: [&str; 2] = ["none", "no_think"];
 
 /// An effort word no template takes: a template that refuses it names the
 /// words it takes ([`probe_thinking_off`]).
@@ -4883,7 +4912,12 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
     if !parses_tools(b) {
         // Muse Spark's reasoning is a message to `self`, which only its recipient scan splits out
         // (the template names no think tag), so a turn with no tools is scanned too.
-        return Ok(matches!(state.tool_format, ToolFormat::MuseSpark).then_some(Tools::MuseSpark));
+        return Ok(match state.tool_format {
+            ToolFormat::MuseSpark => Some(Tools::MuseSpark),
+            // Inkling 2's thinking is a block of its own, which only its scan splits out.
+            ToolFormat::Inkling => Some(Tools::Inkling),
+            _ => None,
+        });
     }
     Ok(Some(match state.tool_format {
         ToolFormat::Dsml(spelling) => Tools::Dsml(spelling),
@@ -4896,6 +4930,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
         }
         ToolFormat::MuseSpark => Tools::MuseSpark,
         ToolFormat::Mistral => Tools::Mistral,
+        ToolFormat::Inkling => Tools::Inkling,
         ToolFormat::Unparsed => {
             return Err(ApiError {
                 retry_after: false,
@@ -4904,7 +4939,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
                 kind: "not_supported_error",
                 message: "the chat template's tool-call markup has no parser in this server \
                           (DSML, GLM's and Solar's key/value markup, Hermes' and Qwen's XML, \
-                          Muse's recipient markup and Mistral's [TOOL_CALLS] are parsed): send \
+                          Muse's recipient markup, Mistral's [TOOL_CALLS] and Inkling's blocks are parsed): send \
                           the request without tools or with tool_choice \"none\""
                     .to_owned(),
             });

@@ -406,8 +406,18 @@ impl Vocab {
                     Model::Gemma4 => "gemma4",
                     _ => m.str("tokenizer.ggml.pre")?.unwrap_or(""),
                 };
-                let pre = crate::named(&Pre::NAMES, name)
+                let mut pre = crate::named(&Pre::NAMES, name)
                     .ok_or_else(|| Error::UnsupportedPre(name.to_string()))?;
+                // The Small's file spells the GPT-4o pre-tokenizer `gpt-4o`, and the tree that reads
+                // it (with the Mini's `inkling2`) runs the expression with `\p{M}` in its lookaheads.
+                if pre == Pre::Gpt4o
+                    && matches!(
+                        m.str("general.architecture")?,
+                        Some("inkling2" | "inkling2_loop")
+                    )
+                {
+                    pre = Pre::Inkling2;
+                }
                 clean_spaces = CLEAN_SPACES.contains(&name);
                 // Only the private stop key marks a Hugging Face tokenizer, whose pre-tokenizer
                 // runs as its tokenizer.json does.

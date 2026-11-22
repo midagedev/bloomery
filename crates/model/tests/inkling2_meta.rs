@@ -13,6 +13,8 @@
 //!
 //! `hw_`: needs the files on the box (`just gate-inkling2-meta`). Headers only: seconds.
 
+#[path = "common/header_tables.rs"]
+mod header_tables;
 #[path = "common/spec_view.rs"]
 mod spec_view;
 
@@ -216,10 +218,34 @@ fn check(
     visits: &[&str],
     plan: &[&str],
 ) {
+    let split = Split::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+    check_split(
+        path,
+        &split,
+        view,
+        defaults,
+        unread_pins,
+        tensors,
+        visits,
+        plan,
+    );
+}
+
+/// [`check`] over an opened `split` named `path`.
+#[allow(clippy::too_many_arguments)]
+fn check_split(
+    path: &str,
+    split: &Split,
+    view: &[&str],
+    defaults: &[&str],
+    unread_pins: &[&str],
+    tensors: &[&str],
+    visits: &[&str],
+    plan: &[&str],
+) {
     let mut o = String::new();
     let mut b = Vec::new();
-    let split = Split::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
-    let read = model::arch::spec(&split).unwrap_or_else(|e| panic!("spec of {path}: {e}"));
+    let read = model::arch::spec(split).unwrap_or_else(|e| panic!("spec of {path}: {e}"));
     let _ = writeln!(o, "file {path}");
     spec_view::compare(
         &mut o,
@@ -229,7 +255,7 @@ fn check(
         view,
     );
     spec_view::compare(&mut o, &mut b, "defaults taken", &read.defaults, defaults);
-    let unread = model::arch::inkling2::hparams::unread_keys(&split);
+    let unread = model::arch::inkling2::hparams::unread_keys(split);
     spec_view::compare(&mut o, &mut b, "keys not read", &unread, unread_pins);
     let mut by_role: BTreeMap<(String, String), usize> = BTreeMap::new();
     for t in &read.tensors.tensors {
@@ -255,13 +281,7 @@ fn check(
     for line in spec_view::items(&list) {
         let _ = writeln!(o, "  {line}");
     }
-    spec_view::compare(
-        &mut o,
-        &mut b,
-        "stores and plan",
-        &place_lines(&split),
-        plan,
-    );
+    spec_view::compare(&mut o, &mut b, "stores and plan", &place_lines(split), plan);
     let _ = o; // printed below
     println!("{o}");
     assert!(
@@ -329,6 +349,48 @@ fn hw_inkling2_spec_mini() {
         MINI_TENSORS,
         MINI_VISITS,
         MINI_PLAN,
+    );
+}
+
+/// The checked-in key table with the tokenizer's token and type tables as arrays of their real
+/// lengths (the reader holds the token count to the unpadded vocabulary; no text of them is read).
+fn small_keys() -> String {
+    let mut table: serde_json::Value =
+        serde_json::from_str(include_str!("inkling2_small_hdr.kv.json"))
+            .expect("the key table parses");
+    let keys = table.as_object_mut().expect("the key table is an object");
+    for (key, item) in [
+        ("tokenizer.ggml.tokens", serde_json::json!("")),
+        ("tokenizer.ggml.token_type", serde_json::json!(1)),
+    ] {
+        let len = keys[key]["array_len"]
+            .as_u64()
+            .expect("the summarized length");
+        keys.insert(key.to_string(), vec![item; len as usize].into());
+    }
+    table.to_string()
+}
+
+/// The Small's real header, checked in beside this test: the first shard's 73 keys (the
+/// tokenizer's token, merge and type tables summarized to their lengths) and the six shards' 1,092
+/// tensors by name, type and dims, laid out as a header-only file. It reads through the same
+/// reader and meets the same pins as the shards on the box.
+#[test]
+fn inkling2_small_header_reads_as_the_file_does() {
+    let split = header_tables::header_of(
+        "inkling2-small",
+        &small_keys(),
+        include_str!("inkling2_small_tensors.tsv"),
+    );
+    check_split(
+        "inkling2_small_hdr.kv.json",
+        &split,
+        SMALL_VIEW,
+        SMALL_DEFAULTS,
+        SMALL_UNREAD,
+        SMALL_TENSORS,
+        SMALL_VISITS,
+        SMALL_PLAN,
     );
 }
 

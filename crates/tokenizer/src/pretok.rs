@@ -3,7 +3,7 @@
 //! `joyai-llm`), [`Pre::HyV4`] (`hy_v4`), [`Pre::DeepseekLlm`] (`deepseek-llm`), [`Pre::Qwen2`] (`qwen2`, `solar-open`),
 //! [`Pre::Glm4`] (`glm4`), [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`),
 //! [`Pre::Tekken`] (`tekken`, `pixtral`), [`Pre::TekkenNum3`] (`tekken-num3`),
-//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Gemma4`] (`gemma4`),
+//! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Inkling2`] (`inkling2`), [`Pre::Gemma4`] (`gemma4`),
 //! [`Pre::Raon`] (`raon`), [`Pre::KimiK2`] (`kimi-k2`), [`Pre::Flint`] (`flint`) and
 //! [`Pre::ExaoneMoe`] (`exaone-moe`).
 //!
@@ -1095,6 +1095,11 @@ pub(crate) enum Pre {
     /// `gpt-4o`: [`Pre::MiniMaxM2`]'s regex under the name of a tree whose UTF-8 reader is the
     /// strict one ([`Pre::strict_utf8`]).
     Gpt4o,
+    /// `inkling2` (and `gpt-4o` in an Inkling 2 file, [`Pre::of_name`]): GPT4O's regex as the
+    /// tree that reads the Inkling 2 files runs it, with `\p{M}` beside `\p{L}` in the lookaheads,
+    /// so a mark is a letter of either case ([`TekkenReference`]) and joins the word beside it;
+    /// the contractions and the numbers in threes are [`Pre::MiniMaxM2`]'s.
+    Inkling2,
     /// `minimax-m2` as a Hugging Face `tokenizer.json` spells and runs it: the letter
     /// categories apart, `\p{M}` in the word classes, and Unicode 14.0's classes. Never named
     /// in a header; a vocabulary with `tokenizer.bloomery.eog_token_ids` gets it.
@@ -1118,7 +1123,7 @@ pub(crate) enum Pre {
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 21] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 22] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -1135,6 +1140,7 @@ impl Pre {
         ("lfm2", Pre::Llama3),
         ("minimax-m2", Pre::MiniMaxM2),
         ("gpt-4o", Pre::Gpt4o),
+        ("inkling2", Pre::Inkling2),
         ("gemma4", Pre::Gemma4),
         ("raon", Pre::Raon),
         ("kimi-k2", Pre::KimiK2),
@@ -1196,6 +1202,7 @@ impl Pre {
             Pre::Raon
                 | Pre::Flint
                 | Pre::Gpt4o
+                | Pre::Inkling2
                 | Pre::Tekken
                 | Pre::TekkenNum3
                 | Pre::KimiK2
@@ -1225,6 +1232,7 @@ impl Pre {
             | Pre::TekkenNum3
             | Pre::MiniMaxM2
             | Pre::Gpt4o
+            | Pre::Inkling2
             | Pre::Raon
             | Pre::KimiK2
             | Pre::Flint
@@ -1261,6 +1269,7 @@ pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usiz
         Pre::Llama3Hf => split_qwen2_hf(cpts, s, 3),
         Pre::MiniMaxM2 | Pre::Gpt4o => split_cased::<M2Reference>(cpts, s, CasedShape::MINIMAX_M2),
         Pre::MiniMaxM2Hf => split_cased::<CasedHf>(cpts, s, CasedShape::MINIMAX_M2),
+        Pre::Inkling2 => split_cased::<TekkenReference>(cpts, s, CasedShape::MINIMAX_M2),
         Pre::Tekken => split_cased::<TekkenReference>(cpts, s, CasedShape::TEKKEN),
         Pre::TekkenHf => split_cased::<CasedHf>(cpts, s, CasedShape::TEKKEN),
         Pre::TekkenNum3 => split_cased::<TekkenReference>(cpts, s, CasedShape::TEKKEN_NUM3),
@@ -1720,6 +1729,38 @@ mod tests {
     #[test]
     fn gpt_4o_is_minimax_m2() {
         assert_eq!(crate::named(&Pre::NAMES, "gpt-4o"), Some(Pre::Gpt4o));
+    }
+
+    /// `inkling2` is a row of its own: the reference maps it to the GPT4O expression of the tree
+    /// that reads the Inkling 2 files, which has `\p{M}` in its lookaheads (`gpt-4o` of an older
+    /// tree has not). FAIL-first: with the row on `Pre::Gpt4o` the mark rows of
+    /// `inkling2_marks_are_letters` fail, and so does the Mini's id gate.
+    #[test]
+    fn inkling2_is_its_own_row() {
+        assert_eq!(crate::named(&Pre::NAMES, "inkling2"), Some(Pre::Inkling2));
+        assert!(crate::runs_pre_tokenizer("inkling2"));
+        assert_eq!(Pre::Inkling2.hf_reading(), None);
+        assert!(Pre::Inkling2.strict_utf8());
+    }
+
+    /// The Inkling 2 splitter is `minimax-m2`'s with a mark a letter of either case, as the tree's
+    /// `[\p{L}\p{M}]` lookaheads make it: a mark joins the letters beside it, a lone mark is a
+    /// word, and everything else splits as `minimax-m2` does. Derived by hand from the regex.
+    /// FAIL-first: with `Pre::Inkling2` on `M2Reference` the mark rows fail.
+    #[test]
+    fn inkling2_marks_are_letters() {
+        let cases: &[(&str, &[&str])] = &[
+            ("e\u{301}x", &["e\u{301}x"]),
+            ("\u{301}.", &["\u{301}", "."]),
+            ("a \u{301}b", &["a", " \u{301}b"]),
+            ("नमस्ते दुनिया", &["नमस्ते", " दुनिया"]),
+            ("HelloWorld", &["Hello", "World"]),
+            ("1234567", &["123", "456", "7"]),
+            ("it's", &["it's"]),
+        ];
+        for &(text, want) in cases {
+            assert_eq!(words(Pre::Inkling2, text), want, "{text:?}");
+        }
     }
 
     fn words(pre: Pre, text: &str) -> Vec<String> {

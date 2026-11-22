@@ -992,6 +992,22 @@ crate::sigmoid_router_instance! {
 }
 
 crate::sigmoid_router_instance! {
+    /// The sigmoid router at 384 experts and the top 8 (Inkling 2 Small's):
+    /// the rule of `sigmoid_128_8` at three times the experts, twelve scored
+    /// a lane. The launch's `scale` is the file's `expert_weights_scale`
+    /// (the row this instance was built for takes 8). A non-finite selection
+    /// value writes NaN weights, as at `sigmoid_128_8`.
+    pub mod sigmoid_384_8 {
+        experts: 384,
+        used: 8,
+        kernels: sigmoid_384_8_router_kernels,
+        entries: sigmoid_384_8_router, sigmoid_384_8_router_pick,
+        prepare: prepare_sigmoid_384_8_router, prepare_sigmoid_384_8_router_pick,
+        refuse_nan: true,
+    }
+}
+
+crate::sigmoid_router_instance! {
     /// The sigmoid router at 256 experts and the top 6: the same rule as
     /// `sigmoid_128_6` (biased sigmoid, the kept unbiased scores renormalized)
     /// at another expert count. The launch's `scale` is the file's

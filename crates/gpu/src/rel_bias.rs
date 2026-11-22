@@ -1,6 +1,7 @@
 //! Rel-bias attention over the head-128 segment walk: the entries an
 //! architecture whose scores carry a distance-gathered bias row runs at a
-//! group of [`GROUP_3`] query heads a key head (Inkling 2's 24 over 8).
+//! group of [`GROUP_3`] (Inkling 2 Mini's 24 over 8) or [`GROUP_6`] (the Small's
+//! 48 over 8) query heads a key head.
 //!
 //! The walk, the tiles and the softmax are `flash_gqa_h128_swa`'s — the same
 //! [`seg_span`] window cut, the same [`fold_tile`] step, one warp a query
@@ -23,19 +24,21 @@
 //! `exp(s − t) / (1 + Σ exp(s_k − t))` and this file's `exp(s) / (exp(t) +
 //! Σ exp(s_k))` are one distribution; the rounding points differ, and the
 //! owning gate bands that distance. The segment body is this file's own
-//! copy of the walk, not a [`GROUP_3`] instance of `seg_h128`: a group of
-//! three leaves `KEY_TILE · ROW_QWORDS` key and value words uneven over the
+//! copy of the walk, not a `seg_h128` instance: a group of three or six
+//! leaves `KEY_TILE · ROW_QWORDS` key and value words uneven over the
 //! block's threads, so the even-division staging `seg_h128` asserts does not
-//! hold at 96 threads — the walk stays that body's, the staging is ragged
-//! here (the same reason `flash_gqa` keeps a body of its own for the group
-//! of five). The plane and ring forms are one body under `RING`, as there.
+//! hold at 96 or 192 threads — the walk stays that body's, the staging is
+//! ragged here (the same reason `flash_gqa` keeps a body of its own for the
+//! group of five). The plane and ring forms and the two groups are one body
+//! under `RING` and `G`, as there; the merge takes the head count as data
+//! and serves both groups.
 
 use crate::GpuError;
 use crate::fault::{FaultSink, FaultSite};
 use crate::flash::{MERGE_BATCH, half_bits_to_f32, online_fold};
 use crate::flash_gqa::{HEAD, KEY_TILE, SEG_KEYS, seg_span, window_cut, window_segments};
 use crate::flash_gqa_h128_swa::{
-    GROUP_3, K_STRIDE, MERGE_THREADS, ROW_QWORDS, fold_tile, live_keys,
+    GROUP_3, GROUP_6, K_STRIDE, MERGE_THREADS, ROW_QWORDS, fold_tile, live_keys,
 };
 use crate::launch_u32;
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -48,15 +51,18 @@ use std::sync::Arc;
 /// Relative dimensions a head: the width of `r` and of the bias table's
 /// first axis.
 pub const REL: usize = 16;
-const THREADS: usize = GROUP_3 * 32;
-const THREADS_U32: u32 = THREADS as u32;
-const _: () = assert!(THREADS_U32 as usize == THREADS && THREADS == 96);
+const THREADS_G3_U32: u32 = (GROUP_3 * 32) as u32;
+const THREADS_G6_U32: u32 = (GROUP_6 * 32) as u32;
+// The entries' launch contracts spell the groups and their blocks out as 3 and
+// 96 threads, 6 and 192.
+const _: () =
+    assert!(GROUP_3 == 3 && GROUP_6 == 6 && THREADS_G3_U32 == 96 && THREADS_G6_U32 == 192);
 const _: () = assert!(REL * KEY_TILE == 512 && K_STRIDE % 2 == 1 && REL <= 32);
 
-/// The segment pass of this file's entries: `seg_h128`'s walk at [`GROUP_3`]
-/// query heads a key head with the bias laid into the score, on a plane
-/// (`RING` false) or a ring (`RING` true). Block
-/// `b = (seg·n_kv + kh)·m + t`, warp `w` is query head `kh·3 + w`; the
+/// The segment pass of this file's entries: `seg_h128`'s walk at `G`
+/// ([`GROUP_3`] or [`GROUP_6`]) query heads a key head with the bias laid
+/// into the score, on a plane (`RING` false) or a ring (`RING` true). Block
+/// `b = (seg·n_kv + kh)·m + t`, warp `w` is query head `kh·G + w`; the
 /// partials, the window cut and the neutral-segment rule are `seg_h128`'s.
 ///
 /// The score's order is the gate: the f32 dot of `seg_h128` (its rotating
@@ -64,20 +70,20 @@ const _: () = assert!(REL * KEY_TILE == 512 && K_STRIDE % 2 == 1 && REL <= 32);
 /// `scale`, then the bias dot added — `REL` fused multiply-adds ascending
 /// `d`, the r row one value a lane, read by shuffle.
 ///
-/// SAFETY: the entry's launch contract at [`GROUP_3`] query heads a key
-/// head (every buffer bound it names, the planes of `n_kv · plane_rows`
+/// SAFETY: the entry's launch contract at `G` query heads a key head
+/// (every buffer bound it names, the planes of `n_kv · plane_rows`
 /// rows, and under `RING` `plane_rows >= 1` with every key the row reads
-/// resident in the ring), a block of `GROUP_3 · 32` threads, and the five
+/// resident in the ring), a block of `G · 32` threads, and the five
 /// tiles this block's shared memory as the entry declared them: the group's
-/// query rows (`GROUP_3 · HEAD` f32), the key tile at stride `K_STRIDE`
+/// query rows (`G · HEAD` f32), the key tile at stride `K_STRIDE`
 /// words, the value tile (`KEY_TILE · ROW_QWORDS` u64), the weight tile
-/// (`GROUP_3 · KEY_TILE` f32) and the bias tile (`REL · KEY_TILE` f32).
+/// (`G · KEY_TILE` f32) and the bias tile (`REL · KEY_TILE` f32).
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
     reason = "a kernel entry's flat arguments, handed on (rust-quality R8)"
 )]
-pub(crate) unsafe fn seg_h128_rel<const RING: bool>(
+pub(crate) unsafe fn seg_h128_rel<const RING: bool, const G: usize>(
     q: &[f32],
     kc: &[u16],
     vc: &[u16],
@@ -101,7 +107,8 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool>(
     ws: *mut f32,
     bs: *mut f32,
 ) {
-    let threads = THREADS;
+    const { assert!(G == GROUP_3 || G == GROUP_6) };
+    let threads = G * 32;
     let b = thread::blockIdx_x() as usize;
     let nkv = n_kv as usize;
     let n_seg = segs as usize;
@@ -116,8 +123,8 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool>(
     let tid = thread::threadIdx_x() as usize;
     let w = tid / 32;
     let lane = warp::lane_id() as usize;
-    let n_head = nkv * GROUP_3;
-    let h = kh * GROUP_3 + w;
+    let n_head = nkv * G;
+    let h = kh * G + w;
     let idx = (t * n_head + h) * n_seg + seg;
     let ctx = ctx as usize;
     // SAFETY: t < m <= n_keys_buf.len() by the launch contract.
@@ -127,7 +134,7 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool>(
     let lo = first + seg * span;
     if lo >= first + n_w {
         if lane == 0 {
-            // SAFETY: idx < m·n_kv·GROUP_3·segs, both slots inside part_ms.
+            // SAFETY: idx < m·n_kv·G·segs, both slots inside part_ms.
             unsafe {
                 *part_ms.get_unchecked_mut(2 * idx) = f32::NEG_INFINITY;
                 *part_ms.get_unchecked_mut(2 * idx + 1) = 0.0;
@@ -137,12 +144,12 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool>(
     }
     let hi = (lo + span).min(first + n_w);
 
-    let qb = (t * n_head + kh * GROUP_3) * HEAD;
+    let qb = (t * n_head + kh * G) * HEAD;
     let mut i = 0usize;
     while i < 4 {
         // SAFETY: qb + 4·tid + i is inside row t's group, and that row is
         // inside q by the launch contract. The shared index is inside
-        // GROUP_3·HEAD, which 4·(GROUP_3·32) equals.
+        // G·HEAD, which 4·(G·32) equals.
         unsafe { *qs.add(4 * tid + i) = *q.get_unchecked(qb + 4 * tid + i) };
         i += 1;
     }
@@ -224,7 +231,7 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool>(
             let mut p = 0usize;
             while p < 4 {
                 // SAFETY: lane < 32 and wd + p < ROW_WORDS, inside the
-                // staged key tile. The query index is inside GROUP_3·HEAD.
+                // staged key tile. The query index is inside G·HEAD.
                 let (kw, q0, q1) = unsafe {
                     (
                         *ks.add(lane * K_STRIDE + wd + p),
@@ -259,7 +266,7 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool>(
         };
 
         // SAFETY: the weight and value tiles are this block's, the value
-        // tile was published by the barrier above, and w < GROUP_3.
+        // tile was published by the barrier above, and w < G.
         unsafe { fold_tile(sc, live, &mut mx, &mut s_sum, &mut acc, ws, vs, w, lane) };
         t0 += KEY_TILE;
     }
@@ -341,7 +348,7 @@ mod rel_bias_kernels {
         // `seg_h128_rel`'s on a plane, and the block is GROUP_3 · 32
         // threads.
         unsafe {
-            seg_h128_rel::<false>(
+            seg_h128_rel::<false, GROUP_3>(
                 q,
                 kc,
                 vc,
@@ -425,7 +432,172 @@ mod rel_bias_kernels {
         // `seg_h128_rel`'s under RING, and the block is GROUP_3 · 32
         // threads.
         unsafe {
-            seg_h128_rel::<true>(
+            seg_h128_rel::<true, GROUP_3>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                r,
+                bias,
+                extent,
+                scale,
+                n_kv,
+                ctx,
+                ring_rows,
+                segs,
+                seg_keys,
+                m,
+                window,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+                SharedArray::as_raw_mut_ptr(&raw mut BS),
+            )
+        };
+    }
+
+    /// [`rel_seg_h128`] at [`GROUP_6`] query heads a key head: a block of
+    /// 192 threads, warp `w` is query head `kh·6 + w`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(192)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            extent >= 1,
+            q.len() >= m * n_kv * 6 * 128,
+            kc.len() >= n_kv * ctx * 128,
+            vc.len() >= n_kv * ctx * 128,
+            r.len() >= m * n_kv * 6 * 16,
+            bias.len() >= 16 * extent,
+            part_v.len() >= m * n_kv * 6 * segs * 128,
+            part_ms.len() >= m * n_kv * 6 * segs * 2
+        )
+    )]
+    pub fn rel_seg_h128_g6(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        r: &[f32],
+        bias: &[f32],
+        extent: u32,
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        window: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QS: SharedArray<f32, { GROUP_6 * HEAD }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { GROUP_6 * KEY_TILE }> = SharedArray::UNINIT;
+        static mut BS: SharedArray<f32, { REL * KEY_TILE }> = SharedArray::UNINIT;
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for GROUP_6 query heads and the bias tile; the
+        // raw form reaches it without a reference. The launch contract is
+        // `seg_h128_rel`'s on a plane, and the block is GROUP_6 · 32
+        // threads.
+        unsafe {
+            seg_h128_rel::<false, GROUP_6>(
+                q,
+                kc,
+                vc,
+                n_keys_buf,
+                r,
+                bias,
+                extent,
+                scale,
+                n_kv,
+                ctx,
+                ctx,
+                segs,
+                seg_keys,
+                m,
+                window,
+                part_v,
+                part_ms,
+                SharedArray::as_raw_mut_ptr(&raw mut QS),
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut VS),
+                SharedArray::as_raw_mut_ptr(&raw mut WS),
+                SharedArray::as_raw_mut_ptr(&raw mut BS),
+            )
+        };
+    }
+
+    /// [`rel_seg_h128_g6`] on a ring of `ring_rows` rows (`seg_h128_rel` under
+    /// `RING`): position `p` is row `p mod ring_rows`, `ctx` stays the bound
+    /// of the live count.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(192)]
+    #[launch_contract(
+        domain = 1,
+        block = (192, 1, 1),
+        requires = (
+            n_keys_buf.len() >= m,
+            segs >= 1,
+            extent >= 1,
+            ring_rows >= 1,
+            q.len() >= m * n_kv * 6 * 128,
+            kc.len() >= n_kv * ring_rows * 128,
+            vc.len() >= n_kv * ring_rows * 128,
+            r.len() >= m * n_kv * 6 * 16,
+            bias.len() >= 16 * extent,
+            part_v.len() >= m * n_kv * 6 * segs * 128,
+            part_ms.len() >= m * n_kv * 6 * segs * 2
+        )
+    )]
+    pub fn rel_seg_h128_ring_g6(
+        q: &[f32],
+        kc: &[u16],
+        vc: &[u16],
+        n_keys_buf: &[u32],
+        r: &[f32],
+        bias: &[f32],
+        extent: u32,
+        scale: f32,
+        n_kv: u32,
+        ctx: u32,
+        ring_rows: u32,
+        segs: u32,
+        seg_keys: u32,
+        m: u32,
+        window: u32,
+        part_v: DisjointSlice<f32>,
+        part_ms: DisjointSlice<f32>,
+    ) {
+        static mut QS: SharedArray<f32, { GROUP_6 * HEAD }> = SharedArray::UNINIT;
+        static mut KS: SharedArray<u32, { KEY_TILE * K_STRIDE }> = SharedArray::UNINIT;
+        static mut VS: SharedArray<u64, { KEY_TILE * ROW_QWORDS }> = SharedArray::UNINIT;
+        static mut WS: SharedArray<f32, { GROUP_6 * KEY_TILE }> = SharedArray::UNINIT;
+        static mut BS: SharedArray<f32, { REL * KEY_TILE }> = SharedArray::UNINIT;
+
+        // SAFETY: each `static mut` above is this block's own shared
+        // allocation, sized for GROUP_6 query heads and the bias tile; the
+        // raw form reaches it without a reference. The launch contract is
+        // `seg_h128_rel`'s under RING, and the block is GROUP_6 · 32
+        // threads.
+        unsafe {
+            seg_h128_rel::<true, GROUP_6>(
                 q,
                 kc,
                 vc,
@@ -596,9 +768,10 @@ impl RelBiasKernels {
         Ok(RelBiasKernels { module })
     }
 
-    /// Enqueue `m` rows at [`GROUP_3`] query heads a key head (`n_head`
-    /// must equal `3 · n_kv`; any other ratio is refused by name, as a
-    /// non-finite scale, a zero extent or count or a short buffer is). A
+    /// Enqueue `m` rows at [`GROUP_3`] or [`GROUP_6`] query heads a key head
+    /// (`n_head` must equal `3 · n_kv` or `6 · n_kv`; any other ratio is
+    /// refused by name, as a non-finite scale, a zero extent or count or a
+    /// short buffer is). A
     /// live count of zero or past `ctx` raises [`FaultSite::KeyCount`] and
     /// the row is NaN.
     pub fn enqueue(
@@ -637,15 +810,19 @@ impl RelBiasKernels {
                 ),
             ));
         }
-        if n_head != n_kv * GROUP_3 {
+        let group = if n_head == n_kv * GROUP_3 {
+            GROUP_3
+        } else if n_head == n_kv * GROUP_6 {
+            GROUP_6
+        } else {
             return Err(GpuError::shape(
                 what,
                 format!(
-                    "the rel-bias kernels take {GROUP_3} query heads a key head; got {n_head} \
-                     heads over {n_kv}"
+                    "the rel-bias kernels take {GROUP_3} or {GROUP_6} query heads a key head; \
+                     got {n_head} heads over {n_kv}"
                 ),
             ));
-        }
+        };
         if !scale.is_finite() {
             return Err(GpuError::shape(
                 what,
@@ -682,55 +859,115 @@ impl RelBiasKernels {
         let m_u = launch_u32(what, "m", m)?;
         let window_u = launch_u32(what, "window", window)?;
         let heads = launch_u32(what, "n_head", n_head)?;
-        if ring_rows.is_some() {
-            let prep =
-                self.module
-                    .prepare_rel_seg_h128_ring(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
-            self.module.rel_seg_h128_ring(
-                stream,
-                &prep,
-                q,
-                kc,
-                vc,
-                n_keys,
-                r,
-                bias,
-                extent_u,
-                scale,
-                n_kv_u,
-                ctx_u,
-                ring_u,
-                segs_u,
-                seg_keys,
-                m_u,
-                window_u,
-                &mut *part_v,
-                &mut *part_ms,
-            )?;
-        } else {
-            let prep =
-                self.module
-                    .prepare_rel_seg_h128(LaunchConfig1D::new(grid, THREADS_U32, 0))?;
-            self.module.rel_seg_h128(
-                stream,
-                &prep,
-                q,
-                kc,
-                vc,
-                n_keys,
-                r,
-                bias,
-                extent_u,
-                scale,
-                n_kv_u,
-                ctx_u,
-                segs_u,
-                seg_keys,
-                m_u,
-                window_u,
-                &mut *part_v,
-                &mut *part_ms,
-            )?;
+        match (group, ring_rows.is_some()) {
+            (GROUP_3, true) => {
+                let prep = self.module.prepare_rel_seg_h128_ring(LaunchConfig1D::new(
+                    grid,
+                    THREADS_G3_U32,
+                    0,
+                ))?;
+                self.module.rel_seg_h128_ring(
+                    stream,
+                    &prep,
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    r,
+                    bias,
+                    extent_u,
+                    scale,
+                    n_kv_u,
+                    ctx_u,
+                    ring_u,
+                    segs_u,
+                    seg_keys,
+                    m_u,
+                    window_u,
+                    &mut *part_v,
+                    &mut *part_ms,
+                )?;
+            }
+            (GROUP_3, false) => {
+                let prep = self.module.prepare_rel_seg_h128(LaunchConfig1D::new(
+                    grid,
+                    THREADS_G3_U32,
+                    0,
+                ))?;
+                self.module.rel_seg_h128(
+                    stream,
+                    &prep,
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    r,
+                    bias,
+                    extent_u,
+                    scale,
+                    n_kv_u,
+                    ctx_u,
+                    segs_u,
+                    seg_keys,
+                    m_u,
+                    window_u,
+                    &mut *part_v,
+                    &mut *part_ms,
+                )?;
+            }
+            (_, true) => {
+                let prep = self
+                    .module
+                    .prepare_rel_seg_h128_ring_g6(LaunchConfig1D::new(grid, THREADS_G6_U32, 0))?;
+                self.module.rel_seg_h128_ring_g6(
+                    stream,
+                    &prep,
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    r,
+                    bias,
+                    extent_u,
+                    scale,
+                    n_kv_u,
+                    ctx_u,
+                    ring_u,
+                    segs_u,
+                    seg_keys,
+                    m_u,
+                    window_u,
+                    &mut *part_v,
+                    &mut *part_ms,
+                )?;
+            }
+            (_, false) => {
+                let prep = self.module.prepare_rel_seg_h128_g6(LaunchConfig1D::new(
+                    grid,
+                    THREADS_G6_U32,
+                    0,
+                ))?;
+                self.module.rel_seg_h128_g6(
+                    stream,
+                    &prep,
+                    q,
+                    kc,
+                    vc,
+                    n_keys,
+                    r,
+                    bias,
+                    extent_u,
+                    scale,
+                    n_kv_u,
+                    ctx_u,
+                    segs_u,
+                    seg_keys,
+                    m_u,
+                    window_u,
+                    &mut *part_v,
+                    &mut *part_ms,
+                )?;
+            }
         }
         let merge_grid = launch_u32(what, "merge grid", m * n_head)?;
         let merge = LaunchConfig1D::new(merge_grid, MERGE_THREADS, 0);

@@ -13,17 +13,17 @@
 //! sees its arguments and the template's top-level names as they are at the
 //! call, never the caller's loop names; the call's value is the body's output
 //! as a string), the conditional expression, `and`/`or`/`not`/`in`,
-//! comparisons (a tuple literal only as the right side of `in`/`not in`,
-//! where it reads as a list), `+`/`-`/`*`/`/`/`//`/`%`/`~` (Python's rounding of `//` and
+//! comparisons (a tuple literal only as the right side of `in`/`not in`
+//! and as the value of a `separators=` argument, where it reads as a list), `+`/`-`/`*`/`/`/`//`/`%`/`~` (Python's rounding of `//` and
 //! `%`), subscripts (a string's by character) and slices `[start:stop:step]`
 //! (Python's rules), string literals with Python's escapes,
 //! `.items()`/`.keys()`/`.values()`/`.get()`/`.strip()`/`.lstrip()`/
 //! `.rstrip()`/`.split()`/`.startswith()`/`.endswith()`/`.format()` with Python's
 //! arguments (`.format()`'s fields are `{}`, `{N}` and `{name}` with `!s`/`!r`; a format spec or an
 //! attribute in a field is refused by name), filters `tojson`/`from_json`/`length`/`count`/`trim`/`string`/
-//! `lower`/`upper`/`capitalize`/`default`/`items`/`safe`/`replace`/`list` (Python string
+//! `lower`/`upper`/`capitalize`/`default`/`items`/`safe`/`replace`/`list`/`int`/`float`/`sort`/`dictsort` (Python string
 //! conversion, optional integer count, positional or keyword arguments), tests `defined`/`undefined`/`none`/`true`/
-//! `false`/`boolean`/`string`/`number`/`mapping`/`sequence`/`iterable`, and
+//! `false`/`boolean`/`string`/`number`/`integer`/`float`/`mapping`/`sequence`/`iterable`, and
 //! `raise_exception`/`range`, and Hugging Face's `{% generation %}` block (it renders its body,
 //! in a scope of its own). Whitespace is Python's `str.isspace`, and
 //! `{{ value }}` is Python's `str()`: a list or dict as its `repr`, a float in
@@ -1122,6 +1122,8 @@ impl Lexer {
             if is_kw {
                 let k = self.name()?;
                 self.expect_op("=")?;
+                // Python's tuple is `tojson`'s `separators`, which reads it as a pair.
+                self.tuple_in = k == "separators";
                 kwargs.push((k, self.expr()?));
             } else {
                 if !kwargs.is_empty() {
@@ -2673,6 +2675,13 @@ fn filter(
     if matches!(name, "select" | "reject" | "selectattr" | "rejectattr") {
         return select_filter(v, name, args, kwargs);
     }
+    match name {
+        "int" => return int_filter(v, args, kwargs),
+        "float" => return float_filter(v, args, kwargs),
+        "sort" => return sort_filter(v, args, kwargs),
+        "dictsort" => return dictsort_filter(v, args, kwargs),
+        _ => {}
+    }
     if !args.is_empty() || !kwargs.is_empty() {
         return err(format!("|{name} takes no arguments"));
     }
@@ -2970,6 +2979,180 @@ fn default_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateE
     })
 }
 
+/// `int(default=0, base=10)` as jinja2's `do_int`: a number truncated, a string read as Python's
+/// `int(str)` and, failing that, as `int(float(str))`; any other value, and a string that is
+/// neither, is the default.
+fn int_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    let slots = bind_args("|int", ["default", "base"], args, kwargs)?;
+    if slots[1].is_some_and(|b| !matches!(b, V::J(v) if v.as_i64() == Some(10))) {
+        return err("|int: only base 10 is supported");
+    }
+    let default = slots[0].cloned().unwrap_or(V::J(Value::from(0)));
+    let truncated = |f: f64| -> Option<Value> {
+        // Python's int() of a float: the integer part, exactly (an infinity or a NaN is an error).
+        (f.is_finite() && f.abs() < 9.2e18).then(|| Value::from(f.trunc() as i64))
+    };
+    let got = match &v {
+        V::J(Value::Bool(b)) => Some(Value::from(i64::from(*b))),
+        V::J(Value::Number(n)) if !n.is_f64() => Some(Value::Number(n.clone())),
+        V::J(Value::Number(n)) => truncated(float(n)),
+        V::J(Value::String(s)) => {
+            let t = s.trim_matches(py_space);
+            t.parse::<i64>()
+                .ok()
+                .map(Value::from)
+                .or_else(|| t.parse::<f64>().ok().and_then(truncated))
+        }
+        _ => None,
+    };
+    Ok(got.map_or(default, V::J))
+}
+
+/// `float(default=0.0)` as jinja2's `do_float`: a number as a float, a string as Python's
+/// `float(str)`; any other value, and a string that is no float, is the default.
+fn float_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    let slots = bind_args("|float", ["default"], args, kwargs)?;
+    let default = slots[0].cloned().unwrap_or(V::J(Value::from(0.0)));
+    let got = match &v {
+        V::J(Value::Bool(b)) => Some(f64::from(u8::from(*b))),
+        V::J(Value::Number(n)) => Some(float(n)),
+        V::J(Value::String(s)) => s.trim_matches(py_space).parse::<f64>().ok(),
+        _ => None,
+    };
+    match got {
+        Some(f) if f.is_finite() => Ok(V::J(Value::from(f))),
+        Some(f) => err(format!("|float: {f} is not a finite number")),
+        None => Ok(default),
+    }
+}
+
+/// How two sort keys compare: strings by code point (their lower case unless `case_sensitive`),
+/// numbers by value; any other pair is the error Python raises for it.
+fn sort_order(
+    a: &Value,
+    b: &Value,
+    case_sensitive: bool,
+) -> Result<std::cmp::Ordering, TemplateError> {
+    match (a, b) {
+        (Value::String(x), Value::String(y)) if case_sensitive => Ok(x.cmp(y)),
+        (Value::String(x), Value::String(y)) => Ok(x.to_lowercase().cmp(&y.to_lowercase())),
+        (Value::Number(_) | Value::Bool(_), Value::Number(_) | Value::Bool(_)) => {
+            numeric_cmp(&V::J(a.clone()), &V::J(b.clone()))
+                .ok_or_else(|| TemplateError("|sort: the numbers are not comparable".into()))
+        }
+        _ => err(format!("|sort cannot order {a} and {b}")),
+    }
+}
+
+/// `sort(reverse=False, case_sensitive=False, attribute=None)` as jinja2's `do_sort`: a stable
+/// sort of a sequence's items (by an item's index or key, `attribute`); a mapping sorts its keys.
+fn sort_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    let slots = bind_args(
+        "|sort",
+        ["reverse", "case_sensitive", "attribute"],
+        args,
+        kwargs,
+    )?;
+    let flag = |i: usize| slots[i].is_some_and(V::truthy);
+    let mut items = match elements(v) {
+        Ok(items) => items,
+        Err(other) => return err(format!("|sort needs a list or a mapping, not {other:?}")),
+    };
+    let attribute = match slots[2] {
+        None | Some(V::J(Value::Null)) => None,
+        Some(V::J(a @ (Value::String(_) | Value::Number(_)))) => Some(a.clone()),
+        Some(other) => return err(format!("|sort: attribute is {other:?}")),
+    };
+    let key = |item: &Value| -> Result<Value, TemplateError> {
+        let Some(a) = &attribute else {
+            return Ok(item.clone());
+        };
+        let got = match (item, a) {
+            (Value::Array(l), Value::Number(n)) => n.as_u64().and_then(|i| l.get(i as usize)),
+            (Value::Object(m), Value::String(k)) => m.get(k),
+            (Value::Object(m), Value::Number(n)) => m.get(&n.to_string()),
+            _ => None,
+        };
+        got.cloned()
+            .ok_or_else(|| TemplateError(format!("|sort: an item has no attribute {a}")))
+    };
+    let mut keyed = items
+        .drain(..)
+        .map(|i| key(&i).map(|k| (k, i)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut fault = None;
+    let case_sensitive = flag(1);
+    keyed.sort_by(|(x, _), (y, _)| {
+        sort_order(x, y, case_sensitive).unwrap_or_else(|e| {
+            fault.get_or_insert(e);
+            std::cmp::Ordering::Equal
+        })
+    });
+    if let Some(e) = fault {
+        return Err(e);
+    }
+    if flag(0) {
+        keyed.reverse();
+    }
+    Ok(V::J(Value::Array(
+        keyed.into_iter().map(|(_, i)| i).collect(),
+    )))
+}
+
+/// `dictsort(case_sensitive=False, by='key', reverse=False)` as jinja2's `do_dictsort`: a
+/// mapping's `[key, value]` pairs, sorted by key or by value, stable.
+fn dictsort_filter(v: V, args: &[V], kwargs: &[(&str, V)]) -> Result<V, TemplateError> {
+    let slots = bind_args(
+        "|dictsort",
+        ["case_sensitive", "by", "reverse"],
+        args,
+        kwargs,
+    )?;
+    let V::J(Value::Object(m)) = v else {
+        return err(format!("|dictsort needs a mapping, not {v:?}"));
+    };
+    let by_value = match slots[1] {
+        None => false,
+        Some(V::J(Value::String(s))) if s == "key" => false,
+        Some(V::J(Value::String(s))) if s == "value" => true,
+        Some(other) => {
+            return err(format!(
+                "|dictsort: by is {other:?}, not \"key\" or \"value\""
+            ));
+        }
+    };
+    let case_sensitive = slots[0].is_some_and(V::truthy);
+    let mut pairs: Vec<(String, Value)> = m.into_iter().collect();
+    let mut fault = None;
+    pairs.sort_by(|(ka, va), (kb, vb)| {
+        let order = if by_value {
+            sort_order(va, vb, case_sensitive)
+        } else {
+            sort_order(
+                &Value::String(ka.clone()),
+                &Value::String(kb.clone()),
+                case_sensitive,
+            )
+        };
+        order.unwrap_or_else(|e| {
+            fault.get_or_insert(e);
+            std::cmp::Ordering::Equal
+        })
+    });
+    if let Some(e) = fault {
+        return Err(e);
+    }
+    if slots[2].is_some_and(V::truthy) {
+        pairs.reverse();
+    }
+    Ok(V::J(Value::Array(
+        pairs
+            .into_iter()
+            .map(|(k, v)| Value::Array(vec![Value::String(k), v]))
+            .collect(),
+    )))
+}
+
 fn to_str(v: &V) -> Result<String, TemplateError> {
     let mut s = String::new();
     v.render(&mut s)?;
@@ -3043,6 +3226,10 @@ fn test(v: &V, name: &str, args: &[V]) -> Result<bool, TemplateError> {
             eq(&rem, &V::J(Value::from(i32::from(name == "odd"))))
         }
         "mapping" => matches!(v, V::J(Value::Object(_))),
+        // jinja2's `integer` is an `int` that is no boolean; its `float` is a number JSON spelled
+        // with a fraction or an exponent.
+        "integer" => matches!(v, V::J(Value::Number(_))) && integer_text(v).is_some(),
+        "float" => matches!(v, V::J(Value::Number(n)) if n.is_f64()),
         // jinja2's Undefined has a length and items; a namespace has neither.
         "sequence" | "iterable" => matches!(
             v,
@@ -4681,6 +4868,69 @@ mod tests {
                 "{{ range(3) | tojson }}",
                 v(r#"{}"#),
                 Err("tojson of a range"),
+            ),
+        ]);
+        assert!(
+            bad.is_empty(),
+            "{} of the cases:\n{}",
+            bad.len(),
+            bad.join("\n")
+        );
+    }
+
+    /// The filters and tests Inkling 2's templates use, as jinja2 3.1.2 renders them (the
+    /// reference's own engine is the serve gate's): `int` and `float` with their defaults,
+    /// `dictsort` and `sort` (stable, case-folded unless `case_sensitive`, by an item's index),
+    /// `is integer` (not a boolean) and `is float`, and a tuple as `tojson`'s `separators`.
+    /// FAIL-first: with the filters out, each of these is "unsupported filter".
+    #[test]
+    fn inkling_templates_filters_follow_jinja2() {
+        let bad = mismatches(&[
+            (
+                "{{ '5'|int }}|{{ ' 7 '|int }}|{{ '+5'|int }}|{{ '-05'|int }}|{{ '1.9'|int }}|{{ 'x'|int }}|{{ 'x'|int(3) }}|{{ 2.7|int }}|{{ -2.7|int }}|{{ true|int }}|{{ none|int }}|{{ [1]|int(9) }}",
+                v("{}"),
+                Ok("5|7|5|-5|1|0|3|2|-2|1|0|9"),
+            ),
+            (
+                "{{ '1.5'|float }}|{{ 'x'|float }}|{{ 'x'|float(-1.0) }}|{{ 3|float }}|{{ true|float }}|{{ ' 2e3 '|float }}|{{ none|float(7) }}",
+                v("{}"),
+                Ok("1.5|0.0|-1.0|3.0|1.0|2000.0|7"),
+            ),
+            (
+                "{{ 1 is integer }}|{{ true is integer }}|{{ 1.0 is integer }}|{{ 1.0 is float }}|{{ 1 is float }}|{{ 'a' is integer }}|{{ true is float }}",
+                v("{}"),
+                Ok("True|False|False|True|False|False|False"),
+            ),
+            (
+                "{% for k, v in d|dictsort %}{{ k }}={{ v }};{% endfor %}|{% for k, v in d|dictsort(case_sensitive=true) %}{{ k }}={{ v }};{% endfor %}|{% for k, v in d|dictsort(by='value', reverse=true) %}{{ k }}={{ v }};{% endfor %}",
+                v(r#"{"d": {"b": 1, "B": 3, "a": 2, "é": 0}}"#),
+                Ok("a=2;b=1;B=3;é=0;|B=3;a=2;b=1;é=0;|B=3;a=2;b=1;é=0;"),
+            ),
+            (
+                "{{ l|sort|tojson }}|{{ l|sort(reverse=true)|tojson }}|{{ w|sort|tojson }}|{{ w|sort(case_sensitive=true)|tojson }}|{{ p|sort(attribute=0)|tojson }}|{{ p|sort(attribute=1)|tojson }}|{{ m|sort|tojson }}",
+                v(
+                    r#"{"l": [3, 1, 2, 1.5], "w": ["b", "A", "a", "B"], "p": [[2, "x"], [1, "y"]], "m": {"b": 1, "a": 2}}"#,
+                ),
+                Ok(
+                    "[1, 1.5, 2, 3]|[3, 2, 1.5, 1]|[\"A\", \"a\", \"b\", \"B\"]|[\"A\", \"B\", \"a\", \"b\"]|[[1, \"y\"], [2, \"x\"]]|[[2, \"x\"], [1, \"y\"]]|[\"a\", \"b\"]",
+                ),
+            ),
+            (
+                "{{ d | tojson(sort_keys=true, separators=(',', ':')) }}",
+                v(r#"{"d": {"b": [1, 2], "a": {"z": 1, "y": "é"}}}"#),
+                Ok("{\"a\":{\"y\":\"é\",\"z\":1},\"b\":[1,2]}"),
+            ),
+            ("{{ ('a', 'b') }}", v("{}"), Err("tuple literal")),
+            (
+                "{{ d | tojson(indent=(1, 2)) }}",
+                v(r#"{"d": 1}"#),
+                Err("tuple literal"),
+            ),
+            ("{{ [1, 'a'] | sort }}", v("{}"), Err("|sort cannot order")),
+            (
+                "{{ d | dictsort(by='size') }}",
+                v(r#"{"d": {"a": 1}}"#),
+                Err("not \"key\" or \"value\""),
             ),
         ]);
         assert!(

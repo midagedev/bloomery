@@ -46,6 +46,9 @@ pub const GROUP_4: usize = 4;
 /// over 8): the segment walk of this file with the bias tile laid in, three
 /// warps a block.
 pub const GROUP_3: usize = 3;
+/// Query heads a key head that `rel_bias`'s second pair of entries serves
+/// (Inkling 2 Small's 48 over 8): the same walk, six warps a block.
+pub const GROUP_6: usize = 6;
 const THREADS: usize = GROUP * 32;
 /// Threads of a block at the group of eight, and at the group of four.
 pub(crate) const THREADS_U32: u32 = THREADS as u32;

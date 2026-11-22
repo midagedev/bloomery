@@ -45,6 +45,10 @@
 //!   weights — the SiTU rows, the down rows and their weighted sum — within
 //!   [`SITU_BAND`] / [`DOWN_BAND`] / [`OUT_BAND`] of `ffn_moe_situ`,
 //!   `ffn_moe_down(_scaled)` and `ffn_moe_out`, on both quant legs.
+//! - `router384_*`: the Small's router (`sigmoid_384_8`: 384 experts, the top 8) on seeded rows, no
+//!   oracle set of the Small existing — the ids, scores and weights against the host's f64 rule,
+//!   the picks reaching past expert 256, the one-token launch the batch's bits, and the `+1e-20`
+//!   guard rule bit for bit. The router is a clause of every tier: it opens no set.
 //! - `no_fault`: nothing raised the fault word.
 //! - `refused`: a split of a name that is not resident, of a non-stack weight,
 //!   of rows that are not whole experts, a second split of the same stack, and
@@ -86,7 +90,7 @@ mod gate {
     use bloomery_gpu::q4k_sel::QuantSel;
     use bloomery_gpu::q5::Q8Blocks32;
     use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels};
-    use bloomery_gpu::route_body::sigmoid_128_8;
+    use bloomery_gpu::route_body::{sigmoid_128_8, sigmoid_384_8};
     use bloomery_gpu::weights::{DevWeight, Weights};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
     use bloomery_gpu_gates::tier::{self, Tier};
@@ -175,6 +179,7 @@ mod gate {
     struct Dev {
         gpu: Gpu,
         router: sigmoid_128_8::RouterKernels,
+        router384: sigmoid_384_8::RouterKernels,
         wide: Gemm32Kernels,
         leg: CardLeg,
         nvfp4: Nvfp4SelKernels,
@@ -691,6 +696,187 @@ mod gate {
         ))
     }
 
+    /// The Small's router (`sigmoid_384_8`, 384 experts at the top 8, hidden 4,608), seeded: no
+    /// Small oracle set exists, so the contract is the host's f64 rule — the logit dot, the
+    /// sigmoid, the selection by score plus bias (rank order, the lower index on a tie), the kept
+    /// unbiased scores over their `1e-20`-guarded sum times the route scale. Sixteen tokens:
+    /// the ids EQUAL the host's (the smallest gap between the eighth and ninth selection value
+    /// is named), the scores and weights within [`PROBS_BAND`] and [`WEIGHTS_BAND`], the picks
+    /// reach past expert 256 (the twelve-a-lane layout holds every expert), the one-token launch
+    /// BIT-EQUALs the batch, and the crafted row of [`GUARD_LOGIT`] holds the `+1e-20` rule bit
+    /// for bit where the floor rule differs.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one clause group over one seeded launch"
+    )]
+    fn small_router_clauses(dev: &Dev) -> Result<Vec<bool>, GateError> {
+        const E: usize = 384;
+        const U: usize = 8;
+        const K: usize = 4608;
+        const T: usize = 16;
+        const SCALE: f32 = 8.0;
+        let stream = dev.stream();
+        let mut rng = bloomery_gpu_gates::GateRng(0x4b32_3834_5f38_u64);
+        let wv: Vec<f32> = (0..E * K).map(|_| rng.uni(-0.05, 0.05)).collect();
+        let xv: Vec<f32> = (0..T * K).map(|_| rng.uni(-1.0, 1.0)).collect();
+        let bias: Vec<f32> = (0..E).map(|_| rng.uni(-0.5, 0.5)).collect();
+        let (w, x, b) = (
+            DeviceTensor::upload(stream, &wv, E, K)?,
+            dev.up(&xv)?,
+            dev.up(&bias)?,
+        );
+        let mut probs = DeviceBuffer::<f32>::zeroed(stream, T * E)?;
+        let mut ids = DeviceBuffer::<u32>::zeroed(stream, T * U)?;
+        let mut weights = DeviceBuffer::<f32>::zeroed(stream, T * U)?;
+        dev.router384.enqueue_router_rows(
+            stream,
+            &dev.gpu,
+            &dev.wide,
+            &w,
+            &x,
+            &b,
+            SCALE,
+            T,
+            &mut probs,
+            &mut ids,
+            &mut weights,
+            dev.gpu.unlabelled_sink(),
+        )?;
+        let (probs, ids, weights) = (dev.read(&probs)?, dev.read(&ids)?, dev.read(&weights)?);
+        let (mut want_p, mut want_w) = (Vec::with_capacity(T * E), Vec::with_capacity(T * U));
+        let (mut ids_equal, mut min_gap, mut top) = (0usize, f64::INFINITY, 0u32);
+        for t in 0..T {
+            let score: Vec<f64> = (0..E)
+                .map(|e| {
+                    let dot: f64 = (0..K)
+                        .map(|c| f64::from(wv[e * K + c]) * f64::from(xv[t * K + c]))
+                        .sum();
+                    1.0 / (1.0 + (-dot).exp())
+                })
+                .collect();
+            let mut order: Vec<usize> = (0..E).collect();
+            let sel = |e: usize| score[e] + f64::from(bias[e]);
+            order.sort_by(|&a, &b| sel(b).total_cmp(&sel(a)).then(a.cmp(&b)));
+            min_gap = min_gap.min((sel(order[U - 1]) - sel(order[U])) / sel(order[U - 1]).abs());
+            let sum: f64 = order[..U].iter().map(|&e| score[e]).sum();
+            want_w.extend(
+                order[..U]
+                    .iter()
+                    .map(|&e| (score[e] / (sum + 1e-20) * f64::from(SCALE)) as f32),
+            );
+            want_p.extend(score.iter().map(|&s| s as f32));
+            let got = &ids[t * U..(t + 1) * U];
+            if got.iter().zip(&order[..U]).all(|(&g, &o)| g as usize == o) {
+                ids_equal += 1;
+            }
+            top = top.max(got.iter().copied().max().unwrap_or(0));
+        }
+        let mut ok = vec![
+            clause(
+                "router384_ids",
+                ids_equal == T,
+                &format!(
+                    "{ids_equal} of {T} tokens' ids equal the host's rank order; the smallest eighth-to-ninth gap {min_gap:.2e} relative"
+                ),
+            ),
+            clause(
+                "router384_probs",
+                rel64(&probs, &want_p) <= PROBS_BAND,
+                &format!(
+                    "relative L2 {:.2e} (band {PROBS_BAND:.0e})",
+                    rel64(&probs, &want_p)
+                ),
+            ),
+            clause(
+                "router384_weights",
+                rel64(&weights, &want_w) <= WEIGHTS_BAND,
+                &format!(
+                    "relative L2 {:.2e} (band {WEIGHTS_BAND:.0e})",
+                    rel64(&weights, &want_w)
+                ),
+            ),
+            clause(
+                "router384_reaches_every_lane",
+                top >= 256,
+                &format!("the highest picked id is {top}"),
+            ),
+        ];
+        // The one-token launch of every token: the batch slice's bits.
+        let mut one = (Vec::new(), Vec::new(), Vec::new());
+        let mut run = sigmoid_384_8::RouterOut::new(stream)?;
+        for t in 0..T {
+            let xt = dev.up(&xv[t * K..(t + 1) * K])?;
+            dev.router384.enqueue_router(
+                stream,
+                &w,
+                &xt,
+                &b,
+                SCALE,
+                &mut run,
+                dev.gpu.unlabelled_sink(),
+            )?;
+            one.0.extend(dev.read(&run.probs)?);
+            one.1.extend(dev.read(&run.ids)?);
+            one.2.extend(dev.read(&run.weights)?);
+        }
+        ok.push(clause(
+            "router384_one_token_is_batch",
+            bits_equal(&one.0, &probs) && one.1 == ids && bits_equal(&one.2, &weights),
+            "the one-token launches' scores, ids and weights: the batch's bits",
+        ));
+        // The +1e-20 rule at 384: every row dots the crafted row to GUARD_LOGIT.
+        let mut wg = vec![0.0f32; E * K];
+        for row in wg.chunks_mut(K) {
+            row[0] = 1.0;
+        }
+        let mut xg = vec![0.0f32; K];
+        xg[0] = GUARD_LOGIT;
+        let (wg, xg, bg) = (
+            DeviceTensor::upload(stream, &wg, E, K)?,
+            dev.up(&xg)?,
+            dev.up(&vec![0.0f32; E])?,
+        );
+        dev.router384.enqueue_router(
+            stream,
+            &wg,
+            &xg,
+            &bg,
+            SCALE,
+            &mut run,
+            dev.gpu.unlabelled_sink(),
+        )?;
+        let (gp, gi, gw) = (
+            dev.read(&run.probs)?,
+            dev.read(&run.ids)?,
+            dev.read(&run.weights)?,
+        );
+        let kept: Vec<f32> = gi.iter().map(|&e| gp[e as usize]).collect();
+        let sum = kept.iter().fold(0.0f64, |a, &p| a + f64::from(p));
+        let div = sum as f32 + 1e-20;
+        let floor = (sum as f32).max(1.0 / 16384.0);
+        let bit_ok = kept
+            .iter()
+            .zip(&gw)
+            .filter(|&(&p, &g)| (p / div * SCALE).to_bits() == g.to_bits())
+            .count();
+        let floor_differs = kept
+            .iter()
+            .zip(&gw)
+            .filter(|&(&p, &g)| (p / floor * SCALE).to_bits() != g.to_bits())
+            .count();
+        ok.push(clause(
+            "router384_guard_rule",
+            bit_ok == U && floor_differs == U,
+            &format!("{bit_ok} of {U} weights bit-equal the +1e-20 rule; {floor_differs} differ from the floor rule's"),
+        ));
+        ok.push(clause(
+            "router384_no_fault",
+            dev.gpu.fault()?.is_none(),
+            "nothing raised the fault word",
+        ));
+        Ok(ok)
+    }
+
     /// The first visit that runs stored layer `l`, as the set's taps name it.
     fn visit_of(hp: &Hparams, l: usize) -> Result<usize, GateError> {
         visits(hp.n_layer, loop_of(hp.loop_))
@@ -970,6 +1156,7 @@ mod gate {
         let hp = Hparams::read(&split).map_err(|e| format!("{}: {e}", path.display()))?;
         let dev = Dev {
             router: sigmoid_128_8::RouterKernels::load(gpu.context())?,
+            router384: sigmoid_384_8::RouterKernels::load(gpu.context())?,
             wide: Gemm32Kernels::load(gpu.context())?,
             leg: CardLeg::load(&gpu)?,
             nvfp4: Nvfp4SelKernels::load(gpu.context(), gpu.fault_word())?,
@@ -1022,6 +1209,7 @@ mod gate {
         let (mut w, l) = weights.ok_or("no ladder layer loaded")?;
         results.extend(refusal_clauses(&dev, &hp, (&mut w, l))?);
         results.push(guard_clause(&dev, &hp)?);
+        results.extend(small_router_clauses(&dev)?);
         let failed = results.iter().filter(|p| !**p).count();
         println!(
             "{NAME}: {} — {} clauses, {failed} failed",

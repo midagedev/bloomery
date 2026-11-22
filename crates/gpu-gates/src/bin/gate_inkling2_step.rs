@@ -1,5 +1,5 @@
 //! GPU gate for Inkling 2's visit pipeline — the block-attention residual's normed mix
-//! (`attn_res::enqueue_normed`), the looped core's message controller (`loop_control::enqueue`)
+//! (`attn_res::enqueue_normed`), the looped core's message controller (`loop_control::enqueue`, `enqueue_attn`)
 //! and the residual short convolutions (`linear::conv_res::enqueue`) — against host f64 rules of
 //! llama.cpp PR #32695's `src/models/inkling2.cpp` (`mix` :212-225, `control` :228-237, `convolve`
 //! :241-283) at the files' shapes (hidden 2,304, gate rank 64, taps 4, the k/v convs 1,024 channels
@@ -84,7 +84,9 @@ fn main() -> std::process::ExitCode {
 mod gate {
     use bloomery_gpu::attn_res::{AttnResKernels, AttnResNormedArgs, MAX_NQ, MAX_VECS};
     use bloomery_gpu::linear::conv_res::{ConvResArgs, ConvResKernels};
-    use bloomery_gpu::loop_control::{LoopControlArgs, LoopControlKernels, MAX_N, MAX_RANK};
+    use bloomery_gpu::loop_control::{
+        LoopControlArgs, LoopControlKernels, MAX_MODULES, MAX_N, MAX_RANK, OUT_COLS, scratch_len,
+    };
     use bloomery_gpu::{Gpu, GpuError};
     use bloomery_gpu_gates::tier::{self, Tier};
     use bloomery_gpu_gates::{
@@ -501,6 +503,7 @@ mod gate {
             let gain = DeviceBuffer::from_host(s, &f32s(&self.gain))?;
             let forget = DeviceBuffer::from_host(s, &f32s(&self.forget))?;
             let mut y = DeviceBuffer::zeroed(s, m * self.n)?;
+            let mut h = DeviceBuffer::zeroed(s, scratch_len(1, m, self.rank))?;
             k.enqueue(
                 s,
                 LoopControlArgs {
@@ -515,6 +518,7 @@ mod gate {
                     eps: EPS,
                     fault: gpu.unlabelled_sink(),
                 },
+                &mut h,
                 &mut y,
             )?;
             s.synchronize()?;
@@ -535,6 +539,91 @@ mod gate {
                 .collect();
             Ok((card, rule))
         }
+
+        fn upload(&self, gpu: &Gpu) -> Result<[DeviceBuffer<f32>; 5], GateError> {
+            let s = gpu.stream();
+            Ok([
+                DeviceBuffer::from_host(s, &f32s(&self.cur.concat()))?,
+                DeviceBuffer::from_host(s, &f32s(&self.msg.concat()))?,
+                DeviceBuffer::from_host(s, &f32s(&self.down))?,
+                DeviceBuffer::from_host(s, &f32s(&self.gain))?,
+                DeviceBuffer::from_host(s, &f32s(&self.forget))?,
+            ])
+        }
+
+        fn args<'a>(&self, gpu: &Gpu, b: &'a [DeviceBuffer<f32>; 5]) -> LoopControlArgs<'a> {
+            LoopControlArgs {
+                cur: &b[0],
+                msg: &b[1],
+                down: &b[2],
+                gain: &b[3],
+                forget: &b[4],
+                n: self.n,
+                rank: self.rank,
+                m: self.cur.len(),
+                eps: EPS,
+                fault: gpu.unlabelled_sink(),
+            }
+        }
+    }
+
+    /// One module's rows from the split launches and from the one-block reference.
+    type BitPair = (Vec<f32>, Vec<f32>);
+
+    /// The split launches' output beside the one-fused-launch reference's, for `cases` (one
+    /// case the single-module pair, three the attention launch), each module's own pair of
+    /// output rows.
+    fn control_pairs(
+        gpu: &Gpu,
+        k: &LoopControlKernels,
+        cases: &[&ControlCase],
+    ) -> Result<Vec<BitPair>, GateError> {
+        let s = gpu.stream();
+        let bufs = cases
+            .iter()
+            .map(|c| c.upload(gpu))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (n, rank, m) = (cases[0].n, cases[0].rank, cases[0].cur.len());
+        let mut old = Vec::new();
+        for (c, b) in cases.iter().zip(&bufs) {
+            let mut y = DeviceBuffer::zeroed(s, m * n)?;
+            k.enqueue_single_block(s, c.args(gpu, b), &mut y)?;
+            s.synchronize()?;
+            old.push(y.to_host_vec(s)?);
+        }
+        let mut new = Vec::new();
+        if cases.len() == 1 {
+            let mut y = DeviceBuffer::zeroed(s, m * n)?;
+            let mut h = DeviceBuffer::zeroed(s, scratch_len(1, m, rank))?;
+            k.enqueue(s, cases[0].args(gpu, &bufs[0]), &mut h, &mut y)?;
+            s.synchronize()?;
+            new.push(y.to_host_vec(s)?);
+        } else {
+            assert_eq!(cases.len(), MAX_MODULES);
+            let mut y0 = DeviceBuffer::zeroed(s, m * n)?;
+            let mut y1 = DeviceBuffer::zeroed(s, m * n)?;
+            let mut y2 = DeviceBuffer::zeroed(s, m * n)?;
+            let mut h = DeviceBuffer::zeroed(s, scratch_len(MAX_MODULES, m, rank))?;
+            k.enqueue_attn(
+                s,
+                [
+                    cases[0].args(gpu, &bufs[0]),
+                    cases[1].args(gpu, &bufs[1]),
+                    cases[2].args(gpu, &bufs[2]),
+                ],
+                &mut h,
+                [&mut y0, &mut y1, &mut y2],
+            )?;
+            s.synchronize()?;
+            for y in [&y0, &y1, &y2] {
+                new.push(y.to_host_vec(s)?);
+            }
+        }
+        Ok(new.into_iter().zip(old).collect())
+    }
+
+    fn same_bits(a: &[f32], b: &[f32]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
     }
 
     /// The card's residual conv over a seeded walk: `hist` one row a position with the dynamic
@@ -797,6 +886,47 @@ mod gate {
             );
             out.push(pass);
         }
+        // The split launches against the one-fused-launch reference: the same bits, at a decode
+        // row, the verify's eight, a width off the output group and a rank off the down group's
+        // pair and the rank unroll, and the widest staging.
+        for (i, &(n, rank, m)) in [
+            (N, RANK, 1usize),
+            (N, RANK, 8),
+            (200, 7, 3),
+            (OUT_COLS + 1, 1, 2),
+            (MAX_N, RANK, 1),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let case = ControlCase::new(0x1c1c_1000 + i as u64, n, rank, m);
+            let pair = control_pairs(gpu, k, &[&case])?;
+            let pass = same_bits(&pair[0].0, &pair[0].1) && gpu.fault()?.is_none();
+            println!(
+                "  control_bitwise {n} wide at rank {rank}, {m} rows: split launches equal the                  one-block launch bit for bit: {}",
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+        // The attention launch: each of the three modules (their own weights and rows) equals
+        // its own single launch bit for bit, and the three differ from one another.
+        for (i, &(n, rank, m)) in [(N, RANK, 1usize), (N, RANK, 8), (200, 7, 3)]
+            .iter()
+            .enumerate()
+        {
+            let cases: Vec<ControlCase> = (0..3)
+                .map(|j| ControlCase::new(0x1c1c_2000 + (i * 3 + j) as u64, n, rank, m))
+                .collect();
+            let pair = control_pairs(gpu, k, &[&cases[0], &cases[1], &cases[2]])?;
+            let own = pair.iter().all(|(new, old)| same_bits(new, old));
+            let distinct = !same_bits(&pair[0].1, &pair[1].1) && !same_bits(&pair[1].1, &pair[2].1);
+            let pass = own && distinct && gpu.fault()?.is_none();
+            println!(
+                "  control_attn {n} wide at rank {rank}, {m} rows: three modules in one launch pair,                  each its own single launch's bits (own={own}, distinct={distinct}): {}",
+                verdict(pass)
+            );
+            out.push(pass);
+        }
         let mut bad = ControlCase::new(0x1c1c_ff00, N, RANK, 1);
         bad.msg[0][11] = f64::NAN;
         let (card, _) = bad.run(gpu, k, ControlDrop::None)?;
@@ -1039,6 +1169,8 @@ mod gate {
         let cgain = DeviceBuffer::from_host(s, &f32s(&cc.gain))?;
         let cforget = DeviceBuffer::from_host(s, &f32s(&cc.forget))?;
         let mut cy = DeviceBuffer::zeroed(s, 512)?;
+        let mut ch = DeviceBuffer::zeroed(s, scratch_len(1, 1, 16))?;
+        let mut short_h = DeviceBuffer::zeroed(s, scratch_len(1, 1, 16) - 1)?;
         let mut control_at = |n: usize, rank: usize, m: usize, eps: f32| {
             control.enqueue(
                 s,
@@ -1054,6 +1186,7 @@ mod gate {
                     eps,
                     fault: gpu.unlabelled_sink(),
                 },
+                &mut ch,
                 &mut cy,
             )
         };
@@ -1086,6 +1219,54 @@ mod gate {
             "a short weight",
             refused(control_at(512, 16, 2, EPS)),
             "cur",
+        ));
+        out.push(refusal(
+            "a short scratch",
+            refused(control.enqueue(
+                s,
+                LoopControlArgs {
+                    cur: &ccur,
+                    msg: &cmsg,
+                    down: &cdown,
+                    gain: &cgain,
+                    forget: &cforget,
+                    n: 512,
+                    rank: 16,
+                    m: 1,
+                    eps: EPS,
+                    fault: gpu.unlabelled_sink(),
+                },
+                &mut short_h,
+                &mut cy,
+            )),
+            "h",
+        ));
+        let (mut cy1, mut cy2) = (
+            DeviceBuffer::<f32>::zeroed(s, 512)?,
+            DeviceBuffer::<f32>::zeroed(s, 512)?,
+        );
+        let mut ch3 = DeviceBuffer::zeroed(s, scratch_len(MAX_MODULES, 1, 16))?;
+        let module = |n: usize| LoopControlArgs {
+            cur: &ccur,
+            msg: &cmsg,
+            down: &cdown,
+            gain: &cgain,
+            forget: &cforget,
+            n,
+            rank: 16,
+            m: 1,
+            eps: EPS,
+            fault: gpu.unlabelled_sink(),
+        };
+        out.push(refusal(
+            "an attention module of another width",
+            refused(control.enqueue_attn(
+                s,
+                [module(512), module(256), module(512)],
+                &mut ch3,
+                [&mut cy, &mut cy1, &mut cy2],
+            )),
+            "share one shape",
         ));
 
         let ring = Ring::new(TAPS);
@@ -1319,6 +1500,7 @@ mod gate {
             let gain = DeviceBuffer::from_host(s, gain)?;
             let forget = DeviceBuffer::from_host(s, forget)?;
             let mut y = DeviceBuffer::zeroed(s, m * N)?;
+            let mut h = DeviceBuffer::zeroed(s, scratch_len(1, m, RANK))?;
             k.enqueue(
                 s,
                 LoopControlArgs {
@@ -1333,6 +1515,7 @@ mod gate {
                     eps: EPS,
                     fault: gpu.unlabelled_sink(),
                 },
+                &mut h,
                 &mut y,
             )?;
             s.synchronize()?;

@@ -1181,6 +1181,10 @@ fn markup(format: ToolFormat) -> [String; 2] {
             "[TOOL_CALLS]get_weather[ARGS]{\"unit\": \"celsius\", \"days\": 2}",
             "[TOOL_CALLS]search[ARGS]{\"query\": \"cats\", \"deep\": false}",
         ],
+        ToolFormat::Inkling => [
+            "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"unit\": \"celsius\", \"days\": 2}}<|end_message|>",
+            "<|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"query\": \"cats\", \"deep\": false}}<|end_message|>",
+        ],
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     texts.map(|t| match format {
@@ -1232,6 +1236,12 @@ fn scanned(format: ToolFormat, tools: &Value, text: &str) -> Vec<(String, Value)
             out.calls.extend(s.finish().expect("closes").calls);
             out
         }
+        ToolFormat::Inkling => {
+            let mut s = crate::inkling::InklingScan::new(true);
+            let mut out = s.push(text).expect("parses");
+            out.calls.extend(s.finish().expect("closes").calls);
+            out
+        }
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     assert!(
@@ -1270,6 +1280,7 @@ fn each_formats_inverse_reads_back_through_its_scanner() {
         ToolFormat::Dsml(Spelling::Spaced),
         ToolFormat::MuseSpark,
         ToolFormat::Mistral,
+        ToolFormat::Inkling,
     ] {
         let [weather, search] = markup(format);
         let required = json!({"tools": tools, "tool_choice": "required"});
@@ -1334,6 +1345,7 @@ fn a_forced_call_obeys_the_tools_when_greedy_does_not() {
         ToolFormat::Dsml(Spelling::Spaced),
         ToolFormat::MuseSpark,
         ToolFormat::Mistral,
+        ToolFormat::Inkling,
     ] {
         let c = build(
             &tok,
@@ -1924,6 +1936,7 @@ fn parser(format: ToolFormat, tools: &Value) -> ChatParser {
         ToolFormat::Dsml(spelling) => Tools::Dsml(spelling),
         ToolFormat::MuseSpark => Tools::MuseSpark,
         ToolFormat::Mistral => Tools::Mistral,
+        ToolFormat::Inkling => Tools::Inkling,
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     ChatParser::with_tools("", ReasoningFormat::None, Some(scan))
@@ -4575,7 +4588,7 @@ fn city_call(format: ToolFormat, keys: &[&str]) -> String {
     for (i, k) in keys.iter().enumerate() {
         let (v, text) = value(k);
         members.push(match format {
-            ToolFormat::Hermes | ToolFormat::Mistral => format!(
+            ToolFormat::Hermes | ToolFormat::Mistral | ToolFormat::Inkling => format!(
                 "{}\"{k}\": {}",
                 if i == 0 { "" } else { ", " },
                 if text {
@@ -4620,6 +4633,10 @@ fn city_call(format: ToolFormat, keys: &[&str]) -> String {
              <atem:invoke name=\"get_weather\">\n{members}</atem:invoke>\n</atem:function_calls>"
         ),
         ToolFormat::Mistral => format!("[TOOL_CALLS]get_weather[ARGS]{{{members}}}"),
+        ToolFormat::Inkling => format!(
+            "<|message_model|>get_weather<|content_invoke_tool_json|>\
+             {{\"name\":\"get_weather\",\"args\":{{{members}}}}}<|end_message|>"
+        ),
         ToolFormat::Unparsed => unreachable!("a parsed format"),
     };
     match format {
@@ -4684,6 +4701,7 @@ fn optional_parameters_may_be_left_out_in_schema_order() {
         ToolFormat::Dsml(Spelling::Joined),
         ToolFormat::Dsml(Spelling::Spaced),
         ToolFormat::MuseSpark,
+        ToolFormat::Inkling,
     ] {
         for keys in subsets {
             let body = json!({"tools": tools, "tool_choice": "required"});
@@ -4752,7 +4770,10 @@ fn an_object_with_no_required_property_may_be_empty() {
                         </tool_calls:6124c78e>"
                     }
                     ToolFormat::Mistral => "[TOOL_CALLS]get_time[ARGS]{}",
-                    ToolFormat::Dsml(_) | ToolFormat::MuseSpark | ToolFormat::Unparsed => {
+                    ToolFormat::Dsml(_)
+                    | ToolFormat::MuseSpark
+                    | ToolFormat::Inkling
+                    | ToolFormat::Unparsed => {
                         unreachable!("not in this loop")
                     }
                 },
@@ -4783,7 +4804,10 @@ fn an_object_with_no_required_property_may_be_empty() {
                         </tool_call:6124c78e></tool_calls:6124c78e>"
                     }
                     ToolFormat::Mistral => "[TOOL_CALLS]get_time[ARGS]{\"zone\": 1}",
-                    ToolFormat::Dsml(_) | ToolFormat::MuseSpark | ToolFormat::Unparsed => {
+                    ToolFormat::Dsml(_)
+                    | ToolFormat::MuseSpark
+                    | ToolFormat::Inkling
+                    | ToolFormat::Unparsed => {
                         unreachable!("not in this loop")
                     }
                 },

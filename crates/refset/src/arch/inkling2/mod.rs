@@ -35,6 +35,7 @@
 //! (`ffn_moe_gate_up` … `ffn_moe_out`).
 
 pub mod fixture;
+pub mod small;
 
 #[cfg(test)]
 mod tests;
@@ -103,5 +104,5 @@ pub static LCPP: Family = Family {
     consumers: &[],
 };
 
-/// The architecture's families, in the order `refset-check` lists them: the real file's, then the fixture's.
-pub static FAMILIES: &[&Family] = &[&LCPP, &fixture::LCPP];
+/// The architecture's families, in the order `refset-check` lists them: the Mini's real file's, the fixture's, then the Small's.
+pub static FAMILIES: &[&Family] = &[&LCPP, &fixture::LCPP, &small::LCPP];

@@ -114,7 +114,25 @@ cb_dump_run() {
   local args=(-m "$MODEL" --out "$stage" --build "$build" --arch "$CB_ARCH" --title "$CB_TITLE" -c 4096 -ub 512 -t "${!thr_var:-32}"
     ${CB_FLAGS[@]+"${CB_FLAGS[@]}"})
   [ -z "$fixture_line_text" ] || args+=(--fixture-line "$fixture_line_text")
+  # DUMP_ONLY="d a" runs those prompts only; DUMP_SKIP_DONE=1 leaves a prompt whose installed set already holds its trailer (a
+  # long dump restarts per prompt). Both unset: every prompt, as before.
+  local prompts=() only=" ${DUMP_ONLY:-} "
   for p in "${CB_PROMPTS[@]}"; do
+    name=${p%%:*}
+    if [ -n "${DUMP_ONLY:-}" ]; then
+      case $only in *" $name "*) ;; *) continue ;; esac
+    fi
+    if [ "${DUMP_SKIP_DONE:-0}" = 1 ] && grep -qs '^# complete' "$BLOOMERY_DATA/$(cb_set_name "$name")/MANIFEST.tsv"; then
+      echo "[skip] $(cb_set_name "$name") is complete" >&2
+      continue
+    fi
+    prompts+=("$p")
+  done
+  if [ ${#prompts[@]} -eq 0 ]; then
+    echo "$CB_SCRIPT: no prompt to dump (DUMP_ONLY='${DUMP_ONLY:-}', every selected set already complete)" >&2
+    exit 0
+  fi
+  for p in "${prompts[@]}"; do
     IFS=: read -r name ids nodes greedy step <<< "$p"
     case $ids in
       /*) ids_path=$ids ;;
@@ -127,7 +145,7 @@ cb_dump_run() {
 
   if [ "${DUMP_DRY:-0}" = 1 ]; then
     printf '[dry] tier\t%s\tprofile %s\n' "${BLOOMERY_TIER:-real}" "$MODEL_NAME"
-    for p in "${CB_PROMPTS[@]}"; do printf '[dry] set\t%s\n' "$(cb_set_name "${p%%:*}")"; done
+    for p in "${prompts[@]}"; do printf '[dry] set\t%s\n' "$(cb_set_name "${p%%:*}")"; done
     printf '[dry] # model\t%s\n[dry] # build\t%s\n[dry] dumper\t%s\n' "$MODEL" "$build" "$BIN"
     [ -z "$fixture_line_text" ] || printf '[dry] %s\n' "$fixture_line_text"
     printf '[dry] argv\t%q' "$BIN"
@@ -162,11 +180,11 @@ cb_dump_run() {
   export CUDA_VISIBLE_DEVICES=""
   lease_bounded "$dump_bound" "$BIN" "${args[@]}"
   if [ "${REF_DUMP_LEASE:-1}" = 1 ]; then witness post-dump; fi
-  for p in "${CB_PROMPTS[@]}"; do
+  for p in "${prompts[@]}"; do
     name=${p%%:*}
     grep -q '^# complete' "$STAGE/$name/MANIFEST.tsv" || { echo "$CB_SCRIPT: $name has no completion trailer — not installing it" >&2; exit 1; }
   done
-  for p in "${CB_PROMPTS[@]}"; do
+  for p in "${prompts[@]}"; do
     name=${p%%:*}
     dest="$BLOOMERY_DATA/$(cb_set_name "$name")"
     rm -rf "$dest.old"

@@ -352,6 +352,16 @@ pub const ROUTERS: &[RouterInst] = &[
         top_k_max: 8,
         at: "gpu/src/route_body.rs sigmoid_128_8_router*",
     },
+    // Inkling 2 Small's router: the rule of the 128/8 row at 384 experts.
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 384,
+        top_k_min: 8,
+        top_k_max: 8,
+        at: "gpu/src/route_body.rs sigmoid_384_8_router*",
+    },
     // 256 experts, top 6. After MiMo's 256/top-8 row: `router_row` at 256
     // stays that row, and the pick ranges 8..=8 and 6..=6 do not overlap.
     RouterInst {
@@ -1244,6 +1254,7 @@ mod tests {
                     || r.at.contains("sigmoid_128_4_router")
                     || r.at.contains("sigmoid_128_6_router")
                     || r.at.contains("sigmoid_128_8_router")
+                    || r.at.contains("sigmoid_384_8_router")
                     || r.at.contains("sigmoid_256_6_router")
                     || r.at.contains("sigmoid_16_8_router")
                     || r.at.contains("sigmoid_896_16_router")
@@ -1255,7 +1266,7 @@ mod tests {
         }
         // The rows that carry the body: GLM's and MiMo's, then Bolt's five, then
         // the 320-expert instance's, then the three 128-expert ones (top 4, top
-        // 6, top 8), then the 256-expert top-6 row, Muse Spark's fixture at 16,
+        // 6, top 8), Inkling 2 Small's 384-expert top-8 row, then the 256-expert top-6 row, Muse Spark's fixture at 16,
         // and Kimi K3's two (896 top 16, its fixture's 8 top 2).
         let widths: Vec<u32> = ROUTERS
             .iter()
@@ -1265,7 +1276,7 @@ mod tests {
         assert_eq!(
             widths,
             [
-                288, 256, 240, 304, 368, 432, 496, 320, 128, 128, 128, 256, 16, 896, 8
+                288, 256, 240, 304, 368, 432, 496, 320, 128, 128, 128, 384, 256, 16, 896, 8
             ]
         );
         // Coverage's `routes(n, &[BiasedSigmoid])`: the rule's shapes pass at
@@ -1280,7 +1291,7 @@ mod tests {
         assert_eq!(
             e.why,
             Refusal::RouterWidth {
-                served: vec![288, 256, 240, 304, 368, 432, 496, 320, 128, 16, 896, 8]
+                served: vec![288, 256, 240, 304, 368, 432, 496, 320, 128, 384, 16, 896, 8]
             }
         );
     }
@@ -1365,6 +1376,27 @@ mod tests {
         );
         let e = select_router(moe(rule, 128, 7)).expect_err("128 at top 7");
         assert!(matches!(e.why, Refusal::TopK { .. }), "{e}");
+    }
+
+    /// The biased sigmoid at 384 experts and top 8 (Inkling 2 Small's) is its own row: the
+    /// 128/8 row's rule at three times the experts, twelve a lane. V4.1's 384-expert router is
+    /// another body under another rule, and the rule picks the row; a top-k that is not 8 is
+    /// refused.
+    #[test]
+    fn sigmoid_384_8_router_is_its_row() {
+        let rule = rules::BIASED_SIGMOID;
+        let r = select_router(moe(rule, 384, 8)).expect("no router row at 384/8");
+        assert_eq!(r.body, super::RouterBody::BiasedSigmoid);
+        assert_eq!((r.experts(), r.per_lane()), (384, 12));
+        assert!(r.at.contains("sigmoid_384_8_router"), "{}", r.at);
+        assert_eq!(router_row(super::RouterBody::BiasedSigmoid, 384), r);
+        assert!(router_row_is(r, rule, false, (8, 8)));
+        for top_k in [6, 7, 9] {
+            let e = select_router(moe(rule, 384, top_k)).expect_err("384 at another top k");
+            assert_eq!(e.why, Refusal::TopK { min: 8, max: 8 }, "{top_k}");
+        }
+        let v41 = select_router(moe(rules::BIASED_SQRT_SOFTPLUS, 384, 6)).expect("V4.1's row");
+        assert_ne!(v41.body, super::RouterBody::BiasedSigmoid);
     }
 
     /// The biased sigmoid at 256 experts and top 6 is its own row, after
