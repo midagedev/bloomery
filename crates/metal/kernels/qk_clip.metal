@@ -8,12 +8,12 @@
 // reference's epilogue order, one SIMD group a row, eight rows a
 // threadgroup (the visit's 2 · (Q + KV) rows are two threadgroups):
 //
-// - a query row takes its per-channel scale, is clipped to an L2 norm of at
+// - a query row takes its head's scale row, is clipped to an L2 norm of at
 //   most `qk_thresh`, then carries the token's `tau`;
 // - a key row takes no scale and clips at the same threshold; a value row
 //   takes a gainless RMS norm at `v_eps` and no clip; both append f16 into
 //   this visit's cache planes, head-major [KV][ctx][HEAD] u16;
-// - a relative row takes its per-channel scale, clips at `r_thresh`, then
+// - a relative row takes its head's scale row, clips at `r_thresh`, then
 //   carries `tau`. A windowed visit passes `tau` 1.0 and the multiply is
 //   exact; a windowless visit passes the log-scaled position factor.
 //
@@ -112,7 +112,7 @@ kernel void qk_clip_append(device float *q [[buffer(0)]],
         for (uint i = 0u; i < 4u; ++i) {
             x[i] = rowbuf[base + lane + 32u * i];
             if (is_q) {
-                x[i] *= gq[lane + 32u * i];
+                x[i] *= gq[base + lane + 32u * i];
             }
             acc = fma(x[i], x[i], acc);
         }
@@ -183,7 +183,7 @@ kernel void qk_clip_append(device float *q [[buffer(0)]],
     const uint h = gw - heads - 2u * kv;
     const uint base = h * BLOOMERY_INK2_REL;
     const bool mine = lane < BLOOMERY_INK2_REL;
-    float x = mine ? r[base + lane] * gr[lane] : 0.0f;
+    float x = mine ? r[base + lane] * gr[base + lane] : 0.0f;
     const float f = qk_clip_factor(sqrt(simd_sum(mine ? x * x : 0.0f)), args.r_thresh);
     if (!isfinite(f)) {
         if (lane == 0u) {

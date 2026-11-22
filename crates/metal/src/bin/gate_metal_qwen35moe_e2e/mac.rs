@@ -124,6 +124,8 @@ use bloomery_metal::library::{Library, sources_for};
 mod chain;
 #[path = "flip.rs"]
 mod flip;
+#[path = "ink2.rs"]
+mod ink2;
 #[path = "keep.rs"]
 mod keep;
 #[path = "layers.rs"]
@@ -187,6 +189,9 @@ fn model_path() -> Result<PathBuf, String> {
     match spec.model {
         row::Model::Split => mlx_split::path(spec.arch),
         row::Model::Folder => mlx_split::folder(spec.arch),
+        row::Model::Fixture => refset::fixture::first_shard(spec.arch)
+            .map(PathBuf::from)
+            .map_err(|e| format!("the fixture file: {e}")),
     }
 }
 
@@ -562,6 +567,10 @@ pub fn main() -> ExitCode {
         Some((m, _)) if !mutants::kept(row.mutants, m.name) => Some(m.clause),
         _ => flag(&args, "--only"),
     };
+    // The family's own session and clauses: no clause above runs on it.
+    if row.model == row::Model::Fixture {
+        return ink2::run(&args, mutant, only);
+    }
     if let Some(name) = only
         && !NAMES.contains(&name)
     {

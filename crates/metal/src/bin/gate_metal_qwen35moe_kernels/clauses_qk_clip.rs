@@ -52,11 +52,11 @@ fn rows(seed: u64) -> Rows {
         k: pick(KV_HEADS, HEAD, seed + 100, &amp),
         v: pick(KV_HEADS, HEAD, seed + 200, &[0.1, 1.0, 7.0]),
         r: pick(QUERY_HEADS, D_REL, seed + 300, &[0.5, 1.0, 2.0, 4.0, 6.0]),
-        gq: ink2::draw(HEAD, seed + 400, 0.5)
+        gq: ink2::draw(QUERY_HEADS * HEAD, seed + 400, 0.5)
             .iter()
             .map(|g| 1.0 + g)
             .collect(),
-        gr: ink2::draw(D_REL, seed + 401, 0.5)
+        gr: ink2::draw(QUERY_HEADS * D_REL, seed + 401, 0.5)
             .iter()
             .map(|g| 1.0 + g)
             .collect(),
@@ -103,8 +103,8 @@ fn launch(h: &Harness<'_>, rows: &Rows, knobs: &Knobs) -> Result<Out, String> {
                 k: k.window_mut(Elems(0), Elems(rows.k.len()))?,
                 v: v.window_mut(Elems(0), Elems(rows.v.len()))?,
                 r: r.window_mut(Elems(0), Elems(rows.r.len()))?,
-                gq: gq.window(Elems(0), Elems(HEAD))?,
-                gr: gr.window(Elems(0), Elems(D_REL))?,
+                gq: gq.window(Elems(0), Elems(QUERY_HEADS * HEAD))?,
+                gr: gr.window(Elems(0), Elems(QUERY_HEADS * D_REL))?,
                 cache_k: ck.window_mut(Elems(0), Elems(plane.len()))?,
                 cache_v: cv.window_mut(Elems(0), Elems(plane.len()))?,
                 ctx: CTX,
@@ -162,7 +162,9 @@ fn fit_rows(
 ) -> Result<f64, String> {
     let mut worst = 0.0f64;
     for (h, (g, x)) in got.chunks(width).zip(input.chunks(width)).enumerate() {
-        let (want, band) = clip(&scaled(x, gain), threshold, tau);
+        // A scale is one row a head, as the file's clip tensors hold it.
+        let row = gain.map(|g| &g[h * width..(h + 1) * width]);
+        let (want, band) = clip(&scaled(x, row), threshold, tau);
         worst = worst.max(ink2::fit(&format!("{what} row {h}"), g, &want, &band)?);
     }
     Ok(worst)
@@ -347,8 +349,8 @@ pub fn qk_clip_bounds(h: &Harness<'_>) -> Clause {
                         k: k.window_mut(Elems(0), Elems(r.k.len()))?,
                         v: v.window_mut(Elems(0), Elems(r.v.len()))?,
                         r: rb.window_mut(Elems(0), Elems(r.r.len()))?,
-                        gq: gq.window(Elems(0), Elems(HEAD))?,
-                        gr: gr.window(Elems(0), Elems(D_REL))?,
+                        gq: gq.window(Elems(0), Elems(QUERY_HEADS * HEAD))?,
+                        gr: gr.window(Elems(0), Elems(QUERY_HEADS * D_REL))?,
                         cache_k: ck.window_mut(Elems(0), Elems(plane_len))?,
                         cache_v: cv.window_mut(Elems(0), Elems(plane_len))?,
                         ctx,

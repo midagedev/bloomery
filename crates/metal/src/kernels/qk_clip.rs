@@ -25,9 +25,11 @@ pub struct QkClipParams<'w> {
     pub v: WindowMut<'w, f32, MetalDevice>,
     /// The relative rows, `24 · 16`, clipped in place.
     pub r: WindowMut<'w, f32, MetalDevice>,
-    /// The query rows' per-channel scale, 128 values.
+    /// The query rows' scale, one a (head, channel): `24 · 128`, head-major as the
+    /// file's `attn_q_clip` rows.
     pub gq: Window<'w, f32, MetalDevice>,
-    /// The relative rows' per-channel scale, 16 values.
+    /// The relative rows' scale, one a (head, value): `24 · 16`, head-major as
+    /// the file's `attn_rel_clip` rows.
     pub gr: Window<'w, f32, MetalDevice>,
     /// The visit's key plane, `8 · ctx · 128` f16 bits, head-major.
     pub cache_k: WindowMut<'w, u16, MetalDevice>,
@@ -82,8 +84,8 @@ impl Kernels {
         check_window_len(WHAT, "k", p.k.len(), KV_HEADS * HEAD)?;
         check_window_len(WHAT, "v", p.v.len(), KV_HEADS * HEAD)?;
         check_window_len(WHAT, "r", p.r.len(), QUERY_HEADS * D_REL)?;
-        check_window_len(WHAT, "gq", p.gq.len(), HEAD)?;
-        check_window_len(WHAT, "gr", p.gr.len(), D_REL)?;
+        check_window_len(WHAT, "gq", p.gq.len(), QUERY_HEADS * HEAD)?;
+        check_window_len(WHAT, "gr", p.gr.len(), QUERY_HEADS * D_REL)?;
         let plane = KV_HEADS
             .checked_mul(p.ctx)
             .and_then(|v| v.checked_mul(HEAD))

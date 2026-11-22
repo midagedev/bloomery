@@ -368,8 +368,8 @@ impl Shape {
     }
 }
 
-/// NVFP4 weights of `rows` by `cols`: every scale byte the finite 1.0, the
-/// codes drawn, in the layout's bytes.
+/// Stacked expert weights of `rows` by `cols`: every scale the finite 1.0,
+/// the codes drawn (an MXFP8 code kept finite), in the layout's bytes.
 fn nvfp4_weights(layout: NvfpLayout, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
     const SCALE_ONE: u8 = 0x38;
     let total = layout.bytes(rows, cols).unwrap_or(0);
@@ -390,6 +390,19 @@ fn nvfp4_weights(layout: NvfpLayout, rows: usize, cols: usize, seed: u64) -> Vec
         NvfpLayout::Rows => {
             for group in bytes.as_chunks_mut::<9>().0 {
                 group[0] = SCALE_ONE;
+            }
+        }
+        NvfpLayout::Q8_0 => {
+            for block in bytes.as_chunks_mut::<34>().0 {
+                block[..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+            }
+        }
+        NvfpLayout::Mxfp8Rows => {
+            for group in bytes.as_chunks_mut::<33>().0 {
+                group[0] = 0x7F;
+                for code in &mut group[1..] {
+                    *code &= 0xF7;
+                }
             }
         }
     }

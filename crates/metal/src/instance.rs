@@ -535,12 +535,15 @@ pub const NEOX_ATTN_H64_GQA7: Instance = Instance {
 /// refuses a row with sinks and no bias path exists, so the family's flash
 /// is `metal/kernels/rel_flash.metal`, compiled at the group of three.
 ///
-/// The row is held out of [`REGISTERED`]: a registered row takes its host
-/// feature and its build, and the family's launches — the rel-bias flash, the
-/// normed mix, the loop controller, the residual short conv, the qk clip
-/// epilogue, the NVFP4 mat-vec, the sigmoid router and the situ pair
-/// (`kernels::inkling2`) — are not wired into a model's step yet. Its FFN
-/// axis's router row is the shape table's own 128-expert top-8
+/// The row is held out of [`REGISTERED`]: a registered row's build compiles
+/// the shared decode flash and router at its geometry, and those refuse its
+/// sinks and its biased sigmoid rule. The family's session
+/// (`arch::inkling2`) runs at [`HOST`] instead: its own launches — the
+/// rel-bias flash, the normed mix, the loop controller, the residual short
+/// conv, the qk clip epilogue, the NVFP4 mat-vec, the sigmoid router and the
+/// situ pair (`kernels::inkling2`) — read the family's geometry, and the
+/// shared ones it takes carry their shapes in launch words. Its FFN axis's
+/// router row is the shape table's own 128-expert top-8
 /// [`RouterBody::BiasedSigmoid`] row.
 pub const INKLING2_MINI: Instance = Instance {
     name: "inkling2_mini",
@@ -1951,7 +1954,7 @@ mod tests {
         assert_eq!(got, m.router, "the table's selection is the row");
         assert!(
             !REGISTERED.contains(&INKLING2_MINI),
-            "the row waits on the family's launches being wired"
+            "a registered row's build compiles the shared flash and router, which refuse the row"
         );
         let a = inkling2_axes();
         assert_eq!(
@@ -1962,6 +1965,9 @@ mod tests {
         assert!(!a.q_gate && !a.head_gate && !a.qk_norm && !a.norm_pairs);
         assert_eq!(inkling2_row().key.hidden, 2304);
         assert_eq!((m.top_k, m.expert_ff), (8, 1152));
-        assert!(!inkling2_row().opens, "no session of the family has landed");
+        assert!(
+            !inkling2_row().opens,
+            "the family's session opens its files at the host instance"
+        );
     }
 }

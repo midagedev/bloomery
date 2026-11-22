@@ -151,6 +151,7 @@ lab-metal-e2e:
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen3
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen3t
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen2
+    run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row inkling2
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --mutants-all
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen38d --mutants-all
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row lfm3 --mutants-all
@@ -158,6 +159,7 @@ lab-metal-e2e:
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen3 --mutants-all
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen3t --mutants-all
     run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row qwen2 --mutants-all
+    run ./tools/mac-gate.sh gate_metal_qwen35moe_e2e --row inkling2 --mutants-all
     # The smoke opens the MLX split's first shard, the same file the e2e gate opens.
     shard() {
         local dir="${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/$1-mlxsplit" found=()

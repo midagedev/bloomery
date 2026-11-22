@@ -35,7 +35,10 @@
 //! deep pin (`m_logits_deep`) reads; Llama's is [`LLAMA`], an edit of the NORM-pairs
 //! prologue that `m_logits` reads; the dense Qwen3's are [`QWEN3`], edits of the head
 //! norm and of the NEOX pairs, which a first step reads none of; Qwen2's is [`QWEN2`], an edit of the
-//! bias add after P1, which the Llama row's layers have none of. The edits compile into
+//! bias add after P1, which the Llama row's layers have none of; Inkling 2's are [`INKLING2`],
+//! edits of the loop controllers' forget gate (`k_taps`) and of the head's pick (`k_greedy`);
+//! `k_visits`' and `k_room`'s defects are the host's (a walk of other visits, a buffer the plan
+//! does not count), one-off edits like the others above. The edits compile into
 //! the row's own instance's source (`program::source_at`), so they land in the
 //! program the row runs.
 
@@ -55,6 +58,7 @@ pub fn all(set: Mutants) -> impl Iterator<Item = (&'static Mutant, Program)> {
         Mutants::Llama => (LLAMA, &[]),
         Mutants::Qwen3 => (QWEN3, &[]),
         Mutants::Qwen2 => (QWEN2, &[]),
+        Mutants::Inkling2 => (INKLING2, &[]),
         Mutants::None => (&[], &[]),
     };
     program::all(main, tensor)
@@ -69,6 +73,7 @@ pub fn kept_of(set: Mutants) -> &'static [Mutant] {
         | Mutants::Llama
         | Mutants::Qwen3
         | Mutants::Qwen2
+        | Mutants::Inkling2
         | Mutants::None => &[],
     }
 }
@@ -448,6 +453,41 @@ pub const QWEN3: &[Mutant] = &[
         edits: &[(
             "float n1 = scratch[i + pairs];",
             "float n1 = scratch[i + 1u];",
+            1,
+        )],
+    },
+];
+
+pub const INKLING2: &[Mutant] = &[
+    Mutant {
+        name: "ink2_forget_sign",
+        clause: "k_taps",
+        why: "the loop controllers' forget gate adds to the stream instead of removing from it, \
+              which only a message visit reads",
+        edits: &[(
+            "(1.0f - tanh(f)) * cur[row + j]",
+            "(1.0f + tanh(f)) * cur[row + j]",
+            1,
+        )],
+    },
+    Mutant {
+        name: "ink2_conv_taps_reversed",
+        clause: "k_taps",
+        why: "the residual convs read their window in the opposite order, which a position past \
+              the first reads",
+        edits: &[(
+            "conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, args.pos, reach - k, c),",
+            "conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, args.pos, k - 1u, c),",
+            1,
+        )],
+    },
+    Mutant {
+        name: "ink2_pick_shifted",
+        clause: "k_greedy",
+        why: "the head stores the id after its argmax's, which no visit's node shows",
+        edits: &[(
+            "step_id[0] = ~uint(best_key);",
+            "step_id[0] = ~uint(best_key) + 1u;",
             1,
         )],
     },

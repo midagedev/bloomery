@@ -111,8 +111,8 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         clause: "qk_clip_rows",
         why: "the key rows take the query's per-channel gain",
         edits: &[(
-            "if (is_q) {\n                x[i] *= gq[lane + 32u * i];",
-            "if (true) {\n                x[i] *= gq[lane + 32u * i];",
+            "if (is_q) {\n                x[i] *= gq[base + lane + 32u * i];",
+            "if (true) {\n                x[i] *= gq[base + lane + 32u * i];",
             1,
         )],
     },
@@ -149,8 +149,30 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         clause: "qk_clip_rows",
         why: "the relative rows skip their gain",
         edits: &[(
-            "float x = mine ? r[base + lane] * gr[lane] : 0.0f;",
+            "float x = mine ? r[base + lane] * gr[base + lane] : 0.0f;",
             "float x = mine ? r[base + lane] : 0.0f;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "qk_clip_q_scale_one_head",
+        clause: "qk_clip_rows",
+        why: "every query head takes head 0's scale row, not its own: the file's \
+              `attn_q_clip` is one row a head",
+        edits: &[(
+            "x[i] *= gq[base + lane + 32u * i];",
+            "x[i] *= gq[lane + 32u * i];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "qk_clip_r_scale_one_head",
+        clause: "qk_clip_rows",
+        why: "every relative head takes head 0's scale row, not its own: the file's \
+              `attn_rel_clip` is one row a head",
+        edits: &[(
+            "float x = mine ? r[base + lane] * gr[base + lane] : 0.0f;",
+            "float x = mine ? r[base + lane] * gr[lane] : 0.0f;",
             1,
         )],
     },
@@ -236,11 +258,11 @@ pub const INK2_MUTANTS: &[Mutant] = &[
     Mutant {
         name: "nvfp4_global_scale_dropped",
         clause: "nvfp4_rows",
-        why: "the expert's global scale is not applied",
+        why: "no entry applies its launch word: the expert's global scale and route weight are lost",
         edits: &[(
             "const float dot = simd_sum(acc) * args.w_scale;",
             "const float dot = simd_sum(acc);",
-            2,
+            4,
         )],
     },
     Mutant {
@@ -268,6 +290,32 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         clause: "nvfp4_nan",
         why: "a scale byte that is not a number is used as a number",
         edits: &[("usable = usable && isfinite(s);", "usable = usable;", 2)],
+    },
+    Mutant {
+        name: "q8_0_scaled_word_dropped",
+        clause: "nvfp4_rows",
+        why: "the Q8_0 entry's rows skip the launch word: a coda expert's route weight is lost",
+        edits: &[(
+            "const float v = float(as_type<char>(blk[2u + lane])) * d;\n        acc += v * x[i * 32u + lane];\n    }\n    const float dot = simd_sum(acc) * args.w_scale;",
+            "const float v = float(as_type<char>(blk[2u + lane])) * d;\n        acc += v * x[i * 32u + lane];\n    }\n    const float dot = simd_sum(acc);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mxfp8_scale_bias_off",
+        clause: "nvfp4_rows",
+        why: "the MXFP8 group scale is read 2^(s − 126), one octave high",
+        edits: &[("exp2(float(sb) - 127.0f)", "exp2(float(sb) - 126.0f)", 1)],
+    },
+    Mutant {
+        name: "mxfp8_nan_code_passes",
+        clause: "nvfp4_nan",
+        why: "an E4M3 NaN code decodes as the largest normal value: the row stays finite",
+        edits: &[(
+            "    if (mag == 0x7fu) {\n        return NAN;\n    }",
+            "    if (mag == 0x7fu) {\n        return 448.0f;\n    }",
+            1,
+        )],
     },
     Mutant {
         name: "router_sigmoid_scale_dropped",

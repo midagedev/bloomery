@@ -1,11 +1,14 @@
-//! The NVFP4 mat-vec of Inkling 2's routed experts (`kernels/nvfp4.metal`):
+//! The scaled mat-vec of Inkling 2's routed experts (`kernels/nvfp4.metal`):
 //! a SIMD group a row, eight rows a threadgroup, over the codes as the files
-//! store them, the expert's global scale a launch word applied after the dot.
+//! store them, a launch word scaling each row's finished dot (the expert's
+//! global scale, times its route weight on a routed down).
 //!
-//! Two layouts, one kernel source: the blocks of the GGUF file (mainline's
-//! `block_nvfp4`: 64 values in 36 bytes, [`NvfpLayout::Blocks`]) and the rows
-//! of the MLX folder's tensors (bloomery's `NVFP4_ROWS`: a UE4M3 scale byte
-//! and 8 code bytes a 16-value group, [`NvfpLayout::Rows`]).
+//! Four layouts, one kernel source: the NVFP4 blocks of the GGUF file
+//! (mainline's `block_nvfp4`: 64 values in 36 bytes, [`NvfpLayout::Blocks`]),
+//! the NVFP4 rows of the MLX folder's tensors (bloomery's `NVFP4_ROWS`: a
+//! UE4M3 scale byte and 8 code bytes a 16-value group, [`NvfpLayout::Rows`]),
+//! and the two codas' forms: the GGUF's Q8_0 blocks ([`NvfpLayout::Q8_0`])
+//! and the MLX folder's MXFP8 rows ([`NvfpLayout::Mxfp8Rows`]).
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -26,6 +29,12 @@ const THREADS: usize = ROWS_PER_GROUP * 32;
 const ROWS_GROUP_VALUES: usize = 16;
 /// Bytes a group of the rows layout holds.
 const ROWS_GROUP_BYTES: usize = 9;
+/// Values a block of the Q8_0 and MXFP8 layouts holds.
+const WIDE_GROUP_VALUES: usize = 32;
+/// Bytes a Q8_0 block holds: the f16 scale and 32 codes.
+const Q8_0_BYTES: usize = 34;
+/// Bytes an MXFP8 group holds: the E8M0 scale byte and 32 codes.
+const MXFP8_BYTES: usize = 33;
 
 /// How the weights are laid out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +45,13 @@ pub enum NvfpLayout {
     /// Bloomery's NVFP4 rows: 16 values in 9 bytes, the scale byte first, value
     /// `2i` the low nibble of code byte `i`. `k` is a multiple of 16.
     Rows,
+    /// GGUF `Q8_0`: 34-byte blocks of 32 values, the f16 scale first. The
+    /// GGUF coda's stacks; `k` is a multiple of 32.
+    Q8_0,
+    /// Bloomery's MXFP8 rows: 33 bytes a 32-value group, the E8M0 scale byte
+    /// first, value `i` E4M3 code byte `i`. The MLX folder coda's stacks; `k`
+    /// is a multiple of 32.
+    Mxfp8Rows,
 }
 
 impl NvfpLayout {
@@ -45,6 +61,7 @@ impl NvfpLayout {
         match self {
             Self::Blocks => NVFP4_VALUES,
             Self::Rows => ROWS_GROUP_VALUES,
+            Self::Q8_0 | Self::Mxfp8Rows => WIDE_GROUP_VALUES,
         }
     }
 
@@ -60,6 +77,17 @@ impl NvfpLayout {
                 }
                 rows.checked_mul(k / ROWS_GROUP_VALUES)?
                     .checked_mul(ROWS_GROUP_BYTES)
+            }
+            Self::Q8_0 | Self::Mxfp8Rows => {
+                if !k.is_multiple_of(WIDE_GROUP_VALUES) {
+                    return None;
+                }
+                let per = if self == Self::Q8_0 {
+                    Q8_0_BYTES
+                } else {
+                    MXFP8_BYTES
+                };
+                rows.checked_mul(k / WIDE_GROUP_VALUES)?.checked_mul(per)
             }
         }
     }
@@ -79,7 +107,8 @@ pub struct Nvfp4Params<'w> {
     pub x: Window<'w, f32, MetalDevice>,
     /// The output, `rows`.
     pub y: WindowMut<'w, f32, MetalDevice>,
-    /// The expert's global scale, applied after the dot.
+    /// The scale of each row's finished dot: the expert's global scale, times
+    /// its route weight on a routed down.
     pub w_scale: f32,
     /// The fault word a raise lands in.
     pub faults: &'w MetalFaultWord,
@@ -137,6 +166,8 @@ impl Kernels {
         let pipeline = match p.layout {
             NvfpLayout::Blocks => &self.ink2.nvfp4,
             NvfpLayout::Rows => &self.ink2.nvfp4_rows,
+            NvfpLayout::Q8_0 => &self.ink2.q8_0_scaled,
+            NvfpLayout::Mxfp8Rows => &self.ink2.mxfp8_rows,
         };
         encoder.set_pipeline(pipeline);
         let mut slot = Bindings::new(encoder);

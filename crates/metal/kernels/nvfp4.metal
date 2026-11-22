@@ -179,3 +179,123 @@ kernel void nvfp4_rows_gemv(device const uint8_t *W [[buffer(0)]],
         y[r] = isfinite(dot) ? dot : NAN;
     }
 }
+
+// The two other forms a routed stack of the family's files takes, beside the
+// NVFP4 ones, each with the same launch word: the GGUF coda's Q8_0 blocks
+// (q8_0_scaled_gemv) and the MLX folder coda's MXFP8 rows
+// (mxfp8_rows_gemv). The launch word is the scale of the row's finished dot
+// (a route weight, the coda's experts having no global scale), so a routed
+// down of either form leaves its expert's weighted output as the NVFP4 one
+// does.
+//
+// Q8_0 (34 bytes a 32-value block: the f16 scale, then 32 int8 codes): a code
+// q means q · d, exact in f32 (an int8 times an f16). A SIMD group a row, lane
+// l the code l of every block, the blocks ascending. A scale that is not
+// finite has no defined value: the row is NaN and the quant-column site
+// raises.
+//
+// MXFP8 rows (33 bytes a 32-value group: the E8M0 scale byte, then 32 E4M3
+// codes, value i code byte i): a code means e4m3(c) · 2^(s − 127), exact in
+// f32. Scale byte 0xff and the E4M3 NaN codes (0x7f, 0xff) have no defined
+// value: the row is NaN and the quant-column site raises. Lane l the code l
+// of every group, the groups ascending.
+
+/// The f32 value of the f16 bits `lo | hi << 8`.
+inline float q8_0_scale(uint lo, uint hi) {
+    return float(as_type<half>(ushort(lo | (hi << 8u))));
+}
+
+kernel void q8_0_scaled_gemv(device const uint8_t *W [[buffer(0)]],
+                             device const float *x [[buffer(1)]],
+                             device float *y [[buffer(2)]],
+                             constant Nvfp4Args &args [[buffer(3)]],
+                             device atomic_uint *faults [[buffer(4)]],
+                             uint row [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]])
+{
+    const uint r = row * 8u + sg;
+    if (r >= args.rows) {
+        return;
+    }
+    const uint blocks = args.k / 32u;
+    device const uint8_t *wr = W + (ulong)r * (ulong)blocks * 34ul;
+    bool usable = true;
+    float acc = 0.f;
+    for (uint i = 0u; i < blocks; ++i) {
+        device const uint8_t *blk = wr + (ulong)i * 34ul;
+        const float d = q8_0_scale(uint(blk[0]), uint(blk[1]));
+        usable = usable && isfinite(d);
+        const float v = float(as_type<char>(blk[2u + lane])) * d;
+        acc += v * x[i * 32u + lane];
+    }
+    const float dot = simd_sum(acc) * args.w_scale;
+    usable = simd_all(usable);
+    if (!usable) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
+            y[r] = NAN;
+        }
+        return;
+    }
+    if (!isfinite(dot) && lane == 0u) {
+        raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
+    }
+    if (lane == 0u) {
+        y[r] = isfinite(dot) ? dot : NAN;
+    }
+}
+
+/// The value of E4M3 code `c`, NaN for the two NaN codes.
+inline float mxfp8_e4m3(uint c) {
+    const uint mag = c & 0x7fu;
+    if (mag == 0x7fu) {
+        return NAN;
+    }
+    const uint exp = mag >> 3;
+    const float man = float(mag & 7u);
+    const float v = exp == 0u ? man * exp2(-9.0f) : (1.0f + man / 8.0f) * exp2(float(exp) - 7.0f);
+    return (c & 0x80u) != 0u ? -v : v;
+}
+
+kernel void mxfp8_rows_gemv(device const uint8_t *W [[buffer(0)]],
+                            device const float *x [[buffer(1)]],
+                            device float *y [[buffer(2)]],
+                            constant Nvfp4Args &args [[buffer(3)]],
+                            device atomic_uint *faults [[buffer(4)]],
+                            uint row [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]])
+{
+    const uint r = row * 8u + sg;
+    if (r >= args.rows) {
+        return;
+    }
+    const uint groups = args.k / 32u;
+    device const uint8_t *wr = W + (ulong)r * (ulong)groups * 33ul;
+    bool usable = true;
+    float acc = 0.f;
+    for (uint g = 0u; g < groups; ++g) {
+        device const uint8_t *grp = wr + (ulong)g * 33ul;
+        const uint sb = uint(grp[0]);
+        const float s = sb == 0xffu ? NAN : exp2(float(sb) - 127.0f);
+        const float v = mxfp8_e4m3(uint(grp[1u + lane])) * s;
+        usable = usable && isfinite(v);
+        acc += v * x[g * 32u + lane];
+    }
+    const float dot = simd_sum(acc) * args.w_scale;
+    usable = simd_all(usable);
+    if (!usable) {
+        if (lane == 0u) {
+            raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
+            y[r] = NAN;
+        }
+        return;
+    }
+    if (!isfinite(dot) && lane == 0u) {
+        raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
+    }
+    if (lane == 0u) {
+        y[r] = isfinite(dot) ? dot : NAN;
+    }
+}

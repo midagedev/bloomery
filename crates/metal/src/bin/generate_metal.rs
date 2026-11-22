@@ -1387,6 +1387,10 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         ctx: Option<usize>,
     ) -> Result<plan::Printed, plan::OpenError> {
         let header = plan::open_plan_header(model)?;
+        if header.split().architecture() == Some(ink2::ARCH) {
+            return bloomery_metal::arch::inkling2::plan::plan_of(model, &header, ctx, CTX_DEFAULT)
+                .map_err(plan::OpenError::Unreadable);
+        }
         let (ctx, unasked) = match ctx {
             Some(c) => (c, None),
             None => {
@@ -1557,9 +1561,116 @@ generate_metal [-m PATH | --hf REPO] --plan [--ctx C]
         eprintln!("discarded_ahead={}", session.stats().discarded);
     }
 
+    /// The Inkling 2 family's run: plain greedy steps (a prompt runs as steps)
+    /// over its own session, with the run's numbers on stderr.
+    mod ink2 {
+        use std::time::Instant;
+
+        use bloomery_metal::arch::inkling2::{Session, generate::greedy, plan};
+        use bloomery_metal::device::MetalDevice;
+        use model_hf::ModelFile;
+
+        use super::{Args, CTX_DEFAULT, Draft, Prompt, Stream};
+
+        /// The architecture the family's files name.
+        pub const ARCH: &str = "inkling2";
+
+        pub fn generate(a: &Args, path: &std::path::Path, file: ModelFile) -> Result<(), String> {
+            let other = [
+                (a.draft != Draft::None, "--draft"),
+                (a.mtp.is_some(), "--mtp"),
+                (a.mtp_check.is_some(), "--mtp-check"),
+                (a.profile.is_some(), "--profile"),
+                (a.pass_times.is_some(), "--pass-times"),
+                (a.step_times.is_some(), "--step-times"),
+                (a.logits_hash.is_some(), "--logits-hash"),
+                (a.draft_step_times.is_some(), "--draft-step-times"),
+                (a.repeat > 1, "--repeat"),
+            ];
+            if let Some((_, flag)) = other.iter().find(|(on, _)| *on) {
+                return Err(format!(
+                    "an inkling2 file runs plain greedy steps: {flag} is another family's"
+                ));
+            }
+            // The tokenizer is opened only where the run reads it: a text
+            // prompt, a text stream, or the end-of-generation set.
+            let needs = matches!(a.prompt, Prompt::Text(_)) || !a.print_ids || !a.ignore_eos;
+            let tok = if needs {
+                Some(file.tokenizer().map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
+            let prompt = match (&a.prompt, &tok) {
+                (Prompt::Text(t), Some(tok)) => tok.encode(t, true, false),
+                (Prompt::Ids(v), _) => v.clone(),
+                (Prompt::Text(_), None) => return Err("a text prompt with no tokenizer".into()),
+            };
+            if prompt.is_empty() {
+                return Err("the prompt has no ids".into());
+            }
+            let prompt = &prompt[..];
+            let ctx = match a.ctx {
+                Some(c) => c,
+                None => plan::unasked_ctx(file.header(), CTX_DEFAULT, path)?,
+            };
+            let instance = Session::instance_of(&file, ctx).map_err(|e| e.to_string())?;
+            let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            let mut session =
+                Session::open(&device, device.library(), &file, ctx).map_err(|e| e.to_string())?;
+            drop(file);
+            let open_s = t0.elapsed().as_secs_f64();
+            let allocated = device.allocated_bytes().map_err(|e| e.to_string())?;
+            let eog: &[u32] = match (&tok, a.ignore_eos) {
+                (Some(tok), false) => tok.eog(),
+                _ => &[],
+            };
+            let mut stream = Stream {
+                decoder: tok
+                    .as_ref()
+                    .filter(|_| !a.print_ids)
+                    .map(|tok| tokenizer::Decoder::new(tok, true)),
+            };
+            let out = greedy(&mut session, prompt, a.n, eog, |id| stream.id(id))
+                .map_err(|e| e.to_string())?;
+            if a.print_ids {
+                let ids: Vec<String> = out.ids.iter().map(u32::to_string).collect();
+                println!("{}", ids.join(","));
+            } else {
+                stream.finish();
+                println!();
+            }
+            let prompt_s = out.prompt_wall.as_secs_f64();
+            let decode_s = out.decode_wall.as_secs_f64();
+            eprintln!("# development-loop numbers: no lease, no witness");
+            eprintln!("model={}", path.display());
+            eprintln!("ctx={ctx}");
+            eprintln!("open_s={open_s:.3}");
+            eprintln!("device_allocated_bytes={allocated}");
+            eprintln!("planned_bytes={}", session.bytes().held().requested);
+            eprintln!("prompt_ids={}", prompt.len());
+            eprintln!("prompt_s={prompt_s:.3}");
+            eprintln!("prompt_tok_s={:.1}", prompt.len() as f64 / prompt_s);
+            eprintln!("decode_tokens={}", out.tokens());
+            eprintln!("decode_s={decode_s:.3}");
+            if out.tokens() > 1 && decode_s > 0.0 {
+                eprintln!(
+                    "decode_tok_s={:.1}",
+                    out.tokens().saturating_sub(1) as f64 / decode_s
+                );
+            } else {
+                eprintln!("decode_tok_s=none");
+            }
+            Ok(())
+        }
+    }
+
     fn generate(a: &Args) -> Result<(), String> {
         let model = model_arg::resolve(&a.model)?;
         let file = ModelFile::open(&model.path).map_err(|e| e.to_string())?;
+        if file.header().architecture() == Some(ink2::ARCH) {
+            return ink2::generate(a, &model.path, file);
+        }
         // The tokenizer decodes what the run streams and owns the
         // end-of-generation set, so every run opens it, whatever named the
         // prompt.

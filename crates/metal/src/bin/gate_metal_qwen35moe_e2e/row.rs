@@ -35,6 +35,9 @@ pub enum Mutants {
     Qwen3,
     /// The dense Qwen2's: the bias add after P1, which every other row's layers have none of.
     Qwen2,
+    /// Inkling 2's: the loop controllers' forget gate, which only a message visit's taps read,
+    /// and the head's pick, which only the greedy table reads.
+    Inkling2,
     /// None: the row runs the kernels of another row's tables.
     None,
 }
@@ -48,6 +51,10 @@ pub enum Model {
     /// `<arch>-mlx`, the checkpoint folder itself: a family `prepare` has no
     /// map for has no split, and the session opens the folder.
     Folder,
+    /// The family's GGUF fixture file (`refset::fixture::first_shard`): a
+    /// family whose own session and clauses (`ink2.rs`) the vendor tree's node
+    /// dumps of that file check.
+    Fixture,
 }
 
 /// Where the ids of a row's prompts come from.
@@ -561,9 +568,32 @@ pub static QWEN2: Row = Row {
     skips: QWEN3_SKIPS,
 };
 
+/// Inkling 2's GGUF fixture (13 stored layers, the core's six run three times: 25 visits), on
+/// the family's own session (`bloomery_metal::arch::inkling2`) and clauses (`ink2.rs`), which
+/// read the row's name, architecture, file and mutants. The qwen session's clauses run on no
+/// such row, so its other fields are the defaults no clause reads.
+pub static INKLING2: Row = Row {
+    name: "inkling2",
+    arch: "inkling2",
+    model: Model::Fixture,
+    prompt: Prompt::Generated {
+        first: 0,
+        lo: 0,
+        hi: 0,
+    },
+    seed: 0,
+    recurrent: false,
+    logit_abs: 0.0,
+    deep_logit_abs: None,
+    count: None,
+    verify: None,
+    mutants: Mutants::Inkling2,
+    skips: &[],
+};
+
 /// Every row, the default first.
-pub static ROWS: [&Row; 8] = [
-    &QWEN35MOE, &QWEN3MOE, &QWEN38D, &LFM3, &LLAMA, &QWEN3, &QWEN3T, &QWEN2,
+pub static ROWS: [&Row; 9] = [
+    &QWEN35MOE, &QWEN3MOE, &QWEN38D, &LFM3, &LLAMA, &QWEN3, &QWEN3T, &QWEN2, &INKLING2,
 ];
 
 /// The row `--row` names.

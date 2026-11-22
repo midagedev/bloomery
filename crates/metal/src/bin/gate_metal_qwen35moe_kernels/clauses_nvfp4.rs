@@ -38,6 +38,17 @@ fn half_scale(b: u8) -> f64 {
     raw * 0.5
 }
 
+/// The value of finite f16 bits `b`.
+fn f16_value(b: u16) -> f64 {
+    let (e, m) = (i32::from((b >> 10) & 31), f64::from(b & 0x3ff));
+    let v = if e == 0 {
+        m * 2f64.powi(-24)
+    } else {
+        (1.0 + m / 1024.0) * 2f64.powi(e - 15)
+    };
+    if b & 0x8000 != 0 { -v } else { v }
+}
+
 /// A scale byte in a range that keeps the dot's terms near 1.
 fn scale_byte(rng: &mut Rng) -> u8 {
     0x28 + (rng.next() % 0x28) as u8
@@ -63,6 +74,26 @@ fn stack(layout: NvfpLayout, rows: usize, k: usize, seed: u64) -> Vec<u8> {
                 bytes.push(scale_byte(&mut rng));
                 for _ in 0..8 {
                     bytes.push(rng.next() as u8);
+                }
+            }
+        }
+        NvfpLayout::Q8_0 => {
+            for _ in 0..rows * (k / 32) {
+                // An f16 scale near 1/64, its low mantissa bits seeded.
+                let d = 0x2400u16 | (rng.next() % 0x400) as u16;
+                bytes.extend(d.to_le_bytes());
+                for _ in 0..32 {
+                    bytes.push(rng.next() as u8);
+                }
+            }
+        }
+        NvfpLayout::Mxfp8Rows => {
+            for _ in 0..rows * (k / 32) {
+                bytes.push(120 + (rng.next() % 6) as u8);
+                for _ in 0..32 {
+                    // Every E4M3 code but the two NaNs.
+                    let c = rng.next() as u8;
+                    bytes.push(if c & 0x7f == 0x7f { c ^ 1 } else { c });
                 }
             }
         }
@@ -93,6 +124,29 @@ fn decode(layout: NvfpLayout, row: &[u8], k: usize) -> Vec<f64> {
                 for i in 0..8 {
                     out[g * 16 + 2 * i] = KVALUES[usize::from(grp[1 + i] & 15)] * d;
                     out[g * 16 + 2 * i + 1] = KVALUES[usize::from(grp[1 + i] >> 4)] * d;
+                }
+            }
+        }
+        NvfpLayout::Q8_0 => {
+            for (b, blk) in row.chunks(34).enumerate() {
+                let d = f16_value(u16::from_le_bytes([blk[0], blk[1]]));
+                for i in 0..32 {
+                    out[b * 32 + i] = f64::from(blk[2 + i] as i8) * d;
+                }
+            }
+        }
+        NvfpLayout::Mxfp8Rows => {
+            for (g, grp) in row.chunks(33).enumerate() {
+                let s = 2f64.powi(i32::from(grp[0]) - 127);
+                for i in 0..32 {
+                    let c = grp[1 + i];
+                    let (e, m) = (i32::from((c >> 3) & 15), f64::from(c & 7));
+                    let v = if e == 0 {
+                        m * 2f64.powi(-9)
+                    } else {
+                        (1.0 + m / 8.0) * 2f64.powi(e - 7)
+                    };
+                    out[g * 32 + i] = if c & 0x80 != 0 { -v } else { v } * s;
                 }
             }
         }
@@ -142,12 +196,17 @@ fn row_bytes(layout: NvfpLayout, k: usize) -> usize {
 /// smallest row of each layout; the decode first held to the `gguf` crate's.
 pub fn nvfp4_rows(h: &Harness<'_>) -> Clause {
     let mut parts = Vec::new();
-    for (layout, name) in [(NvfpLayout::Blocks, "blocks"), (NvfpLayout::Rows, "rows")] {
+    for (layout, name) in [
+        (NvfpLayout::Blocks, "blocks"),
+        (NvfpLayout::Rows, "rows"),
+        (NvfpLayout::Q8_0, "q8_0"),
+        (NvfpLayout::Mxfp8Rows, "mxfp8 rows"),
+    ] {
         for (case, (rows, k)) in [(37usize, 2304usize), (9, layout.step())]
             .into_iter()
             .enumerate()
         {
-            let seed = 0x4A00 + 32 * case as u64 + if name == "rows" { 16 } else { 0 };
+            let seed = 0x4A00 + 32 * case as u64 + 16 * layout as u64;
             let bytes = stack(layout, rows, k, seed);
             let x = ink2::draw(k, seed + 1, 1.0);
             let per = row_bytes(layout, k);
@@ -159,6 +218,10 @@ pub fn nvfp4_rows(h: &Harness<'_>) -> Clause {
                 NvfpLayout::Rows => Nvfp4Rows::new(1.0)
                     .decode(&bytes[..per], &mut gg)
                     .map_err(|e| format!("gguf's NVFP4 rows decode: {e}"))?,
+                NvfpLayout::Q8_0 => dequant_row(GgmlType::Q8_0, &bytes[..per], &mut gg)
+                    .map_err(|e| format!("gguf's Q8_0 decode: {e}"))?,
+                NvfpLayout::Mxfp8Rows => dequant_row(GgmlType::MXFP8, &bytes[..per], &mut gg)
+                    .map_err(|e| format!("gguf's MXFP8 decode: {e}"))?,
             }
             let mine = decode(layout, &bytes[..per], k);
             if let Some(i) = gg.iter().zip(&mine).position(|(a, b)| f64::from(*a) != *b) {
@@ -188,30 +251,46 @@ pub fn nvfp4_rows(h: &Harness<'_>) -> Clause {
         }
     }
     Ok(Verdict::Noted(format!(
-        "both layouts decode as the gguf crate does and dot in the f64 oracle's band, worst error over its band: {}",
+        "the four layouts decode as the gguf crate does and dot in the f64 oracle's band, worst error over its band: {}",
         parts.join(", ")
     )))
 }
 
-/// A scale byte that is no UE4M3 (bit 7 set, or E4M3's NaN 0x7f) makes its row
-/// NaN and raises the quant-column site, in both layouts; every other row is
-/// the clean launch's bits.
+/// A byte with no defined value — an NVFP4 scale that is no UE4M3 (bit 7 set,
+/// or E4M3's NaN 0x7f), a Q8_0 scale that is no finite f16, an MXFP8 scale of
+/// 0xff or E4M3 NaN code — makes its row NaN and raises the quant-column site,
+/// in every layout; every other row is the clean launch's bits.
 pub fn nvfp4_nan(h: &Harness<'_>) -> Clause {
     let (rows, k) = (11usize, 2304usize);
-    for (layout, name) in [(NvfpLayout::Blocks, "blocks"), (NvfpLayout::Rows, "rows")] {
+    for (layout, name) in [
+        (NvfpLayout::Blocks, "blocks"),
+        (NvfpLayout::Rows, "rows"),
+        (NvfpLayout::Q8_0, "q8_0"),
+        (NvfpLayout::Mxfp8Rows, "mxfp8 rows"),
+    ] {
         let bytes = stack(layout, rows, k, 0x4A80);
         let x = ink2::draw(k, 0x4A81, 1.0);
         let clean = launch(h, layout, rows, k, &bytes, &x)?;
         common::expect_clean(h, "the clean mat-vec")?;
         let per = row_bytes(layout, k);
         let mut bad = bytes.clone();
-        // Row 3's last scale byte, row 8's middle one.
-        let (scale_of_last, scale_mid) = match layout {
-            NvfpLayout::Blocks => (3 * per + per - 36 + 3, 8 * per + 36 * 17 + 2),
-            NvfpLayout::Rows => (3 * per + per - 9, 8 * per + 9 * 70),
+        // A byte of row 3's last block or group, one of row 8's middle one.
+        let [(last, last_byte), (mid, mid_byte)] = match layout {
+            NvfpLayout::Blocks => [
+                (3 * per + per - 36 + 3, 0x80),
+                (8 * per + 36 * 17 + 2, 0x7f),
+            ],
+            NvfpLayout::Rows => [(3 * per + per - 9, 0x80), (8 * per + 9 * 70, 0x7f)],
+            // The scale's high byte: a NaN, then an infinity.
+            NvfpLayout::Q8_0 => [
+                (3 * per + per - 34 + 1, 0x7e),
+                (8 * per + 34 * 17 + 1, 0x7c),
+            ],
+            // The scale byte 0xff, then a NaN code.
+            NvfpLayout::Mxfp8Rows => [(3 * per + per - 33, 0xff), (8 * per + 33 * 17 + 5, 0x7f)],
         };
-        bad[scale_of_last] = 0x80;
-        bad[scale_mid] = 0x7f;
+        bad[last] = last_byte;
+        bad[mid] = mid_byte;
         let got = launch(h, layout, rows, k, &bad, &x)?;
         common::expect_fault(h, name, FaultSite::QuantColumn)?;
         for r in 0..rows {
@@ -228,7 +307,7 @@ pub fn nvfp4_nan(h: &Harness<'_>) -> Clause {
         }
     }
     Ok(Verdict::Noted(
-        "a scale byte that is no UE4M3 is NaN in its row alone and raises the quant-column site, in both layouts"
+        "a byte with no defined value is NaN in its row alone and raises the quant-column site, in the four layouts"
             .to_string(),
     ))
 }
