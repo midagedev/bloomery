@@ -61,7 +61,7 @@
 #   ffn_moe_weights_scaled  their sigmoid scores' selected sum, normalized (+1e-20) and times route_scale 8.0
 #   ffn_out, l_out          the FFN output after its post-conv, and the layer output
 #   loop_q_inp, loop_ffn_inp  the loop controllers' outputs: the q attention input and the ffn mix after the message merge,
-#                           on the core visits of passes >= 1 only (the slots 24-47)
+#                           on the core visits of passes >= 1 only (the slots 18-41)
 #   result_norm             the head's input after the output-residual mix and its norm (unnumbered)
 # TAPS_A, prompt a, beside TAPS: the attention's own stages and the router's and the expert stack's whole ladder —
 #   kq, kq_plus_kq_b, kq_soft_max, kqv   the logits, the bias added, the softmax (the sink in its denominator) and the value
