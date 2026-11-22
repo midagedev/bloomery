@@ -752,3 +752,12 @@ generate_ds41 index_key_rms_append 0 0
 generate_ds41 index_pool_norm_rope 0 0
 generate_ds41 kpool_score_tail 0 0
 generate_ds41 qsa_topk_tail 0 0
+generate_ds41 attn_res_mix_normed 0 0
+generate_ds41 conv_res 0 0
+generate_ds41 loop_control 0 0
+generate_ds41 qk_clip_append 0 0
+generate_ds41 rel_merge_h128 0 0
+generate_ds41 rel_seg_h128 0 0
+generate_ds41 rel_seg_h128_ring 0 0
+generate_ds41 sigmoid_128_8_router 0 0
+generate_ds41 sigmoid_128_8_router_pick 0 0
