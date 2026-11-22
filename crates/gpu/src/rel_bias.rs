@@ -51,7 +51,7 @@ pub const REL: usize = 16;
 const THREADS: usize = GROUP_3 * 32;
 const THREADS_U32: u32 = THREADS as u32;
 const _: () = assert!(THREADS_U32 as usize == THREADS && THREADS == 96);
-const _: () = assert!(REL * KEY_TILE == 512 && K_STRIDE % 2 == 1);
+const _: () = assert!(REL * KEY_TILE == 512 && K_STRIDE % 2 == 1 && REL <= 32);
 
 /// The segment pass of this file's entries: `seg_h128`'s walk at [`GROUP_3`]
 /// query heads a key head with the bias laid into the score, on a plane
@@ -62,7 +62,7 @@ const _: () = assert!(REL * KEY_TILE == 512 && K_STRIDE % 2 == 1);
 /// The score's order is the gate: the f32 dot of `seg_h128` (its rotating
 /// ILP partials, combined `(a0 + a1) + (a2 + a3)`), one multiply by
 /// `scale`, then the bias dot added — `REL` fused multiply-adds ascending
-/// `d`, the r row in registers.
+/// `d`, the r row one value a lane, read by shuffle.
 ///
 /// SAFETY: the entry's launch contract at [`GROUP_3`] query heads a key
 /// head (every buffer bound it names, the planes of `n_kv · plane_rows`
@@ -146,16 +146,11 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool>(
         unsafe { *qs.add(4 * tid + i) = *q.get_unchecked(qb + 4 * tid + i) };
         i += 1;
     }
-    // SAFETY: (t·n_head + h)·REL + d is inside r by the launch contract;
-    // every lane of the warp reads the head's whole row.
-    let mut rr = [0.0f32; REL];
-    let mut d = 0usize;
-    while d < REL {
-        // SAFETY: (t·n_head + h)·REL + d is inside r by the launch
-        // contract; every lane of the warp reads the head's whole row.
-        rr[d] = unsafe { *r.get_unchecked((t * n_head + h) * REL + d) };
-        d += 1;
-    }
+    // Lane l holds the head's r value l mod REL; the bias dot reads value d
+    // from lane d by a shuffle, so the row stays in one register a lane.
+    // SAFETY: (t·n_head + h)·REL + lane mod REL is inside r by the launch
+    // contract.
+    let r_lane = unsafe { *r.get_unchecked((t * n_head + h) * REL + lane % REL) };
 
     let plane_rows = plane_rows as usize;
     let plane = kh * plane_rows * HEAD;
@@ -251,9 +246,10 @@ pub(crate) unsafe fn seg_h128_rel<const RING: bool>(
         let mut b = 0.0f32;
         let mut d = 0usize;
         while d < REL {
+            let rd = warp::shuffle_f32(r_lane, d as u32);
             // SAFETY: d·KEY_TILE + lane < REL·KEY_TILE, inside the staged
             // bias tile, published by the barrier above.
-            b = f32::mul_add(rr[d], unsafe { *bs.add(d * KEY_TILE + lane) }, b);
+            b = f32::mul_add(rd, unsafe { *bs.add(d * KEY_TILE + lane) }, b);
             d += 1;
         }
         let sc = if live {
