@@ -1012,3 +1012,12 @@ required-features = ["hy4"]
 [[bin]]
 name = "gate_hy4_dsa"
 required-features = ["gpu"]
+
+# inkling2-attn: Inkling 2's projection epilogues (the qk/rel L2 clips, the gainless v norm, the
+# f16 append) and its rel-bias attention at the group of three (the bias tile, the per-row sink)
+# against the host rules and an f64 re-dot, seeded at the Mini's shapes, then the fixture's node
+# dumps of prompt a and prompt e's deep occurrences replayed as inputs (refset family
+# fx-lcpp-inkling2).
+[[bin]]
+name = "gate_inkling2_attn"
+required-features = ["gpu"]

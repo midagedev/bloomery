@@ -42,6 +42,10 @@ const ILP: usize = 4;
 /// Query heads a key head that the `_g4` entries serve: the segment body of
 /// the group of eight with four warps.
 pub const GROUP_4: usize = 4;
+/// Query heads a key head that `rel_bias`'s entries serve (Inkling 2's 24
+/// over 8): the segment walk of this file with the bias tile laid in, three
+/// warps a block.
+pub const GROUP_3: usize = 3;
 const THREADS: usize = GROUP * 32;
 /// Threads of a block at the group of eight, and at the group of four.
 pub(crate) const THREADS_U32: u32 = THREADS as u32;
@@ -84,7 +88,7 @@ pub(crate) fn live_keys(count: u32, ctx: usize) -> usize {
     clippy::too_many_arguments,
     reason = "the tile step's state is the caller's registers, passed by reference"
 )]
-unsafe fn fold_tile(
+pub(crate) unsafe fn fold_tile(
     sc: f32,
     live: bool,
     mx: &mut f32,

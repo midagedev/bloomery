@@ -311,3 +311,4 @@ gate-gpu-hy4-e2e	family	hy_v4_flash	e2e	graph_fault+attn_latent_mla+attn_gqa+kv_
 gate-gpu-hy4-pp	family	hy_v4_flash	e2e	prompt_walks+attn_latent_mla+kv_pool_checkpoint+hc_engram_common+moe_route+elem_kernels
 gate-gpu-hy4-dsa	family	hy_v4_flash	kernel	attn_latent_mla+kv_pool_checkpoint
 gate-gpu-hy4-serve	family	hy_v4_flash	serve+ship	seats_serve_engine+serve_toolcall
+gate-inkling2-attn	family	inkling2	kernel	attn_rel_bias

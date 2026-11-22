@@ -5052,6 +5052,20 @@ gate-gpu-hy4-dsa:
     ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_hy4_dsa && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_hy4_dsa'
 
 # --- end hy4dsa ---
+# --- inkling2attn ---
+
+# Inkling 2's attention path on one card (gate_inkling2_attn's doc): the projection epilogues of a visit — the q channel
+# scale and the qk L2 clip, the gainless v RMS, the rel clip, the tau of the global visits, the f16 append — and the
+# rel-bias attention over seg_h128's walk at the group of three: the bias tile gathered by key distance with the pad rule,
+# the per-row sink as the merge's last partial. Seeded at the Mini's shapes (24/8 heads of 128, window 1024, extent 1024)
+# against the exact host rule and an f64 re-dot, then the fixture's node dumps (refset family fx-lcpp-inkling2) — prompt a's
+# Qcur/Kcur/Vcur/Rcur/kq_b/kqv_out of a windowed slot replayed as inputs, and prompt e's last occurrence's window-edge rows
+# and deep global rows, where the distance map turns over and the pad rule carries.
+# Fixture-only (tools/ref/fixture-only.sh): the replays read the fixture's sets, the Mini's attention shapes are the same numbers.
+gate-inkling2-attn:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-inkling2-attn && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_attn'
+
+# --- end inkling2attn ---
 # --- hy4serve ---
 
 # The Hy4-flash seat of bloomery-serve on the Hy4 fixture (gate_hy4_serve's doc): the hybrid owner's seat over the placed body. `--parallel 2`
