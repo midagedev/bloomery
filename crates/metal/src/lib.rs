@@ -53,6 +53,11 @@ pub mod instance;
 /// `build.rs`.
 #[path = "kernels/router_geom.rs"]
 pub mod router_geom;
+/// The session core: what every family's session on this backend shares —
+/// the lane algebra, the room rule, the launch lists, and on macOS the step
+/// vocabulary and clock, the pass machinery, the prompt schedule and the
+/// greedy loop. Host arithmetic and chain reads: every OS.
+pub mod session;
 
 #[cfg(target_os = "macos")]
 pub mod buffer;
@@ -75,6 +80,11 @@ pub mod library;
 /// How a binary is told its model (`-m`, `--hf`, `$BLOOMERY_REF_MODEL`) and how a repo is fetched.
 #[cfg(target_os = "macos")]
 pub mod model_arg;
+/// `--plan`: the frame every family's plan prints — the header read, the
+/// device's and the host's room, the render — generic over the family's
+/// verdict.
+#[cfg(target_os = "macos")]
+pub mod plan;
 #[cfg(target_os = "macos")]
 pub mod residency;
 #[cfg(all(target_os = "macos", feature = "pipeline-scan"))]

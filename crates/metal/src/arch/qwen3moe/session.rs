@@ -5,7 +5,7 @@
 //! id slot, encodes the token on one command buffer, commits it, waits for
 //! it, and reads the token's fault word, then the head's pick. While it
 //! waits it encodes the next position's host-fed token and holds it off the
-//! queue ([`Parked`]): the id is the host's to pick from this token's logits,
+//! queue ([`Parked`](crate::stream::Parked)): the id is the host's to pick from this token's logits,
 //! and the token reads it from the slot at run time, so the next host-fed
 //! step writes the slot and commits that buffer instead of encoding one.
 //! The encode is the same whenever it runs: a host-fed token's commands
@@ -93,7 +93,6 @@ use core::ops::Range;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 use std::path::Path;
-use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use bloomery_device::fault::Fault;
@@ -125,9 +124,7 @@ use crate::instance::Instance;
 use crate::kernels::{Kernels, PASS_ROWS, SNAPS};
 use crate::library::Library;
 use crate::residency::{Alloc, ResidencyStats};
-use crate::stream::{
-    GpuInterval, GpuStamps, MetalStream, Parked, Settled, Signalled, TokenRecording, host_secs,
-};
+use crate::stream::{GpuInterval, MetalStream, Settled, Signalled, host_secs};
 use objc2_metal::MTLDevice;
 
 mod mtp;
@@ -242,7 +239,7 @@ pub const SITES: Sites35 = Sites35 {
 /// How long a profiled group's stamps wait for the completed status its
 /// settle already implied: the buffer's signal fires before the driver
 /// reports it complete, so the stamps give the report a moment.
-const STAMP_WAIT: Duration = Duration::from_secs(1);
+pub(crate) use crate::session::clock::STAMP_WAIT;
 
 /// A session's refusal or failure.
 #[derive(Debug)]
@@ -323,228 +320,12 @@ pub(super) fn refuse(detail: impl Into<String>) -> SessionError {
     }
 }
 
-/// What a step returns: the head's pick and what the token encoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Stepped {
-    pub id: u32,
-    pub count: EncodeCount,
-}
-
-/// How a step's token reaches the device.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StepMode {
-    /// The id is written into the host id slot; the step commits its token
-    /// and waits for it, and nothing runs ahead. The next position's
-    /// host-fed token is encoded during the wait and committed by the next
-    /// host-fed call, its id written first.
-    HostFed,
-    /// As host-fed, unless a token runs ahead with this id; either way the
-    /// next token is committed before this one is waited, embedding this
-    /// token's pick on the device.
-    Chain,
-    /// The ids are known ahead of the calls: a prompt's. The token this call
-    /// names lands with no head — its pick is nobody's input, the call after
-    /// names its id — and with `next` named, that token is committed before
-    /// this one is waited, embedding `next` from this token's record slot,
-    /// which the host writes for it. A chain's token ahead reads the pick
-    /// this token's head would have written there; this token writes no
-    /// head, so the slot is the host's. `next` of `None` commits nothing
-    /// ahead: the last row of a span a checkpoint ends, or the row before
-    /// one whose pick is read.
-    Ahead { next: Option<u32> },
-}
-
-/// What the session's steps did with the token ahead, the host's waits, the
-/// command buffers committed and the passes run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StepStats {
-    /// The host's waits on the session's stream: every settle and sync.
-    pub waits: u64,
-    /// The command buffers committed on the session's stream.
-    pub submits: u64,
-    /// Tokens committed ahead of the call that names them.
-    pub ahead: u64,
-    /// Tokens ahead a call kept: its id was their embedded pick.
-    pub kept: u64,
-    /// Tokens ahead waited out and dropped: a broken promise, a fault, a
-    /// reset, a traced step, a checkpoint or a cut.
-    pub discarded: u64,
-    /// Steps at the cache's last row that would commit a token ahead, and
-    /// commit none.
-    pub last_row: u64,
-    /// Host-fed tokens committed from the encode the step before made.
-    pub primed: u64,
-    /// Passes that ran to their settle.
-    pub passes: u64,
-}
-
-/// The token committed ahead of its call.
-struct Ahead {
-    signalled: Signalled,
-    count: EncodeCount,
-    pos: u32,
-    /// The id its embed reads: the pick of the token before it (a chain's,
-    /// learned at that token's land) or the id its committing call named (an
-    /// ahead's, which knew it).
-    embeds: u32,
-    /// Whether the token's encode carried the head: a chain's does, its pick
-    /// the next promise; an ahead's does not, the call after names its id.
-    head: bool,
-}
-
-/// The next host-fed token, encoded during a host-fed step's wait and held
-/// off the queue until the call that names its id.
-struct Primed {
-    parked: Parked,
-    count: EncodeCount,
-    pos: u32,
-    /// The encode's own seconds, when the step clock ran at the encode.
-    encode_s: Option<f64>,
-}
-
-/// The host's encode of a committed token, as the clock counts it.
-#[derive(Clone, Copy)]
-enum Encoded {
-    /// Encoded at the commit, from this host second on.
-    Since(f64),
-    /// Encoded and parked a step before, in this many seconds.
-    Took(f64),
-}
-
-/// One committed token the clock holds until its settle: its identity on the
-/// stream, its stamps (a command buffer's handle, which only a lock may
-/// carry), and the host's seconds around its encode and commit.
-struct PendingToken {
-    value: u64,
-    stamps: GpuStamps,
-    encode_s: f64,
-    submitted: f64,
-}
-
-/// How many step modes a clock holds a row for.
-const MODES: usize = 3;
-
-/// A mode's place in a step clock's rows.
-fn row_of(mode: StepMode) -> usize {
-    match mode {
-        StepMode::HostFed => 0,
-        StepMode::Chain => 1,
-        StepMode::Ahead { .. } => 2,
-    }
-}
-
-/// One mode's phases, summed; the averages are [`StepPhase`].
-#[derive(Clone, Copy, Default)]
-struct Phases {
-    encode_s: f64,
-    start_s: f64,
-    gpu_s: f64,
-    wake_s: f64,
-}
-
-/// One mode's averaged step phases, as a run's steps spent them.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct StepPhase {
-    /// The settled steps the averages hold.
-    pub steps: u64,
-    /// The host's encode of a token, µs: the encoder's begin to the commit,
-    /// or to the park for a token a host-fed step encoded during its wait,
-    /// which no step waits on.
-    pub encode_us: f64,
-    /// A token's GPU start against the host clock at its commit, µs.
-    pub start_us: f64,
-    /// The GPU's own µs on a token.
-    pub gpu_us: f64,
-    /// The host's µs from a token's GPU end to the settle's return.
-    pub wake_us: f64,
-}
-
-/// The step clock: what a run's steps spent, by the mode of the call that
-/// settled each token. [`Session::start_step_clock`] starts one; a session
-/// whose clock is off times nothing, and a step of it costs no read.
-pub struct StepClock {
-    /// The committed tokens whose settle has not come, the run-ahead one
-    /// deep: two stand at once, the token a call settles and the one it
-    /// committed ahead of it. The stamps' buffer handle is not `Sync`, so
-    /// the lock carries it and it never leaves the clock.
-    pending: Mutex<Vec<PendingToken>>,
-    /// One row a mode, [`StepMode`]'s order.
-    rows: [Phases; MODES],
-    steps: [u64; MODES],
-}
-
-impl StepClock {
-    fn new() -> Self {
-        Self {
-            // The run-ahead holds two; a step's commits never grow it.
-            pending: Mutex::new(Vec::with_capacity(2)),
-            rows: [Phases::default(); MODES],
-            steps: [0; MODES],
-        }
-    }
-
-    /// The registry, taken as it stands: every change to it is one push or
-    /// one removal, so a panic while it was held left it whole.
-    fn registry(&self) -> std::sync::MutexGuard<'_, Vec<PendingToken>> {
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// The token `commit` clocked, held until its settle.
-    fn committed(&self, token: PendingToken) {
-        self.registry().push(token);
-    }
-
-    /// The token of signal `value`, taken from the registry: `None` when the
-    /// clock holds none (it was committed before the clock started).
-    fn take(&self, value: u64) -> Option<PendingToken> {
-        let mut pending = self.registry();
-        let at = pending.iter().position(|t| t.value == value)?;
-        Some(pending.swap_remove(at))
-    }
-
-    /// The token of signal `value` whose settle will not come — dropped,
-    /// reset — its clock dropped with it.
-    fn dropped(&self, value: u64) {
-        let mut pending = self.registry();
-        if let Some(at) = pending.iter().position(|t| t.value == value) {
-            pending.swap_remove(at);
-        }
-    }
-
-    /// The settled token's phases under `mode`'s row: its stamps read (the
-    /// settle already implied them complete) and `wake` the host's clock at
-    /// the record.
-    fn settled(
-        &mut self,
-        mode: StepMode,
-        token: PendingToken,
-        wake: f64,
-    ) -> Result<(), SessionError> {
-        let stamps = token.stamps.times(STAMP_WAIT)?;
-        let row = &mut self.rows[row_of(mode)];
-        row.encode_s += token.encode_s;
-        row.start_s += stamps.start - token.submitted;
-        row.gpu_s += stamps.end - stamps.start;
-        row.wake_s += wake - stamps.end;
-        self.steps[row_of(mode)] += 1;
-        Ok(())
-    }
-
-    /// `mode`'s averaged phases; zeros when no step of the mode settled.
-    #[must_use]
-    pub fn phase(&self, mode: StepMode) -> StepPhase {
-        let n = self.steps[row_of(mode)];
-        let p = &self.rows[row_of(mode)];
-        let avg = |s: f64| if n == 0 { 0.0 } else { s / n as f64 * 1e6 };
-        StepPhase {
-            steps: n,
-            encode_us: avg(p.encode_s),
-            start_us: avg(p.start_s),
-            gpu_us: avg(p.gpu_s),
-            wake_us: avg(p.wake_s),
-        }
-    }
-}
+use crate::session::clock::{Ahead, Encoded, PendingToken, Primed};
+/// What a step returns, how a step's token reaches the device, what the
+/// steps did, and the step clock: [`crate::session::clock`], the step
+/// vocabulary's own owner, re-exported here under the paths the bins and
+/// gates read them at.
+pub use crate::session::clock::{StepClock, StepMode, StepPhase, StepStats, Stepped};
 
 /// One group of a profiled token: what the group runs, the layer it runs in
 /// (none for the embed and the head), and the GPU seconds the group's own
@@ -766,34 +547,11 @@ pub struct Session {
     mtp: Option<mtp::Mtp>,
 }
 
-/// When a session opens the copies a pass leaves after rows inside it
-/// ([`StateOut`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MarkCopies {
-    /// With the session, beside the rows arena: a server's session, whose
-    /// chat calls mark their messages.
-    AtOpen,
-    /// On the first pass that takes one: a session that never marks never
-    /// holds them.
-    OnFirstMark,
-}
-
-/// How long each part of a session's open took, on the host's clock. The
-/// pipelines are built beside the other three, which run one after another:
-/// the open's wall is the longer of the two, not the sum.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct OpenSplit {
-    /// The plan read from the file and the weights copied into the arena.
-    pub load: Duration,
-    /// The rows arena's buffers allocated, and the mark copies' when the
-    /// open makes them.
-    pub rows: Duration,
-    /// The residency set's commit: the driver wiring every buffer the open
-    /// made.
-    pub residency: Duration,
-    /// The kernels' pipelines built, the prefill attention's among them.
-    pub pipelines: Duration,
-}
+/// The pass vocabulary — when the mark copies open ([`MarkCopies`]), how long
+/// the open's parts took ([`OpenSplit`]) — and the pass's command-buffer
+/// machinery: [`crate::session::pass`]'s own owners, re-exported here under
+/// the paths the bins and gates read them at.
+pub use crate::session::pass::{MarkCopies, OpenSplit};
 
 /// What [`Session::open_load`] made: the checked plan, the stream with its
 /// residency set committed, both arenas, and how long each part took.
@@ -807,29 +565,11 @@ struct Loaded {
     residency_t: Duration,
 }
 
-/// What a pass returns of its head.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PassOut {
-    /// No head: the rows' picks are nobody's. The pass returns the id it was
-    /// last fed.
-    None,
-    /// The head over the last row: its pick, and its logits row in
-    /// [`Session::logits_row`]. (The verify arm's every-row head is its own
-    /// variant.)
-    Last,
-}
-
-/// The copies of the recurrent state a pass leaves, named by the rows they
-/// follow: each delta layer's state lane and conv ring after that row, the
-/// bits a pass ending there leaves in its stores, which
-/// [`Session::checkpoint_copy`] takes as the point at the position after the
-/// row. A prompt call names the message marks inside a pass here.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct StateOut<'a> {
-    /// The rows after which a copy is taken, ascending, each a row of the
-    /// pass; at most [`SNAPS`]. None takes none.
-    pub after_rows: &'a [u32],
-}
+/// What a pass returns of its head ([`PassOut`]) and of itself ([`Passed`]),
+/// the copies a pass leaves after rows inside it ([`StateOut`]) and one op of
+/// a profiled pass ([`PassSample`]): [`crate::session::pass`]'s own owners,
+/// re-exported here under the paths the bins and gates read them at.
+pub use crate::session::pass::{PassOut, Passed, StateOut};
 
 /// One op of a profiled pass: the op, and the GPU seconds its own command
 /// buffer ran, waited before the next op's was committed.
@@ -838,14 +578,7 @@ pub struct PassSample {
     pub op: Op,
     pub gpu_s: f64,
 }
-
-/// What a pass returns: the head's pick, or the id it was last fed, and what
-/// its ops encoded.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Passed {
-    pub id: u32,
-    pub count: EncodeCount,
-}
+use crate::session::pass::{LayerBuffers, Traced};
 
 /// A recurrent store's pages, the range a checkpoint copies and its name.
 type Store<'a> = (&'a MetalBuffer<f32>, Range<usize>, &'static str);
@@ -1472,7 +1205,7 @@ impl Session {
                 };
                 let walked = Walk::new(&mut ops, &self.plans, m)
                     .run(cap_rows)
-                    .and_then(|()| ops.buffers.finish());
+                    .and_then(|()| Ok(ops.buffers.finish()?));
                 let LayerBuffers { count, last, .. } = ops.buffers;
                 // A refusal after a layer was committed: that layer ran and
                 // wrote, so the stores are as it left them and the caller
@@ -2540,133 +2273,6 @@ impl<A: Arms> ChainOps for Layered<'_, A> {
 
     fn head(&mut self, m: usize) -> Result<(), SessionError> {
         self.one(None, |o| o.head(m))
-    }
-}
-
-/// The command buffers of a walk: the buffer being encoded, and the signal of
-/// the last one committed. A pass takes one a layer ([`LayerBuffers::new`]): a
-/// buffer is committed with a signal and not waited when the walk reaches the
-/// next layer, so the host encodes a layer while the card runs the one before
-/// it; each buffer opens at the stream's token boundary, which the buffer
-/// ahead signals at its end, so it sees what that one wrote. A verify takes
-/// one for the whole walk ([`LayerBuffers::whole`]), as a step does: the groups
-/// close with barriers, so a boundary between layers orders nothing more and
-/// costs the card an idle gap each. The walk settles the last signal once.
-struct LayerBuffers<'s> {
-    stream: &'s MetalStream,
-    /// Whether every op encodes on the one buffer, whatever its layer.
-    whole: bool,
-    /// The buffer being encoded, not yet committed.
-    open: Option<OpenLayer<'s>>,
-    /// The last committed buffer's signal.
-    last: Option<Signalled>,
-    /// What the committed buffers encoded.
-    count: EncodeCount,
-    /// Each committed buffer's host stamps and its GPU stamps handle, when a
-    /// caller traces the walk ([`LayerBuffers::traced`]); `None` reads no clock.
-    trace: Option<Vec<Traced>>,
-}
-
-/// A layer's buffer being encoded.
-struct OpenLayer<'s> {
-    /// The layer its ops name; the embed opens a buffer before one does.
-    layer: Option<usize>,
-    recording: TokenRecording<'s>,
-    /// The host clock when the buffer began, read only in a traced walk.
-    opened: Option<f64>,
-}
-
-/// A committed buffer of a traced walk: the host clock at its begin and at
-/// its commit's return, and the handle its GPU stamps are read through once
-/// the walk settles.
-struct Traced {
-    opened: f64,
-    committed: f64,
-    stamps: GpuStamps,
-}
-
-impl<'s> LayerBuffers<'s> {
-    /// A buffer a layer.
-    fn new(stream: &'s MetalStream) -> Self {
-        Self {
-            stream,
-            whole: false,
-            open: None,
-            last: None,
-            count: EncodeCount::default(),
-            trace: None,
-        }
-    }
-
-    /// One buffer for the whole walk.
-    fn whole(stream: &'s MetalStream) -> Self {
-        Self {
-            whole: true,
-            ..Self::new(stream)
-        }
-    }
-
-    /// These buffers, stamping every buffer they commit.
-    fn traced(self) -> Self {
-        Self {
-            trace: Some(Vec::new()),
-            ..self
-        }
-    }
-
-    /// The buffer an op of `layer` encodes on. The open one when the walk is
-    /// one buffer, when it is `layer`'s, or when either names no layer;
-    /// otherwise the open buffer is committed and the next one opened.
-    fn at(&mut self, layer: Option<usize>) -> Result<&mut TokenRecording<'s>, SessionError> {
-        let open = match self.open.take() {
-            Some(mut open)
-                if self.whole || layer.is_none() || open.layer.is_none() || open.layer == layer =>
-            {
-                open.layer = open.layer.or(layer);
-                open
-            }
-            behind => {
-                if let Some(behind) = behind {
-                    self.commit(behind)?;
-                }
-                let opened = self.trace.is_some().then(host_secs);
-                OpenLayer {
-                    layer,
-                    recording: self.stream.begin()?.open_token_encoder()?,
-                    opened,
-                }
-            }
-        };
-        Ok(&mut self.open.insert(open).recording)
-    }
-
-    /// Commit `open` with a signal, unwaited.
-    fn commit(&mut self, open: OpenLayer<'s>) -> Result<(), SessionError> {
-        let OpenLayer {
-            recording, opened, ..
-        } = open;
-        let (recording, count) = recording.finish();
-        let stamps = opened.map(|opened| (opened, recording.stamps()));
-        // A buffer's own failure is named at the last signal's settle: the
-        // driver reports a failed buffer there, whichever buffer it was.
-        self.last = Some(self.stream.submit_signalled(recording)?);
-        self.count += count;
-        if let (Some(trace), Some((opened, stamps))) = (self.trace.as_mut(), stamps) {
-            trace.push(Traced {
-                opened,
-                committed: host_secs(),
-                stamps,
-            });
-        }
-        Ok(())
-    }
-
-    /// Commit the buffer still open, the walk done.
-    fn finish(&mut self) -> Result<(), SessionError> {
-        match self.open.take() {
-            Some(open) => self.commit(open),
-            None => Ok(()),
-        }
     }
 }
 

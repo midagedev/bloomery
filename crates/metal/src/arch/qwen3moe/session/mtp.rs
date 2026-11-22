@@ -81,7 +81,7 @@ use host::{Held, STORE_ROWS};
 /// call overwrites its arena: row `row` of `arena` (the step arena holds one
 /// row, the rows arena a pass's or a verify's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::arch::qwen3moe) struct HiddenSrc {
+pub struct HiddenSrc {
     pub(in crate::arch::qwen3moe) arena: MtpArena,
     pub(in crate::arch::qwen3moe) row: usize,
 }

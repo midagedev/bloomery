@@ -48,8 +48,8 @@ use runtime::prompt::CallEnd;
 use super::{DraftRow, HiddenAt, RowKind, Session, SessionError, mtp_refuse};
 use crate::arch::qwen3moe::arena::slot_of;
 use crate::arch::qwen3moe::lanes::VERIFY_ROWS;
-use crate::arch::qwen3moe::target;
 use crate::kernels::HiddenRow;
+use crate::session::prompt::prompt_call;
 
 /// The most rows one store walk takes: the draft's ids hold a word a row, and
 /// a prompt unit's rows are walked in runs of this many, each one command
@@ -413,7 +413,7 @@ impl Host for Session {
     }
 
     /// One call with a point at each mark: the session keeps a position
-    /// inside a call ([`target::prompt_call`]), so the draft's units are those
+    /// inside a call ([`crate::session::prompt::prompt_call`]), so the draft's units are those
     /// of the call with no mark.
     fn prompt_marked_with(
         &mut self,
@@ -432,12 +432,12 @@ impl Host for Session {
         }
         self.mtp_ref()?;
         let pick = match sink {
-            None => target::prompt_call(self, ids, marks, None)?,
+            None => prompt_call(self, ids, marks, None)?,
             Some(sink) => {
                 let mut unit = |s: &mut Session, arena: MtpArena, first: u32, rows: usize| {
                     sink(&mut SessionExec(s), arena, first, rows)
                 };
-                target::prompt_call(self, ids, marks, Some(&mut unit))?
+                prompt_call(self, ids, marks, Some(&mut unit))?
             }
         };
         Ok(Some(pick))

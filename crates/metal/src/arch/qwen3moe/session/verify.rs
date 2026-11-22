@@ -555,7 +555,7 @@ impl Session {
         };
         let walked = Walk::new(&mut ops, &self.plans, started.m)
             .run(cap)
-            .and_then(|()| ops.buffers.finish());
+            .and_then(|()| Ok(ops.buffers.finish()?));
         let LayerBuffers {
             last,
             count,

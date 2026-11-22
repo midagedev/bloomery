@@ -51,13 +51,12 @@ use super::session::{CHECKPOINT_EVERY, PROJECTED, SITES, SessionError, WHAT, pas
 use crate::geom::Geometry;
 use crate::instance::{self, Instance};
 use crate::kernels::{HeadMap, MAX_SEGMENTS, Quant, SNAPS, segments_for_keys, shared_entry};
+use crate::session::room::SessionBytes;
+
+pub use crate::session::room::{Bytes, PAGE, Tally, fits_room, room};
 
 /// The arena's name in a refusal.
 const ARENA: &str = "qwen35moe arena";
-
-/// A pass-through page: Apple silicon's, the size a Metal buffer's bytes round
-/// up to in the driver's count.
-pub const PAGE: u64 = 16 * 1024;
 
 /// Every site type the chain reader knows, the widest lists a read can take:
 /// the read of a half that the launch lists refuse still names its sites.
@@ -98,13 +97,9 @@ fn refuse(detail: impl Into<String>) -> SessionError {
     }
 }
 
-/// One refusal, in the words the open returns it in.
-#[derive(Debug)]
-pub struct Item {
-    /// The layer the refusal was met at; `None` for the file's own.
-    pub layer: Option<usize>,
-    pub error: SessionError,
-}
+/// One refusal, in the words the open returns it in: the plan's own item
+/// over this session's error ([`crate::plan::Item`]).
+pub type Item = crate::plan::Item<SessionError>;
 
 /// Where a check's items collect, and the layer they are met at: an arena
 /// refusal of a layer names it, a plan's or the file's does not.
@@ -578,35 +573,28 @@ pub fn check_room(split: &Split, ctx: usize, free: Result<u64, String>) -> Outco
     outcome
 }
 
-/// The open's room rule: the bytes the session asks of the driver — every
-/// class [`Bytes`] counts, the open's buffers and the copies it makes later
-/// with checkpoints every `every` positions, the requested total — held to
-/// `free`, the device's free bytes as the census reads them (the working set
-/// less this process's allocation and the host's available memory, the
-/// smaller). The requested side is the ask itself; the paged figure is an
-/// upper bound the driver's own count can fall short of, and a rule that read
-/// it would refuse loads the driver holds. A load that passes the room is
-/// refused by name, with the largest cache of rows that fits taken from the
-/// byte formula itself, before any buffer is made.
-pub fn room(split: &Split, checked: &Checked, every: u32, free: u64) -> Result<(), SessionError> {
-    let bytes = checked.bytes_at(every)?;
-    if fits_room(&bytes, free) {
-        return Ok(());
-    }
-    let ctx = checked.layout.ctx;
-    Err(room_refusal(
-        &bytes,
-        free,
-        largest_ctx_of(split, ctx, every, free),
-    ))
-}
+/// The qwen35moe family's byte plan for the room rule: its check at another
+/// cache size, its bytes with the checkpoints priced, and its refusal
+/// wording ([`room`], the rule itself, is the common owner's).
+impl SessionBytes for Split {
+    type Checked = Checked;
+    type Error = SessionError;
 
-/// Whether a session of `bytes` fits `free` bytes of the device's room: the
-/// requested total of every class it holds, the copies among them, against
-/// the free bytes. The room rule's one comparison; [`room`] words its refusal.
-#[must_use]
-pub fn fits_room(bytes: &Bytes, free: u64) -> bool {
-    bytes.held().requested <= free
+    fn check_at(&self, rows: usize) -> Option<Checked> {
+        check(self, rows).checked
+    }
+
+    fn bytes_at(checked: &Checked, every: u32) -> Result<Bytes, SessionError> {
+        Checked::bytes_at(checked, every)
+    }
+
+    fn ctx(checked: &Checked) -> usize {
+        checked.layout.ctx
+    }
+
+    fn refuse_room(detail: String) -> SessionError {
+        super::session::refuse(detail)
+    }
 }
 
 /// The cache rows of an open that asked for none, at most `cap`: `cap` when
@@ -616,49 +604,7 @@ pub fn fits_room(bytes: &Bytes, free: u64) -> bool {
 /// another refusal, so the open refuses it by name.
 #[must_use]
 pub fn unasked_ctx(split: &Split, cap: usize, free: u64) -> usize {
-    largest_ctx_of(split, cap, CHECKPOINT_EVERY, free).unwrap_or(cap)
-}
-
-/// The refusal of a session that asks `bytes` of the driver against `free`
-/// bytes of room: the requested total, the room, and the largest cache of
-/// rows that fits when [`largest_ctx_of`] found one.
-fn room_refusal(bytes: &Bytes, free: u64, largest_ctx: Option<usize>) -> SessionError {
-    let asked = bytes.held().requested;
-    super::session::refuse(match largest_ctx {
-        Some(rows) => format!(
-            "the load asks {asked} bytes of the driver and the device's free bytes are {free}; a \
-             cache of {rows} rows fits"
-        ),
-        None => format!(
-            "the load asks {asked} bytes of the driver and the device's free bytes are {free}"
-        ),
-    })
-}
-
-/// The largest cache of at most `ctx` rows whose session fits `free` bytes:
-/// the byte formula itself at each candidate, exact because every class that
-/// scales with the cache's rows — the kv caches, the rope tables, the
-/// attention partials, the rows arena, the checkpoints — never shrinks as the
-/// rows grow. `None` when even one row does not fit.
-fn largest_ctx_of(split: &Split, ctx: usize, every: u32, free: u64) -> Option<usize> {
-    let fits = |rows: usize| {
-        check(split, rows)
-            .checked
-            .is_some_and(|checked| checked.bytes_at(every).is_ok_and(|b| fits_room(&b, free)))
-    };
-    if !fits(1) {
-        return None;
-    }
-    let (mut lo, mut hi) = (1, ctx);
-    while lo < hi {
-        let mid = lo + (hi - lo).div_ceil(2);
-        if fits(mid) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-    Some(lo)
+    crate::session::room::unasked_ctx(split, cap, CHECKPOINT_EVERY, free)
 }
 
 /// The plan of layer `l`'s mixer of kind `kind`, at the lists `sites`: the
@@ -1714,65 +1660,6 @@ fn layer_checks(
     })
 }
 
-/// One class of buffers the open makes: how many, the bytes asked of the
-/// driver, and the bytes its pages count.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Tally {
-    pub buffers: u64,
-    pub requested: u64,
-    pub paged: u64,
-}
-
-impl Tally {
-    fn add(&mut self, bytes: u64) {
-        self.buffers += 1;
-        self.requested += bytes;
-        self.paged += bytes.div_ceil(PAGE) * PAGE;
-    }
-}
-
-/// The bytes a session makes buffers of, by class: the file's weights, the
-/// attention caches, the delta layers' state and rings, the token arena's
-/// other buffers and the rows arena, which the open makes, and the copies the
-/// session makes after it: a pass's mark copies ([`SNAPS`] of each delta
-/// layer's lane and ring, made at the open or by the first pass that asks)
-/// and the checkpoints [`Price::budget`] grants at the cache's rows (a buffer
-/// a store a point, made a point at a time).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Bytes {
-    pub weights: Tally,
-    pub kv: Tally,
-    pub state: Tally,
-    pub scratch: Tally,
-    pub rows: Tally,
-    pub copies: Tally,
-}
-
-impl Bytes {
-    /// The classes the open makes buffers of, together: every class but the
-    /// copies.
-    #[must_use]
-    pub fn total(&self) -> Tally {
-        sum(&[self.weights, self.kv, self.state, self.scratch, self.rows])
-    }
-
-    /// Every class the session can hold, the copies among them: the room
-    /// rule's figure.
-    #[must_use]
-    pub fn held(&self) -> Tally {
-        sum(&[self.total(), self.copies])
-    }
-}
-
-/// The tallies `parts` summed.
-fn sum(parts: &[Tally]) -> Tally {
-    parts.iter().fold(Tally::default(), |a, t| Tally {
-        buffers: a.buffers + t.buffers,
-        requested: a.requested + t.requested,
-        paged: a.paged + t.paged,
-    })
-}
-
 impl Checked {
     /// [`Checked::bytes_at`] with checkpoints every [`CHECKPOINT_EVERY`]
     /// positions, the binaries' spacing.
@@ -1964,6 +1851,17 @@ impl Checked {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    /// The refusal of a session that asks `bytes` of the driver against
+    /// `free` bytes of room, in the room rule's own words, as this family's
+    /// session words it.
+    fn room_refusal(bytes: &Bytes, free: u64, largest_ctx: Option<usize>) -> SessionError {
+        crate::arch::qwen3moe::session::refuse(crate::session::room::room_words(
+            bytes,
+            free,
+            largest_ctx,
+        ))
+    }
 
     use chain::arch::qwen3moe::plan::SandwichPlan;
     use chain::arch::qwen3moe::read::layer_plans;
