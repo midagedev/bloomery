@@ -14,7 +14,10 @@
 `--ids` names them, one step each, teacher-forced). The forward is mlx-lm's modules in f32:
 every quantized linear and embedding is replaced by its exact dequant (scales and biases
 widened before `mx.dequantize`) and every bf16 parameter is widened, so the row carries the
-model's arithmetic without bf16 activation rounding. The embedding is not floatized whole: only
+model's arithmetic without bf16 activation rounding. A routed stack of quantized experts
+(mlx-lm's `QuantizedSwitchLinear`, NVFP4 with a per-expert global scale or MXFP8) is replaced
+the same way, by a stand-in that dequantizes the experts each call routes, so a stack is
+never held whole in f32. The embedding is not floatized whole: only
 the rows of the dumped ids are gathered from the quantized embedding and dequantized the same
 way (the head stays whole in f32), and an id outside that set raises by name; a folder whose
 head is tied to the embedding keeps the whole f32 embedding. A folder that does not floatize
@@ -2063,7 +2066,10 @@ def floatize(model) -> tuple[str, int]:
 
     The leaves come from the module's own `leaf_modules`: a quantized module is a dict
     entry, which a walk of `__dict__` does not see. The note names what was replaced
-    and what bf16 parameter is left.
+    and what bf16 parameter is left. A `QuantizedSwitchLinear` (a routed stack of experts,
+    NVFP4 with a per-expert global scale or MXFP8) is replaced by a stand-in that
+    dequantizes the experts a call routes through the module's own dequantize arguments,
+    the same values a whole-stack dequant gives, so a stack is never held whole in f32.
     """
     import inspect
 
@@ -2081,6 +2087,47 @@ def floatize(model) -> tuple[str, int]:
     except Exception as exc:
         lines.append(f"quant call: {exc}")
 
+    class F32Switch(nn.Module):
+        """A quantized switch linear's exact f32 stand-in: the experts a call routes are
+        dequantized for it, the module's own scales, biases and global scale."""
+
+        def __init__(self, mod):
+            super().__init__()
+            self.weight = mod["weight"]
+            self.scales = mod["scales"]
+            self.biases = mod.get("biases", None)
+            self.global_scale = mod.get("global_scale", None)
+            self.group_size = mod.group_size
+            self.bits = mod.bits
+            self.mode = mod.mode
+
+        def expert(self, e: int):
+            return mx.dequantize(
+                self.weight[e],
+                scales=self.scales[e],
+                biases=None if self.biases is None else self.biases[e],
+                group_size=self.group_size,
+                bits=self.bits,
+                mode=self.mode,
+                global_scale=None if self.global_scale is None else self.global_scale[e],
+            ).astype(mx.float32)
+
+        def __call__(self, x, indices, sorted_indices=False):
+            # One expert row an index: `x` arrives as one row the indices broadcast (the fused
+            # gate-up call) or as a row per routed expert already (the down call), and the row
+            # axis stays in the answer as `gather_qmm` keeps it (the experts' own squeeze takes
+            # it out).
+            flat = indices.reshape(-1).tolist()
+            experts = sorted(set(flat))
+            rows = mx.stack([self.expert(e) for e in experts])
+            place = mx.array([experts.index(e) for e in flat], dtype=mx.uint32)
+            gathered = rows[place].reshape(*indices.shape, rows.shape[-2], rows.shape[-1])
+            xs = x.reshape(*indices.shape[:-1], -1, x.shape[-1])
+            y = mx.matmul(
+                xs[..., None, None, :], gathered[..., None, :, :].swapaxes(-1, -2)
+            )
+            return y.reshape(*indices.shape, x.shape[-2], rows.shape[-2])
+
     replaced = 0
     skipped = []
 
@@ -2089,6 +2136,14 @@ def floatize(model) -> tuple[str, int]:
         if not isinstance(mod, nn.Module):
             return mod
         name = type(mod).__name__
+        if name == "QuantizedSwitchLinear":
+            try:
+                made = F32Switch(mod)
+            except Exception as exc:
+                skipped.append(f"{name}: {exc}")
+                return mod
+            replaced += 1
+            return made
         if name not in ("QuantizedLinear", "QuantizedEmbedding"):
             return mod
         try:

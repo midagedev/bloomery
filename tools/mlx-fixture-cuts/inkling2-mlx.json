@@ -1,0 +1,44 @@
+{
+  "name": "inkling2-mlx",
+  "arch": "inkling2",
+  "source": "mlx-community/Inkling-2-Mini-4bit",
+  "rev": "9856dc53edead71405f8348930937c3638ff21a2",
+  "expect": {"tensors": 1559, "data_bytes": 17308123136},
+  "layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+  "layer_prefix": "model.language_model.layers.",
+  "keep": [
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.embed_tokens.scales",
+    "model.language_model.embed_tokens.biases",
+    "model.language_model.embed_norm.weight",
+    "model.language_model.norm.weight",
+    "model.language_model.final_input.query",
+    "model.language_model.message_input.query",
+    "lm_head.weight",
+    "lm_head.scales",
+    "lm_head.biases"
+  ],
+  "drop": ["model.vision_tower."],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "generation_config.json",
+    "chat_template.jinja"
+  ],
+  "widths": {"experts": {"keep": 24, "align": 1}},
+  "planes": [
+    {"base": "mlp.experts.gate_up_proj", "axis": "rows", "width": "experts",
+     "members": {"weight": 1, "scales": 1, "global_scale": {"along": 1, "optional": true}}},
+    {"base": "mlp.experts.down_proj", "axis": "rows", "width": "experts",
+     "members": {"weight": 1, "scales": 1, "global_scale": {"along": 1, "optional": true}}},
+    {"base": "mlp.gate", "axis": "rows", "width": "experts",
+     "members": {"weight": 1, "e_score_correction_bias": 1}}
+  ],
+  "config": {
+    "layer_count": "text_config.num_hidden_layers",
+    "widths": {"text_config.n_routed_experts": "experts"},
+    "per_layer": [],
+    "layer_names": [],
+    "set": {"vision_config": null}
+  }
+}

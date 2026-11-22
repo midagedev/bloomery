@@ -6,6 +6,11 @@
 //! its bytes. [`verify`] re-plans the cut from the source's headers, then hashes each tensor in the
 //! cut and its source range and holds both to the record.
 //!
+//! A `rows` cut takes the leading axis of a plane of any rank (a stacked experts tensor's leading
+//! axis is its experts, and a rank-1 plane a vector one entry a row); every axis below the cut
+//! stays whole. A member a plane set's instances may lack (a quant format that carries no global
+//! scale beside another that does) is `optional` in the spec.
+//!
 //! The cut knows no model. Which tensors are kept, which are sliced along which axis and in what
 //! block units, and which config fields move are the spec's data (`tools/fixture-cuts/<name>.json`
 //! for a registry row's cut; `tools/mlx-fixture-cuts/<name>.json` for a Metal-only MLX folder, which
@@ -143,12 +148,14 @@ struct Width {
 /// stands for along the cut axis (`along`) and along the matrix's rows (`rows`). A plane whose
 /// stored rows are the matrix's own (a row of block scales beside a row of codes) has `rows` 1;
 /// one whose grid tiles the rows in blocks (an FP8 block's scale square) has `rows` the block's
-/// edge.
+/// edge. `optional` names a plane an instance of the set may lack (a quant format that carries no
+/// global scale beside another that does).
 #[derive(Debug, Clone)]
 struct Member {
     suffix: String,
     along: u64,
     rows: u64,
+    optional: bool,
 }
 
 /// The tensors of one matrix, a plane each (its codes, its block scales), cut together on one
@@ -371,15 +378,29 @@ fn parse_planes(f: &mut Fields, widths: &[Width]) -> Result<Vec<PlaneSet>, CutEr
                     suffix: suffix.to_string(),
                     along: positive(m)?,
                     rows: 1,
+                    optional: false,
                 },
                 v => {
                     let mut m = Fields::new(v, &what)?;
-                    let (along, rows) = (positive(m.get("along")?)?, positive(m.get("rows")?)?);
+                    let along = positive(m.get("along")?)?;
+                    let rows = if m.map.contains_key("rows") {
+                        positive(m.get("rows")?)?
+                    } else {
+                        1
+                    };
+                    let optional = if m.map.contains_key("optional") {
+                        m.get("optional")?
+                            .as_bool()
+                            .ok_or_else(|| spec_err(format!("{what}.optional is not a boolean")))?
+                    } else {
+                        false
+                    };
                     m.finish()?;
                     Member {
                         suffix: suffix.to_string(),
                         along,
                         rows,
+                        optional,
                     }
                 }
             };
@@ -627,13 +648,14 @@ struct Plan {
     dropped_bytes: u64,
 }
 
-/// A matrix's planes found among the tensors: one per member of its plane set.
+/// A matrix's planes found among the tensors: one per member of its plane set, `None` the members
+/// an instance of the set lacks (an optional plane).
 struct Instance {
     base: String,
     set: usize,
     layer: usize,
     /// The index of the member's tensor, in the set's member order.
-    members: Vec<usize>,
+    members: Vec<Option<usize>>,
 }
 
 fn base_matches(pattern: &[String], base: &str) -> bool {
@@ -680,7 +702,11 @@ fn find_instances(spec: &Spec, items: &[(usize, &str)]) -> Result<Vec<Instance>,
     }
     let mut out = Vec::new();
     for ((layer, base, set), slots) in found {
-        if let Some(m) = slots.iter().position(Option::is_none) {
+        if let Some(m) = slots
+            .iter()
+            .zip(&spec.planes[set].members)
+            .position(|(slot, member)| slot.is_none() && !member.optional)
+        {
             return Err(CutError::Planes {
                 base,
                 why: format!(
@@ -693,14 +719,16 @@ fn find_instances(spec: &Spec, items: &[(usize, &str)]) -> Result<Vec<Instance>,
             base,
             set,
             layer,
-            members: slots.into_iter().flatten().collect(),
+            members: slots,
         });
     }
     Ok(out)
 }
 
 /// The values a matrix's planes span along the cut axis, each plane's stored extent times its
-/// unit; the planes must be 2-D, span the same values along the cut axis and span the same rows.
+/// unit; the planes must span the same values along the cut axis and span the same rows. A `rows`
+/// cut takes a plane's leading axis, of a plane of any rank (a rank-1 plane is a vector, its one
+/// axis its rows); a `cols` cut a 2-D plane's columns.
 fn plane_extent(
     spec: &Spec,
     inst: &Instance,
@@ -711,15 +739,22 @@ fn plane_extent(
     let mut common: Option<(u64, &str)> = None;
     let mut rows: Option<(u64, &str)> = None;
     for (&at, member) in inst.members.iter().zip(&set.members) {
+        let Some(at) = at else { continue };
         let (name, shape) = tensors[at];
-        let &[_, _] = shape else {
+        let rows_cut = set.axis == Axis::Rows;
+        let (cuts, bad_rank) = if rows_cut {
+            ("a plane's leading axis", shape.is_empty())
+        } else {
+            ("a 2-D plane's columns", shape.len() != 2)
+        };
+        if bad_rank {
             return Err(CutError::Width {
                 tensor: name.to_string(),
                 width: spec.widths[set.width].name.clone(),
                 keep: spec.widths[set.width].keep,
-                why: format!("which cuts a 2-D plane, and this one is {}-D", shape.len()),
+                why: format!("which cuts {cuts}, and this one is {}-D", shape.len()),
             });
-        };
+        }
         let values = to_u64(shape[axis]) * member.along;
         let matrix_rows = to_u64(shape[0]) * member.rows;
         let suffix = member.suffix.as_str();
@@ -744,18 +779,22 @@ fn plane_extent(
     Ok(common.expect("a plane set has members").0)
 }
 
-/// `tensor` cut to `keep` values along the set's axis, `unit` values to the element.
+/// `tensor` cut to `keep` values along the set's axis, `unit` values to the element. A `rows` cut
+/// keeps the leading axis and every axis below it whole, so it is one contiguous prefix; a `cols`
+/// cut keeps a prefix of every row.
 fn slice(spec: &Spec, set: &PlaneSet, src: &Src, unit: u64) -> (Vec<usize>, View) {
     let width = &spec.widths[set.width];
-    let (rows, cols) = (src.shape[0], src.shape[1]);
     let kept = usize::try_from(width.keep / unit).expect("a kept count fits usize");
     let elem = to_u64(src.dtype.size());
-    let (rows64, cols64) = (to_u64(rows), to_u64(cols));
     match set.axis {
         Axis::Rows => {
-            let take = width.keep / unit * cols64 * elem;
+            let below = src.shape[1..].iter().copied().map(to_u64).product::<u64>();
+            let take = width.keep / unit * below * elem;
+            let mut shape = Vec::with_capacity(src.shape.len());
+            shape.push(kept);
+            shape.extend_from_slice(&src.shape[1..]);
             (
-                vec![kept, cols],
+                shape,
                 View {
                     start: src.start,
                     count: 1,
@@ -764,15 +803,18 @@ fn slice(spec: &Spec, set: &PlaneSet, src: &Src, unit: u64) -> (Vec<usize>, View
                 },
             )
         }
-        Axis::Cols => (
-            vec![rows, kept],
-            View {
-                start: src.start,
-                count: rows64,
-                take: width.keep / unit * elem,
-                stride: cols64 * elem,
-            },
-        ),
+        Axis::Cols => {
+            let (rows, cols) = (src.shape[0], src.shape[1]);
+            (
+                vec![rows, kept],
+                View {
+                    start: src.start,
+                    count: to_u64(rows),
+                    take: width.keep / unit * elem,
+                    stride: to_u64(cols) * elem,
+                },
+            )
+        }
     }
 }
 
@@ -850,17 +892,24 @@ fn slice_planes(
     for inst in find_instances(spec, &items)? {
         let set = &spec.planes[inst.set];
         let width = &spec.widths[set.width];
-        let tensor = |m: usize| kept[inst.members[m]].name.clone();
+        let first = inst
+            .members
+            .iter()
+            .flatten()
+            .copied()
+            .next()
+            .expect("an instance holds a plane");
         if !width.keep.is_multiple_of(width.align) {
             return Err(CutError::Unaligned {
                 width: width.name.clone(),
                 keep: width.keep,
                 align: width.align,
-                tensor: tensor(0),
+                tensor: kept[first].name.clone(),
             });
         }
         let values = plane_extent(spec, &inst, &shapes)?;
         for (m, member) in set.members.iter().enumerate() {
+            let Some(at) = inst.members[m] else { continue };
             let why = if width.keep > values {
                 Some(format!("and the matrix spans {values}"))
             } else if !width.keep.is_multiple_of(member.along) {
@@ -873,16 +922,13 @@ fn slice_planes(
             };
             if let Some(why) = why {
                 return Err(CutError::Width {
-                    tensor: tensor(m),
+                    tensor: kept[at].name.clone(),
                     width: width.name.clone(),
                     keep: width.keep,
                     why,
                 });
             }
-            sliced.insert(
-                inst.members[m],
-                slice(spec, set, kept[inst.members[m]], member.along),
-            );
+            sliced.insert(at, slice(spec, set, kept[at], member.along));
         }
     }
     Ok(sliced)
@@ -4003,5 +4049,472 @@ pub(crate) mod tests {
             matrices += 1;
         }
         assert_eq!(matrices, 4 * 7 + 2);
+    }
+
+    /// A folder of stacked planes: two layers of a router (a 2-D weight and a rank-1 correction
+    /// bias) and a stack of experts whose codes, block scales and per-stack global scale share the
+    /// leading axis, the global scale on layer 0 only (a quant format that carries none beside one
+    /// that does). A rows cut on that axis keeps the first experts of every plane together with
+    /// every axis below whole, the router's rows and the bias's entries move with them, a member
+    /// that is not optional is refused by name on the layer that lacks it, and a cols cut of a
+    /// plane that is not 2-D is refused by name.
+    #[test]
+    fn a_stacked_plane_set_is_cut_on_its_leading_axis_with_an_optional_member() {
+        let root = temp_dir("stacked");
+        let src = root.join("src");
+        fs::create_dir(&src).unwrap();
+        // Two layers: 4 experts of codes [4, 6, 8] with scales [4, 6, 2] (4 values a scale
+        // element along the packed axis), the global scale on layer 0 alone, and a router.
+        let mut tensors = vec![tensor("m.embed.weight", "BF16", &[16, 64])];
+        for l in 0..2 {
+            let p = format!("m.layers.{l}.");
+            tensors.push(tensor(&format!("{p}mlp.gate.weight"), "F32", &[4, 10]));
+            tensors.push(tensor(
+                &format!("{p}mlp.gate.e_score_correction_bias"),
+                "F32",
+                &[4],
+            ));
+            tensors.push(tensor(
+                &format!("{p}mlp.experts.gate_up_proj.weight"),
+                "U8",
+                &[4, 6, 8],
+            ));
+            tensors.push(tensor(
+                &format!("{p}mlp.experts.gate_up_proj.scales"),
+                "U8",
+                &[4, 6, 2],
+            ));
+            if l == 0 {
+                tensors.push(tensor(
+                    &format!("{p}mlp.experts.gate_up_proj.global_scale"),
+                    "F32",
+                    &[4],
+                ));
+            }
+        }
+        let write = |dir: &Path| {
+            let parts: Vec<(&str, &str, &[usize], &[u8])> = tensors
+                .iter()
+                .map(|t| {
+                    (
+                        t.name.as_str(),
+                        t.dtype,
+                        t.shape.as_slice(),
+                        t.data.as_slice(),
+                    )
+                })
+                .collect();
+            fs::write(
+                dir.join("model-00001-of-00001.safetensors"),
+                safetensors::write(&parts),
+            )
+            .unwrap();
+            let weight_map: Map<String, Value> = tensors
+                .iter()
+                .map(|t| (t.name.clone(), json!("model-00001-of-00001.safetensors")))
+                .collect();
+            fs::write(
+                dir.join(Folder::INDEX),
+                json!({"metadata": {"total_size": tensors.iter().map(|t| t.data.len()).sum::<usize>()},
+                       "weight_map": weight_map})
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(
+                dir.join(CONFIG),
+                serde_json::to_string_pretty(&json!({"num_hidden_layers": 2, "n_experts": 4}))
+                    .unwrap(),
+            )
+            .unwrap();
+        };
+        write(&src);
+        let spec_text = |optional: bool, axis: &str| {
+            json!({
+                "name": "stacked", "arch": "stacked", "source": "toy/Stacked", "rev": "r1",
+                "expect": {"tensors": tensors.len(),
+                           "data_bytes": tensors.iter().map(|t| t.data.len()).sum::<usize>()},
+                "layers": [0, 1],
+                "layer_prefix": "m.layers.",
+                "keep": ["m.embed.weight"],
+                "drop": [],
+                "copy": [],
+                "widths": {"experts": {"keep": 2, "align": 1}},
+                "planes": [
+                    {"base": "mlp.experts.gate_up_proj", "axis": axis, "width": "experts",
+                     "members": {"weight": 1, "scales": 1,
+                                 "global_scale": {"along": 1, "optional": optional}}},
+                    {"base": "mlp.gate", "axis": "rows", "width": "experts",
+                     "members": {"weight": 1, "e_score_correction_bias": 1}},
+                ],
+                "config": {
+                    "layer_count": "num_hidden_layers",
+                    "widths": {"n_experts": "experts"},
+                    "per_layer": [], "layer_names": []
+                },
+            })
+            .to_string()
+        };
+        let e = cut(
+            &src,
+            &root.join("cols"),
+            &Spec::parse(&spec_text(true, "cols")).unwrap(),
+            &opts(DEFAULT_SHARD_BYTES),
+            &mut quiet,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, CutError::Width { tensor, why, .. }
+                if tensor.contains("mlp.experts.gate_up_proj")
+                    && why.contains("cuts a 2-D plane's columns")
+                    && why.contains("-D")),
+            "{e}"
+        );
+        let e = cut(
+            &src,
+            &root.join("required"),
+            &Spec::parse(&spec_text(false, "rows")).unwrap(),
+            &opts(DEFAULT_SHARD_BYTES),
+            &mut quiet,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&e, CutError::Planes { base, why } if base == "mlp.experts.gate_up_proj"
+                && why == "no global_scale plane beside the others"),
+            "{e}"
+        );
+
+        let spec = Spec::parse(&spec_text(true, "rows")).unwrap();
+        let out = root.join("out");
+        cut(&src, &out, &spec, &opts(DEFAULT_SHARD_BYTES), &mut quiet).unwrap();
+        let folder = open(&out);
+        let of =
+            |l: usize, suffix: &str| folder.raw(&format!("m.layers.{l}.mlp.{suffix}")).unwrap();
+        // The first 2 experts of every plane, every axis below the leading one whole: one
+        // contiguous prefix of each source tensor's bytes.
+        for l in 0..2 {
+            let codes = of(l, "experts.gate_up_proj.weight");
+            assert_eq!(codes.shape, &[2, 6, 8][..], "layer {l}");
+            assert!(
+                codes.bytes == &tensors[3 + l * 5].data[..2 * 6 * 8],
+                "layer {l}"
+            );
+            let scales = of(l, "experts.gate_up_proj.scales");
+            assert_eq!(scales.shape, &[2, 6, 2][..], "layer {l}");
+            assert!(
+                scales.bytes == &tensors[4 + l * 5].data[..2 * 6 * 2],
+                "layer {l}"
+            );
+            let gate = folder
+                .raw(&format!("m.layers.{l}.mlp.gate.weight"))
+                .unwrap();
+            assert_eq!(gate.shape, &[2, 10][..], "layer {l}");
+            let bias = of(l, "gate.e_score_correction_bias");
+            assert_eq!(bias.shape, &[2][..], "layer {l}");
+        }
+        let gs = of(0, "experts.gate_up_proj.global_scale");
+        assert_eq!(gs.shape, &[2][..]);
+        assert!(gs.bytes == &tensors[5].data[..8]);
+        assert!(
+            !folder
+                .names()
+                .any(|n| n.starts_with("m.layers.1.") && n.contains("global_scale")),
+            "layer 1 keeps no global scale it did not have"
+        );
+        assert_eq!(
+            folder.raw("m.embed.weight").unwrap().bytes.len(),
+            16 * 64 * 2
+        );
+        let have: Value =
+            serde_json::from_str(&fs::read_to_string(out.join(CONFIG)).unwrap()).unwrap();
+        assert_eq!(have["n_experts"], json!(2));
+        verify(&out, Some(&src), &mut |_| {}).expect("the cut verifies");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The inkling2 spec: the Metal-only MLX fixture cut of the looped Mini folder, which has no
+    /// registry row.
+    fn inkling2_spec() -> Spec {
+        Spec::parse(include_str!(
+            "../../../tools/mlx-fixture-cuts/inkling2-mlx.json"
+        ))
+        .unwrap()
+    }
+
+    /// The tensors of the Mini MLX folder from its four committed shard headers, each tensor's
+    /// first byte where its shard file holds it: the source [`plan`] reads, with no tensor bytes
+    /// behind it.
+    fn real_mini_source() -> Vec<Src> {
+        let mut out = Vec::new();
+        for n in 1..=4 {
+            let raw = gunzipped(&format!(
+                "checkpoint-headers/inkling-2-mini-mlx4-model-0000{n}-of-00004.header.json.gz"
+            ));
+            let header: Value = serde_json::from_slice(&raw).unwrap();
+            let base = 8 + to_u64(raw.len());
+            for (name, e) in header.as_object().unwrap() {
+                if name == "__metadata__" {
+                    continue;
+                }
+                let (from, to) = (
+                    e["data_offsets"][0].as_u64().unwrap(),
+                    e["data_offsets"][1].as_u64().unwrap(),
+                );
+                out.push(Src {
+                    name: name.clone(),
+                    dtype: Dtype::of(e["dtype"].as_str().unwrap()).unwrap(),
+                    shape: e["shape"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|d| usize::try_from(d.as_u64().unwrap()).unwrap())
+                        .collect(),
+                    shard: format!("model-0000{n}-of-00004.safetensors"),
+                    start: base + from,
+                    len: to - from,
+                });
+            }
+        }
+        out
+    }
+
+    /// The inkling2 spec over the real Mini folder's four shard headers (1,559 tensors,
+    /// 17,308,123,136 bytes) plans the 24-layer looped fixture: every language layer kept — the
+    /// stem 0-5, the core 6-17 the loop runs three times, the coda 18-23, each six-layer
+    /// attention-residual block whole with its global layer last (5, 11, 17, 23) and the four
+    /// message-gate controllers on the core alone — with the vision tower dropped and the routed
+    /// experts cut to their first 24 of 128 (the stacked planes' leading axis: NVFP4 with a
+    /// global scale on layers 0-19, MXFP8 without one on 20-23) and the router's rows and
+    /// correction bias with them. From the headers: 1,137 tensors and 3,916,345,344 bytes (the
+    /// nine unlayered tensors 521,515,008; a stem layer 122,964,384; a core layer 130,042,272; a
+    /// coda layer 212,543,712).
+    #[test]
+    fn the_inkling2_spec_plans_the_24_layer_looped_fixture_from_the_real_mini_headers() {
+        let spec = inkling2_spec();
+        let src = real_mini_source();
+        Source {
+            dir: PathBuf::new(),
+            tensors: src.clone(),
+        }
+        .check_identity(&spec)
+        .unwrap();
+        let p = plan(&spec, &src, DEFAULT_SHARD_BYTES).unwrap();
+        assert_eq!(p.tensors.len(), 1_137);
+        assert_eq!(
+            p.tensors.iter().map(|t| t.view.len()).sum::<u64>(),
+            3_916_345_344
+        );
+        assert_eq!(p.shards, 1, "3.9 GB fits the default 4 GiB shard cap");
+        assert_eq!(p.dropped_tensors, 422, "the vision tower");
+        assert_eq!(p.dropped_bytes, 636_512_256);
+
+        let in_layer = |t: &Planned, l: usize| {
+            t.name
+                .starts_with(&format!("model.language_model.layers.{l}."))
+        };
+        let names_of = |l: usize| {
+            p.tensors
+                .iter()
+                .filter(|t| in_layer(t, l))
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        let layer_bytes = |l: usize| {
+            p.tensors
+                .iter()
+                .filter(|t| in_layer(t, l))
+                .map(|t| t.view.len())
+                .sum::<u64>()
+        };
+        assert_eq!(
+            p.tensors
+                .iter()
+                .filter(|t| !t.name.starts_with(&spec.layer_prefix))
+                .map(|t| t.view.len())
+                .sum::<u64>(),
+            521_515_008
+        );
+        assert_eq!(
+            (0..24).map(layer_bytes).collect::<Vec<_>>(),
+            [
+                122_955_168,
+                122_964_384,
+                122_964_384,
+                122_964_384,
+                122_964_384,
+                123_074_976,
+                130_042_272,
+                130_042_272,
+                130_042_272,
+                130_042_272,
+                130_042_272,
+                130_152_864,
+                130_042_272,
+                130_042_272,
+                130_042_272,
+                130_042_272,
+                130_042_272,
+                130_152_864,
+                122_964_384,
+                122_964_384,
+                212_543_712,
+                212_543_712,
+                212_543_712,
+                212_654_304
+            ]
+        );
+        // mlx-lm's rule: layer i is one of the four global layers when it is not in
+        // local_layer_ids, and carries the four message-gate controllers when the loop's core
+        // (core_start 6 to core_end 18) holds it.
+        for l in 0..24 {
+            let names = names_of(l);
+            let global = matches!(l, 5 | 11 | 17 | 23);
+            let core = (6..18).contains(&l);
+            assert_eq!(
+                names
+                    .iter()
+                    .any(|n| n.ends_with("q_input_layernorm.weight")),
+                global,
+                "layer {l}"
+            );
+            assert_eq!(
+                names.iter().any(|n| n.ends_with(".input_layernorm.weight")),
+                !global,
+                "layer {l}"
+            );
+            for controller in [
+                "q_message_gate",
+                "k_message_gate",
+                "v_message_gate",
+                "mlp_message_gate",
+            ] {
+                assert_eq!(
+                    names
+                        .iter()
+                        .any(|n| n.contains(&format!(".{controller}.down_proj.weight"))),
+                    core,
+                    "layer {l}: {controller}"
+                );
+            }
+            assert!(
+                !names.iter().any(|n| n.contains("global_scale")) == (l >= 20),
+                "layer {l}"
+            );
+        }
+        assert!(
+            !p.tensors
+                .iter()
+                .any(|t| t.name.starts_with("model.vision_tower.")),
+            "the vision tower is dropped"
+        );
+
+        // Every plane of the expert stacks and the router is cut on the experts' axis and every
+        // other kept tensor whole: the NVFP4 and the MXFP8 layers alike.
+        let by_name: HashMap<&str, &Planned> =
+            p.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
+        let source_of: HashMap<&str, &Src> = src.iter().map(|t| (t.name.as_str(), t)).collect();
+        for t in &p.tensors {
+            let s = source_of[t.src_name.as_str()];
+            let stacked = t.src_name.contains("mlp.experts.")
+                || t.src_name.ends_with("mlp.gate.weight")
+                || t.src_name.ends_with("mlp.gate.e_score_correction_bias");
+            if !stacked {
+                assert_eq!(t.view, View::whole(s.start, s.len), "{}", t.name);
+                assert_eq!((&t.shape, t.dtype), (&s.shape, s.dtype), "{}", t.name);
+            }
+        }
+        for l in 0..24 {
+            let packed = if l < 20 {
+                (288usize, 144usize)
+            } else {
+                (576, 72)
+            };
+            for (suffix, shape) in [
+                ("mlp.experts.gate_up_proj.weight", vec![24, 2304, packed.0]),
+                ("mlp.experts.gate_up_proj.scales", vec![24, 2304, packed.1]),
+                ("mlp.experts.down_proj.weight", vec![24, 2304, packed.0 / 2]),
+                ("mlp.experts.down_proj.scales", vec![24, 2304, packed.1 / 2]),
+                ("mlp.gate.weight", vec![24, 2304]),
+                ("mlp.gate.e_score_correction_bias", vec![24]),
+            ] {
+                let t = by_name
+                    .get(format!("model.language_model.layers.{l}.{suffix}").as_str())
+                    .unwrap_or_else(|| panic!("layer {l}: no {suffix}"));
+                assert_eq!(t.shape, shape, "layer {l} {suffix}");
+            }
+            if l < 20 {
+                let gs = by_name
+                    .get(
+                        format!(
+                            "model.language_model.layers.{l}.mlp.experts.gate_up_proj.global_scale"
+                        )
+                        .as_str(),
+                    )
+                    .unwrap_or_else(|| panic!("layer {l}: no global_scale"));
+                assert_eq!(gs.shape, vec![24], "layer {l}");
+            }
+        }
+    }
+
+    /// The inkling2 spec over the real Mini `config.json` edits the two fields the cut moves:
+    /// `text_config.n_routed_experts` 128 becomes 24 (`num_experts_per_tok` 8 stays, at most the
+    /// kept experts) and `vision_config` becomes null, so mlx-lm builds no vision tower to ask
+    /// for the tensors the cut dropped. Every field the reference reads per layer or per visit
+    /// keeps the source's own value — `num_hidden_layers` 24 (every layer kept), `local_layer_ids`
+    /// (the windowed layers, none dropped), `loop_config` (core 6 to 18, three passes, gate rank
+    /// 64) and `n_layers_per_attn_res_block` 6 (the four blocks whole) — so the loop runs the
+    /// same 48 visits over the cut.
+    #[test]
+    fn the_inkling2_spec_edits_the_real_mini_config_to_24_experts() {
+        let spec = inkling2_spec();
+        let real = String::from_utf8(gunzipped(
+            "quant-configs/mlx-community__Inkling-2-Mini-4bit__config.json.gz",
+        ))
+        .unwrap();
+        let before: Value = serde_json::from_str(&real).unwrap();
+        let edited: Value = serde_json::from_str(&edit_config(&spec, &real).unwrap()).unwrap();
+        let mut want = before;
+        want["text_config"]["n_routed_experts"] = json!(24);
+        want["vision_config"] = Value::Null;
+        assert_eq!(edited, want);
+        let text = &edited["text_config"];
+        assert_eq!(text["num_hidden_layers"].as_u64().unwrap(), 24);
+        assert_eq!(text["num_experts_per_tok"].as_u64().unwrap(), 8);
+        let local: Vec<u64> = text["local_layer_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(local.len(), 20, "the windowed layers");
+        assert_eq!(
+            local
+                .iter()
+                .copied()
+                .filter(|l| (6..18).contains(l))
+                .count(),
+            10,
+            "the core's windowed layers"
+        );
+        assert_eq!(
+            text["loop_config"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| {
+                    matches!(
+                        k.as_str(),
+                        "core_start" | "core_end" | "num_passes" | "gate_rank"
+                    )
+                })
+                .map(|(k, v)| (k.as_str(), v.as_u64().unwrap()))
+                .collect::<BTreeMap<_, u64>>(),
+            BTreeMap::from([
+                ("core_start", 6),
+                ("core_end", 18),
+                ("num_passes", 3),
+                ("gate_rank", 64),
+            ])
+        );
+        assert_eq!(text["n_layers_per_attn_res_block"].as_u64().unwrap(), 6);
     }
 }
