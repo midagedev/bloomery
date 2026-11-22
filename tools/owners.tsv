@@ -9,6 +9,7 @@ node_link	tier	crates/gpu/src/host/node.rs crates/gpu/src/host/link.rs crates/gp
 placement_sizing	placement	crates/placement/src/placement.rs crates/placement/src/placement/workstation.rs crates/placement/src/placement/card_budget.rs crates/placement/src/placement/ctx.rs crates/placement/src/placement/ctx_ask.rs crates/placement/src/placement/devices.rs crates/placement/src/placement/paged_drop.rs crates/placement/src/placement/churn.rs crates/placement/src/slots.rs crates/placement/src/accepts.rs crates/placement/src/r8.rs
 placement_nodes	placement	crates/placement/src/placement/nodes.rs crates/placement/src/placement/nodes_scale.rs crates/placement/src/placement/tp.rs crates/placement/src/placement/need_hook.rs crates/placement/src/placement/qwen38_cards.rs
 weights_load	load	crates/gpu/src/weights.rs crates/gpu/src/upload.rs crates/gpu/src/tensor.rs crates/gpu/src/view.rs
+w13_split	load	crates/gpu/src/w13_split.rs
 checkpoint_folder	load	crates/model-hf/src/folder.rs crates/model-hf/src/arch/mod.rs
 prompt_walks	prompt	crates/gpu/src/host/prompt_stream.rs crates/gpu/src/host/stream_side.rs crates/gpu/src/host/batch.rs crates/gpu/src/host/run.rs crates/gpu/src/host/step.rs crates/runtime/src/prompt.rs crates/runtime/src/splitwalk.rs crates/runtime/src/xsplit.rs crates/gpu/src/prompt_timing.rs
 seats_app	seat	crates/app/src/lib.rs crates/app/src/dspark.rs crates/app/src/mtp.rs

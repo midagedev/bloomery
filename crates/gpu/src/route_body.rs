@@ -974,6 +974,24 @@ crate::sigmoid_router_instance! {
 }
 
 crate::sigmoid_router_instance! {
+    /// The sigmoid router at 128 experts and the top 8 (Inkling 2's): the
+    /// rule of `sigmoid_128_6` at the other pick count — `exp_probs_b`
+    /// steering the selection only, the kept unbiased scores renormalized
+    /// over their `1e-20`-guarded sum — with the launch's `scale` the file's
+    /// `expert_weights_scale` (the row this instance was built for takes 8).
+    /// A non-finite selection value writes NaN weights, so the finite rank
+    /// order is not a defined pick, as at `sigmoid_256_8`.
+    pub mod sigmoid_128_8 {
+        experts: 128,
+        used: 8,
+        kernels: sigmoid_128_8_router_kernels,
+        entries: sigmoid_128_8_router, sigmoid_128_8_router_pick,
+        prepare: prepare_sigmoid_128_8_router, prepare_sigmoid_128_8_router_pick,
+        refuse_nan: true,
+    }
+}
+
+crate::sigmoid_router_instance! {
     /// The sigmoid router at 256 experts and the top 6: the same rule as
     /// `sigmoid_128_6` (biased sigmoid, the kept unbiased scores renormalized)
     /// at another expert count. The launch's `scale` is the file's

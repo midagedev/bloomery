@@ -4640,6 +4640,15 @@ gate-raon1-meta:
 gate-inkling2-meta:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::inkling2 arch::place_hybrid arch::registry arch::rules --nocapture && bash tools/gate.sh --release -p bloomery-model --test inkling2_meta -- --ignored --nocapture'
 
+# inkling2-moe: Inkling 2's routed block on the card (gate_inkling2_moe's doc): the biased sigmoid router at 128 experts and the
+# top 8 (the +1e-20 selected-sum rule, the file's route scale), the fused ffn_gate_up_exps split at upload into gate and up
+# stacks sharing the per-expert scale, and the NVFP4 and Q8_0 expert legs under situ at the file's betas, against the oracle
+# node dumps of whichever tier this run holds — every set's picks and weights, set a's router ladder and both quant legs'
+# whole expert ladder (the raw halves, the situ rows, the down rows, the weighted sum). BLOOMERY_TIER=fixture runs the
+# fixture file and its fx_ref_inkling2_* sets; the real tier the Mini's file and ref_inkling2_*.
+gate-inkling2-moe:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_moe'
+
 # --- inkling2-ref (Inkling 2's oracle: the patched PR tree and its node dumps) --------------------------------------------------------
 # Inkling 2's oracle tree: llama.cpp PR #32695 at its head 6196d9802 (the naming the Mini's file uses) carrying tools/ref/inkling2-scale.patch —
 # upstream master's own a1f422260 ("model : load ffn_gate_up_exps scales", #32657) unedited, which the PR branch lacks: without it the loader

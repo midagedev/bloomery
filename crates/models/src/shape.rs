@@ -341,6 +341,17 @@ pub const ROUTERS: &[RouterInst] = &[
         top_k_max: 6,
         at: "gpu/src/route_body.rs sigmoid_128_6_router*",
     },
+    // Inkling 2's router: the third pick count at 128 experts, its kept
+    // scores scaled by the file's `expert_weights_scale` at the launch.
+    RouterInst {
+        body: RouterBody::BiasedSigmoid,
+        rule: BIASED_SIGMOID,
+        norm_arg: false,
+        experts: 128,
+        top_k_min: 8,
+        top_k_max: 8,
+        at: "gpu/src/route_body.rs sigmoid_128_8_router*",
+    },
     // 256 experts, top 6. After MiMo's 256/top-8 row: `router_row` at 256
     // stays that row, and the pick ranges 8..=8 and 6..=6 do not overlap.
     RouterInst {
@@ -1232,6 +1243,7 @@ mod tests {
                     || r.at.contains("sigmoid_320_8_router")
                     || r.at.contains("sigmoid_128_4_router")
                     || r.at.contains("sigmoid_128_6_router")
+                    || r.at.contains("sigmoid_128_8_router")
                     || r.at.contains("sigmoid_256_6_router")
                     || r.at.contains("sigmoid_16_8_router")
                     || r.at.contains("sigmoid_896_16_router")
@@ -1242,9 +1254,9 @@ mod tests {
             );
         }
         // The rows that carry the body: GLM's and MiMo's, then Bolt's five, then
-        // the 320-expert instance's, then the two 128-expert ones (top 4, top 6),
-        // then the 256-expert top-6 row, Muse Spark's fixture at 16, and Kimi
-        // K3's two (896 top 16, its fixture's 8 top 2).
+        // the 320-expert instance's, then the three 128-expert ones (top 4, top
+        // 6, top 8), then the 256-expert top-6 row, Muse Spark's fixture at 16,
+        // and Kimi K3's two (896 top 16, its fixture's 8 top 2).
         let widths: Vec<u32> = ROUTERS
             .iter()
             .filter(|r| super::body_eq(r.body, super::RouterBody::BiasedSigmoid))
@@ -1253,7 +1265,7 @@ mod tests {
         assert_eq!(
             widths,
             [
-                288, 256, 240, 304, 368, 432, 496, 320, 128, 128, 256, 16, 896, 8
+                288, 256, 240, 304, 368, 432, 496, 320, 128, 128, 128, 256, 16, 896, 8
             ]
         );
         // Coverage's `routes(n, &[BiasedSigmoid])`: the rule's shapes pass at
@@ -1292,7 +1304,9 @@ mod tests {
     /// The 128-expert sigmoid router (MiniMax-M3: top 4, sigmoid with a
     /// selection bias, renormalized) is the `BiasedSigmoid` row at 128: four
     /// experts a lane, its pick range 4 only. The `Dflash` row also has 128
-    /// experts, under another rule and body: the rule picks the row.
+    /// experts, under another rule and body: the rule picks the row. The top-8
+    /// count is Inkling 2's own row; the counts none of the three holds are
+    /// refused.
     #[test]
     fn sigmoid_128_4_router_is_its_row() {
         let rule = rules::BIASED_SIGMOID;
@@ -1302,10 +1316,14 @@ mod tests {
         assert!(r.at.contains("sigmoid_128_4_router"), "{}", r.at);
         assert_eq!(router_row(super::RouterBody::BiasedSigmoid, 128), r);
         assert!(router_row_is(r, rule, false, (4, 4)));
-        for top_k in [3, 5, 8, 9] {
+        for top_k in [3, 5, 9] {
             let x = select_router(moe(rule, 128, top_k)).expect_err("128 at another top k");
             assert_eq!(x.why, Refusal::TopK { min: 4, max: 4 }, "{top_k}");
         }
+        assert!(
+            select_router(moe(rule, 128, 8))
+                .is_ok_and(|row| row.at.contains("sigmoid_128_8_router"))
+        );
         let dflash = select_router(moe(rules::BIASED_SQRT_SOFTPLUS, 128, 3)).expect("dflash");
         assert_eq!(dflash.body, super::RouterBody::Dflash);
     }
@@ -1325,6 +1343,28 @@ mod tests {
         assert_eq!(router_row_k(super::RouterBody::BiasedSigmoid, 128, 4), mm);
         let x = select_router(moe(rule, 128, 5)).expect_err("128 at top 5");
         assert!(matches!(x.why, Refusal::TopK { .. }), "{x}");
+    }
+
+    /// The biased sigmoid at 128 experts and top 8 (Inkling 2's) is its own row
+    /// beside the other two pick counts at 128: the rule of the top-6 row at
+    /// the top-8 count, its kept scores scaled by the file's route scale at the
+    /// launch. Top 7 matches none of the three pick ranges and is refused.
+    #[test]
+    fn sigmoid_128_8_router_is_its_row_beside_the_other_128s() {
+        let rule = rules::BIASED_SIGMOID;
+        let inkling = select_router(moe(rule, 128, 8)).expect("no router row at 128/8");
+        assert!(
+            inkling.at.contains("sigmoid_128_8_router"),
+            "{}",
+            inkling.at
+        );
+        assert!(router_row_is(inkling, rule, false, (8, 8)));
+        assert_eq!(
+            router_row_k(super::RouterBody::BiasedSigmoid, 128, 8),
+            inkling
+        );
+        let e = select_router(moe(rule, 128, 7)).expect_err("128 at top 7");
+        assert!(matches!(e.why, Refusal::TopK { .. }), "{e}");
     }
 
     /// The biased sigmoid at 256 experts and top 6 is its own row, after

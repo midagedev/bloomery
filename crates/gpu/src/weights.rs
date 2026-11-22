@@ -631,6 +631,47 @@ impl Weights {
         }
     }
 
+    /// Split the resident fused w13 stack `name` — every expert
+    /// `2 · rows_half` rows, its gate rows above its up rows — into the gate
+    /// and up stacks [`crate::w13_split::split_w13`] writes, filed under the
+    /// derived names [`crate::w13_split::gate_of`] and
+    /// [`crate::w13_split::up_of`] build and returned, in the stack's own
+    /// resident form. The fused stack leaves the map and its buffers are
+    /// freed, so nothing is resident twice; the halves' device copies are
+    /// synchronized before they are. A stack of another form, not whole
+    /// experts of that many rows, a name that is not resident, a stack held
+    /// as a room and a derived name already resident are each refused by
+    /// name. Load-time only.
+    pub fn split_fused_w13(
+        &mut self,
+        stream: &CudaStream,
+        name: &str,
+        rows_half: usize,
+    ) -> Result<(String, String), GpuError> {
+        self.refuse_roomed(crate::w13_split::WHAT, &[name])?;
+        let (gate, up) = (
+            crate::w13_split::gate_of(name),
+            crate::w13_split::up_of(name),
+        );
+        derived_slot_free(&self.by_name, &gate)?;
+        derived_slot_free(&self.by_name, &up)?;
+        let Some(fused) = self.get(name) else {
+            return Err(GpuError::tensor(
+                crate::w13_split::WHAT,
+                name,
+                "a resident weight",
+            ));
+        };
+        let halves = crate::w13_split::split_w13(stream, (fused, name), rows_half)?;
+        // The halves' copies read the fused stack's buffers: drain them
+        // before it leaves the map and drops.
+        stream.synchronize()?;
+        self.by_name.remove(name);
+        self.by_name.insert(gate.clone(), halves.0);
+        self.by_name.insert(up.clone(), halves.1);
+        Ok((gate, up))
+    }
+
     /// [`Weights::load_where`], and with `tied` the token embedding is also the head
     /// ([`Weights::get`]); each tensor in the format `card` gives it ([`Weights::load_as`]).
     fn load_named(

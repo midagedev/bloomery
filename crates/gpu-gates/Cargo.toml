@@ -1028,3 +1028,11 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_inkling2_step"
 required-features = ["gpu"]
+
+# inkling2-moe: Inkling 2's routed block on the card (gate_inkling2_moe's doc): the biased sigmoid
+# router at 128 experts and the top 8, the fused w13 split at upload and the NVFP4 and Q8_0 expert
+# legs under situ at the file's betas, against the oracle node dumps of whichever tier this run
+# holds (the fixture sets fx_ref_inkling2_*, the Mini's ref_inkling2_*).
+[[bin]]
+name = "gate_inkling2_moe"
+required-features = ["gpu"]
