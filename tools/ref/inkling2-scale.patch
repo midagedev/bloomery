@@ -1,0 +1,60 @@
+commit a1f4222608594c57202fdaa6a45dca1ef05abc62
+Author: Daniel Han <danielhanchen@gmail.com>
+Date:   Fri Nov 20 04:11:28 2026 -0800
+
+    model : load ffn_gate_up_exps scales (#32657)
+    
+    * model: load `ffn_gate_up_exps` scales
+    
+    The generic scale pass loads per-expert scales for ffn_gate_exps,
+    ffn_up_exps and ffn_down_exps but not for the merged ffn_gate_up_exps.
+    Load ~ffn_gate_up_exps_s there~ and expose it as ffn_up_exps_s ~when the layer
+    has no separate up tensor,~ since build_moe_ffn applies up_exps_s to the
+    merged gate_up output. Inkling 2 now passes the expert scales to
+    build_moe_ffn like the other MoE models.
+    
+    * Update src/llama-model.cpp
+    
+    Co-authored-by: Sigbjørn Skjæret <sigbjorn.skjaeret@huggingface.co>
+    
+    * Update src/llama-model.h
+    
+    Co-authored-by: Sigbjørn Skjæret <sigbjorn.skjaeret@huggingface.co>
+    
+    ---------
+    
+    Co-authored-by: Sigbjørn Skjæret <sigbjorn.skjaeret@huggingface.co>
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 629b3a7a6..ec0820a07 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1911,6 +1911,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
+                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
++                if (layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
++                    throw std::runtime_error(format("ffn_up_exps.scale and ffn_gate_up_exps.weight both exist for layer %d", i));
++                }
++            }
++            if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
++                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+             }
+ 
+             // recurrent / linear-attention weight scales (per-tensor, shape {1})
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 3ba20ffe8..ca25c1d53 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -372,7 +372,10 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+                 LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
+                 il,
+                 nullptr,
+-                layer.ffn_gate_up_exps);
++                layer.ffn_gate_up_exps,
++                layer.ffn_up_exps_s,
++                layer.ffn_gate_exps_s,
++                layer.ffn_down_exps_s);
+ 
+         cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
+         cb(cur, "ffn_out", il);

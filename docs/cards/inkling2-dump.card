@@ -1,0 +1,20 @@
+# Inkling 2's real-file node dumps (refset family lcpp-inkling2): `just dump-ref-inkling2` on the Mini's UD-Q4_K_XL file (17.6 GB, one shard,
+# 48 visits over 24 stored layers, the looped core [6, 18) three passes) runs the patched llama.cpp PR #32695 tree (CPU only) over the
+# five prompts of tools/ref/data/inkling2 (35, 35, 39, 5 and 1,038 ids) from ONE load, into ref_inkling2_{a..e}, 32 greedy tokens each.
+# Predicted wall [derived], seconds:
+#   load      17.6 GB mapped lazily; the smoke of 2026-11-22 (llama-completion, 32 threads, cache warm from the earlier smoke) took
+#             12.6 s wall to its first token, its perf block naming 160 ms of load — the rest is paging and graph build: 10-15 s
+#   prefill   1,152 ids x 48 visits x ~90 MMAC (the dense block 26 M, the 8 experts of ff 1,152 64 M) ~ 4.3 GMAC a token, ~9 TFLOP;
+#             the smoke's 5-id prompt ran 31.9 ms a token: 10-37 s
+#   greedy    160 tokens, each reading ~19 GB of active weights (48 visits of dense + 8 experts + the 0.49 GB head) through the page
+#             cache; the smoke measured 68.7 ms a token: ~11 s
+#   writes    the taps' f32 files, ~10-11 GB (e's kq_b is ~103 MB a windowed visit's ubatch over 40 windowed visits, plus the
+#             per-visit taps at 1,038 positions): 10-25 s
+#   total     35-90 s, bound 1800 s. The term derivation cannot fix is the write rate of the two big sets (a's every-tap and e's
+#   window); a run past 3 minutes means a cold file or a stalled write: read the dumper's per-prompt seconds before trusting the
+#   sets' timing, not their bytes.
+kind: exclusive
+reason: inkling2_dump runs the patched llama.cpp tree on 32 CPU threads over the real file; beside a timed run or a gate batch it would
+  take their cores and page cache, so it holds the lease; why now: the family's real sets, the reference the Mini's card rounds are
+  judged against (round ink2r3's resumed half)
+minutes: 0.6..2

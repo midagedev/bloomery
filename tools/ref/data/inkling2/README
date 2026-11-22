@@ -1,0 +1,33 @@
+Inkling 2 oracle prompts: the text of each prompt and its token ids, one decimal id a line, no chat template and no BOS (the file's header states
+tokenizer.ggml.add_bos_token = false, and `inkling2-oracle.sh --prompts` checks llama-tokenize gives the same ids with and without --no-bos before it
+writes a file). A dump of this model's logits takes its ids from here and never tokenizes (tools/ref/cb_dump.cpp): a tokenizer difference would read as
+a kernel bug.
+
+Made once, on the box, by the tokenizer of the family's tree (llama.cpp PR #32695, "convert: register the looped Inkling 2 architecture separately",
+head 6196d9802e0757a5218f16f91d9a6830793ba800, CPU build, no patch, /home/user/llama.cpp-pr32695) on the Mini's UD-Q4_K_XL GGUF (the pre-tokenizer is
+the file's own `inkling2`, the gpt-4o pretokenizer regex; the vocabulary of 200,058 tokens is the unpadded one), by
+`bash crates/tokenizer/tools/inkling2-oracle.sh --prompts tools/ref/data/inkling2`:
+
+    llama-tokenize -m <the Mini's GGUF> -f <text> --ids --no-bos --no-escape --log-disable   # "[id, id, ...]", written one id a line
+
+a, b, c and d are the four prompts every model's dump runs (tools/ref/data/hy4, the same bytes: a the English paragraph, b the Korean one, c the Rust
+function head, d "The capital of France is"); this tokenizer cuts them wider than Hy4-flash's (35, 35, 39 and 5 ids against 32, 31, 30 and 5).
+
+    a  35 ids   English paragraph, cut after "coming home."      txt 139 bytes
+    b  35 ids   Korean paragraph, cut after "단풍이"              txt 97 bytes
+    c  39 ids   Rust function head, cut after `HashMap::new();`  txt 115 bytes
+    d   5 ids   "The capital of France is"                       txt 24 bytes
+    e 1038 ids  the harbor narrative continued to length         txt 4713 bytes
+
+e is the one prompt past the sliding window: the Mini's and the fixture's windowed layers cap at 1,024 keys (attention.sliding_window 1024, and the
+local layers' relative-bias extent is the same 1,024), so e's last 14 positions (1024 through 1037) attend exactly 1,024 keys with their oldest rows
+dropped, while the four global layers (the visits at slots 5, 11, 17 and 23 and their looped copies) attend the whole prefix. It is also the only
+prompt split across ubatches (512 + 512 + 14 at the dumper's -ub 512): the short convolutions' recurrent state and the KV carry across ubatch
+boundaries inside one prefill, and every core visit of passes two and three reads a window its own pass filled. a through d (at most 39 ids) never
+leave the first ubatch or reach the window.
+
+The tree that dumps the sets is the same commit carrying tools/ref/inkling2-scale.patch — upstream master's own a1f422260 ("model : load ffn_gate_up_exps
+scales", #32657), which the PR branch lacks: without it the loader refuses both the Mini's and the fixture's files at the tensor count (their fused NVFP4
+stacks' per-expert `ffn_gate_up_exps.scale` rows are never created). The ids above were made before the patch, from the same commit's tokenizer (the patch
+touches no tokenizer path); the sets (tools/ref/inkling2-dump.sh, ref_inkling2_{a..e} and the fixture's fx_ twins) come from the patched tree, whose build
+line every set names.

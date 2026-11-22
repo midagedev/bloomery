@@ -10,14 +10,18 @@
 #   ssh ws 'cat /root/lcpp-pr27752/pid; tail -n 3 /root/lcpp-pr27752/log; cat /root/lcpp-pr27752/rc'
 #   BLOOMERY_MODEL=glm5next BLOOMERY_CARD=a6000 tools/box.sh 'bash tools/ref/build-lcpp-pr.sh smoke 27752'
 #
-# build <N>: a clone of the local mainline clone /home/user/llama.cpp (its objects shared, `git clone
+# build <N> [cpu]: a clone of the local mainline clone /home/user/llama.cpp (its objects shared, `git clone
 # --shared`) at /home/user/llama.cpp-pr<N>, the PR head fetched from GitHub (`pull/<N>/head`) and
 # checked out detached; the commit goes in the log and the tree's HEAD. Every git and build step runs
 # as the trees' owner `user` (a root-owned object in a shared store blocks that user later). The
 # flags are mainline's: its CMakeCache.txt shows GGML_CUDA=ON, CMAKE_CUDA_ARCHITECTURES=86,
 # LLAMA_CURL=OFF, Release, nvcc from cuda-13.3; every other option at its default, which the log
 # prints beside mainline's for the options that differ. Targets: llama-bench (the timed arms),
-# llama-server (the server and MTP arms), llama-completion (the smoke) and llama-tokenize (its ids). The build runs under
+# llama-server (the server and MTP arms), llama-completion (the smoke) and llama-tokenize (its ids).
+# The `cpu` flavor is the dump-oracle tree instead: the CPU build of the Hy4-flash oracle tree
+# (/home/user/llama.cpp-hy4 — GGML_CUDA=OFF, BUILD_SHARED_LIBS=ON, so the shared dumper links its
+# libllama.so, LLAMA_BUILD_TESTS=OFF, no nvcc, no card) with the smoke's and the tokenizer's CLIs
+# alone as targets (models/inkling2.sh names the tree). The build runs under
 # `taskset -c 0-31 nice -n 19` with 16 jobs and a 30-minute bound, and starts only while the timing
 # lease is free (rc 75): nvcc beside a sitting would tag its rows [cpu-busy]. An existing tree at
 # another commit is refused (rc 65) rather than moved: a moved tree changes rows already timed from
@@ -31,10 +35,10 @@
 # says whether the branch produced it. Not timed and no lease; it loads the whole file (199.7 GB
 # through the mapping, 48.7 GB of it to the card).
 set -uo pipefail
-mode=${1:-} pr=${2:-}
-case $mode:$pr in
-  build:[0-9]* | smoke:[0-9]*) ;;
-  *) echo "usage: build-lcpp-pr.sh build|smoke <PR number>" >&2; exit 64 ;;
+mode=${1:-} pr=${2:-} flavor=${3:-}
+case $mode:$pr:$flavor in
+  build:[0-9]*: | build:[0-9]*:cpu | smoke:[0-9]*:) ;;
+  *) echo "usage: build-lcpp-pr.sh build|smoke <PR number> [cpu]" >&2; exit 64 ;;
 esac
 case $pr in *[!0-9]*) echo "build-lcpp-pr.sh: the PR is a number, got '$pr'" >&2; exit 64 ;; esac
 TREE=/home/user/llama.cpp-pr$pr
@@ -116,17 +120,28 @@ echo "build-lcpp-pr: HEAD $(ugit log -1 --format='%H %cI %s')"
 echo "build-lcpp-pr: mainline's command-line options ($MAINLINE/build/CMakeCache.txt):"
 grep -E ':UNINITIALIZED=|^GGML_CUDA:BOOL=|^CMAKE_BUILD_TYPE:|^CMAKE_CUDA_COMPILER:' "$MAINLINE/build/CMakeCache.txt" | sed 's/^/    /'
 t0=$(date +%s)
-as_user cmake -S "$TREE" -B "$TREE/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_CURL=OFF \
-  -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_COMPILER=$NVCC" || fail "cmake configure failed"
+targets="llama-bench llama-completion llama-tokenize llama-server"
+if [ "$flavor" = cpu ]; then
+  as_user cmake -S "$TREE" -B "$TREE/build" -DGGML_CUDA=OFF -DLLAMA_CURL=OFF -DBUILD_SHARED_LIBS=ON \
+    -DLLAMA_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release || fail "cmake configure failed"
+  targets="llama-completion llama-tokenize"
+else
+  as_user cmake -S "$TREE" -B "$TREE/build" -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_CURL=OFF \
+    -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CUDA_COMPILER=$NVCC" || fail "cmake configure failed"
+fi
 echo "build-lcpp-pr: options that differ from mainline's cache:"
 comm -13 <(grep -E '^(GGML|LLAMA)_[A-Z0-9_]+:[A-Z]+=' "$MAINLINE/build/CMakeCache.txt" | sort) \
   <(grep -E '^(GGML|LLAMA)_[A-Z0-9_]+:[A-Z]+=' "$TREE/build/CMakeCache.txt" | sort) | sed 's/^/    /'
 rc=0
+# shellcheck disable=SC2086 # the flavor's target list is one string of plain words
 lease_bounded 1800 taskset -c 0-31 nice -n 19 sudo -u user env HOME=/home/user "PATH=$USER_PATH" \
-  cmake --build "$TREE/build" --config Release -j 16 --target llama-bench llama-completion llama-tokenize llama-server || rc=$?
+  cmake --build "$TREE/build" --config Release -j 16 --target $targets || rc=$?
 echo "build-lcpp-pr: build rc $rc in $(($(date +%s) - t0)) s, end $(now)"
 if [ "$rc" = 0 ]; then
-  md5sum "$TREE/build/bin/llama-bench" "$TREE/build/bin/llama-completion" "$TREE/build/bin/llama-tokenize" "$TREE/build/bin/llama-server"
-  "$TREE/build/bin/llama-bench" --help 2>&1 | grep -E -- '-n-cpu-moe|-nopo|--no-op-offload' | head -n 3
+  # shellcheck disable=SC2086 # as above
+  md5sum $(for t in $targets; do printf '%s/build/bin/%s ' "$TREE" "$t"; done)
+  if [ "$flavor" != cpu ]; then
+    "$TREE/build/bin/llama-bench" --help 2>&1 | grep -E -- '-n-cpu-moe|-nopo|--no-op-offload' | head -n 3
+  fi
 fi
 echo "$rc" > "$DIR/rc"

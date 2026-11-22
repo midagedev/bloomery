@@ -18,6 +18,7 @@ pub mod gemma_embedding;
 pub mod gemma_embedding2;
 pub mod glm5next;
 pub mod hy4;
+pub mod inkling2;
 pub mod kimi_k3;
 pub mod lfm3;
 pub mod llama;
@@ -66,6 +67,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (mistrallarge4::ARCH, mistrallarge4::FAMILIES),
     (kimi_k3::ARCH, kimi_k3::FAMILIES),
     (hy4::ARCH, hy4::FAMILIES),
+    (inkling2::ARCH, inkling2::FAMILIES),
     (exaone_moe::ARCH, exaone_moe::FAMILIES),
     (tokenizer::ARCH, tokenizer::FAMILIES),
     (dequant::ARCH, dequant::FAMILIES),
@@ -526,6 +528,7 @@ mod tests {
             ("fx-lcpp-mistrallarge4", 2),
             ("fx-lcpp-kimi-k3", 4),
             ("fx-lcpp-hy4", 5),
+            ("fx-lcpp-inkling2", 5),
         ];
         let mut found: Vec<&str> = all()
             .filter(|f| f.name.starts_with("fx-") && !STANDALONE.contains(&f.name))

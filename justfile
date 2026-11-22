@@ -4640,6 +4640,32 @@ gate-raon1-meta:
 gate-inkling2-meta:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::inkling2 arch::place_hybrid arch::registry arch::rules --nocapture && bash tools/gate.sh --release -p bloomery-model --test inkling2_meta -- --ignored --nocapture'
 
+# --- inkling2-ref (Inkling 2's oracle: the patched PR tree and its node dumps) --------------------------------------------------------
+# Inkling 2's oracle tree: llama.cpp PR #32695 at its head 6196d9802 (the naming the Mini's file uses) carrying tools/ref/inkling2-scale.patch —
+# upstream master's own a1f422260 ("model : load ffn_gate_up_exps scales", #32657) unedited, which the PR branch lacks: without it the loader
+# refuses both the Mini's and the fixture's files at the tensor count. The CPU build (the Hy4-flash oracle tree's backend), in its own directory
+# /home/user/llama.cpp-pr32695-scale — the unpatched /home/user/llama.cpp-pr32695 (build-lcpp-pr.sh `build 32695 cpu`) stays at the plain head —
+# by the Qwen tree's script (tools/ref/qvis/build-lcpp-qvis.sh) with the pin, tree, sentinel directory, patch and targets by environment; detached,
+# pid, log and rc under /root/lcpp-pr32695-scale.
+build-inkling2-lcpp:
+    BLOOMERY_BOX_ENV='LCPP_BUILD_PIN=6196d9802e0757a5218f16f91d9a6830793ba800 LCPP_BUILD_TREE=/home/user/llama.cpp-pr32695-scale LCPP_BUILD_DIR=/root/lcpp-pr32695-scale LCPP_BUILD_PATCH=tools/ref/inkling2-scale.patch LCPP_BUILD_CPU_ONLY=1 LCPP_BUILD_TARGETS=llama,mtmd,llama-common,llama-completion,llama-tokenize' ./tools/box.sh '[ "$(id -u)" = 0 ] || { echo "build-inkling2-lcpp: this recipe requires root on the box (/root/lcpp-pr32695-scale and /home/user)" >&2; exit 2; }; setsid -f bash tools/ref/qvis/build-lcpp-qvis.sh </dev/null >/dev/null 2>&1'
+
+# inkling2_dump (the shared tools/ref/cb_dump.cpp) linked against that tree, whose tracked changes must be exactly the patch; tools/ref/
+# inkling2-dump-build.sh is the call, the binary and its build record land in $BLOOMERY_DATA/bin. No lease: a g++ link of one file, seconds.
+inkling2-dump-build:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=60 BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/inkling2-dump-build.sh'
+
+# The Inkling 2 oracle sets (refset family lcpp-inkling2; tools/ref/inkling2-dump.sh has the layout and the taps): the patched PR tree's forward
+# pass over the five prompts of tools/ref/data/inkling2 from ONE load, into ref_inkling2_{a..e}, each with 32 greedy tokens; prompt e (1,038 ids)
+# is the one past the 1,024 window. BLOOMERY_TIER=fixture dumps the fixture file's twin sets fx_ref_inkling2_{a..e}. Both tiers run under the CPU
+# lease and its card (BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=docs/cards/inkling2-dump.card', the fixture's inkling2-fx-dump.card); DUMP_DRY=1 in
+# that variable prints the dump and stops before the lease. Walls: docs/cards/inkling2-dump.card (the real file, ~41 s) and
+# docs/cards/inkling2-fx-dump.card (the fixture, ~19 s).
+dump-ref-inkling2:
+    BLOOMERY_Q_CARD=none BLOOMERY_Q_PRED_S=90 BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/inkling2-dump.sh'
+
+# --- end inkling2-ref ---
+
 # The raon vocabulary: our ids equal the reference tree's `llama-tokenize` on every case of crates/tokenizer/tests/cases.txt and
 # cases-raon.txt, in both parse modes (the pins are tests/raon-ids.tsv, written by crates/tokenizer/tools/raon-oracle.sh from the
 # krafton-ai llama.cpp tree whose pre-tokenizer `raon` and NFC normalizer exist there only), and the header's two end tokens end

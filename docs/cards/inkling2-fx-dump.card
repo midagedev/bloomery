@@ -1,0 +1,23 @@
+# The Inkling 2 gate fixture's CPU node dumps (thirteen layers of the Mini — the stem block whole, one whole core block, a coda layer of
+# the Q8_0 experts, 25 visits over them, at the real hidden 2,304, the real window and extent 1,024 and the real 200,058-id vocabulary,
+# the experts narrowed to ff 512: 4.98 GB in one shard, /models/fixtures/inkling2), `BLOOMERY_TIER=fixture just dump-ref-inkling2`: the five
+# prompts (35, 35, 39, 5 and 1,038 ids: the four shared texts and the one past the window, cut so its last 14 positions attend exactly
+# 1,024 keys and its prefill splits across ubatches 512 + 512 + 14) from ONE load, into fx_ref_inkling2_{a..e}. The phases run one after
+# the other. Predicted wall [derived from the loader smoke below], seconds:
+#   load      4.98 GB mapped; the smoke of 2026-11-22 (llama-completion, 32 threads, page cache warm from the fixture's gates) paged it
+#             in 3.0 s wall total, its perf block naming 79 ms of load: ~1-4 s
+#   prefill   1,152 ids over 25 visits at ~26 MMAC a visit's dense block and ~38 MMAC its 8 experts + the head on the last row: ~1.6
+#             GMAC a token, ~3.7 TFLOP; the smoke's 5-id prompt ran 15.7 ms a token, so batched: 5-18 s
+#   greedy    160 tokens (32 a prompt); the smoke measured 30.4 ms a token (3.3 GB of active weights a step through the page cache):
+#             ~5 s
+#   writes    the taps' f32 files, ~5 GB (e's kq_b rows are 24 x 1,024 x its ubatch's positions x 4 B, ~103 MB a windowed visit's
+#             ubatch): 5-10 s at NVMe write speed
+#   total     15-40 s, bound 1800 s. The term derivation cannot fix is the write rate of e's set; a run past a minute means the host is
+#   contended or the writes stalled: read the dumper's per-prompt lines before the next dump.
+# What the run guarantees: CUDA hidden, the CPU lease held, the staged set installed only when its manifest carries the `# complete`
+# trailer.
+kind: exclusive
+reason: inkling2_dump runs the patched llama.cpp PR #32695 tree on 32 CPU threads; beside a timed run or a gate batch it would take
+  their cores, so it holds the lease; why now: the fixture's oracle sets the Inkling 2 body gates read, and the first read of whether
+  the patched tree (the loader fix the PR branch lacks) opens the family's fixture at all (round ink2r3)
+minutes: 0.2..1
