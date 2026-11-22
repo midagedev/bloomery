@@ -1,16 +1,17 @@
-// The M-row mat-vec family: one weight read multiplied into M = 2 activation
-// rows, the shape a speculative verify of one proposed id needs — each weight
-// row's block is loaded and unpacked once and dotted into both activation rows
-// (Q::partial_rows), where running the 1-row kernel twice reads the weights
-// twice and the prompt-rows GEMM reads a 64-row tile's worth. The kernels are
-// written over M; the entries instantiate M = 2, under the names the host
-// launches:
+// The M-row mat-vec family: one weight read multiplied into M = 2..8
+// activation rows, the shape a speculative verify of up to seven proposed ids
+// needs — each weight row's block is loaded and unpacked once and dotted into
+// every activation row (Q::partial_rows), where running the 1-row kernel M
+// times reads the weights M times and the prompt-rows GEMM reads a 64-row
+// tile's worth. The kernels are written over M; the entries instantiate each M
+// from 2 to 8 for A4 and A8, under the names the host launches (`m<M>` the
+// row count):
 //
-//   a4_matvec_resid_m2        y[m, r] += W[r, :] . x[m, :], in place
-//   a4_matvec_seg_m2          the row segments of up to four tensors, the
+//   <q>_matvec_resid_m<M>     y[m, r] += W[r, :] . x[m, :], in place
+//   <q>_matvec_seg_m<M>       the row segments of up to four tensors, the
 //                             norm on the load, per activation row
-//   a4_matvec_seg_scaled_m2, a4_pair_swiglu_scaled_m2,
-//   a4_head_logits_scaled_m2  the segmented mat-vec, the gate-up pair with its
+//   <q>_matvec_seg_scaled_m<M>, <q>_pair_swiglu_scaled_m<M>,
+//   <q>_head_logits_scaled_m<M>  the segmented mat-vec, the gate-up pair with its
 //                             SwiGLU epilogue (y[m, slot, o] = silu(gate_o . x[m])
 //                             * (up_o . x[m])) and the head's logits (one row
 //                             of logits an activation row; the pick is
@@ -18,12 +19,13 @@
 //                             over inputs the join already normed: M rows of
 //                             x . gain and M scale words (SCALED, the 1-row
 //                             scaled entries' rule)
-//   a4_matvec_headnorm_m2     the gated delta net's out projection: the
+//   <q>_matvec_headnorm_m<M>  the gated delta net's out projection: the
 //                             head-normed residual mat-vec, each row's head
 //                             scales computed from its own partial sums
-//   a4_norm_next_m            the plain residual's hand-on over M rows: each
-//                             row times the next launch's gain, and that
-//                             launch's scale a row, the 1-row norm_next's bits
+//   <q>_norm_next_m           the plain residual's hand-on over M rows (M a
+//                             launch word): each row times the next launch's
+//                             gain, and that launch's scale a row, the 1-row
+//                             norm_next's bits
 //
 // THE ORDER IS THE GATE. Activation row m of any entry here is the 1-row
 // kernel's bits on row m's input alone (matvec_q4k.metal's matvec_rows, its
@@ -43,6 +45,9 @@
 // row m's dots are scaled by scale word m and raised as the norm's, the 1-row
 // SCALED entries' own rule, row by row.
 //
+// The rows are taken in passes of `mrow_pass` rows (`matvec_rows_m`, and the
+// pair's `pair_slot_m`), each pass its own loop over the weights.
+//
 // Every loop over the weight rows and the activation rows is unrolled
 // (FOR_UNROLL): a loop left rolled indexes the lane and sum arrays by its
 // variable, which registers cannot take, and walks the weight rows one after
@@ -57,10 +62,10 @@
 //
 // This file comes after norm.metal, quant.metal, gemm_shared.metal
 // (pair_swiglu), matvec_q4k.metal (simd_first_row) and experts.metal
-// (PairArgs, pair_expert), and instantiates the A4 entries only:
-// the decode owner's partial_rows is A4's, the kind an MLX 4-bit folder of a
-// Bf16 scale pair opens as. Another quant gains the family by gaining
-// partial_rows and instantiating the same bodies.
+// (PairArgs, pair_expert), and instantiates the A4 and A8 entries (the MLX
+// 4-bit and 8-bit folders of a Bf16 scale pair): a quant gains the family by
+// gaining load_rows, words_of, partial_rows and partial_head_rows in its
+// decode owner and instantiating the same bodies.
 
 #include <metal_stdlib>
 
@@ -97,13 +102,59 @@ static_assert(sizeof(SegMArgs) == 20 + 16 * BLOOMERY_MATVEC_MAX_SEGMENTS,
 
 // The weight rows a SIMD group owns in the M-row entries: the geometry's
 // count, as in the 1-row entries (simd_first_row names the first), and the
-// host launches the same count. More activation rows than the family's two
-// would hold more live input values a lane, and each weight row it owns needs
-// registers too (a spilled register is a device-memory round trip every
-// block). The pair's gate rows a SIMD group owns are half of them, each with
-// its up row.
+// host launches the same count. Each activation row of a pass holds sixteen
+// live input values and a sum a lane, and each weight row a lane owns holds a
+// running sum a row, so the registers grow with the rows of a pass
+// (`mrow_pass`). The pair's gate rows a SIMD group owns are half of them, each
+// with its up row.
 constexpr short mrow_nr0() {
     return BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP;
+}
+
+// One block's dots for the pass's M activation rows: the rows loaded by the
+// same lane map into their own registers (Q::load_rows), each weight row's
+// words (already loaded, shared by every row) dotted into them
+// (Q::partial_rows, or partial_head_rows with the rows' head scales).
+template <typename Q, short M, bool NORM, bool HEADNORM>
+inline void mrow_walk(const thread typename Q::Words (&wd)[BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP],
+                      thread float (&sumf)[BLOOMERY_MATVEC_ROWS_PER_SIMD_GROUP][M],
+                      thread float * sum_sq,
+                      device const float * xp,
+                      long row_span,
+                      device const float * gp,
+                      device atomic_uint * faults,
+                      uint layer,
+                      threadgroup const float * scales,
+                      int ib,
+                      const thread typename Q::Lane & lane) {
+    constexpr short NR0 = mrow_nr0();
+    typename Q::Lane lanes[M];
+    FOR_UNROLL (short i = 0; i < M; ++i) {
+        lanes[i] = lane;
+    }
+    Q::template load_rows<NORM ? LOAD_NORM : LOAD_PLAIN, M>(lanes, xp, row_span, gp, sum_sq);
+    if constexpr (HEADNORM) {
+        // A value a row's numerator cannot carry, or a group sum that
+        // left the finite range: the gate's site is raised, and the sums
+        // it is in are not finite either, so the rows are NaN.
+        FOR_UNROLL (short i = 0; i < M; ++i) {
+            if (!Q::sums_finite(lanes[i])) {
+                raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
+            }
+        }
+        // The block's head scale of each row, the 1-row arm's own ask.
+        float lo[M];
+        FOR_UNROLL (short i = 0; i < M; ++i) {
+            lo[i] = Q::head_scales(scales + i * BLOOMERY_DELTA_VALUE_HEADS, ib).x;
+        }
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);
+        }
+    } else {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            Q::template partial_rows<M>(wd[row], lanes, sumf[row]);
+        }
+    }
 }
 
 // The M-row row loop: matvec_rows' walk over the weight rows a SIMD group
@@ -113,7 +164,7 @@ constexpr short mrow_nr0() {
 // first is used, and no register array is indexed by a loop variable.
 template <typename Q, short M, bool NORM, bool RESID, bool ROW_RAISE = true,
           bool SCALED = false, bool HEADNORM = false>
-inline void matvec_rows_m(device const typename Q::Block * W,
+inline void matvec_rows_m_pass(device const typename Q::Block * W,
                           device const float      * x,
                           device float            * y,
                           int nblocks,
@@ -148,10 +199,6 @@ inline void matvec_rows_m(device const typename Q::Block * W,
     }
 
     const typename Q::Lane lane = Q::lane_of(tiisg);
-    typename Q::Lane lanes[M];
-    FOR_UNROLL (short m = 0; m < M; ++m) {
-        lanes[m] = lane;
-    }
     float sumf[NR0][M];
     FOR_UNROLL (short r = 0; r < NR0; ++r) {
         FOR_UNROLL (short m = 0; m < M; ++m) {
@@ -174,29 +221,8 @@ inline void matvec_rows_m(device const typename Q::Block * W,
         FOR_UNROLL (short row = 0; row < NR0; ++row) {
             wd[row] = Q::words_of(rp[row][ib], lane);
         }
-        Q::template load_rows<NORM ? LOAD_NORM : LOAD_PLAIN, M>(lanes, xp, row_span, gp, sum_sq);
-        if constexpr (HEADNORM) {
-            // A value a row's numerator cannot carry, or a group sum that
-            // left the finite range: the gate's site is raised, and the sums
-            // it is in are not finite either, so the rows are NaN.
-            FOR_UNROLL (short m = 0; m < M; ++m) {
-                if (!Q::sums_finite(lanes[m])) {
-                    raise(faults, layer, BLOOMERY_FAULT_SITE_LINEAR_GATE);
-                }
-            }
-            // The block's head scale of each row, the 1-row arm's own ask.
-            float lo[M];
-            FOR_UNROLL (short m = 0; m < M; ++m) {
-                lo[m] = Q::head_scales(scales + m * BLOOMERY_DELTA_VALUE_HEADS, ib).x;
-            }
-            FOR_UNROLL (short row = 0; row < NR0; ++row) {
-                Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);
-            }
-        } else {
-            FOR_UNROLL (short row = 0; row < NR0; ++row) {
-                Q::template partial_rows<M>(wd[row], lanes, sumf[row]);
-            }
-        }
+        mrow_walk<Q, M, NORM, HEADNORM>(wd, sumf, sum_sq, xp, row_span, gp, faults, layer,
+                                           scales, ib, lane);
         xp += Q::block_stride() * Q::values_per_block();
         if (NORM) {
             gp += Q::block_stride() * Q::values_per_block();
@@ -250,6 +276,59 @@ inline void matvec_rows_m(device const typename Q::Block * W,
                 }
             }
         }
+    }
+}
+
+// The activation rows one pass walks the weights for: two. A pass holds each
+// of its rows' sixteen input values, running sums and accumulators beside the
+// weight rows' decoded codes, and a pass of three rows runs the plain loop
+// several times slower than a pass of two on the Apple GPU (the registers a
+// thread holds bound its occupancy, however few instructions the third row
+// adds), the pair and the segments' slower still. A launch of more rows is
+// taken in passes of this many, the last the remainder, each its own loop over
+// the weights (a cache read the second time): a row's arithmetic is the same
+// operations in the same order whatever its pass, so the pass size changes no
+// bit.
+#ifndef BLOOMERY_MROW_PASS
+#define BLOOMERY_MROW_PASS 2
+#endif
+constexpr short mrow_pass() {
+    return BLOOMERY_MROW_PASS;
+}
+
+// The M-row row loop over M rows in passes of `mrow_pass()`: each pass is
+// matvec_rows_m_pass over its rows, the activations, the outputs, the join's
+// scale words and the head scales offset to the pass's first row (the norm's
+// gain is every row's, shared).
+template <typename Q, short M, bool NORM, bool RESID, bool ROW_RAISE = true,
+          bool SCALED = false, bool HEADNORM = false>
+inline void matvec_rows_m(device const typename Q::Block * W,
+                          device const float      * x,
+                          device float            * y,
+                          int nblocks,
+                          float eps,
+                          uint layer,
+                          device const float      * gain,
+                          device atomic_uint      * faults,
+                          int first_row,
+                          int rows,
+                          uint out_stride,
+                          ushort tiisg,
+                          threadgroup const float * scales = nullptr) {
+    constexpr short G = mrow_pass();
+    if constexpr (M <= G) {
+        matvec_rows_m_pass<Q, M, NORM, RESID, ROW_RAISE, SCALED, HEADNORM>(
+            W, x, y, nblocks, eps, layer, gain, faults, first_row, rows, out_stride, tiisg,
+            scales);
+    } else {
+        matvec_rows_m_pass<Q, G, NORM, RESID, ROW_RAISE, SCALED, HEADNORM>(
+            W, x, y, nblocks, eps, layer, gain, faults, first_row, rows, out_stride, tiisg,
+            scales);
+        const long row_span = (long)nblocks * (long)Q::values_per_block();
+        matvec_rows_m<Q, M - G, NORM, RESID, ROW_RAISE, SCALED, HEADNORM>(
+            W, x + (long)G * row_span, y + (ulong)G * out_stride, nblocks, eps, layer,
+            SCALED ? gain + G : gain, faults, first_row, rows, out_stride, tiisg,
+            HEADNORM ? scales + G * BLOOMERY_DELTA_VALUE_HEADS : scales);
     }
 }
 
@@ -394,8 +473,31 @@ kernel void matvec_headnorm_m_kernel(device const typename Q::Block * W [[buffer
 // `gain` binds its M scale words (matvec_rows_m's SCALED): the load is the
 // plain one and the dots are scaled as the norm's, row m's bits the 1-row
 // scaled pair's.
+// One block's dots of the pair's weight rows for the pass's M activation
+// rows: the rows loaded into their own registers by the same lane map and
+// dotted against every gate and up row's words.
 template <typename Q, short M>
-inline void pair_slot_m(device const typename Q::Block * gate,
+inline void pair_walk(const thread typename Q::Words (&wg)[mrow_nr0() / 2],
+                      const thread typename Q::Words (&wu)[mrow_nr0() / 2],
+                      thread float (&sumg)[mrow_nr0() / 2][M],
+                      thread float (&sumu)[mrow_nr0() / 2][M],
+                      device const float * xp,
+                      long row_span,
+                      const thread typename Q::Lane & lane) {
+    constexpr short OUTS = mrow_nr0() / 2;
+    typename Q::Lane lanes[M];
+    FOR_UNROLL (short i = 0; i < M; ++i) {
+        lanes[i] = lane;
+    }
+    Q::template load_rows<LOAD_PLAIN, M>(lanes, xp, row_span, nullptr, nullptr);
+    FOR_UNROLL (short o = 0; o < OUTS; ++o) {
+        Q::template partial_rows<M>(wg[o], lanes, sumg[o]);
+        Q::template partial_rows<M>(wu[o], lanes, sumu[o]);
+    }
+}
+
+template <typename Q, short M>
+inline void pair_slot_m_pass(device const typename Q::Block * gate,
                         device const typename Q::Block * up,
                         device const float * x,
                         device const float * gain,
@@ -407,10 +509,6 @@ inline void pair_slot_m(device const typename Q::Block * gate,
                         ushort tiisg) {
     constexpr short OUTS = mrow_nr0() / 2;
     const typename Q::Lane lane = Q::lane_of(tiisg);
-    typename Q::Lane lanes[M];
-    FOR_UNROLL (short m = 0; m < M; ++m) {
-        lanes[m] = lane;
-    }
     float sumg[OUTS][M];
     float sumu[OUTS][M];
     FOR_UNROLL (short o = 0; o < OUTS; ++o) {
@@ -441,11 +539,7 @@ inline void pair_slot_m(device const typename Q::Block * gate,
             wg[o] = Q::words_of(grow[o][ib], lane);
             wu[o] = Q::words_of(urow[o][ib], lane);
         }
-        Q::template load_rows<LOAD_PLAIN, M>(lanes, xp, row_span, nullptr, nullptr);
-        FOR_UNROLL (short o = 0; o < OUTS; ++o) {
-            Q::template partial_rows<M>(wg[o], lanes, sumg[o]);
-            Q::template partial_rows<M>(wu[o], lanes, sumu[o]);
-        }
+        pair_walk<Q, M>(wg, wu, sumg, sumu, xp, row_span, lane);
         xp += Q::block_stride() * Q::values_per_block();
     }
 
@@ -463,6 +557,33 @@ inline void pair_slot_m(device const typename Q::Block * gate,
                     pair_swiglu(g, u);
             }
         }
+    }
+}
+
+// The pair over M rows in passes of `mrow_pass()` rows (a pass's registers
+// are matvec_rows_m's bound): each pass is pair_slot_m_pass over its rows, the
+// activations, the scale words and the outputs offset to its first row, the
+// slot's weights read again.
+template <typename Q, short M>
+inline void pair_slot_m(device const typename Q::Block * gate,
+                        device const typename Q::Block * up,
+                        device const float * x,
+                        device const float * gain,
+                        device float * y,
+                        constant PairArgs & args,
+                        uint nblocks,
+                        uint slot,
+                        int row0,
+                        ushort tiisg) {
+    constexpr short G = mrow_pass();
+    if constexpr (M <= G) {
+        pair_slot_m_pass<Q, M>(gate, up, x, gain, y, args, nblocks, slot, row0, tiisg);
+    } else {
+        pair_slot_m_pass<Q, G>(gate, up, x, gain, y, args, nblocks, slot, row0, tiisg);
+        const long row_span = (long)nblocks * (long)Q::values_per_block();
+        pair_slot_m<Q, M - G>(gate, up, x + (long)G * row_span, gain + G,
+                              y + (ulong)BLOOMERY_EXPERT_SLOTS * args.stride * G, args, nblocks,
+                              slot, row0, tiisg);
     }
 }
 
@@ -579,12 +700,30 @@ kernel void pair_swiglu_m_kernel(device const typename Q::Block * gate [[buffer(
                                                ushort tiisg [[thread_index_in_simdgroup]],\
                                                ushort sgitg [[simdgroup_index_in_threadgroup]]);
 
-MROW_MATVEC_ENTRY("a4_matvec_resid_m2", A4, block_mlx_a4, 2)
-MROW_SEG_ENTRY("a4_matvec_seg_m2", A4, block_mlx_a4, 2, false)
-MROW_SEG_ENTRY("a4_matvec_seg_scaled_m2", A4, block_mlx_a4, 2, true)
-MROW_PAIR_ENTRY("a4_pair_swiglu_scaled_m2", A4, block_mlx_a4, 2)
-MROW_HEAD_ENTRY("a4_head_logits_scaled_m2", A4, block_mlx_a4, 2)
-MROW_HEADNORM_ENTRY("a4_matvec_headnorm_m2", A4, block_mlx_a4, 2)
+// One quant's six entries at one M, under the names the host launches:
+// `<quant>_<entry>_m<M>`.
+#define MROW_ENTRIES(PFX, Q, BQ, M)                                                     \
+    MROW_MATVEC_ENTRY(PFX "_matvec_resid_m" #M, Q, BQ, M)                               \
+    MROW_SEG_ENTRY(PFX "_matvec_seg_m" #M, Q, BQ, M, false)                             \
+    MROW_SEG_ENTRY(PFX "_matvec_seg_scaled_m" #M, Q, BQ, M, true)                       \
+    MROW_PAIR_ENTRY(PFX "_pair_swiglu_scaled_m" #M, Q, BQ, M)                           \
+    MROW_HEAD_ENTRY(PFX "_head_logits_scaled_m" #M, Q, BQ, M)                           \
+    MROW_HEADNORM_ENTRY(PFX "_matvec_headnorm_m" #M, Q, BQ, M)
+
+// One instance a row count, 2 to 8: the row count sizes the registers a lane
+// holds (M inputs' sixteen values and sums, NR0 x M running sums), so a count
+// the launch does not take pays none of a larger count's.
+#define MROW_QUANT(PFX, Q, BQ)  \
+    MROW_ENTRIES(PFX, Q, BQ, 2) \
+    MROW_ENTRIES(PFX, Q, BQ, 3) \
+    MROW_ENTRIES(PFX, Q, BQ, 4) \
+    MROW_ENTRIES(PFX, Q, BQ, 5) \
+    MROW_ENTRIES(PFX, Q, BQ, 6) \
+    MROW_ENTRIES(PFX, Q, BQ, 7) \
+    MROW_ENTRIES(PFX, Q, BQ, 8)
+
+MROW_QUANT("a4", A4, block_mlx_a4)
+MROW_QUANT("a8", A8, block_mlx_a8)
 
 // The plain residual's hand-on over M rows (norm_next_kernel's own body, one
 // threadgroup a row): the stream's row r, which the out projection already
@@ -628,13 +767,18 @@ kernel void norm_next_m_kernel(device const float *x [[buffer(0)]],
     NEXT_NORM_SCALE(Q, x_row, args.cols, (ulong)args.rows * args.cols + row)
 }
 
-template [[host_name("a4_norm_next_m")]]
-kernel void norm_next_m_kernel<A4>(device const float *x [[buffer(0)]],
-                                   device const float *next_gain [[buffer(1)]],
-                                   device float *xn [[buffer(2)]],
-                                   constant NormNextMArgs &args [[buffer(3)]],
-                                   device atomic_uint *faults [[buffer(4)]],
-                                   uint tid [[thread_position_in_threadgroup]],
-                                   uint lane [[thread_index_in_simdgroup]],
-                                   uint sg [[simdgroup_index_in_threadgroup]],
-                                   uint row [[threadgroup_position_in_grid]]);
+#define MROW_NEXT_ENTRY(NAME, Q)                                                        \
+    template [[host_name(NAME)]]                                                        \
+    kernel void norm_next_m_kernel<Q>(device const float *x [[buffer(0)]],              \
+                                      device const float *next_gain [[buffer(1)]],      \
+                                      device float *xn [[buffer(2)]],                   \
+                                      constant NormNextMArgs &args [[buffer(3)]],       \
+                                      device atomic_uint *faults [[buffer(4)]],         \
+                                      uint tid [[thread_position_in_threadgroup]],      \
+                                      uint lane [[thread_index_in_simdgroup]],          \
+                                      uint sg [[simdgroup_index_in_threadgroup]],       \
+                                      uint row [[threadgroup_position_in_grid]]);
+
+MROW_NEXT_ENTRY("a4_norm_next_m", A4)
+MROW_NEXT_ENTRY("a8_norm_next_m", A8)
+

@@ -5,10 +5,13 @@
 //! residual, 24/4 attention heads of 256, a gated delta net of 48 value
 //! heads), so the pair runs at the one dense slot the session runs it at.
 //!
-//! Every shape times two arms over the same weight working set and the same
+//! Every shape times arms over the same weight working set and the same
 //! activation rows: the 1-row launch the session makes (`m=1`) and the M-row
-//! launch at M = 2. A shape's figure is the window arm's median per-dispatch
-//! GPU time, and each shape prints `t(2)/t(1)` beside it. The pair and the
+//! launch at M = 2 to 6 and 8 ([`ROWS_AT`]). A shape's figure is the window
+//! arm's median per-dispatch GPU time, and each shape prints `t(M)/t(1)`
+//! beside it. The plain mat-vec shapes also time the few-row launch (the
+//! matrix units' kernel, band-equal) at the same counts above two, and print
+//! `few` rows of the same ratio. The pair and the
 //! head run their scaled entries, in both arms: the verify and the step read
 //! the join's normed rows, the only form the M-row pair and head have.
 //!
@@ -33,9 +36,9 @@ use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::{FfnAxes, Key, QWEN35MOE_GDN48, QWEN35MOE_GQA6, open_key};
 use bloomery_metal::kernels::{
-    HEAD_SIMD_GROUPS, HeadMParams, HeadNormMParams, HeadNormParams, HeadParams, Kernels, LoadNorm,
-    MROWS, MatvecMParams, MatvecParams, Mode, PARTIALS_PER_HEAD, PairMParams, PairParams, Quant,
-    SIMD_GROUPS_PER_GROUP, SegMParams, SegParams, Segment,
+    FEW_MAX, HEAD_SIMD_GROUPS, HeadMParams, HeadNormMParams, HeadNormParams, HeadParams, Kernels,
+    LoadNorm, MROWS, MatvecFewParams, MatvecMParams, MatvecParams, Mode, PARTIALS_PER_HEAD,
+    PairMParams, PairParams, Quant, SIMD_GROUPS_PER_GROUP, SegMParams, SegParams, Segment,
 };
 
 use super::{
@@ -62,8 +65,12 @@ const DELTA_PARTIALS: usize = 48 * PARTIALS_PER_HEAD;
 
 const QUANT: Quant = Quant::A4;
 
-/// The M the family runs, beside the 1-row arm.
-const M: usize = MROWS;
+/// The row counts timed beside the 1-row arm: the family's two, the middle
+/// of its range and its last.
+const ROWS_AT: [usize; 7] = [1, 2, 3, 4, 5, 6, MROWS];
+
+/// The row counts the few-row launch is timed at, beside the same arm.
+const FEW_AT: [usize; 4] = [4, MROWS, 12, FEW_MAX];
 
 /// The epsilon every normed launch takes.
 const EPS: f32 = 1e-6;
@@ -252,6 +259,20 @@ pub(super) fn selected(only: &[String]) -> bool {
     super::lfm3::names(only, "mrow")
 }
 
+/// Whether the selection times the shape `label`: every shape when the
+/// selection names only `mrow`, else the shapes whose label holds one of its
+/// further tokens (`--only mrow,down`).
+fn wanted(run: &Run, label: &str) -> bool {
+    let filters: Vec<&str> = run
+        .only
+        .iter()
+        .flat_map(|spec| spec.split(','))
+        .map(str::trim)
+        .filter(|tok| *tok != "mrow")
+        .collect();
+    filters.is_empty() || filters.iter().any(|f| label.contains(f))
+}
+
 pub(super) fn main(run: &Run) -> ExitCode {
     let key = Key {
         hidden: HIDDEN as u32,
@@ -292,20 +313,27 @@ pub(super) fn main(run: &Run) -> ExitCode {
         }
     };
     println!(
-        "info\tinstrument=development-loop\tdevice={}\tlib={}\tbackend={}\tinstance={instance}\ttrials={}\tmrows=1,{M}",
+        "info\tinstrument=development-loop\tdevice={}\tlib={}\tbackend={}\tinstance={instance}\ttrials={}\tmrows={}",
         info.name,
         device.library().path().name(),
         <MetalDevice as Device>::BACKEND,
         run.trials,
+        ROWS_AT.map(|m| m.to_string()).join(","),
     );
 
     print_pipelines(&device);
 
     let mut failed = false;
-    // The window arm's median of each (shape, arm): [m=1, m=M].
-    let mut medians: [Vec<Option<f64>>; 2] = Default::default();
+    // The window arm's median of each (shape, arm): a row of `ROWS_AT`.
+    let mut medians: [Vec<Option<f64>>; ROWS_AT.len()] = Default::default();
     for (at, shape) in SHAPES.iter().enumerate() {
         let label = shape.label();
+        if !wanted(run, &label) {
+            for row in &mut medians {
+                row.push(None);
+            }
+            continue;
+        }
         let bufs = match shape_bufs(&device, shape, at as u64) {
             Ok(bufs) => bufs,
             Err(e) => {
@@ -321,8 +349,8 @@ pub(super) fn main(run: &Run) -> ExitCode {
             println!("mrow {label}: FAIL (the fault word: {e})");
             failed = true;
         }
-        for (row, m) in [1usize, M].into_iter().enumerate() {
-            match time_one(run, &device, &kernels, shape, &bufs, m, &label) {
+        for (row, m) in ROWS_AT.into_iter().enumerate() {
+            match time_one(run, &device, &kernels, shape, &bufs, (m, false), &label) {
                 Ok(us) => medians[row].push(Some(us)),
                 Err(e) => {
                     println!("mrow {label} m={m}: FAIL ({e})");
@@ -344,37 +372,81 @@ pub(super) fn main(run: &Run) -> ExitCode {
         }
     }
 
-    // The ratio rows, one a shape, then the step-weighted mean.
+    // The ratio rows, one a shape and a row count, then each count's
+    // step-weighted mean.
+    for (row, m) in ROWS_AT.into_iter().enumerate().skip(1) {
+        for (at, shape) in SHAPES.iter().enumerate() {
+            let label = shape.label();
+            if !wanted(run, &label) {
+                continue;
+            }
+            let Some(one) = medians[0][at] else {
+                println!("ratio\tshape={label}\tm={m}\tFAIL (the 1-row arm did not time)");
+                continue;
+            };
+            match medians[row][at] {
+                Some(us) => println!(
+                    "ratio\tshape={label}\tm={m}\tt1_us={one:.3}\tt{m}_us={us:.3}\tratio={:.4}",
+                    us / one
+                ),
+                None => println!("ratio\tshape={label}\tm={m}\tFAIL"),
+            }
+        }
+    }
+    // The few-row launch beside the 1-row arm and the M-row launch of the
+    // same count, at the plain mat-vec shapes.
     for (at, shape) in SHAPES.iter().enumerate() {
+        if !matches!(shape, MShape::Matvec { .. }) {
+            continue;
+        }
         let label = shape.label();
         let Some(one) = medians[0][at] else {
-            println!("ratio\tshape={label}\tm={M}\tFAIL (the 1-row arm did not time)");
             continue;
         };
-        match medians[1][at] {
-            Some(us) => println!(
-                "ratio\tshape={label}\tm={M}\tt1_us={one:.3}\tt{M}_us={us:.3}\tratio={:.4}",
-                us / one
-            ),
-            None => println!("ratio\tshape={label}\tm={M}\tFAIL"),
+        let bufs = match shape_bufs(&device, shape, at as u64) {
+            Ok(bufs) => bufs,
+            Err(e) => {
+                println!("few {label}: FAIL ({e})");
+                failed = true;
+                continue;
+            }
+        };
+        for m in FEW_AT {
+            let rows_arm = ROWS_AT
+                .iter()
+                .position(|r| *r == m)
+                .and_then(|row| medians[row][at]);
+            match time_one(run, &device, &kernels, shape, &bufs, (m, true), &label) {
+                Ok(us) => println!(
+                    "few\tshape={label}\tm={m}\tt1_us={one:.3}\tt{m}_us={us:.3}\tratio={:.4}\tmrow_ratio={}",
+                    us / one,
+                    rows_arm.map_or_else(|| "none".to_string(), |r| format!("{:.4}", r / one))
+                ),
+                Err(e) => {
+                    println!("few {label} m={m}: FAIL ({e})");
+                    failed = true;
+                }
+            }
         }
     }
     println!(
-        "expect\tshape=mrow weighted mean\tm={M}\tratio={:.2}-{:.2}\tbasis=the MTP design's M-row decomposition",
+        "expect\tshape=mrow weighted mean\tm=2\tratio={:.2}-{:.2}\tbasis=the MTP design's M-row decomposition",
         EXPECT.0, EXPECT.1
     );
     println!(
-        "expect\tshape=mrow weighted mean\tm={M}\tratio={:.2}-{:.2}\tbasis=the kernels' instruction counts, issue at 65-100 % [derived]",
+        "expect\tshape=mrow weighted mean\tm=2\tratio={:.2}-{:.2}\tbasis=the kernels' instruction counts, issue at 65-100 % [derived]",
         DERIVED.0, DERIVED.1
     );
-    match step_mean(&STEP_LAUNCHES, &medians[0], &medians[1]) {
-        Some(mean) => println!(
-            "mean\tshape=mrow weighted mean\tm={M}\tratio={:.4}\tstep1_us={:.1}\tshapes={}\tbasis={STEP_BASIS}",
-            mean.ratio, mean.step_one_us, mean.shapes
-        ),
-        None => {
-            println!("mean\tshape=mrow weighted mean\tm={M}\tFAIL (no shape timed both arms)");
-            failed = true;
+    for (row, m) in ROWS_AT.into_iter().enumerate().skip(1) {
+        match step_mean(&STEP_LAUNCHES, &medians[0], &medians[row]) {
+            Some(mean) => println!(
+                "mean\tshape=mrow weighted mean\tm={m}\tratio={:.4}\tstep1_us={:.1}\tshapes={}\tbasis={STEP_BASIS}",
+                mean.ratio, mean.step_one_us, mean.shapes
+            ),
+            None => {
+                println!("mean\tshape=mrow weighted mean\tm={m}\tFAIL (no shape timed both arms)");
+                failed = true;
+            }
         }
     }
     if failed {
@@ -386,25 +458,38 @@ pub(super) fn main(run: &Run) -> ExitCode {
 
 /// The pipelines whose resources the probe prints: the 1-row entries of the
 /// five launches and the M-row entries the verify runs.
-const PIPELINES: [&str; 11] = [
+const PIPELINES: [&str; 5] = [
     "a4_matvec_resid",
     "a4_matvec_seg",
     "a4_pair_swiglu",
     "a4_head_logits",
     "a4_matvec_headnorm_resid",
-    "a4_matvec_resid_m2",
-    "a4_matvec_seg_m2",
-    "a4_matvec_seg_scaled_m2",
-    "a4_pair_swiglu_scaled_m2",
-    "a4_head_logits_scaled_m2",
-    "a4_matvec_headnorm_m2",
+];
+
+/// The M-row entries of one row count the probe prints.
+const ROWS_ENTRIES: [&str; 6] = [
+    "a4_matvec_resid",
+    "a4_matvec_seg",
+    "a4_matvec_seg_scaled",
+    "a4_pair_swiglu_scaled",
+    "a4_head_logits_scaled",
+    "a4_matvec_headnorm",
 ];
 
 /// One `pipeline` row an entry: the most threads a threadgroup of it may hold
 /// (the driver lowers it as the entry's registers rise), its SIMD width and
 /// its threadgroup memory.
 fn print_pipelines(device: &MetalDevice) {
-    for entry in PIPELINES {
+    let rows_entries = ROWS_AT
+        .iter()
+        .skip(1)
+        .flat_map(|m| ROWS_ENTRIES.map(|e| format!("{e}_m{m}")));
+    let entries = PIPELINES
+        .map(str::to_string)
+        .into_iter()
+        .chain(rows_entries);
+    for entry in entries {
+        let entry = entry.as_str();
         match device
             .library()
             .pipeline_with_simdgroups(entry, SIMD_GROUPS_PER_GROUP as u32)
@@ -467,7 +552,7 @@ fn shape_bufs(device: &MetalDevice, shape: &MShape, at: u64) -> Result<ShapeBufs
     let x = device
         .upload(
             stream,
-            &super::oracle::activations(M * shape.cols(), 0x5D40 + at, 1.0),
+            &super::oracle::activations(FEW_MAX * shape.cols(), 0x5D40 + at, 1.0),
         )
         .map_err(why)?;
     let gain = device
@@ -479,7 +564,7 @@ fn shape_bufs(device: &MetalDevice, shape: &MShape, at: u64) -> Result<ShapeBufs
     let partials = device
         .upload(
             stream,
-            &super::oracle::activations(M * DELTA_PARTIALS, 0x5D50 + at, 1.0)
+            &super::oracle::activations(MROWS * DELTA_PARTIALS, 0x5D50 + at, 1.0)
                 .into_iter()
                 .map(f32::abs)
                 .collect::<Vec<_>>(),
@@ -506,7 +591,7 @@ fn time_one(
     kernels: &Kernels,
     shape: &MShape,
     bufs: &ShapeBufs,
-    m: usize,
+    (m, few): (usize, bool),
     label: &str,
 ) -> Result<f64, String> {
     let stream = device.stream();
@@ -573,6 +658,21 @@ fn time_one(
                             x: bufs.x.window(Elems(0), Elems(*cols)).map_err(why)?,
                             y: out,
                             mode: Mode::Residual,
+                        },
+                    )
+                    .map_err(|e| e.to_string()),
+                (MShape::Matvec { rows, cols, .. }, _) if few => kernels
+                    .matvec_few(
+                        encoder,
+                        MatvecFewParams {
+                            quant: QUANT,
+                            m,
+                            rows: *rows,
+                            cols: *cols,
+                            weights: w,
+                            x: bufs.x.window(Elems(0), Elems(m * cols)).map_err(why)?,
+                            x_stride: *cols,
+                            y: out,
                         },
                     )
                     .map_err(|e| e.to_string()),
@@ -770,7 +870,7 @@ fn time_one(
             Ok(t) => {
                 print_row(
                     "mrow",
-                    &format!("{label} m={m}"),
+                    &format!("{label} m={m}{}", if few { " few" } else { "" }),
                     arm.name,
                     run.trials,
                     &t,
@@ -782,7 +882,12 @@ fn time_one(
                 }
             }
             Err(e) => {
-                print_fail("mrow", &format!("{label} m={m}"), arm.name, &e);
+                print_fail(
+                    "mrow",
+                    &format!("{label} m={m}{}", if few { " few" } else { "" }),
+                    arm.name,
+                    &e,
+                );
                 return Err(e);
             }
         }

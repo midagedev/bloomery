@@ -23,9 +23,18 @@ use core::fmt;
 use crate::delta_geom::{PASS_ROWS, RingRefusal, ring_fits};
 use crate::geometry::MROWS;
 
-/// The most rows a verify takes: the rows the M-row mat-vecs run. A verify of
-/// `m` rows ends `m` distinct lanes, so the delta state holds this many lanes.
-pub const VERIFY_ROWS: usize = MROWS;
+/// The most rows a verify takes: the largest row count whose M-row mat-vec
+/// pass costs at most twice the 1-row step, weighted by the step's launches
+/// (`metal_matvec_time --only mrow`, the `mean` rows); past it the pass is no
+/// cheaper per accepted row than the steps it replaces. The M-row family runs
+/// to [`MROWS`], more than a verify takes. A verify of `m` rows ends `m`
+/// distinct lanes, so the delta state holds this many lanes.
+pub const VERIFY_ROWS: usize = 3;
+
+const _: () = assert!(
+    VERIFY_ROWS <= MROWS,
+    "a verify takes at most the rows the M-row family runs"
+);
 
 /// Lanes of the delta state: [`VERIFY_ROWS`], and at least the two a token
 /// that ran and was not taken needs to leave the lane its replacement reads

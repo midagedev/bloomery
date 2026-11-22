@@ -1,5 +1,6 @@
 //! The launch of the M-row mat-vec family: the same weight read multiplied
-//! into [`MROWS`] activation rows, the kernels `kernels/matvec_rows.metal`.
+//! into 2 to [`MROWS`] activation rows, the kernels `kernels/matvec_rows.metal`,
+//! one instance an M.
 //!
 //! Five launches: the plain residual mat-vec ([`matvec_m`]), the segmented
 //! norm-on-load mat-vec of a layer's projections ([`matvec_seg_m`]), the
@@ -19,10 +20,12 @@
 //! activations and the outputs are M rows at the width the launch names, the
 //! rows arena's layout.
 //!
-//! Every M but [`MROWS`] is refused by name, as is a window the M rows do not
-//! fit; nothing is encoded for a launch that is refused. The family holds A4
-//! today, the kind an MLX 4-bit folder of a Bf16 scale pair opens as; another
-//! quant gains it by gaining `partial_rows` and the kernel instantiations.
+//! An M outside [`M_MIN`]..=[`MROWS`] is refused by name, as is a window the M
+//! rows do not fit; nothing is encoded for a launch that is refused. The
+//! family holds A4 and A8, the kinds an MLX 4-bit and 8-bit folder of a Bf16
+//! scale pair opens as; another quant gains it by gaining `load_rows`,
+//! `words_of`, `partial_rows` and `partial_head_rows` and the kernel
+//! instantiations.
 
 use bloomery_device::{DeviceError, Elems, LAYER_NONE, Window, WindowMut};
 
@@ -39,6 +42,9 @@ use super::{Kernels, MAX_SEGMENTS, args_bytes, check_weights_align, check_window
 
 pub use crate::geometry::MROWS;
 
+/// The fewest activation rows the family takes: one row is the 1-row kernels'.
+pub const M_MIN: usize = 2;
+
 const MATVEC: &str = "matvec mrows";
 const SEG: &str = "matvec seg mrows";
 const PAIR: &str = "pair mrows";
@@ -50,22 +56,36 @@ fn refuse(what: &'static str, detail: impl Into<String>) -> DeviceError {
     super::range(what, detail)
 }
 
-/// `m` refused by name unless it is the one M the family holds entries of.
+/// `m` refused by name unless it is one of the row counts the family holds
+/// entries of.
 fn check_m(what: &'static str, m: usize) -> Result<(), DeviceError> {
-    if m == MROWS {
-        return Ok(());
-    }
-    Err(refuse(what, format!("M is {m}; the family runs {MROWS}")))
-}
-
-/// The one quant whose decode owner holds `partial_rows`, the family's own.
-fn a4(what: &'static str, quant: Quant) -> Result<(), DeviceError> {
-    if quant == Quant::A4 {
+    if (M_MIN..=MROWS).contains(&m) {
         return Ok(());
     }
     Err(refuse(
         what,
-        format!("{} has no M-row entry; the family holds A4", quant.name()),
+        format!("M is {m}; the family runs {M_MIN} to {MROWS}"),
+    ))
+}
+
+/// Whether the family holds entries of `quant`: the decode owners that hold
+/// `partial_rows`.
+#[must_use]
+pub const fn m_row_serves(quant: Quant) -> bool {
+    matches!(quant, Quant::A4 | Quant::A8)
+}
+
+/// `quant` refused by name unless the family holds it.
+fn served(what: &'static str, quant: Quant) -> Result<(), DeviceError> {
+    if m_row_serves(quant) {
+        return Ok(());
+    }
+    Err(refuse(
+        what,
+        format!(
+            "{} has no M-row entry; the family holds A4 and A8",
+            quant.name()
+        ),
     ))
 }
 
@@ -74,7 +94,7 @@ fn a4(what: &'static str, quant: Quant) -> Result<(), DeviceError> {
 /// layer the entry does not serve runs the 1-row launch once a row).
 #[must_use]
 pub const fn headnorm_m_serves(quant: Quant, m: usize) -> bool {
-    matches!(quant, Quant::A4) && m == MROWS
+    m_row_serves(quant) && m >= M_MIN && m <= MROWS
 }
 
 /// The norm's windows against `m` input rows of `cols` values: a gain of
@@ -100,9 +120,9 @@ fn float4_aligned(what: &'static str, name: &str, start: usize) -> Result<(), De
 /// The plain M-row residual mat-vec: `y[m, r] += W[r, :] . x[m, :]`, M rows of
 /// `rows` outputs over `cols` columns each.
 pub struct MatvecMParams<'w> {
-    /// The weight type. A4 today; the launch refuses the others by name.
+    /// The weight type. A4 or A8; the launch refuses the others by name.
     pub quant: Quant,
-    /// The activation rows, [`MROWS`].
+    /// The activation rows, [`M_MIN`]..=[`MROWS`].
     pub m: usize,
     /// The output rows an activation row takes.
     pub rows: usize,
@@ -118,14 +138,14 @@ pub struct MatvecMParams<'w> {
 }
 
 /// The M-row head-normed residual mat-vec: a gated delta net's out projection
-/// over [`MROWS`] activation rows, `y[m, r] += W[r, :] . (g[m, :] * the head
+/// over [`M_MIN`]..=[`MROWS`] activation rows, `y[m, r] += W[r, :] . (g[m, :] * the head
 /// scale of each column)`, each row's head scales computed from its own
 /// partial sums. Row `m` is the 1-row head-normed launch's
 /// ([`Kernels::headnorm_resid`]) bits on that row's inputs alone.
 pub struct HeadNormMParams<'w> {
-    /// The weight type. A4 today; the launch refuses the others by name.
+    /// The weight type. A4 or A8; the launch refuses the others by name.
     pub quant: Quant,
-    /// The activation rows, [`MROWS`].
+    /// The activation rows, [`M_MIN`]..=[`MROWS`].
     pub m: usize,
     /// The output rows an activation row takes.
     pub rows: usize,
@@ -156,9 +176,9 @@ pub struct HeadNormMParams<'w> {
 /// type and one width, the norm on the load, each activation row's segments
 /// at their own output offsets inside that row's outputs.
 pub struct SegMParams<'w> {
-    /// The weight type. A4 today; the launch refuses the others by name.
+    /// The weight type. A4 or A8; the launch refuses the others by name.
     pub quant: Quant,
-    /// The activation rows, [`MROWS`].
+    /// The activation rows, [`M_MIN`]..=[`MROWS`].
     pub m: usize,
     /// The segments, one to [`MAX_SEGMENTS`] of them.
     pub segments: &'w [Segment],
@@ -189,7 +209,7 @@ pub struct PairMParams<'w> {
     /// The type of the shared expert's gate and up: `quant`, the one type the
     /// M-row pair reads.
     pub shared_quant: Quant,
-    /// The activation rows, [`MROWS`].
+    /// The activation rows, [`M_MIN`]..=[`MROWS`].
     pub m: usize,
     /// The slots. A launch runs the instance's (`ExpertsGeom::slots`).
     pub slots: usize,
@@ -230,9 +250,9 @@ pub struct PairMParams<'w> {
 /// The M-row head: M rows of logits over the hand-on's rows, and one argmax a
 /// row over that row's logits, each into its own pick word.
 pub struct HeadMParams<'w> {
-    /// The weight type. A4 today; the launch refuses the others by name.
+    /// The weight type. A4 or A8; the launch refuses the others by name.
     pub quant: Quant,
-    /// The activation rows, [`MROWS`].
+    /// The activation rows, [`M_MIN`]..=[`MROWS`].
     pub m: usize,
     /// The logits rows an activation row takes: the vocabulary.
     pub rows: usize,
@@ -268,9 +288,9 @@ pub struct HeadMParams<'w> {
 /// take `out`'s rows as `x` and its scale words as their scale.
 pub struct NormNextMParams<'w> {
     /// The next launch's weight type, whose lane order the scale is summed in.
-    /// A4 today; the launch refuses the others by name.
+    /// A4 or A8; the launch refuses the others by name.
     pub quant: Quant,
-    /// The rows, [`MROWS`].
+    /// The rows, [`M_MIN`]..=[`MROWS`].
     pub m: usize,
     /// The stream, `m` rows of the gain's length, on a 16-byte boundary.
     pub x: Window<'w, f32, MetalDevice>,
@@ -299,7 +319,7 @@ fn check_matvec(
     simdgroups: usize,
     rows_per_simd_group: usize,
 ) -> Result<MatvecMShape, DeviceError> {
-    a4(MATVEC, p.quant)?;
+    served(MATVEC, p.quant)?;
     check_m(MATVEC, p.m)?;
     if p.rows == 0 || p.cols == 0 {
         return Err(refuse(
@@ -364,8 +384,8 @@ fn check_headnorm_m(
         return Err(refuse(
             HEADNORM,
             format!(
-                "the M-row head-normed entry runs A4 at M = {} rows; this launch is {} at M = {}",
-                MROWS,
+                "the M-row head-normed entry runs A4 and A8 at M = {M_MIN} to {MROWS} rows; this \
+                 launch is {} at M = {}",
                 p.quant.name(),
                 p.m
             ),
@@ -432,7 +452,7 @@ fn check_seg(
     simdgroups: usize,
     rows_per_simd_group: usize,
 ) -> Result<SegMShape, DeviceError> {
-    a4(SEG, p.quant)?;
+    served(SEG, p.quant)?;
     check_m(SEG, p.m)?;
     if p.segments.is_empty() {
         return Err(refuse(SEG, "the dispatch has no segment"));
@@ -572,7 +592,7 @@ fn check_pair(
     simdgroups: usize,
     rows_per_simd_group: usize,
 ) -> Result<PairMShape, DeviceError> {
-    a4(PAIR, p.quant)?;
+    served(PAIR, p.quant)?;
     check_m(PAIR, p.m)?;
     if p.shared_quant != p.quant {
         return Err(refuse(
@@ -699,7 +719,7 @@ struct HeadMShape {
 /// windows holding the M rows. The logits rows a whole number of `float4`
 /// quads: every row's own argmax window starts on 16 bytes.
 fn check_head(p: &HeadMParams<'_>, rows_per_group: usize) -> Result<HeadMShape, DeviceError> {
-    a4(HEAD, p.quant)?;
+    served(HEAD, p.quant)?;
     check_m(HEAD, p.m)?;
     if p.k == 0 || !p.k.is_multiple_of(p.quant.values_per_block()) {
         return Err(refuse(
@@ -745,7 +765,7 @@ fn check_head(p: &HeadMParams<'_>, rows_per_group: usize) -> Result<HeadMShape, 
 /// The M-row hand-on's argument words: its columns and rows, the next norm's
 /// epsilon and layer.
 fn check_next(p: &NormNextMParams<'_>) -> Result<[u32; 4], DeviceError> {
-    a4(NEXT, p.quant)?;
+    served(NEXT, p.quant)?;
     check_m(NEXT, p.m)?;
     let cols = p.gain.len().get();
     if cols == 0 || !cols.is_multiple_of(p.quant.values_per_block()) {
@@ -783,32 +803,67 @@ fn check_next(p: &NormNextMParams<'_>) -> Result<[u32; 4], DeviceError> {
     ])
 }
 
-/// The pipelines of the M-row family: one per entry, at [`MROWS`] rows.
-pub(crate) struct Pipelines {
+/// One quant's six entries at one M.
+struct Entries {
     resid: Pipeline,
     seg: Pipeline,
     seg_scaled: Pipeline,
     pair: Pipeline,
     head: Pipeline,
     headnorm: Pipeline,
-    /// The hand-on over M rows, whose row count is a launch's own.
-    next: Pipeline,
+}
+
+/// The pipelines of the M-row family: every entry of A4 and A8 at each M from
+/// [`M_MIN`] to [`MROWS`], and the hand-on of each quant, whose row count is
+/// a launch's own.
+pub(crate) struct Pipelines {
+    /// `entries[q][m - M_MIN]`, `q` 0 for A4 and 1 for A8.
+    entries: [Vec<Entries>; 2],
+    next: [Pipeline; 2],
+}
+
+/// The family's quants in the order its tables hold them.
+const QUANTS: [Quant; 2] = [Quant::A4, Quant::A8];
+
+fn slot_of(quant: Quant) -> usize {
+    QUANTS
+        .iter()
+        .position(|q| *q == quant)
+        .expect("a launch asks the family for a quant it holds only after `served`")
 }
 
 impl Pipelines {
     /// `simdgroups` is the mat-vec function constant, as every 1-row
     /// family's.
     pub(crate) fn new(library: &Library, simdgroups: u32) -> Result<Self, DeviceError> {
-        let of = |name: &str| library.pipeline_with_simdgroups(name, simdgroups);
+        let of = |name: String| library.pipeline_with_simdgroups(&name, simdgroups);
+        let entries_of = |quant: Quant| -> Result<Vec<Entries>, DeviceError> {
+            let q = quant.name();
+            (M_MIN..=MROWS)
+                .map(|m| {
+                    Ok(Entries {
+                        resid: of(format!("{q}_matvec_resid_m{m}"))?,
+                        seg: of(format!("{q}_matvec_seg_m{m}"))?,
+                        seg_scaled: of(format!("{q}_matvec_seg_scaled_m{m}"))?,
+                        pair: of(format!("{q}_pair_swiglu_scaled_m{m}"))?,
+                        head: of(format!("{q}_head_logits_scaled_m{m}"))?,
+                        headnorm: of(format!("{q}_matvec_headnorm_m{m}"))?,
+                    })
+                })
+                .collect()
+        };
         Ok(Self {
-            resid: of("a4_matvec_resid_m2")?,
-            seg: of("a4_matvec_seg_m2")?,
-            seg_scaled: of("a4_matvec_seg_scaled_m2")?,
-            pair: of("a4_pair_swiglu_scaled_m2")?,
-            head: of("a4_head_logits_scaled_m2")?,
-            headnorm: of("a4_matvec_headnorm_m2")?,
-            next: library.pipeline("a4_norm_next_m")?,
+            entries: [entries_of(QUANTS[0])?, entries_of(QUANTS[1])?],
+            next: [
+                library.pipeline(&format!("{}_norm_next_m", QUANTS[0].name()))?,
+                library.pipeline(&format!("{}_norm_next_m", QUANTS[1].name()))?,
+            ],
         })
+    }
+
+    /// The entries of `quant` at `m` rows, for a launch whose check passed.
+    fn of(&self, quant: Quant, m: usize) -> &Entries {
+        &self.entries[slot_of(quant)][m - M_MIN]
     }
 }
 
@@ -823,7 +878,7 @@ impl Kernels {
         p: NormNextMParams<'_>,
     ) -> Result<(), DeviceError> {
         let args = args_bytes(check_next(&p)?);
-        encoder.set_pipeline(&self.matvec_rows.next);
+        encoder.set_pipeline(&self.matvec_rows.next[slot_of(p.quant)]);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.x)?)?;
         slot.set(Binding::of(&p.gain)?)?;
@@ -849,7 +904,7 @@ impl Kernels {
             0f32.to_bits(),
             shape.rows,
         ]);
-        encoder.set_pipeline(&self.matvec_rows.resid);
+        encoder.set_pipeline(&self.matvec_rows.of(p.quant, p.m).resid);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.weights)?)?;
         slot.set(Binding::of(&p.x)?)?;
@@ -881,7 +936,7 @@ impl Kernels {
             p.eps.to_bits(),
             shape.stride,
         ]);
-        encoder.set_pipeline(&self.matvec_rows.headnorm);
+        encoder.set_pipeline(&self.matvec_rows.of(p.quant, p.m).headnorm);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.weights)?)?;
         slot.set(Binding::of(&p.g)?)?;
@@ -903,10 +958,11 @@ impl Kernels {
     ) -> Result<(), DeviceError> {
         let shape = check_seg(&p, self.simdgroups, self.rows_per_simd_group)?;
         let args = args_bytes(seg_m_args(&shape, p.layer, p.norm.eps()));
+        let entries = self.matvec_rows.of(p.quant, p.m);
         encoder.set_pipeline(if p.norm.scaled() {
-            &self.matvec_rows.seg_scaled
+            &entries.seg_scaled
         } else {
-            &self.matvec_rows.seg
+            &entries.seg
         });
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.weights)?)?;
@@ -943,7 +999,7 @@ impl Kernels {
             shape.stride,
             0f32.to_bits(),
         ]);
-        encoder.set_pipeline(&self.matvec_rows.pair);
+        encoder.set_pipeline(&self.matvec_rows.of(p.quant, p.m).pair);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.gate)?)?;
         slot.set(Binding::of(&p.up)?)?;
@@ -982,7 +1038,7 @@ impl Kernels {
             0f32.to_bits(),
             shape.rows,
         ]);
-        encoder.set_pipeline(&self.matvec_rows.head);
+        encoder.set_pipeline(&self.matvec_rows.of(p.quant, p.m).head);
         let mut slot = Bindings::new(encoder);
         slot.set(Binding::of(&p.weights)?)?;
         slot.set(Binding::of(&p.x)?)?;
@@ -1019,22 +1075,44 @@ impl Kernels {
 mod tests {
     use super::*;
 
-    /// The family runs [`MROWS`] rows: every other count is refused by name,
-    /// saying the count it runs.
+    /// The family runs [`M_MIN`] to [`MROWS`] rows: every other count is
+    /// refused by name, saying the counts it runs.
     #[test]
-    fn the_family_runs_two_rows() {
-        assert_eq!(MROWS, 2);
-        assert!(check_m(MATVEC, 2).is_ok());
-        for m in [0, 1, 3, 4, 5, 8, usize::MAX] {
+    fn the_family_runs_two_to_eight_rows() {
+        assert_eq!((M_MIN, MROWS), (2, 8));
+        for m in M_MIN..=MROWS {
+            assert!(check_m(MATVEC, m).is_ok(), "M {m}");
+        }
+        for m in [0, 1, MROWS + 1, 16, usize::MAX] {
             match check_m(MATVEC, m) {
                 Ok(()) => panic!("M {m} is accepted"),
                 Err(DeviceError::Range { what, detail }) => {
                     assert_eq!(what, MATVEC);
-                    assert_eq!(detail, format!("M is {m}; the family runs 2"));
+                    assert_eq!(detail, format!("M is {m}; the family runs 2 to 8"));
                 }
                 Err(other) => panic!("M {m} is refused as {other}"),
             }
         }
+    }
+
+    /// The family holds A4 and A8 and refuses every other quant by name.
+    #[test]
+    fn the_family_holds_a4_and_a8() {
+        assert!(served(MATVEC, Quant::A4).is_ok());
+        assert!(served(MATVEC, Quant::A8).is_ok());
+        for quant in [Quant::A4H, Quant::A8H, Quant::Q4K, Quant::Q6K, Quant::F32] {
+            match served(MATVEC, quant) {
+                Ok(()) => panic!("{} is accepted", quant.name()),
+                Err(DeviceError::Range { detail, .. }) => {
+                    assert!(detail.contains(quant.name()), "{detail}");
+                    assert!(detail.contains("holds A4 and A8"), "{detail}");
+                }
+                Err(other) => panic!("{} is refused as {other}", quant.name()),
+            }
+        }
+        assert!(headnorm_m_serves(Quant::A8, 8));
+        assert!(!headnorm_m_serves(Quant::A8, 9));
+        assert!(!headnorm_m_serves(Quant::A4H, 2));
     }
 
     /// The head's logits rows: whole quads, none past the pick's loop, never

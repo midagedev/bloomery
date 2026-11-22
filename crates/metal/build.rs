@@ -213,6 +213,9 @@ fn main() {
         // The M-row mat-vec family instantiates the pair's helpers
         // (experts.metal) beside the mat-vec's own (matvec_q4k.metal).
         "matvec_rows",
+        // The few-row family reads gemm.metal's fragment multiply and the
+        // quant owners'.
+        "matvec_mrows",
         "route",
         "gemm_routed",
         "delta",

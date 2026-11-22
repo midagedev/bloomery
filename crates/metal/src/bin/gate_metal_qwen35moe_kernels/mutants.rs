@@ -3162,6 +3162,56 @@ pub const MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "mrows_rows_beyond_two",
+        clause: "mrows_seg",
+        why: "activation rows past the second read the second row's input: the row span of the load stops at row 1, so only an M of 3 or more shows it",
+        edits: &[(
+            "const float4 xq = act4(block + (long)m * row_span + base + 4 * l);",
+            "const float4 xq = act4(block + (long)min((int)m, 1) * row_span + base + 4 * l);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_a8_dot_order",
+        clause: "mrows_matvec",
+        why: "A8 rows past the first join their four accumulators one after another, ((a0 + a1) + a2) + a3: the same sum to within an ulp and other bits in some groups, which a banded clause passes",
+        edits: &[(
+            "            const float code_dot = (acc[m][0] + acc[m][1]) + (acc[m][2] + acc[m][3]);\n",
+            "            const float code_dot = m > 0 ? ((acc[m][0] + acc[m][1]) + acc[m][2]) + acc[m][3] : (acc[m][0] + acc[m][1]) + (acc[m][2] + acc[m][3]);\n",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_a8_bias_first_row",
+        clause: "mrows_pair_scaled",
+        why: "A8 rows past the first take the first row's input sum in their bias term: the groups' biases are live, so the bits move",
+        edits: &[(
+            "            sum[m] += s * code_dot + b * lanes[m].sumy;",
+            "            sum[m] += s * code_dot + b * lanes[0].sumy;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_a8_word_zero",
+        clause: "mrows_seg",
+        why: "the A8 decode reads the lane's first code word where its last three belong: the weights a row dots are wrong, in every activation row",
+        edits: &[(
+            "            wd.q[m] = q[m];",
+            "            wd.q[m] = q[0];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_few_fragment_row",
+        clause: "mrows_few",
+        why: "the few-row launch's second weight fragment reads the rows one past its own",
+        edits: &[(
+            "min(y_row + 8 * t + (int)fm, last_row)",
+            "min(y_row + 8 * t + (int)fm + (int)t, last_row)",
+            1,
+        )],
+    },
+    Mutant {
         name: "mrows_row_reads_first",
         clause: "mrows_seg",
         why: "every activation row reads the first row's input: the row span of the load drops",
@@ -3243,8 +3293,8 @@ pub const MUTANTS: &[Mutant] = &[
         clause: "mrows_headnorm",
         why: "each activation row of the M-row head-normed out projection takes the other row's head scales",
         edits: &[(
-            "lo[m] = Q::head_scales(scales + m * BLOOMERY_DELTA_VALUE_HEADS, ib).x;",
-            "lo[m] = Q::head_scales(scales + (M - 1 - m) * BLOOMERY_DELTA_VALUE_HEADS, ib).x;",
+            "lo[i] = Q::head_scales(scales + i * BLOOMERY_DELTA_VALUE_HEADS, ib).x;",
+            "lo[i] = Q::head_scales(scales + (M - 1 - i) * BLOOMERY_DELTA_VALUE_HEADS, ib).x;",
             1,
         )],
     },
@@ -3254,20 +3304,20 @@ pub const MUTANTS: &[Mutant] = &[
         why: "the head scale multiplies every loaded value of its head, not the block's finished contribution: the same sum in another order, other bits in some groups",
         edits: &[(
             concat!(
-                "            FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
-                "                Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);\n",
-                "            }\n"
+                "        FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
+                "            Q::template partial_head_rows<M>(wd[row], lanes, lo, sumf[row]);\n",
+                "        }\n"
             ),
             concat!(
-                "            FOR_UNROLL (short m = 0; m < M; ++m) {\n",
-                "                lanes[m].sumy *= lo[m];\n",
-                "                FOR_UNROLL (short k = 0; k < 16; ++k) {\n",
-                "                    lanes[m].yl[k] *= lo[m];\n",
-                "                }\n",
+                "        FOR_UNROLL (short m = 0; m < M; ++m) {\n",
+                "            lanes[m].sumy *= lo[m];\n",
+                "            FOR_UNROLL (short k = 0; k < 16; ++k) {\n",
+                "                lanes[m].yl[k] *= lo[m];\n",
                 "            }\n",
-                "            FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
-                "                Q::template partial_rows<M>(wd[row], lanes, sumf[row]);\n",
-                "            }\n"
+                "        }\n",
+                "        FOR_UNROLL (short row = 0; row < NR0; ++row) {\n",
+                "            Q::template partial_rows<M>(wd[row], lanes, sumf[row]);\n",
+                "        }\n"
             ),
             1,
         )],
@@ -3309,6 +3359,72 @@ pub const MUTANTS: &[Mutant] = &[
         edits: &[(
             "        if (first_row + row >= rows) {\n            break;\n        }\n        FOR_UNROLL (short m = 0; m < M; ++m) {\n            if (NORM && isnan(scale[m])) {",
             "        FOR_UNROLL (short m = 0; m < M; ++m) {\n            if (NORM && isnan(scale[m])) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_pass_x_offset",
+        clause: "mrows_matvec",
+        why: "the second pass of an M-row launch reads the first pass's activation rows: the pass offset of the inputs drops, so only an M of 3 or more shows it",
+        edits: &[(
+            "W, x + (long)G * row_span, y + (ulong)G * out_stride, nblocks, eps, layer,",
+            "W, x, y + (ulong)G * out_stride, nblocks, eps, layer,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_pass_out_offset",
+        clause: "mrows_matvec",
+        why: "the second pass of an M-row launch stores over the first pass's outputs: the pass offset of the outputs drops",
+        edits: &[(
+            "W, x + (long)G * row_span, y + (ulong)G * out_stride, nblocks, eps, layer,",
+            "W, x + (long)G * row_span, y, nblocks, eps, layer,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_pass_tail_dropped",
+        clause: "mrows_matvec",
+        why: "the last pass of an M-row launch runs one row fewer than it holds: the launch's last activation row keeps the outputs it had",
+        edits: &[(
+            "matvec_rows_m<Q, M - G, NORM, RESID, ROW_RAISE, SCALED, HEADNORM>(",
+            "matvec_rows_m<Q, (M - G > 1 ? M - G - 1 : M - G), NORM, RESID, ROW_RAISE, SCALED, HEADNORM>(",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_pass_scale_words",
+        clause: "mrows_seg_scaled",
+        why: "the later passes of a scaled M-row launch read the first rows' scale words: the pass offset of the join's scales drops",
+        edits: &[("SCALED ? gain + G : gain,", "gain,", 1)],
+    },
+    Mutant {
+        name: "mrows_pass_head_scales",
+        clause: "mrows_headnorm",
+        why: "the later passes of the head-normed M-row launch read the first rows' head scales: the pass offset of the scales drops",
+        edits: &[(
+            "HEADNORM ? scales + G * BLOOMERY_DELTA_VALUE_HEADS : scales);",
+            "scales);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_pair_pass_x",
+        clause: "mrows_pair_scaled",
+        why: "the second pass of the M-row pair reads the first pass's activation rows: the pass offset of the inputs drops",
+        edits: &[(
+            "pair_slot_m<Q, M - G>(gate, up, x + (long)G * row_span, gain + G,",
+            "pair_slot_m<Q, M - G>(gate, up, x, gain + G,",
+            1,
+        )],
+    },
+    Mutant {
+        name: "mrows_pair_pass_tail_dropped",
+        clause: "mrows_pair_scaled",
+        why: "the last pass of the M-row pair runs one row fewer than it holds: the launch's last activation row is never written",
+        edits: &[(
+            "pair_slot_m<Q, M - G>(gate, up, x + (long)G * row_span, gain + G,",
+            "pair_slot_m<Q, (M - G > 1 ? M - G - 1 : M - G)>(gate, up, x + (long)G * row_span, gain + G,",
             1,
         )],
     },

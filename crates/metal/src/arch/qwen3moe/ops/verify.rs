@@ -8,7 +8,7 @@
 //! bits instead, one group an op as the step's walk names them:
 //!
 //! - the projections of a layer (P1), the attention's out projection, the FFN's
-//!   down and the head: the M-row A4 mat-vecs (`kernels/matvec_rows.rs`), the
+//!   down and the head: the M-row A4 and A8 mat-vecs (`kernels/matvec_rows.rs`), the
 //!   weights read once for every row;
 //! - the dense FFN's gate-up pair with its SwiGLU: the M-row pair;
 //! - the hand-ons: a layer whose readers each have a scaled entry
@@ -27,8 +27,8 @@
 //!   (`Kernels::delta_rows_ring`), row `r`'s end state in the lane of position
 //!   `from + r + 1` ([`lanes::Verify`]);
 //! - the delta layer's out projection: the M-row head-normed mat-vec over both
-//!   rows (`Kernels::headnorm_m`) when the out projection is A4, the family's
-//!   own quant; a type it holds no entry of runs the one-row launch once a
+//!   rows (`Kernels::headnorm_m`) when the out projection is A4 or A8, the
+//!   family's own quants; a type it holds no entry of runs the one-row launch once a
 //!   row, its weights read once a row.
 //!
 //! The rows sit in the rows arena at the stride the layer's P1 writes: the
@@ -40,7 +40,7 @@
 //! What the pass does not serve is refused by name before it encodes anything
 //! ([`layer_refusal`], [`head_refusal`]): a routed FFN, a short conv layer, a
 //! sandwich residual, a per-head output gate beside the P1 rows, and any
-//! weight type but A4 where the family has an entry.
+//! weight type but A4 and A8 where the family has an entry.
 
 use bloomery_device::fault::LAYER_HEAD;
 use bloomery_device::{Buffer, Elems};
@@ -59,13 +59,14 @@ use crate::device::MetalDevice;
 use crate::encode::ComputeEncoder;
 use crate::kernels::{
     AttentionRowsParams, AttnCache, AttnLayer, BiasRowsParams, DeltaRowStrides, HEAD_SIMD_GROUPS,
-    HeadMParams, HeadNormMParams, HeadNormParams, Kernels, LoadNorm, MROWS, MatvecMParams,
-    NormNextMParams, PairMParams, Quant, SegMParams, headnorm_m_serves, segments_for_window,
+    HeadMParams, HeadNormMParams, HeadNormParams, Kernels, LoadNorm, MatvecMParams,
+    NormNextMParams, PairMParams, Quant, SegMParams, headnorm_m_serves, m_row_serves,
+    segments_for_window,
 };
 use bloomery_device::Window;
 
-/// The weight type the M-row family holds.
-const SERVED: Quant = Quant::A4;
+/// What the M-row family holds, for a refusal's text.
+const SERVED: &str = "A4 and A8";
 
 /// One launch of the attention rows kernels: `rows` rows from row `first`
 /// of the verify, over `segments` split-K segments.
@@ -168,11 +169,11 @@ pub(super) fn layer_refusal(f: &LayerFacts) -> Option<String> {
         ));
     }
     let (quant, out_end) = f.p1;
-    if quant != SERVED {
+    if !m_row_serves(quant) {
         return Some(format!(
             "layer {l}: a P1 of {}, which has no M-row mat-vec (the family holds {})",
             quant.name(),
-            SERVED.name()
+            SERVED
         ));
     }
     if !out_end.is_multiple_of(4) {
@@ -187,12 +188,12 @@ pub(super) fn layer_refusal(f: &LayerFacts) -> Option<String> {
             f.out.name()
         ));
     }
-    if matches!(f.mixer, MixerKind::Attention { .. }) && f.out != SERVED {
+    if matches!(f.mixer, MixerKind::Attention { .. }) && !m_row_serves(f.out) {
         return Some(format!(
             "layer {l}: an attention out projection of {}, which has no M-row mat-vec (the \
              family holds {})",
             f.out.name(),
-            SERVED.name()
+            SERVED
         ));
     }
     if f.routed {
@@ -201,12 +202,12 @@ pub(super) fn layer_refusal(f: &LayerFacts) -> Option<String> {
         ));
     }
     for (what, quant) in [("gate and up", f.gate_up), ("down", f.down)] {
-        if quant != SERVED {
+        if !m_row_serves(quant) {
             return Some(format!(
                 "layer {l}: a dense FFN's {what} of {}, which has no M-row mat-vec (the family \
                  holds {})",
                 quant.name(),
-                SERVED.name()
+                SERVED
             ));
         }
     }
@@ -225,11 +226,11 @@ pub(super) fn layer_refusal(f: &LayerFacts) -> Option<String> {
 /// Why the verify pass does not serve a head of `quant` over `vocab` ids, or
 /// `None`.
 pub(super) fn head_refusal(quant: Quant, vocab: usize) -> Option<String> {
-    if quant != SERVED {
+    if !m_row_serves(quant) {
         return Some(format!(
             "the head is {}, which has no M-row mat-vec (the family holds {})",
             quant.name(),
-            SERVED.name()
+            SERVED
         ));
     }
     if !vocab.is_multiple_of(4) {
@@ -291,7 +292,7 @@ pub(in super::super) fn serves(arena: &Arena) -> Result<(), SessionError> {
 fn unserved(why: String) -> SessionError {
     refuse(format!(
         "a verify: the pass does not serve this file ({why}); it serves attention and delta \
-         layers with a dense A4 FFN and an A4 head"
+         layers with a dense A4 or A8 FFN and an A4 or A8 head"
     ))
 }
 
@@ -308,9 +309,9 @@ fn no_buffers<T>() -> Result<T, SessionError> {
 /// The layer's single P1 dispatch, which the preflight judged served.
 fn single(l: usize, p1: &P1) -> Result<&P1Part, SessionError> {
     match p1.parts.as_slice() {
-        [part] if part.quant == SERVED => Ok(part),
+        [part] if m_row_serves(part.quant) => Ok(part),
         _ => Err(refuse(format!(
-            "layer {l}: a verify over a P1 that is not one A4 dispatch"
+            "layer {l}: a verify over a P1 that is not one A4 or A8 dispatch"
         ))),
     }
 }
@@ -605,7 +606,7 @@ impl MetalOps<'_, '_> {
     }
 
     /// Layer `l`'s delta out projection of the verify's rows: the M-row
-    /// head-normed mat-vec over both rows where [`headnorm_m_serves`] the out
+    /// head-normed mat-vec over all `m` rows where [`headnorm_m_serves`] the out
     /// projection's type at `m` (the family's own quant, the out weights read
     /// once), each row over its own numerator and partial sums into its own
     /// residual row; any other type the pass serves runs the one-row launch a
@@ -623,7 +624,7 @@ impl MetalOps<'_, '_> {
             }
         };
         if headnorm_m_serves(out_quant, m) {
-            self.verify_delta_out_m(l)?;
+            self.verify_delta_out_m(l, m)?;
         } else {
             for r in 0..m {
                 self.verify_delta_out_row(l, m, r)?;
@@ -633,11 +634,10 @@ impl MetalOps<'_, '_> {
         Ok(())
     }
 
-    /// Layer `l`'s delta out projection over both verify rows in one M-row
-    /// launch: each row's own gated numerator and partial sums, into its own
-    /// residual row. No barrier: the caller closes the rows' writes.
-    fn verify_delta_out_m(&mut self, l: usize) -> Result<(), SessionError> {
-        let m = MROWS;
+    /// Layer `l`'s delta out projection over the verify's `m` rows in one
+    /// M-row launch: each row's own gated numerator and partial sums, into its
+    /// own residual row. No barrier: the caller closes the rows' writes.
+    fn verify_delta_out_m(&mut self, l: usize, m: usize) -> Result<(), SessionError> {
         let slot = self.rows_slot(m);
         let Some(ctx) = self.rows.as_mut() else {
             return no_rows();
@@ -1244,10 +1244,10 @@ mod tests {
         );
         says(
             &LayerFacts {
-                p1: (Quant::A8, 16480),
+                p1: (Quant::A8H, 16480),
                 ..served()
             },
-            "a8",
+            "a8h",
         );
         says(
             &LayerFacts {
@@ -1280,7 +1280,7 @@ mod tests {
         );
         says(
             &LayerFacts {
-                gate_up: Quant::A8,
+                gate_up: Quant::A4H,
                 ..served()
             },
             "gate and up",
@@ -1301,11 +1301,12 @@ mod tests {
         );
     }
 
-    /// The head: A4 over a vocabulary of whole quads is served.
+    /// The head: A4 or A8 over a vocabulary of whole quads is served.
     #[test]
-    fn the_head_is_a4_over_whole_quads() {
+    fn the_head_is_a4_or_a8_over_whole_quads() {
         assert_eq!(head_refusal(Quant::A4, 248_320), None);
-        assert!(head_refusal(Quant::A8, 248_320).unwrap().contains("a8"));
+        assert_eq!(head_refusal(Quant::A8, 248_320), None);
+        assert!(head_refusal(Quant::A4H, 248_320).unwrap().contains("a4h"));
         assert!(head_refusal(Quant::A4, 248_322).unwrap().contains("quads"));
     }
 }

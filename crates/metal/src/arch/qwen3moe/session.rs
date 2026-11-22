@@ -2624,7 +2624,10 @@ mod tests {
     fn a_store_that_cannot_be_copied_is_refused_by_name() {
         let refusal = |held| store_lens_of([held], 8).unwrap_err().to_string();
         assert!(refusal(Held::Conv { ring: 0 }).contains("short conv ring of no f32s"));
-        assert!(refusal(Held::Delta { state: 8, ring: 4 }).contains("2 lanes of 8 are 16"));
+        assert!(
+            refusal(Held::Delta { state: 8, ring: 4 })
+                .contains(&format!("{LANES} lanes of 8 are {}", LANES * 8))
+        );
     }
 
     /// A geometry whose slots are not the picks and the shared slot the

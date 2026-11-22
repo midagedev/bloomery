@@ -15,7 +15,7 @@
 //                sum of squares), or the route-weight form
 //   partial      the dot of one block against the loaded input
 //   partial_rows the dot of one block against M loaded inputs, the block's
-//                unpack shared (the M-row mat-vecs; A4's own today)
+//                unpack shared (the M-row mat-vecs; A4's and A8's)
 //   fold_blocks, the folded down's K' in the quant's blocks, and the slot
 //   fold_slot    a block of K' belongs to; `head_scales`, `sums_finite` and
 //                `partial_head` serve the head-normed row loop, `value` the
@@ -988,6 +988,65 @@ struct A8T {
         return s * code_dot + b * lane.sumy;
     }
 
+    // `load` for M activation rows at once: A4's own, the lane's registers
+    // and sums are the same layout, so each row is `load`'s bits.
+    template <LoadMode LOAD, short M>
+    static inline void load_rows(thread Lane * lanes,
+                                 device const float * block,
+                                 long row_span,
+                                 device const float * gain,
+                                 thread float * sum_sq) {
+        Base::template load_rows<LOAD, M>(lanes, block, row_span, gain, sum_sq);
+    }
+
+    // The reads `partial` makes of one group, taken apart: the lane's four
+    // code words and the scale-and-bias word, so the M-row loop issues every
+    // weight row's reads before the first is used.
+    struct Words {
+        uint32_t q[4];
+        uint32_t sb;
+    };
+
+    static inline Words words_of(device const Block & blk, const thread Lane & lane) {
+        device const uint32_t * q = blk.qs + 4 * lane.iq;
+        Words wd;
+        wd.sb = *(device const uint32_t *)&blk.scale;
+        FOR_UNROLL (short m = 0; m < 4; ++m) {
+            wd.q[m] = q[m];
+        }
+        return wd;
+    }
+
+    // The M-row form of `partial`: one group's contribution to N loaded
+    // inputs, the code words widened once and shared. Each input's four
+    // accumulators take `partial`'s own order (the words in order, one product
+    // added a value) and its finishing expression, so row m is `partial`'s bits
+    // on input m; THIS ORDER IS THE GATE.
+    template <short N>
+    static inline void partial_rows(const thread Words & wd,
+                                    const thread Lane * lanes,
+                                    thread float * sum) {
+        float4 acc[N];
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            acc[m] = float4(0.f, 0.f, 0.f, 0.f);
+        }
+        FOR_UNROLL (short w = 0; w < 4; ++w) {
+            const float4 codes = float4(as_type<uchar4>(wd.q[w]));
+            FOR_UNROLL (short m = 0; m < N; ++m) {
+                acc[m][0] += lanes[m].yl[4 * w + 0] * codes[0];
+                acc[m][1] += lanes[m].yl[4 * w + 1] * codes[1];
+                acc[m][2] += lanes[m].yl[4 * w + 2] * codes[2];
+                acc[m][3] += lanes[m].yl[4 * w + 3] * codes[3];
+            }
+        }
+        const float s = Pair::scale_of_word(wd.sb);
+        const float b = Pair::bias_of_word(wd.sb);
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            const float code_dot = (acc[m][0] + acc[m][1]) + (acc[m][2] + acc[m][3]);
+            sum[m] += s * code_dot + b * lanes[m].sumy;
+        }
+    }
+
     // A 64-value group sits whole inside one 128-column value head, so the
     // head's one scale multiplies the whole contribution; `hi` is that same
     // head's and goes unused.
@@ -996,6 +1055,24 @@ struct A8T {
                                      float lo,
                                      float hi) {
         return lo * partial(blk, lane);
+    }
+
+    // The M-row form of `partial_head`: `partial_rows`' contribution with the
+    // head's one scale applied to the finished block, `partial_head`'s rule;
+    // THIS ORDER IS THE GATE.
+    template <short N>
+    static inline void partial_head_rows(const thread Words & wd,
+                                         const thread Lane * lanes,
+                                         const thread float * lo,
+                                         thread float * sum) {
+        float block[N];
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            block[m] = 0.f;
+        }
+        partial_rows<N>(wd, lanes, block);
+        FOR_UNROLL (short m = 0; m < N; ++m) {
+            sum[m] += lo[m] * block[m];
+        }
     }
 
     static inline float2 head_scales(threadgroup const float * scales, int ib) {

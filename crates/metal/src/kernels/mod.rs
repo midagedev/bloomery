@@ -47,6 +47,7 @@ use crate::geometry;
 mod head;
 mod headnorm;
 mod matvec;
+mod matvec_mrows;
 mod matvec_rows;
 mod norm;
 mod routed;
@@ -96,9 +97,10 @@ pub use geometry::{
 pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams};
 pub use headnorm::HeadNormParams;
 pub use matvec::{LoadNorm, MatvecParams, Mode, NormOnLoad, Quant};
+pub use matvec_mrows::{FEW_FRAGMENT, FEW_MAX, FEW_MIN, MatvecFewParams, few_path_ops};
 pub use matvec_rows::{
-    HeadMParams, HeadNormMParams, MROWS, MatvecMParams, NormNextMParams, PairMParams, SegMParams,
-    headnorm_m_serves,
+    HeadMParams, HeadNormMParams, M_MIN, MROWS, MatvecMParams, NormNextMParams, PairMParams,
+    SegMParams, headnorm_m_serves, m_row_serves,
 };
 pub use norm::NormRowsParams;
 pub use norm::{HiddenRow, MtpJoinParams};
@@ -230,12 +232,15 @@ pub struct Kernels {
     /// `gemm_routed.metal`).
     routed: routed::RoutedPipelines,
     experts: experts::Pipelines,
-    /// The M-row mat-vec family (`matvec_rows.metal`): the A4 entries of
-    /// [`MROWS`] activation rows. Built at open with every other family, not
+    /// The M-row mat-vec family (`matvec_rows.metal`): the A4 and A8 entries of
+    /// 2 to [`MROWS`] activation rows. Built at open with every other family, not
     /// on a first verify: the pipeline scan reads the pipelines `Kernels`
     /// builds, a missing entry is a named error at open, and the first verify
     /// then pays no compile inside its own wall.
     matvec_rows: matvec_rows::Pipelines,
+    /// The few-row mat-vec (`matvec_mrows.metal`): M = 3..16 rows on the matrix
+    /// units, built at open like the family above.
+    matvec_mrows: matvec_mrows::Pipelines,
     /// The gated delta step.
     delta: Pipeline,
     /// The gated delta step over rows, and the ring commit after it.
@@ -518,6 +523,7 @@ impl Kernels {
             routed: routed::RoutedPipelines::new(library)?,
             experts: experts::Pipelines::new(library, count)?,
             matvec_rows: matvec_rows::Pipelines::new(library, count)?,
+            matvec_mrows: matvec_mrows::Pipelines::new(library)?,
             delta: library.pipeline("gdn_step")?,
             delta_rows: delta::RowsPipelines::new(library)?,
             attention: attention::AttentionPipelines::new(library)?,

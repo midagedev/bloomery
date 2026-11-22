@@ -8,6 +8,8 @@
 //! The token encoder is the caller: the e2e gate holds what one token, and
 //! one verify, encodes to these counts.
 
+use crate::geometry::MROWS;
+use crate::kernels::M_MIN;
 use core::num::NonZeroU32;
 
 /// One layer of the token.
@@ -22,12 +24,12 @@ pub enum Layer {
     /// A gated delta layer. The live-key length does not add a dispatch.
     Delta {
         qkv: Projection,
-        /// The verify width at which the out projection runs as one M-row
-        /// dispatch for all its rows, as `headnorm_m_serves` answers for its
-        /// weight type; `None` where that type has no M-row entry. At any
-        /// other width it is a dispatch a row. A token has one row, so
-        /// `token_count` ignores it.
-        out_one_at: Option<usize>,
+        /// Whether the out projection runs as one M-row dispatch for all the
+        /// rows of a verify (2 to `MROWS` of them), as `headnorm_m_serves`
+        /// answers for its weight type; false where that type has no M-row
+        /// entry, a dispatch a row. A token has one row, so `token_count`
+        /// ignores it.
+        out_one: bool,
         ffn: FfnKind,
         residual: Residual,
     },
@@ -268,8 +270,8 @@ const VERIFY_HEAD_GROUPS: u32 = 2;
 /// The verify's groups are not the token's: its delta core is three groups of
 /// four dispatches and its flash two of two for each of `flash_launches`
 /// launches (one while its rows share a segment count), the delta layers' out
-/// projection one group of one dispatch at its `out_one_at` width (an A4 out at
-/// two rows) and else a dispatch a row, and
+/// projection one group of one dispatch where `out_one` (an A4 or A8 out at two
+/// to `MROWS` rows) and else a dispatch a row, and
 /// the head two groups, the logits and then a pick a row. The embed is one
 /// group; P1, the attention's out, the gate-up, the down, an attention
 /// layer's biases and each of a plain residual's two hand-ons are one group of
@@ -284,14 +286,12 @@ pub fn verify_count(layers: &[Layer], rows: u32, flash_launches: u32) -> TokenCo
     };
     for layer in layers {
         match *layer {
-            Layer::Delta {
-                qkv, out_one_at, ..
-            } => {
+            Layer::Delta { qkv, out_one, .. } => {
                 add(1, qkv.dispatches());
                 add(VERIFY_DELTA_CORE.0, VERIFY_DELTA_CORE.1);
                 add(
                     1,
-                    if out_one_at == Some(rows as usize) {
+                    if out_one && (M_MIN..=MROWS).contains(&(rows as usize)) {
                         1
                     } else {
                         rows
@@ -455,12 +455,11 @@ impl GroupBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::MROWS;
 
     fn routed_delta(qkv: Projection) -> Layer {
         Layer::Delta {
             qkv,
-            out_one_at: Some(MROWS),
+            out_one: true,
             ffn: FfnKind::Routed,
             residual: Residual::Plain,
         }
@@ -482,12 +481,12 @@ mod tests {
             .map(|l| match *l {
                 Layer::Delta {
                     qkv,
-                    out_one_at,
+                    out_one,
                     residual,
                     ..
                 } => Layer::Delta {
                     qkv,
-                    out_one_at,
+                    out_one,
                     ffn: FfnKind::Dense,
                     residual,
                 },
@@ -753,13 +752,10 @@ mod tests {
                     residual: Residual::Plain,
                 },
                 Layer::Delta {
-                    qkv,
-                    out_one_at,
-                    ffn,
-                    ..
+                    qkv, out_one, ffn, ..
                 } => Layer::Delta {
                     qkv,
-                    out_one_at,
+                    out_one,
                     ffn,
                     residual: Residual::Plain,
                 },
@@ -799,13 +795,10 @@ mod tests {
             .into_iter()
             .map(|l| match l {
                 Layer::Delta {
-                    qkv,
-                    out_one_at,
-                    ffn,
-                    ..
+                    qkv, out_one, ffn, ..
                 } => Layer::Delta {
                     qkv,
-                    out_one_at,
+                    out_one,
                     ffn,
                     residual: Residual::PlainHandOn,
                 },
@@ -862,7 +855,7 @@ mod tests {
             .map(|c| match c {
                 'd' => Layer::Delta {
                     qkv: Projection::ONE,
-                    out_one_at: Some(MROWS),
+                    out_one: true,
                     ffn: FfnKind::Dense,
                     residual: Residual::PlainHandOn,
                 },
@@ -929,11 +922,11 @@ mod tests {
     }
 
     /// A delta layer whose out the M-row head-normed entry does not serve (a
-    /// Q4_K out, `out_one_at: None`) keeps a dispatch a row at two rows: the
+    /// Q4_K out, `out_one: false`) keeps a dispatch a row at two rows: the
     /// same one group of the out, one dispatch more than the A4 out the entry
     /// folds into one launch.
     ///
-    /// Mutant: the out counts one dispatch without asking its `out_one_at`
+    /// Mutant: the out counts one dispatch without asking its `out_one`
     /// width, so a Q4_K out at two rows counts one dispatch.
     #[test]
     fn a_q4k_delta_out_stays_a_dispatch_a_row() {
@@ -945,7 +938,7 @@ mod tests {
                         qkv, ffn, residual, ..
                     } => Layer::Delta {
                         qkv,
-                        out_one_at: None,
+                        out_one: false,
                         ffn,
                         residual,
                     },
@@ -972,8 +965,8 @@ mod tests {
         );
     }
 
-    /// The rows past the M-row entry's count add a dispatch each to a delta
-    /// layer's out (the entry serves two rows only) and to the head's picks,
+    /// The rows past the M-row entries' counts (9 and on) add a dispatch each to
+    /// a delta layer's out, and every row past the first to the head's picks,
     /// never a group; the flash's launches add two groups and two dispatches
     /// each to an attention layer; the biases add one of each.
     ///
@@ -993,14 +986,30 @@ mod tests {
                 dispatches: 22
             }
         );
-        // Two more rows: the delta out leaves the M-row entry's count (a
-        // dispatch a row again, one more than the entry's one) and the head's
-        // picks a dispatch a row: 3 + 2 = 5.
+        // Two more rows: the delta out stays the M-row entry's one dispatch
+        // and the head's picks add a dispatch a row: 2.
         assert_eq!(
             at("da", false, 4, 1),
             TokenCount {
                 groups: base.groups,
-                dispatches: base.dispatches + 5
+                dispatches: base.dispatches + 2
+            }
+        );
+        // The entry's last count, 8 rows: the picks add 6.
+        assert_eq!(
+            at("da", false, 8, 1),
+            TokenCount {
+                groups: base.groups,
+                dispatches: base.dispatches + 6
+            }
+        );
+        // One row past the entry's count, 9: the delta out is a dispatch a
+        // row again, 8 more than the entry's one, and the picks add 7.
+        assert_eq!(
+            at("da", false, 9, 1),
+            TokenCount {
+                groups: base.groups,
+                dispatches: base.dispatches + 15
             }
         );
         // A second launch of the flash.

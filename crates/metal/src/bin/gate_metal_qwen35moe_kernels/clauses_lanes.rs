@@ -29,12 +29,14 @@ use super::{
 /// rows end in the lanes after it, wrapping.
 type RingCase = (usize, usize, u32);
 
-/// The cases: the arena's two lanes at both read lanes, and at the first
-/// position (taps before it); more lanes than rows, so lanes no row writes
-/// must stay as they were; as many rows as lanes, whose last row ends in the
-/// lane the launch read; the widest verify the conv ring rolls back; and the
-/// last positions of the 32-bit word (a token still follows a commit of all rows).
-const RING_CASES: [RingCase; 11] = [
+/// The cases: two lanes at both read lanes, and at the first position (taps
+/// before it); more lanes than rows, so lanes no row writes must stay as they
+/// were; as many rows as lanes, whose last row ends in the lane the launch
+/// read; the arena's eight lanes with a verify of three and of five rows from
+/// other positions, and of eight from the first one; the widest verify the
+/// conv ring rolls back, eight rows; and the last positions of the 32-bit word
+/// (a token still follows a commit of all rows).
+const RING_CASES: [RingCase; 14] = [
     (2, 2, 4),
     (2, 2, 7),
     (2, 2, 0),
@@ -45,6 +47,9 @@ const RING_CASES: [RingCase; 11] = [
     (4, 2, 11),
     (4, 1, 3),
     (PASS_ROWS, PASS_ROWS, 5),
+    (PASS_ROWS, PASS_ROWS, 0),
+    (PASS_ROWS, 5, 6),
+    (PASS_ROWS, 3, 13),
     (3, 3, u32::MAX - 4),
 ];
 

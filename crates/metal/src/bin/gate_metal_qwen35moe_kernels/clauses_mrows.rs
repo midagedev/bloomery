@@ -14,21 +14,25 @@
 //! each row to the 1-row head-normed launch's bits on that row's own gated
 //! numerator and partial sums.
 //!
-//! The M-row family holds A4, the kind an MLX 4-bit folder of a Bf16 scale
-//! pair opens as, so every clause launches A4 over synthetic weights
-//! ([`synthetic::matrix`], its groups' biases made live) at the dense Qwen3.8-27B decode shapes the probe
-//! `metal_matvec_time --only mrow` times: the two P1 segment groups, the
-//! attention out and the FFN down, and the head's whole vocabulary. The pair
-//! runs at the instance's own experts (the width and slots its geometry
-//! names), the one shape the launch checks against the instance.
+//! The M-row family holds A4 and A8, the kinds an MLX 4-bit and 8-bit folder of
+//! a Bf16 scale pair opens as, each at M = 2 to 8 rows, and every clause runs
+//! each (quant, M) cell: a cell is its own kernel instance. A clause launches
+//! synthetic weights ([`synthetic::matrix`], its groups' biases made live) at
+//! the dense Qwen3.8-27B decode shapes the probe `metal_matvec_time --only
+//! mrow` times: the two P1 segment groups, the attention out and the FFN down,
+//! and the head's whole vocabulary. The pair runs at the instance's own
+//! experts (the width and slots its geometry names), the one shape the launch
+//! checks against the instance. A NaN clause poisons the first, a middle and
+//! the last activation row in turn.
 
 use bloomery_device::conformance::{Clause, Verdict, why};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Device, DeviceError, Elems};
 use bloomery_metal::buffer::MetalBuffer;
 use bloomery_metal::kernels::{
-    HEAD_SIMD_GROUPS, HeadMParams, HeadNormMParams, HeadParams, LoadNorm, MROWS, MatvecMParams,
-    NormNextMParams, NormNextParams, PARTIALS_PER_HEAD, PairMParams, Quant, SegMParams, Segment,
+    FEW_FRAGMENT, FEW_MAX, FEW_MIN, HEAD_SIMD_GROUPS, HeadMParams, HeadNormMParams, HeadParams,
+    LoadNorm, M_MIN, MROWS, MatvecFewParams, MatvecMParams, NormNextMParams, NormNextParams,
+    PARTIALS_PER_HEAD, PairMParams, Quant, SegMParams, Segment, few_path_ops,
 };
 
 use super::clauses_experts::{
@@ -47,9 +51,6 @@ use super::{
 /// The epsilon every M-row norm takes.
 const EPS: f32 = 1e-6;
 
-/// The rows every launch runs.
-const M: usize = MROWS;
-
 /// The 27B's residual width, dense FFN width and vocabulary.
 const HIDDEN: usize = 5120;
 const FF: usize = 17_408;
@@ -67,16 +68,66 @@ const OUT_COLS: usize = 6144;
 /// it.
 const TAIL_ROWS: usize = 1531;
 
+/// The type the refusal cases launch: the family holds A4 and A8, and a
+/// refusal is the same either way.
 const QUANT: Quant = Quant::A4;
 
-/// Where an A4 group's bias sits in its block: after the 32 code bytes and the
-/// 2-byte scale.
-const BIAS_AT: usize = 34;
+/// The family's quants, in the order the gate walks them.
+const QUANTS: [Quant; 2] = [Quant::A4, Quant::A8];
+
+/// One cell of the family's grid: a weight type at a row count. Every
+/// launch's clause runs on each, since each is its own kernel instance.
+#[derive(Clone, Copy)]
+struct Cell {
+    quant: Quant,
+    m: usize,
+}
+
+impl core::fmt::Display for Cell {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{} at M = {}", self.quant.name(), self.m)
+    }
+}
+
+/// Every cell: A4 then A8, each at M = 2 to [`MROWS`].
+fn cells() -> impl Iterator<Item = Cell> {
+    QUANTS
+        .into_iter()
+        .flat_map(|quant| (M_MIN..=MROWS).map(move |m| Cell { quant, m }))
+}
+
+/// The activation rows a NaN clause poisons in turn: the first, the last and
+/// one between (when there is one), since a row's isolation is the same
+/// argument at every row and each takes a 1-row launch of the others.
+fn nan_rows(m: usize) -> Vec<usize> {
+    let mut rows = vec![0, m / 2, m - 1];
+    rows.dedup();
+    rows
+}
+
+/// A clause run over every cell: the first cell that fails names itself in
+/// the failure, and the passing note is the last cell's with the cell count.
+fn every_cell(h: &Harness<'_>, run: fn(&Harness<'_>, Cell) -> Clause) -> Clause {
+    let mut count = 0usize;
+    let mut note = String::new();
+    for c in cells() {
+        match run(h, c).map_err(|e| format!("{c}: {e}"))? {
+            Verdict::Noted(n) => note = n,
+            Verdict::Pass => {}
+            skip @ Verdict::Skip(_) => return Ok(skip),
+        }
+        count += 1;
+    }
+    Ok(Verdict::Noted(format!(
+        "{count} cells (A4 and A8 at M = {M_MIN} to {MROWS}): {note}"
+    )))
+}
 
 /// One plain M-row launch of a clause: `M` rows of `rows` outputs over `cols`
 /// columns, `x` holding the input rows and `y0` the output's own rows, which
 /// the launch adds into.
 struct MatvecCase<'a> {
+    cell: Cell,
     rows: usize,
     cols: usize,
     weights: &'a [u8],
@@ -87,10 +138,11 @@ struct MatvecCase<'a> {
 impl MatvecCase<'_> {
     /// The launch's outputs read back, the window's guards checked.
     fn run(&self, h: &Harness<'_>) -> Result<Vec<f32>, String> {
+        let c = self.cell;
         let (device, stream) = (h.device, h.stream);
-        let (m, rows, cols) = (M, self.rows, self.cols);
+        let (m, rows, cols) = (c.m, self.rows, self.cols);
         let sentinel = f32::from_bits(SENTINEL_BITS);
-        let pad = weight_pad(QUANT);
+        let pad = weight_pad(c.quant);
         let weights_buf = device
             .upload(stream, &padded(0xFFu8, pad, self.weights, WEIGHT_TAIL))
             .map_err(why)?;
@@ -104,7 +156,7 @@ impl MatvecCase<'_> {
             h.kernels.matvec_m(
                 encoder,
                 MatvecMParams {
-                    quant: QUANT,
+                    quant: c.quant,
                     m,
                     rows,
                     cols,
@@ -172,14 +224,15 @@ impl Feed<'_> {
 /// back, the window's guards checked.
 fn seg_m(
     h: &Harness<'_>,
+    c: Cell,
     segments: &[(usize, &[u8])],
     cols: usize,
     feed: Feed<'_>,
 ) -> Result<Vec<f32>, String> {
-    let m = M;
+    let m = c.m;
     let (device, stream) = (h.device, h.stream);
     let sentinel = f32::from_bits(SENTINEL_BITS);
-    let block = QUANT.block_bytes();
+    let block = c.quant.block_bytes();
     let mut weights: Vec<u8> = Vec::new();
     let mut segs: Vec<Segment> = Vec::new();
     let mut out_offset = 0usize;
@@ -193,7 +246,7 @@ fn seg_m(
         weights.extend_from_slice(bytes);
         out_offset += rows;
     }
-    let pad = weight_pad(QUANT);
+    let pad = weight_pad(c.quant);
     let weights_buf = device
         .upload(stream, &padded(0xFFu8, pad, &weights, WEIGHT_TAIL))
         .map_err(why)?;
@@ -214,7 +267,7 @@ fn seg_m(
         h.kernels.matvec_seg_m(
             encoder,
             SegMParams {
-                quant: QUANT,
+                quant: c.quant,
                 m,
                 segments: &segs,
                 weights: weights_buf.window(Elems(pad), Elems(weights.len()))?,
@@ -232,8 +285,8 @@ fn seg_m(
 /// The M-row pair over the stacks and picks `launch` names, its buffers the
 /// 1-row pair's own, reading the hand-on's rows `xn` (`M` rows, then `M` scale
 /// words): the outputs read back, the window's guards checked.
-fn pair_m(h: &Harness<'_>, launch: &PairIn<'_>, xn: &[f32]) -> Result<Vec<f32>, String> {
-    let m = M;
+fn pair_m(h: &Harness<'_>, c: Cell, launch: &PairIn<'_>, xn: &[f32]) -> Result<Vec<f32>, String> {
+    let m = c.m;
     let e = h.geom().experts;
     let (device, stream) = (h.device, h.stream);
     let sentinel = f32::from_bits(SENTINEL_BITS);
@@ -311,6 +364,7 @@ fn pair_m(h: &Harness<'_>, launch: &PairIn<'_>, xn: &[f32]) -> Result<Vec<f32>, 
 /// The head's own uploaded buffers, shared by its M-row launch and the 1-row
 /// references: the weights are the vocabulary's whole width.
 struct HeadBufs {
+    cell: Cell,
     weights: MetalBuffer<u8>,
     x: MetalBuffer<f32>,
     gain: MetalBuffer<f32>,
@@ -327,12 +381,13 @@ impl HeadBufs {
         h: &Harness<'_>,
         handed: &MetalBuffer<f32>,
     ) -> Result<(Vec<f32>, Vec<u32>), String> {
-        let m = M;
+        let c = self.cell;
+        let m = c.m;
         h.encode(|encoder| {
             h.kernels.head_m(
                 encoder,
                 HeadMParams {
-                    quant: QUANT,
+                    quant: c.quant,
                     m,
                     rows: VOCAB,
                     k: HIDDEN,
@@ -355,11 +410,12 @@ impl HeadBufs {
     /// The 1-row head over activation row `at`, into that row's own logits
     /// and pick of the shared buffers.
     fn run_one(&mut self, h: &Harness<'_>, at: usize) -> Result<(Vec<f32>, u32), String> {
+        let c = self.cell;
         h.encode(|encoder| {
             h.kernels.head(
                 encoder,
                 HeadParams {
-                    quant: QUANT,
+                    quant: c.quant,
                     rows: VOCAB,
                     k: HIDDEN,
                     simdgroups: HEAD_SIMD_GROUPS,
@@ -435,28 +491,30 @@ fn row_diff(got: &[f32], want: &[f32], at: usize) -> Result<(), String> {
     same_bits(&format!("row {at} against the 1-row kernel"), got, want)
 }
 
-/// A4 weights whose biases are live. `synthetic::matrix` leaves every group's
-/// bias zero, which would hide a defect in how the bias term takes its input
-/// row's sum; each group here gets a small BF16 bias of a sign and size drawn
-/// by its index.
-fn biased(mut weights: Vec<u8>) -> Vec<u8> {
-    for (i, block) in weights.chunks_exact_mut(QUANT.block_bytes()).enumerate() {
+/// Affine weights whose biases are live. `synthetic::matrix` leaves every
+/// group's bias zero, which would hide a defect in how the bias term takes its
+/// input row's sum; each group here gets a small BF16 bias of a sign and size
+/// drawn by its index. A group's bias is its block's last two bytes, after the
+/// codes and the 2-byte scale, at A4 and at A8.
+fn biased(quant: Quant, mut weights: Vec<u8>) -> Vec<u8> {
+    let block_bytes = quant.block_bytes();
+    for (i, block) in weights.chunks_exact_mut(block_bytes).enumerate() {
         let steps = ((i * 7 + 3) % 17) as f32 - 8.0;
-        block[BIAS_AT..BIAS_AT + 2]
+        block[block_bytes - 2..]
             .copy_from_slice(&gguf::quant::fp32_to_bf16_bits(steps * 2.5e-4).to_le_bytes());
     }
     weights
 }
 
 /// A matrix of `synthetic::matrix`'s random groups with live biases.
-fn matrix(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
-    biased(synthetic::matrix(QUANT, rows, cols, seed))
+fn matrix(quant: Quant, rows: usize, cols: usize, seed: u64) -> Vec<u8> {
+    biased(quant, synthetic::matrix(quant, rows, cols, seed))
 }
 
 /// The plain M-row residual mat-vec at the 27B's attention out and FFN down
 /// shapes and at row counts a SIMD group's rows do not divide, every row the
 /// 1-row kernel's bits on that row's input and residual.
-pub fn matvec(h: &Harness<'_>) -> Clause {
+fn matvec_at(h: &Harness<'_>, c: Cell) -> Clause {
     for (name, rows, cols) in [
         ("attn_out", HIDDEN, OUT_COLS),
         ("down", HIDDEN, FF),
@@ -464,11 +522,12 @@ pub fn matvec(h: &Harness<'_>) -> Clause {
         // dead rows are never stored.
         ("tail_resid", TAIL_ROWS, OUT_COLS),
     ] {
-        let weights = matrix(rows, cols, 0x4D31 + M as u64);
-        let x = x_rows(M, cols, 0x4D40 + M as u64);
-        let y0 = x_rows(M, rows, 0x4D50 + M as u64);
+        let weights = matrix(c.quant, rows, cols, 0x4D31 + c.m as u64);
+        let x = x_rows(c.m, cols, 0x4D40 + c.m as u64);
+        let y0 = x_rows(c.m, rows, 0x4D50 + c.m as u64);
         h.clear_fault()?;
         let got = MatvecCase {
+            cell: c,
             rows,
             cols,
             weights: &weights,
@@ -478,10 +537,10 @@ pub fn matvec(h: &Harness<'_>) -> Clause {
         .run(h)
         .map_err(|e| format!("{name} {rows}x{cols}: {e}"))?;
         common::expect_clean(h, "the M-row mat-vec")?;
-        for row in 0..M {
+        for row in 0..c.m {
             let alone = h
                 .matvec(&Launch {
-                    quant: QUANT,
+                    quant: c.quant,
                     rows,
                     cols,
                     weights: &weights,
@@ -498,12 +557,13 @@ pub fn matvec(h: &Harness<'_>) -> Clause {
     // One row's NaN input, each row in turn: that row's every output is NaN,
     // the other row's the 1-row kernel's bits on its own input and residual.
     let (rows, cols) = (HIDDEN, OUT_COLS);
-    let weights = matrix(rows, cols, 0x4D61);
-    let y0 = x_rows(M, rows, 0x4D63);
-    for nan_row in 0..M {
-        let mut bad = x_rows(M, cols, 0x4D62);
+    let weights = matrix(c.quant, rows, cols, 0x4D61);
+    let y0 = x_rows(c.m, rows, 0x4D63);
+    for nan_row in nan_rows(c.m) {
+        let mut bad = x_rows(c.m, cols, 0x4D62);
         bad[nan_row * cols + 17] = f32::NAN;
         let got = MatvecCase {
+            cell: c,
             rows,
             cols,
             weights: &weights,
@@ -512,7 +572,7 @@ pub fn matvec(h: &Harness<'_>) -> Clause {
         }
         .run(h)
         .map_err(|e| format!("a NaN input row {nan_row}: {e}"))?;
-        for row in 0..M {
+        for row in 0..c.m {
             let mine = &got[row * rows..(row + 1) * rows];
             if row == nan_row {
                 if let Some(r) = mine.iter().position(|v| !v.is_nan()) {
@@ -522,7 +582,7 @@ pub fn matvec(h: &Harness<'_>) -> Clause {
             }
             let alone = h
                 .matvec(&Launch {
-                    quant: QUANT,
+                    quant: c.quant,
                     rows,
                     cols,
                     weights: &weights,
@@ -535,7 +595,7 @@ pub fn matvec(h: &Harness<'_>) -> Clause {
         }
     }
     Ok(Verdict::Noted(
-        "residual at the out, down and row-tail shapes: every row of M = 2 is the 1-row kernel's \
+        "residual at the out, down and row-tail shapes: every row is the 1-row kernel's \
          bits; a NaN input row is NaN in its own row only"
             .to_string(),
     ))
@@ -546,6 +606,7 @@ pub fn matvec(h: &Harness<'_>) -> Clause {
 /// numerators, `partials` the partial sums and `y0` the output's own rows,
 /// which the launch adds into.
 struct HeadNormCase<'a> {
+    cell: Cell,
     rows: usize,
     cols: usize,
     weights: &'a [u8],
@@ -557,11 +618,12 @@ struct HeadNormCase<'a> {
 impl HeadNormCase<'_> {
     /// The launch's outputs read back, the window's guards checked.
     fn run(&self, h: &Harness<'_>) -> Result<Vec<f32>, String> {
+        let c = self.cell;
         let (device, stream) = (h.device, h.stream);
-        let (m, rows, cols) = (M, self.rows, self.cols);
+        let (m, rows, cols) = (c.m, self.rows, self.cols);
         let partials_len = h.geom().delta.partials_stride;
         let sentinel = f32::from_bits(SENTINEL_BITS);
-        let pad = weight_pad(QUANT);
+        let pad = weight_pad(c.quant);
         let weights_buf = device
             .upload(stream, &padded(0xFFu8, pad, self.weights, WEIGHT_TAIL))
             .map_err(why)?;
@@ -578,7 +640,7 @@ impl HeadNormCase<'_> {
             h.kernels.headnorm_m(
                 encoder,
                 HeadNormMParams {
-                    quant: QUANT,
+                    quant: c.quant,
                     m,
                     rows,
                     cols,
@@ -599,21 +661,21 @@ impl HeadNormCase<'_> {
 
 /// The M-row head-normed residual mat-vec at the delta out projection's shape
 /// — the 27B's residual width over the instance's delta heads, the weights'
-/// biases live so the bias fold is held too: every row of M = 2 is the 1-row
+/// biases live so the bias fold is held too: every row is the 1-row
 /// head-normed launch's bits on that row's own numerator, partials and
 /// residual; a row whose one head's partials are not finite raises the gate
 /// site and is NaN in its own row only, the other row its exact bits.
-pub fn headnorm(h: &Harness<'_>) -> Clause {
+fn headnorm_at(h: &Harness<'_>, c: Cell) -> Clause {
     let delta = &h.geom().delta;
     let cols = delta.head_cols * delta.value_heads;
     let partials_len = delta.partials_stride;
-    let weights = matrix(HIDDEN, cols, 0x5310);
+    let weights = matrix(c.quant, HIDDEN, cols, 0x5310);
     // The rows carry different numerators and different partials, so a row
     // reading the other's is a defect the bits catch.
-    let g = x_rows(M, cols, 0x5320 + M as u64);
+    let g = x_rows(c.m, cols, 0x5320 + c.m as u64);
     // Partials are sums of squares: positive, as the 1-row clauses draw them,
     // and each row scaled apart so its head scales are its own.
-    let partials: Vec<f32> = (0..M)
+    let partials: Vec<f32> = (0..c.m)
         .flat_map(|m| {
             super::clauses_norm::head_partials(delta)
                 .into_iter()
@@ -622,10 +684,10 @@ pub fn headnorm(h: &Harness<'_>) -> Clause {
         .collect();
     // The residual is drawn non-zero, so the launch that overwrites instead
     // of adding leaves its own bits.
-    let y0 = x_rows(M, HIDDEN, 0x5340 + M as u64);
+    let y0 = x_rows(c.m, HIDDEN, 0x5340 + c.m as u64);
     let alone = |g: &[f32], partials: &[f32], row: usize| -> Result<Vec<f32>, String> {
         h.headnorm(&HeadNormLaunch {
-            quant: QUANT,
+            quant: c.quant,
             rows: HIDDEN,
             cols,
             weights: &weights,
@@ -638,6 +700,7 @@ pub fn headnorm(h: &Harness<'_>) -> Clause {
     };
     let run_case = |g: &[f32], partials: &[f32]| -> Result<Vec<f32>, String> {
         HeadNormCase {
+            cell: c,
             rows: HIDDEN,
             cols,
             weights: &weights,
@@ -651,7 +714,7 @@ pub fn headnorm(h: &Harness<'_>) -> Clause {
     let got =
         run_case(&g, &partials).map_err(|e| format!("the delta out shape {HIDDEN}x{cols}: {e}"))?;
     common::expect_clean(h, "the M-row head-normed mat-vec")?;
-    for row in 0..M {
+    for row in 0..c.m {
         let want = alone(&g, &partials, row)
             .map_err(|e| format!("the delta out shape {HIDDEN}x{cols}: row {row}: {e}"))?;
         row_diff(&got[row * HIDDEN..(row + 1) * HIDDEN], &want, row)
@@ -660,13 +723,13 @@ pub fn headnorm(h: &Harness<'_>) -> Clause {
     // One row's head whose partials are not finite, each row in turn: the
     // gate site raised, that row NaN where the 1-row kernel's are, the other
     // row the clean 1-row bits.
-    for nan_row in 0..M {
+    for nan_row in nan_rows(c.m) {
         let mut bad = partials.clone();
         bad[nan_row * partials_len + 3 * PARTIALS_PER_HEAD + 1] = f32::NAN;
         h.clear_fault()?;
         let got = run_case(&g, &bad).map_err(|e| format!("a NaN partials row {nan_row}: {e}"))?;
         common::expect_fault(h, "a NaN partials row", FaultSite::LinearGate)?;
-        for row in 0..M {
+        for row in 0..c.m {
             let mine = &got[row * HIDDEN..(row + 1) * HIDDEN];
             if row == nan_row {
                 h.clear_fault()?;
@@ -700,7 +763,7 @@ pub fn headnorm(h: &Harness<'_>) -> Clause {
         h.clear_fault()?;
     }
     Ok(Verdict::Noted(format!(
-        "{HIDDEN}x{cols} over {} heads: every row of M = 2 is the 1-row head-normed launch's \
+        "{HIDDEN}x{cols} over {} heads: every row is the 1-row head-normed launch's \
          bits on its own numerator, partials and residual; a NaN partials row raised linear_gate \
          and stayed NaN in its own row",
         delta.value_heads
@@ -710,14 +773,14 @@ pub fn headnorm(h: &Harness<'_>) -> Clause {
 /// The segmented M-row mat-vec at the 27B's two P1 segment groups, every row
 /// the 1-row segmented launch's bits; one row's NaN input raises the norm
 /// site and is NaN in its own row only.
-pub fn seg(h: &Harness<'_>) -> Clause {
+fn seg_at(h: &Harness<'_>, c: Cell) -> Clause {
     let groups: [(&str, &[usize]); 2] =
         [("delta_p1", &DELTA_SEGMENTS), ("attn_p1", &ATTN_SEGMENTS)];
     for (gi, (name, rows_of)) in groups.iter().enumerate() {
         let owned: Vec<Vec<u8>> = rows_of
             .iter()
             .enumerate()
-            .map(|(j, n)| matrix(*n, HIDDEN, 0x4E10 + (8 * gi + j) as u64))
+            .map(|(j, n)| matrix(c.quant, *n, HIDDEN, 0x4E10 + (8 * gi + j) as u64))
             .collect();
         let segments: Vec<(usize, &[u8])> = rows_of
             .iter()
@@ -728,7 +791,7 @@ pub fn seg(h: &Harness<'_>) -> Clause {
         let rows: usize = rows_of.iter().sum();
         let alone = |x: &[f32], row: usize| -> Result<Vec<f32>, String> {
             h.seg(&SegLaunch {
-                quant: QUANT,
+                quant: c.quant,
                 cols: HIDDEN,
                 segments: segments.clone(),
                 x: &x[row * HIDDEN..(row + 1) * HIDDEN],
@@ -738,25 +801,25 @@ pub fn seg(h: &Harness<'_>) -> Clause {
                 layer: LAYER,
             })
         };
-        let x = x_rows(M, HIDDEN, 0x4E20 + M as u64);
+        let x = x_rows(c.m, HIDDEN, 0x4E20 + c.m as u64);
         h.clear_fault()?;
-        let got = seg_m(h, &segments, HIDDEN, Feed::Gain { x: &x, gain: &g })
+        let got = seg_m(h, c, &segments, HIDDEN, Feed::Gain { x: &x, gain: &g })
             .map_err(|e| format!("{name}: {e}"))?;
         common::expect_clean(h, "the M-row segmented mat-vec")?;
-        for row in 0..M {
+        for row in 0..c.m {
             let want = alone(&x, row).map_err(|e| format!("{name}: {e}"))?;
             let at = row * rows;
             row_diff(&got[at..at + rows], &want, row).map_err(|e| format!("{name}: {e}"))?;
         }
         // One row's NaN input, each row in turn: the norm site raised, that
         // row NaN, the other row the clean 1-row bits.
-        for nan_row in 0..M {
-            let mut bad = x_rows(M, HIDDEN, 0x4E2F);
+        for nan_row in nan_rows(c.m) {
+            let mut bad = x_rows(c.m, HIDDEN, 0x4E2F);
             bad[nan_row * HIDDEN + 17] = f32::NAN;
             h.clear_fault()?;
-            let got = seg_m(h, &segments, HIDDEN, Feed::Gain { x: &bad, gain: &g })?;
+            let got = seg_m(h, c, &segments, HIDDEN, Feed::Gain { x: &bad, gain: &g })?;
             common::expect_fault(h, "a NaN input row", FaultSite::NormQuant)?;
-            for row in 0..M {
+            for row in 0..c.m {
                 let mine = &got[row * rows..(row + 1) * rows];
                 if row == nan_row {
                     if let Some(r) = mine.iter().position(|v| !v.is_nan()) {
@@ -774,7 +837,7 @@ pub fn seg(h: &Harness<'_>) -> Clause {
         }
     }
     Ok(Verdict::Noted(
-        "both P1 groups: every row of M = 2 is the 1-row launch's bits; a NaN input row raised \
+        "both P1 groups: every row is the 1-row launch's bits; a NaN input row raised \
          norm_quant and stayed in its own row"
             .to_string(),
     ))
@@ -800,7 +863,7 @@ fn pair_row(
 
 /// The hand-on of one stream row by the 1-row launch, the step's own: the
 /// row times `gain` and the scale word after it, one more word than the row.
-fn next_one(h: &Harness<'_>, row: &[f32], gain: &[f32]) -> Result<Vec<f32>, String> {
+fn next_one(h: &Harness<'_>, c: Cell, row: &[f32], gain: &[f32]) -> Result<Vec<f32>, String> {
     let (device, stream) = (h.device, h.stream);
     let cols = row.len();
     let sentinel = f32::from_bits(SENTINEL_BITS);
@@ -813,7 +876,7 @@ fn next_one(h: &Harness<'_>, row: &[f32], gain: &[f32]) -> Result<Vec<f32>, Stri
         h.kernels.norm_next(
             encoder,
             NormNextParams {
-                quant: QUANT,
+                quant: c.quant,
                 x: x.window(Elems(0), Elems(cols))?,
                 gain: g.window(Elems(0), Elems(cols))?,
                 eps: EPS,
@@ -837,11 +900,17 @@ fn next_one(h: &Harness<'_>, row: &[f32], gain: &[f32]) -> Result<Vec<f32>, Stri
 /// What the step hands a reader of `M` rows, row by row with the 1-row
 /// hand-on: the rows times `gain` (`cols` values each), then each row's scale
 /// word. The faults the rows raise are left in the fault word.
-fn hand_on_rows(h: &Harness<'_>, x: &[f32], cols: usize, gain: &[f32]) -> Result<Vec<f32>, String> {
-    let mut rows = Vec::with_capacity(M * cols + M);
-    let mut scales = Vec::with_capacity(M);
-    for r in 0..M {
-        let one = next_one(h, &x[r * cols..(r + 1) * cols], gain)?;
+fn hand_on_rows(
+    h: &Harness<'_>,
+    c: Cell,
+    x: &[f32],
+    cols: usize,
+    gain: &[f32],
+) -> Result<Vec<f32>, String> {
+    let mut rows = Vec::with_capacity(c.m * cols + c.m);
+    let mut scales = Vec::with_capacity(c.m);
+    for r in 0..c.m {
+        let one = next_one(h, c, &x[r * cols..(r + 1) * cols], gain)?;
         rows.extend_from_slice(&one[..cols]);
         scales.push(one[cols]);
     }
@@ -852,8 +921,14 @@ fn hand_on_rows(h: &Harness<'_>, x: &[f32], cols: usize, gain: &[f32]) -> Result
 /// The hand-on over `M` rows of `x`: the rows times `gain` and the `M` scale
 /// words, the guards around the output window checked: the front guard is a
 /// vector wide, so the window starts on 16 bytes as the launch needs.
-fn next_m(h: &Harness<'_>, x: &[f32], cols: usize, gain: &[f32]) -> Result<Vec<f32>, String> {
-    let m = M;
+fn next_m(
+    h: &Harness<'_>,
+    c: Cell,
+    x: &[f32],
+    cols: usize,
+    gain: &[f32],
+) -> Result<Vec<f32>, String> {
+    let m = c.m;
     let (device, stream) = (h.device, h.stream);
     let sentinel = f32::from_bits(SENTINEL_BITS);
     let words = m * cols + m;
@@ -873,7 +948,7 @@ fn next_m(h: &Harness<'_>, x: &[f32], cols: usize, gain: &[f32]) -> Result<Vec<f
         h.kernels.norm_next_m(
             encoder,
             NormNextMParams {
-                quant: QUANT,
+                quant: c.quant,
                 m,
                 x: x_buf.window(Elems(ACT_PAD), Elems(m * cols))?,
                 gain: gain_buf.window(Elems(ACT_PAD), Elems(cols))?,
@@ -898,15 +973,15 @@ fn next_m(h: &Harness<'_>, x: &[f32], cols: usize, gain: &[f32]) -> Result<Vec<f
 /// The hand-on over M rows of the 27B's stream: each row's values and scale
 /// word the 1-row hand-on's bits on that row alone; a row whose stream is not
 /// finite raises the norm site and hands on NaN, the other row the 1-row bits.
-pub fn hand_on(h: &Harness<'_>) -> Clause {
+fn hand_on_at(h: &Harness<'_>, c: Cell) -> Clause {
     let g = gain(HIDDEN, 0x5010);
-    let x = x_rows(M, HIDDEN, 0x5020 + M as u64);
+    let x = x_rows(c.m, HIDDEN, 0x5020 + c.m as u64);
     h.clear_fault()?;
-    let want = hand_on_rows(h, &x, HIDDEN, &g)?;
+    let want = hand_on_rows(h, c, &x, HIDDEN, &g)?;
     common::expect_clean(h, "the 1-row hand-on")?;
-    let got = next_m(h, &x, HIDDEN, &g)?;
+    let got = next_m(h, c, &x, HIDDEN, &g)?;
     common::expect_clean(h, "the M-row hand-on")?;
-    for row in 0..M {
+    for row in 0..c.m {
         same_bits(
             &format!("row {row}'s values against the 1-row hand-on"),
             &got[row * HIDDEN..(row + 1) * HIDDEN],
@@ -915,43 +990,43 @@ pub fn hand_on(h: &Harness<'_>) -> Clause {
     }
     same_bits(
         "the scale words against the 1-row hand-on's",
-        &got[M * HIDDEN..],
-        &want[M * HIDDEN..],
+        &got[c.m * HIDDEN..],
+        &want[c.m * HIDDEN..],
     )?;
     // One row's NaN stream, each row in turn: its scale NaN and the norm site
     // raised, the other row's words the clean 1-row words.
-    for nan_row in 0..M {
-        let mut bad = x_rows(M, HIDDEN, 0x502F);
+    for nan_row in nan_rows(c.m) {
+        let mut bad = x_rows(c.m, HIDDEN, 0x502F);
         bad[nan_row * HIDDEN + 17] = f32::NAN;
         h.clear_fault()?;
-        let want = hand_on_rows(h, &bad, HIDDEN, &g)?;
+        let want = hand_on_rows(h, c, &bad, HIDDEN, &g)?;
         h.clear_fault()?;
-        let got = next_m(h, &bad, HIDDEN, &g)?;
+        let got = next_m(h, c, &bad, HIDDEN, &g)?;
         common::expect_fault(h, "a NaN stream row", FaultSite::NormQuant)?;
-        if !got[M * HIDDEN + nan_row].is_nan() {
+        if !got[c.m * HIDDEN + nan_row].is_nan() {
             return Err(format!(
                 "the NaN row {nan_row}'s scale is {:?}, not NaN",
-                got[M * HIDDEN + nan_row]
+                got[c.m * HIDDEN + nan_row]
             ));
         }
-        for row in (0..M).filter(|row| *row != nan_row) {
+        for row in (0..c.m).filter(|row| *row != nan_row) {
             same_bits(
                 &format!("a NaN stream row {nan_row}: row {row}"),
                 &got[row * HIDDEN..(row + 1) * HIDDEN],
                 &want[row * HIDDEN..(row + 1) * HIDDEN],
             )?;
-            if got[M * HIDDEN + row].to_bits() != want[M * HIDDEN + row].to_bits() {
+            if got[c.m * HIDDEN + row].to_bits() != want[c.m * HIDDEN + row].to_bits() {
                 return Err(format!(
                     "a NaN stream row {nan_row} changed row {row}'s scale: {:?} against {:?}",
-                    got[M * HIDDEN + row],
-                    want[M * HIDDEN + row]
+                    got[c.m * HIDDEN + row],
+                    want[c.m * HIDDEN + row]
                 ));
             }
         }
     }
     h.clear_fault()?;
     Ok(Verdict::Noted(format!(
-        "{HIDDEN} values a row: every row of M = 2 and its scale word are the 1-row hand-on's \
+        "{HIDDEN} values a row: every row and its scale word are the 1-row hand-on's \
          bits; a NaN stream row raised norm_quant and handed on a NaN scale, the other row's \
          words unchanged"
     )))
@@ -962,14 +1037,14 @@ pub fn hand_on(h: &Harness<'_>) -> Clause {
 /// launch's bits (the engine step's) on each row's stream; a NaN stream row
 /// is NaN in its own row, with the norm site raised, and the other row keeps
 /// the 1-row bits.
-pub fn seg_scaled(h: &Harness<'_>) -> Clause {
+fn seg_scaled_at(h: &Harness<'_>, c: Cell) -> Clause {
     let groups: [(&str, &[usize]); 2] =
         [("delta_p1", &DELTA_SEGMENTS), ("attn_p1", &ATTN_SEGMENTS)];
     for (gi, (name, rows_of)) in groups.iter().enumerate() {
         let owned: Vec<Vec<u8>> = rows_of
             .iter()
             .enumerate()
-            .map(|(j, n)| matrix(*n, HIDDEN, 0x5110 + (8 * gi + j) as u64))
+            .map(|(j, n)| matrix(c.quant, *n, HIDDEN, 0x5110 + (8 * gi + j) as u64))
             .collect();
         let segments: Vec<(usize, &[u8])> = rows_of
             .iter()
@@ -980,7 +1055,7 @@ pub fn seg_scaled(h: &Harness<'_>) -> Clause {
         let rows: usize = rows_of.iter().sum();
         let alone = |x: &[f32], row: usize| -> Result<Vec<f32>, String> {
             h.seg(&SegLaunch {
-                quant: QUANT,
+                quant: c.quant,
                 cols: HIDDEN,
                 segments: segments.clone(),
                 x: &x[row * HIDDEN..(row + 1) * HIDDEN],
@@ -990,25 +1065,25 @@ pub fn seg_scaled(h: &Harness<'_>) -> Clause {
                 layer: LAYER,
             })
         };
-        let x = x_rows(M, HIDDEN, 0x5120 + M as u64);
-        let xn = hand_on_rows(h, &x, HIDDEN, &g)?;
+        let x = x_rows(c.m, HIDDEN, 0x5120 + c.m as u64);
+        let xn = hand_on_rows(h, c, &x, HIDDEN, &g)?;
         h.clear_fault()?;
-        let got = seg_m(h, &segments, HIDDEN, Feed::Scaled { xn: &xn })
+        let got = seg_m(h, c, &segments, HIDDEN, Feed::Scaled { xn: &xn })
             .map_err(|e| format!("{name}: {e}"))?;
         common::expect_clean(h, "the scaled M-row segmented mat-vec")?;
-        for row in 0..M {
+        for row in 0..c.m {
             let want = alone(&x, row).map_err(|e| format!("{name}: {e}"))?;
             let at = row * rows;
             row_diff(&got[at..at + rows], &want, row).map_err(|e| format!("{name}: {e}"))?;
         }
-        for nan_row in 0..M {
-            let mut bad = x_rows(M, HIDDEN, 0x512F);
+        for nan_row in nan_rows(c.m) {
+            let mut bad = x_rows(c.m, HIDDEN, 0x512F);
             bad[nan_row * HIDDEN + 17] = f32::NAN;
-            let xn = hand_on_rows(h, &bad, HIDDEN, &g)?;
+            let xn = hand_on_rows(h, c, &bad, HIDDEN, &g)?;
             h.clear_fault()?;
-            let got = seg_m(h, &segments, HIDDEN, Feed::Scaled { xn: &xn })?;
+            let got = seg_m(h, c, &segments, HIDDEN, Feed::Scaled { xn: &xn })?;
             common::expect_fault(h, "a NaN stream row", FaultSite::NormQuant)?;
-            for row in 0..M {
+            for row in 0..c.m {
                 let mine = &got[row * rows..(row + 1) * rows];
                 if row == nan_row {
                     if let Some(r) = mine.iter().position(|v| !v.is_nan()) {
@@ -1026,7 +1101,7 @@ pub fn seg_scaled(h: &Harness<'_>) -> Clause {
         }
     }
     Ok(Verdict::Noted(
-        "both P1 groups: every row of M = 2 read scaled is the 1-row norm-on-load launch's \
+        "both P1 groups: every row read scaled is the 1-row norm-on-load launch's \
          bits; a NaN stream row raised norm_quant and stayed in its own row"
             .to_string(),
     ))
@@ -1036,21 +1111,21 @@ pub fn seg_scaled(h: &Harness<'_>) -> Clause {
 /// 1-row pair's bits over the same stacks and picks; a NaN stream row is NaN
 /// in its own row's slots only; an id past the stack is NaN in its slot of
 /// every row and raises the expert-id site.
-pub fn pair_scaled(h: &Harness<'_>) -> Clause {
+fn pair_scaled_at(h: &Harness<'_>, c: Cell) -> Clause {
     let e = h.geom().experts;
     let cols = PAIR_COLS;
-    let weights = synthetic_pair_for(&e, QUANT, 0x5210);
+    let weights = synthetic_pair_for(&e, c.quant, 0x5210);
     let weights = PairWeights {
-        gate: biased(weights.gate),
-        up: biased(weights.up),
-        shared_gate: biased(weights.shared_gate),
-        shared_up: biased(weights.shared_up),
+        gate: biased(c.quant, weights.gate),
+        up: biased(c.quant, weights.up),
+        shared_gate: biased(c.quant, weights.shared_gate),
+        shared_up: biased(c.quant, weights.shared_up),
     };
     let norm = synthetic_norm(EPS);
     let ids: Vec<i32> = (0..e.routed_ids).map(|i| (i % 4) as i32).collect();
     let launch = PairIn {
-        quant: QUANT,
-        shared_quant: QUANT,
+        quant: c.quant,
+        shared_quant: c.quant,
         n_experts: N_EXPERTS,
         ids: &ids,
         gate: &weights.gate,
@@ -1062,26 +1137,27 @@ pub fn pair_scaled(h: &Harness<'_>) -> Clause {
         y0: &common::sentinel_rows(e.slots * e.k),
     };
     let out_words = e.slots * e.k;
-    let x = x_rows(M, cols, 0x5220 + M as u64);
-    let xn = hand_on_rows(h, &x, cols, &norm.gain)?;
+    let x = x_rows(c.m, cols, 0x5220 + c.m as u64);
+    let xn = hand_on_rows(h, c, &x, cols, &norm.gain)?;
     h.clear_fault()?;
-    let got = pair_m(h, &launch, &xn)?;
+    let got = pair_m(h, c, &launch, &xn)?;
     common::expect_clean(h, "the scaled M-row pair")?;
-    for row in 0..M {
+    for row in 0..c.m {
         let want = pair_row(h, &launch, &x, cols, row)?;
         let at = row * out_words;
         row_diff(&got[at..at + out_words], &want, row)?;
     }
-    let mut bad = x_rows(M, cols, 0x522F);
-    bad[cols + 17] = f32::NAN;
-    let xn = hand_on_rows(h, &bad, cols, &norm.gain)?;
+    let mut bad = x_rows(c.m, cols, 0x522F);
+    let nan_row = c.m - 1;
+    bad[nan_row * cols + 17] = f32::NAN;
+    let xn = hand_on_rows(h, c, &bad, cols, &norm.gain)?;
     h.clear_fault()?;
-    let got = pair_m(h, &launch, &xn)?;
-    for row in 0..M {
+    let got = pair_m(h, c, &launch, &xn)?;
+    for row in 0..c.m {
         let want = pair_row(h, &launch, &bad, cols, row)?;
         let at = row * out_words;
         let mine = &got[at..at + out_words];
-        if row == 1 {
+        if row == nan_row {
             if let Some(r) = mine.iter().position(|v| !v.is_nan()) {
                 return Err(format!("the NaN row kept word {r} finite: {:?}", mine[r]));
             }
@@ -1099,12 +1175,12 @@ pub fn pair_scaled(h: &Harness<'_>) -> Clause {
         ids: &bad_ids,
         ..launch
     };
-    let x = x_rows(M, cols, 0x522E);
-    let xn = hand_on_rows(h, &x, cols, &norm.gain)?;
+    let x = x_rows(c.m, cols, 0x522E);
+    let xn = hand_on_rows(h, c, &x, cols, &norm.gain)?;
     h.clear_fault()?;
-    let got = pair_m(h, &bad_launch, &xn)?;
+    let got = pair_m(h, c, &bad_launch, &xn)?;
     common::expect_fault(h, "an id past the stack", FaultSite::ExpertId)?;
-    for row in 0..M {
+    for row in 0..c.m {
         let want = pair_row(h, &bad_launch, &x, cols, row)?;
         let at = row * out_words;
         row_diff(&got[at..at + out_words], &want, row)
@@ -1119,7 +1195,7 @@ pub fn pair_scaled(h: &Harness<'_>) -> Clause {
     }
     h.clear_fault()?;
     Ok(Verdict::Noted(format!(
-        "at the instance's {} slots of {}: every row of M = 2 read scaled is the 1-row pair's \
+        "at the instance's {} slots of {}: every row read scaled is the 1-row pair's \
          bits; a NaN stream row stayed in its own row's slots; an id past the stack raised \
          expert_id in its slot of every row",
         e.slots, e.k
@@ -1129,12 +1205,13 @@ pub fn pair_scaled(h: &Harness<'_>) -> Clause {
 /// The scaled M-row head over the whole 27B vocabulary: every row's logits and
 /// pick the 1-row head's on that row's stream; a NaN stream row leaves its own
 /// logits NaN and its pick no token, the other row clean.
-pub fn head_scaled(h: &Harness<'_>) -> Clause {
-    let weights = matrix(VOCAB, HIDDEN, 0x5250);
+fn head_scaled_at(h: &Harness<'_>, c: Cell) -> Clause {
+    let weights = matrix(c.quant, VOCAB, HIDDEN, 0x5250);
     let g = gain(HIDDEN, 0x5260);
     let (device, stream) = (h.device, h.stream);
     let bufs = |x: &[f32]| -> Result<HeadBufs, String> {
         Ok(HeadBufs {
+            cell: c,
             weights: device.upload(stream, &weights).map_err(why)?,
             x: device.upload(stream, x).map_err(why)?,
             gain: device.upload(stream, &g).map_err(why)?,
@@ -1149,8 +1226,8 @@ pub fn head_scaled(h: &Harness<'_>) -> Clause {
                 .map_err(why)?,
         })
     };
-    let x = x_rows(M, HIDDEN, 0x5270 + M as u64);
-    let xn = hand_on_rows(h, &x, HIDDEN, &g)?;
+    let x = x_rows(c.m, HIDDEN, 0x5270 + c.m as u64);
+    let xn = hand_on_rows(h, c, &x, HIDDEN, &g)?;
     let handed = device.upload(stream, &xn).map_err(why)?;
     let mut run = bufs(&x)?;
     h.clear_fault()?;
@@ -1164,9 +1241,10 @@ pub fn head_scaled(h: &Harness<'_>) -> Clause {
             return Err(format!("row {row}'s pick is {pick}, the 1-row head's {id}"));
         }
     }
-    let mut bad = x_rows(M, HIDDEN, 0x527F);
-    bad[HIDDEN + 17] = f32::NAN;
-    let xn = hand_on_rows(h, &bad, HIDDEN, &g)?;
+    let mut bad = x_rows(c.m, HIDDEN, 0x527F);
+    let nan_row = c.m - 1;
+    bad[nan_row * HIDDEN + 17] = f32::NAN;
+    let xn = hand_on_rows(h, c, &bad, HIDDEN, &g)?;
     let handed = device.upload(stream, &xn).map_err(why)?;
     let mut run = bufs(&bad)?;
     h.clear_fault()?;
@@ -1178,7 +1256,7 @@ pub fn head_scaled(h: &Harness<'_>) -> Clause {
         let (alone, id) = run.run_one(h, row)?;
         let at = row * VOCAB;
         let mine = &logits[at..at + VOCAB];
-        if row == 1 {
+        if row == nan_row {
             if let Some(r) = mine.iter().position(|v| !v.is_nan()) {
                 return Err(format!("the NaN row kept logit {r} finite: {:?}", mine[r]));
             }
@@ -1198,7 +1276,7 @@ pub fn head_scaled(h: &Harness<'_>) -> Clause {
     }
     h.clear_fault()?;
     Ok(Verdict::Noted(format!(
-        "{VOCAB}x{HIDDEN}: every row of M = 2 read scaled has the 1-row head's logits and \
+        "{VOCAB}x{HIDDEN}: every row read scaled has the 1-row head's logits and \
          pick; a NaN stream row's pick is no token"
     )))
 }
@@ -1280,7 +1358,7 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
     // the same row count.
     let delta = &h.geom().delta;
     let hn_cols = delta.head_cols * delta.value_heads;
-    let hn_weights = matrix(rows, hn_cols, 0x4F94);
+    let hn_weights = matrix(QUANT, rows, hn_cols, 0x4F94);
     let hn_partials_len = delta.partials_stride;
     let mut bufs = RefusalBufs {
         weights: device
@@ -1381,21 +1459,19 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
             },
         ),
         case(
-            "M of 3",
-            "M is 3",
+            "M past the family's eight",
+            "M is 9",
             Plain {
-                m: 3,
-                x_words: 3 * cols,
-                y_words: 3 * rows,
+                m: MROWS + 1,
                 ..plain
             },
         ),
-        case("M of 5", "M is 5", Plain { m: 5, ..plain }),
+        case("M of 16", "M is 16", Plain { m: 16, ..plain }),
         case(
-            "the A8 family",
+            "the A4H family",
             "no M-row entry",
             Plain {
-                quant: Quant::A8,
+                quant: Quant::A4H,
                 ..plain
             },
         ),
@@ -1461,25 +1537,16 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
             }),
         ),
         BadArg::new(
-            "the head-normed M of 3",
-            "this launch is a4 at M = 3",
+            "the head-normed M past the family's eight",
+            "this launch is a4 at M = 9",
             Box::new(|b, enc| {
-                headnorm_launch(
-                    b,
-                    enc,
-                    QUANT,
-                    3,
-                    3 * hn_cols,
-                    3 * hn_partials_len,
-                    3 * rows,
-                    rows,
-                )
+                headnorm_launch(b, enc, QUANT, MROWS + 1, both.0, both.1, both.2, rows)
             }),
         ),
         BadArg::new(
-            "the head-normed A8 family",
-            "this launch is a8",
-            Box::new(|b, enc| headnorm_launch(b, enc, Quant::A8, 2, both.0, both.1, both.2, rows)),
+            "the head-normed A4H family",
+            "this launch is a4h",
+            Box::new(|b, enc| headnorm_launch(b, enc, Quant::A4H, 2, both.0, both.1, both.2, rows)),
         ),
         BadArg::new(
             "a short head-normed g window",
@@ -1635,10 +1702,10 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
             Box::new(|b: &mut RefusalBufs, enc| next_launch(b, enc, QUANT, 1, cols, cols + 1, EPS)),
         ),
         BadArg::new(
-            "the A8 family",
+            "the A4H family",
             "no M-row entry",
             Box::new(|b: &mut RefusalBufs, enc| {
-                next_launch(b, enc, Quant::A8, 2, cols, 2 * cols + 2, EPS)
+                next_launch(b, enc, Quant::A4H, 2, cols, 2 * cols + 2, EPS)
             }),
         ),
         BadArg::new(
@@ -1708,6 +1775,269 @@ pub fn refusals(h: &Harness<'_>) -> Clause {
     )))
 }
 
+/// One few-row launch of a clause: `m` rows of `rows` outputs over `cols`
+/// columns, `x` holding at least `m` input rows and `y0` the output's own rows.
+struct FewCase<'a> {
+    m: usize,
+    quant: Quant,
+    rows: usize,
+    cols: usize,
+    weights: &'a [u8],
+    x: &'a [f32],
+    y0: &'a [f32],
+}
+
+impl FewCase<'_> {
+    /// The launch's outputs read back, the window's guards checked.
+    fn run(&self, h: &Harness<'_>) -> Result<Vec<f32>, String> {
+        let (device, stream) = (h.device, h.stream);
+        let (m, rows, cols) = (self.m, self.rows, self.cols);
+        let sentinel = f32::from_bits(SENTINEL_BITS);
+        let pad = weight_pad(QUANT);
+        let weights_buf = device
+            .upload(stream, &padded(0xFFu8, pad, self.weights, WEIGHT_TAIL))
+            .map_err(why)?;
+        let x_buf = device
+            .upload(stream, &padded(sentinel, ACT_PAD, &self.x[..m * cols], 1))
+            .map_err(why)?;
+        let mut y = device
+            .upload(
+                stream,
+                &padded(sentinel, OUT_GUARD, &self.y0[..m * rows], OUT_GUARD),
+            )
+            .map_err(why)?;
+        h.encode(|encoder| {
+            h.kernels.matvec_few(
+                encoder,
+                MatvecFewParams {
+                    quant: self.quant,
+                    m,
+                    rows,
+                    cols,
+                    weights: weights_buf.window(Elems(pad), Elems(self.weights.len()))?,
+                    x: x_buf.window(Elems(ACT_PAD), Elems(m * cols))?,
+                    x_stride: cols,
+                    y: y.window_mut(Elems(OUT_GUARD), Elems(m * rows))?,
+                },
+            )
+        })?;
+        read_guards(h, &y, m * rows)
+    }
+}
+
+/// The unit roundoff of f32.
+const UNIT: f64 = 1.0 / 16_777_216.0;
+
+/// The few-row residual mat-vec at M = 3 to 16 (one activation fragment to 8,
+/// two from 9): every activation row within the
+/// f32 accumulation band of the exact value and of the 1-row kernel's output
+/// on that row alone. THE ORDER IS THE GATE: the fragment multiply's order is
+/// not the 1-row kernel's, so the bands are the two paths' own (`few_path_ops`
+/// and `oracle::band`) over the terms' magnitudes, and a row offset wrong in
+/// one fragment is far outside them. A NaN input row is NaN in its own
+/// outputs only, and a row count a threadgroup's 32 rows do not divide never
+/// stores past its last row.
+pub fn matvec_few(h: &Harness<'_>) -> Clause {
+    for (name, rows, cols) in [
+        ("attn_out", HIDDEN, OUT_COLS),
+        ("down", HIDDEN, FF),
+        // 47 threadgroups of 32 rows and one of 27.
+        ("tail_resid", TAIL_ROWS, OUT_COLS),
+    ] {
+        let nblocks = cols / QUANT.values_per_block();
+        let weights = matrix(QUANT, rows, cols, 0x4D71);
+        let x = x_rows(FEW_MAX, cols, 0x4D72);
+        let y0 = x_rows(FEW_MAX, rows, 0x4D73);
+        // Each activation row's exact outputs and the 1-row kernel's, once:
+        // the rows are the same for every M.
+        let mut exact = Vec::with_capacity(FEW_MAX);
+        let mut alone = Vec::with_capacity(FEW_MAX);
+        for row in 0..FEW_MAX {
+            let xr = &x[row * cols..(row + 1) * cols];
+            let x64: Vec<f64> = xr.iter().map(|&v| f64::from(v)).collect();
+            exact.push(
+                oracle::reference(QUANT, &weights, rows, cols, &x64)
+                    .map_err(|e| format!("{name}: {e}"))?,
+            );
+            h.clear_fault()?;
+            alone.push(
+                h.matvec(&Launch {
+                    quant: QUANT,
+                    rows,
+                    cols,
+                    weights: &weights,
+                    x: xr,
+                    y0: &y0[row * rows..(row + 1) * rows],
+                    mode: ModeSpec::Residual,
+                })
+                .map_err(|e| format!("{name}: {e}"))?,
+            );
+        }
+        let one = oracle::band(QUANT, nblocks, oracle::Kind::Residual);
+        let few_factor = oracle::gamma_bound(few_path_ops(nblocks));
+        let floor = (few_path_ops(nblocks) + one.ops()) as f64 * f64::from(f32::MIN_POSITIVE);
+        for m in FEW_MIN..=FEW_MAX {
+            h.clear_fault()?;
+            let got = FewCase {
+                m,
+                quant: QUANT,
+                rows,
+                cols,
+                weights: &weights,
+                x: &x,
+                y0: &y0,
+            }
+            .run(h)
+            .map_err(|e| format!("{name} {rows}x{cols} M={m}: {e}"))?;
+            common::expect_clean(h, "the few-row mat-vec")?;
+            for row in 0..m {
+                let mine = &got[row * rows..(row + 1) * rows];
+                for r in 0..rows {
+                    let carried = f64::from(y0[row * rows + r]);
+                    let want = carried + exact[row].y[r];
+                    let width =
+                        (few_factor + one.factor()) * exact[row].magnitude[r] * (1.0 + UNIT)
+                            + 2.0 * UNIT * want.abs()
+                            + floor;
+                    let to_exact = (f64::from(mine[r]) - want).abs();
+                    let to_alone = (f64::from(mine[r]) - f64::from(alone[row][r])).abs();
+                    if !mine[r].is_finite() || to_exact > width || to_alone > width {
+                        return Err(format!(
+                            "{name} {rows}x{cols} M={m} row {row} output {r}: got {:e}, the 1-row \
+                             kernel {:e}, exact {want:e}; errors {to_exact:e} and {to_alone:e} over \
+                             the band {width:e}",
+                            mine[r], alone[row][r]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    // One row's NaN input, each row in turn at M = 5, the one fragment's last
+    // row count, the second fragment's first and its last: that row's
+    // every output is NaN and the other rows' are untouched by it (the same
+    // launch without the NaN, bit for bit: a row's columns never mix).
+    let (rows, cols) = (HIDDEN, OUT_COLS);
+    let weights = matrix(QUANT, rows, cols, 0x4D74);
+    let y0 = x_rows(FEW_MAX, rows, 0x4D76);
+    let clean = x_rows(FEW_MAX, cols, 0x4D75);
+    for m in [5, FEW_FRAGMENT, FEW_FRAGMENT + 1, FEW_MAX] {
+        let base = FewCase {
+            m,
+            quant: QUANT,
+            rows,
+            cols,
+            weights: &weights,
+            x: &clean,
+            y0: &y0,
+        }
+        .run(h)
+        .map_err(|e| format!("M={m} clean: {e}"))?;
+        for nan_row in 0..m {
+            let mut bad = clean.clone();
+            bad[nan_row * cols + 17] = f32::NAN;
+            let got = FewCase {
+                m,
+                quant: QUANT,
+                rows,
+                cols,
+                weights: &weights,
+                x: &bad,
+                y0: &y0,
+            }
+            .run(h)
+            .map_err(|e| format!("M={m} NaN row {nan_row}: {e}"))?;
+            for row in 0..m {
+                let span = row * rows..(row + 1) * rows;
+                if row == nan_row {
+                    if let Some(r) = got[span].iter().position(|v| !v.is_nan()) {
+                        return Err(format!("M={m}: the NaN row kept output {r} finite"));
+                    }
+                } else {
+                    same_bits(
+                        &format!("M={m} row {row} beside NaN row {nan_row}"),
+                        &got[span.clone()],
+                        &base[span],
+                    )?;
+                }
+            }
+        }
+    }
+    // The launch's refusals, by name.
+    let weights = matrix(QUANT, HIDDEN, OUT_COLS, 0x4D77);
+    let x = x_rows(FEW_MAX + 1, OUT_COLS, 0x4D78);
+    let y0 = x_rows(FEW_MAX + 1, HIDDEN, 0x4D79);
+    for (what, m, quant, cols, expect) in [
+        ("M = 2", 2, QUANT, OUT_COLS, "the launch runs"),
+        ("M = 17", FEW_MAX + 1, QUANT, OUT_COLS, "the launch runs"),
+        ("A8", 4, Quant::A8, OUT_COLS, "no few-row entry"),
+        (
+            "columns of a lone group",
+            4,
+            QUANT,
+            OUT_COLS - 64,
+            "not whole blocks",
+        ),
+    ] {
+        let err = FewCase {
+            m,
+            quant,
+            rows: HIDDEN,
+            cols,
+            weights: &weights,
+            x: &x,
+            y0: &y0,
+        }
+        .run(h)
+        .err()
+        .ok_or_else(|| format!("{what} was not refused"))?;
+        if !err.contains(expect) {
+            return Err(format!("{what}: refused as {err:?}, not as {expect:?}"));
+        }
+    }
+    Ok(Verdict::Noted(
+        "residual at the out, down and row-tail shapes, M = 3 to 16: every row within the f32 band \
+         of the exact value and of the 1-row kernel; a NaN input row is NaN in its own row only; \
+         M outside 3..=16, A8 and a half block of columns are refused by name"
+            .to_string(),
+    ))
+}
+
+/// [`matvec_at`] over every cell.
+pub fn matvec(h: &Harness<'_>) -> Clause {
+    every_cell(h, matvec_at)
+}
+
+/// [`headnorm_at`] over every cell.
+pub fn headnorm(h: &Harness<'_>) -> Clause {
+    every_cell(h, headnorm_at)
+}
+
+/// [`seg_at`] over every cell.
+pub fn seg(h: &Harness<'_>) -> Clause {
+    every_cell(h, seg_at)
+}
+
+/// [`hand_on_at`] over every cell.
+pub fn hand_on(h: &Harness<'_>) -> Clause {
+    every_cell(h, hand_on_at)
+}
+
+/// [`seg_scaled_at`] over every cell.
+pub fn seg_scaled(h: &Harness<'_>) -> Clause {
+    every_cell(h, seg_scaled_at)
+}
+
+/// [`pair_scaled_at`] over every cell.
+pub fn pair_scaled(h: &Harness<'_>) -> Clause {
+    every_cell(h, pair_scaled_at)
+}
+
+/// [`head_scaled_at`] over every cell.
+pub fn head_scaled(h: &Harness<'_>) -> Clause {
+    every_cell(h, head_scaled_at)
+}
+
 /// The M-row clauses in the order the gate runs them: the launches in the
 /// step's order, the hand-on and the scaled readers, then the refusals.
 pub fn table<'a>(h: &'a Harness<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)> {
@@ -1720,6 +2050,7 @@ pub fn table<'a>(h: &'a Harness<'a>) -> Vec<(&'static str, super::ClauseRun<'a>)
             "mrows_headnorm",
             Box::new(move || headnorm(h)) as super::ClauseRun<'a>,
         ),
+        ("mrows_few", Box::new(move || matvec_few(h))),
         ("mrows_seg", Box::new(move || seg(h))),
         ("mrows_next", Box::new(move || hand_on(h))),
         ("mrows_seg_scaled", Box::new(move || seg_scaled(h))),
