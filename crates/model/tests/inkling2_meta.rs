@@ -9,8 +9,7 @@
 //!
 //! `hw_inkling2_fixture` is the fixture-tier clause: the family's planted fixture
 //! (`arch::inkling2::fixture::spec`, thirteen layers of the Mini) read back through the same
-//! reader — `BLOOMERY_REF_MODEL` names it where the profile resolved one (the fixture tier's), the
-//! planted path otherwise.
+//! reader, at its planted path (the file the fixture tier resolves).
 //!
 //! `hw_`: needs the files on the box (`just gate-inkling2-meta`). Headers only: seconds.
 
@@ -391,8 +390,7 @@ const SMALL_PLAN: &[&str] = &[
 ];
 
 /// The fixture's planted path under the fixture root (`arch::inkling2::fixture::spec`'s
-/// directory): the fixture-tier file the gate reads there, and what `BLOOMERY_REF_MODEL` names
-/// where the profile resolved one.
+/// directory): the fixture-tier file the gate reads there.
 const FIXTURE: &str = "/models/fixtures/inkling2/inkling2-fixture-00001-of-00001.gguf";
 
 /// The fixture's whole length, so a different file at the same path fails before the pins.
@@ -438,25 +436,13 @@ const FIXTURE_TENSORS: &[&str] = &[
 
 /// The fixture-tier clause: the planted fixture read back through the same reader — its
 /// description, visits and slot table, tensors by role and type — pinned like the real files'.
-/// `BLOOMERY_REF_MODEL` names the file where the profile resolved one (the fixture tier's, or a
-/// written copy), the planted path otherwise; a file that is not the family's fixture is refused
-/// by its architecture, and the planted path absent leaves the clause to the landing that plants
-/// it.
+/// It reads the planted path; a different file there fails on its length before the pins.
 #[test]
-#[ignore = "needs the inkling2 fixture on the box (BLOOMERY_REF_MODEL names it where set)"]
+#[ignore = "needs the inkling2 fixture on the box"]
 fn hw_inkling2_fixture() {
     let mut o = String::new();
     let mut b = Vec::new();
-    let path = std::env::var_os("BLOOMERY_REF_MODEL")
-        .map(|v| v.into_string().expect("BLOOMERY_REF_MODEL must be UTF-8"))
-        .filter(|p| {
-            let split = Split::open(p).ok();
-            split.is_some_and(|s| {
-                s.value(model::fixture::KEY_VERSION).is_some()
-                    && s.architecture() == Some("inkling2")
-            })
-        })
-        .unwrap_or_else(|| FIXTURE.to_string());
+    let path = FIXTURE.to_string();
     let len = std::fs::metadata(&path).map(|m| m.len());
     let split = Split::open(&path).unwrap_or_else(|e| {
         panic!(
