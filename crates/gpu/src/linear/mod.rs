@@ -59,6 +59,7 @@
 //! being finite, and writes a NaN there, never a plausible value.
 
 pub mod conv;
+pub mod conv_res;
 pub mod delta;
 pub mod mixer_kda;
 pub mod norm_gate;

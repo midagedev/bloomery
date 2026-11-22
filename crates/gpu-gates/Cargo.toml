@@ -1021,3 +1021,10 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_inkling2_attn"
 required-features = ["gpu"]
+
+# inkling2-step: Inkling 2's visit pipeline (the normed attn-res mix, the loop controller, the residual short
+# convs), seeded against f64 rules of the PR's graph and the whole forced mix/controller chain against the
+# fixture's own node dumps.
+[[bin]]
+name = "gate_inkling2_step"
+required-features = ["gpu"]

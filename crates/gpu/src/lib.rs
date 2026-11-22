@@ -80,6 +80,7 @@ pub mod lane;
 pub mod latent;
 pub mod latent_gated;
 pub mod linear;
+pub mod loop_control;
 pub mod mamba2;
 pub mod mamba2_ssd;
 pub mod media;

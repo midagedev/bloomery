@@ -62,6 +62,8 @@ fixture_writer	refset	crates/model/src/fixture/mod.rs crates/model/src/fixture/p
 elem_kernels	kernel	crates/gpu/src/elem.rs
 device_seam	host	crates/device/src/*.rs crates/gpu/src/device.rs crates/metal/src/*.rs
 attn_res	kernel	crates/gpu/src/attn_res.rs
+loop_control	kernel	crates/gpu/src/loop_control.rs
+conv_res	kernel	crates/gpu/src/linear/conv_res.rs
 imatrix_collector	kernel	crates/gpu/src/imatrix.rs
 rows_kit	kernel	crates/gpu/src/arch/rows_kit.rs
 ffn_situ	moe	crates/gpu/src/arch/routed_ffn.rs

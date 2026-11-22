@@ -296,6 +296,7 @@ gate-hy4-tokenizer	family	hy_v4_flash	tokenizer	tokenizer_jinja+serve_toolcall
 gate-gpu-raon1-dflash	family	raon1	draft	drafts_dspark
 gate-kimi-k3-meta	family	kimi-k3	meta	arch_registry
 gate-inkling2-meta	family	inkling2	meta	arch_registry
+gate-inkling2-step	family	inkling2	kernel	attn_res+loop_control+conv_res
 gate-gpu-kimik3-mla	family	kimi-k3	kernel	attn_latent_mla
 gate-gpu-kimik3-dsa	family	kimi-k3	kernel	attn_latent_mla+attn_ds41_csa_hca
 gate-gpu-kimik3-kda	family	kimi-k3	kernel	attn_linear_gdn_kda

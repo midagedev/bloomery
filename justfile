@@ -4666,6 +4666,19 @@ dump-ref-inkling2:
 
 # --- end inkling2-ref ---
 
+# --- inkling2-step (Inkling 2's visit pipeline kernels) -------------------------------------------------------------------------------
+
+# Inkling 2's visit pipeline on the card (gate_inkling2_step's doc): the normed block-attention residual mix (the scaled,
+# many-query entry beside kimi's raw one), the looped core's message controller and the residual short convolutions (static
+# and dynamic taps over the visit's one conv ring), seeded against f64 rules of the PR's `mix`/`control`/`convolve` and the
+# whole forced mix-and-controller chain of a pass-1 visit against the fixture's own node dumps (fx_ref_inkling2_a: the norm,
+# loop_q_inp, loop_ffn_inp and result_norm rows). The conv's own inputs (the wk/wv rows) are not tapped, so its clauses are
+# the seeded ones. Fixture-only (tools/ref/fixture-only.sh): the stages the gate replays read the fixture's taps and weights.
+gate-inkling2-step:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-inkling2-step && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_step && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_step'
+
+# --- end inkling2-step ---
+
 # The raon vocabulary: our ids equal the reference tree's `llama-tokenize` on every case of crates/tokenizer/tests/cases.txt and
 # cases-raon.txt, in both parse modes (the pins are tests/raon-ids.tsv, written by crates/tokenizer/tools/raon-oracle.sh from the
 # krafton-ai llama.cpp tree whose pre-tokenizer `raon` and NFC normalizer exist there only), and the header's two end tokens end
