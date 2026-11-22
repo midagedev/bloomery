@@ -373,6 +373,9 @@ def parse_scan(path):
     rows, md5, method, header, state = {}, {}, None, None, None
     for line in text.split("\n"):
         f = line.split()
+        if line.startswith("ptx-scan: "):
+            # ptx-scan's notes go to stderr; a log of both streams can hold one inside the table.
+            continue
         if line.startswith("entry ") and header is None:
             header, state = f, "rows"
         elif line.startswith("ptx-scan-md5:"):
@@ -587,6 +590,14 @@ def self_test():
         msg = refused(lambda: compare_scans(a, cut))
         expect(msg is not None and "1 entries in only one of the table and the md5 block (beta)" in msg,
                f"a scan whose md5 block lacks a table entry is refused: {msg}")
+        # A note on stderr that lands inside the table (a log of both streams) is skipped, not read as the
+        # table's end.
+        noted = put("noted", scan("ptx-scan-md5: method=decl1", {"alpha": h1, "beta": h1}).replace(
+            "jit_local\n", "jit_local\nptx-scan: entries that call a device function — their rows count "
+            "their own body, not the callee's: alpha:1\n", 1))
+        with contextlib.redirect_stdout(io.StringIO()):
+            msg = refused(lambda: compare_scans(a, noted))
+        expect(msg is None, f"a stderr note inside the table is skipped: {msg}")
         failed = put("failed", "ptx-scan bin=target/release/x missing scan=failed\n")
         msg = refused(lambda: compare_scans(a, failed))
         expect(msg is not None and "failed scan" in msg, f"a failed scan refused: {msg}")
