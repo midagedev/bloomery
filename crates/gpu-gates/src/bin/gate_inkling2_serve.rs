@@ -65,8 +65,8 @@
 //!   ids the body gives directly for the same ids, and the load record names the body's layers
 //!   and visits.
 //! - `extension_is_the_held_run`: the resent answer of `extension_keeps_the_held_sequence` is
-//!   the body's run of the held split: the prose prompt and its answer, the answer's last id,
-//!   [`N`] more.
+//!   the body's run of the held split: the prose prompt and its answer, the answer's last id by
+//!   the body's prompt rule, [`N`] more.
 //! - `rollback_is_refused_by_name`: the body asked to take a position back from where it stands
 //!   returns an error naming `inkling2::Body::rollback` and the rings, and stands where it did;
 //!   and `BLOOMERY_DRAFT=dspark` (the draft is the path that asks for a rollback) is refused by
@@ -649,11 +649,11 @@ mod gate {
             a.load
         );
         check(&mut ok, "completion_ids", same && named);
-        // The extension's held split: the prose prompt and its answer, the answer's last id fed,
-        // then N more.
+        // The extension's held split: the prose prompt and its answer, the answer's last id fed
+        // as the seat feeds a resent prompt's new ids (the body's prompt rule), then N more.
         let held = seat_answer(m, &a.prose.prompt)?;
         let last = *held.last().ok_or("an empty held answer")?;
-        let first = m.step(&[last])?;
+        let first = <Body as Prompt>::prompt(m, &[last])?;
         let extended = continue_from(m, first, N)?;
         let held_run = a
             .resent
