@@ -109,6 +109,7 @@ pub mod qsa;
 pub mod quant_sel;
 pub(crate) mod recur;
 pub mod rel_bias;
+pub mod rel_bias_prefill;
 pub(crate) mod ring_gemm;
 pub(crate) mod room;
 pub mod rope_neox;

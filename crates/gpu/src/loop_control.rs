@@ -57,6 +57,18 @@
 //! [`LoopControlKernels::enqueue_single_block`] keeps the earlier shape (one fused launch, one
 //! block a row) as the gate's bit-identity reference: the split launches' output equals it bit
 //! for bit.
+//!
+//! The rows form ([`LoopControlKernels::enqueue_rows`], [`LoopControlKernels::enqueue_attn_rows`])
+//! is the same pair over a prompt pass's rows with each weight read once a tile of rows instead
+//! of once a row: the down launch (`loop_control_down_rows`) is one block per [`ROWS_DOWN`] rows
+//! of one module, warp `w` the outputs `8·w ..` of [`MAX_RANK`], each lane the same lane-strided
+//! dot of every (row, output) pair the step's warp runs for its one; the out launch
+//! (`loop_control_out_rows`, `loop_control_out3_rows`) one block per [`OUT_COLS`] outputs of
+//! [`ROWS_OUT`] rows of one module, each thread its output's gain and forget dots for eight of
+//! the rows. Every value keeps the step's order — the squares thread-strided over [`THREADS`]
+//! threads with the same butterfly and tree, the normed value one rounded multiply of the raw
+//! one, the dots' first product alone and the folds ascending — so the rows form writes the
+//! step's bits at every row, whatever the pass's length.
 
 use crate::GpuError;
 use crate::elem::rms_scale_of_mean_checked;
@@ -90,9 +102,19 @@ pub const MAX_MODULES: usize = 3;
 const DOWN_UNROLL: usize = 16;
 /// Rank steps a thread loads before folding them (the fold stays ascending).
 const OUT_UNROLL: usize = 8;
+/// Rows one block of the rows form's down launch takes.
+pub const ROWS_DOWN: usize = 8;
+/// Down outputs a warp of the rows form's down launch takes: the eight warps cover [`MAX_RANK`].
+const DOWN_WARP_OUTS: usize = MAX_RANK / WARPS;
+/// Rows one block of the rows form's out launch takes, and the rows a thread of it folds.
+pub const ROWS_OUT: usize = 32;
+const OUT_THREAD_ROWS: usize = ROWS_OUT * OUT_COLS / THREADS;
 
 const _: () = assert!(THREADS == 256 && WARPS == 8);
 const _: () = assert!(DOWN_OUTS <= WARPS && OUT_COLS <= THREADS);
+const _: () = assert!(DOWN_WARP_OUTS * WARPS == MAX_RANK && OUT_THREAD_ROWS == 8);
+const _: () =
+    assert!(THREADS.is_multiple_of(OUT_COLS) && ROWS_OUT.is_multiple_of(THREADS / OUT_COLS));
 
 /// Floats of the scratch `h` a launch pair of `modules` modules over `m` rows at `rank` needs.
 pub const fn scratch_len(modules: usize, m: usize, rank: usize) -> usize {
@@ -239,6 +261,248 @@ unsafe fn out_block(
         ok = fin;
         // SAFETY: t · n + j < m · n <= y.len(); this thread alone writes the value.
         unsafe { *y.get_unchecked_mut(t * n + j) = if fin { out } else { f32::NAN } };
+    }
+    if !ok {
+        fault.raise(FaultSite::F32Product);
+    }
+}
+
+/// One block of the rows form's down launch (module doc): rows `t0 .. t0 + ROWS_DOWN` of one
+/// module, their `rstd` pairs in the step's order, then warp `w`'s outputs `w · DOWN_WARP_OUTS ..`
+/// over every row, lane `l` the values `l, l + 32, …` of each (row, output) pair's dot — the first
+/// product alone, the fused multiply-adds ascending, the warp's sum by the butterfly — written at
+/// `h[(mi · m + t) · rank + r]`. Every thread of the block calls it (it holds barriers).
+///
+/// # Safety
+///
+/// `ws` addresses `ROWS_DOWN · PART_LEN` and `rs` `ROWS_DOWN · RSTD_LEN` shared f32; `m · n <=
+/// cur.len(), msg.len()`; `rank · 2n <= down.len()`; `(mi + 1) · m · rank <= h.len()`; `1 <= n
+/// <= MAX_N`, `1 <= rank <= MAX_RANK`.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the block's inputs, one argument each (rust-quality R8)"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn down_rows_block(
+    (cur, msg, down): (&[f32], &[f32], &[f32]),
+    (ws, rs): (*mut f32, *mut f32),
+    h: &mut DisjointSlice<f32>,
+    (n, rank, m): (usize, usize, usize),
+    (t0, mi): (usize, usize),
+    eps: f32,
+    fault: FaultSink,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let w = tid / 32;
+    let lane = warp::lane_id() as usize;
+    // The two sums of squares of each row (this order is the gate: the step's).
+    let mut sq = [[0.0f32; 2]; ROWS_DOWN];
+    for i in 0..ROWS_DOWN {
+        cuda_device::thread::__unroll_config::<0>();
+        let t = t0 + i;
+        if t < m {
+            let (mut sq_c, mut sq_m) = (0.0f32, 0.0f32);
+            let mut j = tid;
+            while j < n {
+                // SAFETY: t · n + j < m · n <= cur.len() and msg.len() by the contract.
+                let (c, g) =
+                    unsafe { (*cur.get_unchecked(t * n + j), *msg.get_unchecked(t * n + j)) };
+                sq_c += c * c;
+                sq_m += g * g;
+                j += THREADS;
+            }
+            sq[i] = [warp::reduce_sum_f32(sq_c), warp::reduce_sum_f32(sq_m)];
+        }
+    }
+    if lane == 0 {
+        for i in 0..ROWS_DOWN {
+            cuda_device::thread::__unroll_config::<0>();
+            // SAFETY: i · PART_LEN + 2w + 1 < ROWS_DOWN · PART_LEN; one lane a warp writes.
+            unsafe {
+                *ws.add(i * PART_LEN + w * 2) = sq[i][0];
+                *ws.add(i * PART_LEN + w * 2 + 1) = sq[i][1];
+            }
+        }
+    }
+    thread::sync_threads();
+    if tid < ROWS_DOWN && t0 + tid < m {
+        // SAFETY: row tid's eight pairs were written before the barrier above.
+        let mean_c = unsafe { tree(ws.add(tid * PART_LEN), 0) } / n as f32;
+        // SAFETY: as above.
+        let mean_m = unsafe { tree(ws.add(tid * PART_LEN), 1) } / n as f32;
+        // SAFETY: tid < ROWS_DOWN: this thread's pair of RSTD.
+        unsafe {
+            *rs.add(tid * RSTD_LEN) = rms_scale_of_mean_checked(mean_c, eps, fault, true);
+            *rs.add(tid * RSTD_LEN + 1) = rms_scale_of_mean_checked(mean_m, eps, fault, true);
+        }
+    }
+    thread::sync_threads();
+
+    let r0 = w * DOWN_WARP_OUTS;
+    if r0 >= rank {
+        return; // warp-uniform: no barrier follows
+    }
+    let mut scale = [[0.0f32; 2]; ROWS_DOWN];
+    for i in 0..ROWS_DOWN {
+        cuda_device::thread::__unroll_config::<0>();
+        // SAFETY: written before the barrier above (a row past m keeps its stale pair, which
+        // reaches no output: its dots are never stored).
+        unsafe { scale[i] = [*rs.add(i * RSTD_LEN), *rs.add(i * RSTD_LEN + 1)] };
+    }
+    let two_n = 2 * n;
+    let mut acc = [[0.0f32; DOWN_WARP_OUTS]; ROWS_DOWN];
+    let mut k = lane;
+    let mut first = true;
+    while k < two_n {
+        let msg_half = k >= n;
+        let kk = if msg_half { k - n } else { k };
+        let mut v = [0.0f32; ROWS_DOWN];
+        for i in 0..ROWS_DOWN {
+            cuda_device::thread::__unroll_config::<0>();
+            let t = t0 + i;
+            if t < m {
+                // SAFETY: t · n + kk < m · n <= cur.len() and msg.len().
+                let x = unsafe {
+                    if msg_half {
+                        *msg.get_unchecked(t * n + kk)
+                    } else {
+                        *cur.get_unchecked(t * n + kk)
+                    }
+                };
+                v[i] = mul_rn_f32(x, scale[i][usize::from(msg_half)]);
+            }
+        }
+        for o in 0..DOWN_WARP_OUTS {
+            cuda_device::thread::__unroll_config::<0>();
+            let r = r0 + o;
+            if r < rank {
+                // SAFETY: r · 2n + k < rank · 2n <= down.len() by the contract.
+                let wv = unsafe { *down.get_unchecked(r * two_n + k) };
+                for i in 0..ROWS_DOWN {
+                    cuda_device::thread::__unroll_config::<0>();
+                    acc[i][o] = if first {
+                        mul_rn_f32(wv, v[i])
+                    } else {
+                        fma_rn_f32(wv, v[i], acc[i][o])
+                    };
+                }
+            }
+        }
+        first = false;
+        k += 32;
+    }
+    for i in 0..ROWS_DOWN {
+        cuda_device::thread::__unroll_config::<0>();
+        for o in 0..DOWN_WARP_OUTS {
+            cuda_device::thread::__unroll_config::<0>();
+            let s = warp::reduce_sum_f32(acc[i][o]);
+            let (t, r) = (t0 + i, r0 + o);
+            if lane == 0 && t < m && r < rank {
+                // SAFETY: (mi · m + t) · rank + r < (mi + 1) · m · rank <= h.len(); lane 0 of
+                // the output's warp alone writes it.
+                unsafe { *h.get_unchecked_mut((mi * m + t) * rank + r) = s };
+            }
+        }
+    }
+}
+
+/// One block of the rows form's out launch (module doc): outputs `grp · OUT_COLS ..` of rows
+/// `t0 .. t0 + ROWS_OUT` of one module, thread `tid` output `grp · OUT_COLS + tid % OUT_COLS` of
+/// the eight rows `t0 + 8 · (tid / OUT_COLS) ..`, each pair's gain and forget dots, the `tanh`
+/// and the combine in `out_block`'s order. Every thread of the block calls it (it holds a
+/// barrier).
+///
+/// # Safety
+///
+/// `hs` addresses `ROWS_OUT · MAX_RANK` shared f32; `(h_mod + m) · rank <= h.len()` with
+/// `h_mod = mi · m`; `m · n <= cur.len(), msg.len(), y.len()`; `grp · OUT_COLS < n`; `n · rank
+/// <= gain.len(), forget.len()`; `1 <= rank <= MAX_RANK`.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the block's inputs, one argument each (rust-quality R8)"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
+unsafe fn out_rows_block(
+    (cur, msg, gain, forget): (&[f32], &[f32], &[f32], &[f32]),
+    h: &[f32],
+    hs: *mut f32,
+    y: &mut DisjointSlice<f32>,
+    (n, rank, m): (usize, usize, usize),
+    (t0, grp, h_mod): (usize, usize, usize),
+    fault: FaultSink,
+) {
+    let tid = thread::threadIdx_x() as usize;
+    let mut e = tid;
+    while e < ROWS_OUT * rank {
+        let (i, d) = (e / rank, e % rank);
+        let t = t0 + i;
+        let v = if t < m {
+            // SAFETY: (h_mod + t) · rank + d < (h_mod + m) · rank <= h.len().
+            unsafe { *h.get_unchecked((h_mod + t) * rank + d) }
+        } else {
+            0.0
+        };
+        // SAFETY: i · MAX_RANK + d < ROWS_OUT · MAX_RANK; this thread alone writes it.
+        unsafe { *hs.add(i * MAX_RANK + d) = v };
+        e += THREADS;
+    }
+    thread::sync_threads();
+    let j = grp * OUT_COLS + tid % OUT_COLS;
+    let rb = (tid / OUT_COLS) * OUT_THREAD_ROWS;
+    let mut ok = true;
+    if j < n {
+        let gb = j * rank;
+        // The first product rounds alone, then the fused multiply-adds ascend the rank (this
+        // order is the gate: `out_block`'s).
+        let mut g = [0.0f32; OUT_THREAD_ROWS];
+        let mut f = [0.0f32; OUT_THREAD_ROWS];
+        // SAFETY: gb < n · rank <= gain.len() and forget.len(); the staged rows are inside hs,
+        // written before the barrier above.
+        let (gw, fw) = unsafe { (*gain.get_unchecked(gb), *forget.get_unchecked(gb)) };
+        for i in 0..OUT_THREAD_ROWS {
+            cuda_device::thread::__unroll_config::<0>();
+            // SAFETY: as above.
+            let hv = unsafe { *hs.add((rb + i) * MAX_RANK) };
+            g[i] = mul_rn_f32(gw, hv);
+            f[i] = mul_rn_f32(fw, hv);
+        }
+        let mut d = 1usize;
+        while d < rank {
+            // SAFETY: gb + d < gb + rank <= n · rank; as above.
+            let (gw, fw) = unsafe { (*gain.get_unchecked(gb + d), *forget.get_unchecked(gb + d)) };
+            for i in 0..OUT_THREAD_ROWS {
+                cuda_device::thread::__unroll_config::<0>();
+                // SAFETY: as above.
+                let hv = unsafe { *hs.add((rb + i) * MAX_RANK + d) };
+                g[i] = fma_rn_f32(gw, hv, g[i]);
+                f[i] = fma_rn_f32(fw, hv, f[i]);
+            }
+            d += 1;
+        }
+        for i in 0..OUT_THREAD_ROWS {
+            cuda_device::thread::__unroll_config::<0>();
+            let t = t0 + rb + i;
+            if t < m {
+                let one_m_f = 1.0 - f[i].tanh();
+                let gm = g[i].tanh();
+                // SAFETY: t · n + j < m · n <= cur.len() and msg.len() by the contract.
+                let (cv, mv) =
+                    unsafe { (*cur.get_unchecked(t * n + j), *msg.get_unchecked(t * n + j)) };
+                let out = add_rn_f32(mul_rn_f32(one_m_f, cv), mul_rn_f32(gm, mv));
+                let fin = out.is_finite();
+                ok &= fin;
+                // SAFETY: t · n + j < m · n <= y.len(); this thread alone writes the value.
+                unsafe { *y.get_unchecked_mut(t * n + j) = if fin { out } else { f32::NAN } };
+            }
+        }
     }
     if !ok {
         fault.raise(FaultSite::F32Product);
@@ -814,6 +1078,253 @@ mod loop_control_kernels {
             }
         }
     }
+
+    /// The rows form's down launch over `modules` modules of `m` rows (module doc): one block
+    /// per [`ROWS_DOWN`] rows of one module, `h` the step's scratch with the step's bits.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            cur0.len() >= m * n,
+            msg0.len() >= m * n,
+            down0.len() >= rank * 2 * n,
+            cur1.len() >= m * n,
+            msg1.len() >= m * n,
+            down1.len() >= rank * 2 * n,
+            cur2.len() >= m * n,
+            msg2.len() >= m * n,
+            down2.len() >= rank * 2 * n,
+            h.len() >= modules * m * rank,
+            modules >= 1,
+            modules <= 3,
+            m >= 1,
+            n >= 1,
+            n <= 4608,
+            rank >= 1,
+            rank <= 64
+        )
+    )]
+    pub fn loop_control_down_rows(
+        cur0: &[f32],
+        msg0: &[f32],
+        down0: &[f32],
+        cur1: &[f32],
+        msg1: &[f32],
+        down1: &[f32],
+        cur2: &[f32],
+        msg2: &[f32],
+        down2: &[f32],
+        n: u32,
+        rank: u32,
+        m: u32,
+        modules: u32,
+        eps: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        static mut PART: SharedArray<f32, { ROWS_DOWN * PART_LEN }> = SharedArray::UNINIT;
+        static mut RSTD: SharedArray<f32, { ROWS_DOWN * RSTD_LEN }> = SharedArray::UNINIT;
+        let (n, rank, m) = (n as usize, rank as usize, m as usize);
+        let tiles = m.div_ceil(ROWS_DOWN);
+        let bid = thread::blockIdx_x() as usize;
+        if bid >= tiles * modules as usize {
+            return; // block-uniform
+        }
+        let (tile, mi) = (bid % tiles, bid / tiles);
+        let src = match mi {
+            0 => (cur0, msg0, down0),
+            1 => (cur1, msg1, down1),
+            _ => (cur2, msg2, down2),
+        };
+        // SAFETY: the block's own shared allocations, sized as `down_rows_block` names; the raw
+        // form reaches them without a reference to a `static mut`. The launch contract is the
+        // body's for module mi.
+        unsafe {
+            down_rows_block(
+                src,
+                (
+                    SharedArray::as_raw_mut_ptr(&raw mut PART),
+                    SharedArray::as_raw_mut_ptr(&raw mut RSTD),
+                ),
+                &mut h,
+                (n, rank, m),
+                (tile * ROWS_DOWN, mi),
+                eps,
+                fault,
+            )
+        };
+    }
+
+    /// The rows form's out launch of one module (module doc): one block per [`OUT_COLS`]
+    /// outputs of [`ROWS_OUT`] rows.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            cur.len() >= m * n,
+            msg.len() >= m * n,
+            gain.len() >= n * rank,
+            forget.len() >= n * rank,
+            h.len() >= m * rank,
+            y.len() >= m * n,
+            m >= 1,
+            n >= 1,
+            n <= 4608,
+            rank >= 1,
+            rank <= 64
+        )
+    )]
+    pub fn loop_control_out_rows(
+        cur: &[f32],
+        msg: &[f32],
+        gain: &[f32],
+        forget: &[f32],
+        h: &[f32],
+        n: u32,
+        rank: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        static mut HS: SharedArray<f32, { ROWS_OUT * MAX_RANK }> = SharedArray::UNINIT;
+        let (n, rank, m) = (n as usize, rank as usize, m as usize);
+        let cols = n.div_ceil(OUT_COLS);
+        let tiles = m.div_ceil(ROWS_OUT);
+        let bid = thread::blockIdx_x() as usize;
+        if bid >= cols * tiles {
+            return; // block-uniform
+        }
+        // SAFETY: the block's own shared allocation, sized as `out_rows_block` names; the launch
+        // contract is the body's for the one module.
+        unsafe {
+            out_rows_block(
+                (cur, msg, gain, forget),
+                h,
+                SharedArray::as_raw_mut_ptr(&raw mut HS),
+                &mut y,
+                (n, rank, m),
+                ((bid / cols) * ROWS_OUT, bid % cols, 0),
+                fault,
+            )
+        };
+    }
+
+    /// The rows form's out launch of the three attention modules (module doc).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            cur0.len() >= m * n,
+            msg0.len() >= m * n,
+            gain0.len() >= n * rank,
+            forget0.len() >= n * rank,
+            y0.len() >= m * n,
+            cur1.len() >= m * n,
+            msg1.len() >= m * n,
+            gain1.len() >= n * rank,
+            forget1.len() >= n * rank,
+            y1.len() >= m * n,
+            cur2.len() >= m * n,
+            msg2.len() >= m * n,
+            gain2.len() >= n * rank,
+            forget2.len() >= n * rank,
+            y2.len() >= m * n,
+            h.len() >= 3 * m * rank,
+            m >= 1,
+            n >= 1,
+            n <= 4608,
+            rank >= 1,
+            rank <= 64
+        )
+    )]
+    pub fn loop_control_out3_rows(
+        cur0: &[f32],
+        msg0: &[f32],
+        gain0: &[f32],
+        forget0: &[f32],
+        cur1: &[f32],
+        msg1: &[f32],
+        gain1: &[f32],
+        forget1: &[f32],
+        cur2: &[f32],
+        msg2: &[f32],
+        gain2: &[f32],
+        forget2: &[f32],
+        h: &[f32],
+        n: u32,
+        rank: u32,
+        m: u32,
+        fault: FaultSink,
+        mut y0: DisjointSlice<f32>,
+        mut y1: DisjointSlice<f32>,
+        mut y2: DisjointSlice<f32>,
+    ) {
+        static mut HS: SharedArray<f32, { ROWS_OUT * MAX_RANK }> = SharedArray::UNINIT;
+        let (n, rank, m) = (n as usize, rank as usize, m as usize);
+        let cols = n.div_ceil(OUT_COLS);
+        let tiles = m.div_ceil(ROWS_OUT);
+        let bid = thread::blockIdx_x() as usize;
+        if bid >= cols * tiles * MAX_MODULES {
+            return; // block-uniform
+        }
+        let grp = bid % cols;
+        let t0 = ((bid / cols) % tiles) * ROWS_OUT;
+        let mi = bid / (cols * tiles);
+        // SAFETY: the block's own shared allocation; the launch contract is the body's for
+        // module mi.
+        let hs = unsafe { SharedArray::as_raw_mut_ptr(&raw mut HS) };
+        let at = (t0, grp, mi * m);
+        // SAFETY: as above.
+        unsafe {
+            match mi {
+                0 => out_rows_block(
+                    (cur0, msg0, gain0, forget0),
+                    h,
+                    hs,
+                    &mut y0,
+                    (n, rank, m),
+                    at,
+                    fault,
+                ),
+                1 => out_rows_block(
+                    (cur1, msg1, gain1, forget1),
+                    h,
+                    hs,
+                    &mut y1,
+                    (n, rank, m),
+                    at,
+                    fault,
+                ),
+                _ => out_rows_block(
+                    (cur2, msg2, gain2, forget2),
+                    h,
+                    hs,
+                    &mut y2,
+                    (n, rank, m),
+                    at,
+                    fault,
+                ),
+            }
+        }
+    }
 }
 
 /// The loaded module. Owns no stream: each enqueue takes the engine stream.
@@ -1014,6 +1525,148 @@ impl LoopControlKernels {
             0,
         ))?;
         self.module.loop_control_out3(
+            stream,
+            &prep,
+            a[0].cur,
+            a[0].msg,
+            a[0].gain,
+            a[0].forget,
+            a[1].cur,
+            a[1].msg,
+            a[1].gain,
+            a[1].forget,
+            a[2].cur,
+            a[2].msg,
+            a[2].gain,
+            a[2].forget,
+            h,
+            n32,
+            rank32,
+            m32,
+            a[0].fault,
+            y0,
+            y1,
+            y2,
+        )?;
+        Ok(())
+    }
+
+    /// [`LoopControlKernels::enqueue`] in the rows form (module doc): `ceil(m / ROWS_DOWN)`
+    /// blocks, then `ceil(m / ROWS_OUT) · ceil(n / OUT_COLS)`, each weight read once a tile of
+    /// rows; `h` and `y` hold the step's bits. Refusals, asynchrony and capture as
+    /// [`LoopControlKernels::enqueue`].
+    pub fn enqueue_rows(
+        &self,
+        stream: &CudaStream,
+        a: LoopControlArgs<'_>,
+        h: &mut DeviceBuffer<f32>,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "loop_control::enqueue_rows";
+        Self::check(WHAT, &a, y.len())?;
+        let (n, rank, m) = (a.n, a.rank, a.m);
+        crate::short(WHAT, &[("h", h.len(), scratch_len(1, m, rank))])?;
+        let (n32, rank32, m32) = (
+            launch_u32(WHAT, "n", n)?,
+            launch_u32(WHAT, "rank", rank)?,
+            launch_u32(WHAT, "m", m)?,
+        );
+        let down_blocks = launch_u32(WHAT, "down blocks", m.div_ceil(ROWS_DOWN))?;
+        let out_blocks = launch_u32(
+            WHAT,
+            "out blocks",
+            m.div_ceil(ROWS_OUT) * n.div_ceil(OUT_COLS),
+        )?;
+        let prep = self
+            .module
+            .prepare_loop_control_down_rows(LaunchConfig1D::new(down_blocks, THREADS as u32, 0))?;
+        self.module.loop_control_down_rows(
+            stream, &prep, a.cur, a.msg, a.down, a.cur, a.msg, a.down, a.cur, a.msg, a.down, n32,
+            rank32, m32, 1, a.eps, a.fault, h,
+        )?;
+        let prep = self
+            .module
+            .prepare_loop_control_out_rows(LaunchConfig1D::new(out_blocks, THREADS as u32, 0))?;
+        self.module.loop_control_out_rows(
+            stream, &prep, a.cur, a.msg, a.gain, a.forget, h, n32, rank32, m32, a.fault, y,
+        )?;
+        Ok(())
+    }
+
+    /// [`LoopControlKernels::enqueue_attn`] in the rows form: `ceil(m / ROWS_DOWN) · 3` blocks,
+    /// then `ceil(m / ROWS_OUT) · ceil(n / OUT_COLS) · 3`; `h` and `ys` hold the step's bits.
+    /// Refusals, asynchrony and capture as [`LoopControlKernels::enqueue_attn`].
+    pub fn enqueue_attn_rows(
+        &self,
+        stream: &CudaStream,
+        a: [LoopControlArgs<'_>; MAX_MODULES],
+        h: &mut DeviceBuffer<f32>,
+        ys: [&mut DeviceBuffer<f32>; MAX_MODULES],
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "loop_control::enqueue_attn_rows";
+        let [y0, y1, y2] = ys;
+        for (i, (module, y_len)) in a.iter().zip([y0.len(), y1.len(), y2.len()]).enumerate() {
+            Self::check(WHAT, module, y_len)?;
+            if (module.n, module.rank, module.m) != (a[0].n, a[0].rank, a[0].m)
+                || module.eps != a[0].eps
+            {
+                return Err(GpuError::shape(
+                    WHAT,
+                    format!(
+                        "module {i} is {} rows of {} at rank {} (eps {}), module 0 is {} rows \
+                         of {} at rank {} (eps {}): the modules share one shape",
+                        module.m,
+                        module.n,
+                        module.rank,
+                        module.eps,
+                        a[0].m,
+                        a[0].n,
+                        a[0].rank,
+                        a[0].eps,
+                    ),
+                ));
+            }
+        }
+        let (n, rank, m) = (a[0].n, a[0].rank, a[0].m);
+        crate::short(WHAT, &[("h", h.len(), scratch_len(MAX_MODULES, m, rank))])?;
+        let (n32, rank32, m32) = (
+            launch_u32(WHAT, "n", n)?,
+            launch_u32(WHAT, "rank", rank)?,
+            launch_u32(WHAT, "m", m)?,
+        );
+        let down_blocks = launch_u32(WHAT, "down blocks", m.div_ceil(ROWS_DOWN) * MAX_MODULES)?;
+        let out_blocks = launch_u32(
+            WHAT,
+            "out blocks",
+            m.div_ceil(ROWS_OUT) * n.div_ceil(OUT_COLS) * MAX_MODULES,
+        )?;
+        let prep = self
+            .module
+            .prepare_loop_control_down_rows(LaunchConfig1D::new(down_blocks, THREADS as u32, 0))?;
+        self.module.loop_control_down_rows(
+            stream,
+            &prep,
+            a[0].cur,
+            a[0].msg,
+            a[0].down,
+            a[1].cur,
+            a[1].msg,
+            a[1].down,
+            a[2].cur,
+            a[2].msg,
+            a[2].down,
+            n32,
+            rank32,
+            m32,
+            MAX_MODULES as u32,
+            a[0].eps,
+            a[0].fault,
+            h,
+        )?;
+        let prep = self
+            .module
+            .prepare_loop_control_out3_rows(LaunchConfig1D::new(out_blocks, THREADS as u32, 0))?;
+        self.module.loop_control_out3_rows(
             stream,
             &prep,
             a[0].cur,

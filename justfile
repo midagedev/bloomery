@@ -5094,6 +5094,16 @@ gate-inkling2-attn:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-inkling2-attn && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_attn && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_attn'
 
 # --- end inkling2attn ---
+# --- inkling2-pp (Inkling 2's prompt-pass kernels) -----------------------------------------------------------------------------
+
+# Inkling 2's prompt-pass kernels on the card (gate_inkling2_pp's doc): the rel-bias attention over a pass's rows at the groups
+# of three and six (the tensor-core walk against the step kernel at the same rows within its derived band, the ring against the
+# plane's bits, the group of six against the group of three, the key-count fault and the refusals) and the loop controller's
+# rows form against the step pair's bits. Seeded at the Mini's shapes: it opens no model file, so both tiers run it.
+gate-inkling2-pp:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_pp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_pp'
+
+# --- end inkling2-pp ---
 # --- hy4serve ---
 
 # The Hy4-flash seat of bloomery-serve on the Hy4 fixture (gate_hy4_serve's doc): the hybrid owner's seat over the placed body. `--parallel 2`

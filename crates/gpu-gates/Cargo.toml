@@ -1036,3 +1036,10 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_inkling2_moe"
 required-features = ["gpu"]
+
+# inkling2-pp: Inkling 2's prompt-pass kernels (gate_inkling2_pp's doc): the rel-bias attention over a
+# pass's rows at the groups of three and six and the loop controller over a pass's rows, each against
+# the step entry on the same inputs, seeded at the Mini's shapes.
+[[bin]]
+name = "gate_inkling2_pp"
+required-features = ["gpu"]
