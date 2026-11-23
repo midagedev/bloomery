@@ -10,8 +10,10 @@
 #   - x86_64, sm_120a: bloomery-<v>-linux-x86_64-cuda-sm120a, sm_120a PTX (the Blackwell consumer parts' native FP4 and
 #     MXFP8 kernels, which load on cc 12.0 alone), the same host code; built on the box with BLOOMERY_ARCH=sm_120a (the
 #     selection on a machine whose every card is cc 12.0), into its own target dir (target/portable-sm120a) so neither
-#     archive's build rebuilds the other's. A build machine with no cc 12.0 card cannot compile the PTX to cubins, so it
-#     stays PTX and the driver compiles it on the card's first start;
+#     archive's build rebuilds the other's. Its binaries are packed like the aarch64 archive's (below): the PTX compiled
+#     to cubins by the toolkit's ptxas on the build host, no card needed, the PTX kept beside it as `.oxart.ptx`. The
+#     sm_86 archive stays PTX, which the driver compiles on the card's first start: the defect that makes the packing
+#     necessary is cc 12.x's;
 #   - aarch64: bloomery-<v>-linux-aarch64-cuda-sm121a, sm_121a PTX (GB10's native FP4, which loads on cc 12.1 alone),
 #     host code for GB10's cores (rustc's `gb10`); built on a GB10 itself, natively (tools/box.sh's local mode there,
 #     BLOOMERY_BOX_LOCAL=1: box.sh's remote path is the x86_64 box's, with locks under /root and its cards picked by name; the
@@ -22,13 +24,13 @@
 #     name, rc 69, before anything is built, and any other value is rc 64).
 #     Either way the packed binary carries that PTX compiled as cubins, and the PTX stays beside it as `.oxart.ptx`,
 #     which bloomery-gpu loads for a bundle whose cubin the driver refuses, so a first start compiles nothing.
-#     tools/oxart-pack.sh packs it both ways: oxart_ptxas hands each bundle's PTX to the toolkit's
-#     ptxas -arch=<the bundle's target> on the build host, no card and no gate lock, the ptxas version printed, and every
-#     cubin passes tools/ulea-scan.py before the binary is touched (a GB10 driver before CUDA 13.1 compiles some of our
-#     kernels with truncated addresses: docs/upstream/nvlabs-ledger.md row 55, so the driver never links the archive's
-#     cubins). A cross binary's `--version` runs under qemu-aarch64 (user mode, QEMU_LD_PREFIX its
-#     sysroot) before and after the cubins are packed; without qemu-aarch64 on PATH the check is named "not run" in the
-#     output. What no x86_64 machine proves: the driver's load of the cubins on a GB10 and a request.
+#     tools/oxart-pack.sh packs the sm_120a archive and the aarch64 one, natively and cross: oxart_ptxas hands each
+#     bundle's PTX to the toolkit's ptxas -arch=<the bundle's target> on the build host, no card and no gate lock, the
+#     ptxas version printed, and every cubin passes tools/ulea-scan.py before the binary is touched (a cc 12.x card's
+#     driver before CUDA 13.1 compiles some of our kernels with truncated addresses: docs/upstream/nvlabs-ledger.md
+#     row 55, so the driver never links the archive's cubins). Every packed binary runs `--version` again (a cross
+#     binary under qemu-aarch64: user mode, QEMU_LD_PREFIX its sysroot; without qemu-aarch64 on PATH the check is named
+#     "not run" in the output). What no x86_64 machine proves: the driver's load of the cubins on a card and a request.
 #
 # The failures it blocks, each checked on the built binaries before anything is packed:
 #   - a binary for another machine than the platform's (its ELF header);
@@ -39,7 +41,9 @@
 #     function that runs behind a runtime CPU check;
 #   - a binary with no embedded PTX of the platform's arch, or PTX for another target;
 #   - a packed binary whose `--version` fails to run, or names another commit or version than the archive's (a cross
-#     binary runs under qemu-aarch64, or is named "not run" where that is absent).
+#     binary runs under qemu-aarch64, or is named "not run" where that is absent);
+#   - on the sm_120a and aarch64 archives, a cubin that carries the truncated address (tools/ulea-scan.py): the binary stays
+#     as it was and the build ends with the scan's code.
 # A BLOOMERY_ARCH that is no arch of the machine's archives (tools/arch.sh) ends a build with 64 before anything is built;
 # `--check` reads the binaries and never that variable: the archive's arch is its argument, its machine is
 # BLOOMERY_RELEASE_TARGET's or the machine's own, and an x86_64 binary checked with none is held to sm_86.
@@ -146,12 +150,13 @@ scan_past_v3() {
 }
 
 # set_platform <uname -m> <arch>: sets the archive's PLATFORM (its name), RELEASE_ARCH (its PTX target), HOST_CPU,
-# ELF_MACHINE, LOADER, SCAN_V3, GLIBC_FLOOR, CUBIN and TARGET_DIR (its build dir under target/) for the machine and the
-# arch the archive is for; an empty arch is the machine's own (sm_86 on x86_64, sm_121a on aarch64). Another machine or
-# arch is refused by name, rc 64. The x86-64 binary's host code is held to x86-64-v3 by the scan below, and its floor is the
-# oldest distribution the release names. The aarch64 one's target is GB10's own cores (rustc's `gb10`): its sm_121a PTX
-# runs on no other machine, and on a GB10 the `.cargo` table's `native` names the same CPU, so there is no CPU past the
-# target to scan for; its floor is DGX OS 7's glibc (Ubuntu 24.04), which every GB10 runs.
+# ELF_MACHINE, LOADER, SCAN_V3, GLIBC_FLOOR, CUBIN (set for the archives whose binaries are packed with cubins: sm_120a and
+# aarch64's) and TARGET_DIR (its build dir under target/) for the machine and the arch the archive is for; an empty arch is
+# the machine's own (sm_86 on x86_64, sm_121a on aarch64). Another machine or arch is refused by name, rc 64. The x86-64
+# binary's host code is held to x86-64-v3 by the scan below, and its floor is the oldest distribution the release names. The
+# aarch64 one's target is GB10's own cores (rustc's `gb10`): its sm_121a PTX runs on no other machine, and on a GB10 the
+# `.cargo` table's `native` names the same CPU, so there is no CPU past the target to scan for; its floor is DGX OS 7's
+# glibc (Ubuntu 24.04), which every GB10 runs.
 set_platform() {
   local machine=$1 arch=${2:-}
   case "$machine" in
@@ -160,7 +165,7 @@ set_platform() {
       LOADER='ld-linux-x86-64\.so\.2' SCAN_V3=1 GLIBC_FLOOR=2.34 CUBIN=
       case "${arch:-sm_86}" in
         sm_86) PLATFORM=linux-x86_64-cuda-sm86 TARGET_DIR=portable ;;
-        sm_120a) PLATFORM=linux-x86_64-cuda-sm120a TARGET_DIR=portable-sm120a ;;
+        sm_120a) PLATFORM=linux-x86_64-cuda-sm120a TARGET_DIR=portable-sm120a CUBIN=1 ;;
         *)
           echo "release: no x86_64 archive for $arch; the x86_64 archives are sm_86 and sm_120a" >&2
           return 64 ;;
@@ -243,7 +248,7 @@ cross_binutils() {
 }
 
 # The cubin packer's toolkit, refused by name before anything is built (rc 69): ptxas compiles the cubins and cuobjdump
-# reads them back for tools/ulea-scan.py (tools/oxart-pack.sh), on a GB10 and cross alike.
+# reads them back for tools/ulea-scan.py (tools/oxart-pack.sh), for every archive that packs (CUBIN), cross or native.
 cubin_tools() {
   need_tool ptxas "the CUDA toolkit's assembler compiles the archive's cubins (no card is needed)" || return $?
   need_tool cuobjdump "the CUDA toolkit's cuobjdump reads the archive's cubins back for tools/ulea-scan.py" || return $?
@@ -303,6 +308,26 @@ cross_version() {
   else
     echo "release: ${1##*/} --version not run: qemu-aarch64 is not on PATH (apt install qemu-user); a run on a GB10 checks it"
   fi
+}
+
+# pack_archive <bin dir> <oxart_ptxas>: every BINS binary of <bin dir> through tools/oxart-pack.sh (ptxas compiles the bundles
+# on the build host: no card, no gate lock; a binary that fails the scan stays as it was and ends this with the scan's code),
+# then the archive's own checks on the packed directory, at RELEASE_ARCH (an x86_64 check with no arch holds the binary to
+# sm_86), then each packed binary's --version once more: the objcopy rewrote it, and it must still run (a cross binary under
+# qemu-aarch64, see cross_version).
+pack_archive() {
+  local dir=$1 packer=$2 b
+  for b in "${BINS[@]}"; do
+    OBJCOPY=$OBJCOPY bash "$ROOT/tools/oxart-pack.sh" "$dir/$b" "$packer" || return $?
+  done
+  bash "$0" --check "$dir" "$RELEASE_ARCH" || return $?
+  for b in "${BINS[@]}"; do
+    if [ -n "$CROSS" ]; then
+      cross_version "$dir/$b" "$VERSION" "$COMMIT" || return $?
+    else
+      check_version "$dir/$b" "$VERSION" "$COMMIT" || return $?
+    fi
+  done
 }
 
 # The scan on listings in GNU objdump's form: address, bytes and instruction, tab-separated, and the bytes past the
@@ -392,7 +417,7 @@ self_test() {
   local x86='x86-64-v3' x86_tail='v3=1 glibc=2.34 cubin='
   expect_platform x86-default x86_64 '' 0 "linux-x86_64-cuda-sm86 sm_86 $x86 portable $x86_tail"
   expect_platform x86-sm86 x86_64 sm_86 0 "linux-x86_64-cuda-sm86 sm_86 $x86 portable $x86_tail"
-  expect_platform x86-sm120a x86_64 sm_120a 0 "linux-x86_64-cuda-sm120a sm_120a $x86 portable-sm120a $x86_tail"
+  expect_platform x86-sm120a x86_64 sm_120a 0 "linux-x86_64-cuda-sm120a sm_120a $x86 portable-sm120a ${x86_tail}1"
   expect_platform x86-sm121a x86_64 sm_121a 64 "release: no x86_64 archive for sm_121a; the x86_64 archives are sm_86 and sm_120a"
   expect_platform x86-sm120f x86_64 sm_120f 64 "release: no x86_64 archive for sm_120f; the x86_64 archives are sm_86 and sm_120a"
   expect_platform arm-default aarch64 '' 0 "linux-aarch64-cuda-sm121a sm_121a gb10 portable v3= glibc=2.39 cubin=1"
@@ -660,6 +685,52 @@ release: serve --version: $line"
 release: serve --version does not name the commit deadbeefdead: $line"
   rm "$t/qemu-aarch64"
   expect_cross_version no-qemu 0.3.12 abc123456789 0 "release: serve --version not run: qemu-aarch64 is not on PATH (apt install qemu-user); a run on a GB10 checks it"
+
+  # pack_archive on the x86_64 sm_120a row: each binary goes through tools/oxart-pack.sh, the archive's checks then read the
+  # packed directory at the archive's own arch, and each binary runs --version again. The packer and the tools the checks read
+  # the ELF with are stubs (the sm_120a binary is one whose PTX target, sections and symbols they print as a packed one's).
+  local pk="$t/pack"
+  mkdir -p "$pk/tools" "$pk/bin" "$pk/stubs"
+  printf '#!/bin/sh\necho "pack $1 $2 objcopy=$OBJCOPY" >> "$PACK_LOG"\nexit "${PACK_RC:-0}"\n' > "$pk/tools/oxart-pack.sh"
+  printf '#!/bin/sh\necho x86_64\n' > "$pk/stubs/uname"
+  printf '#!/bin/sh\necho 123\n' > "$pk/stubs/stat"
+  printf '#!/bin/sh\necho ".target sm_120a"\n' > "$pk/stubs/strings"
+  printf '#!/bin/sh\nprintf "\\n0000000000401000 <f>:\\n  401000:\\t90                   \\tnop\\n"\n' > "$pk/stubs/objdump"
+  cat > "$pk/stubs/readelf" << 'STUB'
+#!/bin/sh
+case "$1" in
+  -h) echo '  Machine:                           Advanced Micro Devices X86-64' ;;
+  -S) echo '  [13] .oxart            PROGBITS        0 0 0 00  Ao  0   0  8'
+      echo '  [14] .oxart.ptx        PROGBITS        0 0 0 00  Ao  0   0  8' ;;
+esac
+STUB
+  cp "$t/serve" "$pk/bin/bloomery-serve"
+  cp "$t/serve" "$pk/bin/bloomery-quantize"
+  chmod +x "$pk"/stubs/* "$pk/bin"/*
+  expect_pack() { # expect_pack <case> <pack rc> <want rc> <want pack log> <text the output holds, or ''> <text it must not hold, or ''>
+    cases=$((cases + 1))
+    : > "$pk/log"
+    out=$( (set_platform x86_64 sm_120a && OBJCOPY=objcopy CROSS= VERSION=0.3.12 COMMIT=abc123456789 ROOT=$pk PACK_LOG=$pk/log \
+      PACK_RC=$2 BLOOMERY_RELEASE_TARGET= PATH="$pk/stubs:$PATH" pack_archive "$pk/bin" /p/oxart_ptxas) 2>&1) && rc=0 || rc=$?
+    if [ "$rc" != "$3" ] || [ "$(cat "$pk/log")" != "$4" ] || { [ -n "$5" ] && [[ "$out" != *"$5"* ]]; } ||
+      { [ -n "$6" ] && [[ "$out" == *"$6"* ]]; }; then
+      echo "release self-test: pack $1: rc $rc (want $3), packs: $(cat "$pk/log"), want '$4' with '$5' and without '$6'; output: $out" >&2
+      fails=$((fails + 1))
+    fi
+  }
+  local packs="pack $pk/bin/bloomery-serve /p/oxart_ptxas objcopy=objcopy
+pack $pk/bin/bloomery-quantize /p/oxart_ptxas objcopy=objcopy"
+  expect_pack packed 0 0 "$packs" "release: checks passed on $pk/bin" "does not carry"
+  expect_pack packed-binaries-run 0 0 "$packs" "release: bloomery-quantize --version: bloomery-serve 0.3.12" ""
+  expect_pack scan-suspect 1 1 "pack $pk/bin/bloomery-serve /p/oxart_ptxas objcopy=objcopy" "" "checks passed"
+  expect_pack packer-missing 69 69 "pack $pk/bin/bloomery-serve /p/oxart_ptxas objcopy=objcopy" "" "checks passed"
+  # The archive's checks at no arch hold an x86_64 binary to sm_86's PTX, so pack_archive names the archive's own.
+  cases=$((cases + 1))
+  out=$(BLOOMERY_RELEASE_TARGET= PATH="$pk/stubs:$PATH" bash "$0" --check "$pk/bin" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" != 1 ] || [[ "$out" != *"embeds PTX targets [sm_120a ], not sm_86 alone"* ]]; then
+    echo "release self-test: a check with no arch on an sm_120a binary: rc $rc (want 1), output: $out" >&2
+    fails=$((fails + 1))
+  fi
   rm -rf "$t"
 
   if [ "$fails" = 0 ]; then
@@ -732,7 +803,8 @@ else
   export RUSTFLAGS="-C target-cpu=$HOST_CPU"
   bin_args=()
   for b in "${BINS[@]}"; do bin_args+=(--bin "$b"); done
-  # The GB10's own build makes its cubin packer with the binaries; cross, the host's plain cargo built it above.
+  # A native build of an archive that packs makes its cubin packer with the binaries; cross, the host's plain cargo made it
+  # above.
   if [ -n "$CUBIN" ] && [ -z "$CROSS" ]; then bin_args+=(--bin oxart_ptxas); fi
   # The commit goes to cargo alone: the serve build script reads it, and a running binary never does.
   BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release "${bin_args[@]}" ${target_args[@]+"${target_args[@]}"}
@@ -809,15 +881,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/bin"
 for b in "${BINS[@]}"; do cp "$BIN_DIR/$b" "$STAGE/bin/"; done
 if [ -n "$CUBIN" ]; then
-  for b in "${BINS[@]}"; do
-    # ptxas compiles the bundles on the build host: no card, no gate lock.
-    OBJCOPY=$OBJCOPY bash tools/oxart-pack.sh "$STAGE/bin/$b" "$CARGO_TARGET_DIR/release/oxart_ptxas" || exit $?
-  done
-  bash "$0" --check "$STAGE/bin"
-  # The objcopy rewrote the cross binary: it must still run.
-  if [ -n "$CROSS" ]; then
-    for b in "${BINS[@]}"; do cross_version "$STAGE/bin/$b" "$VERSION" "$COMMIT" || exit $?; done
-  fi
+  pack_archive "$STAGE/bin" "$CARGO_TARGET_DIR/release/oxart_ptxas" || exit $?
 fi
 
 cp LICENSE THIRD_PARTY_NOTICES.md docs/serving.md "$STAGE/"

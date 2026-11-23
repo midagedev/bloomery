@@ -31,6 +31,12 @@
 # `[build] target` are refused with 64: a cross triple takes its own runner, or none, and would run the test before
 # the card lock. Other calls keep their existing cargo-test path.
 # The self-test's leading --test-locks DIR forwards gpu-gate.sh's existing isolated-lock fixture.
+# A --gpu --oxide call for a target arch sm_12x packs the captured executable before the replay, but only when the local
+# driver (libcuda's cuDriverGetVersion, the call the loader makes) is older than SM12X_JIT_FIXED, which crates/gpu/src/lib.rs
+# owns and this runner reads from it: that driver's PTX compiler truncates a cc 12.x kernel's addresses, and bloomery-gpu refuses
+# a binary that carries its bundles as PTX alone there (docs/upstream/nvlabs-ledger.md #55). tools/oxart-pack.sh packs it with
+# the toolkit's ptxas (oxart_ptxas is built first, under the build bound, when target/release has none); a newer driver or any
+# other arch changes nothing. An executable with no device code, or already packed, runs as it is.
 #
 # A third failure it closes: a filter that matches nothing. libtest passes a run of 0 tests, so a
 # call whose test-name filter names no test that exists (or none that runs under its ignore flags) is
@@ -42,7 +48,9 @@
 #
 # Exit codes: cargo's or the GPU test's own (0 green, 101 a test failed or a build failed, …); 124 or 137 a bound ran
 # out (the build's, named, or the run's); 64 invalid bound or GPU test selection; 78 a filter matched no test that passed.
-# GPU calls also preserve gpu-gate.sh's refusals (2 missing executable, 69 lock-open failure, 75 contention).
+# GPU calls also preserve gpu-gate.sh's refusals (2 missing executable, 69 lock-open failure, 75 contention). The pack step
+# ends the call with oxart-pack.sh's code (1 a cubin failed the address scan, 69 a tool missing, 64 no single test target) and
+# with 70 when the driver's version or SM12X_JIT_FIXED cannot be read; no test runs then.
 #
 # BLOOMERY_BUILD_ONLY=1 (tools/gate-batch.sh's build lane puts it in an item's box env): the call runs its build phase as
 # above, under the build bound, and ends there with the build's own code; the test phase, the filter check and the GPU replay
@@ -87,6 +95,72 @@ build_bounded() {
   fi
   return "$rc"
 }
+# cuda_dotted <1000 * major + 10 * minor>: the version as `13.4`.
+cuda_dotted() { echo "$(($1 / 1000)).$(($1 % 1000 / 10))"; }
+# driver_cuda_version: the CUDA version of the driver the card runs under, libcuda's cuDriverGetVersion (needs no card).
+driver_cuda_version() {
+  python3 -I - << 'PY'
+import ctypes
+import sys
+
+for name in ("libcuda.so.1", "libcuda.so"):
+    try:
+        lib = ctypes.CDLL(name)
+        break
+    except OSError:
+        pass
+else:
+    sys.exit("gate.sh: no libcuda to read the driver's CUDA version from")
+version = ctypes.c_int()
+rc = lib.cuDriverGetVersion(ctypes.byref(version))
+if rc != 0:
+    sys.exit(f"gate.sh: cuDriverGetVersion failed ({rc})")
+print(version.value)
+PY
+}
+# pack_for_driver <capture dir>: the header's pack step, on the one executable the --gpu build captured in <capture dir>.
+# Returns the code the call ends with, 0 when the executable may run.
+pack_for_driver() {
+  case $OXIDE_ARCH in sm_12*) ;; *) return 0 ;; esac
+  local root fixed have exe packer rc
+  root=$(cd "${BASH_SOURCE[0]%/*}/.." && pwd) || return 70
+  fixed=$(sed -n 's/^const SM12X_JIT_FIXED: i32 = \([0-9][0-9]*\);.*/\1/p' "$root/crates/gpu/src/lib.rs")
+  if [ -z "$fixed" ]; then
+    echo "gate.sh: crates/gpu/src/lib.rs has no 'const SM12X_JIT_FIXED: i32 = <version>;' line to read the first driver with a sound PTX compiler from" >&2
+    return 70
+  fi
+  have=$(driver_cuda_version) || return 70
+  if [ "$have" -ge "$fixed" ]; then
+    echo "gate.sh: $OXIDE_ARCH, driver CUDA $(cuda_dotted "$have") is $(cuda_dotted "$fixed") or later: the test's executable is not packed"
+    return 0
+  fi
+  exe=$(python3 -I - "$1" << 'PY'
+import json
+import sys
+from pathlib import Path
+
+captures = list(Path(sys.argv[1]).glob("run-*.json"))
+if len(captures) != 1:
+    print("gate.sh --gpu: select exactly one test target; got " + str(len(captures)), file=sys.stderr)
+    sys.exit(64)
+print(json.loads(captures[0].read_text(encoding="utf-8"))["argv"][0])
+PY
+  ) || return $?
+  echo "gate.sh: $OXIDE_ARCH, driver CUDA $(cuda_dotted "$have") is before $(cuda_dotted "$fixed"): packing $exe"
+  packer=${CARGO_TARGET_DIR:-$root/target}/release/oxart_ptxas
+  if [ ! -x "$packer" ]; then
+    build_bounded cargo build --release -p bloomery-gpu-gates --bin oxart_ptxas || return $?
+    [ -z "$BIN_SIGNAL" ] || exit 143
+  fi
+  bash "$root/tools/oxart-pack.sh" "$exe" "$packer"
+  rc=$?
+  case $rc in
+    0 | 65) return 0 ;; # 65: nothing to pack, which oxart-pack.sh said (already packed, or no device code)
+    *)
+      echo "GATE RED (exit $rc) in the pack phase — no test ran" >&2
+      return "$rc" ;;
+  esac
+}
 GPU_ARGS=()
 if [ "${1:-}" = --test-locks ]; then
   [ $# -ge 4 ] && [ -d "$2" ] && [ "$3" = --gpu ] || exit 64
@@ -99,11 +173,13 @@ if [ "${1:-}" = --gpu ]; then
   shift
 fi
 RUN=(cargo test)
+OXIDE_ARCH=''
 if [ "${1:-}" = --oxide ]; then
   shift
   # shellcheck source=tools/arch.sh
   source "${BASH_SOURCE[0]%/*}/arch.sh"
   bloomery_arch gate.sh || exit $?
+  OXIDE_ARCH=$ARCH
   RUN=(cargo oxide test --arch "$ARCH" --)
 fi
 # The libtest options that take a value. The one list: tools/recipes.py reads this line (by its
@@ -245,6 +321,7 @@ PY
   build_bounded "${RUN[@]}" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} --config "$RUNNER_CONFIG" -- ${ARGS[@]+"${ARGS[@]}"} || exit $?
   [ -z "$BIN_SIGNAL" ] || exit 143
   [ "$BUILD_ONLY" = 0 ] || exit 0 # the capture runner only recorded the test; the replay takes the card lock
+  pack_for_driver "$CAPTURE" || exit $?
   RUN=(python3 -c '
 import json
 import os

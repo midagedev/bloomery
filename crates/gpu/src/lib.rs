@@ -2908,8 +2908,9 @@ fn jit_defect(device: usize) -> Result<Option<String>, GpuError> {
 
 /// Why a driver of version `driver` must not compile our PTX for a card of
 /// compute capability `cc`: a cc 12.x card under a driver older than
-/// [`SM12X_JIT_FIXED`]. `None` for every other pair.
-fn jit_defect_of(cc: (u32, u32), driver: i32) -> Option<String> {
+/// `SM12X_JIT_FIXED`. `None` for every other pair. Public for the tools that
+/// hand PTX to the driver themselves (`oxart_jit --cubin`).
+pub fn jit_defect_of(cc: (u32, u32), driver: i32) -> Option<String> {
     (cc.0 == 12 && driver < SM12X_JIT_FIXED).then(|| {
         format!(
             "this driver's PTX compiler (CUDA {}.{}) truncates some kernels' addresses on a cc \

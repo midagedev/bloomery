@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Packs a binary's `.oxart` bundles as cubins the CUDA toolkit's ptxas compiles, on the build host with no card:
 # `.oxart` then carries the cubins and `.oxart.ptx` the PTX they came from (bloomery-gpu loads that PTX for a bundle
-# whose cubin the driver refuses). tools/release/build.sh packs the GB10 archive with it. A binary built from source
-# for a cc 12.x card whose driver predates CUDA 13.1 is packed with it before it runs: that driver's PTX compiler
-# truncates some kernels' addresses on cc 12.x (docs/upstream/nvlabs-ledger.md row 55), and bloomery-gpu refuses by
-# name to hand it PTX for such a card.
+# whose cubin the driver refuses). tools/release/build.sh packs the sm_120a and GB10 archives with it, and tools/gate.sh
+# packs a gate's executable with it for a cc 12.x target when the local driver predates CUDA 13.1. A binary built from source
+# for a cc 12.x card under such a driver is packed before it runs: that driver's PTX compiler truncates some kernels'
+# addresses on cc 12.x (docs/upstream/nvlabs-ledger.md row 55), and bloomery-gpu refuses by name to hand it PTX for such a
+# card.
 #
 #   tools/oxart-pack.sh <binary> [<oxart_ptxas>]   default oxart_ptxas: ${CARGO_TARGET_DIR:-target}/release/oxart_ptxas
 #                                                  (plain `cargo build --release -p bloomery-gpu-gates --bin oxart_ptxas`)
@@ -22,7 +23,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 case $# in
   1 | 2) ;;
   *)
-    sed -n '9,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
+    sed -n '10,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' >&2
     exit 64
     ;;
 esac

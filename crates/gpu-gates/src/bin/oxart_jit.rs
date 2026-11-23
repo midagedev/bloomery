@@ -28,8 +28,9 @@
 //! written. It prints one `cubin <bundle> ptx=<bytes> cubin=<bytes>
 //! seconds=<s>` line a bundle. A section with a bundle that carries no PTX is refused.
 //! On a cc 12.x card under a driver before CUDA 13.1 that link truncates some
-//! kernels' addresses (`docs/upstream/nvlabs-ledger.md` #55), so a release
-//! binary's cubins come from the toolkit's ptxas (`oxart_ptxas`) instead.
+//! kernels' addresses (`docs/upstream/nvlabs-ledger.md` #55): `--cubin` refuses
+//! there, by name, and a release binary's cubins come from the toolkit's ptxas
+//! (`oxart_ptxas`) instead.
 //!
 //! It creates a context and JIT-compiles, so it runs on a card: through
 //! `tools/gpu-gate.sh` (the gate lock and its bound), never bare.
@@ -42,7 +43,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 fn run() -> Result<(), bloomery_gpu_gates::GateError> {
     use bloomery_gpu_gates::ptx;
-    use cuda_core::{DriverError, sys};
+    use cuda_core::DriverError;
     use std::path::PathBuf;
 
     const USAGE: &str =
@@ -63,6 +64,15 @@ fn run() -> Result<(), bloomery_gpu_gates::GateError> {
 
     let ctx = bloomery_gpu::capsync::fresh_context(0)?;
     if let Some(out) = out {
+        let (major, minor) = ctx.compute_capability()?;
+        if let Some(why) = bloomery_gpu::jit_defect_of(
+            (u32::try_from(major)?, u32::try_from(minor)?),
+            driver_version()?,
+        ) {
+            return Err(
+                format!("--cubin links the PTX through the driver's compiler, and {why}").into(),
+            );
+        }
         if modules.len() != bundles.len() {
             return Err(format!("{}: a bundle carries no PTX to link", section.display()).into());
         }
@@ -74,12 +84,7 @@ fn run() -> Result<(), bloomery_gpu_gates::GateError> {
             .map_err(|e| format!("write {}: {e}", out.display()).into());
     }
 
-    let mut version = 0i32;
-    // SAFETY: the out-pointer is a live local the call only writes.
-    let rc = unsafe { sys::cuDriverGetVersion(&mut version) };
-    if rc != sys::cudaError_enum_CUDA_SUCCESS {
-        return Err(DriverError(rc).into());
-    }
+    let version = driver_version()?;
     let (cc_major, cc_minor) = ctx.compute_capability()?;
     println!(
         "# card={} cc={}.{} cuda_driver={}.{}",
@@ -106,6 +111,20 @@ fn run() -> Result<(), bloomery_gpu_gates::GateError> {
         }
     }
     Ok(())
+}
+
+/// The driver's CUDA version (`cuDriverGetVersion`: `1000 * major + 10 * minor`).
+#[cfg(feature = "gpu")]
+fn driver_version() -> Result<i32, bloomery_gpu_gates::GateError> {
+    use cuda_core::{DriverError, sys};
+
+    let mut version = 0i32;
+    // SAFETY: the out-pointer is a live local the call only writes.
+    let rc = unsafe { sys::cuDriverGetVersion(&mut version) };
+    if rc != sys::cudaError_enum_CUDA_SUCCESS {
+        return Err(DriverError(rc).into());
+    }
+    Ok(version)
 }
 
 /// Bundle `b` with its PTX module `m` replaced by the driver's cubin of it ([`cubin`]), as a
