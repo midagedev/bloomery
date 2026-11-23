@@ -11,14 +11,14 @@
 //!
 //! A verify takes no forced picks, no taps and no importance collector: each is refused by name.
 
-use super::super::{Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Layer, Router, head_logits};
+use super::super::route::N_USED;
+use super::super::{Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Layer, head_logits};
 use super::{Bufs, RowWalk, Tail};
 use crate::card_leg::{LegBufs, LegRun, LegShape, LegStacks, LegSum};
 use crate::flash_gqa::window_segments;
 use crate::head::Head;
 use crate::hybrid::Chain;
 use crate::model::{GpuModel, MAX_PASS_ROWS, RowHeads, Rows};
-use crate::routed_block::RouterEntry;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -53,7 +53,7 @@ impl VerifyBufs {
         };
         let shape = LegShape {
             cap: VERIFY_ROWS,
-            slots_per_col: Router::N_USED,
+            slots_per_col: N_USED,
             n: d.n,
             ff: d.ff,
         };
@@ -74,18 +74,22 @@ impl Body {
     /// A verify of `m` rows on this load now, or why not by name: a count outside 2 to the rows
     /// a verify and the pass hold, forced picks, armed taps, an importance collector.
     fn verify_refusal(&self, m: usize) -> Result<(), GpuError> {
-        let most = VERIFY_ROWS.min(self.pass.rows);
+        let pass = self.pass.as_ref().ok_or(GpuError::state(
+            WHAT,
+            "a whole-card load (a placed load has no verify: its prompt and drafts are steps)",
+        ))?;
+        let most = VERIFY_ROWS.min(pass.rows);
         if !(2..=most).contains(&m) {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
                     "a verify of {m} rows: 2 to {most} (a draft block's {VERIFY_ROWS}, the \
                      pass's {} at this context)",
-                    self.pass.rows
+                    pass.rows
                 ),
             ));
         }
-        if self.forced.is_some() || self.pass.forced.is_some() {
+        if self.forced.is_some() || pass.forced.is_some() {
             return Err(GpuError::state(
                 WHAT,
                 "a verify under forced picks: unforce them first",
@@ -129,10 +133,13 @@ impl Rows for Body {
                 ),
             ));
         }
-        let (rows, ring) = (self.pass.rows, self.ring);
+        let pass = self
+            .pass
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "a whole-card load"))?;
+        let (rows, ring) = (pass.rows, self.ring);
         let (floor, alpha) = (self.hp.log_floor, self.hp.log_alpha);
-        self.pass
-            .b
+        pass.b
             .stage(stream, (tokens, pos, rows), (ring, floor, alpha))?;
         self.held = pos + launch_u32(WHAT, "rows", tokens.len())?;
         self.end = self.end.max(self.held);
@@ -174,7 +181,12 @@ impl RowWalk<'_> {
         let (gpu, w, k, m, rule) = (self.gpu, self.w, self.k, self.m, self.act);
         let arms = accepts::leg_arms(Program::Inkling2Body)
             .ok_or_else(|| GpuError::state(WHAT, "the inkling2 program's card leg"))?;
-        let names = layer.stacks.each_ref().map(String::as_str);
+        let names = layer
+            .stacks
+            .as_ref()
+            .ok_or(GpuError::state(WHAT, "the card's routed stacks"))?
+            .each_ref()
+            .map(String::as_str);
         let stacks = LegStacks::of_arms(w, names, arms, (GATE_UP_ROLE, DOWN_ROLE))?;
         let v = self
             .verify
@@ -193,7 +205,7 @@ impl RowWalk<'_> {
             normed: fxn,
             m,
             sel: picks,
-            n_card: Router::N_EXPERT,
+            n_card: self.d.n_expert,
             rule,
         };
         k.leg.enqueue(

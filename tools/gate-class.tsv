@@ -321,3 +321,4 @@ gate-inkling2-serve	family	inkling2	serve+ship	seats_serve_engine+serve_toolcall
 gate-inkling2-official-card	family	inkling2	by-hand	checkpoint_folder+weights_load+tier_legs+head_sample
 gate-gpu-inkling2-draft	family	inkling2	draft	drafts_dspark
 gate-inkling2-e2e	family	inkling2	e2e	graph_fault+attn_rel_bias+attn_res+loop_control+conv_res+moe_route+tier_legs+w13_split+weights_load+elem_kernels+head_sample
+gate-inkling2-small-host	family	inkling2	e2e	attn_rel_bias+moe_route+tier_legs+weights_load+head_sample

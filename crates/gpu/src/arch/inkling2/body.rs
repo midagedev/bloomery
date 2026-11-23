@@ -38,6 +38,7 @@
 //! is the step mix's launch pair. A prompt runs as the rows pass ([`pass`]): the same walk over
 //! up to [`place::PASS_ROWS`] rows a launch, the stores left where that many steps leave them.
 
+use super::route::{self, N_USED, Route, RouteOut};
 use super::state::{self, StepIn, VisitStore, WORD_POS, WORD_RING, WORD_TOKEN};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs, MAX_NQ, MAX_VECS};
@@ -48,53 +49,59 @@ use crate::flash_gqa::{FlashGqaKernels, window_segments};
 use crate::folder::Model;
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
+use crate::host::StepLeg;
+use crate::host::placed::PlacedHost;
+use crate::host::swap::Residency;
+use crate::host::swap_source::{DEADLINE, LIVE_DELAY, ResidencySpec, hosted_stacks_named};
 use crate::kquant::Act;
 use crate::linear::conv_res::{ConvResArgs, ConvResKernels};
 use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::loop_control::{LoopControlArgs, LoopControlKernels, MAX_MODULES, scratch_len};
-use crate::model::{ChainBody, GpuModel, NoHost, block_count};
+use crate::model::{ChainBody, GpuModel, HostServed, block_count, refuse_scratch_past, stage_run};
 use crate::norm_proj::{self, F32Site, NormProjArgs, NormProjKernels, Q8Site};
 use crate::norm_proj_bf16::{self, Bf16Site, NormProjBf16Args, NormProjBf16Kernels};
 use crate::q38::{EmbedIo, Q38Kernels};
 use crate::qk_clip::{QkClipArgs, QkClipKernels};
 use crate::rel_bias::{REL, RelBiasArgs, RelBiasKernels};
-use crate::route_body::sigmoid_128_8;
-use crate::routed_block::{RouteIn, RouterEntry};
+use crate::routed_block::RouteIn;
 use crate::site::{self, KGemvKernels, SiteTy};
 use crate::tensor::{PartedBuffer, Window, WindowMut, copy_row};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
+use bloomery_levers::{ChurnHosting, HostCfg};
 use chain::linear::Ring;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::{Split, TensorInfo};
 use model::arch::Arch;
 use model::arch::inkling2::hparams::{Dialect, Hparams, Loop};
 use model::arch::inkling2::names::{self, Ctrl, CtrlPart, Inp};
-use model::arch::inkling2::place;
+use model::arch::inkling2::place::{self, Inputs};
 use model::arch::models::{LoopSpec, OutGate, Visit, visits};
-use model::placement::CardFormat;
 use model::placement::accepts::{self, Program};
 use model::placement::kernels::DownAct;
+use model::placement::{CardFormat, Plan};
+use placed::{LOAD_ROWS, Open, Placed, StepWalk, placed_map};
+use runtime::layer::hosted;
 use std::ops::Range;
+use std::sync::Arc;
 
 #[path = "pass.rs"]
 pub(super) mod pass;
+#[path = "placed.rs"]
+pub(super) mod placed;
 
 const WHAT: &str = "inkling2::Body::load";
 const STEP: &str = "inkling2 step";
 const OPEN: &str = "inkling2 GpuModel::open";
 
-/// The router instance: 128 experts, the top 8, the selection bias.
-type Router = sigmoid_128_8::RouterKernels;
-
 /// The mixes' and the controllers' fixed epsilon (`inkling2.cpp`'s `mix` and `control`).
 const MIX_EPS: f32 = 1e-6;
 /// A head's values: the query, key and value rows'.
 const HEAD: usize = 128;
-/// The query heads a key head the rel-bias entries take.
-const GROUP: usize = 3;
-/// The types the dense sites launch: the files' Q8_0 projections and their f32 and BF16 ones.
-pub(super) const DENSE_TYPES: &[SiteTy] = &[SiteTy::Q8_0, SiteTy::F32, SiteTy::Bf16];
+/// The query heads a key head the rel-bias entries take: the Mini's three or the Small's six.
+const GROUPS: [usize; 2] = [3, 6];
+/// The types the dense sites launch: the files' Q8_0 and Q6_K projections and their f32 and BF16 ones.
+pub(super) const DENSE_TYPES: &[SiteTy] = &[SiteTy::Q8_0, SiteTy::Q6K, SiteTy::F32, SiteTy::Bf16];
 /// The logit the head writes at a padded column: far under any softcapped logit, finite, so the
 /// argmax reads the unpadded vocabulary and the finite argmax's check holds.
 pub const PAD_LOGIT: f32 = -1.0e30;
@@ -176,7 +183,9 @@ struct Layer {
     convs: [String; 4],
     router: String,
     probs_b: String,
-    stacks: [String; 3],
+    /// The routed stacks on the card (gate half, up half, down), `None` on a placed load: its
+    /// experts are the host's ([`placed`]).
+    stacks: Option<[String; 3]>,
     ctrl: Option<Controls>,
     /// The input norms and the projections run as one launch ([`norm_proj_fits`]).
     norm_proj: bool,
@@ -204,6 +213,7 @@ struct Dims {
     taps: usize,
     window: usize,
     ff: usize,
+    n_expert: usize,
     rank: usize,
     /// The conv ring's channels and the four convs' bases in it.
     ch: usize,
@@ -225,12 +235,12 @@ struct Kernels {
     clip: QkClipKernels,
     rel: RelBiasKernels,
     out_gate: OutGateKernels,
-    router: Router,
+    router: Route,
     leg: CardLeg,
 }
 
 impl Kernels {
-    fn load(gpu: &Gpu) -> Result<Kernels, GpuError> {
+    fn load(gpu: &Gpu, n_expert: usize) -> Result<Kernels, GpuError> {
         let ctx = gpu.context();
         Ok(Kernels {
             kgemv: KGemvKernels::load(gpu)?,
@@ -246,7 +256,7 @@ impl Kernels {
             clip: QkClipKernels::load(ctx)?,
             rel: RelBiasKernels::load(ctx)?,
             out_gate: OutGateKernels::load(ctx)?,
-            router: <Router as RouterEntry>::load(ctx)?,
+            router: Route::load(ctx, n_expert)?,
             leg: CardLeg::load(gpu)?,
         })
     }
@@ -296,14 +306,14 @@ struct Scratch {
     prelude: DeviceBuffer<f32>,
     /// The head's padded columns' constant.
     pad: DeviceBuffer<f32>,
-    route: sigmoid_128_8::RouterOut,
+    route: RouteOut,
     leg: LegBufs,
     /// The step mixes' statistics and tickets.
     mix_step: MixStepScratch,
 }
 
 impl Scratch {
-    fn new(stream: &CudaStream, d: &Dims, pad: usize) -> Result<Scratch, GpuError> {
+    fn new(stream: &CudaStream, d: &Dims, pad: usize, router: &Route) -> Result<Scratch, GpuError> {
         let z = |len: usize| -> Result<DeviceBuffer<f32>, GpuError> {
             Ok(DeviceBuffer::zeroed(stream, len.max(1))?)
         };
@@ -312,7 +322,7 @@ impl Scratch {
         let segs = window_segments(d.window).max(window_segments(0));
         let leg = LegShape {
             cap: 1,
-            slots_per_col: Router::N_USED,
+            slots_per_col: N_USED,
             n,
             ff: d.ff,
         };
@@ -354,7 +364,7 @@ impl Scratch {
                 stream,
                 &vec![PAD_LOGIT; (pad * pass::rows::VERIFY_ROWS).max(1)],
             )?,
-            route: sigmoid_128_8::RouterOut::new(stream)?,
+            route: router.new_out(stream)?,
             leg: LegBufs::for_down(stream, leg, DownAct::Q8Blocks32)?,
             mix_step: MixStepScratch::new(stream, n)?,
         })
@@ -404,7 +414,7 @@ impl Scratch {
                 .sum::<usize>()
             + self.leg.bytes()
             + self.mix_step.bytes()
-            + <Router as RouterEntry>::out_bytes(&self.route)
+            + self.route.bytes()
     }
 }
 
@@ -439,19 +449,29 @@ pub struct Body {
     end: u32,
     ctx: usize,
     /// The prompt pass's buffers and kernels ([`pass`]).
-    pass: pass::Pass,
+    pass: Option<pass::Pass>,
     /// A verify's own buffers beside the pass's ([`pass::rows`]).
-    verify: pass::rows::VerifyBufs,
+    verify: Option<pass::rows::VerifyBufs>,
+    /// The host tier and the host embedding of a placed load ([`placed`]); `None` on the
+    /// whole-card load.
+    placed: Option<Placed>,
 }
 
 impl GpuModel<Body> {
     /// Tap the rows entering `visits` (strictly rising, each at most the visit count; the visit
     /// count is the final normed row) from the next step on, one row a tap; empty stops tapping.
-    /// The captured step is dropped first, so the next one records the copies.
+    /// The captured step is dropped first, so the next one records the copies. Refused by name
+    /// on a placed load: its step walk carries no taps.
     pub fn set_draft_taps(&mut self, visits: &[usize]) -> Result<(), GpuError> {
         const WHAT_S: &str = "inkling2::set_draft_taps";
         self.drop_captures();
         let (gpu, _, body) = self.body_parts(WHAT_S)?;
+        if body.placed.is_some() && !visits.is_empty() {
+            return Err(GpuError::state(
+                WHAT_S,
+                "a whole-card load (a placed step carries no taps)",
+            ));
+        }
         body.draft = None;
         if visits.is_empty() {
             return Ok(());
@@ -515,9 +535,95 @@ impl GpuModel<Body> {
             ctx,
             0..n_layers,
             true,
-            |gpu, w| Body::load(gpu, &file, w, (hp, ctx)),
+            |gpu, w| {
+                let stacks = prepare_stacks(gpu.stream(), &file, w, &hp)?;
+                Body::load(gpu, &file, w, (hp, ctx), (Some(stacks), None))
+            },
         )
     }
+}
+
+impl GpuModel<Body> {
+    /// Card `card` of `plan`, which `inputs` made, resident: the dense trunk, the stores at the
+    /// plan's `ctx_max`, the host tier over every routed expert (the card leg runs no IQ stack,
+    /// so the plan's card counts are 0, refused by name otherwise) and the embedding as a host
+    /// row ([`placed`]). The load runs no residency machine. The prompt is stepped one id at a
+    /// time. Refused by name: a plan of other than one stage card running every layer, a plan
+    /// whose head is on no card, an expert tier card, a looped file, experts on the card, and
+    /// scratch past the plan's term for it.
+    pub fn open_placed(
+        file: Split,
+        plan: &Plan<'_>,
+        inputs: &Inputs,
+        card: usize,
+        host: HostCfg,
+    ) -> Result<GpuModel<Body>, GpuError> {
+        const PLAN: &str = "inkling2::Body::open_placed";
+        let hp = &inputs.hp;
+        let (_, ctx) = stage_run(PLAN, plan, card, hp.n_layer)?;
+        plan.head_site(card).map_err(|e| GpuError::plan(PLAN, e))?;
+        let run = hosted(&inputs.spec.layers)
+            .map_err(|e| GpuError::shape(PLAN, format!("the routed layers: {e}")))?;
+        let spec = ResidencySpec {
+            lever: Residency::Off,
+            pool: ChurnHosting::Hosted,
+            delay: LIVE_DELAY,
+            deadline: DEADLINE,
+            top_k: hp.n_used[0],
+            max_rows: LOAD_ROWS,
+            stacks: Arc::new(hosted_stacks_named(
+                &inputs.model,
+                PLAN,
+                (run.len(), true),
+                fused_stack_names,
+            )?),
+        };
+        GpuModel::load_placed_with(
+            file,
+            plan,
+            card,
+            host,
+            spec,
+            |_, _, _, _| Ok(()),
+            |gpu, file, w, set, glue| {
+                let open = Open {
+                    file,
+                    plan,
+                    inputs,
+                    host,
+                    set,
+                    glue,
+                };
+                let mut body =
+                    Body::load(gpu, file, w, (hp.clone(), ctx), (None, Some((open, card))))?;
+                let p = body.placed.as_mut().ok_or(GpuError::shape(
+                    PLAN,
+                    "a placed load without its placed side",
+                ))?;
+                p.prepare_step_union()?;
+                refuse_scratch_past(
+                    PLAN,
+                    plan,
+                    card,
+                    body.scratch_bytes(),
+                    "the step's buffers, the host boundary, the slot map's copy",
+                )?;
+                let p = body.placed.as_mut().ok_or(GpuError::shape(
+                    PLAN,
+                    "a placed load without its placed side",
+                ))?;
+                p.start_residency(gpu)?;
+                Ok(body)
+            },
+        )
+    }
+}
+
+/// Layer `l`'s (gate, up, down) file names: the fused gate·up tensor twice (its two halves), the
+/// down stack.
+fn fused_stack_names(l: usize) -> [String; 3] {
+    let fused = names::ffn_gate_up_exps(l);
+    [fused.clone(), fused, names::ffn_down_exps(l)]
 }
 
 /// The card format of the file tensor `t`: a BF16 attention projection ([`RAW_SITES`]), token
@@ -669,6 +775,42 @@ fn controls(
     })
 }
 
+/// Each layer's routed stacks as the card leg reads them, the whole-card load's: a Q8_0 layer's
+/// in the leg's blocks, then the fused gate·up split into its halves (the per-expert scale
+/// shared, the split exact). The names of (gate half, up half, down) a layer, each checked
+/// against the card leg's arms.
+fn prepare_stacks(
+    stream: &CudaStream,
+    file: &Split,
+    w: &mut Weights,
+    hp: &Hparams,
+) -> Result<Vec<[String; 3]>, GpuError> {
+    let arms = accepts::leg_arms(Program::Inkling2Body)
+        .ok_or_else(|| GpuError::shape(WHAT, "the inkling2 program names no card leg"))?;
+    let ff = hp.expert_ff[0];
+    let mut out = Vec::with_capacity(hp.n_layer);
+    for l in 0..hp.n_layer {
+        let fused = names::ffn_gate_up_exps(l);
+        let down = format!("blk.{l}.ffn_down_exps.weight");
+        let q8 = file
+            .find(&fused)
+            .is_some_and(|(_, t)| t.ty == gguf::GgmlType::Q8_0);
+        if q8 {
+            w.relayout(stream, file, &fused, CardFormat::KQuant)?;
+            w.relayout(stream, file, &down, CardFormat::KQuant)?;
+        }
+        let (gate_half, up_half) = w.split_fused_w13(stream, &fused, ff)?;
+        LegStacks::of_arms(
+            w,
+            [gate_half.as_str(), up_half.as_str(), down.as_str()],
+            arms,
+            (GATE_UP_ROLE, DOWN_ROLE),
+        )?;
+        out.push([gate_half, up_half, down]);
+    }
+    Ok(out)
+}
+
 impl Body {
     #[allow(
         clippy::too_many_lines,
@@ -677,8 +819,9 @@ impl Body {
     fn load(
         gpu: &Gpu,
         file: &Split,
-        w: &mut Weights,
+        w: &Weights,
         (hp, ctx): (Hparams, usize),
+        (stacks, placed): (Option<Vec<[String; 3]>>, Option<(Open<'_>, usize)>),
     ) -> Result<Body, GpuError> {
         let stream = gpu.stream();
         if hp.dialect != Dialect::Unsloth {
@@ -698,28 +841,27 @@ impl Body {
                  every visit",
             ));
         }
-        if hp.head_dim != HEAD || n_head != GROUP * n_kv || hp.d_rel != REL {
+        let group_ok = n_kv > 0 && GROUPS.iter().any(|g| n_head == g * n_kv);
+        if hp.head_dim != HEAD || !group_ok || hp.d_rel != REL {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
                     "heads {n_head} over {n_kv} of {} with relative rows of {}: the rel-bias \
-                     entries take {GROUP} query heads a key head of {HEAD} and rows of {REL}",
+                     entries take {GROUPS:?} query heads a key head of {HEAD} and rows of {REL}",
                     hp.head_dim, hp.d_rel
                 ),
             ));
         }
-        if (hp.n_expert, hp.n_used[0]) != (Router::N_EXPERT, Router::N_USED) {
+        if hp.n_used[0] != N_USED {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
-                    "{} experts, the top {}: the body's router is the {}/{} instance",
-                    hp.n_expert,
-                    hp.n_used[0],
-                    Router::N_EXPERT,
-                    Router::N_USED
+                    "the top {} of {} experts: the body's routers take the top {N_USED}",
+                    hp.n_used[0], hp.n_expert
                 ),
             ));
         }
+        let k = Kernels::load(gpu, hp.n_expert)?;
         let core = hp.loop_.filter(|lp| lp.passes > 1);
         let loop_spec = hp.loop_.map(|lp| LoopSpec {
             core_start: lp.core_start as u32,
@@ -728,6 +870,12 @@ impl Body {
             gate_rank: lp.gate_rank as u32,
         });
         let visits = visits(hp.n_layer, loop_spec);
+        if placed.is_some() && (core.is_some() || visits.len() != hp.n_layer) {
+            return Err(GpuError::shape(
+                WHAT,
+                "a looped file on a placed load: the placed walk's visit is its layer",
+            ));
+        }
         if visits.len() >= crate::fault::LAYER_HEAD as usize {
             return Err(GpuError::shape(
                 WHAT,
@@ -751,34 +899,23 @@ impl Body {
             taps: hp.conv,
             window: hp.swa,
             ff: hp.expert_ff[0],
+            n_expert: hp.n_expert,
             rank: hp.loop_.map_or(0, |lp| lp.gate_rank),
             ch: 2 * kvw + 2 * n,
             bases: [0, kvw, 2 * kvw, 2 * kvw + n],
         };
-        let arms = accepts::leg_arms(Program::Inkling2Body)
-            .ok_or_else(|| GpuError::shape(WHAT, "the inkling2 program names no card leg"))?;
+        let mut stacks = stacks.map(Vec::into_iter);
         let mut layers = Vec::with_capacity(hp.n_layer);
         for l in 0..hp.n_layer {
             let windowed = hp.windowed[l];
             let blk = |s: &str| format!("blk.{l}.{s}");
-            // The routed stacks: a Q8_0 layer's in the leg's blocks, then the fused gate·up split
-            // into its halves (the per-expert scale shared, the split exact).
-            let fused = names::ffn_gate_up_exps(l);
-            let down = blk("ffn_down_exps.weight");
-            let q8 = file
-                .find(&fused)
-                .is_some_and(|(_, t)| t.ty == gguf::GgmlType::Q8_0);
-            if q8 {
-                w.relayout(stream, file, &fused, CardFormat::KQuant)?;
-                w.relayout(stream, file, &down, CardFormat::KQuant)?;
-            }
-            let (gate_half, up_half) = w.split_fused_w13(stream, &fused, d.ff)?;
-            LegStacks::of_arms(
-                w,
-                [gate_half.as_str(), up_half.as_str(), down.as_str()],
-                arms,
-                (GATE_UP_ROLE, DOWN_ROLE),
-            )?;
+            let stacks = match stacks.as_mut() {
+                None => None,
+                Some(it) => Some(
+                    it.next()
+                        .ok_or_else(|| GpuError::shape(WHAT, "fewer stack triples than layers"))?,
+                ),
+            };
             let extent = if windowed { hp.swa } else { hp.extent };
             let norms = if windowed {
                 let norm = vector(w, blk("attn_norm.weight"), n)?;
@@ -832,7 +969,7 @@ impl Body {
                 ],
                 router: blk("ffn_gate_inp.weight"),
                 probs_b: vector(w, blk("exp_probs_b.bias"), hp.n_expert)?,
-                stacks: [gate_half, up_half, down],
+                stacks,
                 ctrl,
                 norm_proj: false,
             };
@@ -860,16 +997,32 @@ impl Body {
         };
         let acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
         let pad = hp.n_vocab - hp.n_vocab_unpadded;
-        let pass = pass::Pass::new(
-            gpu,
-            (&pass::shape_of(&hp, file)?, place::pass_rows(ctx)),
-            &layers,
-        )?;
+        // The prompt pass and the verify run on the card's own experts: a placed load has neither
+        // (its prompt is stepped).
+        let (pass, verify) = if placed.is_some() {
+            (None, None)
+        } else {
+            (
+                Some(pass::Pass::new(
+                    gpu,
+                    (&pass::shape_of(&hp, file)?, place::pass_rows(ctx)),
+                    &layers,
+                )?),
+                Some(pass::rows::VerifyBufs::new(stream, &d)?),
+            )
+        };
+        let placed = placed
+            .map(|(open, card)| {
+                let map = placed_map(&open, card, &hp)?;
+                Placed::new(gpu, map, open)
+            })
+            .transpose()?;
         Ok(Body {
             pass,
-            verify: pass::rows::VerifyBufs::new(stream, &d)?,
-            k: Kernels::load(gpu)?,
-            s: Scratch::new(stream, &d, pad)?,
+            verify,
+            s: Scratch::new(stream, &d, pad, &k.router)?,
+            k,
+            placed,
             step_in: StepIn::new(stream)?,
             ring,
             messages: true,
@@ -886,6 +1039,12 @@ impl Body {
             acts,
             hp,
         })
+    }
+
+    /// The placed side of the load, `None` on the whole-card load ([`GpuModel::open_placed`]).
+    #[must_use]
+    pub fn placed(&self) -> Option<&Placed> {
+        self.placed.as_ref()
     }
 
     /// The positions a rollback takes back, from the written end: every store is positional, so
@@ -961,6 +1120,12 @@ impl Body {
     /// Keep every visit's [`TAP_STAGES`] at each step's position from now on ([`Body::taps`]).
     /// Load-time work: before any capture.
     pub fn arm_taps(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
+        if self.placed.is_some() {
+            return Err(GpuError::state(
+                "inkling2::Body::arm_taps",
+                "a whole-card load (a placed step carries no taps)",
+            ));
+        }
         let block: usize = self.tap_widths().iter().sum();
         self.taps = Some(DeviceBuffer::zeroed(
             gpu.stream(),
@@ -997,7 +1162,7 @@ impl Body {
         (ids, weights): (&[u32], &[f32]),
     ) -> Result<(), GpuError> {
         const WHAT: &str = "inkling2::Body::force_picks";
-        let len = self.visits.len() * Router::N_USED;
+        let len = self.visits.len() * N_USED;
         if ids.len() != len || weights.len() != len {
             return Err(GpuError::shape(
                 WHAT,
@@ -1008,10 +1173,10 @@ impl Body {
                 ),
             ));
         }
-        if let Some(bad) = ids.iter().find(|&&id| id as usize >= Router::N_EXPERT) {
+        if let Some(bad) = ids.iter().find(|&&id| id as usize >= self.d.n_expert) {
             return Err(GpuError::shape(
                 WHAT,
-                format!("expert {bad} of {}", Router::N_EXPERT),
+                format!("expert {bad} of {}", self.d.n_expert),
             ));
         }
         let stream = gpu.stream();
@@ -1034,8 +1199,12 @@ impl Body {
 
     fn scratch_bytes(&self) -> usize {
         self.s.bytes()
-            + self.pass.bytes()
-            + self.verify.bytes()
+            + self.pass.as_ref().map_or(0, pass::Pass::bytes)
+            + self
+                .verify
+                .as_ref()
+                .map_or(0, pass::rows::VerifyBufs::bytes)
+            + self.placed.as_ref().map_or(0, Placed::device_bytes)
             + self.acts.bytes()
             + self.step_in.bytes()
             + self.k.kgemv.device_bytes()
@@ -1064,6 +1233,7 @@ impl Body {
             draft,
             forced,
             ctx,
+            placed,
             ..
         } = self;
         let cx = GqaCx {
@@ -1102,28 +1272,47 @@ impl Body {
             n_msg: 0,
             banked: false,
         };
-        walk.embed()?;
-        let core = hp.loop_.filter(|lp| lp.passes > 1);
-        for (slot, v) in visits.iter().enumerate() {
-            let l = v.layer as usize;
-            let layer = &layers[l];
-            if let Some(lp) = core
-                && l == lp.core_start
-            {
-                walk.pass_edge(v.pass)?;
+        match placed.as_mut() {
+            Some(Placed {
+                host: PlacedHost { shell, side, .. },
+                ..
+            }) => {
+                walk.embed_norm()?;
+                let mut leg = StepLeg::new(gpu.stream(), &mut shell.hybrid);
+                let mut step = StepWalk {
+                    walk,
+                    layers: &layers[..],
+                    stores: &mut stores[..],
+                    placed: side,
+                };
+                step.run(&mut leg)?;
+                walk = step.walk;
             }
-            if let Some(t) = draft.as_mut()
-                && let Some(i) = t.slot(slot)
-            {
-                t.enter(gpu.stream(), i, &walk.s.x, 1)?;
-            }
-            let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
-            walk.attn_half(slot, (l, layer), &mut stores[slot], msg)?;
-            walk.ffn_front(slot, layer, msg)?;
-            walk.ffn_shadow(slot, layer)?;
-            walk.ffn_back(slot, layer, &mut stores[slot])?;
-            if let Some(t) = taps.as_mut() {
-                walk.tap(t, slot)?;
+            None => {
+                walk.embed()?;
+                let core = hp.loop_.filter(|lp| lp.passes > 1);
+                for (slot, v) in visits.iter().enumerate() {
+                    let l = v.layer as usize;
+                    let layer = &layers[l];
+                    if let Some(lp) = core
+                        && l == lp.core_start
+                    {
+                        walk.pass_edge(v.pass)?;
+                    }
+                    if let Some(t) = draft.as_mut()
+                        && let Some(i) = t.slot(slot)
+                    {
+                        t.enter(gpu.stream(), i, &walk.s.x, 1)?;
+                    }
+                    let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
+                    walk.attn_half(slot, (l, layer), &mut stores[slot], msg)?;
+                    walk.ffn_front(slot, layer, msg)?;
+                    walk.ffn_shadow(slot, layer)?;
+                    walk.ffn_back(slot, layer, &mut stores[slot])?;
+                    if let Some(t) = taps.as_mut() {
+                        walk.tap(t, slot)?;
+                    }
+                }
             }
         }
         walk.finish(
@@ -1253,22 +1442,31 @@ impl Walk<'_> {
         let StepIn {
             words, pos, n_keys, ..
         } = &mut *self.step_in;
-        let ids = Window::<u32>::of(words, WORD_TOKEN * 4, 1)?;
-        let pos0 = Window::<u32>::of(words, WORD_POS * 4, 1)?;
-        self.k.q38.enqueue_embed_lookup(
-            gpu,
-            STEP,
-            (w, "token_embd.weight"),
-            EmbedIo {
-                ids: &ids,
-                pos0: &pos0,
-                first: 0,
-                width: self.d.n,
-                y: &mut self.s.emb,
-                pos,
-                n_keys,
-            },
-        )?;
+        {
+            let ids = Window::<u32>::of(words, WORD_TOKEN * 4, 1)?;
+            let pos0 = Window::<u32>::of(words, WORD_POS * 4, 1)?;
+            self.k.q38.enqueue_embed_lookup(
+                gpu,
+                STEP,
+                (w, "token_embd.weight"),
+                EmbedIo {
+                    ids: &ids,
+                    pos0: &pos0,
+                    first: 0,
+                    width: self.d.n,
+                    y: &mut self.s.emb,
+                    pos,
+                    n_keys,
+                },
+            )?;
+        }
+        self.embed_norm()
+    }
+
+    /// The embedding row's norm into the stream: the step's first block input. A placed load's
+    /// row arrives from the host ([`Placed::refresh`]), so it starts here.
+    fn embed_norm(&mut self) -> Result<(), GpuError> {
+        let (gpu, w) = (self.cx.gpu, self.cx.w);
         gpu.elem().enqueue_rms_norm(
             gpu.stream(),
             &self.s.emb,
@@ -1780,25 +1978,30 @@ impl Walk<'_> {
         let (gpu, w) = (self.cx.gpu, self.cx.w);
         let arms = accepts::leg_arms(Program::Inkling2Body)
             .ok_or_else(|| GpuError::state(STEP, "the inkling2 program's card leg"))?;
-        let names = layer.stacks.each_ref().map(String::as_str);
+        let names = layer
+            .stacks
+            .as_ref()
+            .ok_or(GpuError::state(
+                STEP,
+                "the card's routed stacks (a whole-card load)",
+            ))?
+            .each_ref()
+            .map(String::as_str);
         let stacks = LegStacks::of_arms(w, names, arms, (GATE_UP_ROLE, DOWN_ROLE))?;
         let s = &mut *self.s;
         let forced = self
             .forced
             .map(|f| -> Result<_, GpuError> {
-                let at = slot * Router::N_USED * 4;
+                let at = slot * N_USED * 4;
                 Ok((
-                    Window::<u32>::of(&f.ids, at, Router::N_USED)?,
-                    Window::<f32>::of(&f.weights, at, Router::N_USED)?,
+                    Window::<u32>::of(&f.ids, at, N_USED)?,
+                    Window::<f32>::of(&f.weights, at, N_USED)?,
                 ))
             })
             .transpose()?;
         let (sel, weights): (&DeviceBuffer<u32>, &DeviceBuffer<f32>) = match &forced {
             Some((ids, ws)) => (ids, ws),
-            None => (
-                <Router as RouterEntry>::out_ids(&s.route),
-                <Router as RouterEntry>::out_weights(&s.route),
-            ),
+            None => (s.route.ids(), s.route.weights()),
         };
         let run = LegRun {
             layer: slot,
@@ -1806,7 +2009,7 @@ impl Walk<'_> {
             normed: &s.fxn,
             m: 1,
             sel,
-            n_card: Router::N_EXPERT,
+            n_card: self.d.n_expert,
             rule: self.act,
         };
         self.k.leg.enqueue(
@@ -1918,7 +2121,7 @@ fn head_logits(
 
 impl ChainBody for Body {
     type Input = DecodeInput;
-    type Host = NoHost;
+    type Host = Placed;
     const UNHOSTED_POOL: bloomery_levers::UnhostedPool = bloomery_levers::UnhostedPool::NotCarried;
 
     fn arch() -> Arch {
@@ -1952,6 +2155,18 @@ impl ChainBody for Body {
         let tau = state::tau_of(input.pos, self.hp.log_floor, self.hp.log_alpha);
         self.step_in
             .refresh(stream, (input.token, input.pos), (self.ring, tau))?;
+        if let Some(p) = self.placed.as_mut() {
+            p.refresh(
+                stream,
+                input.token,
+                (
+                    &mut self.s.emb,
+                    &mut self.step_in.pos,
+                    &mut self.step_in.n_keys,
+                ),
+                input.pos,
+            )?;
+        }
         self.held = input.pos + 1;
         self.end = self.end.max(self.held);
         Ok(())
@@ -1968,6 +2183,9 @@ impl ChainBody for Body {
         let stream = gpu.stream();
         for store in &mut self.stores {
             store.clear(stream)?;
+        }
+        if let Some(p) = self.placed.as_mut() {
+            p.reset(stream)?;
         }
         self.held = 0;
         self.end = 0;
@@ -1988,8 +2206,8 @@ impl ChainBody for Body {
         0..self.layers.len()
     }
 
-    fn host(&mut self) -> Option<&mut NoHost> {
-        None
+    fn host(&mut self) -> Option<&mut Placed> {
+        self.placed.as_mut()
     }
 }
 

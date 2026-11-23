@@ -35,10 +35,11 @@
 //! the rows' causal offsets, the routed rows on the step's card leg, and the head over every row;
 //! so each row is a step's bits.
 
+use super::route::N_USED;
 use super::state::{self, VisitStore};
 use super::{
-    Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Kernels, Layer, MIX_EPS, MSG_ATTN, MSG_FFN, Router,
-    WHAT, conv_scale, head_logits, tap_widths,
+    Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Kernels, Layer, MIX_EPS, MSG_ATTN, MSG_FFN, WHAT,
+    conv_scale, head_logits, tap_widths,
 };
 use crate::arch::hybrid::{Site, WideCx, project_wide};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs};
@@ -56,7 +57,7 @@ use crate::q38::EmbedIo;
 use crate::qk_clip::QkClipArgs;
 use crate::rel_bias::{REL, RelBiasArgs};
 use crate::rel_bias_prefill::{RelBiasPrefillKernels, RelPrefillArgs};
-use crate::routed_block::{RouteIn, RoutedRows, RouterEntry};
+use crate::routed_block::{RouteIn, RoutedRows};
 use crate::site::{self, SiteTy, WideActs, WideKernels};
 use crate::tensor::{Window, WindowMut, copy_row};
 use crate::weights::Weights;
@@ -434,7 +435,11 @@ impl GpuModel<Body> {
                     ),
                 ));
             }
-            if let Some(f) = &body.pass.forced
+            let pass = body.pass.as_ref().ok_or(GpuError::state(
+                CALL,
+                "a whole-card load (a placed load's prompt is stepped)",
+            ))?;
+            if let Some(f) = &pass.forced
                 && f.rows != ids.len()
             {
                 return Err(GpuError::shape(
@@ -447,7 +452,7 @@ impl GpuModel<Body> {
                 ));
             }
             body.held = u32::MAX;
-            let rows = body.pass.rows;
+            let rows = pass.rows;
             let passes = ids.len().div_ceil(rows);
             for (i, chunk) in ids.chunks(rows).enumerate() {
                 let first = i * rows;
@@ -478,14 +483,14 @@ impl Body {
     /// Rows a pass holds.
     #[must_use]
     pub fn pass_rows(&self) -> usize {
-        self.pass.rows
+        self.pass.as_ref().map_or(0, |p| p.rows)
     }
 
     /// Device bytes the prompt pass's buffers take: what a plan reserves for it
     /// ([`place::pass_bytes`]).
     #[must_use]
     pub fn pass_made_bytes(&self) -> usize {
-        self.pass.bytes()
+        self.pass.as_ref().map_or(0, Pass::bytes)
     }
 
     /// Route every visit's rows of the next prompt pass by `ids` and `weights` (visit-major, then
@@ -499,7 +504,7 @@ impl Body {
         rows: usize,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "inkling2::Body::force_pass_picks";
-        let len = self.visits.len() * rows * Router::N_USED;
+        let len = self.visits.len() * rows * N_USED;
         if ids.len() != len || weights.len() != len {
             return Err(GpuError::shape(
                 WHAT,
@@ -511,14 +516,18 @@ impl Body {
                 ),
             ));
         }
-        if let Some(bad) = ids.iter().find(|&&id| id as usize >= Router::N_EXPERT) {
+        if let Some(bad) = ids.iter().find(|&&id| id as usize >= self.d.n_expert) {
             return Err(GpuError::shape(
                 WHAT,
-                format!("expert {bad} of {}", Router::N_EXPERT),
+                format!("expert {bad} of {}", self.d.n_expert),
             ));
         }
         let stream = gpu.stream();
-        self.pass.forced = Some(PassForced {
+        let pass = self
+            .pass
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "a whole-card load"))?;
+        pass.forced = Some(PassForced {
             ids: DeviceBuffer::from_host(stream, ids)?,
             weights: DeviceBuffer::from_host(stream, weights)?,
             rows,
@@ -528,7 +537,9 @@ impl Body {
 
     /// Route the passes by the router's picks again ([`Body::force_pass_picks`]).
     pub fn unforce_pass_picks(&mut self) {
-        self.pass.forced = None;
+        if let Some(p) = self.pass.as_mut() {
+            p.forced = None;
+        }
     }
 
     /// One pass of a call: the words staged, the visits over its rows, the head's mix, the kept
@@ -541,10 +552,13 @@ impl Body {
         at: &PassAt<'_>,
         kept: &mut Vec<Vec<f32>>,
     ) -> Result<(), GpuError> {
-        let (rows, ring) = (self.pass.rows, self.ring);
+        let pass = self
+            .pass
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "a whole-card load"))?;
+        let (rows, ring) = (pass.rows, self.ring);
         let (floor, alpha) = (self.hp.log_floor, self.hp.log_alpha);
-        self.pass
-            .b
+        pass.b
             .stage(gpu.stream(), (at.ids, at.pos0, rows), (ring, floor, alpha))?;
         self.walk_rows(gpu, w, head, (at.ids.len(), Tail::Pass { at, kept }))
     }
@@ -578,10 +592,19 @@ impl Body {
             b,
             forced,
             ..
-        } = pass;
+        } = pass
+            .as_mut()
+            .ok_or(GpuError::state(WHAT, "a whole-card load"))?;
         let (forced, verify) = match &tail {
             Tail::Pass { at, .. } => (forced.as_ref().map(|f| (f, at.first)), None),
-            Tail::Verify => (None, Some(verify)),
+            Tail::Verify => (
+                None,
+                Some(
+                    verify
+                        .as_mut()
+                        .ok_or(GpuError::state(WHAT, "a whole-card load"))?,
+                ),
+            ),
         };
         let mut r = RowWalk {
             gpu,
@@ -1292,14 +1315,19 @@ impl<'a> RowWalk<'a> {
         let fault = gpu.layer_sink(slot)?;
         let arms = accepts::leg_arms(Program::Inkling2Body)
             .ok_or_else(|| GpuError::state(CALL, "the inkling2 program's card leg"))?;
-        let names = layer.stacks.each_ref().map(String::as_str);
+        let names = layer
+            .stacks
+            .as_ref()
+            .ok_or(GpuError::state(CALL, "the card's routed stacks"))?
+            .each_ref()
+            .map(String::as_str);
         let stacks = LegStacks::of_arms(w, names, arms, (GATE_UP_ROLE, DOWN_ROLE))?;
         let block = stacks.block(self.d.ff, n)?;
-        let slots = m * Router::N_USED;
+        let slots = m * N_USED;
         let forced = self
             .forced
             .map(|(f, first)| -> Result<_, GpuError> {
-                let at = (slot * f.rows + first) * Router::N_USED * 4;
+                let at = (slot * f.rows + first) * N_USED * 4;
                 Ok((
                     Window::<u32>::of(&f.ids, at, slots)?,
                     Window::<f32>::of(&f.weights, at, slots)?,
@@ -1328,7 +1356,7 @@ impl<'a> RowWalk<'a> {
         block.enqueue_rule(
             gpu,
             (Some(&pk.gemm), &k.g32),
-            (route, Router::N_USED),
+            (route, N_USED),
             slots,
             (
                 RouteIo {
@@ -1352,9 +1380,9 @@ impl<'a> RowWalk<'a> {
                 sel,
                 n,
                 m,
-                n_card: Router::N_EXPERT,
-                n_used: Router::N_USED,
-                w_pitch: Router::N_USED,
+                n_card: self.d.n_expert,
+                n_used: N_USED,
+                w_pitch: N_USED,
                 fault,
             },
             moe,

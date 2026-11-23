@@ -28,21 +28,21 @@ const PRES: &[&str] = &["inkling2", "gpt-4o"];
 
 /// What the Inkling 2 body runs that the common table ([`coverage::AVAILABLE`]) does not list for
 /// it: one row per kernel instance, at the widths of the Mini and its fixture (the head of 128
-/// values over groups of 3 query heads, the 128-expert top-8 router). A width the kernels have
-/// no instance of at the body's step stays an item of [`coverage::check`], so the Small's file
-/// (groups of 6, 384 experts, its routed stacks' types) is refused by name.
+/// values over groups of 3 query heads, the 128-expert top-8 router) and the Small's (groups of
+/// 6, the 384-expert top-8 router). A width the kernels have no instance of at the body's step
+/// stays an item of [`coverage::check`].
 pub const AVAILABLE: &[Available] = &[
     Available {
         programs: &[Program::Inkling2Body],
-        at: "gpu/src/rel_bias.rs (GROUP_3 query heads a key head of HEAD 128 with REL 16 bias \
-             rows gathered over the extent 1024, the windowed visits at window 1024 and the \
-             windowless ones over every key)",
+        at: "gpu/src/rel_bias.rs (GROUP_3 or GROUP_6 query heads a key head of HEAD 128 with REL \
+             16 bias rows gathered over the extent 1024, the windowed visits at window 1024 and \
+             the windowless ones over every key)",
         runs: |n| {
             matches!(
                 n,
                 Need::RelBias {
                     head: 128,
-                    group: 3,
+                    group: 3 | 6,
                     window: Some(1024) | None,
                     d_rel: 16,
                     extent: 1024,
@@ -71,6 +71,19 @@ pub const AVAILABLE: &[Available] = &[
                 n,
                 Need::Router(s)
                     if (s.experts, s.top_k) == (128, 8) && s.rule == rules::BIASED_SIGMOID
+            ) && coverage::routes(n, &[RouterBody::BiasedSigmoid])
+        },
+    },
+    Available {
+        programs: &[Program::Inkling2Body],
+        at: "gpu/src/route_body.rs sigmoid_384_8 (the biased sigmoid router at 384 experts and \
+             the top 8, twelve scored experts a lane, the kept scores scaled by the file's \
+             weights scale at the launch)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Router(s)
+                    if (s.experts, s.top_k) == (384, 8) && s.rule == rules::BIASED_SIGMOID
             ) && coverage::routes(n, &[RouterBody::BiasedSigmoid])
         },
     },
@@ -405,7 +418,7 @@ mod tests {
         };
         assert_eq!(
             role("token_embd_norm.weight"),
-            Some((Role::TokenEmbedding, None))
+            Some((Role::Attention, Some(0)))
         );
         assert_eq!(role("output_res_query.weight"), Some((Role::Head, None)));
         assert_eq!(
@@ -454,12 +467,12 @@ mod tests {
         assert!(e.to_string().contains("blk.2.loop_attn_down.weight"), "{e}");
     }
 
-    /// The rows are the kernels' instances, at the Mini's and the fixture's widths: the
-    /// rel-bias head of 128 values over groups of 3 (windowed at 1024 or over every key, bias
-    /// bank 16 x 1024), 4-tap convs, the block mix of 6 at one query or three, the 128-expert
-    /// top-8 router, the situ routed experts, the loop of 3 passes and the softcap at 30. The
-    /// Small's widths (groups of 6, the 384-expert router) and any other width are no row's.
-    /// Mutants: the group row widened to 6, the router row to 384 experts.
+    /// The rows are the kernels' instances, at the Mini's, the fixture's and the Small's widths:
+    /// the rel-bias head of 128 values over groups of 3 or 6 (windowed at 1024 or over every
+    /// key, bias bank 16 x 1024), 4-tap convs, the block mix of 6 at one query or three, the
+    /// 128- and 384-expert top-8 routers, the situ routed experts, the loop of 3 passes and the
+    /// softcap at 30. Any other width is no row's. Mutants: the group row narrowed to 3, the
+    /// 384 row removed.
     #[test]
     fn the_rows_are_the_kernels_instances() {
         use models::shape::{MoeShape, rules};
@@ -490,6 +503,8 @@ mod tests {
         for n in [
             rel(3, Some(1024), 16, 1024),
             rel(3, None, 16, 1024),
+            rel(6, Some(1024), 16, 1024),
+            rel(6, None, 16, 1024),
             Need::Sconv {
                 taps: 4,
                 dynamic: false,
@@ -500,6 +515,7 @@ mod tests {
             },
             Need::OutGateProj,
             router(128, 8),
+            router(384, 8),
             Need::ExpertAct {
                 shared: false,
                 act: situ,
@@ -512,8 +528,7 @@ mod tests {
             assert!(runs(&n), "{n} is the kernels'");
         }
         for n in [
-            rel(6, Some(1024), 16, 1024),
-            rel(6, None, 16, 1024),
+            rel(4, Some(1024), 16, 1024),
             rel(3, Some(512), 16, 1024),
             rel(3, Some(1024), 8, 1024),
             rel(3, Some(1024), 16, 512),
@@ -521,7 +536,7 @@ mod tests {
                 taps: 7,
                 dynamic: false,
             },
-            router(384, 8),
+            router(384, 6),
             router(128, 6),
             Need::ExpertAct {
                 shared: true,

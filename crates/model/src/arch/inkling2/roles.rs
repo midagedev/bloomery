@@ -162,7 +162,9 @@ pub(super) fn model_level(
     core_start: usize,
 ) -> Option<(Role, Option<usize>)> {
     match name {
-        "token_embd_norm.weight" => Some((Role::TokenEmbedding, None)),
+        // The norm's gain applies on the stage card to the row the embedding gives, whether the
+        // table is a card's or the host's: it is the first layer's tensor, not the table's.
+        "token_embd_norm.weight" => Some((Role::Attention, Some(0))),
         "output_res_query.weight" => Some((Role::Head, None)),
         "loop_res_query.weight" | "loop_kv_res_query.weight" if dialect == Dialect::Unsloth => {
             Some((Role::Attention, Some(core_start)))
@@ -238,7 +240,7 @@ mod tests {
                 model_level(name, pr, 2).unwrap(),
                 match name {
                     "output_res_query.weight" => (Role::Head, None),
-                    "token_embd_norm.weight" => (Role::TokenEmbedding, None),
+                    "token_embd_norm.weight" => (Role::Attention, Some(0)),
                     _ => (Role::Attention, Some(2)),
                 }
             );

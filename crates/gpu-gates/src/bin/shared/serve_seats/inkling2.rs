@@ -32,12 +32,17 @@
 //! - The prompt runs by the body's prompt rule (`app::Prompt`): whatever the session does
 //!   with the ids, the seat does the same, and the first id of the answer is a step of the
 //!   last prompt id.
-//! - The load is the whole model on one card (`GpuModel::open`): no routed expert sits on the
-//!   host. The plan is the body's ([`Inputs::plan`], every routed stack of a type the body's
-//!   card leg runs on the card beside the dense weights), and a plan that would leave experts
-//!   off the card is refused by name, a short card at that context ([`card_experts_floor`]),
-//!   since there is no placed load yet. The unset `--ctx` is the largest context the card
-//!   holds whole, up to the file's trained context.
+//! - The load is the whole model on one card (`GpuModel::open`) when the card leg runs every
+//!   routed stack of the file: no routed expert sits on the host. The plan is the body's
+//!   ([`Inputs::plan`], every routed stack of a type the body's card leg runs on the card
+//!   beside the dense weights), and a plan that would leave experts off the card is refused by
+//!   name, a short card at that context ([`card_experts_floor`]). A file whose stacks the card
+//!   leg does not run (the Small's IQ2_XS, IQ3_XXS and IQ4_XS experts) takes the placed load
+//!   (`GpuModel::open_placed`): the dense trunk and the stores on the card, every routed expert
+//!   served by the host tier, the prompt stepped one id at a time. The unset `--ctx` is the
+//!   largest context the plan holds, up to the file's trained context: for the Small the
+//!   card's stores (the 40 windowed layers' rings and the 8 global layers' keys and values)
+//!   are the bound.
 //!
 //! `--place W` is the shared placement word (`generate::Place`); unset, the common untiered
 //! rule decides on one census reading. A placement the plan refuses (more than one card, a tier
@@ -75,14 +80,15 @@ use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
 use bloomery_gpu_gates::{GateError, gpu_census, ref_model_path};
-use bloomery_levers::{DraftWord, Levers};
+use bloomery_levers::{DraftWord, HostCfg, Levers};
 use gguf::Split;
 use model::arch::Arch;
 use model::arch::inkling2::place::Inputs;
 use model::arch::place_hybrid::PlaceError;
+use model::placement::accepts::inkling2_leg;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, card_experts_floor, probe_of};
 use model::placement::workstation::DeviceId;
-use model::placement::{Machine, PlacementError, Plan, PlanLevers};
+use model::placement::{Machine, PlacementError, Plan, PlanLevers, Role};
 use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
@@ -102,6 +108,10 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::SCHEMAJUMP,
     bloomery_levers::DRAFT,
     bloomery_levers::INK2_DENSE,
+    bloomery_levers::HOST_POPULATE,
+    bloomery_levers::HOST_LOCK,
+    bloomery_levers::CARD_DONTNEED,
+    bloomery_levers::R8,
 ];
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
@@ -141,6 +151,58 @@ fn whole_card_plan<'a>(
     }
     card_experts_floor(&plan, 0, inputs.model.experts).map_err(PlaceError::Placement)?;
     Ok(plan)
+}
+
+/// Whether the body's card leg runs every routed stack of `inputs`' file: the whole-card load
+/// serves it. A file with a stack of another type (the Small's IQ quants) takes the placed load.
+fn card_runs_the_experts(inputs: &Inputs) -> bool {
+    inputs
+        .model
+        .tensors
+        .iter()
+        .filter(|t| t.role == Role::RoutedExperts)
+        .all(|t| inkling2_leg(t.ty))
+}
+
+/// The plan of `inputs` on `machine` at `ctx` positions of a file whose routed experts the card
+/// does not run: the body's plan ([`Inputs::plan`], every routed stack on the host, the dense
+/// weights and the stores on the card) refused where its terms break a bound.
+fn hosted_plan<'a>(
+    inputs: &'a Inputs,
+    machine: &'a Machine,
+    ctx: u64,
+    levers: &PlanLevers,
+) -> Result<Plan<'a>, PlaceError> {
+    let plan = inputs.plan(machine, ctx, levers)?;
+    let broken = plan.violations();
+    if !broken.is_empty() {
+        return Err(PlaceError::Broken(broken));
+    }
+    Ok(plan)
+}
+
+/// The plan the seat loads by: the whole-card plan of a file the card leg runs, the hosted plan
+/// of one it does not.
+fn seat_plan<'a>(
+    inputs: &'a Inputs,
+    machine: &'a Machine,
+    ctx: u64,
+    levers: &PlanLevers,
+) -> Result<Plan<'a>, PlaceError> {
+    if card_runs_the_experts(inputs) {
+        whole_card_plan(inputs, machine, ctx, levers)
+    } else {
+        hosted_plan(inputs, machine, ctx, levers)
+    }
+}
+
+/// What a placed load is made from beside the plan's card: everything the engine thread needs to
+/// plan again (the plan borrows the machine and the inputs) and the host tier's settings.
+struct PlacedOpen {
+    inputs: Inputs,
+    machine: Machine,
+    levers: PlanLevers,
+    host: HostCfg,
 }
 
 /// The weights a seat serves: the official checkpoint folder a directory is, or a GGUF file.
@@ -250,6 +312,8 @@ struct OpenSeat {
     /// Whether the load serves a draft: the verify's graphs are captured at load, beside the
     /// step's.
     drafted: bool,
+    /// The placed load's inputs, for a file whose experts the card leg does not run.
+    placed: Option<PlacedOpen>,
 }
 
 /// The model, in graph mode with its step captured.
@@ -267,8 +331,17 @@ impl Inkling2 {
         let t = Instant::now();
         let file = (a.model)()?;
         let opened = t.elapsed();
-        let gpu = Gpu::open_card_after_hook(&a.card, a.device)?;
-        let mut m = GpuModel::<Body>::open(gpu, file, a.ctx)?;
+        let mut m = match a.placed {
+            None => {
+                let gpu = Gpu::open_card_after_hook(&a.card, a.device)?;
+                GpuModel::<Body>::open(gpu, file, a.ctx)?
+            }
+            Some(p) => {
+                let (split, _) = file.into_whole();
+                let plan = p.inputs.plan(&p.machine, a.ctx as u64, &p.levers)?;
+                GpuModel::<Body>::open_placed(split, &plan, &p.inputs, 0, p.host)?
+            }
+        };
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
         if a.drafted {
@@ -313,7 +386,8 @@ impl Seat for Inkling2 {
     /// leaves the stores and the head's row where that id's step would, so the call closes and the
     /// row is read after it. The body's prompt rule is this one call, the gate's seat answer too.
     fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
-        prefill_closing(self, ids, row, true)
+        let closes = self.m.body(NAME)?.placed().is_none();
+        prefill_closing(self, ids, row, closes)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
@@ -462,13 +536,18 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (c, _) => c,
     };
     let asked = choose_ctx(split, (ctx_ask, slots), (None, None), |c| {
-        probe_of(whole_card_plan(&inputs, &machine, c, &plan_levers)).map_err(|e| {
+        probe_of(seat_plan(&inputs, &machine, c, &plan_levers)).map_err(|e| {
             beside::refusal(
                 held,
                 format!(
-                    "--place {}: the inkling2 seat holds the whole model on the card (there is \
-                     no placed load): {e}",
-                    place.name()
+                    "--place {}: the inkling2 seat {}: {e}",
+                    place.name(),
+                    if card_runs_the_experts(&inputs) {
+                        "holds the whole model on the card"
+                    } else {
+                        "holds the dense trunk and the stores on the card and every routed \
+                         expert on the host"
+                    }
                 ),
             )
         })
@@ -488,6 +567,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         ..EngineProps::default()
     };
     let card = &machine.cards[0];
+    let host_experts = !card_runs_the_experts(&inputs);
     drop(plan);
     let (tok, model) = weights.hand_over(&path)?;
     let open = OpenSeat {
@@ -500,6 +580,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
             levers.draft_word(&[DraftWord::Off]),
             Ok(Some(w)) if w != DraftWord::Off
         ),
+        placed: host_experts.then(|| PlacedOpen {
+            inputs,
+            machine: machine.clone(),
+            levers: plan_levers.clone(),
+            host: levers.host(),
+        }),
     };
     let device = card.name.clone();
     let vocab = Arc::new(Vocab::new(tok)?);

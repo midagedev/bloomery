@@ -7,8 +7,10 @@
 //! The model description is `model::arch::inkling2`.
 
 mod body;
+mod route;
 mod seat;
 mod state;
 
+pub use body::placed::Placed;
 pub use body::{Body, PAD_LOGIT, TAP_STAGES};
 pub use state::StoreHost;

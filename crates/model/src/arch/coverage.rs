@@ -2320,10 +2320,12 @@ fn check_for(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The Inkling 2 body holds every stack on the card: a stack of a type its card leg
-                // does not read ([`inkling2_leg`]) is an item.
+                // The Inkling 2 body's rule: a stack passes when its card leg reads the type
+                // ([`inkling2_leg`]) or, on the host tier, a qdot fused kernel serves it at the
+                // stack's row width ([`routed_unrun`], the one owner): a layer whose stacks the
+                // card leg does not read keeps every expert on the host.
                 Some(Program::Inkling2Body) => {
-                    if !inkling2_leg(t.ty) {
+                    if routed_unrun(t, inkling2_leg) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }

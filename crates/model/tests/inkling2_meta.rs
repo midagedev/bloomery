@@ -85,13 +85,19 @@ const MINI_UNREAD: &[&str] = &[
     "general.sampling.min_p",
 ];
 
+// PIN(2026-11-23): the embedding norm (`token_embd_norm.weight`, one F32 vector) is layer 0's
+// attention tensor (`roles::model_level`), not the table's: it applies on the stage card to the
+// row the embedding gives, even where the table is the host's. Every block below counts it under
+// `attn` (+1 F32) and no longer under `token_embd` (-1 F32); the Small's plan line's dense term
+// takes its 4,608 F32 = 18,432 B (the table is the host's there), the Mini's its 2,304 F32 = 9,216 B
+// (a card table's role counts one gathered row; the norm is read whole).
 // PIN(2026-11-21): every tensor of the Mini by role and type (734 in all), [derived] from the
 // header dump's per-name table: the attention rows Q8_0 but the sink projection BF16 and the
 // small matrices F32; the loop's controllers and queries F32; the routed stacks NVFP4 on the
 // first twenty layers and Q8_0 on the last four, their per-expert scales unread F32.
 const MINI_TENSORS: &[&str] = &[
     "attn bf16 32",
-    "attn f32 345",
+    "attn f32 346",
     "attn q8_0 144",
     "ffn_norm f32 72",
     "head f32 2",
@@ -99,7 +105,6 @@ const MINI_TENSORS: &[&str] = &[
     "routed nvfp4 40",
     "routed q8_0 8",
     "router f32 48",
-    "token_embd f32 1",
     "token_embd q8_0 1",
     "unread f32 40",
 ];
@@ -156,7 +161,7 @@ const SMALL_UNREAD: &[&str] = &[
 
 const SMALL_TENSORS: &[&str] = &[
     "attn bf16 48",
-    "attn f32 415",
+    "attn f32 416",
     "attn q6_K 120",
     "attn q8_0 168",
     "ffn_norm f32 144",
@@ -166,7 +171,6 @@ const SMALL_TENSORS: &[&str] = &[
     "routed iq3_xxs 48",
     "routed iq4_xs 8",
     "router f32 96",
-    "token_embd f32 1",
     "token_embd q5_K 1",
 ];
 
@@ -400,38 +404,46 @@ fn inkling2_small_header_reads_as_the_file_does() {
     );
 }
 
-// The Small's file stops at the read with the list of what is its own [derived from the two
-// descriptions: the Small differs from the Mini in 48 query heads over 8 key heads of 128 (groups
-// of 6 where the kernels' instances are groups of 3), the router of 384 experts (the Mini's
-// is 128) and the types of its routed stacks (iq3_xxs everywhere, iq2_xs in layers 0-39, iq4_xs
-// in 40-47, where the body's card leg reads NVFP4 and Q8_0); nothing the two share is listed].
-const SMALL_STOP: &[&str] = &[
-    "relative-position bias attention: head 128, group 6, no rope, window 1024, bias bank 16 x 1024: 0-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46",
-    "router: sigmoid, 384 experts, top 8, with a selection bias: 0-47",
-    "relative-position bias attention: head 128, group 6, no rope, bias bank 16 x 1024: 5,11,17,23,29,35,41,47",
-    "iq3_xxs routed experts on a card: 0-47",
-    "iq2_xs routed experts on a card: 0-39",
-    "iq4_xs routed experts on a card: 40-47",
-];
+// The Small's file reads: its own widths are rows of `inkling2::spec::AVAILABLE` (groups of 6 over
+// 8 key heads of 128, the 384-expert top-8 router) and its routed stacks' types (iq3_xxs
+// everywhere, iq2_xs in layers 0-39, iq4_xs in 40-47) are no card leg's, so the host tier serves
+// them by a qdot fused kernel ([`model::arch::inkling2::host`]); the plan leaves every expert on
+// the host and the card holds the dense weights and the stores.
 
-/// The Small is deferred: the placement's read of its header ends with the not-implemented list
-/// above, every item the Small's own (group 6, the 384/8 router, its stack types), and the
-/// Mini's features the rows of `inkling2::spec::AVAILABLE` cover are not in it. Mutant: the
-/// rel-bias row widened to group 6 drops its two items.
+/// The Small's header reads (no item of the coverage list stands) and its plan on the gate
+/// machine keeps no routed expert on the card: the routed stacks' types are no card leg's, so
+/// every expert of every layer is the host tier's. Mutants: the group row narrowed to 3 or the
+/// 384/8 router row removed lists its items again; `inkling2_leg` widened to a type of the
+/// Small's stacks puts experts on the card.
 #[test]
-fn inkling2_small_stops_at_the_coverage_list() {
+fn inkling2_small_reads_and_its_experts_are_the_hosts() {
     let split = header_tables::header_of(
-        "inkling2-small-stop",
+        "inkling2-small-host",
         &small_keys(),
         include_str!("inkling2_small_tensors.tsv"),
     );
-    match place::Inputs::read(&split) {
-        Err(PlacementError::Unimplemented(items)) => {
-            assert_eq!(spec_view::items(&items), SMALL_STOP);
-        }
-        Err(e) => panic!("{e}, not the coverage refusal"),
-        Ok(_) => panic!("the Small's header reads: the deferred file must stop at the read"),
-    }
+    let inputs = place::Inputs::read(&split).expect("the Small's header reads");
+    let machine = workstation::plan_gate(inputs.model.layers);
+    let plan = inputs
+        .plan(&machine, 4096, &PlanLevers::default())
+        .expect("the gate machine plans the Small");
+    assert_eq!(plan.n_l.len(), 48, "one count a layer");
+    assert!(
+        plan.n_l.iter().all(|&n| n == 0),
+        "no card leg reads the Small's stacks: n_l {:?}",
+        plan.n_l
+    );
+    let routed: u64 = inputs
+        .model
+        .tensors
+        .iter()
+        .filter(|t| t.role == Role::RoutedExperts)
+        .map(|t| t.file_bytes)
+        .sum();
+    assert_eq!(
+        plan.host.expert_bytes, routed,
+        "every routed stack's bytes are the host's"
+    );
 }
 
 #[test]
@@ -482,7 +494,7 @@ const SMALL_VISITS: &[&str] = &[
 const MINI_PLAN: &[&str] = &[
     "weights dense 1819914240 routed 15797846016 B",
     "stores 6 5013504 B 4096 389709824 B 262144 8845426688 B",
-    "plan@4096 dense 1331632128 kv 389709824 scratch 67108864 context 536870912 | host experts 0 B of 0 experts",
+    "plan@4096 dense 1331641344 kv 389709824 scratch 67108864 context 536870912 | host experts 0 B of 0 experts",
 ];
 
 // PIN(2026-11-21): the Small's, the same terms at 8 key heads of 128 and hidden 4,608 (a conv
@@ -491,7 +503,7 @@ const MINI_PLAN: &[&str] = &[
 const SMALL_PLAN: &[&str] = &[
     "weights dense 5955132672 routed 199001899008 B",
     "stores 6 7667712 B 4096 392364032 B 262144 8848080896 B",
-    "plan@4096 dense 5339503872 kv 392364032 scratch 67108864 context 536870912 | host experts 199001899008 B of 18432 experts",
+    "plan@4096 dense 5339522304 kv 392364032 scratch 67108864 context 536870912 | host experts 199001899008 B of 18432 experts",
 ];
 
 /// The fixture's planted path under the fixture root (`arch::inkling2::fixture::spec`'s
@@ -529,7 +541,7 @@ const FIXTURE_VISITS: &[&str] = &[
 ];
 const FIXTURE_TENSORS: &[&str] = &[
     "attn bf16 17",
-    "attn f32 181",
+    "attn f32 182",
     "attn q8_0 78",
     "ffn_norm f32 39",
     "head f32 2",
@@ -537,7 +549,6 @@ const FIXTURE_TENSORS: &[&str] = &[
     "routed nvfp4 24",
     "routed q8_0 2",
     "router f32 26",
-    "token_embd f32 1",
     "token_embd q8_0 1",
     "unread f32 24",
 ];

@@ -1,6 +1,6 @@
 //! `inkling2` — Inkling 2 (the Mini and the Small, one program). The file's keys (`hparams`),
 //! every tensor's role (`roles`), the typed description (`spec`), the tensor names a step
-//! reads (`names`), the placement inputs over the loop's layer visits (`place`) and the family's
+//! reads (`names`), the host tier's layers (`host`), the placement inputs over the loop's layer visits (`place`) and the family's
 //! gate fixtures (`fixture`).
 //!
 //! The trunk is grouped-query attention whose score path carries the positions through a learned
@@ -27,6 +27,7 @@
 //! llama.cpp's `src/models/inkling2.cpp` (and `inkling2-loop.cpp` for the second spelling).
 
 pub mod fixture;
+pub mod host;
 pub mod hparams;
 pub mod names;
 pub mod place;

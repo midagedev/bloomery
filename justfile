@@ -4687,6 +4687,13 @@ gate-inkling2-moe:
 gate-inkling2-e2e:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_e2e'
 
+# The Inkling 2 Small's real file (UD-Q2_K_XL, six shards) on one card with every routed expert on the host tier (gate_inkling2_small's doc):
+# the placement (no expert on the card: the card leg runs no IQ stack; the host's bytes are the file's routed bytes), set d's logits row against
+# the oracle's node dump and the teacher-forced argmax against its greedy table. Real tier only: the Small's quant mix has no fixture, and the
+# gate names its file itself (refset::arch::inkling2::small::MODEL).
+gate-inkling2-small-host:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/real-only.sh gate-inkling2-small-host && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_small && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_small'
+
 # The official Inkling 2 Mini folder on the card (gate_inkling2_official's doc): the folder opened in both arms of
 # BLOOMERY_INK2_DENSE (bf16: the dense as stored, q8_0: written as Q8_0 at load); the arms' dense types and resident bytes
 # apart, and each arm's teacher-forced argmax over the Mini's greedy tables (ref_inkling2_*) within the pin of the Gaussian
