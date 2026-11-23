@@ -526,9 +526,9 @@ pub const INKLING2: &[Mutant] = &[
         )],
     },
     Mutant {
-        name: "ink2_pass_nv4r_one_nibble",
+        name: "ink2_pass_nv4p_one_nibble",
         clause: "k_pass",
-        why: "the grouped GEMM's NVFP4 rows decode both values of a code byte from its high \
+        why: "the grouped GEMM's NVFP4 planes decode both values of a code byte from its high \
               nibble, so every expert weight of the pass's layers 0-19 is another",
         edits: &[("RT_E2M1[byte & 0x0fu] * s", "RT_E2M1[byte >> 4u] * s", 1)],
     },

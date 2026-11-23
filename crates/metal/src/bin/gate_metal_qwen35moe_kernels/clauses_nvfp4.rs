@@ -1,9 +1,10 @@
-//! The NVFP4 mat-vec's clauses (`kernels/nvfp4.metal`): both layouts the
+//! The NVFP4 mat-vec's clauses (`kernels/nvfp4.metal`): every layout the
 //! routed experts' bytes come in — mainline's 36-byte block of 64 values (the
-//! GGUF file's) and bloomery's 9-byte row group of 16 (the MLX folder's, as
-//! stored) — against an f64 dot of an independent decode, the decode itself
-//! held to the `gguf` crate's two decoders, a scale byte that is no UE4M3, and
-//! the launch's refusals.
+//! GGUF file's), bloomery's two planes an expert (the MLX folder's), the
+//! codas' Q8_0 and MXFP8 — against an f64
+//! dot of an independent decode, the decode itself held to the `gguf` crate's
+//! decoders, a scale byte that is no UE4M3, the launch's refusals and the
+//! planes at the Mini's two launch shapes.
 //!
 //! The decode: a code `c` is `KVALUES[c] · ue4m3(scale) / 2`, the doubled E2M1
 //! table and the halved scale both exact in f32; the dot's products and sums
@@ -70,12 +71,13 @@ fn stack(layout: NvfpLayout, rows: usize, k: usize, seed: u64) -> Vec<u8> {
                 }
             }
         }
-        NvfpLayout::Rows => {
+        // One expert: every row's codes, then every row's scale bytes.
+        NvfpLayout::Planes => {
+            for _ in 0..rows * k / 2 {
+                bytes.push(rng.next() as u8);
+            }
             for _ in 0..rows * (k / 16) {
                 bytes.push(scale_byte(&mut rng));
-                for _ in 0..8 {
-                    bytes.push(rng.next() as u8);
-                }
             }
         }
         NvfpLayout::Q8_0 => {
@@ -102,7 +104,27 @@ fn stack(layout: NvfpLayout, rows: usize, k: usize, seed: u64) -> Vec<u8> {
     bytes
 }
 
-/// The values of one row, decoded from first principles.
+/// Row `r` of one expert's stack of `rows` rows as [`decode`] reads it: the
+/// row's own span, or, of the planes, its groups gathered (each group's scale
+/// byte, then its 8 code bytes: the MLX folder's NVFP4 rows type).
+fn row_of(layout: NvfpLayout, bytes: &[u8], rows: usize, r: usize, k: usize) -> Vec<u8> {
+    if layout != NvfpLayout::Planes {
+        let per = row_bytes(layout, k);
+        return bytes[r * per..(r + 1) * per].to_vec();
+    }
+    let (codes, scales) = (&bytes[r * k / 2..], &bytes[rows * k / 2 + r * (k / 16)..]);
+    (0..k / 16)
+        .flat_map(|g| std::iter::once(scales[g]).chain(codes[8 * g..8 * g + 8].iter().copied()))
+        .collect()
+}
+
+/// The values of row `r` of one expert's stack of `rows` rows.
+fn values(layout: NvfpLayout, bytes: &[u8], rows: usize, r: usize, k: usize) -> Vec<f64> {
+    decode(layout, &row_of(layout, bytes, rows, r, k), k)
+}
+
+/// The values of one row as [`row_of`] gives it, decoded from first
+/// principles.
 fn decode(layout: NvfpLayout, row: &[u8], k: usize) -> Vec<f64> {
     let mut out = vec![0.0; k];
     match layout {
@@ -119,7 +141,7 @@ fn decode(layout: NvfpLayout, row: &[u8], k: usize) -> Vec<f64> {
                 }
             }
         }
-        NvfpLayout::Rows => {
+        NvfpLayout::Planes => {
             for (g, grp) in row.chunks(9).enumerate() {
                 let d = half_scale(grp[0]);
                 for i in 0..8 {
@@ -223,14 +245,15 @@ fn row_bytes(layout: NvfpLayout, k: usize) -> usize {
     layout.bytes(1, k).expect("a whole row")
 }
 
-/// Both layouts' mat-vecs against the oracle's dot, at the Mini's width over
-/// a row count that is no multiple of a threadgroup's eight, and at the
-/// smallest row of each layout; the decode first held to the `gguf` crate's.
+/// Every layout's mat-vec against the oracle's dot, at the Mini's width over
+/// a row count that is no multiple of a threadgroup's eight (nor of a planes
+/// SIMD group's sixteen), and at the smallest row of each layout; the decode
+/// first held to the `gguf` crate's.
 pub fn nvfp4_rows(h: &Harness<'_>) -> Clause {
     let mut parts = Vec::new();
     for (layout, name) in [
         (NvfpLayout::Blocks, "blocks"),
-        (NvfpLayout::Rows, "rows"),
+        (NvfpLayout::Planes, "planes"),
         (NvfpLayout::Q8_0, "q8_0"),
         (NvfpLayout::Mxfp8Rows, "mxfp8 rows"),
     ] {
@@ -241,21 +264,21 @@ pub fn nvfp4_rows(h: &Harness<'_>) -> Clause {
             let seed = 0x4A00 + 32 * case as u64 + 16 * layout as u64;
             let bytes = stack(layout, rows, k, seed);
             let x = ink2::draw(k, seed + 1, 1.0);
-            let per = row_bytes(layout, k);
+            let row0 = row_of(layout, &bytes, rows, 0, k);
             // The decode against the crate that reads the files.
             let mut gg = vec![0f32; k];
             match layout {
-                NvfpLayout::Blocks => dequant_row(GgmlType::NVFP4, &bytes[..per], &mut gg)
+                NvfpLayout::Blocks => dequant_row(GgmlType::NVFP4, &row0, &mut gg)
                     .map_err(|e| format!("gguf's NVFP4 decode: {e}"))?,
-                NvfpLayout::Rows => Nvfp4Rows::new(1.0)
-                    .decode(&bytes[..per], &mut gg)
+                NvfpLayout::Planes => Nvfp4Rows::new(1.0)
+                    .decode(&row0, &mut gg)
                     .map_err(|e| format!("gguf's NVFP4 rows decode: {e}"))?,
-                NvfpLayout::Q8_0 => dequant_row(GgmlType::Q8_0, &bytes[..per], &mut gg)
+                NvfpLayout::Q8_0 => dequant_row(GgmlType::Q8_0, &row0, &mut gg)
                     .map_err(|e| format!("gguf's Q8_0 decode: {e}"))?,
-                NvfpLayout::Mxfp8Rows => dequant_row(GgmlType::MXFP8, &bytes[..per], &mut gg)
+                NvfpLayout::Mxfp8Rows => dequant_row(GgmlType::MXFP8, &row0, &mut gg)
                     .map_err(|e| format!("gguf's MXFP8 decode: {e}"))?,
             }
-            let mine = decode(layout, &bytes[..per], k);
+            let mine = values(layout, &bytes, rows, 0, k);
             if let Some(i) = gg.iter().zip(&mine).position(|(a, b)| f64::from(*a) != *b) {
                 return Err(format!(
                     "{name}: value {i} decodes to {} in gguf and {} in the oracle",
@@ -266,7 +289,7 @@ pub fn nvfp4_rows(h: &Harness<'_>) -> Clause {
             common::expect_clean(h, "the mat-vec")?;
             let (mut want, mut band) = (Vec::new(), Vec::new());
             for r in 0..rows {
-                let w = decode(layout, &bytes[r * per..(r + 1) * per], k);
+                let w = values(layout, &bytes, rows, r, k);
                 let dot: f64 = w.iter().zip(&x).map(|(a, b)| a * f64::from(*b)).sum();
                 let mag: f64 = w
                     .iter()
@@ -296,7 +319,7 @@ pub fn nvfp4_nan(h: &Harness<'_>) -> Clause {
     let (rows, k) = (11usize, 2304usize);
     for (layout, name) in [
         (NvfpLayout::Blocks, "blocks"),
-        (NvfpLayout::Rows, "rows"),
+        (NvfpLayout::Planes, "planes"),
         (NvfpLayout::Q8_0, "q8_0"),
         (NvfpLayout::Mxfp8Rows, "mxfp8 rows"),
     ] {
@@ -312,7 +335,10 @@ pub fn nvfp4_nan(h: &Harness<'_>) -> Clause {
                 (3 * per + per - 36 + 3, 0x80),
                 (8 * per + 36 * 17 + 2, 0x7f),
             ],
-            NvfpLayout::Rows => [(3 * per + per - 9, 0x80), (8 * per + 9 * 70, 0x7f)],
+            NvfpLayout::Planes => {
+                let (scales, g) = (rows * k / 2, k / 16);
+                [(scales + 3 * g + g - 1, 0x80), (scales + 8 * g + 70, 0x7f)]
+            }
             // The scale's high byte: a NaN, then an infinity.
             NvfpLayout::Q8_0 => [
                 (3 * per + per - 34 + 1, 0x7e),
@@ -348,21 +374,24 @@ pub fn nvfp4_nan(h: &Harness<'_>) -> Clause {
 pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
     let (rows, k) = (4usize, 128usize);
     let blocks = stack(NvfpLayout::Blocks, rows, k, 0x4AC0);
-    let groups = stack(NvfpLayout::Rows, rows, k, 0x4AC1);
+    let planes = stack(NvfpLayout::Planes, rows, k, 0x4AC3);
     let x = ink2::draw(256, 0x4AC2, 1.0);
     let mut padded = vec![0u8; 2];
     padded.extend_from_slice(&blocks);
     padded.extend_from_slice(&[0u8; 36]);
+    // The planes four bytes into their buffer: on a 32-bit word, off an
+    // 8-byte one.
+    let mut planes_off = vec![0u8; 4];
+    planes_off.extend_from_slice(&planes);
     let run = |label: &str,
                layout: NvfpLayout,
                k: usize,
-               at: usize,
-               len: usize,
+               (at, len): (usize, usize),
                which: usize,
-               slots: usize,
+               (slots, x_at): (usize, usize),
                needle: &str|
      -> Result<(), String> {
-        let src = [&blocks, &groups, &padded][which];
+        let src = [&blocks, &padded, &planes, &planes_off][which];
         let w = ink2::up(h, src)?;
         let xb = ink2::up(h, &x)?;
         let idb = ink2::up(h, &vec![0u32; slots])?;
@@ -381,7 +410,7 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
                         ids: idb.window(Elems(0), Elems(slots))?,
                         scales: sb.window(Elems(0), Elems(1))?,
                         route_weights: None,
-                        x: xb.window(Elems(0), Elems(k))?,
+                        x: xb.window(Elems(x_at), Elems(k))?,
                         x_per_slot: false,
                         y: y.window_mut(Elems(0), Elems(slots * rows))?,
                         plane: rows,
@@ -393,70 +422,82 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
             needle,
         )
     };
-    let bl = blocks.len();
-    let gl = groups.len();
+    let (bl, pl) = (blocks.len(), planes.len());
+    let one = (1, 0);
     run(
         "a partial block",
         NvfpLayout::Blocks,
         100,
+        (0, bl),
         0,
-        bl,
-        0,
-        1,
+        one,
         "whole groups",
     )?;
     run(
-        "a partial group",
-        NvfpLayout::Rows,
+        "a partial planes group",
+        NvfpLayout::Planes,
         100,
-        0,
-        gl,
-        1,
-        1,
+        (0, pl),
+        2,
+        one,
         "whole groups",
     )?;
     run(
         "a short stack",
         NvfpLayout::Blocks,
         k,
+        (0, bl - 36),
         0,
-        bl - 36,
-        0,
-        1,
+        one,
         "weights window",
     )?;
     run(
         "a long stack",
         NvfpLayout::Blocks,
         k,
-        0,
-        bl + 36,
-        2,
+        (0, bl + 36),
         1,
+        one,
         "weights window",
     )?;
     run(
         "blocks off a word",
         NvfpLayout::Blocks,
         k,
-        2,
-        bl,
-        2,
+        (2, bl),
         1,
+        one,
         "32-bit words",
+    )?;
+    run(
+        "planes off an 8-byte word",
+        NvfpLayout::Planes,
+        k,
+        (4, pl),
+        3,
+        one,
+        "8-byte words",
+    )?;
+    run(
+        "planes' input off a float4",
+        NvfpLayout::Planes,
+        k,
+        (0, pl),
+        2,
+        (1, 2),
+        "16-byte aligned",
     )?;
     run(
         "a route of more slots than picks",
         NvfpLayout::Blocks,
         k,
+        (0, bl),
         0,
-        bl,
-        0,
-        TOP_K + 1,
+        (TOP_K + 1, 0),
         "slots",
     )?;
     Ok(Verdict::Noted(
-        "six refusals by name, each before an encode".to_string(),
+        "eight refusals by name, each before an encode".to_string(),
     ))
 }
 
@@ -466,7 +507,7 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
 /// and lands at its plane's slot block — every slot's rows the bits of a
 /// one-slot launch of its expert alone. A slot whose id is past the stack is
 /// NaN and raises the expert-id site; the other slots keep those bits. In the
-/// four layouts.
+/// five layouts.
 pub fn nvfp4_route(h: &Harness<'_>) -> Clause {
     const EXPERTS: usize = 5;
     const SCALES: [f32; EXPERTS] = [0.5, 1.25, 2.0, 0.75, 3.0];
@@ -475,12 +516,20 @@ pub fn nvfp4_route(h: &Harness<'_>) -> Clause {
     let plane = rows / 2;
     for (layout, name) in [
         (NvfpLayout::Blocks, "blocks"),
-        (NvfpLayout::Rows, "rows"),
+        (NvfpLayout::Planes, "planes"),
         (NvfpLayout::Q8_0, "q8_0"),
         (NvfpLayout::Mxfp8Rows, "mxfp8 rows"),
     ] {
         let per = layout.bytes(rows, k).expect("whole groups");
-        let bytes = stack(layout, EXPERTS * rows, k, 0x4B00 + 16 * layout as u64);
+        let seed = 0x4B00 + 16 * layout as u64;
+        // The planes are an expert's own: each expert drawn apart.
+        let bytes: Vec<u8> = if layout == NvfpLayout::Planes {
+            (0..EXPERTS as u64)
+                .flat_map(|e| stack(layout, rows, k, seed + 64 * e))
+                .collect()
+        } else {
+            stack(layout, EXPERTS * rows, k, seed)
+        };
         let x = ink2::draw(3 * k, 0x4B01 + 16 * layout as u64, 1.0);
         let alone = |e: u32, scale: f32, x: &[f32]| {
             let e = e as usize;
@@ -571,6 +620,75 @@ pub fn nvfp4_route(h: &Harness<'_>) -> Clause {
     ))
 }
 
+/// The planes at the Mini's two launches, a route of three slots over a
+/// stack of three experts: the gate·up (2304 rows over the 2304-wide row, one
+/// input, output planes of 1152) and the down (2304 rows over 1152, each
+/// slot's own input and route weight). Every slot's rows against the f64
+/// oracle's dot of its expert's rows: each expert's two planes, each row's
+/// codes and scale bytes, each slot's input and each lane's groups at the
+/// widths the decode launches are the ones its rows read.
+pub fn nvfp4_planes(h: &Harness<'_>) -> Clause {
+    const EXPERTS: usize = 3;
+    const SCALES: [f32; EXPERTS] = [0.5, 1.25, 2.0];
+    const ROUTE: [f32; 3] = [0.3, 0.9, 0.11];
+    let ids = [2u32, 0, 1];
+    let layout = NvfpLayout::Planes;
+    let mut parts = Vec::new();
+    for (name, rows, k, plane, down) in [
+        ("gate·up", 2304usize, 2304usize, 1152usize, false),
+        ("down", 2304, 1152, 2304, true),
+    ] {
+        let per = layout.bytes(rows, k).expect("whole groups");
+        let seed = 0x4C00 + k as u64;
+        let bytes: Vec<u8> = (0..EXPERTS as u64)
+            .flat_map(|e| stack(layout, rows, k, seed + 64 * e))
+            .collect();
+        let x = ink2::draw(if down { ids.len() * k } else { k }, seed + 1, 1.0);
+        let got = launch_route(
+            h,
+            layout,
+            rows,
+            k,
+            &bytes,
+            &ids,
+            &SCALES,
+            down.then_some(&ROUTE[..]),
+            &x,
+            plane,
+        )?;
+        common::expect_clean(h, "the planes route")?;
+        let (mut mine, mut want, mut band) = (Vec::new(), Vec::new(), Vec::new());
+        for (s, &e) in ids.iter().enumerate() {
+            let e = e as usize;
+            let expert = &bytes[e * per..(e + 1) * per];
+            let xs = if down { &x[s * k..(s + 1) * k] } else { &x[..] };
+            let scale = if down {
+                f64::from(SCALES[e] * ROUTE[s])
+            } else {
+                f64::from(SCALES[e])
+            };
+            for r in 0..rows {
+                let w = values(layout, expert, rows, r, k);
+                let dot: f64 = w.iter().zip(xs).map(|(a, b)| a * f64::from(*b)).sum();
+                let mag: f64 = w
+                    .iter()
+                    .zip(xs)
+                    .map(|(a, b)| (a * f64::from(*b)).abs())
+                    .sum();
+                mine.push(got[((r / plane) * ids.len() + s) * plane + r % plane]);
+                want.push(dot * scale);
+                band.push(mag * scale * (ink2::gamma_walk(k / 32 + 8) + 2.0 * U) + 1e-30);
+            }
+        }
+        let worst = ink2::fit(&format!("planes {name} {rows}x{k}"), &mine, &want, &band)?;
+        parts.push(format!("{name} {rows}x{k} {worst:.3}"));
+    }
+    Ok(Verdict::Noted(format!(
+        "the planes at the Mini's launches, three slots over three experts, dot in the f64 oracle's band, worst error over its band: {}",
+        parts.join(", ")
+    )))
+}
+
 /// The mat-vec's clauses, in gate order.
 pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<'a>)> {
     let h = ctx.harness;
@@ -579,5 +697,6 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<
         ("nvfp4_nan", Box::new(|| nvfp4_nan(h))),
         ("nvfp4_bounds", Box::new(|| nvfp4_bounds(h))),
         ("nvfp4_route", Box::new(|| nvfp4_route(h))),
+        ("nvfp4_planes", Box::new(|| nvfp4_planes(h))),
     ]
 }

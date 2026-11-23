@@ -10,12 +10,13 @@
 //! - the loop's message queries, stored as two tables of two rows a core layer
 //!   (q and ffn; k and v), become one table of four rows a core layer in the
 //!   order the controllers read them: q, k, v, ffn;
-//! - a folder's routed stack (codes and block scales in two planes an expert)
-//!   is interleaved into the rows layout, each group's scale byte before its
-//!   codes, and a folder's fused gate·up stack, whose rows alternate gate and
-//!   up, is permuted to the GGUF's order (the gate rows `[0, ff)`, then the up
-//!   rows `[ff, 2·ff)`, the order `pair_situ` reads); a GGUF's stack loads as
-//!   stored;
+//! - a folder's NVFP4 stack (codes and block scales in two planes an expert)
+//!   keeps its two planes, the codes plane then the scales plane an expert; a
+//!   folder's MXFP8 stack is interleaved into the rows layout, each group's
+//!   scale byte before its codes; a folder's fused gate·up stack, whose rows
+//!   alternate gate and up, is permuted to the GGUF's order (the gate rows
+//!   `[0, ff)`, then the up rows `[ff, 2·ff)`, the order `pair_situ` reads)
+//!   in both planes; a GGUF's stack loads as stored;
 //! - the head keeps the rows of the file's vocabulary cut.
 
 use bloomery_device::Elems;
@@ -227,10 +228,11 @@ fn gate_up_row(j: usize, rows: usize) -> usize {
     if j < ff { 2 * j } else { 2 * (j - ff) + 1 }
 }
 
-/// Expert `e` of the folder's stack `st` in the rows layout: each row's
-/// groups, a group's scale byte then its codes, the rows in the launch's
-/// order (`fused`: the gate·up permutation).
-fn interleave(
+/// Expert `e` of the folder's stack `st` in its launch layout, the rows in
+/// the launch's order (`fused`: the gate·up permutation): an NVFP4 stack's
+/// two planes, every row's codes then every row's scale bytes; an MXFP8
+/// stack's rows, a group's scale byte then its codes.
+fn expert_layout(
     st: &Stack,
     codes: &[u8],
     scales: &[u8],
@@ -238,7 +240,7 @@ fn interleave(
     out: &mut Vec<u8>,
 ) -> Result<(), SessionError> {
     let (group, code_bytes) = match st.layout {
-        NvfpLayout::Rows => (16, 8),
+        NvfpLayout::Planes => (16, 8),
         NvfpLayout::Mxfp8Rows => (32, 32),
         other => {
             return Err(refuse(format!(
@@ -258,8 +260,21 @@ fn interleave(
             st.rows * groups
         )));
     }
+    let row = |j: usize| if fused { gate_up_row(j, st.rows) } else { j };
+    if st.layout == NvfpLayout::Planes {
+        let (cb, sb) = (groups * code_bytes, groups);
+        for j in 0..st.rows {
+            let r = row(j);
+            out.extend_from_slice(&codes[r * cb..(r + 1) * cb]);
+        }
+        for j in 0..st.rows {
+            let r = row(j);
+            out.extend_from_slice(&scales[r * sb..(r + 1) * sb]);
+        }
+        return Ok(());
+    }
     for j in 0..st.rows {
-        let r = if fused { gate_up_row(j, st.rows) } else { j };
+        let r = row(j);
         for g in 0..groups {
             out.push(scales[r * groups + g]);
             let at = (r * groups + g) * code_bytes;
@@ -288,11 +303,11 @@ fn stack_buf(
             let m = split
                 .matrix(&st.name, e)
                 .map_err(|e| refuse(format!("{}: {e}", st.name)))?;
-            interleave(st, m.codes, m.block_scales, fused, &mut bytes)?;
+            expert_layout(st, m.codes, m.block_scales, fused, &mut bytes)?;
         }
         match st.layout {
-            NvfpLayout::Rows if scales.len() == st.experts => scales.clone(),
-            NvfpLayout::Rows => {
+            NvfpLayout::Planes if scales.len() == st.experts => scales.clone(),
+            NvfpLayout::Planes => {
                 return Err(refuse(format!(
                     "{}: {} expert scales for {} experts",
                     st.name,

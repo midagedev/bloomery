@@ -1,7 +1,7 @@
-// The NVFP4 mat-vec of Inkling 2's routed experts: one SIMD group a row
-// over the blocks of the fused stacks the family's files hold their first
-// twenty stored layers' experts in, the per-expert global scale applied
-// after the dot.
+// The NVFP4 mat-vec of Inkling 2's routed experts over the fused stacks the
+// family's files hold their first twenty stored layers' experts in — the
+// GGUF's blocks a SIMD group a row, the MLX folder's planes sixteen rows a
+// SIMD group — the per-expert global scale applied after the dot.
 //
 // The block (mainline's block_nvfp4, 64 values, 36 bytes): bytes 0..4 the
 // UE4M3 scales of the four 16-value sub-blocks, bytes 4..36 the codes.
@@ -21,12 +21,6 @@
 // apart. A lane accumulates its two products a block by fused-free adds in
 // block order; the group's lanes are summed by simd_sum.
 //
-// The rows entry (nvfp4_rows_gemv) is bloomery's NVFP4 rows type, the
-// MLX folder's bytes as stored: 9 bytes a 16-value group, the UE4M3 scale
-// byte then 8 code bytes, value 2i the low nibble of code byte i and 2i + 1
-// its high, the expert's scale its entry of the scale row. A lane takes the groups
-// lane, lane + 32, ... of a row, each group's eight bytes in order.
-
 // The per-expert global scale (the file's `<stack>.scale` rows, one f32 an
 // expert) multiplies each row's finished dot once — the same elementwise
 // product either way, exact, so its placement costs nothing.
@@ -198,64 +192,166 @@ kernel void nvfp4_gemv(device const block_nvfp4 *W [[buffer(0)]],
     }
 }
 
-// The rows entry: a SIMD group a row over `k / 16` nine-byte groups.
-kernel void nvfp4_rows_gemv(device const uint8_t *W [[buffer(0)]],
-                            device const float *x [[buffer(1)]],
-                            device float *y [[buffer(2)]],
-                            constant Nvfp4Args &args [[buffer(3)]],
-                            device atomic_uint *faults [[buffer(4)]],
-                            device const int *ids [[buffer(5)]],
-                            device const float *scales [[buffer(6)]],
-                            device const float *route_w [[buffer(7)]],
-                            uint2 tg [[threadgroup_position_in_grid]],
-                            uint lane [[thread_index_in_simdgroup]],
-                            uint sg [[simdgroup_index_in_threadgroup]])
+// The planes entry (nvfp4_planes_gemv) is bloomery's NVFP4 planes layout, the
+// MLX folder's two planes an expert with the rows in the launch's order: the
+// codes plane (k / 2 bytes a row, value 2i the low nibble of byte i), then
+// the scales plane (k / 16 UE4M3 bytes a row, one a 16-value group). Expert
+// e's planes start at e · rows · k · 9 / 16 bytes.
+//
+// Its lane map: a SIMD group owns 16 rows as four sets of four, set q the
+// lanes 8q .. 8q + 7 and the rows 4q .. 4q + 3 of the group's 16; lane j of a
+// set takes the groups j, j + 8, ... of its four rows. A step loads the
+// lane's 16 inputs once (four float4) and, against them, each of its rows'
+// group: one 8-byte code word and one scale byte. A row past the launch's
+// reads the last row and stores nothing.
+//
+// Its decode is arithmetic: an E2M1 code's magnitude bits placed at f16 bits
+// 9 .. 11 and its sign at bit 15 make the f16 d(c) · 2^-15 (d the doubled
+// table above; codes 0 and 1 subnormal, exact), two codes at once from a
+// code word's halves; a UE4M3 byte placed at f16 bits 7 .. 14 makes
+// ue4m3 · 2^-8. A value is d(c) · ue4m3 / 2, so a group's scale is that f16
+// times 2^22, exact. A scale byte at or past 0x7f is none (NaN or bit 7).
+//
+// This order is the gate: a group's 16 products (a code's f16 times its
+// input) sum as four fused chains, chain p the group's values p, p + 4,
+// p + 8, p + 12 in that order, and the chains (0 + 1) + (2 + 3); the group's
+// sum times its scale is fused into the lane's row sum, the groups
+// ascending; a set's eight lanes are summed by the butterfly at 4, 2, 1; the
+// slot's scale multiplies the finished dot.
+
+/// Rows a planes set holds: the rows a lane's inputs serve.
+#define NVP_ROWS 4u
+/// Lanes a planes set holds: a row's groups are dealt over them.
+#define NVP_LANES 8u
+/// Rows a planes SIMD group owns: its four sets'.
+#define NVP_SG_ROWS (NVP_ROWS * (32u / NVP_LANES))
+/// SIMD groups a planes threadgroup holds.
+#define NVP_SGS 2u
+/// The factor that makes the f16 scale's ue4m3 · 2^-8 a value's
+/// ue4m3 / 2 against the code's d(c) · 2^-15: 2^22.
+#define NVP_SCALE 4194304.0f
+
+// The codes p and p + 4 of the code word `w` (values 0 .. 7 of a group's
+// half) as f16 d(c) · 2^-15, widened.
+template <uint P>
+inline float2 nvp_pair(uint w) {
+    const uint mag = P < 3u ? (w << (9u - 4u * P)) : (w >> 3u);
+    const uint sgn = P < 3u ? (w << (12u - 4u * P)) : w;
+    return float2(as_type<half2>((mag & 0x0E000E00u) | (sgn & 0x80008000u)));
+}
+
+// A group's sum of its 16 products: the codes `c` (values 0 .. 7 in c.x,
+// 8 .. 15 in c.y) against the inputs `xv` (values 4i .. 4i + 3 in xv[i]),
+// in the order above.
+inline float nvp_group(uint2 c, thread const float4 *xv) {
+    const float2 a0 = nvp_pair<0u>(c.x);
+    const float2 a1 = nvp_pair<1u>(c.x);
+    const float2 a2 = nvp_pair<2u>(c.x);
+    const float2 a3 = nvp_pair<3u>(c.x);
+    const float2 b0 = nvp_pair<0u>(c.y);
+    const float2 b1 = nvp_pair<1u>(c.y);
+    const float2 b2 = nvp_pair<2u>(c.y);
+    const float2 b3 = nvp_pair<3u>(c.y);
+    float s0 = a0.x * xv[0].x;
+    float s1 = a1.x * xv[0].y;
+    float s2 = a2.x * xv[0].z;
+    float s3 = a3.x * xv[0].w;
+    s0 = fma(a0.y, xv[1].x, s0);
+    s1 = fma(a1.y, xv[1].y, s1);
+    s2 = fma(a2.y, xv[1].z, s2);
+    s3 = fma(a3.y, xv[1].w, s3);
+    s0 = fma(b0.x, xv[2].x, s0);
+    s1 = fma(b1.x, xv[2].y, s1);
+    s2 = fma(b2.x, xv[2].z, s2);
+    s3 = fma(b3.x, xv[2].w, s3);
+    s0 = fma(b0.y, xv[3].x, s0);
+    s1 = fma(b1.y, xv[3].y, s1);
+    s2 = fma(b2.y, xv[3].z, s2);
+    s3 = fma(b3.y, xv[3].w, s3);
+    return (s0 + s1) + (s2 + s3);
+}
+
+kernel void nvfp4_planes_gemv(device const uint8_t *W [[buffer(0)]],
+                              device const float *x [[buffer(1)]],
+                              device float *y [[buffer(2)]],
+                              constant Nvfp4Args &args [[buffer(3)]],
+                              device atomic_uint *faults [[buffer(4)]],
+                              device const int *ids [[buffer(5)]],
+                              device const float *scales [[buffer(6)]],
+                              device const float *route_w [[buffer(7)]],
+                              uint2 tg [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]],
+                              uint sg [[simdgroup_index_in_threadgroup]])
 {
-    const uint r = tg.x * 8u + sg;
+    const uint r0 = (tg.x * NVP_SGS + sg) * NVP_SG_ROWS;
     const uint slot = tg.y;
-    if (r >= args.rows || slot >= args.slots) {
+    if (r0 >= args.rows || slot >= args.slots) {
         return;
     }
-    const uint out = nv_out(args, slot, r);
     ulong expert = 0;
     float w_scale = 0.f;
     if (!nv_route(ids, scales, route_w, args, slot, expert, w_scale)) {
-        if (lane == 0u) {
-            nv_bad_slot(y, args, faults, out);
+        if (lane < NVP_SG_ROWS && r0 + lane < args.rows) {
+            nv_bad_slot(y, args, faults, nv_out(args, slot, r0 + lane));
         }
         return;
     }
     x += slot * args.x_stride;
+    const uint set = lane / NVP_LANES;
+    const uint j = lane % NVP_LANES;
+    const uint rs = r0 + set * NVP_ROWS;
     const uint groups = args.k / 16u;
-    device const uint8_t *wr = W + (expert * (ulong)args.rows + (ulong)r) * (ulong)groups * 9ul;
-    bool usable = true;
-    float acc = 0.f;
-    for (uint g = lane; g < groups; g += 32u) {
-        device const uint8_t *grp = wr + (ulong)g * 9ul;
-        const float s = nvfp4_scale_half(uint(grp[0]));
-        usable = usable && isfinite(s);
-        for (uint i = 0u; i < 8u; ++i) {
-            const uint byte = uint(grp[1u + i]);
-            const uint col = g * 16u + 2u * i;
-            acc += (NV_KVALUES[byte & 0x0fu] * s) * x[col];
-            acc += (NV_KVALUES[byte >> 4u] * s) * x[col + 1u];
+    const ulong code_row = (ulong)groups * 8ul;
+    device const uint8_t *base = W + expert * (ulong)args.rows * (ulong)groups * 9ul;
+    device const uint8_t *sbase = base + (ulong)args.rows * code_row;
+    device const uint2 *cr[NVP_ROWS];
+    device const uint8_t *sr[NVP_ROWS];
+    for (uint i = 0u; i < NVP_ROWS; ++i) {
+        const ulong r = (ulong)min(rs + i, args.rows - 1u);
+        cr[i] = (device const uint2 *)(base + r * code_row);
+        sr[i] = sbase + r * (ulong)groups;
+    }
+    device const float4 *xq = (device const float4 *)x;
+    float acc[NVP_ROWS] = {0.f, 0.f, 0.f, 0.f};
+    uint bad = 0u;
+    for (uint g = j; g < groups; g += NVP_LANES) {
+        float4 xv[4];
+        for (uint i = 0u; i < 4u; ++i) {
+            xv[i] = xq[4u * g + i];
+        }
+        for (uint i = 0u; i < NVP_ROWS; ++i) {
+            const uint2 c = cr[i][g];
+            const uint b = uint(sr[i][g]);
+            bad |= (b >= 0x7fu ? 1u : 0u) << i;
+            const float s = float(as_type<half>(ushort(b << 7u))) * NVP_SCALE;
+            acc[i] = fma(nvp_group(c, xv), s, acc[i]);
         }
     }
-    const float dot = simd_sum(acc) * w_scale;
-    usable = simd_all(usable);
-    if (!usable) {
-        if (lane == 0u) {
-            raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-            y[out] = NAN;
-        }
+    for (uint i = 0u; i < NVP_ROWS; ++i) {
+        acc[i] += simd_shuffle_xor(acc[i], 4u);
+        acc[i] += simd_shuffle_xor(acc[i], 2u);
+        acc[i] += simd_shuffle_xor(acc[i], 1u);
+    }
+    bad |= simd_shuffle_xor(bad, 4u);
+    bad |= simd_shuffle_xor(bad, 2u);
+    bad |= simd_shuffle_xor(bad, 1u);
+    // Lane j < 4 of a set stores the set's row j.
+    const uint r = rs + j;
+    if (j >= NVP_ROWS || r >= args.rows) {
         return;
     }
-    if (!isfinite(dot) && lane == 0u) {
+    const float sum = j == 0u ? acc[0] : j == 1u ? acc[1] : j == 2u ? acc[2] : acc[3];
+    const uint out = nv_out(args, slot, r);
+    if (((bad >> j) & 1u) != 0u) {
+        raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
+        y[out] = NAN;
+        return;
+    }
+    const float dot = sum * w_scale;
+    if (!isfinite(dot)) {
         raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
     }
-    if (lane == 0u) {
-        y[out] = isfinite(dot) ? dot : NAN;
-    }
+    y[out] = isfinite(dot) ? dot : NAN;
 }
 
 // The two other forms a routed stack of the family's files takes, beside the

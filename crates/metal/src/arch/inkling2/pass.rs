@@ -92,12 +92,12 @@ pub(super) fn pass_rows(c: &Checked) -> usize {
 }
 
 /// Whether the pass serves `c`: every routed stack in a form the grouped
-/// GEMM reads (NVFP4 or MXFP8 rows) and the q, k, v and output projections in
+/// GEMM reads (NVFP4 planes or MXFP8 rows) and the q, k, v and output projections in
 /// a type the quantized GEMM takes. A file it does not serve prefills a step an
 /// id.
 #[must_use]
 pub(super) fn serves(c: &Checked) -> bool {
-    let routed = |l: NvfpLayout| matches!(l, NvfpLayout::Rows | NvfpLayout::Mxfp8Rows);
+    let routed = |l: NvfpLayout| matches!(l, NvfpLayout::Planes | NvfpLayout::Mxfp8Rows);
     c.layers.iter().all(|l| {
         routed(l.gate_up.layout)
             && routed(l.down.layout)

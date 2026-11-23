@@ -412,7 +412,7 @@ ROUTED_APART_PLAIN(q6k_apart_q8_0, Q6K, block_q6_K, Q8_0, block_q8_0)
 // Inkling 2's grouped experts over a pass's route table, the scaled pair and
 // plain tiles of its two stack forms:
 //
-//   gemm_routed_ink2_{nv4r,mx8r}_{pair,plain}_f16
+//   gemm_routed_ink2_{nv4p,mx8r}_{pair,plain}_f16
 //
 //   pair     y[p][o] = situ(s_e (gate_e[o] . x), s_e (up_e[o] . x)), the
 //            stack's gate rows then its up rows in one tensor (the fused
@@ -420,10 +420,12 @@ ROUTED_APART_PLAIN(q6k_apart_q8_0, Q6K, block_q6_K, Q8_0, block_q8_0)
 //   plain    y[p][n] = (down_e[n] . x[p]) * (s_e * w[p]), the step's scale
 //            of a routed down's finished dot
 //
-// NV4R is the MLX folder's NVFP4 rows (9 bytes a 16-value group: the UE4M3
-// scale byte, then 8 code bytes, value 2i the low nibble of byte i), MX8R its
-// MXFP8 coda rows (33 bytes a 32-value group: the E8M0 scale byte, then 32
-// E4M3 codes). Both decode exactly into half: an E2M1 code times a UE4M3
+// NV4P is the MLX folder's NVFP4 as two planes an expert (nvfp4.metal's
+// planes layout: every row's codes, value 2i the low nibble of byte i, then
+// every row's UE4M3 scale bytes, one a 16-value group), MX8R its MXFP8 coda
+// rows (33 bytes a 32-value group: the E8M0 scale byte, then 32 E4M3 codes).
+// Each form names its row of an expert (`row`) and decodes the 16 values at
+// a column of it (`dequant16`). Both decode exactly into half: an E2M1 code times a UE4M3
 // half-scale is at most 7 significant bits inside half's normal range, and
 // an E4M3 code times a power of two loses only what falls under half's
 // subnormal step (2^-25 of absolute error a weight). The decode is
@@ -471,13 +473,6 @@ inline float rt_situ(float gate, float up, float gate_beta, float value_beta) {
     return g * u;
 }
 
-struct block_nv4r {
-    uint8_t s;
-    uint8_t q[8];
-};
-
-static_assert(sizeof(block_nv4r) == 9, "an NVFP4 row group is 9 bytes");
-
 struct block_mx8r {
     uint8_t e;
     uint8_t q[32];
@@ -485,20 +480,34 @@ struct block_mx8r {
 
 static_assert(sizeof(block_mx8r) == 33, "an MXFP8 row group is 33 bytes");
 
-struct NV4R {
-    typedef block_nv4r Block;
+// A row of an expert's NVFP4 planes: its codes and its scale bytes.
+struct nv4p_row {
+    device const uint8_t * codes;
+    device const uint8_t * scales;
+};
+
+struct NV4P {
+    typedef nv4p_row Row;
 
     static inline int values_per_block() {
         return 16;
     }
 
+    // Row `r` of expert `e`: `groups` the 16-value groups of an expert's
+    // rows (its codes plane 8 bytes a group, its scales plane after it), `nb`
+    // a row's.
+    static inline Row row(device const uint8_t * W, ulong groups, uint e, uint nb, uint r) {
+        device const uint8_t * base = W + (ulong)e * groups * 9ul;
+        return Row{base + (ulong)r * nb * 8ul, base + groups * 8ul + (ulong)r * nb};
+    }
+
+    // The 16 values at column `pos` (a multiple of 16) of `row`.
     template <typename T>
-    static inline void dequant16(device const Block & blk,
-                                 short il,
-                                 thread matrix<T, 4, 4> & reg) {
-        const float s = rt_ue4m3_half(uint(blk.s));
+    static inline void dequant16(Row row, int pos, thread matrix<T, 4, 4> & reg) {
+        const float s = rt_ue4m3_half(uint(row.scales[pos / 16]));
+        const uint2 q = *((device const uint2 *)(row.codes + pos / 2));
         FOR_UNROLL(short i = 0; i < 8; ++i) {
-            const uint byte = uint(blk.q[i]);
+            const uint byte = ((i < 4 ? q.x : q.y) >> (8u * (uint)(i % 4))) & 0xffu;
             reg[(2 * i) / 4][(2 * i) % 4] = (T)(RT_E2M1[byte & 0x0fu] * s);
             reg[(2 * i + 1) / 4][(2 * i + 1) % 4] = (T)(RT_E2M1[byte >> 4u] * s);
         }
@@ -506,16 +515,24 @@ struct NV4R {
 };
 
 struct MX8R {
-    typedef block_mx8r Block;
+    typedef device const block_mx8r * Row;
 
     static inline int values_per_block() {
         return 32;
     }
 
+    // Row `r` of expert `e`: `blocks` the groups of an expert's rows, `nb` a
+    // row's.
+    static inline Row row(device const uint8_t * W, ulong blocks, uint e, uint nb, uint r) {
+        return (device const block_mx8r *)W + (ulong)e * blocks + (ulong)r * nb;
+    }
+
+    // The 16 values at column `pos` (a multiple of 16) of `row`: half `il`
+    // of its group.
     template <typename T>
-    static inline void dequant16(device const Block & blk,
-                                 short il,
-                                 thread matrix<T, 4, 4> & reg) {
+    static inline void dequant16(Row row, int pos, thread matrix<T, 4, 4> & reg) {
+        device const block_mx8r & blk = row[pos / 32];
+        const short il = (short)((pos / 16) % 2);
         const uint sb = uint(blk.e);
         // E8M0: 2^(e - 127), the bias added as its negation (the same exact
         // sum), so the text is the tile's own and not the mat-vec's.
@@ -542,7 +559,7 @@ static_assert(sizeof(Ink2RoutedArgs) == 16, "Ink2RoutedArgs is four words");
 template <typename Q, typename T, bool PAIR, short NA>
 inline void ink2_routed_tile(threadgroup T                  * sa,
                              threadgroup T                  * sb,
-                             device const typename Q::Block * a_src,
+                             typename Q::Row                  a_src,
                              threadgroup vec<T, 4>          * a_dst,
                              short                            a_koff,
                              device const float             * b_src,
@@ -592,11 +609,8 @@ inline void ink2_routed_tile(threadgroup T                  * sa,
             gemm_stage_x<T>(xr, b_dst, faults, args.layer);
         }
         {
-            const int pos = k0 + a_koff;
-            const int ib = pos / Q::values_per_block();
-            const short il = (short)((pos / 16) % (Q::values_per_block() / 16));
             matrix<T, 4, 4> reg;
-            Q::template dequant16<T>(a_src[ib], il, reg);
+            Q::template dequant16<T>(a_src, k0 + a_koff, reg);
             FOR_UNROLL(short i = 0; i < 4; ++i) {
                 a_dst[i] = vec<T, 4>(reg[i][0], reg[i][1], reg[i][2], reg[i][3]);
             }
@@ -656,7 +670,7 @@ inline void ink2_routed_tile(threadgroup T                  * sa,
 }
 
 template <typename Q, typename T, bool PAIR>
-kernel void gemm_routed_ink2_kernel(device const typename Q::Block * W [[buffer(0)]],
+kernel void gemm_routed_ink2_kernel(device const uint8_t        * W [[buffer(0)]],
                                     device const float      * x [[buffer(1)]],
                                     device float            * y [[buffer(2)]],
                                     device const uint4      * tiles [[buffer(3)]],
@@ -689,21 +703,19 @@ kernel void gemm_routed_ink2_kernel(device const typename Q::Block * W [[buffer(
     const float s_e = scales[expert];
     const uint r0 = tgpig.y * (PAIR ? ROUTED_ROWS / 2 : ROUTED_ROWS);
     const uint nb = args.cols / (uint)Q::values_per_block();
-    device const typename Q::Block * wg = W + args.stack_blocks * (ulong)expert;
-    // The fused stack's up rows follow its gate rows.
-    device const typename Q::Block * wu = wg + (ulong)args.rows * nb;
 
     threadgroup T * sa = (threadgroup T *)shmem;
     threadgroup T * sb = sa + ROUTED_ROWS * LDA;
 
     const short a_row = (short)(tiitg / 2);
     const short a_koff = (short)((tiitg % 2) * 16);
-    device const typename Q::Block * a_src;
+    typename Q::Row a_src;
     if (PAIR) {
+        // The fused stack's up rows follow its gate rows.
         const uint o = r0 + (uint)(8 * (a_row / 16) + a_row % 8);
-        a_src = ((a_row / 8) % 2 == 0 ? wg : wu) + (ulong)o * nb;
+        a_src = Q::row(W, args.stack_blocks, expert, nb, ((a_row / 8) % 2 == 0 ? 0u : args.rows) + o);
     } else {
-        a_src = wg + (ulong)(r0 + a_row) * nb;
+        a_src = Q::row(W, args.stack_blocks, expert, nb, r0 + (uint)a_row);
     }
     threadgroup vec<T, 4> * a_dst = (threadgroup vec<T, 4> *)(sa + a_row * LDA + a_koff);
 
@@ -733,10 +745,10 @@ kernel void gemm_routed_ink2_kernel(device const typename Q::Block * W [[buffer(
     }
 }
 
-#define INK2_ROUTED_ENTRY(NAME, Q, BQ, PAIR)                                        \
+#define INK2_ROUTED_ENTRY(NAME, Q, PAIR)                                            \
     template [[host_name("gemm_routed_ink2_" #NAME)]]                               \
     kernel void gemm_routed_ink2_kernel<Q, half, PAIR>(                             \
-        device const BQ  * W [[buffer(0)]],                                         \
+        device const uint8_t    * W [[buffer(0)]],                                  \
         device const float      * x [[buffer(1)]],                                  \
         device float            * y [[buffer(2)]],                                  \
         device const uint4      * tiles [[buffer(3)]],                              \
@@ -751,7 +763,7 @@ kernel void gemm_routed_ink2_kernel(device const typename Q::Block * W [[buffer(
         ushort sgitg [[simdgroup_index_in_threadgroup]],                            \
         ushort tiisg [[thread_index_in_simdgroup]]);
 
-INK2_ROUTED_ENTRY(nv4r_pair_f16, NV4R, block_nv4r, true)
-INK2_ROUTED_ENTRY(nv4r_plain_f16, NV4R, block_nv4r, false)
-INK2_ROUTED_ENTRY(mx8r_pair_f16, MX8R, block_mx8r, true)
-INK2_ROUTED_ENTRY(mx8r_plain_f16, MX8R, block_mx8r, false)
+INK2_ROUTED_ENTRY(nv4p_pair_f16, NV4P, true)
+INK2_ROUTED_ENTRY(nv4p_plain_f16, NV4P, false)
+INK2_ROUTED_ENTRY(mx8r_pair_f16, MX8R, true)
+INK2_ROUTED_ENTRY(mx8r_plain_f16, MX8R, false)

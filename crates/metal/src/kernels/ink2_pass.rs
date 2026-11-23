@@ -25,8 +25,8 @@ pub(crate) struct Pipelines {
     router_rows: Pipeline,
     table: Pipeline,
     combine_store: Pipeline,
-    /// The scaled grouped tiles: NVFP4 rows' pair and plain, MXFP8 rows'.
-    nv4r: [Pipeline; 2],
+    /// The scaled grouped tiles: NVFP4 planes' pair and plain, MXFP8 rows'.
+    nv4p: [Pipeline; 2],
     mx8r: [Pipeline; 2],
 }
 
@@ -38,9 +38,9 @@ impl Pipelines {
             router_rows: library.pipeline("router_sigmoid_rows")?,
             table: library.pipeline("ink2_route_table")?,
             combine_store: library.pipeline("combine_rows_store")?,
-            nv4r: [
-                library.pipeline("gemm_routed_ink2_nv4r_pair_f16")?,
-                library.pipeline("gemm_routed_ink2_nv4r_plain_f16")?,
+            nv4p: [
+                library.pipeline("gemm_routed_ink2_nv4p_pair_f16")?,
+                library.pipeline("gemm_routed_ink2_nv4p_plain_f16")?,
             ],
             mx8r: [
                 library.pipeline("gemm_routed_ink2_mx8r_pair_f16")?,
@@ -183,7 +183,7 @@ const ROUTED_WHAT: &str = "ink2 routed gemm";
 
 /// One scaled grouped GEMM over the pass's route table.
 pub struct Ink2RoutedParams<'w> {
-    /// The stack's layout: NVFP4 rows or MXFP8 rows.
+    /// The stack's layout: NVFP4 planes or MXFP8 rows.
     pub layout: NvfpLayout,
     /// The SITU pair over the fused gate·up stack, or the plain down.
     pub pair: bool,
@@ -512,7 +512,7 @@ impl Kernels {
     ) -> Result<(), DeviceError> {
         let refuse = |d: String| range(ROUTED_WHAT, d);
         let (family, vpb, block) = match p.layout {
-            NvfpLayout::Rows => (&self.ink2_pass.nv4r, 16, 9),
+            NvfpLayout::Planes => (&self.ink2_pass.nv4p, 16, 9),
             NvfpLayout::Mxfp8Rows => (&self.ink2_pass.mx8r, 32, 33),
             other => return Err(refuse(format!("a stack of {other:?}: no grouped tile"))),
         };
@@ -546,6 +546,17 @@ impl Kernels {
             p.stack.len(),
             experts * stack_rows * nb * block,
         )?;
+        if p.layout == NvfpLayout::Planes {
+            // A tile reads a group's codes as one 8-byte word.
+            let start = p.stack.byte_range()?.start.get();
+            if !start.is_multiple_of(8) || !(stack_rows * nb * block).is_multiple_of(8) {
+                return Err(refuse(format!(
+                    "the stack starts {start} bytes into its buffer, an expert {} bytes: the \
+                     planes' code words are 8-byte words",
+                    stack_rows * nb * block
+                )));
+            }
+        }
         let x_rows = if p.gather { p.x_rows } else { p.slots };
         check_window_len(
             ROUTED_WHAT,

@@ -6,10 +6,15 @@
 //!
 //! Four layouts, one kernel source: the NVFP4 blocks of the GGUF file
 //! (mainline's `block_nvfp4`: 64 values in 36 bytes, [`NvfpLayout::Blocks`]),
-//! the NVFP4 rows of the MLX folder's tensors (bloomery's `NVFP4_ROWS`: a
-//! UE4M3 scale byte and 8 code bytes a 16-value group, [`NvfpLayout::Rows`]),
-//! and the two codas' forms: the GGUF's Q8_0 blocks ([`NvfpLayout::Q8_0`])
-//! and the MLX folder's MXFP8 rows ([`NvfpLayout::Mxfp8Rows`]).
+//! the MLX folder's NVFP4 as two planes an expert ([`NvfpLayout::Planes`]:
+//! the codes, then the UE4M3 scale bytes, one a 16-value group; sixteen rows
+//! a SIMD group), and the two codas' forms: the GGUF's Q8_0 blocks
+//! ([`NvfpLayout::Q8_0`]) and the MLX folder's MXFP8 rows
+//! ([`NvfpLayout::Mxfp8Rows`]).
+//!
+//! Every layout but the planes takes a SIMD group a row, eight rows a
+//! threadgroup; the planes take sixteen rows a SIMD group, two SIMD groups a
+//! threadgroup.
 
 use bloomery_device::{DeviceError, Window, WindowMut};
 
@@ -26,10 +31,19 @@ const WHAT: &str = "nvfp4";
 const ROWS_PER_GROUP: usize = 8;
 /// Threads in the threadgroup.
 const THREADS: usize = ROWS_PER_GROUP * 32;
-/// Values a group of the rows layout holds.
-const ROWS_GROUP_VALUES: usize = 16;
-/// Bytes a group of the rows layout holds.
-const ROWS_GROUP_BYTES: usize = 9;
+/// Rows a planes threadgroup holds: sixteen a SIMD group (`NVP_SG_ROWS`),
+/// two of them (`NVP_SGS`).
+const PLANES_ROWS_PER_GROUP: usize = 32;
+/// Threads in the planes threadgroup.
+const PLANES_THREADS: usize = 64;
+/// Bytes a code word of the planes layout holds: a group's sixteen codes,
+/// loaded as one 8-byte word.
+const PLANES_CODE_WORD: usize = 8;
+/// Values a group of the planes layout holds: one scale byte's.
+const PLANES_GROUP_VALUES: usize = 16;
+/// Bytes a group of the planes layout holds over its two planes: 8 code
+/// bytes and the scale byte.
+const PLANES_GROUP_BYTES: usize = 9;
 /// Values a block of the Q8_0 and MXFP8 layouts holds.
 const WIDE_GROUP_VALUES: usize = 32;
 /// Bytes a Q8_0 block holds: the f16 scale and 32 codes.
@@ -43,9 +57,11 @@ pub enum NvfpLayout {
     /// Mainline's `block_nvfp4`: 64 values in 36 bytes, the four sub-blocks'
     /// scale bytes first. `k` is a multiple of 64.
     Blocks,
-    /// Bloomery's NVFP4 rows: 16 values in 9 bytes, the scale byte first, value
-    /// `2i` the low nibble of code byte `i`. `k` is a multiple of 16.
-    Rows,
+    /// Bloomery's NVFP4 planes: an expert's codes plane (`k / 2` bytes a
+    /// row, value `2i` the low nibble of byte `i`), then its scales plane
+    /// (`k / 16` UE4M3 bytes a row), the rows in the launch's order. `k` is a
+    /// multiple of 16.
+    Planes,
     /// GGUF `Q8_0`: 34-byte blocks of 32 values, the f16 scale first. The
     /// GGUF coda's stacks; `k` is a multiple of 32.
     Q8_0,
@@ -61,7 +77,7 @@ impl NvfpLayout {
     pub const fn step(self) -> usize {
         match self {
             Self::Blocks => NVFP4_VALUES,
-            Self::Rows => ROWS_GROUP_VALUES,
+            Self::Planes => PLANES_GROUP_VALUES,
             Self::Q8_0 | Self::Mxfp8Rows => WIDE_GROUP_VALUES,
         }
     }
@@ -72,12 +88,12 @@ impl NvfpLayout {
     pub fn bytes(self, rows: usize, k: usize) -> Option<usize> {
         match self {
             Self::Blocks => nvfp4_stack_bytes(rows, k),
-            Self::Rows => {
-                if !k.is_multiple_of(ROWS_GROUP_VALUES) {
+            Self::Planes => {
+                if !k.is_multiple_of(PLANES_GROUP_VALUES) {
                     return None;
                 }
-                rows.checked_mul(k / ROWS_GROUP_VALUES)?
-                    .checked_mul(ROWS_GROUP_BYTES)
+                rows.checked_mul(k / PLANES_GROUP_VALUES)?
+                    .checked_mul(PLANES_GROUP_BYTES)
             }
             Self::Q8_0 | Self::Mxfp8Rows => {
                 if !k.is_multiple_of(WIDE_GROUP_VALUES) {
@@ -133,7 +149,8 @@ fn refuse(detail: impl Into<String>) -> DeviceError {
 }
 
 impl Kernels {
-    /// Encode the mat-vec: one dispatch of `⌈rows / 8⌉ × slots` threadgroups.
+    /// Encode the mat-vec: one dispatch of `⌈rows / 8⌉ × slots` threadgroups
+    /// (`⌈rows / 32⌉ × slots` of the planes).
     /// The shape and every window are checked first; a refused launch encodes
     /// nothing.
     #[must_use = "a refused launch encoded nothing"]
@@ -188,6 +205,25 @@ impl Kernels {
             )?;
             debug_assert!(per.is_multiple_of(NVFP4_BYTES));
         }
+        if p.layout == NvfpLayout::Planes {
+            // The kernel reads a group's codes as one 8-byte word and its
+            // inputs as float4s.
+            let start = p.weights.byte_range()?.start.get();
+            if !start.is_multiple_of(PLANES_CODE_WORD)
+                || (experts > 1 && !per.is_multiple_of(PLANES_CODE_WORD))
+            {
+                return Err(refuse(format!(
+                    "the weights start {start} bytes into their buffer, an expert {per} bytes: \
+                     the planes' code words are 8-byte words"
+                )));
+            }
+            check_weights_align(
+                WHAT,
+                "x",
+                p.x.byte_range()?.start.get(),
+                WeightAlign::Float4,
+            )?;
+        }
         let args = [
             word(WHAT, "k", p.k)?,
             word(WHAT, "rows", p.rows)?,
@@ -205,7 +241,7 @@ impl Kernels {
         .map(u32::to_ne_bytes);
         let pipeline = match p.layout {
             NvfpLayout::Blocks => &self.ink2.nvfp4,
-            NvfpLayout::Rows => &self.ink2.nvfp4_rows,
+            NvfpLayout::Planes => &self.ink2.nvfp4_planes,
             NvfpLayout::Q8_0 => &self.ink2.q8_0_scaled,
             NvfpLayout::Mxfp8Rows => &self.ink2.mxfp8_rows,
         };
@@ -223,6 +259,13 @@ impl Kernels {
             Some(w) => Binding::of(w)?,
             None => Binding::of(&p.scales)?,
         })?;
+        if p.layout == NvfpLayout::Planes {
+            return slot.dispatch_groups(
+                p.rows.div_ceil(PLANES_ROWS_PER_GROUP),
+                slots,
+                PLANES_THREADS,
+            );
+        }
         slot.dispatch_groups(p.rows.div_ceil(ROWS_PER_GROUP), slots, THREADS)
     }
 }

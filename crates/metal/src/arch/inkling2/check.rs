@@ -85,8 +85,9 @@ impl Site {
 pub struct Stack {
     pub name: String,
     pub layout: NvfpLayout,
-    /// The folder's planes, which the load interleaves into rows; the GGUF's
-    /// stacks load as stored.
+    /// The folder's planes, which the load keeps as two planes an expert
+    /// (NVFP4) or interleaves into rows (MXFP8); the GGUF's stacks load as
+    /// stored.
     pub planes: bool,
     pub experts: usize,
     pub rows: usize,
@@ -291,7 +292,7 @@ fn stack(
     let planes = matches!(split.place(&name), Some(Place::Stack { .. }));
     let layout = match (t.ty, planes) {
         (GgmlType::NVFP4, false) => NvfpLayout::Blocks,
-        (GgmlType::NVFP4_ROWS, true) => NvfpLayout::Rows,
+        (GgmlType::NVFP4_ROWS, true) => NvfpLayout::Planes,
         (GgmlType::Q8_0, false) => NvfpLayout::Q8_0,
         (GgmlType::MXFP8, true) => NvfpLayout::Mxfp8Rows,
         (ty, _) => {

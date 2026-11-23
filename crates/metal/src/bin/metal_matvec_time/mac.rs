@@ -387,11 +387,7 @@ fn nvfp4_weights(layout: NvfpLayout, rows: usize, cols: usize, seed: u64) -> Vec
                 block[..4].fill(SCALE_ONE);
             }
         }
-        NvfpLayout::Rows => {
-            for group in bytes.as_chunks_mut::<9>().0 {
-                group[0] = SCALE_ONE;
-            }
-        }
+        NvfpLayout::Planes => bytes[rows * cols / 2..].fill(SCALE_ONE),
         NvfpLayout::Q8_0 => {
             for block in bytes.as_chunks_mut::<34>().0 {
                 block[..2].copy_from_slice(&0x3C00u16.to_le_bytes());
@@ -415,7 +411,9 @@ fn other_shapes() -> Vec<(&'static str, Shape)> {
     vec![
         // Inkling 2 Mini's experts: the gate and up rows of one expert (1152
         // by 2304 twice, one launch each here) and the down (2304 by 1152),
-        // in the GGUF's blocks and the MLX folder's rows.
+        // in the GGUF's blocks and the MLX folder's planes; then a route's
+        // launch, the eight slots' 2304 rows each as one slot of eight times
+        // the rows (the decode's gate·up and down bytes and threads).
         (
             "nvfp4 blocks gate 1152x2304",
             Shape::Nvfp4 {
@@ -433,19 +431,35 @@ fn other_shapes() -> Vec<(&'static str, Shape)> {
             },
         ),
         (
-            "nvfp4 rows gate 1152x2304",
+            "nvfp4 planes gate 1152x2304",
             Shape::Nvfp4 {
                 rows: 1152,
                 cols: 2304,
-                layout: NvfpLayout::Rows,
+                layout: NvfpLayout::Planes,
             },
         ),
         (
-            "nvfp4 rows down 2304x1152",
+            "nvfp4 planes down 2304x1152",
             Shape::Nvfp4 {
                 rows: 2304,
                 cols: 1152,
-                layout: NvfpLayout::Rows,
+                layout: NvfpLayout::Planes,
+            },
+        ),
+        (
+            "nvfp4 planes route gate-up 18432x2304",
+            Shape::Nvfp4 {
+                rows: 18432,
+                cols: 2304,
+                layout: NvfpLayout::Planes,
+            },
+        ),
+        (
+            "nvfp4 planes route down 18432x1152",
+            Shape::Nvfp4 {
+                rows: 18432,
+                cols: 1152,
+                layout: NvfpLayout::Planes,
             },
         ),
         (

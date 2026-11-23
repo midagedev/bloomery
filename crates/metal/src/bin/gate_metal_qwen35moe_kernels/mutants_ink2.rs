@@ -366,18 +366,70 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         edits: &[(
             "const float dot = simd_sum(acc) * w_scale;",
             "const float dot = simd_sum(acc);",
-            4,
+            3,
         )],
     },
     Mutant {
-        name: "nvfp4_rows_group_bytes",
-        clause: "nvfp4_rows",
-        why: "a row-major group is eight bytes, not nine",
+        name: "nvfp4_planes_row_stride",
+        clause: "nvfp4_planes",
+        why: "a planes row's codes start one group short of their place: every row past the first reads its neighbour's tail",
         edits: &[(
-            "(expert * (ulong)args.rows + (ulong)r) * (ulong)groups * 9ul",
-            "(expert * (ulong)args.rows + (ulong)r) * (ulong)groups * 8ul",
+            "cr[i] = (device const uint2 *)(base + r * code_row);",
+            "cr[i] = (device const uint2 *)(base + r * (code_row - 8ul));",
             1,
         )],
+    },
+    Mutant {
+        name: "nvfp4_planes_scale_swapped",
+        clause: "nvfp4_rows",
+        why: "a planes row reads the scale bytes of its pair row in the set",
+        edits: &[(
+            "sr[i] = sbase + r * (ulong)groups;",
+            "sr[i] = sbase + (ulong)min(rs + (i ^ 1u), args.rows - 1u) * (ulong)groups;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "nvfp4_planes_scale_doubled",
+        clause: "nvfp4_rows",
+        why: "the planes' group scale is ue4m3, not ue4m3 / 2",
+        edits: &[(
+            "#define NVP_SCALE 4194304.0f",
+            "#define NVP_SCALE 8388608.0f",
+            1,
+        )],
+    },
+    Mutant {
+        name: "nvfp4_planes_global_scale_dropped",
+        clause: "nvfp4_rows",
+        why: "the planes' rows skip their slot's scale: the expert's global scale and route weight are lost",
+        edits: &[(
+            "const float dot = sum * w_scale;",
+            "const float dot = sum;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "nvfp4_planes_sign_dropped",
+        clause: "nvfp4_rows",
+        why: "the planes' decode drops a code's sign bit: the negative codes are positive",
+        edits: &[("(sgn & 0x80008000u)", "(sgn & 0u)", 1)],
+    },
+    Mutant {
+        name: "nvfp4_planes_pairs_misread",
+        clause: "nvfp4_rows",
+        why: "the planes' decode reads a word's codes 2 and 6 where its codes 1 and 5 stand",
+        edits: &[(
+            "const float2 a1 = nvp_pair<1u>(c.x);",
+            "const float2 a1 = nvp_pair<2u>(c.x);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "nvfp4_planes_x_held",
+        clause: "nvfp4_planes",
+        why: "the inputs a lane holds in registers for its first group serve its rows' every later group",
+        edits: &[("xv[i] = xq[4u * g + i];", "xv[i] = xq[4u * j + i];", 1)],
     },
     Mutant {
         name: "nvfp4_negative_codes_positive",
@@ -393,7 +445,13 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         name: "nvfp4_bad_scale_passes",
         clause: "nvfp4_nan",
         why: "a scale byte that is not a number is used as a number",
-        edits: &[("usable = usable && isfinite(s);", "usable = usable;", 2)],
+        edits: &[("usable = usable && isfinite(s);", "usable = usable;", 1)],
+    },
+    Mutant {
+        name: "nvfp4_planes_bad_scale_passes",
+        clause: "nvfp4_nan",
+        why: "a planes scale byte that is not a number is used as a number",
+        edits: &[("bad |= (b >= 0x7fu ? 1u : 0u) << i;", "bad |= 0u << i;", 1)],
     },
     Mutant {
         name: "q8_0_scaled_word_dropped",
