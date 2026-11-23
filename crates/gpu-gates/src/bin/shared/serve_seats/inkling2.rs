@@ -64,7 +64,7 @@ use bloomery_gpu::{Gpu, GpuModel};
 use bloomery_gpu_gates::beside::{self, Beside};
 use bloomery_gpu_gates::bind::{
     ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, note_line,
-    parallel_line, placement_of, slots_of,
+    parallel_line, placement_of, prefill_closing, slots_of,
 };
 use bloomery_gpu_gates::generate::{Place, choose_ctx};
 use bloomery_gpu_gates::need;
@@ -200,6 +200,13 @@ impl Seat for Inkling2 {
     /// The body's prompt rule ([`Prompt::prompt`]) over `ids`.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
         Ok(<Body as Prompt>::prompt(&mut self.m, ids)?)
+    }
+
+    /// A prompt's last call with its last id the pass's last row ([`prefill_closing`]): the pass
+    /// leaves the stores and the head's row where that id's step would, so the call closes and the
+    /// row is read after it. The body's prompt rule is this one call, the gate's seat answer too.
+    fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
+        prefill_closing(self, ids, row, true)
     }
 
     fn step(&mut self, last: u32) -> Result<u32, GateError> {
