@@ -36,7 +36,22 @@ pub fn checked(
     arch: &str,
     rows: &[String],
 ) -> Result<bloomery_gpu_gates::model_file::Folder, GateError> {
-    let f = bloomery_gpu_gates::model_file::open_folder(dir)?;
+    held(
+        dir,
+        bloomery_gpu_gates::model_file::open_folder(dir)?,
+        arch,
+        rows,
+    )
+}
+
+/// The folder `f` read from `dir`, held to architecture `arch` and row tables `rows` ([`checked`]).
+#[cfg(feature = "checkpoint")]
+fn held(
+    dir: &Path,
+    f: bloomery_gpu_gates::model_file::Folder,
+    arch: &str,
+    rows: &[String],
+) -> Result<bloomery_gpu_gates::model_file::Folder, GateError> {
     if f.header.architecture() != Some(arch) {
         return Err(format!(
             "checkpoint folder {}: a {} model, where this seat serves {arch}",
@@ -70,6 +85,29 @@ pub fn open(dir: &Path, arch: &str) -> Result<Opened, GateError> {
 /// A checkpoint folder in a build without the `checkpoint` feature, refused by name.
 #[cfg(not(feature = "checkpoint"))]
 pub fn open(dir: &Path, _arch: &str) -> Result<Opened, GateError> {
+    Err(without_checkpoint(dir))
+}
+
+/// [`open`], with each BF16 or F32 matrix the map reads as Q8_0 written as Q8_0 at load where `q8`
+/// asks (`model_hf::folder::open_with`), every other part as stored.
+#[cfg(feature = "checkpoint")]
+pub fn open_with(dir: &Path, arch: &str, q8: bool) -> Result<Opened, GateError> {
+    if !q8 {
+        return open(dir, arch);
+    }
+    let f = model_hf::folder::open_with(dir, true)
+        .map_err(|e| format!("checkpoint folder {}: {e}", dir.display()))?;
+    let f = held(dir, f, arch, &[])?;
+    Ok(Opened {
+        header: f.header,
+        tokenizer: f.tokenizer,
+        source: f.source,
+    })
+}
+
+/// A checkpoint folder in a build without the `checkpoint` feature, refused by name.
+#[cfg(not(feature = "checkpoint"))]
+pub fn open_with(dir: &Path, _arch: &str, _q8: bool) -> Result<Opened, GateError> {
     Err(without_checkpoint(dir))
 }
 

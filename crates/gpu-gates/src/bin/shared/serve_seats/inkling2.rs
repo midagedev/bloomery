@@ -55,11 +55,14 @@
 //! record (`record::BLOOMERY_SERVE_INKLING2`). `--plan` ends the process after the `parallel`
 //! line, nothing loaded.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use super::folder;
 use app::{Keep, Prompt};
 use bloomery_gpu::arch::inkling2::Body;
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::model::{ChainBody, StepMode};
 use bloomery_gpu::{Gpu, GpuModel};
 use bloomery_gpu_gates::beside::{self, Beside};
@@ -98,6 +101,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::SCREEN,
     bloomery_levers::SCHEMAJUMP,
     bloomery_levers::DRAFT,
+    bloomery_levers::INK2_DENSE,
 ];
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
@@ -139,11 +143,73 @@ fn whole_card_plan<'a>(
     Ok(plan)
 }
 
+/// The weights a seat serves: the official checkpoint folder a directory is, or a GGUF file.
+enum Weights {
+    /// The folder's located header, tokenizer and part source (boxed: the tokenizer outweighs a
+    /// header).
+    Folder(Box<folder::Opened>),
+    /// A GGUF file's header; the engine thread opens the file again.
+    File(Split),
+}
+
+/// The model's open on the engine thread ([`Weights::hand_over`]).
+type OpenModel = Box<dyn FnOnce() -> Result<Model, GateError> + Send>;
+
+impl Weights {
+    /// The weights at `path`: a directory is the checkpoint folder, its dense matrices written as
+    /// Q8_0 at load where `q8` asks (`BLOOMERY_INK2_DENSE`); anything else is the GGUF file.
+    fn open(path: &Path, q8: bool) -> Result<Weights, GateError> {
+        if path.is_dir() {
+            let f = folder::open_with(path, refset::arch::inkling2::ARCH, q8)?;
+            return Ok(Weights::Folder(Box::new(f)));
+        }
+        Ok(Weights::File(
+            Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?,
+        ))
+    }
+
+    /// The header the plan is made from: a split's, a folder's located header.
+    fn header(&self) -> &Split {
+        match self {
+            Weights::Folder(f) => &f.header,
+            Weights::File(header) => header,
+        }
+    }
+
+    /// The tokenizer the vocabulary is built from, and the model's open on the engine thread: a
+    /// folder's header and part source go with it, a file is opened again there.
+    fn hand_over(self, path: &Path) -> Result<(Tokenizer, OpenModel), GateError> {
+        match self {
+            Weights::Folder(f) => {
+                let folder::Opened {
+                    header,
+                    tokenizer,
+                    source,
+                } = *f;
+                let open: OpenModel = Box::new(move || folder::model(header, source));
+                Ok((tokenizer, open))
+            }
+            Weights::File(header) => {
+                drop(header);
+                let tokenizer = Tokenizer::from_gguf(path)?;
+                let file = path.to_path_buf();
+                let open: OpenModel = Box::new(move || -> Result<Model, GateError> {
+                    Ok(Split::open(&file)
+                        .map_err(|e| format!("open {}: {e}", file.display()))?
+                        .into())
+                });
+                Ok((tokenizer, open))
+            }
+        }
+    }
+}
+
 /// What the engine thread opens the model with.
 struct OpenSeat {
     card: String,
     device: Option<DeviceId>,
-    path: std::path::PathBuf,
+    /// The model's open ([`Weights::hand_over`]).
+    model: OpenModel,
     /// The slot's positions the visits' stores are sized for.
     ctx: usize,
     /// Whether the load serves a draft: the verify's graphs are captured at load, beside the
@@ -160,11 +226,11 @@ struct Inkling2 {
 }
 
 impl Inkling2 {
-    /// The model of the file at `a.path` on the planned card, the step graph captured, and the
-    /// `load` record on stderr.
+    /// The model `a.model` opens on the planned card, the step graph captured, and the `load`
+    /// record on stderr.
     fn open(a: OpenSeat) -> Result<Inkling2, GateError> {
         let t = Instant::now();
-        let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
+        let file = (a.model)()?;
         let opened = t.elapsed();
         let gpu = Gpu::open_card_after_hook(&a.card, a.device)?;
         let mut m = GpuModel::<Body>::open(gpu, file, a.ctx)?;
@@ -300,7 +366,10 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
 
     arm_screen(levers.screen());
     let path = ref_model_path()?;
-    let split = Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    // A directory is the official checkpoint folder, opened once here: its located header plans as
+    // a split does, and the header and part source go to the engine thread.
+    let weights = Weights::open(&path, levers.ink2_dense_q8())?;
+    let split = weights.header();
     let first = split
         .shard(0)
         .ok_or_else(|| format!("{} opened with no shard", path.display()))?;
@@ -320,8 +389,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         a.template_file.path(),
         "inkling2",
     )?;
-    let inputs = Inputs::read(&split)?;
-    let tok = Tokenizer::from_gguf(&path)?;
+    let inputs = Inputs::read(split)?;
     let plan_levers = PlanLevers::from_levers(&levers)?;
     let (slots, from) = slots_of(a.parallel, a.ctx.is_some(), DEFAULT_SLOTS)?;
     let census = gpu_census::census()?;
@@ -337,7 +405,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let mut machine = place.machine_untiered()?(inputs.model.layers);
     beside::reserve_on(&mut machine, held);
-    let asked = choose_ctx(&split, (a.ctx, slots), (None, None), |c| {
+    let asked = choose_ctx(split, (a.ctx, slots), (None, None), |c| {
         probe_of(whole_card_plan(&inputs, &machine, c, &plan_levers)).map_err(|e| {
             beside::refusal(
                 held,
@@ -359,15 +427,17 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         bloomery_gpu_gates::start::plan_exit();
     }
     let props = EngineProps {
-        model: Some(model_props(&split, &inputs.model)),
+        model: Some(model_props(split, &inputs.model)),
         placement: placement_of(NAME, &machine, &plan),
         ..EngineProps::default()
     };
     let card = &machine.cards[0];
+    drop(plan);
+    let (tok, model) = weights.hand_over(&path)?;
     let open = OpenSeat {
         card: card.name.clone(),
         device: card.device,
-        path: path.clone(),
+        model,
         ctx: slot_ctx,
         // `check` refused every draft word but off ([`draft_asked`]).
         drafted: matches!(
@@ -376,8 +446,6 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         ),
     };
     let device = card.name.clone();
-    drop(plan);
-    drop(split);
     let vocab = Arc::new(Vocab::new(tok)?);
     let engine = SeatEngine::spawn(
         move || Inkling2::open(open),
