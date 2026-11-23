@@ -1485,7 +1485,7 @@ run 'box.sh: BLOOMERY_BOX_LOCAL takes 1 or 0' 64 'BLOOMERY_BOX_LOCAL is 1 \(run 
 # that take a /root gate lock are the box's to show, not these tests'; local mode's lock is in a directory of the test's.
 G=$tmp/gatetree
 mkdir -p "$G/tools/ref" "$G/target/release"
-cp "$ROOT/tools/gpu-gate.sh" "$ROOT/tools/gate-bound.sh" "$G/tools/"
+cp "$ROOT/tools/gpu-gate.sh" "$ROOT/tools/gate-bound.sh" "$ROOT/tools/pack-for-driver.sh" "$G/tools/"
 cp "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/cards.sh" "$G/tools/ref/"
 printf '#!/bin/sh\nexit 0\n' > "$G/target/release/x"
 chmod +x "$G/target/release/x"
@@ -1539,7 +1539,7 @@ fi
 GS=$tmp/gateshtree
 mkdir -p "$GS/tools" "$GS/stub"
 cp "$tmp/stub/nvidia-smi" "$GS/stub/"
-cp "$ROOT/tools/gate.sh" "$ROOT/tools/gate-bound.sh" "$ROOT/tools/arch.sh" "$GS/tools/"
+cp "$ROOT/tools/gate.sh" "$ROOT/tools/gate-bound.sh" "$ROOT/tools/pack-for-driver.sh" "$ROOT/tools/arch.sh" "$GS/tools/"
 printf '#!/bin/sh\nshift 2\nexec "$@"\n' > "$GS/stub/timeout"
 printf '#!/bin/sh\necho "cargo $*"\n' > "$GS/stub/cargo"
 chmod +x "$GS/stub/timeout" "$GS/stub/cargo"
@@ -2085,6 +2085,17 @@ for rel in ref/lease.sh ref/load-groups.sh; do
     bash -c 'source "$1"; echo "went on"' _ "$O/tools/$rel"
   if grep -q '^went on$' "$tmp/out"; then fail "owner missing: $rel went on" "its output says so" "$tmp/out"; else pass "owner missing: $rel does not go on"; fi
 done
+
+# The pack step's file (tools/pack-for-driver.sh), which gate.sh and gpu-gate.sh source after the owner: missing, each stops 70 by name (the
+# shell's "No such file" line) before it reads an argument, and never goes on with pack_for_driver undefined.
+PK=$tmp/packlib
+mkdir -p "$PK/tools/ref" "$PK/target/release"
+cp "$ROOT/tools/gate.sh" "$ROOT/tools/gpu-gate.sh" "$ROOT/tools/gate-bound.sh" "$ROOT/tools/arch.sh" "$PK/tools/"
+cp "$ROOT/tools/ref/lease-probe.sh" "$ROOT/tools/ref/cards.sh" "$PK/tools/ref/"
+printf '#!/bin/sh\nexit 0\n' > "$PK/target/release/x"
+chmod +x "$PK/target/release/x"
+run 'pack lib missing: gate.sh stops 70 by name' 70 'pack-for-driver\.sh: No such file or directory' bash -c 'cd "$1" && exec bash tools/gate.sh -p x' _ "$PK"
+run 'pack lib missing: gpu-gate.sh stops 70 by name' 70 'pack-for-driver\.sh: No such file or directory' bash -c 'cd "$1" && exec bash tools/gpu-gate.sh x' _ "$PK"
 
 # The t table: the four readers print the same t for df 1..40 (tdump.sh), and it is tdist.py's.
 if "$HERE/tdump.sh" "$ROOT" > "$tmp/tdump" 2>&1; then

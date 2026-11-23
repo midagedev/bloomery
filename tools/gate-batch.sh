@@ -5132,7 +5132,7 @@ GOLD
   mkdir -p "$t/stubbin" "$t/gtools/ref"
   printf '%s\n' '#!/bin/sh' 'echo "$*" >> "$STUB_LOG"' 'case "$*" in *--no-run*) exit "${STUB_BUILD_RC:-0}" ;; esac' 'echo "test result: ok. 1 passed; 0 failed"' 'exit 0' > "$t/stubbin/cargo"
   chmod +x "$t/stubbin/cargo"
-  cp "$(dirname "$self")/gate.sh" "$(dirname "$self")/gate-bound.sh" "$t/gtools/"
+  cp "$(dirname "$self")/gate.sh" "$(dirname "$self")/gate-bound.sh" "$(dirname "$self")/pack-for-driver.sh" "$t/gtools/"
   # gate-bound.sh's bound_timeout takes the stub beside it where the host has no GNU timeout (a Mac without coreutils, a bare PATH): a copy of
   # gate-bound.sh carries ref/stub-timeout.py, or every bounded run in it ends 127.
   cp "$(dirname "$self")/ref/stub-timeout.py" "$t/gtools/ref/"

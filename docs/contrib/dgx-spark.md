@@ -75,9 +75,12 @@ cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,cl
 ```
 
 Under a driver before CUDA 13.1 (R580) the driver's PTX compiler truncates some kernels' addresses on a GB10
-([`../upstream/nvlabs-ledger.md`](../upstream/nvlabs-ledger.md) #55), so bloomery refuses by name to hand it PTX: add
-`--bin oxart_ptxas` to that build and pack the binary before it runs, `tools/oxart-pack.sh target/release/bloomery-serve`
-(the toolkit's ptxas compiles the cubins and `tools/ulea-scan.py` checks each one).
+([`../upstream/nvlabs-ledger.md`](../upstream/nvlabs-ledger.md) #55), so bloomery refuses by name to hand it PTX. The
+gates pack for themselves: `tools/gpu-gate.sh` and `tools/gate.sh --gpu` pack the executable before the card lock when the
+driver is that old (`tools/pack-for-driver.sh`; it builds `oxart_ptxas` first when `target/release` has none, and the
+toolkit's ptxas, 13.1 or later, must be on `PATH`). A binary you run yourself is packed by hand: add `--bin oxart_ptxas` to
+that build and run `tools/oxart-pack.sh target/release/bloomery-serve` before it (the toolkit's ptxas compiles the cubins
+and `tools/ulea-scan.py` checks each one).
 
 Recipes select `sm_121a` on a GB10 when `BLOOMERY_ARCH` is unset (`tools/arch.sh:15-35` at `c21e3b81`). That target
 turns on the native FP4 routed prompt path for NVFP4 and FP4-Local weights (`crates/gpu/build.rs:4-9` at `c21e3b81`;

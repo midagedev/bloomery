@@ -32,6 +32,15 @@
 # BLOOMERY_BOX_CARD(box.sh가 넘기는 카드 선택 — 아래), BLOOMERY_GATE_V41_LOAD(1이면 V4.1 적재 락도 잡는다 — 아래).
 # BLOOMERY_BATCH_OWNER(letters, digits, _: the owner of the batch hold this run's batch put up — the batch hold paragraph below).
 # BLOOMERY_BUILD_ONLY=1: the call ends 0 once the binary is found, before any lock, ticket or card (tools/gate-batch.sh's build lane: the recipe's build ran before this call); tools/gate.sh reads the same variable.
+# The pack phase (tools/pack-for-driver.sh, which tools/gate.sh sources too): after the card pin check and before any lock, ticket or card (so
+# no card is held while it packs), the executable is packed when it carries sm_12x PTX unpacked and the local driver (libcuda's
+# cuDriverGetVersion) is older than CUDA 13.1, whose PTX compiler truncates a cc 12.x kernel's addresses and which bloomery-gpu refuses
+# to hand PTX (docs/upstream/nvlabs-ledger.md #55). A script, a host binary, another target, a packed binary and a newer driver pass
+# untouched; an already packed one (tools/oxart-pack.sh's 65) is no error. It runs under BLOOMERY_GATE_BUILD_BOUND (gate-bound.sh). A pack
+# that fails ends the call with its own code after a `GATE RED (exit N) in the pack phase — no test ran` line (`GATE TIMED OUT in the
+# pack phase` for the bound: 124 or 137), no binary run: 1 a cubin failed the address scan, 64 a refused bound, 69 a tool missing, 70 the
+# executable's sections, SM12X_JIT_FIXED or the driver's version unreadable (70 too, the shell's own "No such file" line, when tools/pack-for-driver.sh
+# itself is missing: the call ends before it reads its first argument). Only the red line tells those codes from the binary's own.
 # BLOOMERY_GATE_STACKS(초 — 설정하면 바이너리의 출력이 그만큼 멈출 때 tools/ref/stack-watch.sh가 스레드 스택을 뜨고 끝낸다).
 # BLOOMERY_LOCK_DIR: the directory of every lock and hold file named below, /root when unset (tools/ref/lease-probe.sh's LOCK_DIR).
 # BLOOMERY_BOX_CARD=local (tools/box.sh's local mode): the run takes one lock, which holds every card this machine has, so it
@@ -849,6 +858,100 @@ PY
   gate_args=(--arm plain)
   GATE_BIN=gate_qwen38_serve case_ "the Qwen3.8 serve gate's plain arm runs on the A6000 in the real tier" 0 'ran on ' a6000 "$t/lease" BLOOMERY_TIER=real
   gate_args=()
+  # The pack phase (tools/pack-for-driver.sh). First the lib's own decisions, in this process with its one outside read (the driver's
+  # version) and its one outside command (the build bound's runner) replaced by recorders: what each kind of executable draws, and the
+  # codes of a pack that fails. Then gpu-gate.sh's call of it, with a stand-in lib that records the call: it comes before any lock file
+  # is opened and before BLOOMERY_BUILD_ONLY's early end is passed, and a pack that fails ends the call by its own code and runs nothing.
+  # The ELF cases need objcopy and an ELF `true` (the box and Linux CI have both). pk-packed is pk-sm120 as oxart-pack.sh leaves it, its
+  # `.oxart` renamed `.oxart.ptx` and a new `.oxart` beside it; that one still names the target here, so only the mark decides.
+  local pk_elf='' pk_c pk_ct=$t/pk-ct
+  for pk_c in /usr/bin/true /bin/true; do
+    [ -x "$pk_c" ] && [ "$(head -c 4 "$pk_c" | od -An -tx1 | tr -d ' \n')" = 7f454c46 ] && { pk_elf=$pk_c; break; }
+  done
+  if [ -n "$pk_elf" ] && command -v objcopy > /dev/null; then
+    # shellcheck source=tools/gate-bound.sh
+    source "${self%/*}/gate-bound.sh"
+    # shellcheck source=tools/pack-for-driver.sh
+    source "${self%/*}/pack-for-driver.sh"
+    printf '.target sm_86\n' > "$t/pk86.ptx"
+    printf '// bundle\n.version 9.0\n.target sm_120a\n' > "$t/pk120.ptx"
+    objcopy --add-section .oxart="$t/pk86.ptx" --set-section-flags .oxart=alloc,load,readonly,data,contents "$pk_elf" "$t/pk-sm86" 2> /dev/null
+    objcopy --add-section .oxart="$t/pk120.ptx" --set-section-flags .oxart=alloc,load,readonly,data,contents "$pk_elf" "$t/pk-sm120" 2> /dev/null
+    objcopy --rename-section .oxart=.oxart.ptx --add-section .oxart="$t/pk120.ptx" --set-section-flags .oxart=alloc,load,readonly,data,contents "$t/pk-sm120" "$t/pk-packed" 2> /dev/null
+    cp "$pk_elf" "$t/pk-plain"
+    mkdir -p "$pk_ct/release"
+    : > "$pk_ct/release/oxart_ptxas"
+    chmod +x "$pk_ct/release/oxart_ptxas"
+    export CARGO_TARGET_DIR=$pk_ct
+    local PK_DRIVER=13040 PK_RC=0 PK_BUILD_RC=0
+    driver_cuda_version() {
+      : > "$t/pk.driver"
+      [ "$PK_DRIVER" != fail ] || { echo "pkcase: no libcuda to read the driver's CUDA version from" >&2; return 70; }
+      echo "$PK_DRIVER"
+    }
+    pack_bounded() {
+      printf '%s\n' "$*" >> "$t/pk.calls"
+      case $1 in env) return "$PK_BUILD_RC" ;; *) return "$PK_RC" ;; esac
+    }
+    # pk <name> <executable> <want rc> <ERE>…: one pack_for_driver call; its output, then the count of commands it ran (the packer's
+    # build and the pack) and whether it read the driver, are judged together (judge_all: an ERE that starts with ! must match nothing).
+    pk() {
+      local pkrc=0
+      rm -f "$t/pk.calls" "$t/pk.driver"
+      pack_for_driver pkcase "$2" > "$t/out" 2>&1 || pkrc=$?
+      echo "ran=$([ -e "$t/pk.calls" ] && wc -l < "$t/pk.calls" | tr -d ' ' || echo 0) driver=$([ -e "$t/pk.driver" ] && echo read || echo unread)" >> "$t/out"
+      [ ! -e "$t/pk.calls" ] || sed 's/^/ran: /' "$t/pk.calls" >> "$t/out"
+      judge_all "pack: $1" "$pkrc" "$3" "${@:4}"
+    }
+    pk 'a shell script is no candidate: nothing read, nothing run, nothing said' "$t/tree/target/release/ok" 0 '^ran=0 driver=unread$' '!packing|not packed|GATE'
+    pk 'an ELF with no .oxart is no candidate' "$t/pk-plain" 0 '^ran=0 driver=unread$' '!packing|not packed|GATE'
+    pk 'sm_86 PTX is no candidate: the driver is not read' "$t/pk-sm86" 0 '^ran=0 driver=unread$' '!packing|not packed|GATE'
+    PK_DRIVER=fail pk 'a packed binary passes before the driver is read' "$t/pk-packed" 0 '^ran=0 driver=unread$' '!packing|not packed|GATE'
+    PK_DRIVER=13040 pk 'sm_120a PTX under CUDA 13.4 is left as it is' "$t/pk-sm120" 0 \
+      'carries sm_120a PTX, driver CUDA 13\.4 is 13\.1 or later: not packed' '^ran=0 driver=read$' '!packing it|GATE'
+    PK_DRIVER=13010 pk 'the first fixed driver itself is left as it is' "$t/pk-sm120" 0 'driver CUDA 13\.1 is 13\.1 or later: not packed' '^ran=0 driver=read$' '!packing it|GATE'
+    PK_DRIVER=13000 pk 'sm_120a PTX under CUDA 13.0 packs it: oxart-pack.sh on the executable, no build' "$t/pk-sm120" 0 \
+      'driver CUDA 13\.0 is before 13\.1: packing it' '^ran=1 driver=read$' "^ran: bash .*/tools/oxart-pack\\.sh $t/pk-sm120 $pk_ct/release/oxart_ptxas\$" '!GATE'
+    PK_DRIVER=13000 PK_RC=65 pk "oxart-pack.sh's 65 (packed meanwhile, or nothing to pack) is no error" "$t/pk-sm120" 0 '^ran=1 driver=read$' '!GATE'
+    PK_DRIVER=13000 PK_RC=1 pk 'a pack that fails is a named red in the pack phase, with its own code' "$t/pk-sm120" 1 \
+      'GATE RED \(exit 1\) in the pack phase — no test ran'
+    PK_DRIVER=13000 PK_RC=69 pk 'a missing tool is 69, named in the pack phase' "$t/pk-sm120" 69 'GATE RED \(exit 69\) in the pack phase — no test ran'
+    PK_DRIVER=13000 PK_RC=124 pk 'a pack past the build bound is named a timeout of the pack phase' "$t/pk-sm120" 124 \
+      'GATE TIMED OUT in the pack phase after the 2700s build bound \(exit 124' '!GATE RED'
+    PK_DRIVER=fail pk 'an unreadable driver ends 70, named, before any pack' "$t/pk-sm120" 70 \
+      'pkcase: no libcuda' 'GATE RED \(exit 70\) in the pack phase — no test ran' '^ran=0 driver=read$'
+    rm "$pk_ct/release/oxart_ptxas"
+    PK_DRIVER=13000 pk 'no oxart_ptxas: it is built first (plain cargo, in the repo), then the pack runs' "$t/pk-sm120" 0 \
+      '^ran=2 driver=read$' '^ran: env -C .* cargo build --release -p bloomery-gpu-gates --bin oxart_ptxas$' '^ran: bash .*/tools/oxart-pack\.sh ' '!GATE'
+    PK_DRIVER=13000 PK_BUILD_RC=3 pk "a failed build of oxart_ptxas ends the call with cargo's code and packs nothing" "$t/pk-sm120" 3 \
+      'GATE RED \(exit 3\) in the pack phase — no test ran' '^ran=1 driver=read$' '!oxart-pack\.sh'
+    unset CARGO_TARGET_DIR
+    unset -f driver_cuda_version pack_bounded pk
+    mkdir -p "$t/pkg"
+    for bf in "$(dirname "$self")"/*; do [ "${bf##*/}" = gpu-gate.sh ] || [ "${bf##*/}" = pack-for-driver.sh ] || ln -sf "$bf" "$t/pkg/${bf##*/}"; done
+    ln -sf "$self" "$t/pkg/gpu-gate.sh"
+    printf '%s\n' 'pack_for_driver() {' '  echo "stand-in pack: $1 $2"' \
+      '  [ -z "${STUB_PACK_RC:-}" ] || { echo "GATE RED (exit $STUB_PACK_RC) in the pack phase — no test ran" >&2; return "$STUB_PACK_RC"; }' '}' > "$t/pkg/pack-for-driver.sh"
+    # pkg <name> <want rc> <ERE>…: one run of gpu-gate.sh over the stand-in lib, no lock file of its own before it (the environment of the
+    # call, STUB_PACK_RC and the like, reaches the run); whether the run opened its card lock file is judged beside the output.
+    pkg() {
+      local pkn=$1 pkw=$2 pkrc=0
+      shift 2
+      rm -f "$t/gate.lock" "$t/gate-a6000.lock" "$t/v41-load.lock"
+      self=$t/pkg/gpu-gate.sh gate "$t/out" 3090 "$t/lease" || pkrc=$?
+      echo "gate.lock: $([ -e "$t/gate.lock" ] && echo opened || echo never-opened)" >> "$t/out"
+      judge_all "pack call: $pkn" "$pkrc" "$pkw" "$@"
+    }
+    pkg 'the pack is called with the runner and the executable, and the binary then runs, its locks open after it' 0 \
+      '^stand-in pack: gpu-gate\.sh \./target/release/ok$' 'ran on' '^gate\.lock: opened$' '!GATE RED'
+    STUB_PACK_RC=7 pkg 'a pack that fails ends the call by its own code before any lock file is opened, no binary run' 7 \
+      'GATE RED \(exit 7\) in the pack phase — no test ran' '^gate\.lock: never-opened$' '!ran on'
+    STUB_PACK_RC=7 BLOOMERY_BUILD_ONLY=1 pkg 'BLOOMERY_BUILD_ONLY ends the call before the pack phase' 0 \
+      'ok is built; nothing runs, no lock is taken' '^gate\.lock: never-opened$' '!stand-in pack|GATE RED'
+    unset -f pkg
+  else
+    echo "skip pack-for-driver cases: no ELF true or no objcopy on this machine (the box and Linux CI run them)"
+  fi
   # Events, not seconds. A run in the background is held by what it waits for and released by what the test saw it do, so no case reads
   # the clock: the stub binary says `up` on STUB_READY once its run holds its locks and then blocks on STUB_HOLD until the test writes a
   # line; a waiting run's own output (read through a FIFO by relay) says it waits. The FIFOs are held open read-write by this shell
@@ -2587,6 +2690,8 @@ shift
 # shellcheck source=tools/gate-bound.sh
 source "${BASH_SOURCE[0]%/*}/gate-bound.sh"
 gate_bound gpu-gate.sh || exit $?
+# shellcheck source=tools/pack-for-driver.sh
+source "${BASH_SOURCE[0]%/*}/pack-for-driver.sh" || exit 70 # a failed source does not stop `set -uo pipefail`
 if [ "$DIRECT" = 1 ]; then
   EXE=$NAME
   case $EXE in /* | ./* | ../*) ;; *) EXE=./$EXE ;; esac
@@ -2731,6 +2836,8 @@ LOCK_FILES=("9:$GATE_LOCK" "8:$A6000_LOCK")
 # A card pin that names no card this machine has ends the run here by name, before any lock is taken (tools/ref/cards.sh): the binary
 # would otherwise see an empty device list and fall to the host engine. BLOOMERY_BUILD_ONLY ended above, before any card.
 { BLOOMERY_BOX_CARD=local . "${BASH_SOURCE[0]%/*}/ref/cards.sh" && cards_pin_check gpu-gate.sh "its environment (tools/box.sh's refusal names the file it sourced)"; } || exit $?
+# The pack phase (the header) is here, after every refusal above and before the first lock is opened: no card is held while it packs.
+pack_for_driver gpu-gate.sh "$EXE" || exit $?
 [ "$V41" = 0 ] || LOCK_FILES+=("7:$V41_LOCK")
 for lock in "${LOCK_FILES[@]}"; do
   eval "exec ${lock%%:*}>\"\${lock#*:}\"" 2> /dev/null || { echo "gpu-gate.sh: cannot open ${lock#*:} — the gate runs on the box, as root$([ "$CARD" != local ] || echo ", or in box.sh's local mode with a BLOOMERY_LOCK_DIR it can write")" >&2; exit 69; }
