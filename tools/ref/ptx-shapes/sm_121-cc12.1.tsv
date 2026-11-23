@@ -763,3 +763,20 @@ generate_ds41   rel_seg_h128_g6                          0           0
 generate_ds41   rel_seg_h128_ring_g6                     0           0
 generate_ds41   sigmoid_384_8_router                     0           0
 generate_ds41   sigmoid_384_8_router_pick                0           0
+# Inkling 2's official checkpoint kernels (BF16 dense, MXFP8 experts), its draft (dspark_*), and the verify's Q8_0 _cols pair: measured by this table's scan.
+generate_ds41   dspark_fuse                              0           0
+generate_ds41   dspark_g3_merge                          0           0
+# PIN(2026-11-23): dspark_g3_seg (crates/gpu/src/dspark/block_attn.rs), Inkling 2's draft attention segment: 52 B ptxas spill and 24 B JIT local measured on the DGX Spark (GB10, driver 580.178.04, ptxas 13.3.73).
+generate_ds41   dspark_g3_seg                           52          24
+generate_ds41   dspark_kv_put                            0           0
+generate_ds41   dspark_rnn_add_cap                       0           0
+generate_ds41   dspark_rnn_input_anchor                  0           0
+generate_ds41   gemm_mxfp8p                              0           0
+generate_ds41   mxfp8_gate_up_sel                        0           0
+generate_ds41   mxfp8_gate_up_sel_cols                   0           0
+generate_ds41   mxfp8_gemv_sel32                         0           0
+generate_ds41   mxfp8_gemv_sel32_cols                    0           0
+generate_ds41   norm_proj_bf16_f32                       0           0
+generate_ds41   norm_proj_bf16_f32_cols                  0           0
+generate_ds41   q8_0_gate_up_sel_cols                    0           0
+generate_ds41   q8_0_gemv_sel32_cols                     0           0
