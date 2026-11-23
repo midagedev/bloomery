@@ -60,7 +60,7 @@ def run(template, body):
     if not err:
         sys.exit("the reference failed without a template error:\n" + p.stderr[-2000:])
     return {"error": err[-1].split("Jinja Exception: ", 1)[1]}
-out = {"reference": "llama.cpp PR #32695 oracle tree, common_chat_templates_apply (its jinja engine) through tools/ref/inkling2-chat-render.cpp; "
+out = {"reference": "the oracle tree of llama.cpp PR #32695, common_chat_templates_apply (its jinja engine) through tools/ref/inkling2-chat-render.cpp; "
                     "regenerate with tools/ref/inkling2-chat-render.sh", "templates": {}}
 for key, name in (("mini", "inkling2-mini-chat-template.jinja"), ("small", "inkling2-small-chat-template.jinja")):
     path = os.path.join(fixtures, name)

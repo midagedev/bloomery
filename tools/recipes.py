@@ -4555,6 +4555,7 @@ def _use_bindings(stmt: str) -> list[tuple[tuple[str, ...], str]]:
 
 _USE_STMT = re.compile(r"\buse\s+([^;]*);")
 _PATH_EXPR = re.compile(r"(?<![A-Za-z0-9_:])((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+[A-Za-z_][A-Za-z0-9_]*)")
+_GROUP_OPEN = re.compile(r"\s*::\s*\{")
 
 
 @functools.cache
@@ -4566,6 +4567,11 @@ def named_paths(text: str) -> frozenset[tuple[str, ...]]:
     for m in _USE_STMT.finditer(shape):
         out.update(_use_paths(m.group(1)))
     for m in _PATH_EXPR.finditer(shape):
+        # A path a `{` follows is a use tree's prefix, which `_use_paths` expanded to its members above: it names no
+        # module of its own (`use a::b::{c, d};` names a::b::c and a::b::d, so a group of a module's submodules does not
+        # make the file a user of the module's own file).
+        if _GROUP_OPEN.match(shape, m.end()):
+            continue
         out.add(tuple(re.split(r"\s*::\s*", m.group(1))))
     return frozenset(out)
 
@@ -15355,6 +15361,11 @@ def narrow_table_self_test(expect, side: Side) -> None:
     got = [p for p in gate_paths_problems(tree, recipes, [row("crates/refset/src/arch/mod.rs", ["gate-refset"])]) if " names " in p and p.endswith("to the row")]
     expect([p.split(": ")[1].split(" ")[0] for p in got] == ["gate-gpu-linear"],
            f"gate-paths: arch/mod.rs's row asks for exactly the gates that call its own items (gate_linear's node_dumps), not its submodules' users: {got}")
+    expect(not names_module(named_paths("use a::b::{c, d};"), ("a", "b"), frozenset({"c", "d"}))
+           and names_module(named_paths("use a::b::{c, d};"), ("a", "b"))
+           and names_module(named_paths("use a::b::{self, c};"), ("a", "b"), frozenset({"c"})),
+           "gate-paths: a use tree's prefix names no module of its own: a group of submodules is no user of their parent's file, "
+           "a `self` in it or a member that is no submodule is")
     expect(names_module(named_paths("use a::b::{self, C};"), ("a", "b")) and not names_module(named_paths("// a::b::c\nlet s = \"a::b\";"), ("a", "b")),
            "gate-paths: a module named in a use tree, or only in a comment or a string")
     expect(glob_regex("x/{a.rs,b/**}").match("x/b/c/d.rs") and not glob_regex("x/*.rs").match("x/b/c.rs"), "gate-paths: glob `**`, `*` and braces")

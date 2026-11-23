@@ -854,7 +854,8 @@ impl ChatParser {
         // Muse Spark's scan splits its own reasoning (the `to=self` span),
         // so it wants no think split; the others track the span so markup
         // inside it is never parsed.
-        let split = (format == ReasoningFormat::Deepseek || tools.is_some())
+        let extract = format == ReasoningFormat::Deepseek;
+        let split = (extract || tools.is_some())
             && !matches!(
                 tools,
                 Some(Tools::MuseSpark | Tools::Inkling | Tools::InklingText)
@@ -867,7 +868,7 @@ impl ChatParser {
             tags,
             think: split.then(|| {
                 let mut t = ThinkSplit::for_prompt_with(prompt, tags);
-                if format == ReasoningFormat::Deepseek {
+                if extract {
                     t = t.trimming_after_opened();
                 }
                 if call_ends_span {
@@ -883,12 +884,8 @@ impl ChatParser {
                 Tools::QwenXml(framing, kinds) => Scan::Qwen(QwenScan::new(kinds, framing)),
                 Tools::MuseSpark => Scan::Recipient(crate::museatem::MuseScan::default()),
                 Tools::Mistral => Scan::Mistral(MistralScan::default()),
-                Tools::Inkling => {
-                    Scan::Inkling(InklingScan::new(format == ReasoningFormat::Deepseek))
-                }
-                Tools::InklingText => Scan::Inkling(
-                    InklingScan::new(format == ReasoningFormat::Deepseek).without_calls(),
-                ),
+                Tools::Inkling => Scan::Inkling(InklingScan::new(extract)),
+                Tools::InklingText => Scan::Inkling(InklingScan::new(extract).without_calls()),
             }),
             streamer: None,
             open: None,

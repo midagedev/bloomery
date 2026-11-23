@@ -877,7 +877,14 @@ gguf 7 2 0
 # PIN(2026-11-22): gpu 3326/444 -> 3351/445, new kernel entries, not old code relaxed: the loop controller's split
 # launches (loop_control.rs: the down and out entries' staging, dots and stores, the shared out block fn with its
 # `# Safety` contract), each unsafe block with its SAFETY line.
-gpu 3351 445 10
+# PIN(2026-11-23): gpu 3351/445 -> 3403/449, new kernel entries, not old code relaxed: Inkling 2's prefill rel-bias flash
+# (rel_bias_prefill.rs, 29 blocks, 2 fns: `stage_tile` and the `rel_prefill` body, their shared-tile and global reads,
+# async copies and row stores), the loop controller's row-batched forms (loop_control.rs +21 blocks, 2 fns:
+# `down_rows_block` and `out_rows_block`, their staging, dots and stores) and the two GROUP_6 entries of rel_bias.rs
+# (+2 blocks, their calls into `seg_h128_rel`). All of it is device code on raw pointers, which a safe wrapper does not
+# reach: the host launches are the module's safe methods and hold no unsafe. Each block has its SAFETY line or `# Safety`
+# contract.
+gpu 3403 449 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.

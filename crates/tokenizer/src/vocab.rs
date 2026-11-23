@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use gguf::Value;
+use gguf::{GENERAL_ARCHITECTURE, Value};
 
 use crate::Error;
 use crate::pretok::Pre;
@@ -412,7 +412,7 @@ impl Vocab {
                 // it (with the Mini's `inkling2`) runs the expression with `\p{M}` in its lookaheads.
                 if pre == Pre::Gpt4o
                     && matches!(
-                        m.str("general.architecture")?,
+                        m.str(GENERAL_ARCHITECTURE)?,
                         Some("inkling2" | "inkling2_loop")
                     )
                 {

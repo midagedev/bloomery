@@ -4637,9 +4637,11 @@ gate-raon1-meta:
 # machine), printed. The fixture clause (`hw_inkling2_fixture`) reads the family's planted fixture — the profile names it
 # (BLOOMERY_MODEL=inkling2), the fixture tier resolving the same file — and is red until the landing plants it
 # (`fixture generate ... /models/fixtures/inkling2`). The lib half runs the synthetic refusals (the master dialect's too,
-# which no file on the box carries); the test half is the files under /models. Headers only, seconds.
+# which no file on the box carries); the test half is the files under /models and, with them (`--include-ignored`), the two
+# clauses on the Small's header checked in beside the test (`inkling2_small_*`: it reads as the file does, and it stops at the
+# coverage list), which need no file. Headers only, seconds.
 gate-inkling2-meta:
-    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::inkling2 arch::place_hybrid arch::registry arch::rules --nocapture && bash tools/gate.sh --release -p bloomery-model --test inkling2_meta -- --ignored --nocapture'
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::inkling2 arch::place_hybrid arch::registry arch::rules --nocapture && bash tools/gate.sh --release -p bloomery-model --test inkling2_meta -- --include-ignored --nocapture'
 
 # inkling2-moe: Inkling 2's routed block on the card (gate_inkling2_moe's doc): the biased sigmoid router at 128 experts and the
 # top 8 (the +1e-20 selected-sum rule, the file's route scale), the fused ffn_gate_up_exps split at upload into gate and up

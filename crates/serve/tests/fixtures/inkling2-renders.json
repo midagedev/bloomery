@@ -1,5 +1,5 @@
 {
- "reference": "llama.cpp PR #32695 oracle tree, common_chat_templates_apply (its jinja engine) through tools/ref/inkling2-chat-render.cpp; regenerate with tools/ref/inkling2-chat-render.sh",
+ "reference": "the oracle tree of llama.cpp PR #32695, common_chat_templates_apply (its jinja engine) through tools/ref/inkling2-chat-render.cpp; regenerate with tools/ref/inkling2-chat-render.sh",
  "templates": {
   "mini": {
    "file": "inkling2-mini-chat-template.jinja",
