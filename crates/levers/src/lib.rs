@@ -32,7 +32,10 @@ use std::sync::OnceLock;
 
 mod registry;
 use registry::REGISTRY;
-pub use registry::{AUTOTUNE, ELASTIC, INK2_DENSE, PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
+pub use registry::{
+    AUTOTUNE, ELASTIC, INK2_DENSE, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, SCHEMAJUMP,
+    SPLIT_WALK, XSTREAM,
+};
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_EXPERTS_CAP, CARD_MARGIN, CED, CHECK_FINITE, DRAFT,
     ENGRAM_HELPER, EXPERT_RANK, FORCE_IDS, GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES,
@@ -1666,6 +1669,14 @@ impl Levers {
             Some("q8_0") => true,
             w => panic!("{INK2_DENSE} holds {w:?}, not bf16 or q8_0"),
         }
+    }
+
+    /// `BLOOMERY_INK2_PASSES`: the passes a variable-loop Inkling 2 folder runs its core at, 1 to
+    /// [`INK2_PASSES_MAX`]; `None` unset, the folder's own `num_passes`.
+    #[must_use]
+    pub fn ink2_passes(&self) -> Option<usize> {
+        self.count(INK2_PASSES)
+            .map(|n| Levers::usize_of(INK2_PASSES, n))
     }
 
     /// `BLOOMERY_AUTOTUNE`: a server makes its load-time kernel picks (the

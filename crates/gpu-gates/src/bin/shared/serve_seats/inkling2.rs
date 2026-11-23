@@ -108,6 +108,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::SCHEMAJUMP,
     bloomery_levers::DRAFT,
     bloomery_levers::INK2_DENSE,
+    bloomery_levers::INK2_PASSES,
     bloomery_levers::HOST_POPULATE,
     bloomery_levers::HOST_LOCK,
     bloomery_levers::CARD_DONTNEED,
@@ -219,11 +220,28 @@ type OpenModel = Box<dyn FnOnce() -> Result<Model, GateError> + Send>;
 
 impl Weights {
     /// The weights at `path`: a directory is the checkpoint folder, its dense matrices written as
-    /// Q8_0 at load where `q8` asks (`BLOOMERY_INK2_DENSE`); anything else is the GGUF file.
-    fn open(path: &Path, q8: bool) -> Result<Weights, GateError> {
+    /// Q8_0 at load where `q8` asks (`BLOOMERY_INK2_DENSE`) and its loop run at `passes` passes
+    /// where one is asked (`BLOOMERY_INK2_PASSES`, a variable-loop folder only); anything else is
+    /// the GGUF file, which has no pass count to set.
+    fn open(path: &Path, q8: bool, passes: Option<usize>) -> Result<Weights, GateError> {
         if path.is_dir() {
-            let f = folder::open_with(path, refset::arch::inkling2::ARCH, q8)?;
+            let f =
+                folder::open_with(path, refset::arch::inkling2::ARCH, q8, passes).map_err(|e| {
+                    match passes {
+                        Some(p) => format!("{}={p}: {e}", bloomery_levers::INK2_PASSES).into(),
+                        None => e,
+                    }
+                })?;
             return Ok(Weights::Folder(Box::new(f)));
+        }
+        if let Some(p) = passes {
+            return Err(format!(
+                "{}={p}: {} is a GGUF file, which carries its own pass count; only a \
+                 variable-loop checkpoint folder runs another",
+                bloomery_levers::INK2_PASSES,
+                path.display()
+            )
+            .into());
         }
         Ok(Weights::File(
             Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?,
@@ -354,6 +372,7 @@ impl Inkling2 {
             .u("ctx", m.ctx_max())
             .u("slots", 1)
             .u("layers", m.layers().len())
+            .u("passes", m.body(NAME)?.passes())
             .u("visits", m.body(NAME)?.visit_table().len())
             .u("graph_nodes", nodes)
             .f("load_s", total.as_secs_f64())
@@ -477,7 +496,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let path = ref_model_path()?;
     // A directory is the official checkpoint folder, opened once here: its located header plans as
     // a split does, and the header and part source go to the engine thread.
-    let weights = Weights::open(&path, levers.ink2_dense_q8())?;
+    let weights = Weights::open(&path, levers.ink2_dense_q8(), levers.ink2_passes())?;
     let split = weights.header();
     let first = split
         .shard(0)

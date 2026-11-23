@@ -33,6 +33,7 @@
 //! and the visits derive at load.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use gguf::{GgmlType, StackLayout, Value};
 use hf::modelopt::{Normal, Plain, Use};
@@ -43,7 +44,7 @@ use serde_json::Value as Json;
 
 use super::section::Section;
 use super::trunk;
-use crate::folder::{Error, FolderMap, Mapped, Mapping, Origin, Squeeze, VocabSpec, refuse};
+use crate::folder::{self, Error, FolderMap, Mapped, Mapping, Origin, Squeeze, VocabSpec, refuse};
 
 const ARCHITECTURE: &str = "inkling2";
 
@@ -159,16 +160,19 @@ const TEXT: &Fields = &[
     ("loop_config", Read),
 ];
 
-/// `loop_config`: the fixed loop's bounds.
+/// `loop_config`: the loop's bounds. `is_varloop` marks the research checkpoint trained to run
+/// its core at any pass count from one to five; its `num_passes` is the count it was
+/// post-trained at, and [`open_passes`] serves another.
 const LOOP: &Fields = &[
     ("core_start", Read),
     ("core_end", Read),
     ("num_passes", Read),
     ("gate_rank", Read),
-    // The research checkpoint's serve-time pass count over shared cache slots, which this
-    // reader does not run.
-    ("is_varloop", Only("[false]")),
+    ("is_varloop", Read),
 ];
+
+/// The most passes a variable loop runs: the research checkpoint was trained on one to five.
+pub const MAX_PASSES: usize = bloomery_levers::INK2_PASSES_MAX as usize;
 
 /// The loop a looped folder carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,6 +329,9 @@ pub struct Checkpoint {
     windowed: Vec<bool>,
     /// The loop; `None`: one pass over every layer.
     loop_: Option<Loop>,
+    /// The core of a variable loop run at one pass: it runs once, so the header carries no loop,
+    /// and the folder's message tensors, which no pass reads, are skipped by name.
+    idle: Option<Loop>,
     hidden: u64,
     heads: u64,
     kv: u64,
@@ -339,6 +346,53 @@ pub struct Checkpoint {
     vocab: VocabSpec,
     /// The header's model keys by suffix, under the architecture's name.
     keys: Vec<(String, Value)>,
+}
+
+/// `config` with its loop run at `passes` passes. Only a variable loop (`loop_config.is_varloop`)
+/// runs another count than the checkpoint's; any other folder refuses by name. The count is
+/// held to the range the checkpoint was trained on by [`Checkpoint::parse`].
+fn with_passes(config: &mut Json, passes: usize) -> Result<(), Error> {
+    const AT: &str = "config.json.text_config.loop_config";
+    let Some(loop_) = config
+        .pointer_mut("/text_config/loop_config")
+        .and_then(Json::as_object_mut)
+    else {
+        return Err(Error::Refused(format!(
+            "{AT} is missing: a pass count needs the variable-loop folder, and this one holds no loop"
+        )));
+    };
+    if loop_.get("is_varloop") != Some(&Json::Bool(true)) {
+        return Err(Error::Refused(format!(
+            "{AT}.is_varloop is not true: only a variable-loop folder runs another pass count than \
+             its num_passes ({}), and this one is a fixed loop",
+            loop_.get("num_passes").map_or(Json::Null, Clone::clone)
+        )));
+    }
+    loop_.insert("num_passes".to_string(), Json::from(passes));
+    Ok(())
+}
+
+/// [`folder::open_with`] of an Inkling 2 folder with its loop run at `passes` passes where one is
+/// asked (`None`: the folder's own `num_passes`, which is [`folder::open_with`]'s open). The
+/// header names the visits and the loop at that count (one pass has no loop: its message tensors
+/// are skipped), so a plan, a load and the step walk follow it. A folder of another model type, a
+/// fixed-loop folder and a count the variable loop was not trained on are refused by name.
+pub fn open_passes(dir: &Path, q8: bool, passes: Option<usize>) -> Result<folder::Opened, Error> {
+    let mut config = folder::read_config(dir)?;
+    let model_type = config
+        .get("model_type")
+        .and_then(Json::as_str)
+        .unwrap_or_default();
+    if !Checkpoint::MODEL_TYPES.contains(&model_type) {
+        return Err(Error::Refused(format!(
+            "{}: model_type {model_type:?} is no Inkling 2 folder",
+            dir.display()
+        )));
+    }
+    if let Some(passes) = passes {
+        with_passes(&mut config, passes)?;
+    }
+    folder::open_as::<Checkpoint>(dir, &config, q8)
 }
 
 impl FolderMap for Checkpoint {
@@ -431,21 +485,34 @@ impl FolderMap for Checkpoint {
             }
             windowed[id] = true;
         }
-        let loop_ = match text.value.get("loop_config") {
+        let (loop_, idle) = match text.value.get("loop_config") {
             Some(value) => {
                 let section = Section::<Error>::new(value, "config.json.text_config.loop_config")?;
                 section.check(&[LOOP])?;
+                let varloop = section
+                    .field("is_varloop")?
+                    .as_bool()
+                    .ok_or_else(|| section.bad("is_varloop", "must be a boolean"))?;
                 let loop_ = Loop {
                     core_start: section.count("core_start")? as usize,
                     core_end: section.count("core_end")? as usize,
                     passes: section.count("num_passes")? as usize,
                     gate_rank: section.count("gate_rank")? as usize,
                 };
-                if loop_.passes < 2 {
+                if loop_.passes < 2 && !varloop {
                     return Err(section.bad(
                         "num_passes",
                         &format!(
                             "is {}; the fixed loop runs at least two passes over its core",
+                            loop_.passes
+                        ),
+                    ));
+                }
+                if varloop && loop_.passes > MAX_PASSES {
+                    return Err(section.bad(
+                        "num_passes",
+                        &format!(
+                            "is {}; the variable loop was trained on one to {MAX_PASSES} passes",
                             loop_.passes
                         ),
                     ));
@@ -472,9 +539,13 @@ impl FolderMap for Checkpoint {
                         ),
                     ));
                 }
-                Some(loop_)
+                if loop_.passes == 1 {
+                    (None, Some(loop_))
+                } else {
+                    (Some(loop_), None)
+                }
             }
-            None => None,
+            None => (None, None),
         };
         let visits = layers + loop_.map_or(0, |loop_| loop_.extra());
         let pattern = |v: usize| match loop_ {
@@ -574,6 +645,7 @@ impl FolderMap for Checkpoint {
             layers,
             windowed,
             loop_,
+            idle,
             hidden: wide("hidden_size"),
             heads: wide("num_attention_heads"),
             kv: wide("num_key_value_heads"),
@@ -601,6 +673,13 @@ impl FolderMap for Checkpoint {
             && !tensors.iter().any(|&(n, _)| n.starts_with(MODEL))
         {
             return self.map_official(tensors);
+        }
+        if self.idle.is_some() {
+            return Err(refuse(
+                MESSAGE_INPUT,
+                "a variable loop at one pass is read from the official folder only: this map \
+                 does not skip the message tensors",
+            ));
         }
         let mut out: BTreeMap<String, Mapped<Step>> = BTreeMap::new();
         let mut skipped = BTreeMap::new();
@@ -936,6 +1015,25 @@ impl Checkpoint {
             .is_some_and(|loop_| (loop_.core_start..loop_.core_end).contains(&l))
     }
 
+    /// Whether the official tensor `short` (the name past `model.llm.`) is a message tensor of
+    /// the loop of a variable-loop folder run at one pass: the two query tables and a core
+    /// layer's controllers.
+    fn is_idle(&self, short: &str) -> bool {
+        let Some(idle) = self.idle else {
+            return false;
+        };
+        short == "middle_cycle_cross_pass_queries"
+            || short == "middle_cycle_cross_pass_kv_queries"
+            || short
+                .strip_prefix("layers.")
+                .and_then(|r| r.split_once('.'))
+                .and_then(|(l, rest)| Some((l.parse::<usize>().ok()?, rest)))
+                .is_some_and(|(l, rest)| {
+                    rest.starts_with("controllers.")
+                        && (idle.core_start..idle.core_end).contains(&l)
+                })
+    }
+
     /// The loop's gate rank, zero where the file carries no loop.
     fn rank(&self) -> u64 {
         self.loop_.map_or(0, |loop_| loop_.gate_rank as u64)
@@ -985,6 +1083,13 @@ impl Checkpoint {
             let short = name
                 .strip_prefix(OFFICIAL)
                 .ok_or_else(|| refuse(name, "not an Inkling 2 tensor of the official folder"))?;
+            if self.is_idle(short) {
+                skipped.insert(
+                    name.to_string(),
+                    "a message tensor of the loop, which one pass never runs".to_string(),
+                );
+                continue;
+            }
             let (to, m) = self.official_tensor(name, short, shape)?;
             if out.insert(to, m).is_some() {
                 return Err(refuse(name, "maps to a name another tensor has"));
@@ -993,7 +1098,8 @@ impl Checkpoint {
         let table = tensors
             .iter()
             .find(|&&(n, _)| n == OFFICIAL_QUERIES)
-            .map(|&(n, _)| n);
+            .map(|&(n, _)| n)
+            .filter(|_| self.idle.is_none());
         self.complete(&out, table, OFFICIAL_QUERIES)?;
         Ok(Mapping {
             tensors: out,
@@ -1550,8 +1656,11 @@ mod tests {
                 "{key}: {e}"
             );
         }
-        let e = refuse(&text("is_varloop", json!(true)));
-        assert!(e.contains("is_varloop"), "{e}");
+        let e = refuse(&text(
+            "loop_config",
+            json!({"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 64, "is_varloop": "yes"}),
+        ));
+        assert!(e.contains("is_varloop") && e.contains("boolean"), "{e}");
         let e = refuse(&text("swa_head_dim", json!(64)));
         assert!(
             e.contains("swa_head_dim is 64, where head_dim is 128"),
@@ -2297,6 +2406,146 @@ mod tests {
                 .contains("not a stack of matrices")
         );
         assert_eq!(flat.dims, [64, 6]);
+    }
+
+    /// The official Mini config as the variable-loop checkpoint's: the same fields with
+    /// `is_varloop` true (`TML-d24-varloop-research`'s `config.json` differs by that one line), its
+    /// loop run at `passes` where one is asked ([`with_passes`]).
+    fn varloop_config(passes: Option<usize>) -> Result<Json, Error> {
+        let mut config = json(OFFICIAL_CONFIG);
+        config["text_config"]["loop_config"]["is_varloop"] = json!(true);
+        if let Some(passes) = passes {
+            with_passes(&mut config, passes)?;
+        }
+        Ok(config)
+    }
+
+    /// The official folder's header planned at `passes` of a variable loop: the map, its header
+    /// keys and the plan of every text tensor (`q8`, the served load).
+    fn varloop_planning(passes: Option<usize>) -> (Checkpoint, folder::Planning<Step>) {
+        let config = varloop_config(passes).unwrap();
+        let checkpoint = Checkpoint::parse(&config).unwrap();
+        let mut header = json(OFFICIAL_HEADER);
+        header.as_object_mut().unwrap().remove("__metadata__");
+        let planning = folder::plan_tensors(
+            &checkpoint,
+            &Config::parse(&config, Some(&json(OFFICIAL_QUANT))).unwrap(),
+            &entries(&header),
+            true,
+            folder::Keep::InPlace,
+        )
+        .unwrap();
+        (checkpoint, planning)
+    }
+
+    /// A variable loop's header follows the pass count: `block_count` the visits (the 24 stored
+    /// layers and the core's 12 once a pass past the first), `num_loops` the count, the pattern
+    /// and head counts a value a visit, and the cache slots' windowless visits one a pass of
+    /// layers 11 and 17. One pass has no loop: the header carries no loop key, and the 146
+    /// message tensors (the two query tables and the 12 core layers' 12 controller tensors each)
+    /// are skipped by name, which no pass reads. The count the folder's own config gives (3) is
+    /// the Mini's header key for key.
+    ///
+    /// FAIL-first: `with_passes` leaving `num_passes` as stored holds every count at 48 visits.
+    #[test]
+    fn a_variable_loop_s_header_follows_the_pass_count() {
+        let key = |c: &Checkpoint, suffix: &str| {
+            c.keys
+                .iter()
+                .find(|(k, _)| k == suffix)
+                .map(|(_, v)| v.clone())
+        };
+        let mini = Checkpoint::parse(&json(OFFICIAL_CONFIG)).unwrap();
+        for passes in 1..=MAX_PASSES {
+            let (checkpoint, planning) = varloop_planning(Some(passes));
+            let visits = 24 + (passes - 1) * 12;
+            assert_eq!(
+                key(&checkpoint, "block_count"),
+                Some(Value::U32(visits as u32)),
+                "{passes} passes"
+            );
+            let Some(Value::Array(pattern)) = key(&checkpoint, "attention.sliding_window_pattern")
+            else {
+                panic!("the pattern is an array");
+            };
+            let windowless: Vec<usize> = (0..visits)
+                .filter(|&v| pattern[v] == Value::Bool(false))
+                .collect();
+            // Layers 5 and 23 once, 11 and 17 once a pass.
+            let want: Vec<usize> = std::iter::once(5)
+                .chain((0..passes).flat_map(|p| [11 + 12 * p, 17 + 12 * p]))
+                .chain([23 + 12 * (passes - 1)])
+                .collect();
+            assert_eq!(windowless, want, "{passes} passes");
+            let message = planning
+                .skipped
+                .keys()
+                .filter(|n| !n.starts_with("model.visual."))
+                .count();
+            if passes == 1 {
+                assert_eq!(key(&checkpoint, "num_loops"), None);
+                assert_eq!(key(&checkpoint, "loop.core_end"), None);
+                assert_eq!(message, 146, "the two tables and 12 layers' 12 controllers");
+                assert_eq!(planning.planned.len(), 734 - 146);
+            } else {
+                assert_eq!(
+                    key(&checkpoint, "num_loops"),
+                    Some(Value::U32(passes as u32))
+                );
+                assert_eq!(message, 0, "{passes} passes");
+                assert_eq!(planning.planned.len(), 734);
+            }
+            assert!(
+                planning.plan.refused.is_empty(),
+                "{:?}",
+                planning.plan.refused
+            );
+        }
+        let (own, _) = varloop_planning(None);
+        let (three, _) = varloop_planning(Some(3));
+        assert_eq!(
+            own.keys, mini.keys,
+            "the folder's own count is the Mini's header"
+        );
+        assert_eq!(three.keys, mini.keys, "an asked 3 is the folder's own");
+    }
+
+    /// The pass count is refused by name where the loop is not a variable one or the count is not
+    /// one the checkpoint was trained on, and the folder's own config refuses a count over five
+    /// and a `num_passes` of 1 on a fixed loop.
+    #[test]
+    fn a_pass_count_is_refused_off_a_variable_loop_and_off_the_trained_range() {
+        let mut fixed = json(OFFICIAL_CONFIG);
+        let e = with_passes(&mut fixed, 2).unwrap_err().to_string();
+        assert!(e.contains("is_varloop") && e.contains("fixed loop"), "{e}");
+        let mut loopless = json(OFFICIAL_CONFIG);
+        loopless["text_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("loop_config");
+        let e = with_passes(&mut loopless, 2).unwrap_err().to_string();
+        assert!(e.contains("loop_config"), "{e}");
+        for passes in [0, MAX_PASSES + 1] {
+            let e = Checkpoint::parse(&varloop_config(Some(passes)).unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("num_passes"), "{passes}: {e}");
+        }
+        // A fixed loop's one pass stays refused.
+        let mut one = json(OFFICIAL_CONFIG);
+        one["text_config"]["loop_config"]["num_passes"] = json!(1);
+        let e = Checkpoint::parse(&one).unwrap_err().to_string();
+        assert!(e.contains("at least two passes"), "{e}");
+    }
+
+    /// The MLX map does not skip the message tensors of a one-pass loop, so it refuses by name;
+    /// the official map keeps a looped folder without its message tables refused.
+    #[test]
+    fn the_one_pass_loop_is_read_from_the_official_folder_only() {
+        let checkpoint = Checkpoint::parse(&varloop_config(Some(1)).unwrap()).unwrap();
+        let mlx: Vec<(&str, &[usize])> = vec![("model.language_model.norm.weight", &[2304])];
+        let e = checkpoint.map(&mlx).err().unwrap().to_string();
+        assert!(e.contains("official folder only"), "{e}");
     }
 
     /// A folder with tensors of both dialects (the MLX map's, which refuses the official names)

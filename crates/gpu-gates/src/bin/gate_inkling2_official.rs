@@ -20,6 +20,20 @@
 //!
 //! Each arm's first [`FIRST_IDS`] greedy ids from set `a`'s prompt are printed beside the
 //! vendor's. A step that raises the fault word ends the gate by name.
+//!
+//! `BLOOMERY_INK2_VARLOOP` names the variable-loop sibling folder (thinkingmachines'
+//! `TML-d24-varloop-research`, the same tensors under `is_varloop: true`) and adds its clause:
+//!
+//! - `varloop_follows_the_pass_count`: the folder opens through `open_passes` at its own count
+//!   (the lever unset), at 3, at 2 and at 1 pass. Each arm's plan line names the passes and the
+//!   visits, the body's visit table is the prelude, the core's passes one after another and the
+//!   coda, a pass count's resident bytes (the visits' stores) grow with it, the graph step is the
+//!   eager one over set `a`'s first greedy ids, and the pass count reaches the kernels: the
+//!   prompt's last logits row differs between every two counts. The folder's own count and an
+//!   asked 3 are the same load: the same header types and bytes, the same greedy ids over every
+//!   set. No reference engine holds these counts' values, so no id is pinned: each arm's greedy
+//!   ids and its teacher-forced top-1 agreement with the 3-pass arm's over the five sets are
+//!   printed.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -73,6 +87,30 @@ mod gate {
     /// The two arms: the name `BLOOMERY_INK2_DENSE` gives each and whether it asks for Q8_0.
     const ARMS: [(&str, bool); 2] = [("bf16", false), ("q8_0", true)];
 
+    /// The variable-loop sibling folder's environment name: the folder `varloop_follows_the_pass_count`
+    /// opens (deferred by name where it is unset).
+    const VARLOOP_ENV: &str = "BLOOMERY_INK2_VARLOOP";
+
+    /// The variable-loop folder's arms, in the order they load: the folder's own count (the lever
+    /// unset), then the counts `BLOOMERY_INK2_PASSES` asks. The 3-pass arm comes before the
+    /// others, whose agreement with it is printed.
+    const VARLOOP_ARMS: [(&str, Option<usize>); 4] = [
+        ("default", None),
+        ("p3", Some(3)),
+        ("p2", Some(2)),
+        ("p1", Some(1)),
+    ];
+
+    /// The greedy ids each variable-loop arm runs a set's prompt for.
+    const VARLOOP_IDS: usize = 48;
+
+    /// The ids of set `a` the graph step and the eager step are held to.
+    const VARLOOP_EAGER_IDS: usize = 16;
+
+    /// The stored layers of the variable loop and its core `[CORE.0, CORE.1)`.
+    const VARLOOP_LAYERS: u32 = 24;
+    const VARLOOP_CORE: (u32, u32) = (6, 18);
+
     /// One set's prompt, its greedy table and the vendor's logits row at the prompt's last
     /// position.
     struct Set {
@@ -87,6 +125,44 @@ mod gate {
         word: &'static str,
         types: Vec<(String, GgmlType)>,
         resident: usize,
+    }
+
+    /// One variable-loop arm: what its load reports and its runs over the sets.
+    struct VarArm {
+        label: &'static str,
+        passes: usize,
+        visits: usize,
+        resident: usize,
+        types: Vec<(String, GgmlType)>,
+        /// Each set's free-run greedy ids.
+        runs: Vec<Vec<u32>>,
+        /// Each set's teacher-forced top-1 matches over the 3-pass arm's ids: (matches, positions).
+        forced: Vec<(usize, usize)>,
+        /// Set `a`'s prompt's last logits row.
+        row: Vec<f32>,
+        /// The body's visit table is the prelude, the core's passes and the coda.
+        table_ok: bool,
+        /// The graph step is the eager one over set `a`'s first greedy ids.
+        eager_ok: bool,
+    }
+
+    /// The folder `BLOOMERY_INK2_VARLOOP` names, `None` where the clause is not asked for.
+    fn varloop_dir() -> Result<Option<PathBuf>, GateError> {
+        match std::env::var_os(VARLOOP_ENV) {
+            None => Ok(None),
+            Some(d) if d.is_empty() => Ok(None),
+            Some(d) => {
+                let dir = PathBuf::from(d);
+                if dir.is_dir() {
+                    Ok(Some(dir))
+                } else {
+                    Err(
+                        format!("{NAME}: {VARLOOP_ENV}={} is not a directory", dir.display())
+                            .into(),
+                    )
+                }
+            }
+        }
     }
 
     /// The folder `--folder` names.
@@ -297,6 +373,220 @@ mod gate {
         Ok(pass)
     }
 
+    /// The visits of the variable loop at `passes`: the prelude once, each pass of the core one
+    /// after another, the coda once; a visit is its stored layer and the pass it runs in.
+    fn varloop_table(passes: usize) -> Vec<(u32, u32)> {
+        let (start, end) = VARLOOP_CORE;
+        let mut table: Vec<(u32, u32)> = (0..start).map(|l| (l, 0)).collect();
+        for pass in 0..passes {
+            table.extend((start..end).map(|l| (l, pass as u32)));
+        }
+        table.extend((end..VARLOOP_LAYERS).map(|l| (l, 0)));
+        table
+    }
+
+    /// `m` run greedy over `prompt` for `n` ids.
+    fn greedy_ids(m: &mut GpuModel<Body>, prompt: &[u32], n: usize) -> Result<Vec<u32>, GateError> {
+        m.reset()?;
+        let mut ids = vec![m.step(prompt)?];
+        while ids.len() < n {
+            let last = ids[ids.len() - 1];
+            ids.push(m.step(&[last])?);
+        }
+        Ok(ids)
+    }
+
+    /// `m`'s argmax at each position of `prompt` then `ids`, fed back (`ids[i]` after `ids[..i]`):
+    /// how many of the `ids.len()` positions argmax `ids` itself.
+    fn forced_matches(
+        m: &mut GpuModel<Body>,
+        prompt: &[u32],
+        ids: &[u32],
+    ) -> Result<(usize, usize), GateError> {
+        m.reset()?;
+        let mut matches = usize::from(m.step(prompt)? == ids[0]);
+        for w in ids.windows(2) {
+            matches += usize::from(m.step(&[w[0]])? == w[1]);
+        }
+        Ok((matches, ids.len()))
+    }
+
+    /// The variable-loop folder `dir` opened at `(label, asked)` passes, run over the sets, with
+    /// the 3-pass arm's ids (`base`, once that arm has run) teacher-forced.
+    fn varloop_arm(
+        dir: &Path,
+        (label, asked): (&'static str, Option<usize>),
+        sets: &[Set],
+        base: Option<&[Vec<u32>]>,
+    ) -> Result<VarArm, GateError> {
+        let t = std::time::Instant::now();
+        let opened = model_hf::arch::inkling2::open_passes(dir, true, asked)
+            .map_err(|e| format!("{NAME}: {} at {label}: {e}", dir.display()))?;
+        let types = opened
+            .header
+            .iter_tensors()
+            .map(|(_, t)| (t.name.clone(), t.ty))
+            .collect();
+        let model = Folder::new(opened.header, opened.source);
+        let mut m = GpuModel::<Body>::open(Gpu::new()?, model, CTX)?;
+        let (passes, visits, stored) = {
+            let body = m.body(NAME)?;
+            (
+                body.passes(),
+                body.visit_table().len(),
+                body.stored_layers(),
+            )
+        };
+        let resident = m.resident_bytes();
+        println!(
+            "varloop arm={label} plan: passes={passes} visits={visits} stored={stored} \
+             resident_bytes={resident} ctx={CTX} loaded in {:.1} s",
+            t.elapsed().as_secs_f64()
+        );
+        let table = m.body(NAME)?.visit_table();
+        let table_ok = table == varloop_table(passes);
+        if !table_ok {
+            println!("varloop arm={label}: the visit table is not the loop's: {table:?}");
+        }
+        let mut arm = VarArm {
+            label,
+            passes,
+            visits,
+            resident,
+            types,
+            runs: Vec::new(),
+            forced: Vec::new(),
+            row: Vec::new(),
+            table_ok,
+            eager_ok: true,
+        };
+        for s in sets {
+            m.set_mode(StepMode::Graph);
+            if s.label == "a" {
+                m.reset()?;
+                m.step(&s.prompt)?;
+                let row = m.logits()?;
+                arm.row = row[..s.logits.len()].to_vec();
+            }
+            let ids = greedy_ids(&mut m, &s.prompt, VARLOOP_IDS)?;
+            if s.label == "a" {
+                // The eager chain is the captured one over the first ids (the e2e gate pins it
+                // at the Mini's three passes; another count captures its own node count).
+                m.set_mode(StepMode::Eager);
+                let eager = greedy_ids(&mut m, &s.prompt, VARLOOP_EAGER_IDS)?;
+                m.set_mode(StepMode::Graph);
+                arm.eager_ok = eager == ids[..VARLOOP_EAGER_IDS];
+                println!(
+                    "varloop arm={label} set=a graph=eager over {VARLOOP_EAGER_IDS} ids: {}",
+                    arm.eager_ok
+                );
+                println!("first_ids arm={label} set=a ours {:?}", &ids[..FIRST_IDS]);
+            }
+            if let Some(base) = base {
+                let reference = &base[arm.runs.len()];
+                let (matches, n) = forced_matches(&mut m, &s.prompt, reference)?;
+                let free = ids
+                    .iter()
+                    .zip(reference)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                println!(
+                    "varloop arm={label} set={} agree_forced={matches}/{n} first_divergence={free} \
+                     of {VARLOOP_IDS} (the 3-pass arm's ids)",
+                    s.label
+                );
+                arm.forced.push((matches, n));
+            }
+            arm.runs.push(ids);
+        }
+        Ok(arm)
+    }
+
+    /// Clause `varloop_follows_the_pass_count` over the variable-loop folder `dir`.
+    fn varloop_follows_the_pass_count(dir: &Path, sets: &[Set]) -> Result<bool, GateError> {
+        if !tier::run_clause("varloop_follows_the_pass_count", Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let mut arms: Vec<VarArm> = Vec::new();
+        for arm in VARLOOP_ARMS {
+            let base = arms
+                .iter()
+                .find(|a| a.label == "p3")
+                .map(|a| a.runs.as_slice());
+            let next = varloop_arm(dir, arm, sets, base)?;
+            arms.push(next);
+        }
+        let by = |label: &str| arms.iter().find(|a| a.label == label).unwrap();
+        let (own, p3, p2, p1) = (by("default"), by("p3"), by("p2"), by("p1"));
+        let mut pass = true;
+        for (a, (_, asked)) in arms.iter().zip(VARLOOP_ARMS) {
+            let want = asked.unwrap_or(3);
+            let ok = a.passes == want
+                && a.visits == 12 + 12 * want
+                && a.table_ok
+                && a.eager_ok
+                && a.runs.iter().all(|r| r.len() == VARLOOP_IDS);
+            println!(
+                "varloop_follows_the_pass_count arm={} passes={} (want {want}) visits={} (want {}) \
+                 table={} graph=eager {} {}",
+                a.label,
+                a.passes,
+                a.visits,
+                12 + 12 * want,
+                a.table_ok,
+                a.eager_ok,
+                verdict(ok)
+            );
+            pass &= ok;
+        }
+        let grows = p1.resident < p2.resident && p2.resident < p3.resident;
+        println!(
+            "varloop_follows_the_pass_count resident p1={} < p2={} < p3={} {}",
+            p1.resident,
+            p2.resident,
+            p3.resident,
+            verdict(grows)
+        );
+        pass &= grows;
+        let same_load = own.types == p3.types
+            && own.resident == p3.resident
+            && own.runs == p3.runs
+            && own.row == p3.row;
+        println!(
+            "varloop_follows_the_pass_count default == p3: types {} resident {} ids {} logits {} {}",
+            own.types == p3.types,
+            own.resident == p3.resident,
+            own.runs == p3.runs,
+            own.row == p3.row,
+            verdict(same_load)
+        );
+        pass &= same_load;
+        let differ = |a: &VarArm, b: &VarArm| {
+            !a.row.is_empty() && a.row.len() == b.row.len() && a.row != b.row
+        };
+        let reached = differ(p1, p2) && differ(p2, p3) && differ(p1, p3);
+        println!(
+            "varloop_follows_the_pass_count logits differ p1/p2 {} p2/p3 {} p1/p3 {} {}",
+            differ(p1, p2),
+            differ(p2, p3),
+            differ(p1, p3),
+            verdict(reached)
+        );
+        pass &= reached;
+        for a in [p2, p1] {
+            let (m, n) = a
+                .forced
+                .iter()
+                .fold((0, 0), |(m, n), (x, y)| (m + x, n + y));
+            println!(
+                "varloop arm={} teacher-forced top-1 agreement with p3: {m}/{n} over {} sets",
+                a.label,
+                a.forced.len()
+            );
+        }
+        Ok(pass)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let tier = Tier::from_env()?;
         if !matches!(tier, Tier::Real) {
@@ -321,6 +611,12 @@ mod gate {
             arms.push(facts);
         }
         ok &= arms_differ_in_bytes(&arms[0], &arms[1])?;
+        match varloop_dir()? {
+            Some(dir) => ok &= varloop_follows_the_pass_count(&dir, &sets)?,
+            None => {
+                println!("varloop_follows_the_pass_count: deferred by name: {VARLOOP_ENV} is unset")
+            }
+        }
         println!("{}", tier::tally_line());
         if !ok {
             return Err(checks_failed());

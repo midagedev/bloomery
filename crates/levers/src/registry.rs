@@ -64,6 +64,10 @@ pub const SCHEMAJUMP: &str = "BLOOMERY_SCHEMAJUMP";
 pub const PREPARE_Q8: &str = "BLOOMERY_PREPARE_Q8";
 pub const AUTOTUNE: &str = "BLOOMERY_AUTOTUNE";
 pub const INK2_DENSE: &str = "BLOOMERY_INK2_DENSE";
+pub const INK2_PASSES: &str = "BLOOMERY_INK2_PASSES";
+
+/// The largest `BLOOMERY_INK2_PASSES`: the passes the variable-loop checkpoint was trained on.
+pub const INK2_PASSES_MAX: u64 = 5;
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -1549,6 +1553,31 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
+        name: INK2_PASSES,
+        class: Class::C,
+        kind: Kind::Count {
+            min: 1,
+            max: INK2_PASSES_MAX,
+            trim: false,
+        },
+        default: Unset::Means("the folder's own `num_passes`"),
+        doc: "Inkling 2's official checkpoint folder of a variable loop \
+              (`loop_config.is_varloop: true`, thinkingmachines' `TML-d24-varloop-research`): the \
+              passes its middle layers run, 1 to 5 (the checkpoint was trained on those, post-trained \
+              at 3, its `num_passes`; the card warns of unpredictable output at another count). \
+              A pass past the first merges the previous pass's banked blocks into each core \
+              sublayer's input through the same message queries and controllers, so every count \
+              reads the one set of weights; each pass keeps its own cache slots, so a step walks \
+              `12 + 12 · passes` visits and the KV stores grow with it, and one pass has no \
+              message at all. A folder of a fixed loop (the Mini) and a GGUF file refuse the lever \
+              by name. Unset runs the folder's `num_passes`. Read where the folder opens \
+              (`model_hf::arch::inkling2::open_passes`); the `load` line prints `passes=`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
         name: "BLOOMERY_POISON",
         class: Class::D,
         kind: Kind::Flag,
@@ -2187,6 +2216,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "BLOOMERY_INK2_OFFICIAL",
         None,
         "The official Inkling 2 Mini checkpoint folder (NVFP4 and MXFP8 experts, BF16 dense) the folder reader's gate and the card's official-folder gate open; each gate is deferred by name where it is unset.",
+    ),
+    path(
+        "BLOOMERY_INK2_VARLOOP",
+        None,
+        "The thinkingmachines `TML-d24-varloop-research` checkpoint folder (the variable-loop sibling of the Mini) the card's official-folder gate also opens, at its own count and at three, two and one passes; the clause is deferred by name where it is unset.",
     ),
     path(
         "BLOOMERY_INK2_GGUF",

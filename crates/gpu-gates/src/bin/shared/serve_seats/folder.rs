@@ -89,14 +89,23 @@ pub fn open(dir: &Path, _arch: &str) -> Result<Opened, GateError> {
 }
 
 /// [`open`], with each BF16 or F32 matrix the map reads as Q8_0 written as Q8_0 at load where `q8`
-/// asks (`model_hf::folder::open_with`), every other part as stored.
+/// asks (`model_hf::folder::open_with`), every other part as stored, and an Inkling 2 folder's
+/// loop run at `passes` passes where one is asked (`model_hf::arch::inkling2::open_passes`).
 #[cfg(feature = "checkpoint")]
-pub fn open_with(dir: &Path, arch: &str, q8: bool) -> Result<Opened, GateError> {
-    if !q8 {
+pub fn open_with(
+    dir: &Path,
+    arch: &str,
+    q8: bool,
+    passes: Option<usize>,
+) -> Result<Opened, GateError> {
+    if !q8 && passes.is_none() {
         return open(dir, arch);
     }
-    let f = model_hf::folder::open_with(dir, true)
-        .map_err(|e| format!("checkpoint folder {}: {e}", dir.display()))?;
+    let f = match passes {
+        None => model_hf::folder::open_with(dir, true),
+        Some(_) => model_hf::arch::inkling2::open_passes(dir, q8, passes),
+    }
+    .map_err(|e| format!("checkpoint folder {}: {e}", dir.display()))?;
     let f = held(dir, f, arch, &[])?;
     Ok(Opened {
         header: f.header,
@@ -107,7 +116,12 @@ pub fn open_with(dir: &Path, arch: &str, q8: bool) -> Result<Opened, GateError> 
 
 /// A checkpoint folder in a build without the `checkpoint` feature, refused by name.
 #[cfg(not(feature = "checkpoint"))]
-pub fn open_with(dir: &Path, _arch: &str, _q8: bool) -> Result<Opened, GateError> {
+pub fn open_with(
+    dir: &Path,
+    _arch: &str,
+    _q8: bool,
+    _passes: Option<usize>,
+) -> Result<Opened, GateError> {
     Err(without_checkpoint(dir))
 }
 

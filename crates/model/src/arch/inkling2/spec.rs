@@ -117,9 +117,15 @@ pub const AVAILABLE: &[Available] = &[
     },
     Available {
         programs: &[Program::Inkling2Body],
-        at: "gpu/src/loop_control.rs and gpu/src/arch/inkling2/body.rs (the core's three passes: \
-             each pass its own slots, the message controllers over the banked blocks)",
-        runs: |n| matches!(n, Need::Loop { passes: 3 }),
+        at: "gpu/src/loop_control.rs and gpu/src/arch/inkling2/body.rs (the core's passes, two to \
+             the five the variable loop was trained on: the walk is the visits table, each pass \
+             its own slots, the message controllers over the banked blocks)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Loop { passes } if (2..=bloomery_levers::INK2_PASSES_MAX as u32).contains(passes)
+            )
+        },
     },
     Available {
         programs: &[Program::Inkling2Body],
@@ -470,9 +476,9 @@ mod tests {
     /// The rows are the kernels' instances, at the Mini's, the fixture's and the Small's widths:
     /// the rel-bias head of 128 values over groups of 3 or 6 (windowed at 1024 or over every
     /// key, bias bank 16 x 1024), 4-tap convs, the block mix of 6 at one query or three, the
-    /// 128- and 384-expert top-8 routers, the situ routed experts, the loop of 3 passes and the
-    /// softcap at 30. Any other width is no row's. Mutants: the group row narrowed to 3, the
-    /// 384 row removed.
+    /// 128- and 384-expert top-8 routers, the situ routed experts, the loop of two to five passes
+    /// and the softcap at 30. Any other width is no row's. Mutants: the group row narrowed to 3, the
+    /// 384 row removed, the loop row held to 3 passes.
     #[test]
     fn the_rows_are_the_kernels_instances() {
         use models::shape::{MoeShape, rules};
@@ -522,7 +528,9 @@ mod tests {
             },
             mix(6, 1),
             mix(6, 3),
+            Need::Loop { passes: 2 },
             Need::Loop { passes: 3 },
+            Need::Loop { passes: 5 },
             epilogue(1.0, 30.0),
         ] {
             assert!(runs(&n), "{n} is the kernels'");
@@ -544,7 +552,9 @@ mod tests {
             },
             mix(8, 1),
             mix(6, 2),
-            Need::Loop { passes: 2 },
+            // One pass is no loop (its header carries none); six is past the trained range.
+            Need::Loop { passes: 1 },
+            Need::Loop { passes: 6 },
             epilogue(1.0, 20.0),
             epilogue(2.0, 30.0),
         ] {

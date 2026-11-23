@@ -1078,6 +1078,12 @@ impl Body {
         self.visits.iter().map(|v| (v.layer, v.pass)).collect()
     }
 
+    /// The passes the core runs, 1 where the trunk has no loop.
+    #[must_use]
+    pub fn passes(&self) -> usize {
+        self.hp.loop_.map_or(1, |lp| lp.passes)
+    }
+
     /// Whether stored layer `l`'s input norms and projections run as one launch (`norm_proj`) on
     /// a step without the imatrix collector.
     #[must_use]

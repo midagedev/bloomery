@@ -105,6 +105,7 @@ crates/metal/src/stream.rs	BLOOMERY_METAL_BREADCRUMB	stays: the Metal crash brea
 crates/hf/src/vocab/tiktoken/tests.rs	BLOOMERY_KIMI_K3_HF,BLOOMERY_KIMI_K3_GGUF	stays: the Kimi-K3 folder and the K3 GGUF header the vocabulary gate reads (cfg(test) only)
 crates/hf/src/dspark/inkling2.rs	BLOOMERY_INKLING2_HF	stays: the Inkling 2 Mini folder whose config.json and mtp.safetensors header the draft gate reads (cfg(test) only)
 crates/model-hf/src/arch/inkling2.rs	BLOOMERY_INK2_OFFICIAL,BLOOMERY_INK2_GGUF	stays: the official Inkling 2 Mini folder and its GGUF twin the folder reader's gate reads (cfg(test) only)
+crates/gpu-gates/src/bin/gate_inkling2_official.rs	BLOOMERY_INK2_VARLOOP	stays: the variable-loop sibling folder the official gate's pass-count clause opens (deferred by name where unset)
 crates/gpu-gates/src/bin/gate_iq_quant.rs	K3Q_TREE,K3Q_FIXTURE	stays: the llama.cpp tree whose llama-quantize the gate compares with, and the K3 fixture it quantizes
 crates/gpu-gates/src/bin/gate_kimi_k3_imatrix.rs	K3Q_TREE	stays: the llama.cpp tree whose llama-imatrix and llama-quantize the gate compares with
 crates/gpu-gates/src/bin/shared/ds41_imatrix_gate.rs	IK	stays: the ik tree whose llama-imatrix the gate compares with

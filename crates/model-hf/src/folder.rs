@@ -408,7 +408,7 @@ pub fn read_staged<M: FolderMap>(
 }
 
 /// A folder's config, read.
-fn read_config(dir: &Path) -> Result<Json, Error> {
+pub(crate) fn read_config(dir: &Path) -> Result<Json, Error> {
     read_json(&dir.join("config.json"))
 }
 

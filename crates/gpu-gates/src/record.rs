@@ -2665,13 +2665,14 @@ pub static LISTENING_RAON1: Kind = Kind {
 pub static LOAD_INKLING2: Kind = Kind {
     name: "load_inkling2",
     head: "load",
-    doc: "The inkling2 seat's model on its card: its architecture, resident bytes (the weights, the stores of `ctx` rows a visit and the step's scratch), the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`: one, the body has no more), the stored layers, the visits the walk makes over them (a looped trunk's core layers are visited more than once), the step graph's nodes, and the load's wall.",
+    doc: "The inkling2 seat's model on its card: its architecture, resident bytes (the weights, the stores of `ctx` rows a visit and the step's scratch), the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`: one, the body has no more), the stored layers, the passes the core runs (1 where the trunk has no loop), the visits the walk makes over them (a looped trunk's core layers are visited once a pass), the step graph's nodes, and the load's wall.",
     parts: &[
         key("arch", Word, ""),
         key("resident_bytes", U64, "B"),
         key("ctx", U64, "positions"),
         key("slots", U64, ""),
         key("layers", U64, ""),
+        key("passes", U64, ""),
         key("visits", U64, ""),
         key("graph_nodes", U64, ""),
         lit(" in "),

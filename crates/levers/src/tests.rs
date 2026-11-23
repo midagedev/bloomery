@@ -713,7 +713,8 @@ fn accessors_read_their_rows() {
             SCHEMAJUMP,
             PREPARE_Q8,
             AUTOTUNE,
-            INK2_DENSE
+            INK2_DENSE,
+            INK2_PASSES
         ]
     );
 }
@@ -736,6 +737,28 @@ fn ink2_dense_takes_bf16_or_q8_0_and_refuses_the_rest() {
             text.contains(INK2_DENSE) && text.contains("one of bf16, q8_0"),
             "{text}"
         );
+    }
+}
+
+/// `BLOOMERY_INK2_PASSES` is no count unset (the folder's own `num_passes`),
+/// takes the counts 1 to [`INK2_PASSES_MAX`], and refuses a count outside them
+/// and a word that is no count, by name.
+#[test]
+fn ink2_passes_takes_one_to_five_and_refuses_the_rest() {
+    let passes = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.ink2_passes());
+    assert_eq!(passes(&[]).unwrap(), None);
+    for n in 1..=INK2_PASSES_MAX {
+        let word = n.to_string();
+        assert_eq!(
+            passes(&[(INK2_PASSES, word.as_str())]).unwrap(),
+            Some(n as usize)
+        );
+    }
+    for bad in ["0", "6", "-1", "two", ""] {
+        let Err(e) = passes(&[(INK2_PASSES, bad)]) else {
+            panic!("{bad:?} is not a count of the row and must be refused");
+        };
+        assert!(e.to_string().contains(INK2_PASSES), "{e}");
     }
 }
 
