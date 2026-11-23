@@ -1,0 +1,59 @@
+# Round pinab: the cuda-oxide pin move (9df9e7ce -> ab2b6738a, tree bloomery-pinmove) against main 0f59b0095
+# (bloomery-pinab-base), Inkling 2 Mini UD-Q4_K_XL on the one RTX 5090, one lease, tools/ref/depth-serve.sh.
+# [derived] what the prompt pass runs. The Mini's file holds NVFP4 routed experts in 20 of its 24 blocks (44 of
+# 48 visits), Q8_0 routed experts in 4 blocks and Q8_0 dense projections everywhere (the file's types, read from
+# its header: 11.47 GB NVFP4, 6.00 GB Q8_0, no K-quant). A prompt is passes of 512 rows (place::PASS_ROWS), so a
+# pass has 4096 routed slots over 128 experts: the Q8_0 route GEMM takes the plain gemm_q8_0p_swiglu_all, never
+# gemm_q8_0p_slab_swiglu_all (its rule wants n_slots > 64 x n_experts = 8192), so that kernel's 8 -> 64 B spill
+# rise is not run here, at P = 512 or 4096. Of the 11 rising rows (pinspill) this model runs ONE: gemm_nvfp4p
+# (spill 64 -> 72 B, JIT local 32 -> 40 B: the p3:32 datalayout adds 16 B, the llc short-ptr takes 8 B off).
+# [derived] its share. Wall of a 512-row pass 103.2 ms [measured: README 0.3.16, 4,962.77 tok/s at P = 512].
+# ink2r5's timeline (derived there): GEMMs 85 of 110 ms = 0.77, elementwise 0.09, attention 0.02-0.07,
+# controllers and router ~0.01; DRAM 17 ms (31 GB at 1.79 TB/s) and host launches 7 ms both under the GEMMs. The
+# GEMMs' FLOPs split 6.12 (routed) : 2.58 (dense) GFLOP a token, so the NVFP4 route GEMMs hold 0.77 x 0.70 x 44/48
+# = 0.50 of the pass, the Q8_0 routed 0.04, the dense Q8_0 projections 0.23. P = 4096 is 8 such passes plus the
+# attention's growth: the shares move by under 0.03.
+# [derived] the rise's effect. A spill of +8 B is two more 4-byte slots: at most two more LDL per k-step of a loop
+# of ~300-700 instructions, +0.3..+0.7 % instructions, 0 if hidden. The same pin shortens the shared-memory address
+# math of every hot loop (gemm_q6k's loop: -78 instructions against +22 local ops, pinspill's static SASS; the
+# NVFP4 loop was not counted). Measured elasticity of this kernel family: q3gemmb cut gemm_q4k's warp-step
+# instructions by 23-29 % and the prompt paid +10.8 % (P = 4096) and +13.3 % (512) against the model's +18..+24 %,
+# about half of the instruction cut reaches the step (rig-log 09-26#q3gemmb-ab); lever A's byte cut paid 0. So
+# the kernel moves by 0.5 x (instruction change) with the local ops counted as instructions: -1..+0.7 % of the
+# kernel if the short-ptr math is not shorter in the NVFP4 loop, up to -3 % (a faster kernel) if it is as short
+# as q6k's. Pass effect = 0.50 x (-0.7..+3) % = -0.35..+1.5 %; the kernels that only moved registers (gemm_q8_0p
+# 106 -> 104, gemm_q8_0p_swiglu_all 110 -> 108, ptxas sm_86 columns; 0.27 of the pass) add -0.05..+0.05.
+# Expected +0.3, band -0.4..+1.5. It holds 0, so it is a noninf card: the tree must not be slower than the
+# base by more than the margin.
+# Decode (the same rows, tg tok/s at D = 512 and 4096): the graph replay holds no cuda-core op; what the pin move
+# can add per token is the host side of the step's `copy_from_host` calls (the token/position words, tau: 2-3 a
+# step) if cuda-core's copy now creates and records an event: 2-3 ops x 5-10 us = 10-30 us on a 6.44 ms step
+# [derived; the pinmove report's bound, <= 0.3 %], and no changed decode kernel moves a byte or a launch.
+# Predicted -0.4..+0.1 %; the tg rows' interval at 14 rounds is +-0.63 % (sd 0.77 %), so they screen for a loss
+# past 1 % and decide nothing for the 0.3 % term, which needs ~100 rounds.
+kind: noninf
+question: does the cuda-oxide pin move (32-bit shared pointers, the short-ptr spill rises in the prompt GEMMs) leave
+  the Inkling 2 Mini prompt pass no more than 0.5 % slower on the one RTX 5090?
+term: pp tok/s @ P = 512 and 4096, bloomery-serve at the serving defaults, Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090
+  600 W, tree bloomery-pinmove (ab2b6738a) against base bloomery-pinab-base (0f59b0095), (tree - base) / base per
+  round; tg tok/s @ D = 512 and 4096 in the same rows
+unit: %
+predict: -0.4..+1.5
+rounds: 14
+sd: 0.07 % pp, the Mini's per-arm SD 0.05-0.07 % over 8 rounds in the ink2loop-ab2 sitting (4 arms of this runner,
+  ROW lines of 2026-11-23); tg's SD there was 0.23-0.85 %
+margin: 0.5 % the pin's rises are accepted as PIN rows only if the pass does not lose more than this: 7 times the
+  ruler at 14 rounds (+-0.07 %), and half the 1 % AGENTS.md calls the same-binary floor of a dispatch change
+condition: one lease (BLOOMERY_MODEL=inkling2 BLOOMERY_AB_ROUNDS=14 just depth-serve bloomery-pinab-base:512
+  bloomery-pinmove:512 bloomery-pinab-base:4096 bloomery-pinmove:4096), both bloomery-serve binaries built on the
+  box from their trees beforehand, the 5090 alone (no ComfyUI, nvidia-smi compute list empty before the lease),
+  order rotated every round; rows carrying [cpu-busy] are counted but listed per arm (other rounds' builds and
+  gates run beside the lease: they must be symmetric across the arms), no [other-busy] row, no [cold] row
+decide-in: pp is not slower beyond the margin: the provisional PIN rows of the rises this model runs (gemm_nvfp4p,
+  gemm_nvfp4p_bf16) stand, each PIN line gains "pp A/B Inkling UD-Q4_K_XL P=512 +x.xx % +- y.yy, P=4096 ..." in
+  one line
+decide-below: pp lost more than 0.4 %: name the kernel (only gemm_nvfp4p's +8 B spill and the register-only moves
+  are in this pass) and take its share from an nsys of one pass before any lever; try the no-short-ptr llc wrapper
+  only as a measured arm
+decide-above: pp gained more than 1.5 %: the shorter shared-pointer address math paid more than half an
+  instruction cut; the pins stand, record the gain as the finding and re-derive the instruction term

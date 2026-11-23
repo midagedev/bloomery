@@ -1,0 +1,42 @@
+# Round pinab: the cuda-oxide pin move (tree bloomery-pinmove, ab2b6738a) against main 0f59b0095 (bloomery-pinab-base),
+# Inkling 2 Mini's official checkpoint folder (/models/Inkling-2-Mini: NVFP4 routed experts in all 24 blocks, the
+# dense matrices written as Q8_0 at load: BLOOMERY_INK2_DENSE's default) on the one RTX 5090, one lease,
+# tools/ref/depth-serve.sh. The second NVFP4 prompt-pass row of the pin move (the release table's "official
+# checkpoint folder" row: 3,818.15 / 3,703.65 tok/s at P = 512 / 4096, README 0.3.16).
+# [derived] what runs. The folder has no K-quant, no Q8_0 experts and, at the default, no MXFP8 site (its dense
+# weights are BF16 as stored and become Q8_0 at load; `Planes::E4m3` / mxfp8_w8a8_norm_gate needs a stored MXFP8
+# weight, site.rs:1614 and :1771): of the 11 rising rows it runs gemm_nvfp4p (spill 64 -> 72 B, JIT local 32 -> 40)
+# and no other. So there is no cheap MXFP8 prompt-pass model on this box: mxfp8_w8a8_norm_gate's rise (288 -> 336 B)
+# stays covered by the scan pins only, and its model is the V4.1 engram path, whose prompt is host-bound.
+# [derived] share and effect: as pinab-ink2.card, with all 44-48 visits' routed GEMMs NVFP4: gemm_nvfp4p holds
+# 0.77 x 0.70 = 0.54 of a pass, the same instruction elasticity (about half of an instruction cut reaches the
+# step: q3gemmb) and the same two extra spill slots. Pass effect = 0.54 x (-0.7..+3) % = -0.4..+1.6 %, expected
+# +0.3. The folder's pass is 134 ms against the file's 103 ms (the same README rows), an unexplained 31 ms a pass
+# that is not in this derivation: the share may be lower (if the extra is outside the GEMMs) -> the band's upper
+# edge is an upper bound, the lower one holds either way.
+# Decode: as the file's (the graph replay, 153.82 tok/s at depth 512), predicted -0.4..+0.1 %.
+kind: noninf
+question: does the cuda-oxide pin move leave the Inkling 2 Mini official-folder prompt pass no more than 0.6 %
+  slower on the one RTX 5090?
+term: pp tok/s @ P = 512 and 4096, bloomery-serve at the serving defaults, BLOOMERY_MODEL=inkling2 with
+  BLOOMERY_REF_MODEL=/models/Inkling-2-Mini (the official folder), RTX 5090 600 W, tree bloomery-pinmove (ab2b6738a)
+  against base bloomery-pinab-base (0f59b0095), (tree - base) / base per round; tg tok/s @ D = 512 and 4096 in
+  the same rows
+unit: %
+predict: -0.4..+1.6
+rounds: 10
+sd: 0.10 % pp, the file's 0.07 % (ink2loop-ab2 sitting, 8 rounds) widened for a folder load (no run of the folder
+  under this runner has a recorded SD)
+margin: 0.6 % one kernel's rise: 6 times the ruler at 10 rounds (+-0.10 %), a bit over the 0.5 % of the file's card
+  because this ruler is wider
+condition: one lease (BLOOMERY_BOX_ENV='BLOOMERY_REF_MODEL=/models/Inkling-2-Mini' BLOOMERY_MODEL=inkling2
+  BLOOMERY_AB_ROUNDS=10 just depth-serve bloomery-pinab-base:512 bloomery-pinmove:512 bloomery-pinab-base:4096
+  bloomery-pinmove:4096), both bloomery-serve binaries built on the box beforehand, the 5090 alone (no ComfyUI),
+  order rotated every round; the folder's load per row is read as load_s (a [cold] row is out of the means);
+  [cpu-busy] rows listed per arm and symmetric, no [other-busy] row
+decide-in: pp is not slower beyond the margin: the gemm_nvfp4p and gemm_nvfp4p_bf16 PIN rows stand (their lines
+  carry both A/Bs: the file's and the folder's)
+decide-below: pp lost more than 0.4 % on the folder but the file's A/B held: the 31 ms a pass the derivation does not
+  hold is in a kernel the pin move changed (list the folder's pass by nsys before any lever)
+decide-above: pp gained more than 1.6 %: the folder's NVFP4 loop is where the shorter address math paid; the pins
+  stand, record the gain

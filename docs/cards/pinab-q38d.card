@@ -1,0 +1,55 @@
+# Round pinab: the cuda-oxide pin move (tree bloomery-pinmove, ab2b6738a) against main 0f59b0095 (bloomery-pinab-base),
+# Qwen3.8-27B Q4_K_M (dense, qwen35 arch) on the one RTX 5090, one lease, tools/ref/depth-serve.sh.
+# [derived] why this model. The risen prompt GEMMs are gemm_q6k and gemm_q6k_bf16 (spill 532 -> 692 B, JIT local
+# 64 -> 72: the largest rise of the 11) and gemm_q4k_swiglu (208 -> 324). gemm_q4k_swiglu runs only for
+# SwigluSlots::Card (the tiered passes of qwen3moe/qwen35moe/qwen4exp with a host expert tier, crates/gpu/src/gemm/
+# grouped.rs enqueue_up_swiglu32, arch/qwen3moe/tier38.rs); every whole-card site (site.rs) passes SwigluSlots::All
+# and takes gemm_q4k plus a separate swiglu quantizer, so no whole-card model runs it and a card+CPU model hides it
+# under the host's expert time (the wall is the host's max): its rise is not measurable on this card and predicts 0
+# on a host-bound pass. gemm_q6k_bf16 is run by this dense model at every Q6_K site of its file (read from the
+# header: ffn_down Q6_K in 33 of 65 layers 2.41 GB, attn_qkv Q6_K in 24 layers 1.03 GB, attn_v Q6_K in 9; the
+# 1.04 GB Q6_K head runs for the last row only). The same Q6_K sits in a MoE (Ornith-1.5-35B-A3B: down experts in 21
+# layers) at the same MAC share, but its grouped GEMM at 16 slots an expert is tile-padded and noisier: the dense
+# model is the cleaner instrument.
+# [derived] the Q6_K share. Weights a pass runs: Q4_K 11.55 GB = 20.5 G weights, Q6_K 3.49 GB = 4.25 G weights, so
+# 17.2 % of the 24.75 G MACs a token are Q6_K. A 512-row pass is 25.3 TFLOP; the measured wall is 152.2 ms (3,364
+# tok/s at P = 512, generate_qwen3moe arms, docs of the q6fold round) = 166 TFLOP/s effective, DRAM 15 GB = 8.4 ms
+# (5.5 %): compute-bound, GEMMs ~0.88 of the pass. Q6_K per-MAC time r = 1.0..1.25 of Q4_K's (one macro), so the
+# gemm_q6k_bf16 share s = 0.88 x 0.172 r / (0.828 + 0.172 r) = 0.15..0.18.
+# [derived] the kernel's change. Static SASS of gemm_q6k (pinspill): the hot loop has 78 fewer instructions and 22
+# more local ops (net -56 of ~1,000 a warp-step: -5.6 %); the elasticity of this family is ~0.5 of an instruction
+# cut (q3gemmb: -23..-29 % instructions paid +10.8..13.3 % prompt, rig-log 09-26#q3gemmb-ab), so -2.8 % kernel time
+# if the local ops cost what other instructions cost; they go through the MIO queue, whose throttle was the largest
+# extra term of the step (+481 of +887 warp-cycles, q3gemmsrc), so +4 % kernel time if they cost double. Kernel
+# -3..+4 %; pass effect = -s x (kernel) = -0.7..+0.55 %, expected -0.1 %. Holds 0: a noninf card.
+# Decode (the same rows): dense gemv decode has no changed byte or launch; the host side of the step's copies,
+# 2-3 ops x 5-10 us on a ~11 ms step (87 tok/s), is <= 0.3 % [derived]: predicted -0.3..+0.1 %, a screen at this
+# card's round count.
+kind: noninf
+question: does the cuda-oxide pin move (the short-ptr spill rise of gemm_q6k_bf16, 532 -> 692 B) leave the
+  Qwen3.8-27B Q4_K_M prompt pass no more than 1 % slower on the one RTX 5090?
+term: pp tok/s @ P = 512 and 4096, bloomery-serve at the serving defaults, BLOOMERY_MODEL=qwen38d
+  (/models/Qwen3.8-27B/Qwen3.8-27B-Q4_K_M.gguf), RTX 5090 600 W, tree bloomery-pinmove (ab2b6738a) against base
+  bloomery-pinab-base (0f59b0095), (tree - base) / base per round; tg tok/s @ D = 512 and 4096 in the same rows
+unit: %
+predict: -0.7..+0.55
+rounds: 10
+sd: 0.15 % pp, twice the per-arm SD of the same model's pp at P = 512 (0.17-0.30 % min-to-max over 6 rounds, SD
+  about 0.08 %, the q6fold/q6cs/cs/v4 A/B logs of 2026-11, generate_qwen3moe arms) for the serve path's fresh
+  server a row
+margin: 1.0 % the loss a pin accepts for one kernel's rise: 6 times the ruler at 10 rounds (+-0.15 %), the same
+  1 % AGENTS.md calls the same-binary floor of a dispatch change, over the -0.85 % the derivation allows
+condition: one lease (BLOOMERY_MODEL=qwen38d BLOOMERY_AB_ROUNDS=10 just depth-serve bloomery-pinab-base:512
+  bloomery-pinmove:512 bloomery-pinab-base:4096 bloomery-pinmove:4096), both bloomery-serve binaries built on the
+  box beforehand, the 5090 alone (no ComfyUI), order rotated every round; the plan record identical in both
+  trees' rows (the runner fails a plan drift; the unset ctx rule picks 199,680 positions and ubatch 512 on this
+  card, `--plan` read before the lease); [cpu-busy] rows listed per arm and symmetric, no [other-busy] row, [cold]
+  rows out of the means by the runner
+decide-in: pp is not slower beyond the margin: the provisional PIN rows of gemm_q6k and gemm_q6k_bf16 stand, each
+  PIN line gains "pp A/B Qwen3.8-27B Q4_K_M P=512 +x.xx % +- y.yy, P=4096 ..." in one line; a row whose upper
+  interval edge is below 0 names its loss in that line
+decide-below: pp lost more than 1 %: gemm_q6k_bf16 is the only risen kernel this pass runs, so its +160 B spill
+  costs more than the instruction cut gives: take its time share from one nsys of a pass and try the llc wrapper
+  without --nvptx-short-ptr as a measured arm
+decide-above: pp gained more than 0.55 %: the shorter address math paid beyond the elasticity read; the pins
+  stand, record the gain
