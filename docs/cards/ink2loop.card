@@ -1,0 +1,40 @@
+# Inkling 2 Mini's loop controller at M = 1: its share of the decode step on the one RTX 5090 (round ink2loop).
+# [derived] per launch at M = 1 (crates/gpu/src/loop_control.rs at 4dca83255; Mini n = 2304, gate rank 64):
+#   production is already the split pair, not the one-block shape: down = ceil(64 / DOWN_OUTS) = 32 blocks a module (96 for the
+#   attention triple), out = ceil(2304 / OUT_COLS) = 36 blocks a module (108); `enqueue_single_block` is only the gate's bit reference.
+#   bytes: down 64 x 4608 x 4 = 1.18 MB of weights a module + 18.4 KB of staged row a block from L2; out 2 x 2304 x 64 x 4 = 1.18 MB.
+#   unit demands a ffn launch (attention x3): DRAM 1.18 MB at 1.79 TB/s = 0.66 us (1.98 us); issue ~700 instructions a dot warp on
+#   two warps a block = ~0.35 us; L2 staging 0.59 MB = <0.1 us. The kernel's cycles are ~6-7 us (the decode card's ~14 us a pair):
+#   the largest demand is 10 % of them, so a launch is latency the resident warps do not hide, not bytes.
+#   Little's law: the down launch has 32 blocks x 2 warps x 32 lanes x 16 loads x 4 B = 131 KB of weights in flight a round against a
+#   bandwidth-delay product of ~1.1 MB (1.79 TB/s x 0.6 us): 1.18 MB / 131 KB = 9 rounds + the 15-load tail = ~15 dependent
+#   load rounds x ~0.5 us = ~7 us. The out launch has 2304 threads x 8 steps x 2 x 4 B = 147 KB in flight: ~11 rounds = ~5 us.
+# [derived] launches: 24 message visits x (attention pair + feed-forward pair) = 48 pairs = 96 launches a token; at ~14 us a pair
+#   (ink2lc, docs/cards/inkling2-decode.card) = 0.67 ms = 10.4 % of the step (6.44 ms = 155.33 tok/s, 0.3.16 sitting, depth 512).
+#   The band below keeps 8..18 us a pair: 0.38..0.86 ms.
+# [derived] the lever (an order-preserving one, so the step gate's bit-identity clauses and the pp gate's control_rows stay the
+#   proof): the dot's loads issued in chunks of 48 a lane for the down launch (3 rounds, the first chunk issued before the staging
+#   barriers, which it does not depend on) and a thread's whole rank (64 gain + 64 forget) issued before its folds for the out
+#   launch, every fold still ascending. Rounds: down ~15 -> ~3 (one hidden under the staging), out ~11 -> ~2. A pair ~14 us ->
+#   ~6-8 us (the DRAM floor of an attention pair is 2 x 2 us): -6..-8 us x 48 pairs = -0.29..-0.38 ms = 4.5..5.9 % of the step,
+#   +4.7..+6.3 % tok/s. Banded +3..+6 % in the A/B card (docs/cards/ink2loop-ab.card) against the ruler of +-1.0 % at four rounds.
+#   A split-K merge (the spec's idea) is not taken: it changes the dot's float order, and gate_inkling2_pp's control_rows holds the
+#   rows form to the step pair bit for bit, so it would move two forms and a band for a gain the order-preserving form already has.
+kind: profile
+question: what do the loop controller's kernels (loop_control_down, loop_control_out, loop_control_out3) cost a decoded token of
+  Inkling 2 Mini in the graph replay on the one RTX 5090, and so what share of the step is that?
+term: sum of the loop_control_* kernels' durations a decode replay in us (nsys --cuda-graph-trace=node, 48 down launches, 24 out
+  and 24 out3 a replay) @ depth ~512, n = 128, bloomery-serve at the serving defaults, Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090,
+  the base build (4dca83255)
+unit: us
+predict: 380..860
+condition: one lease (lease-hold.sh), the 5090 alone (gpu-apps in the witness blocks lists no compute process but the server; ComfyUI
+  down), one bloomery-serve under nsys, one /completion of 512 prose ids and n_predict 128 (cache_prompt off), the replay windows
+  cut by the loop_control_down count (48 a replay) and checked against the request's predicted_n; the table prints each kernel's
+  launches, grid, mean us and the controller's pair spans (down start to out end) beside the replay's period
+decide-in: write the lever's gain from the measured pair (kernel us and span) in docs/cards/ink2loop-ab.card; build the tree with
+  the order-preserving form, run the step, pp, e2e and official-card gates, then the same-lease A/B at 512 and 4096 (>= 4 rounds)
+decide-below: under 190 us (3 % of the step): stop, report the measurement and the reason, no A/B; 190..380 us: scale the lever's
+  band by the measured pair and run the A/B only if its lower edge clears the ruler at the rounds the sitting can afford
+decide-above: over 860 us: the pair is slower than the latency model (a launch gap or a block-count effect is in it): read the
+  per-kernel grids and gaps before the lever, and re-derive the rounds a launch takes

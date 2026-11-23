@@ -1,0 +1,32 @@
+# Round ink2loop, fourth build. Build 3 (docs/cards/ink2loop-nsys-v3.card, band 440..580) measured 615.3 us a
+# replay: out 4.27 / 4.33 us as modelled (-2.5 us a launch), but down 8.43 / 8.60 us against the base's 7.52 /
+# 7.92 with 3 load rounds instead of ~24. ncu of the base and of build 3 agree: the dot region holds 67-70 % of
+# the sampled stalls in both (long scoreboard, 80 % and 89 %), and the dot's two warps are the only ones alive
+# in it, so it is ~90 % of a block's time. The term that was wrong is the load-round count: a dot's time does not
+# fall with fewer rounds. What is left that a launch's shape sets is the bytes one SM reads: 2 outputs x 18.4 KB
+# = 37 KB an SM on 32 SMs of 170.
+# [derived] build 4: the base's dot back (no chunks), the out change kept, and the down launch of one module
+# takes one output a block (DOWN_OUTS_SOLO): 64 blocks on 64 SMs, 18.4 KB an SM; the attention triple keeps two
+# (192 blocks of one would put 22 on SMs that already hold one, and the registers allow one block an SM). The
+# dot's bits do not move (a warp a dot, lanes ascending). If the dot is SM-bound, the dot part of 7.52 us
+# (about 4.5 us: the rest is the launch, the staging and the three barriers, ~3 us) halves: the ffn down is
+# 5.0..6.0 us; the attention down stays 7.9 (7.6..8.3). Sum 24 x (5.0..6.0 + 7.6..8.3 + 4.27 + 4.33) =
+# 509..550 us, banded 505..555. The null (no SM effect) is the base's down with the out change: 579.
+kind: profile
+question: what do the loop controller's kernels cost a decoded token of Inkling 2 Mini with the out change and
+  one down output a block on a one-module launch, on the one RTX 5090?
+term: sum of the loop_control_* kernels' durations a decode replay in us (nsys --cuda-graph-trace=node, 48
+  down, 24 out, 24 out3 launches a replay) @ depth ~512, n = 128, bloomery-serve at the serving defaults,
+  Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090, tree build 4 (base 698.5, build 1 659.0, build 3 615.3 us)
+unit: us
+predict: 505..555
+condition: one lease (lease-hold.sh), the 5090 alone, one bloomery-serve under nsys, one /completion of 512
+  prose ids and n_predict 128, tools/ref/ink2loop-nsys.sh, the table split by grid (down[64] the ffn launch)
+decide-in: down[64] at 5.0..6.0 us: the SM-bound reading holds; build 4 stays (the gates, FAIL-first and the
+  8-round A/B, docs/cards/ink2loop-ab2.card, +2.5..+3 %), and the out launch's own spreading (OUT_COLS 32 on a
+  one-module launch) goes to the report as the next lever
+decide-below: under 505 us: the down launch gains on the triple as well, so the SM reading is only part; build
+  4 stays, the report names the residue
+decide-above: over 555 us (579 is the null): the one-module spreading did not move the dot, so the SM reading
+  is wrong; take DOWN_OUTS_SOLO back to 2 (keep the out change, ~-119 us, ~+1.8 %), run the gates and the
+  A/B on that, and name the down launch's term as unexplained

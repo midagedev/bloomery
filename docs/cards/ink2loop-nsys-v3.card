@@ -1,0 +1,29 @@
+# Round ink2loop, third build. Build 2 (docs/cards/ink2loop-nsys-v2.card, band 420..560) measured 1041.6 us a
+# replay: down 16.05 / 18.74 us. The term that was wrong is the register file, not the load queue: ptxas
+# reports loop_control_down at 255 regs, 3336 B spill, jit_local 1016 (ptx-scan of gate_inkling2_step) for the
+# chunk of 144 (the chunk's 144 weights and its 144 shared reads live together, 288), so the dot ran through
+# local memory; build 1 spilled the same way, which is also its down +1.0..+2.4 us. Out (148 regs, no spill)
+# and out3 (155) are clean and read 4.3 us as modelled.
+# [derived] build 3: DOWN_CHUNK 48 (ptx-scan: 198 regs, 0 spill, 0 jit_local, no depot); the weights of the
+# first chunk are issued behind the staging loop, the other two chunks of the Mini's 144 are issued as the
+# loop reaches them (two exposed load rounds a launch, ~0.5 us each, against ~15 in the base). down: base 7.5
+# us - ~3.7 us of dot rounds saved ... : ffn ~5.0-6.5 us, attention ~5.5-7.5 us (3.54 MB drain 2 us in the
+# first chunk's shadow only in part); out 4.3 us measured. Sum 24 x (5.0..6.5 + 5.5..7.5) + 209 = 460..580 us,
+# banded 440..580 (the base minus the out change alone is 579).
+kind: profile
+question: what do the loop controller's kernels cost a decoded token of Inkling 2 Mini with the down launch's
+  chunk of 48 (no spill), on the one RTX 5090?
+term: sum of the loop_control_* kernels' durations a decode replay in us (nsys --cuda-graph-trace=node, 48
+  down, 24 out, 24 out3 launches a replay) @ depth ~512, n = 128, bloomery-serve at the serving defaults,
+  Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090, tree build 3 (base 698.5, build 1 659.0, build 2 1041.6 us)
+unit: us
+predict: 440..580
+condition: one lease (lease-hold.sh), the 5090 alone, one bloomery-serve under nsys, one /completion of 512
+  prose ids and n_predict 128, tools/ref/ink2loop-nsys.sh, the table split by grid
+decide-in: build 3 stays: the gates again on it, then the A/B (docs/cards/ink2loop-ab2.card, +2..+5 %, 8
+  rounds)
+decide-below: under 440 us: the down launch hides more than modelled; build 3 stays, the A/B's top is the
+  target
+decide-above: over 580 us (the base with the out change alone is 579): the down launch's chunks cost more than
+  the base's dot: take the down launch back to the base's code (keep the out change, ~-119 us, ~+1.8 %), run
+  the gates and the A/B on that

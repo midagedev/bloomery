@@ -1,0 +1,24 @@
+# Round ink2loop, the lever's tree build: the same nsys probe as docs/cards/ink2loop.card (which measured the
+# base at 698.5 us a replay: down 7.72, out 6.73, out3 6.94 us), now on the tree whose dot loads are all in
+# flight.
+# [derived] a launch is ~3 us of fixed cost plus the dot's remaining exposed load rounds: down 3.3-4.3 us
+# (x48), out/out3 3.2-4.3 us (x48): 6.5-8.6 us a pair x 48 = 312-413 us a replay; the A/B card's gain
+# (-0.29..-0.39 ms) is the difference from 698.5.
+kind: profile
+question: what do the loop controller's kernels cost a decoded token of Inkling 2 Mini after the
+  order-preserving all-loads-in-flight change, on the one RTX 5090?
+term: sum of the loop_control_* kernels' durations a decode replay in us (nsys --cuda-graph-trace=node, 48
+  down, 24 out, 24 out3 launches a replay) @ depth ~512, n = 128, bloomery-serve at the serving defaults,
+  Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090, tree build bloomery-ink2loop
+unit: us
+predict: 300..430
+condition: one lease (lease-hold.sh), the 5090 alone, one bloomery-serve under nsys, one /completion of 512
+  prose ids and n_predict 128, tools/ref/ink2loop-nsys.sh as for the base; the A/B of
+  docs/cards/ink2loop-ab.card has run in the same session
+decide-in: the A/B's gain is the controller's: -0.27..-0.40 ms a token; report the per-kernel move beside the
+  A/B effect
+decide-below: under 300 us: the launches are nearer their DRAM floor than modelled (an attention pair is 4 us
+  of bytes): the A/B reads at the top of its band or above; note which launch moved most
+decide-above: over 430 us: some load rounds remain (the staging chain or an L1 miss limit): read the
+  per-kernel table (down vs out, ffn vs attention grid) and price one more lever (the idle warps' prefetch of
+  the out weights, the staging done once) before the next round

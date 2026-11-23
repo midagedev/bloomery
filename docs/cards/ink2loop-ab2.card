@@ -1,0 +1,28 @@
+# Round ink2loop, build 5 against the same base (4dca83255). The first A/B (docs/cards/ink2loop-ab.card, build 1)
+# read +1.06 +- 2.2 % at 512 (the base arm had one 149 tok/s round) and +0.62 +- 0.28 % at 4096; its nsys read the
+# controller at 659 us (base 698.5): out -2.4 us a launch, down +1.0..+2.4 us (a register spill at a chunk of 144).
+# Builds 2..4 were nsys-only (1041.6, 615.3, 576.7 us): spill, chunks of 48 (down unmoved at 8.4-8.6), one down
+# output a block (down[64] 7.57, unmoved).
+# [measured] build 5 (docs/cards/ink2loop-nsys-v5.card, band 455..560): controller 495.7 us a replay against the
+# base's 698.5 (-202.8 us = 3.1 % of the 6.44 ms step; out -2.5 us a launch, down[32] 7.52 -> 4.36 us, down[96]
+# 7.92 -> 7.69). [derived] tok/s = 6.44 / (6.44 - 0.203) - 1 = +3.3 %, if the neighbours' times and the
+# gaps between graph nodes do not move; banded +2.5..+4.0 % (the prefetched weights sit in L2 beside the step's
+# own 4 GB stream: 0.23 GB a token of 96 MB L2 can cost a neighbour a miss). The ruler at 8 rounds is +-0.64 %
+# (card.py: sd 0.6 %), so a 3 % effect is 4.7 of it.
+kind: ab
+question: does build 5 of the loop controller change (dot weights in flight early, down rows prefetched into L2,
+  order-preserving) make the Inkling 2 Mini decode faster on the one RTX 5090?
+term: tg tok/s @ n=128, depth 512 and 4096, bloomery-serve at the serving defaults,
+  Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090, tree bloomery-ink2loop (build 5) against base
+  bloomery-ink2loop-base (4dca83255)
+unit: %
+predict: 2.5..4
+rounds: 8
+condition: one lease (tools/ref/depth-serve.sh, four arms base:512 tree:512 base:4096 tree:4096,
+  BLOOMERY_AB_ROUNDS=8), the 5090 alone; the gates (step, pp, e2e fixture and real, official-card) green on
+  build 5 first; the first A/B's base binary reused (same sha256)
+decide-in: report the effect with its interval at 512 and 4096; the lead lands build 5 with the owning gates
+decide-below: under 2.5 % but clear of 0: the nsys of the same build says the controller saved 203 us, so a
+  neighbour or a gap took the rest: read the neighbours' kernel times in the same table and report which
+decide-above: over 4 %: the prefetched weights also warmed a neighbour; record it and read the neighbours'
+  kernel times in the same table

@@ -1,0 +1,28 @@
+# Round ink2loop. nsys (docs/cards/ink2loop*.card): the down launch is 7.52 us (32 blocks) and 7.92 us (96
+# blocks) in the base, and giving its dot warps every weight load early (chunks of 48, no spill) made it 8.43
+# / 8.60 us: the dot's load rounds are not what it waits on, while the same change took 2.4 us off the out
+# launch. So the launch's time sits elsewhere: the staging loop (9 iterations of two L2 loads each, one round
+# trip each if the compiler does not batch them), the squares' reduction, the three barriers and the tid-0
+# rstd, or the dot's shared reads.
+# [derived] a staging iteration waits one L2 round trip (~0.2 us), nine of them ~1.8 us; the reduction, three
+# barriers and the rstd ~0.8 us; the fixed launch cost ~3 us (the out launch's floor is 4.3 us with one DRAM
+# round): ~5.6 us outside the dot of 7.5, so the dot ~1.9 us. The samples should sit mostly on the staging
+# loop's loads (long scoreboard) and the barriers.
+kind: profile
+question: which instructions of loop_control_down do the warps wait on in the decode graph (stall reasons and
+  per-SASS-line samples, base build)?
+term: share of the loop_control_down warp-stall samples on the staging loop's loads, the three barriers and
+  the rstd section together, in percent (ncu --set full, 2 launches of the decode graph past the prompt pass,
+  depth 512, Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090, base build)
+unit: %
+predict: 50..80
+condition: one lease (lease-hold.sh), the 5090 alone, one bloomery-serve under ncu --graph-profiling node, the
+  kernel name filter ^loop_control_down$, launch-skip 120 (the prompt pass runs the rows form, so the first
+  120 down launches are decode steps), count 2; the SASS lines are read against the kernel's source order
+decide-in: write the staging as one batch of loads (every iteration's two loads issued before the first is
+  consumed, the same ascending sums) and measure it with nsys on a tree that has the base's dot
+decide-below: under 50 %: the dot's shared reads or its FMA chain carry the launch: price a split of the dot's
+  lanes across the idle warps (needs a float order change: not this round) or leave the down launch at the
+  base's code
+decide-above: over 80 %: the staging and barriers are the launch; the next lever is the norm done once a row
+  (the previous launch's or a one-block prologue), outside this round's files

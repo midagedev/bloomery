@@ -1,0 +1,27 @@
+# Round ink2loop. ncu of the base build (docs/cards/ink2loop-ncu.card; ncu clock-locked: 10 us a launch, 2.6
+# GHz, 45 regs): the stall samples of loop_control_down sit 23 % in the staging loop and reduction (SASS
+# 0..265), 2-4 % at the first two barriers, 5-6 % in the scale loop, and 67-70 % in the dot (SASS 482..880:
+# long scoreboard, the FFMA waiting for its weights), against the staging prediction of 50..80 %: the dot, not
+# the staging, is the launch. Yet build 3 (chunks of 48, weights issued behind the staging loop, 198 regs, no
+# spill) read 8.43/8.60 us against the base's 7.52/7.92 us in nsys.
+# [derived] if the dot's long-scoreboard time is what the launch waits on, a chunk of 48 should cut it from ~5
+# us to ~2.5 us. It did not: the samples of build 3 should show where the weights' time went: a throttle on
+# the load queue (lg_throttle / mio_throttle at the LDG run), the shared reads of the fold, or the first
+# chunk's wait now at the first FFMA. Predicted: the dot region keeps 45..70 % of the samples (it is still the
+# launch), its stall reason long scoreboard 25..45 % of all.
+kind: profile
+question: where do the warps of build 3's loop_control_down wait, per SASS line, now that the weights are
+  issued in chunks of 48 behind the staging loop?
+term: share of loop_control_down warp-stall samples in the dot region (after the last barrier), in percent
+  (ncu --set full, 2 launches of the decode graph, depth 512, Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090, tree
+  build 3)
+unit: %
+predict: 45..70
+condition: one lease (lease-hold.sh), the 5090 alone, tools/ref/ink2loop-ncu.sh on the tree's bloomery-serve,
+  launch-skip 120, count 2 (the table of docs/cards/ink2loop-ncu.card's run is the base)
+decide-in: the dot stays the launch: read which stall reason moved (lg/mio throttle, long scoreboard) and
+  choose the chunk or the issue order from it (one more build)
+decide-below: under 45 %: the dot is no longer the launch; the staging and barriers are; batch the staging's
+  loads next (the base's dot, the out change, one build)
+decide-above: over 70 %: the chunks made the dot slower in place; take the down launch back to the base's dot
+  and keep the out change

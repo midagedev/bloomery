@@ -1,0 +1,37 @@
+# Inkling 2 Mini's loop controller with every load of a dot in flight at once (round ink2loop), against the
+# base 4dca83255, one lease, tools/ref/depth-serve.sh.
+# [derived] base, measured: nsys (docs/cards/ink2loop.card's run, the base build, depth 512, 127 replays):
+# loop_control_down 7.72 us x 48, out 6.73 us x 24, out3 6.94 us x 24 a replay = 698.5 us of kernels, pair
+# span (down start to out end) 14.73 us x 48 = 707 us, down end to out start 0.18 us: 10.1 % of the nsys
+# period (6.88 ms), 10.8 % of the untraced step (6.44 ms).
+# [derived] the lever: a launch is ~3 us of fixed cost (launch ramp, the row staging, the squares' reduction
+# and three barriers, the butterfly and the store) plus the dot's load rounds; the base waits ~15 (down) and
+# ~11 (out) of them at ~0.3-0.5 us, the lever's down dot has its first 144 values in flight under the staging
+# and the out thread all 128 in flight under the h staging: the down launch ~3.3-4.3 us (the attention
+# triple's 3.5 MB drain, 2 us, is partly exposed), the out launch ~3.2-4.3 us.
+# Pair 14.7 us -> 6.5-8.6 us: -6.1..-8.2 us x 48 = -0.29..-0.39 ms of 6.44 ms = 4.5..6.1 % of the step,
+# +4.7..+6.5 % tok/s; banded +3..+6 for a launch bound that a block's register and L1 miss limits may not
+# reach. At depth 4096 the step is longer (the 8 global visits' attention) and the saving the same, so the
+# effect is a little smaller.
+# Not under another resource's shadow: the controller is on the one stream's dependency chain (the attention
+# input waits for its out launch), DRAM demand 0.227 GB = 0.13 ms of its 0.70 ms.
+kind: ab
+question: does the Inkling 2 Mini decode step get faster by the loop controller's dot loads all in flight
+  (order-preserving, bit-identical output) on the one RTX 5090?
+term: tg tok/s @ n=128, depth 512 (and 4096 in the same lease), bloomery-serve at the serving defaults,
+  Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090, tree bloomery-ink2loop against base bloomery-ink2loop-base
+  (4dca83255)
+unit: %
+predict: 3..6
+rounds: 4
+condition: one lease (tools/ref/depth-serve.sh, arms bloomery-ink2loop-base:512 bloomery-ink2loop:512
+  bloomery-ink2loop-base:4096 bloomery-ink2loop:4096, BLOOMERY_AB_ROUNDS=4, rotation by round), the 5090 alone
+  (no ComfyUI; gpu-apps in the witness blocks), both binaries built on the box from their trees; the step, pp,
+  e2e and official-card gates green at this tree first (bit-identical to the one-block launch)
+decide-in: report the effect and its interval at 512 and 4096; the lead lands the change with the owning
+  gates, no further lever on the controller (its launch is then ~3 us of fixed cost)
+decide-below: under 3 % but above 1 %: read the per-kernel table of the tree (nsys, same probe) for the
+  launch's new time before blaming the model; at or under the ruler: the loads are not what the launch waits
+  on (a block's L1 miss limit or the staging chain): re-derive from the new kernel times and drop the change
+decide-above: over 6 %: the controller was a larger share than its kernel sum (its launches stalled their
+  neighbours): record the gain as the finding and check the neighbours' per-kernel times in the same table

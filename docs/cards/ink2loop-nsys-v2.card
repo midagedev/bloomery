@@ -1,0 +1,33 @@
+# Round ink2loop, second build of the lever. The first build (docs/cards/ink2loop-nsys-new.card, A/B in
+# docs/cards/ink2loop-ab.card) measured: out 6.73/6.94 -> 4.36/4.36 us (as modelled), but down 7.52/7.92 ->
+# 8.47/10.27 us (modelled 3.3-4.3 us): controller 698.5 -> 659.0 us a replay, the A/B +0.62 % at 4096 (+1.06
+# +- 2.2 % at 512), the step -39.5 us = -0.61 %.
+# Which term was wrong: the down launch's weights were issued BEFORE the staging, so the staging's L2 loads
+# (cur, msg) queued behind 144 DRAM loads a dot lane and the drain of the weights (1.18 MB = 0.66 us, the
+# attention triple's 3.54 MB = 2.0 us) came in series with the norm chain, not under it: +0.95 us (ffn, 32
+# blocks) and +2.35 us (attention, 96 blocks) = +0.66 us and +2.0 us of drain plus ~0.3 us.
+# [derived] build 2: the dot warps issue their 144 weight loads after the staging loop has consumed its own
+# loads (a load queue serves in order) and before the reduction and the three barriers (~0.8 us of chain that
+# they hide under); the out thread also issues its cur and msg loads early (one L2 round less, ~0.4 us). down:
+# the base's ~3.8 us outside the dot (7.5 - ~3.7 of ~15 load rounds at ~0.25 us each, as the out launch's 2.4
+# us for ~10 rounds says) + the weights' exposed part (0.6 us latency + drain 0.66 / 2.0 us - 0.8 us hidden =
+# 0.5 / 1.8 us) + the fold 0.3 us = 4.6 us (ffn) and 5.9 us (attention); out ~3.9-4.3 us. Sum: 24 x (4.6 +
+# 5.9) + 48 x 4.1 = 449 us, band 420..560 (the base minus the out change alone is 579 us: a down launch above
+# its base time is the failure).
+kind: profile
+question: what do the loop controller's kernels cost a decoded token of Inkling 2 Mini with the weights' loads
+  issued behind the staging's, on the one RTX 5090?
+term: sum of the loop_control_* kernels' durations a decode replay in us (nsys --cuda-graph-trace=node, 48
+  down, 24 out, 24 out3 launches a replay) @ depth ~512, n = 128, bloomery-serve at the serving defaults,
+  Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090, tree build 2 (base 698.5 us, build 1 659.0 us)
+unit: us
+predict: 420..560
+condition: one lease (lease-hold.sh), the 5090 alone, one bloomery-serve under nsys, one /completion of 512
+  prose ids and n_predict 128, tools/ref/ink2loop-nsys.sh as before, the table split by grid (down[32] ffn,
+  down[96] attention)
+decide-in: build 2 stays: gates again on it, then the A/B (docs/cards/ink2loop-ab2.card) predicted +2..+4 %
+decide-below: under 420 us: the down launch hides its weights better than modelled; build 2 stays and the A/B
+  band's top is the target; check no launch is under its DRAM floor
+decide-above: over 560 us (579 is base with the out change alone): the down launch's early weights still cost
+  more than they hide: take the down launch back to the base's dot (keep the out change, ~-119 us, ~+1.8 %)
+  and run the A/B on that

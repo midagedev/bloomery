@@ -1,0 +1,30 @@
+# Round ink2loop, fifth build. Build 4 (docs/cards/ink2loop-nsys-v4.card, band 505..555) measured 576.7 us a
+# replay: down[64] (one output a block, 64 SMs) 7.57 us against the base's 7.52 on 32 blocks, down[96] 7.85,
+# out 4.26 / 4.35. Spreading a one-module launch over twice the SMs did not move the dot: the down launch is
+# not SM-bound (the null, the base's down with the out change, is 579). Build 3 (chunks of 48, 3 load rounds)
+# did not move it either (8.4-8.6). Two readings are dead: the dot is neither load-round-bound nor bytes-an-SM
+# bound. What is left is the latency of one load, and one warp's cap on loads in flight: a dot warp has 64
+# warps on the card, 16 (base) or 48 (chunk) loads in flight each, and a DRAM load of ~0.7 us.
+# [derived] build 5: the out change kept, DOWN_OUTS back to 2, and a staging warp (warp DOWN_OUTS) asks for the
+# block's two output rows into L2 (prefetch.global.L2, the helper cores::l2_prefetch the row-prefetch gemv
+# uses: no register, 9 instructions a warp) before the staging; the dot warps' loads after the barriers hit L2
+# (~0.3 us) where they hit DRAM (~0.7 us). If the dot's time is its loads' latency, ~4.5 us of 7.5 becomes
+# ~2 us: ffn down 5.0..7.0 us, attention 5.5..7.5 (three modules' 3.5 MB prefetched at once). Sum 24 x
+# (5.0..7.0 + 5.5..7.5 + 4.27 + 4.33) = 458..554 us, banded 455..560. The null (the hint moves nothing; the
+# dot is neither latency nor DRAM) is 579.
+kind: profile
+question: what do the loop controller's kernels cost a decoded token of Inkling 2 Mini with the out change
+  and the down launch's weights asked into L2 by a staging warp, on the one RTX 5090?
+term: sum of the loop_control_* kernels' durations a decode replay in us (nsys --cuda-graph-trace=node, 48
+  down, 24 out, 24 out3 launches a replay) @ depth ~512, n = 128, bloomery-serve at the serving defaults,
+  Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090, tree build 5 (base 698.5, build 3 615.3, build 4 576.7 us)
+unit: us
+predict: 455..560
+condition: one lease (lease-hold.sh), the 5090 alone, one bloomery-serve under nsys, one /completion of 512
+  prose ids and n_predict 128, tools/ref/ink2loop-nsys.sh, the table split by grid (down[32] the ffn launch)
+decide-in: down[32] at 5.0..7.0 us: the dot is its loads' latency and the hint cuts it; build 5 stays (the
+  gates, FAIL-first, the 8-round A/B, docs/cards/ink2loop-ab2.card, +2.5..+4 %)
+decide-below: under 455 us: the hint also hides the staging's own stall; build 5 stays, the report names it
+decide-above: over 560 us (579 is the null): the hint moves nothing or costs; drop it, keep the out change
+  alone (-119 us, ~+1.8 %), run the gates and the A/B on that, and report the down launch's time as a term
+  no model here explains (not rounds, not SMs, not DRAM latency)
