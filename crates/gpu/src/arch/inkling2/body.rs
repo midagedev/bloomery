@@ -9,15 +9,17 @@
 //! 1. at the first core visit of a pass: on pass 0 the prelude's blocks and stream are kept; on a
 //!    later pass the blocks the previous pass banked past its first become the message bank, its
 //!    last output the bank's last row, and the blocks and stream go back to the prelude's;
-//! 2. on a core visit of a pass past the first, the two message mixes as one four-query launch
-//!    over the bank (`attn_res::enqueue_normed`), rows q, ffn, k, v;
+//! 2. on a core visit of a pass past the first, the message mix: four queries over the bank,
+//!    rows q, ffn, k, v, the first job of the attention mix's launch pair (`attn_res_step`);
 //! 3. the attention input: the normed mix of the banked blocks and the stream (one query
 //!    windowed, three windowless; layer 0 reads the stream), the q, k and v controllers on it as
 //!    one launch pair (`loop_control::enqueue_attn`) where the messages run, then the input norms
 //!    (a windowed visit's one norm, three times where the messages ran; a windowless visit's q,
 //!    k and v norms);
 //! 4. the projections of q, k, v, the relative rows, the sink logits and the output gate (and a
-//!    windowless visit's conv taps), the k and v short convs on the visit's ring, the epilogues
+//!    windowless visit's conv taps), one launch with the input norms (`norm_proj`) where q, k, v,
+//!    rel and gate are Q8_0 and the sinks and taps F32, the k and v short convs on the visit's
+//!    ring, the epilogues
 //!    and the f16 append (`qk_clip`), the rel-bias attention with the per-query sink
 //!    (`rel_bias`), the sigmoid output gate, the output projection and its post conv;
 //! 5. the block join: a visit of a block's first layer banks the stream and the attention output
@@ -31,13 +33,15 @@
 //! input; the head softcaps the logits and writes the padded columns past the unpadded
 //! vocabulary at [`PAD_LOGIT`], so the argmax reads the vocabulary alone.
 //!
-//! The six projections of one attention input are six launches: no common entry takes several
-//! Q8_0 weights over one input row. A prompt runs as the rows pass ([`pass`]): the same walk over
+//! A layer of other site types, and a step under the imatrix collector (which reads each site's
+//! normed input), runs the input norms and the projections a launch each. Every mix of the step
+//! is the step mix's launch pair. A prompt runs as the rows pass ([`pass`]): the same walk over
 //! up to [`place::PASS_ROWS`] rows a launch, the stores left where that many steps leave them.
 
 use super::state::{self, StepIn, VisitStore, WORD_POS, WORD_RING, WORD_TOKEN};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs, MAX_NQ, MAX_VECS};
+use crate::attn_res_step::{AttnResStepKernels, MixStepScratch};
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
 use crate::flash_gqa::{FlashGqaKernels, window_segments};
 use crate::gemm::Gemm32Kernels;
@@ -47,6 +51,7 @@ use crate::linear::conv_res::{ConvResArgs, ConvResKernels};
 use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::loop_control::{LoopControlArgs, LoopControlKernels, MAX_MODULES, scratch_len};
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
+use crate::norm_proj::{self, F32Site, NormProjArgs, NormProjKernels, Q8Site};
 use crate::q38::{EmbedIo, Q38Kernels};
 use crate::qk_clip::{QkClipArgs, QkClipKernels};
 use crate::rel_bias::{REL, RelBiasArgs, RelBiasKernels};
@@ -160,6 +165,8 @@ struct Layer {
     probs_b: String,
     stacks: [String; 3],
     ctrl: Option<Controls>,
+    /// The input norms and the projections run as one launch ([`norm_proj_fits`]).
+    norm_proj: bool,
 }
 
 impl Layer {
@@ -197,6 +204,8 @@ struct Kernels {
     flash: FlashGqaKernels,
     q38: Q38Kernels,
     mix: AttnResKernels,
+    step_mix: AttnResStepKernels,
+    proj: NormProjKernels,
     ctrl: LoopControlKernels,
     conv: ConvResKernels,
     clip: QkClipKernels,
@@ -215,6 +224,8 @@ impl Kernels {
             flash: FlashGqaKernels::load(ctx)?,
             q38: Q38Kernels::load(ctx)?,
             mix: AttnResKernels::load(ctx)?,
+            step_mix: AttnResStepKernels::load(ctx)?,
+            proj: NormProjKernels::load(ctx)?,
             ctrl: LoopControlKernels::load(ctx)?,
             conv: ConvResKernels::load(ctx)?,
             clip: QkClipKernels::load(ctx)?,
@@ -272,6 +283,8 @@ struct Scratch {
     pad: DeviceBuffer<f32>,
     route: sigmoid_128_8::RouterOut,
     leg: LegBufs,
+    /// The step mixes' statistics and tickets.
+    mix_step: MixStepScratch,
 }
 
 impl Scratch {
@@ -325,6 +338,7 @@ impl Scratch {
             pad: DeviceBuffer::from_host(stream, &vec![PAD_LOGIT; pad.max(1)])?,
             route: sigmoid_128_8::RouterOut::new(stream)?,
             leg: LegBufs::for_down(stream, leg, DownAct::Q8Blocks32)?,
+            mix_step: MixStepScratch::new(stream, n)?,
         })
     }
 
@@ -371,6 +385,7 @@ impl Scratch {
                 .map(DeviceBuffer::num_bytes)
                 .sum::<usize>()
             + self.leg.bytes()
+            + self.mix_step.bytes()
             + <Router as RouterEntry>::out_bytes(&self.route)
     }
 }
@@ -438,6 +453,39 @@ impl GpuModel<Body> {
 fn site_of(w: &Weights, name: String, (rows, k): (usize, usize)) -> Result<Site, GpuError> {
     let ty = site::resident_site(w, WHAT, &name, (rows, k), DENSE_TYPES)?;
     Ok(Site::new(name, ty, k))
+}
+
+/// Whether `layer`'s input norms and projections run as one `norm_proj` launch: q, k, v, rel and
+/// gate Q8_0, the sinks and the taps F32, the input a width the entry takes and every site's rows
+/// a multiple of its block's.
+fn norm_proj_fits(layer: &Layer, d: &Dims) -> bool {
+    let q8 = [&layer.q, &layer.k, &layer.v, &layer.rel, &layer.gate]
+        .iter()
+        .all(|s| s.ty == SiteTy::Q8_0);
+    let f32 = std::iter::once(&layer.sink)
+        .chain(layer.taps.iter().flatten())
+        .all(|s| s.ty == SiteTy::F32);
+    let rows = [
+        d.n_head * HEAD,
+        d.n_kv * HEAD,
+        d.n_head * REL,
+        d.n_head,
+        d.n_kv * d.taps,
+    ];
+    q8 && f32
+        && d.n.is_multiple_of(32)
+        && d.n <= norm_proj::MAX_K
+        && rows.iter().all(|r| r.is_multiple_of(norm_proj::ROWS))
+}
+
+/// Site `site`'s Q8_0 planes and its output `y`, for a `norm_proj` launch.
+fn q8_site<'a>(
+    w: &'a Weights,
+    site: &Site,
+    y: &'a mut DeviceBuffer<f32>,
+) -> Result<Q8Site<'a>, GpuError> {
+    let (qs, d) = w.q8_planes(STEP, &site.name)?;
+    Ok(Q8Site { qs, d, y })
 }
 
 /// `name`, an f32 vector of `len` values the weights hold, or a named refusal.
@@ -652,7 +700,7 @@ impl Body {
                 .filter(|lp| (lp.core_start..lp.core_end).contains(&l))
                 .map(|lp| controls(stream, w, (l, lp, n)))
                 .transpose()?;
-            layers.push(Layer {
+            let mut layer = Layer {
                 windowed,
                 q: site_of(w, blk("attn_q.weight"), (n_head * HEAD, n))?,
                 k: site_of(w, blk("attn_k.weight"), (kvw, n))?,
@@ -685,7 +733,10 @@ impl Body {
                 probs_b: vector(w, blk("exp_probs_b.bias"), hp.n_expert)?,
                 stacks: [gate_half, up_half, down],
                 ctrl,
-            });
+                norm_proj: false,
+            };
+            layer.norm_proj = norm_proj_fits(&layer, &d);
+            layers.push(layer);
             w.f32_tensor(WHAT, &layers[l].router)?;
         }
         vector(w, names::TOKEN_EMBD_NORM.to_owned(), n)?;
@@ -737,6 +788,13 @@ impl Body {
     #[must_use]
     pub fn visit_table(&self) -> Vec<(u32, u32)> {
         self.visits.iter().map(|v| (v.layer, v.pass)).collect()
+    }
+
+    /// Whether stored layer `l`'s input norms and projections run as one launch (`norm_proj`) on
+    /// a step without the imatrix collector.
+    #[must_use]
+    pub fn norm_proj(&self, l: usize) -> bool {
+        self.layers.get(l).is_some_and(|x| x.norm_proj)
     }
 
     /// The stored layers the visits run.
@@ -1153,20 +1211,36 @@ impl Walk<'_> {
             fault,
         };
         {
-            let s = &mut *self.s;
-            if let Some(c) = ctrl {
-                self.k.mix.enqueue_normed(
-                    stream,
-                    mix_args(&s.msg_bank, self.n_msg, &s.bank_last, &c.queries, MAX_NQ),
-                    s.msg.whole_mut(),
-                )?;
-            }
-            if let Some((query, nq)) = &layer.attn_query {
-                self.k.mix.enqueue_normed(
-                    stream,
-                    mix_args(&s.banks, self.pushed, &s.x, w.f32_buf(STEP, query)?, *nq),
-                    s.mix.whole_mut(),
-                )?;
+            let Scratch {
+                msg_bank,
+                bank_last,
+                banks,
+                x,
+                msg,
+                mix,
+                mix_step,
+                ..
+            } = &mut *self.s;
+            // The message mix and the attention mix read nothing the other writes: one pair.
+            let msgs = ctrl.map(|c| {
+                (
+                    mix_args(msg_bank, self.n_msg, bank_last, &c.queries, MAX_NQ),
+                    msg.whole_mut(),
+                )
+            });
+            let attn = match &layer.attn_query {
+                Some((query, nq)) => Some((
+                    mix_args(banks, self.pushed, x, w.f32_buf(STEP, query)?, *nq),
+                    mix.whole_mut(),
+                )),
+                None => None,
+            };
+            let (first, second) = match (msgs, attn) {
+                (Some(m), a) => (Some(m), a),
+                (None, a) => (a, None),
+            };
+            if let Some(first) = first {
+                self.k.step_mix.enqueue(stream, first, second, mix_step)?;
             }
         }
         let n_in = if layer.windowed && ctrl.is_none() {
@@ -1174,6 +1248,9 @@ impl Walk<'_> {
         } else {
             3
         };
+        let fused = layer.norm_proj && crate::imatrix::collector().is_none();
+        // The fused launch norms its own inputs.
+        let norms = if fused { 0 } else { n_in };
         {
             let Scratch {
                 mix,
@@ -1208,7 +1285,7 @@ impl Walk<'_> {
                     [c0, c1, c2],
                 )?;
             }
-            for (j, out) in xn.iter_mut().enumerate().take(n_in) {
+            for (j, out) in xn.iter_mut().enumerate().take(norms) {
                 let src = if ctrl.is_some() {
                     &ctl[j]
                 } else {
@@ -1228,7 +1305,66 @@ impl Walk<'_> {
         // The projections of the normed inputs: q, the relative rows, the sinks and the gate read
         // the q input, k and its taps the k input, v and its taps the v input.
         let (ik, iv) = if n_in == 1 { (0, 0) } else { (1, 2) };
-        {
+        if fused {
+            let Scratch {
+                mix,
+                x,
+                ctl,
+                q,
+                k_raw,
+                v_raw,
+                r,
+                sinks,
+                gate,
+                k_taps,
+                v_taps,
+                ..
+            } = &mut *self.s;
+            let (mix, x, ctl) = (&*mix, &*x, &*ctl);
+            // Inputs past the visit's count repeat input 0 and are not read.
+            let at = |i: usize| if i < n_in { i } else { 0 };
+            let src: [&DeviceBuffer<f32>; 3] = std::array::from_fn(|i| {
+                if ctrl.is_some() {
+                    &ctl[at(i)]
+                } else {
+                    attn_input((mix, x), layer, at(i))
+                }
+            });
+            let gain = [
+                w.f32_buf(STEP, &layer.norms[at(0)])?,
+                w.f32_buf(STEP, &layer.norms[at(1)])?,
+                w.f32_buf(STEP, &layer.norms[at(2)])?,
+            ];
+            let sink = w.f32_tensor(STEP, &layer.sink.name)?;
+            // A windowed layer has no taps: the sink rows stand in, unread.
+            let (kt, vt) = match &layer.taps {
+                Some([tk, tv]) => (w.f32_tensor(STEP, &tk.name)?, w.f32_tensor(STEP, &tv.name)?),
+                None => (sink, sink),
+            };
+            self.k.proj.enqueue(
+                stream,
+                NormProjArgs {
+                    x: src,
+                    gain,
+                    ik,
+                    iv,
+                    eps: self.eps,
+                    k: n,
+                    fault,
+                    q8: [
+                        q8_site(w, &layer.q, q)?,
+                        q8_site(w, &layer.k, k_raw)?,
+                        q8_site(w, &layer.v, v_raw)?,
+                        q8_site(w, &layer.rel, r)?,
+                        q8_site(w, &layer.gate, gate)?,
+                    ],
+                    sink: F32Site { w: sink, y: sinks },
+                    kt: F32Site { w: kt, y: k_taps },
+                    vt: F32Site { w: vt, y: v_taps },
+                    taps: layer.taps.is_some(),
+                },
+            )?;
+        } else {
             let (cx, acts, s) = (&self.cx, &mut *self.acts, &mut *self.s);
             layer.q.project(cx, acts, slot, &s.xn[0], &mut s.q)?;
             layer.k.project(cx, acts, slot, &s.xn[ik], &mut s.k_raw)?;
@@ -1404,22 +1540,26 @@ impl Walk<'_> {
         let fault = gpu.layer_sink(slot)?;
         let s = &mut *self.s;
         let cur = if self.banked { &s.attn_out } else { &s.ffn_inp };
-        self.k.mix.enqueue_normed(
+        self.k.step_mix.enqueue(
             stream,
-            AttnResNormedArgs {
-                banks: &s.banks,
-                n_banks: self.pushed,
-                stride: n,
-                cur,
-                queries: w.f32_buf(STEP, &layer.ffn_query)?,
-                nq: 1,
-                scale: self.mix_scale,
-                eps: MIX_EPS,
-                n,
-                m: 1,
-                fault,
-            },
-            &mut s.fmix,
+            (
+                AttnResNormedArgs {
+                    banks: &s.banks,
+                    n_banks: self.pushed,
+                    stride: n,
+                    cur,
+                    queries: w.f32_buf(STEP, &layer.ffn_query)?,
+                    nq: 1,
+                    scale: self.mix_scale,
+                    eps: MIX_EPS,
+                    n,
+                    m: 1,
+                    fault,
+                },
+                &mut s.fmix,
+            ),
+            None,
+            &mut s.mix_step,
         )?;
         let normed_in = match (msg, layer.ctrl.as_ref()) {
             (true, Some(c)) => {
@@ -1556,23 +1696,27 @@ impl Walk<'_> {
         let (gpu, w) = (self.cx.gpu, self.cx.w);
         let stream = gpu.stream();
         let n = self.d.n;
-        let s = &*self.s;
-        self.k.mix.enqueue_normed(
+        let s = &mut *self.s;
+        self.k.step_mix.enqueue(
             stream,
-            AttnResNormedArgs {
-                banks: &s.banks,
-                n_banks: self.pushed,
-                stride: n,
-                cur: &s.x,
-                queries: w.f32_buf(STEP, names::OUTPUT_RES_QUERY)?,
-                nq: 1,
-                scale: self.mix_scale,
-                eps: MIX_EPS,
-                n,
-                m: 1,
-                fault: gpu.layer_sink(n_visits)?,
-            },
-            head.input_mut(),
+            (
+                AttnResNormedArgs {
+                    banks: &s.banks,
+                    n_banks: self.pushed,
+                    stride: n,
+                    cur: &s.x,
+                    queries: w.f32_buf(STEP, names::OUTPUT_RES_QUERY)?,
+                    nq: 1,
+                    scale: self.mix_scale,
+                    eps: MIX_EPS,
+                    n,
+                    m: 1,
+                    fault: gpu.layer_sink(n_visits)?,
+                },
+                head.input_mut(),
+            ),
+            None,
+            &mut s.mix_step,
         )?;
         head_logits((gpu, w), head, &s.pad, (cap, unpadded, padded))
     }

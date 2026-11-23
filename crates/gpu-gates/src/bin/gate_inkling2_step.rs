@@ -1,5 +1,6 @@
 //! GPU gate for Inkling 2's visit pipeline — the block-attention residual's normed mix
-//! (`attn_res::enqueue_normed`), the looped core's message controller (`loop_control::enqueue`, `enqueue_attn`)
+//! (`attn_res::enqueue_normed`) and its step form (`attn_res_step`), the attention input's norms
+//! and projections in one launch (`norm_proj`), the looped core's message controller (`loop_control::enqueue`, `enqueue_attn`)
 //! and the residual short convolutions (`linear::conv_res::enqueue`) — against host f64 rules of
 //! llama.cpp PR #32695's `src/models/inkling2.cpp` (`mix` :212-225, `control` :228-237, `convolve`
 //! :241-283) at the files' shapes (hidden 2,304, gate rank 64, taps 4, the k/v convs 1,024 channels
@@ -46,19 +47,29 @@
 //!    NaN input raises `linear_conv`, its own value of the token NaN and every other value of
 //!    the token finite (the conv is depthwise: one channel's NaN reaches no other channel).
 //!
+//! 10. `mix_step_is_the_mix`: the step mix (`attn_res_step`) at one row of every mix point's
+//!     shape — alone, run twice (the tickets back at zero between calls), and paired as the
+//!     second mix of a launch beside the four-query message mix — gives `enqueue_normed`'s bits;
+//!     a NaN bank value raises `f32_product` and every query row is NaN.
+//! 11. `norm_proj_is_the_sites`: the fused input norms and projections (`norm_proj`) at the
+//!     files' site shapes, with three inputs and with one, each with and without the conv taps,
+//!     give `rms_norm` and each site's own gemv's bits (`q8_0_gemv`, `f32_gemv`), the taps of a
+//!     launch without them unwritten; a NaN input value raises the norm's fault from the fused
+//!     launch, every site of that input NaN and the other inputs' sites their bits.
+//!
 //! The oracle clauses (`fx_ref_inkling2_a`, its positions' count read from the set, the fixture's
 //! 25-visit schedule — the stem 0-5, the core's three passes 6-11, 12-17, 18-23, the coda 24; the
 //! block boundaries 0, 6, 12, 18, 24; the windowless slots 5, 11, 17, 23; every input a tapped
 //! node and every weight an f32 tensor of the fixture file, so the chain carries no quantization):
 //!
-//! 10. `mix_pass0`: the windowed attention mix of slot 8 (banks the embedding norm and `l_out-5`,
+//! 12. `mix_pass0`: the windowed attention mix of slot 8 (banks the embedding norm and `l_out-5`,
 //!     the stream `l_out-7`) through its input norm within [`ORACLE_BAND`] of `norm-8` occurrence
 //!     0; the windowless slot 11's three-query mix through the three input norms of `norm-11`
 //!     occurrences 0 to 2 and its feed-forward mix through occurrence 3; the head's mix over the
 //!     three blocks the walk ends with (the prelude's, pass 2's boundary push and the coda's —
 //!     every pass resets the blocks to the prelude's, so pass 0's pushes are gone) and the
 //!     stream, against the last position's `result_norm` row.
-//! 11. `mix_pass1`: slot 13 (a pass-1 core visit; the fixture's message bank is empty — its pass 0
+//! 13. `mix_pass1`: slot 13 (a pass-1 core visit; the fixture's message bank is empty — its pass 0
 //!     pushed one block — and its `bank_last` is `l_out-11`): the two message tables' rows staged
 //!     as one four-query launch over `l_out-11`, the attention mix of the prelude's two banks
 //!     and `l_out-12`, the feed-forward mix of `ffn_inp-13`, each through its controller within
@@ -83,11 +94,13 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::attn_res::{AttnResKernels, AttnResNormedArgs, MAX_NQ, MAX_VECS};
+    use bloomery_gpu::attn_res_step::{AttnResStepKernels, MixStepScratch};
     use bloomery_gpu::linear::conv_res::{ConvResArgs, ConvResKernels};
     use bloomery_gpu::loop_control::{
         LoopControlArgs, LoopControlKernels, MAX_MODULES, MAX_N, MAX_RANK, OUT_COLS, scratch_len,
     };
-    use bloomery_gpu::{Gpu, GpuError};
+    use bloomery_gpu::norm_proj::{F32Site, NormProjArgs, NormProjKernels, Q8Site};
+    use bloomery_gpu::{DeviceTensor, Fault, Gpu, GpuError};
     use bloomery_gpu_gates::tier::{self, Tier};
     use bloomery_gpu_gates::{
         GateError, GateRng, RefManifest, bits_equal, checks_failed, ref_tensor_logical_in, verdict,
@@ -400,6 +413,37 @@ mod gate {
                 banks,
                 cur,
                 queries,
+            }
+        }
+
+        /// The case's banks (one value when there is none), stream and query rows on the card.
+        fn upload(&self, gpu: &Gpu) -> Result<[DeviceBuffer<f32>; 3], GateError> {
+            let s = gpu.stream();
+            let mut bank_flat: Vec<f32> = self.banks.iter().flatten().map(|x| *x as f32).collect();
+            if bank_flat.is_empty() {
+                bank_flat.push(0.0);
+            }
+            Ok([
+                DeviceBuffer::from_host(s, &bank_flat)?,
+                DeviceBuffer::from_host(s, &f32s(&self.cur.concat()))?,
+                DeviceBuffer::from_host(s, &f32s(&self.queries.concat()))?,
+            ])
+        }
+
+        /// The case's one row as the step mix's mix (its buffers from [`MixCase::upload`]).
+        fn step_args<'a>(&self, gpu: &Gpu, b: &'a [DeviceBuffer<f32>; 3]) -> AttnResNormedArgs<'a> {
+            AttnResNormedArgs {
+                banks: &b[0],
+                n_banks: self.banks.len(),
+                stride: N,
+                cur: &b[1],
+                queries: &b[2],
+                nq: self.queries.len(),
+                scale: SCALE,
+                eps: EPS,
+                n: N,
+                m: 1,
+                fault: gpu.unlabelled_sink(),
             }
         }
 
@@ -827,6 +871,269 @@ mod gate {
              least rel-L2 {noscale_least:.3e}, past {SEP}x band: {}",
             verdict(pass)
         );
+        out.push(pass);
+        Ok(out)
+    }
+
+    /// The step mix's outputs of case `a` and, paired, case `b` (one row each).
+    fn step_run(
+        gpu: &Gpu,
+        step: &AttnResStepKernels,
+        scratch: &mut MixStepScratch,
+        a: &MixCase,
+        b: Option<&MixCase>,
+    ) -> Result<(Vec<f32>, Option<Vec<f32>>), GateError> {
+        let s = gpu.stream();
+        let ba = a.upload(gpu)?;
+        let mut ya = DeviceBuffer::zeroed(s, a.queries.len() * N)?;
+        let bb = b.map(|c| c.upload(gpu)).transpose()?;
+        let mut yb = b
+            .map(|c| DeviceBuffer::zeroed(s, c.queries.len() * N))
+            .transpose()?;
+        let second = match (b, &bb, yb.as_mut()) {
+            (Some(c), Some(buf), Some(y)) => Some((c.step_args(gpu, buf), y)),
+            _ => None,
+        };
+        step.enqueue(s, (a.step_args(gpu, &ba), &mut ya), second, scratch)?;
+        s.synchronize()?;
+        let out_b = yb.map(|y| y.to_host_vec(s)).transpose()?;
+        Ok((ya.to_host_vec(s)?, out_b))
+    }
+
+    /// The `norm_proj` sites' rows at the files' shapes: the Q8_0 `q`, `k`, `v`, `rel` and `gate`
+    /// (24 heads of 128, eight kv heads of 128, 16 relative rows a head), then the F32 `sink`,
+    /// `kt` and `vt` (a sink a head, four conv taps a kv head).
+    const PROJ_ROWS: [usize; 8] = [3072, 1024, 1024, 384, 3072, 24, 32, 32];
+    /// The input each site reads, at three inputs (`ik` 1, `iv` 2).
+    const PROJ_INPUT: [usize; 8] = [0, 1, 2, 0, 0, 0, 1, 2];
+    const PROJ_SITES: [&str; 8] = ["q", "k", "v", "rel", "gate", "sink", "kt", "vt"];
+    /// What every output holds before a launch: a site the launch does not run keeps it.
+    const UNWRITTEN: f32 = -7.25;
+
+    /// One seeded `norm_proj` case: three input rows and their gains, the Q8_0 sites' words and
+    /// f16 scales, the F32 sites' rows.
+    struct ProjCase {
+        x: [Vec<f32>; 3],
+        gain: [Vec<f32>; 3],
+        q8: [(Vec<u32>, Vec<u16>); 5],
+        f32w: [Vec<f32>; 3],
+    }
+
+    impl ProjCase {
+        fn new(seed: u64) -> ProjCase {
+            let mut r = GateRng(seed);
+            let x = std::array::from_fn(|_| fill(&mut r, N, -2.0, 2.0));
+            let gain = std::array::from_fn(|_| fill(&mut r, N, 0.5, 1.5));
+            let q8 = std::array::from_fn(|i| {
+                let rows = PROJ_ROWS[i];
+                let words = (0..rows * N / 4)
+                    .map(|_| r.below(1 << 16) as u32 | ((r.below(1 << 16) as u32) << 16))
+                    .collect();
+                // Normal f16 scales of either sign in [2^-7, 2^-2).
+                let scales = (0..rows * N / 32)
+                    .map(|_| {
+                        ((r.below(2) << 15) | ((8 + r.below(5)) << 10) | r.below(1 << 10)) as u16
+                    })
+                    .collect();
+                (words, scales)
+            });
+            let f32w = std::array::from_fn(|i| fill(&mut r, PROJ_ROWS[5 + i] * N, -0.1, 0.1));
+            ProjCase { x, gain, q8, f32w }
+        }
+    }
+
+    /// Eight outputs at the sites' rows, every value [`UNWRITTEN`].
+    fn unwritten(gpu: &Gpu) -> Result<[DeviceBuffer<f32>; 8], GateError> {
+        let s = gpu.stream();
+        let y = |i: usize| -> Result<DeviceBuffer<f32>, GateError> {
+            Ok(DeviceBuffer::from_host(s, &vec![UNWRITTEN; PROJ_ROWS[i]])?)
+        };
+        Ok([y(0)?, y(1)?, y(2)?, y(3)?, y(4)?, y(5)?, y(6)?, y(7)?])
+    }
+
+    /// The oracle's outputs, the fused launch's, and the fault word the fused launch left.
+    type ProjOut = (Vec<Vec<f32>>, Vec<Vec<f32>>, Option<Fault>);
+
+    /// `case` at `n_in` inputs (one: every site reads input 0) with or without the taps: the
+    /// oracle's outputs (`rms_norm` of each input, then each site's own gemv), the fused launch's,
+    /// and the fault word the fused launch alone left.
+    fn proj_run(
+        gpu: &Gpu,
+        k: &NormProjKernels,
+        case: &ProjCase,
+        n_in: usize,
+        taps: bool,
+    ) -> Result<ProjOut, GateError> {
+        let s = gpu.stream();
+        let (ik, iv) = if n_in == 1 { (0, 0) } else { (1, 2) };
+        let at = |i: usize| if i < n_in { i } else { 0 };
+        let mut xs = Vec::new();
+        let mut gs = Vec::new();
+        for i in 0..3 {
+            xs.push(DeviceBuffer::from_host(s, &case.x[at(i)])?);
+            gs.push(DeviceBuffer::from_host(s, &case.gain[at(i)])?);
+        }
+        let mut q8 = Vec::new();
+        for (i, (words, scales)) in case.q8.iter().enumerate() {
+            q8.push((
+                DeviceTensor::upload(s, words, PROJ_ROWS[i], N / 4)?,
+                DeviceTensor::upload(s, scales, PROJ_ROWS[i], N / 32)?,
+            ));
+        }
+        let mut f32w = Vec::new();
+        for (i, w) in case.f32w.iter().enumerate() {
+            f32w.push(DeviceTensor::upload(s, w, PROJ_ROWS[5 + i], N)?);
+        }
+        let mut want = unwritten(gpu)?;
+        let mut card = unwritten(gpu)?;
+        let mut xn = Vec::new();
+        for (x, g) in xs.iter().zip(&gs) {
+            let mut y = DeviceBuffer::zeroed(s, N)?;
+            gpu.elem().enqueue_rms_norm(s, x, g, EPS, N, 1, &mut y)?;
+            xn.push(y);
+        }
+        let input = PROJ_INPUT.map(at);
+        let q = gpu.q8f32();
+        for (j, y) in want.iter_mut().enumerate() {
+            let x = &xn[input[j]];
+            match j {
+                0..5 => q.enqueue_q8_0_gemv(s, &q8[j].0, &q8[j].1, x, 1, y)?,
+                5 => q.enqueue_f32_gemv(s, &f32w[0], x, 1, y)?,
+                _ if taps => q.enqueue_f32_gemv(s, &f32w[j - 5], x, 1, y)?,
+                _ => {}
+            }
+        }
+        s.synchronize()?;
+        gpu.clear_fault()?;
+        let [cq, ck, cv, cr, cg, cs, ckt, cvt] = &mut card;
+        let sink = &f32w[0];
+        let site = |i: usize, y| Q8Site {
+            qs: &q8[i].0,
+            d: &q8[i].1,
+            y,
+        };
+        k.enqueue(
+            s,
+            NormProjArgs {
+                x: [&xs[0], &xs[1], &xs[2]],
+                gain: [&gs[0], &gs[1], &gs[2]],
+                ik,
+                iv,
+                eps: EPS,
+                k: N,
+                fault: gpu.unlabelled_sink(),
+                q8: [
+                    site(0, cq),
+                    site(1, ck),
+                    site(2, cv),
+                    site(3, cr),
+                    site(4, cg),
+                ],
+                sink: F32Site { w: sink, y: cs },
+                kt: F32Site {
+                    w: if taps { &f32w[1] } else { sink },
+                    y: ckt,
+                },
+                vt: F32Site {
+                    w: if taps { &f32w[2] } else { sink },
+                    y: cvt,
+                },
+                taps,
+            },
+        )?;
+        s.synchronize()?;
+        let fault = gpu.fault()?;
+        let host = |b: &[DeviceBuffer<f32>; 8]| -> Result<Vec<Vec<f32>>, GateError> {
+            b.iter().map(|y| Ok(y.to_host_vec(s)?)).collect()
+        };
+        Ok((host(&want)?, host(&card)?, fault))
+    }
+
+    /// Clause `norm_proj_is_the_sites` (module doc, clause 11).
+    fn norm_proj_clauses(gpu: &Gpu) -> Result<Vec<bool>, GateError> {
+        let k = NormProjKernels::load(gpu.context())?;
+        let case = ProjCase::new(0x1e2a_0200);
+        let mut out = Vec::new();
+        for (n_in, taps) in [(3, true), (1, false), (3, false), (1, true)] {
+            let (want, card, fault) = proj_run(gpu, &k, &case, n_in, taps)?;
+            let off: Vec<&str> = PROJ_SITES
+                .iter()
+                .zip(want.iter().zip(&card))
+                .filter(|(_, (w, c))| !bits_equal(w, c))
+                .map(|(name, _)| *name)
+                .collect();
+            let kept = taps
+                || card[6..]
+                    .iter()
+                    .all(|y| y.iter().all(|v| v.to_bits() == UNWRITTEN.to_bits()));
+            let pass = off.is_empty() && kept && fault.is_none();
+            println!(
+                "  norm_proj_is_the_sites {n_in} input(s), taps {taps}: sites off rms_norm and \
+                 their gemvs' bits {off:?}, unrun taps unwritten {kept}, fault={fault:?}: {}",
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+        let mut bad = case;
+        bad.x[0][7] = f32::NAN;
+        let (want, card, fault) = proj_run(gpu, &k, &bad, 3, true)?;
+        let nan = (0..8)
+            .filter(|&j| PROJ_INPUT[j] == 0)
+            .all(|j| card[j].iter().all(|v| v.is_nan()));
+        let others = (0..8)
+            .filter(|&j| PROJ_INPUT[j] != 0)
+            .all(|j| bits_equal(&card[j], &want[j]));
+        let pass = fault.is_some() && nan && others;
+        println!(
+            "  norm_proj_is_the_sites a NaN value of input 0: fault={fault:?} its sites all NaN \
+             {nan}, the other inputs' sites their bits {others}: {}",
+            verdict(pass)
+        );
+        gpu.clear_fault()?;
+        out.push(pass);
+        Ok(out)
+    }
+
+    /// Clause `mix_step_is_the_mix`: the step mix (`attn_res_step`) at one row of every mix
+    /// point's shape — alone, run twice (the tickets back at zero between calls), and paired as
+    /// the second mix of a launch beside the four-query message mix — gives `enqueue_normed`'s
+    /// bits; a NaN bank value raises `f32_product` and every query row is NaN.
+    fn mix_step_clauses(gpu: &Gpu, k: &AttnResKernels) -> Result<Vec<bool>, GateError> {
+        let step = AttnResStepKernels::load(gpu.context())?;
+        let mut scratch = MixStepScratch::new(gpu.stream(), N)?;
+        let msg = MixCase::new(0x1e2a_0100, 3, 4, 1);
+        let (msg_ref, _) = msg.run(gpu, k, MixDrop::None)?;
+        let mut out = Vec::new();
+        for (i, &(banks, nq, _)) in MIX_CASES.iter().enumerate() {
+            let case = MixCase::new(0x1e2a_0000 + i as u64, banks, nq, 1);
+            let (want, _) = case.run(gpu, k, MixDrop::None)?;
+            let (alone, _) = step_run(gpu, &step, &mut scratch, &case, None)?;
+            let (again, _) = step_run(gpu, &step, &mut scratch, &case, None)?;
+            let (pm, pc) = step_run(gpu, &step, &mut scratch, &msg, Some(&case))?;
+            let paired = bits_equal(&pm, &msg_ref) && pc.is_some_and(|c| bits_equal(&c, &want));
+            let (a1, a2) = (bits_equal(&alone, &want), bits_equal(&again, &want));
+            let pass = a1 && a2 && paired && gpu.fault()?.is_none();
+            println!(
+                "  mix_step_is_the_mix {} vectors, {nq} queries: alone {a1}, again {a2}, paired \
+                 with the message mix {paired} (enqueue_normed's bits): {}",
+                banks + 1,
+                verdict(pass)
+            );
+            out.push(pass);
+        }
+        let mut bad = MixCase::new(0x1e2a_01ff, 2, 2, 1);
+        for v in bad.banks.iter_mut() {
+            v[7] = f64::NAN;
+        }
+        let (card, _) = step_run(gpu, &step, &mut scratch, &bad, None)?;
+        let fault = gpu.fault()?;
+        let nan = card.iter().all(|v| v.is_nan());
+        let pass = fault.is_some() && nan;
+        println!(
+            "  mix_step_is_the_mix a NaN bank value: fault={fault:?} row_all_nan={nan} {}",
+            verdict(pass)
+        );
+        gpu.clear_fault()?;
         out.push(pass);
         Ok(out)
     }
@@ -1759,6 +2066,8 @@ mod gate {
         let mut results = Vec::new();
         results.extend(mix_clauses(&gpu, &mix)?);
         results.extend(mix_faults(&gpu, &mix)?);
+        results.extend(mix_step_clauses(&gpu, &mix)?);
+        results.extend(norm_proj_clauses(&gpu)?);
         results.extend(control_clauses(&gpu, &control)?);
         results.extend(conv_clauses(&gpu, &conv)?);
         results.extend(refusal_clauses(&gpu, &mix, &control, &conv)?);

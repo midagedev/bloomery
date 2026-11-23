@@ -573,21 +573,28 @@ mod gate {
     }
 
     /// The nodes one captured step holds, derived from the walk (`arch/inkling2/body.rs`) term by
-    /// term at one row, and the terms. A visit: its attention mix (a layer past the first), the
-    /// input norms (one on a windowed visit without messages, else three), six projections plus
-    /// a windowless visit's two conv taps, the k and v convs, the epilogue,
-    /// the attention's two launches (segments, merge), the output gate, the output projection,
-    /// its post conv and the join (a copy or an add); the feed-forward's mix, norm and router,
-    /// the card leg's four launches and its sum, the post conv and the stream's add; a visit with
-    /// messages adds the message mix and two controller launch pairs. A pass edge copies the
-    /// stream (pass 0) or the bank, its last row and the prelude back (a bank of no row copies
-    /// nothing). The step opens with the embedding's lookup and norm and closes with the head's
-    /// mix, norm, projection, softcap, padded-column copy and argmax.
-    pub(super) fn derived_nodes(hp: &Hparams, table: &[(u32, u32)]) -> (usize, String) {
-        const VISIT: usize = 6 + 2 + 1 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 5 + 1 + 1;
-        const MESSAGES: usize = 1 + 2 + 2;
+    /// term at one row, and the terms. A mix is the step mix's launch pair (scores, output). A
+    /// visit: its attention mix (a layer past the first), the input norms (one on a windowed visit
+    /// without messages, else three), six projections plus a windowless visit's two conv taps —
+    /// one launch for them all on a layer `norm_proj` names (the body's `norm_proj`) — the
+    /// k and v convs, the epilogue, the attention's two launches (segments, merge), the output
+    /// gate, the output projection, its post conv and the join (a copy or an add); the
+    /// feed-forward's mix, norm and router, the card leg's four launches and its sum, the post
+    /// conv and the stream's add; a visit with messages runs the message mix in its attention
+    /// mix's pair and adds two controller launch pairs. A pass edge copies the stream (pass 0) or
+    /// the bank, its last row and the prelude back (a bank of no row copies nothing). The step
+    /// opens with the embedding's lookup and norm and closes with the head's mix, norm,
+    /// projection, softcap, padded-column copy and argmax.
+    pub(super) fn derived_nodes(
+        hp: &Hparams,
+        table: &[(u32, u32)],
+        norm_proj: &[bool],
+    ) -> (usize, String) {
+        const MIX: usize = 2;
+        const VISIT: usize = 2 + 1 + 2 + 1 + 1 + 1 + 1 + MIX + 1 + 1 + 5 + 1 + 1;
+        const MESSAGES: usize = 2 + 2;
         const EMBED: usize = 2;
-        const HEAD: usize = 6;
+        const HEAD: usize = MIX + 5;
         let core = hp.loop_.filter(|lp| lp.passes > 1);
         let block = hp.block;
         let (mut visit, mut edges, mut pushed, mut prelude) = (0usize, 0usize, 0usize, 0usize);
@@ -606,11 +613,12 @@ mod gate {
                     pushed = prelude;
                 }
             }
-            visit += VISIT
-                + usize::from(l != 0)
-                + if windowed && !msg { 1 } else { 3 }
-                + if windowed { 0 } else { 2 }
-                + if msg { MESSAGES } else { 0 };
+            let front = if norm_proj[l] {
+                1
+            } else {
+                6 + if windowed && !msg { 1 } else { 3 } + if windowed { 0 } else { 2 }
+            };
+            visit += VISIT + front + MIX * usize::from(l != 0) + if msg { MESSAGES } else { 0 };
             if l.is_multiple_of(block) {
                 pushed += 1;
             }
@@ -627,8 +635,12 @@ mod gate {
         if !tier::run_clause("graph_nodes_are_the_walks", Tag::SelfConsistency)? {
             return Ok(true);
         }
-        let table = m.body(NAME)?.visit_table();
-        let (want, terms) = derived_nodes(hp, &table);
+        let body = m.body(NAME)?;
+        let table = body.visit_table();
+        let norm_proj: Vec<bool> = (0..body.stored_layers())
+            .map(|l| body.norm_proj(l))
+            .collect();
+        let (want, terms) = derived_nodes(hp, &table, &norm_proj);
         m.set_mode(StepMode::Graph);
         m.reset()?;
         let nodes = m.capture_step()?;

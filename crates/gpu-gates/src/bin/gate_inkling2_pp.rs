@@ -50,7 +50,7 @@
 //! Clauses 8 and 9 read the tier's model file (the fixture's on the fixture tier, the Mini's on
 //! the real tier): its expert stacks, nothing else. Clauses 10 to 12 load the whole file; 10 and
 //! 11 run on the fixture tier, where the sets are; the real tier runs 12 and the development
-//! timing (`DEV_P`, printed, no pin).
+//! timing (the pass at `DEV_P` rows and the graph step at `DEV_DEPTH`, printed, no pin).
 //!
 //! [derived] [`PP_BAND`]: the two kernels compute the same f32 rule in two orders — the step's
 //! lane dot and segment merge against the tensor core's k16 steps and the tile walk — with the
@@ -974,6 +974,11 @@ mod gate {
         const CTX_REAL: usize = 8192;
         /// The development timing's prompt lengths.
         const DEV_P: [usize; 2] = [512, 4096];
+        /// The development decode timing's depths (the prompt pass's rows before the steps), its
+        /// warm steps (the first captures the step) and its timed steps.
+        const DEV_DEPTH: [usize; 2] = [6, 4096];
+        const DEV_WARM: usize = 4;
+        const DEV_STEPS: usize = 64;
         const N_USED: usize = 8;
         const N_EXPERT: u32 = 128;
         /// The kept logits rows: every 64th row of a call and its last.
@@ -1498,7 +1503,9 @@ mod gate {
         }
 
         /// The development timing on the real tier: the pass's wall at each of [`DEV_P`] rows
-        /// from a reset, twice, after a warm pass; a development number, no lease.
+        /// from a reset, twice, after a warm pass; then the graph step's wall (refresh, replay,
+        /// the id's read) at each of [`DEV_DEPTH`] over [`DEV_STEPS`] greedy steps, twice;
+        /// development numbers, no lease.
         fn dev_timing(m: &mut GpuModel<Body>) -> Result<(), GateError> {
             let family = &inkling2::LCPP;
             let man = RefManifest::open(&family.path(inkling2::E), family)?;
@@ -1519,6 +1526,29 @@ mod gate {
                     );
                 }
             }
+            m.set_mode(StepMode::Graph);
+            for &depth in &DEV_DEPTH {
+                for run in 0..2 {
+                    m.reset()?;
+                    let mut id = m.prompt_pass(&ids[..depth])?;
+                    for _ in 0..DEV_WARM {
+                        id = m.step(&[id])?;
+                    }
+                    let t = std::time::Instant::now();
+                    for _ in 0..DEV_STEPS {
+                        id = m.step(&[id])?;
+                    }
+                    let s = t.elapsed().as_secs_f64();
+                    println!(
+                        "  dev step depth={} run {run}: {:.3} ms a step, {:.1} tok/s over {DEV_STEPS} \
+                         graph steps (development number: no lease)",
+                        depth + DEV_WARM,
+                        s * 1e3 / DEV_STEPS as f64,
+                        DEV_STEPS as f64 / s
+                    );
+                }
+            }
+            m.set_mode(StepMode::Eager);
             Ok(())
         }
 
