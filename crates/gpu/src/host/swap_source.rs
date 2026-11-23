@@ -251,11 +251,22 @@ pub fn hosted_stacks(
     what: &'static str,
     (run_len, empty): (usize, bool),
 ) -> Result<PlanStacks, GpuError> {
+    hosted_stacks_named(model, what, (run_len, empty), routed_stacks)
+}
+
+/// [`hosted_stacks`] over the file names `names` gives a layer's (gate, up, down): a family whose
+/// file fuses gate and up in one tensor names it twice, its two halves one type.
+pub fn hosted_stacks_named(
+    model: &ModelTensors,
+    what: &'static str,
+    (run_len, empty): (usize, bool),
+    names: fn(usize) -> [String; 3],
+) -> Result<PlanStacks, GpuError> {
     PlanStacks::of(
         model,
         StackFacts {
             what,
-            names: routed_stacks,
+            names,
             check: None,
             empty,
             map_layers: Some(run_len),

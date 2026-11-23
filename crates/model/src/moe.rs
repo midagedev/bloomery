@@ -2241,6 +2241,20 @@ pub struct SituSpec<'a> {
     pub linear_beta: f32,
 }
 
+/// What a host tier needs to serve one SiTU layer whose file fuses the gate and up stacks
+/// ([`HostLayer::build_situ_fused`]): the fused stack's tensor name — each expert's `ff` gate
+/// rows above its `ff` up rows, so the stack's dims are `{embd, 2 · ff, n_expert}` — the down's,
+/// the expert count, the widths and the two betas of the rule.
+pub struct FusedSituSpec<'a> {
+    pub gate_up: &'a str,
+    pub down: &'a str,
+    pub n_expert: usize,
+    pub embd: usize,
+    pub ff: usize,
+    pub beta: f32,
+    pub linear_beta: f32,
+}
+
 /// What a host tier needs to serve one relu² layer's routed experts
 /// ([`ExpertForm::Relu2`]): the two stacks' tensor names, the expert count and
 /// the widths — `embd` the width the experts run in, `ff` this layer's own.
@@ -2845,6 +2859,56 @@ impl HostLayer {
         )
     }
 
+    /// [`HostLayer::build_situ`] over a file that fuses the gate and up stacks
+    /// ([`FusedSituSpec`]): the gate is the lower half of each expert's matrix of the fused
+    /// stack and the up its upper half ([`ShardTensor::fused_half`]), read in place, so the
+    /// host tier holds no second copy of the stack. Refused by name: a betas as
+    /// [`HostLayer::build_situ`] refuses them, a fused stack whose dims are not
+    /// `{embd, 2 · ff, n_expert}`, and a source that reads an r8 sidecar (the sidecar holds
+    /// the two stacks apart).
+    pub fn build_situ_fused(
+        src: R8Source<'_>,
+        spec: &FusedSituSpec<'_>,
+    ) -> Result<HostLayer, ModelError> {
+        for (key, v) in [
+            ("situ beta", spec.beta),
+            ("situ linear beta", spec.linear_beta),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                return Err(ModelError::Metadata {
+                    key: key.to_string(),
+                    detail: format!("the beta must be finite and positive, got {v}"),
+                });
+            }
+        }
+        if src.sidecar().is_some() {
+            return Err(ModelError::Metadata {
+                key: spec.gate_up.to_string(),
+                detail: "a fused gate·up stack is served from the source's own file; the r8 \
+                         sidecar holds the gate and the up apart"
+                    .to_string(),
+            });
+        }
+        let split = src.split();
+        let (n_expert, embd, ff) = (spec.n_expert, spec.embd, spec.ff);
+        let fused = ShardTensor::find(split, spec.gate_up)?;
+        expect_stack(fused.info(), embd, 2 * ff, n_expert)?;
+        let down_stack = ShardTensor::find(split, spec.down)?;
+        expect_stack(down_stack.info(), ff, embd, n_expert)?;
+        expert_view(down_stack.info(), 0, n_expert)?;
+        let gate = ShardTensor::fused_half(split, spec.gate_up, false)?;
+        let up = ShardTensor::fused_half(split, spec.gate_up, true)?;
+        Self::assemble(
+            split,
+            (Some(GateUp::File(gate)), GateUp::File(up), down_stack),
+            (n_expert, embd, ff),
+            ExpertForm::Situ {
+                beta: spec.beta,
+                linear_beta: spec.linear_beta,
+            },
+        )
+    }
+
     /// [`HostLayer::build`] for a relu² layer ([`Relu2Spec`]): the up and the
     /// down checked as the gated build checks them, no gate stack looked for.
     /// The form rides beside the spec like the r8 sidecar does: an activation
@@ -2903,6 +2967,17 @@ impl HostLayer {
                 (gate, GateUp::R8(R8Stack::of(src, up)?))
             }
         };
+        Self::assemble(split, (gate, up, down_stack), (n_expert, embd, ff), form)
+    }
+
+    /// The layer over its three stacks once they are found and checked: the union call's own
+    /// check of every stack ([`UnionStack::of_call`]), the paths announced, the layer made.
+    fn assemble(
+        split: &Split,
+        (gate, up, down_stack): (Option<GateUp>, GateUp, ShardTensor),
+        (n_expert, embd, ff): (usize, usize, usize),
+        form: ExpertForm,
+    ) -> Result<HostLayer, ModelError> {
         // A relu² layer's stacks as the union reads them: the up again in the
         // gate's slot, one stack where the gated form reads two.
         let gate_stack = || match &gate {
@@ -3624,8 +3699,9 @@ impl HostLayer {
 #[cfg(test)]
 mod tests {
     use super::{
-        Buckets, HostLayer, HostLayerSpec, HostScratch, Relu2Spec, SituSpec, TOUCHED, UnionScratch,
-        check_host_call, gather_expert_inputs, last_touched_experts, relist, reset_touched,
+        Buckets, FusedSituSpec, HostLayer, HostLayerSpec, HostScratch, Relu2Spec, SituSpec,
+        TOUCHED, UnionScratch, check_host_call, gather_expert_inputs, last_touched_experts, relist,
+        reset_touched,
     };
     use crate::ops::{self, ExpertForm, RowLayout, Tensor2};
     use crate::r8file::{HostR8, R8Source, Sidecar};
@@ -3816,6 +3892,135 @@ mod tests {
                 swiglu_limit: 0.0,
             },
         )
+    }
+
+    /// The fused form of [`layer_file`]'s file: one `gate_up_exps` stack whose expert `e` is
+    /// the gate's matrix `e` above the up's (the converter's un-interleaved form) and the same
+    /// down; returns its path.
+    fn fused_layer_file(
+        tag: &str,
+        split_path: &str,
+        tys: [GgmlType; 3],
+        embd: usize,
+        ff: usize,
+        n_expert: usize,
+    ) -> String {
+        let g = gguf::Gguf::open(split_path).unwrap();
+        let bytes = |name: &str| g.data(g.find(name).unwrap()).unwrap().to_vec();
+        let (gate, up, down) = (bytes("gate_exps"), bytes("up_exps"), bytes("down_exps"));
+        let per = gate.len() / n_expert;
+        let mut fused = Vec::with_capacity(2 * gate.len());
+        for e in 0..n_expert {
+            fused.extend_from_slice(&gate[e * per..(e + 1) * per]);
+            fused.extend_from_slice(&up[e * per..(e + 1) * per]);
+        }
+        let tensors = [
+            (
+                TensorDecl {
+                    name: "gate_up_exps".to_string(),
+                    dims: vec![embd as u64, 2 * ff as u64, n_expert as u64],
+                    type_id: tys[0].as_u32(),
+                    nbytes: fused.len() as u64,
+                },
+                fused,
+            ),
+            (
+                TensorDecl {
+                    name: "down_exps".to_string(),
+                    dims: vec![ff as u64, embd as u64, n_expert as u64],
+                    type_id: tys[2].as_u32(),
+                    nbytes: down.len() as u64,
+                },
+                down,
+            ),
+        ];
+        let layout = Layout::new(&[], tensors.iter().map(|(t, _)| t.clone()).collect()).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "bloomery-moe-{}-{tag}-fused.gguf",
+            std::process::id()
+        ));
+        let mut w = Writer::new(std::fs::File::create(&path).unwrap(), layout).unwrap();
+        for (t, b) in &tensors {
+            w.tensor(&t.name, b).unwrap();
+        }
+        w.finish().unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A SiTU layer over a fused gate·up stack ([`HostLayer::build_situ_fused`]) serves bit for
+    /// bit what the layer over the same bytes as two stacks serves: both halves are file runs of
+    /// the one tensor, the gate the lower rows of each expert's matrix and the up the upper. A
+    /// fused stack of another height is refused by name, and the halves are not interchangeable
+    /// (the layer over swapped halves serves another result).
+    #[test]
+    fn fused_situ_layer_serves_what_the_split_layer_serves() {
+        let (embd, ff, n_expert) = (256, 256, 3);
+        let (beta, linear_beta) = (1.5f32, 4.0f32);
+        let tys = [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q4_K];
+        let split_path = layer_file("fused-split", tys, embd, ff, n_expert);
+        let fused_path = fused_layer_file("fused", &split_path, tys, embd, ff, n_expert);
+        let split = gguf::Split::open(&split_path).unwrap();
+        let fused = gguf::Split::open(&fused_path).unwrap();
+        let two = HostLayer::build_situ(
+            R8Source::rows(&split),
+            &SituSpec {
+                gate: "gate_exps",
+                up: "up_exps",
+                down: "down_exps",
+                n_expert,
+                embd,
+                ff,
+                beta,
+                linear_beta,
+            },
+        )
+        .unwrap();
+        let one = |ff: usize| {
+            HostLayer::build_situ_fused(
+                R8Source::rows(&fused),
+                &FusedSituSpec {
+                    gate_up: "gate_up_exps",
+                    down: "down_exps",
+                    n_expert,
+                    embd,
+                    ff,
+                    beta,
+                    linear_beta,
+                },
+            )
+        };
+        let one_layer = one(ff).unwrap();
+        let x = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let list = [(2u32, 0.5f32), (0, 0.25), (1, 0.125)];
+        let run = |layer: &HostLayer, src: R8Source<'_>| {
+            let mut host = HostScratch::new(embd, ff, list.len()).unwrap();
+            let mut out = vec![f32::NAN; embd];
+            layer
+                .experts_into(src, &x, &list, &mut out, &mut host)
+                .unwrap();
+            out
+        };
+        let want = run(&two, R8Source::rows(&split));
+        let got = run(&one_layer, R8Source::rows(&fused));
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the fused layer must serve the split layer's bits"
+        );
+        assert!(
+            want.iter().any(|&v| v != 0.0),
+            "the layer must serve something"
+        );
+        let e = one(ff / 2).err().expect("a fused stack of another height");
+        assert!(e.to_string().contains("expert stack"), "{e}");
+        std::fs::remove_file(split_path).ok();
+        std::fs::remove_file(fused_path).ok();
     }
 
     /// A layer with a stack the union cannot run — an f32 gate, no fused

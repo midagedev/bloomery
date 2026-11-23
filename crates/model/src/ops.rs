@@ -1185,6 +1185,66 @@ impl ShardTensor {
         }
     }
 
+    /// One half of the fused gate·up stack `name`, `{k, 2 · n, n_expert}`, as a stack of its own
+    /// `{k, n, n_expert}` over the same bytes: matrix `e` of the lower half (`upper` false, the
+    /// gate) is the first `n` rows of expert `e`'s matrix of the fused stack and of the upper
+    /// half (the up) the next `n` — the converter's un-interleaved form, each expert's gate rows
+    /// above its up rows. The halves are file runs ([`StackRuns`]), so nothing is copied; the
+    /// fused tensor's per-expert scale, for a type that reads one, is both halves'. Refused by
+    /// name: a tensor that is not a stack of an even row count, and a stack the split keeps
+    /// located or made rather than in one run of its shard.
+    pub fn fused_half(
+        split: &Split,
+        name: &str,
+        upper: bool,
+    ) -> Result<ShardTensor, crate::ModelError> {
+        let whole = ShardTensor::find(split, name)?;
+        let refuse = |what: &'static str| crate::ModelError::HostLayout {
+            what,
+            tensor: name.to_string(),
+            layout: RowLayout::Rows.name(),
+        };
+        if whole.runs.is_some() {
+            return Err(refuse(
+                "a fused stack is read from its tensor's one run of its shard",
+            ));
+        }
+        let info = whole.info();
+        let (n_expert, per) = stack_cut(info)?;
+        let rows = n_of(info);
+        if rows == 0 || !rows.is_multiple_of(2) || !per.is_multiple_of(2) {
+            return Err(refuse(
+                "a fused stack holds an even number of rows an expert",
+            ));
+        }
+        let (shard, run) = split.run(name)?;
+        let half = (per / 2) as u64;
+        let at: Vec<u64> = (0..n_expert)
+            .map(|e| run.start + (e * per) as u64 + if upper { half } else { 0 })
+            .collect();
+        let runs = StackRuns::new(
+            RowLayout::Rows,
+            (vec![shard; n_expert], at),
+            (Vec::new(), Vec::new()),
+            half,
+            0,
+        )?;
+        let mut dims = info.dims.clone();
+        dims[1] /= 2;
+        Ok(ShardTensor {
+            shard,
+            info: TensorInfo {
+                name: format!("{name}[{}]", if upper { "up" } else { "gate" }),
+                dims,
+                ty: info.ty,
+                offset: info.offset,
+                nbytes: half * n_expert as u64,
+            },
+            runs: Some(Arc::new(runs)),
+            scale: whole.scale.clone(),
+        })
+    }
+
     /// The stacked tensor as a union call reads it, its bytes resolved once
     /// ([`ExpertStack`]).
     pub(crate) fn stack<'a>(

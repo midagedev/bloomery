@@ -40,6 +40,17 @@ pub enum FfnKind {
     Moe,
 }
 
+impl FfnKind {
+    /// `ffn`'s program.
+    #[must_use]
+    pub fn of(ffn: &Ffn) -> FfnKind {
+        match ffn {
+            Ffn::Dense { .. } => FfnKind::Dense,
+            Ffn::Moe(_) => FfnKind::Moe,
+        }
+    }
+}
+
 /// How a layer's input and output meet the residual.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResidualKind {
@@ -81,10 +92,7 @@ impl Layer {
                 Mixer::RelBias(_) => panic!("a rel-bias layer runs in no program yet"),
                 Mixer::None => MixerKind::None,
             },
-            ffn: match spec.ffn {
-                Ffn::Dense { .. } => FfnKind::Dense,
-                Ffn::Moe(_) => FfnKind::Moe,
-            },
+            ffn: FfnKind::of(&spec.ffn),
             residual: match spec.residual {
                 Residual::Plain => ResidualKind::Plain,
                 Residual::Hc => ResidualKind::Hc,
@@ -133,9 +141,11 @@ impl fmt::Display for NoRun {
 }
 
 /// The layers a host tier serves: those with a host leg ([`Layer::host_leg`]),
-/// which must be one run of consecutive layers — the rows of a slot map.
+/// which must be one run of consecutive layers — the rows of a slot map. The leg is the
+/// feed-forward block's alone, so a layer whose mixer or residual no program here runs (a
+/// body with its own sub-layer programs) has its place in the run.
 pub fn hosted(layers: &[LayerSpec]) -> Result<Range<usize>, NoRun> {
-    let leg = |l: &LayerSpec| Layer::of(l).host_leg();
+    let leg = |l: &LayerSpec| FfnKind::of(&l.ffn) == FfnKind::Moe;
     let first = layers.iter().position(leg).ok_or(NoRun::None)?;
     let last = layers.iter().rposition(leg).ok_or(NoRun::None)?;
     let run = first..last + 1;
@@ -295,6 +305,35 @@ mod tests {
         assert_eq!(hosted(&g), Err(NoRun::Gap { at: 20, run: 3..45 }));
         let dense: Vec<LayerSpec> = g[..3].to_vec();
         assert_eq!(hosted(&dense), Err(NoRun::None));
+    }
+
+    /// A body with its own sub-layer programs (Inkling 2: rel-bias attention, the attention-
+    /// residual mix) still gets its host run: the leg is the feed-forward block's alone.
+    #[test]
+    fn hosted_run_needs_no_program_for_the_mixer() {
+        let mut g = glm();
+        for l in &mut g {
+            l.mixer = Mixer::RelBias(models::RelBias {
+                heads: 1,
+                kv_heads: 1,
+                head_dim: 1,
+                window: Some(1024),
+                out_gate: models::OutGate::None,
+                d_rel: 1,
+                extent: 1,
+                qk_clip: 1.0,
+                rel_clip: 1.0,
+                log_floor: 1,
+                log_alpha: 1.0,
+                taps: 3,
+                dynamic: false,
+            });
+            l.residual = Residual::AttnResMix {
+                block: 1,
+                queries: 1,
+            };
+        }
+        assert_eq!(hosted(&g), Ok(3..45));
     }
 
     /// GLM's stores: a KDA layer's conv window and recurrent state, a latent
