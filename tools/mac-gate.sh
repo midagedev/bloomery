@@ -14,14 +14,22 @@
 # it. 75 = the lock was not free within the wait (contention, not a gate failure). 69 = the lock file cannot be opened.
 # 64 = usage, a bad bound, a host that is not Darwin arm64, BLOOMERY_CARD or GATE_CARD set (a box card name). 78 = macOS
 # below 26.2, a macOS version that cannot be read, or no Metal device (the code the gate bin also uses when it is run
-# off macOS). 2 = no such binary.
+# off macOS). 2 = no such binary. 65 = the binary is older than a source it was built from: this script builds nothing,
+# so a binary cargo has not relinked since an edit would gate the old code.
+#
+# Freshness: a binary with cargo's dep-info beside it (`<binary>.d`) is held to every file that names, and to the paths
+# a build script it names (a file under `build/<pkg>-<hash>/out/`) watches by `cargo:rerun-if-changed` in its `output`
+# (a directory: every file under it; a relative path: from the crate of that package in this tree, where the Metal
+# kernels live). Newer than the binary is stale, the file named. A binary with no dep-info (copied, not built here) is
+# not checked.
 #
 # Environment: BLOOMERY_GATE_BOUND (whole seconds, 900 unset; parsed by tools/gate-bound.sh like every gate runner's),
 # MAC_GATE_LOCK (the lock file), MAC_GATE_LOCK_WAIT (seconds to wait for the lock, 1800), MAC_GATE_KILL_GRACE (seconds
 # between TERM and KILL, 10), MAC_GATE_BIN_DIR (where a bare name is looked for, target/release).
 # Test seams, read only while `--self-test` runs its children (it sets MAC_GATE_SELF_TEST): MAC_GATE_TEST_HOST,
-# MAC_GATE_TEST_ARCH, MAC_GATE_TEST_OS, MAC_GATE_TEST_DEVICE (yes|no). They let the self-test run, and refuse, as
-# another host, another macOS or a machine with no Metal device; they work on a non-Darwin host too.
+# MAC_GATE_TEST_ARCH, MAC_GATE_TEST_OS, MAC_GATE_TEST_DEVICE (yes|no), MAC_GATE_TEST_ROOT (the tree whose crates a build
+# script's relative watch is read from). They let the self-test run, and refuse, as another host, another macOS or a
+# machine with no Metal device; they work on a non-Darwin host too.
 set -u
 
 PROG="$(basename "$0")"
@@ -252,12 +260,77 @@ sys.exit(cause)
 PY
 }
 
+stale_source() {
+  # stale_source <binary>: prints the first source newer than the binary, nothing when it is fresh or has no dep-info.
+  local root
+  root=$(seam MAC_GATE_TEST_ROOT)
+  [ -n "$root" ] || root=$(cd "$PROG_DIR/.." && pwd)
+  python3 -I - "$1" "$root" <<'PY'
+import os, re, sys
+bin_path, root = sys.argv[1], sys.argv[2]
+dep = bin_path + ".d"
+if not os.path.isfile(dep):
+    sys.exit(0)
+built = os.stat(bin_path).st_mtime
+text = open(dep).read()
+_, _, deps = text.partition(": ")
+# dep-info escapes a space in a path as "\ ".
+paths = [p.replace("\x00", " ") for p in deps.replace("\\ ", "\x00").split()]
+seen_builds = set()
+def newer(path):
+    try:
+        return os.stat(path).st_mtime > built
+    except FileNotFoundError:
+        return True
+def crate_dir(pkg):
+    for d in sorted(os.listdir(os.path.join(root, "crates"))):
+        toml = os.path.join(root, "crates", d, "Cargo.toml")
+        if os.path.isfile(toml) and re.search(r'^name\s*=\s*"%s"' % re.escape(pkg), open(toml).read(), re.M):
+            return os.path.join(root, "crates", d)
+    return None
+def walk(path):
+    if os.path.isdir(path):
+        for top, _, files in os.walk(path):
+            for f in files:
+                yield os.path.join(top, f)
+    else:
+        yield path
+for p in paths:
+    if newer(p):
+        print(p)
+        sys.exit(0)
+    m = re.match(r"(.*/build/(.+)-[0-9a-f]{16})/out/", p)
+    if m and m.group(1) not in seen_builds:
+        seen_builds.add(m.group(1))
+        out = os.path.join(m.group(1), "output")
+        if not os.path.isfile(out):
+            continue
+        base = crate_dir(m.group(2))
+        for line in open(out):
+            w = line.strip().removeprefix("cargo::").removeprefix("cargo:")
+            if not w.startswith("rerun-if-changed="):
+                continue
+            watched = w.split("=", 1)[1]
+            if not os.path.isabs(watched):
+                if base is None:
+                    continue
+                watched = os.path.join(base, watched)
+            for f in walk(watched):
+                if newer(f):
+                    print(f)
+                    sys.exit(0)
+PY
+}
+
 run_gate() {
   # run_gate <binary> [args...]
   local bin
   bin=$(resolve_binary "$1")
   shift
   [ -x "$bin" ] || die 2 "the gate binary $bin is not there"
+  local stale
+  stale=$(stale_source "$bin")
+  [ -z "$stale" ] || die 65 "the gate binary $bin is older than $stale, a source it was built from: build it first (cargo build)"
   bound_seconds || exit $?
   local lock
   lock=$(lock_path)
@@ -341,6 +414,28 @@ self_test() {
     runner BLOOMERY_GATE_BOUND=1 "$PROG_DIR/mac-gate.sh" "$dir/stubborn"
   check "a lock file that cannot be opened is 69" 69 \
     runner MAC_GATE_LOCK="$dir" "$PROG_DIR/mac-gate.sh" "$dir/code3"
+
+  # Freshness against cargo's dep-info: a source newer than the binary is 65 and nothing runs; older, the gate runs. A
+  # build script's watched kernel directory, relative to its crate, counts too.
+  mkdir -p "$dir/tree/crates/k/kernels" "$dir/tree/target/build/k-0123456789abcdef/out"
+  printf '[package]\nname = "k"\n' >"$dir/tree/crates/k/Cargo.toml"
+  printf 'old\n' >"$dir/tree/crates/k/src.rs"
+  printf 'old\n' >"$dir/tree/crates/k/kernels/a.metal"
+  printf 'lib\n' >"$dir/tree/target/build/k-0123456789abcdef/out/k.metallib"
+  printf 'cargo:rerun-if-changed=kernels\n' >"$dir/tree/target/build/k-0123456789abcdef/output"
+  touch -t 202601010000 "$dir/tree/crates/k/src.rs" "$dir/tree/crates/k/kernels/a.metal" \
+    "$dir/tree/target/build/k-0123456789abcdef/out/k.metallib"
+  cp "$dir/code3" "$dir/fresh3"
+  printf '%s: %s %s\n' "$dir/fresh3" "$dir/tree/crates/k/src.rs" "$dir/tree/target/build/k-0123456789abcdef/out/k.metallib" \
+    >"$dir/fresh3.d"
+  check "a binary newer than its sources runs" 3 runner MAC_GATE_TEST_ROOT="$dir/tree" "$PROG_DIR/mac-gate.sh" "$dir/fresh3"
+  touch "$dir/tree/crates/k/kernels/a.metal"
+  check "a kernel its build script watches, edited after the build, is 65" 65 \
+    runner MAC_GATE_TEST_ROOT="$dir/tree" "$PROG_DIR/mac-gate.sh" "$dir/fresh3"
+  touch -t 202601010000 "$dir/tree/crates/k/kernels/a.metal"
+  touch "$dir/tree/crates/k/src.rs"
+  check "a source edited after the build is 65" 65 runner MAC_GATE_TEST_ROOT="$dir/tree" "$PROG_DIR/mac-gate.sh" "$dir/fresh3"
+  check "a binary with no dep-info is not checked" 3 runner "$PROG_DIR/mac-gate.sh" "$dir/code3"
 
   # The runner ended by TERM takes the gate with it: the gate's pid is gone, and the runner answers 143. The runner is
   # started directly (env, then this script, then python, all by exec), so $! is the pid that gets the signal.
