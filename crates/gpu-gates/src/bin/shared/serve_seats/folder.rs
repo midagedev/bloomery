@@ -89,23 +89,25 @@ pub fn open(dir: &Path, _arch: &str) -> Result<Opened, GateError> {
 }
 
 /// [`open`], with each BF16 or F32 matrix the map reads as Q8_0 written as Q8_0 at load where `q8`
-/// asks (`model_hf::folder::open_with`), every other part as stored, and an Inkling 2 folder's
-/// loop run at `passes` passes where one is asked (`model_hf::arch::inkling2::open_passes`).
+/// asks (`model_hf::folder::open_with`), every other part as stored.
 #[cfg(feature = "checkpoint")]
-pub fn open_with(
-    dir: &Path,
-    arch: &str,
-    q8: bool,
-    passes: Option<usize>,
-) -> Result<Opened, GateError> {
-    if !q8 && passes.is_none() {
+pub fn open_with(dir: &Path, arch: &str, q8: bool) -> Result<Opened, GateError> {
+    if !q8 {
         return open(dir, arch);
     }
-    let f = match passes {
-        None => model_hf::folder::open_with(dir, true),
-        Some(_) => model_hf::arch::inkling2::open_passes(dir, q8, passes),
-    }
-    .map_err(|e| format!("checkpoint folder {}: {e}", dir.display()))?;
+    adopt(dir, arch, model_hf::folder::open_with(dir, true))
+}
+
+/// The folder `read` by a seat's own reader from `dir`, held to architecture `arch` like [`open`]'s,
+/// a failed read named with the folder: for a seat whose architecture opens its folder in a way the
+/// common map reading does not.
+#[cfg(feature = "checkpoint")]
+pub fn adopt<E: std::fmt::Display>(
+    dir: &Path,
+    arch: &str,
+    read: Result<bloomery_gpu_gates::model_file::Folder, E>,
+) -> Result<Opened, GateError> {
+    let f = read.map_err(|e| format!("checkpoint folder {}: {e}", dir.display()))?;
     let f = held(dir, f, arch, &[])?;
     Ok(Opened {
         header: f.header,
@@ -116,12 +118,7 @@ pub fn open_with(
 
 /// A checkpoint folder in a build without the `checkpoint` feature, refused by name.
 #[cfg(not(feature = "checkpoint"))]
-pub fn open_with(
-    dir: &Path,
-    _arch: &str,
-    _q8: bool,
-    _passes: Option<usize>,
-) -> Result<Opened, GateError> {
+pub fn open_with(dir: &Path, _arch: &str, _q8: bool) -> Result<Opened, GateError> {
     Err(without_checkpoint(dir))
 }
 

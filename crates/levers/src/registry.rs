@@ -1570,8 +1570,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               reads the one set of weights; each pass keeps its own cache slots, so a step walks \
               `12 + 12 · passes` visits and the KV stores grow with it, and one pass has no \
               message at all. A folder of a fixed loop (the Mini) and a GGUF file refuse the lever \
-              by name. Unset runs the folder's `num_passes`. Read where the folder opens \
-              (`model_hf::arch::inkling2::open_passes`); the `load` line prints `passes=`.",
+              by name. Unset runs the folder's `num_passes`. Read where the folder opens, in \
+              the Inkling 2 folder reader; the `load` line prints `passes=`.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

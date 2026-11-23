@@ -218,6 +218,33 @@ enum Weights {
 /// The model's open on the engine thread ([`Weights::hand_over`]).
 type OpenModel = Box<dyn FnOnce() -> Result<Model, GateError> + Send>;
 
+/// The checkpoint folder `path` held to this architecture, its dense matrices written as Q8_0 at
+/// load where `q8` asks and its loop run at `passes` passes where one is asked
+/// (`model_hf::arch::inkling2::open_passes`, which sets the count in the folder's config before the
+/// map reads it).
+#[cfg(feature = "checkpoint")]
+fn open_folder(path: &Path, q8: bool, passes: Option<usize>) -> Result<folder::Opened, GateError> {
+    let arch = refset::arch::inkling2::ARCH;
+    match passes {
+        None => folder::open_with(path, arch, q8),
+        Some(_) => folder::adopt(
+            path,
+            arch,
+            model_hf::arch::inkling2::open_passes(path, q8, passes),
+        ),
+    }
+}
+
+/// A checkpoint folder in a build without the `checkpoint` feature, refused by name.
+#[cfg(not(feature = "checkpoint"))]
+fn open_folder(
+    path: &Path,
+    _q8: bool,
+    _passes: Option<usize>,
+) -> Result<folder::Opened, GateError> {
+    Err(folder::without_checkpoint(path))
+}
+
 impl Weights {
     /// The weights at `path`: a directory is the checkpoint folder, its dense matrices written as
     /// Q8_0 at load where `q8` asks (`BLOOMERY_INK2_DENSE`) and its loop run at `passes` passes
@@ -225,13 +252,10 @@ impl Weights {
     /// the GGUF file, which has no pass count to set.
     fn open(path: &Path, q8: bool, passes: Option<usize>) -> Result<Weights, GateError> {
         if path.is_dir() {
-            let f =
-                folder::open_with(path, refset::arch::inkling2::ARCH, q8, passes).map_err(|e| {
-                    match passes {
-                        Some(p) => format!("{}={p}: {e}", bloomery_levers::INK2_PASSES).into(),
-                        None => e,
-                    }
-                })?;
+            let f = open_folder(path, q8, passes).map_err(|e| match passes {
+                Some(p) => format!("{}={p}: {e}", bloomery_levers::INK2_PASSES).into(),
+                None => e,
+            })?;
             return Ok(Weights::Folder(Box::new(f)));
         }
         if let Some(p) = passes {

@@ -23,10 +23,13 @@
 # (default 512) tokens each, scored on the second half of every chunk (255 positions a chunk), so 3,060 positions a
 # domain at the defaults. A base file is 2 * n_vocab bytes a position, 1.2 GB a domain at those.
 #
-# Every run is CPU only (CUDA_VISIBLE_DEVICES hidden, -ngl 0, INK2_KLD_THREADS threads, default 32) and bounded by
-# `timeout` (INK2_KLD_BOUND seconds a run, default 1500); a run that fails leaves its log as <tag>.<domain>.log and
-# the script ends nonzero. The pid of the run in progress is in $INK2_KLD_DIR/<tag>.pid.
+# Every run is CPU only (CUDA_VISIBLE_DEVICES hidden, -ngl 0, INK2_KLD_THREADS threads, default 32) and bounded
+# (bounded_bg, tools/gate-bound.sh: INK2_KLD_BOUND seconds a run, default 1500); a run that fails leaves its log as
+# <tag>.<domain>.log and the script ends nonzero. The pid of the run in progress is in $INK2_KLD_DIR/<tag>.pid.
 set -euo pipefail
+HERE=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
+# shellcheck source=tools/gate-bound.sh
+source "$HERE/../gate-bound.sh" || exit 70
 
 mode=${1:?usage: inkling2-kld.sh base|score <gguf> <tag> [<base tag>]}
 model=${2:?missing the gguf}
@@ -66,19 +69,17 @@ for d in $domains; do
   if [ "$mode" = base ]; then
     out=$dir/$tag.$d.kld
     [ ! -e "$out" ] || { echo "inkling2-kld: $out exists" >&2; exit 64; }
-    timeout --kill-after=10 "$bound" "$bin" "${common[@]}" --kl-divergence-base "$out.part" >"$log" 2>&1 &
-    pid=$!
-    echo "$pid" >"$dir/$tag.pid"
-    wait "$pid" || { echo "inkling2-kld: $d base run failed (rc $?), see $log" >&2; exit 1; }
+    BG_OUT=$log bounded_bg "$bound" "$bin" "${common[@]}" --kl-divergence-base "$out.part"
+    echo "$BG_PID" >"$dir/$tag.pid"
+    bounded_bg_wait || { echo "inkling2-kld: $d base run failed (rc $?), see $log" >&2; exit 1; }
     mv "$out.part" "$out"
     grep -a "Final estimate" "$log" | sed "s/^/ppl tag=$tag domain=$d /" || true
   else
     ref=$dir/$base_tag.$d.kld
     [ -f "$ref" ] || { echo "inkling2-kld: no base $ref" >&2; exit 66; }
-    timeout --kill-after=10 "$bound" "$bin" "${common[@]}" --kl-divergence-base "$ref" --kl-divergence >"$log" 2>&1 &
-    pid=$!
-    echo "$pid" >"$dir/$tag.pid"
-    wait "$pid" || { echo "inkling2-kld: $d score run failed (rc $?), see $log" >&2; exit 1; }
+    BG_OUT=$log bounded_bg "$bound" "$bin" "${common[@]}" --kl-divergence-base "$ref" --kl-divergence
+    echo "$BG_PID" >"$dir/$tag.pid"
+    bounded_bg_wait || { echo "inkling2-kld: $d score run failed (rc $?), see $log" >&2; exit 1; }
     python3 - "$log" "$tag" "$base_tag" "$d" "$chunks" "$ctx" <<'PY'
 import re, sys
 log, tag, base, dom, chunks, ctx = sys.argv[1:7]

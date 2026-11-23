@@ -15,6 +15,9 @@ BIN=$1
 [ -x "$BIN" ] || { echo "ink2loop-ncu.sh: no binary at $BIN" >&2; exit 2; }
 # shellcheck source=tools/ref/ref-paths.sh
 source "$HERE/ref-paths.sh"
+# The server and the request are bounded children of the owner in tools/gate-bound.sh (bounded_bg, bounded).
+# shellcheck source=tools/gate-bound.sh
+source "$HERE/../gate-bound.sh" || exit 70
 [ "${MODEL_NAME:-}" = inkling2 ] || { echo "ink2loop-ncu.sh: BLOOMERY_MODEL=inkling2" >&2; exit 64; }
 KERNEL=${KERNEL:-loop_control_down} SKIP=${SKIP:-120} COUNT=${COUNT:-2} D=${D:-512} N=${N:-16} PORT=${PORT:-18191} BOUND=${BOUND:-900}
 OUT=${OUT:-$BLOOMERY_DATA/ncu}
@@ -31,28 +34,34 @@ print(json.dumps({"prompt": ids, "n_predict": int(sys.argv[1]), "temperature": 0
                   "cache_prompt": False, "return_tokens": False, "stream": False}))' "$N" > "$body"
 echo "[config] bin=$BIN kernel=$KERNEL skip=$SKIP count=$COUNT D=$D N=$N ncu=$($NCU --version | tail -1) out=$rep"
 echo "[apps-before] $(nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader | tr '\n' ';')"
-timeout --kill-after=10 "$BOUND" env -u BLOOMERY_REF_MODEL "$NCU" --target-processes all --graph-profiling node \
+BG_OUT=$rep.server.log bounded_bg "$BOUND" env -u BLOOMERY_REF_MODEL "$NCU" --target-processes all --graph-profiling node \
   --kernel-name "regex:^${KERNEL}\$" --launch-skip "$SKIP" --launch-count "$COUNT" --set full --import-source yes \
   -o "$rep" --force-overwrite \
-  "$BIN" -m "$MODEL" --host 127.0.0.1 --port "$PORT" > "$rep.server.log" 2>&1 &
-pid=$!
+  "$BIN" -m "$MODEL" --host 127.0.0.1 --port "$PORT" || exit $?
+pid=$BG_PID
 echo "[pid] ncu-timeout $pid"
+# server_end: SIGINT to the server so ncu writes its report, 120 s for it to end by itself, then the owner's stop for one
+# that stays (TERM, then KILL); the server's status is in BG_RC.
+server_end() {
+  kill -INT "$pid" 2> /dev/null
+  for _ in $(seq 1 120); do kill -0 "$pid" 2> /dev/null || break; sleep 1; done
+  if kill -0 "$pid" 2> /dev/null; then bounded_bg_stop; else bounded_bg_wait; fi
+}
 up=
 for _ in $(seq 1 "$BOUND"); do
   kill -0 "$pid" 2> /dev/null || break
   if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" 2> /dev/null)" = 200 ]; then up=1; break; fi
   sleep 1
 done
-[ -n "$up" ] || { echo "ink2loop-ncu.sh: the server did not answer /health" >&2; tail -n 20 "$rep.server.log" >&2; kill -INT "$pid" 2> /dev/null; wait "$pid"; exit 1; }
+[ -n "$up" ] || { echo "ink2loop-ncu.sh: the server did not answer /health" >&2; tail -n 20 "$rep.server.log" >&2; server_end; exit 1; }
 echo "[health] up"
-code=$(timeout --kill-after=10 600 curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @"$body" "http://127.0.0.1:$PORT/completion")
+status=$(mktemp "${TMPDIR:-/tmp}/ink2loop-status.XXXXXX")
+LEASE_BOUNDED_OUT=$status bounded 600 curl -sS -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' --data-binary @"$body" "http://127.0.0.1:$PORT/completion"
+code=$(< "$status")
 echo "[request] http $code"
-kill -INT "$pid" 2> /dev/null
-for _ in $(seq 1 120); do kill -0 "$pid" 2> /dev/null || break; sleep 1; done
-if kill -0 "$pid" 2> /dev/null; then kill -TERM "$pid" 2> /dev/null; fi
-wait "$pid"
-echo "[rc] ncu $?"
-rm -f "$body"
+server_end
+echo "[rc] ncu $BG_RC"
+rm -f "$body" "$status"
 [ -f "$rep.ncu-rep" ] || { echo "ink2loop-ncu.sh: no $rep.ncu-rep; log tail:" >&2; tail -n 20 "$rep.server.log" >&2; exit 1; }
 echo "[report] $rep.ncu-rep"
 "$NCU" -i "$rep.ncu-rep" --page details 2>&1 | grep -a -E "^  loop_control|Grid Size|Registers Per Thread|Duration|Elapsed Cycles|SM Frequency|Achieved Occupancy|Theoretical Occupancy|Issue Slots Busy|Executed Ipc Active|Warp Cycles Per Issued|Warp Cycles Per Executed|Eligible Warps|Active Warps Per Scheduler|DRAM Throughput|L1/TEX Hit Rate|L2 Hit Rate|Memory Throughput|stall|Stall|Local|Shared Memory Configuration Size" | head -60
