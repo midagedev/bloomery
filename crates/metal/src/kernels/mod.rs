@@ -44,6 +44,7 @@ mod experts;
 use crate::experts_geom;
 mod gemm;
 use crate::geometry;
+use inkling2::Pipelines as Ink2Pipelines;
 mod conv_res;
 mod head;
 mod head_f32;
@@ -255,7 +256,7 @@ pub struct Kernels {
     /// Inkling 2's own kernels: the normed mix, the residual conv, the qk
     /// epilogue, the controller, the out gate, the NVFP4 mat-vec, the sigmoid
     /// router, the situ combine, the f32 head and the rel-bias flash.
-    ink2: inkling2::Pipelines,
+    ink2: Ink2Pipelines,
     ink2_pass: ink2_pass::Pipelines,
     /// The pass's routing, grouped experts and row glue (`route.metal`,
     /// `gemm_routed.metal`).
@@ -549,7 +550,7 @@ impl Kernels {
             mtp_join: library.pipeline("mtp_join")?,
             bias_rows: library.pipeline("bias_rows")?,
             shortconv: shortconv::Pipelines::new(library)?,
-            ink2: inkling2::Pipelines::new(library)?,
+            ink2: Ink2Pipelines::new(library)?,
             ink2_pass: ink2_pass::Pipelines::new(library)?,
             routed: routed::RoutedPipelines::new(library)?,
             experts: experts::Pipelines::new(library, count)?,

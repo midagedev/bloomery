@@ -104,6 +104,12 @@ mac-test:
 lab-metal:
     cargo test -p bloomery-metal --lib --features encode-trace && cargo test -p bloomery-metal --features pipeline-scan,encode-trace --bin metal_scan && cargo test -p bloomery-metal --bin metal_attention_time --bin metal_gemm_time --bin metal_matvec_time --bin generate_metal --bin gate_metal_qwen35moe_kernels --bin bloomery-serve-metal && cargo build --release -p bloomery-metal --bin gate_metal_device --bin gate_metal_qwen35moe_kernels && ./tools/mac-gate.sh gate_metal_device && BLOOMERY_GATE_BOUND=1800 ./tools/mac-gate.sh gate_metal_qwen35moe_kernels && BLOOMERY_GATE_BOUND=8400 ./tools/mac-gate.sh gate_metal_qwen35moe_kernels --mutants-all
 
+# Inkling 2 Mini's MLX folder read back on an Apple Silicon Mac: every tensor's span summed per shard and in all, against
+# the resident bytes the Metal plan names. It reads the machine's own copy of the folder, `$BLOOMERY_REF_MODEL`, after
+# the device gate holds the Metal lock's checks (tools/mac-gate.sh).
+lab-metal-ink2-bytes:
+    bash tools/ref/needs-env.sh lab-metal-ink2-bytes BLOOMERY_REF_MODEL && cargo build --release -p bloomery-metal --bin gate_metal_device && ./tools/mac-gate.sh gate_metal_device && cargo test -p bloomery-metal --lib --features encode-trace -- --ignored --exact arch::inkling2::layout::tests::hw_inkling2_mini_mlx4_resident_bytes
+
 # The Metal session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh over eight rows (`--row`): the qwen35moe
 # MLX split, then the qwen3moe MLX split (attention layers only, no shared expert, no recurrent store; the clauses that
 # hold a delta contract print SKIP with their reason), then the qwen38d MLX split (Qwen3.8-27B's fixture: a dense FFN in

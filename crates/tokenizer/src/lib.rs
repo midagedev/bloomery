@@ -917,7 +917,7 @@ mod tests {
         let mut header = flint_header();
         header[1].1 = Value::String("gpt-4o".into());
         header.push((
-            "general.architecture".into(),
+            gguf::GENERAL_ARCHITECTURE.into(),
             Value::String("inkling2".into()),
         ));
         let gguf = from_header(&header).unwrap();

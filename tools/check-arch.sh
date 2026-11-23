@@ -228,6 +228,9 @@ dispatch=(
   'crates/gpu/src/lib.rs type NemotronHMoeModel'
   # gpu-vision 은 deepseek41v 탑 자신의 크레이트다(이름이 gpu-<arch> 가 아닐 뿐) — 인코더가 그 탑의 이름표를 읽는다.
   'crates/gpu-vision/src/encoder.rs use'
+  # PIN(2026-11-23): the Metal kernel table takes Inkling 2's pipelines through one aliased use, until they move under
+  # crates/metal/src/arch/inkling2.
+  'crates/metal/src/kernels/mod.rs use'
   # The same crate's second tower (the Qwen3-VL merger of Clef, Qwen3.6 and Qwen3.8) reads its file's
   # names and hyperparameters, and `open` is the one place that maps a file's projector type to a tower.
   'crates/gpu-vision/src/qwen3vl.rs use'
