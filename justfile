@@ -4682,7 +4682,7 @@ gate-inkling2-e2e:
 # error model, its first 32 greedy ids of set a printed. Real tier only (the folder has no fixture); BLOOMERY_INK2_OFFICIAL
 # names the folder (the gate is deferred by name where it is unset).
 gate-inkling2-official-card:
-    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/real-only.sh gate-inkling2-official-card && bash tools/ref/needs-env.sh gate-inkling2-official-card BLOOMERY_INK2_OFFICIAL && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_inkling2_official && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_official --folder "$BLOOMERY_INK2_OFFICIAL"'
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/needs-env.sh gate-inkling2-official-card BLOOMERY_INK2_OFFICIAL && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,checkpoint --release --bin gate_inkling2_official && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_official --folder "$BLOOMERY_INK2_OFFICIAL"'
 
 # Inkling 2's DSpark draft on the card (gate_inkling2_draft's doc): the common owner over the draft's three layers (the group-3
 # block attention over its own context rows), the fused context and the anchor form of the recurrent head, its correction
