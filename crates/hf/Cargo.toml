@@ -16,6 +16,9 @@ workspace = true
 bloomery-gguf = { path = "../gguf" }
 # A normalized tensor's new memory is advised onto huge pages.
 bloomery-os.workspace = true
+# `dspark::inkling2` plans a draft's taps against its target's layer applications, the loop's one
+# expansion (`models::visits`).
+bloomery-models = { path = "../models" }
 # `catalog` orders a model's formats by the placement's own card class, the one owner of it.
 bloomery-placement = { path = "../placement" }
 # `dspark` returns the draft's geometry as the runtime's `DsparkShape`; the runtime depends on the model

@@ -3041,6 +3041,14 @@ gate-hf-vocab-qwen38:
 gate-hf-vocab-kimi-k3:
     ./tools/box.sh 'bash tools/ref/needs-env.sh gate-hf-vocab-kimi-k3 BLOOMERY_KIMI_K3_HF && bash tools/gate.sh --release -p bloomery-hf --lib hw_the_kimi_k3_folder_derives_the_gguf_header_vocabulary -- --ignored --nocapture'
 
+# Inkling 2's DSpark draft from the Mini's folder (crates/hf, host only; BLOOMERY_INKLING2_HF names the folder, of which it reads
+# config.json and the header of mtp.safetensors): the config reads as the common shape (the anchor form of the recurrent head, the fused
+# context, the taps at the looped target's applications, the last the final row), the header holds every tensor the draft reads in BF16
+# at its shape and nothing else, and the load's plan (the target's Q8_0 or BF16 head in place, the fold's W2 and c, the fuse and rnn_proj
+# shapes) is the design's. No card.
+gate-hf-draft-inkling2:
+    ./tools/box.sh 'bash tools/ref/needs-env.sh gate-hf-draft-inkling2 BLOOMERY_INKLING2_HF && bash tools/gate.sh --release -p bloomery-hf --lib hw_the_inkling2_draft_header_plans -- --ignored --nocapture'
+
 # MiniMax-M3.1-Flash's vocabulary from its checkpoint folder (crates/hf, host only; BLOOMERY_MM31_HF names the folder, of which it reads the
 # tokenizer files, config.json and the chat template): the vocabulary `hf::vocab::keys` derives is MiniMax-M3's GGUF vocabulary (the
 # `minimax-m2` pre-tokenizer, tokens, token types and merges at their digests, the bos, eos, padding and unknown ids and the stop list; id

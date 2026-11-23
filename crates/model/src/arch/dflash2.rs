@@ -25,7 +25,7 @@
 //! statement; [`shape`] is the geometry the common DSpark owner runs it by.
 
 use gguf::{GgmlType, Split, Value};
-use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
+use runtime::dspark::{Context, DraftVocab, DsparkShape, HeadKind};
 
 use super::{DFLASH, meta_arr, meta_bool, meta_f32, meta_usize, metadata, n_vocab, positive};
 use crate::placement::PlacementError;
@@ -212,6 +212,7 @@ pub fn shape(hp: &Hparams) -> DsparkShape {
         row0_drafts: false,
         taps: hp.target_layers.clone(),
         hidden: hp.target_hidden,
+        context: Context::Fc,
         vocab: DraftVocab::Full { n: hp.n_vocab },
         mask_id: hp.mask_token,
         window: Some(hp.window),

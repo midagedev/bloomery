@@ -42,7 +42,9 @@
 use std::num::NonZeroU64;
 
 use gguf::{GgmlType, Split, Value};
-use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
+use runtime::dspark::{
+    Context, DraftVocab, DsparkShape, HeadKind, RnnCap, RnnOut, RnnRow, RnnStart,
+};
 
 use super::hparams::{Hparams as Target, YarnKeys};
 use super::names as stem;
@@ -281,11 +283,18 @@ pub fn shape(hp: &Hparams) -> DsparkShape {
         row0_drafts: hp.sample_from_anchor,
         taps: hp.target_layers.clone(),
         hidden: hp.n_embd,
+        context: Context::Fc,
         vocab: DraftVocab::Full { n: hp.n_vocab },
         mask_id: 0,
         window: Some(hp.window),
         head: HeadKind::MarkovRnn {
             rank: hp.markov_rank,
+            row: RnnRow {
+                start: RnnStart::Row0,
+                ctx: false,
+                cap: RnnCap::Projection,
+                out: RnnOut::Own,
+            },
         },
     }
 }
@@ -853,7 +862,10 @@ mod tests {
         assert_eq!((s.ids_per_block(), s.rows(3), s.first_row()), (3, 3, 0));
         assert_eq!(s.taps, vec![2, 19, 37, 55, 72]);
         assert_eq!(s.window, Some(2048));
-        assert_eq!(s.head, runtime::dspark::HeadKind::MarkovRnn { rank: 512 });
+        assert!(matches!(
+            s.head,
+            runtime::dspark::HeadKind::MarkovRnn { rank: 512, row } if row.start == runtime::dspark::RnnStart::Row0
+        ));
     }
 
     /// The tiny draft's statement written out as a file and read back: the

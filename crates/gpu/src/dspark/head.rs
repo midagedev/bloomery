@@ -30,7 +30,9 @@
 //! projection's logits first when its file states a soft cap, then runs
 //! [`super::rnn`]'s loop: a state carried down the rows, the correction
 //! from it, the argmax; six launches a row, the module doc's order. Its
-//! tables are Q8_0 rows over the target's vocabulary; it takes no map.
+//! tables are Q8_0 rows over the target's vocabulary; it takes no map. The
+//! loop launches one form of the row ([`RnnTail::ROW`]); a shape of another
+//! form is refused by name.
 //!
 //! Three heads run: the target's Q6_K matrix over the target's vocabulary
 //! (V4.1's draft), the draft's own Q8_0 rows over the same vocabulary, and
@@ -110,7 +112,7 @@ use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_cont
 use cuda_host::cuda_module;
 use std::sync::Arc;
 
-use runtime::dspark::{DraftVocab, HeadKind};
+use runtime::dspark::{BaseHead, DraftVocab, HeadKind, RnnCap, RnnOut, RnnRow, RnnStart};
 use runtime::selector::{Lattice, SelectorError, walk_p};
 
 use super::rnn::{self, RnnInputArgs, RnnKernels};
@@ -161,6 +163,16 @@ pub struct RnnTail {
 }
 
 impl RnnTail {
+    /// The row form the loop launches: row 0 drafts, the joint row holds no
+    /// context row, the cap is on the projection's logits and the correction
+    /// is the file's own `markov_w2`.
+    pub const ROW: RnnRow = RnnRow {
+        start: RnnStart::Row0,
+        ctx: false,
+        cap: RnnCap::Projection,
+        out: RnnOut::Own,
+    };
+
     /// The state's values: `markov_w1`'s row length.
     #[must_use]
     pub fn rank(&self) -> usize {
@@ -326,7 +338,10 @@ impl HeadWeights {
                 rank: 4 * t.pred.qs.cols(),
                 top_k: t.top_k,
             },
-            HeadTail::MarkovRnn(t) => HeadKind::MarkovRnn { rank: t.rank() },
+            HeadTail::MarkovRnn(t) => HeadKind::MarkovRnn {
+                rank: t.rank(),
+                row: RnnTail::ROW,
+            },
         }
     }
 
@@ -400,11 +415,17 @@ impl HeadWeights {
                     )),
                 }
             }
-            (HeadTail::MarkovRnn(t), HeadKind::MarkovRnn { rank }) => {
+            (HeadTail::MarkovRnn(t), HeadKind::MarkovRnn { rank, row }) => {
                 if *rank != t.rank() {
                     return Err(refuse(format!(
                         "a recurrent Markov rank of {rank} over tables of rank {}",
                         t.rank()
+                    )));
+                }
+                if *row != RnnTail::ROW {
+                    return Err(refuse(format!(
+                        "a recurrent row {row:?}: the loop launches {:?}",
+                        RnnTail::ROW
                     )));
                 }
                 match vocab {
@@ -908,10 +929,14 @@ impl Head {
                             .into(),
                     ));
                 }
+                let base = target.base();
+                BaseHead::plan(base.matrix, base.place).map_err(|e| refuse(e.to_string()))?;
                 let Some(proj) = target.q6k() else {
-                    return Err(refuse(
-                        "a Q8_0 target matrix: the head chain has a row kernel for Q6_K".into(),
-                    ));
+                    return Err(refuse(format!(
+                        "a {:?} target matrix {:?}: the head chain launches its projection on \
+                         Q6_K",
+                        base.matrix, base.place
+                    )));
                 };
                 proj.rows()
             }
@@ -1054,7 +1079,11 @@ impl Head {
         match &self.w.source {
             HeadSource::Target(TargetHead::Q6K(w)) => out.push(tensor(w)),
             // The target's buffer, not the draft's.
-            HeadSource::Target(TargetHead::Q6KInPlace(_)) => {}
+            HeadSource::Target(
+                TargetHead::Q6KInPlace(_)
+                | TargetHead::Q8_0InPlace { .. }
+                | TargetHead::Bf16InPlace(_),
+            ) => {}
             HeadSource::Target(TargetHead::Q8_0(q)) | HeadSource::Own(q) => {
                 out.push(q.qs.buf().num_bytes() as u64);
                 out.push(q.d.buf().num_bytes() as u64);

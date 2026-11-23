@@ -24,7 +24,7 @@
 use std::num::NonZeroU64;
 
 use gguf::{GgmlType, Split, Value};
-use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
+use runtime::dspark::{Context, DraftVocab, DsparkShape, HeadKind};
 
 use super::deepseek41::hparams::HyperConnections;
 use super::{meta_arr, meta_f32, meta_u64, meta_usize, metadata, n_vocab};
@@ -195,6 +195,7 @@ pub fn shape(hp: &DraftHparams) -> DsparkShape {
         row0_drafts: true,
         taps: hp.target_layers.clone(),
         hidden: hp.n_embd,
+        context: Context::Fc,
         vocab: DraftVocab::Full { n: hp.n_vocab },
         mask_id: hp.mask_token,
         window: Some(hp.window),

@@ -401,6 +401,7 @@ name = "bloomery-hf"
 version = "0.1.0"
 dependencies = [
  "bloomery-gguf",
+ "bloomery-models",
  "bloomery-os",
  "bloomery-placement",
  "bloomery-runtime",

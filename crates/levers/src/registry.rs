@@ -2158,6 +2158,11 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "The moonshotai/Kimi-K3 folder whose tokenizer files and config.json the hf crate's Kimi K3 vocabulary gate reads.",
     ),
     path(
+        "BLOOMERY_INKLING2_HF",
+        None,
+        "The Inkling 2 Mini folder whose config.json and mtp.safetensors header the hf crate's Inkling 2 draft gate reads.",
+    ),
+    path(
         "BLOOMERY_KIMI_K3_GGUF",
         None,
         "The K3 GGUF whose first shard's header the hf crate's Kimi K3 vocabulary gate holds the folder's vocabulary to, the box's UD-IQ1_S when unset.",

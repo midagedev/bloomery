@@ -1,12 +1,20 @@
 //! A DSpark draft's geometry ([`DsparkShape`]): what the draft file says about
-//! its block, the target layers it reads, its vocabulary against the target's,
-//! its mask token, its attention window and its head ([`HeadKind`]). Every
-//! field is the file's data,
-//! read once at load by the file's reader; no family's value is a constant in
-//! code. The card-side owner that runs a draft of this shape is
+//! its block, the target layers it reads and how it turns them into context
+//! rows ([`Context`]), its vocabulary against the target's, its mask token, its
+//! attention window and its head ([`HeadKind`]). Every field is the file's
+//! data, read once at load by the file's reader; no family's value is a
+//! constant in code. The card-side owner that runs a draft of this shape is
 //! `bloomery_gpu::dspark`.
+//!
+//! The plans a load makes from a shape and its target are here too, so a host
+//! test holds them: each tap against the target's layer applications
+//! ([`DsparkShape::tap_rows`]), the target's output matrix as the head reads it
+//! ([`BaseHead::plan`]) and the fold of a recurrent head whose correction runs
+//! through that matrix ([`DsparkShape::fold`]).
 
 use std::fmt;
+
+use models::Visit;
 
 /// What a DSpark draft file says about its geometry.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -19,13 +27,20 @@ pub struct DsparkShape {
     /// only the anchor and `w` ids take `w + 1` rows. The file's convention,
     /// set by its reader.
     pub row0_drafts: bool,
-    /// The target layers whose entering rows the draft reads
+    /// The target's layer applications whose entering rows the draft reads
     /// ([`crate::TapNeed::Layers`]), in the file's order: the residual row
-    /// entering layer `L` (HF `hidden_states[L]`). A file written in another
-    /// convention is converted by its reader.
+    /// entering application `L` (HF `hidden_states[L]`). An application is one
+    /// run of a stored layer in the target's run order, so a looped trunk's
+    /// core layers count once a pass ([`models::visits`]). `L` equal to the
+    /// application count is the row the target's head reads, past the last
+    /// application and the output norm (HF's last `hidden_states`;
+    /// [`DsparkShape::tap_rows`]). A file written in another convention is
+    /// converted by its reader.
     pub taps: Vec<usize>,
     /// The target's hidden width; one tap row is `taps.len() * hidden` floats.
     pub hidden: usize,
+    /// How a position's tapped rows become the draft's context rows.
+    pub context: Context,
     /// The draft's vocabulary against the target's.
     pub vocab: DraftVocab,
     /// The token the block's rows 1.. embed.
@@ -45,15 +60,17 @@ pub enum HeadKind {
     /// `rank` values, and the row's argmax is its id (serial over the rows).
     /// `confidence` says the file carries a confidence head.
     Markov { rank: usize, confidence: bool },
-    /// Mistral Large 4's gated Markov recurrence: a state of `rank` values,
-    /// zero at the block's first row, carried down the rows. Row `i`'s
-    /// `joint_proj` over `[state | markov_w1[prev] | normed row]` gives a
-    /// gate, a candidate and a correction vector; the state becomes `cand +
-    /// gate · (state − cand)` and `markov_w2 · tanh(correction)` is added to
-    /// the row's logits after the projection's soft cap. The row's argmax is
-    /// its id and the next row's `prev` (serial over the rows). Row 0
-    /// drafts: its `prev` is the block's first id.
-    MarkovRnn { rank: usize },
+    /// The gated Markov recurrence (Mistral Large 4's, Inkling 2's): a state
+    /// of `rank` values, zero at the first row that drafts, carried down the
+    /// rows. Row `i`'s `joint_proj` over `[state | markov_w1[prev] | normed
+    /// row]` (and the context's own row, [`RnnRow::ctx`]) gives a gate, a
+    /// candidate and a correction vector; the state becomes `cand + gate ·
+    /// (state − cand)` and the correction of `tanh(vector)` is added to the
+    /// row's logits. The row's argmax is its id and the next row's `prev`
+    /// (serial over the rows). The first drafting row's `prev` is the token at
+    /// the target's position. [`RnnRow`] holds the four facts the forms differ
+    /// in.
+    MarkovRnn { rank: usize, row: RnnRow },
     /// DFlash2's selector: every row after the anchor keeps the `top_k` ids
     /// its logits rank highest and scores each against each id the row
     /// before kept through factors of `rank` values
@@ -61,6 +78,177 @@ pub enum HeadKind {
     /// anchor and drafts nothing, and the draft's attention is non-causal
     /// over the block, so a block always runs whole.
     Selector { rank: usize, top_k: usize },
+}
+
+/// The facts a recurrent Markov head's row is built from, each its file's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RnnRow {
+    /// Where the recurrence starts.
+    pub start: RnnStart,
+    /// Whether the joint row ends with the context's own row,
+    /// `[state | markov_w1[prev] | normed row | context row]`: the last fuse mix
+    /// ([`Context::Fuse`]) of the position the block runs after, one row for
+    /// every row of the block.
+    pub ctx: bool,
+    /// Where the logit soft cap applies.
+    pub cap: RnnCap,
+    /// Where the correction comes from.
+    pub out: RnnOut,
+}
+
+/// The row a recurrent head's state starts at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RnnStart {
+    /// Row 0 drafts, and the state starts there: zero, its `prev` the block's
+    /// first id (the token at the target's position).
+    Row0,
+    /// Row 0 is the anchor and drafts nothing: the state starts at row 1, zero,
+    /// its `prev` the anchor's id. The same recurrence one row later.
+    Anchor,
+}
+
+/// Where a recurrent head's logit soft cap applies (its value is the file's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RnnCap {
+    /// On the projection's logits before the correction is added; the
+    /// correction is not capped.
+    Projection,
+    /// On the sum of the projection's logits and the correction; the row's id
+    /// is the first maximum after the cap.
+    Sum,
+}
+
+/// Where a recurrent head's correction comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RnnOut {
+    /// The file's own `markov_w2`: one row of `rank` values a head id.
+    Own,
+    /// `hidden_out` (`rank` values to `hidden`, with a bias `b`) through the
+    /// target's output matrix: the correction is `output · (hidden_out ·
+    /// tanh(e) + b)`. The owner folds it at load ([`DsparkShape::fold`]).
+    Hidden,
+}
+
+impl RnnRow {
+    /// The joint row's width over normed rows of `hidden` values: the state,
+    /// the previous id's row and the normed row, then the context's row when
+    /// the head reads it.
+    #[must_use]
+    pub fn joint_in(&self, rank: usize, hidden: usize) -> usize {
+        2 * rank + hidden * (1 + usize::from(self.ctx))
+    }
+}
+
+/// How a draft turns a position's tapped rows into its context rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Context {
+    /// `fc` over the tapped rows side by side (`taps.len() * hidden` values)
+    /// and the hidden norm after it: one context row a position, which every
+    /// draft layer reads.
+    Fc,
+    /// `mixes` softmax-weighted sums of the tapped rows, each RMS-normed by
+    /// its own gain: the fuse table is a row of `taps.len()` weights a mix
+    /// ([`DsparkShape::fuse_dims`]). Mix `l` is draft layer `l`'s context row;
+    /// under a recurrent head that reads the context ([`RnnRow::ctx`]) the
+    /// last mix is the head's.
+    Fuse { mixes: usize },
+}
+
+/// What a tap reads of its target ([`DsparkShape::tap_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapRow {
+    /// The residual row entering the target's `application`-th layer
+    /// application, a run of `visit.layer` in pass `visit.pass`.
+    Entering { application: usize, visit: Visit },
+    /// The row the target's head reads: past the last application and the
+    /// output norm.
+    Final,
+}
+
+/// The type of the target's output matrix a full-vocabulary draft's head
+/// reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadMatrix {
+    Q6K,
+    Q8_0,
+    Bf16,
+}
+
+/// Where a draft's head reads the target's output matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadPlace {
+    /// A copy on the draft's card: the draft's own bytes.
+    Copy,
+    /// The target's resident matrix, on the target's card: none of its bytes
+    /// the draft's.
+    InPlace,
+}
+
+/// The target's output matrix as a full-vocabulary draft's head reads it:
+/// the block's base projection, and the matrix a folded recurrent head's fold
+/// multiplies at load ([`DsparkShape::fold`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BaseHead {
+    pub matrix: HeadMatrix,
+    pub place: HeadPlace,
+}
+
+impl BaseHead {
+    /// The head planned for `matrix` at `place`: a Q6_K matrix copied or in
+    /// place, a Q8_0 or BF16 matrix in place. A copy of a Q8_0 or BF16 matrix
+    /// is refused by name: the matrix is read where the target holds it, and
+    /// a copy would only take the draft's card its bytes.
+    pub fn plan(matrix: HeadMatrix, place: HeadPlace) -> Result<BaseHead, DsparkError> {
+        match (matrix, place) {
+            (HeadMatrix::Q6K, _) | (_, HeadPlace::InPlace) => Ok(BaseHead { matrix, place }),
+            (HeadMatrix::Q8_0 | HeadMatrix::Bf16, HeadPlace::Copy) => {
+                Err(DsparkError::HeadCopy(matrix))
+            }
+        }
+    }
+
+    /// The draft's own card bytes for a matrix of `rows` rows of `cols`
+    /// values: none in place, the matrix's bytes for a copy (Q6_K: 210 bytes a
+    /// 256 values).
+    #[must_use]
+    pub fn own_bytes(&self, rows: usize, cols: usize) -> u64 {
+        let values = rows as u64 * cols as u64;
+        match (self.place, self.matrix) {
+            (HeadPlace::InPlace, _) => 0,
+            (HeadPlace::Copy, HeadMatrix::Q6K) => values / 256 * 210,
+            (HeadPlace::Copy, HeadMatrix::Q8_0) => values / 32 * 34,
+            (HeadPlace::Copy, HeadMatrix::Bf16) => values * 2,
+        }
+    }
+}
+
+/// A recurrent head whose correction runs through the target's output
+/// matrix ([`RnnOut::Hidden`]), folded at load: `W2 = output · hidden_out`,
+/// one Q8_0 row of `rank` values a head id, and `c = output · b`, one f32 a
+/// head id. A row then reads `W2 · tanh(e) + c`, `rows · rank` values, in
+/// place of the whole output matrix. The fold reorders the correction's float
+/// sum, so a draft id can differ from the unfolded form's at a near-tie; the
+/// verify decides every kept id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fold {
+    /// W2's rows and c's values: the ids the head scores.
+    pub rows: usize,
+    /// W2's row length: the head's rank.
+    pub rank: usize,
+}
+
+impl Fold {
+    /// W2's bytes: Q8_0, 34 bytes a 32 values.
+    #[must_use]
+    pub fn w2_bytes(&self) -> u64 {
+        self.rows as u64 * (self.rank as u64 / 32) * 34
+    }
+
+    /// c's bytes: one f32 a head id.
+    #[must_use]
+    pub fn c_bytes(&self) -> u64 {
+        self.rows as u64 * 4
+    }
 }
 
 /// The ids a draft's head scores.
@@ -90,6 +278,10 @@ pub enum DsparkError {
     Selector(&'static str),
     /// A recurrent Markov head over a shape that cannot host it.
     Rnn(&'static str),
+    /// A tap past the target's layer applications and its final row.
+    TapPast { tap: usize, applications: usize },
+    /// A copy of a target output matrix the head reads in place.
+    HeadCopy(HeadMatrix),
     /// A selector keeping more ids than the head scores.
     TopK { top_k: usize, rows: usize },
     /// A reduced map whose id `index` is `id`, past the target's `n_target`
@@ -118,6 +310,15 @@ impl fmt::Display for DsparkError {
             DsparkError::Zero(what) => write!(f, "dspark: a {what} of 0"),
             DsparkError::Selector(why) => write!(f, "dspark: a selector head {why}"),
             DsparkError::Rnn(why) => write!(f, "dspark: a recurrent Markov head {why}"),
+            DsparkError::TapPast { tap, applications } => write!(
+                f,
+                "dspark: tap {tap} past a target of {applications} layer applications (the \
+                 final row is tap {applications})"
+            ),
+            DsparkError::HeadCopy(m) => write!(
+                f,
+                "dspark: a copy of the target's {m:?} output matrix: the head reads it in place"
+            ),
             DsparkError::TopK { top_k, rows } => write!(
                 f,
                 "dspark: a selector keeping {top_k} ids of a head that scores {rows}"
@@ -205,6 +406,59 @@ impl DsparkShape {
         usize::from(!self.row0_drafts)
     }
 
+    /// The fuse table's rows and row length, `[mixes, taps]`: a row of
+    /// weights a mix, a weight a tap. `None` for an fc context.
+    #[must_use]
+    pub fn fuse_dims(&self) -> Option<[usize; 2]> {
+        match self.context {
+            Context::Fc => None,
+            Context::Fuse { mixes } => Some([mixes, self.taps.len()]),
+        }
+    }
+
+    /// The fold a recurrent head whose correction runs through the target's
+    /// output matrix takes at load, over the ids the head scores; `None` for
+    /// any other head.
+    #[must_use]
+    pub fn fold(&self) -> Option<Fold> {
+        match self.head {
+            HeadKind::MarkovRnn {
+                rank,
+                row:
+                    RnnRow {
+                        out: RnnOut::Hidden,
+                        ..
+                    },
+            } => Some(Fold {
+                rows: self.vocab.rows(),
+                rank,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Each tap against a target whose trunk runs `applications`, in run
+    /// order ([`models::visits`]): a tap below their count enters that
+    /// application, a tap at it is the final row, and a tap past it is refused
+    /// by name.
+    pub fn tap_rows(&self, applications: &[Visit]) -> Result<Vec<TapRow>, DsparkError> {
+        let n = applications.len();
+        self.taps
+            .iter()
+            .map(|&tap| match applications.get(tap) {
+                Some(&visit) => Ok(TapRow::Entering {
+                    application: tap,
+                    visit,
+                }),
+                None if tap == n => Ok(TapRow::Final),
+                None => Err(DsparkError::TapPast {
+                    tap,
+                    applications: n,
+                }),
+            })
+            .collect()
+    }
+
     /// Every field's own check, a named error per field.
     pub fn check(&self) -> Result<(), DsparkError> {
         if self.ids_per_block() == 0 {
@@ -216,20 +470,41 @@ impl DsparkShape {
         if self.hidden == 0 {
             return Err(DsparkError::Zero("hidden width"));
         }
+        if self.context == (Context::Fuse { mixes: 0 }) {
+            return Err(DsparkError::Zero("fuse mix count"));
+        }
         let n_target = self.vocab.n_target();
         match self.head {
             HeadKind::Markov { rank: 0, .. } => return Err(DsparkError::Zero("Markov rank")),
             HeadKind::Markov { .. } => {}
-            HeadKind::MarkovRnn { rank: 0 } => return Err(DsparkError::Zero("Markov rank")),
-            HeadKind::MarkovRnn { .. } => {
-                if !self.row0_drafts {
-                    return Err(DsparkError::Rnn(
-                        "drafts from row 0: its state starts at the block's first id",
-                    ));
+            HeadKind::MarkovRnn { rank: 0, .. } => return Err(DsparkError::Zero("Markov rank")),
+            HeadKind::MarkovRnn { rank, row } => {
+                match (row.start, self.row0_drafts) {
+                    (RnnStart::Row0, false) => {
+                        return Err(DsparkError::Rnn(
+                            "drafts from row 0: its state starts at the block's first id",
+                        ));
+                    }
+                    (RnnStart::Anchor, true) => {
+                        return Err(DsparkError::Rnn(
+                            "starts after the anchor: row 0 is the anchor and drafts nothing",
+                        ));
+                    }
+                    (RnnStart::Row0, true) | (RnnStart::Anchor, false) => {}
                 }
                 if matches!(self.vocab, DraftVocab::Reduced { .. }) {
                     return Err(DsparkError::Rnn(
                         "scores target ids: its tables are the target's vocabulary",
+                    ));
+                }
+                if row.ctx && !matches!(self.context, Context::Fuse { mixes } if mixes >= 2) {
+                    return Err(DsparkError::Rnn(
+                        "reads the context's own row: a fuse of a mix a layer and one more",
+                    ));
+                }
+                if row.out == RnnOut::Hidden && !rank.is_multiple_of(32) {
+                    return Err(DsparkError::Rnn(
+                        "folds its correction into Q8_0 rows: a rank that is a multiple of 32",
                     ));
                 }
             }
@@ -293,7 +568,30 @@ impl DsparkShape {
 
 #[cfg(test)]
 mod tests {
-    use super::{DraftVocab, DsparkError, DsparkShape, HeadKind};
+    use models::{LoopSpec, Visit, visits};
+
+    use super::{
+        BaseHead, Context, DraftVocab, DsparkError, DsparkShape, Fold, HeadKind, HeadMatrix,
+        HeadPlace, RnnCap, RnnOut, RnnRow, RnnStart, TapRow,
+    };
+
+    /// Mistral Large 4's recurrent row: row 0 drafts, no context row, the cap
+    /// on the projection, its own `markov_w2`.
+    const ROW0: RnnRow = RnnRow {
+        start: RnnStart::Row0,
+        ctx: false,
+        cap: RnnCap::Projection,
+        out: RnnOut::Own,
+    };
+
+    /// Inkling 2's: the anchor first, the context's row in the joint row, the
+    /// cap on the sum, the correction through the target's output matrix.
+    const ANCHOR: RnnRow = RnnRow {
+        start: RnnStart::Anchor,
+        ctx: true,
+        cap: RnnCap::Sum,
+        out: RnnOut::Hidden,
+    };
 
     fn shape(block: usize, vocab: DraftVocab) -> DsparkShape {
         DsparkShape {
@@ -301,6 +599,7 @@ mod tests {
             row0_drafts: true,
             taps: vec![2, 10, 20, 30, 37],
             hidden: 2048,
+            context: Context::Fc,
             vocab,
             mask_id: 5,
             window: Some(2048),
@@ -439,11 +738,14 @@ mod tests {
     #[test]
     fn a_recurrent_head_runs_a_row_an_id_and_is_checked_by_name() {
         let mut rnn = shape(3, DraftVocab::Full { n: 64 });
-        rnn.head = HeadKind::MarkovRnn { rank: 512 };
+        rnn.head = HeadKind::MarkovRnn {
+            rank: 512,
+            row: ROW0,
+        };
         assert_eq!(rnn.check(), Ok(()));
         assert_eq!((rnn.rows(3), rnn.first_row(), rnn.width(8)), (3, 0, 3));
         let mut zero = rnn.clone();
-        zero.head = HeadKind::MarkovRnn { rank: 0 };
+        zero.head = HeadKind::MarkovRnn { rank: 0, row: ROW0 };
         assert_eq!(zero.check(), Err(DsparkError::Zero("Markov rank")));
         let mut anchor = rnn.clone();
         anchor.row0_drafts = false;
@@ -491,5 +793,180 @@ mod tests {
             confidence: false,
         };
         assert_eq!(markov.check(), Err(DsparkError::Zero("Markov rank")));
+    }
+
+    /// Inkling 2's draft: a block of 8 whose row 0 is the anchor, four taps
+    /// fused into a mix a layer of three and one for the head, the recurrent
+    /// head of rank 256 over the target's 200,058 ids.
+    fn anchor_shape() -> DsparkShape {
+        DsparkShape {
+            row0_drafts: false,
+            taps: vec![5, 23, 41, 48],
+            hidden: 2304,
+            context: Context::Fuse { mixes: 4 },
+            mask_id: 0,
+            window: None,
+            head: HeadKind::MarkovRnn {
+                rank: 256,
+                row: ANCHOR,
+            },
+            ..shape(8, DraftVocab::Full { n: 200_058 })
+        }
+    }
+
+    /// The anchor form is a shape the owner takes: seven ids a block, eight
+    /// rows for the widest proposal, the first id at row 1. Each start is held
+    /// to the row 0 the file states: a row-0 start whose row 0 does not draft
+    /// is refused as before, an anchor start whose row 0 drafts likewise.
+    #[test]
+    fn an_anchor_recurrent_head_starts_after_the_anchor() {
+        let ink = anchor_shape();
+        assert_eq!(ink.check(), Ok(()));
+        assert_eq!(
+            (
+                ink.ids_per_block(),
+                ink.width(8),
+                ink.rows(7),
+                ink.first_row()
+            ),
+            (7, 7, 8, 1)
+        );
+        let mut row0 = ink.clone();
+        row0.head = HeadKind::MarkovRnn {
+            rank: 256,
+            row: RnnRow { ctx: true, ..ROW0 },
+        };
+        assert_eq!(
+            row0.check(),
+            Err(DsparkError::Rnn(
+                "drafts from row 0: its state starts at the block's first id"
+            ))
+        );
+        let mut drafts = ink;
+        drafts.row0_drafts = true;
+        assert_eq!(
+            drafts.check(),
+            Err(DsparkError::Rnn(
+                "starts after the anchor: row 0 is the anchor and drafts nothing"
+            ))
+        );
+    }
+
+    /// A fuse table is a row of one weight a tap for each mix; a head that
+    /// reads the context's own row needs a fuse with a mix past the layers',
+    /// and its joint row grows by one hidden row.
+    #[test]
+    fn a_fuse_is_a_row_of_tap_weights_a_mix() {
+        let mut three = anchor_shape();
+        three.taps = vec![5, 23, 48];
+        assert_eq!(three.check(), Ok(()));
+        assert_eq!(three.fuse_dims(), Some([4, 3]));
+        assert_eq!(anchor_shape().fuse_dims(), Some([4, 4]));
+        assert_eq!(shape(8, DraftVocab::Full { n: 64 }).fuse_dims(), None);
+        let mut none = anchor_shape();
+        none.context = Context::Fuse { mixes: 0 };
+        assert_eq!(none.check(), Err(DsparkError::Zero("fuse mix count")));
+        for context in [Context::Fc, Context::Fuse { mixes: 1 }] {
+            let mut fc = anchor_shape();
+            fc.context = context;
+            assert!(
+                matches!(fc.check(), Err(DsparkError::Rnn(_))),
+                "{context:?}"
+            );
+        }
+        assert_eq!(ANCHOR.joint_in(256, 2304), 5120);
+        assert_eq!(ROW0.joint_in(512, 7168), 8192);
+    }
+
+    /// Taps count the target's layer applications in run order: a looped
+    /// trunk's core layers once a pass, and the count itself names the row
+    /// the head reads. A tap past it is refused by name.
+    #[test]
+    fn a_tap_at_the_application_count_is_the_final_row() {
+        let loop_ = LoopSpec {
+            core_start: 6,
+            core_end: 18,
+            passes: 3,
+            gate_rank: 64,
+        };
+        let runs = visits(24, Some(loop_));
+        assert_eq!(runs.len(), 48);
+        let at = |application, layer, pass| TapRow::Entering {
+            application,
+            visit: Visit { layer, pass },
+        };
+        assert_eq!(
+            anchor_shape().tap_rows(&runs),
+            Ok(vec![
+                at(5, 5, 0),
+                at(23, 11, 1),
+                at(41, 17, 2),
+                TapRow::Final
+            ])
+        );
+        let mut past = anchor_shape();
+        past.taps = vec![5, 49];
+        assert_eq!(
+            past.tap_rows(&runs),
+            Err(DsparkError::TapPast {
+                tap: 49,
+                applications: 48
+            })
+        );
+    }
+
+    /// The target's Q8_0 or BF16 output matrix is planned in place, none of its
+    /// bytes the draft's, and a copy of either is refused by name. The anchor
+    /// head's correction folds into a Q8_0 W2 of a row a scored id and an f32
+    /// constant a scored id; a head on its own `markov_w2` folds nothing.
+    #[test]
+    fn the_target_head_is_planned_in_place_and_folded() {
+        for matrix in [HeadMatrix::Q6K, HeadMatrix::Q8_0, HeadMatrix::Bf16] {
+            let base = BaseHead::plan(matrix, HeadPlace::InPlace);
+            assert_eq!(
+                base,
+                Ok(BaseHead {
+                    matrix,
+                    place: HeadPlace::InPlace
+                })
+            );
+            assert_eq!(base.map(|b| b.own_bytes(201_024, 2304)), Ok(0));
+        }
+        assert_eq!(
+            BaseHead::plan(HeadMatrix::Q6K, HeadPlace::Copy).map(|b| b.own_bytes(256, 4)),
+            Ok(840)
+        );
+        for matrix in [HeadMatrix::Q8_0, HeadMatrix::Bf16] {
+            assert_eq!(
+                BaseHead::plan(matrix, HeadPlace::Copy),
+                Err(DsparkError::HeadCopy(matrix))
+            );
+        }
+        let fold = anchor_shape().fold();
+        assert_eq!(
+            fold,
+            Some(Fold {
+                rows: 200_058,
+                rank: 256
+            })
+        );
+        assert_eq!(
+            fold.map(|f| (f.w2_bytes(), f.c_bytes())),
+            Some((54_415_776, 800_232))
+        );
+        let mut own = anchor_shape();
+        own.head = HeadKind::MarkovRnn {
+            rank: 256,
+            row: RnnRow {
+                out: RnnOut::Own,
+                ..ANCHOR
+            },
+        };
+        assert_eq!(own.fold(), None);
+        own.head = HeadKind::MarkovRnn {
+            rank: 48,
+            row: ANCHOR,
+        };
+        assert!(matches!(own.check(), Err(DsparkError::Rnn(_))));
     }
 }

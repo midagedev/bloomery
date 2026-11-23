@@ -1,8 +1,8 @@
 //! A DSpark draft directory's geometry: `config.json` (and the `d2t` tensor of a reduced
 //! vocabulary) read into the runtime's [`DsparkShape`], and the dense backbone's own numbers
-//! ([`Backbone`]).
+//! ([`Backbone`]). A draft its target's own config states, Inkling 2's, is [`inkling2`]'s.
 //!
-//! Two layouts of the same draft are read:
+//! Two layouts of the same draft are read here:
 //! - **speculators** (`algorithm: dspark`, RedHatAI's Qwen3.6 draft): `aux_hidden_state_layer_ids`,
 //!   `block_size`, `draft_vocab_size`, `mask_token_id`, `markov_rank`, `enable_confidence_head` at
 //!   the top and the backbone's numbers in `transformer_layer_config`.
@@ -42,8 +42,10 @@
 //! draft_to_target[draft_idx]"; vLLM `vllm/model_executor/models/qwen3_dspark.py`:
 //! `return draft_ids + self.draft_id_to_target_id[draft_ids]`).
 
-use runtime::dspark::{DraftVocab, DsparkError, DsparkShape, HeadKind};
+use runtime::dspark::{Context, DraftVocab, DsparkError, DsparkShape, HeadKind};
 use serde_json::Value;
+
+pub mod inkling2;
 
 /// Why a draft's config or id map was refused.
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +79,8 @@ pub enum Error {
     MixedLayers,
     #[error("dspark config: {0}")]
     Unsupported(String),
+    #[error("dspark file: tensor `{name}` {detail}")]
+    Tensor { name: String, detail: String },
     #[error(transparent)]
     Shape(#[from] DsparkError),
 }
@@ -100,11 +104,17 @@ pub struct Backbone {
     pub eps: f32,
     /// The rotary base.
     pub rope_theta: f64,
-    /// How many context rows back each layer reads: `None` is the whole context.
+    /// How many context rows back a windowed layer reads: `None` is the whole context.
     pub window: Option<usize>,
+    /// Per layer, whether it reads `window` back (`true`) or the whole context (`false`).
+    pub windowed: Vec<bool>,
     /// Whether a block row attends to the block's earlier rows only (`true`), or to every row of
     /// the block (`false`).
     pub block_causal: bool,
+    /// Whether a context row's keys and values have projections of their own (`k_proj_ctx`,
+    /// `v_proj_ctx` and the key norm `k_norm_ctx`) apart from the block rows' (`true`), or come
+    /// from the layer's one set (`false`).
+    pub ctx_kv: bool,
 }
 
 struct Config {
@@ -337,6 +347,7 @@ pub fn shape(config_json: &str, d2t: Option<&[i64]>) -> Result<DsparkShape, Erro
         row0_drafts,
         taps,
         hidden,
+        context: Context::Fc,
         vocab,
         mask_id,
         window: window_of(&cfg)?,
@@ -439,8 +450,9 @@ pub fn backbone(config_json: &str) -> Result<Backbone, Error> {
             _ => window.is_some(),
         },
     };
+    let layers = size(bb, "num_hidden_layers")?;
     Ok(Backbone {
-        layers: size(bb, "num_hidden_layers")?,
+        layers,
         hidden: size(bb, "hidden_size")?,
         heads: size(bb, "num_attention_heads")?,
         kv_heads: size(bb, "num_key_value_heads")?,
@@ -449,7 +461,9 @@ pub fn backbone(config_json: &str) -> Result<Backbone, Error> {
         eps: eps as f32,
         rope_theta,
         window,
+        windowed: vec![window.is_some(); layers],
         block_causal,
+        ctx_kv: false,
     })
 }
 

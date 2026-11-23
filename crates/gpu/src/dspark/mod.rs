@@ -11,8 +11,8 @@
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
-use cuda_core::{CudaContext, CudaStream, DeviceBuffer};
-use runtime::dspark::DsparkShape;
+use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DeviceCopy};
+use runtime::dspark::{BaseHead, Context, DsparkShape, HeadMatrix, HeadPlace};
 
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::{DeviceTensor, Gpu, GpuError, Graph, WindowMut};
@@ -149,17 +149,23 @@ pub struct HostEmbed {
 /// The target's output matrix as the draft's head borrows it: a copy on the
 /// draft's card in the target file's type, each arm holding exactly its
 /// planes, or the target's own resident matrix read in place on the target's
-/// card. The owner runs the types it has a row kernel for and refuses any
-/// other by name.
+/// card. Each arm is a [`BaseHead`] of the runtime's plan ([`TargetHead::base`]);
+/// the owner refuses by name a pair the plan refuses and a type its head chain
+/// has no row kernel for.
 pub enum TargetHead {
     /// Q6_K superblocks: the matrix's words.
     Q6K(DeviceTensor<u32>),
     /// The target's resident Q6_K matrix, read in place ([`InPlace`]): no
     /// copy, and none of its bytes the draft's.
     Q6KInPlace(InPlace),
-    /// Q8_0 rows in the form the row kernel takes. Refused by name until a
-    /// family's borrowed head needs it.
+    /// Q8_0 rows in the form the row kernel takes, copied: refused by the
+    /// plan.
     Q8_0(Q8Rows),
+    /// The target's resident Q8_0 matrix, read in place: its quants four to a
+    /// word and its f16 scales apart, the form the Q8_0 row kernels take.
+    Q8_0InPlace { qs: InPlace, d: InPlace<u16> },
+    /// The target's resident BF16 matrix, read in place: two values to a word.
+    Bf16InPlace(InPlace),
 }
 
 impl TargetHead {
@@ -169,18 +175,33 @@ impl TargetHead {
         match self {
             TargetHead::Q6K(w) => Some(w),
             TargetHead::Q6KInPlace(p) => Some(&p.w),
-            TargetHead::Q8_0(_) => None,
+            TargetHead::Q8_0(_) | TargetHead::Q8_0InPlace { .. } | TargetHead::Bf16InPlace(_) => {
+                None
+            }
         }
+    }
+
+    /// The matrix's type and place, in the plan's terms.
+    #[must_use]
+    pub fn base(&self) -> BaseHead {
+        let (matrix, place) = match self {
+            TargetHead::Q6K(_) => (HeadMatrix::Q6K, HeadPlace::Copy),
+            TargetHead::Q6KInPlace(_) => (HeadMatrix::Q6K, HeadPlace::InPlace),
+            TargetHead::Q8_0(_) => (HeadMatrix::Q8_0, HeadPlace::Copy),
+            TargetHead::Q8_0InPlace { .. } => (HeadMatrix::Q8_0, HeadPlace::InPlace),
+            TargetHead::Bf16InPlace(_) => (HeadMatrix::Bf16, HeadPlace::InPlace),
+        };
+        BaseHead { matrix, place }
     }
 }
 
 /// A window on a matrix the target holds on the draft's card: the launches
 /// read it as a buffer of the draft's own, and dropping it frees nothing.
-pub struct InPlace {
-    w: ManuallyDrop<DeviceTensor<u32>>,
+pub struct InPlace<T: DeviceCopy = u32> {
+    w: ManuallyDrop<DeviceTensor<T>>,
 }
 
-impl InPlace {
+impl<T: DeviceCopy> InPlace<T> {
     /// A window on `w`, a matrix the target holds, in `ctx`, the draft's
     /// context on the target's card.
     ///
@@ -190,7 +211,7 @@ impl InPlace {
     /// allocated and in place while the draft launches: a captured graph
     /// bakes the address in.
     #[must_use]
-    pub unsafe fn new(w: &DeviceTensor<u32>, ctx: &Arc<CudaContext>) -> InPlace {
+    pub unsafe fn new(w: &DeviceTensor<T>, ctx: &Arc<CudaContext>) -> InPlace<T> {
         // SAFETY: the span is `w`'s own `rows × cols` words, and the caller
         // holds them allocated and in place.
         let w = unsafe { DeviceTensor::window(w.buf().cu_deviceptr(), w.rows(), w.cols(), ctx) };
@@ -198,7 +219,7 @@ impl InPlace {
     }
 }
 
-impl Drop for InPlace {
+impl<T: DeviceCopy> Drop for InPlace<T> {
     fn drop(&mut self) {
         // SAFETY: `self.w` is not read again; giving a window back frees no
         // memory.
@@ -333,6 +354,12 @@ impl<L: DraftLayers> DsparkBody<L> {
         let () = Self::COUNTS;
         let refuse = |detail: String| GpuError::shape(WHAT, detail);
         shape.check().map_err(|e| refuse(e.to_string()))?;
+        if let Context::Fuse { mixes } = shape.context {
+            return Err(refuse(format!(
+                "a context of {mixes} fused mixes of {} tapped rows: the owner's append runs fc",
+                shape.taps.len()
+            )));
+        }
         head.check_against(gpu, &shape.head, &shape.vocab)?;
         if shape.rows(1) > L::MAX_ROWS {
             return Err(refuse(format!(

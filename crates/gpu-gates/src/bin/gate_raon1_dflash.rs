@@ -61,7 +61,7 @@ mod gate {
     use refset::arch::draft::DraftFrom;
     use refset::arch::prompt_tables;
     use refset::arch::raon1::{A, DFLASH_BESIDE, LCPP, MODEL};
-    use runtime::dspark::{DraftVocab, DsparkShape, HeadKind};
+    use runtime::dspark::{Context, DraftVocab, DsparkShape, HeadKind};
 
     use crate::raon1_dflash::{self, HeadFrom, Layers, Pick};
 
@@ -117,6 +117,7 @@ mod gate {
             row0_drafts: false,
             taps: vec![2, 7, 12, 17, 22],
             hidden: STREAMS * N_EMBD,
+            context: Context::Fc,
             vocab: DraftVocab::Full { n: n_vocab },
             mask_id: 259_839,
             window: Some(2048),
