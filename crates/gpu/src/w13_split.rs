@@ -20,7 +20,8 @@
 //! holds in the file's blocks, a Q8_0 one through [`crate::weights::Weights::
 //! relayout`], whose routed `_sel` entries read words). The plane forms split
 //! by one pitched device copy a plane — every expert's `rows_half` rows of its
-//! `2 · rows_half` — the words by one copy. The copies are asynchronous on the
+//! `2 · rows_half` — the words by one copy of the bytes (a row of a block type whose block bytes
+//! leave it no whole number of words, an IQ2_XXS row of 594 bytes, splits all the same). The copies are asynchronous on the
 //! caller's stream; [`crate::weights::Weights::split_fused_w13`] is the filing
 //! wrapper, which waits for them before the fused stack's buffers are freed.
 
@@ -110,6 +111,66 @@ fn scale_row(
     let mut row = unsafe { DeviceTensor::<f32>::unfilled(stream, experts, 1)? };
     copy_row(stream, scales.buf(), row.buf_mut(), experts)?;
     Ok(row)
+}
+
+/// `rows_half` rows of each of `experts` experts of a K-quant word stream `w` — the rows
+/// `row_bytes` each, back to back with no per-row padding, an expert's `per_expert` rows after the
+/// last's, the half's rows at `at_row` of each expert — as the word stream of an
+/// `experts · rows_half`-row stack: one pitched device copy of the bytes, asynchronous on
+/// `stream`, into a zeroed tensor of `rows · ceil(words / rows)` words (the layout the upload
+/// gives a stack). A row of `row_bytes` that is no whole number of words (an IQ2_XXS row of
+/// 2,304 values is 594 bytes) splits all the same where a half's bytes are whole words. Refused by
+/// name before anything is allocated when a half's, an expert's or the source offset's bytes pass
+/// usize or are not whole words.
+fn half_words(
+    stream: &CudaStream,
+    w: &DeviceTensor<u32>,
+    (experts, per_expert): (usize, usize),
+    (rows_half, at_row): (usize, usize),
+    row_bytes: usize,
+) -> Result<DeviceTensor<u32>, GpuError> {
+    let bytes = |rows: usize| rows.checked_mul(row_bytes);
+    let (Some(width), Some(pitch), Some(at), Some(rows)) = (
+        bytes(rows_half),
+        bytes(per_expert),
+        bytes(at_row),
+        experts.checked_mul(rows_half),
+    ) else {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "{experts} experts of {per_expert} rows of {row_bytes} bytes: a half's bytes pass usize"
+            ),
+        ));
+    };
+    if ![width, pitch, at].iter().all(|b| b.is_multiple_of(4)) {
+        return Err(GpuError::shape(
+            WHAT,
+            format!(
+                "rows of {row_bytes} bytes: a half of {rows_half} rows ({width} bytes, at {at}, \
+                 an expert {pitch}) is not whole words"
+            ),
+        ));
+    }
+    let words = experts.checked_mul(width / 4).ok_or_else(|| {
+        GpuError::shape(
+            WHAT,
+            format!("{experts} halves of {width} bytes pass usize"),
+        )
+    })?;
+    let mut half = DeviceTensor::<u32>::zeroed(stream, rows, words.div_ceil(rows))?;
+    dtod_2d(
+        stream,
+        (w.buf(), at),
+        (half.buf_mut(), 0),
+        Pitched {
+            width,
+            rows: experts,
+            dev_pitch: pitch,
+            host_pitch: width,
+        },
+    )?;
+    Ok(half)
 }
 
 /// The experts `rows` rows hold as whole experts of `per_expert` rows, when
@@ -219,16 +280,27 @@ pub fn split_w13(
                 .blck_size()
                 .and_then(|b| usize::try_from(b).ok())
                 .filter(|b| k.is_multiple_of(*b));
-            let row_bytes = block
+            let Some(row_bytes) = block
                 .zip((*ty).type_size().and_then(|s| usize::try_from(s).ok()))
                 .map(|(b, s)| s * (k / b))
-                .filter(|bytes| bytes.is_multiple_of(4));
-            if row_bytes.is_none() {
+            else {
                 return Err(refuse(format!(
-                    "a {ty} stack of K={k}: its row bytes are not a whole number of words"
+                    "a {ty} stack of K={k}: its rows are not whole blocks"
                 )));
-            }
-            let words = |at_row| half_plane(stream, w, (experts, per_expert), (rows_half, at_row));
+            };
+            let words = |at_row| {
+                half_words(
+                    stream,
+                    w,
+                    (experts, per_expert),
+                    (rows_half, at_row),
+                    row_bytes,
+                )
+                .map_err(|err| match err {
+                    GpuError::Shape { detail, .. } => refuse(detail),
+                    other => other,
+                })
+            };
             Ok((
                 DevWeight::KQuant {
                     ty: *ty,

@@ -100,16 +100,25 @@ const MIX_EPS: f32 = 1e-6;
 const HEAD: usize = 128;
 /// The query heads a key head the rel-bias entries take: the Mini's three or the Small's six.
 const GROUPS: [usize; 2] = [3, 6];
-/// The types the dense sites launch: the files' Q8_0 and Q6_K projections and their f32 and BF16 ones.
-pub(super) const DENSE_TYPES: &[SiteTy] = &[SiteTy::Q8_0, SiteTy::Q6K, SiteTy::F32, SiteTy::Bf16];
+/// The types the dense sites launch: the files' Q8_0 projections, the K-quant ones of the dynamic
+/// mixes (Q4_K, Q5_K, Q6_K) and their f32 and BF16 ones.
+pub(super) const DENSE_TYPES: &[SiteTy] = &[
+    SiteTy::Q8_0,
+    SiteTy::Q4K,
+    SiteTy::Q5K,
+    SiteTy::Q6K,
+    SiteTy::F32,
+    SiteTy::Bf16,
+];
 /// The logit the head writes at a padded column: far under any softcapped logit, finite, so the
 /// argmax reads the unpadded vocabulary and the finite argmax's check holds.
 pub const PAD_LOGIT: f32 = -1.0e30;
 /// What a refusal of a gate or up stack names.
-const GATE_UP_ROLE: &str = "a resident fused-w13 half of NVFP4 planes, MXFP8 planes or Q8_0 \
-     blocks (the card leg's gate·up arm)";
+const GATE_UP_ROLE: &str = "a resident fused-w13 half of NVFP4 planes, MXFP8 planes, Q8_0 \
+     blocks or an i-quant or K-quant stack the common card leg's gate·up arm reads";
 /// What a refusal of a down stack names.
-const DOWN_ROLE: &str = "a resident down stack of NVFP4 planes, MXFP8 planes or Q8_0 blocks";
+const DOWN_ROLE: &str = "a resident down stack of NVFP4 planes, MXFP8 planes, Q8_0 blocks or a \
+     32-value block type the common card leg's down arm reads (Q2_0, IQ4_NL, Q5_1)";
 /// A layer's attention projections a BF16 file tensor of the name loads in its stored words for
 /// ([`dense_card`], which names the token embedding and the head beside them).
 const RAW_SITES: &[&str] = &[
@@ -631,6 +640,11 @@ fn fused_stack_names(l: usize) -> [String; 3] {
 /// `norm_proj_bf16`, embedding and head kernels read); every other tensor in its type's own (the
 /// BF16 sink and conv projections widened to the F32 the fused launch reads).
 fn dense_card(t: &TensorInfo) -> Option<CardFormat> {
+    // A routed stack of a type with no default layout (the i-quants IQ3_XXS and IQ3_S, IQ4_NL, Q2_0,
+    // MXFP4) loads in the file's blocks, the form the common leg reads every such stack in.
+    if t.name.ends_with("_exps.weight") && CardFormat::of(t.ty).is_none() {
+        return Some(accepts::leg_card_format(t.ty));
+    }
     let raw = t.name == "token_embd.weight"
         || t.name == "output.weight"
         || t.name

@@ -5,7 +5,7 @@
 //! forms the stacks' route GEMMs read ([`RingForms`], from their file types through the kernel
 //! table), and their bytes are the plan's formula ([`ring_pass_bytes_in`]).
 
-use cuda_core::DeviceBuffer;
+use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::place_hybrid::{RingForms, ring_pass_bytes_in};
 
 use crate::card_leg::ExpertInput;
@@ -18,15 +18,20 @@ use crate::{FaultSink, Gpu, GpuError};
 
 const WHAT: &str = "ring_gemm::RingGemm";
 
-/// One form's rows: q8 blocks of 32 or the grouped GEMM's q8_1 blocks of 128.
-enum Rows {
+/// One form's rows: q8 blocks of 32 or the grouped GEMM's q8_1 blocks of 128, by the stack's type.
+pub(crate) enum Rows {
     Blocks32(Box<GemmAct32>),
     Q128(Box<GemmAct>),
 }
 
 impl Rows {
-    fn new(gpu: &Gpu, cols: usize, k: usize, blocks32: bool) -> Result<Rows, GpuError> {
-        let stream = gpu.stream();
+    /// `cols` rows of `k` values in the 32-block form when `blocks32`, else the 128-block one.
+    pub(crate) fn new(
+        stream: &CudaStream,
+        cols: usize,
+        k: usize,
+        blocks32: bool,
+    ) -> Result<Rows, GpuError> {
         Ok(if blocks32 {
             Rows::Blocks32(Box::new(GemmAct32::new(stream, cols, k)?))
         } else {
@@ -34,10 +39,41 @@ impl Rows {
         })
     }
 
-    fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         match self {
             Rows::Blocks32(a) => a.bytes(),
             Rows::Q128(a) => a.bytes(),
+        }
+    }
+
+    /// The rows as the route block reads them: the 128-block form or the 32-block one.
+    pub(crate) fn parts(&self) -> (Option<&GemmAct>, Option<&GemmAct32>) {
+        match self {
+            Rows::Q128(a) => (Some(&**a), None),
+            Rows::Blocks32(a) => (None, Some(&**a)),
+        }
+    }
+
+    /// The rows as the route block writes them.
+    pub(crate) fn parts_mut(&mut self) -> (Option<&mut GemmAct>, Option<&mut GemmAct32>) {
+        match self {
+            Rows::Q128(a) => (Some(&mut **a), None),
+            Rows::Blocks32(a) => (None, Some(&mut **a)),
+        }
+    }
+
+    /// The `m` rows of `x` quantized into this form. Asynchronous on the caller's stream.
+    pub(crate) fn enqueue_quantize(
+        &mut self,
+        gpu: &Gpu,
+        g32: &Gemm32Kernels,
+        x: &DeviceBuffer<f32>,
+        m: usize,
+        fault: FaultSink,
+    ) -> Result<(), GpuError> {
+        match self {
+            Rows::Blocks32(a) => g32.enqueue_quantize_gemm32(gpu.stream(), x, m, a, fault),
+            Rows::Q128(a) => gpu.enqueue_quantize_gemm(x, m, a, fault),
         }
     }
 }
@@ -70,10 +106,10 @@ impl RingGemm {
         let stream = gpu.stream();
         let slots = cap * n_used;
         let ring = RingGemm {
-            x: Rows::new(gpu, cap, n, forms.gate_up32)?,
+            x: Rows::new(stream, cap, n, forms.gate_up32)?,
             g: DeviceBuffer::zeroed(stream, slots * ff)?,
             u: DeviceBuffer::zeroed(stream, slots * ff)?,
-            h: Rows::new(gpu, slots, ff, forms.down32)?,
+            h: Rows::new(stream, slots, ff, forms.down32)?,
             route: GemmRoute::new(stream, slots, half_slots)?,
             cap,
             slots,
@@ -139,10 +175,7 @@ impl RingGemm {
                 format!("a batch of {m} rows in buffers of {}", self.cap),
             ));
         }
-        match &mut self.x {
-            Rows::Blocks32(a) => g32.enqueue_quantize_gemm32(gpu.stream(), x, m, a, fault),
-            Rows::Q128(a) => gpu.enqueue_quantize_gemm(x, m, a, fault),
-        }
+        self.x.enqueue_quantize(gpu, g32, x, m, fault)
     }
 
     /// Landing batch `batch` of a half: its route table from the pass's routed `ids` (`n_slots`
@@ -267,14 +300,8 @@ fn run_block(
     (y, rule): (&mut DeviceBuffer<f32>, Act),
     fault: FaultSink,
 ) -> Result<(), GpuError> {
-    let (x128, x32) = match x {
-        Rows::Q128(a) => (Some(&**a), None),
-        Rows::Blocks32(a) => (None, Some(&**a)),
-    };
-    let (h128, h32) = match h {
-        Rows::Q128(a) => (Some(&mut **a), None),
-        Rows::Blocks32(a) => (None, Some(&mut **a)),
-    };
+    let (x128, x32) = x.parts();
+    let (h128, h32) = h.parts_mut();
     blk.enqueue_input(
         gpu,
         (gemm, g32),

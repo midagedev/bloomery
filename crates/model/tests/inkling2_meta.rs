@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 use gguf::Split;
 use model::arch::inkling2::place;
-use model::placement::{KvBytes, PlacementError, PlanLevers, Role, workstation};
+use model::placement::{KvBytes, PlanLevers, Role, workstation};
 
 /// The Mini: unsloth's UD-Q4_K_XL, one shard, the loop of the core [6, 18) three times.
 const MINI: &str = "/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf";
@@ -405,16 +405,16 @@ fn inkling2_small_header_reads_as_the_file_does() {
 }
 
 // The Small's file reads: its own widths are rows of `inkling2::spec::AVAILABLE` (groups of 6 over
-// 8 key heads of 128, the 384-expert top-8 router) and its routed stacks' types (iq3_xxs
-// everywhere, iq2_xs in layers 0-39, iq4_xs in 40-47) are no card leg's, so the host tier serves
-// them by a qdot fused kernel ([`model::arch::inkling2::host`]); the plan leaves every expert on
-// the host and the card holds the dense weights and the stores.
+// 8 key heads of 128, the 384-expert top-8 router) and its routed downs' types (iq3_xxs in
+// layers 0-39, iq4_xs in 40-47) are no type the card leg's down arm reads (it takes the 32-value
+// forms), so the host tier serves them by a qdot fused kernel ([`model::arch::inkling2::host`]);
+// the plan leaves every expert on the host and the card holds the dense weights and the stores.
 
 /// The Small's header reads (no item of the coverage list stands) and its plan on the gate
-/// machine keeps no routed expert on the card: the routed stacks' types are no card leg's, so
-/// every expert of every layer is the host tier's. Mutants: the group row narrowed to 3 or the
-/// 384/8 router row removed lists its items again; `inkling2_leg` widened to a type of the
-/// Small's stacks puts experts on the card.
+/// machine keeps no routed expert on the card: the downs' types are no card leg's, so every
+/// expert of every layer is the host tier's. Mutants: the group row narrowed to 3 or the
+/// 384/8 router row removed lists its items again; `down32_leg` widened to a type of the
+/// Small's downs puts experts on the card.
 #[test]
 fn inkling2_small_reads_and_its_experts_are_the_hosts() {
     let split = header_tables::header_of(

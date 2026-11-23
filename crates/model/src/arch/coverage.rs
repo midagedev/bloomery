@@ -18,8 +18,8 @@
 //! any program's pin reads, is not an item; the program itself is one.
 
 use bloomery_placement::accepts::{
-    BOLT_LEG, MUSESPARK_LEG, dense_by_name, dense_projected, embed_of_widened, head_of_widened,
-    inkling2_leg, latent_leg_runs, leg_arms, qwen3moe_dense, resident_down_runs,
+    BOLT_LEG, MUSESPARK_LEG, dense_by_name, dense_projected, embed_of_widened, fused_w13_runs,
+    head_of_widened, latent_leg_runs, leg_arms, qwen3moe_dense, resident_down_runs,
 };
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
 use bloomery_placement::accepts::{prompt_leg_down, prompt_leg_gate_up};
@@ -2320,12 +2320,13 @@ fn check_for(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The Inkling 2 body's rule: a stack passes when its card leg reads the type
-                // ([`inkling2_leg`]) or, on the host tier, a qdot fused kernel serves it at the
-                // stack's row width ([`routed_unrun`], the one owner): a layer whose stacks the
-                // card leg does not read keeps every expert on the host.
+                // The Inkling 2 body's rule: a stack passes when its card leg's arm for that part
+                // reads the type ([`fused_w13_runs`]: the fused gate·up arm, the down arm) or, on
+                // the host tier, a qdot fused kernel serves it at the stack's row width
+                // ([`routed_unrun`], the one owner): a layer whose stacks the card leg does not
+                // read keeps every expert on the host.
                 Some(Program::Inkling2Body) => {
-                    if routed_unrun(t, inkling2_leg) {
+                    if routed_unrun(t, |ty| fused_w13_runs(&t.name, ty)) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }

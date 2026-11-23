@@ -6,7 +6,7 @@
 //! gate names the file itself and does not read `BLOOMERY_MODEL`.
 //!
 //! - `small_placement_is_the_hosts`: the plan on the gate card holds no routed expert on the card
-//!   (the card leg runs NVFP4, Q8_0 and MXFP8 stacks only, `accepts::inkling2_leg`), the host's
+//!   (the card leg's down arm reads no 128-value type, `accepts::down32_leg`: the Small's IQ3_XXS and IQ4_XS downs), the host's
 //!   expert bytes are the file's routed bytes, and the loaded body hosts every layer with none of
 //!   its experts on the card.
 //! - `small_decode_is_vendors`: set `d`'s prompt one id a step, the logits row at its last position

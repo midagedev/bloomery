@@ -45,6 +45,12 @@
 //!   weights — the SiTU rows, the down rows and their weighted sum — within
 //!   [`SITU_BAND`] / [`DOWN_BAND`] / [`OUT_BAND`] of `ffn_moe_situ`,
 //!   `ffn_moe_down(_scaled)` and `ffn_moe_out`, on both quant legs.
+//! - `split_flat_*`: a fused gate·up stack of i-quant blocks whose rows are no whole number of
+//!   words (IQ2_XXS 594 bytes a row of 2,304 values, IQ2_XS 666, IQ2_S 738, IQ1_S 450), seeded
+//!   bytes, split by `Weights::split_fused_w13`: each half's resident bytes EQUAL the bytes of
+//!   the experts' gate rows and up rows cut from the fused stack on the host, and a stack whose
+//!   half is no whole number of words is refused by name. No file and no oracle set: the split is
+//!   a byte copy, so the host's cut is its whole reference.
 //! - `router384_*`: the Small's router (`sigmoid_384_8`: 384 experts, the top 8) on seeded rows, no
 //!   oracle set of the Small existing — the ids, scores and weights against the host's f64 rule,
 //!   the picks reaching past expert 256, the one-token launch the batch's bits, and the `+1e-20`
@@ -91,12 +97,12 @@ mod gate {
     use bloomery_gpu::q5::Q8Blocks32;
     use bloomery_gpu::q8_0_sel32::{Q80SelDown, Q80SelKernels};
     use bloomery_gpu::route_body::{sigmoid_128_8, sigmoid_384_8};
-    use bloomery_gpu::weights::{DevWeight, Weights};
+    use bloomery_gpu::weights::{DevWeight, TensorPart, Weights};
     use bloomery_gpu::{DeviceTensor, Gpu, GpuError};
     use bloomery_gpu_gates::tier::{self, Tier};
     use bloomery_gpu_gates::{
-        GateError, RefManifest, bits_equal, checks_failed, ref_tensor_logical_in, split_f32,
-        topk_ids_logical_within, verdict,
+        GateError, GateRng, RefManifest, bits_equal, checks_failed, ref_tensor_logical_in,
+        split_f32, topk_ids_logical_within, verdict,
     };
     use cuda_core::{CudaStream, DeviceBuffer};
     use gguf::Split;
@@ -1146,6 +1152,113 @@ mod gate {
         Ok(ok)
     }
 
+    /// The fused stacks of `split_flat_*`: types whose rows of 2,304 values are not whole words.
+    const FLAT_TYPES: [GgmlType; 4] = [
+        GgmlType::IQ2_XXS,
+        GgmlType::IQ2_XS,
+        GgmlType::IQ2_S,
+        GgmlType::IQ1_S,
+    ];
+
+    /// A weights set holding the one stack `name` of `ty`, `dims` = (values a row, rows an expert,
+    /// experts), whose file bytes are `bytes`.
+    fn flat_stack(
+        stream: &CudaStream,
+        name: &str,
+        ty: GgmlType,
+        (k, rows, experts): (usize, usize, usize),
+        bytes: &[u8],
+    ) -> Result<Weights, GateError> {
+        let mut w = Weights::default();
+        w.add_parts(
+            stream,
+            &[TensorPart {
+                info: gguf::TensorInfo {
+                    name: name.to_string(),
+                    dims: vec![k as u64, rows as u64, experts as u64],
+                    ty,
+                    offset: 0,
+                    nbytes: bytes.len() as u64,
+                },
+                spans: vec![bytes],
+                scale: None,
+            }],
+        )?;
+        Ok(w)
+    }
+
+    /// `split_flat_*`: seeded fused stacks of [`FLAT_TYPES`] split on the card and compared byte
+    /// for byte with the host's cut (module doc).
+    fn flat_split_clauses(dev: &Dev) -> Result<Vec<bool>, GateError> {
+        let stream = dev.stream();
+        let (k, experts, ff) = (2304usize, 3usize, 64usize);
+        let mut rng = GateRng(0x7370_6c69_7466_6c61);
+        let mut ok = Vec::new();
+        for ty in FLAT_TYPES {
+            let row = usize::try_from(ty.type_size().ok_or("a type with no size")?)?
+                * (k / usize::try_from(ty.blck_size().ok_or("a type with no block")?)?);
+            let fused: Vec<u8> = (0..experts * 2 * ff * row)
+                .map(|_| (rng.unit() * 256.0) as u8)
+                .collect();
+            let name = "blk.0.ffn_gate_up_exps.weight".to_string();
+            let mut w = flat_stack(stream, &name, ty, (k, 2 * ff, experts), &fused)?;
+            let (gate, up) = w.split_fused_w13(stream, &name, ff)?;
+            let half = |upper: usize| -> Vec<u8> {
+                (0..experts)
+                    .flat_map(|e| {
+                        let at = (e * 2 * ff + upper * ff) * row;
+                        fused[at..at + ff * row].iter().copied()
+                    })
+                    .collect()
+            };
+            let mut same = true;
+            let mut detail = String::new();
+            for (which, half_name, want) in [("gate", &gate, half(0)), ("up", &up, half(1))] {
+                let Some(DevWeight::KQuant {
+                    w: words, ty: held, ..
+                }) = w.get(half_name)
+                else {
+                    return Err(
+                        format!("the {which} half of a {ty} stack is no K-quant stack").into(),
+                    );
+                };
+                let got: Vec<u8> = dev
+                    .read(words.buf())?
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                let equal = *held == ty && got.len() >= want.len() && got[..want.len()] == want[..];
+                if !equal {
+                    let at = got.iter().zip(&want).position(|(a, b)| a != b);
+                    detail.push_str(&format!(" {which}: first differing byte {at:?};"));
+                }
+                same &= equal;
+            }
+            ok.push(clause(
+                &format!("split_flat {ty}"),
+                same,
+                &format!(
+                    "{experts} experts of {} rows of {k} values, {row} bytes a row: both halves are the host's \
+                     cut, byte for byte{detail}",
+                    2 * ff
+                ),
+            ));
+        }
+        // A half that is no whole number of words: 33 rows of 594 bytes.
+        let ty = GgmlType::IQ2_XXS;
+        let row = 594usize;
+        let (odd, experts) = (33usize, 2usize);
+        let fused = vec![0u8; experts * 2 * odd * row];
+        let name = "blk.1.ffn_gate_up_exps.weight".to_string();
+        let mut w = flat_stack(stream, &name, ty, (k, 2 * odd, experts), &fused)?;
+        let r = w.split_fused_w13(stream, &name, odd).map(|_| ());
+        ok.push(refused(
+            "split of a half that is no whole number of words",
+            r,
+        ));
+        Ok(ok)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
         let tier = Tier::from_env()?;
@@ -1210,6 +1323,7 @@ mod gate {
         results.extend(refusal_clauses(&dev, &hp, (&mut w, l))?);
         results.push(guard_clause(&dev, &hp)?);
         results.extend(small_router_clauses(&dev)?);
+        results.extend(flat_split_clauses(&dev)?);
         let failed = results.iter().filter(|p| !**p).count();
         println!(
             "{NAME}: {} — {} clauses, {failed} failed",

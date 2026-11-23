@@ -10,7 +10,7 @@ use models::Arch;
 use crate::kernels::{
     self, DownAct, DownEntry, EmbedEntry, GateUpEntry, HeadEntry, SiteAct, SiteEntry,
 };
-use crate::placement::{CardFormat, LegPair, RoutedRule};
+use crate::placement::{CardFormat, ExpertPart, LegPair, RoutedRule};
 
 /// A layer program: the chain that runs a family's layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +92,7 @@ pub enum Program {
     /// looped trunk (the rel-bias attention with its per-query sink, the residual short convs, the
     /// cross-layer residual mixes of the normed banks, the looped core's message controllers) and
     /// every routed stack on the common card leg, each fused gate·up stack split at upload into the
-    /// halves the leg's gate·up arm reads ([`inkling2_leg`]).
+    /// halves the leg's gate·up arm reads ([`fused_gate_up_leg`]).
     Inkling2Body,
     /// The host engine (`crates/model`): no card, every layer, the head and the embedding on the
     /// host stage, the matmuls the fused `qdot` kernels run and the routed stacks resident on
@@ -591,8 +591,8 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             down: |ty| ty == MUSESPARK_LEG,
         }),
         Program::Inkling2Body => Some(LegArms {
-            gate_up: inkling2_leg,
-            down: inkling2_leg,
+            gate_up: fused_gate_up_leg,
+            down: down32_leg,
         }),
         // The host stage holds every stack on the host: no card leg.
         Program::NemotronHBody | Program::GemmaEmbedding2Body | Program::Host => None,
@@ -715,8 +715,11 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             down: musespark_leg_card,
             pair: leg_pair(p),
         },
-        // By type, not by part: the fused gate·up stack names no part the part rule reads.
-        Program::Inkling2Body => RoutedRule::PerType(inkling2_leg_card),
+        // The fused gate·up stack by the gate·up arm, the down by the down arm.
+        Program::Inkling2Body => RoutedRule::Fused {
+            gate_up: fused_gate_up_card,
+            down: down32_card,
+        },
         // No routed stack: every one is refused by name.
         Program::NemotronHBody | Program::GemmaEmbedding2Body | Program::Host => {
             RoutedRule::PerType(|_| None)
@@ -729,22 +732,54 @@ fn bolt_leg_card(ty: GgmlType) -> Option<CardFormat> {
     latent_leg_runs(ty).then(|| leg_card_format(ty))
 }
 
-/// The Inkling 2 body's routed stacks: NVFP4 in its planes, Q8_0 in the file's blocks, or MXFP8
-/// in its planes, the forms its files hold (the GGUF's NVFP4 and Q8_0 layers, the official
-/// checkpoint's NVFP4 and MXFP8 ones) — a fused gate·up stack of each, split at upload into the
-/// gate and up halves the common card leg's gate·up arm reads, and a down its down arm reads.
+/// The Inkling 2 body's gate·up arm: NVFP4 in its planes, Q8_0 in the file's blocks or MXFP8 in
+/// its planes (the forms the official checkpoint and the Q4_K_XL file hold), and the i-quant and
+/// K-quant stacks of the dynamic mixes (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+/// IQ4_XS, Q4_K, Q5_K: the common leg's gate·up entries whose prompt GEMM the kernel table names,
+/// [`prompt_leg_gate_up`]) in the file's blocks. A fused gate·up stack is split at upload into the
+/// halves the arm reads, in its own resident form.
 #[must_use]
-pub const fn inkling2_leg(ty: GgmlType) -> bool {
-    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0 | GgmlType::MXFP8)
+pub const fn fused_gate_up_leg(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0 | GgmlType::MXFP8) || prompt_leg_gate_up(ty)
 }
 
-/// The Inkling 2 body's plan arm: a routed stack of a type [`inkling2_leg`] runs, in the leg's
+/// The Inkling 2 body's down arm: NVFP4, Q8_0 or MXFP8 as the gate·up arm, and the common leg's
+/// 32-value downs the dynamic mixes hold (Q2_0, IQ4_NL, Q5_1). The expert width is 1,152 values,
+/// which no 256-value block divides and the leg's one down buffer holds the 32-value form, so a
+/// down that reads 128-value activation columns (the K-quants, the i-quants, MXFP4) is not run.
+#[must_use]
+pub const fn down32_leg(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0 | GgmlType::MXFP8)
+        || (prompt_leg_down(ty) && matches!(kernels::down(ty), Some((_, DownAct::Q8Blocks32))))
+}
+
+/// Whether the fused-w13 body's card leg runs the routed stack `name` of type `ty`: a fused gate·up
+/// stack by [`fused_gate_up_leg`], any other part by [`down32_leg`]. The one rule coverage and
+/// the seats read.
+#[must_use]
+pub fn fused_w13_runs(name: &str, ty: GgmlType) -> bool {
+    if ExpertPart::is_fused_gate_up(name) {
+        fused_gate_up_leg(ty)
+    } else {
+        down32_leg(ty)
+    }
+}
+
+/// The Inkling 2 body's plan arm for a fused gate·up stack: [`fused_gate_up_leg`], in the leg's
 /// card format; an MXFP8 stack in the planes its `_sel` pair and GEMM read (the type's routed
 /// column names none, so no other program's plan takes one).
-fn inkling2_leg_card(ty: GgmlType) -> Option<CardFormat> {
+fn fused_gate_up_card(ty: GgmlType) -> Option<CardFormat> {
     match ty {
         GgmlType::MXFP8 => Some(CardFormat::Mxfp8Planes),
-        _ => inkling2_leg(ty).then(|| leg_card_format(ty)),
+        _ => fused_gate_up_leg(ty).then(|| leg_card_format(ty)),
+    }
+}
+
+/// The Inkling 2 body's plan arm for a down stack: [`down32_leg`], in the leg's card format.
+fn down32_card(ty: GgmlType) -> Option<CardFormat> {
+    match ty {
+        GgmlType::MXFP8 => Some(CardFormat::Mxfp8Planes),
+        _ => down32_leg(ty).then(|| leg_card_format(ty)),
     }
 }
 
@@ -877,6 +912,47 @@ mod tests {
             broken.len(),
             &broken[..broken.len().min(8)]
         );
+    }
+
+    /// The fused-w13 body's arms by part: the gate·up arm reads the forms its files hold and the
+    /// i-quants the common leg's GEMM table names; the down arm only the 32-value forms, because
+    /// the leg's one down buffer holds the 32-value activation and the experts' width is no
+    /// multiple of 256. A K-quant or i-quant down, MXFP4 and a type with no GEMM are refused.
+    #[test]
+    fn the_fused_w13_arms_read_by_part() {
+        use GgmlType as T;
+        for ty in [
+            T::NVFP4,
+            T::Q8_0,
+            T::MXFP8,
+            T::IQ1_S,
+            T::IQ1_M,
+            T::IQ2_XXS,
+            T::IQ2_XS,
+            T::IQ2_S,
+            T::IQ3_XXS,
+        ] {
+            assert!(fused_gate_up_leg(ty), "{ty:?} gate·up");
+        }
+        for ty in [T::NVFP4, T::Q8_0, T::MXFP8, T::Q2_0, T::IQ4_NL, T::Q5_1] {
+            assert!(down32_leg(ty), "{ty:?} down");
+        }
+        for ty in [
+            T::IQ2_XXS,
+            T::IQ3_XXS,
+            T::IQ4_XS,
+            T::Q4_K,
+            T::Q6_K,
+            T::MXFP4,
+        ] {
+            assert!(
+                !down32_leg(ty),
+                "{ty:?} down is a 128-value form or has no GEMM"
+            );
+        }
+        for ty in [T::F16, T::F32, T::Q2_K] {
+            assert!(!fused_gate_up_leg(ty), "{ty:?} gate·up");
+        }
     }
 
     /// V4.1's card layers over every (gate, up, down) triple of the file

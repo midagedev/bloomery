@@ -85,7 +85,7 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::inkling2::place::Inputs;
 use model::arch::place_hybrid::PlaceError;
-use model::placement::accepts::inkling2_leg;
+use model::placement::accepts::fused_w13_runs;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, card_experts_floor, probe_of};
 use model::placement::workstation::DeviceId;
 use model::placement::{Machine, PlacementError, Plan, PlanLevers, Role};
@@ -162,7 +162,7 @@ fn card_runs_the_experts(inputs: &Inputs) -> bool {
         .tensors
         .iter()
         .filter(|t| t.role == Role::RoutedExperts)
-        .all(|t| inkling2_leg(t.ty))
+        .all(|t| fused_w13_runs(&t.name, t.ty))
 }
 
 /// The plan of `inputs` on `machine` at `ctx` positions of a file whose routed experts the card

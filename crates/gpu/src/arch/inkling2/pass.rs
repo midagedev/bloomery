@@ -46,7 +46,7 @@ use crate::attn_res::{AttnResKernels, AttnResNormedArgs};
 use crate::card_leg::{LegStacks, RouteIo};
 use crate::card_slots::{CardAcc, CardSlotKernels};
 use crate::fault::FaultSink;
-use crate::gemm::{GemmAct32, GemmKernels, GemmRoute};
+use crate::gemm::{GemmKernels, GemmRoute};
 use crate::head::Head;
 use crate::kquant::Act;
 use crate::linear::conv_res::ConvResArgs;
@@ -57,6 +57,7 @@ use crate::q38::EmbedIo;
 use crate::qk_clip::QkClipArgs;
 use crate::rel_bias::{REL, RelBiasArgs};
 use crate::rel_bias_prefill::{RelBiasPrefillKernels, RelPrefillArgs};
+use crate::ring_gemm::Rows;
 use crate::routed_block::{RouteIn, RoutedRows};
 use crate::site::{self, SiteTy, WideActs, WideKernels};
 use crate::tensor::{Window, WindowMut, copy_row};
@@ -148,10 +149,11 @@ struct Bufs {
     wide_n: WideActs,
     wide_q: WideActs,
     dense: GemmRoute,
-    x32: GemmAct32,
+    /// The routed rows' inputs in the gate·up's form and the SwiGLU rows in the down's.
+    x_rows: Rows,
     g: DeviceBuffer<f32>,
     u: DeviceBuffer<f32>,
-    h32: GemmAct32,
+    h_rows: Rows,
     route: GemmRoute,
 }
 
@@ -219,10 +221,10 @@ impl Bufs {
             wide_n: WideActs::new(stream, WideActs::wants_of(inner).without_f32(), rows, n)?,
             wide_q: WideActs::new(stream, WideActs::wants_of(outer).without_f32(), rows, q)?,
             dense: GemmRoute::new(stream, rows, 1)?,
-            x32: GemmAct32::new(stream, rows, n)?,
+            x_rows: Rows::new(stream, rows, n, s.forms.gate_up32)?,
             g: z(slots * s.ff)?,
             u: z(slots * s.ff)?,
-            h32: GemmAct32::new(stream, slots, s.ff)?,
+            h_rows: Rows::new(stream, slots, s.ff, s.forms.down32)?,
             route: GemmRoute::new(stream, slots, s.n_expert)?,
         })
     }
@@ -281,8 +283,8 @@ impl Bufs {
             + self.wide_n.bytes()
             + self.wide_q.bytes()
             + self.dense.bytes()
-            + self.x32.bytes()
-            + self.h32.bytes()
+            + self.x_rows.bytes()
+            + self.h_rows.bytes()
             + self.route.bytes()
     }
 }
@@ -305,21 +307,14 @@ pub(super) struct Pass {
 }
 
 impl Pass {
-    /// The pass of shape `s` at `rows` rows over `layers`' sites. Load-time only. Refused by
-    /// name: a routed stack whose route GEMM reads q8_1 blocks of 128 (the pass quantizes its
-    /// rows into q8 blocks of 32), and buffers past the formula's bytes.
+    /// The pass of shape `s` at `rows` rows over `layers`' sites, its routed rows in the form the
+    /// stacks' route GEMMs read ([`PassShape::forms`]). Load-time only. Refused by name: buffers
+    /// past the formula's bytes.
     pub(super) fn new(
         gpu: &Gpu,
         (s, rows): (&PassShape, usize),
         layers: &[Layer],
     ) -> Result<Pass, GpuError> {
-        if !(s.forms.gate_up32 && s.forms.down32) {
-            return Err(GpuError::shape(
-                WHAT,
-                "a routed stack whose route GEMM reads q8_1 blocks of 128: the prompt pass \
-                 quantizes the routed rows into q8 blocks of 32",
-            ));
-        }
         let inner: Vec<SiteTy> = layers
             .iter()
             .flat_map(|l| {
@@ -1338,10 +1333,10 @@ impl<'a> RowWalk<'a> {
             fxn,
             picks,
             weights,
-            x32,
+            x_rows,
             g,
             u,
-            h32,
+            h_rows,
             ys,
             route,
             moe,
@@ -1352,7 +1347,9 @@ impl<'a> RowWalk<'a> {
             None => (picks, weights),
         };
         pk.gemm.enqueue_route(stream, sel, slots, route, fault)?;
-        k.g32.enqueue_quantize_gemm32(stream, fxn, m, x32, fault)?;
+        x_rows.enqueue_quantize(gpu, &k.g32, fxn, m, fault)?;
+        let (x128, x32) = x_rows.parts();
+        let (h128, h32) = h_rows.parts_mut();
         block.enqueue_rule(
             gpu,
             (Some(&pk.gemm), &k.g32),
@@ -1360,12 +1357,12 @@ impl<'a> RowWalk<'a> {
             slots,
             (
                 RouteIo {
-                    x128: None,
-                    x32: Some(x32),
+                    x128,
+                    x32,
                     g,
                     u,
-                    h128: None,
-                    h32: Some(h32),
+                    h128,
+                    h32,
                     y: ys,
                 },
                 self.act,

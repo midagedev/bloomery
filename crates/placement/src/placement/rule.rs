@@ -553,6 +553,15 @@ impl ExpertPart {
             _ => None,
         }
     }
+
+    /// Whether `name` names a fused gate·up stack (`….ffn_gate_up_exps.weight`), the one tensor a
+    /// file that fuses the pair holds in place of a gate and an up.
+    #[must_use]
+    pub fn is_fused_gate_up(name: &str) -> bool {
+        name.strip_suffix("_exps.weight")
+            .and_then(|stem| stem.rsplit_once("ffn_"))
+            .is_some_and(|(_, part)| part == "gate_up")
+    }
 }
 
 /// A routed tensor that keeps its layer on the host under a card rule.
@@ -582,6 +591,14 @@ pub enum RoutedRule {
         down: RoutedFormat,
         pair: Option<LegPair>,
     },
+    /// A card leg over a file that fuses the gate and the up into one stack
+    /// (`ffn_gate_up_exps`): that stack, and a gate or an up where a file keeps them apart, in
+    /// `gate_up`'s format, a down in `down`'s. A gate and an up of two types have no card format,
+    /// and a routed stack whose name names none of the parts is refused by name.
+    Fused {
+        gate_up: RoutedFormat,
+        down: RoutedFormat,
+    },
 }
 
 /// A card leg's layer rule: whether a layer whose gate and up are of the
@@ -603,6 +620,16 @@ impl RoutedRule {
                      leg's rule places by part",
                 )),
             },
+            Self::Fused { gate_up, down } => match ExpertPart::of_name(&t.name) {
+                Some(ExpertPart::Gate | ExpertPart::Up) => Ok(gate_up(t.ty)),
+                Some(ExpertPart::Down) => Ok(down(t.ty)),
+                None if ExpertPart::is_fused_gate_up(&t.name) => Ok(gate_up(t.ty)),
+                None => Err(PlacementError::tensor(
+                    t,
+                    "a routed stack whose name names no fused gate·up, gate, up or down part, \
+                     which a card leg's rule places by part",
+                )),
+            },
         }
     }
 
@@ -612,7 +639,7 @@ impl RoutedRule {
         gate_up_ty: &mut Option<GgmlType>,
     ) -> Result<Option<&'static str>, PlacementError> {
         let unsupported = self.format(tensor)?.is_none();
-        let mismatched = matches!(self, Self::Leg { .. })
+        let mismatched = matches!(self, Self::Leg { .. } | Self::Fused { .. })
             && matches!(
                 ExpertPart::of_name(&tensor.name),
                 Some(ExpertPart::Gate | ExpertPart::Up)
