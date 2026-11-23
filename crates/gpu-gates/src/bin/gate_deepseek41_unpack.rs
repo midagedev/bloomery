@@ -90,8 +90,13 @@ mod gate {
         let s = gpu.stream();
 
         let part = DeviceBuffer::from_host(s, &padded)?;
+        // cuda-core's retirement thread holds a context handle for each queued
+        // copy until it runs; both readings settle it first, so a handle the
+        // unpack keeps past its work is what the comparison sees.
+        gpu.settle_frees()?;
         let handles = Arc::strong_count(gpu.context());
         k.enqueue_in_place(s, part.cu_deviceptr() + 4 * GUARD as u64, n, nb)?;
+        gpu.settle_frees()?;
         let released = Arc::strong_count(gpu.context()) == handles;
         let src = DeviceBuffer::from_host(s, &r8)?;
         let mut dst = DeviceBuffer::<u32>::zeroed(s, n)?;
