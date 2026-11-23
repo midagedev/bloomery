@@ -870,7 +870,7 @@ def self_test():
                 expect("ANTHROPIC_API_KEY" not in child and "ZAI_API_KEY" not in child and child.get("REVIEW_RUN_ENGINE") == "glm"
                        and child.get("ANTHROPIC_AUTH_TOKEN") == "zai-local-test-key"
                        and child.get("ANTHROPIC_BASE_URL") == "https://api.z.ai/api/anthropic"
-                       and child.get("REVIEW_MODEL") == "glm-5.3" and child.get("REVIEW_SETTING_SOURCES") == "project",
+                       and child.get("REVIEW_MODEL") == "glm-5.4" and child.get("REVIEW_SETTING_SOURCES") == "project",
                        f"the glm role's script holds the z.ai login and no Anthropic key: {routing(child)}")
                 rc, msgs = go("**Verdict: CLEAN**: zai-local-test-key\n\n### Checked\nall")
                 expect(rc == 65 and "post.py check refused" in msgs[-1], f"a review that carries the z.ai key is refused 65: {rc} {msgs[-1:]}")

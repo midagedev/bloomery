@@ -123,7 +123,7 @@ only when its login is there and its CLI installed:
 
 | Engine | Login | Runs |
 |---|---|---|
-| `glm` | the secret `ZAI_API_KEY` | `run-claude.sh` with the key as `ANTHROPIC_AUTH_TOKEN`, `ZAI_BASE_URL` (default `https://api.z.ai/api/anthropic`) as `ANTHROPIC_BASE_URL` and `REVIEW_MODEL_GLM` (`glm-5.3`) as the model; the Claude Code CLI |
+| `glm` | the secret `ZAI_API_KEY` | `run-claude.sh` with the key as `ANTHROPIC_AUTH_TOKEN`, `ZAI_BASE_URL` (default `https://api.z.ai/api/anthropic`) as `ANTHROPIC_BASE_URL` and `REVIEW_MODEL_GLM` (`glm-5.4`) as the model; the Claude Code CLI |
 | `claude` | the secret `ANTHROPIC_API_KEY` | `run-claude.sh` with `REVIEW_MODEL` (`claude-sonnet-5-5`); the Claude Code CLI |
 | `codex` | the secret `CODEX_AUTH_JSON` | `run-codex.sh`; the Codex CLI |
 
@@ -235,7 +235,7 @@ not the prose written. The knobs below act on that.
 |---|---|---|
 | engines and their order | `glm,claude,codex` | `REVIEW_ENGINE` repository variable |
 | model, effort | `claude-sonnet-5-5`, high | `REVIEW_MODEL` in the workflow, `run-claude.sh` |
-| glm model, endpoint | `glm-5.3`, `https://api.z.ai/api/anthropic`, high | `REVIEW_MODEL_GLM` in the workflows, `ZAI_BASE_URL`, `tools/review/run.py` |
+| glm model, endpoint | `glm-5.4`, `https://api.z.ai/api/anthropic`, high | `REVIEW_MODEL_GLM` in the workflows, `ZAI_BASE_URL`, `tools/review/run.py` |
 | turns | reviewer 60, validator 30 | `run-claude.sh` |
 | Codex model, effort, CLI | `gpt-6.1-sol`, xhigh, 0.160.0 | `REVIEW_CODEX_MODEL`, `CODEX_VERSION` in the workflows, `run-codex.sh` |
 | Codex service tier | the account's default | `REVIEW_CODEX_TIER` (unset in the workflows; a tier the model does not offer fails the run), `run-codex.sh` |

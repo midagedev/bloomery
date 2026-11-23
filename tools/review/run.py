@@ -11,7 +11,7 @@ order, then the ones it leaves out in the order glm, claude, codex. A word that 
 the order is glm, claude, codex. An engine is tried only when its login is there (ZAI_API_KEY for glm, ANTHROPIC_API_KEY
 for claude, CODEX_HOME/auth.json for codex, which the workflow writes from a secret) and its CLI is on PATH (claude for
 glm and claude). Each engine's child process gets its own login only: glm gets the key as ANTHROPIC_AUTH_TOKEN with
-ZAI_BASE_URL (default https://api.z.ai/api/anthropic) as ANTHROPIC_BASE_URL and REVIEW_MODEL_GLM (default glm-5.3) as
+ZAI_BASE_URL (default https://api.z.ai/api/anthropic) as ANTHROPIC_BASE_URL and REVIEW_MODEL_GLM (default glm-5.4) as
 its model, claude gets neither a base URL, a token nor a cloud switch (CLAUDE_CODE_USE_*) of a runner's, and codex
 neither key. REVIEW_RUN_ENGINE names the
 engine to the script, which passes it to usage.py.
@@ -58,8 +58,8 @@ RUNNER = {"glm": "claude", "claude": "claude", "codex": "codex"}
 ROUTES = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
           "CLAUDE_CODE_USE_FOUNDRY")
 GLM_BASE_URL = "https://api.z.ai/api/anthropic"
-GLM_MODEL = "glm-5.3"
-# Claude Code enforces 200000 for a model it does not know; glm-5.3 takes 1M.
+GLM_MODEL = "glm-5.4"
+# Claude Code enforces 200000 for a model it does not know; glm-5.4 takes 1M.
 GLM_CONTEXT_TOKENS = "1310720"
 NO_ENGINE = 75
 SANDBOX_CHECK_FAILED = 69

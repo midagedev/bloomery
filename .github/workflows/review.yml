@@ -46,7 +46,7 @@ concurrency:
 env:
   CLAUDE_CODE_VERSION: 2.1.284
   REVIEW_MODEL: claude-sonnet-5-5
-  REVIEW_MODEL_GLM: glm-5.3
+  REVIEW_MODEL_GLM: glm-5.4
   CODEX_VERSION: 0.160.0
   REVIEW_CODEX_MODEL: gpt-6.1-sol
   REVIEW_ENGINE: ${{ vars.REVIEW_ENGINE || 'glm,claude,codex' }}
