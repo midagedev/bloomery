@@ -1436,11 +1436,15 @@ pub fn grouped_synthetic(h: &Harness<'_>, quant: Quant, seed: u64) -> Clause {
 // ------------------------------------------------------------ grouped oracle
 
 /// The routed tile the gate keeps as the oracle, from `#define ROUTED_FRAGS_A`
-/// on.
+/// to the tile's end.
 const ORACLE: &str = include_str!("routed_oracle.metal");
 
 /// The shipped routed GEMM's file, whose routed tile the oracle replaces.
 const SHIPPED: &str = include_str!("../../../kernels/gemm_routed.metal");
+
+/// The first line past the shipped routed tile: the Inkling 2 grouped GEMM's
+/// section, which the oracle's library keeps.
+const SHIPPED_TILE_END: &str = "// Inkling 2's grouped experts over a pass's route table";
 
 /// The table tile the oracle's kernel takes.
 const ORACLE_TILE: usize = 32;
@@ -1479,13 +1483,18 @@ fn oracle_kernels(h: &Harness<'_>) -> Result<Kernels, String> {
     let at = SHIPPED
         .find("#define ROUTED_FRAGS_A")
         .ok_or("gemm_routed.metal has no `#define ROUTED_FRAGS_A`; the tile's start moved")?;
+    // The tile ends where the Inkling 2 section starts: that section stays, since
+    // `Kernels::from_library` builds its pipelines from every library.
+    let end = SHIPPED[at..].find(SHIPPED_TILE_END).map(|e| at + e).ok_or(
+        "gemm_routed.metal has no Inkling 2 section after its routed tile; the tile's end moved",
+    )?;
     let from = format!("#define ROUTE_TILE {ROUTE_TILE}\n");
     let to = format!("#define ROUTE_TILE {ORACLE_TILE}\n");
     let acts_from = format!("#define ROUTED_ACTS {ROUTE_TILE}   //");
     let acts_to = format!("#define ROUTED_ACTS {ORACLE_TILE}   //");
     let mut text = source.to_string();
     for (find, with) in [
-        (&SHIPPED[at..], ORACLE),
+        (&SHIPPED[at..end], ORACLE),
         (from.as_str(), to.as_str()),
         (acts_from.as_str(), acts_to.as_str()),
     ] {
