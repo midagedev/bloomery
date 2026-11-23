@@ -408,9 +408,15 @@ impl Vocab {
                 };
                 let mut pre = crate::named(&Pre::NAMES, name)
                     .ok_or_else(|| Error::UnsupportedPre(name.to_string()))?;
+                // Only the private stop key marks a Hugging Face tokenizer, whose pre-tokenizer
+                // runs as its tokenizer.json does.
+                let hf = explicit_stops.is_some();
                 // The Small's file spells the GPT-4o pre-tokenizer `gpt-4o`, and the tree that reads
-                // it (with the Mini's `inkling2`) runs the expression with `\p{M}` in its lookaheads.
+                // it (with the Mini's `inkling2`) runs the expression with `\p{M}` in its lookaheads;
+                // a folder's tokenizer.json holds the expression itself, which runs as `gpt-4o`'s
+                // Hugging Face reading does.
                 if pre == Pre::Gpt4o
+                    && !hf
                     && matches!(
                         m.str(GENERAL_ARCHITECTURE)?,
                         Some("inkling2" | "inkling2_loop")
@@ -419,9 +425,6 @@ impl Vocab {
                     pre = Pre::Inkling2;
                 }
                 clean_spaces = CLEAN_SPACES.contains(&name);
-                // Only the private stop key marks a Hugging Face tokenizer, whose pre-tokenizer
-                // runs as its tokenizer.json does.
-                let hf = explicit_stops.is_some();
                 let pre = match (pre, hf) {
                     (pre, false) => pre,
                     (pre, true) => pre.hf_reading().ok_or_else(|| {

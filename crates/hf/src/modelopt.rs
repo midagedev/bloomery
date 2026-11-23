@@ -121,6 +121,7 @@ pub struct Normal {
 /// | NVFP4 with `csf` or `csf_32x2_v1` scales | as NVFP4, the scales decoded first ([`csf`]) | none |
 /// | NVFP4 compressed-tensors | as NVFP4, `.scale` the reciprocal of `weight_global_scale` | as NVFP4 |
 /// | F8_E4M3 with one scale a block (MXFP8's E8M0 a 32 values, an FP8 block format's), a row or the tensor | the card type the format is held in ([`Format::card_type`]): [`GgmlType::FP8_B128`] or [`GgmlType::MXFP8`], values as stored, each row block the scale of the checkpoint's block it lies in (`fp8_append`) | MXFP8 alone: [`GgmlType::MXFP8`], each row's blocks as the matrix's |
+/// | NVFP4 or MXFP8 experts of an `inkling2` checkpoint, one 3-D tensor a matrix ([`Format::Nvfp4Amax`], [`Format::Mxfp8Stacked`]) | NVFP4 (40), `.scale` an expert (its `amax` over the outer denominator), or [`GgmlType::MXFP8`], the stack's experts written one after another (`stacked_experts`) | none |
 /// | MXFP4 (OCP): E2M1 pairs, one E8M0 a 32 values | [`GgmlType::MXFP4`], each block's scale byte as stored and its codes moved to ggml's order (`mxfp4_append`), a stack one matrix an expert | none |
 /// | MLX affine, 4 or 8 bits, groups of 64 | the card type the format is held in: [`GgmlType::MLX_A4`] or [`GgmlType::MLX_A8`] for BF16 scales and biases, [`GgmlType::MLX_A4H`] or [`GgmlType::MLX_A8H`] for F16 ones, each group's words, scale and bias as stored, a stack one tensor `[k, rows, n_expert]` (`mlx_affine`) | none |
 /// | BF16, F32 | Q8_0, F32 or BF16 as [`Plain`] says | none |
@@ -146,6 +147,9 @@ pub fn type_of(format: Format, role: Use) -> Option<u32> {
             | Format::MlxAffineF16 { .. },
             Use::Matrix(_),
         ) => format.card_type().map(GgmlType::as_u32),
+        (Format::Nvfp4Amax | Format::Mxfp8Stacked, Use::Matrix(_)) => {
+            format.card_type().map(GgmlType::as_u32)
+        }
         // The MLX expert modes hold the plane pairs ModelOpt's NVFP4 and OCP's MXFP8 do, at
         // MLX's own group shapes, and a stack of them is one tensor whose experts are its stored
         // leading axis: the rows type names its bytes whatever role reads it, at MLX's own group
@@ -238,7 +242,7 @@ pub fn format_of(sources: &[(&str, &Placed)]) -> Result<Format, Error> {
 /// # Errors
 ///
 /// A refusal of [`format_of`]; a pair [`type_of`] has no type for; a tensor `get` refuses or
-/// lacks; a refusal of a [`Stack`]'s push, `fp8_q8_0` or `mlx_affine`; a stack of a type other than
+/// lacks; a refusal of a [`Stack`]'s push, `fp8_q8_0`, `mlx_affine` or [`expert_planes`]; a stack of a type other than
 /// NVFP4 and FP8_B128 or of unquantized experts read other than as F32 or BF16, a stack of MLX
 /// tensors (its experts are one tensor), and one of experts of differing shapes; a shape or
 /// dtype the format does not hold; a non-finite value or scaled value; and a row a
@@ -257,6 +261,15 @@ pub fn normalize<'a>(
     };
     let type_id = type_of(format, role)
         .ok_or_else(|| refuse(format!("read as {role:?} has no GGUF type here")))?;
+    if matches!(format, Format::Nvfp4Amax | Format::Mxfp8Stacked) {
+        let [source] = sources else {
+            return Err(refuse(format!(
+                "in a stack of {}: an `inkling2` expert stack is one tensor",
+                sources.len()
+            )));
+        };
+        return stacked_experts(&get, *source, type_id);
+    }
     if let Some(mut stack) = Stack::of(format, role, sources.len()) {
         for &source in sources {
             stack.push(&get, source)?;
@@ -496,6 +509,18 @@ fn plan_part<'a>(
                     weight,
                     format!(
                         "values {at:?} along dim {dim} of {matrix:?}: an MLX affine weight is read whole, its scales and biases are not cut"
+                    ),
+                ));
+            }
+            continue;
+        }
+        if matches!(format, Format::Nvfp4Amax | Format::Mxfp8Stacked) {
+            expert_planes(get, weight, placed)?;
+            if at.start != 0 || matrix.get(dim) != Some(&at.end) {
+                return Err(refuse(
+                    weight,
+                    format!(
+                        "values {at:?} along dim {dim} of {matrix:?}: an expert stack of the parameter groups is read whole, its scale planes are not cut"
                     ),
                 ));
             }
@@ -789,7 +814,11 @@ impl Stack {
             }
             _ => return None,
         };
-        Some(Stack {
+        Some(Stack::new(writer, type_id, experts))
+    }
+
+    fn new(writer: Writer, type_id: u32, experts: usize) -> Stack {
+        Stack {
             writer,
             out: Normal {
                 type_id,
@@ -798,7 +827,7 @@ impl Stack {
             experts,
             first: None,
             pushed: 0,
-        })
+        }
     }
 
     /// Append one source, of the first's shape.
@@ -1226,6 +1255,216 @@ pub fn mlx_expert_planes<'a, 'p>(
         rows,
         k,
     })
+}
+
+/// The stored geometry and per-expert multipliers of an `inkling2` expert stack
+/// ([`expert_planes`]).
+pub struct StackPlanes<'p> {
+    /// The name of the block-scale plane beside the weight.
+    pub block: &'p str,
+    /// One multiplier an expert: what the header's `.scale` holds for it. NVFP4's is the expert's
+    /// `amax` over the tensor's outer denominator, MXFP8's is 1, its type reading no scale.
+    pub scales: Vec<f32>,
+    /// The stack's experts, rows and values a row.
+    pub experts: usize,
+    pub rows: usize,
+    pub k: usize,
+}
+
+/// The block-scale plane and per-expert multipliers of the expert stack `weight`, placed as
+/// `placed` ([`Format::Nvfp4Amax`] or [`Format::Mxfp8Stacked`]): NVFP4's weight is U8
+/// `[experts, rows, k/2]` (two E2M1 values a byte, whole 64-value blocks a row), its plane a UE4M3
+/// byte a 16 values (F8_E4M3 `[experts, rows, k/16]`), then `amax` (F32 `[experts]`) and the outer
+/// denominator (one F32); MXFP8's is F8_E4M3 `[experts, rows, k]` (whole 32-value blocks) with an
+/// E8M0 byte a row's 32 values (`[experts, rows, k/32]`: the stored grid is one row by 32 values
+/// whatever the config's `weight_block_shape` spells). Shapes and byte counts alone, decoding no
+/// value but the multipliers.
+///
+/// # Errors
+///
+/// Another format, a place that names too few or too many planes, a weight or plane of another
+/// dtype, rank, shape or byte count, and an `amax` or denominator that is not finite and
+/// positive, each by name.
+pub fn expert_planes<'a, 'p>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    weight: &str,
+    placed: &'p Placed,
+) -> Result<StackPlanes<'p>, Error> {
+    let refuse = |what: String| Error::Format {
+        name: weight.to_string(),
+        format: placed.format,
+        what,
+    };
+    let (dtype, group, per, want) = match placed.format {
+        Format::Nvfp4Amax => (Dtype::U8, 16usize, 2usize, 3usize),
+        Format::Mxfp8Stacked => (Dtype::F8E4M3, 32, 1, 1),
+        _ => return Err(refuse("not an NVFP4 or MXFP8 expert stack".into())),
+    };
+    if placed.companions.len() != want {
+        return Err(refuse(format!(
+            "its place names {:?}, not the {want} planes of its format",
+            placed.companions
+        )));
+    }
+    let unfilled = |name: &str, what| Error::Shape {
+        name: name.to_string(),
+        what,
+    };
+    let w = stored(get, weight, dtype, unfilled)?;
+    let &[experts, rows, width] = w.shape else {
+        return Err(refuse(format!(
+            "{} {:?}, not the [experts, rows, values] of an expert stack",
+            w.dtype.name(),
+            w.shape
+        )));
+    };
+    let k = width * per;
+    let block = if placed.format == Format::Nvfp4Amax {
+        64
+    } else {
+        group
+    };
+    if experts == 0 || rows == 0 || width == 0 || !k.is_multiple_of(block) {
+        return Err(refuse(format!(
+            "{} {:?}, not experts of rows of whole {block}-value blocks",
+            w.dtype.name(),
+            w.shape
+        )));
+    }
+    let block_plane = placed.companions[0].as_str();
+    let s = get(block_plane)?;
+    let want_dtypes: &[Dtype] = if placed.format == Format::Nvfp4Amax {
+        &[Dtype::F8E4M3]
+    } else {
+        &[Dtype::U8, Dtype::F8E8M0]
+    };
+    if !want_dtypes.contains(&s.dtype)
+        || s.shape != [experts, rows, k / group]
+        || Some(s.bytes.len()) != (experts * rows * (k / group)).checked_mul(s.dtype.size())
+    {
+        return Err(Error::Shape {
+            name: block_plane.to_string(),
+            what: format!(
+                "{} {:?} ({} bytes); the block scales are [{experts}, {rows}, {}] of one byte a {group} values",
+                s.dtype.name(),
+                s.shape,
+                s.bytes.len(),
+                k / group
+            ),
+        });
+    }
+    let scales = if placed.format == Format::Nvfp4Amax {
+        let (amax_name, den_name) = (&placed.companions[1], &placed.companions[2]);
+        let one = |name: &str, shape: &[usize]| -> Result<Vec<f32>, Error> {
+            let t = stored(get, name, Dtype::F32, unfilled)?;
+            if t.shape != shape {
+                return Err(Error::Shape {
+                    name: name.to_string(),
+                    what: format!("shape {:?}, not {shape:?}", t.shape),
+                });
+            }
+            let values: Vec<f32> = t
+                .bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            match values.iter().find(|v| !(v.is_finite() && **v > 0.0)) {
+                Some(v) => Err(Error::Shape {
+                    name: name.to_string(),
+                    what: format!("holds {v}, not a finite positive value"),
+                }),
+                None => Ok(values),
+            }
+        };
+        let amax = one(amax_name, &[experts])?;
+        let den = one(den_name, &[1])?[0];
+        amax.iter().map(|a| a / den).collect()
+    } else {
+        vec![1.0; experts]
+    };
+    Ok(StackPlanes {
+        block: block_plane,
+        scales,
+        experts,
+        rows,
+        k,
+    })
+}
+
+/// The expert stack `weight` ([`expert_planes`]) in the GGUF type `type_id`, each expert read as
+/// the matrix of its own a split-per-expert checkpoint stores: NVFP4's codes and block scales with
+/// the tensor scale `amax / denominator` ([`append_plain`]), MXFP8's values and scales as the
+/// type holds them (`fp8_append`), the experts one after another, `[k, rows, experts]`.
+fn stacked_experts<'a>(
+    get: &impl Fn(&str) -> Result<Raw<'a>, safetensors::Error>,
+    (weight, placed): (&str, &Placed),
+    type_id: u32,
+) -> Result<Normal, Error> {
+    let planes = expert_planes(get, weight, placed)?;
+    let nvfp4 = placed.format == Format::Nvfp4Amax;
+    let writer = if nvfp4 {
+        Writer::Nvfp4
+    } else {
+        Writer::Fp8(GgmlType::MXFP8)
+    };
+    let (w, s) = (get(weight)?, get(planes.block)?);
+    let (rows, k) = (planes.rows, planes.k);
+    let (w_per, s_per) = if nvfp4 {
+        (rows * k / 2, rows * k / 16)
+    } else {
+        (rows * k, rows * k / 32)
+    };
+    let (w_shape, s_shape) = if nvfp4 {
+        ([rows, k / 2], [rows, k / 16])
+    } else {
+        ([rows, k], [rows, k / 32])
+    };
+    let expert_format = if nvfp4 { Format::Nvfp4 } else { Format::Mxfp8 };
+    let mut stack = Stack::new(writer, type_id, planes.experts);
+    for (e, multiplier) in planes.scales.iter().enumerate() {
+        let (wn, sn, tn) = (
+            format!("{weight}[{e}]"),
+            format!("{}[{e}]", planes.block),
+            format!("{weight}[{e}].scale"),
+        );
+        let tensor = multiplier.to_le_bytes();
+        let view = |name: &str| -> Result<Raw<'_>, safetensors::Error> {
+            if name == wn {
+                Ok(Raw {
+                    dtype: w.dtype,
+                    shape: &w_shape,
+                    bytes: &w.bytes[e * w_per..][..w_per],
+                })
+            } else if name == sn {
+                Ok(Raw {
+                    dtype: s.dtype,
+                    shape: &s_shape,
+                    bytes: &s.bytes[e * s_per..][..s_per],
+                })
+            } else if name == tn {
+                Ok(Raw {
+                    dtype: Dtype::F32,
+                    shape: &[1],
+                    bytes: &tensor,
+                })
+            } else {
+                get(name)
+            }
+        };
+        let companions = if nvfp4 {
+            vec![sn.clone(), tn.clone()]
+        } else {
+            vec![sn.clone()]
+        };
+        let expert = Placed {
+            format: expert_format,
+            companions,
+        };
+        stack.push(view, (&wn, &expert))?;
+    }
+    stack.finish()
 }
 
 /// A block scale a checkpoint stores compressed ([`csf`]), as [`nvfp4_compressed_rows_scale`]
@@ -4804,5 +5043,247 @@ mod tests {
             e.to_string().contains("m.weight") && e.to_string().contains("not [rows, k] or [k]"),
             "{e}"
         );
+    }
+
+    /// The tensors of one official expert stack `s.<stem>` (`weight`, `weight_scale`,
+    /// `weight_amax`, `weight_outer_scale_denominator`) over `experts` matrices of `rows` by `k`
+    /// NVFP4 values, and the place that lists them.
+    fn amax_stack(
+        amax: &[f32],
+        den: f32,
+        rows: usize,
+        k: usize,
+    ) -> (Safetensors, Placed, Vec<(String, Placed)>) {
+        let experts = amax.len();
+        let (mut codes, mut scales, mut split) = (vec![], vec![], vec![]);
+        for (e, a) in amax.iter().enumerate() {
+            let (c, s) = expert_bytes(e, rows, k);
+            split.extend([
+                (format!("m.{e}.weight"), "U8", vec![rows, k / 2], c.clone()),
+                (
+                    format!("m.{e}.weight_scale"),
+                    "F8_E4M3",
+                    vec![rows, k / 16],
+                    s.clone(),
+                ),
+                (
+                    format!("m.{e}.weight_scale_2"),
+                    "F32",
+                    vec![],
+                    (a / den).to_le_bytes().to_vec(),
+                ),
+            ]);
+            codes.extend(c);
+            scales.extend(s);
+        }
+        let twins = (0..experts).map(|e| own(&format!("m.{e}"))).collect();
+        let mut tensors = split;
+        tensors.extend([
+            (
+                "s.w13_weight".to_string(),
+                "U8",
+                vec![experts, rows, k / 2],
+                codes,
+            ),
+            (
+                "s.w13_weight_scale".to_string(),
+                "F8_E4M3",
+                vec![experts, rows, k / 16],
+                scales,
+            ),
+            (
+                "s.w13_weight_amax".to_string(),
+                "F32",
+                vec![experts],
+                amax.iter().flat_map(|a| a.to_le_bytes()).collect(),
+            ),
+            (
+                "s.w13_weight_outer_scale_denominator".to_string(),
+                "F32",
+                vec![1],
+                den.to_le_bytes().to_vec(),
+            ),
+        ]);
+        let placed = Placed {
+            format: Format::Nvfp4Amax,
+            companions: ["_scale", "_amax", "_outer_scale_denominator"]
+                .map(|s| format!("s.w13_weight{s}"))
+                .to_vec(),
+        };
+        (file(tensors), placed, twins)
+    }
+
+    /// The official checkpoint's NVFP4 expert stack (one U8 weight `[experts, rows, k/2]`, one
+    /// UE4M3 plane, `amax` an expert and one outer denominator) normalizes to what ModelOpt's
+    /// split experts of the same codes and block scales give with `weight_scale_2 = amax / den`:
+    /// the same type, dims, blocks and `.scale` bit for bit, `[k, rows, experts]`.
+    ///
+    /// FAIL-first: a `.scale` of `amax` (the denominator left out) differs in the `.scale`.
+    #[test]
+    fn stacked_nvfp4_experts_normalize_as_the_split_experts_of_the_same_bytes() {
+        let amax = [123.5f32, 4000.25, 17.75];
+        let den = 2688.0f32;
+        let (rows, k) = (4, 128);
+        let (st, placed, twins) = amax_stack(&amax, den, rows, k);
+        let role = Use::Matrix(Plain::Q8_0);
+        let split = normalize(
+            |n| st.raw(n),
+            &twins
+                .iter()
+                .map(|(n, p)| (n.as_str(), p))
+                .collect::<Vec<_>>(),
+            role,
+        )
+        .unwrap();
+        let stacked = normalize(|n| st.raw(n), &[("s.w13_weight", &placed)], role).unwrap();
+        assert_eq!(stacked, split);
+        assert_eq!(stacked.type_id, GgmlType::NVFP4.as_u32());
+        assert_eq!(stacked.dims, [k as u64, rows as u64, 3]);
+        assert_eq!(
+            stacked.scale,
+            amax.map(|a| a / den),
+            "an expert's scale is its amax over the denominator"
+        );
+        // The stack is read whole: a cut of its rows is refused by name.
+        let e = normalize_part(
+            |n| st.raw(n),
+            &[("s.w13_weight", &placed)],
+            role,
+            &[k as u64, rows as u64, 3],
+            (1, 0..2),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("s.w13_weight") && e.contains("is read whole"),
+            "{e}"
+        );
+    }
+
+    /// The official checkpoint's MXFP8 expert stack (F8_E4M3 `[experts, rows, k]` and one E8M0
+    /// byte a row's 32 values) is the experts written one after another in MXFP8's blocks: its
+    /// bytes are each expert's own normalized bytes in order, `[k, rows, experts]`, with no scale
+    /// beside it; a plane of 32-row blocks (`[experts, rows/2, k/32]` here) is refused by name.
+    ///
+    /// FAIL-first: a stack that reads its scales as a 32 by 32 grid refuses the stored plane.
+    #[test]
+    fn stacked_mxfp8_experts_are_their_experts_one_after_another() {
+        let (experts, rows, k) = (3usize, 4usize, 64usize);
+        let weights: Vec<u8> = (0..experts * rows * k)
+            .map(|i| (i * 37 % 120) as u8)
+            .collect();
+        let scales: Vec<u8> = (0..experts * rows * k / 32)
+            .map(|i| 118 + (i % 7) as u8)
+            .collect();
+        let mut tensors = vec![
+            (
+                "s.w2_weight".to_string(),
+                "F8_E4M3",
+                vec![experts, rows, k],
+                weights.clone(),
+            ),
+            (
+                "s.w2_weight_scale".to_string(),
+                "U8",
+                vec![experts, rows, k / 32],
+                scales.clone(),
+            ),
+        ];
+        for e in 0..experts {
+            tensors.extend([
+                (
+                    format!("m.{e}.weight"),
+                    "F8_E4M3",
+                    vec![rows, k],
+                    weights[e * rows * k..][..rows * k].to_vec(),
+                ),
+                (
+                    format!("m.{e}.weight_scale"),
+                    "U8",
+                    vec![rows, k / 32],
+                    scales[e * rows * k / 32..][..rows * k / 32].to_vec(),
+                ),
+            ]);
+        }
+        let st = file(tensors);
+        let role = Use::Matrix(Plain::Q8_0);
+        let placed = Placed {
+            format: Format::Mxfp8Stacked,
+            companions: vec!["s.w2_weight_scale".into()],
+        };
+        let stacked = normalize(|n| st.raw(n), &[("s.w2_weight", &placed)], role).unwrap();
+        assert_eq!(stacked.type_id, GgmlType::MXFP8.as_u32());
+        assert_eq!(stacked.dims, [k as u64, rows as u64, experts as u64]);
+        assert!(stacked.scale.is_empty());
+        let mut want = vec![];
+        for e in 0..experts {
+            let p = Placed {
+                format: Format::Mxfp8,
+                companions: vec![format!("m.{e}.weight_scale")],
+            };
+            let n = normalize(|n| st.raw(n), &[(&format!("m.{e}.weight"), &p)], role).unwrap();
+            assert_eq!(n.dims, [k as u64, rows as u64]);
+            want.extend(n.bytes);
+        }
+        assert_eq!(stacked.bytes, want);
+        assert_eq!(want.len(), experts * rows * (k / 32) * 33);
+        // The same stack with its plane cut to 32-row blocks.
+        let grid = file(vec![
+            (
+                "s.w2_weight".to_string(),
+                "F8_E4M3",
+                vec![experts, rows, k],
+                weights,
+            ),
+            (
+                "s.w2_weight_scale".to_string(),
+                "U8",
+                vec![experts, rows / 2, k / 32],
+                scales[..experts * rows / 2 * k / 32].to_vec(),
+            ),
+        ]);
+        let e = normalize(|n| grid.raw(n), &[("s.w2_weight", &placed)], role)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("s.w2_weight_scale") && e.contains("[3, 4, 2]"),
+            "{e}"
+        );
+    }
+
+    /// An expert stack with an `amax` that is not one finite positive value an expert, a
+    /// denominator that is not one, a place that lists too few planes, and a source that is not
+    /// one tensor, is refused by name.
+    #[test]
+    fn malformed_expert_stacks_are_refused_by_name() {
+        let role = Use::Matrix(Plain::Q8_0);
+        let (st, placed, _) = amax_stack(&[1.0, 0.0, 2.0], 2688.0, 2, 64);
+        let e = normalize(|n| st.raw(n), &[("s.w13_weight", &placed)], role)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("s.w13_weight_amax") && e.contains("not a finite positive value"),
+            "{e}"
+        );
+        let (st, placed, _) = amax_stack(&[1.0, 2.0], f32::NAN, 2, 64);
+        let e = normalize(|n| st.raw(n), &[("s.w13_weight", &placed)], role)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("s.w13_weight_outer_scale_denominator") && e.contains("holds NaN"),
+            "{e}"
+        );
+        let (st, mut placed, _) = amax_stack(&[1.0, 2.0], 2688.0, 2, 64);
+        placed.companions.pop();
+        let e = normalize(|n| st.raw(n), &[("s.w13_weight", &placed)], role)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not the 3 planes of its format"), "{e}");
+        placed.companions = vec![];
+        let two = [("s.w13_weight", &placed), ("s.w13_weight", &placed)];
+        let e = normalize(|n| st.raw(n), &two, role)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("one tensor"), "{e}");
     }
 }

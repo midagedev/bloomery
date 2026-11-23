@@ -4651,6 +4651,15 @@ gate-raon1-meta:
 gate-inkling2-meta:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/gate.sh --release -p bloomery-model --lib -- arch::inkling2 arch::place_hybrid arch::registry arch::rules --nocapture && bash tools/gate.sh --release -p bloomery-model --test inkling2_meta -- --include-ignored --nocapture'
 
+# The official Inkling 2 Mini folder (thinkingmachines/Inkling-2-Mini: ModelOpt `inkling2` parameter groups, NVFP4 experts of layers 0
+# to 19, MXFP8 of the coda, BF16 dense) read as the GGUF twin (the profile's UD-Q4_K_XL file): the folder opens, tokenizer included,
+# and every tensor the map makes of it is the twin's byte for byte where the twin holds the same type — the NVFP4 stacks with their
+# `.scale` an expert and the fused gate·up rows in the file's order, the F32 and BF16 tensors, and in a read that asks for Q8_0 the
+# dense projections; a read that keeps BF16 holds each dense tensor two bytes a weight. Host only, no card; BLOOMERY_INK2_OFFICIAL
+# names the folder (the gate is deferred by name where it is unset).
+gate-inkling2-official:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/needs-env.sh gate-inkling2-official BLOOMERY_INK2_OFFICIAL && . tools/ref/ref-paths.sh && export BLOOMERY_INK2_GGUF=$MODEL && bash tools/gate.sh --release -p bloomery-model-hf --lib -- --ignored hw_the_official_folder_reads_as_the_served_gguf --nocapture'
+
 # inkling2-moe: Inkling 2's routed block on the card (gate_inkling2_moe's doc): the biased sigmoid router at 128 experts and the
 # top 8 (the +1e-20 selected-sum rule, the file's route scale), the fused ffn_gate_up_exps split at upload into gate and up
 # stacks sharing the per-expert scale, and the NVFP4 and Q8_0 expert legs under situ at the file's betas, against the oracle

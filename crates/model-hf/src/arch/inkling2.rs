@@ -20,6 +20,14 @@
 //! in place ([`Origin::Stack`]): no expert byte is repacked at a load. The vision tower's
 //! tensors are not the text path's and are skipped by name.
 //!
+//! The official checkpoint (thinkingmachines' `Inkling-2-Mini`: the same `inkling2_loop` config,
+//! tensors under `model.llm.`, `hf_quant_config.json` of `inkling2` parameter groups) maps to the
+//! same header by its own names ([`Checkpoint::map_official`]). Its experts are one stack a
+//! matrix: NVFP4 of layers 0 to 19 as GGUF's NVFP4 with a tensor scale an expert, MXFP8 of the
+//! coda as its own format, each written at load ([`Origin::Made`], the fused gate and up rows
+//! un-interleaved by [`Step::Deinterleave`]); the dense projections keep BF16 as stored, or are
+//! written Q8_0 where a load asks ([`folder::read`]'s `q8`); the small tensors widen to F32.
+//!
 //! The header's keys are the config's: the visits, the per-visit head counts and window pattern
 //! (a stored layer's repeats read its own), and the loop's bounds — the loop itself is config,
 //! and the visits derive at load.
@@ -45,6 +53,15 @@ const MODEL: &str = "model.language_model.";
 /// The output head, which a folder of an untied model holds.
 const HEAD: &str = "lm_head.weight";
 
+/// The official checkpoint's prefix of the text model's tensors.
+const OFFICIAL: &str = "model.llm.";
+
+/// The official checkpoint's vision tower, which the text path does not read.
+const VISUAL: &str = "model.visual.";
+
+/// The official checkpoint's model-level table of the loop's attention-and-ffn message queries.
+const OFFICIAL_QUERIES: &str = "model.llm.middle_cycle_cross_pass_queries";
+
 /// The loop's message-query table `model.language_model.message_input.query`: one row a (core
 /// layer, query) pair, a layer's four rows its q, k, v and ffn queries, the order mlx-lm's
 /// `sanitize` interleaves the checkpoint's two tables into.
@@ -56,6 +73,13 @@ const MESSAGE_INPUT: &str = "model.language_model.message_input.query";
 /// config rides along unread: MLX's convert stores no draft tensors. `hf::vocab::Config` reads
 /// `eos_token_id`.
 const ROOT: &Fields = &[
+    (
+        "dtype",
+        Ignore(
+            Type::String,
+            "the dtype HF loads in; each tensor keeps its stored dtype and format",
+        ),
+    ),
     (
         "architectures",
         Need(r#"[["Inkling2LoopForConditionalGeneration"]]"#),
@@ -79,6 +103,7 @@ const ROOT: &Fields = &[
 /// `text_config`: the values the map reads into the header's keys and its tensors' geometry.
 /// Every key the reader holds a fixed rule for is `Only` at the value that rule takes.
 const TEXT: &Fields = &[
+    ("model_type", Only(r#"["inkling2_loop_text"]"#)),
     // The context length, under the convert's own name.
     ("model_max_length", Read),
     (
@@ -189,6 +214,9 @@ pub enum Step {
     /// The model-level message-query table's rows, one a row of the made tensor: each entry the
     /// table's flat row `layer · 4 + query` the output row holds.
     Rows(Vec<u32>),
+    /// The official stacks' fused gate·up rows, gate and up alternating (even rows the gate, odd
+    /// the up), moved to the file's order: the `rows / 2` gate rows, then the up rows.
+    Deinterleave,
 }
 
 impl Step {
@@ -228,8 +256,45 @@ impl Step {
                 t.bytes = bytes;
                 Ok(())
             }
+            Step::Deinterleave => {
+                let &[_, rows, experts] = t.dims.as_slice() else {
+                    return Err(format!("{:?} is not a stack of matrices", t.dims));
+                };
+                let (rows, experts) = (rows as usize, experts as usize);
+                if rows == 0 || !rows.is_multiple_of(2) || experts == 0 {
+                    return Err(format!("{rows} rows of {experts} experts do not pair"));
+                }
+                t.bytes = deinterleave(&t.bytes, rows, experts).ok_or_else(|| {
+                    format!(
+                        "{} bytes are not {experts} experts of {rows} whole rows",
+                        t.bytes.len()
+                    )
+                })?;
+                Ok(())
+            }
         }
     }
+}
+
+/// The rows of each of `experts` matrices of `rows` rows in `bytes` (row-major, every row of one
+/// byte count), the even rows first and then the odd: output row `r` of the first half is input
+/// row `2r`, of the second half input row `2(r - rows / 2) + 1`. `None` when `bytes` is not
+/// whole rows of `rows` and `experts`.
+fn deinterleave(bytes: &[u8], rows: usize, experts: usize) -> Option<Vec<u8>> {
+    let count = rows.checked_mul(experts)?;
+    if count == 0 || !bytes.len().is_multiple_of(count) {
+        return None;
+    }
+    let row = bytes.len() / count;
+    let half = rows / 2;
+    let mut out = Vec::with_capacity(bytes.len());
+    for matrix in bytes.chunks_exact(rows * row) {
+        for r in 0..rows {
+            let from = if r < half { 2 * r } else { 2 * (r - half) + 1 };
+            out.extend_from_slice(&matrix[from * row..][..row]);
+        }
+    }
+    Some(out)
 }
 
 /// The 2-D tensor `t` transposed, its dims and bytes swapped.
@@ -530,6 +595,13 @@ impl FolderMap for Checkpoint {
     }
 
     fn map<'a>(&self, tensors: &[(&'a str, &'a [usize])]) -> Result<Mapping<Step>, Error> {
+        // The official folder holds `model.llm.` names alone; a folder with both prefixes is no
+        // official one, and the MLX map refuses the foreign names.
+        if tensors.iter().any(|&(n, _)| n.starts_with(OFFICIAL))
+            && !tensors.iter().any(|&(n, _)| n.starts_with(MODEL))
+        {
+            return self.map_official(tensors);
+        }
         let mut out: BTreeMap<String, Mapped<Step>> = BTreeMap::new();
         let mut skipped = BTreeMap::new();
         let put = |to: String,
@@ -822,7 +894,7 @@ impl FolderMap for Checkpoint {
                 )?;
             }
         }
-        self.complete(&out, message)?;
+        self.complete(&out, message, MESSAGE_INPUT)?;
         Ok(Mapping {
             tensors: out,
             skipped,
@@ -890,6 +962,232 @@ impl Checkpoint {
         Some(ink::loop_ctrl_pr(l, module, part))
     }
 
+    /// The official checkpoint's tensors (`model.llm.`) mapped to the header's: each by its own
+    /// name, the vision tower skipped by name, and every tensor the header holds mapped at the
+    /// dims the config gives ([`Checkpoint::complete`]).
+    fn map_official<'a>(&self, tensors: &[(&'a str, &'a [usize])]) -> Result<Mapping<Step>, Error> {
+        let mut out: BTreeMap<String, Mapped<Step>> = BTreeMap::new();
+        let mut skipped = BTreeMap::new();
+        for &(name, shape) in tensors {
+            if !trunk::sized(shape) {
+                return Err(refuse(
+                    name,
+                    format!("shape {shape:?} is empty, zero, or overflows usize"),
+                ));
+            }
+            if name.starts_with(VISUAL) {
+                skipped.insert(
+                    name.to_string(),
+                    "the vision tower, which the text path does not read".to_string(),
+                );
+                continue;
+            }
+            let short = name
+                .strip_prefix(OFFICIAL)
+                .ok_or_else(|| refuse(name, "not an Inkling 2 tensor of the official folder"))?;
+            let (to, m) = self.official_tensor(name, short, shape)?;
+            if out.insert(to, m).is_some() {
+                return Err(refuse(name, "maps to a name another tensor has"));
+            }
+        }
+        let table = tensors
+            .iter()
+            .find(|&&(n, _)| n == OFFICIAL_QUERIES)
+            .map(|&(n, _)| n);
+        self.complete(&out, table, OFFICIAL_QUERIES)?;
+        Ok(Mapping {
+            tensors: out,
+            skipped,
+        })
+    }
+
+    /// The header tensor the official tensor `name` (`short` past `model.llm.`, stored as
+    /// `shape`) becomes, and how: a dense projection as its role reads it (BF16 as stored, or
+    /// Q8_0 where a load asks), the tensors the file keeps BF16 as stored, an F32 table in place,
+    /// every other small tensor widened to F32.
+    fn official_tensor(
+        &self,
+        name: &str,
+        short: &str,
+        shape: &[usize],
+    ) -> Result<(String, Mapped<Step>), Error> {
+        let dims = || shape.iter().rev().map(|&d| d as u64).collect::<Vec<_>>();
+        let made = |role: Use, steps: Vec<Step>, dims: Vec<u64>, origin: Origin| Mapped {
+            sources: vec![name.to_string()],
+            role,
+            steps,
+            dims,
+            origin,
+        };
+        let linear = |dims: Vec<u64>| made(Use::Matrix(Plain::Q8_0), vec![], dims, Origin::Made);
+        let bf16 = |dims: Vec<u64>| made(Use::Matrix(Plain::Bf16), vec![], dims, Origin::Made);
+        let widened = |steps: Vec<Step>, dims: Vec<u64>| {
+            made(Use::Matrix(Plain::F32), steps, dims, Origin::Made)
+        };
+        let f32_file = |dims: Vec<u64>| {
+            made(
+                Use::Matrix(Plain::F32),
+                vec![],
+                dims,
+                Origin::File(GgmlType::F32),
+            )
+        };
+        // One matrix an expert, written at load: the stack's own type and `.scale`.
+        let stack = |steps: Vec<Step>, dims: Vec<u64>| {
+            made(Use::Matrix(Plain::Q8_0), steps, dims, Origin::Made)
+        };
+        match short {
+            "embed.weight" => return Ok((common::token_embd(), linear(dims()))),
+            "embed_norm.weight" => {
+                return Ok((
+                    ink::TOKEN_EMBD_NORM.to_string(),
+                    widened(vec![], vec![self.hidden]),
+                ));
+            }
+            "norm.weight" => return Ok((common::output_norm(), widened(vec![], dims()))),
+            "unembed.weight" => return Ok((common::output(), linear(dims()))),
+            "attn_res.output_query" => {
+                return Ok((
+                    ink::OUTPUT_RES_QUERY.to_string(),
+                    f32_file(vec![self.hidden]),
+                ));
+            }
+            "middle_cycle_cross_pass_queries" => {
+                return Ok((ink::LOOP_RES_QUERY.to_string(), f32_file(dims())));
+            }
+            "middle_cycle_cross_pass_kv_queries" => {
+                return Ok((ink::LOOP_KV_RES_QUERY.to_string(), f32_file(dims())));
+            }
+            _ => {}
+        }
+        // The per-layer query tables: a row a layer, the attention mix of layer `l` at `l - 1`.
+        let table = |prefix: &str, shift: usize| -> Result<Option<usize>, Error> {
+            let Some(i) = short.strip_prefix(prefix) else {
+                return Ok(None);
+            };
+            i.parse::<usize>()
+                .ok()
+                .map(|i| i + shift)
+                .filter(|&l| l < self.layers)
+                .map(Some)
+                .ok_or_else(|| refuse(name, format!("layer {i:?} of {}", self.layers)))
+        };
+        if let Some(l) = table("attn_res.attn_queries.", 1)? {
+            return Ok((common::blk(l, "attn_res_query.weight"), f32_file(dims())));
+        }
+        if let Some(l) = table("attn_res.mlp_queries.", 0)? {
+            return Ok((common::blk(l, "ffn_res_query.weight"), f32_file(dims())));
+        }
+        let Some((l, rest)) = short
+            .strip_prefix("layers.")
+            .and_then(|r| r.split_once('.'))
+            .and_then(|(l, rest)| Some((l.parse::<usize>().ok()?, rest)))
+        else {
+            return Err(refuse(
+                name,
+                "not an Inkling 2 tensor of the official folder",
+            ));
+        };
+        if l >= self.layers {
+            return Err(refuse(name, format!("layer {l} of {}", self.layers)));
+        }
+        let windowed = self.windowed[l];
+        let stem = |to: &str| common::blk(l, to);
+        let conv_taps = || widened(vec![Step::Squeeze], vec![self.conv, self.key_rows]);
+        let static_taps = || widened(vec![Step::StaticTaps], vec![self.conv, self.key_rows]);
+        let (to, m) = match rest {
+            "attn.wq_du.weight" => (stem("attn_q.weight"), linear(dims())),
+            "attn.wk_dv.weight" => (stem("attn_k.weight"), linear(dims())),
+            "attn.wv_dv.weight" => (stem("attn_v.weight"), linear(dims())),
+            "attn.wo_ud.weight" => (stem("attn_output.weight"), linear(dims())),
+            "attn.gate_attn.weight" => (stem("attn_gate.weight"), linear(dims())),
+            "attn.wr_du.weight" => (stem("attn_rel.weight"), linear(dims())),
+            "attn.attn_sink_proj.weight" => (stem("attn_sink_proj.weight"), bf16(dims())),
+            "attn.rel_logits_proj.proj" => (
+                stem("attn_rel_bias.weight"),
+                widened(
+                    vec![Step::Bank],
+                    vec![self.d_rel, if windowed { self.swa } else { self.extent }],
+                ),
+            ),
+            "attn.q_l2_clip.scale" => (stem("attn_q_clip.weight"), widened(vec![], dims())),
+            "attn.rel_l2_clip.scale" => (stem("attn_rel_clip.weight"), widened(vec![], dims())),
+            "attn.k_sconv.weight" if windowed => (stem("attn_k_conv.weight"), conv_taps()),
+            "attn.v_sconv.weight" if windowed => (stem("attn_v_conv.weight"), conv_taps()),
+            "attn.k_sconv.static_w" if !windowed => (stem("attn_k_conv.weight"), static_taps()),
+            "attn.v_sconv.static_w" if !windowed => (stem("attn_v_conv.weight"), static_taps()),
+            "attn.k_sconv.weight_proj" if !windowed => (ink::inp(l, ink::Inp::ConvK), bf16(dims())),
+            "attn.v_sconv.weight_proj" if !windowed => (ink::inp(l, ink::Inp::ConvV), bf16(dims())),
+            "attn_sconv.weight" => (
+                stem("attn_post_conv.weight"),
+                widened(vec![Step::Squeeze], vec![self.conv, self.hidden]),
+            ),
+            "mlp_sconv.weight" => (
+                stem("ffn_post_conv.weight"),
+                widened(vec![Step::Squeeze], vec![self.conv, self.hidden]),
+            ),
+            "attn_norm.weight" if windowed => (stem("attn_norm.weight"), widened(vec![], dims())),
+            "q_input_norm.weight" if !windowed => {
+                (ink::inp(l, ink::Inp::NormQ), widened(vec![], dims()))
+            }
+            "k_input_norm.weight" if !windowed => {
+                (ink::inp(l, ink::Inp::NormK), widened(vec![], dims()))
+            }
+            "v_input_norm.weight" if !windowed => {
+                (ink::inp(l, ink::Inp::NormV), widened(vec![], dims()))
+            }
+            "mlp_norm.weight" => (stem("ffn_norm.weight"), widened(vec![], dims())),
+            "mlp.gate.weight" => (stem("ffn_gate_inp.weight"), widened(vec![], dims())),
+            "mlp.gate.bias" => (common::exp_probs_b(l), f32_file(dims())),
+            "mlp.experts.w13_weight" => (
+                stem("ffn_gate_up_exps.weight"),
+                stack(vec![Step::Deinterleave], dims()),
+            ),
+            "mlp.experts.w2_weight" => (common::ffn_down_exps(l), stack(vec![], dims())),
+            other if other.starts_with("controllers.") => {
+                if !self.in_core(l) {
+                    return Err(refuse(
+                        name,
+                        format!(
+                            "layer {l} is outside the loop's core, which holds no message \
+                             controller"
+                        ),
+                    ));
+                }
+                let (module, part) = other
+                    .strip_prefix("controllers.")
+                    .and_then(|r| r.split_once('.'))
+                    .ok_or_else(|| refuse(name, "not an Inkling 2 tensor"))?;
+                let module = match module {
+                    "attn" => ink::Ctrl::Attn,
+                    "k" => ink::Ctrl::K,
+                    "v" => ink::Ctrl::V,
+                    "mlp" => ink::Ctrl::Ffn,
+                    _ => return Err(refuse(name, "not an Inkling 2 controller")),
+                };
+                let part = match part {
+                    "down_weight" => ink::CtrlPart::Down,
+                    "gain_weight" => ink::CtrlPart::Gain,
+                    "forget_weight" => ink::CtrlPart::Forget,
+                    _ => return Err(refuse(name, "not an Inkling 2 controller tensor")),
+                };
+                let dims = if part == ink::CtrlPart::Down {
+                    vec![2 * self.hidden, self.rank()]
+                } else {
+                    vec![self.rank(), self.hidden]
+                };
+                (ink::loop_ctrl_pr(l, module, part), widened(vec![], dims))
+            }
+            other => {
+                return Err(refuse(
+                    name,
+                    format!("{other:?} is not an Inkling 2 tensor"),
+                ));
+            }
+        };
+        Ok((to, m))
+    }
+
     /// Every tensor the header holds is mapped, at the dims the config gives: the model level,
     /// then each stored layer's tensors by its kind. `message` names the model-level
     /// message-query table, which a looped folder holds and a loopless one lacks.
@@ -897,6 +1195,7 @@ impl Checkpoint {
         &self,
         mapped: &BTreeMap<String, Mapped<Step>>,
         message: Option<&str>,
+        table: &str,
     ) -> Result<(), Error> {
         let (e, d) = (self.hidden, self.head_dim);
         let (heads, kv) = (self.heads, self.kv);
@@ -979,7 +1278,7 @@ impl Checkpoint {
         }
         if self.loop_.is_some() != message.is_some() {
             return Err(refuse(
-                MESSAGE_INPUT,
+                table,
                 if self.loop_.is_some() {
                     "is missing from the folder, and the loop's message queries are its tensors"
                 } else {
@@ -1809,5 +2108,337 @@ mod tests {
 
     fn row_all_eq(values: &[f32], want: f32) -> bool {
         !values.is_empty() && values.iter().all(|v| *v == want)
+    }
+
+    const OFFICIAL_CONFIG: &str = "quant-configs/thinkingmachines__Inkling-2-Mini__config.json.gz";
+    const OFFICIAL_QUANT: &str =
+        "quant-configs/thinkingmachines__Inkling-2-Mini__hf_quant_config.json.gz";
+    const OFFICIAL_HEADER: &str =
+        "checkpoint-headers/inkling-2-mini-official-model-00001-of-00001.header.json.gz";
+
+    /// The official folder's header planned as a load (`q8` false: BF16 as stored) or a Q8_0 load
+    /// reads it.
+    fn official_planning(q8: bool) -> (Entries, folder::Planning<Step>) {
+        let config = json(OFFICIAL_CONFIG);
+        let checkpoint = Checkpoint::parse(&config).unwrap();
+        let mut header = json(OFFICIAL_HEADER);
+        header.as_object_mut().unwrap().remove("__metadata__");
+        let entries = entries(&header);
+        let planning = folder::plan_tensors(
+            &checkpoint,
+            &Config::parse(&config, Some(&json(OFFICIAL_QUANT))).unwrap(),
+            &entries,
+            q8,
+            folder::Keep::InPlace,
+        )
+        .unwrap();
+        (entries, planning)
+    }
+
+    /// The official folder's header plans every text tensor in the GGUF twin's types and skips the
+    /// vision tower: the 694 tensors and 40 `.scale` rows the twin (unsloth's UD-Q4_K_XL) holds,
+    /// the NVFP4 experts of layers 0 to 19 as GGUF's NVFP4 with a `.scale` an expert, the coda's
+    /// as MXFP8, the dense projections BF16 as stored (Q8_0 where the load asks), the sink
+    /// projection and the conv projections BF16 either way, and every small tensor F32. The plan
+    /// refuses nothing and the map leaves no folder tensor unread.
+    #[test]
+    fn the_official_headers_plan_every_text_tensor_in_the_twin_s_types() {
+        let (entries, bf16) = official_planning(false);
+        let (_, q8) = official_planning(true);
+        assert_eq!(entries.len(), 1244);
+        for planning in [&bf16, &q8] {
+            assert!(
+                planning.plan.refused.is_empty(),
+                "{:?}",
+                planning.plan.refused
+            );
+            let visual = entries
+                .iter()
+                .filter(|(n, _, _)| n.starts_with("model.visual."))
+                .count();
+            assert_eq!(planning.skipped.len(), visual);
+            assert_eq!(planning.planned.len(), 734);
+            assert_eq!(
+                planning
+                    .planned
+                    .iter()
+                    .filter(|p| !p.decl.name.ends_with(".scale"))
+                    .count(),
+                694
+            );
+        }
+        let ty = |p: &folder::Planning<Step>, n: &str| {
+            p.planned
+                .iter()
+                .find(|p| p.decl.name == n)
+                .unwrap_or_else(|| panic!("{n} is not planned"))
+                .decl
+                .type_id
+        };
+        let (bf16_ty, q8_ty) = (GgmlType::BF16.as_u32(), GgmlType::Q8_0.as_u32());
+        for (name, nvfp4) in [
+            ("blk.0.ffn_gate_up_exps.weight", true),
+            ("blk.19.ffn_down_exps.weight", true),
+            ("blk.20.ffn_gate_up_exps.weight", false),
+            ("blk.23.ffn_down_exps.weight", false),
+        ] {
+            let want = if nvfp4 {
+                GgmlType::NVFP4
+            } else {
+                GgmlType::MXFP8
+            };
+            for p in [&bf16, &q8] {
+                assert_eq!(ty(p, name), want.as_u32(), "{name}");
+            }
+            let scale = name.replace(".weight", ".scale");
+            assert_eq!(
+                bf16.planned.iter().any(|p| p.decl.name == scale),
+                nvfp4,
+                "{scale}"
+            );
+        }
+        assert_eq!(
+            bf16.planned
+                .iter()
+                .find(|p| p.decl.name == "blk.19.ffn_down_exps.scale")
+                .unwrap()
+                .decl
+                .dims,
+            [128]
+        );
+        for name in [
+            "token_embd.weight",
+            "output.weight",
+            "blk.0.attn_q.weight",
+            "blk.7.attn_k.weight",
+            "blk.23.attn_output.weight",
+            "blk.3.attn_gate.weight",
+            "blk.5.attn_rel.weight",
+        ] {
+            assert_eq!(ty(&bf16, name), bf16_ty, "{name}");
+            assert_eq!(ty(&q8, name), q8_ty, "{name}");
+        }
+        for name in [
+            "blk.0.attn_sink_proj.weight",
+            "blk.5.attn_k_conv_proj.weight",
+            "blk.11.attn_v_conv_proj.weight",
+        ] {
+            assert_eq!(ty(&bf16, name), bf16_ty, "{name}");
+            assert_eq!(ty(&q8, name), bf16_ty, "{name}");
+        }
+        for name in [
+            "token_embd_norm.weight",
+            "output_norm.weight",
+            "output_res_query.weight",
+            "loop_res_query.weight",
+            "loop_kv_res_query.weight",
+            "blk.0.attn_norm.weight",
+            "blk.5.attn_q_inp_norm.weight",
+            "blk.0.attn_k_conv.weight",
+            "blk.5.attn_k_conv.weight",
+            "blk.0.attn_post_conv.weight",
+            "blk.0.attn_rel_bias.weight",
+            "blk.0.attn_q_clip.weight",
+            "blk.0.ffn_gate_inp.weight",
+            "blk.0.exp_probs_b.bias",
+            "blk.0.ffn_res_query.weight",
+            "blk.1.attn_res_query.weight",
+            "blk.6.loop_attn_down.weight",
+            "blk.6.loop_mlp_gain.weight",
+            "blk.17.loop_v_forget.weight",
+        ] {
+            assert_eq!(ty(&bf16, name), GgmlType::F32.as_u32(), "{name}");
+            assert_eq!(ty(&q8, name), GgmlType::F32.as_u32(), "{name}");
+        }
+    }
+
+    /// The fused gate·up rows of the official stacks alternate (even rows the gate, odd the up);
+    /// the file holds the gate rows then the up rows. The step moves whole rows of any block
+    /// type, expert by expert, and refuses a stack it cannot pair by name.
+    ///
+    /// FAIL-first: a step that leaves the rows as stored fails the row order.
+    #[test]
+    fn the_gate_up_rows_unweave_expert_by_expert() {
+        let (rows, experts, row) = (6usize, 2usize, 3usize);
+        let bytes: Vec<u8> = (0..rows * experts).flat_map(|r| [r as u8; 3]).collect();
+        assert_eq!(bytes.len(), rows * experts * row);
+        let mut t = Normal {
+            type_id: GgmlType::NVFP4.as_u32(),
+            dims: vec![64, rows as u64, experts as u64],
+            bytes,
+            scale: vec![1.0, 2.0],
+        };
+        Step::Deinterleave.apply(&mut t).unwrap();
+        let order: Vec<u8> = t.bytes.chunks(row).map(|r| r[0]).collect();
+        assert_eq!(order, [0, 2, 4, 1, 3, 5, 6, 8, 10, 7, 9, 11]);
+        assert!(t.bytes.chunks(row).all(|r| r.iter().all(|&b| b == r[0])));
+        assert_eq!(t.dims, [64, 6, 2]);
+        assert_eq!(t.scale, [1.0, 2.0]);
+        let mut odd = Normal {
+            dims: vec![64, 5, 2],
+            bytes: vec![0; 30],
+            ..Normal::default()
+        };
+        assert!(
+            Step::Deinterleave
+                .apply(&mut odd)
+                .unwrap_err()
+                .contains("do not pair")
+        );
+        let mut flat = Normal {
+            dims: vec![64, 6],
+            bytes: vec![0; 12],
+            ..Normal::default()
+        };
+        assert!(
+            Step::Deinterleave
+                .apply(&mut flat)
+                .unwrap_err()
+                .contains("not a stack of matrices")
+        );
+        assert_eq!(flat.dims, [64, 6]);
+    }
+
+    /// A folder with tensors of both dialects (the MLX map's, which refuses the official names)
+    /// and one with a tensor the official map does not name are refused by name.
+    #[test]
+    fn a_folder_of_neither_dialect_is_refused_by_name() {
+        let config = json(OFFICIAL_CONFIG);
+        let checkpoint = Checkpoint::parse(&config).unwrap();
+        let both: Vec<(&str, &[usize])> = vec![
+            ("model.llm.norm.weight", &[2304]),
+            ("model.language_model.norm.weight", &[2304]),
+        ];
+        let e = checkpoint.map(&both).err().unwrap().to_string();
+        assert!(
+            e.contains("model.llm.norm.weight")
+                && e.contains("not an Inkling 2 tensor of the text model"),
+            "{e}"
+        );
+        let stray: Vec<(&str, &[usize])> = vec![
+            ("model.llm.norm.weight", &[2304]),
+            ("model.llm.layers.0.attn.unknown.weight", &[2, 2]),
+        ];
+        let e = checkpoint.map(&stray).err().unwrap().to_string();
+        assert!(e.contains("model.llm.layers.0.attn.unknown.weight"), "{e}");
+    }
+
+    /// The official folder at `$BLOOMERY_INK2_OFFICIAL` read as the GGUF twin at
+    /// `$BLOOMERY_INK2_GGUF` (unsloth's UD-Q4_K_XL file): the folder opens, tokenizer included, and
+    /// every tensor the map makes of it is the twin's, byte for byte where the twin holds the same
+    /// type — the NVFP4 stacks of layers 0 to 19 (codes, block scales and the `.scale` an expert
+    /// as f32 bits, the fused gate and up rows in the file's order), every F32 tensor, the BF16
+    /// ones the file keeps, and, in a read that asks for Q8_0, every dense projection and the
+    /// embedding and head. A read that keeps BF16 holds each dense tensor as the folder stores it,
+    /// two bytes a weight. The coda's MXFP8 stacks (layers 20 to 23) are the twin's dims in
+    /// MXFP8's blocks, which the twin's Q8_0 does not share.
+    ///
+    /// FAIL-first: an identity un-interleave leaves the gate and up rows alternating, and the
+    /// first NVFP4 stack differs from the twin's at its first up row.
+    #[test]
+    #[ignore = "needs the official folder at $BLOOMERY_INK2_OFFICIAL and the GGUF twin at $BLOOMERY_INK2_GGUF"]
+    fn hw_the_official_folder_reads_as_the_served_gguf() {
+        let dir = std::path::PathBuf::from(
+            std::env::var_os("BLOOMERY_INK2_OFFICIAL")
+                .expect("$BLOOMERY_INK2_OFFICIAL names the official folder"),
+        );
+        let twin = gguf::Gguf::open(
+            std::env::var_os("BLOOMERY_INK2_GGUF").expect("$BLOOMERY_INK2_GGUF names the twin"),
+        )
+        .unwrap();
+        let made = |read: &folder::Read<Checkpoint>, p: &folder::Planned<Step>| -> Normal {
+            let folder::Make::Tensor(m) = &p.make else {
+                panic!("{}: not a tensor of the folder", p.decl.name);
+            };
+            let mut n = hf::modelopt::normalize(
+                |s| read.folder.raw(s),
+                &m.placed(&read.plan).unwrap(),
+                m.role,
+            )
+            .unwrap_or_else(|e| panic!("{}: {e}", p.decl.name));
+            if let Some(step) = read.checkpoint.mover(&p.decl.name, &m.steps) {
+                step(&mut n).unwrap();
+            }
+            assert_eq!(n.type_id, p.decl.type_id, "{}", p.decl.name);
+            assert_eq!(n.bytes.len() as u64, p.decl.nbytes, "{}", p.decl.name);
+            n
+        };
+
+        // Q8_0 where asked: the twin's own types, every tensor.
+        let q8 = folder::read::<Checkpoint>(&dir, true).unwrap();
+        assert_eq!(q8.tokenizer.pre(), "gpt-4o");
+        let (mut equal, mut stacks, mut coda) = (0, 0, 0);
+        for p in &q8.planned {
+            let name = p.decl.name.as_str();
+            if name.ends_with(".scale") {
+                continue;
+            }
+            let info = twin
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} is not in the twin"));
+            assert_eq!(info.dims, p.decl.dims, "{name}");
+            let layer = name
+                .strip_prefix("blk.")
+                .and_then(|r| r.split_once('.'))
+                .and_then(|(l, _)| l.parse::<usize>().ok());
+            if name.contains("_exps.") && layer.is_some_and(|l| l >= 20) {
+                // MXFP8 against the twin's Q8_0: the same matrix, another block type.
+                assert_eq!(p.decl.type_id, GgmlType::MXFP8.as_u32(), "{name}");
+                assert_eq!(info.ty, GgmlType::Q8_0, "{name}");
+                let n = made(&q8, p);
+                assert_eq!(n.dims, p.decl.dims, "{name}");
+                assert!(n.scale.is_empty(), "{name}");
+                coda += 1;
+                continue;
+            }
+            assert_eq!(info.ty.as_u32(), p.decl.type_id, "{name}");
+            let n = made(&q8, p);
+            assert!(
+                n.bytes == twin.data(info).unwrap(),
+                "{name}: {} bytes differ from the twin's",
+                n.bytes.len()
+            );
+            if name.contains("_exps.") {
+                let scale = twin
+                    .find(&name.replace(".weight", ".scale"))
+                    .unwrap_or_else(|| panic!("{name} has no .scale in the twin"));
+                let want: Vec<u32> = twin
+                    .data(scale)
+                    .unwrap()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
+                    .collect();
+                let got: Vec<u32> = n.scale.iter().map(|s| s.to_bits()).collect();
+                assert_eq!(got, want, "{name}: the .scale an expert");
+                stacks += 1;
+            }
+            equal += 1;
+        }
+        // 40 NVFP4 stacks, 8 MXFP8; every other tensor of the 694 the twin holds equal.
+        assert_eq!((stacks, coda, equal), (40, 8, 686));
+
+        // BF16 as stored where the read keeps it: each dense tensor two bytes a weight.
+        let bf16 = folder::read::<Checkpoint>(&dir, false).unwrap();
+        let mut dense = 0;
+        for p in &bf16.planned {
+            let info = twin.find(&p.decl.name);
+            if p.decl.type_id != GgmlType::BF16.as_u32()
+                || info.is_none_or(|i| i.ty != GgmlType::Q8_0)
+            {
+                continue;
+            }
+            let folder::Make::Tensor(m) = &p.make else {
+                panic!("{}: not a tensor of the folder", p.decl.name);
+            };
+            let stored = bf16.folder.raw(&m.sources[0]).unwrap();
+            assert_eq!(stored.dtype, Dtype::Bf16, "{}", p.decl.name);
+            let n = made(&bf16, p);
+            assert_eq!(n.bytes.len(), 2 * stored.shape.iter().product::<usize>());
+            assert!(n.bytes == stored.bytes, "{}", p.decl.name);
+            dense += 1;
+        }
+        assert_eq!(dense, 146);
     }
 }

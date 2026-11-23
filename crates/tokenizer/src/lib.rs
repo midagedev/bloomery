@@ -904,6 +904,42 @@ mod tests {
         assert!(error.contains("tokenizer.bloomery.eog_token_ids"));
     }
 
+    /// A header of Inkling 2's architecture with `gpt-4o`'s pre-tokenizer reads the expression two
+    /// ways: a GGUF (the Small's file) as the tree that reads it does (`inkling2`'s reading, a mark
+    /// a letter), a folder's tokenizer (marked by the private stop key) as `tokenizers` runs the
+    /// expression, the reading every `gpt-4o` and `minimax-m2` folder has. The Mini's own
+    /// `inkling2` name has no Hugging Face reading and is refused by name beside that key.
+    ///
+    /// FAIL-first: with the folder's header rewritten to the tree's reading as the GGUF's is, the
+    /// folder is refused for a pre-tokenizer that "has no reading that runs as tokenizers does".
+    #[test]
+    fn an_inkling2_folder_s_gpt_4o_expression_runs_as_tokenizers_does() {
+        let mut header = flint_header();
+        header[1].1 = Value::String("gpt-4o".into());
+        header.push((
+            "general.architecture".into(),
+            Value::String("inkling2".into()),
+        ));
+        let gguf = from_header(&header).unwrap();
+        assert_eq!(gguf.pre(), "gpt-4o");
+        header.push((
+            "tokenizer.bloomery.eog_token_ids".into(),
+            Value::Array([257, 258, 259, 260].map(Value::U32).to_vec()),
+        ));
+        let folder = from_header(&header).unwrap();
+        assert_eq!(folder.pre(), "gpt-4o");
+        assert_eq!(folder.eog(), gguf.eog());
+        header[1].1 = Value::String("inkling2".into());
+        let error = from_header(&header)
+            .err()
+            .expect("the Mini's pre-tokenizer has no Hugging Face reading")
+            .to_string();
+        assert!(
+            error.contains("\"inkling2\"") && error.contains("no reading that runs as tokenizers"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn flint_replaces_invalid_utf8_without_normalizing_valid_text() {
         let tok = from_header(&flint_header()).unwrap();

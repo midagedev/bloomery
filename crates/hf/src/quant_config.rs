@@ -107,6 +107,17 @@ pub enum Format {
     /// MLX's `mxfp8` mode: `.weight` U32 words of 4 F8_E4M3 bytes, one U8 `.scales` byte (an
     /// E8M0 scale) a 32 values, no global scale. Placed as [`Format::MlxNvfp4`] is.
     MlxMxfp8,
+    /// The routed experts NVFP4 as an `inkling2` parameter-group checkpoint ([`Groups`]) stores
+    /// them: one 3-D tensor whose stored leading axis is its experts, U8 E2M1 pairs `[experts,
+    /// rows, k/2]` in ModelOpt's nibble order, an F8_E4M3 `<weight>_scale` `[experts, rows,
+    /// k/16]` and each expert's tensor scale, `<weight>_amax[e]` over the one
+    /// `<weight>_outer_scale_denominator`.
+    Nvfp4Amax,
+    /// The routed experts MXFP8 as an `inkling2` parameter-group checkpoint stores them: one 3-D
+    /// tensor whose stored leading axis is its experts, F8_E4M3 values `[experts, rows, k]` and
+    /// one E8M0 byte (U8) a row's 32 values in `<weight>_scale` `[experts, rows, k/32]`: blocks
+    /// of one row by 32 values, whatever the config's `weight_block_shape` spells.
+    Mxfp8Stacked,
     Bf16,
     F32,
     /// F16 as stored, read widened to f32 (exact) where a role asks for F32.
@@ -134,6 +145,8 @@ impl fmt::Display for Format {
             }
             Format::MlxNvfp4 => f.write_str("MLX-nvfp4 experts"),
             Format::MlxMxfp8 => f.write_str("MLX-mxfp8 experts"),
+            Format::Nvfp4Amax => f.write_str("NVFP4-amax experts"),
+            Format::Mxfp8Stacked => f.write_str("MXFP8 experts"),
             Format::Bf16 => f.write_str("BF16"),
             Format::F32 => f.write_str("F32"),
             Format::F16 => f.write_str("F16"),
@@ -166,8 +179,8 @@ impl Format {
             }
             // The plane pairs the MLX modes hold are the ones ModelOpt's NVFP4 and OCP's MXFP8
             // are, at MLX's own group shapes.
-            Format::MlxNvfp4 => Some(GgmlType::NVFP4),
-            Format::MlxMxfp8 => Some(GgmlType::MXFP8),
+            Format::MlxNvfp4 | Format::Nvfp4Amax => Some(GgmlType::NVFP4),
+            Format::MlxMxfp8 | Format::Mxfp8Stacked => Some(GgmlType::MXFP8),
             Format::Fp8Channel | Format::Fp8Tensor => Some(GgmlType::FP8_B128),
             Format::Mxfp8 => Some(GgmlType::MXFP8),
             Format::Fp8Block { rows, cols } if rows > 0 && cols > 0 => {
@@ -267,7 +280,7 @@ impl Format {
                 matrices.checked_mul(4)?
             }
             // One F32 `.scale` an expert, beside the stack as NVFP4's tensor scales are.
-            Format::MlxNvfp4 => matrices.checked_mul(4)?,
+            Format::MlxNvfp4 | Format::Nvfp4Amax => matrices.checked_mul(4)?,
             _ => 0,
         };
         Some(Held { whole_bytes, block })
@@ -285,6 +298,7 @@ impl Format {
             | Format::Nvfp4Csf
             | Format::Nvfp4Csf32
             | Format::Nvfp4Ct
+            | Format::Nvfp4Amax
             | Format::Mxfp4 => 2,
             Format::Int4Pack { .. } => 8,
             Format::MlxAffine { bits, .. } | Format::MlxAffineF16 { bits, .. } => 32 / bits,
@@ -309,6 +323,249 @@ pub struct Config {
     modelopt: Option<Modelopt>,
     /// `config.json`'s own config: the modules ModelOpt leaves, or every module.
     other: Option<Other>,
+    /// The `inkling2` schema of `hf_quant_config.json`: the formats each tensor is listed under.
+    groups: Option<Groups>,
+}
+
+/// What one `parameter_groups` entry of an `inkling2` checkpoint's `hf_quant_config.json` stores
+/// its tensors as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupKind {
+    /// `compute_dtype` float32 with `weight_transform` `cast`: F32 as stored.
+    F32,
+    /// `compute_dtype` bfloat16 with `weight_transform` `cast`: BF16 as stored.
+    Bf16,
+    /// `compute_dtype` nvfp4 with `weight_transform` `nvfp4_nearest` and `weight_scale_format`
+    /// `amax_denominator`: [`Format::Nvfp4Amax`].
+    Nvfp4Amax,
+    /// `compute_dtype` mxfp8 with `weight_transform` `mxfp8_nearest`: [`Format::Mxfp8Stacked`].
+    Mxfp8,
+}
+
+/// One `parameter_groups` entry: how its tensors are stored and which tensors they are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub kind: GroupKind,
+    /// The group's `weight_block_shape` as the config spells it: empty for a cast, `[1, 16]` for
+    /// NVFP4, `[32, 32]` or `[1, 32]` for MXFP8. The stored scale grids decide the layout.
+    pub block: Vec<u64>,
+    /// `fwd_output_dtype` is float32: the group's matmul returns f32 (the head's logits).
+    pub fwd_f32: bool,
+    /// The tensors the group lists, by their folder names.
+    pub tensors: Vec<String>,
+}
+
+/// The `inkling2` quantization schema: `hf_quant_config.json` with `quant_method` `inkling2`
+/// holds, for the target (`model`) and the draft (`mtp`), `parameter_groups` that each list the
+/// tensors they store. Every tensor of the target's folder is listed in exactly one group; a
+/// weight's companions (`_scale`, `_amax`, `_outer_scale_denominator`) are named by it. The
+/// activation recipe a quantized group requires (W4A4, W8A8) is checked for its format and block
+/// size and is not read further: this engine quantizes activations to its own Q8 blocks.
+#[derive(Debug)]
+pub struct Groups {
+    /// The target's groups, in the file's order.
+    pub model: Vec<Group>,
+    /// The draft's groups; empty when the file has no `mtp` section.
+    pub mtp: Vec<Group>,
+    by_tensor: BTreeMap<String, GroupKind>,
+}
+
+/// `hf_quant_config.json`'s keys under the `inkling2` schema.
+const HF_GROUPS: &Fields = &[("quant_method", Read), ("model", Read), ("mtp", Read)];
+
+/// A section's (`model`, `mtp`) keys.
+const GROUP_SECTION: &Fields = &[("parameter_groups", Read)];
+
+/// A group's keys, each read by [`Group::parse`].
+const GROUP: &Fields = &[
+    ("compute_dtype", Read),
+    ("output_dtype", Read),
+    ("fwd_output_dtype", Read),
+    ("required_activation_quantization", Read),
+    ("weight_block_shape", Read),
+    ("weight_transform", Read),
+    ("weight_scale_format", Read),
+    ("tensors", Read),
+];
+
+/// A group's `required_activation_quantization` keys, `format` and `block_size` read.
+const GROUP_ACTIVATION: &Fields = &[
+    ("amax_type", Read),
+    ("block_size", Read),
+    ("format", Read),
+    ("rounding", Read),
+    ("scale_dtype", Read),
+    ("scale_selection_rule", Read),
+];
+
+/// What a group's storage kind must declare in the config: the scale block shapes it may spell,
+/// its weight scale format and its required activation format with block size.
+struct Declared {
+    blocks: &'static [&'static [u64]],
+    scales: Option<&'static str>,
+    activation: Option<(&'static str, u64)>,
+}
+
+impl Group {
+    fn parse(what: &str, v: &Value) -> Result<Group, Error> {
+        schema::check(v, what, &[GROUP]).map_err(bad)?;
+        let text = |key: &str| -> Result<&str, Error> {
+            v.get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad(format!("{what}.{key} is missing or not a string")))
+        };
+        let block = match v.get("weight_block_shape") {
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|d| {
+                    d.as_u64().filter(|&d| d > 0).ok_or_else(|| {
+                        bad(format!("{what}.weight_block_shape holds {d}, not a count"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(bad(format!(
+                    "{what}.weight_block_shape is missing or not an array"
+                )));
+            }
+        };
+        let (compute, output, transform) = (
+            text("compute_dtype")?,
+            text("output_dtype")?,
+            text("weight_transform")?,
+        );
+        let kind = match (compute, output, transform) {
+            ("float32", "float32", "cast") => GroupKind::F32,
+            ("bfloat16", "bfloat16", "cast") => GroupKind::Bf16,
+            ("nvfp4", "uint8", "nvfp4_nearest") => GroupKind::Nvfp4Amax,
+            ("mxfp8", "float8_e4m3fn", "mxfp8_nearest") => GroupKind::Mxfp8,
+            _ => {
+                return Err(bad(format!(
+                    "{what}: compute_dtype {compute}, output_dtype {output} and weight_transform \
+                     {transform} are not a storage this reader places"
+                )));
+            }
+        };
+        let fwd_f32 = match v.get("fwd_output_dtype").map(Value::as_str) {
+            None => false,
+            Some(Some("float32")) if kind == GroupKind::Bf16 => true,
+            Some(other) => {
+                return Err(bad(format!(
+                    "{what}.fwd_output_dtype {other:?} is not float32 on a bfloat16 group"
+                )));
+            }
+        };
+        let scale_format = v.get("weight_scale_format").map(Value::as_str);
+        let activation = v
+            .get("required_activation_quantization")
+            .filter(|a| !a.is_null());
+        let Declared {
+            blocks: want_block,
+            scales: want_scales,
+            activation: want_activation,
+        } = match kind {
+            GroupKind::F32 | GroupKind::Bf16 => Declared {
+                blocks: &[&[]],
+                scales: None,
+                activation: None,
+            },
+            GroupKind::Nvfp4Amax => Declared {
+                blocks: &[&[1, 16]],
+                scales: Some("amax_denominator"),
+                activation: Some(("nvfp4_e2m1", 16)),
+            },
+            // The stored scale grid is one row by 32 values; the config spells it `[32, 32]`.
+            GroupKind::Mxfp8 => Declared {
+                blocks: &[&[32, 32], &[1, 32]],
+                scales: None,
+                activation: Some(("mxfp8_e4m3", 32)),
+            },
+        };
+        if !want_block.contains(&block.as_slice()) {
+            return Err(bad(format!(
+                "{what}.weight_block_shape {block:?} is not one of {want_block:?} for {compute}"
+            )));
+        }
+        if scale_format != want_scales.map(Some) {
+            return Err(bad(format!(
+                "{what}.weight_scale_format {scale_format:?} is not {want_scales:?} for {compute}"
+            )));
+        }
+        match (activation, want_activation) {
+            (None, None) => {}
+            (Some(a), Some((format, size))) => {
+                schema::check(
+                    a,
+                    &format!("{what}.required_activation_quantization"),
+                    &[GROUP_ACTIVATION],
+                )
+                .map_err(bad)?;
+                if a.get("format").and_then(Value::as_str) != Some(format)
+                    || a.get("block_size").and_then(Value::as_u64) != Some(size)
+                {
+                    return Err(bad(format!(
+                        "{what}.required_activation_quantization {a} is not {format} blocks of \
+                         {size}"
+                    )));
+                }
+            }
+            (a, w) => {
+                return Err(bad(format!(
+                    "{what}.required_activation_quantization is {a:?}, where {compute} has {w:?}"
+                )));
+            }
+        }
+        let tensors = v
+            .get("tensors")
+            .ok_or_else(|| bad(format!("{what}.tensors is missing")))
+            .and_then(|t| strings(t, &format!("{what}.tensors")))?;
+        Ok(Group {
+            kind,
+            block,
+            fwd_f32,
+            tensors,
+        })
+    }
+}
+
+impl Groups {
+    fn parse(h: &Value) -> Result<Groups, Error> {
+        schema::check(h, "hf_quant_config.json", &[HF_GROUPS]).map_err(bad)?;
+        let section = |name: &str| -> Result<Option<Vec<Group>>, Error> {
+            let Some(s) = h.get(name) else {
+                return Ok(None);
+            };
+            let what = format!("hf_quant_config.json.{name}");
+            schema::check(s, &what, &[GROUP_SECTION]).map_err(bad)?;
+            let list = s
+                .get("parameter_groups")
+                .and_then(Value::as_array)
+                .ok_or_else(|| bad(format!("{what}.parameter_groups is missing or not a list")))?;
+            let mut names = BTreeSet::new();
+            let mut groups = Vec::with_capacity(list.len());
+            for (i, g) in list.iter().enumerate() {
+                let group = Group::parse(&format!("{what}.parameter_groups[{i}]"), g)?;
+                for t in &group.tensors {
+                    if !names.insert(t.clone()) {
+                        return Err(bad(format!("{what}: tensor {t} is listed in two groups")));
+                    }
+                }
+                groups.push(group);
+            }
+            Ok(Some(groups))
+        };
+        let model = section("model")?
+            .ok_or_else(|| bad("hf_quant_config.json.model is missing: the target's groups"))?;
+        let by_tensor = model
+            .iter()
+            .flat_map(|g| g.tensors.iter().map(|t| (t.clone(), g.kind)))
+            .collect();
+        Ok(Groups {
+            model,
+            mtp: section("mtp")?.unwrap_or_default(),
+            by_tensor,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -441,6 +698,21 @@ impl Config {
         if method == Some("quark") {
             return Err(bad("Quark checkpoints are not read yet"));
         }
+        // The `inkling2` schema is its own producer's: it reads no other config beside it, and
+        // `config.json` may carry only ModelOpt's one-line copy of its algorithm.
+        if let Some(h) =
+            hf_quant.filter(|h| h.get("quant_method").and_then(Value::as_str) == Some("inkling2"))
+        {
+            if let Some(m) = method.filter(|m| *m != "modelopt") {
+                return Err(bad(format!(
+                    "quantization_config's quant_method {m} beside the inkling2 parameter groups"
+                )));
+            }
+            return Ok(Config {
+                groups: Some(Groups::parse(h)?),
+                ..Config::default()
+            });
+        }
         let mut out = Config {
             mlx,
             ..Config::default()
@@ -466,6 +738,12 @@ impl Config {
             }
         };
         Ok(out)
+    }
+
+    /// The `inkling2` parameter groups, when the config is that schema.
+    #[must_use]
+    pub fn groups(&self) -> Option<&Groups> {
+        self.groups.as_ref()
     }
 
     /// The formats `module` is declared, and the module whose scale a tensor-scale format shares;
@@ -975,6 +1253,9 @@ pub fn plan<'a>(
 ) -> Plan {
     let table: BTreeMap<&str, (Dtype, &[usize])> =
         tensors.into_iter().map(|(n, d, s)| (n, (d, s))).collect();
+    if let Some(groups) = &config.groups {
+        return plan_groups(groups, &table);
+    }
     let mut out = Plan::default();
     let mut claimed = BTreeSet::new();
     for (&name, &(dtype, shape)) in &table {
@@ -1069,6 +1350,145 @@ pub fn plan<'a>(
     out.input_scales.sort();
     out.input_scales.dedup();
     out
+}
+
+/// The plan of a checkpoint under `inkling2` parameter groups: each tensor a group lists is placed
+/// as its group stores it, with the companions its layout names, or refused by name; a tensor no
+/// group lists and no placed weight claims is refused, and so is a listed tensor the folder lacks.
+fn plan_groups(groups: &Groups, table: &BTreeMap<&str, (Dtype, &[usize])>) -> Plan {
+    let mut out = Plan::default();
+    let mut claimed = BTreeSet::new();
+    for (&name, &(dtype, shape)) in table {
+        let Some(&kind) = groups.by_tensor.get(name) else {
+            continue;
+        };
+        match group_layout(kind, name, dtype, shape, table) {
+            Ok((format, companions)) => {
+                claimed.extend(companions.iter().cloned());
+                out.placed
+                    .insert(name.to_string(), Placed { format, companions });
+            }
+            Err(why) => {
+                out.refused.insert(name.to_string(), why);
+            }
+        }
+    }
+    for &name in table.keys() {
+        if out.placed.contains_key(name) || out.refused.contains_key(name) || claimed.contains(name)
+        {
+            continue;
+        }
+        let companion = GROUP_COMPANIONS.iter().any(|s| {
+            name.strip_suffix(s)
+                .is_some_and(|w| groups.by_tensor.contains_key(w))
+        });
+        let why = if companion {
+            "a companion no placed weight reads"
+        } else {
+            "listed by no parameter group of the config"
+        };
+        out.refused.insert(name.to_string(), why.to_string());
+    }
+    for name in groups.by_tensor.keys() {
+        if !table.contains_key(name.as_str()) {
+            out.refused.insert(
+                name.clone(),
+                "listed by a parameter group of the config, and not in the folder".to_string(),
+            );
+        }
+    }
+    out
+}
+
+/// The suffixes of the companions a parameter-group weight names beside its own name.
+const GROUP_COMPANIONS: [&str; 3] = ["_scale", "_amax", "_outer_scale_denominator"];
+
+/// The format a tensor listed under a group of `kind` is placed in and the companions it reads,
+/// or why its stored dtype, shape or companions are not that group's.
+fn group_layout(
+    kind: GroupKind,
+    name: &str,
+    dtype: Dtype,
+    shape: &[usize],
+    table: &BTreeMap<&str, (Dtype, &[usize])>,
+) -> Result<(Format, Vec<String>), String> {
+    let stored = || format!("{} {shape:?}", dtype.name());
+    // The companion `name` + `suffix`, one of `dtypes` and of `want`'s shape.
+    let companion = |suffix: &str, dtypes: &[Dtype], want: &[usize]| -> Result<String, String> {
+        let n = format!("{name}{suffix}");
+        match table.get(n.as_str()) {
+            None => Err(format!("{} lacks its companion {n}", stored())),
+            Some(&(d, s)) if dtypes.contains(&d) && s == want => Ok(n),
+            Some(&(d, s)) => Err(format!(
+                "{} has {n} {} {s:?}, where its layout holds {want:?} of {}",
+                stored(),
+                d.name(),
+                dtypes
+                    .iter()
+                    .map(|d| d.name())
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            )),
+        }
+    };
+    match kind {
+        GroupKind::F32 if dtype == Dtype::F32 => Ok((Format::F32, vec![])),
+        GroupKind::Bf16 if dtype == Dtype::Bf16 => Ok((Format::Bf16, vec![])),
+        GroupKind::F32 | GroupKind::Bf16 => Err(format!(
+            "{} in a {} group",
+            stored(),
+            if kind == GroupKind::F32 {
+                "float32"
+            } else {
+                "bfloat16"
+            }
+        )),
+        GroupKind::Nvfp4Amax => {
+            let &[experts, rows, half] = shape else {
+                return Err(format!(
+                    "{} is not an NVFP4 stack's [experts, rows, k/2]",
+                    stored()
+                ));
+            };
+            if dtype != Dtype::U8 || half == 0 || !half.is_multiple_of(8) {
+                return Err(format!(
+                    "{} is not U8 [experts, rows, k/2] of whole 16-value groups",
+                    stored()
+                ));
+            }
+            Ok((
+                Format::Nvfp4Amax,
+                vec![
+                    companion("_scale", &[Dtype::F8E4M3], &[experts, rows, half / 8])?,
+                    companion("_amax", &[Dtype::F32], &[experts])?,
+                    companion("_outer_scale_denominator", &[Dtype::F32], &[1])?,
+                ],
+            ))
+        }
+        GroupKind::Mxfp8 => {
+            let &[experts, rows, k] = shape else {
+                return Err(format!(
+                    "{} is not an MXFP8 stack's [experts, rows, k]",
+                    stored()
+                ));
+            };
+            if dtype != Dtype::F8E4M3 || k == 0 || !k.is_multiple_of(32) {
+                return Err(format!(
+                    "{} is not F8_E4M3 [experts, rows, k] of whole 32-value blocks",
+                    stored()
+                ));
+            }
+            // One E8M0 byte a row's 32 values (blocks of 1 by 32), not a grid of 32-row blocks.
+            Ok((
+                Format::Mxfp8Stacked,
+                vec![companion(
+                    "_scale",
+                    &[Dtype::U8, Dtype::F8E8M0],
+                    &[experts, rows, k / 32],
+                )?],
+            ))
+        }
+    }
 }
 
 fn plain(dtype: Dtype) -> Option<Format> {
@@ -2755,6 +3175,7 @@ mod tests {
         let header: serde_json::Map<String, Value> = serde_json::from_slice(&text).unwrap();
         header
             .iter()
+            .filter(|(n, _)| *n != "__metadata__")
             .map(|(n, e)| {
                 (
                     n.clone(),
@@ -3270,5 +3691,172 @@ mod tests {
             Some((8, 64, Dtype::Bf16))
         );
         assert_eq!(Format::F16.mlx_affine(), None);
+    }
+
+    const OFFICIAL: &str = "thinkingmachines__Inkling-2-Mini";
+    const OFFICIAL_HEADER: &str = "inkling-2-mini-official-model-00001-of-00001.header.json.gz";
+
+    /// The official Inkling 2 Mini checkpoint's `parameter_groups` (`quant_method` `inkling2`) of
+    /// its `hf_quant_config.json` place every tensor of its header: the F32 and BF16 casts as
+    /// stored, the 40 NVFP4 expert stacks of layers 0 to 19 with their scale plane, `amax` and
+    /// outer denominator, the 8 MXFP8 stacks of layers 20 to 23 with their scale plane, and the
+    /// head as the BF16 group whose matmul returns f32; no tensor is refused and none is left
+    /// unplaced. The draft's groups are parsed and place nothing of the target's folder.
+    ///
+    /// FAIL-first: a parse that drops a group leaves its tensors listed by no group.
+    #[test]
+    fn the_official_checkpoint_s_parameter_groups_place_every_tensor() {
+        let c = config(OFFICIAL).unwrap();
+        let groups = c.groups().expect("the inkling2 schema is read");
+        assert_eq!(
+            groups
+                .model
+                .iter()
+                .map(|g| (g.kind, g.tensors.len(), g.fwd_f32))
+                .collect::<Vec<_>>(),
+            [
+                (GroupKind::F32, 74, false),
+                (GroupKind::Bf16, 993, false),
+                (GroupKind::Nvfp4Amax, 40, false),
+                (GroupKind::Mxfp8, 8, false),
+                (GroupKind::Bf16, 1, true),
+            ]
+        );
+        assert_eq!(groups.model[4].tensors, ["model.llm.unembed.weight"]);
+        assert_eq!(groups.mtp.len(), 1);
+        assert_eq!(groups.mtp[0].tensors.len(), 54);
+        let entries = header_entries(OFFICIAL_HEADER);
+        let p = plan(&c, tensors(&entries), |_| None);
+        assert!(p.refused.is_empty(), "{:?}", p.refused);
+        let count = |f: Format| p.placed.values().filter(|x| x.format == f).count();
+        assert_eq!(
+            (
+                count(Format::F32),
+                count(Format::Bf16),
+                count(Format::Nvfp4Amax),
+                count(Format::Mxfp8Stacked)
+            ),
+            (74, 994, 40, 8)
+        );
+        let w13 = "model.llm.layers.0.mlp.experts.w13_weight";
+        assert_eq!(
+            p.placed[w13],
+            Placed {
+                format: Format::Nvfp4Amax,
+                companions: vec![
+                    format!("{w13}_scale"),
+                    format!("{w13}_amax"),
+                    format!("{w13}_outer_scale_denominator"),
+                ]
+            }
+        );
+        let w2 = "model.llm.layers.23.mlp.experts.w2_weight";
+        assert_eq!(
+            p.placed[w2],
+            Placed {
+                format: Format::Mxfp8Stacked,
+                companions: vec![format!("{w2}_scale")]
+            }
+        );
+        assert_eq!(p.placed["model.llm.unembed.weight"].format, Format::Bf16);
+        // Every entry is a placed weight, a companion one names, or the vision tower's BF16.
+        let claimed: usize = p.placed.values().map(|x| x.companions.len()).sum();
+        assert_eq!(p.placed.len() + claimed, entries.len());
+    }
+
+    /// The groups' MXFP8 stacks store one E8M0 byte a row's 32 values, `[experts, rows, k/32]`,
+    /// whatever `weight_block_shape` `[32, 32]` the config spells: the official header's layers 20
+    /// to 23 are placed on that grid, and a scale plane that is a 32-row grid
+    /// (`[experts, rows/32, k/32]`) is refused by name, as is NVFP4 whose block scale is not the
+    /// 16-value groups of its codes.
+    ///
+    /// FAIL-first: reading the config's `[32, 32]` as the stored grid refuses the real header's
+    /// own scale planes.
+    #[test]
+    fn mxfp8_stacks_are_scaled_a_row_of_32_values_not_a_32_by_32_grid() {
+        let c = config(OFFICIAL).unwrap();
+        let mut entries = header_entries(OFFICIAL_HEADER);
+        let w13 = "model.llm.layers.20.mlp.experts.w13_weight";
+        let scale = format!("{w13}_scale");
+        let shape_of = |entries: &[(String, Dtype, Vec<usize>)], n: &str| {
+            entries.iter().find(|e| e.0 == n).unwrap().2.clone()
+        };
+        assert_eq!(shape_of(&entries, w13), [128, 2304, 2304]);
+        assert_eq!(shape_of(&entries, &scale), [128, 2304, 72]);
+        let p = plan(&c, tensors(&entries), |_| None);
+        assert_eq!(p.placed[w13].format, Format::Mxfp8Stacked);
+        assert!(p.refused.is_empty(), "{:?}", p.refused);
+        // The plane as a 32 by 32 grid is not the stored layout.
+        for e in entries.iter_mut().filter(|e| e.0 == scale) {
+            e.2 = vec![128, 72, 72];
+        }
+        let p = plan(&c, tensors(&entries), |_| None);
+        assert_eq!(
+            p.refused[w13],
+            format!(
+                "F8_E4M3 [128, 2304, 2304] has {scale} U8 [128, 72, 72], where its layout holds \
+                 [128, 2304, 72] of U8 or F8_E8M0"
+            )
+        );
+        // NVFP4's block scale is one byte a 16 values of a row.
+        let w2 = "model.llm.layers.0.mlp.experts.w2_weight";
+        let scale = format!("{w2}_scale");
+        let mut entries = header_entries(OFFICIAL_HEADER);
+        for e in entries.iter_mut().filter(|e| e.0 == scale) {
+            e.2 = vec![128, 2304, 36];
+        }
+        let p = plan(&c, tensors(&entries), |_| None);
+        assert!(p.refused[w2].contains(&scale), "{}", p.refused[w2]);
+    }
+
+    /// A tensor of the header that no group lists, a listed tensor the folder lacks, and a group
+    /// whose storage the reader does not place are each refused by name.
+    #[test]
+    fn parameter_groups_refuse_what_they_do_not_list_or_place() {
+        let c = config(OFFICIAL).unwrap();
+        let mut entries = header_entries(OFFICIAL_HEADER);
+        entries.push(("model.llm.surprise.weight".into(), Dtype::Bf16, vec![2, 2]));
+        let missing = "model.llm.norm.weight";
+        entries.retain(|e| e.0 != missing);
+        let p = plan(&c, tensors(&entries), |_| None);
+        assert_eq!(
+            p.refused["model.llm.surprise.weight"],
+            "listed by no parameter group of the config"
+        );
+        assert_eq!(
+            p.refused[missing],
+            "listed by a parameter group of the config, and not in the folder"
+        );
+        assert_eq!(p.refused.len(), 2, "{:?}", p.refused);
+        // A group of another storage is refused whole by its fields, naming the group.
+        let mut h = fixture(&format!("{OFFICIAL}__hf_quant_config.json")).unwrap();
+        h["model"]["parameter_groups"][2]["weight_transform"] = "int4_nearest".into();
+        let e = Config::parse(
+            &fixture(&format!("{OFFICIAL}__config.json")).unwrap(),
+            Some(&h),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("parameter_groups[2]") && e.contains("int4_nearest"),
+            "{e}"
+        );
+        // A tensor in two groups is refused by name.
+        let mut h = fixture(&format!("{OFFICIAL}__hf_quant_config.json")).unwrap();
+        let first = h["model"]["parameter_groups"][0]["tensors"][0].clone();
+        h["model"]["parameter_groups"][1]["tensors"]
+            .as_array_mut()
+            .unwrap()
+            .push(first.clone());
+        let e = Config::parse(
+            &fixture(&format!("{OFFICIAL}__config.json")).unwrap(),
+            Some(&h),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains(first.as_str().unwrap()) && e.contains("two groups"),
+            "{e}"
+        );
     }
 }
