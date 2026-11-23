@@ -21,10 +21,12 @@
 #     tool, the rust target and, when qemu-aarch64 is on PATH, a QEMU_LD_PREFIX that is no aarch64 sysroot are refused by
 #     name, rc 69, before anything is built, and any other value is rc 64).
 #     Either way the packed binary carries that PTX compiled as cubins, and the PTX stays beside it as `.oxart.ptx`,
-#     which bloomery-gpu loads for a bundle whose cubin the driver refuses, so a first start compiles nothing. On a
-#     GB10, oxart_jit --cubin links each `.oxart` bundle on the building machine's card; cross, oxart_ptxas hands each
-#     bundle's PTX to the toolkit's ptxas -arch=<the bundle's target> on the build host, no card and no gate lock, the
-#     ptxas version printed. A cross binary's `--version` runs under qemu-aarch64 (user mode, QEMU_LD_PREFIX its
+#     which bloomery-gpu loads for a bundle whose cubin the driver refuses, so a first start compiles nothing.
+#     tools/oxart-pack.sh packs it both ways: oxart_ptxas hands each bundle's PTX to the toolkit's
+#     ptxas -arch=<the bundle's target> on the build host, no card and no gate lock, the ptxas version printed, and every
+#     cubin passes tools/ulea-scan.py before the binary is touched (a GB10 driver before CUDA 13.1 compiles some of our
+#     kernels with truncated addresses: docs/upstream/nvlabs-ledger.md row 55, so the driver never links the archive's
+#     cubins). A cross binary's `--version` runs under qemu-aarch64 (user mode, QEMU_LD_PREFIX its
 #     sysroot) before and after the cubins are packed; without qemu-aarch64 on PATH the check is named "not run" in the
 #     output. What no x86_64 machine proves: the driver's load of the cubins on a GB10 and a request.
 #
@@ -240,6 +242,13 @@ cross_binutils() {
   done
 }
 
+# The cubin packer's toolkit, refused by name before anything is built (rc 69): ptxas compiles the cubins and cuobjdump
+# reads them back for tools/ulea-scan.py (tools/oxart-pack.sh), on a GB10 and cross alike.
+cubin_tools() {
+  need_tool ptxas "the CUDA toolkit's assembler compiles the archive's cubins (no card is needed)" || return $?
+  need_tool cuobjdump "the CUDA toolkit's cuobjdump reads the archive's cubins back for tools/ulea-scan.py" || return $?
+}
+
 # The cross toolchain, refused by name before anything is built (rc 69): each tool names the package that provides it,
 # the rust target the command that installs it, ptxas the toolkit it comes with. qemu-aarch64 is optional (the packed
 # binary's --version is then named "not run", see cross_version); when it is on PATH, QEMU_LD_PREFIX must name the
@@ -248,7 +257,7 @@ cross_tools() {
   need_tool aarch64-linux-gnu-gcc "apt install gcc-aarch64-linux-gnu (the cross linker)" || return $?
   need_tool aarch64-linux-gnu-objcopy "apt install binutils-aarch64-linux-gnu (the x86_64 objcopy cannot read an aarch64 binary)" || return $?
   cross_binutils || return $?
-  need_tool ptxas "the CUDA toolkit's assembler compiles the archive's cubins (no card is needed)" || return $?
+  cubin_tools || return $?
   local sysroot
   sysroot=$(rustc --print sysroot 2> /dev/null) || sysroot=
   if [ -z "$sysroot" ] || [ ! -d "$sysroot/lib/rustlib/aarch64-unknown-linux-gnu" ]; then
@@ -450,6 +459,8 @@ self_test() {
   stub aarch64-linux-gnu-strings
   expect_tools no-ptxas 69 "release: ptxas is not on PATH: the CUDA toolkit's assembler compiles the archive's cubins (no card is needed)"
   stub ptxas
+  expect_tools no-cuobjdump 69 "release: cuobjdump is not on PATH: the CUDA toolkit's cuobjdump reads the archive's cubins back for tools/ulea-scan.py"
+  stub cuobjdump
   printf '#!/bin/sh\necho %s\n' "$t/sysroot" > "$t/rustc"
   chmod +x "$t/rustc"
   expect_tools no-rust-target 69 "release: the aarch64-unknown-linux-gnu target is not installed for $t/sysroot: rustup target add aarch64-unknown-linux-gnu"
@@ -688,6 +699,8 @@ if [ -n "$CROSS" ]; then
   ARCH=$RELEASE_ARCH
   cross_platform
   if [ -n "$CHECK_ONLY" ]; then cross_binutils || exit $?; else cross_tools || exit $?; fi
+elif [ -n "$CUBIN" ] && [ -z "$CHECK_ONLY" ]; then
+  cubin_tools || exit $?
 fi
 ALLOWED_NEEDED="^(libc\\.so\\.6|libm\\.so\\.6|libgcc_s\\.so\\.1|$LOADER)\$"
 
@@ -719,9 +732,8 @@ else
   export RUSTFLAGS="-C target-cpu=$HOST_CPU"
   bin_args=()
   for b in "${BINS[@]}"; do bin_args+=(--bin "$b"); done
-  # oxart_jit links the cubins on the building machine's card, so only the GB10's own build wants it; cross, ptxas on
-  # the host makes them and no oxart_jit is built.
-  if [ -n "$CUBIN" ] && [ -z "$CROSS" ]; then bin_args+=(--bin oxart_jit); fi
+  # The GB10's own build makes its cubin packer with the binaries; cross, the host's plain cargo built it above.
+  if [ -n "$CUBIN" ] && [ -z "$CROSS" ]; then bin_args+=(--bin oxart_ptxas); fi
   # The commit goes to cargo alone: the serve build script reads it, and a running binary never does.
   BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release "${bin_args[@]}" ${target_args[@]+"${target_args[@]}"}
 fi
@@ -798,16 +810,8 @@ mkdir -p "$STAGE/bin"
 for b in "${BINS[@]}"; do cp "$BIN_DIR/$b" "$STAGE/bin/"; done
 if [ -n "$CUBIN" ]; then
   for b in "${BINS[@]}"; do
-    f="$STAGE/bin/$b"
-    "$OBJCOPY" --dump-section .oxart="$f.ptx.oxart" "$f"
-    if [ -n "$CROSS" ]; then
-      # ptxas compiles the bundles on the build host: no card, no gate lock.
-      "$CARGO_TARGET_DIR/release/oxart_ptxas" "$f.ptx.oxart" "$f.cubin.oxart"
-    else
-      bash tools/gpu-gate.sh --executable "$CARGO_TARGET_DIR/release/oxart_jit" --cubin "$f.ptx.oxart" "$f.cubin.oxart"
-    fi
-    "$OBJCOPY" --rename-section .oxart=.oxart.ptx --add-section .oxart="$f.cubin.oxart" "$f"
-    rm "$f.ptx.oxart" "$f.cubin.oxart"
+    # ptxas compiles the bundles on the build host: no card, no gate lock.
+    OBJCOPY=$OBJCOPY bash tools/oxart-pack.sh "$STAGE/bin/$b" "$CARGO_TARGET_DIR/release/oxart_ptxas" || exit $?
   done
   bash "$0" --check "$STAGE/bin"
   # The objcopy rewrote the cross binary: it must still run.

@@ -74,6 +74,11 @@ with `cargo oxide` only, for example:
 cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
 ```
 
+Under a driver before CUDA 13.1 (R580) the driver's PTX compiler truncates some kernels' addresses on a GB10
+([`../upstream/nvlabs-ledger.md`](../upstream/nvlabs-ledger.md) #55), so bloomery refuses by name to hand it PTX: add
+`--bin oxart_ptxas` to that build and pack the binary before it runs, `tools/oxart-pack.sh target/release/bloomery-serve`
+(the toolkit's ptxas compiles the cubins and `tools/ulea-scan.py` checks each one).
+
 Recipes select `sm_121a` on a GB10 when `BLOOMERY_ARCH` is unset (`tools/arch.sh:15-35` at `c21e3b81`). That target
 turns on the native FP4 routed prompt path for NVFP4 and FP4-Local weights (`crates/gpu/build.rs:4-9` at `c21e3b81`;
 plain `sm_121` does not build it): both weights and activations use FP4 tensor cores. Dense MXFP8 prompt products use
@@ -84,7 +89,7 @@ card is compute capability 12.0 (the RTX 50 series) builds `sm_120a`, and other 
 
 The release's GB10 archive (`bloomery-<version>-linux-aarch64-cuda-sm121a.tar.gz`) is this build, packed: `sm_121a`
 and the features above, `checkpoint` among them. The maintainers build it natively on a DGX Spark (`tools/release/build.sh` there with `BLOOMERY_BOX_LOCAL=1`, where
-`oxart_jit --cubin` links the cubins on the Spark's own card), so a first start compiles nothing. The toolchain is
+`tools/oxart-pack.sh` compiles the cubins with the toolkit's ptxas, not the driver's link), so a first start compiles nothing. The toolchain is
 `docs/BUILD.md`'s, CUDA 13.3's headers included: a Spark's own CUDA 13.0 packages lack `cuGraphNodeGetParams`, and
 bindgen ends E0425 without them. The cross build on an x86_64 machine (`BLOOMERY_RELEASE_TARGET=aarch64`) still
 builds, but its cubins are refused by a GB10's driver and JIT-compiled at the first start, so the release does not use it. It needs no toolchain to run: from 0.3.11 the release

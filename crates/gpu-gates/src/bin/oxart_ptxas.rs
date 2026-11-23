@@ -8,11 +8,13 @@
 //! bundle is packed, every entry its PTX names must be a function symbol of
 //! the cubin's ELF, refused by bundle and entry name otherwise. It prints one
 //! `cubin <bundle> ptx=<bytes> cubin=<bytes> seconds=<s>` line a bundle, after
-//! one `# ptxas …` line naming the toolkit that compiled them.
+//! one `# ptxas …` line naming the toolkit that compiled them. `--keep DIR`
+//! also leaves each cubin at `DIR/<n>-<bundle>.cubin`, for the SASS check
+//! `tools/oxart-pack.sh` runs on what it ships.
 //!
-//! No card and no gate lock: it runs on the build host, where
-//! `tools/release/build.sh` builds the GB10 archive cross
-//! (`BLOOMERY_RELEASE_TARGET=aarch64`). Host-only like `oxart_ptx`: the
+//! No card and no gate lock: it runs on the build host, through
+//! `tools/oxart-pack.sh` (the GB10 archive of `tools/release/build.sh`,
+//! native or cross). Host-only like `oxart_ptx`: the
 //! package's device dependency sits behind the `gpu` feature, so plain
 //! `cargo build --release -p bloomery-gpu-gates --bin oxart_ptxas` builds it
 //! with no device crate.
@@ -20,7 +22,7 @@
 use bloomery_gpu_gates::{GateError, exit_with, ptx};
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: oxart_ptxas <section.bin> <out.bin>";
+const USAGE: &str = "usage: oxart_ptxas <section.bin> <out.bin> [--keep DIR]";
 
 fn main() -> std::process::ExitCode {
     exit_with("oxart_ptxas", run())
@@ -28,11 +30,13 @@ fn main() -> std::process::ExitCode {
 
 fn run() -> Result<(), GateError> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [section, out] = args.iter().map(String::as_str).collect::<Vec<_>>()[..] else {
-        return Err(USAGE.into());
+    let (section, out, keep) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [section, out] => (section, out, None),
+        [section, out, "--keep", dir] => (section, out, Some(PathBuf::from(dir))),
+        _ => return Err(USAGE.into()),
     };
     let bytes = std::fs::read(section).map_err(|e| format!("read {section}: {e}"))?;
-    let packed = pack(&bytes, "ptxas")?;
+    let packed = pack(&bytes, "ptxas", keep.as_deref())?;
     std::fs::write(out, packed).map_err(|e| format!("write {out}: {e}"))?;
     Ok(())
 }
@@ -40,7 +44,8 @@ fn run() -> Result<(), GateError> {
 /// The section's bundles with each PTX payload replaced by ptxas's cubin of
 /// it, as one section blob: the same bundles in the same order, the cubin each
 /// one's only payload. One `cubin …` line a bundle, after the ptxas version.
-fn pack(section: &[u8], ptxas: &str) -> Result<Vec<u8>, GateError> {
+/// With `keep`, each cubin is also written there as `<n>-<bundle>.cubin`.
+fn pack(section: &[u8], ptxas: &str, keep: Option<&std::path::Path>) -> Result<Vec<u8>, GateError> {
     let bundles = ptx::section_bundles(section)?;
     let modules = ptx::modules(&bundles)?;
     if modules.is_empty() {
@@ -53,7 +58,7 @@ fn pack(section: &[u8], ptxas: &str) -> Result<Vec<u8>, GateError> {
     let tmp = TempDir::new()?;
     let mut written = Vec::new();
     for (n, (b, m)) in (1_usize..).zip(bundles.iter().zip(&modules)) {
-        written.extend(cubin_bundle(b, m, ptxas, &tmp, n)?);
+        written.extend(cubin_bundle(b, m, ptxas, &tmp, n, keep)?);
     }
     Ok(written)
 }
@@ -68,6 +73,7 @@ fn cubin_bundle(
     ptxas: &str,
     tmp: &TempDir,
     n: usize,
+    keep: Option<&std::path::Path>,
 ) -> Result<Vec<u8>, GateError> {
     use oxide_artifacts::{
         ArtifactBundleSpec, ArtifactEntrySpec, ArtifactPayloadKind, ArtifactPayloadSpec,
@@ -96,6 +102,10 @@ fn cubin_bundle(
     let cubin =
         std::fs::read(&cubin_path).map_err(|e| format!("read {}: {e}", cubin_path.display()))?;
     check_entries(&b.name, &ptx::entries(std::slice::from_ref(m)), &cubin)?;
+    if let Some(dir) = keep {
+        let kept = dir.join(format!("{n}-{}.cubin", b.name));
+        std::fs::write(&kept, &cubin).map_err(|e| format!("write {}: {e}", kept.display()))?;
+    }
     let payload = format!("{}.cubin", b.name);
     let mut spec = ArtifactBundleSpec::new(&b.name, &b.target)
         .with_compile_options(b.compile_options)
@@ -282,7 +292,7 @@ mod tests {
             "ptxas --version failed: {}",
             version.status
         );
-        let packed = pack(&section(), "ptxas").expect("ptxas compiles the fixture module");
+        let packed = pack(&section(), "ptxas", None).expect("ptxas compiles the fixture module");
         let bundles = ptx::section_bundles(&packed).expect("the packed section parses");
         assert_eq!(bundles.len(), 1, "one bundle in, one bundle out");
         let b = &bundles[0];

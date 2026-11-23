@@ -2355,7 +2355,7 @@ const fn dense_mma_on((major, _): (i32, i32)) -> bool {
 
 #[cfg(test)]
 mod census_tests {
-    use super::{BUILD_TARGET, Gpu, NATIVE_FP4, census, compute_capability_of};
+    use super::{BUILD_TARGET, Gpu, NATIVE_FP4, census, compute_capability_of, jit_defect_of};
     use ::model::placement::devices::spec_of_device;
     use ::model::placement::workstation::{A6000, RTX_3090};
 
@@ -2399,6 +2399,28 @@ mod census_tests {
         for (major, minor) in [(-1, 0), (8, -1)] {
             let e = compute_capability_of(major, minor).expect_err("a negative attribute");
             assert!(e.to_string().contains("compute capability"), "{e}");
+        }
+    }
+
+    /// A cc 12.x card under a driver before CUDA 13.1 (the Spark's R580,
+    /// 13000) must not get our PTX, and the reason names the remedy; CUDA 13.1
+    /// on cc 12.x, and any driver on another capability, may compile it.
+    #[test]
+    fn a_cc12_card_under_a_driver_before_13_1_refuses_our_ptx() {
+        for cc in [(12, 0), (12, 1)] {
+            let why = jit_defect_of(cc, 13000).expect("cc 12.x under CUDA 13.0");
+            assert!(
+                why.contains("CUDA 13.0") && why.contains("tools/oxart-pack.sh"),
+                "{why}"
+            );
+        }
+        for (cc, driver) in [
+            ((12, 0), 13010),
+            ((12, 1), 13020),
+            ((8, 6), 13000),
+            ((9, 0), 12080),
+        ] {
+            assert_eq!(jit_defect_of(cc, driver), None, "cc {cc:?} under {driver}");
         }
     }
 
@@ -2770,7 +2792,9 @@ static BUNDLES: Mutex<Vec<Bundle>> = Mutex::new(Vec::new());
 /// module outlives every `Gpu`, and the driver errors it records land on
 /// the anchor, never on a `Gpu`'s own handle. A bundle whose compiled code
 /// the driver refuses loads from its PTX instead ([`load_or_ptx`]). A `ctx`
-/// that is not its device's primary context is refused by name.
+/// that is not its device's primary context is refused by name, and so is a
+/// bundle that would reach a driver whose PTX compiler is defective for the
+/// card ([`jit_defect`]): one with no cubin, or whose cubin the driver refuses.
 pub fn bundle_module(
     ctx: &Arc<CudaContext>,
     name: &'static str,
@@ -2807,7 +2831,11 @@ pub fn bundle_module(
         return Ok(Arc::clone(module));
     }
     state.loads += 1;
-    let loaded = load_or_ptx(&anchor, name, load, |name| {
+    let jit = jit_defect(device)?;
+    if let Some(why) = &jit {
+        needs_cubin(name, why)?;
+    }
+    let loaded = load_or_ptx(&anchor, name, load, jit.as_deref(), |name| {
         let exe = std::env::current_exe()
             .map_err(|source| cuda_core::EmbeddedModuleError::CurrentExe { source })?;
         file_ptx(&exe, name)
@@ -2824,17 +2852,26 @@ const PTX_SECTION: &str = ".oxart.ptx";
 /// that code as an image it cannot run ([`refuses_image`]) and `ptx` holds
 /// the bundle's PTX: then one line on stderr names the refusal and the PTX
 /// loads as cuda-core loads a PTX payload, compiled by the driver for the
-/// card. Any other failure, and a refusal with no PTX, is `load`'s error.
+/// card. Any other failure, and a refusal with no PTX, is `load`'s error. A
+/// refusal under `jit` (why the driver must not compile our PTX for this card,
+/// [`jit_defect`]) is refused by name and the PTX is never read.
 fn load_or_ptx(
     anchor: &Arc<CudaContext>,
     name: &str,
     load: impl FnOnce(&Arc<CudaContext>) -> Result<Arc<CudaModule>, cuda_host::EmbeddedModuleError>,
+    jit: Option<&str>,
     ptx: impl FnOnce(&str) -> Result<Option<Vec<u8>>, cuda_core::EmbeddedModuleError>,
 ) -> Result<Arc<CudaModule>, GpuError> {
     let refused = match load(anchor) {
         Err(cuda_host::EmbeddedModuleError::Driver(e)) if refuses_image(e) => e,
         loaded => return Ok(loaded?),
     };
+    if let Some(why) = jit {
+        return Err(GpuError::plan(
+            "bundle_module",
+            format!("{name}: the driver refused its cubin ({refused}), and {why}"),
+        ));
+    }
     let Some(text) = ptx(name).map_err(cuda_host::EmbeddedModuleError::Core)? else {
         return Err(cuda_host::EmbeddedModuleError::Driver(refused).into());
     };
@@ -2845,6 +2882,62 @@ fn load_or_ptx(
     Ok(anchor
         .load_module_from_image(&text)
         .map_err(cuda_host::EmbeddedModuleError::Driver)?)
+}
+
+/// The first driver (`cuDriverGetVersion`, CUDA 13.1) whose PTX compiler keeps
+/// a pointer's high word on a cc 12.x card. An older one lowers a parameter
+/// pointer plus a shifted index into a uniform add with no carry there, so the
+/// kernel reads or writes at the address's low 32 bits
+/// (`docs/upstream/nvlabs-ledger.md` #55): on that card a module loads from
+/// cubins the toolkit's ptxas compiled (`tools/oxart-pack.sh`), never from PTX
+/// that driver compiles.
+const SM12X_JIT_FIXED: i32 = 13010;
+
+/// Why device `device`'s driver must not compile our PTX, or `None`
+/// ([`jit_defect_of`] of its compute capability and the driver's version).
+fn jit_defect(device: usize) -> Result<Option<String>, GpuError> {
+    let cc = raw_device_compute_capability(cuda_core::Device::raw_device(device)?)?;
+    let mut driver = 0;
+    // SAFETY: `driver` is a live out-pointer for the call.
+    let rc = unsafe { cuda_core::sys::cuDriverGetVersion(&mut driver) };
+    graph::cu(rc, "cuDriverGetVersion")?;
+    Ok(jit_defect_of(cc, driver))
+}
+
+/// Why a driver of version `driver` must not compile our PTX for a card of
+/// compute capability `cc`: a cc 12.x card under a driver older than
+/// [`SM12X_JIT_FIXED`]. `None` for every other pair.
+fn jit_defect_of(cc: (u32, u32), driver: i32) -> Option<String> {
+    (cc.0 == 12 && driver < SM12X_JIT_FIXED).then(|| {
+        format!(
+            "this driver's PTX compiler (CUDA {}.{}) truncates some kernels' addresses on a cc \
+             {}.{} card (docs/upstream/nvlabs-ledger.md #55): pack the binary's cubins with \
+             tools/oxart-pack.sh <binary>, or run a driver of CUDA 13.1 or later",
+            driver / 1000,
+            driver % 1000 / 10,
+            cc.0,
+            cc.1
+        )
+    })
+}
+
+/// Bundle `name` of the running executable (the file cuda-core reads the
+/// bundles from), refused by name when it carries no cubin: cuda-core would
+/// hand its PTX to a driver that must not compile it, for the reason `why`.
+fn needs_cubin(name: &str, why: &str) -> Result<(), GpuError> {
+    let bundles = cuda_host::embedded::artifact_bundles_from_current_exe()
+        .map_err(cuda_host::EmbeddedModuleError::Core)?;
+    let cubin = bundles.iter().find(|b| b.name == name).is_some_and(|b| {
+        b.payload(cuda_host::embedded::ArtifactPayloadKind::Cubin)
+            .is_some()
+    });
+    if cubin {
+        return Ok(());
+    }
+    Err(GpuError::plan(
+        "bundle_module",
+        format!("{name}: the binary carries this bundle as PTX alone, and {why}"),
+    ))
 }
 
 /// A driver's refusal of a module image as code it cannot run: compiled for
@@ -4171,7 +4264,7 @@ mod context_tests {
         };
         let anchor = super::anchor(0).expect("device 0's anchor");
 
-        let module = super::load_or_ptx(&anchor, name, broken, |asked| {
+        let module = super::load_or_ptx(&anchor, name, broken, None, |asked| {
             assert_eq!(asked, name);
             Ok(kept)
         })
@@ -4189,7 +4282,7 @@ mod context_tests {
                 .unwrap_or_else(|e| panic!("{k} does not resolve: {e}"));
         }
 
-        match super::load_or_ptx(&anchor, name, broken, |_| Ok(None)) {
+        match super::load_or_ptx(&anchor, name, broken, None, |_| Ok(None)) {
             Err(super::GpuError::Module(e)) => assert!(
                 matches!(*e, EmbeddedModuleError::Driver(d) if super::refuses_image(d)),
                 "{e}"
@@ -4199,13 +4292,43 @@ mod context_tests {
         let other = |_: &Arc<CudaContext>| -> Result<Arc<CudaModule>, EmbeddedModuleError> {
             Err(EmbeddedModuleError::NoModules)
         };
-        match super::load_or_ptx(&anchor, name, other, |_| {
+        match super::load_or_ptx(&anchor, name, other, None, |_| {
             panic!("the PTX was read after a failure that is no refusal")
         }) {
             Err(super::GpuError::Module(e)) => {
                 assert!(matches!(*e, EmbeddedModuleError::NoModules), "{e}");
             }
             other => panic!("a failure that is no refusal: {:?}", other.map(|_| ())),
+        }
+        match super::load_or_ptx(&anchor, name, broken, Some("a defective JIT"), |_| {
+            panic!("the PTX was read for a driver that must not compile it")
+        }) {
+            Err(super::GpuError::Plan { what, source }) => assert!(
+                what == "bundle_module" && source.to_string().ends_with("a defective JIT"),
+                "{what}: {source}"
+            ),
+            other => panic!("a refusal under a JIT defect: {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// Under a JIT defect a bundle the binary carries as PTX alone (this test
+    /// binary's, which no pack has touched) is refused by name before the
+    /// driver sees it, the reason kept. Mutant: `needs_cubin` passing every
+    /// bundle fails it.
+    #[test]
+    fn a_bundle_of_ptx_alone_is_refused_under_a_jit_defect() {
+        let name = env!("CARGO_PKG_NAME");
+        match super::needs_cubin(name, "a defective JIT") {
+            Err(super::GpuError::Plan { what, source }) => {
+                let said = source.to_string();
+                assert!(
+                    what == "bundle_module"
+                        && said.starts_with(name)
+                        && said.ends_with("a defective JIT"),
+                    "{what}: {said}"
+                );
+            }
+            other => panic!("a PTX-only bundle under a JIT defect: {other:?}"),
         }
     }
 }

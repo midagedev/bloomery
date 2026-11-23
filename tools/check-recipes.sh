@@ -515,6 +515,7 @@ pytools_list() {
     "tools/rotation.py --self-test"
     "tools/static-sched.py --self-test"
     "tools/type-census.py --self-test"
+    "tools/ulea-scan.py --self-test"
     "tools/verdict-diff.py --self-test"
   )
 }

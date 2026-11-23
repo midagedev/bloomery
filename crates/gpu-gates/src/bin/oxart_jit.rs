@@ -27,7 +27,9 @@
 //! loaded once and each entry it names is resolved before the section is
 //! written. It prints one `cubin <bundle> ptx=<bytes> cubin=<bytes>
 //! seconds=<s>` line a bundle. A section with a bundle that carries no PTX is refused.
-//! `tools/release/build.sh` puts the section in the GB10 release binary.
+//! On a cc 12.x card under a driver before CUDA 13.1 that link truncates some
+//! kernels' addresses (`docs/upstream/nvlabs-ledger.md` #55), so a release
+//! binary's cubins come from the toolkit's ptxas (`oxart_ptxas`) instead.
 //!
 //! It creates a context and JIT-compiles, so it runs on a card: through
 //! `tools/gpu-gate.sh` (the gate lock and its bound), never bare.
