@@ -38,6 +38,13 @@
 //! block waits on another: the second launch's stream order is the only dependency, and the
 //! launches' grids are flat, decoded from the block index (`grp` fastest, then the row, then the
 //! module). A dot is never split: a block count changes which blocks run a dot, not its order.
+//! A decode row is latency, not bytes: the launches' bytes are a few microseconds of the card's
+//! bandwidth, so a dot's time is the load rounds it waits on. An out thread issues its output's
+//! whole rank of gain and forget, and its `cur` and `msg` values, before it stages `h` (none
+//! depends on it), so every load of its dot is in flight together. The weights of a down block do
+//! not depend on the row either: a staging warp asks for the block's output rows into L2 before
+//! the staging, which the dot warps' loads then hit. The folds are the same ascending ones, so
+//! the bits do not move.
 //! The shared totals are `2 · MAX_N + 2 · WARPS + 2` f32 (down) and [`MAX_RANK`] f32 (out).
 //!
 //! The scratch `h` is `[module][m][rank]` f32, [`scratch_len`] long, written by the down launch
@@ -100,8 +107,6 @@ pub const OUT_COLS: usize = 64;
 pub const MAX_MODULES: usize = 3;
 /// Down-dot loads a lane issues before folding them (the fold stays ascending).
 const DOWN_UNROLL: usize = 16;
-/// Rank steps a thread loads before folding them (the fold stays ascending).
-const OUT_UNROLL: usize = 8;
 /// Rows one block of the rows form's down launch takes.
 pub const ROWS_DOWN: usize = 8;
 /// Down outputs a warp of the rows form's down launch takes: the eight warps cover [`MAX_RANK`].
@@ -111,7 +116,7 @@ pub const ROWS_OUT: usize = 32;
 const OUT_THREAD_ROWS: usize = ROWS_OUT * OUT_COLS / THREADS;
 
 const _: () = assert!(THREADS == 256 && WARPS == 8);
-const _: () = assert!(DOWN_OUTS <= WARPS && OUT_COLS <= THREADS);
+const _: () = assert!(DOWN_OUTS < WARPS && OUT_COLS <= THREADS);
 const _: () = assert!(DOWN_WARP_OUTS * WARPS == MAX_RANK && OUT_THREAD_ROWS == 8);
 const _: () =
     assert!(THREADS.is_multiple_of(OUT_COLS) && ROWS_OUT.is_multiple_of(THREADS / OUT_COLS));
@@ -159,6 +164,10 @@ unsafe fn tree(ws: *const f32, at: usize) -> f32 {
     clippy::too_many_arguments,
     reason = "the block's inputs, one argument each (rust-quality R8)"
 )]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "a range `for` is the loop the unroller recognizes; an iterator loop keeps its array in a local depot"
+)]
 unsafe fn out_block(
     cur: &[f32],
     msg: &[f32],
@@ -175,87 +184,59 @@ unsafe fn out_block(
     fault: FaultSink,
 ) {
     let tid = thread::threadIdx_x() as usize;
+    let j = grp * OUT_COLS + tid;
+    let live = tid < OUT_COLS && j < n;
+    // The thread's whole rank of both weight rows and its `cur` and `msg` values, issued before
+    // `h` is staged and before any fold: none depends on `h`, so their loads are in flight under
+    // the staging and the barrier, and every load of the dot is in flight together instead of a
+    // group at a time.
+    let mut gw = [0.0f32; MAX_RANK];
+    let mut fw = [0.0f32; MAX_RANK];
+    let (mut cv, mut mv) = (0.0f32, 0.0f32);
+    if live {
+        // SAFETY: t · n + j < m · n <= cur.len() and msg.len() by the contract.
+        unsafe {
+            cv = *cur.get_unchecked(t * n + j);
+            mv = *msg.get_unchecked(t * n + j);
+        }
+        let gb = j * rank;
+        for d in 0..MAX_RANK {
+            cuda_device::thread::__unroll_config::<0>();
+            if d < rank {
+                // SAFETY: gb + d < n · rank <= gain.len() and forget.len() for d < rank.
+                unsafe {
+                    gw[d] = *gain.get_unchecked(gb + d);
+                    fw[d] = *forget.get_unchecked(gb + d);
+                }
+            }
+        }
+    }
     if tid < rank {
         // SAFETY: h_row + tid < h_row + rank <= h.len(); tid < rank <= H_LEN; this thread alone
         // writes the value.
         unsafe { *hs.add(tid) = *h.get_unchecked(h_row + tid) };
     }
     thread::sync_threads();
-    let j = grp * OUT_COLS + tid;
     let mut ok = true;
-    if tid < OUT_COLS && j < n {
-        let gb = j * rank;
-        // SAFETY: gb + d < n · rank <= gain.len() and forget.len() for d < rank; d < rank <=
-        // H_LEN, written before the barrier above. The first product rounds alone, then the
-        // fused multiply-adds ascend the rank (this order is the gate); an unrolled step's
-        // loads are issued before its folds.
+    if live {
+        // The first product rounds alone, then the fused multiply-adds ascend the rank (this
+        // order is the gate); d < rank <= H_LEN, written before the barrier above.
+        // SAFETY: hs addresses H_LEN shared f32, written to `rank` before the barrier.
         let (mut g, mut f) = unsafe {
             let hv = *hs.add(0);
-            (
-                mul_rn_f32(*gain.get_unchecked(gb), hv),
-                mul_rn_f32(*forget.get_unchecked(gb), hv),
-            )
+            (mul_rn_f32(gw[0], hv), mul_rn_f32(fw[0], hv))
         };
-        let mut d = 1usize;
-        while d + OUT_UNROLL <= rank {
-            // SAFETY: the last index is gb + d + 7 < gb + rank; as above.
-            unsafe {
-                let gw0 = *gain.get_unchecked(gb + d);
-                let fw0 = *forget.get_unchecked(gb + d);
-                let gw1 = *gain.get_unchecked(gb + d + 1);
-                let fw1 = *forget.get_unchecked(gb + d + 1);
-                let gw2 = *gain.get_unchecked(gb + d + 2);
-                let fw2 = *forget.get_unchecked(gb + d + 2);
-                let gw3 = *gain.get_unchecked(gb + d + 3);
-                let fw3 = *forget.get_unchecked(gb + d + 3);
-                let gw4 = *gain.get_unchecked(gb + d + 4);
-                let fw4 = *forget.get_unchecked(gb + d + 4);
-                let gw5 = *gain.get_unchecked(gb + d + 5);
-                let fw5 = *forget.get_unchecked(gb + d + 5);
-                let gw6 = *gain.get_unchecked(gb + d + 6);
-                let fw6 = *forget.get_unchecked(gb + d + 6);
-                let gw7 = *gain.get_unchecked(gb + d + 7);
-                let fw7 = *forget.get_unchecked(gb + d + 7);
-                let hv0 = *hs.add(d);
-                let hv1 = *hs.add(d + 1);
-                let hv2 = *hs.add(d + 2);
-                let hv3 = *hs.add(d + 3);
-                let hv4 = *hs.add(d + 4);
-                let hv5 = *hs.add(d + 5);
-                let hv6 = *hs.add(d + 6);
-                let hv7 = *hs.add(d + 7);
-                g = fma_rn_f32(gw0, hv0, g);
-                f = fma_rn_f32(fw0, hv0, f);
-                g = fma_rn_f32(gw1, hv1, g);
-                f = fma_rn_f32(fw1, hv1, f);
-                g = fma_rn_f32(gw2, hv2, g);
-                f = fma_rn_f32(fw2, hv2, f);
-                g = fma_rn_f32(gw3, hv3, g);
-                f = fma_rn_f32(fw3, hv3, f);
-                g = fma_rn_f32(gw4, hv4, g);
-                f = fma_rn_f32(fw4, hv4, f);
-                g = fma_rn_f32(gw5, hv5, g);
-                f = fma_rn_f32(fw5, hv5, f);
-                g = fma_rn_f32(gw6, hv6, g);
-                f = fma_rn_f32(fw6, hv6, f);
-                g = fma_rn_f32(gw7, hv7, g);
-                f = fma_rn_f32(fw7, hv7, f);
+        for d in 1..MAX_RANK {
+            cuda_device::thread::__unroll_config::<0>();
+            if d < rank {
+                // SAFETY: as above.
+                let hv = unsafe { *hs.add(d) };
+                g = fma_rn_f32(gw[d], hv, g);
+                f = fma_rn_f32(fw[d], hv, f);
             }
-            d += OUT_UNROLL;
-        }
-        while d < rank {
-            // SAFETY: as above.
-            unsafe {
-                let hv = *hs.add(d);
-                g = fma_rn_f32(*gain.get_unchecked(gb + d), hv, g);
-                f = fma_rn_f32(*forget.get_unchecked(gb + d), hv, f);
-            }
-            d += 1;
         }
         let one_m_f = 1.0 - f.tanh();
         let gm = g.tanh();
-        // SAFETY: t · n + j < m · n <= cur.len() and msg.len() by the contract.
-        let (cv, mv) = unsafe { (*cur.get_unchecked(t * n + j), *msg.get_unchecked(t * n + j)) };
         let out = add_rn_f32(mul_rn_f32(one_m_f, cv), mul_rn_f32(gm, mv));
         let fin = out.is_finite();
         ok = fin;
@@ -782,6 +763,18 @@ mod loop_control_kernels {
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PART) };
         // SAFETY: as above.
         let rs = unsafe { SharedArray::as_raw_mut_ptr(&raw mut RSTD) };
+
+        // The first staging warp asks for the block's output rows of `down` into L2 (a hint that
+        // writes no register), so the dot warps' loads after the barriers hit it.
+        if tid / 32 == DOWN_OUTS {
+            for o in 0..DOWN_OUTS {
+                let r = grp * DOWN_OUTS + o;
+                if r < rank {
+                    // The row is `r · 2n .. (r + 1) · 2n` of `down`, in range by the contract.
+                    crate::cores::l2_prefetch(down, r * 2 * n * 4, 2 * n * 4, tid % 32);
+                }
+            }
+        }
 
         // Stage the raw row and its two sums of squares (this order is the gate).
         let (mut sq_c, mut sq_m) = (0.0f32, 0.0f32);
