@@ -488,7 +488,7 @@ pub static ROWS: &[ArchRow] = &[
         names: &["inkling2", INKLING2_LOOP],
         read: Some(inkling2::spec::read),
         draft: None,
-        coverage: None,
+        coverage: Some(inkling2::spec::AVAILABLE),
         fixture: Some(Fixture::Gguf(FixtureRow {
             family: "inkling2",
             repo: "unsloth/Inkling-2-Mini-GGUF",

@@ -4914,8 +4914,9 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
         // (the template names no think tag), so a turn with no tools is scanned too.
         return Ok(match state.tool_format {
             ToolFormat::MuseSpark => Some(Tools::MuseSpark),
-            // Inkling 2's thinking is a block of its own, which only its scan splits out.
-            ToolFormat::Inkling => Some(Tools::Inkling),
+            // Inkling 2's thinking is a block of its own, which only its scan splits out; a
+            // request that asks for no call gets the scan that reads none.
+            ToolFormat::Inkling => Some(Tools::InklingText),
             _ => None,
         });
     }

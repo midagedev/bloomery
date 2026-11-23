@@ -23,7 +23,7 @@ use std::fmt::Write as _;
 
 use gguf::Split;
 use model::arch::inkling2::place;
-use model::placement::{KvBytes, PlanLevers, Role, workstation};
+use model::placement::{KvBytes, PlacementError, PlanLevers, Role, workstation};
 
 /// The Mini: unsloth's UD-Q4_K_XL, one shard, the loop of the core [6, 18) three times.
 const MINI: &str = "/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf";
@@ -45,7 +45,10 @@ const MINI_VIEW: &[&str] = &[
     "layers 24 mtp 0",
     "hc None",
     "engram None",
-    "chat pre inkling2 template bytes 6868 tools None reasoning None",
+    // PIN(2026-11-23): the chat surface reads the template's tool format and its thinking block
+    // (`chat_from_template`: `ToolFormat::of_template`, `ReasoningFormat::of_template`) since the
+    // server parses Inkling's blocks; the line pinned `None` and `None` before it did.
+    "chat pre inkling2 template bytes 6868 tools Some(Inkling) reasoning Some(ThinkSpan { open: \"<|content_thinking|>\", close: \"<|end_message|>\" })",
     "loop core [6, 18) passes 3 rank 64",
     "logit scale 1 softcap 30 cut 200058",
     "[0-4,6-10,12-16,18-22] relbias 24/8 x 128 d_rel 16 extent 1024 clips 22.627417/8 log 8192/0.1 taps 4 win 1024 gate Proj || moe 128/8 ff 1152 situ 4/25 Sigmoid bias true norm true x8 hash false || attn-res-mix 6/1",
@@ -113,7 +116,10 @@ const SMALL_VIEW: &[&str] = &[
     "layers 48 mtp 0",
     "hc None",
     "engram None",
-    "chat pre gpt-4o template bytes 27995 tools None reasoning None",
+    // PIN(2026-11-23): the chat surface reads the template's tool format and its thinking block
+    // (`chat_from_template`: `ToolFormat::of_template`, `ReasoningFormat::of_template`) since the
+    // server parses Inkling's blocks; the line pinned `None` and `None` before it did.
+    "chat pre gpt-4o template bytes 27995 tools Some(Inkling) reasoning Some(ThinkSpan { open: \"<|content_thinking|>\", close: \"<|end_message|>\" })",
     "logit scale 1 softcap 30 cut 200058",
     "[0-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46] relbias 48/8 x 128 d_rel 16 extent 1024 clips 22.627417/8 log 128000/0.1 taps 4 win 1024 gate Proj || moe 384/8 ff 2304 situ 4/25 Sigmoid bias true norm true x8 hash false || attn-res-mix 6/1",
     "[5,11,17,23,29,35,41,47] relbias 48/8 x 128 d_rel 16 extent 1024 clips 22.627417/8 log 128000/0.1 taps 4 dyn gate Proj || moe 384/8 ff 2304 situ 4/25 Sigmoid bias true norm true x8 hash false || attn-res-mix 6/3",
@@ -394,6 +400,40 @@ fn inkling2_small_header_reads_as_the_file_does() {
     );
 }
 
+// The Small's file stops at the read with the list of what is its own [derived from the two
+// descriptions: the Small differs from the Mini in 48 query heads over 8 key heads of 128 (groups
+// of 6 where the kernels' instances are groups of 3), the router of 384 experts (the Mini's
+// is 128) and the types of its routed stacks (iq3_xxs everywhere, iq2_xs in layers 0-39, iq4_xs
+// in 40-47, where the body's card leg reads NVFP4 and Q8_0); nothing the two share is listed].
+const SMALL_STOP: &[&str] = &[
+    "relative-position bias attention: head 128, group 6, no rope, window 1024, bias bank 16 x 1024: 0-4,6-10,12-16,18-22,24-28,30-34,36-40,42-46",
+    "router: sigmoid, 384 experts, top 8, with a selection bias: 0-47",
+    "relative-position bias attention: head 128, group 6, no rope, bias bank 16 x 1024: 5,11,17,23,29,35,41,47",
+    "iq3_xxs routed experts on a card: 0-47",
+    "iq2_xs routed experts on a card: 0-39",
+    "iq4_xs routed experts on a card: 40-47",
+];
+
+/// The Small is deferred: the placement's read of its header ends with the not-implemented list
+/// above, every item the Small's own (group 6, the 384/8 router, its stack types), and the
+/// Mini's features the rows of `inkling2::spec::AVAILABLE` cover are not in it. Mutant: the
+/// rel-bias row widened to group 6 drops its two items.
+#[test]
+fn inkling2_small_stops_at_the_coverage_list() {
+    let split = header_tables::header_of(
+        "inkling2-small-stop",
+        &small_keys(),
+        include_str!("inkling2_small_tensors.tsv"),
+    );
+    match place::Inputs::read(&split) {
+        Err(PlacementError::Unimplemented(items)) => {
+            assert_eq!(spec_view::items(&items), SMALL_STOP);
+        }
+        Err(e) => panic!("{e}, not the coverage refusal"),
+        Ok(_) => panic!("the Small's header reads: the deferred file must stop at the read"),
+    }
+}
+
 #[test]
 #[ignore = "needs the Inkling-2-Small UD-Q2_K_XL shards on the box"]
 fn hw_inkling2_spec_small() {
@@ -436,10 +476,13 @@ const SMALL_VISITS: &[&str] = &[
 // (`workstation::plan_gate`, a 24 GB card, not the 5090 of ink2r0 §4): the card the dense weights,
 // the stores and the machine's terms, the host every routed stack — the card-kernel round
 // replaces this plan with the engine's own.
+// PIN(2026-11-23): the plan line is the body's own now (`Inputs::plan`, `Program::Inkling2Body`'s
+// routed rule): the Mini's NVFP4 and Q8_0 stacks are the card leg's, so every expert sits on the
+// card and the host holds none; the dense, kv, scratch and context terms are unchanged.
 const MINI_PLAN: &[&str] = &[
     "weights dense 1819914240 routed 15797846016 B",
     "stores 6 5013504 B 4096 389709824 B 262144 8845426688 B",
-    "plan@4096 dense 1331632128 kv 389709824 scratch 67108864 context 536870912 | host experts 15797846016 B of 3072 experts",
+    "plan@4096 dense 1331632128 kv 389709824 scratch 67108864 context 536870912 | host experts 0 B of 0 experts",
 ];
 
 // PIN(2026-11-21): the Small's, the same terms at 8 key heads of 128 and hidden 4,608 (a conv
@@ -470,7 +513,10 @@ const FIXTURE_VIEW: &[&str] = &[
     "layers 13 mtp 0",
     "hc None",
     "engram None",
-    "chat pre inkling2 template bytes 6868 tools None reasoning None",
+    // PIN(2026-11-23): the chat surface reads the template's tool format and its thinking block
+    // (`chat_from_template`: `ToolFormat::of_template`, `ReasoningFormat::of_template`) since the
+    // server parses Inkling's blocks; the line pinned `None` and `None` before it did.
+    "chat pre inkling2 template bytes 6868 tools Some(Inkling) reasoning Some(ThinkSpan { open: \"<|content_thinking|>\", close: \"<|end_message|>\" })",
     "loop core [6, 12) passes 3 rank 64",
     "logit scale 1 softcap 30 cut 200058",
     "[0-4,6-10,12] relbias 24/8 x 128 d_rel 16 extent 1024 clips 22.627417/8 log 8192/0.1 taps 4 win 1024 gate Proj || moe 128/8 ff 512 situ 4/25 Sigmoid bias true norm true x8 hash false || attn-res-mix 6/1",

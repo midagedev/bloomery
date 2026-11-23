@@ -2796,7 +2796,7 @@ dump-lev OUT='$BLOOMERY_DATA/lev/4b/ref':
 # are planned, every named refusal, `/props` `modalities.video`. The decoder's own subprocess rules (src/video): an ffprobe past
 # its limit and an ffmpeg that does not end after its last frame are killed and named; a decode is taken only when ffmpeg ended well.
 gate-serve:
-    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test mistral --test callstream --test limits --test anthropic --test penalty --test sampdraft --test contract --test inkling2 -- --include-ignored --nocapture'
+    ./tools/box.sh 'bash tools/gate.sh -p bloomery-serve --lib --test serve --test dsml --test glmxml --test hermes --test qwenxml --test mistral --test callstream --test limits --test anthropic --test penalty --test sampdraft --test contract --test hy4 --test inkling2 -- --include-ignored --nocapture'
 
 # The server's video decode against a real ffmpeg (crates/serve/tests/video.rs): a lossless clip whose every frame is one colour
 # naming its index, probed (its frame count counted by decoding where the container states none), planned by a tick rule
@@ -5111,6 +5111,22 @@ gate-inkling2-pp:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_pp && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_pp'
 
 # --- end inkling2-pp ---
+# --- inkling2serve ---
+
+# The Inkling 2 seat of bloomery-serve on the Inkling 2 fixture (gate_inkling2_serve's doc): the whole model on one card, one sequence, the
+# prompt fed by the body's prompt rule. `--plan` names the default context and `--parallel 2` is refused by name; one server loads (arch
+# inkling2, one slot, a captured step graph) at the context its line named; the five oracle prompts tokenize to the reference's ids; the chat
+# template renders a user turn byte for byte; a chat turn counts the template's ids; a forced call parses into `tool_calls` and none is
+# read at `tool_choice: none`; the server's greedy ids equal the body's own for the oracle prompts (the 1,038-id one past the window) and
+# the chat turn; a request that shares less than the held sequence re-feeds from an empty model, one that extends it keeps every held
+# position; the body's rollback and `BLOOMERY_DRAFT=dspark` are refused by name. Fixture-only (tools/ref/fixture-only.sh): the real
+# Mini is the dev-loop smoke of the round. One card (any idle one). Predicted wall [derived: one server load and one in-process load of the
+# fixture, seven plan-only starts, about 40 requests and two 1,038-id prompts at a few ms a step, and a first start of the new binary's GPU
+# code ~25 s]: under 4 min after a warm build.
+gate-inkling2-serve:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-inkling2-serve && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve --bin gate_inkling2_serve && D=target/inkling2-serve-gate && rm -rf $D && mkdir -p $D && BLOOMERY_GATE_BOUND=600 BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_serve --dir $D'
+
+# --- end inkling2serve ---
 # --- hy4serve ---
 
 # The Hy4-flash seat of bloomery-serve on the Hy4 fixture (gate_hy4_serve's doc): the hybrid owner's seat over the placed body. `--parallel 2`

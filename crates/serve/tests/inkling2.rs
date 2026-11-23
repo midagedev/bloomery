@@ -525,6 +525,61 @@ fn hw_inkling2_reply_splits_into_blocks() {
     }
 }
 
+/// A request that asks for no call reads none: under `tool_choice: "none"` a reply whose last
+/// block is a call keeps that block in `content` as the model wrote it, the thinking block still
+/// split out and the finish `stop`, streamed and not, on both templates. Mutant: the scan that
+/// reads calls under `"none"` answers a `tool_calls` entry, the finish `tool_calls` and a content
+/// without the block.
+#[test]
+#[ignore = "gate: just gate-serve"]
+fn hw_inkling2_tool_choice_none_reads_no_call() {
+    let call = format!(
+        "{H}get_weather<|content_invoke_tool_json|>{{\"name\":\"get_weather\",\"args\":\
+         {{\"city\":\"Paris\"}}}}{E}"
+    );
+    let reply = format!(
+        "{H}<|content_thinking|>The user wants the weather.{E}{H}<|content_text|>Checking.{E}{call}"
+    );
+    for template in [MINI, SMALL] {
+        for stream in [false, true] {
+            let addr = start(&reply, template);
+            let mut body = common::tool_body(tools(), stream);
+            body["tool_choice"] = json!("none");
+            let r = post(addr, "/v1/chat/completions", &body);
+            assert_eq!(r.status, 200, "{}", r.body);
+            let (finish, reasoning, content, calls) = if stream {
+                let (f, m) = common::fold_stream(&r.body, &[]).expect("no error event");
+                (
+                    f,
+                    m["reasoning_content"].clone(),
+                    m["content"].clone(),
+                    m["calls"].as_array().expect("calls").len(),
+                )
+            } else {
+                let v = r.json();
+                let c = &v["choices"][0];
+                let m = &c["message"];
+                (
+                    c["finish_reason"].clone(),
+                    m["reasoning_content"].clone(),
+                    m["content"].clone(),
+                    m["tool_calls"].as_array().map_or(0, Vec::len),
+                )
+            };
+            assert_eq!(
+                (finish, reasoning, content, calls),
+                (
+                    json!("stop"),
+                    json!("The user wants the weather."),
+                    json!(format!("Checking.{call}")),
+                    0
+                ),
+                "stream {stream}"
+            );
+        }
+    }
+}
+
 /// Markup that does not parse is the request's named error: a 500 without a stream, an error
 /// event that ends a stream. The request is unwatched ([`common::unwatched`]).
 #[test]

@@ -2636,6 +2636,39 @@ pub static LISTENING_RAON1: Kind = Kind {
     ],
 };
 
+/// The inkling2 seat's load.
+pub static LOAD_INKLING2: Kind = Kind {
+    name: "load_inkling2",
+    head: "load",
+    doc: "The inkling2 seat's model on its card: its architecture, resident bytes (the weights, the stores of `ctx` rows a visit and the step's scratch), the cache rows the model was loaded with (`ctx`), the resident sequences it holds (`slots`: one, the body has no more), the stored layers, the visits the walk makes over them (a looped trunk's core layers are visited more than once), the step graph's nodes, and the load's wall.",
+    parts: &[
+        key("arch", Word, ""),
+        key("resident_bytes", U64, "B"),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        key("layers", U64, ""),
+        key("visits", U64, ""),
+        key("graph_nodes", U64, ""),
+        lit(" in "),
+        pos("load_s", F64(1), "s"),
+        lit(" s"),
+    ],
+};
+
+/// The inkling2 seat's address.
+pub static LISTENING_INKLING2: Kind = Kind {
+    name: "listening_inkling2",
+    head: "bloomery-serve-inkling2:",
+    doc: "The inkling2 seat's placement, the context its one slot serves, the slots it serves and the address it listens on.",
+    parts: &[
+        key("place", Word, ""),
+        key("ctx", U64, "positions"),
+        key("slots", U64, ""),
+        lit(" listening on http://"),
+        pos("addr", Word, ""),
+    ],
+};
+
 /// The GGUF set a `--hf` quant picked.
 pub static HF_SET: Kind = Kind {
     name: "hf_set",
@@ -3755,6 +3788,21 @@ pub static BLOOMERY_SERVE_RAON1: &[&Kind] = kinds![
     groups::bind::CACHE,
     groups::drafted::WIDTH,
     groups::card_bytes::WATCH,
+];
+
+/// What the inkling2 seat of `bloomery-serve` prints, all on stderr: the
+/// placement and why (`place unset`), the embedding side seat when one is
+/// named, a `--hf` repo's resolve lines, the plan, the load and its phases,
+/// the address and each request's note of the prefix it kept less of than it
+/// shared (the windowed visits' rings keep a prefix only at the position they
+/// stand).
+pub static BLOOMERY_SERVE_INKLING2: &[&Kind] = kinds![
+    groups::side_seat::SEAT,
+    &[&PLACE_UNSET, &PLAN, &NEED],
+    groups::fetch::FETCH,
+    groups::fetch::SET,
+    &[&LOAD_INKLING2, &LOAD_PHASES, &LISTENING_INKLING2],
+    groups::bind::CACHE,
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the
@@ -5180,7 +5228,7 @@ mod tests {
             vision_seat,
         };
         type Group = &'static [&'static Kind];
-        let table: [(&str, Group, &[Group]); 19] = [
+        let table: [(&str, Group, &[Group]); 20] = [
             (
                 "ds41 seat: Flags::encoder, Draft::from_levers, print_widths, bind::spawn",
                 BLOOMERY_SERVE_DS41,
@@ -5330,6 +5378,11 @@ mod tests {
                 ],
             ),
             (
+                "inkling2 seat: Side::seat, run, bind::spawn",
+                BLOOMERY_SERVE_INKLING2,
+                &[side_seat::SEAT, fetch::FETCH, fetch::SET, bind::CACHE],
+            ),
+            (
                 "raon1 seat: Side::seat, print_widths, bind::spawn",
                 BLOOMERY_SERVE_RAON1,
                 &[
@@ -5430,6 +5483,11 @@ mod tests {
         // The raon1 seat counts no round (`Seat::step_stats` is its default) and has one slot.
         assert_eq!(
             missing(BLOOMERY_SERVE_RAON1, bind::SLOTS),
+            ["slots round", "slot call"]
+        );
+        // The inkling2 seat counts no round and has one slot.
+        assert_eq!(
+            missing(BLOOMERY_SERVE_INKLING2, bind::SLOTS),
             ["slots round", "slot call"]
         );
         // The MiMo seat counts no round (`Seat::step_stats` is its default): no slot record in its list.

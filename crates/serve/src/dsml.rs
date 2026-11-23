@@ -750,6 +750,9 @@ pub enum Tools {
     Mistral,
     /// Inkling 2's blocks ([`crate::inkling`]): the scan splits the thinking blocks out itself.
     Inkling,
+    /// Inkling 2's blocks for a request that asks for no call: the thinking split as
+    /// [`Tools::Inkling`], every other block content as written.
+    InklingText,
 }
 
 #[derive(Clone, Debug)]
@@ -852,7 +855,10 @@ impl ChatParser {
         // so it wants no think split; the others track the span so markup
         // inside it is never parsed.
         let split = (format == ReasoningFormat::Deepseek || tools.is_some())
-            && !matches!(tools, Some(Tools::MuseSpark | Tools::Inkling));
+            && !matches!(
+                tools,
+                Some(Tools::MuseSpark | Tools::Inkling | Tools::InklingText)
+            );
         // Qwen3-Coder's call ends an open span without `</think>`, as
         // llama.cpp's parser for the markup reads it.
         let call_ends_span = matches!(tools, Some(Tools::QwenXml(..)));
@@ -880,6 +886,9 @@ impl ChatParser {
                 Tools::Inkling => {
                     Scan::Inkling(InklingScan::new(format == ReasoningFormat::Deepseek))
                 }
+                Tools::InklingText => Scan::Inkling(
+                    InklingScan::new(format == ReasoningFormat::Deepseek).without_calls(),
+                ),
             }),
             streamer: None,
             open: None,

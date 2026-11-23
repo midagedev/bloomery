@@ -135,6 +135,10 @@ pub mod hy4;
 // body it serves is in the gpu crate, so it needs no feature of its own.
 #[cfg(feature = "deepseek41")]
 pub mod nemotron;
+// The inkling2 seat sits behind `deepseek41` for the nemotron seat's reason; its body is in the
+// gpu crate and its prompt and keep rules in the app crate.
+#[cfg(feature = "deepseek41")]
+pub mod inkling2;
 // The raon1 seat sits behind `deepseek41` for the nemotron seat's reason; its body is
 // in the gpu crate.
 #[cfg(feature = "deepseek41")]
@@ -306,6 +310,12 @@ pub const SEATS: &[Seat] = &[
         "raon1",
         Serves::Arch(&[Arch::Raon1]),
         ["  raon1   Raon-1-mini                  -m <path>"]
+    ),
+    seat!(
+        inkling2,
+        "inkling2",
+        Serves::Arch(&[Arch::Inkling2]),
+        ["  inkling2 Inkling 2 Mini              -m <path>"]
     ),
     seat!(
         musespark,

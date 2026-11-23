@@ -88,6 +88,8 @@ enum State {
     Thinking,
     /// Inside a text block.
     Text,
+    /// Inside a block that is neither, with calls off: content, its end tag with it.
+    Plain,
     /// A call's name, from after the header.
     Name,
     /// The body's fixed opening, `{"name":NAME,"args":`.
@@ -108,6 +110,8 @@ enum State {
 pub struct InklingScan {
     /// Whether the thinking blocks are the reasoning (else content, tags included).
     extract: bool,
+    /// Whether a block headed by a function's name is a call (else content as written).
+    calls_on: bool,
     state: State,
     /// Text not yet decided.
     buf: String,
@@ -120,10 +124,20 @@ impl InklingScan {
     pub fn new(extract: bool) -> Self {
         InklingScan {
             extract,
+            calls_on: true,
             state: State::Idle,
             buf: String::new(),
             calls: 0,
         }
+    }
+
+    /// The scan of a request that asks for no tool call (no tools, or `tool_choice: "none"`): the
+    /// thinking and text blocks are read as ever, and a block headed by anything else is content
+    /// as the model wrote it, markup included, never a call.
+    #[must_use]
+    pub fn without_calls(mut self) -> Self {
+        self.calls_on = false;
+        self
     }
 
     /// Feeds text; returns what may be sent and the calls that closed.
@@ -148,6 +162,8 @@ impl InklingScan {
             State::Idle => out.content = buf,
             State::Thinking => self.thinking_text(&buf, &mut out),
             State::Text => out.content = buf,
+            State::Plain => out.content = buf,
+            State::Kind if !self.calls_on => out.content = format!("{HEADER}{buf}"),
             State::Kind => return Err(unterminated(format!("{HEADER}{buf}"))),
             State::Name => return Err(unterminated(format!("{HEADER}{buf}"))),
             State::Prefix { name } => {
@@ -196,8 +212,11 @@ impl InklingScan {
                     self.state = State::Text;
                 } else if THINK.starts_with(&self.buf) || TEXT.starts_with(&self.buf) {
                     return Ok(false);
-                } else {
+                } else if self.calls_on {
                     self.state = State::Name;
+                } else {
+                    out.content.push_str(HEADER);
+                    self.state = State::Plain;
                 }
                 Ok(true)
             }
@@ -212,6 +231,14 @@ impl InklingScan {
             State::Text => {
                 let (text, ended) = self.block_text();
                 out.content.push_str(&text);
+                Ok(ended)
+            }
+            State::Plain => {
+                let (text, ended) = self.block_text();
+                out.content.push_str(&text);
+                if ended {
+                    out.content.push_str(END);
+                }
                 Ok(ended)
             }
             State::Name => {

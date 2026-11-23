@@ -419,6 +419,14 @@ required-features = ["deepseek41", "kimik3"]
 name = "gate_hy4_serve"
 required-features = ["deepseek41", "hy4"]
 
+# inkling2-serve: the Inkling 2 seat of bloomery-serve over the fixture file: the default context planned and named, a second slot refused,
+# the load at that context, the oracle prompts tokenized to the references ids, the chat templates render, a forced call parsed into
+# `tool_calls` and none read at `tool_choice: none`, the body's own ids served, a prefix kept only where the sequence stands, and a
+# rollback and the draft that would ask for one refused by name.
+[[bin]]
+name = "gate_inkling2_serve"
+required-features = ["deepseek41"]
+
 [[bin]]
 name = "gate_mimo2_serve"
 required-features = ["glm5next", "clef", "mimo2"]
