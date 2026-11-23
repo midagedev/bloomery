@@ -1030,8 +1030,7 @@ pub(crate) fn settled_handles(ctx: &Arc<CudaContext>, want: usize) -> usize {
 /// own, so one marker can run before a cleanup queued ahead of it in the same
 /// pass; the second marker is queued after the first ran, which puts it in a
 /// later pass than everything queued before the first.
-#[cfg(test)]
-pub(crate) fn settle_retirements(stream: &CudaStream) {
+pub(crate) fn try_settle_retirements(stream: &CudaStream) -> Result<(), crate::GpuError> {
     struct Ran(std::sync::mpsc::Sender<()>);
     impl Drop for Ran {
         fn drop(&mut self) {
@@ -1041,11 +1040,22 @@ pub(crate) fn settle_retirements(stream: &CudaStream) {
     }
     for _ in 0..2 {
         let (ran, wait) = std::sync::mpsc::channel();
-        cuda_core::completion::retain_until_complete(Ran(ran), stream)
-            .expect("a marker recorded on the stream");
+        cuda_core::completion::retain_until_complete(Ran(ran), stream)?;
         wait.recv_timeout(std::time::Duration::from_secs(10))
-            .expect("cuda-core's retirement thread ran the marker");
+            .map_err(|_| {
+                crate::GpuError::state(
+                    "settle_retirements",
+                    "cuda-core's retirement thread running a marker within 10 s",
+                )
+            })?;
     }
+    Ok(())
+}
+
+/// [`try_settle_retirements`] for a test, which panics by name when it fails.
+#[cfg(test)]
+pub(crate) fn settle_retirements(stream: &CudaStream) {
+    try_settle_retirements(stream).expect("cuda-core's retirement thread ran both markers");
 }
 
 #[cfg(test)]

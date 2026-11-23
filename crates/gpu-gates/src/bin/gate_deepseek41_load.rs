@@ -297,8 +297,10 @@ mod gate {
         pass
     }
 
-    /// The card's free bytes, as the probe's context reads them.
+    /// The card's free bytes, as the probe's context reads them once
+    /// cuda-core's retirement thread has freed what a drop before it queued.
     fn free(probe: &Gpu) -> Result<u64, GateError> {
+        probe.settle_frees()?;
         Ok(probe.mem_info()?.0 as u64)
     }
 

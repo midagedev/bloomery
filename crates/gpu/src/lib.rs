@@ -3296,6 +3296,16 @@ impl Gpu {
         current_mem_info()
     }
 
+    /// Waits until cuda-core's retirement thread has run every cleanup that
+    /// was ready when this was called, the `cuMemFree` of a buffer dropped
+    /// before it among them: a drop frees nothing on its own thread, so a
+    /// caller that reads [`Gpu::mem_info`] to see what a drop gave back settles
+    /// first. It waits for the work queued on this context's stream.
+    pub fn settle_frees(&self) -> Result<(), GpuError> {
+        self.ctx.bind_to_thread()?;
+        tensor::try_settle_retirements(self.stream())
+    }
+
     /// The driver's minimum allocation granularity for device memory on this
     /// device (`cuMemGetAllocationGranularity`): the page size an allocation's
     /// physical backing is counted in.
