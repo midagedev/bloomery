@@ -289,7 +289,9 @@ forced_exact count pin, the reference gates).
   (`tools/release/sitting.sh`) times every cell's arms and runs its first-request checks on the tarball's own
   `bloomery-serve` (`--binary portable`, equal to the tarball's member by sha256) and writes the verdict
   `tools/release/publish.sh` looks for; a `--binary tree` verdict is an iteration's, marked `stage=tree`, and no
-  release number.
+  release number. The portable stage also records each row's tape (toktape, on the server that timed the row; `tools/release/tape.py`,
+  rc 2 when toktape is missing or too old), and `tape.py publish` is the maintainer's explicit command that turns them into the
+  `[recorded on tape](...)` lines beside the numbers (`docs/performance.md`, "A headline number's tape").
 - **The line to beat is the reference at its fastest flags, measured interleaved** (`decode-measure.sh` runs ik at
   default and `IK_BEST_FLAGS`); under 1 % is claimable only from `BLOOMERY_AB_IK=1 just ab-decode` rounds.
 - **Matching the reference's sum order can be faster and exact at once.** Read the reference kernel before assuming

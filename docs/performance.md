@@ -111,6 +111,31 @@ language is not one of the reasons: the kernels are Rust (274 of them, through
   sampling or output failures fail the run. `bash tools/ref/cold-blocks.sh --self-test` and the
   DS41, Qwen3MoE and GLM depth-runner stub suites exercise this without a model or GPU.
 
+## A headline number's tape
+
+A release's headline rows come from the release sitting (`just release-sitting`, `tools/release/sitting.sh`). A row's tape is
+[toktape](https://tape.midagedev.com)'s record of one request on the server that answered the row: the prompt, the answer,
+the server's own per-token timings, the build and the machine. A tape is a witness beside the row, not the row: it is a
+second request on a warm server, so its `pp` and `tg` are not the sitting's mean, which stays in the verdict.
+
+- **Recording is part of the sitting.** At the portable stage (the verdict a release is cut from) round 1 runs
+  `tools/release/tape.py record` on each arm's own server, right after its timed request and before the checks' hook: the
+  arm's first D ids of the prose corpus, sent as text to `/completion`, greedy, the same `n_predict`, `cache_prompt` off.
+  Tapes land in `<verdict>.d/tapes/`; each tape's line (file, toktape version, `prompt exact|text`, `prompt_n`, `pp`, `tg`,
+  toktape's caveats) is kept in the run's block, and the header says `tapes=on` and `toktape=<version>`.
+- **It refuses, it does not skip.** `tape.py check` runs before the sitting takes its hold: a toktape that is not on `PATH`
+  (`SITTING_TOKTAPE` names another), does not run, or is older than 0.3.0 ends the sitting with rc 2, naming it. A tape that
+  fails to record makes its cell red. The tree stage (an iteration's verdict) records none unless `--tape`; `--no-tape` is the
+  explicit off and the verdict says `tapes=off`. A cell that folds its depths cannot take a tape (rc 64 naming the cells).
+- **Publishing is the maintainer's command**, never a side effect of a sitting or a gate. From a green verdict that recorded
+  tapes: `python3 tools/release/tape.py publish <verdict> --dry-run` shows what would go up, and the same command without
+  `--dry-run` uploads each tape (anonymous; toktape keeps the delete token on that machine, `toktape publish --delete <id>`
+  takes one down) and prints, a row, a line to paste into the release notes and the README:
+  `cell 1 (<profile> place=<p> cards=<c>) D=512 | tape pp <x> tok/s, tg <y> tok/s (prompt_n <n>, <n> tokens, toktape <v>) | [recorded on tape](https://tape.midagedev.com/r/<id>)`.
+  `<verdict>.d/tapes/published.tsv` is the ledger: a tape already uploaded is not uploaded again and its link is printed
+  again. A row whose tape the sitting did not record is a `NOT PUBLISHED` line naming why, and the command exits 1.
+- A sitting that is resumed (`--resume`) keeps the earlier tapes and must be run in the same mode as the first.
+
 ## Recorded sessions
 
 Recorded sessions, not benchmark rows. bloomery 0.2.1: [V4.1 answering a code review on one

@@ -2,7 +2,8 @@
 # The release sitting: every cell of a release's table timed and checked on one binary, in one hold.
 #
 #   tools/release/sitting.sh --cells FILE --binary tree|portable [--tarball PATH] [--version V] [--tree NAME]
-#                            [--out FILE] [--hold-owner NAME] [--keep-going] [--fold off|depths] [--resume VERDICT [--only I,J]] [--dry-run]
+#                            [--out FILE] [--hold-owner NAME] [--keep-going] [--fold off|depths] [--tape | --no-tape]
+#                            [--resume VERDICT [--only I,J]] [--dry-run]
 #   tools/release/sitting.sh --self-test    (stub depth-serve and checks, no box, no card; check-recipes runs it)
 #
 # Runs on the box (`just release-sitting`). A cell is a model file served by `bloomery-serve` at the serving defaults
@@ -99,6 +100,19 @@
 # the resume a red run ends it there unless --keep-going, and a red round 1 skips round 2, as in a whole sitting. The headers add
 # resumed_from (where the earlier verdict is now), resumed_runs and kept_work (its logs and tapes).
 #
+# Tapes. The release's headline rows carry their tapes (tape.midagedev.com links beside the numbers): on round 1, after each arm's timed
+# request on that arm's own server, depth-serve.sh's DEPTH_SERVE_TAPE runs tools/release/tape.py record, one toktape request of the
+# arm's own prompt (the timed request's ids, greedy, its n_predict, cache_prompt off) on the server that answered it, before the checks'
+# hook. The tape is under <out>.d/tapes/, its line (`tape D=<D> | file <id>.toktape | toktape <version> | ... | pp .. | tg ..`) in the
+# run's block, and the figures are a witness beside the row, not the row. Tapes are on at the portable stage (the release's verdict),
+# off at the tree stage unless --tape, and --no-tape is the explicit off. A cell that folds its depths cannot take one (a tape
+# between two requests of a server would sit before the later row's request): at the portable stage that is rc 64 naming the
+# cells, never a verdict without tapes the caller did not ask for. Before the hold, `tape.py check` must find a toktape that runs
+# and is new enough (SITTING_TOKTAPE names the binary, else toktape on PATH): else rc 2 naming it, nothing run. A cell whose
+# run recorded fewer tapes than it has arms, or one that failed, is red. The verdict's header says `tapes=on` and `toktape=<version>`
+# (tapes=off and tapes_off=<why> otherwise), and a --resume carries the earlier tapes directory along (it must be of the same mode).
+# Uploading is not here: tools/release/tape.py publish <verdict> is the lead's own command (docs/performance.md, "A headline number's tape").
+#
 # The verdict. Each run block's second line is its stamp, `stamp finished=<UTC> binary_sha256=<sha> sitting=<start> pid=<pid>`:
 # which sitting ran it, on which binary. --out (default: beside the tarball as <tarball without .tar.gz>.sitting, or target/release-dist/
 # <version>-<tree>-tree.sitting) is `key=value` header lines (stage, result, binary, binary_sha256, tarball,
@@ -117,13 +131,14 @@
 #   SITTING_QUIET_POLL  seconds between two looks for a running compile (default 10)
 #   SITTING_BASELINE_WAIT  whole seconds a card may take to come to rest for the baseline (default 30)
 #   SITTING_BASELINE_POLL  seconds between two reads of a card's used memory for the baseline (default 1)
-#   SITTING_STUB_DIR    the self-test's: a directory whose depth-serve.sh and checks.sh stand in for the real two (named on
+#   SITTING_TOKTAPE     the toktape binary the tapes use (default: toktape on PATH)
+#   SITTING_STUB_DIR    the self-test's: a directory whose depth-serve.sh, checks.sh and tape.sh stand in for the real three (named on
 #                       the first line of the run); leave it unset
 # The environment is the caller's beyond what a cell sets: BLOOMERY_LEASE_CARD names the sitting's prediction card
 # (required), DEPTH_SERVE_N, _PORT, _AFTER_BOUND and the guards' knobs pass through. BLOOMERY_DRY is refused: --dry-run
 # is this script's dry run (no hold, no call, no verdict).
 #
-# Exit: 0 green; 1 red; 2 a file missing; 64 usage or a cells file that does not parse, or a --resume it cannot merge into; 65 the
+# Exit: 0 green; 1 red; 2 a file missing or a toktape the tapes need that is not there or too old; 64 usage or a cells file that does not parse, or a --resume it cannot merge into; 65 the
 # binary is not the tarball's member, or not the one a --resume verdict ran on; 69 a card the cells name is not on the machine (or
 # two cards answer to the name, or the card is not in view under local mode) or gives no memory reading; 75 another owner's hold is up (the box hold, or another sitting's GPU hold), a compile or a program on
 # a card of another track still runs after SITTING_QUIET_WAIT seconds, or a card is not at rest for the baseline; 130/143 a signal.
@@ -313,6 +328,8 @@ for c in cells:
     if c["pp"] and c["tg"]:
         pp, tg = float(c["pp"]), float(c["tg"])
         total += 2 * sum(d / pp + (n_predict - 1) / tg for d in deps)
+        if os.environ.get("SITTING_TAPES") == "on":
+            total += sum(d / pp + (n_predict - 1) / tg for d in deps)
         if c["checks"] != "-":
             total += LONG_TOKENS / pp + 3 * CHAT_TOKENS / tg
     else:
@@ -320,7 +337,8 @@ for c in cells:
 bound = ">=" if unpriced else "="
 print(f"[plan] predicted wall {bound} {total:.0f} s (~{total / 60:.0f} min) [derived per cell: {loads} servers x "
       f"(load + {overhead} s overhead) + 2 x sum(D/pp + (N-1)/tg), N={n_predict}"
-      f" + the checks (long prompt {LONG_TOKENS} tokens/pp + 3 x {CHAT_TOKENS}/tg; a toktape client's own prefill probe a request is not priced);"
+      + (" + the tapes (round 1: one more such request an arm)" if os.environ.get("SITTING_TAPES") == "on" else "")
+      + f" + the checks (long prompt {LONG_TOKENS} tokens/pp + 3 x {CHAT_TOKENS}/tg; a toktape client's own prefill probe a request is not priced);"
       f" the load, pp and tg from the cells file]")
 if unpriced:
     print("[plan] unpriced (a lower bound): " + "; ".join(unpriced))
@@ -328,12 +346,13 @@ PY
 }
 
 usage() {
-  echo "usage: tools/release/sitting.sh --cells FILE --binary tree|portable [--tarball PATH] [--version V] [--tree NAME] [--out FILE] [--hold-owner NAME] [--keep-going] [--fold off|depths] [--resume VERDICT [--only I,J]] [--dry-run] | --self-test" >&2
+  echo "usage: tools/release/sitting.sh --cells FILE --binary tree|portable [--tarball PATH] [--version V] [--tree NAME] [--out FILE] [--hold-owner NAME] [--keep-going] [--fold off|depths] [--tape | --no-tape] [--resume VERDICT [--only I,J]] [--dry-run] | --self-test" >&2
 }
 
 # ---- the run ---------------------------------------------------------------------------------------------------------
 
 STAGE='' CELLS='' TARBALL='' VERSION='' TREE='' OUT='' OWNER='' KEEP=0 DRY=0 FOLD=off
+TAPE_FLAG='' TAPES=off TAPES_WHY='' TT_VERSION='' TAPE_ARR=()
 WORK='' HOLD_FILE='' FINISHED='' RESULT=red REASON='the sitting ended before its last run' STARTED=''
 BIN='' BIN_SHA='' BIN_VERSION='' TB_SHA='' TB_MEMBER='' TB_MEMBER_SHA='' GPU_3090='' CARDS_ERROR='' DS='' CHECKS_RUN='' CHECKS_PY=''
 CELLREC=() REDS=() NOTRUN=()
@@ -707,10 +726,11 @@ call_bound() {
 
 # judge <round> <log> <rc> <arms> <checks>: RUN_RESULT green|red and RUN_WHY of one depth-serve call.
 judge() {
-  local r=$1 log=$2 rc=$3 arms=$4 checks=$5 rows busy hooks bad sess fails fail
+  local r=$1 log=$2 rc=$3 arms=$4 checks=$5 rows busy hooks bad sess fails fail tapes taped
   RUN_RESULT=green RUN_WHY=''
   if [ "$rc" != 0 ]; then
     fail=$(grep -m1 '^FAIL r[0-9]' "$log" 2> /dev/null | cut -c1-240 || true)
+    [ -n "$fail" ] || fail=$(grep -m1 -E '^tape D=[0-9]+ [|] failed: |^TAPE r[0-9]+ .* rc=[1-9]' "$log" 2> /dev/null | cut -c1-240 || true)
     RUN_RESULT=red RUN_WHY="depth-serve.sh exited $rc${fail:+: $fail}"
     return 0
   fi
@@ -723,6 +743,15 @@ judge() {
   if [ "${busy:-0}" != 0 ]; then
     RUN_RESULT=red RUN_WHY="$busy row(s) tagged [cpu-busy]: a co-tenant voided them"
     return 0
+  fi
+  if [ "$r" = 1 ] && [ "$TAPES" = on ]; then
+    tapes=$(grep -c '^tape D=[0-9][0-9]* [|] file ' "$log" || true)
+    taped=$(grep -c '^TAPE r1 .* rc=0$' "$log" || true)
+    if [ "${tapes:-0}" != "$arms" ] || [ "${taped:-0}" != "$arms" ]; then
+      fail=$(grep -m1 -E '^tape D=[0-9]+ [|] failed: ' "$log" 2> /dev/null | cut -c1-240 || true)
+      RUN_RESULT=red RUN_WHY="${tapes:-0} tape(s) recorded for the cell's $arms arm(s)${fail:+: $fail}"
+      return 0
+    fi
   fi
   if [ "$r" = 1 ] && [ "$checks" != - ]; then
     hooks=$(grep -c '^HOOK r[0-9][0-9]* .* rc=' "$log" || true)
@@ -742,11 +771,11 @@ judge() {
   return 0
 }
 
-ROW_LINES='^(ROW r[0-9]+ |HOOK r[0-9]+ |check [A-Za-z0-9_]+: |SESSION rc=|session-plan: |FAIL r[0-9]+ |\[cold\]|\[user-plan\]|\[binary\])'
+ROW_LINES='^(ROW r[0-9]+ |HOOK r[0-9]+ |TAPE r[0-9]+ |tape D=[0-9]+ [|] |check [A-Za-z0-9_]+: |SESSION rc=|session-plan: |FAIL r[0-9]+ |\[cold\]|\[user-plan\]|\[binary\])'
 
 # run_cell <round> <record> <position> <total>: one depth-serve call for a cell, its block, rows and verdict.
 run_cell() {
-  local r=$1 rec=$2 pos=$3 total=$4 tree_arm dir log rc=0 n i k arms=() darr=() envv=()
+  local r=$1 rec=$2 pos=$3 total=$4 tree_arm dir log rc=0 n i k tape_cmd tt_bin arms=() darr=() envv=()
   cell_fields "$rec"
   dir=$WORK/r$r-c$CF_IDX
   mkdir -p "$dir/tmp" || die 2 "cannot make $dir"
@@ -760,7 +789,7 @@ run_cell() {
     arms+=("$tree_arm:${darr[k]}")
   done
   envv=(-u BLOOMERY_REF_MODEL -u BLOOMERY_REF_MODEL_PROFILE -u DEPTH_SERVE_CTX -u DEPTH_SERVE_PLACE -u DEPTH_SERVE_TARBALL
-    -u DEPTH_SERVE_AFTER -u DEPTH_SERVE_MEM_BASELINE -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRY
+    -u DEPTH_SERVE_AFTER -u DEPTH_SERVE_TAPE -u DEPTH_SERVE_TAPE_BOUND -u DEPTH_SERVE_MEM_BASELINE -u BLOOMERY_TIMING_GPU -u BLOOMERY_TIMING_CARDS -u BLOOMERY_DRY
     "BLOOMERY_MODEL=$CF_PROFILE" BLOOMERY_AB_ROUNDS=1 "DEPTH_SERVE_MEM_BASELINE=$MEMBASE" "DEPTH_SERVE_FOLD=$CF_FOLD"
     "TMPDIR=$dir/tmp")
   [ -z "$CF_PATH" ] || envv+=("BLOOMERY_REF_MODEL=$CF_PATH")
@@ -779,6 +808,16 @@ run_cell() {
   if [ "$CF_CARDS" != both ] && [ "$LISTED_N" -gt 1 ] && [ -z "${DEPTH_SERVE_USER_PLAN:-}" ]; then envv+=(DEPTH_SERVE_USER_PLAN=note); fi
   if [ "$r" = 1 ] && [ "$CF_CHECKS" != - ]; then
     envv+=("DEPTH_SERVE_AFTER=$CHECKS_RUN $CF_CHECKS")
+  fi
+  if [ "$r" = 1 ] && [ "$TAPES" = on ]; then
+    # depth-serve.sh runs it as `bash -c` with the server's address, the arm's ids file and n_predict in its environment.
+    printf -v tape_cmd '%q ' "${TAPE_ARR[@]}" record --out "$WORK/tapes" --tag "sit-${VERSION:-$TREE}-c$CF_IDX"
+    tape_cmd+='--url "$BLOOMERY_SESSION_URL" --ids "$DEPTH_SERVE_TAPE_IDS" --n "$DEPTH_SERVE_TAPE_N" --work "$BLOOMERY_SESSION_DIR"'
+    if [ -n "${SITTING_TOKTAPE:-}" ]; then
+      printf -v tt_bin ' --toktape-bin %q' "$SITTING_TOKTAPE"
+      tape_cmd+=$tt_bin
+    fi
+    envv+=("DEPTH_SERVE_TAPE=$tape_cmd")
   fi
   quiet_wait between
   echo
@@ -943,6 +982,8 @@ write_verdict() {
     echo "work=$WORK"
     echo "keep_going=$KEEP"
     echo "fold=$FOLD"
+    echo "tapes=$TAPES"
+    if [ "$TAPES" = on ]; then echo "toktape=$TT_VERSION"; else echo "tapes_off=${TAPES_WHY:--}"; fi
     echo "started=$STARTED"
     echo "finished=$(now)"
     if [ -n "$RESUME" ]; then
@@ -1056,15 +1097,17 @@ resume_load() {
   local -a parts
   RESUME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/sitting-resume.XXXXXX") || die 2 "cannot make a directory for the verdict being resumed"
   out=$(resume_py "$RESUME" "$RESUME_DIR") || exit $?
-  RV_STAGE='' RV_SHA='' RV_WORK='' RV_CELLS=() RV_BLOCKS=()
+  RV_STAGE='' RV_SHA='' RV_WORK='' RV_TAPES='' RV_CELLS=() RV_BLOCKS=()
   while IFS=$US read -r tag a b c d; do
     case $tag in
-      H) case $a in stage) RV_STAGE=$b ;; binary_sha256) RV_SHA=$b ;; work) RV_WORK=$b ;; esac ;;
+      H) case $a in stage) RV_STAGE=$b ;; binary_sha256) RV_SHA=$b ;; work) RV_WORK=$b ;; tapes) RV_TAPES=$b ;; esac ;;
       C) RV_CELLS+=("cell $a: $b") ;;
       B) RV_BLOCKS+=("$a $b $c $d") ;;
     esac
   done <<< "$out"
   [ "$RV_STAGE" = "$STAGE" ] || die 64 "--resume $RESUME is a stage=${RV_STAGE:-none} verdict and this sitting is --binary $STAGE: a merged verdict is one stage's"
+  [ "${RV_TAPES:-off}" = "$TAPES" ] ||
+    die 64 "--resume $RESUME recorded tapes=${RV_TAPES:-off} and this sitting records tapes=$TAPES: a merged verdict's rows all have tapes or none do; give --tape/--no-tape as the first sitting was run"
   { [ -n "$RV_SHA" ] && [ "$RV_SHA" = "$BIN_SHA" ]; } ||
     die 65 "the binary here (sha256 $BIN_SHA) is not the one $RESUME ran on (sha256 ${RV_SHA:-none}): a merged verdict never mixes binaries; run the whole sitting again"
   for have in ${RV_BLOCKS[@]+"${RV_BLOCKS[@]}"}; do
@@ -1113,9 +1156,17 @@ resume_load() {
 }
 
 # resume_seed: the runs of the verdict being resumed that this sitting does not run are this sitting's, with their stamps: their
-# blocks are copied into the work directory as they stand, and a green round 1 keeps its labels for round 2's plan check.
+# blocks are copied into the work directory as they stand, and a green round 1 keeps its labels for round 2's plan check. A sitting
+# that records tapes takes the earlier sitting's tape files too (the kept blocks' tape lines name them, and publish reads them beside
+# the merged verdict); its ledger stays with the verdict it belongs to.
 resume_seed() {
-  local rec r b
+  local rec r b t
+  if [ "$TAPES" = on ] && [ -d "$KEPT_WORK/tapes" ]; then
+    for t in "$KEPT_WORK"/tapes/*.toktape; do
+      [ -e "$t" ] || continue
+      [ -e "$WORK/tapes/${t##*/}" ] || cp "$t" "$WORK/tapes/" || die 2 "cannot copy the kept tape $t into $WORK/tapes"
+    done
+  fi
   for rec in "${CELLREC[@]}"; do
     cell_fields "$rec"
     for r in 1 2; do
@@ -1152,6 +1203,56 @@ merge_state() {
       fi
     done
   done
+}
+
+# tapes_decide: TAPES on|off (and TAPES_WHY when off) from --tape/--no-tape and the stage, and TAPE_ARR, the tape tool's command.
+# The portable stage (the release's verdict) records tapes unless --no-tape; the tree stage's iteration does not unless --tape. A
+# cell that folds its depths takes none: depth-serve.sh refuses the pair, so --tape beside one is rc 64, and so is the portable
+# stage's default, which never goes quietly without a tape.
+tapes_decide() {
+  local rec folded=''
+  for rec in "${CELLREC[@]}"; do
+    cell_fields "$rec"
+    [ "$CF_FOLD" != depths ] || folded="$folded${folded:+,}$CF_IDX"
+  done
+  TAPES=off TAPES_WHY=''
+  case $TAPE_FLAG in
+    off) TAPES_WHY='--no-tape' ;;
+    on)
+      [ -z "$folded" ] || die 64 "--tape: cell(s) $folded fold their depths (fold=depths): a tape between two requests of one server would sit before the later row's request; tapes are the fold-off sitting's"
+      TAPES=on
+      ;;
+    *)
+      if [ "$STAGE" != portable ]; then
+        TAPES_WHY="stage=$STAGE: an iteration's verdict records no tapes (--tape does)"
+      elif [ -n "$folded" ]; then
+        die 64 "the portable stage records each row's tape, and cell(s) $folded fold their depths (fold=depths), which a tape cannot follow: use --fold off, or --no-tape for a verdict whose rows have none"
+      else
+        TAPES=on
+      fi
+      ;;
+  esac
+  if [ -n "${SITTING_STUB_DIR:-}" ]; then TAPE_ARR=(bash "$SITTING_STUB_DIR/tape.sh"); else TAPE_ARR=(python3 "$ROOT/tools/release/tape.py"); fi
+  export SITTING_TAPES=$TAPES
+}
+
+# tapes_check: with tapes on, tape.py check finds a toktape that runs and is new enough, else rc 2 naming it (nothing has started). In
+# a dry run the refusal is a line.
+tapes_check() {
+  local out rc=0
+  [ "$TAPES" = on ] || return 0
+  out=$("${TAPE_ARR[@]}" check ${SITTING_TOKTAPE:+--toktape-bin "$SITTING_TOKTAPE"} 2>&1) || rc=$?
+  if [ "$rc" != 0 ]; then
+    [ "$DRY" != 1 ] || { echo "[dry] tapes: $out (a run refuses, rc 2)"; return 0; }
+    die 2 "the tapes need a toktape: $out"
+  fi
+  TT_VERSION=$(sed -n 's/^toktape \(.*\) at .*/\1/p' <<< "$out")
+  [ -n "$TT_VERSION" ] || die 2 "tape.py check printed no 'toktape <version> at <path>' line: $out"
+  if [ "$DRY" != 1 ]; then
+    echo "[tapes] on: $out; each row's tape is recorded after its timed request on round 1 (tools/release/tape.py publish uploads them)"
+  else
+    echo "[dry] tapes: on ($out); each row's tape would be recorded after its timed request on round 1"
+  fi
 }
 
 # order_records: CELLREC in round 1's order, from the python plan.
@@ -1234,6 +1335,11 @@ main() {
         ;;
       --keep-going) KEEP=1; shift ;;
       --dry-run) DRY=1; shift ;;
+      --tape | --no-tape)
+        [ -z "$TAPE_FLAG" ] || { usage; die 64 "--tape and --no-tape name one mode each; give one"; }
+        if [ "$arg" = --tape ]; then TAPE_FLAG=on; else TAPE_FLAG=off; fi
+        shift
+        ;;
       --fold)
         [ $# -ge 2 ] || { usage; die 64 "--fold needs a value"; }
         case $2 in
@@ -1282,6 +1388,7 @@ main() {
   export SITTING_OVERHEAD_S
 
   order_records
+  tapes_decide
   cells_py text "$CELLS" "$STAGE" || exit $?
 
   # The binary and the tarball.
@@ -1311,6 +1418,7 @@ main() {
         echo "[dry] binary is not the tarball's member $TB_MEMBER (sha256 $TB_MEMBER_SHA): a run refuses, rc 65"
       fi
     fi
+    if [ "$TAPES" = on ]; then tapes_check; else echo "[dry] tapes: off ($TAPES_WHY)"; fi
     echo "[dry] the GPU hold would name the cards the cells time ($SIT_TEXT); the baseline of each is read with the cards idle"
     if [ -n "$RESUME" ]; then
       if [ -z "$BIN_SHA" ]; then
@@ -1333,6 +1441,7 @@ main() {
   [ -n "$BIN_VERSION" ] || die 2 "$BIN --version printed nothing: the binary does not run here"
   [ -n "${BLOOMERY_LEASE_CARD:-}" ] || die 64 "BLOOMERY_LEASE_CARD is unset: name the sitting's prediction card (docs/cards/<slug>.card; BLOOMERY_BOX_ENV='BLOOMERY_LEASE_CARD=...')"
   [ -r "$BLOOMERY_LEASE_CARD" ] || die 2 "the prediction card $BLOOMERY_LEASE_CARD is not readable"
+  tapes_check
 
   # The cards the cells time: their UUIDs key the baseline and the card look, and a cell that times the 3090 alone needs its own.
   cards_resolve
@@ -1362,6 +1471,7 @@ main() {
   archive "$WORK"
   WORK_ARCHIVED=$ARCHIVED_TO
   mkdir -p "$WORK" "${OUT%/*}" || die 2 "cannot make $WORK"
+  [ "$TAPES" != on ] || mkdir -p "$WORK/tapes" || die 2 "cannot make $WORK/tapes"
   STARTED=$(now)
   if [ -n "$RESUME" ]; then
     RESUME_NOW=$RESUME
@@ -1421,7 +1531,9 @@ st_stubs() {
 # The self-test's depth-serve.sh: what it was given goes to $STUB_CALLS, and it prints a call's lines (the hook's before
 # the last arm's row, one ROW an arm). The profile's name picks a fault: red* fails, slow* waits for $STUB_RELEASE, drift*
 # prints another context on its second call, busy* tags a row, cold* tags the first request of a server [cold], short* prints one row,
-# nohook* never runs the hook, flaky* is red on its first call only. Under DEPTH_SERVE_FOLD=depths every row after the first ends [shared] and reads 19 tok/s against 20. Each call line names the box hold, the GPU hold (with the cards it names) and the baseline it was given.
+# nohook* never runs the hook, flaky* is red on its first call only. A DEPTH_SERVE_TAPE runs on each arm before the hook, with the session's
+# variables and the arm's ids file and n_predict (`TAPE r1 <label> D=<D> rc=<n>` ends its lines); a nonzero one makes the call red. The call's
+# DEPTH_SERVE_TAPE goes to $STUB_CALLS.tape (a file of its own: the call lines above are counted by position). Under DEPTH_SERVE_FOLD=depths every row after the first ends [shared] and reads 19 tok/s against 20. Each call line names the box hold, the GPU hold (with the cards it names) and the baseline it was given.
 set -u
 prof=$BLOOMERY_MODEL
 n=$(cat "$STUB_COUNT.$prof" 2> /dev/null || echo 0)
@@ -1467,6 +1579,17 @@ for arm in "$@"; do
     cold*) [ "$k" != 1 ] || tag=' [cold]' ;;
     short*) [ "$k" = 1 ] || continue ;;
   esac
+  if [ -n "${DEPTH_SERVE_TAPE:-}" ]; then
+    mkdir -p "$TMPDIR/tape-r1-D$d"
+    seq 1 "$d" > "$TMPDIR/tape-r1-D$d/ids"
+    echo "depth-serve profile=$prof arm=$k DEPTH_SERVE_TAPE=$DEPTH_SERVE_TAPE" >> "$STUB_CALLS.tape"
+    rc=0
+    env "BLOOMERY_SESSION_URL=http://127.0.0.1:1" "BLOOMERY_SESSION_PID=$$" "BLOOMERY_SESSION_STDERR=/dev/null" \
+      "BLOOMERY_SESSION_DIR=$TMPDIR/tape-r1-D$d" "DEPTH_SERVE_TAPE_IDS=$TMPDIR/tape-r1-D$d/ids" "DEPTH_SERVE_TAPE_N=${DEPTH_SERVE_N:-128}" \
+      bash -c "$DEPTH_SERVE_TAPE" || rc=$?
+    echo "TAPE r1 $label D=$d rc=$rc"
+    [ "$rc" = 0 ] || fail=1
+  fi
   if [ "$k" = "$#" ] && [ -n "${DEPTH_SERVE_AFTER:-}" ] && [ "${prof#nohook}" = "$prof" ]; then
     echo "[hook] r1 $label D=$d: DEPTH_SERVE_AFTER after its timed request"
     mkdir -p "$TMPDIR/session-r1-D$d"
@@ -1509,6 +1632,48 @@ esac
 echo "check pass_short: PASS ok"
 echo "check pass_long: PASS ok"
 echo "SESSION rc=0"
+STUB
+  cat > "$1/tape.sh" << 'STUB'
+#!/usr/bin/env bash
+# The self-test's tools/release/tape.py: `check` answers a toktape (the refusal, rc 2, while toktape.missing is beside this file), and
+# `record` writes the tape file <tag>-D<D>.toktape and prints the product line tape.py prints. The profile's name picks a fault: tapefail*
+# prints a failed line and exits 1, tapeless* exits 0 and prints nothing. Its calls go to $STUB_CALLS.tape.
+set -u
+here=$(cd "$(dirname "$0")" && pwd)
+cmd=${1:-}
+shift
+echo "tape.sh $cmd $*" >> "${STUB_CALLS}.tape"
+case $cmd in
+  check)
+    if [ -e "$here/toktape.missing" ]; then
+      echo "tape.py: toktape is not on PATH (--toktape-bin names it)" >&2
+      exit 2
+    fi
+    echo "toktape 9.9.9 at /stub/bin/toktape"
+    ;;
+  record)
+    out='' tag='' ids='' n=''
+    while [ $# -gt 0 ]; do
+      case $1 in
+        --out) out=$2 ;;
+        --tag) tag=$2 ;;
+        --ids) ids=$2 ;;
+        --n) n=$2 ;;
+      esac
+      shift
+    done
+    d=$(wc -l < "$ids" | tr -d ' ')
+    case ${BLOOMERY_MODEL:-} in
+      tapefail*)
+        echo "tape D=$d | failed: the stub's toktape would not record"
+        exit 1
+        ;;
+      tapeless*) exit 0 ;;
+    esac
+    mkdir -p "$out" && echo "stub tape" > "$out/$tag-D$d.toktape"
+    echo "tape D=$d | file $tag-D$d.toktape | toktape 9.9.9 | prompt exact | prompt_n $((d + 1)) | cache_n 0 | pp 111.11 tok/s | tg 22.22 tok/s | predicted_n $n | caveats -"
+    ;;
+esac
 STUB
 }
 
@@ -1614,10 +1779,12 @@ st_case() {
     chmod +x "$C/bin/timeout"
   fi
   : > "$C/calls"
-  WHY='' ST_EXTRA=()
+  rm -f "$C/calls.tape"
+  # Every case but the tapes' runs --no-tape: the stage's default (tapes on at portable) is the tapes case's, with its own stub.
+  WHY='' ST_EXTRA=() ST_TAPE=(--no-tape)
   mkdir -p "$C/tree/tools/release"
   cp "$SUT" "$C/tree/tools/release/sitting.sh"
-  cp "$(dirname "$SUT")/portable-bin.sh" "$C/tree/tools/release/portable-bin.sh"
+  cp "$ROOT/tools/release/portable-bin.sh" "$C/tree/tools/release/portable-bin.sh"
   ln -s "$ROOT/tools/ref" "$C/tree/tools/ref"
   ln -s "$ROOT/tools/gate-bound.sh" "$C/tree/tools/gate-bound.sh"
   ln -s "$ROOT/tools/gpu-gate.sh" "$C/tree/tools/gpu-gate.sh"
@@ -1630,7 +1797,7 @@ st_run() {
     "STUB_HOLD=$C/holds/bloomery-rel-hold" "STUB_RELEASE=$C/release" "BLOOMERY_LEASE_HOLDS=$C/holds/bloomery-*-hold" \
     "BLOOMERY_LEASE_CARD=$C/card" "SITTING_STUB_DIR=$C/stub" "STUB_GPUHOLD=$C/stub/sitting.gpuhold" "BLOOMERY_LOCK_DIR=$C/locks" SITTING_POLL=0.05 SITTING_QUIET_POLL=0.05 SITTING_BASELINE_POLL=0.05 \
     ${ST_EXTRA[@]+"${ST_EXTRA[@]}"} \
-    bash "$C/tree/tools/release/sitting.sh" --cells "$C/cells.tsv" --tree stubtree --out "$C/v.sitting" "$@" > "$C/out" 2>&1
+    bash "$C/tree/tools/release/sitting.sh" --cells "$C/cells.tsv" --tree stubtree --out "$C/v.sitting" ${ST_TAPE[@]+"${ST_TAPE[@]}"} "$@" > "$C/out" 2>&1
   RC=$?
   cd "$OLDPWD" || exit 2
 }
@@ -1642,7 +1809,7 @@ st_start() {
     "STUB_HOLD=$C/holds/bloomery-rel-hold" "STUB_RELEASE=$C/release" "BLOOMERY_LEASE_HOLDS=$C/holds/bloomery-*-hold" \
     "BLOOMERY_LEASE_CARD=$C/card" "SITTING_STUB_DIR=$C/stub" "STUB_GPUHOLD=$C/stub/sitting.gpuhold" "BLOOMERY_LOCK_DIR=$C/locks" SITTING_POLL=0.05 SITTING_QUIET_POLL=0.05 SITTING_BASELINE_POLL=0.05 \
     ${ST_EXTRA[@]+"${ST_EXTRA[@]}"} \
-    bash "$C/tree/tools/release/sitting.sh" --cells "$C/cells.tsv" --tree stubtree --out "$C/v.sitting" "$@" > "$C/out" 2>&1 &
+    bash "$C/tree/tools/release/sitting.sh" --cells "$C/cells.tsv" --tree stubtree --out "$C/v.sitting" ${ST_TAPE[@]+"${ST_TAPE[@]}"} "$@" > "$C/out" 2>&1 &
   ST_PID=$!
   echo "$ST_PID" >> "$T/pids"
   cd "$OLDPWD" || exit 2
@@ -1665,7 +1832,7 @@ want_before() {
   { [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; } || fault "'$1' (line ${a:-none}) is not before '$2' (line ${b:-none})"
 }
 # st_fresh: the next sitting of a case starts from no call, no count, no ps position and no verdict.
-st_fresh() { : > "$C/calls"; rm -rf "$C"/count.* "$C/ps.i" "$C/v.sitting"; }
+st_fresh() { : > "$C/calls"; rm -rf "$C"/count.* "$C/ps.i" "$C/v.sitting" "$C/calls.tape"; }
 calls_seq() {
   local got
   got=$(sed -n "$1" "$C/calls" 2> /dev/null | paste -sd' ' -)
@@ -2735,6 +2902,200 @@ case_resumedry() {
 # report to $T/res.<k>; the driver runs them in parallel batches and prints the reports in order.
 JOBS_KIND=() JOBS_ARG=() MUT_NAME=() MUT_CASE=() MUT_OLD=() MUT_NEW=()
 
+# Tapes. The portable stage records them (tools/release/tape.py record, DEPTH_SERVE_TAPE) on round 1 only, one a row, after the timed
+# request and before the checks' hook; the iteration's tree stage does not unless --tape; --no-tape is the explicit off; a toktape that
+# is not there is rc 2 before the hold; a tape that failed or was never printed is a red run; the verdict's header and round-1 blocks
+# carry them, tape.py publish (the real one, on a stub toktape, --dry-run) reads them back, and a resume keeps the earlier tapes.
+tape_recs() { sed -n 's/^tape.sh record --out \([^ ]*\) --tag \([^ ]*\) --url \([^ ]*\) --ids [^ ]* --n \([^ ]*\) --work .*/\1 \2 \3 \4/p' "$C/calls.tape" 2> /dev/null; }
+tape_publish() { python3 "$ROOT/tools/release/tape.py" publish "$C/v.sitting" --dry-run --toktape-bin "$C/bin/toktape" > "$C/publish.out" 2>&1; PRC=$?; }
+want_pub() { grep -qF -- "$1" "$C/publish.out" || fault "tape.py publish lacks '$1'"; }
+
+case_tapes() {
+  st_case "tapes$SUF"
+  local a b exp f out
+  cat > "$C/bin/toktape" << 'STUB'
+#!/bin/sh
+case "$1" in
+  version) echo "toktape 0.8.0" ;;
+  publish) echo "dry run: would upload $2" ;;
+  *) echo "toktape stub: $*" >&2; exit 9 ;;
+esac
+STUB
+  chmod +x "$C/bin/toktape"
+  ST_TAPE=()
+  { echo "$HDR"; echo 'pa|a|3090||512,4096|--stub-pass'; echo 'pb|bp|both||512|-'; } | st_cells
+  # the portable stage's default: tapes on, the toktape checked first, round 1's three arms recorded and round 2's none
+  # shellcheck disable=SC2046
+  st_run $(portable) --version 0.0.0
+  want_rc 0
+  want_out '[tapes] on: toktape 9.9.9 at /stub/bin/toktape'
+  want_v 'tapes=on'
+  want_v 'toktape=9.9.9'
+  [ "$(sed -n 1p "$C/calls.tape" 2> /dev/null)" = 'tape.sh check ' ] || fault "the first tape call is not the check: '$(sed -n 1p "$C/calls.tape" 2> /dev/null)'"
+  exp=$(printf '%s\n' "$C/v.sitting.d/tapes sit-0.0.0-c1 http://127.0.0.1:1 128" "$C/v.sitting.d/tapes sit-0.0.0-c1 http://127.0.0.1:1 128" \
+    "$C/v.sitting.d/tapes sit-0.0.0-c2 http://127.0.0.1:1 128")
+  [ "$(tape_recs | sort)" = "$exp" ] || fault "the tape calls (out tag url n) read '$(tape_recs | sort | paste -sd';' -)', want one a round-1 arm: '$(paste -sd';' - <<< "$exp")'"
+  [ "$(grep -c '^tape D=' "$C/v.sitting")" = 3 ] || fault "the verdict does not carry exactly the three round-1 tape lines"
+  [ "$(grep -c '^TAPE r1 .* rc=0$' "$C/v.sitting")" = 3 ] || fault "the verdict does not carry the three round-1 TAPE lines"
+  for f in sit-0.0.0-c1-D512 sit-0.0.0-c1-D4096 sit-0.0.0-c2-D512; do
+    [ -s "$C/v.sitting.d/tapes/$f.toktape" ] || fault "no tape file $f.toktape under the work directory's tapes"
+  done
+  want_v 'tape D=512 | file sit-0.0.0-c1-D512.toktape | toktape 9.9.9 | prompt exact | prompt_n 513 |'
+  a=$(grep -n '^TAPE r1 .* D=4096 rc=0$' "$C/v.sitting" | head -n 1 | cut -d: -f1)
+  b=$(grep -n '^HOOK r1 ' "$C/v.sitting" | head -n 1 | cut -d: -f1)
+  { [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; } || fault "cell 1's last arm's tape (line ${a:-none}) is not before the checks' hook (line ${b:-none})"
+  # tape.py publish reads this verdict: three rows, nothing uploaded
+  tape_publish
+  [ "$PRC" = 0 ] || fault "tape.py publish exited $PRC on the sitting's verdict: $(head -n 3 "$C/publish.out" | paste -sd' ' -)"
+  want_pub 'cell 1 (pa place=a cards=3090) D=4096: would publish sit-0.0.0-c1-D4096.toktape'
+  want_pub 'cell 2 (pb place=bp cards=both) D=512: would publish sit-0.0.0-c2-D512.toktape'
+  want_pub 'tapes: 3 of 3 to publish'
+  # the plan prices the tapes: round 1's extra request an arm
+  st_fresh
+  {
+    printf 'file/profile\tplace\tcards\tctx\tD\tchecks\tload_s\tpp\ttg\n'
+    printf 'pa=/m/a.gguf\ta\t3090\t\t512,4096\t-\t10\t100\t20\n'
+    printf 'pb\tbp\tboth\t\t512\t--client toktape\t20\t50\t10\n'
+  } > "$C/cells.tsv"
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run
+  want_rc 0
+  want_out '[dry] tapes: on (toktape 9.9.9 at /stub/bin/toktape)'
+  # 428.94 s without (the dry case's) + (512/100 + 127/20 + 4096/100 + 127/20) + (512/50 + 127/10) = 428.94 + 58.78 + 22.94 = 510.66
+  want_out 'predicted wall = 511 s (~9 min)'
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run --no-tape
+  want_out '[dry] tapes: off (--no-tape)'
+  want_out 'predicted wall = 429 s (~7 min)'
+  # a tape that failed is a red run naming it; a tape never printed is one too
+  st_fresh
+  { echo "$HDR"; echo 'tapefail1|a|3090||512|-'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 1
+  want_v 'result=red'
+  want_v "tape D=512 | failed: the stub's toktape would not record"
+  want_v 'depth-serve.sh exited 1: tape D=512 | failed:'
+  tape_publish
+  [ "$PRC" = 64 ] || fault "tape.py publish exited $PRC on a red verdict, want 64"
+  want_pub 'result=red'
+  st_fresh
+  { echo "$HDR"; echo 'tapeless1|a|3090||512|-'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 1
+  want_v "0 tape(s) recorded for the cell's 1 arm(s)"
+  # --no-tape: no check, no tape, a verdict that says why, and tape.py publish refuses it by name
+  st_fresh
+  { echo "$HDR"; echo 'pa|a|3090||512|-'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable) --no-tape
+  want_rc 0
+  want_v 'tapes=off'
+  want_v 'tapes_off=--no-tape'
+  [ ! -e "$C/calls.tape" ] || fault "a tape call under --no-tape"
+  [ ! -e "$C/v.sitting.d/tapes" ] || fault "a tapes directory under --no-tape"
+  # a DEPTH_SERVE_TAPE the caller's environment holds never reaches a call: the sitting's own setting is the only one
+  st_fresh
+  ST_EXTRA=(DEPTH_SERVE_TAPE='echo the-callers' DEPTH_SERVE_TAPE_BOUND=5)
+  # shellcheck disable=SC2046
+  st_run $(portable) --no-tape
+  want_rc 0
+  [ ! -e "$C/calls.tape" ] || fault "the caller's DEPTH_SERVE_TAPE reached a depth-serve call"
+  ST_EXTRA=()
+  tape_publish
+  [ "$PRC" = 64 ] || fault "tape.py publish exited $PRC on a verdict with tapes=off, want 64"
+  want_pub 'recorded no tapes (tapes=off)'
+  # the tree stage's iteration: off unless --tape
+  st_fresh
+  st_run --binary tree
+  want_rc 0
+  want_v 'tapes=off'
+  want_v 'tapes_off=stage=tree'
+  [ ! -e "$C/calls.tape" ] || fault "a tape call at the tree stage without --tape"
+  st_fresh
+  st_run --binary tree --tape
+  want_rc 0
+  want_v 'tapes=on'
+  [ "$(tape_recs | wc -l | tr -d ' ')" = 1 ] || fault "the tree stage's --tape recorded $(tape_recs | wc -l | tr -d ' ') tape(s), want 1"
+  st_fresh
+  # shellcheck disable=SC2046
+  st_run $(portable) --tape --no-tape
+  want_rc 64
+  want_out 'name one mode each'
+  no_calls
+  # a cell that folds its depths takes no tape: the portable default and --tape refuse it by name, --no-tape runs it
+  st_fresh
+  { echo "$HDR"; echo 'pa|a|3090||512,4096|-'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable) --fold depths
+  want_rc 64
+  want_out 'cell(s) 1 fold their depths'
+  no_calls
+  no_hold
+  st_run --binary tree --tape --fold depths
+  want_rc 64
+  want_out '--tape: cell(s) 1 fold their depths'
+  no_calls
+  # shellcheck disable=SC2046
+  st_run $(portable) --fold depths --no-tape
+  want_rc 0
+  want_v 'tapes=off'
+  # a toktape that is not there: rc 2 before the hold and every call; a dry run says it, --no-tape does not need one
+  st_fresh
+  : > "$C/stub/toktape.missing"
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 2
+  want_out 'the tapes need a toktape: tape.py: toktape is not on PATH'
+  no_calls
+  no_hold
+  # shellcheck disable=SC2046
+  st_run $(portable) --dry-run
+  want_rc 0
+  want_out '[dry] tapes: tape.py: toktape is not on PATH'
+  want_out '(a run refuses, rc 2)'
+  # shellcheck disable=SC2046
+  st_run $(portable) --no-tape
+  want_rc 0
+  rm -f "$C/stub/toktape.missing"
+  # SITTING_TOKTAPE names the binary: the check and every record carry it
+  st_fresh
+  ST_EXTRA=(SITTING_TOKTAPE=/x/toktape)
+  # shellcheck disable=SC2046
+  st_run $(portable)
+  want_rc 0
+  [ "$(grep -c '^tape.sh check --toktape-bin /x/toktape$' "$C/calls.tape" 2> /dev/null)" = 1 ] || fault "the check did not carry SITTING_TOKTAPE"
+  [ "$(grep -c '^tape.sh record .* --toktape-bin /x/toktape$' "$C/calls.tape" 2> /dev/null)" = 2 ] || fault "the two records did not carry SITTING_TOKTAPE"
+  ST_EXTRA=()
+  # a resume: the first sitting's green round 1 keeps its tape (the file comes along into the merged verdict's directory), the re-run
+  # row records its own, a resume of the other mode is refused, and tape.py publish reads the merged verdict
+  st_fresh
+  { echo "$HDR"; echo 'ok1|bp|both||512|-'; echo 'flaky1|bp|both||512|-'; } | st_cells
+  # shellcheck disable=SC2046
+  st_run $(portable) --keep-going --version 0.0.0
+  want_rc 1
+  [ -s "$C/v.sitting.d/tapes/sit-0.0.0-c1-D512.toktape" ] || fault "the first sitting recorded no tape for cell 1"
+  : > "$C/calls"
+  rm -f "$C/calls.tape"
+  # shellcheck disable=SC2046
+  st_run $(portable) --resume "$C/v.sitting" --no-tape
+  want_rc 64
+  want_out 'recorded tapes=on and this sitting records tapes=off'
+  no_calls
+  no_hold
+  # shellcheck disable=SC2046
+  st_run $(portable) --resume "$C/v.sitting" --version 0.0.0
+  want_rc 0
+  [ -s "$C/v.sitting.d/tapes/sit-0.0.0-c1-D512.toktape" ] || fault "the kept tape of cell 1 did not come along into the merged verdict's tapes"
+  [ -s "$C/v.sitting.d/tapes/sit-0.0.0-c2-D512.toktape" ] || fault "the re-run cell 2 recorded no tape"
+  [ "$(tape_recs | wc -l | tr -d ' ')" = 1 ] || fault "the resume recorded $(tape_recs | wc -l | tr -d ' ') tape(s), want the re-run cell's 1"
+  tape_publish
+  [ "$PRC" = 0 ] || fault "tape.py publish exited $PRC on the merged verdict: $(head -n 3 "$C/publish.out" | paste -sd' ' -)"
+  want_pub 'tapes: 2 of 2 to publish'
+  [ -z "$WHY" ]
+}
+
 # mutant <name> <case> <old> <new>
 mutant() {
   MUT_NAME+=("$1") MUT_CASE+=("$2") MUT_OLD+=("$3") MUT_NEW+=("$4")
@@ -2801,7 +3162,7 @@ selftest() {
   trap 'exit 143' TERM
   trap 'exit 130' INT
   for cs in order redstop keepgoing verdict tree noportable mismatch checks hold quiet dry cellserr env drift fold busy rows dryenv relpaths archive folddefault foldshape \
-    gpuhold baseline cardlook onecard resume resumeguard resumedrift resumedry; do
+    gpuhold baseline cardlook onecard resume resumeguard resumedrift resumedry tapes; do
     JOBS_KIND+=(case) JOBS_ARG+=("$cs")
   done
   mutant family order 'key=lambda c: (first[c["prof"]], PLACE_RANK[c["place"]], c["idx"])' 'key=lambda c: c["idx"]'
@@ -2914,6 +3275,41 @@ selftest() {
   mutant resume-dry resumedry '        resume_load
         echo "[dry] resume' '        :
         echo "[dry] resume'
+  mutant tapes-portable-default tapes '      if [ "$STAGE" != portable ]; then
+        TAPES_WHY=' '      if true; then
+        TAPES_WHY='
+  mutant tapes-tree-default tapes '      if [ "$STAGE" != portable ]; then
+        TAPES_WHY=' '      if false; then
+        TAPES_WHY='
+  mutant tapes-no-tape tapes "    off) TAPES_WHY='--no-tape' ;;" "    nope) TAPES_WHY='--no-tape' ;;"
+  mutant tapes-flag-conflict tapes '        [ -z "$TAPE_FLAG" ] || { usage; die 64 "--tape and --no-tape name one mode each; give one"; }' '        :'
+  mutant tapes-fold-default tapes '      elif [ -n "$folded" ]; then
+        die 64 "the portable stage records' '      elif false; then
+        die 64 "the portable stage records'
+  mutant tapes-fold-flag tapes '      [ -z "$folded" ] || die 64 "--tape: cell(s) $folded fold their depths' '      true || die 64 "--tape: cell(s) $folded fold their depths'
+  mutant tapes-check-first tapes '  [ -r "$BLOOMERY_LEASE_CARD" ] || die 2 "the prediction card $BLOOMERY_LEASE_CARD is not readable"
+  tapes_check' '  [ -r "$BLOOMERY_LEASE_CARD" ] || die 2 "the prediction card $BLOOMERY_LEASE_CARD is not readable"
+  :'
+  mutant tapes-check-refuses tapes '    die 2 "the tapes need a toktape: $out"' '    :'
+  mutant tapes-dry-check tapes '    if [ "$TAPES" = on ]; then tapes_check; else echo "[dry] tapes: off ($TAPES_WHY)"; fi' '    echo "[dry] tapes: off ($TAPES_WHY)"'
+  mutant tapes-judge-count tapes '    if [ "${tapes:-0}" != "$arms" ] || [ "${taped:-0}" != "$arms" ]; then' '    if false; then'
+  mutant tapes-judge-failed tapes '    [ -n "$fail" ] || fail=$(grep -m1 -E '"'"'^tape D=[0-9]+ [|] failed: |^TAPE r[0-9]+ .* rc=[1-9]'"'"' "$log" 2> /dev/null | cut -c1-240 || true)' '    :'
+  mutant tapes-header tapes '    echo "tapes=$TAPES"' '    :'
+  mutant tapes-header-toktape tapes '    if [ "$TAPES" = on ]; then echo "toktape=$TT_VERSION"; else echo "tapes_off=${TAPES_WHY:--}"; fi' '    if [ "$TAPES" = on ]; then :; else echo "tapes_off=${TAPES_WHY:--}"; fi'
+  mutant tapes-header-why tapes '    if [ "$TAPES" = on ]; then echo "toktape=$TT_VERSION"; else echo "tapes_off=${TAPES_WHY:--}"; fi' '    if [ "$TAPES" = on ]; then echo "toktape=$TT_VERSION"; else :; fi'
+  mutant tapes-lines-kept tapes '|TAPE r[0-9]+ |tape D=[0-9]+ [|] |' '|'
+  mutant tapes-round-1 tapes '  if [ "$r" = 1 ] && [ "$TAPES" = on ]; then
+    # depth-serve.sh runs it' '  if [ "$TAPES" = on ]; then
+    # depth-serve.sh runs it'
+  mutant tapes-per-cell-tag tapes '--tag "sit-${VERSION:-$TREE}-c$CF_IDX"' '--tag "sit-${VERSION:-$TREE}"'
+  mutant tapes-out-dir tapes 'record --out "$WORK/tapes"' 'record --out "$WORK"'
+  mutant tapes-url tapes '--url "$BLOOMERY_SESSION_URL" --ids' '--url "http://127.0.0.1:2" --ids'
+  mutant tapes-n tapes '--n "$DEPTH_SERVE_TAPE_N"' '--n 7'
+  mutant tapes-toktape-bin tapes '      tape_cmd+=$tt_bin' '      :'
+  mutant tapes-unset tapes 'DEPTH_SERVE_AFTER -u DEPTH_SERVE_TAPE -u DEPTH_SERVE_TAPE_BOUND -u' 'DEPTH_SERVE_AFTER -u'
+  mutant tapes-plan tapes '            total += sum(d / pp + (n_predict - 1) / tg for d in deps)' '            total += 0'
+  mutant tapes-resume-mode tapes '  [ "${RV_TAPES:-off}" = "$TAPES" ] ||' '  true ||'
+  mutant tapes-resume-copy tapes '      [ -e "$WORK/tapes/${t##*/}" ] || cp "$t" "$WORK/tapes/" || die 2 "cannot copy the kept tape $t into $WORK/tapes"' '      :'
   # six jobs at a time: each is a few sittings on stub servers
   for ((first = 0; first < ${#JOBS_KIND[@]}; first += 6)); do
     pids=()

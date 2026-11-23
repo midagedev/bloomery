@@ -128,6 +128,16 @@
 #                            exit status 1 (the rounds still run). A hook never runs before its server's timed request:
 #                            ds_hook_run refuses (70)
 #   DEPTH_SERVE_AFTER_BOUND  seconds the hook may take, default 300, under BLOOMERY_ARM_BOUND (the server's whole life)
+#   DEPTH_SERVE_TAPE         a command line (bash -c) run under the lease (lease_bounded) after the timed request of each arm's
+#                            server in round 1 (every arm: its own server), before the hook, with the hook's environment and
+#                            DEPTH_SERVE_TAPE_IDS (a file of the arm's D ids, one a line: the first D of the prose ids' file,
+#                            the ids the timed request sent) and DEPTH_SERVE_TAPE_N (n_predict) in it: the arm's tape, a request
+#                            beside the row's (tools/release/tape.py record). Its lines go to this log, `TAPE r<k> <label> D=<D>
+#                            rc=<n>` ends them, a command that exits other than 0 makes the run's exit status 1 (the rounds
+#                            still run). Refused with DEPTH_SERVE_FOLD=depths: a server's later arm would follow the tape, not
+#                            only the earlier row's request. A tape never runs before its server's timed request: ds_tape_run
+#                            refuses (70)
+#   DEPTH_SERVE_TAPE_BOUND   seconds the tape command may take, default 300, under BLOOMERY_ARM_BOUND
 #   DEPTH_SERVE_USER_PLAN    `check` (default): the first load of an arm group must print the plan its `--plan` printed
 #                            in the user's environment, else the arm fails; `note`: the difference is printed
 #                            (`[user-plan]`) and the run goes on, for a card set the user's environment does not see
@@ -645,6 +655,7 @@ ds_print_plan() {
   if [ "$USER_PLAN" != off ]; then
     echo "[plan] user-environment plan (DEPTH_SERVE_USER_PLAN=$USER_PLAN): before round 1, under the lease, each arm group's first arm runs with --plan, CUDA_VISIBLE_DEVICES removed; its plan record must be the one the group's first load prints"
   fi
+  [ -z "$TAPE" ] || echo "[plan] tape: DEPTH_SERVE_TAPE (bound ${TAPE_BOUND}s) after each arm's timed request in round 1, before the hook, with the arm's D ids and n_predict=$N"
   [ -z "$AFTER" ] || echo "[plan] hook: DEPTH_SERVE_AFTER (bound ${AFTER_BOUND}s) after the timed request of round 1's last server of each arm group"
   echo "[plan] last server: a server starts, and the memory baseline is read, when nothing listens on port $PORT and no bloomery-serve holds a timing card (waits up to ${PORT_WAIT_S}s; port 0 skips the port)"
   echo "[plan] memory: a server starts when each timing card's used memory is within ${MEM_SLACK_MIB} MiB of the sitting's baseline (waits up to ${MEM_WAIT_S}s; the baseline is $([ -n "$MEM_BASELINE" ] && echo "the sitting's, DEPTH_SERVE_MEM_BASELINE=$MEM_BASELINE" || echo "read once after the lease"))"
@@ -1007,6 +1018,27 @@ ds_hook_run() {
   HOOK_RUNS=$((HOOK_RUNS + 1))
 }
 
+# ds_tape_run <round> <index>: DEPTH_SERVE_TAPE on the server that has just answered the arm's timed request, under the lease
+# (lease_bounded), once for the arm: the first D ids of the prose file (the timed request's) are the command's
+# DEPTH_SERVE_TAPE_IDS. Like the hook, it follows the timed request of its own server or is refused (70).
+ds_tape_run() {
+  local r=$1 i=$2 label=${A_LABEL[$2]} dep=${A_DEP[$2]} dir rc=0
+  if [ -z "${SRV_PID:-}" ] || [ "${SRV_TIMED_PID:-}" != "$SRV_PID" ]; then
+    ds_refuse 70 "ds_tape_run: refused: the tape of r$r $label D=$dep would be recorded before the timed request of its server (the first request a server answers is the timed one)"
+  fi
+  dir=$(ds_log_name "$r" "$label" "$dep" tape-)
+  dir=${dir%.log}
+  mkdir -p "$dir" || ds_refuse 2 "cannot make the tape's directory $dir"
+  head -n "$dep" "$(ds_ids_file)" > "$dir/ids" || ds_refuse 2 "cannot write the tape's ids $dir/ids"
+  echo "[tape] r$r $label D=$dep: DEPTH_SERVE_TAPE after its timed request (bound ${TAPE_BOUND}s, http://127.0.0.1:$SRV_PORT, work dir $dir)"
+  lease_bounded "$TAPE_BOUND" env "BLOOMERY_SESSION_URL=http://127.0.0.1:$SRV_PORT" "BLOOMERY_SESSION_PID=$SRV_PID" \
+    "BLOOMERY_SESSION_STDERR=$SRV_LOG" "BLOOMERY_SESSION_DIR=$dir" "DEPTH_SERVE_TAPE_IDS=$dir/ids" "DEPTH_SERVE_TAPE_N=$N" \
+    bash -c "$TAPE" || rc=$?
+  echo "TAPE r$r $label D=$dep rc=$rc"
+  if [ "$rc" != 0 ]; then TAPE_FAILS=$((TAPE_FAILS + 1)); fi
+  TAPE_RUNS=$((TAPE_RUNS + 1))
+}
+
 # ds_units <round>: UNITS, the round's servers in the order they run, each the arm indices it serves (space-separated, in
 # the round's rotated order). Fold off: one server an arm. Fold depths: one server an arm group (the arms of one label,
 # whatever their D), the groups in the order their first arm comes up in the rotation.
@@ -1110,6 +1142,7 @@ ds_serve_request() {
     ds_fail "$r" "$i" "timings.predicted_per_second is '$SRV_PRED_TPS', not a rate"
   fi
   ROWS_PENDING+=("ROW r$r $row D=$dep | tg_tok/s $tg | pp_tok/s $pp | load_s $LOAD_S | majflt $maj${CPU_BUSY_TAG:-}${OTHER_BUSY_TAG:-}${COLD_TAG:-}${PLAN_TAG:-}$shared")
+  if [ -n "$TAPE" ] && [ "$r" = 1 ]; then ds_tape_run "$r" "$i"; fi
   if [ -n "$AFTER" ] && [ "$r" = 1 ] && [ "${A_HOOK[$i]}" = 1 ]; then ds_hook_run "$r" "$i"; fi
 }
 
@@ -1140,11 +1173,11 @@ ds_main() {
     if [ -n "$TIMING_LOCAL" ]; then echo "[timing-card] refused: $TIMING_CARDS_WHY" >&2; else echo "[timing-cards] refused: $TIMING_CARDS_WHY" >&2; fi
     exit 64
   fi
-  local i r u n v maxd need
+  local i r u n v maxd need status=0
   # Local mode refused (timing-card.sh printed why as this file sourced it) ends the run here, dry or not.
   [ -z "$TIMING_LOCAL" ] || [ -z "$TIMING_CARDS_WHY" ] || exit 64
   for v in $(compgen -v BLOOMERY_SERVE_); do
-    ds_refuse 64 "$v is set, and nothing reads it: this runner's knobs are DEPTH_SERVE_CTX, DEPTH_SERVE_PLACE, DEPTH_SERVE_N, DEPTH_SERVE_PORT, DEPTH_SERVE_REQ_BOUND, DEPTH_SERVE_IDS, DEPTH_SERVE_LOAD_EST, DEPTH_SERVE_TARBALL, DEPTH_SERVE_AFTER, DEPTH_SERVE_AFTER_BOUND, DEPTH_SERVE_FOLD, DEPTH_SERVE_USER_PLAN, DEPTH_SERVE_PORT_WAIT_S, DEPTH_SERVE_MEM_WAIT_S, DEPTH_SERVE_MEM_SLACK_MIB and DEPTH_SERVE_MEM_BASELINE (a BLOOMERY_ name would have to be a row of the lever registry)"
+    ds_refuse 64 "$v is set, and nothing reads it: this runner's knobs are DEPTH_SERVE_CTX, DEPTH_SERVE_PLACE, DEPTH_SERVE_N, DEPTH_SERVE_PORT, DEPTH_SERVE_REQ_BOUND, DEPTH_SERVE_IDS, DEPTH_SERVE_LOAD_EST, DEPTH_SERVE_TARBALL, DEPTH_SERVE_AFTER, DEPTH_SERVE_AFTER_BOUND, DEPTH_SERVE_TAPE, DEPTH_SERVE_TAPE_BOUND, DEPTH_SERVE_FOLD, DEPTH_SERVE_USER_PLAN, DEPTH_SERVE_PORT_WAIT_S, DEPTH_SERVE_MEM_WAIT_S, DEPTH_SERVE_MEM_SLACK_MIB and DEPTH_SERVE_MEM_BASELINE (a BLOOMERY_ name would have to be a row of the lever registry)"
   done
   DRY=${BLOOMERY_DRY:-}
   ROUNDS=${BLOOMERY_AB_ROUNDS:-4}
@@ -1156,6 +1189,8 @@ ds_main() {
   FOLD=${DEPTH_SERVE_FOLD:-off}
   AFTER=${DEPTH_SERVE_AFTER:-}
   AFTER_BOUND=${DEPTH_SERVE_AFTER_BOUND:-300}
+  TAPE=${DEPTH_SERVE_TAPE:-}
+  TAPE_BOUND=${DEPTH_SERVE_TAPE_BOUND:-300}
   USER_PLAN=${DEPTH_SERVE_USER_PLAN:-check}
   PORT_WAIT_S=${DEPTH_SERVE_PORT_WAIT_S:-120}
   MEM_WAIT_S=${DEPTH_SERVE_MEM_WAIT_S:-60}
@@ -1169,6 +1204,7 @@ ds_main() {
   [ "$PORT" -le 65535 ] || ds_refuse 64 "DEPTH_SERVE_PORT is a port, got $PORT"
   ds_posint DEPTH_SERVE_REQ_BOUND "$REQ_BOUND" 1
   ds_posint DEPTH_SERVE_AFTER_BOUND "$AFTER_BOUND" 1
+  ds_posint DEPTH_SERVE_TAPE_BOUND "$TAPE_BOUND" 1
   ds_posint DEPTH_SERVE_PORT_WAIT_S "$PORT_WAIT_S" 0
   ds_posint DEPTH_SERVE_MEM_WAIT_S "$MEM_WAIT_S" 0
   ds_posint DEPTH_SERVE_MEM_SLACK_MIB "$MEM_SLACK_MIB" 0
@@ -1181,6 +1217,12 @@ ds_main() {
   case $FOLD in off | depths) ;; *) ds_refuse 64 "DEPTH_SERVE_FOLD is off or depths, got '$FOLD'" ;; esac
   if [ -n "$AFTER" ] && [ "$AFTER_BOUND" -ge "$LEASE_ARM_BOUND" ]; then
     ds_refuse 64 "DEPTH_SERVE_AFTER_BOUND $AFTER_BOUND s must be under BLOOMERY_ARM_BOUND $LEASE_ARM_BOUND s: the server's bound covers its load, its request and the hook"
+  fi
+  if [ -n "$TAPE" ] && [ "$TAPE_BOUND" -ge "$LEASE_ARM_BOUND" ]; then
+    ds_refuse 64 "DEPTH_SERVE_TAPE_BOUND $TAPE_BOUND s must be under BLOOMERY_ARM_BOUND $LEASE_ARM_BOUND s: the server's bound covers its load, its request, the tape and the hook"
+  fi
+  if [ -n "$TAPE" ] && [ "$FOLD" = depths ]; then
+    ds_refuse 64 "DEPTH_SERVE_TAPE is set beside DEPTH_SERVE_FOLD=depths: a folded server answers its later depth after the tape, so that row would not be a server's request after the timed one alone; tapes are the fold-off sitting's"
   fi
   [ $# -ge 1 ] || ds_refuse 64 "no arms: <tree>:<D> names a tree under ~/repo and the prompt length in ids"
   ds_parse_arms "$@"
@@ -1213,7 +1255,7 @@ ds_main() {
   LOGDIR=$(mktemp -d "${TMPDIR:-/tmp}/depth-serve.XXXXXX") || exit 2
   ROWS_FILE=$LOGDIR/rows.txt
   : > "$ROWS_FILE"
-  G_KEY=() G_FIRST=() UP_KEY=() HOOK_FAILS=0 HOOK_RUNS=0 SRV_TIMED_PID=''
+  G_KEY=() G_FIRST=() UP_KEY=() HOOK_FAILS=0 HOOK_RUNS=0 TAPE_FAILS=0 TAPE_RUNS=0 SRV_TIMED_PID=''
   echo "[config] model=$MODEL_NAME n=$N ctx=${CTX:-unset} port=$PORT rounds=$ROUNDS place=${PLACE:-unset} arm_bound=${LEASE_ARM_BOUND}s req_bound=${REQ_BOUND}s timing_gpu=$TIMING_GPU other_gpu=$OTHER_GPU CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES logs=$LOGDIR"
   echo "[config] arms=$* (the server at the serving defaults beside --ctx-size and --place when named, no warm-up request, fold=$FOLD: $([ "$FOLD" = depths ] && echo "one fresh server an arm group and round, its depths one after the other" || echo "one fresh server a row"))"
   # The witness blocks' binary line (timing-card.sh's card field) names BIN_PATH and BIN_SHA: the first arm's for the
@@ -1234,10 +1276,15 @@ ds_main() {
   echo
   ds_tables "$ROWS_FILE"
   witness post
+  if [ "$TAPE_FAILS" != 0 ]; then
+    echo "[tape] $TAPE_FAILS of $TAPE_RUNS tape run(s) failed: the run's exit status is 1"
+    status=1
+  fi
   if [ "$HOOK_FAILS" != 0 ]; then
     echo "[hook] $HOOK_FAILS of $HOOK_RUNS hook run(s) failed: the run's exit status is 1"
-    return 1
+    status=1
   fi
+  return "$status"
 }
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1984,6 +2031,57 @@ HOOK
     ds_hook_run 1 0 ) > "$C/out" 2>&1 || RC=$?
   st_check refuse-hook-before-the-timed-request 70 "ds_hook_run: refused: the hook of r1 a D=6 would run before the timed request of its server"
   st_absent refuse-hook-before-the-timed-request-ran-nothing "must-not-run"
+
+  # --- DEPTH_SERVE_TAPE: after the timed request of each arm's server in round 1 (the fold is off: one server an arm), before
+  # the hook, with the hook's environment and the arm's ids and n_predict; never in round 2, never before the request, never
+  # beside the fold, and a command that fails is a red run.
+  st_case tape
+  st_tree a 20
+  st_tree b 21
+  cat > "$C/tape.sh" << 'TAPE'
+echo "tape-ran last=$(tail -n 1 "$TMPDIR/stub-srv-reqs" | cut -d' ' -f1-2) health=$(curl -s -o /dev/null -w '%{http_code}' "$BLOOMERY_SESSION_URL/health") pid=$(kill -0 "$BLOOMERY_SESSION_PID" 2> /dev/null && echo alive) ids=$(wc -l < "$DEPTH_SERVE_TAPE_IDS" | tr -d ' ') first=$(head -n 1 "$DEPTH_SERVE_TAPE_IDS") last=$(tail -n 1 "$DEPTH_SERVE_TAPE_IDS") n=$DEPTH_SERVE_TAPE_N dir=$([ -d "$BLOOMERY_SESSION_DIR" ] && echo ok)"
+echo "tape D=$(wc -l < "$DEPTH_SERVE_TAPE_IDS" | tr -d ' ') | file stub.toktape"
+TAPE
+  cat > "$C/hook.sh" << 'HOOK'
+echo "hook-ran last=$(tail -n 1 "$TMPDIR/stub-srv-reqs" | cut -d' ' -f1-2)"
+HOOK
+  ST_PORT=$(st_port)
+  ST_ENV=(BLOOMERY_AB_ROUNDS=2 DEPTH_SERVE_N=16 "DEPTH_SERVE_TAPE=bash $C/tape.sh" "DEPTH_SERVE_AFTER=bash $C/hook.sh")
+  st_run a:6 a:12 b:6
+  st_check tape-run 0 "[tape] r1 a D=6: DEPTH_SERVE_TAPE after its timed request" "tape-ran last=1 6 health=200 pid=alive ids=6 first=1 last=6 n=16 dir=ok" \
+    "tape-ran last=1 12 health=200 pid=alive ids=12 first=1 last=12 n=16 dir=ok" "tape-ran last=1 6 health=200 pid=alive ids=6 first=1 last=6 n=16 dir=ok" \
+    "tape D=6 | file stub.toktape" "tape D=12 | file stub.toktape" "TAPE r1 a D=6 rc=0" "TAPE r1 a D=12 rc=0" "TAPE r1 b D=6 rc=0"
+  [ "$(grep -c '^tape-ran ' "$C/out")" = 3 ] && ok tape-once-per-arm-in-round-1 || bad tape-once-per-arm-in-round-1 "the tape command did not run exactly three times"
+  st_before tape-after-the-timed-request "[witness-stub] post r1 a D=12" "[tape] r1 a D=12:"
+  st_before tape-before-the-hook "TAPE r1 a D=12 rc=0" "[hook] r1 a D=12:"
+  st_servers tape-servers-stopped 6
+  ST_PORT=
+  st_case tapeplan
+  st_tree a 20
+  ST_ENV=(BLOOMERY_DRY=1 DEPTH_SERVE_TAPE=true)
+  st_run a:6
+  st_check tape-plan 0 "[plan] tape: DEPTH_SERVE_TAPE (bound 300s) after each arm's timed request in round 1, before the hook, with the arm's D ids and n_predict=128"
+  st_case tapefail
+  st_tree a 20
+  ST_ENV=(BLOOMERY_AB_ROUNDS=2 "DEPTH_SERVE_TAPE=echo red; exit 3")
+  st_run a:6
+  st_check tape-failure-is-a-red-run 1 "TAPE r1 a D=6 rc=3" "[tape] 1 of 1 tape run(s) failed" "ROW r2 a/place=a/ctx=16384 D=6" "mean a/place=a/ctx=16384 D=6"
+  st_case tapebefore
+  RC=0
+  ( A_LABEL=(a)
+    A_DEP=(6)
+    LOGDIR=$C TAPE='echo must-not-run' TAPE_BOUND=5 SRV_PID=123 SRV_PORT=1 SRV_LOG=$C/log SRV_TIMED_PID=''
+    ds_tape_run 1 0 ) > "$C/out" 2>&1 || RC=$?
+  st_check refuse-tape-before-the-timed-request 70 "ds_tape_run: refused: the tape of r1 a D=6 would be recorded before the timed request of its server"
+  st_absent refuse-tape-before-the-timed-request-ran-nothing "must-not-run"
+  st_case tapefold
+  st_tree a 20
+  ST_ENV=(DEPTH_SERVE_TAPE=true DEPTH_SERVE_FOLD=depths)
+  st_run a:6
+  st_check refuse-tape-with-the-fold 64 "DEPTH_SERVE_TAPE is set beside DEPTH_SERVE_FOLD=depths"
+  ST_ENV=(DEPTH_SERVE_TAPE=true DEPTH_SERVE_TAPE_BOUND=900 BLOOMERY_ARM_BOUND=900)
+  st_run a:6
+  st_check refuse-tape-bound 64 "DEPTH_SERVE_TAPE_BOUND 900 s must be under BLOOMERY_ARM_BOUND 900 s"
 
   # --- the fold: DEPTH_SERVE_FOLD=depths answers an arm group's depths on one server a round, in the round's rotated order. The
   # server's first request is what it is without the fold, a later one ends ` [shared]`, a server's rows come after its stop,

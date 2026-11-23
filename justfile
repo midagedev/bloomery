@@ -1211,7 +1211,10 @@ release-build VERSION:
 # bloomery-serve first, as depth-serve does), `--dry-run`, `--keep-going`. BLOOMERY_LEASE_CARD (BLOOMERY_BOX_ENV) names the
 # sitting's prediction card; BLOOMERY_HOLD_OWNER (default rel) owns the box-side hold and passes box.sh's guard. The verdict
 # lands beside the tarball (<tarball>.sitting; a tree stage's is target/release-dist/<version>-<tree>-tree.sitting), where
-# tools/release/publish.sh reads it.
+# tools/release/publish.sh reads it. The portable stage also records each row's tape (toktape, tools/release/tape.py; --no-tape
+# is the explicit off, --tape turns it on at the tree stage; a toktape missing or too old is rc 2 before the hold): the verdict's
+# `<verdict>.d/tapes/` holds them, and publishing is the maintainer's own command, never this recipe's:
+# `python3 tools/release/tape.py publish <verdict> [--dry-run]` (docs/performance.md, "A headline number's tape").
 release-sitting VERSION CELLS *ARGS:
     ./tools/box.sh '{{precheck}} && case " {{ARGS}} " in *" --binary tree "*) cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features glm5next,clef,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,vision,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve;; esac && bash tools/release/sitting.sh --version {{VERSION}} --cells {{CELLS}} --hold-owner {{env_var_or_default("BLOOMERY_HOLD_OWNER", "rel")}} {{ARGS}}'
 
