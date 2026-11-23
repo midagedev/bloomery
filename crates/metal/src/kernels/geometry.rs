@@ -20,6 +20,10 @@ pub const SIMD_GROUPS_PER_GROUP: usize = 2;
 /// carries.
 pub const MROWS: usize = 8;
 
+/// The fewest activation rows the M-row family takes: one row is the 1-row
+/// kernels'.
+pub const M_MIN: usize = 2;
+
 /// The output rows one threadgroup of a mat-vec owns.
 pub const ROWS_PER_GROUP: usize = ROWS_PER_SIMD_GROUP * SIMD_GROUPS_PER_GROUP;
 

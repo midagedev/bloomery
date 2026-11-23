@@ -8,8 +8,7 @@
 //! The token encoder is the caller: the e2e gate holds what one token, and
 //! one verify, encodes to these counts.
 
-use crate::geometry::MROWS;
-use crate::kernels::M_MIN;
+use crate::geometry::{M_MIN, MROWS};
 use core::num::NonZeroU32;
 
 /// One layer of the token.

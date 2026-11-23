@@ -40,10 +40,7 @@ use super::matvec::{LoadNorm, Quant};
 use super::seg::{SegArg, Segment};
 use super::{Kernels, MAX_SEGMENTS, args_bytes, check_weights_align, check_window_len, pack, word};
 
-pub use crate::geometry::MROWS;
-
-/// The fewest activation rows the family takes: one row is the 1-row kernels'.
-pub const M_MIN: usize = 2;
+pub use crate::geometry::{M_MIN, MROWS};
 
 const MATVEC: &str = "matvec mrows";
 const SEG: &str = "matvec seg mrows";
