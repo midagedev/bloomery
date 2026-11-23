@@ -896,6 +896,8 @@ pub fn open(gpu: &Gpu, draft: &Split, target: Arc<Split>) -> Result<Ml4Draft, Gp
         )?,
         joint_b: f32s(gpu, draft, &names::joint_proj_bias(), 3 * rank)?,
         softcap: Some(hp.softcap),
+        row: RnnTail::ROW,
+        c: None,
     };
     let head = HeadWeights {
         norm: gain(gpu, draft, &names::output_norm(), e)?,

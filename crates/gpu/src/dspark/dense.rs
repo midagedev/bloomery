@@ -412,7 +412,7 @@ fn per_row_image(p: PerRow, n_kv: usize, row: impl Fn(usize, usize) -> u32) -> V
 }
 
 /// `bits` widened to f32.
-fn widen(bits: &[u16]) -> Vec<f32> {
+pub(super) fn widen(bits: &[u16]) -> Vec<f32> {
     bits.iter()
         .map(|&b| f32::from_bits(u32::from(b) << 16))
         .collect()
@@ -420,7 +420,7 @@ fn widen(bits: &[u16]) -> Vec<f32> {
 
 /// The file's index of new row `j` of a head of `hd` values after the NEOX-to-adjacent permutation
 /// (the module doc): new `2i` is `i`, new `2i + 1` is `i + hd/2`.
-fn adjacent_pairs(hd: usize, j: usize) -> usize {
+pub(super) fn adjacent_pairs(hd: usize, j: usize) -> usize {
     if j.is_multiple_of(2) {
         j / 2
     } else {
@@ -549,7 +549,12 @@ impl Q8Rows {
 }
 
 /// `blocks`, `rows` rows of `k` values, on the card in the two-plane layout of `q8_0_planes`.
-fn upload_blocks(gpu: &Gpu, blocks: &[Q8Block], rows: usize, k: usize) -> Result<Q8Rows, GpuError> {
+pub(super) fn upload_blocks(
+    gpu: &Gpu,
+    blocks: &[Q8Block],
+    rows: usize,
+    k: usize,
+) -> Result<Q8Rows, GpuError> {
     let (qs, d) = q8_0_planes(blocks);
     let stream = gpu.stream();
     Ok(Q8Rows {

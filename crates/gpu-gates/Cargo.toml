@@ -1058,3 +1058,10 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_inkling2_e2e"
 required-features = ["gpu"]
+
+# inkling2-draft: Inkling 2's DSpark draft on the card (gate_inkling2_draft's doc): the official
+# folder's draft beside the Mini's GGUF in the target's shadow, its acceptance per corpus against the
+# reference's. Real tier only.
+[[bin]]
+name = "gate_inkling2_draft"
+required-features = ["gpu", "dspark-hf"]

@@ -21,6 +21,22 @@
 //! 6. the argmax over the `m` rows into `tok` (`elem::argmax_rows_fault`):
 //!    `tok[i]` is row `i + 1`'s previous token.
 //!
+//! # The anchor form
+//!
+//! Inkling 2's draft runs the loop in a second form ([`runtime::dspark::RnnRow`] `{ Anchor, ctx,
+//! Sum, Hidden }`), with its own two entries beside the first form's, which stay as they are:
+//!
+//! - the loop starts at row `start = 1`: row 0 is the anchor and drafts nothing, row 1's state is
+//!   zero and its previous token the anchor `first[0]`; rows `start..m` run, and row 0's logits
+//!   stay the projection's;
+//! - the joint input carries the head's context row after the normed row ([`RnnKernels::
+//!   enqueue_input_anchor`]): `x = [s | markov_w1[p] | h_i | ctx]`;
+//! - the correction is the file's `hidden_out · e + b` through the target's output matrix, folded at
+//!   load into `W2 = output · hidden_out` and `c = output · b` (`super::fold`): step 4's gemv runs
+//!   over `W2`, and the add ([`RnnKernels::enqueue_add_cap`]) writes `cap · tanh((l + (δ + c)) ·
+//!   (1 / cap))`, the soft cap on the sum, in place, so the argmax that follows reads the capped
+//!   row (the first maximum, `elem::argmax_rows_fault`).
+//!
 //! The logits are the head's gemv layout, `logits[v · m + c]`. Rows below
 //! `i` are unchanged since their own step and give the same tokens again;
 //! rows above `i` write a token their own step overwrites. A previous token
@@ -238,6 +254,155 @@ mod rnn_kernels {
             *l = add_rn_f32(*l, *delta.get_unchecked(v));
         }
     }
+
+    /// Row `row`'s joint input in the anchor form (module doc): `x = [s | markov_w1[p] | normed row
+    /// | ctx]`. Row `start` is the loop's first: its state is zero and its previous token
+    /// `first[0]`; a later row's previous token is `tok[row − 1]` and its state `state`. A previous
+    /// token at or past `n_prev` raises [`FaultSite::TokenId`] on `fault` (thread 0) and fills the
+    /// row's table part with NaN.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            w1_qs.len() >= n_prev * 8 * row_scales,
+            w1_d.len() >= n_prev * row_scales,
+            first.len() >= 1,
+            tok.len() >= m,
+            state.len() >= 32 * row_scales,
+            normed.len() >= m * hidden,
+            ctx.len() >= hidden,
+            x.len() >= 64 * row_scales + 2 * hidden,
+            start <= row,
+            row < m,
+            n_prev >= 1,
+            row_scales >= 1,
+            hidden >= 1
+        )
+    )]
+    pub fn dspark_rnn_input_anchor(
+        w1_qs: &[u32],
+        w1_d: &[u16],
+        first: &[u32],
+        tok: &[u32],
+        state: &[f32],
+        normed: &[f32],
+        ctx: &[f32],
+        n_prev: u32,
+        row_scales: u32,
+        hidden: u32,
+        m: u32,
+        row: u32,
+        start: u32,
+        fault: FaultSink,
+        mut x: DisjointSlice<f32>,
+    ) {
+        // `m` is read by the launch contract only (`row < m`).
+        let _ = m;
+        let i = thread::index_1d().get();
+        let rank = 32 * row_scales as usize;
+        let h = hidden as usize;
+        let lead = row == start;
+        // SAFETY: first.len() >= 1, and row - 1 < m <= tok.len() for a row past `start` (so past
+        // 0), by the launch contract.
+        let p = unsafe {
+            if lead {
+                *first.get_unchecked(0)
+            } else {
+                *tok.get_unchecked(row as usize - 1)
+            }
+        };
+        if i == 0 && p >= n_prev {
+            fault.raise(FaultSite::TokenId);
+        }
+        if i >= 2 * rank + 2 * h {
+            return;
+        }
+        let v = if i < rank {
+            if lead {
+                0.0
+            } else {
+                // SAFETY: i < rank = 32 * row_scales <= state.len().
+                unsafe { *state.get_unchecked(i) }
+            }
+        } else if i < 2 * rank {
+            let k = i - rank;
+            if p < n_prev {
+                let p = p as usize;
+                // SAFETY: p < n_prev and k < rank: the word and the scale are inside the tables by
+                // the launch contract.
+                let (word, d) = unsafe {
+                    (
+                        *w1_qs.get_unchecked(p * 8 * row_scales as usize + k / 4),
+                        *w1_d.get_unchecked(p * row_scales as usize + k / 32),
+                    )
+                };
+                let q = ((word >> (8 * (k % 4))) & 0xff) as u8 as i8;
+                mul_rn_f32(f32::from(q), half_to_f32(d))
+            } else {
+                f32::NAN
+            }
+        } else if i < 2 * rank + h {
+            let at = row as usize * h + (i - 2 * rank);
+            // SAFETY: row < m and i - 2 * rank < hidden, so at < m * hidden <= normed.len().
+            unsafe { *normed.get_unchecked(at) }
+        } else {
+            // SAFETY: i - 2 * rank - hidden < hidden <= ctx.len().
+            unsafe { *ctx.get_unchecked(i - 2 * rank - h) }
+        };
+        // SAFETY: i < 2 * rank + 2 * hidden <= x.len(); thread i alone writes it.
+        unsafe {
+            *x.get_unchecked_mut(i) = v;
+        }
+    }
+
+    /// Row `row`'s correction and the soft cap in the anchor form (module doc): thread `v <
+    /// n_head` writes `cap · tanh((l + (delta[v] + c[v])) · inv_cap)` over `l = logits[v · m +
+    /// row]`, each product and sum rounded on its own.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            delta.len() >= n_head,
+            c.len() >= n_head,
+            logits.len() >= n_head * m,
+            row < m
+        )
+    )]
+    pub fn dspark_rnn_add_cap(
+        delta: &[f32],
+        c: &[f32],
+        n_head: u32,
+        m: u32,
+        row: u32,
+        cap: f32,
+        inv_cap: f32,
+        mut logits: DisjointSlice<f32>,
+    ) {
+        let v = thread::index_1d().get();
+        if v >= n_head as usize {
+            return;
+        }
+        let at = v * m as usize + row as usize;
+        // SAFETY: v < n_head <= delta.len() and c.len(), at < n_head * m <= logits.len(); one
+        // thread per v.
+        unsafe {
+            let l = logits.get_unchecked_mut(at);
+            let s = add_rn_f32(*l, add_rn_f32(*delta.get_unchecked(v), *c.get_unchecked(v)));
+            *l = mul_rn_f32(cap, mul_rn_f32(s, inv_cap).tanh());
+        }
+    }
 }
 
 /// [`RnnKernels::enqueue_input`]'s arguments.
@@ -264,6 +429,15 @@ pub struct RnnInputArgs<'a> {
     pub fault: FaultSink,
     /// The joint input, `2 · rank + hidden` values.
     pub x: &'a mut DeviceBuffer<f32>,
+}
+
+/// [`RnnKernels::enqueue_input_anchor`]'s arguments: [`RnnInputArgs`]' and the anchor form's own.
+pub struct RnnAnchorArgs<'a> {
+    pub base: RnnInputArgs<'a>,
+    /// The head's context row, `hidden` values.
+    pub ctx: &'a DeviceBuffer<f32>,
+    /// The loop's first row.
+    pub start: usize,
 }
 
 /// The loaded recurrent-head module. Owns no stream.
@@ -449,5 +623,199 @@ impl RnnKernels {
             logits,
         )?;
         Ok(())
+    }
+
+    /// Enqueue row `a.base.row`'s joint input in the anchor form (`dspark_rnn_input_anchor`).
+    /// Asynchronous, allocation-free, capturable.
+    pub fn enqueue_input_anchor(
+        &self,
+        stream: &CudaStream,
+        a: RnnAnchorArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "RnnKernels::enqueue_input_anchor";
+        let RnnAnchorArgs { base, ctx, start } = a;
+        let RnnInputArgs {
+            w1_qs,
+            w1_d,
+            n_prev,
+            rank,
+            first,
+            tok,
+            state,
+            normed,
+            hidden,
+            m,
+            row,
+            fault,
+            x,
+        } = base;
+        let width = 2 * rank + 2 * hidden;
+        if rank == 0
+            || !rank.is_multiple_of(32)
+            || n_prev == 0
+            || hidden == 0
+            || w1_qs.len() < n_prev * rank / 4
+            || w1_d.len() < n_prev * rank / 32
+            || first.is_empty()
+            || m == 0
+            || row >= m
+            || start > row
+            || tok.len() < m
+            || state.len() < rank
+            || normed.len() < m * hidden
+            || ctx.len() < hidden
+            || x.len() < width
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "rank {rank} (a positive multiple of 32), {n_prev} table rows over {} words \
+                     and {} scales, first {}, row {row} of m {m} from {start}, tok {}, state {}, \
+                     normed {} (need {}), ctx {} (need {hidden}), x {} (need {width})",
+                    w1_qs.len(),
+                    w1_d.len(),
+                    first.len(),
+                    tok.len(),
+                    state.len(),
+                    normed.len(),
+                    m * hidden,
+                    ctx.len(),
+                    x.len()
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", width.div_ceil(THREADS as usize))?;
+        let prep = self
+            .module
+            .prepare_dspark_rnn_input_anchor(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.dspark_rnn_input_anchor(
+            stream,
+            &prep,
+            w1_qs,
+            w1_d,
+            first,
+            tok,
+            state,
+            normed,
+            ctx,
+            launch_u32(what, "n_prev", n_prev)?,
+            launch_u32(what, "row_scales", rank / 32)?,
+            launch_u32(what, "hidden", hidden)?,
+            launch_u32(what, "m", m)?,
+            launch_u32(what, "row", row)?,
+            launch_u32(what, "start", start)?,
+            fault,
+            x,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue row `row`'s correction `delta` and the constant `c` (`n_head` values each) into
+    /// `logits` (`m` rows, `logits[v · m + c]`), then the soft cap `cap` on the sum
+    /// (`dspark_rnn_add_cap`). A cap that is not finite or is 0 is refused by name. Asynchronous,
+    /// allocation-free, capturable.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one launch's inputs and its output, all distinct roles"
+    )]
+    pub fn enqueue_add_cap(
+        &self,
+        stream: &CudaStream,
+        delta: &DeviceBuffer<f32>,
+        c: &DeviceBuffer<f32>,
+        n_head: usize,
+        m: usize,
+        row: usize,
+        cap: f32,
+        logits: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "RnnKernels::enqueue_add_cap";
+        if n_head == 0
+            || m == 0
+            || row >= m
+            || delta.len() < n_head
+            || c.len() < n_head
+            || logits.len() < n_head * m
+            || !cap.is_finite()
+            || cap == 0.0
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "n_head {n_head}, row {row} of m {m}, delta {}, c {}, logits {} (need {}), \
+                     cap {cap} (finite, not 0)",
+                    delta.len(),
+                    c.len(),
+                    logits.len(),
+                    n_head * m
+                ),
+            ));
+        }
+        let grid = launch_u32(what, "grid", n_head.div_ceil(THREADS as usize))?;
+        let prep = self
+            .module
+            .prepare_dspark_rnn_add_cap(LaunchConfig1D::new(grid, THREADS, 0))?;
+        self.module.dspark_rnn_add_cap(
+            stream,
+            &prep,
+            delta,
+            c,
+            launch_u32(what, "n_head", n_head)?,
+            launch_u32(what, "m", m)?,
+            launch_u32(what, "row", row)?,
+            cap,
+            1.0 / cap,
+            logits,
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Gpu;
+
+    /// The soft cap stands on the sum and the argmax reads the capped row: a projection of [40,
+    /// 10] and a correction of [0, 25] cap to [30 tanh(4/3), 30 tanh(7/6)] and pick id 0, where a
+    /// cap on the projection before the add would give [30 tanh(4/3), 30 tanh(1/3) + 25] and id 1;
+    /// a tie after the cap picks the first id; each capped value is `cap · tanh(s · (1 / cap))` of
+    /// the host's f32 ops within the device tanh's error (an approximate tanh is good to 2^-10).
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_softcap_follows_the_add() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let k = RnnKernels::load(gpu.context()).expect("the rnn module");
+        let cap = 30.0f32;
+        // Each case one row of two ids (projection, correction, constant, the id): the case
+        // above, then a tie.
+        let cases = [
+            ([40.0, 10.0], [0.0, 25.0], [0.0, 0.0], 0u32),
+            ([12.0, 7.0], [-1.0, 3.0], [0.5, 1.5], 0),
+        ];
+        for (base, delta, c, want_id) in cases {
+            let mut logits = DeviceBuffer::from_host(stream, &base[..]).expect("logits");
+            let dd = DeviceBuffer::from_host(stream, &delta[..]).expect("delta");
+            let cd = DeviceBuffer::from_host(stream, &c[..]).expect("c");
+            k.enqueue_add_cap(stream, &dd, &cd, 2, 1, 0, cap, &mut logits)
+                .expect("add cap");
+            let mut tok = DeviceBuffer::zeroed(stream, 3).expect("tok");
+            gpu.elem()
+                .enqueue_argmax_rows_fault(stream, &logits, 2, 1, gpu.unlabelled_sink(), &mut tok)
+                .expect("argmax");
+            let got = logits.to_host_vec(stream).expect("logits back");
+            let id = tok.to_host_vec(stream).expect("tok back")[0];
+            for v in 0..2 {
+                let s = base[v] + (delta[v] + c[v]);
+                let want = cap * (s * (1.0 / cap)).tanh();
+                assert!(
+                    (got[v] - want).abs() <= 2e-3 * cap,
+                    "id {v}: capped {} against cap · tanh(s / cap) = {want}",
+                    got[v]
+                );
+            }
+            assert_eq!(id, want_id, "the argmax of the capped sum {got:?}");
+        }
     }
 }

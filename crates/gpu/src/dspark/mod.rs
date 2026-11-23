@@ -1,11 +1,13 @@
 //! The DSpark draft on the card, common to every family that drafts with
-//! one: [`DsparkBody`] runs fc over the target's tapped rows, keeps the
+//! one: [`DsparkBody`] runs fc over the target's tapped rows (or the fused
+//! mixes of a draft with no fc, [`fuse`]), keeps the
 //! context ring's slots, stages a block, and runs the head chain (norm,
 //! projection, then the Markov loop and the draft-to-target id map or the
 //! selector, [`head::HeadTail`]) with one graph per width. The layers
 //! between the embedded block and the head are a family's
 //! ([`DraftLayers`]): V4.1's live in `bloomery-gpu-deepseek41`, the dense
-//! Qwen3-shaped layer in [`dense`] (DFlash2's too, with [`conv`]). The
+//! Qwen3-shaped layer in [`dense`] (DFlash2's too, with [`conv`]), Inkling
+//! 2's layer over its own context projections in [`ctx_dense`]. The
 //! draft's geometry is [`bloomery_runtime::dspark::DsparkShape`].
 
 use std::mem::ManuallyDrop;
@@ -17,14 +19,19 @@ use runtime::dspark::{BaseHead, Context, DsparkShape, HeadMatrix, HeadPlace};
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::{DeviceTensor, Gpu, GpuError, Graph, WindowMut};
 
+pub mod block_attn;
 pub mod conv;
+pub mod ctx_dense;
 pub mod dense;
+pub mod fold;
+pub mod fuse;
 pub mod head;
 pub mod ring;
 pub mod rnn;
 pub mod selector;
 pub mod stage;
 
+use fuse::{FuseArgs, FuseKernels};
 use head::{Head, HeadWeights};
 use ring::Positions;
 use stage::{Inbox, put_f32};
@@ -49,6 +56,30 @@ pub struct FcWeights {
     pub norm: DeviceTensor<f32>,
     /// The hidden norm's epsilon.
     pub eps: f32,
+}
+
+/// A draft's fused context ([`Context::Fuse`]): the mixes' weights over the
+/// taps (each a softmax of the file's row, [`fuse::mix_weights`]) and each
+/// mix's norm gain, the draft layers' in order and the head's last.
+pub struct FuseWeights {
+    /// `mixes · taps` weights.
+    pub mix: DeviceBuffer<f32>,
+    /// `mixes · hidden` gains.
+    pub gains: DeviceBuffer<f32>,
+    /// The mixes' norm epsilon.
+    pub eps: f32,
+}
+
+/// How an append turns tapped rows into the layers' context rows.
+enum ContextIn {
+    /// fc and the hidden norm, a group of rows at a time.
+    Fc(FcWeights),
+    /// Every mix of every row in one launch ([`fuse`]).
+    Fuse {
+        w: FuseWeights,
+        k: FuseKernels,
+        mixes: usize,
+    },
 }
 
 /// A family's draft layers: everything between the embedded block rows and
@@ -78,7 +109,9 @@ pub trait DraftLayers {
 
     /// Append the staged context rows to every layer's KV. Each row of `x` is
     /// already fc over the taps, then the hidden norm,
-    /// [`DraftLayers::hidden`] floats; the layer's own K/V projections and
+    /// [`DraftLayers::hidden`] floats; under a fused context ([`FuseWeights`])
+    /// `x` holds one block of [`DraftLayers::APPEND_GROUP`] rows per mix, layer
+    /// `l`'s mix from row `l · APPEND_GROUP`. The layer's own K/V projections and
     /// rotation are its own. Capturable.
     fn append_kv(&mut self, gpu: &Gpu, x: &DeviceBuffer<f32>, n: usize) -> Result<(), GpuError>;
 
@@ -219,6 +252,38 @@ impl<T: DeviceCopy> InPlace<T> {
     }
 }
 
+impl<T: DeviceCopy> InPlace<T> {
+    /// A window on the first `rows` rows of `w`, a matrix the target holds,
+    /// in `ctx`: a matrix padded past the rows a head scores. More rows than
+    /// `w` holds are refused by name.
+    ///
+    /// # Safety
+    ///
+    /// As [`InPlace::new`].
+    pub unsafe fn rows(
+        w: &DeviceTensor<T>,
+        rows: usize,
+        ctx: &Arc<CudaContext>,
+    ) -> Result<InPlace<T>, GpuError> {
+        if rows == 0 || rows > w.rows() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a window of {rows} rows on a matrix of {}", w.rows()),
+            ));
+        }
+        // SAFETY: the span is the first `rows × cols` words of `w`, which the
+        // caller holds allocated and in place.
+        let w = unsafe { DeviceTensor::window(w.buf().cu_deviceptr(), rows, w.cols(), ctx) };
+        Ok(InPlace { w })
+    }
+
+    /// The window's rows.
+    #[must_use]
+    pub fn n_rows(&self) -> usize {
+        self.w.rows()
+    }
+}
+
 impl<T: DeviceCopy> Drop for InPlace<T> {
     fn drop(&mut self) {
         // SAFETY: `self.w` is not read again; giving a window back frees no
@@ -305,7 +370,7 @@ pub struct DsparkBody<L: DraftLayers> {
     graphs: Graphs,
     layers: L,
     head: Head,
-    fc: FcWeights,
+    context: ContextIn,
     embed: Embed,
     shape: DsparkShape,
     positions: Positions,
@@ -315,8 +380,8 @@ pub struct DsparkBody<L: DraftLayers> {
     hidden: usize,
     /// The most rows one append takes.
     capacity: usize,
-    /// The rows between fc and the head: an append's normed context rows,
-    /// and a block's rows in and out of the layers.
+    /// The rows between fc and the head: an append's normed context rows (a
+    /// fused context's mixes), and a block's rows in and out of the layers.
     x: DeviceBuffer<f32>,
     /// fc's output before its norm, one group's rows.
     fc_out: DeviceBuffer<f32>,
@@ -351,12 +416,45 @@ impl<L: DraftLayers> DsparkBody<L> {
         head: HeadWeights,
         embed: EmbedSource,
     ) -> Result<DsparkBody<L>, GpuError> {
+        Self::build(gpu, shape, layers, ContextIn::Fc(fc), head, embed)
+    }
+
+    /// [`DsparkBody::new`] for a draft of a fused context ([`Context::Fuse`]):
+    /// its mixes instead of fc. The head's last mix is its context row, so the
+    /// head must take one. Load-time only.
+    pub fn fused(
+        gpu: &Gpu,
+        shape: &DsparkShape,
+        layers: L,
+        fuse: FuseWeights,
+        head: HeadWeights,
+        embed: EmbedSource,
+    ) -> Result<DsparkBody<L>, GpuError> {
+        let Context::Fuse { mixes } = shape.context else {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("fused mixes for a draft of {:?}: it runs fc", shape.context),
+            ));
+        };
+        let k = FuseKernels::load(gpu.context())?;
+        let context = ContextIn::Fuse { w: fuse, k, mixes };
+        Self::build(gpu, shape, layers, context, head, embed)
+    }
+
+    fn build(
+        gpu: &Gpu,
+        shape: &DsparkShape,
+        layers: L,
+        context: ContextIn,
+        head: HeadWeights,
+        embed: EmbedSource,
+    ) -> Result<DsparkBody<L>, GpuError> {
         let () = Self::COUNTS;
         let refuse = |detail: String| GpuError::shape(WHAT, detail);
         shape.check().map_err(|e| refuse(e.to_string()))?;
-        if let Context::Fuse { mixes } = shape.context {
+        if let (Context::Fuse { mixes }, ContextIn::Fc(_)) = (&shape.context, &context) {
             return Err(refuse(format!(
-                "a context of {mixes} fused mixes of {} tapped rows: the owner's append runs fc",
+                "a context of {mixes} fused mixes of {} tapped rows loaded with fc",
                 shape.taps.len()
             )));
         }
@@ -375,22 +473,44 @@ impl<L: DraftLayers> DsparkBody<L> {
                 "rows of {hidden} values from {feat} tapped: both multiples of 32"
             )));
         }
-        let (qs, d) = (&fc.fc.qs, &fc.fc.d);
-        if (qs.rows(), qs.cols()) != (hidden, feat / 4)
-            || (d.rows(), d.cols()) != (hidden, feat / 32)
-            || fc.norm.buf().len() != hidden
-        {
-            return Err(refuse(format!(
-                "fc of {}x{} words and {}x{} scales, a norm of {} values; {hidden} rows over \
-                 {feat} tapped values need {hidden}x{} words, {hidden}x{} scales, {hidden} gains",
-                qs.rows(),
-                qs.cols(),
-                d.rows(),
-                d.cols(),
-                fc.norm.buf().len(),
-                feat / 4,
-                feat / 32
-            )));
+        match &context {
+            ContextIn::Fc(fc) => {
+                let (qs, d) = (&fc.fc.qs, &fc.fc.d);
+                if (qs.rows(), qs.cols()) != (hidden, feat / 4)
+                    || (d.rows(), d.cols()) != (hidden, feat / 32)
+                    || fc.norm.buf().len() != hidden
+                {
+                    return Err(refuse(format!(
+                        "fc of {}x{} words and {}x{} scales, a norm of {} values; {hidden} rows \
+                         over {feat} tapped values need {hidden}x{} words, {hidden}x{} scales, \
+                         {hidden} gains",
+                        qs.rows(),
+                        qs.cols(),
+                        d.rows(),
+                        d.cols(),
+                        fc.norm.buf().len(),
+                        feat / 4,
+                        feat / 32
+                    )));
+                }
+            }
+            ContextIn::Fuse { w, mixes, .. } => {
+                let taps = shape.taps.len();
+                if shape.hidden != hidden
+                    || w.mix.len() != mixes * taps
+                    || w.gains.len() != mixes * hidden
+                {
+                    return Err(refuse(format!(
+                        "{mixes} mixes of {taps} taps of {} into rows of {hidden}: weights {} \
+                         (need {}), gains {} (need {}); a mix is as wide as a tap",
+                        shape.hidden,
+                        w.mix.len(),
+                        mixes * taps,
+                        w.gains.len(),
+                        mixes * hidden
+                    )));
+                }
+            }
         }
         let embed = match embed {
             EmbedSource::Target => Embed::Layers,
@@ -413,6 +533,13 @@ impl<L: DraftLayers> DsparkBody<L> {
             }
         };
         let head = Head::new(gpu, head, hidden, L::MAX_ROWS)?;
+        if matches!(context, ContextIn::Fuse { .. }) != head.ctx_row().is_some() {
+            return Err(refuse(
+                "a fused context and a head that takes a context row come together: the head's \
+                 row is the last mix"
+                    .into(),
+            ));
+        }
         if head.n_vocab() != shape.vocab.rows() {
             return Err(refuse(format!(
                 "a projection of {} rows for a draft vocabulary of {}",
@@ -435,7 +562,7 @@ impl<L: DraftLayers> DsparkBody<L> {
             },
             layers,
             head,
-            fc,
+            context,
             embed,
             shape: shape.clone(),
             positions: Positions::new(shape.window)?,
@@ -490,30 +617,59 @@ impl<L: DraftLayers> DsparkBody<L> {
     fn enqueue_append(&mut self, gpu: &Gpu, n: usize) -> Result<(), GpuError> {
         let s = gpu.stream();
         let (group, hidden) = (L::APPEND_GROUP, self.hidden);
-        for r0 in (0..n).step_by(group) {
-            let rows = group.min(n - r0);
-            let feat = self.feats.f32s(r0 * self.feat, rows * self.feat)?;
-            gpu.q8f32().enqueue_q8_0_gemv_mcol(
-                s,
-                Q8_0GemvMcolArgs {
-                    qs: &self.fc.fc.qs,
-                    d: &self.fc.fc.d,
-                    x: &feat,
-                    m: rows,
-                    out: GemvOut::TokenMajor,
-                    y: &mut self.fc_out,
-                },
-            )?;
-            let mut normed = WindowMut::of_mut(&mut self.x, 4 * r0 * hidden, rows * hidden)?;
-            gpu.elem().enqueue_rms_norm(
-                s,
-                &self.fc_out,
-                self.fc.norm.buf(),
-                self.fc.eps,
-                hidden,
-                rows,
-                &mut normed,
-            )?;
+        match &self.context {
+            ContextIn::Fc(fc) => {
+                for r0 in (0..n).step_by(group) {
+                    let rows = group.min(n - r0);
+                    let feat = self.feats.f32s(r0 * self.feat, rows * self.feat)?;
+                    gpu.q8f32().enqueue_q8_0_gemv_mcol(
+                        s,
+                        Q8_0GemvMcolArgs {
+                            qs: &fc.fc.qs,
+                            d: &fc.fc.d,
+                            x: &feat,
+                            m: rows,
+                            out: GemvOut::TokenMajor,
+                            y: &mut self.fc_out,
+                        },
+                    )?;
+                    let mut normed =
+                        WindowMut::of_mut(&mut self.x, 4 * r0 * hidden, rows * hidden)?;
+                    gpu.elem().enqueue_rms_norm(
+                        s,
+                        &self.fc_out,
+                        fc.norm.buf(),
+                        fc.eps,
+                        hidden,
+                        rows,
+                        &mut normed,
+                    )?;
+                }
+            }
+            ContextIn::Fuse { w, k, mixes } => {
+                let feats = self.feats.f32s(0, n * self.feat)?;
+                let last = self.head.ctx_row_mut().ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the head's context row",
+                })?;
+                k.enqueue_fuse(
+                    s,
+                    FuseArgs {
+                        feats: &feats,
+                        mix: &w.mix,
+                        gains: &w.gains,
+                        taps: self.shape.taps.len(),
+                        hidden,
+                        n,
+                        mixes: *mixes,
+                        group,
+                        eps: w.eps,
+                        fault: gpu.unlabelled_sink(),
+                        x: &mut self.x,
+                        last,
+                    },
+                )?;
+            }
         }
         self.layers.append_kv(gpu, &self.x, n)
     }
@@ -735,9 +891,13 @@ impl<L: DraftLayers> DsparkBody<L> {
     }
 
     /// The most rows one append takes: the window in whole groups, or one
-    /// group for a draft with no window.
+    /// group for a draft with no window or a fused context (its mixes stand
+    /// in blocks of one group).
     fn capacity(shape: &DsparkShape) -> usize {
         let group = L::APPEND_GROUP;
+        if let Context::Fuse { .. } = shape.context {
+            return group;
+        }
         shape.window.map_or(group, |w| w.div_ceil(group) * group)
     }
 
@@ -749,12 +909,11 @@ impl<L: DraftLayers> DsparkBody<L> {
         let capacity = Self::capacity(shape);
         let feat = shape.taps.len() * shape.hidden;
         let block_words = 1 + if host { L::MAX_ROWS * hidden } else { 0 };
-        [
-            capacity.max(L::MAX_ROWS) * hidden,
-            L::APPEND_GROUP * hidden,
-            capacity * feat,
-            block_words,
-        ]
+        let (x_rows, fc_out) = match shape.context {
+            Context::Fc => (capacity.max(L::MAX_ROWS), L::APPEND_GROUP * hidden),
+            Context::Fuse { mixes } => ((mixes * L::APPEND_GROUP).max(L::MAX_ROWS), 1),
+        };
+        [x_rows * hidden, fc_out, capacity * feat, block_words]
     }
 
     /// Card bytes of the owner's working buffers for a draft of `shape` over
@@ -779,11 +938,16 @@ impl<L: DraftLayers> DsparkBody<L> {
     /// inboxes' card sides and the head's scratch. The layers' are theirs.
     #[must_use]
     pub fn own_held(&self) -> OwnHeld {
-        let mut weights = vec![
-            self.fc.fc.qs.buf().num_bytes() as u64,
-            self.fc.fc.d.buf().num_bytes() as u64,
-            self.fc.norm.buf().num_bytes() as u64,
-        ];
+        let mut weights = match &self.context {
+            ContextIn::Fc(fc) => vec![
+                fc.fc.qs.buf().num_bytes() as u64,
+                fc.fc.d.buf().num_bytes() as u64,
+                fc.norm.buf().num_bytes() as u64,
+            ],
+            ContextIn::Fuse { w, .. } => {
+                vec![w.mix.num_bytes() as u64, w.gains.num_bytes() as u64]
+            }
+        };
         weights.extend(self.head.weight_buffers());
         let working = (self.x.num_bytes()
             + self.fc_out.num_bytes()
@@ -850,10 +1014,13 @@ impl<L: DraftLayers> DsparkBody<L> {
     }
 
     /// Launches of the owner's part of an append of `n` rows: fc and the
-    /// hidden norm for each group of rows.
+    /// hidden norm for each group of rows, or the one fuse launch.
     #[must_use]
     pub fn fc_launches(&self, n: usize) -> usize {
-        2 * n.div_ceil(L::APPEND_GROUP)
+        match self.context {
+            ContextIn::Fc(_) => 2 * n.div_ceil(L::APPEND_GROUP),
+            ContextIn::Fuse { .. } => 1,
+        }
     }
 }
 

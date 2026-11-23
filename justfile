@@ -4676,6 +4676,16 @@ gate-inkling2-moe:
 gate-inkling2-e2e:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_e2e'
 
+# Inkling 2's DSpark draft on the card (gate_inkling2_draft's doc): the common owner over the draft's three layers (the group-3
+# block attention over its own context rows), the fused context and the anchor form of the recurrent head, its correction
+# folded through the target's Q8_0 output, beside the Mini's file in the target's shadow: per corpus, τ of a width-7
+# schedule over the greedy continuation (up to 1024 ids or its end of generation) within 15 % of the reference's. Real
+# tier only: the draft is the official folder's (the profile's DSPARK_HF), the prompts the reference tokenizer's ids under
+# $BLOOMERY_DATA/inkling2-draft-prompts. Wall [derived: the load under a minute, about thirteen thousand one-id target
+# steps and as many appends].
+gate-gpu-inkling2-draft:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/real-only.sh gate-gpu-inkling2-draft && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu,dspark-hf --release --bin gate_inkling2_draft && . tools/ref/ref-paths.sh && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_draft --draft "$DSPARK_HF" --prompts "$BLOOMERY_DATA/inkling2-draft-prompts"'
+
 # --- inkling2-ref (Inkling 2's oracle: the patched PR tree and its node dumps) --------------------------------------------------------
 # Inkling 2's oracle tree: llama.cpp PR #32695 at its head 6196d9802 (the naming the Mini's file uses) carrying tools/ref/inkling2-scale.patch —
 # upstream master's own a1f422260 ("model : load ffn_gate_up_exps scales", #32657) unedited, which the PR branch lacks: without it the loader

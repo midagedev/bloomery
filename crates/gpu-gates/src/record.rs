@@ -113,6 +113,9 @@ use bloomery_record::Ty::{Bool, Csv, F64, I64, List, Text, U64, Word};
 /// The node gate's optional timing record.
 pub static GATE_QWEN38_NODES: &[&Kind] = &[&TIER_COST];
 
+/// Inkling 2's draft gate's acceptance records.
+pub static GATE_INKLING2_DRAFT: &[&Kind] = &[&DRAFT_ACCEPTANCE];
+
 /// One warmed local or node tier sample on a fixed plan.
 pub static TIER_COST: Kind = Kind {
     name: "tier_cost",
@@ -2043,6 +2046,28 @@ pub static DRAFT_SUMMARY: Kind = Kind {
         opt("rates", Csv, "positions/ms"),
         opt("walk_ms", F64(3), "ms/id"),
         opt("closed", U64, "passes"),
+    ],
+};
+
+/// A block draft's acceptance in the shadow of a greedy target run over one corpus.
+pub static DRAFT_ACCEPTANCE: Kind = Kind {
+    name: "draft_acceptance",
+    head: "draft acceptance",
+    doc: "gate_inkling2_draft: one corpus's shadow run — the prompt's ids, the generated positions \
+          the draft proposed at (the continuation before its end), the blocks a speculative \
+          schedule ran over the target's greedy continuation at the draft's width, tau (one plus the \
+          mean ids a block accepted), the share of blocks accepting at least i ids for i = 1..width, \
+          tau over a proposal at every generated id, and the reference's tau the clause holds it to.",
+    parts: &[
+        key("corpus", Word, ""),
+        key("prompt", U64, "ids"),
+        key("proposals", U64, ""),
+        key("blocks", U64, ""),
+        key("width", U64, "ids"),
+        key("tau", F64(3), ""),
+        key("a", Csv, ""),
+        key("tau_every", F64(3), ""),
+        key("ref", F64(2), ""),
     ],
 };
 
@@ -5516,6 +5541,7 @@ mod tests {
             H2D_PROBE,
             LINK_PROBE,
             GATE_NVTIER,
+            GATE_INKLING2_DRAFT,
             groups::serve_client::SPAWN,
         ] {
             let mut names: Vec<&str> = set.iter().map(|k| k.name).collect();
@@ -6002,6 +6028,7 @@ mod tests {
             H2D_PROBE,
             LINK_PROBE,
             GATE_NVTIER,
+            GATE_INKLING2_DRAFT,
             groups::serve_client::SPAWN,
         ] {
             for &kind in set {

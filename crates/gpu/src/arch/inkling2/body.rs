@@ -43,6 +43,7 @@ use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs, MAX_NQ, MAX_VECS};
 use crate::attn_res_step::{AttnResStepKernels, MixStepScratch};
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
+use crate::draft_taps::DraftTaps;
 use crate::flash_gqa::{FlashGqaKernels, window_segments};
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
@@ -408,6 +409,9 @@ pub struct Body {
     messages: bool,
     /// Each visit's [`TAP_STAGES`] at the step's position, armed by [`Body::arm_taps`].
     taps: Option<DeviceBuffer<f32>>,
+    /// A block draft's taps ([`GpuModel::set_draft_taps`]): the rows entering the visits it
+    /// names, and the visit count for the final normed row.
+    draft: Option<DraftTaps>,
     /// Each visit's routed ids and weights from the host, armed by [`Body::force_picks`].
     forced: Option<Forced>,
     /// The position the stores stand at: the next step's or pass's.
@@ -422,6 +426,41 @@ pub struct Body {
 }
 
 impl GpuModel<Body> {
+    /// Tap the rows entering `visits` (strictly rising, each at most the visit count; the visit
+    /// count is the final normed row) from the next step on, one row a tap; empty stops tapping.
+    /// The captured step is dropped first, so the next one records the copies.
+    pub fn set_draft_taps(&mut self, visits: &[usize]) -> Result<(), GpuError> {
+        const WHAT_S: &str = "inkling2::set_draft_taps";
+        self.drop_captures();
+        let (gpu, _, body) = self.body_parts(WHAT_S)?;
+        body.draft = None;
+        if visits.is_empty() {
+            return Ok(());
+        }
+        let free = gpu.alloc_room()?;
+        let mut t = DraftTaps::new(
+            gpu.stream(),
+            visits,
+            body.visits.len() + 1,
+            (body.d.n, 1),
+            free,
+        )?;
+        t.plan(1);
+        body.draft = Some(t);
+        Ok(())
+    }
+
+    /// The last step's tapped row, the taps in the order they were named. Blocking; refused by
+    /// name with no taps set.
+    pub fn draft_taps(&mut self) -> Result<Vec<f32>, GpuError> {
+        const WHAT_T: &str = "inkling2::draft_taps";
+        let (gpu, _, body) = self.body_parts(WHAT_T)?;
+        body.draft
+            .as_ref()
+            .ok_or(GpuError::state(WHAT_T, "taps set (set_draft_taps)"))?
+            .read(gpu.stream(), 0, 1)
+    }
+
     /// The whole model of `file` resident on `gpu`, plus the output head: the dense sites and the
     /// f32 tables as the file holds them, each routed layer's fused gate·up stack split at upload
     /// into its gate and up halves (a Q8_0 layer's stacks in the leg's blocks first), the visits'
@@ -776,6 +815,7 @@ impl Body {
             ring,
             messages: true,
             taps: None,
+            draft: None,
             forced: None,
             held: 0,
             end: 0,
@@ -940,6 +980,7 @@ impl Body {
             + self.step_in.bytes()
             + self.k.kgemv.device_bytes()
             + self.taps.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.draft.as_ref().map_or(0, DraftTaps::bytes)
             + self
                 .layers
                 .iter()
@@ -960,6 +1001,7 @@ impl Body {
             step_in,
             messages,
             taps,
+            draft,
             forced,
             ctx,
             ..
@@ -1010,6 +1052,11 @@ impl Body {
             {
                 walk.pass_edge(v.pass)?;
             }
+            if let Some(t) = draft.as_mut()
+                && let Some(i) = t.slot(slot)
+            {
+                t.enter(gpu.stream(), i, &walk.s.x, 1)?;
+            }
             let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
             walk.attn_half(slot, (l, layer), &mut stores[slot], msg)?;
             walk.ffn_front(slot, layer, msg)?;
@@ -1023,7 +1070,13 @@ impl Body {
             visits.len(),
             head,
             (hp.softcap, hp.n_vocab_unpadded, hp.n_vocab),
-        )
+        )?;
+        if let Some(t) = draft.as_mut()
+            && let Some(i) = t.slot(visits.len())
+        {
+            t.enter(gpu.stream(), i, head.normed(), 1)?;
+        }
+        Ok(())
     }
 }
 

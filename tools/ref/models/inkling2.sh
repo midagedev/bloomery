@@ -24,6 +24,8 @@
 #           plain head), the CPU build `just build-inkling2-lcpp` writes; the oracle
 #           (tools/ref/inkling2-dump.sh) and the prompts' ids (crates/tokenizer/tools/
 #           inkling2-oracle.sh) both come from it.
+#   DSPARK_HF the official checkpoint folder whose config.json and mtp.safetensors are the DSpark draft
+#           gate-gpu-inkling2-draft reads beside MODEL; BLOOMERY_INKLING2_HF moves it.
 #   The fixture the fixture tier's model: thirteen layers of the Mini — the stem block whole, one
 #           whole core block, a coda layer of the Q8_0 experts — at the experts narrowed to 512,
 #           crates/model/src/arch/inkling2/fixture.rs `spec`, planted by:
@@ -37,3 +39,4 @@ MODEL_NAME=inkling2
 : "${IK:=/home/user/ik-idxkey}"
 : "${LCPP:=/home/user/llama.cpp-pr32695-scale}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf}
+DSPARK_HF=${BLOOMERY_INKLING2_HF:-/models/Inkling-2-Mini}

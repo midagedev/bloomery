@@ -31,11 +31,17 @@
 //! [`super::rnn`]'s loop: a state carried down the rows, the correction
 //! from it, the argmax; six launches a row, the module doc's order. Its
 //! tables are Q8_0 rows over the target's vocabulary; it takes no map. The
-//! loop launches one form of the row ([`RnnTail::ROW`]); a shape of another
-//! form is refused by name.
+//! loop launches two forms of the row, Mistral Large 4's ([`RnnTail::ROW`])
+//! and Inkling 2's ([`RnnTail::ANCHOR`]: the anchor start, the head's context
+//! row in the joint input, the folded correction and its constant, the soft
+//! cap on the sum, `super::rnn`'s anchor form); a shape of another form is
+//! refused by name.
 //!
-//! Three heads run: the target's Q6_K matrix over the target's vocabulary
-//! (V4.1's draft), the draft's own Q8_0 rows over the same vocabulary, and
+//! Five heads run: the target's Q6_K matrix over the target's vocabulary
+//! (V4.1's draft), the target's resident Q8_0 or BF16 matrix in place over
+//! its first `n_head` rows (Inkling 2's draft over the target's unpadded
+//! ids; the f32 rows go straight to the row kernel, no quantizer), the
+//! draft's own Q8_0 rows over the same vocabulary, and
 //! the draft's own rows over a reduced one. A reduced head scores `n_head`
 //! ids, `markov_w2` and the logits have `n_head` rows, `markov_w1` has the
 //! target's `n_prev`, and [`HeadWeights::to_target`] gives each head id its
@@ -43,8 +49,8 @@
 //! after the first index `markov_w1` by their previous token's target id. The
 //! head returns head ids ([`Head::tokens`], [`Head::tokens_p`]); the owner
 //! maps them to target ids. [`Head::n_vocab`] counts the logits' rows,
-//! `n_head`. The target's Q8_0 matrix, and any map over the target's matrix
-//! (no file needs one), are refused by name.
+//! `n_head`. A copy of the target's Q8_0 matrix, and any map over the
+//! target's matrix (no file needs one), are refused by name.
 //!
 //! # The selector
 //!
@@ -105,7 +111,7 @@
 
 use crate::elem::ElemKernels;
 use crate::mtp::{ArgmaxPArgs, MtpKernels};
-use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
+use crate::q8f32::{Bf16GemvMcolArgs, GemvOut, Q8_0GemvMcolArgs};
 use crate::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, Q8Act, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread};
@@ -115,7 +121,7 @@ use std::sync::Arc;
 use runtime::dspark::{BaseHead, DraftVocab, HeadKind, RnnCap, RnnOut, RnnRow, RnnStart};
 use runtime::selector::{Lattice, SelectorError, walk_p};
 
-use super::rnn::{self, RnnInputArgs, RnnKernels};
+use super::rnn::{self, RnnAnchorArgs, RnnInputArgs, RnnKernels};
 use super::selector::{self, SelectArgs, Selector, SelectorTail};
 use super::{HeadSource, Q8Rows, TargetHead};
 
@@ -149,21 +155,31 @@ pub enum HeadTail {
 /// target's vocabulary.
 pub struct RnnTail {
     /// `markov_w1`: one Q8_0 row of `rank` values per target id (the previous
-    /// token).
+    /// token); at least a row per head id.
     pub w1: Q8Rows,
-    /// `markov_w2`: one Q8_0 row of `rank` values per head id.
+    /// The correction's rows, one Q8_0 row of `rank` values per head id: the
+    /// file's `markov_w2`, or the folded `W2 = output · hidden_out`
+    /// ([`super::fold`]).
     pub w2: Q8Rows,
-    /// `joint_proj`: `3 · rank` Q8_0 rows over `2 · rank + hidden` values.
+    /// `joint_proj`: `3 · rank` Q8_0 rows over the row form's joint input
+    /// ([`RnnRow::joint_in`]).
     pub joint: Q8Rows,
     /// `joint_proj.bias`: `3 · rank` values.
     pub joint_b: DeviceBuffer<f32>,
-    /// The soft cap on the projection's logits, which the correction does
-    /// not take; `None` for a file that states none.
+    /// The soft cap: on the projection's logits under [`RnnTail::ROW`] (the
+    /// correction does not take it), on the sum under [`RnnTail::ANCHOR`];
+    /// `None` for a file that states none.
     pub softcap: Option<f32>,
+    /// The row form the loop launches: [`RnnTail::ROW`] or
+    /// [`RnnTail::ANCHOR`].
+    pub row: RnnRow,
+    /// The folded correction's constant `c = output · b`, one value per head
+    /// id: [`RnnTail::ANCHOR`]'s; `None` under [`RnnTail::ROW`].
+    pub c: Option<DeviceBuffer<f32>>,
 }
 
 impl RnnTail {
-    /// The row form the loop launches: row 0 drafts, the joint row holds no
+    /// Mistral Large 4's row form: row 0 drafts, the joint row holds no
     /// context row, the cap is on the projection's logits and the correction
     /// is the file's own `markov_w2`.
     pub const ROW: RnnRow = RnnRow {
@@ -173,24 +189,59 @@ impl RnnTail {
         out: RnnOut::Own,
     };
 
+    /// Inkling 2's row form: the loop starts after the anchor, the joint row
+    /// holds the head's context row, the cap is on the sum and the correction
+    /// runs through the target's output matrix, folded at load.
+    pub const ANCHOR: RnnRow = RnnRow {
+        start: RnnStart::Anchor,
+        ctx: true,
+        cap: RnnCap::Sum,
+        out: RnnOut::Hidden,
+    };
+
     /// The state's values: `markov_w1`'s row length.
     #[must_use]
     pub fn rank(&self) -> usize {
         self.w1.d.cols() * 32
     }
 
+    /// The loop's first row: 0, or 1 after the anchor.
+    #[must_use]
+    pub fn start(&self) -> usize {
+        match self.row.start {
+            RnnStart::Row0 => 0,
+            RnnStart::Anchor => 1,
+        }
+    }
+
     /// Refuse by name tables the loop has no launch for, over a head of
-    /// `n_head` ids and rows of `hidden` values: both Markov tables a row per
-    /// id of `rank` values, `joint_proj` and its bias of `3 · rank` rows over
-    /// `2 · rank + hidden`, a soft cap that is finite and not 0.
+    /// `n_head` ids and rows of `hidden` values: a row form the loop launches,
+    /// `markov_w1` of at least a row per id and the correction a row per id,
+    /// both of `rank` values, `joint_proj` and its bias of `3 · rank` rows over
+    /// the form's joint input, a soft cap that is finite and not 0, and the
+    /// anchor form's constant of a value per id and its cap.
     fn check(&self, n_head: usize, hidden: usize) -> Result<(), GpuError> {
         let refuse = |detail: String| GpuError::shape(WHAT, detail);
         let rank = self.rank();
+        if self.row != RnnTail::ROW && self.row != RnnTail::ANCHOR {
+            return Err(refuse(format!(
+                "a recurrent row {:?}: the loop launches {:?} and {:?}",
+                self.row,
+                RnnTail::ROW,
+                RnnTail::ANCHOR
+            )));
+        }
         let q8 = |q: &Q8Rows| (q.d.rows(), q.d.cols() * 32, q.qs.rows(), q.qs.cols());
+        let w1_rows = self.w1.d.rows().max(n_head);
         for (name, t, rows, k) in [
-            ("markov_w1", &self.w1, n_head, rank),
+            ("markov_w1", &self.w1, w1_rows, rank),
             ("markov_w2", &self.w2, n_head, rank),
-            ("joint_proj", &self.joint, 3 * rank, 2 * rank + hidden),
+            (
+                "joint_proj",
+                &self.joint,
+                3 * rank,
+                self.row.joint_in(rank, hidden),
+            ),
         ] {
             let (d_rows, d_k, qs_rows, qs_cols) = q8(t);
             if rank == 0 || d_rows != rows || d_k != k || qs_rows != rows || qs_cols != k / 4 {
@@ -213,7 +264,22 @@ impl RnnTail {
                 "a logit soft cap of {cap}: finite and not 0"
             )));
         }
-        Ok(())
+        match (self.row == RnnTail::ANCHOR, &self.c) {
+            (true, Some(c)) if c.len() == n_head && self.softcap.is_some() => Ok(()),
+            (true, Some(c)) => Err(refuse(format!(
+                "the anchor form's constant of {} values over {n_head} ids, cap {:?}: a value \
+                 per id and a cap",
+                c.len(),
+                self.softcap
+            ))),
+            (true, None) => Err(refuse(
+                "the anchor form without its folded constant c = output · b".into(),
+            )),
+            (false, Some(_)) => Err(refuse(
+                "a folded constant on the file's own markov_w2: the form adds none".into(),
+            )),
+            (false, None) => Ok(()),
+        }
     }
 
     /// The device bytes of each table buffer, as allocated: `markov_w1`'s
@@ -225,6 +291,9 @@ impl RnnTail {
             out.push(q.d.buf().num_bytes() as u64);
         }
         out.push(self.joint_b.num_bytes() as u64);
+        if let Some(c) = &self.c {
+            out.push(c.num_bytes() as u64);
+        }
         out
     }
 }
@@ -340,7 +409,7 @@ impl HeadWeights {
             },
             HeadTail::MarkovRnn(t) => HeadKind::MarkovRnn {
                 rank: t.rank(),
-                row: RnnTail::ROW,
+                row: t.row,
             },
         }
     }
@@ -422,10 +491,10 @@ impl HeadWeights {
                         t.rank()
                     )));
                 }
-                if *row != RnnTail::ROW {
+                if *row != t.row {
                     return Err(refuse(format!(
-                        "a recurrent row {row:?}: the loop launches {:?}",
-                        RnnTail::ROW
+                        "a recurrent row {row:?} over tables of the row {:?}",
+                        t.row
                     )));
                 }
                 match vocab {
@@ -897,6 +966,9 @@ pub struct Head {
     sel: Option<Selector>,
     /// The recurrent loop's kernels and buffers: the recurrent kind's alone.
     rnn: Option<Rnn>,
+    /// The head's context row, `hidden` values: a recurrent head whose joint
+    /// row reads one ([`RnnTail::ANCHOR`]). The owner's append writes it.
+    ctx: Option<DeviceBuffer<f32>>,
 }
 
 impl Head {
@@ -931,14 +1003,49 @@ impl Head {
                 }
                 let base = target.base();
                 BaseHead::plan(base.matrix, base.place).map_err(|e| refuse(e.to_string()))?;
-                let Some(proj) = target.q6k() else {
-                    return Err(refuse(format!(
-                        "a {:?} target matrix {:?}: the head chain launches its projection on \
-                         Q6_K",
-                        base.matrix, base.place
-                    )));
-                };
-                proj.rows()
+                match target {
+                    TargetHead::Q6K(w) => w.rows(),
+                    TargetHead::Q6KInPlace(p) => p.w.rows(),
+                    TargetHead::Q8_0InPlace { qs, d } => {
+                        let (qs, d) = (&qs.w, &d.w);
+                        if qs.rows() == 0
+                            || qs.rows() != d.rows()
+                            || qs.cols() * 4 != hidden
+                            || d.cols() * 32 != hidden
+                        {
+                            return Err(refuse(format!(
+                                "a Q8_0 target matrix of {}x{} words and {}x{} scales; \
+                                 {hidden}-wide rows need n x {} words and n x {} scales",
+                                qs.rows(),
+                                qs.cols(),
+                                d.rows(),
+                                d.cols(),
+                                hidden / 4,
+                                hidden / 32
+                            )));
+                        }
+                        qs.rows()
+                    }
+                    TargetHead::Bf16InPlace(p) => {
+                        if p.w.rows() == 0 || p.w.cols() * 2 != hidden {
+                            return Err(refuse(format!(
+                                "a BF16 target matrix of {}x{} words; {hidden}-wide rows need \
+                                 n x {}",
+                                p.w.rows(),
+                                p.w.cols(),
+                                hidden / 2
+                            )));
+                        }
+                        p.w.rows()
+                    }
+                    TargetHead::Q8_0(_) => {
+                        return Err(refuse(format!(
+                            "a {:?} target matrix {:?}: the head chain reads a Q8_0 matrix in \
+                             place",
+                            base.matrix, base.place
+                        )));
+                    }
+                }
             }
             HeadSource::Own(q) => {
                 let (qs, d) = (&q.qs, &q.d);
@@ -984,7 +1091,7 @@ impl Head {
                     None,
                     Some(Rnn {
                         k: RnnKernels::load(gpu.context())?,
-                        x: DeviceBuffer::zeroed(s, 2 * rank + hidden)?,
+                        x: DeviceBuffer::zeroed(s, t.row.joint_in(rank, hidden))?,
                         joint: DeviceBuffer::zeroed(s, 3 * rank)?,
                         state: DeviceBuffer::zeroed(s, rank)?,
                         e: DeviceBuffer::zeroed(s, rank)?,
@@ -994,10 +1101,14 @@ impl Head {
             }
         };
         let acts = match &w.source {
-            HeadSource::Target(_) => (1..=rows)
+            HeadSource::Target(target) if target.q6k().is_some() => (1..=rows)
                 .map(|m| Q8Act::with_k(s, m, hidden))
                 .collect::<Result<Vec<_>, _>>()?,
-            HeadSource::Own(_) => Vec::new(),
+            HeadSource::Target(_) | HeadSource::Own(_) => Vec::new(),
+        };
+        let ctx = match &w.tail {
+            HeadTail::MarkovRnn(t) if t.row.ctx => Some(DeviceBuffer::zeroed(s, hidden)?),
+            _ => None,
         };
         Ok(Head {
             markov: MarkovKernels::load(gpu.context())?,
@@ -1014,8 +1125,29 @@ impl Head {
             n_head,
             sel,
             rnn,
+            ctx,
             w,
         })
+    }
+
+    /// The head's context row, when its joint row reads one.
+    #[must_use]
+    pub fn ctx_row(&self) -> Option<&DeviceBuffer<f32>> {
+        self.ctx.as_ref()
+    }
+
+    /// The head's context row, writable: the owner's append writes it.
+    pub fn ctx_row_mut(&mut self) -> Option<&mut DeviceBuffer<f32>> {
+        self.ctx.as_mut()
+    }
+
+    /// Launches of the norm and the projection: the quantizer between them
+    /// on the Q6_K matrix, none on a Q8_0 or BF16 one.
+    fn logit_launches(&self) -> usize {
+        match &self.w.source {
+            HeadSource::Target(t) if t.q6k().is_some() => Head::LOGIT_LAUNCHES,
+            HeadSource::Target(_) | HeadSource::Own(_) => Head::LOGIT_LAUNCHES - 1,
+        }
     }
 
     /// Rows of the logits: the ids the head scores. A reduced head's is its
@@ -1048,6 +1180,9 @@ impl Head {
             HeadTail::Markov(_) => Head::launches(m),
             HeadTail::Selector(_) if m == 1 => Head::LOGIT_LAUNCHES,
             HeadTail::Selector(_) => Head::LOGIT_LAUNCHES + selector::LAUNCHES,
+            HeadTail::MarkovRnn(t) if t.row == RnnTail::ANCHOR => {
+                self.logit_launches() + rnn::ROW_LAUNCHES * m.saturating_sub(t.start())
+            }
             HeadTail::MarkovRnn(t) => {
                 Head::LOGIT_LAUNCHES + usize::from(t.softcap.is_some()) + rnn::ROW_LAUNCHES * m
             }
@@ -1116,6 +1251,7 @@ impl Head {
             + self.no_map.num_bytes()) as u64
             + self.sel.as_ref().map_or(0, Selector::scratch_bytes)
             + self.rnn.as_ref().map_or(0, Rnn::bytes)
+            + self.ctx.as_ref().map_or(0, |c| c.num_bytes() as u64)
     }
 
     /// Refuse a row count the head holds no scratch for.
@@ -1152,6 +1288,29 @@ impl Head {
             &mut self.normed,
         )?;
         match &self.w.source {
+            HeadSource::Target(TargetHead::Q8_0InPlace { qs, d }) => {
+                gpu.q8f32().enqueue_q8_0_gemv_mcol(
+                    s,
+                    Q8_0GemvMcolArgs {
+                        qs: &qs.w,
+                        d: &d.w,
+                        x: &self.normed,
+                        m,
+                        out: GemvOut::RowMajor,
+                        y: &mut self.logits,
+                    },
+                )
+            }
+            HeadSource::Target(TargetHead::Bf16InPlace(p)) => gpu.q8f32().enqueue_bf16_gemv_mcol(
+                s,
+                Bf16GemvMcolArgs {
+                    w: &p.w,
+                    x: &self.normed,
+                    m,
+                    out: GemvOut::RowMajor,
+                    y: &mut self.logits,
+                },
+            ),
             HeadSource::Target(target) => {
                 let proj = target.q6k().ok_or(GpuError::State {
                     what: WHAT,
@@ -1273,9 +1432,11 @@ impl Head {
     }
 
     /// Enqueue the recurrent loop over the `m` rows' logits ([`super::rnn`]),
-    /// row 0's previous token `first[0]` (a target id), after the soft cap
-    /// when the tail carries one: that cap's launch, then `m` rows of
-    /// [`rnn::ROW_LAUNCHES`]. A head of another kind is refused by name.
+    /// the first row's previous token `first[0]` (a target id). Under
+    /// [`RnnTail::ROW`], after the soft cap when the tail carries one: that
+    /// cap's launch, then `m` rows of [`rnn::ROW_LAUNCHES`]. Under
+    /// [`RnnTail::ANCHOR`], rows `1..m` of [`rnn::ROW_LAUNCHES`], the cap in
+    /// each row's add. A head of another kind is refused by name.
     /// Asynchronous, allocation-free, capturable.
     pub fn enqueue_rnn(
         &mut self,
@@ -1292,6 +1453,7 @@ impl Head {
             tok,
             hidden,
             n_head,
+            ctx,
             ..
         } = self;
         let (HeadTail::MarkovRnn(t), Some(r)) = (&w.tail, rnn.as_mut()) else {
@@ -1302,29 +1464,37 @@ impl Head {
         };
         let (s, n_head, hidden, rank) = (gpu.stream(), *n_head, *hidden, t.rank());
         let fault = gpu.unlabelled_sink();
-        if let Some(cap) = t.softcap {
+        let anchor = t.row == RnnTail::ANCHOR;
+        if !anchor && let Some(cap) = t.softcap {
             gpu.elem()
                 .enqueue_softcap_rows(s, logits, n_head * m, cap)?;
         }
-        for row in 0..m {
-            r.k.enqueue_input(
-                s,
-                RnnInputArgs {
-                    w1_qs: t.w1.qs.buf(),
-                    w1_d: t.w1.d.buf(),
-                    n_prev: t.w1.d.rows(),
-                    rank,
-                    first,
-                    tok: &*tok,
-                    state: &r.state,
-                    normed: &*normed,
-                    hidden,
-                    m,
-                    row,
-                    fault,
-                    x: &mut r.x,
-                },
-            )?;
+        let start = t.start();
+        for row in start..m {
+            let base = RnnInputArgs {
+                w1_qs: t.w1.qs.buf(),
+                w1_d: t.w1.d.buf(),
+                n_prev: t.w1.d.rows(),
+                rank,
+                first,
+                tok: &*tok,
+                state: &r.state,
+                normed: &*normed,
+                hidden,
+                m,
+                row,
+                fault,
+                x: &mut r.x,
+            };
+            if anchor {
+                let ctx = ctx.as_ref().ok_or(GpuError::State {
+                    what: WHAT,
+                    missing: "the anchor form's context row",
+                })?;
+                r.k.enqueue_input_anchor(s, RnnAnchorArgs { base, ctx, start })?;
+            } else {
+                r.k.enqueue_input(s, base)?;
+            }
             gpu.q8f32().enqueue_q8_0_gemv_mcol(
                 s,
                 Q8_0GemvMcolArgs {
@@ -1348,7 +1518,18 @@ impl Head {
                     y: &mut r.delta,
                 },
             )?;
-            r.k.enqueue_add(s, &r.delta, n_head, m, row, logits)?;
+            match (anchor, &t.c, t.softcap) {
+                (true, Some(c), Some(cap)) => {
+                    r.k.enqueue_add_cap(s, &r.delta, c, n_head, m, row, cap, logits)?;
+                }
+                (true, _, _) => {
+                    return Err(GpuError::State {
+                        what: WHAT,
+                        missing: "the anchor form's constant and cap",
+                    });
+                }
+                (false, _, _) => r.k.enqueue_add(s, &r.delta, n_head, m, row, logits)?,
+            }
             gpu.elem()
                 .enqueue_argmax_rows_fault(s, &*logits, n_head, m, fault, tok)?;
         }
@@ -1474,5 +1655,198 @@ impl Head {
             .chain(taken.iter().map(|t| t.p))
             .collect();
         Ok((ids, p))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dspark::InPlace;
+    use crate::dspark::dense::upload_blocks;
+    use crate::dspark::fold::{fold, fold_sigma};
+    use gguf::quant::{Q8Block, half_to_f32, quantize_q8_0};
+
+    const H: usize = 256;
+    const R: usize = 64;
+    /// Scored ids: the head's window on a matrix of [`PAD`] rows.
+    const N: usize = 1000;
+    const PAD: usize = 1024;
+    const M: usize = 8;
+    const CAP: f32 = 30.0;
+
+    /// A seeded value in [-1, 1).
+    fn lcg(seed: &mut u64) -> f32 {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (*seed >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+    }
+
+    /// `rows` rows of `k` seeded values times `amp`, quantized to Q8_0: the blocks and their
+    /// values as the card reads them.
+    fn q8(seed: &mut u64, rows: usize, k: usize, amp: f32) -> (Vec<Q8Block>, Vec<f64>) {
+        let mut blocks = Vec::with_capacity(rows * k / 32);
+        let mut deq = Vec::with_capacity(rows * k);
+        let mut v = [0f32; 32];
+        for _ in 0..rows * k / 32 {
+            for x in &mut v {
+                *x = amp * lcg(seed);
+            }
+            let b = quantize_q8_0(&v);
+            let d = f64::from(half_to_f32(b.d));
+            deq.extend(b.q.iter().map(|&q| d * f64::from(q)));
+            blocks.push(b);
+        }
+        (blocks, deq)
+    }
+
+    fn dot(a: &[f64], b: &[f64]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    /// The anchor form of the recurrent head against its rule on the host in f64 with the
+    /// correction unfolded, `output · (hidden_out · e + b)` where the card reads the folded
+    /// `W2 · e + c` ([`super::super::fold`]). Row 0 is the anchor: its logits are the projection's,
+    /// which the loop leaves alone. Each later row runs from the state 0 and the anchor id
+    /// (`first[0]`) on row 1 and the card's own previous id after, and its logits are
+    /// `cap · tanh((base + bias) / cap)` within the fold's band: six times `fold_sigma` over that
+    /// id's row of `W2` (the requantization's error, uniform within half a step, as a normal sum
+    /// over the rank), plus the device tanh's 2^-10 of the value and 1e-4 of f32 sums.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_anchor_rnn_head_is_the_host_rule() {
+        let gpu = Gpu::with_device(0).expect("a Gpu on device 0");
+        let s = gpu.stream();
+        let mut seed = 0x1234_5678u64;
+        let (out_blocks, out) = q8(&mut seed, PAD, H, 0.05);
+        let target = upload_blocks(&gpu, &out_blocks, PAD, H).expect("the target's output");
+        let ho: Vec<f32> = (0..H * R).map(|_| 0.1 * lcg(&mut seed)).collect();
+        let hb: Vec<f32> = (0..H).map(|_| 0.5 * lcg(&mut seed)).collect();
+        let (w1_blocks, w1) = q8(&mut seed, PAD, R, 0.5);
+        let k = 2 * R + 2 * H;
+        let (j_blocks, joint) = q8(&mut seed, 3 * R, k, 0.05);
+        let jb: Vec<f32> = (0..3 * R).map(|_| 0.1 * lcg(&mut seed)).collect();
+        let gain: Vec<f32> = (0..H).map(|_| 1.0 + 0.1 * lcg(&mut seed)).collect();
+        let x: Vec<f32> = (0..M * H).map(|_| lcg(&mut seed)).collect();
+        let ctx: Vec<f32> = (0..H).map(|_| lcg(&mut seed)).collect();
+        let first = 7u32;
+
+        // SAFETY: `target` lives to the end of the test, past the head and every launch.
+        let source = unsafe {
+            TargetHead::Q8_0InPlace {
+                qs: InPlace::rows(&target.qs, N, gpu.context()).expect("qs"),
+                d: InPlace::rows(&target.d, N, gpu.context()).expect("d"),
+            }
+        };
+        let folded = fold(&gpu, &source, &ho, &hb, H, R).expect("the fold");
+        let w2_scales: Vec<f32> = folded
+            .w2
+            .d
+            .buf()
+            .to_host_vec(s)
+            .expect("W2's scales")
+            .into_iter()
+            .map(half_to_f32)
+            .collect();
+        let w = HeadWeights {
+            norm: DeviceTensor::upload(s, &gain, 1, H).expect("norm"),
+            eps: 1e-6,
+            source: HeadSource::Target(source),
+            tail: HeadTail::MarkovRnn(RnnTail {
+                w1: upload_blocks(&gpu, &w1_blocks, PAD, R).expect("w1"),
+                w2: folded.w2,
+                joint: upload_blocks(&gpu, &j_blocks, 3 * R, k).expect("joint"),
+                joint_b: DeviceBuffer::from_host(s, &jb).expect("joint b"),
+                softcap: Some(CAP),
+                row: RnnTail::ANCHOR,
+                c: Some(folded.c),
+            }),
+        };
+        let mut head = Head::new(&gpu, w, H, M).expect("the head");
+        head.ctx_row_mut()
+            .expect("the anchor form's context row")
+            .copy_from_host(s, &ctx)
+            .expect("ctx");
+        let xd = DeviceBuffer::from_host(s, &x).expect("x");
+        let fd = DeviceBuffer::from_host(s, &[first]).expect("first");
+        head.enqueue_logits(&gpu, &xd, M).expect("logits");
+        head.enqueue_rnn(&gpu, M, &fd).expect("the loop");
+        let got = head.logits(s, M).expect("logits back");
+        let tok = head.tokens(s, M).expect("ids back");
+
+        let normed: Vec<Vec<f64>> = x
+            .as_chunks::<H>()
+            .0
+            .iter()
+            .map(|row| {
+                let ms = row.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / H as f64;
+                let sc = 1.0 / (ms + 1e-6).sqrt();
+                row.iter()
+                    .zip(&gain)
+                    .map(|(&v, &g)| f64::from(v) * sc * f64::from(g))
+                    .collect()
+            })
+            .collect();
+        let at = |v: usize, t: usize| f64::from(got[v * M + t]);
+        let base = |v: usize, t: usize| dot(&out[v * H..][..H], &normed[t]);
+
+        let worst0 = (0..N)
+            .map(|v| (at(v, 0) - base(v, 0)).abs())
+            .fold(0.0, f64::max);
+        println!("anchor row: max |card - projection| {worst0:.2e}");
+        assert!(
+            worst0 <= 1e-4,
+            "row 0 (the anchor) is {worst0:.3e} off the projection's logits: the loop ran on it"
+        );
+
+        let ho: Vec<f64> = ho.iter().map(|&v| f64::from(v)).collect();
+        let ctx: Vec<f64> = ctx.iter().map(|&v| f64::from(v)).collect();
+        let mut state = vec![0f64; R];
+        let mut worst = (0.0f64, 0, 0, 0.0, 0.0, 0.0);
+        for t in 1..M {
+            let prev = if t == 1 { first } else { tok[t - 1] } as usize;
+            let input: Vec<f64> = state
+                .iter()
+                .chain(&w1[prev * R..][..R])
+                .chain(&normed[t])
+                .chain(&ctx)
+                .copied()
+                .collect();
+            let a: Vec<f64> = (0..3 * R)
+                .map(|r| dot(&joint[r * k..][..k], &input) + f64::from(jb[r]))
+                .collect();
+            let e: Vec<f64> = (0..R)
+                .map(|r| {
+                    let g = 1.0 / (1.0 + (-a[r]).exp());
+                    let c = a[R + r].tanh();
+                    state[r] = c + g * (state[r] - c);
+                    a[2 * R + r].tanh()
+                })
+                .collect();
+            let corr: Vec<f64> = (0..H)
+                .map(|i| dot(&ho[i * R..][..R], &e) + f64::from(hb[i]))
+                .collect();
+            let e32: Vec<f32> = e.iter().map(|&v| v as f32).collect();
+            for v in 0..N {
+                let sum = base(v, t) + dot(&out[v * H..][..H], &corr);
+                let want = f64::from(CAP) * (sum / f64::from(CAP)).tanh();
+                let band = 6.0 * fold_sigma(&w2_scales[v * (R / 32)..][..R / 32], &e32)
+                    + want.abs() / 1024.0
+                    + 1e-4;
+                let err = (at(v, t) - want).abs();
+                if err / band > worst.0 {
+                    worst = (err / band, t, v, at(v, t), want, band);
+                }
+            }
+        }
+        let (ratio, t, v, card, want, band) = worst;
+        println!(
+            "rows 1..{M}: worst |card - unfolded| / band {ratio:.3} (row {t} id {v}: {card:.5} \
+             against {want:.5}, band {band:.2e})"
+        );
+        assert!(
+            ratio <= 1.0,
+            "row {t} id {v}: the card's {card} against the unfolded rule's {want}, band {band:.3e}"
+        );
     }
 }
