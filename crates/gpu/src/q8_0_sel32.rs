@@ -30,11 +30,21 @@
 //! before their first load and raise nothing. Any other id at or past the
 //! stack's expert count raises [`FaultSite::ExpertId`] first (warp-uniform);
 //! the slot's rows of `y` stay as they were.
+//!
+//! Runs. `q8_0_gemv_sel32_cols` and `q8_0_gate_up_sel_cols` (the K-quant
+//! family's Walk A gate·up of a Q8_0 stack, `kq_gate_up_act_q8_0`) serve a run
+//! of tokens whose slots can name one expert: the first slot naming an expert
+//! writes every slot naming it, so each distinct expert's rows leave memory
+//! once a run, and each slot's row is its slot-local entry's walk, bit for bit.
 
 use crate::cores::half_to_f32;
 use crate::fault::{FaultSink, FaultSite};
 use crate::hybrid::HOST;
-use crate::kquant::q8_0::q8_0_code;
+use crate::kquant::act;
+use crate::kquant::q8_0::{Q8_0, q8_0_code};
+use crate::kquant::sel::{Fmt, GateUpAct, gate_up_dims, walk_a_planes};
+use crate::kquant::walk::row_dot_1col;
+use crate::mxfp4_sel::names_before;
 use crate::q5::{Q8Blocks32, q5_a_chain};
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -221,6 +231,238 @@ mod q8_0_sel32_kernels {
             }
         }
     }
+
+    /// [`q8_0_gemv_sel32`] over a run whose slots can name one expert
+    /// (module doc): warp row `n = slot · rows_per_expert + r` returns when
+    /// an earlier slot names its expert; otherwise it writes row `r` of every
+    /// slot `s >= slot` naming that expert, `y[s · rows_per_expert + r]`
+    /// against column `s` by [`q8_0_row_dot32`] and the warp tree, the
+    /// slot-local entry's bits. Ids: module doc.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            2 * w.len() >= n_experts * rows_per_expert * 17 * k_blocks,
+            q.len() >= n_slots * q_stride,
+            d8.len() >= n_slots * k_blocks,
+            sel.len() >= n_slots,
+            y.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q8_0_gemv_sel32_cols(
+        w: &[u32],
+        q: &[u32],
+        d8: &[f32],
+        sel: &[u32],
+        k_blocks: u32,
+        q_stride: u32,
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        fault: FaultSink,
+        mut y: DisjointSlice<f32>,
+    ) {
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        let rpe = rows_per_expert as usize;
+        if row >= n_slots as usize * rpe {
+            return;
+        }
+        let slot = row / rpe;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform, so the returns below never diverge a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+            }
+            return;
+        }
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; every
+        // lane reads the same `id` and `slot`.
+        if unsafe { names_before(sel, id, slot, lane) } {
+            return;
+        }
+        let r = row % rpe;
+        let row_abs = id as usize * rpe + r;
+        let n_slots = n_slots as usize;
+        let mut i0 = slot;
+        while i0 < n_slots {
+            let i = i0 + lane;
+            // SAFETY: i < n_slots <= sel.len() by the launch contract.
+            let mut hits = warp::ballot(i < n_slots && unsafe { *sel.get_unchecked(i) } == id);
+            while hits != 0 {
+                let at = i0 + hits.trailing_zeros() as usize;
+                hits &= hits - 1;
+                // SAFETY: as q8_0_gemv_sel32's for slot `at` < n_slots: the
+                // expert's row inside the stream, column at < n_slots of the
+                // activation at the host's q_stride.
+                let f0 = unsafe {
+                    q8_0_row_dot32(
+                        w,
+                        q,
+                        d8,
+                        k_blocks as usize,
+                        q_stride as usize,
+                        row_abs,
+                        at,
+                        lane,
+                    )
+                };
+                let s0 = warp::reduce_sum_f32(f0);
+                if lane == 0 {
+                    // SAFETY: at · rpe + r < n_slots · rows_per_expert <=
+                    // y.len() by the launch contract; slot `at` names this
+                    // warp's expert and this warp is its first slot, so lane 0
+                    // here is the row's only writer.
+                    unsafe { *y.get_unchecked_mut(at * rpe + r) = s0 };
+                }
+            }
+            i0 += 32;
+        }
+    }
+
+    /// The Q8_0 Walk A gate·up (`kq_gate_up_act_q8_0`) over a run whose
+    /// slots can name one expert (module doc): warp row `n = slot ·
+    /// rows_per_expert + r` returns when an earlier slot names its expert;
+    /// otherwise it writes row `r` of every slot `s >= slot` naming that
+    /// expert, `h[s · rows_per_expert + r]` from column `s / slots_per_col`
+    /// by the slot-local body's own walk (`gate_up_act_body`: the
+    /// [`row_dot_1col`] pair, the warp trees, the rule), its bits. Ids:
+    /// module doc; an id past the stack writes NaN to its slot's rows.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    // Three blocks an SM: the registers of the hit loop on top of those of the slot-local walk
+    // do not fit in the 64 that four blocks leave without a spill.
+    #[launch_bounds(256, 3)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            wg.len() >= n_experts * rows_per_expert * 68 * n_sb,
+            wu.len() >= n_experts * rows_per_expert * 68 * n_sb,
+            slots_per_col >= 1,
+            n_slots <= m_cols * slots_per_col,
+            q.len() >= m_cols * 256 * iters,
+            s8.len() >= m_cols * 8 * n_sb,
+            d8.len() >= m_cols * 2 * n_sb,
+            sel.len() >= n_slots,
+            h.len() >= n_slots * rows_per_expert
+        )
+    )]
+    pub fn q8_0_gate_up_sel_cols(
+        wg: &[u32],
+        wu: &[u32],
+        q: &[u32],
+        s8: &[i32],
+        d8: &[f32],
+        sel: &[u32],
+        n_experts: u32,
+        rows_per_expert: u32,
+        n_slots: u32,
+        m_cols: u32,
+        slots_per_col: u32,
+        n_sb: u32,
+        iters: u32,
+        act: u32,
+        limit: f32,
+        fault: FaultSink,
+        mut h: DisjointSlice<f32>,
+    ) {
+        // m_cols only bounds the activation in the launch contract.
+        let _ = m_cols;
+        let t = thread::index_1d().get() % THREADS as usize;
+        let row = (thread::index_1d().get() / THREADS as usize) * ROWS_PER_BLOCK + t / 32;
+        let rpe = rows_per_expert as usize;
+        if row >= n_slots as usize * rpe {
+            return;
+        }
+        let slot = row / rpe;
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; the
+        // load is warp-uniform, so the returns below never diverge a warp.
+        let id = unsafe { *sel.get_unchecked(slot) };
+        let lane = warp::lane_id() as usize;
+        if id >= n_experts {
+            if id != HOST && lane == 0 {
+                fault.raise(FaultSite::ExpertId);
+                // SAFETY: row < n_slots · rows_per_expert <= h.len() by the
+                // launch contract; only lane 0 of the warp writes h[row].
+                unsafe { *h.get_unchecked_mut(row) = f32::NAN };
+            }
+            return;
+        }
+        // SAFETY: slot < n_slots <= sel.len() by the launch contract; every
+        // lane reads the same `id` and `slot`.
+        if unsafe { names_before(sel, id, slot, lane) } {
+            return;
+        }
+        let r = row % rpe;
+        let row_abs = id as usize * rpe + r;
+        let (n_slots, spc) = (n_slots as usize, slots_per_col as usize);
+        let mut i0 = slot;
+        while i0 < n_slots {
+            let i = i0 + lane;
+            // SAFETY: i < n_slots <= sel.len() by the launch contract.
+            let mut hits = warp::ballot(i < n_slots && unsafe { *sel.get_unchecked(i) } == id);
+            while hits != 0 {
+                let at = i0 + hits.trailing_zeros() as usize;
+                hits &= hits - 1;
+                // SAFETY: row_abs < n_experts · rows_per_expert rows of both
+                // stacks; column at / spc < m_cols because at < n_slots <=
+                // m_cols · slots_per_col; the host passes iters =
+                // ceil(n_sb/4); all 32 lanes of the warp are here.
+                let (fg, fu) = unsafe {
+                    (
+                        row_dot_1col::<Q8_0>(
+                            wg,
+                            q,
+                            s8,
+                            d8,
+                            n_sb as usize,
+                            iters,
+                            row_abs,
+                            at / spc,
+                            lane,
+                        ),
+                        row_dot_1col::<Q8_0>(
+                            wu,
+                            q,
+                            s8,
+                            d8,
+                            n_sb as usize,
+                            iters,
+                            row_abs,
+                            at / spc,
+                            lane,
+                        ),
+                    )
+                };
+                let g = warp::reduce_sum_f32(fg);
+                let u = warp::reduce_sum_f32(fu);
+                if lane == 0 {
+                    // SAFETY: at · rpe + r < n_slots · rows_per_expert <=
+                    // h.len() by the launch contract; slot `at` names this
+                    // warp's expert and this warp is its first slot, so lane 0
+                    // here is the row's only writer.
+                    unsafe {
+                        *h.get_unchecked_mut(at * rpe + r) =
+                            act::apply_checked(act, limit, g, u, fault);
+                    }
+                }
+            }
+            i0 += 32;
+        }
+    }
 }
 
 /// A Q8_0 down `_sel` launch ([`Q80SelKernels::enqueue_gemv_q8_0_sel32`]).
@@ -282,7 +524,82 @@ impl Q80SelKernels {
         fault: FaultSink,
         y: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
-        let what = "enqueue_gemv_q8_0_sel32";
+        self.enqueue_down(stream, (a, false), fault, y)
+    }
+
+    /// [`Q80SelKernels::enqueue_gemv_q8_0_sel32`] reading each distinct
+    /// expert once a run (`q8_0_gemv_sel32_cols`, module doc): the same rows
+    /// bit for bit, the same refusals.
+    pub fn enqueue_gemv_q8_0_sel32_cols(
+        &self,
+        stream: &CudaStream,
+        a: &Q80SelDown<'_>,
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        self.enqueue_down(stream, (a, true), fault, y)
+    }
+
+    /// Enqueue the Q8_0 Walk A gate·up of `a` reading each distinct expert
+    /// once a run (`q8_0_gate_up_sel_cols`, module doc): every row
+    /// `QuantSelKernels::enqueue_gate_up_q8_0` writes for `a`, bit for bit,
+    /// with its refusals (`gate_up_dims`). Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_gate_up_q8_0_cols(
+        &self,
+        stream: &CudaStream,
+        a: &GateUpAct<'_>,
+        fault: FaultSink,
+        h: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_gate_up_q8_0_cols";
+        let fmt = Fmt {
+            name: "Q8_0",
+            words: 68,
+        };
+        let d = gate_up_dims(what, fmt, a, h.len())?;
+        let prep = self
+            .module
+            .prepare_q8_0_gate_up_sel_cols(LaunchConfig1D::new(d.grid, THREADS, 0))?;
+        let (q, s8, d8) = walk_a_planes(a.act);
+        self.module.q8_0_gate_up_sel_cols(
+            stream,
+            &prep,
+            a.wg.buf(),
+            a.wu.buf(),
+            q,
+            s8,
+            d8,
+            a.sel,
+            d.n_experts,
+            d.rows_per_expert,
+            d.n_slots,
+            d.m_cols,
+            d.slots_per_col,
+            d.n_sb,
+            d.iters,
+            d.act,
+            d.limit,
+            fault,
+            h,
+        )?;
+        Ok(())
+    }
+
+    /// The down launch of `a`, slot-local or, under `dedupe`, each distinct
+    /// expert once a run.
+    fn enqueue_down(
+        &self,
+        stream: &CudaStream,
+        (a, dedupe): (&Q80SelDown<'_>, bool),
+        fault: FaultSink,
+        y: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let what = if dedupe {
+            "enqueue_gemv_q8_0_sel32_cols"
+        } else {
+            "enqueue_gemv_q8_0_sel32"
+        };
         let k = a.act.k();
         let k_blocks = k / 32;
         let (n_slots, rpe) = (a.n_slots, a.rows_per_expert);
@@ -319,25 +636,32 @@ impl Q80SelKernels {
             a.sel.len(),
             y.len(),
         )?;
-        let grid = launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?;
-        let prep = self
-            .module
-            .prepare_q8_0_gemv_sel32(LaunchConfig1D::new(grid, THREADS, 0))?;
-        self.module.q8_0_gemv_sel32(
-            stream,
-            &prep,
-            a.w.buf(),
-            &a.act.q,
-            &a.act.d8,
-            a.sel,
+        let config = LaunchConfig1D::new(
+            launch_u32(what, "grid", slot_rows.div_ceil(ROWS_PER_BLOCK))?,
+            THREADS,
+            0,
+        );
+        let (k_blocks, q_stride) = (
             launch_u32(what, "k_blocks", k_blocks)?,
             launch_u32(what, "q_stride", a.act.q_stride())?,
+        );
+        let (n_experts, rpe, n_slots) = (
             launch_u32(what, "n_experts", rows / rpe)?,
             launch_u32(what, "rows_per_expert", rpe)?,
             launch_u32(what, "n_slots", n_slots)?,
-            fault,
-            y,
-        )?;
+        );
+        let (w, q, d8, sel) = (a.w.buf(), &a.act.q, &a.act.d8, a.sel);
+        if dedupe {
+            let prep = self.module.prepare_q8_0_gemv_sel32_cols(config)?;
+            self.module.q8_0_gemv_sel32_cols(
+                stream, &prep, w, q, d8, sel, k_blocks, q_stride, n_experts, rpe, n_slots, fault, y,
+            )?;
+        } else {
+            let prep = self.module.prepare_q8_0_gemv_sel32(config)?;
+            self.module.q8_0_gemv_sel32(
+                stream, &prep, w, q, d8, sel, k_blocks, q_stride, n_experts, rpe, n_slots, fault, y,
+            )?;
+        }
         Ok(())
     }
 }

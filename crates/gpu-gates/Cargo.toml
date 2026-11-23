@@ -1059,6 +1059,13 @@ required-features = ["gpu"]
 name = "gate_inkling2_e2e"
 required-features = ["gpu"]
 
+# inkling2-official-card: the official Inkling 2 Mini folder on the card in both dense arms
+# (gate_inkling2_official's doc): the arms' dense types and resident bytes apart, each arm's
+# teacher-forced argmax over the Mini's greedy tables within the pin. Real tier only.
+[[bin]]
+name = "gate_inkling2_official"
+required-features = ["gpu", "checkpoint"]
+
 # inkling2-draft: Inkling 2's DSpark draft on the card (gate_inkling2_draft's doc): the official
 # folder's draft beside the Mini's GGUF in the target's shadow, its acceptance per corpus against the
 # reference's. Real tier only.

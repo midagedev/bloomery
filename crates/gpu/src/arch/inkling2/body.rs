@@ -45,6 +45,7 @@ use crate::attn_res_step::{AttnResStepKernels, MixStepScratch};
 use crate::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks, LegSum};
 use crate::draft_taps::DraftTaps;
 use crate::flash_gqa::{FlashGqaKernels, window_segments};
+use crate::folder::Model;
 use crate::gemm::Gemm32Kernels;
 use crate::head::Head;
 use crate::kquant::Act;
@@ -53,6 +54,7 @@ use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::loop_control::{LoopControlArgs, LoopControlKernels, MAX_MODULES, scratch_len};
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
 use crate::norm_proj::{self, F32Site, NormProjArgs, NormProjKernels, Q8Site};
+use crate::norm_proj_bf16::{self, Bf16Site, NormProjBf16Args, NormProjBf16Kernels};
 use crate::q38::{EmbedIo, Q38Kernels};
 use crate::qk_clip::{QkClipArgs, QkClipKernels};
 use crate::rel_bias::{REL, RelBiasArgs, RelBiasKernels};
@@ -64,7 +66,7 @@ use crate::weights::Weights;
 use crate::{Gpu, GpuError};
 use chain::linear::Ring;
 use cuda_core::{CudaStream, DeviceBuffer};
-use gguf::Split;
+use gguf::{Split, TensorInfo};
 use model::arch::Arch;
 use model::arch::inkling2::hparams::{Dialect, Hparams, Loop};
 use model::arch::inkling2::names::{self, Ctrl, CtrlPart, Inp};
@@ -97,10 +99,20 @@ pub(super) const DENSE_TYPES: &[SiteTy] = &[SiteTy::Q8_0, SiteTy::F32, SiteTy::B
 /// argmax reads the unpadded vocabulary and the finite argmax's check holds.
 pub const PAD_LOGIT: f32 = -1.0e30;
 /// What a refusal of a gate or up stack names.
-const GATE_UP_ROLE: &str =
-    "a resident fused-w13 half of NVFP4 planes or Q8_0 blocks (the card leg's gate·up arm)";
+const GATE_UP_ROLE: &str = "a resident fused-w13 half of NVFP4 planes, MXFP8 planes or Q8_0 \
+     blocks (the card leg's gate·up arm)";
 /// What a refusal of a down stack names.
-const DOWN_ROLE: &str = "a resident down stack of NVFP4 planes or Q8_0 blocks";
+const DOWN_ROLE: &str = "a resident down stack of NVFP4 planes, MXFP8 planes or Q8_0 blocks";
+/// A layer's attention projections a BF16 file tensor of the name loads in its stored words for
+/// ([`dense_card`], which names the token embedding and the head beside them).
+const RAW_SITES: &[&str] = &[
+    "attn_q.weight",
+    "attn_k.weight",
+    "attn_v.weight",
+    "attn_rel.weight",
+    "attn_gate.weight",
+    "attn_output.weight",
+];
 
 /// The stages [`Body::arm_taps`] keeps of every visit, in this order, each named as the reference
 /// names that visit's node (`<stage>-<slot>`): the q, k and v rows and the relative rows after
@@ -207,6 +219,7 @@ struct Kernels {
     mix: AttnResKernels,
     step_mix: AttnResStepKernels,
     proj: NormProjKernels,
+    proj_bf16: NormProjBf16Kernels,
     ctrl: LoopControlKernels,
     conv: ConvResKernels,
     clip: QkClipKernels,
@@ -227,6 +240,7 @@ impl Kernels {
             mix: AttnResKernels::load(ctx)?,
             step_mix: AttnResStepKernels::load(ctx)?,
             proj: NormProjKernels::load(ctx)?,
+            proj_bf16: NormProjBf16Kernels::load(ctx)?,
             ctrl: LoopControlKernels::load(ctx)?,
             conv: ConvResKernels::load(ctx)?,
             clip: QkClipKernels::load(ctx)?,
@@ -336,7 +350,10 @@ impl Scratch {
             msg_bank: z(MAX_VECS * n)?,
             bank_last: z(n)?,
             prelude: z(n)?,
-            pad: DeviceBuffer::from_host(stream, &vec![PAD_LOGIT; pad.max(1)])?,
+            pad: DeviceBuffer::from_host(
+                stream,
+                &vec![PAD_LOGIT; (pad * pass::rows::VERIFY_ROWS).max(1)],
+            )?,
             route: sigmoid_128_8::RouterOut::new(stream)?,
             leg: LegBufs::for_down(stream, leg, DownAct::Q8Blocks32)?,
             mix_step: MixStepScratch::new(stream, n)?,
@@ -423,6 +440,8 @@ pub struct Body {
     ctx: usize,
     /// The prompt pass's buffers and kernels ([`pass`]).
     pass: pass::Pass,
+    /// A verify's own buffers beside the pass's ([`pass::rows`]).
+    verify: pass::rows::VerifyBufs,
 }
 
 impl GpuModel<Body> {
@@ -461,17 +480,20 @@ impl GpuModel<Body> {
             .read(gpu.stream(), 0, 1)
     }
 
-    /// The whole model of `file` resident on `gpu`, plus the output head: the dense sites and the
-    /// f32 tables as the file holds them, each routed layer's fused gate·up stack split at upload
-    /// into its gate and up halves (a Q8_0 layer's stacks in the leg's blocks first), the visits'
-    /// stores of `ctx` positions (a windowed visit's ring of its window), the step scratch. The
-    /// model takes the file and closes it once the weights are resident.
+    /// The whole model of `file` (a GGUF split, or a checkpoint folder's header and part source)
+    /// resident on `gpu`, plus the output head: the dense sites and the f32 tables as the file holds
+    /// them, a BF16 attention projection, token embedding and head in their stored words
+    /// ([`dense_card`]), each routed layer's fused gate·up stack split at upload into its gate and
+    /// up halves (a Q8_0 layer's stacks in the leg's blocks first), the visits' stores of `ctx`
+    /// positions (a windowed visit's ring of its window), the step scratch. The model takes the
+    /// file and closes it once the weights are resident.
     ///
     /// Refused by name: a file of llama.cpp master's loop dialect, a router other than 128
     /// experts and the top 8, layers whose widths differ, a group other than three query heads a
     /// key head, a file whose tensors and prompt pass ([`place::pass_bytes`]) exceed the card's
     /// free bytes.
-    pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
+    pub fn open(gpu: Gpu, file: impl Into<Model>, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
+        let (file, origin) = file.into().into_whole();
         let n_layers = block_count(&file, OPEN)?;
         let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
         let reserve = place::pass_bytes(&pass::shape_of(&hp, &file)?, place::pass_rows(ctx));
@@ -486,10 +508,30 @@ impl GpuModel<Body> {
                 ),
             ));
         }
-        GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
-            Body::load(gpu, &file, w, (hp, ctx))
-        })
+        GpuModel::load_blocks_from(
+            gpu,
+            &file,
+            (origin.bytes(), &dense_card),
+            ctx,
+            0..n_layers,
+            true,
+            |gpu, w| Body::load(gpu, &file, w, (hp, ctx)),
+        )
     }
+}
+
+/// The card format of the file tensor `t`: a BF16 attention projection ([`RAW_SITES`]), token
+/// embedding or head in its stored words (`Bf16Raw`, two bytes a weight, which the BF16 site,
+/// `norm_proj_bf16`, embedding and head kernels read); every other tensor in its type's own (the
+/// BF16 sink and conv projections widened to the F32 the fused launch reads).
+fn dense_card(t: &TensorInfo) -> Option<CardFormat> {
+    let raw = t.name == "token_embd.weight"
+        || t.name == "output.weight"
+        || t.name
+            .strip_prefix("blk.")
+            .and_then(|r| r.split_once('.'))
+            .is_some_and(|(_, site)| RAW_SITES.contains(&site));
+    (raw && t.ty == gguf::GgmlType::BF16).then_some(CardFormat::Bf16Raw)
 }
 
 /// `name`'s site of `rows` rows of `k`, its type the resident weight's (one of [`DENSE_TYPES`]).
@@ -498,13 +540,17 @@ fn site_of(w: &Weights, name: String, (rows, k): (usize, usize)) -> Result<Site,
     Ok(Site::new(name, ty, k))
 }
 
-/// Whether `layer`'s input norms and projections run as one `norm_proj` launch: q, k, v, rel and
-/// gate Q8_0, the sinks and the taps F32, the input a width the entry takes and every site's rows
-/// a multiple of its block's.
+/// Whether `layer`'s input norms and projections run as one fused launch: q, k, v, rel and gate
+/// all Q8_0 (`norm_proj`) or all BF16 words (`norm_proj_bf16`), the sinks and the taps F32, the
+/// input a width the entry takes and every site's rows a multiple of its block's.
 fn norm_proj_fits(layer: &Layer, d: &Dims) -> bool {
-    let q8 = [&layer.q, &layer.k, &layer.v, &layer.rel, &layer.gate]
-        .iter()
-        .all(|s| s.ty == SiteTy::Q8_0);
+    let five = [&layer.q, &layer.k, &layer.v, &layer.rel, &layer.gate];
+    let (max_k, block) = match five[0].ty {
+        SiteTy::Q8_0 => (norm_proj::MAX_K, norm_proj::ROWS),
+        SiteTy::Bf16 => (norm_proj_bf16::MAX_K, norm_proj_bf16::ROWS),
+        _ => return false,
+    };
+    let same = five.iter().all(|s| s.ty == five[0].ty);
     let f32 = std::iter::once(&layer.sink)
         .chain(layer.taps.iter().flatten())
         .all(|s| s.ty == SiteTy::F32);
@@ -515,10 +561,10 @@ fn norm_proj_fits(layer: &Layer, d: &Dims) -> bool {
         d.n_head,
         d.n_kv * d.taps,
     ];
-    q8 && f32
+    same && f32
         && d.n.is_multiple_of(32)
-        && d.n <= norm_proj::MAX_K
-        && rows.iter().all(|r| r.is_multiple_of(norm_proj::ROWS))
+        && d.n <= max_k
+        && rows.iter().all(|r| r.is_multiple_of(block))
 }
 
 /// Site `site`'s Q8_0 planes and its output `y`, for a `norm_proj` launch.
@@ -529,6 +575,18 @@ fn q8_site<'a>(
 ) -> Result<Q8Site<'a>, GpuError> {
     let (qs, d) = w.q8_planes(STEP, &site.name)?;
     Ok(Q8Site { qs, d, y })
+}
+
+/// Site `site`'s BF16 words and its output `y`, for a `norm_proj_bf16` launch.
+fn bf16_site<'a>(
+    w: &'a Weights,
+    site: &Site,
+    y: &'a mut DeviceBuffer<f32>,
+) -> Result<Bf16Site<'a>, GpuError> {
+    Ok(Bf16Site {
+        w: w.bf16(STEP, &site.name)?,
+        y,
+    })
 }
 
 /// `name`, an f32 vector of `len` values the weights hold, or a named refusal.
@@ -809,6 +867,7 @@ impl Body {
         )?;
         Ok(Body {
             pass,
+            verify: pass::rows::VerifyBufs::new(stream, &d)?,
             k: Kernels::load(gpu)?,
             s: Scratch::new(stream, &d, pad)?,
             step_in: StepIn::new(stream)?,
@@ -976,6 +1035,7 @@ impl Body {
     fn scratch_bytes(&self) -> usize {
         self.s.bytes()
             + self.pass.bytes()
+            + self.verify.bytes()
             + self.acts.bytes()
             + self.step_in.bytes()
             + self.k.kgemv.device_bytes()
@@ -1424,29 +1484,56 @@ impl Walk<'_> {
                 Some([tk, tv]) => (w.f32_tensor(STEP, &tk.name)?, w.f32_tensor(STEP, &tv.name)?),
                 None => (sink, sink),
             };
-            self.k.proj.enqueue(
-                stream,
-                NormProjArgs {
-                    x: src,
-                    gain,
-                    ik,
-                    iv,
-                    eps: self.eps,
-                    k: n,
-                    fault,
-                    q8: [
-                        q8_site(w, &layer.q, q)?,
-                        q8_site(w, &layer.k, k_raw)?,
-                        q8_site(w, &layer.v, v_raw)?,
-                        q8_site(w, &layer.rel, r)?,
-                        q8_site(w, &layer.gate, gate)?,
-                    ],
-                    sink: F32Site { w: sink, y: sinks },
-                    kt: F32Site { w: kt, y: k_taps },
-                    vt: F32Site { w: vt, y: v_taps },
-                    taps: layer.taps.is_some(),
-                },
-            )?;
+            if layer.q.ty == SiteTy::Bf16 {
+                self.k.proj_bf16.enqueue(
+                    stream,
+                    NormProjBf16Args {
+                        x: src,
+                        gain,
+                        ik,
+                        iv,
+                        eps: self.eps,
+                        k: n,
+                        m: 1,
+                        fault,
+                        bf16: [
+                            bf16_site(w, &layer.q, q)?,
+                            bf16_site(w, &layer.k, k_raw)?,
+                            bf16_site(w, &layer.v, v_raw)?,
+                            bf16_site(w, &layer.rel, r)?,
+                            bf16_site(w, &layer.gate, gate)?,
+                        ],
+                        sink: F32Site { w: sink, y: sinks },
+                        kt: F32Site { w: kt, y: k_taps },
+                        vt: F32Site { w: vt, y: v_taps },
+                        taps: layer.taps.is_some(),
+                    },
+                )?;
+            } else {
+                self.k.proj.enqueue(
+                    stream,
+                    NormProjArgs {
+                        x: src,
+                        gain,
+                        ik,
+                        iv,
+                        eps: self.eps,
+                        k: n,
+                        fault,
+                        q8: [
+                            q8_site(w, &layer.q, q)?,
+                            q8_site(w, &layer.k, k_raw)?,
+                            q8_site(w, &layer.v, v_raw)?,
+                            q8_site(w, &layer.rel, r)?,
+                            q8_site(w, &layer.gate, gate)?,
+                        ],
+                        sink: F32Site { w: sink, y: sinks },
+                        kt: F32Site { w: kt, y: k_taps },
+                        vt: F32Site { w: vt, y: v_taps },
+                        taps: layer.taps.is_some(),
+                    },
+                )?;
+            }
         } else {
             let (cx, acts, s) = (&self.cx, &mut *self.acts, &mut *self.s);
             layer.q.project(cx, acts, slot, &s.xn[0], &mut s.q)?;
@@ -1801,25 +1888,28 @@ impl Walk<'_> {
             None,
             &mut s.mix_step,
         )?;
-        head_logits((gpu, w), head, &s.pad, (cap, unpadded, padded))
+        head_logits((gpu, w), head, &s.pad, (cap, unpadded, padded), 1)
     }
 }
 
-/// The head over its input row: the norm, the projection, the softcap at `cap`, the padded columns
-/// past `unpadded` at [`PAD_LOGIT`] (`pad`'s), the argmax over the `padded` columns.
+/// The head over its `m` input rows: the norm, the projection, the softcap at `cap`, the padded
+/// columns past `unpadded` at [`PAD_LOGIT`] (`pad`'s, at least `m` rows of them), the argmax over
+/// the `padded` columns. The rows lie column by column (`logits[v · m + r]`), so the padded
+/// columns of every row are one tail.
 fn head_logits(
     (gpu, w): (&Gpu, &Weights),
     head: &mut Head,
     pad: &DeviceBuffer<f32>,
     (cap, unpadded, padded): (f32, usize, usize),
+    m: usize,
 ) -> Result<(), GpuError> {
     let stream = gpu.stream();
-    let n_pad = padded - unpadded;
+    let n_pad = (padded - unpadded) * m;
     head.enqueue_with_epilogue(gpu, w, |logits: &mut DeviceBuffer<f32>| {
         gpu.elem()
-            .enqueue_softcap_rows(stream, logits, padded, cap)?;
+            .enqueue_softcap_rows(stream, logits, padded * m, cap)?;
         if n_pad > 0 {
-            let mut tail = WindowMut::<f32>::of_mut(logits, unpadded * 4, n_pad)?;
+            let mut tail = WindowMut::<f32>::of_mut(logits, unpadded * m * 4, n_pad)?;
             copy_row(stream, pad, &mut tail, n_pad)?;
         }
         Ok(())

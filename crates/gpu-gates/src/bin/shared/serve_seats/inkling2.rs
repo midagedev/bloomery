@@ -146,6 +146,9 @@ struct OpenSeat {
     path: std::path::PathBuf,
     /// The slot's positions the visits' stores are sized for.
     ctx: usize,
+    /// Whether the load serves a draft: the verify's graphs are captured at load, beside the
+    /// step's.
+    drafted: bool,
 }
 
 /// The model, in graph mode with its step captured.
@@ -167,6 +170,9 @@ impl Inkling2 {
         let mut m = GpuModel::<Body>::open(gpu, file, a.ctx)?;
         m.set_mode(StepMode::Graph);
         let nodes = m.capture_step()?;
+        if a.drafted {
+            m.capture_verify()?;
+        }
         let total = t.elapsed();
         Record::new(&record::LOAD_INKLING2)
             .w("arch", Body::arch().name())
@@ -363,6 +369,11 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         device: card.device,
         path: path.clone(),
         ctx: slot_ctx,
+        // `check` refused every draft word but off ([`draft_asked`]).
+        drafted: matches!(
+            levers.draft_word(&[DraftWord::Off]),
+            Ok(Some(w)) if w != DraftWord::Off
+        ),
     };
     let device = card.name.clone();
     drop(plan);

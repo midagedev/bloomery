@@ -183,7 +183,7 @@ unsafe fn slot_weight(route: &[u32], wts: &[f32], j: u32, c: usize) -> f32 {
 ///
 /// `slot <= sel.len()` and `lane < 32`.
 #[inline(always)]
-unsafe fn names_before(sel: &[u32], id: u32, slot: usize, lane: usize) -> bool {
+pub(crate) unsafe fn names_before(sel: &[u32], id: u32, slot: usize, lane: usize) -> bool {
     let mut i0 = 0;
     while i0 < slot {
         let i = i0 + lane;

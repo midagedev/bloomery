@@ -1355,6 +1355,11 @@ impl CardLeg {
                 self.quant
                     .enqueue_gate_up_q5k(stream, &words()?, fault, h)?
             }
+            // A run whose slots can name one expert reads each once (`_cols`),
+            // the slot-local launch's rows bit for bit.
+            Some(GateUpEntry::Q8_0) if slots > slots_per_col => self
+                .q80
+                .enqueue_gate_up_q8_0_cols(stream, &words()?, fault, h)?,
             Some(GateUpEntry::Q8_0) => {
                 self.quant
                     .enqueue_gate_up_q8_0(stream, &words()?, fault, h)?
@@ -1627,8 +1632,8 @@ struct Sel32<'a> {
 /// `y[s · rows_per_expert ..]`. `entry` is the table's row for the stack's
 /// type, [`kernels::down`]'s for a down and [`kernels::up`]'s for an up (one
 /// entry: an up is a down-shaped `_sel`). `slots_per_col` is the slots of a
-/// token, which the NVFP4 entry reads to serve a run of tokens whose slots
-/// can name one expert.
+/// token, which the NVFP4 and Q8_0 entries read to serve a run of tokens
+/// whose slots can name one expert.
 #[derive(Clone, Copy)]
 struct Sel32Run<'a> {
     entry: DownEntry,
@@ -1686,7 +1691,11 @@ impl Sel32<'_> {
                     n_slots,
                     rows_per_expert,
                 };
-                self.q80.enqueue_gemv_q8_0_sel32(stream, &d, fault, y)
+                if n_slots > slots_per_col {
+                    self.q80.enqueue_gemv_q8_0_sel32_cols(stream, &d, fault, y)
+                } else {
+                    self.q80.enqueue_gemv_q8_0_sel32(stream, &d, fault, y)
+                }
             }
             DownEntry::Iq4nl => {
                 let d = IqDown {

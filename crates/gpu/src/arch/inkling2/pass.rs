@@ -12,10 +12,10 @@
 //! - the epilogue's append of the rows' keys at their positions (a windowed visit's ring slots,
 //!   [`super::state`]: the ring holds the window and a pass's rows) before the rel-bias prefill
 //!   flash reads them over the cached prefix and the rows (`rel_bias_prefill`);
-//! - the feed-forward block in the step's three parts over the rows ([`Rows::ffn_front`]: the
-//!   mix, the controller, the norm and the router's rows; [`Rows::ffn_shadow`]: the routed rows
+//! - the feed-forward block in the step's three parts over the rows ([`RowWalk::ffn_front`]: the
+//!   mix, the controller, the norm and the router's rows; [`RowWalk::ffn_shadow`]: the routed rows
 //!   on the grouped route GEMM, the table, gate·up, SiTU and down, then the card sum;
-//!   [`Rows::ffn_back`]: the post conv and the stream's sum): a placed body attaches its host
+//!   [`RowWalk::ffn_back`]: the post conv and the stream's sum): a placed body attaches its host
 //!   tier between them. Every visit routes its rows anew.
 //!
 //! After the last visit the head's mix runs over the rows and the head over the last row, so the
@@ -29,13 +29,18 @@
 //!
 //! The buffers are [`place::pass_bytes`] at the load's rows, the plan's reserve; the load refuses
 //! by name a pass that takes more.
+//!
+//! A verify ([`rows`]) walks the same rows with the step's kernels where the prompt's differ: the
+//! projections as the step's gemvs over the rows, the attention as the step's rel-bias flash at
+//! the rows' causal offsets, the routed rows on the step's card leg, and the head over every row;
+//! so each row is a step's bits.
 
 use super::state::{self, VisitStore};
 use super::{
     Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Kernels, Layer, MIX_EPS, MSG_ATTN, MSG_FFN, Router,
     WHAT, conv_scale, head_logits, tap_widths,
 };
-use crate::arch::hybrid::{WideCx, project_wide};
+use crate::arch::hybrid::{Site, WideCx, project_wide};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs};
 use crate::card_leg::{LegStacks, RouteIo};
 use crate::card_slots::{CardAcc, CardSlotKernels};
@@ -49,10 +54,10 @@ use crate::loop_control::{LoopControlArgs, MAX_MODULES, scratch_len};
 use crate::model::GpuModel;
 use crate::q38::EmbedIo;
 use crate::qk_clip::QkClipArgs;
-use crate::rel_bias::REL;
+use crate::rel_bias::{REL, RelBiasArgs};
 use crate::rel_bias_prefill::{RelBiasPrefillKernels, RelPrefillArgs};
 use crate::routed_block::{RouteIn, RoutedRows, RouterEntry};
-use crate::site::{SiteTy, WideActs, WideKernels};
+use crate::site::{self, SiteTy, WideActs, WideKernels};
 use crate::tensor::{Window, WindowMut, copy_row};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
@@ -62,6 +67,9 @@ use gguf::Split;
 use model::arch::inkling2::hparams::Hparams;
 use model::arch::inkling2::names;
 use model::arch::inkling2::place::{self, PassShape};
+
+#[path = "rows.rs"]
+pub(super) mod rows;
 use model::arch::models::OutGate;
 use model::placement::accepts::{self, Program};
 
@@ -533,6 +541,22 @@ impl Body {
         at: &PassAt<'_>,
         kept: &mut Vec<Vec<f32>>,
     ) -> Result<(), GpuError> {
+        let (rows, ring) = (self.pass.rows, self.ring);
+        let (floor, alpha) = (self.hp.log_floor, self.hp.log_alpha);
+        self.pass
+            .b
+            .stage(gpu.stream(), (at.ids, at.pos0, rows), (ring, floor, alpha))?;
+        self.walk_rows(gpu, w, head, (at.ids.len(), Tail::Pass { at, kept }))
+    }
+
+    /// The visits over the `m` staged rows, then `tail`'s head.
+    fn walk_rows(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        head: &mut Head,
+        (m, tail): (usize, Tail<'_, '_>),
+    ) -> Result<(), GpuError> {
         let Body {
             hp,
             d,
@@ -540,12 +564,12 @@ impl Body {
             layers,
             stores,
             k,
-            ring,
             messages,
             taps,
             pass,
             ctx,
             s,
+            verify,
             ..
         } = self;
         let Pass {
@@ -555,20 +579,20 @@ impl Body {
             forced,
             ..
         } = pass;
-        b.stage(
-            gpu.stream(),
-            (at.ids, at.pos0, *rows),
-            (*ring, hp.log_floor, hp.log_alpha),
-        )?;
-        let mut r = Rows {
+        let (forced, verify) = match &tail {
+            Tail::Pass { at, .. } => (forced.as_ref().map(|f| (f, at.first)), None),
+            Tail::Verify => (None, Some(verify)),
+        };
+        let mut r = RowWalk {
             gpu,
             w,
             k,
             pk,
             b,
-            forced: forced.as_ref().map(|f| (f, at.first)),
+            forced,
+            verify,
             d: *d,
-            m: at.ids.len(),
+            m,
             cap: *rows,
             ctx: *ctx,
             eps: hp.rms_eps,
@@ -604,18 +628,26 @@ impl Body {
                 r.tap(t, slot)?;
             }
         }
-        r.finish(
-            (visits.len(), &s.pad),
-            head,
-            (hp.softcap, hp.n_vocab_unpadded, hp.n_vocab),
-            at,
-            kept,
-        )
+        let logits = (hp.softcap, hp.n_vocab_unpadded, hp.n_vocab);
+        match tail {
+            Tail::Pass { at, kept } => r.finish((visits.len(), &s.pad), head, logits, at, kept),
+            Tail::Verify => r.finish_rows((visits.len(), &s.pad), head, logits),
+        }
     }
 }
 
-/// One pass's borrowed parts and the walk's counters (the step's [`super::Walk`]'s, over rows).
-struct Rows<'a> {
+/// What a walk over rows ends with: a prompt pass's head over its kept rows and, on the call's
+/// last pass, its last row; or a verify's head over every row ([`rows`]).
+enum Tail<'t, 'c> {
+    Pass {
+        at: &'t PassAt<'c>,
+        kept: &'t mut Vec<Vec<f32>>,
+    },
+    Verify,
+}
+
+/// One walk's borrowed parts and its counters (the step's [`super::Walk`]'s, over rows).
+struct RowWalk<'a> {
     gpu: &'a Gpu,
     w: &'a Weights,
     k: &'a Kernels,
@@ -623,6 +655,8 @@ struct Rows<'a> {
     b: &'a mut Bufs,
     /// The forced picks and this pass's first row in the call.
     forced: Option<(&'a PassForced, usize)>,
+    /// A verify's own buffers; none on a prompt pass.
+    verify: Option<&'a mut rows::VerifyBufs>,
     d: Dims,
     /// The pass's rows, and the rows the buffers hold (the banks' pitch).
     m: usize,
@@ -699,7 +733,7 @@ impl MixAt<'_> {
     }
 }
 
-impl<'a> Rows<'a> {
+impl<'a> RowWalk<'a> {
     /// The visit's mixes' shared arguments under `fault`.
     fn mixes(&self, fault: FaultSink) -> MixAt<'a> {
         let (k, gpu): (&'a Kernels, &'a Gpu) = (self.k, self.gpu);
@@ -744,6 +778,9 @@ impl<'a> Rows<'a> {
             m,
             &mut b.x,
         )?;
+        if self.verify.is_some() {
+            return Ok(());
+        }
         self.pk
             .gemm
             .enqueue_route_dense(gpu.stream(), m, &mut b.dense, gpu.unlabelled_sink())
@@ -951,7 +988,23 @@ impl<'a> Rows<'a> {
         let normed: &[DeviceBuffer<f32>; 3] = if ctrl.is_some() { mix } else { xn };
         let tw = d.n_kv * d.taps;
         let dense = &*dense;
-        {
+        if self.verify.is_some() {
+            // The step's sites (`norm_proj`'s outputs are these gemvs' bits) over the rows.
+            let (ik, iv) = if n_in == 1 { (0, 0) } else { (1, 2) };
+            let gemv = |site: &Site, x: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>| {
+                site::gemv(gpu, &k.g32, (site.ty, w, &site.name), x, m, y)
+            };
+            gemv(&layer.q, &normed[0], q)?;
+            gemv(&layer.k, &normed[ik], k_raw)?;
+            gemv(&layer.v, &normed[iv], v_raw)?;
+            gemv(&layer.rel, &normed[0], r)?;
+            gemv(&layer.sink, &normed[0], sinks)?;
+            gemv(&layer.gate, &normed[0], gate)?;
+            if let Some([tk, tv]) = &layer.taps {
+                gemv(tk, &normed[ik], k_taps)?;
+                gemv(tv, &normed[iv], v_taps)?;
+            }
+        } else {
             let mut qs = vec![
                 (&layer.q, qw, &mut *q),
                 (&layer.rel, d.n_head * REL, &mut *r),
@@ -1034,28 +1087,59 @@ impl<'a> Rows<'a> {
                 },
             )?;
         }
-        pk.prefill.enqueue(
-            stream,
-            RelPrefillArgs {
-                q,
-                kc: &store.kc,
-                vc: &store.vc,
-                n_keys,
-                r,
-                bias: &layer.bias,
-                extent: layer.extent,
-                scale: 1.0 / (HEAD as f32).sqrt(),
-                n_kv: d.n_kv,
-                ctx: self.ctx,
-                ring_rows: store.shape.ring.then_some(store.shape.rows),
-                m,
-                window: if layer.windowed { d.window } else { 0 },
-                sinks,
-                fault,
-                y: attn,
-            },
-            d.n_head,
-        )?;
+        let (scale, ring_rows) = (
+            1.0 / (HEAD as f32).sqrt(),
+            store.shape.ring.then_some(store.shape.rows),
+        );
+        let window = if layer.windowed { d.window } else { 0 };
+        match self.verify.as_deref_mut() {
+            Some(v) => k.rel.enqueue(
+                stream,
+                RelBiasArgs {
+                    q,
+                    kc: &store.kc,
+                    vc: &store.vc,
+                    n_keys,
+                    r,
+                    bias: &layer.bias,
+                    extent: layer.extent,
+                    scale,
+                    n_kv: d.n_kv,
+                    ctx: self.ctx,
+                    ring_rows,
+                    m,
+                    window,
+                    sinks,
+                    part_v: &mut v.part_v,
+                    part_ms: &mut v.part_ms,
+                    fault,
+                    y: attn,
+                },
+                d.n_head,
+            )?,
+            None => pk.prefill.enqueue(
+                stream,
+                RelPrefillArgs {
+                    q,
+                    kc: &store.kc,
+                    vc: &store.vc,
+                    n_keys,
+                    r,
+                    bias: &layer.bias,
+                    extent: layer.extent,
+                    scale,
+                    n_kv: d.n_kv,
+                    ctx: self.ctx,
+                    ring_rows,
+                    m,
+                    window,
+                    sinks,
+                    fault,
+                    y: attn,
+                },
+                d.n_head,
+            )?,
+        }
         k.out_gate.enqueue_out_gate(
             stream,
             OutGateArgs {
@@ -1068,13 +1152,17 @@ impl<'a> Rows<'a> {
                 y: gated,
             },
         )?;
-        project_wide(
-            &wc,
-            (wide_q, dense),
-            slot,
-            gated,
-            &mut [(&layer.o, n, &mut *o)],
-        )?;
+        if self.verify.is_some() {
+            site::gemv(gpu, &k.g32, (layer.o.ty, w, &layer.o.name), gated, m, o)?;
+        } else {
+            project_wide(
+                &wc,
+                (wide_q, dense),
+                slot,
+                gated,
+                &mut [(&layer.o, n, &mut *o)],
+            )?;
+        }
         k.conv.enqueue(
             stream,
             ConvResArgs {
@@ -1195,6 +1283,9 @@ impl<'a> Rows<'a> {
     /// over the card's stacks (every expert resident, so a pick's id is its place) — the table,
     /// the rows in q8 blocks of 32, gate·up, SiTU, down — and the card sum of each row's slots.
     fn ffn_shadow(&mut self, slot: usize, layer: &Layer) -> Result<(), GpuError> {
+        if self.verify.is_some() {
+            return self.shadow_rows(slot, layer);
+        }
         let (gpu, w, k, pk) = (self.gpu, self.w, self.k, self.pk);
         let stream = gpu.stream();
         let (n, m) = (self.d.n, self.m);
@@ -1356,7 +1447,7 @@ impl<'a> Rows<'a> {
         )?;
         let row = |t: usize, head: &mut Head| -> Result<(), GpuError> {
             copy_span(stream, (&b.fmix, t * n), (head.input_mut(), 0), n)?;
-            head_logits((gpu, w), head, pad, logits)
+            head_logits((gpu, w), head, pad, logits, 1)
         };
         for &t in &at.scored {
             row(t, head)?;

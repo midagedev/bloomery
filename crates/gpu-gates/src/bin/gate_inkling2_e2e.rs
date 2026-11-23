@@ -47,6 +47,17 @@
 //!   below the end, so it is refused, where a rollback of 5 more is taken and replays the fresh
 //!   run). A prompt pass moves the written end as steps do: after one, a rollback of
 //!   [`PASS_ROWS`] positions is taken and one more is refused.
+//! - `verify_is_m_steps`: set `a`'s prompt, then for `m` = 2 to [`VERIFY_ROWS`] the next `m` ids
+//!   (its greedy ids, cycled) as a verify of `m` rows (`GpuModel::step_rows`, the body's `Rows`)
+//!   and as `m` steps in turn, each rolled back to the prompt's end: the verify's ids and every
+//!   row's logits are the steps' bit for bit and the model stands `m` positions on, eager and
+//!   replayed (graph mode captures the verify's graphs as a load serving a draft does,
+//!   `GpuModel::capture_verify`).
+//! - `verify_then_rollback`: the longest set's prompt (past a windowed visit's window), a verify
+//!   of [`VERIFY_ROWS`] ids, a rollback to [`VERIFY_BACK`] rows past the prompt and the rest of
+//!   the ids stepped from there: the verify's rows and the steps' are those of a run that only
+//!   stepped, bit for bit; the verify wrote its rows' end, so a rollback below the prompt's end
+//!   is refused and the model stands where it did.
 //!
 //! Before the card loads, a set absent from the box, dumped from another file or build, or
 //! unfinished ends the gate by name. A step that raises the fault word ends the gate by name.
@@ -66,7 +77,7 @@ fn main() -> std::process::ExitCode {
 #[cfg(feature = "gpu")]
 mod gate {
     use bloomery_gpu::arch::inkling2::{Body, PAD_LOGIT, TAP_STAGES};
-    use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::model::{Rows, StepMode};
     use bloomery_gpu::{Gpu, GpuModel};
     use bloomery_gpu_gates::prompts::{GreedyRow, MARGIN_FLOOR, compare_forced, std_normal_cdf};
     use bloomery_gpu_gates::rel::rel;
@@ -845,6 +856,189 @@ mod gate {
         Ok(pass)
     }
 
+    /// The rows a verify walks at most, a draft block: the body's [`Rows::MAX_ROWS`].
+    const VERIFY_ROWS: usize = 8;
+    const _: () = assert!(<Body as Rows>::MAX_ROWS == VERIFY_ROWS);
+    /// The rows of a verified block `verify_then_rollback` keeps.
+    const VERIFY_BACK: usize = 3;
+
+    /// What a verify gave: its ids, every row's logits, and its wall in ms (the enqueue or the
+    /// replay, and the ids' read).
+    struct Verified {
+        ids: Vec<u32>,
+        rows: Vec<Vec<f32>>,
+        ms: f64,
+    }
+
+    /// A verify of the first `M` of `ids` from where the model stands.
+    fn verify_of<const M: usize>(
+        m: &mut GpuModel<Body>,
+        ids: &[u32],
+    ) -> Result<Verified, GateError> {
+        let tokens: [u32; M] = std::array::from_fn(|r| ids[r]);
+        let t = std::time::Instant::now();
+        let out = m.step_rows::<M>(tokens)?;
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        Ok(Verified {
+            ids: out.to_vec(),
+            rows: m.rows_logits::<M>()?.into_iter().collect(),
+            ms,
+        })
+    }
+
+    /// [`verify_of`] at `rows` rows, 2 to [`VERIFY_ROWS`].
+    fn verify(m: &mut GpuModel<Body>, ids: &[u32], rows: usize) -> Result<Verified, GateError> {
+        if ids.len() < rows {
+            return Err(format!("{NAME}: a verify of {rows} rows over {} ids", ids.len()).into());
+        }
+        match rows {
+            2 => verify_of::<2>(m, ids),
+            3 => verify_of::<3>(m, ids),
+            4 => verify_of::<4>(m, ids),
+            5 => verify_of::<5>(m, ids),
+            6 => verify_of::<6>(m, ids),
+            7 => verify_of::<7>(m, ids),
+            8 => verify_of::<8>(m, ids),
+            _ => Err(format!("{NAME}: a verify of {rows} rows (2 to {VERIFY_ROWS})").into()),
+        }
+    }
+
+    /// Whether a verify's ids and logits rows are the steps' `(id, logits)` bit for bit.
+    fn rows_are_steps(steps: &[(u32, Vec<f32>)], v: &Verified) -> bool {
+        steps.len() == v.ids.len()
+            && steps.len() == v.rows.len()
+            && steps
+                .iter()
+                .zip(v.ids.iter().zip(&v.rows))
+                .all(|((id, row), (vid, vrow))| id == vid && bits_equal(row, vrow))
+    }
+
+    /// Clause `verify_is_m_steps`: see the module header. Prints, beside, each verify's wall at its
+    /// second replay (the first uploads the graph) and its steps' walls, at the prompt's depth:
+    /// development numbers, not timed runs.
+    fn verify_is_m_steps(m: &mut GpuModel<Body>, s: &Set) -> Result<bool, GateError> {
+        if !tier::run_clause("verify_is_m_steps", Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let at = u32::try_from(s.prompt.len())?;
+        let ids: Vec<u32> = s
+            .greedy
+            .ids
+            .iter()
+            .cycle()
+            .copied()
+            .take(VERIFY_ROWS)
+            .collect();
+        let mut miss: Option<String> = None;
+        let mut nodes = Vec::new();
+        let mut walls = Vec::new();
+        for mode in [StepMode::Eager, StepMode::Graph] {
+            m.set_mode(mode);
+            m.reset()?;
+            m.step(&s.prompt)?;
+            if mode == StepMode::Graph {
+                nodes = m.capture_verify()?.to_vec();
+            }
+            for rows in 2..=VERIFY_ROWS {
+                let mut steps = Vec::with_capacity(rows);
+                let mut step_ms = 0.0;
+                for &id in &ids[..rows] {
+                    let t = std::time::Instant::now();
+                    let token = m.step(&[id])?;
+                    step_ms += t.elapsed().as_secs_f64() * 1e3;
+                    steps.push((token, m.logits()?));
+                }
+                m.rollback(at)?;
+                let v = verify(m, &ids, rows)?;
+                let on = at + u32::try_from(rows)?;
+                let same = rows_are_steps(&steps, &v);
+                if !(same && m.pos() == on) && miss.is_none() {
+                    miss = Some(format!(
+                        "{mode:?} m={rows}: ids {:?} against the steps' {:?}, rows bit for bit \
+                         {same}, standing at {} (want {on})",
+                        v.ids,
+                        steps.iter().map(|s| s.0).collect::<Vec<_>>(),
+                        m.pos()
+                    ));
+                }
+                m.rollback(at)?;
+                if mode == StepMode::Graph {
+                    let again = verify(m, &ids, rows)?;
+                    walls.push(format!("m{rows}={:.2}/{step_ms:.2}", again.ms));
+                    m.rollback(at)?;
+                }
+            }
+        }
+        m.set_mode(StepMode::Eager);
+        let captured = nodes.len() == VERIFY_ROWS - 1 && nodes.iter().all(|&n| n > 0);
+        let pass = miss.is_none() && captured;
+        println!(
+            "verify_is_m_steps set={} at={at} rows=2..={VERIFY_ROWS} modes=eager,graph \
+             verify_graph_nodes={nodes:?} first_miss={miss:?} {}",
+            s.label,
+            verdict(pass)
+        );
+        println!(
+            "verify_walls_ms (development: the verify's second graph replay / its m graph \
+             steps, depth {at}) {}",
+            walls.join(" ")
+        );
+        Ok(pass)
+    }
+
+    /// Clause `verify_then_rollback`: see the module header.
+    fn verify_then_rollback(m: &mut GpuModel<Body>, s: &Set) -> Result<bool, GateError> {
+        if !tier::run_clause("verify_then_rollback", Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let at = u32::try_from(s.prompt.len())?;
+        let ids: Vec<u32> = s
+            .greedy
+            .ids
+            .iter()
+            .cycle()
+            .copied()
+            .take(VERIFY_ROWS)
+            .collect();
+        m.set_mode(StepMode::Graph);
+        // The fresh run: the prompt, then every id a step.
+        m.reset()?;
+        m.step(&s.prompt)?;
+        let mut fresh = Vec::with_capacity(VERIFY_ROWS);
+        for &id in &ids {
+            let token = m.step(&[id])?;
+            fresh.push((token, m.logits()?));
+        }
+        // The verified run: the prompt, the block's verify, back to VERIFY_BACK rows past the
+        // prompt, the rest stepped.
+        m.reset()?;
+        m.step(&s.prompt)?;
+        let verified = rows_are_steps(&fresh, &verify(m, &ids, VERIFY_ROWS)?);
+        let end = at + u32::try_from(VERIFY_ROWS)?;
+        let past_refused = m.rollback(at - 1).is_err() && m.pos() == end;
+        let back = at + u32::try_from(VERIFY_BACK)?;
+        let rolled = m.rollback(back).is_ok() && m.pos() == back;
+        let mut replayed = Vec::new();
+        if rolled {
+            for (j, &id) in ids.iter().enumerate().skip(VERIFY_BACK) {
+                let token = m.step(&[id])?;
+                let (want, row) = &fresh[j];
+                replayed.push(token == *want && bits_equal(&m.logits()?, row));
+            }
+        }
+        m.set_mode(StepMode::Eager);
+        let replays = replayed.len() == VERIFY_ROWS - VERIFY_BACK && replayed.iter().all(|&b| b);
+        let pass = verified && past_refused && rolled && replays;
+        println!(
+            "verify_then_rollback set={} at={at} rows={VERIFY_ROWS} verify_is_the_steps={verified} \
+             below_the_prompt_refused={past_refused} back_to={back} taken={rolled} \
+             steps_are_the_fresh_run={replayed:?} {}",
+            s.label,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let tier = Tier::from_env()?;
         let split = open_split(Arch::Inkling2, RECIPE)?;
@@ -904,6 +1098,8 @@ mod gate {
             .max_by_key(|s| s.prompt.len())
             .ok_or("no prompt set")?;
         ok &= rollback_is_a_fresh_run(&mut m, &hp, longest)?;
+        ok &= verify_is_m_steps(&mut m, &sets[0])?;
+        ok &= verify_then_rollback(&mut m, longest)?;
         println!("{}", tier::tally_line());
         if !ok {
             return Err(checks_failed());
@@ -913,7 +1109,8 @@ mod gate {
              visits and logits within their bands (the fixture's with the vendor's picks, the \
              Mini's free), the teacher-forced argmax disagreements within the pin; the message \
              path live; the captured step's nodes the walk's; the graph the eager chain; a \
-             rollback within the reach a fresh run"
+             rollback within the reach a fresh run; a verify of 2 to 8 rows the steps, and a \
+             rollback after one a fresh run"
         );
         Ok(())
     }
