@@ -11,3 +11,4 @@ mod seat;
 mod state;
 
 pub use body::{Body, PAD_LOGIT, TAP_STAGES};
+pub use state::StoreHost;

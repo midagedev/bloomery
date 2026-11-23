@@ -32,8 +32,8 @@
 //! vocabulary at [`PAD_LOGIT`], so the argmax reads the vocabulary alone.
 //!
 //! The six projections of one attention input are six launches: no common entry takes several
-//! Q8_0 weights over one input row. A prompt is stepped one id at a time ([`GpuModel::step`] over
-//! the slice): each id is a decode step's bits.
+//! Q8_0 weights over one input row. A prompt runs as the rows pass ([`pass`]): the same walk over
+//! up to [`place::PASS_ROWS`] rows a launch, the stores left where that many steps leave them.
 
 use super::state::{self, StepIn, VisitStore, WORD_POS, WORD_RING, WORD_TOKEN};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
@@ -62,11 +62,15 @@ use gguf::Split;
 use model::arch::Arch;
 use model::arch::inkling2::hparams::{Dialect, Hparams, Loop};
 use model::arch::inkling2::names::{self, Ctrl, CtrlPart, Inp};
+use model::arch::inkling2::place;
 use model::arch::models::{LoopSpec, OutGate, Visit, visits};
 use model::placement::CardFormat;
 use model::placement::accepts::{self, Program};
 use model::placement::kernels::DownAct;
 use std::ops::Range;
+
+#[path = "pass.rs"]
+pub(super) mod pass;
 
 const WHAT: &str = "inkling2::Body::load";
 const STEP: &str = "inkling2 step";
@@ -236,9 +240,7 @@ struct Scratch {
     h: DeviceBuffer<f32>,
     /// The q, k and v inputs normed.
     xn: [DeviceBuffer<f32>; 3],
-    q_raw: DeviceBuffer<f32>,
     q: DeviceBuffer<f32>,
-    r_raw: DeviceBuffer<f32>,
     r: DeviceBuffer<f32>,
     sinks: DeviceBuffer<f32>,
     gate: DeviceBuffer<f32>,
@@ -266,10 +268,6 @@ struct Scratch {
     bank_last: DeviceBuffer<f32>,
     /// The prelude's stream, which every pass past the first restarts from.
     prelude: DeviceBuffer<f32>,
-    /// The per-channel clip scales the epilogue launch reads (the scales are applied before it,
-    /// [`Walk::clip_scales`]): 1.0 throughout.
-    unit_q: DeviceBuffer<f32>,
-    unit_r: DeviceBuffer<f32>,
     /// The head's padded columns' constant.
     pad: DeviceBuffer<f32>,
     route: sigmoid_128_8::RouterOut,
@@ -298,9 +296,7 @@ impl Scratch {
             ctl: [z(n)?, z(n)?, z(n)?],
             h: z(scratch_len(MAX_MODULES, 1, d.rank.max(1)))?,
             xn: [z(n)?, z(n)?, z(n)?],
-            q_raw: z(q)?,
             q: z(q)?,
-            r_raw: z(r)?,
             r: z(r)?,
             sinks: z(d.n_head)?,
             gate: z(q)?,
@@ -326,8 +322,6 @@ impl Scratch {
             msg_bank: z(MAX_VECS * n)?,
             bank_last: z(n)?,
             prelude: z(n)?,
-            unit_q: DeviceBuffer::from_host(stream, &[1.0f32; HEAD])?,
-            unit_r: DeviceBuffer::from_host(stream, &[1.0f32; REL])?,
             pad: DeviceBuffer::from_host(stream, &vec![PAD_LOGIT; pad.max(1)])?,
             route: sigmoid_128_8::RouterOut::new(stream)?,
             leg: LegBufs::for_down(stream, leg, DownAct::Q8Blocks32)?,
@@ -339,9 +333,7 @@ impl Scratch {
             &self.emb,
             &self.x,
             &self.h,
-            &self.q_raw,
             &self.q,
-            &self.r_raw,
             &self.r,
             &self.sinks,
             &self.gate,
@@ -367,8 +359,6 @@ impl Scratch {
             &self.msg_bank,
             &self.bank_last,
             &self.prelude,
-            &self.unit_q,
-            &self.unit_r,
             &self.pad,
         ];
         bufs.iter().map(|b| b.num_bytes()).sum::<usize>()
@@ -405,9 +395,11 @@ pub struct Body {
     taps: Option<DeviceBuffer<f32>>,
     /// Each visit's routed ids and weights from the host, armed by [`Body::force_picks`].
     forced: Option<Forced>,
-    /// The position the stores stand at: the next step's.
+    /// The position the stores stand at: the next step's or pass's.
     held: u32,
     ctx: usize,
+    /// The prompt pass's buffers and kernels ([`pass`]).
+    pass: pass::Pass,
 }
 
 impl GpuModel<Body> {
@@ -419,21 +411,23 @@ impl GpuModel<Body> {
     ///
     /// Refused by name: a file of llama.cpp master's loop dialect, a router other than 128
     /// experts and the top 8, layers whose widths differ, a group other than three query heads a
-    /// key head, a file whose tensors exceed the card's free bytes.
+    /// key head, a file whose tensors and prompt pass ([`place::pass_bytes`]) exceed the card's
+    /// free bytes.
     pub fn open(gpu: Gpu, file: Split, ctx: usize) -> Result<GpuModel<Body>, GpuError> {
         let n_layers = block_count(&file, OPEN)?;
+        let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
+        let reserve = place::pass_bytes(&pass::shape_of(&hp, &file)?, place::pass_rows(ctx));
         let (free, total) = gpu.mem_info()?;
         let bytes: u64 = file.iter_tensors().map(|(_, t)| t.nbytes).sum();
-        if usize::try_from(bytes).map_or(true, |b| b > free) {
+        if usize::try_from(bytes + reserve).map_or(true, |b| b > free) {
             return Err(GpuError::shape(
                 OPEN,
                 format!(
-                    "the file's tensors are {bytes} B and the card has {free} of {total} B free: \
-                     the body holds the whole model on one card"
+                    "the file's tensors are {bytes} B and the prompt pass {reserve} B; the card \
+                     has {free} of {total} B free: the body holds the whole model on one card"
                 ),
             ));
         }
-        let hp = Hparams::read(&file).map_err(|e| GpuError::plan(WHAT, e))?;
         GpuModel::load_blocks(gpu, &file, ctx, 0..n_layers, true, |gpu, w| {
             Body::load(gpu, &file, w, (hp, ctx))
         })
@@ -526,29 +520,6 @@ fn controls(
     })
 }
 
-/// The most blocks the walk banks at once: the stem's and the coda's block heads plus, at the
-/// core, the prelude's and one pass's (every pass restarts from the prelude's).
-fn banked_most(visits: &[Visit], block: usize, core: Option<Loop>) -> usize {
-    let (mut pushed, mut prelude, mut most) = (0usize, 0usize, 0usize);
-    for v in visits {
-        let l = v.layer as usize;
-        if let Some(lp) = core
-            && l == lp.core_start
-        {
-            if v.pass == 0 {
-                prelude = pushed;
-            } else {
-                pushed = prelude;
-            }
-        }
-        if l.is_multiple_of(block) {
-            pushed += 1;
-        }
-        most = most.max(pushed);
-    }
-    most
-}
-
 impl Body {
     #[allow(
         clippy::too_many_lines,
@@ -614,7 +585,7 @@ impl Body {
                 format!("{} visits: the fault word names fewer", visits.len()),
             ));
         }
-        let most = banked_most(&visits, hp.block, core);
+        let most = place::banked_most(&hp);
         if most + 1 > MAX_VECS {
             return Err(GpuError::shape(
                 WHAT,
@@ -729,14 +700,21 @@ impl Body {
             .into_iter()
             .map(|s| VisitStore::new(stream, s))
             .collect::<Result<Vec<_>, _>>()?;
-        let ring = if stores.iter().any(|s| s.shape.ring) {
-            u32::try_from(hp.swa).map_err(|e| GpuError::shape(WHAT, e.to_string()))?
-        } else {
-            0
+        let ring = match stores.iter().find(|s| s.shape.ring) {
+            Some(s) => {
+                u32::try_from(s.shape.rows).map_err(|e| GpuError::shape(WHAT, e.to_string()))?
+            }
+            None => 0,
         };
         let acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
         let pad = hp.n_vocab - hp.n_vocab_unpadded;
+        let pass = pass::Pass::new(
+            gpu,
+            (&pass::shape_of(&hp, file)?, place::pass_rows(ctx)),
+            &layers,
+        )?;
         Ok(Body {
+            pass,
             k: Kernels::load(gpu)?,
             s: Scratch::new(stream, &d, pad)?,
             step_in: StepIn::new(stream)?,
@@ -771,6 +749,12 @@ impl Body {
     #[must_use]
     pub fn store_bytes(&self) -> usize {
         self.stores.iter().map(VisitStore::bytes).sum()
+    }
+
+    /// Every visit's stores as the card holds them, in run order: a gate's read of what a prompt
+    /// left. Synchronizes `stream`.
+    pub fn stores_to_host(&self, stream: &CudaStream) -> Result<Vec<state::StoreHost>, GpuError> {
+        self.stores.iter().map(|s| s.to_host(stream)).collect()
     }
 
     /// Whether the visits of a pass past the first run their message mixes and controllers. Off,
@@ -863,6 +847,7 @@ impl Body {
 
     fn scratch_bytes(&self) -> usize {
         self.s.bytes()
+            + self.pass.bytes()
             + self.acts.bytes()
             + self.step_in.bytes()
             + self.k.kgemv.device_bytes()
@@ -1129,31 +1114,6 @@ impl Walk<'_> {
         copy_row(stream, &s.prelude, &mut s.x, n)
     }
 
-    /// The per-channel clip scales on the query and relative rows, applied before the epilogue
-    /// launch, which reads unit scales: the files' `attn_q_clip` is `[n_head][128]` and
-    /// `attn_rel_clip` `[n_head][16]`, one row a head, and `qk_clip` takes per-head scales once
-    /// its entry indexes them; until then the product runs here, elementwise, exactly the
-    /// reference's `ggml_mul` before the clip.
-    fn clip_scales(&mut self, layer: &Layer) -> Result<(), GpuError> {
-        let (gpu, w) = (self.cx.gpu, self.cx.w);
-        let (stream, s) = (gpu.stream(), &mut *self.s);
-        let (q, r) = (self.d.n_head * HEAD, self.d.n_head * REL);
-        gpu.elem().enqueue_mul_rows(
-            stream,
-            &s.q_raw,
-            w.f32_buf(STEP, &layer.q_clip)?,
-            q,
-            &mut s.q,
-        )?;
-        gpu.elem().enqueue_mul_rows(
-            stream,
-            &s.r_raw,
-            w.f32_buf(STEP, &layer.rel_clip)?,
-            r,
-            &mut s.r,
-        )
-    }
-
     /// The visit's attention half (module doc, steps 2 to 5), the stream joined.
     #[allow(
         clippy::too_many_lines,
@@ -1270,10 +1230,10 @@ impl Walk<'_> {
         let (ik, iv) = if n_in == 1 { (0, 0) } else { (1, 2) };
         {
             let (cx, acts, s) = (&self.cx, &mut *self.acts, &mut *self.s);
-            layer.q.project(cx, acts, slot, &s.xn[0], &mut s.q_raw)?;
+            layer.q.project(cx, acts, slot, &s.xn[0], &mut s.q)?;
             layer.k.project(cx, acts, slot, &s.xn[ik], &mut s.k_raw)?;
             layer.v.project(cx, acts, slot, &s.xn[iv], &mut s.v_raw)?;
-            layer.rel.project(cx, acts, slot, &s.xn[0], &mut s.r_raw)?;
+            layer.rel.project(cx, acts, slot, &s.xn[0], &mut s.r)?;
             layer.sink.project(cx, acts, slot, &s.xn[0], &mut s.sinks)?;
             layer.gate.project(cx, acts, slot, &s.xn[0], &mut s.gate)?;
             if let Some([tk, tv]) = &layer.taps {
@@ -1319,7 +1279,6 @@ impl Walk<'_> {
                 )?;
             }
         }
-        self.clip_scales(layer)?;
         {
             let (s, step_in) = (&mut *self.s, &*self.step_in);
             let word = if store.shape.ring {
@@ -1335,8 +1294,8 @@ impl Walk<'_> {
                     k: &mut s.k,
                     v: &mut s.v,
                     r: &mut s.r,
-                    gq: &s.unit_q,
-                    gr: &s.unit_r,
+                    gq: w.f32_buf(STEP, &layer.q_clip)?,
+                    gr: w.f32_buf(STEP, &layer.rel_clip)?,
                     tau: if layer.windowed {
                         &step_in.one
                     } else {
@@ -1615,17 +1574,29 @@ impl Walk<'_> {
             },
             head.input_mut(),
         )?;
-        let pad = padded - unpadded;
-        head.enqueue_with_epilogue(gpu, w, |logits: &mut DeviceBuffer<f32>| {
-            gpu.elem()
-                .enqueue_softcap_rows(stream, logits, padded, cap)?;
-            if pad > 0 {
-                let mut tail = WindowMut::<f32>::of_mut(logits, unpadded * 4, pad)?;
-                copy_row(stream, &s.pad, &mut tail, pad)?;
-            }
-            Ok(())
-        })
+        head_logits((gpu, w), head, &s.pad, (cap, unpadded, padded))
     }
+}
+
+/// The head over its input row: the norm, the projection, the softcap at `cap`, the padded columns
+/// past `unpadded` at [`PAD_LOGIT`] (`pad`'s), the argmax over the `padded` columns.
+fn head_logits(
+    (gpu, w): (&Gpu, &Weights),
+    head: &mut Head,
+    pad: &DeviceBuffer<f32>,
+    (cap, unpadded, padded): (f32, usize, usize),
+) -> Result<(), GpuError> {
+    let stream = gpu.stream();
+    let n_pad = padded - unpadded;
+    head.enqueue_with_epilogue(gpu, w, |logits: &mut DeviceBuffer<f32>| {
+        gpu.elem()
+            .enqueue_softcap_rows(stream, logits, padded, cap)?;
+        if n_pad > 0 {
+            let mut tail = WindowMut::<f32>::of_mut(logits, unpadded * 4, n_pad)?;
+            copy_row(stream, pad, &mut tail, n_pad)?;
+        }
+        Ok(())
+    })
 }
 
 impl ChainBody for Body {
@@ -1705,32 +1676,7 @@ impl ChainBody for Body {
 
 #[cfg(test)]
 mod tests {
-    use super::{banked_most, conv_scale};
-    use model::arch::inkling2::hparams::Loop;
-    use model::arch::models::{LoopSpec, visits};
-
-    /// The Mini's walk banks at most four blocks (the stem's, the prelude's pass's two, the
-    /// coda's), every pass restarting from the prelude's one; the fixture's at most three.
-    /// Mutant: a pass that keeps the blocks before it (no restart) counts eight.
-    #[test]
-    fn the_walk_banks_a_pass_over_the_prelude() {
-        let lp = |start: usize, end: usize| Loop {
-            core_start: start,
-            core_end: end,
-            passes: 3,
-            gate_rank: 64,
-        };
-        let spec = |l: Loop| LoopSpec {
-            core_start: l.core_start as u32,
-            core_end: l.core_end as u32,
-            passes: l.passes as u32,
-            gate_rank: l.gate_rank as u32,
-        };
-        let mini = lp(6, 18);
-        assert_eq!(banked_most(&visits(24, Some(spec(mini))), 6, Some(mini)), 4);
-        let fx = lp(6, 12);
-        assert_eq!(banked_most(&visits(13, Some(spec(fx))), 6, Some(fx)), 3);
-    }
+    use super::conv_scale;
 
     /// The conv scales are the reference's `1 / √(taps + 1)` and `1 / √(2·taps + 1)`.
     #[test]

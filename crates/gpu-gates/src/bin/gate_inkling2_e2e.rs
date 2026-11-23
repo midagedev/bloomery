@@ -575,7 +575,7 @@ mod gate {
     /// The nodes one captured step holds, derived from the walk (`arch/inkling2/body.rs`) term by
     /// term at one row, and the terms. A visit: its attention mix (a layer past the first), the
     /// input norms (one on a windowed visit without messages, else three), six projections plus
-    /// a windowless visit's two conv taps, the k and v convs, the two clip scales, the epilogue,
+    /// a windowless visit's two conv taps, the k and v convs, the epilogue,
     /// the attention's two launches (segments, merge), the output gate, the output projection,
     /// its post conv and the join (a copy or an add); the feed-forward's mix, norm and router,
     /// the card leg's four launches and its sum, the post conv and the stream's add; a visit with
@@ -584,7 +584,7 @@ mod gate {
     /// nothing). The step opens with the embedding's lookup and norm and closes with the head's
     /// mix, norm, projection, softcap, padded-column copy and argmax.
     pub(super) fn derived_nodes(hp: &Hparams, table: &[(u32, u32)]) -> (usize, String) {
-        const VISIT: usize = 6 + 2 + 2 + 1 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 5 + 1 + 1;
+        const VISIT: usize = 6 + 2 + 1 + 2 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 5 + 1 + 1;
         const MESSAGES: usize = 1 + 2 + 2;
         const EMBED: usize = 2;
         const HEAD: usize = 6;

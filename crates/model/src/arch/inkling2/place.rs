@@ -6,17 +6,22 @@
 //! ([`Inputs::plan`]) is the Inkling 2 body's ([`Program::Inkling2Body`]): every routed stack of a
 //! type the body's card leg runs goes to the card by the expert rule beside the dense weights,
 //! the visits' K and V and their convolution states — the weights once per stored layer (a
-//! looped layer's passes share them: the file holds one set), the stores once per visit.
+//! looped layer's passes share them: the file holds one set), the stores once per visit — and,
+//! beside them on the card, the prompt pass's buffers ([`pass_bytes`] of [`pass_shape`] at
+//! [`pass_rows`]), the one formula the load holds the pass it makes to.
 
-use gguf::Split;
-use models::ModelSpec;
+use gguf::{GgmlType, Split};
+use models::{LoopSpec, ModelSpec, visits};
 
-use super::hparams::Hparams;
+use super::hparams::{Hparams, Loop};
+use super::names::{self, Inp};
 use super::spec;
 use crate::arch::coverage;
+use crate::arch::place_hybrid::{self, RingForms};
 use crate::placement::accepts::{Program, routed_rule};
+use crate::placement::kernels::wide_act_bytes;
 use crate::placement::{
-    Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, plan_routed,
+    Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, plan_routed_reserving,
 };
 
 pub use crate::arch::place_hybrid::KvLayout;
@@ -82,8 +87,9 @@ impl Inputs {
     /// The placement of the file on `machine` at `ctx_max` positions under the placement's
     /// `levers`: the routed stacks by the body's rule ([`routed_rule`] of
     /// [`Program::Inkling2Body`], each stack by its own type, so a fused gate·up stack plans whole)
-    /// through the expert rule, the dense tensors where their roles say, and the visits' stores
-    /// on the cards that run their layers.
+    /// through the expert rule, the dense tensors where their roles say, the visits' stores on the
+    /// cards that run their layers, and the prompt pass's buffers kept beside them on every card
+    /// ([`Inputs::pass_reserve`]).
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
@@ -91,18 +97,248 @@ impl Inputs {
         levers: &PlanLevers,
     ) -> Result<Plan<'a>, PlacementError> {
         let rule = routed_rule(Program::Inkling2Body);
-        plan_routed(&self.model, machine, ctx_max, &self.kv, levers, rule)
+        let reserve = self.pass_reserve(ctx_max)?;
+        plan_routed_reserving(
+            &self.model,
+            machine,
+            ctx_max,
+            &self.kv,
+            levers,
+            rule,
+            reserve,
+        )
     }
+
+    /// The card bytes of the prompt pass a load at `ctx_max` positions makes: [`pass_bytes`] of
+    /// the file's [`pass_shape`] at [`pass_rows`]. A site tensor missing or of a type no site
+    /// entry runs is refused by name.
+    pub fn pass_reserve(&self, ctx_max: u64) -> Result<u64, PlacementError> {
+        let shape = pass_shape(&self.hp, |name| {
+            self.model
+                .tensors
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.ty)
+        })?;
+        let ctx = usize::try_from(ctx_max).unwrap_or(usize::MAX);
+        Ok(pass_bytes(&shape, pass_rows(ctx)))
+    }
+}
+
+/// The most rows one prompt pass runs: the prompt batch a window ring keeps room for beside its
+/// window ([`runtime::stores::PROMPT_BATCH`]), so a pass's appended keys never overwrite a key one
+/// of its rows reads.
+pub const PASS_ROWS: usize = 512;
+const _: () = assert!(PASS_ROWS as u64 == runtime::stores::PROMPT_BATCH);
+
+/// The rows a load's pass is cut for at `ctx` positions: [`PASS_ROWS`], or the context where it is
+/// shorter.
+#[must_use]
+pub fn pass_rows(ctx: usize) -> usize {
+    PASS_ROWS.min(ctx)
+}
+
+/// The most blocks a walk of `hp`'s visits banks at once: the stem's and the coda's block heads
+/// plus, at the core, the prelude's and one pass's (every pass past the first restarts from the
+/// prelude's banks). The step's bank and the pass's are cut by it.
+#[must_use]
+pub fn banked_most(hp: &Hparams) -> usize {
+    banks_of(hp.n_layer, hp.block, hp.loop_)
+}
+
+/// [`banked_most`] of `n_layer` stored layers in blocks of `block` around the loop `lp`.
+fn banks_of(n_layer: usize, block: usize, lp: Option<Loop>) -> usize {
+    let core = lp.filter(|lp| lp.passes > 1);
+    let spec = lp.map(|lp| LoopSpec {
+        core_start: lp.core_start as u32,
+        core_end: lp.core_end as u32,
+        passes: lp.passes as u32,
+        gate_rank: lp.gate_rank as u32,
+    });
+    let (mut pushed, mut prelude, mut most) = (0usize, 0usize, 0usize);
+    for v in visits(n_layer, spec) {
+        let l = v.layer as usize;
+        if let Some(lp) = core
+            && l == lp.core_start
+        {
+            if v.pass == 0 {
+                prelude = pushed;
+            } else {
+                pushed = prelude;
+            }
+        }
+        if l.is_multiple_of(block) {
+            pushed += 1;
+        }
+        most = most.max(pushed);
+    }
+    most
+}
+
+/// The widths and forms the prompt pass's buffers are cut from: what every visit shares (the
+/// body refuses layers whose widths differ), the bank's rows ([`banked_most`]), whether the core
+/// loops (the message bank, the controllers' scratch and the pass edge's rows), and the file
+/// types of the projection sites by the width they read: the model's (q, k, v, the relative rows,
+/// the sinks, the gate and a windowless layer's conv taps) and the attention's (the output).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PassShape {
+    pub n: usize,
+    pub n_head: usize,
+    pub n_kv: usize,
+    pub head: usize,
+    pub rel: usize,
+    pub taps: usize,
+    pub ff: usize,
+    pub n_used: usize,
+    pub n_expert: usize,
+    pub banks: usize,
+    pub rank: usize,
+    pub looped: bool,
+    pub inner: Vec<GgmlType>,
+    pub outer: Vec<GgmlType>,
+    /// The forms the route GEMMs read the routed rows in, over every layer's stacks: a role's
+    /// 32-value form where every layer's type reads it, else the grouped GEMM's.
+    pub forms: RingForms,
+}
+
+/// The shape of `hp`'s prompt pass, its site types read by name through `ty_of` (the plan's
+/// tensor list or the file's header). A site tensor `ty_of` does not find, or a routed stack
+/// whose types no route GEMM reads, is refused by name.
+pub fn pass_shape(
+    hp: &Hparams,
+    ty_of: impl Fn(&str) -> Option<GgmlType>,
+) -> Result<PassShape, PlacementError> {
+    let first = |v: &[usize], key: &str| {
+        v.first().copied().ok_or_else(|| PlacementError::Metadata {
+            key: key.to_string(),
+            detail: "names no visit's value".to_string(),
+        })
+    };
+    let ty = |name: String| {
+        ty_of(&name).ok_or_else(|| PlacementError::Tensor {
+            name,
+            detail: "is not in the file: a prompt pass's projection reads it".to_string(),
+        })
+    };
+    let (mut inner, mut outer) = (Vec::new(), Vec::new());
+    let add = |set: &mut Vec<GgmlType>, t: GgmlType| {
+        if !set.contains(&t) {
+            set.push(t);
+        }
+    };
+    let mut forms = RingForms::BLOCKS32;
+    for l in 0..hp.n_layer {
+        let blk = |s: &str| format!("blk.{l}.{s}");
+        let mut sites = vec![
+            blk("attn_q.weight"),
+            blk("attn_k.weight"),
+            blk("attn_v.weight"),
+            names::attn_rel(l),
+            names::attn_sink_proj(l),
+            blk("attn_gate.weight"),
+        ];
+        if !hp.windowed[l] {
+            sites.push(names::inp(l, Inp::ConvK));
+            sites.push(names::inp(l, Inp::ConvV));
+        }
+        for s in sites {
+            add(&mut inner, ty(s)?);
+        }
+        add(&mut outer, ty(blk("attn_output.weight"))?);
+        let (fused, down) = (names::ffn_gate_up_exps(l), blk("ffn_down_exps.weight"));
+        let f =
+            RingForms::of(ty(fused.clone())?, ty(down)?).ok_or_else(|| PlacementError::Tensor {
+                name: fused,
+                detail: "is of a type no route GEMM reads: the prompt pass's experts run there"
+                    .to_string(),
+            })?;
+        forms.gate_up32 &= f.gate_up32;
+        forms.down32 &= f.down32;
+    }
+    Ok(PassShape {
+        n: hp.n_embd,
+        n_head: first(&hp.n_head, "attention.head_count")?,
+        n_kv: first(&hp.n_head_kv, "attention.head_count_kv")?,
+        head: hp.head_dim,
+        rel: hp.d_rel,
+        taps: hp.conv,
+        ff: first(&hp.expert_ff, "expert_feed_forward_length")?,
+        n_used: first(&hp.n_used, "expert_used_count")?,
+        n_expert: hp.n_expert,
+        banks: banked_most(hp),
+        rank: hp.loop_.map_or(0, |lp| lp.gate_rank),
+        looped: hp.loop_.is_some_and(|lp| lp.passes > 1),
+        inner,
+        outer,
+        forms,
+    })
+}
+
+/// The card bytes of the buffers of a prompt pass of `rows` rows over `s`, four bytes a value:
+///
+/// - f32 rows of the model's width: the stream, the attention mix's three inputs, the three
+///   controllers' outputs, the three normed inputs, the output projection (the embedding's rows
+///   before their norm), the attention block's output, the feed-forward's input, its mix (the
+///   head's mix after the last visit), its normed input, the routed sum and the post conv's
+///   output — fourteen — and, where the core loops, the prelude's stream, the bank's last row and
+///   the four message rows; the bank's rows ([`PassShape::banks`] of them) and, where the core
+///   loops, the message bank's as many;
+/// - f32 rows of the attention's widths: the query, the gate, the attention and its gated rows
+///   (`n_head · head` each), the key and value before and after their convs (`n_kv · head` each),
+///   the relative rows, the sinks, the two conv taps' rows (`n_kv · taps` each), each row's
+///   factor and the windowed visits' unit factor; where the core loops, the controllers' scratch
+///   (three modules of `rank`);
+/// - the router's scores (`n_expert` a row) and weights (`n_used` a row) and the slots' down rows
+///   (`n_used · n` a row);
+/// - u32 words: the ids, the positions, the live key counts, the ring slots, the first position
+///   word and the router's picks (`n_used` a row);
+/// - the forms: the wide forms of the model's and the attention's site widths
+///   ([`wide_act_bytes`] of their types), the one-expert route table
+///   ([`place_hybrid::route_bytes`]) and the route block's buffers over the experts
+///   ([`place_hybrid::ring_pass_bytes_in`] over every expert: the rows' and the slots' forms,
+///   the gate and up rows, the route table).
+///
+/// The one formula of those bytes: the plan reserves them ([`Inputs::pass_reserve`]) and the load
+/// refuses a pass that makes more.
+#[must_use]
+pub fn pass_bytes(s: &PassShape, rows: usize) -> u64 {
+    let (f, u) = (size_of::<f32>(), size_of::<u32>());
+    let looped = usize::from(s.looped);
+    let q = s.n_head * s.head;
+    let kv = s.n_kv * s.head;
+    let model_rows = 14 + looped * 6 + s.banks * (1 + looped);
+    let f32s = rows
+        * (model_rows * s.n
+            + 4 * q
+            + 4 * kv
+            + s.n_head * s.rel
+            + s.n_head
+            + 2 * s.n_kv * s.taps
+            + 2
+            + looped * 3 * s.rank
+            + s.n_expert
+            + s.n_used
+            + s.n_used * s.n);
+    let u32s = rows * (4 + s.n_used) + 1;
+    let (cols, n, q64) = (rows as u64, s.n as u64, q as u64);
+    let wide = wide_act_bytes(s.inner.iter().copied(), cols, n)
+        + wide_act_bytes(s.outer.iter().copied(), cols, q64);
+    let route = place_hybrid::route_bytes(rows);
+    let experts = place_hybrid::ring_pass_bytes_in(rows, s.n_used, s.n, s.ff, s.n_expert, s.forms);
+    (f32s * f + u32s * u + route + experts) as u64 + wide
 }
 
 #[cfg(test)]
 mod tests {
     use models::LoopSpec;
 
+    use super::super::hparams::Loop;
     use super::super::hparams::tests::{keys, tensors};
-    use super::Inputs;
+    use super::{Inputs, PassShape, banks_of, pass_bytes};
+    use crate::arch::place_hybrid::RingForms;
     use crate::arch::synthetic::{V, header_shaped};
     use crate::placement::{KvBytes, PlacementError, PlanLevers, workstation};
+    use gguf::GgmlType;
 
     /// The small header's file, opened; each test names its own file (the tests run in threads of
     /// one process). `typed` names a file whose routed stacks are Q8_0 (a type the host stack
@@ -223,5 +459,58 @@ mod tests {
             Err(PlacementError::Unimplemented(items)) => assert!(!items.is_empty()),
             other => panic!("{other:?}, not the coverage refusal"),
         }
+    }
+
+    /// The Mini's walk banks at most four blocks (the stem's, the prelude's pass's two, the
+    /// coda's), every pass restarting from the prelude's one; the fixture's at most three.
+    /// Mutant: a pass that keeps the blocks before it (no restart) counts eight.
+    #[test]
+    fn the_walk_banks_a_pass_over_the_prelude() {
+        let lp = |start: usize, end: usize| Loop {
+            core_start: start,
+            core_end: end,
+            passes: 3,
+            gate_rank: 64,
+        };
+        assert_eq!(banks_of(24, 6, Some(lp(6, 18))), 4);
+        assert_eq!(banks_of(13, 6, Some(lp(6, 12))), 3);
+    }
+
+    /// The Mini's pass of 512 rows [derived term by term from `pass_bytes`' list]: f32 values a
+    /// row 28 x 2,304 (fourteen model rows, six loop rows, four bank rows twice) + 4 x 3,072 +
+    /// 4 x 1,024 + 384 + 24 + 64 + 2 + 192 + 128 + 8 + 18,432 = 100,130; u32 words 12 a row and
+    /// one; the forms: the q8 blocks of 32 (80 B a 64-value step) of 512 rows at 2,304 and at
+    /// 3,072, 1,474,560 + 1,966,080 (the BF16 sites read the f32 rows), the one-expert table of
+    /// 512 slots 4 x (512 + 2 x 9 + 2 + 512) = 4,176, the route block over 4,096 slots of 128
+    /// experts 1,474,560 + 2 x 4 x 4,096 x 1,152 + 4,096 x 1,440 + 4 x (4,096 + 2 x 192 + 2) =
+    /// 45,139,464: 253,675,100 B in all. Mutant: a model row left out moves it by 4,718,592.
+    #[test]
+    fn the_mini_pass_is_its_buffers() {
+        let mini = PassShape {
+            n: 2304,
+            n_head: 24,
+            n_kv: 8,
+            head: 128,
+            rel: 16,
+            taps: 4,
+            ff: 1152,
+            n_used: 8,
+            n_expert: 128,
+            banks: 4,
+            rank: 64,
+            looped: true,
+            inner: vec![GgmlType::Q8_0, GgmlType::BF16],
+            outer: vec![GgmlType::Q8_0],
+            forms: RingForms::BLOCKS32,
+        };
+        let f32s =
+            512 * (28 * 2304 + 4 * 3072 + 4 * 1024 + 384 + 24 + 64 + 2 + 192 + 128 + 8 + 18_432);
+        assert_eq!(f32s, 512 * 100_130);
+        let forms = 3_440_640 + 4_176 + 45_139_464;
+        assert_eq!(
+            pass_bytes(&mini, 512),
+            4 * (f32s + 512 * 12 + 1) as u64 + forms
+        );
+        assert_eq!(pass_bytes(&mini, 512), 253_675_100);
     }
 }

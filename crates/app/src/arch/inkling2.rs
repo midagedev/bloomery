@@ -1,6 +1,6 @@
-//! The Inkling 2 session: [`Body`] behind the session's traits — its prompt stepped one id at a
-//! time ([`GpuModel::step`] over the slice: each id a decode step's bits, the head's argmax
-//! after the last the call's) and its keep rule. The whole-card body opens by its own constructor
+//! The Inkling 2 session: [`Body`] behind the session's traits — its prompt as the rows passes
+//! ([`GpuModel::prompt_pass`]: the stores left where the ids' steps leave them, the head's argmax
+//! after the last row the call's) and its keep rule. The whole-card body opens by its own constructor
 //! ([`GpuModel::open`]), so the session plans nothing. The body lives in the gpu crate's own
 //! inkling2 arch, so it needs no feature.
 
@@ -12,9 +12,9 @@ use crate::{Keep, Prompt, cut_where_it_stands, keep_where_it_stands};
 const WHAT: &str = "inkling2 session";
 
 impl Prompt for Body {
-    /// The ids one step at a time ([`GpuModel::step`]), one readback after the last.
+    /// The ids as passes of rows ([`GpuModel::prompt_pass`]), one readback after the last.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        m.step(ids)
+        m.prompt_pass(ids)
     }
 }
 

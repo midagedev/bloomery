@@ -3,10 +3,12 @@
 //! a looped layer's visits share its weights alone).
 //!
 //! - A visit's K and V: head-major `[n_kv][rows][128]` f16 planes as `qk_clip` appends them. A
-//!   windowed visit whose window is under the context holds a ring of `window` rows (position `p`
-//!   at row `p mod window`, the rel-bias ring entries' indexing); every other visit holds a plane
-//!   of `ctx` rows. Only rows below the live count are read, and each is written by its own step
-//!   first, so a reset needs nothing of them.
+//!   windowed visit holds a ring of the plan's rows ([`runtime::stores::ring_rows`]: the window
+//!   and a prompt pass's rows, padded) when that is under the context (position `p` at row
+//!   `p mod rows`, the rel-bias ring entries' indexing), so a pass that appends its rows before
+//!   it reads keeps every key its rows read; every other visit holds a plane of `ctx` rows. Only
+//!   rows below the live count are read, and each is written by its own step or pass first, so a
+//!   reset needs nothing of them.
 //! - A visit's conv ring: [`Ring::values`] over the visit's whole channel width (the k and v
 //!   paths, then the two post convs, `conv_res`'s one ring a visit). A position before the
 //!   sequence start reads zero whatever the ring holds (`conv_res`'s rule); the ring is zeroed at
@@ -33,7 +35,7 @@ pub(super) struct StoreShape {
     /// Key heads and their values.
     pub(super) n_kv: usize,
     pub(super) head: usize,
-    /// The planes' rows a key head: the ring's `window`, or `ctx`.
+    /// The planes' rows a key head: the ring's ([`runtime::stores::ring_rows`]), or `ctx`.
     pub(super) rows: usize,
     /// Whether the planes are a ring of `rows` rows (the append at the ring row).
     pub(super) ring: bool,
@@ -43,25 +45,39 @@ pub(super) struct StoreShape {
 
 /// The stores of every visit, in run order: `windowed[v]` whether visit `v` attends a window of
 /// `window` positions, every visit over `ctx` positions with `n_kv` key heads of `head` values
-/// and a conv ring of `ring` over `ch` channels.
+/// and a conv ring of `ring` over `ch` channels. A windowed visit rings at
+/// [`runtime::stores::ring_rows`] rows where those are under `ctx`.
 pub(super) fn shapes(
     windowed: impl Iterator<Item = bool>,
     (n_kv, head): (usize, usize),
     (window, ctx): (usize, usize),
     (ring, ch): (Ring, usize),
 ) -> Vec<StoreShape> {
+    let ring_rows = usize::try_from(runtime::stores::ring_rows(window as u64, ctx as u64))
+        .unwrap_or(ctx)
+        .min(ctx);
     windowed
         .map(|w| {
-            let ring_rows = w && window < ctx;
+            let rings = w && ring_rows < ctx;
             StoreShape {
                 n_kv,
                 head,
-                rows: if ring_rows { window } else { ctx },
-                ring: ring_rows,
+                rows: if rings { ring_rows } else { ctx },
+                ring: rings,
                 conv: ring.values(ch),
             }
         })
         .collect()
+}
+
+/// One visit's stores read back: the K and V planes and the conv ring as the card holds them.
+pub struct StoreHost {
+    pub k: Vec<u16>,
+    pub v: Vec<u16>,
+    pub conv: Vec<f32>,
+    /// The planes' rows a key head, and whether they ring (position `p` at row `p mod rows`).
+    pub rows: usize,
+    pub ring: bool,
 }
 
 /// One visit's stores.
@@ -92,6 +108,18 @@ impl VisitStore {
 
     pub(super) fn bytes(&self) -> usize {
         self.kc.num_bytes() + self.vc.num_bytes() + self.conv.num_bytes()
+    }
+
+    /// The stores as the card holds them, after `stream`'s work so far. A blocking read.
+    pub(super) fn to_host(&self, stream: &CudaStream) -> Result<StoreHost, GpuError> {
+        stream.synchronize()?;
+        Ok(StoreHost {
+            k: self.kc.to_host_vec(stream)?,
+            v: self.vc.to_host_vec(stream)?,
+            conv: self.conv.to_host_vec(stream)?,
+            rows: self.shape.rows,
+            ring: self.shape.ring,
+        })
     }
 }
 
@@ -153,11 +181,12 @@ pub(super) fn tau_of(pos: u32, floor: u32, alpha: f32) -> f32 {
 mod tests {
     use super::{Ring, shapes, tau_of};
 
-    /// A windowed visit rings at its window only under a longer context, and every visit's conv
-    /// ring holds the ring's rows over its channels. Mutant: the ring sized at `reach()` (the
-    /// rows a token reads) fails the conv count.
+    /// A windowed visit rings at the window plus a prompt pass's rows, padded (1,024 + 511 up to
+    /// 1,536), only under a longer context, and every visit's conv ring holds the ring's rows over
+    /// its channels. Mutants: the ring at the window alone (1,024) fails the first; the ring sized
+    /// at `reach()` (the rows a token reads) fails the conv count.
     #[test]
-    fn the_shapes_ring_a_window_under_the_context_alone() {
+    fn the_shapes_ring_a_window_and_a_pass_under_the_context_alone() {
         let ring = Ring::new(4);
         let s = shapes(
             [true, false].into_iter(),
@@ -165,11 +194,13 @@ mod tests {
             (1024, 4096),
             (ring, 10),
         );
-        assert_eq!((s[0].rows, s[0].ring), (1024, true));
+        assert_eq!((s[0].rows, s[0].ring), (1536, true));
         assert_eq!((s[1].rows, s[1].ring), (4096, false));
         assert_eq!(s[0].conv, ring.rows() * 10);
-        let short = shapes([true].into_iter(), (8, 128), (1024, 512), (ring, 10));
-        assert_eq!((short[0].rows, short[0].ring), (512, false));
+        for ctx in [512, 1536] {
+            let short = shapes([true].into_iter(), (8, 128), (1024, ctx), (ring, 10));
+            assert_eq!((short[0].rows, short[0].ring), (ctx, false));
+        }
     }
 
     /// The factor is 1 through the floor and grows by alpha's log past it.

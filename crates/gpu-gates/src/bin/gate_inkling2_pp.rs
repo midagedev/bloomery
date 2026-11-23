@@ -31,9 +31,26 @@
 //!    over 512 seeded rows against the step's leg on the same rows, an NVFP4 layer and the Q8_0
 //!    coda, within [`MOE_BAND`] (derived at the constant).
 //! 9. `moe_leg_rows`: the leg over the 512 rows equals the leg over one row, bit for bit.
+//! 10. `pass_is_steps`: the whole-card prompt pass (`GpuModel::prompt_pass`, passes of up to 512
+//!     rows over every visit) against the step chain over two calls of set `e` under its forced
+//!     picks — the second call carries every store across a call boundary and wraps the windowed
+//!     visits' rings. The first visit's stores (keys, values, conv rings) within
+//!     `FIRST_VISIT_BAND` (derived at the constant), blocks 0 and 1 within the e2e's forced stage
+//!     bands, the later blocks and the kept logits (every 64th row and each call's last) printed;
+//!     and `pass_is_single_rows`: the same calls run one row a pass equal the 512-row passes, the
+//!     kept logits and every written store row the same bits, so the carry across pass, call and
+//!     ring boundaries is exact.
+//! 11. `pass_is_the_oracle`: the pass's taps at the last row under the vendor's picks within
+//!     `gate_inkling2_e2e`'s forced bands by block, and the free pass's greedy id against every
+//!     fixture set's `greedy.tsv` under the e2e's pin (σ `SIGMA_FIXTURE`, margins at or past
+//!     `MARGIN_FLOOR`).
+//! 12. `pass_reserve`: the bytes the pass's buffers take equal the plan's reserve
+//!     (`place::pass_bytes` at the pass's rows), which the load refuses past by name.
 //!
 //! Clauses 8 and 9 read the tier's model file (the fixture's on the fixture tier, the Mini's on
-//! the real tier): its expert stacks, nothing else.
+//! the real tier): its expert stacks, nothing else. Clauses 10 to 12 load the whole file; 10 and
+//! 11 run on the fixture tier, where the sets are; the real tier runs 12 and the development
+//! timing (`DEV_P`, printed, no pin).
 //!
 //! [derived] [`PP_BAND`]: the two kernels compute the same f32 rule in two orders — the step's
 //! lane dot and segment merge against the tensor core's k16 steps and the tile walk — with the
@@ -47,7 +64,9 @@
 //! What each clause holds red: a bias distance one past the step's, the query's low half dropped
 //! (plain f16 queries miss [`PP_BAND`] on every pass), a window cut one key short or the sink left
 //! out turn `prefill_attn`; any change to the controller's order of rounding turns `control_rows`;
-//! SwiGLU in SiTU's place in the route block turns `moe_rows`.
+//! SwiGLU in SiTU's place in the route block turns `moe_rows`; the conv rings cleared at a pass
+//! boundary turn `pass_is_steps`; every visit routed by the first visit's picks turns
+//! `pass_is_the_oracle`; a pass buffer one row short turns `pass_reserve`.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -925,6 +944,630 @@ mod gate {
         Ok(ok)
     }
 
+    /// The whole-card prompt pass (`Body`'s `prompt_pass`) on the tier's model file: clauses 10 to
+    /// 12 and the development timing (module doc).
+    mod pass {
+        use super::clause;
+        use bloomery_gpu::arch::inkling2::{Body, StoreHost, TAP_STAGES};
+        use bloomery_gpu::model::StepMode;
+        use bloomery_gpu::{Gpu, GpuModel};
+        use bloomery_gpu_gates::prompts::{MARGIN_FLOOR, std_normal_cdf};
+        use bloomery_gpu_gates::rel::rel;
+        use bloomery_gpu_gates::tier::{self, Tier};
+        use bloomery_gpu_gates::{
+            GateError, RefManifest, RowKind, bits_equal, open_split, ref_tensor_logical_in,
+            topk_ids_logical_within,
+        };
+        use gguf::quant::half_to_f32;
+        use model::arch::Arch;
+        use model::arch::inkling2::hparams::Hparams;
+        use model::arch::inkling2::place::Inputs;
+        use refset::arch::{inkling2, prompt_tables};
+
+        const NAME: &str = "gate_inkling2_pp";
+        const RECIPE: &str = "gate-inkling2-pp";
+        /// The fixture tier's stores: two calls of set `e` (1,038 ids each), so the second call
+        /// carries every store across a call boundary and wraps the windowed visits' rings
+        /// (1,536 rows under this context).
+        const CTX: usize = 4096;
+        /// The real tier's stores: the development timing's longest prompt and room past it.
+        const CTX_REAL: usize = 8192;
+        /// The development timing's prompt lengths.
+        const DEV_P: [usize; 2] = [512, 4096];
+        const N_USED: usize = 8;
+        const N_EXPERT: u32 = 128;
+        /// The kept logits rows: every 64th row of a call and its last.
+        const SCORE_EVERY: usize = 64;
+        const L_OUT: usize = TAP_STAGES.len() - 1;
+        /// `gate_inkling2_e2e`'s forced-chain bands by block (its `FORCED_BANDS` and
+        /// `FORCED_STAGE_BANDS`, the visit outputs and the other stages against the vendor's
+        /// nodes): clause 11 holds the pass's taps to them.
+        const FORCED_BANDS: [f64; 3] = [6.6e-2, 2.0e-1, 4.3e-1];
+        const FORCED_STAGE_BANDS: [f64; 2] = [1.2e-1, 3.5e-1];
+        /// [derived] The first visit's stores, pass against steps, the worst key or value row
+        /// (every head of a position) and the conv ring by relative L2. The first visit's keys and
+        /// values are its k and v projections (and taps) of the normed embedding through the
+        /// convs and the epilogue: the pass's projections read the row in q8 blocks of 32, the
+        /// step's gemv the f32 row, so each output carries one input rounding,
+        /// `(amax / rms) / (127 · √12)` of the block, ≈ 2.5 / 440 ≈ 5.7e-3 of a row, plus a
+        /// half-ulp of f16 (2⁻¹²) where the two land in different f16 values. The conv ring also
+        /// holds the post convs' inputs: the attention output (that rounding through the
+        /// projections and the attention, ~1e-2) and the routed sum (the route GEMM's 32-value
+        /// grid against the leg's 128-value one, `MOE_BAND`'s ~1.1e-2). 4e-2 is about three
+        /// times the worst of these; a ring that forgets its rows at a boundary moves those rows
+        /// by order 1.
+        const FIRST_VISIT_BAND: f64 = 4e-2;
+        /// `gate_inkling2_e2e`'s `SIGMA_FIXTURE`: the fixture's logit deviation between two
+        /// implementations, the σ of the greedy pin ([`greedy_pin`]).
+        const SIGMA_FIXTURE: f64 = 1.5;
+
+        /// The disagreements the Gaussian error of two implementations predicts at the margins of
+        /// `margins` at or past [`MARGIN_FLOOR`], and the pin that follows: the expected count plus
+        /// three standard deviations of it, rounded up (`gate_inkling2_e2e`'s `forced_pin`).
+        fn greedy_pin(margins: &[f32], sigma: f64) -> (f64, usize) {
+            let pair = sigma * std::f64::consts::SQRT_2;
+            let expected: f64 = margins
+                .iter()
+                .filter(|&&m| m >= MARGIN_FLOOR)
+                .map(|&m| std_normal_cdf(-f64::from(m) / pair))
+                .sum();
+            (expected, (expected + 3.0 * expected.sqrt()).ceil() as usize)
+        }
+
+        /// A fixture set's name, its ids, and its first greedy id and margin.
+        type GreedySet = (&'static str, Vec<u32>, (u32, f32));
+
+        /// Every fixture set's ids and its first greedy id and margin.
+        fn open_greedy() -> Result<Vec<GreedySet>, GateError> {
+            let family = &inkling2::fixture::LCPP;
+            let sets = [
+                inkling2::fixture::A,
+                inkling2::fixture::B,
+                inkling2::fixture::C,
+                inkling2::fixture::D,
+                inkling2::fixture::E,
+            ];
+            sets.iter()
+                .map(|&name| {
+                    let path = tier::fixture_set("the pass clauses", family, name)?;
+                    let man = RefManifest::open(&path, family)?;
+                    let g = prompt_tables::greedy(&man)?;
+                    let first = g
+                        .ids
+                        .first()
+                        .zip(g.margins.first())
+                        .map(|(&id, &m)| (id, m))
+                        .ok_or_else(|| format!("{name}: an empty greedy table"))?;
+                    Ok((name, prompt_tables::tokens(&man)?.to_vec(), first))
+                })
+                .collect()
+        }
+
+        /// Set `e` of the fixture's family: its ids, the vendor's picks at every position and
+        /// every visit's [`TAP_STAGES`] at the last position.
+        struct SetE {
+            prompt: Vec<u32>,
+            picks: (Vec<Vec<u32>>, Vec<Vec<f32>>),
+            stages: Vec<Vec<Option<Vec<f32>>>>,
+        }
+
+        /// Every occurrence of `name` in order: the prompt's rows.
+        fn all_rows(man: &RefManifest, name: &str) -> Result<Vec<f32>, GateError> {
+            let mut out = Vec::new();
+            let mut occ = 0u32;
+            while let Some(row) = man.find(RowKind::Tensor, name, occ) {
+                out.extend(ref_tensor_logical_in(&man.dir, row)?);
+                occ += 1;
+            }
+            Ok(out)
+        }
+
+        /// The last row of `n` values of node `name`, `None` where the dump names none.
+        fn last_row(
+            man: &RefManifest,
+            name: &str,
+            n: usize,
+        ) -> Result<Option<Vec<f32>>, GateError> {
+            if man.tensor(name, 0).is_err() {
+                return Ok(None);
+            }
+            let mut occ = 0u32;
+            while man.tensor(name, occ + 1).is_ok() {
+                occ += 1;
+            }
+            let all = ref_tensor_logical_in(&man.dir, man.tensor(name, occ)?)?;
+            if all.len() < n || !all.len().is_multiple_of(n) {
+                return Err(format!(
+                    "{name} occurrence {occ}: {} values, not rows of {n}",
+                    all.len()
+                )
+                .into());
+            }
+            Ok(Some(all[all.len() - n..].to_vec()))
+        }
+
+        fn open_e(widths: &[usize; TAP_STAGES.len()], visits: usize) -> Result<SetE, GateError> {
+            let family = &inkling2::fixture::LCPP;
+            let path = tier::fixture_set("the pass clauses", family, inkling2::fixture::E)?;
+            let man = RefManifest::open(&path, family)?;
+            let prompt: Vec<u32> = prompt_tables::tokens(&man)?.to_vec();
+            let p = prompt.len();
+            let (mut ids, mut ws) = (Vec::new(), Vec::new());
+            for v in 0..visits {
+                let topk = format!("ffn_moe_topk-{v}");
+                let mut got = Vec::new();
+                let mut occ = 0u32;
+                while let Some(row) = man.find(RowKind::Tensor, &topk, occ) {
+                    got.extend(
+                        topk_ids_logical_within(&man, row, N_EXPERT)?
+                            .into_iter()
+                            .map(|id| id as u32),
+                    );
+                    occ += 1;
+                }
+                let w = all_rows(&man, &format!("ffn_moe_weights_scaled-{v}"))?;
+                if got.len() != p * N_USED || w.len() != p * N_USED {
+                    return Err(format!(
+                        "visit {v}: {} picks and {} weights for {p} positions",
+                        got.len(),
+                        w.len()
+                    )
+                    .into());
+                }
+                ids.push(got);
+                ws.push(w);
+            }
+            let stages = (0..visits)
+                .map(|v| {
+                    TAP_STAGES
+                        .iter()
+                        .zip(widths)
+                        .map(|(stage, &w)| last_row(&man, &format!("{stage}-{v}"), w))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(SetE {
+                prompt,
+                picks: (ids, ws),
+                stages,
+            })
+        }
+
+        /// Each visit's block: the block joins at or before it, less one (`gate_inkling2_e2e`'s).
+        fn blocks_of(table: &[(u32, u32)], block: usize) -> Vec<usize> {
+            let mut joins = 0usize;
+            table
+                .iter()
+                .map(|&(l, _)| {
+                    if (l as usize).is_multiple_of(block) {
+                        joins += 1;
+                    }
+                    joins.saturating_sub(1)
+                })
+                .collect()
+        }
+
+        /// The vendor's picks of every visit at `rows` positions from `from` of the set's (the
+        /// positions past the set's last taken from its first again), visit-major then
+        /// position-major.
+        fn picks_at(s: &SetE, from: usize, rows: usize) -> (Vec<u32>, Vec<f32>) {
+            let p = s.prompt.len();
+            let (mut ids, mut ws) = (Vec::new(), Vec::new());
+            for (vi, vw) in s.picks.0.iter().zip(&s.picks.1) {
+                for pos in from..from + rows {
+                    let at = (pos % p) * N_USED..(pos % p + 1) * N_USED;
+                    ids.extend_from_slice(&vi[at.clone()]);
+                    ws.extend_from_slice(&vw[at]);
+                }
+            }
+            (ids, ws)
+        }
+
+        fn stores(m: &mut GpuModel<Body>) -> Result<Vec<StoreHost>, GateError> {
+            let (gpu, _, body) = m.body_parts(NAME)?;
+            Ok(body.stores_to_host(gpu.stream())?)
+        }
+
+        /// One store pair's distance: the worst key and value row (a position's every head) by
+        /// relative L2 over the rows both hold, its row, and the conv rings'.
+        fn store_rel(a: &StoreHost, b: &StoreHost, written: usize) -> (f64, usize, f64) {
+            let rows = written.min(a.rows);
+            let heads = a.k.len() / (a.rows * 128);
+            let mut worst = (0.0f64, 0usize);
+            for r in 0..rows {
+                for (pa, pb) in [(&a.k, &b.k), (&a.v, &b.v)] {
+                    let row = |p: &[u16]| -> Vec<f32> {
+                        (0..heads)
+                            .flat_map(|h| {
+                                let at = (h * a.rows + r) * 128;
+                                p[at..at + 128].iter().map(|&x| half_to_f32(x))
+                            })
+                            .collect()
+                    };
+                    let x = rel(&row(pa), &row(pb));
+                    if x > worst.0 || x.is_nan() {
+                        worst = (x, r);
+                    }
+                }
+            }
+            (worst.0, worst.1, rel(&a.conv, &b.conv))
+        }
+
+        /// Whether two stores hold the same bits: the key and value rows of the `written`
+        /// positions (the rows past them are unread and hold what an earlier run left) and the
+        /// conv rings.
+        fn same_stores(a: &[StoreHost], b: &[StoreHost], written: usize) -> bool {
+            a.iter().zip(b).all(|(x, y)| {
+                let rows = written.min(x.rows);
+                let heads = x.k.len() / (x.rows * 128);
+                (0..heads).all(|h| {
+                    let at = h * x.rows * 128..(h * x.rows + rows) * 128;
+                    x.k[at.clone()] == y.k[at.clone()] && x.v[at.clone()] == y.v[at]
+                }) && bits_equal(&x.conv, &y.conv)
+            })
+        }
+
+        /// Clause 12 `pass_reserve`: the pass's buffers are the bytes the plan reserves.
+        fn reserve(m: &GpuModel<Body>, planned: u64) -> Result<bool, GateError> {
+            let body = m.body(NAME)?;
+            let made = body.pass_made_bytes() as u64;
+            Ok(clause(
+                "pass_reserve",
+                made == planned,
+                &format!(
+                    "the pass allocates {made} B at {} rows; the plan reserves {planned} B \
+                     (place::pass_bytes)",
+                    body.pass_rows()
+                ),
+            ))
+        }
+
+        /// What one arm of clause 10 leaves: the kept logits rows and the stores after each call.
+        struct Arm {
+            logits: Vec<Vec<f32>>,
+            stores: Vec<Vec<StoreHost>>,
+        }
+
+        /// Clause 10 `pass_is_steps` (module doc): three arms over two calls of set `e` with the
+        /// vendor's picks forced — the pass, the pass one row a call and the steps.
+        #[allow(clippy::too_many_lines, reason = "three arms and their comparisons")]
+        fn pass_is_steps(
+            m: &mut GpuModel<Body>,
+            s: &SetE,
+            (block, vocab): (usize, usize),
+        ) -> Result<Vec<bool>, GateError> {
+            let p = s.prompt.len();
+            let mut scored: Vec<usize> = (0..p).step_by(SCORE_EVERY).collect();
+            if scored.last() != Some(&(p - 1)) {
+                scored.push(p - 1);
+            }
+            m.set_mode(StepMode::Eager);
+            // The pass: each call one forced pass call.
+            m.reset()?;
+            let mut pass = Arm {
+                logits: Vec::new(),
+                stores: Vec::new(),
+            };
+            for call in 0..2 {
+                let (ids, ws) = picks_at(s, call * p, p);
+                {
+                    let (gpu, _, body) = m.body_parts(NAME)?;
+                    body.force_pass_picks(gpu, (&ids, &ws), p)?;
+                }
+                let (_, kept) = m.prompt_pass_scored(&s.prompt, &scored)?;
+                pass.logits.extend(kept);
+                pass.stores.push(stores(m)?);
+            }
+            // The pass one row a call, and the steps, at the same positions.
+            let mut arms = Vec::new();
+            for rows_arm in [true, false] {
+                m.reset()?;
+                let mut arm = Arm {
+                    logits: Vec::new(),
+                    stores: Vec::new(),
+                };
+                for call in 0..2 {
+                    for (t, &id) in s.prompt.iter().enumerate() {
+                        let (ids, ws) = picks_at(s, call * p + t, 1);
+                        let keep = scored.contains(&t);
+                        if rows_arm {
+                            {
+                                let (gpu, _, body) = m.body_parts(NAME)?;
+                                body.force_pass_picks(gpu, (&ids, &ws), 1)?;
+                            }
+                            let (_, kept) =
+                                m.prompt_pass_scored(&[id], if keep { &[0] } else { &[] })?;
+                            arm.logits.extend(kept);
+                        } else {
+                            {
+                                let (gpu, _, body) = m.body_parts(NAME)?;
+                                body.force_picks(gpu, (&ids, &ws))?;
+                            }
+                            m.step(&[id])?;
+                            if keep {
+                                arm.logits.push(m.logits()?);
+                            }
+                        }
+                    }
+                    arm.stores.push(stores(m)?);
+                }
+                arms.push(arm);
+            }
+            {
+                let body = m.body_parts(NAME)?.2;
+                body.unforce_pass_picks();
+                body.unforce_picks();
+            }
+            let steps = arms.pop().ok_or("the steps arm")?;
+            let rows = arms.pop().ok_or("the rows arm")?;
+            let blocks = blocks_of(&m.body(NAME)?.visit_table(), block);
+            let mut ok = Vec::new();
+            // The pass against the steps: the first visit held, every visit and kept row printed,
+            // the blocks of the e2e's stage bands held.
+            let mut first_worst = 0.0f64;
+            let mut block_worst = (0.0f64, 0usize, 0usize);
+            for call in 0..2 {
+                let written = (call + 1) * p;
+                println!(
+                    "  pass_is_steps call {call} (positions {}..{written}):",
+                    call * p
+                );
+                for (v, (a, b)) in pass.stores[call]
+                    .iter()
+                    .zip(&steps.stores[call])
+                    .enumerate()
+                {
+                    let (kv, row, conv) = store_rel(a, b, written);
+                    println!(
+                        "    visit {v} (block {}): kv {kv:.2e} at row {row}, conv {conv:.2e}",
+                        blocks[v]
+                    );
+                    if v == 0 {
+                        first_worst = first_worst.max(kv).max(conv);
+                    }
+                    if let Some(&band) = FORCED_STAGE_BANDS.get(blocks[v]) {
+                        let share = kv.max(conv) / band;
+                        if share > block_worst.0 || share.is_nan() {
+                            block_worst = (share, v, call);
+                        }
+                    }
+                }
+            }
+            // The unpadded vocabulary: the padded columns are the head's constant in every arm.
+            let logit_rels: Vec<f64> = pass
+                .logits
+                .iter()
+                .zip(&steps.logits)
+                .map(|(a, b)| rel(&a[..vocab], &b[..vocab]))
+                .collect();
+            println!(
+                "  pass_is_steps logits rows {scored:?} x 2 calls, rel-L2 from the steps: {}",
+                logit_rels
+                    .iter()
+                    .map(|x| format!("{x:.2e}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            ok.push(clause(
+                "pass_is_steps first visit",
+                first_worst <= FIRST_VISIT_BAND,
+                &format!(
+                    "the first visit's worst key/value row and conv ring {first_worst:.3e} (band \
+                     {FIRST_VISIT_BAND:.0e}; the order: q8-32 wide GEMMs against the f32 gemv, the \
+                     prefill flash's key tiles, the route GEMM's 32-value grid)"
+                ),
+            ));
+            ok.push(clause(
+                "pass_is_steps blocks",
+                block_worst.0 <= 1.0,
+                &format!(
+                    "every visit's stores of blocks 0 and 1 within {FORCED_STAGE_BANDS:?}: worst \
+                     share {:.2} at visit {} after call {} (later blocks printed)",
+                    block_worst.0, block_worst.1, block_worst.2
+                ),
+            ));
+            // The pass against itself one row a call: the same kernels, so the same bits.
+            let logits_same = pass.logits.len() == rows.logits.len()
+                && pass
+                    .logits
+                    .iter()
+                    .zip(&rows.logits)
+                    .all(|(a, b)| bits_equal(a, b));
+            let stores_same: Vec<bool> = (0..2)
+                .map(|c| same_stores(&pass.stores[c], &rows.stores[c], (c + 1) * p))
+                .collect();
+            let worst_rows = (0..2)
+                .flat_map(|c| {
+                    pass.stores[c]
+                        .iter()
+                        .zip(&rows.stores[c])
+                        .enumerate()
+                        .map(move |(v, (a, b))| (store_rel(a, b, (c + 1) * p), v, c))
+                })
+                .fold(((0.0f64, 0usize, 0.0f64), 0usize, 0usize), |w, x| {
+                    if x.0.0.max(x.0.2) > w.0.0.max(w.0.2) {
+                        x
+                    } else {
+                        w
+                    }
+                });
+            let worst_logit = pass
+                .logits
+                .iter()
+                .zip(&rows.logits)
+                .map(|(a, b)| rel(a, b))
+                .fold(0.0f64, f64::max);
+            ok.push(clause(
+                "pass_is_single_rows",
+                logits_same && stores_same.iter().all(|&x| x),
+                &format!(
+                    "passes of 512 rows against passes of one row a call: logits rows same bits \
+                     {logits_same} (worst rel {worst_logit:.2e}), stores same bits {stores_same:?} \
+                     (worst kv {:.2e} at row {} / conv {:.2e}, visit {}, call {})",
+                    worst_rows.0.0, worst_rows.0.1, worst_rows.0.2, worst_rows.1, worst_rows.2
+                ),
+            ));
+            Ok(ok)
+        }
+
+        /// Clause 11 `pass_is_the_oracle` (module doc): the forced pass's taps against the
+        /// vendor's nodes in the e2e's bands, and the free pass's greedy id.
+        fn pass_is_the_oracle(
+            m: &mut GpuModel<Body>,
+            s: &SetE,
+            block: usize,
+        ) -> Result<Vec<bool>, GateError> {
+            let p = s.prompt.len();
+            m.reset()?;
+            let (ids, ws) = picks_at(s, 0, p);
+            {
+                let (gpu, _, body) = m.body_parts(NAME)?;
+                body.arm_taps(gpu)?;
+                body.force_pass_picks(gpu, (&ids, &ws), p)?;
+            }
+            m.prompt_pass(&s.prompt)?;
+            let (taps, widths, blocks) = {
+                let (gpu, _, body) = m.body_parts(NAME)?;
+                let out = (
+                    body.taps(gpu.stream())?,
+                    body.tap_widths(),
+                    blocks_of(&body.visit_table(), block),
+                );
+                body.unforce_pass_picks();
+                body.disarm_taps();
+                out
+            };
+            let row: usize = widths.iter().sum();
+            let (mut held, mut worst) = (0usize, (0.0f64, 0usize, ""));
+            for (v, theirs) in s.stages.iter().enumerate() {
+                let mut at = v * row;
+                for (k, (w, t)) in widths.iter().zip(theirs).enumerate() {
+                    let ours = &taps[at..at + w];
+                    at += w;
+                    let Some(t) = t else { continue };
+                    let x = rel(ours, t);
+                    let bands: &[f64] = if k == L_OUT {
+                        &FORCED_BANDS
+                    } else {
+                        &FORCED_STAGE_BANDS
+                    };
+                    if let Some(band) = bands.get(blocks[v]) {
+                        held += 1;
+                        if x / band > worst.0 || x.is_nan() {
+                            worst = (x / band, v, TAP_STAGES[k]);
+                        }
+                    }
+                }
+            }
+            let mut ok = vec![clause(
+                "pass_is_the_oracle taps",
+                worst.0 <= 1.0,
+                &format!(
+                    "the forced pass's taps at the last row against the vendor's nodes: held={held} \
+                     worst_share={:.2} at {}-{} (gate_inkling2_e2e's bands by block)",
+                    worst.0, worst.2, worst.1
+                ),
+            )];
+            // The free pass's first greedy id on every fixture set against the vendor's.
+            let (mut margins, mut off, mut rows) = (Vec::new(), 0usize, Vec::new());
+            for (name, prompt, (want, margin)) in open_greedy()? {
+                m.reset()?;
+                let id = m.prompt_pass(&prompt)?;
+                margins.push(margin);
+                if id != want && margin >= MARGIN_FLOOR {
+                    off += 1;
+                }
+                rows.push(format!(
+                    "{}: {id}/{want} at {margin:.2}",
+                    name.trim_start_matches("fx_ref_inkling2_")
+                ));
+            }
+            let (expected, pin) = greedy_pin(&margins, SIGMA_FIXTURE);
+            ok.push(clause(
+                "pass_is_the_oracle greedy",
+                off <= pin,
+                &format!(
+                    "the free pass's first greedy id against the vendor's (ours/theirs at the \
+                     vendor's margin): {}; disagreements at or past MARGIN_FLOOR {MARGIN_FLOOR}: \
+                     {off}, expected {expected:.2}, pin {pin} (gate_inkling2_e2e's rule at its \
+                     fixture σ {SIGMA_FIXTURE})",
+                    rows.join(", ")
+                ),
+            ));
+            Ok(ok)
+        }
+
+        /// The development timing on the real tier: the pass's wall at each of [`DEV_P`] rows
+        /// from a reset, twice, after a warm pass; a development number, no lease.
+        fn dev_timing(m: &mut GpuModel<Body>) -> Result<(), GateError> {
+            let family = &inkling2::LCPP;
+            let man = RefManifest::open(&family.path(inkling2::E), family)?;
+            let base: Vec<u32> = prompt_tables::tokens(&man)?.to_vec();
+            let ids: Vec<u32> = base.iter().copied().cycle().take(DEV_P[1]).collect();
+            m.reset()?;
+            m.prompt_pass(&ids[..DEV_P[0]])?;
+            for &p in &DEV_P {
+                for run in 0..2 {
+                    m.reset()?;
+                    let t = std::time::Instant::now();
+                    m.prompt_pass(&ids[..p])?;
+                    let s = t.elapsed().as_secs_f64();
+                    println!(
+                        "  dev pass P={p} run {run}: {:.1} ms, {:.0} tok/s (development number: no lease)",
+                        s * 1e3,
+                        p as f64 / s
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        pub(super) fn clauses() -> Result<Vec<bool>, GateError> {
+            let tier = Tier::from_env()?;
+            let split = open_split(Arch::Inkling2, RECIPE)?;
+            let hp =
+                Hparams::read(&split).map_err(|e| format!("{NAME}: the file's header: {e}"))?;
+            let ctx = match tier {
+                Tier::Fixture => CTX,
+                Tier::Real => CTX_REAL,
+            };
+            let planned = Inputs::describe(&split)
+                .and_then(|i| i.pass_reserve(ctx as u64))
+                .map_err(|e| format!("{NAME}: the plan's pass reserve: {e}"))?;
+            let n = hp.n_embd;
+            let (q, kv, r) = (
+                hp.n_head[0] * 128,
+                hp.n_head_kv[0] * 128,
+                hp.n_head[0] * hp.d_rel,
+            );
+            let widths = [q, kv, kv, r, q, n, n, n, n, n];
+            let visits = model::arch::models::visits(
+                hp.n_layer,
+                hp.loop_.map(|lp| model::arch::models::LoopSpec {
+                    core_start: lp.core_start as u32,
+                    core_end: lp.core_end as u32,
+                    passes: lp.passes as u32,
+                    gate_rank: lp.gate_rank as u32,
+                }),
+            )
+            .len();
+            let set = match tier {
+                Tier::Fixture => Some(open_e(&widths, visits)?),
+                Tier::Real => None,
+            };
+            let mut m = GpuModel::<Body>::open(Gpu::new()?, split, ctx)?;
+            let mut ok = vec![reserve(&m, planned)?];
+            match &set {
+                Some(s) => {
+                    ok.extend(pass_is_steps(&mut m, s, (hp.block, hp.n_vocab_unpadded))?);
+                    ok.extend(pass_is_the_oracle(&mut m, s, hp.block)?);
+                }
+                None => dev_timing(&mut m)?,
+            }
+            Ok(ok)
+        }
+    }
+
     pub fn run() -> Result<(), GateError> {
         let gpu = Gpu::new()?;
         let ctx = gpu.context();
@@ -944,6 +1587,8 @@ mod gate {
         results.extend(attention_clauses(&dev, &mut rng)?);
         results.extend(control_clauses(&dev, &mut rng)?);
         results.extend(moe_clauses(&dev, &mut rng)?);
+        drop(dev);
+        results.extend(pass::clauses()?);
         let failed = results.iter().filter(|p| !**p).count();
         println!(
             "gate_inkling2_pp: {} — {} clauses, {failed} failed",
