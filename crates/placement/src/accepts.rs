@@ -188,7 +188,8 @@ pub const fn qwen35_gate_up(ty: GgmlType) -> Option<GateUpEntry> {
         | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
         | GateUpEntry::Mxfp4
-        | GateUpEntry::Nvfp4 => None,
+        | GateUpEntry::Nvfp4
+        | GateUpEntry::Mxfp8 => None,
     }
 }
 
@@ -221,7 +222,8 @@ pub const fn qwen35_down(ty: GgmlType) -> Option<DownEntry> {
         | DownEntry::Q2_0
         | DownEntry::Iq4xs
         | DownEntry::Mxfp4
-        | DownEntry::Nvfp4 => None,
+        | DownEntry::Nvfp4
+        | DownEntry::Mxfp8 => None,
     }
 }
 
@@ -727,18 +729,23 @@ fn bolt_leg_card(ty: GgmlType) -> Option<CardFormat> {
     latent_leg_runs(ty).then(|| leg_card_format(ty))
 }
 
-/// The Inkling 2 body's routed stacks: NVFP4 in its planes or Q8_0 in the file's blocks, the two
-/// forms its files hold — a fused gate·up stack of either, split at upload into the gate and up
-/// halves the common card leg's gate·up arm reads, and a down its down arm reads.
+/// The Inkling 2 body's routed stacks: NVFP4 in its planes, Q8_0 in the file's blocks, or MXFP8
+/// in its planes, the forms its files hold (the GGUF's NVFP4 and Q8_0 layers, the official
+/// checkpoint's NVFP4 and MXFP8 ones) — a fused gate·up stack of each, split at upload into the
+/// gate and up halves the common card leg's gate·up arm reads, and a down its down arm reads.
 #[must_use]
 pub const fn inkling2_leg(ty: GgmlType) -> bool {
-    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0)
+    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0 | GgmlType::MXFP8)
 }
 
 /// The Inkling 2 body's plan arm: a routed stack of a type [`inkling2_leg`] runs, in the leg's
-/// card format.
+/// card format; an MXFP8 stack in the planes its `_sel` pair and GEMM read (the type's routed
+/// column names none, so no other program's plan takes one).
 fn inkling2_leg_card(ty: GgmlType) -> Option<CardFormat> {
-    inkling2_leg(ty).then(|| leg_card_format(ty))
+    match ty {
+        GgmlType::MXFP8 => Some(CardFormat::Mxfp8Planes),
+        _ => inkling2_leg(ty).then(|| leg_card_format(ty)),
+    }
 }
 
 /// The muse-spark body's plan arm: [`MUSESPARK_LEG`], in its card format.

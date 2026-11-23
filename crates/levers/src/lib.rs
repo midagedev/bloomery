@@ -32,7 +32,7 @@ use std::sync::OnceLock;
 
 mod registry;
 use registry::REGISTRY;
-pub use registry::{AUTOTUNE, ELASTIC, PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
+pub use registry::{AUTOTUNE, ELASTIC, INK2_DENSE, PREPARE_Q8, SCHEMAJUMP, SPLIT_WALK, XSTREAM};
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_EXPERTS_CAP, CARD_MARGIN, CED, CHECK_FINITE, DRAFT,
     ENGRAM_HELPER, EXPERT_RANK, FORCE_IDS, GEN_SLOTS, GEN_SLOTS_MAX, HOST_LANES,
@@ -1655,6 +1655,17 @@ impl Levers {
     #[must_use]
     pub fn prepare_q8(&self) -> bool {
         self.flag(PREPARE_Q8)
+    }
+
+    /// `BLOOMERY_INK2_DENSE`: Inkling 2's official checkpoint folder opens its
+    /// dense weights written as Q8_0 at load (`q8_0`), not as stored (`bf16`).
+    #[must_use]
+    pub fn ink2_dense_q8(&self) -> bool {
+        match self.word(INK2_DENSE) {
+            Some("bf16") => false,
+            Some("q8_0") => true,
+            w => panic!("{INK2_DENSE} holds {w:?}, not bf16 or q8_0"),
+        }
     }
 
     /// `BLOOMERY_AUTOTUNE`: a server makes its load-time kernel picks (the

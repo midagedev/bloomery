@@ -341,7 +341,8 @@ impl GemmWeight {
             | GemmEntry::Q5_1
             | GemmEntry::Iq4nl
             | GemmEntry::Q2_0
-            | GemmEntry::Nvfp4 => None,
+            | GemmEntry::Nvfp4
+            | GemmEntry::Mxfp8 => None,
         }
     }
 

@@ -161,9 +161,11 @@ pub(crate) const OWN_ROWS: &[QRow] = &[
     // (`quant::E4m3Rows`), so `dequant_row`, which has no tensor scale, does not decode it.
     QRow { ty: T::F8E4M3_ROWS, name: "f8e4m3_rows", blck: 1, bytes: 1, dequant: false, host_act: H::None, card: Card::NONE },
     // mxfp8: OCP MX with F8_E4M3 elements, the block's E8M0 scale byte then its 32 F8_E4M3 bytes
-    // (`quant::check_mxfp8`, `dequant_mxfp8`); no CPU matmul here.
+    // (`quant::check_mxfp8`, `dequant_mxfp8`); no CPU matmul here. A routed stack's `_sel` pair and
+    // GEMM read its planes (`crates/gpu/src/mxfp8_sel.rs`, `gemm_mxfp8p`); a program that runs them
+    // names the planes as its stacks' card format, the routed column stays empty.
     QRow { ty: T::MXFP8, name: "mxfp8", blck: 32, bytes: 33, dequant: true, host_act: H::None,
-           card: card!(Mxfp8Planes   -             -       -                   -      Mxfp8   -    -) },
+           card: card!(Mxfp8Planes   -             Mxfp8   (Mxfp8, Q8Blocks32) Mxfp8  Mxfp8   -    -) },
     // nvfp4_rows: ModelOpt's NVFP4 groups of 16 values, the group's UE4M3 scale byte then its 8
     // code bytes in ModelOpt's order (value 2i in the low nibble of byte i, 2i + 1 in the high),
     // each value e2m1 x scale times its tensor's one f32 `<stem>.scale` (`quant::Nvfp4Rows`), so

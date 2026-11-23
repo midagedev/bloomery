@@ -559,8 +559,14 @@ pub struct Opened {
 /// the map, of [`plan_tensors`] or of the places its tensors ask for ([`open_as`]) is the
 /// folder's.
 pub fn open(dir: &Path) -> Result<Opened, Error> {
+    open_with(dir, false)
+}
+
+/// [`open`], with each BF16 or F32 matrix the map reads as Q8_0 written as Q8_0 at load where
+/// `q8` asks ([`read`]'s `q8`), and every other part in its stored format.
+pub fn open_with(dir: &Path, q8: bool) -> Result<Opened, Error> {
     let config = read_config(dir)?;
-    (map_of(&config, &dir.display())?.open)(dir, &config)
+    (map_of(&config, &dir.display())?.open)(dir, &config, q8)
 }
 
 /// The `general.architecture` the header of a folder whose `config.json` holds `config` names,
@@ -613,10 +619,11 @@ fn model_type_of(config: &Json) -> Option<&str> {
         .as_str()
 }
 
-/// The folder `dir`, whose config is `config`, opened as the map `M` reads it ([`open`]), and the
-/// draft it holds ([`FolderMap::draft`]). Any refusal of [`read`] or of the places the map's
-/// tensors ask for is the folder's; one of the draft is the draft's, held in [`Opened::draft`].
-pub fn open_as<M: FolderMap>(dir: &Path, config: &Json) -> Result<Opened, Error> {
+/// The folder `dir`, whose config is `config`, opened as the map `M` reads it ([`open_with`], `q8`
+/// as there), and the draft it holds ([`FolderMap::draft`]). Any refusal of [`read`] or of the
+/// places the map's tensors ask for is the folder's; one of the draft is the draft's, held in
+/// [`Opened::draft`].
+pub fn open_as<M: FolderMap>(dir: &Path, config: &Json, q8: bool) -> Result<Opened, Error> {
     let Folded {
         checkpoint,
         folder,
@@ -624,7 +631,7 @@ pub fn open_as<M: FolderMap>(dir: &Path, config: &Json) -> Result<Opened, Error>
         planned,
         skipped,
         kvs,
-    } = fold::<M>(dir, config, false, Keep::InPlace)?;
+    } = fold::<M>(dir, config, q8, Keep::InPlace)?;
     let (kvs, tokenizer) = tokenized(dir, &checkpoint, kvs)?;
     let Assembled {
         header,

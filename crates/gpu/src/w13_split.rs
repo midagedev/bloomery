@@ -128,8 +128,9 @@ fn plane_rows(rows: usize, per_expert: usize) -> String {
 /// Split the resident fused w13 stack `name` — every expert `2 · rows_half`
 /// rows, its gate rows `[0, rows_half)` above its up rows — into its gate and
 /// up stacks of the same resident form: an NVFP4 stack's planes, each half
-/// carrying the fused stack's per-expert scale values; a Q8_0 stack's two
-/// planes (the codes and the block scales, one pitched copy each); or a
+/// carrying the fused stack's per-expert scale values; a Q8_0 or an MXFP8
+/// stack's two planes (the codes and the block scales, one pitched copy
+/// each); or a
 /// K-quant's words (its row bytes a whole number of words, as the words the
 /// half's kernels address by byte offset need). Any other resident form is
 /// refused by name, as is a stack that is not whole experts of that many
@@ -190,6 +191,19 @@ pub fn split_w13(
                 k: *k,
             };
             Ok((gate, up))
+        }
+        DevWeight::Mxfp8 { qs, e, k } => {
+            let experts = whole_experts((qs.rows(), e.rows()), per_expert)
+                .ok_or_else(|| refuse(plane_rows(qs.rows(), per_expert)))?;
+            let geom = (experts, per_expert);
+            let half = |at_row| -> Result<DevWeight, GpuError> {
+                Ok(DevWeight::Mxfp8 {
+                    qs: half_plane(stream, qs, geom, (rows_half, at_row))?,
+                    e: half_plane(stream, e, geom, (rows_half, at_row))?,
+                    k: *k,
+                })
+            };
+            Ok((half(0)?, half(rows_half)?))
         }
         DevWeight::KQuant { ty, w, k } => {
             let (rows, cols) = (w.rows(), w.cols());

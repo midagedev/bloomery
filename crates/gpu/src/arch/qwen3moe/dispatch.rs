@@ -1307,7 +1307,8 @@ fn slots_down(
             | GateUpEntry::Iq3s
             | GateUpEntry::Iq4xs
             | GateUpEntry::Mxfp4
-            | GateUpEntry::Nvfp4 => {
+            | GateUpEntry::Nvfp4
+            | GateUpEntry::Mxfp8 => {
                 return Err(GpuError::state(
                     WHAT,
                     "a gate·up entry the plan admits for no stack here",
@@ -1387,7 +1388,8 @@ fn slots_down(
             | DownEntry::Q2_0
             | DownEntry::Iq4xs
             | DownEntry::Mxfp4
-            | DownEntry::Nvfp4 => {
+            | DownEntry::Nvfp4
+            | DownEntry::Mxfp8 => {
                 return Err(GpuError::state(
                     WHAT,
                     "a down entry the plan admits for no stack here",
@@ -1543,7 +1545,8 @@ fn apart_down(
         | GateUpEntry::Iq3s
         | GateUpEntry::Iq4xs
         | GateUpEntry::Mxfp4
-        | GateUpEntry::Nvfp4 => {
+        | GateUpEntry::Nvfp4
+        | GateUpEntry::Mxfp8 => {
             return Err(GpuError::state(
                 WHAT,
                 "a gate·up entry the plan admits for no stack here",
@@ -1597,7 +1600,8 @@ fn apart_down(
         | DownEntry::Q2_0
         | DownEntry::Iq4xs
         | DownEntry::Mxfp4
-        | DownEntry::Nvfp4 => {
+        | DownEntry::Nvfp4
+        | DownEntry::Mxfp8 => {
             return Err(GpuError::state(
                 WHAT,
                 "a down entry the plan admits for no stack here",

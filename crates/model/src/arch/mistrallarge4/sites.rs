@@ -99,7 +99,8 @@ const fn sel_up(entry: DownEntry) -> Option<SelUp> {
         | DownEntry::Iq4nl
         | DownEntry::Q2_0
         | DownEntry::Mxfp4
-        | DownEntry::Nvfp4 => None,
+        | DownEntry::Nvfp4
+        | DownEntry::Mxfp8 => None,
     }
 }
 

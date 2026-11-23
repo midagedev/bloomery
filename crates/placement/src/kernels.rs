@@ -68,7 +68,8 @@ pub const fn gemm_reads_blocks32(entry: GemmEntry) -> bool {
         | GemmEntry::Q5_1
         | GemmEntry::Iq4nl
         | GemmEntry::Q2_0
-        | GemmEntry::Nvfp4 => true,
+        | GemmEntry::Nvfp4
+        | GemmEntry::Mxfp8 => true,
         GemmEntry::Q3k
         | GemmEntry::Q4k
         | GemmEntry::Q5k
@@ -761,6 +762,10 @@ mod tests {
     // `iq1_s_gate_up_sel`, `iq1_m_gate_up_sel` through the block's shared
     // table, and their `_gemv_sel` downs); IQ2_XS also takes the file-block
     // layout and a routed column. Every other pair is unchanged.
+    // PIN(2026-11-23): the gate·up, down, activation-form and up pairs gain
+    // MXFP8 (`mxfp8_gate_up_sel`, `mxfp8_gemv_sel32` over its two planes, the
+    // Inkling 2 checkpoint's coda experts); its routed column and the run sets
+    // stay empty, so only the Inkling 2 body's plan arm places it.
     #[test]
     fn gate_up_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -780,6 +785,7 @@ mod tests {
                 (GgmlType::IQ2_S, GateUpEntry::Iq2s),
                 (GgmlType::IQ4_XS, GateUpEntry::Iq4xs),
                 (GgmlType::IQ1_M, GateUpEntry::Iq1m),
+                (GgmlType::MXFP8, GateUpEntry::Mxfp8),
                 (GgmlType::NVFP4_ROWS, GateUpEntry::Nvfp4),
             ]
         );
@@ -812,6 +818,7 @@ mod tests {
                 (GgmlType::IQ4_XS, DownEntry::Iq4xs),
                 (GgmlType::IQ1_M, DownEntry::Iq1m),
                 (GgmlType::Q2_0, DownEntry::Q2_0),
+                (GgmlType::MXFP8, DownEntry::Mxfp8),
                 (GgmlType::NVFP4_ROWS, DownEntry::Nvfp4),
             ]
         );
@@ -847,6 +854,7 @@ mod tests {
                 (GgmlType::IQ4_XS, DownAct::Q8Act),
                 (GgmlType::IQ1_M, DownAct::Q8Act),
                 (GgmlType::Q2_0, DownAct::Q8Blocks32),
+                (GgmlType::MXFP8, DownAct::Q8Blocks32),
                 (GgmlType::NVFP4_ROWS, DownAct::Q8Blocks32),
             ]
         );
@@ -883,6 +891,7 @@ mod tests {
                 GgmlType::NVFP4,
                 GgmlType::IQ4_NL,
                 GgmlType::Q2_0,
+                GgmlType::MXFP8,
                 GgmlType::NVFP4_ROWS,
             ]
         );
@@ -906,6 +915,7 @@ mod tests {
                 (GgmlType::NVFP4, DownEntry::Nvfp4),
                 (GgmlType::IQ4_NL, DownEntry::Iq4nl),
                 (GgmlType::Q2_0, DownEntry::Q2_0),
+                (GgmlType::MXFP8, DownEntry::Mxfp8),
                 (GgmlType::NVFP4_ROWS, DownEntry::Nvfp4),
             ]
         );
@@ -1002,6 +1012,7 @@ mod tests {
                 GgmlType::NVFP4,
                 GgmlType::IQ4_NL,
                 GgmlType::Q2_0,
+                GgmlType::MXFP8,
                 GgmlType::NVFP4_ROWS
             ]
         );
@@ -1047,6 +1058,8 @@ mod tests {
     // PIN(2026-10-25): and IQ2_XS, IQ2_S, IQ1_S and IQ1_M (`gemm_iq2xs`,
     // `gemm_iq2s`, `gemm_iq1s`, `gemm_iq1m` over the file's blocks); every
     // other pair is unchanged.
+    // PIN(2026-11-23): and MXFP8 (`gemm_mxfp8p` over its two planes, the `_sel`
+    // pair's integer rule); every other pair is unchanged.
     #[test]
     fn gemm_admits_exactly_the_pinned_pairs() {
         assert_eq!(
@@ -1070,6 +1083,7 @@ mod tests {
                 (GgmlType::IQ4_XS, GemmEntry::Iq4xs),
                 (GgmlType::IQ1_M, GemmEntry::Iq1m),
                 (GgmlType::Q2_0, GemmEntry::Q2_0),
+                (GgmlType::MXFP8, GemmEntry::Mxfp8),
                 (GgmlType::NVFP4_ROWS, GemmEntry::Nvfp4),
             ]
         );

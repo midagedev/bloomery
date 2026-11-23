@@ -20,11 +20,11 @@ pub mod qwen3moe;
 mod section;
 mod trunk;
 
-/// A folder map's row in [`MAPS`]: the `model_type`s it reads, the open of a folder it reads and
-/// the architecture it reads a config as.
+/// A folder map's row in [`MAPS`]: the `model_type`s it reads, the open of a folder it reads (its
+/// Q8_0 rewrite asked or not, [`folder::open_with`]) and the architecture it reads a config as.
 pub struct MapRow {
     pub model_types: &'static [&'static str],
-    pub open: fn(&Path, &Json) -> Result<folder::Opened, folder::Error>,
+    pub open: fn(&Path, &Json, bool) -> Result<folder::Opened, folder::Error>,
     pub architecture: fn(&Json) -> Result<&'static str, folder::Error>,
 }
 

@@ -124,6 +124,9 @@ pub enum GateUpEntry {
     /// `Nvfp4SelKernels::enqueue_gate_up` (`nvfp4_gate_up_sel`, the two
     /// planes and a tensor scale an expert) in `crates/gpu/src/mxfp4_sel.rs`.
     Nvfp4,
+    /// `Mxfp8SelKernels::enqueue_gate_up` (`mxfp8_gate_up_sel`, the two
+    /// planes) in `crates/gpu/src/mxfp8_sel.rs`.
+    Mxfp8,
 }
 
 /// A common card down `_sel` entry: slot `s` writes the rows of expert
@@ -188,6 +191,9 @@ pub enum DownEntry {
     /// `Nvfp4SelKernels::enqueue_sel32` (`nvfp4_gemv_sel32`, the two planes
     /// and a tensor scale an expert) in `crates/gpu/src/mxfp4_sel.rs`.
     Nvfp4,
+    /// `Mxfp8SelKernels::enqueue_sel32` (`mxfp8_gemv_sel32`, the two planes)
+    /// in `crates/gpu/src/mxfp8_sel.rs`.
+    Mxfp8,
 }
 
 /// The activation form a down `_sel` reads.
@@ -253,6 +259,9 @@ pub enum GemmEntry {
     /// tensor scale an expert of the route's stack) in
     /// `crates/gpu/src/gemm/kernels32.rs`.
     Nvfp4,
+    /// `Gemm32Weight::Mxfp8Planes` (`gemm_mxfp8p`, the two planes) in
+    /// `crates/gpu/src/gemm/kernels32.rs`.
+    Mxfp8,
 }
 
 /// A dense gemv site's launch family (`SiteTy` in `crates/gpu/src/site.rs`):
@@ -476,6 +485,7 @@ impl DownEntry {
         match self {
             DownEntry::Q5_0 => CardFormat::Q5_0,
             DownEntry::Nvfp4 => CardFormat::Nvfp4Planes,
+            DownEntry::Mxfp8 => CardFormat::Mxfp8Planes,
             DownEntry::Q4k
             | DownEntry::Q5k
             | DownEntry::Q6k

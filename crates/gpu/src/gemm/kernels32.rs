@@ -2246,6 +2246,8 @@ pub struct Gemm32Kernels {
     #[cfg(bloomery_nvfp4_mma)]
     pub(super) native: super::nvfp4mma::Kernels,
     pub(super) module: gemm32_kernels::LoadedModule,
+    /// The MXFP8 arm's module (`mxfp8gemm.rs`).
+    pub(super) mx8: super::mxfp8gemm::Mxfp8GemmKernels,
     /// One wave of `gemm_q8_0p_slab` on the card ([`q8_0p_wave`]).
     pub(super) q8_0p_wave: u32,
 }
@@ -2259,6 +2261,7 @@ impl Gemm32Kernels {
         let q8_0p_wave = q8_0p_wave(ctx, &module)?;
         Ok(Gemm32Kernels {
             module,
+            mx8: super::mxfp8gemm::Mxfp8GemmKernels::load(ctx)?,
             q8_0p_wave,
             #[cfg(bloomery_nvfp4_mma)]
             native: super::nvfp4mma::Kernels::load(ctx)?,

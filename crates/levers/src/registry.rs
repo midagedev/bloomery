@@ -63,6 +63,7 @@ pub const SCREEN: &str = "BLOOMERY_SCREEN";
 pub const SCHEMAJUMP: &str = "BLOOMERY_SCHEMAJUMP";
 pub const PREPARE_Q8: &str = "BLOOMERY_PREPARE_Q8";
 pub const AUTOTUNE: &str = "BLOOMERY_AUTOTUNE";
+pub const INK2_DENSE: &str = "BLOOMERY_INK2_DENSE";
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -1528,6 +1529,25 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         },
     },
     LeverSpec {
+        name: INK2_DENSE,
+        class: Class::A,
+        kind: Kind::Words(&["bf16", "q8_0"]),
+        default: Unset::Is("bf16"),
+        doc: "Inkling 2's dense weights when the model opens from its official checkpoint \
+              folder (`model_hf::folder::open_with`): `bf16` keeps the attention projections, \
+              the token embedding and the head as the folder stores them, two bytes a weight, \
+              read by the BF16 kernels (`norm_proj_bf16_f32`, `bf16_gemv`, `bf16_mma_gemm`); \
+              `q8_0` writes each of them as ggml's reference Q8_0 at load (the rewrite \
+              `BLOOMERY_PREPARE_Q8=1` writes), read by the Q8_0 kernels. The rewrite is lossy. \
+              The sink and conv projections stay BF16 and the experts keep their stored NVFP4 \
+              and MXFP8 blocks under both words; a GGUF file is read as it stores its tensors. \
+              `bf16` and `q8_0` are the same-binary arms. Read where the folder opens.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
         name: "BLOOMERY_POISON",
         class: Class::D,
         kind: Kind::Flag,
@@ -2161,6 +2181,16 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         "BLOOMERY_INKLING2_HF",
         None,
         "The Inkling 2 Mini folder whose config.json and mtp.safetensors header the hf crate's Inkling 2 draft gate reads.",
+    ),
+    path(
+        "BLOOMERY_INK2_OFFICIAL",
+        None,
+        "The official Inkling 2 Mini checkpoint folder (NVFP4 and MXFP8 experts, BF16 dense) the folder reader's gate and the card's official-folder gate open; each gate is deferred by name where it is unset.",
+    ),
+    path(
+        "BLOOMERY_INK2_GGUF",
+        None,
+        "The Inkling 2 Mini GGUF twin the folder reader's gate holds the official folder's tensors to; its recipe sets it to the profile's model file.",
     ),
     path(
         "BLOOMERY_KIMI_K3_GGUF",

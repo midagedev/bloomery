@@ -81,6 +81,7 @@ use crate::host::xstream::RingLayer;
 use crate::iq_sel::{IqDown, IqGateUp, Q20Down};
 use crate::kquant::{Act, GateUpAct, SelDown};
 use crate::mxfp4_sel::{Mxfp4SelKernels, Nvfp4Down, Nvfp4GateUp, Nvfp4SelKernels, Nvfp4Stack};
+use crate::mxfp8_sel::{Mxfp8Down, Mxfp8GateUp, Mxfp8SelKernels, Mxfp8Stack};
 use crate::q4k_sel::QuantSel;
 use crate::q5::{Q5Kernels, Q8Blocks32};
 use crate::q5_1_sel::{Q51SelDown, Q51SelKernels};
@@ -289,20 +290,23 @@ pub fn leg_bytes_for(shape: LegShape, act: DownAct) -> usize {
 
 /// A resident routed stack's device form: the file's blocks as words
 /// (`DevWeight::KQuant`), NVFP4's planes and its experts' scales
-/// (`DevWeight::Nvfp4Stack`), or a Q5_0 stack in the `pack_q5_0` layout
-/// (`DevWeight::Q5_0`), which `q5_0_gemv_sel` reads.
+/// (`DevWeight::Nvfp4Stack`), a Q5_0 stack in the `pack_q5_0` layout
+/// (`DevWeight::Q5_0`), which `q5_0_gemv_sel` reads, or MXFP8's planes
+/// (`DevWeight::Mxfp8`).
 #[derive(Clone, Copy)]
 pub(crate) enum StackW<'a> {
     Words(&'a DeviceTensor<u32>),
     Nvfp4(Nvfp4Stack<'a>),
     Q5_0(&'a DeviceTensor<u32>),
+    Mxfp8(Mxfp8Stack<'a>),
 }
 
 impl<'a> StackW<'a> {
     /// The resident routed stack `name` of `w` and its file type, for a walk
     /// whose route GEMM reads it ([`StackW::route`]): the file's blocks as
-    /// words, Q5_0 packed, or NVFP4's planes (type [`GgmlType::NVFP4`]). Any
-    /// other weight is refused by name as `what`'s.
+    /// words, Q5_0 packed, NVFP4's planes (type [`GgmlType::NVFP4`]) or
+    /// MXFP8's (type [`GgmlType::MXFP8`]). Any other weight is refused by name
+    /// as `what`'s.
     pub(crate) fn resident(
         what: &'static str,
         w: &'a Weights,
@@ -314,10 +318,13 @@ impl<'a> StackW<'a> {
             Some(DevWeight::Nvfp4Stack { .. }) => {
                 Ok((GgmlType::NVFP4, StackW::Nvfp4(w.nvfp4_stack(what, name)?)))
             }
+            Some(DevWeight::Mxfp8 { qs, e, .. }) => {
+                Ok((GgmlType::MXFP8, StackW::Mxfp8(Mxfp8Stack { qs, e })))
+            }
             _ => Err(GpuError::tensor(
                 what,
                 name,
-                "a resident routed stack (the file's blocks as words, Q5_0 packed, or NVFP4 planes)",
+                "a resident routed stack (the file's blocks as words, Q5_0 packed, or NVFP4 or MXFP8 planes)",
             )),
         }
     }
@@ -327,14 +334,15 @@ impl<'a> StackW<'a> {
         match self {
             StackW::Words(w) | StackW::Q5_0(w) => w.rows(),
             StackW::Nvfp4(s) => s.qs.rows(),
+            StackW::Mxfp8(s) => s.qs.rows(),
         }
     }
 
     /// The stack, of file type `ty`, as the route GEMM the kernel table names
     /// for that type reads it ([`kernels::gemm`]): a K-quant's or an
     /// i-quant's words through the grouped GEMM, the file's Q8_0, Q5_1,
-    /// IQ4_NL or Q2_0 blocks, a Q5_0 stack's packed words and NVFP4's planes through
-    /// the 32-value GEMM. `None` for a type the table names no GEMM for, or a
+    /// IQ4_NL or Q2_0 blocks, a Q5_0 stack's packed words and NVFP4's or MXFP8's planes
+    /// through the 32-value GEMM. `None` for a type the table names no GEMM for, or a
     /// form that GEMM does not read.
     pub(crate) fn route(self, ty: GgmlType) -> Option<RouteW<'a>> {
         Some(match (kernels::gemm(ty)?, self) {
@@ -344,8 +352,9 @@ impl<'a> StackW<'a> {
             (GemmEntry::Iq4nl, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Iq4NlFile(w)),
             (GemmEntry::Q2_0, StackW::Words(w)) => RouteW::Blocks32(Gemm32Weight::Q2_0File(w)),
             (GemmEntry::Nvfp4, StackW::Nvfp4(s)) => RouteW::Blocks32(Gemm32Weight::Nvfp4Planes(s)),
+            (GemmEntry::Mxfp8, StackW::Mxfp8(s)) => RouteW::Blocks32(Gemm32Weight::Mxfp8Planes(s)),
             (entry, StackW::Words(w)) => RouteW::Grouped(GemmWeight::of_entry(entry)?, w),
-            (_, StackW::Nvfp4(_) | StackW::Q5_0(_)) => return None,
+            (_, StackW::Nvfp4(_) | StackW::Q5_0(_) | StackW::Mxfp8(_)) => return None,
         })
     }
 }
@@ -650,6 +659,12 @@ impl<'a> LegStack<'a> {
                 w: StackW::Nvfp4(w.nvfp4_stack(WHAT, name)?),
                 k: *k,
             }),
+            Some(DevWeight::Mxfp8 { qs, e, k }) if runs(GgmlType::MXFP8) => Ok(LegStack {
+                name,
+                ty: GgmlType::MXFP8,
+                w: StackW::Mxfp8(Mxfp8Stack { qs, e }),
+                k: *k,
+            }),
             _ => Err(GpuError::Tensor {
                 what: WHAT,
                 name: name.to_owned(),
@@ -681,7 +696,7 @@ impl<'a> LegStack<'a> {
     fn words(&self) -> Result<&'a DeviceTensor<u32>, GpuError> {
         match self.w {
             StackW::Words(w) => Ok(w),
-            StackW::Nvfp4(_) | StackW::Q5_0(_) => Err(self.unrun()),
+            StackW::Nvfp4(_) | StackW::Q5_0(_) | StackW::Mxfp8(_) => Err(self.unrun()),
         }
     }
 
@@ -689,7 +704,7 @@ impl<'a> LegStack<'a> {
     fn q5_0(&self) -> Result<&'a DeviceTensor<u32>, GpuError> {
         match self.w {
             StackW::Q5_0(w) => Ok(w),
-            StackW::Words(_) | StackW::Nvfp4(_) => Err(self.unrun()),
+            StackW::Words(_) | StackW::Nvfp4(_) | StackW::Mxfp8(_) => Err(self.unrun()),
         }
     }
 
@@ -697,7 +712,15 @@ impl<'a> LegStack<'a> {
     fn planes(&self) -> Result<Nvfp4Stack<'a>, GpuError> {
         match self.w {
             StackW::Nvfp4(s) => Ok(s),
-            StackW::Words(_) | StackW::Q5_0(_) => Err(self.unrun()),
+            StackW::Words(_) | StackW::Q5_0(_) | StackW::Mxfp8(_) => Err(self.unrun()),
+        }
+    }
+
+    /// The stack's two planes, for an MXFP8 entry.
+    fn mxfp8(&self) -> Result<Mxfp8Stack<'a>, GpuError> {
+        match self.w {
+            StackW::Mxfp8(s) => Ok(s),
+            StackW::Words(_) | StackW::Q5_0(_) | StackW::Nvfp4(_) => Err(self.unrun()),
         }
     }
 
@@ -1059,6 +1082,7 @@ pub struct CardLeg {
     q6k: Q6kSelKernels,
     mxfp4: Mxfp4SelKernels,
     nvfp4: Nvfp4SelKernels,
+    mxfp8: Mxfp8SelKernels,
     q51: Q51SelKernels,
     q80: Q80SelKernels,
     slots: CardSlotKernels,
@@ -1082,6 +1106,7 @@ impl CardLeg {
             q6k: Q6kSelKernels::load(ctx, word)?,
             mxfp4: Mxfp4SelKernels::load(ctx, word)?,
             nvfp4: Nvfp4SelKernels::load(ctx, word)?,
+            mxfp8: Mxfp8SelKernels::load(ctx, word)?,
             q51: Q51SelKernels::load(ctx, word)?,
             q80: Q80SelKernels::load(ctx, word)?,
             slots: CardSlotKernels::load(ctx)?,
@@ -1349,6 +1374,19 @@ impl CardLeg {
                 };
                 self.nvfp4.enqueue_gate_up(stream, &a, fault, h)?;
             }
+            Some(GateUpEntry::Mxfp8) => {
+                let a = Mxfp8GateUp {
+                    gate: st.gate.mxfp8()?,
+                    up: st.up.mxfp8()?,
+                    act: act_x,
+                    sel: run.sel,
+                    n_slots: slots,
+                    rows_per_expert: ff,
+                    slots_per_col,
+                    rule: run.rule,
+                };
+                self.mxfp8.enqueue_gate_up(stream, &a, fault, h)?;
+            }
             Some(
                 GateUpEntry::Iq2xxs
                 | GateUpEntry::Iq2xs
@@ -1467,6 +1505,17 @@ impl CardLeg {
                     slots_per_col,
                 };
                 self.nvfp4.enqueue_sel32(stream, &d, fault, down)?;
+            }
+            (Some((DownEntry::Mxfp8, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
+                let d = Mxfp8Down {
+                    w: st.down.mxfp8()?,
+                    act,
+                    sel,
+                    n_slots: slots,
+                    rows_per_expert,
+                    slots_per_col,
+                };
+                self.mxfp8.enqueue_sel32(stream, &d, fault, down)?;
             }
             (Some((entry, DownAct::Q8Blocks32)), ActH::Blocks32(act)) => {
                 let run = Sel32Run {

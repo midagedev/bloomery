@@ -42,6 +42,9 @@
 //!   `silu(g) · u` of each output and the gate GEMM's row and quantizes a
 //!   slab's rows into the down GEMM's activations instead
 //!   ([`Gemm32Kernels::enqueue_up_swiglu32`]).
+//! - `gemm_mxfp8p` (`mxfp8gemm.rs`, its own module and contract): MXFP8 in
+//!   its two card planes, the routed `_sel` pair's integer rule on the same
+//!   launch geometry and route table.
 //!
 //! Numeric contract, every entry. Per 32-value block `b` of an output
 //! `(slot, row)`: `isum` the exact i32 dot of the weight codes (Q8_0 int8;
@@ -103,6 +106,7 @@ use crate::fault::FaultSink;
 use crate::iq::iq4_word;
 use crate::iq_sel::spread2;
 use crate::mxfp4_sel::Nvfp4Stack;
+use crate::mxfp8_sel::Mxfp8Stack;
 use crate::q5::q5_0_row_words;
 use crate::tensor::DeviceTensor;
 use crate::{GpuError, launch_u32};
@@ -1423,6 +1427,11 @@ pub enum Gemm32Weight<'a> {
     /// route's stack (a dense tensor through a one-expert table holds one),
     /// applied once at the store. K must be a multiple of 64.
     Nvfp4Planes(Nvfp4Stack<'a>),
+    /// MXFP8 in its two card planes (`q8f32::e4m3_planes`, the planes the
+    /// routed `_sel` pair reads): `qs` rows × K/4 words, `e` rows × ceil(K/128)
+    /// words of E8M0 bytes, run by `gemm_mxfp8p` (`mxfp8gemm.rs`, the `_sel`
+    /// pair's integer rule). F32 output only.
+    Mxfp8Planes(Mxfp8Stack<'a>),
 }
 
 /// [`Gemm32Kernels::enqueue_gemm32`]'s arguments: `w` the stack, `route`
@@ -1527,7 +1536,8 @@ impl Gemm32Launch {
             | Gemm32Weight::Iq4NlFile(qs)
             | Gemm32Weight::Q2_0File(qs)
             | Gemm32Weight::Q5_0Packed(qs)
-            | Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, .. }) => qs.rows(),
+            | Gemm32Weight::Nvfp4Planes(Nvfp4Stack { qs, .. })
+            | Gemm32Weight::Mxfp8Planes(Mxfp8Stack { qs, .. }) => qs.rows(),
         };
         if stack_rows != n_rows {
             return Err(GpuError::shape(
@@ -1641,6 +1651,9 @@ impl Gemm32Launch {
             }
             Gemm32Weight::Nvfp4Planes(planes) => {
                 planes.experts(what, k, rows)?;
+            }
+            Gemm32Weight::Mxfp8Planes(planes) => {
+                super::mxfp8gemm::Mxfp8GemmKernels::check(what, planes, k, rows)?;
             }
         }
         if !act.q8_required && !matches!(w, Gemm32Weight::Nvfp4Planes(_)) {
@@ -1864,6 +1877,21 @@ impl Gemm32Kernels {
                     scales.buf()
                 );
             }
+            Gemm32Weight::Mxfp8Planes(planes) => {
+                let l = super::mxfp8gemm::Mxfp8Launch {
+                    grid: g.grid,
+                    n_experts: g.n_experts,
+                    rows: g.rows,
+                    kb: g.kb,
+                    steps: g.steps,
+                    act_cols: g.act_cols,
+                    n_slots: g.n_slots,
+                    max_tiles: g.max_tiles,
+                    slot_div: g.slot_div,
+                    row_tiles: g.row_tiles,
+                };
+                self.mx8.enqueue(stream, &l, (planes, act, route), y)?;
+            }
         }
         Ok(())
     }
@@ -1937,6 +1965,12 @@ impl Gemm32Kernels {
             Gemm32Weight::Q5_0Packed(w) => {
                 let s_words = launch_u32(what, "s_words", (g.kb as usize).div_ceil(2))?;
                 launch!(prepare_gemm_q5_0p_bf16, gemm_q5_0p_bf16, w.buf(), s_words);
+            }
+            Gemm32Weight::Mxfp8Planes(_) => {
+                return Err(GpuError::shape(
+                    what,
+                    "MXFP8 planes have no BF16-output entry (`gemm_mxfp8p` stores F32)",
+                ));
             }
         }
         Ok(())

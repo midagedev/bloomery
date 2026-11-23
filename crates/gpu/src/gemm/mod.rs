@@ -71,6 +71,7 @@ mod remap;
 
 // After `gemm32`, for the same reason.
 mod kernels32;
+mod mxfp8gemm;
 
 mod batch;
 
