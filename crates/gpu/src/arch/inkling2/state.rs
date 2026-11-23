@@ -19,8 +19,8 @@
 //!
 //! Every store's size is [`shapes`]'s, the one place a load sizes them.
 
-use crate::GpuError;
 use crate::DeviceBufferRaw;
+use crate::GpuError;
 use chain::linear::Ring;
 use cuda_core::{CudaStream, DeviceBuffer};
 

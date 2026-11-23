@@ -1368,7 +1368,7 @@ mod tests {
         }
         stream.synchronize().expect("the room's work finished");
         let drain_error = DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN);
-        crate::tensor::settle_retirements();
+        crate::tensor::settle_retirements(&stream);
         ctx.record_err::<()>(Err(drain_error));
         drop(p);
         assert_eq!(
@@ -1423,6 +1423,7 @@ mod tests {
         drop(r);
         drop(held);
         stream.synchronize().expect("the room's work finished");
+        crate::tensor::settle_retirements(&stream);
     }
 
     /// Two rooms of one layout share a prefix's pages: the layout of
@@ -1747,7 +1748,10 @@ mod tests {
     /// and bytes written through the buffer read back equal. The squeezing
     /// allocations are freed after. Runs alone (`hw_held_`): the squeeze
     /// holds the device's free bytes, which a parallel test's allocation
-    /// would shift. FAIL-first: a spill that hands the card's refusal back.
+    /// would shift; the test waits for the retirement thread to free the
+    /// squeeze's buffer before it returns, so the next test reads the free bytes
+    /// of a card that has them back. FAIL-first: a spill that hands the card's
+    /// refusal back.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_held_a_spill_room_backs_on_the_host_when_the_card_is_full() {
@@ -1808,6 +1812,7 @@ mod tests {
         drop(squeeze);
         drop(bulk);
         stream.synchronize().expect("the room's work finished");
+        crate::tensor::settle_retirements(&stream);
     }
 
     /// A `Backing::Spill` room of twelve pages with a margin of six pages
@@ -1816,8 +1821,11 @@ mod tests {
     /// the margin sit on the host (`host_mapped()` holds pages, `mapped()`
     /// no more than the six the margin leaves) and every page is backed.
     /// Runs alone (`hw_held_`): the free bytes are the device's, which a
-    /// parallel test's allocation moves. FAIL-first: a spill that waits for
-    /// the driver's refusal takes all twelve pages from the card.
+    /// parallel test's allocation moves, and each reading comes after the
+    /// retirement thread ran the frees queued before it (a buffer a test
+    /// dropped is freed there, a moment after the drop). FAIL-first: a spill
+    /// that waits for the driver's refusal takes all twelve pages from the
+    /// card.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_held_a_spill_room_keeps_the_cards_margin() {
@@ -1834,6 +1842,7 @@ mod tests {
         }];
         let free = || {
             crate::capsync::ctx_sync(&ctx, "the spill room's check").expect("the context syncs");
+            crate::tensor::settle_retirements(&stream);
             crate::current_mem_info()
                 .expect("the device's free bytes")
                 .0

@@ -909,15 +909,22 @@ pub(crate) mod hold {
 
     /// The hold; dropping it opens it, so a failed assert never leaves the
     /// stream shut. While it is shut the test must not wait for anything
-    /// enqueued behind it: no land, no event or stream sync, no extent drop.
-    /// It runs alone ([`require_serial_pass`]).
+    /// enqueued behind it: no land, no event or stream sync, no extent drop,
+    /// and it drops no device buffer: cuda-core frees a dropped buffer on its
+    /// retirement thread, whose `cuMemFree` waits for the shut stream with the
+    /// driver's lock held, and the test's next driver call queues behind it.
+    /// [`Hold::on`] settles that thread before it shuts the stream, so a free
+    /// the test's earlier drops queued is over by then. It runs alone
+    /// ([`require_serial_pass`]).
     pub struct Hold(Arc<AtomicBool>);
 
     impl Hold {
-        /// Shuts `stream` after the work it holds so far. Panics by name
+        /// Shuts `stream` after the work it holds so far, once cuda-core's
+        /// retirement thread ran what was queued before. Panics by name
         /// unless the tests run one at a time (see [`Hold`]).
         pub fn on(stream: &CudaStream) -> Result<Hold, GpuError> {
             require_serial_pass("Hold::on");
+            crate::tensor::settle_retirements(stream);
             let flag = Arc::new(AtomicBool::new(false));
             let data = Arc::into_raw(Arc::clone(&flag)).cast_mut().cast::<c_void>();
             // SAFETY: `data` is a live `Arc` count that `wait_open` takes.
@@ -953,6 +960,83 @@ fn refused(e: seqstate::CheckpointError) -> GpuError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Hold::on` shuts the stream after cuda-core's retirement thread ran
+    /// what was queued before it. With the thread busy and a buffer dropped
+    /// behind that work, its free is still queued when the stream shuts
+    /// unless `Hold::on` waits: the thread's `cuMemFree` then takes the
+    /// driver's lock and waits for the shut stream, and the copy call a held
+    /// stream's test makes after the free began never returns. FAIL-first: a
+    /// `Hold::on` that does not settle leaves that call timing out.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_a_hold_shuts_after_the_frees_queued_before_it_ran() {
+        use crate::checkpoint::staging::Staging;
+        use crate::tensor::{Pitched, dtoh_2d};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct Busy(mpsc::Sender<()>, mpsc::Sender<()>);
+        impl Drop for Busy {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = self.1.send(());
+            }
+        }
+
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        let source = cuda_core::DeviceBuffer::<u16>::zeroed(&stream, 1024).expect("a source");
+        let dropped = cuda_core::DeviceBuffer::<u8>::zeroed(&stream, 4096).expect("a buffer");
+        let pool = Staging::pinned(&ctx, 2 << 20).expect("a pool");
+        let mut staged = pool.lend(1024, 0).expect("a lend").expect("room");
+        stream.synchronize().expect("the buffers are ready");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (ended_tx, ended_rx) = mpsc::channel();
+        cuda_core::completion::retain_until_complete(Busy(started_tx, ended_tx), &stream)
+            .expect("work for the retirement thread");
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the retirement thread is busy");
+        drop(dropped);
+        let hold = hold::Hold::on(&stream).expect("a held stream");
+        let (done_tx, done_rx) = mpsc::channel();
+        let held = Arc::clone(&stream);
+        let copy = std::thread::spawn(move || {
+            // The free queued behind the busy work begins once it ends.
+            ended_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the busy work ended");
+            std::thread::sleep(Duration::from_millis(20));
+            // SAFETY: the extent is held until the stream is synchronized below.
+            let result = unsafe {
+                dtoh_2d(
+                    &held,
+                    &source,
+                    0,
+                    staged.rows_ptr(),
+                    staged.rows_bytes(),
+                    Pitched {
+                        width: 2048,
+                        rows: 1,
+                        dev_pitch: 2048,
+                        host_pitch: 2048,
+                    },
+                )
+            };
+            done_tx.send(result.is_ok()).expect("the copy is queued");
+            (source, staged)
+        });
+        let queued = done_rx.recv_timeout(Duration::from_secs(5));
+        assert_eq!(
+            queued,
+            Ok(true),
+            "the copy call returns while the stream is shut"
+        );
+        hold.open();
+        stream.synchronize().expect("the copy ran");
+        copy.join().expect("the copy thread");
+    }
 
     /// A sequence's checkpoints hold the points one prompt call over its
     /// context takes and the previous call's end: stores of 7 f32s spaced

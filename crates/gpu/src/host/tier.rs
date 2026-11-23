@@ -2949,7 +2949,13 @@ pub(super) mod tests {
     /// `hw_held_…`.
     fn parking_work(file: &gguf::Split) -> super::TierWork {
         crate::checkpoint::hold::require_serial_pass("tier::tests::parking_work");
-        remote_work(file, Arc::new(AtomicBool::new(false)), false)
+        let work = remote_work(file, Arc::new(AtomicBool::new(false)), false);
+        // The work's stream parks on its first wait: what the opening dropped
+        // is freed on cuda-core's retirement thread before that, not during it
+        // (a `cuMemFree` there waits for the parked stream, and the driver
+        // call that would release it queues behind the free).
+        crate::tensor::settle_retirements(work.gpu().stream());
+        work
     }
 
     #[test]

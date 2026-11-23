@@ -1016,14 +1016,36 @@ pub(crate) fn settled_handles(ctx: &Arc<CudaContext>, want: usize) -> usize {
     }
 }
 
-/// Lets cuda-core's retirement thread finish what a synchronized stream already
-/// completed: it retires a queued copy's lease within a millisecond or two of its
-/// event passing, and a lease's last drop binds the context, which reads and
-/// clears the context's sticky error. A test that records an error and reads it
-/// back settles first.
+/// Blocks until cuda-core's retirement thread has run every cleanup that was
+/// ready when this was called: the `cuMemFree` of a buffer a test just dropped
+/// (a drop frees nothing on its own thread, so the device's free bytes still
+/// lack the buffer), a queued copy's lease (whose last drop binds the context,
+/// which reads and clears its sticky error), a retired stream. A test that
+/// reads the device's free bytes or the context's error settles first, and one
+/// that drops a buffer of the card's free bytes settles before it returns, so
+/// the next test does not inherit the free; a cleanup still waiting on an
+/// event of `stream` is not ready and is not waited for.
+///
+/// The thread runs the cleanups it finds ready in one pass in an order of its
+/// own, so one marker can run before a cleanup queued ahead of it in the same
+/// pass; the second marker is queued after the first ran, which puts it in a
+/// later pass than everything queued before the first.
 #[cfg(test)]
-pub(crate) fn settle_retirements() {
-    std::thread::sleep(std::time::Duration::from_millis(20));
+pub(crate) fn settle_retirements(stream: &CudaStream) {
+    struct Ran(std::sync::mpsc::Sender<()>);
+    impl Drop for Ran {
+        fn drop(&mut self) {
+            // The receiver is gone only when the wait below gave up.
+            let _ = self.0.send(());
+        }
+    }
+    for _ in 0..2 {
+        let (ran, wait) = std::sync::mpsc::channel();
+        cuda_core::completion::retain_until_complete(Ran(ran), stream)
+            .expect("a marker recorded on the stream");
+        wait.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("cuda-core's retirement thread ran the marker");
+    }
 }
 
 #[cfg(test)]
@@ -1064,6 +1086,33 @@ mod tests {
                 && msg.contains(&format!("rows {}", usize::MAX))
                 && msg.contains("cols 2"),
             "the panic names the constructor and both values: {msg}"
+        );
+    }
+
+    /// `settle_retirements` returns after the retirement thread freed a
+    /// buffer dropped before the call: half the device's free bytes taken by
+    /// a buffer are free again at once, where a read straight after the drop
+    /// still lacks them. Runs alone (`hw_held_`): the free bytes are the
+    /// device's, which a parallel test's allocation moves. FAIL-first:
+    /// `settle_retirements` returning at once leaves the buffer's bytes taken.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_settle_retirements_returns_after_a_dropped_buffers_free() {
+        let (ctx, stream) = crate::capsync::fresh_stream(0).expect("CUDA device 0 with a stream");
+        ctx.bind_to_thread().expect("the context binds");
+        let page = crate::allocation_granularity(0).expect("the granularity");
+        settle_retirements(&stream);
+        let (free, _) = crate::current_mem_info().expect("the device's free bytes");
+        let len = (free / 2) & !(page - 1);
+        let buf = DeviceBuffer::<u8>::zeroed(&stream, len).expect("half the free bytes");
+        let (taken, _) = crate::current_mem_info().expect("the device's free bytes");
+        assert!(taken + len <= free + page, "the buffer took {len} B");
+        drop(buf);
+        settle_retirements(&stream);
+        let (after, _) = crate::current_mem_info().expect("the device's free bytes");
+        assert!(
+            after >= taken + len,
+            "the free bytes hold the dropped buffer's {len} B again: {taken} B, then {after} B"
         );
     }
 
