@@ -1,0 +1,11 @@
+--- a/crates/placement/src/accepts.rs
++++ b/crates/placement/src/accepts.rs
+@@ -740,7 +740,7 @@
+ /// halves the arm reads, in its own resident form.
+ #[must_use]
+ pub const fn fused_gate_up_leg(ty: GgmlType) -> bool {
+-    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0 | GgmlType::MXFP8) || prompt_leg_gate_up(ty)
++    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0 | GgmlType::MXFP8)
+ }
+ 
+ /// The Inkling 2 body's down arm: NVFP4, Q8_0 or MXFP8 as the gate·up arm, and the common leg's

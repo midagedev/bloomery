@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/w13_split.rs
++++ b/crates/gpu/src/w13_split.rs
+@@ -129,7 +129,7 @@
+     (rows_half, at_row): (usize, usize),
+     row_bytes: usize,
+ ) -> Result<DeviceTensor<u32>, GpuError> {
+-    let bytes = |rows: usize| rows.checked_mul(row_bytes);
++    let bytes = |rows: usize| rows.checked_mul(row_bytes / 4 * 4);
+     let (Some(width), Some(pitch), Some(at), Some(rows)) = (
+         bytes(rows_half),
+         bytes(per_expert),

@@ -1,0 +1,11 @@
+--- a/crates/gguf/src/scale_fold.rs
++++ b/crates/gguf/src/scale_fold.rs
+@@ -32,7 +32,7 @@
+         | GgmlType::IQ2_S
+         | GgmlType::IQ3_XXS
+         | GgmlType::IQ3_S => Some(&[0]),
+-        GgmlType::Q4_1 | GgmlType::Q5_1 | GgmlType::Q4_K | GgmlType::Q5_K => Some(&[0, 2]),
++        GgmlType::Q4_1 | GgmlType::Q5_1 | GgmlType::Q4_K | GgmlType::Q5_K => Some(&[0]),
+         GgmlType::Q6_K => Some(&[208]),
+         GgmlType::Q3_K => Some(&[108]),
+         GgmlType::Q2_K => Some(&[80, 82]),

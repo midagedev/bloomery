@@ -209,7 +209,10 @@ pub(crate) fn role_with_nextn(
 
 /// The role of a format's tensor scale, `<stem>.scale` beside a `<stem>.weight`
 /// of `split` whose type reads one ([`gguf::GgmlType::reads_scale`]: NVFP4, one
-/// a tensor or an expert, and bloomery's F8 and NVFP4 rows), which the load
+/// a tensor or an expert, and bloomery's F8 and NVFP4 rows) or one the scale folds into
+/// ([`gguf::GgmlType::folds_scale`]: an i-quant or K-quant stack of a dynamic mix, the card load
+/// folds it into the blocks and the host tier dots the experts with it) when `folds`, a family
+/// whose loads do ([`classify_folding`]), which the load
 /// reads by name with its tensor: unread, on the tensor's layer. `None` for
 /// any other name, and for a scale beside a tensor of another type or one
 /// `role_of` does not claim.
@@ -217,8 +220,13 @@ fn tensor_scale_role(
     split: &Split,
     name: &str,
     role_of: &impl Fn(&str) -> Option<(Role, Option<usize>)>,
+    folds: bool,
 ) -> Option<(Role, Option<usize>)> {
-    let weight = gguf::scaled_weight(split, name)?;
+    let weight = gguf::scaled_weight(split, name).or_else(|| {
+        folds
+            .then(|| gguf::folded_scale_weight(split, name))
+            .flatten()
+    })?;
     role_of(&weight).map(|(_, layer)| (Role::Unread, layer))
 }
 
@@ -251,11 +259,31 @@ pub(crate) fn classify_with(
     role_of: impl Fn(&str) -> Option<(Role, Option<usize>)>,
     counts: Counts,
 ) -> Result<ModelTensors, PlacementError> {
+    classify_scaled(split, role_of, counts, false)
+}
+
+/// [`classify_with`] for a family whose loads fold a `<stem>.scale` beside an i-quant or K-quant
+/// stack into the stack's blocks (card) or dot the experts with it (host): such a scale is unread
+/// here, where every other family's is refused by name with the names no role claims.
+pub(crate) fn classify_folding(
+    split: &Split,
+    role_of: impl Fn(&str) -> Option<(Role, Option<usize>)>,
+    counts: Counts,
+) -> Result<ModelTensors, PlacementError> {
+    classify_scaled(split, role_of, counts, true)
+}
+
+fn classify_scaled(
+    split: &Split,
+    role_of: impl Fn(&str) -> Option<(Role, Option<usize>)>,
+    counts: Counts,
+    folds: bool,
+) -> Result<ModelTensors, PlacementError> {
     let mut tensors = Vec::with_capacity(split.tensor_count());
     let mut unclassified = Vec::new();
     for (shard, t) in split.iter_tensors() {
         let Some((role, layer)) = role_of(&t.name)
-            .or_else(|| tensor_scale_role(split, &t.name, &role_of))
+            .or_else(|| tensor_scale_role(split, &t.name, &role_of, folds))
             .or_else(|| input_scale_role(split, &t.name, &role_of))
         else {
             unclassified.push(t.name.clone());

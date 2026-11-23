@@ -4023,6 +4023,209 @@ mod tests {
         std::fs::remove_file(fused_path).ok();
     }
 
+    /// The fused layer file `src` holds, rewritten with its gate·up bytes `gate_up` and, when
+    /// `scale` is given, a `gate_up_exps.scale` of those f32 values beside it; returns its path.
+    fn rescaled_file(tag: &str, src: &str, gate_up: Vec<u8>, scale: Option<&[f32]>) -> String {
+        let g = gguf::Gguf::open(src).unwrap();
+        let down = g.data(g.find("down_exps").unwrap()).unwrap().to_vec();
+        let dims = |n: &str| g.find(n).unwrap().dims.clone();
+        let ty = |n: &str| g.find(n).unwrap().ty.as_u32();
+        let mut tensors = vec![
+            (
+                TensorDecl {
+                    name: "gate_up_exps.weight".to_string(),
+                    dims: dims("gate_up_exps"),
+                    type_id: ty("gate_up_exps"),
+                    nbytes: gate_up.len() as u64,
+                },
+                gate_up,
+            ),
+            (
+                TensorDecl {
+                    name: "down_exps.weight".to_string(),
+                    dims: dims("down_exps"),
+                    type_id: ty("down_exps"),
+                    nbytes: down.len() as u64,
+                },
+                down,
+            ),
+        ];
+        if let Some(scale) = scale {
+            let bytes: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
+            tensors.push((
+                TensorDecl {
+                    name: "gate_up_exps.scale".to_string(),
+                    dims: vec![scale.len() as u64],
+                    type_id: GgmlType::F32.as_u32(),
+                    nbytes: bytes.len() as u64,
+                },
+                bytes,
+            ));
+        }
+        let layout = Layout::new(&[], tensors.iter().map(|(t, _)| t.clone()).collect()).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "bloomery-moe-{}-{tag}-rescaled.gguf",
+            std::process::id()
+        ));
+        let mut w = Writer::new(std::fs::File::create(&path).unwrap(), layout).unwrap();
+        for (t, b) in &tensors {
+            w.tensor(&t.name, b).unwrap();
+        }
+        w.finish().unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    /// A fused gate·up stack of K-quant blocks with a `gate_up_exps.scale` beside it (an Unsloth
+    /// dynamic file's) is dotted with each expert's scale on the host tier: the layer serves what
+    /// the layer over the same stack with the scale folded into its blocks
+    /// ([`gguf::scale_fold::fold_scales`], the card load's form) serves, within the f16
+    /// rounding of the folded scalars, and not what the unscaled stack serves. A scale of
+    /// another count is refused by name.
+    #[test]
+    fn a_scale_beside_a_kquant_stack_is_the_hosts_dot_factor() {
+        let (embd, ff, n_expert) = (256, 256, 4);
+        let (beta, linear_beta) = (1.5f32, 4.0f32);
+        let tys = [GgmlType::Q4_K; 3];
+        let split_path = layer_file("scaled-split", tys, embd, ff, n_expert);
+        let plain_path = fused_layer_file("scaled", &split_path, tys, embd, ff, n_expert);
+        let plain = gguf::Gguf::open(&plain_path).unwrap();
+        let fused = plain
+            .data(plain.find("gate_up_exps").unwrap())
+            .unwrap()
+            .to_vec();
+        let scales = [0.5f32, 1.75, 0.8, 1.3];
+        let mut folded = fused.clone();
+        let per = folded.len() / n_expert;
+        gguf::scale_fold::fold_scales(GgmlType::Q4_K, &mut folded, per, &scales).unwrap();
+        let scaled_path = rescaled_file("scaled-dot", &plain_path, fused.clone(), Some(&scales));
+        let folded_path = rescaled_file("scaled-fold", &plain_path, folded, None);
+        let unscaled_path = rescaled_file("scaled-none", &plain_path, fused.clone(), None);
+        let short_path = rescaled_file("scaled-short", &plain_path, fused, Some(&scales[..3]));
+        let layer = |path: &str| {
+            let split = gguf::Split::open(path).unwrap();
+            let layer = HostLayer::build_situ_fused(
+                R8Source::rows(&split),
+                &FusedSituSpec {
+                    gate_up: "gate_up_exps.weight",
+                    down: "down_exps.weight",
+                    n_expert,
+                    embd,
+                    ff,
+                    beta,
+                    linear_beta,
+                },
+            );
+            (split, layer)
+        };
+        let x = Tensor2::from_vec(
+            embd,
+            1,
+            (0..embd)
+                .map(|i| ((i * 7919) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let list = [(2u32, 0.5f32), (0, 0.25), (1, 0.125), (3, 0.125)];
+        let run = |path: &str| {
+            let (split, layer) = layer(path);
+            let layer = layer.unwrap();
+            let mut host = HostScratch::new(embd, ff, list.len()).unwrap();
+            let mut out = vec![f32::NAN; embd];
+            layer
+                .experts_into(R8Source::rows(&split), &x, &list, &mut out, &mut host)
+                .unwrap();
+            out
+        };
+        let rel = |a: &[f32], b: &[f32]| {
+            let num: f64 = a.iter().zip(b).map(|(x, y)| f64::from(x - y).powi(2)).sum();
+            let den: f64 = b.iter().map(|y| f64::from(*y).powi(2)).sum();
+            (num / den).sqrt()
+        };
+        let (dot, fold, plain_out) = (run(&scaled_path), run(&folded_path), run(&unscaled_path));
+        assert!(
+            rel(&dot, &fold) < 2e-3,
+            "the dot factor and the folded blocks serve one layer: {}",
+            rel(&dot, &fold)
+        );
+        assert!(
+            rel(&dot, &plain_out) > 0.05,
+            "the scale must matter: {}",
+            rel(&dot, &plain_out)
+        );
+        // The union pass over a wide call (12 columns: the row lanes' path for a Q4_K stack)
+        // multiplies by the expert's scale as the one-column call does: its columns are the scaled file's
+        // one-column calls bit for bit, and the folded file's within the fold's rounding.
+        let cols = 12usize;
+        let xs = Tensor2::from_vec(
+            embd,
+            cols,
+            (0..embd * cols)
+                .map(|i| ((i * 7919 + 13) % 1013) as f32 / 1013.0 - 0.5)
+                .collect(),
+        );
+        let lists: Vec<Vec<(u32, f32)>> = (0..cols)
+            .map(|j| {
+                list.iter()
+                    .map(|&(e, w)| (((e as usize + j) % n_expert) as u32, w))
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[(u32, f32)]> = lists.iter().map(Vec::as_slice).collect();
+        let union = |path: &str| {
+            let (split, layer) = layer(path);
+            let layer = layer.unwrap();
+            let mut us = UnionScratch::new_routed(embd, ff, 16, 4).unwrap();
+            let mut got = vec![f32::NAN; embd * cols];
+            layer
+                .experts_union_into(R8Source::rows(&split), &xs, &slices, &mut got, &mut us)
+                .unwrap();
+            got
+        };
+        let columns = {
+            let (split, layer) = layer(&scaled_path);
+            let layer = layer.unwrap();
+            let mut host = HostScratch::new(embd, ff, list.len()).unwrap();
+            let mut out = vec![f32::NAN; embd * cols];
+            for (j, l) in lists.iter().enumerate() {
+                let xj = Tensor2::from_vec(embd, 1, xs.col(j).to_vec());
+                layer
+                    .experts_into(
+                        R8Source::rows(&split),
+                        &xj,
+                        l,
+                        &mut out[j * embd..][..embd],
+                        &mut host,
+                    )
+                    .unwrap();
+            }
+            out
+        };
+        let (u_dot, u_fold) = (union(&scaled_path), union(&folded_path));
+        assert!(
+            u_dot
+                .iter()
+                .zip(&columns)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the union's columns are the one-column calls' bits"
+        );
+        assert!(
+            rel(&u_dot, &u_fold) < 2e-3,
+            "the union's dot factor and the folded blocks serve one layer: {}",
+            rel(&u_dot, &u_fold)
+        );
+        let (_, short) = layer(&short_path);
+        let e = short.err().expect("a scale of another count");
+        assert!(e.to_string().contains("scale"), "{e}");
+        for p in [
+            &split_path,
+            &plain_path,
+            &scaled_path,
+            &folded_path,
+            &short_path,
+        ] {
+            std::fs::remove_file(p).ok();
+        }
+    }
+
     /// A layer with a stack the union cannot run — an f32 gate, no fused
     /// kernel — is refused when the host tier builds it, by the union's own
     /// error naming the matrix, the stack, its type and `k`; the same layer

@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/weights.rs
++++ b/crates/gpu/src/weights.rs
+@@ -1754,7 +1754,8 @@
+         })?;
+     let mut bytes = flat_of(src, take)?.into_owned();
+     let per_scale = bytes.len() / scales.len();
+-    gguf::scale_fold::fold_scales(t.ty, &mut bytes, per_scale, scales)
++    let scales: Vec<f32> = scales.iter().rev().copied().collect();
++    gguf::scale_fold::fold_scales(t.ty, &mut bytes, per_scale, &scales)
+         .map_err(|e| refuse(e.to_string()))?;
+     Ok(bytes)
+ }

@@ -1610,7 +1610,7 @@ fn upload_segment(
     let held: u64 = spans.iter().map(|s| s.rows.end - s.rows.start).sum();
     let rows =
         usize::try_from(held).map_err(|_| placed_refusal(t, format!("{held} rows pass usize")))?;
-    let scale = tensor_scales(PLACED, info, |n| {
+    let scale = upload_scales(PLACED, info, |n| {
         let (s, t) = split.find(n)?;
         Some((split.shard(s)?, t))
     })?
@@ -1684,7 +1684,7 @@ fn upload_file_tensor_with<'g>(
             format!("tensor {} has type {} with no device format", t.name, t.ty),
         ));
     };
-    let scale = tensor_scales("Weights::load", t, find)?;
+    let scale = upload_scales("Weights::load", t, find)?;
     upload_rows(
         stream,
         ring,
@@ -1707,6 +1707,56 @@ pub(crate) fn tensor_scales<'g>(
         gguf::LoadError::Scale { .. } => GpuError::shape(what, e.to_string()),
         e => e.into(),
     })
+}
+
+/// The scales `t`'s upload carries: an NVFP4 tensor's, which its planes hold
+/// ([`tensor_scales`]), or the `.scale` beside a stack of a block type a scale folds into
+/// ([`gguf::folded_scales`]: an i-quant or K-quant of a dynamic mix), which the upload folds into
+/// the blocks in the file's form ([`fold_rows`]). `None` for a tensor with neither.
+fn upload_scales<'g>(
+    what: &'static str,
+    t: &TensorInfo,
+    find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
+) -> Result<Option<Vec<f32>>, GpuError> {
+    if let Some(scales) = tensor_scales(what, t, &find)? {
+        return Ok(Some(scales));
+    }
+    gguf::folded_scales(t, find).map_err(|e| match e {
+        gguf::LoadError::Scale { .. } => GpuError::shape(what, e.to_string()),
+        e => e.into(),
+    })
+}
+
+/// The `take` bytes of `src`, the `rows` rows of `t` (a stack's held experts' rows in order, or a
+/// lone tensor's), with each expert's scale folded into its blocks ([`gguf::scale_fold`]), as one
+/// run. Refused by name: scales that do not number the held experts, and the fold's own refusals
+/// (an overflowing product).
+fn fold_rows(
+    what: &'static str,
+    t: &TensorInfo,
+    (src, take): (&[&[u8]], usize),
+    rows: usize,
+    scales: &[f32],
+) -> Result<Vec<u8>, GpuError> {
+    let refuse = |detail: String| GpuError::shape(what, format!("tensor {}: {detail}", t.name));
+    let per_expert_rows = match t.dims.as_slice() {
+        &[_, per, _] => usize::try_from(per).ok(),
+        _ => Some(rows),
+    };
+    per_expert_rows
+        .filter(|&p| p > 0 && !scales.is_empty() && p.checked_mul(scales.len()) == Some(rows))
+        .ok_or_else(|| {
+            refuse(format!(
+                "{} scales for the {rows} rows it holds of {:?}",
+                scales.len(),
+                t.dims
+            ))
+        })?;
+    let mut bytes = flat_of(src, take)?.into_owned();
+    let per_scale = bytes.len() / scales.len();
+    gguf::scale_fold::fold_scales(t.ty, &mut bytes, per_scale, scales)
+        .map_err(|e| refuse(e.to_string()))?;
+    Ok(bytes)
 }
 
 /// The bytes `t`'s upload moves, for sizing a load's staging ring: its
@@ -1752,6 +1802,16 @@ fn upload_rows_in(
     let (what, format, rooms) = at;
     let mut made = None;
     let name = t.name.as_str();
+    if scale.is_some() && t.ty.folds_scale() && format != CardFormat::KQuant {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "tensor {name}: a scale beside {} blocks is folded into the file's blocks, and \
+                 the {format:?} form holds none",
+                t.ty
+            ),
+        ));
+    }
     let all_rows: u64 = t.dims[1..].iter().product();
     let layout = (rows as u64 <= all_rows)
         .then(|| format.resident_bytes(t.ty, t.dims[0], rows as u64))
@@ -1839,6 +1899,21 @@ fn upload_rows_in(
                 name,
                 dst: w.buf().cu_deviceptr(),
                 dst_bytes: w.buf().num_bytes(),
+            };
+            // A scale beside blocks of a type that folds one is multiplied into them first.
+            let folded = match scale.as_deref() {
+                Some(scales) if t.ty.folds_scale() => {
+                    Some(fold_rows(what, t, (src, take), rows, scales)?)
+                }
+                _ => None,
+            };
+            let one;
+            let src: &[&[u8]] = match &folded {
+                Some(bytes) => {
+                    one = [bytes.as_slice()];
+                    &one
+                }
+                None => src,
             };
             if let Err(e) = ring.copy_bytes(stream, &stage, src, take) {
                 if room.is_some() {

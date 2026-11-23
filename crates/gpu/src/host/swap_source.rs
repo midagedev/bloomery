@@ -864,6 +864,28 @@ impl FileSwap {
                 .iter()
                 .map(|n| plan.model.tensors.iter().find(|t| t.name == *n))
                 .collect::<Vec<_>>();
+            // The swap moves a stack's file blocks as they are: a stack of a block type a scale
+            // folds into, with a `.scale` beside it, would land on the card unscaled.
+            let split = pair.source().split();
+            for t in tensors.iter().flatten().filter(|t| t.ty.folds_scale()) {
+                let Some((_, info)) = split.find(&t.name) else {
+                    continue;
+                };
+                let find = |n: &str| {
+                    let (s, i) = split.find(n)?;
+                    Some((split.shard(s)?, i))
+                };
+                let folded = gguf::folded_scales(info, find)
+                    .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
+                if folded.is_some() {
+                    return Err(GpuError::tensor(
+                        WHAT,
+                        t.name.clone(),
+                        "a stack whose blocks the `.scale` beside it folds into: the swap copies \
+                         the file's blocks unscaled",
+                    ));
+                }
+            }
             let Some((parts, slots)) =
                 layer_parts(l, &names, stacks.types(l), &found, &tensors, experts)?
             else {

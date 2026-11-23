@@ -4694,6 +4694,13 @@ gate-inkling2-e2e:
 gate-inkling2-small-host:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/real-only.sh gate-inkling2-small-host && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_small && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_small'
 
+# A Unsloth UD file as downloaded (an i-quant fused gate·up stack with its per-expert `.scale` tensor beside it, folded into the blocks' `d`
+# at load) against its scale-folded copy (gate_inkling2_fold's doc): both on the card one after the other, the same seeded prompt and
+# greedy ids, the same prompt logits row, and each file's prompt pass held to its steps. Real tier only (the gate refuses the fixture tier by
+# name); BLOOMERY_INK2_FOLD is `<raw file>,<folded copy>`, and the gate is deferred by name where it is unset.
+gate-inkling2-fold:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/needs-env.sh gate-inkling2-fold BLOOMERY_INK2_FOLD && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_fold && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_fold --raw "${BLOOMERY_INK2_FOLD%%,*}" --folded "${BLOOMERY_INK2_FOLD#*,}"'
+
 # The official Inkling 2 Mini folder on the card (gate_inkling2_official's doc): the folder opened in both arms of
 # BLOOMERY_INK2_DENSE (bf16: the dense as stored, q8_0: written as Q8_0 at load); the arms' dense types and resident bytes
 # apart, and each arm's teacher-forced argmax over the Mini's greedy tables (ref_inkling2_*) within the pin of the Gaussian

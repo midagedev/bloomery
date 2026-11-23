@@ -50,6 +50,7 @@ pub mod iq_tables;
 pub mod kquant;
 pub mod qtype;
 pub mod quant;
+pub mod scale_fold;
 pub mod shard_dirs;
 pub mod v41;
 pub mod write;
@@ -1439,6 +1440,39 @@ pub fn tensor_scales<'g>(
     if !t.ty.reads_scale() {
         return Ok(None);
     }
+    read_scales(t, find).map(Some)
+}
+
+/// The scales of a tensor whose type holds its magnitude in blocks a scale can be folded into
+/// ([`GgmlType::folds_scale`]: the i-quants, K-quants and legacy quants but IQ1_M), read as
+/// [`tensor_scales`] reads them: the f32 `<stem>.scale` beside `<stem>.weight`, one an expert of a
+/// stack. `None` for a type the fold cannot express and for a tensor with no `.scale` beside it
+/// (an Unsloth file made without one). A scale that is there and malformed is
+/// [`LoadError::Scale`]. The scale is the stack's values' factor: the card load folds it into the
+/// blocks ([`scale_fold::fold_scales`]), the host tier dots the experts with it.
+///
+/// # Errors
+///
+/// As [`tensor_scales`].
+pub fn folded_scales<'g>(
+    t: &TensorInfo,
+    find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
+) -> Result<Option<Vec<f32>>, LoadError> {
+    let sibling = t
+        .name
+        .strip_suffix(".weight")
+        .map(|stem| format!("{stem}.scale"));
+    if !t.ty.folds_scale() || sibling.is_none_or(|n| find(&n).is_none()) {
+        return Ok(None);
+    }
+    read_scales(t, find).map(Some)
+}
+
+/// The f32 `<stem>.scale` beside `t`, validated: [`tensor_scales`]'s body.
+fn read_scales<'g>(
+    t: &TensorInfo,
+    find: impl Fn(&str) -> Option<(&'g Gguf, &'g TensorInfo)>,
+) -> Result<Vec<f32>, LoadError> {
     let refuse = |detail: String| LoadError::Scale {
         name: t.name.clone(),
         detail,
@@ -1475,7 +1509,7 @@ pub fn tensor_scales<'g>(
             "its scale {name} [{i}] is {v}, not a finite value"
         )));
     }
-    Ok(Some(scales))
+    Ok(scales)
 }
 
 /// The tensor `name` is the tensor scale of ([`tensor_scales`]): `<stem>.weight` of `split`
@@ -1485,6 +1519,15 @@ pub fn scaled_weight(split: &Split, name: &str) -> Option<String> {
     let weight = format!("{}.weight", name.strip_suffix(".scale")?);
     let (_, t) = split.find(&weight)?;
     t.ty.reads_scale().then_some(weight)
+}
+
+/// The tensor `name` is the scale of ([`folded_scales`]): `<stem>.weight` of `split` beside
+/// `<stem>.scale`, of a type whose blocks a scale folds into. `None` for any other name.
+#[must_use]
+pub fn folded_scale_weight(split: &Split, name: &str) -> Option<String> {
+    let weight = format!("{}.weight", name.strip_suffix(".scale")?);
+    let (_, t) = split.find(&weight)?;
+    t.ty.folds_scale().then_some(weight)
 }
 
 /// [`tensor_bytes`], or [`LoadError::TooLarge`] naming the tensor.

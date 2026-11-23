@@ -1,0 +1,11 @@
+--- a/crates/placement/src/accepts.rs
++++ b/crates/placement/src/accepts.rs
+@@ -749,7 +749,7 @@
+ /// down that reads 128-value activation columns (the K-quants, the i-quants, MXFP4) is not run.
+ #[must_use]
+ pub const fn down32_leg(ty: GgmlType) -> bool {
+-    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0 | GgmlType::MXFP8)
++    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0 | GgmlType::MXFP8 | GgmlType::IQ3_XXS)
+         || (prompt_leg_down(ty) && matches!(kernels::down(ty), Some((_, DownAct::Q8Blocks32))))
+ }
+ 

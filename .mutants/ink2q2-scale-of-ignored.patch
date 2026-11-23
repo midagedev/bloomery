@@ -1,0 +1,11 @@
+--- a/crates/model/src/ops.rs
++++ b/crates/model/src/ops.rs
+@@ -1129,7 +1129,7 @@
+     /// dot runs scaled or not at all.
+     pub(crate) fn scale_of(&self, e: usize) -> Result<f32, crate::ModelError> {
+         let reads = self.info.ty.reads_scale();
+-        if !reads && self.scale.is_none() {
++        if !reads {
+             return Ok(1.0);
+         }
+         let scale = self.scale.as_deref().ok_or_else(|| unscaled(&self.info))?;

@@ -1072,9 +1072,11 @@ pub struct ShardTensor {
     /// The tensor scales a type that reads them ([`GgmlType::reads_scale`]) is
     /// dotted with, one an expert of a stack (one the tensor): the split's own
     /// placement carries them for a located stack, the `<stem>.scale` beside
-    /// the tensor ([`gguf::tensor_scales`]) for any other. The one owner of a
+    /// the tensor ([`gguf::tensor_scales`]) for any other. A block type a scale folds into
+    /// ([`GgmlType::folds_scale`]) is dotted with the `.scale` beside it when the file holds
+    /// one ([`gguf::folded_scales`]). The one owner of a
     /// tensor scale for both sources, and for both layouts; `None` for a type
-    /// that reads none.
+    /// that reads none and a file that holds none.
     scale: Option<Arc<[f32]>>,
 }
 
@@ -1090,14 +1092,19 @@ impl ShardTensor {
             .ok_or_else(|| crate::ModelError::MissingTensor(name.to_string()))?;
         let (runs, scale) = match placed(split, name)? {
             Some(Placed { runs, scales }) => (Some(Arc::new(runs)), placed_scales(info, scales)?),
-            None => (
-                None,
-                gguf::tensor_scales(info, |n| {
+            None => {
+                let find = |n: &str| {
                     let (s, i) = split.find(n)?;
                     Some((split.shard(s)?, i))
-                })?
-                .map(Arc::from),
-            ),
+                };
+                // A block type a scale folds into is dotted with the `.scale` beside it when the
+                // file holds one (the card load folds it into the blocks instead).
+                let scales = match gguf::tensor_scales(info, find)? {
+                    Some(scales) => Some(scales),
+                    None => gguf::folded_scales(info, find)?,
+                };
+                (None, scales.map(Arc::from))
+            }
         };
         Ok(ShardTensor {
             shard,
@@ -1121,7 +1128,8 @@ impl ShardTensor {
     /// on a handle that carries none, or none for `e`, is refused by name — a
     /// dot runs scaled or not at all.
     pub(crate) fn scale_of(&self, e: usize) -> Result<f32, crate::ModelError> {
-        if !self.info.ty.reads_scale() {
+        let reads = self.info.ty.reads_scale();
+        if !reads && self.scale.is_none() {
             return Ok(1.0);
         }
         let scale = self.scale.as_deref().ok_or_else(|| unscaled(&self.info))?;
@@ -2007,7 +2015,7 @@ fn check_stack_scale(
     n_expert: usize,
     scale: Option<&[f32]>,
 ) -> Result<(), crate::ModelError> {
-    if info.ty.reads_scale() && scale.is_none_or(|s| s.len() != n_expert) {
+    if (info.ty.reads_scale() || scale.is_some()) && scale.is_none_or(|s| s.len() != n_expert) {
         return Err(unscaled(info));
     }
     Ok(())
@@ -3042,8 +3050,8 @@ struct PairWork<'a> {
     /// at a time.
     layout: RowLayout,
     /// The tensor scale each of the pair's dots is multiplied by, once, after
-    /// the dot ([`PairMeta::scale`]): 1 for a pair of a type that reads none,
-    /// and for a row-lane or r8 pair, which is of one.
+    /// the dot ([`PairMeta::scale`]): 1 for a pair of a type that reads none
+    /// and a file holds none beside, and for an r8 pair, which is of one.
     scale: f32,
     /// The slot whose columns this pair reads, and the claim table when
     /// quantization is deferred into the dispatch (`None`: the pre-pass
@@ -3476,7 +3484,7 @@ impl<'a> PairWork<'a> {
                             // SAFETY: row `g·G + r` is inside `rows`, whole groups
                             // of this chunk's own (the assert above) — see the
                             // SharedOut construction site.
-                            unsafe { self.out.write((t0 + i) * n + g * G + r, val) };
+                            unsafe { self.out.write((t0 + i) * n + g * G + r, val * self.scale) };
                         }
                     }
                     t0 += m;

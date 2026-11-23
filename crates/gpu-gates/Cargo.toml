@@ -1066,6 +1066,13 @@ required-features = ["gpu"]
 name = "gate_inkling2_small"
 required-features = ["gpu"]
 
+# inkling2-fold: a UD file as Unsloth ships it (a per-expert scale beside i-quant stacks) against its
+# scale-folded copy (gate_inkling2_fold's doc): the same seeded prompt and greedy ids, the same
+# prompt logits row. Real tier only.
+[[bin]]
+name = "gate_inkling2_fold"
+required-features = ["gpu"]
+
 # inkling2-official-card: the official Inkling 2 Mini folder on the card in both dense arms
 # (gate_inkling2_official's doc): the arms' dense types and resident bytes apart, each arm's
 # teacher-forced argmax over the Mini's greedy tables within the pin. Real tier only.

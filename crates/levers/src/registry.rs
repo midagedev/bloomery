@@ -3363,4 +3363,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             by: Readers::Every,
         },
     },
+    runner(
+        "BLOOMERY_INK2_FOLD",
+        Some("ref/needs-env.sh"),
+        "An Inkling 2 Mini UD GGUF as downloaded (an i-quant fused gate·up stack with its per-expert `.scale` tensor beside it) and its scale-folded copy, `<raw file>,<folded copy>`: `gate-inkling2-fold` serves both one after the other and holds them to the same greedy ids, and a batch defers it by name where this is unset.",
+    ),
 ];

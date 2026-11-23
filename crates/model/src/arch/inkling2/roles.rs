@@ -13,7 +13,7 @@
 
 use gguf::Split;
 
-use crate::arch::classify::{Counts, classify_with, role_by_layer};
+use crate::arch::classify::{Counts, classify_folding, role_by_layer};
 use crate::arch::stems::{Stem, join, opt, req};
 use crate::placement::{ModelTensors, PlacementError, Role};
 
@@ -176,7 +176,7 @@ pub(super) fn model_level(
 /// Every tensor of `split` with its role and header facts.
 pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementError> {
     let core_start = hp.loop_.map_or(0, |loop_| loop_.core_start);
-    classify_with(
+    classify_folding(
         split,
         |name| {
             model_level(name, hp.dialect, core_start)

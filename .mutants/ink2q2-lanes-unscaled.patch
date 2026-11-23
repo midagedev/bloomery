@@ -1,0 +1,11 @@
+--- a/crates/model/src/ops.rs
++++ b/crates/model/src/ops.rs
+@@ -3484,7 +3484,7 @@
+                             // SAFETY: row `g·G + r` is inside `rows`, whole groups
+                             // of this chunk's own (the assert above) — see the
+                             // SharedOut construction site.
+-                            unsafe { self.out.write((t0 + i) * n + g * G + r, val * self.scale) };
++                            unsafe { self.out.write((t0 + i) * n + g * G + r, val) };
+                         }
+                     }
+                     t0 += m;

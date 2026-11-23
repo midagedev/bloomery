@@ -1,0 +1,11 @@
+--- a/crates/gguf/src/scale_fold.rs
++++ b/crates/gguf/src/scale_fold.rs
+@@ -111,7 +111,7 @@
+         for (n, b) in run.chunks_exact(block).enumerate() {
+             for &at in offsets {
+                 let v = half_to_f32(scalar(b, at)) * s;
+-                if f32_to_f16_bits(v) & 0x7c00 == 0x7c00 {
++                if f32_to_f16_bits(v) & 0x7c00 == 0x7c00 && v.is_nan() {
+                     return Err(refuse(format!(
+                         "scale {i} ({s}) takes block {n}'s scalar at byte {at} to {v}, past f16's \
+                          range"

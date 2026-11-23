@@ -13,6 +13,8 @@
 #
 # A variable may state a machine fact rather than an address: BLOOMERY_CARD_ALL_EXPERTS says one card holds every routed
 # expert of the plan (a 128 GB GB10), which gate-gpu-qwen4exp-nvfp4 needs; a smaller card defers it by name.
+# A variable may also name the files a gate compares: BLOOMERY_INK2_FOLD is `<raw file>,<folded copy>`, which
+# gate-inkling2-fold serves one after the other.
 #
 # Exit codes: 67 VAR is unset or empty, 64 a missing recipe name or variable, or a variable that is no name.
 set -euo pipefail
