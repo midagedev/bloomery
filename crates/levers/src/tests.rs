@@ -718,13 +718,13 @@ fn accessors_read_their_rows() {
     );
 }
 
-/// `BLOOMERY_INK2_DENSE` is `bf16` unset (the folder's BF16 as stored),
-/// `q8_0` asks for the Q8_0 rewrite at load, and any other word is refused by
+/// `BLOOMERY_INK2_DENSE` is `q8_0` unset (the Q8_0 rewrite at load), `bf16`
+/// keeps the folder's BF16 as stored, and any other word is refused by
 /// name with the words the row takes.
 #[test]
 fn ink2_dense_takes_bf16_or_q8_0_and_refuses_the_rest() {
     let q8 = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.ink2_dense_q8());
-    assert!(!q8(&[]).unwrap());
+    assert!(q8(&[]).unwrap());
     assert!(!q8(&[(INK2_DENSE, "bf16")]).unwrap());
     assert!(q8(&[(INK2_DENSE, "q8_0")]).unwrap());
     for bad in ["q8", "BF16", "1", ""] {

@@ -1532,7 +1532,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         name: INK2_DENSE,
         class: Class::A,
         kind: Kind::Words(&["bf16", "q8_0"]),
-        default: Unset::Is("bf16"),
+        default: Unset::Is("q8_0"),
         doc: "Inkling 2's dense weights when the model opens from its official checkpoint \
               folder (`model_hf::folder::open_with`): `bf16` keeps the attention projections, \
               the token embedding and the head as the folder stores them, two bytes a weight, \
@@ -1541,7 +1541,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `BLOOMERY_PREPARE_Q8=1` writes), read by the Q8_0 kernels. The rewrite is lossy. \
               The sink and conv projections stay BF16 and the experts keep their stored NVFP4 \
               and MXFP8 blocks under both words; a GGUF file is read as it stores its tensors. \
-              `bf16` and `q8_0` are the same-binary arms. Read where the folder opens.",
+              `q8_0` is the default, the faster arm on a step that reads its dense weights; `bf16` \
+              and `q8_0` are the same-binary arms. Read where the folder opens.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

@@ -82,7 +82,7 @@ use model::arch::inkling2::place::Inputs;
 use model::arch::place_hybrid::PlaceError;
 use model::placement::ctx_ask::{DEFAULT_SLOTS, card_experts_floor, probe_of};
 use model::placement::workstation::DeviceId;
-use model::placement::{Machine, Plan, PlanLevers};
+use model::placement::{Machine, PlacementError, Plan, PlanLevers};
 use serve::{CacheNote, EngineProps, Saved, ServeError};
 use tokenizer::Tokenizer;
 
@@ -203,6 +203,41 @@ impl Weights {
         }
     }
 }
+
+/// The largest slot context, a multiple of [`FOLDER_STEP`] up to [`FOLDER_LIMIT`], at which
+/// `holds` says the whole-card plan holds, its line on stderr; a context no step holds is refused
+/// by name.
+fn folder_fit<E>(mut holds: impl FnMut(u64) -> Result<bool, E>) -> Result<usize, GateError>
+where
+    E: std::fmt::Display,
+{
+    let mut probe = |c: u64| holds(c).map_err(|e| GateError::from(e.to_string()));
+    let (mut lo, mut hi) = (0u64, FOLDER_LIMIT / FOLDER_STEP + 1);
+    if probe(FOLDER_LIMIT)? {
+        lo = FOLDER_LIMIT / FOLDER_STEP;
+    }
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if probe(mid * FOLDER_STEP)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return Err(format!(
+            "no context of {FOLDER_STEP} positions or more holds the folder's whole model on the card"
+        )
+        .into());
+    }
+    let ctx = lo * FOLDER_STEP;
+    eprintln!("ctx rule=folder-fit ctx={ctx} step={FOLDER_STEP} limit={FOLDER_LIMIT}");
+    Ok(usize::try_from(ctx)?)
+}
+
+/// The folder fit's context unit and its upper bound (the Mini's trained context).
+const FOLDER_STEP: u64 = 1024;
+const FOLDER_LIMIT: u64 = 1 << 20;
 
 /// What the engine thread opens the model with.
 struct OpenSeat {
@@ -405,7 +440,28 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let mut machine = place.machine_untiered()?(inputs.model.layers);
     beside::reserve_on(&mut machine, held);
-    let asked = choose_ctx(split, (a.ctx, slots), (None, None), |c| {
+    // A folder's MXFP8 stacks have no host kernel, so a context the card cannot hold whole is the
+    // plan's refusal, not a short card: with no context asked, the seat takes the largest it holds.
+    let ctx_ask = match (a.ctx, matches!(weights, Weights::Folder(_))) {
+        (None, true) => Some(
+            folder_fit(
+                |c| match whole_card_plan(&inputs, &machine, c, &plan_levers) {
+                    Ok(_) => Ok(true),
+                    Err(PlaceError::Placement(PlacementError::NoHostKernel { .. })) => Ok(false),
+                    Err(e) => probe_of(Err::<Plan<'_>, _>(e)).map(|_| false),
+                },
+            )
+            .map_err(|e| {
+                format!(
+                    "--place {}: the inkling2 seat holds the whole model on the card (there is no \
+                 placed load): {e}",
+                    place.name()
+                )
+            })?,
+        ),
+        (c, _) => c,
+    };
+    let asked = choose_ctx(split, (ctx_ask, slots), (None, None), |c| {
         probe_of(whole_card_plan(&inputs, &machine, c, &plan_levers)).map_err(|e| {
             beside::refusal(
                 held,
