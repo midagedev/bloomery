@@ -135,7 +135,54 @@ pub fn cut_depth_keeps(depth: u64, rows: u64, ctx: u64, window: u64) -> bool {
     if rows == ctx {
         return true;
     }
-    depth <= rows.saturating_sub(window).saturating_add(1)
+    depth <= ring_cut_reach(rows, window)
+}
+
+/// The positions a window ring of `rows` rows over `window` takes back, from the end the ring
+/// was last written to: `rows - window + 1`, the slack [`cut_depth_keeps`] spends.
+#[must_use]
+pub const fn ring_cut_reach(rows: u64, window: u64) -> u64 {
+    rows.saturating_sub(window).saturating_add(1)
+}
+
+/// The positions a recurrent conv ring of [`conv_ring_rows`] rows takes back, from the end the
+/// ring was last written to. A step at `q` reads the inputs of `q - (conv - 1) .. q - 1`, each in
+/// slot `p mod rows`; the slot of the oldest is next written by `q - (conv - 1) + rows`, so the
+/// ring still holds them while the written end is at most `rows - (conv - 1)` = [`PASS_ROWS`]
+/// positions past `q`.
+///
+/// # Panics
+///
+/// On a conv of no tap, by name.
+#[must_use]
+pub const fn conv_cut_reach(conv: usize) -> usize {
+    conv_ring_rows(conv) - (conv - 1)
+}
+
+/// The positions a body whose stores are all positional takes back, from the end its writes
+/// reached: the least of its conv ring's ([`conv_cut_reach`] of the `conv`-tap conv) and each
+/// window ring's ([`ring_cut_reach`] of `(rows, window)`, the rings alone: a plane takes any
+/// cut). A rollback needs no checkpoint inside it.
+///
+/// # Panics
+///
+/// On a conv of no tap, by name.
+#[must_use]
+pub fn rollback_reach(conv: usize, rings: impl IntoIterator<Item = (u64, u64)>) -> u32 {
+    let least = rings
+        .into_iter()
+        .map(|(rows, window)| ring_cut_reach(rows, window))
+        .fold(conv_cut_reach(conv) as u64, u64::min);
+    u32::try_from(least).unwrap_or(u32::MAX)
+}
+
+/// The lowest position a body whose writes reached `end` (one past the highest position any
+/// step or pass wrote since the last reset) takes back to, given its [`rollback_reach`]. The depth
+/// is measured from the written end, not from where the body stands: a rollback leaves the rows
+/// it passed over where they are, so a second one is as deep as the first and the span between.
+#[must_use]
+pub const fn rollback_floor(end: u32, reach: u32) -> u32 {
+    end.saturating_sub(reach)
 }
 
 /// Rows of a pooled key plane over `ctx` positions in pools of `pool`, the
@@ -555,11 +602,12 @@ impl PosLayout {
 #[cfg(test)]
 mod tests {
     use super::{
-        DELTA_VERIFY_ROWS, PROMPT_BATCH, RING_ALIGN, Rows, conv_ring_bytes, conv_ring_rows,
-        cut_depth_keeps, delta_carry_bytes, delta_lane_bytes, delta_record_bytes,
-        delta_record_words, dense_kv_bytes, index_ring_bytes, index_ring_rows, kv_plane_bytes,
-        kv_row_bytes, mamba2_bytes, mamba2_lens, ple_ring_bytes, ple_ring_rows, pooled_rows,
-        recurrent_bytes, ring_rows, selecting_bytes, selecting_rows_bytes, window_rows,
+        DELTA_VERIFY_ROWS, PASS_ROWS, PROMPT_BATCH, RING_ALIGN, Rows, conv_cut_reach,
+        conv_ring_bytes, conv_ring_rows, cut_depth_keeps, delta_carry_bytes, delta_lane_bytes,
+        delta_record_bytes, delta_record_words, dense_kv_bytes, index_ring_bytes, index_ring_rows,
+        kv_plane_bytes, kv_row_bytes, mamba2_bytes, mamba2_lens, ple_ring_bytes, ple_ring_rows,
+        pooled_rows, recurrent_bytes, ring_cut_reach, ring_rows, rollback_floor, rollback_reach,
+        selecting_bytes, selecting_rows_bytes, window_rows,
     };
 
     /// A GQA layer's planes over `ctx` positions are `ctx` rows of the layout asked for: f16 K and V,
@@ -785,6 +833,108 @@ mod tests {
         assert!(cut_depth_keeps(written - first, rows, ctx, window));
         assert!(!cut_depth_keeps(written - second, rows, ctx, window));
         assert!(cut_depth_keeps(first - second, rows, ctx, window));
+    }
+
+    /// A conv ring as the kernels index it: the input of position `p` in slot `p mod rows`, a step
+    /// at `q` reading the inputs of `q - d` (`d` in `1..conv`) from their slots, none before the
+    /// sequence start. It holds the position each slot's input is of.
+    struct SimRing {
+        slots: Vec<Option<usize>>,
+        conv: usize,
+    }
+
+    impl SimRing {
+        fn new(conv: usize) -> SimRing {
+            SimRing {
+                slots: vec![None; conv_ring_rows(conv)],
+                conv,
+            }
+        }
+
+        fn write(&mut self, p: usize) {
+            let rows = self.slots.len();
+            self.slots[p % rows] = Some(p);
+        }
+
+        /// Whether a step at `q` finds the input of every predecessor it reads.
+        fn reads_hold(&self, q: usize) -> bool {
+            let rows = self.slots.len();
+            (1..self.conv)
+                .filter(|&d| q >= d)
+                .all(|d| self.slots[(q - d) % rows] == Some(q - d))
+        }
+    }
+
+    /// A conv ring takes back [`PASS_ROWS`] positions from the written end and not one more: a
+    /// step at the position `depth` below the end finds its predecessors exactly while
+    /// `depth <= PASS_ROWS`, for every conv of two taps up to eight, and
+    /// [`conv_cut_reach`] and [`rollback_floor`] say so. Mutants: a floor that takes
+    /// `PASS_ROWS + 1` fails its equality with `end - PASS_ROWS`; a ring a row short
+    /// (`conv_ring_rows` one less) fails the reach's equality with `PASS_ROWS`.
+    #[test]
+    fn a_conv_ring_takes_back_a_pass_and_no_more() {
+        for conv in 2..=8usize {
+            assert_eq!(conv_cut_reach(conv), PASS_ROWS, "conv {conv}");
+            assert_eq!(rollback_reach(conv, []) as usize, PASS_ROWS, "conv {conv}");
+            let end = 40;
+            let mut ring = SimRing::new(conv);
+            (0..end).for_each(|p| ring.write(p));
+            let floor = rollback_floor(end as u32, rollback_reach(conv, [])) as usize;
+            assert_eq!(floor, end - PASS_ROWS);
+            for q in end - PASS_ROWS - 3..=end {
+                assert_eq!(
+                    ring.reads_hold(q),
+                    q >= floor,
+                    "conv {conv}: a step at {q} after writes to {end}"
+                );
+            }
+        }
+    }
+
+    /// The depth is measured from the written end. Writes to 34 and a rollback to 30 leave the
+    /// rows 30..34 in the ring; a second rollback to 24 is six positions below where the body
+    /// stands and ten below the end, and the ring no longer holds the inputs of 22 and 21 (the
+    /// writes of 33 and 32 took their slots). Measured from where the body stands, the rule would
+    /// grant it. Mutant: the floor taken from the held position instead of the end fails.
+    #[test]
+    fn a_second_rollback_is_measured_from_the_written_end() {
+        let conv = 4;
+        let reach = rollback_reach(conv, []);
+        let mut ring = SimRing::new(conv);
+        (0..34).for_each(|p| ring.write(p));
+        let (end, held) = (34u32, 30u32);
+        let floor = rollback_floor(end, reach);
+        assert_eq!(floor, 26);
+        assert!(!ring.reads_hold(24), "the ring was taken for deeper");
+        assert!(24 < floor, "a rollback to 24 passes the floor");
+        assert!(held - reach <= 24, "from the held position it would pass");
+        assert!(ring.reads_hold(26) && ring.reads_hold(30));
+        assert!(!ring.reads_hold(25));
+    }
+
+    /// The reach is the least of the conv ring's and each window ring's: Inkling 2's four-tap
+    /// conv and rings of 1,536 rows over a window of 1,024 take back eight (the conv's, the
+    /// rings' being 513); a ring of the window and six rows takes back seven, and the tightest of
+    /// two rings binds. A window ring's reach is the slack [`cut_depth_keeps`] spends: they agree
+    /// at every depth.
+    #[test]
+    fn the_reach_is_the_least_of_the_conv_and_the_rings() {
+        assert_eq!(rollback_reach(4, []), 8);
+        assert_eq!(rollback_reach(4, [(1536, 1024)]), 8);
+        assert_eq!(ring_cut_reach(1536, 1024), 513);
+        assert_eq!(rollback_reach(4, [(1030, 1024)]), 7);
+        assert_eq!(
+            rollback_reach(4, [(1536, 1024), (1028, 1024), (1030, 1024)]),
+            5
+        );
+        let (rows, ctx, window) = (1536u64, 4096u64, 1024u64);
+        for depth in 0..=2000 {
+            assert_eq!(
+                cut_depth_keeps(depth, rows, ctx, window),
+                depth <= ring_cut_reach(rows, window),
+                "depth {depth}"
+            );
+        }
     }
 
     /// The pooled plane counts a partial last pool whole and nothing past it.

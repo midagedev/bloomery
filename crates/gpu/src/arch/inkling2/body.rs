@@ -411,7 +411,11 @@ pub struct Body {
     /// Each visit's routed ids and weights from the host, armed by [`Body::force_picks`].
     forced: Option<Forced>,
     /// The position the stores stand at: the next step's or pass's.
-    held: u32,
+    pub(super) held: u32,
+    /// One past the highest position any step or pass wrote since the last reset. A rollback
+    /// leaves it where it is, so the depth of a later one is measured from it
+    /// ([`runtime::stores::rollback_floor`]).
+    end: u32,
     ctx: usize,
     /// The prompt pass's buffers and kernels ([`pass`]).
     pass: pass::Pass,
@@ -774,6 +778,7 @@ impl Body {
             taps: None,
             forced: None,
             held: 0,
+            end: 0,
             ctx,
             d,
             visits,
@@ -782,6 +787,31 @@ impl Body {
             acts,
             hp,
         })
+    }
+
+    /// The positions a rollback takes back, from the written end: every store is positional, so
+    /// the least of the conv ring's reach and each windowed visit ring's slack
+    /// ([`runtime::stores::rollback_reach`]).
+    #[must_use]
+    pub fn rollback_reach(&self) -> u32 {
+        let window = self.hp.swa as u64;
+        runtime::stores::rollback_reach(
+            self.d.taps,
+            self.stores
+                .iter()
+                .filter(|s| s.shape.ring)
+                .map(|s| (s.shape.rows as u64, window)),
+        )
+    }
+
+    /// The lowest position a rollback takes back to ([`runtime::stores::rollback_floor`] of the
+    /// written end): nothing at all after a call that failed part-way, until a reset.
+    #[must_use]
+    pub fn rollback_floor(&self) -> u32 {
+        if self.held == u32::MAX {
+            return u32::MAX;
+        }
+        runtime::stores::rollback_floor(self.end, self.rollback_reach())
     }
 
     /// The visits the step walks, in run order: `(stored layer, pass)` each.
@@ -1780,6 +1810,7 @@ impl ChainBody for Body {
         self.step_in
             .refresh(stream, (input.token, input.pos), (self.ring, tau))?;
         self.held = input.pos + 1;
+        self.end = self.end.max(self.held);
         Ok(())
     }
 
@@ -1796,6 +1827,7 @@ impl ChainBody for Body {
             store.clear(stream)?;
         }
         self.held = 0;
+        self.end = 0;
         Ok(())
     }
 

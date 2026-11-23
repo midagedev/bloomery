@@ -274,6 +274,26 @@ pub fn keep_where_it_stands<B: ChainBody>(m: &GpuModel<B>, n: u32) -> u32 {
     if n >= m.pos() { m.pos() } else { 0 }
 }
 
+/// The longest prefix of at most `n` positions a cut keeps on a body whose stores are
+/// positional and take positions back down to `floor` (its written end less its reach): `n`
+/// from `floor` up to the position the model stands at, that position for an `n` past it,
+/// nothing below `floor`. The cut itself is [`cut_positions`], which the body refuses by name
+/// below its floor.
+pub fn keep_down_to<B: ChainBody>(m: &GpuModel<B>, n: u32, floor: u32) -> u32 {
+    kept_down_to(m.pos(), n, floor)
+}
+
+/// [`keep_down_to`] over the position the model stands at, `pos`.
+fn kept_down_to(pos: u32, n: u32, floor: u32) -> u32 {
+    if n >= pos {
+        pos
+    } else if n >= floor {
+        n
+    } else {
+        0
+    }
+}
+
 /// The cut of the same body: back to empty at 0 (a reset), or the position
 /// the model stands at (nothing to take back); any other cut is refused by
 /// name (`what`), `why` naming the state that takes no position back.
@@ -1541,8 +1561,32 @@ impl<B: Prompt + Keep + Rows + Rollback> Session<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArmFailed, BestRows, SessionError, clearable, round_passes, run_arms};
+    use super::{
+        ArmFailed, BestRows, SessionError, clearable, kept_down_to, round_passes, run_arms,
+    };
     use bloomery_gpu::{Fault, FaultSite, GpuError, best};
+
+    /// A cut keeps the prefix it is asked for from the floor up to where the model stands, where
+    /// the floor is the written end less the reach (the model at 100, written to 104, reach 8:
+    /// floor 96), that position for a prefix past it, and nothing below the floor — the longest
+    /// prefix at most `n` is then none, which is a reset. Mutants: the floor read as exclusive
+    /// (`>` for `>=`) loses 96; a `n` past the model's position kept as `n`; a prefix below the
+    /// floor kept.
+    #[test]
+    fn a_cut_keeps_what_the_floor_allows() {
+        let (pos, floor) = (100, 96);
+        assert_eq!(kept_down_to(pos, 100, floor), 100);
+        assert_eq!(kept_down_to(pos, 150, floor), 100);
+        assert_eq!(kept_down_to(pos, 99, floor), 99);
+        assert_eq!(kept_down_to(pos, 96, floor), 96);
+        assert_eq!(kept_down_to(pos, 95, floor), 0);
+        assert_eq!(kept_down_to(pos, 0, floor), 0);
+        assert_eq!(kept_down_to(0, 0, 0), 0);
+        assert_eq!(kept_down_to(5, 1, 0), 1);
+        assert_eq!(kept_down_to(5, 9, 0), 5);
+        // A failed call leaves the floor at the top: nothing below the model's position is kept.
+        assert_eq!(kept_down_to(100, 99, u32::MAX), 0);
+    }
 
     /// A best read's row holds its own list alone: the row read before it is
     /// back at -inf, and a list naming an id past the vocabulary or a row

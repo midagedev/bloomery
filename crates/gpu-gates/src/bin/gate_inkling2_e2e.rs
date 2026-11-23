@@ -38,6 +38,15 @@
 //! - `graph_is_eager`: set `a`'s prompt and [`GRAPH_STEPS`] greedy steps in graph mode (the chain
 //!   captured once and replayed at every position) give the eager chain's ids and last logits row
 //!   bit for bit.
+//! - `rollback_is_a_fresh_run`: the longest set's ids stepped to the position a windowed visit's
+//!   ring is [`PASS_ROWS`] rows short of wrapping, then `k` = 1 to [`PASS_ROWS`] cycles of: roll
+//!   back `k` positions, step those `k` ids again and [`ROLLBACK_ADVANCE`] new ones, each step's
+//!   id and logits row bit for bit the row of a run that never rolled back. A rollback past the
+//!   reach is refused by name and the model stands where it did; a rollback is as deep as its
+//!   written end, not where the model stands (a rollback of 3 and another of 6 more is nine
+//!   below the end, so it is refused, where a rollback of 5 more is taken and replays the fresh
+//!   run). A prompt pass moves the written end as steps do: after one, a rollback of
+//!   [`PASS_ROWS`] positions is taken and one more is refused.
 //!
 //! Before the card loads, a set absent from the box, dumped from another file or build, or
 //! unfinished ends the gate by name. A step that raises the fault word ends the gate by name.
@@ -71,6 +80,7 @@ mod gate {
     use refset::arch::inkling2;
     use refset::arch::prompt_tables::{self, Greedy, Top};
     use refset::family::Family;
+    use runtime::stores::PASS_ROWS;
 
     /// The gate's name: the recipe's and the refusals'.
     const NAME: &str = "gate_inkling2_e2e";
@@ -120,6 +130,14 @@ mod gate {
 
     /// The greedy steps `graph_is_eager` takes after the prompt.
     const GRAPH_STEPS: usize = 8;
+
+    /// The new positions each cycle of `rollback_is_a_fresh_run` steps after replaying its
+    /// rolled-back ids.
+    const ROLLBACK_ADVANCE: usize = 2;
+
+    /// The ids `rollback_is_a_fresh_run` feeds as a prompt pass before it takes the pass's end
+    /// back.
+    const PASS_PROMPT: usize = 64;
 
     /// The vendor clauses a run declares: two a set, each a fixture-oracle clause.
     const FX_ORACLE: usize = 2 * inkling2::SETS.len();
@@ -699,6 +717,134 @@ mod gate {
         Ok(pass)
     }
 
+    /// Clause `rollback_is_a_fresh_run`: see the module header. The ids are set `s`'s prompt and
+    /// its greedy ids, cycled, up to [`PASS_ROWS`] positions past the wrap of a windowed ring and
+    /// the cycles' advance; the fresh run keeps the id and logits row of every position from
+    /// [`PASS_ROWS`] below the first rollback on.
+    fn rollback_is_a_fresh_run(
+        m: &mut GpuModel<Body>,
+        hp: &Hparams,
+        s: &Set,
+    ) -> Result<bool, GateError> {
+        if !tier::run_clause("rollback_is_a_fresh_run", Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let reach = PASS_ROWS;
+        let advance = reach * ROLLBACK_ADVANCE;
+        let ring = usize::try_from(runtime::stores::ring_rows(hp.swa as u64, CTX as u64))?;
+        let n = ring.saturating_sub(reach).max(s.prompt.len());
+        let ids: Vec<u32> = s
+            .prompt
+            .iter()
+            .chain(s.greedy.ids.iter().cycle())
+            .copied()
+            .take(n + advance)
+            .collect();
+        if ids.len() != n + advance || ids.len() >= CTX {
+            return Err(format!(
+                "{NAME}: {} ids for a rollback run of {} positions in stores of {CTX}",
+                ids.len(),
+                n + advance
+            )
+            .into());
+        }
+        let first = n - reach;
+        // The fresh run: every id a step, the rows of the positions the cycles replay kept.
+        m.set_mode(StepMode::Graph);
+        m.reset()?;
+        let mut fresh: Vec<(u32, Vec<f32>)> = Vec::with_capacity(reach + advance);
+        for (p, &id) in ids.iter().enumerate() {
+            let token = m.step(&[id])?;
+            if p >= first {
+                fresh.push((token, m.logits()?));
+            }
+        }
+        // The rolled run, to the first cycle's start.
+        m.reset()?;
+        for &id in &ids[..n] {
+            m.step(&[id])?;
+        }
+        let mut held = n;
+        let mut miss: Option<String> = None;
+        let mut replays = 0usize;
+        // One step of the rolled run at position `p`, checked against the fresh run's row.
+        let mut again = |m: &mut GpuModel<Body>, p: usize| -> Result<bool, GateError> {
+            let token = m.step(&[ids[p]])?;
+            let (want, row) = &fresh[p - first];
+            replays += 1;
+            Ok(token == *want && bits_equal(&m.logits()?, row))
+        };
+        'cycles: for k in 1..=reach {
+            let to = held - k;
+            if let Err(e) = m.rollback(u32::try_from(to)?) {
+                miss = Some(format!("k={k}: a rollback to {to} refused: {e}"));
+                break;
+            }
+            if m.pos() as usize != to {
+                miss = Some(format!(
+                    "k={k}: the model stands at {} after a rollback to {to}",
+                    m.pos()
+                ));
+                break;
+            }
+            for p in to..held + ROLLBACK_ADVANCE {
+                if !again(m, p)? {
+                    miss = Some(format!("k={k}: position {p} differs from the fresh run"));
+                    break 'cycles;
+                }
+            }
+            held += ROLLBACK_ADVANCE;
+        }
+        // Past the reach: refused by name, the model where it stood.
+        let at = u32::try_from(held)?;
+        let (reach32, below) = (u32::try_from(reach)?, u32::try_from(reach + 1)?);
+        let past = m.rollback(at - below);
+        let past_text = past.as_ref().err().map(ToString::to_string);
+        let past_named = past_text
+            .as_deref()
+            .is_some_and(|t| t.contains("inkling2::Body::rollback") && t.contains("conv ring"));
+        let past_stands = m.pos() == at;
+        // The depth is the written end's: 3 back, then 6 more is 9 below the end (refused, the
+        // model standing at `at - 3`), then 5 more is 8 below it and replays the fresh run.
+        let three = m.rollback(at - 3).is_ok() && m.pos() == at - 3;
+        let deeper_refused = m.rollback(at - 9).is_err() && m.pos() == at - 3;
+        let eight = m.rollback(at - reach32).is_ok() && m.pos() == at - reach32;
+        let mut end_run = three && eight;
+        if miss.is_none() && end_run {
+            for p in held - reach..held {
+                end_run &= again(m, p)?;
+            }
+        }
+        m.set_mode(StepMode::Eager);
+        // A pass writes the end as steps do: the rollback of the reach is taken, one more refused.
+        m.reset()?;
+        m.prompt_pass(&ids[..PASS_PROMPT])?;
+        let end = u32::try_from(PASS_PROMPT)?;
+        let pass_refused = m.rollback(end - below).is_err() && m.pos() == end;
+        let pass_taken = m.rollback(end - reach32).is_ok() && m.pos() == end - reach32;
+        let pass_end = pass_refused && pass_taken;
+        let reaches = m.body(NAME)?.rollback_reach() as usize == reach;
+        let pass = miss.is_none()
+            && past_named
+            && past_stands
+            && deeper_refused
+            && end_run
+            && pass_end
+            && reaches;
+        println!(
+            "rollback_is_a_fresh_run set={} positions={} first_cycle_at={n} reach={reach} \
+             (body {}) rows_checked={replays} first_miss={miss:?} \
+             past_reach_refused={past_text:?} named={past_named} stands={past_stands} \
+             nine_below_the_end_refused={deeper_refused} \
+             eight_below_the_end_replays={end_run} after_a_pass_end_held={pass_end} {}",
+            s.label,
+            ids.len(),
+            m.body(NAME)?.rollback_reach(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     pub fn run() -> Result<(), GateError> {
         let tier = Tier::from_env()?;
         let split = open_split(Arch::Inkling2, RECIPE)?;
@@ -753,6 +899,11 @@ mod gate {
         ok &= loop_proven(&mut m, &sets[0])?;
         ok &= graph_nodes_are_the_walks(&mut m, &hp)?;
         ok &= graph_is_eager(&mut m, &sets[0])?;
+        let longest = sets
+            .iter()
+            .max_by_key(|s| s.prompt.len())
+            .ok_or("no prompt set")?;
+        ok &= rollback_is_a_fresh_run(&mut m, &hp, longest)?;
         println!("{}", tier::tally_line());
         if !ok {
             return Err(checks_failed());
@@ -761,7 +912,8 @@ mod gate {
             "PASSED: {NAME} tier {tier:?}: the visits of the loop; on every set the chain's \
              visits and logits within their bands (the fixture's with the vendor's picks, the \
              Mini's free), the teacher-forced argmax disagreements within the pin; the message \
-             path live; the captured step's nodes the walk's; the graph the eager chain"
+             path live; the captured step's nodes the walk's; the graph the eager chain; a \
+             rollback within the reach a fresh run"
         );
         Ok(())
     }

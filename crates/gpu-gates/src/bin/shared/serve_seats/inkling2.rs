@@ -21,13 +21,14 @@
 //!
 //! - The body holds one sequence: its visits' stores of one context and their convolution
 //!   rings. It has no slot rows, so `--parallel` above 1 is refused by name before any plan.
-//! - A windowed visit's ring holds the window it stands at alone, so the body takes no
-//!   position back (`Rollback for Body` refuses by name). A request keeps the prefix it shares
-//!   with what the slot holds only when that prefix is the whole held sequence; any other
-//!   shared prefix is kept 0, the slot reset and the prompt fed again. A speculative or draft
-//!   path is what asks a body for a rollback, and this seat has none: `BLOOMERY_DRAFT` set to
-//!   any word but `off` is refused by name before any load. The seat runs no prompt cache and
-//!   takes no snapshot.
+//! - Every store of the body is positional, so it takes positions back as far as its conv ring
+//!   holds them: a rollback is at most [`Body::rollback_reach`] positions below the end the
+//!   body has written to, and `Rollback for Body` refuses a deeper one by name. A request keeps
+//!   the prefix it shares with what the slot holds down to that floor
+//!   ([`Body::rollback_floor`]); a shorter shared prefix is kept 0, the slot reset and the
+//!   prompt fed again. The draft is the path that asks a body for a rollback, and it is not
+//!   wired to this seat: `BLOOMERY_DRAFT` set to any word but `off` is refused by name before
+//!   any load. The seat runs no prompt cache and takes no snapshot.
 //! - The prompt runs by the body's prompt rule (`app::Prompt`): whatever the session does
 //!   with the ids, the seat does the same, and the first id of the answer is a step of the
 //!   last prompt id.
@@ -102,18 +103,17 @@ pub const ACTS_ON: &[&str] = &[
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the inkling2 seat runs no prompt cache";
 
-/// Why a prefix shorter than the held sequence is not kept.
-const NO_STEP_BACK: &str = "the windowed visits' rings take no position back: a prefix is kept only where the sequence \
-     stands";
+/// Why a prefix further below the written end than the conv ring holds is not kept.
+const PAST_REACH: &str = "the conv ring holds a pass of positions: a prefix is kept only down to the written end \
+     less that";
 
 /// `BLOOMERY_DRAFT` read for a seat with no draft: unset and `off` pass, any other word is
-/// refused by name with the reason a draft asks for a rollback.
+/// refused by name with the reason the seat has none.
 fn draft_asked(levers: &Levers) -> Result<(), GateError> {
     levers.draft_word(&[DraftWord::Off]).map(drop).map_err(|e| {
         format!(
-            "BLOOMERY_DRAFT={}: the inkling2 seat drafts nothing: a drafted pass takes the rows \
-             the target rejects back with a rollback, and the body refuses one by name ({NO_STEP_BACK}); \
-             unset it or set off",
+            "BLOOMERY_DRAFT={}: the inkling2 seat drafts nothing: the draft and its verify pass \
+             are not wired to it; unset it or set off",
             e.word
         )
         .into()
@@ -236,19 +236,18 @@ impl Seat for Inkling2 {
         Ok(self.m.reset()?)
     }
 
-    /// Never asked for a position other than the one the model stands at ([`Seat::keep`]
-    /// grants no other), and refused by the body by name when it is
-    /// (`inkling2::Body::rollback`).
+    /// Asked only for a position [`Seat::keep`] granted, and refused by the body by name when
+    /// it is below the floor (`inkling2::Body::rollback`).
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
         Ok(self.m.rollback(pos)?)
     }
 
-    /// `n` when it is the whole held sequence, else nothing: the caller then resets the slot
-    /// and feeds the prompt again ([`Keep::keepable`]).
+    /// `n` from the body's floor up to the held sequence, else nothing: the caller then resets
+    /// the slot and feeds the prompt again ([`Keep::keepable`]).
     fn keep(&self, n: usize) -> (usize, Option<String>) {
         let at = u32::try_from(n).unwrap_or(u32::MAX);
         let kept = <Body as Keep>::keepable(&self.m, at) as usize;
-        (kept, (kept < n).then(|| NO_STEP_BACK.to_owned()))
+        (kept, (kept < n).then(|| PAST_REACH.to_owned()))
     }
 
     /// Nowhere: no prompt call is cut for a prefix a later request keeps.

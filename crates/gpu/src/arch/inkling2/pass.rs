@@ -457,6 +457,7 @@ impl GpuModel<Body> {
                 body.run_pass(gpu, w, head, &at, &mut kept)?;
             }
             body.held = pos + n;
+            body.end = body.end.max(body.held);
             Ok(true)
         })?;
         let token =

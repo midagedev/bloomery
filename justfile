@@ -5129,7 +5129,8 @@ gate-inkling2-pp:
 # template renders a user turn byte for byte; a chat turn counts the template's ids; a forced call parses into `tool_calls` and none is
 # read at `tool_choice: none`; the server's greedy ids equal the body's own for the oracle prompts (the 1,038-id one past the window) and
 # the chat turn; a request that shares less than the held sequence re-feeds from an empty model, one that extends it keeps every held
-# position; the body's rollback and `BLOOMERY_DRAFT=dspark` are refused by name. Fixture-only (tools/ref/fixture-only.sh): the real
+# position; a rollback past the conv ring's reach (8 positions below the written end) and `BLOOMERY_DRAFT=dspark` are refused by
+# name. Fixture-only (tools/ref/fixture-only.sh): the real
 # Mini is the dev-loop smoke of the round. One card (any idle one). Predicted wall [derived: one server load and one in-process load of the
 # fixture, seven plan-only starts, about 40 requests and two 1,038-id prompts at a few ms a step, and a first start of the new binary's GPU
 # code ~25 s]: under 4 min after a warm build.

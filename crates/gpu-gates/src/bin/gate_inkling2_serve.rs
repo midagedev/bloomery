@@ -2,9 +2,9 @@
 //! the inkling2 file of the profile (`BLOOMERY_REF_MODEL`; the fixture under the fixture tier):
 //! the family's serve gate. The seat holds the whole model on one card and one sequence, feeds a
 //! prompt by the body's prompt rule (`app::Prompt`), keeps a prefix a request shares with the
-//! slot only where it is the whole held sequence (a windowed visit's ring holds the window it
-//! stands at alone) and takes no position back: a rollback is refused by name, and the seat runs
-//! no draft, the one path that asks a body for one.
+//! slot down to the body's floor (the end it has written to less the conv ring's reach, every
+//! store being positional) and takes a rollback within that reach: a deeper one is refused by
+//! name, and the seat runs no draft yet, the one path that asks a body for one.
 //!
 //!     gate_inkling2_serve --dir <dir>
 //!
@@ -50,8 +50,8 @@
 //!   `hw_inkling2_tool_choice_none_reads_no_call` (`gate-serve`).
 //! - `edit_resend_is_a_fresh_run`: a prompt answered with the prompt cache, then resent with its
 //!   second half changed, answers the ids of the same request run from an empty cache and keeps
-//!   nothing (`cache_n` 0): the shared prefix is shorter than the held sequence and the rings
-//!   cannot step back, so the slot is reset. A `keep` that grants the shared prefix reaches the
+//!   nothing (`cache_n` 0): the shared prefix is further below the held sequence's end than the
+//!   conv ring holds, so the slot is reset. A `keep` that grants the shared prefix reaches the
 //!   body's refused rollback, the request fails and the clause is red.
 //! - `extension_keeps_the_held_sequence`: the prompt resent with its answer appended keeps the
 //!   held positions (`cache_n` above 0): the shared prefix is the whole held sequence.
@@ -67,10 +67,17 @@
 //! - `extension_is_the_held_run`: the resent answer of `extension_keeps_the_held_sequence` is
 //!   the body's run of the held split: the prose prompt and its answer, the answer's last id by
 //!   the body's prompt rule, [`N`] more.
-//! - `rollback_is_refused_by_name`: the body asked to take a position back from where it stands
-//!   returns an error naming `inkling2::Body::rollback` and the rings, and stands where it did;
-//!   and `BLOOMERY_DRAFT=dspark` (the draft is the path that asks for a rollback) is refused by
-//!   name before any plan, naming the rollback and the ring, while `BLOOMERY_DRAFT=off` plans.
+//! - `rollback_is_refused_past_the_reach`: the body asked to take back one position from where it
+//!   stands does, and one asked for more than the conv ring's reach (`PASS_ROWS`) returns an error
+//!   naming `inkling2::Body::rollback` and the conv ring and stands where it did. The rollbacks'
+//!   rows are `gate_inkling2_e2e`'s `rollback_is_a_fresh_run`.
+//! - `draft_is_refused_until_wired`: `BLOOMERY_DRAFT=dspark` is refused by name before any plan,
+//!   naming the variable and that the seat drafts nothing, while `BLOOMERY_DRAFT=off` plans.
+//!
+//! PIN(2026-11-23): `rollback_is_refused_by_name` is `rollback_is_refused_past_the_reach` and
+//! `draft_is_refused_until_wired`: the body takes positions back down to its written end less
+//! the reach, so the old refusal of every rollback no longer holds, and the draft's refusal no
+//! longer rests on it.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -95,6 +102,7 @@ mod gate {
     };
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
     use gguf::Split;
+    use runtime::stores::PASS_ROWS;
     use serde_json::{Value, json};
 
     const USAGE: &str = "usage: gate_inkling2_serve --dir <dir>";
@@ -623,9 +631,8 @@ mod gate {
         ))
     }
 
-    /// `completion_ids`, `extension_is_the_held_run` and the body half of
-    /// `rollback_is_refused_by_name` (the module header): the server stopped and the body on the
-    /// card.
+    /// `completion_ids` and `extension_is_the_held_run` (the module header): the server stopped
+    /// and the body on the card.
     fn body_clauses(m: &mut GpuModel<Body>, a: &Answers) -> Result<bool, GateError> {
         let mut ok = true;
         let mut same = true;
@@ -667,40 +674,47 @@ mod gate {
         Ok(ok)
     }
 
-    /// `rollback_is_refused_by_name` (the module header): the body half on a model that has run a
-    /// prompt, and the draft half on two `--plan` runs.
-    fn rollback_is_refused_by_name(
-        m: &mut GpuModel<Body>,
-        dir: &Path,
-        file: &Path,
-    ) -> Result<bool, GateError> {
+    /// `rollback_is_refused_past_the_reach` (the module header): the body on a model that has run
+    /// a prompt.
+    fn rollback_is_refused_past_the_reach(m: &mut GpuModel<Body>) -> Result<bool, GateError> {
         let mut ok = true;
         seat_answer(m, &oracle("a")?)?;
         let at = m.pos();
-        let refused = m.rollback(at - 1);
+        let reach = u32::try_from(PASS_ROWS)?;
+        let refused = m.rollback(at - reach - 1);
         let text = refused.as_ref().err().map(ToString::to_string);
-        let by_name = text.as_deref().is_some_and(|t| {
-            t.contains("inkling2::Body::rollback") && t.contains("take no position back")
-        });
+        let by_name = text
+            .as_deref()
+            .is_some_and(|t| t.contains("inkling2::Body::rollback") && t.contains("conv ring"));
         let stands = m.pos() == at;
+        let within = m.rollback(at - 1).is_ok() && m.pos() == at - 1;
         println!(
-            "rollback to {} from {at}: {text:?}; names the body and the rings {by_name}; the \
-             model stands at {at} {stands}",
-            at - 1
+            "rollback to {} from {at}: {text:?}; names the body and the conv ring {by_name}; the \
+             model stands at {at} {stands}; a rollback of one is taken {within}",
+            at - reach - 1
         );
+        check(
+            &mut ok,
+            "rollback_is_refused_past_the_reach",
+            by_name && stands && within,
+        );
+        Ok(ok)
+    }
+
+    /// `draft_is_refused_until_wired` (the module header): two `--plan` runs.
+    fn draft_is_refused_until_wired(dir: &Path, file: &Path) -> Result<bool, GateError> {
+        let mut ok = true;
         let (status, log, text) = SEAT.plan_under(
             (dir, "draft-dspark"),
             file,
             &[],
             &[(bloomery_levers::DRAFT, Some("dspark"))],
         )?;
-        let draft_named = text.contains("BLOOMERY_DRAFT=dspark")
-            && text.contains("rollback")
-            && text.contains("ring");
+        let named = text.contains("BLOOMERY_DRAFT=dspark") && text.contains("drafts nothing");
         let no_plan = log.first(&record::PLAN)?.is_none();
         println!(
-            "BLOOMERY_DRAFT=dspark: exit non-zero {}; names the variable, the rollback and the \
-             ring {draft_named}; no plan record {no_plan}",
+            "BLOOMERY_DRAFT=dspark: exit non-zero {}; names the variable and that the seat drafts \
+             nothing {named}; no plan record {no_plan}",
             !status.success()
         );
         let (off, _, _) = SEAT.plan_under(
@@ -712,8 +726,8 @@ mod gate {
         println!("BLOOMERY_DRAFT=off: plans (exit 0) {}", off.success());
         check(
             &mut ok,
-            "rollback_is_refused_by_name",
-            by_name && stands && !status.success() && draft_named && no_plan && off.success(),
+            "draft_is_refused_until_wired",
+            !status.success() && named && no_plan && off.success(),
         );
         Ok(ok)
     }
@@ -733,7 +747,8 @@ mod gate {
         if let Some(a) = answers {
             ok &= body_clauses(&mut m, &a)?;
         }
-        ok &= rollback_is_refused_by_name(&mut m, &dir, &file)?;
+        ok &= rollback_is_refused_past_the_reach(&mut m)?;
+        ok &= draft_is_refused_until_wired(&dir, &file)?;
         if !ok {
             return Err(checks_failed());
         }
@@ -741,7 +756,8 @@ mod gate {
             "PASSED: gate_inkling2_serve the seat plans its default and says so, refuses a second \
              slot, loads at the context it named, tokenizes the oracle prompts to the reference's \
              ids, renders the chat template, parses a forced call and reads none at none, answers \
-             the body's ids, keeps a prefix only where the sequence stands and takes no position back"
+             the body's ids, keeps a prefix down to the body's floor, takes a rollback within the conv \
+             ring's reach and refuses a deeper one by name, and refuses the draft until it is wired"
         );
         Ok(())
     }
