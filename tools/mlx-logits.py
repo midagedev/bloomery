@@ -56,9 +56,11 @@ of every `nn.Linear` (q, k, v, o, gate, up, down and the head; a tied head's
 `nn.Embedding.as_linear` too) and the keys and values the mlx-lm cache stores (after the k bias and
 the rope) are each rounded once into half and widened back, through wraps installed for the run
 only (`nn.Linear.__call__`, `nn.Embedding.as_linear`, `KVCache.update_and_fetch` and
-`RotatingKVCache.update_and_fetch`, the caches `make_prompt_cache` builds for the qwen2, llama and
-qwen3 models; a folder of another `model_type` is refused by name). The ids must be the pin's own,
-and `--positions`, when given, must be the pin's rows. `--round k` rounds the stored keys alone
+`RotatingKVCache.update_and_fetch`, the caches `make_prompt_cache` builds for the qwen2, llama,
+qwen3 and inkling2 models; a folder of another `model_type` is refused by name). A routed stack's
+f32 stand-in (`floatize`'s, one class a load) rounds its input the same way: the experts' gate-up
+and down are projections too. The ids must be the pin's own, and `--positions`, when given, must
+be the pin's rows. `--round k` rounds the stored keys alone
 (the harness's sensitivity probe: the logits must move); `--round none` rounds nothing.
 
 An LFM3 folder (`model_type` `lfm3`) loads through mlx-vlm's `lfm3` instead, since mlx-lm has none:
@@ -66,6 +68,21 @@ its language model alone runs, with the same floatize and the same two blocks. B
 folder's `config.json` and safetensors headers are held to what the Rust folder map reads (MLX's
 4-bit affine blocks, conv taps stored `[channels, kernel, 1]`, the tie flag against `lm_head`), so a
 pin is never taken of a folder the map would refuse.
+
+An Inkling 2 folder (`model_type` `inkling2_loop`) runs through mlx-lm's own `inkling2` as it
+is: the loop's visits, the message bank and its controllers, the relative bias, the sinks and the
+final soft cap are the module's, and the floatize above is the only change (the routed stacks are
+NVFP4 with a global scale and MXFP8, both through the stand-in, which asks `mx.dequantize` for f32
+where the global scale would round its bf16 default). Its router keeps 8 of 128 experts
+by biased sigmoid score and a near-tie of the 8th and 9th is common (one decision in a hundred
+lies within 6e-5), so a rounding can swap an expert; `dump` then also writes
+`<family>.routes` (`--out` only): every router call of the walk in run order, its step and visit,
+the kept ids ascending and the gap between the 8th and 9th biased scores. The e2e row's walk
+follows those kept ids. `simulate` of such a folder holds its rounded run to them the same way (the
+kept ids the control run chose, the weights from the rounded run's own scores) and prints the
+largest score difference the rounding makes beside the rows: the near-tie floor's input. `nodes`
+writes the walk's per-visit attention, post-conv and expert outputs in the e2e row's `--nodes`
+format and, given the session's, prints the relative difference of each: where a band miss starts.
 
 A Qwen3.6 fixture folder names each layer in `layer_types` and may still carry the source
 model's `full_attention_interval`. mlx-lm builds the layer kind from that interval. When the
@@ -129,6 +146,7 @@ USAGE = (
     " | mtp-dump <folder> <sidecar> <family> (--ids ID,ID,… | --text FILE [--max-ids N])"
     " [--positions P,P] [--f32-target] --out DIR"
     " | compare <ours-dir> <mlx-dir>"
+    " | nodes <folder> inkling2 --ids ID,ID,… --out PREFIX [--against SESSION-PREFIX]"
     " | f64 <ours-dir> <mlx-dir> <split.gguf> | --self-test"
 )
 OFFSET = 14695981039346656037
@@ -450,9 +468,6 @@ def dump(
     positions: list[int] | None = None,
     out: str | None = None,
 ) -> None:
-    import mlx.core as mx
-    import numpy as np
-
     if loader_of(model_type_of(folder)) == "mlx-vlm":
         model = load_lfm3(folder)
         make_cache = model.make_cache
@@ -471,6 +486,33 @@ def dump(
         raise SystemExit(f"mlx-logits: {folder} does not run in f32:\n{note}")
     prompt_cache = make_cache()
     keep = None if positions is None else set(positions)
+    calls: list = []
+    with route_hook(model, calls):
+        rows, argmax, n = dump_steps(model, ids, keep, prompt_cache)
+    raw = b"".join(rows)
+    text = header(
+        family, ids, len(ids), n, raw, positions, None if positions is None else argmax
+    )
+    emit(family, text, raw, out)
+    if out is not None:
+        print(f"mlx-logits: wrote {out}/{family}.txt and {out}/{family}.f32", file=sys.stderr)
+    if calls:
+        if out is None:
+            raise SystemExit("mlx-logits: a routed folder's dump writes its routes file: give --out")
+        import pathlib
+
+        visits = len(calls) // len(ids)
+        path = pathlib.Path(out) / f"{family}.routes"
+        path.write_text(routes_text(family, len(ids), visits, [c[:2] for c in calls]))
+        print(f"mlx-logits: wrote {path} ({len(ids)} steps of {visits} router calls)", file=sys.stderr)
+
+
+def dump_steps(model, ids: list[int], keep, prompt_cache):
+    """`dump`'s steps: every id fed teacher-forced, the rows of the kept steps (all for `keep`
+    None) as f32 bytes, their argmax and the vocabulary."""
+    import mlx.core as mx
+    import numpy as np
+
     rows = []
     argmax = []
     n = 0
@@ -489,13 +531,7 @@ def dump(
         if keep is None or step in keep:
             rows.append(row.tobytes())
             argmax.append(int(np.argmax(row)))
-    raw = b"".join(rows)
-    text = header(
-        family, ids, len(ids), n, raw, positions, None if positions is None else argmax
-    )
-    emit(family, text, raw, out)
-    if out is not None:
-        print(f"mlx-logits: wrote {out}/{family}.txt and {out}/{family}.f32", file=sys.stderr)
+    return rows, argmax, n
 
 
 def read_pin(pins: str, family: str) -> dict:
@@ -605,13 +641,125 @@ def parse_simulate(argv: list[str]):
     return folder, family, ids, positions, pins, mode
 
 
-def rounding(mode: str):
+ROUTES_VERSION = 1
+
+
+def routes_text(family: str, steps: int, visits: int, calls: list) -> str:
+    """The routes file of `calls` (each the kept ids and the 8th-9th biased gap of one router
+    call, in run order): `steps * visits` lines of step, visit, the ids ascending and the gap."""
+    if len(calls) != steps * visits:
+        raise SystemExit(f"mlx-logits: {len(calls)} router calls are not {steps} steps of {visits}")
+    lines = [f"version {ROUTES_VERSION}", f"family {family}", f"steps {steps}", f"visits {visits}"]
+    for k, (ids, gap) in enumerate(calls):
+        step, visit = divmod(k, visits)
+        lines.append(f"{step} {visit} {','.join(str(i) for i in sorted(ids))} {gap:.6e}")
+    return "\n".join(lines) + "\n"
+
+
+def read_routes(text: str, family: str) -> tuple[int, int, list]:
+    """`routes_text`'s file read back as (steps, visits, calls), refused by name when a line is
+    out of place, the family is another or the count is not steps * visits."""
+    lines = text.splitlines()
+    head = dict(line.split(" ", 1) for line in lines[:4] if " " in line)
+    if head.get("version") != str(ROUTES_VERSION) or head.get("family") != family:
+        raise SystemExit(f"mlx-logits: the routes file's head {lines[:2]} is not version "
+                         f"{ROUTES_VERSION} of {family}")
+    steps, visits = int(head["steps"]), int(head["visits"])
+    calls = []
+    for k, line in enumerate(lines[4:]):
+        step, visit, ids, gap = line.split(" ")
+        if (int(step), int(visit)) != divmod(k, visits):
+            raise SystemExit(f"mlx-logits: routes line {k + 5} is step {step} visit {visit}")
+        calls.append(([int(i) for i in ids.split(",")], float(gap)))
+    if len(calls) != steps * visits:
+        raise SystemExit(f"mlx-logits: the routes file holds {len(calls)} calls, not {steps} * {visits}")
+    return steps, visits, calls
+
+
+def routers(model) -> list:
+    """The model's routed-expert routers whose kept set the e2e walk follows: mlx-lm's
+    `inkling2` `TopKRouter`s; none for another model."""
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
+
+    return [
+        mod
+        for _, mod in tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+        if type(mod).__name__ == "TopKRouter" and "inkling2" in type(mod).__module__
+    ]
+
+
+def route_hook(model, calls: list, forced: list | None = None):
+    """A context that records every router call of `model` into `calls` (the kept ids and the
+    8th-9th biased gap; with `forced`, also the largest |score - forced call's score| as a third
+    field) and, given `forced` (a recorded run's calls with their scores), keeps that run's ids at
+    each call, the weights from this run's own scores as the router's own rule makes them."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def installed():
+        import mlx.core as mx
+        import numpy as np
+
+        mods = routers(model)
+        if not mods:
+            yield
+            return
+        cls = type(mods[0])
+        call = cls.__call__
+
+        def hooked(self, hidden_states):
+            logits = hidden_states.astype(mx.float32) @ self.weight.T
+            scores = mx.sigmoid(logits)
+            mx.eval(scores)
+            got = np.array(scores, dtype=np.float64).reshape(-1)
+            biased = got + np.array(self.e_score_correction_bias, dtype=np.float64)
+            order = np.sort(biased)[::-1]
+            gap = float(order[self.top_k - 1] - order[self.top_k])
+            if forced is None:
+                idx, w = call(self, hidden_states)
+                mx.eval(idx)
+                calls.append((sorted(int(i) for i in np.array(idx).reshape(-1)), gap, got))
+                return idx, w
+            ids, _gap, ref = forced[len(calls)]
+            calls.append((ids, gap, float(np.abs(got - ref).max())))
+            at = mx.array(ids, dtype=mx.int32).reshape(*scores.shape[:-1], len(ids))
+            kept = mx.take_along_axis(scores, at, axis=-1)
+            w = kept / (kept.sum(axis=-1, keepdims=True) + 1e-20)
+            return at, w * self.routed_scaling_factor
+
+        cls.__call__ = hooked
+        try:
+            yield
+        finally:
+            cls.__call__ = call
+
+    return installed()
+
+
+# The model types `simulate` rounds: their caches are the `KVCache` and `RotatingKVCache` the
+# rounding rule wraps, and every projection is an `nn.Linear` or a routed stack's stand-in.
+SIMULATE_TYPES = ("qwen2", "llama", "qwen3", "inkling2_loop")
+
+
+def simulate_refusal(kind: str) -> str | None:
+    """Why `simulate` refuses a folder of `model_type` `kind`, or None for a type it rounds."""
+    if kind in SIMULATE_TYPES:
+        return None
+    return (
+        f"simulate rounds the mlx-lm modules of {', '.join(SIMULATE_TYPES)}; "
+        f"the folder is model_type {kind!r}"
+    )
+
+
+def rounding(mode: str, switches=()):
     """The rounding rule's wraps, installed for the `with` block only: `nn.Linear.__call__` and a
-    tied head's `nn.Embedding.as_linear` round the projection's input, and the mlx-lm cache's
-    `update_and_fetch` (`KVCache` and `RotatingKVCache`, the caches `make_prompt_cache` builds for
-    the qwen2, llama and qwen3 models) rounds the keys and values it stores — each rounded once
-    into half and widened back, nothing else moved. Mode `k` rounds the stored keys alone; mode
-    `none` installs nothing."""
+    tied head's `nn.Embedding.as_linear` round the projection's input, the `__call__` of each class
+    in `switches` (a routed stack's f32 stand-in, `floatize`'s) rounds the experts' input, and the
+    mlx-lm cache's `update_and_fetch` (`KVCache` and `RotatingKVCache`, the caches
+    `make_prompt_cache` builds for the types of `SIMULATE_TYPES`) rounds the keys and values it
+    stores — each rounded once into half and widened back, nothing else moved. Mode `k` rounds the
+    stored keys alone; mode `none` installs nothing."""
     import contextlib
 
     @contextlib.contextmanager
@@ -642,6 +790,12 @@ def rounding(mode: str):
 
                 install(nn.Linear, "__call__", rounded_linear)
                 install(nn.Embedding, "as_linear", rounded_as_linear)
+                for cls in switches:
+
+                    def rounded_switch(self, x, indices, sorted_indices=False, _call=cls.__call__):
+                        return _call(self, half(x), indices, sorted_indices)
+
+                    install(cls, "__call__", rounded_switch)
             if mode in ("all", "k"):
                 round_values = mode == "all"
 
@@ -677,16 +831,14 @@ def simulate_main(argv: list[str]) -> int:
     from mlx_lm.utils import load
 
     folder, family, ids, positions, pins, mode = args
-    kind = model_type_of(folder)
-    if kind not in ("qwen2", "llama", "qwen3"):
-        raise SystemExit(
-            "mlx-logits: simulate rounds the mlx-lm qwen2, llama and qwen3 modules; "
-            f"{folder} is model_type {kind!r}"
-        )
+    refusal = simulate_refusal(model_type_of(folder))
+    if refusal is not None:
+        raise SystemExit(f"mlx-logits: {folder}: {refusal}")
     pin = read_pin(pins, family)
     held = pin_steps(pin, ids, positions, family)
     rules = {
-        "all": "the input of every linear and the head, and the keys and values the cache stores",
+        "all": "the input of every linear, routed stack and the head, and the keys and values "
+        "the cache stores",
         "k": "the keys the cache stores alone",
         "none": "nothing",
     }
@@ -699,8 +851,15 @@ def simulate_main(argv: list[str]) -> int:
     note, replaced = floatize(model)
     if replaced == 0 or "bf16 parameters left: 0" not in note:
         raise SystemExit(f"mlx-logits: {folder} does not run in f32:\n{note}")
+    import mlx.nn as nn
+    from mlx.utils import tree_flatten
     from mlx_lm.models import cache as mlx_cache
 
+    switches = {
+        type(mod)
+        for _, mod in tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module)
+        if type(mod).__name__ == "F32Switch"
+    }
     keep = set(held)
 
     def forward():
@@ -730,7 +889,9 @@ def simulate_main(argv: list[str]) -> int:
             out.append((float(d.max()) if np.isfinite(d).all() else float("inf"), step))
         return out
 
-    control = distances(forward())
+    recorded: list = []
+    with route_hook(model, recorded):
+        control = distances(forward())
     cw, cs = max(control)
     print(f"control worst {cw:.4e} at step {cs}")
     if cw > 1e-5:
@@ -738,10 +899,26 @@ def simulate_main(argv: list[str]) -> int:
             f"mlx-logits: the control run misses the {family} pin by {cw:.4e} at step {cs}; "
             "the harness does not reproduce the pin"
         )
-    with rounding(mode):
+    rerouted: list = []
+    if recorded:
+        import pathlib
+
+        _steps, _visits, pinned = read_routes(
+            (pathlib.Path(pins) / f"{family}.routes").read_text(), family
+        )
+        if [c[0] for c in recorded] != [c[0] for c in pinned]:
+            raise SystemExit(f"mlx-logits: the control run's routes are not {family}.routes'")
+    with rounding(mode, switches), route_hook(model, rerouted, recorded if recorded else None):
         sim = distances(forward())
     for w, step in sim:
         print(f"step {step}: {w:.4e}")
+    if rerouted:
+        worst = max(rerouted, key=lambda c: c[2])
+        k = rerouted.index(worst)
+        print(
+            f"router scores: max |rounded - control| {worst[2]:.4e} at call {k} "
+            f"(step {k // (len(rerouted) // len(ids))}), every call kept the control's ids"
+        )
     sw, ss = max(sim)
     print(f"simulated worst {sw:.4e} at step {ss}")
     return 0
@@ -1060,6 +1237,29 @@ def self_test_simulate() -> int:
     import tempfile
 
     fails = 0
+    # The stand-in's dequant: f32 asked for exactly where a global scale is multiplied in.
+    if not needs_f32("nvfp4", 1.0) or any(
+        needs_f32(m, g) for m, g in (("affine", None), ("affine", 1.0), ("mxfp8", None), ("nvfp4", None))
+    ):
+        print("mlx-logits self-test FAIL: f32 dequant not asked exactly at a global scale", file=sys.stderr)
+        fails += 1
+    # The nodes index: a well-formed pair reads back; a gap, a repeat and a stray kind refuse.
+    good = "0\t0\tkqv\t0\t4\n0\t0\tmoe_out\t4\t2\n"
+    if read_nodes_index(good) != {(0, 0, "kqv"): (0, 4), (0, 0, "moe_out"): (4, 2)}:
+        print("mlx-logits self-test FAIL: nodes index roundtrip", file=sys.stderr)
+        fails += 1
+    for name, bad in (
+        ("offset gap", "0\t0\tkqv\t0\t4\n0\t0\tmoe_out\t5\t2\n"),
+        ("repeat", "0\t0\tkqv\t0\t4\n0\t0\tkqv\t4\t4\n"),
+        ("kind", "0\t0\tlout\t0\t4\n"),
+        ("shape", "0\t0\tkqv\t0\n"),
+    ):
+        try:
+            read_nodes_index(bad)
+            print(f"mlx-logits self-test FAIL: nodes index took a {name}", file=sys.stderr)
+            fails += 1
+        except ValueError:
+            pass
 
     def check(name: str, ok: bool) -> None:
         nonlocal fails
@@ -1095,6 +1295,39 @@ def self_test_simulate() -> int:
     )
     walk = parse_simulate(["f", "llama", "--ids-walk", "3:5", "--positions", "1,2", "--pin", "p"])
     check("simulate walk", walk[2] == walk_ids(3, 5) and walk[3] == [1, 2] and walk[5] == "all")
+    check(
+        "simulate rounds the dense types and Inkling 2's loop",
+        all(simulate_refusal(k) is None for k in ("qwen2", "llama", "qwen3", "inkling2_loop")),
+    )
+    check(
+        "simulate refuses another type by name",
+        "model_type 'lfm3'" in (simulate_refusal("lfm3") or ""),
+    )
+    calls = [([5, 1, 3], 1.5e-3), ([2, 0, 4], 2.5e-5), ([7, 6, 1], 0.25), ([3, 2, 0], 1e-6)]
+    routes = routes_text("inkling2", 2, 2, calls)
+    steps, visits, back = read_routes(routes, "inkling2")
+    check(
+        "routes read back",
+        (steps, visits) == (2, 2)
+        and [c[0] for c in back] == [sorted(c[0]) for c in calls]
+        and all(abs(b[1] - c[1]) <= 1e-6 * c[1] for b, c in zip(back, calls)),
+    )
+    check(
+        "routes of another family are refused",
+        refused(lambda: read_routes(routes, "qwen3"), "is not version 1 of qwen3"),
+    )
+    check(
+        "routes missing a call are refused",
+        refused(lambda: read_routes(routes.rsplit("\n", 2)[0] + "\n", "inkling2"), "holds 3 calls"),
+    )
+    check(
+        "routes out of order are refused",
+        refused(lambda: read_routes(routes.replace("1 0 ", "1 1 ", 1), "inkling2"), "is step 1 visit 1"),
+    )
+    check(
+        "routes of another call count are refused",
+        refused(lambda: routes_text("inkling2", 3, 2, calls), "are not 3 steps of 2"),
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
@@ -1971,6 +2204,15 @@ def gguf_name_of(tail: str) -> str | None:
     return None
 
 
+def needs_f32(mode: str, global_scale) -> bool:
+    """Whether `mx.dequantize` must be asked for f32 (`dtype=`) to return exact values. An affine
+    mode's output takes the widened scales' f32. Any other mode's uint8 scales leave the output
+    bf16: exact for MXFP8 and NVFP4 codes times their scale byte, but an NVFP4 global scale
+    multiplied in rounds every value to bf16 once more. Asked only where a global scale is
+    given, so an mlx build without the argument still runs every other mode."""
+    return mode != "affine" and global_scale is not None
+
+
 def dequantize_f32(mod, weight, scales, biases):
     """`weight`, `scales` and `biases` (the whole of the quantized module `mod`, or the same rows
     of each) as exact f32 values.
@@ -2089,7 +2331,8 @@ def floatize(model) -> tuple[str, int]:
 
     class F32Switch(nn.Module):
         """A quantized switch linear's exact f32 stand-in: the experts a call routes are
-        dequantized for it, the module's own scales, biases and global scale."""
+        dequantized for it, the module's own scales, biases and global scale, in f32 where the
+        global scale would round them ([`needs_f32`])."""
 
         def __init__(self, mod):
             super().__init__()
@@ -2110,6 +2353,7 @@ def floatize(model) -> tuple[str, int]:
                 bits=self.bits,
                 mode=self.mode,
                 global_scale=None if self.global_scale is None else self.global_scale[e],
+                **({"dtype": mx.float32} if needs_f32(self.mode, self.global_scale) else {}),
             ).astype(mx.float32)
 
         def __call__(self, x, indices, sorted_indices=False):
@@ -2788,6 +3032,141 @@ def _load_model(folder: str):
     return model
 
 
+NODE_KINDS = ("kqv", "attn_out", "moe_out", "ffn_out")
+
+
+def read_nodes_index(text: str) -> dict:
+    """A `--nodes` index (`<prefix>.tsv`, the e2e inkling2 row's and `nodes`'s) as
+    {(step, visit, kind): (offset, length)}: one line a node, `step visit kind offset length`
+    tab-separated, the offsets the running sum of the lengths before. A line of another shape, a
+    kind not in `NODE_KINDS`, a node named twice and an offset off the running sum raise by
+    name."""
+    index = {}
+    at = 0
+    for n, line in enumerate(text.splitlines(), 1):
+        cols = line.split("\t")
+        if len(cols) != 5 or not all(c.isdigit() for c in cols[:2] + cols[3:]):
+            raise ValueError(f"nodes line {n}: {line!r} is not step, visit, kind, offset, length")
+        step, visit, kind, offset, length = int(cols[0]), int(cols[1]), cols[2], int(cols[3]), int(cols[4])
+        if kind not in NODE_KINDS:
+            raise ValueError(f"nodes line {n}: kind {kind!r} is none of {', '.join(NODE_KINDS)}")
+        if (step, visit, kind) in index:
+            raise ValueError(f"nodes line {n}: step {step} visit {visit} {kind} named twice")
+        if offset != at:
+            raise ValueError(f"nodes line {n}: offset {offset}, the lengths before sum to {at}")
+        index[(step, visit, kind)] = (offset, length)
+        at += length
+    return index
+
+
+def nodes_main(argv: list[str]) -> int:
+    """`nodes <folder> inkling2 --ids ID,ID,… --out PREFIX [--against SESSION]`: mlx-lm's nodes
+    of the dump's walk (the same load, f32 over the exact dequant, the ids fed one step each),
+    each visit's attention output before its gate (`kqv`), the attention post-conv's output
+    (`attn_out`), the experts' sum (`moe_out`, the FFN post-conv's input) and the FFN post-conv's
+    output (`ffn_out`), written as `PREFIX.f32` and `PREFIX.tsv` in the e2e row's `--nodes`
+    format. With `--against`, the session's nodes of the same walk (`gate_metal_qwen35moe_e2e
+    --row inkling2 --nodes SESSION`) beside them: one line a step and kind, each visit's
+    max |session − mlx-lm| / max |mlx-lm|. A diagnostic that names the visit and stage where a
+    band miss starts; no gate reads it."""
+    if len(argv) < 2:
+        print(USAGE, file=sys.stderr)
+        return 64
+    folder, family = argv[0], argv[1]
+    ids, out, against = None, None, None
+    rest = argv[2:]
+    while rest:
+        if rest[0] == "--ids" and len(rest) >= 2:
+            ids = parse_ids(rest[1])
+        elif rest[0] == "--out" and len(rest) >= 2:
+            out = rest[1]
+        elif rest[0] == "--against" and len(rest) >= 2:
+            against = rest[1]
+        else:
+            print(USAGE, file=sys.stderr)
+            return 64
+        rest = rest[2:]
+    if family != "inkling2" or ids is None or out is None:
+        print("mlx-logits: nodes takes the inkling2 family, --ids and --out", file=sys.stderr)
+        return 64
+    import mlx.core as mx
+    import numpy as np
+    from mlx_lm.models import cache as mlx_cache
+    from mlx_lm.models.inkling2 import layers as ink
+    from mlx_lm.utils import load
+
+    model, _tokenizer = load_folder(folder, load)
+    gather_embedding(model, ids)
+    note, replaced = floatize(model)
+    if replaced == 0 or "bf16 parameters left: 0" not in note:
+        raise SystemExit(f"mlx-logits: {folder} does not run in f32:\n{note}")
+    role = {}
+    for layer in model.layers:
+        role[id(layer.post_attention_convolution)] = "attn"
+        role[id(layer.post_mlp_convolution)] = "ffn"
+    seen: list = []
+    conv_call, attend = ink.ShortConvolution.__call__, ink.Attention._attention
+
+    def conv(self, x, state, mask):
+        y, window = conv_call(self, x, state, mask)
+        if role.get(id(self)) == "ffn":
+            seen.extend((("moe_out", x), ("ffn_out", y)))
+        elif role.get(id(self)) == "attn":
+            seen.append(("attn_out", y))
+        return y, window
+
+    def attention(self, *args, **kwargs):
+        y = attend(self, *args, **kwargs)
+        seen.append(("kqv", y))
+        return y
+
+    lines, raw, at = [], [], 0
+    cache = mlx_cache.make_prompt_cache(model)
+    ink.ShortConvolution.__call__, ink.Attention._attention = conv, attention
+    try:
+        with route_hook(model, []):
+            for step, token in enumerate(ids):
+                seen.clear()
+                mx.eval(unwrap_logits(model(mx.array([token])[None], cache=cache)))
+                visit = -1
+                for kind, value in seen:
+                    visit += kind == "kqv"
+                    row = np.ascontiguousarray(np.array(value.astype(mx.float32)).reshape(-1), dtype=np.float32)
+                    lines.append(f"{step}\t{visit}\t{kind}\t{at}\t{row.size}")
+                    raw.append(row.tobytes())
+                    at += row.size
+    finally:
+        ink.ShortConvolution.__call__, ink.Attention._attention = conv_call, attend
+    with open(f"{out}.f32", "wb") as f:
+        f.write(b"".join(raw))
+    with open(f"{out}.tsv", "w") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"mlx-logits: wrote {out}.f32 and {out}.tsv ({len(lines)} nodes)", file=sys.stderr)
+    if against is None:
+        return 0
+    with open(f"{against}.tsv") as f:
+        ours_index = read_nodes_index(f.read())
+    theirs_index = read_nodes_index("\n".join(lines))
+    ours = np.fromfile(f"{against}.f32", dtype="<f4")
+    theirs = np.frombuffer(b"".join(raw), dtype="<f4")
+    visits = 1 + max(v for _s, v, _k in theirs_index)
+    for step in range(len(ids)):
+        for kind in NODE_KINDS:
+            cells = []
+            for visit in range(visits):
+                key = (step, visit, kind)
+                if key not in ours_index or key not in theirs_index:
+                    cells.append("--")
+                    continue
+                (oo, on), (to, tn) = ours_index[key], theirs_index[key]
+                if on != tn:
+                    raise SystemExit(f"mlx-logits: step {step} visit {visit} {kind}: {on} values, mlx-lm {tn}")
+                a, b = ours[oo : oo + on], theirs[to : to + tn]
+                cells.append(f"{float(np.abs(a - b).max() / (np.abs(b).max() + 1e-30)):.0e}")
+            print(f"step {step} {kind}: {' '.join(cells)}")
+    return 0
+
+
 def compare_main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(USAGE, file=sys.stderr)
@@ -2865,6 +3244,8 @@ def main(argv: list[str]) -> int:
         return f64_main(argv[1:])
     if argv and argv[0] == "compare":
         return compare_main(argv[1:])
+    if argv and argv[0] == "nodes":
+        return nodes_main(argv[1:])
     if not argv or argv[0] != "dump" or len(argv) < 3:
         print(USAGE, file=sys.stderr)
         return 64

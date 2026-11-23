@@ -188,10 +188,7 @@ fn model_path() -> Result<PathBuf, String> {
     let spec = row::current();
     match spec.model {
         row::Model::Split => mlx_split::path(spec.arch),
-        row::Model::Folder => mlx_split::folder(spec.arch),
-        row::Model::Fixture => refset::fixture::first_shard(spec.arch)
-            .map(PathBuf::from)
-            .map_err(|e| format!("the fixture file: {e}")),
+        row::Model::Folder | row::Model::Family => mlx_split::folder(spec.arch),
     }
 }
 
@@ -568,7 +565,7 @@ pub fn main() -> ExitCode {
         _ => flag(&args, "--only"),
     };
     // The family's own session and clauses: no clause above runs on it.
-    if row.model == row::Model::Fixture {
+    if row.model == row::Model::Family {
         return ink2::run(&args, mutant, only);
     }
     if let Some(name) = only

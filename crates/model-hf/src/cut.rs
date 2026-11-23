@@ -4278,17 +4278,15 @@ pub(crate) mod tests {
     }
 
     /// The inkling2 spec over the real Mini folder's four shard headers (1,559 tensors,
-    /// 17,308,123,136 bytes) plans the 24-layer looped fixture: every language layer kept — the
-    /// stem 0-5, the core 6-17 the loop runs three times, the coda 18-23, each six-layer
-    /// attention-residual block whole with its global layer last (5, 11, 17, 23) and the four
-    /// message-gate controllers on the core alone — with the vision tower dropped and the routed
-    /// experts cut to their first 24 of 128 (the stacked planes' leading axis: NVFP4 with a
-    /// global scale on layers 0-19, MXFP8 without one on 20-23) and the router's rows and
-    /// correction bias with them. From the headers: 1,137 tensors and 3,916,345,344 bytes (the
-    /// nine unlayered tensors 521,515,008; a stem layer 122,964,384; a core layer 130,042,272; a
-    /// coda layer 212,543,712).
+    /// 17,308,123,136 bytes) plans the 13-layer looped fixture: source layers 0-11 and 20 kept
+    /// whole as the cut's layers 0-12 — the stem 0-5 with its global layer 5, the core 6-11 the
+    /// loop runs three times with its global layer 11 and the four message-gate controllers on
+    /// each core layer, and the coda's layer 20 (MXFP8, where layers 0-11 are NVFP4 with a global
+    /// scale) — every one with all 128 experts, the vision tower dropped, and the model-level
+    /// message-query table sliced to the six core layers' rows. From the headers: 615 tensors
+    /// and 8,708,318,336 bytes in three shards.
     #[test]
-    fn the_inkling2_spec_plans_the_24_layer_looped_fixture_from_the_real_mini_headers() {
+    fn the_inkling2_spec_plans_the_13_layer_looped_fixture_from_the_real_mini_headers() {
         let spec = inkling2_spec();
         let src = real_mini_source();
         Source {
@@ -4298,77 +4296,56 @@ pub(crate) mod tests {
         .check_identity(&spec)
         .unwrap();
         let p = plan(&spec, &src, DEFAULT_SHARD_BYTES).unwrap();
-        assert_eq!(p.tensors.len(), 1_137);
+        assert_eq!(p.tensors.len(), 615);
         assert_eq!(
             p.tensors.iter().map(|t| t.view.len()).sum::<u64>(),
-            3_916_345_344
+            8_708_318_336
         );
-        assert_eq!(p.shards, 1, "3.9 GB fits the default 4 GiB shard cap");
-        assert_eq!(p.dropped_tensors, 422, "the vision tower");
-        assert_eq!(p.dropped_bytes, 636_512_256);
+        assert_eq!(p.shards, 3, "8.7 GB over the default 4 GiB shard cap");
+        assert_eq!(
+            p.dropped_tensors, 944,
+            "the vision tower and layers 12-19, 21-23"
+        );
+        assert_eq!(p.dropped_bytes, 8_599_583_616);
 
-        let in_layer = |t: &Planned, l: usize| {
-            t.name
-                .starts_with(&format!("model.language_model.layers.{l}."))
-        };
-        let names_of = |l: usize| {
-            p.tensors
+        // Each cut layer is its source layer whole: the same tensors, views, shapes and dtypes.
+        const KEPT: [usize; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20];
+        let source_of: HashMap<&str, &Src> = src.iter().map(|t| (t.name.as_str(), t)).collect();
+        let query = "model.language_model.message_input.query";
+        for t in &p.tensors {
+            let s = source_of[t.src_name.as_str()];
+            if t.src_name == query {
+                assert_eq!(t.shape, vec![6, 4, 2304], "the six core layers' query rows");
+                assert_eq!(t.view.len() * 2, s.len, "half the table's twelve rows");
+                continue;
+            }
+            assert_eq!(t.view, View::whole(s.start, s.len), "{}", t.name);
+            assert_eq!((&t.shape, t.dtype), (&s.shape, s.dtype), "{}", t.name);
+            if let Some(rest) = t.name.strip_prefix(&spec.layer_prefix) {
+                let (l, tail) = rest.split_once('.').unwrap();
+                let from = format!(
+                    "{}{}.{tail}",
+                    spec.layer_prefix,
+                    KEPT[l.parse::<usize>().unwrap()]
+                );
+                assert_eq!(t.src_name, from, "{}", t.name);
+            }
+        }
+        for (l, &from) in KEPT.iter().enumerate() {
+            let source = format!("{}{from}.", spec.layer_prefix);
+            let want = src.iter().filter(|t| t.name.starts_with(&source)).count();
+            let cut = format!("{}{l}.", spec.layer_prefix);
+            let names: Vec<&str> = p
+                .tensors
                 .iter()
-                .filter(|t| in_layer(t, l))
+                .filter(|t| t.name.starts_with(&cut))
                 .map(|t| t.name.as_str())
-                .collect::<Vec<_>>()
-        };
-        let layer_bytes = |l: usize| {
-            p.tensors
-                .iter()
-                .filter(|t| in_layer(t, l))
-                .map(|t| t.view.len())
-                .sum::<u64>()
-        };
-        assert_eq!(
-            p.tensors
-                .iter()
-                .filter(|t| !t.name.starts_with(&spec.layer_prefix))
-                .map(|t| t.view.len())
-                .sum::<u64>(),
-            521_515_008
-        );
-        assert_eq!(
-            (0..24).map(layer_bytes).collect::<Vec<_>>(),
-            [
-                122_955_168,
-                122_964_384,
-                122_964_384,
-                122_964_384,
-                122_964_384,
-                123_074_976,
-                130_042_272,
-                130_042_272,
-                130_042_272,
-                130_042_272,
-                130_042_272,
-                130_152_864,
-                130_042_272,
-                130_042_272,
-                130_042_272,
-                130_042_272,
-                130_042_272,
-                130_152_864,
-                122_964_384,
-                122_964_384,
-                212_543_712,
-                212_543_712,
-                212_543_712,
-                212_654_304
-            ]
-        );
-        // mlx-lm's rule: layer i is one of the four global layers when it is not in
-        // local_layer_ids, and carries the four message-gate controllers when the loop's core
-        // (core_start 6 to core_end 18) holds it.
-        for l in 0..24 {
-            let names = names_of(l);
-            let global = matches!(l, 5 | 11 | 17 | 23);
-            let core = (6..18).contains(&l);
+                .collect();
+            assert_eq!(names.len(), want, "layer {l} (source {from})");
+            // mlx-lm's rule over the edited config: a global layer is one local_layer_ids does
+            // not name, and the core (6 to core_end 12) carries the message-gate controllers.
+            let global = matches!(l, 5 | 11);
+            let core = (6..12).contains(&l);
             assert_eq!(
                 names
                     .iter()
@@ -4377,28 +4354,23 @@ pub(crate) mod tests {
                 "layer {l}"
             );
             assert_eq!(
-                names.iter().any(|n| n.ends_with(".input_layernorm.weight")),
-                !global,
+                names
+                    .iter()
+                    .any(|n| n.contains(".mlp_message_gate.down_proj.weight")),
+                core,
                 "layer {l}"
             );
-            for controller in [
-                "q_message_gate",
-                "k_message_gate",
-                "v_message_gate",
-                "mlp_message_gate",
-            ] {
-                assert_eq!(
-                    names
-                        .iter()
-                        .any(|n| n.contains(&format!(".{controller}.down_proj.weight"))),
-                    core,
-                    "layer {l}: {controller}"
-                );
-            }
-            assert!(
-                !names.iter().any(|n| n.contains("global_scale")) == (l >= 20),
-                "layer {l}"
+            assert_eq!(
+                names.iter().any(|n| n.contains("global_scale")),
+                from < 20,
+                "layer {l}: NVFP4 carries the global scale, MXFP8 none"
             );
+            let gate = p
+                .tensors
+                .iter()
+                .find(|t| t.name == format!("{cut}mlp.gate.weight"))
+                .unwrap_or_else(|| panic!("layer {l}: no router"));
+            assert_eq!(gate.shape, vec![128, 2304], "layer {l}: every expert");
         }
         assert!(
             !p.tensors
@@ -4406,65 +4378,17 @@ pub(crate) mod tests {
                 .any(|t| t.name.starts_with("model.vision_tower.")),
             "the vision tower is dropped"
         );
-
-        // Every plane of the expert stacks and the router is cut on the experts' axis and every
-        // other kept tensor whole: the NVFP4 and the MXFP8 layers alike.
-        let by_name: HashMap<&str, &Planned> =
-            p.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
-        let source_of: HashMap<&str, &Src> = src.iter().map(|t| (t.name.as_str(), t)).collect();
-        for t in &p.tensors {
-            let s = source_of[t.src_name.as_str()];
-            let stacked = t.src_name.contains("mlp.experts.")
-                || t.src_name.ends_with("mlp.gate.weight")
-                || t.src_name.ends_with("mlp.gate.e_score_correction_bias");
-            if !stacked {
-                assert_eq!(t.view, View::whole(s.start, s.len), "{}", t.name);
-                assert_eq!((&t.shape, t.dtype), (&s.shape, s.dtype), "{}", t.name);
-            }
-        }
-        for l in 0..24 {
-            let packed = if l < 20 {
-                (288usize, 144usize)
-            } else {
-                (576, 72)
-            };
-            for (suffix, shape) in [
-                ("mlp.experts.gate_up_proj.weight", vec![24, 2304, packed.0]),
-                ("mlp.experts.gate_up_proj.scales", vec![24, 2304, packed.1]),
-                ("mlp.experts.down_proj.weight", vec![24, 2304, packed.0 / 2]),
-                ("mlp.experts.down_proj.scales", vec![24, 2304, packed.1 / 2]),
-                ("mlp.gate.weight", vec![24, 2304]),
-                ("mlp.gate.e_score_correction_bias", vec![24]),
-            ] {
-                let t = by_name
-                    .get(format!("model.language_model.layers.{l}.{suffix}").as_str())
-                    .unwrap_or_else(|| panic!("layer {l}: no {suffix}"));
-                assert_eq!(t.shape, shape, "layer {l} {suffix}");
-            }
-            if l < 20 {
-                let gs = by_name
-                    .get(
-                        format!(
-                            "model.language_model.layers.{l}.mlp.experts.gate_up_proj.global_scale"
-                        )
-                        .as_str(),
-                    )
-                    .unwrap_or_else(|| panic!("layer {l}: no global_scale"));
-                assert_eq!(gs.shape, vec![24], "layer {l}");
-            }
-        }
     }
 
-    /// The inkling2 spec over the real Mini `config.json` edits the two fields the cut moves:
-    /// `text_config.n_routed_experts` 128 becomes 24 (`num_experts_per_tok` 8 stays, at most the
-    /// kept experts) and `vision_config` becomes null, so mlx-lm builds no vision tower to ask
-    /// for the tensors the cut dropped. Every field the reference reads per layer or per visit
-    /// keeps the source's own value — `num_hidden_layers` 24 (every layer kept), `local_layer_ids`
-    /// (the windowed layers, none dropped), `loop_config` (core 6 to 18, three passes, gate rank
-    /// 64) and `n_layers_per_attn_res_block` 6 (the four blocks whole) — so the loop runs the
-    /// same 48 visits over the cut.
+    /// The inkling2 spec over the real Mini `config.json` edits the fields the cut moves:
+    /// `num_hidden_layers` 24 becomes 13, `local_layer_ids` names the cut's windowed layers (every
+    /// kept layer but the global 5 and 11), `loop_config.core_end` 18 becomes 12 (the core the
+    /// cut's layers 6-11), and `vision_config` becomes null, so mlx-lm builds no vision tower to
+    /// ask for the dropped tensors. The experts (128, 8 a token), the passes (3), the gate rank
+    /// and the six-layer attention-residual block keep the source's values, so the loop runs
+    /// 6 + 3 · 6 + 1 = 25 visits over the cut.
     #[test]
-    fn the_inkling2_spec_edits_the_real_mini_config_to_24_experts() {
+    fn the_inkling2_spec_edits_the_real_mini_config_to_the_13_layer_loop() {
         let spec = inkling2_spec();
         let real = String::from_utf8(gunzipped(
             "quant-configs/mlx-community__Inkling-2-Mini-4bit__config.json.gz",
@@ -4473,28 +4397,14 @@ pub(crate) mod tests {
         let before: Value = serde_json::from_str(&real).unwrap();
         let edited: Value = serde_json::from_str(&edit_config(&spec, &real).unwrap()).unwrap();
         let mut want = before;
-        want["text_config"]["n_routed_experts"] = json!(24);
+        want["text_config"]["num_hidden_layers"] = json!(13);
+        want["text_config"]["local_layer_ids"] = json!([0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12]);
+        want["text_config"]["loop_config"]["core_end"] = json!(12);
         want["vision_config"] = Value::Null;
         assert_eq!(edited, want);
         let text = &edited["text_config"];
-        assert_eq!(text["num_hidden_layers"].as_u64().unwrap(), 24);
+        assert_eq!(text["n_routed_experts"].as_u64().unwrap(), 128);
         assert_eq!(text["num_experts_per_tok"].as_u64().unwrap(), 8);
-        let local: Vec<u64> = text["local_layer_ids"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_u64().unwrap())
-            .collect();
-        assert_eq!(local.len(), 20, "the windowed layers");
-        assert_eq!(
-            local
-                .iter()
-                .copied()
-                .filter(|l| (6..18).contains(l))
-                .count(),
-            10,
-            "the core's windowed layers"
-        );
         assert_eq!(
             text["loop_config"]
                 .as_object()
@@ -4510,7 +4420,7 @@ pub(crate) mod tests {
                 .collect::<BTreeMap<_, u64>>(),
             BTreeMap::from([
                 ("core_start", 6),
-                ("core_end", 18),
+                ("core_end", 12),
                 ("num_passes", 3),
                 ("gate_rank", 64),
             ])

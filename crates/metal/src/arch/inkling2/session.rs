@@ -147,17 +147,17 @@ impl Tap {
 /// route a forced step then takes.
 pub type TapSink<'a> = &'a mut dyn FnMut(usize, Tap, &[f32]);
 
-/// The route a forced step takes at a visit: the kept ids and their scaled
-/// weights, in place of the router's (the e2e gate's replay of a reference
-/// chain, whose near-tied scores another engine's roundings may order
-/// otherwise), or the reason there is none.
+/// The route a routed step takes at a visit ([`Session::step_routed`]): the
+/// kept ids and their scaled weights, in place of the router's (the e2e
+/// gate's walk over a reference's kept ids, whose near-tied scores another
+/// engine's roundings may order otherwise), or the reason there is none.
 pub type Routes<'a> = &'a mut dyn FnMut(usize) -> Result<([u32; 8], [f32; 8]), String>;
 
-/// The rows a replayed step's visit starts from, given the visit and the
-/// blocks the walk has closed: those blocks then the stream, in place of the
-/// walk's own (the e2e gate's replay of a reference chain a visit at a time,
-/// each visit fed the reference's own inputs); None keeps the walk's own; an
-/// error is the reason there are none. The head is the visit after the last.
+/// The rows a forced walk's visit starts from (`ops::Walk::token`'s hook), given
+/// the visit and the blocks the walk has closed: those blocks then the stream,
+/// in place of the walk's own; None keeps the walk's own; an error is the
+/// reason there are none. The head is the visit after the last. No session
+/// step forces one.
 pub type Inputs<'a> = &'a mut dyn FnMut(usize, usize) -> Result<Option<Vec<f32>>, String>;
 
 /// An Inkling 2 model, open on one stream.
@@ -282,7 +282,7 @@ impl Session {
     /// A poisoned session, a position past the cache, an id past the
     /// vocabulary, the device's error, or the fault word raised by the step.
     pub fn step(&mut self, id: u32) -> Result<u32, SessionError> {
-        self.step_with(id, None, None, None)
+        self.step_with(id, None, None)
     }
 
     /// [`Session::step`] that hands every visit's nodes to `taps` as the walk
@@ -291,24 +291,23 @@ impl Session {
     /// # Errors
     /// As [`Session::step`].
     pub fn step_tapped(&mut self, id: u32, taps: TapSink<'_>) -> Result<u32, SessionError> {
-        self.step_with(id, Some(taps), None, None)
+        self.step_with(id, Some(taps), None)
     }
 
-    /// [`Session::step_tapped`] whose experts run the routes `routes` names
-    /// at each visit instead of the router's picks, and whose visits (and
-    /// head) each start from the rows `inputs` gives, where it is given.
+    /// [`Session::step_tapped`] whose experts run the route `routes` gives at
+    /// each visit instead of the router's picks; the router hands its own
+    /// scores, kept ids and weights to `taps` before the route is asked for.
     ///
     /// # Errors
-    /// As [`Session::step`], and a route or rows the hooks refuse, a route
-    /// that names an expert past the file's, or rows of another length.
-    pub fn step_replayed(
+    /// As [`Session::step`], and a route the hook refuses or one that names
+    /// an expert past the file's.
+    pub fn step_routed(
         &mut self,
         id: u32,
         taps: TapSink<'_>,
         routes: Routes<'_>,
-        inputs: Option<Inputs<'_>>,
     ) -> Result<u32, SessionError> {
-        self.step_with(id, Some(taps), Some(routes), inputs)
+        self.step_with(id, Some(taps), Some(routes))
     }
 
     fn step_with(
@@ -316,7 +315,6 @@ impl Session {
         id: u32,
         taps: Option<TapSink<'_>>,
         routes: Option<Routes<'_>>,
-        inputs: Option<Inputs<'_>>,
     ) -> Result<u32, SessionError> {
         if let Some(f) = self.poisoned {
             return Err(SessionError::Poisoned(f));
@@ -340,7 +338,7 @@ impl Session {
             k: &self.kernels,
             stream: &self.stream,
         };
-        let picked = walk.token(id, self.pos, taps, routes, inputs);
+        let picked = walk.token(id, self.pos, taps, routes, None);
         // A raise outranks the walk's own error: the fault names the visit.
         let fault = self.arena.faults.read(&self.stream)?;
         if let Some(f) = fault {

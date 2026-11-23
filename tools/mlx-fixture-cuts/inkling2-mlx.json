@@ -4,7 +4,7 @@
   "source": "mlx-community/Inkling-2-Mini-4bit",
   "rev": "9856dc53edead71405f8348930937c3638ff21a2",
   "expect": {"tensors": 1559, "data_bytes": 17308123136},
-  "layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+  "layers": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 20],
   "layer_prefix": "model.language_model.layers.",
   "keep": [
     "model.language_model.embed_tokens.weight",
@@ -25,20 +25,20 @@
     "generation_config.json",
     "chat_template.jinja"
   ],
-  "widths": {"experts": {"keep": 24, "align": 1}},
+  "widths": {"core": {"keep": 6, "align": 1}},
   "planes": [
-    {"base": "mlp.experts.gate_up_proj", "axis": "rows", "width": "experts",
-     "members": {"weight": 1, "scales": 1, "global_scale": {"along": 1, "optional": true}}},
-    {"base": "mlp.experts.down_proj", "axis": "rows", "width": "experts",
-     "members": {"weight": 1, "scales": 1, "global_scale": {"along": 1, "optional": true}}},
-    {"base": "mlp.gate", "axis": "rows", "width": "experts",
-     "members": {"weight": 1, "e_score_correction_bias": 1}}
+    {"base": "model.language_model.message_input", "axis": "rows", "width": "core",
+     "members": {"query": 1}}
   ],
   "config": {
     "layer_count": "text_config.num_hidden_layers",
-    "widths": {"text_config.n_routed_experts": "experts"},
+    "widths": {},
     "per_layer": [],
     "layer_names": [],
-    "set": {"vision_config": null}
+    "set": {
+      "vision_config": null,
+      "text_config.local_layer_ids": [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12],
+      "text_config.loop_config.core_end": 12
+    }
   }
 }

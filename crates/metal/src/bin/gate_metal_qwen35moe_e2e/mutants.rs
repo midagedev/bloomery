@@ -36,9 +36,11 @@
 //! prologue that `m_logits` reads; the dense Qwen3's are [`QWEN3`], edits of the head
 //! norm and of the NEOX pairs, which a first step reads none of; Qwen2's is [`QWEN2`], an edit of the
 //! bias add after P1, which the Llama row's layers have none of; Inkling 2's are [`INKLING2`],
-//! edits of the loop controllers' forget gate (`k_taps`) and of the head's pick (`k_greedy`);
-//! `k_visits`' and `k_room`'s defects are the host's (a walk of other visits, a buffer the plan
-//! does not count), one-off edits like the others above. The edits compile into
+//! edits of the router's selection bias (`k_routes`), of the loop controllers' forget gate, the
+//! residual convs' taps and the MXFP8 coda's scale (`k_logits`) and of the head's pick
+//! (`k_greedy`); `k_visits`' and `k_room`'s defects are
+//! the host's (a walk of other visits, a buffer the plan does not count), one-off edits like the
+//! others above. The edits compile into
 //! the row's own instance's source (`program::source_at`), so they land in the
 //! program the row runs.
 
@@ -461,7 +463,7 @@ pub const QWEN3: &[Mutant] = &[
 pub const INKLING2: &[Mutant] = &[
     Mutant {
         name: "ink2_forget_sign",
-        clause: "k_taps",
+        clause: "k_logits",
         why: "the loop controllers' forget gate adds to the stream instead of removing from it, \
               which only a message visit reads",
         edits: &[(
@@ -472,9 +474,9 @@ pub const INKLING2: &[Mutant] = &[
     },
     Mutant {
         name: "ink2_conv_taps_reversed",
-        clause: "k_taps",
-        why: "the residual convs read their window in the opposite order, which a position past \
-              the first reads",
+        clause: "k_logits",
+        why: "the residual convs' later static taps read their window in the opposite order, so \
+              the current input takes another tap's weight from the first step on",
         edits: &[(
             "conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, args.pos, reach - k, c),",
             "conv_res_tap(x, ring, d, args.ch, args.base, args.rows, t, args.pos, k - 1u, c),",
@@ -484,11 +486,29 @@ pub const INKLING2: &[Mutant] = &[
     Mutant {
         name: "ink2_pick_shifted",
         clause: "k_greedy",
-        why: "the head stores the id after its argmax's, which no visit's node shows",
+        why: "the head stores the id after its argmax's, which the logits row does not show",
         edits: &[(
             "step_id[0] = ~uint(best_key);",
             "step_id[0] = ~uint(best_key) + 1u;",
             1,
         )],
+    },
+    Mutant {
+        name: "ink2_router_bias_dropped",
+        clause: "k_routes",
+        why: "the router selects by the sigmoid score alone, the correction bias dropped, so it \
+              keeps another set wherever the bias reorders the 8th and 9th",
+        edits: &[(
+            "const float sel = score + bias[row];",
+            "const float sel = score;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "ink2_mxfp8_scale_exp",
+        clause: "k_logits",
+        why: "an MXFP8 group's E8M0 scale reads its exponent one too high, so the MXFP8 coda's \
+              every expert weight is doubled, which only an MLX folder's coda layer holds",
+        edits: &[("exp2(float(sb) - 127.0f)", "exp2(float(sb) - 126.0f)", 1)],
     },
 ];

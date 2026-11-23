@@ -84,7 +84,7 @@ const DEEP_DIR: &str = "deep";
 
 /// The committed pin for `family` in `pins/<sub>` (`pins/` for none): the text
 /// and the f32 little-endian rows.
-fn pin_of(sub: Option<&str>, family: &str) -> Result<(String, Vec<u8>), String> {
+pub(super) fn pin_of(sub: Option<&str>, family: &str) -> Result<(String, Vec<u8>), String> {
     let mut dir =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/bin/gate_metal_qwen35moe_e2e/pins");
     if let Some(sub) = sub {
@@ -111,15 +111,16 @@ fn pin_of(sub: Option<&str>, family: &str) -> Result<(String, Vec<u8>), String> 
     Ok((text, raw))
 }
 
-struct Pin {
-    ids: Vec<u32>,
+/// A pin read and checked ([`parse_pin`]).
+pub(super) struct Pin {
+    pub(super) ids: Vec<u32>,
     /// The step each held row belongs to, increasing: every step where the pin
     /// names no `positions`.
-    positions: Vec<usize>,
+    pub(super) positions: Vec<usize>,
     /// The argmax of each held row the pin's own line names, when it has one.
-    argmax: Option<Vec<u32>>,
-    n: usize,
-    rows: Vec<f32>,
+    pub(super) argmax: Option<Vec<u32>>,
+    pub(super) n: usize,
+    pub(super) rows: Vec<f32>,
 }
 
 /// The first index of the largest value of `row`: a NaN is not a candidate.
@@ -143,7 +144,7 @@ fn field<'a>(map: &'a [(&str, &str)], key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("the mlx-lm pin has no {key}"))
 }
 
-fn parse_pin(family: &str, text: &str, raw: &[u8]) -> Result<Pin, String> {
+pub(super) fn parse_pin(family: &str, text: &str, raw: &[u8]) -> Result<Pin, String> {
     let mut map = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let Some((key, value)) = line.split_once(' ') else {
@@ -267,17 +268,17 @@ fn parse_pin(family: &str, text: &str, raw: &[u8]) -> Result<Pin, String> {
 
 /// One step's row against the pin's row: the largest |a − b| and where, the
 /// values over the band and the rms.
-struct Distance {
-    max: f64,
-    at: usize,
-    session: f32,
-    stored: f32,
-    over: usize,
-    rms: f64,
+pub(super) struct Distance {
+    pub(super) max: f64,
+    pub(super) at: usize,
+    pub(super) session: f32,
+    pub(super) stored: f32,
+    pub(super) over: usize,
+    pub(super) rms: f64,
 }
 
 /// `got` against `want`. A NaN or an infinity is not a distance.
-fn distance(got: &[f32], want: &[f32], band: f64) -> Result<Distance, String> {
+pub(super) fn distance(got: &[f32], want: &[f32], band: f64) -> Result<Distance, String> {
     if got.len() != want.len() {
         return Err(format!(
             "the logit row holds {} values; the pin holds {}",

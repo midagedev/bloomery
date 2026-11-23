@@ -35,8 +35,9 @@ pub enum Mutants {
     Qwen3,
     /// The dense Qwen2's: the bias add after P1, which every other row's layers have none of.
     Qwen2,
-    /// Inkling 2's: the loop controllers' forget gate, which only a message visit's taps read,
-    /// and the head's pick, which only the greedy table reads.
+    /// Inkling 2's: the router's selection bias, which its routes clause reads, the loop
+    /// controllers' forget gate, the residual convs' taps and the MXFP8 coda's scales, which its
+    /// logits read, and the head's pick, which only its greedy clause reads.
     Inkling2,
     /// None: the row runs the kernels of another row's tables.
     None,
@@ -51,10 +52,9 @@ pub enum Model {
     /// `<arch>-mlx`, the checkpoint folder itself: a family `prepare` has no
     /// map for has no split, and the session opens the folder.
     Folder,
-    /// The family's GGUF fixture file (`refset::fixture::first_shard`): a
-    /// family whose own session and clauses (`ink2.rs`) the vendor tree's node
-    /// dumps of that file check.
-    Fixture,
+    /// `<arch>-mlx`, the checkpoint folder, on the family's own session and
+    /// clauses (`ink2.rs`): a family the qwen session does not run.
+    Family,
 }
 
 /// Where the ids of a row's prompts come from.
@@ -245,6 +245,22 @@ const QWEN2_LOGIT_ABS: f64 = 0.02;
 const QWEN2_LOGIT_CAP: f64 = 0.15;
 
 const _: () = assert!(QWEN2_LOGIT_ABS <= QWEN2_LOGIT_CAP);
+
+/// PIN(2026-11-23): max |session − pin| on a logit of the 13-layer cut of Inkling 2 Mini's MLX folder
+/// at each pinned step (`pins/inkling2.txt`: mlx-lm's `inkling2_loop` in f32 over the exact dequant,
+/// the NVFP4 experts' global scale multiplied in f32, the walk forced onto the pin's routes). The
+/// band is the rounding rule simulated, as [`QWEN2_LOGIT_ABS`]'s: `tools/mlx-logits.py simulate`
+/// runs the pin's model in f32 with the input of every projection, of the routed experts and of the
+/// head, and the K and V the cache stores, rounded once into half, on the same forced routes. Its
+/// worst against the pin is 1.32e-2 at step 3 (0 with no rounding, 2.56e-3 with the stored keys
+/// alone), rounded up. Measured: the session's worst is 7.18e-3 (step 2), between the two rules, as
+/// the session rounds only the K and V it stores.
+const INKLING2_LOGIT_ABS: f64 = 0.014;
+
+/// Half the smallest top-2 gap of the pin's six rows, 0.1154 at step 34, rounded down.
+const INKLING2_LOGIT_CAP: f64 = 0.05;
+
+const _: () = assert!(INKLING2_LOGIT_ABS <= INKLING2_LOGIT_CAP);
 
 /// Qwen3.6-35B-A3B's fixture: the gated delta net beside the attention layers.
 pub static QWEN35MOE: Row = Row {
@@ -568,14 +584,15 @@ pub static QWEN2: Row = Row {
     skips: QWEN3_SKIPS,
 };
 
-/// Inkling 2's GGUF fixture (13 stored layers, the core's six run three times: 25 visits), on
+/// Inkling 2 Mini's checkpoint folder cut to 13 stored layers with every expert
+/// (`tools/mlx-fixture-cuts/inkling2-mlx.json`: the core's six run three times, 25 visits), on
 /// the family's own session (`bloomery_metal::arch::inkling2`) and clauses (`ink2.rs`), which
-/// read the row's name, architecture, file and mutants. The qwen session's clauses run on no
-/// such row, so its other fields are the defaults no clause reads.
+/// read the row's name, architecture, folder, band and mutants. The qwen session's clauses run on
+/// no such row, so its other fields are the defaults no clause reads.
 pub static INKLING2: Row = Row {
     name: "inkling2",
     arch: "inkling2",
-    model: Model::Fixture,
+    model: Model::Family,
     prompt: Prompt::Generated {
         first: 0,
         lo: 0,
@@ -583,7 +600,7 @@ pub static INKLING2: Row = Row {
     },
     seed: 0,
     recurrent: false,
-    logit_abs: 0.0,
+    logit_abs: INKLING2_LOGIT_ABS,
     deep_logit_abs: None,
     count: None,
     verify: None,
