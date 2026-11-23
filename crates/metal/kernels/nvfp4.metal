@@ -1,7 +1,7 @@
 // The NVFP4 mat-vec of Inkling 2's routed experts: one SIMD group a row
 // over the blocks of the fused stacks the family's files hold their first
-// twenty stored layers' experts in, the per-expert global scale a launch
-// word applied after the dot.
+// twenty stored layers' experts in, the per-expert global scale applied
+// after the dot.
 //
 // The block (mainline's block_nvfp4, 64 values, 36 bytes): bytes 0..4 the
 // UE4M3 scales of the four 16-value sub-blocks, bytes 4..36 the codes.
@@ -24,19 +24,32 @@
 // The rows entry (nvfp4_rows_gemv) is bloomery's NVFP4 rows type, the
 // MLX folder's bytes as stored: 9 bytes a 16-value group, the UE4M3 scale
 // byte then 8 code bytes, value 2i the low nibble of code byte i and 2i + 1
-// its high, the tensor's scale one launch word. A lane takes the groups
+// its high, the expert's scale its entry of the scale row. A lane takes the groups
 // lane, lane + 32, ... of a row, each group's eight bytes in order.
 
 // The per-expert global scale (the file's `<stack>.scale` rows, one f32 an
 // expert) multiplies each row's finished dot once — the same elementwise
 // product either way, exact, so its placement costs nothing.
 //
+// The route: a launch covers every slot of a route at once, the grid's
+// height a slot. A slot reads its expert's id on the card through the
+// experts' common id read (pair_expert, experts.metal), its expert's rows
+// at the id's offset in the stack, its expert's scale out of the stack's
+// scale row and, on a routed down, its route weight — the scale of its
+// rows' finished dots the f32 product scale · weight. Its input is the one
+// row every slot shares (a gate·up) or its own (a down), and its outputs
+// land in planes of `plane` rows: row r of slot s at
+// ((r / plane) · slots + s) · plane + r % plane, so a gate·up's gate rows of
+// every slot come first and its up rows after them.
+//
 // No silent failure: a scale byte that is no UE4M3 (bit 7 set, or E4M3's
 // NaN 0x7f) has no defined scale; the decode is NaN, the quant-column site
 // raises and the row is NaN — never a plausible dot. A row whose dot stops
-// being finite raises the product site.
+// being finite raises the product site. A slot whose id names no expert of
+// the stack, or a slot past the row's routed ids, raises the expert-id site
+// and its rows are NaN.
 //
-// This file comes after fault.metal (raise).
+// This file comes after fault.metal (raise) and experts.metal (pair_expert).
 
 #pragma METAL fp contract(off)
 
@@ -75,28 +88,79 @@ inline float nvfp4_scale_half(uint b) {
 // The launch's argument block, bound by value.
 struct Nvfp4Args {
     uint k;        // the input's values, a multiple of the block's
-    uint rows;     // the output's rows
+    uint rows;     // an expert's rows, every one of them a slot's launch
     uint layer;
-    float w_scale; // the expert's global scale, the launch's own word
+    uint experts;  // the stack's experts: an id at or past it names none
+    uint slots;    // the route's slots, the grid's height
+    uint plane;    // rows an output plane holds; it divides rows
+    uint x_stride; // values between two slots' inputs, 0 for one shared row
+    uint weighted; // 1: a slot's scale is its expert's times its route weight
 };
 
-static_assert(sizeof(Nvfp4Args) == 16, "Nvfp4Args is 16 bytes: the host packs four words");
+static_assert(sizeof(Nvfp4Args) == 32, "Nvfp4Args is 32 bytes: the host packs eight words");
+
+// Slot `slot`'s expert and the scale of its rows' finished dots, or false
+// when the slot names no expert: an id past the stack (pair_expert's
+// refusal), or a slot past the row's routed ids, which no id reads.
+inline bool nv_route(device const int *ids,
+                     device const float *scales,
+                     device const float *route_w,
+                     constant Nvfp4Args &args,
+                     uint slot,
+                     thread ulong &expert,
+                     thread float &w_scale)
+{
+    int e = 0;
+    if (slot >= BLOOMERY_EXPERT_ROUTED || pair_expert(ids, slot, args.experts, e)) {
+        return false;
+    }
+    expert = ulong(e);
+    w_scale = args.weighted != 0u ? scales[e] * route_w[slot] : scales[e];
+    return true;
+}
+
+// Where row `r` of slot `slot` lands: its plane's slot block.
+inline uint nv_out(constant Nvfp4Args &args, uint slot, uint r)
+{
+    return ((r / args.plane) * args.slots + slot) * args.plane + r % args.plane;
+}
+
+// The rows of a slot that names no expert: NaN, the expert-id site raised.
+inline void nv_bad_slot(device float *y, constant Nvfp4Args &args, device atomic_uint *faults, uint out)
+{
+    raise(faults, args.layer, BLOOMERY_FAULT_SITE_EXPERT_ID);
+    y[out] = NAN;
+}
 
 kernel void nvfp4_gemv(device const block_nvfp4 *W [[buffer(0)]],
                        device const float *x [[buffer(1)]],
                        device float *y [[buffer(2)]],
                        constant Nvfp4Args &args [[buffer(3)]],
                        device atomic_uint *faults [[buffer(4)]],
-                       uint row [[threadgroup_position_in_grid]],
+                       device const int *ids [[buffer(5)]],
+                       device const float *scales [[buffer(6)]],
+                       device const float *route_w [[buffer(7)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
                        uint lane [[thread_index_in_simdgroup]],
                        uint sg [[simdgroup_index_in_threadgroup]])
 {
-    const uint r = row * 8u + sg;
-    if (r >= args.rows) {
+    const uint r = tg.x * 8u + sg;
+    const uint slot = tg.y;
+    if (r >= args.rows || slot >= args.slots) {
         return;
     }
+    const uint out = nv_out(args, slot, r);
+    ulong expert = 0;
+    float w_scale = 0.f;
+    if (!nv_route(ids, scales, route_w, args, slot, expert, w_scale)) {
+        if (lane == 0u) {
+            nv_bad_slot(y, args, faults, out);
+        }
+        return;
+    }
+    x += slot * args.x_stride;
     const uint blocks = args.k / NV_VALUES;
-    device const block_nvfp4 *wr = W + (ulong)r * (ulong)blocks;
+    device const block_nvfp4 *wr = W + (expert * (ulong)args.rows + (ulong)r) * (ulong)blocks;
     // The lane's sub-block: byte b of a block is sub-block b/8's pair, and
     // the lane's byte of every block is its own l, so a lane's sub-block is
     // fixed by its lane index in eights.
@@ -116,13 +180,13 @@ kernel void nvfp4_gemv(device const block_nvfp4 *W [[buffer(0)]],
         acc += v0 * x[col];
         acc += v1 * x[col + 8u];
     }
-    const float dot = simd_sum(acc) * args.w_scale;
+    const float dot = simd_sum(acc) * w_scale;
     // One lane's scale byte that is none makes the whole row undefined.
     usable = simd_all(usable);
     if (!usable) {
         if (lane == 0u) {
             raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-            y[r] = NAN;
+            y[out] = NAN;
         }
         return;
     }
@@ -130,7 +194,7 @@ kernel void nvfp4_gemv(device const block_nvfp4 *W [[buffer(0)]],
         raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
     }
     if (lane == 0u) {
-        y[r] = isfinite(dot) ? dot : NAN;
+        y[out] = isfinite(dot) ? dot : NAN;
     }
 }
 
@@ -140,16 +204,30 @@ kernel void nvfp4_rows_gemv(device const uint8_t *W [[buffer(0)]],
                             device float *y [[buffer(2)]],
                             constant Nvfp4Args &args [[buffer(3)]],
                             device atomic_uint *faults [[buffer(4)]],
-                            uint row [[threadgroup_position_in_grid]],
+                            device const int *ids [[buffer(5)]],
+                            device const float *scales [[buffer(6)]],
+                            device const float *route_w [[buffer(7)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
                             uint lane [[thread_index_in_simdgroup]],
                             uint sg [[simdgroup_index_in_threadgroup]])
 {
-    const uint r = row * 8u + sg;
-    if (r >= args.rows) {
+    const uint r = tg.x * 8u + sg;
+    const uint slot = tg.y;
+    if (r >= args.rows || slot >= args.slots) {
         return;
     }
+    const uint out = nv_out(args, slot, r);
+    ulong expert = 0;
+    float w_scale = 0.f;
+    if (!nv_route(ids, scales, route_w, args, slot, expert, w_scale)) {
+        if (lane == 0u) {
+            nv_bad_slot(y, args, faults, out);
+        }
+        return;
+    }
+    x += slot * args.x_stride;
     const uint groups = args.k / 16u;
-    device const uint8_t *wr = W + (ulong)r * (ulong)groups * 9ul;
+    device const uint8_t *wr = W + (expert * (ulong)args.rows + (ulong)r) * (ulong)groups * 9ul;
     bool usable = true;
     float acc = 0.f;
     for (uint g = lane; g < groups; g += 32u) {
@@ -163,12 +241,12 @@ kernel void nvfp4_rows_gemv(device const uint8_t *W [[buffer(0)]],
             acc += (NV_KVALUES[byte >> 4u] * s) * x[col + 1u];
         }
     }
-    const float dot = simd_sum(acc) * args.w_scale;
+    const float dot = simd_sum(acc) * w_scale;
     usable = simd_all(usable);
     if (!usable) {
         if (lane == 0u) {
             raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-            y[r] = NAN;
+            y[out] = NAN;
         }
         return;
     }
@@ -176,15 +254,15 @@ kernel void nvfp4_rows_gemv(device const uint8_t *W [[buffer(0)]],
         raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
     }
     if (lane == 0u) {
-        y[r] = isfinite(dot) ? dot : NAN;
+        y[out] = isfinite(dot) ? dot : NAN;
     }
 }
 
 // The two other forms a routed stack of the family's files takes, beside the
-// NVFP4 ones, each with the same launch word: the GGUF coda's Q8_0 blocks
+// NVFP4 ones, each with the same route: the GGUF coda's Q8_0 blocks
 // (q8_0_scaled_gemv) and the MLX folder coda's MXFP8 rows
-// (mxfp8_rows_gemv). The launch word is the scale of the row's finished dot
-// (a route weight, the coda's experts having no global scale), so a routed
+// (mxfp8_rows_gemv). The coda's experts have no global scale (their scale
+// row is ones), so a routed down's scale is its route weight and a routed
 // down of either form leaves its expert's weighted output as the NVFP4 one
 // does.
 //
@@ -210,16 +288,30 @@ kernel void q8_0_scaled_gemv(device const uint8_t *W [[buffer(0)]],
                              device float *y [[buffer(2)]],
                              constant Nvfp4Args &args [[buffer(3)]],
                              device atomic_uint *faults [[buffer(4)]],
-                             uint row [[threadgroup_position_in_grid]],
+                             device const int *ids [[buffer(5)]],
+                             device const float *scales [[buffer(6)]],
+                             device const float *route_w [[buffer(7)]],
+                             uint2 tg [[threadgroup_position_in_grid]],
                              uint lane [[thread_index_in_simdgroup]],
                              uint sg [[simdgroup_index_in_threadgroup]])
 {
-    const uint r = row * 8u + sg;
-    if (r >= args.rows) {
+    const uint r = tg.x * 8u + sg;
+    const uint slot = tg.y;
+    if (r >= args.rows || slot >= args.slots) {
         return;
     }
+    const uint out = nv_out(args, slot, r);
+    ulong expert = 0;
+    float w_scale = 0.f;
+    if (!nv_route(ids, scales, route_w, args, slot, expert, w_scale)) {
+        if (lane == 0u) {
+            nv_bad_slot(y, args, faults, out);
+        }
+        return;
+    }
+    x += slot * args.x_stride;
     const uint blocks = args.k / 32u;
-    device const uint8_t *wr = W + (ulong)r * (ulong)blocks * 34ul;
+    device const uint8_t *wr = W + (expert * (ulong)args.rows + (ulong)r) * (ulong)blocks * 34ul;
     bool usable = true;
     float acc = 0.f;
     for (uint i = 0u; i < blocks; ++i) {
@@ -229,12 +321,12 @@ kernel void q8_0_scaled_gemv(device const uint8_t *W [[buffer(0)]],
         const float v = float(as_type<char>(blk[2u + lane])) * d;
         acc += v * x[i * 32u + lane];
     }
-    const float dot = simd_sum(acc) * args.w_scale;
+    const float dot = simd_sum(acc) * w_scale;
     usable = simd_all(usable);
     if (!usable) {
         if (lane == 0u) {
             raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-            y[r] = NAN;
+            y[out] = NAN;
         }
         return;
     }
@@ -242,7 +334,7 @@ kernel void q8_0_scaled_gemv(device const uint8_t *W [[buffer(0)]],
         raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
     }
     if (lane == 0u) {
-        y[r] = isfinite(dot) ? dot : NAN;
+        y[out] = isfinite(dot) ? dot : NAN;
     }
 }
 
@@ -263,16 +355,30 @@ kernel void mxfp8_rows_gemv(device const uint8_t *W [[buffer(0)]],
                             device float *y [[buffer(2)]],
                             constant Nvfp4Args &args [[buffer(3)]],
                             device atomic_uint *faults [[buffer(4)]],
-                            uint row [[threadgroup_position_in_grid]],
+                            device const int *ids [[buffer(5)]],
+                            device const float *scales [[buffer(6)]],
+                            device const float *route_w [[buffer(7)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
                             uint lane [[thread_index_in_simdgroup]],
                             uint sg [[simdgroup_index_in_threadgroup]])
 {
-    const uint r = row * 8u + sg;
-    if (r >= args.rows) {
+    const uint r = tg.x * 8u + sg;
+    const uint slot = tg.y;
+    if (r >= args.rows || slot >= args.slots) {
         return;
     }
+    const uint out = nv_out(args, slot, r);
+    ulong expert = 0;
+    float w_scale = 0.f;
+    if (!nv_route(ids, scales, route_w, args, slot, expert, w_scale)) {
+        if (lane == 0u) {
+            nv_bad_slot(y, args, faults, out);
+        }
+        return;
+    }
+    x += slot * args.x_stride;
     const uint groups = args.k / 32u;
-    device const uint8_t *wr = W + (ulong)r * (ulong)groups * 33ul;
+    device const uint8_t *wr = W + (expert * (ulong)args.rows + (ulong)r) * (ulong)groups * 33ul;
     bool usable = true;
     float acc = 0.f;
     for (uint g = 0u; g < groups; ++g) {
@@ -283,12 +389,12 @@ kernel void mxfp8_rows_gemv(device const uint8_t *W [[buffer(0)]],
         usable = usable && isfinite(v);
         acc += v * x[g * 32u + lane];
     }
-    const float dot = simd_sum(acc) * args.w_scale;
+    const float dot = simd_sum(acc) * w_scale;
     usable = simd_all(usable);
     if (!usable) {
         if (lane == 0u) {
             raise(faults, args.layer, BLOOMERY_FAULT_SITE_QUANT_COLUMN);
-            y[r] = NAN;
+            y[out] = NAN;
         }
         return;
     }
@@ -296,6 +402,6 @@ kernel void mxfp8_rows_gemv(device const uint8_t *W [[buffer(0)]],
         raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
     }
     if (lane == 0u) {
-        y[r] = isfinite(dot) ? dot : NAN;
+        y[out] = isfinite(dot) ? dot : NAN;
     }
 }

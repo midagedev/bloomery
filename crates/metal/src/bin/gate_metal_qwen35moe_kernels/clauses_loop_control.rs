@@ -58,6 +58,7 @@ fn launch(h: &Harness<'_>, w: &Weights, r: &Rows) -> Result<Vec<f32>, String> {
         ink2::up(h, &w.forget)?,
     );
     let mut y = ink2::up(h, &ink2::blank(ROWS * N))?;
+    let mut down_rows = ink2::up(h, &ink2::blank(ROWS * RANK))?;
     h.clear_fault()?;
     h.encode(|encoder| {
         h.kernels.loop_control(
@@ -72,6 +73,7 @@ fn launch(h: &Harness<'_>, w: &Weights, r: &Rows) -> Result<Vec<f32>, String> {
                 gain: gain.window(Elems(0), Elems(w.gain.len()))?,
                 forget: forget.window(Elems(0), Elems(w.forget.len()))?,
                 y: y.window_mut(Elems(0), Elems(ROWS * N))?,
+                h: down_rows.window_mut(Elems(0), Elems(ROWS * RANK))?,
                 eps: EPS,
                 faults: h.device.fault_word(),
                 layer: LAYER,
@@ -211,6 +213,7 @@ pub fn loop_control_bounds(h: &Harness<'_>) -> Clause {
         ink2::up(h, &w.forget)?,
     );
     let mut y = ink2::up(h, &ink2::blank(ROWS * N))?;
+    let mut down_rows = ink2::up(h, &ink2::blank(ROWS * RANK))?;
     let mut run = |label: &str,
                    n: usize,
                    rank: usize,
@@ -233,6 +236,7 @@ pub fn loop_control_bounds(h: &Harness<'_>) -> Clause {
                         gain: gain.window(Elems(0), Elems(w.gain.len()))?,
                         forget: forget.window(Elems(0), Elems(w.forget.len()))?,
                         y: y.window_mut(Elems(0), Elems(ROWS * N))?,
+                        h: down_rows.window_mut(Elems(0), Elems(ROWS * RANK))?,
                         eps,
                         faults: h.device.fault_word(),
                         layer: LAYER,

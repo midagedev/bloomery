@@ -20,7 +20,7 @@ use super::arena::Arena;
 use super::check::{self, Checked, Refusal};
 use super::ops::Walk;
 use crate::device::MetalDevice;
-use crate::instance::{HOST, Instance};
+use crate::instance::{INKLING2_MINI, Instance};
 use crate::kernels::Kernels;
 use crate::library::Library;
 use crate::residency::Alloc;
@@ -176,14 +176,11 @@ pub struct Session {
 }
 
 impl Session {
-    /// The instance whose library a session of `file` runs on: the build's
-    /// host instance. The family's own kernels (`kernels::inkling2`) read the
-    /// family's geometry (`inkling2_geom`), and the shared launches it takes
-    /// (the segmented mat-vec, the mat-vec, the row norm, the bias add, the
-    /// combine and the head) take their shapes as launch words, so any
-    /// library runs it; the Mini's own row ([`crate::instance::INKLING2_MINI`])
-    /// cannot compile a library, its sinks and its biased sigmoid router being
-    /// rows the shared flash and router refuse.
+    /// The instance whose library a session of `file` runs on: the Mini's own
+    /// row ([`INKLING2_MINI`]). The family's own kernels (`kernels::inkling2`)
+    /// read the family's geometry (`inkling2_geom`), and the shared launches
+    /// it takes (the segmented mat-vec, the mat-vec, the row norm, the bias
+    /// add, the combine and the head) take their shapes as launch words.
     ///
     /// # Errors
     /// The check's first refusal of the file at `ctx` rows.
@@ -191,7 +188,7 @@ impl Session {
         check::check(file.header(), ctx)
             .checked_or_first()
             .map_err(SessionError::Refused)?;
-        Ok(&HOST)
+        Ok(&INKLING2_MINI)
     }
 
     /// A session of `file` at a cache of `ctx` rows on `device`, its kernels

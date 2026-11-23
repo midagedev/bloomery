@@ -1,7 +1,8 @@
 //! The scaled mat-vec of Inkling 2's routed experts (`kernels/nvfp4.metal`):
-//! a SIMD group a row, eight rows a threadgroup, over the codes as the files
-//! store them, a launch word scaling each row's finished dot (the expert's
-//! global scale, times its route weight on a routed down).
+//! a SIMD group a row, eight rows a threadgroup, every slot of a route in one
+//! launch (the grid's height a slot), each slot's expert id read on the card
+//! out of the router's ids and its rows' finished dots scaled by its expert's
+//! global scale, times its route weight on a routed down.
 //!
 //! Four layouts, one kernel source: the NVFP4 blocks of the GGUF file
 //! (mainline's `block_nvfp4`: 64 values in 36 bytes, [`NvfpLayout::Blocks`]),
@@ -15,7 +16,7 @@ use bloomery_device::{DeviceError, Window, WindowMut};
 use crate::device::MetalDevice;
 use crate::encode::{Binding, Bindings, ComputeEncoder};
 use crate::fault::MetalFaultWord;
-use crate::inkling2_geom::{NVFP4_BYTES, NVFP4_VALUES, nvfp4_stack_bytes};
+use crate::inkling2_geom::{NVFP4_BYTES, NVFP4_VALUES, TOP_K, nvfp4_stack_bytes};
 
 use super::{Kernels, WeightAlign, check_weights_align, check_window_len, pack, range, word};
 
@@ -93,23 +94,34 @@ impl NvfpLayout {
     }
 }
 
-/// One NVFP4 mat-vec launch of one expert's rows.
+/// One NVFP4 mat-vec launch over a route's slots.
 pub struct Nvfp4Params<'w> {
     /// The weights' layout.
     pub layout: NvfpLayout,
-    /// Output rows.
+    /// An expert's rows, every one of them a slot's.
     pub rows: usize,
     /// The input's values.
     pub k: usize,
-    /// The rows' bytes, exactly [`NvfpLayout::bytes`].
+    /// The stack: every expert's rows, expert `e`'s at `e` times
+    /// [`NvfpLayout::bytes`], exactly one expert a scale.
     pub weights: Window<'w, u8, MetalDevice>,
-    /// The input, `k`.
+    /// The route's expert ids, one a slot, at most [`TOP_K`]: a slot whose id
+    /// is past the stack raises the expert-id site and its rows are NaN.
+    pub ids: Window<'w, u32, MetalDevice>,
+    /// Each expert's global scale, one an expert of the stack.
+    pub scales: Window<'w, f32, MetalDevice>,
+    /// Each slot's route weight, which its expert's scale is multiplied by
+    /// (a routed down), or none (a gate·up).
+    pub route_weights: Option<Window<'w, f32, MetalDevice>>,
+    /// The input: `k` values every slot reads, or a slot's own `k` each
+    /// ([`Nvfp4Params::x_per_slot`]).
     pub x: Window<'w, f32, MetalDevice>,
-    /// The output, `rows`.
+    pub x_per_slot: bool,
+    /// The output, `slots · rows`, in planes of `plane` rows: row `r` of slot
+    /// `s` at `((r / plane) · slots + s) · plane + r % plane`.
     pub y: WindowMut<'w, f32, MetalDevice>,
-    /// The scale of each row's finished dot: the expert's global scale, times
-    /// its route weight on a routed down.
-    pub w_scale: f32,
+    /// Rows an output plane holds; it divides `rows`.
+    pub plane: usize,
     /// The fault word a raise lands in.
     pub faults: &'w MetalFaultWord,
     /// The layer a raise is recorded in.
@@ -121,8 +133,9 @@ fn refuse(detail: impl Into<String>) -> DeviceError {
 }
 
 impl Kernels {
-    /// Encode the mat-vec: one dispatch of `⌈rows / 8⌉` threadgroups. The shape
-    /// and every window are checked first; a refused launch encodes nothing.
+    /// Encode the mat-vec: one dispatch of `⌈rows / 8⌉ × slots` threadgroups.
+    /// The shape and every window are checked first; a refused launch encodes
+    /// nothing.
     #[must_use = "a refused launch encoded nothing"]
     pub fn nvfp4_matvec(
         &self,
@@ -132,7 +145,7 @@ impl Kernels {
         if p.rows == 0 || p.k == 0 {
             return Err(refuse(format!("{} rows of {} values", p.rows, p.k)));
         }
-        let need = p.layout.bytes(p.rows, p.k).ok_or_else(|| {
+        let per = p.layout.bytes(p.rows, p.k).ok_or_else(|| {
             refuse(format!(
                 "{} values a row are not whole groups of {} (or {} rows wrap)",
                 p.k,
@@ -140,12 +153,31 @@ impl Kernels {
                 p.rows
             ))
         })?;
-        if !p.w_scale.is_finite() {
-            return Err(refuse(format!("scale {} is not finite", p.w_scale)));
+        let slots = p.ids.len().get();
+        if slots == 0 || slots > TOP_K {
+            return Err(refuse(format!("{slots} slots; a route holds 1 to {TOP_K}")));
         }
+        if p.plane == 0 || !p.rows.is_multiple_of(p.plane) {
+            return Err(refuse(format!(
+                "a plane of {} rows does not divide {}",
+                p.plane, p.rows
+            )));
+        }
+        let experts = p.scales.len().get();
+        let need = per
+            .checked_mul(experts)
+            .ok_or_else(|| refuse(format!("{experts} experts of {per} bytes wrap")))?;
         check_window_len(WHAT, "weights", p.weights.len(), need)?;
-        check_window_len(WHAT, "x", p.x.len(), p.k)?;
-        check_window_len(WHAT, "y", p.y.len(), p.rows)?;
+        check_window_len(
+            WHAT,
+            "x",
+            p.x.len(),
+            if p.x_per_slot { slots * p.k } else { p.k },
+        )?;
+        check_window_len(WHAT, "y", p.y.len(), slots * p.rows)?;
+        if let Some(w) = &p.route_weights {
+            check_window_len(WHAT, "route weights", w.len(), slots)?;
+        }
         if p.layout == NvfpLayout::Blocks {
             // The kernel reads each block's scale word as a 32-bit word.
             check_weights_align(
@@ -154,13 +186,21 @@ impl Kernels {
                 p.weights.byte_range()?.start.get(),
                 WeightAlign::Word,
             )?;
-            debug_assert!(need.is_multiple_of(NVFP4_BYTES));
+            debug_assert!(per.is_multiple_of(NVFP4_BYTES));
         }
         let args = [
             word(WHAT, "k", p.k)?,
             word(WHAT, "rows", p.rows)?,
             p.layer,
-            p.w_scale.to_bits(),
+            word(WHAT, "experts", experts)?,
+            word(WHAT, "slots", slots)?,
+            word(WHAT, "plane", p.plane)?,
+            if p.x_per_slot {
+                word(WHAT, "k", p.k)?
+            } else {
+                0
+            },
+            u32::from(p.route_weights.is_some()),
         ]
         .map(u32::to_ne_bytes);
         let pipeline = match p.layout {
@@ -176,6 +216,27 @@ impl Kernels {
         slot.set(Binding::of_mut(&p.y)?)?;
         slot.set(Binding::bytes(pack(&args))?)?;
         slot.set(p.faults.binding())?;
-        slot.dispatch_groups(p.rows.div_ceil(ROWS_PER_GROUP), 1, THREADS)
+        slot.set(Binding::of(&p.ids)?)?;
+        slot.set(Binding::of(&p.scales)?)?;
+        // A gate·up reads no route weight: the scales stand in the slot.
+        slot.set(match &p.route_weights {
+            Some(w) => Binding::of(w)?,
+            None => Binding::of(&p.scales)?,
+        })?;
+        slot.dispatch_groups(p.rows.div_ceil(ROWS_PER_GROUP), slots, THREADS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::experts_geom::routed_ids;
+    use crate::inkling2_geom::TOP_K;
+    use crate::instance::INKLING2_MINI;
+
+    /// The family's row compiles at least the route's slots as routed ids,
+    /// so no slot of a launch is the shared slot the id read leaves unread.
+    #[test]
+    fn the_rows_routed_ids_cover_a_route() {
+        assert!(routed_ids(&INKLING2_MINI) >= TOP_K);
     }
 }

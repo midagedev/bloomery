@@ -55,10 +55,10 @@ pub struct LayerBufs {
     pub router_bias: MetalBuffer<f32>,
     pub gate_up: MetalBuffer<u8>,
     pub down: MetalBuffer<u8>,
-    /// Each expert's factor of the gate·up and down results: the stack's
-    /// global scale, 1 for a form that has none.
-    pub gate_up_scale: Vec<f32>,
-    pub down_scale: Vec<f32>,
+    /// Each expert's factor of the gate·up and down results, one an expert:
+    /// the stack's global scale, 1 for a form that has none.
+    pub gate_up_scale: MetalBuffer<f32>,
+    pub down_scale: MetalBuffer<f32>,
     /// The core layer's controllers, in the order q, k, v, ffn: each its down,
     /// gain and forget rows.
     pub controllers: Vec<[MetalBuffer<f32>; 3]>,
@@ -76,7 +76,9 @@ pub struct VisitBufs {
 pub struct Scratch {
     /// The bank's blocks, then the stream's row: row `i` at `i · hidden`.
     pub rows: MetalBuffer<f32>,
-    /// The last pass's blocks past its first, then its stream.
+    /// The message banks, one a pass the loop runs again, `message_rows`
+    /// rows each: that pass's blocks past its first, then its stream. The
+    /// step zeroes them and each pass's end adds its rows into its own.
     pub message: MetalBuffer<f32>,
     /// The attention's mixes, one a query row.
     pub amix: MetalBuffer<f32>,
@@ -84,6 +86,8 @@ pub struct Scratch {
     pub msgs: MetalBuffer<f32>,
     /// The q, k and v paths' inputs after their controllers.
     pub xin: MetalBuffer<f32>,
+    /// The four controllers' down rows, q, k, v, ffn: each the rank's values.
+    pub lc_h: MetalBuffer<f32>,
     /// The q, relative and gate rows.
     pub qrg: MetalBuffer<f32>,
     pub sinks: MetalBuffer<f32>,
@@ -112,7 +116,9 @@ pub struct Scratch {
     pub gate_up: MetalBuffer<f32>,
     pub act: MetalBuffer<f32>,
     pub down: MetalBuffer<f32>,
-    /// The experts' sum and the post-conv's output.
+    /// The experts' sums, a row a visit: the step zeroes them and each
+    /// visit's combine adds its slots into its own row. Then the post-conv's
+    /// output.
     pub moe: MetalBuffer<f32>,
     pub moe_conv: MetalBuffer<f32>,
     /// The head's mix.
@@ -271,7 +277,7 @@ fn stack_buf(
     weights: &Weights<'_>,
     st: &Stack,
     fused: bool,
-) -> Result<(MetalBuffer<u8>, Vec<f32>), SessionError> {
+) -> Result<(MetalBuffer<u8>, MetalBuffer<f32>), SessionError> {
     let per = st.expert_bytes();
     let mut bytes = Vec::with_capacity(st.experts * per);
     let scales = if st.planes {
@@ -324,7 +330,8 @@ fn stack_buf(
     if let Some(bad) = scales.iter().find(|s| !(s.is_finite() && **s > 0.0)) {
         return Err(refuse(format!("{}: an expert's scale is {bad}", st.name)));
     }
-    Ok((filled(alloc, &bytes)?, scales))
+    let stack = filled(alloc, &bytes)?;
+    Ok((stack, filled(alloc, &scales)?))
 }
 
 /// The relative-bias table `name`, stored `extent` rows of `d_rel` values, as
@@ -486,6 +493,7 @@ impl Arena {
             amix: next()?,
             msgs: next()?,
             xin: next()?,
+            lc_h: next()?,
             qrg: next()?,
             sinks: next()?,
             k_raw: next()?,

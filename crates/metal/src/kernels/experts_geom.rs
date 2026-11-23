@@ -3,10 +3,11 @@ use crate::geometry;
 use crate::instance::{FfnAxes, HOST, Instance};
 
 /// Slots in one launch of `inst`'s experts: its routed picks, and a gated
-/// shared expert's slot after them; a dense FFN's one.
+/// shared expert's slot after them; a dense FFN's one. Each function here
+/// reads the axes the experts are compiled at ([`Instance::ffn_built`]).
 #[must_use]
 pub const fn slots(inst: &Instance) -> usize {
-    match inst.key.ffn {
+    match inst.ffn_built() {
         FfnAxes::Routed(m) => m.top_k as usize + m.router.rule.gated as usize,
         FfnAxes::Dense { .. } => 1,
     }
@@ -20,7 +21,7 @@ pub const EXPERT_SLOTS: usize = slots(&HOST);
 /// (expert 0 of its one-expert stacks).
 #[must_use]
 pub const fn routed_ids(inst: &Instance) -> usize {
-    match inst.key.ffn {
+    match inst.ffn_built() {
         FfnAxes::Routed(m) => m.top_k as usize,
         FfnAxes::Dense { .. } => 1,
     }
@@ -46,7 +47,7 @@ pub const SHARED_SLOT: usize = shared_slot(&HOST);
 /// FFN's own. The pair's rows and the fold's K are this.
 #[must_use]
 pub const fn expert_k(inst: &Instance) -> usize {
-    match inst.key.ffn {
+    match inst.ffn_built() {
         FfnAxes::Routed(m) => m.expert_ff as usize,
         FfnAxes::Dense { ff } => ff as usize,
     }

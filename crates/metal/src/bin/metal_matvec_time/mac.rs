@@ -790,6 +790,9 @@ fn time_shape(
     }
     let ids = device.upload(stream, &[0i32]).map_err(why)?;
     let route = device.upload(stream, &[1.0f32]).map_err(why)?;
+    // The NVFP4 launch's one-slot route: expert 0 of a one-expert stack at
+    // scale 1 (the route word above).
+    let nv_ids = device.upload(stream, &[0u32]).map_err(why)?;
     let mut step_id = device
         .zeroed::<u32>(stream, Elems(outputs.div_ceil(dispatches)))
         .map_err(why)?;
@@ -841,9 +844,13 @@ fn time_shape(
                                 rows: *rows,
                                 k: *cols,
                                 weights: w,
+                                ids: nv_ids.window(Elems(0), Elems(1)).map_err(why)?,
+                                scales: route.window(Elems(0), Elems(1)).map_err(why)?,
+                                route_weights: None,
                                 x: x.window(Elems(0), Elems(*cols)).map_err(why)?,
+                                x_per_slot: false,
                                 y: out,
-                                w_scale: 1.0,
+                                plane: *rows,
                                 faults: device.fault_word(),
                                 layer: 0,
                             },

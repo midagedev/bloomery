@@ -240,8 +240,9 @@ fn main() {
         // scale and the fault's raise; conv_res the short conv's slot rule;
         // qk_clip the attention's half conversion; rel_flash the attention's
         // lane widening and the ticket's fold; router_situ the ticket's
-        // argmax key; nvfp4 the quant's float4 load; situ the shared ABI's
-        // activation cast nothing of its own.
+        // argmax key; nvfp4 the quant's float4 load and the experts' id read
+        // (pair_expert); situ the shared ABI's activation cast nothing of its
+        // own.
         "res_mix",
         "loop_control",
         "conv_res",

@@ -23,7 +23,7 @@ pub const KV_HEADS: usize = HOST.key.attn.n_kv as usize;
 /// Query heads per key head of `inst`.
 #[must_use]
 pub const fn gqa(inst: &Instance) -> usize {
-    (inst.key.attn.n_head / inst.key.attn.n_kv) as usize
+    (inst.attn_built().n_head / inst.attn_built().n_kv) as usize
 }
 
 /// Keys in one K/V tile.
@@ -47,7 +47,7 @@ pub const HEADS_PER_SG: usize = 1;
 /// its lanes cover the head.
 #[must_use]
 pub const fn lane_dims(inst: &Instance) -> usize {
-    inst.key.attn.row.head as usize / SIMD_WIDTH
+    inst.attn_built().row.head as usize / SIMD_WIDTH
 }
 
 /// One segment partial of a head of `head` values: the max, the weight sum,
@@ -61,7 +61,7 @@ pub const fn partial_elems(head: usize) -> usize {
 /// writes one.
 #[must_use]
 pub const fn qg_stride(inst: &Instance) -> usize {
-    inst.key.attn.row.head as usize * (1 + inst.key.attn.q_gate as usize)
+    inst.attn_built().row.head as usize * (1 + inst.attn_built().q_gate as usize)
 }
 
 /// One head of the query projection: the query, then the gate. A shim: the
@@ -72,28 +72,28 @@ pub const QG_STRIDE: usize = qg_stride(&HOST);
 /// row does.
 #[must_use]
 pub const fn windowed(inst: &Instance) -> bool {
-    inst.key.attn.row.window
+    inst.attn_built().row.window
 }
 
 /// Whether the layers of `inst` gate their output with one value a query
 /// head, from a projection of their own, in a buffer the launch binds.
 #[must_use]
 pub const fn head_gate(inst: &Instance) -> bool {
-    inst.key.attn.head_gate
+    inst.attn_built().head_gate
 }
 
 /// Whether the flash of `inst` norms each query and key head by the file's
 /// gains before its rope.
 #[must_use]
 pub const fn qk_norm(inst: &Instance) -> bool {
-    inst.key.attn.qk_norm
+    inst.attn_built().qk_norm
 }
 
 /// Whether the rope of `inst` pairs the neighbours `2i, 2i + 1` (GGUF's NORM
 /// pairing), not the NEOX halves.
 #[must_use]
 pub const fn norm_pairs(inst: &Instance) -> bool {
-    inst.key.attn.norm_pairs
+    inst.attn_built().norm_pairs
 }
 
 /// The live keys the count model and the e2e gate take as one segment's
@@ -219,7 +219,7 @@ pub fn holds(g: &Geometry) -> Result<(), KernelRefused> {
     {
         return refuse("head", &a.head, "64, 128 or 256 values");
     }
-    let row = &g.instance.key.attn.row;
+    let row = &g.instance.attn_built().row;
     if row.value as usize != a.head {
         return refuse("value width", &row.value, "the head's width");
     }
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn the_scale_is_iks_for_every_registered_head() {
         for inst in REGISTERED {
-            let head = inst.key.attn.row.head;
+            let head = inst.attn_built().row.head;
             let ik = 1.0f32 / (head as f32).sqrt();
             assert_eq!(
                 scale_of(head as usize).to_bits(),

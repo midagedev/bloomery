@@ -26,14 +26,15 @@ pub const ROWS: usize = rows(&HOST);
 /// Callers left: the arch, the kernel gate, its oracles and the probes.
 pub const SHARED: usize = HOST.router_built().router.rule.gated as usize;
 
-/// The columns of every row of `inst`'s router: the hidden width of a routed FFN. A dense FFN
-/// launches no router, so the router's kernels it carries stay at the columns of the instance of
-/// no router's own ([`UNLAUNCHED_K`]), and the residual's width meets none of the router's rules.
+/// The columns of every row of `inst`'s router: the hidden width of a routed FFN. A dense FFN,
+/// and a family that brings its own kernels, launch no shared router, so the router's kernels
+/// they carry stay at the columns of the instance of no router's own ([`UNLAUNCHED_K`]), and the
+/// residual's width meets none of the router's rules.
 #[must_use]
 pub const fn k(inst: &Instance) -> usize {
-    match inst.key.ffn {
-        FfnAxes::Routed(_) => inst.key.hidden as usize,
-        FfnAxes::Dense { .. } => UNLAUNCHED_K,
+    match (inst.own_kernels, inst.key.ffn) {
+        (false, FfnAxes::Routed(_)) => inst.key.hidden as usize,
+        _ => UNLAUNCHED_K,
     }
 }
 

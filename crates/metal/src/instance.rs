@@ -14,11 +14,19 @@ pub struct Instance {
     pub name: &'static str,
     pub key: Key,
     /// The cargo feature a build whose host is this instance ([`HOST`]) is
-    /// made with; none for the default build's.
+    /// made with; none for the default build's and for a row of
+    /// [`Instance::own_kernels`], which no build hosts.
     pub host_feature: Option<&'static str>,
     /// Whether a model session opens files at this instance: false for a row
     /// only the kernel gate compiles, whose family has no session yet.
     pub opens: bool,
+    /// Whether the row's family brings its own attention, router and expert
+    /// kernels: its session (`arch::<family>`) launches kernels that read the
+    /// family's own geometry, so its unit compiles the shared decode flash,
+    /// router and experts at their unlaunched axes ([`Instance::attn_built`],
+    /// [`Instance::ffn_built`]), as a dense FFN's unit compiles its router; its
+    /// flash row serves no file through [`Key::of`], and it is no build's host.
+    pub own_kernels: bool,
 }
 
 /// The axes an instance's kernels are compiled at: what a file's shape is
@@ -101,9 +109,10 @@ const GATED_ROUTED: MoeAxes = MoeAxes {
     expert_ff: 512,
 };
 
-/// The routed axes an instance of a dense FFN compiles its router's kernels
-/// at: every instance's translation unit holds them, and no layer of its
-/// files launches them.
+/// The routed axes an instance of a dense FFN, or of a family that brings its
+/// own kernels, compiles the router's and the experts' kernels at: every
+/// instance's translation unit holds them, and no layer of its files launches
+/// them.
 const ROUTER_UNLAUNCHED: MoeAxes = GATED_ROUTED;
 
 /// Qwen3.6-35B-A3B's gated delta net.
@@ -117,6 +126,11 @@ const QWEN35_GDN: DeltaAxes = DeltaAxes {
 /// at: every instance's translation unit holds them, and no layer of its
 /// files launches them.
 const DELTA_UNLAUNCHED: DeltaAxes = QWEN35_GDN;
+
+/// The attention axes an instance of a family that brings its own kernels
+/// compiles the decode flash at: Qwen3.6's, which no layer of its files
+/// launches.
+const ATTN_UNLAUNCHED: AttnAxes = QWEN35MOE_A3B.key.attn;
 
 /// A gated delta net of 48 value heads: three to each of 16 key heads, the
 /// value heads as an axis beside Qwen3.6's 32.
@@ -150,6 +164,7 @@ pub const QWEN35MOE_A3B: Instance = Instance {
     },
     host_feature: None,
     opens: true,
+    own_kernels: false,
 };
 
 /// Qwen3-30B-A3B's shape (`qwen3moe`): the softmax router over 128 experts
@@ -181,6 +196,7 @@ pub const QWEN3MOE_A3B: Instance = Instance {
     },
     host_feature: Some("host-qwen3moe-a3b"),
     opens: true,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the delta net of [`GDN_48`]: the kernel gate's row of
@@ -194,6 +210,7 @@ pub const QWEN35MOE_GDN48: Instance = Instance {
     },
     host_feature: Some("host-qwen35moe-gdn48"),
     opens: true,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention layers of a dense Qwen3.8-27B: 24 heads
@@ -220,6 +237,7 @@ pub const QWEN35MOE_GQA6: Instance = Instance {
     },
     host_feature: Some("host-qwen35moe-gqa6"),
     opens: true,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention layers of a 9B-class model: 16 heads
@@ -244,6 +262,7 @@ pub const QWEN35MOE_GQA4: Instance = Instance {
     },
     host_feature: Some("host-qwen35moe-gqa4"),
     opens: true,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention layers of LFM3-1.7B: 16 heads over 4
@@ -280,6 +299,7 @@ pub const LFM3_ATTN: Instance = Instance {
     },
     host_feature: Some("host-lfm3-attn"),
     opens: false,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention layers of a dense Llama: 32 heads over
@@ -307,6 +327,7 @@ pub const LLAMA_ATTN: Instance = Instance {
     },
     host_feature: Some("host-llama-attn"),
     opens: false,
+    own_kernels: false,
 };
 
 /// A flash row of this backend's kernels at `head` values: one threadgroup of
@@ -353,6 +374,7 @@ pub const QWEN3_ATTN_GQA2: Instance = Instance {
     },
     host_feature: Some("host-qwen3-attn-gqa2"),
     opens: false,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention layers of Llama-3.2-3B: 24 heads over 8
@@ -382,6 +404,7 @@ pub const LLAMA_ATTN_GQA3: Instance = Instance {
     },
     host_feature: Some("host-llama-attn-gqa3"),
     opens: false,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention layers of Llama-3.2-1B: 32 heads over 8
@@ -412,6 +435,7 @@ pub const LLAMA_ATTN_H64: Instance = Instance {
     },
     host_feature: Some("host-llama-attn-h64"),
     opens: false,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention flash of Qwen2.5-14B: 40 heads over 8
@@ -441,6 +465,7 @@ pub const NEOX_ATTN_GQA5: Instance = Instance {
     },
     host_feature: Some("host-neox-attn-gqa5"),
     opens: false,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention flash of Qwen2.5-1.5B: 12 heads over 2
@@ -468,6 +493,7 @@ pub const NEOX_ATTN_GQA6: Instance = Instance {
     },
     host_feature: Some("host-neox-attn-gqa6"),
     opens: false,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention flash of Qwen2.5-7B: 28 heads over 4
@@ -495,6 +521,7 @@ pub const NEOX_ATTN_GQA7: Instance = Instance {
     },
     host_feature: Some("host-neox-attn-gqa7"),
     opens: false,
+    own_kernels: false,
 };
 
 /// Qwen3.6's shape with the attention flash of Qwen2.5-0.5B: 14 heads over 2
@@ -522,6 +549,7 @@ pub const NEOX_ATTN_H64_GQA7: Instance = Instance {
     },
     host_feature: Some("host-neox-attn-h64-gqa7"),
     opens: false,
+    own_kernels: false,
 };
 
 /// Inkling 2 Mini's shape: 24 query heads over 8 key heads of 128 values, a
@@ -535,14 +563,14 @@ pub const NEOX_ATTN_H64_GQA7: Instance = Instance {
 /// refuses a row with sinks and no bias path exists, so the family's flash
 /// is `metal/kernels/rel_flash.metal`, compiled at the group of three.
 ///
-/// The row is held out of [`REGISTERED`]: a registered row's build compiles
-/// the shared decode flash and router at its geometry, and those refuse its
-/// sinks and its biased sigmoid rule. The family's session
-/// (`arch::inkling2`) runs at [`HOST`] instead: its own launches — the
+/// The family brings its own kernels ([`Instance::own_kernels`]): the shared
+/// decode flash, router and experts refuse its sinks, its biased sigmoid rule
+/// and its expert width of 1152, so its unit compiles them at their
+/// unlaunched axes and its session (`arch::inkling2`) launches its own — the
 /// rel-bias flash, the normed mix, the loop controller, the residual short
 /// conv, the qk clip epilogue, the NVFP4 mat-vec, the sigmoid router and the
-/// situ pair (`kernels::inkling2`) — read the family's geometry, and the
-/// shared ones it takes carry their shapes in launch words. Its FFN axis's
+/// situ pair (`kernels::inkling2`), which read the family's geometry — and
+/// the shared ones it takes carry their shapes in launch words. Its FFN axis's
 /// router row is the shape table's own 128-expert top-8
 /// [`RouterBody::BiasedSigmoid`] row.
 pub const INKLING2_MINI: Instance = Instance {
@@ -578,7 +606,8 @@ pub const INKLING2_MINI: Instance = Instance {
         delta: None,
     },
     host_feature: None,
-    opens: false,
+    opens: true,
+    own_kernels: true,
 };
 
 /// Query heads a key head of Inkling 2's attention.
@@ -603,6 +632,7 @@ pub const REGISTERED: &[Instance] = &[
     NEOX_ATTN_GQA6,
     NEOX_ATTN_GQA7,
     NEOX_ATTN_H64_GQA7,
+    INKLING2_MINI,
 ];
 
 /// The name of an instance made at open for a shape no row registers. No
@@ -722,12 +752,36 @@ impl Instance {
     }
 
     /// The routed axes this instance's router kernels are compiled at: its
-    /// own, or [`ROUTER_UNLAUNCHED`] when its files have a dense FFN.
+    /// own, or [`ROUTER_UNLAUNCHED`] when its files have a dense FFN or its
+    /// family brings its own kernels.
     #[must_use]
     pub const fn router_built(&self) -> MoeAxes {
-        match self.key.ffn {
+        match self.ffn_built() {
             FfnAxes::Routed(m) => m,
             FfnAxes::Dense { .. } => ROUTER_UNLAUNCHED,
+        }
+    }
+
+    /// The FFN axes this instance's router and expert kernels are compiled
+    /// at: its own, or [`ROUTER_UNLAUNCHED`]'s routed axes when its family
+    /// brings its own kernels.
+    #[must_use]
+    pub const fn ffn_built(&self) -> FfnAxes {
+        if self.own_kernels {
+            FfnAxes::Routed(ROUTER_UNLAUNCHED)
+        } else {
+            self.key.ffn
+        }
+    }
+
+    /// The attention axes this instance's decode flash is compiled at: its
+    /// own, or [`ATTN_UNLAUNCHED`] when its family brings its own kernels.
+    #[must_use]
+    pub const fn attn_built(&self) -> AttnAxes {
+        if self.own_kernels {
+            ATTN_UNLAUNCHED
+        } else {
+            self.key.attn
         }
     }
 }
@@ -863,14 +917,15 @@ fn agree<T: PartialEq>(
     }
 }
 
-/// The flash rows the registered instances compile, in the order
+/// The flash rows the registered instances compile (a row of
+/// [`Instance::own_kernels`] compiles the unlaunched axes, not its own), in the order
 /// [`shape::select_gqa_in`] prefers them: a row of one block a group ahead of
 /// a packed row, a wider pack ahead of a narrower, each row once. The shape
 /// table's own rows ([`shape::GQA`]) are the card's; a row here is a kernel
 /// of this backend.
 fn served_rows() -> Vec<GqaInst> {
     let mut rows: Vec<GqaInst> = Vec::new();
-    for inst in REGISTERED {
+    for inst in REGISTERED.iter().filter(|i| !i.own_kernels) {
         let row = inst.key.attn.row;
         if !rows.contains(&row) {
             rows.push(row);
@@ -1024,6 +1079,7 @@ pub fn open_key(key: Key) -> Result<&'static Instance, Refused> {
         key,
         host_feature: None,
         opens: true,
+        own_kernels: false,
     };
     Geometry::of(&made)
         .check()
@@ -1226,12 +1282,22 @@ mod tests {
             REGISTERED.contains(&HOST),
             "the host's instance is registered"
         );
-        let features: Vec<_> = REGISTERED.iter().map(|i| i.host_feature).collect();
+        // A row of a family that brings its own kernels is no build's host:
+        // the host's shims are the shared kernels' geometry.
+        let hosts: Vec<&Instance> = REGISTERED.iter().filter(|i| !i.own_kernels).collect();
+        for inst in REGISTERED.iter().filter(|i| i.own_kernels) {
+            assert!(
+                inst.host_feature.is_none() && *inst != HOST,
+                "{}: a row of its family's own kernels hosts no build",
+                inst.name
+            );
+        }
+        let features: Vec<_> = hosts.iter().map(|i| i.host_feature).collect();
         for (i, f) in features.iter().enumerate() {
             assert!(
                 !features[..i].contains(f),
                 "{}: one build a host instance",
-                REGISTERED[i].name
+                hosts[i].name
             );
         }
         let manifest = include_str!("../Cargo.toml");
@@ -1675,7 +1741,9 @@ mod tests {
     /// does. Mutant: `served_rows` sorts the packed rows by ascending pack.
     #[test]
     fn each_registered_attention_selects_its_own_row() {
-        for inst in REGISTERED {
+        // A row of a family that brings its own kernels serves no file
+        // through `Key::of` (`inkling2s_router_row_is_the_tables`).
+        for inst in REGISTERED.iter().filter(|i| !i.own_kernels) {
             let a = inst.key.attn;
             let gate = if a.q_gate {
                 OutGate::Packed
@@ -1919,13 +1987,15 @@ mod tests {
     }
 
     /// Inkling 2's router row is the table's own 128-expert top-8
-    /// `BiasedSigmoid` row, spelled in [`INKLING2_MINI`] until the table
-    /// carries it: today the table, asked for exactly that shape, selects
-    /// its 128-expert row of this body and refuses the picks, which is why
-    /// the instance stays out of [`REGISTERED`] — a registered row's router
-    /// is the row the table selects. The spelled row runs its own rule, and
-    /// the attention axes beside it are the family's own flash row, not the
-    /// decode attention's.
+    /// `BiasedSigmoid` row, the row the table selects at its picks, and the
+    /// attention axes beside it are the family's own flash row, not the
+    /// decode attention's. The row is registered and opens its family's
+    /// files; its family brings its own kernels, so its unit compiles the
+    /// shared flash, router and experts at their unlaunched axes, which the
+    /// geometry check takes, and its flash row serves no other file.
+    ///
+    /// Mutant: `own_kernels: false` on the row (the build compiles the
+    /// shared kernels at its sinks and its sigmoid rule, which they refuse).
     /// The inkling2 row's attention axes read through a call, so the test's
     /// assertions are not constants of the row itself.
     fn inkling2_axes() -> AttnAxes {
@@ -1952,9 +2022,19 @@ mod tests {
         })
         .expect("the table carries the row");
         assert_eq!(got, m.router, "the table's selection is the row");
+        assert!(REGISTERED.contains(&INKLING2_MINI), "the row is registered");
+        let row = inkling2_row();
+        assert!(row.own_kernels, "the family brings its own kernels");
+        assert_eq!(
+            crate::geom::Geometry::of(&row).check(),
+            Ok(()),
+            "the unit compiles the shared kernels at their unlaunched axes"
+        );
+        assert_eq!(row.attn_built(), ATTN_UNLAUNCHED);
+        assert_eq!(row.router_built(), ROUTER_UNLAUNCHED);
         assert!(
-            !REGISTERED.contains(&INKLING2_MINI),
-            "a registered row's build compiles the shared flash and router, which refuse the row"
+            !served_rows().contains(&row.key.attn.row),
+            "its flash row serves no file through Key::of"
         );
         let a = inkling2_axes();
         assert_eq!(
@@ -1966,8 +2046,8 @@ mod tests {
         assert_eq!(inkling2_row().key.hidden, 2304);
         assert_eq!((m.top_k, m.expert_ff), (8, 1152));
         assert!(
-            !inkling2_row().opens,
-            "the family's session opens its files at the host instance"
+            inkling2_row().opens,
+            "the family's session opens its files at the row"
         );
     }
 }

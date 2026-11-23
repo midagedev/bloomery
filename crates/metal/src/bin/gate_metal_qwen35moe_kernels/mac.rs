@@ -45,9 +45,9 @@ use bloomery_device::conformance::{Clause, Report, Verdict, why};
 use bloomery_device::{Buffer, Device, DeviceError, Elems, FaultWord};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::instance::{
-    self, Instance, LFM3_ATTN, LLAMA_ATTN, LLAMA_ATTN_GQA3, LLAMA_ATTN_H64, NEOX_ATTN_GQA5,
-    NEOX_ATTN_GQA6, NEOX_ATTN_GQA7, NEOX_ATTN_H64_GQA7, QWEN3_ATTN_GQA2, QWEN3MOE_A3B,
-    QWEN35MOE_A3B, QWEN35MOE_GDN48, QWEN35MOE_GQA4, QWEN35MOE_GQA6, REGISTERED,
+    self, INKLING2_MINI, Instance, LFM3_ATTN, LLAMA_ATTN, LLAMA_ATTN_GQA3, LLAMA_ATTN_H64,
+    NEOX_ATTN_GQA5, NEOX_ATTN_GQA6, NEOX_ATTN_GQA7, NEOX_ATTN_H64_GQA7, QWEN3_ATTN_GQA2,
+    QWEN3MOE_A3B, QWEN35MOE_A3B, QWEN35MOE_GDN48, QWEN35MOE_GQA4, QWEN35MOE_GQA6, REGISTERED,
 };
 use bloomery_metal::kernels::{
     Geometry, HeadNormParams, Kernels, LoadNorm, MatvecParams, Mode, NormOnLoad, Quant,
@@ -527,6 +527,12 @@ fn tensor_kernels_of_text(
 /// What the gate runs at an instance.
 #[derive(Clone, Copy)]
 enum Table {
+    /// An instance whose family brings its own attention, router and expert
+    /// kernels ([`Instance::own_kernels`]): its translation units compile the
+    /// shared kernels at their unlaunched axes, so they are another row's
+    /// (`of`) byte for byte, and the family's own clauses and mutants run at
+    /// that row. The `twin` clause holds the two rows' units equal.
+    Twin { of: &'static Instance },
     /// Every clause and both mutant tables: the gate is written at this
     /// instance's fixture.
     Whole,
@@ -730,6 +736,11 @@ const INSTANCE_ROWS: &[InstanceRow] = &[
             ],
         },
     },
+    InstanceRow {
+        instance: &INKLING2_MINI,
+        fixture: "qwen35moe",
+        table: Table::Twin { of: &QWEN35MOE_A3B },
+    },
 ];
 
 /// Every instance of `registry` has exactly one of `rows`, and every row is
@@ -742,6 +753,15 @@ fn rows_cover_registry(rows: &[InstanceRow], registry: &[Instance]) -> Result<()
             0 => return Err(format!("instance {} has no gate row", inst.name)),
             n => return Err(format!("instance {} has {n} gate rows", inst.name)),
         }
+    }
+    if let Some(row) = rows
+        .iter()
+        .find(|r| r.instance.own_kernels != matches!(r.table, Table::Twin { .. }))
+    {
+        return Err(format!(
+            "instance {}: a twin row is exactly an instance that brings its own kernels",
+            row.instance.name
+        ));
     }
     match rows.iter().find(|r| !registry.contains(r.instance)) {
         Some(row) => Err(format!(
@@ -841,6 +861,29 @@ fn instance_library(h: &Harness<'_>, row: &InstanceRow) -> Clause {
     Ok(Verdict::Noted(format!(
         "{name} compiles, {} entries make pipelines",
         INSTANCE_ENTRIES.len() + INSTANCE_MATVEC_ENTRIES.len(),
+    )))
+}
+
+/// A twin row's translation units are its twin's, text for text: the main
+/// unit and the tensor-op unit, so every clause and mutant run at the twin
+/// covers this row's kernels.
+fn twin_units(row: &InstanceRow, of: &Instance) -> Clause {
+    let mine = library::sources_of(row.instance).map_err(why)?;
+    let twin = library::sources_of(of).map_err(why)?;
+    for (unit, a, b) in [("main", mine.0, twin.0), ("tensor", mine.1, twin.1)] {
+        if a != b {
+            return Err(format!(
+                "{}'s {unit} unit is not {}'s: their texts differ",
+                row.instance.name, of.name
+            ));
+        }
+    }
+    Ok(Verdict::Noted(format!(
+        "{}'s main and tensor units are {}'s byte for byte ({} and {} bytes): its family's clauses and mutants run there",
+        row.instance.name,
+        of.name,
+        mine.0.len(),
+        mine.1.len()
     )))
 }
 
@@ -1144,6 +1187,12 @@ fn clause_table<'a>(
         ))
     };
     match row.table {
+        Table::Twin { of } => instances()
+            .chain(std::iter::once((
+                "twin",
+                Box::new(move || twin_units(row, of)) as ClauseRun<'a>,
+            )))
+            .collect(),
         Table::Delta { .. } => instances()
             .chain(clauses_delta::wide(ctx))
             .chain(clauses_rows::wide(ctx))

@@ -23,12 +23,13 @@ use super::fixture::{Fixture, OUTPUT_ROWS};
 use super::oracle::{self, Kind};
 use super::{Harness, SENTINEL_BITS};
 
-/// What the fixture's head is written for, held for every registered row: the
-/// 2048-wide tensors the clauses read.
+/// What the fixture's head is written for, held for every registered row
+/// whose clauses read it: the 2048-wide tensors the clauses read. A row that
+/// brings its own kernels runs its twin's clauses, not these.
 const _: () = {
     let mut i = 0;
     while i < REGISTERED.len() {
-        assert!(Geometry::of(&REGISTERED[i]).hidden == 2_048);
+        assert!(REGISTERED[i].own_kernels || Geometry::of(&REGISTERED[i]).hidden == 2_048);
         i += 1;
     }
 };

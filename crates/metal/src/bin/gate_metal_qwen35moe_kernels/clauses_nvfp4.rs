@@ -12,6 +12,7 @@
 use bloomery_device::conformance::{Clause, Verdict};
 use bloomery_device::fault::FaultSite;
 use bloomery_device::{Buffer, Elems};
+use bloomery_metal::inkling2_geom::TOP_K;
 use bloomery_metal::kernels::{Nvfp4Params, NvfpLayout};
 use gguf::quant::{GgmlType, Nvfp4Rows, dequant_row};
 
@@ -154,17 +155,29 @@ fn decode(layout: NvfpLayout, row: &[u8], k: usize) -> Vec<f64> {
     out
 }
 
-fn launch(
+/// One launch over a route of `ids.len()` slots of the stack `bytes` (one
+/// expert a scale of `scales`), each slot's rows at its plane's place; a
+/// slot reads its own input when `x` holds one a slot. The output read back.
+#[allow(clippy::too_many_arguments)]
+fn launch_route(
     h: &Harness<'_>,
     layout: NvfpLayout,
     rows: usize,
     k: usize,
     bytes: &[u8],
+    ids: &[u32],
+    scales: &[f32],
+    route_weights: Option<&[f32]>,
     x: &[f32],
+    plane: usize,
 ) -> Result<Vec<f32>, String> {
+    let slots = ids.len();
     let w = ink2::up(h, bytes)?;
+    let idb = ink2::up(h, ids)?;
+    let sb = ink2::up(h, scales)?;
+    let rw = route_weights.map(|r| ink2::up(h, r)).transpose()?;
     let xb = ink2::up(h, x)?;
-    let mut y = ink2::up(h, &ink2::blank(rows))?;
+    let mut y = ink2::up(h, &ink2::blank(slots * rows))?;
     h.clear_fault()?;
     h.encode(|encoder| {
         h.kernels.nvfp4_matvec(
@@ -174,9 +187,16 @@ fn launch(
                 rows,
                 k,
                 weights: w.window(Elems(0), Elems(bytes.len()))?,
-                x: xb.window(Elems(0), Elems(k))?,
-                y: y.window_mut(Elems(0), Elems(rows))?,
-                w_scale: W_SCALE,
+                ids: idb.window(Elems(0), Elems(slots))?,
+                scales: sb.window(Elems(0), Elems(scales.len()))?,
+                route_weights: rw
+                    .as_ref()
+                    .map(|b| b.window(Elems(0), Elems(slots)))
+                    .transpose()?,
+                x: xb.window(Elems(0), Elems(x.len()))?,
+                x_per_slot: x.len() != k,
+                y: y.window_mut(Elems(0), Elems(slots * rows))?,
+                plane,
                 faults: h.device.fault_word(),
                 layer: LAYER,
             },
@@ -185,6 +205,18 @@ fn launch(
     let out = ink2::read(h, &y)?;
     ink2::written("the mat-vec", &out)?;
     Ok(out)
+}
+
+/// One expert's rows at the scale `W_SCALE`: a one-slot route.
+fn launch(
+    h: &Harness<'_>,
+    layout: NvfpLayout,
+    rows: usize,
+    k: usize,
+    bytes: &[u8],
+    x: &[f32],
+) -> Result<Vec<f32>, String> {
+    launch_route(h, layout, rows, k, bytes, &[0], &[W_SCALE], None, x, rows)
 }
 
 fn row_bytes(layout: NvfpLayout, k: usize) -> usize {
@@ -327,13 +359,15 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
                at: usize,
                len: usize,
                which: usize,
-               w_scale: f32,
+               slots: usize,
                needle: &str|
      -> Result<(), String> {
         let src = [&blocks, &groups, &padded][which];
         let w = ink2::up(h, src)?;
         let xb = ink2::up(h, &x)?;
-        let mut y = ink2::up(h, &ink2::blank(rows))?;
+        let idb = ink2::up(h, &vec![0u32; slots])?;
+        let sb = ink2::up(h, &[W_SCALE])?;
+        let mut y = ink2::up(h, &ink2::blank(slots * rows))?;
         ink2::refused(
             label,
             h.encode(|encoder| {
@@ -344,9 +378,13 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
                         rows,
                         k,
                         weights: w.window(Elems(at), Elems(len))?,
+                        ids: idb.window(Elems(0), Elems(slots))?,
+                        scales: sb.window(Elems(0), Elems(1))?,
+                        route_weights: None,
                         x: xb.window(Elems(0), Elems(k))?,
-                        y: y.window_mut(Elems(0), Elems(rows))?,
-                        w_scale,
+                        x_per_slot: false,
+                        y: y.window_mut(Elems(0), Elems(slots * rows))?,
+                        plane: rows,
                         faults: h.device.fault_word(),
                         layer: LAYER,
                     },
@@ -364,7 +402,7 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
         0,
         bl,
         0,
-        W_SCALE,
+        1,
         "whole groups",
     )?;
     run(
@@ -374,7 +412,7 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
         0,
         gl,
         1,
-        W_SCALE,
+        1,
         "whole groups",
     )?;
     run(
@@ -384,7 +422,7 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
         0,
         bl - 36,
         0,
-        W_SCALE,
+        1,
         "weights window",
     )?;
     run(
@@ -394,7 +432,7 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
         0,
         bl + 36,
         2,
-        W_SCALE,
+        1,
         "weights window",
     )?;
     run(
@@ -404,21 +442,132 @@ pub fn nvfp4_bounds(h: &Harness<'_>) -> Clause {
         2,
         bl,
         2,
-        W_SCALE,
+        1,
         "32-bit words",
     )?;
     run(
-        "a scale that is not a number",
+        "a route of more slots than picks",
         NvfpLayout::Blocks,
         k,
         0,
         bl,
         0,
-        f32::NAN,
-        "scale",
+        TOP_K + 1,
+        "slots",
     )?;
     Ok(Verdict::Noted(
         "six refusals by name, each before an encode".to_string(),
+    ))
+}
+
+/// A route's slots in one launch: each slot reads its expert's id on the
+/// card, its expert's rows at the id's offset in the stack, its expert's
+/// scale (times its route weight on a down) and, on a down, its own input,
+/// and lands at its plane's slot block — every slot's rows the bits of a
+/// one-slot launch of its expert alone. A slot whose id is past the stack is
+/// NaN and raises the expert-id site; the other slots keep those bits. In the
+/// four layouts.
+pub fn nvfp4_route(h: &Harness<'_>) -> Clause {
+    const EXPERTS: usize = 5;
+    const SCALES: [f32; EXPERTS] = [0.5, 1.25, 2.0, 0.75, 3.0];
+    const ROUTE: [f32; 3] = [0.3, 0.9, 0.11];
+    let (rows, k) = (24usize, 256usize);
+    let plane = rows / 2;
+    for (layout, name) in [
+        (NvfpLayout::Blocks, "blocks"),
+        (NvfpLayout::Rows, "rows"),
+        (NvfpLayout::Q8_0, "q8_0"),
+        (NvfpLayout::Mxfp8Rows, "mxfp8 rows"),
+    ] {
+        let per = layout.bytes(rows, k).expect("whole groups");
+        let bytes = stack(layout, EXPERTS * rows, k, 0x4B00 + 16 * layout as u64);
+        let x = ink2::draw(3 * k, 0x4B01 + 16 * layout as u64, 1.0);
+        let alone = |e: u32, scale: f32, x: &[f32]| {
+            let e = e as usize;
+            launch_route(
+                h,
+                layout,
+                rows,
+                k,
+                &bytes[e * per..(e + 1) * per],
+                &[0],
+                &[scale],
+                None,
+                x,
+                rows,
+            )
+        };
+        let same = |what: &str, s: usize, e: u32, got: f32, want: f32, r: usize| {
+            if got.to_bits() == want.to_bits() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{name} {what}: slot {s} (expert {e}) row {r} is {got:e}, {want:e} alone"
+                ))
+            }
+        };
+        // The gate·up form: one shared input, two planes, no route weight.
+        let ids = [3u32, 0, 4];
+        let got = launch_route(
+            h,
+            layout,
+            rows,
+            k,
+            &bytes,
+            &ids,
+            &SCALES,
+            None,
+            &x[..k],
+            plane,
+        )?;
+        common::expect_clean(h, "the gate·up route")?;
+        for (s, &e) in ids.iter().enumerate() {
+            let want = alone(e, SCALES[e as usize], &x[..k])?;
+            for (r, w) in want.iter().enumerate() {
+                let at = ((r / plane) * ids.len() + s) * plane + r % plane;
+                same("gate·up", s, e, got[at], *w, r)?;
+            }
+        }
+        // The down form: a slot's own input, its route weight times its
+        // expert's scale, one plane; then a slot whose id is past the stack.
+        for (ids, bad) in [([3u32, 0, 4], None), ([1, EXPERTS as u32 + 2, 2], Some(1))] {
+            let got = launch_route(
+                h,
+                layout,
+                rows,
+                k,
+                &bytes,
+                &ids,
+                &SCALES,
+                Some(&ROUTE),
+                &x,
+                rows,
+            )?;
+            match bad {
+                Some(_) => common::expect_fault(h, name, FaultSite::ExpertId)?,
+                None => common::expect_clean(h, "the down route")?,
+            }
+            for (s, &e) in ids.iter().enumerate() {
+                if Some(s) == bad {
+                    if let Some(r) = (0..rows).find(|&r| !got[s * rows + r].is_nan()) {
+                        return Err(format!(
+                            "{name}: slot {s}'s id {e} is past the stack's {EXPERTS} experts, and its row {r} is {:e}",
+                            got[s * rows + r]
+                        ));
+                    }
+                    continue;
+                }
+                let scale = SCALES[e as usize] * ROUTE[s];
+                let want = alone(e, scale, &x[s * k..(s + 1) * k])?;
+                for (r, w) in want.iter().enumerate() {
+                    same("down", s, e, got[s * rows + r], *w, r)?;
+                }
+            }
+        }
+    }
+    Ok(Verdict::Noted(
+        "every slot of a route is its expert's one-slot launch to the bit, at its plane's place, with its own input and route weight on a down; an id past the stack is NaN in its slot alone and raises the expert-id site, in the four layouts"
+            .to_string(),
     ))
 }
 
@@ -429,5 +578,6 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<
         ("nvfp4_rows", Box::new(|| nvfp4_rows(h)) as ClauseRun),
         ("nvfp4_nan", Box::new(|| nvfp4_nan(h))),
         ("nvfp4_bounds", Box::new(|| nvfp4_bounds(h))),
+        ("nvfp4_route", Box::new(|| nvfp4_route(h))),
     ]
 }

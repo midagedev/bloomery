@@ -765,8 +765,10 @@ impl Checked {
             }
             w.add(f32s(128 * n));
             w.add(f32s(128));
+            // Each stack, then its scale row.
             for st in [&l.gate_up, &l.down] {
                 w.add((st.experts * st.expert_bytes()) as u64);
+                w.add(f32s(st.experts));
             }
             if l.core {
                 for _ in 0..4 {
@@ -808,20 +810,29 @@ impl Checked {
         }
     }
 
+    /// The message banks the step keeps: one a pass the loop runs again, and
+    /// at least one.
+    #[must_use]
+    pub fn message_banks(&self) -> usize {
+        self.visits.iter().filter(|v| v.pass_end).count().max(1)
+    }
+
     /// The f32 scratch buffers the arena makes, in its order: the bank's rows,
-    /// the message bank, the mixes, the paths' outputs, the attention's
-    /// partials and output, the router's partials, logits and weights, the
-    /// experts' slots, the accumulator and the logits.
+    /// the message banks, the mixes, the controllers' outputs and down rows,
+    /// the paths' outputs, the attention's partials and output, the router's
+    /// partials, logits and weights, the experts' slots, the visits' expert
+    /// sums and the logits.
     #[must_use]
     pub fn scratch_f32s(&self) -> Vec<usize> {
         let n = self.hidden;
         let segments = crate::attention_geom::SEGMENT_CAP;
         vec![
             (self.max_banks + 1) * n,
-            self.message_rows * n,
+            self.message_banks() * self.message_rows * n,
             3 * n,
             4 * n,
             3 * n,
+            4 * crate::inkling2_geom::CONTROLLER_RANK,
             3072 + 384 + 3072,
             24,
             1024,
@@ -844,7 +855,7 @@ impl Checked {
             self.top_k * 2 * self.ff,
             self.top_k * self.ff,
             self.top_k * n,
-            n,
+            self.visits.len() * n,
             n,
             n,
             self.cut,

@@ -4,7 +4,7 @@ use crate::attention_geom;
 use crate::delta_geom;
 use crate::experts_geom;
 use crate::geometry;
-use crate::instance::{HOST, Instance};
+use crate::instance::{FfnAxes, HOST, Instance};
 use crate::router_geom;
 
 /// A geometry one kernel family cannot take: which kernel, which axis, the
@@ -244,8 +244,9 @@ impl Geometry {
     #[must_use]
     pub const fn of(inst: &Instance) -> Geometry {
         let key = &inst.key;
+        let attn = inst.attn_built();
         let hidden = key.hidden as usize;
-        let head = key.attn.row.head as usize;
+        let head = attn.row.head as usize;
         let delta = inst.delta_built();
         let value_heads = delta.value_heads as usize;
         let head_cols = delta.head_cols as usize;
@@ -259,9 +260,9 @@ impl Geometry {
             hidden,
             attn: AttnGeom {
                 head,
-                rot: key.attn.rot as usize,
-                query_heads: key.attn.n_head as usize,
-                kv_heads: key.attn.n_kv as usize,
+                rot: attn.rot as usize,
+                query_heads: attn.n_head as usize,
+                kv_heads: attn.n_kv as usize,
                 gqa: attention_geom::gqa(inst),
                 simd_groups: attention_geom::simd_groups(inst),
                 lane_dims: attention_geom::lane_dims(inst),
@@ -269,7 +270,7 @@ impl Geometry {
                 qg_stride: attention_geom::qg_stride(inst),
                 flash_threads: attention_geom::flash_threads(inst),
                 scale: attention_geom::scale_of(head),
-                gated: key.attn.q_gate,
+                gated: attn.q_gate,
                 windowed: attention_geom::windowed(inst),
                 head_gate: attention_geom::head_gate(inst),
                 qk_norm: attention_geom::qk_norm(inst),
@@ -302,7 +303,7 @@ impl Geometry {
                 shared_slot: experts_geom::shared_slot(inst),
                 has_shared: slots > routed_ids,
                 k: experts_geom::expert_k(inst),
-                dense: key.is_dense(),
+                dense: matches!(inst.ffn_built(), FfnAxes::Dense { .. }),
             },
         }
     }
@@ -559,15 +560,18 @@ mod tests {
         for inst in REGISTERED {
             let g = Geometry::of(inst);
             let key = &inst.key;
+            // A row whose family brings its own kernels compiles the shared
+            // ones at their unlaunched axes: its built axes are those.
+            let attn = inst.attn_built();
             let name = inst.name;
             assert_eq!(g.instance, *inst, "{name}: the instance");
             assert_eq!(g.hidden, key.hidden as usize, "{name}: hidden");
 
             let a = g.attn;
-            assert_eq!(a.head, key.attn.row.head as usize, "{name}: head");
-            assert_eq!(a.rot, key.attn.rot as usize, "{name}: rot");
-            assert_eq!(a.query_heads, key.attn.n_head as usize, "{name}: heads");
-            assert_eq!(a.kv_heads, key.attn.n_kv as usize, "{name}: kv heads");
+            assert_eq!(a.head, attn.row.head as usize, "{name}: head");
+            assert_eq!(a.rot, attn.rot as usize, "{name}: rot");
+            assert_eq!(a.query_heads, attn.n_head as usize, "{name}: heads");
+            assert_eq!(a.kv_heads, attn.n_kv as usize, "{name}: kv heads");
             assert_eq!(a.gqa * a.kv_heads, a.query_heads, "{name}: gqa");
             assert_eq!(
                 a.simd_groups * attention_geom::HEADS_PER_SG,
@@ -576,12 +580,12 @@ mod tests {
             );
             assert_eq!(a.lane_dims * 32, a.head, "{name}: lane dims");
             assert_eq!(a.partial_elems, a.head + 2, "{name}: partial");
-            let gate = usize::from(key.attn.q_gate);
+            let gate = usize::from(attn.q_gate);
             assert_eq!(a.qg_stride, a.head * (1 + gate), "{name}: qg stride");
             assert_eq!(a.flash_threads, 32 * a.simd_groups, "{name}: flash threads");
-            assert_eq!(a.gated, key.attn.q_gate, "{name}: gated");
-            assert_eq!(a.windowed, key.attn.row.window, "{name}: windowed");
-            assert_eq!(a.head_gate, key.attn.head_gate, "{name}: head gate");
+            assert_eq!(a.gated, attn.q_gate, "{name}: gated");
+            assert_eq!(a.windowed, attn.row.window, "{name}: windowed");
+            assert_eq!(a.head_gate, attn.head_gate, "{name}: head gate");
             let ik = 1.0f32 / (a.head as f32).sqrt();
             assert_eq!(a.scale.to_bits(), ik.to_bits(), "{name}: scale");
 
@@ -609,7 +613,7 @@ mod tests {
             assert_eq!(d.q_scale.to_bits(), ik.to_bits(), "{name}: q scale");
 
             let r = g.router;
-            let moe = key.routed().expect("a registered row is routed");
+            let moe = inst.router_built();
             assert_eq!(r.experts, moe.router.experts as usize, "{name}: experts");
             assert_eq!(
                 r.shared,
@@ -617,7 +621,12 @@ mod tests {
                 "{name}: shared"
             );
             assert_eq!(r.rows, r.experts + r.shared, "{name}: rows");
-            assert_eq!(r.k, key.hidden as usize, "{name}: router k");
+            let k = if inst.own_kernels {
+                router_geom::UNLAUNCHED_K
+            } else {
+                key.hidden as usize
+            };
+            assert_eq!(r.k, k, "{name}: router k");
             assert_eq!(r.partials, r.rows, "{name}: partials");
             assert_eq!(
                 r.groups,

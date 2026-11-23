@@ -207,6 +207,22 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "loop_control_down_first_block",
+        clause: "loop_control",
+        why: "every down threadgroup computes the rank's first eight outputs: the rest of h is never written",
+        edits: &[("const uint r = tg.x * LC_SG + sg;", "const uint r = sg;", 1)],
+    },
+    Mutant {
+        name: "loop_control_merge_first_block",
+        clause: "loop_control",
+        why: "every merge threadgroup writes the row's first 256 outputs: the rest of the row is never written",
+        edits: &[(
+            "const uint j = tg.x * LC_THREADS + tid;",
+            "const uint j = tid;",
+            1,
+        )],
+    },
+    Mutant {
         name: "loop_control_nan_row_kept",
         clause: "loop_control_nan",
         why: "an unusable row is passed through as it came",
@@ -258,9 +274,9 @@ pub const INK2_MUTANTS: &[Mutant] = &[
     Mutant {
         name: "nvfp4_global_scale_dropped",
         clause: "nvfp4_rows",
-        why: "no entry applies its launch word: the expert's global scale and route weight are lost",
+        why: "no entry applies its slot's scale: the expert's global scale and route weight are lost",
         edits: &[(
-            "const float dot = simd_sum(acc) * args.w_scale;",
+            "const float dot = simd_sum(acc) * w_scale;",
             "const float dot = simd_sum(acc);",
             4,
         )],
@@ -270,8 +286,8 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         clause: "nvfp4_rows",
         why: "a row-major group is eight bytes, not nine",
         edits: &[(
-            "(ulong)r * (ulong)groups * 9ul",
-            "(ulong)r * (ulong)groups * 8ul",
+            "(expert * (ulong)args.rows + (ulong)r) * (ulong)groups * 9ul",
+            "(expert * (ulong)args.rows + (ulong)r) * (ulong)groups * 8ul",
             1,
         )],
     },
@@ -294,9 +310,9 @@ pub const INK2_MUTANTS: &[Mutant] = &[
     Mutant {
         name: "q8_0_scaled_word_dropped",
         clause: "nvfp4_rows",
-        why: "the Q8_0 entry's rows skip the launch word: a coda expert's route weight is lost",
+        why: "the Q8_0 entry's rows skip their slot's scale: a coda expert's route weight is lost",
         edits: &[(
-            "const float v = float(as_type<char>(blk[2u + lane])) * d;\n        acc += v * x[i * 32u + lane];\n    }\n    const float dot = simd_sum(acc) * args.w_scale;",
+            "const float v = float(as_type<char>(blk[2u + lane])) * d;\n        acc += v * x[i * 32u + lane];\n    }\n    const float dot = simd_sum(acc) * w_scale;",
             "const float v = float(as_type<char>(blk[2u + lane])) * d;\n        acc += v * x[i * 32u + lane];\n    }\n    const float dot = simd_sum(acc);",
             1,
         )],
@@ -314,6 +330,52 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         edits: &[(
             "    if (mag == 0x7fu) {\n        return NAN;\n    }",
             "    if (mag == 0x7fu) {\n        return 448.0f;\n    }",
+            1,
+        )],
+    },
+    Mutant {
+        name: "nvfp4_slot_reads_slot_zero",
+        clause: "nvfp4_route",
+        why: "every slot reads the first slot's id: the route runs one expert eight times",
+        edits: &[(
+            "pair_expert(ids, slot, args.experts, e)",
+            "pair_expert(ids, 0u, args.experts, e)",
+            1,
+        )],
+    },
+    Mutant {
+        name: "nvfp4_route_weight_dropped",
+        clause: "nvfp4_route",
+        why: "a routed down's slot keeps its expert's scale without its route weight",
+        edits: &[(
+            "args.weighted != 0u ? scales[e] * route_w[slot] : scales[e];",
+            "scales[e];",
+            1,
+        )],
+    },
+    Mutant {
+        name: "nvfp4_planes_ignored",
+        clause: "nvfp4_route",
+        why: "a slot's rows land as one block: the gate·up's up rows sit inside the next slot's gate rows",
+        edits: &[(
+            "return ((r / args.plane) * args.slots + slot) * args.plane + r % args.plane;",
+            "return slot * args.rows + r;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "nvfp4_slot_input_shared",
+        clause: "nvfp4_route",
+        why: "every slot of a down reads the first slot's activation",
+        edits: &[("    x += slot * args.x_stride;\n", "", 4)],
+    },
+    Mutant {
+        name: "nvfp4_bad_id_reads_expert_zero",
+        clause: "nvfp4_route",
+        why: "an id past the stack reads expert 0 and raises nothing",
+        edits: &[(
+            "if (slot >= BLOOMERY_EXPERT_ROUTED || pair_expert(ids, slot, args.experts, e)) {",
+            "if (slot >= BLOOMERY_EXPERT_ROUTED || (pair_expert(ids, slot, args.experts, e) && false)) {",
             1,
         )],
     },

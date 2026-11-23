@@ -463,15 +463,18 @@ mod tests {
 
     /// The MLX folder this backend opens, its headers read back: every
     /// tensor's span summed per shard and in all, the number
-    /// [`MINI_RESIDENT`] names. The folder is a machine's own copy; the
-    /// test runs where it is planted.
+    /// [`MINI_RESIDENT`] names. The folder is a machine's own copy, named
+    /// as the Metal binaries take their model from the environment:
+    /// `$BLOOMERY_REF_MODEL`.
     #[cfg(target_os = "macos")]
     #[test]
-    #[ignore = "needs the Inkling-2-Mini-mlx4 folder under ~/.cache/bloomery/mac-port/models"]
+    #[ignore = "needs $BLOOMERY_REF_MODEL naming the Inkling-2-Mini-mlx4 folder"]
     fn hw_inkling2_mini_mlx4_resident_bytes() {
-        let dir = std::path::Path::new(
-            "/Users/hckim/.cache/bloomery/mac-port/models/Inkling-2-Mini-mlx4",
-        );
+        let dir = std::env::var_os("BLOOMERY_REF_MODEL")
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+            .expect("$BLOOMERY_REF_MODEL names the Inkling-2-Mini-mlx4 folder this test reads");
+        let dir = dir.as_path();
         let index = dir.join(safetensors::Folder::INDEX);
         let map = safetensors::Folder::weight_map(&index)
             .unwrap_or_else(|e| panic!("{}: {e}", index.display()));

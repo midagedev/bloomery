@@ -38,6 +38,8 @@ use super::Table;
 /// row takes, so that rows with a defect in common hold it once).
 pub fn all(table: Table) -> Vec<(&'static Mutant, Program)> {
     match table {
+        // The twin's row runs them.
+        Table::Twin { .. } => Vec::new(),
         Table::Whole => program::all(MUTANTS, TENSOR_MUTANTS)
             .chain(program::all(INK2_MUTANTS, &[]))
             .collect(),
