@@ -2280,6 +2280,13 @@ PY
   flock -x 6 || { echo "FAIL: the test cannot hold the local lock"; return 1; }
   case_ '  … the local lock held: 75 at the bound' 75 'no gate lock \(local\) was free within 4 s' any "$t/lease" "${LOC[@]}"
   exec 6>&-
+  # On the box local mode's one lock is the box's gate lock, so the box's other runs hold it off.
+  : > "$t/box-lease.lock"
+  exec 5> "$t/gate.lock"
+  flock -x 5 || { echo "FAIL: the test cannot hold the gate lock"; return 1; }
+  case_ '  … on the box, the gate lock held: 75 at the bound' 75 'no gate lock \(local\) was free within 4 s' any "$t/lease" "${LOC[@]}"
+  exec 5>&-
+  rm -f "$t/box-lease.lock"
   exec 7> "$t/lease"
   flock -x 7 || { echo "FAIL: the test cannot hold its lease file"; return 1; }
   case_ '  … the lease held: it times the card, 75 at the bound' 75 'no gate lock \(local\) was free within 4 s' any "$t/lease" "${LOC[@]}"
@@ -2648,6 +2655,8 @@ if [ "${1:-}" = --test-locks ]; then
   [ $# -ge 3 ] && [ -d "$2" ] || { echo "usage: gpu-gate.sh --test-locks <dir> <binary> [args...] (the self-test's)" >&2; exit 64; }
   GATE_LOCK=$2/gate.lock A6000_LOCK=$2/gate-a6000.lock LOCAL_LOCK=$2/gate-local.lock V41_LOCK=$2/v41-load.lock GPU_HOLD=$2/batch.gpuhold SIT_HOLD=$2/sitting.gpuhold V41_BOUND=6 POLL=1 CARD_BOUND=4
   V41_QDIR=$2/v41-queue.d V41_SEQ=$2/v41-queue.seq
+  # The box's mark is the test's too, so a case reads the machine the test makes, not the one it runs on (the box has /root's mark).
+  BOX_LEASE=$2/box-lease.lock
   # A helper waiter, one whose life the test ends by an event (it releases the lock the waiter queues on), is set up with a safety cap
   # in place of the two bounds; the cases that judge a bound never set it.
   if [ -n "${GATE_TEST_CAP:-}" ]; then
