@@ -91,9 +91,9 @@ generate_ds41   ds41_ffn_handoff_10_cols_tier            0           0
 generate_ds41   ds41_ffn_handoff_4                       0           0
 generate_ds41   ds41_ffn_handoff_8                       0           0
 generate_ds41   ds41_ffn_handoff_4_tier                  0           0
-# PIN(2026-10-26): ffn_handoff_6_tier measured from generate_ds41 at b9b6e013 with
-# Rust1.99.1 / cuda-oxide9df9e7ce + repository patch31ab6a1d3f58; sm_86 ptxas13.3.33,
-# RTX3090 cc8.6 driver595.91.07 JIT CUDA13.2: spill0 / jit_local0 (both register counts26).
+# PIN(2026-10-26): ffn_handoff_6_tier measured from generate_ds41 at b9b6e013 with Rust 1.99.1 / cuda-oxide 9df9e7ce
+# plus the repository's #1648 patch (the pin until 2026-11-23: ab2b6738 carries #1648 and the repository none);
+# sm_86 ptxas 13.3.33, RTX 3090 cc 8.6 driver 595.91.07 JIT CUDA 13.2: spill 0 / jit_local 0 (both register counts 26).
 generate_ds41   ffn_handoff_6_tier                       0           0
 generate_ds41   ds41_ffn_handoff_8_tier                  0           0
 generate_ds41   ds41_ffn_handoff_9                       0           0
@@ -392,7 +392,8 @@ generate_ds41   hc_gated_up_mma_mix_4                  752         240
 # PIN(2026-10-25): the new entry uses sm_86 ptxas 13.3.73 spill/stack (676/192). The cc 8.6 JIT was not measured (the
 # GB10 JIT reads 88 B of local for this PTX); this new entry's jit_local pin uses the measured ptxas stack frame.
 # PIN(2026-10-26): spill 676 -> 628 B and cc 8.6 JIT local 192 -> 200 B, both measured by gate-ptx-spill (sm_86 ptxas
-# 13.3.73, the RTX A6000's JIT): cuda-oxide moved to NVIDIA/cuda-rust 9df9e7cef561 with #1648, and the PTX moved with it.
+# 13.3.73, the RTX A6000's JIT): cuda-oxide moved to NVIDIA/cuda-rust 9df9e7cef561 with the repository's #1648 patch
+# (upstream in ab2b6738, the pin since 2026-11-23), and the PTX moved with it.
 # PIN(2026-11-01): spill 628 -> 832 B and cc 8.6 JIT local 200 -> 280 B, measured with the row above, after the same
 # commits. cc 8.6 never launches the entry.
 generate_ds41   hc_gated_up_mma_mix_4_bf16             832         280

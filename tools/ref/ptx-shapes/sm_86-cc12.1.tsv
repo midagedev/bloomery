@@ -7,6 +7,7 @@
 # Every entry has a row measured on cc 12.1; tools/check-ptx-names.py checks for stale and missing rows.
 #
 # binary          entry                              spill  jit_local
+# PIN(2026-11-23): the cuda-oxide pin moved to ab2b6738 (32-bit shared pointers, hoisted stack allocations, native f32 max/min). Each row that fell is re-pinned down to the gate-ptx-spill scan (ptxas 13.3.73, GB10 cc 12.1 JIT); a PIN line above a row names that row at its own date. Rows that rose are re-pinned at their own PIN(2026-11-23) lines below, each with its cause and, where the pinab round timed a model that runs the kernel, its prefill A/B on the 5090.
 
 # generate_ds41 (--features gpu,deepseek41)
 generate_ds41   add                                      0           0
@@ -34,14 +35,15 @@ generate_ds41   bf16_mma_cols_gemm_bf16                  0           0
 # PIN(2026-10-28): JIT local 160 -> 168 B, spill unchanged at 0 (ptxas 13.3.73 sm_86, cc 12.1 JIT on GB10 driver 595.84) once the shared MMA tile's columns
 # stage and replay through generic types (`MmaCols::Exact`, `landed_fits`, the replay's `X: TileRows`); the BF16
 # norm-gate projection runs for a BF16 weight (the NVFP4 checkpoint), not FP4-Local's MXFP8 one.
-generate_ds41   bf16_mma_norm_gate                       0         168
+generate_ds41   bf16_mma_norm_gate                       0         0
 generate_ds41   bf16_mma_gemm                            0           0
 generate_ds41   bf16_tile_gemm                           0           0
 generate_ds41   cand_block_max                           0           0
 generate_ds41   cand_compact                             0           0
 generate_ds41   cand_remap                               0           0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives cand_select 64 registers (no register bound in the PTX) and keeps 8 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
-generate_ds41   cand_select                              0           8
+# PIN(2026-11-23): cand_select spill 0 B unchanged, JIT local 8 -> 16 B: the llc `--nvptx-short-ptr` of the cuda-oxide pin move (#1661) alone moves it: on the 5090 the stage replay without it returns the old spill and the frontend and opt stages change nothing (pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B: none (no whole-card model on the A/B runs this kernel's pass; the effect is not measured) (pinab round).
+generate_ds41   cand_select                              0          16
 generate_ds41   card_sel                                 0           0
 generate_ds41   dflash_conv                              0           0
 generate_ds41   dflash_expert_down                       0           0
@@ -51,13 +53,13 @@ generate_ds41   dflash_router                            0           0
 generate_ds41   down_add_q5_1                            0           0
 generate_ds41   ds41_attn_merge                          0           0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives ds41_attn_seg 128 registers (128 registers is the cap of a 512-thread block) and keeps 24 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
-generate_ds41   ds41_attn_seg                            0          24
+generate_ds41   ds41_attn_seg                            0          0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives ds41_attn_seg_sel 128 registers (128 registers is the cap of a 512-thread block) and keeps 24 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
-generate_ds41   ds41_attn_seg_sel                        0          24
+generate_ds41   ds41_attn_seg_sel                        0          0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives ds41_attn_seg_sel_stage 128 registers (128 registers is the cap of a 512-thread block) and keeps 32 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
-generate_ds41   ds41_attn_seg_sel_stage                  0          32
+generate_ds41   ds41_attn_seg_sel_stage                  0          0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives ds41_attn_seg_stage 128 registers (128 registers is the cap of a 512-thread block) and keeps 16 bytes a thread in local memory, where the cc 8.6 JIT keeps 8 (tools/ref/ptx-shapes.tsv); ptxas spills 8 bytes at sm_86, as on cc 8.6.
-generate_ds41   ds41_attn_seg_stage                      8          16
+generate_ds41   ds41_attn_seg_stage                      0          0
 generate_ds41   ds41_card_gather                         0           0
 generate_ds41   ds41_card_gather_8                       0           0
 generate_ds41   ds41_comp_pool                           0           0
@@ -67,7 +69,7 @@ generate_ds41   engram_key_norm                          0           0
 generate_ds41   ds41_expert_gate_up                      0           0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives ds41_expert_gate_up_tiles 48 registers (.minnctapersm 5: 5 blocks of 256 threads an SM) and keeps 144 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
 # PIN(2026-10-26): cc 12.1 JIT local 144 -> 152 B, spill unchanged at 0 B (sm_86 ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
-generate_ds41   ds41_expert_gate_up_tiles                0         152
+generate_ds41   ds41_expert_gate_up_tiles                0         144
 generate_ds41   ds41_ffn_card_acc                        0           0
 generate_ds41   ds41_ffn_card_acc_10                     0           0
 # PIN(2026-11-05): ds41_ffn_card_acc_16 and ds41_ffn_card_acc_2, new entries, at 0 spill and 0 JIT local bytes [derived: the sm_86 cc 8.6 scan's 0/0 (tools/ref/ptx-shapes.tsv): the same body as ds41_ffn_card_acc_4 at other slot counts], until a scan on this table's arch and capability.
@@ -161,13 +163,13 @@ generate_ds41   f32_gemv                                 0           0
 generate_ds41   f32_tile_gemm                            0           0
 generate_ds41   flash_latent                             0           0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives flash_latent_mma 128 registers (128 registers is the cap of a 512-thread block) and keeps 8 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
-generate_ds41   flash_latent_mma                         0           8
+generate_ds41   flash_latent_mma                         0           0
 # PIN(2026-11-02): flash_latent_mma_sel shares flash_latent_mma's body (the same walk macro or row body, a per-token key list or row position), pinned at flash_latent_mma's cc 12.1 value here (0 spill, 8 JIT local) until a cc 12.1 scan runs; sm_86 measured 0/0.
-generate_ds41   flash_latent_mma_sel                     0           8
+generate_ds41   flash_latent_mma_sel                     0           0
 # PIN(2026-11-18): flash_latent_mma_win (a ring row) and flash_latent_mma_win_stage (below, a ring-or-staging row), the sink, window and ring-commit forms of the latent walk (crates/gpu/src/flash.rs): 0 spill measured on sm_86 by the ptx-compare scan of the hy4r2a tree (ptxas 13.3.73); 8 JIT local as that scan's cc 12.0 JIT read and flash_latent_mma_sel's cc 12.1 value here, not measured on cc 12.1 until a scan on it runs.
-generate_ds41   flash_latent_mma_win                     0           8
+generate_ds41   flash_latent_mma_win                     0           0
 # PIN(2026-11-18): flash_latent_mma_win_stage, the staged form of flash_latent_mma_win above: the same measurement and values.
-generate_ds41   flash_latent_mma_win_stage               0           8
+generate_ds41   flash_latent_mma_win_stage               0           0
 generate_ds41   flash_latent_q8                          0           0
 generate_ds41   flash_merge                              0           0
 # PIN(2026-11-02): flash_merge_sel shares flash_merge's body (the same walk macro or row body, a per-token key list or row position), pinned at flash_merge's cc 12.1 value here (0 spill, 0 JIT local) until a cc 12.1 scan runs; sm_86 measured 0/0.
@@ -211,9 +213,10 @@ generate_ds41   gdn_norm_gate_q128                       0           0
 generate_ds41   gdn_norm_gate_q32                        0           0
 generate_ds41   geglu_tanh                               0           0
 # PIN(2026-10-23): ptxas at sm_86 and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1, on the F32 GEMM epilogue whose exact walk runs only for a tile that leaves the F32 range.
-generate_ds41   gemm_iq3s                                8          16
+generate_ds41   gemm_iq3s                                0          8
 # PIN(2026-10-23): ptxas at sm_86 and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1, on the F32 GEMM epilogue whose exact walk runs only for a tile that leaves the F32 range.
-generate_ds41   gemm_iq3xxs                             16           0
+# PIN(2026-11-23): gemm_iq3xxs spill 0 B unchanged, JIT local 0 -> 8 B: the llc `--nvptx-short-ptr` of the cuda-oxide pin move (#1661) alone moves it: on the 5090 the stage replay without it returns the old spill and the frontend and opt stages change nothing (pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B: none (no whole-card model on the A/B runs this kernel's pass; the effect is not measured) (pinab round).
+generate_ds41   gemm_iq3xxs                             0           8
 generate_ds41   gemm_iq4nl               0  0
 generate_ds41   gemm_iq4nl_bf16          0  0
 generate_ds41   gemm_iq4xs               0  0
@@ -222,29 +225,36 @@ generate_ds41   gemm_iq4xs_bf16                          0           0
 # PIN(2026-10-23): ptxas at sm_86 and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1, on the F32 GEMM epilogue whose exact walk runs only for a tile that leaves the F32 range.
 # PIN(2026-10-24): staged NVFP4 weights: 48 spill bytes at sm_86 (ptxas 13.3.73),
 # 32 local bytes in the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.
-generate_ds41   gemm_nvfp4p                             48          32
+# PIN(2026-11-23): gemm_nvfp4p spill 32 B unchanged, JIT local 32 -> 40 B: #1661's p3:32 datalayout in the opt stage adds 16 B and its llc `--nvptx-short-ptr` takes 8 B off on the 5090; the frontend changes nothing (pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B (RTX 5090, same lease, tree vs base): Inkling 2 Mini UD-Q4_K_XL P=512 +0.37 % +- 0.08, P=4096 +0.26 % +- 0.03 (14 rounds); official folder P=512 +0.45 % +- 0.09, P=4096 +0.26 % +- 0.03 (10 rounds): the pass is faster, so the row stands (pinab round).
+generate_ds41   gemm_nvfp4p                             32          40
 # PIN(2026-11-01): gemm_nvfp4p_bf16 at gemm_nvfp4p's values, its body with the BF16 store, until a scan on this table's arch and capability.
-generate_ds41   gemm_nvfp4p_bf16                        48          32
+# PIN(2026-11-23): gemm_nvfp4p_bf16 spill 32 B unchanged, JIT local 32 -> 40 B: #1661's p3:32 datalayout in the opt stage adds 16 B and its llc `--nvptx-short-ptr` takes 8 B off on the 5090; the frontend changes nothing (pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B (RTX 5090, same lease, tree vs base): Inkling 2 Mini UD-Q4_K_XL P=512 +0.37 % +- 0.08, P=4096 +0.26 % +- 0.03 (14 rounds); official folder P=512 +0.45 % +- 0.09, P=4096 +0.26 % +- 0.03 (10 rounds): the pass is faster, so the row stands (pinab round).
+generate_ds41   gemm_nvfp4p_bf16                        32          40
 # PIN(2026-10-24): fused SwiGLU: 0 spill bytes at sm_86 (ptxas 13.3.73),
 # 64 local bytes in the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.
-generate_ds41   gemm_nvfp4p_swiglu                       0          64
+generate_ds41   gemm_nvfp4p_swiglu                       0          32
 # PIN(2026-11-14): gemm_q2_0 and gemm_q2_0_bf16: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned (the sm_86 cc 8.6 scan reads 0/0), not a measured no-spill claim.
 generate_ds41   gemm_q2_0                                0           0
 generate_ds41   gemm_q2_0_bf16                           0           0
 generate_ds41   gemm_q3k                                 0           0
 generate_ds41   gemm_q3k_bf16                            0           0
-generate_ds41   gemm_q4k                                 0           0
-generate_ds41   gemm_q4k_bf16                            0           0
+# PIN(2026-11-23): gemm_q4k spill 0 -> 32 B, JIT local 0 B unchanged: the llc `--nvptx-short-ptr` of the cuda-oxide pin move (#1661) alone adds the spill (pinspill round, sm_86 ptxas with and without it) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B: none (Ampere prefill; no Ampere card on the box, the derived effect and its measurement are in the pinab report) (pinab round).
+generate_ds41   gemm_q4k                                32           0
+# PIN(2026-11-23): gemm_q4k_bf16 spill 0 -> 48 B, JIT local 0 B unchanged: the llc `--nvptx-short-ptr` of the cuda-oxide pin move (#1661) alone adds the spill (pinspill round, sm_86 ptxas with and without it) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B: none (Ampere prefill; no Ampere card on the box, the derived effect and its measurement are in the pinab report) (pinab round).
+generate_ds41   gemm_q4k_bf16                           48           0
 # PIN(2026-11-02): gemm_q4k_swiglu: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
-generate_ds41   gemm_q4k_swiglu                          0           0
+# PIN(2026-11-23): gemm_q4k_swiglu spill 0 B unchanged, JIT local 0 -> 72 B: the pin was the unmeasured strict 0/0 of 2026-11-02, so this is the table's first reading of the row on this arch; the same PTX on sm_121a reads 64 -> 72 with the pin move, so the rise is derived from that, not scanned at the base JIT local bytes (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B: none (the kernel runs only in a host-tier pass, Qwen3.8-Flash-Next's card+CPU prompt, derived at about 1 % of a host-bound pass, so an effect of 0; a per-kernel nsys of that pass would measure it) (pinab round).
+generate_ds41   gemm_q4k_swiglu                          0          72
 generate_ds41   gemm_q5_1                                0           0
 generate_ds41   gemm_q5_1_bf16                           0           0
 generate_ds41   gemm_q5k                                 0           0
 generate_ds41   gemm_q5k_bf16                            0           0
 # PIN(2026-10-23): ptxas at sm_86 and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1, on the F32 GEMM epilogue whose exact walk runs only for a tile that leaves the F32 range.
-generate_ds41   gemm_q6k                                 0          64
+# PIN(2026-11-23): gemm_q6k spill 0 B unchanged, JIT local 64 -> 72 B: the llc `--nvptx-short-ptr` of the cuda-oxide pin move (#1661) alone moves it: on the 5090 the stage replay without it returns the old spill and the frontend and opt stages change nothing (pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B (RTX 5090, same lease, tree vs base, 10 rounds): Qwen3.8-27B Q4_K_M P=512 +0.95 % +- 0.13, P=4096 +0.85 % +- 0.16: the pass is faster, so the row stands; the pin move's other changes in that pass are not separated from this kernel's (pinab round).
+generate_ds41   gemm_q6k                                 0          72
 # PIN(2026-11-01): gemm_q6k_bf16 at gemm_q6k's values, its body with the BF16 store, until a scan on this table's arch and capability.
-generate_ds41   gemm_q6k_bf16                            0          64
+# PIN(2026-11-23): gemm_q6k_bf16 spill 0 B unchanged, JIT local 64 -> 72 B: the llc `--nvptx-short-ptr` of the cuda-oxide pin move (#1661) alone moves it: on the 5090 the stage replay without it returns the old spill and the frontend and opt stages change nothing (pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B (RTX 5090, same lease, tree vs base, 10 rounds): Qwen3.8-27B Q4_K_M P=512 +0.95 % +- 0.13, P=4096 +0.85 % +- 0.16: the pass is faster, so the row stands; the pin move's other changes in that pass are not separated from this kernel's (pinab round).
+generate_ds41   gemm_q6k_bf16                            0          72
 generate_ds41   gemm_q8_0f                               0           0
 generate_ds41   gemm_q8_0f_bf16                          0           0
 generate_ds41   gemm_q8_0p                               0           0
@@ -252,7 +262,8 @@ generate_ds41   gemm_q8_0p_bf16                          0           0
 generate_ds41   gemm_q8_0p_slab                          0           0
 generate_ds41   gemm_q8_0p_slab_bf16                     0           0
 # PIN(2026-11-02): gemm_q8_0p_slab_swiglu_all: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
-generate_ds41   gemm_q8_0p_slab_swiglu_all               0           0
+# PIN(2026-11-23): gemm_q8_0p_slab_swiglu_all spill 0 B unchanged, JIT local 0 -> 32 B: the pin was the unmeasured strict 0/0 of 2026-11-02, so this is the table's first reading of the row on this arch; the same PTX on sm_121a reads 8 -> 32 with the pin move, so the rise is derived from that, not scanned at the base JIT local bytes (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B: none (no whole-card model on the A/B runs this kernel's pass; the effect is not measured) (pinab round).
+generate_ds41   gemm_q8_0p_slab_swiglu_all               0          32
 # PIN(2026-11-02): gemm_q8_0p_swiglu_all: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
 generate_ds41   gemm_q8_0p_swiglu_all                    0           0
 generate_ds41   gemm_route                               0           0
@@ -273,7 +284,7 @@ generate_ds41   gqa_flash_seg_256_p2                     0           0
 generate_ds41   gqa_flash_seg_256_p4                     0           0
 generate_ds41   gqa_flash_seg_k192                       0           0
 # PIN(2026-10-14): on cc 12.1 the driver JIT gives gqa_flash_seg_k192_ring 80 registers (no register bound in the PTX) and keeps 8 bytes a thread in local memory, where the cc 8.6 JIT keeps 0 (tools/ref/ptx-shapes.tsv).
-generate_ds41   gqa_flash_seg_k192_ring                  0           8
+generate_ds41   gqa_flash_seg_k192_ring                  0           0
 generate_ds41   gqa_flash_seg_mma                        0           0
 generate_ds41   gqa_flash_seg_mma_256                    0           0
 generate_ds41   gqa_flash_seg_mma_256_p12_sel            0           0
@@ -339,13 +350,15 @@ generate_ds41   hc_gated_up_mix_bf16_1col                0           0
 # PIN(2026-10-26): spill 608 -> 536 B, cc 12.1 JIT local unchanged at 88 B (sm_86 ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
 # PIN(2026-10-28): spill 536 -> 528 B, JIT local 88 -> 64 B (ptxas 13.3.73 sm_86, cc 12.1 JIT on GB10 driver 595.84): the mix reads the normed
 # streams as BF16 words, not F32 values.
-generate_ds41   hc_gated_up_mma_mix_4                  528          64
+# PIN(2026-11-23): hc_gated_up_mma_mix_4 spill 528 -> 788 B, JIT local 24 B unchanged: the pin of 528 is stale since 2026-11-01: the base (main 0f59b0095) reads 752 on the box's sm_86 scan, and the pin move adds 36 (+4 frontend, +32 `--nvptx-short-ptr` #1661, pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round).
+generate_ds41   hc_gated_up_mma_mix_4                  788          24
 # PIN(2026-10-25): the HC up/mix that also writes mixed's BF16 form, spill and GB10 JIT local measured with
 # ptxas 13.3.73, driver 595.84, sm_86.
 # PIN(2026-10-26): spill 676 -> 628 B, cc 12.1 JIT local unchanged at 88 B (sm_86 ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
 # PIN(2026-10-28): JIT local 88 -> 56 B, spill unchanged at 628 (ptxas 13.3.73 sm_86, cc 12.1 JIT on GB10 driver 595.84): the mix reads the normed
 # streams as BF16 words, not F32 values.
-generate_ds41   hc_gated_up_mma_mix_4_bf16             628          56
+# PIN(2026-11-23): hc_gated_up_mma_mix_4_bf16 spill 628 -> 832 B, JIT local 24 B unchanged: the pin of 628 is stale since 2026-11-01: the base (main 0f59b0095) reads 832 on the box's sm_86 scan and the pin move leaves it there (pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round).
+generate_ds41   hc_gated_up_mma_mix_4_bf16             832          24
 generate_ds41   hc_gated_up_mix_bf16_4x320               0           0
 generate_ds41   hc_pre_q8_0                              0           0
 generate_ds41   head_norm_neox_append                    0           0
@@ -414,7 +427,7 @@ generate_ds41   mxfp4_gemv_sel                           0           0
 generate_ds41   mxfp8_gemv                               0           0
 # PIN(2026-10-23): measured spill and JIT local bytes with ptxas 13.3.73, sm_86, GB10 cc 12.1, driver 595.84.
 # PIN(2026-10-26): spill 28 -> 60 B, cc 12.1 JIT local unchanged at 0 B (sm_86 ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
-generate_ds41   mxfp8_gemv_ids                          60           0
+generate_ds41   mxfp8_gemv_ids                          16           0
 generate_ds41   mxfp8_gemv_mcol                          0           0
 # PIN(2026-10-27): mxfp8_gemv_mcol_staged, a new entry, at the sm_121a GB10 scan's 0 spill and 0 JIT local bytes.
 generate_ds41   mxfp8_gemv_mcol_staged                   0           0
@@ -531,15 +544,16 @@ generate_ds41   qwen3moe_o_resid_q4k                     0           0
 generate_ds41   qwen3moe_o_resid_q4k_mcol                0           0
 generate_ds41   qwen3moe_o_resid_q4k_prefetch            0           0
 generate_ds41   qwen3moe_qkv_q4k                         0           0
-generate_ds41   qwen3moe_qkv_q4k_mcol                    0           0
+# PIN(2026-11-23): qwen3moe_qkv_q4k_mcol spill 0 -> 24 B, JIT local 0 B unchanged: the base reads 24 B too (pinspill round, the box's sm_86 scan of main 0f59b0095): the pin move does not move it and the 2026-10 pin of 0 does not reproduce, so this is a stale pin, not a rise (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round).
+generate_ds41   qwen3moe_qkv_q4k_mcol                   24           0
 generate_ds41   qwen3moe_qkv_q4k_prefetch                0           0
 generate_ds41   qwen3moe_qkv_q4k_q6k                     0           0
 generate_ds41   softmax_router_fused                    0           0
 generate_ds41   softmax_router_logits                   0           0
 generate_ds41   softmax_router_norm                     0           0
 # PIN(2026-10-26): softmax_router_norm_m and softmax_router_norm_m_prefetch: cc 12.1 JIT local 0 -> 8 B each, spill unchanged at 0 B (sm_86 ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
-generate_ds41   softmax_router_norm_m                   0           8
-generate_ds41   softmax_router_norm_m_prefetch          0           8
+generate_ds41   softmax_router_norm_m                   0           0
+generate_ds41   softmax_router_norm_m_prefetch          0           0
 generate_ds41   softmax_router_norm_prefetch            0           0
 generate_ds41   softmax_router_route                    0           0
 generate_ds41   token_major                              0           0
@@ -627,7 +641,8 @@ generate_ds41     iq2_xxs_rows                                 0           0
 generate_ds41     mamba2_norm_rows                             0           0
 generate_ds41     mamba2_ring_tail                             0           0
 generate_ds41     mamba2_step                                  0           0
-generate_ds41     mamba2_steps                                 0           0
+# PIN(2026-11-23): mamba2_steps spill 0 B unchanged, JIT local 0 -> 16 B: the PTX the llc `--nvptx-short-ptr` of #1661 writes takes 71 registers in ptxas against 69 without it, and the JIT keeps 16 B of local; the spill stays 0 (pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B: none (no whole-card model on the A/B runs this kernel's pass; the effect is not measured) (pinab round).
+generate_ds41     mamba2_steps                                 0          16
 generate_ds41     nemotron_moe_router_240                      0           0
 generate_ds41     nemotron_moe_router_240_pick                 0           0
 generate_ds41     nemotron_moe_router_304                      0           0
@@ -677,7 +692,8 @@ generate_ds41   swiglu_rule_rows                         0           0
 generate_ds41   gemm_iq1m                                0           0
 generate_ds41   gemm_iq1s                                0           0
 # PIN(2026-10-26): ptxas at sm_86 and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1, on the F32 GEMM epilogue whose exact walk runs only for a tile that leaves the F32 range.
-generate_ds41   gemm_iq2s                                0           8
+# PIN(2026-11-23): gemm_iq2s spill 0 B unchanged, JIT local 8 -> 16 B: the llc `--nvptx-short-ptr` of the cuda-oxide pin move (#1661) alone moves it: on the 5090 the stage replay without it returns the old spill and the frontend and opt stages change nothing (pinspill round) (ptxas 13.3.73 sm_86, GB10 cc 12.1 JIT, driver 580.178.04, pinab round). pp A/B: none (no whole-card model on the A/B runs this kernel's pass; the effect is not measured) (pinab round).
+generate_ds41   gemm_iq2s                                0          16
 generate_ds41   gemm_iq2xs                               0           0
 generate_ds41   iq1_m_gate_up_sel                        0           0
 generate_ds41   iq1_m_gemv_sel                           0           0
@@ -696,7 +712,7 @@ generate_ds41   gqa_flash_seg_mma_g7                     0           0
 generate_ds41   gqa_flash_seg_mma_g7_q8                  0           0
 generate_ds41   gqa_prefill_flash_g7                     0           0
 # PIN(2026-10-26): cc 12.1 JIT local 0 -> 80 B, spill unchanged at 0 B (sm_86 ptxas 13.3.73, cc 12.1 JIT on GB10 driver 595.84, gate-ptx-spill). cuda-oxide moved from the fork's rev to NVIDIA/cuda-rust 9df9e7cef561 (stable 1.99.1), and the entry's PTX moved with it.
-generate_ds41   gqa_prefill_flash_g7_q8                  0          80
+generate_ds41   gqa_prefill_flash_g7_q8                  0          0
 generate_ds41   rope_norm_append                         0           0
 generate_ds41   rope_norm_append_q8                      0           0
 # PIN(2026-10-27): Flint's entries (gqa_flash_merge_h128_swa_ring, gqa_flash_seg_h128_swa_ring, head_norm_neox_append_ring, normalize, qk_rms_append_ring, restore, routed_shared_residual, sigmoid_floor_256_6_router, sigmoid_floor_256_6_router_pick) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv), not measured on cc 12.1, until a GB10 scan runs.
@@ -715,7 +731,7 @@ generate_ds41   sigmoid_floor_256_6_router_pick          0           0
 generate_ds41 attn_res_mix 0 0
 # PIN(2026-11-07): the IQ1_S/IQ2_XXS card quantizer's three entries (iq_quant_finish, iq_quant_subs, iq_src_f32) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill; JIT local 280, 1096, 0 B), not measured on cc 12.1 (the table's card) until a GB10 scan runs.
 generate_ds41 iq_quant_finish 0 280
-generate_ds41 iq_quant_subs 0 1096
+generate_ds41 iq_quant_subs 0 1080
 # PIN(2026-11-08): the importance collector's two entries (imat_dense_sum2, imat_routed_sum2, crates/gpu/src/imatrix.rs) at the cc 8.6 scan's values (tools/ref/ptx-shapes.tsv, ptxas 13.3.73 sm_86: 0 spill, 0 B JIT local), not measured on cc 12.1 (the table's card) until a GB10 scan runs.
 generate_ds41 imat_dense_sum2 0 0
 generate_ds41 imat_routed_sum2 0 0
@@ -770,7 +786,7 @@ generate_ds41   sigmoid_384_8_router_pick                0           0
 generate_ds41   dspark_fuse                              0           0
 generate_ds41   dspark_g3_merge                          0           0
 # PIN(2026-11-23): dspark_g3_seg (crates/gpu/src/dspark/block_attn.rs): 0 B spill on sm_86 and 24 B JIT local at cc 12.1, measured on the DGX Spark (GB10, driver 580.178.04, ptxas 13.3.73).
-generate_ds41   dspark_g3_seg                            0          24
+generate_ds41   dspark_g3_seg                            0          0
 generate_ds41   dspark_kv_put                            0           0
 generate_ds41   dspark_rnn_add_cap                       0           0
 generate_ds41   dspark_rnn_input_anchor                  0           0
