@@ -408,3 +408,350 @@ ROUTED_APART_PAIR(q4k_apart_q8_0, Q4K, block_q4_K, Q8_0, block_q8_0)
 ROUTED_APART_PAIR(q5k_apart_q8_0, Q5K, block_q5_K, Q8_0, block_q8_0)
 ROUTED_APART_PLAIN(q5k_apart_q8_0, Q5K, block_q5_K, Q8_0, block_q8_0)
 ROUTED_APART_PLAIN(q6k_apart_q8_0, Q6K, block_q6_K, Q8_0, block_q8_0)
+
+// Inkling 2's grouped experts over a pass's route table, the scaled pair and
+// plain tiles of its two stack forms:
+//
+//   gemm_routed_ink2_{nv4r,mx8r}_{pair,plain}_f16
+//
+//   pair     y[p][o] = situ(s_e (gate_e[o] . x), s_e (up_e[o] . x)), the
+//            stack's gate rows then its up rows in one tensor (the fused
+//            w13 the load interleaved), s_e the expert's global scale
+//   plain    y[p][n] = (down_e[n] . x[p]) * (s_e * w[p]), the step's scale
+//            of a routed down's finished dot
+//
+// NV4R is the MLX folder's NVFP4 rows (9 bytes a 16-value group: the UE4M3
+// scale byte, then 8 code bytes, value 2i the low nibble of byte i), MX8R its
+// MXFP8 coda rows (33 bytes a 32-value group: the E8M0 scale byte, then 32
+// E4M3 codes). Both decode exactly into half: an E2M1 code times a UE4M3
+// half-scale is at most 7 significant bits inside half's normal range, and
+// an E4M3 code times a power of two loses only what falls under half's
+// subnormal step (2^-25 of absolute error a weight). The decode is
+// nvfp4.metal's rule restated here, since this file comes before it; the
+// tile body is the routed tile's, its epilogue the scale and the SITU.
+//
+// No silent failure: a scale byte that is none decodes NaN; a pair or plain
+// output that is not finite raises the product site and is stored NaN.
+
+#pragma METAL fp contract(off)
+
+// The E2M1 significand table, doubled (nvfp4.metal's NV_KVALUES).
+static constant float RT_E2M1[16] = {
+    0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f,
+    0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f,
+};
+
+// `ue4m3(b) / 2`, NaN for a byte that is none (nvfp4.metal's nvfp4_scale_half).
+inline float rt_ue4m3_half(uint b) {
+    if ((b & 0x80u) != 0u || b == 0x7fu) {
+        return NAN;
+    }
+    const uint exp = b >> 3;
+    const float man = float(b & 7u);
+    const float raw = exp == 0u ? man * exp2(-9.0f) : (1.0f + man / 8.0f) * exp2(float(exp) - 7.0f);
+    return 0.5f * raw;
+}
+
+// The value of E4M3 code `c`, NaN for the two NaN codes (nvfp4.metal's mxfp8_e4m3).
+inline float rt_e4m3(uint c) {
+    const uint mag = c & 0x7fu;
+    if (mag == 0x7Fu) {
+        return NAN;
+    }
+    const uint exp = mag >> 3;
+    const float man = float(mag & 7u);
+    const float v = exp == 0u ? man * exp2(-9.0f) : (1.0f + man / 8.0f) * exp2(float(exp) - 7.0f);
+    return (c & 0x80u) != 0u ? -v : v;
+}
+
+// The SITU activation (situ.metal's pair_situ, this order the gate).
+inline float rt_situ(float gate, float up, float gate_beta, float value_beta) {
+    const float g = tanh(gate / gate_beta) * gate_beta * (1.0f / (1.0f + exp(-gate)));
+    const float u = tanh(up / value_beta) * value_beta;
+    return g * u;
+}
+
+struct block_nv4r {
+    uint8_t s;
+    uint8_t q[8];
+};
+
+static_assert(sizeof(block_nv4r) == 9, "an NVFP4 row group is 9 bytes");
+
+struct block_mx8r {
+    uint8_t e;
+    uint8_t q[32];
+};
+
+static_assert(sizeof(block_mx8r) == 33, "an MXFP8 row group is 33 bytes");
+
+struct NV4R {
+    typedef block_nv4r Block;
+
+    static inline int values_per_block() {
+        return 16;
+    }
+
+    template <typename T>
+    static inline void dequant16(device const Block & blk,
+                                 short il,
+                                 thread matrix<T, 4, 4> & reg) {
+        const float s = rt_ue4m3_half(uint(blk.s));
+        FOR_UNROLL(short i = 0; i < 8; ++i) {
+            const uint byte = uint(blk.q[i]);
+            reg[(2 * i) / 4][(2 * i) % 4] = (T)(RT_E2M1[byte & 0x0fu] * s);
+            reg[(2 * i + 1) / 4][(2 * i + 1) % 4] = (T)(RT_E2M1[byte >> 4u] * s);
+        }
+    }
+};
+
+struct MX8R {
+    typedef block_mx8r Block;
+
+    static inline int values_per_block() {
+        return 32;
+    }
+
+    template <typename T>
+    static inline void dequant16(device const Block & blk,
+                                 short il,
+                                 thread matrix<T, 4, 4> & reg) {
+        const uint sb = uint(blk.e);
+        // E8M0: 2^(e - 127), the bias added as its negation (the same exact
+        // sum), so the text is the tile's own and not the mat-vec's.
+        const float s = sb == 0xffu ? NAN : exp2(float(sb) + (-127.0f));
+        FOR_UNROLL(short i = 0; i < 16; ++i) {
+            reg[i / 4][i % 4] = (T)(rt_e4m3(uint(blk.q[16 * il + i])) * s);
+        }
+    }
+};
+
+// The scaled tiles' second argument block.
+struct Ink2RoutedArgs {
+    float gate_beta;
+    float value_beta;
+    uint per_row;     // slots a pass row holds: the gather's divisor
+    uint pad;
+};
+
+static_assert(sizeof(Ink2RoutedArgs) == 16, "Ink2RoutedArgs is four words");
+
+// The routed tile (routed_tile's K loop and staging, unchanged) with the
+// scaled epilogue: the expert's scale, then SITU on the pair, the scale
+// times the slot's route weight on the plain tile.
+template <typename Q, typename T, bool PAIR, short NA>
+inline void ink2_routed_tile(threadgroup T                  * sa,
+                             threadgroup T                  * sb,
+                             device const typename Q::Block * a_src,
+                             threadgroup vec<T, 4>          * a_dst,
+                             short                            a_koff,
+                             device const float             * b_src,
+                             threadgroup vec<T, 4>          * b_dst,
+                             short                            count,
+                             uint                             first,
+                             uint                             r0,
+                             device float                   * y,
+                             device const uint              * sorted,
+                             device const float             * route_w,
+                             float                            s_e,
+                             constant RoutedArgs            & args,
+                             constant Ink2RoutedArgs        & iargs,
+                             device atomic_uint             * faults,
+                             ushort                           tiitg,
+                             ushort                           sgitg,
+                             ushort                           tiisg) {
+    constexpr int BK = gemm_bk<T>();
+    constexpr int LDA = gemm_lda<T>();
+    const bool b_stage = (short)(tiitg / 2) < NA * 8;
+
+    const short qid = (short)(tiisg >> 2);
+    const short fm = (qid & 4) + ((tiisg >> 1) & 3);
+    const short fn = ((qid & 2) << 1) + ((tiisg & 1) << 1);
+    const short gn = 16 * (short)sgitg;
+
+    threadgroup const T * arow[NA];
+    threadgroup const T * brow[ROUTED_FRAGS_W];
+    FOR_UNROLL(short i = 0; i < NA; ++i) {
+        arow[i] = sb + fn + (8 * i + fm) * LDA;
+    }
+    FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W; ++j) {
+        brow[j] = sa + (gn + 8 * j + fn) * LDA + fm;
+    }
+
+    vec<float, 2> c[NA][ROUTED_FRAGS_W];
+    FOR_UNROLL(short i = 0; i < NA; ++i) {
+        FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W; ++j) {
+            c[i][j] = vec<float, 2>(0.f);
+        }
+    }
+
+    for (int k0 = 0; k0 < (int)args.cols; k0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (b_stage) {
+            device const float * xr = b_src + k0;
+            gemm_stage_x<T>(xr, b_dst, faults, args.layer);
+        }
+        {
+            const int pos = k0 + a_koff;
+            const int ib = pos / Q::values_per_block();
+            const short il = (short)((pos / 16) % (Q::values_per_block() / 16));
+            matrix<T, 4, 4> reg;
+            Q::template dequant16<T>(a_src[ib], il, reg);
+            FOR_UNROLL(short i = 0; i < 4; ++i) {
+                a_dst[i] = vec<T, 4>(reg[i][0], reg[i][1], reg[i][2], reg[i][3]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (short kk = 0; kk < BK; kk += 8) {
+            simdgroup_barrier(mem_flags::mem_none);
+            vec<half, 2> ah[NA];
+            vec<half, 2> bh[ROUTED_FRAGS_W];
+            FOR_UNROLL(short i = 0; i < NA; ++i) {
+                ah[i] = *(threadgroup const vec<half, 2> *)(arow[i] + kk);
+            }
+            FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W; ++j) {
+                threadgroup const T *w = brow[j];
+                bh[j] = vec<half, 2>(w[kk], w[LDA + kk]);
+            }
+            simdgroup_barrier(mem_flags::mem_none);
+            FOR_UNROLL(short m = 0; m < NA; ++m) {
+                FOR_UNROLL(short n = 0; n < ROUTED_FRAGS_W; ++n) {
+                    const short ns = (m % 2) ? ROUTED_FRAGS_W - 1 - n : n;
+                    frag_mma_half(c[m][ns], ah[m], bh[ns], c[m][ns]);
+                }
+            }
+        }
+    }
+
+    bool bad = false;
+    FOR_UNROLL(short i = 0; i < NA; ++i) {
+        const short m = 8 * i + fm;
+        if (m >= count) {
+            continue;
+        }
+        const uint place = first + (uint)m;
+        device float * p = y + (ulong)place * args.y_stride;
+        if (PAIR) {
+            const uint o = r0 + (uint)(8 * sgitg + fn);
+            const float h0 = rt_situ(c[i][0].x * s_e, c[i][1].x * s_e, iargs.gate_beta, iargs.value_beta);
+            const float h1 = rt_situ(c[i][0].y * s_e, c[i][1].y * s_e, iargs.gate_beta, iargs.value_beta);
+            bad = bad || !isfinite(h0) || !isfinite(h1);
+            p[o] = isfinite(h0) ? h0 : NAN;
+            p[o + 1] = isfinite(h1) ? h1 : NAN;
+        } else {
+            const float ws = s_e * route_w[sorted[place]];
+            FOR_UNROLL(short j = 0; j < ROUTED_FRAGS_W; ++j) {
+                const uint n = r0 + (uint)(gn + 8 * j + fn);
+                const float d0 = c[i][j].x * ws;
+                const float d1 = c[i][j].y * ws;
+                bad = bad || !isfinite(d0) || !isfinite(d1);
+                p[n] = isfinite(d0) ? d0 : NAN;
+                p[n + 1] = isfinite(d1) ? d1 : NAN;
+            }
+        }
+    }
+    if (bad) {
+        raise(faults, args.layer, BLOOMERY_FAULT_SITE_F32_PRODUCT);
+    }
+}
+
+template <typename Q, typename T, bool PAIR>
+kernel void gemm_routed_ink2_kernel(device const typename Q::Block * W [[buffer(0)]],
+                                    device const float      * x [[buffer(1)]],
+                                    device float            * y [[buffer(2)]],
+                                    device const uint4      * tiles [[buffer(3)]],
+                                    device const uint       * sorted [[buffer(4)]],
+                                    device const float      * route_w [[buffer(5)]],
+                                    constant RoutedArgs     & args [[buffer(6)]],
+                                    device atomic_uint      * faults [[buffer(7)]],
+                                    device const float      * scales [[buffer(8)]],
+                                    constant Ink2RoutedArgs & iargs [[buffer(9)]],
+                                    uint2  tgpig [[threadgroup_position_in_grid]],
+                                    ushort tiitg [[thread_index_in_threadgroup]],
+                                    ushort sgitg [[simdgroup_index_in_threadgroup]],
+                                    ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup char shmem[routed_shmem_bytes<T>()];
+    constexpr int LDA = gemm_lda<T>();
+
+    if (tgpig.x >= tiles[0].x) {
+        return;
+    }
+    const uint4 tile = tiles[1 + tgpig.x];
+    const uint expert = tile.x;
+    const uint first = tile.y;
+    const short count = (short)tile.z;
+    if (expert >= args.n_experts || count < 1 || count > ROUTED_ACTS) {
+        if (tiitg == 0) {
+            raise(faults, args.layer, (BLOOMERY_FAULT_SITE_EXPERT_ID));
+        }
+        return;
+    }
+    const float s_e = scales[expert];
+    const uint r0 = tgpig.y * (PAIR ? ROUTED_ROWS / 2 : ROUTED_ROWS);
+    const uint nb = args.cols / (uint)Q::values_per_block();
+    device const typename Q::Block * wg = W + args.stack_blocks * (ulong)expert;
+    // The fused stack's up rows follow its gate rows.
+    device const typename Q::Block * wu = wg + (ulong)args.rows * nb;
+
+    threadgroup T * sa = (threadgroup T *)shmem;
+    threadgroup T * sb = sa + ROUTED_ROWS * LDA;
+
+    const short a_row = (short)(tiitg / 2);
+    const short a_koff = (short)((tiitg % 2) * 16);
+    device const typename Q::Block * a_src;
+    if (PAIR) {
+        const uint o = r0 + (uint)(8 * (a_row / 16) + a_row % 8);
+        a_src = ((a_row / 8) % 2 == 0 ? wg : wu) + (ulong)o * nb;
+    } else {
+        a_src = wg + (ulong)(r0 + a_row) * nb;
+    }
+    threadgroup vec<T, 4> * a_dst = (threadgroup vec<T, 4> *)(sa + a_row * LDA + a_koff);
+
+    const short b_row = (short)(tiitg / 2);
+    const uint b_place = first + (uint)min(b_row, (short)(count - 1));
+    const ulong src_row =
+        args.gather != 0u ? (ulong)(sorted[b_place] / iargs.per_row) : (ulong)b_place;
+    device const float * b_src = x + src_row * args.x_stride + a_koff;
+    threadgroup vec<T, 4> * b_dst = (threadgroup vec<T, 4> *)(sb + b_row * LDA + a_koff);
+
+    switch ((count + 7) >> 3) {
+#define INK2_ROUTED_CASE(NA)                                                              \
+    case NA:                                                                              \
+        ink2_routed_tile<Q, T, PAIR, NA>(sa, sb, a_src, a_dst, a_koff, b_src, b_dst,      \
+                                         count, first, r0, y, sorted, route_w, s_e, args, \
+                                         iargs, faults, tiitg, sgitg, tiisg);             \
+        break;
+        INK2_ROUTED_CASE(1)
+        INK2_ROUTED_CASE(2)
+        INK2_ROUTED_CASE(3)
+        INK2_ROUTED_CASE(4)
+        INK2_ROUTED_CASE(5)
+        INK2_ROUTED_CASE(6)
+        INK2_ROUTED_CASE(7)
+        INK2_ROUTED_CASE(8)
+#undef INK2_ROUTED_CASE
+    }
+}
+
+#define INK2_ROUTED_ENTRY(NAME, Q, BQ, PAIR)                                        \
+    template [[host_name("gemm_routed_ink2_" #NAME)]]                               \
+    kernel void gemm_routed_ink2_kernel<Q, half, PAIR>(                             \
+        device const BQ  * W [[buffer(0)]],                                         \
+        device const float      * x [[buffer(1)]],                                  \
+        device float            * y [[buffer(2)]],                                  \
+        device const uint4      * tiles [[buffer(3)]],                              \
+        device const uint       * sorted [[buffer(4)]],                             \
+        device const float      * route_w [[buffer(5)]],                            \
+        constant RoutedArgs     & args [[buffer(6)]],                               \
+        device atomic_uint      * faults [[buffer(7)]],                             \
+        device const float      * scales [[buffer(8)]],                             \
+        constant Ink2RoutedArgs & iargs [[buffer(9)]],                              \
+        uint2  tgpig [[threadgroup_position_in_grid]],                              \
+        ushort tiitg [[thread_index_in_threadgroup]],                               \
+        ushort sgitg [[simdgroup_index_in_threadgroup]],                            \
+        ushort tiisg [[thread_index_in_simdgroup]]);
+
+INK2_ROUTED_ENTRY(nv4r_pair_f16, NV4R, block_nv4r, true)
+INK2_ROUTED_ENTRY(nv4r_plain_f16, NV4R, block_nv4r, false)
+INK2_ROUTED_ENTRY(mx8r_pair_f16, MX8R, block_mx8r, true)
+INK2_ROUTED_ENTRY(mx8r_plain_f16, MX8R, block_mx8r, false)

@@ -54,17 +54,17 @@ use crate::kernels::{
 use crate::stream::{MetalStream, Recording};
 
 /// The query, key and relative rows' widths of a visit.
-const Q_ROWS: usize = 3072;
-const KV_ROWS: usize = 1024;
-const REL_ROWS: usize = 384;
+pub(super) const Q_ROWS: usize = 3072;
+pub(super) const KV_ROWS: usize = 1024;
+pub(super) const REL_ROWS: usize = 384;
 /// The heads of a windowless conv's dynamic taps, and the controllers' rank.
-const TAP_HEADS: usize = 8;
-const RANK: usize = 64;
+pub(super) const TAP_HEADS: usize = 8;
+pub(super) const RANK: usize = 64;
 /// The conv ring's channel bases: k, v, the attention's post-conv, the FFN's.
-const BASE_K: usize = 0;
-const BASE_V: usize = 1024;
-const BASE_ATTN: usize = 2048;
-const BASE_FFN: usize = 2048 + 2304;
+pub(super) const BASE_K: usize = 0;
+pub(super) const BASE_V: usize = 1024;
+pub(super) const BASE_ATTN: usize = 2048;
+pub(super) const BASE_FFN: usize = 2048 + 2304;
 
 /// Where a path's input lies.
 #[derive(Clone, Copy)]
@@ -96,7 +96,7 @@ pub struct Walk<'a> {
 }
 
 /// `len` elements of `b` from `at`.
-fn win<T: bloomery_device::Elem>(
+pub(super) fn win<T: bloomery_device::Elem>(
     b: &MetalBuffer<T>,
     at: usize,
     len: usize,
@@ -121,7 +121,7 @@ fn src<'b>(
 }
 
 /// The log-scaled position factor of a windowless visit's q and relative rows.
-fn tau(c: &Checked, pos: u32) -> f32 {
+pub(super) fn tau(c: &Checked, pos: u32) -> f32 {
     let ratio = (f64::from(pos) + 1.0) / f64::from(c.log_floor);
     (1.0 + f64::from(c.log_alpha) * ratio.max(1.0).ln()) as f32
 }
@@ -1065,5 +1065,13 @@ impl Walk<'_> {
         t(vi, Tap::FfnOut, &Self::read(&sc.moe_conv, 0, n)?);
         t(vi, Tap::LOut, &Self::read(&sc.rows, banks * n, n)?);
         Ok(())
+    }
+}
+
+impl Walk<'_> {
+    /// The embedded and normed row of `id` a prompt pass's row starts from:
+    /// the step's own.
+    pub(super) fn embedded(&self, id: u32) -> Result<Vec<f32>, SessionError> {
+        self.embed(id)
     }
 }

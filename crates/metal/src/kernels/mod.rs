@@ -48,6 +48,7 @@ mod conv_res;
 mod head;
 mod head_f32;
 mod headnorm;
+mod ink2_pass;
 mod inkling2;
 mod loop_control;
 mod matvec;
@@ -108,6 +109,10 @@ pub use geometry::{
 pub use head::{HEAD_K, HEAD_SIMD_GROUPS, HEAD_THREADS, HeadParams};
 pub use head_f32::HeadF32Params;
 pub use headnorm::HeadNormParams;
+pub use ink2_pass::{
+    CombineStoreParams, Ink2RoutedParams, Ink2TableParams, QkClipRowsParams, RelPrefillParams,
+    RouterRowsParams,
+};
 pub use loop_control::LoopControlParams;
 pub use matvec::{LoadNorm, MatvecParams, Mode, NormOnLoad, Quant};
 pub use matvec_mrows::{FEW_FRAGMENT, FEW_MAX, FEW_MIN, MatvecFewParams, few_path_ops};
@@ -251,6 +256,7 @@ pub struct Kernels {
     /// epilogue, the controller, the out gate, the NVFP4 mat-vec, the sigmoid
     /// router, the situ combine, the f32 head and the rel-bias flash.
     ink2: inkling2::Pipelines,
+    ink2_pass: ink2_pass::Pipelines,
     /// The pass's routing, grouped experts and row glue (`route.metal`,
     /// `gemm_routed.metal`).
     routed: routed::RoutedPipelines,
@@ -544,6 +550,7 @@ impl Kernels {
             bias_rows: library.pipeline("bias_rows")?,
             shortconv: shortconv::Pipelines::new(library)?,
             ink2: inkling2::Pipelines::new(library)?,
+            ink2_pass: ink2_pass::Pipelines::new(library)?,
             routed: routed::RoutedPipelines::new(library)?,
             experts: experts::Pipelines::new(library, count)?,
             matvec_rows: matvec_rows::Pipelines::new(library, count)?,

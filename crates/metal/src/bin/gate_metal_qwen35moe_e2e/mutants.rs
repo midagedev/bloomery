@@ -38,9 +38,12 @@
 //! bias add after P1, which the Llama row's layers have none of; Inkling 2's are [`INKLING2`],
 //! edits of the router's selection bias (`k_routes`), of the loop controllers' forget gate, the
 //! residual convs' taps and the MXFP8 coda's scale (`k_logits`) and of the head's pick
-//! (`k_greedy`); `k_visits`' and `k_room`'s defects are
-//! the host's (a walk of other visits, a buffer the plan does not count), one-off edits like the
-//! others above. The edits compile into
+//! (`k_greedy`), and of the prompt pass's own kernels: the grouped NVFP4 rows' decode, the SITU
+//! epilogue, the router over rows, the attention's sink (`k_pass`) and its window (`k_carry`);
+//! `k_visits`' and `k_room`'s defects are
+//! the host's (a walk of other visits, a buffer the plan does not count), as are the pass's own
+//! (a conv ring reset at a pass boundary, a route reused across visits, a ring of the window
+//! only), one-off edits like the others above. The edits compile into
 //! the row's own instance's source (`program::source_at`), so they land in the
 //! program the row runs.
 
@@ -510,5 +513,66 @@ pub const INKLING2: &[Mutant] = &[
         why: "an MXFP8 group's E8M0 scale reads its exponent one too high, so the MXFP8 coda's \
               every expert weight is doubled, which only an MLX folder's coda layer holds",
         edits: &[("exp2(float(sb) - 127.0f)", "exp2(float(sb) - 126.0f)", 1)],
+    },
+    Mutant {
+        name: "ink2_pass_mxfp8_scale_exp",
+        clause: "k_pass",
+        why: "the grouped tile's MXFP8 scale reads its exponent one too high, so the pass's coda \
+              experts are doubled while the step's mat-vec reads them right",
+        edits: &[(
+            "exp2(float(sb) + (-127.0f))",
+            "exp2(float(sb) + (-126.0f))",
+            1,
+        )],
+    },
+    Mutant {
+        name: "ink2_pass_nv4r_one_nibble",
+        clause: "k_pass",
+        why: "the grouped GEMM's NVFP4 rows decode both values of a code byte from its high \
+              nibble, so every expert weight of the pass's layers 0-19 is another",
+        edits: &[("RT_E2M1[byte & 0x0fu] * s", "RT_E2M1[byte >> 4u] * s", 1)],
+    },
+    Mutant {
+        name: "ink2_pass_situ_betas_swapped",
+        clause: "k_pass",
+        why: "the grouped pair's SITU epilogue takes the value softcap for the gate and the gate's \
+              for the value",
+        edits: &[(
+            "iargs.gate_beta, iargs.value_beta);",
+            "iargs.value_beta, iargs.gate_beta);",
+            2,
+        )],
+    },
+    Mutant {
+        name: "ink2_pass_router_bias_dropped",
+        clause: "k_pass",
+        why: "the router over rows selects by the sigmoid score alone, so the pass keeps other \
+              sets than mlx-lm's past the near-tie floor",
+        edits: &[(
+            "const float sel = score + bias[e];",
+            "const float sel = score;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "ink2_pass_sink_dropped",
+        clause: "k_pass",
+        why: "the attention over rows leaves each head's sink out of the softmax's denominator",
+        edits: &[(
+            "const float l = running_l * rescale + (sink > -INFINITY ? exp(sink - m) : 0.0f);",
+            "const float l = running_l * rescale;",
+            1,
+        )],
+    },
+    Mutant {
+        name: "ink2_pass_window_wide",
+        clause: "k_carry",
+        why: "a windowed visit's rows attend one key past the window, which only a row a window \
+              past the first key reads",
+        edits: &[(
+            "return args.window != 0u && live > args.window ? live - args.window : 0u;",
+            "return args.window != 0u && live > args.window + 1u ? live - args.window - 1u : 0u;",
+            1,
+        )],
     },
 ];

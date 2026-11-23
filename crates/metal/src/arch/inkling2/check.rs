@@ -724,7 +724,8 @@ impl Checked {
     }
 
     /// The bytes the open makes buffers of, by class, one [`Tally::add`] a
-    /// buffer the arena makes (`arena.rs`, in the same order).
+    /// buffer the arena makes (`arena.rs`, in the same order), and the prompt
+    /// pass's buffers as the rows (`pass.rs`).
     #[must_use]
     pub fn bytes(&self) -> Bytes {
         let n = self.hidden;
@@ -806,6 +807,7 @@ impl Checked {
             kv,
             state,
             scratch: s,
+            rows: super::pass::tally(self),
             ..Bytes::default()
         }
     }

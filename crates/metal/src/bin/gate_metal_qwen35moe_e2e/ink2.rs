@@ -33,6 +33,24 @@
 //!   ([`VISIT_LAYERS`]).
 //! - `k_room`: the open's device bytes are the plan's, to within a page a
 //!   buffer, and the room line the plan prints.
+//! - `k_pass`: the pin's ids as prompt passes (`Session::pass_routed`), each
+//!   ending at a held step and run on the walk's routing rule, against the
+//!   step walk's logits at the held steps, within twice the row's band (each
+//!   walk is within one band of the pin); the passes' own kept sets part from
+//!   mlx-lm's only under `k_routes`' floor.
+//! - `k_pass_pin`: the same passes' logits against the pin, by `k_logits`'s
+//!   measure and band.
+//! - `k_carry`: a prompt of the pin's ids repeated to 1,600 positions as five
+//!   passes ([`CARRY_ENDS`]: a pass boundary three rows past a full pass,
+//!   rows a window and more past the first key, a windowed visit's ring
+//!   wrapped), each visit's route recorded, against the steps of the same ids
+//!   at the recorded routes, at each pass's last row: the conv rings, the K
+//!   and V rows and the ring's window carried across the passes are the
+//!   steps'.
+//! - `k_serve`: the server's engine over the session (`serve.rs`), last, since
+//!   the engine takes the session: a prompt of the pin's ids repeated to 600
+//!   (two passes), a request extending it by the pin's first 20 ids, and one
+//!   sharing only the prompt.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -48,10 +66,20 @@ use bloomery_metal::session::room::PAGE;
 use model_hf::ModelFile;
 
 use super::mlx::{Pin, distance, parse_pin, pin_of};
-use super::{GATE, flag, mlx_split, mutants, row};
+use super::{GATE, flag, mlx_split, mutants, row, serve};
 
 /// The row's clauses, in the order they run.
-pub const NAMES: [&str; 5] = ["k_routes", "k_logits", "k_greedy", "k_visits", "k_room"];
+pub const NAMES: [&str; 9] = [
+    "k_routes",
+    "k_logits",
+    "k_greedy",
+    "k_visits",
+    "k_room",
+    "k_pass",
+    "k_pass_pin",
+    "k_carry",
+    "k_serve",
+];
 
 /// The experts a router call keeps.
 const TOP_K: usize = 8;
@@ -87,6 +115,11 @@ const GLOBAL_LAYERS: [usize; 2] = [5, 11];
 /// `n_layers_per_attn_res_block`: a stored layer whose id it divides closes a block onto the
 /// bank (`DecoderLayer.is_block_boundary`), so the visits 0, 6, 12, 18 and 24 do.
 const BLOCK: usize = 6;
+
+/// The ends of `k_carry`'s passes: a whole prompt batch, three rows across its boundary, two
+/// passes of a whole batch whose rows read keys a window back (the second's past the ring's first
+/// wrap, at 1,536 rows at [`CTX`]) and a tail.
+const CARRY_ENDS: [usize; 5] = [512, 515, 1027, 1539, 1600];
 
 /// The first visit of the second pass: the core's visits from it on merge the messages of the
 /// pass before (`_run_loop` hands a bank to every pass past the first), the visits 12 to 23.
@@ -201,6 +234,43 @@ struct Seen {
 /// Every node of the walk as it runs: the step, the visit, the kind and its values.
 type StepTaps<'a> = &'a mut dyn FnMut(usize, usize, Tap, &[f32]);
 
+/// One route of the walk: each kept id and its weight.
+type Route8 = ([u32; TOP_K], [f32; TOP_K]);
+
+/// One router call's route by the walk's rule: the session's own ids and weights where its kept
+/// set is mlx-lm's `r`, else mlx-lm's ids with the weights the session's own scores `probs` give
+/// them (route scale `scale`), and then the session's kept set, ascending, which parted.
+fn route_of(
+    r: &Route,
+    probs: &[f32],
+    kept: &[u32],
+    weights: &[f32],
+    scale: f32,
+) -> Result<(Route8, Option<Vec<u32>>), String> {
+    let mut ours = kept.to_vec();
+    ours.sort_unstable();
+    if ours == r.ids {
+        let ids = kept.try_into().map_err(|_| "a route of another width")?;
+        let w = weights.try_into().map_err(|_| "weights of another width")?;
+        return Ok(((ids, w), None));
+    }
+    let at = |e: u32| {
+        probs
+            .get(e as usize)
+            .copied()
+            .ok_or("an expert past the scores")
+    };
+    let mut sum = 0.0f32;
+    for &e in &r.ids {
+        sum += at(e)?;
+    }
+    let mut w = [0.0f32; TOP_K];
+    for (wi, &e) in w.iter_mut().zip(&r.ids) {
+        *wi = at(e)? / (sum + 1e-20) * scale;
+    }
+    Ok(((r.ids, w), Some(ours)))
+}
+
 /// The pin's ids through the session from position 0, one step an id, each visit's experts at
 /// mlx-lm's kept ids (the session's own route where its kept set is mlx-lm's): each held step's
 /// logits and pick, and every call where the session's own kept set parts from mlx-lm's; every
@@ -233,43 +303,17 @@ fn walk(session: &mut Session, pin: &Pin, sink: StepTaps<'_>) -> Result<Walked, 
         let mut route = |vi: usize| -> Result<([u32; TOP_K], [f32; TOP_K]), String> {
             let r = &routes[k * visits + vi];
             let s = seen.borrow();
-            let mut ours = s.kept.clone();
-            ours.sort_unstable();
-            if ours == r.ids {
-                let ids = s
-                    .kept
-                    .clone()
-                    .try_into()
-                    .map_err(|_| "a route of another width")?;
-                let w = s
-                    .weights
-                    .clone()
-                    .try_into()
-                    .map_err(|_| "weights of another width")?;
-                return Ok((ids, w));
+            let ((ids, w), parted) = route_of(r, &s.probs, &s.kept, &s.weights, scale)?;
+            if let Some(ours) = parted {
+                parts.borrow_mut().push(Part {
+                    step: k,
+                    visit: vi,
+                    ours,
+                    theirs: r.ids,
+                    gap: r.gap,
+                });
             }
-            let at = |e: u32| {
-                s.probs
-                    .get(e as usize)
-                    .copied()
-                    .ok_or("an expert past the scores")
-            };
-            let mut sum = 0.0f32;
-            for &e in &r.ids {
-                sum += at(e)?;
-            }
-            let mut w = [0.0f32; TOP_K];
-            for (wi, &e) in w.iter_mut().zip(&r.ids) {
-                *wi = at(e)? / (sum + 1e-20) * scale;
-            }
-            parts.borrow_mut().push(Part {
-                step: k,
-                visit: vi,
-                ours,
-                theirs: r.ids,
-                gap: r.gap,
-            });
-            Ok((r.ids, w))
+            Ok((ids, w))
         };
         let pick = session
             .step_routed(id, &mut taps, &mut route)
@@ -437,6 +481,237 @@ fn k_greedy(session: &mut Session) -> Clause {
         "the walk's picks at the pinned steps: {}",
         said.join("; ")
     )))
+}
+
+/// The pin's ids through the session as prompt passes, each ending at a held step, every visit's
+/// experts routed by [`route_of`] row by row: each held step's logits and the head's pick, and
+/// every router call where the pass's own kept set parts from mlx-lm's.
+fn pass_walk(session: &mut Session, pin: &Pin) -> Result<(Vec<Held>, Vec<Part>), String> {
+    let visits = session.checked().visits.len();
+    let scale = session.checked().route_scale;
+    let experts = session.checked().experts;
+    if session.checked().top_k != TOP_K {
+        return Err(format!(
+            "the file keeps {} experts a call; the pin's routes keep {TOP_K}",
+            session.checked().top_k
+        ));
+    }
+    let routes = routes(pin, visits)?;
+    session.reset().map_err(|e| e.to_string())?;
+    let mut held = Vec::with_capacity(pin.positions.len());
+    let mut parts = Vec::new();
+    let mut from = 0usize;
+    for &end in &pin.positions {
+        let rows = end + 1 - from;
+        let mut hook = |vi: usize,
+                        probs: &[f32],
+                        kept: &[u32],
+                        weights: &[f32]|
+         -> Result<(Vec<u32>, Vec<f32>), String> {
+            let mut ids = Vec::with_capacity(rows * TOP_K);
+            let mut w = Vec::with_capacity(rows * TOP_K);
+            for t in 0..rows {
+                let r = &routes[(from + t) * visits + vi];
+                let ((i, wt), parted) = route_of(
+                    r,
+                    &probs[t * experts..(t + 1) * experts],
+                    &kept[t * TOP_K..(t + 1) * TOP_K],
+                    &weights[t * TOP_K..(t + 1) * TOP_K],
+                    scale,
+                )?;
+                if let Some(ours) = parted {
+                    parts.push(Part {
+                        step: from + t,
+                        visit: vi,
+                        ours,
+                        theirs: r.ids,
+                        gap: r.gap,
+                    });
+                }
+                ids.extend(i);
+                w.extend(wt);
+            }
+            Ok((ids, w))
+        };
+        let passed = session
+            .pass_routed(&pin.ids[from..=end], &mut hook)
+            .map_err(|e| format!("the pass of steps {from}..={end}: {e}"))?;
+        let logits = session.logits_row().map_err(|e| e.to_string())?.to_vec();
+        held.push(Held {
+            step: end,
+            logits,
+            pick: passed.id,
+        });
+        from = end + 1;
+    }
+    Ok((held, parts))
+}
+
+/// `k_pass`.
+fn k_pass(session: &mut Session) -> Clause {
+    let pin = pin(session)?;
+    let band = 2.0 * row::current().logit_abs;
+    let steps = walk(session, &pin, &mut |_, _, _, _| {})?.held;
+    let (passes, parts) = pass_walk(session, &pin)?;
+    if let Some(p) = parts.iter().find(|p| p.gap >= TIE) {
+        return Err(format!(
+            "step {} visit {}: the pass keeps {:?}, mlx-lm {:?}, whose 8th-9th gap {:.3e} ≥ the \
+             floor {TIE:.1e}",
+            p.step, p.visit, p.ours, p.theirs, p.gap
+        ));
+    }
+    let mut worst: Option<(usize, f64)> = None;
+    let mut per_step = Vec::new();
+    let mut picks = 0;
+    for (s, p) in steps.iter().zip(&passes) {
+        let d =
+            distance(&p.logits, &s.logits, band).map_err(|e| format!("step {}: {e}", p.step))?;
+        println!(
+            "k_pass step {} (id {}): max |pass − steps| {:.3e} at {} (pass {:.6}, steps {:.6}), \
+             rms {:.3e}; picks {} and {}",
+            p.step, pin.ids[p.step], d.max, d.at, d.session, d.stored, d.rms, p.pick, s.pick
+        );
+        per_step.push(format!("{}: {:.2e}", p.step, d.max));
+        picks += usize::from(p.pick == s.pick);
+        if worst.is_none_or(|(_, w)| d.max > w) {
+            worst = Some((p.step, d.max));
+        }
+    }
+    let (at, max) = worst.ok_or("the pin holds no row")?;
+    let line = format!(
+        "pass = steps: max |logit| difference {max:.3e} at step {at}; per step [{}]; band {band} \
+         (twice the row's: each walk within one of the pin); {picks} of {} picks equal; {} router \
+         calls of the passes part from mlx-lm's, each under the near-tie floor; order: the \
+         pass's projections and experts sum half products in f32 over K in the GEMM tiles' steps, \
+         the step's mat-vecs f32 products a row",
+        per_step.join(", "),
+        passes.len(),
+        parts.len()
+    );
+    if max <= band {
+        Ok(Verdict::Noted(line))
+    } else {
+        Err(line)
+    }
+}
+
+/// `k_pass_pin`.
+fn k_pass_pin(session: &mut Session) -> Clause {
+    let pin = pin(session)?;
+    let band = row::current().logit_abs;
+    let mut worst: Option<(usize, f64)> = None;
+    let mut per_step = Vec::new();
+    let mut over = 0;
+    for (h, got) in pass_walk(session, &pin)?.0.iter().enumerate() {
+        let want = &pin.rows[h * pin.n..(h + 1) * pin.n];
+        let d = distance(&got.logits, want, band)
+            .map_err(|e| format!("step {} (id {}): {e}", got.step, pin.ids[got.step]))?;
+        println!(
+            "k_pass_pin step {} (id {}): max |logit| difference {:.3e} at {} (pass {:.6}, pin \
+             {:.6}), {} values over the band, rms {:.3e}",
+            got.step, pin.ids[got.step], d.max, d.at, d.session, d.stored, d.over, d.rms
+        );
+        per_step.push(format!("{}: {:.2e}", got.step, d.max));
+        over += d.over;
+        if worst.is_none_or(|(_, w)| d.max > w) {
+            worst = Some((got.step, d.max));
+        }
+    }
+    let (at, max) = worst.ok_or("the pin holds no row")?;
+    let line = format!(
+        "passes against pin inkling2: max |logit| difference {max:.3e} at step {at}; per step \
+         [{}]; band {band}, {over} values over it",
+        per_step.join(", ")
+    );
+    if max <= band {
+        Ok(Verdict::Noted(line))
+    } else {
+        Err(line)
+    }
+}
+
+/// `k_carry`.
+fn k_carry(session: &mut Session) -> Clause {
+    let pin = pin(session)?;
+    let band = 2.0 * row::current().logit_abs;
+    let visits = session.checked().visits.len();
+    let n = CARRY_ENDS[CARRY_ENDS.len() - 1];
+    if session.ctx() < n {
+        return Err(format!(
+            "a cache of {} rows holds no prompt of {n}",
+            session.ctx()
+        ));
+    }
+    let ids: Vec<u32> = pin.ids.iter().copied().cycle().take(n).collect();
+    session.reset().map_err(|e| e.to_string())?;
+    let mut table: Vec<Route8> = vec![([0; TOP_K], [0.0; TOP_K]); n * visits];
+    let mut passed: Vec<(usize, Vec<f32>, u32)> = Vec::with_capacity(CARRY_ENDS.len());
+    let mut from = 0usize;
+    for &end in &CARRY_ENDS {
+        let mut hook = |vi: usize,
+                        _probs: &[f32],
+                        kept: &[u32],
+                        weights: &[f32]|
+         -> Result<(Vec<u32>, Vec<f32>), String> {
+            for t in 0..end - from {
+                let at = (from + t) * visits + vi;
+                table[at]
+                    .0
+                    .copy_from_slice(&kept[t * TOP_K..(t + 1) * TOP_K]);
+                table[at]
+                    .1
+                    .copy_from_slice(&weights[t * TOP_K..(t + 1) * TOP_K]);
+            }
+            Ok((kept.to_vec(), weights.to_vec()))
+        };
+        let p = session
+            .pass_routed(&ids[from..end], &mut hook)
+            .map_err(|e| format!("the pass of positions {from}..{end}: {e}"))?;
+        let logits = session.logits_row().map_err(|e| e.to_string())?.to_vec();
+        passed.push((end - 1, logits, p.id));
+        from = end;
+    }
+    session.reset().map_err(|e| e.to_string())?;
+    let mut worst: Option<(usize, f64)> = None;
+    let mut per_pos = Vec::new();
+    let mut picks = 0;
+    let mut next = 0usize;
+    for (k, &id) in ids.iter().enumerate() {
+        let mut taps = |_: usize, _: Tap, _: &[f32]| {};
+        let mut route = |vi: usize| -> Result<Route8, String> { Ok(table[k * visits + vi]) };
+        let pick = session
+            .step_routed(id, &mut taps, &mut route)
+            .map_err(|e| format!("step {k} (id {id}): {e}"))?;
+        if passed.get(next).is_none_or(|p| p.0 != k) {
+            continue;
+        }
+        let (_, want, pass_pick) = &passed[next];
+        let got = session.logits_row().map_err(|e| e.to_string())?;
+        let d = distance(want, got, band).map_err(|e| format!("position {k}: {e}"))?;
+        println!(
+            "k_carry position {k}: max |pass − steps| {:.3e} at {} (pass {:.6}, steps {:.6}), rms \
+             {:.3e}; picks {pass_pick} and {pick}",
+            d.max, d.at, d.session, d.stored, d.rms
+        );
+        per_pos.push(format!("{k}: {:.2e}", d.max));
+        picks += usize::from(*pass_pick == pick);
+        if worst.is_none_or(|(_, w)| d.max > w) {
+            worst = Some((k, d.max));
+        }
+        next += 1;
+    }
+    let (at, max) = worst.ok_or("no pass ended")?;
+    let line = format!(
+        "passes ending at {CARRY_ENDS:?} against the steps at their routes: max |logit| difference \
+         {max:.3e} at position {at}; per position [{}]; band {band}; {picks} of {} picks equal",
+        per_pos.join(", "),
+        passed.len()
+    );
+    if max <= band {
+        Ok(Verdict::Noted(line))
+    } else {
+        Err(line)
+    }
 }
 
 /// `k_visits`.
@@ -614,9 +889,24 @@ pub fn run(
             "k_greedy" => k_greedy(&mut session),
             "k_visits" => k_visits(&session),
             "k_room" => k_room(&session, opened),
+            "k_pass" => k_pass(&mut session),
+            "k_pass_pin" => k_pass_pin(&mut session),
+            "k_carry" => k_carry(&mut session),
+            "k_serve" => continue,
             other => Err(format!("no clause named {other}")),
         };
         report.clause(name, result);
+    }
+    if only.is_none_or(|o| o == "k_serve") {
+        bloomery_metal::stream::breadcrumb_clause("k_serve");
+        let result = match pin(&session) {
+            Ok(p) => {
+                let prompt: Vec<u32> = p.ids.iter().copied().cycle().take(600).collect();
+                serve::k_serve(session, &path, &prompt, &p.ids[..20])
+            }
+            Err(e) => Err(e),
+        };
+        report.clause("k_serve", result);
     }
     let scope = match (mutant, only) {
         (Some((m, _)), _) => format!(" (row inkling2, mutant {})", m.name),

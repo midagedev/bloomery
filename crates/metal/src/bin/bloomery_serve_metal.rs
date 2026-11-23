@@ -62,6 +62,12 @@
 //! verify pass does not serve (at open, before the server listens). DSpark has no
 //! Metal draft model: `--draft dspark` is refused like any other word.
 //!
+//! An Inkling 2 file (architecture `inkling2`, the MLX folder) opens the
+//! family's own session: a prompt span runs in passes of up to its
+//! `pass_rows` ids, a short one a step an id; no checkpoint (its conv rings
+//! keep only the last inputs, so a request keeps the whole cache or starts
+//! over) and no draft (`--draft` and `--mtp` are refused by name).
+//!
 //! `BLOOMERY_SCREEN` (on unset) lets `d` open the server's live view on a
 //! terminal (`serve::live`); the start screen is the CUDA seats' alone.
 //!
@@ -348,6 +354,9 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         let path = &model.path;
         let file = ModelFile::open(path).map_err(|e| e.to_string())?;
         let split = file.header();
+        if split.architecture() == Some(ink2::ARCH) {
+            return ink2::open(a, &model, file);
+        }
         let ctx = match a.ctx {
             Some(c) => c,
             None => {
@@ -469,6 +478,90 @@ bloomery-serve-metal (-m PATH | --hf REPO) [--host H] [--port P] [--ctx C] [--ch
         let addr = server.local_addr().map_err(|e| e.to_string())?;
         eprintln!("bloomery-serve-metal: listening on http://{addr}");
         Ok(server)
+    }
+
+    /// The Inkling 2 family's server: its own session (`arch::inkling2`), a
+    /// prompt in passes of rows, no checkpoint and no draft.
+    mod ink2 {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use bloomery_metal::MetalDevice;
+        use bloomery_metal::arch::inkling2::{Session, plan};
+        use bloomery_metal::model_arg::{self, Model};
+        use model_hf::ModelFile;
+        use serve::sampling::sampler_factory;
+        use serve::vocab::{ChatSurface, Vocab};
+        use serve::{EngineProps, FATAL_LINGER, Server, ServerConfig, SlotConfig, TargetEngine};
+
+        use super::{Args, CTX_DEFAULT, bind};
+
+        /// The architecture the family's files name.
+        pub const ARCH: &str = "inkling2";
+
+        /// The server over `file`, the model `model` resolved, as `a` asks.
+        pub fn open(a: Args, model: &Model, file: ModelFile) -> Result<Server, String> {
+            if a.draft.is_some() || a.mtp.is_some() {
+                return Err(format!(
+                    "an {ARCH} file serves no draft: --draft and --mtp are the qwen3.5 family's"
+                ));
+            }
+            let path = &model.path;
+            let split = file.header();
+            let ctx = match a.ctx {
+                Some(c) => c,
+                None => plan::unasked_ctx(split, CTX_DEFAULT, path)?,
+            };
+            let ChatSurface { template, name } = ChatSurface::read(
+                path,
+                split.value("tokenizer.chat_template"),
+                split.value("general.name"),
+                a.template_file.path(),
+                &model_arg::default_alias(file.name(), model.repo.as_deref(), ARCH),
+            )?;
+            let tok = file.tokenizer().map_err(|e| e.to_string())?;
+            let vocab = Arc::new(Vocab::new(tok)?.with_chat_template(&template)?);
+            let instance = Session::instance_of(&file, ctx).map_err(|e| e.to_string())?;
+            let device = MetalDevice::open(instance).map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            let session =
+                Session::open(&device, device.library(), &file, ctx).map_err(|e| e.to_string())?;
+            drop(file);
+            eprintln!(
+                "bloomery-serve-metal: opened {} in {:.1} s, ctx {ctx}, prompt passes of up to \
+                 {} rows, no checkpoints (a cut keeps the whole sequence or nothing)",
+                path.display(),
+                t0.elapsed().as_secs_f64(),
+                session.pass_rows()
+            );
+            let head_rows = session.vocab_cut();
+            let engine: Box<dyn serve::Engine> = Box::new(TargetEngine::new(
+                session,
+                head_rows,
+                vocab,
+                format!("metal {ARCH} session"),
+                EngineProps::default(),
+            )?);
+            let config = ServerConfig {
+                model_alias: a.alias.unwrap_or(name),
+                model_path: path.display().to_string(),
+                chat_template: template,
+                chat_preparation: None,
+                sampler: Some(sampler_factory()),
+                fatal_linger: FATAL_LINGER,
+                slot_save_path: None,
+                api_keys: a.api_keys,
+            };
+            let slots = SlotConfig {
+                parallel: 1,
+                queue_depth: a.queue_depth,
+                ..SlotConfig::default()
+            };
+            let server = bind(engine, config, slots, (a.host.as_str(), a.port))?;
+            let addr = server.local_addr().map_err(|e| e.to_string())?;
+            eprintln!("bloomery-serve-metal: listening on http://{addr}");
+            Ok(server)
+        }
     }
 
     #[cfg(test)]

@@ -253,6 +253,9 @@ fn main() {
         "situ",
         "out_gate",
         "head_f32",
+        // The Inkling 2 prompt pass's row forms: after qk_clip, router_situ
+        // and route, whose helpers they read.
+        "ink2_pass",
     ] {
         let path = kernels_dir.join(format!("{name}.metal"));
         let source =

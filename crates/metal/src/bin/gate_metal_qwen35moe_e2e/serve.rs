@@ -23,11 +23,18 @@
 //!   proposal, so the counts of one request are the other's), and
 //!   a request whose first ids read the logits row (as a request that samples
 //!   does) keeps drafting.
+//! - `k_serve` (the `inkling2` row): the engine over the Inkling 2 session
+//!   (`bloomery-serve-metal`'s, no draft) serves greedy requests by ids with
+//!   the plain session's picks: a fresh prompt the target runs in passes, a
+//!   request that extends the cache (the whole sequence kept, the tail
+//!   prompted) and one that shares only the first prompt (the conv rings keep
+//!   no earlier point, so the engine starts over).
 
 use std::path::Path;
 use std::sync::Arc;
 
 use bloomery_device::conformance::{Clause, Verdict};
+use bloomery_metal::arch::inkling2::Session as InkSession;
 use bloomery_metal::arch::qwen3moe::session::{Session, StepMode};
 use bloomery_metal::device::MetalDevice;
 use bloomery_metal::kernels::HiddenRow;
@@ -35,7 +42,7 @@ use bloomery_metal::library::Library;
 use model_hf::ModelFile;
 use runtime::prompt::{CallEnd, PrefillMode};
 use runtime::width::{Chosen, Mode as WidthMode, Wall};
-use runtime::{Choosing, Lookup, Speculative};
+use runtime::{Choosing, Lookup, Speculative, Target, Want};
 use serve::vocab::Vocab;
 use serve::{DraftWindow, Engine, EngineProps, TargetEngine};
 
@@ -513,5 +520,107 @@ pub fn v_lookup_serve(device: &MetalDevice, library: &Library, path: &Path) -> C
         fresh.accepted,
         sampled.proposed,
         sampled.accepted
+    )))
+}
+
+/// The picks of each request of `k_serve`.
+const INK2_GEN: usize = 16;
+
+/// The plain session's greedy run as the engine runs a request from the cache's end: the prompt
+/// call of every id but the last, then a step each, `n` picks.
+fn ink2_plain(s: &mut InkSession, ids: &[u32], n: usize) -> Result<Vec<u32>, String> {
+    let (&last, run) = ids.split_last().ok_or("a request of no ids")?;
+    if !run.is_empty() {
+        Target::prompt(s, run, Want::Argmax).map_err(|e| e.to_string())?;
+    }
+    let mut got = vec![
+        Target::step(s, last, Want::Argmax)
+            .map_err(|e| e.to_string())?
+            .argmax(),
+    ];
+    while got.len() < n {
+        let at = *got.last().expect("the first pick is in hand");
+        got.push(
+            Target::step(s, at, Want::Argmax)
+                .map_err(|e| e.to_string())?
+                .argmax(),
+        );
+    }
+    Ok(got)
+}
+
+/// One greedy request through `e` from the cache's end: `n` picks.
+fn ink2_request(
+    e: &mut TargetEngine<InkSession>,
+    ids: &[u32],
+    n: usize,
+    what: &str,
+) -> Result<Vec<u32>, String> {
+    let mut got = vec![
+        e.prefill_next(ids, &[], &[], None)
+            .map_err(|err| format!("{what}: {err}"))?,
+    ];
+    while got.len() < n {
+        let last = *got.last().expect("the first pick is in hand");
+        got.push(e.next(last, None).map_err(|err| format!("{what}: {err}"))?);
+    }
+    Ok(got)
+}
+
+/// `k_serve`: the Inkling 2 row's server engine serves greedy requests by ids with the plain
+/// session's picks. `prompt` runs in passes (more ids than a step batch); `tail` extends the first
+/// request.
+pub fn k_serve(mut s: InkSession, path: &Path, prompt: &[u32], tail: &[u32]) -> Clause {
+    s.reset().map_err(|e| e.to_string())?;
+    let first = ink2_plain(&mut s, prompt, INK2_GEN)?;
+    let mut extended = prompt.to_vec();
+    extended.extend(&first);
+    extended.extend(tail);
+    let more = ink2_plain(
+        &mut s,
+        &extended[prompt.len() + first.len() - 1..],
+        INK2_GEN,
+    )?;
+    s.reset().map_err(|e| e.to_string())?;
+    let head_rows = s.vocab_cut();
+    let rows = s.pass_rows();
+    let file = ModelFile::open(path).map_err(|e| e.to_string())?;
+    let vocab = Arc::new(Vocab::new(file.tokenizer().map_err(|e| e.to_string())?)?);
+    drop(file);
+    let mut e = TargetEngine::new(
+        s,
+        head_rows,
+        vocab,
+        "the e2e inkling2 session".into(),
+        EngineProps::default(),
+    )?;
+    let fresh = ink2_request(&mut e, prompt, INK2_GEN, "the fresh request")?;
+    same(&fresh, &first, "the fresh request")?;
+    let at = prompt.len() + INK2_GEN - 1;
+    let kept = e.keepable(at);
+    if kept != at {
+        return Err(format!(
+            "the extending request: the engine keeps {kept} of the {at} positions the cache holds"
+        ));
+    }
+    e.cut(kept).map_err(|err| err.to_string())?;
+    let ext = ink2_request(&mut e, &extended[at..], INK2_GEN, "the extending request")?;
+    same(&ext, &more, "the extending request")?;
+    let shared = e.keepable(prompt.len());
+    if shared != 0 {
+        return Err(format!(
+            "a request sharing the first prompt: the engine keeps {shared} positions; the conv \
+             rings keep no earlier point than the cache's end"
+        ));
+    }
+    e.reset().map_err(|err| err.to_string())?;
+    let again = ink2_request(&mut e, prompt, INK2_GEN, "the request after the reset")?;
+    same(&again, &first, "the request after the reset")?;
+    Ok(Verdict::Noted(format!(
+        "{} prompt ids (passes of up to {rows} rows) then {INK2_GEN} picks {first:?}; the extending \
+         request ({} tail ids, {at} positions kept) {ext:?}; the request sharing the prompt starts \
+         over and picks the first's: each the plain session's",
+        prompt.len(),
+        extended.len() - at,
     )))
 }

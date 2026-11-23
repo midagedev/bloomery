@@ -7,8 +7,9 @@
 //! routed experts launch at host-known ids, so each visit's command buffer
 //! ends at its router and the host reads the picks before it encodes the
 //! experts; a pass the loop runs again also ends its buffer, where the host
-//! keeps the pass's blocks for the next pass's messages. A prompt runs as
-//! steps (`target.rs`); the batched pass is not this family's yet.
+//! keeps the pass's blocks for the next pass's messages. A prompt runs
+//! through the common prompt call (`target.rs`) as passes of rows
+//! ([`Session::pass`], `pass.rs`), a batch of a few ids as steps.
 
 use std::fmt;
 
@@ -16,14 +17,18 @@ use bloomery_device::fault::{Fault, FaultWord};
 use bloomery_device::{DeviceError, Elems};
 use model_hf::ModelFile;
 
+use runtime::prompt::PrefillMode;
+
 use super::arena::Arena;
 use super::check::{self, Checked, Refusal};
 use super::ops::Walk;
+use super::pass::{self as rows, Pass, PassBufs, PassRoutes};
 use crate::device::MetalDevice;
 use crate::instance::{INKLING2_MINI, Instance};
 use crate::kernels::Kernels;
 use crate::library::Library;
 use crate::residency::Alloc;
+use crate::session::pass::{PassOut, Passed};
 use crate::session::room::Bytes;
 use crate::stream::MetalStream;
 
@@ -166,8 +171,14 @@ pub struct Session {
     kernels: Kernels,
     checked: Checked,
     arena: Arena,
+    /// The prompt pass's buffers.
+    rows: PassBufs,
+    prefill: PrefillMode,
     pos: u32,
     poisoned: Option<Fault>,
+    /// The last call was a pass that ran no head: the logits row is an
+    /// earlier position's.
+    headless: bool,
     /// The last step's logits after the epilogue, read on request.
     logits: Vec<f32>,
     logits_fresh: bool,
@@ -232,15 +243,24 @@ impl Session {
             .weights()
             .map_err(|e| refuse(format!("the weights: {e}")))?;
         let arena = Arena::open(alloc, split, &weights, &checked)?;
+        let rows = PassBufs::open(alloc, &checked)?;
         staged.commit();
+        let prefill = if rows::serves(&checked) {
+            PrefillMode::Batch
+        } else {
+            PrefillMode::Steps
+        };
         Ok(Session {
             stream,
             kernels,
             logits: vec![0.0; checked.cut],
             checked,
             arena,
+            rows,
+            prefill,
             pos: 0,
             poisoned: None,
+            headless: false,
             logits_fresh: false,
             logit_scale,
         })
@@ -332,6 +352,7 @@ impl Session {
             )));
         }
         self.logits_fresh = false;
+        self.headless = false;
         let mut walk = Walk {
             c: &self.checked,
             a: &mut self.arena,
@@ -350,6 +371,117 @@ impl Session {
         Ok(picked)
     }
 
+    /// How a prompt call feeds its ids: in passes, or a step each. A file the
+    /// pass does not serve (a routed stack in another form than NVFP4 or
+    /// MXFP8 rows, the sink or tap rows not widened to f32) opens at steps.
+    #[must_use]
+    pub fn prefill(&self) -> PrefillMode {
+        self.prefill
+    }
+
+    /// Feed prompt calls in passes ([`PrefillMode::Batch`], the default of a
+    /// file the pass serves) or a step each ([`PrefillMode::Steps`], the
+    /// same-binary arm and the oracle's).
+    ///
+    /// # Errors
+    /// Passes on a file the pass does not serve.
+    pub fn set_prefill(&mut self, mode: PrefillMode) -> Result<(), SessionError> {
+        if mode == PrefillMode::Batch && !rows::serves(&self.checked) {
+            return Err(refuse(
+                "the file's stacks or sink rows are in a form the pass does not read",
+            ));
+        }
+        self.prefill = mode;
+        Ok(())
+    }
+
+    /// The most rows a pass holds: a prompt batch, no more than the cache's
+    /// rows, and no more than a windowed visit's ring holds beside the window.
+    #[must_use]
+    pub fn pass_rows(&self) -> usize {
+        self.rows.cap()
+    }
+
+    /// Run `ids` at [`Session::pos`] as one pass of rows: every visit over
+    /// the rows, the caches and the conv rings left where the steps of the
+    /// ids would leave them. [`PassOut::Last`] runs the head over the last
+    /// row (its logits in [`Session::logits_row`]) and returns its pick;
+    /// [`PassOut::None`] returns the last id, and the logits row is refused
+    /// until a step or a pass with a head.
+    ///
+    /// # Errors
+    /// As [`Session::step`], a pass of no ids or of more than
+    /// [`Session::pass_rows`], and a file the pass does not serve.
+    pub fn pass(&mut self, ids: &[u32], out: PassOut) -> Result<Passed, SessionError> {
+        self.pass_with(ids, out == PassOut::Last, None)
+    }
+
+    /// [`Session::pass`] with the head, whose experts run at the route
+    /// `routes` gives at each visit instead of the router's picks: each
+    /// visit's buffer ends at its router, and the hook reads the router's
+    /// scores, kept ids and weights of every row.
+    ///
+    /// # Errors
+    /// As [`Session::pass`], and a route the hook refuses, of another shape,
+    /// or naming an expert past the file's.
+    pub fn pass_routed(
+        &mut self,
+        ids: &[u32],
+        routes: PassRoutes<'_>,
+    ) -> Result<Passed, SessionError> {
+        self.pass_with(ids, true, Some(routes))
+    }
+
+    fn pass_with(
+        &mut self,
+        ids: &[u32],
+        head: bool,
+        routes: Option<PassRoutes<'_>>,
+    ) -> Result<Passed, SessionError> {
+        if let Some(f) = self.poisoned {
+            return Err(SessionError::Poisoned(f));
+        }
+        if !rows::serves(&self.checked) {
+            return Err(refuse(
+                "a pass over a file whose routed stacks or dense projections are in a form it does not read",
+            ));
+        }
+        let end = self.pos as usize + ids.len();
+        if end > self.checked.ctx {
+            return Err(refuse(format!(
+                "a pass of {} rows at position {} of a cache of {} rows",
+                ids.len(),
+                self.pos,
+                self.checked.ctx
+            )));
+        }
+        if let Some(id) = ids.iter().find(|&&id| id as usize >= self.checked.vocab) {
+            return Err(refuse(format!(
+                "id {id} is past the vocabulary of {}",
+                self.checked.vocab
+            )));
+        }
+        self.logits_fresh = false;
+        let mut pass = Pass {
+            c: &self.checked,
+            a: &mut self.arena,
+            p: &mut self.rows,
+            k: &self.kernels,
+            stream: &self.stream,
+        };
+        let ran = pass.run(ids, self.pos, head, routes);
+        // A raise outranks the walk's own error: the fault names the visit.
+        let fault = self.arena.faults.read(&self.stream)?;
+        if let Some(f) = fault {
+            self.poisoned = Some(f);
+            return Err(SessionError::Fault(f));
+        }
+        let (id, count) = ran?;
+        self.pos = u32::try_from(end).expect("the cache's rows fit a u32 position");
+        self.headless = !head;
+        Ok(Passed { id, count })
+    }
+
     /// The last step's logits over the cut, after the epilogue (the scale and
     /// the soft cap, which leave the pick unmoved).
     ///
@@ -358,6 +490,9 @@ impl Session {
     pub fn logits_row(&mut self) -> Result<&[f32], SessionError> {
         if self.pos == 0 {
             return Err(refuse("the logits of no step"));
+        }
+        if self.headless {
+            return Err(refuse("the logits of a pass that ran no head"));
         }
         if !self.logits_fresh {
             self.arena
@@ -387,6 +522,7 @@ impl Session {
         self.poisoned = None;
         self.pos = 0;
         self.logits_fresh = false;
+        self.headless = false;
         Ok(())
     }
 
