@@ -268,6 +268,8 @@ file's `--plan` prints on this card.
 | Hy4-flash `Q4_K_M` | card + CPU | 31.75 ³ | 31.48 ³ | 31.71 | 31.78 |
 | GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 194.44 | 210.03 | 30.09 | 26.17 |
 | Nemotron 3.5 Bolt 74B-A9B `24GB` | the whole model on the card | 4,971.72 | 7,166.02 | 182.41 | 180.44 |
+| Inkling 2 Mini `UD-Q4_K_XL` ⁴ | the whole model on the card | 4,962.77 | 4,759.63 | 155.33 | 150.91 |
+| Inkling 2 Mini, the official checkpoint folder ⁴ | the whole model on the card | 3,818.15 | 3,703.65 | 153.82 | 151.38 |
 
 ¹ rounds 699.14 and 884.09.
 
@@ -275,6 +277,9 @@ file's `--plan` prints on this card.
 
 ³ Hy4-flash's prompt pass computes the host's share of its routed experts on the CPU, so its prompt runs at about its
 decode rate; at the unset context (1,048,576 positions) the plan holds 2,004 of its 20,992 routed experts on the card.
+
+⁴ the tagged 0.3.16 binary, in 0.3.16's release sitting, without a draft (0.3.16 serves Inkling 2 Mini without one).
+The folder's dense weights are written as Q8_0 at load (the default; `BLOOMERY_INK2_DENSE=bf16` keeps them as stored).
 
 The Hy4-flash and GLM-5.3-Flash cells were re-run in the same sitting (`sitting.sh --resume --only`) after their first rows
 read cold (major faults after another model's load evicted their files from the page cache).

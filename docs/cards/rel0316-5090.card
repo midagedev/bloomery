@@ -1,0 +1,15 @@
+# 0.3.16's release sitting on the one RTX 5090 32 GB: Inkling 2 Mini, the GGUF file (unsloth UD-Q4_K_XL) and the official
+# checkpoint folder (its dense written as Q8_0 at load, the default), at the serving defaults, D = 512 and 4096, two rounds.
+# The term with a derivation is the GGUF file's decode at depth 512: the tree build's smoke on this card read 161.6 tok/s over
+# 200 tokens at depth ~35 (development number, one request), and the walk's attention grows with depth only on its 8 global
+# visits, so depth 512 reads within 10 % below it: 145..165 [derived]. The folder's cell reads beside it (its smoke 160.4).
+kind: baseline
+question: what decode rate does Inkling 2 Mini UD-Q4_K_XL serve at depth 512 on the one RTX 5090 at the serving defaults?
+term: tg tok/s @ n=128, depth 512, bloomery-serve at the serving defaults (place unset, no --ctx-size), RTX 5090 32 GB
+unit: tok/s
+predict: 145..165
+condition: one lease, the 5090 alone (local mode, no compute process on it), tools/release/sitting.sh --binary portable, two rounds, cells-0.3.16.tsv
+reason: the tree build's one-request smoke on this card (161.6 at depth ~35) and the walk's depth growth on its 8 global visits.
+decide-in: the README's 5090 table takes the measured means with their rounds
+decide-below: under 145: read the cell's plan record and witness blocks before any row is published
+decide-above: beyond 165: read the witness blocks before crediting the card
