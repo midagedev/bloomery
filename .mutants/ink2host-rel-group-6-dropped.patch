@@ -1,0 +1,11 @@
+--- a/crates/model/src/arch/inkling2/spec.rs
++++ b/crates/model/src/arch/inkling2/spec.rs
+@@ -42,7 +42,7 @@
+                 n,
+                 Need::RelBias {
+                     head: 128,
+-                    group: 3 | 6,
++                    group: 3,
+                     window: Some(1024) | None,
+                     d_rel: 16,
+                     extent: 1024,

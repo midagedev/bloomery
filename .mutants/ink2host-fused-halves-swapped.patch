@@ -1,0 +1,13 @@
+--- a/crates/model/src/moe.rs
++++ b/crates/model/src/moe.rs
+@@ -2896,8 +2896,8 @@
+         let down_stack = ShardTensor::find(split, spec.down)?;
+         expect_stack(down_stack.info(), ff, embd, n_expert)?;
+         expert_view(down_stack.info(), 0, n_expert)?;
+-        let gate = ShardTensor::fused_half(split, spec.gate_up, false)?;
+-        let up = ShardTensor::fused_half(split, spec.gate_up, true)?;
++        let gate = ShardTensor::fused_half(split, spec.gate_up, true)?;
++        let up = ShardTensor::fused_half(split, spec.gate_up, false)?;
+         Self::assemble(
+             split,
+             (Some(GateUp::File(gate)), GateUp::File(up), down_stack),

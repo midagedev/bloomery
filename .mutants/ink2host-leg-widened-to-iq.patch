@@ -1,0 +1,19 @@
+--- a/crates/placement/src/accepts.rs
++++ b/crates/placement/src/accepts.rs
+@@ -735,7 +735,15 @@
+ /// gate and up halves the common card leg's gate·up arm reads, and a down its down arm reads.
+ #[must_use]
+ pub const fn inkling2_leg(ty: GgmlType) -> bool {
+-    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0 | GgmlType::MXFP8)
++    matches!(
++        ty,
++        GgmlType::NVFP4
++            | GgmlType::Q8_0
++            | GgmlType::MXFP8
++            | GgmlType::IQ2_XS
++            | GgmlType::IQ3_XXS
++            | GgmlType::IQ4_XS
++    )
+ }
+ 
+ /// The Inkling 2 body's plan arm: a routed stack of a type [`inkling2_leg`] runs, in the leg's
