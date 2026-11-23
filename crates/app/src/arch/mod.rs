@@ -32,6 +32,9 @@ pub mod flint;
 pub mod glm5next;
 #[cfg(feature = "hy4")]
 pub mod hy4;
+/// Inkling 2's session pieces: the body lives in the gpu crate's own inkling2
+/// arch, so they need no feature of their own.
+pub mod inkling2;
 /// Kimi K3's session pieces: the body lives in the gpu crate's own kimi_k3
 /// arch, so they need no feature of their own.
 pub mod kimi_k3;

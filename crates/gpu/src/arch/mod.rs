@@ -14,6 +14,7 @@
 pub mod deepseek2;
 pub mod gated_mla;
 pub mod hybrid;
+pub mod inkling2;
 pub mod kimi_k3;
 pub mod musespark;
 pub mod nemotron_h;

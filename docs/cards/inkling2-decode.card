@@ -1,0 +1,31 @@
+# Inkling 2 Mini on the card body (crates/gpu/src/arch/inkling2, round ink2r4): one token, whole-card, graph mode.
+# [derived] terms:
+# DRAM 4.01 GB of weights a token (design ink2d §5: dense 1.444 GB over 48 visits, experts 1.847, controllers 0.227,
+# head 0.490) at the gemv ceiling 1.79 TB/s (docs/cards/gemv5090-l1tex.card) = 2.24 ms; at 0.8-0.9 of it, as the step
+# gemvs run, 2.5-2.8 ms
+# chain 1,598 nodes a token (gate_inkling2_e2e derived_nodes on the Mini: 48 visits of 29-38 launches, 7 pass-edge
+# copies, the embedding 2, the head 6); ~530 are byte-bound gemvs (the term above, plus ~1 us of ramp each: 0.5 ms),
+# 96 are the 24 message visits' controller pairs (~14 us a pair at m = 1, ink2lc: 0.67 ms), ~975 are small dependent
+# kernels (norms, mixes, convs, the clip, the attention at depth 6, copies) at ~2-3 us each in a replay: 1.95-2.9 ms
+# host two refresh copies and the argmax readback a token: ~0.05 ms; PCIe, host DRAM and NVMe idle (whole-card)
+# wall one stream, every launch after its predecessor: the sum, 5.6-6.9 ms = 145-178 tok/s. DRAM demand (2.24 ms) is
+# well under the step, so the step is the chain latency: a byte lever predicts only its share; the launch count is the
+# other lever
+kind: baseline
+question: where does the Inkling 2 card body decode the Mini on one RTX 5090 at depth 6?
+term: tg tok/s @ depth 6, n = 128, Inkling-2-Mini-UD-Q4_K_XL.gguf, the whole-card body
+  (GpuModel<inkling2::Body>) in graph mode, RTX 5090
+unit: tok/s
+predict: 135..185
+condition: one lease on the timing runner that opens the body (the serve seat R6 lands, or the runner the lead
+  names), four rounds, the card free of other compute (ComfyUI down), the witness block read beside each mean;
+  the e2e gate green at the same tree first
+reason: the first measured decode row of the Inkling 2 card body, the baseline the R5 prompt pass and the R6
+  seat are judged against; why now: the body's first gate-green load
+decide-in: post the row as the body's first decode number; a launch fold (one multi-weight Q8_0 gemv for the
+  six projections, the clip-scale products gone with the per-head qk_clip) opens only when its derivation
+  predicts more than the ruler
+decide-below: the small-kernel term is wider than 2-3 us a node: take the step's per-kernel table (nsys on the
+  replay) and read the gaps between the chain's launches before any kernel change
+decide-above: the gemvs run nearer the ceiling or the small kernels hide under them: re-derive both terms from
+  the per-kernel table and move the band

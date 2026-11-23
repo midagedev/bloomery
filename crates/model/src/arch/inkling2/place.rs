@@ -3,11 +3,10 @@
 //! ([`place_hybrid::KvLayout::of_visits`]) are read once ([`Inputs::describe`];
 //! [`Inputs::read`] refuses a file whose features no program runs, every one listed — the
 //! coverage list is the work queue of the rounds that build one). The plan itself
-//! ([`Inputs::plan`]) is the host-routed one: no card kernel reads this family's routed stacks
-//! yet, so every expert stays on the host and the card holds the dense weights, the visits' K and
-//! V and their convolution states — the weights once per stored layer (a looped layer's passes
-//! share them: the file holds one set), the stores once per visit. The engine that runs the card
-//! side names its own program when it lands, and the plan follows it there.
+//! ([`Inputs::plan`]) is the Inkling 2 body's ([`Program::Inkling2Body`]): every routed stack of a
+//! type the body's card leg runs goes to the card by the expert rule beside the dense weights,
+//! the visits' K and V and their convolution states — the weights once per stored layer (a
+//! looped layer's passes share them: the file holds one set), the stores once per visit.
 
 use gguf::Split;
 use models::ModelSpec;
@@ -15,8 +14,9 @@ use models::ModelSpec;
 use super::hparams::Hparams;
 use super::spec;
 use crate::arch::coverage;
+use crate::placement::accepts::{Program, routed_rule};
 use crate::placement::{
-    Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, plan_host_routed,
+    Machine, ModelTensors, PlacementError, Plan, PlanLevers, Unimplemented, plan_routed,
 };
 
 pub use crate::arch::place_hybrid::KvLayout;
@@ -80,18 +80,18 @@ impl Inputs {
     }
 
     /// The placement of the file on `machine` at `ctx_max` positions under the placement's
-    /// `levers`: every routed stack on the host — no card kernel reads this family's experts yet
-    /// ([`placement::plan_host_routed`]) — the dense tensors where their roles say, and the
-    /// visits' stores on the cards that run their layers. A machine that names an expert tier
-    /// card is refused by name (the tier would hold nothing). The engine's own program replaces
-    /// this plan when its card leg lands.
+    /// `levers`: the routed stacks by the body's rule ([`routed_rule`] of
+    /// [`Program::Inkling2Body`], each stack by its own type, so a fused gate·up stack plans whole)
+    /// through the expert rule, the dense tensors where their roles say, and the visits' stores
+    /// on the cards that run their layers.
     pub fn plan<'a>(
         &'a self,
         machine: &'a Machine,
         ctx_max: u64,
         levers: &PlanLevers,
     ) -> Result<Plan<'a>, PlacementError> {
-        plan_host_routed(&self.model, machine, ctx_max, &self.kv, levers)
+        let rule = routed_rule(Program::Inkling2Body);
+        plan_routed(&self.model, machine, ctx_max, &self.kv, levers, rule)
     }
 }
 
@@ -200,35 +200,25 @@ mod tests {
         runtime::stores::ring_rows(window, ctx)
     }
 
-    /// The host-routed plan of the described file holds on the gate machine: the dense tensors
-    /// and the visits' stores on the card, every routed stack on the host, and a machine that
-    /// names an expert tier card is refused by name. The read still refuses the small header
-    /// through the coverage check (its features are the work queue's).
+    /// The body's plan of the described file holds on the gate machine with every expert on the
+    /// card: the Q8_0 stacks are the card leg's, the small header's experts fit beside the dense
+    /// tensors and the stores, so no stack is hosted. The read still refuses the small header
+    /// through the coverage check (its widths are no kernel's). Mutant: the host-routed plan
+    /// keeps every layer's experts on the host.
     #[test]
-    fn the_described_file_plans_with_its_experts_on_the_host() {
+    fn the_described_file_plans_its_experts_on_the_card() {
         let inputs = typed_inputs("inkling2-place-plan");
         let machine = workstation::plan_gate(6);
         let plan = inputs
             .plan(&machine, 64, &PlanLevers::default())
             .expect("the gate machine plans the file");
+        let experts = inputs.model.experts;
         assert!(
-            plan.n_l.iter().all(|&n| n == 0),
-            "no layer keeps experts on the card: {:?}",
+            plan.n_l.iter().all(|&n| n == experts),
+            "every layer keeps its {experts} experts on the card: {:?}",
             plan.n_l
         );
-        assert!(plan.host.expert_bytes > 0, "the routed stacks are hosted");
-        let tiered = workstation::plan_tiers(
-            6,
-            workstation::A6000,
-            &[workstation::RTX_3090],
-            None,
-            workstation::NO_TIER_BATCH,
-        )
-        .expect("the tiered machine");
-        let err = inputs
-            .plan(&tiered, 64, &PlanLevers::default())
-            .expect_err("a tier card is refused");
-        assert!(err.to_string().contains("tier"), "{err}");
+        assert_eq!(plan.host.expert_bytes, 0, "no routed stack is hosted");
         match Inputs::read(&opened("inkling2-place-read")) {
             Err(PlacementError::Unimplemented(items)) => assert!(!items.is_empty()),
             other => panic!("{other:?}, not the coverage refusal"),

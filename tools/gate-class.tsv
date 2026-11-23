@@ -315,3 +315,4 @@ gate-gpu-hy4-dsa	family	hy_v4_flash	kernel	attn_latent_mla+kv_pool_checkpoint
 gate-gpu-hy4-serve	family	hy_v4_flash	serve+ship	seats_serve_engine+serve_toolcall
 gate-inkling2-attn	family	inkling2	kernel	attn_rel_bias
 gate-inkling2-pp	family	inkling2	kernel	attn_rel_prefill+loop_control
+gate-inkling2-e2e	family	inkling2	e2e	graph_fault+attn_rel_bias+attn_res+loop_control+conv_res+moe_route+tier_legs+w13_split+weights_load+elem_kernels+head_sample

@@ -4650,6 +4650,13 @@ gate-inkling2-meta:
 gate-inkling2-moe:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_moe && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_moe'
 
+# Inkling 2's whole decode step on one card (gate_inkling2_e2e's doc): the card body's visits of the looped trunk, the message bank at the
+# pass edges and the head's mix, one prompt id a step, against the node dumps of whichever tier this run holds (BLOOMERY_TIER=fixture: the
+# fixture file and its fx_ref_inkling2_* sets; the real tier: the Mini's file and ref_inkling2_*), the teacher-forced argmax against the
+# greedy tables, the captured step's node count against the walk's and the graph against the eager chain.
+gate-inkling2-e2e:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_e2e'
+
 # --- inkling2-ref (Inkling 2's oracle: the patched PR tree and its node dumps) --------------------------------------------------------
 # Inkling 2's oracle tree: llama.cpp PR #32695 at its head 6196d9802 (the naming the Mini's file uses) carrying tools/ref/inkling2-scale.patch —
 # upstream master's own a1f422260 ("model : load ffn_gate_up_exps scales", #32657) unedited, which the PR branch lacks: without it the loader

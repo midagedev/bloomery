@@ -1043,3 +1043,10 @@ required-features = ["gpu"]
 [[bin]]
 name = "gate_inkling2_pp"
 required-features = ["gpu"]
+
+# inkling2-e2e: Inkling 2's whole decode step on one card (gate_inkling2_e2e's doc): the visits of
+# the looped trunk, the message bank, the head's mix, against the oracle node dumps of whichever
+# tier this run holds; the captured step's node count and the graph against the eager chain.
+[[bin]]
+name = "gate_inkling2_e2e"
+required-features = ["gpu"]

@@ -19,7 +19,7 @@
 
 use bloomery_placement::accepts::{
     BOLT_LEG, MUSESPARK_LEG, dense_by_name, dense_projected, embed_of_widened, head_of_widened,
-    latent_leg_runs, leg_arms, qwen3moe_dense, resident_down_runs,
+    inkling2_leg, latent_leg_runs, leg_arms, qwen3moe_dense, resident_down_runs,
 };
 pub use bloomery_placement::accepts::{Program, program_of, qwen35_down, qwen35_gate_up};
 use bloomery_placement::accepts::{prompt_leg_down, prompt_leg_gate_up};
@@ -2317,6 +2317,13 @@ fn check_for(
                 // names it here first.
                 Some(Program::MuseSparkBody) => {
                     if routed_unrun(t, |ty| ty == MUSESPARK_LEG) {
+                        at(t.layer, Need::RoutedFormat(t.ty));
+                    }
+                }
+                // The Inkling 2 body holds every stack on the card: a stack of a type its card leg
+                // does not read ([`inkling2_leg`]) is an item.
+                Some(Program::Inkling2Body) => {
+                    if !inkling2_leg(t.ty) {
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }

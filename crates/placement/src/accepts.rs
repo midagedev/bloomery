@@ -88,6 +88,12 @@ pub enum Program {
     /// list, the engram sites), the routed experts the plan puts on the card (the common pair over
     /// the latent, gate-first clamped) and the rest on the host tier, beside a shared expert.
     Hy4Body,
+    /// The Inkling 2 body (`crates/gpu/src/arch/inkling2` `Body`): whole-card, the visits of the
+    /// looped trunk (the rel-bias attention with its per-query sink, the residual short convs, the
+    /// cross-layer residual mixes of the normed banks, the looped core's message controllers) and
+    /// every routed stack on the common card leg, each fused gate·up stack split at upload into the
+    /// halves the leg's gate·up arm reads ([`inkling2_leg`]).
+    Inkling2Body,
     /// The host engine (`crates/model`): no card, every layer, the head and the embedding on the
     /// host stage, the matmuls the fused `qdot` kernels run and the routed stacks resident on
     /// the host. No architecture picks it ([`program_of`]): a start with no card, or one that asks
@@ -116,9 +122,9 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
         Arch::KimiK3 => Some(Program::KimiK3Body),
         Arch::Hy4 => Some(Program::Hy4Body),
-        // No program runs inkling2 yet: a start that opens one of its files is refused by the
+        Arch::Inkling2 => Some(Program::Inkling2Body),
+        // No program runs lfm3 yet: a start that opens one of its files is refused by the
         // coverage check's one item, never sent down another family's path.
-        Arch::Inkling2 => None,
         Arch::Lfm3 => None,
     }
 }
@@ -147,6 +153,7 @@ impl Program {
             Self::FlintBody => "flint",
             Self::MistralLarge4Body => "mistrallarge4",
             Self::Hy4Body => "hy4",
+            Self::Inkling2Body => "inkling2",
             Self::Host => "host",
         }
     }
@@ -581,6 +588,10 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
             gate_up: |ty| ty == MUSESPARK_LEG,
             down: |ty| ty == MUSESPARK_LEG,
         }),
+        Program::Inkling2Body => Some(LegArms {
+            gate_up: inkling2_leg,
+            down: inkling2_leg,
+        }),
         // The host stage holds every stack on the host: no card leg.
         Program::NemotronHBody | Program::GemmaEmbedding2Body | Program::Host => None,
     }
@@ -702,6 +713,8 @@ pub fn routed_rule(p: Program) -> RoutedRule {
             down: musespark_leg_card,
             pair: leg_pair(p),
         },
+        // By type, not by part: the fused gate·up stack names no part the part rule reads.
+        Program::Inkling2Body => RoutedRule::PerType(inkling2_leg_card),
         // No routed stack: every one is refused by name.
         Program::NemotronHBody | Program::GemmaEmbedding2Body | Program::Host => {
             RoutedRule::PerType(|_| None)
@@ -712,6 +725,20 @@ pub fn routed_rule(p: Program) -> RoutedRule {
 /// The latent MoE body's plan arm: [`latent_leg_runs`], in its card format.
 fn bolt_leg_card(ty: GgmlType) -> Option<CardFormat> {
     latent_leg_runs(ty).then(|| leg_card_format(ty))
+}
+
+/// The Inkling 2 body's routed stacks: NVFP4 in its planes or Q8_0 in the file's blocks, the two
+/// forms its files hold — a fused gate·up stack of either, split at upload into the gate and up
+/// halves the common card leg's gate·up arm reads, and a down its down arm reads.
+#[must_use]
+pub const fn inkling2_leg(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::NVFP4 | GgmlType::Q8_0)
+}
+
+/// The Inkling 2 body's plan arm: a routed stack of a type [`inkling2_leg`] runs, in the leg's
+/// card format.
+fn inkling2_leg_card(ty: GgmlType) -> Option<CardFormat> {
+    inkling2_leg(ty).then(|| leg_card_format(ty))
 }
 
 /// The muse-spark body's plan arm: [`MUSESPARK_LEG`], in its card format.
@@ -745,7 +772,7 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 16] = [
+    const PROGRAMS: [Program; 17] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
@@ -762,6 +789,7 @@ mod tests {
         Program::FlintBody,
         Program::MistralLarge4Body,
         Program::Hy4Body,
+        Program::Inkling2Body,
     ];
 
     /// Every type the file format names.
