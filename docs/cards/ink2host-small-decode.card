@@ -1,0 +1,18 @@
+# Inkling 2 Small decode on one RTX 5090, every routed expert on the host tier (round ink2host).
+# The first derivation (23..27 tok/s: 4.146 GB a token at the V4.1 anchor's 110 GB/s = 37.7 ms, plus ~3.5 ms of card and boundary) MISSED:
+# the development run (server timings, not a sitting) read 14.3..14.8 tok/s, and the gate's split (HybridStats, 31 steps) says why:
+# step 66.4 ms = host leg 56.7 ms (48 services of 1.18 ms) + card and boundary 9.7 ms. The wrong term is the host rate: 4.146 GB in
+# 56.7 ms is 73 GB/s, not 110 (the IQ2_XS/IQ3_XXS/IQ4_XS dots are compute-heavier a byte than the Q4_K the anchor reads); the card
+# and boundary term was 3x its guess (96 go/join round trips ~5 ms + the dense trunk ~4.5 ms at the card's stream rate).
+# Resource timeline a token [measured]: host CPU/DRAM 56.7 ms (32 workers, 73 GB/s), card SMs ~4.5 ms, PCIe ~0.1 ms of bytes + 96 round
+# trips, NVMe 0 (199 GB of page cache); wall = the sum (layer l+1 reads layer l's routed sum): go_early 31 of 1488, the card waits.
+# The term left: the same rate under the lease (quiet host, no ComfyUI), predicted from the measured 66.4 ms and 69 ms server step.
+kind: profile
+question: is the Small's decode step 66..70 ms with the host leg at 57 +- 2 ms, on a quiet machine, behind the placed walk?
+term: decode tok/s @ n=1, depth 512, RTX 5090 (bloomery-serve inkling2 placed load, UD-Q2_K_XL, no --ctx), server timings predicted_per_second
+unit: tok/s
+predict: 14..15.5
+condition: one lease (depth-serve sitting, the lead's go), the file's pages resident (majflt 0 in the row), no ComfyUI process on the card, TIMING_GPU the 5090
+decide-in: the host dots are 85 % of the step: perf the three IQ dots per type (compute against DRAM bound) before any flow change
+decide-below: the development run was disturbed (another process on the cores or the card): read the witness block and the majflt, rerun
+decide-above: the dev run carried noise or the quiet host reads faster: re-derive the card shadow (IQ arms on the card, n_l ~44) against the new rate
