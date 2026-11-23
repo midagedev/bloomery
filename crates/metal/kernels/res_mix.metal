@@ -26,6 +26,15 @@
 // tree; this order is the named band term between the two. The softmax is
 // exp(s - max) in f32, summed in vector order, each divided by the sum.
 //
+// Latency: a lane loads MIX_PREFETCH of its values (and their query values)
+// before it adds the first, and a thread MIX_COLS of its outputs' vector
+// values before it sums the first, so a row's loads are in flight together
+// instead of one after another; thread v takes vector v's RMS scale and
+// thread q query row q's softmax. The loads moved, not the sums: every
+// accumulation above keeps its order.
+// The loops over those arrays unroll in full (FOR_UNROLL, quant.metal): an
+// array indexed by a rolled loop's variable does not stay in registers.
+//
 // No silent failure: a vector whose sum of squares is not usable
 // (rms_usable, norm.metal) or a score that is not finite raises the norm
 // site and the query row's output is NaN, never a plausible mix.
@@ -37,6 +46,11 @@
 
 #define MIX_THREADS 256u
 #define MIX_SG (MIX_THREADS / 32u)
+// A lane's values loaded at once in the scores: the Mini's 72 a lane in six.
+#define MIX_PREFETCH 12u
+// A thread's outputs whose vector values are loaded at once in the sum: the
+// Mini's nine a thread in three.
+#define MIX_COLS 3u
 
 static_assert(MIX_THREADS == 256u, "the mix's threadgroup is the norm's own width");
 
@@ -62,8 +76,9 @@ struct ResMixShared {
 };
 
 // The mix of one row, one threadgroup of MIX_THREADS threads arrived
-// converged. A SIMD group takes a vector at a time; thread 0 takes the
-// softmax; the threadgroup sums the weighted normed states.
+// converged. A SIMD group takes a vector at a time; thread v takes vector
+// v's scale and thread q query row q's softmax; the threadgroup sums the
+// weighted normed states.
 static void res_mix_row(device const float *banks,
                         device const float *cur,
                         device const float *queries,
@@ -84,19 +99,41 @@ static void res_mix_row(device const float *banks,
         device const float *src =
             v < args.n_banks ? banks + v * args.stride + row : cur + row;
         float dot[BLOOMERY_INK2_MIX_NQ];
-        for (uint q = 0u; q < nq; ++q) {
+        FOR_UNROLL(uint q = 0u; q < BLOOMERY_INK2_MIX_NQ; ++q) {
             dot[q] = 0.f;
         }
         float sq = 0.f;
-        for (uint j = lane; j < n; j += 32u) {
-            const float value = src[j];
-            sq = fma(value, value, sq);
-            for (uint q = 0u; q < nq; ++q) {
-                dot[q] = fma(value, queries[q * n + j], dot[q]);
+        for (uint j0 = lane; j0 < n; j0 += 32u * MIX_PREFETCH) {
+            float value[MIX_PREFETCH];
+            float query[MIX_PREFETCH][BLOOMERY_INK2_MIX_NQ];
+            FOR_UNROLL(uint u = 0u; u < MIX_PREFETCH; ++u) {
+                const uint j = j0 + 32u * u;
+                value[u] = 0.f;
+                FOR_UNROLL(uint q = 0u; q < BLOOMERY_INK2_MIX_NQ; ++q) {
+                    query[u][q] = 0.f;
+                    if (j < n && q < nq) {
+                        query[u][q] = queries[q * n + j];
+                    }
+                }
+                if (j < n) {
+                    value[u] = src[j];
+                }
+            }
+            FOR_UNROLL(uint u = 0u; u < MIX_PREFETCH; ++u) {
+                if (j0 + 32u * u < n) {
+                    sq = fma(value[u], value[u], sq);
+                    FOR_UNROLL(uint q = 0u; q < BLOOMERY_INK2_MIX_NQ; ++q) {
+                        if (q < nq) {
+                            dot[q] = fma(value[u], query[u][q], dot[q]);
+                        }
+                    }
+                }
             }
         }
-        for (uint q = 0u; q < nq; ++q) {
-            dot[q] = simd_sum(dot[q]);
+        FOR_UNROLL(uint q = 0u; q < BLOOMERY_INK2_MIX_NQ; ++q) {
+            if (q < nq) {
+                dot[q] = simd_sum(dot[q]);
+            }
         }
         sq = simd_sum(sq);
         if (lane == 0u) {
@@ -107,50 +144,73 @@ static void res_mix_row(device const float *banks,
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        bool usable = true;
+    // A vector's scale, NaN where its sum of squares is not usable: a
+    // usable scale is finite, so a NaN names the vector to every thread.
+    if (tid < vecs) {
+        const uint v = tid;
+        const float scale = rms_scale(shared.rstd[v], n, args.eps);
+        shared.rstd[v] = rms_usable(shared.rstd[v], scale) ? scale : NAN;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    bool usable = true;
+    for (uint v = 0u; v < vecs; ++v) {
+        usable = usable && !isnan(shared.rstd[v]);
+    }
+    if (tid < nq) {
+        const uint q = tid;
+        float mx = -INFINITY;
         for (uint v = 0u; v < vecs; ++v) {
-            const float scale = rms_scale(shared.rstd[v], n, args.eps);
-            usable = usable && rms_usable(shared.rstd[v], scale);
-            shared.rstd[v] = scale;
+            // The dot rounds, then the rstd, then the scale (the
+            // reference's mul_mat, then its soft_max's in-place scale);
+            // this order is the gate.
+            const float s = shared.rstd[v] * shared.prob[q][v] * args.scale;
+            shared.prob[q][v] = s;
+            mx = max(mx, s);
         }
-        for (uint q = 0u; q < nq; ++q) {
-            float mx = -INFINITY;
-            for (uint v = 0u; v < vecs; ++v) {
-                // The dot rounds, then the rstd, then the scale (the
-                // reference's mul_mat, then its soft_max's in-place scale);
-                // this order is the gate.
-                const float s = shared.rstd[v] * shared.prob[q][v] * args.scale;
-                shared.prob[q][v] = s;
-                mx = max(mx, s);
-            }
-            float total = 0.f;
-            for (uint v = 0u; v < vecs; ++v) {
-                const float e = exp(shared.prob[q][v] - mx);
-                shared.prob[q][v] = e;
-                total += e;
-            }
-            const float p = 1.f / total;
-            for (uint v = 0u; v < vecs; ++v) {
-                shared.prob[q][v] = usable ? shared.prob[q][v] * p : NAN;
-            }
+        float total = 0.f;
+        for (uint v = 0u; v < vecs; ++v) {
+            const float e = exp(shared.prob[q][v] - mx);
+            shared.prob[q][v] = e;
+            total += e;
         }
-        if (!usable) {
-            raise(faults, uint(args.layer), BLOOMERY_FAULT_SITE_NORM_QUANT);
+        const float p = 1.f / total;
+        for (uint v = 0u; v < vecs; ++v) {
+            shared.prob[q][v] = usable ? shared.prob[q][v] * p : NAN;
         }
+    }
+    if (tid == 0u && !usable) {
+        raise(faults, uint(args.layer), BLOOMERY_FAULT_SITE_NORM_QUANT);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // The weighted sum of the normed states, a query row an output row.
-    for (uint j = tid; j < n; j += MIX_THREADS) {
-        for (uint q = 0u; q < nq; ++q) {
-            float acc = 0.f;
-            for (uint v = 0u; v < vecs; ++v) {
-                device const float *src =
-                    v < args.n_banks ? banks + v * args.stride + row : cur + row;
-                const float normed = src[j] * shared.rstd[v];
-                acc = fma(shared.prob[q][v], normed, acc);
+    for (uint j0 = tid; j0 < n; j0 += MIX_THREADS * MIX_COLS) {
+        float state[MIX_COLS][BLOOMERY_INK2_MIX_VECS];
+        FOR_UNROLL(uint c = 0u; c < MIX_COLS; ++c) {
+            const uint j = j0 + MIX_THREADS * c;
+            FOR_UNROLL(uint v = 0u; v < BLOOMERY_INK2_MIX_VECS; ++v) {
+                state[c][v] = 0.f;
+                if (j < n && v < vecs) {
+                    device const float *src =
+                        v < args.n_banks ? banks + v * args.stride + row : cur + row;
+                    state[c][v] = src[j];
+                }
             }
-            y[t * nq * n + q * n + j] = acc;
+        }
+        FOR_UNROLL(uint c = 0u; c < MIX_COLS; ++c) {
+            const uint j = j0 + MIX_THREADS * c;
+            if (j >= n) {
+                break;
+            }
+            for (uint q = 0u; q < nq; ++q) {
+                float acc = 0.f;
+                FOR_UNROLL(uint v = 0u; v < BLOOMERY_INK2_MIX_VECS; ++v) {
+                    if (v < vecs) {
+                        const float normed = state[c][v] * shared.rstd[v];
+                        acc = fma(shared.prob[q][v], normed, acc);
+                    }
+                }
+                y[t * nq * n + q * n + j] = acc;
+            }
         }
     }
 }

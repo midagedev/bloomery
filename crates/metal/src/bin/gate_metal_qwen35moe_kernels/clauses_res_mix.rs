@@ -175,30 +175,121 @@ pub fn res_mix(h: &Harness<'_>) -> Clause {
     )))
 }
 
-/// A vector that is not a number makes its row's mixes NaN, raises the norm
-/// site, and moves no other row: the clean launch's bits stand beside it.
+/// A vector that is not a number, or whose sum of squares overflows, makes
+/// its row's mixes NaN, raises the norm site, and moves no other row: the
+/// clean launch's bits stand beside it.
 pub fn res_mix_nan(h: &Harness<'_>) -> Clause {
     let clean = case(4, 2, 0x41C0);
     let want = launch(h, &clean)?;
     common::expect_clean(h, "the clean mix")?;
-    let mut bad = case(4, 2, 0x41C0);
-    bad.banks[2][HIDDEN + 700] = f32::NAN;
-    let got = launch(h, &bad)?;
-    common::expect_fault(h, "a NaN in bank 2's row 1", FaultSite::NormQuant)?;
-    let per = bad.nq * HIDDEN;
-    for t in 0..ROWS {
-        let (g, w) = (&got[t * per..(t + 1) * per], &want[t * per..(t + 1) * per]);
-        if t == 1 {
-            if !g.iter().all(|v| v.is_nan()) {
-                return Err("a NaN vector left a mix value that is not NaN".to_string());
-            }
+    let per = clean.nq * HIDDEN;
+    // (row, what): a NaN in bank 2's row 1, a value whose square overflows in
+    // bank 1's row 2.
+    for (row, what) in [(1usize, "a NaN"), (2, "an overflowing value")] {
+        let mut bad = case(4, 2, 0x41C0);
+        if row == 1 {
+            bad.banks[2][HIDDEN + 700] = f32::NAN;
         } else {
-            ink2::same(&format!("row {t} beside a NaN in row 1"), g, w)?;
+            bad.banks[1][2 * HIDDEN + 100] = 1.0e20;
+        }
+        let got = launch(h, &bad)?;
+        common::expect_fault(h, &format!("{what} in row {row}"), FaultSite::NormQuant)?;
+        for t in 0..ROWS {
+            let (g, w) = (&got[t * per..(t + 1) * per], &want[t * per..(t + 1) * per]);
+            if t == row {
+                if !g.iter().all(|v| v.is_nan()) {
+                    return Err(format!("{what} left a mix value that is not NaN"));
+                }
+            } else {
+                ink2::same(&format!("row {t} beside {what} in row {row}"), g, w)?;
+            }
         }
     }
     Ok(Verdict::Noted(
-        "a NaN vector is NaN in its row's mixes alone and raises the norm site".to_string(),
+        "a NaN vector, and one whose sum of squares overflows, is NaN in its row's mixes alone and raises the norm site"
+            .to_string(),
     ))
+}
+
+/// Row counts past one, as the prompt pass launches them: an m = 2 and an
+/// m = 512 launch over the most vectors and query rows, the banks a stride
+/// of `m · n` and garbage apart, every row's mixes the bits of the m = 1
+/// launch of that row alone.
+pub fn res_mix_rows(h: &Harness<'_>) -> Clause {
+    let n = HIDDEN;
+    let (n_banks, nq) = (MIX_VECS - 1, MIX_NQ);
+    let scale = (1.0 / (n as f64).sqrt()) as f32;
+    for (i, m) in [2usize, 512].into_iter().enumerate() {
+        let seed = 0x4200 + 32 * i as u64;
+        let stride = m * n + PAD;
+        let mut flat = Vec::with_capacity(n_banks * stride);
+        for b in 0..n_banks {
+            flat.extend(ink2::draw(m * n, seed + b as u64, 0.4 + 0.45 * b as f32));
+            flat.extend(std::iter::repeat_n(1.0e6f32, PAD));
+        }
+        let banks = ink2::up(h, &flat)?;
+        let cur = ink2::up(h, &ink2::draw(m * n, seed + 100, 1.7))?;
+        let queries = ink2::up(h, &ink2::draw(nq * n, seed + 200, 3.0))?;
+        let per = nq * n;
+        let mut whole = ink2::up(h, &ink2::blank(m * per))?;
+        let mut apart = ink2::up(h, &ink2::blank(m * per))?;
+        h.clear_fault()?;
+        h.encode(|encoder| {
+            h.kernels.res_mix(
+                encoder,
+                ResMixParams {
+                    n,
+                    nq,
+                    m,
+                    n_banks,
+                    stride,
+                    banks: Some(banks.window(Elems(0), Elems(flat.len()))?),
+                    cur: cur.window(Elems(0), Elems(m * n))?,
+                    queries: queries.window(Elems(0), Elems(per))?,
+                    y: whole.window_mut(Elems(0), Elems(m * per))?,
+                    eps: EPS,
+                    scale,
+                    faults: h.device.fault_word(),
+                    layer: LAYER,
+                },
+            )?;
+            for t in 0..m {
+                h.kernels.res_mix(
+                    encoder,
+                    ResMixParams {
+                        n,
+                        nq,
+                        m: 1,
+                        n_banks,
+                        stride,
+                        banks: Some(banks.window(Elems(t * n), Elems((n_banks - 1) * stride + n))?),
+                        cur: cur.window(Elems(t * n), Elems(n))?,
+                        queries: queries.window(Elems(0), Elems(per))?,
+                        y: apart.window_mut(Elems(t * per), Elems(per))?,
+                        eps: EPS,
+                        scale,
+                        faults: h.device.fault_word(),
+                        layer: LAYER,
+                    },
+                )?;
+            }
+            Ok(())
+        })?;
+        common::expect_clean(h, "the rows' mixes")?;
+        let (got, want) = (ink2::read(h, &whole)?, ink2::read(h, &apart)?);
+        ink2::written("the rows' mixes", &got)?;
+        ink2::written("the rows' own mixes", &want)?;
+        for t in 0..m {
+            ink2::same(
+                &format!("{m} rows: row {t} against its own launch"),
+                &got[t * per..(t + 1) * per],
+                &want[t * per..(t + 1) * per],
+            )?;
+        }
+    }
+    Ok(Verdict::Noted(format!(
+        "every row of an m = 2 and an m = 512 mix is its own m = 1 launch's bits, {n_banks} banks and {nq} query rows"
+    )))
 }
 
 /// The shapes and windows the launch refuses by name, nothing encoded.
@@ -319,6 +410,7 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<
     vec![
         ("res_mix", Box::new(|| res_mix(h)) as ClauseRun),
         ("res_mix_nan", Box::new(|| res_mix_nan(h))),
+        ("res_mix_rows", Box::new(|| res_mix_rows(h))),
         ("res_mix_bounds", Box::new(|| res_mix_bounds(h))),
     ]
 }

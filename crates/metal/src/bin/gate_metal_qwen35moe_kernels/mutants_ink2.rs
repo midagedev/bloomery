@@ -11,8 +11,8 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         clause: "res_mix",
         why: "the weighted sum takes the raw vectors, not the normed ones",
         edits: &[(
-            "const float normed = src[j] * shared.rstd[v];",
-            "const float normed = src[j];",
+            "const float normed = state[c][v] * shared.rstd[v];",
+            "const float normed = state[c][v];",
             1,
         )],
     },
@@ -37,12 +37,62 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         )],
     },
     Mutant {
+        name: "res_mix_prefetch_pass_skips",
+        clause: "res_mix",
+        why: "a lane's next pass of loads starts a value late: the scores drop values",
+        edits: &[(
+            "j0 < n; j0 += 32u * MIX_PREFETCH",
+            "j0 < n; j0 += 32u * MIX_PREFETCH + 32u",
+            1,
+        )],
+    },
+    Mutant {
+        name: "res_mix_softmax_row_zero",
+        clause: "res_mix",
+        why: "every softmax thread takes query row 0: the other rows keep raw dots",
+        edits: &[(
+            "        const uint q = tid;\n",
+            "        const uint q = 0u;\n",
+            1,
+        )],
+    },
+    Mutant {
+        name: "res_mix_sum_pass_skips",
+        clause: "res_mix",
+        why: "a thread's next pass of outputs starts a row late: outputs go unwritten",
+        edits: &[(
+            "j0 < n; j0 += MIX_THREADS * MIX_COLS",
+            "j0 < n; j0 += MIX_THREADS * MIX_COLS + MIX_THREADS",
+            1,
+        )],
+    },
+    Mutant {
+        name: "res_mix_reads_row_zero",
+        clause: "res_mix_rows",
+        why: "every row's mix reads row 0's banks and stream",
+        edits: &[(
+            "    const uint row = t * n;\n    const uint sg = tid / 32u;",
+            "    const uint row = 0u;\n    const uint sg = tid / 32u;",
+            1,
+        )],
+    },
+    Mutant {
         name: "res_mix_nan_unraised",
         clause: "res_mix_nan",
         why: "an unusable vector raises nothing",
         edits: &[(
-            "usable = usable && rms_usable(shared.rstd[v], scale);",
-            "usable = true;",
+            "if (tid == 0u && !usable) {",
+            "if (tid == 0u && false) {",
+            1,
+        )],
+    },
+    Mutant {
+        name: "res_mix_overflow_usable",
+        clause: "res_mix_nan",
+        why: "a vector whose sum of squares overflows is mixed at a zero scale instead of failing",
+        edits: &[(
+            "shared.rstd[v] = rms_usable(shared.rstd[v], scale) ? scale : NAN;",
+            "shared.rstd[v] = scale;",
             1,
         )],
     },
@@ -191,8 +241,8 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         clause: "loop_control",
         why: "the forget gate adds to the stream instead of removing from it",
         edits: &[(
-            "(1.0f - tanh(f)) * cur[row + j]",
-            "(1.0f + tanh(f)) * cur[row + j]",
+            "(1.0f - tanh(f)) * c + tanh(g) * m;",
+            "(1.0f + tanh(f)) * c + tanh(g) * m;",
             1,
         )],
     },
@@ -200,11 +250,49 @@ pub const INK2_MUTANTS: &[Mutant] = &[
         name: "loop_control_down_cur_only",
         clause: "loop_control",
         why: "the down projection reads the stream half of the staged row alone",
+        edits: &[("const uint kn = 2u * n;", "const uint kn = n;", 1)],
+    },
+    Mutant {
+        name: "loop_control_down_pass_skips",
+        clause: "loop_control",
+        why: "a lane's next pass of down weights starts a value late: the dots drop weights",
         edits: &[(
-            "for (uint k = lane; k < 2u * n; k += 32u) {",
-            "for (uint k = lane; k < n; k += 32u) {",
+            "k0 < kn; k0 += 32u * LC_DOWN_PREFETCH",
+            "k0 < kn; k0 += 32u * LC_DOWN_PREFETCH + 32u",
             1,
         )],
+    },
+    Mutant {
+        name: "loop_control_scales_pass_first",
+        clause: "loop_control",
+        why: "every stream value a thread loads is its pass's first: the stream half's norm is wrong",
+        edits: &[("c[i] = cur[row + j];", "c[i] = cur[row + j0];", 1)],
+    },
+    Mutant {
+        name: "loop_control_merge_pass_first",
+        clause: "loop_control",
+        why: "every pass of a merge reads the row's first gain weights",
+        edits: &[(
+            "gv[u] = float4(gw[d0 / 4u + u]);",
+            "gv[u] = float4(gw[u]);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "loop_control_down_reads_row_zero",
+        clause: "loop_control_rows",
+        why: "every row's down projection reads row 0's stream and message",
+        edits: &[(
+            "loop_control_scales(cur, msg, args, t * n, tid, true, staged, partials, rstd);",
+            "loop_control_scales(cur, msg, args, 0u, tid, true, staged, partials, rstd);",
+            1,
+        )],
+    },
+    Mutant {
+        name: "loop_control_merge_reads_row_zero",
+        clause: "loop_control_rows",
+        why: "every row's merge reads row 0's down projection",
+        edits: &[("hs[d] = h[t * rank + d];", "hs[d] = h[d];", 1)],
     },
     Mutant {
         name: "loop_control_down_first_block",

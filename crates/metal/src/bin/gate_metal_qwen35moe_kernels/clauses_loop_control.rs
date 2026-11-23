@@ -202,6 +202,84 @@ pub fn loop_control_nan(h: &Harness<'_>) -> Clause {
     ))
 }
 
+/// Row counts past one, as the prompt pass launches them: an m = 2 and an
+/// m = 512 controller (the grid's height the rows), every row's merge the
+/// bits of the m = 1 launch of that row alone.
+pub fn loop_control_rows(h: &Harness<'_>) -> Clause {
+    let w = weights(0x4760);
+    let (down, gain, forget) = (
+        ink2::up(h, &w.down)?,
+        ink2::up(h, &w.gain)?,
+        ink2::up(h, &w.forget)?,
+    );
+    for (i, m) in [2usize, 512].into_iter().enumerate() {
+        let seed = 0x4770 + 8 * i as u64;
+        let cur = ink2::up(h, &ink2::draw(m * N, seed, 2.0))?;
+        let msg = ink2::up(h, &ink2::draw(m * N, seed + 1, 0.7))?;
+        let mut whole = ink2::up(h, &ink2::blank(m * N))?;
+        let mut whole_h = ink2::up(h, &ink2::blank(m * RANK))?;
+        let mut apart = ink2::up(h, &ink2::blank(m * N))?;
+        let mut apart_h = ink2::up(h, &ink2::blank(m * RANK))?;
+        h.clear_fault()?;
+        h.encode(|encoder| {
+            h.kernels.loop_control(
+                encoder,
+                LoopControlParams {
+                    n: N,
+                    rank: RANK,
+                    m,
+                    cur: cur.window(Elems(0), Elems(m * N))?,
+                    msg: msg.window(Elems(0), Elems(m * N))?,
+                    down: down.window(Elems(0), Elems(w.down.len()))?,
+                    gain: gain.window(Elems(0), Elems(w.gain.len()))?,
+                    forget: forget.window(Elems(0), Elems(w.forget.len()))?,
+                    y: whole.window_mut(Elems(0), Elems(m * N))?,
+                    h: whole_h.window_mut(Elems(0), Elems(m * RANK))?,
+                    eps: EPS,
+                    faults: h.device.fault_word(),
+                    layer: LAYER,
+                },
+            )?;
+            for t in 0..m {
+                h.kernels.loop_control(
+                    encoder,
+                    LoopControlParams {
+                        n: N,
+                        rank: RANK,
+                        m: 1,
+                        cur: cur.window(Elems(t * N), Elems(N))?,
+                        msg: msg.window(Elems(t * N), Elems(N))?,
+                        down: down.window(Elems(0), Elems(w.down.len()))?,
+                        gain: gain.window(Elems(0), Elems(w.gain.len()))?,
+                        forget: forget.window(Elems(0), Elems(w.forget.len()))?,
+                        y: apart.window_mut(Elems(t * N), Elems(N))?,
+                        h: apart_h.window_mut(Elems(t * RANK), Elems(RANK))?,
+                        eps: EPS,
+                        faults: h.device.fault_word(),
+                        layer: LAYER,
+                    },
+                )?;
+            }
+            Ok(())
+        })?;
+        common::expect_clean(h, "the rows' controller")?;
+        let (got, want) = (ink2::read(h, &whole)?, ink2::read(h, &apart)?);
+        ink2::written("the rows' controller", &got)?;
+        ink2::written("the rows' own controllers", &want)?;
+        for t in 0..m {
+            ink2::same(
+                &format!("{m} rows: row {t} against its own launch"),
+                &got[t * N..(t + 1) * N],
+                &want[t * N..(t + 1) * N],
+            )?;
+        }
+    }
+    Ok(Verdict::Noted(
+        "every row of an m = 2 and an m = 512 controller is its own m = 1 launch's bits"
+            .to_string(),
+    ))
+}
+
 /// The shapes and windows the launch refuses by name: the Small's hidden is
 /// the staging's named refusal.
 pub fn loop_control_bounds(h: &Harness<'_>) -> Clause {
@@ -347,6 +425,7 @@ pub fn table<'a>(ctx: &'a super::ClauseCtx<'a>) -> Vec<(&'static str, ClauseRun<
     vec![
         ("loop_control", Box::new(|| loop_control(h)) as ClauseRun),
         ("loop_control_nan", Box::new(|| loop_control_nan(h))),
+        ("loop_control_rows", Box::new(|| loop_control_rows(h))),
         ("loop_control_bounds", Box::new(|| loop_control_bounds(h))),
         ("out_gate", Box::new(|| out_gate(h))),
         ("out_gate_nan", Box::new(|| out_gate_nan(h))),

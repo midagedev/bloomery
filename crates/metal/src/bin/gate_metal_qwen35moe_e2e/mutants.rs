@@ -467,8 +467,8 @@ pub const INKLING2: &[Mutant] = &[
         why: "the loop controllers' forget gate adds to the stream instead of removing from it, \
               which only a message visit reads",
         edits: &[(
-            "(1.0f - tanh(f)) * cur[row + j]",
-            "(1.0f + tanh(f)) * cur[row + j]",
+            "(1.0f - tanh(f)) * c + tanh(g) * m;",
+            "(1.0f + tanh(f)) * c + tanh(g) * m;",
             1,
         )],
     },

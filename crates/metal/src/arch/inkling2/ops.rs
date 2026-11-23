@@ -1,7 +1,8 @@
 //! The walk of one Inkling 2 token over its visits: the dispatches of a
 //! visit in the reference's order (`mlx_lm/models/inkling2/layers.py`,
-//! `DecoderLayer.__call__`), all of them on one concurrent encoder of one
-//! command buffer, one commit and one wait a token. A barrier stands where a
+//! `DecoderLayer.__call__`), all of them on concurrent encoders of
+//! three command buffers committed as the host encodes them (the first after
+//! two visits, the second halfway), one wait a token. A barrier stands where a
 //! dispatch reads what an earlier one wrote (or writes what it read), and
 //! each one names that hazard.
 //!
@@ -72,6 +73,18 @@ enum Src {
     Rows(usize),
     Amix(usize),
     Xin(usize),
+}
+
+/// The visits of a token's first command buffer: few enough that the card
+/// starts while the host encodes the rest, enough that the host's encode of
+/// the rest ends before the card runs out of them.
+const FIRST_CHUNK_VISITS: usize = 2;
+
+/// Whether a plain step commits the command buffer it holds after visit
+/// `vi` of `visits`: after the first chunk, and halfway, so the host's
+/// encode of the token's tail overlaps the card's run of its head.
+fn chunk_ends(vi: usize, visits: usize) -> bool {
+    vi + 1 == FIRST_CHUNK_VISITS || vi + 1 == visits / 2
 }
 
 /// One token's walk over the session's buffers.
@@ -220,6 +233,14 @@ impl Walk<'_> {
                 let (rec, _) = tr.finish();
                 self.flush(rec)?;
                 self.back_taps(vi, banks, t)?;
+                tr = stream.begin()?.open_token_encoder()?;
+            } else if !split && chunk_ends(vi, self.c.visits.len()) {
+                // The card runs the token's first visits while the host
+                // encodes the rest: the chunk signals the token boundary at
+                // its end, and the next chunk's encoder waits for it.
+                let (rec, _) = tr.finish();
+                // The token's closing sync reads every chunk's failure.
+                drop(stream.submit_signalled(rec)?);
                 tr = stream.begin()?.open_token_encoder()?;
             }
             if v.pass_end {
