@@ -106,9 +106,9 @@ lab-metal:
 
 # Inkling 2 Mini's MLX folder read back on an Apple Silicon Mac: every tensor's span summed per shard and in all, against
 # the resident bytes the Metal plan names. It reads the machine's own copy of the folder, `$BLOOMERY_REF_MODEL`, after
-# the device gate holds the Metal lock's checks (tools/mac-gate.sh).
+# the device gate holds the Metal lock's checks (tools/mac-gate.sh). Unset, the test fails naming the variable.
 lab-metal-ink2-bytes:
-    bash tools/ref/needs-env.sh lab-metal-ink2-bytes BLOOMERY_REF_MODEL && cargo build --release -p bloomery-metal --bin gate_metal_device && ./tools/mac-gate.sh gate_metal_device && cargo test -p bloomery-metal --lib --features encode-trace -- --ignored --exact arch::inkling2::layout::tests::hw_inkling2_mini_mlx4_resident_bytes
+    cargo build --release -p bloomery-metal --bin gate_metal_device && ./tools/mac-gate.sh gate_metal_device && cargo test -p bloomery-metal --lib --features encode-trace -- --ignored --exact arch::inkling2::layout::tests::hw_inkling2_mini_mlx4_resident_bytes
 
 # The Metal session's e2e gate on an Apple Silicon Mac, run by tools/mac-gate.sh over eight rows (`--row`): the qwen35moe
 # MLX split, then the qwen3moe MLX split (attention layers only, no shared expert, no recurrent store; the clauses that
