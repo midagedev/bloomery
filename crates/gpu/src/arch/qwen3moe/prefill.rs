@@ -53,6 +53,7 @@ use super::program::{self, Program, Tail};
 use super::scratch::{Arena, Dims, Forms, IN_IDS, IN_POS0, Inbox, Io, param_view, put_input};
 use super::ubatch::UbCtx;
 use super::wide::GEMV_COLS;
+use crate::DeviceBufferRaw;
 use crate::head::Head;
 use crate::host::BatchLeg;
 use crate::model::{GpuModel, StepMode};
@@ -289,7 +290,7 @@ impl Prefill {
         // argument); the window lives for this enqueue, and the image stays
         // in place until the copy has run (it is reallocated only at load).
         let src = unsafe { param_view::<u32>(self.image.dev(), chunk * BLOCK, BLOCK) };
-        self.slot.copy_from_device_async(&src, stream)?;
+        self.slot.copy_from_device_raw(&src, stream)?;
         self.staged = Some(chunk);
         Ok(())
     }
@@ -873,8 +874,7 @@ impl GpuModel<Body> {
                         body.run_ubatch(gpu, w, tokens, pos)?;
                         if last {
                             let row = body.ub.last_row(t)?;
-                            head.input_mut()
-                                .copy_from_device_async(&row, gpu.stream())?;
+                            head.input_mut().copy_from_device_raw(&row, gpu.stream())?;
                             dispatch::enqueue_head(gpu, w, &body.k, &mut body.head_state, head)?;
                         }
                         Ok(last)

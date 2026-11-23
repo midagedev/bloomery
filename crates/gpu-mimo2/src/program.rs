@@ -18,6 +18,7 @@
 //! The launches per layer and the step's counts are the description's facts
 //! ([`model::arch::mimo2::program`]: `step_launches`, `step_memops`).
 
+use bloomery_gpu::DeviceBufferRaw;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::StepLeg;
 use bloomery_gpu::host::run::HostRun;
@@ -89,7 +90,7 @@ impl StepProgram<'_, '_> {
         } else {
             &self.parts.s.x
         };
-        tap.copy_from_device_async(out, self.gpu.stream())?;
+        tap.copy_from_device_raw(out, self.gpu.stream())?;
         Ok(())
     }
 }

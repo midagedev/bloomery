@@ -28,6 +28,7 @@
 //! next unit's front ran is the unit's own: its record (each row's live count, selected count,
 //! walk pair, rope row and its bits) and its list.
 
+use bloomery_gpu::DeviceBufferRaw;
 use bloomery_gpu::arch::hybrid::{Site, WideCx, project_wide, wide_acts_at};
 use bloomery_gpu::flash::{FlashGeom, FlashMergeSelArgs, FlashSelArgs, segments_for};
 use bloomery_gpu::gemm::{GemmKernels, GemmRoute};
@@ -945,7 +946,7 @@ impl<'a> Attention<'a> {
             // holds that row.
             if let Some(f) = forced.filter(|f| f.layer == l && rec.end == call_end) {
                 let mut row = span_mut(WHAT, unit_list, (m - 1) * sh.top_k, sh.top_k)?;
-                row.copy_from_device_async(&f.list, stream)?;
+                row.copy_from_device_raw(&f.list, stream)?;
             }
             if let Some(tap) = self
                 .sel
@@ -963,8 +964,8 @@ impl<'a> Attention<'a> {
                     (last % IDX_CHUNK) * rows_k,
                     rows_k,
                 )?;
-                tap.list.copy_from_device_async(&list, stream)?;
-                tap.scores.copy_from_device_async(&scores, stream)?;
+                tap.list.copy_from_device_raw(&list, stream)?;
+                tap.scores.copy_from_device_raw(&scores, stream)?;
             }
         }
         // 6. the absorbed queries, eight rows a launch, each the step's own bits; a roped layer's

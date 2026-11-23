@@ -73,6 +73,7 @@
 //! windows of those words. The gather's pairs are fixed at load from the
 //! image's layout.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::mem::{ManuallyDrop, size_of};
 use std::ops::Range;
 
@@ -774,7 +775,7 @@ impl AttnChain {
     /// row a faulted step left non-finite would raise on every later step.
     pub fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         if let Some(src) = self.scratch.source.as_mut() {
-            src.pre.zero_async(stream)?;
+            src.pre.zero_raw(stream)?;
         }
         Ok(())
     }
@@ -2077,7 +2078,7 @@ fn enqueue_select(
                                   (AttnChain::arm_cand_tap), and a captured step holds no tap",
                     });
                 }
-                count_of(tap, m)?.copy_from_device_async(&a.scratch.scores, stream)?;
+                count_of(tap, m)?.copy_from_device_raw(&a.scratch.scores, stream)?;
             }
             ck.enqueue_compact(
                 stream,

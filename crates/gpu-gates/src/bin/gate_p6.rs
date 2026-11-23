@@ -45,6 +45,8 @@
 //! keeps it closed.
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu::DeviceBufferRaw;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{Fnv1a64, GateError, ptx_shapes, verdict};
 
 #[cfg(feature = "gpu")]
@@ -456,12 +458,12 @@ fn run() -> Result<(), GateError> {
         r0u.to_host_vec(stream)?,
         r0d.to_host_vec(stream)?,
     );
-    probs_dev.zero_async(stream)?;
-    ids_dev.zero_async(stream)?;
-    w_dev.zero_async(stream)?;
-    r0g.zero_async(stream)?;
-    r0u.zero_async(stream)?;
-    r0d.zero_async(stream)?;
+    probs_dev.zero_raw(stream)?;
+    ids_dev.zero_raw(stream)?;
+    w_dev.zero_raw(stream)?;
+    r0g.zero_raw(stream)?;
+    r0u.zero_raw(stream)?;
+    r0d.zero_raw(stream)?;
     stream.synchronize()?;
     let graph = gpu.capture(|_s| {
         chain(

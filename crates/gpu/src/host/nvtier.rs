@@ -7356,7 +7356,7 @@ pub(super) mod tests {
                 drop(pin);
             }
             drop(graph.take());
-            drop(std::mem::ManuallyDrop::into_inner(arena).into_raw_parts());
+            drop(std::mem::ManuallyDrop::into_inner(arena));
         }
     }
 

@@ -51,6 +51,7 @@
 //! walk's host leg; until then it stays on the card's fault word, which the
 //! target's next readback names.
 
+use bloomery_gpu::DeviceBufferRaw;
 use bloomery_gpu::draft::{
     ChainBlock, DraftFeed, DraftHead, Feed, Held, Hidden, Proposal, SlotDraft, WalkBounds,
     WalkMode, chain_rows, refuse_own, refuse_rows,
@@ -413,7 +414,7 @@ impl Nextn {
         n: usize,
     ) -> Result<(), GpuError> {
         span_mut(WHAT, &mut self.a.round, to, n)?
-            .copy_from_device_async(&*span(WHAT, self.head.token_words(), from, n)?, stream)?;
+            .copy_from_device_raw(&*span(WHAT, self.head.token_words(), from, n)?, stream)?;
         Ok(())
     }
 
@@ -1320,7 +1321,7 @@ impl Body {
         } = nx;
         let ln = &nm.latent;
         row.x
-            .copy_from_device_async(&*span(WHAT, &a.x, r * n, n)?, stream)?;
+            .copy_from_device_raw(&*span(WHAT, &a.x, r * n, n)?, stream)?;
         row.pos.copy_from_host(stream, &[p])?;
         row.vis.copy_from_host(stream, &[0, p + 1])?;
         row.cnt.copy_from_host(stream, &[p + 1])?;

@@ -72,6 +72,7 @@ mod gate {
     use crate::dense_file::{
         Decl, by_name, check, columns, decl, host_rows, mma_neighbours, q8_0_bytes,
     };
+    use bloomery_gpu::DeviceBufferRaw;
     use bloomery_gpu::gemm::{Gemm32Kernels, GemmInput, GemmKernels, GemmRoute};
     use bloomery_gpu::head::{Head, HeadNorm};
     use bloomery_gpu::q8f32::Bf16GemvIdsArgs;
@@ -418,7 +419,7 @@ mod gate {
                 }
             }
             if (1..=8).contains(&m) {
-                y_dev.zero_async(stream)?;
+                y_dev.zero_raw(stream)?;
                 stream.synchronize()?;
                 let graph =
                     gpu.capture(|_| site::gemv(gpu, g32, (ty, w, name), &x_dev, m, &mut y_dev))?;

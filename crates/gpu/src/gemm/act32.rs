@@ -14,6 +14,7 @@ use super::f32tile::FORM_THREADS;
 use super::f32tile::NATIVE_BUILD;
 use super::kernels32::Gemm32Kernels;
 use super::{GEMM_MAX_SLOTS, GEMM32_STEP};
+use crate::DeviceBufferRaw;
 use crate::fault::FaultSink;
 use crate::kquant::Act;
 use crate::tensor::Q8ACT_MAX_K;
@@ -223,7 +224,7 @@ impl GemmAct32 {
     ) -> Result<[&mut DeviceBuffer<u32>; 3], GpuError> {
         let f = self.room(what, form, k, n)?;
         f.of = None;
-        f.refused.zero_async(stream)?;
+        f.refused.zero_raw(stream)?;
         Ok([&mut f.words, &mut f.scales, &mut f.refused])
     }
 

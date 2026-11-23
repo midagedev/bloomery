@@ -2181,7 +2181,7 @@ impl SwapMachine {
         }
         let rule = SwapMachine::rule_of(&layout, &cfg, n_expert, &unrouted)?;
         let events = (0..layers.len() * cfg.params.spares)
-            .map(|_| ctx.new_event(None))
+            .map(|_| ctx.new_event_with_flags(None))
             .collect::<Result<Vec<_>, _>>()?;
         let mut ledger = SlotLedger::of_map(slots)?;
         for (l, &reserved) in layers.clone().zip(&layout.withdrawn) {
@@ -2190,15 +2190,15 @@ impl SwapMachine {
             row[at..].fill(SlotState::Withdrawn);
         }
         let copy = crate::role_stream(ctx, crate::StreamRole::Background)?;
-        let boundary_event = ctx.new_event(None)?;
+        let boundary_event = ctx.new_event_with_flags(None)?;
         let call_landed = (0..layers.len())
-            .map(|_| ctx.new_event(None))
+            .map(|_| ctx.new_event_with_flags(None))
             .collect::<Result<Vec<_>, _>>()?;
         let call_read = (0..layers.len())
-            .map(|_| ctx.new_event(None))
+            .map(|_| ctx.new_event_with_flags(None))
             .collect::<Result<Vec<_>, _>>()?;
         let call_returned = (0..layers.len())
-            .map(|_| ctx.new_event(None))
+            .map(|_| ctx.new_event_with_flags(None))
             .collect::<Result<Vec<_>, _>>()?;
         let land = LandRows::new(ctx, layers.len(), n_expert)?;
         // The lane starts last: from here the machine's drop owns it, and

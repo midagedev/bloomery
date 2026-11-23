@@ -1637,7 +1637,7 @@ mod tests {
         let b = Boundary::with_rows(&ctx, &stream, shape, 2).expect("a boundary");
         let held = Arc::strong_count(&ctx);
         drop(b);
-        let after = Arc::strong_count(&ctx);
+        let after = crate::tensor::settled_handles(&ctx, before);
         eprintln!("boundary context handles: before {before} held {held} after {after}");
         assert!(held > before, "the boundary's buffers hold the context");
         assert_eq!(after, before, "a dropped boundary leaves no context handle");
@@ -1655,7 +1655,7 @@ mod tests {
                 ..
             })
         ));
-        let after_error = Arc::strong_count(&ctx);
+        let after_error = crate::tensor::settled_handles(&ctx, before);
         eprintln!(
             "boundary allocation failure context handles: before {before} after {after_error}"
         );

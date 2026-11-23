@@ -4416,7 +4416,7 @@ pub(crate) mod tests {
             );
             // The window frees nothing; the page goes after every launch
             // that read it drained (the reads above).
-            drop(std::mem::ManuallyDrop::into_inner(arena).into_raw_parts());
+            drop(std::mem::ManuallyDrop::into_inner(arena));
             drop(page);
         }
     }

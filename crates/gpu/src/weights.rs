@@ -10,6 +10,7 @@
 //! `model::placement::CardFormat`'s. The gates (`gate_p10`, `gate_load_v41`)
 //! pin the uploads against independent host packings bit for bit.
 
+use crate::DeviceBufferRaw;
 use crate::GpuError;
 use crate::mxfp4::Nvfp4Weight;
 use crate::mxfp4_sel::Nvfp4Stack;
@@ -209,7 +210,7 @@ impl DevWeight {
     /// other weight is dropped, as it would be anywhere.
     fn dissolve_view(self) {
         if let DevWeight::KQuant { w, .. } = self {
-            drop(w.into_buf().into_raw_parts());
+            drop(w.into_buf());
         }
     }
 
@@ -932,9 +933,9 @@ impl Weights {
                     window::<u32>(part.buf().cu_deviceptr(), words, stream.context()),
                 )
             };
-            let copied = dst.copy_from_device_async(&src, stream);
-            drop(ManuallyDrop::into_inner(dst).into_raw_parts());
-            drop(ManuallyDrop::into_inner(src).into_raw_parts());
+            let copied = dst.copy_from_device_raw(&src, stream);
+            drop(ManuallyDrop::into_inner(dst));
+            drop(ManuallyDrop::into_inner(src));
             copied?;
             at += words;
         }
@@ -1003,9 +1004,9 @@ impl Weights {
                     window::<T>(part.buf().cu_deviceptr(), len, stream.context()),
                 )
             };
-            let copied = dst.copy_from_device_async(&src, stream);
-            drop(ManuallyDrop::into_inner(dst).into_raw_parts());
-            drop(ManuallyDrop::into_inner(src).into_raw_parts());
+            let copied = dst.copy_from_device_raw(&src, stream);
+            drop(ManuallyDrop::into_inner(dst));
+            drop(ManuallyDrop::into_inner(src));
             copied?;
             at += len;
         }
@@ -1099,12 +1100,12 @@ impl Weights {
                 )
             };
             let copied = dst_qs
-                .copy_from_device_async(&src_qs, stream)
-                .and_then(|()| dst_d.copy_from_device_async(&src_d, stream));
-            drop(ManuallyDrop::into_inner(dst_qs).into_raw_parts());
-            drop(ManuallyDrop::into_inner(src_qs).into_raw_parts());
-            drop(ManuallyDrop::into_inner(dst_d).into_raw_parts());
-            drop(ManuallyDrop::into_inner(src_d).into_raw_parts());
+                .copy_from_device_raw(&src_qs, stream)
+                .and_then(|()| dst_d.copy_from_device_raw(&src_d, stream));
+            drop(ManuallyDrop::into_inner(dst_qs));
+            drop(ManuallyDrop::into_inner(src_qs));
+            drop(ManuallyDrop::into_inner(dst_d));
+            drop(ManuallyDrop::into_inner(src_d));
             copied?;
             at += n;
         }
@@ -1918,7 +1919,7 @@ fn upload_rows_in(
             if let Err(e) = ring.copy_bytes(stream, &stage, src, take) {
                 if room.is_some() {
                     // The room drops after this, and its drop drains the copies.
-                    drop(w.into_buf().into_raw_parts());
+                    drop(w.into_buf());
                 }
                 return Err(e);
             }

@@ -69,6 +69,7 @@ use super::router::gated;
 use super::scratch::{Append256, Io, cells_view};
 use super::scratch38::{Arena38, Store38, Taps38};
 use super::tier38::{STAGE_TIER, TierSide38};
+use crate::DeviceBufferRaw;
 use crate::card_slots::CardSlotKernels;
 use crate::fault::{FaultSink, LAYER_HEAD};
 use crate::flash_gqa::{FlashGqaKernels, GqaListArgs, GqaSelArgs, GqaSelSeqsArgs};
@@ -548,7 +549,7 @@ fn tap(
             .out
             .get_mut(l)
             .ok_or(GpuError::state(WHAT, "a tap for every layer"))?;
-        tap.copy_from_device_async(res, gpu.stream())?;
+        tap.copy_from_device_raw(res, gpu.stream())?;
     }
     Ok(())
 }
@@ -698,11 +699,11 @@ impl Parts38<'_> {
             t.logits
                 .get_mut(l)
                 .ok_or_else(missing)?
-                .copy_from_device_async(&s.route.logits, stream)?;
+                .copy_from_device_raw(&s.route.logits, stream)?;
             t.ids
                 .get_mut(l)
                 .ok_or_else(missing)?
-                .copy_from_device_async(&s.route.ids, stream)?;
+                .copy_from_device_raw(&s.route.ids, stream)?;
         }
         Ok(())
     }
@@ -1913,7 +1914,7 @@ impl<'a> LayerProgram for Verify38<'a> {
         let res = &self.p.s.res[self.p.cur];
         for c in &mut self.copies {
             let from = rows_of(res, &c.rows, wide)?;
-            rows_mut(c.to, &(0..c.rows.len()), wide)?.copy_from_device_async(&from, stream)?;
+            rows_mut(c.to, &(0..c.rows.len()), wide)?.copy_from_device_raw(&from, stream)?;
         }
         Ok(())
     }
@@ -1958,8 +1959,7 @@ impl<'a> Pass38<'a> {
         // values inside `mixed` (`rows · hidden`), which stays in place while
         // the window lives (one copy).
         let row = unsafe { cells_view(&self.p.s.mixed, (m - 1) * h, h) };
-        head.input_mut()
-            .copy_from_device_async(&row, gpu.stream())?;
+        head.input_mut().copy_from_device_raw(&row, gpu.stream())?;
         head.enqueue(gpu, self.p.c.w)
     }
 

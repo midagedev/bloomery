@@ -46,6 +46,7 @@
 //! call takes the rows it was given whatever it returns, and ends with a named error when it staged
 //! fewer rows than it held.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
@@ -880,7 +881,7 @@ impl<R: RouterEntry, A: BatchAttention> Walk<'_, R, A> {
         };
         let row = span(WHAT, &*unit.x, (t - 1) * n, n)?;
         head.input_mut()
-            .copy_from_device_async(&row, self.gpu.stream())?;
+            .copy_from_device_raw(&row, self.gpu.stream())?;
         let gpu = self.gpu;
         let Some(cap) = self.softcap else {
             return head.enqueue(gpu, self.w);
@@ -918,7 +919,7 @@ impl<R: RouterEntry, A: BatchAttention> Walk<'_, R, A> {
         let n = self.embd;
         let t = self.ts[u];
         let row = span(WHAT, &*self.units[u].x, (t - 1) * n, n)?;
-        Ok(tap.copy_from_device_async(&row, self.gpu.stream())?)
+        Ok(tap.copy_from_device_raw(&row, self.gpu.stream())?)
     }
 }
 

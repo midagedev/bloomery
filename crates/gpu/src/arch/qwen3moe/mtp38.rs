@@ -114,6 +114,7 @@ use super::scratch::{
     Append256, IN_IDS, IN_POS0, Inbox, KvPlanes, cells_view, param_view, put_input,
 };
 use super::scratch38::{PASS_ROWS, VERIFY_ROWS};
+use crate::DeviceBufferRaw;
 use crate::card_slots::CardAcc;
 use crate::checkpoint::bytes::{Fail, Put, Take};
 use crate::checkpoint::saved::Spans;
@@ -1071,7 +1072,7 @@ fn copy_hidden(
         (Hidden::Host(v), _) => h.copy_from_host(stream, v)?,
         (Hidden::Target { .. }, Some((t, first))) => {
             let src = Window::<f32>::of(t, first * WIDE * size_of::<f32>(), h.len())?;
-            h.copy_from_device_async(&src, stream)?;
+            h.copy_from_device_raw(&src, stream)?;
         }
         (Hidden::Target { .. }, None) => {
             return Err(GpuError::state(WHAT, "the target's streams to copy"));
@@ -1244,7 +1245,7 @@ impl TapBufs {
                 cells_view(src, 0, n),
             )
         };
-        dst.copy_from_device_async(&src, stream)?;
+        dst.copy_from_device_raw(&src, stream)?;
         Ok(())
     }
 }
@@ -2142,8 +2143,8 @@ impl Mtp38 {
                     param_view::<u32>(&a.out, 2 * m - 1, 1),
                 )
             };
-            id.copy_from_device_async(&w_id, stream)?;
-            p.copy_from_device_async(&w_p, stream)?;
+            id.copy_from_device_raw(&w_id, stream)?;
+            p.copy_from_device_raw(&w_p, stream)?;
             walks.push(m);
         }
         // The own rows are the proposal's, and no later walk reads them: the
@@ -2171,8 +2172,8 @@ impl Mtp38 {
                 param_view::<u32>(&a.out, 2 * m + 1, 1),
             )
         };
-        word.copy_from_device_async(&w_word, stream)?;
-        sites.copy_from_device_async(&w_sites, stream)?;
+        word.copy_from_device_raw(&w_word, stream)?;
+        sites.copy_from_device_raw(&w_sites, stream)?;
         let out = a.chain.to_host_vec(stream)?;
         let n = walks.len();
         let (Some(&word), Some(&sites)) =
@@ -2330,15 +2331,15 @@ impl Mtp38 {
             let pair = 2 * (b.pair + j);
             let w_id = Window::<u32>::of(&a.out, last * word, 1)?;
             WindowMut::<u32>::of_mut(&mut a.st.pos, pair * word, 1)?
-                .copy_from_device_async(&w_id, stream)?;
+                .copy_from_device_raw(&w_id, stream)?;
             let w_p = Window::<u32>::of(&a.out, (m + last) * word, 1)?;
             WindowMut::<u32>::of_mut(&mut a.st.pos, (pair + 1) * word, 1)?
-                .copy_from_device_async(&w_p, stream)?;
+                .copy_from_device_raw(&w_p, stream)?;
             if b.own > j {
                 let src = Window::<f32>::of(&a.res, last * WIDE * size_of::<f32>(), WIDE)?;
                 let mut dst =
                     WindowMut::<f32>::of_mut(&mut a.h_in, next * WIDE * size_of::<f32>(), WIDE)?;
-                dst.copy_from_device_async(&src, stream)?;
+                dst.copy_from_device_raw(&src, stream)?;
                 next += 1;
             }
         }
@@ -2349,10 +2350,10 @@ impl Mtp38 {
         // any walk of the round raised is on it.
         let w_word = Window::<u32>::of(&a.out, 2 * m * word, 1)?;
         WindowMut::<u32>::of_mut(&mut a.st.pos, 2 * CHAIN_PAIRS * word, 1)?
-            .copy_from_device_async(&w_word, stream)?;
+            .copy_from_device_raw(&w_word, stream)?;
         let w_sites = Window::<u32>::of(&a.out, (2 * m + 1) * word, 1)?;
         WindowMut::<u32>::of_mut(&mut a.st.pos, (2 * CHAIN_PAIRS + 1) * word, 1)?
-            .copy_from_device_async(&w_sites, stream)?;
+            .copy_from_device_raw(&w_sites, stream)?;
         Ok(())
     }
 
@@ -2439,8 +2440,8 @@ impl Mtp38 {
                 cells_view(&a.res, (m - 1) * WIDE, WIDE),
             )
         };
-        a.own_id.copy_from_device_async(&id, stream)?;
-        a.own_h.copy_from_device_async(&row, stream)?;
+        a.own_id.copy_from_device_raw(&id, stream)?;
+        a.own_h.copy_from_device_raw(&row, stream)?;
         Ok(())
     }
 
@@ -2552,7 +2553,7 @@ impl Mtp38 {
                     cells_view(&a.res, 0, m * WIDE),
                 )
             };
-            dst.copy_from_device_async(&src, stream)?;
+            dst.copy_from_device_raw(&src, stream)?;
         }
 
         // The attention site: its mix, then q, k and v.
@@ -2719,9 +2720,9 @@ impl Mtp38 {
             &mut a.route,
         )?;
         if let (Some(t), false) = (a.taps.as_mut(), capturing) {
-            t.logits.copy_from_device_async(&a.route.logits, stream)?;
-            t.ids.copy_from_device_async(&a.route.ids, stream)?;
-            t.weights.copy_from_device_async(&a.route.weights, stream)?;
+            t.logits.copy_from_device_raw(&a.route.logits, stream)?;
+            t.ids.copy_from_device_raw(&a.route.ids, stream)?;
+            t.weights.copy_from_device_raw(&a.route.weights, stream)?;
         }
         let pitch = a.route.dims().slots();
         k.handoff.enqueue_places_cols(
@@ -2805,8 +2806,8 @@ impl Mtp38 {
             t.node(stream, MtpNode::Routed, &a.acc, m)?;
             t.node(stream, MtpNode::Shared, &a.sh_y, m)?;
             t.node(stream, MtpNode::FfnOut, &a.y, m)?;
-            t.routed_h.copy_from_device_async(&a.rh, stream)?;
-            t.shared_h.copy_from_device_async(&a.sh_h, stream)?;
+            t.routed_h.copy_from_device_raw(&a.rh, stream)?;
+            t.shared_h.copy_from_device_raw(&a.sh_h, stream)?;
         }
 
         // The head: its site's mix (the block's combine first), the

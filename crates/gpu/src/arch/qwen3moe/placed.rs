@@ -93,6 +93,7 @@ use super::program::{Program, Stores, Tail, enqueue_tail};
 use super::scratch::{Arena, Dims, Forms, Io};
 use super::tier_leg::{self, TierCombineArgs, TierJoin};
 use super::wide::{self, CardRoute, GEMV_COLS, HostSide, arena_bytes};
+use crate::DeviceBufferRaw;
 use crate::card_leg::{
     self, CardLeg, LegBufs, LegRun, LegShape, LegStacks, RouteIo, RouteW, leg_bytes_for,
 };
@@ -1367,7 +1368,7 @@ fn widen_map(
     }
     let row = Window::<u32>::of(src, at * size_of::<u32>(), n)?;
     let mut head = WindowMut::<u32>::of_mut(map, 0, n)?;
-    head.copy_from_device_async(&row, stream)?;
+    head.copy_from_device_raw(&row, stream)?;
     Ok(())
 }
 
@@ -2732,7 +2733,7 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StepWalk<'a, S> {
                     combine_tier(&lc, p.side, p.rows, p.s, 1, sums, tier_k, out)?;
                     if let Some(t) = taps {
                         let src: &DeviceBuffer<f32> = if last { head.input_mut() } else { &p.s.x };
-                        t.rows[l].copy_from_device_async(src, stream)?;
+                        t.rows[l].copy_from_device_raw(src, stream)?;
                     }
                 }
                 _ => combine_tier(&lc, p.side, p.rows, p.s, 1, sums, tier_k, None)?,
@@ -2746,7 +2747,7 @@ impl<'a, S: Stores + ?Sized> LayerProgram for StepWalk<'a, S> {
                     combine(&lc, p.side, p.rows, p.s, 1, hsum, out)?;
                     if let Some(t) = taps {
                         let src: &DeviceBuffer<f32> = if last { head.input_mut() } else { &p.s.x };
-                        t.rows[l].copy_from_device_async(src, stream)?;
+                        t.rows[l].copy_from_device_raw(src, stream)?;
                     }
                 }
                 _ => combine(&lc, p.side, p.rows, p.s, 1, hsum, None)?,

@@ -70,6 +70,7 @@
 //! the compressed rows, the index keys and the states consistently with each
 //! other.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::mem::ManuallyDrop;
@@ -739,9 +740,9 @@ impl LayerKv {
     /// ([`LayerKv::settle`]), and a row is written by the step that completes it before any
     /// step reads it.
     fn zero(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.ring.buf_mut().zero_async(stream)?;
+        self.ring.buf_mut().zero_raw(stream)?;
         for t in [&mut self.values, &mut self.scores].into_iter().flatten() {
-            t.buf_mut().zero_async(stream)?;
+            t.buf_mut().zero_raw(stream)?;
         }
         Ok(())
     }
@@ -934,13 +935,11 @@ impl RoomShadows {
             // and the shadow are different buffers, and both outlive the
             // copy: the ring is the layer's own, and the shadow's room
             // synchronizes the context before it unmaps.
-            unsafe {
-                cuda_core::simt::memory::memcpy_dtod_async(dst, src, n * row, stream.cu_stream())
-            }
-            .map_err(|source| GpuError::Driver {
-                op: Some("cuMemcpyDtoDAsync (the ring restore)"),
-                source,
-            })?;
+            unsafe { cuda_core::memory::memcpy_dtod_async(dst, src, n * row, stream.cu_stream()) }
+                .map_err(|source| GpuError::Driver {
+                    op: Some("cuMemcpyDtoDAsync (the ring restore)"),
+                    source,
+                })?;
             q += n;
         }
         Ok(())
@@ -1241,7 +1240,7 @@ impl PinnedShadows {
             // for the context before it frees the allocation, so the copy
             // completes while `src` lives.
             let copied = unsafe { dst.copy_from_host_async_unchecked(stream, src) };
-            drop(ManuallyDrop::into_inner(dst).into_raw_parts());
+            drop(ManuallyDrop::into_inner(dst));
             copied?;
             q += n;
         }
@@ -3662,14 +3661,14 @@ impl ChainBody for Body {
         self.seq.clear(stream)?;
         for lane in &mut self.lanes {
             for t in &mut lane.hc {
-                t.buf_mut().zero_async(stream)?;
+                t.buf_mut().zero_raw(stream)?;
             }
             for f in &mut lane.folds {
-                f.zero_async(stream)?;
+                f.zero_raw(stream)?;
             }
         }
         for l in self.lists.iter_mut().flatten() {
-            l.zero_async(stream)?;
+            l.zero_raw(stream)?;
         }
         if let Some(tap) = self.tap.as_mut() {
             tap.pos = [None; PAIR_ROWS];

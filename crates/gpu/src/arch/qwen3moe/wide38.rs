@@ -192,6 +192,7 @@ use super::router::gated;
 use super::scratch::{Append256, Io, KvPlanes, PrefillFlash, RecStore, cells_view, param_view};
 use super::scratch38::{Arena38, Ple38, ROUTE_ROWS, Store38, final_res};
 use super::tier38::TierSide38;
+use crate::DeviceBufferRaw;
 use crate::GpuError;
 use crate::card_leg::{RouteBlock, RouteW, StackW, with_ring};
 use crate::card_slots::{CardAcc, CardJoin, DownRows, DownStore, SharedJoin};
@@ -2183,7 +2184,7 @@ impl WideParts<'_> {
                         cells_view(&s.route.logits, 0, n * width),
                     )
                 };
-                tw.copy_from_device_async(&lw, stream)?;
+                tw.copy_from_device_raw(&lw, stream)?;
             }
             if let Some(f) = &x.force {
                 let lf = f
@@ -2205,7 +2206,7 @@ impl WideParts<'_> {
                             cells_view(lf, (at + t) * geo::EXPERTS, geo::EXPERTS),
                         )
                     };
-                    dw.copy_from_device_async(&pw, stream)?;
+                    dw.copy_from_device_raw(&pw, stream)?;
                 }
                 self.c
                     .k
@@ -2223,8 +2224,8 @@ impl WideParts<'_> {
                     cells_view(&s.route.weights, 0, n * slots),
                 )
             };
-            iw.copy_from_device_async(&ri, stream)?;
-            ww.copy_from_device_async(&rw, stream)?;
+            iw.copy_from_device_raw(&ri, stream)?;
+            ww.copy_from_device_raw(&rw, stream)?;
             c0 += n;
         }
         if let Some(t) = x.taps.as_mut() {
@@ -2235,7 +2236,7 @@ impl WideParts<'_> {
             // SAFETY: the walk's rows r0 .. r0 + m <= taps.rows of `slots`
             // ids, inside the tap; it stays in place for the copy.
             let mut tw = unsafe { param_view::<u32>(it, u.r0 * slots, m * slots) };
-            tw.copy_from_device_async(&u.ids, stream)?;
+            tw.copy_from_device_raw(&u.ids, stream)?;
         }
         Ok(())
     }
@@ -2980,8 +2981,7 @@ impl<'a> Gemm38<'a> {
         // Row m − 1 of `mixed` (1 <= m <= rows, the walk refused anything
         // else).
         let row = Window::<f32>::of(&s.mixed, (m - 1) * h * size_of::<f32>(), h)?;
-        head.input_mut()
-            .copy_from_device_async(&row, gpu.stream())?;
+        head.input_mut().copy_from_device_raw(&row, gpu.stream())?;
         head.enqueue(gpu, self.p.c.w)
     }
 }

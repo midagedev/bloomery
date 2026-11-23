@@ -353,6 +353,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::DeviceBufferRaw;
     use std::ops::Range;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex, PoisonError, mpsc};
@@ -1095,7 +1096,7 @@ mod gate {
             // The view is taken apart without a free before the room drops.
             let held = self.view.get_mut().unwrap_or_else(PoisonError::into_inner);
             if let Some(view) = held.take() {
-                drop(view.into_raw_parts());
+                drop(view);
             }
         }
     }
@@ -2956,7 +2957,7 @@ mod gate {
         let took = t0.elapsed();
         let stall_said = show(&st.err);
         let m = st.machine.take().ok_or("gate_swap: no machine")?;
-        let ev = gpu.context().new_event(None)?;
+        let ev = gpu.context().new_event_with_flags(None)?;
         ev.record(m.copy_stream())?;
         let t1 = Instant::now();
         drop(m);
@@ -3724,7 +3725,7 @@ mod gate {
         snap: &mut [DeviceBuffer<u32>],
     ) -> Result<(), GateError> {
         for (s, buf) in snap.iter_mut().zip(&stacks.bufs[li(l)]) {
-            s.copy_from_device_async(buf, stream)?;
+            s.copy_from_device_raw(buf, stream)?;
         }
         Ok(())
     }

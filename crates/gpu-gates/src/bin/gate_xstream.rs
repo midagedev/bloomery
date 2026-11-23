@@ -732,7 +732,7 @@ mod gate {
 
         // fronts: layer 0 of two units in the walk's declared order, the
         // lane held past the first unit's shadow.
-        let new_event = || ctx.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT));
+        let new_event = || ctx.new_event_with_flags(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT));
         let (origin, front_b, landed_a) = (new_event()?, new_event()?, new_event()?);
         x.begin_call();
         x.delay_lane(LANE_HOLD);

@@ -3097,7 +3097,7 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
     runner(
         "BLOOMERY_OXIDE_BACKENDS",
         Some("oxide-backend.sh"),
-        "The directory the patched cuda-oxide backends are built into and read from, one \
+        "The directory the cuda-oxide backends are built into and read from, one \
          `<rev>/` each; unset, `${CARGO_HOME:-~/.cargo}/cuda-oxide-bloomery`.",
     ),
     runner(

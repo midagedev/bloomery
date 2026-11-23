@@ -96,13 +96,12 @@ MLX is under the MIT licence, Copyright (c) 2023 Apple Inc.:
 Apache-2.0 headers from cuda-oxide. The GPU crates depend on cuda-oxide (Apache-2.0) as a pinned git revision.
 
 `Cargo.toml` takes cuda-oxide from [NVIDIA/cuda-rust](https://github.com/NVIDIA/cuda-rust) (cuda-oxide lives under
-`cuda-oxide/` there) at revision `9df9e7cef561e03a066230b3bb433b3d8285da81`, as published: bloomery carries no fork (the
+`cuda-oxide/` there) at revision `ab2b6738a729d97db1cde2efa569f8c4cc7f9256`, as published: bloomery carries no fork (the
 fork's last pinned revision is the tag `pin/87bc9518` of [midagedev/cuda-oxide](https://github.com/midagedev/cuda-oxide)).
-One patch of the backend source is carried in `tools/oxide-backend/cuda-rust-1648.patch` and applied when
-`tools/oxide-backend.sh` builds the backend: it is
+`tools/oxide-backend.sh` builds the backend from that checkout without a patch. The one patch of the backend source that
+earlier pins needed,
 [NVIDIA/cuda-rust#1648](https://github.com/NVIDIA/cuda-rust/pull/1648) by juliankang4 (dialect-cute's verifier indexes
-its provenance facts by carrier and skips a story whose family has no operation in the scope), unchanged, until the pin
-holds it. What earlier
+its provenance facts by carrier and skips a story whose family has no operation in the scope), is in this revision. What earlier
 revisions needed from a fork is done in bloomery's own tree: the `launch_contract`
 `requires` bounds are written with integer literals (a compile-time assertion beside each kernel holds the constant the
 literal stands for), and `tools/oxide-host.sh` chooses the host CPU flags of `cargo oxide` by target triple. The range

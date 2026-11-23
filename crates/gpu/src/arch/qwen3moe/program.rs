@@ -16,6 +16,7 @@ use super::draft_taps::DraftTaps;
 use super::head_argmax::HeadArgmaxState;
 use super::plan::{DeltaPlan, FfnPlan, GqaPlan};
 use super::scratch::{Arena, Io, KvPlanes, LayerStore, StoreMut, cells_view};
+use crate::DeviceBufferRaw;
 use crate::head::Head;
 use crate::model::lookup::f32_gain;
 use crate::tensor::Window;
@@ -116,7 +117,7 @@ impl Tail<'_> {
         } = self
         {
             let src: &DeviceBuffer<f32> = if l.last { head.input_mut() } else { x };
-            t.rows[l.layer].copy_from_device_async(src, gpu.stream())?;
+            t.rows[l.layer].copy_from_device_raw(src, gpu.stream())?;
         }
         Ok(())
     }
@@ -311,8 +312,7 @@ pub(super) fn enqueue_last(
     // SAFETY: row m − 1 < rows spans `hidden` values inside `x` (rows ·
     // hidden), which stays in place while the window lives (one copy).
     let row = unsafe { cells_view(&s.x, (m - 1) * h, h) };
-    head.input_mut()
-        .copy_from_device_async(&row, gpu.stream())?;
+    head.input_mut().copy_from_device_raw(&row, gpu.stream())?;
     dispatch::enqueue_head(gpu, w, k, state, head)
 }
 
@@ -337,8 +337,7 @@ pub(super) fn enqueue_one(
         ));
     }
     let rows = Window::of(&s.x, 0, m * s.dims.hidden)?;
-    head.input_mut()
-        .copy_from_device_async(&rows, gpu.stream())?;
+    head.input_mut().copy_from_device_raw(&rows, gpu.stream())?;
     dispatch::enqueue_head(gpu, w, k, state, head)
 }
 

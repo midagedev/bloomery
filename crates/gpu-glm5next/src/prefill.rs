@@ -96,6 +96,7 @@
 //! read at the end of every group, before a mark's checkpoint can copy or
 //! seal a state the fault condemned.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::time::Instant;
@@ -522,7 +523,7 @@ fn block_rows(
         match tap {
             Hidden::Swiglu(dst) => {
                 span_mut(WHAT, dst, row, ff)?
-                    .copy_from_device_async(&*span(WHAT, h, 0, ff)?, stream)?;
+                    .copy_from_device_raw(&*span(WHAT, h, 0, ff)?, stream)?;
             }
             Hidden::GateUp([dg, du]) => {
                 let [g, u] =
@@ -533,9 +534,9 @@ fn block_rows(
                             missing: "a split block's gate and up rows",
                         })?;
                 span_mut(WHAT, dg, row, ff)?
-                    .copy_from_device_async(&*span(WHAT, g, 0, ff)?, stream)?;
+                    .copy_from_device_raw(&*span(WHAT, g, 0, ff)?, stream)?;
                 span_mut(WHAT, du, row, ff)?
-                    .copy_from_device_async(&*span(WHAT, u, 0, ff)?, stream)?;
+                    .copy_from_device_raw(&*span(WHAT, u, 0, ff)?, stream)?;
             }
         }
     }
@@ -564,7 +565,7 @@ fn tap_ffn_in(
             input: Some(tap), ..
         })) => {
             span_mut(WHAT, tap, p0 * n, t * n)?
-                .copy_from_device_async(&*span(WHAT, src, 0, t * n)?, gpu.stream())?;
+                .copy_from_device_raw(&*span(WHAT, src, 0, t * n)?, gpu.stream())?;
             Ok(())
         }
         Some(_) => Ok(()),
@@ -3016,11 +3017,11 @@ impl PromptProgram<'_> {
                 });
             };
             span_mut(WHAT, probs, p0 * N_EXPERT, t * N_EXPERT)?
-                .copy_from_device_async(&*span(WHAT, &b.probs, 0, t * N_EXPERT)?, stream)?;
+                .copy_from_device_raw(&*span(WHAT, &b.probs, 0, t * N_EXPERT)?, stream)?;
             span_mut(WHAT, ids, p0 * N_USED, t * N_USED)?
-                .copy_from_device_async(&*span(WHAT, &b.ids, 0, t * N_USED)?, stream)?;
+                .copy_from_device_raw(&*span(WHAT, &b.ids, 0, t * N_USED)?, stream)?;
             span_mut(WHAT, weights, p0 * N_USED, t * N_USED)?
-                .copy_from_device_async(&*span(WHAT, &ub.weights, 0, t * N_USED)?, stream)?;
+                .copy_from_device_raw(&*span(WHAT, &ub.weights, 0, t * N_USED)?, stream)?;
         }
         if let Some(plant) = self.planted {
             let Some(Some(TapPlanes { ids, weights, .. })) = plant.layers.get(l) else {
@@ -3030,9 +3031,9 @@ impl PromptProgram<'_> {
                 });
             };
             span_mut(WHAT, &mut b.ids, 0, t * N_USED)?
-                .copy_from_device_async(&*span(WHAT, ids, p0 * N_USED, t * N_USED)?, stream)?;
+                .copy_from_device_raw(&*span(WHAT, ids, p0 * N_USED, t * N_USED)?, stream)?;
             span_mut(WHAT, &mut ub.weights, 0, t * N_USED)?
-                .copy_from_device_async(&*span(WHAT, weights, p0 * N_USED, t * N_USED)?, stream)?;
+                .copy_from_device_raw(&*span(WHAT, weights, p0 * N_USED, t * N_USED)?, stream)?;
         }
         port.mark(at, Mark::FrontEnd as usize)?;
         let key = port.key(at);
@@ -3332,7 +3333,7 @@ impl<'a> LayerProgram for PromptProgram<'a> {
             let shadowed = if self.p.card.sums(l) { &b.pre } else { &b.sh_y };
             if self.p.card.hostless(l) {
                 span_mut(WHAT, &mut b.out, 0, t * n)?
-                    .copy_from_device_async(&*span(WHAT, shadowed, 0, t * n)?, self.gpu.stream())?;
+                    .copy_from_device_raw(&*span(WHAT, shadowed, 0, t * n)?, self.gpu.stream())?;
             } else {
                 self.gpu.elem().enqueue_add(
                     self.gpu.stream(),

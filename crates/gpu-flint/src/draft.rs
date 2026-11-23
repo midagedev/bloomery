@@ -27,6 +27,7 @@
 //! rows are copied out of the heads' inputs at the end of the walk that wrote them, the prompt unit's
 //! out of the walk's last layer ([`PromptTap`]).
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -338,11 +339,11 @@ impl Draft {
         let n = self.hidden;
         let stream = gpu.stream();
         match heads {
-            [one] => self.step.copy_from_device_async(one.input(), stream)?,
+            [one] => self.step.copy_from_device_raw(one.input(), stream)?,
             [a, b] => {
                 for (r, head) in [a, b].into_iter().enumerate() {
                     span_mut(WHAT, &mut self.pair, r * n, n)?
-                        .copy_from_device_async(&*span(WHAT, head.input(), 0, n)?, stream)?;
+                        .copy_from_device_raw(&*span(WHAT, head.input(), 0, n)?, stream)?;
                 }
             }
             _ => {
@@ -485,7 +486,7 @@ impl Draft {
             ffn.dense_rows((gpu, &self.w), (self.layer, m), (&self.x1, &mut self.x2))?;
             self.head
                 .input_mut()
-                .copy_from_device_async(&*span(WHAT, &self.x2, (m - 1) * n, n)?, stream)?;
+                .copy_from_device_raw(&*span(WHAT, &self.x2, (m - 1) * n, n)?, stream)?;
             let gain = if self.own_gain { &self.w } else { tw };
             self.head.enqueue_over(gpu, gain, tw)?;
         }
@@ -639,7 +640,7 @@ where
         .check_read(WHAT, walk, T_MAX, (first, 1), pos)?;
     let n = d.hidden;
     span_mut(WHAT, &mut d.step, 0, n)?
-        .copy_from_device_async(&*span(WHAT, &d.prefill, first * n, n)?, gpu.stream())?;
+        .copy_from_device_raw(&*span(WHAT, &d.prefill, first * n, n)?, gpu.stream())?;
     d.wrote.step = Held::at(pos - 1, 1);
     Ok(())
 }
@@ -678,7 +679,7 @@ impl Entering for PromptTap<'_> {
             .map(|r| (r.start - self.from) as usize)
             .ok_or_else(|| shape(format!("unit {u} of a group of {}", self.runs.len())))?;
         span_mut(WHAT, self.arena, at * n, t * n)?
-            .copy_from_device_async(&*span(WHAT, buf, 0, t * n)?, stream)
+            .copy_from_device_raw(&*span(WHAT, buf, 0, t * n)?, stream)
             .map_err(Into::into)
     }
 

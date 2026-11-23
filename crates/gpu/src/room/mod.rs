@@ -443,10 +443,8 @@ impl Room {
         // rooms of this device, or a room's scratch mappings of new pages)
         // that stay mapped until the stream has run the copy, and they do
         // not overlap.
-        unsafe {
-            cuda_core::simt::memory::memcpy_dtod_async(dst, src, bytes, self.stream.cu_stream())
-        }
-        .map_err(driver("cuMemcpyDtoDAsync"))
+        unsafe { cuda_core::memory::memcpy_dtod_async(dst, src, bytes, self.stream.cu_stream()) }
+            .map_err(driver("cuMemcpyDtoDAsync"))
     }
 
     /// Page `i`'s bytes zeroed on the room's stream, in order before any
@@ -462,7 +460,7 @@ impl Room {
         // SAFETY: `va` is the start of a page of this room's reservation,
         // `page` bytes long, mapped read-write for this device; the room
         // keeps a mapping there until it drops, after the device finished.
-        unsafe { cuda_core::simt::memory::memset_d8_async(va, 0, self.page, stream.cu_stream()) }
+        unsafe { cuda_core::memory::memset_d8_async(va, 0, self.page, stream.cu_stream()) }
             .map_err(driver("cuMemsetD8Async"))
     }
 
@@ -785,15 +783,15 @@ impl Drop for Room {
     }
 }
 
-/// What a room's buffers are held as: every buffer taken apart without a
-/// free when the holder drops, since its memory is the room's.
+/// What a room's buffers are held as: every buffer dropped when the holder
+/// drops, which frees nothing since its memory is the room's.
 pub(crate) trait Views {
     fn dissolve(self);
 }
 
 impl<T> Views for DeviceBuffer<T> {
     fn dissolve(self) {
-        drop(self.into_raw_parts());
+        drop(self);
     }
 }
 
@@ -887,12 +885,9 @@ impl<V: Views> Roomed<V> {
         // the range, so none frees an address in it.
         let views = std::array::from_fn(|i| {
             // SAFETY: the buffer lies in this room's reservation, which the
-            // `Roomed` below owns and outlives it: `Roomed::drop` takes every
-            // buffer apart without a free (`Views::dissolve`) before the room
-            // drops, so no `cuMemFree` ever reaches these addresses.
-            unsafe {
-                DeviceBuffer::from_raw_parts(base + (i * stride) as u64, len, Arc::clone(&ctx))
-            }
+            // `Roomed` below owns and outlives it: the buffer's storage is
+            // borrowed, so no `cuMemFree` ever reaches these addresses.
+            unsafe { crate::tensor::borrowed(base + (i * stride) as u64, len, &ctx) }
         });
         Ok(Roomed {
             views: ManuallyDrop::new(build(views)),
@@ -1067,8 +1062,8 @@ impl<V: Views> Drop for Roomed<V> {
 /// ([`StackRoom::restore`]); the range stays reserved, and the pages given back
 /// or never backed map the device's spare page. The buffer
 /// [`StackRoom::new`] returns is a view over the room's range: its holder
-/// takes it apart without a free (`DeviceBuffer::into_raw_parts`) before the
-/// room drops, as [`Views::dissolve`] does for a store's.
+/// drops it (nothing is freed: its storage is borrowed) before the room drops,
+/// as [`Views::dissolve`] does for a store's.
 pub struct StackRoom {
     room: Mutex<Roomed<()>>,
     /// Device bytes of the pages given back and not backed again.
@@ -1149,9 +1144,9 @@ impl StackRoom {
     /// A `rows × cols` tensor of words held as a room ([`StackRoom::with_backed`]
     /// over `rows · cols` words, the pages of the first `backed` rows backed: a
     /// stack of `rows` slots a plan filled `backed` of), the buffer owned by the
-    /// tensor. The tensor is a view over the room's range; its holder takes it
-    /// apart without a free (`DeviceTensor::into_buf`, then
-    /// `DeviceBuffer::into_raw_parts`) before the room drops.
+    /// tensor. The tensor is a view over the room's range; its holder drops it
+    /// (`DeviceTensor::into_buf`, then the buffer; nothing is freed) before the
+    /// room drops.
     pub(crate) fn tensor_backed(
         stream: Arc<CudaStream>,
         rows: usize,
@@ -1373,6 +1368,7 @@ mod tests {
         }
         stream.synchronize().expect("the room's work finished");
         let drain_error = DriverError(cuda_core::sys::cudaError_enum_CUDA_ERROR_UNKNOWN);
+        crate::tensor::settle_retirements();
         ctx.record_err::<()>(Err(drain_error));
         drop(p);
         assert_eq!(
@@ -1635,7 +1631,7 @@ mod tests {
         }
         stream.synchronize().expect("the room's work finished");
         // The view is taken apart without a free before the room drops.
-        drop(buf.into_raw_parts());
+        drop(buf);
         drop(room);
     }
 

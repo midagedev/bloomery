@@ -58,6 +58,7 @@
 //! deeper cut is refused by name. The fault word is read at the end of every
 //! group.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::ops::Range;
 
 use bloomery_gpu::card_experts::{CardBatch, CardExperts};
@@ -1012,7 +1013,7 @@ impl PromptProgram<'_> {
         };
         let row = span(WHAT, &ub.x, (t - 1) * n, n)?;
         head.input_mut()
-            .copy_from_device_async(&row, self.gpu.stream())?;
+            .copy_from_device_raw(&row, self.gpu.stream())?;
         head.enqueue(self.gpu, self.w)
     }
 }

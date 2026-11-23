@@ -1926,7 +1926,7 @@ impl Body {
         let card_marks = (0..CARD_MARKS * self.layers.len() * sets)
             .map(|_| {
                 gpu.context()
-                    .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
+                    .new_event_with_flags(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Last: its refusal names the card's free bytes with every other

@@ -37,6 +37,7 @@
 //!
 //! A state's byte form, what a slot file carries, is [`bytes`]'.
 
+use crate::DeviceBufferRaw;
 pub mod bytes;
 pub mod planes;
 pub mod saved;
@@ -339,7 +340,7 @@ impl Checkpoints {
             Cut::Stay => {}
             Cut::Empty => {
                 for s in stores.iter_mut() {
-                    s.zero_async(stream)?;
+                    s.zero_raw(stream)?;
                 }
             }
             Cut::Restore { slot, at } => {

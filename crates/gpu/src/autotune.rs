@@ -387,11 +387,11 @@ fn race(
 
 /// A timing event on `gpu`'s context.
 fn new_event(gpu: &Gpu) -> Result<cuda_core::CudaEvent, GpuError> {
-    // A timed event: `new_event(None)` makes a sync-only one, whose
+    // A timed event: `new_event_with_flags(None)` makes a sync-only one, whose
     // `elapsed_ms` the driver refuses.
     Ok(gpu
         .context()
-        .new_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?)
+        .new_event_with_flags(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?)
 }
 
 #[cfg(test)]

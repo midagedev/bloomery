@@ -15,6 +15,7 @@
 //! is its stacks' slots, which the machine never grows, and every routed layer has a host share
 //! the machine moves experts through ([`PlacedHost::new`]).
 
+use crate::DeviceBufferRaw;
 use std::sync::Arc;
 
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -316,7 +317,7 @@ impl PlacedSide {
         }
         let row = Window::<u32>::of(self.slots.buf(), self.row_off(l) * size_of::<u32>(), n)?;
         let mut to = WindowMut::<u32>::of_mut(map, 0, n)?;
-        to.copy_from_device_async(&row, stream)?;
+        to.copy_from_device_raw(&row, stream)?;
         Ok(())
     }
 

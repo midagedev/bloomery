@@ -72,6 +72,7 @@
 //! `plan_nextn_slots`), the load holds its plan to them, and a sequence past
 //! their count is refused by name.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -367,18 +368,18 @@ impl Store {
         match self {
             Store::Kda { state, stamp, ring } => {
                 let lanes = state.lanes();
-                state.whole_mut().zero_async(stream)?;
+                state.whole_mut().zero_raw(stream)?;
                 stamp.copy_from_host(stream, &stamps(0, 0, lanes)?[..lanes.count()])?;
-                ring.zero_async(stream)?;
+                ring.zero_raw(stream)?;
             }
             Store::Latent {
                 latent,
                 index,
                 pooled,
             } => {
-                latent.buf_mut().zero_async(stream)?;
-                index.buf_mut().zero_async(stream)?;
-                pooled.buf_mut().zero_async(stream)?;
+                latent.buf_mut().zero_raw(stream)?;
+                index.buf_mut().zero_raw(stream)?;
+                pooled.buf_mut().zero_raw(stream)?;
             }
         }
         Ok(())
@@ -1093,7 +1094,7 @@ impl<'s> Parts<'s> {
                 what: WHAT,
                 missing: "the layer's tap",
             })?;
-            tap.copy_from_device_async(&self.s.streams[cur], gpu.stream())?;
+            tap.copy_from_device_raw(&self.s.streams[cur], gpu.stream())?;
         }
         Ok(())
     }
@@ -2537,7 +2538,7 @@ impl ChainBody for Body {
         }
         for row in self.s.rows_mut() {
             for s in &mut row.streams {
-                s.zero_async(stream)?;
+                s.zero_raw(stream)?;
             }
         }
         self.s.lane.copy_from_host(stream, &[0])?;

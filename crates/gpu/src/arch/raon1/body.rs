@@ -73,7 +73,7 @@ enum Mixer {
     /// ([`state::rda_store`]).
     Rda {
         sites: Box<RdaSites>,
-        store: RecStore,
+        store: Box<RecStore>,
     },
     /// The latent cache, `[ctx][row]` f16.
     Mla {
@@ -669,7 +669,7 @@ impl Body {
             let mixer = match hp.kind(l) {
                 Kind::Rda => Mixer::Rda {
                     sites: Box::new(RdaSites::load(file, w, &kda, l)?),
-                    store: state::rda_store(stream, kda.shape, lanes)?,
+                    store: Box::new(state::rda_store(stream, kda.shape, lanes)?),
                 },
                 Kind::Mla => Mixer::Mla {
                     sites: Box::new(MlaSites::load(file, w, &mla, l)?),

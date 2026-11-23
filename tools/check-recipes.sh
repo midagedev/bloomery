@@ -329,7 +329,7 @@ blk_boxsh() { tool_selftest box.sh; }
 # oxide-host.sh writes the generated .cargo/cuda-oxide.toml for a triple and refuses an llc that is unset, missing, of another
 # major or without a version banner, each by name: its cases run on scratch trees and stub llc scripts, no build and no card.
 blk_oxidehost() { tool_selftest oxide-host.sh; }
-# oxide-backend.sh builds the patched backend and refuses, by name, one without this tree's patch, with another rev or missing: its cases
+# oxide-backend.sh builds the pin's backend and refuses, by name, one of another rev or missing: its cases
 # run on a scratch tree with stub cargo and rustc, no build and no card.
 blk_oxidebackend() { tool_selftest oxide-backend.sh; }
 # seed-target.sh clones a warm tree's target/ into a new worktree and restores the seed's mtime on the files that are equal:

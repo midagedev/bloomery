@@ -6,6 +6,7 @@
 use super::moe::{MoeKernels, MoeLayer, MoeScratch, MoeShape, Routing, routed, sel32_words};
 use super::placed::{PLACED_ROWS, Placed, PlacedOpen, StepWalk, plan_map};
 use super::program::Program;
+use crate::DeviceBufferRaw;
 use crate::arch::hybrid::{
     self, Acts, Cx, DecodeInput, GqaLayer, Kernels, MambaLayer, Names, Site, Trunk, Words,
     attention_heads, derive_zero_conv_bias, mamba_shape,
@@ -570,7 +571,7 @@ impl ChainBody for Body {
             }
         }
         if let Some(p) = self.placed.as_mut() {
-            self.ms.up.zero_async(gpu.stream())?;
+            self.ms.up.zero_raw(gpu.stream())?;
             self.prompt.clear_expert_up(gpu.stream())?;
             p.reset(gpu.stream())?;
         }

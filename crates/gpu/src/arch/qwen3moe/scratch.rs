@@ -17,6 +17,7 @@
 use super::image::MediaRows;
 use super::plan::Flash;
 use super::wide::{GEMV_COLS, Wide};
+use crate::DeviceBufferRaw;
 use crate::GpuError;
 use crate::checkpoint::saved::{Plane, Spans};
 use crate::fault::FaultSink;
@@ -93,7 +94,7 @@ impl Inbox {
         Ok(Inbox {
             host: PinnedHostBuffer::zeroed(ctx, words)?,
             dev: DeviceBuffer::zeroed(stream, words)?,
-            copied: ctx.new_event(None)?,
+            copied: ctx.new_event_with_flags(None)?,
         })
     }
 
@@ -2081,7 +2082,7 @@ impl StepParams {
         // SAFETY: word 0 of `token`, which the caller holds for the call; the
         // window lives for this enqueue.
         let src = unsafe { param_view::<u32>(token, 0, 1) };
-        self.token.copy_from_device_async(&src, stream)?;
+        self.token.copy_from_device_raw(&src, stream)?;
         Ok(())
     }
 
@@ -2465,7 +2466,7 @@ mod tests {
             let _row = unsafe { cells_view(&rows, 4, 4) };
         }
         stream.synchronize().expect("the upload");
-        let after = Arc::strong_count(&ctx);
+        let after = crate::tensor::settled_handles(&ctx, before);
         eprintln!("view context handles: before {before} after {after}");
         assert_eq!(after, before, "the views leave no context handle");
     }

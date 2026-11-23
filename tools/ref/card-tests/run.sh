@@ -763,8 +763,6 @@ cp "$ROOT/Cargo.toml" "$B/"
 # A cargo oxide command runs tools/oxide-host.sh in the tree, which reads .cargo/config.toml's list for the triple.
 mkdir -p "$B/.cargo"
 cp "$ROOT/tools/oxide-host.sh" "$ROOT/tools/oxide-backend.sh" "$B/tools/"
-mkdir -p "$B/tools/oxide-backend"
-cp "$ROOT/tools/oxide-backend/cuda-rust-1648.patch" "$B/tools/oxide-backend/"
 cp "$ROOT/.cargo/config.toml" "$B/.cargo/"
 # The ssh stub answers the queue's one probe after a failed rsync (flock -n -x on the dir lock, then the remote tree's id) with
 # `lock=$STUB_PROBE_RC` (0 where unset) and $STUB_SYNC_ID on the next line, or with an ssh that ends 255 when STUB_PROBE_RC is 255;
@@ -1344,11 +1342,10 @@ else
   # that prints its banner, for the triple the config carries a list for whatever machine this runs on.
   printf '#!/bin/sh\necho "LLVM version 21.1.8"\n' > "$tmp/llc21"
   chmod +x "$tmp/llc21"
-  # ... and the pin's backend with the patch's record (tools/oxide-backend.sh --check), under a backend root of this directory.
+  # ... and the pin's backend with its source rev (tools/oxide-backend.sh --check), under a backend root of this directory.
   mkdir -p "$tmp/oxbackends/$PIN"
   printf 'so\n' > "$tmp/oxbackends/$PIN/librustc_codegen_cuda.so"
   printf '%s\n' "$PIN" > "$tmp/oxbackends/$PIN/source-rev.txt"
-  printf 'patch-sha256: %s tools/oxide-backend/cuda-rust-1648.patch\n' "$( (sha256sum "$ROOT/tools/oxide-backend/cuda-rust-1648.patch" 2> /dev/null || shasum -a 256 "$ROOT/tools/oxide-backend/cuda-rust-1648.patch") | cut -d' ' -f1)" > "$tmp/oxbackends/$PIN/PROVENANCE"
   printf 'export CUDA_OXIDE_BACKEND=/x/backend.so CUDA_OXIDE_LLC=%s CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu BLOOMERY_OXIDE_BACKENDS=%s\n' "$tmp/llc21" "$tmp/oxbackends" > "$tmp/oxide-env.sh"
   # A cargo oxide command still takes the installed cargo-oxide check in local mode: a stub cargo-oxide and a stub cargo
   # at the pin pass it.
@@ -1358,13 +1355,12 @@ else
   chmod +x "$tmp/oxpin/cargo" "$tmp/oxpin/cargo-oxide"
   run 'box.sh: local mode unsets the environment file'"'"'s CUDA_OXIDE_BACKEND and adds no backend check to cargo oxide' 0 'oxide=unset data=' \
     boxl PATH="$tmp/oxpin:$tmp/uname:$tmp/stub:$PATH" BLOOMERY_ENV_FILE="$tmp/oxide-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && $SHOW"
-  # ... and one built without the patch ends the command by name before it runs: the PROVENANCE record is what tells the two apart.
-  cp "$tmp/oxbackends/$PIN/PROVENANCE" "$tmp/oxbackends/PROVENANCE.good"
-  printf 'built by cargo-oxide itself\n' > "$tmp/oxbackends/$PIN/PROVENANCE"
-  run 'box.sh: local mode refuses an unpatched backend by name' 70 'built without tools/oxide-backend/cuda-rust-1648\.patch' \
+  # ... and one of another rev ends the command by name before it runs: the source-rev record is what tells the two apart.
+  printf 'ffffffffffffffffffffffffffffffffffffffff\n' > "$tmp/oxbackends/$PIN/source-rev.txt"
+  run 'box.sh: local mode refuses a backend of another rev by name' 70 "records source rev 'f+', not the pin $PIN" \
     boxl PATH="$tmp/oxpin:$tmp/uname:$tmp/stub:$PATH" BLOOMERY_ENV_FILE="$tmp/oxide-env.sh" "$B/tools/box.sh" "echo 'cargo oxide build' && $SHOW"
-  if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: the unpatched-backend refusal ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: the unpatched-backend refusal ran no command'; fi
-  cp "$tmp/oxbackends/PROVENANCE.good" "$tmp/oxbackends/$PIN/PROVENANCE"
+  if grep -q '^pwd=' "$tmp/out"; then fail 'box.sh: the other-rev backend refusal ran no command' 'the command ran' "$tmp/out"; else pass 'box.sh: the other-rev backend refusal ran no command'; fi
+  printf '%s\n' "$PIN" > "$tmp/oxbackends/$PIN/source-rev.txt"
   printf 'export BLOOMERY_LOCK_DIR=%s/elsewhere\n' "$tmp" > "$tmp/lockdir-env.sh"
   run "box.sh: local mode refuses an environment file that moves the lock directory after the guard" 64 \
     'the environment file or BLOOMERY_BOX_ENV set BLOOMERY_LOCK_DIR after local mode.s guard probed the lock directory' \

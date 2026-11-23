@@ -19,6 +19,7 @@
 //! `x`, which the embedding wrote together with the position words; the last layer's add writes the head's input,
 //! and the end is the head.
 
+use bloomery_gpu::DeviceBufferRaw;
 use bloomery_gpu::arch::hybrid::GqaCx;
 use bloomery_gpu::flash_gqa::{FlashGqaKernels, GROUP_16, GqaArgs};
 use bloomery_gpu::gemm::Gemm32Kernels;
@@ -189,7 +190,7 @@ impl StepProgram<'_> {
         } else {
             &self.s.x
         };
-        tap.copy_from_device_async(out, self.gpu.stream())?;
+        tap.copy_from_device_raw(out, self.gpu.stream())?;
         Ok(())
     }
 

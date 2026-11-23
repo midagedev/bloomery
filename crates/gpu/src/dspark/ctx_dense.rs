@@ -28,6 +28,7 @@
 //! word `l` the ring rows layer `l` reads (`min(count, cap)`), word `layers + l` the ring row of an
 //! append's first row in layer `l` (`count mod cap`), and a last word 0, the block's start.
 
+use crate::DeviceBufferRaw;
 use cuda_core::DeviceBuffer;
 use model::embed::EmbedTable;
 
@@ -609,7 +610,7 @@ impl DraftLayers for CtxDenseLayers {
         {
             let rows = Window::<f32>::of(&s.rows, 0, b * h)?;
             let mut input = WindowMut::<f32>::of_mut(&mut *x, 0, b * h)?;
-            input.copy_from_device_async(&rows, stream)?;
+            input.copy_from_device_raw(&rows, stream)?;
         }
         let (qh, kh) = (
             u32::try_from(n_q).unwrap_or(0),

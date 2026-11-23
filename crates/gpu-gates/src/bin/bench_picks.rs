@@ -205,7 +205,7 @@ mod picks {
     fn card(gpu: &Gpu, g32: &Gemm32Kernels) -> Result<(), GateError> {
         let ctx = gpu.context();
         let (major, minor) = ctx.compute_capability()?;
-        let l2 = cuda_core::Device::new(ctx.ordinal())?.l2_cache_size_bytes()?;
+        let l2 = ctx.l2_cache_size_bytes()?;
         let rates = match bloomery_gpu::host::costs::card_rates(ctx) {
             Ok(r) => format!(
                 "dram_b_per_us={:.1} int8_ops_per_us={:.1}",

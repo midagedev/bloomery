@@ -5,6 +5,7 @@
 //! [`crate::linear::LinearShape`]; a later scan passes its own lengths. The
 //! lengths are the only architecture facts this module takes.
 
+use crate::DeviceBufferRaw;
 use crate::GpuError;
 use crate::linear::LinearShape;
 use crate::linear::delta::{NEVER, recovery_record_len};
@@ -113,10 +114,10 @@ impl RecStore {
     /// Every lane of the state, the whole ring and the carry back to zero on
     /// the device, ordered on `stream`. The stamps are unchanged.
     pub(crate) fn clear(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.state.zero_async(stream)?;
-        self.ring.zero_async(stream)?;
+        self.state.zero_raw(stream)?;
+        self.ring.zero_raw(stream)?;
         if let Some(carry) = self.carry.as_mut() {
-            carry.zero_async(stream)?;
+            carry.zero_raw(stream)?;
         }
         Ok(())
     }

@@ -95,6 +95,7 @@
 //! is refused by name (`enqueue_fused`'s shape error, one launch routes at
 //! most eight) before any launch.
 
+use bloomery_gpu::DeviceBufferRaw;
 use bloomery_gpu::arch::qwen3moe::ubatch::UBATCH;
 use bloomery_gpu::fused::{FusedKernels, Q8ActHost, readback_q8act};
 use bloomery_gpu::route_softmax::{MAX_TOKENS, ROW, RouterDims, RouterKernels, RouterOut};
@@ -161,7 +162,7 @@ fn route(
     sink: FaultSink,
     out: &mut RouterOut,
 ) -> Result<Routed, GateError> {
-    out.logits.copy_from_device_async(x, stream)?;
+    out.logits.copy_from_device_raw(x, stream)?;
     k.enqueue_route(stream, 1, sink, out)?;
     stream.synchronize()?;
     Ok(Routed {
@@ -1551,9 +1552,9 @@ pub fn run() -> Result<(), GateError> {
     let logits = ref_tensor_logical_in(&man.dir, lrow)?;
     let x = DeviceBuffer::from_host(stream, &logits[..N_EXPERT])?;
     let eager = route(&k, stream, &x, sink, &mut out)?;
-    out.probs.zero_async(stream)?;
-    out.ids.zero_async(stream)?;
-    out.weights.zero_async(stream)?;
+    out.probs.zero_raw(stream)?;
+    out.ids.zero_raw(stream)?;
+    out.weights.zero_raw(stream)?;
     stream.synchronize()?;
     // The eager run left the token's logits in `out.logits`; the graph
     // routes them there.
@@ -1619,10 +1620,10 @@ pub fn run() -> Result<(), GateError> {
     k.enqueue_fused(stream, &w, &x, MAX_TOKENS, sink, &mut fout)?;
     stream.synchronize()?;
     let eager = read_fused(stream, &fout, MAX_TOKENS)?;
-    fout.logits.zero_async(stream)?;
-    fout.probs.zero_async(stream)?;
-    fout.ids.zero_async(stream)?;
-    fout.weights.zero_async(stream)?;
+    fout.logits.zero_raw(stream)?;
+    fout.probs.zero_raw(stream)?;
+    fout.ids.zero_raw(stream)?;
+    fout.weights.zero_raw(stream)?;
     stream.synchronize()?;
     let graph = gpu.capture(|s| k.enqueue_fused(s, &w, &x, MAX_TOKENS, sink, &mut fout))?;
     let mut replays_ok = true;

@@ -38,6 +38,7 @@
 //! ([`place::prompt_reserve_bytes`]), and a tiered load's own buffers past the
 //! plan's tier reserve ([`place::tier_reserve_bytes`]).
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
@@ -1092,8 +1093,8 @@ impl Body {
     pub fn clear_stores(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         for s in &mut self.stores {
-            s.k.zero_async(stream)?;
-            s.v.zero_async(stream)?;
+            s.k.zero_raw(stream)?;
+            s.v.zero_raw(stream)?;
         }
         Ok(())
     }

@@ -9,11 +9,11 @@ exclude = ["crates/oxide-ice-unroll", "crates/oxide-ice-unroll/variants/unroll_s
 # that repository by rev. A floating rev puts yesterday's numbers and today's on different compilers. A rev move here
 # needs the box's backend and cargo-oxide for that rev (tools/box.sh, docs/BUILD.md) and rust-toolchain.toml on the
 # channel of that rev's cuda-oxide/rust-toolchain.toml.
-cuda-device = { version = "0.2.1", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "9df9e7cef561e03a066230b3bb433b3d8285da81" }
-cuda-host = { version = "0.2.1", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "9df9e7cef561e03a066230b3bb433b3d8285da81" }
+cuda-device = { version = "0.4.0", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "ab2b6738a729d97db1cde2efa569f8c4cc7f9256" }
+cuda-host = { version = "0.4.0", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "ab2b6738a729d97db1cde2efa569f8c4cc7f9256" }
 # cuda-host takes cuda-core by path inside the same repository, so cuda-core comes from that repository and rev too: a
 # crates.io copy would be a second crate whose types are not cuda-host's.
-cuda-core = { version = "0.5.0", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "9df9e7cef561e03a066230b3bb433b3d8285da81" }
+cuda-core = { version = "0.5.0", git = "https://github.com/NVIDIA/cuda-rust.git", rev = "ab2b6738a729d97db1cde2efa569f8c4cc7f9256" }
 # The .oxart container parser is the copy cuda-core's module loader links: cuda-core and cuda-host both take
 # oxide-artifacts from crates.io (the repository's own copy is its publish source, not a dependency). Requirements on
 # one semver line unify into one version, so the gates cut the text handed to the driver with the loader's own code.

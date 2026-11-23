@@ -184,8 +184,8 @@ forced_exact count pin, the reference gates).
   fork: a defect that shapes our code is worked around in bloomery (the ledger row names the workaround and the
   upstream issue or PR that would remove it), proposed upstream as a short single-purpose issue or PR, and the
   workaround goes in the change that moves the pin to a rev that fixes it, proved by the gate that owns it. A patch of
-  the backend source is such a workaround: `tools/oxide-backend/cuda-rust-1648.patch` (upstream #1648, unchanged),
-  applied by `tools/oxide-backend.sh`. The fork's last pinned rev is the tag `pin/87bc9518` of midagedev/cuda-oxide.
+  the backend source is such a workaround, applied by `tools/oxide-backend.sh`; today none is carried, and the backend is
+  built from the pin's checkout as published. The fork's last pinned rev is the tag `pin/87bc9518` of midagedev/cuda-oxide.
 - **Common code first, so the next model attaches cheaply.** A concept two models share (tier legs, prompt walks,
   seats, placement sizing, drafts, residency glue) has one common owner. A model's own code holds only what an
   architecture fact forces (tensor shapes, the recurrent state, the attention kind, the quant), and its description
@@ -250,9 +250,9 @@ forced_exact count pin, the reference gates).
   floats. A rev move is a codegen change (every gate) unless `just canon-check BASE` proves every entry the same program
   (`reordered-only` or identical, equal resource columns). Each rev has its directory on the box,
   `~/.cargo/cuda-oxide-bloomery/<rev>/`: its backend and its own `cargo-oxide` (`tools/box.sh`). The backend is built by
-  `tools/oxide-backend.sh` from the rev's checkout plus `tools/oxide-backend/cuda-rust-1648.patch`, with the patch's sha256 in
-  its `PROVENANCE`; the llc, the host CPU flags and that record are checked by `tools/oxide-host.sh` before every
-  `cargo oxide` build (LLVM 21 `llc` named by `CUDA_OXIDE_LLC`; an unpatched backend is refused by name).
+  `tools/oxide-backend.sh` from the rev's checkout as published, with the rev in `source-rev.txt` and its build record in
+  `PROVENANCE`; the llc, the host CPU flags and that rev are checked by `tools/oxide-host.sh` before every
+  `cargo oxide` build (LLVM 21 `llc` named by `CUDA_OXIDE_LLC`; a backend of another rev is refused by name).
 
 ## Measuring
 

@@ -1073,7 +1073,7 @@ mod tests {
             let ends: Vec<_> = gpus
                 .iter()
                 .map(|g| {
-                    let e = g.context().new_event(None).expect("an event");
+                    let e = g.context().new_event_with_flags(None).expect("an event");
                     e.record(g.stream()).expect("recorded");
                     e
                 })

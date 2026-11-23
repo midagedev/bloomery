@@ -17,6 +17,7 @@
 
 use super::body::Body;
 use super::step::Layer;
+use crate::DeviceBufferRaw;
 use crate::arch::hybrid::{
     RowBuffers, Shape, Site, WideCx, append_plane, norm_rows, project_wide, residual_rows,
 };
@@ -381,7 +382,7 @@ impl Body {
         if let Some(head) = head {
             let last = if in_a { &p.xa } else { &p.xb };
             let row = Window::<f32>::of(last, (m - 1) * sh.hidden * size_of::<f32>(), sh.hidden)?;
-            head.input_mut().copy_from_device_async(&row, stream)?;
+            head.input_mut().copy_from_device_raw(&row, stream)?;
             head.enqueue(gpu, w)?;
         }
         Ok(())

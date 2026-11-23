@@ -145,6 +145,7 @@ mod e2e;
 #[cfg(feature = "gpu")]
 mod gate {
     use crate::e2e::rel;
+    use bloomery_gpu::DeviceBufferRaw;
     use bloomery_gpu::arch::qwen3moe::experts::{CombineArgs, ExpertKernels, GateUpArgs};
     use bloomery_gpu::arch::qwen3moe::router::gated::{
         ROW, ROW_WIDE, RouterKernels, RouterOut, RouterWeight,
@@ -622,7 +623,7 @@ mod gate {
     ) -> Result<Routed, GateError> {
         let stream = c.stream();
         let x = DeviceBuffer::from_host(stream, logits)?;
-        out.logits.copy_from_device_async(&x, stream)?;
+        out.logits.copy_from_device_raw(&x, stream)?;
         c.router.enqueue_route(stream, 1, sink, out)?;
         stream.synchronize()?;
         read_out(stream, out, 1)
@@ -1003,7 +1004,7 @@ mod gate {
     ) -> Result<Routed, GateError> {
         let stream = c.stream();
         let x = DeviceBuffer::from_host(stream, logits)?;
-        out.logits.copy_from_device_async(&x, stream)?;
+        out.logits.copy_from_device_raw(&x, stream)?;
         c.router.enqueue_route(stream, n, sink, out)?;
         stream.synchronize()?;
         read_wide(stream, out)
@@ -1029,7 +1030,7 @@ mod gate {
             let x = DeviceBuffer::from_host(stream, &logits)?;
             for top_k in PICKS {
                 let mut out = RouterOut::for_ubatch(stream, dims(experts, top_k)?, PICK_TOKENS)?;
-                out.logits.copy_from_device_async(&x, stream)?;
+                out.logits.copy_from_device_raw(&x, stream)?;
                 c.router
                     .enqueue_route(stream, PICK_TOKENS, sink, &mut out)?;
                 stream.synchronize()?;
@@ -1076,7 +1077,7 @@ mod gate {
         stream.synchronize()?;
         let got = read_wide(stream, &fout)?;
         rout.logits
-            .copy_from_device_async(&DeviceBuffer::from_host(stream, &want)?, stream)?;
+            .copy_from_device_raw(&DeviceBuffer::from_host(stream, &want)?, stream)?;
         c.router.enqueue_route(stream, M, sink, &mut rout)?;
         stream.synchronize()?;
         let alone = read_wide(stream, &rout)?;
@@ -1856,10 +1857,10 @@ mod gate {
         // The fused launch as a captured graph.
         let x = DeviceBuffer::from_host(stream, &cols[..MAX_TOKENS * HIDDEN])?;
         let (eager, _) = fused_run(c, &ly.router, &x, MAX_TOKENS, sink, &mut fout)?;
-        fout.logits.zero_async(stream)?;
-        fout.probs.zero_async(stream)?;
-        fout.ids.zero_async(stream)?;
-        fout.weights.zero_async(stream)?;
+        fout.logits.zero_raw(stream)?;
+        fout.probs.zero_raw(stream)?;
+        fout.ids.zero_raw(stream)?;
+        fout.weights.zero_raw(stream)?;
         stream.synchronize()?;
         let graph = c.gpu.capture(|s| {
             c.router
@@ -2758,7 +2759,7 @@ mod gate {
         enqueue_ffn(c, stream, ly, stacks(ly)?, &x, &mut b)?;
         stream.synchronize()?;
         let eager = b.y.to_host_vec(stream)?;
-        b.y.zero_async(stream)?;
+        b.y.zero_raw(stream)?;
         stream.synchronize()?;
         let st = stacks(ly)?;
         let graph = c.gpu.capture(|s| enqueue_ffn(c, s, ly, st, &x, &mut b))?;

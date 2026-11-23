@@ -77,6 +77,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
+    use bloomery_gpu::DeviceBufferRaw;
     use bloomery_gpu::route_core::{renorm_divisor, sigmoid};
     use bloomery_gpu::{DeviceTensor, Fault, FaultSink, FaultSite, Gpu, GpuError, LAYER_NONE};
     use bloomery_gpu_deepseek41::router::{glm5next, mimo2, sigmoid_128_4, sigmoid_320_8};
@@ -229,10 +230,10 @@ mod gate {
                 }
 
                 fn zero(out: &mut Self::Out, s: &CudaStream) -> Result<(), GateError> {
-                    out.logits.zero_async(s)?;
-                    out.probs.zero_async(s)?;
-                    out.ids.zero_async(s)?;
-                    out.weights.zero_async(s)?;
+                    out.logits.zero_raw(s)?;
+                    out.probs.zero_raw(s)?;
+                    out.ids.zero_raw(s)?;
+                    out.weights.zero_raw(s)?;
                     Ok(())
                 }
 

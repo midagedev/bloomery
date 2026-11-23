@@ -42,6 +42,7 @@
 //! once from its own checkpoints before its row 0, its held position and
 //! rows' records moved.
 
+use bloomery_gpu::DeviceBufferRaw;
 use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::draft::Held;
 use bloomery_gpu::head::Head;
@@ -366,7 +367,7 @@ impl Rows for Body {
         if let Some(n) = self.nextn.as_deref_mut() {
             let fin = program::final_streams(self.cfg.len());
             n.pair0_mut()
-                .copy_from_device_async(&self.s.rows[0].streams[fin], gpu.stream())?;
+                .copy_from_device_raw(&self.s.rows[0].streams[fin], gpu.stream())?;
         }
         self.planted(Plant::AfterLaunch)
     }
@@ -844,7 +845,7 @@ impl Body {
         for r in rows {
             if r.slot == 0 {
                 nx.pair0_mut()
-                    .copy_from_device_async(&s.rows[0].streams[fin], gpu.stream())?;
+                    .copy_from_device_raw(&s.rows[0].streams[fin], gpu.stream())?;
                 continue;
             }
             let GlmSlot {
@@ -860,7 +861,7 @@ impl Body {
                 what: "glm5next Body::enqueue_slots",
                 missing: "the slot's NextN side (a NextN load's sequences each carry one)",
             })?;
-            d.pair0_mut().copy_from_device_async(row0, gpu.stream())?;
+            d.pair0_mut().copy_from_device_raw(row0, gpu.stream())?;
         }
         Ok(())
     }

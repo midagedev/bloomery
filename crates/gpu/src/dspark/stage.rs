@@ -30,7 +30,7 @@ impl Inbox {
         Ok(Inbox {
             host: PinnedHostBuffer::zeroed(gpu.context(), words)?,
             dev: DeviceBuffer::zeroed(gpu.stream(), words)?,
-            copied: gpu.context().new_event(None)?,
+            copied: gpu.context().new_event_with_flags(None)?,
         })
     }
 

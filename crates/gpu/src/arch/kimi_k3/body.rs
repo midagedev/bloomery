@@ -98,7 +98,7 @@ enum Mixer {
     /// The recurrent state, its stamp and the conv ring ([`state::kda_store`]).
     Kda {
         sites: Box<KdaSites>,
-        store: RecStore,
+        store: Box<RecStore>,
     },
     /// The latent cache, `[ctx][row]` f16, and a K3.1 layer's indexer with its key rows
     /// ([`index::Index`]; `None` in a K3 file), each a room backed as far as the positions fitted
@@ -1058,7 +1058,7 @@ impl Body {
             let mixer = match hp.kind(l) {
                 Kind::Kda => Mixer::Kda {
                     sites: Box::new(KdaSites::load(file, w, &kd, l)?),
-                    store: state::kda_store(stream, kd.shape)?,
+                    store: Box::new(state::kda_store(stream, kd.shape)?),
                 },
                 Kind::Mla => Mixer::Mla {
                     sites: Box::new(MlaSites::load(file, w, &md, l)?),

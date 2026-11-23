@@ -193,7 +193,7 @@ mod gate {
             up_qs: DeviceTensor<u32>,
             up_d: DeviceTensor<u16>,
             view_qs: DeviceTensor<u32>,
-            view_d: DeviceTensor<u16>,
+            view_d: Box<DeviceTensor<u16>>,
         },
         Bf16 {
             down: DeviceTensor<u32>,
@@ -261,7 +261,7 @@ mod gate {
                 up_qs: DeviceTensor::upload(st, &uq, wide, R / 4)?,
                 up_d: DeviceTensor::upload(st, &ud, wide, R / 32)?,
                 view_qs: DeviceTensor::upload(st, &dq, R * S, d / 4)?,
-                view_d: DeviceTensor::upload(st, &dd, R * S, d / 32)?,
+                view_d: Box::new(DeviceTensor::upload(st, &dd, R * S, d / 32)?),
             };
             Site::with(gpu, (seed, d), card::q8_dot, planes, (down, up))
         }
@@ -325,7 +325,7 @@ mod gate {
                     ..
                 } => {
                     let (qs, d) = if view {
-                        (view_qs, view_d)
+                        (view_qs, &**view_d)
                     } else {
                         (up_qs, up_d)
                     };

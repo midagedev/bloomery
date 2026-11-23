@@ -73,6 +73,7 @@
 //!   the block's rows 1.., each stage the anchor's into row 0, and the pass copies them into its input
 //!   first.
 
+use crate::DeviceBufferRaw;
 use std::sync::{Mutex, PoisonError};
 
 use cuda_core::DeviceBuffer;
@@ -1701,7 +1702,7 @@ impl DraftLayers for DenseLayers {
         if let Some(e) = embed.as_ref() {
             let rows = Window::<f32>::of(&e.rows, 0, m * h)?;
             let mut input = WindowMut::<f32>::of_mut(&mut *x, 0, m * h)?;
-            input.copy_from_device_async(&rows, stream)?;
+            input.copy_from_device_raw(&rows, stream)?;
         }
         let n_keys = Window::<u32>::of(&s.blk_words, 4 * n_kv, BLOCK_MAX)?;
         // The per-row window's block append is two launches, as a context append is (the image's

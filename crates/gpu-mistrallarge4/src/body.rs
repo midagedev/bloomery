@@ -76,6 +76,7 @@
 //! is made inside the join over both cards' slots, so a load with an expert
 //! tier card refuses the taps by name.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -1316,7 +1317,7 @@ pub(crate) fn attention(
         indexer.enqueue_topk(stream, &mut args, &s.ints, words::N_VIS, words::TOP_K)?;
         // A gate's forced list stands for the pick the top-k just made.
         if let Some(list) = forced {
-            st.list.copy_from_device_async(list, stream)?;
+            st.list.copy_from_device_raw(list, stream)?;
         }
     }
     // 6. the absorbed query: each head's nope slice dotted into the latent
@@ -1622,10 +1623,10 @@ impl LayerTap {
         copy_row(stream, kidx_at, &mut self.kidx, kidx)?;
         copy_row(stream, &s.wi, &mut self.wi, wi)?;
         if let Some(list) = list {
-            self.list.copy_from_device_async(list, stream)?;
+            self.list.copy_from_device_raw(list, stream)?;
         }
         if let Some(cache) = cache {
-            self.cache16.copy_from_device_async(cache.buf(), stream)?;
+            self.cache16.copy_from_device_raw(cache.buf(), stream)?;
         }
         copy_row(stream, &s.att, &mut self.att, sh.heads * sh.latent)?;
         copy_row(stream, &s.av, &mut self.av, sh.heads * sh.head_v)?;
@@ -1684,10 +1685,10 @@ impl LayerTap {
             what: STEP,
             missing: "the routing tap of a routed layer",
         })?;
-        r.logits.copy_from_device_async(&out.logits, stream)?;
-        r.probs.copy_from_device_async(&out.probs, stream)?;
-        r.weights.copy_from_device_async(&out.weights, stream)?;
-        r.ids.copy_from_device_async(ids, stream)?;
+        r.logits.copy_from_device_raw(&out.logits, stream)?;
+        r.probs.copy_from_device_raw(&out.probs, stream)?;
+        r.weights.copy_from_device_raw(&out.weights, stream)?;
+        r.ids.copy_from_device_raw(ids, stream)?;
         Ok(())
     }
 

@@ -180,10 +180,12 @@ impl PromptTiming {
         if units == 0 {
             return Err(GpuError::shape(WHAT, "timing for walks of no unit"));
         }
-        // Timed events: `new_event(None)` makes a sync-only event, whose
+        // Timed events: `new_event_with_flags(None)` makes a sync-only event, whose
         // `elapsed_ms` the driver refuses.
         let marks = (0..layers * units * MARKS)
-            .map(|_| ctx.new_event(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT)))
+            .map(|_| {
+                ctx.new_event_with_flags(Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT))
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(PromptTiming {
             marks,

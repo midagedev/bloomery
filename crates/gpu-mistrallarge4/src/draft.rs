@@ -62,6 +62,7 @@
 //! embedded row — is copied to the card by the stage calls, never inside a
 //! capture. The mask rows sit in the block's input buffer from the load.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::sync::Arc;
 
 use bloomery_gpu::dspark::dense::{gguf_f32, gguf_tensor};
@@ -737,7 +738,7 @@ impl DraftLayers for Ml4Layers {
         {
             let rows = Window::<f32>::of(&img.rows, 0, m * e)?;
             let mut input = WindowMut::<f32>::of_mut(&mut *x, 0, m * e)?;
-            input.copy_from_device_async(&rows, stream)?;
+            input.copy_from_device_raw(&rows, stream)?;
         }
         let blk_cs = Window::<f32>::of(&img.blk_cs, 0, m * rope)?;
         let blk_slots = Window::<u32>::of(&img.blk_slots, 0, m)?;

@@ -519,7 +519,7 @@ mod tests {
             )
         }
         .expect("a 2-D read");
-        let end = Arc::new(ctx.new_event(None).expect("an event"));
+        let end = Arc::new(ctx.new_event_with_flags(None).expect("an event"));
         end.record(&stream).expect("recorded");
         staged.hold(Arc::clone(&end));
         assert!(

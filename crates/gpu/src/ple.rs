@@ -68,6 +68,7 @@
 //! and the values it reaches are NaN, never the zero a vanishing scale or
 //! the ½ a NaN dot's `sgn` would give.
 
+use crate::DeviceBufferRaw;
 use crate::GpuError;
 use crate::elem::{RMS_THREADS, RMS_WARPS, rms_scale, rms_warp_tree};
 use crate::fault::{FaultSink, FaultSite};
@@ -921,7 +922,7 @@ impl PleKernels {
         hc: usize,
     ) -> Result<(), GpuError> {
         need("ple reset_ring", "ring", ring.len(), ring_len(hc))?;
-        ring.zero_async(stream)?;
+        ring.zero_raw(stream)?;
         Ok(())
     }
 }

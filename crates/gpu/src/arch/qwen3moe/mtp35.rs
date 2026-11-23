@@ -63,6 +63,7 @@ use super::scratch::{
     Append256, Arena, Dims, Forms, IN_IDS, IN_POS0, Inbox, Io, KvPlanes, StepParams, put_input,
 };
 use super::wide::{gemm_site, wide_kernels};
+use crate::DeviceBufferRaw;
 use crate::draft::{self, DraftHead, Feed, Hidden, WalkBounds, WalkMode};
 use crate::gemm::{GemmInput, GemmRoute};
 use crate::head::{Head, HeadNorm};
@@ -959,7 +960,7 @@ fn norm_row(
         ));
     }
     let src = Window::<f32>::of(&arena.x, row * hidden * size_of::<f32>(), hidden)?;
-    mtp.raw.copy_from_device_async(&src, gpu.stream())?;
+    mtp.raw.copy_from_device_raw(&src, gpu.stream())?;
     gpu.elem().enqueue_rms_norm(
         gpu.stream(),
         &mtp.raw,
@@ -1180,7 +1181,7 @@ fn walk_rows(
                 let row = step_row
                     .ok_or_else(|| GpuError::state(WHAT, "the head's normed row of the step"))?;
                 let mut rows = WindowMut::<f32>::of_mut(&mut mtp.store.h, 0, width)?;
-                rows.copy_from_device_async(row, gpu.stream())?;
+                rows.copy_from_device_raw(row, gpu.stream())?;
             }
             Hidden::Target {
                 walk: MtpArena::Pass,
@@ -1210,7 +1211,7 @@ fn walk_rows(
                     let row = step_row.ok_or_else(|| {
                         GpuError::state(WHAT, "the head's normed row of the step")
                     })?;
-                    mtp.h_row.copy_from_device_async(row, gpu.stream())?;
+                    mtp.h_row.copy_from_device_raw(row, gpu.stream())?;
                 }
                 Hidden::Target {
                     walk: MtpArena::Pass,

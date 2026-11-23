@@ -741,12 +741,12 @@ struct StageRow {
 
 impl Drop for StageRow {
     fn drop(&mut self) {
-        // SAFETY: each window is taken once, here, and never read again; its
-        // raw parts are dropped (the context handle with them) and no memory
-        // is freed — the page frees its allocation after the rows.
+        // SAFETY: each window is taken once, here, and never read again; it is
+        // dropped (the context handle with it) and no memory is freed — the
+        // page frees its allocation after the rows.
         unsafe {
-            drop(ManuallyDrop::take(&mut self.image).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.rows).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.image));
+            drop(ManuallyDrop::take(&mut self.rows));
         }
     }
 }
@@ -1281,10 +1281,10 @@ struct TierRows(ManuallyDrop<DeviceBuffer<f32>>);
 
 impl Drop for TierRows {
     fn drop(&mut self) {
-        // SAFETY: the window is taken once, here, and never read again; its
-        // raw parts are dropped (the context handle with them) and no memory
-        // is freed — the host tier frees the page after its tier cards.
-        unsafe { drop(ManuallyDrop::take(&mut self.0).into_raw_parts()) };
+        // SAFETY: the window is taken once, here, and never read again; it is
+        // dropped (the context handle with it) and no memory is freed — the
+        // host tier frees the page after its tier cards.
+        unsafe { drop(ManuallyDrop::take(&mut self.0)) };
     }
 }
 
@@ -1369,7 +1369,7 @@ impl TierWork {
         ctx.bind_to_thread()?;
         let stream = gpu.stream();
         let act = match shape.act {
-            TierAct::Q8 => Staged::Q8(Q8Act::with_k(stream, cols, shape.hidden)?),
+            TierAct::Q8 => Staged::Q8(Box::new(Q8Act::with_k(stream, cols, shape.hidden)?)),
             TierAct::F32 => Staged::F32(DeviceBuffer::zeroed(stream, cols * shape.hidden)?),
         };
         // The shape is checked once here, as the page the work binds to
@@ -2661,7 +2661,7 @@ const _: () = assert!(TIER_CHAINS == DEFER_MAX_COLS + 2);
 /// A tier card's staging of a row's activation, in its image's form
 /// ([`TierAct`]).
 enum Staged {
-    Q8(Q8Act),
+    Q8(Box<Q8Act>),
     F32(DeviceBuffer<f32>),
 }
 

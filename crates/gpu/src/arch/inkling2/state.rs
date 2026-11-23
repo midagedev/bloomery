@@ -20,6 +20,7 @@
 //! Every store's size is [`shapes`]'s, the one place a load sizes them.
 
 use crate::GpuError;
+use crate::DeviceBufferRaw;
 use chain::linear::Ring;
 use cuda_core::{CudaStream, DeviceBuffer};
 
@@ -102,7 +103,7 @@ impl VisitStore {
 
     /// The conv ring back to zero, ordered on `stream`. Never inside a capture.
     pub(super) fn clear(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.conv.zero_async(stream)?;
+        self.conv.zero_raw(stream)?;
         Ok(())
     }
 

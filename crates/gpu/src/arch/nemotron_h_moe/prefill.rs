@@ -59,6 +59,7 @@ use super::moe::{MoeLayer, MoeShape, Shared};
 use super::placed::{Placed, PlacedSide};
 use super::router::Routers;
 use super::router::{COUNTS, MAX_TOP_K};
+use crate::DeviceBufferRaw;
 use crate::arch::hybrid::{RowBuffers, Shape, Site, norm_rows, residual_rows};
 use crate::card_leg::{RouteW, StackW};
 use crate::card_slots::CardAcc;
@@ -631,7 +632,7 @@ impl Prompt {
     /// slots the host serves and the quantize after it reads every slot's
     /// row, so rows a faulted pass left non-finite fault the next valid one.
     pub(super) fn clear_expert_up(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
-        self.b.up.zero_async(stream)?;
+        self.b.up.zero_raw(stream)?;
         Ok(())
     }
 
@@ -1752,7 +1753,7 @@ impl Body {
         if let Some(head) = head {
             let f = size_of::<f32>();
             let row = Window::<f32>::of(&p.x[cur], (m - 1) * sh.hidden * f, sh.hidden)?;
-            head.input_mut().copy_from_device_async(&row, stream)?;
+            head.input_mut().copy_from_device_raw(&row, stream)?;
             head.enqueue(gpu, w)?;
         }
         Ok(())

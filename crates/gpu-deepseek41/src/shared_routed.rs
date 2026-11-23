@@ -33,6 +33,7 @@
 //! and support mixed sites, including IQ4_XS.
 //! A Q8_0 shared pair runs the clamp alone; a SwiGLU-OAI shared expert on it is refused before launch.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::sync::Arc;
 
 use bloomery_gpu::card_experts::{CardBatch, CardExperts, CardFamily};
@@ -1263,7 +1264,7 @@ pub fn shadow_of<R: RouterEntry>(
     enqueue_block_act(gpu, w, &kernels, &mut r.block, (&blk, shared), io)?;
     if r.k.residual.is_some() {
         span_mut(WHAT, &mut step.x1s, 0, r.d.embd)?
-            .copy_from_device_async(&*span(WHAT, x1, 0, r.d.embd)?, stream)?;
+            .copy_from_device_raw(&*span(WHAT, x1, 0, r.d.embd)?, stream)?;
     } else {
         gpu.elem()
             .enqueue_add(stream, x1, &step.sh_y, r.d.embd, &mut step.x1s)?;
@@ -1541,7 +1542,7 @@ impl<R: RouterEntry> Routed<R> {
         }
         if k.residual.is_some() {
             span_mut(WHAT, &mut b.x1s, 0, m * n)?
-                .copy_from_device_async(&*span(WHAT, x1, 0, m * n)?, gpu.stream())?;
+                .copy_from_device_raw(&*span(WHAT, x1, 0, m * n)?, gpu.stream())?;
             Ok(())
         } else {
             gpu.elem()

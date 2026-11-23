@@ -14,6 +14,8 @@
 //! `dequant_row`'s Q8_0 arm computes, exact in f32.
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu::DeviceBufferRaw;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::GateError;
 
 #[cfg(feature = "gpu")]
@@ -115,7 +117,7 @@ fn run() -> Result<(), GateError> {
         kernels.enqueue_q8_0_gemv(stream, &qs_dev, &d_dev, &x_dev, 8, &mut y_dev)?;
         stream.synchronize()?;
         let y_eager = y_dev.to_host_vec(stream)?;
-        y_dev.zero_async(stream)?;
+        y_dev.zero_raw(stream)?;
         stream.synchronize()?;
         let graph =
             gpu.capture(|s| kernels.enqueue_q8_0_gemv(s, &qs_dev, &d_dev, &x_dev, 8, &mut y_dev))?;

@@ -23,6 +23,7 @@
 //! the session names it and keeps its page and ends alive, since a card may
 //! still wait on the page, and the run ends.
 
+use crate::DeviceBufferRaw;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::ops::Range;
@@ -392,7 +393,7 @@ impl Sums {
         // SAFETY: the part's values lie in the rank's own place of the page, mapped in this
         // context, which the sums hold until their owner has waited for every launch it enqueued.
         let mut place = unsafe { WindowMut::<f32>::from_raw(own, part.len(), gpu.context()) };
-        place.copy_from_device_async(part, gpu.stream())?;
+        place.copy_from_device_raw(part, gpu.stream())?;
         Ok(set)
     }
 

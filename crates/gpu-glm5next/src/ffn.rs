@@ -51,6 +51,7 @@
 //!
 //! [`BlockPlan::extra_launches`]: bloomery_gpu_deepseek41::block::BlockPlan::extra_launches
 
+use bloomery_gpu::DeviceBufferRaw;
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegRun, LegShape, LegStacks};
 use bloomery_gpu::host::leg_tier::{STAGE_TIER, TierSide};
 use bloomery_gpu::host::run::HostRun;
@@ -1112,7 +1113,7 @@ pub(crate) fn back(
     if p.card.hostless(l) {
         return s
             .out
-            .copy_from_device_async(&card_row(&p.card.rows, p.row)?.pre, gpu.stream())
+            .copy_from_device_raw(&card_row(&p.card.rows, p.row)?.pre, gpu.stream())
             .map_err(Into::into);
     }
     let shadowed = if p.card.has(l) {

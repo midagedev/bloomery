@@ -97,4 +97,4 @@ the visible card with the most memory; set `CUDA_VISIBLE_DEVICES` to pick anothe
 
 ## Licence
 
-MIT (`LICENSE`). Third-party code and the patched cuda-oxide toolchain: `THIRD_PARTY_NOTICES.md`.
+MIT (`LICENSE`). Third-party code and the cuda-oxide toolchain: `THIRD_PARTY_NOTICES.md`.

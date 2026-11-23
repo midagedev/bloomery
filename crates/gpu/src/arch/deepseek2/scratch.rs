@@ -220,14 +220,13 @@ pub(super) struct LayerScratch {
 impl Drop for LayerScratch {
     fn drop(&mut self) {
         // SAFETY: each window into `step_params` is taken once, here, and
-        // never read again; its raw parts are dropped (the context handle
-        // with them) and no memory is freed — `step_params` frees the
-        // allocation after this.
+        // never read again; it is dropped (the context handle with it) and no
+        // memory is freed — `step_params` frees the allocation after this.
         unsafe {
-            drop(ManuallyDrop::take(&mut self.pos_buf).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.n_keys_buf).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.token_buf).into_raw_parts());
-            drop(ManuallyDrop::take(&mut self.cs_buf).into_raw_parts());
+            drop(ManuallyDrop::take(&mut self.pos_buf));
+            drop(ManuallyDrop::take(&mut self.n_keys_buf));
+            drop(ManuallyDrop::take(&mut self.token_buf));
+            drop(ManuallyDrop::take(&mut self.cs_buf));
         }
     }
 }
@@ -849,7 +848,7 @@ mod tests {
                 ..
             })
         ));
-        let after = Arc::strong_count(&ctx);
+        let after = crate::tensor::settled_handles(&ctx, before);
         eprintln!("scratch allocation failure context handles: before {before} after {after}");
         assert_eq!(after, before, "a refused scratch leaves no context handle");
     }

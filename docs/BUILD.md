@@ -26,16 +26,16 @@ Install `cargo-oxide` at the pinned rev, not from upstream's main branch (NVIDIA
 
 ```sh
 cargo +1.99.1 install --locked --git https://github.com/NVIDIA/cuda-rust.git \
-  --rev 9df9e7cef561e03a066230b3bb433b3d8285da81 cargo-oxide
+  --rev ab2b6738a729d97db1cde2efa569f8c4cc7f9256 cargo-oxide
 ```
 
-That `cargo-oxide` would build its codegen backend from the checkout cargo resolved for `cuda-device`, at the pinned rev (`crates/cargo-oxide/src/backend_source.rs` in the repository). This tree builds the backend itself instead, with one patch (`tools/oxide-backend/cuda-rust-1648.patch`, NVIDIA/cuda-rust pull request #1648: without it the cute verifier's time is cubic in the block count of a large kernel, and `bloomery-gpu` does not finish):
+That `cargo-oxide` would build its codegen backend from the checkout cargo resolved for `cuda-device`, at the pinned rev (`crates/cargo-oxide/src/backend_source.rs` in the repository). This tree builds the backend itself instead, from the same checkout with the release profile (cargo-oxide builds it in the dev profile, where the device lowering of a crate as large as `bloomery-gpu` runs several times slower):
 
 ```sh
 tools/oxide-backend.sh        # about a minute; installs under ${CARGO_HOME:-~/.cargo}/cuda-oxide-bloomery/<rev>/
 ```
 
-`tools/oxide-host.sh` (run before every `cargo oxide` build by `tools/box.sh`, and by hand in a shell) writes the `backend = ...` line of the generated `.cargo/cuda-oxide.toml` and refuses, by name, a backend that was not built from this tree's patch. The maintainers' machine keeps one `cargo-oxide` per rev in that directory too and points `CUDA_OXIDE_BACKEND` at the backend; you do not need that. The install above has not been run on a clean host yet.
+`tools/oxide-host.sh` (run before every `cargo oxide` build by `tools/box.sh`, and by hand in a shell) writes the `backend = ...` line of the generated `.cargo/cuda-oxide.toml` and refuses, by name, a backend that is missing or was built from another rev. The maintainers' machine keeps one `cargo-oxide` per rev in that directory too and points `CUDA_OXIDE_BACKEND` at the backend; you do not need that. The install above has not been run on a clean host yet.
 
 An environment like this one works on the development machine. Adjust the paths to your install:
 

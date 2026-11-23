@@ -14,7 +14,7 @@
 use bloomery_gpu::checkpoint::saved::{Identity, SeqView};
 use bloomery_gpu::flash_gqa::{HEAD, HEAD_K192};
 use bloomery_gpu::{Gpu, GpuError, GpuModel};
-use cuda_core::simt::memory::{memcpy_dtoh_async, memcpy_htod_async};
+use cuda_core::memory::{memcpy_dtoh_async, memcpy_htod_async};
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::mimo2::place::{self, PlanInputs};
 use models::Mixer;

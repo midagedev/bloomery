@@ -1,9 +1,8 @@
 //! CUDA graph capture and replay over the driver bindings cuda-core re-exports
 //! as `cuda_core::sys` (cutile-rs `cuda-bindings`, bindgen of `^cu.*` against
 //! the toolkit headers, resolved through `dlopen("libcuda.so.1")` at first
-//! call). cuda-core 0.3.1 has `begin_capture`/`end_capture` only on its legacy
-//! `runtime::Stream`, not on the `simt::CudaStream` the generated launchers
-//! take, and no instantiate/launch wrapper at all — so this file is the
+//! call). cuda-core has `begin_capture`/`end_capture` on its stream but no
+//! instantiate/launch wrapper at all — so this file is the
 //! bloomery-side wrapper and the shape of the cutile-rs contribution
 //! (`docs/upstream/nvlabs-ledger.md` #3).
 //!
@@ -428,8 +427,8 @@ impl Branch {
         let ctx = main.context();
         Ok(Branch {
             stream: crate::role_stream(ctx, crate::StreamRole::Engine)?,
-            forked: ctx.new_event(None)?,
-            joined: ctx.new_event(None)?,
+            forked: ctx.new_event_with_flags(None)?,
+            joined: ctx.new_event_with_flags(None)?,
             main,
         })
     }
@@ -1294,6 +1293,7 @@ mod tests {
     use super::{
         Branch, FLAG_WAIT_OPS, Graph, HostFlags, StagedRows, capturing, cu, in_place_flags,
     };
+    use crate::DeviceBufferRaw;
     use crate::{DeviceTensor, Gpu, GpuError, Q8Act, capsync};
     use cuda_core::{DeviceBuffer, PinnedHostBuffer, sys};
     use std::ffi::c_void;
@@ -1466,7 +1466,7 @@ mod tests {
             .synchronize()
             .expect("the allocation lands before capture");
         let graph = Graph::capture(&stream, |s| {
-            buf.zero_async(s)?;
+            buf.zero_raw(s)?;
             // SAFETY: `s` is the live stream being captured; `nothing` takes
             // any pointer and never reads it, and the graph is never launched.
             let rc = unsafe {
@@ -1512,17 +1512,17 @@ mod tests {
             .synchronize()
             .expect("the allocations land before capture");
         let graph = Graph::capture(&stream, |s| {
-            on_main.zero_async(s)?;
+            on_main.zero_raw(s)?;
             for r in 0..ROUNDS {
                 let fork = branch.fork()?;
-                beside.zero_async(fork.stream())?;
-                on_main.zero_async(s)?;
+                beside.zero_raw(fork.stream())?;
+                on_main.zero_raw(s)?;
                 if r == 1 {
                     drop(fork);
                 } else {
                     fork.join()?;
                 }
-                on_main.zero_async(s)?;
+                on_main.zero_raw(s)?;
             }
             Ok(())
         })
@@ -1675,7 +1675,7 @@ mod tests {
         /// node count and what the replay wrote.
         fn replayed(&mut self, gpu: &Gpu) -> (usize, Vec<f32>) {
             let s = gpu.stream();
-            self.y.zero_async(s).expect("zero y");
+            self.y.zero_raw(s).expect("zero y");
             s.synchronize().expect("the zero lands before the capture");
             let graph = gpu.capture(|_| self.enqueue(gpu)).expect("the capture");
             graph.launch(s).expect("a replay");

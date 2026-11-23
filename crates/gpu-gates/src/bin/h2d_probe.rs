@@ -455,7 +455,7 @@ mod probe {
     }
 
     fn timing_event(ctx: &Arc<CudaContext>) -> Result<CudaEvent, GateError> {
-        Ok(ctx.new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?)
+        Ok(ctx.new_event_with_flags(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?)
     }
 
     /// One untimed `copy`, then `reps` of them between a pair of timing
@@ -979,7 +979,7 @@ mod probe {
             .map(|_| PinnedHostBuffer::<u8>::zeroed(ctx, chunk))
             .collect::<Result<_, _>>()?;
         let events: Vec<CudaEvent> = (0..a.ring)
-            .map(|_| ctx.new_event(None))
+            .map(|_| ctx.new_event_with_flags(None))
             .collect::<Result<_, _>>()?;
         let mut i = 0;
         let why = loop {

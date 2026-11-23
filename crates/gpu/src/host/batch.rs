@@ -378,7 +378,7 @@ impl BatchPort {
                 })?,
                 w: pinned("cuMemAllocHost (the batch's routing)", cap * n_used)?,
                 sum: pinned("cuMemAllocHost (the batch's host sums)", cap * n_embd)?,
-                routed: ctx.new_event(None)?,
+                routed: ctx.new_event_with_flags(None)?,
                 stage: Stage::Free,
             })
         };
@@ -482,7 +482,7 @@ impl BatchPort {
             rows_stage,
             rows,
             tsel,
-            done: tier.map(|c| c.new_event(None)).transpose()?,
+            done: tier.map(|c| c.new_event_with_flags(None)).transpose()?,
             planes: (0, 0),
             leg: Leg::Idle,
         })

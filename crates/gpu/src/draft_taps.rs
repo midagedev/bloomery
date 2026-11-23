@@ -12,6 +12,7 @@
 //! readback interleaves them into a position's row of the taps' layers in
 //! the order they were named.
 
+use crate::DeviceBufferRaw;
 use crate::GpuError;
 use crate::model::fit::FIT_RESERVE;
 use crate::tensor::{Window, WindowMut};
@@ -167,7 +168,7 @@ impl DraftTaps {
         let src = Window::<f32>::of(x, 0, len)?;
         let off = self.offset(slot, at);
         let mut dst = WindowMut::<f32>::of_mut(&mut self.buf, off, len)?;
-        dst.copy_from_device_async(&src, stream)?;
+        dst.copy_from_device_raw(&src, stream)?;
         Ok(())
     }
 

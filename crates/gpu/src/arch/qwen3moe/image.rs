@@ -280,7 +280,7 @@ impl MediaRows {
         let ctx = stream.context();
         Ok(MediaRows {
             host: PinnedHostBuffer::zeroed(ctx, 0)?,
-            copied: ctx.new_event(None)?,
+            copied: ctx.new_event_with_flags(None)?,
             width,
             spans: Vec::new(),
             unit: 0..0,

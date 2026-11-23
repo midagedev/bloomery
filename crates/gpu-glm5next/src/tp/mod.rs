@@ -23,6 +23,7 @@
 //! ([`step`]), so no rank's stream holds more than one sub-layer's work queued behind a wait.
 //! The NextN layer and a prompt batch are not run here.
 
+use bloomery_gpu::DeviceBufferRaw;
 mod source;
 
 use std::sync::Arc;
@@ -370,9 +371,9 @@ impl Rank {
         if sub == Sub::Ffn {
             p.tap(gpu, l, *cur)?;
             if let Some(Some(t)) = routes.as_mut().and_then(|r| r.get_mut(l)) {
-                t.ids.copy_from_device_async(&p.s.rout.ids, gpu.stream())?;
+                t.ids.copy_from_device_raw(&p.s.rout.ids, gpu.stream())?;
                 t.probs
-                    .copy_from_device_async(&p.s.rout.probs, gpu.stream())?;
+                    .copy_from_device_raw(&p.s.rout.probs, gpu.stream())?;
             }
         }
         Ok(())

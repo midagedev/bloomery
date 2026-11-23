@@ -19,6 +19,7 @@
 //! layer on the card and hands the rest to a host tier; its routed layers run
 //! the hybrid MoE half, and nothing else in the chain changes.
 
+use crate::DeviceBufferRaw;
 mod dispatch;
 mod names;
 mod pins;
@@ -517,11 +518,11 @@ impl ChainBody for Body {
         if let Some(h) = self.hybrid.as_mut() {
             h.reset(gpu.stream())?;
             if let Some(m) = self.scratch.moe.as_mut() {
-                m.h_exp.zero_async(gpu.stream())?;
+                m.h_exp.zero_raw(gpu.stream())?;
             }
         }
         for cache in self.kv.iter_mut() {
-            cache.buf_mut().zero_async(gpu.stream())?;
+            cache.buf_mut().zero_raw(gpu.stream())?;
         }
         Ok(())
     }

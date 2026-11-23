@@ -118,7 +118,7 @@ A recipe's inputs are:
     fixture directory table it reads, tools/fixture-dirs.tsv, tools/ref/models/deepseek41.sh and the recipe's profile (`BLOOMERY_MODEL=x` on the line, else
     deepseek2);
   - for a cargo recipe, Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo/config.toml, and
-    tools/oxide-host.sh (the host's CPU flags and llc), tools/oxide-backend.sh and its patch when the recipe runs `cargo oxide`. A virtual workspace's Cargo.toml is read by
+    tools/oxide-host.sh (the host's CPU flags and llc), tools/oxide-backend.sh when the recipe runs `cargo oxide`. A virtual workspace's Cargo.toml is read by
     table too (`root_moves`): of [workspace], `members`/`exclude` select the recipes that read a package that
     entered or left the workspace (an exclude of a path that held no member selects nothing),
     `default-members` the recipes with a cargo line naming no `-p` and no `--workspace`, and each moved
@@ -329,7 +329,7 @@ LOCK_FILE = "Cargo.lock"
 # The workspace's root manifest: a cargo global every cargo recipe reads, narrowed by table (`root_moves`) where it is a
 # virtual manifest; as a package's own manifest it stays whole.
 ROOT_MANIFEST = "Cargo.toml"
-OXIDE_GLOBALS = ["tools/oxide-host.sh", "tools/oxide-backend.sh", "tools/oxide-backend/cuda-rust-1648.patch"]
+OXIDE_GLOBALS = ["tools/oxide-host.sh", "tools/oxide-backend.sh"]
 BOX_GLOBALS = ["tools/box.sh", "tools/ref/ref-paths.sh", "tools/fixture-dirs.tsv", "tools/ref/models/deepseek41.sh"]
 DEFAULT_PROFILE = "deepseek2"
 # Runners that execute target/release/<first argument>.

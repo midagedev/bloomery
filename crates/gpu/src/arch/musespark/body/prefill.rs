@@ -58,6 +58,7 @@
 use super::placed::{Placed, PlacedSide};
 use super::tier::{TierSum, enqueue_tier_sum};
 use super::{Body, Kernels, Layer, RouteOut, Shape, Taps, enqueue_head, stack};
+use crate::DeviceBufferRaw;
 use crate::arch::hybrid::{Site, WideCx, norm_rows, project_wide, wide_acts_at};
 use crate::card_leg::LegStacks;
 use crate::card_slots::ColPlaces;
@@ -973,8 +974,8 @@ impl PassWalk<'_> {
         let sel = match places {
             Places::Ids => &b.ids,
             Places::Cut => {
-                b.up.zero_async(stream)?;
-                b.down.zero_async(stream)?;
+                b.up.zero_raw(stream)?;
+                b.down.zero_raw(stream)?;
                 &b.sel
             }
         };
@@ -1574,7 +1575,7 @@ impl Body {
         if let Some(head) = head {
             let f = size_of::<f32>();
             let row = Window::<f32>::of(&walk.b.x, (m - 1) * sh.hidden * f, sh.hidden)?;
-            head.input_mut().copy_from_device_async(&row, stream)?;
+            head.input_mut().copy_from_device_raw(&row, stream)?;
             enqueue_head(gpu, w, head, self.epilogue)?;
         }
         Ok(())

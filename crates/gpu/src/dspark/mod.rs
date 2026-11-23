@@ -10,6 +10,7 @@
 //! 2's layer over its own context projections in [`ctx_dense`]. The
 //! draft's geometry is [`bloomery_runtime::dspark::DsparkShape`].
 
+use crate::DeviceBufferRaw;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
 
@@ -822,7 +823,7 @@ impl<L: DraftLayers> DsparkBody<L> {
         if let Embed::Host(_) = self.embed {
             let rows = self.block_in.f32s(1, m * self.hidden)?;
             let mut x = WindowMut::of_mut(&mut self.x, 0, m * self.hidden)?;
-            x.copy_from_device_async(&rows, s)?;
+            x.copy_from_device_raw(&rows, s)?;
         }
         match graph {
             Some(g) => {

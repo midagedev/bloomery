@@ -939,7 +939,7 @@ mod probe {
             self.release()?;
             let end = gpu
                 .context()
-                .new_event(None)
+                .new_event_with_flags(None)
                 .map_err(|e| format!("no end event: {e}"))?;
             end.record(gpu.stream())
                 .map_err(|e| format!("end event not recorded: {e}"))?;
@@ -1200,7 +1200,7 @@ mod probe {
             if card.node.rank == 0 {
                 self.launch(stale, stamps, card.total, 0, 0, total)?;
             }
-            let end = ctx.new_event(None)?;
+            let end = ctx.new_event_with_flags(None)?;
             end.record(stream)?;
             card.node.settle(&end, Instant::now(), total)
         }
@@ -1454,7 +1454,7 @@ mod probe {
         ctx.bind_to_thread()?;
         let stream = gpu.stream();
         let events = (0..AHEAD)
-            .map(|_| ctx.new_event(None))
+            .map(|_| ctx.new_event_with_flags(None))
             .collect::<Result<Vec<_>, _>>()?;
         let mut progress = Instant::now();
         for k in 1..=total {
@@ -1465,7 +1465,7 @@ mod probe {
             enqueue(k)?;
             events[k % AHEAD].record(stream)?;
         }
-        let end = ctx.new_event(None)?;
+        let end = ctx.new_event_with_flags(None)?;
         end.record(stream)?;
         node.settle(&end, Instant::now(), total)
     }

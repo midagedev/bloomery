@@ -81,10 +81,12 @@ impl UploadRing {
                     op: Some("cuMemAllocHost (the upload ring)"),
                     source,
                 })?,
-                done: ctx.new_event(None).map_err(|source| GpuError::Driver {
-                    op: Some("cuEventCreate (the upload ring)"),
-                    source,
-                })?,
+                done: ctx
+                    .new_event_with_flags(None)
+                    .map_err(|source| GpuError::Driver {
+                        op: Some("cuEventCreate (the upload ring)"),
+                        source,
+                    })?,
             });
         }
         Ok(UploadRing { slots, next: 0 })
@@ -341,7 +343,7 @@ fn enqueue_from_slot(
     // passed: the next use of the slot waits it, and the ring's drop waits
     // every slot's. The copy is enqueued, not run, here.
     let enqueue = unsafe { window.copy_from_host_async_unchecked(stream, staging) };
-    drop(ManuallyDrop::into_inner(window).into_raw_parts());
+    drop(ManuallyDrop::into_inner(window));
     if let Err(source) = enqueue {
         let _ = stream.synchronize();
         return Err(GpuError::Driver {

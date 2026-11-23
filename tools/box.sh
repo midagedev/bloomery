@@ -75,7 +75,7 @@
 #                             which holds the machine's cards), BLOOMERY_CARD 3090 and a6000 run on the cards in view, and
 #                             `both` runs when two or more are in view, read after the environment file and BLOOMERY_BOX_ENV, else 64 naming
 #                             what is in view (a timing runner pins its timing card: tools/ref/timing-card.sh). CUDA_OXIDE_BACKEND is unset after the
-#                             environment file; tools/oxide-host.sh selects the patched backend tools/oxide-backend.sh
+#                             environment file; tools/oxide-host.sh selects the backend tools/oxide-backend.sh
 #                             installed, and refuses one that is missing. BLOOMERY_REMOTE names no
 #                             directory here and adds no CARGO_BUILD_JOBS. What box.sh reads on this side, its own outputs
 #                             (BLOOMERY_REF_MODEL_PROFILE, the fixture tier's BLOOMERY_CARD_BUDGET and
@@ -1454,11 +1454,11 @@ fi
 # install under a running build. The rev is the first cuda-device rev of Cargo.toml's [workspace.dependencies]. A command that runs
 # cargo oxide stops by name (rc 70) when the backend file is missing or its source-rev.txt names another rev, or when the cargo-oxide
 # cargo resolves is not at the rev. CUDA_OXIDE_BACKEND pins the backend, and cargo-oxide then does not compare it with the
-# dependencies' commit, so that comparison is made here. A rev's backend is built by tools/oxide-backend.sh (the rev's checkout with
-# tools/oxide-backend/cuda-rust-1648.patch applied, built with cargo-oxide's own backend command, installed by temp file + mv with the
-# rev in source-rev.txt and the patch's sha256 in PROVENANCE), and tools/oxide-host.sh, which runs before every cargo oxide command
-# here, refuses a backend that does not carry this tree's patch. The generated .cargo/cuda-oxide.toml names the same file, so a
-# cargo oxide run outside this script (local mode, a shell in the tree) takes the patched backend too.
+# dependencies' commit, so that comparison is made here. A rev's backend is built by tools/oxide-backend.sh (the rev's checkout, built
+# with cargo-oxide's own backend command plus --release, installed by temp file + mv with the rev in source-rev.txt), and
+# tools/oxide-host.sh, which runs before every cargo oxide command here, refuses a backend of another rev. The generated
+# .cargo/cuda-oxide.toml names the same file, so a cargo oxide run outside this script (local mode, a shell in the tree) takes
+# the same backend too.
 OXREV=$(sed -n 's/^cuda-device = .*rev = "\([0-9a-f]*\)".*/\1/p' "$HERE/Cargo.toml" | head -1)
 [ -n "$OXREV" ] || { echo "box.sh: no cuda-oxide rev in $HERE/Cargo.toml" >&2; exit 70; }
 OXIDE="export CUDA_OXIDE_BACKEND=\$HOME/.cargo/cuda-oxide-bloomery/$OXREV/librustc_codegen_cuda.so PATH=\$HOME/.cargo/cuda-oxide-bloomery/$OXREV/bin:\$PATH && "

@@ -30,6 +30,7 @@
 //! term: the plan keeps [`PlanInputs::prompt_reserve`] of the card for them out of the expert
 //! budget, and the load holds their made bytes to it.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::num::NonZeroUsize;
 use std::ops::Range;
 use std::sync::Arc;
@@ -1301,8 +1302,8 @@ impl ChainBody for Body {
         self.shell.hybrid.settle(stream)?;
         for s in &mut self.stores {
             if let Store::Kda { state, ring, .. } = s {
-                state.zero_async(stream)?;
-                ring.zero_async(stream)?;
+                state.zero_raw(stream)?;
+                ring.zero_raw(stream)?;
             }
         }
         Body::restamp(stream, &mut self.stores, 0)?;

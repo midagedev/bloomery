@@ -116,7 +116,7 @@ fn placing(device: CUdevice) -> Result<Placing, GpuError> {
 /// once a device ([`placing`]); a card-only room keeps the card's own
 /// granularity ([`crate::allocation_granularity`]).
 pub(crate) fn page_for(ordinal: usize) -> Result<usize, GpuError> {
-    let device = cuda_core::Device::raw_device(ordinal)?;
+    let device = cuda_core::Device::new(ordinal)?.cu_device();
     let (card, host) = (
         crate::allocation_granularity(ordinal)?,
         placing(device)?.granularity,

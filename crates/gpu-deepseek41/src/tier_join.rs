@@ -16,6 +16,7 @@
 //! What stays with the family is where its slots' rows, places and weights live
 //! ([`TierJoin`], [`TierSlots`]) and what its base is.
 
+use bloomery_gpu::DeviceBufferRaw;
 use std::mem::size_of;
 
 use bloomery_gpu::card_experts::TierJoin;
@@ -159,9 +160,9 @@ impl TierBatch {
         weights: &DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         span_mut(WHAT, &mut self.join_weights, 0, slots)?
-            .copy_from_device_async(&*span(WHAT, weights, 0, slots)?, stream)?;
+            .copy_from_device_raw(&*span(WHAT, weights, 0, slots)?, stream)?;
         span_mut(WHAT, &mut self.join_places, 0, slots)?
-            .copy_from_device_async(&*span(WHAT, &self.places, 0, slots)?, stream)?;
+            .copy_from_device_raw(&*span(WHAT, &self.places, 0, slots)?, stream)?;
         Ok(())
     }
 

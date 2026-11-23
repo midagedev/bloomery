@@ -14,6 +14,7 @@
 //! launches over all of them, each sequence's append and attention over its
 //! own store, the head and the readback.
 
+use crate::DeviceBufferRaw;
 use crate::media::CallRows;
 use crate::model::slots::slot_twice;
 use crate::model::{GpuModel, MAX_PASS_ROWS, Slots, StepMode};
@@ -39,7 +40,7 @@ pub fn retain_hidden_row(
         .ok_or_else(|| GpuError::shape("draft::retain_hidden_row", "hidden row offset overflow"))?;
     let source = crate::tensor::Window::<f32>::of(source, byte_off, width)?;
     let mut target = crate::tensor::WindowMut::<f32>::of_mut(target, 0, width)?;
-    target.copy_from_device_async(&source, stream)?;
+    target.copy_from_device_raw(&source, stream)?;
     Ok(())
 }
 

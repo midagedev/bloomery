@@ -1,6 +1,7 @@
 //! The step's walk: common attention, then the dense or routed block, and the output head, for one
 //! row (the one-token step) or the rows of a verify pass, one layer apart on the one stream.
 
+use bloomery_gpu::DeviceBufferRaw;
 use bloomery_gpu::attention_h128::{Binding, Cache, Kernels, Scratch};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::StepLeg;
@@ -154,7 +155,7 @@ impl<R: RouterEntry> Step<'_, R> {
             } else {
                 &self.s.x
             };
-            taps[l].copy_from_device_async(out, self.gpu.stream())?;
+            taps[l].copy_from_device_raw(out, self.gpu.stream())?;
         }
         Ok(())
     }

@@ -140,6 +140,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "gpu")]
 mod gate {
+    use bloomery_gpu::DeviceBufferRaw;
     use bloomery_gpu::linear::conv::{
         ConvArgs, ConvOut, ConvRows, KdaBetaScale, KdaConvArgs, KdaGateRule, conv_prep_host,
         kda_conv_prep_host,
@@ -2904,8 +2905,8 @@ mod gate {
                         .collect::<Result<Vec<_>, GateError>>()?;
                     let mut o = DeviceBuffer::zeroed(s, m * K1_SHAPE.n_v * HEAD)?;
                     let timed = Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT);
-                    let start = cx.gpu.context().new_event(timed)?;
-                    let end = cx.gpu.context().new_event(timed)?;
+                    let start = cx.gpu.context().new_event_with_flags(timed)?;
+                    let end = cx.gpu.context().new_event_with_flags(timed)?;
                     for round in 0..4 {
                         for recovery in if round % 2 == 0 {
                             [false, true]
@@ -2913,7 +2914,7 @@ mod gate {
                             [true, false]
                         } {
                             for (state, stamp, _) in &mut stores {
-                                state.zero_async(s)?;
+                                state.zero_raw(s)?;
                                 stamp.copy_from_host(s, &stamps)?;
                             }
                             s.synchronize()?;
@@ -3358,8 +3359,8 @@ mod gate {
             let table = unsafe { RecoveryTable::new(s, K1_SHAPE, (ROW_LANES, m), &rows) }?;
             drop(rows);
             let timed = Some(cuda_core::sys::CUevent_flags_enum_CU_EVENT_DEFAULT);
-            let start = cx.gpu.context().new_event(timed)?;
-            let end = cx.gpu.context().new_event(timed)?;
+            let start = cx.gpu.context().new_event_with_flags(timed)?;
+            let end = cx.gpu.context().new_event_with_flags(timed)?;
             for round in 0..4 {
                 for fused in if round % 2 == 0 {
                     [false, true]

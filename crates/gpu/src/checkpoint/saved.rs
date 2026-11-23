@@ -813,8 +813,8 @@ impl<T> SeqState<T> {
         let timed = Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT);
         let ready = engine.record_event(None)?;
         lane.stream.wait(&ready)?;
-        let start = ctx.new_event(timed)?;
-        let end = ctx.new_event(timed)?;
+        let start = ctx.new_event_with_flags(timed)?;
+        let end = ctx.new_event_with_flags(timed)?;
         start.record(&lane.stream)?;
         let (calls, end) = lane.copy(|| {
             let (rows_at, rows_len) = (staged.rows_ptr(), staged.rows_bytes());

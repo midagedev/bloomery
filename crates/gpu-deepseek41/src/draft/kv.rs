@@ -24,6 +24,7 @@
 //! to [`GROUP`] rows captures ([`KvAppend::capture`]) and replays after any
 //! stage of that many rows.
 
+use bloomery_gpu::DeviceBufferRaw;
 use bloomery_gpu::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use bloomery_gpu::{DeviceTensor, Gpu, GpuError, Graph};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -91,7 +92,7 @@ impl DraftRings {
     /// Zero every ring. Asynchronous.
     pub fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         for r in &mut self.rings {
-            r.buf_mut().zero_async(stream)?;
+            r.buf_mut().zero_raw(stream)?;
         }
         Ok(())
     }

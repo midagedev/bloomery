@@ -64,8 +64,7 @@ The contributor's builds run in the `nvidia/cuda:13.3.1-devel-ubuntu24.04` conta
 toolkit, answer 7) with LLVM 21.1.8's ARM64 release `llc` named by `CUDA_OXIDE_LLC` `[#13]`. The host driver needs
 CUDA 13.0 or later (`crates/serve/src/preflight.rs:16`). `.cargo/config.toml` carries `target-cpu=native` for
 `aarch64-unknown-linux-gnu` (`f0139df3`), and `tools/oxide-host.sh` writes the `cargo oxide` file from it, so a Spark
-needs no local flag. Run `tools/oxide-backend.sh` once (about a minute: it builds the backend with the patch this tree
-carries) and `tools/oxide-host.sh` before `cargo oxide`. `tools/oxide-host.sh` refuses by name an unset
+needs no local flag. Run `tools/oxide-backend.sh` once (about a minute: it builds the backend of the pin's checkout) and `tools/oxide-host.sh` before `cargo oxide`. `tools/oxide-host.sh` refuses by name an unset
 `CUDA_OXIDE_LLC`, an `llc` of another LLVM major (`tools/oxide-host.sh:121` at `c21e3b81`) and a backend not built by
 `tools/oxide-backend.sh`, so the Rust toolchain's newer `llc` cannot make the PTX (section 6). Device crates build
 with `cargo oxide` only, for example:

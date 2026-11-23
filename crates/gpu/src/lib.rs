@@ -37,6 +37,8 @@ pub mod autotune;
 pub mod best;
 pub mod cand;
 pub mod capsync;
+mod raw_async;
+pub use raw_async::DeviceBufferRaw;
 pub mod card_bytes;
 pub mod card_experts;
 pub mod card_leg;
@@ -2489,7 +2491,7 @@ pub fn allocation_granularity(device: usize) -> Result<usize, GpuError> {
     if let Some(Some(page)) = pages.get(device) {
         return Ok(*page);
     }
-    let raw = cuda_core::Device::raw_device(device)?;
+    let raw = cuda_core::Device::new(device)?.cu_device();
     let page = cuda_core::vmm::allocation_granularity(raw)?;
     if pages.len() <= device {
         pages.resize(device + 1, None);
@@ -2512,7 +2514,7 @@ pub fn host_page(device: usize) -> Result<usize, GpuError> {
 pub(crate) fn device_info(
     ordinal: usize,
 ) -> Result<::model::placement::workstation::DeviceInfo, GpuError> {
-    let dev = cuda_core::Device::raw_device(ordinal)?;
+    let dev = cuda_core::Device::new(ordinal)?.cu_device();
     let mut total = 0usize;
     // SAFETY: `total` is a live out-pointer for the call and `dev` a
     // device handle the driver just returned.
@@ -2900,7 +2902,7 @@ const SM12X_JIT_FIXED: i32 = 13010;
 /// Why device `device`'s driver must not compile our PTX, or `None`
 /// ([`jit_defect_of`] of its compute capability and the driver's version).
 fn jit_defect(device: usize) -> Result<Option<String>, GpuError> {
-    let cc = raw_device_compute_capability(cuda_core::Device::raw_device(device)?)?;
+    let cc = raw_device_compute_capability(cuda_core::Device::new(device)?.cu_device())?;
     let mut driver = 0;
     // SAFETY: `driver` is a live out-pointer for the call.
     let rc = unsafe { cuda_core::sys::cuDriverGetVersion(&mut driver) };

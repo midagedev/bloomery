@@ -307,13 +307,24 @@ pub const LAND_BATCHES: usize = 3;
 /// ring half); the card route only reads them.
 ///
 /// [`HOST`]: super::slots::HOST
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LandBatch {
     /// The batch's map row, host-mapped and device-visible: `experts` words.
     pub map: sys::CUdeviceptr,
     /// The copy stream's event after the batch's last copy; `None` when no
     /// copy lands in the batch's slots.
     pub event: Option<Arc<CudaEvent>>,
+}
+
+// A `CudaEvent` has no `Debug`: the batch prints its map row and whether an
+// event follows the copies.
+impl std::fmt::Debug for LandBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LandBatch")
+            .field("map", &self.map)
+            .field("event", &self.event.is_some())
+            .finish()
+    }
 }
 
 impl LandBatch {
@@ -382,7 +393,7 @@ impl LandRows {
         let events = (0..layers)
             .map(|_| {
                 (0..LAND_BATCHES)
-                    .map(|_| ctx.new_event(None).map(Arc::new))
+                    .map(|_| ctx.new_event_with_flags(None).map(Arc::new))
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -478,7 +489,7 @@ fn with_row<T>(
     // window owns nothing and frees nothing.
     let window = unsafe { crate::tensor::window::<u32>(row, experts, ctx) };
     let ran = f(&window);
-    drop(std::mem::ManuallyDrop::into_inner(window).into_raw_parts());
+    drop(std::mem::ManuallyDrop::into_inner(window));
     ran
 }
 
@@ -1007,7 +1018,7 @@ impl XStream {
         let copy = crate::role_stream(ctx, crate::StreamRole::Background)?;
         let new_events = |n| {
             (0..n)
-                .map(|_| ctx.new_event(None))
+                .map(|_| ctx.new_event_with_flags(None))
                 .collect::<Result<Vec<_>, _>>()
         };
         let used = new_events(HALVES)?;

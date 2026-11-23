@@ -507,7 +507,7 @@ impl AttnBatch {
         while on && self.marks.len() < want {
             self.marks.push(
                 gpu.context()
-                    .new_event(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
+                    .new_event_with_flags(Some(sys::CUevent_flags_enum_CU_EVENT_DEFAULT))?,
             );
         }
         self.timed = on;

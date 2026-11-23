@@ -47,6 +47,7 @@
 //! three parts of the tier's step walk around the host's go, the card's slots
 //! under it.
 
+use crate::DeviceBufferRaw;
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Names, Site, norm_rows};
 use crate::card_slots::CardAcc;
 use crate::checkpoint::saved::Identity;
@@ -1550,9 +1551,9 @@ impl ChainBody for Body {
     /// faulted call left would fault the next valid one.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         if let Some(p) = self.placed.as_mut() {
-            self.s.up.zero_async(gpu.stream())?;
-            self.s.rows.zero_async(gpu.stream())?;
-            self.s.rows2.zero_async(gpu.stream())?;
+            self.s.up.zero_raw(gpu.stream())?;
+            self.s.rows.zero_raw(gpu.stream())?;
+            self.s.rows2.zero_raw(gpu.stream())?;
             p.reset(gpu.stream())?;
         }
         Ok(())

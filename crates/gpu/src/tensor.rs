@@ -29,8 +29,9 @@ pub(crate) fn check_alignment<V, T>(
 }
 
 /// A non-owning window of `len` `T` at device address `ptr` in `ctx`. The
-/// launches read it exactly as they read a buffer of their own;
-/// `ManuallyDrop` keeps it from ever freeing memory it does not own.
+/// launches read it exactly as they read a buffer of their own; its storage is
+/// borrowed, so dropping it frees nothing, and an access still in flight keeps
+/// only the handle alive.
 ///
 /// # Safety
 ///
@@ -43,10 +44,40 @@ pub unsafe fn window<T>(
     len: usize,
     ctx: &Arc<CudaContext>,
 ) -> ManuallyDrop<DeviceBuffer<T>> {
-    // SAFETY: the range is the caller's contract. `from_raw_parts` asks for a
-    // `cuMemAlloc` pointer because its drop frees one; a window is never
-    // dropped, so the only uses left are the address and the length.
-    ManuallyDrop::new(unsafe { DeviceBuffer::from_raw_parts(ptr, len, ctx.clone()) })
+    // SAFETY: the range is the caller's contract.
+    ManuallyDrop::new(unsafe { borrowed(ptr, len, ctx) })
+}
+
+/// A buffer of `len` `T` at device address `ptr` in `ctx` over memory the caller
+/// owns: its storage is borrowed (`Owner::Borrowed`), so a drop frees nothing.
+/// `DeviceBuffer::from_raw_parts` would own the range and free it, and its
+/// `into_raw_parts` refuses an allocation a copy still holds in flight.
+///
+/// # Safety
+///
+/// [`window`]'s contract.
+pub(crate) unsafe fn borrowed<T>(
+    ptr: sys::CUdeviceptr,
+    len: usize,
+    ctx: &Arc<CudaContext>,
+) -> DeviceBuffer<T> {
+    let bytes = len.checked_mul(size_of::<T>()).unwrap_or_else(|| {
+        panic!(
+            "borrowed buffer: {len} × {} B overflows usize",
+            size_of::<T>()
+        )
+    });
+    // SAFETY: the range is the caller's contract.
+    let storage =
+        unsafe { cuda_core::RawDeviceBuffer::borrowed_from_raw_parts(ptr, bytes, ctx.clone()) };
+    // SAFETY: the memory is the caller's and initialized before any read;
+    // `from_storage` refuses an address not aligned for `T`, and that panics by name.
+    unsafe { DeviceBuffer::<T>::from_storage(storage, len) }.unwrap_or_else(|e| {
+        panic!(
+            "borrowed buffer of {len} × {} B at {ptr:#x} refused: {e}",
+            size_of::<T>()
+        )
+    })
 }
 
 /// A non-owning window of `len` `T` at `byte_off` of a live parent buffer,
@@ -76,9 +107,9 @@ impl<T> Drop for Window<'_, T> {
     fn drop(&mut self) {
         // SAFETY: `buf` is taken once, here, and never read again.
         let buf = unsafe { ManuallyDrop::take(&mut self.buf) };
-        // The window owns no memory: its raw parts are dropped, the context
-        // handle with them, and nothing is freed.
-        drop(buf.into_raw_parts());
+        // The window owns no memory: its storage is borrowed, so the drop
+        // releases the handles and frees nothing.
+        drop(buf);
     }
 }
 
@@ -105,8 +136,8 @@ impl<T> Window<'_, T> {
     /// - The parent must stay alive and in place — the same allocation, not
     ///   freed — for as long as the handle is used.
     /// - The handle's owner owes it, exactly once, the release this window's
-    ///   `Drop` would have done: dropping the buffer's raw parts, which
-    ///   releases the context handle and frees nothing.
+    ///   `Drop` would have done: dropping the buffer, which releases the
+    ///   context handle and frees nothing.
     pub(crate) unsafe fn into_handle(mut self) -> ManuallyDrop<DeviceBuffer<T>> {
         // SAFETY: `buf` is taken once, here; `self` is forgotten right below,
         // so its drop cannot take it again.
@@ -577,10 +608,10 @@ impl<T, const N: usize> Drop for PartedBuffer<T, N> {
     fn drop(&mut self) {
         for part in &mut self.parts {
             // SAFETY: each window is taken once, here, and never read again;
-            // its raw parts are dropped (the context handle with them) and no
-            // memory is freed — `whole` frees the allocation after this.
+            // it is dropped (the context handle with it) and no memory is
+            // freed — `whole` frees the allocation after this.
             let buf = unsafe { ManuallyDrop::take(part) };
-            drop(buf.into_raw_parts());
+            drop(buf);
         }
     }
 }
@@ -648,7 +679,7 @@ impl<T: DeviceCopy> DeviceTensor<T> {
             0
         } else {
             // SAFETY: the stream's context is current and `bytes` is positive.
-            unsafe { cuda_core::simt::memory::malloc_sync(bytes)? }
+            unsafe { cuda_core::memory::malloc_sync(bytes)? }
         };
         // SAFETY: `ptr` owns this context's allocation of `len` elements, or
         // is null for no bytes; the buffer takes it over and frees it on drop.
@@ -689,7 +720,7 @@ impl<T: DeviceCopy> DeviceTensor<T> {
     /// Give back a [`DeviceTensor::window`]: its handle on the context is
     /// dropped and no memory is freed.
     pub fn release(t: ManuallyDrop<DeviceTensor<T>>) {
-        drop(ManuallyDrop::into_inner(t).buf.into_raw_parts());
+        drop(ManuallyDrop::into_inner(t).buf);
     }
 
     /// A `rows × cols` window of `parent` from byte `byte_off`, for a
@@ -783,11 +814,11 @@ impl<T> Deref for TensorWindow<'_, T> {
 
 impl<T> Drop for TensorWindow<'_, T> {
     fn drop(&mut self) {
-        // The window owns no memory: the tensor's raw parts are dropped, the
-        // context handle with them, and nothing is freed — the parent frees
-        // the allocation after the window is gone.
+        // The window owns no memory: the tensor is dropped, the context
+        // handle with it, and nothing is freed — the parent frees the
+        // allocation after the window is gone.
         if let Some(t) = self.tensor.take() {
-            drop(t.buf.into_raw_parts());
+            drop(t.buf);
         }
     }
 }
@@ -966,6 +997,33 @@ thread_local! {
     pub(crate) static FAIL_ALLOCATION: std::cell::Cell<Option<&'static str>> = const {
         std::cell::Cell::new(None)
     };
+}
+
+/// The strong count of `ctx` once the buffers a test just dropped have given
+/// their handles back: `want` as soon as it holds, else the last count after two
+/// seconds. cuda-core keeps a buffer's allocation alive until a thread that polls
+/// the events of its queued copies, every millisecond, retires them, so a count
+/// read right after a drop can still hold them; a handle that leaks never goes.
+#[cfg(test)]
+pub(crate) fn settled_handles(ctx: &Arc<CudaContext>, want: usize) -> usize {
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let held = Arc::strong_count(ctx);
+        if held == want || std::time::Instant::now() >= end {
+            return held;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Lets cuda-core's retirement thread finish what a synchronized stream already
+/// completed: it retires a queued copy's lease within a millisecond or two of its
+/// event passing, and a lease's last drop binds the context, which reads and
+/// clears the context's sticky error. A test that records an error and reads it
+/// back settles first.
+#[cfg(test)]
+pub(crate) fn settle_retirements() {
+    std::thread::sleep(std::time::Duration::from_millis(20));
 }
 
 #[cfg(test)]

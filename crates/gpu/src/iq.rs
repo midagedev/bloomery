@@ -1821,14 +1821,13 @@ mod tests {
             let len = w.planes[plane].len();
             let parent = DeviceBuffer::<u32>::zeroed(&stream, len + 1).expect("parent");
             // SAFETY: the u32-aligned window covers len words of parent, which
-            // lives through the launch and read; into_raw_parts prevents its free.
-            let view = unsafe {
-                DeviceBuffer::from_raw_parts(parent.cu_deviceptr() + 4, len, ctx.clone())
-            };
+            // lives through the launch and read; the view's storage is borrowed, so
+            // its drop frees nothing.
+            let view = unsafe { crate::tensor::borrowed(parent.cu_deviceptr() + 4, len, &ctx) };
             let owned = std::mem::replace(&mut w.planes[plane], view);
             let result = kernels.enqueue_rows(&stream, &w, &q, &d8, 1, &mut y);
             let view = std::mem::replace(&mut w.planes[plane], owned);
-            let _parts = view.into_raw_parts();
+            drop(view);
             let w = std::mem::ManuallyDrop::into_inner(w);
             stream.synchronize().expect("launch finished");
             let name = if plane == 0 { "qs" } else { "meta" };

@@ -31,6 +31,8 @@
 //! deviation measures 1.3–1.4e-2.
 
 #[cfg(feature = "gpu")]
+use bloomery_gpu::DeviceBufferRaw;
+#[cfg(feature = "gpu")]
 use bloomery_gpu_gates::{GateError, bits_equal, verdict};
 
 #[cfg(feature = "gpu")]
@@ -229,7 +231,7 @@ fn run() -> Result<(), GateError> {
     stream.synchronize()?;
     let y_eager = y_dev.to_host_vec(stream)?;
 
-    y_dev.zero_async(stream)?;
+    y_dev.zero_raw(stream)?;
     stream.synchronize()?;
     let graph = gpu.capture(|_s| {
         q5.enqueue_quantize_q8(stream, &x_dev, &mut act, gpu.unlabelled_sink())?;

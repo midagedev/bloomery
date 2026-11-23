@@ -3,6 +3,7 @@
 
 use super::names::LayerNames;
 use super::scratch::{Gather, LayerScratch, MoeDims, MoeScratch};
+use crate::DeviceBufferRaw;
 use crate::flash::{
     FlashGeom, FlashInputs, FlashLatentArgs, FlashLatentQ8Args, FlashMergeArgs, FlashMergeQ8Args,
     FlashSegArgs,
@@ -75,9 +76,9 @@ pub(super) fn enqueue_chain<H: HostExperts>(
             &mut |_, _, _| Ok(()),
         )?;
         if slot == last {
-            head.input_mut().copy_from_device_async(&s.l_out, stream)?;
+            head.input_mut().copy_from_device_raw(&s.l_out, stream)?;
         } else {
-            s.x.copy_from_device_async(&s.l_out, stream)?;
+            s.x.copy_from_device_raw(&s.l_out, stream)?;
         }
         if let Some(h) = hybrid.as_deref_mut().filter(|_| names[slot].routed) {
             h.layer_enqueued(names[slot].layer)?;
@@ -850,7 +851,7 @@ fn enqueue_ffn_moe_hybrid(
     let n_card = slots.on_card(names.layer)?;
     let card = n_card > 0;
     if card {
-        m.down.zero_async(stream)?;
+        m.down.zero_raw(stream)?;
         tick(i, obs, "hybrid_zero_down", bsum(&[Some(4 * m.down.len())]))?;
         gpu.elem().enqueue_card_sel(
             stream,

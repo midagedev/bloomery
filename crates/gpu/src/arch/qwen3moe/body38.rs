@@ -140,6 +140,7 @@ use super::wide38::{
     Gemm38, PleRowsIn, STREAM_FLOOR, SplitWalk, Wide38, WideForce, WideForms, WideParts, WideTaps,
     dense_rows, route_taps_host,
 };
+use crate::DeviceBufferRaw;
 use crate::checkpoint::bytes::{self, Fail, Put, refused};
 use crate::checkpoint::saved::{
     HostBytes, Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams,
@@ -3827,7 +3828,7 @@ impl Body38 {
         } = &mut *self;
         for (walk, (_, v)) in [(TargetRows::Step, &d.step), (TargetRows::Pass, &d.pass)] {
             let arena = final_streams_mut(plans, [s, a, wa], walk);
-            arena.zero_async(stream)?;
+            arena.zero_raw(stream)?;
             if !v.is_empty() {
                 WindowMut::<f32>::of_mut(arena, 0, v.len())?.copy_from_host(stream, v)?;
             }
@@ -6753,7 +6754,7 @@ impl EndMarker {
         Ok(EndMarker {
             copy: ctx.new_stream()?,
             done: (0..layers)
-                .map(|_| ctx.new_event(flags))
+                .map(|_| ctx.new_event_with_flags(flags))
                 .collect::<Result<_, _>>()?,
         })
     }
