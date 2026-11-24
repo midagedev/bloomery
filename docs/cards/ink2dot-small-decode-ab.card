@@ -1,0 +1,37 @@
+# Round ink2dot: the host tier's IQ2_XS and IQ3_XXS row dots for Inkling 2 Small, this tree against the base
+# (9c7c22203) in one lease. The kernels are bit-identical (the mirrors and ik's dumps hold them, gate-qdot); the
+# question is the host leg's time.
+# Decomposition [derived; the round took no timing, so every cycle count is a static count of the compiled kernels]:
+#   a token streams 4.146 GB of routed weights through the three dots (IQ2_XS 1.964, IQ3_XXS 1.821, IQ4_XS 0.361 GB;
+#   the file's tensor table); by the two quiet single-thread anchors (docs/cards/qdot-rate-redpairs.card: IQ3_XXS
+#   5.1 GB/s = 86.5 cycles a block at 4.5 GHz, IQ2_XS 4.6 = 72.4) their compute is 3.60 G-cycles a token = 31.3 ms
+#   at 3.6 GHz over 32 cores, under the 37.7 ms the DRAM bound (110 GB/s) needs for the bytes; the measured leg is
+#   56.7 ms (step 66.4 ms, 14.3..14.8 tok/s, docs/cards/ink2host-small-decode.card).
+#   The rewrite cuts a block to IQ2_XS 253 instructions from 366 and takes IQ3_XXS's 48 memory inserts out (309 ->
+#   325 instructions); by the port model that fits both anchors (the larger of llvm-mca's block throughput and
+#   instructions / 5) a block is IQ3_XXS 80.5 -> 65 cycles (-19 %), IQ2_XS 73.2 -> 50.7 (-31 %): the dots' compute
+#   31.3 -> 23..24 ms.
+#   => the leg's other ~25 ms fixed, each model's ratio on the anchors: the dots' compute 31.3 -> 23.5 ms (that
+#      model) / 26.9 (4 instructions a cycle) / 29.9 (2 load ports: IQ3_XXS unmoved), step 66.4 -> 58.6 / 62.0 /
+#      65.0 ms, tok/s +13 / +7 / +2 %; DRAM-bound branch (the dots were already under the stream and the leg binds
+#      elsewhere): 0 %. The band is the paper's (+3..+12, written before the edit); +13 is its above.
+kind: ab
+question: do the rewritten IQ2_XS and IQ3_XXS row dots lift the Small's decode with every routed expert on the host tier?
+term: decode tok/s @ n=1, depth 512, RTX 5090, bloomery-serve inkling2 placed load of UD-Q2_K_XL, every routed expert
+  on the host tier — (this tree − base 9c7c22203) / base, paired by round
+unit: %
+predict: +3..+12
+rounds: 6
+sd: 0.6 % AGENTS.md 「Know the ruler」, same-binary paired ratio SD
+condition: the base binary built from 9c7c22203 in a worktree and this tree's, both arms in one lease, the order
+  rotated every round, a fresh process per load, the file's pages resident (majflt 0 in the rows), no ComfyUI process
+  on the card or the cores, TIMING_GPU the 5090, the same token stream in both arms
+decide-in: land the two kernels; the leg's other ~25 ms (lane skew, the 32-core stalls, the combine and its
+  quantization) is the next term, read from the level-1 split of a service; refresh the tile_units rows of IQ2_XS and
+  IQ3_XXS in crates/model/src/ops.rs from tools/ref/tile-units.sh
+decide-below: read `just measure-qdot-rate` at k = 4608 and 2304 before anything else (predicted 5.1 -> 6.2..6.6 GB/s
+  IQ3_XXS, 4.6 -> 5.9..6.6 IQ2_XS): a single-thread gain with no decode gain names the leg's other term, not the dots;
+  no single-thread gain on IQ3_XXS names its load ports (180 loads a block: the index bytes through one qword load
+  each sub-block), a different design from this gather
+decide-above: up to +13 is the port model with the kernels' static counts; beyond it more of the leg than the 25 ms
+  moved with the dots' instruction count: re-derive the leg from the level-1 split before spending the gain

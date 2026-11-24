@@ -6120,6 +6120,46 @@ fn hw_iq3xxs_tile_matches_dot_row() {
     iq_tile_real(GgmlType::IQ3_XXS, 98, 256);
 }
 
+/// IQ3_XXS gate A on generated rows, no file (the file-backed gate reads one k of a real
+/// tensor): `ROWS` pseudo-random rows at k = 2304 and 4608 (the Small's down and gate·up
+/// widths), then the ends of [`IQ3XXS_ENDS`] at k = 768 and 256 — the one-column kernel against
+/// the mirror, and the tile at two to eight columns against it — bit for bit.
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "hw: needs the box (AVX2)"]
+fn hw_iq3xxs_generated_rows_match_mirror() {
+    let ty = GgmlType::IQ3_XXS;
+    assert!(
+        qdot::supports(ty),
+        "gate A compares the AVX2 kernel against its mirror; this CPU lacks the kernel's ISA"
+    );
+    generated_gate_a(ty, 98, 256, &[2304, 4608]);
+    for k in [768, 256] {
+        let nb = k / 256;
+        let cols = legacy_tile_columns(ty, k, vec![]);
+        let rows = legacy_end_rows(&IQ3XXS_ENDS, nb, |end| end());
+        for (r, row) in rows.chunks(98 * nb).enumerate() {
+            for (j, col) in cols.iter().enumerate() {
+                let a = dot_row_avx2(ty, row, col, k).unwrap();
+                let b = dot_row_scalar(ty, row, col, k).unwrap();
+                assert!(
+                    a.to_bits() == b.to_bits(),
+                    "end row {r} (k = {k}) column {j}: kernel {a:e} (bits {:#x}) and mirror {b:e} \
+                     (bits {:#x}) must be bit-identical",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+        }
+        eprintln!(
+            "IQ3_XXS gate A: {} end rows x {} columns bit-identical (k = {k})",
+            rows.len() / (98 * nb),
+            cols.len()
+        );
+        assert_tile_matches_emulator(ty, "IQ3_XXS end rows", k, 98 * nb, &rows, &cols);
+    }
+}
+
 /// IQ4_XS tile clause: random rows and the ends of [`IQ4XS_ENDS`] (the code-15
 /// blocks reach the `maddubs` saturation against the ±3.0 columns) at k =
 /// 2560, 768 and 256, then the file's first routed-expert rows — tile =
