@@ -1,0 +1,19 @@
+# 0.3.17: DeepSeek-V4.1-Flash bq3km on ws (RTX 5090 + 32-core host) with the DGX Spark's GB10 as the expert tier node over the direct
+# ConnectX 100GbE link, RDMA, against ws alone, one binary, interleaved.
+# [measured 2026-11-25, untimed looks, no lease, two requests a load, 512 prose ids, n 128] ws alone 20.53 ms (first request) and
+# 15.89 ms (second); ws + Spark with BLOOMERY_CARD_BUDGET=53866M (node 3,201 experts, host 10,578) 18.29 and 15.52 ms.
+# [derived] warm, the node removes ~3,200 experts' host-DRAM reads from the host leg (under the card front, worth ~0) and adds the node
+# leg after the front, now ~45 us + 87 us a row over the trips that pick a node expert; the looks put the warm net at +2.4 % and the
+# first request at +12 %. So warm D 512: +1..+6 %.
+kind: ab
+question: is ws + the Spark's GB10 tier faster than ws alone on warm V4.1 decode at depth 512?
+term: tg tok/s of the warm rows @ n=128, prose D=512, ctx 16384, RTX 5090 + host 252 GiB (+ the Spark's GB10 for the changed arm), release tree 0.3.17
+unit: %
+predict: 1..6
+rounds: 5
+condition: one bloomery-serve binary of the release tree, the Spark's tier_server from the same commit restarted before each load; arms
+  ws alone (place unset) and env=BLOOMERY_TIER_LINK=rdma,BLOOMERY_TIER_NODES=10.42.0.2:19000,BLOOMERY_CARD_BUDGET=53866M with DEPTH_SERVE_PLACE=bp,
+  DEPTH_SERVE_CTX=16384 DEPTH_SERVE_N=128 DEPTH_SERVE_FOLD=depths, D 512 and 4096, BLOOMERY_AB_ROUNDS=5, no compute process on the 5090 but ours
+decide-in: the notes state the measured effect and its interval as the RDMA tier's gain on this pair
+decide-below: under 1: the notes say the tier is a capacity lever (more experts off the host) and not a warm speed gain on this pair
+decide-above: over 6: read both plan lines and the rows' majflt before claiming; a cold ws-alone row is not a node gain

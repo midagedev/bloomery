@@ -1,0 +1,16 @@
+# 0.3.17's release sitting on the one RTX 5090 32 GB: ERNIE 5.5 Flash Preview (our F8M4 GGUF) and DeepSeek-V4.1-Flash bq3km with its
+# r8 sidecar, at the serving defaults, D = 512 and 4096, two rounds.
+# The term with a derivation is ERNIE's decode at depth 512. The release tree's look on this card (no lease, one request, hosted
+# prompt pass) read 36 ids/s of decode after a short prompt, and 142 ids/s of prompt over 2,006 ids. Depth 512 adds attention over
+# 512 positions on its MLA-DSA and HCA layers, a small share of a host-tier-bound step: 30..40 [derived].
+# V4.1's cell reads beside it against 0.3.15's row (30.24 at depth 512): the release changed its node tier, not the one-card path.
+kind: baseline
+question: what decode rate does ERNIE 5.5 Flash Preview F8M4 serve at depth 512 on the one RTX 5090 at the serving defaults?
+term: tg tok/s @ n=128, depth 512, bloomery-serve at the serving defaults (place unset, no --ctx-size), RTX 5090 32 GB
+unit: tok/s
+predict: 30..40
+condition: one lease, the 5090 alone (local mode, no compute process on it), tools/release/sitting.sh --binary portable, two rounds, cells-0.3.17.tsv
+reason: the release tree's one-request look on this card (36 ids/s) and a host-tier-bound step that depth 512 barely moves.
+decide-in: the README's 5090 table takes the measured means with their rounds
+decide-below: under 30: read the cell's plan record and witness blocks before any row is published
+decide-above: beyond 40: read the witness blocks and the plan's card share before crediting the card
