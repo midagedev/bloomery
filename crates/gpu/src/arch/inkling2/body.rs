@@ -825,6 +825,10 @@ fn prepare_stacks(
     Ok(out)
 }
 
+/// What a load places beside the card's dense trunk: the routed stacks' names a whole-card load
+/// uploads, and a placed load's open file with its stage card.
+type Placing<'a> = (Option<Vec<[String; 3]>>, Option<(Open<'a>, usize)>);
+
 impl Body {
     #[allow(
         clippy::too_many_lines,
@@ -835,7 +839,7 @@ impl Body {
         file: &Split,
         w: &Weights,
         (hp, ctx): (Hparams, usize),
-        (stacks, placed): (Option<Vec<[String; 3]>>, Option<(Open<'_>, usize)>),
+        (stacks, placed): Placing<'_>,
     ) -> Result<Body, GpuError> {
         let stream = gpu.stream();
         if hp.dialect != Dialect::Unsloth {

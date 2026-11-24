@@ -202,18 +202,18 @@ mod tests {
                 continue;
             }
             let k = blck * blocks_per_row;
-            for e in 0..experts {
+            for (e, &scale) in scales.iter().enumerate().take(experts) {
                 for r in 0..rows_each {
                     let at = e * per + r * row_bytes;
                     let (mut want, mut got) = (vec![0f32; k], vec![0f32; k]);
                     dequant_row(ty, &bytes[at..at + row_bytes], &mut want).unwrap();
                     dequant_row(ty, &folded[at..at + row_bytes], &mut got).unwrap();
-                    let peak = want.iter().fold(0f32, |m, v| m.max(v.abs())) * scales[e];
+                    let peak = want.iter().fold(0f32, |m, v| m.max(v.abs())) * scale;
                     for (w, g) in want.iter().zip(&got) {
                         assert!(
-                            (w * scales[e] - g).abs() <= peak * 2f32.powi(-9) + 1e-30,
+                            (w * scale - g).abs() <= peak * 2f32.powi(-9) + 1e-30,
                             "{ty}: expert {e} row {r}: {} against {g}",
-                            w * scales[e]
+                            w * scale
                         );
                     }
                 }
