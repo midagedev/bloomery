@@ -25,7 +25,7 @@
 //! names it a lost card; a node that stops signalling mid-step is the go
 //! deadline's, as for a card of node 0's. A step sends the node its layers
 //! as enqueue frames, one a layer: a replayed chain's every layer the node
-//! holds experts of, written together with the pass's first go
+//! holds experts of, written together at the pass's start
 //! ([`TierNode::send_listed`]); an eager chain's only the layers whose picks
 //! name its slots, each at its picks ([`TierNode::send_enqueue`]). Node 0
 //! ends each pass that sent it a frame with an end frame
@@ -1484,14 +1484,14 @@ impl TierNode {
         Ok(())
     }
 
-    /// [`TierNode::send_enqueue`] for every service of a listed pass at once
-    /// ([`super::tier::TierCard::go_listed`]): one enqueue frame each, in go
-    /// order, over `cols` columns, written together without their replies.
-    /// The node enqueues each layer as its frame arrives, gated on the
-    /// layer's go, so its card starts a layer when the go lands and the
-    /// enqueue's cost sits under the layers before it. The frames open the
-    /// node's pass as one would, and their replies are read by
-    /// [`TierNode::drain_pass`].
+    /// [`TierNode::send_enqueue`] for every service of a listed pass at once,
+    /// at the pass's start ([`super::tier::TierCard::replay`]): one enqueue
+    /// frame each, in go order, over `cols` columns, written together without
+    /// their replies. The node enqueues each layer as its frame arrives, gated
+    /// on the layer's go, so its card starts a layer when the go lands, and
+    /// the frames' delivery and the enqueues sit under the stage card's work
+    /// before the pass's first go. The frames open the node's pass as one
+    /// would, and their replies are read by [`TierNode::drain_pass`].
     pub(super) fn send_listed(
         &mut self,
         list: &[(usize, usize)],
@@ -3216,13 +3216,13 @@ pub(super) mod tests {
     }
 
     /// Over loopback, with no card: a replayed chain's pass on a node tier is
-    /// listed. It sends nothing until its first go, then every service's
-    /// enqueue frame together, in go order, and the host expects the list's
-    /// layers; each later go sends nothing. A go out of order or past the
-    /// list, and a layer's own frame, are refused by name; a settle before
-    /// every go is raised is refused by name; the pass ends with one end.
+    /// listed. Its start sends every service's enqueue frame together, in go
+    /// order, and the host expects the list's layers, none of whose gos is
+    /// raised yet; a go sends nothing. A go out of order or past the list,
+    /// and a layer's own frame, are refused by name; a settle before every
+    /// go is raised is refused by name; the pass ends with one end.
     #[test]
-    fn a_listed_pass_sends_its_layers_with_its_first_go() {
+    fn a_listed_pass_sends_its_layers_at_its_start() {
         use super::super::tier::Pass;
         use super::{TierCard, TierSet};
 
@@ -3239,6 +3239,7 @@ pub(super) mod tests {
             Pass::Listed
         );
         assert!(card.listing());
+        assert_eq!((card.issued(), card.raised()), (3, 0));
         assert!(
             card.send_layer(Chain::Step, 0, 0, 1).is_err(),
             "a layer's own frame during a listed pass must be refused"

@@ -119,12 +119,16 @@
 //!   twice under the file in its environment alone: over a loopback `tier_server` the gate
 //!   serves (`BLOOMERY_TIER_NODES`, the TCP link) and with the tier a card of the child's own
 //!   process. Over the node, a replayed step's pass is listed: every layer of the node's goes to
-//!   it with the pass's first go, and the host raises each layer's go, so a layer whose picks
+//!   it at the pass's start, and the host raises each layer's go, so a layer whose picks
 //!   name no slot of the node's runs there over none and its done carries no row; each step
 //!   must count those layers (`stats().node_skipped`, the `stat step` record's `node_skipped`
 //!   field) and the two children's tokens and logits must agree bit for bit — the same experts
-//!   on the same homes, so a layer the picks leave the node moves no value. Precondition: the
-//!   trace leaves a routed layer's whole tier depth unrouted, so every step has such a layer.
+//!   on the same homes, so a layer the picks leave the node moves no value. The node child then
+//!   steps the prompt again eagerly on the same load: an eager chain sends the node only the
+//!   layers whose picks name its slots, and the host adds a skipped layer's unit to the tier's
+//!   counter itself, so the eager run must be the replayed run bit for bit and skip as many
+//!   layers. Precondition: the trace leaves a routed layer's whole tier depth unrouted, so every
+//!   step has such a layer.
 //! - `--rank` (B10): the plan with a router rank (`BLOOMERY_EXPERT_RANK`). The gate writes a
 //!   rank file from the model's own routed layers, each layer's ids in a stride order that is not
 //!   the id order, and runs this binary as a child (`--rank-stage`) whose environment alone names
@@ -1670,6 +1674,12 @@ mod gate {
                 }
             };
             drop(stage);
+            if !pass {
+                // A stage that failed may have stopped before writing its
+                // trace and run: there is nothing to compare.
+                drop(node);
+                return Ok(false);
+            }
             let theirs: Vec<Vec<u32>> = std::fs::read_to_string(dir.join("trace.tsv"))?
                 .lines()
                 .map(|line| {
@@ -1733,8 +1743,9 @@ mod gate {
     /// B11's stage, on `m`, the ranked tiered plan with its tier on the node
     /// the gate serves or a card of this process: the prompt one decode step a
     /// position, each step's `node_skipped` held to at least one layer (the
-    /// rank keeps a layer's tier experts unrouted) and the totals printed.
-    /// Returns the run for the gate's bit comparison.
+    /// rank keeps a layer's tier experts unrouted) and the totals printed;
+    /// on the node, then its eager half ([`bnodeskip_eager`]). Returns the
+    /// replayed run for the gate's bit comparison.
     fn bnodeskip_stage(
         m: &mut Deepseek41Model,
         ids: &[u32],
@@ -1792,7 +1803,47 @@ mod gate {
             println!("FAIL B11: the run over the node skipped no layer; the clause proves nothing");
             pass = false;
         }
+        if on_node {
+            pass &= bnodeskip_eager(m, ids, &run, before)?;
+        }
         Ok((pass, run))
+    }
+
+    /// B11's eager half, on the node stage's own load after its replayed
+    /// run: the prompt again from a reset, one eager step a position. An
+    /// eager chain sends the node only the layers whose picks name a slot
+    /// of its, and the host adds a skipped layer's unit to the tier's counter
+    /// itself (`TierCard::send_layer`, `TierPage::add_unit`). The run must be
+    /// the replayed run, `graph`, bit for bit, and skip the layers it
+    /// skipped, `skipped`: the same picks leave the node the same layers.
+    fn bnodeskip_eager(
+        m: &mut Deepseek41Model,
+        ids: &[u32],
+        graph: &Run,
+        skipped: u64,
+    ) -> Result<bool, GateError> {
+        let before = m.body(NAME)?.hybrid().stats().node_skipped;
+        let mut run = Run::default();
+        m.set_mode(StepMode::Eager);
+        m.reset()?;
+        for &id in ids {
+            let tok = m.step(&[id])?;
+            run.push(tok, m.logits()?);
+        }
+        m.set_mode(StepMode::Graph);
+        let eager = m.body(NAME)?.hybrid().stats().node_skipped - before;
+        let mut pass = same(
+            "B11 eager (the node's eager steps against its replayed run)",
+            graph,
+            &run,
+        );
+        if eager == skipped {
+            println!("ok B11 eager skips: {eager} layers, the replayed run's");
+        } else {
+            println!("FAIL B11 eager skips: {eager} layers, the replayed run skipped {skipped}");
+            pass = false;
+        }
+        Ok(pass)
     }
 
     /// The rank file for B11 in `dir`: the format of B10's `write_rank`, each

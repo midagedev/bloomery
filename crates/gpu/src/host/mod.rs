@@ -3181,8 +3181,8 @@ impl<H: HostExperts> HostTier<H> {
     /// one is held for that tier's layers of the chain's go order; for a tier
     /// with none, the host enqueues each of its layers on its stream as it
     /// serves it, and captures its graph once the pass has settled; a tier on
-    /// a node is sent its layers of the go order as one list with the pass's
-    /// first go, and every listed layer's go is raised at its picks
+    /// a node is sent its layers of the go order as one list at the pass's
+    /// start, and every listed layer's go is raised at its picks
     /// ([`tier::Pass`], [`HostTier::serve`]). Once the last layer is served
     /// the host waits for every tier with a layer in the pass to catch up and
     /// reads their fault copies ([`HostTier::settle_tiers`]).

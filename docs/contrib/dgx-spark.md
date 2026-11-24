@@ -890,13 +890,14 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    not the tier's set, then loads the rows of node 0's plan from its own copy of the file, each tensor checked against
    node 0's description and each row's bytes against their sha256 in node 0's file (both nodes hash the tier's rows, not
    the whole file). A node tier's layers arrive as one enqueue frame each, named by layer, never as a captured graph.
-   A replayed chain's pass is listed: its every layer of the node's goes out in one write with the pass's first go,
-   and the host raises each layer's go at its picks whatever they name, so node 1's stream holds a layer before its go
-   lands and the enqueue's cost sits under the layers before it; a layer whose picks name no slot of the node's runs
-   there over none. An eager chain sends a layer at its picks, only when they name a slot of the node's. The launch
-   protocol the channel once carried — a capture request a launch frame replayed — is gone, its two tags reserved and
-   a frame of either refused by name. A pass that sent the node a layer ends with one end frame once node 0 has
-   settled it, or released its waits on a failure that did not name the node's card lost.
+   A replayed chain's pass is listed: its every layer of the node's goes out in one write at the pass's start, before
+   its first go, and the host raises each layer's go at its picks whatever they name, so node 1's stream holds a layer
+   before its go lands and the frames' delivery and the enqueues sit under the stage card's work before that go; a
+   layer whose picks name no slot of the node's runs there over none. An eager chain sends a layer at its picks, only
+   when they name a slot of the node's. The launch protocol the channel once carried — a capture request a launch
+   frame replayed — is gone, its two tags reserved and a frame of either refused by name. A pass that sent the node a
+   layer ends with one end frame once node 0 has settled it, or released its waits on a failure that did not name the
+   node's card lost.
    `TierCard` keeps the stage side, and its tier side is either a card of this process or a node (`TierWork` is the part
    both run). A shared bind on loopback maps one `/dev/shm` file, created mode 0600 and removed once both ends hold
    it (`Link::across`, `MappedHost::shared_file`). An RDMA bind allocates one page per process and exchanges each

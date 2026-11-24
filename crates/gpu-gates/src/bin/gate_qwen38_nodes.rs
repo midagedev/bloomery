@@ -1768,7 +1768,8 @@ mod gate {
             assert!(independent, "the node budgets must use their own census");
             let mut s = c.open(&plan)?;
             let mut fresh = super::q38_history::history(&mut s, &c.ids, |_| Ok(()))?;
-            assert!(super::tier_structure(&mut s, &super::tier_layers(&plan))?);
+            let layers = super::tier_layers(&plan);
+            assert!(super::tier_structure(&mut s, &layers)?);
             let ready = s.model().body(NAME)?.hybrid().tiers()[0]
                 .stats()
                 .control_round_trips;
@@ -1789,16 +1790,24 @@ mod gate {
             let before = s.model().body(NAME)?.hybrid().tiers()[0]
                 .stats()
                 .control_round_trips;
+            // PIN(2026-11-25): a listed pass sends its layers at its start, before the refused first
+            // service, so the release reads one enqueue reply a tier layer before its own.
             assert_eq!(
                 before - ready,
-                2,
-                "one replay launch and one remote release"
+                1 + layers.len() as u64,
+                "the listed pass's enqueues and one remote release"
             );
             s.clear()?;
             let after = s.model().body(NAME)?.hybrid().tiers()[0]
                 .stats()
                 .control_round_trips;
-            assert_eq!(after - before, 4, "three reset phases and one fault clear");
+            // PIN(2026-11-25): the refused pass's end, sent after the release and read by the
+            // reset's first request.
+            assert_eq!(
+                after - before,
+                5,
+                "the refused pass's end, three reset phases and one fault clear"
+            );
             let mut recovered = super::q38_history::Run::default();
             super::q38_history::step(&mut s, &mut recovered, c.ids[0])?;
             fresh.tokens.truncate(1);
