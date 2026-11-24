@@ -3101,15 +3101,34 @@ gate-minimax31-folder:
     ./tools/box.sh 'bash tools/ref/needs-env.sh gate-minimax31-folder BLOOMERY_MM31_FOLDER && bash tools/gate.sh -p bloomery-model-hf --lib -- --ignored hw_the_minimax_folder_opens_as_the_m3_reader_reads_it --nocapture'
 
 # ERNIE 5.5 Flash Preview's whole program on one card (gate_ernie55_e2e's doc) over the fixture cut (layers 0, 1 and 7 of the released
-# folder: HCA with the dense lead, HCA routed, MLA-DSA routed), in two arms of one placement rule: the card's plan (every expert on the
-# card, the prompt as the pass's units) and the same card under a card-experts cap of half the routed experts (each routed layer's
-# rest through the common host tier, the prompt stepped). Against the numpy writer's sets `fx-np-ernie55` (short 34 ids, long 2,328
-# ids past the indexer's top-k): every layer's streams at the prompt's last rows, the routed picks as sets and their weights, the
-# MLA-DSA selection (long), the logits before and after MultiMax, the teacher-forced greedy ids; and the graph against the eager
-# chain. Fixture-only (tools/ref/fixture-only.sh): the released folder's sets have no family yet. Predicted wall [derived: a warm
-# build; the cut's 2.4 GB read twice; long's 2,328 ids stepped once a set on the hosted arm at a few ms a step]: under 3 min.
+# folder: HCA with the dense lead, HCA routed, MLA-DSA routed), in three arms of one placement rule: the card's plan (every expert on the
+# card, the prompt as the pass's units); the same card under a card-experts cap of half the routed experts (each routed layer's rest
+# through the common host tier, the prompt stepped), opened from the cut's GGUF that bloomery-quantize writes (the profile's GGUF_MODEL,
+# tools/ref/models/ernie5_5.sh, which ref-paths.sh's gguf_model resolves for the tier: a folder's MXFP4 stacks are made at load, so no
+# load from the folder hosts one; a missing file ends the command by name before the build, never the card arm alone); and that hosted
+# file opened again under the residency a server runs by default (every routed layer reseeded to the experts a first prompt picked,
+# experts the plan left on the host promoted into slots below the card count). Against the numpy writer's sets `fx-np-ernie55` (short 34
+# ids, long 2,328 ids past the indexer's top-k): every layer's streams at the prompt's last rows, the routed picks as sets and their
+# weights, the MLA-DSA selection (long), the logits before and after MultiMax, the teacher-forced greedy ids; the graph against the eager
+# chain; a reset model writing a fresh open's bits and holding its caches cleared; the promoted experts read within the same bands.
+# Fixture-only (tools/ref/fixture-only.sh): the released folder's sets have no family yet. Predicted wall [derived: the gate's three
+# arms ran 26 s on the 5090; a warm build, and one that recompiles bloomery-device and what links it took 3.5 min]: under 4 min.
 gate-gpu-ernie55-e2e:
-    BLOOMERY_MODEL=ernie5_5 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ernie55-e2e && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features ernie55,checkpoint --release --bin gate_ernie55_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ernie55_e2e'
+    BLOOMERY_MODEL=ernie5_5 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ernie55-e2e && __g=$(. tools/ref/ref-paths.sh && gguf_model) && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features ernie55,checkpoint --release --bin gate_ernie55_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ernie55_e2e --hosted-gguf "$__g"'
+
+# bloomery-quantize on ERNIE 5.5 Flash Preview (crates/model-hf/tests/ernie55_quantize.rs; docs/quantize.md's ERNIE rows), host only
+# (--cpu, no card): a toy folder of the three layer kinds in every stored format through the plan (the FP8 128-block projections Q8_0 by
+# ggml's reference rule over the loader's values, the MXFP4 stacks the loader's bytes and the OCP decode of the stored planes, the
+# description reading the GGUF as the folder, the experts the file's mapped runs), `--hf` reading a folder as `prepare` does, and a cut
+# folder's bloomery.fixture.* keys landing in the GGUF so the fixture tier opens it; then the fixture cut twice (its folder is the fixture
+# root's ernie55, E55Q_CUT names another): under the file type Q8_0, and under the lossless rule `\.weight$=fp8_b128` (the rule a hosted
+# load's file is written with, gate-gpu-ernie55-e2e): no tensor Q8_0, every tensor of the GGUF byte for byte the folder loader's made
+# tensor, nothing converted. The GGUFs go under the temp dir and are removed (E55Q_WORK moves them; E55Q_OUT, E55Q_OUT_FP8 keep one).
+# Fixture-only (tools/ref/fixture-only.sh): the cut is three layers, the vendor's 43-layer folder is refused by name. Predicted wall
+# [derived: the test's release build 32 s on a warm tree; its five tests 58 s, the two runs over the 5.5 GB cut 10.5 s and 7.0 s of
+# them]: under 4 min.
+gate-ernie55-quant:
+    BLOOMERY_MODEL=ernie5_5 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-ernie55-quant && bash tools/gate.sh --release -p bloomery-model-hf --test ernie55_quantize -- --include-ignored --nocapture --test-threads=1'
 
 # ERNIE 5.5 Flash Preview's two halves in one pass (host only, no card; the model folder is the profile's, tools/ref/models/ernie5_5.sh:
 # /models/ERNIE-5.5-Flash-Preview in the real tier, the cut tools/fixture-cuts/ernie55.json makes in /models/fixtures/ernie55 in the fixture tier).

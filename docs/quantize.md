@@ -12,11 +12,12 @@ so the Mac archive has no binary of it (`--cpu` included).
 
 ## Scope
 
-The architectures are `kimi-k3`, `exaone-moe` and `deepseek41`; the file types are Q3_K_M, Q4_K_M, Q5_K_M, Q6_K, Q8_0,
-IQ2_XXS and IQ1_S. Any other architecture, type, or a type resolution that lands on a type not ported (Q2_K, ...) is
+The architectures are `kimi-k3`, `exaone-moe`, `deepseek41` and `ernie5_5`; the file types are Q3_K_M, Q4_K_M, Q5_K_M, Q6_K,
+Q8_0, IQ2_XXS and IQ1_S. Any other architecture, type, or a type resolution that lands on a type not ported (Q2_K, ...) is
 refused by name before anything is written. Q3_K is also a rule type: a `--tensor-type-file` rule,
 `--output-tensor-type` or `--token-embedding-type` may name it (ggml's `quantize_row_q3_K_ref` without an importance
-matrix, `_impl` with one).
+matrix, `_impl` with one). A rule may also name a type the quantizer copies and does not write (F16, BF16, MXFP4,
+FP8_B128): a tensor already in it is copied, any other is refused by name (ERNIE 5.5's lossless file, below).
 
 Q3_K_M is `llama_tensor_get_type_impl`'s Q3_K_M branches, and a rules file is not needed to reach them: the first two
 `attn_v`-like tensors Q5_K and the rest Q4_K (Q8_0 at eight experts), `attn_output` Q4_K (Q5_K at eight experts),
@@ -64,7 +65,9 @@ Q3_K); a rules file only changes what the file type does not say.
 With `--hf` the bytes are the ones the `prepare` split would have given (`just gate-quantize-hf`: the header and the
 output's sha256 per shard equal on a toy K3.1 folder and on a 2-layer cut of the real one). A folder with a shard its
 index names missing, a `weight_scale` with no `weight`, or an E8M0 scale byte of 255 is refused by name before any
-output remains.
+output remains. A folder `fixture cut` wrote carries its `bloomery.fixture.*` metadata into the GGUF's keys, as the
+fixture readers take their types (the version a u32, the card budget a u64), so the fixture tier opens a cut's GGUF as
+the fixture it is; a folder with no such keys writes none (`just gate-ernie55-quant`).
 
 `--resume` continues an interrupted run of the same plan. The plan is a pure function of the inputs and the command
 line, so a shard an earlier run finished is exactly the shard this run would write, and before any tensor is read every
@@ -93,6 +96,33 @@ divide a tensor's columns for another (Q4_K to Q5_0, Q5_K to Q5_1, Q6_K to Q8_0,
 a tensor whose columns are not a multiple of 256 under a K-quant type needs a rule naming a type the port writes
 (Q8_0), or the run is refused by name with the tensor. K3.1's `tight` map names `attn_k_b` and `ssm_f_b` Q8_0 by rule
 (`gen_rules` in `tools/ref/k31-quant.sh`), so those two never reach a K-quant type.
+
+## ERNIE 5.5 Flash Preview (`ernie5_5`)
+
+The input is the checkpoint folder (`--hf`), never a GGUF: projections stored FP8 e4m3 with one f32 scale a 128 by 128
+square (FP8_B128 in the GGUF: 128 values a block, each row's block taking its square's scale), MXFP4 routed experts,
+BF16 embedding, head, routers and compressor matrices, F32 the rest (the norms, the mHC mixers' tables, the VHA head
+mix). No rules file is needed: the rows keyed to `ernie5_5` keep as converted what the conversion names
+(`tensor_allows_quantization`: the mHC mixers, the VHA head mix, the compressor's table, the indexer) and what the
+reader holds in its stored type alone (the embedding, the head and the routers BF16, the routed stacks MXFP4, the
+compressor's matrices as the folder load keeps them), and the file type types the FP8 projections. `DIR` is the
+profile's `MODEL` (`tools/ref/models/ernie5_5.sh`), the released folder, whose lossless GGUF is the profile's
+`GGUF_MODEL`; `just quantize` runs the same command through the card's gate lock.
+
+| | the command (`--cpu`: nothing needs the card) | the FP8 128-block projections | the MXFP4 routed experts | BF16 and F32 |
+|---|---|---|---|---|
+| the default | `bloomery-quantize --hf DIR OUT Q8_0 --allow-requantize --cpu` | Q8_0: ggml's reference rule over the FP8 values the loader makes, each value within its derived band | MXFP4, byte for byte the blocks the loader makes of the stored planes | as stored |
+| the lossless file | `bloomery-quantize --hf DIR OUT Q8_0 --tensor-type-file RULES --cpu`, RULES the one line `\.weight$=fp8_b128` | FP8_B128, the loader's blocks unchanged: every tensor of the GGUF byte for byte the folder loader's made tensor, nothing converted (no `--allow-requantize`: every tensor is a copy) | MXFP4, byte for byte | as stored |
+
+Both files carry the experts as runs of the file where a folder's are made at load, which is what a hosted load opens:
+`gate_ernie55_e2e`'s hosted arms (`--hosted-gguf`, the fixture tier's file the profile's `GGUF_MODEL`) open the lossless
+one, the folder's own dense bytes. A cut folder's GGUF is a fixture file (above). `just gate-ernie55-quant` holds the
+two rows on the fixture cut: the types under the folder's names and dims, the experts the loader's bytes and the OCP
+MXFP4 decode of the stored planes, the Q8_0 blocks the reference rule's, the description reading either GGUF as the
+folder, and the lossless file's every tensor the loader's. The released folder's set was written once, with
+`--allow-requantize --keep-split --resume --cpu` (`--keep-split`: one output shard a shard of the split `--hf-shard-gib`
+plans; the box's NVMe): 4 shards, 155.08 GB, 0 tensors converted, the tool's summary `done in 384 s`; a later run of the
+same plan keeps every whole shard (`--resume`).
 
 ## The importance matrix's slabs
 
@@ -137,6 +167,10 @@ Nothing is turned into a plausible value.
 - Plan equality: the types and bytes of every tensor equal `llama-quantize --dry-run`'s, tensor for tensor
   (`--llama-plan`, and the writer cross-checks it on every run that has one).
 - `just gate-gpu-iq-quant`: the card's bytes against the oracle, `--cpu` equal to the card, `--check`, each refusal.
+- `just gate-ernie55-quant` (ERNIE 5.5, the fixture cut and a toy folder, `--cpu`): each expert stack byte for byte the
+  folder loader's made tensor and decoding to the OCP MXFP4 value of the stored planes; each Q8_0 block ggml's reference
+  rule over the loader's FP8 values; the description reading the GGUF as the folder; under the lossless rule every tensor
+  the loader's bytes, none Q8_0; a cut folder's `bloomery.fixture.*` keys in the GGUF.
 
 ## Room and time: the resource timeline
 

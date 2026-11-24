@@ -46,8 +46,10 @@
 #                          refuses that file as not a fixture, so tools/gate-batch.sh defers, as real-file, a recipe whose targets reach it.
 #   none                   the family has no fixture yet — and so does a profile the table does not name: 66, naming the
 #                          family. Never a run on the real file.
+# A profile whose folder has a GGUF twin (the file `bloomery-quantize --hf` writes of it; the profile's GGUF_FIXTURE) takes the cut's
+# under the fixture root in the fixture tier (GGUF_MODEL, as MODEL takes the fixture's); a missing one is `gguf_model`'s named 66.
 # Exit codes: 64 a BLOOMERY_TIER that is neither, 65 a fixture whose header is not a whole fixture (`fixture_budget`), 66 no
-# fixture for the family.
+# fixture for the family or no GGUF twin where a command asked for one (`gguf_model`).
 #
 # A fixture variant. BLOOMERY_FIXTURE_VARIANT=<tag> moves the fixture root to fixture-variants/<tag> beside it (the box manifest keys
 # every file under the root into every fixture-tier item, so variants never sit under it): the family's fixture requantized
@@ -193,6 +195,20 @@ case "${BLOOMERY_TIER:-real}" in
             fi
           fi
         fi
+        # A profile whose folder has a GGUF twin — the file `bloomery-quantize --hf` writes of it, which a hosted load opens — names the
+        # fixture tier's in GGUF_FIXTURE: its path under the fixture root, the cut's own and never a variant's (a variant's map retypes no
+        # file but its own). GGUF_MODEL is the tier's file as MODEL is the tier's model, a caller's BLOOMERY_REF_GGUF_MODEL winning as
+        # BLOOMERY_REF_MODEL does. A file that is not there does not exit here — box.sh reads this file for every command of the profile,
+        # and a gate that opens no GGUF needs none — GGUF_MODEL is left empty with the reason kept, and gguf_model is what refuses.
+        # FIXTURE_NEW=1 (a writer making the fixture) looks for none.
+        if [ -n "${GGUF_FIXTURE:-}" ] && [ -z "${FIXTURE_NEW:-}" ] && [ -z "${BLOOMERY_REF_GGUF_MODEL:-}" ]; then
+          GGUF_MODEL=${BLOOMERY_FIXTURE_ROOT:-/models/fixtures}/$GGUF_FIXTURE
+          GGUF_MODEL_WHY=
+          if [ ! -f "$GGUF_MODEL" ]; then
+            GGUF_MODEL_WHY="ref-paths.sh: BLOOMERY_TIER=fixture: the family '$BLOOMERY_MODEL' has no GGUF of its fixture cut at $GGUF_MODEL (the profile's GGUF_FIXTURE row names the command: \`bloomery-quantize --hf $FIXTURE_MODEL $GGUF_MODEL Q8_0 --tensor-type-file RULES --cpu\`, RULES the one rule \\.weight\$=fp8_b128; docs/quantize.md); not opening a hosted arm on another file (exit 66)"
+            GGUF_MODEL=
+          fi
+        fi
         ;;
     esac
     unset __fixture_dir __fixture_root __fixture_files __fixture_drafts __fixture_base __fixture_ext __fixture_verb __variant_family
@@ -213,6 +229,18 @@ esac
 source "${BASH_SOURCE[0]%/*}/dspark-path.sh"
 dspark_model() {
   dspark_path "${DSPARK_MODEL:-}" "${DSPARK_MODEL_WHY:-}"
+}
+
+# gguf_model: the GGUF twin of the tier's model, the file a hosted load opens (ERNIE 5.5: gate_ernie55_e2e's hosted
+# arms, `--hosted-gguf`), on stdout, no trailing newline. Non-empty — the profile's GGUF_MODEL in the real tier, the
+# cut's in the fixture tier, a caller's BLOOMERY_REF_GGUF_MODEL over either — prints it and returns 0. Empty: the reason
+# kept at the resolution above (or a named line when the profile names none) goes to stderr, ending "(exit 66)", and
+# exit 66 (dspark_path, the draft's print-or-refuse): `$(. tools/ref/ref-paths.sh && gguf_model)` ends a command's `&&`
+# chain there, before its build, so a gate never falls back to the arm that needs no file. It never prints an empty path.
+gguf_model() {
+  local why=${GGUF_MODEL_WHY:-}
+  [ -n "$why" ] || why="ref-paths.sh: the $MODEL_NAME profile names no GGUF of its model and the tier resolved none (GGUF_MODEL; a caller's BLOOMERY_REF_GGUF_MODEL names one) (exit 66)"
+  dspark_path "${GGUF_MODEL:-}" "$why"
 }
 
 # fixture_budget: what a command under the fixture tier needs of the fixture's header, once per command (tools/box.sh calls it):

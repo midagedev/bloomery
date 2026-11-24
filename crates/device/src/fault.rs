@@ -113,12 +113,13 @@ pub enum FaultSite {
     /// A linear-attention delta step (`linear::delta`) read a lane word at
     /// or past the state's lanes.
     DeltaLane = 15,
-    /// A cache append (`latent`, `flash::kv_append_pos_buf`, the fused
-    /// `kv_norm_rope_append`, and the f16
-    /// head appends of `rope_neox`, `rope_norm`, `qk_rms` and
-    /// `attention_h128_ring`) met a value that is not finite: a non-finite
-    /// input, a norm whose mean square or variance is not finite, or a value
-    /// past f16's range.
+    /// A cache append (`latent`, `flash::kv_append_pos_buf`, and the f16 head
+    /// appends of `rope_neox`, `rope_norm`, `qk_rms` and `attention_h128_ring`)
+    /// met a value that is not finite: a non-finite input, a norm whose mean
+    /// square or variance is not finite, or a value past f16's range. The fused
+    /// `kv_norm_rope_append` raises it for the last alone, a finite value the
+    /// cache row's f16 cannot hold: its non-finite norm and values raise
+    /// [`FaultSite::F32Product`].
     CacheValue = 16,
     /// A token-pool selector (`qsa`; GLM's `latent::index_pool` and `kpool`)
     /// met an indexer key that is not finite after its f16 rounding

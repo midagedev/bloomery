@@ -247,6 +247,7 @@ gate-mimo2-meta	family	mimo2	meta	arch_registry
 gate-minimax31-folder	family	minimax-m3	by-hand	arch_registry
 gate-gpu-ernie55-e2e	family	ernie5_5	e2e	graph_fault+attn_ds41_csa_hca+attn_latent_mla+moe_route+quant_mxfp4+ffn_situ+tier_legs+prompt_walks+checkpoint_folder+head_sample
 gate-ernie55-meta	family	ernie5_5	meta	arch_registry+checkpoint_folder+placement_sizing+tokenizer_jinja
+gate-ernie55-quant	family	ernie5_5	e2e	quant_iq_writer+checkpoint_folder+refset_readers
 gate-gpu-ernie55-serve	family	ernie5_5	serve+ship	seats_serve_engine+checkpoint_folder
 gate-ernie55-hca	family	ernie5_5	kernel	attn_ds41_csa_hca+graph_fault
 gate-model-hf	common		host	arch_registry+checkpoint_folder
