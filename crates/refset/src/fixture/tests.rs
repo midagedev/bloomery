@@ -1,8 +1,8 @@
 use super::{
-    DEFAULT_ROOT, DIRS_TABLE, KEY_SUBSET, KEY_VARIANT, KEY_VERSION, LINE_PREFIX, ROOT_ENV, SELF,
-    VARIANT_ENV, check_stated, dir_of, dirs, first_shard, first_shard_in, keys, line, parse_dirs,
-    render, root_of, selected_of, variant_of, variant_root, variant_set_name, with_root,
-    with_variant,
+    DEFAULT_ROOT, DIRS_TABLE, KEY_CARD_BUDGET, KEY_SUBSET, KEY_VARIANT, KEY_VERSION, LINE_PREFIX,
+    ROOT_ENV, SELF, VARIANT_ENV, check_stated, dir_of, dirs, first_shard, first_shard_in,
+    folder_values, keys, line, parse_dirs, render, root_of, selected_of, variant_of, variant_root,
+    variant_set_name, with_root, with_variant,
 };
 use crate::RefError;
 use crate::arch::named;
@@ -1602,4 +1602,218 @@ fn a_cut_folder_resolves_through_the_table_and_takes_no_variant() -> Result<(), 
         "{e}"
     );
     remove(&top)
+}
+
+/// A cut folder's fixture keys are what a GGUF written from it carries: the first shard's
+/// `bloomery.fixture.` entries sorted, the version a u32, the card budget a u64, a decimal a u64, a
+/// list of decimals an array of u32, any other text a string, the keys of other prefixes left out;
+/// and the GGUF holding them states the line of the folder it was written from, byte for byte.
+#[test]
+fn a_cut_folders_values_are_the_keys_a_gguf_made_of_it_carries() -> Result<(), RefError> {
+    let dir = temp("folder-values")?;
+    write_shard(&dir.join("model-00001-of-00002.safetensors"), &CUT_META);
+    write_shard(
+        &dir.join("model-00002-of-00002.safetensors"),
+        &[("format", "pt")],
+    );
+    let values = folder_values(&dir)?;
+    let key = |k: &str| values.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    assert_eq!(key("bloomery.fixture.version"), Some(Value::U32(1)));
+    assert_eq!(
+        key("bloomery.fixture.card_budget"),
+        Some(Value::U64(8_589_934_592))
+    );
+    assert_eq!(key("bloomery.fixture.ff"), Some(Value::U64(512)));
+    assert_eq!(
+        key("bloomery.fixture.layers"),
+        Some(Value::Array(vec![
+            Value::U32(0),
+            Value::U32(3),
+            Value::U32(59)
+        ]))
+    );
+    assert_eq!(
+        key("bloomery.fixture.source"),
+        Some(Value::String("MiniMaxAI/MiniMax-M3.1-Flash".to_string()))
+    );
+    assert_eq!(
+        key("bloomery.fixture.rev"),
+        Some(Value::String("76faee1b".to_string()))
+    );
+    assert!(
+        values
+            .iter()
+            .all(|(k, _)| k.starts_with("bloomery.fixture.")),
+        "the format entry is not a fixture key: {values:?}"
+    );
+    assert_eq!(values.len(), CUT_META.len() - 1);
+    let sorted: Vec<&str> = values.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(sorted.is_sorted(), "{sorted:?}");
+
+    let gguf = dir.join("f.gguf");
+    write_gguf(&gguf, &values);
+    assert_eq!(
+        keys(&gguf)?,
+        keys(&dir.join("model-00001-of-00002.safetensors"))?
+    );
+    let split = gguf::Split::open(&gguf).map_err(|e| RefError::missing(&gguf, e.to_string()))?;
+    assert_eq!(
+        split.value(KEY_CARD_BUDGET).and_then(gguf::Value::as_u64),
+        Some(8_589_934_592),
+        "the budget reads back as the planners read it"
+    );
+    remove(&dir)
+}
+
+/// A list of anything but decimals that fit u32 is an array of strings, a number past u32 in a
+/// list is text, a single number is a u64 and a number with a leading zero is text, so each reads back
+/// as the line states it.
+#[test]
+fn a_cut_folders_lists_and_numbers_keep_the_text_the_line_states() -> Result<(), RefError> {
+    let dir = temp("folder-types")?;
+    let shard = dir.join("model-00001-of-00001.safetensors");
+    let strings = |items: &[&str]| {
+        Value::Array(
+            items
+                .iter()
+                .map(|s| Value::String((*s).to_string()))
+                .collect(),
+        )
+    };
+    for (text, want) in [
+        ("7", Value::U64(7)),
+        ("0", Value::U64(0)),
+        ("007", Value::String("007".to_string())),
+        ("18446744073709551615", Value::U64(u64::MAX)),
+        (
+            "18446744073709551616",
+            Value::String("18446744073709551616".to_string()),
+        ),
+        (
+            "0,1,7",
+            Value::Array(vec![Value::U32(0), Value::U32(1), Value::U32(7)]),
+        ),
+        (
+            "4294967295,1",
+            Value::Array(vec![Value::U32(u32::MAX), Value::U32(1)]),
+        ),
+        ("4294967296,1", strings(&["4294967296", "1"])),
+        ("a,b", strings(&["a", "b"])),
+        ("1,x", strings(&["1", "x"])),
+        ("01,2", strings(&["01", "2"])),
+        ("1.5", Value::String("1.5".to_string())),
+        ("-3", Value::String("-3".to_string())),
+    ] {
+        write_shard(
+            &shard,
+            &[
+                ("bloomery.fixture.version", "1"),
+                ("bloomery.fixture.k", text),
+            ],
+        );
+        let values = folder_values(&dir)?;
+        let got = values
+            .iter()
+            .find(|(k, _)| k == "bloomery.fixture.k")
+            .map(|(_, v)| v);
+        assert_eq!(got, Some(&want), "{text}");
+        let gguf = dir.join("f.gguf");
+        write_gguf(&gguf, &values);
+        assert_eq!(keys(&gguf)?, keys(&shard)?, "the line states {text}");
+    }
+    remove(&dir)
+}
+
+/// What a folder carries none of, and what it is refused for, each by name with the file and the key:
+/// no first shard and no metadata keys carry none; two first shards, no version key beside other keys,
+/// the subset key, an empty value, whitespace, `=`, a control character, a list with an empty item and a
+/// version or budget that is no decimal of its type are refused.
+#[test]
+fn a_cut_folders_values_are_none_or_refused_by_name() -> Result<(), RefError> {
+    let dir = temp("folder-values-refuse")?;
+    assert_eq!(folder_values(&dir)?, Vec::new(), "no first shard: none");
+    let shard = dir.join("model-00001-of-00001.safetensors");
+    write_shard(&dir.join("model-00002-of-00002.safetensors"), &CUT_META);
+    assert_eq!(
+        folder_values(&dir)?,
+        Vec::new(),
+        "no first shard but the second: none"
+    );
+    write_shard(&shard, &[("format", "pt")]);
+    assert_eq!(folder_values(&dir)?, Vec::new(), "no fixture key: none");
+    std::fs::write(&shard, b"not a safetensors header at all")
+        .map_err(|e| RefError::missing(&shard, e.to_string()))?;
+    assert!(
+        matches!(folder_values(&dir), Err(RefError::Malformed { .. })),
+        "a first shard that is no header"
+    );
+
+    let refused = |meta: &[(&str, &str)], what: &str, names: &str| {
+        write_shard(&shard, meta);
+        let e = folder_values(&dir).expect_err(what).to_string();
+        assert!(
+            e.contains(&shard.display().to_string()) || e.contains("first shards"),
+            "{what}: {e}"
+        );
+        assert!(e.contains(names), "{what}: {e}");
+    };
+    let with = |extra: (&'static str, &'static str)| {
+        let mut v = CUT_META.to_vec();
+        v.push(extra);
+        v
+    };
+    refused(
+        &[("bloomery.fixture.ff", "512")],
+        "no version",
+        "bloomery.fixture.version",
+    );
+    refused(
+        &with(("bloomery.fixture.subset", "x")),
+        "subset",
+        "bloomery.fixture.subset",
+    );
+    for (text, why) in [
+        ("", "empty"),
+        ("a b", "whitespace"),
+        ("a=b", "="),
+        ("a\u{1}b", "control"),
+        ("1,,2", "an empty list item"),
+        (",1", "a leading comma"),
+    ] {
+        refused(
+            &with(("bloomery.fixture.bad", text)),
+            why,
+            "bloomery.fixture.bad",
+        );
+    }
+    for key in ["bloomery.fixture.version", "bloomery.fixture.card_budget"] {
+        for text in ["x", "1.5", "-1", "007", "1,2", "18446744073709551616"] {
+            let mut meta: Vec<(&str, &str)> = CUT_META
+                .iter()
+                .copied()
+                .filter(|(k, _)| *k != key)
+                .collect();
+            meta.push((key, text));
+            refused(&meta, text, key);
+        }
+    }
+    let mut meta: Vec<(&str, &str)> = CUT_META
+        .iter()
+        .copied()
+        .filter(|(k, _)| *k != "bloomery.fixture.version")
+        .collect();
+    meta.push(("bloomery.fixture.version", "4294967296"));
+    refused(&meta, "a version past u32", "bloomery.fixture.version");
+
+    write_shard(&shard, &CUT_META);
+    write_shard(&dir.join("other-00001-of-00003.safetensors"), &CUT_META);
+    let e = folder_values(&dir)
+        .expect_err("two first shards")
+        .to_string();
+    assert!(
+        e.contains("two fixtures in one directory")
+            && e.contains("other-00001-of-00003.safetensors"),
+        "{e}"
+    );
+    remove(&dir)
 }

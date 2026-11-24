@@ -218,6 +218,11 @@ pub trait Trunk {
     /// and repeated into its four streams, copied on `stream`. Synchronizing, outside a capture.
     fn embed(&mut self, stream: &CudaStream, tokens: &[u32]) -> Result<(), GpuError>;
 
+    /// The walk of the decode chain: one token, over the streams of the last embed; the chain's
+    /// launches are for it whether the chain is captured before any embed or enqueued after a
+    /// prompt pass.
+    fn begin_step(&mut self);
+
     /// Sub-layer `sub` of layer `l`'s pre over the walk's rows: the mix, the fold into
     /// [`Trunk::fold`], its norm by the sub-layer's gain into [`Trunk::normed`]; the post and comb
     /// mixes kept for [`Trunk::enqueue_post`].

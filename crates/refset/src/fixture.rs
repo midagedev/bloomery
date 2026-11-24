@@ -360,13 +360,10 @@ pub fn first_shard_in(root: &str, arch: &str) -> Result<String, RefError> {
     first_shard_at(&format!("{root}/{dir}"), "`fixture generate` writes it")
 }
 
-/// The first shard of directory `at`, joined as `"{at}/{file}"`: for a directory that holds a
-/// checkpoint folder's index (`model.safetensors.index.json`) the one `*-00001-of-*.safetensors`
-/// file beside it, for any other the one `*-00001-of-*.gguf`. A directory that cannot be listed,
-/// an entry that cannot be read, a first shard whose name is not UTF-8, none or more than one, and
-/// a folder's index beside a GGUF first shard are [`RefError::Missing`], naming the directory and
-/// what was found; `maker` says what writes a GGUF split (a folder is cut by `fixture cut`).
-pub fn first_shard_at(at: &str, maker: &str) -> Result<String, RefError> {
+/// The names of directory `at`'s first shards, GGUF ones and safetensors ones: the entries the glob
+/// `*-00001-of-*<ext>` matches. A directory that cannot be listed, an entry that cannot be read and a
+/// first shard whose name is not UTF-8 are [`RefError::Missing`].
+fn first_shards(at: &str) -> Result<(Vec<String>, Vec<String>), RefError> {
     let entries = std::fs::read_dir(at)
         .map_err(|e| RefError::missing(at, format!("fixture: cannot list {at}: {e}")))?;
     let (mut ggufs, mut shards): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
@@ -392,6 +389,17 @@ pub fn first_shard_at(at: &str, maker: &str) -> Result<String, RefError> {
             shards.push(name);
         }
     }
+    Ok((ggufs, shards))
+}
+
+/// The first shard of directory `at`, joined as `"{at}/{file}"`: for a directory that holds a
+/// checkpoint folder's index (`model.safetensors.index.json`) the one `*-00001-of-*.safetensors`
+/// file beside it, for any other the one `*-00001-of-*.gguf`. A directory that cannot be listed,
+/// an entry that cannot be read, a first shard whose name is not UTF-8, none or more than one, and
+/// a folder's index beside a GGUF first shard are [`RefError::Missing`], naming the directory and
+/// what was found; `maker` says what writes a GGUF split (a folder is cut by `fixture cut`).
+pub fn first_shard_at(at: &str, maker: &str) -> Result<String, RefError> {
+    let (mut ggufs, shards) = first_shards(at)?;
     let folder = Path::new(at).join(INDEX).is_file();
     if folder && !ggufs.is_empty() {
         ggufs.sort();
@@ -532,7 +540,6 @@ fn check_held(first_shard: &Path, file: &str, keys: &[&str]) -> Result<(), RefEr
 /// the header, are [`RefError::Malformed`], as in a GGUF's; a shard with no metadata is no fixture.
 fn folder_keys(first_shard: &Path) -> Result<String, RefError> {
     let file = first_shard.display().to_string();
-    let bad = |why: String| RefError::malformed(format!("fixture: {file}"), why);
     let pairs = shard_metadata(first_shard)?;
     let mut held: Vec<(&str, &str)> = pairs
         .iter()
@@ -547,21 +554,127 @@ fn folder_keys(first_shard: &Path) -> Result<String, RefError> {
     )?;
     let mut parts = Vec::with_capacity(held.len());
     for (key, v) in held.into_iter().filter(|(k, _)| *k != KEY_CARD_BUDGET) {
-        if let Some(c) = v
-            .chars()
-            .find(|c| c.is_whitespace() || *c == '=' || c.is_control())
-        {
-            return Err(bad(format!(
-                "{key}: the string {v:?} holds {c:?}: whitespace, `=` and control characters \
-                 cannot be told apart from the line's own separators"
-            )));
-        }
-        if v.is_empty() {
-            return Err(bad(format!("{key}: an empty value states nothing")));
-        }
+        check_text(&file, key, v)?;
         parts.push(format!("{key}={v}"));
     }
     Ok(parts.join(" "))
+}
+
+/// The text `v` of `key` in a cut folder's metadata is one the line can state: not empty, and holding no
+/// whitespace, `=` or control character.
+fn check_text(file: &str, key: &str, v: &str) -> Result<(), RefError> {
+    let bad = |why: String| RefError::malformed(format!("fixture: {file}"), why);
+    if let Some(c) = v
+        .chars()
+        .find(|c| c.is_whitespace() || *c == '=' || c.is_control())
+    {
+        return Err(bad(format!(
+            "{key}: the string {v:?} holds {c:?}: whitespace, `=` and control characters \
+             cannot be told apart from the line's own separators"
+        )));
+    }
+    if v.is_empty() {
+        return Err(bad(format!("{key}: an empty value states nothing")));
+    }
+    Ok(())
+}
+
+/// The `bloomery.fixture.` keys of the checkpoint folder `dir`, as a GGUF written from the folder
+/// carries them: the entries of the first shard's safetensors `__metadata__` (the one
+/// `*-00001-of-*.safetensors` file in `dir`), sorted by key, each typed so that [`keys`] states the
+/// GGUF's line as it states the folder's. A text is typed by what it spells: the version key a u32
+/// and the card budget a u64 (the types of [`KEY_VERSION`] and [`KEY_CARD_BUDGET`]), any other
+/// decimal number a u64, a comma-separated list of decimals that fit u32 an array of u32, a list of
+/// anything else an array of strings, and every other text a string. A folder with no first
+/// shard, or whose first shard holds no such key, carries none.
+///
+/// A key set the line refuses is refused here by the same words: no version key beside other keys
+/// (not a fixture), the subset key (the folder holds only some tensors, and a GGUF made of it
+/// holds no more, which the fixture tier refuses to run), a value that is empty or holds
+/// whitespace, `=` or a control character, a list with an empty item, and a version or budget
+/// that is no decimal of its type; two first shards are two fixtures in one directory.
+pub fn folder_values(dir: &Path) -> Result<Vec<(String, Value)>, RefError> {
+    let at = dir.display().to_string();
+    let (_, shards) = first_shards(&at)?;
+    let first = match shards.as_slice() {
+        [] => return Ok(Vec::new()),
+        [one] => dir.join(one),
+        _ => {
+            return Err(RefError::malformed(
+                format!("fixture: {at}"),
+                format!(
+                    "{} first shards (*-00001-of-*{SAFETENSORS}): {shards:?}, two fixtures in one directory",
+                    shards.len()
+                ),
+            ));
+        }
+    };
+    let file = first.display().to_string();
+    let pairs = shard_metadata(&first)?;
+    let mut held: Vec<(&str, &str)> = pairs
+        .iter()
+        .filter(|(k, _)| k.starts_with(KEY_PREFIX))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    if held.is_empty() {
+        return Ok(Vec::new());
+    }
+    held.sort_by(|a, b| a.0.cmp(b.0));
+    check_held(
+        &first,
+        &file,
+        &held.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+    )?;
+    held.into_iter()
+        .map(|(key, v)| {
+            check_text(&file, key, v)?;
+            Ok((key.to_string(), typed(&file, key, v)?))
+        })
+        .collect()
+}
+
+/// The value a cut folder's metadata text `v` of `key` is carried as: see [`folder_values`].
+fn typed(file: &str, key: &str, v: &str) -> Result<Value, RefError> {
+    let bad =
+        |why: String| RefError::malformed(format!("fixture: {file}"), format!("{key}: {why}"));
+    let decimal = |s: &str| {
+        let canonical = !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && (s == "0" || !s.starts_with('0'));
+        canonical.then(|| s.parse::<u64>().ok()).flatten()
+    };
+    match key {
+        KEY_VERSION => decimal(v)
+            .and_then(|n| u32::try_from(n).ok())
+            .map(Value::U32)
+            .ok_or_else(|| bad(format!("{v:?} is not a decimal u32, the version's type"))),
+        KEY_CARD_BUDGET => decimal(v)
+            .map(Value::U64)
+            .ok_or_else(|| bad(format!("{v:?} is not a decimal u64, the budget's type"))),
+        _ if !v.contains(',') => {
+            Ok(decimal(v).map_or_else(|| Value::String(v.to_string()), Value::U64))
+        }
+        _ => {
+            let items: Vec<&str> = v.split(',').collect();
+            if items.contains(&"") {
+                return Err(bad(format!("the list {v:?} has an empty item")));
+            }
+            let numbers: Option<Vec<Value>> = items
+                .iter()
+                .map(|s| {
+                    decimal(s)
+                        .and_then(|n| u32::try_from(n).ok())
+                        .map(Value::U32)
+                })
+                .collect();
+            Ok(Value::Array(numbers.unwrap_or_else(|| {
+                items
+                    .iter()
+                    .map(|s| Value::String((*s).to_string()))
+                    .collect()
+            })))
+        }
+    }
 }
 
 /// A safetensors shard's `__metadata__` entries (every `bloomery.fixture.` one a string);

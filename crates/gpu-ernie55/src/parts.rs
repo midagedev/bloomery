@@ -89,6 +89,10 @@ fn head_mix(
 // ------------------------------------------------------------------------------------- the trunk
 
 impl body::Trunk for Trunk {
+    fn begin_step(&mut self) {
+        Trunk::begin_step(self);
+    }
+
     fn embed(&mut self, stream: &CudaStream, tokens: &[u32]) -> Result<(), GpuError> {
         Trunk::embed(self, stream, tokens)
     }

@@ -790,7 +790,7 @@ impl Mla {
                 ),
             ));
         }
-        self.enqueue_unit(c, st, 0, x, out)
+        self.enqueue_unit(c, st, (0, 1), x, out)
     }
 
     /// The chain of a prompt chunk, the `t` tokens at `pos0 .. pos0 + t` of `x` (`[t][hidden]`)
@@ -842,19 +842,21 @@ impl Mla {
         }
         let mut at = 0;
         while at < t {
-            self.enqueue_unit(c, st, at, x, out)?;
-            at += c.s.unit.min(t - at);
+            let u = c.s.unit.min(t - at);
+            self.enqueue_unit(c, st, (at, u), x, out)?;
+            at += u;
         }
         Ok(())
     }
 
-    /// The chain of one unit (module doc): the `u` tokens at span offset `at`, `u` the fewest of
-    /// the scratch's columns and the span's rest, columns `at .. at + u` of `x` into `out`'s.
+    /// The chain of one unit (module doc): `u` tokens at span offset `at`, `u` at most the
+    /// scratch's columns, columns `at .. at + u` of `x` into `out`'s. The caller states `u`: a
+    /// step's capture comes before any span is set, so the unit's width is not read off the span.
     fn enqueue_unit(
         &self,
         c: &mut Call<'_>,
         st: &mut MlaState,
-        at: usize,
+        (at, u): (usize, usize),
         x: &DeviceBuffer<f32>,
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
@@ -865,8 +867,6 @@ impl Mla {
         let bn = &mut *c.bn;
         let s = &mut *c.s;
         let sh = self.sh;
-        let (_, t) = words.span();
-        let u = s.unit.min(t - at);
         let layer = &self.layers[st.at];
         let l = layer.layer;
         let fault = gpu.layer_sink(l)?;

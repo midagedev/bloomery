@@ -59,8 +59,11 @@ usage:
   --sensitivity TSV      with --fit: the table tools/ref/qfit.py measures (class layers type dkld se positions)
   --fit-out FILE         with --fit: the rules file to write (an existing file is refused)
 
-Types are written for F32, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS and the architectures kimi-k3 and exaone-moe;
-anything else is refused by name.
+Types are written for F32, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS and the architectures kimi-k3, exaone-moe,
+deepseek41 and ernie5_5; a flag or a rule may also name a type the quantizer copies (F16, BF16, MXFP4, FP8_B128): a tensor
+already in it is copied and any other is refused by name; anything else is refused by name. An ernie5_5 set keeps as
+converted every tensor its reader holds in one stored type (the embedding, the head, the routers and the compressor BF16,
+the routed stacks MXFP4, the mixers F32) and takes the file type for its FP8 projections.
 
 exit: 0 done; 1 a refusal, named (a source row that is not finite, an imatrix entry that is unusable, a type this
 quantizer does not write, too little room, a whole output shard that is not this plan's under --resume, a --check or

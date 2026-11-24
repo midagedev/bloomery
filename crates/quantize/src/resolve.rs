@@ -16,9 +16,10 @@ use gguf::quant::GgmlType;
 /// that show the ported branches are the whole logic for a set of it: none of the branches keyed
 /// to an architecture (`tensor_allows_quantization`'s rows at `:337-410`,
 /// `llama_tensor_get_type_impl`'s at `:534-573`, FALCON's at `:574,705-740`) applies to a set of
-/// the row beyond what the port already carries, and a tensor that reaches a branch the port
-/// does not (an `n_expert` below four's head-count ratio under an IQ type, the first eighth of
-/// `ffn_down` under one) is refused by name.
+/// the row beyond what the port already carries (ernie5_5's in [`ARCH_KEPT`], deepseek41's among
+/// the arch-free exclusions, kimi-k3's and exaone-moe's in none), and a tensor that reaches a
+/// branch the port does not (an `n_expert` below four's head-count ratio under an IQ type, the
+/// first eighth of `ffn_down` under one) is refused by name.
 pub const ARCHS: &[(&str, &str)] = &[
     (
         "kimi-k3",
@@ -42,7 +43,52 @@ pub const ARCHS: &[(&str, &str)] = &[
          keyed to it, and the grouped `attn_output_a` takes the standard logic (its name is not \
          the `attn_output.weight` category)",
     ),
+    (
+        "ernie5_5",
+        "the only lines of `llama-quant.cpp` that name it are the ERNIE 5.5 conversion's block of \
+         `tensor_allows_quantization` (its pull request's hunk, after the KIMI_K31 exclusions): \
+         the mHC mixers, the VHA head mix, the compressor's position table and the indexer stay \
+         as converted. No branch of `llama_tensor_get_type_impl` is keyed to it, and its \
+         projections take the standard logic",
+    ),
 ];
+
+/// What a set of one architecture keeps as converted: `tensor_allows_quantization`'s rows keyed to an architecture,
+/// each a fragment a tensor's name holds or a tensor's whole name. A set of an architecture no row names takes the
+/// arch-free checks alone.
+const ARCH_KEPT: &[(&str, &[Kept])] = &[(
+    "ernie5_5",
+    &[
+        // The conversion's rows, in the spelling of the names the ernie55 map writes: the
+        // mHC mixers and the head's fold, the head mix (`attn_vha_u`, `attn_vha_v`), the
+        // compressor's position table.
+        Kept::Fragment("hc_"),
+        Kept::Fragment("attn_vha_"),
+        Kept::Fragment("attn_compressor_ape"),
+        // The indexer's rows, cut to the tensors the checkpoint stores BF16 and F32: its
+        // FP8 query projection takes the file type with every dense projection.
+        Kept::Fragment("indexer.attn_k."),
+        Kept::Fragment("indexer.proj."),
+        Kept::Fragment("indexer.k_norm"),
+        // The tensors the reader's table holds in their stored type alone (`gguf::arch::ernie55`):
+        // the embedding, the head and the two routers BF16, the routed stacks MXFP4; and the
+        // compressor's two matrices, BF16 as the folder load keeps them.
+        Kept::Whole("token_embd.weight"),
+        Kept::Whole("output.weight"),
+        Kept::Fragment("ffn_gate_inp_1."),
+        Kept::Fragment("ffn_gate_exps."),
+        Kept::Fragment("ffn_up_exps."),
+        Kept::Fragment("ffn_down_exps."),
+        Kept::Fragment("attn_compressor_kv."),
+        Kept::Fragment("attn_compressor_gate."),
+    ],
+)];
+
+/// One row keyed to an architecture: a fragment the tensor's name holds, or the tensor's whole name.
+enum Kept {
+    Fragment(&'static str),
+    Whole(&'static str),
+}
 
 /// The file types the logic is ported for (`llama_ftype`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +155,9 @@ impl Ftype {
     }
 }
 
-/// The type a flag or a rule names, among those the port writes or copies.
+/// The type a flag or a rule names: one the port writes, or a source type the port copies (F16,
+/// BF16, MXFP4, FP8_B128): a tensor that already is in a copied type stays as it is, and one that
+/// is not is refused by name ([`Target::of`] has no writer for it).
 pub fn parse_type(s: &str) -> Result<GgmlType> {
     Ok(match s.to_ascii_uppercase().as_str() {
         "F32" => GgmlType::F32,
@@ -120,17 +168,25 @@ pub fn parse_type(s: &str) -> Result<GgmlType> {
         "Q8_0" => GgmlType::Q8_0,
         "IQ1_S" => GgmlType::IQ1_S,
         "IQ2_XXS" => GgmlType::IQ2_XXS,
+        "F16" => GgmlType::F16,
+        "BF16" => GgmlType::BF16,
+        "MXFP4" => GgmlType::MXFP4,
+        "FP8_B128" => GgmlType::FP8_B128,
         o => {
             return Err(Error::refused(format!(
-                "type {o}: the quantizer writes F32, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS"
+                "type {o}: the quantizer writes F32, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, IQ1_S and IQ2_XXS, and copies F16, BF16, MXFP4 and FP8_B128"
             )));
         }
     })
 }
 
-/// What the type logic reads of the model: `<arch>.block_count`, `<arch>.expert_count`.
+/// What the type logic reads of the model: its architecture word (the rows of
+/// `tensor_allows_quantization` keyed to one, [`ARCH_KEPT`]), `<arch>.block_count` and
+/// `<arch>.expert_count`.
 #[derive(Debug, Clone, Copy)]
 pub struct Model {
+    /// The architecture's row of [`ARCHS`].
+    pub arch: &'static str,
     pub n_layer_all: u32,
     pub n_expert: u32,
 }
@@ -139,20 +195,21 @@ impl Model {
     /// From the first shard's metadata; an architecture no row of [`ARCHS`] names is refused
     /// naming the rows.
     pub fn read(set: &dyn Source) -> Result<Model> {
-        let arch = set.architecture().unwrap_or("");
-        if !ARCHS.iter().any(|&(name, _)| name == arch) {
+        let word = set.architecture().unwrap_or("");
+        let Some(&(arch, _)) = ARCHS.iter().find(|&&(name, _)| name == word) else {
             let names: Vec<&str> = ARCHS.iter().map(|&(name, _)| name).collect();
             return Err(Error::refused(format!(
-                "architecture {arch:?}: the type logic is ported for {} only",
+                "architecture {word:?}: the type logic is ported for {} only",
                 names.join(", ")
             )));
-        }
+        };
         let get = |suffix: &str| {
             set.arch_get_u64(suffix)
                 .and_then(|v| u32::try_from(v).ok())
                 .ok_or_else(|| Error::refused(format!("no {}", set.arch_key(suffix))))
         };
         Ok(Model {
+            arch,
             n_layer_all: get("block_count")?,
             n_expert: get("expert_count")?,
         })
@@ -235,14 +292,27 @@ fn is_attn_v(c: Category) -> bool {
 }
 
 /// `tensor_allows_quantization`, as it reads with `quantize_output_tensor` on and no `only_copy`: the
-/// arch-free checks every [`ARCHS`] set needs, no row of another architecture's own.
-fn allows_quantization(name: &str, dims: &[u64]) -> bool {
+/// arch-free checks every [`ARCHS`] set needs, and the rows keyed to the set's own architecture
+/// ([`ARCH_KEPT`]), none of another's.
+fn allows_quantization(arch: &str, name: &str, dims: &[u64]) -> bool {
     let n_dims = dims
         .iter()
         .rposition(|&d| d != 1)
         .map_or(1, |p| p + 1)
         .max(1);
     if n_dims < 2 || !name.ends_with("weight") {
+        return false;
+    }
+    let kept = |row: &Kept| match row {
+        Kept::Fragment(f) => name.contains(f),
+        Kept::Whole(w) => name == *w,
+    };
+    if ARCH_KEPT
+        .iter()
+        .filter(|&&(word, _)| word == arch)
+        .flat_map(|&(_, rows)| rows.iter())
+        .any(kept)
+    {
         return false;
     }
     const EXCLUDED: &[&str] = &[
@@ -473,7 +543,7 @@ pub fn resolve(
     }
     let mut out = Vec::with_capacity(tensors.len());
     for t in tensors {
-        if !allows_quantization(t.name, t.dims) {
+        if !allows_quantization(m.arch, t.name, t.dims) {
             out.push(t.ty);
             continue;
         }

@@ -12,15 +12,18 @@ use quantize::resolve::{Ftype, Model, Options, TensorRef, layer_of, resolve};
 use quantize::rules::Rules;
 
 const M8: Model = Model {
+    arch: "kimi-k3",
     n_layer_all: 8,
     n_expert: 8,
 };
 const M64: Model = Model {
+    arch: "kimi-k3",
     n_layer_all: 8,
     n_expert: 64,
 };
 /// DeepSeek-V4.1's counts: 43 blocks, so ggml's Q3_K_M `ffn_down` takes Q5_K for blocks 0 and 1 (`43 / 16`).
 const M43: Model = Model {
+    arch: "deepseek41",
     n_layer_all: 43,
     n_expert: 256,
 };
@@ -213,9 +216,9 @@ impl quantize::source::Source for Set {
     }
 }
 
-/// [`Model::read`]: each row of the architecture table reads its set's block and expert counts,
-/// and an architecture no row names is refused naming the rows. Mutant (red at the refusal): the
-/// `exaone-moe` row out of the table.
+/// [`Model::read`]: each row of the architecture table reads its set's block and expert counts
+/// under its own word, and an architecture no row names is refused naming the rows. Mutant (red
+/// at the refusal): the `exaone-moe` row out of the table.
 #[test]
 fn the_architecture_rows_read_their_sets_and_refuse_another() {
     let set = |arch: &str| {
@@ -228,17 +231,117 @@ fn the_architecture_rows_read_their_sets_and_refuse_another() {
             (format!("{arch}.expert_count"), gguf::Value::U32(256)),
         ])
     };
-    for arch in ["kimi-k3", "exaone-moe", "deepseek41"] {
+    for arch in ["kimi-k3", "exaone-moe", "deepseek41", "ernie5_5"] {
         let m = Model::read(&set(arch)).unwrap();
-        assert_eq!((m.n_layer_all, m.n_expert), (79, 256), "{arch}");
+        assert_eq!(
+            (m.arch, m.n_layer_all, m.n_expert),
+            (arch, 79, 256),
+            "{arch}"
+        );
     }
     let e = Model::read(&set("flint")).unwrap_err().to_string();
     assert!(
         e.contains("\"flint\"")
             && e.contains("kimi-k3")
             && e.contains("exaone-moe")
-            && e.contains("deepseek41"),
+            && e.contains("deepseek41")
+            && e.contains("ernie5_5"),
         "{e}"
+    );
+}
+
+/// An ernie5_5 set under Q8_0, no rules: the FP8 128-block projections take the file type (the
+/// indexer's query projection with them), and the rows keyed to the architecture keep every
+/// tensor the reader holds in one stored type as the folder load makes it: the embedding, the
+/// head, the two routers and the compressor's matrices BF16, the routed stacks MXFP4, the mixers,
+/// the head mix, the position table and the indexer's matrices as converted. Mutant (red at the
+/// `blk.1.ffn_gate_inp_1.weight` row): a fragment out of the row, or `indexer.` whole.
+#[test]
+fn an_ernie5_5_set_keeps_its_stored_types_and_takes_the_file_type_for_its_fp8_projections() {
+    use GgmlType::*;
+    let m = Model {
+        arch: "ernie5_5",
+        n_layer_all: 3,
+        n_expert: 512,
+    };
+    let f8 = &[2048u64, 64][..];
+    let mx = &[2048u64, 2048, 512][..];
+    let names = [
+        ("token_embd.weight", D, B),
+        ("output.weight", D, B),
+        ("output_hc_fn.weight", D, F32),
+        ("output_hc_base.weight", &[4][..], F32),
+        ("output_multimax_ranges.weight", &[4][..], F32),
+        ("blk.0.attn_norm.weight", &[4096][..], F32),
+        ("blk.0.hc_attn_fn.weight", D, F32),
+        ("blk.0.hc_attn_scale.weight", &[3][..], F32),
+        ("blk.0.attn_vha_u.weight", D, F32),
+        ("blk.0.attn_compressor_ape.weight", D, F32),
+        ("blk.0.attn_compressor_kv.weight", D, B),
+        ("blk.0.attn_compressor_gate.weight", D, B),
+        ("blk.0.attn_q_b.weight", f8, FP8_B128),
+        ("blk.0.attn_output_a.weight", f8, FP8_B128),
+        ("blk.0.ffn_gate.weight", f8, FP8_B128),
+        ("blk.1.ffn_gate_inp.weight", D, B),
+        ("blk.1.ffn_gate_inp_1.weight", D, B),
+        ("blk.1.exp_probs_b.bias", &[512][..], F32),
+        ("blk.1.ffn_gate_exps.weight", mx, MXFP4),
+        ("blk.1.ffn_up_exps.weight", mx, MXFP4),
+        ("blk.1.ffn_down_exps.weight", mx, MXFP4),
+        ("blk.1.ffn_routed_down.weight", f8, FP8_B128),
+        ("blk.1.ffn_gate_shexp.weight", f8, FP8_B128),
+        ("blk.2.indexer.attn_q_b.weight", f8, FP8_B128),
+        ("blk.2.indexer.attn_k.weight", D, B),
+        ("blk.2.indexer.proj.weight", D, B),
+        ("blk.2.indexer.k_norm.weight", &[128][..], F32),
+        ("blk.2.indexer.k_norm.bias", &[128][..], F32),
+        ("blk.2.attn_kv_b.weight", f8, FP8_B128),
+    ];
+    assert_eq!(
+        run(&names, "", &m, &opts(Ftype::Q8_0)).unwrap(),
+        [
+            B, B, F32, F32, F32, F32, F32, F32, F32, F32, B, B, Q8_0, Q8_0, Q8_0, B, B, F32, MXFP4,
+            MXFP4, MXFP4, Q8_0, Q8_0, Q8_0, B, B, F32, F32, Q8_0
+        ]
+    );
+}
+
+/// A flag or a rule may name a type the quantizer copies: a tensor already in it is typed as it
+/// is, and a type no row of the table has is refused naming what the quantizer writes and copies.
+#[test]
+fn a_copied_type_names_a_tensor_already_in_it() {
+    use GgmlType::*;
+    for (s, ty) in [
+        ("f16", F16),
+        ("bf16", B),
+        ("mxfp4", MXFP4),
+        ("FP8_B128", FP8_B128),
+    ] {
+        assert_eq!(quantize::resolve::parse_type(s).unwrap(), ty, "{s}");
+    }
+    let e = quantize::resolve::parse_type("q2_k")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("copies F16, BF16, MXFP4 and FP8_B128"), "{e}");
+    // A rule naming a stored type keeps the tensor that is in it: the FP8 projection stays FP8_B128
+    // where the file type alone would write it Q8_0 (the plan refuses the rule for a tensor of
+    // another type: no writer converts to a copied type).
+    let f8 = ("blk.0.attn_q_b.weight", &[2048u64, 64][..], FP8_B128);
+    let bf = ("blk.0.attn_kv.weight", &[2048u64, 64][..], B);
+    let m = Model {
+        arch: "ernie5_5",
+        n_layer_all: 3,
+        n_expert: 512,
+    };
+    assert_eq!(
+        run(
+            &[f8, bf],
+            "attn_q_b=fp8_b128 attn_kv=bf16",
+            &m,
+            &opts(Ftype::Q8_0)
+        )
+        .unwrap(),
+        [FP8_B128, B]
     );
 }
 
@@ -255,6 +358,7 @@ fn the_architecture_rows_read_their_sets_and_refuse_another() {
 fn an_exaone_moe_set_types_as_llama_quantize_types_it() {
     use GgmlType::*;
     let m = Model {
+        arch: "exaone-moe",
         n_layer_all: 79,
         n_expert: 256,
     };
@@ -326,6 +430,7 @@ fn the_q3_k_m_word_types_as_llama_quantize_types_it() {
         ("blk.0.attn_norm.weight", &[256][..], F32),
     ];
     let m = Model {
+        arch: "deepseek41",
         n_layer_all: 43,
         n_expert: 64,
     };
@@ -337,6 +442,7 @@ fn the_q3_k_m_word_types_as_llama_quantize_types_it() {
         ]
     );
     let eight = Model {
+        arch: "deepseek41",
         n_layer_all: 43,
         n_expert: 8,
     };

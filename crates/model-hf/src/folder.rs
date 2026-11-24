@@ -504,8 +504,8 @@ fn tokenized<M: FolderMap>(
 /// The folder `dir` read and checked as the map `M` reads it: `config.json`, its tensors placed
 /// by its quantization config and planned for the split `prepare` writes ([`plan_tensors`],
 /// [`Keep::Made`], `q8` as there), the header's keys
-/// (the model's and the tokenizer's), and serving's tokenizer built from them and checked against
-/// Hugging Face's ([`served_as_hf`]).
+/// (the model's, the tokenizer's and a cut folder's fixture keys), and serving's tokenizer built
+/// from them and checked against Hugging Face's ([`served_as_hf`]).
 pub fn read<M: FolderMap>(dir: &Path, q8: bool) -> Result<Read<M>, Error> {
     read_with(dir, q8, &Options::default())
 }
@@ -521,7 +521,8 @@ pub fn read_with<M: FolderMap>(dir: &Path, q8: bool, options: &Options) -> Resul
         skipped,
         kvs,
     } = fold_with::<M>(dir, &read_config(dir)?, q8, Keep::Made, options)?;
-    let (kvs, tokenizer) = tokenized(dir, &checkpoint, kvs)?;
+    let (mut kvs, tokenizer) = tokenized(dir, &checkpoint, kvs)?;
+    kvs.extend(fixture_keys(dir)?);
     Ok(Read {
         checkpoint,
         folder,
@@ -531,6 +532,15 @@ pub fn read_with<M: FolderMap>(dir: &Path, q8: bool, options: &Options) -> Resul
         kvs,
         tokenizer,
     })
+}
+
+/// The `bloomery.fixture.` keys of a cut folder (`fixture cut`), which the split written from the
+/// folder carries so that the fixture tier reads the file as the fixture it is
+/// ([`refset::fixture::folder_values`]); none for a folder that holds none. The keys of a folder
+/// opened for a load ([`open`]) stay out of its header: the load reads them from the folder.
+fn fixture_keys(dir: &Path) -> Result<Vec<(String, Value)>, Error> {
+    refset::fixture::folder_values(dir)
+        .map_err(|e| Error::Refused(format!("{}: {e}", dir.display())))
 }
 
 /// A folder as a load opens it ([`open`]).

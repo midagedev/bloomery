@@ -107,6 +107,7 @@ pub fn split_model_types() -> Vec<&'static str> {
         <qwen3moe::Checkpoint as FolderMap>::MODEL_TYPES,
         <kimi_k3::Checkpoint as FolderMap>::MODEL_TYPES,
         <exaone_moe::Checkpoint as FolderMap>::MODEL_TYPES,
+        <ernie55::Checkpoint as FolderMap>::MODEL_TYPES,
     ]
     .concat()
 }
@@ -122,6 +123,8 @@ pub fn with_split_map<U: MapUse>(model_type: &str, user: U) -> Option<U::Out> {
         Some(user.with::<kimi_k3::Checkpoint>())
     } else if <exaone_moe::Checkpoint as FolderMap>::MODEL_TYPES.contains(&model_type) {
         Some(user.with::<exaone_moe::Checkpoint>())
+    } else if <ernie55::Checkpoint as FolderMap>::MODEL_TYPES.contains(&model_type) {
+        Some(user.with::<ernie55::Checkpoint>())
     } else {
         None
     }

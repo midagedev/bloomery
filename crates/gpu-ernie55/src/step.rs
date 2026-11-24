@@ -34,6 +34,7 @@ pub(crate) fn enqueue(
     head: &mut Head,
 ) -> Result<(), GpuError> {
     let pos = pos(gpu, body)?;
+    body.parts.trunk.begin_step();
     match body.placed.take() {
         Some(mut placed) => {
             let walked = crate::placed::walk((gpu, w), body, &mut placed, pos);

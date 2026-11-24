@@ -448,6 +448,13 @@ impl Trunk {
         self.tokens
     }
 
+    /// The walk of the decode chain: one token, over the streams of the last embed. The chain is
+    /// captured before any embed, and one enqueued after a prompt pass finds the pass's rows
+    /// here; either way its launches are for the one token each refresh embeds.
+    pub fn begin_step(&mut self) {
+        self.tokens = 1;
+    }
+
     /// The streams of the walk in progress: `tokens` of four streams, token-major.
     #[must_use]
     pub fn streams(&self) -> &DeviceBuffer<f32> {
