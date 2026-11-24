@@ -5,7 +5,8 @@
 //! ([`body::Mixer`], [`body::RoutedFfn`], [`body::Trunk`], [`body::HeadMix`]) that [`parts::load`] builds from the
 //! file. It loads by a placement plan ([`body::Body::open_placed`]): every layer's dense part and the stores on the
 //! stage card with each routed layer's card share of its experts, the rest on the common host tier. A prompt runs as
-//! the pass's units ([`pass::prompt`]) on a load whose card holds every expert, and steps otherwise.
+//! the pass's units ([`pass::prompt`]), each hosted layer's host experts read once for a unit's rows through the host
+//! tier's batch port; a load opened with no pass steps it.
 
 pub mod attn_hca;
 pub mod attn_mla;

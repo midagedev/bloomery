@@ -730,6 +730,60 @@ impl RoutedFfn for Routed {
         )
     }
 
+    fn enqueue_front_rows(
+        &mut self,
+        cx: Cx<'_>,
+        l: usize,
+        m: usize,
+        x: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let g = sites(cx, &self.k, (self.hidden, self.eps));
+        self.moe
+            .enqueue_front_rows((cx.gpu, cx.w, &g, &self.k.gemm), &mut self.bufs, l, m, x)
+    }
+
+    fn latent_rows(&self) -> &DeviceBuffer<f32> {
+        self.bufs.lat()
+    }
+
+    fn enqueue_shadow_rows(
+        &mut self,
+        cx: Cx<'_>,
+        l: usize,
+        m: usize,
+        x: &DeviceBuffer<f32>,
+        sel_n_card: (&DeviceBuffer<u32>, usize),
+    ) -> Result<bool, GpuError> {
+        let g = sites(cx, &self.k, (self.hidden, self.eps));
+        self.moe.enqueue_shadow_rows(
+            (cx.gpu, cx.w, &g, &self.k.gemm),
+            &mut self.bufs,
+            l,
+            m,
+            x,
+            sel_n_card,
+        )
+    }
+
+    fn enqueue_back_rows(
+        &mut self,
+        cx: Cx<'_>,
+        l: usize,
+        m: usize,
+        card_hsum: (bool, Option<&DeviceBuffer<f32>>),
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let g = sites(cx, &self.k, (self.hidden, self.eps));
+        self.moe.enqueue_back_rows(
+            (cx.gpu, cx.w, &g, &self.k.gemm),
+            &mut self.bufs,
+            l,
+            m,
+            card_hsum,
+            out,
+        )
+    }
+
     fn rows(&self) -> usize {
         self.bufs.rows()
     }

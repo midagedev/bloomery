@@ -84,12 +84,17 @@ pub struct PassTerms {
     pub moe: u64,
     /// The head's one row of folded streams.
     pub head: u64,
+    /// The hosted pass's buffers beside the placed side: the host's sums of a unit's rows and the
+    ///   places of its routed slots (made where the plan hosts experts; counted whatever it does,
+    ///   as a plan does not know its placement when it reserves).
+    pub placed: u64,
 }
 
 impl PassTerms {
     /// The terms of `hp`, in bytes, from the widths the parts build their buffers from (each
     /// term's lines in the body's allocation: `Trunk`, `HcaState::new`, `Scratch::new` of the
-    /// latent chain, `MoeBufs::new`). The terms, in four-byte words a row unless said:
+    /// latent chain, `MoeBufs::new`, the hosted pass's buffers). The terms, in four-byte words a
+    /// row unless said:
     ///
     /// - trunk: the two stream buffers (`2 · hc · embd`), the sub-layers' mixes and the pre's
     ///   rows (`2 · mix`), the fold, the norm and the post's fold (`3 · embd`), the dense lead's
@@ -110,7 +115,9 @@ impl PassTerms {
     ///   rows, the up's output and the shared expert's output, its gate, up and activation,
     ///   the card leg's buffers ([`kernels::leg_bytes`], both down forms: a bound), the forms of
     ///   the three widths a site reads (both where the width allows them) and a one-expert route;
-    /// - head: the streams and their fold, one row (a bound).
+    /// - head: the streams and their fold, one row (a bound);
+    /// - placed: the host's sums of a unit's rows (the latent's width a row) and the places of its
+    ///   routed slots (`n_used` a row).
     #[must_use]
     pub fn of(hp: &Hparams) -> PassTerms {
         let r = PROMPT_ROWS;
@@ -189,13 +196,14 @@ impl PassTerms {
             mla: (WORD * mla_words) as u64,
             moe: moe_bytes as u64,
             head: (WORD * (k + h)) as u64,
+            placed: (WORD * r * (hp.latent + e.n_used)) as u64,
         }
     }
 
     /// Every term: what the plan reserves ([`prompt_reserve_bytes`]).
     #[must_use]
     pub fn total(&self) -> u64 {
-        self.trunk + self.hca + self.mla + self.moe + self.head
+        self.trunk + self.hca + self.mla + self.moe + self.head + self.placed
     }
 }
 

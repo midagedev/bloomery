@@ -17,7 +17,9 @@
 //!    epilogue) and the argmax.
 //!
 //! A load whose routed experts the card cannot hold runs each layer with a host share as the
-//! routed block's three parts around the common host tier's go and wait ([`crate::placed`]).
+//! routed block's three parts around the common host tier's go and wait ([`crate::placed`]); its
+//! prompt runs the same three parts around the host tier's batch port, a unit's rows at once
+//! ([`crate::pass`]).
 //!
 //! The parts are the component modules' (`attn_hca`, `attn_mla`, `trunk`, `head`, `moe`), each
 //! behind the narrow trait the walk calls; [`crate::parts`] builds them from the file. Every part
@@ -209,6 +211,52 @@ pub trait RoutedFfn {
         l: usize,
         m: usize,
         x: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<(), GpuError>;
+
+    /// The front of a hosted layer over the `m` normed rows of `x`: the router over the rows (the
+    /// picks in [`RoutedFfn::route`], `[m, n_used]`) and the latent down of each row into the
+    /// buffers' latent rows ([`RoutedFfn::latent_rows`]), the rows a prompt batch's download hands
+    /// the host. The caller runs the places and the download between this and
+    /// [`RoutedFfn::enqueue_shadow_rows`].
+    fn enqueue_front_rows(
+        &mut self,
+        cx: Cx<'_>,
+        l: usize,
+        m: usize,
+        x: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError>;
+
+    /// The last front's latent rows, `m` of the latent's width: the experts' input the card's
+    /// slots read and a prompt batch's download hands the host.
+    fn latent_rows(&self) -> &DeviceBuffer<f32>;
+
+    /// [`RoutedFfn::enqueue_shadow`] over the `m` rows: the shared expert into the buffers'
+    /// `shared` rows and the card's slots one run over the latent rows at the places `sel`
+    /// (`m · n_used`, a card slot below `n_card` or the host mark), the picks' weights the sum's.
+    /// Whether the card's slots ran.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the card, the layer, the rows, the input, the places and the card count (rust-quality R8)"
+    )]
+    fn enqueue_shadow_rows(
+        &mut self,
+        cx: Cx<'_>,
+        l: usize,
+        m: usize,
+        x: &DeviceBuffer<f32>,
+        sel_n_card: (&DeviceBuffer<u32>, usize),
+    ) -> Result<bool, GpuError>;
+
+    /// [`RoutedFfn::enqueue_back`] over the `m` rows: the routed sums plus the host's `hsum` (`m`
+    /// rows of the latent's width) through the norm, the latent up and the shared expert, into
+    /// `out`.
+    fn enqueue_back_rows(
+        &mut self,
+        cx: Cx<'_>,
+        l: usize,
+        m: usize,
+        card_hsum: (bool, Option<&DeviceBuffer<f32>>),
         out: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError>;
 
@@ -475,6 +523,9 @@ pub struct Body {
     pub(crate) placed: Option<PlacedHost>,
     /// The prompt pass's rows a unit ([`crate::pass`]); `None` on a load that steps its prompt.
     pub(crate) pass: Option<usize>,
+    /// The hosted pass's buffers beside the placed side ([`crate::placed::HostedPass`]) on a load
+    /// whose plan hosts experts and that has the pass; `None` otherwise.
+    pub(crate) hosted: Option<crate::placed::HostedPass>,
 }
 
 impl Body {
@@ -491,6 +542,7 @@ impl Body {
             taps: None,
             placed: None,
             pass: None,
+            hosted: None,
         })
     }
 
@@ -607,6 +659,10 @@ impl Body {
         self.parts.bytes()
             + F32 * self.y.len()
             + self.placed.as_ref().map_or(0, PlacedHost::device_bytes)
+            + self
+                .hosted
+                .as_ref()
+                .map_or(0, crate::placed::HostedPass::bytes)
     }
 }
 
@@ -721,11 +777,9 @@ impl Rollback for Body {
 }
 
 impl XStreamBody for Body {
-    /// `BLOOMERY_XSTREAM`: `off` is the one mode the body runs. A prompt call streams host experts
-    /// only where a unit's rows pass through a hosted layer, and the body has none: a load whose
-    /// plan hosts experts steps its prompt (the routed block's host share over a unit's rows is
-    /// not built, [`Body::open_placed`]), and a load with a pass holds every expert on the card.
-    /// `admit` and `split` are refused by name.
+    /// `BLOOMERY_XSTREAM`: `off` is the one mode the body runs. The body keeps no expert stream: a
+    /// prompt unit's host picks are served through the host tier's batch port and no expert moves
+    /// to the card for it. `admit` and `split` are refused by name.
     fn set_xstream(&mut self, _gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
         match xstream_refusal(mode) {
             None => Ok(()),
@@ -745,9 +799,9 @@ fn xstream_refusal(mode: XMode) -> Option<String> {
     match mode {
         XMode::Off => None,
         XMode::Admit | XMode::Split => Some(format!(
-            "xstream={}: a prompt unit never passes through a hosted layer (a plan that hosts \
-             experts steps its prompt, one that does not holds every expert on the card), so the \
-             body moves no expert for it; it runs `off`",
+            "xstream={}: the body keeps no expert stream (a prompt unit's host picks are served \
+             through the host tier's batch port, and no expert moves to the card for it), so it \
+             runs `off`",
             mode.word()
         )),
     }
@@ -803,8 +857,7 @@ mod tests {
     use super::xstream_refusal;
 
     /// The body runs `off` and refuses the two modes that move experts, each by name with its
-    /// word: a prompt unit never passes through a hosted layer, so there is nothing to admit or
-    /// stream. Mutant: `admit` or `split` accepted.
+    /// word: it keeps no expert stream. Mutant: `admit` or `split` accepted.
     #[test]
     fn the_body_streams_nothing_and_refuses_the_modes_that_would() {
         assert_eq!(xstream_refusal(XMode::Off), None);
@@ -814,7 +867,7 @@ mod tests {
                 why.starts_with(&format!("xstream={}:", mode.word())),
                 "{why}"
             );
-            assert!(why.contains("hosted layer"), "{why}");
+            assert!(why.contains("no expert stream"), "{why}");
         }
     }
 }

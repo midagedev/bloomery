@@ -3103,14 +3103,16 @@ gate-minimax31-folder:
 # ERNIE 5.5 Flash Preview's whole program on one card (gate_ernie55_e2e's doc) over the fixture cut (layers 0, 1 and 7 of the released
 # folder: HCA with the dense lead, HCA routed, MLA-DSA routed), in three arms of one placement rule: the card's plan (every expert on the
 # card, the prompt as the pass's units); the same card under a card-experts cap of half the routed experts (each routed layer's rest
-# through the common host tier, the prompt stepped), opened from the cut's GGUF that bloomery-quantize writes (the profile's GGUF_MODEL,
-# tools/ref/models/ernie5_5.sh, which ref-paths.sh's gguf_model resolves for the tier: a folder's MXFP4 stacks are made at load, so no
-# load from the folder hosts one; a missing file ends the command by name before the build, never the card arm alone); and that hosted
-# file opened again under the residency a server runs by default (every routed layer reseeded to the experts a first prompt picked,
-# experts the plan left on the host promoted into slots below the card count). Against the numpy writer's sets `fx-np-ernie55` (short 34
-# ids, long 2,328 ids past the indexer's top-k): every layer's streams at the prompt's last rows, the routed picks as sets and their
-# weights, the MLA-DSA selection (long), the logits before and after MultiMax, the teacher-forced greedy ids; the graph against the eager
-# chain; a reset model writing a fresh open's bits and holding its caches cleared; the promoted experts read within the same bands.
+# through the common host tier: a step around its go and wait, a prompt unit's rows around its batch port, the host experts read once a
+# unit), opened from the cut's GGUF that bloomery-quantize writes (the profile's GGUF_MODEL, tools/ref/models/ernie5_5.sh, which
+# ref-paths.sh's gguf_model resolves for the tier: a folder's MXFP4 stacks are made at load, so no load from the folder hosts one; a
+# missing file ends the command by name before the build, never the card arm alone); and that hosted file opened again under the
+# residency a server runs by default (every routed layer reseeded to the experts a first prompt picked, experts the plan left on the host
+# promoted into slots below the card count). Against the numpy writer's sets `fx-np-ernie55` (short 34 ids, long 2,328 ids past the
+# indexer's top-k): every layer's streams at the prompt's last rows, the routed picks as sets and their weights, the MLA-DSA selection
+# (long), the logits before and after MultiMax, the teacher-forced greedy ids, each arm's step chain layer by layer; the hosted arms'
+# prompts served by the batch port and not stepped; the graph against the eager chain; a reset model writing a fresh open's bits and
+# holding its caches cleared; the promoted experts read within the same bands.
 # Fixture-only (tools/ref/fixture-only.sh): the released folder's sets have no family yet. Predicted wall [derived: the gate's three
 # arms ran 26 s on the 5090; a warm build, and one that recompiles bloomery-device and what links it took 3.5 min]: under 4 min.
 gate-gpu-ernie55-e2e:

@@ -176,10 +176,10 @@ fn prove(folder: &Path, gguf: &Path) -> (usize, usize) {
         };
         let made = source.whole(&t.name);
         let written = split.data(&t.name).unwrap();
-        assert_eq!(
-            written, made,
-            "{}: not the folder loader's made bytes",
-            t.name
+        assert_same_bytes(
+            written,
+            &made,
+            format!("{}: not the folder loader's made bytes", t.name),
         );
         // `blk.L.ffn_{gate,up,down}_exps.weight` is made of `model.layers.L.block_sparse_moe.experts.E.w{1,3,2}`.
         let (l, which) = t
@@ -212,10 +212,13 @@ fn prove(folder: &Path, gguf: &Path) -> (usize, usize) {
                     &mut v,
                 )
                 .unwrap();
-                assert_eq!(
-                    v, w,
-                    "{}: expert {e} row {r} does not decode to the OCP value",
-                    t.name
+                assert_same_f32s(
+                    &v,
+                    w,
+                    format!(
+                        "{}: expert {e} row {r} does not decode to the OCP value",
+                        t.name
+                    ),
                 );
             }
             experts += 1;
@@ -533,11 +536,10 @@ fn lossless(folder: &Path, gguf: &Path) -> usize {
     let mut fp8 = 0;
     for (_, t) in split.iter_tensors() {
         assert_ne!(t.ty, Ty::Q8_0, "{}: the rule keeps the stored type", t.name);
-        assert_eq!(
+        assert_same_bytes(
             split.data(&t.name).unwrap(),
-            source.whole(&t.name),
-            "{}",
-            t.name
+            &source.whole(&t.name),
+            &t.name,
         );
         fp8 += usize::from(t.ty == Ty::FP8_B128);
     }

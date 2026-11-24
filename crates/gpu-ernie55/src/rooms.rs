@@ -92,7 +92,7 @@ mod tests {
     use super::held_against;
     use crate::attn_hca::HcaDims;
     use crate::attn_mla::Shape;
-    use crate::placed::PASS_ROWS;
+    use crate::placed::{HostedPass, PASS_ROWS};
 
     /// The real checkpoint's widths over the layers `ratios` name (0 a latent layer), the routed
     /// experts `expert_ff` wide.
@@ -229,8 +229,10 @@ mod tests {
     /// context the HCA term and the flash partials of the pooled rows' segments (a block of
     /// positions each) are [`HcaDims::scratch_bytes`], and the latent term and the score rows (a
     /// row a position) are [`Shape::scratch_bytes`] of one span, the sinks and the staging
-    /// included. The whole reserve is the parts' terms summed. Mutants: a term of the formula
-    /// left out of either side, the shadow row or the pre-rope rows made a layer's again.
+    /// included. The `placed` term is the hosted pass's buffers ([`HostedPass::bytes_at`]): the
+    /// host's sums of a unit's rows and the places of its routed slots. The whole reserve is the
+    /// parts' terms summed. Mutants: a term of the formula left out of either side, the shadow row
+    /// or the pre-rope rows made a layer's again, the slots' places left out of the `placed` term.
     #[test]
     fn the_reserve_holds_the_mixers_working_buffers() {
         let ratios = (0..43)
@@ -255,9 +257,15 @@ mod tests {
                 "latent at {ctx} positions"
             );
         }
+        let made = HostedPass::bytes_at((PASS_ROWS, hp.latent, hp.experts.n_used));
+        assert_eq!(
+            made, 1_053_696,
+            "the hosted pass's buffers at the real widths"
+        );
+        assert_eq!(terms.placed, made as u64);
         assert_eq!(
             prompt_reserve_bytes(&hp),
-            terms.trunk + terms.hca + terms.mla + terms.moe + terms.head
+            terms.trunk + terms.hca + terms.mla + terms.moe + terms.head + terms.placed
         );
     }
 }

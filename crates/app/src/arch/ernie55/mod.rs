@@ -3,11 +3,12 @@
 //! part and the stores on the stage card, each routed layer's card share of its experts by the
 //! common card leg's rule, the rest on the host tier) and loaded by the body's placed constructor
 //! ([`Body::open_placed`]) under the session's residency word. `file` is a GGUF split or a
-//! checkpoint folder: the body reads either. A plan whose card holds every expert loads the prompt
-//! pass and runs a prompt as its units ([`prompt`]); a plan that hosts experts steps the ids one at
-//! a time ([`GpuModel::step`]). Either way the head's argmax after the last id is the call's. An HCA
-//! layer's window ring holds the position it stands at alone, so a cut keeps every held position
-//! or nothing. One resident sequence: the parts hold one sequence's caches.
+//! checkpoint folder: the body reads either. The load carries the prompt pass, and a prompt runs as
+//! its units ([`prompt`]): each layer whole where the card holds its experts, each hosted layer's
+//! host experts read once for a unit's rows through the host tier's batch port. Either way the
+//! head's argmax after the last id is the call's. An HCA layer's window ring holds the position it
+//! stands at alone, so a cut keeps every held position or nothing. One resident sequence: the parts
+//! hold one sequence's caches.
 
 use std::num::NonZeroUsize;
 
@@ -38,8 +39,8 @@ impl Batch for Body {
         PlanInputs::read(file).map_err(|e| GpuError::plan(WHAT, e))
     }
 
-    /// The placed load on stage card 0, with the prompt pass where the plan's card holds every
-    /// expert ([`Body::plan_hosts`]). An MTP draft is the default refusal: the file carries none.
+    /// The placed load on stage card 0 with the prompt pass. An MTP draft is the default refusal:
+    /// the file carries none.
     fn open_placed(
         file: Model,
         plan: &Plan<'_>,
@@ -48,8 +49,7 @@ impl Batch for Body {
         residency: Residency,
         _slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        let rows = (!Body::plan_hosts(plan, inputs)).then_some(PASS_ROWS);
-        Body::open_placed(file, (plan, inputs), 0, host, (rows, residency))
+        Body::open_placed(file, (plan, inputs), 0, host, (Some(PASS_ROWS), residency))
     }
 
     /// Refused by name: the prompt is [`Batch::prompt`]'s pass units or steps, so nothing calls a
@@ -76,7 +76,8 @@ impl Batch for Body {
         Ok(false)
     }
 
-    /// The ids as the pass's units where the load has the pass ([`prompt`]), else stepped.
+    /// The ids as the pass's units ([`prompt`]), one residency pass; the load always has the pass,
+    /// and a body opened without it by hand steps.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
         if m.body(WHAT)?.pass_rows().is_none() {
             return m.step(ids);

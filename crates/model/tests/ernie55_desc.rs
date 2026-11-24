@@ -833,10 +833,11 @@ fn planned(inputs: &PlanInputs, ctx: u64) -> Planned {
 /// layer, host routed 121.05 GB at 32768; 3,096, 74 and 123.05 GB at 262144; the report's §2.1
 /// gives 3,236 and 77 a layer, the 166-expert gap being the head in MXFP8 planes, no draft term,
 /// the card's size and reserves, and the pooling state). Those figures counted no prompt pass and
-/// the latent layers' index keys at f16; the pass's reserve (300,684,320 B), its stage rows (the
-/// flash partials of the pooled rows' segments and the score rows: 68.2 MB at 32768, 547.4 MB at
-/// 262144) and the keys at f32 (6 x positions x 256 B: 50.3 MB, 402.7 MB) take 63 experts (1.49 a
-/// layer) at 32768 and 187 (4.46) at 262144, so the derivation is 79.4 and 69.2 a layer. Every
+/// the latent layers' index keys at f16; the pass's reserve (301,738,016 B, the hosted pass's
+/// buffers a term), its stage rows (the flash partials of the pooled rows' segments and the score
+/// rows: 68.2 MB at 32768, 547.4 MB at 262144) and the keys at f32 (6 x positions x 256 B: 50.3
+/// MB, 402.7 MB) take 63 experts (1.50 a layer) at 32768 and 187 (4.46) at 262144, so the
+/// derivation is 79.4 and 69.2 a layer. Every
 /// expert is on the card or the host: the card's bytes and the host's make the file's
 /// 42 x 512 x 6,684,672. FAIL-first: a KV store dropped from the common owner's hold of either
 /// kind, or the pass's terms from the plan, moves the card's experts out of the band.
@@ -890,9 +891,10 @@ fn plan_on_a_5090() {
 }
 
 /// The plan reserves the prompt pass's buffers beside the stores: the parts' terms for units of
-/// [`PROMPT_ROWS`] rows are the plan's prompt reserve, the flash partials of the pooled rows'
-/// segments (one block of `ratio · 64` positions each) and the latent chain's score rows (one f32 a
-/// column of a span a position) are the stage's block and position scratch, and a plan that holds
+/// [`PROMPT_ROWS`] rows and the hosted pass's buffers ([`PassTerms::placed`]) are the plan's prompt
+/// reserve, the flash partials of the pooled rows' segments (one block of `ratio · 64` positions
+/// each) and the latent chain's score rows (one f32 a column of a span a position) are the stage's
+/// block and position scratch, and a plan that holds
 /// them gives the card fewer experts than one that holds none, by the bytes they take to within
 /// one expert a layer. FAIL-first: the reserve left out of [`PlanInputs::describe`], the block or
 /// position scratch left out, or a part's term left out of [`PassTerms::of`] reds the clause.
@@ -904,12 +906,13 @@ fn the_plan_reserves_the_prompt_pass() {
     inputs.room = (workstation::HOST_USABLE, HostRead::Given);
     let terms = PassTerms::of(&inputs.hp);
     println!(
-        "ernie55 pass reserve @{PROMPT_ROWS} rows: trunk {} B, hca {} B, mla {} B, moe {} B, head {} B, total {} B",
+        "ernie55 pass reserve @{PROMPT_ROWS} rows: trunk {} B, hca {} B, mla {} B, moe {} B, head {} B, placed {} B, total {} B",
         terms.trunk,
         terms.hca,
         terms.mla,
         terms.moe,
         terms.head,
+        terms.placed,
         terms.total()
     );
     for (what, bytes) in [
@@ -918,6 +921,7 @@ fn the_plan_reserves_the_prompt_pass() {
         ("mla", terms.mla),
         ("moe", terms.moe),
         ("head", terms.head),
+        ("placed", terms.placed),
     ] {
         assert!(bytes > 0, "the {what} part's buffers are a term");
     }

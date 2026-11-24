@@ -7,13 +7,14 @@
 //! ([`Family::read_model`], `serve_seats::folder::open`) and the common owner loads it from its
 //! located header and part source. An HCA layer's window ring takes no position back, so a request
 //! shares a prefix with the slot only where the sequence stands (`app::arch::ernie55`). The body
-//! loads its prompt pass where the plan's card holds every expert and steps the prompt otherwise
-//! (`app::arch::ernie55`'s `Batch::prompt`); the `load` record names the pass's rows. The stores
-//! are whole buffers sized at the load, no rooms, so the K/V levers are not acted on. The body
-//! streams no host expert: a prompt unit never passes through a hosted layer (a plan that hosts
-//! experts steps its prompt, one that does not holds them all on the card), so `BLOOMERY_XSTREAM`
-//! is `off` ([`Family::xstream`]), the plan keeps no stream ring ([`Family::ring`] and
-//! [`Family::with_ring`] are the defaults) and the pass reserve is the plan's own
+//! loads its prompt pass (`app::arch::ernie55`'s `Batch::prompt`): a prompt runs as the pass's
+//! units, each hosted layer's host experts read once for a unit's rows through the host tier's
+//! batch port (`bloomery_gpu_ernie55::pass`), the call one residency pass; the `load` record names
+//! the pass's rows. The stores are whole buffers sized at the load, no rooms, so the K/V levers are
+//! not acted on. The body keeps no expert stream (a prompt unit's host picks are served through the
+//! host tier's batch port and no expert moves to the card for it), so `BLOOMERY_XSTREAM` is `off`
+//! ([`Family::xstream`]), the plan keeps no stream ring ([`Family::ring`] and [`Family::with_ring`]
+//! are the defaults) and the pass reserve is the plan's own
 //! (`model::arch::ernie55::place::prompt_reserve_bytes`). The body serves no expert tier card
 //! ([`TierRule::UNTIERED`]).
 //!
@@ -111,8 +112,8 @@ impl Family for Ernie55 {
             body.set_xstream(gpu, XMode::Off)?;
             let word = body.xstream_word();
             return Ok(Some(format!(
-                "xstream={word} (unset: the body streams no host expert, a prompt unit never passes \
-                 through a hosted layer)"
+                "xstream={word} (unset: the body streams no host expert; a prompt unit's host picks \
+                 are served through the host tier's batch port)"
             )));
         }
         Ok(Some(xstream_rule(
@@ -124,8 +125,7 @@ impl Family for Ernie55 {
         )?))
     }
 
-    /// The rows of the prompt pass the load holds (`Body::pass_rows`), none where the plan hosts
-    /// experts and the prompt steps.
+    /// The rows of the prompt pass the load holds (`Body::pass_rows`).
     fn pass_rows(m: &GpuModel<Body>) -> Result<Option<usize>, GateError> {
         Ok(m.body(NAME)?.pass_rows())
     }

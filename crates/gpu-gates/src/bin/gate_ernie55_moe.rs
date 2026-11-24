@@ -1506,17 +1506,15 @@ mod gate {
             rel32(&split_out, &f64s(&steps.out)),
             SPLIT_BAND,
         ));
-        // The unit, split.
-        let mut lat_u = dev.zeroed(TOKENS * LATENT)?;
+        // The unit, split: the latent rows are the buffers' own, where the batch port's download reads them.
         moe_c.enqueue_front_rows(
             (&dev.gpu, &w_card, &cx_c, &dev.gemm),
             &mut bufs_c,
             LAYER,
             TOKENS,
             &x_unit,
-            &mut lat_u,
         )?;
-        let lat_all = dev.read(&lat_u)?;
+        let lat_all = dev.read(bufs_c.lat())?;
         let (ids_u2, w_u2) = bufs_c.picks_rows((dev.stream(), TOKENS))?;
         let lists: Vec<Vec<(u32, f32)>> = (0..TOKENS)
             .map(|t| {
@@ -1546,7 +1544,6 @@ mod gate {
             LAYER,
             TOKENS,
             &x_unit,
-            &lat_u,
             (&sel_u, n_card),
         )?;
         let mut out_su = dev.zeroed(TOKENS * HIDDEN)?;

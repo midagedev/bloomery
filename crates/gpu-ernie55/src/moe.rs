@@ -560,6 +560,13 @@ impl MoeBufs {
         ))
     }
 
+    /// The latent rows the last front or prompt wrote: the experts' input, up to the buffers'
+    /// rows of the latent's width, token-major.
+    #[must_use]
+    pub fn lat(&self) -> &DeviceBuffer<f32> {
+        &self.lat
+    }
+
     /// The last step's router output read back: router 0's logits, router 1's, the summed scores
     /// (each [`split::N_EXPERT`]; a gate's instrument, it synchronizes the stream).
     pub fn scores(&self, stream: &CudaStream) -> Result<RouterRead, GpuError> {
@@ -1316,12 +1323,9 @@ impl Moe {
 
     /// The front of layer `l` over the `m` rows of `x`, a layer with a host share: the router
     /// over the rows into the buffers' `probs`, `logits`, `ids` and `weights`, and the latent
-    /// down into `lat` (`m` rows, the rows a batch's download hands the host). The caller runs the
-    /// places and the download between this and [`Moe::enqueue_shadow_rows`].
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the card, weights, the two contexts, the buffers, the layer, the rows, the input and the latent rows"
-    )]
+    /// down into the buffers' `lat` ([`MoeBufs::lat`]: `m` rows, the rows a prompt batch's
+    /// download hands the host and the card's slots read). The caller runs the places and the
+    /// download between this and [`Moe::enqueue_shadow_rows`].
     pub fn enqueue_front_rows(
         &self,
         (gpu, w, cx, gemm): (&Gpu, &Weights, &GqaCx<'_>, &GemmKernels),
@@ -1329,27 +1333,17 @@ impl Moe {
         l: usize,
         m: usize,
         x: &DeviceBuffer<f32>,
-        lat: &mut DeviceBuffer<f32>,
     ) -> Result<(), GpuError> {
         let r = layer(&self.layers, l)?;
         check_rows((bufs.rows, self.dims.hidden), m, x)?;
         bufs.unit_route = true;
         let dims = &self.dims;
-        if lat.len() < m * dims.latent {
-            return Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "layer {l}: {m} latent rows of {} values into a buffer of {}",
-                    dims.latent,
-                    lat.len()
-                ),
-            ));
-        }
         let MoeBufs {
             probs,
             logits,
             ids,
             weights,
+            lat,
             wide,
             dense,
             ..
@@ -1373,12 +1367,8 @@ impl Moe {
     }
 
     /// [`Moe::enqueue_shadow`] over the `m` rows: the shared expert into the buffers' `shared`
-    /// rows, the card's slots one run over the latent rows `lat` at the places `sel` (`m · 10`
-    /// places), the buffers' `weights` the sum's. Whether the card's slots ran.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the card, weights, the two contexts, the buffers, the layer, the rows, the input, the latent rows and the places"
-    )]
+    /// rows, the card's slots one run over the buffers' latent rows at the places `sel`
+    /// (`m · 10` places), the buffers' `weights` the sum's. Whether the card's slots ran.
     pub fn enqueue_shadow_rows(
         &self,
         (gpu, w, cx, gemm): (&Gpu, &Weights, &GqaCx<'_>, &GemmKernels),
@@ -1386,7 +1376,6 @@ impl Moe {
         l: usize,
         m: usize,
         x: &DeviceBuffer<f32>,
-        lat: &DeviceBuffer<f32>,
         (sel, n_card): (&DeviceBuffer<u32>, usize),
     ) -> Result<bool, GpuError> {
         let r = layer(&self.layers, l)?;
@@ -1399,6 +1388,7 @@ impl Moe {
             act,
             shared,
             leg,
+            lat,
             routed,
             wide,
             dense,

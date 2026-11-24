@@ -16,6 +16,14 @@
 //!   sum is linear in the experts' rows), the latent up and the shared expert
 //!   ([`RoutedFfn::enqueue_back`]), then the post.
 //!
+//! A prompt unit of the pass runs the same three parts around the host tier's batch port
+//! ([`walk_pass`], the common schedule's walk `(1, m, Batch)`): the front ends in the places of
+//! the unit's slots and the download of its latent rows, ids and weights; the shadow is the shared
+//! expert and the card's slots over the unit's rows under the tier's one union call, which reads
+//! each distinct host expert once for every row that picked it; the back adds the uploaded sums
+//! row by row. The buffers the batch leg needs beside the placed side are [`HostedPass`]'s,
+//! counted by the plan's prompt reserve.
+//!
 //! [`RoutedFfn::enqueue_front`]: crate::body::RoutedFfn::enqueue_front
 //! [`RoutedFfn::enqueue_shadow`]: crate::body::RoutedFfn::enqueue_shadow
 //! [`RoutedFfn::enqueue_back`]: crate::body::RoutedFfn::enqueue_back
@@ -23,17 +31,18 @@
 use std::sync::Arc;
 
 use bloomery_gpu::folder::Model;
-use bloomery_gpu::host::StepLeg;
 use bloomery_gpu::host::placed::{PlacedHost, PlacedSide, SideShape};
 use bloomery_gpu::host::run::{HostRun, HostWidths};
 use bloomery_gpu::host::shell::TierShell;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::host::swap_source::{ResidencySpec, hosted_stacks};
+use bloomery_gpu::host::{BatchLeg, StepLeg};
 use bloomery_gpu::hybrid::{Hybrid, SlotMap};
 use bloomery_gpu::model::{HostServed, hosted_hybrid_at, refuse_reserve_past, stage_run};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use bloomery_levers::HostCfg;
+use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::ernie55::names::Sub;
 use model::arch::ernie55::place::{PROMPT_ROWS, PlanInputs};
 use model::placement::{KvBytes, Machine, Plan, PlanLevers};
@@ -45,6 +54,9 @@ use crate::step;
 
 /// What the placed load's refusals name.
 const PLACED: &str = "ernie55 placed load";
+
+/// What the pass's walk's refusals name.
+const PASS: &str = "ernie55 placed pass";
 
 /// The step's walk: one row through the host tier's step port.
 const STEP_WALK: Overlap = Overlap {
@@ -58,6 +70,47 @@ pub(crate) const LOAD_ROWS: usize = 1;
 
 /// The rows a prompt unit of the pass asks the parts for: one HCA compression block.
 pub const PASS_ROWS: usize = 128;
+
+/// The hosted prompt pass's buffers beside the placed side: the host's sums of a unit's rows (the
+/// latent's width a row, where the batch leg's upload lands them) and the places of a unit's
+/// routed slots in the card's stacks, or the host mark. The plan's prompt reserve counts them
+/// (`model::arch::ernie55::place::PassTerms::placed`).
+pub(crate) struct HostedPass {
+    hsum: DeviceBuffer<f32>,
+    sel: DeviceBuffer<u32>,
+}
+
+impl HostedPass {
+    /// The values of the two buffers of units of up to `rows` rows of `latent` values routing
+    /// `n_used` slots a row: the host's sums, then the places.
+    fn lens_at((rows, latent, n_used): (usize, usize, usize)) -> (usize, usize) {
+        (rows * latent, rows * n_used)
+    }
+
+    /// The device bytes [`HostedPass::lens_at`] makes, four bytes a value: the plan's reserve's
+    /// term for the buffers (`model::arch::ernie55::place::PassTerms::placed`), which a test holds
+    /// to it.
+    #[cfg(test)]
+    pub(crate) fn bytes_at(shape: (usize, usize, usize)) -> usize {
+        let (hsum, sel) = Self::lens_at(shape);
+        4 * (hsum + sel)
+    }
+
+    /// The buffers for units of up to `rows` rows of `latent` values routing `n_used` slots a
+    /// row. Load-time only.
+    fn new(stream: &CudaStream, shape: (usize, usize, usize)) -> Result<HostedPass, GpuError> {
+        let (hsum, sel) = Self::lens_at(shape);
+        Ok(HostedPass {
+            hsum: DeviceBuffer::zeroed(stream, hsum)?,
+            sel: DeviceBuffer::zeroed(stream, sel)?,
+        })
+    }
+
+    /// The device bytes the buffers hold: the plan's reserve's term for them.
+    pub(crate) fn bytes(&self) -> usize {
+        self.hsum.num_bytes() + self.sel.num_bytes()
+    }
+}
 
 impl Body {
     /// The plan of `inputs`' file on `machine` at `ctx` positions under `levers`: the common hybrid
@@ -79,7 +132,8 @@ impl Body {
     }
 
     /// Whether `plan` hosts experts of any routed layer of `inputs`' file: a load of it has a
-    /// host tier and steps its prompt.
+    /// host tier, which the step serves through its step port and the prompt pass through its
+    /// batch port.
     #[must_use]
     pub fn plan_hosts(plan: &Plan<'_>, inputs: &PlanInputs) -> bool {
         let n_expert = inputs.hp.experts.n_expert as u64;
@@ -91,12 +145,14 @@ impl Body {
     /// Card `card` of `plan`, which `inputs` made from `file`'s header, resident: every layer's
     /// dense part, each routed layer's card share of its stacks and the parts' caches at the
     /// plan's context, the host tier over the layers the plan hosts experts of; a prompt pass of
-    /// `rows` rows a unit when `rows` is `Some` ([`crate::pass`]). Under `residency` the common
-    /// machine runs over the card's routed stacks. A folder's card tensors are read through its
-    /// part source ([`Model::Folder`]). Refused by name: a plan of another layer count or of more
-    /// than one stage card ([`stage_run`]), an expert tier card, a routed run with a gap, a
-    /// layer whose card stacks are not its card count's, parts whose caches are not the plan's
-    /// bytes ([`crate::rooms::check`]).
+    /// `rows` rows a unit when `rows` is `Some` ([`crate::pass`]), over the host tier's batch
+    /// port where the plan hosts experts. Under `residency` the common machine runs over the
+    /// card's routed stacks. A folder's card tensors are read through its part source
+    /// ([`Model::Folder`]). Refused by name: a plan of another layer count or of more than one
+    /// stage card ([`stage_run`]), an expert tier card, a routed run with a gap, a unit of no
+    /// rows or of more than [`PROMPT_ROWS`], a layer whose card stacks are not its card count's,
+    /// parts whose caches are not the plan's bytes ([`crate::rooms::check`]) or whose buffers
+    /// with the hosted pass's pass the plan's prompt reserve.
     pub fn open_placed(
         file: impl Into<Model>,
         (plan, inputs): (&Plan<'_>, &PlanInputs),
@@ -152,15 +208,6 @@ impl Body {
                 let unit = rows.unwrap_or(1);
                 let parts = crate::parts::load(gpu, file, w, hp, (ctx, unit))?;
                 crate::rooms::check(&parts, hp, planned)?;
-                refuse_reserve_past(
-                    PLACED,
-                    "prompt pass buffers",
-                    reserve,
-                    crate::rooms::beside_stores(&parts)?,
-                    "the walk's streams and the dense lead's blocks, the mixers' chains, flash partials, \
-                     staging, words and score rows, the routed block's rows, card leg and forms, the \
-                     head's row",
-                )?;
                 let mut body = Body::new(gpu, hp, ctx, parts)?;
                 let map = SlotMap::of_plan(plan, card, None, run.clone(), hp.experts.n_expert)?;
                 let shape = SideShape {
@@ -180,17 +227,23 @@ impl Body {
                         moe.check_card_stacks(w, l, on_card)
                     })?;
                 let hosted_set = side.hosted_set();
-                if !hosted_set.is_empty() && rows.is_some() {
-                    return Err(GpuError::shape(
-                        PLACED,
-                        format!(
-                            "a prompt pass over a plan that hosts experts of {} layers: the \
-                             routed block's host share over a unit's rows is not built, so the \
-                             load steps its prompt (open it with no pass)",
-                            hosted_set.len()
-                        ),
-                    ));
-                }
+                let hosted = match rows {
+                    Some(rows) if !hosted_set.is_empty() => Some(HostedPass::new(
+                        gpu.stream(),
+                        (rows, hp.latent, hp.experts.n_used),
+                    )?),
+                    _ => None,
+                };
+                refuse_reserve_past(
+                    PLACED,
+                    "prompt pass buffers",
+                    reserve,
+                    crate::rooms::beside_stores(&body.parts)?
+                        + hosted.as_ref().map_or(0, HostedPass::bytes) as u64,
+                    "the walk's streams and the dense lead's blocks, the mixers' chains, flash \
+                     partials, staging, words and score rows, the routed block's rows, card leg and \
+                     forms, the head's row, the hosted pass's host sums and the slots' places",
+                )?;
                 if !hosted_set.is_empty() {
                     // Ten slots a token have a handoff entry of their own (`HandoffSlots::Ten`), so this builds no sink;
                     // a count with no entry gets the any-count tier sink.
@@ -215,7 +268,13 @@ impl Body {
                         TierShell::new(hybrid, glue, hp.n_embd, PLACED),
                         side,
                     )?;
-                    placed.prepare_step_union()?;
+                    if let Some(rows) = rows {
+                        // The batch sets and union slabs for the pass's rows, which also serve the
+                        // step's one column.
+                        placed.prepare_pass_rows(gpu, rows)?;
+                    } else {
+                        placed.prepare_step_union()?;
+                    }
                     placed.start_residency(gpu)?;
                     body.placed = Some(placed);
                 } else if residency != Residency::Off {
@@ -228,6 +287,7 @@ impl Body {
                 if rows.is_some() {
                     body.pass = Some(body.parts.rows());
                 }
+                body.hosted = hosted;
                 Ok(body)
             },
         )
@@ -360,5 +420,165 @@ impl<'a> LayerProgram for StepWalk<'a> {
             return Ok(());
         }
         back((self.cx, self.card), self.body, leg.hybrid(), l)
+    }
+}
+
+/// A hosted layer's front from the feed-forward norm on over a unit's `m` rows: the router and
+/// the latent down into the buffers' latent rows, the picks tapped, the places of the unit's
+/// slots ([`PlacedSide::places_rows`]) and the download of the latent rows, weights and ids
+/// ([`PlacedSide::download_rows`]).
+fn front_rows(
+    cx: Cx<'_>,
+    body: &mut Body,
+    side: &PlacedSide,
+    (sel, m): (&mut DeviceBuffer<u32>, usize),
+    port: &mut BatchLeg<'_, HostRun>,
+    l: usize,
+) -> Result<(), GpuError> {
+    {
+        let Body { parts, .. } = &mut *body;
+        let x = parts.trunk.normed();
+        parts.moe.enqueue_front_rows(cx, l, m, x)?;
+    }
+    tap_picks(cx.gpu, body, l, m)?;
+    let moe = &body.parts.moe;
+    let (ids, weights) = moe.route();
+    side.places_rows(cx.gpu, l, (ids, m), sel)?;
+    side.download_rows(
+        port,
+        At { unit: 0, layer: l },
+        (moe.latent_rows(), weights, ids),
+        &[],
+    )
+}
+
+/// A hosted layer's card work under the host's union, over a unit's `m` rows: the shared expert
+/// and the card's slots over the latent rows at the unit's places. Whether the card's slots ran.
+fn shadow_rows(
+    cx: Cx<'_>,
+    body: &mut Body,
+    side: &PlacedSide,
+    sel: &DeviceBuffer<u32>,
+    (l, m): (usize, usize),
+) -> Result<bool, GpuError> {
+    let Body { parts, .. } = body;
+    let x = parts.trunk.normed();
+    parts
+        .moe
+        .enqueue_shadow_rows(cx, l, m, x, (sel, side.n_card(l)))
+}
+
+/// A hosted layer's back from the upload on, over a unit's `m` rows: the card's and the host's
+/// sums row by row through the block's tail into `y`, then the post.
+fn back_rows(
+    (cx, card): (Cx<'_>, bool),
+    body: &mut Body,
+    hsum: &DeviceBuffer<f32>,
+    (l, m): (usize, usize),
+) -> Result<(), GpuError> {
+    {
+        let Body { parts, y, .. } = &mut *body;
+        parts
+            .moe
+            .enqueue_back_rows(cx, l, m, (card, Some(hsum)), y)?;
+    }
+    step::close(cx.gpu, cx.w, body, l, m)
+}
+
+/// The prompt pass's walk `(1, m, Batch)`: one unit of `m` rows through the host tier's batch
+/// port.
+struct PassWalk<'a> {
+    cx: Cx<'a>,
+    body: &'a mut Body,
+    side: &'a PlacedSide,
+    /// The places of the unit's routed slots.
+    sel: &'a mut DeviceBuffer<u32>,
+    /// The unit's first position and its rows.
+    at: (u32, usize),
+    /// Whether the hosted layer's card slots ran, from its shadow to its back.
+    card: bool,
+}
+
+/// One unit of the prompt pass over every layer of `body`, its `m` rows (the embedding already in
+/// the streams) at positions `at ..`, through `placed`'s batch port. The hosted pass's buffers
+/// ([`HostedPass`]) leave `body` for the walk and return whatever it returned.
+pub(crate) fn walk_pass(
+    (gpu, w): (&Gpu, &Weights),
+    body: &mut Body,
+    placed: &mut PlacedHost,
+    (m, at): (usize, u32),
+) -> Result<(), GpuError> {
+    let n = body.sh.n_layer;
+    let rows = body.pass.ok_or(GpuError::State {
+        what: PASS,
+        missing: "the load's prompt pass",
+    })?;
+    let mut hosted = body.hosted.take().ok_or(GpuError::State {
+        what: PASS,
+        missing: "the hosted pass's buffers (a load opened with the pass over a plan that hosts \
+                  experts)",
+    })?;
+    let PlacedHost { shell, side, .. } = placed;
+    let walked = {
+        let mut leg = BatchLeg::new(gpu.stream(), &mut shell.hybrid, &mut hosted.hsum, rows);
+        let mut prog = PassWalk {
+            cx: Cx { gpu, w },
+            body,
+            side,
+            sel: &mut hosted.sel,
+            at: (at, m),
+            card: false,
+        };
+        sched::walk(
+            Overlap {
+                units: 1,
+                cols: m,
+                port: PortKind::Batch,
+            },
+            n,
+            &mut leg,
+            &mut prog,
+        )
+    };
+    body.hosted = Some(hosted);
+    walked
+}
+
+impl<'a> LayerProgram for PassWalk<'a> {
+    type Port = BatchLeg<'a, HostRun>;
+
+    fn host_leg(&self, at: At) -> bool {
+        self.side.hosted(at.layer)
+    }
+
+    /// A layer with no host share whole over the unit's rows; a hosted one up to its download.
+    fn front(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let (l, (pos0, m)) = (at.layer, self.at);
+        step::attn(self.cx.gpu, self.cx.w, self.body, l, Run::Prompt(pos0, m))?;
+        if !self.side.hosted(l) {
+            step::ffn_whole(self.cx.gpu, self.cx.w, self.body, l, m)?;
+            return step::close(self.cx.gpu, self.cx.w, self.body, l, m);
+        }
+        self.body.parts.trunk.enqueue_pre(self.cx, l, Sub::Ffn)?;
+        front_rows(self.cx, self.body, self.side, (&mut *self.sel, m), port, l)
+    }
+
+    /// The shared expert and the card's slots of a hosted layer, under the host's union.
+    fn shadow(&mut self, _port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        if !self.side.hosted(at.layer) {
+            return Ok(());
+        }
+        let (_, m) = self.at;
+        self.card = shadow_rows(self.cx, self.body, self.side, self.sel, (at.layer, m))?;
+        Ok(())
+    }
+
+    /// A hosted layer from the upload on, then its post.
+    fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        if !self.side.hosted(at.layer) {
+            return Ok(());
+        }
+        let (_, m) = self.at;
+        back_rows((self.cx, self.card), self.body, port.hsum(), (at.layer, m))
     }
 }

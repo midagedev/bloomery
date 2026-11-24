@@ -627,6 +627,42 @@ pub fn q8_0_within_band(source: &[u8], written: &[u8], ne0: usize) -> f32 {
     worst
 }
 
+/// `a` and `b` the same bytes, else a panic naming the first offset they differ at and the two bytes there: never
+/// the vectors, which a whole expert stack makes a gigabyte of.
+pub fn assert_same_bytes(a: &[u8], b: &[u8], what: impl std::fmt::Display) {
+    if a.len() != b.len() {
+        panic!("{what}: {} bytes against {}", a.len(), b.len());
+    }
+    match a.iter().zip(b).position(|(x, y)| x != y) {
+        None => {}
+        Some(at) => panic!(
+            "{what}: byte {at} of {} is {:#04x}, the other's {:#04x}",
+            a.len(),
+            a[at],
+            b[at]
+        ),
+    }
+}
+
+/// [`assert_same_bytes`] of f32 rows, by `==` as the vectors were compared (`0` is `-0`): the first value that differs and
+/// the two values, with their bits.
+pub fn assert_same_f32s(a: &[f32], b: &[f32], what: impl std::fmt::Display) {
+    if a.len() != b.len() {
+        panic!("{what}: {} values against {}", a.len(), b.len());
+    }
+    match a.iter().zip(b).position(|(x, y)| x != y) {
+        None => {}
+        Some(at) => panic!(
+            "{what}: value {at} of {} is {} ({:#010x}), the other's {} ({:#010x})",
+            a.len(),
+            a[at],
+            a[at].to_bits(),
+            b[at],
+            b[at].to_bits()
+        ),
+    }
+}
+
 /// The header facts the description reads of `split`: the hparams field by field (`Hparams`' `Debug` spelling), then
 /// every tensor's name and dims, sorted (the reader holds names and dims to the keys; a tensor's type is the
 /// quantizer's); a text two files are compared by.

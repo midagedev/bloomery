@@ -12,10 +12,11 @@
 //!   the pass's units (`bloomery_gpu_ernie55::prompt`), the steps as the captured chain;
 //! - `hosted`: the same card under a card-experts cap of half the routed experts, so every routed
 //!   layer serves the rest of its picks from the common host tier (the card leg's front, shadow
-//!   and back around the tier's go and wait): the prompt steps. It opens the cut's GGUF, the file
-//!   `bloomery-quantize` writes of the folder, named by [`HOSTED_GGUF`]: the folder's MXFP4
-//!   expert stacks are made at load, so no load from the folder splits a stack between the card
-//!   and the host. Without the argument the arm is refused by one printed line
+//!   and back around the tier's go and wait in a step, around the tier's batch port in the pass:
+//!   a prompt unit's rows at once, each distinct host expert read once). It opens the cut's GGUF,
+//!   the file `bloomery-quantize` writes of the folder, named by [`HOSTED_GGUF`]: the folder's
+//!   MXFP4 expert stacks are made at load, so no load from the folder splits a stack between the
+//!   card and the host. Without the argument the arm is refused by one printed line
 //!   ([`HOSTED_REFUSED`]), and the gate's verdict is the card arm's;
 //! - `hosted-mid` (the hosted arm's file, opened again once the `hosted` arm is closed): the
 //!   residency a server runs by default ([`RESIDENT`], `mid-p0-s1`) over the same hosted load.
@@ -27,11 +28,11 @@
 //! For each set and arm, against the writer's rows at the prompt's last positions:
 //!
 //! - `layer_outputs_are_reference`: each layer's four streams after it (`l_out-L`, the last four
-//!   rows, the last one on a stepped prompt) within [`L_OUT_BAND`] by relative L2.
-//! - `stepped_layer_outputs_are_reference` (an arm whose prompt runs as the pass, the card arm):
-//!   the prompt fed again one id a step from a reset, the last step's four streams after each
-//!   layer within [`L_OUT_BAND`] of the writer's last row, so the whole-card step chain is held
-//!   layer by layer and not by the teacher-forced argmax alone.
+//!   rows) within [`L_OUT_BAND`] by relative L2.
+//! - `stepped_layer_outputs_are_reference` (every arm's prompt runs as the pass): the prompt fed
+//!   again one id a step from a reset, the last step's four streams after each layer within
+//!   [`L_OUT_BAND`] of the writer's last row, so each arm's step chain, the whole-card one and the
+//!   hosted ones, is held layer by layer and not by the teacher-forced argmax alone.
 //! - `picks_are_reference`: each routed layer's picks at those rows are the writer's ids
 //!   (`ffn_moe_topk-L`) as a set, exactly, and their weights by id within [`WEIGHTS_BAND`] of
 //!   `ffn_moe_weights-L` (renormalized, times the learned scale).
@@ -47,6 +48,10 @@
 //!
 //! and the clauses that need no reference:
 //!
+//! - `prompt_runs_as_a_pass` (`hosted`, `hosted-mid`): after a prompt, the host tier's batch port
+//!   served one layer-batch a hosted layer a unit ([`PASS_ROWS`] rows a unit), over the prompt's
+//!   rows, listing host slots, and the step port served nothing of it: the prompt ran as the pass
+//!   over the batch port, and did not step.
 //! - `residency_reads_promoted_experts` (`hosted-mid`): the reseed promoted at least one expert in
 //!   every routed layer (on the host before and on the card after, the card's copy of the slot map
 //!   read back each time), and the writer's picks at `short`'s last row include at least one
@@ -108,6 +113,7 @@ mod gate {
     use crate::{folder, gate_card};
     use bloomery_gpu::GpuModel;
     use bloomery_gpu::folder::Model;
+    use bloomery_gpu::host::HybridStats;
     use bloomery_gpu::host::served::TierBody;
     use bloomery_gpu::host::slots::HOST;
     use bloomery_gpu::host::swap::{CardTable, Residency};
@@ -170,14 +176,13 @@ mod gate {
     /// The reference clauses of an arm: four a set, and `long`'s selection.
     const FX_ARM: usize = 4 * SETS.len() + 1;
 
-    /// The reference clauses of the card arm: [`FX_ARM`] and the stepped layer outputs a set, the
-    /// card arm's prompt running as the pass. The hosted arm, where it opens, adds [`FX_ARM`] and
-    /// [`FX_RESIDENT`].
-    const FX_CARD: usize = FX_ARM + SETS.len();
+    /// The reference clauses of the card arm and of the hosted arm, each: [`FX_ARM`] and the
+    /// stepped layer outputs a set, every arm's prompt running as the pass.
+    const FX_ARM_STEPPED: usize = FX_ARM + SETS.len();
 
-    /// The reference clauses of the `hosted-mid` arm: `short`'s four (its prompt steps and it
-    /// dumps no selection).
-    const FX_RESIDENT: usize = 4;
+    /// The reference clauses of the `hosted-mid` arm: `short`'s four (it dumps no selection) and
+    /// its stepped layer outputs.
+    const FX_RESIDENT: usize = 4 + 1;
 
     /// The residency a server runs by default: no pinned expert, one spare slot a routed layer.
     const RESIDENT: Residency = Residency::Mid {
@@ -304,8 +309,8 @@ mod gate {
 
     /// The fixture cut opened on the card in view, from `gguf` where given and else from the cut
     /// folder, under a card-experts cap of half the routed experts where `capped` and the
-    /// residency `residency`: the plan, whether it hosts experts, and the model (with the pass
-    /// where the card holds every expert).
+    /// residency `residency`: the plan, whether it hosts experts, and the model with the prompt
+    /// pass (over the host tier's batch port where the plan hosts experts).
     fn open_arm(
         name: &'static str,
         capped: bool,
@@ -335,12 +340,17 @@ mod gate {
         let machine = workstation::plan_on(gate_card::room()?, hp.n_layer);
         let plan = Body::plan(&inputs, &machine, CTX as u64, &levers)?;
         let hosts = Body::plan_hosts(&plan, &inputs);
-        let rows = (!hosts).then_some(PASS_ROWS);
         let host = HostCfg {
             populate: residency != Residency::Off,
             ..HOST_CFG
         };
-        let m = Body::open_placed(model, (&plan, &inputs), 0, host, (rows, residency))?;
+        let m = Body::open_placed(
+            model,
+            (&plan, &inputs),
+            0,
+            host,
+            (Some(PASS_ROWS), residency),
+        )?;
         Ok((Arm { name, m }, hosts))
     }
 
@@ -383,9 +393,9 @@ mod gate {
         Ok(ok)
     }
 
-    /// Clause `stepped_layer_outputs_are_reference` on an arm whose prompt runs as the pass: the
-    /// prompt fed one id a step from a reset, the last step's layer outputs against the writer's
-    /// last row ([`layer_outputs`]).
+    /// Clause `stepped_layer_outputs_are_reference`, on every arm (each prompt runs as the pass):
+    /// the prompt fed one id a step from a reset, the last step's layer outputs against the
+    /// writer's last row ([`layer_outputs`]): the arm's step chain, whole-card or hosted.
     fn stepped_layer_outputs(arm: &mut Arm, s: &Set) -> Result<bool, GateError> {
         arm.m.reset()?;
         arm.m.step(&s.prompt)?;
@@ -571,17 +581,71 @@ mod gate {
         )
     }
 
+    /// The host tier's service counters since load ([`HybridStats`]) of an arm whose plan hosts
+    /// experts, read back before a prompt; `None` on an arm with no host tier.
+    fn host_stats(m: &mut GpuModel<Body>) -> Result<Option<HybridStats>, GateError> {
+        let body = m.body(NAME)?;
+        Ok((!body.hosted().is_empty()).then(|| body.hybrid().stats()))
+    }
+
+    /// Clause `prompt_runs_as_a_pass` of an arm whose plan hosts `hosted` routed layers, between
+    /// the counters `before` the prompt and `after` it: the batch port served one layer-batch a
+    /// hosted layer a unit of [`PASS_ROWS`] rows, over the prompt's `rows`, listing host slots,
+    /// and the step port served nothing of it. The pass ran over the batch port, and did not step.
+    fn prompt_runs_as_a_pass(
+        arm: &str,
+        s: &Set,
+        before: &HybridStats,
+        after: &HybridStats,
+        hosted: usize,
+    ) -> bool {
+        let rows = s.prompt.len();
+        let units = rows.div_ceil(PASS_ROWS);
+        let served = after.batch_served - before.batch_served;
+        let cols = after.batch_cols - before.batch_cols;
+        let slots = after.batch_host_slots - before.batch_host_slots;
+        let steps = after.served - before.served;
+        let pass = hosted > 0
+            && served == (units * hosted) as u64
+            && cols == (rows * hosted) as u64
+            && slots > 0
+            && steps == 0;
+        println!(
+            "prompt_runs_as_a_pass set={} arm={arm} rows={rows} units={units} hosted_layers={hosted} \
+             batch_served={served} batch_cols={cols} batch_host_slots={slots} step_served={steps} {}",
+            s.name,
+            verdict(pass)
+        );
+        pass
+    }
+
+    /// [`prompt_runs_as_a_pass`] on `arm` where its plan hosts experts and `tier` runs the
+    /// clause; `true` elsewhere.
+    fn pass_served(arm: &mut Arm, s: &Set, before: Option<HybridStats>) -> Result<bool, GateError> {
+        let hosted = arm.m.body(NAME)?.hosted().len();
+        let clause = format!("prompt_runs_as_a_pass set={} arm={}", s.name, arm.name);
+        let Some(before) = before else {
+            return Ok(true);
+        };
+        if !tier::run_clause(&clause, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let after = host_stats(&mut arm.m)?.ok_or("the arm's host tier is gone")?;
+        Ok(prompt_runs_as_a_pass(arm.name, s, &before, &after, hosted))
+    }
+
     /// The reference clauses of set `s` on `arm`, in the order their state needs: the prompt from
-    /// a reset and its taps, the stepped prompt from a reset on an arm with a pass, then the
-    /// forced argmax from a reset.
+    /// a reset and its taps (and, where the plan hosts experts, the pass it ran as), the stepped
+    /// prompt from a reset, then the forced argmax from a reset.
     fn reference_clauses(arm: &mut Arm, s: &Set) -> Result<bool, GateError> {
         let a = arm.name;
         arm.m.reset()?;
+        let before = host_stats(&mut arm.m)?;
         feed(&mut arm.m, &s.prompt)?;
+        let mut ok = pass_served(arm, s, before)?;
         let t = taps(&mut arm.m)?;
         let logits = arm.m.logits()?;
         let k = arm.m.body(NAME)?.shape().n_used;
-        let mut ok = true;
         if runs("layer_outputs_are_reference", s, a)? {
             ok &= layer_outputs(a, s, &t)?;
         }
@@ -759,8 +823,10 @@ mod gate {
     fn resident_clauses(arm: &mut Arm, s: &Set) -> Result<bool, GateError> {
         let a = arm.name;
         arm.m.reset()?;
+        let before = host_stats(&mut arm.m)?;
         feed(&mut arm.m, &s.prompt)?;
         let first = taps(&mut arm.m)?;
+        let passed = pass_served(arm, s, before)?;
         let k = arm.m.body(NAME)?.shape().n_used;
         let (layers, n_expert) = {
             let (_, _, body) = arm.m.body_parts(NAME)?;
@@ -780,7 +846,7 @@ mod gate {
             .residency_reseed(&order)?
             .ok_or("the load reseeded no residency machine")?;
         let after = card_table(&mut arm.m)?;
-        let mut ok = true;
+        let mut ok = passed;
         let clause = format!("residency_reads_promoted_experts set={} arm={a}", s.name);
         if tier::run_clause(&clause, Tag::SelfConsistency)? {
             for (i, l) in layers.enumerate() {
@@ -942,7 +1008,11 @@ mod gate {
         }
         tier::expect_fixture_oracle(
             NAME,
-            FX_CARD + gguf.as_ref().map_or(0, |_| FX_ARM + FX_RESIDENT),
+            if gguf.is_some() {
+                2 * FX_ARM_STEPPED + FX_RESIDENT
+            } else {
+                FX_ARM_STEPPED
+            },
         )?;
         ok &= graph_is_eager(&mut card.m, &sets[0])?;
         println!("{}", tier::tally_line());
