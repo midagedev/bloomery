@@ -160,7 +160,7 @@ fn node_nvme_host_run(
                 uuid: census[0].uuid,
             }),
             card: 0,
-            rows: NodeOpen::rows_of(&source, &file, 0).unwrap(),
+            rows: NodeOpen::rows_of(&source, &file, 0, false).unwrap(),
             set: set.clone(),
             shape,
             cols: 2,

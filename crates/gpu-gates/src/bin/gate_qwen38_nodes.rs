@@ -680,7 +680,7 @@ mod gate {
             name: t.name,
             device: t.device,
             card: t.card,
-            rows: NodeOpen::rows_of(plan, file, t.card)?,
+            rows: NodeOpen::rows_of(plan, file, t.card, false)?,
             set: TierSet::of_map(&map, 0)?,
             shape: TierShape {
                 hidden: 1,

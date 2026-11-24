@@ -57,6 +57,7 @@ use gguf::Split;
 use gguf::digest::sha256_hex_of;
 use model::ops::DEFER_MAX_COLS;
 use model::placement::devices::{DeviceId, DeviceInfo, spec_of_device};
+use model::placement::host_lock::PageDrop;
 use model::placement::workstation::{self, ArenaGrant, CardSpec, HostRead};
 use model::placement::{
     Device, ExpertList, Format, ModelTensor, ModelTensors, Plan, Role, Row, Segment,
@@ -69,13 +70,13 @@ use super::slots::HOST;
 use super::step::GO_DEADLINE;
 use super::tier::{
     BlockRows, ReplyRows, TIER_GRACE, TierAct, TierBlock, TierCard, TierExperts, TierLayout,
-    TierSet, TierShape, TierWork,
+    TierOpen, TierSet, TierShape, TierWork,
 };
 use crate::fault::{FAULT_NONE, Fault};
 use crate::model::CardBytes;
 use crate::tensor::TIER_ACT_MAX_COLS;
 use crate::upload::bytes_of;
-use crate::weights::{SegmentFile, Weights};
+use crate::weights::{SegmentFile, Weights, segment_ranges};
 use crate::words::WordOps;
 use crate::{Gpu, GpuError, Q8Act};
 use block::{BlockRequest, NodeBlock};
@@ -327,6 +328,26 @@ fn segment_sha256(
     Ok(sha256_hex_of(
         std::iter::once(header.as_bytes()).chain(f.bytes),
     ))
+}
+
+/// [`segment_sha256`] of a row node 0 sends, each whole page of the segment's
+/// spans then released through `pages` when given ([`NodeOpen::rows_of`]).
+fn released_sha256(
+    file: &Split,
+    experts: u64,
+    t: &ModelTensor,
+    seg: &Segment,
+    pages: Option<&mut PageDrop<'_>>,
+) -> Result<String, GpuError> {
+    let sha256 = segment_sha256(file, experts, t, seg)?;
+    if let Some(pages) = pages {
+        for (shard, at) in segment_ranges(file, experts, t, seg)? {
+            pages
+                .release(shard, at)
+                .map_err(|e| GpuError::plan(WHAT, e))?;
+        }
+    }
+    Ok(sha256)
 }
 
 /// What a tier node opens its tier from ([`TierNode::open`]): the family
@@ -598,11 +619,35 @@ impl NodeOpen {
 
     /// The segments `plan` puts on its card `card`, each with its tensor's
     /// name and file identity and the sha256 of its header and bytes in `file`, the
-    /// model file the plan was made from.
-    pub fn rows_of(plan: &Plan<'_>, file: &Split, card: usize) -> Result<Vec<NodeRow>, GpuError> {
+    /// model file the plan was made from. With `release` (a tier on a node, in a load
+    /// that drops its card segments' pages, `BLOOMERY_CARD_DONTNEED`), each segment's
+    /// whole pages leave this process's mappings and the page cache once hashed
+    /// ([`PageDrop`]): this process reads a node's rows no more, so the digest holds
+    /// one segment in the page cache, as the card upload does, and does not evict the
+    /// host set the load populated before it.
+    pub fn rows_of(
+        plan: &Plan<'_>,
+        file: &Split,
+        card: usize,
+        release: bool,
+    ) -> Result<Vec<NodeRow>, GpuError> {
+        let mut pages = release.then(|| PageDrop::new(file));
         Self::rows_by(plan, card, |t, s| {
-            segment_sha256(file, plan.model.experts, t, s)
+            released_sha256(file, plan.model.experts, t, s, pages.as_mut())
         })
+    }
+
+    /// [`NodeOpen::rows_of`] of the tier `t` opens, in a load whose card segments' pages
+    /// go once uploaded when `card_dontneed`: released once hashed when the tier is on a
+    /// node, whose process reads them; kept for a tier card of this process, whose upload
+    /// reads them next.
+    pub fn tier_rows(
+        plan: &Plan<'_>,
+        file: &Split,
+        t: &TierOpen,
+        card_dontneed: bool,
+    ) -> Result<Vec<NodeRow>, GpuError> {
+        Self::rows_of(plan, file, t.card, t.node.is_some() && card_dontneed)
     }
 
     /// [`NodeOpen::rows_of`] for a tier whose segments a part source loads
@@ -617,7 +662,7 @@ impl NodeOpen {
     fn rows_by(
         plan: &Plan<'_>,
         card: usize,
-        digest: impl Fn(&ModelTensor, &Segment) -> Result<String, GpuError>,
+        mut digest: impl FnMut(&ModelTensor, &Segment) -> Result<String, GpuError>,
     ) -> Result<Vec<NodeRow>, GpuError> {
         let mut rows = Vec::new();
         for row in &plan.rows {
@@ -2268,7 +2313,12 @@ impl Session<'_> {
     /// this process's file, which must hold them as node 0's plan does
     /// ([`NodeOpen::rows_on`]) and with the bytes node 0's file holds (each
     /// segment's sha256, [`NodeRow::sha256`]), and its family's computation
-    /// over them. A second open on one connection is refused by name.
+    /// over them. A second open on one connection is refused by name. A card
+    /// tier's rows leave the page cache once uploaded
+    /// ([`Weights::load_rows_released`]): no family reads their bytes from the
+    /// file again, and on a card that shares the host's memory the pages would
+    /// hold what the card's allocations need. `BLOOMERY_CARD_DONTNEED` does not
+    /// reach the node: the server reads no load lever and refuses it set.
     fn open(&self, open: &NodeOpen) -> Result<TierWork, GpuError> {
         if self.opened.is_some() {
             return Err(GpuError::shape(SERVER, "a second open on one connection"));
@@ -2307,7 +2357,8 @@ impl Session<'_> {
         let (w, experts) = if open.nvme.is_some() {
             open.load_host(&gpu, self.file, &tensors, family)?
         } else {
-            let w = Weights::load_rows(gpu.stream(), self.file, &tensors, &rows, open.card)?;
+            let w =
+                Weights::load_rows_released(gpu.stream(), self.file, &tensors, &rows, open.card)?;
             let experts = (family.experts)(&gpu, self.file, &tensors, &w, open)?;
             (w, experts)
         };
@@ -2386,6 +2437,226 @@ pub(super) mod tests {
             .expect("the model header");
         let file = Split::open(&path).expect("the model file");
         (path, std::sync::Arc::new(file))
+    }
+
+    /// The bytes of each expert of [`release_tensor`]'s stack.
+    #[cfg(target_os = "linux")]
+    const RELEASE_PER: usize = 1 << 20;
+
+    /// An F32 routed stack of two experts of [`RELEASE_PER`] bytes each.
+    #[cfg(target_os = "linux")]
+    fn release_tensor() -> ModelTensor {
+        ModelTensor {
+            name: model::arch::names::routed_stacks(0)[1].clone(),
+            shard: 0,
+            layer: Some(0),
+            role: Role::RoutedExperts,
+            ty: GgmlType::F32,
+            dims: vec![(RELEASE_PER / 16) as u64, 4, 2],
+            file_bytes: 2 * RELEASE_PER as u64,
+            gathered_rows: None,
+        }
+    }
+
+    /// The segment that puts [`release_tensor`]'s expert 1 on card 1.
+    #[cfg(target_os = "linux")]
+    fn release_segment() -> model::placement::Segment {
+        model::placement::Segment {
+            device: model::placement::Device::Card(1),
+            format: Format::Card(model::placement::CardFormat::F32),
+            experts: Some(model::placement::ExpertList::range(1..2).unwrap()),
+            resident_bytes: RELEASE_PER as u64,
+        }
+    }
+
+    /// A model file of [`release_tensor`] alone, every byte read into the page
+    /// cache, and synced: a page release skips a dirty page.
+    #[cfg(target_os = "linux")]
+    fn release_file(tag: &str) -> (std::path::PathBuf, std::sync::Arc<Split>) {
+        use gguf::write::TensorDecl;
+
+        let tensor = release_tensor();
+        let path = std::env::temp_dir().join(format!("bloomery-{tag}-{}.gguf", std::process::id()));
+        let layout = Layout::new(
+            &[],
+            vec![TensorDecl {
+                name: tensor.name.clone(),
+                dims: tensor.dims.clone(),
+                type_id: 0,
+                nbytes: tensor.file_bytes,
+            }],
+        )
+        .unwrap();
+        let mut writer = Writer::new(std::fs::File::create_new(&path).unwrap(), layout).unwrap();
+        let bytes: Vec<u8> = (0..2 * RELEASE_PER).map(|i| (i % 251) as u8).collect();
+        writer.tensor(&tensor.name, &bytes).unwrap();
+        writer.finish().unwrap();
+        std::fs::File::open(&path).unwrap().sync_all().unwrap();
+        let file = Split::open(&path).unwrap();
+        let read: u64 = file
+            .shard(0)
+            .unwrap()
+            .mapping()
+            .iter()
+            .map(|&b| u64::from(b))
+            .sum();
+        std::hint::black_box(read);
+        (path, std::sync::Arc::new(file))
+    }
+
+    /// The whole pages inside expert `expert`'s bytes of [`release_tensor`] in
+    /// `file`, and how many of them the page cache holds.
+    #[cfg(target_os = "linux")]
+    fn expert_pages(file: &Split, expert: usize) -> (usize, usize) {
+        let g = file.shard(0).unwrap();
+        let map = g.mapping();
+        let offset = file.find(&release_tensor().name).unwrap().1.offset;
+        let at = usize::try_from(g.data_base() + offset).unwrap() + expert * RELEASE_PER;
+        // SAFETY: sysconf reads no memory of ours.
+        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+        let (first, end) = (at.div_ceil(page) * page, (at + RELEASE_PER) / page * page);
+        let mut vec = vec![0u8; (end - first) / page];
+        // SAFETY: `first..end` is whole pages inside the live mapping
+        // (page-aligned, as every mapping is), and `vec` holds a byte for each
+        // of them.
+        let rc = unsafe {
+            libc::mincore(
+                map.as_ptr().add(first).cast_mut().cast(),
+                end - first,
+                vec.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+        (vec.len(), vec.iter().filter(|&&b| b & 1 == 1).count())
+    }
+
+    /// Node 0's digest of a node's row, released ([`super::released_sha256`]),
+    /// is the row's digest and leaves none of the row's whole pages in the
+    /// page cache, so a load's digest of the node's rows cannot evict the host
+    /// set; the expert outside the row keeps its pages.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_released_row_digest_drops_its_whole_pages() {
+        use model::placement::host_lock::PageDrop;
+
+        let (path, file) = release_file("node-release");
+        let (tensor, segment) = (release_tensor(), release_segment());
+        let (n, held) = expert_pages(&file, 1);
+        assert!(
+            n >= 8 && held == n,
+            "the row's {n} pages read in: {held} cached"
+        );
+        let digest = super::segment_sha256(&file, 2, &tensor, &segment).unwrap();
+        let mut pages = PageDrop::new(&file);
+        let released =
+            super::released_sha256(&file, 2, &tensor, &segment, Some(&mut pages)).unwrap();
+        assert_eq!(released, digest);
+        assert_eq!(
+            expert_pages(&file, 1).1,
+            0,
+            "the row's whole pages left the page cache"
+        );
+        let (n, held) = expert_pages(&file, 0);
+        assert_eq!(held, n, "the other expert's pages stay");
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A node's open of a card tier ([`Session::open`]) hashes its rows, which
+    /// reads them in, uploads them, and leaves none of their whole pages in
+    /// the page cache by the time its family builds the tier's computation:
+    /// on a card that shares the host's memory, the pages would hold what the
+    /// card's allocations need. The family here ends the open with the count.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_a_node_open_releases_its_rows_pages() {
+        let (path, file) = release_file("node-open-release");
+        let (tensor, segment) = (release_tensor(), release_segment());
+        let card = crate::census()
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("a visible card");
+        let open = NodeOpen {
+            nvme: None,
+            family: "release-test".into(),
+            name: card.name,
+            device: None,
+            card: 1,
+            rows: vec![NodeRow {
+                name: tensor.name.clone(),
+                shard: 0,
+                ty: tensor.ty.to_string(),
+                dims: tensor.dims.clone(),
+                file_bytes: tensor.file_bytes,
+                format: segment.format.to_string(),
+                experts: Some(vec![1]),
+                resident_bytes: segment.resident_bytes,
+                sha256: super::segment_sha256(&file, 2, &tensor, &segment).unwrap(),
+            }],
+            set: TierSet::new(0..1, 2, vec![vec![1]]).unwrap(),
+            shape: TierShape {
+                hidden: RELEASE_PER / 16,
+                n_used: 1,
+                rows: 4,
+                act: TierAct::F32,
+                reply: ReplyRows::Whole,
+            },
+            cols: 1,
+            layers: 1,
+            block: (0, 0),
+        };
+        let family = super::NodeFamily {
+            word: "release-test",
+            tensors: |_| {
+                Ok(ModelTensors {
+                    tensors: vec![release_tensor()],
+                    layers: 1,
+                    experts: 2,
+                    experts_used: 1,
+                    bf16_words: |_| false,
+                })
+            },
+            experts: |_, file, _, w, _| {
+                let held = w.get(&release_tensor().name).is_some();
+                let (n, cached) = expert_pages(file, 1);
+                Err(GpuError::shape(
+                    "release-test",
+                    format!("uploaded={held} whole={n} cached={cached}"),
+                ))
+            },
+            host: |_, _| panic!("a card tier opens no host experts"),
+        };
+        let session = Session {
+            local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+            reset_phase: 0,
+            file: &file,
+            families: &[family],
+            opened: None,
+            asked: 0,
+            pass: 0,
+            seen: (0, Instant::now()),
+            reply: Out::default(),
+            on_open: &mut |_| {},
+        };
+        let error = session
+            .open(&open)
+            .err()
+            .expect("the test family ends the open")
+            .to_string();
+        let whole = error
+            .split_once("whole=")
+            .and_then(|(_, n)| n.split_once(' '))
+            .and_then(|(n, _)| n.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("the family's count: {error}"));
+        assert!(
+            whole >= 8 && error.contains("uploaded=true") && error.ends_with(" cached=0"),
+            "the open's rows left the page cache once uploaded: {error}"
+        );
+        drop(session);
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

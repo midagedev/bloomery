@@ -3590,7 +3590,7 @@ fn open_tier(
         name: t.name.clone(),
         device: t.device,
         card: t.card,
-        rows: NodeOpen::rows_of(plan, file, t.card)?,
+        rows: NodeOpen::tier_rows(plan, file, t, card_dontneed)?,
         set: TierSet::of_map(map, tier)?,
         shape: TierShape {
             hidden: hp.n_embd,

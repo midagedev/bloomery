@@ -584,6 +584,22 @@ impl Weights {
         load_segments(stream, split, (model, rows, card), None, None)
     }
 
+    /// [`Weights::load_rows`] for a process that reads those rows from `split`
+    /// no more (a tier node's open, [`crate::host::node`]): each uploaded
+    /// segment's whole file pages leave the page cache as soon as its bytes are
+    /// staged ([`PageDrop`]), as [`Weights::load_placed`] releases them with
+    /// `card_dontneed`.
+    pub fn load_rows_released(
+        stream: &CudaStream,
+        split: &Split,
+        model: &ModelTensors,
+        rows: &[Row],
+        card: usize,
+    ) -> Result<Weights, GpuError> {
+        let mut release = PageDrop::new(split);
+        load_segments(stream, split, (model, rows, card), Some(&mut release), None)
+    }
+
     /// Upload every tensor of `split` whose name `keep` accepts, each from
     /// its own shard, in the device format its kernel consumes — the one
     /// uploader of a file without a placement plan: [`Weights::load`]'s layer
@@ -1486,8 +1502,9 @@ fn load_segments(
 
 /// The file bytes of placement segment `seg` of tensor `t`, a stack of
 /// `experts` when it is one: the shard and the file offsets of each of its
-/// spans, the bytes the upload copies from and the load releases afterwards.
-fn segment_ranges(
+/// spans, the bytes the upload copies from and the load releases afterwards
+/// (and a tier node's digest, `host::node`, once it has read them).
+pub(crate) fn segment_ranges(
     split: &Split,
     experts: u64,
     t: &ModelTensor,
