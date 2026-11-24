@@ -146,6 +146,16 @@
 //! `QuantColumn` fault with its 128-value block refused, the other bytes
 //! what the same input with that block zeroed leaves.
 //!
+//! The GEMM's activations from a `Q8Act`'s q3 plane and scales alone
+//! (`GemmKernels::enqueue_act_from_q8`, case `act_from_q8`: an expert tier's
+//! block, whose request carries those two planes) at K ∈ {768, 5120} for 1,
+//! 8, 64 and 512 columns: its five planes bit for bit what
+//! `Gpu::enqueue_quantize_gemm` writes from the rows `Gpu::enqueue_quantize_q8_1_cols`
+//! quantized, a NaN block in the last column refused by both quantizers
+//! (`QuantColumn`) and carried over as its refused bytes with no fault of
+//! its own; a column count past either side and a `k` the two do not share
+//! refused by name.
+//!
 //! And once per case: a rerun bit-identical, the route and the GEMM
 //! captured into a graph whose replay equals the eager launch. Then the
 //! faults: a NaN activation ends as the named error `GpuError::Fault`, its
@@ -2440,6 +2450,64 @@ mod gate {
         Ok(ok && nan_ok)
     }
 
+    /// The GEMM's activations from a `Q8Act`'s q3 plane and scales
+    /// (`GemmKernels::enqueue_act_from_q8`) against the GEMM's own quantizer
+    /// over the same rows (module doc), its refusals.
+    fn act_from_q8_case(dev: &Dev<'_>) -> Result<bool, GateError> {
+        if !wanted("act_from_q8") {
+            return Ok(true);
+        }
+        let gpu = dev.gpu;
+        let stream = gpu.stream();
+        let same = |a: &Planes, b: &Planes| {
+            a.0 == b.0 && a.1 == b.1 && a.2 == b.2 && a.3 == b.3 && bits_equal(&a.4, &b.4)
+        };
+        let mut ok = true;
+        for k in [768usize, 5120] {
+            for n in [1usize, 8, 64, 512] {
+                let mut xh = activations(k, n, 9100 + n as u32 + k as u32);
+                xh[(n - 1) * k + 200] = f32::NAN;
+                let x = DeviceBuffer::from_host(stream, &xh)?;
+                let mut q8 = Q8Act::with_tier_cols(stream, n, k)?;
+                let mut direct = GemmAct::new(stream, n, k)?;
+                let mut conv = GemmAct::new(stream, n, k)?;
+                gpu.clear_fault()?;
+                gpu.enqueue_quantize_gemm(&x, n, &mut direct, gpu.unlabelled_sink())?;
+                let f_direct = gpu.take_fault()?;
+                gpu.enqueue_quantize_q8_1_cols(&x, &mut q8, n, 0)?;
+                let f_q8 = gpu.take_fault()?;
+                dev.gk.enqueue_act_from_q8(stream, &q8, n, &mut conv)?;
+                let f_conv = gpu.take_fault()?;
+                let planes_same = same(&planes(&conv, stream)?, &planes(&direct, stream)?);
+                let quant =
+                    |f: Option<Fault>| f.is_some_and(|f| f.code == FaultSite::QuantColumn as u32);
+                let faults_ok = quant(f_direct) && quant(f_q8) && f_conv.is_none();
+                let pass = planes_same && faults_ok;
+                println!(
+                    "gemm case=act_from_q8 K={k} cols={n} planes_eq_quantize_gemm_bits={planes_same} \
+                     nan_block_refused_by_both_quantizers_none_raised_by_the_copy={faults_ok} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+        }
+        let q8 = Q8Act::with_tier_cols(stream, 8, 768)?;
+        let mut wide = GemmAct::new(stream, 4, 5120)?;
+        let mut narrow = GemmAct::new(stream, 4, 768)?;
+        let refused = [
+            dev.gk.enqueue_act_from_q8(stream, &q8, 0, &mut narrow),
+            dev.gk.enqueue_act_from_q8(stream, &q8, 5, &mut narrow),
+            dev.gk.enqueue_act_from_q8(stream, &q8, 2, &mut wide),
+        ]
+        .iter()
+        .all(|r| matches!(r, Err(GpuError::Shape { .. })));
+        println!(
+            "gemm case=act_from_q8 refusals(no column, past the GemmAct, another k)={refused} {}",
+            verdict(refused)
+        );
+        Ok(ok && refused)
+    }
+
     /// The clamped SwiGLU quantizer (`GemmKernels::enqueue_swiglu_act_quant`
     /// under `Act::SwigluClamp`) against the CPU tier's ik-verified
     /// `qdot::swiglu_clamp` quantized by `Gpu::enqueue_quantize_gemm`: the
@@ -2990,6 +3058,7 @@ mod gate {
         ok &= route_table_case(&dev)?;
         ok &= swiglu_case(&dev)?;
         ok &= relu_sqr_case(&dev)?;
+        ok &= act_from_q8_case(&dev)?;
         ok &= swiglu_clamp_case(&dev)?;
         ok &= swiglu_gclamp_case(&dev)?;
         ok &= swiglu_sel_case(&dev)?;

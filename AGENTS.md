@@ -312,6 +312,6 @@ forced_exact count pin, the reference gates).
 - `gate-qdot`'s hw tests read harness dumps under `$BLOOMERY_DATA/ref/` that `just build-ref` writes.
 - A V4.1 prompt batch's shadow runs the card's routed experts on the grouped int8 GEMM (`enqueue_gemm_batch`: route
   table → gate and up → down), a pick's kept and streamed passes each over the map row `ds41_ffn_pass_map` narrows to
-  their experts; the (slot tile, row tile) path (`ds41_card_buckets` → `grouped_tiles` → `ds41_card_gather` →
-  `ds41_expert_gate_up_tiles` / `q4k_gemv_tiles`) is the catcher's and the expert tier's
-  (`just gate-gpu-ds41-prefill`).
+  their experts, and the expert tier runs its block on the same sequence over its places (`gemm_place_ids`,
+  `place_map`); the (slot tile, row tile) path (`ds41_card_buckets` → `grouped_tiles` → `ds41_card_gather` →
+  `ds41_expert_gate_up_tiles` / `q4k_gemv_tiles`) is the catcher's (`just gate-gpu-ds41-prefill`).

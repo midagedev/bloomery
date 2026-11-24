@@ -37,21 +37,24 @@
 //!   prompt batch (`body::prefill`), then [`BATCH_STEPS`] greedy steps, walked
 //!   against the same prompt fed one decode step per position on the tiered
 //!   load (`logits_band::walk`): the call's last position and every greedy
-//!   step, in order. The call's stage experts run the grouped GEMM, its
-//!   tier's the tile path and the steps' the gemv, the same exact integer
-//!   block sums folded in more than one f32 order, so the logits sit within
-//!   the logits band of the steps', not on their bits. No reference load.
+//!   step, in order. The call's stage and tier experts run the grouped GEMM
+//!   and the steps' the gemv, the same exact integer block sums folded in
+//!   more than one f32 order, so the logits sit within the logits band of
+//!   the steps', not on their bits. No reference load.
 //! - `--batch2` (B7, a group): [`BATCH_P2`] positions, two batches run as one
-//!   group of [`BATCH_GROUP`], then the greedy steps, walked against the
-//!   reference's prompt call of the same ids. The reference's experts all
-//!   sit on its one card, so all run the grouped GEMM; the tiered call's
-//!   tier experts run the tile path, so the logits sit within the logits
-//!   band of the reference's, not on its bits.
+//!   group of [`BATCH_GROUP`], then the greedy steps, against the
+//!   reference's prompt call of the same ids: tokens and logits bit for bit.
+//!   The reference's experts all sit on its one card and the tiered call's
+//!   on two, all on the grouped GEMM over the same q8_1 bytes (the tier's
+//!   from the q3 plane and scales it is handed,
+//!   `GemmKernels::enqueue_act_from_q8`), each slot's down row summed in an
+//!   order K fixes, and the join sums both cards' slots in slot order — the
+//!   one-card sum.
 //!
-//!   Both: the walk's tokens agree until a position the reference was not
-//!   clear about (clear top-1 equality is the band's hard clause), after
-//!   which the contexts differ and the rest is not compared. Precondition,
-//!   the prompt call itself sent every tier layer at least one routed slot
+//!   `--batch`'s walk: the tokens agree until a position the reference was
+//!   not clear about (clear top-1 equality is the band's hard clause), after
+//!   which the contexts differ and the rest is not compared. Both:
+//!   precondition, the prompt call itself sent every tier layer at least one routed slot
 //!   (the tier's per-layer hits across the call), and `--batch2`'s call ran
 //!   as a group of two, or the clause proves nothing and fails by name.
 //! - `--bfault` (B2): a fault raised on the tier card's word at the first
@@ -843,10 +846,9 @@ mod gate {
 
     /// Whether `got`, a prompt call and the greedy steps after it, is within the logits band of
     /// `want`'s: the two runs' positions walked in order ([`logits_band::walk`]), which prints its
-    /// line. A prompt call's stage experts run the grouped GEMM and a tier's the tile path, while
-    /// the steps' run the gemv and a reference load's call runs every expert on the GEMM, so the
-    /// same exact integer block sums fold in more than one f32 order and the logits are near the
-    /// other order's, not on its bits.
+    /// line. A prompt call's stage and tier experts run the grouped GEMM while the steps' run the
+    /// gemv, so the same exact integer block sums fold in more than one f32 order and the logits
+    /// are near the other order's, not on its bits.
     fn in_band(what: &str, want: &Run, got: &Run) -> bool {
         logits_band::walk(what, want.positions(), got.positions()).ok
     }
@@ -922,8 +924,7 @@ mod gate {
             ),
             (
                 args.batch2,
-                "B7 group: two batches as one group are within the logits band of the \
-                 reference's call",
+                "B7 group: two batches as one group are the reference's call bit for bit",
             ),
             (
                 args.bfault,
@@ -1241,7 +1242,14 @@ mod gate {
         }
         if let Some(want) = &want.batch2 {
             let (got, sent) = batch_run(&mut m, &long)?;
-            pass &= in_band(
+            // PIN(2026-11-25): bit for bit where it was the logits band. The tier's block moved from
+            // the tile path to the grouped GEMM the reference's call runs, over byte-equal q8_1
+            // planes, so each tier slot's down row is the reference's and the join's slot-order sum
+            // is the one-card sum (module doc): the real file read max |Δlogit| 0 and rms 0 in the
+            // band's walk. FAIL-first: a converter that reads the q3 pair's other half
+            // (`act_from_q3_block`, bit 4 for bit 3) kept the band green at max |Δlogit| 4.144
+            // (pin 16) and is red here.
+            pass &= same(
                 "B7 group (two batches against the reference's call, then greedy steps)",
                 want,
                 &got,

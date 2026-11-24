@@ -5,6 +5,7 @@
 //! every body calls live with their owner (`grouped.rs`, `route.rs`,
 //! `swiglu.rs`, whose warp body both SwiGLU entries share).
 
+use super::act::act_from_q3_block;
 use super::grouped::{
     B_COL_W, B_STAGE_W, GEMM_BM, GEMM_NT, GEMM_THREADS, IQ1M_SB_BYTES, IQ1S_SB_BYTES,
     IQ2S_SB_BYTES, IQ2XS_SB_BYTES, IQ2XXS_SB_BYTES, IQ3S_QH, IQ3S_QS, IQ3S_SB_BYTES, IQ3S_SCALES,
@@ -1477,6 +1478,72 @@ mod gemm_kernels {
         };
         if refused && lane == 0 {
             fault.raise(FaultSite::QuantColumn);
+        }
+    }
+
+    /// The five planes `q3k_quantize_q8_1` writes for `n_cols` columns of
+    /// `256·n_sb` values, from the q3 plane and the block scales it wrote
+    /// alone (a `Q8Act`'s two planes, the ones a tier image carries): one
+    /// 32-thread block per 128-value block, lane `l` of block `(col, b)` the
+    /// column's word `32·b + l` ([`act_from_q3_block`]). The codes, their sums
+    /// and the scales are the quantizer's integers and floats, so every plane
+    /// holds the bytes the quantizer writes from the values the q3 plane was
+    /// quantized from, a refused block (zero codes, NaN scale) included.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(32)]
+    #[launch_contract(
+        domain = 1,
+        block = (32, 1, 1),
+        requires = (
+            q3_in.len() >= n_cols * 64 * half_it,
+            d8_in.len() >= n_cols * 2 * n_sb,
+            q3.len() >= n_cols * 64 * half_it,
+            q4.len() >= n_cols * 256 * quad_it,
+            q6.len() >= n_cols * 128 * half_it,
+            s8.len() >= n_cols * 8 * n_sb,
+            d8.len() >= n_cols * 2 * n_sb
+        )
+    )]
+    pub fn gemm_act_from_q3(
+        q3_in: &[u64],
+        d8_in: &[f32],
+        n_cols: u32,
+        n_sb: u32,
+        half_it: u32,
+        quad_it: u32,
+        mut q3: DisjointSlice<u64>,
+        mut q4: DisjointSlice<u32>,
+        mut q6: DisjointSlice<u32>,
+        mut s8: DisjointSlice<i32>,
+        mut d8: DisjointSlice<f32>,
+    ) {
+        let blk = thread::index_1d().get() / 32;
+        let n_sb = n_sb as usize;
+        let per_col = 2 * n_sb;
+        if blk >= n_cols as usize * per_col {
+            return; // warp-uniform: one warp per block
+        }
+        let col = blk / per_col;
+        let b = blk - col * per_col;
+        let lane = warp::lane_id() as usize;
+        // SAFETY: this warp's one `(col, b)` with its lane, inside the
+        // launch's columns and blocks; the host passes n_sb.div_ceil(2) and
+        // div_ceil(4), and the contract bounds every plane at n_cols columns.
+        unsafe {
+            act_from_q3_block(
+                (q3_in, d8_in),
+                [col, b, n_sb, lane],
+                (half_it, quad_it),
+                &mut q3,
+                &mut q4,
+                &mut q6,
+                &mut s8,
+                &mut d8,
+            );
         }
     }
 }

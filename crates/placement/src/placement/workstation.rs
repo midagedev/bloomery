@@ -527,8 +527,8 @@ pub fn plan_streams(plan: &Plan<'_>) -> bool {
 
 /// The expert tier's prompt-batch service in bytes ([`tier_batch_bytes`]):
 /// on the tier card, the staging a block is copied into — the activations,
-/// the tier places, their q8_1 form, the down outputs by slot — and the tile
-/// path's scratch; on the host, per exchange set, the rows it hands back and
+/// the tier places, their q8_1 form, the down outputs by slot — and the
+/// block's scratch; on the host, per exchange set, the rows it hands back and
 /// the places it reads. The GPU side checks its allocations against these at
 /// load and refuses a difference by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -670,6 +670,44 @@ pub const fn tier_block_scratch_bytes(n_embd: u64, ff: u64, slots: u64) -> u64 {
         + q8_act_bytes(slots, ff)
 }
 
+/// The grouped GEMM's scratch of the expert tier's block for blocks of up to
+/// `cols` tokens of rows of `n_embd`, `n_used` slots a token, through experts
+/// of `ff`, over a model of `n_layer` layers of `n_expert` experts: the rows'
+/// q8_1 form a column a token, the gate and up products by slot, the
+/// SwiGLU's q8_1 form a column a slot, the slots' route ids, the place map
+/// (`n_expert + 1` words) and the route tables' bound
+/// ([`tier_route_bound_bytes`]).
+#[must_use]
+pub const fn tier_gemm_scratch_bytes(
+    n_embd: u64,
+    ff: u64,
+    n_used: u64,
+    cols: u64,
+    (n_layer, n_expert): (u64, u64),
+) -> u64 {
+    let slots = cols * n_used;
+    q8_act_bytes(cols, n_embd)
+        + 2 * 4 * slots * ff
+        + q8_act_bytes(slots, ff)
+        + 4 * slots
+        + 4 * (n_expert + 1)
+        + tier_route_bound_bytes(slots, (n_layer, n_expert))
+}
+
+/// The route tables of the expert tier's block over `slots` slots, counted
+/// before the plan sets the tier's experts a layer: one table a layer of
+/// `n_layer`, each at most its slot list and its zero list (`4 · 2 · slots`),
+/// its tile words at up to `n_expert` experts (`8 · (slots / 64 +
+/// min(n_expert, slots))`) and its counts (8) — `GemmRoute::bytes_at`'s
+/// largest over every count up to `n_expert`. The tier holds the tables of
+/// its own counts and the rest of this bound beside them, so its block bytes
+/// are the reserve.
+#[must_use]
+pub const fn tier_route_bound_bytes(slots: u64, (n_layer, n_expert): (u64, u64)) -> u64 {
+    let tiles = slots / 64 + if n_expert < slots { n_expert } else { slots };
+    n_layer * (4 * 2 * slots + 8 * tiles + 8)
+}
+
 /// The Walk A tile path's scratch for prompt batches of up to `cols` tokens
 /// of rows of `n_embd`, `n_used` slots a token, through experts of `ff`
 /// (the K-quant grouped entries, `bloomery_gpu::kquant::tiles`): the rows'
@@ -731,12 +769,20 @@ const fn try_tier_batch_host_bytes(n_embd: u64, n_used: u64, cols: u64) -> Optio
 }
 
 /// The expert tier's prompt-batch bytes for blocks of up to `cols` tokens of
-/// rows of `n_embd`, routed to `n_used` experts of `ff` rows each.
+/// rows of `n_embd`, routed to `n_used` experts of `ff` rows each, over a
+/// model of `n_layer` layers of `n_expert` experts: the block on the grouped
+/// GEMM ([`tier_gemm_scratch_bytes`]).
 #[must_use]
-pub const fn tier_batch_bytes(n_embd: u64, ff: u64, n_used: u64, cols: u64) -> TierBatchBytes {
+pub const fn tier_batch_bytes(
+    n_embd: u64,
+    ff: u64,
+    n_used: u64,
+    cols: u64,
+    layers: (u64, u64),
+) -> TierBatchBytes {
     TierBatchBytes {
         staging: tier_batch_staging_bytes(n_embd, n_used, cols),
-        scratch: tier_block_scratch_bytes(n_embd, ff, cols * n_used),
+        scratch: tier_gemm_scratch_bytes(n_embd, ff, n_used, cols, layers),
         host: tier_batch_host_bytes(n_embd, n_used, cols),
         leg: None,
     }
@@ -2231,9 +2277,9 @@ mod tests {
     #[test]
     fn plan_tiers_is_plan_bp_a_and_gate() {
         let batches = [
-            tier_batch_bytes(5120, 2304, 6, 512),
-            tier_batch_bytes(4096, 1536, 8, 512),
-            tier_batch_bytes(2048, 768, 8, 4096),
+            tier_batch_bytes(5120, 2304, 6, 512, (40, 384)),
+            tier_batch_bytes(4096, 1536, 8, 512, (47, 256)),
+            tier_batch_bytes(2048, 768, 8, 4096, (48, 128)),
             TierBatchBytes {
                 staging: 1,
                 scratch: 2,
@@ -2284,7 +2330,7 @@ mod tests {
     /// tier either way.
     #[test]
     fn the_draft_is_reserved_on_the_card_its_index_names() {
-        let batch = tier_batch_bytes(5120, 2304, 6, 512);
+        let batch = tier_batch_bytes(5120, 2304, 6, 512, (40, 384));
         let at = |on: usize| {
             let reserve = Some(draft_reserve(Device::Card(on), 7));
             plan_tiers(43, A6000, &[RTX_3090], reserve, batch).expect("a card of the list")
@@ -2356,7 +2402,7 @@ mod tests {
     /// the list by name; the 3090 as the stage with the A6000 its tier plans.
     #[test]
     fn plan_tiers_refuses_by_name() {
-        let batch = tier_batch_bytes(5120, 2304, 6, 512);
+        let batch = tier_batch_bytes(5120, 2304, 6, 512, (40, 384));
         let on_card = |on| Some(draft_reserve(Device::Card(on), 7));
         match plan_tiers(43, A6000, &[A6000], None, batch) {
             Err(PlacementError::DeviceTwice {
@@ -2663,16 +2709,19 @@ mod tests {
     }
 
     /// V4.1's tier batch at the host union's 512 columns: the allocation
-    /// sizes of the tier's staging and tile scratch, summed by hand.
+    /// sizes of the tier's staging and its block's GEMM scratch — the rows'
+    /// q8_1 form, the gate and up products, the SwiGLU's q8_1 form, the ids,
+    /// the place map and 40 route tables of 3072 slots at 384 experts —
+    /// summed by hand.
     #[test]
     fn v41_tier_batch_bytes() {
-        let b = tier_batch_bytes(5120, 2304, 6, 512);
+        let b = tier_batch_bytes(5120, 2304, 6, 512, (40, 384));
         assert_eq!(b.staging, 10_485_760 + 12_288 + 8_273_920 + 62_914_560);
         assert_eq!(
             b.scratch,
-            12_288 + 4_100 + 5_124 + 15_728_640 + 491_520 + 28_311_552 + 26_271_744
+            8_273_920 + 2 * 28_311_552 + 26_271_744 + 12_288 + 1_540 + 40 * 28_040
         );
-        assert_eq!(b.card().expect("card reserve"), 152_511_496);
+        assert_eq!(b.card().expect("card reserve"), 173_990_724);
         let edge = TierBatchBytes {
             staging: u64::MAX - 1,
             scratch: 1,

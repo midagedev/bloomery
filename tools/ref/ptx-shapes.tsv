@@ -225,6 +225,8 @@ generate_ds41   gdn_norm_gate_sigmoid                    0           0
 generate_ds41   gdn_norm_gate_q128                       0           0
 generate_ds41   gdn_norm_gate_q32                        0           0
 generate_ds41   geglu_tanh                               0           0
+# PIN(2026-11-25): gemm_act_from_q3: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
+generate_ds41   gemm_act_from_q3                         0           0
 generate_ds41   gemm_iq1m                                0           0
 generate_ds41   gemm_iq1s                                0           0
 generate_ds41   gemm_iq2s                                0           0
@@ -254,6 +256,8 @@ generate_ds41   gemm_nvfp4p_bf16                        48          24
 # sm_86 ptxas 13.3.73, read on GB10; jit_local uses the measured stack frame.
 # The cc8.6 JIT was not measured.
 generate_ds41   gemm_nvfp4p_swiglu                       0           0
+# PIN(2026-11-25): gemm_place_ids: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
+generate_ds41   gemm_place_ids                           0           0
 generate_ds41   gemm_q2_0                                0           0
 generate_ds41   gemm_q2_0_bf16                           0           0
 generate_ds41   gemm_q3k                                 0           0

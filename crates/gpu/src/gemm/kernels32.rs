@@ -1737,6 +1737,36 @@ mod gemm32_kernels {
         }
     }
 
+    /// The remapped route's ids of slots that carry a place in a stack of
+    /// `n_experts` experts, not an expert id (`remap.rs`'s `place_map`), one
+    /// thread a slot of `n_slots`: a place as it is, `HOST` as `n_experts` —
+    /// the one id past the stack, which the map sends to the host. A place in
+    /// `[n_experts, HOST)` stays itself, past the map, so the route refuses
+    /// it and raises [`FaultSite::ExpertId`].
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (sel.len() >= n_slots, ids.len() >= n_slots)
+    )]
+    pub fn gemm_place_ids(sel: &[u32], n_slots: u32, n_experts: u32, mut ids: DisjointSlice<u32>) {
+        let s = thread::index_1d().get();
+        if s < n_slots as usize {
+            // SAFETY: s < n_slots <= sel.len() by the launch contract.
+            let p = unsafe { *sel.get_unchecked(s) };
+            // SAFETY: s < n_slots <= ids.len() by the launch contract; thread
+            // s is ids[s]'s only writer.
+            unsafe {
+                *ids.get_unchecked_mut(s) = if p == crate::hybrid::HOST {
+                    n_experts
+                } else {
+                    p
+                };
+            }
+        }
+    }
+
     /// The wide F32 product (`f32tile.rs`, [`f32_tile_body`]): `w` an F32
     /// weight of `rows` rows of `k` values, `x` `n` columns of `k`; writes
     /// `y[c · rows + r]`, each value bit for bit `q8f32::f32_gemv`'s for its

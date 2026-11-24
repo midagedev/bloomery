@@ -1140,7 +1140,7 @@ mod tests {
     /// devices they name.
     #[test]
     fn two_3090s_plan_as_stage_and_tier() {
-        let batch = tier_batch_bytes(5120, 2304, 6, 512);
+        let batch = tier_batch_bytes(5120, 2304, 6, 512, (40, 384));
         let two = census(&[(NAME_3090, TOTAL_3090), (NAME_3090, TOTAL_3090)]);
         let specs = resolve(alias("bp"), &two).expect("two 3090s");
         let m = plan_tiers(43, specs[0], &specs[1..], None, batch).expect("stage + tier");

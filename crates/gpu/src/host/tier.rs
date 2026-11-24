@@ -1172,8 +1172,8 @@ pub trait TierExperts {
     ) -> Result<(), GpuError>;
 
     /// Layer `layer`'s tier experts over the block `io` of a prompt batch,
-    /// from `weights`, on `gpu`'s stream, by the same tile path the stage
-    /// card runs for its card experts over a block. Eager,
+    /// from `weights`, on `gpu`'s stream, by the path the stage card runs
+    /// for its card experts over a block. Eager,
     /// allocation-free; a layer the tier holds no expert of, and a block
     /// past the scratch the architecture made at load, are refused by name.
     fn enqueue_block(

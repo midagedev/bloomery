@@ -43,6 +43,7 @@ generate_ds41 flash_latent_mma_win_stage 0 0
 # PIN(2026-11-03): gdn_delta_prepared 172/64 -> 0/0 (the same scan): each eight keys' state parts are built once and live
 # alone through that block's products, so the walk's state, accumulators and prefetched rows fit the registers.
 generate_ds41 gdn_delta_prepared 0 0
+generate_ds41 gemm_act_from_q3 0 0
 # PIN(2026-11-23): gemm_iq2s spill 24 -> 72 B, JIT local 8 -> 16 B: the llc `--nvptx-short-ptr` of the cuda-oxide pin move (#1661) alone moves it: the stage replay without it returns the old spill, the frontend and opt stages change nothing (pinspill round; ptxas 13.3.73 sm_120a, RTX 5090 driver 615.71.09, a plain jit_local provisional for 595.99.02). pp A/B: none (no whole-card model on the A/B runs this kernel's pass; the effect is not measured) (pinab round).
 generate_ds41 gemm_iq2s 72 16
 generate_ds41 gemm_iq3s 8 8
@@ -53,6 +54,7 @@ generate_ds41 gemm_nvfp4p 72 40
 generate_ds41 gemm_nvfp4p_bf16 72 40
 # PIN(2026-11-17): gemm_nvfp4p_swiglu JIT local 56 -> 64 B on driver 615.71.09 (the same scan: spill 160 as pinned); the plain 56 stays the pin for driver 595.99.02.
 generate_ds41 gemm_nvfp4p_swiglu 64 56 @615.71.09=32
+generate_ds41 gemm_place_ids 0 0
 # PIN(2026-11-17): gemm_q4k JIT local 8 -> 0 B on driver 615.71.09 (the same scan: spill 0 as pinned); the plain 8 stays the pin for driver 595.99.02.
 generate_ds41 gemm_q4k 0 8 @615.71.09=0
 # PIN(2026-11-01): gemm_q4k_bf16 at gemm_q4k's values, its body with the BF16 store, until a scan on this table's arch and capability.

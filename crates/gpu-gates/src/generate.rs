@@ -2197,7 +2197,7 @@ mod tests {
     };
     use std::net::SocketAddr;
 
-    const BATCH: TierBatchBytes = workstation::tier_batch_bytes(5120, 2304, 6, 512);
+    const BATCH: TierBatchBytes = workstation::tier_batch_bytes(5120, 2304, 6, 512, (40, 384));
 
     /// Every alias and its list spelling is one placement, printed by the
     /// alias, and plans the machine its plan function makes: `a` and `a6000`

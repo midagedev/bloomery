@@ -47,9 +47,9 @@
 //!   the stage's step graph of the reference's node count. The call and the
 //!   passes after it are walked in order against the reference's
 //!   (`logits_band::walk_at`, a position clear from a margin of
-//!   [`CLEAR_MARGIN`]): the call's stage experts run the grouped GEMM and
-//!   its tier's the tile path, the reference's all on the GEMM, so their
-//!   logits sit within the logits band of the reference's, not on its bits.
+//!   [`CLEAR_MARGIN`]): the call's stage and tier experts run the grouped
+//!   GEMM, as the reference's all do, and the clause holds their logits
+//!   within the logits band of the reference's.
 //!   The tokens agree until a position the reference was not clear about
 //!   (clear top-1 equality is the band's hard clause), after which the
 //!   contexts differ and the rest is not compared; the positions both loads
@@ -595,10 +595,9 @@ mod gate {
 
     /// Whether `got`, run `what`, is `want`: the stepped part bit for bit, the call and the passes
     /// after it within the logits band of `want`'s ([`walk_called`]), and the passes' accepted
-    /// proposals within [`KEPT_PIN`] over the passes the walk compared. The call's stage experts run the grouped
-    /// GEMM and its tier's the tile path where the reference's all run the GEMM, so the same exact
-    /// integer block sums fold in more than one f32 order and the logits are near the reference's,
-    /// not on its bits. Prints each part's line.
+    /// proposals within [`KEPT_PIN`] over the passes the walk compared. The call's stage and tier
+    /// experts run the grouped GEMM, as the reference's all do; the call and the passes are held
+    /// within the logits band of the reference's. Prints each part's line.
     fn same(what: &str, want: &Run, got: &Run) -> bool {
         let stepped = same_stepped(what, want, got);
         let walk = walk_called(what, want, got);

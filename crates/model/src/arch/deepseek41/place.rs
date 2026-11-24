@@ -91,8 +91,9 @@ pub struct PlanInputs {
 /// The expert tier's prompt-batch bytes plan (b′) reserves for a file of
 /// hyperparameters `hp` (`workstation::plan_bp`): blocks of the host union's
 /// [`crate::moe::UNION_MAX_COLS`] columns of rows of `n_embd`, routed to
-/// `n_used` experts of `ff` rows — the sizes the tier's staging and tile
-/// scratch are allocated at ([`workstation::tier_batch_bytes`]).
+/// `n_used` experts of `ff` rows, over `n_layer` layers of `n_expert`
+/// experts — the sizes the tier's staging and its block's GEMM scratch are
+/// allocated at ([`workstation::tier_batch_bytes`]).
 #[must_use]
 pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
     workstation::tier_batch_bytes(
@@ -100,6 +101,7 @@ pub fn tier_batch(hp: &Hparams) -> TierBatchBytes {
         hp.experts.ff as u64,
         hp.experts.n_used as u64,
         crate::moe::UNION_MAX_COLS as u64,
+        (hp.n_layer as u64, hp.experts.n_expert as u64),
     )
 }
 

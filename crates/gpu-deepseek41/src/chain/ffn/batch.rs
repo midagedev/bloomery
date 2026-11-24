@@ -932,8 +932,8 @@ pub struct TiledBlock<'a> {
 /// weight row is read once for up to eight slots. A down of another type, or
 /// a q5_K one with no tile module held, is a named refusal that launches
 /// nothing. The table's size is a device value: no launch here reads it on
-/// the host. The stage card's batch shadow and the expert tier's batch
-/// service both run it, each over its own scratch. Asynchronous,
+/// the host. The stage card's batch shadow runs it where a gate's catcher
+/// asks for it ([`Body::set_batch_card_tiles`]). Asynchronous,
 /// allocation-free.
 pub fn enqueue_tiled_experts(
     gpu: &Gpu,
@@ -1144,9 +1144,10 @@ pub struct FfnBatchKernels {
     /// ([`CardSlotKernels`]).
     slots: CardSlotKernels,
     /// The grouped GEMM and the 32-value GEMM's route fill, for the default
-    /// block's card experts ([`enqueue_block_experts`]).
-    gemm: GemmKernels,
-    g32: Gemm32Kernels,
+    /// block's card experts ([`enqueue_block_experts`]) and the expert
+    /// tier's block ([`super::tier::Ds41Tier`]).
+    pub(super) gemm: GemmKernels,
+    pub(super) g32: Gemm32Kernels,
 }
 
 /// What [`FfnBatchKernels::enqueue_gate_up_tiles`] reads: both Q3_K stacks
@@ -1664,8 +1665,7 @@ struct HeldRouting {
 /// ([`enqueue_tiled_experts`]): the K-quant family's ([`TileScratch`]: the
 /// table, the SwiGLU output and its q8_1 form by entry) and the planes the
 /// step's Q3_K walk reads gathered by table entry (`q3_ord`, `d8_ord`) —
-/// column `j` is slot `order[j]`'s. The stage card's batch and the expert
-/// tier each own one; the path is the same.
+/// column `j` is slot `order[j]`'s. The stage card's batch owns it.
 pub struct Q3TileScratch {
     tile: TileScratch,
     q3_ord: DeviceBuffer<u64>,
@@ -1782,19 +1782,20 @@ fn collect_route(
 /// form (a column a token — the route's norm quantized again, whose bytes
 /// the norm's fused launch defines equal to its own, bit for bit), the gate
 /// and up products (slot-major, `ff` a slot) and the SwiGLU's q8_1 form (a
-/// column a slot).
-struct GemmScratch {
-    act_x: GemmAct,
-    g: DeviceBuffer<f32>,
-    u: DeviceBuffer<f32>,
-    act_down: GemmAct,
+/// column a slot). The expert tier's block holds one of its own
+/// ([`super::tier::Ds41Tier`]).
+pub(super) struct GemmScratch {
+    pub(super) act_x: GemmAct,
+    pub(super) g: DeviceBuffer<f32>,
+    pub(super) u: DeviceBuffer<f32>,
+    pub(super) act_down: GemmAct,
 }
 
 impl GemmScratch {
     /// The scratch for blocks of up to `cap` tokens of `n_embd` through
     /// experts of `ff`, on `stream`'s card. Load-time only; the shapes the
     /// GEMM family does not take are its named refusal.
-    fn new(
+    pub(super) fn new(
         stream: &CudaStream,
         (cap, n_embd, ff): (usize, usize, usize),
     ) -> Result<GemmScratch, GpuError> {
@@ -1808,7 +1809,7 @@ impl GemmScratch {
     }
 
     /// Device bytes of the scratch.
-    fn bytes(&self) -> usize {
+    pub(super) fn bytes(&self) -> usize {
         self.act_x.bytes() + self.g.num_bytes() + self.u.num_bytes() + self.act_down.bytes()
     }
 }

@@ -13,7 +13,7 @@
 //! the layer; once the host has waited for the set's copies it enqueues each
 //! such tier's service on that tier's stream before the union — the block's
 //! f32 activations and places copied from the set to the tier, quantized
-//! there, the tier's experts by the same tile path the stage card runs, their
+//! there, the tier's experts by the path the stage card runs for its own, their
 //! rows copied back into the leg's host-mapped rows and an event recorded —
 //! and after the union the host waits for every served leg's event under the
 //! go deadline ([`HostTier::tier_rows_of`]) before the stage card's card sum
@@ -1363,7 +1363,7 @@ fn enqueue_tier_service(
 /// the set to the staging from column 0; their q8_1 form, the bytes the
 /// stage card's fused norm wrote for the same columns (its q8_1 output is
 /// the quantizer's over its f32 output); the tier's experts over the block
-/// by the tile path into the down outputs by slot, and those copied into
+/// (`TierExperts::enqueue_block`) into the down outputs by slot, and those copied into
 /// the set's rows — or, for a [`BlockRows::Packed`] tier, its slots' rows
 /// packed at their front and those alone copied, one row for each slot the
 /// places do not leave to the host; the set's event. On a node: the block

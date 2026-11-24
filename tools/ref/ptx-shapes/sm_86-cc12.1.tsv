@@ -212,6 +212,8 @@ generate_ds41   gdn_norm_gate_sigmoid                    0           0
 generate_ds41   gdn_norm_gate_q128                       0           0
 generate_ds41   gdn_norm_gate_q32                        0           0
 generate_ds41   geglu_tanh                               0           0
+# PIN(2026-11-25): gemm_act_from_q3: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
+generate_ds41   gemm_act_from_q3                         0           0
 # PIN(2026-10-23): ptxas at sm_86 and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1, on the F32 GEMM epilogue whose exact walk runs only for a tile that leaves the F32 range.
 generate_ds41   gemm_iq3s                                0          8
 # PIN(2026-10-23): ptxas at sm_86 and the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.1, on the F32 GEMM epilogue whose exact walk runs only for a tile that leaves the F32 range.
@@ -233,6 +235,8 @@ generate_ds41   gemm_nvfp4p_bf16                        32          40
 # PIN(2026-10-24): fused SwiGLU: 0 spill bytes at sm_86 (ptxas 13.3.73),
 # 64 local bytes in the cc 12.1 JIT on GB10, driver 595.84, CUDA 13.3.
 generate_ds41   gemm_nvfp4p_swiglu                       0          32
+# PIN(2026-11-25): gemm_place_ids: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned, not a measured no-spill claim.
+generate_ds41   gemm_place_ids                           0           0
 # PIN(2026-11-14): gemm_q2_0 and gemm_q2_0_bf16: unmeasured on this arch/capability; retain strict 0/0 pins until this pair is scanned (the sm_86 cc 8.6 scan reads 0/0), not a measured no-spill claim.
 generate_ds41   gemm_q2_0                                0           0
 generate_ds41   gemm_q2_0_bf16                           0           0

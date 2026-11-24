@@ -30,13 +30,21 @@
 //! [`TierExperts`]) is the stage card's routed launches over the tier's
 //! stacks: the `_sel` gate·up on the staged activation, the q8_1 of the tier
 //! slots' columns of `h`, and the `_sel` down into the tier's rows; over a
-//! prompt batch's block, the stage card's tile path over its own scratch
-//! ([`super::batch::enqueue_tiled_experts`]).
+//! prompt batch's block, the grouped GEMM the stage card runs for its card
+//! experts ([`bloomery_gpu::gemm::enqueue_gemm_batch`]) over the tier's
+//! stacks (`TierGemm`): the block's q8_1 planes in the GEMM's form from the
+//! q3 plane and scales the block carries, the route ids from the tier
+//! places, the route table over the place map, the gate and up GEMMs, the
+//! SwiGLU of the tier slots and the down GEMM into the block's down outputs
+//! by slot, a host slot's rows left as they were.
 
 use bloomery_gpu::FaultSite;
 use bloomery_gpu::host::tier::{TierBlock, TierExperts, TierInput, TierIo, TierSet, TierTarget};
 
-use super::batch::{FfnBatchKernels, Q3TileScratch, TiledBlock, enqueue_tiled_experts};
+use bloomery_gpu::gemm::{DownW, GateUp, GemmWeight, enqueue_gemm_batch, place_map};
+use model::placement::workstation::tier_route_bound_bytes;
+
+use super::batch::{FfnBatchKernels, GemmScratch};
 
 use super::*;
 
@@ -793,16 +801,16 @@ fn enqueue_handoff_tier(
 
 /// The V4.1 tier card's computation ([`TierExperts`]): per tier layer the
 /// stage card's routed launches over the tier's stacks, into the tier's
-/// rows; over a prompt batch's block, the tile path. Its scratch — the
-/// slots' SwiGLU outputs and, when a layer holds tier experts, their q8_1
-/// and the tile path's for a block of the host union's columns — is made at
-/// load.
+/// rows; over a prompt batch's block, the grouped GEMM (`TierGemm`). Its
+/// scratch — the slots' SwiGLU outputs and, when a layer holds tier experts,
+/// their q8_1 and the GEMM's for a block of the host union's columns — is
+/// made at load.
 pub struct Ds41Tier {
     experts: ExpertKernels,
     h: DeviceBuffer<f32>,
     act_h: Option<Q8Act>,
     batch: FfnBatchKernels,
-    tile: Option<Q3TileScratch>,
+    block: Option<TierGemm>,
     layers: Range<usize>,
     /// Per layer of `layers`, the experts the tier holds and the layer's
     /// `swiglu_clamp_exp`.
@@ -882,8 +890,8 @@ impl Ds41Tier {
         let stream = gpu.stream();
         // Only a layer with tier experts runs (`tier_layer`), each a fused one.
         let held = cfg.iter().any(|&(k, _)| k > 0);
-        let tile = held
-            .then(|| Q3TileScratch::new(stream, UNION_MAX_COLS * N_USED, n, ff))
+        let block = held
+            .then(|| TierGemm::new(stream, hp, cfg.iter().map(|&(k, _)| k)))
             .transpose()?;
         Ok(Ds41Tier {
             experts: ExpertKernels::load(gpu.context())?,
@@ -892,12 +900,80 @@ impl Ds41Tier {
                 .then(|| Q8Act::with_k(stream, N_USED, ff))
                 .transpose()?,
             batch: FfnBatchKernels::load(gpu.context())?,
-            tile,
+            block,
             layers,
             cfg,
             n_embd: n,
             ff,
         })
+    }
+}
+
+/// The tier's prompt-batch block on the grouped GEMM
+/// ([`TierExperts::enqueue_block`]): the GEMM's scratch for a block of the
+/// host union's columns ([`GemmScratch`]), the route ids of its slots, the
+/// place map of a stack of the model's experts ([`place_map`]: every tier
+/// layer's places are below it, and the route table of the layer's count
+/// refuses a place at or past that count), one route table a distinct tier
+/// count ([`RouteSet`]), and the rest of the plan's bound for those tables
+/// beside them (`workstation::tier_route_bound_bytes`), so the block's bytes
+/// are the plan's reserve (`place::tier_batch`).
+struct TierGemm {
+    scratch: GemmScratch,
+    ids: DeviceBuffer<u32>,
+    map: DeviceBuffer<u32>,
+    n_map: usize,
+    routes: RouteSet,
+    slack: Option<DeviceBuffer<u8>>,
+}
+
+impl TierGemm {
+    /// The block for the model `hp` whose tier layers hold `counts` experts
+    /// (zero for a layer it holds none of), on `stream`'s card. Tables past
+    /// the plan's bound for them are refused by name. Load-time only.
+    fn new(
+        stream: &CudaStream,
+        hp: &Hparams,
+        counts: impl IntoIterator<Item = usize>,
+    ) -> Result<TierGemm, GpuError> {
+        const WHAT: &str = "TierGemm::new";
+        let slots = UNION_MAX_COLS * N_USED;
+        let n_map = hp.experts.n_expert;
+        let routes = RouteSet::new(stream, slots, counts)?;
+        let bound = usize::try_from(tier_route_bound_bytes(
+            slots as u64,
+            (hp.n_layer as u64, n_map as u64),
+        ))
+        .map_err(|_| GpuError::shape(WHAT, "the route tables' bound past usize"))?;
+        let slack = bound.checked_sub(routes.bytes()).ok_or_else(|| {
+            GpuError::shape(
+                WHAT,
+                format!(
+                    "the route tables of tier counts {:?} hold {} B, past the plan's bound of {bound} B",
+                    routes.counts().collect::<Vec<_>>(),
+                    routes.bytes()
+                ),
+            )
+        })?;
+        Ok(TierGemm {
+            scratch: GemmScratch::new(stream, (UNION_MAX_COLS, hp.n_embd, hp.experts.ff))?,
+            ids: DeviceBuffer::zeroed(stream, slots)?,
+            map: DeviceBuffer::from_host(stream, &place_map(n_map)?)?,
+            n_map,
+            routes,
+            slack: (slack > 0)
+                .then(|| DeviceBuffer::zeroed(stream, slack))
+                .transpose()?,
+        })
+    }
+
+    /// Device bytes, the slack in.
+    fn bytes(&self) -> usize {
+        self.scratch.bytes()
+            + self.ids.num_bytes()
+            + self.map.num_bytes()
+            + self.routes.bytes()
+            + self.slack.as_ref().map_or(0, DeviceBuffer::num_bytes)
     }
 }
 
@@ -918,17 +994,26 @@ impl Ds41Tier {
 }
 
 impl TierExperts for Ds41Tier {
-    /// The tile path's scratch, for blocks of up to [`UNION_MAX_COLS`]
-    /// tokens.
+    /// The block's GEMM scratch, for blocks of up to [`UNION_MAX_COLS`]
+    /// tokens (`TierGemm`).
     fn block_bytes(&self) -> usize {
-        self.tile.as_ref().map_or(0, Q3TileScratch::device_bytes)
+        self.block.as_ref().map_or(0, TierGemm::bytes)
     }
 
-    /// The tile path reads the q3 plane and its scales alone.
+    /// The block's GEMM form is made from the q3 plane and its scales alone
+    /// (`GemmKernels::enqueue_act_from_q8`).
     fn block_planes(&self) -> bool {
         true
     }
 
+    /// The block's tier slots on the grouped GEMM (`TierGemm`): the GEMM
+    /// form of the block's q8_1 planes, the route ids of its places, then
+    /// the common batch sequence ([`enqueue_gemm_batch`]) over the place
+    /// map, the layer's stacks (each type read from the stacks and refused
+    /// by name where the grouped GEMM decodes it not) and the route table of
+    /// its count, into the down outputs by slot. A block of no column or
+    /// past the scratch, and places or down outputs short of it, are refused
+    /// by name.
     fn enqueue_block(
         &mut self,
         gpu: &Gpu,
@@ -937,29 +1022,60 @@ impl TierExperts for Ds41Tier {
         io: TierBlock<'_>,
     ) -> Result<(), GpuError> {
         const WHAT: &str = "Ds41Tier::enqueue_block";
-        let (_, limit) = self.tier_layer(layer, WHAT)?;
-        let stacks = CardStacks::of(weights, layer)?.ok_or_else(|| GpuError::Tensor {
+        let (k, limit) = self.tier_layer(layer, WHAT)?;
+        let s = CardStacks::of(weights, layer)?.ok_or_else(|| GpuError::Tensor {
             what: WHAT,
             name: names::ffn_down_exps(layer),
             need: "the tier's routed stacks of a tier layer",
         })?;
-        let t = TiledBlock {
-            stacks,
-            q3: io.act.q3(),
-            d8: io.act.d8(),
-            col0: 0,
-            cols: io.cols,
-            sel: io.sel,
-            layer,
-            limit,
-        };
-        let tile = self.tile.as_mut().ok_or(GpuError::State {
+        let (cols, n, ff) = (io.cols, self.n_embd, self.ff);
+        let slots = cols * N_USED;
+        if cols == 0 || cols > UNION_MAX_COLS || io.sel.len() < slots || io.down.len() < slots * n {
+            return Err(GpuError::Shape {
+                what: WHAT,
+                detail: format!(
+                    "layer {layer}: a block of {cols} columns (1..={UNION_MAX_COLS}) over {} \
+                     places and {} down values",
+                    io.sel.len(),
+                    io.down.len()
+                ),
+            });
+        }
+        let b = self.block.as_mut().ok_or(GpuError::State {
             what: WHAT,
-            missing: "the tile scratch of a tier with a tier layer (Ds41Tier::new)",
+            missing: "the GEMM block of a tier with a tier layer (Ds41Tier::new)",
         })?;
-        // No q5_K tile module: a tier layer's down is the q4_K triple's by
-        // the load's own refusal above, so the dispatch never asks for one.
-        enqueue_tiled_experts(gpu, &self.batch, None, &t, tile, io.down)
+        let (gty, dty) = (
+            GemmWeight::from_ggml(s.gate_up_ty())?,
+            GemmWeight::from_ggml(s.down_ty())?,
+        );
+        let (stream, sink) = (gpu.stream(), gpu.layer_sink(layer)?);
+        let g = &mut b.scratch;
+        self.batch
+            .gemm
+            .enqueue_act_from_q8(stream, io.act, cols, &mut g.act_x)?;
+        self.batch
+            .g32
+            .enqueue_place_ids(stream, io.sel, (slots, b.n_map), &mut b.ids)?;
+        enqueue_gemm_batch(
+            (&self.batch.gemm, &self.batch.g32),
+            stream,
+            &b.ids,
+            &b.map,
+            GateUp::Grouped(gty, [s.gate, s.up], &g.act_x),
+            DownW::Grouped(
+                dty,
+                s.down,
+                Act::SwigluClamp { limit },
+                &mut g.act_down,
+                &mut *io.down,
+            ),
+            (cols, k),
+            (N_USED, ff, n),
+            sink,
+            (&mut g.g, &mut g.u),
+            (io.sel, b.routes.of_mut(WHAT, layer, k)?),
+        )
     }
 
     fn enqueue_layer(

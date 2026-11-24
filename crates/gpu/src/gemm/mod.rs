@@ -93,6 +93,7 @@ pub use gemm32::{GateUp32Args, Gemm32Args, Gemm32Weight, Q8_0pEntry};
 pub use grouped::{GemmArgs, GemmInput, GemmWeight};
 pub use kernels::GemmKernels;
 pub use kernels32::Gemm32Kernels;
+pub use remap::place_map;
 pub use route::{GemmRoute, GemmTile, RouteSet};
 pub use swiglu32::SwigluSlots;
 
