@@ -71,7 +71,7 @@ slot index one past the end (8 of 8).
   `proved: no_oob_idx(param 0, param 1)` and the PTX keeps `ld.global.nc.b32 [%rd1+4000000]`. A `get_unchecked` read at
   the same offset is rejected, and a raw-pointer write is rejected by `disjoint_writes`.
 
-We are preparing a fix for the raw-pointer case. Each limit has a small repro crate that builds on its own against the
+The raw-pointer case has a fix proposed in [#1862](https://github.com/NVIDIA/cuda-rust/pull/1862). Each limit has a small repro crate that builds on its own against the
 pin.
 
 ## What we take from it
