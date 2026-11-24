@@ -33,16 +33,21 @@
 //!   with the ids, the seat does the same, and the first id of the answer is a step of the
 //!   last prompt id.
 //! - The load is the whole model on one card (`GpuModel::open`) when the card leg runs every
-//!   routed stack of the file: no routed expert sits on the host. The plan is the body's
-//!   ([`Inputs::plan`], every routed stack of a type the body's card leg runs on the card
-//!   beside the dense weights), and a plan that would leave experts off the card is refused by
-//!   name, a short card at that context ([`card_experts_floor`]). A file whose stacks the card
-//!   leg does not run (the Small's IQ2_XS, IQ3_XXS and IQ4_XS experts) takes the placed load
-//!   (`GpuModel::open_placed`): the dense trunk and the stores on the card, every routed expert
-//!   served by the host tier, the prompt stepped one id at a time. The unset `--ctx` is the
-//!   largest context the plan holds, up to the file's trained context: for the Small the
-//!   card's stores (the 40 windowed layers' rings and the 8 global layers' keys and values)
-//!   are the bound.
+//!   routed stack of the file and the card holds all of them at the floor context: no routed
+//!   expert sits on the host. The plan is the body's ([`Inputs::plan`], every routed stack of a
+//!   type the body's card leg runs on the card beside the dense weights), and a plan that would
+//!   leave experts off the card at the asked context is refused by name, a short card at that
+//!   context ([`card_experts_floor`]). A file the card leg runs but the card cannot hold whole
+//!   even at the floor context (a 12 GB card and the Mini's IQ3_XXS file) takes the mixed load
+//!   (`GpuModel::open_placed`): the plan's card share of each layer's experts (the id prefix
+//!   `[0, n_l)`, the same count on every layer give or take one) beside the dense weights and
+//!   the stores, the host tier serving the rest, a pick's slot on the card or the host as the
+//!   handoff places it; the plan line is followed by a `mixed` line with every layer's `n_l`. A
+//!   file whose stacks the card leg does not run (the Small's IQ2_XS, IQ3_XXS and IQ4_XS
+//!   experts) takes the same load with every routed expert on the host, the prompt stepped one id
+//!   at a time. The unset `--ctx` is the largest context the plan holds, up to the file's
+//!   trained context: for the Small the card's stores (the 40 windowed layers' rings and the 8
+//!   global layers' keys and values) are the bound.
 //!
 //! `--place W` is the shared placement word (`generate::Place`); unset, the common untiered
 //! rule decides on one census reading. A placement the plan refuses (more than one card, a tier
@@ -75,7 +80,7 @@ use bloomery_gpu_gates::bind::{
     ChatSurface, Pass, Seat, SeatEngine, SeatFlags, Vocab, arm_screen, model_props, note_line,
     parallel_line, placement_of, prefill_closing, slots_of,
 };
-use bloomery_gpu_gates::generate::{Place, choose_ctx};
+use bloomery_gpu_gates::generate::{Place, SEAT_STEPS, choose_ctx};
 use bloomery_gpu_gates::need;
 use bloomery_gpu_gates::record::{self, Record};
 use bloomery_gpu_gates::side_seat;
@@ -165,9 +170,9 @@ fn card_runs_the_experts(inputs: &Inputs) -> bool {
         .all(|t| fused_w13_runs(&t.name, t.ty))
 }
 
-/// The plan of `inputs` on `machine` at `ctx` positions of a file whose routed experts the card
-/// does not run: the body's plan ([`Inputs::plan`], every routed stack on the host, the dense
-/// weights and the stores on the card) refused where its terms break a bound.
+/// The plan of `inputs` on `machine` at `ctx` positions that leaves routed experts on the host:
+/// the body's plan ([`Inputs::plan`], the card share of the stacks its leg runs, the rest on the
+/// host, the dense weights and the stores on the card) refused where its terms break a bound.
 fn hosted_plan<'a>(
     inputs: &'a Inputs,
     machine: &'a Machine,
@@ -182,18 +187,51 @@ fn hosted_plan<'a>(
     Ok(plan)
 }
 
-/// The plan the seat loads by: the whole-card plan of a file the card leg runs, the hosted plan
-/// of one it does not.
+/// Which plan shape the seat loads by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// The whole model on the card: a file the card leg runs, held whole at the floor context.
+    Whole,
+    /// The plan's card share of each layer's experts beside the host's: a file the card leg runs
+    /// and the card cannot hold whole at the floor context.
+    Mixed,
+    /// Every routed expert on the host: a file whose stacks the card leg does not run.
+    Hosted,
+}
+
+impl Shape {
+    /// The shape of `inputs`' file on `machine`: [`Shape::Hosted`] for a file the card leg does
+    /// not run; for one it runs, [`Shape::Whole`] when the whole-card plan holds at the seat's
+    /// floor context ([`SEAT_STEPS`]), else [`Shape::Mixed`] when `mixed` allows it (a GGUF file:
+    /// a checkpoint folder's stacks have no host kernel, so its short card stays a refusal).
+    fn of(inputs: &Inputs, machine: &Machine, levers: &PlanLevers, mixed: bool) -> Shape {
+        if !card_runs_the_experts(inputs) {
+            Shape::Hosted
+        } else if !mixed || whole_card_plan(inputs, machine, SEAT_STEPS.floor, levers).is_ok() {
+            Shape::Whole
+        } else {
+            Shape::Mixed
+        }
+    }
+
+    /// Whether the load is the placed one (experts on the host).
+    fn placed(self) -> bool {
+        self != Shape::Whole
+    }
+}
+
+/// The plan the seat loads by in `shape`: the whole-card plan, or the plan as it falls (the card
+/// share and the host's) refused where its terms break a bound.
 fn seat_plan<'a>(
     inputs: &'a Inputs,
     machine: &'a Machine,
     ctx: u64,
     levers: &PlanLevers,
+    shape: Shape,
 ) -> Result<Plan<'a>, PlaceError> {
-    if card_runs_the_experts(inputs) {
-        whole_card_plan(inputs, machine, ctx, levers)
-    } else {
-        hosted_plan(inputs, machine, ctx, levers)
+    match shape {
+        Shape::Whole => whole_card_plan(inputs, machine, ctx, levers),
+        Shape::Mixed | Shape::Hosted => hosted_plan(inputs, machine, ctx, levers),
     }
 }
 
@@ -557,6 +595,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     };
     let mut machine = place.machine_untiered()?(inputs.model.layers);
     beside::reserve_on(&mut machine, held);
+    let shape = Shape::of(
+        &inputs,
+        &machine,
+        &plan_levers,
+        matches!(weights, Weights::File(_)),
+    );
     // A folder's MXFP8 stacks have no host kernel, so a context the card cannot hold whole is the
     // plan's refusal, not a short card: with no context asked, the seat takes the largest it holds.
     let ctx_ask = match (a.ctx, matches!(weights, Weights::Folder(_))) {
@@ -579,17 +623,22 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         (c, _) => c,
     };
     let asked = choose_ctx(split, (ctx_ask, slots), (None, None), |c| {
-        probe_of(seat_plan(&inputs, &machine, c, &plan_levers)).map_err(|e| {
+        probe_of(seat_plan(&inputs, &machine, c, &plan_levers, shape)).map_err(|e| {
             beside::refusal(
                 held,
                 format!(
                     "--place {}: the inkling2 seat {}: {e}",
                     place.name(),
-                    if card_runs_the_experts(&inputs) {
-                        "holds the whole model on the card"
-                    } else {
-                        "holds the dense trunk and the stores on the card and every routed \
-                         expert on the host"
+                    match shape {
+                        Shape::Whole => "holds the whole model on the card",
+                        Shape::Mixed => {
+                            "holds the dense trunk, the stores and a share of each layer's \
+                             experts on the card and the rest on the host"
+                        }
+                        Shape::Hosted => {
+                            "holds the dense trunk and the stores on the card and every routed \
+                             expert on the host"
+                        }
                     }
                 ),
             )
@@ -599,6 +648,12 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
     let slot_ctx = usize::try_from(asked.slot_ctx)?;
     let plan = asked.plan;
     record::plan(place.name(), &machine, &plan).eprint();
+    if shape == Shape::Mixed {
+        eprintln!(
+            "mixed n_l={:?} of {} experts a layer, host_expert_bytes={}",
+            plan.n_l, inputs.hp.n_expert, plan.host.expert_bytes
+        );
+    }
     need::print(&plan, 0, 0, true)?;
     parallel_line(slots, slot_ctx, from, Pass::One);
     if a.plan_only {
@@ -610,7 +665,7 @@ pub fn run(args: &[String], side: &side_seat::Flags) -> Result<ServeError, GateE
         ..EngineProps::default()
     };
     let card = &machine.cards[0];
-    let host_experts = !card_runs_the_experts(&inputs);
+    let host_experts = shape.placed();
     drop(plan);
     let (tok, model) = weights.hand_over(&path)?;
     let open = OpenSeat {

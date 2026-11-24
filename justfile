@@ -4704,6 +4704,13 @@ gate-inkling2-small-host:
 gate-inkling2-fold:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/needs-env.sh gate-inkling2-fold BLOOMERY_INK2_FOLD && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_fold && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_fold --raw "${BLOOMERY_INK2_FOLD%%,*}" --folded "${BLOOMERY_INK2_FOLD#*,}"'
 
+# Inkling 2 Mini's UD-IQ3_XXS file under a 12 GB card budget (a 3060's), a share of every layer's routed experts on the card and the rest
+# on the host tier (gate_inkling2_mix's doc): the plan's split, then the file's whole-card load and its mixed load on the same seeded
+# prompt, the prompt's logits row within a band and the whole card's greedy ids fed to the mixed load within the Gaussian pin. Real tier only;
+# the file is the raw one of BLOOMERY_INK2_FOLD (`<raw file>,<folded copy>`), and the gate is deferred by name where it is unset.
+gate-inkling2-mix:
+    BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/needs-env.sh gate-inkling2-mix BLOOMERY_INK2_FOLD && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_mix && BLOOMERY_CARD_BUDGET=12G BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_mix --file "${BLOOMERY_INK2_FOLD%%,*}"'
+
 # The official Inkling 2 Mini folder on the card (gate_inkling2_official's doc): the folder opened in both arms of
 # BLOOMERY_INK2_DENSE (bf16: the dense as stored, q8_0: written as Q8_0 at load); the arms' dense types and resident bytes
 # apart, and each arm's teacher-forced argmax over the Mini's greedy tables (ref_inkling2_*) within the pin of the Gaussian

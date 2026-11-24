@@ -90,6 +90,9 @@ pub(super) mod pass;
 #[path = "placed.rs"]
 pub(super) mod placed;
 
+/// What a placed load is made from, and its stage card: `None` on the whole-card load.
+type PlacedOpen<'a> = Option<(Open<'a>, usize)>;
+
 const WHAT: &str = "inkling2::Body::load";
 const STEP: &str = "inkling2 step";
 const OPEN: &str = "inkling2 GpuModel::open";
@@ -192,8 +195,10 @@ struct Layer {
     convs: [String; 4],
     router: String,
     probs_b: String,
-    /// The routed stacks on the card (gate half, up half, down), `None` on a placed load: its
-    /// experts are the host's ([`placed`]).
+    /// The routed stacks on the card (gate half, up half, down): every expert of the layer on the
+    /// whole-card load, the plan's card share of them (the id prefix `[0, n_card)`) on a placed
+    /// load's layer that holds one, and `None` on a load whose experts are all the host's
+    /// ([`placed`]).
     stacks: Option<[String; 3]>,
     ctrl: Option<Controls>,
     /// The input norms and the projections run as one launch ([`norm_proj_fits`]).
@@ -306,6 +311,8 @@ struct Scratch {
     fctl: DeviceBuffer<f32>,
     fxn: DeviceBuffer<f32>,
     moe: DeviceBuffer<f32>,
+    /// A placed layer's card slots' weighted sum, which the host's joins to make `moe`.
+    cacc: DeviceBuffer<f32>,
     ffn_out: DeviceBuffer<f32>,
     /// The banked block inputs, `n` apart, and the message bank and its last row.
     banks: DeviceBuffer<f32>,
@@ -364,6 +371,7 @@ impl Scratch {
             fctl: z(n)?,
             fxn: z(n)?,
             moe: z(n)?,
+            cacc: z(n)?,
             ffn_out: z(n)?,
             banks: z(MAX_VECS * n)?,
             msg_bank: z(MAX_VECS * n)?,
@@ -405,6 +413,7 @@ impl Scratch {
             &self.fctl,
             &self.fxn,
             &self.moe,
+            &self.cacc,
             &self.ffn_out,
             &self.banks,
             &self.msg_bank,
@@ -554,12 +563,15 @@ impl GpuModel<Body> {
 
 impl GpuModel<Body> {
     /// Card `card` of `plan`, which `inputs` made, resident: the dense trunk, the stores at the
-    /// plan's `ctx_max`, the host tier over every routed expert (the card leg runs no IQ stack,
-    /// so the plan's card counts are 0, refused by name otherwise) and the embedding as a host
-    /// row ([`placed`]). The load runs no residency machine. The prompt is stepped one id at a
-    /// time. Refused by name: a plan of other than one stage card running every layer, a plan
-    /// whose head is on no card, an expert tier card, a looped file, experts on the card, and
-    /// scratch past the plan's term for it.
+    /// plan's `ctx_max`, each layer's card share of the routed experts (the id prefix
+    /// `[0, n_card)`, its fused gate·up stack split into the halves the card leg reads; none on a
+    /// file whose stacks the card leg does not run), the host tier over every routed layer and the
+    /// embedding as a host row ([`placed`]). The step walks the file's visits, a looped trunk's
+    /// included: a layer's host service is asked once a visit. The load runs no residency
+    /// machine. The prompt is stepped one id at a time. Refused by name: a plan of other than one
+    /// stage card running every layer, a plan whose head is on no card, an expert tier card, a
+    /// layer whose experts the card holds whole, a card share of a stack the card leg does not
+    /// run, and scratch past the plan's term for it.
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -593,7 +605,7 @@ impl GpuModel<Body> {
             card,
             host,
             spec,
-            |_, _, _, _| Ok(()),
+            |stream, _, layers, w| split_card_shares(stream, w, layers, hp.expert_ff[0]),
             |gpu, file, w, set, glue| {
                 let open = Open {
                     file,
@@ -603,8 +615,14 @@ impl GpuModel<Body> {
                     set,
                     glue,
                 };
-                let mut body =
-                    Body::load(gpu, file, w, (hp.clone(), ctx), (None, Some((open, card))))?;
+                let halves = (0..hp.n_layer).map(split_stack_names).collect();
+                let mut body = Body::load(
+                    gpu,
+                    file,
+                    w,
+                    (hp.clone(), ctx),
+                    (Some(halves), Some((open, card))),
+                )?;
                 let p = body.placed.as_mut().ok_or(GpuError::shape(
                     PLAN,
                     "a placed load without its placed side",
@@ -626,6 +644,36 @@ impl GpuModel<Body> {
             },
         )
     }
+}
+
+/// Layer `l`'s (gate half, up half, down) names after the fused stack's split
+/// ([`Weights::split_fused_w13`]): the derived names the split files, which a layer the card
+/// holds no experts of has no weight under.
+fn split_stack_names(l: usize) -> [String; 3] {
+    let fused = names::ffn_gate_up_exps(l);
+    [
+        crate::w13_split::gate_of(&fused),
+        crate::w13_split::up_of(&fused),
+        names::ffn_down_exps(l),
+    ]
+}
+
+/// Each layer's card share of the fused gate·up stack (resident when the plan gives the layer
+/// experts on the card) split into its gate and up halves, in its own resident form: the card
+/// leg reads the halves. A layer with no card share has no stack to split.
+fn split_card_shares(
+    stream: &CudaStream,
+    w: &mut Weights,
+    layers: Range<usize>,
+    ff: usize,
+) -> Result<(), GpuError> {
+    for l in layers {
+        let fused = names::ffn_gate_up_exps(l);
+        if w.get(&fused).is_some() {
+            w.split_fused_w13(stream, &fused, ff)?;
+        }
+    }
+    Ok(())
 }
 
 /// Layer `l`'s (gate, up, down) file names: the fused gate·up tensor twice (its two halves), the
@@ -825,9 +873,23 @@ fn prepare_stacks(
     Ok(out)
 }
 
-/// What a load places beside the card's dense trunk: the routed stacks' names a whole-card load
-/// uploads, and a placed load's open file with its stage card.
-type Placing<'a> = (Option<Vec<[String; 3]>>, Option<(Open<'a>, usize)>);
+/// `layer`'s card stacks as the card leg reads them, each checked against the leg's arms: the
+/// names a layer that holds experts on the card carries, refused by name when it has none or a
+/// stack is resident in a form the leg does not read.
+fn layer_card_stacks<'w>(w: &'w Weights, layer: &'w Layer) -> Result<LegStacks<'w>, GpuError> {
+    let arms = accepts::leg_arms(Program::Inkling2Body)
+        .ok_or_else(|| GpuError::state(STEP, "the inkling2 program's card leg"))?;
+    let names = layer
+        .stacks
+        .as_ref()
+        .ok_or(GpuError::state(
+            STEP,
+            "the card's routed stacks of a layer with experts on the card",
+        ))?
+        .each_ref()
+        .map(String::as_str);
+    LegStacks::of_arms(w, names, arms, (GATE_UP_ROLE, DOWN_ROLE))
+}
 
 impl Body {
     #[allow(
@@ -839,7 +901,7 @@ impl Body {
         file: &Split,
         w: &Weights,
         (hp, ctx): (Hparams, usize),
-        (stacks, placed): Placing<'_>,
+        (stacks, placed): (Option<Vec<[String; 3]>>, PlacedOpen<'_>),
     ) -> Result<Body, GpuError> {
         let stream = gpu.stream();
         if hp.dialect != Dialect::Unsloth {
@@ -888,12 +950,6 @@ impl Body {
             gate_rank: lp.gate_rank as u32,
         });
         let visits = visits(hp.n_layer, loop_spec);
-        if placed.is_some() && (core.is_some() || visits.len() != hp.n_layer) {
-            return Err(GpuError::shape(
-                WHAT,
-                "a looped file on a placed load: the placed walk's visit is its layer",
-            ));
-        }
         if visits.len() >= crate::fault::LAYER_HEAD as usize {
             return Err(GpuError::shape(
                 WHAT,
@@ -1035,6 +1091,13 @@ impl Body {
                 Placed::new(gpu, map, open)
             })
             .transpose()?;
+        if let Some(p) = &placed {
+            for (l, layer) in layers.iter().enumerate() {
+                if p.n_card(l) > 0 {
+                    layer_card_stacks(w, layer)?;
+                }
+            }
+        }
         Ok(Body {
             pass,
             verify,
@@ -1296,6 +1359,7 @@ impl Body {
             n_msg: 0,
             banked: false,
         };
+        let core = hp.loop_.filter(|lp| lp.passes > 1);
         match placed.as_mut() {
             Some(Placed {
                 host: PlacedHost { shell, side, .. },
@@ -1305,6 +1369,9 @@ impl Body {
                 let mut leg = StepLeg::new(gpu.stream(), &mut shell.hybrid);
                 let mut step = StepWalk {
                     walk,
+                    visits: &visits[..],
+                    loop_core: core.map(|lp| lp.core_start),
+                    messages: *messages,
                     layers: &layers[..],
                     stores: &mut stores[..],
                     placed: side,
@@ -1314,7 +1381,6 @@ impl Body {
             }
             None => {
                 walk.embed()?;
-                let core = hp.loop_.filter(|lp| lp.passes > 1);
                 for (slot, v) in visits.iter().enumerate() {
                     let l = v.layer as usize;
                     let layer = &layers[l];
@@ -1359,6 +1425,9 @@ struct Forced {
     ids: DeviceBuffer<u32>,
     weights: DeviceBuffer<f32>,
 }
+
+/// One visit's forced ids and weights as windows over the forced buffers.
+type ForcedPicks<'a> = (Window<'a, u32>, Window<'a, f32>);
 
 /// The step's borrowed parts and the walk's counters.
 struct Walk<'a> {
@@ -1430,7 +1499,7 @@ fn attn_input<'b>(
     }
 }
 
-impl Walk<'_> {
+impl<'a> Walk<'a> {
     /// Visit `slot`'s [`TAP_STAGES`] into its block of `t`.
     fn tap(&mut self, t: &mut DeviceBuffer<f32>, slot: usize) -> Result<(), GpuError> {
         let stream = self.cx.gpu.stream();
@@ -1996,33 +2065,27 @@ impl Walk<'_> {
         self.k.router.route(stream, &s.fxn, &rin, &mut s.route)
     }
 
-    /// The feed-forward block's shadow: every pick on the card's slots (every expert resident,
-    /// so a pick's id is its place), the slots' weighted sum.
-    fn ffn_shadow(&mut self, slot: usize, layer: &Layer) -> Result<(), GpuError> {
-        let (gpu, w) = (self.cx.gpu, self.cx.w);
-        let arms = accepts::leg_arms(Program::Inkling2Body)
-            .ok_or_else(|| GpuError::state(STEP, "the inkling2 program's card leg"))?;
-        let names = layer
-            .stacks
-            .as_ref()
-            .ok_or(GpuError::state(
-                STEP,
-                "the card's routed stacks (a whole-card load)",
-            ))?
-            .each_ref()
-            .map(String::as_str);
-        let stacks = LegStacks::of_arms(w, names, arms, (GATE_UP_ROLE, DOWN_ROLE))?;
-        let s = &mut *self.s;
-        let forced = self
-            .forced
-            .map(|f| -> Result<_, GpuError> {
+    /// The forced picks of visit `slot`: its ids and weights as windows over the forced buffers
+    /// ([`Body::force_picks`]), `None` when the router's own picks run.
+    fn forced_picks(&self, slot: usize) -> Result<Option<ForcedPicks<'a>>, GpuError> {
+        self.forced
+            .map(|f| {
                 let at = slot * N_USED * 4;
                 Ok((
                     Window::<u32>::of(&f.ids, at, N_USED)?,
                     Window::<f32>::of(&f.weights, at, N_USED)?,
                 ))
             })
-            .transpose()?;
+            .transpose()
+    }
+
+    /// The feed-forward block's shadow: every pick on the card's slots (every expert resident,
+    /// so a pick's id is its place), the slots' weighted sum.
+    fn ffn_shadow(&mut self, slot: usize, layer: &Layer) -> Result<(), GpuError> {
+        let (gpu, w) = (self.cx.gpu, self.cx.w);
+        let stacks = layer_card_stacks(w, layer)?;
+        let forced = self.forced_picks(slot)?;
+        let s = &mut *self.s;
         let (sel, weights): (&DeviceBuffer<u32>, &DeviceBuffer<f32>) = match &forced {
             Some((ids, ws)) => (ids, ws),
             None => (s.route.ids(), s.route.weights()),

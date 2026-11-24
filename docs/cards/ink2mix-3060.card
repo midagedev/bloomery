@@ -1,0 +1,30 @@
+# Inkling 2 Mini UD-IQ3_XXS on a 12 GB RTX 3060 desktop, a share of every layer's routed experts on the card and the rest on the host
+# tier (round ink2mix; the lead's run-only sitting on the 3060 host, a release-style binary).
+# [derived] shape: 24 stored layers, 48 visits (the looped core [6, 18) three passes), 128 experts a layer, top 8, ff 1152; the file's
+#   routed bytes 10.298 GB, 3.352 MB an expert, so a visit's 8 picks are 26.8 MB and a token's 48 visits 1.287 GB. At a 12 GB card budget
+#   and ctx 32768 the plan holds 8.235 GB of them on the card (n_l 102..103 of 128, the common rule: the same count on every layer, give or
+#   take one), so 20.0 % of the experts, 2.06 GB, are the host's. The router is the aux-loss-free biased sigmoid, so the picks are taken as
+#   uniform over ids: 8 x 0.200 = 1.60 host slots a visit (the gate prints host_slots a step beside this: 77 predicted), 5.4 MB a visit.
+# [derived] resource timeline a visit (ms of each resource; the wall is a chain, layer l + 1 reads layer l's sum, so the visit is the sum of
+#   the card's front and back, the round trip and the longer of the host service and the card's own experts):
+#     card SMs   front + back 12.4 ms / 48 = 258 us (dense and head 2.16 GB at ~305 GB/s = 7.1 ms, ~975 small launches 5.3 ms), the card's
+#                experts 1.03 GB = 3.4 ms / 48 = 71 us under the host's work
+#     host cores 5.4 MB at ~36 GB/s = 149 us (a 12700F: dual-channel DDR4-3200 ~51 GB/s peak x 0.75, the IQ dots compute-bound near the same;
+#                the box's 32 Zen3 workers read 73 GB/s on these dots, rig-log docs/cards/ink2host-small-decode.card)
+#     PCIe       the go, the join and the 2.3 KB rows: a round trip ~25 us a hosted visit (measured on the box's 5090 by
+#                gate_inkling2_mix at 1 % to 9 % of the slots hosted: the step's fixed cost over the whole card 0.8..1.6 ms over 48 visits;
+#                the first paper figure, 108 us, was the Small's 5.2 ms over 48 visits and was 3 to 6 times too high)
+#     host DRAM  the same 5.4 MB; NVMe 0 (the file's pages resident)
+#   wall = 48 x (258 + 25 + max(149, 71)) = 48 x 432 us = 20.7 ms = 48 tok/s. The step is the card's byte term (the 3060's 360 GB/s
+#   against the 5090's 1.79 TB/s: 12.4 ms of the 20.7 ms) and the host's service (7.2 ms); the 48 round trips are 1.2 ms. The host rate
+#   the box measured at the gate (46.5 us a 3.35 MB slot = 72 GB/s, the ink2host figure) is the box's 32 Zen3 cores: the desktop's
+#   36 GB/s is the derived term this card's run settles. The first lever is the host's rate on that CPU, not the round-trip count.
+kind: profile
+question: is the mixed load's decode step 17..28 ms on the 3060 desktop, with the host service under 200 us a visit?
+term: decode tok/s @ n=1, depth 512, RTX 3060 12 GB + the 12700F host (bloomery-serve inkling2, UD-IQ3_XXS, --ctx 32768, serving defaults, the mixed load by the seat's own plan), server timings predicted_per_second
+unit: tok/s
+predict: 36..58
+condition: one quiet run on the 3060 host (no other compute process on the card, the file's pages resident: majflt 0 in the row, the host's free memory above the plan's host need), the plan line's n_l and card_expert_bytes copied into the row, a /completion of 512 prose ids and n_predict 128 with cache_prompt off, the gate's split (host_slots a step near 77, leg_ms a visit) read beside the tok/s
+decide-in: the host service and the card's byte term are the step: the next lever is the planner's split (more of each layer's experts on the card by a smaller ctx, or the heat-ordered prefix), not the round-trip count
+decide-below: under 36: read the split first (leg_ms a service against 149 us and the step's rest against 25 us a round trip); a service over 250 us means the host rate is under 22 GB/s (memory-bound DDR4): hold more of each layer's experts on the card by a smaller ctx, or perf the IQ dots on that CPU
+decide-above: over 58: the host is faster than the 36 GB/s taken: re-derive the card's byte term at the 3060's measured gemv rate

@@ -1,16 +1,23 @@
-//! The placed load of an Inkling 2 file: the dense trunk and the stores on the stage card, every
-//! routed expert served by the host tier ([`Placed`]), and the token embedding read as a host row.
+//! The placed load of an Inkling 2 file: the dense trunk and the stores on the stage card, each
+//! routed layer's experts split between the card (the plan's share, the id prefix
+//! `[0, n_card)`) and the host tier ([`Placed`]), and the token embedding read as a host row.
 //!
-//! The card leg runs no IQ-quantized stack ([`accepts::leg_arms`]: NVFP4, Q8_0 and MXFP8
-//! only), so the Small's experts all sit on the host (the plan's card counts are 0, refused by
-//! name otherwise): a layer's block is the router and the handoff of its picks on the card
-//! ([`StepWalk`]'s front), the host's work (the step port's serve), and the routed sum back in
-//! `moe` where the post conv reads it. The walk is the common step walk's
-//! ([`runtime::sched::walk`], one row through the step port), the layers' sequence the
-//! whole-card step's: a loopless body's visit is its layer. The prompt is stepped one id at a
-//! time; the verify and the prompt pass are the whole-card load's.
+//! The card leg runs the stack types of [`accepts::leg_arms`] (NVFP4, Q8_0, MXFP8 and the
+//! dynamic mixes' i-quant and 32-value ones); a file with a stack of another type (the Small's
+//! IQ2_XS and IQ4_XS ones) has none of its experts on the card (the plan's card counts are 0, a
+//! share refused by name otherwise). A layer's block is the router and the handoff of its picks
+//! on the card ([`StepWalk`]'s front), the card's own slots under the host's work (its shadow,
+//! the slots the handoff placed on the card, summed in slot order), the host's work (the step
+//! port's serve), and the routed sum back in `moe`, the card's sum and the host's added where the
+//! post conv reads it (the routed sum is linear in the experts' rows). The walk is the common step
+//! walk's ([`runtime::sched::walk`], one row through the step port) over the file's visits: a
+//! looped trunk's stored layer is visited once a pass, its host service asked once a visit, so the
+//! go, the join and the host's work are the visit's, the experts and the slot map the layer's.
+//! The prompt is stepped one id at a time; the verify and the prompt pass are the whole-card
+//! load's.
 
-use super::{Layer, STEP, VisitStore, Walk};
+use super::{Layer, STEP, VisitStore, Walk, layer_card_stacks};
+use crate::card_leg::LegSum;
 use crate::host::StepLeg;
 use crate::host::placed::{PlacedHost, PlacedSide, SideShape};
 use crate::host::refuse_tier_count;
@@ -29,6 +36,7 @@ use gguf::Split;
 use model::arch::inkling2::hparams::Hparams;
 use model::arch::inkling2::place::Inputs;
 use model::arch::inkling2::{host, names};
+use model::arch::models::Visit;
 use model::embed::EmbedTable;
 use model::placement::Plan;
 use runtime::layer::hosted;
@@ -92,8 +100,8 @@ pub(super) fn placed_map(open: &Open<'_>, card: usize, hp: &Hparams) -> Result<S
 impl Placed {
     /// The placed side of the load `open` describes, over the slot map `map` of the routed run:
     /// the host tier over every routed layer, the card's side and the embedding table. Refused
-    /// by name: a layer with experts on the card (the card leg runs none of the file's quant
-    /// types) and a vocabulary that is not the file's. Load-time only.
+    /// by name: a layer with all its experts on the card, an expert tier card and a vocabulary
+    /// that is not the file's. Load-time only.
     pub(super) fn new(gpu: &Gpu, map: SlotMap, open: Open<'_>) -> Result<Placed, GpuError> {
         let Open {
             file,
@@ -112,13 +120,17 @@ impl Placed {
             width: hp.n_embd,
         };
         let side = PlacedSide::new(gpu, &map, (n, shape), PLACED, |l, on_card| {
-            Err(GpuError::shape(
-                PLACED,
-                format!(
-                    "layer {l}: {on_card} experts on the card, whose leg runs NVFP4, Q8_0 and \
-                     MXFP8 stacks only: the file's experts are the host's"
-                ),
-            ))
+            if on_card >= n_expert {
+                return Err(GpuError::shape(
+                    PLACED,
+                    format!(
+                        "layer {l}: all {on_card} experts on the card: the placed walk serves \
+                         layers the host holds a share of (a load that holds the whole model on \
+                         the card is the whole-card load)"
+                    ),
+                ));
+            }
+            Ok(())
         })?;
         let hosted_set = side.hosted_set();
         let hybrid = hosted_hybrid_at(
@@ -180,8 +192,8 @@ impl Placed {
         self.host.side.hosted(l)
     }
 
-    /// The card's experts of layer `l`: 0 on every layer of a load this body makes. A layer past
-    /// the model panics by name.
+    /// The card's experts of layer `l`: the plan's share, 0 on a layer whose stacks the card leg
+    /// does not run. A layer past the model panics by name.
     #[must_use]
     pub fn n_card(&self, l: usize) -> usize {
         self.host.side.n_card(l)
@@ -243,21 +255,33 @@ impl TierBody for Placed {
     }
 }
 
-/// The captured decode step's walk `(1, 1, Step)` through the host tier's step port: each
-/// visit's mixer half and the block's router and handoff (the front), the host's serve, then the
-/// routed sum, the post conv and the stream's sum (the back).
+/// The captured decode step's walk `(1, 1, Step)` through the host tier's step port, over the
+/// file's visits: each visit's mixer half and the block's router and handoff (the front), the
+/// card's slots under the host's serve (the shadow), then the routed sum, the post conv and the
+/// stream's sum (the back). A walk's layer is the visit's index; the visit's stored layer names
+/// the weights, the slot map's row and the host service.
 pub(super) struct StepWalk<'a> {
     pub(super) walk: Walk<'a>,
+    pub(super) visits: &'a [Visit],
+    /// The looped core's first stored layer, where a pass begins; `None` on a loopless file.
+    pub(super) loop_core: Option<usize>,
+    /// Whether the visits of a pass past the first run their messages.
+    pub(super) messages: bool,
     pub(super) layers: &'a [Layer],
     pub(super) stores: &'a mut [VisitStore],
     pub(super) placed: &'a mut PlacedSide,
 }
 
 impl<'a> StepWalk<'a> {
-    /// Walk every layer through `leg`.
+    /// Walk every visit through `leg`.
     pub(super) fn run(&mut self, leg: &mut StepLeg<'a, HostRun>) -> Result<(), GpuError> {
-        let n = self.layers.len();
+        let n = self.visits.len();
         sched::walk(STEP_WALK, n, leg, self)
+    }
+
+    /// The stored layer of the walk's visit `k`.
+    fn layer_of(&self, k: usize) -> usize {
+        self.visits[k].layer as usize
     }
 }
 
@@ -265,22 +289,31 @@ impl<'a> LayerProgram for StepWalk<'a> {
     type Port = StepLeg<'a, HostRun>;
 
     fn host_leg(&self, at: At) -> bool {
-        self.placed.hosted(at.layer)
+        self.placed.hosted(self.layer_of(at.layer))
     }
 
-    /// The layer's mixer half, the feed-forward front and the router, the normed row into the
+    /// The visit's mixer half, the feed-forward front and the router, the normed row into the
     /// boundary and the handoff of the picks with the go that releases the host leg.
     fn front(&mut self, leg: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        let l = at.layer;
+        let k = at.layer;
+        let v = self.visits[k];
+        let l = v.layer as usize;
         let StepWalk {
             walk,
             layers,
             stores,
             placed,
+            loop_core,
+            messages,
+            ..
         } = self;
         let layer = &layers[l];
-        walk.attn_half(l, (l, layer), &mut stores[l], false)?;
-        walk.ffn_front(l, layer, false)?;
+        if *loop_core == Some(l) {
+            walk.pass_edge(v.pass)?;
+        }
+        let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
+        walk.attn_half(k, (l, layer), &mut stores[k], msg)?;
+        walk.ffn_front(k, layer, msg)?;
         let gpu = walk.cx.gpu;
         let hy = leg.hybrid();
         copy_row(
@@ -289,31 +322,80 @@ impl<'a> LayerProgram for StepWalk<'a> {
             hy.boundary_mut().normed_mut(),
             walk.d.n,
         )?;
-        let picks = (walk.s.route.ids(), walk.s.route.weights());
+        let forced = walk.forced_picks(k)?;
+        let picks: (&DeviceBuffer<u32>, &DeviceBuffer<f32>) = match &forced {
+            Some((ids, weights)) => (ids, weights),
+            None => (walk.s.route.ids(), walk.s.route.weights()),
+        };
         placed.go(gpu, picks, hy, l)
     }
 
-    /// No card expert runs under the host's: the card's share of every layer is empty.
-    fn shadow(&mut self, _leg: &mut StepLeg<'a, HostRun>, _at: At) -> Result<(), GpuError> {
-        Ok(())
+    /// The card's slots of the layer, under the host's work: the slots the handoff placed on
+    /// the card over the router's normed row, summed in slot order; none on a layer with no
+    /// experts on the card.
+    fn shadow(&mut self, _leg: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+        let l = self.layer_of(at.layer);
+        if self.placed.n_card(l) == 0 {
+            return Ok(());
+        }
+        let StepWalk {
+            walk,
+            layers,
+            placed,
+            ..
+        } = self;
+        let stacks = layer_card_stacks(walk.cx.w, &layers[l])?;
+        let forced = walk.forced_picks(at.layer)?;
+        let Walk { cx, k, s, act, .. } = walk;
+        let super::Scratch {
+            fxn,
+            leg,
+            cacc,
+            route,
+            ..
+        } = &mut **s;
+        let Some(run) = placed.card_run(l, &stacks, fxn, *act) else {
+            return Ok(());
+        };
+        k.leg.enqueue(
+            cx.gpu,
+            leg,
+            &run,
+            Some(LegSum {
+                w: match &forced {
+                    Some((_, weights)) => weights,
+                    None => route.weights(),
+                },
+                acc: cacc,
+            }),
+        )
     }
 
-    /// From the join on: the host's routed sum into `moe`, then the post conv and the stream's
-    /// sum.
+    /// From the join on: the host's routed sum, the card's added where it holds experts of the
+    /// layer, into `moe`, then the post conv and the stream's sum.
     fn back(&mut self, leg: &mut StepLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
-        let l = at.layer;
+        let k = at.layer;
+        let l = self.layer_of(k);
         let StepWalk {
             walk,
             layers,
             stores,
+            placed,
             ..
         } = self;
         let gpu = walk.cx.gpu;
         let stream = gpu.stream();
+        let n = walk.d.n;
         let hy = leg.hybrid();
         hy.boundary().enqueue_back_of(stream, 0, l)?;
-        copy_row(stream, hy.boundary().hsum_of(0)?, &mut walk.s.moe, walk.d.n)?;
+        let hsum = hy.boundary().hsum_of(0)?;
+        if placed.n_card(l) > 0 {
+            gpu.elem()
+                .enqueue_add(stream, &walk.s.cacc, hsum, n, &mut walk.s.moe)?;
+        } else {
+            copy_row(stream, hsum, &mut walk.s.moe, n)?;
+        }
         hy.row_enqueued(l, 0)?;
-        walk.ffn_back(l, &layers[l], &mut stores[l])
+        walk.ffn_back(k, &layers[l], &mut stores[k])
     }
 }
