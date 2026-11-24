@@ -9717,7 +9717,8 @@ DATA_NEVER_ONLY_NAMED = re.compile(r"BLOOMERY_DATA\}?\"?/tokenizer|TOKENIZER_SET
 CARGO_PARAM = re.compile(r"(?:--features|--bin|--test|--example|--package|-p|-F)(?:=|\s+)\S*\{\{[^}]*\}\}")
 
 # A reference tree (ik, llama.cpp, mistral.rs) is outside the manifest: a recipe that reads one is
-# never skipped. The profiles and ref-paths.sh only define these names for every box command. The home
+# never skipped. No gate reads one (the self-test holds the never-skip set empty), so this detector names the
+# next gate that does, before a batch. The profiles and ref-paths.sh only define these names for every box command. The home
 # path is spelled with a class so that this file, which check-recipes runs, does not match itself. A path under the
 # MODEL_ROOTS root in the home directory is a model file, keyed as one, not a reference tree.
 IK_READ = re.compile(r"\$\{?(?:IK|IKBIN|LCPP|LCPPBIN|MRS|MRSBIN)\b|/home/[u]ser/(?!models\b)")
@@ -13073,7 +13074,7 @@ def key_detectors_self_test(expect, real: Side) -> None:
     for n, hit in never_only_readers:
         expect(n in never, f"{n} reads {hit}: an entry the box manifest leaves out (DATA_NEVER_ONLY), and {n} can skip — take it out of DATA_NEVER_ONLY")
     expect(not never_only_readers, f"{never_only_readers} name the tokenizer*/ directories of the format before the trailer: the box manifest leaves them out, and the sets gate-tokenizer reads are ref-tokenizer-*")
-    expect(never == {"gate-1-1"}, f"never-skip gate recipes: {sorted(never)}")
+    expect(not never, f"never-skip gate recipes (no gate reads a reference tree or runs a binary built from one): {sorted(never)}")
     expect(
         tree_scoped <= never,
         f"skippable gate-* recipes keyed on the whole tree: {sorted(tree_scoped - never)} — a script in the closure walks the tree",
@@ -13628,7 +13629,8 @@ def key_self_test(expect, pieces: tuple[str, ...]) -> None:
             expect(c2.parts(items["cpu"])[2] is not None, "a caller env path outside data and /models was skippable")
             c3 = KeyContext(sa, mf, "BLOOMERY_DATA=/root/bloomery-data", {}, settings=settings)
             expect(c3.parts(items["cpu"])[2] is None, "the data directory itself made an item never-skip")
-            expect(c.parts("gate-1-1")[2] is not None, "an ik-reading gate was skippable")
+            reason = c.parts("gate-1-1")[2]
+            expect(reason is None, f"gate-1-1 reads no reference tree (iq_tables.rs is held to its recorded md5s) and was never-skip: {reason}")
             reason = c.parts("gate-tokenizer")[2]
             expect(reason is None, f"gate-tokenizer reads its sets, no reference tree, and was never-skip: {reason}")
             expect(c.parts("smoke")[2] is not None, "smoke (a batch in a batch) was skippable")

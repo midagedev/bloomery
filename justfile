@@ -1265,17 +1265,19 @@ measure-profile: build-decode
 perf-decode *ARGS: build-decode
     ./tools/box.sh 'bash tools/ref/perf-decode.sh {{ARGS}}'
 
-# 참조 하네스(ggml에 링크하는 C++). 진실값과 기준 속도의 출처다.
-# build-qdot-ref.sh는 ik의 커널 테이블까지 링크하는 x4 하네스 열을 짓고 참조 하네스 다섯을
-# **실행까지** 한다 — gate-qdot의 hw 테스트 일곱이 읽는 $BLOOMERY_DATA/ref/의 덤프
-# (*-ik-dot.txt 다섯과 q5_K의 to_float 행)가 그 산출물이다. q5_K는 V2-Lite에 없어서 V4.1 첫
-# 샤드를 읽는다. 나머지 다섯(*_rate)은 빌드만 한다: 실행은 측정이다.
+# The reference harnesses (C++ linked to ggml), run to write the dumps gate-qdot reads. gate-qdot runs no harness and
+# reads no tree, only the stored dumps; this recipe needs a clone of the reference tree at its pin, so it runs at
+# onboarding or when the pin moves. build-qdot-ref.sh builds the x4 harness row linked to ik's kernel tables and runs
+# the reference harnesses: the *-ik-dot.txt dumps and the q5_K to_float rows under $BLOOMERY_DATA/ref/ are its output.
+# q5_K is not in V2-Lite, so it reads the V4.1 first shard. The *_rate harnesses are only built: running them is a
+# measurement.
 build-ref:
     ./tools/box.sh 'bash tools/ref/build-qdot-ref.sh'
 
 # The IQ4_XS reference alone: its own ik tree at the commit of tools/ref/iq4xs-ik.pin (made once by
 # tools/ref/ik-pin-tree.sh, CPU only), iq4xs_ref linked to it, and the dump with the meta that names the commit.
-# gate-qdot's two IQ4_XS clauses read them; no other dump is touched.
+# It runs only to re-dump the pair (a moved pin), never from a gate; gate-qdot's IQ4_XS clauses read the stored pair
+# through the pair reader, and no other dump is touched.
 build-ref-iq4xs:
     ./tools/box.sh 'bash tools/ref/build-qdot-ref.sh iq4xs_ref'
 
@@ -2880,10 +2882,11 @@ kvclear-probe *ARGS:
 # split reader's and the inventory's plain tests along. The sets open through their refset families
 # (crates/refset/src/arch/dequant.rs), which refuse by name a set written by another harness or ggml build, from
 # another model file, with a file that is not the one dumped, or never finished; `just dump-ref-dequant` writes
-# them. gen-iq-tables.py --check re-extracts the i-quant codebooks (iq_tables.rs) from ik's headers and compares
-# them with the committed file byte for byte.
+# them. gen-iq-tables.py --check holds each i-quant codebook of iq_tables.rs to the md5 its doc line records and
+# reads no tree; its `--ik DIR` form (a tree cloned at the pin, for onboarding only) compares the file with a
+# fresh extraction from that tree's headers byte for byte.
 gate-1-1:
-    ./tools/box.sh 'source tools/ref/ref-paths.sh && python3 tools/ref/gen-iq-tables.py --check --ik "$IK" && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
+    ./tools/box.sh 'python3 tools/ref/gen-iq-tables.py --check && bash tools/gate.sh -p bloomery-gguf -- --include-ignored --nocapture'
 # The dequantization oracle's sets, once per change of the ggml build, dequant_ref.cpp or the model files: builds
 # the harness (tools/ref/build-dequant.sh) and dumps $BLOOMERY_DATA/ref-dequant-v2lite (V2-Lite),
 # ref-dequant-v41<suffix> (the V4.1 file) and ref-synth (`--synthetic`), each with its DEQUANT.tsv

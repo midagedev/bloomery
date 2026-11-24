@@ -1,8 +1,9 @@
 //! The i-quant codebooks, transcribed from ggml by `tools/ref/gen-iq-tables.py`.
 //!
-//! Generated; do not edit. `just gate-1-1` regenerates this file from the header
-//! the reference harnesses link and fails on any difference. The md5 after each
-//! table's source is over its little-endian bytes, as the script prints it.
+//! Generated; do not edit. `just gate-1-1` holds each table to the md5 its doc line
+//! records, over its little-endian bytes as the script prints it: the digest of the
+//! last extraction from the header the line names. The script's `--ik DIR` reads a tree
+//! (onboarding only) and fails unless this file equals the fresh generation.
 
 /// `kmask_iq2xs` (ggml/src/ggml-common.h:821), md5 0bdcb7835c2168aa551d312665e07797.
 #[rustfmt::skip]

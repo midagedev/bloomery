@@ -2036,105 +2036,13 @@ fn iq4xs_pair_reader_waits_for_the_writer() {
     assert_eq!(late.expect("the reader after the unlock"), Ok(256));
 }
 
-/// A scratch data dir for the built `iq4xs_ref` harness: the oracle's activation dump copied in,
-/// and the model path of a file that is not there, which makes the harness dump synthetic blocks.
-fn iq4xs_ref_scratch(tag: &str) -> (ScratchData, std::process::Command) {
-    let real = std::env::var("BLOOMERY_DATA").unwrap_or_else(|_| "/root/bloomery-data".into());
-    let bin = format!("{real}/bin/iq4xs_ref");
-    assert!(
-        std::path::Path::new(&bin).exists(),
-        "{bin}: run just build-ref-iq4xs first"
-    );
-    let s = ScratchData::new(tag);
-    let norm = "attn_norm-0.0.f32";
-    std::fs::copy(format!("{real}/ref/{norm}"), s.file(norm))
-        .expect("the oracle's activation dump");
-    let mut cmd = std::process::Command::new(bin);
-    cmd.arg(s.file("no-model.gguf"))
-        .env("BLOOMERY_DATA", s.base())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    (s, cmd)
-}
-
-/// The harness takes the pair's lock exclusive and drops the meta before it publishes the dump,
-/// so a meta write that fails leaves a dump with no meta, never a meta of an earlier commit
-/// beside a dump of this one. Its meta names the commit of `tools/ref/iq4xs-ik.pin`.
-#[test]
-#[ignore = "hw: needs the box and the built iq4xs_ref"]
-fn hw_iq4xs_ref_invalidates_the_meta_before_it_publishes() {
-    let pin = IQ4XS_IK_PIN.trim();
-    let (s, mut cmd) = iq4xs_ref_scratch("ref-invalidate");
-    assert!(cmd.status().unwrap().success(), "the harness run");
-    let meta = std::fs::read_to_string(s.file("iq4xs-ik-dot.meta")).expect("the harness's meta");
-    dump_ik_meta_check("iq4xs-ik-dot", &meta, pin)
-        .unwrap_or_else(|why| panic!("{why} — the harness binary is not the pin's: rebuild it"));
-    read_iq4xs_pair(s.base(), pin).expect("a pair at the pin");
-    // A meta of another commit stands; the next run's meta write fails (its temporary name is a
-    // directory: `sh` execs the harness, so the pid in the name is the harness's).
-    let earlier = "c10fbbcccd69cb1c66ddeb39601b0cd71701f7c3";
-    std::fs::write(s.file("iq4xs-ik-dot.meta"), format!("ik={earlier}\n")).unwrap();
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(r#"mkdir "$1.tmp.$$" && exec "$2" "$3""#)
-        .args(["sh", &s.file("iq4xs-ik-dot.meta")])
-        .arg(cmd.get_program())
-        .arg(s.file("no-model.gguf"))
-        .env("BLOOMERY_DATA", s.base())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(
-        !status.success(),
-        "the harness run with a failing meta write"
-    );
-    assert!(
-        !std::path::Path::new(&s.file("iq4xs-ik-dot.meta")).exists(),
-        "a meta of ik {earlier} is left beside the dump of the run that failed to write its own"
-    );
-    let err = read_iq4xs_pair(s.base(), pin)
-        .err()
-        .expect("a dump with no meta");
-    assert!(err.contains("iq4xs-ik-dot.meta"), "{err}");
-}
-
-/// The harness publishes nothing while a reader holds the pair's shared lock, and publishes once
-/// it lets go.
-#[test]
-#[ignore = "hw: needs the box and the built iq4xs_ref"]
-fn hw_iq4xs_ref_publishes_under_the_pair_lock() {
-    use std::time::{Duration, Instant};
-    let pin = IQ4XS_IK_PIN.trim();
-    let (s, mut cmd) = iq4xs_ref_scratch("ref-lock");
-    let reader = std::fs::File::create(s.file("iq4xs-ik-dot.lock")).unwrap();
-    reader.lock_shared().unwrap();
-    let mut child = cmd.spawn().unwrap();
-    std::thread::sleep(Duration::from_secs(1));
-    let waiting = child.try_wait().unwrap().is_none();
-    let published = ["iq4xs-ik-dot.txt", "iq4xs-ik-dot.meta"]
-        .iter()
-        .any(|f| std::path::Path::new(&s.file(f)).exists());
-    reader.unlock().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let status = loop {
-        if let Some(st) = child.try_wait().unwrap() {
-            break st;
-        }
-        if Instant::now() > deadline {
-            child.kill().unwrap();
-            panic!("the harness did not finish within 60 s of the unlock");
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(waiting, "the harness finished while a reader held the lock");
-    assert!(
-        !published,
-        "the harness published while a reader held the lock"
-    );
-    assert!(status.success(), "the harness run after the unlock");
-    read_iq4xs_pair(s.base(), pin).expect("the pair the harness published");
-}
+// PIN(2026-11-24): RETIRED — hw_iq4xs_ref_invalidates_the_meta_before_it_publishes and
+// hw_iq4xs_ref_publishes_under_the_pair_lock ran the iq4xs_ref harness (tools/ref/iq4xs_ref.cpp), a
+// binary linked to the ik tree at tools/ref/iq4xs-ik.pin. No gate reads a live third-party tree or
+// runs a binary built from one (user decision), so the harness is not built for a gate and the pair
+// it wrote stays stored under $BLOOMERY_DATA/ref. Their subject was the harness's publish protocol,
+// not a kernel; the reader's half of that protocol stays pinned by
+// iq4xs_pair_reader_refuses_by_name and iq4xs_pair_reader_waits_for_the_writer.
 
 /// IQ4_XS gate B: every dumped row within 1 ULP of ik's
 /// `mul_mat_qX_K_q8_K_T<DequantizerIQ4XS, 1>` (the IQ3_XXS band).
