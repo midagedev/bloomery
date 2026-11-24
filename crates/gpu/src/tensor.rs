@@ -1029,8 +1029,17 @@ pub(crate) fn settled_handles(ctx: &Arc<CudaContext>, want: usize) -> usize {
 /// The thread runs the cleanups it finds ready in one pass in an order of its
 /// own, so one marker can run before a cleanup queued ahead of it in the same
 /// pass; the second marker is queued after the first ran, which puts it in a
-/// later pass than everything queued before the first.
+/// later pass than everything queued before the first. Refused by name on a
+/// thread with a frees hold up ([`crate::capsync::Frees`]): the thread it
+/// would wait for runs nothing until that hold drops.
 pub(crate) fn try_settle_retirements(stream: &CudaStream) -> Result<(), crate::GpuError> {
+    if crate::capsync::holding_frees() {
+        return Err(crate::GpuError::state(
+            "settle_retirements",
+            "refused under this thread's frees hold: cuda-core's retirement thread runs no \
+             cleanup until it drops",
+        ));
+    }
     struct Ran(std::sync::mpsc::Sender<()>);
     impl Drop for Ran {
         fn drop(&mut self) {

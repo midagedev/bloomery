@@ -1563,6 +1563,7 @@ impl<B: ChainBody> GpuModel<B> {
             .get(1)
             .ok_or(GpuError::state(WHAT, "no captured chain"))?;
         if let Some(host) = body.host() {
+            gpu.hold_frees_for_call()?;
             host.at_boundary(gpu.stream(), BoundaryAt::Launch { reads: *reads })?;
         }
         graph.launch(gpu.stream())?;
@@ -1633,9 +1634,16 @@ impl<B: ChainBody> GpuModel<B> {
     /// taken, else made now). Nothing for a body with no host service.
     /// Refused by name first while a pass of several slots waits for its
     /// commit ([`GpuModel::refuse_if_slots_wait`]): no pass opens inside it.
+    /// A body with host service holds cuda-core's frees from here to the end
+    /// of the guarded call around it ([`Gpu::hold_frees_for_call`]): a
+    /// caller that enqueues the pass itself holds that call open over it
+    /// ([`GpuModel::prompt_busy`]), or the hold drops on this call's return.
     pub fn pass_boundary(&mut self) -> Result<(), GpuError> {
         self.refuse_if_slots_wait("GpuModel::pass_boundary")?;
         let _busy = watchdog::busy(&self.watch, watchdog::PASS_BOUNDARY, self.reads);
+        if self.body.host().is_some() {
+            self.gpu.hold_frees_for_call()?;
+        }
         self.boundary_at(BoundaryAt::Launch { reads: self.reads })
     }
 
@@ -2320,6 +2328,9 @@ impl<B: ChainBody> GpuModel<B> {
 /// service's residency boundary runs first, stamped with `reads`
 /// ([`HostServed::at_boundary`] at [`BoundaryAt::Launch`]): the caller has
 /// looked `graph` up, so the boundary runs once the chain is known to exist.
+/// Before it, cuda-core's frees are held to the guarded call's end
+/// ([`Gpu::hold_frees_for_call`]): the replay's stage card waits on the
+/// host's stores while this thread still launches a tier's graph.
 fn launch_served<B: ChainBody>(
     graph: &Graph,
     body: &mut B,
@@ -2328,6 +2339,7 @@ fn launch_served<B: ChainBody>(
     chain: Chain,
 ) -> Result<(), GpuError> {
     if let Some(host) = body.host() {
+        gpu.hold_frees_for_call()?;
         host.at_boundary(gpu.stream(), BoundaryAt::Launch { reads })?;
     }
     graph.launch(gpu.stream())?;

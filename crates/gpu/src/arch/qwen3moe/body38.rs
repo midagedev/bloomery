@@ -4753,6 +4753,9 @@ impl GpuModel<Body38> {
         end: CallEnd,
     ) -> Result<u32, GpuError> {
         let resolved = self.prompt38_checked(tokens, path)?;
+        // One guarded call over the pass, so the frees hold its boundary
+        // takes lasts until the fed pass is served (`prompt_pass`'s rule).
+        let _call = self.prompt_busy();
         // The steps feed is no pass of its own: each id is a step with its
         // boundary and its kept row, so none is opened around them.
         let one_pass = resolved != Prompt38::Step;

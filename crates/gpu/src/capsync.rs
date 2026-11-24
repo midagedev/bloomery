@@ -23,10 +23,20 @@
 //! once. A thread that must make a driver call before it opens such a wait
 //! waits behind the waiter while the waiter waits for the wait: neither
 //! returns, and no bound of ours ends it. The engine makes its synchronizes
-//! and frees on the thread that drives the steps, at load and teardown, and
-//! its helper threads copy and store but neither free nor synchronize; a
-//! test that parks a stream runs alone
-//! (`checkpoint::hold::require_serial_pass`).
+//! on the thread that drives the steps, at load and teardown, and its helper
+//! threads copy and store but neither free nor synchronize; a test that
+//! parks a stream runs alone (`checkpoint::hold::require_serial_pass`).
+//!
+//! A dropped device buffer is freed on none of those threads: cuda-core
+//! queues its `cuMemFree` on its one `cuda-resource-retirement` thread,
+//! which runs it a moment later, whenever the engine stands. An engine call
+//! that launches a pass whose streams wait on host stores — the stage card's
+//! joins on the host leg, a tier's go on the stage card's — and then makes a
+//! driver call before those stores (a tier graph's launch, a fed tier
+//! layer) closes the cycle above with that thread when a free starts in
+//! between. [`Frees`] keeps the thread from starting any cleanup while it is
+//! held; the engine holds it from a call's first pass launch to the call's
+//! end (`GpuModel`'s pass launches, `watchdog::hold_frees_for_call`).
 //!
 //! A capture holds one device's shared side for its whole body; a body
 //! that also took a second device's exclusive side could meet another
@@ -35,8 +45,10 @@
 
 use crate::{GpuError, StreamRole, role_stream};
 use cuda_core::{CudaContext, CudaStream, DriverError};
-use std::cell::RefCell;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::cell::{Cell, RefCell};
+use std::marker::PhantomData;
+use std::sync::{Arc, Mutex, PoisonError, RwLock, mpsc};
+use std::time::Duration;
 
 /// One lock per device: exclusive while a context-wide synchronize or a
 /// fresh handle's first stream runs, shared over a capture's begin..end.
@@ -217,4 +229,212 @@ pub(crate) fn capture_hold<R>(device: usize, during: impl FnOnce() -> R) -> R {
     };
     let _note = CapturingOn::note(device);
     during()
+}
+
+/// How long [`hold_frees`] waits for cuda-core's retirement thread to reach
+/// its gate: the cleanups queued ahead of it run first, each a free that
+/// waits for the device's queued work at most.
+const FREES_ENTRY: Duration = Duration::from_secs(10);
+
+/// The process's frees holds: how many are up, and the sender whose drop
+/// opens the gate the retirement thread sits in while any is.
+struct FreesHeld {
+    count: usize,
+    open: Option<mpsc::Sender<()>>,
+}
+
+static FREES: Mutex<FreesHeld> = Mutex::new(FreesHeld {
+    count: 0,
+    open: None,
+});
+
+thread_local! {
+    /// The frees holds this thread has up: a settle of the retirement
+    /// thread from under one would wait for itself
+    /// (`tensor::try_settle_retirements` refuses it by name).
+    static HOLDING: Cell<usize> = const { Cell::new(0) };
+}
+
+/// cuda-core's retirement thread held: while any `Frees` of the process is
+/// up, that thread runs no cleanup — no buffer's `cuMemFree`, so none of the
+/// implicit synchronizes this module's doc names — and what was queued runs
+/// once the last one drops. The holds count: a second one, on any thread,
+/// only adds to the count. Not `Send`: the thread that took it drops it.
+#[must_use = "the retirement thread runs again as soon as the hold drops"]
+pub struct Frees(PhantomData<*const ()>);
+
+/// Hold cuda-core's retirement thread ([`Frees`]). The first hold of the
+/// process queues a gate behind what the thread holds now, as an owner of an
+/// event recorded on `quiet` — a stream no work is ever enqueued on, so the
+/// gate waits on no stream — and returns once the thread sits in it: every
+/// cleanup it started before has ended, and it starts none until the last
+/// hold drops. Refused by name when the thread does not reach the gate in
+/// [`FREES_ENTRY`]; the gate then opens at once when it is reached.
+pub(crate) fn hold_frees(quiet: &CudaStream) -> Result<Frees, GpuError> {
+    struct Gate {
+        entered: mpsc::Sender<()>,
+        open: mpsc::Receiver<()>,
+    }
+    impl Drop for Gate {
+        /// Runs on the retirement thread: say it is here, then stay until
+        /// the last hold drops its sender.
+        fn drop(&mut self) {
+            let _ = self.entered.send(());
+            let _ = self.open.recv();
+        }
+    }
+    let mut held = FREES.lock().unwrap_or_else(PoisonError::into_inner);
+    if held.count == 0 {
+        let (entered, at_gate) = mpsc::channel();
+        let (open, opened) = mpsc::channel();
+        cuda_core::completion::retain_until_complete(
+            Gate {
+                entered,
+                open: opened,
+            },
+            quiet,
+        )?;
+        at_gate.recv_timeout(FREES_ENTRY).map_err(|_| {
+            GpuError::state(
+                "capsync::hold_frees",
+                "cuda-core's retirement thread did not reach the frees gate within 10 s",
+            )
+        })?;
+        held.open = Some(open);
+    }
+    held.count += 1;
+    HOLDING.with(|h| h.set(h.get() + 1));
+    Ok(Frees(PhantomData))
+}
+
+impl Drop for Frees {
+    fn drop(&mut self) {
+        HOLDING.with(|h| h.set(h.get().saturating_sub(1)));
+        let mut held = FREES.lock().unwrap_or_else(PoisonError::into_inner);
+        held.count = held.count.saturating_sub(1);
+        if held.count == 0 {
+            // The gate's receive ends with its sender: the thread runs on.
+            held.open = None;
+        }
+    }
+}
+
+/// Whether this thread has a [`Frees`] hold up.
+pub(crate) fn holding_frees() -> bool {
+    HOLDING.with(Cell::get) > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cuda_core::{DeviceBuffer, sys};
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    /// Runs on the driver's thread in the stream's order, and returns once
+    /// the flag is up: the stage card's wait on a host store.
+    unsafe extern "C" fn wait_open(flag: *mut c_void) {
+        // SAFETY: the `Arc` count the test handed this call.
+        let flag = unsafe { Arc::from_raw(flag.cast::<AtomicBool>()) };
+        while !flag.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    /// A pass launch takes the call's frees hold before its stream waits on a
+    /// host store, so a free queued before the launch has run when the
+    /// thread's next driver call comes, and none starts under the wait. Here
+    /// the retirement thread runs a slow marker, a buffer is dropped behind
+    /// that work, and the guarded call holds the frees ([`crate::Gpu::hold_frees_for_call`],
+    /// what `GpuModel`'s pass launches take), parks the stream on a host
+    /// store and makes a driver call after the busy work ended, before the
+    /// store. Without the hold the free begins under the wait, takes the
+    /// driver's lock and waits for the parked stream, and that call returns
+    /// only when the watcher opens the store 5 s later. Runs alone
+    /// (`hw_held_`): it parks a stream and makes a driver call before it
+    /// opens it. FAIL-first: a `hold_frees_for_call` that holds nothing
+    /// leaves the call waiting for the watcher.
+    #[test]
+    #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
+    fn hw_held_a_pass_launch_keeps_a_queued_free_out_of_its_host_wait() {
+        crate::checkpoint::hold::require_serial_pass("capsync::tests (a parked pass)");
+        struct Busy(mpsc::Sender<()>, mpsc::Sender<()>);
+        impl Drop for Busy {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+                std::thread::sleep(Duration::from_millis(100));
+                let _ = self.1.send(());
+            }
+        }
+
+        let gpu = crate::Gpu::new().expect("a Gpu on device 0");
+        let stream = gpu.stream();
+        let target = DeviceBuffer::<u32>::zeroed(stream, 1024).expect("a target");
+        let dropped = DeviceBuffer::<u8>::zeroed(stream, 4096).expect("a buffer");
+        stream.synchronize().expect("the buffers are ready");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (ended_tx, ended_rx) = mpsc::channel();
+        cuda_core::completion::retain_until_complete(Busy(started_tx, ended_tx), stream)
+            .expect("work for the retirement thread");
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the retirement thread is busy");
+        drop(dropped);
+
+        let watch = Arc::new(crate::watchdog::Watch::new());
+        let call = crate::watchdog::busy(&watch, crate::watchdog::STEP, 0).expect("the call");
+        gpu.hold_frees_for_call().expect("the frees hold");
+        let flag = Arc::new(AtomicBool::new(false));
+        let data = Arc::into_raw(Arc::clone(&flag)).cast_mut().cast::<c_void>();
+        // SAFETY: `data` is a live `Arc` count that `wait_open` takes.
+        let rc = unsafe { sys::cuLaunchHostFunc(stream.cu_stream(), Some(wait_open), data) };
+        assert_eq!(
+            rc,
+            sys::cudaError_enum_CUDA_SUCCESS,
+            "the stream parks on its host store"
+        );
+        let returned = Arc::new(AtomicBool::new(false));
+        let watcher = std::thread::spawn({
+            let (flag, returned) = (Arc::clone(&flag), Arc::clone(&returned));
+            move || {
+                let end = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < end && !returned.load(Ordering::Acquire) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let wedged = !returned.load(Ordering::Acquire);
+                flag.store(true, Ordering::Release);
+                wedged
+            }
+        });
+        ended_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the busy work ended");
+        // An unheld free begins once the busy work ends.
+        std::thread::sleep(Duration::from_millis(20));
+        // SAFETY: `target` holds 1024 words and lives until the stream is
+        // synchronized below.
+        let set =
+            unsafe { sys::cuMemsetD32Async(target.cu_deviceptr(), 0, 1024, stream.cu_stream()) };
+        returned.store(true, Ordering::Release);
+        let wedged = watcher.join().expect("the watcher");
+        flag.store(true, Ordering::Release);
+        assert!(
+            !wedged,
+            "the driver call after the pass launch returns while the pass waits on its host \
+             store: a free that began under the wait held the driver's lock until the watcher \
+             opened the store"
+        );
+        assert_eq!(
+            set,
+            sys::cudaError_enum_CUDA_SUCCESS,
+            "the memset is queued"
+        );
+        drop(call);
+        stream.synchronize().expect("the stream ran on");
+        assert_eq!(
+            target.to_host_vec(stream).expect("the target"),
+            vec![0; 1024]
+        );
+    }
 }

@@ -178,6 +178,34 @@ thread_local! {
     /// thread-local read, no lock, no allocation — the `Arc` a guard holds
     /// is a reference count, cloned once per guarded call.
     static GUARDED: RefCell<Option<Arc<Watch>>> = const { RefCell::new(None) };
+
+    /// The frees hold the outermost guarded call on this thread took at its
+    /// first pass launch ([`hold_frees_for_call`]), dropped when that call
+    /// ends.
+    static CALL_FREES: RefCell<Option<crate::capsync::Frees>> = const { RefCell::new(None) };
+}
+
+/// Hold cuda-core's retirement thread ([`crate::capsync::Frees`], made by
+/// `take`) until the outermost guarded call on this thread ends: from a pass
+/// launch whose streams wait on host stores, no free may start while this
+/// thread still makes driver calls before those stores. The call's first
+/// pass takes it; later passes of the call find it up. Refused by name
+/// outside a guarded call, which has no end to drop it at.
+pub(crate) fn hold_frees_for_call(
+    take: impl FnOnce() -> Result<crate::capsync::Frees, crate::GpuError>,
+) -> Result<(), crate::GpuError> {
+    if guarded(|_| ()).is_none() {
+        return Err(crate::GpuError::state(
+            "watchdog::hold_frees_for_call",
+            "a pass launch outside a guarded engine call, which would drop its frees hold",
+        ));
+    }
+    if CALL_FREES.with(|f| f.borrow().is_some()) {
+        return Ok(());
+    }
+    let held = take()?;
+    CALL_FREES.with(|f| *f.borrow_mut() = Some(held));
+    Ok(())
 }
 
 /// What the guarded call this thread is inside reads, if any.
@@ -209,7 +237,8 @@ pub(crate) fn busy(watch: &Arc<Watch>, call: Call, reads: u64) -> Option<Busy> {
 
 /// The engine thread's busy mark: clears the busy word and bumps progress
 /// when dropped, and puts the previously guarded watch (another model's,
-/// when calls nest across models) back.
+/// when calls nest across models) back; the outermost one also drops the
+/// call's frees hold ([`hold_frees_for_call`]).
 pub struct Busy {
     prev: Option<Arc<Watch>>,
 }
@@ -222,6 +251,11 @@ impl Drop for Busy {
         if let Some(w) = w {
             w.busy_since.store(0, Ordering::Relaxed);
             w.progress.fetch_add(1, Ordering::Relaxed);
+        }
+        // The outermost guarded call has ended: its passes' host stores are
+        // all made, so the frees its first pass held back may run.
+        if GUARDED.with(|g| g.borrow().is_none()) {
+            drop(CALL_FREES.with(|f| f.borrow_mut().take()));
         }
     }
 }

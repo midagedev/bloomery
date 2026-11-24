@@ -212,11 +212,14 @@ pub fn read_fault<E: HostExperts>(
 /// and none inside ([`GpuModel::pass_boundary`]), so the slot map is one map
 /// for the whole call, and 0 rows kept after it, whatever it returned — the
 /// residency rule counts decode rows only, and the batch service notes no id.
-/// Nothing more on a load with no residency machine.
+/// Nothing more on a load with no residency machine. The call is a guarded
+/// prompt call ([`GpuModel::prompt_busy`], unless its caller holds one), so
+/// the frees hold its boundary takes lasts until `run` has served its pass.
 pub fn prompt_pass<B: ChainBody, T>(
     m: &mut GpuModel<B>,
     run: impl FnOnce(&mut GpuModel<B>) -> Result<T, GpuError>,
 ) -> Result<T, GpuError> {
+    let _call = m.prompt_busy();
     m.pass_boundary()?;
     let r = run(m);
     let kept = m.keep_rows(KeptRows::prefix(0), PassKind::Prompt);

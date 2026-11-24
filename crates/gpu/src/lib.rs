@@ -2562,6 +2562,10 @@ pub(crate) fn device_info(
 pub struct Gpu {
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
+    /// A stream no work is ever enqueued on: the frees hold records its
+    /// gate's event here ([`Gpu::hold_frees_for_call`]), so the hold waits
+    /// on no stream of the engine's.
+    quiet: Arc<CudaStream>,
     module: kernels::LoadedModule,
     q4k_sel: q4k_sel::Q4kSelKernels,
     q5: q5::Q5Kernels,
@@ -3053,6 +3057,7 @@ impl Gpu {
         // the kernels module above; every launcher checks its launch
         // contract before launching.
         let module = unsafe { crate::shared_module!(kernels, &ctx)? };
+        let quiet = ctx.new_stream()?;
         Ok(Gpu {
             row_prefetch: row_prefetch(&ctx)?,
             q4k_sel: q4k_sel::Q4kSelKernels::load(&ctx, &fault)?,
@@ -3066,6 +3071,7 @@ impl Gpu {
             fault,
             ctx,
             stream,
+            quiet,
             module,
             opened_free,
         })
@@ -3306,6 +3312,18 @@ impl Gpu {
     pub fn settle_frees(&self) -> Result<(), GpuError> {
         self.ctx.bind_to_thread()?;
         tensor::try_settle_retirements(self.stream())
+    }
+
+    /// Hold cuda-core's retirement thread until the guarded engine call this
+    /// thread is inside ends ([`watchdog::hold_frees_for_call`]): what a
+    /// pass launch whose streams wait on host stores takes first. A free
+    /// that started after the launch would wait for those streams with the
+    /// driver's lock held, and the call's next driver call before the stores
+    /// would never return ([`capsync`]'s doc). The first hold of a call waits
+    /// for the cleanups the thread already started, never for this card's
+    /// streams; a hold already up costs nothing.
+    pub(crate) fn hold_frees_for_call(&self) -> Result<(), GpuError> {
+        watchdog::hold_frees_for_call(|| capsync::hold_frees(&self.quiet))
     }
 
     /// The driver's minimum allocation granularity for device memory on this
