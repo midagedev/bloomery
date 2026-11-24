@@ -39,7 +39,7 @@
 //!   0's step fails within the bound at its wait for the tier, naming the
 //!   node, the layers it served short of those sent it, and the lost card,
 //!   and node 0 keeps its failed load. Node 1 is then continued: it takes the
-//!   step's enqueue frame, whose pass node 0 never ends, and exits within
+//!   step's enqueue frames, whose pass node 0 never ends, and exits within
 //!   [`LOST_BOUND_S`] naming the loss as that pass not ended, its words
 //!   released and its stream drained.
 //! - Lost node 0: node 0 asks a step of node 1 through a relay in this
@@ -1165,7 +1165,7 @@ mod gate {
     const PASS_NOT_ENDED: &str = "node 0 sent no layer or end of the pass";
 
     /// The frame the relay holds once armed: the first a step sends node 1,
-    /// one of the layers whose picks name its slots.
+    /// the first of its pass's listed layers, the rest queued behind it.
     const HELD_FRAME: Tag = Tag::Enqueue;
 
     /// A relay between node 0 and node 1 that holds node 0's next
@@ -1327,7 +1327,7 @@ mod gate {
     /// Node 1 stopped before node 0 asks a step of it: node 0's step fails
     /// at its wait for the tier, which signalled nothing more for the layer
     /// sent it, naming the node and the lost card, node 0 keeping its failed
-    /// load. Node 1 is then continued: it takes the step's enqueue frame,
+    /// load. Node 1 is then continued: it takes the step's enqueue frames,
     /// whose pass node 0 never ends, and exits within the bound naming the
     /// loss as that pass not ended, its words released and its stream
     /// drained.

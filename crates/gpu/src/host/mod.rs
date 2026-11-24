@@ -365,10 +365,11 @@ pub struct HybridStats {
     /// to a tier's batch leg of its layer-batch, summed: the tiers' share,
     /// which the host did not compute.
     pub batch_tier_slots: u64,
-    /// Layers the host sent no node tier, since load: a step service's picks
-    /// named no slot of the node's, or a prompt batch's union named none, so
-    /// the node was sent nothing for the layer and the host signalled its
-    /// counter itself ([`HostTier::serve`], [`BatchPort::serve_tiered`]).
+    /// Layers whose picks named no slot of a node tier's, since load: a step
+    /// service's on an eager chain or a prompt batch's union, so the node was
+    /// sent nothing for the layer and the host signalled its counter itself,
+    /// or a step service's on a listed pass, whose node ran the layer over no
+    /// slot of its own ([`HostTier::serve`], [`BatchPort::serve_tiered`]).
     /// Zero without a tier on a node.
     pub node_skipped: u64,
     /// Services, step or batch, that met input the card should already have
@@ -1009,7 +1010,7 @@ pub struct HostTier<H> {
     /// Per tier, the tier layers the host has served since load (wrapping):
     /// a tier whose progress is behind it holds the stage card at a wait.
     tier_goes: Vec<u32>,
-    /// Layers the host sent no node tier, since load
+    /// Layers whose picks named no slot of a node tier's, since load
     /// ([`HybridStats::node_skipped`]).
     node_skipped: u64,
     /// Per tier, a replay's tier layers in go order: the service's scratch.
@@ -3179,10 +3180,12 @@ impl<H: HostExperts> HostTier<H> {
     /// With expert tiers each tier's graph of `chain` is launched first when
     /// one is held for that tier's layers of the chain's go order; for a tier
     /// with none, the host enqueues each of its layers on its stream as it
-    /// serves it, and captures its graph once the pass has settled
-    /// ([`tier::Pass`]). Once the last layer is served the host waits for
-    /// every tier with a layer in the pass to catch up and reads their fault
-    /// copies ([`HostTier::settle_tiers`]).
+    /// serves it, and captures its graph once the pass has settled; a tier on
+    /// a node is sent its layers of the go order as one list with the pass's
+    /// first go, and every listed layer's go is raised at its picks
+    /// ([`tier::Pass`], [`HostTier::serve`]). Once the last layer is served
+    /// the host waits for every tier with a layer in the pass to catch up and
+    /// reads their fault copies ([`HostTier::settle_tiers`]).
     pub fn serve_captured_of(&mut self, chain: Chain) -> Result<(), GpuError> {
         let k = self.tiers.len();
         let mut pass = [Pass::Graph; MAX_TIERS];
@@ -3560,12 +3563,14 @@ impl<H: HostExperts> HostTier<H> {
             self.tier_page.as_ref(),
             &mut self.node_skipped,
         );
-        let slots = &self.slots;
-        // The node tiers' share of this layer: sent at the picks, the skipped
-        // layers' units added at the signal. A layer no node tier holds
-        // experts of serves none here ([`HostTier::feed_tiers`] feeds a card
-        // of this process before the serve).
-        let mut skip = 0u32;
+        let (slots, lists) = (&self.slots, &self.tier_lists);
+        // The node tiers' share of this layer: on a listed pass its go raised
+        // at the picks, whatever they name; on an eager chain the layer sent
+        // at the picks, the skipped layers' units added at the signal. A
+        // layer no node tier holds experts of serves none here
+        // ([`HostTier::feed_tiers`] feeds a card of this process before the
+        // serve).
+        let (mut skip, mut empty) = (0u32, 0u32);
         let mut serve_nodes = |point: step::NodePoint, picks: &[u64; MAX_TIERS]| {
             use step::NodePoint;
             // A layer no node tier holds experts of, or a load with no tier,
@@ -3577,7 +3582,14 @@ impl<H: HostExperts> HostTier<H> {
             match point {
                 NodePoint::Picks => {
                     for t in (0..tiers.len()).filter(|t| nodes >> t & 1 == 1) {
-                        if tiers[t].send_layer(chain, layer, row, picks[t])? {
+                        if tiers[t].listing() {
+                            let list = lists.get(t).map_or(&[][..], Vec::as_slice);
+                            tiers[t].go_listed(layer, row, list)?;
+                            page.add_go(t, row)?;
+                            if picks[t] == 0 {
+                                empty |= 1 << t;
+                            }
+                        } else if tiers[t].send_layer(chain, layer, row, picks[t])? {
                             page.add_go(t, row)?;
                         } else {
                             skip |= 1 << t;
@@ -3601,7 +3613,7 @@ impl<H: HostExperts> HostTier<H> {
                         }
                         page.add_unit(t, row)?;
                     }
-                    if skip != 0 {
+                    if (skip | empty) != 0 {
                         *skipped += 1;
                     }
                 }
@@ -3639,10 +3651,11 @@ impl<H: HostExperts> HostTier<H> {
                 let mut behind = 0u32;
                 if let Some(page) = self.tier_page.as_ref() {
                     for (t, card) in self.tiers.iter().enumerate() {
-                        // A tier on a node serves only the layers it was
-                        // sent; the host's count also holds the skipped ones.
+                        // A tier on a node serves only the layers whose go
+                        // the host raised; the host's count also holds the
+                        // skipped ones.
                         let want = if card.node().is_some() {
-                            card.issued()
+                            card.raised()
                         } else {
                             self.tier_goes[t]
                         };

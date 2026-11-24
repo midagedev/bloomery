@@ -345,6 +345,35 @@ impl Channel {
         Ok(())
     }
 
+    /// Send `bodies.len() / each` frames of `tag`, the bodies `each` bytes
+    /// apiece one after another in `bodies`, whole by `deadline` in one
+    /// write: the peer reads them as that many frames, in order. A length
+    /// that is not a whole number of bodies, an empty body and a body past
+    /// [`INLINE`] are refused.
+    pub(super) fn send_each(
+        &mut self,
+        tag: Tag,
+        bodies: &[u8],
+        each: usize,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        if each == 0 || each > INLINE || !bodies.len().is_multiple_of(each) {
+            return Err(io::Error::other(format!(
+                "{} bytes of frame bodies of {each} bytes each",
+                bodies.len()
+            )));
+        }
+        let len = u32::try_from(each + 1)
+            .map_err(|_| io::Error::other(format!("a frame of {each} bytes")))?;
+        self.outbuf.clear();
+        for body in bodies.chunks_exact(each) {
+            self.outbuf.extend_from_slice(&len.to_le_bytes());
+            self.outbuf.push(tag as u8);
+            self.outbuf.extend_from_slice(body);
+        }
+        write_whole(&mut self.s, &self.outbuf, deadline)
+    }
+
     /// Read on for a slice: a whole frame, the stream ended between frames,
     /// or neither yet. A frame past [`MAX_FRAME`] or of a tag the protocol
     /// does not name is an error, and so is a stream ended inside a frame.
@@ -557,5 +586,29 @@ mod tests {
         assert_eq!(rx.recv(deadline).expect("a frame"), Tag::Ok);
         assert_eq!(rx.body(), b"end");
         writer.join().expect("the writer");
+    }
+
+    /// Frames of one tag written in one write read back one frame a body,
+    /// in order, and a frame after them reads back whole; bodies that are
+    /// not a whole number of frames, and an empty body, are refused before
+    /// anything is written.
+    #[test]
+    fn frames_written_together_read_back_one_a_body() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let w = TcpStream::connect(l.local_addr().expect("its address")).expect("a connect");
+        let mut rx = Channel::new(l.accept().expect("an accept").0).expect("a channel");
+        let mut tx = Channel::new(w).expect("a channel");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        assert!(tx.send_each(Tag::Enqueue, b"abcdefg", 3, deadline).is_err());
+        assert!(tx.send_each(Tag::Enqueue, b"", 0, deadline).is_err());
+        tx.send_each(Tag::Enqueue, b"abcdefghi", 3, deadline)
+            .expect("three frames");
+        tx.send(Tag::End, &[], deadline).expect("an end");
+        for body in [b"abc", b"def", b"ghi"] {
+            assert_eq!(rx.recv(deadline).expect("a frame"), Tag::Enqueue);
+            assert_eq!(rx.body(), body);
+        }
+        assert_eq!(rx.recv(deadline).expect("the end"), Tag::End);
+        assert!(rx.body().is_empty());
     }
 }

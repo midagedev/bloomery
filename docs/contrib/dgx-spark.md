@@ -889,11 +889,14 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    the tier card (`spec_of_device` of the row node 1 sent) before anything loads. Node 1 refuses an open whose rows are
    not the tier's set, then loads the rows of node 0's plan from its own copy of the file, each tensor checked against
    node 0's description and each row's bytes against their sha256 in node 0's file (both nodes hash the tier's rows, not
-   the whole file). A node tier's layers arrive as one enqueue frame each, named by layer, from the host's own
-   reading of the picks, never as a captured graph: the launch protocol the channel once carried — a capture request
-   a launch frame replayed — is gone, its two tags reserved and a frame of either refused by name. A pass that
-   sent the node a layer ends with one end frame once node 0 has settled it, or released its waits on a failure
-   that did not name the node's card lost.
+   the whole file). A node tier's layers arrive as one enqueue frame each, named by layer, never as a captured graph.
+   A replayed chain's pass is listed: its every layer of the node's goes out in one write with the pass's first go,
+   and the host raises each layer's go at its picks whatever they name, so node 1's stream holds a layer before its go
+   lands and the enqueue's cost sits under the layers before it; a layer whose picks name no slot of the node's runs
+   there over none. An eager chain sends a layer at its picks, only when they name a slot of the node's. The launch
+   protocol the channel once carried — a capture request a launch frame replayed — is gone, its two tags reserved and
+   a frame of either refused by name. A pass that sent the node a layer ends with one end frame once node 0 has
+   settled it, or released its waits on a failure that did not name the node's card lost.
    `TierCard` keeps the stage side, and its tier side is either a card of this process or a node (`TierWork` is the part
    both run). A shared bind on loopback maps one `/dev/shm` file, created mode 0600 and removed once both ends hold
    it (`Link::across`, `MappedHost::shared_file`). An RDMA bind allocates one page per process and exchanges each
@@ -924,10 +927,10 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    and ends its channel, and the step fails with the tier `CardLost`. The go deadline still covers a node that answers
    but stops computing. Node 1 has two ends of its own: the channel closing without a close, and outstanding work with
    neither a frame nor progress past the go deadline and its grace (node 0 stopped). Work is outstanding while a layer
-   asked of it is unserved, or while a pass node 0 opened with an enqueue frame has had no end frame: a layer whose
-   picks name no slot of the node's is sent nothing, so only the end frame tells node 1 that node 0 finished the pass,
-   and a node between passes stays idle for any time. On either end it writes `RELEASE` to its own counters and go
-   words, drains its stream within the drain deadline and exits with the loss named. Node 0 sends no end for a pass
+   asked of it is unserved, or while a pass node 0 opened with an enqueue frame has had no end frame: on an eager
+   chain a layer whose picks name no slot of the node's is sent nothing, so only the end frame tells node 1 that node
+   0 finished the pass, and a node between passes stays idle for any time. On either end it writes `RELEASE` to its
+   own counters and go words, drains its stream within the drain deadline and exits with the loss named. Node 0 sends no end for a pass
    whose card it named lost, so a node 1 that was stopped and runs again takes that pass's enqueue and ends by the
    pass rule while node 0 still holds the failed load. The end costs one frame each way per pass that sent the node a
    layer, sent after the settle and its reply read with the next pass's first frame, so no round trip waits on it.

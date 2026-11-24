@@ -10,15 +10,21 @@
 //! tier:  wait tier go, −1 → copy x, places in → [gate·up → h q8_1 → down] → copy rows out → barrier → cnt +1, prog +1
 //! ```
 //!
-//! A tier on a node runs the tier's line a layer at a time, on frames the
-//! host sends as it reads each service's picks ([`TierCard::send_layer`]):
-//! the stage card's chain adds no go of a node's tier and the host adds it
-//! itself for the layers it sends, so a layer whose picks name no slot of the
-//! node's sends it nothing — no go, so no image crosses, and the host adds
-//! the layer's unit to the tier's counter itself once the tier is caught up
-//! ([`TierPage::add_unit`]), which the stage card's wait of that layer takes
-//! back as the tier's own signal's. The stage card's wait keeps its one fixed
-//! target on every step; only the tier's work behind it varies.
+//! A tier on a node runs the tier's line a layer at a time, on enqueue
+//! frames the host sends; the stage card's chain adds no go of a node's tier
+//! and the host adds it itself, at each service's picks. A replayed chain's
+//! pass is listed ([`TierCard::replay`]): its every layer of the tier goes to
+//! the node with the pass's first go, so the node's stream holds each layer
+//! before its go lands, and the host raises every layer's go, picks or none
+//! ([`TierCard::go_listed`]) — a layer whose picks name no slot of the
+//! node's runs over none, and its done carries no row. An eager chain sends
+//! a layer at its picks, and only when they name a slot of the node's
+//! ([`TierCard::send_layer`]): a layer that names none sends nothing — no
+//! go, so no image crosses — and the host adds the layer's unit to the
+//! tier's counter itself once the tier is caught up ([`TierPage::add_unit`]),
+//! which the stage card's wait of that layer takes back as the tier's own
+//! signal's. The stage card's wait keeps its one fixed target on every step;
+//! only the tier's work behind it varies.
 //!
 //! The tiers' words live in one page ([`TierPage`], laid out by
 //! [`TierLayout`]) the host tier owns, which the stage card, each tier card
@@ -1264,7 +1270,8 @@ pub struct TierStats {
     /// Passes of a captured chain that launched the tier's graph held for
     /// it ([`TierCard::replay`]), passes fed a layer at a time for want of
     /// one, and the graphs captured after those: a chain is fed and captured
-    /// once, at its first pass, and replayed by every later one.
+    /// once, at its first pass, and replayed by every later one. A tier on a
+    /// node holds no graph: each of its passes is fed, as a listed pass.
     pub replays: u64,
     pub feeds: u64,
     pub captures: u64,
@@ -1809,7 +1816,22 @@ pub struct TierCard {
     /// Layers the host asked of the tier since load (wrapping): what the
     /// progress word reaches once the tier has served them.
     issued: u32,
+    /// A tier on a node: the listed pass under way ([`TierCard::replay`]),
+    /// `None` between passes and on a fed one.
+    listed: Option<Listed>,
     name: String,
+}
+
+/// A tier on a node's listed pass ([`TierCard::replay`]): the columns of
+/// its chain, its services, whether their frames went out
+/// ([`TierCard::go_listed`]), and how many of them the host has raised the
+/// go of.
+#[derive(Clone, Copy, Debug)]
+struct Listed {
+    cols: usize,
+    len: usize,
+    sent: bool,
+    raised: usize,
 }
 
 impl TierCard {
@@ -1852,6 +1874,7 @@ impl TierCard {
                 ..TierStats::default()
             },
             issued: 0,
+            listed: None,
             name,
         }
     }
@@ -2221,9 +2244,14 @@ impl TierCard {
     /// ([`Pass::Feed`]), then captures the graph once it has settled
     /// ([`TierCard::capture`]): an instantiation may wait for the card, and
     /// the stage card's launched chain waits for the host, so none is made
-    /// while that chain runs. A tier on a node never holds one: which of its
-    /// layers a step sends the node depends on the token's picks, so the
-    /// graph's fixed layer list cannot serve it ([`TierCard::send_layer`]).
+    /// while that chain runs. A tier on a node holds none: its pass is listed
+    /// ([`Pass::Listed`]) — every service of `list` goes to the node as one
+    /// enqueue frame a layer, written together with the pass's first go, and
+    /// the host raises each service's go at its picks, whether they name a
+    /// slot of the node's or none ([`TierCard::go_listed`]) — and counts as
+    /// fed. The node's stream runs the frames in order, each waiting on its
+    /// row's go, so a service left without its go would hand its go to the
+    /// next one: no listed service is skipped.
     pub(super) fn replay(
         &mut self,
         chain: Chain,
@@ -2231,19 +2259,27 @@ impl TierCard {
     ) -> Result<Pass, GpuError> {
         let i = chain_slot(chain)?;
         self.chain_cols(chain)?;
+        self.listed = None;
         if list.is_empty() {
             return Ok(Pass::Graph);
         }
-        if matches!(self.side, TierSide::Node(_))
-            || self.graph_nodes_at(i).is_none()
-            || self.captured[i] != list
-        {
+        if matches!(self.side, TierSide::Node(_)) {
+            self.listed = Some(Listed {
+                cols: self.chain_cols(chain)?,
+                len: list.len(),
+                sent: false,
+                raised: 0,
+            });
+            self.stats.feeds += 1;
+            return Ok(Pass::Listed);
+        }
+        if self.graph_nodes_at(i).is_none() || self.captured[i] != list {
             self.stats.feeds += 1;
             return Ok(Pass::Feed);
         }
         match &mut self.side {
             TierSide::Here(w) => w.launch(chain)?,
-            // A tier on a node took the Pass::Feed return above.
+            // A tier on a node took the Pass::Listed return above.
             TierSide::Node(_) => unreachable!("a node tier never holds a graph"),
         }
         self.issue(list.len());
@@ -2295,6 +2331,15 @@ impl TierCard {
         row: usize,
         picks: u64,
     ) -> Result<bool, GpuError> {
+        if self.listed.is_some() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier {}: a layer's own frame during a listed pass (TierCard::go_listed)",
+                    self.name
+                ),
+            ));
+        }
         if picks == 0 {
             // Nothing of the layer's is the node's to compute: the node is
             // sent no frame, so no round trip, and the host signals the
@@ -2317,10 +2362,105 @@ impl TierCard {
         Ok(true)
     }
 
-    /// The replies of the frames [`TierCard::send_layer`] and
-    /// [`TierCard::end_pass`] sent, read by `deadline`; a tier of this
-    /// process has none to read.
+    /// Whether the pass under way is a listed pass of a tier on a node
+    /// ([`TierCard::replay`]): its services' gos are
+    /// [`TierCard::go_listed`]'s, not [`TierCard::send_layer`]'s.
+    pub(super) fn listing(&self) -> bool {
+        self.listed.is_some()
+    }
+
+    /// The go of service `(layer, row)` of a listed pass, at its picks,
+    /// whatever they name: the pass's every service in go order, `list`
+    /// (the one [`TierCard::replay`] took), goes to the node with the first
+    /// go ([`TierNode::send_listed`]), and the host then expects the tier to
+    /// serve `list.len()` layers more. The caller raises the go on the page
+    /// after the call ([`TierPage::add_go`]): the node's stream waits on it
+    /// and the link carries the row's image across with it. A service that
+    /// is not the list's next — out of order, past its end, or with no
+    /// listed pass under way — is refused by name before anything is sent,
+    /// since the node's next layer would take its go.
+    pub(super) fn go_listed(
+        &mut self,
+        layer: usize,
+        row: usize,
+        list: &[(usize, usize)],
+    ) -> Result<(), GpuError> {
+        let Some(mut pass) = self.listed else {
+            return Err(GpuError::State {
+                what: WHAT,
+                missing: "a listed pass of a tier on a node (TierCard::replay)",
+            });
+        };
+        if list.len() != pass.len || list.get(pass.raised) != Some(&(layer, row)) {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "the tier {}: the go of layer {layer}, row {row}, where its listed pass's \
+                     service {} of {} is {:?}",
+                    self.name,
+                    pass.raised,
+                    list.len(),
+                    list.get(pass.raised)
+                ),
+            ));
+        }
+        if !pass.sent {
+            match &mut self.side {
+                TierSide::Node(n) => n.send_listed(list, pass.cols)?,
+                TierSide::Here(_) => {
+                    return Err(GpuError::shape(
+                        WHAT,
+                        format!(
+                            "the tier {}: a listed pass of a card of this process",
+                            self.name
+                        ),
+                    ));
+                }
+            }
+            self.issue(list.len());
+            pass.sent = true;
+        }
+        pass.raised += 1;
+        self.listed = Some(pass);
+        Ok(())
+    }
+
+    /// The layers the tier serves once every go the host has raised is
+    /// taken: those asked of it, less a listed pass's services whose go is
+    /// still to come.
+    pub(super) fn raised(&self) -> u32 {
+        match self.listed {
+            Some(Listed {
+                sent: true,
+                len,
+                raised,
+                ..
+            }) => {
+                let left = u32::try_from(len - raised)
+                    .expect("a listed pass holds a tier's layers of a chain, far below u32::MAX");
+                self.issued.wrapping_sub(left)
+            }
+            _ => self.issued,
+        }
+    }
+
+    /// The replies of the frames [`TierCard::send_layer`],
+    /// [`TierCard::go_listed`] and [`TierCard::end_pass`] sent, read by
+    /// `deadline`; a tier of this process has none to read. A listed pass
+    /// whose services' gos were not all raised is refused by name first: the
+    /// node waits for the rest.
     pub(super) fn drain_layers(&mut self, deadline: Instant) -> Result<(), GpuError> {
+        if let Some(pass) = self.listed
+            && pass.raised != pass.len
+        {
+            return Err(GpuError::protocol(
+                WHAT,
+                format!(
+                    "the tier {}: a listed pass of {} services settled with {} gos raised",
+                    self.name, pass.len, pass.raised
+                ),
+            ));
+        }
         match &mut self.side {
             TierSide::Node(n) => n.drain_pass(deadline),
             TierSide::Here(_) => Ok(()),
@@ -2329,19 +2469,22 @@ impl TierCard {
 
     /// End the pass a tier on a node holds open, once the host is done with
     /// it — settled, or failed with the card not named lost — so the node is
-    /// idle, not stalled ([`TierNode::send_end`]). Nothing when the pass sent
-    /// the node no layer, and nothing for a tier of this process.
+    /// idle, not stalled ([`TierNode::send_end`]), and its listed pass with
+    /// it. Nothing when the pass sent the node no layer, and nothing for a
+    /// tier of this process.
     pub(super) fn end_pass(&mut self) -> Result<(), GpuError> {
+        self.listed = None;
         match &mut self.side {
             TierSide::Node(n) => n.send_end(),
             TierSide::Here(_) => Ok(()),
         }
     }
 
-    /// Leave the pass a tier on a node holds open unended: the host named the
-    /// tier's card lost ([`TierNode::leave_pass_open`]). Nothing for a tier
-    /// of this process.
+    /// Leave the pass a tier on a node holds open unended, its listed pass
+    /// with it: the host named the tier's card lost
+    /// ([`TierNode::leave_pass_open`]). Nothing for a tier of this process.
     pub(super) fn leave_pass_open(&mut self) {
+        self.listed = None;
         if let TierSide::Node(n) = &mut self.side {
             n.leave_pass_open();
         }
@@ -2638,6 +2781,10 @@ pub(super) enum Pass {
     /// it serves it ([`TierCard::enqueue_eager`]) and captures the graph once
     /// the pass has settled ([`TierCard::capture`]).
     Feed,
+    /// A tier on a node: the pass's services go to the node together with
+    /// its first go, and the host raises each one's go at its picks
+    /// ([`TierCard::go_listed`]); nothing is captured.
+    Listed,
 }
 
 /// The tier graph's slot of `chain`: the step 0, the pair 1, the quad the

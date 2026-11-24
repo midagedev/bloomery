@@ -23,20 +23,23 @@
 //! A lost node ends both sides by name. Node 0 marks a tier whose channel
 //! failed lost ([`TierNode::lost`]) and ends that channel, and the host tier
 //! names it a lost card; a node that stops signalling mid-step is the go
-//! deadline's, as for a card of node 0's. A step sends the node only the
-//! layers whose picks name its slots, one enqueue frame each, so node 0 ends
-//! each pass that sent it one with an end frame ([`TierNode::send_end`]),
-//! and sends nothing more for a pass whose card it named lost. The server
-//! ends when node 0's channel ends without a close, when a request fails
-//! after it reached the tier's stream, or when work is outstanding — a layer
-//! asked of it unserved, or a pass opened and not ended — with no frame or
-//! progress past the go deadline and its grace: it writes
-//! [`super::step::RELEASE`] to its own counters and go words, so every wait
-//! its stream holds passes and node 0 names the release when it runs again
-//! ([`super::tier::TierCard::released`]); it drains its stream and returns
-//! the loss by name. A server between passes is idle for any time. A
-//! half-open control connection is bounded by its request deadline, and an
-//! unresponsive tier by the go deadline.
+//! deadline's, as for a card of node 0's. A step sends the node its layers
+//! as enqueue frames, one a layer: a replayed chain's every layer the node
+//! holds experts of, written together with the pass's first go
+//! ([`TierNode::send_listed`]); an eager chain's only the layers whose picks
+//! name its slots, each at its picks ([`TierNode::send_enqueue`]). Node 0
+//! ends each pass that sent it a frame with an end frame
+//! ([`TierNode::send_end`]), and sends nothing more for a pass whose card it
+//! named lost. The server ends when node 0's channel ends without a close,
+//! when a request fails after it reached the tier's stream, or when work is
+//! outstanding — a layer asked of it unserved, or a pass opened and not
+//! ended — with no frame or progress past the go deadline and its grace: it
+//! writes [`super::step::RELEASE`] to its own counters and go words, so
+//! every wait its stream holds passes and node 0 names the release when it
+//! runs again ([`super::tier::TierCard::released`]); it drains its stream
+//! and returns the loss by name. A server between passes is idle for any
+//! time. A half-open control connection is bounded by its request deadline,
+//! and an unresponsive tier by the go deadline.
 //!
 //! A prompt batch's block runs on the node as one request a tiered
 //! layer-batch ([`block`]): node 0 sends it before its host's union and
@@ -93,6 +96,9 @@ const SERVER: &str = "tier_server";
 /// or ends a pass and returns at once, so a node that has not answered by
 /// the go deadline is lost.
 const REPLY: Duration = GO_DEADLINE;
+
+/// An enqueue frame's payload: its layer, row and columns, a `u64` each.
+const ENQUEUE_BYTES: usize = 24;
 
 /// The open's bound beyond reading its rows: the card's open and the
 /// family's build. Derived, not measured.
@@ -1474,6 +1480,38 @@ impl TierNode {
             .send(Tag::Enqueue, self.req.done(), Instant::now() + REPLY);
         written.map_err(|e| self.lose_now("enqueue", e.to_string()))?;
         self.frames.enqueues += 1;
+        self.frames.open = true;
+        Ok(())
+    }
+
+    /// [`TierNode::send_enqueue`] for every service of a listed pass at once
+    /// ([`super::tier::TierCard::go_listed`]): one enqueue frame each, in go
+    /// order, over `cols` columns, written together without their replies.
+    /// The node enqueues each layer as its frame arrives, gated on the
+    /// layer's go, so its card starts a layer when the go lands and the
+    /// enqueue's cost sits under the layers before it. The frames open the
+    /// node's pass as one would, and their replies are read by
+    /// [`TierNode::drain_pass`].
+    pub(super) fn send_listed(
+        &mut self,
+        list: &[(usize, usize)],
+        cols: usize,
+    ) -> Result<(), GpuError> {
+        self.ready("enqueue")?;
+        let n = u32::try_from(list.len())
+            .map_err(|_| GpuError::shape(WHAT, format!("a listed pass of {}", list.len())))?;
+        self.req.clear();
+        for &(layer, row) in list {
+            self.req.len(layer).len(row).len(cols);
+        }
+        let written = self.ch.send_each(
+            Tag::Enqueue,
+            self.req.done(),
+            ENQUEUE_BYTES,
+            Instant::now() + REPLY,
+        );
+        written.map_err(|e| self.lose_now("enqueue", e.to_string()))?;
+        self.frames.enqueues += n;
         self.frames.open = true;
         Ok(())
     }
@@ -3174,6 +3212,68 @@ pub(super) mod tests {
             got,
             vec![want[0].clone(), want[1].clone(), (Tag::Close, Vec::new()),],
             "the frames the node got: layer 6 (no node pick) must send none"
+        );
+    }
+
+    /// Over loopback, with no card: a replayed chain's pass on a node tier is
+    /// listed. It sends nothing until its first go, then every service's
+    /// enqueue frame together, in go order, and the host expects the list's
+    /// layers; each later go sends nothing. A go out of order or past the
+    /// list, and a layer's own frame, are refused by name; a settle before
+    /// every go is raised is refused by name; the pass ends with one end.
+    #[test]
+    fn a_listed_pass_sends_its_layers_with_its_first_go() {
+        use super::super::tier::Pass;
+        use super::{TierCard, TierSet};
+
+        let (addr, peer) = loopback_peer();
+        let mut card = TierCard::on_node(
+            loopback_node(addr),
+            "test tier".into(),
+            TierSet::new(0..3, 4, vec![vec![0], vec![1], vec![2]]).expect("a set"),
+        );
+        let list = [(0, 0), (1, 0), (2, 0)];
+        let deadline = || Instant::now() + Duration::from_secs(10);
+        assert_eq!(
+            card.replay(Chain::Step, &list).expect("the replay"),
+            Pass::Listed
+        );
+        assert!(card.listing());
+        assert!(
+            card.send_layer(Chain::Step, 0, 0, 1).is_err(),
+            "a layer's own frame during a listed pass must be refused"
+        );
+        let early = card.go_listed(1, 0, &list).expect_err("a go out of order");
+        assert!(early.to_string().contains("service 0 of 3"), "{early}");
+        card.go_listed(0, 0, &list).expect("the first go");
+        assert_eq!((card.issued(), card.raised()), (3, 1));
+        let short = card
+            .drain_layers(deadline())
+            .expect_err("a settle before every go is raised");
+        assert!(short.to_string().contains("with 1 gos raised"), "{short}");
+        card.go_listed(1, 0, &list).expect("the second go");
+        card.go_listed(2, 0, &list).expect("the third go");
+        assert!(card.go_listed(2, 0, &list).is_err(), "a go past the list");
+        assert_eq!((card.issued(), card.raised()), (3, 3));
+        card.drain_layers(deadline()).expect("the frames' replies");
+        card.end_pass().expect("the pass's end");
+        assert!(!card.listing());
+        drop(card);
+        let enqueue = |layer| {
+            let mut o = Out::default();
+            o.len(layer).len(0).len(1);
+            (Tag::Enqueue, o.done().to_vec())
+        };
+        assert_eq!(
+            peer.join().expect("the peer"),
+            vec![
+                enqueue(0),
+                enqueue(1),
+                enqueue(2),
+                (Tag::End, Vec::new()),
+                (Tag::Close, Vec::new()),
+            ],
+            "the frames the node got: the list's, then one end"
         );
     }
 

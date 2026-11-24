@@ -118,12 +118,13 @@
 //!   plan, the ids it never picks coldest — and runs this binary as a child ([`NODESKIP_STAGE`])
 //!   twice under the file in its environment alone: over a loopback `tier_server` the gate
 //!   serves (`BLOOMERY_TIER_NODES`, the TCP link) and with the tier a card of the child's own
-//!   process. Over the node, a layer whose picks name no slot of the node's sends it no frame
-//!   and the host signals the layer's counter itself, so the node's stream stays in step; each
-//!   step must count its skipped layers (`stats().node_skipped`, the `stat step` record's
-//!   `node_skipped` field) and the two children's tokens and logits must agree bit for bit —
-//!   the same experts on the same homes, so the skip moves no value. Precondition: the trace
-//!   leaves a routed layer's whole tier depth unrouted, so every step skips a layer.
+//!   process. Over the node, a replayed step's pass is listed: every layer of the node's goes to
+//!   it with the pass's first go, and the host raises each layer's go, so a layer whose picks
+//!   name no slot of the node's runs there over none and its done carries no row; each step
+//!   must count those layers (`stats().node_skipped`, the `stat step` record's `node_skipped`
+//!   field) and the two children's tokens and logits must agree bit for bit — the same experts
+//!   on the same homes, so a layer the picks leave the node moves no value. Precondition: the
+//!   trace leaves a routed layer's whole tier depth unrouted, so every step has such a layer.
 //! - `--rank` (B10): the plan with a router rank (`BLOOMERY_EXPERT_RANK`). The gate writes a
 //!   rank file from the model's own routed layers, each layer's ids in a stride order that is not
 //!   the id order, and runs this binary as a child (`--rank-stage`) whose environment alone names
