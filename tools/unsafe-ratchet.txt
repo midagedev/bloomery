@@ -891,7 +891,10 @@ gguf 7 2 0
 # host launches are the modules' safe methods. Each block has its SAFETY line or `# Safety` contract.
 # PIN(2026-11-23): gpu 3455/452 -> 3548/457, new code, not old code relaxed: Inkling 2's card body (the official
 # folder's MXFP8 and Q8_0 selected-expert launches, the DSpark draft kernels' launches), each block with its SAFETY line.
-gpu 3548 457 10
+# PIN(2026-11-24): gpu 3548/457 -> 3556/459, new code, not old code relaxed: the cuda-oxide pin move's
+# retirement settle (tensor::try_settle_retirements, Gpu::settle_frees) and the frees hold (capsync::hold_frees and its
+# hw_held_ test's driver calls), each block with its SAFETY line.
+gpu 3556 459 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -1274,7 +1277,9 @@ placement 0 0 0
 # (`generic::dot_q8k_tile_avx2`: one target_feature fn with its block, and the IQ2_S dispatch arm in `tile`), IQ2_S's
 # vector scale decode (`scales_avx2`, one fn and block), and the two test clauses that hold the tile to the generic
 # dot (`tile_of`, `check_tile`), each with its SAFETY line.
-qdot 296 136 0
+# PIN(2026-11-24): qdot 296/136 -> 298/138, new code, not old code relaxed: IQ3_XXS's word-doubled grid gather and
+# scale shuffle (`iq3xxs_values`, `iq3xxs_scale`: two inline(always) fns, each with its block and `# Safety`).
+qdot 298 138 0
 quantize 0 0 0
 record 0 0 0
 refset 0 0 0

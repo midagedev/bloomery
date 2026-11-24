@@ -72,3 +72,6 @@ crates/metal/src/trace.rs 2 a test's scripted load workers and a test's off-thre
 crates/model-hf/src/bin/prepare.rs 1 the --follow order test's landing thread, from a libtest thread that is never pinned
 crates/quantize/src/run.rs 3 the writer's scoped threads (the host conversion ahead of the writer; the expert-batch reader twice) borrow the mmapped set and the plan, which spawn_helper's 'static body cannot; bloomery-quantize never calls pin_caller, so they inherit no one-cpu mask
 crates/vision/src/arch/qwen3vl/fixture.rs 1 the synthetic encoder writer's fill lanes (one scope per tensor), from the fixture_mmproj main or a libtest thread, never pinned
+# PIN(2026-11-24): the late-free tests (cuda-oxide ab2b6738's retirement thread) watch a call from a second thread.
+crates/gpu/src/capsync.rs 1 a gate test's watcher that reports whether the driver call after a parked pass returns, from a libtest thread that is never pinned
+crates/gpu/src/checkpoint.rs 1 a gate test's copy call made while its stream is held, from a libtest thread that is never pinned
