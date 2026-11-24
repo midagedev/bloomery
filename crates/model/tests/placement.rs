@@ -72,18 +72,19 @@ struct HostPin {
     headroom: i128,
 }
 
-// PIN(2026-09-23): design §3, the whole model placed once.
-const TENSORS: usize = 1_046;
-// PIN(2026-09-23): design §1, bf16 decoded to f32 on the cards: the routers.
-const BF16_ROUTERS: u64 = 314_572_800;
+// PIN(2026-11-24): the nine headers' count. The bq3km set's Engram tables are concatenated: one `engram_gate` where the Q3_K_M set held `engram_k` and `engram_q` at each of the two sites, and one `per_layer_token_embd` where it held two `engram_embd`: 1,046 − 3.
+const TENSORS: usize = 1_043;
+// PIN(2026-11-24): the bq3km set holds the routers in f32, so no tensor of it decodes from bf16: the 40 `ffn_gate_inp` weights and their 40 `exp_probs_b` biases sit on the cards in the file's f32, 40 × (5120 × 384 + 384) × 4 B (design §3's router row).
+const F32_ROUTERS: (usize, u64) = (80, 314_634_240);
 
 // PIN(2026-09-24): the public Q3_K_M file, plan (a)'s A6000 line, re-taken on top of the host ring shadow: attention and the shared experts in q3_K/q4_K instead of q8_0 leave 4,258,054,144 dense bytes fewer, and the card keeps 254 experts more (2,668), n_l 70–71.
+// PIN(2026-11-24): the public bq3km file: two Engram gains fewer on the card, 163,840 dense bytes fewer, and the allocator's granules the same (the gains' room was shared granules' slack), so the rounding is 163,840 B more.
 const PUB_A_A6000: CardPin = CardPin {
     card: "A6000",
-    dense: 3_891_325_376,
+    dense: 3_891_161_536,
     expert_bytes: 44_750_684_160,
     experts: 2_668,
-    rounding: 515_233_344,
+    rounding: 515_397_184,
     kv: 110_125_056,
     headroom: 1_081_057_280,
     eligible: 2..40,
@@ -97,12 +98,13 @@ const PUB_A_HOST: HostPin = HostPin {
     headroom: 43_437_910_016,
 };
 // PIN(2026-09-24): the public file, plan (b)'s A6000 line, re-taken on top of the host ring shadow: 134 experts more (2,814), n_l 156–157 on layers 2–19.
+// PIN(2026-11-24): the public bq3km file, both Engram sites below the cut: as plan (a)'s A6000, 163,840 dense bytes fewer and 163,840 B more rounding.
 const PUB_B_A6000: CardPin = CardPin {
     card: "A6000",
-    dense: 1_743_902_176,
+    dense: 1_743_738_336,
     expert_bytes: 47_199_559_680,
     experts: 2_814,
-    rounding: 255_724_064,
+    rounding: 255_887_904,
     kv: 65_560_576,
     headroom: 1_083_678_720,
     eligible: 2..20,
@@ -144,25 +146,23 @@ struct FilePins {
     gate_experts: u64,
 }
 
-// PIN(2026-11-18): every number below was taken on the former default, the 1017 Q3_K_M set; the default is now the bq3km set
-// (gguf::v41::PUBLIC), whose dense and Engram tensors differ (its routed stacks are the same types and counts), so a run on it
-// reads these as a mismatch with the plan's own figures printed beside: re-take them from that run's summary.
+// PIN(2026-11-24): every number below was taken on the 1017 Q3_K_M set; fd121bd41 made the 1017 bq3km set the default, whose routers and Engram gains are f32 in the file where that set held them in bf16, whose gains are one `engram_gate` a site for `engram_k` and `engram_q`, and whose routed stacks are the same types and counts (the expert pins did not move): re-taken from the plan's own summary, each against the file's headers.
 const PUBLIC: FilePins = FilePins {
     a_cards: &[PUB_A_A6000],
     a_host: &PUB_A_HOST,
     b_cards: &[PUB_B_A6000, PUB_B_3090],
     b_host: &PUB_B_HOST,
-    // PIN(2026-09-24): the public file's engram_embd ×2 in q3_K on NVMe.
+    // PIN(2026-11-24): the bq3km set's one per_layer_token_embd holds both tables' rows: the same bytes.
     nvme: 84_482_513_500,
     // PIN(2026-09-24): the public file has no q8_0 tensor.
     q8_0_card: (0, 0),
     // PIN(2026-09-24): ffn_down_shexp of layers 0 and 1, q5_K, on the card for the dense gemv.
     q5_k_card: (2, 16_220_160),
-    // PIN(2026-10-21): engram_{k,q} are bf16 in the file, decoded to f32 on the cards: 4 × 20,480 values × 4 B, the same bytes as from q3_K.
-    engram_gain: 327_680,
-    // PIN(2026-10-21): the default file's bytes one token reads: all, and dense. Each engram_{k,q} reads its file bytes, 40,960 (bf16) where the former file held 8,800 (q3_K): +4 × 32,160 = +128,640 on both.
-    read_total: 7_774_439_160,
-    read_dense: 3_731_190_360,
+    // PIN(2026-11-24): the bq3km set's gains are its two sites' `engram_gate` in f32: 2 × 20,480 values × 4 B.
+    engram_gain: 163_840,
+    // PIN(2026-11-24): the bq3km set's routers read their f32 bytes, 40 × 5120 × 384 × 4 B where the Q3_K_M set's read its bf16 half: +157,286,400 on both; its two gains read what the four read (2 × 81,920 = 4 × 40,960).
+    read_total: 7_931_725_560,
+    read_dense: 3_888_476_760,
     // PIN(2026-09-24): the public file's gate placement keeps 1,146 experts; re-taken on top of the host ring shadow.
     gate_experts: 1_146,
 };
@@ -510,14 +510,20 @@ fn pins(plan: &Plan<'_>, cards: &[CardPin], host: &HostPin, f: &FilePins) -> Vec
         f.q5_k_card.0 as u64,
     );
     pin(&mut bad, "q5_K on cards: bytes", bytes, f.q5_k_card.1);
-    let (_, bytes) = on_cards(plan, &mut bad, CardFormat::Bf16AsF32, |role, ty| {
-        ty == GgmlType::BF16 && role == Role::Router
+    let (count, bytes) = on_cards(plan, &mut bad, CardFormat::F32, |role, _| {
+        role == Role::Router
     });
-    pin(&mut bad, "bf16 routers as f32", bytes, BF16_ROUTERS);
-    let (_, bytes) = on_cards(plan, &mut bad, CardFormat::Bf16AsF32, |role, _| {
+    pin(
+        &mut bad,
+        "routers as f32: tensors",
+        count as u64,
+        F32_ROUTERS.0 as u64,
+    );
+    pin(&mut bad, "routers as f32: bytes", bytes, F32_ROUTERS.1);
+    let (_, bytes) = on_cards(plan, &mut bad, CardFormat::F32, |role, _| {
         role == Role::EngramGain
     });
-    pin(&mut bad, "engram_{k,q} as f32", bytes, f.engram_gain);
+    pin(&mut bad, "engram gains as f32", bytes, f.engram_gain);
     for r in &plan.rows {
         let t = &plan.model.tensors[r.tensor];
         let want = match t.ty {
