@@ -209,6 +209,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bloomery-gpu-ernie55"
+version = "0.1.0"
+dependencies = [
+ "bloomery-gguf",
+ "bloomery-gpu",
+ "bloomery-levers",
+ "bloomery-model",
+ "bloomery-runtime",
+ "cuda-core",
+]
+
+[[package]]
 name = "bloomery-gpu-flint"
 version = "0.1.0"
 dependencies = [
@@ -234,6 +246,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
+ "bloomery-gpu-ernie55",
  "bloomery-gpu-flint",
  "bloomery-gpu-gemma-embedding2",
  "bloomery-gpu-gemma4a",

@@ -77,6 +77,8 @@ bloomery-gpu-gemma4a = { path = "../gpu-gemma4a", optional = true }
 bloomery-gpu-mistrallarge4 = { path = "../gpu-mistrallarge4", optional = true }
 # The Hy4-flash program, reached only through the `hy4` feature (its end-to-end gate).
 bloomery-gpu-hy4 = { path = "../gpu-hy4", optional = true }
+# The ERNIE 5.5 Flash program, reached only through the `ernie55` feature.
+bloomery-gpu-ernie55 = { path = "../gpu-ernie55", optional = true }
 cuda-core = { workspace = true, optional = true }
 # A gate binary's own `#[cuda_module]` (`gate_kquant`: entries no engine binary links) needs the
 # device and host halves of cuda-oxide as direct dependencies: the macros emit `::cuda_host` and
@@ -178,6 +180,8 @@ gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
 mistrallarge4 = ["gpu", "dep:bloomery-gpu-deepseek41", "dep:bloomery-gpu-mistrallarge4", "bloomery-app/mistrallarge4"]
 # The Hy4-flash program and its session (serve_seats/hy4.rs, the e2e and serve gates).
 hy4 = ["gpu", "dep:bloomery-gpu-hy4", "bloomery-app/hy4"]
+# The ERNIE 5.5 Flash program (its component gates).
+ernie55 = ["gpu", "dep:bloomery-gpu-ernie55"]
 
 [[bin]]
 name = "gate_gemma4a"

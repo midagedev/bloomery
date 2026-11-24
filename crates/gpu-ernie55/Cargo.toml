@@ -1,0 +1,19 @@
+[package]
+name = "bloomery-gpu-ernie55"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+# The ERNIE 5.5 Flash program: host code only, no `#[cuda_module]` of its own. It composes the kernels of
+# `bloomery-gpu` as `bloomery-gpu-hy4` does. It is built with `cargo oxide` because that crate is.
+[dependencies]
+cuda-core.workspace = true
+bloomery-gpu = { path = "../gpu" }
+bloomery-gguf = { path = "../gguf" }
+bloomery-levers = { path = "../levers" }
+bloomery-model = { path = "../model" }
+bloomery-runtime = { path = "../runtime" }
