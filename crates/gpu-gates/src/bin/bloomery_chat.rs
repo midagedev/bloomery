@@ -399,7 +399,7 @@ mod drive {
                 let machine = machine(Body::layer_count(&inputs));
                 let plan = Body::plan(&inputs, &machine, ctx, &ds41)?;
                 let planned = t.elapsed();
-                let mut model = Body::open(file, &inputs, &plan, &ds41)?;
+                let mut model = Body::open(file.into(), &inputs, &plan, &ds41)?;
                 model.note_load_plan(planned);
                 Ok(model)
             },

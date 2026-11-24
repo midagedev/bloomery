@@ -20,6 +20,7 @@
 
 use std::num::NonZeroUsize;
 
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::weights::Weights;
@@ -49,14 +50,22 @@ impl Batch for Body {
     }
 
     fn open_placed(
-        file: Split,
+        file: Model,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         host: HostCfg,
         residency: Residency,
         slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed_slots(file, plan, inputs, 0, host, residency, slots)
+        Body::open_placed_slots(
+            crate::split_of(file, WHAT)?,
+            plan,
+            inputs,
+            0,
+            host,
+            residency,
+            slots,
+        )
     }
 
     fn batch(

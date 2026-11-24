@@ -15,6 +15,14 @@
 //! another epsilon, or whose keys carry no rope (`n_dims` 0, the table is not
 //! read), launches the same kernel.
 //!
+//! [`IndexKeyKernels::enqueue_index_key_ln_neox`] is the form for a selector
+//! that reads its keys at f32 precision (ERNIE 5.5's lightning indexer): the
+//! same LayerNorm, a NEOX turn of the first `n_dims` values — pairs `(i, i +
+//! n_dims/2)` through `rope_neox::neox_pair`, the lane's partner `lane ^
+//! (n_dims/8)` reached by one xor shuffle — no transform, and an f32 row at
+//! the position. A key that is not finite after its turn raises
+//! [`FaultSite::CacheValue`] as the f16 form's does.
+//!
 //! Numeric contract: the rope is `rope_table::rope_pair_rn`, ik's unfused
 //! rotation; the transform is ik's `fast_ht` (`iqk_cpu_ops.cpp`) op for op
 //! (butterflies at `h = 1, 2, 4, …, 64`, the lower value `x + y`, the upper
@@ -38,6 +46,7 @@
 
 use crate::flash::{f16_finite, f32_to_f16_bits};
 use crate::latent::warp_sum_f64;
+use crate::rope_neox::neox_pair;
 use crate::rope_table::rope_pair_rn;
 use crate::{DeviceTensor, FaultSink, FaultSite, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -266,6 +275,122 @@ mod index_key_kernels {
             fault.raise(FaultSite::CacheValue);
         }
     }
+
+    /// One warp per token, four a block: token `t`'s key is `x[t·128 ..]` (the projection of its layer's input),
+    /// normalized by the LayerNorm of the module doc (`gain`, `bias`, `eps`), its first `n_dims` values turned in
+    /// NEOX pairs `(i, i + n_dims/2)` — `neox_pair` of the lower lane's value and its partner's, the partner lane
+    /// `lane ^ (n_dims/8)`, by table pair `i` of `cs[t·n_dims ..]`; none when `n_dims` is 0 — and stored as f32, no
+    /// transform, into row `pos[t]` of `cache` (`rows` rows of 128 f32). A token whose position leaves the cache
+    /// writes nothing. Every guard reads warp-uniform values, so every lane reaches the shuffle.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            x.len() >= m * 128,
+            gain.len() >= 128,
+            bias.len() >= 128,
+            pos.len() >= m,
+            cs.len() >= m * n_dims,
+            cache.len() >= rows * 128
+        )
+    )]
+    pub fn index_key_ln_neox(
+        x: &[f32],
+        gain: &[f32],
+        bias: &[f32],
+        pos: &[u32],
+        cs: &[f32],
+        eps: f32,
+        n_dims: u32,
+        rows: u32,
+        m: u32,
+        fault: FaultSink,
+        mut cache: DisjointSlice<f32>,
+    ) {
+        let tid = thread::threadIdx_x();
+        let t = thread::blockIdx_x() as usize * INPUT_WARPS + (tid / LANES) as usize;
+        if t >= m as usize {
+            return;
+        }
+        let lane = tid % LANES;
+        // SAFETY: t < m <= pos.len() by the launch contract.
+        let row = unsafe { *pos.get_unchecked(t) } as usize;
+        if row >= rows as usize {
+            if lane == 0 {
+                fault.raise(FaultSite::CachePos);
+            }
+            return;
+        }
+        let v = PER_LANE * lane as usize;
+        // SAFETY: t < m, so t·128 + v + 4 <= m·128 <= x.len().
+        let k = unsafe { load4(x, t * WIDTH + v) };
+        let (dev, scale) = ln_dev_scale(k, eps);
+        // SAFETY: v + 4 <= 128 <= gain.len() and bias.len().
+        let (gw, bw) = unsafe { (load4(gain, v), load4(bias, v)) };
+        // Each product rounded on its own: a plain multiply feeding the
+        // add would be contracted into a fused one.
+        let mut n = [
+            add_rn_f32(mul_rn_f32(mul_rn_f32(dev[0], scale), gw[0]), bw[0]),
+            add_rn_f32(mul_rn_f32(mul_rn_f32(dev[1], scale), gw[1]), bw[1]),
+            add_rn_f32(mul_rn_f32(mul_rn_f32(dev[2], scale), gw[2]), bw[2]),
+            add_rn_f32(mul_rn_f32(mul_rn_f32(dev[3], scale), gw[3]), bw[3]),
+        ];
+        let nd = n_dims as usize;
+        let half = nd / 2;
+        // The other member of each of this lane's pairs: the whole warp
+        // issues the shuffle, lanes outside the turned span included.
+        let mask = (half / PER_LANE) as u32;
+        let p = [
+            warp::shuffle_xor_f32(n[0], mask),
+            warp::shuffle_xor_f32(n[1], mask),
+            warp::shuffle_xor_f32(n[2], mask),
+            warp::shuffle_xor_f32(n[3], mask),
+        ];
+        if v < nd {
+            let lower = v < half;
+            let i0 = if lower { v } else { v - half };
+            // SAFETY: i0 + 3 < n_dims/2, so the eight table values lie inside
+            // token t's n_dims values, below m·n_dims <= cs.len().
+            let (c0, c1) = unsafe { (load4(cs, t * nd + 2 * i0), load4(cs, t * nd + 2 * i0 + 4)) };
+            let cs4 = [
+                [c0[0], c0[1]],
+                [c0[2], c0[3]],
+                [c1[0], c1[1]],
+                [c1[2], c1[3]],
+            ];
+            let mut j = 0usize;
+            while j < PER_LANE {
+                let [c, s] = cs4[j];
+                let (y0, y1) = if lower {
+                    neox_pair(n[j], p[j], c, s)
+                } else {
+                    neox_pair(p[j], n[j], c, s)
+                };
+                n[j] = if lower { y0 } else { y1 };
+                j += 1;
+            }
+        }
+        let base = row * WIDTH + v;
+        let mut ok = true;
+        let mut j = 0usize;
+        while j < PER_LANE {
+            ok &= n[j].is_finite();
+            // SAFETY: base + 4 <= (row + 1)·128 <= rows·128 <= cache.len();
+            // one warp owns the position's row (distinct positions, the
+            // caller's contract) and the lane its four values.
+            unsafe { *cache.get_unchecked_mut(base + j) = n[j] };
+            j += 1;
+        }
+        if !ok {
+            fault.raise(FaultSite::CacheValue);
+        }
+    }
 }
 
 // -------------------------------------------------------------- launchers
@@ -399,6 +524,196 @@ impl IndexKeyKernels {
         )?;
         Ok(())
     }
+
+    /// Enqueue the f32 keys of `m` tokens (module doc): the LayerNorm, the
+    /// NEOX turn of the first `n_dims` values, the f32 row at each token's
+    /// position. One warp a token, four a block. Refused before the launch:
+    /// no token, a turned span that is not zero or a multiple of eight at
+    /// most [`WIDTH`], a cache of no rows or not [`WIDTH`] wide, short rows,
+    /// weights, positions or tables. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_index_key_ln_neox(
+        &self,
+        stream: &CudaStream,
+        args: IndexKeyLnNeoxArgs<'_>,
+    ) -> Result<(), GpuError> {
+        let what = "enqueue_index_key_ln_neox";
+        let IndexKeyLnNeoxArgs {
+            x,
+            gain,
+            bias,
+            pos,
+            cs,
+            eps,
+            n_dims,
+            m,
+            cache,
+            fault,
+        } = args;
+        if m == 0 {
+            return Err(GpuError::shape(what, "no token: m must be at least 1"));
+        }
+        if n_dims != 0 && !(n_dims.is_multiple_of(PER_LANE * 2) && n_dims <= WIDTH) {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "the turned span is two lanes' four values a pair: n_dims must be zero or a \
+                     multiple of {} at most {WIDTH}, got {n_dims}",
+                    PER_LANE * 2
+                ),
+            });
+        }
+        if cache.cols() != WIDTH || cache.rows() == 0 {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "the cache is {}x{}, want rows of {WIDTH} and at least one",
+                    cache.rows(),
+                    cache.cols()
+                ),
+            });
+        }
+        if x.len() < m * WIDTH
+            || gain.len() < WIDTH
+            || bias.len() < WIDTH
+            || pos.len() < m
+            || cs.len() < m * n_dims
+        {
+            return Err(GpuError::Shape {
+                what,
+                detail: format!(
+                    "x.len() {} (need {}), gain.len() {} and bias.len() {} (need {WIDTH}), \
+                     pos.len() {} (need {m}), cs.len() {} (need {})",
+                    x.len(),
+                    m * WIDTH,
+                    gain.len(),
+                    bias.len(),
+                    pos.len(),
+                    cs.len(),
+                    m * n_dims
+                ),
+            });
+        }
+        let rows = launch_u32(what, "rows", cache.rows())?;
+        launch_u32(what, "rows * WIDTH", cache.rows() * WIDTH)?;
+        let grid = launch_u32(what, "grid", m.div_ceil(INPUT_WARPS))?;
+        let prep =
+            self.module
+                .prepare_index_key_ln_neox(LaunchConfig1D::new(grid, INPUT_THREADS, 0))?;
+        self.module.index_key_ln_neox(
+            stream,
+            &prep,
+            x,
+            gain,
+            bias,
+            pos,
+            cs,
+            eps,
+            launch_u32(what, "n_dims", n_dims)?,
+            rows,
+            launch_u32(what, "m", m)?,
+            fault,
+            cache.buf_mut(),
+        )?;
+        Ok(())
+    }
+}
+
+/// [`IndexKeyKernels::enqueue_index_key_ln_neox`]'s arguments: as
+/// [`IndexKeyInputArgs`]'s — `x` holds `m` projections of [`WIDTH`],
+/// token-major; `gain` and `bias` the key norm's weights; `pos` the `m`
+/// positions (the cache rows the keys land on); `cs` the tokens' rope tables
+/// (`n_dims` values a token, `[cos, sin, …]`; not read when `n_dims` is 0) —
+/// and `cache` the index-key cache, a row of [`WIDTH`] f32 per position.
+pub struct IndexKeyLnNeoxArgs<'a> {
+    pub x: &'a DeviceBuffer<f32>,
+    pub gain: &'a DeviceBuffer<f32>,
+    pub bias: &'a DeviceBuffer<f32>,
+    pub pos: &'a DeviceBuffer<u32>,
+    pub cs: &'a DeviceBuffer<f32>,
+    pub eps: f32,
+    pub n_dims: usize,
+    pub m: usize,
+    pub cache: &'a mut DeviceTensor<f32>,
+    /// Where a position past the cache and a key value that is not finite
+    /// are raised (the launch's layer).
+    pub fault: FaultSink,
+}
+
+/// The site `site`'s bit, as the card's layer mask holds it.
+fn site_bit(site: FaultSite) -> u32 {
+    1 << site as u32
+}
+
+/// The host rule of [`IndexKeyKernels::enqueue_index_key_ln_neox`]: the
+/// module doc's LayerNorm (op for op: the lane sums in value order, the xor
+/// butterfly in f64) by `norm`'s gain and bias, the NEOX turn of the first
+/// `n_dims` values — `neox_pair`'s rounding, the inner product rounded on its
+/// own and one fused multiply-add — and the f32 row, for the `pos.len()`
+/// tokens of `x` (`[m][128]`) into `cache` (`[rows][128]` f32). Returns the
+/// mask of the sites the launch raises.
+///
+/// # Panics
+///
+/// When `x` holds fewer than `pos.len()` rows, `cs` fewer than `n_dims` values
+/// a token, or `norm`'s gain or bias is shorter than [`WIDTH`].
+#[must_use]
+pub fn index_key_ln_neox_host(
+    x: &[f32],
+    norm: (&[f32], &[f32]),
+    pos: &[u32],
+    cs: &[f32],
+    eps: f32,
+    n_dims: usize,
+    cache: &mut [f32],
+) -> u32 {
+    let (gain, bias) = norm;
+    let rows = cache.len() / WIDTH;
+    let mut sites = 0;
+    for (t, &p) in pos.iter().enumerate() {
+        let k = &x[t * WIDTH..t * WIDTH + WIDTH];
+        let lane_sum = |f: &dyn Fn(usize) -> f64| -> f64 {
+            let lanes: Vec<f64> = (0..LANES as usize)
+                .map(|l| {
+                    (0..PER_LANE)
+                        .map(|j| f(PER_LANE * l + j))
+                        .fold(0.0, |s, e| s + e)
+                })
+                .collect();
+            crate::linear::butterfly_f64(&lanes)
+        };
+        let mean = (lane_sum(&|i| f64::from(k[i])) / WIDTH as f64) as f32;
+        let dev: Vec<f32> = k.iter().map(|&e| e - mean).collect();
+        let var = (lane_sum(&|i| f64::from(dev[i] * dev[i])) / WIDTH as f64) as f32;
+        let scale = if var.is_finite() {
+            1.0 / (var + eps).sqrt()
+        } else {
+            f32::NAN
+        };
+        let p = p as usize;
+        if p >= rows {
+            sites |= site_bit(FaultSite::CachePos);
+            continue;
+        }
+        let mut n: Vec<f32> = (0..WIDTH)
+            .map(|d| ((dev[d] * scale) * gain[d]) + bias[d])
+            .collect();
+        let half = n_dims / 2;
+        let table = &cs[t * n_dims..t * n_dims + n_dims];
+        for i in 0..half {
+            let (c, s) = (table[2 * i], table[2 * i + 1]);
+            let (x0, x1) = (n[i], n[i + half]);
+            n[i] = x0.mul_add(c, -(x1 * s));
+            n[i + half] = x0.mul_add(s, x1 * c);
+        }
+        for d in 0..WIDTH {
+            if !n[d].is_finite() {
+                sites |= site_bit(FaultSite::CacheValue);
+            }
+            cache[p * WIDTH + d] = n[d];
+        }
+    }
+    sites
 }
 
 #[cfg(test)]

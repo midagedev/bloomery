@@ -32,6 +32,8 @@ bloomery-gpu-solar2 = { path = "../gpu-solar2", optional = true }
 bloomery-gpu-flint = { path = "../gpu-flint", optional = true }
 # The Hy4-flash session (`arch::hy4`).
 bloomery-gpu-hy4 = { path = "../gpu-hy4", optional = true }
+# The ERNIE 5.5 Flash session (`arch::ernie55`).
+bloomery-gpu-ernie55 = { path = "../gpu-ernie55", optional = true }
 # The Mistral Large 4 session (`arch::mistrallarge4`).
 bloomery-gpu-mistrallarge4 = { path = "../gpu-mistrallarge4", optional = true }
 # The levers the sessions' own configurations carry (the plan's card budget, the host set's load
@@ -48,4 +50,5 @@ minimaxm3 = ["dep:bloomery-gpu-minimaxm3"]
 solar2 = ["dep:bloomery-gpu-solar2"]
 flint = ["dep:bloomery-gpu-flint"]
 hy4 = ["dep:bloomery-gpu-hy4"]
+ernie55 = ["dep:bloomery-gpu-ernie55"]
 mistrallarge4 = ["dep:bloomery-gpu-mistrallarge4", "dspark"]

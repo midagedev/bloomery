@@ -1,8 +1,8 @@
 //! What an ERNIE 5.5 file asks that [`models::ModelSpec`] has no field for, in this family's own
 //! types: each is a part of the layers or the head that the common description cannot state
-//! without a field every family would fill, so it is listed here and refused by name
-//! ([`Ops::unrun`]) until a program of this family runs it. A common owner that takes one up
-//! would add the field named beside it:
+//! without a field every family would fill, so it is listed here. The ernie55 body runs each at
+//! the values [`Ops::unrun`] names, and a file holding another value is refused by name. A common
+//! owner that takes one up would add the field named beside it:
 //! - the head mix ([`Ops::vha_rank`]): `models::Latent` would gain a head-mix rank, set to 0 by its
 //!   literals in deepseek41, glm5next, hy4 and mistrallarge4 (`spec.rs`) and in `delta_mla`'s
 //!   `Mla::latent` (kimi_k3, raon1);
@@ -43,6 +43,11 @@ pub struct Ops {
 /// Router matrices an ERNIE routed layer carries.
 pub const ROUTERS: u32 = 2;
 
+/// The rotated values of the indexer's query and key the ernie55 body turns: the latent layer's
+/// rope row's width, whose turn the indexer shares (`gpu-ernie55/src/attn_mla.rs` asserts its
+/// `ROPE` equal).
+pub const INDEX_ROPE: u32 = 64;
+
 impl Ops {
     /// The ops of `hp`'s file.
     pub fn of(hp: &Hparams) -> Result<Ops, PlacementError> {
@@ -54,32 +59,43 @@ impl Ops {
         })
     }
 
-    /// Every op a description of this family holds that no program runs, one item each: the whole
-    /// list, since no program of this family exists.
+    /// Every op of this file the ernie55 body does not run, one item each: a head mix of no rank
+    /// (`gpu/src/vha.rs` `fold` folds any other), a router count other than [`ROUTERS`] (the two
+    /// routers `gpu-ernie55/src/moe.rs` sums), a MultiMax of another count than [`MULTIMAX`]
+    /// (`gpu/src/multimax.rs`, which `gpu-ernie55/src/head.rs` asserts equal) and an indexer rope
+    /// of another width than [`INDEX_ROPE`]. Empty for a file the body runs.
     #[must_use]
     pub fn unrun(&self) -> Vec<Unimplemented> {
         let item = |feature: String| Unimplemented {
             layer: None,
             feature,
         };
-        vec![
-            item(format!(
+        let mut out = Vec::new();
+        if self.vha_rank == 0 {
+            out.push(item(format!(
                 "the head mix of rank {}: every layer's heads mixed by attn_vha_u and attn_vha_v",
                 self.vha_rank
-            )),
-            item(format!(
+            )));
+        }
+        if self.routers != ROUTERS {
+            out.push(item(format!(
                 "{} summed sigmoid routers (ffn_gate_inp, ffn_gate_inp_1) with a learned per-expert \
                  scale (ffn_exp_scale)",
                 self.routers
-            )),
-            item(format!(
+            )));
+        }
+        if self.multimax as usize != MULTIMAX {
+            out.push(item(format!(
                 "the head's MultiMax: {} ranges and scales on the logits",
                 self.multimax
-            )),
-            item(format!(
+            )));
+        }
+        if self.index_rope != INDEX_ROPE {
+            out.push(item(format!(
                 "the indexer's NeoX rope over its leading {} values",
                 self.index_rope
-            )),
-        ]
+            )));
+        }
+        out
     }
 }

@@ -221,6 +221,20 @@ pub struct Read {
     pub source: Option<FolderSource>,
 }
 
+/// The GGUF split at `path` ([`read_file`]) for the seat `family`, which serves `serves` files: a
+/// directory is refused by name. The model a seat that reads no checkpoint folder takes
+/// ([`Tiered::read_model`]).
+pub fn read_split(path: &Path, family: &str, serves: &str) -> Result<Read, GateError> {
+    if path.is_dir() {
+        return Err(format!(
+            "{} is a directory: the {family} seat serves {serves} files",
+            path.display()
+        )
+        .into());
+    }
+    read_file(path)
+}
+
 /// The GGUF split at `path`, which the engine thread opens again for its load.
 pub fn read_file(path: &Path) -> Result<Read, GateError> {
     let split = Split::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -325,19 +339,11 @@ pub trait Tiered: Seat + Sized + 'static {
     /// Whether `arch` is a file this seat serves.
     fn accepts(arch: Arch) -> bool;
 
-    /// The model at `path`. The default is a GGUF split and refuses a directory by name; a seat
-    /// that reads a checkpoint folder overrides it, opening the folder once ([`Read`]).
+    /// The model at `path`. The default is a GGUF split and refuses a directory by name
+    /// ([`read_split`]); a seat that reads a checkpoint folder overrides it, opening the folder
+    /// once ([`Read`]).
     fn read_model(path: &Path) -> Result<Read, GateError> {
-        if path.is_dir() {
-            return Err(format!(
-                "{} is a directory: the {} seat serves {} files",
-                path.display(),
-                Self::FAMILY,
-                Self::SERVES
-            )
-            .into());
-        }
-        read_file(path)
+        read_split(path, Self::FAMILY, Self::SERVES)
     }
 
     /// Whether this seat's explicit flags select the one-token prompt feed.
@@ -472,6 +478,12 @@ pub trait Tiered: Seat + Sized + 'static {
     fn think(_inputs: &PlanInputs<Self::H>) -> Result<Option<ThinkTags>, GateError> {
         Ok(None)
     }
+
+    /// The chat template the seat serves where the model carries none (`tokenizer.chat_template`)
+    /// and no `--chat-template-file` names one: the server's port of a renderer a checkpoint ships
+    /// as code. `None` (the default) serves the model's own, and a model with none is refused by
+    /// name.
+    const TEMPLATE: Option<&'static str> = None;
 
     /// Registers the record kinds the seat's server prints (`record::at_main_with_flags` with its
     /// `record::BLOOMERY_SERVE_*` list), before the run checks its arguments.
@@ -847,9 +859,11 @@ pub fn run<S: Tiered>(args: &[String], side: &side_seat::Flags) -> Result<ServeE
         )
         .into());
     }
+    // A model that carries no template is served the seat's own where it has one.
+    let own = S::TEMPLATE.map(|t| gguf::Value::String(t.to_owned()));
     let chat = ChatSurface::read(
         &path,
-        split.value("tokenizer.chat_template"),
+        split.value("tokenizer.chat_template").or(own.as_ref()),
         split.value("general.name"),
         a.template_file.path(),
         S::ALIAS,

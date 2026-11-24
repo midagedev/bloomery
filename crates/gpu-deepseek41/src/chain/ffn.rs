@@ -108,11 +108,11 @@ use runtime::combine::Slots;
 use crate::chain::join::TRUNK;
 use crate::dense::{Dense, DenseKernels};
 use crate::experts::{ExpertGateUp, ExpertKernels};
-use crate::hc::{
+use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
+use bloomery_gpu::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPostArgs,
     HcPreScratch, hc_fold_elem, hc_post_elem,
 };
-use crate::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
 use bloomery_gpu::token_major::TokenMajor;
 
 mod batch;

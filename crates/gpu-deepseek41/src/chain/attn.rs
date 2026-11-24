@@ -100,13 +100,13 @@ use crate::compress::{
     w_row,
 };
 use crate::dense::{Dense, DenseKernels};
-use crate::hc::{
-    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPostArgs,
-    HcPreScratch,
-};
 use crate::index_key::{CompIndexKeyKernels, IndexKeyArgs};
 use crate::params::{ImageLayout, Table};
 use crate::rope::{KvAppendArgs, RopeKernels, TailShape};
+use bloomery_gpu::hc::{
+    HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcFn, HcFnArgs, HcKernels, HcPostArgs,
+    HcPreScratch,
+};
 use bloomery_gpu::token_major::TokenMajor;
 
 mod batch;

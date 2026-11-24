@@ -19,11 +19,13 @@
 //! the pass's, or without it where the ring leaves the pass no room.
 
 use std::marker::PhantomData;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use app::arch::{Batch, HybridCfg, SequenceSlots};
 use app::{Loaded, OpenArgs, OpenLog, Prompt, Session, SessionError};
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::TierBody;
 use bloomery_gpu::host::swap::Residency;
@@ -60,7 +62,7 @@ use super::tiered::{self, BuildMachine, Open, PassAttempt, PassPlan, Tiered, Wal
 /// made, with the pass's buffers beside it, under the seat's residency word.
 pub type PassOpen<F> = Box<
     dyn FnOnce(
-            Split,
+            Model,
             &Plan<'_>,
             &PlanInputs<<F as Family>::H>,
             HostCfg,
@@ -193,6 +195,17 @@ pub trait Family: Sized + 'static {
 
     /// The file's plan inputs, its own reading.
     fn read(split: &Split) -> Result<PlanInputs<Self::H>, PlacementError>;
+
+    /// The model at `path` ([`Tiered::read_model`]): by default a GGUF split, a directory refused
+    /// by name ([`tiered::read_split`]); a family whose body reads a checkpoint folder opens it
+    /// here, once, and the seat loads it from its header and part source.
+    fn read_model(path: &Path) -> Result<tiered::Read, GateError> {
+        tiered::read_split(path, Self::FAMILY, Self::SERVES)
+    }
+
+    /// The chat template the seat serves where the model carries none ([`Tiered::TEMPLATE`]);
+    /// `None` (the default) serves the model's own.
+    const TEMPLATE: Option<&'static str> = None;
 
     /// `ctx` positions refused by name when the body cannot serve that many; asked of the context
     /// as given, before any plan, and of the context the plan chose ([`Tiered::check_ctx`]).
@@ -452,13 +465,18 @@ fn mtp_asked<F: Family>() -> Result<Option<WidthMode>, GateError> {
     }
 }
 
-/// The session of the file at `a.path` on `a.place`, the step captured, the
-/// `load` record on stderr, on the calling thread, pinned to the dispatcher's
-/// cpu slot when asked.
+/// The session of the model at `a.path` (a file, or the folder `a.folder` the common run opened)
+/// on `a.place`, the step captured, the `load` record on stderr, on the calling thread, pinned to
+/// the dispatcher's cpu slot when asked.
 fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError> {
     record::require(record::groups::hybrid::GROUP, "hybrid seat");
     let pinned = a.pin_main && threads::pool().pin_caller();
-    let file = Split::open(&a.path).map_err(|e| format!("open {}: {e}", a.path.display()))?;
+    let file: Model = match a.folder.take() {
+        Some(f) => super::folder::model(f.header, f.source)?,
+        None => Split::open(&a.path)
+            .map_err(|e| format!("open {}: {e}", a.path.display()))?
+            .into(),
+    };
     let mut log = Log::<F> {
         t: Instant::now(),
         opened: Duration::ZERO,
@@ -552,7 +570,7 @@ fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError
 /// `ctx` (`app::Open::plan`, as [`Loaded::open`] plans), handed to `log`, then the body by `open`
 /// with the pass's buffers under the configuration's residency, in graph mode.
 fn open_pass<F: Family>(
-    file: Split,
+    file: Model,
     (inputs, open): (&PlanInputs<F::H>, PassOpen<F>),
     machine: &Machine,
     (ctx, cfg): (usize, HybridCfg),
@@ -571,12 +589,12 @@ fn open_pass<F: Family>(
 /// with the ring ([`Family::with_ring`]) planned on the run's `machine` at `ctx`, as the run's plan
 /// of the same inputs was, and loaded by the body's own open ([`app::Open::open`]).
 fn open_stepped_ring<F: Family>(
-    file: Split,
+    file: Model,
     machine: &Machine,
     (ctx, cfg): (usize, HybridCfg),
     log: &mut Log<F>,
 ) -> Result<Loaded<F::Body>, GateError> {
-    let mut inputs = <F::Body as app::Open>::inputs(&file)?;
+    let mut inputs = <F::Body as app::Open>::inputs(file.header())?;
     <F::Body as app::Open>::configure_inputs(&mut inputs, &cfg)?;
     let inputs = F::with_ring(inputs)?;
     let by = cfg.clone();
@@ -831,6 +849,12 @@ impl<F: Family> Tiered for Hybrid<F> {
     fn read(split: &Split) -> Result<PlanInputs<F::H>, PlacementError> {
         F::read(split)
     }
+
+    fn read_model(path: &Path) -> Result<tiered::Read, GateError> {
+        F::read_model(path)
+    }
+
+    const TEMPLATE: Option<&'static str> = F::TEMPLATE;
 
     fn configure(inputs: &mut PlanInputs<Self::H>, group: usize) -> Result<(), GateError> {
         F::configure(inputs, group)?;

@@ -13,8 +13,7 @@ use std::path::PathBuf;
 
 use gguf::arch::ernie55::{ARCH, PRE};
 use model::arch::ernie55::place::PlanInputs;
-use model::placement::accepts::{Program, routed_rule};
-use model::placement::workstation::{self, CardSpec, MIB};
+use model::placement::workstation::{self, CardSpec, HostRead, MIB};
 use model::placement::{self, PlanLevers};
 use model_hf::folder::{self, Opened};
 
@@ -73,16 +72,9 @@ struct Planned {
 fn planned(inputs: &PlanInputs, ctx: u64) -> Planned {
     inputs.check_ctx(ctx).expect("a trained context");
     let machine = workstation::plan_on(RTX_5090, inputs.model.layers);
-    let plan = placement::plan_routed_reserving(
-        &inputs.model,
-        &machine,
-        ctx,
-        &inputs.kv,
-        &PlanLevers::default(),
-        routed_rule(Program::Ernie55Body),
-        0,
-    )
-    .unwrap_or_else(|e| panic!("plan @{ctx}: {e}"));
+    let plan = inputs
+        .plan(&machine, ctx, &PlanLevers::default())
+        .unwrap_or_else(|e| panic!("plan @{ctx}: {e}"));
     let bad = plan.violations();
     assert!(
         bad.is_empty(),
@@ -119,7 +111,8 @@ fn planned(inputs: &PlanInputs, ctx: u64) -> Planned {
 fn hw_the_folder_header_plans_as_the_description_pinned() {
     let o = open();
     assert_eq!(o.header.architecture(), Some(ARCH));
-    let inputs = PlanInputs::describe(&o.header).unwrap_or_else(|e| panic!("{e}"));
+    let mut inputs = PlanInputs::describe(&o.header).unwrap_or_else(|e| panic!("{e}"));
+    inputs.room = (workstation::HOST_USABLE, HostRead::Given);
     let layers = inputs.hp.n_layer;
     let (expert_bytes, at_32k, at_256k) = match layers {
         REAL_LAYERS => (

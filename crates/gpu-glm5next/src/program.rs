@@ -29,6 +29,7 @@
 //! layer with card experts, [`BlockPlan::extra_launches`] more on a K-quant
 //! block); the head adds the mean and its own three.
 
+use bloomery_gpu::hc::{HcFn, HcFnArgs, HcPostArgs, HcQ8Params, HcQ8PreArgs};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::StepLeg;
 use bloomery_gpu::host::run::HostRun;
@@ -36,7 +37,6 @@ use bloomery_gpu::hybrid::Hybrid;
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{Gpu, GpuError};
 use bloomery_gpu_deepseek41::block::BlockPlan;
-use bloomery_gpu_deepseek41::hc::{HcFn, HcFnArgs, HcPostArgs, HcQ8Params, HcQ8PreArgs};
 use model::arch::glm5next::names::Sub;
 use runtime::layer::{FfnKind, MixerKind};
 use runtime::sched::{self, At, LayerProgram, Overlap, Port, PortKind};

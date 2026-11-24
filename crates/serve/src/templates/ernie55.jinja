@@ -1,0 +1,144 @@
+{#- ERNIE 5.5 Flash Preview's chat protocol, as text. The checkpoint folder ships no template: its renderer is
+    Python (encoding_ernie.py, render_chat), and this template writes the text that renderer writes, turn by turn: a
+    leading <|ERNIE_MASK|>, the system block (the first system message, system_settings, agent_storage, examples), the
+    global settings (reasoning_effort, parallel_tool_calls), the tool list, the turns, and a generation prompt that
+    opens the think span (the closed pair when thinking is off). The server hands it the request as every template
+    reads one (crates/serve/src/api.rs, render_chat): an array content joined to one text, a `developer` role mapped to
+    `system`, a tool call's string arguments parsed, and chat_template_kwargs merged into the variables, where the
+    Python renderer's keyword arguments arrive: options (thinking_mode, parallel_tool_calls), system_settings,
+    agent_storage, examples, sort_keys, enable_thinking, reasoning_effort. -#}
+{%- set mask = '<|ERNIE_MASK|>' -%}
+{%- set start = '<|ernie:im_start|>' -%}
+{%- set end = '<|ernie:im_end|>' -%}
+{%- set think = '<ernie:think>' -%}
+{%- set think_end = '</ernie:think>' -%}
+{%- set call = '<ernie:tool_call>' -%}
+{%- set call_end = '</ernie:tool_call>' -%}
+{%- set output = '<ernie:tool_output>' -%}
+{%- set output_end = '</ernie:tool_output>' -%}
+{%- macro text_of(content) -%}
+  {%- if content is string -%}
+    {{- content -}}
+  {%- elif content is sequence -%}
+    {%- for part in content -%}{%- if part.type == 'text' -%}{{- part.text if part.text is defined else '' -}}{%- endif -%}{%- endfor -%}
+  {%- endif -%}
+{%- endmacro %}
+{%- macro assistant(m, content) -%}
+  {%- set reasoning = m.thoughts if m.thoughts is string else (m.reasoning_content if m.reasoning_content is string else none) -%}
+  {%- if reasoning is none -%}
+    {%- if think_end in content -%}
+      {%- set pieces = content.split(think_end) -%}
+      {%- set opens = pieces[0].split(think) -%}
+      {%- set reasoning = opens[opens|length - 1] if opens|length > 1 else pieces[0] -%}
+      {%- set content = pieces[pieces|length - 1] -%}
+    {%- else -%}
+      {%- set reasoning = '' -%}
+    {%- endif -%}
+  {%- endif -%}
+  {{- start ~ 'assistant\n' ~ think -}}
+  {%- if not off and reasoning.strip() -%}{{- reasoning -}}{%- endif -%}
+  {{- think_end ~ content -}}
+  {%- if m.tool_calls is defined and m.tool_calls -%}
+    {{- call ~ '\n' -}}
+    {%- for c in m.tool_calls -%}
+      {%- set f = c.function if c.function is defined and c.function else c -%}
+      {%- if f is not mapping or f.name is not string -%}
+        {{- raise_exception('a tool call names no function') -}}
+      {%- endif -%}
+      {{- '<invoke name="' ~ f.name ~ '">' -}}
+      {%- set args = f.arguments if f.arguments is defined else none -%}
+      {%- if args is not mapping -%}
+        {{- raise_exception('tool call arguments must be a JSON object or its JSON string') -}}
+      {%- endif -%}
+      {%- for key, value in (args | dictsort(case_sensitive=true) if sorted else args.items()) -%}
+        {{- '<parameter name="' ~ key ~ '">' ~ (value if value is string else value | tojson(sort_keys=sorted)) ~ '</parameter>' -}}
+      {%- endfor -%}
+      {{- '</invoke>\n' -}}
+    {%- endfor -%}
+    {{- call_end -}}
+  {%- endif -%}
+  {{- end -}}
+{%- endmacro %}
+{%- macro turns(msgs) -%}
+  {%- for m in msgs -%}
+    {%- set role = m.role -%}
+    {%- set content = text_of(m.content if m.content is defined else none) -%}
+    {%- if role == 'system' and loop.index0 == 0 -%}
+      {%- elif role == 'user' or role == 'system' -%}
+      {{- start ~ role ~ '\n' ~ content ~ end -}}
+      {%- if not loop.last -%}{{- '\n' -}}{%- endif -%}
+    {%- elif role == 'assistant' -%}
+      {{- assistant(m, content) -}}
+      {%- if not loop.last -%}{{- '\n' -}}{%- endif -%}
+    {%- elif role == 'tool' -%}
+      {%- if loop.first or loop.previtem.role != 'tool' -%}{{- start ~ 'tool' -}}{%- endif -%}
+      {{- '\n' ~ output ~ content ~ output_end -}}
+      {%- if loop.last or loop.nextitem.role != 'tool' -%}{{- end -}}{%- if not loop.last -%}{{- '\n' -}}{%- endif -%}{%- endif -%}
+    {%- else -%}
+      {{- raise_exception('Unsupported role at messages[' ~ loop.index0 ~ ']: ' ~ "'" ~ role ~ "'") -}}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro %}
+{%- if messages|length == 0 -%}
+  {{- raise_exception('messages must be a non-empty list/tuple of message dictionaries') -}}
+{%- endif -%}
+{%- if options is defined and options and options is not mapping -%}
+  {{- raise_exception('options must be a dictionary') -}}
+{%- endif -%}
+{%- set opts = options if options is defined and options is mapping else {} -%}
+{%- set off = opts.get('thinking_mode') in ('close', 'false') or (enable_thinking is defined and enable_thinking in (false, 0, 'false')) -%}
+{%- if not off -%}
+  {%- set effort = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 'high' -%}
+  {%- if effort not in ('low', 'medium', 'high') -%}
+    {{- raise_exception("reasoning_effort must be one of ('low', 'medium', 'high'), got '" ~ effort ~ "'") -}}
+  {%- endif -%}
+{%- endif -%}
+{%- set sorted = sort_keys if sort_keys is defined and sort_keys is not none else true -%}
+{%- set generate = add_generation_prompt if add_generation_prompt is defined and add_generation_prompt is not none else true -%}
+{%- set has_settings = system_settings is defined and system_settings -%}
+{%- set has_storage = agent_storage is defined and agent_storage -%}
+{%- set has_examples = examples is defined and examples -%}
+{%- if has_settings and system_settings is not string -%}
+  {{- raise_exception('system_settings must be text') -}}
+{%- endif -%}
+{%- if has_storage and agent_storage is not string -%}
+  {{- raise_exception('agent_storage must be text') -}}
+{%- endif -%}
+{%- set first = messages[0] -%}
+{{- mask ~ start ~ 'system\n' -}}
+{%- if first.role == 'system' or has_settings or has_storage or has_examples -%}
+  {{- '<ernie:system_setting>' -}}
+  {%- if has_settings -%}{{- '\n' ~ system_settings -}}{%- endif -%}
+  {%- if first.role == 'system' and first.content is defined and first.content is not none -%}{{- '\n' ~ text_of(first.content) -}}{%- endif -%}
+  {%- if has_storage -%}{{- '\n【agent storage】记录额外的信息，包含但不限于用户画像、长期记忆内容等。\n' ~ agent_storage -}}{%- endif -%}
+  {%- if has_examples and examples[0] -%}
+    {{- '\n【行为例子】列举了一些情况下的行为逻辑供你参考。\n' -}}
+    {%- for i in range(examples|length) -%}
+      {%- set example = examples[examples|length - 1 - i] -%}
+      {%- if i > 0 -%}{{- '\n' -}}{%- endif -%}
+      {{- '[示例' ~ (i + 1) ~ ']\n' -}}
+      {{- turns(example) -}}
+    {%- endfor -%}
+  {%- endif -%}
+  {{- '\n</ernie:system_setting>\n' -}}
+{%- endif -%}
+{{- '<ernie:global_setting>' -}}
+{%- if not off -%}{{- '\nreasoning_effort=' ~ effort -}}{%- endif -%}
+{%- if tools is defined and tools -%}
+  {%- if opts.get('parallel_tool_calls') not in (false, 0, 'false') -%}{{- '\nparallel_tool_calls=True' -}}{%- endif -%}
+{%- endif -%}
+{{- '\n</ernie:global_setting>' -}}
+{%- if tools is defined and tools -%}
+  {{- '\n<ernie:tool_list>\n[' -}}
+  {%- for tool in tools -%}
+    {%- if loop.index0 > 0 -%}{{- ', ' -}}{%- endif -%}
+    {{- tool | tojson(sort_keys=sorted) -}}
+  {%- endfor -%}
+  {{- ']\n</ernie:tool_list>' -}}
+{%- endif -%}
+{{- end ~ '\n' -}}
+{{- turns(messages) -}}
+{%- if generate -%}
+  {{- '\n' ~ start ~ 'assistant\n' -}}
+  {%- if off -%}{{- think ~ think_end -}}{%- else -%}{{- think -}}{%- endif -%}
+{%- endif -%}

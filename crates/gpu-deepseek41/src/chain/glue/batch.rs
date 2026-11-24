@@ -10,8 +10,8 @@
 //! each, token by token what their one-token launches write.
 
 use super::*;
-use crate::hc::HC_MAX_TOKENS;
 use crate::span::{span, span_mut};
+use bloomery_gpu::hc::HC_MAX_TOKENS;
 use bloomery_gpu::token_major::TokenMajor;
 
 const WHAT: &str = "deepseek41 GlueBatch";

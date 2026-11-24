@@ -1,0 +1,2873 @@
+{
+  "template": "no template: ERNIE-5.5-Flash-Preview's Python chat protocol (encoding_ernie.py of the checkpoint folder, md5 c18cc575c562a14245143330025cc8d2), rendered by crates/serve/src/templates/ernie55.jinja",
+  "reference": "the vendor's own renderer, encoding_ernie.py render_chat of baidu/ERNIE-5.5-Flash-Preview, run from a copy outside the model folder (Python 3.12.3); each case rendered for the request as bloomery-serve's /apply-template hands a template one (a content array joined by newlines, developer as system, reasoning_effort none as enable_thinking false, chat_template_kwargs merged as the renderer's keywords); runs are the added-token ids and ordinary text runs of encode_segments (tokenization_ernie.py) over the folder's tokenizer.json; a case the vendor refused carries its error and the words the server's 400 names it by; every body has its keys sorted at every level unless the case is about their order. Script: crates/serve/tests/fixtures/render_ernie55.py, run as `python3 -I render_ernie55.py <vendor dir> <tokenizer.json> > ernie55-renders.json`",
+  "cases": [
+    {
+      "name": "user only",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "system and user",
+      "body": {
+        "messages": [
+          {
+            "content": "You are terse.",
+            "role": "system"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\nYou are terse.\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        9,
+        "\nYou are terse.\n",
+        10,
+        "\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "three turns",
+      "body": {
+        "messages": [
+          {
+            "content": "What is the capital of France?",
+            "role": "user"
+          },
+          {
+            "content": "Paris.",
+            "role": "assistant"
+          },
+          {
+            "content": "And of Italy?",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nWhat is the capital of France?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>Paris.<|ernie:im_end|>\n<|ernie:im_start|>user\nAnd of Italy?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nWhat is the capital of France?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        "Paris.",
+        8,
+        "\n",
+        7,
+        "user\nAnd of Italy?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "a system message with no content",
+      "body": {
+        "messages": [
+          {
+            "role": "system"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        9,
+        "\n",
+        10,
+        "\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "a system message in the middle is a turn",
+      "body": {
+        "messages": [
+          {
+            "content": "First.",
+            "role": "user"
+          },
+          {
+            "content": "Second.",
+            "role": "system"
+          },
+          {
+            "content": "Third.",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nFirst.<|ernie:im_end|>\n<|ernie:im_start|>system\nSecond.<|ernie:im_end|>\n<|ernie:im_start|>user\nThird.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nFirst.",
+        8,
+        "\n",
+        7,
+        "system\nSecond.",
+        8,
+        "\n",
+        7,
+        "user\nThird.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "no generation prompt ends at the last turn",
+      "body": {
+        "add_generation_prompt": false,
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>Hello!<|ernie:im_end|>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        "Hello!",
+        8
+      ]
+    },
+    {
+      "name": "no generation prompt after a user turn",
+      "body": {
+        "add_generation_prompt": false,
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8
+      ]
+    },
+    {
+      "name": "reasoning_content of an assistant turn",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning_content": "The user greets.",
+            "role": "assistant"
+          },
+          {
+            "content": "Again?",
+            "role": "user"
+          },
+          {
+            "content": "Hello again!",
+            "reasoning_content": "  ",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>The user greets.</ernie:think>Hello!<|ernie:im_end|>\n<|ernie:im_start|>user\nAgain?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>Hello again!<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        "The user greets.",
+        20,
+        "Hello!",
+        8,
+        "\n",
+        7,
+        "user\nAgain?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        "Hello again!",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "thoughts before reasoning_content",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning": "unused",
+            "reasoning_content": "second",
+            "role": "assistant",
+            "thoughts": "first"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>first</ernie:think>Hello!<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        "first",
+        20,
+        "Hello!",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "inline think tags in an assistant's content",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "<ernie:think>The user greets.</ernie:think>Hello!",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>The user greets.</ernie:think>Hello!<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        "The user greets.",
+        20,
+        "Hello!",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "inline think tags: text before the open tag is dropped, the first close ends the reasoning",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "dropped<ernie:think>kept<ernie:think>still reasoning</ernie:think>first answer<ernie:think>x</ernie:think>last answer",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>still reasoning</ernie:think>last answer<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        "still reasoning",
+        20,
+        "last answer",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "an assistant's content with a close tag and no open tag",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "the reasoning</ernie:think>the answer",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>the reasoning</ernie:think>the answer<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        "the reasoning",
+        20,
+        "the answer",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "thinking off: enable_thinking false in the kwargs",
+      "body": {
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20
+      ]
+    },
+    {
+      "name": "thinking off: options thinking_mode close",
+      "body": {
+        "chat_template_kwargs": {
+          "options": {
+            "thinking_mode": "close"
+          }
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20
+      ]
+    },
+    {
+      "name": "thinking off: options thinking_mode false",
+      "body": {
+        "chat_template_kwargs": {
+          "options": {
+            "thinking_mode": "false"
+          }
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20
+      ]
+    },
+    {
+      "name": "thinking off: enable_thinking 0 in the kwargs",
+      "body": {
+        "chat_template_kwargs": {
+          "enable_thinking": 0
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20
+      ]
+    },
+    {
+      "name": "thinking off: reasoning_effort none on the body",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "none"
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20
+      ]
+    },
+    {
+      "name": "thinking off drops an assistant's reasoning and reads no effort",
+      "body": {
+        "chat_template_kwargs": {
+          "enable_thinking": false,
+          "reasoning_effort": "max"
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "Hello!",
+            "reasoning_content": "The user greets.",
+            "role": "assistant"
+          },
+          {
+            "content": "<ernie:think>inline</ernie:think>Hi",
+            "role": "assistant"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>Hello!<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>Hi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        "Hello!",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        "Hi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20
+      ]
+    },
+    {
+      "name": "enable_thinking true in the kwargs",
+      "body": {
+        "chat_template_kwargs": {
+          "enable_thinking": true
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "reasoning_effort low on the body",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "low"
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=low\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=low\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "reasoning_effort medium on the body",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "medium"
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=medium\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=medium\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "reasoning_effort high on the body",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "high"
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "reasoning_effort through the kwargs",
+      "body": {
+        "chat_template_kwargs": {
+          "reasoning_effort": "low"
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=low\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=low\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "tools offered",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather in Seoul?",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "default": "celsius",
+                    "description": "celsius or fahrenheit.",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}, {\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather in Seoul?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}, {\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nWeather in Seoul?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "tools and a system turn",
+      "body": {
+        "messages": [
+          {
+            "content": "You help.",
+            "role": "system"
+          },
+          {
+            "content": "Weather in Seoul?",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "default": "celsius",
+                    "description": "celsius or fahrenheit.",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          },
+          {
+            "description": "No wrapper.",
+            "name": "bare",
+            "parameters": {
+              "properties": {},
+              "type": "object"
+            },
+            "strict": false
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\nYou help.\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}, {\"description\": \"No wrapper.\", \"name\": \"bare\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}, \"strict\": false}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather in Seoul?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        9,
+        "\nYou help.\n",
+        10,
+        "\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}, {\"description\": \"No wrapper.\", \"name\": \"bare\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}, \"strict\": false}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nWeather in Seoul?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "tools with parallel_tool_calls false in the options",
+      "body": {
+        "chat_template_kwargs": {
+          "options": {
+            "parallel_tool_calls": false
+          }
+        },
+        "messages": [
+          {
+            "content": "Weather?",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "default": "celsius",
+                    "description": "celsius or fahrenheit.",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nWeather?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "tools with parallel_tool_calls the string false in the options",
+      "body": {
+        "chat_template_kwargs": {
+          "options": {
+            "parallel_tool_calls": "false"
+          }
+        },
+        "messages": [
+          {
+            "content": "Weather?",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "default": "celsius",
+                    "description": "celsius or fahrenheit.",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nWeather?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "tools with parallel_tool_calls true in the options",
+      "body": {
+        "chat_template_kwargs": {
+          "options": {
+            "parallel_tool_calls": true
+          }
+        },
+        "messages": [
+          {
+            "content": "Weather?",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "default": "celsius",
+                    "description": "celsius or fahrenheit.",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nWeather?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "no tools: parallel_tool_calls writes nothing",
+      "body": {
+        "chat_template_kwargs": {
+          "options": {
+            "parallel_tool_calls": true
+          }
+        },
+        "messages": [
+          {
+            "content": "Weather?",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nWeather?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "numbers and nesting in a tool schema",
+      "body": {
+        "messages": [
+          {
+            "content": "Set the gain.",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "A knob.\nWith a newline and \"quotes\".",
+              "name": "set_knob",
+              "parameters": {
+                "properties": {
+                  "gain": {
+                    "default": 1.5,
+                    "maximum": 2,
+                    "minimum": -0.25,
+                    "type": "number"
+                  },
+                  "on": {
+                    "type": "boolean"
+                  },
+                  "rate": {
+                    "default": 1e-05,
+                    "type": "number"
+                  },
+                  "size": {
+                    "type": "integer"
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "gain"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"A knob.\\nWith a newline and \\\"quotes\\\".\", \"name\": \"set_knob\", \"parameters\": {\"properties\": {\"gain\": {\"default\": 1.5, \"maximum\": 2, \"minimum\": -0.25, \"type\": \"number\"}, \"on\": {\"type\": \"boolean\"}, \"rate\": {\"default\": 1e-05, \"type\": \"number\"}, \"size\": {\"type\": \"integer\"}, \"tags\": {\"items\": {\"type\": \"string\"}, \"type\": \"array\"}}, \"required\": [\"gain\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nSet the gain.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"A knob.\\nWith a newline and \\\"quotes\\\".\", \"name\": \"set_knob\", \"parameters\": {\"properties\": {\"gain\": {\"default\": 1.5, \"maximum\": 2, \"minimum\": -0.25, \"type\": \"number\"}, \"on\": {\"type\": \"boolean\"}, \"rate\": {\"default\": 1e-05, \"type\": \"number\"}, \"size\": {\"type\": \"integer\"}, \"tags\": {\"items\": {\"type\": \"string\"}, \"type\": \"array\"}}, \"required\": [\"gain\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nSet the gain.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "an assistant tool call and its result",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather in Seoul?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "reasoning_content": "One call.",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "days": 3,
+                    "location": "Seoul"
+                  },
+                  "name": "get_weather"
+                },
+                "id": "call_a",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "21 C",
+            "role": "tool",
+            "tool_call_id": "call_a"
+          },
+          {
+            "content": "Thanks.",
+            "role": "user"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "default": "celsius",
+                    "description": "celsius or fahrenheit.",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather in Seoul?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>One call.</ernie:think><ernie:tool_call>\n<invoke name=\"get_weather\"><parameter name=\"days\">3</parameter><parameter name=\"location\">Seoul</parameter></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>tool\n<ernie:tool_output>21 C</ernie:tool_output><|ernie:im_end|>\n<|ernie:im_start|>user\nThanks.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nWeather in Seoul?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        "One call.",
+        20,
+        17,
+        "\n<invoke name=\"get_weather\"><parameter name=\"days\">3</parameter><parameter name=\"location\">Seoul</parameter></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "tool\n",
+        15,
+        "21 C",
+        16,
+        8,
+        "\n",
+        7,
+        "user\nThanks.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "two calls and two results: the tool group",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather and time in Seoul?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "location": "Seoul"
+                  },
+                  "name": "get_weather"
+                },
+                "id": "call_a",
+                "type": "function"
+              },
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_b",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool",
+            "tool_call_id": "call_b"
+          },
+          {
+            "content": "{\"temp\": 21, \"sky\": \"맑음\"}",
+            "role": "tool",
+            "tool_call_id": "call_a"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "default": "celsius",
+                    "description": "celsius or fahrenheit.",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          },
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}, {\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather and time in Seoul?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think><ernie:tool_call>\n<invoke name=\"get_weather\"><parameter name=\"location\">Seoul</parameter></invoke>\n<invoke name=\"get_time\"></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>tool\n<ernie:tool_output>12:00</ernie:tool_output>\n<ernie:tool_output>{\"temp\": 21, \"sky\": \"맑음\"}</ernie:tool_output><|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}, {\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nWeather and time in Seoul?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        17,
+        "\n<invoke name=\"get_weather\"><parameter name=\"location\">Seoul</parameter></invoke>\n<invoke name=\"get_time\"></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "tool\n",
+        15,
+        "12:00",
+        16,
+        "\n",
+        15,
+        "{\"temp\": 21, \"sky\": \"맑음\"}",
+        16,
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "tool results with no tools offered",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_c",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "12:00",
+            "role": "tool"
+          },
+          {
+            "content": "Thanks.",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nTime?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think><ernie:tool_call>\n<invoke name=\"get_time\"></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>tool\n<ernie:tool_output>12:00</ernie:tool_output><|ernie:im_end|>\n<|ernie:im_start|>user\nThanks.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nTime?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        17,
+        "\n<invoke name=\"get_time\"></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "tool\n",
+        15,
+        "12:00",
+        16,
+        8,
+        "\n",
+        7,
+        "user\nThanks.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "a tool message first",
+      "body": {
+        "messages": [
+          {
+            "content": "orphan",
+            "role": "tool"
+          },
+          {
+            "content": "Thanks.",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>tool\n<ernie:tool_output>orphan</ernie:tool_output><|ernie:im_end|>\n<|ernie:im_start|>user\nThanks.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "tool\n",
+        15,
+        "orphan",
+        16,
+        8,
+        "\n",
+        7,
+        "user\nThanks.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "a null assistant content with tool calls",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": null,
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_d",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nTime?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think><ernie:tool_call>\n<invoke name=\"get_time\"></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nTime?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        17,
+        "\n<invoke name=\"get_time\"></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "tool call arguments as a JSON string",
+      "body": {
+        "messages": [
+          {
+            "content": "Weather?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "{\"location\": \"Seoul\", \"days\": 3}",
+                  "name": "get_weather"
+                },
+                "id": "call_e",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Current weather for a city.",
+              "name": "get_weather",
+              "parameters": {
+                "properties": {
+                  "days": {
+                    "description": "How many days ahead.",
+                    "type": "integer"
+                  },
+                  "location": {
+                    "description": "City name, e.g. Seoul.",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "default": "celsius",
+                    "description": "celsius or fahrenheit.",
+                    "enum": [
+                      "celsius",
+                      "fahrenheit"
+                    ]
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nWeather?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think><ernie:tool_call>\n<invoke name=\"get_weather\"><parameter name=\"days\">3</parameter><parameter name=\"location\">Seoul</parameter></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Current weather for a city.\", \"name\": \"get_weather\", \"parameters\": {\"properties\": {\"days\": {\"description\": \"How many days ahead.\", \"type\": \"integer\"}, \"location\": {\"description\": \"City name, e.g. Seoul.\", \"type\": \"string\"}, \"unit\": {\"default\": \"celsius\", \"description\": \"celsius or fahrenheit.\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"location\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nWeather?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        17,
+        "\n<invoke name=\"get_weather\"><parameter name=\"days\">3</parameter><parameter name=\"location\">Seoul</parameter></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "a bare tool call: no function wrapper",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "arguments": {
+                  "zone": 1
+                },
+                "name": "get_time"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nTime?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think><ernie:tool_call>\n<invoke name=\"get_time\"><parameter name=\"zone\">1</parameter></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nTime?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        17,
+        "\n<invoke name=\"get_time\"><parameter name=\"zone\">1</parameter></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "nested and typed arguments",
+      "body": {
+        "messages": [
+          {
+            "content": "Note it.",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "filter": {
+                      "f": 1.5,
+                      "n": [
+                        1,
+                        2
+                      ],
+                      "ok": true,
+                      "q": "서울 ☃",
+                      "x": null
+                    },
+                    "text": "a<b & \"c\" </parameter x"
+                  },
+                  "name": "save_note"
+                },
+                "id": "call_f",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Save a note.",
+              "name": "save_note",
+              "parameters": {
+                "properties": {
+                  "filter": {
+                    "type": "object"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "tone": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Save a note.\", \"name\": \"save_note\", \"parameters\": {\"properties\": {\"filter\": {\"type\": \"object\"}, \"text\": {\"type\": \"string\"}, \"tone\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"text\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nNote it.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think><ernie:tool_call>\n<invoke name=\"save_note\"><parameter name=\"filter\">{\"f\": 1.5, \"n\": [1, 2], \"ok\": true, \"q\": \"서울 ☃\", \"x\": null}</parameter><parameter name=\"text\">a<b & \"c\" </parameter x</parameter></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Save a note.\", \"name\": \"save_note\", \"parameters\": {\"properties\": {\"filter\": {\"type\": \"object\"}, \"text\": {\"type\": \"string\"}, \"tone\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"text\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nNote it.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        17,
+        "\n<invoke name=\"save_note\"><parameter name=\"filter\">{\"f\": 1.5, \"n\": [1, 2], \"ok\": true, \"q\": \"서울 ☃\", \"x\": null}</parameter><parameter name=\"text\">a<b & \"c\" </parameter x</parameter></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "the arguments' keys sorted: uppercase before lowercase",
+      "body": {
+        "messages": [
+          {
+            "content": "Note it.",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "a": "first",
+                    "text": "t",
+                    "tone": null,
+                    "z": "last"
+                  },
+                  "name": "save_note"
+                },
+                "id": "call_g",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Save a note.",
+              "name": "save_note",
+              "parameters": {
+                "properties": {
+                  "filter": {
+                    "type": "object"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "tone": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Save a note.\", \"name\": \"save_note\", \"parameters\": {\"properties\": {\"filter\": {\"type\": \"object\"}, \"text\": {\"type\": \"string\"}, \"tone\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"text\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nNote it.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think><ernie:tool_call>\n<invoke name=\"save_note\"><parameter name=\"a\">first</parameter><parameter name=\"text\">t</parameter><parameter name=\"tone\">null</parameter><parameter name=\"z\">last</parameter></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Save a note.\", \"name\": \"save_note\", \"parameters\": {\"properties\": {\"filter\": {\"type\": \"object\"}, \"text\": {\"type\": \"string\"}, \"tone\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"text\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nNote it.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        17,
+        "\n<invoke name=\"save_note\"><parameter name=\"a\">first</parameter><parameter name=\"text\">t</parameter><parameter name=\"tone\">null</parameter><parameter name=\"z\">last</parameter></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "sort_keys false: the keys in the request's order",
+      "body": {
+        "chat_template_kwargs": {
+          "sort_keys": false
+        },
+        "messages": [
+          {
+            "content": "Note it.",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {
+                    "z": "last",
+                    "a": "first",
+                    "text": "t"
+                  },
+                  "name": "save_note"
+                },
+                "id": "call_h",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "Save a note.",
+              "name": "save_note",
+              "parameters": {
+                "properties": {
+                  "filter": {
+                    "type": "object"
+                  },
+                  "text": {
+                    "type": "string"
+                  },
+                  "tone": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"Save a note.\", \"name\": \"save_note\", \"parameters\": {\"properties\": {\"filter\": {\"type\": \"object\"}, \"text\": {\"type\": \"string\"}, \"tone\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"text\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nNote it.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think><ernie:tool_call>\n<invoke name=\"save_note\"><parameter name=\"z\">last</parameter><parameter name=\"a\">first</parameter><parameter name=\"text\">t</parameter></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"Save a note.\", \"name\": \"save_note\", \"parameters\": {\"properties\": {\"filter\": {\"type\": \"object\"}, \"text\": {\"type\": \"string\"}, \"tone\": {\"type\": [\"string\", \"null\"]}}, \"required\": [\"text\"], \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nNote it.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        17,
+        "\n<invoke name=\"save_note\"><parameter name=\"z\">last</parameter><parameter name=\"a\">first</parameter><parameter name=\"text\">t</parameter></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "system_settings and agent_storage through the kwargs",
+      "body": {
+        "chat_template_kwargs": {
+          "agent_storage": "The user likes rain.",
+          "system_settings": "Be terse."
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\nBe terse.\n【agent storage】记录额外的信息，包含但不限于用户画像、长期记忆内容等。\nThe user likes rain.\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        9,
+        "\nBe terse.\n【agent storage】记录额外的信息，包含但不限于用户画像、长期记忆内容等。\nThe user likes rain.\n",
+        10,
+        "\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "system_settings with a system message",
+      "body": {
+        "chat_template_kwargs": {
+          "system_settings": "Be terse."
+        },
+        "messages": [
+          {
+            "content": "You are a weather bot.",
+            "role": "system"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\nBe terse.\nYou are a weather bot.\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        9,
+        "\nBe terse.\nYou are a weather bot.\n",
+        10,
+        "\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "examples through the kwargs: the last first",
+      "body": {
+        "chat_template_kwargs": {
+          "examples": [
+            [
+              {
+                "content": "one?",
+                "role": "user"
+              },
+              {
+                "content": "one.",
+                "role": "assistant"
+              }
+            ],
+            [
+              {
+                "content": "two?",
+                "role": "user"
+              },
+              {
+                "content": "two.",
+                "reasoning_content": "two's reasoning",
+                "role": "assistant"
+              },
+              {
+                "content": "two again.",
+                "role": "assistant"
+              }
+            ]
+          ]
+        },
+        "messages": [
+          {
+            "content": "Be terse.",
+            "role": "system"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\nBe terse.\n【行为例子】列举了一些情况下的行为逻辑供你参考。\n[示例1]\n<|ernie:im_start|>user\ntwo?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>two's reasoning</ernie:think>two.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>two again.<|ernie:im_end|>\n[示例2]\n<|ernie:im_start|>user\none?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>one.<|ernie:im_end|>\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        9,
+        "\nBe terse.\n【行为例子】列举了一些情况下的行为逻辑供你参考。\n[示例1]\n",
+        7,
+        "user\ntwo?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        "two's reasoning",
+        20,
+        "two.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        "two again.",
+        8,
+        "\n[示例2]\n",
+        7,
+        "user\none?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        "one.",
+        8,
+        "\n",
+        10,
+        "\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "non-ASCII turns",
+      "body": {
+        "messages": [
+          {
+            "content": "당신은 간결합니다.",
+            "role": "system"
+          },
+          {
+            "content": "서울의 날씨는? ☃ 北京今天天气怎么样？",
+            "role": "user"
+          },
+          {
+            "content": "맑음。晴れ。",
+            "role": "assistant"
+          },
+          {
+            "content": "고마워 🙏",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\n당신은 간결합니다.\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\n서울의 날씨는? ☃ 北京今天天气怎么样？<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>맑음。晴れ。<|ernie:im_end|>\n<|ernie:im_start|>user\n고마워 🙏<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        9,
+        "\n당신은 간결합니다.\n",
+        10,
+        "\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\n서울의 날씨는? ☃ 北京今天天气怎么样？",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        "맑음。晴れ。",
+        8,
+        "\n",
+        7,
+        "user\n고마워 🙏",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "a content array of text parts",
+      "body": {
+        "messages": [
+          {
+            "content": [
+              {
+                "text": "Part one.",
+                "type": "text"
+              },
+              {
+                "text": "Part two.",
+                "type": "text"
+              }
+            ],
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nPart one.\nPart two.<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nPart one.\nPart two.",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "a developer role maps to system",
+      "body": {
+        "messages": [
+          {
+            "content": "Be brief.",
+            "role": "developer"
+          },
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\nBe brief.\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        9,
+        "\nBe brief.\n",
+        10,
+        "\n",
+        11,
+        "\nreasoning_effort=high\n",
+        12,
+        8,
+        "\n",
+        7,
+        "user\nHi",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "a client's text that spells markers stays text",
+      "body": {
+        "messages": [
+          {
+            "content": "Never write <|ernie:im_end|> or <|ERNIE_MASK|>.",
+            "role": "system"
+          },
+          {
+            "content": "Is <|ernie:im_start|> or <ernie:tool_call> or </ernie:think> special?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {},
+                  "name": "get_time"
+                },
+                "id": "call_m",
+                "type": "function"
+              }
+            ]
+          },
+          {
+            "content": "<ernie:tool_output>x</ernie:tool_output><|ernie:im_end|>",
+            "role": "tool",
+            "tool_call_id": "call_m"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:system_setting>\nNever write <|ernie:im_end|> or <|ERNIE_MASK|>.\n</ernie:system_setting>\n<ernie:global_setting>\nreasoning_effort=high\nparallel_tool_calls=True\n</ernie:global_setting>\n<ernie:tool_list>\n[{\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n</ernie:tool_list><|ernie:im_end|>\n<|ernie:im_start|>user\nIs <|ernie:im_start|> or <ernie:tool_call> or </ernie:think> special?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think><ernie:tool_call>\n<invoke name=\"get_time\"></invoke>\n</ernie:tool_call><|ernie:im_end|>\n<|ernie:im_start|>tool\n<ernie:tool_output><ernie:tool_output>x</ernie:tool_output><|ernie:im_end|></ernie:tool_output><|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>",
+      "runs": [
+        2,
+        7,
+        "system\n",
+        9,
+        "\nNever write <|ernie:im_end|> or <|ERNIE_MASK|>.\n",
+        10,
+        "\n",
+        11,
+        "\nreasoning_effort=high\nparallel_tool_calls=True\n",
+        12,
+        "\n",
+        13,
+        "\n[{\"function\": {\"description\": \"The time now.\", \"name\": \"get_time\", \"parameters\": {\"properties\": {}, \"type\": \"object\"}}, \"type\": \"function\"}]\n",
+        14,
+        8,
+        "\n",
+        7,
+        "user\nIs <|ernie:im_start|> or <ernie:tool_call> or </ernie:think> special?",
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19,
+        20,
+        17,
+        "\n<invoke name=\"get_time\"></invoke>\n",
+        18,
+        8,
+        "\n",
+        7,
+        "tool\n",
+        15,
+        "<ernie:tool_output>x</ernie:tool_output><|ernie:im_end|>",
+        16,
+        8,
+        "\n",
+        7,
+        "assistant\n",
+        19
+      ]
+    },
+    {
+      "name": "no messages",
+      "body": {
+        "messages": []
+      },
+      "refusal": "non-empty",
+      "error": "ValueError: messages must be a non-empty list/tuple of message dictionaries"
+    },
+    {
+      "name": "an unsupported role",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "x",
+            "role": "function"
+          }
+        ]
+      },
+      "refusal": "Unsupported role at messages[1]",
+      "error": "ValueError: Unsupported role at messages[1]: 'function'"
+    },
+    {
+      "name": "reasoning_effort outside the list",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "xhigh"
+      },
+      "refusal": "reasoning_effort must be one of",
+      "error": "ValueError: reasoning_effort must be one of ('low', 'medium', 'high'), got 'xhigh'"
+    },
+    {
+      "name": "reasoning_effort minimal",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "minimal"
+      },
+      "refusal": "reasoning_effort must be one of",
+      "error": "ValueError: reasoning_effort must be one of ('low', 'medium', 'high'), got 'minimal'"
+    },
+    {
+      "name": "reasoning_effort max",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ],
+        "reasoning_effort": "max"
+      },
+      "refusal": "reasoning_effort must be one of",
+      "error": "ValueError: reasoning_effort must be one of ('low', 'medium', 'high'), got 'max'"
+    },
+    {
+      "name": "tool call arguments that are not an object",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "[]",
+                  "name": "get_time"
+                },
+                "id": "call_i",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "refusal": "tool call arguments must be a JSON object",
+      "error": "TypeError: tool call arguments must be a JSON object or its JSON string"
+    },
+    {
+      "name": "tool call arguments that are not JSON",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": "nope",
+                  "name": "get_time"
+                },
+                "id": "call_j",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "refusal": "is not valid JSON",
+      "error": "JSONDecodeError: Expecting value: line 1 column 1 (char 0)"
+    },
+    {
+      "name": "a tool call that names no function",
+      "body": {
+        "messages": [
+          {
+            "content": "Time?",
+            "role": "user"
+          },
+          {
+            "content": "",
+            "role": "assistant",
+            "tool_calls": [
+              {
+                "function": {
+                  "arguments": {}
+                },
+                "id": "call_k",
+                "type": "function"
+              }
+            ]
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "description": "The time now.",
+              "name": "get_time",
+              "parameters": {
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "type": "function"
+          }
+        ]
+      },
+      "refusal": "a tool call names no function",
+      "error": "KeyError: 'name'"
+    },
+    {
+      "name": "system_settings that is not text",
+      "body": {
+        "chat_template_kwargs": {
+          "system_settings": 5
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "refusal": "system_settings must be text",
+      "error": "TypeError: Expected text, got int"
+    },
+    {
+      "name": "agent_storage that is not text",
+      "body": {
+        "chat_template_kwargs": {
+          "agent_storage": [
+            "a"
+          ]
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "refusal": "agent_storage must be text",
+      "error": "TypeError: Expected text, got list"
+    },
+    {
+      "name": "options that is not a dictionary",
+      "body": {
+        "chat_template_kwargs": {
+          "options": "close"
+        },
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          }
+        ]
+      },
+      "refusal": "options must be a dictionary",
+      "error": "TypeError: options must be a dictionary"
+    },
+    {
+      "name": "an open tag with no close stays in the content",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi",
+            "role": "user"
+          },
+          {
+            "content": "a <ernie:think> b",
+            "role": "assistant"
+          }
+        ]
+      },
+      "vendor_differs": "the template leaves the content as it came, the vendor's way (no close tag: nothing to slice), and the vendor then writes that content as ordinary text, where the server tokenizes it with its special tokens, as an assistant message's content is the model's own output sent back (crates/serve/src/guard.rs)",
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>a <ernie:think> b<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>"
+    },
+    {
+      "name": "an assistant's content that spells a marker",
+      "body": {
+        "messages": [
+          {
+            "content": "Hi?",
+            "role": "user"
+          },
+          {
+            "content": "Call <ernie:tool_call><invoke name=\"get_time\"></invoke></ernie:tool_call>?",
+            "role": "assistant"
+          }
+        ]
+      },
+      "vendor_differs": "the vendor's renderer writes an assistant's content as ordinary text, so a marker it spells is BPE, where a marker of its own (a tool call's, a think tag) is an added-token id; the server tokenizes an assistant message's content with its special tokens, as it is the model's own output sent back (crates/serve/src/guard.rs)",
+      "prompt": "<|ERNIE_MASK|><|ernie:im_start|>system\n<ernie:global_setting>\nreasoning_effort=high\n</ernie:global_setting><|ernie:im_end|>\n<|ernie:im_start|>user\nHi?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think></ernie:think>Call <ernie:tool_call><invoke name=\"get_time\"></invoke></ernie:tool_call>?<|ernie:im_end|>\n<|ernie:im_start|>assistant\n<ernie:think>"
+    }
+  ]
+}

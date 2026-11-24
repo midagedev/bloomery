@@ -278,7 +278,7 @@ mod gate {
             let machine = Glm::machine(&inputs)?;
             let cfg = self.cfg();
             let plan = <Body as Open>::plan(&inputs, &machine, CTX, &cfg)?;
-            let mut model = <Body as Open>::open(file, &inputs, &plan, &cfg)?;
+            let mut model = <Body as Open>::open(file.into(), &inputs, &plan, &cfg)?;
             model.set_mode(StepMode::Graph);
             let at = u32::try_from(plan.ctx_max)?;
             Ok(Loaded::<Body>::from_model(model, cfg, at).ready(&mut Quiet)?)

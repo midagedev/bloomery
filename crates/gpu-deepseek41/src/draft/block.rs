@@ -62,11 +62,11 @@ use crate::attn::{self as attn_op, AttnArgs, AttnKernels};
 use crate::chain::glue::{EmbdRows, enqueue_embed_row, glue_kernels};
 use crate::experts::ExpertKernels;
 use crate::experts_mxfp4::{DraftRouterKernels, DraftRouterOut, N_EXPERT, N_USED, RouterArgs};
-use crate::hc::{HC_MIX, HC_STREAMS, HcKernels, HcPostArgs};
-use crate::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
 use crate::rope::{Direction, KvAppendArgs, RopeKernels, RopeSpec, RopeTable, TailShape};
 use crate::span::span_mut;
 use bloomery_gpu::dspark::stage::{Inbox, put_f32};
+use bloomery_gpu::hc::{HC_MIX, HC_STREAMS, HcKernels, HcPostArgs};
+use bloomery_gpu::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
 
 const WHAT: &str = "draft::block";
 

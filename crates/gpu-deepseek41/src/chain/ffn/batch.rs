@@ -78,8 +78,8 @@ use bloomery_gpu::{FaultSink, FaultSite, col_sums, store_cols};
 use cuda_core::{CudaContext, IntoResult, sys};
 
 use super::*;
-use crate::hc::hc_mean_elem;
 use crate::span::{span, span_mut};
+use bloomery_gpu::hc::hc_mean_elem;
 use bloomery_gpu::kquant::act::{self, ACT_SWIGLU_CLAMP};
 
 const WHAT: &str = "FfnBatch";
@@ -3083,7 +3083,7 @@ impl FfnPiece {
         let c = &self.cfg[i];
         let fault = gpu.layer_sink(layer)?;
         {
-            crate::hc::feed_hc_fn(gpu, &c.hc_fn, io.streams, (m, n, self.rms_eps))?;
+            bloomery_gpu::hc::feed_hc_fn(gpu, &c.hc_fn, io.streams, (m, n, self.rms_eps))?;
             let pre = HcFnArgs {
                 params: &lw.hc,
                 x: io.streams,

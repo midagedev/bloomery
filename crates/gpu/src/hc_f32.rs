@@ -11,7 +11,7 @@
 //! 2. Row `r` (warp `r % 8` owns rows `w`, `w + 8`, `w + 16`): `f32_gemv`'s
 //!    order at one column — lane `L` sums `w[r*K + 32*it + L] * x[32*it + L]`
 //!    by `mul_add` from 0, `it` ascending
-//!    (`bloomery_gpu::q8f32::f32_lane_partial_1col`), then
+//!    (`crate::q8f32::f32_lane_partial_1col`), then
 //!    `warp::reduce_sum_f32` (lane `l` adds lane `l ^ s`, s = 16, 8, 4, 2, 1).
 //! 3. The squares on warp 0: lane `L` sums `x[32*it + L]` squared by
 //!    `v.mul_add(v, acc)` from 0, `it` ascending, then `warp::reduce_sum_f32`.
@@ -19,10 +19,10 @@
 //!    is not finite and positive is NaN and raises `FaultSite::F32Product`.
 //! 5. HC_PRE on warp 0 ([`crate::hc`]'s `hc_pre_lane`).
 
+use crate::elem::rms_scale_checked;
 use crate::hc::{HC_MIX, hc_pre_lane};
-use bloomery_gpu::elem::rms_scale_checked;
-use bloomery_gpu::q8f32::f32_lane_partial_1col;
-use bloomery_gpu::{DeviceTensor, FaultSink, GpuError, launch_u32};
+use crate::q8f32::f32_lane_partial_1col;
+use crate::{DeviceTensor, FaultSink, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::{
     DisjointSlice, SharedArray, kernel, launch_bounds, launch_contract, thread, warp,
@@ -217,7 +217,7 @@ impl HcF32Kernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<HcF32Kernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
-        let module = unsafe { bloomery_gpu::shared_module!(hc_f32_kernels, ctx)? };
+        let module = unsafe { crate::shared_module!(hc_f32_kernels, ctx)? };
         Ok(HcF32Kernels { module })
     }
 

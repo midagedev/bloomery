@@ -9,6 +9,7 @@ pub use draft::{Ds41Draft, open_draft};
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu_deepseek41::body::{
     self, Body, BodyMeta, FeatureRows, FeatureSink, OpenCfg, PrefillMode, TierOpen,
@@ -89,7 +90,7 @@ impl Open for Body {
     /// The stage card, card 0, and the plan's expert tier cards
     /// ([`TierOpen::of_machine`]).
     fn open(
-        file: Split,
+        file: Model,
         inputs: &PlanInputs,
         plan: &Plan<'_>,
         cfg: &Ds41Cfg,
@@ -98,7 +99,13 @@ impl Open for Body {
             hp: inputs.hp.clone(),
             levers: cfg.open.body,
         };
-        Body::open_placed_tiered(file, plan, 0, TierOpen::of_machine(plan.machine)?, &meta)
+        Body::open_placed_tiered(
+            crate::split_of(file, WHAT)?,
+            plan,
+            0,
+            TierOpen::of_machine(plan.machine)?,
+            &meta,
+        )
     }
 
     /// The batch's buffers under the batched schedule (with the card-timing

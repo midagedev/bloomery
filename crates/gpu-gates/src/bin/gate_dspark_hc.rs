@@ -48,9 +48,9 @@ mod gate {
         Head, HeadTail, HeadWeights, MarkovTail, ReducedMarkovWeights,
     };
     use bloomery_gpu::dspark::{HeadSource, Q8Rows};
+    use bloomery_gpu::hc::HC_MIX;
+    use bloomery_gpu::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
     use bloomery_gpu::{DeviceTensor, FAULT_NONE, Fault, FaultSite, Gpu, LAYER_NONE};
-    use bloomery_gpu_deepseek41::hc::HC_MIX;
-    use bloomery_gpu_deepseek41::hc_f32::{HcF32Args, HcF32Kernels, HcF32Params};
     use bloomery_gpu_deepseek41::markov::{
         MARKOV_RANK, MARKOV_ROW_WORDS, MarkovKernels, MarkovWeights,
     };

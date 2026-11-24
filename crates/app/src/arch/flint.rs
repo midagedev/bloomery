@@ -4,6 +4,7 @@
 
 use std::num::NonZeroUsize;
 
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::weights::Weights;
@@ -41,25 +42,41 @@ macro_rules! flint_batch {
             }
 
             fn open_placed(
-                file: Split,
+                file: Model,
                 plan: &Plan<'_>,
                 inputs: &PlanInputs,
                 host: HostCfg,
                 residency: Residency,
                 slots: NonZeroUsize,
             ) -> Result<GpuModel<Self>, GpuError> {
-                Self::open_placed_slots(file, plan, inputs, 0, host, residency, slots)
+                Self::open_placed_slots(
+                    crate::split_of(file, WHAT)?,
+                    plan,
+                    inputs,
+                    0,
+                    host,
+                    residency,
+                    slots,
+                )
             }
 
             fn open_placed_drafted(
-                file: Split,
+                file: Model,
                 plan: &Plan<'_>,
                 inputs: &PlanInputs,
                 host: HostCfg,
                 residency: Residency,
                 slots: NonZeroUsize,
             ) -> Result<GpuModel<Self>, GpuError> {
-                Self::open_placed_slots_drafted(file, plan, inputs, 0, host, residency, slots)
+                Self::open_placed_slots_drafted(
+                    crate::split_of(file, WHAT)?,
+                    plan,
+                    inputs,
+                    0,
+                    host,
+                    residency,
+                    slots,
+                )
             }
 
             fn configure_draft(inputs: &mut PlanInputs) -> Result<(), GpuError> {

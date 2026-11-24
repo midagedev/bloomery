@@ -30,6 +30,7 @@
 
 use std::num::NonZeroUsize;
 
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::host::swap::Residency;
@@ -83,14 +84,21 @@ impl Batch for Body {
     /// plan counts `_slots` sequences' stores; the session parks them after
     /// the load.
     fn open_placed(
-        file: Split,
+        file: Model,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         host: HostCfg,
         residency: Residency,
         _slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed_with(file, plan, inputs, 0, host, residency)
+        Body::open_placed_with(
+            crate::split_of(file, WHAT)?,
+            plan,
+            inputs,
+            0,
+            host,
+            residency,
+        )
     }
 
     fn batch(

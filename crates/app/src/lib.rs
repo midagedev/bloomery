@@ -42,6 +42,7 @@ pub mod warm;
 pub use bloomery_gpu::card_bytes::PhaseBytes;
 
 use bloomery_gpu::best;
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::host::PassKind;
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::host::swap::ResetReport;
@@ -163,14 +164,18 @@ where
 }
 
 /// A body that loads by a placement plan: the file's headers read once, the
-/// plan made once from them, and gpumodel's constructor over that plan.
+/// plan made once from them, and gpumodel's constructor over that plan. The
+/// model is a GGUF split or a checkpoint folder ([`Model`]): the plan reads
+/// its header (a split's first shard, a folder's located header) and the open
+/// takes the model whole; a body that loads splits alone refuses a folder by
+/// name ([`split_of`]).
 pub trait Open: ChainBody + Sized {
     /// The body's own load levers and schedules, parsed once by the binary.
     type Cfg;
     /// What the plan is made from, read from the file's headers.
     type Inputs;
 
-    /// Read `file`'s headers.
+    /// Read the model's header `file` ([`Model::header`]).
     fn inputs(file: &Split) -> Result<Self::Inputs, GpuError>;
 
     /// Apply load settings that change planned buffers, before the plan borrows its inputs.
@@ -190,9 +195,9 @@ pub trait Open: ChainBody + Sized {
         cfg: &Self::Cfg,
     ) -> Result<Plan<'a>, GpuError>;
 
-    /// The model resident by `plan`, which `inputs` made.
+    /// The model `file` resident by `plan`, which `inputs` made from its header.
     fn open(
-        file: Split,
+        file: Model,
         inputs: &Self::Inputs,
         plan: &Plan<'_>,
         cfg: &Self::Cfg,
@@ -201,6 +206,18 @@ pub trait Open: ChainBody + Sized {
     /// Make the prompt call's buffers `cfg` asks for, before any prompt, so
     /// that a timed prompt allocates nothing; whether it made any.
     fn prepare(m: &mut GpuModel<Self>, cfg: &Self::Cfg) -> Result<bool, GpuError>;
+}
+
+/// The GGUF split `file` is, for the open of a body that loads splits alone: a checkpoint folder
+/// is refused by name (`what` the body's session).
+pub fn split_of(file: Model, what: &'static str) -> Result<Split, GpuError> {
+    match file {
+        Model::Split(split) => Ok(split),
+        Model::Folder(_) => Err(GpuError::shape(
+            what,
+            "a checkpoint folder: this body loads a GGUF split",
+        )),
+    }
 }
 
 /// A body's prompt schedule.
@@ -429,11 +446,12 @@ pub struct Loaded<B: Open> {
 }
 
 impl<B: Open> Loaded<B> {
-    /// Read `file`'s headers, plan once on `args`' placement and hand the
-    /// plan to `log` (`false` stops here: `Ok(None)`), then load by that plan
-    /// in `args`' step mode and hand `log` the model.
+    /// Read `file`'s header, plan once on `args`' placement and hand the
+    /// plan to `log` (`false` stops here: `Ok(None)`), then load `file` by
+    /// that plan in `args`' step mode and hand `log` the model. `file` is a
+    /// GGUF split or a checkpoint folder ([`Model`]).
     pub fn open<M: Fn(usize) -> Machine>(
-        file: Split,
+        file: impl Into<Model>,
         args: OpenArgs<B::Cfg, M>,
         log: &mut impl OpenLog<B>,
     ) -> Result<Option<Loaded<B>>, SessionError> {
@@ -445,12 +463,13 @@ impl<B: Open> Loaded<B> {
     /// itself (a diagnostic's hand-placed card set) keeps every other row
     /// the planner made.
     pub fn open_edited<M: Fn(usize) -> Machine>(
-        file: Split,
+        file: impl Into<Model>,
         args: OpenArgs<B::Cfg, M>,
         log: &mut impl OpenLog<B>,
         edit: impl FnOnce(&B::Inputs, &mut Plan<'_>) -> Result<(), SessionError>,
     ) -> Result<Option<Loaded<B>>, SessionError> {
-        let mut inputs = B::inputs(&file)?;
+        let file = file.into();
+        let mut inputs = B::inputs(file.header())?;
         B::configure_inputs(&mut inputs, &args.cfg)?;
         let machine = (args.machine)(B::layer_count(&inputs));
         let mut plan = B::plan(&inputs, &machine, args.ctx, &args.cfg)?;

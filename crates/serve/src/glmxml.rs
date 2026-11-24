@@ -311,7 +311,7 @@ impl KvError {
 
 /// What a tool schema says of one argument.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     /// `"type": "string"`: the value is raw text.
     String,
     /// A `type` without `"string"`: the value is JSON; the type as written.
@@ -357,7 +357,7 @@ impl ArgTypes {
         ArgTypes { kinds }
     }
 
-    fn kind(&self, name: &str, key: &str) -> Option<&Kind> {
+    pub(crate) fn kind(&self, name: &str, key: &str) -> Option<&Kind> {
         self.kinds.get(name)?.get(key)
     }
 }

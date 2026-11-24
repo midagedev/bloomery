@@ -1,7 +1,9 @@
 //! A hybrid file planned onto a machine: the one path from a family's headers to a plan that keeps
 //! its invariants, for every family whose body mixes with GQA layers (a plane, or a ring for a window
-//! layer, and an index key row a position for a layer that selects blocks) and delta-rule layers (a
-//! state and a conv ring), routes every layer's experts and puts the rest of them on the host. A
+//! layer, and an index key row a position for a layer that selects blocks), latent layers (a row a
+//! position, or a ring, a pooled row every `ratio` positions and a compressor's state for a layer
+//! that compresses) and delta-rule layers (a state and a conv ring), routes every layer's experts and
+//! puts the rest of them on the host. A
 //! family reads its headers into a [`ModelSpec`] and its tensors' roles ([`PlanInputs::new`]); what
 //! the layers hold is read off the description ([`KvLayout::of`]), the program off its architecture
 //! ([`program_of`]), and the placement runs the expert rule on the layers whose stacks the card
@@ -26,7 +28,8 @@ use std::ops::Range;
 use bloomery_levers::{KvFloor, KvHost};
 use bloomery_placement::slots::{SeqTerms, Stores, kv_host_room, layer_padding, room_spare};
 use models::{
-    DeltaRule, Gqa, IndexKeys, Latent, Mixer, ModelSpec, PoolRule, RopeMode, Selector, Source,
+    Compress, Compressor, DeltaRule, Gqa, IndexKeys, Latent, Mixer, ModelSpec, PoolRule, RopeMode,
+    Selector, Source,
 };
 use runtime::stores::{self, PosLayout, Rows};
 
@@ -766,6 +769,15 @@ impl<H> PlanInputs<H> {
         }
     }
 
+    /// `self` for a body whose indexer keeps its index keys in f32 ([`KvLayout::with_f32_index_keys`]).
+    #[must_use]
+    pub fn with_f32_index_keys(self) -> PlanInputs<H> {
+        PlanInputs {
+            kv: self.kv.with_f32_index_keys(),
+            ..self
+        }
+    }
+
     /// The card bytes the load of `machine` makes beside the plan's terms: the prompt batch's, and
     /// a tiered load's more. A machine that names an expert tier card where the body serves none
     /// is refused by name ([`PlaceError::Tier`]); a reserve-only member is no tier card.
@@ -1137,6 +1149,17 @@ enum Hold {
     /// A latent layer that reads the rows another layer wrote ([`Source::From`]): no cached row of
     /// its own, and `index` bytes of index key a position when its indexer writes keys of its own.
     Reader { index: u64 },
+    /// A latent layer that compresses its rows ([`compressed_hold`]): a ring of `window` rows of
+    /// `row` bytes of its own (the whole ring whatever the context: a position sits at slot
+    /// `position % window`, so the body makes every slot at the load), one pooled row of `row`
+    /// bytes every `ratio` positions over every position (the open pool counted whole), and its
+    /// compressor's pooling state of `state` bytes whatever the context.
+    Compressed {
+        row: u64,
+        window: u64,
+        ratio: u64,
+        state: u64,
+    },
     /// A delta-rule layer: its first state lane and conv ring (`fixed` bytes), and the lanes'
     /// stamps and the lanes past the first over `v_heads` heads of `d × d` f32, whatever the
     /// context.
@@ -1170,8 +1193,10 @@ enum Hold {
 /// over [`IndexKeys::FromInput`]), one f16 index key of the selector's `d` values for every
 /// position, which a layer that reads another's keys does not keep; under the gated token pool
 /// ([`Selector::TokenPool`]) one f16 key and one f32 score a pool of positions instead. A latent
-/// layer over a window that selects nothing holds its rows as a GQA window layer does. A
-/// delta-rule layer holds a
+/// layer over a window that selects nothing holds its rows as a GQA window layer does. A latent
+/// layer that compresses holds its last `window` rows on a ring of its own, whatever the row
+/// choice (its body keeps no plane of raw rows), one pooled row every `ratio` positions and its
+/// compressor's state. A delta-rule layer holds a
 /// state of `v_heads` heads of `d × d` f32 in each of its stamped lanes, and the conv ring
 /// (`runtime::stores::recurrent_bytes`, `delta_lane_bytes`): one lane, or the lanes of a load that
 /// verifies ([`KvLayout::with_lanes`]).
@@ -1208,10 +1233,11 @@ pub struct KvLayout {
 
 impl KvLayout {
     /// The layout of the trunk layers `mixers` name, window layers on the ring; a mixer whose store
-    /// this owner does not size (a Mamba-2 layer, a latent layer that compresses, that windows
-    /// beside a selector or another layer's rows, or whose selector is not the stream top-k over
-    /// keys of the layer input or the gated token pool, a GQA layer with a selector other than the
-    /// block selector or with a window beside it) is refused by name with its layer.
+    /// this owner does not size (a Mamba-2 layer, a latent layer that compresses otherwise than
+    /// [`compressed_hold`] sizes, that windows beside a selector or another layer's rows, or whose
+    /// selector is not the stream top-k over keys of the layer input or the gated token pool, a GQA
+    /// layer with a selector other than the block selector or with a window beside it) is refused
+    /// by name with its layer.
     pub fn of<'a>(mixers: impl IntoIterator<Item = &'a Mixer>) -> Result<KvLayout, PlacementError> {
         let mut holds = Vec::new();
         let mut ropes: Vec<(u32, u32)> = Vec::new();
@@ -1289,6 +1315,35 @@ impl KvLayout {
         }
     }
 
+    /// The same layout with every index key a position at f32 where the stores size it at f16: a
+    /// body whose indexer keeps its keys at full width (the lightning indexer's scores read f32
+    /// keys). Only the index bytes of the layers that own keys change, to twice, whether the layer
+    /// owns its rows or reads another's; rows, pools, rings and states are as before.
+    #[must_use]
+    pub fn with_f32_index_keys(self) -> KvLayout {
+        let wide = |index: u64| index / stores::F16_BYTES * stores::F32_BYTES;
+        let holds = self
+            .holds
+            .into_iter()
+            .map(|hold| match hold {
+                Hold::Attention {
+                    row,
+                    index,
+                    pooled,
+                    window,
+                } => Hold::Attention {
+                    row,
+                    index: wide(index),
+                    pooled,
+                    window,
+                },
+                Hold::Reader { index } => Hold::Reader { index: wide(index) },
+                other => other,
+            })
+            .collect();
+        KvLayout { holds, ..self }
+    }
+
     /// The same layout with the by-position buffers `rooms` the body holds in rooms: the part of
     /// each layer's bytes the plan reads at the expert spread's floor
     /// ([`KvBytes::rooms`]). The family that builds the rooms owns the declaration and its
@@ -1332,11 +1387,13 @@ impl KvLayout {
     /// past the trunk, holds none. The index keys of a layer that selects blocks are not counted
     /// here: it has no window, so they are one for each of the `ctx_max` positions
     /// ([`KvBytes::layer_bytes`] adds them). A relative-position bias layer's rows are its visits'
-    /// — the loop's passes inside its core.
+    /// — the loop's passes inside its core. A compressing latent layer's are its ring's, every
+    /// slot whatever the context; its pooled rows are not raw rows.
     #[must_use]
     pub fn rows_at(&self, layer: usize, ctx_max: u64) -> u64 {
         match self.holds.get(layer) {
             Some(Hold::Attention { window, .. }) => self.rows.count(*window, ctx_max),
+            Some(Hold::Compressed { window, .. }) => *window,
             Some(Hold::RelBias { window, visits, .. }) => {
                 self.rows.count(*window, ctx_max).saturating_mul(*visits)
             }
@@ -1420,6 +1477,10 @@ fn hold_of(
                 }
             }
         }
+        Mixer::Latent(a) if a.compress.is_some() => match compressed_hold(a) {
+            Ok(hold) => hold,
+            Err(what) => return Err(unsized_store(layer, what)),
+        },
         // A latent layer over a window of positions that compresses and selects nothing
         // holds its own rows on the ring, as a GQA window layer does.
         Mixer::Latent(a)
@@ -1578,14 +1639,64 @@ fn latent_pool_row(a: &Latent) -> Result<Pooled, &'static str> {
     }
 }
 
+/// The stores of latent layer `a`, which compresses: one f16 row of its latent values a position
+/// on a ring of its last `window` positions, one pooled row of the same width every `ratio`
+/// positions, and its compressor's pooling state, the last `ratio` projections' values and scores
+/// of the latent's width in f32. The one layout this owner knows the bytes of: the layer owns its
+/// rows and its compressor, scores its pools (gated) over groups that do not overlap, attends a
+/// window beside the pooled stream, selects nothing and keeps no key values beside the latent.
+/// Any other is `Err` with the words a refusal names the mixer by.
+fn compressed_hold(a: &Latent) -> Result<Hold, &'static str> {
+    let Some(Compress { ratio, rows }) = &a.compress else {
+        return Err("a latent mixer that compresses nothing, read as one that compresses");
+    };
+    let ratio = u64::from(*ratio);
+    if ratio == 0 {
+        return Err("a compressing latent mixer that pools no position");
+    }
+    if !matches!(
+        rows,
+        Source::Own(Compressor {
+            gated: true,
+            overlap: false,
+            ..
+        })
+    ) {
+        return Err(
+            "a compressing latent mixer whose pooled rows are not its own gated compressor's \
+             over groups that do not overlap",
+        );
+    }
+    if a.cache != Source::Own(()) {
+        return Err("a compressing latent mixer that reads another layer's rows");
+    }
+    if a.select.is_some() {
+        return Err("a compressing latent mixer that selects");
+    }
+    if a.pe != 0 {
+        return Err("a compressing latent mixer with key values beside the latent");
+    }
+    let Some(window) = a.window.filter(|&w| w > 0) else {
+        return Err("a compressing latent mixer with no window beside the pooled stream");
+    };
+    let latent = u64::from(a.latent);
+    Ok(Hold::Compressed {
+        row: latent * stores::F16_BYTES,
+        window: u64::from(window),
+        ratio,
+        state: 2 * ratio * latent * stores::F32_BYTES,
+    })
+}
+
 /// The refusal of layer `layer`, a mixer this owner does not size (`what` names it).
 fn unsized_store(layer: usize, what: &str) -> PlacementError {
     PlacementError::Unimplemented(vec![Unimplemented {
         layer: Some(layer),
         feature: format!(
             "{what}: this plan sizes the stores of a GQA layer (plain, or selecting blocks), a latent \
-             layer (plain, over a window, or selecting by the stream top-k over keys of the layer \
-             input or by the gated token pool) and a delta-rule layer"
+             layer (plain, over a window, selecting by the stream top-k over keys of the layer \
+             input or by the gated token pool, or compressing by a gated compressor of its own \
+             beside a window) and a delta-rule layer"
         ),
     }])
 }
@@ -1611,6 +1722,15 @@ impl KvBytes for KvLayout {
                 .saturating_add(ctx_max.saturating_mul(*index))
                 .saturating_add(ctx_max.div_ceil(*per).saturating_mul(*pool_bytes)),
             Some(Hold::Reader { index }) => ctx_max.saturating_mul(*index),
+            Some(Hold::Compressed {
+                row,
+                window,
+                ratio,
+                state,
+            }) => (*window)
+                .saturating_add(ctx_max.div_ceil(*ratio))
+                .saturating_mul(*row)
+                .saturating_add(*state),
             Some(Hold::State { fixed, v_heads, d }) => {
                 fixed + stores::delta_lane_bytes(*v_heads, *d, self.lanes.get())
             }
@@ -2088,6 +2208,33 @@ mod tests {
         }
     }
 
+    /// A body whose indexer keeps f32 keys plans twice the index bytes of every layer that owns
+    /// keys, and nothing else: with the layers of the test above (rows of 40 B
+    /// a position, index keys of 12 values) the keys are 48 B a position, not 24 B, so layer 1
+    /// holds 9 × (40 + 48), layer 2 9 × 48, and the layers that hold no keys hold what they held.
+    /// Mutant: the knob left out of a layer kind, or applied to the rows.
+    #[test]
+    fn f32_index_keys_double_the_index_bytes_alone() {
+        let own = Source::Own(());
+        let from = Source::From(1);
+        let own_keys = Source::Own(IndexKeys::FromInput { norm_eps: 1e-6 });
+        let mixers = [
+            latent(4, own, None),
+            latent(4, own, Some(stream(12, own_keys, None))),
+            latent(4, from, Some(stream(12, own_keys, None))),
+            latent(4, own, Some(stream(12, Source::From(1), None))),
+            latent(4, from, Some(stream(12, Source::From(1), None))),
+        ];
+        let half = KvLayout::of(&mixers).expect("latent layers are sized");
+        let full = half.clone().with_f32_index_keys();
+        let at = |kv: &KvLayout| (0..5).map(|l| kv.layer_bytes(l, 9)).collect::<Vec<_>>();
+        assert_eq!(at(&half), [9 * 40, 9 * 64, 9 * 24, 9 * 40, 0]);
+        assert_eq!(at(&full), [9 * 40, 9 * 88, 9 * 48, 9 * 40, 0]);
+        for l in 0..5 {
+            assert_eq!(full.rows_at(l, 9), half.rows_at(l, 9), "layer {l}");
+        }
+    }
+
     /// A latent layer holds one f16 row a position of its latent and key values (here 16 + 4
     /// values, 40 B) unless another layer wrote the rows it reads, and one f16 index key a position
     /// of the selector's `d` values (here 12, 24 B) unless it reads another layer's keys, the two
@@ -2160,8 +2307,99 @@ mod tests {
         assert_eq!(ring.layer_bytes(0, past), past * 40);
     }
 
+    /// A latent layer that compresses (here 16 latent values, a window of 8, a pool every 4
+    /// positions) holds one f16 row of 32 B a position on a ring of its last 8 positions, one pooled
+    /// row of 32 B every 4 positions with the open pool counted whole, and its gated compressor's
+    /// state of the last 4 projections' values and scores of 16 f32, 512 B, whatever the context: at
+    /// 3 positions the 8 ring rows (the ring is whole from the first position), 1 pool and the state
+    /// (800 B), at 9 the 8 ring rows, 3 pools and the state (864 B), at 4,096 the 8 ring rows, 1,024 pools and the state (33,536 B), whatever the
+    /// row choice. A compressing layer this owner does not size is refused by name: key values
+    /// beside the latent, a compressor that scores nothing, one whose groups overlap, one another
+    /// layer writes, a selector, another layer's rows. Mutants: the ring counted at every position,
+    /// the ring cut at the context, the open pool dropped, the state left out.
+    #[test]
+    fn a_compressing_latent_layer_holds_its_ring_pools_and_state() {
+        let own = Source::Own(());
+        let compressor = Compressor {
+            gated: true,
+            ape: true,
+            overlap: false,
+        };
+        let Mixer::Latent(base) = latent(0, own, None) else {
+            unreachable!("a latent layer")
+        };
+        let with = |f: &dyn Fn(&mut Latent)| {
+            let mut a = Latent {
+                window: Some(8),
+                compress: Some(Compress {
+                    ratio: 4,
+                    rows: Source::Own(compressor),
+                }),
+                ..base.clone()
+            };
+            f(&mut a);
+            Mixer::Latent(a)
+        };
+        let sized = with(&|_| {});
+        let ring = KvLayout::of([&sized]).expect("a compressing latent layer is sized");
+        let plane = ring.clone().with_rows(Rows::Plane);
+        for kv in [&ring, &plane] {
+            assert_eq!(kv.layer_bytes(0, 3), 8 * 32 + 32 + 512);
+            assert_eq!(kv.layer_bytes(0, 9), 8 * 32 + 3 * 32 + 512);
+            assert_eq!(kv.layer_bytes(0, 4096), 8 * 32 + 1024 * 32 + 512);
+            assert_eq!(kv.rows_at(0, 9), 8);
+            assert_eq!(kv.rows_at(0, 3), 8);
+        }
+        assert_eq!(ring.stage_position_bytes(4096), 0);
+        let refused = [
+            with(&|a| a.pe = 4),
+            with(&|a| {
+                a.compress = Some(Compress {
+                    ratio: 4,
+                    rows: Source::Own(Compressor {
+                        gated: false,
+                        ..compressor
+                    }),
+                })
+            }),
+            with(&|a| {
+                a.compress = Some(Compress {
+                    ratio: 4,
+                    rows: Source::Own(Compressor {
+                        overlap: true,
+                        ..compressor
+                    }),
+                })
+            }),
+            with(&|a| {
+                a.compress = Some(Compress {
+                    ratio: 4,
+                    rows: Source::From(0),
+                })
+            }),
+            with(&|a| {
+                a.select = Some(stream(
+                    12,
+                    Source::Own(IndexKeys::FromInput { norm_eps: 1e-6 }),
+                    None,
+                ))
+            }),
+            with(&|a| a.cache = Source::From(0)),
+        ];
+        for (l, mixer) in refused.iter().enumerate() {
+            match KvLayout::of([&sized, mixer]) {
+                Err(PlacementError::Unimplemented(items)) => {
+                    assert_eq!(items.len(), 1, "case {l}");
+                    assert_eq!(items[0].layer, Some(1), "case {l}");
+                }
+                other => panic!("case {l}: {other:?}, not the refusal of layer 1"),
+            }
+        }
+    }
+
     /// A latent layer whose store this owner does not size is refused by name with its layer: one
-    /// that compresses, one over a window that also selects or reads another layer's rows (the
+    /// that compresses with no window, one over a window that also selects or reads another layer's
+    /// rows (the
     /// window layer this owner sizes owns its rows and selects nothing), a selector that is not the
     /// stream top-k or the gated pool, a stream top-k that ranks a candidate pool first and one
     /// whose keys are pooled from rows. Mutant: the candidate pool or the pooled keys sized as keys

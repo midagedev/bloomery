@@ -126,9 +126,9 @@ use crate::chain::ffn::{
     host_widths,
 };
 use crate::chain::glue::{EngramKv, EngramStep, Glue, RowsArrival, RowsLevers, StepRows};
-use crate::hc::{HC_STREAMS, HcKernels};
 use crate::params::{ImageDims, ImageLayout, StepImage, rope_specs};
 use crate::swap;
+use bloomery_gpu::hc::{HC_STREAMS, HcKernels};
 
 mod ced;
 mod prefill;

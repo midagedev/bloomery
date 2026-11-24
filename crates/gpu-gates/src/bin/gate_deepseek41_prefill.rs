@@ -274,6 +274,7 @@ mod gate {
     use std::time::Instant;
 
     use app::Session;
+    use bloomery_gpu::hc::{HC_MIX, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch};
     use bloomery_gpu::hybrid::{HOST, HandoffLayout, HandoffTarget, PageLayout};
     use bloomery_gpu::model::{ChainBody, StepMode};
     use bloomery_gpu::q4k_sel::tile_cap;
@@ -294,9 +295,6 @@ mod gate {
         DenseKernels, Q3kHeadsGroupsArgs, Q3kHeadsMcolArgs, RowsPart,
     };
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels};
-    use bloomery_gpu_deepseek41::hc::{
-        HC_MIX, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch,
-    };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_deepseek41::span::span;
     use bloomery_gpu_gates::logits_band::{LOGITS_CLEAR_PIN, LogitsBand, Pins, seam_verdict};

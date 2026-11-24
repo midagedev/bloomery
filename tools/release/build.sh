@@ -807,7 +807,7 @@ else
   # above.
   if [ -n "$CUBIN" ] && [ -z "$CROSS" ]; then bin_args+=(--bin oxart_ptxas); fi
   # The commit goes to cargo alone: the serve build script reads it, and a running binary never does.
-  BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release "${bin_args[@]}" ${target_args[@]+"${target_args[@]}"}
+  BLOOMERY_GIT_COMMIT="$COMMIT" cargo oxide build --arch "$ARCH" -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,ernie55,mistrallarge4,gemma-embedding2,hf,checkpoint --release "${bin_args[@]}" ${target_args[@]+"${target_args[@]}"}
 fi
 
 fail=0

@@ -12,9 +12,9 @@
 //! positions of the same run wrote: the caller resets the model before
 //! position 0 of each layer's run.
 
+use bloomery_gpu::hc::HC_STREAMS;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError};
-use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use model::arch::glm5next::names::Sub;
 use runtime::layer::{FfnKind, MixerKind};
 

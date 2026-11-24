@@ -122,7 +122,7 @@ impl Family for KimiK3 {
             plan,
             Box::new(move |file, plan, inputs, host, residency| {
                 GpuModel::<Body>::open_placed_with(
-                    file,
+                    app::split_of(file, NAME)?,
                     (plan, inputs),
                     0,
                     host,

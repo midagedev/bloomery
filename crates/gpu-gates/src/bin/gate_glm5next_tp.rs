@@ -67,10 +67,10 @@ mod gate {
 
     use crate::e2e::{argmax, layer_table, on_path, rel, same_bits};
     use crate::glm5next_tier::{self, FxBands, IkRoute, fx_route_cap, ik_bands};
+    use bloomery_gpu::hc::HC_STREAMS as STREAMS;
     use bloomery_gpu::host::{GatherLoop, PostCols};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu::{Gpu, GpuError, MappedHost};
-    use bloomery_gpu_deepseek41::hc::HC_STREAMS as STREAMS;
     use bloomery_gpu_deepseek41::router::glm5next::N_EXPERT;
     use bloomery_gpu_gates::act_rule::Arm;
     use bloomery_gpu_gates::flip::{self, Flip};

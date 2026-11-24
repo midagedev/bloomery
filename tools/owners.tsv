@@ -41,14 +41,14 @@ attn_latent_mla	attn	crates/gpu/src/latent.rs crates/gpu/src/latent_gated.rs cra
 attn_linear_gdn_kda	recur	crates/gpu/src/linear/conv.rs crates/gpu/src/linear/delta.rs crates/gpu/src/linear/mixer_kda.rs crates/gpu/src/linear/norm_gate.rs crates/gpu/src/linear/out_gate.rs crates/gpu-glm5next/src/kda.rs crates/model/src/arch/kda.rs
 recur_mamba2	recur	crates/gpu/src/mamba2.rs crates/gpu/src/mamba2_ssd.rs crates/model/src/mamba2.rs crates/gpu/src/recur.rs
 recur_state	recur	crates/runtime/src/seqstate.rs crates/runtime/src/state.rs
-attn_ds41_csa_hca	attn	crates/gpu-deepseek41/src/attn.rs crates/gpu-deepseek41/src/compress.rs crates/gpu-deepseek41/src/indexer.rs crates/gpu-deepseek41/src/index_key.rs crates/gpu/src/indexer.rs crates/gpu/src/index_key.rs crates/gpu-deepseek41/src/hc.rs crates/gpu/src/hc_gated.rs
+attn_ds41_csa_hca	attn	crates/gpu-deepseek41/src/attn.rs crates/gpu-deepseek41/src/compress.rs crates/gpu-deepseek41/src/indexer.rs crates/gpu-deepseek41/src/index_key.rs crates/gpu/src/indexer.rs crates/gpu/src/index_key.rs crates/gpu/src/hc.rs crates/gpu/src/hc_gated.rs
 attn_rel_bias	attn	crates/gpu/src/rel_bias.rs crates/gpu/src/qk_clip.rs
 attn_rel_prefill	attn	crates/gpu/src/rel_bias_prefill.rs
 moe_route	moe	crates/gpu/src/moe_fused.rs crates/gpu/src/router.rs crates/gpu/src/route_core.rs crates/gpu/src/route_body.rs crates/gpu/src/route_softmax.rs crates/gpu/src/cand.rs crates/gpu/src/gemm/route.rs
 kv_pool_checkpoint	kv	crates/gpu/src/kpool.rs crates/gpu/src/checkpoint.rs crates/gpu/src/checkpoint/planes.rs crates/gpu/src/checkpoint/saved.rs crates/gpu/src/checkpoint/staging.rs crates/runtime/src/stores.rs crates/runtime/src/savemap.rs crates/model/src/kv.rs
 graph_fault	graph	crates/gpu/src/graph.rs crates/gpu/src/lane.rs crates/gpu/src/fault.rs crates/gpu/src/watchdog.rs crates/gpu/src/capsync.rs
 ple_embed	load	crates/gpu/src/ple.rs crates/embed/src/lib.rs
-head_sample	host	crates/gpu/src/head.rs crates/sampler/src/lib.rs crates/runtime/src/stop.rs
+head_sample	host	crates/gpu/src/head.rs crates/gpu/src/multimax.rs crates/sampler/src/lib.rs crates/runtime/src/stop.rs
 tokenizer_jinja	host	crates/tokenizer/src/lib.rs crates/jinja/src/lib.rs
 levers	lever	crates/levers/src/registry.rs crates/levers/src/lib.rs
 refset_readers	refset	crates/refset/src/lib.rs crates/refset/src/family.rs crates/refset/src/fixture.rs crates/refset/src/columns.rs
@@ -72,4 +72,4 @@ ffn_situ	moe	crates/gpu/src/arch/routed_ffn.rs
 token_major	kernel	crates/gpu/src/token_major.rs
 fault_step_order	graph	crates/gpu/src/arch/step_order.rs
 quant_types	quant	crates/gguf/src/qtype.rs crates/gguf/src/iq_tables.rs crates/qdot/src/generic.rs
-hc_engram_common	kernel	crates/gpu/src/hc_ident.rs crates/gpu/src/engram_delta.rs crates/gpu/src/engram_gate.rs
+hc_engram_common	kernel	crates/gpu/src/hc_ident.rs crates/gpu/src/hc_f32_pieces.rs crates/gpu/src/engram_delta.rs crates/gpu/src/engram_gate.rs

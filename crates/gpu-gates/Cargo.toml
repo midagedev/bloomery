@@ -180,8 +180,8 @@ gemma4a = ["gpu", "dep:bloomery-gpu-gemma4a", "dep:bloomery-vision"]
 mistrallarge4 = ["gpu", "dep:bloomery-gpu-deepseek41", "dep:bloomery-gpu-mistrallarge4", "bloomery-app/mistrallarge4"]
 # The Hy4-flash program and its session (serve_seats/hy4.rs, the e2e and serve gates).
 hy4 = ["gpu", "dep:bloomery-gpu-hy4", "bloomery-app/hy4"]
-# The ERNIE 5.5 Flash program (its component gates).
-ernie55 = ["gpu", "dep:bloomery-gpu-ernie55"]
+# The ERNIE 5.5 Flash program and its session (serve_seats/ernie55.rs, the component, e2e and serve gates).
+ernie55 = ["gpu", "dep:bloomery-gpu-ernie55", "bloomery-app/ernie55"]
 
 [[bin]]
 name = "gate_gemma4a"
@@ -199,7 +199,7 @@ required-features = ["deepseek41"]
 [[bin]]
 name = "bloomery-serve"
 path = "src/bin/bloomery_serve.rs"
-required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "kimik3", "hy4", "mistrallarge4", "gemma-embedding2", "hf"]
+required-features = ["glm5next", "clef", "mimo2", "solar2", "minimaxm3", "flint", "kimik3", "hy4", "ernie55", "mistrallarge4", "gemma-embedding2", "hf"]
 
 [[bin]]
 name = "bloomery-serve-ds41"
@@ -422,6 +422,12 @@ required-features = ["deepseek41", "kimik3"]
 [[bin]]
 name = "gate_hy4_serve"
 required-features = ["deepseek41", "hy4"]
+
+# ernie55-serve: the ERNIE 5.5 Flash seat of bloomery-serve over the fixture cut (a checkpoint folder): a second slot refused, the load at
+# the context asked, one chat turn answered, the cut that keeps the position or nothing.
+[[bin]]
+name = "gate_ernie55_serve"
+required-features = ["deepseek41", "ernie55"]
 
 # inkling2-serve: the Inkling 2 seat of bloomery-serve over the fixture file: the default context planned and named, a second slot refused,
 # the load at that context, the oracle prompts tokenized to the references ids, the chat templates render, a forced call parsed into
@@ -1010,14 +1016,33 @@ required-features = ["deepseek41", "flint"]
 name = "gate_hy4_attn"
 required-features = ["gpu"]
 
+# ernie55-hca: ERNIE 5.5's HCA attention sub-layer on the card over the common window ⧺ compressed attention, the compressor
+# and the tail rope, with its VHA head mix, grouped output and gate; seeded inputs, against an f64 rule of the reference.
+[[bin]]
+name = "gate_ernie55_hca"
+required-features = ["ernie55"]
+
 [[bin]]
 name = "gate_hy4_e2e"
 required-features = ["hy4"]
+
+# ernie55-e2e: ERNIE 5.5 Flash Preview's whole program on one card over the fixture cut (the card arm with the prompt pass,
+# the hosted arm through the common host tier) against the numpy writer's sets `fx-np-ernie55`. Fixture tier only.
+[[bin]]
+name = "gate_ernie55_e2e"
+required-features = ["ernie55", "checkpoint"]
 
 # hy4-pp: the prompt batch (one pass a layer over every row, the grouped int8 GEMMs) against the decode chain on the fixture file.
 [[bin]]
 name = "gate_hy4_pp"
 required-features = ["hy4"]
+
+# ernie55-moe: ERNIE 5.5's latent mixture of experts on the card (the two-router sigmoid selection with the learned scale, the latent
+# pair, the MXFP4 experts on the common card leg under SiTU, the routed sum's norm, the shared expert) and its split with the common host
+# tier, seeded inputs at the released file's shapes against f64 rules of the reference, no model file.
+[[bin]]
+name = "gate_ernie55_moe"
+required-features = ["ernie55"]
 
 # hy4-dsa: Hy4-flash's k-pool selector on the card (the key append, the pool, the forced-tail score
 # and top-k) against each kernel's host rule and the exact f64 rule, on synthetic inputs.
@@ -1097,3 +1122,17 @@ required-features = ["gpu", "checkpoint"]
 [[bin]]
 name = "gate_inkling2_draft"
 required-features = ["gpu", "dspark-hf"]
+
+# ernie55-mla: ERNIE 5.5 Flash Preview's MLA-DSA layer (the latent attention, the lightning indexer's f32 top-k with its
+# forced window, the output gate, the k_b/v_b repack) at the released file's shapes, seeded inputs in a synthetic file,
+# against an f64 rule of llama.cpp PR #31925; the prompt form is the step form.
+[[bin]]
+name = "gate_ernie55_mla"
+required-features = ["ernie55"]
+
+# ernie55-trunk: ERNIE 5.5 Flash Preview's trunk on the card (the F32 mHC mix with the RMS factor outside the root, the head's four-row mix,
+# the post and fold, MultiMax, the dense SiTU block on FP8_B128 and the embedding, the trunk and head components over a synthetic one-layer
+# file), seeded inputs, against f64 rules of llama.cpp PR #31925's graph.
+[[bin]]
+name = "gate_ernie55_trunk"
+required-features = ["ernie55"]

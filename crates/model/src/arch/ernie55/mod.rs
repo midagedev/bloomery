@@ -13,9 +13,9 @@
 //! Both gate their heads' outputs by a sigmoid projection of the normed query latent and mix the
 //! heads' outputs by `I + V·Uᵀ` (`attn_vha_u`, `attn_vha_v`). The head is the untied matrix
 //! behind a MultiMax epilogue of eight values (`output_multimax_*`). The file's keys
-//! (`hparams`) and where the checkpoint's config keys go (`config`), every tensor's role (`roles`), the tensor names a step reads (`names`), what a
-//! layer's stores are (`kv`), the description (`spec`), what it cannot state (`ops`) and the plan's
-//! inputs (`place`).
+//! (`hparams`) and where the checkpoint's config keys go (`config`), every tensor's role (`roles`), the tensor names a step reads (`names`), the
+//! description (`spec`), what it cannot state (`ops`) and the plan's inputs, whose layers' stores
+//! the common hybrid owner reads off the description (`place`).
 //!
 //! The dialect's authority is the model folder's `config.json` and checkpoint, with llama.cpp's
 //! `src/models/ernie5-5.cpp` (PR #31925) and vLLM-ERNIE's `model.py`, `attention.py`, `moe.py`
@@ -23,7 +23,6 @@
 
 pub mod config;
 pub mod hparams;
-pub mod kv;
 pub mod names;
 pub mod ops;
 pub mod place;

@@ -18,12 +18,13 @@ use gguf::arch::ernie55::{ARCH, PRE, allowed_types};
 use model::arch::coverage;
 use model::arch::ernie55::config::{FIXED, IGNORED, MAP};
 use model::arch::ernie55::hparams::{Hparams, unread_keys};
-use model::arch::ernie55::kv::kv_layout;
-use model::arch::ernie55::place::PlanInputs;
+use model::arch::ernie55::ops::Ops;
+use model::arch::ernie55::place::{
+    PROMPT_ROWS, PassTerms, PlanInputs, hca_partials_block, mla_scores_row, prompt_reserve_bytes,
+};
 use model::arch::ernie55::roles;
 use model::arch::ernie55::spec;
-use model::placement::accepts::{Program, routed_rule};
-use model::placement::workstation::{self, CardSpec, MIB};
+use model::placement::workstation::{self, CardSpec, HostRead, MIB};
 use model::placement::{self, KvBytes, PlanLevers, Role};
 use models::{
     Arch, Collapse, Ffn, HcKind, HcMix, IndexKeys, LatentOut, LatentUp, Mixer, OutGate, Score,
@@ -733,43 +734,45 @@ fn the_header_reads_as_the_config() {
     );
 }
 
-/// The stores of the two kinds at 32768 positions, against the figures of the checkpoint's
-/// dimensions: a latent layer holds 1,408 bytes a position (the 576-value row and the 128-value
-/// indexer key, f16); an HCA layer a 128-row ring and a pooled row every 128 positions (both 1,024
-/// bytes) and the pooling state of 524,288 bytes. FAIL-first: the state left out, or the indexer
-/// key left out of a latent layer, reds the clause.
+/// The stores of the two kinds at 32768 positions, as the common hybrid owner reads them off the
+/// description ([`PlanInputs::describe`]), against the figures of the checkpoint's dimensions: a
+/// latent layer holds 1,664 bytes a position (the 576-value row in f16, 1,152 bytes, and the
+/// 128-value indexer key in f32, 512 bytes: the lightning indexer's score pass reads full-width
+/// keys, so [`PlanInputs::describe`] counts them at f32); an HCA layer a 128-row ring and a pooled
+/// row every 128 positions (both 1,024 bytes) and the pooling state of 524,288 bytes. The ring is
+/// whole whatever the context (the body makes every slot at the load), the open pool counts whole
+/// and the pooled rows grow with the positions. FAIL-first: the state left out, the ring counted
+/// at every position or cut at the context, the 64 rotated key values left out of a latent layer,
+/// or the indexer key counted at f16, reds the clause.
 #[test]
 fn kv_bytes_of_both_kinds() {
     let cfg = config();
-    let hp = Hparams::read(&header("ernie55-kv", &cfg, |_| {}, |_, l| Some(l))).expect("reads");
-    let kv = kv_layout(&hp);
+    let split = header("ernie55-kv", &cfg, |_| {}, |_, l| Some(l));
+    let inputs = PlanInputs::describe(&split).expect("describes");
+    let (hp, kv) = (&inputs.hp, &inputs.kv);
     let ctx = 32_768;
-    let (mut mla, mut pooled, mut ring_state) = (0u64, 0u64, 0u64);
+    let (mut mla, mut hca) = (0u64, 0u64);
     for l in 0..hp.n_layer {
         if hp.latent_layer(l) {
             mla += kv.layer_bytes(l, ctx);
         } else {
-            pooled += kv.by_position(l, ctx);
-            ring_state += kv.fixed(l, ctx);
+            hca += kv.layer_bytes(l, ctx);
         }
     }
-    println!(
-        "ernie55 kv @{ctx}: latent {mla} B (6 layers), HCA pooled rows {pooled} B, ring + state {ring_state} B"
-    );
-    let want = (
-        6 * 32_768 * 1408,
-        37 * 256 * 1024,
-        37 * (128 * 1024 + 524_288),
-    );
+    println!("ernie55 kv @{ctx}: latent {mla} B (6 layers), HCA {hca} B (37 layers)");
+    let want = (6 * 32_768 * 1664, 37 * (256 * 1024 + 128 * 1024 + 524_288));
     assert_eq!(
-        (mla, pooled, ring_state),
+        (mla, hca),
         want,
-        "latent layers, HCA pooled rows, HCA ring + state"
+        "latent layers; HCA pooled rows, ring and state"
     );
-    // The ring is whole rows to the window and the rows grow with the positions.
-    assert_eq!(kv.fixed(0, 64), 64 * 1024 + 524_288);
-    assert_eq!(kv.by_position(0, 262_144), 2048 * 1024);
-    assert_eq!(kv.layer_bytes(7, 262_144), 262_144 * 1408);
+    assert_eq!(kv.layer_bytes(0, 64), 1024 + 128 * 1024 + 524_288);
+    assert_eq!(
+        kv.layer_bytes(0, 262_144),
+        2048 * 1024 + 128 * 1024 + 524_288
+    );
+    assert_eq!(kv.layer_bytes(7, 262_144), 262_144 * 1664);
+    assert!(kv.rooms().is_none(), "no store is a room");
 }
 
 /// The card the plan is made on: an RTX 5090 as `nvidia-smi` reports it, its driver reserve the
@@ -786,9 +789,11 @@ const RTX_5090: CardSpec = CardSpec {
     granule_bytes: workstation::GRANULE,
 };
 
-/// The plan of the file on one 5090 at `ctx`: per routed layer the experts the card holds, and the
-/// host's bytes. The routed stacks take the rule of [`Program::Ernie55Body`], the common card leg;
-/// no draft, no prompt pass and no stream ring are counted, so the figures are the decode plan's.
+/// The plan of the file on one 5090 at `ctx` by the common hybrid owner ([`PlanInputs::plan`], the
+/// seat's call), the host's room given as the workstation's: per routed layer the experts the card
+/// holds, and the host's bytes. The routed stacks take the rule of `Program::Ernie55Body`, the
+/// common card leg; no draft and no stream ring are counted, and the prompt pass is
+/// ([`PassTerms`]), so the figures are the plan of a load that holds its pass.
 struct Planned {
     n_l: Vec<u64>,
     card_experts: u64,
@@ -802,16 +807,9 @@ struct Planned {
 fn planned(inputs: &PlanInputs, ctx: u64) -> Planned {
     inputs.check_ctx(ctx).expect("a trained context");
     let machine = workstation::plan_on(RTX_5090, inputs.model.layers);
-    let plan = placement::plan_routed_reserving(
-        &inputs.model,
-        &machine,
-        ctx,
-        &inputs.kv,
-        &PlanLevers::default(),
-        routed_rule(Program::Ernie55Body),
-        0,
-    )
-    .unwrap_or_else(|e| panic!("plan @{ctx}: {e}"));
+    let plan = inputs
+        .plan(&machine, ctx, &PlanLevers::default())
+        .unwrap_or_else(|e| panic!("plan @{ctx}: {e}"));
     let bad = plan.violations();
     assert!(
         bad.is_empty(),
@@ -834,14 +832,20 @@ fn planned(inputs: &PlanInputs, ctx: u64) -> Planned {
 /// band the derivation gave before it ran (`predictions.txt`: 3,396 card experts, 81 a routed
 /// layer, host routed 121.05 GB at 32768; 3,096, 74 and 123.05 GB at 262144; the report's §2.1
 /// gives 3,236 and 77 a layer, the 166-expert gap being the head in MXFP8 planes, no draft term,
-/// the card's size and reserves, and the pooling state). Every expert is on the card or the host:
-/// the card's bytes and the host's make the file's 42 x 512 x 6,684,672. FAIL-first: a KV store
-/// dropped from `kv_layout` moves the card's experts out of the band.
+/// the card's size and reserves, and the pooling state). Those figures counted no prompt pass and
+/// the latent layers' index keys at f16; the pass's reserve (300,684,320 B), its stage rows (the
+/// flash partials of the pooled rows' segments and the score rows: 68.2 MB at 32768, 547.4 MB at
+/// 262144) and the keys at f32 (6 x positions x 256 B: 50.3 MB, 402.7 MB) take 63 experts (1.49 a
+/// layer) at 32768 and 187 (4.46) at 262144, so the derivation is 79.4 and 69.2 a layer. Every
+/// expert is on the card or the host: the card's bytes and the host's make the file's
+/// 42 x 512 x 6,684,672. FAIL-first: a KV store dropped from the common owner's hold of either
+/// kind, or the pass's terms from the plan, moves the card's experts out of the band.
 #[test]
 fn plan_on_a_5090() {
     let cfg = config();
     let split = header("ernie55-plan", &cfg, |_| {}, |_, l| Some(l));
-    let inputs = PlanInputs::describe(&split).expect("describes");
+    let mut inputs = PlanInputs::describe(&split).expect("describes");
+    inputs.room = (workstation::HOST_USABLE, HostRead::Given);
     let all = 42 * 512 * 6_684_672u64;
     let (a, b) = (planned(&inputs, 32_768), planned(&inputs, 262_144));
     for (ctx, p) in [(32_768, &a), (262_144, &b)] {
@@ -869,13 +873,13 @@ fn plan_on_a_5090() {
         per_layer(&b)
     );
     assert!(
-        (76.0..=86.0).contains(&per_layer(&a)),
-        "@32768: {} a layer, derived 80.9 (band 76 to 86)",
+        (74.0..=84.0).contains(&per_layer(&a)),
+        "@32768: {} a layer, derived 79.4 (band 74 to 84)",
         per_layer(&a)
     );
     assert!(
-        (69.0..=79.0).contains(&per_layer(&b)),
-        "@262144: {} a layer, derived 73.7 (band 69 to 79)",
+        (64.0..=74.0).contains(&per_layer(&b)),
+        "@262144: {} a layer, derived 69.2 (band 64 to 74)",
         per_layer(&b)
     );
     assert!(
@@ -883,6 +887,73 @@ fn plan_on_a_5090() {
         "a longer context leaves the card fewer experts"
     );
     assert!(b.kv > a.kv);
+}
+
+/// The plan reserves the prompt pass's buffers beside the stores: the parts' terms for units of
+/// [`PROMPT_ROWS`] rows are the plan's prompt reserve, the flash partials of the pooled rows'
+/// segments (one block of `ratio · 64` positions each) and the latent chain's score rows (one f32 a
+/// column of a span a position) are the stage's block and position scratch, and a plan that holds
+/// them gives the card fewer experts than one that holds none, by the bytes they take to within
+/// one expert a layer. FAIL-first: the reserve left out of [`PlanInputs::describe`], the block or
+/// position scratch left out, or a part's term left out of [`PassTerms::of`] reds the clause.
+#[test]
+fn the_plan_reserves_the_prompt_pass() {
+    let cfg = config();
+    let split = header("ernie55-reserve", &cfg, |_| {}, |_, l| Some(l));
+    let mut inputs = PlanInputs::describe(&split).expect("describes");
+    inputs.room = (workstation::HOST_USABLE, HostRead::Given);
+    let terms = PassTerms::of(&inputs.hp);
+    println!(
+        "ernie55 pass reserve @{PROMPT_ROWS} rows: trunk {} B, hca {} B, mla {} B, moe {} B, head {} B, total {} B",
+        terms.trunk,
+        terms.hca,
+        terms.mla,
+        terms.moe,
+        terms.head,
+        terms.total()
+    );
+    for (what, bytes) in [
+        ("trunk", terms.trunk),
+        ("hca", terms.hca),
+        ("mla", terms.mla),
+        ("moe", terms.moe),
+        ("head", terms.head),
+    ] {
+        assert!(bytes > 0, "the {what} part's buffers are a term");
+    }
+    assert_eq!(inputs.prompt_reserve, terms.total());
+    assert_eq!(inputs.prompt_reserve, prompt_reserve_bytes(&inputs.hp));
+    let (partials, block) = hca_partials_block(&inputs.hp);
+    assert_eq!(
+        (partials, block),
+        (4 * 128 * 64 * (512 + 2), 128 * 64),
+        "128 rows of 64 heads, a (512 + 2)-word partial a segment; a segment 64 pooled rows"
+    );
+    assert_eq!(mla_scores_row(), 4 * 8);
+    let bare = {
+        let mut b = inputs.clone().with_prompt_reserve(0);
+        b.kv = b.kv.with_position_scratch(0).with_block_scratch(0, 1);
+        b
+    };
+    let ctx = 262_144u64;
+    let rows = inputs.kv.stage_position_bytes(ctx) - bare.kv.stage_position_bytes(ctx);
+    assert_eq!(
+        rows,
+        mla_scores_row() * ctx + partials * ctx.div_ceil(block)
+    );
+    let extra = inputs.prompt_reserve + rows;
+    let (held, free) = (planned(&inputs, ctx), planned(&bare, ctx));
+    println!(
+        "ernie55 plan @{ctx}: card experts {} with the pass reserved, {} without; the pass takes {extra} B",
+        held.card_experts, free.card_experts
+    );
+    let lost = free.card_experts - held.card_experts;
+    let (expert, layers) = (6_684_672u64, 42u64);
+    assert!(lost >= 1, "a reserve takes card bytes out of the experts");
+    assert!(
+        (lost + layers) * expert >= extra && (lost.saturating_sub(layers)) * expert <= extra,
+        "{lost} experts lost for {extra} B"
+    );
 }
 
 /// The description of the file: every layer a latent attention (an HCA layer with the pooled stream
@@ -912,7 +983,7 @@ fn the_description_is_the_architecture() {
             assert_eq!(a.up, LatentUp::Absorbed { qk: 256, v: 256 }, "layer {l}");
             assert_eq!(
                 (a.pe, a.rope.map(|r| (r.dims, r.base.to_bits(), r.yarn))),
-                (0, Some((64, 8_000_000f32.to_bits(), None))),
+                (64, Some((64, 8_000_000f32.to_bits(), None))),
                 "layer {l}"
             );
             assert_eq!(a.out, LatentOut::Plain, "layer {l}");
@@ -1011,43 +1082,70 @@ fn the_description_is_the_architecture() {
     }
 }
 
-/// No program runs the family, so the description is read and refused by name: the coverage check
-/// lists the needs no program runs (the mHC root factor, the query-latent gate on both output
-/// rows, the pooled stream, the selector, the latent experts) and [`PlanInputs::read`] adds the
-/// ops the description cannot state. FAIL-first: an `Ops::unrun` that lists nothing leaves the
-/// refusal without the four ops.
+/// The ernie55 body runs the family, so the config's description reads whole: the coverage check
+/// lists nothing against the family's rows (`spec::AVAILABLE`) and [`PlanInputs::read`] refuses no
+/// op. A rope of another width is an item on both sides, the latent layer's attention (whose width
+/// the body pins, where the HCA layers take a tail of any four) and the indexer's turn the ops hold
+/// ([`Ops::unrun`]); an op of another count is an item. FAIL-first: a row of `spec::AVAILABLE`
+/// taken out lists its needs, and an `Ops::unrun` that lists nothing has no item for the rope.
 #[test]
-fn the_description_is_not_runnable() {
+fn the_description_runs_and_another_width_is_refused() {
     let cfg = config();
-    let split = header("ernie55-refuse", &cfg, |_| {}, |_, l| Some(l));
+    let split = header("ernie55-runs", &cfg, |_| {}, |_, l| Some(l));
     let inputs = PlanInputs::describe(&split).expect("describes");
     let needs: Vec<String> = coverage::check(&inputs.spec, &inputs.model)
         .iter()
         .map(|i| i.feature.clone())
         .collect();
-    for part in [
-        "hyper-connections of 4 streams with the RMS factor 1 / (sqrt(mean) + eps)",
-        "of a projection of the query latent, on the grouped output projection's rows",
-        "of a projection of the query latent, on the heads' outputs",
-    ] {
+    assert!(needs.is_empty(), "the body runs every need: {needs:#?}");
+    if let Err(e) = PlanInputs::read(&split) {
+        panic!("the body runs the file: {e}");
+    }
+    let ops = Ops::of(&inputs.hp).expect("the ops");
+    assert!(ops.unrun().is_empty(), "the body runs every op: {ops:?}");
+    let other = Ops {
+        multimax: ops.multimax + 1,
+        routers: ops.routers + 1,
+        ..ops
+    };
+    let items: Vec<String> = other.unrun().into_iter().map(|i| i.feature).collect();
+    for part in ["the head's MultiMax: 5 ranges", "3 summed sigmoid routers"] {
         assert!(
-            needs.iter().any(|n| n.contains(part)),
-            "no item {part:?} in {needs:#?}"
+            items.iter().any(|i| i.contains(part)),
+            "no item {part:?} in {items:#?}"
         );
     }
-    let refused = PlanInputs::read(&split)
-        .expect_err("no program runs it")
-        .to_string();
-    println!("ernie55 refusal: {refused}");
-    for part in [
-        "the head mix of rank 16",
-        "2 summed sigmoid routers",
-        "the head's MultiMax: 4 ranges",
-        "the indexer's NeoX rope over its leading 64 values",
-    ] {
-        assert!(
-            refused.contains(part),
-            "the refusal lacks {part:?}: {refused}"
-        );
+    let mut narrow = inputs.spec.clone();
+    for layer in &mut narrow.layers {
+        if let Mixer::Latent(a) = &mut layer.mixer
+            && let Some(rope) = &mut a.rope
+        {
+            rope.dims = 32;
+        }
     }
+    let items: Vec<String> = coverage::check(&narrow, &inputs.model)
+        .into_iter()
+        .map(|i| i.feature)
+        .collect();
+    assert!(
+        items
+            .iter()
+            .any(|i| i.contains("latent attention 512 x rope 32, absorbed")),
+        "no item for the latent layer's rope of 32 in {items:#?}"
+    );
+    assert!(
+        !items.iter().any(|i| i.contains("K = V")),
+        "the HCA layers turn a tail of 32: {items:#?}"
+    );
+    let rope = Ops {
+        index_rope: 32,
+        ..ops
+    };
+    let items: Vec<String> = rope.unrun().into_iter().map(|i| i.feature).collect();
+    assert!(
+        items
+            .iter()
+            .any(|i| i.contains("the indexer's NeoX rope over its leading 32 values")),
+        "no item for the indexer's rope of 32 in {items:#?}"
+    );
 }

@@ -141,7 +141,7 @@ mod gate {
             let cfg = self.ds41(r8);
             let ctx = usize::try_from(workstation::CTX_MAX)?;
             let plan = <Body as Open>::plan(&inputs, &machine, ctx, &cfg)?;
-            let mut model = <Body as Open>::open(file, &inputs, &plan, &cfg)?;
+            let mut model = <Body as Open>::open(file.into(), &inputs, &plan, &cfg)?;
             model.set_mode(StepMode::Graph);
             let at = u32::try_from(plan.ctx_max)?;
             Ok(Loaded::<Body>::from_model(model, cfg, at).ready(&mut Quiet)?)

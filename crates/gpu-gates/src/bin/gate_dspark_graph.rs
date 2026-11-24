@@ -96,6 +96,7 @@ mod gate {
 
     use bloomery_gpu::dspark::{DraftLayers, Submit};
     use bloomery_gpu::elem::q3k_embed_value;
+    use bloomery_gpu::hc::HC_STREAMS;
     use bloomery_gpu::{Gpu, GpuError, Graph};
     use bloomery_gpu_deepseek41::draft::block::{
         BlockInput, BlockPass, LayerBufs, MAX_WIDTH, Rule, embedding_row,
@@ -104,7 +105,6 @@ mod gate {
     use bloomery_gpu_deepseek41::draft::layers::OracleBlock;
     use bloomery_gpu_deepseek41::draft::load::DraftWeights;
     use bloomery_gpu_deepseek41::draft::{DraftBody, open as open_draft};
-    use bloomery_gpu_deepseek41::hc::HC_STREAMS;
     use bloomery_gpu_gates::hc_host::lcg;
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path, verdict};
     use cuda_core::DeviceBuffer;

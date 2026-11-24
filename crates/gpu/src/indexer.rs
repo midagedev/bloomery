@@ -46,8 +46,33 @@
 //! pass adds into it only when the top-k pass will read it, and that pass
 //! zeroes what it reads. Both passes of a step must therefore run, in order,
 //! on one stream.
+//!
+//! A second score pass serves an indexer whose keys are read at f32 precision
+//! and whose heads are [`HEADS_F32`] (ERNIE 5.5's lightning indexer: 64 heads
+//! of 128, the query's and the key's first [`TURN_F32`] values turned in NEOX
+//! pairs by the token's table row, no transform):
+//! `indexer_score_f32` stages a tile of [`F32_KEYS`] keys of the `[rows ×
+//! HEAD_DIM]` f32 key cache in shared memory, each lane holding two heads' 32
+//! values of the token's turned query in registers, and dots every key on the
+//! CUDA cores in f32: per key four warps' partial dots (32 values a warp, two
+//! heads a lane, one fused multiply-add a value) meet through shared memory,
+//! `relu`, the head weights `w · scale`, and the head sum as one add a lane
+//! then the xor butterfly (16, 8, 4, 2, 1). `tokens` query tokens walk the
+//! same tile in one launch (a prompt's rows), token `t` scoring the rows
+//! below its own `n_vis`; the histogram is the 32-head pass's. The grid comes
+//! from the key cache's rows and the token count, so a block whose tile lies
+//! past its token's `n_vis` leaves before any barrier.
+//!
+//! `indexer_window` writes the rows a sliding window forces into a selection
+//! list after its top-k — the list `[top_k of 0 .. n_vis | n_vis .. n_win]`,
+//! its live count `min(n_vis, top_k) + (n_win − n_vis)` — so one list carries
+//! a DSA layer's keys below the cut (the top-k is the identity there: every
+//! key) and above it. [`IndexerF32Kernels`] launches the two and the top-k
+//! pass.
 
+use crate::fault::{FaultSink, FaultSite};
 use crate::qsa::{order_key, pick_bin, refine};
+use crate::rope_neox::neox_pair;
 use crate::{DeviceTensor, GpuError, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
 use cuda_device::atomic::{AtomicOrdering, BlockAtomicU32, DeviceAtomicU32};
@@ -109,6 +134,23 @@ const COARSE_PER: usize = HIST_BINS / TOPK_THREADS as usize;
 const FINE_PER: usize = FINE_BINS / TOPK_THREADS as usize;
 const _: () = assert!(COARSE_PER * TOPK_THREADS as usize == HIST_BINS);
 const _: () = assert!(FINE_PER * TOPK_THREADS as usize == FINE_BINS);
+
+/// Query heads of the f32-key score pass (`indexer_score_f32`).
+pub const HEADS_F32: usize = 64;
+/// Values at the front of the f32 pass's query heads and of its keys that
+/// turn: NEOX pairs `(i, i + TURN_F32/2)`.
+pub const TURN_F32: usize = 64;
+/// Keys a block of the f32 pass stages, its threads (eight warps: four a key,
+/// two keys a pass), the values a warp dots and the f32 the four warps of a
+/// key exchange (`[parity][key][warp][lane][2]`, two passes in flight).
+const F32_KEYS: usize = 32;
+const F32_THREADS: u32 = 256;
+const F32_DIMS: usize = HEAD_DIM / 4;
+const F32_PART: usize = 2 * 2 * 4 * 32 * 2;
+const _: () =
+    assert!(HEADS_F32 == 64 && TURN_F32 / 2 == F32_DIMS && F32_THREADS == 256 && F32_PART == 1024);
+/// Threads of the window pass: the most cells one token's window holds.
+const WINDOW_THREADS: u32 = 128;
 
 /// The weights' scale ik applies (`build_deepseek4.cpp`, the `lid_weights`
 /// scale): `1/√(head_dim · n_head)`, the square root and the quotient each
@@ -665,6 +707,335 @@ mod indexer_kernels {
             base += 32 * LANE_ROWS;
         }
     }
+
+    /// The f32-key score pass (module doc): block `b` serves token `t = b /
+    /// tiles`'s key tile `b % tiles`, the rows `F32_KEYS·tile ..` of `keys`
+    /// (`rows` rows of [`HEAD_DIM`] f32). `q` is the query projection, raw,
+    /// `[tokens × HEADS_F32 × HEAD_DIM]` token-major; `w` the weights'
+    /// projection `[tokens × HEADS_F32]`, scaled by `scale` here; token `t`'s
+    /// rope row is `tables[rope_at + t·rope_stride ..]` ([`TURN_F32`] f32,
+    /// `[cos, sin, …]`). Writes `scores[t·rows + key]` for every row below
+    /// `ints[n_vis_at + t]`, and adds into `hist[t·HIST_BINS ..]`; a count
+    /// past the cache's rows raises [`FaultSite::KeyCount`] and scores
+    /// nothing, a score that is not finite raises [`FaultSite::PoolSelect`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(256, 1)]
+    #[launch_contract(
+        domain = 1,
+        block = (256, 1, 1),
+        requires = (
+            q.len() >= tokens * 8192,
+            w.len() >= tokens * 64,
+            ints.len() >= n_vis_at + tokens,
+            ints.len() > top_k_at,
+            tables.len() + rope_stride >= rope_at + tokens * rope_stride + 64,
+            keys.len() >= rows * 128,
+            scores.len() >= tokens * rows,
+            hist.len() >= tokens * 1024
+        )
+    )]
+    pub fn indexer_score_f32(
+        q: &[f32],
+        w: &[f32],
+        ints: &[u32],
+        tables: &[f32],
+        keys: &[f32],
+        tokens: u32,
+        tiles: u32,
+        n_vis_at: u32,
+        top_k_at: u32,
+        rope_at: u32,
+        rope_stride: u32,
+        rows: u32,
+        scale: f32,
+        fault: FaultSink,
+        mut scores: DisjointSlice<f32>,
+        mut hist: DisjointSlice<u32>,
+    ) {
+        static mut KS: SharedArray<f32, { F32_KEYS * HEAD_DIM }> = SharedArray::UNINIT;
+        static mut PART: SharedArray<f32, F32_PART> = SharedArray::UNINIT;
+        static mut HS: SharedArray<u32, HIST_BINS> = SharedArray::UNINIT;
+
+        let bid = thread::blockIdx_x() as usize;
+        let tiles = tiles as usize;
+        let _ = tokens;
+        let (t, tile) = (bid / tiles, bid % tiles);
+        let tid = thread::threadIdx_x() as usize;
+        let lane = warp::lane_id() as usize;
+        let wid = tid / 32;
+        // SAFETY: t < tokens (the grid is tiles·tokens), so n_vis_at + t <
+        // ints.len() by the launch contract.
+        let n_vis = unsafe { *ints.get_unchecked(n_vis_at as usize + t) };
+        if n_vis > rows {
+            if tid == 0 {
+                fault.raise(FaultSite::KeyCount);
+            }
+            return; // block-uniform: n_vis is the token's
+        }
+        // SAFETY: top_k_at < ints.len() by the launch contract.
+        let k = unsafe { *ints.get_unchecked(top_k_at as usize) } as usize;
+        let n = n_vis as usize;
+        let key0 = tile * F32_KEYS;
+        if n <= k || k == 0 || key0 >= n {
+            return; // block-uniform: no barrier is skipped
+        }
+        let live = F32_KEYS.min(n - key0);
+        // SAFETY: block-shared statics; the raw forms reach them without a
+        // reference, and every access below is bounded and barrier-ordered.
+        let (ks, part, hs) = unsafe {
+            (
+                SharedArray::as_raw_mut_ptr(&raw mut KS),
+                SharedArray::as_raw_mut_ptr(&raw mut PART),
+                SharedArray::as_raw_mut_ptr(&raw mut HS),
+            )
+        };
+        let mut b = tid;
+        while b < HIST_BINS {
+            // SAFETY: b < HIST_BINS; thread tid alone zeroes bins tid + 256·i
+            // before the barrier below.
+            unsafe { *hs.add(b) = 0 };
+            b += F32_THREADS as usize;
+        }
+
+        // ---- the query: warp `wid % 4` dots dims 32·(wid % 4) .., lane
+        // `lane` heads 2·lane and 2·lane + 1, 32 values a head in registers;
+        // the first TURN_F32 turned in NEOX pairs (i, i + TURN_F32/2) by the
+        // token's table row, the lower member of a pair at dim i.
+        let dq = F32_DIMS * (wid % 4);
+        let qbase = t * HEADS_F32 * HEAD_DIM;
+        let tab = rope_at as usize + t * rope_stride as usize;
+        let mut qq = [[0.0f32; F32_DIMS]; 2];
+        let mut i = 0usize;
+        while i < F32_DIMS {
+            thread::__unroll_config::<0>();
+            let d = dq + i;
+            let mut hi = 0usize;
+            while hi < 2 {
+                thread::__unroll_config::<0>();
+                let at = qbase + (2 * lane + hi) * HEAD_DIM;
+                qq[hi][i] = if d < TURN_F32 {
+                    let p = d % (TURN_F32 / 2);
+                    // SAFETY: 2·p + 1 < TURN_F32, so both lie inside token t's
+                    // table row, below rope_at + t·rope_stride + TURN_F32 <=
+                    // tables.len() (launch contract).
+                    let (c, s) = unsafe {
+                        (
+                            *tables.get_unchecked(tab + 2 * p),
+                            *tables.get_unchecked(tab + 2 * p + 1),
+                        )
+                    };
+                    // SAFETY: at + p + TURN_F32/2 < qbase + HEADS_F32·HEAD_DIM
+                    // <= q.len() (launch contract).
+                    let (x0, x1) = unsafe {
+                        (
+                            *q.get_unchecked(at + p),
+                            *q.get_unchecked(at + TURN_F32 / 2 + p),
+                        )
+                    };
+                    let (y0, y1) = neox_pair(x0, x1, c, s);
+                    if d < TURN_F32 / 2 { y0 } else { y1 }
+                } else {
+                    // SAFETY: at + d < qbase + HEADS_F32·HEAD_DIM <= q.len()
+                    // (launch contract).
+                    unsafe { *q.get_unchecked(at + d) }
+                };
+                hi += 1;
+            }
+            i += 1;
+        }
+        // SAFETY: 2·lane + 1 < HEADS_F32, so both indexes lie below
+        // HEADS_F32·tokens <= w.len() (launch contract).
+        let (w0, w1) = unsafe {
+            (
+                *w.get_unchecked(t * HEADS_F32 + 2 * lane),
+                *w.get_unchecked(t * HEADS_F32 + 2 * lane + 1),
+            )
+        };
+        let (w0, w1) = (mul_rn_f32(w0, scale), mul_rn_f32(w1, scale));
+
+        // ---- the key tile, staged whole: rows key0 .. key0 + live of `keys`.
+        let vals = live * HEAD_DIM;
+        let mut at = tid;
+        while at < vals {
+            // SAFETY: at < live·HEAD_DIM, so key0·HEAD_DIM + at < n·HEAD_DIM
+            // <= rows·HEAD_DIM <= keys.len() (launch contract); thread tid
+            // alone writes ks[at], at = tid + 256·i, before the barrier below.
+            unsafe { *ks.add(at) = *keys.get_unchecked(key0 * HEAD_DIM + at) };
+            at += F32_THREADS as usize;
+        }
+        thread::sync_threads();
+
+        // ---- the dots: warps 4·group .. 4·group + 3 share key `2·it + group`
+        // of the pass, warp `wi` its dims 32·wi ..; the partials meet through
+        // PART, double-buffered by the pass's parity, and warp 0 of the group
+        // finishes the key: relu, the weights, the head sum, the histogram.
+        let group = wid / 4;
+        let wi = wid % 4;
+        let sbase = t * rows as usize;
+        let iters = live.div_ceil(2);
+        let mut it = 0usize;
+        while it < iters {
+            let j = 2 * it + group;
+            if j < live {
+                let kbase = j * HEAD_DIM + F32_DIMS * wi;
+                let (mut a0, mut a1) = (0.0f32, 0.0f32);
+                let mut i = 0usize;
+                while i < F32_DIMS {
+                    thread::__unroll_config::<0>();
+                    // SAFETY: block-shared, F32_KEYS·HEAD_DIM == the tile,
+                    // written before the barrier above; kbase + i < j·HEAD_DIM
+                    // + HEAD_DIM <= live·HEAD_DIM.
+                    let kd = unsafe { *ks.add(kbase + i) };
+                    a0 = fma_rn_f32(qq[0][i], kd, a0);
+                    a1 = fma_rn_f32(qq[1][i], kd, a1);
+                    i += 1;
+                }
+                let p = ((it & 1) * 2 + group) * 256 + wi * 64 + 2 * lane;
+                // SAFETY: block-shared, F32_PART == 1024 words; p < ((it&1)·2
+                // + group)·256 + 256 <= F32_PART, and this lane alone writes
+                // its slot before the barrier below.
+                unsafe { *part.add(p) = a0 };
+                // SAFETY: p + 1 is this lane's second slot, as p above.
+                unsafe { *part.add(p + 1) = a1 };
+            }
+            thread::sync_threads();
+            if wi == 0 && j < live {
+                let base = ((it & 1) * 2 + group) * 256 + 2 * lane;
+                let (mut s0, mut s1) = (0.0f32, 0.0f32);
+                let mut r = 0usize;
+                while r < 4 {
+                    thread::__unroll_config::<0>();
+                    // SAFETY: block-shared, F32_PART == 1024 words; base +
+                    // 64·r + 1 < ((it&1)·2 + group)·256 + 256 <= F32_PART,
+                    // published by the barrier above.
+                    let (p0, p1) =
+                        unsafe { (*part.add(base + 64 * r), *part.add(base + 64 * r + 1)) };
+                    s0 = add_rn_f32(s0, p0);
+                    s1 = add_rn_f32(s1, p1);
+                    r += 1;
+                }
+                // The head sum: the lane's pair as one add, then the xor butterfly over
+                // all 32 lanes (16, 8, 4, 2, 1): every lane holds two distinct heads.
+                let mut v = add_rn_f32(mul_rn_f32(relu(s0), w0), mul_rn_f32(relu(s1), w1));
+                let mut lv = 0u32;
+                while lv < 5 {
+                    thread::__unroll_config::<0>();
+                    v = add_rn_f32(v, warp::shuffle_xor_f32(v, 16u32 >> lv));
+                    lv += 1;
+                }
+                if lane == 0 {
+                    let key = key0 + j;
+                    // SAFETY: key < n <= rows, so sbase + key < tokens·rows <=
+                    // scores.len() (launch contract); lane 0 of the group's
+                    // warp 0 alone writes the key's score.
+                    unsafe { *scores.get_unchecked_mut(sbase + key) = v };
+                    if v.is_finite() {
+                        let bin = (order_key(v) >> 22) as usize;
+                        // SAFETY: bin < HIST_BINS, block-shared; every access
+                        // to the histogram between the two barriers is atomic.
+                        unsafe {
+                            BlockAtomicU32::from_ptr(hs.add(bin))
+                                .fetch_add(1, AtomicOrdering::Relaxed)
+                        };
+                    } else {
+                        fault.raise(FaultSite::PoolSelect);
+                    }
+                }
+            }
+            it += 1;
+        }
+        thread::sync_threads();
+        let hist_ptr = hist.as_mut_ptr();
+        let mut b = tid;
+        while b < HIST_BINS {
+            // SAFETY: b < HIST_BINS; the barrier above ordered every add first.
+            let cnt = unsafe { *hs.add(b) };
+            if cnt != 0 {
+                // SAFETY: t·HIST_BINS + b < tokens·HIST_BINS <= hist.len()
+                // (launch contract); every access to it in this launch is
+                // atomic.
+                unsafe {
+                    DeviceAtomicU32::from_ptr(hist_ptr.add(t * HIST_BINS + b))
+                        .fetch_add(cnt, AtomicOrdering::Relaxed)
+                };
+            }
+            b += F32_THREADS as usize;
+        }
+    }
+
+    /// The forced window of a selection list (module doc): block `t` serves
+    /// token `t`, whose candidates are the rows `0 .. n_vis =
+    /// ints[n_vis_at + t]`, whose window the rows `n_vis .. n_win =
+    /// ints[n_win_at + t]` and whose top-k `ints[top_k_at]`. Thread `i` writes
+    /// the cell `i` of the window, `list[t·stride + min(n_vis, top_k) + i] =
+    /// n_vis + i`, and thread 0 the list's live count `counts[t] = min(n_vis,
+    /// top_k) + (n_win − n_vis)`. A window past the block's threads, a
+    /// `n_vis` past `n_win` or a list too narrow for the top-k and the window
+    /// raises [`FaultSite::KeyCount`] and writes nothing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "kernel entry: the device ABI takes the arguments flat (rust-quality R8)"
+    )]
+    #[kernel]
+    #[launch_bounds(128)]
+    #[launch_contract(
+        domain = 1,
+        block = (128, 1, 1),
+        requires = (
+            ints.len() >= n_vis_at + tokens,
+            ints.len() >= n_win_at + tokens,
+            ints.len() > top_k_at,
+            list.len() >= tokens * stride,
+            counts.len() >= tokens
+        )
+    )]
+    pub fn indexer_window(
+        ints: &[u32],
+        tokens: u32,
+        n_vis_at: u32,
+        n_win_at: u32,
+        top_k_at: u32,
+        stride: u32,
+        fault: FaultSink,
+        mut list: DisjointSlice<u32>,
+        mut counts: DisjointSlice<u32>,
+    ) {
+        let t = thread::blockIdx_x() as usize;
+        let i = thread::threadIdx_x();
+        let _ = tokens;
+        // SAFETY: t < tokens, so n_vis_at + t < ints.len() by the launch contract.
+        let n_vis = unsafe { *ints.get_unchecked(n_vis_at as usize + t) };
+        // SAFETY: t < tokens, so n_win_at + t < ints.len() by the launch contract.
+        let n_win = unsafe { *ints.get_unchecked(n_win_at as usize + t) };
+        // SAFETY: top_k_at < ints.len() by the launch contract.
+        let top_k = unsafe { *ints.get_unchecked(top_k_at as usize) };
+        let kept = n_vis.min(top_k);
+        if n_vis > n_win || n_win - n_vis > WINDOW_THREADS || kept + (n_win - n_vis) > stride {
+            if i == 0 {
+                fault.raise(FaultSite::KeyCount);
+            }
+            return; // block-uniform: the counts are the token's
+        }
+        let cells = n_win - n_vis;
+        if i < cells {
+            // SAFETY: kept + i < kept + cells <= stride, so t·stride + kept +
+            // i < tokens·stride <= list.len() (launch contract); thread i
+            // alone writes the cell.
+            unsafe {
+                *list.get_unchecked_mut(t * stride as usize + kept as usize + i as usize) =
+                    n_vis + i
+            };
+        }
+        if i == 0 {
+            // SAFETY: t < tokens <= counts.len() (launch contract); thread 0
+            // alone writes the token's count.
+            unsafe { *counts.get_unchecked_mut(t) = kept + cells };
+        }
+    }
 }
 
 /// The keys of rows `base + 32·m + lane`, `m = 0 .. LANE_ROWS`, of one
@@ -973,6 +1344,242 @@ fn check_scratch(
         });
     }
     Ok(())
+}
+
+/// [`IndexerF32Kernels::enqueue_score`]'s arguments: the query projection `q`
+/// (`[tokens × HEADS_F32 × HEAD_DIM]` f32, raw, token-major), the weights'
+/// projection `w` (`[tokens × HEADS_F32]`, before the scale), the counts
+/// `ints` (token `t`'s `n_vis` at `ints[n_vis_at + t]`, `top_k` at
+/// `ints[top_k_at]`), the rope table `tables` (token `t`'s row at `rope_at +
+/// t·rope_stride`, [`TURN_F32`] f32), the key cache `keys` (`[rows ×
+/// HEAD_DIM]` f32), the scores `[tokens × rows]` and the histogram `[tokens ×
+/// HIST_BINS]` (zeroed, and zero again once the top-k pass has read it).
+pub struct ScoreF32Args<'a> {
+    pub q: &'a DeviceBuffer<f32>,
+    pub w: &'a DeviceBuffer<f32>,
+    pub ints: &'a DeviceBuffer<u32>,
+    pub n_vis_at: usize,
+    pub top_k_at: usize,
+    pub tables: &'a DeviceBuffer<f32>,
+    pub rope_at: usize,
+    pub rope_stride: usize,
+    pub keys: &'a DeviceTensor<f32>,
+    pub tokens: usize,
+    pub scores: &'a mut DeviceBuffer<f32>,
+    pub hist: &'a mut DeviceBuffer<u32>,
+    pub fault: FaultSink,
+}
+
+/// [`IndexerF32Kernels::enqueue_topk`]'s arguments: the top-k pass
+/// (`ds41_indexer_topk`, the module doc's first paragraph) over `scores`
+/// (`[tokens × rows]`) into `list` (`[tokens × stride]`), token `t`'s live
+/// rows at `ints[n_vis_at + t]` and `top_k` at `ints[top_k_at]`, the
+/// histogram the score pass left.
+pub struct TopkArgs<'a> {
+    pub ints: &'a DeviceBuffer<u32>,
+    pub n_vis_at: usize,
+    pub top_k_at: usize,
+    pub scores: &'a DeviceBuffer<f32>,
+    pub tokens: usize,
+    pub rows: usize,
+    pub stride: usize,
+    pub hist: &'a mut DeviceBuffer<u32>,
+    pub list: &'a mut DeviceBuffer<u32>,
+}
+
+/// [`IndexerF32Kernels::enqueue_window`]'s arguments: token `t`'s `n_vis` at
+/// `ints[n_vis_at + t]`, `n_win` at `ints[n_win_at + t]` and `top_k` at
+/// `ints[top_k_at]`; the list `[tokens × stride]` the top-k pass wrote the
+/// front of and the counts `[tokens]`.
+pub struct WindowArgs<'a> {
+    pub ints: &'a DeviceBuffer<u32>,
+    pub n_vis_at: usize,
+    pub n_win_at: usize,
+    pub top_k_at: usize,
+    pub tokens: usize,
+    pub stride: usize,
+    pub fault: FaultSink,
+    pub list: &'a mut DeviceBuffer<u32>,
+    pub counts: &'a mut DeviceBuffer<u32>,
+}
+
+/// The f32-key indexer's kernels (module doc): the score pass over
+/// [`HEADS_F32`] heads with the query's first [`TURN_F32`] values turned, the
+/// top-k pass and the forced window. Owns no stream: each enqueue takes the
+/// engine stream, so its launches order with the rest of the step and
+/// capture.
+pub struct IndexerF32Kernels {
+    module: indexer_kernels::LoadedModule,
+    scale: f32,
+}
+
+impl IndexerF32Kernels {
+    /// Load this file's device bundle into `ctx` for the f32-key indexer.
+    /// Load-time only.
+    pub fn load(ctx: &Arc<CudaContext>) -> Result<IndexerF32Kernels, GpuError> {
+        // SAFETY: this crate owns the embedded device bundle produced for the
+        // module above; the launchers check its launch contracts.
+        let module = unsafe { crate::shared_module!(indexer_kernels, ctx)? };
+        Ok(IndexerF32Kernels {
+            module,
+            scale: weights_scale(HEADS_F32, HEAD_DIM),
+        })
+    }
+
+    /// The weights' scale the score pass applies, `1/√(HEADS_F32 · HEAD_DIM)`.
+    #[must_use]
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+
+    /// Enqueue the f32-key score pass (module doc): the grid comes from the
+    /// key cache's rows and the token count, so a captured graph replays it at
+    /// any `n_vis`. Refused before the launch: no token, a key cache of no
+    /// rows or not [`HEAD_DIM`] wide, short `q`, `w`, `ints`, `tables`,
+    /// `scores` or `hist`. Asynchronous, allocation-free, capturable.
+    pub fn enqueue_score(&self, stream: &CudaStream, a: ScoreF32Args<'_>) -> Result<(), GpuError> {
+        let what = "IndexerF32Kernels::enqueue_score";
+        let shape = |detail: String| GpuError::Shape { what, detail };
+        let rows = a.keys.rows();
+        if a.tokens == 0 || a.keys.cols() != HEAD_DIM || rows == 0 {
+            return Err(shape(format!(
+                "tokens {} and keys {}x{}: at least one token, and rows of {HEAD_DIM}",
+                a.tokens,
+                rows,
+                a.keys.cols()
+            )));
+        }
+        let last_table = a.rope_at + (a.tokens - 1) * a.rope_stride + TURN_F32;
+        for (name, have, want) in [
+            ("q", a.q.len(), a.tokens * HEADS_F32 * HEAD_DIM),
+            ("w", a.w.len(), a.tokens * HEADS_F32),
+            ("ints (n_vis)", a.ints.len(), a.n_vis_at + a.tokens),
+            ("ints (top_k)", a.ints.len(), a.top_k_at + 1),
+            ("tables", a.tables.len(), last_table),
+            ("scores", a.scores.len(), a.tokens * rows),
+            ("hist", a.hist.len(), a.tokens * HIST_BINS),
+        ] {
+            if have < want {
+                return Err(shape(format!("{name} holds {have}, want >= {want}")));
+            }
+        }
+        let grid = launch_u32(what, "grid", rows.div_ceil(F32_KEYS) * a.tokens)?;
+        let tiles = launch_u32(what, "tiles", rows.div_ceil(F32_KEYS))?;
+        let prep =
+            self.module
+                .prepare_indexer_score_f32(LaunchConfig1D::new(grid, F32_THREADS, 0))?;
+        self.module.indexer_score_f32(
+            stream,
+            &prep,
+            a.q,
+            a.w,
+            a.ints,
+            a.tables,
+            a.keys.buf(),
+            launch_u32(what, "tokens", a.tokens)?,
+            tiles,
+            launch_u32(what, "n_vis_at", a.n_vis_at)?,
+            launch_u32(what, "top_k_at", a.top_k_at)?,
+            launch_u32(what, "rope_at", a.rope_at)?,
+            launch_u32(what, "rope_stride", a.rope_stride)?,
+            launch_u32(what, "rows", rows)?,
+            self.scale,
+            a.fault,
+            &mut *a.scores,
+            &mut *a.hist,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the top-k pass over the scores the f32-key pass left (module
+    /// doc): `min(n_vis, top_k)` rows a token, ascending, ties to the lower
+    /// row, the identity when `n_vis <= top_k`. Refused before the launch: no
+    /// token or row, short `ints`, `list` or `hist`. Asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_topk(&self, stream: &CudaStream, a: TopkArgs<'_>) -> Result<(), GpuError> {
+        let what = "IndexerF32Kernels::enqueue_topk";
+        let shape = |detail: String| GpuError::Shape { what, detail };
+        if a.tokens == 0 || a.rows == 0 {
+            return Err(shape(format!(
+                "a top-k of {} tokens over {} rows: at least one of each",
+                a.tokens, a.rows
+            )));
+        }
+        for (name, have, want) in [
+            ("ints (n_vis)", a.ints.len(), a.n_vis_at + a.tokens),
+            ("ints (top_k)", a.ints.len(), a.top_k_at + 1),
+            ("scores", a.scores.len(), a.tokens * a.rows),
+            ("hist", a.hist.len(), a.tokens * HIST_BINS),
+            ("list", a.list.len(), a.tokens * a.stride),
+        ] {
+            if have < want {
+                return Err(shape(format!("{name} holds {have}, want >= {want}")));
+            }
+        }
+        let tokens = launch_u32(what, "tokens", a.tokens)?;
+        let prep =
+            self.module
+                .prepare_ds41_indexer_topk(LaunchConfig1D::new(tokens, TOPK_THREADS, 0))?;
+        self.module.ds41_indexer_topk(
+            stream,
+            &prep,
+            a.ints,
+            a.scores,
+            tokens,
+            launch_u32(what, "n_vis_at", a.n_vis_at)?,
+            launch_u32(what, "top_k_at", a.top_k_at)?,
+            launch_u32(what, "rows", a.rows)?,
+            launch_u32(what, "stride", a.stride)?,
+            &mut *a.hist,
+            &mut *a.list,
+        )?;
+        Ok(())
+    }
+
+    /// Enqueue the forced window after the top-k (module doc): one block a
+    /// token. Refused before the launch: no token or stride, short `ints`,
+    /// `list` or `counts`; a window wider than the block's threads raises
+    /// [`FaultSite::KeyCount`] on the device. Asynchronous, allocation-free,
+    /// capturable.
+    pub fn enqueue_window(&self, stream: &CudaStream, a: WindowArgs<'_>) -> Result<(), GpuError> {
+        let what = "IndexerF32Kernels::enqueue_window";
+        let shape = |detail: String| GpuError::Shape { what, detail };
+        if a.tokens == 0 || a.stride == 0 {
+            return Err(shape(format!(
+                "need tokens and stride >= 1, got tokens={} stride={}",
+                a.tokens, a.stride
+            )));
+        }
+        for (name, have, want) in [
+            ("ints (n_vis)", a.ints.len(), a.n_vis_at + a.tokens),
+            ("ints (n_win)", a.ints.len(), a.n_win_at + a.tokens),
+            ("ints (top_k)", a.ints.len(), a.top_k_at + 1),
+            ("list", a.list.len(), a.tokens * a.stride),
+            ("counts", a.counts.len(), a.tokens),
+        ] {
+            if have < want {
+                return Err(shape(format!("{name} holds {have}, want >= {want}")));
+            }
+        }
+        let tokens = launch_u32(what, "tokens", a.tokens)?;
+        let prep =
+            self.module
+                .prepare_indexer_window(LaunchConfig1D::new(tokens, WINDOW_THREADS, 0))?;
+        self.module.indexer_window(
+            stream,
+            &prep,
+            a.ints,
+            tokens,
+            launch_u32(what, "n_vis_at", a.n_vis_at)?,
+            launch_u32(what, "n_win_at", a.n_win_at)?,
+            launch_u32(what, "top_k_at", a.top_k_at)?,
+            launch_u32(what, "stride", a.stride)?,
+            a.fault,
+            &mut *a.list,
+            &mut *a.counts,
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

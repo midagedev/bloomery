@@ -24,6 +24,7 @@
 
 use bloomery_gpu::GpuError;
 use bloomery_gpu::GpuModel;
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu_glm5next::{Body, PrefillMode};
 use bloomery_levers::HostCfg;
@@ -94,12 +95,12 @@ impl Open for Body {
     }
 
     fn open(
-        file: Split,
+        file: Model,
         inputs: &PlanInputs,
         plan: &Plan<'_>,
         cfg: &GlmCfg,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed(file, plan, inputs, 0, cfg.host)
+        Body::open_placed(crate::split_of(file, WHAT)?, plan, inputs, 0, cfg.host)
     }
 
     /// The configuration's feed and group; the batch feed's buffers made

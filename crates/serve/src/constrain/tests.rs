@@ -14,6 +14,7 @@ use crate::api::logprobs::Ask as Probs;
 use crate::callstream::CallPiece;
 use crate::dsml::{ChatParser, DsmlScan, MarkupError, Spelling, ToolFormat, Tools};
 use crate::engine::{Decoder, Drafted, Engine, EngineError, Sampler, SamplingParams, Tokenizer};
+use crate::erniexml::ErnieScan;
 use crate::genloop::{
     Event, GenError, GenParams, Outcome, Slot, StopKind, Timings, generate, generate_in_quanta,
 };
@@ -1185,6 +1186,10 @@ fn markup(format: ToolFormat) -> [String; 2] {
             "<|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"unit\": \"celsius\", \"days\": 2}}<|end_message|>",
             "<|message_model|>search<|content_invoke_tool_json|>{\"name\":\"search\",\"args\":{\"query\": \"cats\", \"deep\": false}}<|end_message|>",
         ],
+        ToolFormat::ErnieXml => [
+            "<ernie:tool_call>\n<invoke name=\"get_weather\"><parameter name=\"unit\">celsius</parameter><parameter name=\"days\">2</parameter></invoke>\n</ernie:tool_call>",
+            "<ernie:tool_call>\n<invoke name=\"search\"><parameter name=\"query\">cats</parameter><parameter name=\"deep\">false</parameter></invoke>\n</ernie:tool_call>",
+        ],
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     texts.map(|t| match format {
@@ -1242,6 +1247,12 @@ fn scanned(format: ToolFormat, tools: &Value, text: &str) -> Vec<(String, Value)
             out.calls.extend(s.finish().expect("closes").calls);
             out
         }
+        ToolFormat::ErnieXml => {
+            let mut s = ErnieScan::new(ArgTypes::of_tools(Some(tools)));
+            let mut out = s.push(text).expect("parses");
+            out.calls.extend(s.finish().expect("closes").calls);
+            out
+        }
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     assert!(
@@ -1281,6 +1292,7 @@ fn each_formats_inverse_reads_back_through_its_scanner() {
         ToolFormat::MuseSpark,
         ToolFormat::Mistral,
         ToolFormat::Inkling,
+        ToolFormat::ErnieXml,
     ] {
         let [weather, search] = markup(format);
         let required = json!({"tools": tools, "tool_choice": "required"});
@@ -1346,6 +1358,7 @@ fn a_forced_call_obeys_the_tools_when_greedy_does_not() {
         ToolFormat::MuseSpark,
         ToolFormat::Mistral,
         ToolFormat::Inkling,
+        ToolFormat::ErnieXml,
     ] {
         let c = build(
             &tok,
@@ -1472,6 +1485,9 @@ fn numeric_tool_arguments_keep_their_values() {
                 ToolFormat::MuseSpark => format!(
                     " to=f<|message|><atem:function_calls>\n<atem:invoke name=\"f\">\n<atem:parameter name=\"n\">{value}</atem:parameter>\n</atem:invoke>\n</atem:function_calls>"
                 ),
+                ToolFormat::ErnieXml => format!(
+                    "<ernie:tool_call>\n<invoke name=\"f\"><parameter name=\"n\">{value}</parameter></invoke>\n</ernie:tool_call>"
+                ),
                 _ => unreachable!("a parsed format"),
             };
             let mut whole = parser(format, &tools);
@@ -1575,7 +1591,7 @@ fn call_body(params: &Value) -> Value {
         {"type": "function", "function": {"name": "f", "parameters": params}}]})
 }
 
-const FORMATS: [ToolFormat; 8] = [
+const FORMATS: [ToolFormat; 9] = [
     ToolFormat::Hermes,
     QWEN,
     QWEN_COMPACT,
@@ -1584,6 +1600,7 @@ const FORMATS: [ToolFormat; 8] = [
     HY4,
     ToolFormat::Dsml(Spelling::Joined),
     ToolFormat::Dsml(Spelling::Spaced),
+    ToolFormat::ErnieXml,
 ];
 
 /// Every closing tag a chat format's scanner looks for, in one string.
@@ -1820,6 +1837,7 @@ fn a_raw_literal_with_an_angle_bracket_is_refused() {
             SOLAR,
             ToolFormat::Dsml(Spelling::Joined),
             ToolFormat::Dsml(Spelling::Spaced),
+            ToolFormat::ErnieXml,
         ] {
             let e = build(&tok, format, &body).expect_err(&q.to_string());
             assert!(
@@ -1876,6 +1894,7 @@ fn a_free_string_cannot_spell_its_formats_closing_tag() {
         (ToolFormat::Hermes, "</tool_call>"),
         (QWEN, "\n</parameter>\n"),
         (QWEN_COMPACT, "</parameter>"),
+        (ToolFormat::ErnieXml, "</parameter>"),
         (GLM, "</arg_value>"),
         (SOLAR, "<|tool_arg:end|>"),
         (ToolFormat::Dsml(Spelling::Joined), "</｜DSML｜parameter>"),
@@ -1937,6 +1956,7 @@ fn parser(format: ToolFormat, tools: &Value) -> ChatParser {
         ToolFormat::MuseSpark => Tools::MuseSpark,
         ToolFormat::Mistral => Tools::Mistral,
         ToolFormat::Inkling => Tools::Inkling,
+        ToolFormat::ErnieXml => Tools::ErnieXml(ArgTypes::of_tools(Some(tools))),
         ToolFormat::Unparsed => unreachable!("no markup"),
     };
     ChatParser::with_tools("", ReasoningFormat::None, Some(scan))
@@ -4608,6 +4628,7 @@ fn city_call(format: ToolFormat, keys: &[&str]) -> String {
                 "<｜DSML｜parameter name=\"{k}\" string=\"{text}\">{v}</｜DSML｜parameter>\n"
             ),
             ToolFormat::MuseSpark => format!("<atem:parameter name=\"{k}\">{v}</atem:parameter>\n"),
+            ToolFormat::ErnieXml => format!("<parameter name=\"{k}\">{v}</parameter>"),
             ToolFormat::Unparsed => unreachable!("a parsed format"),
         });
     }
@@ -4636,6 +4657,9 @@ fn city_call(format: ToolFormat, keys: &[&str]) -> String {
         ToolFormat::Inkling => format!(
             "<|message_model|>get_weather<|content_invoke_tool_json|>\
              {{\"name\":\"get_weather\",\"args\":{{{members}}}}}<|end_message|>"
+        ),
+        ToolFormat::ErnieXml => format!(
+            "<ernie:tool_call>\n<invoke name=\"get_weather\">{members}</invoke>\n</ernie:tool_call>"
         ),
         ToolFormat::Unparsed => unreachable!("a parsed format"),
     };
@@ -4672,6 +4696,7 @@ fn optional_parameters_may_be_left_out_in_schema_order() {
         ToolFormat::Dsml(Spelling::Joined),
         ToolFormat::Dsml(Spelling::Spaced),
         ToolFormat::Mistral,
+        ToolFormat::ErnieXml,
     ] {
         for keys in subsets {
             let body = json!({"tools": tools, "tool_choice": "auto"});
@@ -4702,6 +4727,7 @@ fn optional_parameters_may_be_left_out_in_schema_order() {
         ToolFormat::Dsml(Spelling::Spaced),
         ToolFormat::MuseSpark,
         ToolFormat::Inkling,
+        ToolFormat::ErnieXml,
     ] {
         for keys in subsets {
             let body = json!({"tools": tools, "tool_choice": "required"});
@@ -4773,6 +4799,7 @@ fn an_object_with_no_required_property_may_be_empty() {
                     ToolFormat::Dsml(_)
                     | ToolFormat::MuseSpark
                     | ToolFormat::Inkling
+                    | ToolFormat::ErnieXml
                     | ToolFormat::Unparsed => {
                         unreachable!("not in this loop")
                     }
@@ -4807,6 +4834,7 @@ fn an_object_with_no_required_property_may_be_empty() {
                     ToolFormat::Dsml(_)
                     | ToolFormat::MuseSpark
                     | ToolFormat::Inkling
+                    | ToolFormat::ErnieXml
                     | ToolFormat::Unparsed => {
                         unreachable!("not in this loop")
                     }

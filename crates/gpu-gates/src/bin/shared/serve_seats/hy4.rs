@@ -142,7 +142,7 @@ impl Family for Hy4 {
             plan,
             Box::new(move |file, plan, inputs, host, residency| {
                 bloomery_gpu_hy4::Body::open_placed_with(
-                    file,
+                    app::split_of(file, NAME)?,
                     (plan, inputs),
                     0,
                     host,

@@ -78,9 +78,9 @@ use model::part::StoredRows;
 use crate::chain::ffn::ShadowWork;
 use crate::chain::join;
 use crate::dense::{Dense, DenseKernels};
-use crate::hc::{HC_MIX, HC_STREAMS, HcKernels};
 use crate::params::ImageLayout;
 use crate::span::{SpanMut, span_mut};
+use bloomery_gpu::hc::{HC_MIX, HC_STREAMS, HcKernels};
 
 mod batch;
 pub use batch::{GlueBatch, PromptRows};

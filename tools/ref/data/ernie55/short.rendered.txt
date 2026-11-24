@@ -1,0 +1,7 @@
+<|ERNIE_MASK|><|ernie:im_start|>system
+<ernie:global_setting>
+</ernie:global_setting><|ernie:im_end|>
+<|ernie:im_start|>user
+Alice was beginning to get very tired of sitting by her sister on the bank<|ernie:im_end|>
+<|ernie:im_start|>assistant
+<ernie:think></ernie:think>

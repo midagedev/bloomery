@@ -13,6 +13,7 @@
 //! reads.
 
 use bloomery_gpu::arch::musespark::Body;
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::{GpuError, GpuModel};
 use gguf::Split;
 use model::arch::musespark::place::PlanInputs;
@@ -56,13 +57,19 @@ impl Open for Body {
     /// configuration's residency ([`Residency::Off`](bloomery_gpu::host::swap::Residency)
     /// keeps the plan's slot map for the model's life).
     fn open(
-        file: Split,
+        file: Model,
         _inputs: &PlanInputs,
         plan: &Plan<'_>,
         cfg: &HybridCfg,
     ) -> Result<GpuModel<Body>, GpuError> {
         <super::SingleSequence as super::SequenceSlots<Body>>::check(cfg.slots, WHAT)?;
-        GpuModel::<Body>::open_placed_with(file, plan, 0, cfg.host, cfg.residency)
+        GpuModel::<Body>::open_placed_with(
+            crate::split_of(file, WHAT)?,
+            plan,
+            0,
+            cfg.host,
+            cfg.residency,
+        )
     }
 
     /// None to make: the load cut the prompt pass's buffers from the card's

@@ -16,6 +16,7 @@
 
 use std::num::NonZeroUsize;
 
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::{GpuError, GpuModel};
 use bloomery_gpu_mimo2::{Body, PrefillMode};
@@ -92,12 +93,20 @@ impl Open for Body {
     }
 
     fn open(
-        file: Split,
+        file: Model,
         inputs: &PlanInputs,
         plan: &Plan<'_>,
         cfg: &Mimo2Cfg,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed_slots(file, plan, inputs, 0, cfg.host, cfg.residency, cfg.slots)
+        Body::open_placed_slots(
+            crate::split_of(file, WHAT)?,
+            plan,
+            inputs,
+            0,
+            cfg.host,
+            cfg.residency,
+            cfg.slots,
+        )
     }
 
     /// The configuration's feed and group; the batch feed's buffers made

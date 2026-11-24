@@ -357,7 +357,8 @@ pub fn of(arch: model::arch::Arch) -> StepOrder {
         Arch::Hy4 => ("Hy4", FaultSite::ALL),
         // Reader only: no program runs inkling2 yet.
         Arch::Inkling2 => ("Inkling2", FaultSite::ALL),
-        // Reader only: no program runs ernie55 yet.
+        // The ernie55 body launches no ordered table of its own: the listing
+        // is neutral, every site once, so a fault word still decodes.
         Arch::Ernie55 => ("Ernie55", FaultSite::ALL),
     };
     StepOrder { arch: name, sites }

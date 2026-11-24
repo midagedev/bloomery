@@ -12,6 +12,7 @@ pub mod deepseek41;
 pub mod deepseek41v;
 pub mod dequant;
 pub mod draft;
+pub mod ernie55;
 pub mod exaone_moe;
 pub mod forced_logits;
 pub mod gemma_embedding;
@@ -74,6 +75,7 @@ static BY_ARCH: &[(&str, &[&Family])] = &[
     (quant::ARCH, quant::FAMILIES),
     (gemma_embedding::ARCH, gemma_embedding::FAMILIES),
     (gemma_embedding2::ARCH, gemma_embedding2::FAMILIES),
+    (ernie55::ARCH, ernie55::FAMILIES),
 ];
 
 /// The families of architecture `arch`; none for one the table does not hold.
@@ -297,8 +299,8 @@ mod tests {
     use crate::family::Identity;
 
     /// The fixture families whose real file's sets have no refset family: the card gates open
-    /// those by name. Each is checked in its own module.
-    const STANDALONE: [&str; 2] = ["fx-ik-qwen3moe", "fx-ik-deepseek41"];
+    /// those by name, or no gate reads the family yet. Each is checked in its own module.
+    const STANDALONE: [&str; 3] = ["fx-ik-qwen3moe", "fx-ik-deepseek41", "fx-np-ernie55"];
 
     /// The word a fixture cut adds to its sets' family word, the real twin's name without it:
     /// `fx_ref_mistrallarge4e128_a` twins `ref_mistrallarge4_a`. The cut keeps all 128 experts

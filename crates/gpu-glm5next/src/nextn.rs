@@ -56,6 +56,7 @@ use bloomery_gpu::draft::{
     ChainBlock, DraftFeed, DraftHead, Feed, Held, Hidden, Proposal, SlotDraft, WalkBounds,
     WalkMode, chain_rows, refuse_own, refuse_rows,
 };
+use bloomery_gpu::hc::HC_STREAMS;
 use bloomery_gpu::head::{Head, HeadNorm, read_tokens};
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::shell::TierShell;
@@ -67,7 +68,6 @@ use bloomery_gpu::site::{ByName, Out};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError, GpuModel, host_filled};
 use bloomery_gpu_deepseek41::block::{Block, BlockIo, BlockPlan, enqueue_block};
-use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use bloomery_gpu_deepseek41::span::{span, span_mut};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;

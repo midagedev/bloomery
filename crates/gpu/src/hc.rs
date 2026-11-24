@@ -15,7 +15,7 @@
 //! [`HC_PIECE`] values of K (one q3_K row-walk iteration: super-blocks `2p`,
 //! `2p + 1` of every weight row).
 //! 1. The raw stream values are quantized to q8_1 per 128-value block by the
-//!    rule of `bloomery_gpu`'s `q3k_quantize_q8_1` (d = amax/127, bytes by
+//!    rule of the crate's `q3k_quantize_q8_1` (d = amax/127, bytes by
 //!    `cores::q8_quad`), in the lanes of `cores::q3k_row_dot` that consume
 //!    them. The RMS scale multiplies the gemv result instead of the input:
 //!    a q8 block's relative error does not depend on a common factor, and
@@ -36,7 +36,7 @@
 //! 5. HC_PRE per token on one warp ([`hc_pre_lane`]).
 //!
 //! `hc_pre_q8_0` — the same chain for a Q8_0 `hc_{attn,ffn}_fn` (GLM-5.3-Flash;
-//! weights in `bloomery_gpu::q8f32`'s device layout: `qs` `24 × K/4` code
+//! weights in `crate::q8f32`'s device layout: `qs` `24 × K/4` code
 //! words, `d` `24 × K/32` f16 scale bits), over `ds41_hc_pre_groups`' token
 //! groups, blocks, partials, squares and ticket. The activations stay f32, as
 //! in every Q8_0 gemv of the tree: no quantizer, so a non-finite stream value
@@ -67,11 +67,11 @@
 //! four streams, `((s_0 + s_1) + s_2) + s_3` then a multiply by 0.25
 //! ([`hc_mean_elem`]).
 
-use bloomery_gpu::cores::{q3k_chain, q3k_sb_decode, q8_quad};
-use bloomery_gpu::elem::rms_scale_checked;
-use bloomery_gpu::fault::quad_finite;
-use bloomery_gpu::weights::{DevWeight, Weights};
-use bloomery_gpu::{
+use crate::cores::{q3k_chain, q3k_sb_decode, q8_quad};
+use crate::elem::rms_scale_checked;
+use crate::fault::quad_finite;
+use crate::weights::{DevWeight, Weights};
+use crate::{
     COL_GROUP, ColGroups, DeviceTensor, FaultSink, FaultSite, GpuError, col_group, launch_u32,
 };
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -97,12 +97,12 @@ const _: () = assert!(HC_MIX == 2 * HC_STREAMS + HC_STREAMS * HC_STREAMS);
 /// the hook normalizes into a scratch and feeds the scratch. Nothing when no collector is attached; it allocates,
 /// which only a collecting walk reaches.
 pub fn feed_hc_fn(
-    gpu: &bloomery_gpu::Gpu,
+    gpu: &crate::Gpu,
     name: &str,
     streams: &DeviceBuffer<f32>,
     (m, n, eps): (usize, usize, f32),
-) -> Result<(), bloomery_gpu::GpuError> {
-    let Some(c) = bloomery_gpu::imatrix::collector() else {
+) -> Result<(), GpuError> {
+    let Some(c) = crate::imatrix::collector() else {
         return Ok(());
     };
     let (stream, width) = (gpu.stream(), HC_STREAMS * n);
@@ -133,11 +133,11 @@ const _: () = assert!(COL_GROUP == HC_MAX_TOKENS);
 /// The finishing block's first squares thread: token `t`'s squares are
 /// summed by thread `HC_SS_THREAD + t`, in the last warp, so the sum does
 /// not run behind the partial sums of threads `0..24m` in their warps.
-const HC_SS_THREAD: usize = HC_PRE_THREADS - 32;
+pub(crate) const HC_SS_THREAD: usize = HC_PRE_THREADS - 32;
 const _: () = assert!(HC_MIX * HC_MAX_TOKENS <= HC_SS_THREAD);
 const _: () = assert!(HC_SS_THREAD + HC_MAX_TOKENS <= HC_PRE_THREADS);
 /// The finishing block's shared mix slots: one per (token, row).
-const HC_MIX_SLOTS: usize = HC_MIX * HC_MAX_TOKENS;
+pub(crate) const HC_MIX_SLOTS: usize = HC_MIX * HC_MAX_TOKENS;
 /// Pieces a finishing sum loads ahead of its adds: the V4.1 width's 40
 /// pieces in one round.
 const HC_FIN_BATCH: usize = 40;
@@ -238,7 +238,7 @@ pub(crate) fn hc_pre_lane(
 /// `post` and `comb`, with the multiply-adds fused where ik's build fuses
 /// them.
 #[inline(always)]
-pub(crate) fn hc_post_elem(x: f32, res: [f32; 4], post: [f32; 4], comb: &[f32; 16]) -> [f32; 4] {
+pub fn hc_post_elem(x: f32, res: [f32; 4], post: [f32; 4], comb: &[f32; 16]) -> [f32; 4] {
     [
         hc_post_stream(x, res, post[0], [comb[0], comb[4], comb[8], comb[12]]),
         hc_post_stream(x, res, post[1], [comb[1], comb[5], comb[9], comb[13]]),
@@ -292,7 +292,7 @@ fn abs_max16(v: &[f32; 16]) -> f32 {
 /// The sum of squares of 16 values in index order, one fused multiply-add
 /// per value from 0.
 #[inline(always)]
-fn squares16(v: &[f32; 16]) -> f32 {
+pub(crate) fn squares16(v: &[f32; 16]) -> f32 {
     let mut a = v[0].mul_add(v[0], 0.0);
     a = v[1].mul_add(v[1], a);
     a = v[2].mul_add(v[2], a);
@@ -314,7 +314,7 @@ fn squares16(v: &[f32; 16]) -> f32 {
 /// The fold of four stream values by `pre`: `o_0 * pre_0`, then one fused
 /// multiply-add per further stream.
 #[inline(always)]
-pub(crate) fn hc_fold_elem(o: [f32; 4], pre: [f32; 4]) -> f32 {
+pub fn hc_fold_elem(o: [f32; 4], pre: [f32; 4]) -> f32 {
     let mut y = o[0] * pre[0];
     y = o[1].mul_add(pre[1], y);
     y = o[2].mul_add(pre[2], y);
@@ -326,7 +326,7 @@ pub(crate) fn hc_fold_elem(o: [f32; 4], pre: [f32; 4]) -> f32 {
 /// of two. ggml's `dsv4_hc_mean_for_capture` (a left fold of adds, then
 /// `ggml_scale` by 1/4) has the same order.
 #[inline(always)]
-pub(crate) fn hc_mean_elem(o: [f32; 4]) -> f32 {
+pub fn hc_mean_elem(o: [f32; 4]) -> f32 {
     (((o[0] + o[1]) + o[2]) + o[3]) * 0.25
 }
 
@@ -422,7 +422,12 @@ unsafe fn store_streams(out: &mut DisjointSlice<f32>, n: usize, i: usize, o: [f3
 /// SAFETY: `off + (n - 1) * stride < buf.len()`, and every store to those
 /// slots is ordered before these reads.
 #[inline(always)]
-unsafe fn column_sum(buf: &mut DisjointSlice<f32>, off: usize, stride: usize, n: usize) -> f32 {
+pub(crate) unsafe fn column_sum(
+    buf: &mut DisjointSlice<f32>,
+    off: usize,
+    stride: usize,
+    n: usize,
+) -> f32 {
     let mut acc = 0.0f32;
     let mut q = 0usize;
     while q < n {
@@ -454,21 +459,21 @@ unsafe fn column_sum(buf: &mut DisjointSlice<f32>, off: usize, stride: usize, n:
 /// tokens `t0` in the launch's input and output, and its group's scratch —
 /// partials from `part0`, squares from `ss0`, the ticket at `ticket`.
 #[derive(Clone, Copy)]
-struct HcPreAt {
-    p: usize,
-    t0: usize,
-    part0: usize,
-    ss0: usize,
-    ticket: usize,
+pub(crate) struct HcPreAt {
+    pub(crate) p: usize,
+    pub(crate) t0: usize,
+    pub(crate) part0: usize,
+    pub(crate) ss0: usize,
+    pub(crate) ticket: usize,
 }
 
 /// A HC_PRE block's shared slots: the last-ticket flag, [`HC_MIX_SLOTS`]
 /// mixes and [`HC_MAX_TOKENS`] scales.
 #[derive(Clone, Copy)]
-struct HcPreShared {
-    last: *mut u32,
-    mix: *mut f32,
-    scl: *mut f32,
+pub(crate) struct HcPreShared {
+    pub(crate) last: *mut u32,
+    pub(crate) mix: *mut f32,
+    pub(crate) scl: *mut f32,
 }
 
 /// One block of HC_PRE over the `m` tokens of a group (the module doc's
@@ -1286,7 +1291,7 @@ mod hc_kernels {
     /// and whose last block finishes its tokens. A token's result is a
     /// function of its own streams alone, so every token holds what
     /// `ds41_hc_pre` over its group writes. `n_groups` is
-    /// [`bloomery_gpu::col_group_count`]`(lead, tokens)`, the launch has
+    /// [`crate::col_group_count`]`(lead, tokens)`, the launch has
     /// exactly `n_pieces · n_groups` blocks, and every `ctr[g]` holds 0 when
     /// it starts (each group's finish leaves it 0).
     #[allow(
@@ -1595,10 +1600,10 @@ mod hc_kernels {
 /// branch joined before the next one forks) share one. The counter is zero
 /// at allocation and every completed launch leaves it zero.
 pub struct HcPreScratch {
-    part: DeviceBuffer<f32>,
-    ss: DeviceBuffer<f32>,
-    ctr: DeviceBuffer<u32>,
-    n_pieces: usize,
+    pub(crate) part: DeviceBuffer<f32>,
+    pub(crate) ss: DeviceBuffer<f32>,
+    pub(crate) ctr: DeviceBuffer<u32>,
+    pub(crate) n_pieces: usize,
 }
 
 impl HcPreScratch {
@@ -1639,6 +1644,12 @@ impl HcPreScratch {
     #[must_use]
     pub fn k(&self) -> usize {
         self.n_pieces * HC_PIECE
+    }
+
+    /// Its bytes on the card: the partials, the squares and the tickets.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.part.num_bytes() + self.ss.num_bytes() + self.ctr.num_bytes()
     }
 
     /// Token groups a launch into this scratch may run.
@@ -1688,7 +1699,7 @@ pub struct HcPreArgs<'a> {
 /// One sub-layer's HC_PRE parameters with a Q8_0 `hc_{attn,ffn}_fn`.
 pub struct HcQ8Params<'a> {
     /// The fn's code words: [`HC_MIX`] rows of `K / 4` u32
-    /// (`bloomery_gpu::q8f32`'s device layout).
+    /// (`crate::q8f32`'s device layout).
     pub qs: &'a DeviceTensor<u32>,
     /// The fn's block scales: [`HC_MIX`] rows of `K / 32` f16 bits.
     pub d: &'a DeviceTensor<u16>,
@@ -1797,7 +1808,7 @@ impl HcKernels {
     pub fn load(ctx: &Arc<CudaContext>) -> Result<HcKernels, GpuError> {
         // SAFETY: this crate owns the embedded device bundle produced for the
         // module above; each launcher checks its launch contract.
-        let module = unsafe { bloomery_gpu::shared_module!(hc_kernels, ctx)? };
+        let module = unsafe { crate::shared_module!(hc_kernels, ctx)? };
         Ok(HcKernels {
             module,
             f32: HcF32Kernels::load(ctx)?,

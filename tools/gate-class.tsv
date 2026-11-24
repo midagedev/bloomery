@@ -245,7 +245,10 @@ gate-llama-meta	family	llama	meta	arch_registry
 gate-lfm3-meta	family	lfm3	meta	arch_registry
 gate-mimo2-meta	family	mimo2	meta	arch_registry
 gate-minimax31-folder	family	minimax-m3	by-hand	arch_registry
+gate-gpu-ernie55-e2e	family	ernie5_5	e2e	graph_fault+attn_ds41_csa_hca+attn_latent_mla+moe_route+quant_mxfp4+ffn_situ+tier_legs+prompt_walks+checkpoint_folder+head_sample
 gate-ernie55-meta	family	ernie5_5	meta	arch_registry+checkpoint_folder+placement_sizing+tokenizer_jinja
+gate-gpu-ernie55-serve	family	ernie5_5	serve+ship	seats_serve_engine+checkpoint_folder
+gate-ernie55-hca	family	ernie5_5	kernel	attn_ds41_csa_hca+graph_fault
 gate-model-hf	common		host	arch_registry+checkpoint_folder
 gate-models	common		host	arch_registry
 gate-model-host	common		host	model_host_ops+threads_pool+residency
@@ -325,3 +328,6 @@ gate-inkling2-e2e	family	inkling2	e2e	graph_fault+attn_rel_bias+attn_res+loop_co
 gate-inkling2-small-host	family	inkling2	e2e	attn_rel_bias+moe_route+tier_legs+weights_load+head_sample
 gate-inkling2-fold	family	inkling2	by-hand	weights_load
 gate-inkling2-mix	family	inkling2	by-hand	tier_legs+weights_load
+gate-ernie55-mla	family	ernie5_5	kernel	attn_latent_mla+attn_ds41_csa_hca+graph_fault+prompt_walks
+gate-ernie55-moe	family	ernie5_5	kernel	moe_route+tier_legs+quant_mxfp4+prompt_walks+graph_fault+ffn_situ
+gate-ernie55-trunk	family	ernie5_5	kernel	hc_engram_common+head_sample+ffn_situ+graph_fault

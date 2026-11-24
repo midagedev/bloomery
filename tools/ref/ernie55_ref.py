@@ -14,14 +14,21 @@ Sources (all read, none run):
 
 Usage (on ws, system python has numpy 1.26 with a netlib BLAS: pass --pylib to a numpy 2.x OpenBLAS dir for the real run):
   python3 -I tools/ref/ernie55_ref.py --self-test
-  python3 tools/ref/ernie55_ref.py tokenize --model DIR --out DIR --pylib PYLIB
-  python3 tools/ref/ernie55_ref.py run --model DIR --out SETS_DIR --prompt short=IDS --prompt long=IDS --steps 32
-  python3 tools/ref/ernie55_ref.py sanity --model DIR --set SETS_DIR/short --set SETS_DIR/long
+  python3 -B tools/ref/ernie55_ref.py tokenize --model DIR --out DIR --pylib PYLIB [--short USER] [--long TEXT_FILE] [--long-max N]
+  python3 -I tools/ref/ernie55_ref.py run --model DIR --out SETS_DIR --prompt short=IDS --prompt long=IDS --steps 32
+                                      [--fixture-line "$(refset-check --fixture-line FIRST_SHARD)"]
+  python3 -I tools/ref/ernie55_ref.py sanity --model DIR --set SETS_DIR/short --set SETS_DIR/long
 
 Set format (one dir per prompt, the ik dump_ref grammar `RefManifest::read` parses; crates/refset/src/ik.rs):
-  MANIFEST.tsv  header (# model, # arch ernie5_5, # build, # tokens, # tokens_file ...), `# kind` column line and `tensor`
-                rows (name occurrence type ne0..ne3 bytes sum op contig logical src0 src1), the `# int` column line and
-                `int` rows, then the trailer `# complete <tensor rows> 0`.  Files `<stem>.<occ>.f32` (+ `.i32` for ids).
+  MANIFEST.tsv  header (# model: the folder's first shard, the identity a refset family checks; # fixture: a cut's generation line,
+                refset's own (`refset-check --fixture-line`), present only for a cut; # arch ernie5_5; # build: this writer's md5,
+                what the family pins; # numpy; # tokens, # tokens_file ...), `# kind` column line and `tensor` rows
+                (name occurrence type ne0..ne3 bytes sum op contig logical src0 src1), the `# int` column line and `int` rows,
+                then the trailer `# complete <tensor rows> 0`.  Files `<stem>.<occ>.f32` (+ `.i32` for ids).
+  tokenize      DIR holds the renderer (encoding_ernie.py) and tokenizer.json. --short is the user text; the long prompt is the
+                paragraphs of a text file (--long), kept in order while the rendered ids stay within --long-max, or by default the
+                model's LICENSE under a summarizing task. The ids are made once and kept (tools/ref/data/ernie55): a dump never
+                tokenizes, a tokenizer difference would read as a kernel bug.
   greedy.tsv    the 7-column `--gen` argmax format (`read_greedy`): id n_tokens argmax top5_ids top5_logits gen_ids margins.
   rows:  l_out-<il>      f32 [4096, 4 streams, 4 positions]  residual after layer il, the last 4 prompt positions
          ffn_moe_topk-<il>     i32 [10, 4]  routed expert ids of those positions (descending biased score)
@@ -48,6 +55,7 @@ for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_v, "1")  # one BLAS thread per pool thread; the pool is the parallelism
 
 import argparse  # noqa: E402
+import glob  # noqa: E402
 import hashlib  # noqa: E402
 import json  # noqa: E402
 import math  # noqa: E402
@@ -972,12 +980,69 @@ def top5(v):
     return i.tolist(), v[i].tolist()
 
 
+def _refuse(msg):
+    """A named refusal of an input this does not read: the message on stderr, exit 65."""
+    print(f"ernie55_ref.py: {msg}", file=sys.stderr)
+    sys.exit(65)
+
+
+def manifest_reader():
+    """tools/bloomery/manifest.py, the Python side's one reader of a set's MANIFEST.tsv, imported by path: `sanity` reads the
+    sets through it, and a cut's `# fixture` line is held to its shard by its `check_fixture_line`. No bytecode is written: an
+    import never leaves a __pycache__ in the tree it reads."""
+    import importlib.util
+
+    sys.dont_write_bytecode = True
+    mp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bloomery", "manifest.py")
+    spec = importlib.util.spec_from_file_location("bloomery_manifest", mp)
+    mf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mf)
+    return mf
+
+
+def writer_build():
+    """`# build`: `ernie55_ref-` and the first 12 hex digits of this file's md5. The refset family pins it
+    (crates/refset/src/arch/ernie55), so an edit of this writer moves the pin and the sets are dumped again."""
+    with open(os.path.abspath(__file__), "rb") as f:
+        return "ernie55_ref-" + hashlib.md5(f.read()).hexdigest()[:12]
+
+
+def first_shard(folder):
+    """The folder's one `*-00001-of-*.safetensors`, joined as the shell joins it: the `# model` line of every set of the folder,
+    the identity its family checks against the file the tree runs (a folder's path alone tells no generation apart)."""
+    shards = sorted(glob.glob(os.path.join(folder, "*-00001-of-*.safetensors")))
+    if len(shards) != 1:
+        _refuse(f"{folder} holds {len(shards)} first shards (*-00001-of-*.safetensors), want one")
+    return shards[0]
+
+
+def fixture_text(shard, given):
+    """The text after the tab of a cut's `# fixture` line, `None` for a folder that is not a cut. The line is refset's, its one
+    owner (`refset-check --fixture-line <first shard>`, passed as --fixture-line); it is held here to the shard it names by
+    tools/bloomery/manifest.py's `check_fixture_line`, the rule every Python writer holds it to. A cut without the line, a line
+    for a folder that is no cut, and a line of another generation are refused by name."""
+    with open(shard, "rb") as f:
+        n = int.from_bytes(f.read(8), "little")
+        meta = json.loads(f.read(n)).get("__metadata__")
+    meta = meta if isinstance(meta, dict) else {}
+    if not any(k.startswith("bloomery.fixture.") for k in meta):
+        if given is not None:
+            _refuse(f"--fixture-line names a cut, and {shard} carries no bloomery.fixture.* key: the folder is not a cut")
+        return None
+    if given is None:
+        _refuse(f'{shard} is a cut: pass --fixture-line "$(refset-check --fixture-line {shard})"')
+    return manifest_reader().check_fixture_line(meta, given, shard, _refuse)
+
+
 def run(args):
     t_start = time.time()
     model = args.model
     with open(os.path.join(model, "config.json")) as f:
         cfg = Cfg(json.load(f))
     log = lambda s: print(s, file=sys.stderr, flush=True)  # noqa: E731
+    shard = first_shard(model.rstrip("/"))
+    fixture = fixture_text(shard, args.fixture_line)
+    build = writer_build()
     store = Store(model)
     eng = Eng(store, args.threads)
     M = Model(eng, cfg, log)
@@ -989,6 +1054,7 @@ def run(args):
     seqs = [Seq(ids) for _, _, ids in prompts]
     nl = args.layers
     log(f"prompts: {[(n, len(i)) for n, _, i in prompts]} steps={args.steps} threads={args.threads} layers={nl or cfg.L}")
+    log(f"first shard {shard} build {build} numpy {np.__version__}" + (f" fixture {fixture}" if fixture is not None else ""))
     t = time.time()
     H, segs = M.forward(seqs, [s.ids for s in seqs], capture=True, nlayers=nl, tag="prefill")
     log(f"prefill {time.time() - t:.1f}s")
@@ -1014,9 +1080,11 @@ def run(args):
         sha = hashlib.sha256(open(path, "rb").read()).hexdigest()
         header = [
             "# ernie55_ref -- layer-streaming CPU f32 reference (tools/ref/ernie55_ref.py), raw f32 little-endian",
-            f"# model\t{model}",
+            f"# model\t{shard}",
+            *([f"# fixture\t{fixture}"] if fixture is not None else []),
             "# arch\ternie5_5",
-            "# build\ternie55_ref.py-1",
+            f"# build\t{build}",
+            f"# numpy\t{np.__version__}",
             f"# tokens\t{','.join(str(x) for x in ids)}",
             f"# tokens_file\t{path}",
             f"# tokens_file_sha256\t{sha}",
@@ -1046,7 +1114,7 @@ def run(args):
         t5i, t5v = first[i]
         write_greedy(
             os.path.join(d, "greedy.tsv"),
-            model,
+            shard,
             [(0, n, t5i[0], ",".join(map(str, t5i)), ",".join(f"{v:.6f}" for v in t5v), ",".join(map(str, gen[i])), ",".join(f"{v:.6f}" for v in margins[i]))],
             args.steps,
         )
@@ -1071,6 +1139,7 @@ def run(args):
 # tokenize: render the chat with the model's own renderer and encode with tokenizer.json
 # ---------------------------------------------------------------------------------------------------------------------
 def cmd_tokenize(args):
+    sys.dont_write_bytecode = True  # the renderer is imported from --model: no __pycache__ is left in that folder
     sys.path.insert(0, args.model)
     import encoding_ernie as E  # the model folder's own renderer
     from tokenizers import Tokenizer
@@ -1089,15 +1158,21 @@ def cmd_tokenize(args):
     open(os.path.join(args.out, "short.txt"), "w").write(text)
     open(os.path.join(args.out, "short.ids"), "w").write(",".join(map(str, ids)) + "\n")
     print(f"short: {len(ids)} tokens")
-    lic = open(os.path.join(args.model, "LICENSE")).read()
+    # the long prompt: a source text's paragraphs in order, each kept while the rendered ids stay within --long-max
+    if args.long is None:
+        source, task = open(os.path.join(args.model, "LICENSE")).read(), "Summarize the following license text in two sentences.\n\n"
+    else:
+        source, task = open(args.long).read(), ""
     body, n = "", 0
-    for para in lic.split("\n\n"):
+    for para in source.split("\n\n"):
         cand = body + para + "\n\n"
-        t, i = render("Summarize the following license text in two sentences.\n\n" + cand)
+        t, i = render(task + cand)
         if len(i) > args.long_max:
             break
         body, n = cand, len(i)
         text, ids = t, i
+    if not n:
+        _refuse(f"the long prompt's source: its first paragraph alone renders to more than --long-max {args.long_max} ids")
     open(os.path.join(args.out, "long.txt"), "w").write(text)
     open(os.path.join(args.out, "long.ids"), "w").write(",".join(map(str, ids)) + "\n")
     print(f"long: {len(ids)} tokens")
@@ -1117,13 +1192,7 @@ def cmd_sanity(args):
     rg, ts = eng.f32("model.lm_head.multimax_ranges"), eng.f32("model.lm_head.multimax_ts")
     bad = 0
     # the Python side's one set reader (tools/bloomery/manifest.py, by column name): the sets must parse through it
-    import importlib.util
-
-    sys.dont_write_bytecode = True  # a check never leaves a __pycache__ in the tree it reads
-    mp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bloomery", "manifest.py")
-    spec = importlib.util.spec_from_file_location("bloomery_manifest", mp)
-    mf = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mf)
+    mf = manifest_reader()
     for d in args.set:
         man = mf.read(d)
         trows, irows = man.rows("tensor"), man.rows("int")
@@ -1553,8 +1622,16 @@ def main():
             p.add_argument("--steps", type=int, default=32)
             p.add_argument("--threads", type=int, default=32)
             p.add_argument("--layers", type=int, default=None, help="debug: run only the first N layers")
+            p.add_argument(
+                "--fixture-line",
+                help="a cut's `# fixture` line as `refset-check --fixture-line <first shard>` prints it: required for a cut, refused for a folder that is not one",
+            )
         else:
             p.add_argument("--short", default="Tell me a short story about a robot who learns to paint.")
+            p.add_argument(
+                "--long",
+                help="the long prompt's source text: its paragraphs are kept in order while the rendered ids stay within --long-max (default: the model's LICENSE, under a summarizing task)",
+            )
             p.add_argument("--long-max", type=int, default=2400)
     args = ap.parse_args()
     {"run": run, "tokenize": cmd_tokenize, "sanity": cmd_sanity}[args.cmd](args)

@@ -14,6 +14,7 @@
 use std::num::NonZeroUsize;
 
 use bloomery_gpu::arch::kimi_k3::Body;
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::weights::Weights;
@@ -45,14 +46,20 @@ impl Batch for Body {
     /// The placed load on stage card 0 under `residency` ([`GpuModel::open_placed_with`]): a `mid`
     /// word runs the common machine over the card's routed stacks and the slot map the step reads.
     fn open_placed(
-        file: Split,
+        file: Model,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         host: HostCfg,
         residency: Residency,
         _slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        GpuModel::<Body>::open_placed_with(file, (plan, inputs), 0, host, (None, residency))
+        GpuModel::<Body>::open_placed_with(
+            crate::split_of(file, WHAT)?,
+            (plan, inputs),
+            0,
+            host,
+            (None, residency),
+        )
     }
 
     /// Refused by name: the placed load has no rows pass, so the prompt is [`Batch::prompt`]'s

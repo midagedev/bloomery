@@ -31,11 +31,11 @@ use bloomery_gpu::checkpoint::saved::{
     Identity, Lent, Pending, SaveLane, SeqState, SeqView, Spans, Streams,
 };
 use bloomery_gpu::checkpoint::staging::NoRoom;
+use bloomery_gpu::hc::HC_STREAMS;
 use bloomery_gpu::latent::{INDEX_HEAD, INDEX_ROW, LATENT, POOL, pools_for};
 use bloomery_gpu::linear::KHeadMap;
 use bloomery_gpu::linear::LinearShape;
 use bloomery_gpu::{DeviceTensor, GpuError, GpuModel};
-use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use cuda_core::{CudaStream, DeviceBuffer};
 use model::arch::glm5next::place::PlanInputs;
 use models::Mixer;

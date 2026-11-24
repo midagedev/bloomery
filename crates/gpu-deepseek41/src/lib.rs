@@ -1,9 +1,15 @@
 //! bloomery-gpu-deepseek41 — the DeepSeek-V4.1 device code: the
-//! `#[cuda_module]`s only this architecture runs. They live outside
-//! `bloomery-gpu` so that a compiler defect in one of them breaks the builds
-//! that depend on this crate and no other: a build without this crate in its
-//! graph never compiles V4.1 device code. Device bodies shared with V2-Lite
-//! are called as `bloomery_gpu::cores::*`; a body is reachable from here when
+//! `#[cuda_module]`s only this architecture runs, beside the re-exports of
+//! the three that V4.1 and ERNIE 5.5 share — the attention over window rows ⧺
+//! compressed rows ([`bloomery_gpu::hca`]), the pooled compressed KV
+//! ([`bloomery_gpu::compress`]) and the tail rope
+//! ([`bloomery_gpu::rope_tail`]), which are `bloomery-gpu`'s and are read
+//! here as [`attn`], [`compress`] and [`rope`]. This crate's own modules live
+//! outside `bloomery-gpu` so that a compiler defect in one of them breaks the
+//! builds that depend on this crate and no other: a build without this crate
+//! in its graph never compiles V4.1 device code. Device bodies shared with
+//! V2-Lite are called as `bloomery_gpu::cores::*`; a body is reachable from
+//! here when
 //! it is `pub` and `#[inline(always)]`, and it inlines into the same
 //! instructions it compiles to in its own crate.
 //!
@@ -26,8 +32,6 @@ pub mod dense;
 pub mod draft;
 pub mod experts;
 pub mod experts_mxfp4;
-pub mod hc;
-pub mod hc_f32;
 pub mod index_key;
 pub mod indexer;
 pub mod markov;

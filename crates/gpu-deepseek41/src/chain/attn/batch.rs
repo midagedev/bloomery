@@ -51,9 +51,9 @@ use cuda_core::{CudaEvent, CudaStream, DeviceBuffer, sys};
 
 use super::*;
 use crate::dense::{Dense, Q3kHeadsGroupsArgs, RowsPart};
-use crate::hc::{HcFn, HcFnArgs};
 use crate::params::ImageLayout;
 use crate::span::{span, span_mut};
+use bloomery_gpu::hc::{HcFn, HcFnArgs};
 
 const WHAT_BATCH: &str = "deepseek41 AttnBatch";
 
@@ -961,7 +961,7 @@ fn collect_streams(
     streams_in: &DeviceBuffer<f32>,
     tokens: usize,
 ) -> Result<(), GpuError> {
-    crate::hc::feed_hc_fn(
+    bloomery_gpu::hc::feed_hc_fn(
         cx.gpu,
         &cx.lp.names.hc_fn,
         streams_in,

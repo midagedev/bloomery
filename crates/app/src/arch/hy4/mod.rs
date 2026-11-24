@@ -11,6 +11,7 @@
 
 use std::num::NonZeroUsize;
 
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::swap::Residency;
 use bloomery_gpu::weights::Weights;
@@ -40,14 +41,20 @@ impl Batch for Body {
     /// word runs the common machine over the card's routed stacks and the slot map the step reads.
     /// The load makes one sequence; the session adds the rest ([`ResidentSequences`]).
     fn open_placed(
-        file: Split,
+        file: Model,
         plan: &Plan<'_>,
         inputs: &PlanInputs,
         host: HostCfg,
         residency: Residency,
         _slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed_with(file, (plan, inputs), 0, host, (None, residency))
+        Body::open_placed_with(
+            crate::split_of(file, WHAT)?,
+            (plan, inputs),
+            0,
+            host,
+            (None, residency),
+        )
     }
 
     /// Refused by name: the placed pass is the body's own walk ([`Batch::prompt`]), so nothing

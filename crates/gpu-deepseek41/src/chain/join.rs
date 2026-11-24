@@ -14,7 +14,7 @@ use bloomery_gpu::GpuError;
 use bloomery_gpu::host::GatherShape;
 use model::arch::deepseek41::hparams::Hparams;
 
-use crate::hc::HC_STREAMS;
+use bloomery_gpu::hc::HC_STREAMS;
 
 /// The trunk's slot: the attention's and the MoE sub-layer's sums.
 pub(crate) const TRUNK: usize = 0;

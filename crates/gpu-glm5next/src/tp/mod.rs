@@ -28,13 +28,13 @@ mod source;
 
 use std::sync::Arc;
 
+use bloomery_gpu::hc::HC_STREAMS;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::rank::{Sums, alike, at_pos, streams_at};
 use bloomery_gpu::host::{GatherLoop, GatherShape, Gathers};
 use bloomery_gpu::hybrid::SlotMap;
 use bloomery_gpu::weights::{Weights, block_index};
 use bloomery_gpu::{Branch, DeviceTensor, Gpu, GpuError, MappedHost};
-use bloomery_gpu_deepseek41::hc::HC_STREAMS;
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;

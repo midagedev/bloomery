@@ -77,6 +77,7 @@ mod gate {
     use std::sync::Arc;
 
     use bloomery_gpu::fused::FusedKernels;
+    use bloomery_gpu::hc::{HC_MIX, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch};
     use bloomery_gpu::host::run::HostRun;
     use bloomery_gpu::hybrid::{Boundary, BoundaryShape, HOST, Hybrid, SlotMap};
     use bloomery_gpu::weights::{DevWeight, Weights};
@@ -86,9 +87,6 @@ mod gate {
     };
     use bloomery_gpu_deepseek41::dense::{Dense, DenseKernels};
     use bloomery_gpu_deepseek41::experts::{ExpertGateUp, ExpertKernels};
-    use bloomery_gpu_deepseek41::hc::{
-        HC_MIX, HC_STREAMS, HcKernels, HcParams, HcPreArgs, HcPreScratch,
-    };
     use bloomery_gpu_deepseek41::router::{N_EXPERT, N_USED, RouterKernels, RouterOut};
     use bloomery_gpu_gates::{
         GateError, activations, bits_equal, bytes_to_words, checks_failed, no_local_depot,

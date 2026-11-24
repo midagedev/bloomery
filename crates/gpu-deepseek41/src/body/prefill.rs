@@ -135,11 +135,11 @@ use crate::chain::attn::{AttnBatch, BatchIo, ChunkCaches, ChunkSource};
 use crate::chain::ffn::{BatchLayer, BlockIo, FfnBatch, JoinIo, LEG_PIECE, STAGE_TIER};
 use crate::chain::glue::{GlueBatch, PromptRows};
 use crate::chain::nanos;
-use crate::hc::{HC_MAX_TOKENS, HC_MIX};
 use crate::router::N_EXPERT;
 use crate::span::{span, span_mut};
 use bloomery_gpu::Fault;
 use bloomery_gpu::fault::read_cards;
+use bloomery_gpu::hc::{HC_MAX_TOKENS, HC_MIX};
 use runtime::prompt::{CallEnd, GROUP_LEVER, group_sets, groups};
 
 /// Positions one batch runs at most: the host union's columns, and the

@@ -103,6 +103,10 @@ use std::time::Instant;
 
 use bloomery_gpu::checkpoint::{Checkpoints, Pending};
 use bloomery_gpu::draft::Held;
+use bloomery_gpu::hc::{
+    HC_MAX_TOKENS, HC_MIX, HC_STREAMS, HcFn, HcFnArgs, HcPostArgs, HcPreScratch, HcQ8Params,
+    HcQ8PreArgs,
+};
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::BatchLeg;
 use bloomery_gpu::host::run::HostRun;
@@ -123,10 +127,6 @@ use bloomery_gpu::{COL_GROUP, DeviceTensor, Gpu, GpuError};
 use bloomery_gpu_deepseek41::attn::{self, AttnArgs, SelectedRows};
 use bloomery_gpu_deepseek41::block::{
     Block, BlockIo, BlockKernels, BlockScratch, enqueue_block_cols,
-};
-use bloomery_gpu_deepseek41::hc::{
-    HC_MAX_TOKENS, HC_MIX, HC_STREAMS, HcFn, HcFnArgs, HcPostArgs, HcPreScratch, HcQ8Params,
-    HcQ8PreArgs,
 };
 use bloomery_gpu_deepseek41::router::glm5next::{N_EXPERT, N_USED};
 use bloomery_gpu_deepseek41::span::{span, span_mut};
@@ -170,7 +170,7 @@ const _: () = assert!(CHUNK == HC_MAX_TOKENS);
 // by this chunk and the attention's segment.
 const _: () = assert!(CHUNK == place::PROMPT_CHUNK && attn::SEG_KEYS == place::ATTN_SEG_KEYS);
 // So is its hyper-connection scratch's piece.
-const _: () = assert!(bloomery_gpu_deepseek41::hc::HC_PIECE == place::HC_PIECE);
+const _: () = assert!(bloomery_gpu::hc::HC_PIECE == place::HC_PIECE);
 
 /// The fewest tokens a batch runs its GEMM projections over
 /// ([`GemmFront`]: a KDA mixer's input and output projections but its decay

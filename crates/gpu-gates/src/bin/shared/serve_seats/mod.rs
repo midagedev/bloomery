@@ -24,7 +24,7 @@
 //! the recipient protocol; [`nemotron`] the Nemotron 3 Nano seat, one
 //! sequence on one card, opened as `gate_nemotron_e2e` opens it.
 //! [`hybrid`] holds the open, load record and calls of the one-chain seat
-//! ([`solar2`], [`flint`], [`kimi_k3`], [`hy4`]). [`host_seat`] is the host seat: the file's own host forward with
+//! ([`solar2`], [`flint`], [`kimi_k3`], [`hy4`], [`ernie55`]). [`host_seat`] is the host seat: the file's own host forward with
 //! no card (deepseek2 today), served through `serve::TargetEngine`.
 //! `drafted` is the
 //! seats' shared MTP draft driver and `served` the owner of the DSpark draft
@@ -108,7 +108,8 @@ pub mod mistrallarge4;
         feature = "solar2",
         feature = "flint",
         feature = "kimik3",
-        feature = "hy4"
+        feature = "hy4",
+        feature = "ernie55"
     )
 ))]
 pub mod hybrid;
@@ -119,7 +120,8 @@ pub mod hybrid;
         feature = "solar2",
         feature = "flint",
         feature = "kimik3",
-        feature = "hy4"
+        feature = "hy4",
+        feature = "ernie55"
     )
 ))]
 pub mod hybrid_draft;
@@ -130,6 +132,10 @@ pub mod kimi_k3;
 // a time.
 #[cfg(all(feature = "deepseek41", feature = "hy4"))]
 pub mod hy4;
+// The ERNIE 5.5 Flash seat, on the hybrid seat's owner: one sequence of a checkpoint folder, its
+// prompt the pass's units where the card holds every expert, else stepped.
+#[cfg(all(feature = "deepseek41", feature = "ernie55"))]
+pub mod ernie55;
 // The nemotron seat sits behind `deepseek41` for the same reason: the server
 // surface it binds through is scoped to it, and it runs no V4.1 code. The
 // body it serves is in the gpu crate, so it needs no feature of its own.
@@ -340,6 +346,12 @@ pub const SEATS: &[Seat] = &[
         "hy4",
         Serves::Arch(&[Arch::Hy4]),
         ["  hy4     Hy4-flash                    -m <path>"]
+    ),
+    seat!(
+        ernie55,
+        "ernie55",
+        Serves::Arch(&[Arch::Ernie55]),
+        ["  ernie55 ERNIE 5.5 Flash Preview      -m <folder>"]
     ),
     seat!(
         mistrallarge4,

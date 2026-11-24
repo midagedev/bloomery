@@ -1,0 +1,37 @@
+ERNIE 5.5 Flash Preview oracle prompts (tools/ref/ernie55-dump.sh; the reference tools/ref/ernie55_ref.py): the user text of each
+prompt, the chat the model's own renderer makes of it, and the ids of that chat. The ids are comma-separated, as the writer's `tokenize`
+writes and its `run` reads. The dumper never tokenizes (it reads these .ids files): a tokenizer difference would read as a kernel bug.
+
+Made once, on the box, by the writer's `tokenize`: the vendor folder's renderer (encoding_ernie.py, render_chat with
+enable_thinking=False, the one user turn) renders each user text, and the `tokenizers` package encodes the rendered text with the folder's
+tokenizer.json, no special token added (the rendered text opens with <|ERNIE_MASK|> itself):
+
+    python3 -B tools/ref/ernie55_ref.py tokenize --model /models/ERNIE-5.5-Flash-Preview --out DIR --pylib PYLIB \
+        --short "$(cat tools/ref/data/ernie55/short.user.txt)" --long tools/ref/data/ernie55/long.user.txt --long-max 2400
+
+PYLIB is a numpy 2.x OpenBLAS directory that holds `tokenizers` too (tools/ref/ernie55-dump.sh's ERNIE55_PYLIB names the box's). The real
+folder is read for its renderer and tokenizer only: the cut of the fixture tier carries tokenizer.json (the same bytes, sha256
+20e7c81f36fdfb90db664583fc6426d5c2ac6d6bcaf631c910941a8d8f30f2d9) but no encoding_ernie.py. `-B` and the writer's own
+sys.dont_write_bytecode leave no __pycache__ under /models.
+
+    short.user.txt   74 bytes    the opening clause of Alice's Adventures in Wonderland, cut before the comma; no final newline
+    long.user.txt    9,797       the same chapter: its heading and the first 23 paragraphs, in order, one blank line between two and no
+                                 final newline. The paragraphs after it take the prompt past --long-max 2400 ids
+    short.rendered.txt, long.rendered.txt    the rendered chat the ids encode: the prompt as the engine is given it
+    short.ids  34 ids    sha256 435d718d8bb42d44837c0e9c9a6a1814537615a61e9b6a9e43dfb63dd19fd416
+    long.ids   2,328 ids sha256 50829d9d4c92099068990050061b476e4da46826e318f5efa425ae4a6882c8a7
+    text sha256: short.user.txt 176a90b56f12183435df0754e20a9b545eb575e7b228b7b6ec09fe69a216c6e7
+                 long.user.txt  38f7d9b3caf8ea6c0c15eb115f4a95a8e7c7f334de579b90008b37646e4a93b7
+                 short.rendered.txt 89d640b2eedd0e1b0969be4cd9f72f04bacb52788a429318936814cb880845e1
+                 long.rendered.txt  06704cd49a04cc5bfba1ca05c354127585740997adfc7e24da52b58183d3c728
+
+The prose is public domain: Lewis Carroll, Alice's Adventures in Wonderland (1865), as the NLTK `gutenberg` corpus carries Project
+Gutenberg's text (github.com/nltk/nltk_data, packages/corpora/gutenberg.zip, sha256
+2d3c3ab548c653944310f37f536443ec85d0a0ad855fcae217a0c9efdce2d611; its carroll-alice.txt sha256
+5ce9042c0d8536b072b61d4c7c4e6d70c72d9dbb5f3d816261326d9280749266), each paragraph's hard line ends joined by one space.
+
+What the two reach. The template is 17 ids (10 before the user text, 7 after: the empty think block of enable_thinking=False); short
+holds 17 ids of text and long 2,311. short stays inside every window: its 34 positions are fewer than an HCA compressor block (128) and
+than the window. long is the prompt past the DSA indexer's threshold: its last position, 2,327, has 2,200 positions older than the
+128 window, more than the 2,048 the indexer keeps, so the top-k selection runs in its set alone (the writer's `indexer_top_k-<il>` row,
+2,048 positions, on each DSA layer; the selection is the whole older set up to position 2,175).

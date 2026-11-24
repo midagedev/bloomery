@@ -57,11 +57,14 @@ pub enum Format {
     Gguf3,
     /// A GGUF set of 2-bit weights (`UD-IQ2_XXS`).
     Gguf2,
+    /// A checkpoint folder of block-scaled FP8 dense weights and MXFP4 experts (ERNIE 5.5's
+    /// release).
+    Fp8Mxfp4,
 }
 
 impl Format {
     /// Every format, the explicit-only ones included.
-    pub const ALL: [Format; 9] = [
+    pub const ALL: [Format; 10] = [
         Format::Fp4Local,
         Format::Nvfp4,
         Format::Mxfp4,
@@ -71,6 +74,7 @@ impl Format {
         Format::Gguf4,
         Format::Gguf3,
         Format::Gguf2,
+        Format::Fp8Mxfp4,
     ];
 
     /// Whether a start by name takes a row of this format on its own. The 8-, 6- and 5-bit sets
@@ -91,12 +95,14 @@ impl Format {
             Format::Gguf4 => "gguf4",
             Format::Gguf3 => "gguf3",
             Format::Gguf2 => "gguf2",
+            Format::Fp8Mxfp4 => "fp8-mxfp4",
         }
     }
 }
 
 /// Where a native FP4 product runs, the FP4 folders come first, the FP4-Local folder before the
-/// NVFP4 one (the faster of the two on the Spark's rows).
+/// NVFP4 one (the faster of the two on the Spark's rows). The FP8 + MXFP4 folder is last in every
+/// order: no model has it beside another format.
 const FP4_FIRST: &[Format] = &[
     Format::Fp4Local,
     Format::Nvfp4,
@@ -104,6 +110,7 @@ const FP4_FIRST: &[Format] = &[
     Format::Mxfp4,
     Format::Gguf3,
     Format::Gguf2,
+    Format::Fp8Mxfp4,
 ];
 
 /// Without native FP4 products an FP4 folder gains nothing from its format, so it ranks after
@@ -115,6 +122,7 @@ const GGUF_FIRST: &[Format] = &[
     Format::Gguf2,
     Format::Fp4Local,
     Format::Nvfp4,
+    Format::Fp8Mxfp4,
 ];
 
 /// The automatic formats of `class`, best first; a row whose format is not here is never ranked.

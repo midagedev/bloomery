@@ -10,6 +10,7 @@
 
 use std::num::NonZeroUsize;
 
+use bloomery_gpu::folder::Model;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::served::prompt_pass;
 use bloomery_gpu::host::swap::Residency;
@@ -26,6 +27,8 @@ use crate::{Keep, Open, Prompt};
 
 #[cfg(feature = "deepseek41")]
 pub mod deepseek41;
+#[cfg(feature = "ernie55")]
+pub mod ernie55;
 #[cfg(feature = "flint")]
 pub mod flint;
 #[cfg(feature = "glm5next")]
@@ -146,9 +149,11 @@ pub trait Batch: ChainBody + Rollback + Sized {
     }
 
     /// The body resident by `plan`, which `inputs` made: the layers the plan
-    /// puts on the card, the host tier over the routed ones.
+    /// puts on the card, the host tier over the routed ones. `file` is a GGUF
+    /// split or a checkpoint folder; a body that loads splits alone refuses a
+    /// folder by name ([`crate::split_of`]).
     fn open_placed(
-        file: Split,
+        file: Model,
         plan: &Plan<'_>,
         inputs: &Self::Inputs,
         host: HostCfg,
@@ -159,7 +164,7 @@ pub trait Batch: ChainBody + Rollback + Sized {
     /// [`Batch::open_placed`] with the file's in-file MTP layer loaded beside the target. A family
     /// whose body has none refuses by name (the default).
     fn open_placed_drafted(
-        _file: Split,
+        _file: Model,
         _plan: &Plan<'_>,
         _inputs: &Self::Inputs,
         _host: HostCfg,
@@ -268,7 +273,7 @@ impl<B: Batch> Open for B {
     }
 
     fn open(
-        file: Split,
+        file: Model,
         inputs: &B::Inputs,
         plan: &Plan<'_>,
         cfg: &HybridCfg,

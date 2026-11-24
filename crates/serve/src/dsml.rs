@@ -2,7 +2,7 @@
 //! generation into `reasoning_content`, `content` and `tool_calls` under the
 //! tool-call markup its template teaches ([`ToolFormat`]: DSML here, GLM's and
 //! Solar-Open's in [`crate::glmxml`], Hermes' in [`crate::hermes`], Qwen3-Coder's in
-//! [`crate::qwenxml`], Mistral's in [`crate::mistral`]).
+//! [`crate::qwenxml`], Mistral's in [`crate::mistral`], ERNIE 5.5's in [`crate::erniexml`]).
 //!
 //! The markup is the template's own (its `tools_header` and the assistant
 //! `tool_calls` branch), in one of two spellings ([`Spelling`]):
@@ -48,6 +48,7 @@ use crate::constrain::{
     value,
 };
 use crate::engine::Tokenizer;
+use crate::erniexml::{ErnieScan, ErnieXmlError};
 use crate::glmxml::{self, ArgTypes, KvError, KvScan, KvSpelling};
 use crate::hermes::{self, HermesError, HermesScan};
 use crate::inkling::{InklingError, InklingScan};
@@ -571,6 +572,9 @@ pub enum ToolFormat {
     /// Inkling 2's block protocol ([`crate::inkling`]): calls are blocks headed by
     /// the function's name, the thinking a block of its own.
     Inkling,
+    /// ERNIE 5.5's XML ([`crate::erniexml`]): a `<ernie:tool_call>` block around
+    /// `<invoke name="NAME">` and `<parameter name="KEY">` elements.
+    ErnieXml,
     /// None the server parses: a chat request that asks for tool calls is
     /// refused.
     Unparsed,
@@ -647,6 +651,12 @@ impl ToolFormat {
             ToolFormat::Mistral
         } else if ::models::ToolFormat::of_template(source) == Some(::models::ToolFormat::Inkling) {
             ToolFormat::Inkling
+        } else if source.contains(crate::ernie55::CALL_OPEN)
+            && source.contains(crate::ernie55::CALL_CLOSE)
+            && source.contains("<invoke name=")
+            && source.contains("<parameter name=")
+        {
+            ToolFormat::ErnieXml
         } else {
             ToolFormat::Unparsed
         }
@@ -753,6 +763,8 @@ pub enum Tools {
     /// Inkling 2's blocks for a request that asks for no call: the thinking split as
     /// [`Tools::Inkling`], every other block content as written.
     InklingText,
+    /// ERNIE 5.5's XML, typing each argument by the request's tool schemas.
+    ErnieXml(ArgTypes),
 }
 
 #[derive(Clone, Debug)]
@@ -764,6 +776,7 @@ enum Scan {
     Recipient(crate::museatem::MuseScan),
     Mistral(MistralScan),
     Inkling(InklingScan),
+    Ernie(ErnieScan),
 }
 
 /// A generation whose tool-call markup does not parse: which scan refused,
@@ -785,6 +798,9 @@ pub enum MarkupError {
     /// The Qwen3-Coder scan's refusal.
     #[error("{0}")]
     Qwen(#[from] QwenXmlError),
+    /// The ERNIE 5.5 scan's refusal.
+    #[error("{0}")]
+    Ernie(#[from] ErnieXmlError),
     /// A call's arguments were streamed as they were read and the markup does
     /// not end them that way ([`crate::callstream`]).
     #[error(
@@ -886,6 +902,7 @@ impl ChatParser {
                 Tools::Mistral => Scan::Mistral(MistralScan::default()),
                 Tools::Inkling => Scan::Inkling(InklingScan::new(extract)),
                 Tools::InklingText => Scan::Inkling(InklingScan::new(extract).without_calls()),
+                Tools::ErnieXml(types) => Scan::Ernie(ErnieScan::new(types)),
             }),
             streamer: None,
             open: None,
@@ -959,6 +976,7 @@ impl ChatParser {
             Some(Scan::Qwen(q)) => q.read_specials(tok),
             Some(Scan::Hermes(h)) => h.read_specials(tok),
             Some(Scan::Kv(k)) => k.read_specials(tok),
+            Some(Scan::Ernie(e)) => e.read_specials(tok),
             Some(Scan::Dsml(_) | Scan::Recipient(_) | Scan::Mistral(_) | Scan::Inkling(_))
             | None => {}
         }
@@ -1030,6 +1048,7 @@ impl ChatParser {
             Some(Scan::Recipient(m)) => Some(m.push(&split.content)),
             Some(Scan::Mistral(m)) => Some(m.push(&split.content)?),
             Some(Scan::Inkling(i)) => Some(i.push(&split.content)?),
+            Some(Scan::Ernie(e)) => Some(e.push_stream(&split.content, &split.specials)?),
         };
         self.stream(scanned.as_ref())?;
         Ok(self.emit(split, scanned))
@@ -1071,6 +1090,7 @@ impl ChatParser {
             Some(Scan::Mistral(m)) => Some(ended(m.finish(), MistralError::unclosed, cut, whole)?),
             Some(Scan::Inkling(i)) => Some(ended(i.finish(), InklingError::unclosed, cut, whole)?),
             Some(Scan::Qwen(q)) => Some(ended(q.finish(), QwenXmlError::unclosed, cut, sent)?),
+            Some(Scan::Ernie(e)) => Some(ended(e.finish(), ErnieXmlError::unclosed, cut, sent)?),
             // The scan closes a message the stream ends inside as its call on its own.
             Some(Scan::Recipient(m)) => Some(m.finish()),
         };
@@ -1208,6 +1228,7 @@ impl ToolFormat {
             ToolFormat::MuseSpark => crate::museatem::call_parts(funs, mode),
             ToolFormat::Mistral => mistral::call_parts(funs, mode),
             ToolFormat::Inkling => crate::inkling::call_parts(funs, mode),
+            ToolFormat::ErnieXml => crate::erniexml::call_parts(funs, mode),
             ToolFormat::Unparsed => Err(Refusal {
                 message: "the chat template's tool-call markup has no inverse in this server: \
                           send the request without tool_choice \"required\" or a named function"

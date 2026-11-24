@@ -321,7 +321,7 @@ pub fn normalize_part<'a>(
     at: (usize, Range<u64>),
 ) -> Result<Normal, Error> {
     let cuts = match plan_part(&get, sources, role, dims, at)? {
-        PartPlan::Experts(r) => return normalize(get, &sources[r], role),
+        PartPlan::Sources(r) => return normalize(get, &sources[r], role),
         PartPlan::Cuts(cuts) => cuts,
     };
     let encoding = csf::Encoding::of(sources[0].1.format);
@@ -373,7 +373,9 @@ pub fn normalize_part<'a>(
 /// Check the part of `sources` [`normalize_part`] makes at `at` against what they store, reading
 /// headers alone: the cut keeps whole stored values of each weight and whole blocks of its scale
 /// grid (a compressed scale's decoded one), except a grid of one block along the dim, which every
-/// part reads whole. An MLX affine weight is read whole: its part is the whole of a dim.
+/// part reads whole. An MLX affine weight is read whole: its part is the whole of a dim. A vector
+/// of one stored value a source (`[n]` over `n` sources) holds its values in its sources: a part
+/// reads the sources it holds whole.
 ///
 /// # Errors
 ///
@@ -411,7 +413,7 @@ pub fn part_runs<'a>(
     at: (usize, Range<u64>),
 ) -> Result<StoredRuns, Error> {
     let (read, cuts) = match plan_part(&get, sources, role, dims, at)? {
-        PartPlan::Experts(r) => (&sources[r], vec![]),
+        PartPlan::Sources(r) => (&sources[r], vec![]),
         PartPlan::Cuts(cuts) => (sources, cuts),
     };
     let mut out = Vec::new();
@@ -430,10 +432,10 @@ pub fn part_runs<'a>(
     Ok(out)
 }
 
-/// What a part of a tensor reads ([`check_part`]): a stack's experts, or each weight and block
-/// scale cut.
+/// What a part of a tensor reads ([`check_part`]): the sources it holds whole (a stack's experts,
+/// a vector's values), or each weight and block scale cut.
 enum PartPlan {
-    Experts(Range<usize>),
+    Sources(Range<usize>),
     Cuts(Vec<Cut>),
 }
 
@@ -470,6 +472,12 @@ fn plan_part<'a>(
         [k, rows, experts] if *experts == n as u64 && get(first)?.shape.len() == 2 => {
             vec![*k, *rows]
         }
+        // A vector of one stored value a source: the part's values are its sources.
+        [values]
+            if n > 1 && *values == n as u64 && get(first)?.shape.iter().product::<usize>() == 1 =>
+        {
+            vec![]
+        }
         _ if n == 1 => dims.to_vec(),
         _ => {
             return Err(refuse(
@@ -478,13 +486,19 @@ fn plan_part<'a>(
             ));
         }
     };
-    if dims.len() == 3 && matrix.len() == 2 && dim == 2 {
+    if matrix.is_empty() && dim != 0 {
+        return Err(refuse(
+            first,
+            format!("dim {dim} of a vector of {n} sources, which has dim 0 alone"),
+        ));
+    }
+    if (dims.len() == 3 && matrix.len() == 2 && dim == 2) || matrix.is_empty() {
         let picked = usize::try_from(at.start)
             .ok()
             .zip(usize::try_from(at.end).ok())
             .filter(|&(a, b)| a < b && b <= n)
             .ok_or_else(|| refuse(first, format!("experts {at:?} of a stack of {n}")))?;
-        return Ok(PartPlan::Experts(picked.0..picked.1));
+        return Ok(PartPlan::Sources(picked.0..picked.1));
     }
     let values_per_element = format.logical(&[1])[0] as u64;
     let mut cuts = Vec::new();
@@ -4709,6 +4723,63 @@ mod tests {
             e.contains("m.scales") && e.contains("groups are [2, 2, 2]"),
             "{e}"
         );
+    }
+
+    /// A vector of one stored value a source (a block's mix scalars, `[3]` over three `[1]`
+    /// tensors) is planned whole and in parts along its one dim: a part reads the sources it holds,
+    /// in source order. Another dim, a source of more than one value and a count other than the
+    /// sources' are refused by name. Mutant: the vector arm left out of the plan, so the whole
+    /// tensor is refused as a stack.
+    #[test]
+    fn a_vector_of_scalar_sources_is_planned_by_its_sources() {
+        let role = Use::Matrix(Plain::F32);
+        let values = [0.5f32, 1.5, -2.0];
+        let names = ["b.alpha_pre", "b.alpha_post", "b.alpha_res"];
+        let bytes: Vec<[u8; 4]> = values.iter().map(|v| v.to_le_bytes()).collect();
+        let st = Safetensors::parse(write(&[
+            (names[0], "F32", &[1][..], &bytes[0][..]),
+            (names[1], "F32", &[1][..], &bytes[1][..]),
+            (names[2], "F32", &[1][..], &bytes[2][..]),
+            ("b.pair", "F32", &[2][..], &[0u8; 8][..]),
+        ]))
+        .unwrap();
+        let placed = Placed {
+            format: Format::F32,
+            companions: vec![],
+        };
+        let sources: Vec<(&str, &Placed)> = names.iter().map(|n| (*n, &placed)).collect();
+        let floats = |n: &Normal| -> Vec<f32> {
+            n.bytes
+                .chunks(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect()
+        };
+        let whole = normalize(|n| st.raw(n), &sources, role).unwrap();
+        assert_eq!(floats(&whole), values);
+        check_part(|n| st.raw(n), &sources, role, &[3], (0, 0..3)).unwrap();
+        let all = normalize_part(|n| st.raw(n), &sources, role, &[3], (0, 0..3)).unwrap();
+        assert_eq!(all, whole);
+        let tail = normalize_part(|n| st.raw(n), &sources, role, &[3], (0, 1..3)).unwrap();
+        assert_eq!(floats(&tail), values[1..]);
+        let runs = part_runs(|n| st.raw(n), &sources, role, &[3], (0, 1..3)).unwrap();
+        let read: Vec<&str> = runs.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(read, names[1..]);
+        let refused = |sources: &[(&str, &Placed)], dims: &[u64], at| {
+            check_part(|n| st.raw(n), sources, role, dims, at)
+                .unwrap_err()
+                .to_string()
+        };
+        let e = refused(&sources, &[3], (1, 0..1));
+        assert!(e.contains("dim 1 of a vector of 3 sources"), "{e}");
+        let e = refused(&sources, &[4], (0, 0..4));
+        assert!(e.contains("[4] are not the dims of a stack of 3"), "{e}");
+        let pairs = [
+            ("b.pair", &placed),
+            ("b.pair", &placed),
+            ("b.pair", &placed),
+        ];
+        let e = refused(&pairs, &[3], (0, 0..3));
+        assert!(e.contains("[3] are not the dims of a stack of 3"), "{e}");
     }
 
     /// One `weight_global_scale` an expert, in the range the real file holds.

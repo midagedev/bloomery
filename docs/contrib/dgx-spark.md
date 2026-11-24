@@ -70,7 +70,7 @@ needs no local flag. Run `tools/oxide-backend.sh` once (about a minute: it build
 with `cargo oxide` only, for example:
 
 ```sh
-cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
+cargo oxide build --arch sm_121a -- -p bloomery-gpu-gates --features glm5next,clef,vision,mimo2,solar2,minimaxm3,flint,kimik3,hy4,ernie55,mistrallarge4,gemma-embedding2,hf,checkpoint --release --bin bloomery-serve
 ```
 
 Under a driver before CUDA 13.1 (R580) the driver's PTX compiler truncates some kernels' addresses on a GB10

@@ -508,7 +508,9 @@ impl LoadPlan {
         })
     }
 
-    /// The parts of `plan`'s tensors that `on`, a card of it, reads from `source` under `room`.
+    /// The parts of `plan`'s tensors that `on`, a card of it, reads from `source` under `room`,
+    /// each staged in the card format the plan holds it in ([`OnCard::format`]), as the load
+    /// uploads it.
     fn reading<S: Source>(
         source: &S,
         plan: &Plan<'_>,
@@ -519,7 +521,12 @@ impl LoadPlan {
             source,
             keep: |name: &str| plan.model.tensors.iter().any(|t| t.name == name),
         };
-        Self::new(&selected, |name, _, _| on.take(name), |_| None, room)
+        Self::new(
+            &selected,
+            |name, _, _| on.take(name),
+            |t| on.format(t),
+            room,
+        )
     }
 }
 
@@ -668,7 +675,8 @@ impl OnCard {
             let elsewhere = |placed: String| {
                 refused(format!(
                     "{} is placed {placed}: a load from a part source holds every tensor whole \
-                     on card {card}, and reads a row-gathered table from the NVMe tier",
+                     on card {card}, and reads a row-gathered table from the NVMe tier; a GGUF \
+                     that stores the tensor, opened as a file, places it so",
                     t.name
                 ))
             };

@@ -4932,6 +4932,7 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
         ToolFormat::MuseSpark => Tools::MuseSpark,
         ToolFormat::Mistral => Tools::Mistral,
         ToolFormat::Inkling => Tools::Inkling,
+        ToolFormat::ErnieXml => Tools::ErnieXml(ArgTypes::of_tools(b.get("tools"))),
         ToolFormat::Unparsed => {
             return Err(ApiError {
                 retry_after: false,
@@ -4940,7 +4941,8 @@ fn tool_scan(state: &State, b: &Map<String, Value>) -> Result<Option<Tools>, Api
                 kind: "not_supported_error",
                 message: "the chat template's tool-call markup has no parser in this server \
                           (DSML, GLM's and Solar's key/value markup, Hermes' and Qwen's XML, \
-                          Muse's recipient markup, Mistral's [TOOL_CALLS] and Inkling's blocks are parsed): send \
+                          Muse's recipient markup, Mistral's [TOOL_CALLS], Inkling's blocks and ERNIE 5.5's \
+                          XML are parsed): send \
                           the request without tools or with tool_choice \"none\""
                     .to_owned(),
             });

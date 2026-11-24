@@ -42,12 +42,12 @@
 //! prefill is split by its caller and nothing here covers that split.
 
 use bloomery_gpu::fused::readback_q8act;
-use bloomery_gpu::{
-    DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_group_count,
-};
-use bloomery_gpu_deepseek41::hc::{
+use bloomery_gpu::hc::{
     HC_MAX_TOKENS, HC_MIX, HC_PIECE, HC_STREAMS, HcKernels, HcParams, HcPostArgs, HcPreArgs,
     HcPreScratch, HcQ8Params, HcQ8PreArgs,
+};
+use bloomery_gpu::{
+    DeviceTensor, Fault, FaultSite, Gpu, GpuError, LAYER_NONE, Q8Act, col_group_count,
 };
 use bloomery_gpu_gates::act_rule;
 use bloomery_gpu_gates::hc_host::{self, exp_ours, hc_chain_q8_0, hc_pre_f32, lcg, q8_0_fixture};

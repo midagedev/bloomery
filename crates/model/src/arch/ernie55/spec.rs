@@ -11,15 +11,16 @@
 //! rest the sigmoid router over `situ` experts in a latent, the routed sum normed before its up
 //! projection, beside a shared expert.
 //!
-//! What the file asks beyond [`ModelSpec`]'s fields is in [`super::ops`]; no program runs the
-//! family, so [`AVAILABLE`] names none and every need of a description is an item of the coverage
-//! check.
+//! What the file asks beyond [`ModelSpec`]'s fields is in [`super::ops`]. The ernie55 body runs
+//! the family: [`AVAILABLE`] holds the needs it runs, and a need it does not run is an item of the
+//! coverage check.
 
 use gguf::Split;
+use models::shape::rules;
 use models::{
-    Arch, ChatSpec, Collapse, Compress, Compressor, Ffn, HcKind, HcMix, HcSpec, IndexKeys, Latent,
-    LatentOut, LayerSpec, Mixer, ModelSpec, OutGate, Residual, Rope, RopeMode, Selector, Source,
-    Yarn,
+    Act, Arch, ChatSpec, Collapse, Compress, Compressor, Ffn, HcKind, HcMix, HcSpec, IndexKeys,
+    Latent, LatentOut, LatentUp, LayerSpec, Mixer, ModelSpec, Need, OutGate, Residual, Rope,
+    RopeMode, Selector, Source, Yarn,
 };
 
 use super::hparams::Hparams;
@@ -27,13 +28,129 @@ use super::roles;
 use crate::arch::coverage::Available;
 use crate::arch::{Read, chat_of, rules_of, spec_u32};
 use crate::placement::PlacementError;
+use crate::placement::accepts::Program;
 
 /// The indexer key's LayerNorm epsilon: not a header key, the family's code states it.
 pub const INDEX_KEY_NORM_EPS: f32 = 1e-6;
 
-/// What a program of this family runs that the common table does not list: nothing, because no
-/// program runs the family yet.
-pub const AVAILABLE: &[Available] = &[];
+/// What the ernie55 body runs that the common table ([`crate::arch::coverage::AVAILABLE`]) does
+/// not list for it: one row per part, citing the check or constant that owns it. A width the
+/// part's shape check pins is the architecture's, and any other is refused there by name; a width
+/// it takes at any multiple of a block is held to that block, so the fixture's narrower dense and
+/// shared widths pass as the real file's do.
+pub const AVAILABLE: &[Available] = &[
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu/src/hca.rs LATENT and gpu-ernie55/src/attn_hca.rs HcaDims::new (K = V rows of 512, \
+             a pairwise tail of 4 to 512 values in fours)",
+        runs: |n| match n {
+            Need::Latent {
+                latent: 512,
+                rope,
+                up: LatentUp::KeqV,
+            } => (4..=512).contains(rope) && rope.is_multiple_of(4),
+            _ => false,
+        },
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu/src/compress.rs WIDTH (the gated compressor and its position table) and \
+             gpu/src/hca.rs (the pooled stream attended whole beside the window)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::Compress { width: 512 } | Need::CompressorApe | Need::WholeStream
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu-ernie55/src/attn_hca.rs (the weightless per-head norm of the query after attn_q_b)",
+        runs: |n| matches!(n, Need::QueryHeadNorm),
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu-ernie55/src/attn_hca.rs and attn_mla.rs over gpu/src/linear HEAD (the sigmoid gate \
+             of the normed query latent, on the grouped rows and on the heads' outputs)",
+        runs: |n| matches!(n, Need::LatentOutGateQ { .. }),
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu-ernie55/src/attn_mla.rs Shape::of (LATENT, ROPE; k_b's Q8_0 blocks along the \
+             unrotated key values, whole gpu/src/linear HEAD heads of v) and the rope row beside the \
+             latent",
+        runs: |n| match n {
+            Need::Latent {
+                latent: 512,
+                rope: 64,
+                up: LatentUp::Absorbed { qk, v },
+            } => *qk > 64 && (qk - 64).is_multiple_of(32) && *v > 0 && v.is_multiple_of(128),
+            Need::LatentPe { width } => *width == 64,
+            _ => false,
+        },
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu-ernie55/src/attn_mla.rs Shape::of (gpu/src/indexer.rs HEADS_F32 x HEAD_DIM, the f32 \
+             score pass) over keys of the layer input (the key's LayerNorm and NeoX turn)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::StreamIndex { heads: 64, d: 128 } | Need::IndexKeyFromInput
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu/src/route_body.rs sigmoid_split_512_10 (gpu-ernie55/src/moe.rs MoeDims::check: the \
+             biased sigmoid, the kept weights renormalized over their sum)",
+        runs: |n| {
+            matches!(n, Need::Router(s)
+                if (s.experts, s.top_k) == (512, 10) && s.rule == rules::BIASED_SIGMOID)
+        },
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu-ernie55/src/moe.rs MoeDims::check (the latent pair around the card leg and the host \
+             tier in whole 256-value super-blocks, the routed sum normed by ffn_routed_norm, the \
+             ungated shared expert in whole 128-value blocks)",
+        runs: |n| match n {
+            Need::LatentExperts { latent } => *latent > 0 && latent.is_multiple_of(256),
+            Need::Shared {
+                ff,
+                sigmoid_gate: false,
+            } => *ff > 0 && ff.is_multiple_of(128),
+            Need::SumNorm => true,
+            _ => false,
+        },
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu/src/kquant/act.rs Act::Situ (the card leg and the shared expert, \
+             gpu-ernie55/src/moe.rs MoeDims::rule) and model/src/moe.rs ExpertForm::Situ (the host \
+             tier)",
+        runs: |n| {
+            matches!(
+                n,
+                Need::ExpertAct {
+                    act: Act::Situ { .. },
+                    ..
+                }
+            )
+        },
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu-ernie55/src/trunk.rs dense_block (situ over the FP8 B128 sites, DENSE_TYPES)",
+        runs: |n| matches!(n, Need::Situ { ff } if *ff > 0 && ff.is_multiple_of(128)),
+    },
+    Available {
+        programs: &[Program::Ernie55Body],
+        at: "gpu/src/hc.rs (the mHC pre mix, the post and the head's fold of four streams; \
+             gpu-ernie55/src/trunk.rs Facts::of, head.rs Head::enqueue_fold)",
+        runs: |n| matches!(n, Need::HcRoot { streams: 4 } | Need::HcHead),
+    },
+];
 
 /// `split`'s description and roles, and the defaults the key read took and the description row's
 /// facts.
@@ -156,7 +273,6 @@ fn hca_layer(hp: &Hparams) -> Result<Latent, PlacementError> {
 /// A latent layer: the absorbed MLA row with the DSA indexer over keys from the layer input.
 fn latent_layer(hp: &Hparams) -> Result<Latent, PlacementError> {
     let mut latent = hp.mla.latent(hp.heads)?;
-    latent.pe = 0;
     latent.rope = Some(Rope {
         mode: RopeMode::NormTail,
         dims: spec_u32("rope.dimension_count", hp.mla.pe)?,

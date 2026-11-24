@@ -138,7 +138,7 @@ pub struct Hparams {
     pub defaults: Vec<String>,
 }
 
-/// Every `ernie55.` key [`Hparams::read`] reads but the routed block's ([`noaux::KEYS`]), by
+/// Every `ernie5_5.` key [`Hparams::read`] reads but the routed block's ([`noaux::KEYS`]), by
 /// suffix.
 const READ: &[&str] = &[
     "block_count",

@@ -80,6 +80,7 @@ OUTSIDE_MODELS = {
 # Catalog models with no row in docs/models.md, and why.
 UNDOCUMENTED = {
     "qwen3.8-27b": "docs/models.md has no row for the dense Qwen3.8-27B yet",
+    "ernie-5.5-flash-preview": "docs/models.md has no row until the ernie55 seat has served the folder on a card",
 }
 
 HF_LINK = re.compile(r"\[`([^`]+)`\]\(https://huggingface\.co/([^)\s]+)\)")

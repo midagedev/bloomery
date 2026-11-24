@@ -80,6 +80,7 @@ dependencies = [
  "bloomery-gguf",
  "bloomery-gpu",
  "bloomery-gpu-deepseek41",
+ "bloomery-gpu-ernie55",
  "bloomery-gpu-flint",
  "bloomery-gpu-glm5next",
  "bloomery-gpu-hy4",
