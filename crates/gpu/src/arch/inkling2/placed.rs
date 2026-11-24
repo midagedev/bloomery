@@ -13,12 +13,18 @@
 //! walk's ([`runtime::sched::walk`], one row through the step port) over the file's visits: a
 //! looped trunk's stored layer is visited once a pass, its host service asked once a visit, so the
 //! go, the join and the host's work are the visit's, the experts and the slot map the layer's.
-//! The prompt is stepped one id at a time; the verify and the prompt pass are the whole-card
+//!
+//! The prompt runs as the prompt pass ([`super::pass`]) over the host tier's batch port when the
+//! load holds the pass's buffers ([`Placed::attach_pass`], [`PlacedPass`]): a visit's rows go to the
+//! host once, its experts are served in one union call under the card's share of the same rows, and
+//! the routed sum is the card's and the host's added, as the step adds them. The batch leg keys its
+//! exchange by the walk's layer, so [`VisitLeg`] hands it the visit's stored layer. A load with no
+//! room for the pass's buffers steps its prompt one id at a time; the verify is the whole-card
 //! load's.
 
 use super::{Layer, STEP, VisitStore, Walk, layer_card_stacks};
 use crate::card_leg::LegSum;
-use crate::host::StepLeg;
+use crate::gemm::RouteSet;
 use crate::host::placed::{PlacedHost, PlacedSide, SideShape};
 use crate::host::refuse_tier_count;
 use crate::host::run::{HostRun, HostWidths};
@@ -26,21 +32,23 @@ use crate::host::served::{ResidencyParts, TierBody};
 use crate::host::shell::TierShell;
 use crate::host::swap_source::ResidencyGlue;
 use crate::host::tier::TierOpen;
+use crate::host::{BatchLeg, StepLeg};
 use crate::hybrid::{Chain, HostResidency, Hybrid, SlotMap};
 use crate::model::{hosted_hybrid_at, stage_run};
-use crate::tensor::copy_row;
+use crate::tensor::{WindowMut, copy_row};
 use crate::{Gpu, GpuError};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::inkling2::hparams::Hparams;
-use model::arch::inkling2::place::Inputs;
+use model::arch::inkling2::place::{Inputs, PassShape};
 use model::arch::inkling2::{host, names};
 use model::arch::models::Visit;
 use model::embed::EmbedTable;
 use model::placement::Plan;
 use runtime::layer::hosted;
-use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
+use runtime::sched::{self, At, BatchOrder, LayerProgram, Overlap, Port, PortKind, Refused};
+use std::mem::size_of;
 use std::sync::Arc;
 
 const PLACED: &str = "inkling2 placed load";
@@ -77,6 +85,113 @@ struct EmbedHost {
 pub struct Placed {
     pub(super) host: PlacedHost,
     embed: EmbedHost,
+    /// What the prompt pass holds beside the pass's own buffers; `None` on a load that steps its
+    /// prompt.
+    pub(super) pass: Option<PlacedPass>,
+}
+
+/// What a placed load's prompt pass holds beside the pass's own buffers ([`super::pass::Pass`],
+/// which the plan reserves): the host's routed sums of a visit's rows, the places of its slots in
+/// the card's stacks, the layer's row of the slot map the route table is built through, a route
+/// table for each card count of the hosted layers (a grouped GEMM's table holds the experts of the
+/// stack it reads), and the host's staging of the rows' embeddings.
+pub(super) struct PlacedPass {
+    /// The rows the batch leg's upload lands the host's sums in.
+    pub(super) hsum: DeviceBuffer<f32>,
+    /// Each slot's place in the card's stacks, or `HOST`, over the visit's rows.
+    pub(super) places: DeviceBuffer<u32>,
+    /// The visit's layer's row of the slot map's card copy.
+    pub(super) map: DeviceBuffer<u32>,
+    pub(super) routes: RouteSet,
+    /// The rows' embeddings as the host reads them, before they go to the card.
+    stage: Vec<f32>,
+    /// The rows a call's pass holds.
+    pub(super) rows: usize,
+}
+
+impl PlacedPass {
+    /// The device bytes [`PlacedPass::new`] takes at `rows` rows over hosted layers whose card
+    /// counts are `counts`.
+    pub(super) fn bytes_at(
+        shape: &PassShape,
+        rows: usize,
+        counts: impl IntoIterator<Item = usize>,
+    ) -> usize {
+        let slots = rows * shape.n_used;
+        size_of::<f32>() * (rows * shape.n + slots + shape.n_expert)
+            + RouteSet::bytes_at(slots, counts)
+    }
+
+    /// The pass's side buffers for `rows` rows of `shape` over `side`'s hosted layers.
+    /// Load-time only.
+    pub(super) fn new(
+        gpu: &Gpu,
+        side: &PlacedSide,
+        shape: &PassShape,
+        rows: usize,
+    ) -> Result<PlacedPass, GpuError> {
+        let stream = gpu.stream();
+        let slots = rows * shape.n_used;
+        let counts = side.hosted_set().into_iter().map(|l| side.n_card(l));
+        Ok(PlacedPass {
+            hsum: DeviceBuffer::zeroed(stream, rows * shape.n)?,
+            places: DeviceBuffer::zeroed(stream, slots)?,
+            map: DeviceBuffer::zeroed(stream, shape.n_expert)?,
+            routes: RouteSet::new(stream, slots, counts)?,
+            stage: vec![0.0; rows * shape.n],
+            rows,
+        })
+    }
+
+    /// Device bytes the buffers take.
+    pub(super) fn bytes(&self) -> usize {
+        self.hsum.num_bytes() + self.places.num_bytes() + self.map.num_bytes() + self.routes.bytes()
+    }
+}
+
+/// The batch leg of a walk over a looped trunk's visits. The leg keys its exchange by the walk's
+/// layer, which here is the visit's index; the host service and the experts are the stored
+/// layer's, so every exchange (the download, the serve, the upload) is keyed by
+/// [`VisitLeg::stored`].
+pub(super) struct VisitLeg<'a> {
+    pub(super) leg: BatchLeg<'a, HostRun>,
+    visits: &'a [Visit],
+}
+
+impl<'a> VisitLeg<'a> {
+    pub(super) fn new(leg: BatchLeg<'a, HostRun>, visits: &'a [Visit]) -> VisitLeg<'a> {
+        VisitLeg { leg, visits }
+    }
+
+    /// `at` with its layer the stored layer of the visit it names.
+    pub(super) fn stored(&self, at: At) -> At {
+        At {
+            unit: at.unit,
+            layer: self.visits[at.layer].layer as usize,
+        }
+    }
+}
+
+impl Port for VisitLeg<'_> {
+    type Error = GpuError;
+    const KIND: PortKind = PortKind::Batch;
+
+    fn open(&mut self, o: Overlap) -> Result<(), GpuError> {
+        self.leg.open(o)
+    }
+
+    fn open_ordered(&mut self, o: Overlap, order: BatchOrder) -> Result<(), GpuError> {
+        self.leg.open_ordered(o, order)
+    }
+
+    fn serve(&mut self, at: At) -> Result<(), GpuError> {
+        let at = self.stored(at);
+        self.leg.serve(at)
+    }
+
+    fn refused(why: Refused) -> GpuError {
+        <BatchLeg<'_, HostRun> as Port>::refused(why)
+    }
 }
 
 /// The slot map of a placed load's plan over the routed run: one row of `n_expert` places a
@@ -171,19 +286,29 @@ impl Placed {
                 table,
                 row: vec![0.0; hp.n_embd],
             },
+            pass: None,
         })
     }
 
+    /// The placed pass's side buffers held for the load's life, and the host tier's batch sets and
+    /// union slabs for its rows (which also serve the one-column step). Load-time only.
+    pub(super) fn attach_pass(&mut self, gpu: &Gpu, pass: PlacedPass) -> Result<(), GpuError> {
+        self.host.prepare_pass_rows(gpu, pass.rows)?;
+        self.pass = Some(pass);
+        Ok(())
+    }
+
     /// The host tier's union slabs for the one-column step: the resident path of the host layer
-    /// serves the step only through them. Load-time only.
+    /// serves the step only through them. Load-time only, on a load without a pass (a pass load
+    /// makes them for its rows).
     pub(super) fn prepare_step_union(&mut self) -> Result<(), GpuError> {
         self.host.prepare_step_union()
     }
 
     /// Device bytes the placed side holds beside the plan's terms for the tier: the slot map's
-    /// card copy, the places and the boundary.
+    /// card copy, the places, the boundary and the placed pass's side buffers.
     pub(super) fn device_bytes(&self) -> usize {
-        self.host.device_bytes()
+        self.host.device_bytes() + self.pass.as_ref().map_or(0, PlacedPass::bytes)
     }
 
     /// Whether the host serves a share of layer `l`. A layer past the model panics by name.
@@ -208,6 +333,47 @@ impl Placed {
     /// The host tier's settling.
     pub(super) fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         self.host.reset(stream)
+    }
+
+    /// The pass's embedding rows of `ids`, one a position from `at`, into `o`, and the position
+    /// words the card's embedding lookup writes (`pos`, the live key count `pos + 1`) for them: the
+    /// host table's rows, as [`Placed::refresh`] reads the step's. Refused by name: a load with no
+    /// pass, more ids than the pass's rows, and a token past the vocabulary.
+    pub(super) fn refresh_rows(
+        &mut self,
+        stream: &CudaStream,
+        ids: &[u32],
+        (o, pos, n_keys): (
+            &mut DeviceBuffer<f32>,
+            &mut DeviceBuffer<u32>,
+            &mut DeviceBuffer<u32>,
+        ),
+        at: u32,
+    ) -> Result<(), GpuError> {
+        const ROWS: &str = "inkling2 prompt pass (the host's embedding rows)";
+        let pass = self.pass.as_mut().ok_or(GpuError::state(
+            ROWS,
+            "a placed load with the pass's side buffers",
+        ))?;
+        let EmbedHost { table, row } = &self.embed;
+        let (n, m) = (row.len(), ids.len());
+        if m * n > pass.stage.len() {
+            return Err(GpuError::shape(
+                ROWS,
+                format!("{m} ids over a pass of {} rows", pass.rows),
+            ));
+        }
+        for (t, &token) in ids.iter().enumerate() {
+            table
+                .row_into(token, &mut pass.stage[t * n..(t + 1) * n])
+                .map_err(|e| GpuError::shape(ROWS, format!("token {token}: {e}")))?;
+        }
+        WindowMut::<f32>::of_mut(o, 0, m * n)?.copy_from_host(stream, &pass.stage[..m * n])?;
+        let words: Vec<u32> = (0..m as u32).map(|t| at + t).collect();
+        let keys: Vec<u32> = words.iter().map(|p| p + 1).collect();
+        WindowMut::<u32>::of_mut(pos, 0, m)?.copy_from_host(stream, &words)?;
+        WindowMut::<u32>::of_mut(n_keys, 0, m)?.copy_from_host(stream, &keys)?;
+        Ok(())
     }
 
     /// The step's embedding row of `token` into `emb`, and the position words the card's

@@ -467,7 +467,7 @@ impl Seat for Inkling2 {
     /// leaves the stores and the head's row where that id's step would, so the call closes and the
     /// row is read after it. The body's prompt rule is this one call, the gate's seat answer too.
     fn prefill_next(&mut self, ids: &[u32], row: Option<&mut [f32]>) -> Result<u32, GateError> {
-        let closes = self.m.body(NAME)?.placed().is_none();
+        let closes = self.m.body(NAME)?.pass_rows() > 0;
         prefill_closing(self, ids, row, closes)
     }
 

@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/arch/inkling2/placed.rs
++++ b/crates/gpu/src/arch/inkling2/placed.rs
+@@ -383,7 +383,7 @@
+         let hy = leg.hybrid();
+         hy.boundary().enqueue_back_of(stream, 0, l)?;
+         let hsum = hy.boundary().hsum_of(0)?;
+-        if placed.n_card(l) > 0 {
++        if placed.n_card(l) > 0 && l == usize::MAX {
+             gpu.elem()
+                 .enqueue_add(stream, &walk.s.cacc, hsum, n, &mut walk.s.moe)?;
+         } else {

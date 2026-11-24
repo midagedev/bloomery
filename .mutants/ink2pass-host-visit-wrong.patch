@@ -1,0 +1,19 @@
+# ink2pass (gate_inkling2_mix, the placed prompt pass): the batch leg's exchange (download, serve,
+# upload) is keyed by the NEXT visit's stored layer, so the host serves another layer's experts
+# for the visit's rows (the looped trunk's visits cross its stored layers).
+# Expected red (every table with a host slot; the Card table serves none):
+#   mix_pass_forced_host_picks_are_the_whole_card_pass FAIL
+#   mix_pass_forced_any_picks_are_the_whole_card_pass FAIL
+#   mix_pass_forced_host_picks_are_the_placed_steps FAIL
+#   mix_pass_forced_any_picks_are_the_placed_steps FAIL
+--- a/crates/gpu/src/arch/inkling2/placed.rs
++++ b/crates/gpu/src/arch/inkling2/placed.rs
+@@ -167,7 +167,7 @@
+     pub(super) fn stored(&self, at: At) -> At {
+         At {
+             unit: at.unit,
+-            layer: self.visits[at.layer].layer as usize,
++            layer: self.visits[(at.layer + 1) % self.visits.len()].layer as usize,
+         }
+     }
+ }

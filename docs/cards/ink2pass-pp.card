@@ -1,0 +1,46 @@
+# Inkling 2 Mini, a placed load (12 GB card cap, a share of every layer's routed experts on the host tier) on
+# the 5090: the prompt as the batched pass over
+# the host tier's batch port against the base tree's stepped prompt (round ink2pass). Base = the ink2mix
+# commit's tree, changed = this tree; one binary each.
+# [derived] shape: 24 stored layers, 48 visits (the looped core three passes), 128 experts a layer, top 8, ff
+# 1152; a visit's 512 columns route 4096 slots, so every
+# expert the host holds is read once a visit (one union call), and the card's share runs as the grouped GEMM
+# under it (the Hy4 shadow shape, card slots summed in slot order).
+# [derived] resource timeline a visit at 512 columns, Q4_K_XL at the 12G cap (ms of each resource; the wall is
+# a chain over 48 visits, the card's front and back and the
+# two PCIe copies in the sum, the host serve and the card's shadow in parallel so the longer of them):
+# card SMs front + back 0.99 ms (the whole-card pass's 512 ids / 4,962.77 tok/s / 48 visits = 2.15 ms a visit,
+# less its routed GEMMs), the card's shadow 0.59 ms (IQ3_XXS 0.9..1.4 ms)
+# host cores serve 15.7 ms (IQ3_XXS 12.1 ms): the V4.1 fit's per-column cost (22.98 us a column, 31.5 us a
+# slot at P512) taken for these quants, the term a run settles
+# PCIe 0.19 ms down + 0.19 ms up (the rows' stream, 512 x 9.2 KB = 4.7 MB each way at ~25 GB/s; the 4096 picks
+# and weights are 32 KB)
+# host DRAM 326 MB Q4_K_XL (86 MB IQ3_XXS) a visit = 4.5 ms (1.2 ms) at the 73 GB/s the box's workers read on
+# these dots, under the compute; NVMe 0
+# wall = 48 x (0.99 + 0.38 + max(15.7, 0.59)) = 819 ms for 512 ids = 625 tok/s (IQ3_XXS 48 x (0.99 + 0.38 +
+# 12.1) = 647 ms = 790 tok/s); pp4096 the same within 1 %.
+# The base arm is stepped (57 tok/s Q4_K_XL, 94 tok/s IQ3_XXS: ink2mix, dev numbers), so the gain is x11
+# (x8.4): +996 % (+740 %). The host's batch is the wall; the card
+# shadow's value is 0 and PCIe is 2 % of the visit; two-unit overlap would hide up to the card's 1.37 ms of
+# 17.07 (+6..10 %), weight streaming over PCIe is the lever beyond the host's rate.
+kind: ab
+question: is the placed Q4_K_XL load's pp512 +650..+1300 % over the stepped prompt, the host's batch serve
+  (15.7 ms a visit) the wall?
+term: pp tok/s @ P=512, depth 0, RTX 5090 + the box host, bloomery-serve inkling2 UD-Q4_K_XL at the 12 GB card
+  cap (the seat's own plan, ctx 32768), prompt only, cache_prompt off, server timings prompt_per_second
+unit: %
+predict: 650..1300
+rounds: 3
+sd: 0.6 % AGENTS.md Know the ruler (same-binary SD; the effect is orders above it)
+condition: a quiet 5090 (no other compute process on it, the user's ComfyUI down, the witness block's card
+  line before and after), the file's pages resident (majflt 0 in the row), both arms at the same plan line
+  (n_l and card_expert_bytes copied from it), the base binary built in a worktree at the ink2mix commit (just
+  build-decode), the gate's dev print (host serve ms a visit, pp tok/s) read beside the row
+decide-in: land the pass: the host's batch is the wall, the next lever is the host's per-column cost (the
+  grouped tile over 512 rows as a GEMM, SIMD) before any overlap or PCIe change
+decide-below: under +650 %: read the dev print's serve ms a visit against 15.7; a serve over 22 ms means the
+  host cost per column is 40 % over the V4.1 fit (host kernel first); a serve near 15.7 with the visit longer
+  means the chain does not overlap the card's shadow (read the walk order)
+decide-above: over +1300 %: the host's cost per column is under the fit (NVFP4 and Q8_0 are cheaper than
+  V4.1's): re-derive the visit from the measured serve, and price the card's front and back and the PCIe
+  copies as the next terms

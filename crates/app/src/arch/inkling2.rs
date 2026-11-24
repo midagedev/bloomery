@@ -1,6 +1,6 @@
 //! The Inkling 2 session: [`Body`] behind the session's traits — its prompt as the rows passes
 //! ([`GpuModel::prompt_pass`]: the stores left where the ids' steps leave them, the head's argmax
-//! after the last row the call's; a placed load steps its ids) and its keep rule (the positions its rollback takes back). The
+//! after the last row the call's; a load with no pass steps its ids) and its keep rule (the positions its rollback takes back). The
 //! whole-card body opens by its own constructor ([`GpuModel::open`]), so the session plans
 //! nothing. The body lives in the gpu crate's own inkling2 arch, so it needs no feature.
 
@@ -12,10 +12,11 @@ use crate::{Keep, Prompt, cut_positions, keep_down_to};
 const WHAT: &str = "inkling2 session";
 
 impl Prompt for Body {
-    /// The ids as passes of rows ([`GpuModel::prompt_pass`]), one readback after the last; a
-    /// placed load (its experts the host's) has no pass and steps the ids one at a time.
+    /// The ids as passes of rows ([`GpuModel::prompt_pass`]), one readback after the last; a load
+    /// with no pass (a placed one the card had no room for the pass's buffers beside) steps the
+    /// ids one at a time.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        if m.body(WHAT)?.placed().is_some() {
+        if m.body(WHAT)?.pass_rows() == 0 {
             return m.step(ids);
         }
         m.prompt_pass(ids)

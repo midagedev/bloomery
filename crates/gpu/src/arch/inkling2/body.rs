@@ -57,7 +57,10 @@ use crate::kquant::Act;
 use crate::linear::conv_res::{ConvResArgs, ConvResKernels};
 use crate::linear::out_gate::{OutGateArgs, OutGateKernels};
 use crate::loop_control::{LoopControlArgs, LoopControlKernels, MAX_MODULES, scratch_len};
-use crate::model::{ChainBody, GpuModel, HostServed, block_count, refuse_scratch_past, stage_run};
+use crate::model::{
+    ChainBody, GpuModel, HostServed, block_count, refuse_reserve_past, refuse_scratch_past,
+    stage_run,
+};
 use crate::norm_proj::{self, F32Site, NormProjArgs, NormProjKernels, Q8Site};
 use crate::norm_proj_bf16::{self, Bf16Site, NormProjBf16Args, NormProjBf16Kernels};
 use crate::q38::{EmbedIo, Q38Kernels};
@@ -80,7 +83,7 @@ use model::arch::models::{LoopSpec, OutGate, Visit, visits};
 use model::placement::accepts::{self, Program};
 use model::placement::kernels::DownAct;
 use model::placement::{CardFormat, Plan};
-use placed::{LOAD_ROWS, Open, Placed, StepWalk, placed_map};
+use placed::{LOAD_ROWS, Open, Placed, PlacedPass, StepWalk, placed_map};
 use runtime::layer::hosted;
 use std::ops::Range;
 use std::sync::Arc;
@@ -568,10 +571,12 @@ impl GpuModel<Body> {
     /// file whose stacks the card leg does not run), the host tier over every routed layer and the
     /// embedding as a host row ([`placed`]). The step walks the file's visits, a looped trunk's
     /// included: a layer's host service is asked once a visit. The load runs no residency
-    /// machine. The prompt is stepped one id at a time. Refused by name: a plan of other than one
+    /// machine. The prompt runs as the prompt pass over the host tier's batch ([`placed`]) when
+    /// the card has room for the pass's buffers beside the load; a load with none steps its prompt
+    /// one id at a time ([`Body::pass_rows`] is 0). Refused by name: a plan of other than one
     /// stage card running every layer, a plan whose head is on no card, an expert tier card, a
     /// layer whose experts the card holds whole, a card share of a stack the card leg does not
-    /// run, and scratch past the plan's term for it.
+    /// run, pass buffers past the plan's reserve for them, and scratch past the plan's term for it.
     pub fn open_placed(
         file: Split,
         plan: &Plan<'_>,
@@ -623,17 +628,25 @@ impl GpuModel<Body> {
                     (hp.clone(), ctx),
                     (Some(halves), Some((open, card))),
                 )?;
-                let p = body.placed.as_mut().ok_or(GpuError::shape(
-                    PLAN,
-                    "a placed load without its placed side",
-                ))?;
-                p.prepare_step_union()?;
+                let reserve = inputs
+                    .pass_reserve(plan.ctx_max)
+                    .map_err(|e| GpuError::plan(PLAN, e))?;
+                let shape = pass::shape_of(hp, file)?;
+                body.attach_pass(gpu, (&shape, place::pass_rows(ctx)), reserve)?;
+                if body.pass.is_none() {
+                    let p = body.placed.as_mut().ok_or(GpuError::shape(
+                        PLAN,
+                        "a placed load without its placed side",
+                    ))?;
+                    p.prepare_step_union()?;
+                }
                 refuse_scratch_past(
                     PLAN,
                     plan,
                     card,
-                    body.scratch_bytes(),
-                    "the step's buffers, the host boundary, the slot map's copy",
+                    body.scratch_beside_pass(),
+                    "the step's buffers, the host boundary, the slot map's copy, the placed \
+                     pass's sums, places and route tables",
                 )?;
                 let p = body.placed.as_mut().ok_or(GpuError::shape(
                     PLAN,
@@ -1071,8 +1084,9 @@ impl Body {
         };
         let acts = Acts::new(stream, layers.iter().flat_map(Layer::sites))?;
         let pad = hp.n_vocab - hp.n_vocab_unpadded;
-        // The prompt pass and the verify run on the card's own experts: a placed load has neither
-        // (its prompt is stepped).
+        // The pass of a placed load is attached after the load ([`Body::attach_pass`]), once the
+        // card's room is known; its verify runs on the card's own experts, which a placed load has
+        // none of (its drafts are steps).
         let (pass, verify) = if placed.is_some() {
             (None, None)
         } else {
@@ -1126,6 +1140,41 @@ impl Body {
     #[must_use]
     pub fn placed(&self) -> Option<&Placed> {
         self.placed.as_ref()
+    }
+
+    /// The prompt pass for a placed body: its buffers and kernels at `rows` rows of `shape`, the
+    /// placed side's buffers beside them and the host tier's batch sets, when the card has room
+    /// for all of them now; a body with none steps its prompt. Load-time only. Refused by name:
+    /// pass buffers past the plan's `reserve` for them, and a body with no placed side.
+    fn attach_pass(
+        &mut self,
+        gpu: &Gpu,
+        (shape, rows): (&place::PassShape, usize),
+        reserve: u64,
+    ) -> Result<(), GpuError> {
+        const WHAT_A: &str = "inkling2::Body::attach_pass";
+        let placed = self
+            .placed
+            .as_mut()
+            .ok_or(GpuError::state(WHAT_A, "a placed load"))?;
+        let side = &placed.host.side;
+        let counts = side.hosted_set().into_iter().map(|l| side.n_card(l));
+        let need =
+            place::pass_bytes(shape, rows) + PlacedPass::bytes_at(shape, rows, counts) as u64;
+        if (gpu.alloc_room()? as u64) < need {
+            return Ok(());
+        }
+        let pass = pass::Pass::new(gpu, (shape, rows), &self.layers)?;
+        refuse_reserve_past(
+            WHAT_A,
+            "prompt pass buffers",
+            reserve,
+            pass.bytes() as u64,
+            "the row buffers, the activation forms, the routes and the scratch",
+        )?;
+        placed.attach_pass(gpu, PlacedPass::new(gpu, &placed.host.side, shape, rows)?)?;
+        self.pass = Some(pass);
+        Ok(())
     }
 
     /// The positions a rollback takes back, from the written end: every store is positional, so
@@ -1285,8 +1334,13 @@ impl Body {
     }
 
     fn scratch_bytes(&self) -> usize {
+        self.scratch_beside_pass() + self.pass.as_ref().map_or(0, pass::Pass::bytes)
+    }
+
+    /// The scratch the plan's scratch term holds: every buffer but the prompt pass's, which the
+    /// plan reserves by its own formula ([`place::pass_bytes`]).
+    fn scratch_beside_pass(&self) -> usize {
         self.s.bytes()
-            + self.pass.as_ref().map_or(0, pass::Pass::bytes)
             + self
                 .verify
                 .as_ref()

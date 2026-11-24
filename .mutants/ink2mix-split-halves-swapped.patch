@@ -1,0 +1,12 @@
+--- a/crates/gpu/src/arch/inkling2/body.rs
++++ b/crates/gpu/src/arch/inkling2/body.rs
+@@ -649,8 +649,8 @@
+ fn split_stack_names(l: usize) -> [String; 3] {
+     let fused = names::ffn_gate_up_exps(l);
+     [
+-        crate::w13_split::gate_of(&fused),
+         crate::w13_split::up_of(&fused),
++        crate::w13_split::gate_of(&fused),
+         names::ffn_down_exps(l),
+     ]
+ }

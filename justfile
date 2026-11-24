@@ -4706,7 +4706,9 @@ gate-inkling2-fold:
 
 # Inkling 2 Mini's UD-IQ3_XXS file under a 12 GB card budget (a 3060's), a share of every layer's routed experts on the card and the rest
 # on the host tier (gate_inkling2_mix's doc): the plan's split, then the file's whole-card load and its mixed load on the same seeded
-# prompt, the prompt's logits row within a band and the whole card's greedy ids fed to the mixed load within the Gaussian pin. Real tier only;
+# prompt, the prompt's logits row within a band and the whole card's greedy ids fed to the mixed load within the Gaussian pin; the mixed load's
+# prompt as the batched pass over the host tier (forced card, host and mixed picks against the whole card's pass and against the placed
+# steps, the host's slot count, a dev pp tok/s print beside the step's). Real tier only;
 # the file is the raw one of BLOOMERY_INK2_FOLD (`<raw file>,<folded copy>`), and the gate is deferred by name where it is unset.
 gate-inkling2-mix:
     BLOOMERY_MODEL=inkling2 ./tools/box.sh 'bash tools/ref/needs-env.sh gate-inkling2-mix BLOOMERY_INK2_FOLD && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features gpu --release --bin gate_inkling2_mix && BLOOMERY_CARD_BUDGET=12G BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_inkling2_mix --file "${BLOOMERY_INK2_FOLD%%,*}"'

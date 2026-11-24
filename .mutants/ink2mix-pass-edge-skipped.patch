@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/arch/inkling2/placed.rs
++++ b/crates/gpu/src/arch/inkling2/placed.rs
+@@ -308,7 +308,7 @@
+             ..
+         } = self;
+         let layer = &layers[l];
+-        if *loop_core == Some(l) {
++        if *loop_core == Some(usize::MAX) {
+             walk.pass_edge(v.pass)?;
+         }
+         let msg = *messages && v.pass > 0 && layer.ctrl.is_some();

@@ -15,8 +15,11 @@
 //! - the feed-forward block in the step's three parts over the rows ([`RowWalk::ffn_front`]: the
 //!   mix, the controller, the norm and the router's rows; [`RowWalk::ffn_shadow`]: the routed rows
 //!   on the grouped route GEMM, the table, gate·up, SiTU and down, then the card sum;
-//!   [`RowWalk::ffn_back`]: the post conv and the stream's sum): a placed body attaches its host
-//!   tier between them. Every visit routes its rows anew.
+//!   [`RowWalk::ffn_back`]: the post conv and the stream's sum). Every visit routes its rows anew.
+//!   A placed body runs the card's share of the experts on the same GEMMs behind a route table over
+//!   its slot map ([`RowWalk::hosted_shadow`]), and the host tier's batch serves the rest between
+//!   the front and the back ([`PlacedProgram`]: the rows' download, one union serve, the routed sum
+//!   the card's and the host's added as the step adds them).
 //!
 //! After the last visit the head's mix runs over the rows and the head over the last row, so the
 //! call's argmax and logits are the last position's, the first decode step's input.
@@ -28,7 +31,8 @@
 //! of 32 where the step's leg reads q8_1 at one scale a 128 values.
 //!
 //! The buffers are [`place::pass_bytes`] at the load's rows, the plan's reserve; the load refuses
-//! by name a pass that takes more.
+//! by name a pass that takes more. A placed load's side buffers ([`PlacedPass`]) sit beside them,
+//! under the plan's scratch term.
 //!
 //! A verify ([`rows`]) walks the same rows with the step's kernels where the prompt's differ: the
 //! mixes as the step's launch pair over the rows, the controllers as the step's launch pair at the
@@ -36,11 +40,12 @@
 //! the step's rel-bias flash at the rows' causal offsets, the routed rows on the step's card leg,
 //! and the head over every row; so each row is a step's bits.
 
+use super::placed::{PlacedPass, VisitLeg};
 use super::route::N_USED;
 use super::state::{self, VisitStore};
 use super::{
     Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Kernels, Layer, MIX_EPS, MSG_ATTN, MSG_FFN, MSG_K,
-    MSG_Q, MSG_V, WHAT, conv_scale, head_logits, tap_widths,
+    MSG_Q, MSG_V, Placed, WHAT, conv_scale, head_logits, layer_card_stacks, tap_widths,
 };
 use crate::arch::hybrid::{Site, WideCx, project_wide};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs};
@@ -48,8 +53,11 @@ use crate::attn_res_step::AttnResStepKernels;
 use crate::card_leg::{LegStacks, RouteIo};
 use crate::card_slots::{CardAcc, CardSlotKernels};
 use crate::fault::FaultSink;
-use crate::gemm::{GemmKernels, GemmRoute};
+use crate::gemm::{GemmKernels, GemmRoute, RouteSet};
 use crate::head::Head;
+use crate::host::BatchLeg;
+use crate::host::placed::{PlacedHost, PlacedSide};
+use crate::host::run::HostRun;
 use crate::kquant::Act;
 use crate::linear::conv_res::ConvResArgs;
 use crate::linear::out_gate::OutGateArgs;
@@ -64,13 +72,15 @@ use crate::routed_block::{RouteIn, RoutedRows};
 use crate::site::{self, SiteTy, WideActs, WideKernels};
 use crate::tensor::{Window, WindowMut, copy_row};
 use crate::weights::Weights;
-use crate::{Gpu, GpuError};
+use crate::{DeviceBufferRaw, Gpu, GpuError};
 use chain::linear::Ring;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
 use model::arch::inkling2::hparams::Hparams;
 use model::arch::inkling2::names;
 use model::arch::inkling2::place::{self, PassShape};
+use model::arch::models::Visit;
+use runtime::sched::{self, At, LayerProgram, Overlap, PortKind};
 
 #[path = "rows.rs"]
 pub(super) mod rows;
@@ -435,7 +445,8 @@ impl GpuModel<Body> {
             }
             let pass = body.pass.as_ref().ok_or(GpuError::state(
                 CALL,
-                "a whole-card load (a placed load's prompt is stepped)",
+                "a load with the pass's buffers (a placed load with no room for them steps its \
+                 prompt)",
             ))?;
             if let Some(f) = &pass.forced
                 && f.rows != ids.len()
@@ -524,7 +535,7 @@ impl Body {
         let pass = self
             .pass
             .as_mut()
-            .ok_or(GpuError::state(WHAT, "a whole-card load"))?;
+            .ok_or(GpuError::state(WHAT, "a load with the pass's buffers"))?;
         pass.forced = Some(PassForced {
             ids: DeviceBuffer::from_host(stream, ids)?,
             weights: DeviceBuffer::from_host(stream, weights)?,
@@ -553,7 +564,7 @@ impl Body {
         let pass = self
             .pass
             .as_mut()
-            .ok_or(GpuError::state(WHAT, "a whole-card load"))?;
+            .ok_or(GpuError::state(WHAT, "a load with the pass's buffers"))?;
         let (rows, ring) = (pass.rows, self.ring);
         let (floor, alpha) = (self.hp.log_floor, self.hp.log_alpha);
         pass.b
@@ -582,6 +593,7 @@ impl Body {
             ctx,
             s,
             verify,
+            placed,
             ..
         } = self;
         let Pass {
@@ -592,7 +604,7 @@ impl Body {
             ..
         } = pass
             .as_mut()
-            .ok_or(GpuError::state(WHAT, "a whole-card load"))?;
+            .ok_or(GpuError::state(WHAT, "a load with the pass's buffers"))?;
         let (forced, verify) = match &tail {
             Tail::Pass { at, .. } => (forced.as_ref().map(|f| (f, at.first)), None),
             Tail::Verify => (
@@ -630,23 +642,85 @@ impl Body {
             n_msg: 0,
             banked: false,
         };
-        r.embed()?;
         let core = hp.loop_.filter(|lp| lp.passes > 1);
-        for (slot, v) in visits.iter().enumerate() {
-            let l = v.layer as usize;
-            let layer = &layers[l];
-            if let Some(lp) = core
-                && l == lp.core_start
-            {
-                r.pass_edge(v.pass)?;
+        match placed.as_mut() {
+            None => {
+                r.embed()?;
+                for (slot, v) in visits.iter().enumerate() {
+                    let l = v.layer as usize;
+                    let layer = &layers[l];
+                    if let Some(lp) = core
+                        && l == lp.core_start
+                    {
+                        r.pass_edge(v.pass)?;
+                    }
+                    let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
+                    r.attn_half(slot, (l, layer), &mut stores[slot], msg)?;
+                    r.ffn_front(slot, layer, msg)?;
+                    r.ffn_shadow(slot, layer)?;
+                    r.ffn_back(slot, layer, &mut stores[slot])?;
+                    if let Some(t) = taps.as_mut() {
+                        r.tap(t, slot)?;
+                    }
+                }
             }
-            let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
-            r.attn_half(slot, (l, layer), &mut stores[slot], msg)?;
-            r.ffn_front(slot, layer, msg)?;
-            r.ffn_shadow(slot, layer)?;
-            r.ffn_back(slot, layer, &mut stores[slot])?;
-            if let Some(t) = taps.as_mut() {
-                r.tap(t, slot)?;
+            Some(p) => {
+                let Tail::Pass { at, .. } = &tail else {
+                    return Err(GpuError::state(
+                        CALL,
+                        "a prompt pass (a placed load has no verify)",
+                    ));
+                };
+                let b = &mut *r.b;
+                p.refresh_rows(
+                    gpu.stream(),
+                    at.ids,
+                    (&mut b.o, &mut b.pos, &mut b.n_keys),
+                    at.pos0,
+                )?;
+                r.embed_norm()?;
+                let Placed {
+                    host: PlacedHost { shell, side, .. },
+                    pass: Some(held),
+                    ..
+                } = p
+                else {
+                    return Err(GpuError::state(
+                        CALL,
+                        "a placed load holding the pass's side buffers",
+                    ));
+                };
+                let PlacedPass {
+                    hsum,
+                    places,
+                    map,
+                    routes,
+                    ..
+                } = held;
+                let leg = BatchLeg::new(gpu.stream(), &mut shell.hybrid, hsum, r.cap);
+                let mut leg = VisitLeg::new(leg, &visits[..]);
+                let mut prog = PlacedProgram {
+                    r,
+                    visits: &visits[..],
+                    loop_core: core.map(|lp| lp.core_start),
+                    messages: *messages,
+                    layers: &layers[..],
+                    stores: &mut stores[..],
+                    side,
+                    io: HostedIo {
+                        places,
+                        map,
+                        routes,
+                    },
+                    taps: taps.as_mut(),
+                };
+                let o = Overlap {
+                    units: 1,
+                    cols: m,
+                    port: PortKind::Batch,
+                };
+                sched::walk(o, visits.len(), &mut leg, &mut prog)?;
+                r = prog.r;
             }
         }
         let logits = (hp.softcap, hp.n_vocab_unpadded, hp.n_vocab);
@@ -665,6 +739,108 @@ enum Tail<'t, 'c> {
         kept: &'t mut Vec<Vec<f32>>,
     },
     Verify,
+}
+
+/// A hosted layer's buffers beside the pass's own ([`PlacedPass`]): the places of the visit's slots,
+/// the layer's row of the slot map and the route tables.
+struct HostedIo<'a> {
+    places: &'a mut DeviceBuffer<u32>,
+    map: &'a mut DeviceBuffer<u32>,
+    routes: &'a mut RouteSet,
+}
+
+/// A placed body's pass walk over the host tier's batch port ([`runtime::sched::walk`], one unit of
+/// the pass's rows, in the order front, shadow, serve, back): each visit's mixer half, the
+/// feed-forward block's router and the rows' download to the host (the front), the card's share of
+/// the experts under the host's union serve (the shadow), then the routed sum, the post conv and the
+/// stream's sum (the back). A walk's layer is the visit's index; the visit's stored layer names the
+/// weights, the slot map's row and the host service.
+struct PlacedProgram<'a> {
+    r: RowWalk<'a>,
+    visits: &'a [Visit],
+    /// The looped core's first stored layer, where a pass begins; `None` on a loopless file.
+    loop_core: Option<usize>,
+    /// Whether the visits of a pass past the first run their messages.
+    messages: bool,
+    layers: &'a [Layer],
+    stores: &'a mut [VisitStore],
+    side: &'a PlacedSide,
+    io: HostedIo<'a>,
+    taps: Option<&'a mut DeviceBuffer<f32>>,
+}
+
+impl<'a> LayerProgram for PlacedProgram<'a> {
+    type Port = VisitLeg<'a>;
+
+    fn host_leg(&self, at: At) -> bool {
+        self.side.hosted(self.visits[at.layer].layer as usize)
+    }
+
+    /// The visit's mixer half, the feed-forward front and router, and the download of the rows to
+    /// the host tier's batch set.
+    fn front(&mut self, leg: &mut VisitLeg<'a>, at: At) -> Result<(), GpuError> {
+        let k = at.layer;
+        let v = self.visits[k];
+        let l = v.layer as usize;
+        let PlacedProgram {
+            r,
+            layers,
+            stores,
+            side,
+            io,
+            loop_core,
+            messages,
+            ..
+        } = self;
+        let layer = &layers[l];
+        if *loop_core == Some(l) {
+            r.pass_edge(v.pass)?;
+        }
+        let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
+        r.attn_half(k, (l, layer), &mut stores[k], msg)?;
+        r.ffn_front(k, layer, msg)?;
+        let stored = leg.stored(at);
+        r.hosted_front(k, stored, (*side, &mut *io.places), &mut leg.leg)
+    }
+
+    /// The card's share of the layer's experts over the rows, under the host's serve; none on a
+    /// layer with no experts on the card.
+    fn shadow(&mut self, _leg: &mut VisitLeg<'a>, at: At) -> Result<(), GpuError> {
+        let k = at.layer;
+        let l = self.visits[k].layer as usize;
+        if self.side.n_card(l) == 0 {
+            return Ok(());
+        }
+        let PlacedProgram {
+            r,
+            layers,
+            side,
+            io,
+            ..
+        } = self;
+        r.hosted_shadow(k, (l, &layers[l]), side, io)
+    }
+
+    /// From the join on: the routed sum of the card's slots and the host's, the post conv and the
+    /// stream's sum.
+    fn back(&mut self, leg: &mut VisitLeg<'a>, at: At) -> Result<(), GpuError> {
+        let k = at.layer;
+        let l = self.visits[k].layer as usize;
+        let PlacedProgram {
+            r,
+            layers,
+            stores,
+            side,
+            taps,
+            ..
+        } = self;
+        r.hosted_sum(side.n_card(l) > 0, leg.leg.hsum())?;
+        r.ffn_back(k, &layers[l], &mut stores[k])?;
+        match taps.as_deref_mut() {
+            Some(t) => r.tap(t, k),
+            None => Ok(()),
+        }
+    }
 }
 
 /// One walk's borrowed parts and its counters (the step's [`super::Walk`]'s, over rows).
@@ -771,8 +947,8 @@ impl<'a> RowWalk<'a> {
         }
     }
 
-    /// The rows' embeddings, normed by the embedding norm into the stream, each row's position
-    /// and live key count beside them; the dense table over the rows.
+    /// The rows' embeddings from the card's table, then [`RowWalk::embed_norm`]: each row's
+    /// position and live key count beside them.
     fn embed(&mut self) -> Result<(), GpuError> {
         let (gpu, w, m, n) = (self.gpu, self.w, self.m, self.d.n);
         let b = &mut *self.b;
@@ -792,6 +968,15 @@ impl<'a> RowWalk<'a> {
                 n_keys: &mut b.n_keys,
             },
         )?;
+        drop((ids, pos0));
+        self.embed_norm()
+    }
+
+    /// The rows' embeddings (`o`, from the card's table or the host's) normed by the embedding
+    /// norm into the stream; the dense table over the rows.
+    fn embed_norm(&mut self) -> Result<(), GpuError> {
+        let (gpu, w, m, n) = (self.gpu, self.w, self.m, self.d.n);
+        let b = &mut *self.b;
         gpu.elem().enqueue_rms_norm(
             gpu.stream(),
             &b.o,
@@ -1429,6 +1614,126 @@ impl<'a> RowWalk<'a> {
             },
             moe,
         )
+    }
+
+    /// A hosted layer's front from the router: the picks a forced call names staged where the
+    /// router leaves its own, the places of the slots in the card's stacks (`HOST` for an expert
+    /// the card does not hold) and the download of the normed rows, weights and ids to the host
+    /// tier's next batch set. `at` is the stored layer of visit `slot`.
+    fn hosted_front(
+        &mut self,
+        slot: usize,
+        at: At,
+        (side, places): (&PlacedSide, &mut DeviceBuffer<u32>),
+        leg: &mut BatchLeg<'_, HostRun>,
+    ) -> Result<(), GpuError> {
+        let (gpu, m) = (self.gpu, self.m);
+        let stream = gpu.stream();
+        let slots = m * N_USED;
+        let Bufs {
+            fxn,
+            picks,
+            weights,
+            ..
+        } = &mut *self.b;
+        if let Some((f, first)) = self.forced {
+            let from = (slot * f.rows + first) * N_USED * 4;
+            let from_ids = Window::<u32>::of(&f.ids, from, slots)?;
+            let mut to_ids = WindowMut::<u32>::of_mut(picks, 0, slots)?;
+            to_ids.copy_from_device_raw(&from_ids, stream)?;
+            let from_wts = Window::<f32>::of(&f.weights, from, slots)?;
+            let mut to_wts = WindowMut::<f32>::of_mut(weights, 0, slots)?;
+            to_wts.copy_from_device_raw(&from_wts, stream)?;
+        }
+        side.places_rows(gpu, at.layer, (&*picks, m), places)?;
+        side.download_rows(leg, at, (&*fxn, &*weights, &*picks), &[])
+    }
+
+    /// A hosted layer's card share over the rows, under the host's serve: the route table built
+    /// through the stored layer `l`'s slot-map row (the host's slots get no tile), the rows in q8
+    /// blocks of 32, gate·up, SiTU, down, and the card sum of the slots the places put on the card,
+    /// in slot order, into `ffn_out`. The layer holds experts on the card.
+    fn hosted_shadow(
+        &mut self,
+        slot: usize,
+        (l, layer): (usize, &Layer),
+        side: &PlacedSide,
+        io: &mut HostedIo<'_>,
+    ) -> Result<(), GpuError> {
+        let (gpu, w, k, pk) = (self.gpu, self.w, self.k, self.pk);
+        let stream = gpu.stream();
+        let (n, m) = (self.d.n, self.m);
+        let fault = gpu.layer_sink(slot)?;
+        let n_card = side.n_card(l);
+        let stacks = layer_card_stacks(w, layer)?;
+        let block = stacks.block(self.d.ff, n)?;
+        let slots = m * N_USED;
+        let Bufs {
+            fxn,
+            picks,
+            weights,
+            x_rows,
+            g,
+            u,
+            h_rows,
+            ys,
+            ffn_out,
+            ..
+        } = &mut *self.b;
+        let table = io.routes.of_mut(CALL, l, n_card)?;
+        side.remap_row(stream, l, &mut *io.map)?;
+        k.g32
+            .enqueue_route_remap(stream, &*picks, &*io.map, slots, table, fault)?;
+        x_rows.enqueue_quantize(gpu, &k.g32, fxn, m, fault)?;
+        let (x128, x32) = x_rows.parts();
+        let (h128, h32) = h_rows.parts_mut();
+        block.enqueue_rule(
+            gpu,
+            (Some(&pk.gemm), &k.g32),
+            (&*table, N_USED),
+            slots,
+            (
+                RouteIo {
+                    x128,
+                    x32,
+                    g,
+                    u,
+                    h128,
+                    h32,
+                    y: ys,
+                },
+                self.act,
+            ),
+            fault,
+        )?;
+        pk.slots.enqueue_card_acc(
+            stream,
+            &CardAcc {
+                down: ys,
+                w: weights,
+                sel: &*io.places,
+                n,
+                m,
+                n_card,
+                n_used: N_USED,
+                w_pitch: N_USED,
+                fault,
+            },
+            ffn_out,
+        )
+    }
+
+    /// A hosted layer's routed sum from the join on, into `moe`: the card's sum (`ffn_out`) and the
+    /// host's `hsum` added where the layer holds experts on the card, the host's alone otherwise.
+    fn hosted_sum(&mut self, on_card: bool, hsum: &DeviceBuffer<f32>) -> Result<(), GpuError> {
+        let (gpu, len) = (self.gpu, self.m * self.d.n);
+        let stream = gpu.stream();
+        let Bufs { moe, ffn_out, .. } = &mut *self.b;
+        if on_card {
+            gpu.elem().enqueue_add(stream, &*ffn_out, hsum, len, moe)
+        } else {
+            copy_span(stream, (hsum, 0), (moe, 0), len)
+        }
     }
 
     /// The feed-forward block's back over the rows: the post conv of the routed sum, the

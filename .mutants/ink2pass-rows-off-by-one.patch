@@ -1,0 +1,19 @@
+# ink2pass (gate_inkling2_mix, the placed prompt pass): the batch walk hands the host one row
+# fewer than the pass holds, so the last position's host sum is never served (it reads the
+# previous visit's rows, or the leg refuses the column count by name).
+# Expected red (a named refusal or a numeric FAIL, in every table with a host slot):
+#   mix_pass_forced_host_picks_are_the_whole_card_pass FAIL
+#   mix_pass_forced_any_picks_are_the_whole_card_pass FAIL
+#   mix_pass_forced_host_picks_are_the_placed_steps FAIL
+#   mix_pass_forced_any_picks_are_the_placed_steps FAIL
+--- a/crates/gpu/src/arch/inkling2/pass.rs
++++ b/crates/gpu/src/arch/inkling2/pass.rs
+@@ -716,7 +716,7 @@
+                 };
+                 let o = Overlap {
+                     units: 1,
+-                    cols: m,
++                    cols: m - 1,
+                     port: PortKind::Batch,
+                 };
+                 sched::walk(o, visits.len(), &mut leg, &mut prog)?;

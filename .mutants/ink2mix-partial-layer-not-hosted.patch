@@ -1,0 +1,11 @@
+--- a/crates/gpu/src/host/placed.rs
++++ b/crates/gpu/src/host/placed.rs
+@@ -84,7 +84,7 @@
+             row_off[l] = map.row_offset(l).ok_or_else(|| {
+                 GpuError::shape(what, format!("layer {l}: a routed layer with no map row"))
+             })?;
+-            hosted[l] = on_card < shape.n_expert;
++            hosted[l] = on_card == 0;
+             if on_card > 0 {
+                 check(l, on_card)?;
+             }

@@ -25,14 +25,27 @@
 //!   margin of [`MARGIN_FLOOR`] or more are at most the pin the Gaussian error model gives at the
 //!   measured σ̂ of the two arms' logit rows, and σ̂ is under [`SIGMA_CEIL`]. The rows' relative
 //!   L2 is printed.
+//! - `mix_pass_attached`: the mixed load holds the prompt pass's buffers (`Body::pass_rows` is
+//!   `place::pass_rows` at the context) and they take no more than the plan's reserve for them
+//!   (`Inputs::pass_reserve`), so the prompts below run as passes, not steps.
+//! - `mix_pass_forced_{card,host,any}_picks_are_the_whole_card_pass`: the seeded prompt as one call
+//!   of the prompt pass (`GpuModel::prompt_pass_scored`, every position kept) on the whole card and
+//!   on the mixed load, every visit's picks forced to the step clauses' tables (`Body::force_pass_picks`:
+//!   a visit's picks repeated at every position), each position's logits row compared by relative L2
+//!   (the card table in its step band, the host and any tables within [`PASS_HOST_REL`]); and the host tier's batch service computes exactly the table's host
+//!   slots (none for the card table, every slot of every position of every visit for the host table,
+//!   at most that for the any table).
+//! - `mix_pass_forced_{card,host,any}_picks_are_the_placed_steps`: the mixed load's pass against its
+//!   own stepped prompt under the same tables, each position's row within [`PASS_STEPS_REL`].
 //!
 //! The two arms hold the same weights and run the same card launches on the card's slots; the
 //! mixed load's host share is dotted by the host tier's kernels, which quantize the activation on
 //! their own grid and sum in their own order, so the arms differ by that share's rounding and
 //! nothing else: a card sum left out, a shadow not run, a visit of the looped trunk whose
 //! pass edge or host service is wrong moves the row by order 1. Each arm's development timing
-//! (the steps' wall after [`DEV_WARM`] warm ones) is printed: development numbers, no lease. A
-//! step that raises the fault word ends the gate by name.
+//! (the steps' wall after [`DEV_WARM`] warm ones, and a prompt pass of [`DEV_P`] ids on the two
+//! loads that run one) is printed: development numbers, no lease. A step that raises the fault word
+//! ends the gate by name.
 
 #[cfg(feature = "gpu")]
 fn main() -> std::process::ExitCode {
@@ -56,7 +69,7 @@ mod gate {
     use bloomery_levers::{CARD_BUDGET, CARD_DONTNEED, HOST_LOCK, HOST_POPULATE, R8};
     use gguf::Split;
     use model::arch::Arch;
-    use model::arch::inkling2::place::Inputs;
+    use model::arch::inkling2::place::{self, Inputs};
     use model::placement::{Plan, PlanLevers};
     use std::path::PathBuf;
 
@@ -98,6 +111,26 @@ mod gate {
     /// PIN(2026-11-24): 1.5 times the first run's 0.277 (the 12G budget).
     const SIGMA_CEIL: f64 = 0.42;
 
+    /// The band of the mixed load's prompt pass against its own stepped prompt under one forced
+    /// table, the largest over the prompt's positions of the logits row's relative L2: the pass
+    /// reads its projections and routed rows on wider grids than the step's gemvs and leg
+    /// (`gate_inkling2_fold`'s pass-versus-steps row, every slot on another grid, 7.6e-3), and the
+    /// host's slots add the host dots' own grid, so the two stack to the order of 1e-2.
+    /// PIN(2026-11-24): 1.5 times the first run's 1.31e-2 (the host-only table, the 12G budget;
+    /// the card-only table 1.07e-2, the any table 9.7e-3).
+    const PASS_STEPS_REL: f64 = 2.0e-2;
+
+    /// The band of the mixed load's prompt pass against the whole card's pass under a forced table
+    /// with slots on the host or anywhere: both arms read the pass's grids, so the host dots' own
+    /// grid is the difference, as in [`HOST_REL`], at the pass's floor (the any table's rows sit
+    /// at that floor with 8 % of the slots hosted, as the host-only table's with all of them).
+    /// PIN(2026-11-24): 1.5 times the first run's 1.24e-2 (the any table, the 12G budget; the
+    /// host-only table 8.9e-3).
+    const PASS_HOST_REL: f64 = 1.9e-2;
+
+    /// The prompt length of the passes' development timing.
+    const DEV_P: usize = 512;
+
     /// Experts a visit's pick list holds (the router's top count).
     const N_USED: usize = 8;
 
@@ -110,6 +143,17 @@ mod gate {
         Host,
         /// Any id.
         Any,
+    }
+
+    impl Kind {
+        /// The table's name in the pass clauses.
+        fn tag(self) -> &'static str {
+            match self {
+                Kind::Card => "card",
+                Kind::Host => "host",
+                Kind::Any => "any",
+            }
+        }
     }
 
     /// The forced tables the gate runs, by clause name.
@@ -241,6 +285,85 @@ mod gate {
         Ok(rows)
     }
 
+    /// `per_visit`'s pick lists (`N_USED` entries a visit) each repeated at `rows` positions: the
+    /// pass's forced picks, visit-major, then position-major.
+    fn repeated<T: Copy>(per_visit: &[T], rows: usize) -> Vec<T> {
+        per_visit
+            .chunks(N_USED)
+            .flat_map(|c| (0..rows).flat_map(move |_| c.iter().copied()))
+            .collect()
+    }
+
+    /// The prompt as one call of the prompt pass with every visit's picks forced to `table` (a
+    /// visit's picks at every position): the logits row after each position, cut to the unpadded
+    /// vocabulary.
+    fn pass_forced(
+        m: &mut GpuModel<Body>,
+        prompt: &[u32],
+        table: &(Vec<u32>, Vec<f32>),
+        vocab: usize,
+    ) -> Result<Vec<Vec<f32>>, GateError> {
+        m.reset()?;
+        {
+            let (gpu, _, body) = m.body_parts(NAME)?;
+            let ids = repeated(&table.0, prompt.len());
+            let weights = repeated(&table.1, prompt.len());
+            body.force_pass_picks(gpu, (&ids, &weights), prompt.len())?;
+        }
+        let kept: Vec<usize> = (0..prompt.len()).collect();
+        let called = m.prompt_pass_scored(prompt, &kept);
+        m.body_parts(NAME)?.2.unforce_pass_picks();
+        let (_, rows) = called?;
+        rows.into_iter()
+            .map(|r| {
+                r.get(..vocab).map(<[f32]>::to_vec).ok_or_else(|| {
+                    GateError::from(format!(
+                        "{NAME}: a kept row of {} values under a vocabulary of {vocab}",
+                        r.len()
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    /// The wall in ms of the router's own prompt pass over `ids` after a warm call of an eighth of
+    /// them.
+    fn dev_pass_ms(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<f64, GateError> {
+        m.reset()?;
+        m.prompt_pass(&ids[..ids.len() / 8])?;
+        m.reset()?;
+        let t = std::time::Instant::now();
+        m.prompt_pass(ids)?;
+        Ok(t.elapsed().as_secs_f64() * 1e3)
+    }
+
+    /// The host tier's batch service so far: layer-batches served and host slots computed.
+    fn host_batch(m: &GpuModel<Body>) -> Result<(u64, u64), GateError> {
+        let s = m
+            .body(NAME)?
+            .placed()
+            .ok_or("the load has no placed side")?
+            .hybrid()
+            .stats();
+        Ok((s.batch_served, s.batch_host_slots))
+    }
+
+    /// Each position's relative L2 between two prompts' logits rows.
+    fn rows_rel(a: &[Vec<f32>], b: &[Vec<f32>]) -> Vec<f64> {
+        a.iter().zip(b).map(|(x, y)| rel(x, y)).collect()
+    }
+
+    /// `pos` as the clauses print it: the largest, then each position's.
+    fn summarize(pos: &[f64]) -> (f64, String) {
+        let max = pos.iter().copied().fold(0.0f64, f64::max);
+        let each = pos
+            .iter()
+            .map(|r| format!("{r:.1e}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        (max, each)
+    }
+
     /// The top-two gap of a logits row.
     fn margin(row: &[f32]) -> f32 {
         let (mut a, mut b) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
@@ -348,7 +471,7 @@ mod gate {
             plan.n_l.iter().copied().max().unwrap_or(0),
         );
         // The whole card first: the file as `GpuModel::open` holds it.
-        let (whole, whole_forced, tables) = {
+        let (whole, whole_forced, whole_passes, tables, dev) = {
             let whole_split =
                 Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
             let t = std::time::Instant::now();
@@ -373,7 +496,13 @@ mod gate {
                 .iter()
                 .map(|t| walk_forced(&mut m, &prompt, t, vocab))
                 .collect::<Result<Vec<_>, _>>()?;
-            (natural, forced, tables)
+            let passes = tables
+                .iter()
+                .map(|t| pass_forced(&mut m, &prompt, t, vocab))
+                .collect::<Result<Vec<_>, _>>()?;
+            let dev_ids: Vec<u32> = (0..DEV_P).map(|_| rng.below(vocab) as u32).collect();
+            let dev_ms = dev_pass_ms(&mut m, &dev_ids)?;
+            (natural, forced, passes, tables, (dev_ids, dev_ms))
         };
         let t = std::time::Instant::now();
         let mut m = match GpuModel::<Body>::open_placed(split, &plan, &inputs, 0, levers.host()) {
@@ -389,6 +518,21 @@ mod gate {
             m.resident_bytes()
         );
         ok &= placement(&inputs, &plan, Some(&m))?;
+        let attached = {
+            let body = m.body(NAME)?;
+            let (rows, made) = (body.pass_rows(), body.pass_made_bytes() as u64);
+            let want = place::pass_rows(CTX);
+            let reserve = inputs
+                .pass_reserve(CTX as u64)
+                .map_err(|e| format!("{NAME}: the pass reserve: {e}"))?;
+            let pass = rows == want && made <= reserve;
+            println!(
+                "mix_pass_attached rows={rows} want={want} pass_bytes={made} reserve={reserve} {}",
+                verdict(pass)
+            );
+            pass
+        };
+        ok &= attached;
         let before = m
             .body(NAME)?
             .placed()
@@ -413,6 +557,7 @@ mod gate {
             after.served - before.served,
             (after.straggle_ns - before.straggle_ns) as f64 * 1e-6 / steps as f64,
         );
+        let mut step_rows = Vec::with_capacity(TABLE_KINDS.len());
         for ((name, _, band), (table, whole_rows)) in
             TABLE_KINDS.iter().zip(tables.iter().zip(&whole_forced))
         {
@@ -433,6 +578,7 @@ mod gate {
                 verdict(pass)
             );
             ok &= pass;
+            step_rows.push(mixed_rows);
         }
         let lr = rel(&whole.rows[0], &mixed.rows[0]);
         let sigma = sigma_hat(&whole, &mixed);
@@ -455,6 +601,45 @@ mod gate {
             verdict(same)
         );
         ok &= same;
+        if attached {
+            let visits = m.body(NAME)?.visit_table().len();
+            let slots_all = (visits * PROMPT * N_USED) as u64;
+            for (i, (_, kind, band)) in TABLE_KINDS.iter().enumerate() {
+                let tag = kind.tag();
+                let (served0, slots0) = host_batch(&m)?;
+                let rows = pass_forced(&mut m, &prompt, &tables[i], vocab)?;
+                let (served1, slots1) = host_batch(&m)?;
+                let (served, slots) = (served1 - served0, slots1 - slots0);
+                let slots_ok = match kind {
+                    Kind::Card => slots == 0,
+                    Kind::Host => slots == slots_all,
+                    Kind::Any => slots <= slots_all,
+                };
+                let to_whole = rows_rel(&whole_passes[i], &rows);
+                let (max, each) = summarize(&to_whole);
+                let band = match kind {
+                    Kind::Card => *band,
+                    Kind::Host | Kind::Any => PASS_HOST_REL,
+                };
+                let pass = to_whole.iter().all(|r| r.is_finite()) && max <= band && slots_ok;
+                println!(
+                    "mix_pass_forced_{tag}_picks_are_the_whole_card_pass prompt={PROMPT} \
+                     max_rel={max:.3e} band={band:.1e} host_slots={slots} of {slots_all} \
+                     served={served} per-position: {each} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+                let to_steps = rows_rel(&step_rows[i], &rows);
+                let (max, each) = summarize(&to_steps);
+                let pass = to_steps.iter().all(|r| r.is_finite()) && max <= PASS_STEPS_REL;
+                println!(
+                    "mix_pass_forced_{tag}_picks_are_the_placed_steps prompt={PROMPT} \
+                     max_rel={max:.3e} band={PASS_STEPS_REL:.1e} per-position: {each} {}",
+                    verdict(pass)
+                );
+                ok &= pass;
+            }
+        }
         println!(
             "  dev whole card: {:.3} ms a step ({:.1} tok/s) after {DEV_WARM} warm ones, depth \
              ~{PROMPT}, ctx {CTX}; mixed: {:.3} ms a step ({:.1} tok/s) (development numbers: no \
@@ -464,14 +649,27 @@ mod gate {
             mixed.step_ms,
             1e3 / mixed.step_ms
         );
+        if attached {
+            let (dev_ids, whole_ms) = dev;
+            let placed_ms = dev_pass_ms(&mut m, &dev_ids)?;
+            let tok_s = |ms: f64| DEV_P as f64 * 1e3 / ms;
+            println!(
+                "  dev prompt pass P={DEV_P} (the router's picks): mixed {:.1} tok/s ({placed_ms:.1} \
+                 ms), whole card {:.1} tok/s ({whole_ms:.1} ms); the mixed load's stepped prompt \
+                 runs at its step rate, {:.1} tok/s (development numbers: no lease)",
+                tok_s(placed_ms),
+                tok_s(whole_ms),
+                1e3 / mixed.step_ms
+            );
+        }
         println!("{}", tier::tally_line());
         if !ok {
             return Err(checks_failed());
         }
         println!(
             "PASSED: {NAME}: the plan split every layer's experts between the card and the host, \
-             and the mixed load's prompt logits row and teacher-forced argmax held to the whole \
-             card's"
+             the mixed load's prompt logits row and teacher-forced argmax held to the whole \
+             card's, and its prompt pass to the whole card's pass and to its own steps"
         );
         Ok(())
     }
