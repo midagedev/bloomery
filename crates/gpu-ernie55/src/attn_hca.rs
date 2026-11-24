@@ -825,6 +825,22 @@ impl HcaState {
         Ok(())
     }
 
+    /// The FNV-1a 64 of every cache's bits, read back (synchronizes `stream`).
+    pub fn digest(&self, stream: &CudaStream) -> Result<u64, GpuError> {
+        let mut h = crate::body::DIGEST_BASIS;
+        for c in self.caches.iter().flatten() {
+            for tensor in [&c.ring, &c.rows] {
+                let v = tensor.buf().to_host_vec(stream)?;
+                h = crate::body::fold(h, v.into_iter().map(u32::from));
+            }
+            for buf in [&c.ring_kv, &c.ring_score] {
+                let v = buf.to_host_vec(stream)?;
+                h = crate::body::fold(h, v.into_iter().map(f32::to_bits));
+            }
+        }
+        Ok(h)
+    }
+
     /// The bytes the state holds on the card: its caches, staging, words and
     /// scratch.
     #[must_use]

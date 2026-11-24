@@ -280,6 +280,10 @@ impl Mixer for HcaMixer {
         self.st.reset(stream)
     }
 
+    fn cache_digest(&self, stream: &CudaStream) -> Result<u64, GpuError> {
+        self.st.digest(stream)
+    }
+
     /// The state's bytes (its caches, staging, words and scratch) and the layers' folded head
     /// mixes.
     fn bytes(&self) -> usize {
@@ -510,6 +514,13 @@ impl Mixer for LatentMixer {
         }
         self.last = None;
         Ok(())
+    }
+
+    fn cache_digest(&self, stream: &CudaStream) -> Result<u64, GpuError> {
+        self.states
+            .iter()
+            .flatten()
+            .try_fold(crate::body::DIGEST_BASIS, |h, st| st.digest(h, stream))
     }
 
     /// The states, the span's scratch, words and forms, the gather's tables and the folded head

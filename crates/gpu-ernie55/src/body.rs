@@ -51,6 +51,18 @@ pub(crate) const WHAT: &str = "ernie55::Body";
 /// The hyper-connection streams every layer reads and writes (`hyper_connection.count`).
 pub const HC: usize = 4;
 
+/// The offset of the cache digests' FNV-1a 64 fold.
+pub(crate) const DIGEST_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// `h` folded with `words`, each word's four bytes in order (FNV-1a 64).
+pub(crate) fn fold(h: u64, words: impl IntoIterator<Item = u32>) -> u64 {
+    words.into_iter().fold(h, |h, w| {
+        w.to_le_bytes()
+            .iter()
+            .fold(h, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3))
+    })
+}
+
 /// Bytes of an f32 on the card: the windows are byte-offset.
 const F32: usize = size_of::<f32>();
 
@@ -114,6 +126,10 @@ pub trait Mixer {
     /// Every cache back to the load's state: the next prompt writes the bits a fresh process
     /// writes.
     fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError>;
+
+    /// The FNV-1a 64 of every cache's bits, read back (synchronizes `stream`): what a gate holds
+    /// [`Mixer::reset`] to.
+    fn cache_digest(&self, stream: &CudaStream) -> Result<u64, GpuError>;
 
     /// The device bytes the caches, words and scratch hold.
     fn bytes(&self) -> usize;
@@ -552,6 +568,14 @@ impl Body {
             rows.weights.push(weights);
         }
         Ok(rows)
+    }
+
+    /// The digests of the HCA caches and of the MLA-DSA stores ([`Mixer::cache_digest`]).
+    pub fn cache_digests(&self, stream: &CudaStream) -> Result<[u64; 2], GpuError> {
+        Ok([
+            self.parts.hca.cache_digest(stream)?,
+            self.parts.mla.cache_digest(stream)?,
+        ])
     }
 
     /// Layer `l`'s last selection (synchronizes); `None` on an HCA layer or under the threshold.

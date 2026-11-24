@@ -1261,6 +1261,14 @@ impl MlaState {
         &self.keys
     }
 
+    /// `h` folded with both stores' bits, read back (synchronizes `stream`).
+    pub fn digest(&self, h: u64, stream: &CudaStream) -> Result<u64, GpuError> {
+        let cache = self.cache.buf().to_host_vec(stream)?;
+        let h = crate::body::fold(h, cache.into_iter().map(u32::from));
+        let keys = self.keys.buf().to_host_vec(stream)?;
+        Ok(crate::body::fold(h, keys.into_iter().map(f32::to_bits)))
+    }
+
     /// Fill both stores with NaN. Synchronizes `stream` per chunk; never inside a capture.
     pub fn reset(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
         fill_nan::<u16>(stream, self.cache.buf_mut(), NAN_F16)?;

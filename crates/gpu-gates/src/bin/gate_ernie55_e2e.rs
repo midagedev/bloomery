@@ -5,8 +5,8 @@
 //! and 7, an HCA layer with the dense lead, an HCA routed layer and an MLA-DSA routed layer),
 //! against the numpy f32 forward's sets of that cut (`tools/ref/ernie55_ref.py`, refset family
 //! `fx-np-ernie55`: `short`, 34 ids, and `long`, 2,328 ids, the one prompt past the indexer's
-//! top-k). The model opens through `Body::open_placed` of `bloomery-gpu-ernie55` in two arms of
-//! the one placement rule:
+//! top-k). The model opens through `Body::open_placed` of `bloomery-gpu-ernie55` in arms of the
+//! one placement rule:
 //!
 //! - `card`: the plan of the card in view, which holds every expert of the cut: the prompt runs as
 //!   the pass's units (`bloomery_gpu_ernie55::prompt`), the steps as the captured chain;
@@ -16,7 +16,13 @@
 //!   `bloomery-quantize` writes of the folder, named by [`HOSTED_GGUF`]: the folder's MXFP4
 //!   expert stacks are made at load, so no load from the folder splits a stack between the card
 //!   and the host. Without the argument the arm is refused by one printed line
-//!   ([`HOSTED_REFUSED`]), and the gate's verdict is the card arm's.
+//!   ([`HOSTED_REFUSED`]), and the gate's verdict is the card arm's;
+//! - `hosted-mid` (the hosted arm's file, opened again once the `hosted` arm is closed): the
+//!   residency a server runs by default ([`RESIDENT`], `mid-p0-s1`) over the same hosted load.
+//!   `short` is fed once, which gives the machine a usage; every routed layer's card set is then
+//!   reseeded (`SwapMachine::reseed`) to the experts that prompt picked first and the highest ids
+//!   after, so the card takes experts the plan left on the host into slots below its card count,
+//!   never the slot of their own id; `short`'s reference clauses run again over that layout.
 //!
 //! For each set and arm, against the writer's rows at the prompt's last positions:
 //!
@@ -41,6 +47,21 @@
 //!
 //! and the clauses that need no reference:
 //!
+//! - `residency_reads_promoted_experts` (`hosted-mid`): the reseed promoted at least one expert in
+//!   every routed layer (on the host before and on the card after, the card's copy of the slot map
+//!   read back each time), and the writer's picks at `short`'s last row include at least one
+//!   expert the card reads from a slot other than its id's, so the reference clauses that follow
+//!   are not a pass over the plan's own layout; what the MXFP4 card slot path does with such an
+//!   expert is what they hold to [`L_OUT_BAND`] and the rest.
+//! - `reset_is_fresh` (the card arm and `hosted`, before the arm's first reset): `long` as the
+//!   open's first prompt and again after a reset give the same token, taps, logits and selection
+//!   bit for bit, the bits a fresh process writes, which the mixers' reset and the body's reset
+//!   promise.
+//! - `reset_clears_the_caches` (the card arm): the HCA caches and the MLA-DSA stores, read back and
+//!   hashed, are the same after `long` and a reset as after `short` and a reset, and each moved
+//!   from what its prompt left. No prompt's output shows a cache the reset skipped, since every
+//!   cell a prompt reads it wrote first; the reset is the tripwire that makes a stray read loud
+//!   (the NaN of the MLA-DSA stores), and this holds the tripwire armed.
 //! - `opens_the_fixture`: each arm opens and carries the cut's three layers of their kinds; the
 //!   card arm hosts no layer, the hosted arm every routed one.
 //! - `graph_is_eager`: `short`'s prompt and [`GRAPH_STEPS`] greedy steps on the card arm in graph
@@ -87,9 +108,12 @@ mod gate {
     use crate::{folder, gate_card};
     use bloomery_gpu::GpuModel;
     use bloomery_gpu::folder::Model;
-    use bloomery_gpu::host::swap::Residency;
+    use bloomery_gpu::host::served::TierBody;
+    use bloomery_gpu::host::slots::HOST;
+    use bloomery_gpu::host::swap::{CardTable, Residency};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_ernie55::{Body, PASS_ROWS, TapRows};
+    use bloomery_gpu_gates::generate::Residence;
     use bloomery_gpu_gates::prompts::{
         GreedyRow, MARGIN_FLOOR, compare_forced, read_greedy, std_normal_cdf,
     };
@@ -147,8 +171,19 @@ mod gate {
     const FX_ARM: usize = 4 * SETS.len() + 1;
 
     /// The reference clauses of the card arm: [`FX_ARM`] and the stepped layer outputs a set, the
-    /// card arm's prompt running as the pass. The hosted arm, where it opens, adds [`FX_ARM`].
+    /// card arm's prompt running as the pass. The hosted arm, where it opens, adds [`FX_ARM`] and
+    /// [`FX_RESIDENT`].
     const FX_CARD: usize = FX_ARM + SETS.len();
+
+    /// The reference clauses of the `hosted-mid` arm: `short`'s four (its prompt steps and it
+    /// dumps no selection).
+    const FX_RESIDENT: usize = 4;
+
+    /// The residency a server runs by default: no pinned expert, one spare slot a routed layer.
+    const RESIDENT: Residency = Residency::Mid {
+        pinned: 0,
+        spares: 1,
+    };
 
     /// The argument that names the hosted arm's file, the cut's GGUF.
     const HOSTED_GGUF: &str = "--hosted-gguf";
@@ -158,7 +193,8 @@ mod gate {
         stacks are made at load, so no load from the folder splits them between the card and the \
         host; a hosted load needs the cut's GGUF bloomery-quantize writes (--hosted-gguf <file>)";
 
-    /// The host tier's configuration the load opens with: no lever is read.
+    /// The host tier's configuration the load opens with: no lever is read. A load under a
+    /// residency reads its host set in ([`open_arm`]).
     const HOST_CFG: HostCfg = HostCfg {
         populate: false,
         lock: false,
@@ -267,12 +303,14 @@ mod gate {
     }
 
     /// The fixture cut opened on the card in view, from `gguf` where given and else from the cut
-    /// folder, under a card-experts cap of half the routed experts where `capped`: the plan,
-    /// whether it hosts experts, and the model (with the pass where the card holds every expert).
+    /// folder, under a card-experts cap of half the routed experts where `capped` and the
+    /// residency `residency`: the plan, whether it hosts experts, and the model (with the pass
+    /// where the card holds every expert).
     fn open_arm(
         name: &'static str,
         capped: bool,
         gguf: Option<&Path>,
+        residency: Residency,
     ) -> Result<(Arm, bool), GateError> {
         let model: Model = match gguf {
             Some(path) => {
@@ -298,7 +336,11 @@ mod gate {
         let plan = Body::plan(&inputs, &machine, CTX as u64, &levers)?;
         let hosts = Body::plan_hosts(&plan, &inputs);
         let rows = (!hosts).then_some(PASS_ROWS);
-        let m = Body::open_placed(model, (&plan, &inputs), 0, HOST_CFG, (rows, Residency::Off))?;
+        let host = HostCfg {
+            populate: residency != Residency::Off,
+            ..HOST_CFG
+        };
+        let m = Body::open_placed(model, (&plan, &inputs), 0, host, (rows, residency))?;
         Ok((Arm { name, m }, hosts))
     }
 
@@ -566,6 +608,222 @@ mod gate {
         Ok(ok)
     }
 
+    /// A prompt's outputs: the answer, the taps, the logits and each layer's selection.
+    struct Walk {
+        token: u32,
+        taps: TapRows,
+        logits: Vec<f32>,
+        sel: Vec<Option<Vec<u32>>>,
+    }
+
+    /// `ids` from the model's position as one prompt, and what it left.
+    fn walk(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<Walk, GateError> {
+        let token = feed(m, ids)?;
+        let t = taps(m)?;
+        let logits = m.logits()?;
+        let (gpu, _, body) = m.body_parts(NAME)?;
+        let sel = (0..KINDS.len())
+            .map(|l| body.selection(gpu.stream(), l))
+            .collect::<Result<_, _>>()?;
+        Ok(Walk {
+            token,
+            taps: t,
+            logits,
+            sel,
+        })
+    }
+
+    /// The parts of `a` that are not `b`'s, bit for bit, by name.
+    fn differing(a: &Walk, b: &Walk) -> Vec<String> {
+        let mut d = Vec::new();
+        if a.token != b.token {
+            d.push("token".to_string());
+        }
+        if a.taps.rows != b.taps.rows {
+            d.push("rows".to_string());
+        }
+        for l in 0..a.taps.l_out.len() {
+            if !bits_equal(&a.taps.l_out[l], &b.taps.l_out[l]) {
+                d.push(format!("l_out-{l}"));
+            }
+            if a.taps.ids[l] != b.taps.ids[l] {
+                d.push(format!("ids-{l}"));
+            }
+            if !bits_equal(&a.taps.weights[l], &b.taps.weights[l]) {
+                d.push(format!("weights-{l}"));
+            }
+        }
+        if !bits_equal(&a.taps.raw, &b.taps.raw) {
+            d.push("raw".to_string());
+        }
+        if !bits_equal(&a.logits, &b.logits) {
+            d.push("logits".to_string());
+        }
+        if a.sel != b.sel {
+            d.push("selection".to_string());
+        }
+        d
+    }
+
+    /// Clause `reset_is_fresh` of one arm, whose model has run nothing: `s`'s prompt as the open's
+    /// first, then again after a reset, bit for bit.
+    fn reset_is_fresh(arm: &mut Arm, s: &Set) -> Result<bool, GateError> {
+        let clause = format!("reset_is_fresh set={} arm={}", s.name, arm.name);
+        if !tier::run_clause(&clause, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let fresh = walk(&mut arm.m, &s.prompt)?;
+        arm.m.reset()?;
+        let again = walk(&mut arm.m, &s.prompt)?;
+        let differs = differing(&fresh, &again);
+        let pass = differs.is_empty();
+        println!(
+            "reset_is_fresh set={} arm={} token={}/{} differs={differs:?} {}",
+            s.name,
+            arm.name,
+            fresh.token,
+            again.token,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The digests of the HCA caches and the MLA-DSA stores of the arm's model.
+    fn digests(arm: &mut Arm) -> Result<[u64; 2], GateError> {
+        let (gpu, _, body) = arm.m.body_parts(NAME)?;
+        Ok(body.cache_digests(gpu.stream())?)
+    }
+
+    /// Clause `reset_clears_the_caches` of one arm: after `long` and a reset the caches' digests
+    /// are those after `short` and a reset, and each moved off what its prompt left.
+    fn reset_clears_the_caches(
+        arm: &mut Arm,
+        (long, short): (&Set, &Set),
+    ) -> Result<bool, GateError> {
+        let clause = format!("reset_clears_the_caches arm={}", arm.name);
+        if !tier::run_clause(&clause, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let mut states = [([0u64; 2], [0u64; 2]); 2];
+        for (s, state) in [long, short].into_iter().zip(&mut states) {
+            arm.m.reset()?;
+            feed(&mut arm.m, &s.prompt)?;
+            let left = digests(arm)?;
+            arm.m.reset()?;
+            *state = (left, digests(arm)?);
+        }
+        let [(left, after_long), (_, after_short)] = states;
+        let pass = after_long == after_short && (0..2).all(|i| left[i] != after_long[i]);
+        println!(
+            "reset_clears_the_caches arm={} hca after_long={:016x} after_short={:016x} \
+             left_by_long={:016x} mla after_long={:016x} after_short={:016x} left_by_long={:016x} {}",
+            arm.name,
+            after_long[0],
+            after_short[0],
+            left[0],
+            after_long[1],
+            after_short[1],
+            left[1],
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// The card's copy of the slot map, read back (synchronizes the stream).
+    fn card_table(m: &mut GpuModel<Body>) -> Result<CardTable, GateError> {
+        let (gpu, _, body) = m.body_parts(NAME)?;
+        let parts = body
+            .residency_parts()
+            .ok_or("the load runs no residency machine")?;
+        Residence::of(gpu, parts.slots, parts.hybrid).table()
+    }
+
+    /// The reseed order of one routed layer of `n_expert` ids: the ids `picked` first, then every
+    /// other id from the highest, so the card's set after the reseed holds experts the plan left
+    /// on the host.
+    fn promote_order(picked: &[u32], n_expert: usize) -> Vec<u32> {
+        let mut order: Vec<u32> = Vec::with_capacity(n_expert);
+        for &id in picked {
+            if !order.contains(&id) {
+                order.push(id);
+            }
+        }
+        let high = u32::try_from(n_expert).expect("an expert count fits u32");
+        order.extend((0..high).rev().filter(|id| !picked.contains(id)));
+        order
+    }
+
+    /// The `hosted-mid` arm's clauses on `s`: its prompt fed once, every routed layer reseeded to
+    /// the experts that prompt picked, clause `residency_reads_promoted_experts`, then `s`'s
+    /// reference clauses over the layout the reseed made.
+    fn resident_clauses(arm: &mut Arm, s: &Set) -> Result<bool, GateError> {
+        let a = arm.name;
+        arm.m.reset()?;
+        feed(&mut arm.m, &s.prompt)?;
+        let first = taps(&mut arm.m)?;
+        let k = arm.m.body(NAME)?.shape().n_used;
+        let (layers, n_expert) = {
+            let (_, _, body) = arm.m.body_parts(NAME)?;
+            let parts = body
+                .residency_parts()
+                .ok_or("the load runs no residency machine")?;
+            let map = parts.hybrid.slots();
+            (map.layers(), map.n_expert())
+        };
+        let before = card_table(&mut arm.m)?;
+        let ranked: Vec<Vec<u32>> = layers
+            .clone()
+            .map(|l| promote_order(&first.ids[l], n_expert))
+            .collect();
+        let order: Vec<&[u32]> = ranked.iter().map(Vec::as_slice).collect();
+        arm.m
+            .residency_reseed(&order)?
+            .ok_or("the load reseeded no residency machine")?;
+        let after = card_table(&mut arm.m)?;
+        let mut ok = true;
+        let clause = format!("residency_reads_promoted_experts set={} arm={a}", s.name);
+        if tier::run_clause(&clause, Tag::SelfConsistency)? {
+            for (i, l) in layers.enumerate() {
+                let at = i * n_expert..(i + 1) * n_expert;
+                let (was, now) = (&before.entries()[at.clone()], &after.entries()[at]);
+                let off_id = |e: usize| now[e] != HOST && now[e] as usize != e;
+                let promoted = (0..n_expert)
+                    .filter(|&e| was[e] == HOST && now[e] != HOST)
+                    .count();
+                let moved = (0..n_expert).filter(|&e| off_id(e)).count();
+                let used = last_rows_u(&s.picks[l].0, k, 1)
+                    .iter()
+                    .filter(|&&id| off_id(id as usize))
+                    .count();
+                let pass = promoted >= 1 && used >= 1;
+                ok &= pass;
+                println!(
+                    "residency_reads_promoted_experts set={} arm={a} layer={l} promoted={promoted} \
+                     slot_not_id={moved} picks_on_them={used}/{k} {}",
+                    s.name,
+                    verdict(pass)
+                );
+            }
+        }
+        ok &= reference_clauses(arm, s)?;
+        Ok(ok)
+    }
+
+    /// The `hosted-mid` arm: the hosted file opened under [`RESIDENT`] (`opened`: whether clause
+    /// `opens_the_fixture` runs), its clauses on `s`, closed.
+    fn resident_arm(gguf: &Path, s: &Set, opened: bool) -> Result<bool, GateError> {
+        let (mut arm, hosts) = open_arm("hosted-mid", true, Some(gguf), RESIDENT)?;
+        let mut ok = if opened {
+            opens(&arm, hosts, true)?
+        } else {
+            true
+        };
+        let (gpu, _, body) = arm.m.body_parts(NAME)?;
+        body.arm_taps(gpu, TAP_ROWS)?;
+        ok &= resident_clauses(&mut arm, s)?;
+        Ok(ok)
+    }
+
     /// Clause `graph_is_eager`: `s`'s prompt and [`GRAPH_STEPS`] greedy steps in graph mode give
     /// the eager chain's ids and last logits row bit for bit, the chain captured from the reset
     /// model before any token, as a session's open captures it.
@@ -637,9 +895,9 @@ mod gate {
             .map(|&n| open_set("the reference clauses", n))
             .collect::<Result<_, _>>()?;
         let opened = tier::run_clause("opens_the_fixture", Tag::SelfConsistency)?;
-        let (mut card, card_hosts) = open_arm("card", false, None)?;
+        let (mut card, card_hosts) = open_arm("card", false, None, Residency::Off)?;
         let mut hosted = match &gguf {
-            Some(path) => Some(open_arm("hosted", true, Some(path))?),
+            Some(path) => Some(open_arm("hosted", true, Some(path), Residency::Off)?),
             None => {
                 println!("{HOSTED_REFUSED}");
                 None
@@ -655,22 +913,37 @@ mod gate {
                 return Err(checks_failed());
             }
         }
+        let named = |name: &str| {
+            sets.iter()
+                .find(|s| s.name == name)
+                .ok_or_else(|| format!("{NAME}: the sets hold no {name}"))
+        };
+        let (short, long) = (named(SHORT)?, named(LONG)?);
         let mut arms = vec![&mut card];
         arms.extend(hosted.as_mut().map(|(arm, _)| arm));
         for arm in arms {
             let (gpu, _, body) = arm.m.body_parts(NAME)?;
             body.arm_taps(gpu, TAP_ROWS)?;
+            ok &= reset_is_fresh(arm, long)?;
             for s in &sets {
                 ok &= reference_clauses(arm, s)?;
             }
         }
+        ok &= reset_clears_the_caches(&mut card, (long, short))?;
         let arms = if hosted.is_some() {
-            "card and hosted"
+            "card, hosted and hosted-mid"
         } else {
             "card, hosted refused"
         };
-        tier::expect_fixture_oracle(NAME, FX_CARD + hosted.as_ref().map_or(0, |_| FX_ARM))?;
+        // The hosted arm closes before its file opens again under the residency.
         drop(hosted);
+        if let Some(path) = &gguf {
+            ok &= resident_arm(path, short, opened)?;
+        }
+        tier::expect_fixture_oracle(
+            NAME,
+            FX_CARD + gguf.as_ref().map_or(0, |_| FX_ARM + FX_RESIDENT),
+        )?;
         ok &= graph_is_eager(&mut card.m, &sets[0])?;
         println!("{}", tier::tally_line());
         if !ok {
@@ -680,8 +953,9 @@ mod gate {
             "PASSED: {NAME} on {SETS:?}, arms {arms}: every layer within \
              {L_OUT_BAND:.1e}, the writer's picks with weights within {WEIGHTS_BAND:.1e}, the \
              selection within {SEL_SWAPS} swaps, the logits before and after MultiMax within \
-             {LOGITS_BAND:.1e}, the teacher-forced argmax within the pin; the graph is the eager \
-             chain"
+             {LOGITS_BAND:.1e}, the teacher-forced argmax within the pin; a reset model writes \
+             a fresh open's bits and holds its caches cleared; experts promoted into other slots are read within the same \
+             bands; the graph is the eager chain"
         );
         Ok(())
     }

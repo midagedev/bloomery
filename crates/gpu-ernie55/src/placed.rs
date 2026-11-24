@@ -192,7 +192,8 @@ impl Body {
                     ));
                 }
                 if !hosted_set.is_empty() {
-                    // Ten slots a token: no per-count handoff entry is built for it.
+                    // Ten slots a token have a handoff entry of their own (`HandoffSlots::Ten`), so this builds no sink;
+                    // a count with no entry gets the any-count tier sink.
                     side.sink_any_count(gpu.stream())?;
                     let hybrid = hosted_hybrid_at(
                         (gpu, file, plan),
