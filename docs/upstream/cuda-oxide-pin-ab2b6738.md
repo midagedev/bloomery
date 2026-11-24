@@ -91,6 +91,11 @@ showed up in our gates:
 
 Both rows, with repro steps, are in [`nvlabs-ledger.md`](nvlabs-ledger.md).
 
+## `#[verify]`
+
+This pin is the commit that brought cuda-oxide's preview Lean 4 verifier (#1851). What happened when we tried it on
+our kernels: [`verify-on-bloomery.md`](verify-on-bloomery.md).
+
 ## Thanks
 
 To the cuda-rust maintainers and to the authors of the PRs above: juliankang4, praveenperera, CanReader and
