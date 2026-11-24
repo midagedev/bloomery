@@ -3100,6 +3100,21 @@ gate-model-hf:
 gate-minimax31-folder:
     ./tools/box.sh 'bash tools/ref/needs-env.sh gate-minimax31-folder BLOOMERY_MM31_FOLDER && bash tools/gate.sh -p bloomery-model-hf --lib -- --ignored hw_the_minimax_folder_opens_as_the_m3_reader_reads_it --nocapture'
 
+# ERNIE 5.5 Flash Preview's two halves in one pass (host only, no card; the model folder is the profile's, tools/ref/models/ernie5_5.sh:
+# /models/ERNIE-5.5-Flash-Preview in the real tier, the cut tools/fixture-cuts/ernie55.json makes in /models/fixtures/ernie55 in the fixture tier).
+# The description: the config's keys, the header's reading, the layers' stores, the plan on one 32 GB card, the stems both halves name and the
+# refusals by name (crates/model/tests/ernie55_desc.rs and arch::ernie55, on a header built here from the loader's stem table). The loader: the
+# quantization config's 128 by 128 FP8 scales (a bare `linear_o_group_proj` among them) and MXFP4 experts (crates/hf), the `ernie5` pre-tokenizer
+# row and its bare BOS template, the gguf descriptor's stem types, and the checkpoint map on a toy folder of the three layer kinds with every
+# refusal by name. The seam (crates/model-hf/tests/ernie55_meta.rs): the folder's header through the map, read by the description's reader and
+# planned on a 5090 to the figures the description pinned (real: 3,347 card experts at 32,768 and 3,028 at 262,144; the cut: its 1,024), and the
+# folder's tokenizer open as `ernie5` with BOS id 2. Real tier only: the 140,457 tensor headers planned with no refusal into 1,552 tensors of
+# 155,069,470,588 bytes in 55 roles with the draft's 4,716 skipped. Both tiers: our ids equal the `tokenizers` package's on 117 cases (the cut's
+# tokenizer.json is the folder's file). Headers and the vocabulary only, no tensor byte. Predicted wall [derived: 128 header reads ~5 s measured,
+# a vocabulary load ~1 s, 117 short encodes, the description's tests under 1 s, a warm build]: under 2 min in the real tier, under 1 min in the fixture tier.
+gate-ernie55-meta:
+    BLOOMERY_MODEL=ernie5_5 ./tools/box.sh '. tools/ref/ref-paths.sh && export BLOOMERY_REF_MODEL=$MODEL && if [ "${BLOOMERY_TIER:-real}" = fixture ]; then ign=; else ign=--include-ignored; fi && bash tools/gate.sh -p bloomery-gguf --lib -- arch::ernie55 --nocapture && bash tools/gate.sh -p bloomery-model --lib -- arch::ernie55 --nocapture && bash tools/gate.sh -p bloomery-model --test ernie55_desc -- --nocapture && bash tools/gate.sh -p bloomery-hf --lib -- ernie unk_or_byte --nocapture && bash tools/gate.sh -p bloomery-model-hf --lib -- $ign arch::ernie55 --nocapture && bash tools/gate.sh -p bloomery-model-hf --test ernie55_meta -- --include-ignored --nocapture && bash tools/gate.sh --release -p bloomery-tokenizer --lib -- pretok::tests::ernie5 --nocapture && bash tools/gate.sh --release -p bloomery-tokenizer --test ernie55 -- --include-ignored --nocapture'
+
 # Reference sets (crates/refset, host only): the readers' unit tests, then every family's sets in place
 # against the family table — each complete, dumped from the file the tree runs, of the family's ik build.
 # The draft set's family needs the profile's DSPARK_MODEL, exported as the dspark recipes do.

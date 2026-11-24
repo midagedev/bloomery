@@ -208,7 +208,7 @@ impl OutGateKernels {
                     ),
                 ));
             }
-            OutGate::None | OutGate::Packed => {
+            OutGate::None | OutGate::Packed | OutGate::QLatent => {
                 return Err(GpuError::shape(
                     what,
                     format!(

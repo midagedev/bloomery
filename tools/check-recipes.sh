@@ -428,6 +428,8 @@ blk_releasebuildmac() { tool_selftest release/build-mac.sh; }
 # (pytools.K, the K-th line, run from the repository root), so the scheduler bounds them with every other unit.
 pytools_list() {
   selftests=(
+    "crates/tokenizer/tools/ernie55_pins.py --self-test"
+    "crates/tokenizer/tools/sweep_digits.py --self-test"
     "tools/affected-cards.py --self-test"
     "tools/bloomery/catalog.py --self-test"
     "tools/bloomery/manifest.py --self-test"
@@ -530,7 +532,7 @@ blk_pytools() {
   pytools_list
   if [ "$1" = list ]; then
     listed=$(printf '%s\n' "${selftests[@]}" | cut -d' ' -f1 | sort)
-    found=$(cd "$root" && grep -rlE -e '--self-test|"self-test"' --include='*.py' tools | grep -vx 'tools/recipes.py' | sort)
+    found=$(cd "$root" && grep -rlE -e '--self-test|"self-test"' --include='*.py' tools crates/tokenizer/tools | grep -vx 'tools/recipes.py' | sort)
     if [ "$listed" != "$found" ]; then
       echo "check-recipes: the Python tools with a self-test and the list this check runs differ (< listed, > found):" >&2
       diff <(echo "$listed") <(echo "$found") >&2 || true

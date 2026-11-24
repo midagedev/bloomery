@@ -2262,7 +2262,7 @@ fn check_for(
                         at(t.layer, Need::RoutedFormat(t.ty));
                     }
                 }
-                // The mimo2, solar2, mistral-large4 and hy4 bodies' rule: the
+                // The mimo2, solar2, mistral-large4, hy4 and ernie55 bodies' rule: the
                 // same — a stack passes when the common card leg runs its type
                 // (`kernels::card_runs`) or the host runs it by a qdot fused
                 // kernel at the stack's row width.
@@ -2270,7 +2270,8 @@ fn check_for(
                     Program::Mimo2Body
                     | Program::Solar2Body
                     | Program::MistralLarge4Body
-                    | Program::Hy4Body,
+                    | Program::Hy4Body
+                    | Program::Ernie55Body,
                 ) => {
                     if routed_unrun(t, crate::placement::kernels::card_runs) {
                         at(t.layer, Need::RoutedFormat(t.ty));

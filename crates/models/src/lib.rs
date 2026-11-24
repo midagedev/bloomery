@@ -226,6 +226,11 @@ pub enum Arch {
     /// block inputs as each sublayer's input, `situ` experts behind a biased sigmoid router, and
     /// the Mini's looped core. No program runs it yet.
     Inkling2,
+    /// Baidu ERNIE 5.5 Flash Preview: gated latent attention over compressed (HCA) rows on most
+    /// layers and an MLA layer with a DSA indexer every seventh, a dense lead, a latent mixture of
+    /// experts (two routers summed) beside a shared expert, and four-stream hyper-connections
+    /// whose RMS factor is `1 / (sqrt(mean) + eps)`. No program runs it yet.
+    Ernie55,
 }
 
 impl Arch {
@@ -260,6 +265,7 @@ impl Arch {
             Arch::KimiK3 => "kimi-k3",
             Arch::Hy4 => "hy_v4_flash",
             Arch::Inkling2 => "inkling2",
+            Arch::Ernie55 => "ernie5_5",
         }
     }
 }
@@ -497,6 +503,12 @@ pub enum OutGate {
     /// A projection of the layer input of its own (`attn_gate`) with one value per query head:
     /// a head's gate multiplies every value of that head alike.
     ProjHead,
+    /// A latent layer's: a projection of the layer's normed query latent of its own
+    /// (`attn_gate`), one value per row the output projection reads. Under
+    /// [`LatentOut::Plain`] those are the heads' outputs; under [`LatentOut::Grouped`] the
+    /// `groups × rank` rows the grouped projection writes, the gate sitting between that
+    /// projection and the final one.
+    QLatent,
 }
 
 impl Gqa {
@@ -535,8 +547,9 @@ pub struct Latent {
     /// rope-ness is the reader's to hold equal.
     pub cache: Source<()>,
     /// The gate on the heads' outputs before the output projection; [`OutGate::Proj`] is a
-    /// projection of the layer input of its own (`attn_gate`). [`OutGate::Packed`] and
-    /// [`OutGate::ProjHead`] are not a latent layer's.
+    /// projection of the layer input of its own (`attn_gate`); [`OutGate::QLatent`] reads the
+    /// normed query latent instead. [`OutGate::Packed`] and [`OutGate::ProjHead`] are not a
+    /// latent layer's.
     pub out_gate: OutGate,
     pub out: LatentOut,
     /// The raw positions attended; `None`: every position.
@@ -835,9 +848,9 @@ pub struct Moe {
     /// `expert_feed_forward_length`: one expert's values.
     pub expert_ff: u32,
     /// `moe_latent_size`: the routed experts read and write this many values,
-    /// the layer's input projected down to it before them (`ffn_latent_down`)
-    /// and their weighted sum projected back up after (`ffn_latent_up`);
-    /// `None`: they read and write the hidden row.
+    /// the layer's input projected down to it before them and their weighted
+    /// sum projected back up after (the stems are the file's: `ffn_latent_*`
+    /// or `ffn_routed_*`); `None`: they read and write the hidden row.
     pub latent: Option<u32>,
     /// `ffn_pre_exp_norm`: a weighted RMS norm on the experts' input — the
     /// latent, when they run in one — at the block norm's epsilon; `false`:
@@ -1026,6 +1039,17 @@ pub enum HcKind {
     /// Manifold-constrained: pre, post and comb mixes from one projection of
     /// the streams, the comb made doubly stochastic by Sinkhorn rounds.
     Mhc {
+        /// `hyper_connection.sinkhorn_iterations`.
+        sinkhorn: u32,
+        /// `hyper_connection.epsilon`: the floor on the mixes.
+        eps: f32,
+        mix: HcMix,
+        collapse: Collapse,
+    },
+    /// [`HcKind::Mhc`] with the streams' RMS factor `1 / (sqrt(mean) + rms_eps)` where `Mhc` takes
+    /// `1 / sqrt(mean + rms_eps)`, at the spec's `rms_eps`: the same mixes, the same Sinkhorn
+    /// rounds, the same floor `eps`.
+    MhcRoot {
         /// `hyper_connection.sinkhorn_iterations`.
         sinkhorn: u32,
         /// `hyper_connection.epsilon`: the floor on the mixes.

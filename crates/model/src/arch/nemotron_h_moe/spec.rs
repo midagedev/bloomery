@@ -491,8 +491,8 @@ mod tests {
         let moe = vec![Some(1), Some(4), Some(5)];
         assert_eq!(
             at(
-                "routed experts in a 16-value latent (ffn_latent_down before them, \
-                ffn_latent_up after their sum)"
+                "routed experts in a 16-value latent (a projection down before them, \
+                one up after their sum)"
             ),
             moe
         );

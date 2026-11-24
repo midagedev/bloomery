@@ -442,7 +442,7 @@ mod tests {
             ),
             (
                 Some(0),
-                "routed experts in a 512-value latent (ffn_latent_down before them, ffn_latent_up \
+                "routed experts in a 512-value latent (a projection down before them, one up \
                  after their sum)",
             ),
             (

@@ -1,0 +1,118 @@
+# Cases of the ERNIE 5.5 vocabulary (pre-tokenizer ernie5): English prose, Korean and Chinese and Japanese text with digits, the digit groups (right-aligned threes, runs past the 510-digit chunk, full-width and other scripts' decimal digits, the numbers that are no decimal digit), the Han and kana run edges, code and its punctuation, and the whitespace rules; one line a text, decoded as UTF-8 with the escapes \n \t \r \\ \xNN \uNNNN \UNNNNNNNN.
+Hello world
+Hello, world!
+The quick brown fox jumps over the lazy dog.
+\x20\x20leading and trailing\x20\x20
+tabs\tand\tspaces
+line one\nline two\n\nline four
+windows\r\nline endings\r\n
+a  b   c
+a \n b
+\n\n\n
+\x20
+\t
+\x20\x20
+don't I'm we've they'll you're she'd
+He said "hello" and left.
+CamelCaseWord and snake_case_word and kebab-case-word
+NASA FBI HTTP2 3D
+0
+7
+12
+123
+1234
+12345
+123456
+1234567
+12345678
+123456789
+1234567890
+12,345,678.90
+1,234,567
+2026-11-24
+10:30:45
+3.14159
+0.001
+007
+0x1F 0b101 1e10
+$100 and 50% and #1
++82-10-1234-5678
+10000000000000000000000
+12345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890
+１２３４５
+１２３４５６７
+٠١٢٣٤٥
+१२३४५६७
+১২৩৪৫৬৭৮
+5²3
+x²+y²=z²
+10³ and 2⁸
+½ ¼ ¾
+ⅷ Ⅷ Ⅻ
+①②③
+1½2
+12½345
+²³
+一二三四五六七八九十
+１２3４５6
+안녕하세요
+안녕하세요 세계
+대한민국의 수도는 서울입니다.
+한글은 세종대왕이 창제했다.
+한글 123 한글
+가격은 12,500원입니다.
+서울특별시 강남구 테헤란로 123길 45
+\u1112\u1161\u11ab\u1100\u1173\u11af
+카카오톡과 네이버 그리고 구글
+ㅋㅋㅋ ㅎㅎㅎ ㅠㅠ
+你好，世界！
+中文分词测试123
+今天天气很好，我们去公园玩吧。
+价格是￥1,299.00元
+人工智能（AI）发展迅速
+こんにちは世界
+カタカナとひらがなと漢字
+日本語のテキスト2026年
+ｱｲｳｴｵ
+abc中文def
+한글漢字ひらがなkana
+GPT-5 모델은 2026년 11월에 128K 컨텍스트로 출시되었다.
+Mixed 한국어 English 中文 日本語 text 12345.
+fn main() { println!("Hello, {}!", 42); }
+def f(x):\n    return x ** 2 + 1\n
+for i in range(10):\n    print(i)\n
+x = [i**2 for i in range(10)]
+SELECT * FROM users WHERE id = 1 AND name LIKE '%a%';
+#include <stdio.h>\nint main(void) { return 0; }\n
+if (a && b || !c) { x += 1; }
+https://example.com/path/to/page?query=1&other=2#frag
+user@example.com
+a.b.c.d
+.NET !important @user #tag --flag -v
+`code` and ``double`` and ```fence```
+// comment\n/* block */
+<div class="a">text</div>
+{"key": "value", "n": 123, "list": [1, 2, 3]}
+\\path\\to\\file.txt
+C:\\Users\\name
+~/.config/app/settings.toml
+1+1=2 and 3*4=12 and 8/2=4
+…ellipsis and —dash and –en
+“smart quotes” ‘single’
+naïve café résumé
+e\u0301 and a\u0308
+😀 hello 🎉 world 👍🏽
+👨‍👩‍👧‍👦
+tab\x0bvertical\x0cformfeed
+nbsp\u00a0here and ideographic\u3000space
+\u200bzero width\u200b
+αβγ δεζ Ελληνικά
+Привет, мир! Это тест.
+مرحبا بالعالم
+שלום עולם
+สวัสดีชาวโลก
+ünïcödé
+ǅ ǈ ǋ
+ß ẞ ŉ
+$
+x

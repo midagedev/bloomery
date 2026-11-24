@@ -245,6 +245,7 @@ gate-llama-meta	family	llama	meta	arch_registry
 gate-lfm3-meta	family	lfm3	meta	arch_registry
 gate-mimo2-meta	family	mimo2	meta	arch_registry
 gate-minimax31-folder	family	minimax-m3	by-hand	arch_registry
+gate-ernie55-meta	family	ernie5_5	meta	arch_registry+checkpoint_folder+placement_sizing+tokenizer_jinja
 gate-model-hf	common		host	arch_registry+checkpoint_folder
 gate-models	common		host	arch_registry
 gate-model-host	common		host	model_host_ops+threads_pool+residency

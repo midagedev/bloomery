@@ -17,9 +17,9 @@ use super::coverage::Available;
 use super::draft::Rule;
 use super::{
     Arch, DEEPSEEK4, GEMMA_EMBEDDING, GEMMA_EMBEDDING2, GLM5_NEXT_LLAMA_CPP, INKLING2_LOOP,
-    QWEN35_BODY, Read, deepseek41, draft, flint, gemma_embedding, gemma_embedding2, glm5next, hy4,
-    inkling2, kimi_k3, lfm3, llama, mimo2, minimaxm3, mistrallarge4, musespark, nemotron_h,
-    nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
+    QWEN35_BODY, Read, deepseek41, draft, ernie55, flint, gemma_embedding, gemma_embedding2,
+    glm5next, hy4, inkling2, kimi_k3, lfm3, llama, mimo2, minimaxm3, mistrallarge4, musespark,
+    nemotron_h, nemotron_h_moe, qwen3moe, qwen35moe, raon1, solar2,
 };
 use crate::placement::PlacementError;
 
@@ -484,6 +484,14 @@ pub static ROWS: &[ArchRow] = &[
         })),
     },
     ArchRow {
+        arch: Some(Arch::Ernie55),
+        names: &["ernie5_5"],
+        read: Some(ernie55::spec::read),
+        draft: None,
+        coverage: Some(ernie55::spec::AVAILABLE),
+        fixture: Some(Fixture::Cut(CutRow { family: "ernie55" })),
+    },
+    ArchRow {
         arch: Some(Arch::Inkling2),
         names: &["inkling2", INKLING2_LOOP],
         read: Some(inkling2::spec::read),
@@ -703,6 +711,7 @@ mod tests {
             "kimi-k3" | "kimi-k31" => kimi_k3::spec::read,
             "hy_v4_flash" => hy4::spec::read,
             "inkling2" | INKLING2_LOOP => inkling2::spec::read,
+            "ernie5_5" => ernie55::spec::read,
             other => panic!("{other}: no reader is named for it"),
         }
     }
@@ -753,6 +762,7 @@ mod tests {
             Arch::KimiK3,
             Arch::Hy4,
             Arch::Inkling2,
+            Arch::Ernie55,
         ] {
             let rows = ROWS.iter().filter(|r| r.arch == Some(arch)).count();
             assert_eq!(rows, 1, "{arch:?} is in {rows} rows");
@@ -805,7 +815,7 @@ mod tests {
                 "inkling2"
             ]
         );
-        assert_eq!(archs_of(false), ["minimax-m3", "exaone-moe"]);
+        assert_eq!(archs_of(false), ["minimax-m3", "exaone-moe", "ernie5_5"]);
     }
 
     /// A row's fixture family is the directory `tools/fixture-dirs.tsv` gives its architecture (refset

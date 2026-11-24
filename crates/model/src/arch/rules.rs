@@ -340,6 +340,57 @@ static ROWS: &[ArchRules] = &[
             chat: "the file's own template, read by models' formats table (no parser of this family's markup runs yet)",
         },
     },
+    ArchRules {
+        // V is the vLLM-ERNIE source the checkpoint's reference graph is: `mhc.py`, `nvidia/moe.py`
+        // and `nvidia/model.py`.
+        arch: Arch::Ernie55,
+        // The latent layers' rope part and the HCA layers' rotated tail are paired (2i, 2i + 1).
+        pairs: RopeMode::NormTail,
+        // `situ` bounds its gate and up itself; no clamp key is read.
+        clamp: ClampOrder::None,
+        // The kept weights divide by their sum floored at 1e-20, then scale per expert.
+        router_norm: RouterNorm::SelectedSum,
+        // No layer falls back: every layer ropes.
+        rope_fallback: None,
+        facts: &[
+            (
+                "router = sigmoid(gate) + sigmoid(gate_1), selection adds exp_probs_b",
+                "V moe.py split_sigmoid_sum, ernie5_5_routing: the kept scores are the unbiased sums",
+            ),
+            (
+                "kept weights = renormalized, times the learned per-expert ffn_exp_scale",
+                "V moe.py _ernie5_5_routing_torch: weights / max(sum, 1e-20) * scale[ids]; the header's scale is only its initial value",
+            ),
+            (
+                "mHC RMS factor = 1 / (sqrt(mean) + eps), pre and sinkhorn floor = hyper_connection.epsilon",
+                "V mhc.py:6 and mhc_kernels.py:84: the factor differs from rsqrt(mean + eps)",
+            ),
+            (
+                "mHC post multiplier = 2.0",
+                "V model.py hc_post_alpha: the config has no key for it",
+            ),
+            (
+                "indexer rope = NeoX over the leading rope.dimension_count values, plain base",
+                "V attention.py:949-957: the layer's own rope is pairwise",
+            ),
+            (
+                "indexer key norm = LayerNorm at 1e-6",
+                "V attention.py:947: k_norm = LayerNorm(head_dim, eps=1e-6)",
+            ),
+            (
+                "YaRN = HCA layers only, at the compress base; latent layers and the indexer rope plain",
+                "V config.py:188-191 mla_rope_parameters",
+            ),
+        ],
+        chat: ChatParsers::FromTemplate,
+        sources: RuleSources {
+            pairs: "V attention.py:1195-1199: the latent layer's rope is not NeoX",
+            clamp: "V moe.py: the experts' activation is situ, no clamp key",
+            router_norm: "V moe.py _ernie5_5_routing_torch: weights / sum.clamp_min(1e-20)",
+            rope_fallback: "V attention.py: every layer builds a rope",
+            chat: "the file's own template, read by models' formats table (no parser of this family's markup runs yet)",
+        },
+    },
 ];
 
 /// The description row of `arch`, the file's own architecture string; `None`

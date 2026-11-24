@@ -18,6 +18,7 @@ pub mod delta_mla;
 pub mod dflash2;
 pub mod draft;
 pub mod dspark;
+pub mod ernie55;
 pub mod flint;
 pub mod gemma_embedding;
 pub mod gemma_embedding2;
@@ -245,6 +246,11 @@ pub enum Arch {
     /// experts behind a biased sigmoid router, and the Mini's loop. No executable program is
     /// registered.
     Inkling2,
+    /// Baidu ERNIE 5.5 Flash Preview (`ernie55`): gated latent attention over compressed rows
+    /// with an MLA and DSA-indexer layer every seventh, a latent mixture of experts of two summed
+    /// routers beside a shared expert, and four-stream hyper-connections. No executable program is
+    /// registered.
+    Ernie55,
 }
 
 impl Arch {
@@ -285,6 +291,7 @@ impl Arch {
             "kimi-k3" | "kimi-k31" => Ok(Arch::KimiK3),
             gguf::arch::hy_v4_flash::ARCH => Ok(Arch::Hy4),
             "inkling2" | INKLING2_LOOP => Ok(Arch::Inkling2),
+            gguf::arch::ernie55::ARCH => Ok(Arch::Ernie55),
             other => Err(ModelError::UnknownArchitecture(other.to_string())),
         }
     }
@@ -318,6 +325,7 @@ impl Arch {
             Arch::KimiK3 => "kimi-k3",
             Arch::Hy4 => gguf::arch::hy_v4_flash::ARCH,
             Arch::Inkling2 => "inkling2",
+            Arch::Ernie55 => gguf::arch::ernie55::ARCH,
         }
     }
 }
@@ -1393,6 +1401,7 @@ mod tests {
             Arch::KimiK3,
             Arch::Hy4,
             Arch::Inkling2,
+            Arch::Ernie55,
         ] {
             assert_eq!(Arch::from_name(a.name()).unwrap(), a);
         }

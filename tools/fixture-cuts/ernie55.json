@@ -1,0 +1,56 @@
+{
+  "name": "ernie55",
+  "arch": "ernie5_5",
+  "source": "baidu/ERNIE-5.5-Flash-Preview",
+  "rev": "ace1100dcde7bf4eb06add6ae11ce4f43a11ddfe",
+  "expect": {"tensors": 140457, "data_bytes": 165882599176},
+  "layers": [0, 1, 7],
+  "layer_prefix": "model.layers.",
+  "keep": [
+    "model.embed_tokens.weight",
+    "lm_head.weight",
+    "model.norm.weight",
+    "model.lm_head.multimax_ranges",
+    "model.lm_head.multimax_ts",
+    "model.mhc_contract.hc_head_base",
+    "model.mhc_contract.hc_head_fn",
+    "model.mhc_contract.hc_head_scale"
+  ],
+  "drop": ["model.mtp."],
+  "copy": [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "generation_config.json"
+  ],
+  "widths": {
+    "dense_ff": {"keep": 1024, "align": 128},
+    "expert_ff": {"keep": 512, "align": 128}
+  },
+  "planes": [
+    {"base": "mlp.gate_proj", "axis": "rows", "width": "dense_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.up_proj", "axis": "rows", "width": "dense_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "mlp.down_proj", "axis": "cols", "width": "dense_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "block_sparse_moe.shared_experts.w1", "axis": "rows", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "block_sparse_moe.shared_experts.w3", "axis": "rows", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "block_sparse_moe.shared_experts.w2", "axis": "cols", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": {"along": 128, "rows": 128}}},
+    {"base": "block_sparse_moe.experts.*.w1", "axis": "rows", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": 1}},
+    {"base": "block_sparse_moe.experts.*.w3", "axis": "rows", "width": "expert_ff",
+     "members": {"weight": 1, "weight_scale_inv": 1}},
+    {"base": "block_sparse_moe.experts.*.w2", "axis": "cols", "width": "expert_ff",
+     "members": {"weight": 2, "weight_scale_inv": 32}}
+  ],
+  "config": {
+    "layer_count": "num_hidden_layers",
+    "widths": {"intermediate_size": "dense_ff", "moe_intermediate_size": "expert_ff"},
+    "per_layer": ["compress_ratios"],
+    "layer_names": [],
+    "set": {"dspark_target_layer_ids": [0, 1, 2]}
+  }
+}

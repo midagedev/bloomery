@@ -7,6 +7,7 @@ use serde_json::Value as Json;
 use crate::folder::{self, FolderMap};
 
 pub mod deepseek41;
+pub mod ernie55;
 pub mod exaone_moe;
 pub mod glm5next;
 pub mod inkling2;
@@ -80,6 +81,11 @@ pub const MAPS: &[MapRow] = &[
         model_types: <inkling2::Checkpoint as FolderMap>::MODEL_TYPES,
         open: folder::open_as::<inkling2::Checkpoint>,
         architecture: folder::architecture_as::<inkling2::Checkpoint>,
+    },
+    MapRow {
+        model_types: <ernie55::Checkpoint as FolderMap>::MODEL_TYPES,
+        open: folder::open_as::<ernie55::Checkpoint>,
+        architecture: folder::architecture_as::<ernie55::Checkpoint>,
     },
 ];
 

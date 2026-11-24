@@ -78,7 +78,8 @@ pub enum Format {
     Fp8Channel,
     /// F8_E4M3 with one scale a tensor.
     Fp8Tensor,
-    /// OCP MXFP4: U8 or I8 E2M1 pairs, one E8M0 scale a 32 values.
+    /// OCP MXFP4: U8 or I8 E2M1 pairs, one E8M0 scale a 32 values (`weight_scale`, `scale` or
+    /// `weight_scale_inv`).
     Mxfp4,
     /// compressed-tensors pack-quantized: eight symmetric int4 an I32, one scale a `group` values.
     Int4Pack {
@@ -1061,7 +1062,7 @@ impl Other {
             q.get("store_dtype").and_then(Value::as_str),
         ) {
             (None, None) => false,
-            (Some("fp4"), None) | (None, Some("mxfp4")) => true,
+            (Some("fp4" | "mxfp4"), None) | (None, Some("mxfp4")) => true,
             (e, s) => return Err(refuse(&format!("expert_dtype {e:?} store_dtype {s:?}"))),
         };
         if q.get("mxfp4_block_size")
@@ -1228,6 +1229,17 @@ pub struct Plan {
     pub input_scales: Vec<String>,
 }
 
+/// The F8_E4M3 tensor `name` that carries no `.weight` suffix and is a weight all the same: the
+/// table holds its block scale beside it as `<name>_scale_inv`. Its module is the name itself.
+fn bare_weight<'a>(
+    name: &'a str,
+    dtype: Dtype,
+    table: &BTreeMap<&str, (Dtype, &[usize])>,
+) -> Option<&'a str> {
+    (dtype == Dtype::F8E4M3 && table.contains_key(format!("{name}_scale_inv").as_str()))
+        .then_some(name)
+}
+
 /// The companion suffixes a weight's format reads.
 const COMPANIONS: [&str; 12] = [
     "weight_scale",
@@ -1262,6 +1274,7 @@ pub fn plan<'a>(
         let Some(module) = name
             .strip_suffix(".weight")
             .or_else(|| name.strip_suffix(".weight_packed"))
+            .or_else(|| bare_weight(name, dtype, &table))
         else {
             continue;
         };
@@ -1329,7 +1342,7 @@ pub fn plan<'a>(
             {
                 true
             }
-            _ => name.contains(".weight_scale."),
+            _ => name.contains(".weight_scale.") || name.ends_with("_scale_inv"),
         };
         let why = if companion {
             "a companion no placed weight reads".to_string()
@@ -1524,10 +1537,15 @@ fn layout(
     }
     let &[rows, cols] = shape else { return None };
     // The first of `suffixes` beside the weight (or, for a shared scale, beside `owner`) that is
-    // one of `dtypes` and of `want`'s shape.
+    // one of `dtypes` and of `want`'s shape. A weight stored without `.weight` is its own module
+    // and its companions are named `<name>_scale_inv`.
+    let bare = module == name;
     let find = |at: &str, suffixes: &[&str], dtypes: &[Dtype], want: &dyn Fn(&[usize]) -> bool| {
         suffixes.iter().find_map(|s| {
-            let n = format!("{at}.{s}");
+            let n = match (bare && at == module, s.strip_prefix("weight_")) {
+                (true, Some(tail)) => format!("{at}_{tail}"),
+                _ => format!("{at}.{s}"),
+            };
             let &(d, sh) = table.get(n.as_str())?;
             (dtypes.contains(&d) && want(sh)).then_some(n)
         })
@@ -1638,7 +1656,7 @@ fn layout(
             }
             out.push(find(
                 module,
-                &["weight_scale", "scale"],
+                &["weight_scale", "scale", "weight_scale_inv"],
                 &[Dtype::U8, Dtype::F8E8M0],
                 &|s| s == [rows, k / 32],
             )?);
@@ -2566,6 +2584,75 @@ mod tests {
             );
         }
         assert_eq!(c.declared("model2.layers.3", || None), (vec![], None));
+    }
+
+    /// ERNIE 5.5's quantization config (`fp8`, 128 by 128 blocks, `expert_dtype` `mxfp4`) places
+    /// its folder's tensors: a dense weight beside its f32 `weight_scale_inv` is FP8 128-blocks
+    /// (a grid rounds up, 576 rows are five rows of blocks), a weight stored with no `.weight`
+    /// (`linear_o_group_proj`) reads its scale at `<name>_scale_inv`, and a routed expert is I8
+    /// pairs beside an E8M0 `weight_scale_inv` a 32 values, MXFP4. A scale of another grid, an F8
+    /// weight with no scale, a scale with no weight and an `expert_dtype` of another name are
+    /// refused by name. Mutant: `"mxfp4"` left out of the accepted `expert_dtype`s, or
+    /// `weight_scale_inv` left out of MXFP4's scale names.
+    #[test]
+    fn an_ernie_folder_plans_fp8_blocks_and_mxfp4_experts() {
+        use Dtype::*;
+        let q = |expert: &str| {
+            serde_json::json!({ "quantization_config": {
+                "activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+                "expert_dtype": expert, "scale_fmt": "ue8m0", "weight_block_size": [128, 128] } })
+        };
+        let c = Config::parse(&q("mxfp4"), None).unwrap();
+        let t: &[(&str, Dtype, &[usize])] = &[
+            ("m.attn.q_a.weight", F8E4M3, &[1024, 4096]),
+            ("m.attn.q_a.weight_scale_inv", F32, &[8, 32]),
+            ("m.attn.kv_a.weight", F8E4M3, &[576, 4096]),
+            ("m.attn.kv_a.weight_scale_inv", F32, &[5, 32]),
+            ("m.attn.o_group", F8E4M3, &[8192, 4096]),
+            ("m.attn.o_group_scale_inv", F32, &[64, 32]),
+            ("m.moe.experts.0.w1.weight", I8, &[2048, 1024]),
+            ("m.moe.experts.0.w1.weight_scale_inv", F8E8M0, &[2048, 64]),
+            ("m.moe.experts.1.w1.weight", I8, &[2048, 1024]),
+            ("m.moe.experts.1.w1.weight_scale_inv", F8E8M0, &[2048, 32]),
+            ("m.attn.lone", F8E4M3, &[128, 128]),
+            ("m.attn.stray_scale_inv", F32, &[1, 1]),
+            ("m.norm.weight", Bf16, &[4096]),
+        ];
+        let p = plan(&c, t.iter().copied(), |_| None);
+        let got = |n: &str| p.placed.get(n).map(|pl| (pl.format, pl.companions.clone()));
+        assert_eq!(
+            got("m.attn.q_a.weight").unwrap(),
+            (B128, vec!["m.attn.q_a.weight_scale_inv".into()])
+        );
+        assert_eq!(
+            got("m.attn.kv_a.weight").unwrap(),
+            (B128, vec!["m.attn.kv_a.weight_scale_inv".into()])
+        );
+        assert_eq!(
+            got("m.attn.o_group").unwrap(),
+            (B128, vec!["m.attn.o_group_scale_inv".into()])
+        );
+        assert_eq!(
+            got("m.moe.experts.0.w1.weight").unwrap(),
+            (
+                Format::Mxfp4,
+                vec!["m.moe.experts.0.w1.weight_scale_inv".into()]
+            )
+        );
+        assert_eq!(got("m.norm.weight").unwrap().0, Format::Bf16);
+        let refused = |n: &str, why: &str| assert!(p.refused[n].contains(why), "{n}: {p:?}");
+        refused("m.moe.experts.1.w1.weight", "fits none of");
+        refused("m.attn.lone", "F8_E4M3 outside a quantized weight");
+        refused(
+            "m.attn.stray_scale_inv",
+            "a companion no placed weight reads",
+        );
+        assert_eq!(p.placed.len() + p.refused.len() + 4, t.len());
+        for expert in ["fp4", "mxfp4"] {
+            assert!(Config::parse(&q(expert), None).is_ok(), "{expert}");
+        }
+        let e = Config::parse(&q("nvfp4"), None).unwrap_err().to_string();
+        assert!(e.contains("expert_dtype Some(\"nvfp4\")"), "{e}");
     }
 
     /// Every tensor of a table gets one format or a refusal naming it: each format's layout is

@@ -53,6 +53,12 @@ impl PlanDims {
                      which no attention site here reads",
                 ));
             }
+            OutGate::QLatent => {
+                return Err(ChainError::shape(
+                    what,
+                    "an output gate projected from a query latent, which is a latent layer's",
+                ));
+            }
         };
         let ff = first_ffn_width(spec, what)?;
         let (heads, kv_heads, head) = (g.heads as usize, g.kv_heads as usize, g.head_dim as usize);

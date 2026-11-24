@@ -19,7 +19,7 @@ fixture	real	side	kind	class	reason
 kimik3	tests/kimi_k3	real	need	cross-layer residual attention: every 12th layer banks its input, each sublayer and the head read the softmax mix of the banks and the running sum	cut
 kimik3	tests/kimi_k3	real	need	delta rule KDA with a full-width output gate: d 128, 96 heads, conv 4, sigmoid gate bounded below by -5	cut
 kimik3	tests/kimi_k3	real	need	dense situ layer: ff 33792	cut
-kimik3	tests/kimi_k3	real	need	routed experts in a 3584-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+kimik3	tests/kimi_k3	real	need	routed experts in a 3584-value latent (a projection down before them, one up after their sum)	cut
 kimik3	tests/kimi_k3	real	need	router: sigmoid, 896 experts, top 16, with a selection bias	cut
 kimik3	tests/kimi_k3	real	need	shared expert, ff 6144	cut
 kimik3	tests/kimi_k3	real	width	attn_gate 7168x12288	cut
@@ -52,7 +52,7 @@ kimik3	tests/kimi_k3	real	router	BiasedSigmoid over 896 experts, top 16..=16	cut
 kimik3	tests/kimi_k3	fixture	need	cross-layer residual attention: every 2th layer banks its input, each sublayer and the head read the softmax mix of the banks and the running sum	cut
 kimik3	tests/kimi_k3	fixture	need	delta rule KDA with a full-width output gate: d 128, 2 heads, conv 4, sigmoid gate bounded below by -5	cut
 kimik3	tests/kimi_k3	fixture	need	dense situ layer: ff 1024	cut
-kimik3	tests/kimi_k3	fixture	need	routed experts in a 256-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+kimik3	tests/kimi_k3	fixture	need	routed experts in a 256-value latent (a projection down before them, one up after their sum)	cut
 kimik3	tests/kimi_k3	fixture	need	router: sigmoid, 8 experts, top 2, with a selection bias	cut
 kimik3	tests/kimi_k3	fixture	need	shared expert, ff 512	cut
 kimik3	tests/kimi_k3	fixture	width	attn_gate 512x256	cut
@@ -82,7 +82,7 @@ kimik3	tests/kimi_k3	fixture	width	ssm_f_b 128x256	cut
 kimik3	tests/kimi_k3	fixture	width	ssm_g 512x256	cut
 kimik3	tests/kimi_k3	fixture	width	token_embd 512x163840	cut
 kimik3	tests/kimi_k3	fixture	router	BiasedSigmoid over 8 experts, top 2..=2	cut
-musespark	tests/musespark	real	need	routed experts in a 4096-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+musespark	tests/musespark	real	need	routed experts in a 4096-value latent (a projection down before them, one up after their sum)	cut
 musespark	tests/musespark	real	need	router: sigmoid, 256 experts, top 8, with a selection bias	cut
 musespark	tests/musespark	real	width	attn_gate 8192x8192	cut
 musespark	tests/musespark	real	width	attn_k 8192x1024	cut
@@ -98,7 +98,7 @@ musespark	tests/musespark	real	width	ffn_up_exps 4096x4096	cut
 musespark	tests/musespark	real	width	output 8192x202048	cut
 musespark	tests/musespark	real	width	token_embd 8192x202048	cut
 musespark	tests/musespark	real	router	BiasedSigmoid over 256 experts, top 8..=8	cut
-musespark	tests/musespark	fixture	need	routed experts in a 512-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+musespark	tests/musespark	fixture	need	routed experts in a 512-value latent (a projection down before them, one up after their sum)	cut
 musespark	tests/musespark	fixture	need	router: sigmoid, 16 experts, top 8, with a selection bias	cut
 musespark	tests/musespark	fixture	width	attn_gate 1024x1024	cut
 musespark	tests/musespark	fixture	width	attn_k 1024x128	cut
@@ -3469,7 +3469,7 @@ nemotron-bolt	source/nemotron-bolt	real	router	BiasedSigmoid over 304 experts, t
 nemotron-bolt	source/nemotron-bolt	real	router	BiasedSigmoid over 368 experts, top 9..=9	cut
 nemotron-bolt	source/nemotron-bolt	real	router	BiasedSigmoid over 432 experts, top 9..=9	cut
 nemotron-bolt	source/nemotron-bolt	fixture	need	routed stacks whose expert count and width differ by layer (2 shapes)	cut
-musespark	source/musespark	real	need	routed experts in a 4096-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+musespark	source/musespark	real	need	routed experts in a 4096-value latent (a projection down before them, one up after their sum)	cut
 musespark	source/musespark	real	need	router: sigmoid, 256 experts, top 8, with a selection bias	cut
 musespark	source/musespark	real	width	attn_gate 8192x8192	cut
 musespark	source/musespark	real	width	attn_k 8192x1024	cut
@@ -3485,7 +3485,7 @@ musespark	source/musespark	real	width	ffn_up_exps 4096x4096	cut
 musespark	source/musespark	real	width	output 8192x202048	cut
 musespark	source/musespark	real	width	token_embd 8192x202048	cut
 musespark	source/musespark	real	router	BiasedSigmoid over 256 experts, top 8..=8	cut
-musespark	source/musespark	fixture	need	routed experts in a 512-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+musespark	source/musespark	fixture	need	routed experts in a 512-value latent (a projection down before them, one up after their sum)	cut
 musespark	source/musespark	fixture	need	router: sigmoid, 16 experts, top 8, with a selection bias	cut
 musespark	source/musespark	fixture	width	attn_gate 1024x1024	cut
 musespark	source/musespark	fixture	width	attn_k 1024x128	cut
@@ -3501,7 +3501,7 @@ musespark	source/musespark	fixture	width	ffn_up_exps 512x256	cut
 musespark	source/musespark	fixture	width	output 1024x202048	cut
 musespark	source/musespark	fixture	width	token_embd 1024x202048	cut
 musespark	source/musespark	fixture	router	BiasedSigmoid over 16 experts, top 8..=8	cut
-musespark	source/musesparkfull	real	need	routed experts in a 4096-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+musespark	source/musesparkfull	real	need	routed experts in a 4096-value latent (a projection down before them, one up after their sum)	cut
 musespark	source/musesparkfull	real	need	router: sigmoid, 256 experts, top 8, with a selection bias	cut
 musespark	source/musesparkfull	real	width	attn_gate 8192x8192	cut
 musespark	source/musesparkfull	real	width	attn_k 8192x1024	cut
@@ -3517,7 +3517,7 @@ musespark	source/musesparkfull	real	width	ffn_up_exps 4096x4096	cut
 musespark	source/musesparkfull	real	width	output 8192x202048	cut
 musespark	source/musesparkfull	real	width	token_embd 8192x202048	cut
 musespark	source/musesparkfull	real	router	BiasedSigmoid over 256 experts, top 8..=8	cut
-musespark	source/musesparkfull	fixture	need	routed experts in a 512-value latent (ffn_latent_down before them, ffn_latent_up after their sum)	cut
+musespark	source/musesparkfull	fixture	need	routed experts in a 512-value latent (a projection down before them, one up after their sum)	cut
 musespark	source/musesparkfull	fixture	need	router: sigmoid, 16 experts, top 8, with a selection bias	cut
 musespark	source/musesparkfull	fixture	width	attn_gate 1024x1024	cut
 musespark	source/musesparkfull	fixture	width	attn_k 1024x128	cut

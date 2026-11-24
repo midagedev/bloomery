@@ -4,8 +4,8 @@
 //! [`Pre::Glm4`] (`glm4`), [`Pre::Qwen35`] (`qwen35`), [`Pre::Llama3`] (`llama-bpe`, `lfm2`),
 //! [`Pre::Tekken`] (`tekken`, `pixtral`), [`Pre::TekkenNum3`] (`tekken-num3`),
 //! [`Pre::MiniMaxM2`] (`minimax-m2`), [`Pre::Gpt4o`] (`gpt-4o`), [`Pre::Inkling2`] (`inkling2`), [`Pre::Gemma4`] (`gemma4`),
-//! [`Pre::Raon`] (`raon`), [`Pre::KimiK2`] (`kimi-k2`), [`Pre::Flint`] (`flint`) and
-//! [`Pre::ExaoneMoe`] (`exaone-moe`).
+//! [`Pre::Raon`] (`raon`), [`Pre::KimiK2`] (`kimi-k2`), [`Pre::Flint`] (`flint`),
+//! [`Pre::ExaoneMoe`] (`exaone-moe`) and [`Pre::Ernie5`] (`ernie5`).
 //!
 //! ## deepseek-v3
 //!
@@ -270,6 +270,22 @@
 //! while the model's `tokenizer.json` normalizes NFC. The engine follows the model
 //! ([`Pre::nfc`]), so the ids of a case whose text is not already NFC are the Hugging Face
 //! tokenizer's, which the gate pins beside the reference's (`tests/exaone-nfc-ids.tsv`).
+//!
+//! ## ernie5
+//!
+//! The reference's ERNIE5 type is deepseek-v3's three regexes with the number rule
+//! `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))` in place of `\p{N}{1,3}`: the run of numbers in words of
+//! three from its end, the first one the shorter ([`DigitRule::ThreesFromEnd`]), through the same
+//! passes as deepseek-v3's ([`split_ordered`]). ERNIE's own `tokenizer.json` spells the numbers in
+//! five steps instead: Hugging Face's `Digits` cuts runs of numbers (`Nd`, `Nl`, `No`), then
+//! regexes over `\p{Nd}` cut each run of decimal digits in words of three from its end (a piece of
+//! at most 510 digits first, then a leading one or two digits, then threes: right-aligned over
+//! the whole run), and a number that is no decimal digit stays a piece of its own. The two
+//! agree on every text whose numbers are decimal digits; on a run that mixes them with other
+//! numbers (`5²3`) the reference makes one word of three, the tokenizer three pieces.
+//! [`Pre::Ernie5Hf`] is the tokenizer's reading ([`split_ernie5_hf`]), with `Digits`' and
+//! `\p{Nd}`'s codepoints read off Hugging Face's own tables ([`ERNIE_NUMERIC`], [`ERNIE_DECIMAL`])
+//! and Unicode 14.0's classes in the word regex as the other Hugging Face readings have them.
 
 use crate::spelling::Spelling;
 use crate::unicode::{collapse, collapse_hf, letter_case};
@@ -1119,11 +1135,20 @@ pub(crate) enum Pre {
     /// as a regex, not a hand-written splitter, and the model's NFC normalizer applied first
     /// ([`Pre::nfc`], the `raon` precedent).
     ExaoneMoe,
+    /// `ernie5`: deepseek-v3's three regexes with the number run cut in words of three from its end
+    /// (`\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`, [`Pre::TekkenNum3`]'s rule), as the reference writes it.
+    Ernie5,
+    /// `ernie5` as ERNIE's `tokenizer.json` spells and runs it: `Digits` cuts runs of numbers, the
+    /// regexes over `\p{Nd}` cut a run of decimal digits in words of three from its end, and a
+    /// number that is no decimal digit is a piece of its own ([`split_ernie5_hf`]); Unicode 14.0's
+    /// classes in the word regex. Never named in a header; a vocabulary with
+    /// `tokenizer.bloomery.eog_token_ids` gets it.
+    Ernie5Hf,
 }
 
 impl Pre {
     /// The names this crate runs, as `tokenizer.ggml.pre` spells them.
-    pub(crate) const NAMES: [(&'static str, Pre); 22] = [
+    pub(crate) const NAMES: [(&'static str, Pre); 23] = [
         ("deepseek-v3", Pre::DeepseekV3),
         ("hunyuan-dense", Pre::DeepseekV3),
         ("joyai-llm", Pre::DeepseekV3),
@@ -1146,6 +1171,7 @@ impl Pre {
         ("kimi-k2", Pre::KimiK2),
         ("flint", Pre::Flint),
         ("exaone-moe", Pre::ExaoneMoe),
+        ("ernie5", Pre::Ernie5),
     ];
 
     /// The reading of this pre-tokenizer that runs as a Hugging Face `tokenizer.json` does, its
@@ -1159,6 +1185,7 @@ impl Pre {
             Pre::Tekken => Some(Pre::TekkenHf),
             Pre::MiniMaxM2 | Pre::Gpt4o => Some(Pre::MiniMaxM2Hf),
             Pre::ExaoneMoe => Some(Pre::ExaoneMoe),
+            Pre::Ernie5 => Some(Pre::Ernie5Hf),
             _ => None,
         }
     }
@@ -1208,6 +1235,7 @@ impl Pre {
                 | Pre::KimiK2
                 | Pre::ExaoneMoe
                 | Pre::HyV4
+                | Pre::Ernie5
         )
     }
 
@@ -1236,7 +1264,9 @@ impl Pre {
             | Pre::Raon
             | Pre::KimiK2
             | Pre::Flint
-            | Pre::ExaoneMoe => Spelling::ByteLevel,
+            | Pre::ExaoneMoe
+            | Pre::Ernie5
+            | Pre::Ernie5Hf => Spelling::ByteLevel,
         }
     }
 }
@@ -1246,14 +1276,20 @@ impl Pre {
 pub(crate) fn split<'s>(pre: Pre, cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
     s.collapsed.clear();
     let class: fn(u32) -> u8 = match pre {
-        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::Llama3Hf | Pre::DeepseekV3Hf => collapse_hf,
+        Pre::Qwen35Hf | Pre::Qwen2Hf | Pre::Llama3Hf | Pre::DeepseekV3Hf | Pre::Ernie5Hf => {
+            collapse_hf
+        }
         Pre::MiniMaxM2Hf | Pre::TekkenHf => collapse_cased,
         _ => collapse,
     };
     s.collapsed.extend(cpts.iter().map(|&cp| class(cp)));
     match pre {
-        Pre::DeepseekV3 | Pre::DeepseekV3Hf | Pre::HyV4 => split_ordered(cpts, s, match_word),
-        Pre::Flint => split_ordered(cpts, s, match_flint),
+        Pre::DeepseekV3 | Pre::DeepseekV3Hf | Pre::HyV4 => {
+            split_ordered(cpts, s, DigitRule::Front(3), match_word)
+        }
+        Pre::Ernie5 => split_ordered(cpts, s, DigitRule::ThreesFromEnd, match_word),
+        Pre::Ernie5Hf => split_ernie5_hf(cpts, s),
+        Pre::Flint => split_ordered(cpts, s, DigitRule::Front(3), match_flint),
         Pre::DeepseekLlm => split_deepseek_llm(cpts, s),
         Pre::Qwen2 => {
             split_custom(cpts, &s.collapsed, 1, &mut s.b);
@@ -1520,11 +1556,12 @@ fn split_cased<'s, K: CasedLetters>(
     &s.b
 }
 
-/// Numbers, then CJK, then the vocabulary's final word regex, each pass
+/// Numbers (`digits`), then CJK, then the vocabulary's final word regex, each pass
 /// re-splitting only the pieces the previous pass left.
 fn split_ordered<'s>(
     cpts: &[u32],
     s: &'s mut Scratch,
+    digits: DigitRule,
     word: impl Fn(&[u8], usize, usize) -> usize,
 ) -> &'s [usize] {
     let c = &s.collapsed;
@@ -1533,12 +1570,279 @@ fn split_ordered<'s>(
     if !cpts.is_empty() {
         s.a.push(cpts.len());
     }
-    resplit(&s.a, &mut s.b, |i, hi| match_number(c, i, hi, 3));
+    resplit(&s.a, &mut s.b, |i, hi| digits.at(c, i, hi));
     resplit(&s.b, &mut s.a, |i, hi| {
         cpts[i..hi].iter().take_while(|&&cp| is_cjk(cp)).count()
     });
     resplit(&s.a, &mut s.b, |i, hi| word(c, i, hi));
     &s.b
+}
+/// The codepoints Hugging Face's `Digits` pre-tokenizer cuts out as a number (Rust's
+/// `char::is_numeric`: `Nd`, `Nl` and `No`), as `(first, last)` runs in order.
+static ERNIE_NUMERIC: [(u32, u32); 146] = [
+    (0x0030, 0x0039),
+    (0x00B2, 0x00B3),
+    (0x00B9, 0x00B9),
+    (0x00BC, 0x00BE),
+    (0x0660, 0x0669),
+    (0x06F0, 0x06F9),
+    (0x07C0, 0x07C9),
+    (0x0966, 0x096F),
+    (0x09E6, 0x09EF),
+    (0x09F4, 0x09F9),
+    (0x0A66, 0x0A6F),
+    (0x0AE6, 0x0AEF),
+    (0x0B66, 0x0B6F),
+    (0x0B72, 0x0B77),
+    (0x0BE6, 0x0BF2),
+    (0x0C66, 0x0C6F),
+    (0x0C78, 0x0C7E),
+    (0x0CE6, 0x0CEF),
+    (0x0D58, 0x0D5E),
+    (0x0D66, 0x0D78),
+    (0x0DE6, 0x0DEF),
+    (0x0E50, 0x0E59),
+    (0x0ED0, 0x0ED9),
+    (0x0F20, 0x0F33),
+    (0x1040, 0x1049),
+    (0x1090, 0x1099),
+    (0x1369, 0x137C),
+    (0x16EE, 0x16F0),
+    (0x17E0, 0x17E9),
+    (0x17F0, 0x17F9),
+    (0x1810, 0x1819),
+    (0x1946, 0x194F),
+    (0x19D0, 0x19DA),
+    (0x1A80, 0x1A89),
+    (0x1A90, 0x1A99),
+    (0x1B50, 0x1B59),
+    (0x1BB0, 0x1BB9),
+    (0x1C40, 0x1C49),
+    (0x1C50, 0x1C59),
+    (0x2070, 0x2070),
+    (0x2074, 0x2079),
+    (0x2080, 0x2089),
+    (0x2150, 0x2182),
+    (0x2185, 0x2189),
+    (0x2460, 0x249B),
+    (0x24EA, 0x24FF),
+    (0x2776, 0x2793),
+    (0x2CFD, 0x2CFD),
+    (0x3007, 0x3007),
+    (0x3021, 0x3029),
+    (0x3038, 0x303A),
+    (0x3192, 0x3195),
+    (0x3220, 0x3229),
+    (0x3248, 0x324F),
+    (0x3251, 0x325F),
+    (0x3280, 0x3289),
+    (0x32B1, 0x32BF),
+    (0xA620, 0xA629),
+    (0xA6E6, 0xA6EF),
+    (0xA830, 0xA835),
+    (0xA8D0, 0xA8D9),
+    (0xA900, 0xA909),
+    (0xA9D0, 0xA9D9),
+    (0xA9F0, 0xA9F9),
+    (0xAA50, 0xAA59),
+    (0xABF0, 0xABF9),
+    (0xFF10, 0xFF19),
+    (0x10107, 0x10133),
+    (0x10140, 0x10178),
+    (0x1018A, 0x1018B),
+    (0x102E1, 0x102FB),
+    (0x10320, 0x10323),
+    (0x10341, 0x10341),
+    (0x1034A, 0x1034A),
+    (0x103D1, 0x103D5),
+    (0x104A0, 0x104A9),
+    (0x10858, 0x1085F),
+    (0x10879, 0x1087F),
+    (0x108A7, 0x108AF),
+    (0x108FB, 0x108FF),
+    (0x10916, 0x1091B),
+    (0x109BC, 0x109BD),
+    (0x109C0, 0x109CF),
+    (0x109D2, 0x109FF),
+    (0x10A40, 0x10A48),
+    (0x10A7D, 0x10A7E),
+    (0x10A9D, 0x10A9F),
+    (0x10AEB, 0x10AEF),
+    (0x10B58, 0x10B5F),
+    (0x10B78, 0x10B7F),
+    (0x10BA9, 0x10BAF),
+    (0x10CFA, 0x10CFF),
+    (0x10D30, 0x10D39),
+    (0x10D40, 0x10D49),
+    (0x10E60, 0x10E7E),
+    (0x10F1D, 0x10F26),
+    (0x10F51, 0x10F54),
+    (0x10FC5, 0x10FCB),
+    (0x11052, 0x1106F),
+    (0x110F0, 0x110F9),
+    (0x11136, 0x1113F),
+    (0x111D0, 0x111D9),
+    (0x111E1, 0x111F4),
+    (0x112F0, 0x112F9),
+    (0x11450, 0x11459),
+    (0x114D0, 0x114D9),
+    (0x11650, 0x11659),
+    (0x116C0, 0x116C9),
+    (0x116D0, 0x116E3),
+    (0x11730, 0x1173B),
+    (0x118E0, 0x118F2),
+    (0x11950, 0x11959),
+    (0x11BF0, 0x11BF9),
+    (0x11C50, 0x11C6C),
+    (0x11D50, 0x11D59),
+    (0x11DA0, 0x11DA9),
+    (0x11DE0, 0x11DE9),
+    (0x11F50, 0x11F59),
+    (0x11FC0, 0x11FD4),
+    (0x12400, 0x1246E),
+    (0x16130, 0x16139),
+    (0x16A60, 0x16A69),
+    (0x16AC0, 0x16AC9),
+    (0x16B50, 0x16B59),
+    (0x16B5B, 0x16B61),
+    (0x16D70, 0x16D79),
+    (0x16E80, 0x16E96),
+    (0x16FF4, 0x16FF6),
+    (0x1CCF0, 0x1CCF9),
+    (0x1D2C0, 0x1D2D3),
+    (0x1D2E0, 0x1D2F3),
+    (0x1D360, 0x1D378),
+    (0x1D7CE, 0x1D7FF),
+    (0x1E140, 0x1E149),
+    (0x1E2F0, 0x1E2F9),
+    (0x1E4F0, 0x1E4F9),
+    (0x1E5F1, 0x1E5FA),
+    (0x1E8C7, 0x1E8CF),
+    (0x1E950, 0x1E959),
+    (0x1EC71, 0x1ECAB),
+    (0x1ECAD, 0x1ECAF),
+    (0x1ECB1, 0x1ECB4),
+    (0x1ED01, 0x1ED2D),
+    (0x1ED2F, 0x1ED3D),
+    (0x1F100, 0x1F10C),
+    (0x1FBF0, 0x1FBF9),
+];
+
+/// The codepoints `\p{Nd}` matches in a Hugging Face regex, as `(first, last)` runs in order.
+static ERNIE_DECIMAL: [(u32, u32); 71] = [
+    (0x0030, 0x0039),
+    (0x0660, 0x0669),
+    (0x06F0, 0x06F9),
+    (0x07C0, 0x07C9),
+    (0x0966, 0x096F),
+    (0x09E6, 0x09EF),
+    (0x0A66, 0x0A6F),
+    (0x0AE6, 0x0AEF),
+    (0x0B66, 0x0B6F),
+    (0x0BE6, 0x0BEF),
+    (0x0C66, 0x0C6F),
+    (0x0CE6, 0x0CEF),
+    (0x0D66, 0x0D6F),
+    (0x0DE6, 0x0DEF),
+    (0x0E50, 0x0E59),
+    (0x0ED0, 0x0ED9),
+    (0x0F20, 0x0F29),
+    (0x1040, 0x1049),
+    (0x1090, 0x1099),
+    (0x17E0, 0x17E9),
+    (0x1810, 0x1819),
+    (0x1946, 0x194F),
+    (0x19D0, 0x19D9),
+    (0x1A80, 0x1A89),
+    (0x1A90, 0x1A99),
+    (0x1B50, 0x1B59),
+    (0x1BB0, 0x1BB9),
+    (0x1C40, 0x1C49),
+    (0x1C50, 0x1C59),
+    (0xA620, 0xA629),
+    (0xA8D0, 0xA8D9),
+    (0xA900, 0xA909),
+    (0xA9D0, 0xA9D9),
+    (0xA9F0, 0xA9F9),
+    (0xAA50, 0xAA59),
+    (0xABF0, 0xABF9),
+    (0xFF10, 0xFF19),
+    (0x104A0, 0x104A9),
+    (0x10D30, 0x10D39),
+    (0x10D40, 0x10D49),
+    (0x11066, 0x1106F),
+    (0x110F0, 0x110F9),
+    (0x11136, 0x1113F),
+    (0x111D0, 0x111D9),
+    (0x112F0, 0x112F9),
+    (0x11450, 0x11459),
+    (0x114D0, 0x114D9),
+    (0x11650, 0x11659),
+    (0x116C0, 0x116C9),
+    (0x116D0, 0x116E3),
+    (0x11730, 0x11739),
+    (0x118E0, 0x118E9),
+    (0x11950, 0x11959),
+    (0x11BF0, 0x11BF9),
+    (0x11C50, 0x11C59),
+    (0x11D50, 0x11D59),
+    (0x11DA0, 0x11DA9),
+    (0x11F50, 0x11F59),
+    (0x16130, 0x16139),
+    (0x16A60, 0x16A69),
+    (0x16AC0, 0x16AC9),
+    (0x16B50, 0x16B59),
+    (0x16D70, 0x16D79),
+    (0x1CCF0, 0x1CCF9),
+    (0x1D7CE, 0x1D7FF),
+    (0x1E140, 0x1E149),
+    (0x1E2F0, 0x1E2F9),
+    (0x1E4F0, 0x1E4F9),
+    (0x1E5F1, 0x1E5FA),
+    (0x1E950, 0x1E959),
+    (0x1FBF0, 0x1FBF9),
+];
+
+/// Whether `cpt` is in the sorted `(first, last)` runs.
+fn in_runs(runs: &[(u32, u32)], cpt: u32) -> bool {
+    let i = runs.partition_point(|&(_, last)| last < cpt);
+    runs.get(i).is_some_and(|&(first, _)| first <= cpt)
+}
+
+/// `ernie5` as ERNIE's `tokenizer.json` runs it, five passes each re-splitting the pieces the
+/// last left: `Digits` cuts runs of numbers (`Nd`, `Nl`, `No`) from the rest; the three regexes
+/// over `\p{Nd}` that follow cut each run of decimal digits in words of three from its end, the
+/// first one the shorter, and leave a number that is no decimal digit (`²`, `½`, `Ⅷ`) a piece of
+/// its own; then deepseek-v3's CJK run and word regex.
+fn split_ernie5_hf<'s>(cpts: &[u32], s: &'s mut Scratch) -> &'s [usize] {
+    let c = &s.collapsed;
+
+    s.a.clear();
+    if !cpts.is_empty() {
+        s.a.push(cpts.len());
+    }
+    resplit(&s.a, &mut s.b, |i, hi| {
+        cpts[i..hi]
+            .iter()
+            .take_while(|&&cp| in_runs(&ERNIE_NUMERIC, cp))
+            .count()
+    });
+    resplit(&s.b, &mut s.a, |i, hi| {
+        let n = cpts[i..hi]
+            .iter()
+            .take_while(|&&cp| in_runs(&ERNIE_DECIMAL, cp))
+            .count();
+        match n % 3 {
+            0 if n == 0 => 0,
+            0 => 3,
+            first => first,
+        }
+    });
+    resplit(&s.a, &mut s.b, |i, hi| {
+        cpts[i..hi].iter().take_while(|&&cp| is_cjk(cp)).count()
+    });
+    resplit(&s.b, &mut s.a, |i, hi| match_word(c, i, hi));
+    &s.a
 }
 
 /// `unicode_regex_split_custom_qwen2` (`digits` 1) or `_llama3` (`digits` 3)
@@ -2738,5 +3042,75 @@ mod tests {
         for &(text, want) in cases {
             assert_eq!(words(Pre::ExaoneMoe, text), want, "{text:?}");
         }
+    }
+
+    /// `ernie5` is a row of its own on the strict reader, with a Hugging Face reading, and cuts a
+    /// run of numbers in words of three from its end, the first one the shorter. FAIL-first: a row
+    /// that cuts from the start (`DigitRule::Front(3)`) fails the words.
+    #[test]
+    fn ernie5_cuts_numbers_from_their_end() {
+        assert_eq!(crate::named(&Pre::NAMES, "ernie5"), Some(Pre::Ernie5));
+        assert!(crate::runs_pre_tokenizer("ernie5"));
+        assert!(Pre::Ernie5.strict_utf8() && !Pre::Ernie5.nfc() && !Pre::Ernie5.ignore_merges());
+        assert_eq!(Pre::Ernie5.hf_reading(), Some(Pre::Ernie5Hf));
+        assert_eq!(Pre::Ernie5Hf.hf_reading(), None);
+        for pre in [Pre::Ernie5, Pre::Ernie5Hf] {
+            let cases: &[(&str, &[&str])] = &[
+                ("1", &["1"]),
+                ("12", &["12"]),
+                ("123", &["123"]),
+                ("1234", &["1", "234"]),
+                ("12345", &["12", "345"]),
+                ("1234567", &["1", "234", "567"]),
+                ("abc1234def", &["abc", "1", "234", "def"]),
+                (" 12345 ", &[" ", "12", "345", " "]),
+                ("1,234,567", &["1", ",", "234", ",", "567"]),
+                ("中文123한글", &["中文", "123", "한글"]),
+                ("Hello, world!", &["Hello", ",", " world", "!"]),
+                ("x//\n", &["x", "//\n"]),
+            ];
+            for &(text, want) in cases {
+                assert_eq!(words(pre, text), want, "{pre:?} {text:?}");
+            }
+        }
+    }
+
+    /// The Hugging Face reading of `ernie5` makes the pieces of ERNIE's `tokenizer.json`: on every
+    /// case of the frozen set (`tests/ernie55-pieces.tsv`, the `tokenizers` package's own pieces),
+    /// and the reference's reading makes the same pieces but for the four texts whose number run
+    /// mixes decimal digits with other numbers: there it keeps one run of up to three numbers a
+    /// word, where the tokenizer cuts the decimal digits apart from the rest. FAIL-first: with a
+    /// number that is no decimal digit read as one (`ERNIE_DECIMAL` as `ERNIE_NUMERIC`), the
+    /// reading makes one word of `5²3`.
+    #[test]
+    fn ernie5_hf_makes_hugging_faces_pieces() {
+        let unhex = |hex: &str| -> String {
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            String::from_utf8(bytes).unwrap()
+        };
+        let (mut rows, mut differ) = (0, vec![]);
+        let mut complete = None;
+        for line in include_str!("../tests/ernie55-pieces.tsv").lines() {
+            if let Some(n) = line.strip_prefix("# complete\t") {
+                complete = Some(n.parse::<usize>().unwrap());
+                continue;
+            }
+            if line.starts_with('#') {
+                continue;
+            }
+            let (text, pieces) = line.split_once('\t').unwrap();
+            let text = unhex(text);
+            let want: Vec<String> = pieces.split(' ').map(unhex).collect();
+            assert_eq!(words(Pre::Ernie5Hf, &text), want, "{text:?}");
+            if words(Pre::Ernie5, &text) != want {
+                differ.push(text);
+            }
+            rows += 1;
+        }
+        assert_eq!(complete, Some(rows), "the pins' trailer names every row");
+        assert_eq!(differ, ["5²3", "10³ and 2⁸", "1½2", "12½345"]);
     }
 }

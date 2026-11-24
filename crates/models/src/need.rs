@@ -11,8 +11,8 @@ use gguf::GgmlType;
 use crate::shape::MoeShape;
 use crate::{
     Act, Collapse, DeltaKind, EngramSpec, Extra, Ffn, GdnGate, HcKind, HcMix, IndexKeys, KdaGate,
-    LatentUp, LayerIdx, Mixer, ModelSpec, NgramRule, OutGate, PoolRule, Residual, RopeMode,
-    RouterNorm, Score, Selector, Source,
+    LatentOut, LatentUp, LayerIdx, Mixer, ModelSpec, NgramRule, OutGate, PoolRule, Residual,
+    RopeMode, RouterNorm, Score, Selector, Source,
 };
 
 /// A feature of a file the engine does not run yet: what it is, and the layer
@@ -99,6 +99,14 @@ pub enum Need {
     /// A latent layer's heads' outputs multiplied by a sigmoid gate a projection of the layer input
     /// of its own writes.
     LatentOutGate,
+    /// A latent layer's output rows multiplied by a sigmoid gate a projection of its normed query
+    /// latent writes: the heads' outputs, or (`grouped`) the rows of the grouped output
+    /// projection before the final one.
+    LatentOutGateQ { grouped: bool },
+    /// A latent layer's spec that carries a GQA layer's gate, the packed one ([`OutGate::Packed`],
+    /// `packed`) or the per-head projection ([`OutGate::ProjHead`]): no latent body has it, so
+    /// it is an item by its own name that no program covers, never another gate's.
+    LatentOutGateForm { packed: bool },
     /// A per-head RMS norm on the latent query.
     QueryHeadNorm,
     /// A compressor writing `width`-value rows.
@@ -222,6 +230,9 @@ pub enum Need {
     ShortConv { taps: u32 },
     /// Hyper-connections of `streams` streams.
     Hc { streams: u32 },
+    /// [`HcKind::MhcRoot`]: the manifold-constrained streams whose RMS factor is
+    /// `1 / (sqrt(mean) + eps)`.
+    HcRoot { streams: u32 },
     /// Chart-constrained hyper-connections of `streams` streams, every sublayer its own mix, the
     /// streams collapsed by `collapse`.
     HcChart { streams: u32, collapse: Collapse },
@@ -392,6 +403,24 @@ impl fmt::Display for Need {
             Need::LatentOutGate => {
                 f.write_str("latent attention output gate: sigmoid of its own projection")
             }
+            Need::LatentOutGateQ { grouped } => write!(
+                f,
+                "latent attention output gate: sigmoid of a projection of the query latent, on the {}",
+                if *grouped {
+                    "grouped output projection's rows"
+                } else {
+                    "heads' outputs"
+                }
+            ),
+            Need::LatentOutGateForm { packed } => write!(
+                f,
+                "latent attention carrying the {} output gate, which only a GQA layer has",
+                if *packed {
+                    "packed (beside the query)"
+                } else {
+                    "one-per-head projection"
+                }
+            ),
             Need::QueryHeadNorm => f.write_str("the per-head query RMS norm"),
             Need::Compress { width } => write!(f, "a compressor of {width}-value rows"),
             Need::CompressorApe => {
@@ -527,8 +556,8 @@ impl fmt::Display for Need {
             }
             Need::LatentExperts { latent } => write!(
                 f,
-                "routed experts in a {latent}-value latent (ffn_latent_down before them, \
-                 ffn_latent_up after their sum)"
+                "routed experts in a {latent}-value latent (a projection down before them, \
+                 one up after their sum)"
             ),
             Need::PreExpNorm => {
                 f.write_str("a weighted RMS norm on the routed experts' input (ffn_pre_exp_norm)")
@@ -590,6 +619,10 @@ impl fmt::Display for Need {
             ),
             Need::ShortConv { taps } => write!(f, "gated short-conv mixer: {taps} taps"),
             Need::Hc { streams } => write!(f, "hyper-connections of {streams} streams"),
+            Need::HcRoot { streams } => write!(
+                f,
+                "hyper-connections of {streams} streams with the RMS factor 1 / (sqrt(mean) + eps)"
+            ),
             Need::HcChart { streams, collapse } => write!(
                 f,
                 "chart-constrained hyper-connections of {streams} streams, collapse {collapse:?}"
@@ -737,6 +770,9 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                     OutGate::Packed => at(Need::OutGate),
                     OutGate::Proj => at(Need::OutGateProj),
                     OutGate::ProjHead => at(Need::OutGateProjHead),
+                    // A latent layer's gate: on a layer with no query latent it is an item by its
+                    // own name, never another gate's.
+                    OutGate::QLatent => at(Need::LatentOutGateQ { grouped: false }),
                 }
                 if g.o_norm {
                     at(Need::OutNorm { head: g.head_dim });
@@ -765,8 +801,14 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 if matches!(a.cache, Source::From(_)) {
                     at(Need::SharedLatentCache);
                 }
-                if a.out_gate == OutGate::Proj {
-                    at(Need::LatentOutGate);
+                match a.out_gate {
+                    OutGate::Proj => at(Need::LatentOutGate),
+                    OutGate::QLatent => at(Need::LatentOutGateQ {
+                        grouped: matches!(a.out, LatentOut::Grouped { .. }),
+                    }),
+                    OutGate::None => {}
+                    OutGate::Packed => at(Need::LatentOutGateForm { packed: true }),
+                    OutGate::ProjHead => at(Need::LatentOutGateForm { packed: false }),
                 }
                 if let Some(c) = &a.compress {
                     at(Need::Compress { width: a.latent });
@@ -818,6 +860,9 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                     OutGate::Packed => at(Need::OutGate),
                     OutGate::Proj => at(Need::OutGateProj),
                     OutGate::ProjHead => at(Need::OutGateProjHead),
+                    // A latent layer's gate: on a layer with no query latent it is an item by its
+                    // own name, never another gate's.
+                    OutGate::QLatent => at(Need::LatentOutGateQ { grouped: false }),
                 }
             }
             Mixer::None => {}
@@ -880,6 +925,9 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                         HcKind::Mhc { .. } => Need::Hc {
                             streams: hc.streams,
                         },
+                        HcKind::MhcRoot { .. } => Need::HcRoot {
+                            streams: hc.streams,
+                        },
                         HcKind::Chart { collapse, .. } => Need::HcChart {
                             streams: hc.streams,
                             collapse,
@@ -899,6 +947,9 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
                 if let Some(hc) = spec.hc {
                     at(match hc.kind {
                         HcKind::Mhc { .. } => Need::Hc {
+                            streams: hc.streams,
+                        },
+                        HcKind::MhcRoot { .. } => Need::HcRoot {
                             streams: hc.streams,
                         },
                         HcKind::Chart { collapse, .. } => Need::HcChart {
@@ -977,11 +1028,13 @@ pub fn needs(spec: &ModelSpec) -> Vec<(Need, Option<LayerIdx>)> {
         model(Need::QueryHeadNorm);
     }
     match spec.hc.map(|hc| hc.kind) {
-        Some(HcKind::Mhc { mix, collapse, .. }) => match (mix, collapse) {
-            (_, Collapse::Head) => model(Need::HcHead),
-            (HcMix::Lagged, Collapse::LastMix) => {}
-            (mix, collapse) => model(Need::HcWiring { mix, collapse }),
-        },
+        Some(HcKind::Mhc { mix, collapse, .. } | HcKind::MhcRoot { mix, collapse, .. }) => {
+            match (mix, collapse) {
+                (_, Collapse::Head) => model(Need::HcHead),
+                (HcMix::Lagged, Collapse::LastMix) => {}
+                (mix, collapse) => model(Need::HcWiring { mix, collapse }),
+            }
+        }
         Some(HcKind::Chart { .. } | HcKind::Identity { .. }) => {}
         Some(HcKind::Gated { rank }) => model(Need::HcGatedHead { rank }),
         None => {}
@@ -1100,8 +1153,8 @@ fn select_needs(select: &Selector, at: &mut impl FnMut(Need)) {
 #[cfg(test)]
 mod tests {
     use crate::{
-        Act, Ffn, Gqa, LayerSpec, LogitEpilogue, Mixer, ModelSpec, Moe, Need, OutGate, Residual,
-        Rope, RopeMode, Router, Score, ShortConv, needs,
+        Act, Ffn, Gqa, Latent, LatentOut, LatentUp, LayerSpec, LogitEpilogue, Mixer, ModelSpec,
+        Moe, Need, OutGate, Residual, Rope, RopeMode, Router, Score, ShortConv, Source, needs,
     };
 
     /// One Muse-shaped layer: a Proj-gated GQA mixer whose output norm is
@@ -1346,6 +1399,57 @@ mod tests {
             !got.iter().any(|g| g.starts_with("delta rule KDA:")),
             "the full-gate kind rides the low-rank KDA row: {got:#?}"
         );
+    }
+
+    /// A latent layer built with a GQA layer's gate form is refused by name: the packed gate and the
+    /// per-head projection each become an item of their own that no program covers, and the latent
+    /// forms (`Proj`, `QLatent`) and no gate keep theirs. FAIL-first: the arm returning to
+    /// `OutGate::None | OutGate::Packed | OutGate::ProjHead => {}` leaves both lists empty.
+    #[test]
+    fn a_latent_layer_with_a_gqa_gate_is_refused_by_name() {
+        let layer = |gate| {
+            let mut s = muse_spec(false, false, None, Residual::Plain, None);
+            s.layers[0].mixer = Mixer::Latent(Latent {
+                heads: 2,
+                q_lora: 8,
+                latent: 16,
+                up: LatentUp::KeqV,
+                rope: None,
+                q_head_norm: false,
+                ssmax: false,
+                pe: 0,
+                cache: Source::Own(()),
+                out_gate: gate,
+                out: LatentOut::Plain,
+                window: None,
+                sinks: false,
+                compress: None,
+                select: None,
+            });
+            needs(&s)
+        };
+        let named = |got: &[(Need, Option<crate::LayerIdx>)], want: &str| {
+            got.iter()
+                .filter(|(n, _)| matches!(n, Need::LatentOutGateForm { .. }))
+                .map(|(n, _)| n.to_string())
+                .eq([want.to_string()])
+        };
+        assert!(named(
+            &layer(OutGate::Packed),
+            "latent attention carrying the packed (beside the query) output gate, which only a GQA layer has"
+        ));
+        assert!(named(
+            &layer(OutGate::ProjHead),
+            "latent attention carrying the one-per-head projection output gate, which only a GQA layer has"
+        ));
+        for gate in [OutGate::None, OutGate::Proj, OutGate::QLatent] {
+            assert!(
+                !layer(gate)
+                    .iter()
+                    .any(|(n, _)| matches!(n, Need::LatentOutGateForm { .. })),
+                "{gate:?}"
+            );
+        }
     }
 
     /// None of it without the facts: a Proj-gated layer with no output norm,

@@ -88,6 +88,11 @@ pub enum Program {
     /// list, the engram sites), the routed experts the plan puts on the card (the common pair over
     /// the latent, gate-first clamped) and the rest on the host tier, beside a shared expert.
     Hy4Body,
+    /// The ERNIE 5.5 body: described, with no program behind it yet. Its routed experts take the
+    /// common pair over the latent, so a plan reads them by the same leg as the other bodies that
+    /// run one; the coverage table names no row for it, so every need of its description is one
+    /// no program runs.
+    Ernie55Body,
     /// The Inkling 2 body (`crates/gpu/src/arch/inkling2` `Body`): whole-card, the visits of the
     /// looped trunk (the rel-bias attention with its per-query sink, the residual short convs, the
     /// cross-layer residual mixes of the normed banks, the looped core's message controllers) and
@@ -122,6 +127,7 @@ pub fn program_of(arch: Arch) -> Option<Program> {
         Arch::MistralLarge4 => Some(Program::MistralLarge4Body),
         Arch::KimiK3 => Some(Program::KimiK3Body),
         Arch::Hy4 => Some(Program::Hy4Body),
+        Arch::Ernie55 => Some(Program::Ernie55Body),
         Arch::Inkling2 => Some(Program::Inkling2Body),
         // No program runs lfm3 yet: a start that opens one of its files is refused by the
         // coverage check's one item, never sent down another family's path.
@@ -153,6 +159,7 @@ impl Program {
             Self::FlintBody => "flint",
             Self::MistralLarge4Body => "mistrallarge4",
             Self::Hy4Body => "hy4",
+            Self::Ernie55Body => "ernie55",
             Self::Inkling2Body => "inkling2",
             Self::Host => "host",
         }
@@ -570,7 +577,8 @@ pub fn leg_arms(p: Program) -> Option<LegArms> {
         Program::Mimo2Body
         | Program::Solar2Body
         | Program::MistralLarge4Body
-        | Program::Hy4Body => Some(LegArms {
+        | Program::Hy4Body
+        | Program::Ernie55Body => Some(LegArms {
             gate_up: kernels::card_gate_up_runs,
             down: kernels::card_down_runs,
         }),
@@ -690,7 +698,8 @@ pub fn routed_rule(p: Program) -> RoutedRule {
         Program::Mimo2Body
         | Program::Solar2Body
         | Program::MistralLarge4Body
-        | Program::Hy4Body => RoutedRule::Leg {
+        | Program::Hy4Body
+        | Program::Ernie55Body => RoutedRule::Leg {
             gate_up: common_leg_gate_up,
             down: common_leg_down,
             pair: leg_pair(p),
@@ -814,7 +823,7 @@ mod tests {
     use super::*;
     use crate::placement::{ModelTensor, ModelTensors, Role};
 
-    const PROGRAMS: [Program; 17] = [
+    const PROGRAMS: [Program; 18] = [
         Program::Deepseek41Chain,
         Program::Qwen3moeBody,
         Program::Qwen35Body,
@@ -831,6 +840,7 @@ mod tests {
         Program::FlintBody,
         Program::MistralLarge4Body,
         Program::Hy4Body,
+        Program::Ernie55Body,
         Program::Inkling2Body,
     ];
 

@@ -131,7 +131,7 @@ macro_rules! pre_tokenizer {
 /// `tokenizer.json` must repeat: [`ignores_merges`]). `Removed` with `invert` keeps the regex's
 /// matches and drops what lies between them, which `Isolated` keeps as pieces of their own; both
 /// regexes match every codepoint, so no gap exists and the two split alike.
-pub const PRE: [(&str, &str, bool); 9] = [
+pub const PRE: [(&str, &str, bool); 10] = [
     (
         "qwen35",
         pre_tokenizer!(qwen35_regex, "Isolated", false, false),
@@ -197,7 +197,22 @@ pub const PRE: [(&str, &str, bool); 9] = [
         pre_tokenizer!(tekken_regex, "Isolated", false, true),
         true,
     ),
+    // ERNIE 5.5's pipeline, as its `tokenizer.json` spells it: `Digits` cuts the runs of numbers,
+    // three regexes over `\p{Nd}` cut each run of decimal digits in words of three from its end,
+    // then DeepSeek-V3's CJK and word regexes, before ByteLevel without its own regex. Its
+    // post-processor is a bare BOS template ([`BARE_BOS`]).
+    (
+        "ernie5",
+        r##"{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":false},{"type":"Split","pattern":{"Regex":"\\p{Nd}{1,510}(?=(?>\\p{Nd}{510})*(?:\\P{Nd}|$))|\\G\\p{Nd}{510}"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"\\A\\p{Nd}{1,2}(?=\\p{Nd}{3}+\\z)"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"\\A\\p{Nd}{3}|\\G\\p{Nd}{3}"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}"##,
+        false,
+    ),
 ];
+
+/// The rows whose `post_processor` is a bare `TemplateProcessing` (no ByteLevel before it) writing
+/// one special token before the text, a token of its own that the header exports as the BOS where
+/// the config names another: ERNIE's `tokenizer.json` prepends `<|ERNIE_MASK|>` (id 2), the config's
+/// `bos_token_id` is `<|ERNIE_BEGIN|>` (id 1).
+const BARE_BOS: [&str; 1] = ["ernie5"];
 
 /// The names of [`PRE`] and of the tiktoken rows, as the refusal of an unknown one lists them.
 fn pre_names() -> String {
@@ -247,8 +262,11 @@ fn ids_only(pre: &Json) -> Json {
 fn rows() -> impl Iterator<Item = (&'static str, Json, String)> {
     PRE.into_iter().map(|(name, spelled, _)| {
         let row: Json = serde_json::from_str(spelled).expect("a pre-tokenizer row is JSON");
-        let regex = row["pretokenizers"][0]["pattern"]["Regex"]
-            .as_str()
+        let regex = row["pretokenizers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|part| part["pattern"]["Regex"].as_str())
             .expect("a pre-tokenizer row splits by a regex")
             .to_string();
         (name, ids_only(&row), regex)
@@ -312,6 +330,10 @@ const TOKENIZER: &Fields = &[
             byte_level!(false, false, false),
             ",",
             byte_level!(true, true, true),
+            // ERNIE's: the pipeline's own ByteLevel (`trim_offsets` trims an encoding's offsets,
+            // which decoding does not read).
+            ",",
+            byte_level!(false, true, false),
             "]"
         )),
     ),
@@ -324,11 +346,15 @@ const MODEL: &Fields = &[
     ("vocab", Read),
     ("merges", Read),
     ("dropout", Only("[null, 0, 0.0]")),
-    ("unk_token", Only("[null]")),
+    // A name or null; `keys` takes a name only of a vocabulary that holds every byte
+    // (`byte_alphabet`), where no piece is unknown.
+    ("unk_token", Read),
     ("continuing_subword_prefix", Only(r#"[null, ""]"#)),
     ("end_of_word_suffix", Only(r#"[null, ""]"#)),
     ("fuse_unk", Only("[false]")),
-    ("byte_fallback", Only("[false]")),
+    // `keys` takes true only of a vocabulary that holds every byte (`byte_alphabet`), where no
+    // byte falls back.
+    ("byte_fallback", Only("[false, true]")),
     // The pre-tokenizer row's own value ([`PRE`]); an absent key is HF's default, false.
     ("ignore_merges", Only("[false, true]")),
 ];
@@ -416,7 +442,7 @@ const TOKENIZER_CONFIG: &Fields = &[
     (
         "tokenizer_class",
         Only(
-            r#"["Qwen2Tokenizer", "Qwen2TokenizerFast", "PreTrainedTokenizerFast", "TokenizersBackend"]"#,
+            r#"["Qwen2Tokenizer", "Qwen2TokenizerFast", "PreTrainedTokenizerFast", "TokenizersBackend", "ErnieChatTokenizer"]"#,
         ),
     ),
     (
@@ -424,6 +450,16 @@ const TOKENIZER_CONFIG: &Fields = &[
         Ignore(
             Type::Number,
             "HF warns past it and truncates only when asked; the context length is config.json's",
+        ),
+    ),
+    // `ErnieChatTokenizer` is a `PreTrainedTokenizerFast` whose one vocabulary file is
+    // tokenizer.json (tokenization_ernie.py: `vocab_files_names`).
+    (
+        "auto_map",
+        Ignore(
+            Type::Object,
+            "the remote class `tokenizer_class` names, which builds the tokenizer from \
+             tokenizer.json",
         ),
     ),
     // Both build the fast tokenizer from tokenizer.json.
@@ -1037,31 +1073,50 @@ fn post_processor<'a>(
     post: Option<&'a Json>,
     bos: Option<u32>,
     by_name: &HashMap<&str, u32>,
-) -> Result<Option<&'a str>, Error> {
+    rule: Bos,
+) -> Result<Option<(&'a str, u32)>, Error> {
     let bad = |what: String| Error::Vocab(what);
+    let bare = rule == Bos::Template;
     let Some(post) = post.filter(|v| !v.is_null()) else {
-        return Ok(None);
+        return if bare {
+            Err(bad(
+                "tokenizer.json.post_processor is absent, where this row's is a bare template \
+                 that adds the BOS first"
+                    .into(),
+            ))
+        } else {
+            Ok(None)
+        };
     };
     let unsupported = || {
         bad(format!(
-            "tokenizer.json.post_processor {post} is unsupported; it is absent, a ByteLevel \
-             that moves no id, or a Sequence of one and a template that adds the BOS first"
+            "tokenizer.json.post_processor {post} is unsupported; {}",
+            if bare {
+                "it is a bare template that adds the BOS first"
+            } else {
+                "it is absent, a ByteLevel that moves no id, or a Sequence of one and a template \
+                 that adds the BOS first"
+            }
         ))
     };
-    if byte_level_posts().iter().any(|v| v == post) {
-        return Ok(None);
-    }
-    if post["type"] != "Sequence" || post.as_object().is_none_or(|o| o.len() != 2) {
-        return Err(unsupported());
-    }
-    if !post.get("processors").is_some_and(|v| v.is_array()) {
-        return Err(unsupported());
-    }
-    let processors = post["processors"].as_array().expect("an array");
-    if processors.len() != 2 || !byte_level_posts().iter().any(|v| v == &processors[0]) {
-        return Err(unsupported());
-    }
-    let template = &processors[1];
+    let template = if bare {
+        post
+    } else {
+        if byte_level_posts().iter().any(|v| v == post) {
+            return Ok(None);
+        }
+        if post["type"] != "Sequence" || post.as_object().is_none_or(|o| o.len() != 2) {
+            return Err(unsupported());
+        }
+        if !post.get("processors").is_some_and(|v| v.is_array()) {
+            return Err(unsupported());
+        }
+        let processors = post["processors"].as_array().expect("an array");
+        if processors.len() != 2 || !byte_level_posts().iter().any(|v| v == &processors[0]) {
+            return Err(unsupported());
+        }
+        &processors[1]
+    };
     if template["type"] != "TemplateProcessing"
         || !template.as_object().is_some_and(|o| {
             o.keys()
@@ -1143,7 +1198,7 @@ fn post_processor<'a>(
             "tokenizer.json.post_processor names {token:?}, no token of this vocabulary"
         ))
     })?;
-    if Some(id) != bos {
+    if !bare && Some(id) != bos {
         return Err(bad(format!(
             "tokenizer.json.post_processor names {token:?} (id {id}), not the exported bos \
              token (id {bos:?})"
@@ -1159,7 +1214,76 @@ fn post_processor<'a>(
             "tokenizer.json.post_processor names {token:?} with no special_tokens entry for it"
         )));
     }
-    Ok(Some(token))
+    Ok(Some((token, id)))
+}
+
+/// HF's `unk_token` and `byte_fallback` act on a piece the vocabulary lacks. Where either is set
+/// the vocabulary must hold the byte-level token of every byte that occurs in UTF-8 text (all but
+/// 0xC0, 0xC1 and 0xF5 to 0xFF, which no encoded string holds), so no piece of a ByteLevel word is
+/// unknown and serving's BPE, which skips such a piece, makes HF's ids; an `unk_token` must name a
+/// token of the vocabulary. Refused by name otherwise.
+fn byte_alphabet(
+    model: &Json,
+    tokens: &[Value],
+    by_name: &HashMap<&str, u32>,
+) -> Result<(), Error> {
+    let bad = |what: String| Error::Vocab(what);
+    let unk = match &model["unk_token"] {
+        Json::Null => None,
+        Json::String(name) => Some(name.as_str()),
+        v => {
+            return Err(bad(format!(
+                "tokenizer.json.model.unk_token {v} is not a name"
+            )));
+        }
+    };
+    if let Some(name) = unk
+        && !by_name.contains_key(name)
+    {
+        return Err(bad(format!(
+            "tokenizer.json.model.unk_token {name:?} is no token of this vocabulary"
+        )));
+    }
+    if unk.is_none() && model["byte_fallback"] != Json::Bool(true) {
+        return Ok(());
+    }
+    let held: std::collections::HashSet<&str> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Value::String(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut buf = [0u8; 4];
+    let missing: Vec<usize> = tokenizer::byte_to_cpt_table()
+        .iter()
+        .enumerate()
+        .filter(|&(byte, &cp)| {
+            !matches!(byte, 0xC0 | 0xC1 | 0xF5..=0xFF)
+                && char::from_u32(cp)
+                    .is_none_or(|c| !held.contains(c.encode_utf8(&mut buf) as &str))
+        })
+        .map(|(byte, _)| byte)
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(bad(format!(
+            "tokenizer.json.model sets unk_token or byte_fallback, and its vocabulary lacks the \
+             byte-level tokens of the bytes {missing:?}, which UTF-8 text holds: a piece of a word \
+             would be unknown"
+        )))
+    }
+}
+
+/// What a row's post-processor says of the BOS.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bos {
+    /// A Sequence of a ByteLevel and a template whose token is the BOS the config names.
+    Exported,
+    /// A bare template ([`BARE_BOS`]): its token is the BOS, the header exports it, and the
+    /// config's `bos_token_id` is what the chat protocol writes itself.
+    Template,
 }
 
 /// The chat template of the repo at `dir`: `chat_template.jinja`, else `tokenizer_config.json`'s
@@ -1263,6 +1387,7 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
         added,
         by_name,
     } = vocabulary(model, &tok, &tc, spec)?;
+    byte_alphabet(model, &tokens, &by_name)?;
     let mut out = vec![
         (
             "tokenizer.ggml.model".to_string(),
@@ -1289,7 +1414,23 @@ pub fn keys(dir: &Path, spec: &VocabSpec) -> Result<Keys, Error> {
         });
     // The BOS template the post-processor spells is the header's `add_bos_token`; without one
     // the key the config writes stands.
-    let template = post_processor(tok.get("post_processor"), bos, &by_name)?;
+    let rule = if BARE_BOS.contains(&pre) {
+        Bos::Template
+    } else {
+        Bos::Exported
+    };
+    let template = post_processor(tok.get("post_processor"), bos, &by_name, rule)?;
+    let mut ids = ids;
+    if let (Bos::Template, Some((_, id))) = (rule, template) {
+        let value = Value::U32(id);
+        match ids
+            .iter_mut()
+            .find(|(k, _)| k == "tokenizer.ggml.bos_token_id")
+        {
+            Some(entry) => entry.1 = value,
+            None => ids.push(("tokenizer.ggml.bos_token_id".to_string(), value)),
+        }
+    }
     out.extend(ids);
     for kind in ["bos", "eos"] {
         let key = format!("add_{kind}_token");
@@ -1758,6 +1899,7 @@ mod tests {
             ["tokenizer_config.json", "", "pretokenize_regex", "$", "different"],
             ["tokenizer_config.json", "", "tokenizer_class", "PreTrainedTokenizerFast", "LlamaTokenizer"],
             ["tokenizer_config.json", "", "model_max_length", 262144, "long"],
+            ["tokenizer_config.json", "", "auto_map", {"AutoTokenizer":["a.B",null]}, "a.B"],
             ["tokenizer_config.json", "", "backend", "tokenizers", "sentencepiece"],
             ["tokenizer_config.json", "", "model_input_names", ["input_ids", "attention_mask"], ["input_ids"]],
             ["tokenizer_config.json", "", "is_local", true, "yes"],
@@ -2906,6 +3048,210 @@ mod tests {
                 .reverse();
         });
         super::keys(&dir, &spec_of(&dir)).unwrap();
+        remove(&dir);
+    }
+
+    /// ERNIE 5.5 Flash Preview's tokenizer files as the folder ships them but for the vocabulary,
+    /// which holds the nine specials (ids 0 to 8: pad, begin, mask, five fillers, `<|ernie:im_end|>`)
+    /// and the byte-level token of every byte UTF-8 text holds (247 of 256: the vocabulary lacks
+    /// 0xC0, 0xC1 and 0xF5 to 0xFF), and no merges; the pipeline is [`PRE`]'s `ernie5` row
+    /// itself. The post-processor is the bare `<|ERNIE_MASK|>` template (id 2), the config's
+    /// `bos_token_id` is `<|ERNIE_BEGIN|>` (id 1), `unk_token` is the pad token and
+    /// `byte_fallback` is on. `edit` takes `tokenizer.json`, `tokenizer_config.json` and
+    /// `config.json`.
+    fn ernie_repo(edit: impl FnOnce(&mut Json, &mut Json, &mut Json)) -> std::path::PathBuf {
+        use serde_json::json;
+        let specials = [
+            "<|ERNIE_PAD|>",
+            "<|ERNIE_BEGIN|>",
+            "<|ERNIE_MASK|>",
+            "<|ernie:3|>",
+            "<|ernie:4|>",
+            "<|ernie:5|>",
+            "<|ernie:6|>",
+            "<|ernie:7|>",
+            "<|ernie:im_end|>",
+        ];
+        let mut vocab = serde_json::Map::new();
+        for (id, name) in specials.iter().enumerate() {
+            vocab.insert((*name).to_string(), json!(id));
+        }
+        for (byte, &cp) in tokenizer::byte_to_cpt_table().iter().enumerate() {
+            if !matches!(byte, 0xC0 | 0xC1 | 0xF5..=0xFF) {
+                let piece = char::from_u32(cp).expect("a byte's codepoint").to_string();
+                vocab.insert(piece, json!(vocab.len()));
+            }
+        }
+        let size = vocab.len();
+        let added: Vec<Json> = specials
+            .iter()
+            .enumerate()
+            .map(|(id, name)| {
+                json!({"id":id,"content":name,"single_word":false,"lstrip":false,"rstrip":false,
+                    "normalized":false,"special":true})
+            })
+            .collect();
+        let row = PRE
+            .iter()
+            .find(|r| r.0 == "ernie5")
+            .expect("the ernie5 row");
+        let mut tokenizer = json!({"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":added,"normalizer":null,
+            "pre_tokenizer":serde_json::from_str::<Json>(row.1).unwrap(),
+            "post_processor":{"type":"TemplateProcessing",
+                "single":[{"SpecialToken":{"id":"<|ERNIE_MASK|>","type_id":0}},
+                    {"Sequence":{"id":"A","type_id":0}}],
+                "pair":[{"SpecialToken":{"id":"<|ERNIE_MASK|>","type_id":0}},
+                    {"Sequence":{"id":"A","type_id":0}},
+                    {"SpecialToken":{"id":"<|ERNIE_MASK|>","type_id":1}},
+                    {"Sequence":{"id":"B","type_id":1}}],
+                "special_tokens":{"<|ERNIE_MASK|>":{"id":"<|ERNIE_MASK|>","ids":[2],
+                    "tokens":["<|ERNIE_MASK|>"]}}},
+            "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false},
+            "model":{"type":"BPE","dropout":null,"unk_token":"<|ERNIE_PAD|>",
+                "continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,
+                "byte_fallback":true,"ignore_merges":false,"vocab":vocab,"merges":[]}});
+        let mut tc = json!({"tokenizer_class":"ErnieChatTokenizer",
+            "auto_map":{"AutoTokenizer":["tokenization_ernie.ErnieChatTokenizer",null]},
+            "eos_token":"<|ernie:im_end|>","model_max_length":1_048_576,
+            "clean_up_tokenization_spaces":false,"bos_token":"<|ERNIE_BEGIN|>",
+            "pad_token":"<|ERNIE_PAD|>"});
+        let mut config = json!({"model_type":"ernie5_5_moe","vocab_size":size,"bos_token_id":1,
+            "eos_token_id":2,"pad_token_id":0});
+        edit(&mut tokenizer, &mut tc, &mut config);
+        let generation = json!({"bos_token_id":1,"eos_token_id":[2,8],"pad_token_id":0});
+        repo(&[
+            ("tokenizer.json", &tokenizer.to_string()),
+            ("tokenizer_config.json", &tc.to_string()),
+            ("generation_config.json", &generation.to_string()),
+            ("config.json", &config.to_string()),
+        ])
+    }
+
+    /// ERNIE's files are the `ernie5` row, with a bare BOS template: the header exports the
+    /// template's token (`<|ERNIE_MASK|>`, id 2) as the BOS and adds it, where the config names
+    /// `<|ERNIE_BEGIN|>` (id 1) that the chat protocol writes itself; the pad and the stops are the
+    /// files'. Mutants (each red at this clause): the row's BOS rule off (`BARE_BOS` empty:
+    /// `tokenizer.json.post_processor ... is unsupported`), the exported id left at the config's
+    /// (`bos_token_id` is 1), the row out of [`PRE`] (`pre-tokenizer row "ernie5" is not one of`).
+    #[test]
+    fn the_ernie_files_open_as_the_ernie5_row() {
+        let dir = ernie_repo(|_, _, _| {});
+        let spec = spec_of(&dir).with_pre("ernie5").unwrap();
+        let keys = super::keys(&dir, &spec).unwrap();
+        let value = |key: &str| get(&keys.keys, &format!("tokenizer.ggml.{key}")).cloned();
+        assert_eq!(value("pre"), Some(Value::String("ernie5".into())));
+        assert_eq!(value("bos_token_id"), Some(Value::U32(2)), "the template's");
+        assert_eq!(value("add_bos_token"), Some(Value::Bool(true)));
+        assert_eq!(value("padding_token_id"), Some(Value::U32(0)));
+        assert_eq!(keys.stop, [2, 8]);
+        remove(&dir);
+    }
+
+    /// A bare template is read or refused by name: with no post-processor, a ByteLevel Sequence
+    /// around the template (another row's spelling), a template whose token is no token of the
+    /// vocabulary, or whose `special_tokens` entry is missing, the row refuses and names the
+    /// post-processor; and the bare spelling is the `ernie5` row's alone, so the same files under
+    /// Qwen's pre-tokenizer refuse it as unsupported. Mutants: the bare arm taking any
+    /// `post_processor`, every row taking the bare spelling.
+    #[test]
+    fn the_ernie_bare_template_is_read_or_refused_by_name() {
+        fn run(edit: impl FnOnce(&mut Json, &mut Json, &mut Json), needle: &str) {
+            let dir = ernie_repo(edit);
+            let spec = spec_of(&dir).with_pre("ernie5").unwrap();
+            let e = super::keys(&dir, &spec).unwrap_err().to_string();
+            assert!(e.contains(needle), "{e}");
+            remove(&dir);
+        }
+        run(
+            |t, _, _| t["post_processor"] = Json::Null,
+            "post_processor is absent",
+        );
+        run(
+            |t, _, _| {
+                let template = t["post_processor"].take();
+                t["post_processor"] = serde_json::json!({"type":"Sequence","processors":[
+                    {"type":"ByteLevel","add_prefix_space":true,"trim_offsets":false,"use_regex":true},
+                    template]});
+            },
+            "post_processor",
+        );
+        run(
+            |t, _, _| {
+                t["post_processor"]["single"][0]["SpecialToken"]["id"] =
+                    serde_json::json!("<|nowhere|>");
+            },
+            "no token of this vocabulary",
+        );
+        run(
+            |t, _, _| {
+                t["post_processor"]["special_tokens"] = serde_json::json!({});
+            },
+            "post_processor",
+        );
+        let dir = ernie_repo(|t, _, _| {
+            let qwen = PRE
+                .iter()
+                .find(|r| r.0 == "qwen35")
+                .expect("the qwen35 row");
+            t["pre_tokenizer"] = serde_json::from_str(qwen.1).unwrap();
+        });
+        let spec = spec_of(&dir).with_pre("qwen35").unwrap();
+        let e = super::keys(&dir, &spec).unwrap_err().to_string();
+        assert!(
+            e.contains("post_processor") && e.contains("is unsupported"),
+            "{e}"
+        );
+        remove(&dir);
+    }
+
+    /// `unk_token` and `byte_fallback` ask for the byte-level token of every byte UTF-8 text holds:
+    /// a vocabulary without one is refused naming the byte, an `unk_token` that names no token is
+    /// refused, and a byte-level vocabulary that sets neither is free of the rule (a vocabulary
+    /// short of a byte is another model's). Mutant: the check dropped from `keys`.
+    #[test]
+    fn unk_or_byte_fallback_need_the_whole_byte_alphabet() {
+        fn run(edit: impl FnOnce(&mut Json, &mut Json, &mut Json), needle: &str) {
+            let dir = ernie_repo(edit);
+            let spec = spec_of(&dir).with_pre("ernie5").unwrap();
+            let e = super::keys(&dir, &spec).unwrap_err().to_string();
+            assert!(e.contains(needle), "{e}");
+            remove(&dir);
+        }
+        // "A" (0x41) is its own byte-level token; with its id dropped the vocabulary has a hole.
+        let without_a = |t: &mut Json| {
+            let id = t["model"]["vocab"]
+                .as_object_mut()
+                .unwrap()
+                .remove("A")
+                .unwrap();
+            let moved = t["model"]["vocab"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .find(|(_, v)| v.as_u64() > id.as_u64())
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            t["model"]["vocab"][moved.as_str()] = id;
+        };
+        run(
+            |t, _, c| {
+                without_a(t);
+                c["vocab_size"] = serde_json::json!(255);
+            },
+            "lacks the byte-level tokens of the bytes [65]",
+        );
+        run(
+            |t, _, _| t["model"]["unk_token"] = serde_json::json!("<|nowhere|>"),
+            "unk_token \"<|nowhere|>\" is no token",
+        );
+        let dir = ernie_repo(|t, _, c| {
+            without_a(t);
+            c["vocab_size"] = serde_json::json!(255);
+            t["model"]["unk_token"] = Json::Null;
+            t["model"]["byte_fallback"] = serde_json::json!(false);
+        });
+        super::keys(&dir, &spec_of(&dir).with_pre("ernie5").unwrap()).unwrap();
         remove(&dir);
     }
 

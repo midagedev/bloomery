@@ -8,6 +8,7 @@ use crate::engram::EngramFacts;
 use crate::facts::Fact;
 
 pub mod deepseek41;
+pub mod ernie55;
 pub mod exaone_moe;
 pub mod hy_v4_flash;
 pub mod kimi_k3;
@@ -32,6 +33,7 @@ pub fn engram_facts(arch: &str) -> Option<&'static EngramFacts> {
 #[must_use]
 pub fn allowed_types(arch: &str, stem: &str) -> Option<&'static [GgmlType]> {
     match arch {
+        ernie55::ARCH => ernie55::allowed_types(stem),
         exaone_moe::ARCH => exaone_moe::allowed_types(stem),
         hy_v4_flash::ARCH => hy_v4_flash::allowed_types(stem),
         kimi_k3::ARCH | kimi_k3::ARCH_K31 => kimi_k3::allowed_types(stem),
@@ -53,7 +55,7 @@ pub fn row_groups_fact(arch: &str, stem: &str) -> Option<&'static Fact> {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_types, exaone_moe, hy_v4_flash, kimi_k3};
+    use super::{allowed_types, ernie55, exaone_moe, hy_v4_flash, kimi_k3};
 
     /// The one call routes each architecture word to its own stem table (both Kimi words to the same one) and holds
     /// an architecture with no table, or a stem it lacks, to `None`.
@@ -78,6 +80,11 @@ mod tests {
             hy_v4_flash::allowed_types(stem)
         );
         assert!(allowed_types(hy_v4_flash::ARCH, stem).is_some());
+        assert_eq!(
+            allowed_types(ernie55::ARCH, stem),
+            ernie55::allowed_types(stem)
+        );
+        assert!(allowed_types(ernie55::ARCH, stem).is_some());
         assert_eq!(allowed_types("no-such-arch", stem), None);
         assert_eq!(allowed_types(kimi_k3::ARCH, "no.such.stem"), None);
     }

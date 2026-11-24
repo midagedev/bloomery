@@ -46,7 +46,7 @@ pub fn out_gate(
     let gates = match kind {
         OutGate::Proj => m * width,
         OutGate::ProjHead => m * n_head,
-        OutGate::None | OutGate::Packed => {
+        OutGate::None | OutGate::Packed | OutGate::QLatent => {
             return Err(ChainError::shape(
                 WHAT,
                 format!("{kind:?} is not a gate of its own: this rule takes Proj and ProjHead"),
