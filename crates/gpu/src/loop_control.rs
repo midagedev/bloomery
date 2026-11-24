@@ -76,6 +76,13 @@
 //! threads with the same butterfly and tree, the normed value one rounded multiply of the raw
 //! one, the dots' first product alone and the folds ascending — so the rows form writes the
 //! step's bits at every row, whatever the pass's length.
+//!
+//! A few rows (a verify's, 2 to [`ROWS_DOWN`]) take the step's pair itself:
+//! [`LoopControlKernels::enqueue`] and [`LoopControlKernels::enqueue_attn`] launch over `m` rows,
+//! a block one row's, so their grids widen with the rows (`groups · m`, then `cols · m`, a module)
+//! and each row is the step's bits at its position. The rows form's down grid is one block a
+//! module under [`ROWS_DOWN`] rows, on one SM; the step's blocks read each weight once a row, so
+//! past a few rows the rows form is the reader.
 
 use crate::GpuError;
 use crate::elem::rms_scale_of_mean_checked;

@@ -1,24 +1,29 @@
 //! The Inkling 2 verify: the step widened to `m` rows ([`Rows`]), 2 to [`VERIFY_ROWS`] a call.
 //! A verify walks the prompt pass's rows ([`super`]) from the held position with the step's
-//! kernel at every node: the mixes, the controllers' rows forms and the norms over the rows, the
-//! step's gemvs over the rows (`norm_proj`'s outputs are their bits), the convs on the visit's
-//! conv ring (a row reads the rows before it, this call's too), the epilogue's append of every
-//! row's keys before the step's rel-bias flash reads each row's live keys, the router's rows,
-//! the routed rows on the step's card leg (a run's slots naming one expert read it once) and
-//! the head once over every row ([`RowHeads::One`]). Each row is the step's bits at its
-//! position, so a verify of `m` rows is `m` steps in turn, and it leaves every store, the held
-//! position and the written end where they leave them; a rollback after it is the step's.
+//! kernel at every node: the mixes as the step's launch pair over the rows ([`MixAt::mix_step`], a
+//! query a job), the controllers as the step's launch pair at the rows (a block one row's) and the
+//! norms over the rows, the step's gemvs over the rows (`norm_proj`'s outputs are their bits), the
+//! convs on the visit's conv ring (a row reads the rows before it, this call's too), the
+//! epilogue's append of every row's keys before the step's rel-bias flash reads each row's live
+//! keys, the router's rows, the routed rows on the step's card leg (a run's slots naming one
+//! expert read it once) and the head once over every row ([`RowHeads::One`]). Each row is the
+//! step's bits at its position, so a verify of `m` rows is `m` steps in turn, and it leaves every
+//! store, the held position and the written end where they leave them; a rollback after it is the
+//! step's.
 //!
 //! A verify takes no forced picks, no taps and no importance collector: each is refused by name.
 
 use super::super::route::N_USED;
-use super::super::{Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Layer, head_logits};
-use super::{Bufs, RowWalk, Tail};
+use super::super::{Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Layer, MIX_EPS, head_logits};
+use super::{Bufs, MixAt, RowWalk, Tail};
+use crate::attn_res::AttnResNormedArgs;
+use crate::attn_res_step::MixStepScratch;
 use crate::card_leg::{LegBufs, LegRun, LegShape, LegStacks, LegSum};
 use crate::flash_gqa::window_segments;
 use crate::head::Head;
 use crate::hybrid::Chain;
 use crate::model::{GpuModel, MAX_PASS_ROWS, RowHeads, Rows};
+use crate::tensor::Window;
 use crate::weights::Weights;
 use crate::{Gpu, GpuError, launch_u32};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -34,10 +39,11 @@ pub(in crate::arch::inkling2) const VERIFY_ROWS: usize = MAX_PASS_ROWS;
 const _: () = assert!(VERIFY_ROWS == 8);
 
 /// A verify's own buffers beside the prompt pass's, whose rows it walks: the step's flash
-/// partials and card leg at [`VERIFY_ROWS`] rows.
+/// partials and card leg at [`VERIFY_ROWS`] rows, and its mixes' statistics and tickets at as many.
 pub(in crate::arch::inkling2) struct VerifyBufs {
     pub(super) part_v: DeviceBuffer<f32>,
     pub(super) part_ms: DeviceBuffer<f32>,
+    pub(super) mix: MixStepScratch,
     leg: LegBufs,
 }
 
@@ -60,13 +66,14 @@ impl VerifyBufs {
         Ok(VerifyBufs {
             part_v: z(VERIFY_ROWS * d.n_head * segs * HEAD)?,
             part_ms: z(VERIFY_ROWS * d.n_head * segs * 2)?,
+            mix: MixStepScratch::rows(stream, (d.n, VERIFY_ROWS))?,
             leg: LegBufs::for_down(stream, shape, DownAct::Q8Blocks32)?,
         })
     }
 
     /// Device bytes the buffers take.
     pub(in crate::arch::inkling2) fn bytes(&self) -> usize {
-        self.part_v.num_bytes() + self.part_ms.num_bytes() + self.leg.bytes()
+        self.part_v.num_bytes() + self.part_ms.num_bytes() + self.mix.bytes() + self.leg.bytes()
     }
 }
 
@@ -174,6 +181,85 @@ impl GpuModel<Body> {
     }
 }
 
+/// One mix of the step's pair over the verify's rows: the banked blocks and the stream, the query
+/// row (`j` of its table) and the rows it writes. A job is one query, so each query's rows land
+/// in their own buffer, as the controllers and the norms read them.
+pub(super) struct StepMix<'a> {
+    banks: (&'a DeviceBuffer<f32>, usize),
+    cur: &'a DeviceBuffer<f32>,
+    query: (&'a DeviceBuffer<f32>, usize),
+    y: &'a mut DeviceBuffer<f32>,
+}
+
+impl<'a> StepMix<'a> {
+    /// The mix over `banks` and the stream by query row `j` of the query table, into `y`'s rows.
+    pub(super) fn new(
+        banks: (&'a DeviceBuffer<f32>, usize),
+        cur: &'a DeviceBuffer<f32>,
+        query: (&'a DeviceBuffer<f32>, usize),
+        y: &'a mut DeviceBuffer<f32>,
+    ) -> StepMix<'a> {
+        StepMix {
+            banks,
+            cur,
+            query,
+            y,
+        }
+    }
+}
+
+/// Query row `j` of a query table: its `n` values.
+fn query_row(buf: &DeviceBuffer<f32>, (j, n): (usize, usize)) -> Result<Window<'_, f32>, GpuError> {
+    Window::<f32>::of(buf, j * n * 4, n)
+}
+
+/// `m`'s mix at the one query row `query`: the visit's pitch, row count, scale and epsilon and
+/// its fault sink.
+fn step_args<'a>(
+    m: &StepMix<'a>,
+    query: &'a DeviceBuffer<f32>,
+    at: &MixAt<'_>,
+) -> AttnResNormedArgs<'a> {
+    AttnResNormedArgs {
+        banks: m.banks.0,
+        n_banks: m.banks.1,
+        stride: at.pitch,
+        cur: m.cur,
+        queries: query,
+        nq: 1,
+        scale: at.scale,
+        eps: MIX_EPS,
+        n: at.n,
+        m: at.m,
+        fault: at.fault,
+    }
+}
+
+impl MixAt<'_> {
+    /// The step's launch pair over the rows ([`crate::attn_res_step`]): the mix `a` and, beside
+    /// it, the independent mix `b` into their outputs, each row of an output the step mix's bits
+    /// at that row ([`MixAt::mix`] writes the same row, a query a launch). The banks are the
+    /// pass's pitch apart, the statistics and tickets `scratch`'s, a row each.
+    pub(super) fn mix_step(
+        &self,
+        (scratch, a, b): (&mut MixStepScratch, StepMix<'_>, Option<StepMix<'_>>),
+    ) -> Result<(), GpuError> {
+        let qa = query_row(a.query.0, (a.query.1, self.n))?;
+        let a_args = step_args(&a, &qa, self);
+        let StepMix { y: y_a, .. } = a;
+        let Some(b) = b else {
+            return self
+                .step
+                .enqueue_rows(self.stream, (a_args, y_a), None, scratch);
+        };
+        let qb = query_row(b.query.0, (b.query.1, self.n))?;
+        let b_args = step_args(&b, &qb, self);
+        let StepMix { y: y_b, .. } = b;
+        self.step
+            .enqueue_rows(self.stream, (a_args, y_a), Some((b_args, y_b)), scratch)
+    }
+}
+
 impl RowWalk<'_> {
     /// The verify's routed rows on the step's card leg: every row's slots at the router's picks
     /// (a run's slots naming one expert read it once), each row's weighted sum into `moe`.
@@ -219,8 +305,8 @@ impl RowWalk<'_> {
         )
     }
 
-    /// The head's mix of the banked blocks and the stream over every row into the head's rows,
-    /// then the head over them ([`head_logits`]).
+    /// The head's mix of the banked blocks and the stream over every row into the head's rows
+    /// (the step's pair), then the head over them ([`head_logits`]).
     pub(super) fn finish_rows(
         &mut self,
         (n_visits, pad): (usize, &DeviceBuffer<f32>),
@@ -230,12 +316,20 @@ impl RowWalk<'_> {
         let (gpu, w) = (self.gpu, self.w);
         let mx = self.mixes(gpu.layer_sink(n_visits)?);
         let b = &*self.b;
-        mx.mix(
-            (&b.banks, self.pushed),
-            &b.x,
-            (w.f32_buf(WHAT, names::OUTPUT_RES_QUERY)?, 0),
-            head.input_mut(),
-        )?;
+        let v = self
+            .verify
+            .as_deref_mut()
+            .ok_or(GpuError::state(WHAT, "a verify's buffers"))?;
+        mx.mix_step((
+            &mut v.mix,
+            StepMix::new(
+                (&b.banks, self.pushed),
+                &b.x,
+                (w.f32_buf(WHAT, names::OUTPUT_RES_QUERY)?, 0),
+                head.input_mut(),
+            ),
+            None,
+        ))?;
         head_logits((gpu, w), head, pad, logits, self.m)
     }
 }

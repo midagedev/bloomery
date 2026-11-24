@@ -1,0 +1,47 @@
+# ink2vrows: Inkling 2 Mini's verify of 8 rows with its controllers and mixes on the step's launch pairs at
+# the rows, against main 3cd0efa97, on the RTX 5090. The derivation is /root/agents/specs/ink2vrows/paper.py
+# (paper.txt its output).
+# [measured] base: gate_inkling2_e2e real tier prints verify_walls_ms m=8 37.83 / 38.39 ms at depth 35 (two
+# runs, ink2r4 work/v-e2e-real1.log and prof-base.log); the quickest replay's nsys class table (ink2r4
+# work/nsys-base.class.txt): kernel sum 37.51 ms over 1,670 kernels, gaps 0.33 ms; loop_control_down_rows 48 x
+# 415.4 us = 19.94 ms (grids 1 and 3 blocks: one 256-thread block a module, each reading its 1.18 MB on one
+# SM) and its out forms 24 x 16.5 + 24 x 16.2 us = 0.78 ms; attn_res_mix_normed 208 x 9.67 us = 2.01 ms (grid
+# 8); the rest 14.77 ms (the experts' _cols 6.2, the projections 6.2).
+# [derived] item 1, the controllers as the step's pair at m = 8 (enqueue_attn / enqueue, the step's entries,
+# no new one): grids 768 / 864 / 256 / 288 blocks a core visit, a block one row's, the weights read once a row
+# (the DRAM bytes the step's: the triple's 7 MB sit under the L2), each launch the step's block chain (7.7 us
+# a down at 4+ blocks an SM, 6.7 us an out) plus its bytes at 1 TB/s: 0.7..1.7 ms for the 48 down and 48 out
+# launches, the hi end at one down block an SM (4.5 waves a triple). A wider rows entry would read the weights
+# once for the 8 rows and save about 0.3 ms more: inside the 20 % the simplest form costs.
+# [derived] item 3, the mixes as the step pair's rows form (its two entries take m; a query a job, 153 pairs =
+# 306 launches for 208): a launch the step's 2.35 us, the 98 nodes at c_node 0.5 us (the verify's own smallest
+# nodes): 0.7..1.0 ms. The step's kernel a row instead would be 153 pairs x 8 rows = 2,448 launches at 2.35 us =
+# 5.8 ms, and the entries address no row.
+# [derived] verify(8) wall = 14.77 + 0.33 gaps + 0.05 nodes + the items = 15.8..18.0 ms. The projections (6.2
+# ms) stay: the step's norm_proj a row reads its 22 MB eight times (146 us a visit against the 130 measured,
+# beside 11 copies a row), and the m-row entry they need lives in norm_proj.rs, outside the round's file list.
+# Against the base's 37.8..38.8 ms: -58..-52 %.
+kind: ab
+question: does Inkling 2 Mini's verify of 8 rows take about half its wall once its controllers and mixes run
+  the step's launch pairs at the rows?
+term: the verify of 8 rows' wall (GpuModel::step_rows::<8> replayed in graph mode, the ids' read included) —
+  (changed − base) / base, ms @ Inkling-2-Mini-UD-Q4_K_XL, depth 35 (set a's prompt), RTX 5090, tree
+  bloomery-ink2vrows against base 3cd0efa97
+unit: %
+predict: -58..-52
+rounds: 4
+sd: 1.5 % the base's own three verify(8) replays under nsys, 37.84 / 37.85 / 38.82 ms (ink2r4
+  work/nsys-base.class.txt), and its two gate runs 37.83 / 38.39
+condition: both arms' binaries built on the box from their trees and gate_inkling2_e2e (fixture and real)
+  green at the changed tree first (verify_is_m_steps holds the bits and, from this round, the step-pair forms:
+  each row the step's); one lease, the 5090 alone, the arms alternating a round, an arm's wall the median of
+  its verify(8) replays after a warm one, the same depth and set; nothing else on the card (gpu-apps in the
+  witness). Not checked inside the rounds: the prompt pass, which keeps the pass's rows forms
+decide-in: land the change with its owning gates; the next terms are the projections (an m-row norm_proj entry
+  in norm_proj.rs, 6.2 -> 1.0..1.5 ms) and the experts' 6.2 ms
+decide-below: under -58 %: the step's grids at 8 rows ran cheaper than the block chain says (the rows' blocks
+  hit the L2 under one another); read the per-kernel table of the changed tree (nsys, the same probe) and
+  record the launches' times as the finding
+decide-above: above -52 %: read the per-kernel table for the form that did not move (a controller launch still
+  one block a module, a mix still attn_res_mix_normed) and the gaps between the 306 mix launches before
+  crediting the model

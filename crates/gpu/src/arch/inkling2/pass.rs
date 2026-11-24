@@ -31,18 +31,20 @@
 //! by name a pass that takes more.
 //!
 //! A verify ([`rows`]) walks the same rows with the step's kernels where the prompt's differ: the
-//! projections as the step's gemvs over the rows, the attention as the step's rel-bias flash at
-//! the rows' causal offsets, the routed rows on the step's card leg, and the head over every row;
-//! so each row is a step's bits.
+//! mixes as the step's launch pair over the rows, the controllers as the step's launch pair at the
+//! rows (a block one row's), the projections as the step's gemvs over the rows, the attention as
+//! the step's rel-bias flash at the rows' causal offsets, the routed rows on the step's card leg,
+//! and the head over every row; so each row is a step's bits.
 
 use super::route::N_USED;
 use super::state::{self, VisitStore};
 use super::{
-    Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Kernels, Layer, MIX_EPS, MSG_ATTN, MSG_FFN, WHAT,
-    conv_scale, head_logits, tap_widths,
+    Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Kernels, Layer, MIX_EPS, MSG_ATTN, MSG_FFN, MSG_K,
+    MSG_Q, MSG_V, WHAT, conv_scale, head_logits, tap_widths,
 };
 use crate::arch::hybrid::{Site, WideCx, project_wide};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs};
+use crate::attn_res_step::AttnResStepKernels;
 use crate::card_leg::{LegStacks, RouteIo};
 use crate::card_slots::{CardAcc, CardSlotKernels};
 use crate::fault::FaultSink;
@@ -74,6 +76,7 @@ use model::arch::inkling2::place::{self, PassShape};
 pub(super) mod rows;
 use model::arch::models::OutGate;
 use model::placement::accepts::{self, Program};
+use rows::StepMix;
 
 const CALL: &str = "inkling2 prompt pass";
 /// The message mix's rows: q, ffn, k and v.
@@ -707,11 +710,12 @@ fn copy_span(
     copy_row(stream, &src, &mut dst, len)
 }
 
-/// What every normed mix of a visit shares: the kernels, the rows and the banks' pitch, the
-/// score scale, the visit's fault sink.
+/// What every normed mix of a visit shares: the kernels (the pass's and the step's pair), the rows
+/// and the banks' pitch, the score scale, the visit's fault sink.
 #[derive(Clone, Copy)]
 struct MixAt<'a> {
     k: &'a AttnResKernels,
+    step: &'a AttnResStepKernels,
     stream: &'a CudaStream,
     n: usize,
     m: usize,
@@ -757,6 +761,7 @@ impl<'a> RowWalk<'a> {
         let (k, gpu): (&'a Kernels, &'a Gpu) = (self.k, self.gpu);
         MixAt {
             k: &k.mix,
+            step: &k.step_mix,
             stream: gpu.stream(),
             n: self.d.n,
             m: self.m,
@@ -909,7 +914,8 @@ impl<'a> RowWalk<'a> {
             ffn_inp,
             ..
         } = &mut *self.b;
-        // The message mixes (q, ffn, k, v) over the bank, then the attention mix's queries.
+        // The message mixes (q, ffn, k, v) over the bank, then the attention mix's queries: the
+        // pass's entry a query a launch; a verify the step's pair, a query a job (rows.rs).
         if let Some(c) = ctrl {
             let LoopRows {
                 msg: msgs,
@@ -919,14 +925,46 @@ impl<'a> RowWalk<'a> {
             } = lp
                 .as_mut()
                 .ok_or(GpuError::state(CALL, "a looped trunk's message rows"))?;
-            for (j, y) in msgs.iter_mut().enumerate() {
-                mx.mix((msg_bank, n_msg), bank_last, (&c.queries, j), y)?;
+            if let Some(v) = self.verify.as_deref_mut() {
+                let [mq, mf, mk, mv] = &mut *msgs;
+                let (bank, last, table) = (&*msg_bank, &*bank_last, &c.queries);
+                mx.mix_step((
+                    &mut v.mix,
+                    StepMix::new((bank, n_msg), last, (table, MSG_Q), mq),
+                    Some(StepMix::new((bank, n_msg), last, (table, MSG_FFN), mf)),
+                ))?;
+                mx.mix_step((
+                    &mut v.mix,
+                    StepMix::new((bank, n_msg), last, (table, MSG_K), mk),
+                    Some(StepMix::new((bank, n_msg), last, (table, MSG_V), mv)),
+                ))?;
+            } else {
+                for (j, y) in msgs.iter_mut().enumerate() {
+                    mx.mix((msg_bank, n_msg), bank_last, (&c.queries, j), y)?;
+                }
             }
         }
         if let Some((query, nq)) = &layer.attn_query {
             let queries = w.f32_buf(CALL, query)?;
-            for (j, y) in mix.iter_mut().enumerate().take(*nq) {
-                mx.mix((banks, pushed), x, (queries, j), y)?;
+            if let Some(v) = self.verify.as_deref_mut() {
+                let [y0, y1, y2] = &mut *mix;
+                let (bank, cur, table) = (&*banks, &*x, queries);
+                mx.mix_step((
+                    &mut v.mix,
+                    StepMix::new((bank, pushed), cur, (table, 0), y0),
+                    (*nq > 1).then(|| StepMix::new((bank, pushed), cur, (table, 1), y1)),
+                ))?;
+                if *nq > 2 {
+                    mx.mix_step((
+                        &mut v.mix,
+                        StepMix::new((bank, pushed), cur, (table, 2), y2),
+                        None,
+                    ))?;
+                }
+            } else {
+                for (j, y) in mix.iter_mut().enumerate().take(*nq) {
+                    mx.mix((banks, pushed), x, (queries, j), y)?;
+                }
             }
         }
         let n_in = if layer.windowed && ctrl.is_none() {
@@ -965,12 +1003,13 @@ impl<'a> RowWalk<'a> {
                     })
                 };
                 let [y0, y1, y2] = &mut *xn;
-                k.ctrl.enqueue_attn_rows(
-                    stream,
-                    [args(0)?, args(1)?, args(2)?],
-                    h,
-                    [y0, y1, y2],
-                )?;
+                let modules = [args(0)?, args(1)?, args(2)?];
+                if self.verify.is_some() {
+                    // The step's pair at the rows (rows.rs): a block one row's.
+                    k.ctrl.enqueue_attn(stream, modules, h, [y0, y1, y2])?;
+                } else {
+                    k.ctrl.enqueue_attn_rows(stream, modules, h, [y0, y1, y2])?;
+                }
             }
             for (j, y) in mix.iter_mut().enumerate() {
                 gpu.elem().enqueue_rms_norm(
@@ -1234,35 +1273,41 @@ impl<'a> RowWalk<'a> {
             ..
         } = &mut *self.b;
         let cur = if self.banked { &*attn_out } else { &*ffn_inp };
-        mx.mix(
-            (banks, self.pushed),
-            cur,
-            (w.f32_buf(CALL, &layer.ffn_query)?, 0),
-            fmix,
-        )?;
+        let query = w.f32_buf(CALL, &layer.ffn_query)?;
+        if let Some(v) = self.verify.as_deref_mut() {
+            mx.mix_step((
+                &mut v.mix,
+                StepMix::new((&*banks, self.pushed), cur, (query, 0), fmix),
+                None,
+            ))?;
+        } else {
+            mx.mix((banks, self.pushed), cur, (query, 0), fmix)?;
+        }
         let normed_in: &DeviceBuffer<f32> = match (msg, layer.ctrl.as_ref()) {
             (true, Some(c)) => {
                 let LoopRows { msg: msgs, h, .. } = lp
                     .as_mut()
                     .ok_or(GpuError::state(CALL, "a looped trunk's message rows"))?;
                 let [down, gain, forget] = &c.w[3];
-                k.ctrl.enqueue_rows(
-                    stream,
-                    LoopControlArgs {
-                        cur: fmix,
-                        msg: &msgs[MSG_FFN],
-                        down: w.f32_buf(CALL, down)?,
-                        gain: w.f32_buf(CALL, gain)?,
-                        forget: w.f32_buf(CALL, forget)?,
-                        n,
-                        rank: self.d.rank,
-                        m,
-                        eps: MIX_EPS,
-                        fault,
-                    },
-                    h,
-                    moe,
-                )?;
+                let control = LoopControlArgs {
+                    cur: fmix,
+                    msg: &msgs[MSG_FFN],
+                    down: w.f32_buf(CALL, down)?,
+                    gain: w.f32_buf(CALL, gain)?,
+                    forget: w.f32_buf(CALL, forget)?,
+                    n,
+                    rank: self.d.rank,
+                    m,
+                    eps: MIX_EPS,
+                    fault,
+                };
+                // A verify the step's pair at the rows (rows.rs), a block one row's; the pass's the
+                // rows form.
+                if self.verify.is_some() {
+                    k.ctrl.enqueue(stream, control, h, moe)?;
+                } else {
+                    k.ctrl.enqueue_rows(stream, control, h, moe)?;
+                }
                 moe
             }
             (true, None) => return Err(GpuError::state(CALL, "a core layer's controllers")),

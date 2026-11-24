@@ -52,7 +52,10 @@
 //!   and as `m` steps in turn, each rolled back to the prompt's end: the verify's ids and every
 //!   row's logits are the steps' bit for bit and the model stands `m` positions on, eager and
 //!   replayed (graph mode captures the verify's graphs as a load serving a draft does,
-//!   `GpuModel::capture_verify`).
+//!   `GpuModel::capture_verify`). Beside the bits, the clause holds the verify graph's forms at
+//!   every row count: the controllers and the mixes launch the step's pairs alone (none of the
+//!   prompt pass's rows forms, a down for an out and a scores for an out), and prints each
+//!   count's geometry (`verify_geometry`, launches and grids an entry).
 //! - `verify_then_rollback`: the longest set's prompt (past a windowed visit's window), a verify
 //!   of [`VERIFY_ROWS`] ids, a rollback to [`VERIFY_BACK`] rows past the prompt and the rest of
 //!   the ids stepped from there: the verify's rows and the steps' are those of a run that only
@@ -862,6 +865,77 @@ mod gate {
     /// The rows of a verified block `verify_then_rollback` keeps.
     const VERIFY_BACK: usize = 3;
 
+    /// The prompt pass's rows forms of the controllers and the mix: one block a module at a
+    /// verify's rows. A verify launches none of them ([`verify_geometry`]): its controllers and
+    /// its mixes run the step's own pair at the rows (`arch/inkling2/rows.rs`).
+    const PASS_ROWS_FORMS: [&str; 4] = [
+        "loop_control_down_rows",
+        "loop_control_out_rows",
+        "loop_control_out3_rows",
+        "attn_res_mix_normed",
+    ];
+
+    /// The verify graph of `rows` rows' launch geometry: the controllers' and the mixes' entries
+    /// (the step's and the pass's rows forms) with their launches and the grids they launch at,
+    /// and whether the graph holds the step's pairs alone: none of [`PASS_ROWS_FORMS`], every
+    /// pair's two launches there (a down for an out, a scores for an out), and a mix at least.
+    fn verify_geometry(m: &GpuModel<Body>, rows: usize) -> Result<(Vec<String>, bool), GateError> {
+        let nodes = match rows {
+            2 => m.rows_graph_nodes::<2>()?,
+            3 => m.rows_graph_nodes::<3>()?,
+            4 => m.rows_graph_nodes::<4>()?,
+            5 => m.rows_graph_nodes::<5>()?,
+            6 => m.rows_graph_nodes::<6>()?,
+            7 => m.rows_graph_nodes::<7>()?,
+            8 => m.rows_graph_nodes::<8>()?,
+            _ => {
+                return Err(format!("{NAME}: a verify of {rows} rows (2 to {VERIFY_ROWS})").into());
+            }
+        };
+        const ENTRIES: [&str; 9] = [
+            "loop_control_down",
+            "loop_control_out",
+            "loop_control_out3",
+            "loop_control_down_rows",
+            "loop_control_out_rows",
+            "loop_control_out3_rows",
+            "attn_res_step_scores",
+            "attn_res_step_out",
+            "attn_res_mix_normed",
+        ];
+        let mut hist =
+            std::collections::BTreeMap::<&str, (usize, std::collections::BTreeSet<u32>)>::new();
+        for name in ENTRIES {
+            hist.insert(name, (0, std::collections::BTreeSet::new()));
+        }
+        let mut pass_forms = 0usize;
+        for n in &nodes {
+            let Some(k) = &n.kernel else {
+                continue;
+            };
+            if PASS_ROWS_FORMS.contains(&k.name.as_str()) {
+                pass_forms += 1;
+            }
+            if let Some((count, grids)) = hist.get_mut(k.name.as_str()) {
+                *count += 1;
+                grids.insert(k.grid[0]);
+            }
+        }
+        let launches = |name: &str| hist.get(name).map_or(0, |(count, _)| *count);
+        let step_pairs = launches("loop_control_down")
+            == launches("loop_control_out") + launches("loop_control_out3")
+            && launches("attn_res_step_scores") == launches("attn_res_step_out")
+            && launches("attn_res_step_scores") > 0;
+        let entries = hist
+            .iter()
+            .map(|(name, (count, grids))| {
+                let grids: Vec<String> = grids.iter().map(u32::to_string).collect();
+                format!("{name}={count}x{{{}}}", grids.join(","))
+            })
+            .collect();
+        Ok((entries, pass_forms == 0 && step_pairs))
+    }
+
     /// What a verify gave: its ids, every row's logits, and its wall in ms (the enqueue or the
     /// replay, and the ids' read).
     struct Verified {
@@ -915,7 +989,8 @@ mod gate {
 
     /// Clause `verify_is_m_steps`: see the module header. Prints, beside, each verify's wall at its
     /// second replay (the first uploads the graph) and its steps' walls, at the prompt's depth:
-    /// development numbers, not timed runs.
+    /// development numbers, not timed runs; and each row count's launch geometry
+    /// ([`verify_geometry`]), whose step-pair forms the clause holds beside the bits.
     fn verify_is_m_steps(m: &mut GpuModel<Body>, s: &Set) -> Result<bool, GateError> {
         if !tier::run_clause("verify_is_m_steps", Tag::SelfConsistency)? {
             return Ok(true);
@@ -932,6 +1007,8 @@ mod gate {
         let mut miss: Option<String> = None;
         let mut nodes = Vec::new();
         let mut walls = Vec::new();
+        let mut geometry = Vec::new();
+        let mut step_forms = true;
         for mode in [StepMode::Eager, StepMode::Graph] {
             m.set_mode(mode);
             m.reset()?;
@@ -966,15 +1043,18 @@ mod gate {
                     let again = verify(m, &ids, rows)?;
                     walls.push(format!("m{rows}={:.2}/{step_ms:.2}", again.ms));
                     m.rollback(at)?;
+                    let (entries, pairs) = verify_geometry(m, rows)?;
+                    step_forms &= pairs;
+                    geometry.push(format!("m{rows}: {}", entries.join(" ")));
                 }
             }
         }
         m.set_mode(StepMode::Eager);
         let captured = nodes.len() == VERIFY_ROWS - 1 && nodes.iter().all(|&n| n > 0);
-        let pass = miss.is_none() && captured;
+        let pass = miss.is_none() && captured && step_forms;
         println!(
             "verify_is_m_steps set={} at={at} rows=2..={VERIFY_ROWS} modes=eager,graph \
-             verify_graph_nodes={nodes:?} first_miss={miss:?} {}",
+             verify_graph_nodes={nodes:?} first_miss={miss:?} step_pairs={step_forms} {}",
             s.label,
             verdict(pass)
         );
@@ -982,6 +1062,10 @@ mod gate {
             "verify_walls_ms (development: the verify's second graph replay / its m graph \
              steps, depth {at}) {}",
             walls.join(" ")
+        );
+        println!(
+            "verify_geometry (launches x {{grids}} of the controllers' and the mixes' entries) {}",
+            geometry.join(" | ")
         );
         Ok(pass)
     }

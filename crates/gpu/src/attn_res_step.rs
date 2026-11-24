@@ -27,6 +27,15 @@
 //! query row `q` and vector `i` at `MAX_VECS + q · MAX_VECS + i`; the tickets one `u32` a mix,
 //! zero between launches.
 //!
+//! The same two entries take `m` rows ([`AttnResStepKernels::enqueue_rows`]): the grid is the
+//! one-row grid a row, the row the fastest index, and a block is its row's block of the one-row
+//! launch on that row's values ([`crate::attn_res`]'s layout: bank `i`'s row `t` at
+//! `banks[i · stride + t · n ..][..n]` with `stride >= m · n`, the stream's row `t` at
+//! `cur[t · n ..]`, the output value `j` of query row `q` and row `t` at
+//! `y[t · nq · n + q · n + j]`). The statistics and the tickets are the one-row ones a row
+//! (`row · JOBS` apart). A mix's tickets count its own row's blocks, so a row's softmax waits on
+//! that row's vectors alone, and every row is the one-row launch's bits on its values.
+//!
 //! No silent failure, as [`crate::attn_res`]'s entry: a vector whose sum of squares is not finite
 //! and positive raises [`FaultSite::F32Product`] through its scale, a score that is not finite
 //! raises it in the softmax, and that query row's probabilities, so its output, are NaN.
@@ -52,7 +61,8 @@ pub const JOB_STATS: usize = MAX_VECS * (1 + MAX_NQ);
 pub const JOBS: usize = 2;
 /// f32s of the scores block's warp sums: a dot a query row and the squares, a slot a warp.
 const PART_LEN: usize = (MAX_NQ + 1) * WARPS;
-const _: () = assert!(THREADS == 256 && WARPS == 8 && MAX_NQ == 4);
+// The entries' `launch_contract` spells JOBS · JOB_STATS as the literal 160.
+const _: () = assert!(THREADS == 256 && WARPS == 8 && MAX_NQ == 4 && JOBS * JOB_STATS == 160);
 
 /// One thread's partial sums over the vector `src[base ..][..n]`'s values `tid, tid + THREADS, …`:
 /// a dot with each of the four query rows and the sum of squares, each `acc += a · b` in that
@@ -180,9 +190,10 @@ struct Job<'a> {
 mod attn_res_step_kernels {
     use super::*;
 
-    /// The sums, scales and scores of every vector of up to two mixes (module doc, launch 1):
-    /// block `b < nb_a + 1` is vector `b` of mix a, the next `nb_b + 1` blocks mix b's (none at
-    /// `jobs = 1`). The mix's last block writes its probabilities and zeroes its ticket.
+    /// The sums, scales and scores of every vector of up to two mixes (module doc, launch 1) over
+    /// `m` rows: block `b` is vector `b / m` (mix a's `0 .. nb_a`, then mix b's `nb_b + 1`, none
+    /// at `jobs = 1`) of row `b % m`. The mix's last block of a row writes that row's
+    /// probabilities and zeroes its ticket.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -195,10 +206,12 @@ mod attn_res_step_kernels {
         block = (256, 1, 1),
         requires = (
             banks_a.len() >= nb_a * stride_a,
-            cur_a.len() >= n,
+            stride_a >= m * n,
+            cur_a.len() >= m * n,
             queries_a.len() >= nq_a * n,
             banks_b.len() >= nb_b * stride_b,
-            cur_b.len() >= n,
+            stride_b >= m * n,
+            cur_b.len() >= m * n,
             queries_b.len() >= nq_b * n,
             nq_a >= 1,
             nq_a <= 4,
@@ -208,8 +221,9 @@ mod attn_res_step_kernels {
             nb_b < 16,
             jobs >= 1,
             jobs <= 2,
-            stats.len() >= 2 * 80,
-            done.len() >= 2
+            m >= 1,
+            stats.len() >= 160 * m,
+            done.len() >= 2 * m
         )
     )]
     pub fn attn_res_step_scores(
@@ -231,6 +245,7 @@ mod attn_res_step_kernels {
         scale: f32,
         eps: f32,
         n: u32,
+        m: u32,
         mut stats: DisjointSlice<f32>,
         mut done: DisjointSlice<u32>,
     ) {
@@ -239,12 +254,13 @@ mod attn_res_step_kernels {
 
         let blk = thread::blockIdx_x() as usize;
         let tid = thread::threadIdx_x() as usize;
-        let n = n as usize;
+        let (n, m) = (n as usize, m as usize);
         let va = nb_a as usize + 1;
-        let (job, i) = if blk < va {
-            (0usize, blk)
+        let (vec, t) = (blk / m, blk % m);
+        let (job, i) = if vec < va {
+            (0usize, vec)
         } else {
-            (1usize, blk - va)
+            (1usize, vec - va)
         };
         if job >= jobs as usize || (job == 1 && i > nb_b as usize) {
             return; // block-uniform: a block past the mixes' vectors
@@ -272,13 +288,14 @@ mod attn_res_step_kernels {
         let ws = unsafe { SharedArray::as_raw_mut_ptr(&raw mut PART) };
         // SAFETY: as above.
         let last = unsafe { SharedArray::as_raw_mut_ptr(&raw mut LAST) };
-        // SAFETY: bank i lies below (i + 1) · stride <= nb · stride <= banks.len(), the stream
-        // below n <= cur.len(), the query rows below nq · n <= queries.len(), by the contract.
+        // SAFETY: bank i's row t ends below (i + 1) · stride <= nb · stride <= banks.len()
+        // (stride >= m · n, the contract), the stream's row t below (t + 1) · n <= m · n <=
+        // cur.len(), the query rows below nq · n <= queries.len(), by the contract.
         let (dot, sq) = unsafe {
             if i < src.nb {
-                partials((src.banks, i * src.stride), queries, nq, n, tid)
+                partials((src.banks, i * src.stride + t * n), queries, nq, n, tid)
             } else {
-                partials((src.cur, 0), queries, nq, n, tid)
+                partials((src.cur, t * n), queries, nq, n, tid)
             }
         };
         let dot = [
@@ -301,13 +318,14 @@ mod attn_res_step_kernels {
             }
         }
         thread::sync_threads();
-        let at = job * JOB_STATS;
+        let at = (t * JOBS + job) * JOB_STATS;
         if tid == 0 {
             // SAFETY: every slot was written before the barrier above.
             let sq = unsafe { tree(ws, MAX_NQ) };
             let rstd = rms_scale_of_mean_checked(sq / n as f32, eps, fault, true);
-            // SAFETY: at + i < 2 · JOB_STATS <= stats.len(), i < vecs <= MAX_VECS; this block's
-            // thread 0 alone writes vector i's slots.
+            // SAFETY: at + i < m · JOBS · JOB_STATS <= stats.len() (t < m by the grid, job < 2,
+            // i < vecs <= MAX_VECS); this block's thread 0 alone writes vector i's slots of its
+            // row's mix.
             unsafe { *stats.get_unchecked_mut(at + i) = rstd };
             let mut q = 0usize;
             while q < nq {
@@ -322,8 +340,9 @@ mod attn_res_step_kernels {
         }
         threadfence();
         thread::sync_threads();
-        // SAFETY: done holds JOBS tickets by the contract; every access to one is atomic.
-        let ticket = unsafe { done.as_mut_ptr().add(job) };
+        // SAFETY: done holds JOBS tickets a row, 2 · m by the contract, and t · JOBS + job is
+        // inside them (t < m by the grid, job < 2); every access to one is atomic.
+        let ticket = unsafe { done.as_mut_ptr().add(t * JOBS + job) };
         if tid == 0 {
             // SAFETY: as above.
             let count = unsafe { DeviceAtomicU32::from_ptr(ticket) };
@@ -336,7 +355,7 @@ mod attn_res_step_kernels {
         if unsafe { *last } == 0 {
             return;
         }
-        // The mix's last block: every vector's scale and scores are published.
+        // The row's mix's last block: every vector's scale and scores of the row are published.
         let pr = stats.as_mut_ptr();
         if tid < nq {
             let q = tid;
@@ -345,7 +364,8 @@ mod attn_res_step_kernels {
             let mut mx = f32::NEG_INFINITY;
             let mut v = 0usize;
             while v < vecs {
-                // SAFETY: row + v < 2 · JOB_STATS; this thread alone touches query q's row.
+                // SAFETY: row + v < at + JOB_STATS <= m · JOBS · JOB_STATS <= stats.len(); this
+                // thread alone touches query q's row.
                 let s = unsafe { *pr.add(row + v) };
                 finite &= s.is_finite();
                 if s > mx {
@@ -386,9 +406,9 @@ mod attn_res_step_kernels {
         }
     }
 
-    /// Every output value of up to two mixes (module doc, launch 2): blocks `[0, per)` mix a's
-    /// values, `[per, 2 · per)` mix b's, `per = ⌈n / 256⌉`; thread `tid` of a block value
-    /// `(block mod per) · 256 + tid`.
+    /// Every output value of up to two mixes (module doc, launch 2) over `m` rows: block `b` is
+    /// mix `b / (m · per)`'s value chunk `(b / m) % per` of row `b % m`, `per = ⌈n / 256⌉`;
+    /// thread `tid` of a block value `chunk · 256 + tid` of its row.
     #[allow(
         clippy::too_many_arguments,
         reason = "kernel entry: the device ABI takes the two mixes' arguments flat (rust-quality R8)"
@@ -400,9 +420,11 @@ mod attn_res_step_kernels {
         block = (256, 1, 1),
         requires = (
             banks_a.len() >= nb_a * stride_a,
-            cur_a.len() >= n,
+            stride_a >= m * n,
+            cur_a.len() >= m * n,
             banks_b.len() >= nb_b * stride_b,
-            cur_b.len() >= n,
+            stride_b >= m * n,
+            cur_b.len() >= m * n,
             nq_a >= 1,
             nq_a <= 4,
             nq_b >= 1,
@@ -411,9 +433,10 @@ mod attn_res_step_kernels {
             nb_b < 16,
             jobs >= 1,
             jobs <= 2,
-            stats.len() >= 2 * 80,
-            y_a.len() >= nq_a * n,
-            y_b.len() >= nq_b * n
+            m >= 1,
+            stats.len() >= 160 * m,
+            y_a.len() >= m * nq_a * n,
+            y_b.len() >= m * nq_b * n
         )
     )]
     pub fn attn_res_step_out(
@@ -429,6 +452,7 @@ mod attn_res_step_kernels {
         stride_b: u32,
         jobs: u32,
         n: u32,
+        m: u32,
         stats: &[f32],
         mut y_a: DisjointSlice<f32>,
         mut y_b: DisjointSlice<f32>,
@@ -437,9 +461,10 @@ mod attn_res_step_kernels {
 
         let blk = thread::blockIdx_x() as usize;
         let tid = thread::threadIdx_x() as usize;
-        let n = n as usize;
+        let (n, m) = (n as usize, m as usize);
         let per = n.div_ceil(THREADS);
-        let job = blk / per;
+        let (mix, t) = (blk / m, blk % m);
+        let job = mix / per;
         if job >= jobs as usize {
             return; // block-uniform
         }
@@ -464,16 +489,18 @@ mod attn_res_step_kernels {
                 nq_b as usize,
             )
         };
+        let at = (t * JOBS + job) * JOB_STATS;
         // SAFETY: ST is this block's own shared allocation; the raw form is the only way to reach
         // it without a reference to a `static mut`. Every access is below JOB_STATS and ordered
         // by `sync_threads`.
         let st = unsafe { SharedArray::as_raw_mut_ptr(&raw mut ST) };
         if tid < JOB_STATS {
-            // SAFETY: job · JOB_STATS + tid < 2 · JOB_STATS <= stats.len(); tid < JOB_STATS.
-            unsafe { *st.add(tid) = *stats.get_unchecked(job * JOB_STATS + tid) };
+            // SAFETY: at + tid < m · JOBS · JOB_STATS <= stats.len() (t < m by the grid, job < 2);
+            // tid < JOB_STATS.
+            unsafe { *st.add(tid) = *stats.get_unchecked(at + tid) };
         }
         thread::sync_threads();
-        let j = (blk - job * per) * THREADS + tid;
+        let j = (mix - job * per) * THREADS + tid;
         if j >= n {
             return;
         }
@@ -487,14 +514,18 @@ mod attn_res_step_kernels {
         while v < src.nb {
             // Four banks' values loaded ahead of their sums; a bank past the last reads bank 0
             // and is not summed.
-            let at = |b: usize| if b < src.nb { b } else { 0 };
-            // SAFETY: bank b < nb lies below nb · stride <= banks.len() and j < n.
+            let bank = |b: usize| if b < src.nb { b } else { 0 };
+            // SAFETY: bank b < nb's row t ends below b · stride + m · n <= (b + 1) · stride <=
+            // nb · stride <= banks.len() (stride >= m · n, the contract) and j < n.
             let w = unsafe {
                 [
-                    *src.banks.get_unchecked(at(v) * src.stride + j),
-                    *src.banks.get_unchecked(at(v + 1) * src.stride + j),
-                    *src.banks.get_unchecked(at(v + 2) * src.stride + j),
-                    *src.banks.get_unchecked(at(v + 3) * src.stride + j),
+                    *src.banks.get_unchecked(bank(v) * src.stride + t * n + j),
+                    *src.banks
+                        .get_unchecked(bank(v + 1) * src.stride + t * n + j),
+                    *src.banks
+                        .get_unchecked(bank(v + 2) * src.stride + t * n + j),
+                    *src.banks
+                        .get_unchecked(bank(v + 3) * src.stride + t * n + j),
                 ]
             };
             let mut k = 0usize;
@@ -510,8 +541,9 @@ mod attn_res_step_kernels {
             }
             v += 4;
         }
-        // SAFETY: j < n <= cur.len(); nb < MAX_VECS, loaded before the barrier above.
-        let (r, c) = unsafe { (*st.add(src.nb), *src.cur.get_unchecked(j)) };
+        // SAFETY: t · n + j < m · n <= cur.len() by the contract; nb < MAX_VECS, loaded before the
+        // barrier above.
+        let (r, c) = unsafe { (*st.add(src.nb), *src.cur.get_unchecked(t * n + j)) };
         let nv = mul_rn_f32(c, r);
         a0 += p(0, src.nb) * nv;
         a1 += p(1, src.nb) * nv;
@@ -520,13 +552,13 @@ mod attn_res_step_kernels {
         let acc = [a0, a1, a2, a3];
         let mut q = 0usize;
         while q < nq {
-            // SAFETY: q · n + j < nq · n <= the mix's output length by the contract; this thread
-            // alone writes the value.
+            // SAFETY: t · nq · n + q · n + j < m · nq · n <= the mix's output length by the
+            // contract; this thread alone writes the value.
             unsafe {
                 if job == 0 {
-                    *y_a.get_unchecked_mut(q * n + j) = acc[q];
+                    *y_a.get_unchecked_mut(t * nq * n + q * n + j) = acc[q];
                 } else {
-                    *y_b.get_unchecked_mut(q * n + j) = acc[q];
+                    *y_b.get_unchecked_mut(t * nq * n + q * n + j) = acc[q];
                 }
             }
             q += 1;
@@ -539,23 +571,32 @@ pub struct AttnResStepKernels {
     module: attn_res_step_kernels::LoadedModule,
 }
 
-/// The device words the launch pair passes between its launches: [`JOBS`] mixes' statistics and
-/// their tickets. One a stream: a pair's second launch reads what its first wrote, and the next
-/// pair on the stream starts after it.
+/// The device words the launch pair passes between its launches: the [`JOBS`] mixes' statistics
+/// and their tickets, a row of the pair's rows. One a stream: a pair's second launch reads what its
+/// first wrote, and the next pair on the stream starts after it.
 pub struct MixStepScratch {
     stats: DeviceBuffer<f32>,
     done: DeviceBuffer<u32>,
-    /// The stand-in output of a pair that carries one mix: one row of `n`.
+    /// The stand-in output of a pair that carries one mix: its rows of `n`.
     spare: DeviceBuffer<f32>,
 }
 
 impl MixStepScratch {
-    /// The statistics and the tickets (zero) of mixes `n` wide.
+    /// The statistics and the tickets (zero) of one row's mixes `n` wide: the step's.
     pub fn new(stream: &CudaStream, n: usize) -> Result<MixStepScratch, GpuError> {
+        Self::rows(stream, (n, 1))
+    }
+
+    /// The statistics and the tickets (zero) of `rows` rows' mixes `n` wide, and the stand-in
+    /// output of a pair that carries one mix, `rows` rows of `n`.
+    pub fn rows(
+        stream: &CudaStream,
+        (n, rows): (usize, usize),
+    ) -> Result<MixStepScratch, GpuError> {
         Ok(MixStepScratch {
-            stats: DeviceBuffer::zeroed(stream, JOBS * JOB_STATS)?,
-            done: DeviceBuffer::zeroed(stream, JOBS)?,
-            spare: DeviceBuffer::zeroed(stream, n.max(1))?,
+            stats: DeviceBuffer::zeroed(stream, rows * JOBS * JOB_STATS)?,
+            done: DeviceBuffer::zeroed(stream, rows * JOBS)?,
+            spare: DeviceBuffer::zeroed(stream, (rows * n).max(1))?,
         })
     }
 
@@ -565,15 +606,16 @@ impl MixStepScratch {
     }
 }
 
-/// A mix's checks, [`crate::attn_res::AttnResKernels::enqueue_normed`]'s at one row; refused by
-/// name as `what`'s.
-fn check(what: &'static str, a: &AttnResNormedArgs<'_>, y_len: usize) -> Result<(), GpuError> {
+/// One mix's checks at its `m` rows, [`crate::attn_res::AttnResKernels::enqueue_normed`]'s;
+/// refused by name as `what`'s.
+fn check_shape(
+    what: &'static str,
+    a: &AttnResNormedArgs<'_>,
+    y_len: usize,
+) -> Result<(), GpuError> {
     let bad = |detail: String| Err(GpuError::shape(what, detail));
-    if a.m != 1 {
-        return bad(format!(
-            "{} rows: the step's mix takes one row (a pass of rows is attn_res's)",
-            a.m
-        ));
+    if a.m == 0 {
+        return bad("a mix of no row".into());
     }
     if a.n == 0 {
         return bad("a row of no value".into());
@@ -590,10 +632,10 @@ fn check(what: &'static str, a: &AttnResNormedArgs<'_>, y_len: usize) -> Result<
             a.n_banks
         ));
     }
-    if a.n_banks > 0 && a.stride < a.n {
+    if a.stride < a.m * a.n {
         return bad(format!(
-            "a stride of {} between banks under the row's {}",
-            a.stride, a.n
+            "a stride of {} between banks under the {} rows' {}",
+            a.stride, a.m, a.n
         ));
     }
     if !(a.eps.is_finite() && a.eps > 0.0) {
@@ -603,25 +645,42 @@ fn check(what: &'static str, a: &AttnResNormedArgs<'_>, y_len: usize) -> Result<
         return bad(format!("scale {}: a finite one", a.scale));
     }
     if a.banks.len() < a.n_banks * a.stride
-        || a.cur.len() < a.n
+        || a.cur.len() < a.m * a.n
         || a.queries.len() < a.nq * a.n
-        || y_len < a.nq * a.n
+        || y_len < a.m * a.nq * a.n
     {
         return bad(format!(
-            "{} banks of stride {} in {} values, the stream {} of {}, the queries {} of {} · {}, \
-             the output {y_len} of {}",
+            "{} banks of stride {} in {} values, the stream {} of {} · {}, the queries {} of {} · \
+             {}, the output {y_len} of {} · {} · {}",
             a.n_banks,
             a.stride,
             a.banks.len(),
             a.cur.len(),
+            a.m,
             a.n,
             a.queries.len(),
             a.nq,
             a.n,
-            a.nq * a.n
+            a.m,
+            a.nq,
+            a.n
         ));
     }
     Ok(())
+}
+
+/// A mix's checks at the step's one row; refused by name as `what`'s.
+fn check(what: &'static str, a: &AttnResNormedArgs<'_>, y_len: usize) -> Result<(), GpuError> {
+    if a.m != 1 {
+        return Err(GpuError::shape(
+            what,
+            format!(
+                "{} rows: the step's mix takes one row (a pass of rows is enqueue_rows')",
+                a.m
+            ),
+        ));
+    }
+    check_shape(what, a, y_len)
 }
 
 impl AttnResStepKernels {
@@ -647,23 +706,76 @@ impl AttnResStepKernels {
     ) -> Result<(), GpuError> {
         const WHAT: &str = "attn_res_step::enqueue";
         check(WHAT, &a, y_a.len())?;
-        if let Some((b, y_b)) = &b {
-            check(WHAT, b, y_b.len())?;
-            if b.n != a.n
-                || b.scale.to_bits() != a.scale.to_bits()
-                || b.eps.to_bits() != a.eps.to_bits()
-            {
-                return Err(GpuError::shape(
-                    WHAT,
-                    format!(
-                        "two mixes of one launch take one width, scale and epsilon: {} / {} / {} \
-                         and {} / {} / {}",
-                        a.n, a.scale, a.eps, b.n, b.scale, b.eps
-                    ),
-                ));
-            }
+        Self::agreed(WHAT, &a, b.as_ref().map(|(b, y_b)| (b, y_b.len())))?;
+        self.pair(stream, WHAT, a, y_a, b, scratch)
+    }
+
+    /// [`AttnResStepKernels::enqueue`] over the `a.m` rows of `a` and `b` (module doc): every row
+    /// of each output is `enqueue_normed`'s bits at that row, two launches over the one-row grids
+    /// a row. The banks are `a.stride` apart, the stream, the outputs and the scratch `a.m` rows
+    /// ([`MixStepScratch::rows`]). Refusals as `enqueue`'s beside a short scratch; asynchronous,
+    /// allocation-free, capturable.
+    pub fn enqueue_rows(
+        &self,
+        stream: &CudaStream,
+        (a, y_a): (AttnResNormedArgs<'_>, &mut DeviceBuffer<f32>),
+        b: Option<(AttnResNormedArgs<'_>, &mut DeviceBuffer<f32>)>,
+        scratch: &mut MixStepScratch,
+    ) -> Result<(), GpuError> {
+        const WHAT: &str = "attn_res_step::enqueue_rows";
+        check_shape(WHAT, &a, y_a.len())?;
+        Self::agreed(WHAT, &a, b.as_ref().map(|(b, y_b)| (b, y_b.len())))?;
+        self.pair(stream, WHAT, a, y_a, b, scratch)
+    }
+
+    /// The second mix's checks, and that the two mixes take one width, scale and epsilon.
+    fn agreed(
+        what: &'static str,
+        a: &AttnResNormedArgs<'_>,
+        b: Option<(&AttnResNormedArgs<'_>, usize)>,
+    ) -> Result<(), GpuError> {
+        let Some((b, y_len)) = b else {
+            return Ok(());
+        };
+        check_shape(what, b, y_len)?;
+        if b.n != a.n
+            || b.scale.to_bits() != a.scale.to_bits()
+            || b.eps.to_bits() != a.eps.to_bits()
+            || b.m != a.m
+        {
+            return Err(GpuError::shape(
+                what,
+                format!(
+                    "two mixes of one launch take one width, scale, epsilon and row count: {} / {} \
+                     / {} / {} and {} / {} / {} / {}",
+                    a.n, a.scale, a.eps, a.m, b.n, b.scale, b.eps, b.m
+                ),
+            ));
         }
-        let u = |name: &'static str, v: usize| launch_u32(WHAT, name, v);
+        Ok(())
+    }
+
+    /// The two launches of the pair over the checked jobs (module doc): the scores of every vector
+    /// of every row, then the outputs. One mix gives the second no work: its arguments are the
+    /// first's, its output the spare, and no block reads them.
+    fn pair(
+        &self,
+        stream: &CudaStream,
+        what: &'static str,
+        a: AttnResNormedArgs<'_>,
+        y_a: &mut DeviceBuffer<f32>,
+        b: Option<(AttnResNormedArgs<'_>, &mut DeviceBuffer<f32>)>,
+        scratch: &mut MixStepScratch,
+    ) -> Result<(), GpuError> {
+        let m = a.m;
+        crate::short(
+            what,
+            &[
+                ("stats", scratch.stats.len(), m * JOBS * JOB_STATS),
+                ("done", scratch.done.len(), m * JOBS),
+            ],
+        )?;
+        let u = |name: &'static str, v: usize| launch_u32(what, name, v);
         let jobs = if b.is_some() { 2 } else { 1 };
         let (nb_a, nq_a, stride_a) = (
             u("n_banks", a.n_banks)?,
@@ -671,10 +783,9 @@ impl AttnResStepKernels {
             u("stride", a.stride)?,
         );
         let n = u("n", a.n)?;
+        let m32 = u("rows", m)?;
         let (bb, y_b): (AttnResNormedArgs<'_>, &mut DeviceBuffer<f32>) = match b {
             Some((b, y_b)) => (b, y_b),
-            // One mix: mix b's arguments are mix a's, its output the spare, and no block reads
-            // them.
             None => (
                 AttnResNormedArgs {
                     nq: 1,
@@ -684,13 +795,14 @@ impl AttnResStepKernels {
                 &mut scratch.spare,
             ),
         };
-        if y_b.len() < bb.nq * a.n {
+        let need = bb.nq * m * n as usize;
+        if y_b.len() < need {
             return Err(GpuError::shape(
-                WHAT,
+                what,
                 format!(
-                    "the spare row holds {} values, the mixes are {} wide",
+                    "the spare rows hold {} values, the mixes are {} wide over {m} rows",
                     y_b.len(),
-                    a.n
+                    n
                 ),
             ));
         }
@@ -704,7 +816,7 @@ impl AttnResStepKernels {
         let prep = self
             .module
             .prepare_attn_res_step_scores(LaunchConfig1D::new(
-                u("grid", vecs)?,
+                u("grid", vecs * m)?,
                 THREADS as u32,
                 0,
             ))?;
@@ -729,12 +841,13 @@ impl AttnResStepKernels {
             a.scale,
             a.eps,
             n,
+            m32,
             &mut scratch.stats,
             &mut scratch.done,
         )?;
         let per = a.n.div_ceil(THREADS);
         let prep = self.module.prepare_attn_res_step_out(LaunchConfig1D::new(
-            u("grid", jobs * per)?,
+            u("grid", jobs * per * m)?,
             THREADS as u32,
             0,
         ))?;
@@ -753,6 +866,7 @@ impl AttnResStepKernels {
             stride_b,
             jobs32,
             n,
+            m32,
             &scratch.stats,
             y_a,
             y_b,
