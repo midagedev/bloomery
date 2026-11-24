@@ -1,0 +1,51 @@
+# ink2down: Inkling 2 Mini prompt pass, the controllers rows-form down block (loop_control_down_rows) with its
+# loads in groups,
+# against the base = this tree without the change (main 3cd0efa97 + round ink2vrows uncommitted diff), the RTX
+# 5090. Derivation:
+# /root/agents/specs/ink2down/paper.py (paper.txt its output); all [derived] unless marked [measured].
+# [measured] ink2r4 work/nsys-base.class.txt:8: loop_control_down_rows 48 launches x 415.43 us (grids 1 and 3:
+# one block a module
+# at m = 8, one SM each), ptx-scan sm_120a: 150 regs, 1 block/SM, 32 scalar global loads, 80 fma; step cycles
+# 1.10 M a block.
+# [derived] a block moves 1.47 MB L2->SM, 2.36 M FMA, 18.4 K loads, ~34 K issue slots: the largest unit is 3.1
+# % of the block cycles,
+# so the block is latency: 144 k-steps x (8 weight loads, each behind an if, one round trip each, + 8
+# activation loads) = 2.88 us a
+# k-step = 8 x ~340 ns, plus the squares phase (8 rows x 9 dependent load rounds, 11..18 us). Nothing else
+# overlaps it: one stream.
+# [derived] pass: 24 attn launches (3 modules x 64 row tiles = 192 blocks, 2 waves on 170 SMs at 1 block/SM) +
+# 24 ffn (64 blocks).
+# Base a launch: ffn T_b, attn 1.5 T_b, T_b 179..415 us (all-L2 chain .. the m = 8 number): 10.8..24.9 ms of
+# pp512 (103.17 ms).
+# [derived] new block: loads for 4 k-steps x (8 rows + 8 outputs) in flight, squares one round a thread value:
+# issue floor 13.2 us,
+# central 20.5, high 31.4 us (170..190 regs, still 1 block/SM, same grid): ffn 16.5..32.9 us, attn 31.6..64.2
+# us, 1.15..2.33 ms a pass.
+# [derived] saving 8.4..23.8 ms a pass (central 16.3): pp512 5,404..6,449 tok/s over 4,962.77 (+8.9..+29.9 %,
+# central +18.8 %);
+# pp4096 (8 passes of 512 rows) 5,164..6,110 over 4,759.63 (+8.5..+28.4 %). Band taken as +9..+30 for pp512.
+kind: ab
+question: does the Inkling 2 Mini prompt pass get faster by the controllers rows-form down block loading in
+  groups (the step bits, unchanged) on the one RTX 5090?
+term: pp tok/s @ P = 512 (pp4096 in the same lease), bloomery-serve at the serving defaults,
+  Inkling-2-Mini-UD-Q4_K_XL.gguf, RTX 5090 - (changed - base) / base, tree bloomery-ink2down against the tree
+  without the change (ink2vrows base)
+unit: %
+predict: +9..+30
+rounds: 4
+condition: one lease on the 5090 alone (no ComfyUI; gpu-apps in the witness blocks), both binaries built on
+  the box from their trees, arms alternating a round with the order rotated; gate-inkling2-pp (control_rows at
+  512 rows, ragged, rank 7 and 1, MAX_N, control_attn_rows, control_rows_nan) and the e2e count pins green at
+  the changed tree first, so every row is the step bits; the prompt call is the same ids in both arms
+decide-in: land the change with its owning gates; the next terms are the out launches (loop_control_out_rows
+  and out3_rows at 512 rows, 1,728 blocks a triple) and a wider down grid (outputs split across blocks, the
+  issue floor)
+decide-below: under +9 %: read the per-kernel table of both trees (nsys-gpu.sh on the pass, the same probe as
+  ink2r4) before blaming the model: if the changed down launches are over ~35 us (ffn) the loads are not what
+  the block waits on (L1 miss limit, 64 loads in flight a lane): lower DOWN_ROWS_UNROLL to 2 or prefetch the
+  module weights into L2; if the base launches were already near 180 us the share was the small end and the
+  change stays as landed
+decide-above: over +30 %: the controllers were a larger share than the m = 8 chain says (the attn triple past
+  two waves, or the L2-hit latency of 64 blocks sharing one module slower than the single block): record the
+  base launch times from the per-kernel table as the finding and re-derive the out launches (1,728 blocks)
+  before the next lever

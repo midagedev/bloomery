@@ -77,6 +77,14 @@
 //! one, the dots' first product alone and the folds ascending — so the rows form writes the
 //! step's bits at every row, whatever the pass's length.
 //!
+//! A block of the down launch is latency, not bytes or arithmetic, so it keeps its loads in
+//! flight together: the squares of the tile's eight rows load as one round a thread value, and a
+//! lane loads [`DOWN_ROWS_UNROLL`] values of its k sequence for the whole tile (eight rows by
+//! eight outputs) before it folds the first, the folds still ascending. A tile row past the pass
+//! and an output past the rank read the last valid one, so every load is in range with no guard
+//! around it that would end a load group; their dots reach no store. A lane's sum starts at
+//! −0.0, so its first fused multiply-add is the product rounded alone, the step's first `mul`.
+//!
 //! A few rows (a verify's, 2 to [`ROWS_DOWN`]) take the step's pair itself:
 //! [`LoopControlKernels::enqueue`] and [`LoopControlKernels::enqueue_attn`] launch over `m` rows,
 //! a block one row's, so their grids widen with the rows (`groups · m`, then `cols · m`, a module)
@@ -118,6 +126,9 @@ const DOWN_UNROLL: usize = 16;
 pub const ROWS_DOWN: usize = 8;
 /// Down outputs a warp of the rows form's down launch takes: the eight warps cover [`MAX_RANK`].
 const DOWN_WARP_OUTS: usize = MAX_RANK / WARPS;
+/// Values of its k sequence a lane of the rows form's down dot loads, for every row and output of
+/// its tile, before it folds any of them (the folds stay ascending).
+const DOWN_ROWS_UNROLL: usize = 4;
 /// Rows one block of the rows form's out launch takes, and the rows a thread of it folds.
 pub const ROWS_OUT: usize = 32;
 const OUT_THREAD_ROWS: usize = ROWS_OUT * OUT_COLS / THREADS;
@@ -259,13 +270,18 @@ unsafe fn out_block(
 /// module, their `rstd` pairs in the step's order, then warp `w`'s outputs `w · DOWN_WARP_OUTS ..`
 /// over every row, lane `l` the values `l, l + 32, …` of each (row, output) pair's dot — the first
 /// product alone, the fused multiply-adds ascending, the warp's sum by the butterfly — written at
-/// `h[(mi · m + t) · rank + r]`. Every thread of the block calls it (it holds barriers).
+/// `h[(mi · m + t) · rank + r]`. The sums of squares of the eight rows load together, and a lane
+/// loads [`DOWN_ROWS_UNROLL`] of its values for every row and output of the tile before it folds
+/// the first, so the block waits on a round of loads a group and not one a value. A tile row past
+/// `m` and an output past `rank` read the last valid one (their dots reach no store), so every
+/// load is in range with no guard around it. Every thread of the block calls it (it holds
+/// barriers).
 ///
 /// # Safety
 ///
 /// `ws` addresses `ROWS_DOWN · PART_LEN` and `rs` `ROWS_DOWN · RSTD_LEN` shared f32; `m · n <=
 /// cur.len(), msg.len()`; `rank · 2n <= down.len()`; `(mi + 1) · m · rank <= h.len()`; `1 <= n
-/// <= MAX_N`, `1 <= rank <= MAX_RANK`.
+/// <= MAX_N`, `1 <= m`, `1 <= rank <= MAX_RANK`.
 #[inline(always)]
 #[allow(
     clippy::too_many_arguments,
@@ -287,45 +303,75 @@ unsafe fn down_rows_block(
     let tid = thread::threadIdx_x() as usize;
     let w = tid / 32;
     let lane = warp::lane_id() as usize;
-    // The two sums of squares of each row (this order is the gate: the step's).
-    let mut sq = [[0.0f32; 2]; ROWS_DOWN];
+    // Where each tile row's values start: a row past `m` is the last row (its values are dead).
+    let mut x_at = [0usize; ROWS_DOWN];
     for i in 0..ROWS_DOWN {
         cuda_device::thread::__unroll_config::<0>();
-        let t = t0 + i;
-        if t < m {
-            let (mut sq_c, mut sq_m) = (0.0f32, 0.0f32);
-            let mut j = tid;
-            while j < n {
-                // SAFETY: t · n + j < m · n <= cur.len() and msg.len() by the contract.
-                let (c, g) =
-                    unsafe { (*cur.get_unchecked(t * n + j), *msg.get_unchecked(t * n + j)) };
-                sq_c += c * c;
-                sq_m += g * g;
-                j += THREADS;
+        x_at[i] = (t0 + i).min(m - 1) * n;
+    }
+    // The two sums of squares of each row (this order is the gate: the step's), the thread's
+    // values of every row loaded together.
+    let mut sq_c = [0.0f32; ROWS_DOWN];
+    let mut sq_m = [0.0f32; ROWS_DOWN];
+    let mut j = tid;
+    while j < n {
+        let mut c = [0.0f32; ROWS_DOWN];
+        let mut g = [0.0f32; ROWS_DOWN];
+        for i in 0..ROWS_DOWN {
+            cuda_device::thread::__unroll_config::<0>();
+            // SAFETY: x_at[i] + j <= (m − 1) · n + j < m · n <= cur.len() and msg.len() by the
+            // contract.
+            unsafe {
+                c[i] = *cur.get_unchecked(x_at[i] + j);
+                g[i] = *msg.get_unchecked(x_at[i] + j);
             }
-            sq[i] = [warp::reduce_sum_f32(sq_c), warp::reduce_sum_f32(sq_m)];
         }
+        for i in 0..ROWS_DOWN {
+            cuda_device::thread::__unroll_config::<0>();
+            sq_c[i] += c[i] * c[i];
+            sq_m[i] += g[i] * g[i];
+        }
+        j += THREADS;
+    }
+    let mut part = [[0.0f32; 2]; ROWS_DOWN];
+    for i in 0..ROWS_DOWN {
+        cuda_device::thread::__unroll_config::<0>();
+        part[i] = [warp::reduce_sum_f32(sq_c[i]), warp::reduce_sum_f32(sq_m[i])];
     }
     if lane == 0 {
         for i in 0..ROWS_DOWN {
             cuda_device::thread::__unroll_config::<0>();
-            // SAFETY: i · PART_LEN + 2w + 1 < ROWS_DOWN · PART_LEN; one lane a warp writes.
+            // SAFETY: i · PART_LEN + 2w + 1 < ROWS_DOWN · PART_LEN; one lane a warp writes its
+            // pairs.
             unsafe {
-                *ws.add(i * PART_LEN + w * 2) = sq[i][0];
-                *ws.add(i * PART_LEN + w * 2 + 1) = sq[i][1];
+                *ws.add(i * PART_LEN + w * 2) = part[i][0];
+                *ws.add(i * PART_LEN + w * 2 + 1) = part[i][1];
             }
         }
     }
     thread::sync_threads();
-    if tid < ROWS_DOWN && t0 + tid < m {
+    if tid < ROWS_DOWN {
+        let live = t0 + tid < m;
         // SAFETY: row tid's eight pairs were written before the barrier above.
-        let mean_c = unsafe { tree(ws.add(tid * PART_LEN), 0) } / n as f32;
-        // SAFETY: as above.
-        let mean_m = unsafe { tree(ws.add(tid * PART_LEN), 1) } / n as f32;
-        // SAFETY: tid < ROWS_DOWN: this thread's pair of RSTD.
+        let (mean_c, mean_m) = unsafe {
+            (
+                tree(ws.add(tid * PART_LEN), 0) / n as f32,
+                tree(ws.add(tid * PART_LEN), 1) / n as f32,
+            )
+        };
+        // SAFETY: tid < ROWS_DOWN: this thread's pair of RSTD. A row past `m` gets zeros (its
+        // sums are a copy of the last row's, and no fault is raised for it twice).
         unsafe {
-            *rs.add(tid * RSTD_LEN) = rms_scale_of_mean_checked(mean_c, eps, fault, true);
-            *rs.add(tid * RSTD_LEN + 1) = rms_scale_of_mean_checked(mean_m, eps, fault, true);
+            *rs.add(tid * RSTD_LEN) = if live {
+                rms_scale_of_mean_checked(mean_c, eps, fault, true)
+            } else {
+                0.0
+            };
+            *rs.add(tid * RSTD_LEN + 1) = if live {
+                rms_scale_of_mean_checked(mean_m, eps, fault, true)
+            } else {
+                0.0
+            };
         }
     }
     thread::sync_threads();
@@ -337,50 +383,106 @@ unsafe fn down_rows_block(
     let mut scale = [[0.0f32; 2]; ROWS_DOWN];
     for i in 0..ROWS_DOWN {
         cuda_device::thread::__unroll_config::<0>();
-        // SAFETY: written before the barrier above (a row past m keeps its stale pair, which
-        // reaches no output: its dots are never stored).
+        // SAFETY: written before the barrier above.
         unsafe { scale[i] = [*rs.add(i * RSTD_LEN), *rs.add(i * RSTD_LEN + 1)] };
     }
     let two_n = 2 * n;
+    // Where each output's row of `down` starts: an output past `rank` is the last row.
+    let mut w_at = [0usize; DOWN_WARP_OUTS];
+    for o in 0..DOWN_WARP_OUTS {
+        cuda_device::thread::__unroll_config::<0>();
+        w_at[o] = (r0 + o).min(rank - 1) * two_n;
+    }
+    // A lane with a value starts at −0.0, so its first fused multiply-add is the product rounded
+    // alone (a zero product keeps its sign): the step's first `mul`, with no peeled step.
+    let start = if lane < two_n { -0.0f32 } else { 0.0 };
     let mut acc = [[0.0f32; DOWN_WARP_OUTS]; ROWS_DOWN];
-    let mut k = lane;
-    let mut first = true;
-    while k < two_n {
-        let msg_half = k >= n;
-        let kk = if msg_half { k - n } else { k };
-        let mut v = [0.0f32; ROWS_DOWN];
-        for i in 0..ROWS_DOWN {
-            cuda_device::thread::__unroll_config::<0>();
-            let t = t0 + i;
-            if t < m {
-                // SAFETY: t · n + kk < m · n <= cur.len() and msg.len().
-                let x = unsafe {
-                    if msg_half {
-                        *msg.get_unchecked(t * n + kk)
-                    } else {
-                        *cur.get_unchecked(t * n + kk)
-                    }
-                };
-                v[i] = mul_rn_f32(x, scale[i][usize::from(msg_half)]);
-            }
-        }
+    for i in 0..ROWS_DOWN {
+        cuda_device::thread::__unroll_config::<0>();
         for o in 0..DOWN_WARP_OUTS {
             cuda_device::thread::__unroll_config::<0>();
-            let r = r0 + o;
-            if r < rank {
-                // SAFETY: r · 2n + k < rank · 2n <= down.len() by the contract.
-                let wv = unsafe { *down.get_unchecked(r * two_n + k) };
+            acc[i][o] = start;
+        }
+    }
+    let mut k = lane;
+    // The groups of `DOWN_ROWS_UNROLL` values this lane has: every load first, then the folds.
+    while k + 32 * (DOWN_ROWS_UNROLL - 1) < two_n {
+        let mut xv = [[0.0f32; ROWS_DOWN]; DOWN_ROWS_UNROLL];
+        let mut wv = [[0.0f32; DOWN_WARP_OUTS]; DOWN_ROWS_UNROLL];
+        // SAFETY: x_at[i] + kk <= (m − 1) · n + kk < m · n <= cur.len() and msg.len() by the
+        // contract (kk < n); w_at[o] + ks <= (rank − 1) · 2n + ks < rank · 2n <= down.len() by
+        // the contract (ks < 2n by the loop's condition).
+        unsafe {
+            for s in 0..DOWN_ROWS_UNROLL {
+                cuda_device::thread::__unroll_config::<0>();
+                let ks = k + 32 * s;
+                let msg_half = ks >= n;
+                let kk = if msg_half { ks - n } else { ks };
                 for i in 0..ROWS_DOWN {
                     cuda_device::thread::__unroll_config::<0>();
-                    acc[i][o] = if first {
-                        mul_rn_f32(wv, v[i])
+                    xv[s][i] = if msg_half {
+                        *msg.get_unchecked(x_at[i] + kk)
                     } else {
-                        fma_rn_f32(wv, v[i], acc[i][o])
+                        *cur.get_unchecked(x_at[i] + kk)
                     };
+                }
+                for o in 0..DOWN_WARP_OUTS {
+                    cuda_device::thread::__unroll_config::<0>();
+                    wv[s][o] = *down.get_unchecked(w_at[o] + ks);
                 }
             }
         }
-        first = false;
+        for s in 0..DOWN_ROWS_UNROLL {
+            cuda_device::thread::__unroll_config::<0>();
+            let msg_half = k + 32 * s >= n;
+            let mut v = [0.0f32; ROWS_DOWN];
+            for i in 0..ROWS_DOWN {
+                cuda_device::thread::__unroll_config::<0>();
+                v[i] = mul_rn_f32(xv[s][i], if msg_half { scale[i][1] } else { scale[i][0] });
+            }
+            for o in 0..DOWN_WARP_OUTS {
+                cuda_device::thread::__unroll_config::<0>();
+                for i in 0..ROWS_DOWN {
+                    cuda_device::thread::__unroll_config::<0>();
+                    acc[i][o] = fma_rn_f32(wv[s][o], v[i], acc[i][o]);
+                }
+            }
+        }
+        k += 32 * DOWN_ROWS_UNROLL;
+    }
+    // The lane's last values, fewer than a group, one at a time.
+    while k < two_n {
+        let msg_half = k >= n;
+        let kk = if msg_half { k - n } else { k };
+        let mut xv = [0.0f32; ROWS_DOWN];
+        let mut wv = [0.0f32; DOWN_WARP_OUTS];
+        // SAFETY: as the group's loads, with k < 2n.
+        unsafe {
+            for i in 0..ROWS_DOWN {
+                cuda_device::thread::__unroll_config::<0>();
+                xv[i] = if msg_half {
+                    *msg.get_unchecked(x_at[i] + kk)
+                } else {
+                    *cur.get_unchecked(x_at[i] + kk)
+                };
+            }
+            for o in 0..DOWN_WARP_OUTS {
+                cuda_device::thread::__unroll_config::<0>();
+                wv[o] = *down.get_unchecked(w_at[o] + k);
+            }
+        }
+        let mut v = [0.0f32; ROWS_DOWN];
+        for i in 0..ROWS_DOWN {
+            cuda_device::thread::__unroll_config::<0>();
+            v[i] = mul_rn_f32(xv[i], if msg_half { scale[i][1] } else { scale[i][0] });
+        }
+        for o in 0..DOWN_WARP_OUTS {
+            cuda_device::thread::__unroll_config::<0>();
+            for i in 0..ROWS_DOWN {
+                cuda_device::thread::__unroll_config::<0>();
+                acc[i][o] = fma_rn_f32(wv[o], v[i], acc[i][o]);
+            }
+        }
         k += 32;
     }
     for i in 0..ROWS_DOWN {
