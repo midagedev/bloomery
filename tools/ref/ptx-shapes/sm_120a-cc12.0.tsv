@@ -746,3 +746,14 @@ generate_ds41 norm_proj_bf16_f32 0 0
 generate_ds41 norm_proj_bf16_f32_cols 0 0
 generate_ds41 q8_0_gate_up_sel_cols 0 0
 generate_ds41 q8_0_gemv_sel32_cols 0 0
+# PIN(2026-11-25): ERNIE 5.5's ten common entries generate_ds41 links, scanned on the RTX 5090 (driver 615.71.09, ptxas 13.3) in 0.3.17's release batch: every one 0/0.
+generate_ds41 hc_head_f32 0 0
+generate_ds41 hc_pre_f32_rmsadd 0 0
+generate_ds41 indexer_score_f32 0 0
+generate_ds41 indexer_window 0 0
+generate_ds41 index_key_ln_neox 0 0
+generate_ds41 multimax_rows 0 0
+generate_ds41 sigmoid_split_512_10_pick 0 0
+generate_ds41 sigmoid_split_512_10_router 0 0
+generate_ds41 sigmoid_split_512_10_scores 0 0
+generate_ds41 vha_mix 0 0
