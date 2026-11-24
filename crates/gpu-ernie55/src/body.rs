@@ -738,8 +738,8 @@ impl ChainBody for Body {
     }
 }
 
-/// Why a tier accessor of a load with no host share panics: the seat reads the host tier only of
-/// a load whose plan hosts experts.
+/// Why a tier accessor that demands the tier panics on a load with no host share: a reader that
+/// serves either load asks [`TierBody::host_tier`].
 const NO_TIER: &str = "ernie55::Body: a load whose card holds every expert has no host tier";
 
 impl TierBody for Body {
@@ -747,6 +747,10 @@ impl TierBody for Body {
 
     fn hybrid(&self) -> &Hybrid<HostRun> {
         self.placed.as_ref().expect(NO_TIER).hybrid()
+    }
+
+    fn host_tier(&self) -> Option<&Hybrid<HostRun>> {
+        self.placed.as_ref().map(TierBody::hybrid)
     }
 
     fn hybrid_mut(&mut self) -> &mut Hybrid<HostRun> {

@@ -436,7 +436,12 @@ impl<F: Family> Log<F> {
         };
         r.f("load_s", total.as_secs_f64()).eprint();
         record::eprint_load_phases(m, total, self.opened);
-        record::host_tier::eprint_nvtier(m.body(F::NAME).ok().and_then(|b| b.hybrid().nvme_tier()));
+        record::host_tier::eprint_nvtier(
+            m.body(F::NAME)
+                .ok()
+                .and_then(|b| b.host_tier())
+                .and_then(|h| h.nvme_tier()),
+        );
         Ok(())
     }
 }
@@ -543,7 +548,13 @@ fn open_session<F: Family>(mut a: Open<Flags<F>>) -> Result<Hybrid<F>, GateError
         None => None,
     };
     let mut census = record::host_tier::CensusSpan::default();
-    census.mark("load", record::census_of(s.model().body(F::NAME)?.hybrid()));
+    census.mark(
+        "load",
+        s.model()
+            .body(F::NAME)?
+            .host_tier()
+            .and_then(record::census_of),
+    );
     // The encoder after the model's captures: its tower loads on the card the plan seated.
     #[cfg(feature = "vision")]
     let vision = vision_seat::open_resident(s.model().gpu().context(), a.vision.take())?;
@@ -637,8 +648,7 @@ impl<F: Family> Seat for Hybrid<F> {
     /// the `tier census` records of the steps since the last prompt and of
     /// this one, then the `nvtier` record.
     fn prefill(&mut self, ids: &[u32]) -> Result<u32, GateError> {
-        self.census
-            .steps(Some(self.s.model().body(F::NAME)?.hybrid()));
+        self.census.steps(self.s.model().body(F::NAME)?.host_tier());
         let next = match self.drafted.as_mut() {
             Some(d) => d.prompt_call(&mut self.s, ids, CallEnd::Argmax)?,
             None => <F::Body as Prompt>::prompt(self.s.model_mut(), ids)?,
@@ -646,7 +656,7 @@ impl<F: Family> Seat for Hybrid<F> {
         self.s
             .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         self.census
-            .prompt(Some(self.s.model().body(F::NAME)?.hybrid()));
+            .prompt(self.s.model().body(F::NAME)?.host_tier());
         self.print_host_yields()?;
         Ok(next)
     }
@@ -676,13 +686,12 @@ impl<F: Family> Seat for Hybrid<F> {
             )
             .into());
         }
-        self.census
-            .steps(Some(self.s.model().body(F::NAME)?.hybrid()));
+        self.census.steps(self.s.model().body(F::NAME)?.host_tier());
         let next = F::prompt_media(&mut self.s, v, ids, feeds)?;
         self.s
             .card_check(model::placement::card_made::CardPhase::FirstPrompt)?;
         self.census
-            .prompt(Some(self.s.model().body(F::NAME)?.hybrid()));
+            .prompt(self.s.model().body(F::NAME)?.host_tier());
         self.print_host_yields()?;
         Ok(next)
     }

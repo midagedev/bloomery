@@ -33,6 +33,15 @@ pub trait TierBody {
     #[must_use]
     fn hybrid(&self) -> &Hybrid<Self::Experts>;
 
+    /// The body's host tier when this load has one. A body whose plan can seat every expert on
+    /// the card holds no tier then and answers `None`; a reader that serves either load (the
+    /// serve seat's censuses) goes through here, and [`TierBody::hybrid`] stays for a caller that
+    /// demands the tier. The default is the tier itself.
+    #[must_use]
+    fn host_tier(&self) -> Option<&Hybrid<Self::Experts>> {
+        Some(self.hybrid())
+    }
+
     /// The body's host tier, mutable.
     fn hybrid_mut(&mut self) -> &mut Hybrid<Self::Experts>;
 
