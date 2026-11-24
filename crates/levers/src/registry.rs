@@ -65,6 +65,7 @@ pub const PREPARE_Q8: &str = "BLOOMERY_PREPARE_Q8";
 pub const AUTOTUNE: &str = "BLOOMERY_AUTOTUNE";
 pub const INK2_DENSE: &str = "BLOOMERY_INK2_DENSE";
 pub const INK2_PASSES: &str = "BLOOMERY_INK2_PASSES";
+pub const REPLAY_POISON: &str = "BLOOMERY_REPLAY_POISON";
 
 /// The largest `BLOOMERY_INK2_PASSES`: the passes the variable-loop checkpoint was trained on.
 pub const INK2_PASSES_MAX: u64 = 5;
@@ -1572,6 +1573,24 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               message at all. A folder of a fixed loop (the Mini) and a GGUF file refuse the lever \
               by name. Unset runs the folder's `num_passes`. Read where the folder opens, in \
               the Inkling 2 folder reader; the `load` line prints `passes=`.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: REPLAY_POISON,
+        class: Class::D,
+        kind: Kind::Flag,
+        default: Unset::Is("0"),
+        doc: "`gate_nemotron_h_moe_e2e`: its `replay_owns_its_scratch` clause. The captured \
+              decode step's plain device allocations are read off its nodes' parameters; each \
+              is filled with a poison right before a replay, and the replay's logits and argmax \
+              are held bit for bit to the unpoisoned replay's, except a span that is state the \
+              step reads before it writes (a scan state, a conv ring, a K or V plane) or a \
+              load-time constant, each counted as the file's header derives. A span's non-zero \
+              bytes at the load are written back after the poison: an input stays, and a zero \
+              the replay reads without writing is shown. Off, nothing is read.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

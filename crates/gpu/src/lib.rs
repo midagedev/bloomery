@@ -116,6 +116,7 @@ pub mod quant_sel;
 pub(crate) mod recur;
 pub mod rel_bias;
 pub mod rel_bias_prefill;
+pub mod replay_scratch;
 pub(crate) mod ring_gemm;
 pub(crate) mod room;
 pub mod rope_neox;
@@ -146,6 +147,7 @@ pub use graph::{
     op_write,
 };
 pub use model::{GpuModel, Slots};
+pub use replay_scratch::{POISON, ReplayLeft, ReplayScratch, ReplaySpan, ReplayStep};
 pub use room::elastic::{
     Elastic, ElasticBody, ElasticStats, FilledBytes, HELD_NO_QUANTUM, settle_to_margin, with_room,
 };

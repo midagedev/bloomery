@@ -295,8 +295,9 @@ impl Graph {
 }
 
 /// What the driver reports of `node`: its type, a host node's sync mode, and
-/// a kernel node's entry name and geometry. The one reader of these facts:
-/// [`Graph::nodes`] and the gates' template walk both call it.
+/// a kernel node's entry name, geometry and parameters' pointer-sized words.
+/// The one reader of these facts: [`Graph::nodes`] and the gates' template
+/// walk both call it.
 ///
 /// # Safety
 ///
@@ -381,7 +382,80 @@ unsafe fn kernel_node(node: sys::CUgraphNode) -> Result<KernelNode, GpuError> {
         name,
         grid: [p.gridDimX, p.gridDimY, p.gridDimZ],
         block: [p.blockDimX, p.blockDimY, p.blockDimZ],
+        words: param_words(&p)?,
     })
+}
+
+/// The most parameters a kernel node's function is read to have, far past
+/// any entry this engine launches: past it the node is refused by name, as a
+/// function whose parameter list the driver never ends.
+const MOST_PARAMS: usize = 1024;
+/// The most bytes one kernel parameter is read to hold: the parameter space
+/// of a launch.
+const WIDEST_PARAM: usize = 4096;
+
+/// The pointer-sized words of kernel node `p`'s parameters: every 8 bytes at
+/// the 8-byte-aligned offsets of each parameter's value, once each and
+/// ascending. Where a launch's device and mapped host addresses are to be
+/// found ([`ReplayScratch::of`]): an argument that is an address, and one
+/// inside an argument passed by value (a sink's word, a slice's data, a
+/// launch record's pointers), is one of these words. A node launched through
+/// `extra`, a parameter the node holds no value for and a function past
+/// [`MOST_PARAMS`] parameters are refused by name.
+fn param_words(p: &sys::CUDA_KERNEL_NODE_PARAMS) -> Result<Vec<u64>, GpuError> {
+    const WHAT: &str = "Graph::nodes";
+    let mut words: Vec<u64> = Vec::new();
+    for i in 0..MOST_PARAMS {
+        let mut bytes = 0usize;
+        // SAFETY: the node is live and `func` (or, it null, `kern`) is the
+        // function its launch names; `bytes` is a local the call writes. The
+        // offset is not read: `kernelParams[i]` already points at parameter
+        // `i`'s value.
+        let rc = unsafe {
+            if p.func.is_null() {
+                sys::cuKernelGetParamInfo(p.kern, i, &mut 0, &mut bytes)
+            } else {
+                sys::cuFuncGetParamInfo(p.func, i, &mut 0, &mut bytes)
+            }
+        };
+        if rc == sys::cudaError_enum_CUDA_ERROR_INVALID_VALUE {
+            return Ok(words);
+        }
+        cu(rc, "cuFuncGetParamInfo")?;
+        if bytes == 0 {
+            continue;
+        }
+        if p.kernelParams.is_null() {
+            return Err(GpuError::state(
+                WHAT,
+                "a kernel node whose parameters go through `extra`, which this reader does not take",
+            ));
+        }
+        if bytes > WIDEST_PARAM {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a kernel parameter of {bytes} bytes, past {WIDEST_PARAM}"),
+            ));
+        }
+        // SAFETY: the node owns its `kernelParams` array while it lives, and
+        // `i` is below the parameter count its function just named.
+        let value = unsafe { *p.kernelParams.add(i) };
+        if value.is_null() {
+            return Err(GpuError::state(
+                WHAT,
+                "a kernel parameter the node holds no value for",
+            ));
+        }
+        // SAFETY: `value` is the `bytes` the node owns for parameter `i`;
+        // `[u8; 8]` needs no alignment, the slice reads whole 8-byte groups
+        // inside them and is dropped here.
+        let groups = unsafe { std::slice::from_raw_parts(value.cast::<[u8; 8]>(), bytes / 8) };
+        words.extend(groups.iter().map(|g| u64::from_ne_bytes(*g)));
+    }
+    Err(GpuError::shape(
+        WHAT,
+        format!("a kernel node past {MOST_PARAMS} parameters"),
+    ))
 }
 
 /// `cuGraphLaunch` of `exec` on `stream`, mapped to [`GpuError`].
@@ -1268,6 +1342,10 @@ pub struct KernelNode {
     pub grid: [u32; 3],
     /// The block, in threads: x, y, z.
     pub block: [u32; 3],
+    /// The pointer-sized words of the node's parameters ([`param_words`]),
+    /// once each and ascending: the launch record's addresses are among
+    /// them, for [`ReplayScratch::of`] to tell which are the device's.
+    pub words: Vec<u64>,
 }
 
 impl Drop for Graph {

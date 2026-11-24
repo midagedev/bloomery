@@ -538,6 +538,7 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.gen_slots(), 1);
     assert!(!unset.prepare_q8());
     assert!(unset.autotune());
+    assert!(!unset.replay_poison());
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -589,6 +590,7 @@ fn accessors_read_their_rows() {
             (GEN_SLOTS, "2"),
             (PREPARE_Q8, "1"),
             (AUTOTUNE, "off"),
+            (REPLAY_POISON, "1"),
         ]),
         Scope::Every,
     )
@@ -646,6 +648,7 @@ fn accessors_read_their_rows() {
     assert_eq!(set.gen_slots(), 2);
     assert!(set.prepare_q8());
     assert!(!set.autotune());
+    assert!(set.replay_poison());
     assert_eq!(
         set.host(),
         HostCfg {
@@ -714,7 +717,8 @@ fn accessors_read_their_rows() {
             PREPARE_Q8,
             AUTOTUNE,
             INK2_DENSE,
-            INK2_PASSES
+            INK2_PASSES,
+            REPLAY_POISON
         ]
     );
 }
@@ -760,6 +764,33 @@ fn ink2_passes_takes_one_to_five_and_refuses_the_rest() {
         };
         assert!(e.to_string().contains(INK2_PASSES), "{e}");
     }
+}
+
+/// `BLOOMERY_REPLAY_POISON` is off unset, `1` turns a capture gate's replay-poison clause on, `0`
+/// keeps it off, a word that is neither flag is refused by name, and a binary whose `at_main`
+/// list leaves the row out refuses it set.
+#[test]
+fn replay_poison_is_off_unless_one() {
+    let on = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.replay_poison());
+    assert!(!on(&[]).unwrap());
+    assert!(!on(&[(REPLAY_POISON, "0")]).unwrap());
+    assert!(on(&[(REPLAY_POISON, "1")]).unwrap());
+    for bad in ["on", "true", "2", ""] {
+        let Err(e) = on(&[(REPLAY_POISON, bad)]) else {
+            panic!("{bad:?} is not a flag of the row and must be refused");
+        };
+        assert!(e.to_string().contains(REPLAY_POISON), "{e}");
+    }
+    let Err(e) = read(
+        &env(&[(REPLAY_POISON, "1")]),
+        Scope::Main {
+            bin: "b",
+            acts_on: &[],
+        },
+    ) else {
+        panic!("a binary that does not act on the row refuses it set");
+    };
+    assert!(e.to_string().contains("does not act on it"), "{e}");
 }
 
 /// `BLOOMERY_SCHEMAJUMP` is on unset, `off` is the step arm, and a word that is

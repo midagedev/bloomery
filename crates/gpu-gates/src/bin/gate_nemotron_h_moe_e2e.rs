@@ -21,6 +21,23 @@
 //! - `eager_equals_replay`, `reset_rewinds`, `state_carries`,
 //!   `fault_word_clean` (self-consistency): as `gate_nemotron_e2e`'s, over a
 //!   16-token walk.
+//! - `replay_owns_its_scratch` (self-consistency, only under
+//!   `BLOOMERY_REPLAY_POISON=1`; unset, it prints `SKIPPED` and runs
+//!   nothing): the captured step's replay writes every cell of its scratch
+//!   that it reads. The plain device allocations the step's nodes address are
+//!   read off the nodes' parameters ([`ReplayScratch`]: no model names its
+//!   buffers), and each is filled with a poison right before a replay at the
+//!   first and the last position of the walk: the replay's token and logits
+//!   are the unpoisoned replay's bit for bit, span by span and with the owned
+//!   spans together, unless the span is one the step reads before it writes by
+//!   what its owner allocated: state it updates in place (a scan state, a conv
+//!   ring, a K or V plane), a launch's ticket count (the scan's norm, a
+//!   router's: zero at rest after a step, which the clause holds it to) or a
+//!   load-time constant (the one-expert ids), each counted and sized as the
+//!   header derives, at the exact length. The weights, the
+//!   fault words, host memory and the rooms are left alone; a span's non-zero
+//!   bytes at the load are written back after the poison, so an input stays
+//!   and a zero the replay reads without writing shows.
 //! - `routing_is_mainlines` (fixture oracle): per prompt and MoE layer, the
 //!   body's kept experts at the last position against the set's, as sets
 //!   (ggml's top-k gives no order), with two checks of the card against its
@@ -172,13 +189,18 @@ mod gate {
     };
     use crate::gate_card;
     use bloomery_gpu::arch::nemotron_h_moe::Routing;
+    use bloomery_gpu::flash_gqa::HEAD;
     use bloomery_gpu::host::served::TierBody;
+    use bloomery_gpu::linear::CONV_TAPS;
     use bloomery_gpu::model::StepMode;
-    use bloomery_gpu::{Gpu, GpuError, NemotronHMoeModel};
+    use bloomery_gpu::site::BY_NAME_COLS;
+    use bloomery_gpu::{
+        Gpu, GpuError, NemotronHMoeModel, NodeInfo, ReplayScratch, ReplaySpan, ReplayStep,
+    };
     use bloomery_gpu_gates::nodes::count_kinds;
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, open_split, verdict};
-    use cuda_core::sys;
+    use cuda_core::{CudaStream, sys};
     use model::arch::Arch;
     use model::arch::nemotron_h_moe::hparams::{Hparams, Kind};
     use model::arch::nemotron_h_moe::place::{self as moe_place, Experts};
@@ -186,6 +208,7 @@ mod gate {
     use refset::arch::nemotron_h_moe::fixture::{LOGITS, LOGITS_SET};
     use refset::arch::nemotron_h_moe::{LOGITS as REAL_LOGITS, LOGITS_SET as REAL_SET};
     use refset::nemotron::LogitsSet;
+    use runtime::stores;
     use std::collections::BTreeMap;
 
     type Model = NemotronHMoeModel;
@@ -234,13 +257,27 @@ mod gate {
 
     /// What a clause is run over: the layer kinds and expert counts the
     /// file's header names, the walk, and in the fixture tier the set and
-    /// the body's runs of its prompts.
+    /// the body's runs of its prompts; the context the load was opened at,
+    /// and the captured step's scratch with its image at the load when the
+    /// replay-poison lever is set.
     struct Case {
         hp: Hparams,
         walk: Vec<u32>,
         /// Each MoE layer's selection bias, from the file, in layer order.
         bias: Vec<Vec<f32>>,
         mainline: Option<Mainline>,
+        /// The K/V planes' rows a key head, as the model was opened.
+        ctx: usize,
+        scratch: Option<Held>,
+    }
+
+    /// The captured step's scratch ([`ReplayScratch`]), its image at the load
+    /// and the nodes it was read from: taken with the step captured before
+    /// any call ran on the model, so the image is the load's.
+    struct Held {
+        scratch: ReplayScratch,
+        image: Vec<Vec<u8>>,
+        nodes: Vec<NodeInfo>,
     }
 
     /// The set and, per prompt, the body's run of it.
@@ -267,6 +304,11 @@ mod gate {
             "eager_equals_replay",
             Tag::SelfConsistency,
             eager_equals_replay,
+        ),
+        (
+            SCRATCH_CLAUSE,
+            Tag::SelfConsistency,
+            replay_owns_its_scratch,
         ),
         ("reset_rewinds", Tag::SelfConsistency, reset_rewinds),
         ("state_carries", Tag::SelfConsistency, state_carries),
@@ -418,6 +460,403 @@ mod gate {
             finite(&eager),
             verdict(pass)
         );
+        Ok(pass)
+    }
+
+    // ---------------------------------------------- replay_owns_its_scratch
+
+    /// The clause's name: the list's, the refusals' and its lines'.
+    const SCRATCH_CLAUSE: &str = "replay_owns_its_scratch";
+
+    /// The captured step's scratch and its image at the load: the step
+    /// captured before any call ran on the model, so the image is the load's.
+    fn scratch_at_load(m: &mut Model) -> Result<Held, GateError> {
+        m.set_mode(StepMode::Graph);
+        m.capture_step()?;
+        let nodes = m.step_graph_nodes()?;
+        let scratch = ReplayScratch::of(m.gpu(), m.weights(), &nodes)?;
+        let image = scratch.image(m.gpu().stream())?;
+        Ok(Held {
+            scratch,
+            image,
+            nodes,
+        })
+    }
+
+    /// A buffer the step reads before it writes, by what the code that
+    /// allocated it says it is ([`read_before_write`]). A span is one only at
+    /// the allocation's exact length: a plain allocation comes back from the
+    /// driver at the length its owner asked for.
+    enum ReadFirst {
+        /// State the step updates in place, of `bytes`: the replay writes into
+        /// it (fewer bytes at the poison than it holds), and `by`'s entries
+        /// alone address it.
+        State {
+            what: &'static str,
+            bytes: usize,
+            by: fn(&str) -> bool,
+        },
+        /// A constant the replay never writes, of `bytes`: zero at the load
+        /// here, whole at the poison, and `by`'s entries alone address it.
+        Constant {
+            what: &'static str,
+            bytes: usize,
+            by: fn(&str) -> bool,
+        },
+        /// A launch's ticket count, of `bytes`: allocated zero, every block
+        /// of `entry`'s draws one before the launch's other work, and the
+        /// block that draws the last puts the count back to zero. So `entry`
+        /// alone addresses it and it is all zero at the load; that it is zero
+        /// at rest after a step too is the clause's own check ([`at_rest`]).
+        Tickets {
+            what: &'static str,
+            bytes: usize,
+            entry: String,
+        },
+    }
+
+    /// Whether `entry` addresses a Mamba-2 layer's stores: the scan, which
+    /// reads the state and the ring and writes both.
+    fn scan_entry(entry: &str) -> bool {
+        entry == "mamba2_step"
+    }
+
+    /// Whether `entry` addresses an attention layer's K or V plane: an
+    /// append, which writes its row, or a flash pass, which reads it.
+    fn plane_entry(entry: &str) -> bool {
+        entry.starts_with("kv_append") || entry.starts_with("gqa_flash")
+    }
+
+    /// Whether `entry` is the one-expert gemv over a stack, which takes the
+    /// shared expert's selection: the entry alone that reads its one id.
+    fn sel_entry(entry: &str) -> bool {
+        entry == "iq2_xxs_gemv_sel"
+    }
+
+    /// The buffers a step at position `k` reads before it writes, each by the
+    /// code that allocates it ([`ReadFirst`]). Per Mamba-2 layer
+    /// ([`Kind::Mamba`]): its scan state and conv ring ([`stores::mamba2_lens`],
+    /// f32), at every position. Per attention layer, once a position is there
+    /// to attend to: its K and V planes (`kv` rows of a key head's [`HEAD`]
+    /// f16 over the context). Once for the model: the grouped norm's ticket
+    /// count, one u32 a group ([`bloomery_gpu::mamba2::Mamba2Scratch::new`]; the one
+    /// `Mamba2Scratch` serves every Mamba-2 layer, and the scan's `mamba2_step`
+    /// carries the norm). Per MoE layer ([`Kind::Moe`]): its router's ticket
+    /// count, one u32 (`RouterOut::new`), addressed by the layer's router
+    /// entry alone. Once for the model: the shared expert's one id
+    /// (`MoeScratch::zero_id`, one u32; the one `MoeScratch` serves every MoE
+    /// layer), and the site kernels' one-expert ids ([`BY_NAME_COLS`] u32).
+    /// The constants are zero at the load.
+    fn read_before_write(hp: &Hparams, ctx: usize, k: usize) -> Vec<ReadFirst> {
+        let of = |want: Kind| hp.kinds.iter().filter(|&&kind| kind == want).count();
+        let [state, ring] =
+            stores::mamba2_lens(hp.ssm.d_inner, hp.ssm.d_state, CONV_TAPS, hp.ssm.conv_dim);
+        let mut out = Vec::new();
+        for _ in 0..of(Kind::Mamba) {
+            out.extend([
+                ReadFirst::State {
+                    what: "scan state",
+                    bytes: 4 * state,
+                    by: scan_entry,
+                },
+                ReadFirst::State {
+                    what: "conv ring",
+                    bytes: 4 * ring,
+                    by: scan_entry,
+                },
+            ]);
+        }
+        if k > 0 {
+            let planes = hp
+                .kinds
+                .iter()
+                .zip(&hp.kv)
+                .filter(|(kind, _)| **kind == Kind::Attention)
+                .map(|(_, kv)| 2 * *kv * ctx * HEAD);
+            for bytes in planes {
+                out.extend([
+                    ReadFirst::State {
+                        what: "K plane",
+                        bytes,
+                        by: plane_entry,
+                    },
+                    ReadFirst::State {
+                        what: "V plane",
+                        bytes,
+                        by: plane_entry,
+                    },
+                ]);
+            }
+        }
+        out.push(ReadFirst::Tickets {
+            what: "the scan's norm ticket count",
+            bytes: size_of::<u32>() * hp.ssm.n_groups,
+            entry: "mamba2_step".to_owned(),
+        });
+        for x in hp.experts.iter().flatten() {
+            out.push(ReadFirst::Tickets {
+                what: "the router's block ticket count",
+                bytes: size_of::<u32>(),
+                entry: format!("nemotron_moe_router_{}", x.n_expert),
+            });
+        }
+        out.extend([
+            ReadFirst::Constant {
+                what: "the shared expert's one id",
+                bytes: size_of::<u32>(),
+                by: sel_entry,
+            },
+            ReadFirst::Constant {
+                what: "the site kernels' one-expert ids",
+                bytes: size_of::<u32>() * BY_NAME_COLS,
+                by: |_| true,
+            },
+        ]);
+        out
+    }
+
+    impl ReadFirst {
+        /// What the buffer is, to print.
+        fn what(&self) -> &'static str {
+            match self {
+                ReadFirst::State { what, .. }
+                | ReadFirst::Constant { what, .. }
+                | ReadFirst::Tickets { what, .. } => what,
+            }
+        }
+
+        /// Whether `span`, poisoned, is this buffer, at the derived length
+        /// exactly: a state one the replay wrote into, by its entries alone; a
+        /// constant one the replay left whole at the poison, all zero at the
+        /// load, by its entries alone; a ticket count its entry alone
+        /// addresses, all zero at the load.
+        fn fits(&self, span: &ReplaySpan, got: &ReplayStep, was: &[u8], entries: &[&str]) -> bool {
+            let zero = |bytes: &[u8]| bytes.iter().all(|&b| b == 0);
+            match self {
+                ReadFirst::State { bytes, by, .. } => {
+                    span.bytes == *bytes
+                        && got.still < span.bytes
+                        && entries.iter().all(|entry| by(entry))
+                }
+                ReadFirst::Constant { bytes, by, .. } => {
+                    span.bytes == *bytes
+                        && got.still == span.bytes
+                        && zero(was)
+                        && entries.iter().all(|entry| by(entry))
+                }
+                ReadFirst::Tickets { bytes, entry, .. } => {
+                    span.bytes == *bytes
+                        && entries.len() == 1
+                        && entries[0] == entry.as_str()
+                        && zero(was)
+                }
+            }
+        }
+    }
+
+    /// Whether the span the replay read before it wrote is one the layer kinds
+    /// account for ([`read_before_write`]): the first of `allowed` it is,
+    /// claimed from it.
+    fn claimed(
+        span: &ReplaySpan,
+        got: &ReplayStep,
+        was: &[u8],
+        entries: &[&str],
+        allowed: &mut Vec<ReadFirst>,
+    ) -> Option<&'static str> {
+        let at = allowed
+            .iter()
+            .position(|read| read.fits(span, got, was, entries))?;
+        Some(allowed.remove(at).what())
+    }
+
+    /// Whether every ticket count the step's nodes name is zero after the
+    /// reference step at position `k` ([`ReadFirst::Tickets`]): its owner's
+    /// last block puts it back, and a count left standing is a launch that
+    /// never draws its last ticket again. A kind no span names is unclaimed.
+    /// Prints each count not at rest; the second of the pair is how many
+    /// ticket counts the nodes name.
+    fn at_rest(
+        scratch: &ReplayScratch,
+        nodes: &[NodeInfo],
+        stream: &CudaStream,
+        allowed: &[ReadFirst],
+        k: usize,
+    ) -> Result<(bool, usize), GateError> {
+        let spans = scratch.spans();
+        let mut ok = true;
+        let mut found = 0;
+        for read in allowed {
+            let ReadFirst::Tickets { what, bytes, entry } = read else {
+                continue;
+            };
+            for (at, span) in spans.iter().enumerate() {
+                if span.bytes != *bytes || scratch.entries(nodes, at) != [entry.as_str()] {
+                    continue;
+                }
+                found += 1;
+                let rest = scratch.read(stream, at)?;
+                let awake = rest.iter().filter(|&&b| b != 0).count();
+                if awake != 0 {
+                    ok = false;
+                    println!(
+                        "{SCRATCH_CLAUSE}: position {k}: span {at} at {:#x}, {} B ({entry}), \
+                         {what}, is not at rest after the step: {awake} of {} B non-zero {}",
+                        span.base,
+                        span.bytes,
+                        span.bytes,
+                        verdict(false)
+                    );
+                }
+            }
+        }
+        Ok((ok, found))
+    }
+
+    /// How a poisoned replay left the unpoisoned one's answer.
+    fn how(got: &ReplayStep, want: &ReplayStep) -> String {
+        if !got.poisoned {
+            return "the walk before the step raised the fault word".to_owned();
+        }
+        if let Some(fault) = got.fault {
+            return format!("it raised the fault word {fault}");
+        }
+        let off = got
+            .logits
+            .iter()
+            .zip(&want.logits)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        format!(
+            "id {} against {}, {} of {} logits differ",
+            got.id,
+            want.id,
+            off,
+            want.logits.len()
+        )
+    }
+
+    /// The captured step's replay owns its scratch (module doc): at the first
+    /// and the last position of the walk, every plain allocation the step's
+    /// nodes address is poisoned right before the replay, and the replay's
+    /// token and logits are the unpoisoned replay's bit for bit, unless the
+    /// span is one the step reads before it writes by what its owner
+    /// allocated ([`read_before_write`]): state it updates in place, a
+    /// launch's ticket count or a load-time constant, each counted and sized
+    /// by the header's derivation, a ticket count also held to zero at rest
+    /// after the reference step; then the owned spans together. A span no
+    /// owner accounts for, a count not at rest, or a replay the owned spans
+    /// together move, is a FAIL naming the span.
+    fn replay_owns_its_scratch(m: &mut Model, case: &Case) -> Result<bool, GateError> {
+        let Some(held) = case.scratch.as_ref() else {
+            return Err(
+                format!("{SCRATCH_CLAUSE}: ran without the scratch read at the load").into(),
+            );
+        };
+        let Held {
+            scratch,
+            image,
+            nodes,
+        } = held;
+        let spans = scratch.spans();
+        let left = scratch.left();
+        let positions = [0, case.walk.len() - 1];
+        println!(
+            "{SCRATCH_CLAUSE}: {} plain allocations in the step's {} nodes (addresses left \
+             alone: {} in weights, {} in the fault words, {} in rooms, {} in host memory, {} of \
+             no plain range); positions {positions:?} of the {}-id walk; {} poisoned replays",
+            spans.len(),
+            nodes.len(),
+            left.weights,
+            left.fault_words,
+            left.rooms,
+            left.host,
+            left.unranged,
+            case.walk.len(),
+            2 * spans.len() + 2,
+        );
+        m.set_mode(StepMode::Graph);
+        let mut pass = true;
+        for &k in &positions {
+            let (prefix, token) = (&case.walk[..k], case.walk[k]);
+            let want = scratch.step(m, prefix, token)?;
+            if let Some(fault) = want.fault {
+                return Err(format!(
+                    "{SCRATCH_CLAUSE}: the step at position {k} raised the fault word before \
+                     any poison: {fault}"
+                )
+                .into());
+            }
+            let mut allowed = read_before_write(&case.hp, case.ctx, k);
+            let (rest, rests) = at_rest(scratch, nodes, m.gpu().stream(), &allowed, k)?;
+            let mut owned: Vec<usize> = Vec::new();
+
+            let mut moved: Vec<(usize, ReplayStep)> = Vec::new();
+            for at in 0..spans.len() {
+                let got = scratch.poisoned_step(m, prefix, token, &[at], image)?;
+                if got.fault.is_none() && got.id == want.id && same_bits(&got.logits, &want.logits)
+                {
+                    owned.push(at);
+                } else {
+                    moved.push((at, got));
+                }
+            }
+            let together = scratch.poisoned_step(m, prefix, token, &owned, image)?;
+            let held = together.fault.is_none()
+                && together.id == want.id
+                && same_bits(&together.logits, &want.logits);
+            let mut by_name: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+
+            let mut stray = 0usize;
+            for (at, got) in &moved {
+                let span = &spans[*at];
+                let entries = scratch.entries(nodes, *at);
+                match claimed(span, got, &image[*at], &entries, &mut allowed) {
+                    Some(what) => {
+                        let count = by_name.entry(what).or_insert((0, span.bytes));
+                        count.0 += 1;
+                    }
+                    None => {
+                        stray += 1;
+                        println!(
+                            "{SCRATCH_CLAUSE}: position {k}: span {at} at {:#x}, {} B ({}; {} B \
+                             still at the poison) moved the replay: {}",
+                            span.base,
+                            span.bytes,
+                            entries.join(", "),
+                            got.still,
+                            how(got, &want),
+                        );
+                    }
+                }
+            }
+            let listed: Vec<String> = by_name
+                .iter()
+                .map(|(what, (n, bytes))| format!("{n} of {bytes} B: {what}"))
+                .collect();
+            let unaccounted = if stray == 0 {
+                String::new()
+            } else {
+                format!("; {stray} no owner accounts for")
+            };
+            let ok = stray == 0 && held && rest;
+            println!(
+                "{SCRATCH_CLAUSE}: position {k}: {} of {} spans owned (token and logits bit-equal \
+                 with the span poisoned; with the {} owned spans together: {}); read before \
+                 write: {} spans, their owners' [{}]{}; {rests} ticket count(s) at rest: {}; \
+                 overall {}",
+                owned.len(),
+                spans.len(),
+                owned.len(),
+                verdict(held),
+                moved.len(),
+                listed.join("; "),
+                unaccounted,
+                verdict(rest),
+                verdict(ok),
+            );
+            pass &= ok;
+        }
         Ok(pass)
     }
 
@@ -1730,6 +2169,7 @@ mod gate {
     // ---------------------------------------------------------------- run
 
     pub fn run() -> Result<(), GateError> {
+        let levers = bloomery_levers::at_main(&tier::acts_on(&[bloomery_levers::REPLAY_POISON])?)?;
         let file = open_split(Arch::NemotronHMoe, "gate-gpu-nemotron-h-moe-e2e")?;
         let hp = Hparams::read(&file).map_err(|e| format!("nemotron_h_moe header: {e}"))?;
         // The set opens before the card loads: one the tier runs, missing or
@@ -1772,6 +2212,13 @@ mod gate {
             m.layers().len(),
             t.elapsed().as_secs_f64()
         );
+        // The scratch's image is the load's only while no call has run on the
+        // model: it is taken here, before the mainline's prompts.
+        let scratch = if levers.replay_poison() {
+            Some(scratch_at_load(&mut m)?)
+        } else {
+            None
+        };
         let mainline = match set {
             Some(set) => {
                 let mut runs = Vec::with_capacity(set.prompts.len());
@@ -1787,9 +2234,18 @@ mod gate {
             walk,
             bias,
             mainline,
+            ctx,
+            scratch,
         };
         let mut ok = true;
         for (name, tag, clause) in CLAUSES {
+            if *name == SCRATCH_CLAUSE && case.scratch.is_none() {
+                println!(
+                    "SKIPPED ({name}): {} is unset",
+                    bloomery_levers::REPLAY_POISON
+                );
+                continue;
+            }
             if !tier::run_clause(name, *tag)? {
                 continue;
             }
@@ -1825,13 +2281,19 @@ mod gate {
         if !ok {
             return Err(checks_failed());
         }
+        // The scratch clause names itself only when the lever let it run.
+        let owned = if case.scratch.is_some() {
+            format!("; the replay owns its scratch ({SCRATCH_CLAUSE})")
+        } else {
+            String::new()
+        };
         println!(
             "PASSED: {NAME} the captured step holds the entries its layer kinds derive; eager and \
              replay give bit-identical logits; a reset rewinds the ids and the logits bits; the \
              scan state carries; the fault word stays clean; in the fixture tier the logits keep \
              the cosine floor, the argmax is mainline's above the band and every MoE layer keeps \
              mainline's experts on every prompt of the set; the prompt path, alone and before a \
-             step, keeps the cosine floor"
+             step, keeps the cosine floor{owned}"
         );
         Ok(())
     }

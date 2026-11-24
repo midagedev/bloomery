@@ -33,8 +33,8 @@ use std::sync::OnceLock;
 mod registry;
 use registry::REGISTRY;
 pub use registry::{
-    AUTOTUNE, ELASTIC, INK2_DENSE, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, SCHEMAJUMP,
-    SPLIT_WALK, XSTREAM,
+    AUTOTUNE, ELASTIC, INK2_DENSE, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, REPLAY_POISON,
+    SCHEMAJUMP, SPLIT_WALK, XSTREAM,
 };
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_EXPERTS_CAP, CARD_MARGIN, CED, CHECK_FINITE, DRAFT,
@@ -1677,6 +1677,13 @@ impl Levers {
     pub fn ink2_passes(&self) -> Option<usize> {
         self.count(INK2_PASSES)
             .map(|n| Levers::usize_of(INK2_PASSES, n))
+    }
+
+    /// `BLOOMERY_REPLAY_POISON`: a capture gate runs its replay-poison
+    /// clause; off, the clause is left out.
+    #[must_use]
+    pub fn replay_poison(&self) -> bool {
+        self.flag(REPLAY_POISON)
     }
 
     /// `BLOOMERY_AUTOTUNE`: a server makes its load-time kernel picks (the
