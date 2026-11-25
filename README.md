@@ -268,7 +268,7 @@ file's `--plan` prints on this card.
 | Hy4-flash `Q4_K_M` | card + CPU | 31.75 ³ | 31.48 ³ | 31.71 | 31.78 |
 | GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 194.44 | 210.03 | 30.09 | 26.17 |
 | Nemotron 3.5 Bolt 74B-A9B `24GB` | the whole model on the card | 4,971.72 | 7,166.02 | 182.41 | 180.44 |
-| ERNIE 5.5 Flash Preview `F8M4` (our GGUF) ⁵ | card + CPU | 117.78 | 115.80 | 35.40 | 32.11 |
+| ERNIE 5.5 Flash Preview `F8M4` (our GGUF) ⁵ | card + CPU | 161.54 | 141.34 | 43.46 | 36.07 |
 | Inkling 2 Mini `UD-Q4_K_XL` ⁴ | the whole model on the card | 4,962.77 | 4,759.63 | 155.33 | 150.91 |
 | Inkling 2 Mini, the official checkpoint folder ⁴ | the whole model on the card | 3,818.15 | 3,703.65 | 153.82 | 151.38 |
 
