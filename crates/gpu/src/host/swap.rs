@@ -574,6 +574,8 @@ pub struct Tally {
     ids: Vec<u32>,
     /// Per (row, layer), a bit per slot noted this pass.
     filled: Vec<u64>,
+    /// Per (row, layer), a bit per slot the pass cut ([`Tally::note_cut`]).
+    cut: Vec<u64>,
     /// Per layer: no pass routes it, so no note of it is taken
     /// ([`MachineCfg::unrouted`]).
     unrouted: Vec<bool>,
@@ -595,6 +597,7 @@ impl Tally {
             max_rows,
             ids: vec![0; cells * top_k],
             filled: vec![0; cells],
+            cut: vec![0; cells],
             unrouted,
         }
     }
@@ -643,14 +646,75 @@ impl Tally {
                 format!("layer {layer} row {row}: slot {k} noted twice in one pass"),
             ));
         }
+        if self.cut[cell] & bit != 0 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer} row {row}: slot {k} was cut in this pass"),
+            ));
+        }
         self.filled[cell] |= bit;
         self.ids[cell * self.top_k + k] = id;
         Ok(())
     }
 
-    /// Forget the noted ids: the next pass starts empty.
+    /// Slot `k` of row `row`'s routing at layer `layer` is cut: the pass
+    /// does not weigh it, so it is neither a hit nor a miss and no heat. A
+    /// tally that is off notes nothing. Refused by name, as [`Tally::note`]
+    /// does, and for a slot already noted.
+    pub fn note_cut(&mut self, layer: usize, row: usize, k: usize) -> Result<(), GpuError> {
+        const WHAT: &str = "Tally::note_cut";
+        if !self.on {
+            return Ok(());
+        }
+        if !self.layers.contains(&layer) || row >= self.max_rows || k >= self.top_k {
+            return Err(GpuError::shape(
+                WHAT,
+                format!(
+                    "layer {layer} row {row} slot {k}: the tally holds layers {:?}, {} rows, \
+                     top-{}",
+                    self.layers, self.max_rows, self.top_k
+                ),
+            ));
+        }
+        if self.unrouted[layer - self.layers.start] {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer} row {row}: a layer no pass routes (MachineCfg::unrouted)"),
+            ));
+        }
+        let cell = row * self.layers.len() + (layer - self.layers.start);
+        let bit = 1u64 << k;
+        if self.filled[cell] & bit != 0 || self.cut[cell] & bit != 0 {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("layer {layer} row {row}: slot {k} noted twice in one pass"),
+            ));
+        }
+        self.cut[cell] |= bit;
+        Ok(())
+    }
+
+    /// Forget the noted ids and cuts: the next pass starts empty.
     pub fn clear(&mut self) {
         self.filled.fill(0);
+        self.cut.fill(0);
+    }
+
+    /// The slots of a cell accounted for: noted or cut.
+    fn accounted(&self, cell: usize) -> u64 {
+        self.filled[cell] | self.cut[cell]
+    }
+
+    /// How many leading slots of a cell are weighed: the noted ones, which
+    /// must be exactly the slots before the cut tail.
+    fn weighed(&self, cell: usize) -> Option<usize> {
+        let n = self.filled[cell].count_ones() as usize;
+        let prefix = if n == TALLY_TOP_K {
+            u64::MAX
+        } else {
+            (1u64 << n) - 1
+        };
+        (n > 0 && self.filled[cell] == prefix).then_some(n)
     }
 
     /// Every slot of a cell noted.
@@ -2634,16 +2698,18 @@ impl SwapMachine {
         Ok(())
     }
 
-    /// `tally` holds, for each kept row, every slot of every layer
+    /// `tally` accounts, for each kept row, every slot of every layer
     /// but the ones no pass routes, and for each other row every slot of a
-    /// layer or none; every noted row names distinct ids below the experts.
+    /// layer or none; a slot is accounted when noted or cut, the cut slots
+    /// are the tail and at least one is weighed; every weighed slot names a
+    /// distinct id below the experts.
     fn check_tally(&self, t: &Tally, kept: KeptRows, what: &'static str) -> Result<(), GpuError> {
         let n = self.layers.len();
         let full = t.full();
         for row in 0..t.max_rows {
             for (l, &unrouted) in self.rule.unrouted().iter().enumerate().take(n) {
                 let cell = row * n + l;
-                let mask = t.filled[cell];
+                let mask = t.accounted(cell);
                 let layer = self.layers.start + l;
                 if mask == 0 && (!kept.keeps(row) || unrouted) {
                     continue;
@@ -2661,7 +2727,17 @@ impl SwapMachine {
                         ),
                     ));
                 }
-                let ids = &t.ids[cell * t.top_k..(cell + 1) * t.top_k];
+                let Some(w) = t.weighed(cell) else {
+                    return Err(GpuError::shape(
+                        what,
+                        format!(
+                            "row {row} at layer {layer}: slots cut {:#b} of noted {:#b}; the \
+                             cut slots must be the tail and one slot must be weighed",
+                            t.cut[cell], t.filled[cell]
+                        ),
+                    ));
+                };
+                let ids = &t.ids[cell * t.top_k..cell * t.top_k + w];
                 for (k, &id) in ids.iter().enumerate() {
                     if id as usize >= self.n_expert || ids[..k].contains(&id) {
                         return Err(GpuError::shape(
@@ -2686,12 +2762,15 @@ impl SwapMachine {
         for row in 0..t.max_rows {
             for l in 0..n {
                 let cell = row * n + l;
-                if t.filled[cell] == 0 {
+                if t.accounted(cell) == 0 {
                     continue;
                 }
-                let ids = &t.ids[cell * t.top_k..(cell + 1) * t.top_k];
+                let Some(w) = t.weighed(cell) else {
+                    return Err(GpuError::shape(what, "a cell with no weighed prefix"));
+                };
+                let ids = &t.ids[cell * t.top_k..cell * t.top_k + w];
                 self.rule
-                    .observe(l, row, ids)
+                    .observe_weighed(l, row, ids)
                     .map_err(|e| rule_err(what, e))?;
             }
         }
@@ -5392,6 +5471,32 @@ mod tests {
         t.clear();
         t.note(2, 0, 1, 8)
             .expect("a cleared tally takes the slot again");
+    }
+
+    /// A cut tail is accounted without being noted: the weighed prefix is what
+    /// the machine folds, a cut slot noted or a slot cut twice is refused by
+    /// name, and a cell with no weighed slot or a cut that is not the tail has
+    /// no weighed prefix.
+    #[test]
+    fn a_tally_accounts_a_cut_tail_as_neither_noted_nor_missing() {
+        let mut t = Tally::new(2..3, 4, 1, vec![false]);
+        t.note(2, 0, 0, 7).expect("slot 0");
+        t.note(2, 0, 1, 8).expect("slot 1");
+        t.note_cut(2, 0, 2).expect("slot 2 cut");
+        t.note_cut(2, 0, 3).expect("slot 3 cut");
+        assert_eq!(t.accounted(0), t.full());
+        assert_eq!(t.weighed(0), Some(2));
+        assert!(t.note(2, 0, 2, 1).is_err());
+        assert!(t.note_cut(2, 0, 2).is_err() && t.note_cut(2, 0, 0).is_err());
+        t.clear();
+        t.note(2, 0, 0, 7).expect("slot 0");
+        t.note(2, 0, 2, 8).expect("slot 2");
+        assert_eq!(t.weighed(0), None, "a hole before the tail");
+        t.clear();
+        t.note_cut(2, 0, 0).expect("cut");
+        assert_eq!(t.weighed(0), None, "nothing weighed");
+        let mut off = Tally::off();
+        assert!(off.note_cut(9, 9, 9).is_ok());
     }
 
     /// A call's pick takes a live slot from its victim to `Landing`, and the

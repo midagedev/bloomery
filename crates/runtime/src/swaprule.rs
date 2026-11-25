@@ -583,6 +583,9 @@ pub struct SwapRule {
     pending: Vec<Flip>,
     /// `(row * layers + layer) * top_k`.
     rows: Vec<u32>,
+    /// Per (row, layer): how many leading ids of `rows` the observed cell
+    /// weighs; the rest were cut and are no heat.
+    weighed: Vec<usize>,
     seen: Vec<bool>,
     /// One past the last row observed in this pass.
     pass_rows: usize,
@@ -852,6 +855,7 @@ impl SwapRule {
             in_flight: vec![0; layers],
             pending: Vec::with_capacity(most),
             rows: vec![0; shape.max_rows * layers * shape.top_k],
+            weighed: vec![0; shape.max_rows * layers],
             seen: vec![false; shape.max_rows * layers],
             pass_rows: 0,
             passes: 0,
@@ -1067,7 +1071,7 @@ impl SwapRule {
             .iter()
             .enumerate()
             .filter(|(_, s)| **s)
-            .map(move |(cell, _)| (cell, &self.rows[cell * k..(cell + 1) * k]))
+            .map(move |(cell, _)| (cell, &self.rows[cell * k..cell * k + self.weighed[cell]]))
     }
 
     fn index_of(layer: usize, id: u32, experts: usize) -> Result<usize, SwapRuleError> {
@@ -1213,6 +1217,33 @@ impl SwapRule {
 
     /// Buffer row `row`'s routed `ids` at layer `layer` for this pass.
     pub fn observe(&mut self, layer: usize, row: usize, ids: &[u32]) -> Result<(), SwapRuleError> {
+        if ids.len() != self.shape.top_k {
+            self.check_layer(layer)?;
+            if row >= self.shape.max_rows {
+                return Err(SwapRuleError::RowOutOfRange {
+                    row,
+                    max_rows: self.shape.max_rows,
+                });
+            }
+            return Err(SwapRuleError::RowLength {
+                layer,
+                row,
+                len: ids.len(),
+                top_k: self.shape.top_k,
+            });
+        }
+        self.observe_weighed(layer, row, ids)
+    }
+
+    /// [`SwapRule::observe`] for a row whose router picks beyond the first
+    /// `ids.len()` were cut: `ids` holds the weighed picks, 1 to `top_k` of
+    /// them, and only those are heat. A cut slot is not a pick.
+    pub fn observe_weighed(
+        &mut self,
+        layer: usize,
+        row: usize,
+        ids: &[u32],
+    ) -> Result<(), SwapRuleError> {
         self.check_layer(layer)?;
         let Shape {
             experts,
@@ -1222,7 +1253,7 @@ impl SwapRule {
         if row >= max_rows {
             return Err(SwapRuleError::RowOutOfRange { row, max_rows });
         }
-        if ids.len() != top_k {
+        if ids.is_empty() || ids.len() > top_k {
             return Err(SwapRuleError::RowLength {
                 layer,
                 row,
@@ -1244,7 +1275,8 @@ impl SwapRule {
             return Err(SwapRuleError::RowObservedTwice { layer, row });
         }
         self.seen[cell] = true;
-        self.rows[cell * top_k..(cell + 1) * top_k].copy_from_slice(ids);
+        self.rows[cell * top_k..cell * top_k + ids.len()].copy_from_slice(ids);
+        self.weighed[cell] = ids.len();
         self.pass_rows = self.pass_rows.max(row + 1);
         Ok(())
     }
@@ -1331,7 +1363,7 @@ impl SwapRule {
                     continue;
                 }
                 let cell = row * l_n + layer;
-                for &id in &self.rows[cell * top_k..(cell + 1) * top_k] {
+                for &id in &self.rows[cell * top_k..cell * top_k + self.weighed[cell]] {
                     self.heat[heat + layer * e + id as usize] += 1.0;
                     self.usage[layer * e + id as usize] += 1;
                 }
@@ -1917,6 +1949,40 @@ mod tests {
             evict,
             live_at,
         }
+    }
+
+    /// A row whose tail picks were cut is heat for the weighed picks alone, and
+    /// a weighed row of no pick or of more than `top_k` is refused by name.
+    #[test]
+    fn a_cut_tail_is_no_heat() {
+        let mut r = rule(params(2, 96, 1.5, 2.0, 1.0), 6, 3, &[&[0, 1]]);
+        r.observe_weighed(0, 0, &[4, 5]).unwrap();
+        r.end_pass(KeptRows::prefix(1)).unwrap();
+        assert_eq!(r.usage(), [0, 0, 0, 0, 1, 1]);
+        assert!(matches!(
+            r.observe_weighed(0, 0, &[]),
+            Err(SwapRuleError::RowLength {
+                len: 0,
+                top_k: 3,
+                ..
+            })
+        ));
+        assert!(matches!(
+            r.observe_weighed(0, 0, &[0, 1, 2, 3]),
+            Err(SwapRuleError::RowLength {
+                len: 4,
+                top_k: 3,
+                ..
+            })
+        ));
+        assert!(matches!(
+            r.observe(0, 0, &[0, 1]),
+            Err(SwapRuleError::RowLength {
+                len: 2,
+                top_k: 3,
+                ..
+            })
+        ));
     }
 
     /// Case 1: expert 2 used every step clears min count 2 and margin 1.5 over the

@@ -1113,6 +1113,9 @@ impl StepPort {
             ours.clear();
         }
         let live = self.cut.map_or(h.n_used, |c| c.min(h.n_used));
+        for s in live..h.n_used {
+            self.tally.note_cut(layer, row, s)?;
+        }
         for s in 0..live {
             let (Some(id), Some(wb)) = (
                 payload_word(page, image_off, h.ids + s, words),
