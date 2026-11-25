@@ -268,6 +268,7 @@ file's `--plan` prints on this card.
 | Hy4-flash `Q4_K_M` | card + CPU | 31.75 ³ | 31.48 ³ | 31.71 | 31.78 |
 | GLM-5.3-Flash `UD-Q4_K_XL` | card + CPU | 194.44 | 210.03 | 30.09 | 26.17 |
 | Nemotron 3.5 Bolt 74B-A9B `24GB` | the whole model on the card | 4,971.72 | 7,166.02 | 182.41 | 180.44 |
+| ERNIE 5.5 Flash Preview `F8M4` (our GGUF) ⁵ | card + CPU | 117.78 | 115.80 | 35.40 | 32.11 |
 | Inkling 2 Mini `UD-Q4_K_XL` ⁴ | the whole model on the card | 4,962.77 | 4,759.63 | 155.33 | 150.91 |
 | Inkling 2 Mini, the official checkpoint folder ⁴ | the whole model on the card | 3,818.15 | 3,703.65 | 153.82 | 151.38 |
 
@@ -280,6 +281,10 @@ decode rate; at the unset context (1,048,576 positions) the plan holds 2,004 of 
 
 ⁴ the tagged 0.3.16 binary, in 0.3.16's release sitting, without a draft (0.3.16 serves Inkling 2 Mini without one).
 The folder's dense weights are written as Q8_0 at load (the default; `BLOOMERY_INK2_DENSE=bf16` keeps them as stored).
+
+⁵ the tagged 0.3.17 binary, in 0.3.17's release sitting (two rounds). In the same sitting DeepSeek-V4.1-Flash read 30.61 and
+30.48 tok/s of decode at depths 512 and 4,096, and Inkling 2 Mini `UD-Q4_K_XL` 158.84 and 154.34: the sitting's request
+sets `ignore_eos`, which Inkling 2 Mini's draft does not serve, so that row is the draft-less path with the draft loaded.
 
 The Hy4-flash and GLM-5.3-Flash cells were re-run in the same sitting (`sitting.sh --resume --only`) after their first rows
 read cold (major faults after another model's load evicted their files from the page cache).
@@ -362,8 +367,9 @@ every gate is shown to fail on its defect before the fix lands ([how](docs/perfo
 
 ## Known limits (0.3.17)
 
-- Inkling 2 Mini serves without its draft in 0.3.16: `BLOOMERY_DRAFT` other than `off` is refused by name on it, for the
-  GGUF file and for the official checkpoint folder alike. The draft comes in the next release.
+- Inkling 2 Mini's draft serves greedy requests only (temperature 0, no `logit_bias`, no `ignore_eos`, no
+  `logprobs`). A sampled request takes the draft-less path, about 3 % slower than `BLOOMERY_DRAFT=off` on one RTX 5090
+  while the draft is loaded. The draft is CUDA only; on a Mac the model serves without one.
 - Hy4-flash's prompt pass computes the host's share of its routed experts on the CPU, so its prompt runs at about its
   decode rate on a card + CPU plan.
 - Hy4-flash turns thinking off on `reasoning_effort: "none"`; `chat_template_kwargs: {"enable_thinking": false}` is not
