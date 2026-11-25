@@ -41,6 +41,8 @@
 # SC2034: every name here is read by the file that sources this one.
 # shellcheck disable=SC2034
 MODEL_NAME=ernie5_5
+# The default IK is only so IKBIN can be formed: ik has no ernie5_5.
+: "${IK:=/home/user/ik-idxkey}"
 MODEL=${BLOOMERY_REF_MODEL:-/models/ERNIE-5.5-Flash-Preview}
 GGUF_MODEL=${BLOOMERY_REF_GGUF_MODEL:-/models/ERNIE-5.5-Flash-Preview-GGUF/ERNIE-5.5-Flash-Preview-F8M4-00001-of-00004.gguf}
 GGUF_FIXTURE=ernie55-gguf/ernie55-cut.fp8.gguf
