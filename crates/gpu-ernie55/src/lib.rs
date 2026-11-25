@@ -6,7 +6,8 @@
 //! file. It loads by a placement plan ([`body::Body::open_placed`]): every layer's dense part and the stores on the
 //! stage card with each routed layer's card share of its experts, the rest on the common host tier. A prompt runs as
 //! the pass's units ([`pass::prompt`]), each hosted layer's host experts read once for a unit's rows through the host
-//! tier's batch port; a load opened with no pass steps it.
+//! tier's batch port, and under `BLOOMERY_XSTREAM=admit` the unit's most-routed host experts move into the card's pool
+//! first (`stream`); a load opened with no pass steps it.
 
 pub mod attn_hca;
 pub mod attn_mla;
@@ -18,6 +19,7 @@ pub mod pass;
 mod placed;
 mod rooms;
 mod step;
+mod stream;
 pub mod trunk;
 
 pub use body::{Body, Cx, HC, HeadMix, Mixer, Parts, RoutedFfn, Shape, SubIn, TapRows, Trunk};

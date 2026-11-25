@@ -1,5 +1,5 @@
 //! Kimi K3's body behind the traits the common hybrid seat serves it by: [`Rollback`], which takes
-//! no position back, and [`TierBody`], which is the placed load's host tier.
+//! a position back to a checkpoint, and [`TierBody`], which is the placed load's host tier.
 
 use super::body::Body;
 use crate::GpuError;
@@ -8,7 +8,6 @@ use crate::host::served::{ResidencyParts, TierBody};
 use crate::hybrid::{Chain, Hybrid};
 use crate::model::{ChainBody, Rollback};
 
-const ROLLBACK: &str = "kimi_k3::Body::rollback";
 const SERVE: &str = "kimi_k3::Body::serve_chain";
 
 /// What the tier's accessors name when the load is the whole card's.
@@ -16,14 +15,11 @@ const WHOLE_CARD: &str = "kimi_k3::Body as a TierBody: the whole-card load (GpuM
                           host tier; the hybrid seat loads by a plan (GpuModel::open_placed)";
 
 impl Rollback for Body {
-    /// Refused by name, always: the delta layers' state holds the position it stands at alone, so
-    /// the body takes no position back. The session's cut keeps every held position or nothing
-    /// (a reset) and never asks for another.
+    /// A cut to `pos` ([`Body::cut`]): a position where a checkpoint stands, refused by name at
+    /// any other (the delta layers' state holds the position it stands at alone); the card work
+    /// waits for the next device call.
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
-        Err(GpuError::shape(
-            ROLLBACK,
-            format!("a rollback to position {pos}: the delta layers' state takes no position back"),
-        ))
+        self.cut(pos)
     }
 }
 

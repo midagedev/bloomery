@@ -2,9 +2,10 @@
 //! each routed layer's card experts on the stage card, an optional expert tier card, the host and
 //! NVMe tiers behind them) serving one sequence, its prompt run as placed passes.
 //!
-//! What this file holds is what K3's architecture forces. The delta layers' state takes no
-//! position back, so a request shares a prefix with the slot only where the sequence stands
-//! (`app::arch::kimi_k3`). The body has one tier card, so the family says one tier card
+//! What this file holds is what K3's architecture forces. The body takes a checkpoint of the delta
+//! layers' state and conv rings at each prompt call's start and end, so a request shares a prefix
+//! with the slot up to the newest checkpoint at or below it (`app::arch::kimi_k3`). The body has
+//! one tier card, so the family says one tier card
 //! ([`TierRule`]), and runs the common residency machine under the seat's word: unset, the serving
 //! word on a serving placement, which the plan keeps, moves or turns `off`. A K3.1 file runs every
 //! context ([`PlanInputs::check_ctx`]): past its indexer's top-k the latent layers attend the rows

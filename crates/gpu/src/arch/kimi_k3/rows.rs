@@ -449,6 +449,7 @@ impl Body {
     ) -> Result<(), GpuError> {
         let m = ids.len();
         self.fit_pass(pos, m)?;
+        self.apply_cut(gpu.stream())?;
         if !(1..=PASS_ROWS).contains(&m) {
             return Err(GpuError::shape(
                 ROWS,
@@ -511,6 +512,7 @@ impl Body {
             pass.input
                 .stage_words(gpu.stream(), (pos, m), sel.top_k())?;
         }
+        self.held = u32::MAX;
         self.walk_rows(gpu, w, pass, m, tail)?;
         self.held = end;
         Ok(())

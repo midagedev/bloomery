@@ -10,12 +10,20 @@
 //!   [`crate::batch::INDEX_RING`] positions (the most a prompt batch's launch appends, and a pool),
 //!   its pooled keys (128 f16 a pool of four), its scores and its list of picked rows;
 //! - a window (SWA) layer keeps a ring of `W` 576-wide rows, position `p` at slot `p % W`.
+//!
+//! A cut back to an earlier position goes to a checkpoint ([`Body::cut`]): a window layer's ring and
+//! a sparse layer's index ring hold the rows of the positions after the cut over those of the
+//! positions it keeps, and the engram history is a host value that moved on with every token, so
+//! a checkpoint copies the rings to a host slot ([`Checkpoints`], by the common owner) and clones
+//! the history beside it ([`Points`]). The cache rows and the pooled keys are by position: the
+//! positions after a cut write them again.
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use bloomery_gpu::arch::hybrid::{Acts, GqaCx, Site};
 use bloomery_gpu::card_leg::{CardLeg, LegBufs, LegShape, LegStacks};
+use bloomery_gpu::checkpoint::{Checkpoints, Marked};
 use bloomery_gpu::engram_delta::EngramDeltaKernels;
 use bloomery_gpu::flash::{FlashKernels, partials_ms_len, partials_v_len, window_partials_lens};
 use bloomery_gpu::flash_gqa::FlashGqaKernels;
@@ -41,7 +49,7 @@ use bloomery_gpu::route_body::sigmoid_512_16;
 use bloomery_gpu::routed_block::RouterEntry;
 use bloomery_gpu::site::{KGemvKernels, SiteTy};
 use bloomery_gpu::weights::Weights;
-use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, KvBackings, RoomTensor};
+use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel, KvBackings, RoomTensor, WindowMut};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use engram::hash::{Hash, History};
@@ -54,6 +62,7 @@ use model::arch::place_hybrid;
 use model::placement::Plan;
 use model::placement::kernels::DownForms;
 use runtime::layer::hosted;
+use runtime::seqstate::{Kept, Take};
 use runtime::stores::PosBuf;
 
 use crate::batch::{PassShape, PlacedPass};
@@ -61,6 +70,15 @@ use crate::placed::{LOAD_ROWS, Open, Placed};
 
 /// What the refusals of this file name.
 pub(crate) const WHAT: &str = "hy4::Body";
+
+/// The spacing of a prompt call's inner checkpoints: none. A call takes a checkpoint at its start
+/// and at its end ([`Checkpoints::marks`]), so a sequence holds the two newest points
+/// ([`Price::budget`](runtime::seqstate::Price::budget) of a ledger with no spacing: two slots,
+/// whatever the context). A request that extends the last call's prompt returns to its end.
+pub const CHECKPOINT_EVERY: u32 = 0;
+
+// The rings are lent to the checkpoints as the f32 words of their f16 rows.
+const _: () = assert!(ROW.is_multiple_of(2) && INDEX_ROW.is_multiple_of(2));
 
 /// The router instance: the file's 512 experts and its top 16 (the fixture keeps both).
 pub(crate) type Router = sigmoid_512_16::RouterKernels;
@@ -407,6 +425,8 @@ pub struct Body {
     pub(crate) taps: Option<Taps>,
     /// The position the stores stand at: the next step's.
     pub(crate) held: u32,
+    /// The rings and the engram history at chosen positions: what a cut goes back to.
+    pub(crate) ckpt: Points,
     /// The host tier's side of a placed load ([`crate::placed`]); `None` on the whole-card load.
     pub(crate) placed: Option<Placed>,
     /// The placed prompt pass's buffers ([`crate::batch::PlacedPass`]), on a placed load opened with
@@ -417,12 +437,13 @@ pub struct Body {
     pub(crate) xs: StreamSide,
 }
 
-/// What one resident sequence owns ([`Slots`]): every layer's stores, the engram history and the
-/// position the stores stand at.
+/// What one resident sequence owns ([`Slots`]): every layer's stores, the engram history, the
+/// position the stores stand at and its checkpoints.
 pub struct Seq {
     stores: Vec<Store>,
     hist: Option<History>,
     held: u32,
+    ckpt: Points,
 }
 
 /// A step's host input.
@@ -539,6 +560,54 @@ impl Layer {
         }
         v
     }
+}
+
+/// One sequence's checkpoints: the rings' host copies at chosen positions ([`copied`]) and, beside
+/// each, the engram history at its position, a host value no store holds. Every history stands at
+/// a position the copies hold a point at.
+pub(crate) struct Points {
+    pub(crate) copies: Checkpoints,
+    hists: Vec<(u32, History)>,
+}
+
+impl Points {
+    /// The checkpoints of `sh.ctx` positions of rings of `lens` f32 words, none taken.
+    fn new(gpu: &Gpu, lens: Vec<usize>, ctx: usize) -> Result<Points, GpuError> {
+        Ok(Points {
+            copies: Checkpoints::sequence(gpu.context(), lens, ctx, CHECKPOINT_EVERY)?,
+            hists: Vec::new(),
+        })
+    }
+
+    /// Every point dropped: the sequence is empty.
+    fn clear(&mut self) {
+        self.copies.clear();
+        self.hists.clear();
+    }
+
+    /// The histories of the points the copies still hold, no others: after a take (it may have
+    /// evicted one), a cut (it dropped the points past it) and a clear.
+    fn prune(&mut self) {
+        let held = self.copies.positions();
+        self.hists.retain(|(at, _)| held.contains(at));
+    }
+}
+
+/// The rings a checkpoint copies, each lent as the f32 words of its f16 rows, in layer order: a
+/// window layer's ring, a sparse layer's index ring. The order is the same on every call, so a
+/// slot holds each ring at its index.
+fn copied(stores: &mut [Store]) -> Result<Vec<WindowMut<'_, f32>>, GpuError> {
+    stores
+        .iter_mut()
+        .map(|store| {
+            let buf = match store {
+                Store::Dsa(d) => d.index.buf_mut(),
+                Store::Swa { ring } => ring.buf_mut(),
+            };
+            let words = buf.num_bytes() / size_of::<f32>();
+            WindowMut::<f32>::of_mut(buf, 0, words)
+        })
+        .collect()
 }
 
 impl Store {
@@ -931,11 +1000,13 @@ impl Body {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let decl: Vec<Vec<PosBuf>> = (0..hp.n_layer).map(|l| hp.pos_bufs(l)).collect();
-        let stores = layers
+        let mut stores = layers
             .iter()
             .zip(&decl)
             .map(|(layer, d)| Store::new(&handle, &sh, (d, kv), layer.dsa))
             .collect::<Result<Vec<_>, _>>()?;
+        let lens: Vec<usize> = copied(&mut stores)?.iter().map(|w| w.len()).collect();
+        let ckpt = Points::new(gpu, lens, ctx)?;
         let rope = [
             RopeTable::new(&RopeSpec::window(hp.rope_base, ROPE))?,
             RopeTable::new(&RopeSpec::window(hp.rope_base_swa, ROPE))?,
@@ -1022,6 +1093,7 @@ impl Body {
             rope_rows,
             taps: None,
             held: 0,
+            ckpt,
             placed: None,
             pass: None,
             xs: StreamSide::default(),
@@ -1247,9 +1319,9 @@ impl ChainBody for Body {
         Ok(DecodeInput { token, pos })
     }
 
-    /// The host inputs of the step, after the cache rooms are fitted through its position
-    /// ([`Body::fit`]); refused by name off the position the stores stand at, so the engram
-    /// history and the stores never part.
+    /// A waiting cut carried out, then the host inputs of the step, after the cache rooms are
+    /// fitted through its position ([`Body::fit`]); refused by name off the position the stores
+    /// stand at, so the engram history and the stores never part.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         if input.pos != self.held {
             return Err(GpuError::shape(
@@ -1261,6 +1333,7 @@ impl ChainBody for Body {
                 ),
             ));
         }
+        self.apply_cut(stream)?;
         self.fit(input.pos as usize, 1)?;
         self.host_inputs(stream, input.token, input.pos)?;
         self.held = input.pos + 1;
@@ -1272,7 +1345,8 @@ impl ChainBody for Body {
     }
 
     /// The engram history back to a fresh sequence, the position to 0, the cache rooms' pages
-    /// given back and the host tier settled. The other stores need nothing: a window layer's flash
+    /// given back, the host tier settled and every checkpoint dropped. The other stores need
+    /// nothing: a window layer's flash
     /// reads only the slots its position reaches, a sparse layer's selector only the pools and
     /// rows before its count, and each row below the count is written by its own step first.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
@@ -1286,6 +1360,7 @@ impl ChainBody for Body {
             p.reset(gpu.stream())?;
         }
         self.held = 0;
+        self.ckpt.clear();
         Ok(())
     }
 
@@ -1339,18 +1414,137 @@ impl TierBody for Body {
     }
 }
 
-impl Rollback for Body {
-    /// Refused by name, always: a window layer's ring and the engram history hold the position
-    /// they stand at alone, so the body takes no position back. The session's cut keeps every
-    /// held position or nothing (a reset) and never asks for another.
-    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+impl Body {
+    /// What a cut to at most `n` positions of a model standing at `pos` keeps, and why: every
+    /// position, the empty model, or the nearest checkpoint at or below `n`. After a call that
+    /// failed part-way the stores hold other positions than `pos`, so only a checkpoint is kept.
+    #[must_use]
+    pub fn kept(&self, n: u32, pos: u32) -> Kept {
+        if self.held == pos {
+            self.ckpt.copies.kept(n, pos)
+        } else {
+            self.ckpt.copies.kept(n.min(pos), self.held)
+        }
+    }
+
+    /// The checkpoints: their positions, their slots, what they have done.
+    #[must_use]
+    pub fn checkpoints(&self) -> &Checkpoints {
+        &self.ckpt.copies
+    }
+
+    /// A checkpoint at `pos`, the position the model stands at, after any waiting cut: the window
+    /// and index rings copied to a host slot and the engram history cloned beside them, or nothing
+    /// where one stands. Refused by name when the stores hold other positions. Waits for the
+    /// copies.
+    pub fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
+        self.held_at(pos)?;
+        self.apply_cut(gpu.stream())?;
+        let Body {
+            stores, ckpt, host, ..
+        } = self;
+        let mut lent = copied(stores)?;
+        let mut rings: Vec<&mut DeviceBuffer<f32>> = lent.iter_mut().map(|w| &mut **w).collect();
+        let take = ckpt.copies.take(gpu.stream(), pos, &mut rings)?;
+        if matches!(take, Take::Copy { .. })
+            && let Some((_, hist)) = host.hash.as_ref()
+        {
+            ckpt.hists.push((pos, hist.clone()));
+        }
+        ckpt.prune();
+        Ok(take)
+    }
+
+    /// The waiting cut carried out: each ring from its checkpoint's slot, or zeroed for the empty
+    /// model. Nothing, and no allocation, when no cut waits. Waits for the copies; the first
+    /// device call after a cut runs it ([`ChainBody::refresh`], a prompt call).
+    pub(crate) fn apply_cut(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if !self.ckpt.copies.pending() {
+            return Ok(());
+        }
+        let Body { stores, ckpt, .. } = self;
+        let mut lent = copied(stores)?;
+        let mut rings: Vec<&mut DeviceBuffer<f32>> = lent.iter_mut().map(|w| &mut **w).collect();
+        ckpt.copies.apply(stream, &mut rings)
+    }
+
+    /// A cut to `pos`: nothing at the position the stores stand at; the empty model at 0; else the
+    /// checkpoint at `pos`, its rings copied back at the next device call and its engram history
+    /// now. Any other position is refused by name ([`Body::kept`] says what a cut keeps).
+    pub fn cut(&mut self, pos: u32) -> Result<(), GpuError> {
+        self.ckpt.copies.cut(pos, self.held)?;
+        let was = std::mem::replace(&mut self.held, pos);
+        if pos == was {
+            return Ok(());
+        }
+        let back = match self.host.hash.as_ref() {
+            None => None,
+            Some((hash, _)) if pos == 0 => Some(
+                hash.new_mapped_history()
+                    .map_err(|e| GpuError::plan(WHAT, e)),
+            ),
+            Some(_) => Some(
+                self.ckpt
+                    .hists
+                    .iter()
+                    .find(|(at, _)| *at == pos)
+                    .map(|(_, h)| h.clone())
+                    .ok_or_else(|| {
+                        GpuError::shape(WHAT, format!("no engram history at the checkpoint {pos}"))
+                    }),
+            ),
+        };
+        self.ckpt.prune();
+        match (back, self.host.hash.as_mut()) {
+            (Some(Ok(h)), Some((_, hist))) => *hist = h,
+            (Some(Err(e)), _) => {
+                // The stores are planned back and the history is not: no step continues.
+                self.held = u32::MAX;
+                return Err(e);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Refused by name unless the stores hold `pos` positions: a call that failed part-way left
+    /// the stores and the engram history between positions, so a checkpoint of them would hold a
+    /// state no position has.
+    fn held_at(&self, pos: u32) -> Result<(), GpuError> {
+        if self.held == pos {
+            return Ok(());
+        }
         Err(GpuError::shape(
             WHAT,
             format!(
-                "a rollback to position {pos}: the window rings and the engram history take no \
-                 position back"
+                "a checkpoint at position {pos} on stores that hold {} (a call failed part-way: \
+                 cut back to a checkpoint or reset first)",
+                if self.held == u32::MAX {
+                    "no position".to_string()
+                } else {
+                    format!("{} positions", self.held)
+                }
             ),
         ))
+    }
+}
+
+impl Marked for Body {
+    fn marks(&self, from: u32, to: u32) -> Vec<u32> {
+        self.ckpt.copies.marks(from, to)
+    }
+
+    fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
+        Body::checkpoint(self, gpu, pos)
+    }
+}
+
+impl Rollback for Body {
+    /// A cut to `pos` ([`Body::cut`]): a position where a checkpoint stands, refused by name at
+    /// any other (a window layer's ring and the engram history hold the position they stand at
+    /// alone); the card work waits for the next device call.
+    fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
+        self.cut(pos)
     }
 }
 
@@ -1383,15 +1577,17 @@ impl Slots for Body {
             ),
             None => None,
         };
+        let ckpt = Points::new(gpu, self.ckpt.copies.lens().to_vec(), self.sh.ctx)?;
         Ok(Seq {
             stores,
             hist,
             held: 0,
+            ckpt,
         })
     }
 
-    /// The stores, the engram history and the position exchanged: pointer moves only. A parked
-    /// sequence of another layout is refused by name.
+    /// The stores, the engram history, the position and the checkpoints exchanged: pointer moves
+    /// only. A parked sequence of another layout is refused by name.
     fn swap_seq(&mut self, _gpu: &Gpu, seq: &mut Seq) -> Result<(), GpuError> {
         let same = self.stores.len() == seq.stores.len()
             && self
@@ -1411,6 +1607,7 @@ impl Slots for Body {
             std::mem::swap(hist, other);
         }
         std::mem::swap(&mut self.held, &mut seq.held);
+        std::mem::swap(&mut self.ckpt, &mut seq.ckpt);
         Ok(())
     }
 

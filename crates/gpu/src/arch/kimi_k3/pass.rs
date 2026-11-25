@@ -1067,6 +1067,7 @@ impl super::Body {
     ) -> Result<(), GpuError> {
         let m = ids.len();
         self.fit_pass(pos, m)?;
+        self.apply_cut(gpu.stream())?;
         let Some(placed) = self.placed.as_mut() else {
             return Err(GpuError::shape(
                 PASS,
@@ -1145,6 +1146,7 @@ impl super::Body {
             WindowMut::<u32>::of_mut(&mut pass.words, 0, m * WORDS)?
                 .copy_from_host(stream, host)?;
         }
+        self.held = u32::MAX;
         self.walk_placed(gpu, w, m, tail)?;
         self.held = end;
         Ok(())

@@ -22,12 +22,13 @@
 //!   and its RDA layers' states and conv rings. It has no slot rows, so
 //!   `--parallel` above 1 is refused by name before any plan.
 //! - The prompt runs by the body's prompt rule (`app::Prompt`).
-//! - An RDA state cannot step back past what a pass checkpointed. A request
-//!   keeps the prefix it shares with what the slot holds only when that
-//!   prefix is the whole held sequence; any other shared prefix is kept 0,
-//!   the slot reset and the prompt fed again. A rollback to a position the
-//!   model does not stand at, a snapshot and a resume are refused by name,
-//!   and the seat runs no prompt cache.
+//! - An RDA state and its conv ring hold the position they stand at alone, so
+//!   the body takes a checkpoint of them at each prompt call's start and end
+//!   (`app::arch::raon1`). A request keeps the prefix it shares with what the
+//!   slot holds up to the newest checkpoint at or below it, and from an empty
+//!   model where none is held; the draft follows ([`ServedSpark::keep`]). A
+//!   rollback to a position no checkpoint stands at, a snapshot and a resume
+//!   are refused by name, and the seat runs no prompt cache.
 //!
 //! The draft is Raon-1-mini's DFlash2 draft (`raon1_dflash`: the file
 //! `$BLOOMERY_DSPARK_MODEL`, else refset's `raon1::DFLASH_BESIDE` file beside the target),
@@ -126,10 +127,6 @@ pub const ACTS_ON: &[&str] = &[
 
 /// Why the seat takes no sequence state: it runs no prompt cache.
 const NO_CACHE: &str = "the raon1 seat runs no prompt cache";
-
-/// Why a prefix shorter than the held sequence is not kept.
-const NO_STEP_BACK: &str =
-    "the RDA state cannot step back: a prefix is kept only where the sequence stands";
 
 /// A verify of a proposal: the token at the target's position, then the
 /// draft's 7 ids.
@@ -434,14 +431,10 @@ impl Raon1 {
         })
     }
 
-    /// The body's keep rule: `n` when it is the whole held sequence, else
-    /// nothing.
+    /// The body's keep rule ([`Session::keep_query`]): `n` when it is the whole
+    /// held sequence, else the nearest checkpoint at or below it, or nothing.
     fn body_keep(&self, n: usize) -> (usize, Option<String>) {
-        if n == self.pos() {
-            (n, None)
-        } else {
-            (0, Some(NO_STEP_BACK.to_owned()))
-        }
+        self.s.keep_query(n)
     }
 
     /// A call the draft did not take: the draft no longer follows.
@@ -540,18 +533,18 @@ impl Seat for Raon1 {
         Ok(())
     }
 
-    /// Never asked for a position other than the one the model stands at
-    /// ([`Seat::keep`] grants no other); any other is refused by name.
+    /// The session's cut (`app::Keep`), which takes only a position
+    /// [`Seat::keep`] granted: a checkpoint of the body; any other is refused
+    /// by name. The draft no longer follows the target's position.
     fn rollback(&mut self, pos: u32) -> Result<(), GateError> {
-        Err(format!(
-            "a rollback to position {pos} from {}: {NO_STEP_BACK}",
-            self.s.model().pos()
-        )
-        .into())
+        runtime::Target::cut(&mut self.s, pos)?;
+        self.left_behind();
+        Ok(())
     }
 
-    /// `n` when it is the whole held sequence, else nothing: the caller then
-    /// resets the slot and feeds the prompt again. Under `BLOOMERY_DRAFT=dspark`
+    /// `n` when it is the whole held sequence, else the nearest checkpoint at
+    /// or below it ([`Session::keep_query`]), or nothing: the caller then
+    /// cuts the slot to it, or resets it and feeds the prompt again. Under `BLOOMERY_DRAFT=dspark`
     /// the draft must follow the kept prefix too ([`ServedSpark::keep`]), so
     /// every request drafts; the unset rule keeps the body's prefix and runs
     /// plain a request the draft does not follow.

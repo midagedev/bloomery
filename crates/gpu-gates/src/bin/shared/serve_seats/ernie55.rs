@@ -5,18 +5,20 @@
 //! What this file holds is what ERNIE's architecture forces. The model ships as a checkpoint
 //! folder (FP8 dense weights, MXFP4 experts), so the seat opens a folder once on the main thread
 //! ([`Family::read_model`], `serve_seats::folder::open`) and the common owner loads it from its
-//! located header and part source. An HCA layer's window ring takes no position back, so a request
-//! shares a prefix with the slot only where the sequence stands (`app::arch::ernie55`). The body
+//! located header and part source. The body takes a checkpoint of its HCA window rings and
+//! compressor state at each prompt call's start and end, so a request shares a prefix with the
+//! slot up to the newest checkpoint at or below it (`app::arch::ernie55`). The body
 //! loads its prompt pass (`app::arch::ernie55`'s `Batch::prompt`): a prompt runs as the pass's
 //! units, each hosted layer's host experts read once for a unit's rows through the host tier's
 //! batch port (`bloomery_gpu_ernie55::pass`), the call one residency pass; the `load` record names
 //! the pass's rows. The stores are whole buffers sized at the load, no rooms, so the K/V levers are
-//! not acted on. The body keeps no expert stream (a prompt unit's host picks are served through the
-//! host tier's batch port and no expert moves to the card for it), so `BLOOMERY_XSTREAM` is `off`
-//! ([`Family::xstream`]), the plan keeps no stream ring ([`Family::ring`] and [`Family::with_ring`]
-//! are the defaults) and the pass reserve is the plan's own
-//! (`model::arch::ernie55::place::prompt_reserve_bytes`). The body serves no expert tier card
-//! ([`TierRule::UNTIERED`]).
+//! not acted on. The prompt pass streams host experts under the common stream rule
+//! (`shared/xstream_rule.rs`, [`Family::xstream`]): each unit's pick moves the host experts the
+//! unit routes most into the card's pool (`admit`), and the experts are MXFP4 stacks the route GEMM
+//! has no entry for, so `split` is refused in the form the unset rule falls back from to `admit`.
+//! The plan keeps no stream ring ([`Family::ring`] and [`Family::with_ring`] are the defaults) and
+//! the pass reserve is the plan's own (`model::arch::ernie55::place::prompt_reserve_bytes`). The
+//! body serves no expert tier card ([`TierRule::UNTIERED`]).
 //!
 //! A folder carries no `tokenizer.chat_template` (the vendor's renderer is Python), so the seat
 //! serves the server's port of it ([`Family::TEMPLATE`], `serve::ernie::TEMPLATE`) unless
@@ -27,7 +29,6 @@ use std::path::Path;
 
 use bloomery_gpu::GpuModel;
 use bloomery_gpu::host::swap::Residency;
-use bloomery_gpu::host::xstream::{XMode, XStreamBody};
 use bloomery_gpu_ernie55::body::Body;
 use bloomery_gpu_gates::generate::Place;
 use bloomery_gpu_gates::{GateError, record, side_seat};
@@ -51,7 +52,7 @@ const USAGE: &str = "usage: bloomery-serve --model ernie55 [-m PATH | --hf <repo
 
 /// The placement, host load, residency, caller and start settings the seat acts on. There is no
 /// prompt group (a prompt runs as the pass's units or stepped) and no K/V lever (the stores
-/// declare no rooms); the expert stream is acted on as `off` alone.
+/// declare no rooms); the expert stream is acted on as `off` and `admit`.
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::CARD_BUDGET,
     bloomery_levers::CARD_MARGIN,
@@ -98,9 +99,10 @@ impl Family for Ernie55 {
         })
     }
 
-    /// The stream word the load runs: `off` unset (the body streams no expert, and says so on the
-    /// line), a set `BLOOMERY_XSTREAM` through the common rule, whose `set_xstream` refuses
-    /// `admit` and `split` by name.
+    /// The stream by the common rule once the load is open: `BLOOMERY_XSTREAM` as set, unset what
+    /// the rule picks for the plan (`admit` at `--place a` beside a residency, `off` without
+    /// one), the `xstream=` line naming why. The body refuses `split` in the form refusal the rule
+    /// answers with `admit`, and refuses `admit` or `split` with no residency machine by name.
     fn xstream(
         m: &mut GpuModel<Body>,
         set: Option<&str>,
@@ -108,14 +110,6 @@ impl Family for Ernie55 {
         residency: Residency,
     ) -> Result<Option<String>, GateError> {
         let (gpu, _, body) = m.body_parts(NAME)?;
-        if set.is_none() {
-            body.set_xstream(gpu, XMode::Off)?;
-            let word = body.xstream_word();
-            return Ok(Some(format!(
-                "xstream={word} (unset: the body streams no host expert; a prompt unit's host picks \
-                 are served through the host tier's batch port)"
-            )));
-        }
         Ok(Some(xstream_rule(
             gpu,
             body,

@@ -3146,9 +3146,13 @@ gate-minimax31-folder:
 # indexer's top-k): every layer's streams at the prompt's last rows, the routed picks as sets and their weights, the MLA-DSA selection
 # (long), the logits before and after MultiMax, the teacher-forced greedy ids, each arm's step chain layer by layer; the hosted arms'
 # prompts served by the batch port and not stepped; the graph against the eager chain; a reset model writing a fresh open's bits and
-# holding its caches cleared; the promoted experts read within the same bands.
+# holding its caches cleared; the promoted experts read within the same bands; the residency's own clauses: the unset word on each arm's
+# plan (the serving word where the plan hosts experts, off beside a fixed placement, the step feed and a plan with none), the mid load's
+# machine and source with each layer seeded by its plan, a history's boundaries (none, the prompt call, each step), the history twice
+# with flips landing and the same bits, and a session's clear returning the machine to its seed.
 # Fixture-only (tools/ref/fixture-only.sh): the released folder's sets have no family yet. Predicted wall [derived: the gate's three
-# arms ran 26 s on the 5090; a warm build, and one that recompiles bloomery-device and what links it took 3.5 min]: under 4 min.
+# arms ran 26 s on the 5090; a warm build, and one that recompiles bloomery-device and what links it took 3.5 min; the histories add two
+# runs of 192 steps and three clears, about 2 s at the arms' step rate]: under 4 min.
 gate-gpu-ernie55-e2e:
     BLOOMERY_MODEL=ernie5_5 ./tools/box.sh 'bash tools/ref/fixture-only.sh gate-gpu-ernie55-e2e && __g=$(. tools/ref/ref-paths.sh && gguf_model) && cargo oxide build --arch {{arch}} -- -p bloomery-gpu-gates --features ernie55,checkpoint --release --bin gate_ernie55_e2e && BLOOMERY_GATE_CARD=${BLOOMERY_GATE_CARD:-any} bash tools/gpu-gate.sh gate_ernie55_e2e --hosted-gguf "$__g"'
 
@@ -3223,8 +3227,8 @@ gate-ernie55-trunk:
 # The ERNIE 5.5 Flash seat of bloomery-serve on the fixture cut (gate_ernie55_serve's doc): the hybrid owner's seat over the placed body, one
 # sequence, the checkpoint folder opened once on the main thread and loaded from its header and part source. `--parallel 2` is refused by name
 # before any plan; one server at ctx 4096 loads (arch ernie5_5, one slot, the cut's layers), listens, answers a chat turn and keeps the
-# position the model stands at across requests (a shorter shared prefix re-feeds from an empty model: the HCA window rings take no position
-# back). The reasoning-split and turn-end clauses read the model's text and are the real folder's (Tag::FileBound). Fixture-only
+# prefix a request shares with the slot up to the last prompt call's end (a checkpoint of the HCA window and compressor rings; the first
+# reply wraps both rings, and the extended request's ids equal the same request's on an empty slot). The reasoning-split and turn-end clauses read the model's text and are the real folder's (Tag::FileBound). Fixture-only
 # (tools/ref/fixture-only.sh): the real folder's serve is the milestone's hand check. One card (any idle one). Predicted wall [derived: two
 # plan-only starts, one fixture load of the three-layer cut and the max-ctx arm's, and a first start of the new binary's GPU code ~25 s (the
 # solar2 seat's first-start measure)]: under 4 min after a warm build.
@@ -5219,8 +5223,9 @@ gate-gpu-kimik3-place:
 # The Kimi K3 seat of bloomery-serve on the K3 fixture (gate_kimi_k3_serve's doc): the hybrid owner's seat over the placed body, one sequence, the
 # prompt stepped one id at a time. `--parallel 2` is refused by name before any plan; the residency lever is `off` unset (why `prefill_steps`) and
 # `off` set, and `mid-p0-s1` is refused by name; one server at ctx 4096 loads (arch kimi-k3, one slot, the file's layers), listens and answers
-# a chat turn, keeps the position the model stands at across requests (a shorter shared prefix re-feeds from an empty model, the delta state
-# taking no position back); a request that carries `tools` is answered with an error and no completion, and a plain turn after it is answered.
+# a chat turn, keeps the prefix a request shares with the slot up to the last prompt call's end (a checkpoint of the delta layers' state and conv
+# rings; the first reply wraps the conv ring, and the extended request's ids equal the same request's on an empty slot, cache-off arm where the
+# residency lever is `off`); a request that carries `tools` is answered with an error and no completion, and a plain turn after it is answered.
 # Fixture-only (tools/ref/fixture-only.sh): the real file's plan needs `--place bp` and the host tier; the reasoning-split and turn-end clauses
 # read the model's text and are the real file's (Tag::FileBound). One card (any idle one). Predicted wall [derived: three fixture loads of a few
 # seconds each, four plan-only starts, and a first start of the new binary's GPU code ~25 s (the solar2 seat's first-start measure)]: under
@@ -5366,8 +5371,9 @@ gate-inkling2-serve:
 
 # The Hy4-flash seat of bloomery-serve on the Hy4 fixture (gate_hy4_serve's doc): the hybrid owner's seat over the placed body. `--parallel 2`
 # plans two resident slots a slot's context wide; one server at ctx 4096 loads (arch hy-v4-flash, one slot, the file's layers), listens, answers
-# a chat turn with its reasoning split at the template's think tags and keeps the position the model stands at across requests (a shorter
-# shared prefix re-feeds from an empty model: the window rings and the engram history take no position back); a server of two slots loads
+# a chat turn with its reasoning split at the template's think tags and keeps the prefix a request shares with the slot up to the last prompt
+# call's end (a checkpoint of the window rings, the sparse layers' index rings and the engram history; the first reply wraps the fixture's
+# window ring, and the extended request's ids equal the same request's on an empty slot); a server of two slots loads
 # both, keeps each slot's rows apart (a continuation back on its slot after the other slot ran answers the truth's ids, cached and uncached)
 # and answers a request that carries `tools` (the real file's call clause is FileBound); a server at a card budget of the plan's floor plus half
 # the experts' bytes loads experts on the card and the host and answers greedy ids over both legs; with the Hy4 projector on /models

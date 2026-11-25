@@ -1760,6 +1760,7 @@ pub fn prompt(model: &mut GpuModel<Body>, p: &mut Prompt, tokens: &[u32]) -> Res
     }
     let n = u32::try_from(tokens.len()).map_err(|_| GpuError::shape(CALL, "ids past u32"))?;
     let token = model.run_rows(tokens.len(), CALL, |gpu, w, body, head, pos| {
+        body.apply_cut(gpu.stream())?;
         if pos != body.held {
             return Err(GpuError::shape(
                 CALL,

@@ -30,11 +30,12 @@
 
 use std::ops::Range;
 
+use bloomery_gpu::checkpoint::Checkpoints;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::placed::PlacedHost;
 use bloomery_gpu::host::run::HostRun;
 use bloomery_gpu::host::served::{ResidencyParts, TierBody};
-use bloomery_gpu::host::xstream::{XMode, XStreamBody};
+use bloomery_gpu::host::stream_side::StreamSide;
 use bloomery_gpu::hybrid::{Chain, Hybrid};
 use bloomery_gpu::model::{ChainBody, Rollback};
 use bloomery_gpu::weights::Weights;
@@ -46,6 +47,7 @@ use model::arch::ernie55::hparams::Hparams;
 use model::arch::ernie55::names::Sub;
 use model::moe::HostLayer;
 use model::r8file::R8Source;
+use runtime::seqstate::{Kept, Take};
 
 /// What the body's refusals name.
 pub(crate) const WHAT: &str = "ernie55::Body";
@@ -67,6 +69,12 @@ pub(crate) fn fold(h: u64, words: impl IntoIterator<Item = u32>) -> u64 {
 
 /// Bytes of an f32 on the card: the windows are byte-offset.
 const F32: usize = size_of::<f32>();
+
+/// The spacing of a prompt call's inner checkpoints: none. A call takes a checkpoint at its start
+/// and at its end ([`Checkpoints::marks`]), so the sequence holds the two newest points
+/// ([`Price::budget`](runtime::seqstate::Price::budget) of a ledger with no spacing: two slots,
+/// whatever the context). A request that extends the last call's prompt returns to its end.
+pub const CHECKPOINT_EVERY: u32 = 0;
 
 /// The card and the weights a part's launch reads.
 #[derive(Clone, Copy)]
@@ -132,6 +140,13 @@ pub trait Mixer {
     /// The FNV-1a 64 of every cache's bits, read back (synchronizes `stream`): what a gate holds
     /// [`Mixer::reset`] to.
     fn cache_digest(&self, stream: &CudaStream) -> Result<u64, GpuError>;
+
+    /// The stores a checkpoint copies, each as the f32 words of its bytes, in an order that is the
+    /// kind's alone and the same on every call: what a position keeps that the positions after it
+    /// overwrite. A kind whose stores are rows by position, cut by position, lends none.
+    fn copied(&mut self) -> Result<Vec<WindowMut<'_, f32>>, GpuError> {
+        Ok(Vec::new())
+    }
 
     /// The device bytes the caches, words and scratch hold.
     fn bytes(&self) -> usize;
@@ -217,8 +232,8 @@ pub trait RoutedFfn {
     /// The front of a hosted layer over the `m` normed rows of `x`: the router over the rows (the
     /// picks in [`RoutedFfn::route`], `[m, n_used]`) and the latent down of each row into the
     /// buffers' latent rows ([`RoutedFfn::latent_rows`]), the rows a prompt batch's download hands
-    /// the host. The caller runs the places and the download between this and
-    /// [`RoutedFfn::enqueue_shadow_rows`].
+    /// the host. The caller runs the download after this, and the places between the unit's pick
+    /// and [`RoutedFfn::enqueue_card_rows`].
     fn enqueue_front_rows(
         &mut self,
         cx: Cx<'_>,
@@ -231,20 +246,25 @@ pub trait RoutedFfn {
     /// slots read and a prompt batch's download hands the host.
     fn latent_rows(&self) -> &DeviceBuffer<f32>;
 
-    /// [`RoutedFfn::enqueue_shadow`] over the `m` rows: the shared expert into the buffers'
-    /// `shared` rows and the card's slots one run over the latent rows at the places `sel`
-    /// (`m · n_used`, a card slot below `n_card` or the host mark), the picks' weights the sum's.
-    /// Whether the card's slots ran.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the card, the layer, the rows, the input, the places and the card count (rust-quality R8)"
-    )]
-    fn enqueue_shadow_rows(
+    /// [`RoutedFfn::enqueue_shadow`]'s shared expert over the `m` rows of `x`, into the buffers'
+    /// `shared` rows: the half of the shadow that reads no places, which a prompt unit runs under
+    /// the host's work before the unit's pick ([`RoutedFfn::enqueue_card_rows`] after it).
+    fn enqueue_shared_rows(
         &mut self,
         cx: Cx<'_>,
         l: usize,
         m: usize,
         x: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError>;
+
+    /// [`RoutedFfn::enqueue_shadow`]'s card slots over the `m` rows: one run over the latent rows
+    /// ([`RoutedFfn::latent_rows`]) at the places `sel` (`m · n_used`, a card slot below `n_card`
+    /// or the host mark), the picks' weights the sum's. Whether the card's slots ran.
+    fn enqueue_card_rows(
+        &mut self,
+        cx: Cx<'_>,
+        l: usize,
+        m: usize,
         sel_n_card: (&DeviceBuffer<u32>, usize),
     ) -> Result<bool, GpuError>;
 
@@ -526,14 +546,30 @@ pub struct Body {
     /// The hosted pass's buffers beside the placed side ([`crate::placed::HostedPass`]) on a load
     /// whose plan hosts experts and that has the pass; `None` otherwise.
     pub(crate) hosted: Option<crate::placed::HostedPass>,
+    /// The HCA layers' window rings and compressor rings on the host at chosen positions
+    /// ([`Mixer::copied`]): what a cut goes back to.
+    pub(crate) ckpt: Checkpoints,
+    /// The prompt calls' host streaming ([`crate::stream`]): the `BLOOMERY_XSTREAM` lever's side.
+    pub(crate) xs: StreamSide,
 }
 
 impl Body {
     /// The body of `hp`'s file at `ctx` positions over `parts`: a sub-layer's output buffer over
     /// the trunk's rows, no host tier and no pass. Load-time only.
-    pub(crate) fn new(gpu: &Gpu, hp: &Hparams, ctx: usize, parts: Parts) -> Result<Body, GpuError> {
+    pub(crate) fn new(
+        gpu: &Gpu,
+        hp: &Hparams,
+        ctx: usize,
+        mut parts: Parts,
+    ) -> Result<Body, GpuError> {
         let sh = Shape::of(hp, ctx)?;
         let y = DeviceBuffer::zeroed(gpu.stream(), parts.trunk.rows().max(1) * sh.hidden)?;
+        let lens: Vec<usize> = parts.hca.copied()?.iter().map(|w| w.len()).collect();
+        let ckpt = if lens.is_empty() {
+            Checkpoints::stateless(gpu.context(), CHECKPOINT_EVERY)
+        } else {
+            Checkpoints::sequence(gpu.context(), lens, ctx, CHECKPOINT_EVERY)?
+        };
         Ok(Body {
             sh,
             parts,
@@ -543,7 +579,82 @@ impl Body {
             placed: None,
             pass: None,
             hosted: None,
+            ckpt,
+            xs: StreamSide::default(),
         })
+    }
+
+    /// What a cut to at most `n` positions of a model standing at `pos` keeps, and why: every
+    /// position, the empty model, or the nearest checkpoint at or below `n`. After a call that
+    /// failed part-way the stores hold other positions than `pos`, so only a checkpoint is kept.
+    #[must_use]
+    pub fn kept(&self, n: u32, pos: u32) -> Kept {
+        if self.held == pos {
+            self.ckpt.kept(n, pos)
+        } else {
+            self.ckpt.kept(n.min(pos), self.held)
+        }
+    }
+
+    /// The checkpoints: their positions, their slots, what they have done.
+    #[must_use]
+    pub fn checkpoints(&self) -> &Checkpoints {
+        &self.ckpt
+    }
+
+    /// A checkpoint at `pos`, the position the model stands at, after any waiting cut: the HCA
+    /// layers' window rings and compressor rings copied to a host slot, or nothing where one
+    /// stands. Refused by name when the stores hold other positions. Waits for the copies.
+    pub fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
+        self.held_at(pos)?;
+        self.apply_cut(gpu.stream())?;
+        let Body { parts, ckpt, .. } = self;
+        let mut lent = parts.hca.copied()?;
+        let mut stores: Vec<&mut DeviceBuffer<f32>> = lent.iter_mut().map(|w| &mut **w).collect();
+        ckpt.take(gpu.stream(), pos, &mut stores)
+    }
+
+    /// The waiting cut carried out: each store from its checkpoint's slot, or zeroed for the empty
+    /// model. Nothing, and no allocation, when no cut waits. Waits for the copies; the first
+    /// device call after a cut runs it ([`ChainBody::refresh`], a prompt call).
+    pub(crate) fn apply_cut(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if !self.ckpt.pending() {
+            return Ok(());
+        }
+        let Body { parts, ckpt, .. } = self;
+        let mut lent = parts.hca.copied()?;
+        let mut stores: Vec<&mut DeviceBuffer<f32>> = lent.iter_mut().map(|w| &mut **w).collect();
+        ckpt.apply(stream, &mut stores)
+    }
+
+    /// A cut to `pos`: nothing at the position the stores stand at; the empty model at 0; else the
+    /// checkpoint at `pos`, copied back at the next device call. Any other position is refused by
+    /// name ([`Body::kept`] says what a cut keeps).
+    pub fn cut(&mut self, pos: u32) -> Result<(), GpuError> {
+        self.ckpt.cut(pos, self.held)?;
+        self.held = pos;
+        Ok(())
+    }
+
+    /// Refused by name unless the stores hold `pos` positions: a step that failed past its inputs
+    /// has written the position into the window ring and a prompt call that failed part-way left
+    /// the stores between positions, so a checkpoint of either would hold a state no position has.
+    fn held_at(&self, pos: u32) -> Result<(), GpuError> {
+        if self.held == pos {
+            return Ok(());
+        }
+        Err(GpuError::shape(
+            WHAT,
+            format!(
+                "a checkpoint at position {pos} on stores that hold {} (a call failed part-way: \
+                 cut back to a checkpoint or reset first)",
+                if self.held == u32::MAX {
+                    "no position".to_string()
+                } else {
+                    format!("{} positions", self.held)
+                }
+            ),
+        ))
     }
 
     /// The widths and kinds.
@@ -686,8 +797,8 @@ impl ChainBody for Body {
         Ok(DecodeInput { token, pos })
     }
 
-    /// The step's host inputs, refused by name off the position the stores stand at: a window
-    /// ring holds the position it stands at alone.
+    /// A waiting cut carried out, then the step's host inputs, refused by name off the position
+    /// the stores stand at: a window ring holds the position it stands at alone.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         if input.pos != self.held {
             return Err(GpuError::shape(
@@ -699,6 +810,7 @@ impl ChainBody for Body {
                 ),
             ));
         }
+        self.apply_cut(stream)?;
         self.host_inputs(stream, input.token, input.pos)?;
         self.held = input.pos + 1;
         Ok(())
@@ -708,7 +820,8 @@ impl ChainBody for Body {
         crate::step::enqueue(gpu, w, self, head)
     }
 
-    /// Every part's caches back to the load's state, the position to 0 and the host tier settled.
+    /// Every part's caches back to the load's state, the position to 0, the host tier settled and
+    /// every checkpoint dropped.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         self.parts.hca.reset(stream)?;
@@ -717,6 +830,7 @@ impl ChainBody for Body {
             p.reset(stream)?;
         }
         self.held = 0;
+        self.ckpt.clear();
         Ok(())
     }
 
@@ -770,44 +884,11 @@ impl TierBody for Body {
 }
 
 impl Rollback for Body {
-    /// Refused by name, always: an HCA layer's window ring holds the position it stands at
-    /// alone, so the body takes no position back.
+    /// A cut to `pos` ([`Body::cut`]): a position where a checkpoint stands, refused by name at any
+    /// other (an HCA layer's window ring holds the position it stands at alone); the card work
+    /// waits for the next device call.
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
-        Err(GpuError::shape(
-            WHAT,
-            format!("a rollback to position {pos}: the HCA window rings take no position back"),
-        ))
-    }
-}
-
-impl XStreamBody for Body {
-    /// `BLOOMERY_XSTREAM`: `off` is the one mode the body runs. The body keeps no expert stream: a
-    /// prompt unit's host picks are served through the host tier's batch port and no expert moves
-    /// to the card for it. `admit` and `split` are refused by name.
-    fn set_xstream(&mut self, _gpu: &Gpu, mode: XMode) -> Result<(), GpuError> {
-        match xstream_refusal(mode) {
-            None => Ok(()),
-            Some(detail) => Err(GpuError::shape("ernie55::Body::set_xstream", detail)),
-        }
-    }
-
-    /// The load line's `xstream=` word: `off`.
-    fn xstream_word(&self) -> String {
-        XMode::Off.word().to_string()
-    }
-}
-
-/// Why the body refuses `mode`: `None` for `off`, the one mode it runs, a named fact for the other
-/// two.
-fn xstream_refusal(mode: XMode) -> Option<String> {
-    match mode {
-        XMode::Off => None,
-        XMode::Admit | XMode::Split => Some(format!(
-            "xstream={}: the body keeps no expert stream (a prompt unit's host picks are served \
-             through the host tier's batch port, and no expert moves to the card for it), so it \
-             runs `off`",
-            mode.word()
-        )),
+        self.cut(pos)
     }
 }
 
@@ -852,26 +933,4 @@ fn tail_rows<T>(
     let from = Window::<f32>::of(src, (m - n) * width * F32, n * width)?;
     let mut to = WindowMut::<f32>::of_mut(dst, 0, n * width)?;
     copy_row(gpu.stream(), &from, &mut to, n * width)
-}
-
-#[cfg(test)]
-mod tests {
-    use bloomery_gpu::host::xstream::XMode;
-
-    use super::xstream_refusal;
-
-    /// The body runs `off` and refuses the two modes that move experts, each by name with its
-    /// word: it keeps no expert stream. Mutant: `admit` or `split` accepted.
-    #[test]
-    fn the_body_streams_nothing_and_refuses_the_modes_that_would() {
-        assert_eq!(xstream_refusal(XMode::Off), None);
-        for mode in [XMode::Admit, XMode::Split] {
-            let why = xstream_refusal(mode).expect("a mode that moves experts is refused");
-            assert!(
-                why.starts_with(&format!("xstream={}:", mode.word())),
-                "{why}"
-            );
-            assert!(why.contains("no expert stream"), "{why}");
-        }
-    }
 }

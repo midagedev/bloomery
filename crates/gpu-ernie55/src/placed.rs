@@ -17,12 +17,14 @@
 //!   ([`RoutedFfn::enqueue_back`]), then the post.
 //!
 //! A prompt unit of the pass runs the same three parts around the host tier's batch port
-//! ([`walk_pass`], the common schedule's walk `(1, m, Batch)`): the front ends in the places of
-//! the unit's slots and the download of its latent rows, ids and weights; the shadow is the shared
-//! expert and the card's slots over the unit's rows under the tier's one union call, which reads
-//! each distinct host expert once for every row that picked it; the back adds the uploaded sums
-//! row by row. The buffers the batch leg needs beside the placed side are [`HostedPass`]'s,
-//! counted by the plan's prompt reserve.
+//! ([`walk_pass`], the common schedule's walk `(1, m, Batch)`): the front ends in the download of
+//! the unit's latent rows, ids and weights; the shadow is the shared expert, the unit's pick under
+//! host streaming (the host experts the unit routes most move into the card's pool,
+//! [`crate::stream`]), the places of the unit's slots over the map the pick left and the card's
+//! slots at those places, under the tier's one union call, which reads each distinct host expert
+//! once for every row that picked it and leaves out the experts the pick moved; the back adds the
+//! uploaded sums row by row. The buffers the batch leg needs beside the placed side are
+//! [`HostedPass`]'s, counted by the plan's prompt reserve.
 //!
 //! [`RoutedFfn::enqueue_front`]: crate::body::RoutedFfn::enqueue_front
 //! [`RoutedFfn::enqueue_shadow`]: crate::body::RoutedFfn::enqueue_shadow
@@ -424,14 +426,13 @@ impl<'a> LayerProgram for StepWalk<'a> {
 }
 
 /// A hosted layer's front from the feed-forward norm on over a unit's `m` rows: the router and
-/// the latent down into the buffers' latent rows, the picks tapped, the places of the unit's
-/// slots ([`PlacedSide::places_rows`]) and the download of the latent rows, weights and ids
-/// ([`PlacedSide::download_rows`]).
+/// the latent down into the buffers' latent rows, the picks tapped and the download of the latent
+/// rows, weights and ids ([`PlacedSide::download_rows`]).
 fn front_rows(
     cx: Cx<'_>,
     body: &mut Body,
     side: &PlacedSide,
-    (sel, m): (&mut DeviceBuffer<u32>, usize),
+    m: usize,
     port: &mut BatchLeg<'_, HostRun>,
     l: usize,
 ) -> Result<(), GpuError> {
@@ -443,7 +444,6 @@ fn front_rows(
     tap_picks(cx.gpu, body, l, m)?;
     let moe = &body.parts.moe;
     let (ids, weights) = moe.route();
-    side.places_rows(cx.gpu, l, (ids, m), sel)?;
     side.download_rows(
         port,
         At { unit: 0, layer: l },
@@ -452,20 +452,67 @@ fn front_rows(
     )
 }
 
-/// A hosted layer's card work under the host's union, over a unit's `m` rows: the shared expert
-/// and the card's slots over the latent rows at the unit's places. Whether the card's slots ran.
+/// Whether the stream's pick covers layer `l`: a hosted layer whose card holds experts.
+fn pick_covers(side: &PlacedSide, l: usize) -> bool {
+    side.hosted(l) && side.n_card(l) > 0
+}
+
+/// A hosted layer's card work under the host's union, over a unit's `m` rows of a walk ending at
+/// position `walk_end`: the shared expert over the rows, which reads no places; the layer's pick
+/// under host streaming ([`PromptStream::unit_pick`]), which moves host experts into the card's
+/// pool; the places of the unit's slots over the map the pick left ([`PlacedSide::places_rows`]);
+/// the card's slots at those places, each behind its landing batch's event; then the unit's read of
+/// the layer ([`PromptStream::unit_read`]). The pick sits before the places because the places
+/// name the slots it moved. Whether the card's slots ran. Refused by name: a ring the stream gave
+/// the layer, which the body never starts.
+///
+/// [`PromptStream::unit_pick`]: bloomery_gpu::host::prompt_stream::PromptStream::unit_pick
+/// [`PromptStream::unit_read`]: bloomery_gpu::host::prompt_stream::PromptStream::unit_read
 fn shadow_rows(
     cx: Cx<'_>,
     body: &mut Body,
-    side: &PlacedSide,
-    sel: &DeviceBuffer<u32>,
-    (l, m): (usize, usize),
+    (side, port): (&PlacedSide, &mut BatchLeg<'_, HostRun>),
+    sel: &mut DeviceBuffer<u32>,
+    (at, m, walk_end): (At, usize, usize),
 ) -> Result<bool, GpuError> {
-    let Body { parts, .. } = body;
-    let x = parts.trunk.normed();
-    parts
-        .moe
-        .enqueue_shadow_rows(cx, l, m, x, (sel, side.n_card(l)))
+    let l = at.layer;
+    {
+        let Body { parts, .. } = &mut *body;
+        let x = parts.trunk.normed();
+        parts.moe.enqueue_shared_rows(cx, l, m, x)?;
+    }
+    let covers = |k: usize| pick_covers(side, k);
+    let (ring, land) = body
+        .xs
+        .stream
+        .unit_pick(port, at, (m, 1), walk_end, covers)?;
+    if ring.is_some() {
+        return Err(GpuError::shape(
+            PASS,
+            format!("layer {l}: the stream gave a ring to a body that starts none"),
+        ));
+    }
+    let n_card = side.n_card(l);
+    let ran = if n_card > 0 {
+        {
+            let (ids, _) = body.parts.moe.route();
+            side.places_rows(cx.gpu, l, (ids, m), sel)?;
+        }
+        // The pick's admits copy into the slots the map now names: the card's slots read them
+        // behind every landing batch's event.
+        for event in land.iter().filter_map(|b| b.event.as_deref()) {
+            cx.gpu.stream().wait(event)?;
+        }
+        body.parts
+            .moe
+            .enqueue_card_rows(cx, l, m, (&*sel, n_card))?
+    } else {
+        false
+    };
+    body.xs
+        .stream
+        .unit_read(port, (at, 1), (land, None), covers)?;
+    Ok(ran)
 }
 
 /// A hosted layer's back from the upload on, over a unit's `m` rows: the card's and the host's
@@ -497,6 +544,13 @@ struct PassWalk<'a> {
     at: (u32, usize),
     /// Whether the hosted layer's card slots ran, from its shadow to its back.
     card: bool,
+}
+
+impl PassWalk<'_> {
+    /// The walk's last position: the unit's first plus its rows.
+    fn walk_end(&self) -> usize {
+        self.at.0 as usize + self.at.1
+    }
 }
 
 /// One unit of the prompt pass over every layer of `body`, its `m` rows (the embedding already in
@@ -539,6 +593,13 @@ pub(crate) fn walk_pass(
             &mut leg,
             &mut prog,
         )
+        .and_then(|()| {
+            // The walk's end under host streaming: the last returned layer's return, and a pick
+            // still held or a join still waiting refused by name.
+            prog.body.xs.stream.end_walk(leg.hybrid(), gpu.stream())?;
+            prog.body.xs.stream.walk_done();
+            Ok(())
+        })
     };
     body.hosted = Some(hosted);
     walked
@@ -560,25 +621,39 @@ impl<'a> LayerProgram for PassWalk<'a> {
             return step::close(self.cx.gpu, self.cx.w, self.body, l, m);
         }
         self.body.parts.trunk.enqueue_pre(self.cx, l, Sub::Ffn)?;
-        front_rows(self.cx, self.body, self.side, (&mut *self.sel, m), port, l)
+        front_rows(self.cx, self.body, self.side, m, port, l)
     }
 
-    /// The shared expert and the card's slots of a hosted layer, under the host's union.
-    fn shadow(&mut self, _port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
+    /// The shared expert, the pick and the card's slots of a hosted layer, under the host's
+    /// union.
+    fn shadow(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         if !self.side.hosted(at.layer) {
             return Ok(());
         }
-        let (_, m) = self.at;
-        self.card = shadow_rows(self.cx, self.body, self.side, self.sel, (at.layer, m))?;
+        let m = self.at.1;
+        let walk_end = self.walk_end();
+        self.card = shadow_rows(
+            self.cx,
+            self.body,
+            (self.side, port),
+            &mut *self.sel,
+            (at, m, walk_end),
+        )?;
         Ok(())
     }
 
-    /// A hosted layer from the upload on, then its post.
+    /// A hosted layer from the upload on, then its post, then the layer's return owed in a
+    /// returning call's last walk ([`PromptStream::unit_back`]).
+    ///
+    /// [`PromptStream::unit_back`]: bloomery_gpu::host::prompt_stream::PromptStream::unit_back
     fn back(&mut self, port: &mut BatchLeg<'a, HostRun>, at: At) -> Result<(), GpuError> {
         if !self.side.hosted(at.layer) {
             return Ok(());
         }
-        let (_, m) = self.at;
-        back_rows((self.cx, self.card), self.body, port.hsum(), (at.layer, m))
+        let m = self.at.1;
+        back_rows((self.cx, self.card), self.body, port.hsum(), (at.layer, m))?;
+        let (walk_end, covers) = (self.walk_end(), pick_covers(self.side, at.layer));
+        self.body.xs.stream.unit_back((at, 1), walk_end, covers);
+        Ok(())
     }
 }

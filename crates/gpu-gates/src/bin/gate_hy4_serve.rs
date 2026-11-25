@@ -15,9 +15,12 @@
 //!
 //! The shared clauses (`shared/serve_gate.rs`) take the seat's facts: the common hybrid seat's
 //! records, the think span the description names (`hy4::spec::REASONING`), the turn end
-//! as the vocabulary spells it, and the body's cut: a window layer's ring and the engram history
-//! take no position back (`app::arch::hy4`'s `Batch::cut`), so a request that shares less than
-//! the slot holds re-feeds its prompt from an empty model ([`serve_gate::Cut::WhereItStands`]).
+//! as the vocabulary spells it, and the body's cut: the body takes a checkpoint of the window
+//! rings, the sparse layers' index rings and the engram history at each prompt call's start and
+//! end (`app::arch::hy4`'s `Batch::cut`), so a request that extends the last prompt keeps all of
+//! it and answers as the same request on an empty slot does ([`serve_gate::Cut::Checkpoint`];
+//! the first reply is long enough to wrap the fixture's window ring, so a restore that leaves a
+//! ring or the history out answers differently or is refused by name).
 //!
 //! - `plan_names_the_slots`: the shared clause. The body's sequences are resident
 //!   (`bloomery_gpu_hy4::Seq`), so `--parallel 2` plans two slots a slot's context wide.
@@ -28,8 +31,8 @@
 //!   `listening` records with two slots of [`CTX`] each.
 //! - `slots_keep_their_own_rows`: on that server, P on a slot, then P and its answer there (every
 //!   held position kept), Q on the other slot, then the whole of P's history (P, both answers)
-//!   back on P's slot: it keeps every position the slot holds (the body's cut keeps where the
-//!   sequence stands, so the request continues it) and answers the ids the same request answers
+//!   back on P's slot: it keeps every position the slot holds (the request holds the slot's
+//!   whole history, so the cut keeps all of it) and answers the ids the same request answers
 //!   uncached, from an empty model (the server walks its prompts as steps, `--prefill steps`, so a kept
 //!   row and a re-fed one are the same bits, and both tiers judge it; a pass's batch sums differ
 //!   from a step's in rounding). FAIL-first: a sequence exchange that leaves the stores in
@@ -475,9 +478,9 @@ mod gate {
             think: Some(["<think:6124c78e>", "</think:6124c78e>"]),
             turn_end: Some(TURN_END),
             ctx: CTX,
-            // A window layer's ring and the engram history take no position back: a cut keeps
-            // the position the model stands at, or nothing (`app::arch::hy4`'s `Batch::cut`).
-            cut: serve_gate::Cut::WhereItStands,
+            // A cut keeps the newest checkpoint at or below the shared prefix: the body takes one
+            // at each prompt call's start and end (`app::arch::hy4`'s `Batch::cut`).
+            cut: serve_gate::Cut::Checkpoint,
         };
         std::fs::create_dir_all(&dir)?;
         let mut ok = serve_gate::plan_names_the_slots(&c, &dir)?;

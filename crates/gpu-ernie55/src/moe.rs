@@ -1366,9 +1366,9 @@ impl Moe {
         )
     }
 
-    /// [`Moe::enqueue_shadow`] over the `m` rows: the shared expert into the buffers' `shared`
-    /// rows, the card's slots one run over the buffers' latent rows at the places `sel`
-    /// (`m · 10` places), the buffers' `weights` the sum's. Whether the card's slots ran.
+    /// [`Moe::enqueue_shadow`] over the `m` rows: [`Moe::enqueue_shared_rows`], then
+    /// [`Moe::enqueue_card_rows`] at the places `sel` (`m · 10` places). Whether the card's slots
+    /// ran. A walk that moves experts between the two (a prompt call's pick) runs the two apart.
     pub fn enqueue_shadow_rows(
         &self,
         (gpu, w, cx, gemm): (&Gpu, &Weights, &GqaCx<'_>, &GemmKernels),
@@ -1376,44 +1376,82 @@ impl Moe {
         l: usize,
         m: usize,
         x: &DeviceBuffer<f32>,
-        (sel, n_card): (&DeviceBuffer<u32>, usize),
+        sel_n_card: (&DeviceBuffer<u32>, usize),
     ) -> Result<bool, GpuError> {
+        self.enqueue_shared_rows((gpu, w, cx, gemm), bufs, l, m, x)?;
+        self.enqueue_card_rows((gpu, w), bufs, l, m, sel_n_card)
+    }
+
+    /// The shared expert over the `m` rows of `x` into the buffers' `shared` rows, the half of
+    /// [`Moe::enqueue_shadow_rows`] that reads no places: it runs under the host's work before a
+    /// unit's pick moves the card's experts.
+    pub fn enqueue_shared_rows(
+        &self,
+        (_, _, cx, gemm): (&Gpu, &Weights, &GqaCx<'_>, &GemmKernels),
+        bufs: &mut MoeBufs,
+        l: usize,
+        m: usize,
+        x: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
         let r = layer(&self.layers, l)?;
         check_rows((bufs.rows, self.dims.hidden), m, x)?;
         let dims = &self.dims;
         let MoeBufs {
-            weights,
             gate,
             up,
             act,
             shared,
-            leg,
-            lat,
-            routed,
             wide,
             dense,
             ..
         } = bufs;
-        let rule = dims.rule();
         shared_rows(
             (wide, &*dense, gemm),
             cx,
             (r, l, m),
             x,
             (gate, up, act, shared),
-            rule,
+            dims.rule(),
             dims.hidden,
-        )?;
+        )
+    }
+
+    /// The card's slots over the `m` rows of the buffers' latent rows, one run at the places `sel`
+    /// (`m · 10` places, a card slot below `n_card` or the host mark), the buffers' `weights` the
+    /// sum's: the half of [`Moe::enqueue_shadow_rows`] that reads the places. Whether the card's
+    /// slots ran (`false` with `n_card` 0).
+    pub fn enqueue_card_rows(
+        &self,
+        (gpu, w): (&Gpu, &Weights),
+        bufs: &mut MoeBufs,
+        l: usize,
+        m: usize,
+        (sel, n_card): (&DeviceBuffer<u32>, usize),
+    ) -> Result<bool, GpuError> {
+        let r = layer(&self.layers, l)?;
+        if m == 0 || m > bufs.rows {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("{m} rows on buffers of {}", bufs.rows),
+            ));
+        }
         if n_card == 0 {
             return Ok(false);
         }
+        let MoeBufs {
+            weights,
+            leg,
+            lat,
+            routed,
+            ..
+        } = bufs;
         card_slots(
             (&self.leg, leg),
             (gpu, w),
             (r, l, m),
             lat,
             (sel, &*weights, n_card),
-            rule,
+            self.dims.rule(),
             routed,
         )?;
         Ok(true)

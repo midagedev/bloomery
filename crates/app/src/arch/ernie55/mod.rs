@@ -6,9 +6,11 @@
 //! checkpoint folder: the body reads either. The load carries the prompt pass, and a prompt runs as
 //! its units ([`prompt`]): each layer whole where the card holds its experts, each hosted layer's
 //! host experts read once for a unit's rows through the host tier's batch port. Either way the
-//! head's argmax after the last id is the call's. An HCA layer's window ring holds the position it
-//! stands at alone, so a cut keeps every held position or nothing. One resident sequence: the parts
-//! hold one sequence's caches.
+//! head's argmax after the last id is the call's. An HCA layer's window ring and compressor rings
+//! hold the position they stand at alone, so a cut keeps every held position, the empty model, or
+//! a checkpoint: each prompt call takes one at its start and at its end ([`Body::kept`]), which a
+//! request that extends the last prompt returns to. One resident sequence: the parts hold one
+//! sequence's caches.
 
 use std::num::NonZeroUsize;
 
@@ -23,8 +25,10 @@ use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::ernie55::place::PlanInputs;
 use model::placement::Plan;
+use runtime::seqstate::Kept;
 
-use super::{Batch, SingleSequence};
+use super::{Batch, SingleSequence, cut_checkpointed};
+use crate::Keep;
 
 const WHAT: &str = "ernie55 session";
 
@@ -76,25 +80,26 @@ impl Batch for Body {
         Ok(false)
     }
 
-    /// The ids as the pass's units ([`prompt`]), one residency pass; the load always has the pass,
-    /// and a body opened without it by hand steps.
+    /// The ids as the pass's units ([`prompt`]), one residency pass, and the call's checkpoints;
+    /// a body opened without the pass by hand steps them.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        if m.body(WHAT)?.pass_rows().is_none() {
-            return m.step(ids);
-        }
         prompt(m, ids)
     }
 
-    /// The window rings hold the position they stand at alone: a cut keeps that position, or
-    /// nothing.
+    /// [`Body::kept`]: every position, the empty model, or the nearest checkpoint at or below
+    /// `n`.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
-        crate::keep_where_it_stands(m, n)
+        <Body as Keep>::kept(m, n).at
     }
 
-    /// Back to empty at 0 (a reset), or the position the model stands at; any other cut is
-    /// refused by name.
+    /// [`Body::kept`].
+    fn kept(m: &GpuModel<Body>, n: u32) -> Kept {
+        m.body(WHAT)
+            .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n, m.pos()))
+    }
+
+    /// [`cut_checkpointed`]: the checkpoints are the only positions a cut takes back.
     fn cut(m: &mut GpuModel<Body>, n: u32) -> Result<(), GpuError> {
-        let why = "the HCA window rings take no position back";
-        crate::cut_where_it_stands(m, n, (WHAT, why))
+        cut_checkpointed(m, n)
     }
 }
