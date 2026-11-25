@@ -1504,6 +1504,15 @@ impl FfnBatchKernels {
 pub struct BatchLayer<'w> {
     layer: usize,
     lw: LayerWeights<'w>,
+    /// The layer's masked selection bias where `BLOOMERY_ROUTE_MASK` bans experts of it.
+    masked: Option<Arc<DeviceBuffer<f32>>>,
+}
+
+impl BatchLayer<'_> {
+    /// The selection bias the batch's router reads: the mask's, else the file's.
+    fn bias(&self) -> &DeviceBuffer<f32> {
+        self.masked.as_deref().unwrap_or(self.lw.bias)
+    }
 }
 
 /// What the batch join reads, `m` tokens token-major: `acc` the card sums,
@@ -2403,7 +2412,8 @@ impl FfnPiece {
                 "of the format the file's header names for it",
             ));
         }
-        Ok(BatchLayer { layer, lw })
+        let masked = self.dials.as_ref().and_then(|d| d.masked.handle(layer));
+        Ok(BatchLayer { layer, lw, masked })
     }
 
     /// The route of `bl`'s layer for the block `io` of a batch: per chunk the
@@ -2486,7 +2496,7 @@ impl FfnPiece {
                         &self.kernels.g32,
                         lw.router,
                         &x,
-                        lw.bias,
+                        bl.bias(),
                         self.scale,
                         t,
                         &mut probs,
@@ -2497,7 +2507,7 @@ impl FfnPiece {
                     1
                 }
                 Some((vl, media)) => {
-                    let runs = pick_runs(media, at, u, [lw.bias, vl])?;
+                    let runs = pick_runs(media, at, u, [bl.bias(), vl])?;
                     self.router.enqueue_router_rows_runs(
                         stream,
                         gpu,
@@ -2517,6 +2527,20 @@ impl FfnPiece {
             }
         };
         let slots_n = t * N_USED;
+        if let Some(DialState {
+            kernels,
+            census: Some(census),
+            ..
+        }) = self.dials.as_mut()
+        {
+            census.enqueue(
+                kernels,
+                stream,
+                layer,
+                (&b.ids, &b.weights),
+                (at * N_USED, t, N_USED),
+            )?;
+        }
         if let Some(col) = bloomery_gpu::imatrix::collector() {
             let x = span(WHAT, &b.x, at * n, t * n)?;
             let ids = span(WHAT, &b.ids, at * N_USED, slots_n)?;

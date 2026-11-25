@@ -178,14 +178,29 @@ pub trait RoutedFfn {
     ) -> Result<(), GpuError>;
 
     /// The front of a hosted layer's step: the router and the latent down of `x` into `lat`, the
-    /// row the host leg reads.
+    /// row the host leg reads. `slots` is the layer's `(slot map card copy, row offset)`, which a
+    /// resident bonus reads ([`RoutedFfn::set_route_dials`]).
     fn enqueue_front(
         &mut self,
         cx: Cx<'_>,
         l: usize,
         x: &DeviceBuffer<f32>,
-        lat: &mut DeviceBuffer<f32>,
+        slots_lat: (Option<(&DeviceBuffer<u32>, usize)>, &mut DeviceBuffer<f32>),
     ) -> Result<(), GpuError>;
+
+    /// The router levers of the load over a model of `n_layer` layers: the resident bonus, the
+    /// top-k cut, the banned-experts mask and the census ([`bloomery_gpu::route_dial::RouteSetup`]).
+    /// Returns the cut as a slot count, `None` the model's own. Load-time only.
+    fn set_route_dials(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        n_layer: usize,
+        setup: &bloomery_gpu::route_dial::RouteSetup,
+    ) -> Result<Option<usize>, GpuError>;
+
+    /// Write the routing census now; nothing with the census off.
+    fn flush_census(&self) -> Result<(), GpuError>;
 
     /// The last launch's picks as the router left them on the card, row-major `[m, n_used]`: the
     /// ids and their final weights (renormalized, times the learned scale). The handoff's input

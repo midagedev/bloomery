@@ -17,11 +17,12 @@ use std::num::NonZeroUsize;
 use bloomery_gpu::folder::Model;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::swap::Residency;
+use bloomery_gpu::route_dial::RouteSetup;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use bloomery_gpu_ernie55::body::Body;
 use bloomery_gpu_ernie55::{PASS_ROWS, prompt};
-use bloomery_levers::HostCfg;
+use bloomery_levers::{HostCfg, Levers};
 use gguf::Split;
 use model::arch::ernie55::place::PlanInputs;
 use model::placement::Plan;
@@ -53,7 +54,16 @@ impl Batch for Body {
         residency: Residency,
         _slots: NonZeroUsize,
     ) -> Result<GpuModel<Body>, GpuError> {
-        Body::open_placed(file, (plan, inputs), 0, host, (Some(PASS_ROWS), residency))
+        let mut m = Body::open_placed(file, (plan, inputs), 0, host, (Some(PASS_ROWS), residency))?;
+        // The router levers, read from the environment the binary already checked at `main`
+        // (`BLOOMERY_ROUTE_*`): set before the first step, so the capture holds their launches.
+        let levers = Levers::from_env().map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
+        let setup = RouteSetup::from_levers(&levers);
+        if setup.any() {
+            let (gpu, w, body) = m.body_parts(WHAT)?;
+            body.set_route_dials(gpu, w, &setup)?;
+        }
+        Ok(m)
     }
 
     /// Refused by name: the prompt is [`Batch::prompt`]'s pass units or steps, so nothing calls a

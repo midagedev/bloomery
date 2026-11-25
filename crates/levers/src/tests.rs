@@ -563,6 +563,8 @@ fn accessors_read_their_rows() {
     assert_eq!(unset.ink2_loopcd_ref(), 1);
     assert_eq!(unset.route_resident_bonus(), None);
     assert_eq!(unset.route_topk(), None);
+    assert_eq!(unset.route_mask(), None);
+    assert_eq!(unset.route_census(), None);
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -757,6 +759,8 @@ fn accessors_read_their_rows() {
             INK2_LOOPCD_REF,
             ROUTE_RESIDENT_BONUS,
             ROUTE_TOPK,
+            ROUTE_MASK,
+            ROUTE_CENSUS,
             REPLAY_POISON
         ]
     );

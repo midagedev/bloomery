@@ -92,6 +92,14 @@
 //!   same experts, each of which the reference clauses hold to the writer within the bands above;
 //!   [`LOGITS_BAND`] is used here as an unmeasured upper bound, and the clause's line prints the
 //!   worst row's value.
+//! - `route_mask_never_picks_banned` and `route_cut_counts_picks` (a fresh card load, `short`):
+//!   the router dials set after the open (`Body::set_route_dials`, as the app's batch does) with a
+//!   mask banning in every routed layer the ten experts the writer picked at `short`'s last row
+//!   and a cut to [`CUT_K`]: the prompt and a step after it pick no banned id, and the step's row
+//!   weighs exactly [`CUT_K`] picks.
+//! - `route_bonus_is_resident` (`hosted-mid`, its last clause): a bonus of [`LARGE_BONUS`] set
+//!   after the open makes a step after `short`'s prompt pick only experts that hold a card slot
+//!   in every routed layer, each of which holds at least k of them.
 //! - `reset_is_fresh` (the card arm and `hosted`, before the arm's first reset): `long` as the
 //!   open's first prompt and again after a reset give the same token, taps, logits and selection
 //!   bit for bit, the bits a fresh process writes, which the mixers' reset and the body's reset
@@ -168,6 +176,7 @@ mod gate {
     use bloomery_gpu::host::xstream::{XMode, XStreamBody};
     use bloomery_gpu::host::{HybridStats, PassKind};
     use bloomery_gpu::model::StepMode;
+    use bloomery_gpu::route_dial::{RouteDials, RouteSetup};
     use bloomery_gpu_ernie55::{Body, PASS_ROWS, TapRows};
     use bloomery_gpu_gates::generate::Residence;
     use bloomery_gpu_gates::prompts::{
@@ -233,6 +242,12 @@ mod gate {
     /// rows, so every row of a unit routes the same experts and the unit's count of each is the
     /// unit's rows, past the admit floor (`ADMIT_FLOOR`, 32) on any router.
     const SKEW_IDS: usize = 2 * PASS_ROWS;
+
+    /// The picks `route_mask_and_cut` keeps: a cut under the model's ten.
+    const CUT_K: usize = 4;
+    /// The bonus `route_bonus_is_resident` adds to a card slot's selection value: past any
+    /// sigmoid score (at most 1) and any file bias, so a resident expert outranks every host one.
+    const LARGE_BONUS: f32 = 1.0e3;
 
     /// The reference clauses of an arm: four a set, and `long`'s selection.
     const FX_ARM: usize = 4 * SETS.len() + 1;
@@ -1273,6 +1288,163 @@ mod gate {
         Ok(pass)
     }
 
+    /// Clause `route_mask_never_picks_banned` and clause `route_cut_counts_picks` on a fresh
+    /// whole-card load ([`RouteSetup`] set after the open, as the app's batch does): a mask banning
+    /// in every routed layer the ten experts the writer picked at `s`'s last prompt row, and a cut
+    /// to [`CUT_K`]. The prompt (the model's own k) and a step after it pick no banned id in any
+    /// routed layer, and the step's row weighs exactly [`CUT_K`] picks (the cut's tail is weighed
+    /// 0, the head renormalized). The banned ids are the ones the unmasked router picks, so the
+    /// clause is red where the mask is not read.
+    fn route_mask_and_cut(s: &Set) -> Result<bool, GateError> {
+        let names = [
+            format!(
+                "route_mask_never_picks_banned set={} arm=card-dials",
+                s.name
+            ),
+            format!("route_cut_counts_picks set={} arm=card-dials", s.name),
+        ];
+        let mut runs = [false; 2];
+        for (r, name) in runs.iter_mut().zip(&names) {
+            *r = tier::run_clause(name, Tag::SelfConsistency)?;
+        }
+        if !runs.iter().any(|&r| r) {
+            return Ok(true);
+        }
+        let (mut arm, _) = open_arm("card-dials", false, None, Residency::Off)?;
+        let k = arm.m.body(NAME)?.shape().n_used;
+        let banned: Vec<Vec<u32>> = s
+            .picks
+            .iter()
+            .map(|(ids, _)| {
+                if ids.is_empty() {
+                    Vec::new()
+                } else {
+                    last_rows_u(ids, k, 1).to_vec()
+                }
+            })
+            .collect();
+        let path = std::env::temp_dir().join(format!("{NAME}-mask-{}.txt", std::process::id()));
+        let text: String = banned
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| !b.is_empty())
+            .map(|(l, b)| {
+                let ids: Vec<String> = b.iter().map(u32::to_string).collect();
+                format!("{l} {}\n", ids.join(" "))
+            })
+            .collect();
+        std::fs::write(&path, text)
+            .map_err(|e| format!("{NAME}: write {}: {e}", path.display()))?;
+        let setup = RouteSetup {
+            dials: RouteDials::of(None, Some(CUT_K)),
+            mask: Some(path.clone()),
+            census: None,
+        };
+        let set = {
+            let (gpu, w, body) = arm.m.body_parts(NAME)?;
+            body.arm_taps(gpu, TAP_ROWS)
+                .and_then(|()| body.set_route_dials(gpu, w, &setup))
+        };
+        let _ = std::fs::remove_file(&path);
+        set?;
+        arm.m.reset()?;
+        let first = feed(&mut arm.m, &s.prompt)?;
+        let prompt = taps(&mut arm.m)?;
+        arm.m.step(&[first])?;
+        let step = taps(&mut arm.m)?;
+        let hits = |t: &TapRows| -> usize {
+            banned
+                .iter()
+                .enumerate()
+                .map(|(l, b)| t.ids[l].iter().filter(|id| b.contains(id)).count())
+                .sum()
+        };
+        let (in_prompt, in_step) = (hits(&prompt), hits(&step));
+        let mut ok = true;
+        if runs[0] {
+            let pass = in_prompt == 0 && in_step == 0;
+            ok &= pass;
+            println!(
+                "{} banned_per_layer={} banned_picked_in_prompt={in_prompt} \
+                 banned_picked_in_step={in_step} {}",
+                names[0],
+                banned.iter().map(Vec::len).max().unwrap_or(0),
+                verdict(pass)
+            );
+        }
+        if runs[1] {
+            let mut weighed = Vec::new();
+            for (l, b) in banned.iter().enumerate() {
+                if !b.is_empty() {
+                    weighed.push(step.weights[l].iter().filter(|&&w| w != 0.0).count());
+                }
+            }
+            let pass = !weighed.is_empty() && weighed.iter().all(|&n| n == CUT_K);
+            ok &= pass;
+            println!(
+                "{} k_cut={CUT_K} weighed_picks_per_routed_layer={weighed:?} {}",
+                names[1],
+                verdict(pass)
+            );
+        }
+        Ok(ok)
+    }
+
+    /// Clause `route_bonus_is_resident` of the arm that runs a residency over a plan that hosts
+    /// experts, the arm's last: with a bonus of [`LARGE_BONUS`] set after the open, a step after
+    /// `s`'s prompt picks, in every routed layer, only experts that hold a card slot (read from
+    /// the card's copy of the slot map right before the step), the premise being that the layer
+    /// holds at least k of them.
+    fn route_bonus_is_resident(arm: &mut Arm, s: &Set) -> Result<bool, GateError> {
+        let clause = format!("route_bonus_is_resident set={} arm={}", s.name, arm.name);
+        if !tier::run_clause(&clause, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let setup = RouteSetup {
+            dials: RouteDials::of(Some(LARGE_BONUS), None),
+            mask: None,
+            census: None,
+        };
+        {
+            let (gpu, w, body) = arm.m.body_parts(NAME)?;
+            body.set_route_dials(gpu, w, &setup)?;
+        }
+        arm.m.reset()?;
+        let first = feed(&mut arm.m, &s.prompt)?;
+        let k = arm.m.body(NAME)?.shape().n_used;
+        let (layers, n_expert) = {
+            let (_, _, body) = arm.m.body_parts(NAME)?;
+            let parts = body
+                .residency_parts()
+                .ok_or("the load runs no residency machine")?;
+            let map = parts.hybrid.slots();
+            (map.layers(), map.n_expert())
+        };
+        let table = card_table(&mut arm.m)?;
+        arm.m.step(&[first])?;
+        let t = taps(&mut arm.m)?;
+        let mut ok = true;
+        for (i, l) in layers.enumerate() {
+            let at = &table.entries()[i * n_expert..(i + 1) * n_expert];
+            let resident = at.iter().filter(|&&e| e != HOST).count();
+            let ids = &t.ids[l][..k];
+            let on_card = ids.iter().filter(|&&id| at[id as usize] != HOST).count();
+            let premise = tier::premise(
+                "route_bonus_is_resident: the layer holds at least k resident experts",
+                Tag::SelfConsistency,
+                resident >= k,
+            )?;
+            let pass = premise && on_card == k;
+            ok &= pass;
+            println!(
+                "{clause} layer={l} resident={resident} picks_on_card={on_card}/{k} \
+                 bonus={LARGE_BONUS:.0e} {}",
+                verdict(pass)
+            );
+        }
+        Ok(ok)
+    }
+
     /// The `hosted-mid` arm: the hosted file opened under [`RESIDENT`] (`opened`: whether clause
     /// `opens_the_fixture` runs; `card` the card arm, whose plan the unset word is also read
     /// on), its residency clauses and its clauses on `s`, closed.
@@ -1293,6 +1465,7 @@ mod gate {
         body.arm_taps(gpu, TAP_ROWS)?;
         ok &= resident_clauses(&mut arm, s)?;
         ok &= xstream_admit_matches_off(&mut arm, s)?;
+        ok &= route_bonus_is_resident(&mut arm, s)?;
         Ok(ok)
     }
 
@@ -1464,6 +1637,7 @@ mod gate {
         )?;
         ok &= graph_is_eager(&mut card.m, &sets[0])?;
         ok &= cut_restores(&mut card.m, &sets[0])?;
+        ok &= route_mask_and_cut(&sets[0])?;
         println!("{}", tier::tally_line());
         if !ok {
             return Err(checks_failed());

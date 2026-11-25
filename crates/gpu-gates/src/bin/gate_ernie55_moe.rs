@@ -1370,7 +1370,7 @@ mod gate {
                 &mut bufs,
                 LAYER,
                 &x_t[0],
-                &mut lat_short,
+                (None, &mut lat_short),
             ),
         ));
         let router = split::RouterKernels::load(dev.gpu.context())?;
@@ -1449,7 +1449,13 @@ mod gate {
         let mut host_steps = Vec::new();
         for x in &x_t {
             let mut lat = dev.zeroed(LATENT)?;
-            moe_c.enqueue_front((&dev.gpu, &w_card, &cx_c), &mut bufs_c, LAYER, x, &mut lat)?;
+            moe_c.enqueue_front(
+                (&dev.gpu, &w_card, &cx_c),
+                &mut bufs_c,
+                LAYER,
+                x,
+                (None, &mut lat),
+            )?;
             let lat_host = dev.read(&lat)?;
             let (ids, w) = bufs_c.picks(dev.stream())?;
             let list = host_list(&ids, &w);

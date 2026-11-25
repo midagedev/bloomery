@@ -1093,6 +1093,7 @@ mod gate {
                 (&out.ids, &out.probs),
                 (N_EXPERT, N_USED, cut),
                 (SCALE, false),
+                None,
                 fault,
                 &mut out.weights,
             )?;
@@ -1124,6 +1125,7 @@ mod gate {
                 (&out.ids, &out.probs),
                 (N_EXPERT, N_USED, N_USED + 1),
                 (SCALE, false),
+                None,
                 fault,
                 &mut out.weights,
             )

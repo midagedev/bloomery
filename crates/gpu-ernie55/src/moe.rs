@@ -42,6 +42,7 @@ use bloomery_gpu::host::placed::SideShape;
 use bloomery_gpu::host::run::HostWidths;
 use bloomery_gpu::kquant::Act;
 use bloomery_gpu::route_body::sigmoid_split_512_10 as split;
+use bloomery_gpu::route_dial::{Beside, MaskedBias, RouteCensus, RouteDialKernels, RouteSetup};
 use bloomery_gpu::routed_block::RoutedRows;
 use bloomery_gpu::site::{self, SiteTy, WideActs, WideKernels};
 use bloomery_gpu::weights::Weights;
@@ -54,6 +55,7 @@ use model::arch::names::routed_stacks;
 use model::moe::{HostLayer, SituSpec};
 use model::placement::kernels::{DownAct, DownForms};
 use model::r8file::R8Source;
+use runtime::routedial::MaskShape;
 
 /// What the refusals of this file name.
 pub const WHAT: &str = "ernie55 moe";
@@ -387,6 +389,21 @@ pub struct Moe {
     layers: Vec<Option<Routed>>,
     router: split::RouterKernels,
     leg: CardLeg,
+    /// The router levers of the load ([`Moe::set_route_dials`]); `None` routes as the file says.
+    dials: Option<Dials>,
+}
+
+/// A load's router levers, resolved: the entries of the dials' launches, λ, the cut as a slot
+/// count and the masked selection biases.
+struct Dials {
+    kernels: RouteDialKernels,
+    /// `BLOOMERY_ROUTE_RESIDENT_BONUS`'s λ, when on.
+    lambda: Option<f32>,
+    /// The first `cut` of a decode step's slots run; `None` the model's own count.
+    cut: Option<usize>,
+    /// `BLOOMERY_ROUTE_MASK`'s buffers: a layer's file bias with its banned experts' entries pushed
+    /// down; a layer the mask leaves alone reads the file's.
+    masked: MaskedBias,
 }
 
 /// The block's buffers: a step's one row and a prompt unit's up to `rows` rows, token-major, and
@@ -427,6 +444,11 @@ pub struct MoeBufs {
     wide: Vec<(usize, WideActs)>,
     /// The wide arm's one-expert table.
     dense: GemmRoute,
+    /// The bonus's selection bias, one layer's at a time ([`Moe::set_route_dials`]); `None` with
+    /// the bonus off.
+    dial_bias: Option<DeviceBuffer<f32>>,
+    /// The routing census counters ([`Moe::set_route_dials`]); `None` with the census off.
+    census: Option<RouteCensus>,
 }
 
 /// The last step's router output read back by [`MoeBufs::scores`], each [`split::N_EXPERT`] long.
@@ -511,6 +533,8 @@ impl MoeBufs {
             acts: Acts::new(stream, sites.iter().copied())?,
             wide,
             dense: GemmRoute::new(stream, rows, 1)?,
+            dial_bias: None,
+            census: None,
         })
     }
 
@@ -637,6 +661,8 @@ impl MoeBufs {
             + self.leg.bytes()
             + self.wide.iter().map(|(_, a)| a.bytes()).sum::<usize>()
             + self.dense.bytes()
+            + self.dial_bias.as_ref().map_or(0, DeviceBuffer::num_bytes)
+            + self.census.as_ref().map_or(0, RouteCensus::bytes)
     }
 }
 
@@ -672,14 +698,14 @@ fn check_rows(
     Ok(())
 }
 
-/// The step's router: layer `l`'s two matrices, the bias and the learned scale over the one row
-/// `x` into `out`.
+/// The step's router: layer `l`'s two matrices, the selection `bias` (the file's, the mask's or the
+/// bonus's) and the learned scale over the one row `x` into `out`.
 fn route_1(
     router: &split::RouterKernels,
     (gpu, w): (&Gpu, &Weights),
     r: &Routed,
     l: usize,
-    x: &DeviceBuffer<f32>,
+    (x, bias): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
     out: &mut split::RouterOut,
 ) -> Result<(), GpuError> {
     let (w0, w1) = (
@@ -690,25 +716,25 @@ fn route_1(
         gpu.stream(),
         (w0, w1),
         x,
-        w.f32_buf(WHAT, &r.bias)?,
+        bias,
         w.f32_buf(WHAT, &r.escale)?,
         out,
         gpu.layer_sink(l)?,
     )
 }
 
-/// A unit's router over `m` rows of `x`: the scores into `probs`, router 1's logits into
-/// `logits`, the picks' ids and weights.
+/// A unit's router over `m` rows of `x` under the selection `bias`: the scores into `probs`,
+/// router 1's logits into `logits`, the picks' ids and weights.
 #[allow(
     clippy::too_many_arguments,
-    reason = "the router, the card and weights, the layer and rows, the input and the four row buffers"
+    reason = "the router, the card and weights, the layer and rows, the input and bias and the four row buffers"
 )]
 fn route_rows(
     router: &split::RouterKernels,
     (gpu, w, g32): (&Gpu, &Weights, &Gemm32Kernels),
     r: &Routed,
     (l, m): (usize, usize),
-    x: &DeviceBuffer<f32>,
+    (x, bias): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
     (probs, logits, ids, weights): (
         &mut DeviceBuffer<f32>,
         &mut DeviceBuffer<f32>,
@@ -724,7 +750,7 @@ fn route_rows(
         (gpu.stream(), g32),
         (w0, w1),
         x,
-        w.f32_buf(WHAT, &r.bias)?,
+        bias,
         w.f32_buf(WHAT, &r.escale)?,
         m,
         RoutedRows {
@@ -1051,6 +1077,7 @@ impl Moe {
                 layers: by,
                 router: split::RouterKernels::load(gpu.context())?,
                 leg: CardLeg::load(gpu)?,
+                dials: None,
             },
             bufs,
         ))
@@ -1060,6 +1087,183 @@ impl Moe {
     #[must_use]
     pub fn dims(&self) -> &MoeDims {
         &self.dims
+    }
+
+    /// The router levers of the load (`BLOOMERY_ROUTE_RESIDENT_BONUS`, `BLOOMERY_ROUTE_TOPK`,
+    /// `BLOOMERY_ROUTE_MASK`, `BLOOMERY_ROUTE_CENSUS`; [`RouteSetup`]) over a model of `n_layer`
+    /// layers. The router is the split sigmoid instance, which takes a selection bias in place:
+    /// the mask is a bias buffer per masked layer (the file's plus [`runtime::routedial::BAN`] on
+    /// the banned experts), the bonus a launch before a hosted layer's router that writes the
+    /// stage card's `+λ` on that bias, and the cut a launch after it that renormalizes the first
+    /// `k'` slots and weighs the rest 0, times the learned per-expert scale as the router's own
+    /// weight stage does. The prompt pass keeps the model's `k` and takes the mask (a banned
+    /// expert is never picked, in the pass too) and the census, not the bonus or the cut. Refused
+    /// by name: `k'` above 10 and every refusal of the mask and of the dials
+    /// ([`RouteSetup::check`]; the body has no draft and refuses an expert tier card at its
+    /// load). Returns the cut as a slot count, which the host tier skips too
+    /// (`HostTier::set_route_cut`; `None` the model's own). All unset leaves the block as it was.
+    /// Load-time only.
+    pub fn set_route_dials(
+        &mut self,
+        bufs: &mut MoeBufs,
+        (gpu, w, n_layer): (&Gpu, &Weights, usize),
+        setup: &RouteSetup,
+    ) -> Result<Option<usize>, GpuError> {
+        let n = self.dims.n_expert;
+        let cut = setup.check(self.dims.n_used, Beside::default())?;
+        if !setup.any() {
+            self.dials = None;
+            return Ok(None);
+        }
+        let shape = MaskShape {
+            n_layer,
+            n_expert: n,
+            k: self.dims.n_used,
+        };
+        let masked = match setup.read_mask(shape)? {
+            Some(mask) => {
+                mask.check_routed(|l| self.layers.get(l).is_some_and(Option::is_some))
+                    .map_err(|e| GpuError::shape(WHAT, e.to_string()))?;
+                MaskedBias::upload(gpu.stream(), &mask, n_layer, |l| {
+                    let r = layer(&self.layers, l)?;
+                    Ok(w.f32_buf(WHAT, &r.bias)?.to_host_vec(gpu.stream())?)
+                })?
+            }
+            None => MaskedBias::upload(gpu.stream(), &Default::default(), n_layer, |_| {
+                Ok(Vec::new())
+            })?,
+        };
+        let lambda = setup.dials.bonus();
+        bufs.dial_bias = lambda
+            .map(|_| DeviceBuffer::zeroed(gpu.stream(), n))
+            .transpose()?;
+        bufs.census = setup
+            .census
+            .clone()
+            .map(|path| RouteCensus::new(gpu.stream_handle(), path, (n_layer, n, self.dims.n_used)))
+            .transpose()?;
+        self.dials = Some(Dials {
+            kernels: RouteDialKernels::load(gpu.context())?,
+            lambda,
+            cut,
+            masked,
+        });
+        Ok(cut)
+    }
+
+    /// Write the routing census now ([`RouteCensus::flush`]); nothing with the census off.
+    pub fn flush_census(&self, bufs: &MoeBufs) -> Result<(), GpuError> {
+        bufs.census.as_ref().map_or(Ok(()), RouteCensus::flush)
+    }
+
+    /// Layer `l`'s selection bias before the bonus: the mask's buffer where the layer has banned
+    /// experts, else the file's.
+    fn base_bias<'a>(
+        &'a self,
+        w: &'a Weights,
+        r: &'a Routed,
+        l: usize,
+    ) -> Result<&'a DeviceBuffer<f32>, GpuError> {
+        match self.dials.as_ref().and_then(|d| d.masked.get(l)) {
+            Some(b) => Ok(b),
+            None => w.f32_buf(WHAT, &r.bias),
+        }
+    }
+
+    /// The step's router at layer `l` over the row `x` into `route`, under the load's dials: the
+    /// bias is the base, with `+λ` on the experts the layer's stage-card slot map holds when the
+    /// bonus is on and `slots` is that map's `(card copy, row offset)` (a layer whose card holds
+    /// every expert passes `None`: every expert is resident, a constant `+λ` moves no pick); then
+    /// the router, the cut of its weights and the census add. With no dial on, the router alone on
+    /// the file's bias.
+    fn route_decode(
+        &self,
+        (gpu, w): (&Gpu, &Weights),
+        (r, l): (&Routed, usize),
+        x: &DeviceBuffer<f32>,
+        slots: Option<(&DeviceBuffer<u32>, usize)>,
+        (route, dial_bias, census): (
+            &mut split::RouterOut,
+            &mut Option<DeviceBuffer<f32>>,
+            &mut Option<RouteCensus>,
+        ),
+    ) -> Result<(), GpuError> {
+        let base = self.base_bias(w, r, l)?;
+        let Some(d) = self.dials.as_ref() else {
+            return route_1(&self.router, (gpu, w), r, l, (x, base), route);
+        };
+        let stream = gpu.stream();
+        let bias = match (d.lambda, slots, dial_bias.as_mut()) {
+            (Some(lambda), Some((map, row_off)), Some(scratch)) => {
+                d.kernels
+                    .enqueue_resident_bias(stream, (base, map, row_off), lambda, scratch)?;
+                &*scratch
+            }
+            _ => base,
+        };
+        route_1(&self.router, (gpu, w), r, l, (x, bias), route)?;
+        if let Some(cut) = d.cut {
+            d.kernels.enqueue_cut(
+                stream,
+                (&route.ids, &route.probs),
+                (split::N_EXPERT, split::N_USED, cut),
+                (1.0, false),
+                Some(w.f32_buf(WHAT, &r.escale)?),
+                gpu.layer_sink(l)?,
+                &mut route.weights,
+            )?;
+        }
+        if let Some(c) = census.as_mut() {
+            c.enqueue(
+                &d.kernels,
+                stream,
+                l,
+                (&route.ids, &route.weights),
+                (0, 1, d.cut.unwrap_or(split::N_USED)),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A unit's router at layer `l` over `m` rows of `x` under the load's mask (and no bonus or
+    /// cut: the pass keeps the model's `k`), then the census add of the unit's rows.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the card, weights and kernels, the layer and rows, the input, the four row buffers and the census"
+    )]
+    fn route_unit(
+        &self,
+        (gpu, w, g32): (&Gpu, &Weights, &Gemm32Kernels),
+        (r, l, m): (&Routed, usize, usize),
+        x: &DeviceBuffer<f32>,
+        rows: (
+            &mut DeviceBuffer<f32>,
+            &mut DeviceBuffer<f32>,
+            &mut DeviceBuffer<u32>,
+            &mut DeviceBuffer<f32>,
+        ),
+        census: &mut Option<RouteCensus>,
+    ) -> Result<(), GpuError> {
+        let base = self.base_bias(w, r, l)?;
+        let (probs, logits, ids, weights) = rows;
+        route_rows(
+            &self.router,
+            (gpu, w, g32),
+            r,
+            (l, m),
+            (x, base),
+            (&mut *probs, logits, &mut *ids, &mut *weights),
+        )?;
+        if let (Some(c), Some(d)) = (census.as_mut(), self.dials.as_ref()) {
+            c.enqueue(
+                &d.kernels,
+                gpu.stream(),
+                l,
+                (&*ids, &*weights),
+                (0, m, split::N_USED),
+            )?;
+        }
+        Ok(())
     }
 
     /// Layer `l`'s block over the one normed row `x` into `out`, every expert on the card: the
@@ -1089,9 +1293,11 @@ impl Moe {
             shared,
             leg,
             acts,
+            dial_bias,
+            census,
             ..
         } = bufs;
-        route_1(&self.router, (gpu, w), r, l, x, route)?;
+        self.route_decode((gpu, w), (r, l), x, None, (route, dial_bias, census))?;
         r.down_lat.project(cx, acts, l, x, lat)?;
         let rule = dims.rule();
         glu_1(cx, acts, (rule, l), &r.shared, x, (gate, up, act), shared)?;
@@ -1118,15 +1324,16 @@ impl Moe {
 
     /// The front of layer `l`'s step, a layer with a host share: the router into the buffers'
     /// step output and the latent down of `x` into `lat`, the row the host leg reads (a placed
-    /// load's boundary hands it over). The caller runs the handoff and the go between this and
-    /// [`Moe::enqueue_shadow`].
+    /// load's boundary hands it over). `slots` is the layer's `(slot map card copy, row offset)`
+    /// the bonus reads ([`Moe::set_route_dials`]). The caller runs the handoff and the go between
+    /// this and [`Moe::enqueue_shadow`].
     pub fn enqueue_front(
         &self,
         (gpu, w, cx): (&Gpu, &Weights, &GqaCx<'_>),
         bufs: &mut MoeBufs,
         l: usize,
         x: &DeviceBuffer<f32>,
-        lat: &mut DeviceBuffer<f32>,
+        (slots, lat): (Option<(&DeviceBuffer<u32>, usize)>, &mut DeviceBuffer<f32>),
     ) -> Result<(), GpuError> {
         let r = layer(&self.layers, l)?;
         check_rows((bufs.rows, self.dims.hidden), 1, x)?;
@@ -1141,8 +1348,14 @@ impl Moe {
                 ),
             ));
         }
-        let MoeBufs { route, acts, .. } = bufs;
-        route_1(&self.router, (gpu, w), r, l, x, route)?;
+        let MoeBufs {
+            route,
+            acts,
+            dial_bias,
+            census,
+            ..
+        } = bufs;
+        self.route_decode((gpu, w), (r, l), x, slots, (route, dial_bias, census))?;
         r.down_lat.project(cx, acts, l, x, lat)
     }
 
@@ -1273,15 +1486,15 @@ impl Moe {
             leg,
             wide,
             dense,
+            census,
             ..
         } = bufs;
-        route_rows(
-            &self.router,
+        self.route_unit(
             (gpu, w, cx.g32),
-            r,
-            (l, m),
+            (r, l, m),
             x,
             (probs, logits, ids, weights),
+            census,
         )?;
         gemm.enqueue_route_dense(gpu.stream(), m, dense, gpu.layer_sink(l)?)?;
         project(
@@ -1346,15 +1559,15 @@ impl Moe {
             lat,
             wide,
             dense,
+            census,
             ..
         } = bufs;
-        route_rows(
-            &self.router,
+        self.route_unit(
             (gpu, w, cx.g32),
-            r,
-            (l, m),
+            (r, l, m),
             x,
             (probs, logits, ids, weights),
+            census,
         )?;
         gemm.enqueue_route_dense(gpu.stream(), m, dense, gpu.layer_sink(l)?)?;
         project(

@@ -794,6 +794,9 @@ fn feed(
     media: Option<&CallMedia<'_>>,
     end: CallEnd,
 ) -> Result<Option<u32>, GpuError> {
+    // The census of every call before this one is on disk once it starts (a no-op with the
+    // census off).
+    m.body(WHAT)?.flush_census()?;
     let head = end.head();
     if ids.is_empty() {
         return Err(GpuError::Shape {

@@ -34,9 +34,9 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     AUTOTUNE, ELASTIC, INK2_DENSE, INK2_LOOPCD, INK2_LOOPCD_MAX, INK2_LOOPCD_PLACES,
-    INK2_LOOPCD_REF, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, REPLAY_POISON, ROUTE_RESIDENT_BONUS,
-    ROUTE_RESIDENT_BONUS_MAX, ROUTE_RESIDENT_BONUS_PLACES, ROUTE_TOPK, ROUTE_TOPK_MAX, SCHEMAJUMP,
-    SPLIT_WALK, XSTREAM,
+    INK2_LOOPCD_REF, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, REPLAY_POISON, ROUTE_CENSUS,
+    ROUTE_MASK, ROUTE_RESIDENT_BONUS, ROUTE_RESIDENT_BONUS_MAX, ROUTE_RESIDENT_BONUS_PLACES,
+    ROUTE_TOPK, ROUTE_TOPK_MAX, SCHEMAJUMP, SPLIT_WALK, XSTREAM,
 };
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_EXPERTS_CAP, CARD_MARGIN, CED, CHECK_FINITE, DRAFT,
@@ -1773,6 +1773,18 @@ impl Levers {
     pub fn route_topk(&self) -> Option<usize> {
         self.count(ROUTE_TOPK)
             .map(|n| Levers::usize_of(ROUTE_TOPK, n))
+    }
+
+    /// `BLOOMERY_ROUTE_MASK`: the banned-experts sidecar; `None` unset.
+    #[must_use]
+    pub fn route_mask(&self) -> Option<&Path> {
+        self.path(ROUTE_MASK)
+    }
+
+    /// `BLOOMERY_ROUTE_CENSUS`: the routing census file; `None` unset.
+    #[must_use]
+    pub fn route_census(&self) -> Option<&Path> {
+        self.path(ROUTE_CENSUS)
     }
 
     /// `BLOOMERY_REPLAY_POISON`: a capture gate runs its replay-poison

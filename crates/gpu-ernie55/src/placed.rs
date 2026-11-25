@@ -41,6 +41,7 @@ use bloomery_gpu::host::swap_source::{ResidencySpec, hosted_stacks};
 use bloomery_gpu::host::{BatchLeg, StepLeg};
 use bloomery_gpu::hybrid::{Hybrid, SlotMap};
 use bloomery_gpu::model::{HostServed, hosted_hybrid_at, refuse_reserve_past, stage_run};
+use bloomery_gpu::route_dial::RouteSetup;
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{Gpu, GpuError, GpuModel};
 use bloomery_levers::HostCfg;
@@ -300,6 +301,36 @@ impl Body {
     pub fn pass_rows(&self) -> Option<usize> {
         self.pass
     }
+
+    /// The router levers of the load (`BLOOMERY_ROUTE_RESIDENT_BONUS`, `BLOOMERY_ROUTE_TOPK`,
+    /// `BLOOMERY_ROUTE_MASK`, `BLOOMERY_ROUTE_CENSUS`): the routed block's launches
+    /// ([`crate::moe::Moe::set_route_dials`]) and the host tier's skip of the slots a cut leaves
+    /// unrun (`HostTier::set_route_cut`: no read, no residency heat, no census pick). A cut slot
+    /// is not served by the host, so the host tier's own counts and the residency rule see the
+    /// k' picks that ran; the prompt pass's picks and the xstream `admit` rule see the model's
+    /// `k` of the masked router, so a banned expert is never admitted either. All unset leaves
+    /// the load as it was. Load-time only.
+    pub fn set_route_dials(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        setup: &RouteSetup,
+    ) -> Result<(), GpuError> {
+        let cut = self
+            .parts
+            .moe
+            .set_route_dials(gpu, w, self.sh.n_layer, setup)?;
+        if let Some(placed) = self.placed.as_mut() {
+            placed.shell.hybrid.set_route_cut(cut);
+        }
+        Ok(())
+    }
+
+    /// Write the routing census now (`BLOOMERY_ROUTE_CENSUS`); nothing with the census off. A
+    /// prompt call does it at its start, and the census does it when dropped.
+    pub fn flush_census(&self) -> Result<(), GpuError> {
+        self.parts.moe.flush_census()
+    }
 }
 
 /// A hosted layer's front from the feed-forward norm on: the router and the latent down into the
@@ -314,9 +345,10 @@ fn front(
     {
         let Body { parts, .. } = &mut *body;
         let x = parts.trunk.normed();
+        let slots = Some((side.slots().buf(), side.row_off(l)));
         parts
             .moe
-            .enqueue_front(cx, l, x, hy.boundary_mut().normed_mut())?;
+            .enqueue_front(cx, l, x, (slots, hy.boundary_mut().normed_mut()))?;
     }
     tap_picks(cx.gpu, body, l, 1)?;
     side.go(cx.gpu, body.parts.moe.route(), hy, l)

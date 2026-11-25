@@ -68,6 +68,8 @@ pub const INK2_PASSES: &str = "BLOOMERY_INK2_PASSES";
 pub const REPLAY_POISON: &str = "BLOOMERY_REPLAY_POISON";
 pub const ROUTE_RESIDENT_BONUS: &str = "BLOOMERY_ROUTE_RESIDENT_BONUS";
 pub const ROUTE_TOPK: &str = "BLOOMERY_ROUTE_TOPK";
+pub const ROUTE_MASK: &str = "BLOOMERY_ROUTE_MASK";
+pub const ROUTE_CENSUS: &str = "BLOOMERY_ROUTE_CENSUS";
 
 /// The digits `BLOOMERY_ROUTE_RESIDENT_BONUS` takes past its point, and its largest value in units
 /// of the last place: 100.
@@ -1689,7 +1691,8 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               rows only: the prompt pass, `BLOOMERY_PREFILL=steps` feeds excepted (those are \
               decode steps and take the bonus), keeps the file's bias. Refused by name beside \
               `BLOOMERY_DRAFT` and a draft's verify (its rows would pick without the bonus) and \
-              on a router that selects by probability alone (softmax: ERNIE 5.5 and its kind). \
+              on a router that selects by probability alone (a softmax entry, which has no selection bias: \
+              Mistral-Large-4's; ERNIE 5.5's split sigmoid router takes the bias in place). \
               An accuracy lever, opt-in: the picks leave the trained router's, more with λ. \
               Unset and 0: no launch, today's bias buffer and bits. A decimal of at most 3 \
               places, 0 to 100.",
@@ -1719,6 +1722,54 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               `card` and `file` keep adding up. Refused by name above the model's own k, \
               beside `BLOOMERY_DRAFT`, and on a load with an expert tier card. Unset and k' \
               equal to the model's k: no launch and today's bits. An accuracy lever, opt-in.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: ROUTE_MASK,
+        class: Class::A,
+        kind: Kind::File,
+        default: Unset::Means("no expert is banned"),
+        doc: "Routed MoE (DeepSeek V4.1, ERNIE 5.5): a sidecar of banned experts. One text line \
+              a routed layer, `<layer> <id> <id> ...`; blank lines and `#` lines are skipped; \
+              a line with no id, a layer given twice, an id twice in a line, a layer or id out of \
+              range and a layer that bans so many that fewer than k remain are refused by name \
+              at the load (`tools/route-mask.py` writes one from a census). A banned expert is \
+              never picked, in the decode step and the prompt pass alike: its selection value \
+              is the file bias plus -1e30, so the router's own top-k leaves it out (the router \
+              keeps its values finite) and the gate weights renormalize over the picked set as \
+              the model's rule does. The mask is a bias buffer per masked layer made at the \
+              load: no launch of its own, and the bonus (`BLOOMERY_ROUTE_RESIDENT_BONUS`) adds \
+              to it. A banned expert is never read from the host, never counted by the \
+              residency rule and never streamed, because nothing routes to it; the plan still \
+              sizes the card and the host for every expert (the host bytes of a mask are not \
+              yet cut). Refused beside `BLOOMERY_DRAFT` and on a TP rank (their rows pick \
+              without it). An accuracy lever, opt-in. Unset: no buffer, today's bits.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: ROUTE_CENSUS,
+        class: Class::D,
+        kind: Kind::Path,
+        default: Unset::Means("no census"),
+        doc: "Routed MoE (DeepSeek V4.1, ERNIE 5.5): the file the engine writes a routing census \
+              to, the input of `tools/route-mask.py`. Per (routed layer, expert) the picks that \
+              ran and the sum of their gate weights, over the decode steps and the prompt pass \
+              both (`crates/gpu/src/route_dial.rs` `RouteCensus`): one added launch a router \
+              launch, two device counters (u32 picks, f32 weights, atomic adds), no host lock \
+              and no read per step. The table is read back and written (a new file renamed \
+              over the old, so a reader never sees half of one) when a prompt call starts \
+              and when the model is dropped; the file at any moment holds every call before \
+              the last prompt call's start, plus the whole run after a clean exit. Format: `# \
+              route-census v1`, `n_layer N`, `n_expert E`, `n_used K`, then `<layer> <expert> \
+              <picks> <weight_sum>` for each cell with a pick. Runs add: census files are \
+              merged by the tool. Under `BLOOMERY_ROUTE_TOPK` the tail slots are not counted. \
+              Unset: no buffer, no launch, no write.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,

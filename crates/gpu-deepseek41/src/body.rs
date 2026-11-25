@@ -92,7 +92,7 @@ use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap, refuse_expert_tiers,
 };
 use bloomery_gpu::model::{ChainBody, HostServed, Resident, Rollback, Rows};
-use bloomery_gpu::route_dial::{Beside, RouteDials};
+use bloomery_gpu::route_dial::{Beside, RouteDials, RouteSetup};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{
     CardKeep, DeviceTensor, FreedBytes, Gpu, GpuError, GpuModel, HostGrowBook, HostGrowStats,
@@ -321,12 +321,13 @@ impl OpenCfg {
             hoststream,
             route: RouteDials::from_levers(levers),
         };
-        if body.route.any() && levers.draft().is_some_and(|w| w != "off") {
+        let route_files = levers.route_mask().is_some() || levers.route_census().is_some();
+        if (body.route.any() || route_files) && levers.draft().is_some_and(|w| w != "off") {
             return Err(GpuError::Shape {
-                what: "BLOOMERY_ROUTE_RESIDENT_BONUS / BLOOMERY_ROUTE_TOPK",
-                detail: "beside BLOOMERY_DRAFT: a draft's verify rows pick without the dials, so \
-                         the two paths would route one token differently; use BLOOMERY_DRAFT=off \
-                         or unset the dials"
+                what: "BLOOMERY_ROUTE_*",
+                detail: "beside BLOOMERY_DRAFT: a draft's verify rows pick without the dials, the \
+                         mask and the census, so the two paths would route one token differently; \
+                         use BLOOMERY_DRAFT=off or unset them"
                     .to_string(),
             });
         }
@@ -508,11 +509,11 @@ fn rank_levers(levers: BodyLevers) -> Result<BodyLevers, GpuError> {
         prefill: PrefillMode::Steps,
         ..levers
     };
-    if levers.route.any() {
+    if levers.route.any() || RouteSetup::with_env_files(RouteDials::OFF)?.any() {
         return Err(GpuError::Shape {
-            what: "BLOOMERY_ROUTE_RESIDENT_BONUS / BLOOMERY_ROUTE_TOPK",
+            what: "BLOOMERY_ROUTE_*",
             detail: "a tensor-parallel rank holds every expert on its card and routes through \
-                     no slot map; unset the dials"
+                     no slot map; unset the dials, the mask and the census"
                 .to_string(),
         });
     }
@@ -3232,10 +3233,43 @@ impl Body {
                 Body::load_placed(gpu, file, plan, on, meta, residency, residency_glue)
             },
         )?;
+        // The router levers, set before the first step so the capture holds their launches: the
+        // dials as the binary parsed them, the mask and census files from the environment.
+        let setup = RouteSetup::with_env_files(meta.levers.route)?;
+        if setup.any() {
+            let (gpu, w, body) = m.body_parts("deepseek41 Body::open_placed_slots")?;
+            body.set_route_dials((gpu, w, meta.hp.n_layer), &setup)?;
+        }
         if tiered && meta.levers.prefill == PrefillMode::Batch {
             prefill::prepare_prefill(&mut m)?;
         }
         Ok(m)
+    }
+
+    /// The router levers of the load (`BLOOMERY_ROUTE_RESIDENT_BONUS`, `BLOOMERY_ROUTE_TOPK`,
+    /// `BLOOMERY_ROUTE_MASK`, `BLOOMERY_ROUTE_CENSUS`) over a model of `n_layer` layers
+    /// ([`FfnPiece::set_route_dials`]), and the host tier's skip of the slots a cut leaves unrun
+    /// (`HostTier::set_route_cut`). Refused by name: a cut above `k`, the dials beside an expert
+    /// tier card (its images carry the slot weights the cut zeroes on the stage card only), and
+    /// what [`RouteSetup::check`] refuses. All unset leaves the load as it was. Load-time only.
+    pub fn set_route_dials(
+        &mut self,
+        (gpu, w, n_layer): (&Gpu, &Weights, usize),
+        setup: &RouteSetup,
+    ) -> Result<(), GpuError> {
+        let beside = Beside {
+            draft: false,
+            tier: self.tier.is_some(),
+            softmax: false,
+        };
+        let cut = self.ffn.set_route_dials((gpu, w, n_layer), setup, beside)?;
+        self.hybrid.set_route_cut(cut);
+        Ok(())
+    }
+
+    /// Write the routing census now; nothing with the census off.
+    pub fn flush_census(&self) -> Result<(), GpuError> {
+        self.ffn.flush_census()
     }
 
     /// V4.1 derives no new values at load: it moves the attention's Q3_K
@@ -3464,17 +3498,6 @@ impl Body {
         let mut hybrid = Hybrid::new(boundary, map, host, layers.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
         let tier = tiers(gpu, &mut hybrid)?;
-        // The router dials, resolved against what the load hangs beside the stage card.
-        let cut = ffn.set_route_dials(
-            gpu,
-            cfg.route,
-            Beside {
-                draft: false,
-                tier: tier.is_some(),
-                softmax: false,
-            },
-        )?;
-        hybrid.set_route_cut(cut);
         let ced = ced::Ced::new(&CedLayer::table(hp), seq.ring_rows(), cfg.ced);
 
         let mut body = Body {

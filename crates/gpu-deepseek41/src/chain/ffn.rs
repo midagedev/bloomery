@@ -92,7 +92,7 @@ use bloomery_gpu::kquant::act::Act;
 use bloomery_gpu::kquant::sel::SelDown;
 use bloomery_gpu::q4k_sel::QuantSel;
 use bloomery_gpu::quant_sel::QuantSelKernels;
-use bloomery_gpu::route_dial::{Beside, RouteDialKernels, RouteDials};
+use bloomery_gpu::route_dial::{Beside, MaskedBias, RouteCensus, RouteDialKernels, RouteSetup};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError, Q8Act, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -105,6 +105,7 @@ use model::moe::UNION_MAX_COLS;
 use model::placement::accepts::{self, LegArms, Program};
 use model::placement::{Role, tp};
 use runtime::combine::Slots;
+use runtime::routedial::MaskShape;
 
 use crate::chain::join::TRUNK;
 use crate::dense::{Dense, DenseKernels};
@@ -1238,7 +1239,7 @@ pub struct FfnPiece {
     dials: Option<DialState>,
 }
 
-/// A load's router dials, resolved ([`FfnPiece::set_route_dials`]).
+/// A load's router levers, resolved ([`FfnPiece::set_route_dials`]).
 struct DialState {
     kernels: RouteDialKernels,
     /// λ and the biased selection bias the router reads in place of the file's, one layer's at a
@@ -1246,6 +1247,11 @@ struct DialState {
     bonus: Option<(f32, DeviceBuffer<f32>)>,
     /// The first `cut` of the router's slots run; `None` the model's own count.
     cut: Option<usize>,
+    /// `BLOOMERY_ROUTE_MASK`'s buffers: a layer's file bias with its banned experts pushed down,
+    /// which the decode step's router and the prompt batch's both read in place of the file's.
+    masked: MaskedBias,
+    /// `BLOOMERY_ROUTE_CENSUS`'s counters.
+    census: Option<RouteCensus>,
 }
 
 impl FfnPiece {
@@ -1376,36 +1382,72 @@ impl FfnPiece {
         })
     }
 
-    /// The router dials of the decode step's front (`BLOOMERY_ROUTE_RESIDENT_BONUS`,
-    /// `BLOOMERY_ROUTE_TOPK`; [`RouteDials`]): the front's router reads a selection bias with
-    /// the bonus on the experts the layer's stage-card slot map holds, and a cut renormalizes
-    /// the router's first k' slots and weighs the rest 0. Refused by name above the model's `k`
-    /// and beside what `beside` says. Returns the cut as a slot count (`None`: the model's own
-    /// `k`), which the host tier needs as well (`HostTier::set_route_cut`). Dials all off leave
-    /// the piece as it was: no launch, the file's bias. Load-time only.
+    /// The router levers of the load (`BLOOMERY_ROUTE_RESIDENT_BONUS`, `BLOOMERY_ROUTE_TOPK`,
+    /// `BLOOMERY_ROUTE_MASK`, `BLOOMERY_ROUTE_CENSUS`; [`RouteSetup`]) over a model of `n_layer`
+    /// layers. The decode step's router reads a selection bias with the bonus on the experts the
+    /// layer's stage-card slot map holds, and a cut renormalizes the router's first k' slots and
+    /// weighs the rest 0. The mask is a bias buffer per masked layer (the file's plus
+    /// [`runtime::routedial::BAN`] on the banned experts) that the decode router and the prompt
+    /// batch's both read, and the base the bonus adds to; a media call's `exp_probs_b_vl` picks
+    /// are not masked. The census counts the picks of both. Refused by name above the model's `k`,
+    /// beside what `beside` says, and a mask line on a layer this piece does not route. Returns
+    /// the cut as a slot count (`None`: the model's own `k`), which the host tier needs as well
+    /// (`HostTier::set_route_cut`). All unset leaves the piece as it was: no launch, the file's
+    /// bias. Load-time only.
     pub fn set_route_dials(
         &mut self,
-        gpu: &Gpu,
-        dials: RouteDials,
+        (gpu, w, n_layer): (&Gpu, &Weights, usize),
+        setup: &RouteSetup,
         beside: Beside,
     ) -> Result<Option<usize>, GpuError> {
-        let cut = dials.check(N_USED, beside)?;
-        if dials.bonus().is_none() && cut.is_none() {
+        let cut = setup.check(N_USED, beside)?;
+        if !setup.any() {
             self.dials = None;
             return Ok(None);
         }
-        let bonus = dials
+        let shape = MaskShape {
+            n_layer,
+            n_expert: self.n_expert,
+            k: N_USED,
+        };
+        let mask = setup.read_mask(shape)?.unwrap_or_default();
+        mask.check_routed(|l| self.index_of(l).is_some())
+            .map_err(|e| GpuError::shape("route mask", e.to_string()))?;
+        let masked = MaskedBias::upload(gpu.stream(), &mask, n_layer, |l| {
+            let i = self.layer_index(l, ENQUEUE)?;
+            Ok(w.f32_buf(ENQUEUE, &self.cfg[i].bias)?
+                .to_host_vec(gpu.stream())?)
+        })?;
+        let bonus = setup
+            .dials
             .bonus()
             .map(|lambda| {
                 Ok::<_, GpuError>((lambda, DeviceBuffer::zeroed(gpu.stream(), self.n_expert)?))
+            })
+            .transpose()?;
+        let census = setup
+            .census
+            .clone()
+            .map(|path| {
+                RouteCensus::new(gpu.stream_handle(), path, (n_layer, self.n_expert, N_USED))
             })
             .transpose()?;
         self.dials = Some(DialState {
             kernels: RouteDialKernels::load(gpu.context())?,
             bonus,
             cut,
+            masked,
+            census,
         });
         Ok(cut)
+    }
+
+    /// Write the routing census now ([`RouteCensus::flush`]); nothing with the census off.
+    pub fn flush_census(&self) -> Result<(), GpuError> {
+        self.dials
+            .as_ref()
+            .and_then(|d| d.census.as_ref())
+            .map_or(Ok(()), RouteCensus::flush)
     }
 
     /// The activation forms the piece's layers read beside the f32 rows,
@@ -1458,7 +1500,9 @@ impl FfnPiece {
         self.cfg_of(layer).map(|c| {
             let base = if c.n_card > 0 { 10 } else { 7 };
             let dials = self.dials.as_ref().map_or(0, |d| {
-                usize::from(d.bonus.is_some()) + usize::from(d.cut.is_some())
+                usize::from(d.bonus.is_some())
+                    + usize::from(d.cut.is_some())
+                    + usize::from(d.census.is_some())
             });
             base + usize::from(c.sh_down_q8_1) + 2 * usize::from(c.sh_rows) + dials
         })
@@ -1471,11 +1515,11 @@ impl FfnPiece {
         self.rows.iter().map(FfnRow::device_bytes).sum::<usize>()
             + hc_pre_scratch_bytes(&self.hc_scratch)
             + self.routes.bytes()
-            + self
-                .dials
-                .as_ref()
-                .and_then(|d| d.bonus.as_ref())
-                .map_or(0, |(_, b)| b.num_bytes())
+            + self.dials.as_ref().map_or(0, |d| {
+                d.bonus.as_ref().map_or(0, |(_, b)| b.num_bytes())
+                    + d.masked.bytes()
+                    + d.census.as_ref().map_or(0, RouteCensus::bytes)
+            })
     }
 
     /// Device bytes of one row's buffers.
@@ -1881,24 +1925,33 @@ impl FfnPiece {
             hybrid.boundary_mut().normed_mut(),
             fault,
         )?;
-        // The dials' launches, when on: the layer's biased selection bias before the router and
-        // the cut of its weights after it. Off, the router reads the file's bias as it did.
+        // The levers' launches, when on: the layer's selection bias (the mask's buffer where the
+        // layer has banned experts, the file's otherwise) with the bonus on the stage card's
+        // experts before the router, the cut of its weights and the census add after it. All off,
+        // the router reads the file's bias as it did.
         let bias = match self.dials.as_mut() {
             Some(DialState {
                 kernels,
-                bonus: Some((lambda, scratch)),
+                bonus,
+                masked,
                 ..
             }) => {
-                let row_off = self.cfg[layer - self.layers.start].row_off;
-                kernels.enqueue_resident_bias(
-                    stream,
-                    (lw.bias, io.slots.buf(), row_off),
-                    *lambda,
-                    scratch,
-                )?;
-                &*scratch
+                let base = masked.get(layer).unwrap_or(lw.bias);
+                match bonus {
+                    Some((lambda, scratch)) => {
+                        let row_off = self.cfg[layer - self.layers.start].row_off;
+                        kernels.enqueue_resident_bias(
+                            stream,
+                            (base, io.slots.buf(), row_off),
+                            *lambda,
+                            scratch,
+                        )?;
+                        &*scratch
+                    }
+                    None => base,
+                }
             }
-            _ => lw.bias,
+            None => lw.bias,
         };
         self.router.enqueue_router(
             stream,
@@ -1909,14 +1962,33 @@ impl FfnPiece {
             &mut r.rout,
             fault,
         )?;
-        if let Some((d, cut)) = self.dials.as_ref().and_then(|d| d.cut.map(|cut| (d, cut))) {
-            d.kernels.enqueue_cut(
+        let live = match self.dials.as_ref().and_then(|d| d.cut.map(|cut| (d, cut))) {
+            Some((d, cut)) => {
+                d.kernels.enqueue_cut(
+                    stream,
+                    (&r.rout.ids, &r.rout.probs),
+                    (self.n_expert, N_USED, cut),
+                    (self.scale, false),
+                    None,
+                    fault,
+                    &mut r.rout.weights,
+                )?;
+                cut
+            }
+            None => N_USED,
+        };
+        if let Some(DialState {
+            kernels,
+            census: Some(c),
+            ..
+        }) = self.dials.as_mut()
+        {
+            c.enqueue(
+                kernels,
                 stream,
-                (&r.rout.ids, &r.rout.probs),
-                (self.n_expert, N_USED, cut),
-                (self.scale, false),
-                fault,
-                &mut r.rout.weights,
+                layer,
+                (&r.rout.ids, &r.rout.weights),
+                (0, 1, live),
             )?;
         }
         Ok(())

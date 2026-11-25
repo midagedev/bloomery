@@ -33,6 +33,9 @@ pub fn prompt(model: &mut GpuModel<Body>, tokens: &[u32]) -> Result<u32, GpuErro
     if tokens.is_empty() {
         return Err(GpuError::shape(CALL, "a prompt of no id"));
     }
+    // The census of every call before this one is on disk once it starts (a no-op with the
+    // census off).
+    model.body(CALL)?.flush_census()?;
     let from = model.pos();
     let to = u32::try_from(tokens.len())
         .ok()

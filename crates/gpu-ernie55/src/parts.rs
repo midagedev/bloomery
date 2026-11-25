@@ -11,6 +11,7 @@ use std::sync::Arc;
 use bloomery_gpu::arch::hybrid::GqaCx;
 use bloomery_gpu::flash_gqa::FlashGqaKernels;
 use bloomery_gpu::gemm::{Gemm32Kernels, GemmKernels};
+use bloomery_gpu::route_dial::RouteSetup;
 use bloomery_gpu::site::{ByName, KGemvKernels};
 use bloomery_gpu::vha::VhaKernels;
 use bloomery_gpu::weights::Weights;
@@ -679,11 +680,26 @@ impl RoutedFfn for Routed {
         cx: Cx<'_>,
         l: usize,
         x: &DeviceBuffer<f32>,
-        lat: &mut DeviceBuffer<f32>,
+        slots_lat: (Option<(&DeviceBuffer<u32>, usize)>, &mut DeviceBuffer<f32>),
     ) -> Result<(), GpuError> {
         let g = sites(cx, &self.k, (self.hidden, self.eps));
         self.moe
-            .enqueue_front((cx.gpu, cx.w, &g), &mut self.bufs, l, x, lat)
+            .enqueue_front((cx.gpu, cx.w, &g), &mut self.bufs, l, x, slots_lat)
+    }
+
+    fn set_route_dials(
+        &mut self,
+        gpu: &Gpu,
+        w: &Weights,
+        n_layer: usize,
+        setup: &RouteSetup,
+    ) -> Result<Option<usize>, GpuError> {
+        self.moe
+            .set_route_dials(&mut self.bufs, (gpu, w, n_layer), setup)
+    }
+
+    fn flush_census(&self) -> Result<(), GpuError> {
+        self.moe.flush_census(&self.bufs)
     }
 
     fn route(&self) -> (&DeviceBuffer<u32>, &DeviceBuffer<f32>) {
