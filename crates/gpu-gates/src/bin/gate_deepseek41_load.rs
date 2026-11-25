@@ -104,7 +104,7 @@ mod gate {
     use bloomery_gpu_deepseek41::body::{self, Body, Deepseek41Model, OpenCfg, StepInput};
     use bloomery_gpu_deepseek41::chain::attn::join_groups;
     use bloomery_gpu_deepseek41::params::{ImageView, Table};
-    use bloomery_gpu_deepseek41::rope::{Direction, RopeKernels, RopeSpec, RopeTable};
+    use bloomery_gpu_deepseek41::rope::{Direction, RopeSpec, RopeTable};
     use bloomery_gpu_gates::tier;
     use bloomery_gpu_gates::{
         Fnv1a64, GateError, bits_equal, bytes_to_words, checks_failed, prose_ids, verdict,
@@ -180,7 +180,8 @@ mod gate {
         let need = t.dense_bytes + t.expert_bytes + t.rounding_bytes + t.kv_bytes + t.scratch_bytes;
         // Both bundles JIT here, before the first reading: the module pool's
         // granule rounding then sits in `free0`, and no drop owes it (check v).
-        let _ds41_bundle = RopeKernels::load(probe.context())?;
+        // The router's kernels are this crate's own, so their load is its bundle's.
+        let _ds41_bundle = bloomery_gpu_deepseek41::router::RouterKernels::load(probe.context())?;
         let device = probe.context().ordinal();
         // The card's mapping granule, the one unit check (v)'s leftover is
         // counted in.

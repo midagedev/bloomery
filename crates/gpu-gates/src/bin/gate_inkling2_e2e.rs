@@ -34,7 +34,7 @@
 //! - `loop_proven`: set `a`'s logits with the messages off (`Body::set_messages`) differ from
 //!   those with them on: the message path is live.
 //! - `graph_nodes_are_the_walks`: the captured step holds the nodes the walk derives
-//!   ([`derived_nodes`], term by term from the body's launches).
+//!   ([`derived_nodes`], term by term from the body's launches), LoopCD-Hidden off and on.
 //! - `graph_is_eager`: set `a`'s prompt and [`GRAPH_STEPS`] greedy steps in graph mode (the chain
 //!   captured once and replayed at every position) give the eager chain's ids and last logits row
 //!   bit for bit.
@@ -61,6 +61,16 @@
 //!   the ids stepped from there: the verify's rows and the steps' are those of a run that only
 //!   stepped, bit for bit; the verify wrote its rows' end, so a rollback below the prompt's end
 //!   is refused and the model stands where it did.
+//! - `loopcd_extrapolates_the_boundary`: LoopCD-Hidden (`BLOOMERY_INK2_LOOPCD`,
+//!   `GpuModel::set_loopcd`) on set `a`, the on and the zero runs walking the off run's tokens. At
+//!   ω 0 after an on run, the ids and the logits rows are the unset run's bit for bit. At ω 0.2
+//!   with the reference pass 1, every visit's stages through the last core one are the off run's
+//!   bits, the stream entering the coda's first visit is
+//!   `h + ω (h − h_1)` (f64 over the run's own streams) within four f32 units of the last place
+//!   a value, and the logits differ from the off run's; a verify of 2 and of 8 rows under the rule
+//!   is its steps' bits; the prompt pass's logits move, and its rows through the boundary are the
+//!   off pass's bits. It prints, beside, the step's wall off and on: development numbers.
+//!   `graph_nodes_are_the_walks` derives the captured step's nodes with the rule off and on.
 //!
 //! Before the card loads, a set absent from the box, dumped from another file or build, or
 //! unfinished ends the gate by name. A step that raises the fault word ends the gate by name.
@@ -616,11 +626,14 @@ mod gate {
     /// mix's pair and adds two controller launch pairs. A pass edge copies the stream (pass 0) or
     /// the bank, its last row and the prelude back (a bank of no row copies nothing). The step
     /// opens with the embedding's lookup and norm and closes with the head's mix, norm,
-    /// projection, softcap, padded-column copy and argmax.
+    /// projection, softcap, padded-column copy and argmax. LoopCD-Hidden on, with the reference
+    /// pass `loopcd` (its index from 1): one copy more at that pass's edge and one launch before
+    /// the coda's first visit.
     pub(super) fn derived_nodes(
         hp: &Hparams,
         table: &[(u32, u32)],
         norm_proj: &[bool],
+        loopcd: Option<u32>,
     ) -> (usize, String) {
         const MIX: usize = 2;
         const VISIT: usize = 2 + 1 + 2 + 1 + 1 + 1 + 1 + MIX + 1 + 1 + 5 + 1 + 1;
@@ -629,7 +642,8 @@ mod gate {
         const HEAD: usize = MIX + 5;
         let core = hp.loop_.filter(|lp| lp.passes > 1);
         let block = hp.block;
-        let (mut visit, mut edges, mut pushed, mut prelude) = (0usize, 0usize, 0usize, 0usize);
+        let (mut visit, mut edges, mut pushed, mut prelude, mut boundary) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         for &(l, pass) in table {
             let l = l as usize;
             let windowed = hp.windowed[l];
@@ -641,9 +655,13 @@ mod gate {
                     prelude = pushed;
                     edges += 1;
                 } else {
-                    edges += 2 + usize::from(pushed > prelude + 1);
+                    edges +=
+                        2 + usize::from(pushed > prelude + 1) + usize::from(loopcd == Some(pass));
                     pushed = prelude;
                 }
+            }
+            if loopcd.is_some() && core.is_some_and(|lp| l == lp.core_end) {
+                boundary += 1;
             }
             let front = if norm_proj[l] {
                 1
@@ -655,24 +673,15 @@ mod gate {
                 pushed += 1;
             }
         }
-        let total = EMBED + visit + edges + HEAD;
+        let total = EMBED + visit + edges + boundary + HEAD;
         (
             total,
-            format!("embed={EMBED} visits={visit} edges={edges} head={HEAD}"),
+            format!("embed={EMBED} visits={visit} edges={edges} boundary={boundary} head={HEAD}"),
         )
     }
 
-    /// Clause `graph_nodes_are_the_walks`: the captured step's node count is [`derived_nodes`].
-    fn graph_nodes_are_the_walks(m: &mut GpuModel<Body>, hp: &Hparams) -> Result<bool, GateError> {
-        if !tier::run_clause("graph_nodes_are_the_walks", Tag::SelfConsistency)? {
-            return Ok(true);
-        }
-        let body = m.body(NAME)?;
-        let table = body.visit_table();
-        let norm_proj: Vec<bool> = (0..body.stored_layers())
-            .map(|l| body.norm_proj(l))
-            .collect();
-        let (want, terms) = derived_nodes(hp, &table, &norm_proj);
+    /// The nodes of the captured step by entry, with the step captured in graph mode after a reset.
+    fn captured_entries(m: &mut GpuModel<Body>) -> Result<(usize, String), GateError> {
         m.set_mode(StepMode::Graph);
         m.reset()?;
         let nodes = m.capture_step()?;
@@ -683,19 +692,44 @@ mod gate {
                 .map_or_else(|| format!("kind{}", n.kind), |k| k.name);
             *hist.entry(key).or_default() += 1;
         }
+        let entries = hist
+            .iter()
+            .map(|(k, n)| format!("{k}={n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok((nodes, entries))
+    }
+
+    /// Clause `graph_nodes_are_the_walks`: the captured step's node count is [`derived_nodes`],
+    /// LoopCD-Hidden off and on (on: the reference pass's copy and the boundary's launch alone).
+    fn graph_nodes_are_the_walks(m: &mut GpuModel<Body>, hp: &Hparams) -> Result<bool, GateError> {
+        if !tier::run_clause("graph_nodes_are_the_walks", Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let (table, norm_proj) = {
+            let body = m.body(NAME)?;
+            (
+                body.visit_table(),
+                (0..body.stored_layers())
+                    .map(|l| body.norm_proj(l))
+                    .collect::<Vec<bool>>(),
+            )
+        };
+        let (want, terms) = derived_nodes(hp, &table, &norm_proj, None);
+        let (nodes, entries) = captured_entries(m)?;
+        m.set_loopcd(LOOPCD_OMEGA, LOOPCD_REF)?;
+        let (want_on, terms_on) = derived_nodes(hp, &table, &norm_proj, Some(LOOPCD_REF));
+        let (nodes_on, entries_on) = captured_entries(m)?;
+        m.set_loopcd(0.0, LOOPCD_REF)?;
         m.set_mode(StepMode::Eager);
-        let pass = nodes == want;
+        let pass = nodes == want && nodes_on == want_on && nodes_on == nodes + 2;
         println!(
-            "graph_nodes_are_the_walks nodes={nodes} want={want} ({terms}) {}",
+            "graph_nodes_are_the_walks nodes={nodes} want={want} ({terms}) on_nodes={nodes_on} \
+             on_want={want_on} ({terms_on}) {}",
             verdict(pass)
         );
-        println!(
-            "  entries: {}",
-            hist.iter()
-                .map(|(k, n)| format!("{k}={n}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        println!("  entries: {entries}");
+        println!("  entries on: {entries_on}");
         Ok(pass)
     }
 
@@ -876,7 +910,8 @@ mod gate {
     ];
 
     /// The verify graph of `rows` rows' launch geometry: the controllers' and the mixes' entries
-    /// (the step's and the pass's rows forms) with their launches and the grids they launch at,
+    /// (the step's and the pass's rows forms) and the input norms' and projections' rows entry
+    /// with their launches and the grids they launch at,
     /// and whether the graph holds the step's pairs alone: none of [`PASS_ROWS_FORMS`], every
     /// pair's two launches there (a down for an out, a scores for an out), and a mix at least.
     fn verify_geometry(m: &GpuModel<Body>, rows: usize) -> Result<(Vec<String>, bool), GateError> {
@@ -892,7 +927,7 @@ mod gate {
                 return Err(format!("{NAME}: a verify of {rows} rows (2 to {VERIFY_ROWS})").into());
             }
         };
-        const ENTRIES: [&str; 9] = [
+        const ENTRIES: [&str; 10] = [
             "loop_control_down",
             "loop_control_out",
             "loop_control_out3",
@@ -902,6 +937,7 @@ mod gate {
             "attn_res_step_scores",
             "attn_res_step_out",
             "attn_res_mix_normed",
+            "norm_proj_q8_f32_cols",
         ];
         let mut hist =
             std::collections::BTreeMap::<&str, (usize, std::collections::BTreeSet<u32>)>::new();
@@ -1064,7 +1100,8 @@ mod gate {
             walls.join(" ")
         );
         println!(
-            "verify_geometry (launches x {{grids}} of the controllers' and the mixes' entries) {}",
+            "verify_geometry (launches x {{grids}} of the controllers', the mixes' and the \
+             projections' entries) {}",
             geometry.join(" | ")
         );
         Ok(pass)
@@ -1119,6 +1156,306 @@ mod gate {
              steps_are_the_fresh_run={replayed:?} {}",
             s.label,
             verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// LoopCD-Hidden's strength and reference pass the two clauses run the rule at.
+    const LOOPCD_OMEGA: f32 = 0.2;
+    const LOOPCD_REF: u32 = 1;
+    /// The graph steps after the prompt one look times, for the step's wall.
+    const LOOPCD_LOOK_STEPS: usize = 32;
+
+    /// One run of set `s` in graph mode under one LoopCD-Hidden setting: the prompt's last logits
+    /// row, the argmaxes and logits rows of the next [`GRAPH_STEPS`] positions, every visit's
+    /// tapped stages, the stream entering the coda's first visit (the draft taps'), and the mean
+    /// wall of [`LOOPCD_LOOK_STEPS`] graph steps after them, each with its argmax read back.
+    struct LoopcdRun {
+        logits: Vec<f32>,
+        ids: Vec<u32>,
+        rows: Vec<Vec<f32>>,
+        taps: Vec<f32>,
+        entering: Vec<f32>,
+        ms: f64,
+    }
+
+    /// [`LoopcdRun`] of set `s` from a reset: the prompt, [`GRAPH_STEPS`] greedy steps with their
+    /// rows, the taps, then [`LOOPCD_LOOK_STEPS`] steps timed. `forced` feeds each of those
+    /// positions its id there instead of the step's own argmax, so a run under another setting
+    /// walks the same tokens; it names one id a position, the prompt's argmax first.
+    fn loopcd_run(
+        m: &mut GpuModel<Body>,
+        s: &Set,
+        forced: Option<&[u32]>,
+    ) -> Result<LoopcdRun, GateError> {
+        let steps = GRAPH_STEPS + LOOPCD_LOOK_STEPS;
+        if forced.is_some_and(|f| f.len() < steps + 1) {
+            return Err(format!(
+                "{NAME}: a forced run of {steps} steps over {} ids",
+                forced.map_or(0, <[u32]>::len)
+            )
+            .into());
+        }
+        m.reset()?;
+        let mut ids = vec![m.step(&s.prompt)?];
+        let logits = m.logits()?;
+        let mut rows = Vec::new();
+        let next = |ids: &[u32]| forced.map_or(ids[ids.len() - 1], |f| f[ids.len() - 1]);
+        for _ in 0..GRAPH_STEPS {
+            ids.push(m.step(&[next(&ids)])?);
+            rows.push(m.logits()?);
+        }
+        let taps = {
+            let (gpu, _, body) = m.body_parts(NAME)?;
+            body.taps(gpu.stream())?
+        };
+        let entering = m.draft_taps()?;
+        let t = std::time::Instant::now();
+        for _ in 0..LOOPCD_LOOK_STEPS {
+            ids.push(m.step(&[next(&ids)])?);
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3 / LOOPCD_LOOK_STEPS as f64;
+        Ok(LoopcdRun {
+            logits,
+            ids,
+            rows,
+            taps,
+            entering,
+            ms,
+        })
+    }
+
+    /// The prompt as a pass: its last logits row and every visit's stages at the last row.
+    fn loopcd_pass(m: &mut GpuModel<Body>, s: &Set) -> Result<(Vec<f32>, Vec<f32>), GateError> {
+        m.reset()?;
+        m.prompt_pass(&s.prompt)?;
+        let logits = m.logits()?;
+        let (gpu, _, body) = m.body_parts(NAME)?;
+        Ok((logits, body.taps(gpu.stream())?))
+    }
+
+    /// Visit `v`'s output among its tapped stages (the last of [`TAP_STAGES`]): the last `n`
+    /// values of its block of `row` values.
+    fn visit_output(taps: &[f32], v: usize, (row, n): (usize, usize)) -> &[f32] {
+        &taps[v * row + row - n..v * row + row]
+    }
+
+    /// The first of the first `visits` visits' stages at which two tapped runs' values differ,
+    /// `None` when they are the same bits.
+    fn first_tap_gap(
+        a: &[f32],
+        b: &[f32],
+        widths: &[usize; TAP_STAGES.len()],
+        visits: usize,
+    ) -> Option<String> {
+        let row: usize = widths.iter().sum();
+        (0..visits).find_map(|v| {
+            let mut at = v * row;
+            widths.iter().zip(TAP_STAGES).find_map(|(&w, stage)| {
+                let differs = !bits_equal(&a[at..at + w], &b[at..at + w]);
+                at += w;
+                differs.then(|| format!("visit {v} stage {stage}"))
+            })
+        })
+    }
+
+    /// Clause `loopcd_extrapolates_the_boundary`: see the module header. Mutants: the boundary
+    /// step with its strength's sign flipped, the reference saved one pass later, the launch left
+    /// out: each is red at the stream entering the coda, the line naming the lever and the value.
+    fn loopcd_extrapolates_the_boundary(
+        m: &mut GpuModel<Body>,
+        hp: &Hparams,
+        s: &Set,
+    ) -> Result<bool, GateError> {
+        if !tier::run_clause("loopcd_extrapolates_the_boundary", Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let core = hp
+            .loop_
+            .filter(|lp| lp.passes > 1)
+            .ok_or("a looped trunk: LoopCD-Hidden has no boundary to hold")?;
+        let (n, widths) = (hp.n_embd, m.body(NAME)?.tap_widths());
+        let row: usize = widths.iter().sum();
+        let table = m.body(NAME)?.visit_table();
+        let coda = table
+            .iter()
+            .position(|&(l, _)| l as usize == core.core_end)
+            .ok_or("no visit past the core")?;
+        let last = coda
+            .checked_sub(1)
+            .ok_or("a coda with no core visit before it")?;
+        // The reference pass's last core visit: a coda visit carries pass 0 too, so the core's
+        // layers bound the search.
+        let h_b = table
+            .iter()
+            .rposition(|&(l, pass)| {
+                (core.core_start..core.core_end).contains(&(l as usize)) && pass == LOOPCD_REF - 1
+            })
+            .ok_or("no visit of the reference pass")?;
+        let (omega, reference) = (LOOPCD_OMEGA, LOOPCD_REF);
+        m.set_mode(StepMode::Graph);
+        m.set_loopcd(0.0, reference)?;
+        {
+            let (gpu, _, body) = m.body_parts(NAME)?;
+            body.arm_taps(gpu)?;
+        }
+        m.set_draft_taps(&[coda])?;
+        let off = loopcd_run(m, s, None)?;
+        m.set_loopcd(omega, reference)?;
+        let on = loopcd_run(m, s, Some(&off.ids))?;
+        m.set_loopcd(0.0, reference)?;
+        let zero = loopcd_run(m, s, Some(&off.ids))?;
+        // The rule touches the boundary alone: every stage of every visit through the last core
+        // one is the off run's bits.
+        let untouched = bits_equal(&on.taps[..(last + 1) * row], &off.taps[..(last + 1) * row]);
+        let gap = first_tap_gap(&on.taps, &off.taps, &widths, last + 1);
+        let zero_gap = first_tap_gap(&zero.taps, &off.taps, &widths, last + 1);
+        // The draft tap reads the stream entering the visit: off, the last core visit's output.
+        let read_ok = bits_equal(&off.entering, visit_output(&off.taps, last, (row, n)));
+        // [derived] the stream entering the coda is h + ω (h − h_b) in f64 over the run's own h
+        // and h_b, each within four f32 units of the last place (two roundings).
+        let (h_last, h_ref) = (
+            visit_output(&on.taps, last, (row, n)),
+            visit_output(&on.taps, h_b, (row, n)),
+        );
+        let omega64 = f64::from(omega);
+        let mut worst = (0.0f64, 0usize, 0.0f64, 0.0f64);
+        let mut miss: Option<String> = None;
+        for i in 0..n {
+            let (h, h_b, got) = (
+                f64::from(h_last[i]),
+                f64::from(h_ref[i]),
+                f64::from(on.entering[i]),
+            );
+            if !got.is_finite() {
+                miss = Some(format!(
+                    "BLOOMERY_INK2_LOOPCD={omega}: value {i} of the stream entering the coda is \
+                     not finite"
+                ));
+                break;
+            }
+            let want = h + omega64 * (h - h_b);
+            let err = (got - want).abs();
+            let tol = 4.0 * f64::from(f32::EPSILON) * (want.abs() + omega64 * (h - h_b).abs());
+            let ratio = if tol > 0.0 {
+                err / tol
+            } else if err > 0.0 {
+                f64::INFINITY
+            } else {
+                0.0
+            };
+            if ratio > worst.0 {
+                worst = (ratio, i, err, tol);
+            }
+            if ratio > 1.0 && miss.is_none() {
+                miss = Some(format!(
+                    "BLOOMERY_INK2_LOOPCD={omega} with BLOOMERY_INK2_LOOPCD_REF={reference}: value \
+                     {i} of the stream entering the coda is {err:.3e} from h + the strength times \
+                     (h − h_b), past {tol:.3e} (four units of the last place)"
+                ));
+            }
+        }
+        let rule_ok = miss.is_none();
+        let n_vocab = s.logits.len();
+        let moved = !bits_equal(&on.logits[..n_vocab], &off.logits[..n_vocab]);
+        let on_finite = on.logits.iter().all(|v| v.is_finite());
+        let zero_same = zero.ids == off.ids
+            && bits_equal(&zero.logits, &off.logits)
+            && zero.rows.len() == off.rows.len()
+            && zero
+                .rows
+                .iter()
+                .zip(&off.rows)
+                .all(|(a, b)| bits_equal(a, b));
+        // A verify runs with no taps armed: both sets come off; the visit taps return for the
+        // pass.
+        m.body_parts(NAME)?.2.disarm_taps();
+        m.set_draft_taps(&[])?;
+        // A verify of 2 and of 8 rows under the rule is its steps' bits.
+        m.set_loopcd(omega, reference)?;
+        let at = u32::try_from(s.prompt.len())?;
+        let ids: Vec<u32> = s
+            .greedy
+            .ids
+            .iter()
+            .cycle()
+            .copied()
+            .take(VERIFY_ROWS)
+            .collect();
+        let mut verify_same = true;
+        let mut verify_miss: Option<String> = None;
+        for rows in [2usize, VERIFY_ROWS] {
+            m.reset()?;
+            m.step(&s.prompt)?;
+            if rows == 2 {
+                m.capture_verify()?;
+            }
+            let mut steps = Vec::with_capacity(rows);
+            for &id in &ids[..rows] {
+                steps.push((m.step(&[id])?, m.logits()?));
+            }
+            m.rollback(at)?;
+            let v = verify(m, &ids, rows)?;
+            let same = rows_are_steps(&steps, &v) && m.pos() == at + u32::try_from(rows)?;
+            verify_same &= same;
+            if !same && verify_miss.is_none() {
+                verify_miss = Some(format!(
+                    "m={rows}: ids {:?} against the steps' {:?}, rows bit for bit {}",
+                    v.ids,
+                    steps.iter().map(|s| s.0).collect::<Vec<_>>(),
+                    rows_are_steps(&steps, &v)
+                ));
+            }
+        }
+        // The prompt pass under the rule: its rows through the last core visit are the off
+        // pass's bits, and its logits move.
+        {
+            let (gpu, _, body) = m.body_parts(NAME)?;
+            body.arm_taps(gpu)?;
+        }
+        let (pass_on, pass_taps_on) = loopcd_pass(m, s)?;
+        m.set_loopcd(0.0, reference)?;
+        let (pass_off, pass_taps_off) = loopcd_pass(m, s)?;
+        let pass_moved = !bits_equal(&pass_on[..n_vocab], &pass_off[..n_vocab]);
+        let pass_untouched = bits_equal(
+            &pass_taps_on[..(last + 1) * row],
+            &pass_taps_off[..(last + 1) * row],
+        );
+        m.set_mode(StepMode::Eager);
+        m.set_draft_taps(&[])?;
+        m.body_parts(NAME)?.2.disarm_taps();
+        let pass = untouched
+            && read_ok
+            && rule_ok
+            && moved
+            && on_finite
+            && zero_same
+            && verify_same
+            && pass_moved
+            && pass_untouched;
+        println!(
+            "loopcd_extrapolates_the_boundary set={} omega={omega} ref={reference} coda_visit={coda} \
+             h_b_visit={h_b} before_boundary_same_bits={untouched} entering_is_l_out={read_ok} \
+             boundary_worst_share={:.3} at value {} (err {:.3e}, 4 ulp {:.3e}) logits_moved={moved} \
+             logits_finite={on_finite} logits_rel_from_off={:.3e} zero_is_unset={zero_same} \
+             verify_is_m_steps={verify_same} pass_moved={pass_moved} \
+             pass_before_boundary_same_bits={pass_untouched} first_gap={gap:?} \
+             zero_first_gap={zero_gap:?} first_miss={miss:?} verify_miss={verify_miss:?} {}",
+            s.label,
+            worst.0,
+            worst.1,
+            worst.2,
+            worst.3,
+            rel(&on.logits[..n_vocab], &off.logits[..n_vocab]),
+            verdict(pass)
+        );
+        println!(
+            "loopcd_walls_ms (development: the mean of {LOOPCD_LOOK_STEPS} graph steps after {GRAPH_STEPS}, \
+             the argmax read back, depth {}) off={:.3} on={:.3} apart={:+.2} %",
+            s.prompt.len() + GRAPH_STEPS,
+            off.ms,
+            on.ms,
+            (on.ms / off.ms - 1.0) * 100.0
         );
         Ok(pass)
     }
@@ -1184,6 +1521,7 @@ mod gate {
         ok &= rollback_is_a_fresh_run(&mut m, &hp, longest)?;
         ok &= verify_is_m_steps(&mut m, &sets[0])?;
         ok &= verify_then_rollback(&mut m, longest)?;
+        ok &= loopcd_extrapolates_the_boundary(&mut m, &hp, &sets[0])?;
         println!("{}", tier::tally_line());
         if !ok {
             return Err(checks_failed());
@@ -1192,9 +1530,11 @@ mod gate {
             "PASSED: {NAME} tier {tier:?}: the visits of the loop; on every set the chain's \
              visits and logits within their bands (the fixture's with the vendor's picks, the \
              Mini's free), the teacher-forced argmax disagreements within the pin; the message \
-             path live; the captured step's nodes the walk's; the graph the eager chain; a \
-             rollback within the reach a fresh run; a verify of 2 to 8 rows the steps, and a \
-             rollback after one a fresh run"
+             path live; the captured step's nodes the walk's, LoopCD-Hidden off and on; the graph \
+             the eager chain; a rollback within the reach a fresh run; a verify of 2 to 8 rows \
+             the steps, and a rollback after one a fresh run; LoopCD-Hidden's stream entering the \
+             coda within ulps of the rule, zero the unset bits, live in a step, a verify and a \
+             prompt pass"
         );
         Ok(())
     }

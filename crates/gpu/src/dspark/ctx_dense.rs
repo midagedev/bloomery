@@ -30,13 +30,16 @@
 
 use crate::DeviceBufferRaw;
 use cuda_core::DeviceBuffer;
+use gguf::GgmlType;
+use model::ModelError;
+use model::arch::dspark::DraftHeld;
 use model::embed::EmbedTable;
 
 use super::block_attn::{
     AttnArgs, BlockAttn, GROUP, HEAD, PutArgs, ROWS, partials_ms_len, partials_v_len,
 };
-use super::dense::{Bf16Source, adjacent_pairs, widen};
-use super::{DraftLayers, Q8Rows};
+use super::dense::{Bf16Source, adjacent_pairs};
+use super::{DraftLayers, OwnHeld, Q8Rows};
 use crate::graph::capturing;
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::rope_table::{Direction, RopeSpec, RopeTable};
@@ -84,9 +87,104 @@ pub struct CtxDims {
 /// The block's anchor row from the target: its embedding table, its embedding norm's gain and
 /// epsilon.
 pub struct AnchorEmbed {
-    pub table: EmbedTable,
+    pub table: AnchorTable,
     pub gain: Vec<f32>,
     pub eps: f32,
+}
+
+/// The target's token embedding as the host reads a row of it by token: a GGUF file's table, or
+/// whole rows a checkpoint folder's part source read ([`HostRows`]).
+pub enum AnchorTable {
+    /// A GGUF file's table, read from the mapped file a row at a time.
+    File(EmbedTable),
+    /// Whole rows of one ggml type held on the host.
+    Rows(HostRows),
+}
+
+impl AnchorTable {
+    /// The table's rows.
+    #[must_use]
+    pub fn n_vocab(&self) -> usize {
+        match self {
+            AnchorTable::File(t) => t.n_vocab(),
+            AnchorTable::Rows(t) => t.n_vocab(),
+        }
+    }
+
+    /// Row `token` dequantized into `out`: refused by name for a token past the rows, and for a
+    /// row `out` does not hold.
+    fn row_into(&self, token: u32, out: &mut [f32]) -> Result<(), ModelError> {
+        match self {
+            AnchorTable::File(t) => t.row_into(token, out),
+            AnchorTable::Rows(t) => t.row_into(token, out),
+        }
+    }
+}
+
+/// Rows of one ggml type on the host, `n_embd` values a row in the type's own blocks.
+pub struct HostRows {
+    ty: GgmlType,
+    n_embd: usize,
+    row_bytes: usize,
+    bytes: Vec<u8>,
+}
+
+impl HostRows {
+    /// The rows of `ty`, each `n_embd` values. Refused by name for a row length the type sizes no
+    /// row for, and bytes that are not a whole number of rows.
+    pub fn new(ty: GgmlType, n_embd: usize, bytes: Vec<u8>) -> Result<HostRows, GpuError> {
+        let refuse = |detail: String| shape_err(format!("the anchor's {ty} rows: {detail}"));
+        let (Some(blck), Some(tsz)) = (ty.blck_size(), ty.type_size()) else {
+            return Err(refuse("a type that sizes no row".to_owned()));
+        };
+        if n_embd == 0 || !n_embd.is_multiple_of(blck as usize) {
+            return Err(refuse(format!("no row of {n_embd} values")));
+        }
+        let row_bytes = tsz as usize * (n_embd / blck as usize);
+        if !bytes.len().is_multiple_of(row_bytes) {
+            return Err(refuse(format!(
+                "{} bytes are not whole rows of {row_bytes}",
+                bytes.len()
+            )));
+        }
+        Ok(HostRows {
+            ty,
+            n_embd,
+            row_bytes,
+            bytes,
+        })
+    }
+
+    /// The table's rows.
+    #[must_use]
+    pub fn n_vocab(&self) -> usize {
+        self.bytes.len() / self.row_bytes
+    }
+
+    /// Row `token` dequantized into `out`: refused by name for a token past the rows, and for a
+    /// row `out` does not hold.
+    fn row_into(&self, token: u32, out: &mut [f32]) -> Result<(), ModelError> {
+        let t = token as usize;
+        let refuse = |detail: String| ModelError::EmbedRows {
+            tensor: "token_embd.weight (the anchor's rows)".to_owned(),
+            detail,
+        };
+        if t >= self.n_vocab() {
+            return Err(refuse(format!(
+                "token {token} is past the {} rows",
+                self.n_vocab()
+            )));
+        }
+        if out.len() != self.n_embd {
+            return Err(refuse(format!(
+                "fills {} values, out holds {}",
+                self.n_embd,
+                out.len()
+            )));
+        }
+        let row = &self.bytes[t * self.row_bytes..(t + 1) * self.row_bytes];
+        Ok(gguf::quant::dequant_row(self.ty, row, out)?)
+    }
 }
 
 /// One layer on the card.
@@ -197,20 +295,10 @@ fn layer_name(l: usize, tail: &str) -> String {
     format!("layers.{l}.{tail}")
 }
 
-/// Tensor `name` of `src` as bits of shape `want`, refused by name otherwise.
-fn tensor<'a>(src: &'a dyn Bf16Source, name: &str, want: &[usize]) -> Result<&'a [u16], GpuError> {
-    let (bits, shape) = src.bf16(name)?;
-    if shape != want {
-        return Err(shape_err(format!(
-            "{name} is {shape:?}; the layers read {want:?}"
-        )));
-    }
-    Ok(bits)
-}
-
 impl CtxDenseLayers {
-    /// The layers of `src` (the draft's BF16 tensors, each matrix quantized to Q8_0 on the host)
-    /// under `spec`, the anchor's rows from `anchor`. A width the attention has no entry for (a head
+    /// The layers of `src` (each matrix as Q8_0 rows on the card, [`Bf16Source::q8_rows`]: a
+    /// safetensors draft's BF16 quantized on the host, a GGUF draft's Q8_0 blocks unchanged) under
+    /// `spec`, the anchor's rows from `anchor`. A width the attention has no entry for (a head
     /// of other than [`HEAD`] values, a group of other than [`GROUP`]) is refused by name, as a
     /// missing tensor or one of another shape. Load-time only.
     pub fn load(
@@ -227,11 +315,13 @@ impl CtxDenseLayers {
                 spec.ctx
             )));
         }
-        let (_, q_shape) = src.bf16(&layer_name(0, "self_attn.q_proj.weight"))?;
-        let (_, k_shape) = src.bf16(&layer_name(0, "self_attn.k_proj.weight"))?;
-        let (_, n_shape) = src.bf16(&layer_name(0, "self_attn.q_norm.weight"))?;
-        let (_, g_shape) = src.bf16(&layer_name(0, "mlp.gate_proj.weight"))?;
-        let (&[qr, h], &[kr, _], &[hd], &[inter, _]) = (q_shape, k_shape, n_shape, g_shape) else {
+        let q_shape = src.shape(&layer_name(0, "self_attn.q_proj.weight"))?;
+        let k_shape = src.shape(&layer_name(0, "self_attn.k_proj.weight"))?;
+        let n_shape = src.shape(&layer_name(0, "self_attn.q_norm.weight"))?;
+        let g_shape = src.shape(&layer_name(0, "mlp.gate_proj.weight"))?;
+        let (&[qr, h], &[kr, _], &[hd], &[inter, _]) =
+            (&q_shape[..], &k_shape[..], &n_shape[..], &g_shape[..])
+        else {
             return Err(shape_err(format!(
                 "layer 0's q {q_shape:?}, k {k_shape:?}, q_norm {n_shape:?}, gate {g_shape:?}"
             )));
@@ -265,15 +355,14 @@ impl CtxDenseLayers {
         // pair's NEOX index (module doc).
         let permuted = move |r: usize| (r / hd) * hd + adjacent_pairs(hd, r % hd);
         let q8 = |name: &str, rows: usize, k: usize, perm: bool| -> Result<Q8Rows, GpuError> {
-            let bits = tensor(src, name, &[rows, k])?;
             if perm {
-                Q8Rows::from_bf16(gpu, bits, rows, k, &permuted)
+                src.q8_rows(gpu, name, rows, k, &permuted)
             } else {
-                Q8Rows::from_bf16(gpu, bits, rows, k, &|r| r)
+                src.q8_rows(gpu, name, rows, k, &|r| r)
             }
         };
         let gain = |name: &str, n: usize, perm: bool| -> Result<DeviceBuffer<f32>, GpuError> {
-            let v = widen(tensor(src, name, &[n])?);
+            let v = src.f32s(name, &[n])?;
             if perm {
                 let p: Vec<f32> = (0..n).map(|j| v[adjacent_pairs(n, j)]).collect();
                 up_f32(gpu, &p)
@@ -311,7 +400,7 @@ impl CtxDenseLayers {
                 vc: DeviceBuffer::zeroed(stream, plane)?,
             });
         }
-        let mask = widen(tensor(src, "mask_embed", &[h])?);
+        let mask = src.f32s("mask_embed", &[h])?;
         let mut rows = vec![0.0f32; BLOCK * h];
         for r in rows.chunks_exact_mut(h).skip(1) {
             r.copy_from_slice(&mask);
@@ -719,5 +808,51 @@ impl DraftLayers for CtxDenseLayers {
         .sum::<u64>()
             + s.words.num_bytes() as u64;
         weights + planes + scratch
+    }
+}
+
+impl CtxDenseLayers {
+    /// The buffers the load allocated, counted from the buffers themselves: each layer's weights
+    /// and the owner's (`own`, [`DsparkBody::own_held`]), the context planes, and every working
+    /// buffer. The captured graphs are not buffers.
+    #[must_use]
+    pub fn held(&self, own: &OwnHeld) -> DraftHeld {
+        let f = |b: &DeviceBuffer<f32>| b.num_bytes() as u64;
+        let mut weights = Vec::new();
+        for l in &self.layers {
+            for q in [
+                &l.q, &l.k, &l.v, &l.k_ctx, &l.v_ctx, &l.o, &l.gate, &l.up, &l.down,
+            ] {
+                weights.push(q.qs.buf().num_bytes() as u64);
+                weights.push(q.d.buf().num_bytes() as u64);
+            }
+            weights.extend(
+                [&l.ln_in, &l.ln_post, &l.q_norm, &l.k_norm, &l.k_norm_ctx]
+                    .into_iter()
+                    .map(f),
+            );
+        }
+        weights.extend(own.weights.iter().copied().filter(|&n| n > 0));
+        let rings: Vec<u64> = self
+            .layers
+            .iter()
+            .flat_map(|l| [l.kc.num_bytes() as u64, l.vc.num_bytes() as u64])
+            .collect();
+        let s = &self.s;
+        let working = [
+            &s.xn, &s.q, &s.qn, &s.qr, &s.k, &s.kn, &s.kr, &s.v, &s.attn, &s.o, &s.x1, &s.xn2,
+            &s.g, &s.u, &s.act, &s.dn, &s.part_v, &s.part_ms, &s.ck, &s.ckn, &s.ckr, &s.cv,
+            &s.blk_cs, &s.ctx_cs, &s.rows,
+        ]
+        .into_iter()
+        .map(f)
+        .sum::<u64>()
+            + s.words.num_bytes() as u64
+            + own.working;
+        DraftHeld {
+            weights,
+            rings,
+            working,
+        }
     }
 }

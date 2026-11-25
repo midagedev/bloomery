@@ -2446,6 +2446,7 @@ mod tests {
                         devices: vec![remote],
                         host_room: (u64::MAX, workstation::HostRead::Given),
                         arena_given: None,
+                        file: true,
                     }
                     .write(&mut payload);
                     stream.write_all(

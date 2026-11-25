@@ -90,6 +90,7 @@ fn sample(kind: Kind) -> String {
         Kind::Words(words) => words[0].into(),
         Kind::Count { min, .. } | Kind::CountOr { min, .. } => min.to_string(),
         Kind::Multiple { of } => of.to_string(),
+        Kind::Decimal { places, min, .. } => decimal_spelled(min, places),
         Kind::Bytes => "38G".into(),
         Kind::CardBytes => "CUDA0=38G,cuda1=20G".into(),
         Kind::Path => "/data/set".into(),
@@ -168,6 +169,25 @@ fn garbage(kind: Kind) -> Vec<String> {
             format!("0{of}"),
             format!("-{of}"),
         ]),
+        Kind::Decimal { places, min, max } => {
+            // A sign, padding spellings, a word, a point with nothing or too much past it, and
+            // the range's neighbours.
+            g.extend(
+                [
+                    "-1", "+1", "01", ".5", "1.", "1..5", "0,5", "two", "0x5", "1e0",
+                ]
+                .map(String::from),
+            );
+            if places > 0 {
+                g.push(format!("1.{}1", "0".repeat(places as usize)));
+                g.push(decimal_spelled(max + 1, places));
+            } else {
+                g.push("1.0".to_string());
+            }
+            if min > 0 {
+                g.push(decimal_spelled(min - 1, places));
+            }
+        }
         Kind::Bytes => {
             g.extend(["38g", "38 G", "-1", "38GB", "1.5G", "G", "17179869184G"].map(String::from))
         }
@@ -539,6 +559,8 @@ fn accessors_read_their_rows() {
     assert!(!unset.prepare_q8());
     assert!(unset.autotune());
     assert!(!unset.replay_poison());
+    assert_eq!(unset.ink2_loopcd(), None);
+    assert_eq!(unset.ink2_loopcd_ref(), 1);
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -591,6 +613,8 @@ fn accessors_read_their_rows() {
             (PREPARE_Q8, "1"),
             (AUTOTUNE, "off"),
             (REPLAY_POISON, "1"),
+            (INK2_LOOPCD, "0.2"),
+            (INK2_LOOPCD_REF, "2"),
         ]),
         Scope::Every,
     )
@@ -649,6 +673,8 @@ fn accessors_read_their_rows() {
     assert!(set.prepare_q8());
     assert!(!set.autotune());
     assert!(set.replay_poison());
+    assert_eq!(set.ink2_loopcd().map(f32::to_bits), Some(0.2f32.to_bits()));
+    assert_eq!(set.ink2_loopcd_ref(), 2);
     assert_eq!(
         set.host(),
         HostCfg {
@@ -718,6 +744,8 @@ fn accessors_read_their_rows() {
             AUTOTUNE,
             INK2_DENSE,
             INK2_PASSES,
+            INK2_LOOPCD,
+            INK2_LOOPCD_REF,
             REPLAY_POISON
         ]
     );
@@ -764,6 +792,118 @@ fn ink2_passes_takes_one_to_five_and_refuses_the_rest() {
         };
         assert!(e.to_string().contains(INK2_PASSES), "{e}");
     }
+}
+
+/// `BLOOMERY_INK2_LOOPCD` is off unset and at 0 in each spelling it takes; a decimal of at most
+/// three places from 0 to 2 reads as the `f32` nearest that decimal (the literal's own bits); a
+/// sign, a leading zero, a bare point, a fourth place, a value past 2 and a word are refused by
+/// name with what the row takes.
+#[test]
+fn ink2_loopcd_takes_zero_to_two_and_refuses_the_rest() {
+    let omega = |pairs: &[(&str, &str)]| {
+        read(&env(pairs), Scope::Every).map(|l| l.ink2_loopcd().map(f32::to_bits))
+    };
+    assert_eq!(omega(&[]).unwrap(), None);
+    for zero in ["0", "0.0", "0.000"] {
+        assert_eq!(omega(&[(INK2_LOOPCD, zero)]).unwrap(), None, "{zero}");
+    }
+    for (word, want) in [
+        ("0.001", 0.001f32),
+        ("0.1", 0.1f32),
+        ("0.2", 0.2f32),
+        ("0.25", 0.25f32),
+        ("1", 1.0f32),
+        ("1.5", 1.5f32),
+        ("2", 2.0f32),
+        ("2.000", 2.0f32),
+    ] {
+        assert_eq!(
+            omega(&[(INK2_LOOPCD, word)]).unwrap(),
+            Some(want.to_bits()),
+            "{word}"
+        );
+    }
+    for bad in [
+        "", "-0.2", "+0.2", ".2", "0.", "00.2", "0.2000", "2.001", "3", "two", "0x2", " 0.2",
+    ] {
+        let Err(e) = omega(&[(INK2_LOOPCD, bad)]) else {
+            panic!("{bad:?} is no strength the row takes and must be refused");
+        };
+        let text = e.to_string();
+        assert!(
+            text.contains(INK2_LOOPCD)
+                && text
+                    .contains("a decimal number of at most 3 digits past the point, from 0 to 2"),
+            "{text}"
+        );
+    }
+}
+
+/// `BLOOMERY_INK2_LOOPCD_REF` is 1 unset, takes the passes 1 and 2, and refuses any other count by
+/// name.
+#[test]
+fn ink2_loopcd_ref_takes_one_or_two() {
+    let reference =
+        |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.ink2_loopcd_ref());
+    assert_eq!(reference(&[]).unwrap(), 1);
+    for n in [1, 2] {
+        let word = n.to_string();
+        assert_eq!(reference(&[(INK2_LOOPCD_REF, word.as_str())]).unwrap(), n);
+    }
+    for bad in ["0", "3", "-1", "two", ""] {
+        let Err(e) = reference(&[(INK2_LOOPCD_REF, bad)]) else {
+            panic!("{bad:?} is not a pass the row takes and must be refused");
+        };
+        assert!(e.to_string().contains(INK2_LOOPCD_REF), "{e}");
+    }
+}
+
+/// The two LoopCD rows are Runtime: a loaded Inkling 2 body changes them between calls through
+/// `set_loopcd`, the function `arch/inkling2/body.rs` defines (the lever check reads the same two
+/// words off the row), and the `--levers` table and the Markdown table say so.
+#[test]
+fn the_loopcd_rows_change_between_calls_through_one_setter() {
+    for name in [INK2_LOOPCD, INK2_LOOPCD_REF] {
+        let row = spec(name).expect("a row of the registry");
+        let Site::Parsed {
+            phase: Phase::Runtime { setter },
+            left,
+        } = row.site
+        else {
+            panic!("{name} is not a Parsed row of the Runtime phase");
+        };
+        assert!(left.is_empty(), "{name}");
+        assert_eq!(
+            (setter.file, setter.item),
+            ("crates/gpu/src/arch/inkling2/body.rs", "set_loopcd"),
+            "{name}"
+        );
+    }
+    let table = reading(&env(&[(INK2_LOOPCD, "0.2")]), Scope::Every).table();
+    for name in [INK2_LOOPCD, INK2_LOOPCD_REF] {
+        let line = table
+            .lines()
+            .find(|l| l.starts_with(name))
+            .unwrap_or_else(|| panic!("no line for {name}"));
+        assert!(
+            line.contains(" runtime ")
+                && line.contains(
+                    "between calls through set_loopcd in crates/gpu/src/arch/inkling2/body.rs"
+                ),
+            "{line}"
+        );
+    }
+    let md = markdown();
+    let line = md
+        .lines()
+        .find(|l| l.starts_with(&format!("| `{INK2_LOOPCD}` |")))
+        .expect("a Markdown line for the strength");
+    assert!(
+        line.contains(
+            "| A arm | a decimal number of at most 3 digits past the point, from 0 to 2 "
+        ),
+        "{line}"
+    );
 }
 
 /// `BLOOMERY_REPLAY_POISON` is off unset, `1` turns a capture gate's replay-poison clause on, `0`

@@ -34,3 +34,4 @@ llama	(?-i:\bLlama\b|\bllama\b(?![.-]| flags?\b| reads\b)|gate_llama_)	-	2026-10
 nanbeige43	nanbeige	-	2026-10-26
 hy4	hy4|hy[_-]v4	-	2026-11-18
 inkling2	inkling2	-	2026-11-21
+ernie55	ernie	-	2026-11-24

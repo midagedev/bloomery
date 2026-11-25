@@ -34,7 +34,7 @@ pub mod dsml;
 pub mod embed;
 pub mod embed_cache;
 pub mod engine;
-pub mod ernie55;
+pub mod ernie;
 pub mod erniexml;
 pub mod event;
 pub mod exit;

@@ -31,6 +31,16 @@
 //!   nodes per layer and the fault copy; each chain fed and captured once and replayed by
 //!   every later pass. Precondition: node 1 holds the tier's experts and
 //!   every tier layer was sent a routed slot.
+//! - Fed bits: node 1 started with no model file (no `-m`, no
+//!   `$BLOOMERY_REF_MODEL`) says so in its census, and node 0 feeds it its
+//!   tier's rows from its own file over the channel at open
+//!   (`bloomery_gpu::host::node::load`); node 0's history over that tier is
+//!   the one-process history bit for bit, as the node with a file's is. Node 1
+//!   prints its fed open, and exits 0 once node 0 closes the load. Under
+//!   `--host` the plan's paged tier is refused by name on a node with no file.
+//! - Fed loss: node 1 killed once it prints its fed open, node 0's load fails
+//!   naming the load request; node 0 killed there, node 1 exits within
+//!   [`LOST_BOUND_S`] naming the loss while node 0 fed the tier's rows.
 //! - Lost node 1: node 1 killed after the history, node 0's next step fails
 //!   within the go deadline and its grace naming the node and the lost card,
 //!   the host tier is poisoned as a lost card, and the next step and a reset
@@ -1378,6 +1388,114 @@ mod gate {
         }
     }
 
+    /// Node 1 with no model file: a [`node1`] whose command names none and
+    /// whose environment holds no `$BLOOMERY_REF_MODEL`.
+    fn fileless_node1(c: &Common) -> Result<(Proc, SocketAddr), GateError> {
+        let mut cmd = node1_command(None, c.node_host.then_some(GATE_HOST_ROOM))?;
+        cmd.env_remove(gguf::v41::REF_ENV);
+        tier_server(cmd, "node 1 (no file)")
+    }
+
+    /// The fed bits clause (module header): node 0's history over the tier of
+    /// a node with no model file, against `want`, the one-process history;
+    /// under `--host`, the paged tier's refusal by name.
+    fn fed_history(c: &Common, gib: u64, want: &Run) -> Result<bool, GateError> {
+        let (mut n1, addr) = fileless_node1(c)?;
+        let out = std::env::temp_dir().join(format!("{NAME}-{}-fed.run", std::process::id()));
+        let args = [
+            "--history".to_string(),
+            gib.to_string(),
+            out.display().to_string(),
+        ];
+        let mut n0 = node0(&args, addr, c.node_host)?;
+        let status = n0
+            .wait_within(Duration::from_secs(1800))?
+            .ok_or("node 0 over the fed node did not end within 1800 s")?;
+        if c.node_host {
+            let refused = !status.success() && n0.stderr().contains("a paged tier reads");
+            println!(
+                "fed: node 0's paged tier on a node with no file ended {status}, refused by name: {}",
+                verdict(refused)
+            );
+            drop(n1.kill());
+            return Ok(refused);
+        }
+        let fed = n1.wait_line("fed open: ", Duration::from_secs(5)).is_ok();
+        println!(
+            "fed: node 1 printed its fed open: {}; node 0 ended {status}",
+            verdict(fed)
+        );
+        let mut ok = fed && status.success();
+        if !status.success() {
+            println!("node 0 stderr: {}", n0.stderr());
+        }
+        match read_run(&out) {
+            Ok(got) => ok &= same("node 0 and the fed node 1", want, &got),
+            Err(e) => {
+                println!("FAIL node 0 and the fed node 1: no run read back: {e}");
+                ok = false;
+            }
+        }
+        remove_run(&out).map_err(|e| format!("remove {}: {e}", out.display()))?;
+        let ended = n1.wait_within(Duration::from_secs_f64(LOST_BOUND_S))?;
+        let clean = ended.is_some_and(|s| s.success());
+        println!(
+            "fed: node 1 ended {ended:?} once node 0 closed the load: {}",
+            verdict(clean)
+        );
+        Ok(ok && clean)
+    }
+
+    /// The fed loss clause (module header): node 1 killed while node 0 feeds
+    /// it, then node 0 killed there.
+    fn fed_lost(c: &Common, gib: u64) -> Result<bool, GateError> {
+        if c.node_host {
+            println!("fed loss: a paged tier is not fed (the fed bits clause holds its refusal)");
+            return Ok(true);
+        }
+        let out = std::env::temp_dir().join(format!("{NAME}-{}-fedlost.run", std::process::id()));
+        let args = [
+            "--history".to_string(),
+            gib.to_string(),
+            out.display().to_string(),
+        ];
+        let bound = Duration::from_secs_f64(LOST_BOUND_S);
+
+        let (mut n1, addr) = fileless_node1(c)?;
+        let mut n0 = node0(&args, addr, c.node_host)?;
+        n1.wait_line("fed open: ", Duration::from_secs(600))?;
+        n1.kill()?;
+        let status = n0.wait_within(bound + Duration::from_secs(60))?;
+        let err = n0.stderr();
+        let node1_lost = status.is_some_and(|s| !s.success()) && err.contains("the load request");
+        println!(
+            "fed loss: node 1 killed mid-feed, node 0 ended {status:?} naming the load request: {}",
+            verdict(node1_lost)
+        );
+        if !node1_lost {
+            println!("node 0 stderr: {err}");
+        }
+
+        let (mut n1, addr) = fileless_node1(c)?;
+        let mut n0 = node0(&args, addr, c.node_host)?;
+        n1.wait_line("fed open: ", Duration::from_secs(600))?;
+        n0.kill()?;
+        let status = n1.wait_within(bound)?;
+        let err = n1.stderr();
+        let node0_lost =
+            status.is_some_and(|s| !s.success()) && err.contains("while it fed the tier's rows");
+        println!(
+            "fed loss: node 0 killed mid-feed, node 1 ended {status:?} within {LOST_BOUND_S} s \
+             naming the feed: {}",
+            verdict(node0_lost)
+        );
+        if !node0_lost {
+            println!("node 1 stderr: {err}");
+        }
+        drop(remove_run(&out));
+        Ok(node1_lost && node0_lost)
+    }
+
     fn gate(c: &Common) -> Result<(), GateError> {
         let mut pass = true;
         tier::sc("census: node 1's census over the channel is the plan's tier card")?;
@@ -1437,6 +1555,11 @@ mod gate {
         remove_run(&out).map_err(|e| format!("remove {}: {e}", out.display()))?;
         let killed = n1.wait_within(Duration::from_secs(60))?;
         println!("node 1 ended {killed:?} (killed by node 0's lost node clause)");
+
+        tier::sc("fed bits: node 1 with no model file, fed its rows by node 0 = one process")?;
+        pass &= fed_history(c, gib, &want)?;
+        tier::sc("fed loss: either node lost while node 0 feeds the rows ends the other by name")?;
+        pass &= fed_lost(c, gib)?;
 
         tier::sc("stopped node 1: node 0's step fails; continued, node 1 ends")?;
         pass &= stopped_node1(gib, c.node_host)?;

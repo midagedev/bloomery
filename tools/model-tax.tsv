@@ -35,8 +35,8 @@ crates/gpu-gates/src/bin/forced_probe.rs	deepseek	4	baseline T 4: case-table row
 crates/gpu-gates/src/bin/gate_bf16.rs	qwen	6	PIN(2026-10-20) qwen: the embedding lookup it checks (embed_rows_bf16 beside embed_rows_q8_0) is a kernel of bloomery_gpu::q38, the module named after its first model; the lookup would sit in a module named for what it does
 crates/gpu-gates/src/bin/gate_block.rs	deepseek	1	baseline T 1: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_dspark_experts.rs	deepseek	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
-crates/gpu-gates/src/bin/gate_dspark_graph.rs	deepseek	10	baseline T 10: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
-crates/gpu-gates/src/bin/gate_dspark_hc.rs	deepseek	5	baseline T 6: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_dspark_graph.rs	deepseek	9	baseline T 10: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
+crates/gpu-gates/src/bin/gate_dspark_hc.rs	deepseek	3	baseline T 6: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_dspark_kv.rs	deepseek	6	baseline T 6: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_e2e.rs	deepseek	5	baseline T 5: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
 crates/gpu-gates/src/bin/gate_e2e.rs	qwen	2	baseline T 2: case-table rows, the gate's model shapes (quantdesign owns gate_iq_sel, gate_gemm, gate_kquant)
@@ -76,6 +76,7 @@ crates/gpu-gates/src/bin/shared/dense_e2e.rs	qwen	15	PIN(2026-10-26) qwen: the d
 crates/gpu-gates/src/bin/shared/emb2_image.rs	gemma	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/route_trace38.rs	qwen	3	baseline O 3: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu-gates/src/bin/shared/routed_legs.rs	deepseek	8	baseline P 9: MK2 program by body
+crates/gpu-gates/src/bin/shared/routed_legs.rs	ernie55	2	PIN(2026-11-25) ernie55: the family's two arms of the routed-leg program and seat-name tables (no program, no seat word); the arms are the program-keyed rule's, filled by ModelSpec when it carries the registry
 crates/gpu-gates/src/bin/shared/routed_legs.rs	flint	2	PIN(2026-10-25) flint: family_of and skip_of match every models::Arch exhaustively; no common routed-legs adapter is registered, and the full-file body transitions have their own owning gate
 crates/gpu-gates/src/bin/shared/routed_legs.rs	gemma	4	baseline P 5: MK2 program by body
 crates/gpu-gates/src/bin/shared/routed_legs.rs	glm	7	baseline P 8: MK2 program by body
@@ -120,8 +121,14 @@ crates/gpu-gates/src/vision_seat.rs	qwen	7	baseline D 7: media design: VideoRule
 crates/gpu-vision/src/encoder.rs	deepseek	2	baseline D 2: media design: VideoRule data per tower (vidcore)
 crates/gpu/src/arch/hybrid.rs	nemotron	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/gpu/src/card_slots.rs	deepseek	32	PIN(2026-11-05) deepseek: baseline K 20 + 4 + 8, the four-slot entry `ds41_ffn_card_acc_4` (MiniMax-M3 routes 4 a token) and the two- and sixteen-slot entries `ds41_ffn_card_acc_2` and `ds41_ffn_card_acc_16` (Kimi K3's 8-expert fixture routes 2, its 896-expert layers 16): one more copy of the per-count entry each, since a `#[kernel]` entry cannot be generic over the slot count; the deferred rename of the entries by what they compute absorbs them
+crates/gpu/src/compress.rs	deepseek	6	PIN(2026-11-25) deepseek: the V4.1 kernel module the ERNIE 5.5 trunk shares: its entries keep the first model's names (ds41_*, pinned by name in tools/ref/ptx-shapes.tsv) and its docs name the plan owner; a rename moves the pinned entries
 crates/gpu/src/dspark/head.rs	deepseek	3	baseline K 3: rename the kernel entries by what they compute (deferred)
+crates/gpu/src/hc.rs	deepseek	15	PIN(2026-11-25) deepseek: the V4.1 kernel module the ERNIE 5.5 trunk shares: its entries keep the first model's names (ds41_*, pinned by name in tools/ref/ptx-shapes.tsv) and its docs name the plan owner; a rename moves the pinned entries
+crates/gpu/src/hc_f32.rs	deepseek	3	PIN(2026-11-25) deepseek: the V4.1 kernel module the ERNIE 5.5 trunk shares: its entries keep the first model's names (ds41_*, pinned by name in tools/ref/ptx-shapes.tsv) and its docs name the plan owner; a rename moves the pinned entries
+crates/gpu/src/hca.rs	deepseek	21	PIN(2026-11-25) deepseek: the V4.1 kernel module the ERNIE 5.5 trunk shares: its entries keep the first model's names (ds41_*, pinned by name in tools/ref/ptx-shapes.tsv) and its docs name the plan owner; a rename moves the pinned entries
 crates/gpu/src/host/handoff.rs	deepseek	37	PIN(2026-10-26) deepseek: the tier launcher uses a common F32 error context instead of selecting a family-named label per slot count; existing kernel entry symbols remain ABI-stable
+crates/gpu/src/rope_tail.rs	deepseek	6	PIN(2026-11-25) deepseek: the V4.1 kernel module the ERNIE 5.5 trunk shares: its entries keep the first model's names (ds41_*, pinned by name in tools/ref/ptx-shapes.tsv) and its docs name the plan owner; a rename moves the pinned entries
+crates/hf/src/vocab.rs	ernie55	3	PIN(2026-11-25) ernie55: the ernie5 pre-tokenizer's name in the pre-tokenizer table, its bare-BOS row and the tokenizer class the folder names; tokenizer programs are not yet described by ModelSpec
 crates/hf/src/vocab.rs	qwen	7	PIN(2026-10-28) qwen: the qwen35 tokenizer pipeline name and regex (4), and the qwen2 pre-tokenizer's regex macro, name and row (+3, Qwen3-30B-A3B's HF reading; the shape of minimax-m2's row); tokenizer programs are not yet described by ModelSpec
 crates/metal/src/bin/bloomery_serve_metal.rs	qwen	3	PIN(2026-11-06) qwen: Metal arch dispatch by program: the Metal bins open the one Metal architecture's session and its plan (the room rule for --ctx) by name until crates/metal/src/arch picks a session by the file's architecture string; PIN(2026-11-23) the third line is the Inkling 2 arm's refusal that names the Qwen folders it is not
 crates/metal/src/bin/gate_metal_device/mac.rs	qwen	2	PIN(2026-11-01) qwen: a compile probe by program: wide_heads_compile takes Qwen3-30B-A3B's instance key and widens its attention to 64 heads of 128 over 8, until the device gate builds probe keys from a shape row alone
@@ -135,6 +142,7 @@ crates/metal/src/bin/metal_matvec_time/mrow.rs	qwen	3	PIN(2026-11-02) qwen: a ti
 crates/metal/src/bin/metal_matvec_time/mac.rs	lfm	7	PIN(2026-10-29) lfm: a timing cut by program: `--only lfm3` hands the run to the bin's own lfm3.rs module, which times LFM3-1.7B's decode shapes and source cuts, until the bin reads its shapes from an instance's plan
 crates/metal/src/bin/metal_matvec_time/mac.rs	qwen	1	PIN(2026-11-01) qwen: the `--only d27` arm's usage line names the model it times, until the bin reads its shapes from an instance's plan
 crates/model/src/arch/coverage.rs	deepseek	16	PIN(2026-10-26) deepseek: baseline P 13: MK2 program by body; +3 are the V4.1 chain's compressor and indexer type pin (its programs key and the two name selectors of roles::is_side_matrix); the program would own its type pins instead of this list naming Program::Deepseek41Chain
+crates/model/src/arch/coverage.rs	ernie55	1	PIN(2026-11-25) ernie55: the family's program in the coverage arm that lists the programs reading a placed attention tensor; the arm is a program-keyed rule
 crates/model/src/arch/coverage.rs	gemma	18	baseline P 18: MK2 program by body
 crates/model/src/arch/coverage.rs	glm	21	PIN(2026-10-27) glm: the absorbed key/value pair and the selector (its own row-major gemv, and its pool positions read as f32) are pin rows of their program beside the by-name row, until common entries read them (was 18; baseline P 21: MK2 program by body)
 crates/model/src/arch/coverage.rs	mimo	10	baseline P 10: MK2 program by body
@@ -146,6 +154,7 @@ crates/model/src/arch/dspark.rs	deepseek	1	baseline O 1: own path: an alias row 
 crates/model/src/arch/hybrid.rs	qwen	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/model/src/arch/mod.rs	clef	1	baseline A 1: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	deepseek	14	baseline A 15: MK1a/MK1b ArchRow registry
+crates/model/src/arch/mod.rs	ernie55	4	PIN(2026-11-25) ernie55: the family's module declaration (`pub mod ernie55;`) and the `model::arch::Arch` arms of `from_name` and `name`, as every family's; the module list is not a registry
 crates/model/src/arch/mod.rs	flint	4	PIN(2026-10-23) flint: the module declaration and architecture variant with from_name and name arms remain outside the ArchRow registry
 crates/model/src/arch/mod.rs	gemma	11	baseline A 13: MK1a/MK1b ArchRow registry
 crates/model/src/arch/mod.rs	glm	5	baseline A 6: MK1a/MK1b ArchRow registry
@@ -155,6 +164,7 @@ crates/model/src/arch/mod.rs	qwen	16	baseline A 19: MK1a/MK1b ArchRow registry
 crates/model/src/bin/bloomery-decode.rs	deepseek	3	baseline R 4: MK1a one registry row per crate
 crates/model/src/bin/r8conv.rs	deepseek	1	baseline T 1: case-table row, a fixture label or default path
 crates/models/src/lib.rs	deepseek	4	baseline A 4: MK1a/MK1b ArchRow registry
+crates/models/src/lib.rs	ernie55	2	PIN(2026-11-25) ernie55: ModelSpec.arch names the family by an enum variant with its name arm; the variant stays until ModelSpec carries the registry
 crates/models/src/lib.rs	flint	2	PIN(2026-10-23) flint: ModelSpec.arch names the reader by an enum variant and name arm until ModelSpec carries the registry's name
 crates/models/src/lib.rs	gemma	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	glm	3	baseline A 3: MK1a/MK1b ArchRow registry
@@ -162,6 +172,7 @@ crates/models/src/lib.rs	mimo	2	baseline A 2: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	nemotron	4	baseline A 4: MK1a/MK1b ArchRow registry
 crates/models/src/lib.rs	qwen	11	PIN(2026-11-01) qwen: + 2 (was 9, baseline A 9), ModelSpec.arch names the dense Qwen3 by an enum variant and its name arm; the variant stays until ModelSpec carries the registry's name instead
 crates/placement/src/accepts.rs	deepseek	16	PIN(2026-11-04) deepseek: +2 are ds41_pair's doc lines naming the crate whose tier image and fused kernels read the pair, a Program-owned pair rule would carry them; MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet; +4 are V4.1's leg arms (ds41_gate_up, ds41_down, ds41_pair and its routed_rule arm), held in the Program-keyed arm table beside qwen35's and qwen38's until a Program owns its arms
+crates/placement/src/accepts.rs	ernie55	5	PIN(2026-11-25) ernie55: the program the family runs: its variant and name, the arm of program_of and its arms of leg_arms and routed_rule (5 lines, as the hy4 and inkling2 rows hold)
 crates/placement/src/accepts.rs	flint	5	PIN(2026-10-25) flint: the implemented body registers its Program variant, name, architecture selection, expert arms and routed rule in the existing exhaustive program owners
 crates/placement/src/accepts.rs	gemma	5	PIN(2026-10-21) gemma: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
 crates/placement/src/accepts.rs	glm	5	PIN(2026-10-21) glm: MK2 program by body; +1 is the family's word in the common Program::name owner, which the model's own code does not carry yet
@@ -171,12 +182,17 @@ crates/placement/src/accepts.rs	qwen	25	PIN(2026-10-21) qwen: MK2 program by bod
 crates/placement/src/placement/nodes_scale.rs	deepseek	10	baseline D 10: shapes read from the fixture ModelSpec rows (deferred)
 crates/placement/src/placement/nodes_scale.rs	glm	2	baseline D 2: shapes read from the fixture ModelSpec rows (deferred)
 crates/placement/src/placement/nodes_scale.rs	qwen	32	baseline D 32: shapes read from the fixture ModelSpec rows (deferred)
+crates/quantize/src/cli.rs	deepseek	1	PIN(2026-11-25) deepseek: the same usage text names deepseek41, the other architecture the rule table covers
+crates/quantize/src/cli.rs	ernie55	2	PIN(2026-11-25) ernie55: the quantizer's usage text names the two architectures its rule table covers; the text is the CLI's, until the table is a registry
+crates/quantize/src/resolve.rs	ernie55	2	PIN(2026-11-25) ernie55: the quantizer's architecture table row and its name list; the table is the quantizer's per-architecture rules
 crates/refset/src/emb2.rs	clef	1	baseline O 1: own path: an alias row in tools/model-tokens.tsv or a move into the family directory
 crates/serve/src/api.rs	glm	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/api.rs	qwen	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/dsml.rs	deepseek	3	baseline D 4: MK7 tool format and reasoning from the template
+crates/serve/src/dsml.rs	ernie55	13	PIN(2026-11-25) ernie55: the ERNIE XML call format's variants, scan arms and template detection in the tool-call scanner every family shares; the scanner picks a format by variant, as it does for the other tool formats
 crates/serve/src/dsml.rs	glm	2	PIN(2026-10-19) glm: MK7 tool format and reasoning from the template; +1 is ToolFormat::call_parts, the forced-call inverse of each format's scan (structured output)
 crates/serve/src/dsml.rs	qwen	15	PIN(2026-10-19) qwen: MK7 tool format and reasoning from the template; +1 is ToolFormat::call_parts, the forced-call inverse of each format's scan (structured output)
+crates/serve/src/lib.rs	ernie55	2	PIN(2026-11-25) ernie55: the family's two module declarations (the chat protocol and its XML scanner), as every family's; the module list is not a registry
 crates/serve/src/lib.rs	glm	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/lib.rs	qwen	1	baseline S 1: MK9/MK7 seat and tool-format data
 crates/serve/src/lib.rs	deepseek	1	PIN(2026-10-21) deepseek: MK9/MK7 seat and tool-format data: `pub mod v41`, V4.1's official prompt encoding, beside glmxml and qwenxml (#595)
@@ -211,7 +227,7 @@ crates/serve/src/dsml.rs	muse	7	PIN(2026-10-23) muse: ToolFormat, Tools and Scan
 crates/serve/src/lib.rs	muse	1	PIN(2026-10-23) muse: the recipient-protocol parser's module declaration beside the other chat formats'
 crates/gpu-gates/src/record.rs	muse	4	PIN(2026-10-23) muse: MK12 per-bin Kind statics into record/<bin>.rs: the seat's load and listening kinds and its list are the common file's, where every seat's are
 crates/gpu-gates/src/record.rs	kimi	1	PIN(2026-11-06) kimi: the per-bin Kind static GENERATE_KIMI_K3 (what generate_kimi_k3 prints), one line like the other families' until MK12 moves the statics into record/<bin>
-crates/gpu-gates/src/record.rs	inkling2	5	PIN(2026-11-23) inkling2: MK12 per-bin Kind statics into record/<bin>.rs: the seat's load and listening kinds and its list are the common file's, where every seat's are; the official folder's kind
+crates/gpu-gates/src/record.rs	inkling2	6	PIN(2026-11-23) inkling2: MK12 per-bin Kind statics into record/<bin>.rs: the seat's load and listening kinds and its list are the common file's, where every seat's are; the official folder's kind; PIN(2026-11-25) 5 -> 6: the seat's row in the records-order test names the seat, as every seat's row does
 crates/model/src/arch/coverage.rs	muse	25	PIN(2026-10-23) muse: the coverage rows, the type pins and the expert-stack match are keyed by Program, so each row the musespark body runs lists its variant; the program would own its rows instead of the list naming programs
 crates/hf/src/vocab.rs	minimax	1	PIN(2026-11-22) minimax: the minimax-m2 pre-tokenizer's name in the pre-tokenizer table (its regex is GPT-4o's, `gpt4o_regex`, which the gpt-4o row shares); tokenizer programs are not yet described by ModelSpec
 crates/hf/src/vocab.rs	lfm	1	PIN(2026-10-28) lfm: the lfm2 pre-tokenizer's name in the pre-tokenizer table (the llama3 regex row with ignore_merges); tokenizer programs are not yet described by ModelSpec
@@ -259,8 +275,9 @@ crates/quantize/src/resolve.rs	deepseek	1	PIN(2026-11-15) deepseek: the ARCHS ro
 crates/gpu-gates/src/bin/tier_server.rs	kimi	1	PIN(2026-11-07) kimi: the tier server's node family table names the family's NODE_FAMILY const
 crates/hf/src/lib.rs	kimi	1	PIN(2026-11-07) kimi: the folder map's file table names the Kimi checkpoint's tiktoken vocabulary file (tokenization_kimi.py); the tokenizer program is not described by ModelSpec yet
 crates/gpu/src/index_key.rs	deepseek	3	PIN(2026-11-07) deepseek: the index key input's kernel entry keeps its first model's name (ds41_index_key_input, pinned by name in tools/ref/ptx-shapes); a rename moves the pinned entry
-crates/gpu/src/indexer.rs	deepseek	6	PIN(2026-11-07) deepseek: the lightning indexer's kernel entries keep their first model's names (ds41_indexer_score, ds41_indexer_topk, pinned by name in tools/ref/ptx-shapes); a rename moves the pinned entries
+crates/gpu/src/indexer.rs	deepseek	8	PIN(2026-11-07) deepseek: the lightning indexer's kernel entries keep their first model's names (ds41_indexer_score, ds41_indexer_topk, pinned by name in tools/ref/ptx-shapes); a rename moves the pinned entries; ERNIE 5.5 shares the module (two more doc lines name its plan owner)
 crates/gpu-gates/src/bin/tier_server.rs	flint	2	PIN(2026-11-14) flint: the tier server's family list is one `#[cfg(feature)]` arm a family (the attribute line and the NODE_FAMILY line), as deepseek's, glm's and solar's rows above; a registry of node families built from the features would own the list instead
+crates/gpu-gates/src/bin/tier_server.rs	mistral	2	PIN(2026-11-25) mistral: the tier server's family list is one `#[cfg(feature)]` arm a family (the attribute line and the NODE_FAMILY line), as deepseek's, glm's, solar's and flint's rows above; a registry of node families built from the features would own the list instead
 crates/gpu-gates/src/bin/bench_picks.rs	qwen	1	PIN(2026-11-15) qwen: the fewrow arms time the per-slot gate.up entry the dense qwen35 FFN launches, which lives in the qwen3moe experts module (`qwen3moe_gate_up_swiglu_q4k`, a kernel entry named after its first model); a common gate.up entry would own the import
 crates/model/src/arch/mod.rs	hy4	4	PIN(2026-11-18) hy4: the family's module declaration (`pub mod hy_v4_flash;`), its `model::arch::Arch` variant with the arms of `from_name` and `name`, and the every-arch list; the module list is not a registry and the enum lists the architectures a reader reads, so each family adds its directory, variant and arms here until the registry owns them
 crates/model/src/arch/mod.rs	inkling2	5	PIN(2026-11-21) inkling2: the family's module declaration (`pub mod inkling2;`), its `INKLING2_LOOP` alias and the `model::arch::Arch` arms of `from_name` and `name`; the module list is not a registry and the enum lists the architectures a body runs, so each family adds its directory, variant and two arms here until the registry owns them
@@ -273,7 +290,7 @@ crates/gpu-gates/src/bin/shared/routed_legs.rs	inkling2	2	PIN(2026-11-21) inklin
 crates/model/src/arch/coverage.rs	hy4	1	PIN(2026-11-18) hy4: the expert-stack match of the coverage check is keyed by Program; the family's body shares the common card leg's arm with the mimo2, solar2 and mistral-large4 bodies
 crates/model/src/arch/coverage.rs	inkling2	1	PIN(2026-11-23) inkling2: the expert-stack match of the coverage check is keyed by Program, so the family's whole-card arm names its program and reads the leg's arms by part (accepts.rs's fused_gate_up_leg and down32_leg); the program would own its stack rule instead of the list naming programs
 crates/gpu-gates/src/vision_seat.rs	hy4	7	PIN(2026-11-19) hy4: media design: the hy_v4_flash projector's row of the Rule table (its projector type, the start, end and pad ids of the image's span with their strings, the row width and the default limits read from the tower's header) and the tower's import; a tower's facts stay in this table until VideoRule data per tower (vidcore) carries them
-crates/hf/src/dspark.rs	inkling2	1	PIN(2026-11-23) inkling2: the DSpark reader names the family whose draft folder layout it reads
+crates/hf/src/dspark.rs	inkling2	2	PIN(2026-11-23) inkling2: the DSpark reader names the family whose draft folder layout it reads; PIN(2026-11-25) 1 -> 2: the module's #[path] line, its file moved under arch/inkling2/ where check-arch holds a draft's tensor names
 crates/hf/src/modelopt.rs	inkling2	1	PIN(2026-11-23) inkling2: the ModelOpt reader names the family whose hf_quant_config it was written against
 crates/hf/src/quant_config.rs	inkling2	2	PIN(2026-11-23) inkling2: the quant-config reader names the family whose NVFP4/MXFP8 split it reads
 crates/metal/src/bin/bloomery_serve_metal.rs	inkling2	2	PIN(2026-11-23) inkling2: Metal arch dispatch by program: the Metal bins open the one Metal architecture's session
@@ -291,3 +308,4 @@ crates/metal/src/kernels/rel_flash.rs	inkling2	1	PIN(2026-11-23) inkling2: a Met
 crates/metal/src/kernels/res_mix.rs	inkling2	1	PIN(2026-11-23) inkling2: a Metal kernel module of the family, until the lift into crates/metal/src/arch/inkling2
 crates/metal/src/kernels/router_situ.rs	inkling2	1	PIN(2026-11-23) inkling2: a Metal kernel module of the family, until the lift into crates/metal/src/arch/inkling2
 crates/metal/src/lib.rs	inkling2	2	PIN(2026-11-23) inkling2: the Metal crate root declares the family's modules
+crates/gpu-gates/src/bin/tier_server.rs	muse	1	PIN(2026-11-25) muse: the tier server's family list names the family's NODE_FAMILY const (one unconditional line, as kimi's row above); a registry of node families built from the features would own the list instead

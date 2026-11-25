@@ -79,7 +79,11 @@
 //! `--place W` is the shared placement word (`generate::Place`): `a` (the
 //! largest visible card), `bp` (plan (b′): the A6000 the stage card, the 3090
 //! an expert tier holding each layer's next ids), `gate`, or one card of the
-//! census by name or ordinal. Unset, the common rule decides (`Place::choose`
+//! census by name or ordinal. `BLOOMERY_TIER_NODES` puts that tier card on a
+//! node: the plan reads its card from the node's census, and a `tier_server`
+//! of this family (`bloomery_gpu::arch::musespark::NODE_FAMILY`) serves it. The
+//! node serves the step; a prompt pass's batch is served by the host for the
+//! node's experts. Unset, the common rule decides (`Place::choose`
 //! by [`TIER_RULE`]), on one census reading: two cards in view run `bp` when
 //! its plan puts at least the rule's break-even of experts on the tier card,
 //! else `a`; a `place unset` record names the word and why. The stage card
@@ -172,7 +176,8 @@ const USAGE: &str = "usage: bloomery-serve --model musespark [-m PATH | --hf <re
 /// load settings, which the open reads (`PlanLevers::from_levers`,
 /// `Levers::host`), the residency machine's word and the expert stream's, the
 /// engine thread's pin, the host legs' lane rule, the start screen and the
-/// schema jump; and the prompt group, which the common run reads for every
+/// schema jump; the expert tier's node (`BLOOMERY_TIER_NODES`, read where the
+/// plan resolves the tier card and where the load opens it); and the prompt group, which the common run reads for every
 /// tiered seat and this body does not use. The V4.1 host tier's r8 sidecar is
 /// not among them: the body reads its routed experts from the source.
 pub const ACTS_ON: &[&str] = &[
@@ -187,6 +192,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::HOST_LANES,
     bloomery_levers::SCREEN,
     bloomery_levers::SCHEMAJUMP,
+    bloomery_levers::TIER_NODES,
 ];
 
 /// How the body feeds a prompt, the `load` record's `prompt` word: passes

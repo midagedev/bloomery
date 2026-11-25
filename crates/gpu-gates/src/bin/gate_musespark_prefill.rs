@@ -105,6 +105,29 @@
 //! of the arm, the common ones on the two-card load included, by name (`tier::defer_for_room`, `no-card-room`), in either
 //! tier, and loads nothing.
 //!
+//! The node arm (`--node`, `just gate-gpu-musespark-node`, the fixture tier, the only arm it runs): plan (b′) with its tier card
+//! on a node (`BLOOMERY_TIER_NODES`): a `tier_server` beside the gate serves the tier from this machine's own card, so the arm
+//! needs one card in view, not two. The whole model on the card is read first and released: the no-node load, which holds every
+//! expert the node plan splits between the stage card and the node. The gate then starts the node, hands its address over as
+//! the tier node (`bloomery_levers::override_with`, once, after that load: a placed load with no tier refuses a node list), and
+//! plans under the fixture's `mid` budget (the stage card half the experts, the node the rest). It holds:
+//! - `node_tier_load`: the plan puts experts on the tier, the load's tier opened on the node the gate started, its experts by
+//!   layer are the plan's, and the stage card keeps the experts the `mid` arm's card keeps;
+//! - `node_tier_eager_is_replay`: [`TWO_WALK`] steps of the walk, eager and as the captured graph's replays, read the same ids and
+//!   logits bits, every logit finite, and the walk sent every tier layer a routed slot;
+//! - `node_tier_first_token_near_whole`: the first token's layers against the no-node load, each layer teacher-forced as
+//!   `two_card_first_token_near_union` runs them, within [`TWO_STEP_BAND`]: the node computes the rows the stage card would, and
+//!   only the experts' sum is grouped otherwise (`(card + tier) + host` against the card's);
+//! - `node_tier_prompt_is_the_host_loads`: the prompt on the layers' inputs the no-node load's steps give, each layer alone as
+//!   the batch, on this load and on the `mid` arm's (the card's half of the experts and the host the rest, no node): the batch's
+//!   host serves the node's experts as it serves the host tier's and the stage card the same experts in both, so every layer's
+//!   last row is the same bits. Against the no-node load the rows differ by the host's expert input rule (the card quantizes
+//!   q8_1, the host Q8_K), so a node load's prompt is not asked to equal it;
+//! - `node_tier_prompt_is_the_hosts`: that prompt and the common clauses' sent the node no batch service: a node serves the
+//!   step, and the batch's host serves the node's experts (`HostTier::batch_slots`).
+//!
+//! The common clauses then run on the node load: its batches against its own steps, which cross the node.
+//!
 //! `--diag` runs no clause: on the whole-card load it prints, per layer, the batch's last-row output against the steps'
 //! with both paths' routed ids (lengths 1, 7, 2,047), and the load's passes against passes of one row (7, 600, 2,600):
 //! the narrowing that tells an exchanged expert from a pass defect.
@@ -151,6 +174,13 @@ mod prefill_clauses;
 #[cfg(feature = "gpu")]
 #[allow(
     dead_code,
+    reason = "the gate starts and reaps its node; stdin, signals and the kill serve other gates"
+)]
+#[path = "shared/node_proc.rs"]
+mod node_proc;
+#[cfg(feature = "gpu")]
+#[allow(
+    dead_code,
     reason = "the two-card gates share the module; each takes the helpers it reads"
 )]
 #[path = "shared/tier_twocard.rs"]
@@ -160,10 +190,12 @@ mod gate {
     use crate::e2e::{cross_band, feed, finite, rel, same, selection_order, walk};
     use crate::gate_card;
     use crate::lcpp_e2e::{self, Dims, Seat, fnv1a};
+    use crate::node_proc::{Proc, tier_server, tier_server_command};
     use crate::prefill_clauses::{self, Case};
     use crate::tier_twocard::{Sent, sent_between, sent_every, tier_counts, tier_on_card};
     use app::Prompt;
     use bloomery_gpu::arch::musespark::{Body, LayerNodes, LayerRoute};
+    use bloomery_gpu::host::node::node_cards;
     use bloomery_gpu::host::served::TierBody;
     use bloomery_gpu::host::swap::Residency;
     use bloomery_gpu::host::xstream::{XLayer, XMode, XReport, XStreamBody};
@@ -171,7 +203,9 @@ mod gate {
     use bloomery_gpu::{Gpu, GpuError, GpuModel};
     use bloomery_gpu_gates::prompts::{SIGMA_LOGIT_V41, k_of};
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
-    use bloomery_gpu_gates::{GateError, bits_equal, checks_failed, open_split, split_f32};
+    use bloomery_gpu_gates::{
+        GateError, bits_equal, checks_failed, open_split, ref_model_path, split_f32,
+    };
     use model::arch::Arch;
     use model::arch::musespark::hparams::Hparams;
     use model::arch::musespark::place::{self, PlanInputs};
@@ -254,7 +288,27 @@ mod gate {
         TWO_CARD_BATCH,
     ];
 
-    /// Steps of the walk the two-card arm runs eager and as replays.
+    /// The node arm's own clauses, each declared where it runs and left by name, with the body's and the common ones the arm
+    /// runs on the node load, where the card in view cannot hold the no-node reference.
+    const NODE_LOAD: &str = "node_tier_load";
+    const NODE_EAGER: &str = "node_tier_eager_is_replay";
+    const NODE_FIRST: &str = "node_tier_first_token_near_whole";
+    const NODE_PROMPT: &str = "node_tier_prompt_is_the_host_loads";
+    const NODE_BATCH: &str = "node_tier_prompt_is_the_hosts";
+    const NODE_COMMON: &str = "node_tier_common_clauses_cross_the_node";
+    const NODE_OWN: [&str; 6] = [
+        NODE_LOAD,
+        NODE_EAGER,
+        NODE_FIRST,
+        NODE_PROMPT,
+        NODE_BATCH,
+        NODE_COMMON,
+    ];
+
+    /// How long the node may take to exit once the load that used it closed.
+    const NODE_CLOSE_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Steps of the walk the two-card and node arms run eager and as replays.
     const TWO_WALK: usize = 16;
 
     /// Rows of the two-card arm's prompt past one pass: a second, short pass.
@@ -314,6 +368,8 @@ mod gate {
         Plan,
         /// Plan (b′) on the two largest cards in view (module doc), run alone by `--two-card`.
         Two,
+        /// Plan (b′) with the tier on a node of this machine's card (module doc), run alone by `--node`.
+        Node,
         /// The `mid` budget under the residency machine with the prompt calls' expert stream on (module doc).
         Stream,
     }
@@ -325,6 +381,7 @@ mod gate {
                 Arm::Mid => "mid",
                 Arm::Plan => "plan",
                 Arm::Two => "two",
+                Arm::Node => "node",
                 Arm::Stream => "stream",
             }
         }
@@ -358,6 +415,7 @@ mod gate {
         let mut m = match arm {
             Arm::Whole => Model::open(Gpu::new()?, file, ctx)?,
             Arm::Two => return Err("the two-card arm opens through two_card".into()),
+            Arm::Node => return Err("the node arm opens through node_card".into()),
             Arm::Mid | Arm::Plan | Arm::Stream => {
                 let inputs = PlanInputs::read(&file)?;
                 // The stream arm's plan counts the ring's term, the only card bytes its ring takes.
@@ -366,14 +424,14 @@ mod gate {
                         let ring = place::stream_ring(&inputs.hp, &inputs.model)?;
                         inputs.streaming(ring)
                     }
-                    Arm::Whole | Arm::Mid | Arm::Plan | Arm::Two => inputs,
+                    Arm::Whole | Arm::Mid | Arm::Plan | Arm::Two | Arm::Node => inputs,
                 };
                 let machine =
                     workstation::placed_on(gate_card::card()?, hp.n_layer, workstation::SCRATCH);
                 let ctx = u64::try_from(ctx)?;
                 let levers = match arm {
                     Arm::Mid | Arm::Stream => stage_budget(&inputs, &machine, ctx, |all| all / 2)?,
-                    Arm::Whole | Arm::Plan | Arm::Two => PlanLevers::default(),
+                    Arm::Whole | Arm::Plan | Arm::Two | Arm::Node => PlanLevers::default(),
                 };
                 let plan = inputs.plan(&machine, ctx, &levers)?;
                 println!(
@@ -392,7 +450,7 @@ mod gate {
                         println!("arm stream xstream={}", body.xstream_word());
                         m
                     }
-                    Arm::Whole | Arm::Mid | Arm::Plan | Arm::Two => {
+                    Arm::Whole | Arm::Mid | Arm::Plan | Arm::Two | Arm::Node => {
                         Model::open_placed(file, &plan, 0, HOST)?
                     }
                 }
@@ -682,7 +740,13 @@ mod gate {
         );
 
         tier::sc(TWO_CARD_FIRST)?;
-        pass &= near_union(&want, &got, sent_first.as_ref(), &tier_layers);
+        pass &= near_union(
+            TWO_CARD_FIRST,
+            &want,
+            &got,
+            sent_first.as_ref(),
+            &tier_layers,
+        );
 
         tier::sc(TWO_CARD_PROMPT)?;
         let before = counts(&m)?;
@@ -698,19 +762,250 @@ mod gate {
         Ok(Ok((m, pass, tier_layers)))
     }
 
+    /// Plan (b′)'s machine with the stage on `stage` and the tier on the card of a node at `node`'s spec, laid out as the
+    /// placement and [`place::stage_placed`] lay one out ([`workstation::placed_on`], the tier card, the host's prompt-batch
+    /// rows). The node runs on this machine's own card here, one device twice, which the placement refuses; the plan holds
+    /// the two budgets to the device instead (`stage_budget`'s card budget splits it).
+    fn node_machine(
+        hp: &Hparams,
+        stage: model::placement::workstation::CardSpec,
+        node: model::placement::workstation::CardSpec,
+    ) -> Result<Machine, GateError> {
+        let batch = place::tier_batch(hp)?;
+        let mut machine = workstation::placed_on(stage, hp.n_layer, workstation::SCRATCH);
+        machine.tiers.push(workstation::tier_card(node, batch));
+        machine
+            .host_mut()
+            .reserves
+            .push((workstation::TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
+        Ok(machine)
+    }
+
+    /// What the node arm leaves: the load, whether its own clauses held, the tier's layers and the node process the load's
+    /// tier runs on, which outlives the load's use and is reaped after it closes.
+    type NodeLoad = (Model, bool, Vec<usize>, Proc);
+
+    /// The node arm's load (module doc): the no-node reference's first token and prompt read and the reference released,
+    /// then the node started and named as the tier's node, plan (b′) opened over it and the arm's own clauses run; the load
+    /// is left as [`open`] leaves one, the taps armed and the step captured. `Ok(Ok(load))`; `Ok(Err(why))` where the card in
+    /// view cannot hold every expert for the reference, before anything loads.
+    fn node_card(hp: &Hparams, ctx: usize) -> Result<Result<NodeLoad, String>, GateError> {
+        if !bloomery_levers::tier_nodes()?.is_empty() {
+            return Err(format!(
+                "{} is set: the node arm sets it for its load alone",
+                bloomery_levers::TIER_NODES
+            )
+            .into());
+        }
+        let inputs = PlanInputs::read(&open_split(Arch::MuseSpark, RECIPE)?)?;
+        let ctx = u64::try_from(ctx)?;
+        // The reference holds every expert on the card alone: the plan of that card must put none on the host.
+        let card = gate_card::card()?;
+        let one = workstation::placed_on(card, hp.n_layer, workstation::SCRATCH);
+        let whole = inputs.plan(&one, ctx, &PlanLevers::default())?;
+        if whole.host.experts > 0 {
+            return Ok(Err(format!(
+                "the no-node reference holds every expert on the card alone, whose plan puts {} experts on the host \
+                 (card {}, {} usable bytes; plan values)",
+                whole.host.experts,
+                card.name,
+                card.usable_bytes()
+            )));
+        }
+        let ctx = usize::try_from(ctx)?;
+        let walk = walk(TWO_WALK, hp.n_vocab);
+        let tok = *walk.first().ok_or("the walk is empty")?;
+
+        // The reference: the whole model on the card, its first token, its steps over the prompt and each layer of the
+        // prompt alone on them read, then released.
+        let (want, rows_in) = {
+            let mut r = Model::open(Gpu::new()?, open_split(Arch::MuseSpark, RECIPE)?, ctx)?;
+            let want = first_nodes(&mut r, tok)?;
+            (want, ForcedRows::read(&mut r, hp)?)
+        };
+        // The prompt's reference: the load of this card's half of the experts and the host the rest, no node, which the
+        // node's plan below divides further; its batches run the host's experts as the node load's do.
+        let want_prompt = {
+            let mut r = open(Arm::Mid, hp, ctx)?;
+            if r.pass_rows()? != rows_in.rows {
+                return Err(format!(
+                    "the host-tier load's passes are {} rows, the reference's {}",
+                    r.pass_rows()?,
+                    rows_in.rows
+                )
+                .into());
+            }
+            rows_in.outs(&mut r, (hp.n_layer, hp.n_embd))?
+        };
+
+        let model = ref_model_path()?;
+        let (node, addr) = tier_server(tier_server_command(Some(model.as_path()))?, "node")?;
+        println!("node: tier_server pid {} serves on {addr}", node.id());
+        for note in bloomery_levers::override_with(&[
+            (bloomery_levers::TIER_NODES, addr.to_string()),
+            (bloomery_levers::TIER_LINK, "tcp".to_string()),
+        ])? {
+            println!("{note}");
+        }
+        let ctx64 = u64::try_from(ctx)?;
+        let (_, node_card) = node_cards(&[addr])?
+            .into_iter()
+            .next()
+            .ok_or("the node's census holds no card")?;
+        let machine = node_machine(hp, card, node_card)?;
+        // The stage card alone, the budget's machine: the stage keeps half the experts and the node's card the rest.
+        let flat = Machine {
+            tiers: Vec::new(),
+            ..machine.clone()
+        };
+        let levers = stage_budget(&inputs, &flat, ctx64, |all| all / 2)?;
+        let plan = inputs.plan(&machine, ctx64, &levers)?;
+        // The stage card keeps the experts the host-tier load's card keeps: that load's own plan, the same budget rule over
+        // the same card with no tier or host reserve.
+        let stage_same = {
+            let mid = workstation::placed_on(card, hp.n_layer, workstation::SCRATCH);
+            let mid_levers = stage_budget(&inputs, &mid, ctx64, |all| all / 2)?;
+            plan.n_l == inputs.plan(&mid, ctx64, &mid_levers)?.n_l
+        };
+        let on_tier: Vec<u64> = plan.tier_n_l.first().cloned().unwrap_or_default();
+        let tier_layers: Vec<usize> = (0..hp.n_layer)
+            .filter(|&l| on_tier.get(l).copied().unwrap_or(0) > 0)
+            .collect();
+        println!(
+            "arm node plan (b′) under a card budget of {} at ctx {ctx64}: stage {} experts ({} B), the node's tier {} experts \
+             ({} B) on {} layers, host {} experts (plan values)",
+            model::placement::card_budget::in_bytes(&levers.card_budget_bytes),
+            plan.cards[0].experts,
+            plan.cards[0].expert_bytes,
+            plan.cards.get(1).map_or(0, |c| c.experts),
+            plan.cards.get(1).map_or(0, |c| c.expert_bytes),
+            tier_layers.len(),
+            plan.host.experts,
+        );
+
+        let t0 = std::time::Instant::now();
+        let mut m = Model::open_placed(open_split(Arch::MuseSpark, RECIPE)?, &plan, 0, HOST)?;
+        let mut pass = true;
+
+        tier::sc(NODE_LOAD)?;
+        let placed = m
+            .body(NAME)?
+            .placed()
+            .ok_or("the node load is not a placed load")?;
+        let tier = placed
+            .hybrid()
+            .tiers()
+            .first()
+            .ok_or("the node load holds no tier card")?;
+        println!(
+            "arm node load in {:.1} s: stage {} ({} B), tier {} experts on the node at {:?} ({} B)",
+            t0.elapsed().as_secs_f64(),
+            m.gpu().device_name()?,
+            m.resident_bytes(),
+            tier.set().experts(),
+            tier.node(),
+            tier.resident_bytes(),
+        );
+        let on_node = tier.node() == Some(addr);
+        let loaded: Vec<u64> = (0..hp.n_layer)
+            .map(|l| u64::try_from(placed.tier_k(l)))
+            .collect::<Result<_, _>>()?;
+        let planned: Vec<u64> = (0..hp.n_layer)
+            .map(|l| on_tier.get(l).copied().unwrap_or(0))
+            .collect();
+        let rows_ok = m.pass_rows()? == rows_in.rows;
+        let load_ok =
+            !tier_layers.is_empty() && loaded == planned && on_node && rows_ok && stage_same;
+        println!(
+            "{NODE_LOAD}: the tier holds experts on {} layers; it runs on the node {addr}: {on_node}; the load's tier experts by \
+             layer {} the plan's; its pass rows {} equal the reference's {}: {rows_ok}; its stage experts by layer are the \
+             host-tier load's: {stage_same} {}",
+            tier_layers.len(),
+            if loaded == planned { "are" } else { "are not" },
+            m.pass_rows()?,
+            rows_in.rows,
+            verdict(load_ok)
+        );
+        if loaded != planned {
+            println!("  loaded {loaded:?}\n  planned {planned:?}");
+        }
+        pass &= load_ok;
+
+        tier::sc(NODE_EAGER)?;
+        m.set_taps(true)?;
+        m.set_mode(StepMode::Eager);
+        m.reset()?;
+        let before = counts(&m)?;
+        let eager = feed(&mut m, &walk)?;
+        let sent_walk = sent_between(before, counts(&m)?);
+        let before = counts(&m)?;
+        let got = forced_first_nodes(&mut m, tok, &want)?;
+        let sent_first = sent_between(before, counts(&m)?);
+        m.set_mode(StepMode::Graph);
+        m.capture_step()?;
+        m.reset()?;
+        let replay = feed(&mut m, &walk)?;
+        let bits = finite(&eager) && same(&eager, &replay);
+        println!(
+            "{NODE_EAGER}: {TWO_WALK} steps, eager and replay the same ids and logits bits, every logit finite: {bits} {}",
+            verdict(bits)
+        );
+        pass &= bits;
+        pass &= sent_every(
+            "node_tier_eager_is_replay walk",
+            sent_walk.as_ref(),
+            &tier_layers,
+            false,
+        );
+
+        tier::sc(NODE_FIRST)?;
+        pass &= near_union(NODE_FIRST, &want, &got, sent_first.as_ref(), &tier_layers);
+
+        tier::sc(NODE_PROMPT)?;
+        let before = counts(&m)?;
+        // The taps the capture holds are the ones a pass writes: no re-arming under the capture.
+        let got_prompt = rows_in.outs(&mut m, (hp.n_layer, hp.n_embd))?;
+        let sent_prompt = sent_between(before, counts(&m)?);
+        pass &= prompt_is_the_host_loads(NODE_PROMPT, &want_prompt, &got_prompt);
+
+        tier::sc(NODE_BATCH)?;
+        pass &= node_no_batch(NODE_BATCH, sent_prompt.as_ref(), true);
+        Ok(Ok((m, pass, tier_layers, node)))
+    }
+
+    /// Whether `sent`, what a span sent the node tier, holds no batch service of the node and, when `no_hits`, no routed slot
+    /// either: a node serves the step, and the batch's host serves its experts (module doc). Prints the counters.
+    fn node_no_batch(what: &str, sent: Option<&Sent>, no_hits: bool) -> bool {
+        let Some(sent) = sent else {
+            println!("FAIL {what}: the load holds no tier card");
+            return false;
+        };
+        let hits: u64 = sent.hits.iter().sum();
+        let st = sent.stats;
+        let ok = st.served == 0 && st.settles == 0 && (!no_hits || hits == 0);
+        println!(
+            "{what}: the span sent the node {hits} routed slots and {} batch services ({} settles): the batch's host serves \
+             the node's experts {}",
+            st.served,
+            st.settles,
+            verdict(ok)
+        );
+        ok
+    }
+
     /// The first token's layers of the two-card load `got`, each run alone on the reference's input, against the
     /// reference's `want` (module doc): every layer keeps the reference's picks (the same input bits route the same) and
     /// its distance within [`TWO_STEP_BAND`]; the token must have sent the tier a slot on one of the tier's layers.
     fn near_union(
+        clause: &str,
         want: &[LayerNodes],
         got: &[LayerNodes],
         sent: Option<&Sent>,
         tier_layers: &[usize],
     ) -> bool {
-        const CLAUSE: &str = TWO_CARD_FIRST;
         if want.len() != got.len() {
             println!(
-                "{CLAUSE}: {} layers read, the reference {} FAIL",
+                "{clause}: {} layers read, the reference {} FAIL",
                 got.len(),
                 want.len()
             );
@@ -729,14 +1024,14 @@ mod gate {
         for (l, (w, g)) in want.iter().zip(got).enumerate() {
             if sorted(&w.ffn_moe_topk) != sorted(&g.ffn_moe_topk) {
                 println!(
-                    "{CLAUSE}: layer {l} picks {:?} on the reference's input, the reference {:?} FAIL",
+                    "{clause}: layer {l} picks {:?} on the reference's input, the reference {:?} FAIL",
                     g.ffn_moe_topk, w.ffn_moe_topk
                 );
                 ok = false;
             }
             let r = rel(&g.ffn_moe_out, &w.ffn_moe_out).max(rel(&g.l_out, &w.l_out));
             if r > TWO_STEP_BAND {
-                println!("{CLAUSE}: layer {l} relative distance {r:.3e} past {TWO_STEP_BAND} FAIL");
+                println!("{clause}: layer {l} relative distance {r:.3e} past {TWO_STEP_BAND} FAIL");
                 ok = false;
             }
             each.push(r);
@@ -746,13 +1041,13 @@ mod gate {
         }
         let sent_tier = !reached.is_empty();
         println!(
-            "{CLAUSE}: {}; the token sent the tier a slot on layers {reached:?} {}",
+            "{clause}: {}; the token sent the tier a slot on layers {reached:?} {}",
             distances(&each, TWO_STEP_BAND),
             verdict(ok && sent_tier)
         );
         if !sent_tier {
             println!(
-                "FAIL precondition {CLAUSE}: the token sent the tier no slot on any layer; the clause proves nothing"
+                "FAIL precondition {clause}: the token sent the tier no slot on any layer; the clause proves nothing"
             );
         }
         ok && sent_tier
@@ -792,6 +1087,33 @@ mod gate {
         ok & sent_every(CLAUSE, sent, tier_layers, true)
     }
 
+    /// The node load's prompt rows `got` against the host-tier load's `want`, each layer alone as the batch on the same
+    /// rows (module doc): the batch's host serves the node's experts as it serves the host tier's, and the stage card
+    /// the same experts in both, so every layer's last-row `l_out` has the same bits. Prints each layer's relative
+    /// distance beside the verdict.
+    fn prompt_is_the_host_loads(clause: &str, want: &[Vec<f32>], got: &[Vec<f32>]) -> bool {
+        if want.len() != got.len() {
+            println!(
+                "{clause}: {} layers read, the host-tier load's {} FAIL",
+                got.len(),
+                want.len()
+            );
+            return false;
+        }
+        let each: Vec<f64> = want.iter().zip(got).map(|(w, g)| rel(g, w)).collect();
+        let ok = want.iter().zip(got).all(|(w, g)| bits_equal(w, g));
+        println!(
+            "{clause}: {} layers, last-row l_out relative distances [{}] against the host-tier load's: bits equal {ok} {}",
+            each.len(),
+            each.iter()
+                .map(|r| format!("{r:.3e}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            verdict(ok)
+        );
+        ok
+    }
+
     /// Each layer's relative distance in layer order, then the worst and its layer against `band`.
     fn distances(each: &[f64], band: f64) -> String {
         let (worst, at) =
@@ -813,15 +1135,16 @@ mod gate {
         if pass { "ok" } else { "FAIL" }
     }
 
-    /// The arms the command line names: `--two-card` runs the two-card arm alone; no argument, the tier's arms. Any other
-    /// argument is refused by name.
-    fn two_card_arg() -> Result<bool, GateError> {
+    /// The arm the command line runs alone: `--two-card` or `--node`; no argument, the tier's arms. Any other argument is
+    /// refused by name.
+    fn alone_arg() -> Result<Option<Arm>, GateError> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         match args.as_slice() {
-            [] => Ok(false),
-            [a] if a == "--two-card" => Ok(true),
+            [] => Ok(None),
+            [a] if a == "--two-card" => Ok(Some(Arm::Two)),
+            [a] if a == "--node" => Ok(Some(Arm::Node)),
             other => Err(format!(
-                "{NAME}: arguments {other:?}: the gate takes none, or --two-card"
+                "{NAME}: arguments {other:?}: the gate takes none, --two-card or --node"
             )
             .into()),
         }
@@ -1483,13 +1806,17 @@ mod gate {
         }
         let own_at = own_lengths(&lengths, tier_now);
         let mut failed = None;
-        let two = two_card_arg()?;
-        let arms = if two { &[Arm::Two][..] } else { arms(tier_now) };
+        let alone = alone_arg()?;
+        let arms: &[Arm] = match alone {
+            Some(Arm::Two) => &[Arm::Two],
+            Some(Arm::Node) => &[Arm::Node],
+            _ => arms(tier_now),
+        };
         for &arm in arms {
             let t = std::time::Instant::now();
-            let (m, two_pass) = match arm {
+            let (m, two_pass, node) = match arm {
                 Arm::Two => match two_card(&hp, ctx, tier_now)? {
-                    Ok((m, pass, layers)) => (m, Some((pass, layers))),
+                    Ok((m, pass, layers)) => (m, Some((pass, layers)), None),
                     Err(why) => {
                         // The body's and the common clauses run on the two-card load too, so they are left with it.
                         let names: Vec<&str> = TWO_CARD_OWN
@@ -1502,7 +1829,22 @@ mod gate {
                         continue;
                     }
                 },
-                Arm::Whole | Arm::Mid | Arm::Plan | Arm::Stream => (open(arm, &hp, ctx)?, None),
+                Arm::Node => match node_card(&hp, ctx)? {
+                    Ok((m, pass, layers, node)) => (m, Some((pass, layers)), Some(node)),
+                    Err(why) => {
+                        let names: Vec<&str> = NODE_OWN
+                            .iter()
+                            .copied()
+                            .chain(OWN.iter().map(|&(name, _)| name))
+                            .chain(prefill_clauses::CLAUSES.iter().map(|&(name, _, _)| name))
+                            .collect();
+                        tier::defer_for_room(&names, &why)?;
+                        continue;
+                    }
+                },
+                Arm::Whole | Arm::Mid | Arm::Plan | Arm::Stream => {
+                    (open(arm, &hp, ctx)?, None, None)
+                }
             };
             let rows = m.pass_rows()?;
             println!(
@@ -1542,7 +1884,7 @@ mod gate {
             let mut own = true;
             let clauses = match arm {
                 Arm::Stream => &OWN[1..],
-                Arm::Whole | Arm::Mid | Arm::Plan | Arm::Two => &OWN[..],
+                Arm::Whole | Arm::Mid | Arm::Plan | Arm::Two | Arm::Node => &OWN[..],
             };
             for &(clause, f) in clauses {
                 if tier::run_clause(clause, Tag::SelfConsistency)? {
@@ -1574,12 +1916,39 @@ mod gate {
                 failed.get_or_insert(common.err().unwrap_or_else(checks_failed));
             }
             if let Some((pass, layers)) = two_pass {
-                tier::sc(TWO_CARD_BATCH)?;
                 let sent = sent_between(before, counts(&seat.m)?);
-                let batch = sent_every(TWO_CARD_BATCH, sent.as_ref(), &layers, true);
-                if !(pass && batch) {
-                    println!("arm two FAIL");
-                    failed.get_or_insert_with(|| "the two-card arm's clauses failed".into());
+                let held = if matches!(arm, Arm::Node) {
+                    tier::sc(NODE_COMMON)?;
+                    sent_every(NODE_COMMON, sent.as_ref(), &layers, false)
+                        & node_no_batch(NODE_COMMON, sent.as_ref(), false)
+                } else {
+                    tier::sc(TWO_CARD_BATCH)?;
+                    sent_every(TWO_CARD_BATCH, sent.as_ref(), &layers, true)
+                };
+                if !(pass && held) {
+                    println!("arm {} FAIL", arm.word());
+                    failed.get_or_insert_with(|| {
+                        format!("the {} arm's clauses failed", arm.word()).into()
+                    });
+                }
+            }
+            if let Some(mut node) = node {
+                // The load's close ends the node's serving: it exits 0 once the stage has let go.
+                drop(seat);
+                match node.wait_within(NODE_CLOSE_WITHIN)? {
+                    Some(status) if status.success() => {
+                        println!("ok node: it exited 0 once the load closed");
+                    }
+                    Some(status) => {
+                        println!("FAIL node: {status}");
+                        failed.get_or_insert_with(|| "the node exited nonzero".into());
+                    }
+                    None => {
+                        println!(
+                            "FAIL node: still running {NODE_CLOSE_WITHIN:?} after the load closed; killed"
+                        );
+                        failed.get_or_insert_with(|| "the node did not exit".into());
+                    }
                 }
             }
         }

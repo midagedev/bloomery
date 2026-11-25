@@ -20,6 +20,7 @@ use runtime::dspark::{BaseHead, Context, DsparkShape, HeadMatrix, HeadPlace};
 use crate::q8f32::{GemvOut, Q8_0GemvMcolArgs};
 use crate::{DeviceTensor, Gpu, GpuError, Graph, WindowMut};
 
+pub mod anchor_draft;
 pub mod block_attn;
 pub mod conv;
 pub mod ctx_dense;

@@ -24,6 +24,10 @@
 //! After the last visit the head's mix runs over the rows and the head over the last row, so the
 //! call's argmax and logits are the last position's, the first decode step's input.
 //!
+//! A block draft's taps ([`GpuModel::set_draft_taps`]) are laid over the rows as the step's walk
+//! lays them ([`super::Walk`]): the rows entering each tapped visit, and the final normed row of
+//! every row, which [`GpuModel::prompt_pass_tapped`] hands the draft as each pass ends.
+//!
 //! The order is the step's where the kernels are the step's (the mixes, the convs, the
 //! epilogue, the controllers' rows forms, the router's rows, the output gate), and the prompt
 //! kernels' elsewhere: the wide projections read q8 blocks of 32 where the step's gemv reads the
@@ -36,22 +40,31 @@
 //!
 //! A verify ([`rows`]) walks the same rows with the step's kernels where the prompt's differ: the
 //! mixes as the step's launch pair over the rows, the controllers as the step's launch pair at the
-//! rows (a block one row's), the projections as the step's gemvs over the rows, the attention as
-//! the step's rel-bias flash at the rows' causal offsets, the routed rows on the step's card leg,
-//! and the head over every row; so each row is a step's bits.
+//! rows (a block one row's), the input norms and projections of a layer the step runs as one
+//! `norm_proj` launch as that launch's rows entry and the other layers' as the step's gemvs over
+//! the rows, the attention as the step's rel-bias flash at the rows' causal offsets, the routed
+//! rows on the step's card leg, and the head over every row; so each row is a step's bits.
+//!
+//! LoopCD-Hidden (`BLOOMERY_INK2_LOOPCD`) touches a pass and a verify as it touches a step: the
+//! rows' stream is kept at the end of the reference pass and, before the first visit past the core,
+//! becomes `h + ω (h − h_b)` row by row ([`RowWalk::pass_edge`], [`RowWalk::loop_boundary`]); off,
+//! nothing of it launches.
 
+use super::loop_cd::LoopCdArgs;
 use super::placed::{PlacedPass, VisitLeg};
 use super::route::N_USED;
 use super::state::{self, VisitStore};
 use super::{
-    Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Kernels, Layer, MIX_EPS, MSG_ATTN, MSG_FFN, MSG_K,
-    MSG_Q, MSG_V, Placed, WHAT, conv_scale, head_logits, layer_card_stacks, tap_widths,
+    Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Kernels, Layer, LoopCd, MIX_EPS, MSG_ATTN, MSG_FFN,
+    MSG_K, MSG_Q, MSG_V, Placed, WHAT, conv_scale, head_logits, layer_card_stacks, q8_site,
+    tap_widths,
 };
 use crate::arch::hybrid::{Site, WideCx, project_wide};
 use crate::attn_res::{AttnResKernels, AttnResNormedArgs};
 use crate::attn_res_step::AttnResStepKernels;
 use crate::card_leg::{LegStacks, RouteIo};
 use crate::card_slots::{CardAcc, CardSlotKernels};
+use crate::draft_taps::{DraftTaps, TapRowsSink};
 use crate::fault::FaultSink;
 use crate::gemm::{GemmKernels, GemmRoute, RouteSet};
 use crate::head::Head;
@@ -63,6 +76,7 @@ use crate::linear::conv_res::ConvResArgs;
 use crate::linear::out_gate::OutGateArgs;
 use crate::loop_control::{LoopControlArgs, MAX_MODULES, scratch_len};
 use crate::model::GpuModel;
+use crate::norm_proj::{F32Site, NormProjArgs};
 use crate::q38::EmbedIo;
 use crate::qk_clip::QkClipArgs;
 use crate::rel_bias::{REL, RelBiasArgs};
@@ -76,7 +90,7 @@ use crate::{DeviceBufferRaw, Gpu, GpuError};
 use chain::linear::Ring;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
-use model::arch::inkling2::hparams::Hparams;
+use model::arch::inkling2::hparams::{Hparams, Loop};
 use model::arch::inkling2::names;
 use model::arch::inkling2::place::{self, PassShape};
 use model::arch::models::Visit;
@@ -114,6 +128,9 @@ struct LoopRows {
     msg_bank: DeviceBuffer<f32>,
     /// The controllers' down rows.
     h: DeviceBuffer<f32>,
+    /// The stream saved at the end of LoopCD-Hidden's reference pass ([`LoopCd`]), a pass's rows,
+    /// read at the loop→coda boundary.
+    h_ref: DeviceBuffer<f32>,
 }
 
 /// The pass's buffers, each `rows` rows: the terms of [`place::pass_bytes`] in its order.
@@ -193,6 +210,7 @@ impl Bufs {
                 prelude: z(rn)?,
                 msg_bank: z(s.banks * rn)?,
                 h: z(scratch_len(MAX_MODULES, rows, s.rank))?,
+                h_ref: z(rn)?,
             })
         } else {
             None
@@ -280,6 +298,7 @@ impl Bufs {
                 + lp.prelude.num_bytes()
                 + lp.msg_bank.num_bytes()
                 + lp.h.num_bytes()
+                + lp.h_ref.num_bytes()
         });
         f32s.iter().map(|b| b.num_bytes()).sum::<usize>()
             + self
@@ -421,6 +440,31 @@ impl GpuModel<Body> {
         ids: &[u32],
         scored: &[usize],
     ) -> Result<(u32, Vec<Vec<f32>>), GpuError> {
+        self.prompt_pass_with(ids, scored, None)
+    }
+
+    /// [`GpuModel::prompt_pass`] with the draft's taps ([`GpuModel::set_draft_taps`]) of each
+    /// pass's last `window` rows handed to `sink` as the pass ends (the first position they hold,
+    /// then one tapped row a position, [`GpuModel::draft_tap_width`] values each): the stores,
+    /// the position and the argmax are the plain call's. Refused by name with no taps set; a
+    /// sink's error ends the call and comes back as it was.
+    pub fn prompt_pass_tapped(
+        &mut self,
+        ids: &[u32],
+        window: usize,
+        sink: &mut TapRowsSink<'_>,
+    ) -> Result<u32, GpuError> {
+        self.prompt_pass_with(ids, &[], Some((window, sink)))
+            .map(|(id, _)| id)
+    }
+
+    /// [`GpuModel::prompt_pass_scored`] over `tap` too: the tapped rows each pass hands `sink`.
+    fn prompt_pass_with(
+        &mut self,
+        ids: &[u32],
+        scored: &[usize],
+        mut tap: Option<(usize, &mut TapRowsSink<'_>)>,
+    ) -> Result<(u32, Vec<Vec<f32>>), GpuError> {
         if ids.is_empty() {
             return Err(GpuError::shape(CALL, "a prompt of no id"));
         }
@@ -429,6 +473,9 @@ impl GpuModel<Body> {
                 CALL,
                 format!("a kept row {bad} of a call of {} ids", ids.len()),
             ));
+        }
+        if tap.is_some() && self.body(CALL)?.draft.is_none() {
+            return Err(GpuError::state(CALL, "taps set (set_draft_taps)"));
         }
         let n = u32::try_from(ids.len()).map_err(|_| GpuError::shape(CALL, "ids past u32"))?;
         let mut kept = Vec::with_capacity(scored.len());
@@ -477,6 +524,12 @@ impl GpuModel<Body> {
                         .collect(),
                 };
                 body.run_pass(gpu, w, head, &at, &mut kept)?;
+                if let Some((window, sink)) = tap.as_mut() {
+                    let handed = chunk.len().min(*window);
+                    let from = chunk.len() - handed;
+                    let taps = body.draft_taps_rows_at(gpu.stream(), (from, handed))?;
+                    sink(at.pos0 + u32::try_from(from).unwrap_or(u32::MAX), &taps)?;
+                }
             }
             body.held = pos + n;
             body.end = body.end.max(body.held);
@@ -500,6 +553,20 @@ impl Body {
     #[must_use]
     pub fn pass_made_bytes(&self) -> usize {
         self.pass.as_ref().map_or(0, Pass::bytes)
+    }
+
+    /// Rows `from .. from + rows` of the last walk's draft taps, one [`DraftTaps::width`] row
+    /// each. Blocking; refused by name with no taps set, and past the rows the last walk laid in.
+    pub(super) fn draft_taps_rows_at(
+        &self,
+        stream: &CudaStream,
+        (from, rows): (usize, usize),
+    ) -> Result<Vec<f32>, GpuError> {
+        const WHAT_T: &str = "inkling2::draft_taps_rows";
+        self.draft
+            .as_ref()
+            .ok_or(GpuError::state(WHAT_T, "taps set (set_draft_taps)"))?
+            .read(stream, from, rows)
     }
 
     /// Route every visit's rows of the next prompt pass by `ids` and `weights` (visit-major, then
@@ -569,10 +636,15 @@ impl Body {
         let (floor, alpha) = (self.hp.log_floor, self.hp.log_alpha);
         pass.b
             .stage(gpu.stream(), (at.ids, at.pos0, rows), (ring, floor, alpha))?;
+        if let Some(t) = self.draft.as_mut() {
+            t.plan(at.ids.len());
+        }
         self.walk_rows(gpu, w, head, (at.ids.len(), Tail::Pass { at, kept }))
     }
 
-    /// The visits over the `m` staged rows, then `tail`'s head.
+    /// The visits over the `m` staged rows, then `tail`'s head. A draft's taps are laid as the
+    /// step lays them ([`super::Walk`]): the rows entering each tapped visit, and the final
+    /// normed row of every row.
     fn walk_rows(
         &mut self,
         gpu: &Gpu,
@@ -588,7 +660,9 @@ impl Body {
             stores,
             k,
             messages,
+            loopcd,
             taps,
+            draft,
             pass,
             ctx,
             s,
@@ -624,6 +698,7 @@ impl Body {
             b,
             forced,
             verify,
+            draft: draft.as_mut(),
             d: *d,
             m,
             cap: *rows,
@@ -641,6 +716,7 @@ impl Body {
             prelude: 0,
             n_msg: 0,
             banked: false,
+            loopcd: *loopcd,
         };
         let core = hp.loop_.filter(|lp| lp.passes > 1);
         match placed.as_mut() {
@@ -653,6 +729,15 @@ impl Body {
                         && l == lp.core_start
                     {
                         r.pass_edge(v.pass)?;
+                    }
+                    if core.is_some_and(|lp| l == lp.core_end) {
+                        r.loop_boundary()?;
+                    }
+                    if let Some(t) = r.draft.as_deref_mut()
+                        && let Some(i) = t.slot(slot)
+                    {
+                        let x = &r.b.x;
+                        t.enter(r.gpu.stream(), i, x, r.m)?;
                     }
                     let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
                     r.attn_half(slot, (l, layer), &mut stores[slot], msg)?;
@@ -702,7 +787,7 @@ impl Body {
                 let mut prog = PlacedProgram {
                     r,
                     visits: &visits[..],
-                    loop_core: core.map(|lp| lp.core_start),
+                    core,
                     messages: *messages,
                     layers: &layers[..],
                     stores: &mut stores[..],
@@ -725,9 +810,40 @@ impl Body {
         }
         let logits = (hp.softcap, hp.n_vocab_unpadded, hp.n_vocab);
         match tail {
-            Tail::Pass { at, kept } => r.finish((visits.len(), &s.pad), head, logits, at, kept),
-            Tail::Verify => r.finish_rows((visits.len(), &s.pad), head, logits),
+            Tail::Pass { at, kept } => {
+                r.finish((visits.len(), &s.pad), head, logits, at, kept)?;
+                // The pass runs its head on a row at a time, so the final normed row of every
+                // row is laid for the draft here: the head's mix rows under the head's norm,
+                // into the stream, which the head's mix has read.
+                if let Some(t) = r.draft.as_deref_mut()
+                    && let Some(i) = t.slot(visits.len())
+                {
+                    let (gpu, w, m, n) = (r.gpu, r.w, r.m, r.d.n);
+                    let b = &mut *r.b;
+                    gpu.elem().enqueue_rms_norm(
+                        gpu.stream(),
+                        &b.fmix,
+                        w.f32_buf(WHAT, &names::output_norm())?,
+                        r.eps,
+                        n,
+                        m,
+                        &mut b.x,
+                    )?;
+                    let x = &b.x;
+                    t.enter(gpu.stream(), i, x, m)?;
+                }
+            }
+            Tail::Verify => {
+                r.finish_rows((visits.len(), &s.pad), head, logits)?;
+                // The verify's head holds every row: its normed rows are the tap's.
+                if let Some(t) = r.draft.as_deref_mut()
+                    && let Some(i) = t.slot(visits.len())
+                {
+                    t.enter(r.gpu.stream(), i, head.normed(), r.m)?;
+                }
+            }
         }
+        Ok(())
     }
 }
 
@@ -758,8 +874,9 @@ struct HostedIo<'a> {
 struct PlacedProgram<'a> {
     r: RowWalk<'a>,
     visits: &'a [Visit],
-    /// The looped core's first stored layer, where a pass begins; `None` on a loopless file.
-    loop_core: Option<usize>,
+    /// The looped core: its first stored layer is where a pass begins and the layer past its last
+    /// the loop→coda boundary; `None` on a loopless file.
+    core: Option<Loop>,
     /// Whether the visits of a pass past the first run their messages.
     messages: bool,
     layers: &'a [Layer],
@@ -788,13 +905,16 @@ impl<'a> LayerProgram for PlacedProgram<'a> {
             stores,
             side,
             io,
-            loop_core,
+            core,
             messages,
             ..
         } = self;
         let layer = &layers[l];
-        if *loop_core == Some(l) {
+        if core.is_some_and(|lp| lp.core_start == l) {
             r.pass_edge(v.pass)?;
+        }
+        if core.is_some_and(|lp| lp.core_end == l) {
+            r.loop_boundary()?;
         }
         let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
         r.attn_half(k, (l, layer), &mut stores[k], msg)?;
@@ -854,6 +974,9 @@ struct RowWalk<'a> {
     forced: Option<(&'a PassForced, usize)>,
     /// A verify's own buffers; none on a prompt pass.
     verify: Option<&'a mut rows::VerifyBufs>,
+    /// A block draft's taps ([`GpuModel::set_draft_taps`]), laid as the step's walk lays them;
+    /// none on a load with no taps set (a placed one carries none).
+    draft: Option<&'a mut DraftTaps>,
     d: Dims,
     /// The pass's rows, and the rows the buffers hold (the banks' pitch).
     m: usize,
@@ -869,6 +992,9 @@ struct RowWalk<'a> {
     prelude: usize,
     n_msg: usize,
     banked: bool,
+    /// LoopCD-Hidden at the loop→coda boundary ([`RowWalk::pass_edge`],
+    /// [`RowWalk::loop_boundary`]); `None` off.
+    loopcd: Option<LoopCd>,
 }
 
 /// `src`'s values `[from, from + len)` into `dst` from `to`, one copy; nothing for none.
@@ -1025,9 +1151,38 @@ impl<'a> RowWalk<'a> {
             (&mut lp.msg_bank, 0),
             self.n_msg * pitch,
         )?;
+        // The rows' stream here is the core's output after `pass` passes (this edge opens pass
+        // `pass`, counted from 0): the rule's reference when `pass` is the reference pass `b`, kept
+        // until the boundary.
+        if self.loopcd.is_some_and(|cd| cd.reference == pass) {
+            copy_span(stream, (&b.x, 0), (&mut lp.h_ref, 0), mn)?;
+        }
         copy_span(stream, (&b.x, 0), (&mut lp.bank_last, 0), mn)?;
         self.pushed = self.prelude;
         copy_span(stream, (&lp.prelude, 0), (&mut b.x, 0), mn)
+    }
+
+    /// LoopCD-Hidden at the loop→coda boundary over the rows ([`super::Walk::loop_boundary`]):
+    /// the rows' stream past the core's last pass becomes `h + ω (h − h_b)` in place, `h_b` the
+    /// rows [`RowWalk::pass_edge`] saved; nothing off.
+    fn loop_boundary(&mut self) -> Result<(), GpuError> {
+        let Some(cd) = self.loopcd else {
+            return Ok(());
+        };
+        let b = &mut *self.b;
+        let lp =
+            b.lp.as_mut()
+                .ok_or(GpuError::state(CALL, "a looped trunk's saved pass"))?;
+        self.k.loop_cd.enqueue(
+            self.gpu.stream(),
+            LoopCdArgs {
+                h_b: &lp.h_ref,
+                omega: cd.omega,
+                n: self.d.n,
+                m: self.m,
+            },
+            &mut b.x,
+        )
     }
 
     /// The visit's attention half over the rows ([`super::Walk::attn_half`]): where the messages
@@ -1161,6 +1316,10 @@ impl<'a> RowWalk<'a> {
             let _ = mix;
             if layer.windowed { 0 } else { j }
         };
+        // A verify of a layer whose step runs the input norms and projections as one launch
+        // (`norm_proj` over Q8_0 sites) runs them as one launch over the rows, which norms its
+        // own inputs (`norm_proj`'s rows entry: each row the step's launch's bits).
+        let fused = self.verify.is_some() && layer.norm_proj && layer.q.ty == SiteTy::Q8_0;
         if let Some(c) = ctrl {
             let LoopRows { msg: msgs, h, .. } = lp
                 .as_mut()
@@ -1196,7 +1355,7 @@ impl<'a> RowWalk<'a> {
                     k.ctrl.enqueue_attn_rows(stream, modules, h, [y0, y1, y2])?;
                 }
             }
-            for (j, y) in mix.iter_mut().enumerate() {
+            for (j, y) in mix.iter_mut().enumerate().take(if fused { 0 } else { 3 }) {
                 gpu.elem().enqueue_rms_norm(
                     stream,
                     &xn[j],
@@ -1208,7 +1367,7 @@ impl<'a> RowWalk<'a> {
                 )?;
             }
         } else {
-            for (j, y) in xn.iter_mut().enumerate().take(n_in) {
+            for (j, y) in xn.iter_mut().enumerate().take(if fused { 0 } else { n_in }) {
                 let src = match layer.attn_query {
                     Some(_) => &mix[input(mix, j)],
                     None => &*x,
@@ -1230,7 +1389,55 @@ impl<'a> RowWalk<'a> {
         let normed: &[DeviceBuffer<f32>; 3] = if ctrl.is_some() { mix } else { xn };
         let tw = d.n_kv * d.taps;
         let dense = &*dense;
-        if self.verify.is_some() {
+        if fused {
+            // The step's launch over the rows: the inputs before their norms (a controller's
+            // outputs, else the attention mix's rows or the stream), inputs past the visit's
+            // count repeating input 0, unread.
+            let (ik, iv) = if n_in == 1 { (0, 0) } else { (1, 2) };
+            let at = |i: usize| if i < n_in { i } else { 0 };
+            let (xn, mix, x) = (&*xn, &*mix, &*x);
+            let src: [&DeviceBuffer<f32>; 3] =
+                std::array::from_fn(|i| match (ctrl.is_some(), layer.attn_query.is_some()) {
+                    (true, _) => &xn[at(i)],
+                    (false, true) => &mix[input(mix, at(i))],
+                    (false, false) => x,
+                });
+            let gain = [
+                w.f32_buf(CALL, &layer.norms[at(0)])?,
+                w.f32_buf(CALL, &layer.norms[at(1)])?,
+                w.f32_buf(CALL, &layer.norms[at(2)])?,
+            ];
+            let sink = w.f32_tensor(CALL, &layer.sink.name)?;
+            // A windowed layer has no taps: the sink rows stand in, unread.
+            let (kt, vt) = match &layer.taps {
+                Some([tk, tv]) => (w.f32_tensor(CALL, &tk.name)?, w.f32_tensor(CALL, &tv.name)?),
+                None => (sink, sink),
+            };
+            k.proj.enqueue_rows(
+                stream,
+                NormProjArgs {
+                    x: src,
+                    gain,
+                    ik,
+                    iv,
+                    eps: self.eps,
+                    k: n,
+                    fault,
+                    q8: [
+                        q8_site(w, &layer.q, q)?,
+                        q8_site(w, &layer.k, k_raw)?,
+                        q8_site(w, &layer.v, v_raw)?,
+                        q8_site(w, &layer.rel, r)?,
+                        q8_site(w, &layer.gate, gate)?,
+                    ],
+                    sink: F32Site { w: sink, y: sinks },
+                    kt: F32Site { w: kt, y: k_taps },
+                    vt: F32Site { w: vt, y: v_taps },
+                    taps: layer.taps.is_some(),
+                },
+                m,
+            )?;
+        } else if self.verify.is_some() {
             // The step's sites (`norm_proj`'s outputs are these gemvs' bits) over the rows.
             let (ik, iv) = if n_in == 1 { (0, 0) } else { (1, 2) };
             let gemv = |site: &Site, x: &DeviceBuffer<f32>, y: &mut DeviceBuffer<f32>| {

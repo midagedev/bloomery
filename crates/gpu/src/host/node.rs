@@ -16,7 +16,9 @@
 //! carries the tier's rows of node 0's plan ([`NodeOpen`]); the server loads
 //! them from its own copy of the model file, which must match the tier's
 //! set, each row's tensor and the sha256 of its header and bytes, and builds the
-//! family's tier computation over them ([`NodeFamily`]).
+//! family's tier computation over them ([`NodeFamily`]). A server with no
+//! model file says so in its census, and node 0 streams it the rows from its
+//! own file ([`load`]).
 //!
 //! Every read and write of the channel is bounded: a request and its reply
 //! by one deadline, the open by one its rows' bytes give ([`open_bound`]).
@@ -27,7 +29,11 @@
 //! as enqueue frames, one a layer: a replayed chain's every layer the node
 //! holds experts of, written together at the pass's start
 //! ([`TierNode::send_listed`]); an eager chain's only the layers whose picks
-//! name its slots, each at its picks ([`TierNode::send_enqueue`]). Node 0
+//! name its slots, each at its picks ([`TierNode::send_enqueue`]). The
+//! server runs a frame's layer as one graph launch: each service — a layer
+//! of a row over its columns — is captured into a graph of its own at its
+//! first frame and launched at every frame that names it
+//! ([`super::tier::TierWork::enqueue_graph`]). Node 0
 //! ends each pass that sent it a frame with an end frame
 //! ([`TierNode::send_end`]), and sends nothing more for a pass whose card it
 //! named lost. The server ends when node 0's channel ends without a close,
@@ -48,6 +54,7 @@
 //! is unread.
 
 pub mod block;
+pub mod load;
 pub mod wire;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -147,6 +154,9 @@ pub struct NodeCensus {
     /// The node's available host bytes and the reading that supplied them.
     pub host_room: (u64, HostRead),
     pub arena_given: Option<u64>,
+    /// Whether the node holds a model file: one that holds none is fed its
+    /// tier's rows by node 0 at open ([`load`]).
+    pub file: bool,
 }
 
 impl NodeCensus {
@@ -162,6 +172,7 @@ impl NodeCensus {
                 .map_err(|e| GpuError::plan(SERVER, e))?,
             arena_given: workstation::nvtier_arena_given()
                 .map_err(|e| GpuError::plan(SERVER, e))?,
+            file: true,
         })
     }
 
@@ -180,7 +191,7 @@ impl NodeCensus {
             Some(bytes) => o.u8(1).u64(bytes),
             None => o.u8(0),
         };
-        o.len(self.devices.len());
+        o.u8(u8::from(self.file)).len(self.devices.len());
         for d in &self.devices {
             o.u32(d.ordinal)
                 .str(&d.name)
@@ -226,6 +237,7 @@ impl NodeCensus {
         } else {
             None
         };
+        let file = i.flag("model file")?;
         let n = i.len("device count")?;
         if n == 0 {
             return Err("a census of no device".to_string());
@@ -267,6 +279,7 @@ impl NodeCensus {
             devices,
             host_room,
             arena_given,
+            file,
         })
     }
 }
@@ -506,7 +519,26 @@ impl NodeOpen {
             ));
         }
         let card = if let Some(addr) = node {
-            TierCard::on_node(TierNode::open(addr, &self)?, self.name, self.set)
+            let tier = if census.file {
+                if self.rows.iter().any(|r| r.sha256.is_empty()) {
+                    self.rows = NodeOpen::rows_of(plan, file, self.card, card_dontneed)?;
+                }
+                TierNode::open(addr, &self)?
+            } else {
+                let wire =
+                    match bloomery_levers::tier_link().map_err(|e| GpuError::plan(WHAT, e))? {
+                        bloomery_levers::TierLink::Rdma => load::LoadWire::Rdma,
+                        _ => load::LoadWire::Tcp,
+                    };
+                let feed = load::Feed {
+                    file,
+                    model: plan.model,
+                    release: card_dontneed,
+                    wire,
+                };
+                TierNode::open_fed(addr, &self, &feed)?
+            };
+            TierCard::on_node(tier, self.name, self.set)
         } else {
             let gpu = Gpu::open_card(&self.name, self.device)?;
             let tensors = (family.tensors)(file)?;
@@ -643,17 +675,21 @@ impl NodeOpen {
         })
     }
 
-    /// [`NodeOpen::rows_of`] of the tier `t` opens, in a load whose card segments' pages
-    /// go once uploaded when `card_dontneed`: released once hashed when the tier is on a
-    /// node, whose process reads them; kept for a tier card of this process, whose upload
-    /// reads them next.
+    /// [`NodeOpen::rows_of`] of the tier `t` opens, kept in the page cache for a tier card
+    /// of this process, whose upload reads them next. A tier on a node takes its rows
+    /// unhashed ([`NodeOpen::rows_unhashed`]): its open hashes them once the node's census
+    /// says whether it reads its own file ([`NodeOpen::open_tier_from`]), and a node with
+    /// none is fed them from this file, hashed as they are read ([`load`]), so no row of
+    /// the node's is read here twice.
     pub fn tier_rows(
         plan: &Plan<'_>,
         file: &Split,
         t: &TierOpen,
-        card_dontneed: bool,
     ) -> Result<Vec<NodeRow>, GpuError> {
-        Self::rows_of(plan, file, t.card, t.node.is_some() && card_dontneed)
+        if t.node.is_some() {
+            return Self::rows_unhashed(plan, t.card);
+        }
+        Self::rows_of(plan, file, t.card, false)
     }
 
     /// [`NodeOpen::rows_of`] for a tier whose segments a part source loads
@@ -1266,6 +1302,16 @@ impl TierNode {
     /// be one the node sends in its census on this connection. The node's
     /// load is waited for under [`open_bound`]. Load-time only.
     pub fn open(addr: SocketAddr, open: &NodeOpen) -> Result<TierNode, GpuError> {
+        let mut node = TierNode::connected(addr, open)?;
+        open.write(node.req.clear())?;
+        node.call(Tag::Open, open_bound(open)?, "open")?;
+        node.read_open_reply()?;
+        Ok(node)
+    }
+
+    /// A channel to the node at `addr` for the open of `open`, whose device
+    /// must be one the node sends in its census on this connection.
+    fn connected(addr: SocketAddr, open: &NodeOpen) -> Result<TierNode, GpuError> {
         let (ch, census) = connect(addr)?;
         let device = open
             .device
@@ -1283,7 +1329,7 @@ impl TierNode {
                 )
             })?
             .clone();
-        let mut node = TierNode {
+        let node = TierNode {
             addr,
             ch,
             req: Out::default(),
@@ -1299,9 +1345,13 @@ impl TierNode {
             control_round_trips: 0,
             lost: None,
         };
-        open.write(node.req.clear())?;
-        node.call(Tag::Open, open_bound(open)?, "open")?;
-        let mut i = In::new(node.ch.body());
+        Ok(node)
+    }
+
+    /// The open's reply, the last reply read: the tier's planes, resident
+    /// bytes and device bytes.
+    fn read_open_reply(&mut self) -> Result<(), GpuError> {
+        let mut i = In::new(self.ch.body());
         let r = (|| {
             let planes = (i.len("codes")?, i.len("scales")?);
             let resident = i.len("resident bytes")?;
@@ -1309,11 +1359,11 @@ impl TierNode {
             i.end()?;
             Ok::<_, String>((planes, resident, device))
         })();
-        let (planes, resident, device) = r.map_err(|e| node.lose_now("open", e))?;
-        node.planes = planes;
-        node.resident_bytes = resident;
-        node.device_bytes = device;
-        Ok(node)
+        let (planes, resident, device) = r.map_err(|e| self.lose_now("open", e))?;
+        self.planes = planes;
+        self.resident_bytes = resident;
+        self.device_bytes = device;
+        Ok(())
     }
 
     /// Mark the node lost by `why` in the request `what` and end its
@@ -1839,8 +1889,11 @@ impl Opened {
 struct Session<'a> {
     local_ip: std::net::IpAddr,
     reset_phase: u8,
-    file: &'a Arc<Split>,
+    /// The node's model file; with none, an open is fed by node 0 ([`load`]).
+    file: Option<&'a Arc<Split>>,
     families: &'a [NodeFamily],
+    /// A fed open whose rows node 0 is streaming, until its load's end.
+    loading: Option<load::NodeLoad>,
     opened: Option<Opened>,
     asked: u32,
     /// Enqueue frames taken since node 0 last ended a pass ([`Tag::End`]):
@@ -1850,6 +1903,9 @@ struct Session<'a> {
     reply: Out,
     /// Given the tier's page-word operations once an open succeeds.
     on_open: &'a mut dyn FnMut(&WordOps),
+    /// Given a line naming the rows of a fed open once the node is ready
+    /// for their bytes.
+    on_feed: &'a mut dyn FnMut(&str),
 }
 
 /// Serve the expert tier of one load on `listener`, from `file`: each
@@ -1867,7 +1923,20 @@ pub fn serve(
     listener: &TcpListener,
     file: &Arc<Split>,
     families: &[NodeFamily],
+    on_open: impl FnMut(&WordOps),
+) -> Result<(), GpuError> {
+    serve_on(listener, Some(file), families, on_open, |_| {})
+}
+
+/// [`serve`] from `file`, or with no model file: the census then says so and
+/// each open is fed by node 0 ([`load`]); `on_feed` is given a line naming
+/// a fed open's rows once the node is ready for their bytes.
+pub fn serve_on(
+    listener: &TcpListener,
+    file: Option<&Arc<Split>>,
+    families: &[NodeFamily],
     mut on_open: impl FnMut(&WordOps),
+    mut on_feed: impl FnMut(&str),
 ) -> Result<(), GpuError> {
     loop {
         let (s, peer) = listener
@@ -1881,14 +1950,18 @@ pub fn serve(
             reset_phase: 0,
             file,
             families,
+            loading: None,
             opened: None,
             asked: 0,
             pass: 0,
             seen: (0, Instant::now()),
             reply: Out::default(),
             on_open: &mut on_open,
+            on_feed: &mut on_feed,
         };
-        NodeCensus::here()?.write(&mut session.reply);
+        let mut census = NodeCensus::here()?;
+        census.file = file.is_some();
+        census.write(&mut session.reply);
         ch.send(Tag::Census, session.reply.done(), Instant::now() + REPLY)
             .map_err(lost)?;
         match session.run(&mut ch) {
@@ -1921,6 +1994,12 @@ impl Session<'_> {
                     continue;
                 }
                 Ok(Polled::Closed) => {
+                    if let Some(l) = &self.loading {
+                        return Err(format!(
+                            "the channel ended with no close while node 0 fed the tier's rows: {}",
+                            l.state()
+                        ));
+                    }
                     return match &self.opened {
                         None => Ok(Ended::Census),
                         Some(o) => Err(format!(
@@ -1932,6 +2011,12 @@ impl Session<'_> {
                 Err(e) => return Err(format!("the channel failed: {e}")),
             };
             if tag == Tag::Close {
+                if let Some(l) = &self.loading {
+                    return Err(format!(
+                        "node 0 closed the load while it fed the tier's rows: {}",
+                        l.state()
+                    ));
+                }
                 if !ch.body().is_empty() {
                     let e = GpuError::shape(
                         SERVER,
@@ -1970,6 +2055,11 @@ impl Session<'_> {
                 }
             };
             if let Some(e) = fatal {
+                if tag == Tag::Load {
+                    return Err(format!(
+                        "the fed load failed, which ends it on both sides: {e}"
+                    ));
+                }
                 return Err(format!(
                     "a {tag:?} request failed after it reached the tier's stream: {e}"
                 ));
@@ -2049,8 +2139,14 @@ impl Session<'_> {
         if self.reset_phase != 0 && tag != Tag::Reset {
             return Err(bad("the remote reset is incomplete".to_string()).into());
         }
+        if self.loading.is_some() && tag != Tag::Load {
+            return Err(Failed::Fatal(bad(
+                "a request other than a load while node 0 feeds the tier's rows".to_string(),
+            )));
+        }
         match tag {
             Tag::Open => self.handle_open(&mut i, bad)?,
+            Tag::Load => self.handle_load(&mut i, bad)?,
             Tag::Bind => {
                 let mode = i.u8("bind mode").map_err(bad)?;
                 match mode {
@@ -2114,7 +2210,9 @@ impl Session<'_> {
                 i.end().map_err(bad)?;
                 let o = self.opened()?;
                 o.check_service(layer, row, cols)?;
-                o.work.enqueue(layer, row, cols).map_err(Failed::Fatal)?;
+                o.work
+                    .enqueue_graph(layer, row, cols)
+                    .map_err(Failed::Fatal)?;
                 self.ask(1);
             }
             Tag::End => {
@@ -2327,8 +2425,52 @@ impl Session<'_> {
         bad: impl Fn(String) -> GpuError,
     ) -> Result<(), Failed> {
         let open = NodeOpen::read(i).map_err(&bad)?;
-        i.end().map_err(&bad)?;
+        if i.end().is_err() {
+            let head = load::StreamHead::read(i).map_err(&bad)?;
+            i.end().map_err(&bad)?;
+            if self.opened.is_some() {
+                return Err(GpuError::shape(SERVER, "a second open on one connection").into());
+            }
+            let (rows, bytes) = (
+                open.rows.len(),
+                open.rows.iter().map(|r| r.resident_bytes).sum::<u64>(),
+            );
+            let l =
+                load::NodeLoad::open(self.families, open, head, self.local_ip, &mut self.reply)?;
+            (self.on_feed)(&format!(
+                "fed open: node 0 streams {rows} rows ({bytes} resident bytes)"
+            ));
+            self.loading = Some(l);
+            return Ok(());
+        }
         let work = self.open(&open)?;
+        self.opened_with(work, open);
+        Ok(())
+    }
+
+    /// A load request of the fed open ([`load::NodeLoad::take`]); its end
+    /// opens the tier as an open does. Any refusal ends the load on both
+    /// sides.
+    fn handle_load(
+        &mut self,
+        i: &mut In<'_>,
+        bad: impl Fn(String) -> GpuError,
+    ) -> Result<(), Failed> {
+        let Some(l) = self.loading.as_mut() else {
+            return Err(bad("a load request with no fed open".to_string()).into());
+        };
+        if !l.take(i).map_err(|e| Failed::Fatal(bad(e)))? {
+            return Ok(());
+        }
+        let l = self.loading.take().expect("a load whose end was taken");
+        let (work, open) = l.end(self.families).map_err(Failed::Fatal)?;
+        self.opened_with(work, open);
+        Ok(())
+    }
+
+    /// Hold `work`, the tier `open` opened, and write the open's reply: its
+    /// planes and bytes.
+    fn opened_with(&mut self, work: TierWork, open: NodeOpen) {
         (self.on_open)(work.word_ops());
         let (q3, d8) = work.planes();
         self.reply
@@ -2343,7 +2485,6 @@ impl Session<'_> {
             cols: open.cols,
             block: None,
         });
-        Ok(())
     }
 
     /// The tier `open` names: its card by name and device, checked against
@@ -2361,6 +2502,13 @@ impl Session<'_> {
         if self.opened.is_some() {
             return Err(GpuError::shape(SERVER, "a second open on one connection"));
         }
+        let file = self.file.ok_or_else(|| {
+            GpuError::shape(
+                SERVER,
+                "an open of rows from this node's own model file: this node holds none, and \
+                 node 0 feeds such a node its tier's rows (its census says it holds no file)",
+            )
+        })?;
         let family = self
             .families
             .iter()
@@ -2375,11 +2523,11 @@ impl Session<'_> {
                     ),
                 )
             })?;
-        let tensors = (family.tensors)(self.file)?;
+        let tensors = (family.tensors)(file)?;
         let rows = open.rows_on(&tensors)?;
         for (r, row) in open.rows.iter().zip(&rows) {
             let (t, seg) = (&tensors.tensors[row.tensor], &row.segments[0]);
-            let sha256 = segment_sha256(self.file, tensors.experts, t, seg)?;
+            let sha256 = segment_sha256(file, tensors.experts, t, seg)?;
             if sha256 != r.sha256 {
                 return Err(GpuError::shape(
                     SERVER,
@@ -2393,11 +2541,10 @@ impl Session<'_> {
         }
         let gpu = Gpu::open_card(&open.name, open.device)?;
         let (w, experts) = if open.nvme.is_some() {
-            open.load_host(&gpu, self.file, &tensors, family)?
+            open.load_host(&gpu, file, &tensors, family)?
         } else {
-            let w =
-                Weights::load_rows_released(gpu.stream(), self.file, &tensors, &rows, open.card)?;
-            let experts = (family.experts)(&gpu, self.file, &tensors, &w, open)?;
+            let w = Weights::load_rows_released(gpu.stream(), file, &tensors, &rows, open.card)?;
+            let experts = (family.experts)(&gpu, file, &tensors, &w, open)?;
             (w, experts)
         };
         TierWork::open(gpu, w, experts, open.shape, open.cols)
@@ -2409,6 +2556,15 @@ impl Session<'_> {
     /// A stream that did not drain may still touch the work's buffers and
     /// the page, so the work is then never freed: the process ends with it.
     fn end_lost(&mut self, peer: SocketAddr, why: &str) -> GpuError {
+        if let Some(l) = self.loading.take() {
+            return GpuError::link(
+                SERVER,
+                format!(
+                    "node 0 at {peer} is lost while it fed the tier's rows ({}): {why}",
+                    l.state()
+                ),
+            );
+        }
         let Some(o) = self.opened.take() else {
             return GpuError::link(SERVER, format!("node 0 at {peer} is lost: {why}"));
         };
@@ -2669,14 +2825,16 @@ pub(super) mod tests {
         let session = Session {
             local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             reset_phase: 0,
-            file: &file,
+            file: Some(&file),
             families: &[family],
+            loading: None,
             opened: None,
             asked: 0,
             pass: 0,
             seen: (0, Instant::now()),
             reply: Out::default(),
             on_open: &mut |_| {},
+            on_feed: &mut |_| {},
         };
         let error = session
             .open(&open)
@@ -2820,14 +2978,16 @@ pub(super) mod tests {
         let session = Session {
             local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             reset_phase: 0,
-            file: &files[1],
+            file: Some(&files[1]),
             families: &[family],
+            loading: None,
             opened: None,
             asked: 0,
             pass: 0,
             seen: (0, Instant::now()),
             reply: Out::default(),
             on_open: &mut |_| {},
+            on_feed: &mut |_| {},
         };
         let error = session
             .open(&open)
@@ -2855,8 +3015,9 @@ pub(super) mod tests {
         let mut session = Session {
             local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             reset_phase: 0,
-            file: &file,
+            file: Some(&file),
             families: &[],
+            loading: None,
             opened: Some(super::Opened {
                 work,
                 name: "test tier".into(),
@@ -2869,6 +3030,7 @@ pub(super) mod tests {
             seen: (0, Instant::now()),
             reply: Out::default(),
             on_open: &mut |_| {},
+            on_feed: &mut |_| {},
         };
         assert!(matches!(
             session.handle(Tag::Release, &[]),
@@ -2906,8 +3068,9 @@ pub(super) mod tests {
         let mut session = Session {
             local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             reset_phase: 0,
-            file: &file,
+            file: Some(&file),
             families: &[],
+            loading: None,
             opened: Some(super::Opened {
                 work,
                 name: "test tier".into(),
@@ -2920,6 +3083,7 @@ pub(super) mod tests {
             seen: (0, Instant::now()),
             reply: Out::default(),
             on_open: &mut |_| {},
+            on_feed: &mut |_| {},
         };
         let mut req = Out::default();
         req.len(1).len(0).len(1);
@@ -3112,14 +3276,16 @@ pub(super) mod tests {
         let mut session = Session {
             local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             reset_phase: 0,
-            file: &file,
+            file: Some(&file),
             families: &[],
+            loading: None,
             opened: None,
             asked: 4,
             pass: 0,
             seen: (4, t0),
             reply: Out::default(),
             on_open: &mut |_| {},
+            on_feed: &mut |_| {},
         };
         assert!(
             session.stopped_at(4, past + hour).is_ok(),
@@ -3431,6 +3597,7 @@ pub(super) mod tests {
                 devices: vec![gb10(7)],
                 host_room: (1234, read),
                 arena_given: Some(0),
+                file: true,
             };
             let mut out = Out::default();
             census.write(&mut out);
@@ -3469,12 +3636,20 @@ pub(super) mod tests {
             host_room: (u64::MAX, HostRead::Given),
             arena_given: None,
             devices: vec![gb10(7)],
+            file: true,
         };
         let mut o = Out::default();
         census.write(&mut o);
         let mut i = In::new(o.done());
         assert_eq!(NodeCensus::read(&mut i), Ok(census.clone()));
         assert!(i.end().is_ok());
+        let fileless = NodeCensus {
+            file: false,
+            ..census.clone()
+        };
+        let mut o = Out::default();
+        fileless.write(&mut o);
+        assert_eq!(NodeCensus::read(&mut In::new(o.done())), Ok(fileless));
         let mut full = gb10(8);
         full.free_bytes = full.total_bytes + 1;
         for bad in [Vec::new(), vec![full], vec![gb10(7), gb10(7)]] {
@@ -3581,14 +3756,16 @@ pub(super) mod tests {
         let mut session = Session {
             local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
             reset_phase: 0,
-            file: &file,
+            file: Some(&file),
             families: &[],
+            loading: None,
             opened: None,
             asked: 0,
             pass: 0,
             seen: (0, Instant::now()),
             reply: Out::default(),
             on_open: &mut |_| {},
+            on_feed: &mut |_| {},
         };
         session.reset_phase = 1;
         for (tag, payload) in [(Tag::Launch, vec![]), (Tag::Reset, vec![0])] {

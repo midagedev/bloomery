@@ -1,5 +1,5 @@
 //! Gate: ERNIE 5.5 Flash Preview's chat in `/apply-template` and `/v1/chat/completions`, and its tool calls
-//! (`crates/serve/src/ernie55.rs`, `templates/ernie55.jinja`, `erniexml.rs`).
+//! (`crates/serve/src/ernie.rs`, `templates/ernie55.jinja`, `erniexml.rs`).
 //!
 //! The checkpoint ships no chat template: its renderer is Python, and `tests/fixtures/ernie55-renders.json` holds
 //! that renderer's text for every case of `render_ernie55.py` (plain chat, a system turn, multi-turn, tools offered,
@@ -26,7 +26,7 @@ use gguf::Value as Gguf;
 use serde_json::{Value, json};
 use serve::callstream::CallPiece;
 use serve::dsml::{ChatParser, MarkupError, Message, ToolFormat, Tools};
-use serve::ernie55::{CALL_CLOSE, CALL_OPEN, MASK, TEMPLATE, THINK};
+use serve::ernie::{CALL_CLOSE, CALL_OPEN, MASK, TEMPLATE, THINK};
 use serve::erniexml::ErnieXmlError;
 use serve::glmxml::ArgTypes;
 use serve::reasoning::{ReasoningFormat, ThinkEntry};
@@ -315,7 +315,7 @@ fn hw_ernie55_prompt_ids_are_the_vendors_runs() {
     let vocab = Arc::new(vocabulary());
     for (text, id) in [
         (MASK, MASK_ID),
-        (serve::ernie55::END, END_ID),
+        (serve::ernie::END, END_ID),
         (CALL_OPEN, CALL_OPEN_ID),
         (CALL_CLOSE, CALL_CLOSE_ID),
         (THINK.close, THINK_CLOSE_ID),
@@ -899,7 +899,7 @@ fn hw_ernie55_markers_are_markup_only_where_their_tokens_wrote_them() {
 #[ignore = "gate: the ERNIE 5.5 folder's tokenizer.json on the box"]
 fn hw_ernie55_a_message_ends_on_the_mask_and_the_turn_end() {
     let vocab = Arc::new(vocabulary());
-    for end in [MASK, serve::ernie55::END] {
+    for end in [MASK, serve::ernie::END] {
         let addr = scripted(
             Arc::clone(&vocab),
             vocab.encode(&format!("Hello!</ernie:think>Bye!{end}and a new turn")),

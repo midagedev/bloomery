@@ -19,9 +19,9 @@
 //! ([`TierRule::UNTIERED`]).
 //!
 //! A folder carries no `tokenizer.chat_template` (the vendor's renderer is Python), so the seat
-//! serves the server's port of it ([`Family::TEMPLATE`], `serve::ernie55::TEMPLATE`) unless
+//! serves the server's port of it ([`Family::TEMPLATE`], `serve::ernie::TEMPLATE`) unless
 //! `--chat-template-file` names another, and the server splits the reply's think span
-//! (`serve::ernie55::THINK`) into `reasoning_content`.
+//! (`serve::ernie::THINK`) into `reasoning_content`.
 
 use std::path::Path;
 
@@ -82,7 +82,7 @@ impl Family for Ernie55 {
     const SERVES: &'static str = "ernie5_5";
 
     /// The server's port of the vendor's renderer: a folder carries no template.
-    const TEMPLATE: Option<&'static str> = Some(serve::ernie55::TEMPLATE);
+    const TEMPLATE: Option<&'static str> = Some(serve::ernie::TEMPLATE);
 
     /// A checkpoint folder of an `ernie5_5` model ([`super::folder::open`]): its located header,
     /// tokenizer and part source; a path that is not a directory is a GGUF split.
@@ -160,10 +160,10 @@ impl Family for Ernie55 {
         record::Record::new(&record::LOAD_HYBRID)
     }
 
-    /// The renderer's think span (`serve::ernie55::THINK`): the description reads no template from
+    /// The renderer's think span (`serve::ernie::THINK`): the description reads no template from
     /// a folder, so the seat names the span the server's port writes.
     fn think_tags(_inputs: &PlanInputs) -> Result<Option<ThinkTags>, GateError> {
-        Ok(Some(serve::ernie55::THINK))
+        Ok(Some(serve::ernie::THINK))
     }
 }
 

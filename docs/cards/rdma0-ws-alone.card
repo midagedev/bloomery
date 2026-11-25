@@ -1,0 +1,30 @@
+# Round rdma0 (kind baseline): the reference row of the ws + Spark RDMA sitting. V4.1-Flash bq3km on ws alone, one RTX 5090 32 GB and
+# the 32-core host (252 GiB), ctx 16384, place unset (plan a). The node arms (rdma0-node-rdma.card) are read against it; it runs
+# before them and once after them, and the drift between the two is the window's.
+# [measured] the 11-17 look2 (same machine and file, commit 4b258a7f, specs/day1117/spark5090-r2.log): plan a holds card_experts=1581,
+# host_experts=13779, paged 20.1 GB. A fresh server's FIRST request is cold (majflt 66,986, 24 MB a step read in decode): 29.0 tok/s,
+# 34.5 ms (the README's 30.24 is this regime). The same server's requests 5..8 at D 512 (majflt 114..1071): 57.1, 60.6, 61.3, 62.7 tok/s
+# = 16.5, 16.3, 15.9 ms (the first of the four 17.5). D 4096: 31.6 then 40.1 tok/s while the page cache still fills.
+# [derived] warm, the step is the card front (~14.5 ms, serial) + ~2 ms exposed host leg: the host leg (DRAM, 100 slots x 142 us) and the
+# paged reads sit under the front once the 20 GB paged set is in the page cache; cold, the paged reads (24 MB a step at ~1.4 GB/s of
+# page faults) add ~18 ms. The runner tags a row [cold] at 1 % of its window (COLD_US 75, COLD_PCT 1: ~870 faults at a 6.5 s window), so a
+# cold first request is out of the means and the warm rows (the [shared] rows of the fold included) are the mean.
+# [measured 2026-11-25, untimed 4.1 look, no lease] bq3km on ws, place unset: plan a card_experts=1581 (26.6 GB), host_experts=13779
+# (232.1 GB), paged=0 (the 11-17 look2 file, Q3_K_M, paged 20.1 GB; ws no longer holds it). So the cold regime below is the page cache's,
+# not a paged set's; the warm band is kept from look2 [derived: same card front, the host leg's bytes 7 % fewer].
+kind: baseline
+question: what decode rate does ws alone read on V4.1 bq3km at ctx 16384 on warm rows, the row the node arms are read against
+term: tg tok/s of the warm rows (no [cold] tag; a [shared] row of the fold counts) @ n=128, prose D=512, ctx 16384, one slot, serving defaults, RTX 5090 + host 252 GiB, main 759512396, place unset
+unit: tok/s
+predict: 55..64
+condition: one bloomery-serve binary of tree bloomery-rdma0 (main 759512396, built by the recipe on ws), BLOOMERY_V41_MODEL the bq3km shard 1 (/models/DeepSeek-V4.1-Flash-1017-bq3km/DeepSeek-V4.1-Flash-1017-bq3km-00001-of-00009.gguf, the
+  file the Spark's tier_server holds), DEPTH_SERVE_CTX=16384 DEPTH_SERVE_N=128 DEPTH_SERVE_FOLD=depths, arms D 512, 1024 and 4096 on one label,
+  BLOOMERY_AB_ROUNDS=3, a fresh server a round; no compute process on the 5090 but ours (ComfyUI is not running, or paused by the user's word);
+  the plan line names place=a, card_experts=1581 and the paged GB; MemAvailable on ws is read before each server and printed beside the row
+reason: the reference for the node arms: the same binary, file, context and card, so a node row is read as a ratio to this one, and the second
+  run after the node arms gives the window's drift (AGENTS.md: the same commit moves ~5 % between windows)
+decide-in: take it as the reference; the node arms' predicted 43..50 tok/s is read against its mean and the drift between its two runs
+decide-below: under 55 with a warm tag: read the plan line's card_experts and paged GB and the rows' majflt first; a warm row with majflt over 500 is a
+  half-warm page cache, not the engine; the cold rows (29..35, tagged) are the README's regime and are reported beside the mean, not in it
+decide-above: over 64: read card_experts (more card room than 1581 shortens the host leg) and whether the prompt's routing repeats a hot set;
+  the node arms' ratio is read against this row, not against the README's 30.24

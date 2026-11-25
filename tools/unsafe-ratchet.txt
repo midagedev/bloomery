@@ -897,7 +897,16 @@ gguf 7 2 0
 # PIN(2026-11-24): gpu 3556 -> 3565 blocks, new code, not old code relaxed: the replay-scratch owner's ten driver
 # queries (graph.rs's parameter words, replay_scratch.rs's pointer attributes, address ranges and copies), one block a
 # call with its SAFETY line; the controllers' rows-form down block gives one back.
-gpu 3565 459 10
+# PIN(2026-11-25): gpu 3565/459 -> 3799/482, new code, not old code relaxed: ERNIE 5.5's kernel launchers (compress.rs, hc.rs,
+# hc_f32.rs, hc_f32_pieces.rs, hca.rs, rope_tail.rs, multimax.rs, vha.rs; the existing indexer, route, gemm and index_key launchers
+# gained its entries), one block a launch or driver call, each with its SAFETY line.
+# PIN(2026-11-25): gpu 3799/482 -> 3804/483, new code: the tier node's page copy (host/tier.rs `TierCopy::enqueue` and its
+# span windows, host/node.rs's two calls of it), each block with its SAFETY line.
+# PIN(2026-11-25): gpu 3804/483 -> 3831/486, new code, not old code relaxed: the m-row norm projections' launchers
+# (norm_proj.rs), Inkling 2's LoopCD launch (arch/inkling2/loop_cd.rs), the node's load with no model file
+# (host/node/load.rs) and the dense draft's anchor read (dspark/dense.rs), one block a launch or driver call, each with
+# its SAFETY line.
+gpu 3831 486 10
 # PIN(2026-10-01): gpu-deepseek41 459 -> 464 blocks, 51 -> 52 fns, a new kernel entry, not old code relaxed:
 # ds41_ffn_card_acc_8_tier (the tier form of the card sum at 8 slots, chain/ffn/batch.rs) adds its two blocks and
 # card_acc_tier_at (the one unsafe fn) with its three, each with its SAFETY line.
@@ -952,6 +961,9 @@ gpu 3565 459 10
 # `ds41_ffn_pass_map` (chain/ffn/batch.rs: the slot map read, the batch row read and the place store), each
 # with its SAFETY line.
 gpu-deepseek41 358 43 0
+# PIN(2026-11-25): gpu-ernie55 starts at 1 block, 0 fns and 0 impls: head.rs head_sink binds the head's fault layer code
+# through `FaultSink::at_layer`, with its SAFETY line (the code is below `LAYER_NONE`).
+gpu-ernie55 1 0 0
 # PIN(2026-10-24): gpu-flint starts at 2 blocks, 0 fns and 0 impls: step and prompt
 # call the checked common attention binding with staged distinct positions, each with SAFETY.
 # PIN(2026-11-13): gpu-flint 2 -> 3 blocks, new code, not old code relaxed: the MTP draft's layer call

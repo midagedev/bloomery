@@ -322,13 +322,21 @@ impl<B: ChainBody + 'static> ServedSpark<B> {
             return body(n);
         }
         let window = self.window.window();
-        let (k, why) = body(n.saturating_sub(window));
-        let why = format!(
-            "the DSpark draft starts over, so the prompt call carries its window of \
-             {window} positions: cut to at most {}{}",
-            n.saturating_sub(window),
-            why.map(|w| format!(", then {w}")).unwrap_or_default()
-        );
+        let carried = n.saturating_sub(window);
+        let (k, why) = body(carried);
+        let then = why.map(|w| format!(", then {w}")).unwrap_or_default();
+        // A draft with no window keeps every position: its next prompt call feeds it every id.
+        let why = if window == usize::MAX {
+            format!(
+                "the DSpark draft starts over and keeps every position, so the prompt call feeds \
+                 it every id: cut to at most {carried}{then}"
+            )
+        } else {
+            format!(
+                "the DSpark draft starts over, so the prompt call carries its window of \
+                 {window} positions: cut to at most {carried}{then}"
+            )
+        };
         (k, Some(why))
     }
 

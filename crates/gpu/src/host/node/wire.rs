@@ -10,9 +10,11 @@ use std::net::{Shutdown, TcpStream};
 use std::time::{Duration, Instant};
 
 /// The protocol's version, the census's first word: a node of another
-/// version is refused by name. Version 9 is a prompt batch's block on the
-/// node: the block open and the block request with its packed rows.
-pub(super) const VERSION: u32 = 9;
+/// version is refused by name. Version 10 is a node with no model file: the
+/// census says whether the node holds one, and an open of a node without one
+/// is followed by the load requests that carry its tier's rows
+/// ([`super::load`]).
+pub(super) const VERSION: u32 = 10;
 
 /// The longest frame either side takes. A prompt block's reply is the
 /// largest, an f32 row for every slot of the block the node computes; a
@@ -50,6 +52,7 @@ pub enum Tag {
     Release = 13,
     BlockOpen = 14,
     End = 15,
+    Load = 16,
     Ok = 100,
     Err = 101,
 }
@@ -72,6 +75,7 @@ impl Tag {
             Tag::Release,
             Tag::BlockOpen,
             Tag::End,
+            Tag::Load,
             Tag::Ok,
             Tag::Err,
         ]

@@ -97,6 +97,7 @@ pub use placed::Placed;
 use placed::{PlacedOpen, StepWalk, plan_map};
 use prefill::{PASS_ROWS_MAX, PassSizes, Prompt, choose_pass_rows, placed_rows};
 pub use stream::STREAM_FLOOR;
+pub use tier::NODE_FAMILY;
 
 const WHAT: &str = "musespark::Body::load";
 const STEP: &str = "musespark::Body::enqueue_chain";

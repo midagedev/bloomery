@@ -45,6 +45,9 @@
 #              gate plan's card (the stage's 2 GiB beside the tier's share), so the host holds fewer than the gate plan's
 #              209.52e9 B; the e2e row's 211e9 is the upper bound [derived], read the plan line of the first real run and
 #              replace it. The two loads run one after the other.
+#   mistrallarge4-node --place bp with the tier on a loopback node under the same card budget (`gate_mistrallarge4_twocard --node`):
+#              the plan's host experts are those of the twocard row, so its 211e9 bound holds [derived]; the union run and the node
+#              run load one after the other, and the node's tier_server holds only its tier's rows.
 #   mistrallarge4-xstream --place a under gate_mistrallarge4_xstream's card budget (the stage keeps the stream's ring and 8 GiB of
 #              routed experts, so the host holds the gate plan's 209.52e9 B less what the stage holds more) and --place bp under the
 #              two-card gate's budget: the e2e row's 211e9 is the upper bound of both [derived], read the plan lines of the first
@@ -117,6 +120,7 @@ gate-gpu-mistrallarge4-prefill	-	211000000000
 gate-gpu-mistrallarge4-verify	-	211000000000
 gate-gpu-mistrallarge4-serve	-	222000000000
 gate-gpu-mistrallarge4-twocard	-	211000000000
+gate-gpu-mistrallarge4-node	-	211000000000
 gate-gpu-mistrallarge4-residency	-	222000000000
 gate-gpu-mistrallarge4-xstream	-	211000000000
 gate-gpu-musespark-prefill	-	204000000000

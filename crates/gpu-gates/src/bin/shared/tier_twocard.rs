@@ -1,5 +1,6 @@
-//! What the two-card tier gates share (`gate_glm5next_twocard`, `gate_solar2_twocard`): plan (b′) against the same
-//! plan with every tier segment on the stage card, the legs' reads, and the per-layer counters of what the tier was sent.
+//! What the two-card tier gates share (`gate_glm5next_twocard`, `gate_solar2_twocard`, `gate_mistrallarge4_twocard`):
+//! plan (b′) against the same plan with every tier segment on the stage card, the legs' reads, and the per-layer
+//! counters of what the tier was sent.
 //! The reference of a two-card run is the stage card opened alone over the union of its experts and the tier's
 //! ([`model::placement::union_plan`]): the tier's slots computed by the stage card's own launches, so the two-card run must read the same
 //! tokens and logits rows bit for bit ([`same`]). A gate includes it by `#[path]`, with `#[allow(dead_code)]` for the
@@ -96,6 +97,35 @@ pub fn tier_on_card(
         stage.1,
         tier.set().experts(),
         tier_gpu.device_name()?,
+        tier.resident_bytes(),
+    );
+    Ok(())
+}
+
+/// Refused unless `hybrid`'s tier is the one expert tier of plan (b′) on a node (`BLOOMERY_TIER_NODES`), a
+/// card of the node's census; prints the load line as [`tier_on_card`] does, `what` its name, `t0` the load's
+/// start and `stage` the stage card's name and resident bytes.
+pub fn tier_on_node(
+    what: &str,
+    t0: Instant,
+    stage: (&str, usize),
+    hybrid: &Hybrid<HostRun>,
+) -> Result<(), GateError> {
+    let tier = hybrid
+        .tiers()
+        .first()
+        .ok_or("the (b′) load holds no tier card")?;
+    let (addr, device) = tier
+        .node()
+        .zip(tier.node_device())
+        .ok_or("the load's tier is a card of this process, not a node's")?;
+    println!(
+        "{what} in {:.1} s: stage {} ({} B), tier {} experts on node {addr}'s {} ({} B)",
+        t0.elapsed().as_secs_f64(),
+        stage.0,
+        stage.1,
+        tier.set().experts(),
+        device.name,
         tier.resident_bytes(),
     );
     Ok(())

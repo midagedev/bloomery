@@ -41,7 +41,21 @@
 //! The taps are not armed: a tier layer's card sum is made inside the join, in no buffer a tap could copy
 //! (`Body::arm_taps` refuses such a load by name), so the clauses read the step's tokens and logits.
 //!
-//! FAIL-first (box): the one-line mutants under the round's mutant folder name the clause each reddens.
+//! The node arm (`--node`, `just gate-gpu-mistrallarge4-node`; no argument runs the two-card arm above) runs the clauses
+//! with the plan's one expert tier on a node (`BLOOMERY_TIER_NODES`, served by a loopback `tier_server` built with the
+//! `mistrallarge4` feature, [`bloomery_gpu_mistrallarge4::NODE_FAMILY`]) and needs one card in view: on one card the tier
+//! node's card is the stage's own, so the plan's card budget splits the device between the two (`node_machine`). The lever
+//! is read at every load, so the arm is two runs of this binary, each a process of its own with the same card budget:
+//! `--union` (no lever) loads the reference, the plan's tier segments joined onto the stage card alone, and prints its plan
+//! and its walk's tokens and logits digests; `--node0` (the lever set) loads the plan with its tier on the node and prints
+//! the same for the eager walk and the replayed one. This process compares the two (the plans first, then the digests,
+//! FNV-1a over every logits row's bits) as the clauses:
+//! - `node_load` (the node run's): the plan puts experts on the tier, the load's tier opened on the node's card and the
+//!   experts it holds, by layer, are the plan's;
+//! - `node_step_bits` (this process's): the node tier's eager and replayed walks are the union's bit for bit, over the
+//!   same plan;
+//! - `node_tier_sent` (the node run's): the replayed walk sent every layer the tier holds experts of at least one routed
+//!   slot.
 
 #[cfg(feature = "mistrallarge4")]
 fn main() -> std::process::ExitCode {
@@ -65,22 +79,35 @@ mod e2e;
 mod tier_twocard;
 
 #[cfg(feature = "mistrallarge4")]
+#[allow(
+    dead_code,
+    reason = "the gates that start a node share the module; each takes the helpers it reads"
+)]
+#[path = "shared/node_proc.rs"]
+mod node_proc;
+
+#[cfg(feature = "mistrallarge4")]
 mod gate {
-    use std::time::Instant;
+    use std::net::SocketAddr;
+    use std::process::Command;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::time::{Duration, Instant};
 
     use bloomery_gpu::GpuModel;
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_gates::generate::Place;
     use bloomery_gpu_gates::tier::{self, Tier};
-    use bloomery_gpu_gates::{GateError, checks_failed, open_split};
+    use bloomery_gpu_gates::{GateError, checks_failed, open_split, ref_model_path};
     use bloomery_gpu_mistrallarge4::body::Body;
     use model::arch::Arch;
     use model::arch::mistrallarge4::place::{self, PlanInputs};
+    use model::placement::workstation::{self, CardSpec, TierBatchBytes};
     use model::placement::{Device, ExpertList, Machine, Plan, PlanLevers, Role, union_plan};
 
     use crate::e2e::walk;
+    use crate::node_proc::{Proc, tier_server, tier_server_command};
     use crate::tier_twocard::{
-        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_card,
+        Leg, Sent, same, sent_between, sent_every, tier_counts, tier_on_card, tier_on_node,
     };
 
     type Model = GpuModel<Body>;
@@ -123,6 +150,31 @@ mod gate {
     const STEP_BITS: &str = "two_card_step_bits";
     const TIER_SENT: &str = "two_card_tier_sent";
     const CLAUSES: [&str; 3] = [TWO_CARD_LOAD, STEP_BITS, TIER_SENT];
+
+    /// The node arm's clauses, decided by the run that can: the node run's, and the comparison of the two runs'.
+    const NODE_LOAD: &str = "node_load";
+    const NODE_STEP_BITS: &str = "node_step_bits";
+    const NODE_TIER_SENT: &str = "node_tier_sent";
+    const NODE_CLAUSES: [&str; 3] = [NODE_LOAD, NODE_STEP_BITS, NODE_TIER_SENT];
+
+    /// What a run of the node arm tells its parent, a keyword and its text a line: the layer splits it planned, the
+    /// reason it left its clauses, a clause it decided, and a leg's tokens and row digests.
+    const PLAN: &str = "NODEARM plan";
+    const DEFERRED: &str = "NODEARM deferred";
+    const RESULT: &str = "NODEARM result";
+    const LEG: &str = "NODEARM leg";
+
+    /// The node arm (`--node`) and its two runs of this binary: the reference (no node lever), and the load with its tier
+    /// on the node `BLOOMERY_TIER_NODES` names.
+    const NODE: &str = "--node";
+    const UNION: &str = "--union";
+    const NODE0: &str = "--node0";
+
+    /// The bound on each of the node arm's runs: a load and the walks, or the real file's.
+    const RUN_BOUND: Duration = Duration::from_secs(1800);
+
+    /// How long the parent waits for a line a finished run printed.
+    const LINE_WITHIN: Duration = Duration::from_secs(10);
 
     /// What the walk read: its tokens and logits rows, and what it sent the tier.
     struct Run {
@@ -247,17 +299,34 @@ mod gate {
     pub fn run() -> Result<(), GateError> {
         let tier_now = Tier::from_env()?;
         let inputs = PlanInputs::describe(&split()?)?;
-        let pass = bits(&inputs, tier_now)?;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let (pass, proves) = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+            [] => (
+                bits(&inputs, tier_now)?,
+                "plan (b′) loads the expert tier on the second card beside the stage card with the plan's experts on it, \
+                 the walk eager and replayed reads the one card's ids and logits bit for bit, and every tier layer was \
+                 sent a routed slot",
+            ),
+            [NODE] => (
+                node_arm()?,
+                "plan (b′) opens the expert tier on a node with the plan's experts on it, the walk eager and replayed \
+                 reads the no-node load's ids and logits bit for bit, and every tier layer was sent a routed slot",
+            ),
+            [UNION] => return union_run(&inputs, tier_now),
+            [NODE0] => return node_run(&inputs, tier_now),
+            _ => {
+                return Err(format!(
+                    "unknown arguments {args:?}: usage: {NAME} [{NODE} | {UNION} | {NODE0}]"
+                )
+                .into());
+            }
+        };
         println!("{NAME}: {}", tier::tally_line());
+        if tier::ran_any() && pass {
+            println!("PASSED: {NAME} {proves}");
+        }
         if !pass {
             return Err(checks_failed());
-        }
-        if tier::ran_any() {
-            println!(
-                "PASSED: {NAME} plan (b′) loads the expert tier on the second card beside the stage card with the plan's \
-                 experts on it, the walk eager and replayed reads the one card's ids and logits bit for bit, and every \
-                 tier layer was sent a routed slot"
-            );
         }
         Ok(())
     }
@@ -283,26 +352,7 @@ mod gate {
         let plan = inputs.plan(&two, ctx, &levers)?;
         let splits = layer_splits(&plan);
         let tier_layers: Vec<usize> = splits.iter().filter(|o| o.2 > 0).map(|o| o.0).collect();
-        let tier_bytes = plan.cards.get(1).map_or(0, |c| c.expert_bytes);
-        let stage = &plan.cards[0];
-        let card = &plan.machine.cards[0];
-        println!(
-            "plan (b′) under a card budget of {} at ctx {CTX}: stage {} experts ({} B), tier {} experts ({tier_bytes} B) on \
-             {} layers, host {} experts ({} B); the reference's union {} B of the stage card {}'s {} usable (plan values)",
-            model::placement::card_budget::in_bytes(&levers.card_budget_bytes),
-            stage.experts,
-            stage.expert_bytes,
-            plan.cards.get(1).map_or(0, |c| c.experts),
-            tier_layers.len(),
-            plan.host.experts,
-            plan.host.expert_bytes,
-            tier::union_bytes(&plan),
-            card.name,
-            card.usable_bytes,
-        );
-        for (l, on_stage, on_tier, on_host) in &splits {
-            println!("  layer {l}: stage {on_stage}, tier {on_tier}, host {on_host}");
-        }
+        print_plan(&plan, &levers, &splits);
         if let Some(why) = tier::union_lack_of(&plan) {
             tier::defer_for_room(&CLAUSES, &why)?;
             return Ok(true);
@@ -390,6 +440,332 @@ mod gate {
             &tier_layers,
             false,
         );
+        Ok(pass)
+    }
+
+    /// The plan's one line and its per-layer splits.
+    fn print_plan(plan: &Plan<'_>, levers: &PlanLevers, splits: &[(usize, u64, u64, u64)]) {
+        let tier_bytes = plan.cards.get(1).map_or(0, |c| c.expert_bytes);
+        let stage = &plan.cards[0];
+        let card = &plan.machine.cards[0];
+        println!(
+            "plan (b′) under a card budget of {} at ctx {CTX}: stage {} experts ({} B), tier {} experts ({tier_bytes} B) on \
+             {} layers, host {} experts ({} B); the reference's union {} B of the stage card {}'s {} usable (plan values)",
+            model::placement::card_budget::in_bytes(&levers.card_budget_bytes),
+            stage.experts,
+            stage.expert_bytes,
+            plan.cards.get(1).map_or(0, |c| c.experts),
+            splits.iter().filter(|o| o.2 > 0).count(),
+            plan.host.experts,
+            plan.host.expert_bytes,
+            tier::union_bytes(plan),
+            card.name,
+            card.usable_bytes,
+        );
+        for (l, on_stage, on_tier, on_host) in splits {
+            println!("  layer {l}: stage {on_stage}, tier {on_tier}, host {on_host}");
+        }
+    }
+
+    /// Plan (b′)'s machine over `stage` and `tier`, which may be one device: the stage card for `layers` layers, the
+    /// tier card beside it holding the prompt batch's card bytes, and the host's rows of it. `Place::machine` refuses
+    /// a tier on the stage's own device (`workstation::check_holding`); the planner's card budget, which the gate sets,
+    /// is what splits one device between the two.
+    fn node_machine(
+        layers: usize,
+        stage: CardSpec,
+        tier: CardSpec,
+        batch: TierBatchBytes,
+    ) -> Machine {
+        let mut m = workstation::plan_on(stage, layers);
+        m.tiers.push(workstation::tier_card(tier, batch));
+        m.host_mut()
+            .reserves
+            .push((workstation::TIER_BATCH_HOST_RESERVE.to_string(), batch.host));
+        m
+    }
+
+    /// The stage card of [`node_machine`] alone, the reference's machine.
+    fn flat_machine(layers: usize, stage: CardSpec, batch: TierBatchBytes) -> Machine {
+        Machine {
+            tiers: Vec::new(),
+            ..node_machine(layers, stage, stage, batch)
+        }
+    }
+
+    /// The layers' stage, tier and host expert counts as the one token both runs print and the parent compares.
+    fn splits_key(splits: &[(usize, u64, u64, u64)]) -> String {
+        splits
+            .iter()
+            .map(|(l, s, t, h)| format!("{l}:{s}:{t}:{h}"))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+
+    /// FNV-1a over the bits of `row`.
+    fn fnv(row: &[f32]) -> u64 {
+        row.iter()
+            .flat_map(|v| v.to_bits().to_le_bytes())
+            .fold(0xcbf2_9ce4_8422_2325, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            })
+    }
+
+    /// What a run tells its parent about a leg: its tokens and the digest of every logits row.
+    fn print_leg(name: &str, leg: &Leg) {
+        let tokens: Vec<String> = leg.tokens.iter().map(u32::to_string).collect();
+        let rows: Vec<String> = leg
+            .logits
+            .iter()
+            .map(|r| format!("{:016x}", fnv(r)))
+            .collect();
+        println!(
+            "{LEG} {name} tokens {} rows {}",
+            tokens.join(","),
+            rows.join(",")
+        );
+    }
+
+    /// The reference run of the node arm (module header): the plan the node run makes, with its tier segments
+    /// joined onto the stage card, loaded with no node and walked as the captured step graph.
+    fn union_run(inputs: &PlanInputs, tier_now: Tier) -> Result<(), GateError> {
+        let layers = inputs.hp.n_layer;
+        let ctx = u64::try_from(CTX)?;
+        let batch = place::tier_batch(inputs)?;
+        let stage = *Place::A
+            .on_host()?
+            .card_specs()?
+            .first()
+            .ok_or("no stage card in view")?;
+        let flat = flat_machine(layers, stage, batch);
+        let mut two = node_machine(layers, stage, stage, batch);
+        two.nodes.push(workstation::node_of(&stage));
+        let levers = stage_budget(inputs, &flat, ctx, tier_now)?;
+        let plan = inputs.plan(&two, ctx, &levers)?;
+        let splits = layer_splits(&plan);
+        print_plan(&plan, &levers, &splits);
+        println!("{PLAN} {}", splits_key(&splits));
+        if let Some(why) = tier::union_lack_of(&plan) {
+            println!("{DEFERRED} {why}");
+            return Ok(());
+        }
+        let uplan = union_plan(&plan, &flat)?;
+        let t0 = Instant::now();
+        let mut r = open(&uplan, inputs)?;
+        on_stage_card("reference load", &r)?;
+        if !r.body(NAME)?.hybrid().tiers().is_empty() {
+            return Err("the reference load holds a tier card".into());
+        }
+        println!(
+            "reference load in {:.1} s: {} ({} B) holds the union, {} experts, no tier",
+            t0.elapsed().as_secs_f64(),
+            r.gpu().device_name()?,
+            r.resident_bytes(),
+            uplan.n_l.iter().sum::<u64>(),
+        );
+        capture(&mut r)?;
+        let want = walk_leg(&mut r, &walk(PROMPT, inputs.hp.n_vocab))?;
+        if !want.leg.logits.iter().flatten().all(|v| v.is_finite()) {
+            return Err("a logit of the reference walk is not finite".into());
+        }
+        print_leg("union", &want.leg);
+        Ok(())
+    }
+
+    /// The node run of the node arm (module header): the plan with its tier on the node `BLOOMERY_TIER_NODES` names,
+    /// the clauses `node_load` and `node_tier_sent` decided here, the eager and replayed walks handed to the parent.
+    fn node_run(inputs: &PlanInputs, tier_now: Tier) -> Result<(), GateError> {
+        let layers = inputs.hp.n_layer;
+        let ctx = u64::try_from(CTX)?;
+        let batch = place::tier_batch(inputs)?;
+        let place = Place::Bp.on_host()?;
+        let stage = *place.card_specs()?.first().ok_or("no stage card in view")?;
+        let two = place.machine_with(|first, tiers| match tiers {
+            &[tier] => Ok(node_machine(layers, first, tier, batch)),
+            _ => Err(format!(
+                "--place {}: the node arm takes a stage card and one tier card",
+                place.name()
+            )
+            .into()),
+        })?;
+        let flat = flat_machine(layers, stage, batch);
+        let levers = stage_budget(inputs, &flat, ctx, tier_now)?;
+        let plan = inputs.plan(&two, ctx, &levers)?;
+        let splits = layer_splits(&plan);
+        print_plan(&plan, &levers, &splits);
+        println!("{PLAN} {}", splits_key(&splits));
+        if let Some(why) = tier::union_lack_of(&plan) {
+            println!("{DEFERRED} {why}");
+            return Ok(());
+        }
+        let tier_layers: Vec<usize> = splits.iter().filter(|o| o.2 > 0).map(|o| o.0).collect();
+        let prompt = walk(PROMPT, inputs.hp.n_vocab);
+
+        let t0 = Instant::now();
+        let mut m = open(&plan, inputs)?;
+        on_stage_card("node load", &m)?;
+        tier_on_node(
+            "node load",
+            t0,
+            (&m.gpu().device_name()?, m.resident_bytes()),
+            m.body(NAME)?.hybrid(),
+        )?;
+        let loaded: Vec<u64> = m
+            .body(NAME)?
+            .tier_experts()
+            .into_iter()
+            .map(u64::try_from)
+            .collect::<Result<_, _>>()?;
+        let planned: Vec<u64> = (0..layers)
+            .map(|l| splits.iter().find(|o| o.0 == l).map_or(0, |o| o.2))
+            .collect();
+        let load_ok = !tier_layers.is_empty() && loaded == planned;
+        println!(
+            "{NODE_LOAD}: the tier holds experts on {} layers; the node's experts by layer {} the plan's {}",
+            tier_layers.len(),
+            if loaded == planned { "are" } else { "are not" },
+            verdict(load_ok)
+        );
+        if tier_layers.is_empty() {
+            println!(
+                "FAIL precondition {NODE_LOAD}: the plan holds no expert on the tier: the run proves nothing"
+            );
+        }
+        if loaded != planned {
+            println!("  loaded {loaded:?}\n  planned {planned:?}");
+        }
+        println!("{RESULT} {NODE_LOAD} {}", verdict(load_ok));
+
+        m.set_mode(StepMode::Eager);
+        let eager = walk_leg(&mut m, &prompt)?;
+        print_leg("eager", &eager.leg);
+        capture(&mut m)?;
+        let replay = walk_leg(&mut m, &prompt)?;
+        print_leg("replay", &replay.leg);
+        let sent_ok = sent_every(
+            "node_tier_sent replayed walk",
+            replay.sent.as_ref(),
+            &tier_layers,
+            false,
+        );
+        println!("{RESULT} {NODE_TIER_SENT} {}", verdict(sent_ok));
+        Ok(())
+    }
+
+    /// One run of this binary under `arg`, with `BLOOMERY_TIER_NODES` naming `node` or, with none, unset; its stdout's
+    /// lines and its exit, within [`RUN_BOUND`].
+    fn child(
+        arg: &str,
+        node: Option<SocketAddr>,
+        tag: &'static str,
+    ) -> Result<Vec<String>, GateError> {
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.arg(arg).env_remove(bloomery_levers::TIER_NODES);
+        if let Some(addr) = node {
+            cmd.env(bloomery_levers::TIER_NODES, addr.to_string());
+        }
+        let mut p = Proc::spawn(cmd, tag)?;
+        let end = Instant::now() + RUN_BOUND;
+        let mut lines = Vec::new();
+        loop {
+            match p.next_line(end.saturating_duration_since(Instant::now())) {
+                Ok(l) => lines.push(l),
+                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(format!("{tag}: not done within {} s", RUN_BOUND.as_secs()).into());
+                }
+            }
+        }
+        let status = p
+            .wait_within(LINE_WITHIN)?
+            .ok_or_else(|| format!("{tag}: closed its output and did not exit"))?;
+        if !status.success() {
+            return Err(format!("{tag}: {status}; stderr: {}", p.stderr()).into());
+        }
+        Ok(lines)
+    }
+
+    /// The text after `prefix` on the first of `lines` that starts with it.
+    fn field<'a>(lines: &'a [String], prefix: &str, tag: &str) -> Result<&'a str, GateError> {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(prefix))
+            .map(str::trim)
+            .ok_or_else(|| format!("{tag}: printed no {prefix:?} line").into())
+    }
+
+    /// The tokens and row digests of leg `name`, which a run printed through [`print_leg`].
+    fn leg_of<'a>(
+        lines: &'a [String],
+        name: &str,
+        tag: &str,
+    ) -> Result<(&'a str, &'a str), GateError> {
+        let text = field(lines, &format!("{LEG} {name} tokens "), tag)?;
+        text.split_once(" rows ")
+            .ok_or_else(|| format!("{tag}: the {name} leg line has no rows").into())
+    }
+
+    /// Whether leg `name` of the node run is the union's bit for bit; prints the first difference.
+    fn same_leg(name: &str, union: &[String], node: &[String]) -> Result<bool, GateError> {
+        let (ut, ur) = leg_of(union, "union", "union run")?;
+        let (nt, nr) = leg_of(node, name, "node run")?;
+        let what = format!("{NODE_STEP_BITS}: {name} walk");
+        if ut != nt {
+            let at = ut.split(',').zip(nt.split(',')).position(|(a, b)| a != b);
+            println!("FAIL {what}: tokens apart at {at:?}");
+            return Ok(false);
+        }
+        if ur != nr {
+            let at = ur.split(',').zip(nr.split(',')).position(|(a, b)| a != b);
+            println!("FAIL {what}: logits row {at:?} apart (digests of every logit's bits)");
+            return Ok(false);
+        }
+        println!(
+            "ok {what}: {} tokens, {} logits rows bit for bit the union's",
+            ut.split(',').count(),
+            ur.split(',').count()
+        );
+        Ok(true)
+    }
+
+    /// The node arm (module header): the union run, then a loopback `tier_server` and the node run, and the clauses.
+    fn node_arm() -> Result<bool, GateError> {
+        let model = ref_model_path()?;
+        let union = child(UNION, None, "union")?;
+        if let Ok(why) = field(&union, DEFERRED, "union run") {
+            tier::defer_for_room(&NODE_CLAUSES, why)?;
+            return Ok(true);
+        }
+        let (server, addr) = tier_server(tier_server_command(Some(&model))?, "node")?;
+        let node = child(NODE0, Some(addr), "node 0")?;
+        drop(server);
+        if let Ok(why) = field(&node, DEFERRED, "node run") {
+            tier::defer_for_room(&NODE_CLAUSES, why)?;
+            return Ok(true);
+        }
+        for c in NODE_CLAUSES {
+            tier::sc(c)?;
+        }
+        let mut pass = true;
+        let (up, np) = (
+            field(&union, PLAN, "union run")?,
+            field(&node, PLAN, "node run")?,
+        );
+        if up != np {
+            println!(
+                "FAIL precondition {NODE_STEP_BITS}: the two runs planned other splits (layer:stage:tier:host)\n  \
+                 union run {up}\n  node run  {np}"
+            );
+            pass = false;
+        }
+        for c in [NODE_LOAD, NODE_TIER_SENT] {
+            let v = field(&node, &format!("{RESULT} {c} "), "node run")?;
+            println!("{c} (node run): {v}");
+            pass &= v == verdict(true);
+        }
+        for name in ["eager", "replay"] {
+            pass &= same_leg(name, &union, &node)?;
+        }
         Ok(pass)
     }
 }

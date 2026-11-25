@@ -348,9 +348,11 @@ pub struct Checkpoint {
     keys: Vec<(String, Value)>,
 }
 
-/// `config` with its loop run at `passes` passes. Only a variable loop (`loop_config.is_varloop`)
-/// runs another count than the checkpoint's; any other folder refuses by name. The count is
-/// held to the range the checkpoint was trained on by [`Checkpoint::parse`].
+/// `config` with its loop run at `passes` passes. The message tensors are not indexed by pass, so
+/// a fixed loop (`loop_config.is_varloop` false) reads the one set of weights at any count as a
+/// variable loop does: the in-memory config is marked variable, so [`Checkpoint::parse`] takes
+/// the count (one to [`MAX_PASSES`]) instead of the fixed loop's own two-or-more. The count is
+/// held to that range by [`Checkpoint::parse`]; a folder with no loop is refused by name.
 fn with_passes(config: &mut Json, passes: usize) -> Result<(), Error> {
     const AT: &str = "config.json.text_config.loop_config";
     let Some(loop_) = config
@@ -358,25 +360,35 @@ fn with_passes(config: &mut Json, passes: usize) -> Result<(), Error> {
         .and_then(Json::as_object_mut)
     else {
         return Err(Error::Refused(format!(
-            "{AT} is missing: a pass count needs the variable-loop folder, and this one holds no loop"
+            "{AT} is missing: a pass count needs a looped folder, and this one holds no loop"
         )));
     };
-    if loop_.get("is_varloop") != Some(&Json::Bool(true)) {
-        return Err(Error::Refused(format!(
-            "{AT}.is_varloop is not true: only a variable-loop folder runs another pass count than \
-             its num_passes ({}), and this one is a fixed loop",
-            loop_.get("num_passes").map_or(Json::Null, Clone::clone)
-        )));
-    }
+    loop_.insert("is_varloop".to_string(), Json::Bool(true));
     loop_.insert("num_passes".to_string(), Json::from(passes));
     Ok(())
+}
+
+/// The `num_passes` the folder at `dir` was trained at: its `config.json`'s own loop count.
+pub fn trained_passes(dir: &Path) -> Result<usize, Error> {
+    let config = folder::read_config(dir)?;
+    config
+        .pointer("/text_config/loop_config/num_passes")
+        .and_then(Json::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| {
+            Error::Refused(format!(
+                "{}: config.json.text_config.loop_config.num_passes is missing: the folder holds no loop",
+                dir.display()
+            ))
+        })
 }
 
 /// [`folder::open_with`] of an Inkling 2 folder with its loop run at `passes` passes where one is
 /// asked (`None`: the folder's own `num_passes`, which is [`folder::open_with`]'s open). The
 /// header names the visits and the loop at that count (one pass has no loop: its message tensors
-/// are skipped), so a plan, a load and the step walk follow it. A folder of another model type, a
-/// fixed-loop folder and a count the variable loop was not trained on are refused by name.
+/// are skipped), so a plan, a load and the step walk follow it. A folder of another model type
+/// and a count outside one to [`MAX_PASSES`] are refused by name; a fixed loop (the Mini) takes
+/// the count as an experiment, its output at another count than its own not guaranteed.
 pub fn open_passes(dir: &Path, q8: bool, passes: Option<usize>) -> Result<folder::Opened, Error> {
     let mut config = folder::read_config(dir)?;
     let model_type = config
@@ -2510,14 +2522,28 @@ mod tests {
         assert_eq!(three.keys, mini.keys, "an asked 3 is the folder's own");
     }
 
-    /// The pass count is refused by name where the loop is not a variable one or the count is not
-    /// one the checkpoint was trained on, and the folder's own config refuses a count over five
-    /// and a `num_passes` of 1 on a fixed loop.
+    /// A fixed loop takes an asked count as the variable loop does (the message tensors are not
+    /// indexed by pass), the pass count is refused by name where the folder holds no loop or the
+    /// count is outside one to five, and the folder's own fixed `num_passes` of 1 stays refused.
     #[test]
-    fn a_pass_count_is_refused_off_a_variable_loop_and_off_the_trained_range() {
-        let mut fixed = json(OFFICIAL_CONFIG);
-        let e = with_passes(&mut fixed, 2).unwrap_err().to_string();
-        assert!(e.contains("is_varloop") && e.contains("fixed loop"), "{e}");
+    fn a_pass_count_is_refused_off_a_loop_and_off_the_range() {
+        for passes in 1..=MAX_PASSES {
+            let mut fixed = json(OFFICIAL_CONFIG);
+            with_passes(&mut fixed, passes).unwrap();
+            let checkpoint = Checkpoint::parse(&fixed).unwrap();
+            let mut variable = json(OFFICIAL_CONFIG);
+            variable["text_config"]["loop_config"]["is_varloop"] = json!(true);
+            with_passes(&mut variable, passes).unwrap();
+            assert_eq!(
+                checkpoint.keys,
+                Checkpoint::parse(&variable).unwrap().keys,
+                "{passes} passes"
+            );
+        }
+        let mut over = json(OFFICIAL_CONFIG);
+        with_passes(&mut over, MAX_PASSES + 1).unwrap();
+        let e = Checkpoint::parse(&over).unwrap_err().to_string();
+        assert!(e.contains("num_passes"), "{e}");
         let mut loopless = json(OFFICIAL_CONFIG);
         loopless["text_config"]
             .as_object_mut()

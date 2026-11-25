@@ -889,7 +889,30 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    the tier card (`spec_of_device` of the row node 1 sent) before anything loads. Node 1 refuses an open whose rows are
    not the tier's set, then loads the rows of node 0's plan from its own copy of the file, each tensor checked against
    node 0's description and each row's bytes against their sha256 in node 0's file (both nodes hash the tier's rows, not
-   the whole file). A node tier's layers arrive as one enqueue frame each, named by layer, never as a captured graph.
+   the whole file).
+   **A node needs no copy of the model file.** A `tier_server` started with no `-m` and no `BLOOMERY_REF_MODEL` says so in
+   its census, and node 0 streams the tier's rows to it at open (`crates/gpu/src/host/node/load.rs`; one rule, no flag).
+   The open carries node 0's shard headers, their digest and each row's scales; node 1 builds the split from the headers
+   alone, checks the open against it as it would against its own file, opens the card and answers with its staging.
+   Node 0 reads each row from its file's mapping (read ahead, and released once copied under `BLOOMERY_CARD_DONTNEED`)
+   and sends it: with `BLOOMERY_TIER_LINK=rdma` by RDMA writes into one of two slots of node 1's pinned host memory
+   registered with `ibv_reg_mr`, while node 1 uploads the slot before it to the card (the Spark has no GPUDirect
+   RDMA, so the slot is the staging); over any other link as load frames on the control channel. Each row ends with the
+   SHA-256 of every 16 MiB chunk as node 0 read it; node 1 hashes what landed on several threads beside the upload, and a
+   chunk that differs is named (tensor, chunk, both digests) and ends both sides, so no byte that did not arrive as node 0
+   read it is served. A lost channel during the stream ends both sides by name too. A paged tier (rows on node 1's host or
+   drive) reads node 1's own file and is refused by name on a node with none: start that node with `-m`. A node started
+   with a file keeps the path above. Run it as `tier_server --listen <node ip>:<port>` on the Spark, with `-m` left
+   out and `BLOOMERY_REF_MODEL` unset, and `BLOOMERY_TIER_NODES=<node ip>:<port> BLOOMERY_TIER_LINK=rdma` on node 0
+   (the RoCE port's address on both). The node prints `fed open: node 0 streams <rows> rows (<bytes> resident bytes)`
+   when it is ready for the rows. At the stream's end node 0 prints `tier node <addr>: <rows> rows, <bytes> B fed over
+   Rdma in <s> s (<rate> GB/s; waiting <s> s on the filler (the file's reads, copied and hashed on <n> threads), <s> s
+   on the wire, <s> s on the node's replies)` and node 1 `tier_server: node 0 fed <rows> rows, <bytes> B, in <s> s
+   (rows <s> s: sha256 <s> s beside upload <s> s)`: the phase that bounds the stream is the one its time is near.
+   A node tier's layers arrive as one enqueue frame each, named by layer, never as a captured graph.
+   Node 1 runs each frame's layer as one launch of a graph of its own: a service (a layer of a row over its columns) is
+   captured at its first frame — the go wait and take-back, one copy-in launch, the family's launches, one copy-out
+   launch, the fault copy and the signal — and launched at every later frame that names it (`TierWork::enqueue_graph`).
    A replayed chain's pass is listed: its every layer of the node's goes out in one write at the pass's start, before
    its first go, and the host raises each layer's go at its picks whatever they name, so node 1's stream holds a layer
    before its go lands and the frames' delivery and the enqueues sit under the stage card's work before that go; a
@@ -916,11 +939,12 @@ What `crates/gpu/src/host/mod.rs` and `tier.rs` need to cross a node:
    host/NVMe split against its own grant.
    A remote tier serves no prompt batch of its own: the batch's host serves its experts, except where the node's family
    computes a block (V4.1's).
-   Qwen3.8, GLM and V4.1 open their tiers through that common open; `tier_server` serves Qwen3.8's and Kimi K3's families
-   always and V4.1's, GLM's, Solar-Open2's and Flint's when it is built with the `deepseek41`, `glm5next`, `solar2` or
-   `flint` feature. `just gate-gpu-qwen38-nodes` holds the
+   Qwen3.8, GLM and V4.1 open their tiers through that common open; `tier_server` serves Qwen3.8's, Kimi K3's and Muse Spark's
+   families always and V4.1's, GLM's, Solar-Open2's, Flint's and Mistral Large 4's when it is built with the `deepseek41`,
+   `glm5next`, `solar2`, `flint` or `mistrallarge4` feature. `just gate-gpu-qwen38-nodes` holds the
    census, the refused opens (a row of other experts, and a copy of the file whose tier row holds other bytes), the bits
-   (node 0 with node 1's tier against the same plan in one process) and the losses below. Its `--host` mode lowers
+   (node 0 with node 1's tier against the same plan in one process), the fed bits (a node 1 with no file reads the same
+   logits as the one with a file) and the losses below, a lost stream among them. Its `--host` mode lowers
    equal routed ranges onto two nodes and compares the paged node with the same build's local CPU tier. It requires
    nonzero NVMe fills and file bytes on the remote tier, checks the callback/copy graph shape and the history's
    capture/replay counts, and applies the same loss and drain clauses.

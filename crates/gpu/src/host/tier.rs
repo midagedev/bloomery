@@ -412,18 +412,6 @@ pub enum TierAct {
     F32,
 }
 
-impl TierAct {
-    /// Copies from the page a tier layer stages: the activation's fields
-    /// and the places.
-    #[must_use]
-    pub const fn copies(self) -> usize {
-        match self {
-            TierAct::Q8 => 3,
-            TierAct::F32 => 2,
-        }
-    }
-}
-
 /// Which of a row's routed rows a tier's done carries back to the stage
 /// card's page over a mirrored link, the architecture's choice
 /// ([`TierShape::reply`]); the shared page carries nothing.
@@ -1121,6 +1109,107 @@ mod tier_kernels {
             }
         }
     }
+
+    /// Up to three spans of u32 words copied, a word a thread: `to_k[i] =
+    /// from_k[i]` for every `i` below `to_k.len()`. A tier layer's copy in
+    /// (the activation's fields and the places, from the row's image into
+    /// the staging) and its copy out (the routed rows, to the row's routed
+    /// rows on the page) are one launch each ([`TierCopy`]); a span a copy
+    /// does not use is empty.
+    #[allow(clippy::too_many_arguments, reason = "flat device ABI")]
+    #[kernel]
+    #[launch_bounds(256)]
+    #[launch_contract(domain = 1, block = (256, 1, 1), requires = (
+        from0.len() >= to0.len(), from1.len() >= to1.len(), from2.len() >= to2.len()
+    ))]
+    pub fn tier_copy_spans(
+        from0: &[u32],
+        mut to0: DisjointSlice<u32>,
+        from1: &[u32],
+        mut to1: DisjointSlice<u32>,
+        from2: &[u32],
+        mut to2: DisjointSlice<u32>,
+    ) {
+        let i = thread::index_1d().get();
+        // SAFETY: i < to_k.len() <= from_k.len() by the launch contract for
+        // the span it indexes; thread i owns entry i of every span.
+        unsafe {
+            if i < to0.len() {
+                *to0.get_unchecked_mut(i) = *from0.get_unchecked(i);
+            }
+            if i < to1.len() {
+                *to1.get_unchecked_mut(i) = *from1.get_unchecked(i);
+            }
+            if i < to2.len() {
+                *to2.get_unchecked_mut(i) = *from2.get_unchecked(i);
+            }
+        }
+    }
+}
+
+/// One [`tier_kernels::tier_copy_spans`] launch as a tier layer enqueues
+/// it: up to three spans, each `words` u32 words from device address `from`
+/// to device address `to`, both reached in the tier's context.
+struct TierCopy {
+    spans: [(sys::CUdeviceptr, sys::CUdeviceptr, usize); 3],
+}
+
+impl TierCopy {
+    /// Threads a block, the launch contract's: a thread copies one word of
+    /// each span, so the grid covers the longest span.
+    const BLOCK: u32 = 256;
+
+    /// Enqueue the copy on `stream`: one launch, no node when every span is
+    /// empty.
+    ///
+    /// # Safety
+    ///
+    /// Each span's `words` u32 at `from` and at `to` lie in memory the card
+    /// reaches in `ctx` — a device buffer of the tier's context or a span of
+    /// the tier page inside its allocation — 4-aligned, the `to` spans apart
+    /// from each other and from every `from`, and live for the launch and
+    /// every replay of a graph that captured it.
+    unsafe fn enqueue(
+        &self,
+        module: &tier_kernels::LoadedModule,
+        stream: &CudaStream,
+        ctx: &Arc<cuda_core::CudaContext>,
+    ) -> Result<(), GpuError> {
+        let longest = self.spans.iter().map(|s| s.2).max().unwrap_or(0);
+        if longest == 0 {
+            return Ok(());
+        }
+        let grid = crate::launch_u32(
+            "TierCopy::enqueue",
+            "grid",
+            longest.div_ceil(Self::BLOCK as usize),
+        )?;
+        let [(f0, t0, n0), (f1, t1, n1), (f2, t2, n2)] = self.spans;
+        // SAFETY: each span's source is the caller's contract; the windows
+        // are used for this launch only and their drops free nothing.
+        let (from0, from1, from2) = unsafe {
+            (
+                window::<u32>(f0, n0, ctx),
+                window::<u32>(f1, n1, ctx),
+                window::<u32>(f2, n2, ctx),
+            )
+        };
+        // SAFETY: each span's destination is the caller's contract, apart
+        // from every other span; the windows are used for this launch only
+        // and their drops free nothing.
+        let (mut to0, mut to1, mut to2) = unsafe {
+            (
+                WindowMut::<u32>::from_raw(t0, n0, ctx),
+                WindowMut::<u32>::from_raw(t1, n1, ctx),
+                WindowMut::<u32>::from_raw(t2, n2, ctx),
+            )
+        };
+        let prep = module.prepare_tier_copy_spans(LaunchConfig1D::new(grid, Self::BLOCK, 0))?;
+        module.tier_copy_spans(
+            stream, &prep, &from0, &mut to0, &from1, &mut to1, &from2, &mut to2,
+        )?;
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------- the card
@@ -1271,7 +1360,9 @@ pub struct TierStats {
     /// it ([`TierCard::replay`]), passes fed a layer at a time for want of
     /// one, and the graphs captured after those: a chain is fed and captured
     /// once, at its first pass, and replayed by every later one. A tier on a
-    /// node holds no graph: each of its passes is fed, as a listed pass.
+    /// node holds no graph here: each of its passes is fed, as a listed
+    /// pass, and the node launches a graph a layer of it
+    /// ([`TierWork::enqueue_graph`]).
     pub replays: u64,
     pub feeds: u64,
     pub captures: u64,
@@ -1302,6 +1393,15 @@ struct Stage {
     fault: Arc<DeviceBuffer<u32>>,
 }
 
+/// A service a tier node's server is asked for ([`TierWork::enqueue_graph`]):
+/// a layer of a row over its first columns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Service {
+    layer: usize,
+    row: usize,
+    cols: usize,
+}
+
 /// The tier graphs' slots: the step, the pair, the quad, and one per
 /// [`Chain::Cols`] width `2..=DEFER_MAX_COLS` ([`chain_slot`]).
 pub(super) const TIER_CHAINS: usize = 2 + DEFER_MAX_COLS;
@@ -1318,6 +1418,9 @@ pub(super) const TIER_CHAINS: usize = 2 + DEFER_MAX_COLS;
 /// the windows before the link, the weights and the link before the card.
 pub(crate) struct TierWork {
     graphs: [Option<Graph>; TIER_CHAINS],
+    /// One graph a service a tier node's server was asked for, by its layer,
+    /// row and columns ([`TierWork::enqueue_graph`]).
+    services: Vec<(Service, Graph)>,
     experts: Box<dyn TierExperts>,
     module: tier_kernels::LoadedModule,
     /// How this card adds to the page's words: a layer's go take-back and
@@ -1389,6 +1492,7 @@ impl TierWork {
         let words = super::word_ops(&ctx, stream)?;
         Ok(TierWork {
             graphs: std::array::from_fn(|_| None),
+            services: Vec::new(),
             experts,
             module,
             words,
@@ -1641,6 +1745,44 @@ impl TierWork {
         self.gpu.context().bind_to_thread()?;
         self.post_cols.set(cols);
         self.parts()?.enqueue_layer(layer, row, cols, true)
+    }
+
+    /// [`TierWork::enqueue`] as one graph launch, the form a tier node's
+    /// server takes each enqueue frame in: the service of layer `layer` of
+    /// row `row` over `cols` columns is captured into a graph of its own the
+    /// first time it is asked, and that graph is launched on the tier's
+    /// stream every time, its done posting those columns. One graph serves
+    /// every later ask of the same service: its go wait, copies and launches
+    /// read the go, the image and the picks from the row's words on the page
+    /// as they stand when it runs. A capture, an instantiation or a launch
+    /// that fails is returned by name.
+    pub(super) fn enqueue_graph(
+        &mut self,
+        layer: usize,
+        row: usize,
+        cols: usize,
+    ) -> Result<(), GpuError> {
+        self.gpu.context().bind_to_thread()?;
+        let key = Service { layer, row, cols };
+        let i = match self.services.iter().position(|(k, _)| *k == key) {
+            Some(i) => i,
+            None => {
+                let mut parts = self.parts()?;
+                let graph = Graph::capture(parts.gpu.stream(), |_| {
+                    parts.enqueue_layer(layer, row, cols, true)
+                })?;
+                self.services.push((key, graph));
+                self.services.len() - 1
+            }
+        };
+        self.post_cols.set(cols);
+        self.services[i].1.launch(self.gpu.stream())
+    }
+
+    /// Graphs [`TierWork::enqueue_graph`] holds.
+    #[cfg(test)]
+    fn service_graphs(&self) -> usize {
+        self.services.len()
     }
 
     /// Enqueue layer `layer`'s tier experts over the block `io` of a prompt
@@ -2107,14 +2249,14 @@ impl TierCard {
         }
     }
 
-    /// Nodes per tier layer of a captured tier graph whose image carries
-    /// `act`, on a card that adds to the page's words on `side`: the go wait
-    /// and its take-back, the copies in ([`TierAct::copies`]), the
+    /// Nodes per tier layer of a captured tier graph on a card that adds to
+    /// the page's words on `side`: the go wait and its take-back, the copy
+    /// in (one launch whatever the image carries, [`TierCopy`]), the
     /// architecture's launches (`launches`), the routed rows' copy out and
     /// the signal; the graph's last layer adds the fault copy.
     #[must_use]
-    pub const fn nodes_per_layer(act: TierAct, launches: usize, side: WordSide) -> usize {
-        word_batch_nodes(side) + act.copies() + launches + 1 + word_batch_nodes(side)
+    pub const fn nodes_per_layer(launches: usize, side: WordSide) -> usize {
+        word_batch_nodes(side) + 1 + launches + 1 + word_batch_nodes(side)
     }
 
     /// The side the tier's card adds to the page's words on: the work's own
@@ -2836,10 +2978,11 @@ impl Parts<'_> {
     /// first `cols` columns: wait for the row's go and take it back, copy
     /// those columns of the row's image — the activation (the q8_1 codes and
     /// their scales, or the f32 values), this tier's places — into the
-    /// staging, the architecture's launches into the card's routed rows, one
-    /// copy of those columns' rows to the row's routed rows on the page, then
-    /// (when `copy_fault`) the fault copy, a system barrier and the row's
-    /// counter and the progress word each plus one.
+    /// staging in one launch ([`TierCopy`]), the architecture's launches
+    /// into the card's routed rows, one launch copying those columns' rows to
+    /// the row's routed rows on the page, then (when `copy_fault`) the fault
+    /// copy, a system barrier and the row's counter and the progress word
+    /// each plus one.
     fn enqueue_layer(
         &mut self,
         layer: usize,
@@ -2890,34 +3033,37 @@ impl Parts<'_> {
         // Each field holds its columns one after another: the first `cols`
         // columns are its first `cols / img.cols` part.
         let part = |len: usize| len / img.cols * cols;
-        match &*self.act {
-            Staged::Q8(a) => {
-                copy_page(
-                    stream,
-                    a.q3.cu_deviceptr(),
-                    end.dev(at + 4 * img.q3),
-                    4 * part(img.q3_words),
-                )?;
-                copy_page(
-                    stream,
-                    a.d8.cu_deviceptr(),
-                    end.dev(at + 4 * img.d8),
-                    4 * part(img.d8_len),
-                )?;
-            }
-            Staged::F32(x) => copy_page(
-                stream,
-                x.cu_deviceptr(),
-                end.dev(at + 4 * img.x),
-                4 * part(img.x_len),
-            )?,
-        }
-        copy_page(
-            stream,
-            self.sel.cu_deviceptr(),
+        let sel = (
             end.dev(at + 4 * img.sel),
-            4 * img.n_used * cols,
-        )?;
+            self.sel.cu_deviceptr(),
+            img.n_used * cols,
+        );
+        let copy_in = match &*self.act {
+            Staged::Q8(a) => [
+                (
+                    end.dev(at + 4 * img.q3),
+                    a.q3.cu_deviceptr(),
+                    part(img.q3_words),
+                ),
+                (
+                    end.dev(at + 4 * img.d8),
+                    a.d8.cu_deviceptr(),
+                    part(img.d8_len),
+                ),
+                sel,
+            ],
+            Staged::F32(x) => [
+                (end.dev(at + 4 * img.x), x.cu_deviceptr(), part(img.x_len)),
+                sel,
+                (sel.0, sel.1, 0),
+            ],
+        };
+        let ctx = self.gpu.context();
+        // SAFETY: each span lies in the row's image on the page (row checked
+        // above) and in the staging (its shape checked above), apart from
+        // each other; the host tier drops the page after its tier cards and
+        // so after every graph that captured this copy.
+        unsafe { TierCopy { spans: copy_in }.enqueue(self.module, stream, ctx)? };
         self.experts.enqueue_layer(
             self.gpu,
             self.weights,
@@ -2929,14 +3075,18 @@ impl Parts<'_> {
                 cols,
             },
         )?;
-        copy_page(
-            stream,
-            self.rows[row].0.cu_deviceptr(),
-            self.out.cu_deviceptr(),
-            4 * routed,
-        )?;
+        let (to, from) = (self.rows[row].0.cu_deviceptr(), self.out.cu_deviceptr());
+        // SAFETY: the routed rows' `routed` words lie in the card's routed
+        // rows and in the row's routed rows on the page (both checked above),
+        // which outlive every graph that captured this copy; the other two
+        // spans are empty.
+        unsafe {
+            TierCopy {
+                spans: [(from, to, routed), (from, to, 0), (from, to, 0)],
+            }
+            .enqueue(self.module, stream, ctx)?;
+        }
         if copy_fault {
-            let ctx = self.gpu.context();
             // SAFETY: the fault copy's two words lie in this tier's flag
             // lines, which outlive the window; it is used for this launch
             // only, and its drop frees nothing.
@@ -3100,8 +3250,10 @@ pub(super) mod tests {
         std::fs::remove_file(path).expect("remove the fixture");
     }
 
-    /// A launched chain and an enqueued layer each set the columns the
-    /// page's link posts of their dones, before the tier's stream runs them.
+    /// A launched chain, an enqueued layer and a node's service graph each
+    /// set the columns the page's link posts of their dones, before the
+    /// tier's stream runs them; a service asked again launches the graph
+    /// its first ask captured.
     #[test]
     #[ignore = "needs a CUDA device; `just gate-gpu-lib` runs it on the box"]
     fn hw_held_a_chain_sets_the_columns_its_dones_post() {
@@ -3116,6 +3268,12 @@ pub(super) mod tests {
         posted.set(usize::MAX);
         work.enqueue(0, 0, 1).expect("a go wait");
         let enqueued = posted.get();
+        let mut served = Vec::new();
+        for _ in 0..2 {
+            posted.set(usize::MAX);
+            work.enqueue_graph(0, 0, 1).expect("a service graph");
+            served.push((posted.get(), work.service_graphs()));
+        }
         work.link
             .as_ref()
             .expect("a page")
@@ -3123,6 +3281,7 @@ pub(super) mod tests {
             .expect("release for cleanup");
         work.sync().expect("drained for cleanup");
         assert_eq!((launched, enqueued), (1, 1));
+        assert_eq!(served, [(1, 1), (1, 1)]);
         drop(work);
         drop(file);
         std::fs::remove_file(path).expect("remove the fixture");
@@ -3414,7 +3573,6 @@ pub(super) mod tests {
         assert!(l.bytes().unwrap() >= l.rows_off(1) + 4 * 8 * 4096);
         assert!(TierLayout::new(glm, 512, 0, 1).is_err());
         assert!(TierLayout::new(glm, 0, 32, 1).is_err());
-        assert_eq!(TierAct::F32.copies() + 1, TierAct::Q8.copies());
     }
 
     /// Qwen3.8's tier page of one tier: one row of up to four columns of ten

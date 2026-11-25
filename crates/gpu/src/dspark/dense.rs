@@ -108,11 +108,176 @@ const GUARD: usize = BLOCK_MAX;
 /// Whether the attention takes the tensor-core segment pass.
 const MMA: bool = false;
 
-/// A draft's weights as bf16 bits by tensor name, the form its safetensors file stores them in. The
-/// owner of a file format implements it; this crate holds no file reader.
+/// A draft's weights by the names of its statement, in the forms a load takes: bf16 bits, the form a
+/// safetensors draft stores every tensor in ([`Bf16Source::bf16`]), Q8_0 rows on the card
+/// ([`Bf16Source::q8_rows`]) and f32 values ([`Bf16Source::f32s`]). The last two are made from the
+/// bf16 unless a source overrides them: a file that holds Q8_0 blocks hands them over unchanged and
+/// f32 values as stored ([`GgufSource`]). The owner of a file format implements it.
 pub trait Bf16Source {
-    /// Tensor `name` as its bits and shape, or a named error.
+    /// Tensor `name` as its bits and shape (rows first), or a named error.
     fn bf16(&self, name: &str) -> Result<(&[u16], &[usize]), GpuError>;
+
+    /// Tensor `name`'s shape, rows first, or a named error.
+    fn shape(&self, name: &str) -> Result<Vec<usize>, GpuError> {
+        Ok(self.bf16(name)?.1.to_vec())
+    }
+
+    /// Tensor `name`, `rows` rows of `k` values, as Q8_0 rows on the card, row `r` of the result
+    /// being the file's row `pick(r)`: the bf16 quantized on the host ([`Q8Rows::from_bf16`]).
+    /// Another shape is refused by name.
+    fn q8_rows(
+        &self,
+        gpu: &Gpu,
+        name: &str,
+        rows: usize,
+        k: usize,
+        pick: &(dyn Fn(usize) -> usize + Sync),
+    ) -> Result<Q8Rows, GpuError> {
+        Q8Rows::from_bf16(gpu, bits_of(self, name, &[rows, k])?, rows, k, pick)
+    }
+
+    /// Tensor `name` of shape `shape` (rows first) as f32 values: the bf16 widened. Another shape is
+    /// refused by name.
+    fn f32s(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, GpuError> {
+        Ok(widen(bits_of(self, name, shape)?))
+    }
+}
+
+/// Tensor `name` of `src` as bf16 bits of shape `want`, refused by name otherwise.
+fn bits_of<'a, S: Bf16Source + ?Sized>(
+    src: &'a S,
+    name: &str,
+    want: &[usize],
+) -> Result<&'a [u16], GpuError> {
+    let (bits, shape) = src.bf16(name)?;
+    if shape != want || bits.len() != want.iter().product::<usize>() {
+        return Err(shape_err(format!(
+            "{name} is {shape:?} ({} values); the load reads {want:?}",
+            bits.len()
+        )));
+    }
+    Ok(bits)
+}
+
+/// A draft's GGUF file read by the names of the draft's statement ([`Bf16Source`]): `names` maps a
+/// statement name to the file's. Each form is read from what the file stores: a Q8_0 matrix goes to
+/// the card with the file's blocks unchanged, a BF16 one is quantized on the host as a safetensors
+/// draft's is; f32 values are the file's F32 values or its BF16 ones widened, and bf16 bits only a
+/// BF16 tensor's. A name the map does not take, a tensor the file does not hold, another shape and a
+/// type a form does not read are refused by name.
+pub struct GgufSource<'a> {
+    split: &'a Split,
+    names: &'a (dyn Fn(&str) -> Option<String> + Sync),
+    /// Every tensor of the file: its name and its shape rows first (ggml's `ne` reversed).
+    shapes: Vec<(String, Vec<usize>)>,
+}
+
+impl<'a> GgufSource<'a> {
+    /// `split` read by the statement's names, `names` giving each one's name in the file. Load-time
+    /// only.
+    #[must_use]
+    pub fn new(
+        split: &'a Split,
+        names: &'a (dyn Fn(&str) -> Option<String> + Sync),
+    ) -> GgufSource<'a> {
+        let shapes = split
+            .iter_tensors()
+            .map(|(_, t)| {
+                let shape = t.dims.iter().rev().map(|&d| d as usize).collect();
+                (t.name.clone(), shape)
+            })
+            .collect();
+        GgufSource {
+            split,
+            names,
+            shapes,
+        }
+    }
+
+    /// Statement name `name`'s tensor: its name in the file, its type and its shape rows first.
+    fn find(&self, name: &str) -> Result<(&str, GgmlType, &[usize]), GpuError> {
+        let file = (self.names)(name).ok_or_else(|| {
+            shape_err(format!("{name}: no tensor of the GGUF draft's names is it"))
+        })?;
+        let (n, shape) = self
+            .shapes
+            .iter()
+            .find(|(n, _)| *n == file)
+            .ok_or_else(|| GpuError::tensor(WHAT, &file, "in the draft file"))?;
+        let (_, info) = self
+            .split
+            .find(n)
+            .ok_or_else(|| GpuError::tensor(WHAT, n, "in the draft file"))?;
+        Ok((n, info.ty, shape))
+    }
+
+    /// Statement name `name`'s tensor, refused by name unless its shape is `want`.
+    fn find_shaped(&self, name: &str, want: &[usize]) -> Result<(&str, GgmlType), GpuError> {
+        let (file, ty, shape) = self.find(name)?;
+        if shape != want {
+            return Err(shape_err(format!(
+                "{name} ({file}) is {shape:?}; the load reads {want:?}"
+            )));
+        }
+        Ok((file, ty))
+    }
+}
+
+impl Bf16Source for GgufSource<'_> {
+    fn bf16(&self, name: &str) -> Result<(&[u16], &[usize]), GpuError> {
+        let (file, ty, shape) = self.find(name)?;
+        if ty != GgmlType::BF16 {
+            return Err(shape_err(format!(
+                "{name} ({file}) is {ty}; bf16 bits are read from a BF16 tensor only"
+            )));
+        }
+        let bytes = self.split.data(file)?;
+        // SAFETY: every bit pattern is a `u16`; `align_to` returns the aligned middle only, and the
+        // prefix and suffix are refused below, so the whole tensor is that middle.
+        let (head, mid, tail) = unsafe { bytes.align_to::<u16>() };
+        if !head.is_empty() || !tail.is_empty() {
+            return Err(shape_err(format!(
+                "{file}: its bytes are not 2-byte aligned in the file"
+            )));
+        }
+        Ok((mid, shape))
+    }
+
+    fn shape(&self, name: &str) -> Result<Vec<usize>, GpuError> {
+        Ok(self.find(name)?.2.to_vec())
+    }
+
+    fn q8_rows(
+        &self,
+        gpu: &Gpu,
+        name: &str,
+        rows: usize,
+        k: usize,
+        pick: &(dyn Fn(usize) -> usize + Sync),
+    ) -> Result<Q8Rows, GpuError> {
+        match self.find_shaped(name, &[rows, k])? {
+            (file, GgmlType::Q8_0) => {
+                Q8Rows::gguf_rows(gpu, self.split, file, &Take::all(rows, k, pick))
+            }
+            (_, GgmlType::BF16) => Q8Rows::from_bf16(gpu, self.bf16(name)?.0, rows, k, pick),
+            (file, ty) => Err(shape_err(format!(
+                "{name} ({file}) is {ty}; the card's Q8_0 rows are read from Q8_0 or BF16"
+            ))),
+        }
+    }
+
+    fn f32s(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, GpuError> {
+        match self.find_shaped(name, shape)? {
+            (file, GgmlType::F32) => {
+                let dims: Vec<usize> = shape.iter().rev().copied().collect();
+                gguf_f32(self.split, file, &dims)
+            }
+            (_, GgmlType::BF16) => Ok(widen(self.bf16(name)?.0)),
+            (file, ty) => Err(shape_err(format!(
+                "{name} ({file}) is {ty}; f32 values are read from F32 or BF16"
+            ))),
+        }
+    }
 }
 
 /// What a draft's config states about its dense layers; the widths come from the tensors' shapes.

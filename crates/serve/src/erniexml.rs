@@ -50,7 +50,7 @@ use crate::constrain::{
 };
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
-use crate::ernie55::{CALL_CLOSE, CALL_OPEN};
+use crate::ernie::{CALL_CLOSE, CALL_OPEN};
 use crate::glmxml::{ArgTypes, Kind};
 use crate::reasoning::{Marked, SpecialTags, partial_suffix};
 

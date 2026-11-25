@@ -367,6 +367,14 @@ pub(crate) fn assert_one_role_per_stem(groups: &[&[Stem]]) {
     }
 }
 
+/// Whether `name` is a compressor or an indexer matrix: the attention
+/// tensors whose dense sites (`gpu-deepseek41` `Dense::of`) take BF16 in its
+/// words, where the other attention matrices take the K-quants and q8_0. The
+/// families with a pooling compressor or an indexer share it.
+pub fn is_side_matrix(name: &str) -> bool {
+    name.contains("compressor") || name.contains("indexer")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Counts, classify_with};

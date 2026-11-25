@@ -917,7 +917,7 @@ pub unsafe fn f32_lane_partial_1col_w32<W: RowValues>(
 /// lanes takes one whole code word — four consecutive values of one block —
 /// so a step is 32 consecutive words, 128 values, four blocks, and the warp's
 /// code load in a step is one contiguous 128-byte line.
-const Q8_STEP: usize = 128;
+pub(crate) const Q8_STEP: usize = 128;
 
 /// Steps whose code, scale and activation loads the single-column Q8_0 body
 /// issues before its first multiply-add: the Q8_0 counterpart of
@@ -1170,7 +1170,7 @@ unsafe fn block_step<F: ByteBlocks>(
 /// `j` of `x`. The product `v_j·d` is exact in f32 for a Q8_0 block, and for
 /// an MXFP8 one whose product is a normal f32, so each term rounds once.
 #[inline(always)]
-fn word_dot<F: ByteBlocks>(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
+pub(crate) fn word_dot<F: ByteBlocks>(f: f32, q: u32, d: f32, x: F32x4) -> f32 {
     let [x0, x1, x2, x3] = x.to_array();
     let [v0, v1, v2, v3] = F::values(q);
     let f = f32::mul_add(d * v0, x0, f);
@@ -1314,7 +1314,7 @@ pub(crate) unsafe fn blocks_lane_partial_1col<F: ByteBlocks>(
 /// As [`block_step`]: word `32s + lane` of the row exists, with `wq` and `wd`
 /// built as [`blocks_lane_partials_mcol`] builds them.
 #[inline(always)]
-unsafe fn block_code<F: ByteBlocks>(
+pub(crate) unsafe fn block_code<F: ByteBlocks>(
     qs: &[u32],
     d: &[F::Scale],
     wq: usize,

@@ -40,7 +40,10 @@
 //! A layer an expert tier card holds experts of ([`super::tier`]) also
 //! downloads each slot's tier place with the host's rows, and its back joins
 //! the tier's rows through the port ([`BatchLeg::join_tiered`]): normed and
-//! summed beside the card's slots before the host's sums add.
+//! summed beside the card's slots before the host's sums add. A tier on a
+//! node serves the step only: its experts are the batch's host's
+//! ([`batch_tier_k`]), so a pass over them downloads no tier place and joins
+//! no tier row.
 //!
 //! The head reads the last row of the prompt's last pass only. After
 //! [`GpuModel::prefill_with`] the K/V planes and the position are those of
@@ -68,6 +71,7 @@ use crate::flash_gqa::{Gqa64Args, HEAD_64, SEG_KEYS, SEGMENTS, window_segments};
 use crate::gemm::{GEMM_BN, GEMM32_STEP, GemmKernels, GemmRoute};
 use crate::head::Head;
 use crate::host::BatchLeg;
+use crate::host::leg_tier::STAGE_TIER;
 use crate::host::run::HostRun;
 use crate::host::served::prompt_pass;
 use crate::host::stream_side::{RingPass, RingRows, StreamSide};
@@ -1151,7 +1155,8 @@ impl PassWalk<'_> {
         let stream = gpu.stream();
         let b = &*self.b;
         let key = leg.key(at);
-        match side.tier.as_mut().filter(|t| t.k(l) > 0) {
+        let n_tier = batch_tier_k(side, leg, l)?;
+        match side.tier.as_mut().filter(|_| n_tier > 0) {
             Some(t) => {
                 t.enqueue_pass_places(
                     stream,
@@ -1193,7 +1198,7 @@ impl PassWalk<'_> {
         (at, union): (At, Option<(&DeviceBuffer<u32>, usize)>),
     ) -> Result<(), GpuError> {
         let l = at.layer;
-        let n_tier = side.tier.as_ref().map_or(0, |t| t.k(l));
+        let n_tier = batch_tier_k(side, leg, l)?;
         if n_tier > 0 {
             return self.tier_back(side, leg, (at, n_tier), union);
         }
@@ -1279,6 +1284,21 @@ impl PassWalk<'_> {
         }
         self.ffn_post(l, Sum::Moe)
     }
+}
+
+/// The experts layer `l`'s expert tier holds for a prompt batch, as the batch's view of the slot map reads them
+/// ([`HostTier::batch_slots`](crate::host::HostTier::batch_slots)): the map's own count on a tier card of this
+/// process, 0 on a tier on a node, whose experts the batch's host serves, so no tier place is written for that layer
+/// and the join has no tier rows. 0 on a load with no tier.
+fn batch_tier_k(
+    side: &PlacedSide,
+    leg: &mut BatchLeg<'_, HostRun>,
+    l: usize,
+) -> Result<usize, GpuError> {
+    if side.tier.is_none() {
+        return Ok(0);
+    }
+    leg.hybrid().batch_slots()?.on_tier_of(STAGE_TIER, l)
 }
 
 /// Which pass buffer holds a layer's experts' weighted sum.

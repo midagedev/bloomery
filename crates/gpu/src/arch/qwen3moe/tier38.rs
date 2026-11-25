@@ -645,7 +645,7 @@ pub(super) fn open_tier(
         name: t.name.clone(),
         device: t.device,
         card: t.card,
-        rows: NodeOpen::tier_rows(plan, file, t, card_dontneed)?,
+        rows: NodeOpen::tier_rows(plan, file, t)?,
         set,
         shape: SHAPE,
         cols: step_cols,

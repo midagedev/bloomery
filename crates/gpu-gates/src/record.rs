@@ -2629,6 +2629,19 @@ pub static DRAFT_RULE_RAON1: Kind = Kind {
     parts: &[key("drafts", Word, ""), key("why", Text, "")],
 };
 
+/// What a serve seat's `BLOOMERY_DRAFT` resolved to before the plan: the
+/// seats whose rule is a draft word and a found draft.
+pub static DRAFT_RULE: Kind = Kind {
+    name: "draft_rule",
+    head: "draft rule",
+    doc: "What a serve seat's BLOOMERY_DRAFT resolved to before the plan: the draft its greedy \
+          requests run (dspark, lookup, or off: none) and why (the lever's word, or unset with the \
+          draft's folder and where it was found, or what left the plain path: off, no draft \
+          folder, a build without the draft's reader, a load the draft's verify does not run on, \
+          a card the draft's reserve leaves short).",
+    parts: &[key("drafts", Word, ""), key("why", Text, "")],
+};
+
 /// The raon1 seat's load.
 pub static LOAD_RAON1: Kind = Kind {
     name: "load_raon1",
@@ -3818,17 +3831,25 @@ pub static BLOOMERY_SERVE_RAON1: &[&Kind] = kinds![
 
 /// What the inkling2 seat of `bloomery-serve` prints, all on stderr: the
 /// placement and why (`place unset`), the embedding side seat when one is
-/// named, a `--hf` repo's resolve lines, the plan, the load and its phases,
-/// the address and each request's note of the prefix it kept less of than it
-/// shared (the windowed visits' rings keep a prefix only at the position they
-/// stand).
+/// named, a `--hf` repo's resolve lines, what the draft word resolved to
+/// (`draft rule`), the plan, the load and its phases,
+/// the DSpark draft's load, the address, each request's note of the prefix it
+/// kept less of than it shared (the windowed visits' rings keep a prefix only
+/// at the position they stand) and the width chooser's record at a drafted
+/// request's end.
 pub static BLOOMERY_SERVE_INKLING2: &[&Kind] = kinds![
     groups::side_seat::SEAT,
-    &[&PLACE_UNSET, &PLAN, &NEED],
+    &[&PLACE_UNSET, &DRAFT_RULE, &PLAN, &NEED],
     groups::fetch::FETCH,
     groups::fetch::SET,
-    &[&LOAD_INKLING2, &LOAD_PHASES, &LISTENING_INKLING2],
+    &[
+        &LOAD_INKLING2,
+        &LOAD_PHASES,
+        &LOAD_DRAFT,
+        &LISTENING_INKLING2
+    ],
     groups::bind::CACHE,
+    groups::drafted::WIDTH,
 ];
 
 /// What the GLM seat of `bloomery-serve` prints, all on stderr: the
@@ -5404,9 +5425,15 @@ mod tests {
                 ],
             ),
             (
-                "inkling2 seat: Side::seat, run, bind::spawn",
+                "inkling2 seat: Side::seat, print_widths, bind::spawn",
                 BLOOMERY_SERVE_INKLING2,
-                &[side_seat::SEAT, fetch::FETCH, fetch::SET, bind::CACHE],
+                &[
+                    side_seat::SEAT,
+                    fetch::FETCH,
+                    fetch::SET,
+                    drafted::WIDTH,
+                    bind::CACHE,
+                ],
             ),
             (
                 "raon1 seat: Side::seat, print_widths, bind::spawn",

@@ -117,25 +117,30 @@ fn hw_the_folder_header_plans_as_the_description_pinned() {
     let (expert_bytes, at_32k, at_256k) = match layers {
         REAL_LAYERS => (
             REAL_EXPERT_BYTES,
+            // PIN(2026-11-25): the six latent layers' indexer keys counted at f32 (256 B a row
+            // more: kv 310,771,712 -> 361,103,360 at 32,768) and the prompt pass's buffers beside
+            // the stores move 67 and 198 experts to the host, as the description's plan prints.
             Planned {
-                card_experts: 3_347,
+                card_experts: 3_280,
                 dense: 9_227_818_876,
-                kv: 310_771_712,
-                host_experts: 121_373_589_504,
+                kv: 361_103_360,
+                host_experts: 121_821_462_528,
             },
             Some(Planned {
-                card_experts: 3_028,
+                card_experts: 2_830,
                 dense: 9_227_818_876,
-                kv: 2_316_435_456,
-                host_experts: 123_505_999_872,
+                kv: 2_719_088_640,
+                host_experts: 124_829_564_928,
             }),
         ),
         CUT_LAYERS => (
             CUT_EXPERT_BYTES,
+            // PIN(2026-11-25): kv 47,972,352 -> 56,360,960, the one latent layer's indexer key
+            // counted at f32 (32,768 rows x 256 B more), as the description's kv clause pins it.
             Planned {
                 card_experts: 1_024,
                 dense: 1_345_061_308,
-                kv: 47_972_352,
+                kv: 56_360_960,
                 host_experts: 0,
             },
             None,

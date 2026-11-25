@@ -1123,6 +1123,12 @@ required-features = ["gpu", "checkpoint"]
 name = "gate_inkling2_draft"
 required-features = ["gpu", "dspark-hf"]
 
+# inkling2-draft-gguf: the same draft opened from its GGUF beside the Mini's file
+# (gate_inkling2_draft_gguf's doc), against the folder's in one target load. Real tier only.
+[[bin]]
+name = "gate_inkling2_draft_gguf"
+required-features = ["gpu", "dspark-hf"]
+
 # ernie55-mla: ERNIE 5.5 Flash Preview's MLA-DSA layer (the latent attention, the lightning indexer's f32 top-k with its
 # forced window, the output gate, the k_b/v_b repack) at the released file's shapes, seeded inputs in a synthetic file,
 # against an f64 rule of llama.cpp PR #31925; the prompt form is the step form.

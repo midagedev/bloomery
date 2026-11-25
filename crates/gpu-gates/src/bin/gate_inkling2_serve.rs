@@ -4,7 +4,7 @@
 //! prompt by the body's prompt rule (`app::Prompt`), keeps a prefix a request shares with the
 //! slot down to the body's floor (the end it has written to less the conv ring's reach, every
 //! store being positional) and takes a rollback within that reach: a deeper one is refused by
-//! name, and the seat runs no draft yet, the one path that asks a body for one.
+//! name. A draft's commit is the path that asks a body for one.
 //!
 //!     gate_inkling2_serve --dir <dir>
 //!
@@ -71,13 +71,29 @@
 //!   stands does, and one asked for more than the conv ring's reach (`PASS_ROWS`) returns an error
 //!   naming `inkling2::Body::rollback` and the conv ring and stands where it did. The rollbacks'
 //!   rows are `gate_inkling2_e2e`'s `rollback_is_a_fresh_run`.
-//! - `draft_is_refused_until_wired`: `BLOOMERY_DRAFT=dspark` is refused by name before any plan,
-//!   naming the variable and that the seat drafts nothing, while `BLOOMERY_DRAFT=off` plans.
+//! - `draft_on_is_the_plain_ids`: a second server under `BLOOMERY_DRAFT=lookup` answers the plain
+//!   server's ids to the gate's prompts (the four oracle and chat prompts, the prose one), each
+//!   from an empty cache, and prints the width chooser's `mtp width` record. `BLOOMERY_DRAFT=dspark`
+//!   with no draft folder named is refused by name before any plan (the variable, and
+//!   `BLOOMERY_DSPARK_MODEL`), and the word unset with none plans the plain path, its `draft rule`
+//!   record naming `off` and the missing folder. In the real tier, where the environment names the
+//!   official checkpoint folder (`BLOOMERY_INK2_OFFICIAL`, which states the draft): a server under
+//!   `BLOOMERY_DRAFT=dspark` with that folder as `BLOOMERY_DSPARK_MODEL` answers the plain ids
+//!   too, its `load draft=dspark` record printed; on the folder, the unset word plans the folder's
+//!   draft and `off` the plain path (the `draft rule` record), and a plain server, a lookup server
+//!   and an unset one, which loads the folder's draft, answer the same ids. Each DSpark server's
+//!   `mtp width` records count a verified window and one that took back every row past row 0, so
+//!   a verify and its rollback ran; a lookup server's are printed (the fixture's answers repeat no
+//!   id, so its lookup verifies nothing: not proven there). A draft changes which rows a pass
+//!   runs, never a token: every kept token is the target's argmax, and a commit's rollback lands
+//!   inside the conv ring's reach or is refused by name. The gate refuses to start with
+//!   `BLOOMERY_DSPARK_MODEL` set, which would turn the plan and serve clauses' servers drafted.
 //!
-//! PIN(2026-11-23): `rollback_is_refused_by_name` is `rollback_is_refused_past_the_reach` and
-//! `draft_is_refused_until_wired`: the body takes positions back down to its written end less
-//! the reach, so the old refusal of every rollback no longer holds, and the draft's refusal no
-//! longer rests on it.
+//! PIN(2026-11-23): `rollback_is_refused_by_name` is `rollback_is_refused_past_the_reach`: the
+//! body takes positions back down to its written end less the reach, so the old refusal of every
+//! rollback no longer holds.
+//! PIN(2026-11-25): `draft_is_refused_until_wired` is `draft_on_is_the_plain_ids`: the seat serves
+//! the lookup and the DSpark draft, so the refusal of every draft word no longer holds.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -86,7 +102,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(feature = "deepseek41")]
 mod gate {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use app::Prompt;
@@ -100,7 +116,9 @@ mod gate {
         Answer, SeatGate, Served, agree, chat_is_those_ids, check, curl, greedy, json_of, rendered,
         server_log, tokenized,
     };
+    use bloomery_gpu_gates::tier::Tier;
     use bloomery_gpu_gates::{GateError, checks_failed, ref_model_path};
+    use bloomery_record::Log;
     use gguf::Split;
     use runtime::stores::PASS_ROWS;
     use serde_json::{Value, json};
@@ -116,11 +134,25 @@ mod gate {
     /// The cache rows of the session the ids are read from: past every prompt here and its answer.
     const SESSION_CTX: usize = 2048;
 
+    /// The gate's prompts in the order the draft clause sends them: the oracle prompts `a`, `d`
+    /// and `e`, the chat turn, the prose prompt.
+    const PROMPT_LABELS: [&str; 5] = ["a", "d", "e", "turn", "prose"];
+
     /// The default is one slot.
     const DEFAULT_SLOTS: u64 = 1;
 
     /// The words of the refusal of a second slot.
     const ONE_SEQUENCE: &str = "holds one sequence";
+
+    /// The lever naming the DSpark draft's folder.
+    const DSPARK_MODEL: &str = "BLOOMERY_DSPARK_MODEL";
+
+    /// The environment variable naming the official checkpoint folder.
+    const INK2_OFFICIAL: &str = "BLOOMERY_INK2_OFFICIAL";
+
+    /// What the unset draft word serves on the official checkpoint folder, which holds its
+    /// draft: the seat's serving default (`UNSET_SERVES_DSPARK` in its seat).
+    const UNSET_FOLDER_DRAFTS: &str = "dspark";
 
     /// This gate's seat: the one server's model word and the kinds it prints.
     const SEAT: SeatGate = SeatGate {
@@ -701,39 +733,354 @@ mod gate {
         Ok(ok)
     }
 
-    /// `draft_is_refused_until_wired` (the module header): two `--plan` runs.
-    fn draft_is_refused_until_wired(dir: &Path, file: &Path) -> Result<bool, GateError> {
+    /// The gate's prompts ([`PROMPT_LABELS`]) as the plain server answered them: the oracle prompts
+    /// `a`, `d` and `e` and the chat turn ([`Answers::runs`]'s first four: its fifth is the turn
+    /// again, for the chat clause), then the prose prompt.
+    fn plain_of(a: &Answers) -> Result<Vec<(&'static str, &Answer)>, GateError> {
+        let runs: Vec<&Answer> = a
+            .runs
+            .iter()
+            .take(PROMPT_LABELS.len() - 1)
+            .chain(std::iter::once(&a.prose))
+            .collect();
+        if runs.len() != PROMPT_LABELS.len() {
+            return Err(format!(
+                "the plain server answered {} of the gate's {} prompts",
+                runs.len() - 1,
+                PROMPT_LABELS.len()
+            )
+            .into());
+        }
+        Ok(PROMPT_LABELS
+            .iter()
+            .zip(runs)
+            .map(|(name, run)| (*name, run))
+            .collect())
+    }
+
+    /// A server's answers and records ([`server_under`]).
+    struct ServedOnce {
+        /// The answers, in the prompts' order; `None` when the server never listened.
+        answers: Option<Vec<Answer>>,
+        /// The records the server printed; `None` when none.
+        log: Option<Log>,
+    }
+
+    /// A server on `file` under the levers `env` (each set to its value, or removed from the
+    /// server's environment where the value is `None`), answering the gate's `prompts` each from
+    /// an empty cache: its answers in `prompts`' order (`None` when it never listened or a request
+    /// failed, the failure printed) and its log of records (`None` when none printed).
+    fn server_under(
+        dir: &Path,
+        file: &Path,
+        env: &[(&str, Option<&str>)],
+        name: &str,
+        prompts: &[(&str, Vec<u32>)],
+    ) -> Result<ServedOnce, GateError> {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d)?;
+        let (mut cmd, mut all) = SEAT.command(file)?;
+        for &(k, v) in env {
+            match v {
+                Some(v) => cmd.env(k, v),
+                None => cmd.env_remove(k),
+            };
+        }
+        all.extend(["--port".to_owned(), "0".to_owned()]);
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        let mut s = Served::spawn_cmd(cmd, &all, &d)?;
+        let err_log = d.join("server.err");
+        let answers = match s.address(&err_log, LISTEN_POLLS, Duration::from_secs(1)) {
+            Ok(addr) => {
+                let url = |p: &str| format!("http://{addr}{p}");
+                let mut answers = Vec::with_capacity(prompts.len());
+                let mut failed = false;
+                for (label, ids) in prompts {
+                    match greedy(&url, ids.clone(), N, &d, label, false) {
+                        Ok((answer, _)) => answers.push(answer),
+                        Err(e) => {
+                            // A request that fails is this server's clause's FAIL; the server stops.
+                            println!("{name} {label}: {e}");
+                            failed = true;
+                            break;
+                        }
+                    }
+                }
+                (!failed).then_some(answers)
+            }
+            Err(e) => {
+                println!("{name}: the server never listened: {e}");
+                None
+            }
+        };
+        println!("{name}: server stopped: {}", s.stop()?);
+        let log = server_log(&err_log, record::BLOOMERY_SERVE_INKLING2).ok();
+        Ok(ServedOnce { answers, log })
+    }
+
+    /// The drafted windows a server's `mtp width` records count over its requests, and of them
+    /// the windows that kept row 0 alone: each took back every row past it.
+    fn windows_of(log: Option<&Log>) -> Result<(u64, u64), GateError> {
+        let mut seen = (0, 0);
+        for r in log
+            .map(|l| l.all(&record::MTP_WIDTH))
+            .transpose()?
+            .unwrap_or_default()
+        {
+            seen.0 += r.u64("windows")?;
+            seen.1 += r
+                .csv("kept")?
+                .first()
+                .map(|k| k.parse::<u64>())
+                .transpose()
+                .map_err(|e| format!("mtp width kept: {e}"))?
+                .unwrap_or(0);
+        }
+        Ok(seen)
+    }
+
+    /// Whether `answers` are the plain `runs`' ids, each stopped as its plain run did, and the
+    /// chooser's `mtp width` record printed; a miss names the first prompt that differs. Where
+    /// `drafted`, the server also verified a drafted window and took rows back after one
+    /// ([`windows_of`]); elsewhere the windows are printed, and none is "not proven here".
+    fn same_ids(
+        name: &str,
+        runs: &[(&'static str, &Answer)],
+        answers: &[Answer],
+        log: Option<&Log>,
+        drafted: bool,
+    ) -> Result<bool, GateError> {
+        let mut same = true;
+        for ((label, plain), served) in runs.iter().zip(answers) {
+            let agree = agree(&plain.tokens, &plain.stop, &served.tokens);
+            println!(
+                "draft {name} {label}: {} tokens are the plain run's {agree}",
+                served.tokens.len()
+            );
+            same &= agree;
+        }
+        let width = log.is_some_and(|l| l.first(&record::MTP_WIDTH).is_ok_and(|r| r.is_some()));
+        let (windows, cut) = windows_of(log)?;
+        let ran = windows > 0 && cut > 0;
+        println!(
+            "draft {name}: the width chooser's mtp width record printed {width}; {windows} drafted \
+             windows verified, {cut} of them took back every row past row 0{}",
+            match (drafted, ran) {
+                (true, _) => format!(": a verify and its rollback ran {ran}"),
+                (false, true) => String::new(),
+                (false, false) => {
+                    ": not proven here (no drafted window and its rollback ran)".to_owned()
+                }
+            }
+        );
+        Ok(same && width && (ran || !drafted))
+    }
+
+    /// The `draft rule` record of a `--plan` of `file` under `env` names `drafts`, its why holding
+    /// `why`, and the plan record follows: a part of `draft_on_is_the_plain_ids`.
+    fn rule_is(
+        dir: &Path,
+        (name, file): (&str, &Path),
+        env: &[(&str, Option<&str>)],
+        (drafts, why): (&str, &str),
+    ) -> Result<bool, GateError> {
+        let (status, log, _) = SEAT.plan_under((dir, name), file, &[], env)?;
+        let rule = log.first(&record::DRAFT_RULE)?;
+        let got = match rule {
+            Some(r) => Some((r.word("drafts")?.to_owned(), r.text("why")?.to_owned())),
+            None => None,
+        };
+        let planned = log.first(&record::PLAN)?.is_some();
+        let held = status.success()
+            && planned
+            && got
+                .as_ref()
+                .is_some_and(|(d, w)| d == drafts && w.contains(why));
+        println!(
+            "draft rule {name}: plans (exit 0) {} with a plan record {planned}; the draft rule \
+             record {got:?}, want drafts={drafts} with {why:?}: {held}",
+            status.success()
+        );
+        Ok(held)
+    }
+
+    /// `draft_on_is_the_plain_ids` (the module header).
+    fn draft_on_is_the_plain_ids(dir: &Path, file: &Path, a: &Answers) -> Result<bool, GateError> {
         let mut ok = true;
-        let (status, log, text) = SEAT.plan_under(
-            (dir, "draft-dspark"),
+        let plain = plain_of(a)?;
+        let prompts: Vec<(&str, Vec<u32>)> = plain
+            .iter()
+            .map(|(name, run)| (*name, run.prompt.clone()))
+            .collect();
+        let draft = bloomery_levers::DRAFT;
+        // The lookup draft, on the gate's file.
+        let ServedOnce { answers, log } = server_under(
+            dir,
+            file,
+            &[(draft, Some("lookup"))],
+            "serve-lookup",
+            &prompts,
+        )?;
+        let lookup = match answers {
+            Some(answers) => same_ids("lookup", &plain, &answers, log.as_ref(), false)?,
+            None => false,
+        };
+        check(&mut ok, "draft_on_is_the_plain_ids lookup", lookup);
+        // `dspark` with no draft folder: refused by name before any plan, naming the lever.
+        let (status, planned, text) = SEAT.plan_under(
+            (dir, "draft-dspark-nofolder"),
             file,
             &[],
-            &[(bloomery_levers::DRAFT, Some("dspark"))],
+            &[(draft, Some("dspark")), (DSPARK_MODEL, None)],
         )?;
-        let named = text.contains("BLOOMERY_DRAFT=dspark") && text.contains("drafts nothing");
-        let no_plan = log.first(&record::PLAN)?.is_none();
+        let named = text.contains("BLOOMERY_DRAFT=dspark") && text.contains(DSPARK_MODEL);
+        let no_plan = planned.first(&record::PLAN)?.is_none();
         println!(
-            "BLOOMERY_DRAFT=dspark: exit non-zero {}; names the variable and that the seat drafts \
-             nothing {named}; no plan record {no_plan}",
+            "draft dspark with no folder: exit non-zero {}; names the draft word and {DSPARK_MODEL} \
+             {named}; no plan record {no_plan}",
             !status.success()
         );
-        let (off, _, _) = SEAT.plan_under(
-            (dir, "draft-off"),
-            file,
-            &[],
-            &[(bloomery_levers::DRAFT, Some("off"))],
-        )?;
-        println!("BLOOMERY_DRAFT=off: plans (exit 0) {}", off.success());
         check(
             &mut ok,
-            "draft_is_refused_until_wired",
-            !status.success() && named && no_plan && off.success(),
+            "draft_on_is_the_plain_ids dspark refused",
+            !status.success() && named && no_plan,
         );
+        // Unset with no draft folder: the plain path, and the record says why.
+        let unset_plain = rule_is(
+            dir,
+            ("draft-unset-nofolder", file),
+            &[(draft, None), (DSPARK_MODEL, None)],
+            ("off", "no DSpark draft folder"),
+        )?;
+        check(
+            &mut ok,
+            "draft_on_is_the_plain_ids unset plain",
+            unset_plain,
+        );
+        // The real tier, on the official checkpoint folder, which states the draft the Mini's
+        // visits feed.
+        let official = std::env::var_os(INK2_OFFICIAL).filter(|v| !v.is_empty());
+        let folder = match (Tier::from_env(), official) {
+            (Ok(Tier::Real), Some(folder)) => PathBuf::from(folder),
+            (tier, official) => {
+                println!(
+                    "draft dspark served and on the official folder: not run here (the tier \
+                     {tier:?}, {INK2_OFFICIAL} {})",
+                    if official.is_some() { "set" } else { "unset" }
+                );
+                return Ok(ok);
+            }
+        };
+        let at = folder.to_string_lossy().into_owned();
+        // `dspark` on the gate's file, the draft's folder named.
+        let ServedOnce { answers, log } = server_under(
+            dir,
+            file,
+            &[(draft, Some("dspark")), (DSPARK_MODEL, Some(&at))],
+            "serve-dspark",
+            &prompts,
+        )?;
+        let loaded = loaded_dspark(log.as_ref());
+        println!("draft dspark: the load draft=dspark record printed {loaded}");
+        let served = loaded
+            && match answers {
+                Some(answers) => same_ids("dspark", &plain, &answers, log.as_ref(), true)?,
+                None => false,
+            };
+        check(&mut ok, "draft_on_is_the_plain_ids dspark served", served);
+        // The folder's own draft: unset serves it ([`UNSET_FOLDER_DRAFTS`]), `off` the plain path.
+        let unset_folder = rule_is(
+            dir,
+            ("draft-unset-folder", &folder),
+            &[(draft, None), (DSPARK_MODEL, None)],
+            (UNSET_FOLDER_DRAFTS, "the target's folder"),
+        )?;
+        let off_folder = rule_is(
+            dir,
+            ("draft-off-folder", &folder),
+            &[(draft, Some("off")), (DSPARK_MODEL, None)],
+            ("off", "BLOOMERY_DRAFT=off"),
+        )?;
+        check(
+            &mut ok,
+            "draft_on_is_the_plain_ids unset and off on the folder",
+            unset_folder && off_folder,
+        );
+        // A plain server, a lookup server and an unset one (the folder's draft) on the folder.
+        let ServedOnce {
+            answers: plain_folder,
+            ..
+        } = server_under(
+            dir,
+            &folder,
+            &[(draft, Some("off")), (DSPARK_MODEL, None)],
+            "folder-plain",
+            &prompts,
+        )?;
+        let Some(plain_folder) = plain_folder else {
+            check(&mut ok, "draft_on_is_the_plain_ids folder", false);
+            return Ok(ok);
+        };
+        let plain_folder: Vec<(&'static str, &Answer)> = PROMPT_LABELS
+            .iter()
+            .zip(&plain_folder)
+            .map(|(name, run)| (*name, run))
+            .collect();
+        let ServedOnce { answers, log } = server_under(
+            dir,
+            &folder,
+            &[(draft, Some("lookup")), (DSPARK_MODEL, None)],
+            "folder-lookup",
+            &prompts,
+        )?;
+        let lookup = match answers {
+            Some(answers) => same_ids(
+                "folder lookup",
+                &plain_folder,
+                &answers,
+                log.as_ref(),
+                false,
+            )?,
+            None => false,
+        };
+        let ServedOnce { answers, log } = server_under(
+            dir,
+            &folder,
+            &[(draft, None), (DSPARK_MODEL, None)],
+            "folder-unset",
+            &prompts,
+        )?;
+        let loaded = loaded_dspark(log.as_ref());
+        println!("draft folder unset: the load draft=dspark record printed {loaded}");
+        let unset = loaded
+            && match answers {
+                Some(answers) => {
+                    same_ids("folder unset", &plain_folder, &answers, log.as_ref(), true)?
+                }
+                None => false,
+            };
+        check(&mut ok, "draft_on_is_the_plain_ids folder", lookup && unset);
         Ok(ok)
+    }
+
+    /// Whether a server's log holds the `load draft=dspark` record.
+    fn loaded_dspark(log: Option<&Log>) -> bool {
+        log.and_then(|l| l.one(&record::LOAD_DRAFT).ok())
+            .is_some_and(|r| r.word("draft").is_ok_and(|w| w == "dspark"))
     }
 
     pub fn run() -> Result<(), GateError> {
         let dir = SEAT.dir(USAGE)?;
+        // Every server here names the draft's folder or removes it, but the plan clauses' servers
+        // inherit the environment: a folder named there would serve the unset word's draft.
+        if std::env::var_os(DSPARK_MODEL).is_some_and(|v| !v.is_empty()) {
+            return Err(format!(
+                "{DSPARK_MODEL} is set: the plan and serve clauses' servers would serve the DSpark \
+                 draft by default; unset it (the draft clause names the official folder, \
+                 {INK2_OFFICIAL}, on the servers that draft)"
+            )
+            .into());
+        }
         std::fs::create_dir_all(&dir)?;
         let file = ref_model_path()?;
         let mut ok = true;
@@ -744,11 +1091,15 @@ mod gate {
         ok &= pass;
         // The server stopped, the body on the card: the one in-process load both clauses read.
         let mut m = open_body(&file)?;
-        if let Some(a) = answers {
-            ok &= body_clauses(&mut m, &a)?;
+        if let Some(a) = &answers {
+            ok &= body_clauses(&mut m, a)?;
         }
         ok &= rollback_is_refused_past_the_reach(&mut m)?;
-        ok &= draft_is_refused_until_wired(&dir, &file)?;
+        // The body leaves the card before the clause's servers load theirs.
+        drop(m);
+        if let Some(a) = &answers {
+            ok &= draft_on_is_the_plain_ids(&dir, &file, a)?;
+        }
         if !ok {
             return Err(checks_failed());
         }
@@ -757,7 +1108,8 @@ mod gate {
              slot, loads at the context it named, tokenizes the oracle prompts to the reference's \
              ids, renders the chat template, parses a forced call and reads none at none, answers \
              the body's ids, keeps a prefix down to the body's floor, takes a rollback within the conv \
-             ring's reach and refuses a deeper one by name, and refuses the draft until it is wired"
+             ring's reach and refuses a deeper one by name, answers the plain run's ids under \
+             the lookup and the DSpark drafts, and names what the draft word resolved to"
         );
         Ok(())
     }

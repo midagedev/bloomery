@@ -45,6 +45,7 @@
 use runtime::dspark::{Context, DraftVocab, DsparkError, DsparkShape, HeadKind};
 use serde_json::Value;
 
+#[path = "arch/inkling2/dspark.rs"]
 pub mod inkling2;
 
 /// Why a draft's config or id map was refused.
@@ -81,6 +82,8 @@ pub enum Error {
     Unsupported(String),
     #[error("dspark file: tensor `{name}` {detail}")]
     Tensor { name: String, detail: String },
+    #[error("dspark file: key `{key}` {detail}")]
+    Key { key: String, detail: String },
     #[error(transparent)]
     Shape(#[from] DsparkError),
 }

@@ -10,10 +10,15 @@
 //!
 //! The model file is `-m`'s, else `$BLOOMERY_REF_MODEL`: this node's own
 //! copy, which must hold the rows node 0's plan gives the tier with node 0's
-//! headers and bytes (each row's sha256). It serves Qwen3.8's and Kimi K3's tier
-//! families, and V4.1's, GLM's, Solar-Open2's and Flint's (the exaone-moe files too) when
-//! built with the `deepseek41`, `glm5next`, `solar2` or `flint` feature; an open of another
-//! family is refused by name. The explicit
+//! headers and bytes (each row's sha256). With neither, the node holds no
+//! model file: its census says so, and node 0 streams it its tier's rows from
+//! its own file at open, over the tier's link (`bloomery_gpu::host::node::load`;
+//! RDMA writes when `BLOOMERY_TIER_LINK=rdma`, the control channel otherwise),
+//! each chunk checked against node 0's sha256 as it lands. A fed open prints
+//! `fed open: …` once the node is ready for the rows. It serves Qwen3.8's, Kimi K3's and
+//! Muse Spark's tier families, and V4.1's, GLM's, Solar-Open2's, Flint's (the exaone-moe files
+//! too) and Mistral Large 4's when built with the `deepseek41`, `glm5next`, `solar2`, `flint` or
+//! `mistrallarge4` feature; an open of another family is refused by name. The explicit
 //! listen address is loopback, private or 198.18.0.0/15 IPv4. Off-host nodes bind their
 //! own RDMA or TCP pages over this control channel, which has no authentication and belongs on a trusted
 //! network.
@@ -69,20 +74,25 @@ mod server {
             )
             .into());
         }
-        let path = ref_model_path()?;
-        let file = std::sync::Arc::new(
-            Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
-        );
+        let file = if model_file::model_file().is_some() || model_file::reference().is_some() {
+            let path = ref_model_path()?;
+            Some(std::sync::Arc::new(
+                Split::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?,
+            ))
+        } else {
+            None
+        };
         let listener = TcpListener::bind(listen).map_err(|e| format!("bind {listen}: {e}"))?;
         let at = listener.local_addr()?;
         println!("listening on {at}");
         std::io::stdout().flush()?;
-        node::serve(
+        node::serve_on(
             &listener,
-            &file,
+            file.as_ref(),
             &[
                 NODE_FAMILY,
                 bloomery_gpu::arch::kimi_k3::NODE_FAMILY,
+                bloomery_gpu::arch::musespark::NODE_FAMILY,
                 #[cfg(feature = "deepseek41")]
                 bloomery_gpu_deepseek41::NODE_FAMILY,
                 #[cfg(feature = "glm5next")]
@@ -91,8 +101,11 @@ mod server {
                 bloomery_gpu_solar2::NODE_FAMILY,
                 #[cfg(feature = "flint")]
                 bloomery_gpu_flint::tier::NODE_FAMILY,
+                #[cfg(feature = "mistrallarge4")]
+                bloomery_gpu_mistrallarge4::NODE_FAMILY,
             ],
             |words| println!("{words}"),
+            |fed| println!("{fed}"),
         )?;
         println!("node 0 closed the load");
         Ok(())

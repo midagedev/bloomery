@@ -39,6 +39,13 @@ use crate::arch::{
 };
 use crate::placement::PlacementError;
 
+/// The metadata key a caller lays over a file ([`Split::with_overlay`]) to run its loop at another
+/// pass count than the file's own. The file's stored layers and per-visit arrays are read at the
+/// count it carries; only the loop the walk runs follows this one. The message tensors are not
+/// indexed by pass (the two query tables hold two rows a core layer, the controllers sit on the
+/// core layers), so any count from one reads the one set of weights.
+pub const PASSES_OVERRIDE: &str = "bloomery.inkling2.passes";
+
 /// Which spelling of the loop a file carries, by its `general.architecture`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
@@ -47,6 +54,9 @@ pub enum Dialect {
     /// `inkling2_loop`: llama.cpp master's, `block_count` the stored layers.
     Master,
 }
+
+/// llama.cpp's LLAMA_MAX_LAYERS bounds the visits a loop expands to.
+const MAX_LAYERS: usize = 512;
 
 /// The loop of a Mini-shaped file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,7 +293,39 @@ impl Hparams {
             (0..hp.n_layer).map(|l| hp.layer_dims(l)),
         )?;
         hp.model_dims_agree(split)?;
-        Ok(hp)
+        hp.with_overridden_passes(split)
+    }
+
+    /// `self` with its loop run at the count [`PASSES_OVERRIDE`] names, where `split` carries it;
+    /// a file with no loop, a value that is no count and a count whose visits pass the layer
+    /// limit are refused by name.
+    fn with_overridden_passes(mut self, split: &Split) -> Result<Hparams, PlacementError> {
+        let Some(value) = split.value(PASSES_OVERRIDE) else {
+            return Ok(self);
+        };
+        let passes = value
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .filter(|&p| p > 0)
+            .ok_or_else(|| PlacementError::Metadata {
+                key: PASSES_OVERRIDE.to_string(),
+                detail: format!("is {value:?}, not a count above 0"),
+            })?;
+        let Some(loop_) = self.loop_.as_mut() else {
+            return Err(PlacementError::Metadata {
+                key: PASSES_OVERRIDE.to_string(),
+                detail: "is set on a file that carries no loop".to_string(),
+            });
+        };
+        let visits = loop_.core_end + (passes - 1) * (loop_.core_end - loop_.core_start);
+        if visits > MAX_LAYERS {
+            return Err(PlacementError::Metadata {
+                key: PASSES_OVERRIDE.to_string(),
+                detail: format!("is {passes}: {visits} visits, above the layer limit {MAX_LAYERS}"),
+            });
+        }
+        loop_.passes = passes;
+        Ok(self)
     }
 
     /// Layer `l`'s kind: whether it is a windowed layer, whether it is a core layer of the
@@ -534,8 +576,6 @@ fn read_loop(split: &Split, dialect: Dialect) -> Result<Option<Loop>, PlacementE
             gate_rank: positive(split, "loop.gate_rank")?,
         },
     };
-    // llama.cpp's LLAMA_MAX_LAYERS bounds the visits a loop expands to.
-    const MAX_LAYERS: usize = 512;
     let core = loop_.core_end - loop_.core_start;
     let visits = loop_.core_end + (loop_.passes - 1) * core;
     if loop_.passes < 2 {

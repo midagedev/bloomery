@@ -288,6 +288,146 @@ pub fn dspark_lever() -> Option<String> {
 /// The lever the DSpark-kind draft rows name their file by.
 pub const DSPARK_LEVER: &str = "BLOOMERY_DSPARK_MODEL";
 
+/// The file a checkpoint folder holds its DSpark draft's weights in, beside `config.json`, which
+/// states the draft.
+pub const DSPARK_FOLDER_FILE: &str = "mtp.safetensors";
+
+/// Why no one DSpark draft was found beside a target, or a draft's path was refused.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum DsparkBeside {
+    /// Two files of the convention's name beside one target: which is its draft is not the
+    /// engine's guess.
+    #[error(
+        "two DSpark drafts beside {}: {} and {}; set {DSPARK_LEVER} to the one to open",
+        target.display(), first.display(), second.display()
+    )]
+    Two {
+        target: PathBuf,
+        first: PathBuf,
+        second: PathBuf,
+    },
+    /// The directory the search lists could not be read.
+    #[error("{}: {error}", dir.display())]
+    Dir { dir: PathBuf, error: String },
+    /// A draft's path in neither form ([`DsparkForm`]).
+    #[error(
+        "{}: not a DSpark draft's path (a checkpoint folder holding config.json and \
+         {DSPARK_FOLDER_FILE}, that folder's {DSPARK_FOLDER_FILE}, or a .gguf file)",
+        .0.display()
+    )]
+    Form(PathBuf),
+}
+
+/// The DSpark draft beside `target` in llama.cpp's convention: for a GGUF target, the one
+/// `dspark-*.gguf` file in its directory, or, with none there, in the directory its symlinks
+/// resolve to (the order [`BesideDraft::pick`] walks); for a checkpoint folder, its
+/// [`DSPARK_FOLDER_FILE`]. `None` when there is no such file. Two such files beside one target and
+/// a directory that cannot be listed are refused by name.
+pub fn dspark_beside(target: &Path) -> Result<Option<PathBuf>, DsparkBeside> {
+    if target.is_dir() {
+        let file = target.join(DSPARK_FOLDER_FILE);
+        return Ok(file.is_file().then_some(file));
+    }
+    let unresolved = target.parent().map(Path::to_path_buf);
+    let resolved = target
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .filter(|dir| {
+            unresolved
+                .as_ref()
+                .and_then(|u| u.join(".").canonicalize().ok())
+                .as_deref()
+                != Some(dir.as_path())
+        });
+    for dir in unresolved.into_iter().chain(resolved) {
+        let listed = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir.as_path()
+        };
+        let unread = |e: std::io::Error| DsparkBeside::Dir {
+            dir: listed.to_path_buf(),
+            error: e.to_string(),
+        };
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(listed).map_err(unread)? {
+            let name = entry.map_err(unread)?.file_name();
+            let named = name
+                .to_str()
+                .is_some_and(|n| n.starts_with("dspark-") && n.ends_with(".gguf"));
+            let path = dir.join(&name);
+            if named && path.is_file() {
+                found.push(path);
+            }
+        }
+        found.sort();
+        match found.as_slice() {
+            [] => {}
+            [one] => return Ok(Some(one.clone())),
+            [first, second, ..] => {
+                return Err(DsparkBeside::Two {
+                    target: target.to_path_buf(),
+                    first: first.clone(),
+                    second: second.clone(),
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The DSpark draft a run of `target` opens: `set` when given (the lever, [`dspark_lever`]), else
+/// [`dspark_beside`]'s, with where it came from ([`DraftFrom::Lever`], [`DraftFrom::Beside`] for a
+/// GGUF target's, [`DraftFrom::Folder`] for a checkpoint folder's own). `None`: neither.
+pub fn dspark_pick(
+    set: Option<&Path>,
+    target: &Path,
+) -> Result<Option<(PathBuf, DraftFrom)>, DsparkBeside> {
+    if let Some(p) = set {
+        return Ok(Some((p.to_path_buf(), DraftFrom::Lever(DSPARK_LEVER))));
+    }
+    let from = if target.is_dir() {
+        DraftFrom::Folder
+    } else {
+        DraftFrom::Beside
+    };
+    Ok(dspark_beside(target)?.map(|p| (p, from)))
+}
+
+/// The two forms a DSpark draft comes in, by what its path is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DsparkForm {
+    /// A checkpoint folder whose `config.json` states the draft and whose [`DSPARK_FOLDER_FILE`]
+    /// holds its weights.
+    Folder(PathBuf),
+    /// A GGUF file of llama.cpp's DSpark convention.
+    Gguf(PathBuf),
+}
+
+impl DsparkForm {
+    /// The form `path` is: a folder holding `config.json` and [`DSPARK_FOLDER_FILE`], or that
+    /// file itself (its folder), or a file named `*.gguf`. Any other path is refused by name.
+    pub fn of(path: &Path) -> Result<DsparkForm, DsparkBeside> {
+        let folder = |dir: &Path| {
+            (dir.join("config.json").is_file() && dir.join(DSPARK_FOLDER_FILE).is_file())
+                .then(|| DsparkForm::Folder(dir.to_path_buf()))
+        };
+        let form = if path.is_dir() {
+            folder(path)
+        } else if !path.is_file() {
+            None
+        } else if path.file_name() == Some(OsStr::new(DSPARK_FOLDER_FILE)) {
+            path.parent().and_then(folder)
+        } else if path.extension() == Some(OsStr::new("gguf")) {
+            Some(DsparkForm::Gguf(path.to_path_buf()))
+        } else {
+            None
+        };
+        form.ok_or_else(|| DsparkBeside::Form(path.to_path_buf()))
+    }
+}
+
 /// The MiMo-V2.6-Flash MTP sidecar (`mtp-<checkpoint>-Q8_0.gguf`; the repos'
 /// Q4_0 and BF16 files are not rows, since a resolve fetches every file of
 /// the table the repo holds). The two checkpoints' sidecars differ in
@@ -329,8 +469,9 @@ pub fn beside_draft(arch: &str) -> Option<&'static BesideDraft> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BesideDraft, Candidate, DraftFile, DraftFrom, MIMO2_BESIDE, MTP_LEVER, UnknownCheckpoint,
-        beside_draft, beside_drafts,
+        BesideDraft, Candidate, DSPARK_FOLDER_FILE, DSPARK_LEVER, DraftFile, DraftFrom,
+        DsparkBeside, DsparkForm, MIMO2_BESIDE, MTP_LEVER, UnknownCheckpoint, beside_draft,
+        beside_drafts, dspark_beside, dspark_pick,
     };
     use crate::arch::all;
     use std::path::{Path, PathBuf};
@@ -716,5 +857,89 @@ mod tests {
     fn a_checkpoint_row_has_no_checkpoint_free_pick() {
         let row = &MIMO2_BESIDE;
         let _ = row.pick(None, Path::new("/nowhere/target.gguf"));
+    }
+
+    /// The DSpark convention's draft beside a target: none, then the one `dspark-*.gguf` beside a
+    /// GGUF target (another file's name, a directory of the name and the target's other shards
+    /// never one), two refused by name with both, the file beside the real target when the target
+    /// is a symlink to it, a folder's own `mtp.safetensors`; the lever's path first. The form is
+    /// read from the path: a folder (or its `mtp.safetensors`) with `config.json`, a `.gguf` file,
+    /// anything else refused by name.
+    #[test]
+    fn the_dspark_draft_beside_a_target_is_the_one_of_its_name() {
+        let root =
+            std::env::temp_dir().join(format!("bloomery-dspark-beside-{}", std::process::id()));
+        let at = |p: &Path| p.display().to_string();
+        let mk = |p: &Path| std::fs::create_dir_all(p).unwrap_or_else(|e| panic!("{}: {e}", at(p)));
+        let touch = |p: &Path| std::fs::write(p, b"").unwrap_or_else(|e| panic!("{}: {e}", at(p)));
+        let dir = root.join("gguf");
+        mk(&dir);
+        let target = dir.join("Model-UD-Q4_K_XL.gguf");
+        touch(&target);
+        touch(&dir.join("mmproj-BF16.gguf"));
+        touch(&dir.join("dspark-Model-Q8_0.txt"));
+        mk(&dir.join("dspark-dir.gguf"));
+        assert_eq!(dspark_beside(&target), Ok(None));
+        assert_eq!(dspark_pick(None, &target), Ok(None));
+        let draft = dir.join("dspark-Model-Q8_0.gguf");
+        touch(&draft);
+        assert_eq!(dspark_beside(&target), Ok(Some(draft.clone())));
+        assert_eq!(
+            dspark_pick(None, &target),
+            Ok(Some((draft.clone(), DraftFrom::Beside)))
+        );
+        let lever = root.join("elsewhere.gguf");
+        assert_eq!(
+            dspark_pick(Some(&lever), &target),
+            Ok(Some((lever, DraftFrom::Lever(DSPARK_LEVER))))
+        );
+        assert_eq!(DsparkForm::of(&draft), Ok(DsparkForm::Gguf(draft.clone())));
+
+        #[cfg(unix)]
+        {
+            let linked = root.join("linked");
+            mk(&linked);
+            let link = linked.join("Model-UD-Q4_K_XL.gguf");
+            std::os::unix::fs::symlink(&target, &link)
+                .unwrap_or_else(|e| panic!("{}: {e}", at(&link)));
+            let found = dspark_beside(&link)
+                .expect("one draft")
+                .expect("beside the real file");
+            assert_eq!(found.file_name(), draft.file_name());
+        }
+
+        let second = dir.join("dspark-Model-BF16.gguf");
+        touch(&second);
+        assert_eq!(
+            dspark_beside(&target),
+            Err(DsparkBeside::Two {
+                target: target.clone(),
+                first: second,
+                second: draft,
+            })
+        );
+
+        let folder = root.join("folder");
+        mk(&folder);
+        assert_eq!(dspark_beside(&folder), Ok(None));
+        assert_eq!(
+            DsparkForm::of(&folder),
+            Err(DsparkBeside::Form(folder.clone()))
+        );
+        let mtp = folder.join(DSPARK_FOLDER_FILE);
+        touch(&mtp);
+        assert_eq!(dspark_beside(&folder), Ok(Some(mtp.clone())));
+        assert_eq!(
+            dspark_pick(None, &folder),
+            Ok(Some((mtp.clone(), DraftFrom::Folder)))
+        );
+        assert_eq!(DsparkForm::of(&mtp), Err(DsparkBeside::Form(mtp.clone())));
+        touch(&folder.join("config.json"));
+        for p in [&folder, &mtp] {
+            assert_eq!(DsparkForm::of(p), Ok(DsparkForm::Folder(folder.clone())));
+        }
+        let config = folder.join("config.json");
+        assert_eq!(DsparkForm::of(&config), Err(DsparkBeside::Form(config)));
+        std::fs::remove_dir_all(&root).unwrap_or_else(|e| panic!("{}: {e}", at(&root)));
     }
 }

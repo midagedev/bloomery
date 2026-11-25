@@ -280,9 +280,9 @@ pub fn pass_shape(
 ///   controllers' outputs, the three normed inputs, the output projection (the embedding's rows
 ///   before their norm), the attention block's output, the feed-forward's input, its mix (the
 ///   head's mix after the last visit), its normed input, the routed sum and the post conv's
-///   output — fourteen — and, where the core loops, the prelude's stream, the bank's last row and
-///   the four message rows; the bank's rows ([`PassShape::banks`] of them) and, where the core
-///   loops, the message bank's as many;
+///   output — fourteen — and, where the core loops, the prelude's stream, the bank's last row, the
+///   four message rows and the saved pass of LoopCD-Hidden (`BLOOMERY_INK2_LOOPCD`); the bank's
+///   rows ([`PassShape::banks`] of them) and, where the core loops, the message bank's as many;
 /// - f32 rows of the attention's widths: the query, the gate, the attention and its gated rows
 ///   (`n_head · head` each), the key and value before and after their convs (`n_kv · head` each),
 ///   the relative rows, the sinks, the two conv taps' rows (`n_kv · taps` each), each row's
@@ -306,7 +306,7 @@ pub fn pass_bytes(s: &PassShape, rows: usize) -> u64 {
     let looped = usize::from(s.looped);
     let q = s.n_head * s.head;
     let kv = s.n_kv * s.head;
-    let model_rows = 14 + looped * 6 + s.banks * (1 + looped);
+    let model_rows = 14 + looped * 7 + s.banks * (1 + looped);
     let f32s = rows
         * (model_rows * s.n
             + 4 * q
@@ -477,13 +477,13 @@ mod tests {
     }
 
     /// The Mini's pass of 512 rows [derived term by term from `pass_bytes`' list]: f32 values a
-    /// row 28 x 2,304 (fourteen model rows, six loop rows, four bank rows twice) + 4 x 3,072 +
-    /// 4 x 1,024 + 384 + 24 + 64 + 2 + 192 + 128 + 8 + 18,432 = 100,130; u32 words 12 a row and
+    /// row 29 x 2,304 (fourteen model rows, seven loop rows, four bank rows twice) + 4 x 3,072 +
+    /// 4 x 1,024 + 384 + 24 + 64 + 2 + 192 + 128 + 8 + 18,432 = 102,434; u32 words 12 a row and
     /// one; the forms: the q8 blocks of 32 (80 B a 64-value step) of 512 rows at 2,304 and at
     /// 3,072, 1,474,560 + 1,966,080 (the BF16 sites read the f32 rows), the one-expert table of
     /// 512 slots 4 x (512 + 2 x 9 + 2 + 512) = 4,176, the route block over 4,096 slots of 128
     /// experts 1,474,560 + 2 x 4 x 4,096 x 1,152 + 4,096 x 1,440 + 4 x (4,096 + 2 x 192 + 2) =
-    /// 45,139,464: 253,675,100 B in all. Mutant: a model row left out moves it by 4,718,592.
+    /// 45,139,464: 258,393,692 B in all. Mutant: a model row left out moves it by 4,718,592.
     #[test]
     fn the_mini_pass_is_its_buffers() {
         let mini = PassShape {
@@ -504,13 +504,13 @@ mod tests {
             forms: RingForms::BLOCKS32,
         };
         let f32s =
-            512 * (28 * 2304 + 4 * 3072 + 4 * 1024 + 384 + 24 + 64 + 2 + 192 + 128 + 8 + 18_432);
-        assert_eq!(f32s, 512 * 100_130);
+            512 * (29 * 2304 + 4 * 3072 + 4 * 1024 + 384 + 24 + 64 + 2 + 192 + 128 + 8 + 18_432);
+        assert_eq!(f32s, 512 * 102_434);
         let forms = 3_440_640 + 4_176 + 45_139_464;
         assert_eq!(
             pass_bytes(&mini, 512),
             4 * (f32s + 512 * 12 + 1) as u64 + forms
         );
-        assert_eq!(pass_bytes(&mini, 512), 253_675_100);
+        assert_eq!(pass_bytes(&mini, 512), 258_393_692);
     }
 }

@@ -9,7 +9,7 @@
 
 use app::Session;
 use bloomery_gpu::arch::qwen3moe::Body38;
-use bloomery_gpu::host::tier::{TierAct, TierCard};
+use bloomery_gpu::host::tier::TierCard;
 use bloomery_gpu::hybrid::Chain;
 use bloomery_gpu::words::WordSide;
 use bloomery_gpu_gates::{GateError, verdict};
@@ -23,12 +23,14 @@ pub const STEPS: usize = 24;
 /// The verify windows: their rows and the rows each keeps.
 pub const WINDOWS: [(usize, usize); 6] = [(4, 2), (3, 3), (2, 1), (4, 4), (2, 2), (3, 1)];
 /// Nodes of a tier graph a tier layer on a card that adds to the page's
-/// words by memory operations, nine: the go wait, the activation's and the
-/// places' copies in, the card leg's four launches into the tier card's
-/// rows, the rows' copy out to the page, the signal.
-pub const TIER_LAYER_NODES: usize = TierCard::nodes_per_layer(TierAct::F32, 4, WordSide::Memop);
-// PIN(2026-10-06): 8 -> 9, the rows' copy out; launches storing into the page held 385 against 433.
-const _: () = assert!(TIER_LAYER_NODES == 9);
+/// words by memory operations, eight: the go wait, the copy in of the
+/// activation and the places (one launch), the card leg's four launches
+/// into the tier card's rows, the rows' copy out to the page (one launch),
+/// the signal.
+pub const TIER_LAYER_NODES: usize = TierCard::nodes_per_layer(4, WordSide::Memop);
+// PIN(2026-11-25): 9 -> 8, the activation's and the places' two copies in are one launch
+// (tier_copy_spans); the rows' copy out stays a node of its own, a launch now.
+const _: () = assert!(TIER_LAYER_NODES == 8);
 
 /// Every token and logits row a history read, in order, its stage graph
 /// nodes (the step's, then each verify width's), and the flips that landed
@@ -176,7 +178,7 @@ pub fn tier_graphs_and_chains(tier: &TierCard, layers: usize) -> bool {
         return false;
     };
     let launches = if paged { 5 } else { 4 };
-    let per_layer = TierCard::nodes_per_layer(TierAct::F32, launches, side);
+    let per_layer = TierCard::nodes_per_layer(launches, side);
     let want = Some(per_layer * layers + 1);
     let graphs: Vec<Option<usize>> = [Chain::Step, Chain::Cols(2), Chain::Cols(3), Chain::Cols(4)]
         .iter()

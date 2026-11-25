@@ -1,0 +1,36 @@
+# Round rdma0 (kind profile): V4.1-Flash bq3km with the Spark as the expert tier node over the direct ConnectX 100GbE link, RDMA.
+# ws = RTX 5090 stage + host (8,183 host experts, no paged set, r8 path); Spark = GB10 holding 5,596 of the off-card experts at
+# BLOOMERY_CARD_BUDGET=90G. Link [measured 2026-11-24, rig-log log/2026-11-24.md#spark-cx7-hotplug]: 98.0 Gb/s = 12.25 GB/s both ways,
+# one way 1.25 us (64 B), 3.18 (8 KiB), 4.10 (16 KiB).
+# [measured] the 11-17 look2, the same arm on the 10GbE TCP link (52 us RTT floor, 1.24 GB/s; commit 4b258a7f): requests 5..8 at D 512
+# 42.0, 42.1, 41.2, 42.5 tok/s = 23.8, 23.8, 24.3, 23.5 ms (ws alone on the same server pair: 16.5, 16.3, 15.9, 17.5 ms); D 4096 38.3 and 41.1
+# tok/s; first request 32.9 tok/s (30.4 ms, majflt 61,878). tier-link-pump 100 % of one cpu (psr 48), tier-link-tcp 28 %, GB10 util 30..36 %.
+# [derived] B - A warm = 7.3 ms over 27..35 layers with a node pick (nodeskip) = 209..270 us a trip against the 10GbE leg's ~220 us (go 30 +
+# done 43 wire + hops 11 + chain 40 + GB10 slot 80 x 1.2): the node leg is serial after the card's front, not under its shadow. RDMA
+# replaces the pump's go and done (73 -> 7.1 us a trip) and the CX's TCP carries the Enqueue frame (52 -> 12.6 us RTT floor): 66..86 us a
+# trip x 27..35 trips = 1.8..3.0 ms a step, so 23.9 - (1.8..3.0) = 20.8..22.1 ms = 45.3..48.0 tok/s. The wire is 5 % of the leg; RDMA against
+# TCP on the CX is ~12 us a trip (wire 7.1 against 19.0) = 0.3..0.4 ms = 1.5..2 %, at the edge of a 3-round ruler (+-1.4 %): this is not an RDMA-versus-TCP A/B. The Spark cannot pass ws alone warm
+# (the card front is common to both and A already sits at front + 2 ms): -25..-21 % against 60.4 tok/s; it wins where A pages (cold
+# first request +21..+26 %, D 4096 a tie).
+# Resource timeline a step, warm D 512 (21.5 ms): card front 14.5 ms serial | host DRAM ~7 ms (under the front) | node leg 27..35 trips x
+# ~150 us = 4..5 ms serial after the front | PCIe ~3.6 ms | link ~0.1 ms | NVMe 0 (host fits) | GB10 busy ~3 ms of 21.5 (86 % idle).
+# [measured 2026-11-25, untimed 4.1 look] bq3km on both machines (copied to the Spark's /models, sha256 equal on all nine shards):
+# plan bp card_experts=1581, host_experts=8183 (138.3 GB), paged=0, the node 5,596; the Spark printed word_ops=kernel driver=13000; greedy
+# 16 ids md5 equal to ws alone. tier_server packed with tools/oxart-pack.sh (cubins, ptxas 13.3; sha256 10aaa0e4f5feeceb...).
+kind: profile
+question: does the engine's round trip over RDMA land the node leg at the derived ~150 us a trip, i.e. how much of the 10GbE look2's 7.3 ms exposed node leg does the link remove
+term: tg tok/s of the warm rows of the arm env=BLOOMERY_TIER_LINK=rdma (no [cold] tag; a [shared] row counts) @ n=128, prose D=512, ctx 16384, --place bp, RTX 5090 + host 252 GiB + the Spark's GB10 as the one tier, main 759512396; the BLOOMERY_THREADS=31 arm and the D 1024 and 4096 rows are read beside it
+unit: tok/s
+predict: 43..50
+condition: the ws-alone card's condition on the same binary, serving defaults beside the levers; arms env=BLOOMERY_TIER_LINK=rdma,BLOOMERY_TIER_NODES=10.42.0.2:19000,
+  BLOOMERY_CARD_BUDGET=90G (one arm also BLOOMERY_THREADS=31), DEPTH_SERVE_PLACE=bp, DEPTH_SERVE_FOLD=depths, BLOOMERY_AB_ROUNDS=3, one server a
+  round; the Spark's tier_server from the same commit (packed, sha256 10aaa0e4f5feeceb...) restarted before each load by the loop, MemAvailable on the
+  Spark over 112 GB and no yc-* container over 10 GB at each start; the plan line names place=bp, the tier's 5,596 experts, card_experts=1581,
+  host_experts=8183 and paged=0; once per arm, mid-window, `ps -L -o tid,psr,comm -p <serve pid>` names the cpus of tier-link-pump against the
+  pool's; the Spark's and ws's NIC counters are read before and after (no errors, no port_xmit_wait growth)
+decide-in: 43..50: the engine round trip over RDMA is the derived one; the Spark's value on this machine is the NVMe it removes (cold rows, D 4096, a
+  quant past host RAM) not warm decode; the next sitting is the hot-first node set (f 0.6) or a quant that pages on ws alone, not the TCP arm
+decide-below: under 43: the node leg is above ~150 us a trip: read the pump's cpu and the per-layer node wait (BLOOMERY_PROFILE=1 tier stamps); if the
+  THREADS=31 arm is above this one by more than 3 points the pump threads tax the host leg and the pump must leave the pool's cores
+decide-above: over 50: the node leg is partly hidden under the front or the frame did not cost what 10GbE showed; read trips a step and the GB10 busy
+  share before claiming; over A's warm mean (60) is not derivable: check both plan lines' paged GB and majflt (A was cold)

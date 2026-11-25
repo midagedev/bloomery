@@ -1551,24 +1551,7 @@ impl<'f> SegmentFile<'f> {
         t: &ModelTensor,
         seg: &Segment,
     ) -> Result<SegmentFile<'f>, GpuError> {
-        let spans = seg
-            .spans(t, experts)
-            .map_err(|e| GpuError::plan(PLACED, e))?;
-        let (shard, info) = split
-            .find(&t.name)
-            .ok_or_else(|| placed_refusal(t, "is not in the split".to_string()))?;
-        if shard != t.shard || info.ty != t.ty || info.dims != t.dims || info.nbytes != t.file_bytes
-        {
-            let detail = format!(
-                "the split's shard {shard} {} {:?} ({} bytes) is not the plan's shard {} {} {:?} \
-                 ({} bytes)",
-                info.ty, info.dims, info.nbytes, t.shard, t.ty, t.dims, t.file_bytes
-            );
-            return Err(placed_refusal(t, detail));
-        }
-        let gguf = split
-            .shard(shard)
-            .ok_or_else(|| placed_refusal(t, format!("shard {shard} is not in the split")))?;
+        let (shard, info, gguf, spans) = segment_place(split, experts, t, seg)?;
         let data = gguf.data(info)?;
         let mut bytes = Vec::with_capacity(spans.len());
         for span in &spans {
@@ -1594,6 +1577,195 @@ impl<'f> SegmentFile<'f> {
             spans,
             bytes,
         })
+    }
+}
+
+/// Where placement segment `seg` of tensor `t`, a stack of `experts` when it
+/// is one, lies in `split`, without its bytes: the tensor's shard, header
+/// entry and reader, and the segment's spans. A tensor the split lacks or
+/// holds otherwise is refused by name.
+fn segment_place<'f>(
+    split: &'f Split,
+    experts: u64,
+    t: &ModelTensor,
+    seg: &Segment,
+) -> Result<(usize, &'f TensorInfo, &'f Gguf, Vec<Span>), GpuError> {
+    let spans = seg
+        .spans(t, experts)
+        .map_err(|e| GpuError::plan(PLACED, e))?;
+    let (shard, info) = split
+        .find(&t.name)
+        .ok_or_else(|| placed_refusal(t, "is not in the split".to_string()))?;
+    if shard != t.shard || info.ty != t.ty || info.dims != t.dims || info.nbytes != t.file_bytes {
+        let detail = format!(
+            "the split's shard {shard} {} {:?} ({} bytes) is not the plan's shard {} {} {:?} \
+             ({} bytes)",
+            info.ty, info.dims, info.nbytes, t.shard, t.ty, t.dims, t.file_bytes
+        );
+        return Err(placed_refusal(t, detail));
+    }
+    let gguf = split
+        .shard(shard)
+        .ok_or_else(|| placed_refusal(t, format!("shard {shard} is not in the split")))?;
+    Ok((shard, info, gguf, spans))
+}
+
+/// The scales the upload of segment `seg` of `info`, a tensor of `split`,
+/// carries ([`upload_scales`]): a stack's those of its listed experts, in the
+/// order its planes hold them. `None` for a tensor with none.
+fn listed_scales(
+    split: &Split,
+    info: &TensorInfo,
+    seg: &Segment,
+) -> Result<Option<Vec<f32>>, GpuError> {
+    Ok(upload_scales(PLACED, info, |n| {
+        let (s, t) = split.find(n)?;
+        Some((split.shard(s)?, t))
+    })?
+    .map(|all| match &seg.experts {
+        Some(list) if info.dims.len() == 3 => list.ids().iter().map(|&e| all[e as usize]).collect(),
+        _ => all,
+    }))
+}
+
+/// [`listed_scales`] of placement segment `seg` of tensor `t`, a stack of
+/// `experts` when it is one, in `split`: what a process that sends the
+/// segment's bytes to another sends beside them ([`SegmentLoad::upload`]).
+pub(crate) fn segment_scales(
+    split: &Split,
+    experts: u64,
+    t: &ModelTensor,
+    seg: &Segment,
+) -> Result<Option<Vec<f32>>, GpuError> {
+    let (_, info, _, _) = segment_place(split, experts, t, seg)?;
+    listed_scales(split, info, seg)
+}
+
+/// The card segments of one load uploaded from bytes the caller holds rather
+/// than from `split`'s mappings: `split` names each segment's tensor (a header
+/// alone serves, [`Split::from_headers`]) and each segment's bytes and scales
+/// come with it ([`SegmentLoad::upload`]) — a tier node that node 0 feeds its
+/// tier's rows (`crate::host::node`). Each segment is uploaded as
+/// [`Weights::load_rows`] uploads it, in its card format, on one staging ring
+/// whose copies [`SegmentLoad::finish`] synchronizes.
+pub(crate) struct SegmentLoad {
+    /// Declared first, so it drops first: its drop drains the copies into
+    /// the buffers `weights` holds.
+    ring: UploadRing,
+    weights: Weights,
+    split: Arc<Split>,
+    experts: u64,
+}
+
+impl SegmentLoad {
+    /// A load of the segments `rows` (placement rows of `model`, `split`'s
+    /// tensors) put on card `card`, its ring sized by their resident bytes.
+    /// `stream`'s context is made current first.
+    pub(crate) fn new(
+        stream: &CudaStream,
+        split: Arc<Split>,
+        model: &ModelTensors,
+        rows: &[Row],
+        card: usize,
+    ) -> Result<SegmentLoad, GpuError> {
+        stream.context().bind_to_thread()?;
+        let budget = rows
+            .iter()
+            .flat_map(|row| row.segments.iter())
+            .filter(|seg| seg.device == Device::Card(card))
+            .map(|seg| seg.resident_bytes)
+            .sum::<u64>();
+        Ok(SegmentLoad {
+            ring: UploadRing::new(stream, usize::try_from(budget).unwrap_or(usize::MAX))?,
+            weights: Weights::default(),
+            split,
+            experts: model.experts,
+        })
+    }
+
+    /// Upload segment `seg` of tensor `t` from `bytes`, its spans' bytes in
+    /// slot order as one run (the bytes [`SegmentFile::of`] borrows, one after
+    /// another), with `scale` ([`segment_scales`] of the file they come from).
+    /// A run of other than the spans' bytes, a format that is not a card's, a
+    /// second segment of one tensor and an upload of other than the segment's
+    /// resident bytes are refused by name. `bytes` is read only inside the call.
+    pub(crate) fn upload(
+        &mut self,
+        stream: &CudaStream,
+        t: &ModelTensor,
+        seg: &Segment,
+        bytes: &[u8],
+        scale: Option<Vec<f32>>,
+    ) -> Result<(), GpuError> {
+        let Format::Card(format) = seg.format else {
+            return Err(placed_refusal(t, format!("is on a card as {}", seg.format)));
+        };
+        if self.weights.by_name.contains_key(&t.name) {
+            return Err(placed_refusal(
+                t,
+                "has two segments on one card".to_string(),
+            ));
+        }
+        let (_, info, _, spans) = segment_place(&self.split, self.experts, t, seg)?;
+        let lens: Vec<usize> = spans
+            .iter()
+            .map(|s| usize::try_from(s.bytes.end - s.bytes.start))
+            .collect::<Result<_, _>>()
+            .map_err(|_| placed_refusal(t, "a span past usize".to_string()))?;
+        if lens.iter().sum::<usize>() != bytes.len() {
+            return Err(placed_refusal(
+                t,
+                format!(
+                    "{} bytes for spans {spans:?} of {} bytes",
+                    bytes.len(),
+                    lens.iter().sum::<usize>()
+                ),
+            ));
+        }
+        let mut src = Vec::with_capacity(lens.len());
+        let mut rest = bytes;
+        for n in lens {
+            let (span, tail) = rest.split_at(n);
+            src.push(span);
+            rest = tail;
+        }
+        let held: u64 = spans.iter().map(|s| s.rows.end - s.rows.start).sum();
+        let rows = usize::try_from(held)
+            .map_err(|_| placed_refusal(t, format!("{held} rows pass usize")))?;
+        let (dw, room, backed) = upload_rows_in(
+            stream,
+            &mut self.ring,
+            (PLACED, format, None),
+            info,
+            rows,
+            &src,
+            scale,
+        )?;
+        if room.is_some() || backed != seg.resident_bytes {
+            // The upload's copies may still be running into the buffers this
+            // error is about to drop; drain before they do.
+            let _ = stream.synchronize();
+            if room.is_some() {
+                dw.dissolve_view();
+            }
+            return Err(placed_refusal(
+                t,
+                format!(
+                    "uploaded {backed} device bytes of backed rows, the plan has {}",
+                    seg.resident_bytes
+                ),
+            ));
+        }
+        self.weights.by_name.insert(t.name.clone(), dw);
+        Ok(())
+    }
+
+    /// The weights uploaded, once the ring's copies have ended.
+    pub(crate) fn finish(self, stream: &CudaStream) -> Result<Weights, GpuError> {
+        let SegmentLoad { ring, weights, .. } = self;
+        let done = ring.finish(stream);
+        drop(ring);
+        done.map(|()| weights)
     }
 }
 
@@ -1628,15 +1800,7 @@ fn upload_segment(
     let held: u64 = spans.iter().map(|s| s.rows.end - s.rows.start).sum();
     let rows =
         usize::try_from(held).map_err(|_| placed_refusal(t, format!("{held} rows pass usize")))?;
-    let scale = upload_scales(PLACED, info, |n| {
-        let (s, t) = split.find(n)?;
-        Some((split.shard(s)?, t))
-    })?
-    .map(|all| match &seg.experts {
-        // The listed experts' scales, in the order the planes hold them.
-        Some(list) if info.dims.len() == 3 => list.ids().iter().map(|&e| all[e as usize]).collect(),
-        _ => all,
-    });
+    let scale = listed_scales(split, info, seg)?;
     let (dw, room, backed) = upload_rows_in(
         stream,
         ring,

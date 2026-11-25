@@ -10,6 +10,7 @@ crates/threads/src/lib.rs 2 the pool's workers: each pins itself, and pool() bui
 crates/gpu-gates/src/bind.rs 4 the engine thread, spawned by the serve main, which is never pinned (the engine thread pins itself); a test's echo thread; a test's file thread (the seat's state commands); a test's command receiver, which reads its own CPU time
 crates/gpu-gates/src/side_seat.rs 1 the embedding model's thread, which owns its card, spawned by the serve main, never pinned
 crates/gpu-gates/src/bin/gate_gemma_embedding2_serve.rs 1 the gate's concurrent chat request, from the gate main, never pinned
+crates/gpu-gates/src/bin/gate_ernie55_moe.rs 1 the synthetic MXFP4 stacks' row writers (scoped, one per chunk), from the gate main before any pool or pin_caller, never pinned
 crates/gpu-gates/src/serve_client.rs 2 a serve gate's two concurrent requests (together), from the gate main, never pinned
 crates/gpu-gates/src/bin/shared/serve_seats/decide.rs 2 the decide seat's backbone worker thread, which owns the card, spawned by the serve main, never pinned; the worker test's job thread, from a libtest thread that is never pinned
 crates/serve/src/api.rs 4 the HTTP server's threads and the signal handlers' reader thread, spawned by the serve main or its accept loop, never pinned
@@ -75,3 +76,4 @@ crates/vision/src/arch/qwen3vl/fixture.rs 1 the synthetic encoder writer's fill 
 # PIN(2026-11-24): the late-free tests (cuda-oxide ab2b6738's retirement thread) watch a call from a second thread.
 crates/gpu/src/capsync.rs 1 a gate test's watcher that reports whether the driver call after a parked pass returns, from a libtest thread that is never pinned
 crates/gpu/src/checkpoint.rs 1 a gate test's copy call made while its stream is held, from a libtest thread that is never pinned
+crates/gpu/src/host/node/load.rs 4 the node's load-time scoped threads (chunk hashing and row reads beside the card upload) borrow the mapped rows and the upload buffer, which spawn_helper's 'static body cannot; tier_server's load runs before any pin_caller, so they inherit no one-cpu mask

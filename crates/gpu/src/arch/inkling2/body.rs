@@ -33,6 +33,12 @@
 //! input; the head softcaps the logits and writes the padded columns past the unpadded
 //! vocabulary at [`PAD_LOGIT`], so the argmax reads the vocabulary alone.
 //!
+//! LoopCD-Hidden (`BLOOMERY_INK2_LOOPCD`, [`GpuModel::set_loopcd`]) touches two points of the walk:
+//! the end of the reference pass, where the stream is kept ([`Walk::pass_edge`]), and the
+//! loop→coda boundary, where the stream past the last pass becomes `h + ω (h − h_b)` before the
+//! coda's first layer reads it, its mix and the block it banks alike ([`Walk::loop_boundary`]).
+//! Off, nothing of it launches.
+//!
 //! A layer of other site types, and a step under the imatrix collector (which reads each site's
 //! normed input), runs the input norms and the projections a launch each. Every mix of the step
 //! is the step mix's launch pair. A prompt runs as the rows pass ([`pass`]): the same walk over
@@ -71,7 +77,9 @@ use crate::site::{self, KGemvKernels, SiteTy};
 use crate::tensor::{PartedBuffer, Window, WindowMut, copy_row};
 use crate::weights::Weights;
 use crate::{Gpu, GpuError};
-use bloomery_levers::{ChurnHosting, HostCfg};
+use bloomery_levers::{
+    ChurnHosting, HostCfg, INK2_LOOPCD, INK2_LOOPCD_MAX, INK2_LOOPCD_REF, INK2_PASSES,
+};
 use chain::linear::Ring;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::{Split, TensorInfo};
@@ -88,10 +96,13 @@ use runtime::layer::hosted;
 use std::ops::Range;
 use std::sync::Arc;
 
+#[path = "loop_cd.rs"]
+mod loop_cd;
 #[path = "pass.rs"]
 pub(super) mod pass;
 #[path = "placed.rs"]
 pub(super) mod placed;
+use loop_cd::{LoopCdArgs, LoopCdKernels};
 
 /// What a placed load is made from, and its stage card: `None` on the whole-card load.
 type PlacedOpen<'a> = Option<(Open<'a>, usize)>;
@@ -254,6 +265,8 @@ struct Kernels {
     out_gate: OutGateKernels,
     router: Route,
     leg: CardLeg,
+    /// The LoopCD-Hidden boundary step ([`loop_cd`]).
+    loop_cd: LoopCdKernels,
 }
 
 impl Kernels {
@@ -275,6 +288,7 @@ impl Kernels {
             out_gate: OutGateKernels::load(ctx)?,
             router: Route::load(ctx, n_expert)?,
             leg: CardLeg::load(gpu)?,
+            loop_cd: LoopCdKernels::load(ctx)?,
         })
     }
 }
@@ -323,6 +337,9 @@ struct Scratch {
     bank_last: DeviceBuffer<f32>,
     /// The prelude's stream, which every pass past the first restarts from.
     prelude: DeviceBuffer<f32>,
+    /// The stream saved at the end of LoopCD-Hidden's reference pass ([`LoopCd`]), read at the
+    /// loop→coda boundary.
+    h_ref: DeviceBuffer<f32>,
     /// The head's padded columns' constant.
     pad: DeviceBuffer<f32>,
     route: RouteOut,
@@ -380,6 +397,7 @@ impl Scratch {
             msg_bank: z(MAX_VECS * n)?,
             bank_last: z(n)?,
             prelude: z(n)?,
+            h_ref: z(n)?,
             pad: DeviceBuffer::from_host(
                 stream,
                 &vec![PAD_LOGIT; (pad * pass::rows::VERIFY_ROWS).max(1)],
@@ -422,6 +440,7 @@ impl Scratch {
             &self.msg_bank,
             &self.bank_last,
             &self.prelude,
+            &self.h_ref,
             &self.pad,
         ];
         bufs.iter().map(|b| b.num_bytes()).sum::<usize>()
@@ -437,6 +456,16 @@ impl Scratch {
             + self.mix_step.bytes()
             + self.route.bytes()
     }
+}
+
+/// LoopCD-Hidden on a loaded body ([`GpuModel::set_loopcd`]): the stream past the core's last pass
+/// becomes `h + ω (h − h_b)`, `h_b` the core's output after pass `reference`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LoopCd {
+    /// ω, the strength: finite, not negative.
+    pub omega: f32,
+    /// The reference pass `b`, 1 or 2.
+    pub reference: u32,
 }
 
 /// The Inkling 2 chain over one sequence on one card.
@@ -455,6 +484,8 @@ pub struct Body {
     /// Whether the visits of a pass past the first run their messages: always on a serving
     /// load; [`Body::set_messages`] turns them off for a gate's clause.
     messages: bool,
+    /// LoopCD-Hidden at the loop→coda boundary ([`GpuModel::set_loopcd`]): `None` off.
+    loopcd: Option<LoopCd>,
     /// Each visit's [`TAP_STAGES`] at the step's position, armed by [`Body::arm_taps`].
     taps: Option<DeviceBuffer<f32>>,
     /// A block draft's taps ([`GpuModel::set_draft_taps`]): the rows entering the visits it
@@ -480,9 +511,11 @@ pub struct Body {
 
 impl GpuModel<Body> {
     /// Tap the rows entering `visits` (strictly rising, each at most the visit count; the visit
-    /// count is the final normed row) from the next step on, one row a tap; empty stops tapping.
-    /// The captured step is dropped first, so the next one records the copies. Refused by name
-    /// on a placed load: its step walk carries no taps.
+    /// count is the final normed row) from the next walk on, one row a tap: the step's row, a
+    /// verify's rows, a prompt pass's ([`GpuModel::draft_taps_rows`]). The taps hold a prompt
+    /// pass's rows ([`Body::pass_rows`]), a verify's at the most. The captured step is dropped
+    /// first, so the next one records the copies. Refused by name on a placed load: its step walk
+    /// carries no taps.
     pub fn set_draft_taps(&mut self, visits: &[usize]) -> Result<(), GpuError> {
         const WHAT_S: &str = "inkling2::set_draft_taps";
         self.drop_captures();
@@ -498,11 +531,12 @@ impl GpuModel<Body> {
             return Ok(());
         }
         let free = gpu.alloc_room()?;
+        let rows = body.pass_rows().max(pass::rows::VERIFY_ROWS).max(1);
         let mut t = DraftTaps::new(
             gpu.stream(),
             visits,
             body.visits.len() + 1,
-            (body.d.n, 1),
+            (body.d.n, rows),
             free,
         )?;
         t.plan(1);
@@ -513,12 +547,53 @@ impl GpuModel<Body> {
     /// The last step's tapped row, the taps in the order they were named. Blocking; refused by
     /// name with no taps set.
     pub fn draft_taps(&mut self) -> Result<Vec<f32>, GpuError> {
-        const WHAT_T: &str = "inkling2::draft_taps";
+        self.draft_taps_rows(1)
+    }
+
+    /// The first `rows` rows of the last walk's draft taps, each [`GpuModel::draft_tap_width`]
+    /// values (the taps in the order they were named): a verify's rows, a prompt pass's, a
+    /// step's one. Blocking; refused by name with no taps set, and past the rows the last walk
+    /// laid in.
+    pub fn draft_taps_rows(&mut self, rows: usize) -> Result<Vec<f32>, GpuError> {
+        const WHAT_T: &str = "inkling2::draft_taps_rows";
         let (gpu, _, body) = self.body_parts(WHAT_T)?;
         body.draft
             .as_ref()
             .ok_or(GpuError::state(WHAT_T, "taps set (set_draft_taps)"))?
-            .read(gpu.stream(), 0, 1)
+            .read(gpu.stream(), 0, rows)
+    }
+
+    /// The values of one position's draft tap row; 0 with no taps set.
+    pub fn draft_tap_width(&self) -> Result<usize, GpuError> {
+        const WHAT_W: &str = "inkling2::draft_tap_width";
+        Ok(self
+            .body(WHAT_W)?
+            .draft
+            .as_ref()
+            .map_or(0, DraftTaps::width))
+    }
+
+    /// The visits the draft's taps read, as [`GpuModel::set_draft_taps`] named them; `None` with
+    /// none set.
+    pub fn draft_layers(&self) -> Result<Option<&[usize]>, GpuError> {
+        const WHAT_L: &str = "inkling2::draft_layers";
+        Ok(self.body(WHAT_L)?.draft.as_ref().map(DraftTaps::layers))
+    }
+
+    /// LoopCD-Hidden from the next step, prompt pass or verify on ([`LoopCd`]): before the coda's
+    /// first layer reads the stream past the core's last pass, the stream becomes
+    /// `h + ω (h − h_b)`, `h_b` the core's output after pass `reference`. An ω of 0 turns it off, and
+    /// a load starts off. The captured chains are dropped first, so the next graph run records the
+    /// rule's copy and launch, or neither. Refused by name, nothing changed: an ω that is negative,
+    /// not finite or past the lever's range, a reference that is not 1 or 2, a trunk that does not
+    /// loop, and a reference pass with no pass after it (the rule would read the last pass's own
+    /// output).
+    pub fn set_loopcd(&mut self, omega: f32, reference: u32) -> Result<(), GpuError> {
+        const WHAT_S: &str = "inkling2::set_loopcd";
+        self.body_parts(WHAT_S)?.2.refuse_loopcd(omega, reference)?;
+        self.drop_captures();
+        self.body_parts(WHAT_S)?.2.loopcd = (omega != 0.0).then_some(LoopCd { omega, reference });
+        Ok(())
     }
 
     /// The whole model of `file` (a GGUF split, or a checkpoint folder's header and part source)
@@ -1121,6 +1196,7 @@ impl Body {
             step_in: StepIn::new(stream)?,
             ring,
             messages: true,
+            loopcd: None,
             taps: None,
             draft: None,
             forced: None,
@@ -1253,6 +1329,47 @@ impl Body {
         tap_widths(&self.d)
     }
 
+    /// [`GpuModel::set_loopcd`]'s refusals, before anything changes: the two levers named, and
+    /// the file's loop read for what it holds.
+    fn refuse_loopcd(&self, omega: f32, reference: u32) -> Result<(), GpuError> {
+        const WHAT_S: &str = "inkling2::set_loopcd";
+        let pair = format!("{INK2_LOOPCD}={omega} with {INK2_LOOPCD_REF}={reference}");
+        let most = INK2_LOOPCD_MAX as f32 / 10f32.powi(bloomery_levers::INK2_LOOPCD_PLACES as i32);
+        if !omega.is_finite() || omega < 0.0 || omega > most {
+            return Err(GpuError::shape(
+                WHAT_S,
+                format!("{pair}: the strength is a decimal number from 0 to {most}"),
+            ));
+        }
+        if !(1..=2).contains(&reference) {
+            return Err(GpuError::shape(
+                WHAT_S,
+                format!("{pair}: the reference pass is 1 or 2"),
+            ));
+        }
+        let Some(lp) = self.hp.loop_.filter(|lp| lp.passes > 1) else {
+            return Err(GpuError::shape(
+                WHAT_S,
+                format!(
+                    "{pair}: a trunk of {} stored layers run once, no loop: no core pass to \
+                     extrapolate from",
+                    self.hp.n_layer
+                ),
+            ));
+        };
+        if u32::try_from(lp.passes).is_ok_and(|passes| passes <= reference) {
+            return Err(GpuError::shape(
+                WHAT_S,
+                format!(
+                    "{pair}: the core runs {} passes, so pass {reference} has none after it: the \
+                     reference is a pass before the last ({INK2_PASSES} names the count)",
+                    lp.passes
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Keep every visit's [`TAP_STAGES`] at each step's position from now on ([`Body::taps`]).
     /// Load-time work: before any capture.
     pub fn arm_taps(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
@@ -1370,6 +1487,7 @@ impl Body {
             s,
             step_in,
             messages,
+            loopcd,
             taps,
             draft,
             forced,
@@ -1412,6 +1530,7 @@ impl Body {
             prelude: 0,
             n_msg: 0,
             banked: false,
+            loopcd: *loopcd,
         };
         let core = hp.loop_.filter(|lp| lp.passes > 1);
         match placed.as_mut() {
@@ -1424,7 +1543,7 @@ impl Body {
                 let mut step = StepWalk {
                     walk,
                     visits: &visits[..],
-                    loop_core: core.map(|lp| lp.core_start),
+                    core,
                     messages: *messages,
                     layers: &layers[..],
                     stores: &mut stores[..],
@@ -1442,6 +1561,9 @@ impl Body {
                         && l == lp.core_start
                     {
                         walk.pass_edge(v.pass)?;
+                    }
+                    if core.is_some_and(|lp| l == lp.core_end) {
+                        walk.loop_boundary()?;
                     }
                     if let Some(t) = draft.as_mut()
                         && let Some(i) = t.slot(slot)
@@ -1509,6 +1631,9 @@ struct Walk<'a> {
     n_msg: usize,
     /// Whether this visit banked the stream: its attention output is the feed-forward input.
     banked: bool,
+    /// LoopCD-Hidden at the loop→coda boundary ([`Walk::pass_edge`], [`Walk::loop_boundary`]);
+    /// `None` off.
+    loopcd: Option<LoopCd>,
 }
 
 /// `src`'s `rows` rows of `n` from row `from` into `dst` from row `to`, one copy; nothing for no
@@ -1648,6 +1773,12 @@ impl<'a> Walk<'a> {
                 ),
             ));
         }
+        // The stream here is the core's output after `pass` passes (this edge opens pass `pass`,
+        // counted from 0): the rule's reference when `pass` is the reference pass `b`, kept until
+        // the boundary.
+        if self.loopcd.is_some_and(|cd| cd.reference == pass) {
+            copy_row(stream, &s.x, &mut s.h_ref, n)?;
+        }
         self.n_msg = self.pushed - first;
         copy_rows(
             stream,
@@ -1658,6 +1789,27 @@ impl<'a> Walk<'a> {
         copy_row(stream, &s.x, &mut s.bank_last, n)?;
         self.pushed = self.prelude;
         copy_row(stream, &s.prelude, &mut s.x, n)
+    }
+
+    /// LoopCD-Hidden at the loop→coda boundary, before the first visit past the core reads the
+    /// stream: the stream past the core's last pass becomes `h + ω (h − h_b)` over the row
+    /// ([`crate::arch::inkling2::loop_cd`]), `h_b` the stream [`Walk::pass_edge`] saved; nothing
+    /// off.
+    fn loop_boundary(&mut self) -> Result<(), GpuError> {
+        let Some(cd) = self.loopcd else {
+            return Ok(());
+        };
+        let s = &mut *self.s;
+        self.k.loop_cd.enqueue(
+            self.cx.gpu.stream(),
+            LoopCdArgs {
+                h_b: &s.h_ref,
+                omega: cd.omega,
+                n: self.d.n,
+                m: 1,
+            },
+            &mut s.x,
+        )
     }
 
     /// The visit's attention half (module doc, steps 2 to 5), the stream joined.
@@ -2296,6 +2448,10 @@ impl ChainBody for Body {
         let tau = state::tau_of(input.pos, self.hp.log_floor, self.hp.log_alpha);
         self.step_in
             .refresh(stream, (input.token, input.pos), (self.ring, tau))?;
+        // A step lays one row into the draft's taps, whatever the walk before it laid.
+        if let Some(t) = self.draft.as_mut() {
+            t.plan(1);
+        }
         if let Some(p) = self.placed.as_mut() {
             p.refresh(
                 stream,

@@ -17,8 +17,7 @@ use super::hparams::Hparams;
 use super::names::{
     OUTPUT_HC_BASE, OUTPUT_HC_FN, OUTPUT_HC_SCALE, OUTPUT_MULTIMAX_RANGES, OUTPUT_MULTIMAX_TS,
 };
-use crate::arch::classify::{Counts, classify_with, role_by_layer};
-use crate::arch::deepseek41::roles::is_side_matrix;
+use crate::arch::classify::{Counts, classify_with, is_side_matrix, role_by_layer};
 use crate::arch::noaux;
 use crate::arch::stems::{DENSE, HC, Stem, join, req};
 use crate::placement::{ModelTensor, ModelTensors, PlacementError, Role};

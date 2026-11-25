@@ -44,9 +44,9 @@
 //!   reference's load runs such a layer without a host leg, no go and no
 //!   wait; the tier load keeps the leg on every tier layer, its stage card
 //!   holding fewer than all the layer's experts); the tier's graph of the
-//!   step and of each verify width holds nine nodes a tier layer (the go
-//!   wait, the two copies in, the four launches into the tier card's rows,
-//!   the rows' copy out to the page, the signal) and the fault copy; each
+//!   step and of each verify width holds eight nodes a tier layer (the go
+//!   wait, the copy in, the four launches into the tier card's rows, the
+//!   rows' copy out to the page, the signal) and the fault copy; each
 //!   chain the history runs is fed and captured once, at its first pass, and
 //!   replayed by every later one. Precondition: every tier layer was sent a
 //!   routed slot by the steps.
@@ -1558,7 +1558,7 @@ mod gate {
     }
 
     /// `--slots`' structure line over the load `m` after its wide passes:
-    /// the tier's graph of each of 5 to 8 columns holds nine nodes a tier
+    /// the tier's graph of each of 5 to 8 columns holds eight nodes a tier
     /// layer of `layers` and the fault copy, and the tier is opened for the
     /// port's columns.
     fn structure_wide(m: &Qwen38Model, layers: &[usize]) -> Result<bool, GateError> {

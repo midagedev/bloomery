@@ -76,7 +76,7 @@ fn keys(cfg: &J) -> serde_json::Map<String, J> {
     let scaling = &cfg["rope_scaling"];
     assert_eq!(cfg["scoring_func"], "sigmoid");
     let table: Vec<(&str, J)> = vec![
-        ("general.architecture", json!(ARCH)),
+        (gguf::GENERAL_ARCHITECTURE, json!(ARCH)),
         ("tokenizer.ggml.pre", json!(PRE)),
         ("ernie5_5.block_count", json!(cfg["num_hidden_layers"])),
         (

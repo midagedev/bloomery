@@ -171,6 +171,7 @@ fn node_nvme_host_run(
             devices: census,
             host_room: (0, workstation::HostRead::Given),
             arena_given: Some(72 << 20),
+            file: true,
         };
         let mut resident = open.clone();
         for row in &mut resident.rows {

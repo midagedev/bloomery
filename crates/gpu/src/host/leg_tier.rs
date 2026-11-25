@@ -449,7 +449,7 @@ pub fn open_tier(
         device: t.device,
         card: t.card,
         rows: match bytes {
-            CardBytes::File => NodeOpen::tier_rows(plan, file, t, card_dontneed)?,
+            CardBytes::File => NodeOpen::tier_rows(plan, file, t)?,
             CardBytes::Parts(_) => NodeOpen::rows_unhashed(plan, t.card)?,
         },
         set: TierSet::of_map(map, tier)?,

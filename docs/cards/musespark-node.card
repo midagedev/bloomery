@@ -1,0 +1,33 @@
+# Muse Spark Open 816B-A42B UD-IQ2_XXS on ws (RTX 5090 32 GB + 32-core host, 252 GiB) with the DGX Spark's GB10 as the expert tier node
+# over the direct ConnectX 100GbE link, RDMA, against ws alone, one binary, interleaved. The lead's real sitting; the round that wrote
+# this card ran no timed run and opened no real-file body (the `--plan` header reads only).
+# [measured, `bloomery-serve --model musespark --ctx 4352 --plan` on ws, headers only] ws alone, plan a: card_experts 509 (6,604,849,152 B)
+# of 15,872, host_experts 15,363 (199,352,254,464 B), n_l 8..9 on the 62 layers; `--place bp` on the one card is refused by name
+# (visible card 2 by size, 1 visible). So c = 3.2 % of the picks on the card, 96.8 % on the host [derived: uniform over ids].
+# Decode, one token [derived]: the step is the stage card's dense work, the experts' exposed leg and the bridge, D + E + B.
+#   D  dense + head 18.67 GB on the 5090 at 1.2..1.5 TB/s (assumed 67..84 % of the 1.79 TB/s peak, the A6000's 74..91 %): 12.4..15.6 ms
+#   B  bridge 62 x 21..36 us + launches ~1,600 x 0.852 us: 2.7..3.6 ms
+#   E  ws alone: the speed039 card's host leg, 23..28 ms at host share 0.745..0.77 [measured, A6000 + 3090, D 512], is 29.9..37.6 ms
+#      a unit share, so 28.9..36.4 ms at 0.968. Step 44.0..55.6 ms, 18.0..22.7 tok/s.
+#      With the node: the GB10's ~100 GB of 12.98 MB triples is n ~0.485 of the picks, the host's share 0.483 (14.4..18.2 ms), and the
+#      node's leg 62 x (132 us + 3.88 slots x 68 us) = 24.5 ms (19.6..29.4 at +-20 %). The tier's go is written with the host's image
+#      (handoff_go_tier), so both legs run in one layer's shadow and E = max(host, node) = the node's leg: step 39.6..43.7 ms, 22.9..25.3
+#      tok/s. Net +11..+27 % at the central node leg; the node leg's +-20 % moves it to -1..+43 %, so the band below is the central part
+#      with the fast-node tail. A node leg after the host's instead (E = host + node) would read -12..-18 %, the below-band's action.
+#   PCIe and the link carry under 0.3 ms a token (the go image and the node's rows are the latent's width, one row); host DRAM and the
+#   card's SMs are each under the node leg's shadow at its end; NVMe is out (the host holds every expert resident).
+# Prompt (companion, not this card's term): the batch's host serves the node's experts (the batch port has no leg on a node), so pp is
+# the ws-alone figure, +-0 % [derived].
+kind: ab
+question: is ws + the Spark's GB10 tier faster than ws alone on Muse Spark Open decode at depth 512?
+term: tg tok/s of the warm rows @ n=128, prose D=512, ctx 4352, RTX 5090 + host 252 GiB (+ the Spark's GB10 for the changed arm), Muse Spark Open UD-IQ2_XXS, release tree
+unit: %
+predict: 5..30
+rounds: 5
+condition: one bloomery-serve binary of the tree, the Spark's tier_server from the same commit (built with a feature set that serves Muse) restarted before each load;
+  arms ws alone (DEPTH_SERVE_PLACE=a) and env=BLOOMERY_TIER_LINK=rdma,BLOOMERY_TIER_NODES=10.42.0.2:19000 with DEPTH_SERVE_PLACE=bp, DEPTH_SERVE_CTX=4352 DEPTH_SERVE_N=128
+  DEPTH_SERVE_FOLD=depths, D 512, BLOOMERY_AB_ROUNDS=5, the 5090's compute processes ours alone (no ComfyUI), the host's experts resident (majflt near 0 in the rows) and the
+  node arm's `plan` record naming a tier0 card on the node with its experts, else the row is void
+decide-in: the notes state the measured effect and its interval as the node tier's gain on Muse decode, and the pair's pp row as unchanged
+decide-below: under 5: read the step's per-layer node wait against the host wait; a node wait over the host's means the node leg is not under the host's shadow (price a go issued before the host image), and the release states the node as a capacity lever
+decide-above: over 30: read both plan lines and the rows' majflt before claiming; a cold ws-alone row is not a node gain

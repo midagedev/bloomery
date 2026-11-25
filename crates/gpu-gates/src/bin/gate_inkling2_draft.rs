@@ -28,33 +28,31 @@ fn main() -> std::process::ExitCode {
     bloomery_gpu_gates::exit_with("gate_inkling2_draft", gate::run())
 }
 
+// The draft's one opener: the inkling2 seat of `bloomery-serve` reads the same files through it.
+#[cfg(feature = "gpu")]
+#[path = "shared/inkling2_draft.rs"]
+#[allow(
+    dead_code,
+    reason = "the gate and the inkling2 seat share the opener; each takes the parts it reads"
+)]
+mod inkling2_draft;
+
 #[cfg(feature = "gpu")]
 mod gate {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
+    use crate::inkling2_draft::{self as opener, Draft};
     use bloomery_gpu::arch::inkling2::Body;
-    use bloomery_gpu::dspark::ctx_dense::{AnchorEmbed, CtxDenseLayers, CtxSpec};
-    use bloomery_gpu::dspark::dense::{Bf16Source, gguf_f32};
-    use bloomery_gpu::dspark::fold::fold;
-    use bloomery_gpu::dspark::fuse::mix_weights;
-    use bloomery_gpu::dspark::head::{HeadTail, HeadWeights, RnnTail};
-    use bloomery_gpu::dspark::{
-        DsparkBody, EmbedSource, FuseWeights, HeadSource, InPlace, Q8Rows, TargetHead,
-    };
-    use bloomery_gpu::weights::DevWeight;
-    use bloomery_gpu::{DeviceTensor, Gpu, GpuError, GpuModel};
+    use bloomery_gpu::dspark::DsparkBody;
+    use bloomery_gpu::dspark::ctx_dense::CtxDenseLayers;
+    use bloomery_gpu::{Gpu, GpuModel};
     use bloomery_gpu_gates::record::DRAFT_ACCEPTANCE;
     use bloomery_gpu_gates::tier::{self, Tag};
     use bloomery_gpu_gates::{GateError, checks_failed, open_split, verdict};
     use bloomery_record::Record;
-    use cuda_core::DeviceBuffer;
-    use hf::dspark::inkling2::{self as config, Draft};
     use model::arch::Arch;
     use model::arch::inkling2::hparams::Hparams;
-    use model::arch::names;
-    use model::embed::EmbedTable;
-    use safetensors::Safetensors;
 
     const NAME: &str = "gate_inkling2_draft";
     const RECIPE: &str = "gate-gpu-inkling2-draft";
@@ -129,42 +127,6 @@ mod gate {
         })
     }
 
-    /// The draft folder's `mtp.safetensors` as the layers' weight source.
-    struct Mtp {
-        st: Safetensors,
-    }
-
-    impl Bf16Source for Mtp {
-        fn bf16(&self, name: &str) -> Result<(&[u16], &[usize]), GpuError> {
-            self.st.bf16(name).map_err(|e| GpuError::Shape {
-                what: NAME,
-                detail: e.to_string(),
-            })
-        }
-    }
-
-    impl Mtp {
-        /// Tensor `name` as f32, refused by name unless its shape is `shape`.
-        fn f32s(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>, GateError> {
-            let t = self.st.tensor(name).map_err(|e| format!("{NAME}: {e}"))?;
-            if t.shape != shape {
-                return Err(
-                    format!("{NAME}: {name} is {:?}, the draft reads {shape:?}", t.shape).into(),
-                );
-            }
-            Ok(t.data)
-        }
-
-        /// Tensor `name`'s bf16 bits, refused by name unless its shape is `shape`.
-        fn bits(&self, name: &str, shape: &[usize]) -> Result<&[u16], GateError> {
-            let (bits, got) = self.bf16(name)?;
-            if got != shape {
-                return Err(format!("{NAME}: {name} is {got:?}, the draft reads {shape:?}").into());
-            }
-            Ok(bits)
-        }
-    }
-
     /// One id a line; an empty file or a line that is not an id is refused by name.
     fn read_ids(path: &Path) -> Result<Vec<u32>, GateError> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -183,104 +145,16 @@ mod gate {
         Ok(ids)
     }
 
-    /// The draft beside `m`: its layers, the fused context and the head, which reads the target's
-    /// resident Q8_0 output matrix in place over the scored ids and folds the correction through it.
+    /// The draft beside `m` ([`opener::load`]), its anchor's rows from the target file `split`.
     fn load_draft(
         m: &GpuModel<Body>,
-        split: Arc<gguf::Split>,
+        split: &Arc<gguf::Split>,
         hp: &Hparams,
         d: &Draft,
-        mtp: &Mtp,
         ctx: usize,
     ) -> Result<DsparkBody<CtxDenseLayers>, GateError> {
-        let gpu = m.gpu();
-        let s = gpu.stream();
-        let b = &d.backbone;
-        let (hidden, rank) = (b.hidden, d.rank);
-        let window = b
-            .window
-            .ok_or(format!("{NAME}: the draft states no window"))?;
-        let anchor = AnchorEmbed {
-            table: EmbedTable::new(Arc::clone(&split), &names::token_embd(), hp.n_embd)
-                .map_err(|e| format!("{NAME}: token_embd: {e}"))?,
-            gain: gguf_f32(&split, "token_embd_norm.weight", &[hp.n_embd])?,
-            eps: hp.rms_eps,
-        };
-        let spec = CtxSpec {
-            layers: b.layers,
-            eps: b.eps,
-            rope_theta: b.rope_theta as f32,
-            window,
-            windowed: b.windowed.clone(),
-            ctx,
-        };
-        let layers = CtxDenseLayers::load(gpu, mtp, spec, anchor)?;
-
-        let taps = d.shape.taps.len();
-        let logits = mtp.f32s("fuse_weight", &[b.layers + 1, taps])?;
-        let mut gains = Vec::with_capacity((b.layers + 1) * hidden);
-        for l in 0..b.layers {
-            gains.extend(mtp.f32s(&format!("layers.{l}.dflare_norm.weight"), &[hidden])?);
-        }
-        gains.extend(mtp.f32s("markov_head.dflare_norm.weight", &[hidden])?);
-        let fuse = FuseWeights {
-            mix: DeviceBuffer::from_host(s, &mix_weights(&logits, taps)?)?,
-            gains: DeviceBuffer::from_host(s, &gains)?,
-            eps: b.eps,
-        };
-
-        let Some(DevWeight::Q8_0 { qs, d: scales, .. }) = m.weights().get(&names::output()) else {
-            return Err(format!(
-                "{NAME}: the target's {} is not a resident Q8_0 matrix",
-                names::output()
-            )
-            .into());
-        };
-        let n_head = hp.n_vocab_unpadded;
-        // SAFETY: `m` owns the output matrix and outlives the draft (the caller drops the draft
-        // first), and the draft runs on `m`'s own Gpu, so the windows' addresses stay allocated
-        // and in place for every launch and captured graph.
-        let output = unsafe {
-            TargetHead::Q8_0InPlace {
-                qs: InPlace::rows(qs, n_head, gpu.context())?,
-                d: InPlace::rows(scales, n_head, gpu.context())?,
-            }
-        };
-        let hidden_out = mtp.f32s("markov_head.hidden_out.weight", &[hidden, rank])?;
-        let hidden_b = mtp.f32s("markov_head.hidden_out.bias", &[hidden])?;
-        let folded = fold(gpu, &output, &hidden_out, &hidden_b, hidden, rank)?;
-        let joint_in = 2 * rank + 2 * hidden;
-        let w1 = mtp.bits(
-            "markov_head.markov_w1.weight",
-            &[d.target.padded_vocab, rank],
-        )?;
-        let joint = mtp.bits("markov_head.rnn_proj.weight", &[3 * rank, joint_in])?;
-        let norm = mtp.f32s("norm.weight", &[hidden])?;
-        let head = HeadWeights {
-            norm: DeviceTensor::upload(s, &norm, 1, hidden)?,
-            eps: b.eps,
-            source: HeadSource::Target(output),
-            tail: HeadTail::MarkovRnn(RnnTail {
-                w1: Q8Rows::from_bf16(gpu, w1, d.target.padded_vocab, rank, &|r| r)?,
-                w2: folded.w2,
-                joint: Q8Rows::from_bf16(gpu, joint, 3 * rank, joint_in, &|r| r)?,
-                joint_b: DeviceBuffer::from_host(
-                    s,
-                    &mtp.f32s("markov_head.rnn_proj.bias", &[3 * rank])?,
-                )?,
-                softcap: Some(d.target.softcap),
-                row: RnnTail::ANCHOR,
-                c: Some(folded.c),
-            }),
-        };
-        Ok(DsparkBody::fused(
-            gpu,
-            &d.shape,
-            layers,
-            fuse,
-            head,
-            EmbedSource::Target,
-        )?)
+        let anchor = opener::anchor_of_file(split, hp)?;
+        Ok(opener::load(m, m.gpu(), anchor, d, ctx)?)
     }
 
     /// The target's continuation of `prompt`, `n_gen` ids or up to the first of `eog`, and for each
@@ -352,13 +226,7 @@ mod gate {
             return Ok(());
         }
         let a = args()?;
-        let text = std::fs::read_to_string(a.draft.join("config.json"))
-            .map_err(|e| format!("{}: {e}", a.draft.join("config.json").display()))?;
-        let d = config::read(&text).map_err(|e| format!("{NAME}: config.json: {e}"))?;
-        let path = a.draft.join("mtp.safetensors");
-        let mtp = Mtp {
-            st: Safetensors::open(&path).map_err(|e| format!("{}: {e}", path.display()))?,
-        };
+        let d = Draft::read(&a.draft)?;
         let corpora = CORPORA
             .iter()
             .map(|c| Ok((c, read_ids(&a.prompts.join(c.file))?)))
@@ -374,18 +242,18 @@ mod gate {
             .map_err(|e| format!("{NAME}: {}: {e}", model.display()))?;
         let t = std::time::Instant::now();
         let mut m = GpuModel::<Body>::open(Gpu::new()?, split, ctx)?;
-        m.set_draft_taps(&d.shape.taps)?;
-        let mut draft = load_draft(&m, embed_split, &hp, &d, &mtp, ctx)?;
+        m.set_draft_taps(d.taps())?;
+        let mut draft = load_draft(&m, &embed_split, &hp, &d, ctx)?;
         println!(
             "{NAME}: taps {:?}, {} generated ids a corpus, ctx {ctx}, draft card bytes {}, target \
              and draft open in {:.1} s",
-            d.shape.taps,
+            d.taps(),
             a.n_gen,
             draft.card_bytes(ctx),
             t.elapsed().as_secs_f64()
         );
         for w in [3, WIDTH] {
-            let m = d.shape.rows(w);
+            let m = d.d.shape.rows(w);
             println!(
                 "{NAME}: width {w}: block graph {} nodes ({m} rows, the head's {}), append graph {} nodes",
                 draft.graph_block(m).map_or(0, |g| g.node_count()),

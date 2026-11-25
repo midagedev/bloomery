@@ -93,6 +93,10 @@
 //! ids), `gate`, or one card of the census by name or ordinal. Unset, the common rule decides
 //! (`Place::choose` by [`TIER_RULE`]): two cards in view run `a` until a sitting has shown the tier
 //! not slower (the rule carries no break-even), and a `place unset` record names the word and why.
+//! The one expert tier card of `bp` may be a node's: `BLOOMERY_TIER_NODES` names the node's
+//! address, the plan takes the tier card from that node's census, and a `tier_server` built with
+//! the `mistrallarge4` feature serves the tier ([`bloomery_gpu_mistrallarge4::NODE_FAMILY`]) from
+//! its own copy of the file. A node serves decode; a prompt batch's experts on it are the host's.
 //!
 //! `--ctx` is the total context the slots share (`--ctx 0` is refused); `--parallel N` gives each
 //! slot an Nth of it. The context comes first and the plan fills the machine around it
@@ -187,8 +191,8 @@ const USAGE: &str = "usage: bloomery-serve --model mistrallarge4 [-m PATH | --hf
 /// draft's card), the plan's card budget and the host set's load settings, which
 /// the open reads (`PlanLevers::from_levers`, `Levers::host`), the residency machine's word, the
 /// batches a prompt group runs, the engine thread's pin, the host legs' lane rule, the start
-/// screen, the schema jump and the expert stream's word, which the plan and the open resolve by
-/// the common rule ([`xstream_rule`]).
+/// screen, the schema jump, the expert tier's node (`BLOOMERY_TIER_NODES`) and the expert
+/// stream's word, which the plan and the open resolve by the common rule ([`xstream_rule`]).
 pub const ACTS_ON: &[&str] = &[
     bloomery_levers::DRAFT,
     bloomery_levers::MTP_WIDTH,
@@ -203,6 +207,7 @@ pub const ACTS_ON: &[&str] = &[
     bloomery_levers::HOST_LANES,
     bloomery_levers::SCREEN,
     bloomery_levers::SCHEMAJUMP,
+    bloomery_levers::TIER_NODES,
     bloomery_levers::XSTREAM,
 ];
 

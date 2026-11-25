@@ -1,8 +1,9 @@
 //! The Inkling 2 verify: the step widened to `m` rows ([`Rows`]), 2 to [`VERIFY_ROWS`] a call.
 //! A verify walks the prompt pass's rows ([`super`]) from the held position with the step's
 //! kernel at every node: the mixes as the step's launch pair over the rows ([`MixAt::mix_step`], a
-//! query a job), the controllers as the step's launch pair at the rows (a block one row's) and the
-//! norms over the rows, the step's gemvs over the rows (`norm_proj`'s outputs are their bits), the
+//! query a job), the controllers as the step's launch pair at the rows (a block one row's), the
+//! input norms and projections as the step's `norm_proj` launch over the rows (its rows entry) or,
+//! for a layer the step projects a site at a time, the norms and the step's gemvs over the rows, the
 //! convs on the visit's conv ring (a row reads the rows before it, this call's too), the
 //! epilogue's append of every row's keys before the step's rel-bias flash reads each row's live
 //! keys, the router's rows, the routed rows on the step's card leg (a run's slots naming one
@@ -11,7 +12,8 @@
 //! store, the held position and the written end where they leave them; a rollback after it is the
 //! step's.
 //!
-//! A verify takes no forced picks, no taps and no importance collector: each is refused by name.
+//! A verify takes no forced picks, no armed stage taps ([`Body::arm_taps`]) and no importance
+//! collector: each is refused by name. A block draft's taps it lays ([`super::pass`]).
 
 use super::super::route::N_USED;
 use super::super::{Body, DOWN_ROLE, Dims, GATE_UP_ROLE, HEAD, Layer, MIX_EPS, head_logits};
@@ -127,8 +129,9 @@ impl Rows for Body {
     const HEADS: RowHeads = RowHeads::One;
 
     /// The verify's ids, ring slots, first position and global factors staged as a prompt
-    /// pass's, and the held position and the written end moved as `tokens.len()` steps move
-    /// them. Refused by name off the held position and as [`Body::verify_refusal`] says.
+    /// pass's, a draft's taps told the rows the walk lays, and the held position and the written
+    /// end moved as `tokens.len()` steps move them. Refused by name off the held position and as
+    /// [`Body::verify_refusal`] says.
     fn plan_rows(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
         self.verify_refusal(tokens.len())?;
         if pos != self.held {
@@ -139,6 +142,9 @@ impl Rows for Body {
                     self.held
                 ),
             ));
+        }
+        if let Some(t) = self.draft.as_mut() {
+            t.plan(tokens.len());
         }
         let pass = self
             .pass

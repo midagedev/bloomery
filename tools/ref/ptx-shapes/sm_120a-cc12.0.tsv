@@ -646,6 +646,8 @@ generate_ds41 swiglu_nvfp4_32_sel 0 0
 generate_ds41 swiglu_quant32 0 0
 generate_ds41 swiglu_quant32_sel 0 0
 generate_ds41 swiglu_rule_rows 0 0
+# PIN(2026-11-25): tier_copy_spans at 0/0 [derived: a word a thread, three spans, no local array], until a scan on this table's arch and capability.
+generate_ds41 tier_copy_spans 0 0
 generate_ds41 tier_fault_copy 0 0
 generate_ds41 touch 0 0
 generate_ds41 weighted_sum 0 0
@@ -714,6 +716,8 @@ generate_ds41 sigmoid_128_8_router 0 0
 generate_ds41 sigmoid_128_8_router_pick 0 0
 generate_ds41 attn_res_step_out 0 0
 generate_ds41 attn_res_step_scores 0 0
+# PIN(2026-11-25): loop_cd_apply, a new entry (LoopCD-Hidden's boundary step, crates/gpu/src/arch/inkling2/loop_cd.rs), at 0 spill and 0 JIT local bytes [measured: gate-ptx-spill on generate_ds41, ptxas 13.3.73 sm_120a, RTX 5090 cc 12.0 JIT, driver 615.71.09; an elementwise fma with no local array].
+generate_ds41 loop_cd_apply 0 0
 generate_ds41 loop_control_down 0 0
 generate_ds41 loop_control_down_rows 0 0
 generate_ds41 loop_control_out 0 0
@@ -721,6 +725,8 @@ generate_ds41 loop_control_out3 0 0
 generate_ds41 loop_control_out3_rows 0 0
 generate_ds41 loop_control_out_rows 0 0
 generate_ds41 norm_proj_q8_f32 0 0
+# PIN(2026-11-25): norm_proj_q8_f32_cols (crates/gpu/src/norm_proj.rs), Inkling 2's verify input norms and projections over m rows: 16 B ptxas spill (8 B stored, 8 B loaded) and 8 B JIT local measured on this table's scan (ptxas 13.3.73 sm_120a, RTX 5090 cc 12.0, driver 615.71.09; a plain jit_local provisional for 595.99.02). launch_bounds(256, 2) caps it at 128 registers so two blocks of 45 KB shared rows share an SM; the spill is that cap's (the sm_86 ptxas fits it in 128 with none).
+generate_ds41 norm_proj_q8_f32_cols 16 8
 generate_ds41 rel_prefill_h128_g3 0 0
 generate_ds41 rel_prefill_h128_g3_ring 0 0
 generate_ds41 rel_prefill_h128_g6 0 0

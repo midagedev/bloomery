@@ -114,7 +114,7 @@ impl LegFamily for MuseSpark {
 }
 
 /// Muse's tier node service ([`leg_tier::node_family`]).
-pub(super) const NODE_FAMILY: NodeFamily = leg_tier::node_family::<MuseSpark>();
+pub const NODE_FAMILY: NodeFamily = leg_tier::node_family::<MuseSpark>();
 
 /// The stage card's side of a tiered load: the common tier side (the slot
 /// map's tier view and the step's tier places) and a pass's tier places.

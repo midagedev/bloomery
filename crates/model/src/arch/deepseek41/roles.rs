@@ -126,12 +126,7 @@ pub fn classify(split: &Split, hp: &Hparams) -> Result<ModelTensors, PlacementEr
     Ok(model)
 }
 
-/// Whether `name` is a compressor or an indexer matrix: the attention
-/// tensors whose dense sites (`gpu-deepseek41` `Dense::of`) take BF16 in its
-/// words, where the other attention matrices take the K-quants and q8_0.
-pub fn is_side_matrix(name: &str) -> bool {
-    name.contains("compressor") || name.contains("indexer")
-}
+pub use crate::arch::classify::is_side_matrix;
 
 /// Whether the chain reads BF16 tensor `t` in its words
 /// ([`ModelTensors::bf16_words`]): a compressor or indexer matrix, whose dense

@@ -33,8 +33,9 @@ use std::sync::OnceLock;
 mod registry;
 use registry::REGISTRY;
 pub use registry::{
-    AUTOTUNE, ELASTIC, INK2_DENSE, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, REPLAY_POISON,
-    SCHEMAJUMP, SPLIT_WALK, XSTREAM,
+    AUTOTUNE, ELASTIC, INK2_DENSE, INK2_LOOPCD, INK2_LOOPCD_MAX, INK2_LOOPCD_PLACES,
+    INK2_LOOPCD_REF, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, REPLAY_POISON, SCHEMAJUMP,
+    SPLIT_WALK, XSTREAM,
 };
 pub use registry::{
     CARD_BUDGET, CARD_DONTNEED, CARD_EXPERTS_CAP, CARD_MARGIN, CED, CHECK_FINITE, DRAFT,
@@ -106,6 +107,9 @@ pub(crate) enum Kind {
     },
     /// A positive whole multiple of `of`.
     Multiple { of: u64 },
+    /// A decimal number of at most `places` digits past its point
+    /// ([`decimal`]), in units of the last place from `min` to `max`.
+    Decimal { places: u32, min: u64, max: u64 },
     /// A byte count ([`parse_bytes`]).
     Bytes,
     /// A [`CardBudget`] ([`card_budget_value`]): one byte count, or
@@ -158,6 +162,47 @@ fn whole(s: &str) -> Result<u64, NotWhole> {
 /// What a number past `u64` is refused for.
 const OVERFLOW: &str = "more than a u64 holds";
 
+/// `s` as a decimal number of at most `places` digits past its point, in units of the last place:
+/// `0`, `1`, `0.2`, `1.5` — digits only, no sign, a leading zero only before the point (`0.2`,
+/// not `00.2`), a point only with a digit after it (`0.5`, not `.5` or `1.`); `None` for anything
+/// else, or a value a `u64` cannot hold.
+fn decimal(s: &str, places: u32) -> Option<u64> {
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) if !f.is_empty() && f.len() <= places as usize => (w, f),
+        Some(_) => return None,
+        None => (s, ""),
+    };
+    let digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
+    if whole.is_empty()
+        || !digits(whole)
+        || !digits(frac)
+        || (whole.len() > 1 && whole.starts_with('0'))
+    {
+        return None;
+    }
+    let unit = 10u64.checked_pow(places)?;
+    let rest = 10u64.checked_pow(places - frac.len() as u32)?;
+    let past = frac.bytes().try_fold(0u64, |a, b| {
+        a.checked_mul(10)?.checked_add(u64::from(b - b'0'))
+    })?;
+    whole
+        .parse::<u64>()
+        .ok()?
+        .checked_mul(unit)?
+        .checked_add(past.checked_mul(rest)?)
+}
+
+/// `n`, a value in units of the last of `places` places, as [`decimal`] spells it: `0`, `2`,
+/// `0.2`, `1.5` (no digit past the point that is only padding).
+fn decimal_spelled(n: u64, places: u32) -> String {
+    let unit = 10u64.pow(places);
+    if n.is_multiple_of(unit) {
+        return (n / unit).to_string();
+    }
+    let frac = format!("{:0width$}", n % unit, width = places as usize);
+    format!("{}.{}", n / unit, frac.trim_end_matches('0'))
+}
+
 impl Kind {
     /// `v` as a value of this kind, or the refusal's text: what the kind
     /// takes, after the reason when that alone does not say why.
@@ -194,6 +239,10 @@ impl Kind {
             Kind::CountOr { word, .. } if v == word => Ok(Value::Word(word)),
             Kind::CountOr { min, max, .. } => number(whole(v), &|n| (min..=max).contains(&n)),
             Kind::Multiple { of } => number(whole(v), &|n| n > 0 && n.is_multiple_of(of)),
+            Kind::Decimal { places, min, max } => match decimal(v, places) {
+                Some(n) if (min..=max).contains(&n) => Ok(Value::Count(n)),
+                Some(_) | None => Err(refused(None)),
+            },
             Kind::Bytes => parse_bytes(v).map(Value::Bytes).map_err(|e| match e {
                 BytesError::NotBytes(_) => refused(None),
                 BytesError::Overflow(_) => refused(Some(e.reason())),
@@ -297,6 +346,15 @@ impl Kind {
                 }
             }
             Kind::Multiple { of } => format!("a positive multiple of {of} ({DIGITS})"),
+            Kind::Decimal { places, min, max } => {
+                let digits = if places == 1 { "digit" } else { "digits" };
+                format!(
+                    "a decimal number of at most {places} {digits} past the point, from {} to {} \
+                     (base 10, no sign or leading zero)",
+                    decimal_spelled(min, places),
+                    decimal_spelled(max, places)
+                )
+            }
             Kind::Bytes => {
                 "bytes, or a whole number of MiB or GiB with an M or G suffix".to_string()
             }
@@ -592,10 +650,6 @@ pub(crate) enum Phase {
     Load,
     /// Changeable between calls of one loaded model, no reload, through the
     /// named API `setter`; the environment value is the initial one.
-    ///
-    /// No row constructs it today: the registry holds no Runtime lever, so
-    /// the dead-code lint is expected here until the first one lands.
-    #[expect(dead_code)]
     Runtime { setter: Setter },
 }
 
@@ -747,9 +801,18 @@ impl Site {
                 .collect();
             list.join(", ")
         };
+        // A lever a loaded model changes between calls names the function it changes through.
+        let calls = |phase: Phase| match phase {
+            Phase::Load => String::new(),
+            Phase::Runtime { setter } => {
+                format!("; between calls through {} in {}", setter.item, setter.file)
+            }
+        };
         match self {
-            Site::Parsed { left: [], .. } => "parsed".to_string(),
-            Site::Parsed { left, .. } => format!("parsed; in place in {}", places(left)),
+            Site::Parsed { left: [], phase } => format!("parsed{}", calls(phase)),
+            Site::Parsed { left, phase } => {
+                format!("parsed; in place in {}{}", places(left), calls(phase))
+            }
             Site::Direct {
                 at,
                 by: Readers::Every,
@@ -1671,12 +1734,27 @@ impl Levers {
         }
     }
 
-    /// `BLOOMERY_INK2_PASSES`: the passes a variable-loop Inkling 2 folder runs its core at, 1 to
-    /// [`INK2_PASSES_MAX`]; `None` unset, the folder's own `num_passes`.
+    /// `BLOOMERY_INK2_PASSES`: the passes an Inkling 2 checkpoint (folder or GGUF, either loop) runs its core at, 1 to
+    /// [`INK2_PASSES_MAX`]; `None` unset, the checkpoint's own `num_passes`.
     #[must_use]
     pub fn ink2_passes(&self) -> Option<usize> {
         self.count(INK2_PASSES)
             .map(|n| Levers::usize_of(INK2_PASSES, n))
+    }
+
+    /// `BLOOMERY_INK2_LOOPCD`: LoopCD-Hidden's strength for Inkling 2, ω, the row's value in
+    /// units of its last place over that unit; `None` unset or 0, the rule off.
+    #[must_use]
+    pub fn ink2_loopcd(&self) -> Option<f32> {
+        let units = self.count(INK2_LOOPCD)?;
+        (units != 0).then(|| units as f32 / 10f32.powi(INK2_LOOPCD_PLACES as i32))
+    }
+
+    /// `BLOOMERY_INK2_LOOPCD_REF`: the pass whose output is LoopCD-Hidden's reference, 1 or 2.
+    #[must_use]
+    pub fn ink2_loopcd_ref(&self) -> u32 {
+        let n = Levers::defaulted(INK2_LOOPCD_REF, self.count(INK2_LOOPCD_REF));
+        u32::try_from(n).unwrap_or_else(|_| panic!("{INK2_LOOPCD_REF}={n} past u32"))
     }
 
     /// `BLOOMERY_REPLAY_POISON`: a capture gate runs its replay-poison

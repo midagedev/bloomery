@@ -40,7 +40,7 @@ use crate::{Gpu, GpuError};
 use bloomery_levers::HostCfg;
 use cuda_core::{CudaStream, DeviceBuffer};
 use gguf::Split;
-use model::arch::inkling2::hparams::Hparams;
+use model::arch::inkling2::hparams::{Hparams, Loop};
 use model::arch::inkling2::place::{Inputs, PassShape};
 use model::arch::inkling2::{host, names};
 use model::arch::models::Visit;
@@ -429,8 +429,9 @@ impl TierBody for Placed {
 pub(super) struct StepWalk<'a> {
     pub(super) walk: Walk<'a>,
     pub(super) visits: &'a [Visit],
-    /// The looped core's first stored layer, where a pass begins; `None` on a loopless file.
-    pub(super) loop_core: Option<usize>,
+    /// The looped core: its first stored layer is where a pass begins and the layer past its last
+    /// the loop→coda boundary; `None` on a loopless file.
+    pub(super) core: Option<Loop>,
     /// Whether the visits of a pass past the first run their messages.
     pub(super) messages: bool,
     pub(super) layers: &'a [Layer],
@@ -469,13 +470,16 @@ impl<'a> LayerProgram for StepWalk<'a> {
             layers,
             stores,
             placed,
-            loop_core,
+            core,
             messages,
             ..
         } = self;
         let layer = &layers[l];
-        if *loop_core == Some(l) {
+        if core.is_some_and(|lp| lp.core_start == l) {
             walk.pass_edge(v.pass)?;
+        }
+        if core.is_some_and(|lp| lp.core_end == l) {
+            walk.loop_boundary()?;
         }
         let msg = *messages && v.pass > 0 && layer.ctrl.is_some();
         walk.attn_half(k, (l, layer), &mut stores[k], msg)?;

@@ -651,8 +651,8 @@ impl ToolFormat {
             ToolFormat::Mistral
         } else if ::models::ToolFormat::of_template(source) == Some(::models::ToolFormat::Inkling) {
             ToolFormat::Inkling
-        } else if source.contains(crate::ernie55::CALL_OPEN)
-            && source.contains(crate::ernie55::CALL_CLOSE)
+        } else if source.contains(crate::ernie::CALL_OPEN)
+            && source.contains(crate::ernie::CALL_CLOSE)
             && source.contains("<invoke name=")
             && source.contains("<parameter name=")
         {

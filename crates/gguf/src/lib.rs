@@ -636,6 +636,9 @@ pub struct Split {
     by_name: HashMap<String, (usize, usize)>,
     /// Every tensor's place, for a split made by [`Split::located`]; empty for any other.
     places: HashMap<String, Place>,
+    /// Metadata pairs a caller laid over the first shard's: [`Split::value`] answers them before
+    /// the file's own keys.
+    overlay: Vec<(String, Value)>,
 }
 
 /// How a stack's matrices lie in their bytes. A tensor's type says how a row encodes its values;
@@ -898,6 +901,40 @@ impl Split {
         Split::assemble(vec![shard], vec![path], None)
     }
 
+    /// The split another process holds, from its shards' headers alone: shard `i` is named
+    /// `shards[i].0`, its header bytes (each shard's [`Gguf::header_bytes`]) are `shards[i].1`
+    /// and its file is `shards[i].2` bytes long. Every tensor is checked as a shard's is (its
+    /// type, block alignment and size, inside that file length), a name held twice is refused,
+    /// and every read of a tensor's bytes is refused by name ([`Gguf::data`]: past the data the
+    /// shard holds). The split keys are not checked again: the process that sent the headers
+    /// opened the split, and their digest is the caller's identity of it. A tier node with no
+    /// model file of its own reads node 0's split so.
+    pub fn from_headers(shards: Vec<(PathBuf, Vec<u8>, u64)>) -> Result<Split, LoadError> {
+        if shards.is_empty() {
+            return Err(LoadError::Located {
+                detail: "a split of no shard header".to_string(),
+            });
+        }
+        let mut paths = Vec::with_capacity(shards.len());
+        let mut readers = Vec::with_capacity(shards.len());
+        for (path, bytes, len) in shards {
+            let h = parse_header(&bytes, len)?;
+            let tensors = strict_tensors(h.tensors, h.data_base, len, &[], true)?;
+            readers.push(Gguf {
+                _file: None,
+                map: Backing::Header(bytes),
+                meta: h.meta,
+                offsets: h.offsets,
+                tensors,
+                data_base: h.data_base,
+                alignment: h.alignment,
+                unread: HashMap::new(),
+            });
+            paths.push(path);
+        }
+        Split::assemble(readers, paths, None)
+    }
+
     /// The header `layout` lays out, over the files that hold the tensors' bytes where they
     /// are: shard `i` is `files[i]`, mapped read-only as a GGUF shard is, and `places[i]` is
     /// where the `i`-th tensor of `layout` keeps its bytes ([`Place`]). The keys are shard 0's,
@@ -1026,7 +1063,18 @@ impl Split {
             paths,
             by_name,
             places,
+            overlay: Vec::new(),
         })
+    }
+
+    /// This split with `key` answering `value` from [`Split::value`], over whatever the first
+    /// shard holds under it. The file is untouched; iteration ([`Split::iter_kv`],
+    /// [`Split::keys`]) lists the file's own pairs only.
+    #[must_use]
+    pub fn with_overlay(mut self, key: &str, value: Value) -> Split {
+        self.overlay.retain(|(k, _)| k != key);
+        self.overlay.push((key.to_string(), value));
+        self
     }
 
     /// Add `shard`, the file at `path`, after the shards the split has: its tensors are the
@@ -1165,7 +1213,10 @@ impl Split {
 
     /// Raw metadata lookup by exact key, in the first shard.
     pub fn value(&self, key: &str) -> Option<&Value> {
-        self.shards[0].value(key)
+        match self.overlay.iter().find(|(k, _)| k == key) {
+            Some((_, v)) => Some(v),
+            None => self.shards[0].value(key),
+        }
     }
 
     /// The first shard's metadata pairs, in file order.
@@ -2154,6 +2205,51 @@ mod split_tests {
             let e = shard.data(t).unwrap_err().to_string();
             assert!(e.contains(&format!("{:?}", t.name)), "{e}");
         }
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A split rebuilt from its shards' headers and file lengths reads as the split: the same
+    /// keys, tensors, shards and header bytes, and every read of a tensor's bytes refused by
+    /// name; a header cut short is refused, and so is no shard at all.
+    #[test]
+    fn a_split_from_its_headers_reads_as_the_split_and_holds_no_byte() {
+        let d = good_set("from-headers");
+        let file = Split::open(shard_path(&d, 0)).unwrap();
+        let heads = |keep: fn(usize) -> usize| {
+            (0..file.shard_count())
+                .map(|i| {
+                    let g = file.shard(i).unwrap();
+                    let h = g.header_bytes();
+                    (
+                        file.shard_path(i).unwrap().to_path_buf(),
+                        h[..keep(h.len())].to_vec(),
+                        g.mapping().len() as u64,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let head = Split::from_headers(heads(|n| n)).unwrap();
+        assert_eq!(head.shard_count(), file.shard_count());
+        assert_eq!(head.keys(), file.keys());
+        let infos = |s: &Split| {
+            s.iter_tensors()
+                .map(|(i, t)| (i, t.name.clone(), t.dims.clone(), t.ty, t.offset, t.nbytes))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(infos(&head), infos(&file));
+        for i in 0..file.shard_count() {
+            let (h, f) = (head.shard(i).unwrap(), file.shard(i).unwrap());
+            assert_eq!(h.header_bytes(), f.header_bytes());
+            assert_eq!(h.data_base(), f.data_base());
+            for t in h.iter_tensors() {
+                let e = h.data(t).unwrap_err().to_string();
+                assert!(e.contains(&format!("{:?}", t.name)), "{e}");
+            }
+        }
+        assert!(head.is_header_only());
+        let short = Split::from_headers(heads(|n| n / 2));
+        assert!(short.is_err(), "a header cut short parses");
+        assert!(Split::from_headers(Vec::new()).is_err());
         std::fs::remove_dir_all(&d).unwrap();
     }
 

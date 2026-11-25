@@ -8,7 +8,7 @@
 //! every `BLOOMERY_*` name under `tools/`, in the justfile and in `.cargo/` to
 //! a row.
 
-use crate::{Class, HostLanes, InPlace, Kind, LeverSpec, Phase, Readers, Site, Unset};
+use crate::{Class, HostLanes, InPlace, Kind, LeverSpec, Phase, Readers, Setter, Site, Unset};
 
 pub const THREADS: &str = "BLOOMERY_THREADS";
 pub const SPIN: &str = "BLOOMERY_SPIN";
@@ -67,8 +67,17 @@ pub const INK2_DENSE: &str = "BLOOMERY_INK2_DENSE";
 pub const INK2_PASSES: &str = "BLOOMERY_INK2_PASSES";
 pub const REPLAY_POISON: &str = "BLOOMERY_REPLAY_POISON";
 
-/// The largest `BLOOMERY_INK2_PASSES`: the passes the variable-loop checkpoint was trained on.
+/// The largest `BLOOMERY_INK2_PASSES`: the passes the variable-loop checkpoint was trained on, and
+/// the range a fixed loop takes (no tensor of the loop is indexed by pass).
 pub const INK2_PASSES_MAX: u64 = 5;
+
+pub const INK2_LOOPCD: &str = "BLOOMERY_INK2_LOOPCD";
+pub const INK2_LOOPCD_REF: &str = "BLOOMERY_INK2_LOOPCD_REF";
+
+/// The digits `BLOOMERY_INK2_LOOPCD` takes past its point, and its largest value in units of the
+/// last place: 2.
+pub const INK2_LOOPCD_PLACES: u32 = 3;
+pub const INK2_LOOPCD_MAX: u64 = 2000;
 
 /// The largest `BLOOMERY_PREFILL_GROUP`: the batches a V4.1 prompt group
 /// holds at most, which the body's buffers are sized for.
@@ -567,9 +576,9 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               dials). The \
               channel has no authentication and belongs on a trusted network. The plan takes \
               each tier card from its node's census. \
-              Qwen3.8's, Kimi K3's, V4.1's, GLM's, Solar-Open2's and Flint's (K-EXAONE-2.0's too) \
-              loads open a tier on a node, which `tier_server` serves when built with that \
-              family's feature. \
+              Qwen3.8's, Kimi K3's, Muse Spark's, V4.1's, GLM's, Solar-Open2's, Flint's \
+              (K-EXAONE-2.0's too) and Mistral Large 4's loads open a tier on a node, which \
+              `tier_server` serves when built with that family's feature. \
               Read where a load takes its tier cards.",
         site: Site::Parsed {
             left: &[],
@@ -1561,21 +1570,84 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
             max: INK2_PASSES_MAX,
             trim: false,
         },
-        default: Unset::Means("the folder's own `num_passes`"),
-        doc: "Inkling 2's official checkpoint folder of a variable loop \
-              (`loop_config.is_varloop: true`, thinkingmachines' `TML-d24-varloop-research`): the \
-              passes its middle layers run, 1 to 5 (the checkpoint was trained on those, post-trained \
-              at 3, its `num_passes`; the card warns of unpredictable output at another count). \
+        default: Unset::Means("the checkpoint's own `num_passes`"),
+        doc: "The passes Inkling 2's middle layers run, 1 to 5, for the official checkpoint folder \
+              and the GGUF file of either loop. The variable-loop research checkpoint \
+              (`loop_config.is_varloop: true`, thinkingmachines' `TML-d24-varloop-research`) was \
+              trained on those counts and post-trained at 3, its `num_passes`; the card warns of \
+              unpredictable output at another count. The fixed loop (the Mini, `num_passes` 3) takes \
+              the same range as an experiment: its output at a count other than its own is not \
+              guaranteed, and a count that differs from the checkpoint's own is noted on stderr. \
               A pass past the first merges the previous pass's banked blocks into each core \
-              sublayer's input through the same message queries and controllers, so every count \
-              reads the one set of weights; each pass keeps its own cache slots, so a step walks \
-              `12 + 12 · passes` visits and the KV stores grow with it, and one pass has no \
-              message at all. A folder of a fixed loop (the Mini) and a GGUF file refuse the lever \
-              by name. Unset runs the folder's `num_passes`. Read where the folder opens, in \
-              the Inkling 2 folder reader; the `load` line prints `passes=`.",
+              sublayer's input through the same message queries and controllers, which no tensor \
+              indexes by pass (the two query tables hold two rows a core layer, the controllers \
+              sit on the core layers), so every count reads the one set of weights; each pass \
+              keeps its own cache slots, so a step walks `12 + 12 · passes` visits and the KV \
+              stores and the plan follow the count, and one pass has no message at all. \
+              `BLOOMERY_INK2_LOOPCD_REF` is held to the overridden count. Unset runs the \
+              checkpoint's own `num_passes`, bit for bit. Read where the folder opens, in the \
+              Inkling 2 folder reader, and over the GGUF header in the seat; the `load` line \
+              prints `passes=`.",
         site: Site::Parsed {
             left: &[],
             phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: INK2_LOOPCD,
+        class: Class::A,
+        kind: Kind::Decimal {
+            places: INK2_LOOPCD_PLACES,
+            min: 0,
+            max: INK2_LOOPCD_MAX,
+        },
+        default: Unset::Is("0"),
+        doc: "Inkling 2: LoopCD-Hidden's strength, the ω of `h' = h + ω (h − h_b)` (arXiv \
+              2610.02185, the hidden-state form). Before the coda's first layer reads the stream \
+              past the looped core's last pass, the stream becomes `h'`: `h` that stream, `h_b` \
+              the core's output after pass `BLOOMERY_INK2_LOOPCD_REF`, saved once at that pass's \
+              end. The step, a verify's rows and the prompt pass run the same rule \
+              (`arch/inkling2/body.rs`). Off unset and at 0: no copy and no launch of it in any \
+              walk. An accuracy lever, opt-in: on, a step adds one copy and one launch over the \
+              hidden width, so the default is the faster path. Changeable between calls of one \
+              loaded model through `GpuModel::<Body>::set_loopcd`, the environment value the \
+              initial one; a captured chain is captured again at the next step. Refused by name \
+              where it is read: a value past 2. Refused by name where it is applied: a file whose \
+              trunk does not loop, and a reference pass with no pass after it \
+              (`BLOOMERY_INK2_PASSES` at or below the reference).",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Runtime {
+                setter: Setter {
+                    file: "crates/gpu/src/arch/inkling2/body.rs",
+                    item: "set_loopcd",
+                },
+            },
+        },
+    },
+    LeverSpec {
+        name: INK2_LOOPCD_REF,
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: 2,
+            trim: false,
+        },
+        default: Unset::Is("1"),
+        doc: "Inkling 2: the pass whose output is LoopCD-Hidden's reference, `h_b` \
+              (`BLOOMERY_INK2_LOOPCD`), pass 1 or 2. Unset, 1. Changeable between calls of one \
+              loaded model through the same setter as the strength. A loop of as many passes has \
+              no pass after its reference, so the pair is refused by name where it is applied \
+              (`BLOOMERY_INK2_PASSES` at or below the reference). It does nothing while the \
+              strength is unset or 0.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Runtime {
+                setter: Setter {
+                    file: "crates/gpu/src/arch/inkling2/body.rs",
+                    item: "set_loopcd",
+                },
+            },
         },
     },
     LeverSpec {
@@ -2374,6 +2446,14 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
          (`tools/ref/models/mistral-large4.sh`), which `tools/ref/dump-ml4-dspark.sh` and \
          `gate-gpu-mistrallarge4-dspark` read; the path is the draft family's identity, so a \
          set dumped from another file is refused by name.",
+    ),
+    path(
+        "BLOOMERY_REF_GGUF_MODEL",
+        Some("ref/ref-paths.sh"),
+        "The GGUF of the model a profile hosts next to its own checkpoint format \
+         (`GGUF_MODEL` in `tools/ref/models/ernie5_5.sh`): `tools/ref/ref-paths.sh` \
+         resolves it for the recipes that take a hosted GGUF; a caller's own wins over the \
+         tier's file.",
     ),
     path(
         "BLOOMERY_REF_MODEL",
