@@ -44,7 +44,8 @@
 
 use crate::callstream::Args;
 use crate::constrain::{
-    Arg, Call, CallMode, Fun, Part, Refusal, Style, call, is_text, object_parameters, value,
+    Arg, Call, CallMode, Ends, Fun, Order, Part, Refusal, Style, call, is_text, object_parameters,
+    value,
 };
 use crate::dsml::{Scanned, ToolCall};
 use crate::reasoning::partial_suffix;
@@ -364,7 +365,12 @@ pub(crate) fn call_parts(funs: &[Fun<'_>], mode: CallMode) -> Result<Call, Refus
         parts.extend(value(
             &a.schema,
             if is_text(&a.schema) {
-                Style::Raw
+                // The scan ends the message at its end tokens and cuts the
+                // invoke at its close before it reads a value.
+                Style::Raw(Ends {
+                    close: PARAM_CLOSE,
+                    never: &[INVOKE_CLOSE, EOM, EOT],
+                })
             } else {
                 Style::JsonInMarkup
             },
@@ -378,7 +384,7 @@ pub(crate) fn call_parts(funs: &[Fun<'_>], mode: CallMode) -> Result<Call, Refus
             "{MESSAGE}{CALLS_OPEN}\n{INVOKE_OPEN}{name}\">\n",
             name = f.name
         ))];
-        parts.extend(object_parameters(&f.args, &block)?);
+        parts.extend(object_parameters(&f.args, Order::Schema, &block)?);
         parts.push(Part::Text(format!("{INVOKE_CLOSE}\n{CALLS_CLOSE}")));
         Ok(parts)
     })?;

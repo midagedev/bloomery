@@ -15,8 +15,10 @@
 //!   after another, a choice is a trie, a free string or number takes any
 //!   token of its class and ends on a token that opens the text after it, and
 //!   a fork's options are followed side by side until the ids part them.
+//! - [`raw`]: a raw value's automaton over its format's tags, which says
+//!   what text the value may hold and where it ends.
 //! - [`vocab`]: the vocabulary read once at bind, which the free-string
-//!   classes come from.
+//!   classes and the raw values' automata come from.
 //!
 //! The tool-call text comes from the chat format's own module (`hermes`,
 //! `qwenxml`, `glmxml`, `dsml`): each has an inverse of its parser, a
@@ -47,15 +49,17 @@
 //! the step arm from the same rows: nothing is taken back.
 
 mod program;
+mod raw;
 mod schema;
 mod vocab;
 
 #[cfg(test)]
 pub(crate) use program::Kid;
 pub(crate) use program::{Constraint, Decision, Draw, Part, StepError, Style, Walk, Watch};
+pub(crate) use raw::Ends;
 pub(crate) use schema::{
-    Arg, Ask, Call, CallMode, Fun, any_start, call, is_text, object_parameters, outside, request,
-    value,
+    Arg, Ask, Call, CallMode, Fun, Order, any_start, call, is_text, object_parameters, outside,
+    request, value,
 };
 pub(crate) use vocab::Vocab;
 

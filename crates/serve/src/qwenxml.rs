@@ -61,7 +61,7 @@ use serde_json::Value;
 
 use crate::callstream::{self, Reading, held, read_value};
 use crate::constrain::{
-    Arg, Call, CallMode, Fun, Part, Refusal, Style, call, object_parameters, value,
+    Arg, Call, CallMode, Ends, Fun, Order, Part, Refusal, Style, call, object_parameters, value,
 };
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
@@ -926,7 +926,11 @@ pub(crate) fn call_parts(
             a.key,
             framing.value_open()
         ))];
-        parts.extend(value(&a.schema, Style::Raw, &a.path)?);
+        let ends = Ends {
+            close: framing.value_close(),
+            never: &[],
+        };
+        parts.extend(value(&a.schema, Style::Raw(ends), &a.path)?);
         parts.push(Part::Text(match framing {
             Framing::Lines | Framing::Coder => PARAM_VALUE_CLOSE.to_owned(),
             Framing::Compact => PARAM_CLOSE.to_owned(),
@@ -935,7 +939,7 @@ pub(crate) fn call_parts(
     };
     let body = call(funs, &format!("\n{FUNCTION_OPEN}"), str::to_owned, |f| {
         let mut parts = vec![Part::Text(">\n".to_owned())];
-        parts.extend(object_parameters(&f.args, &block)?);
+        parts.extend(object_parameters(&f.args, Order::Schema, &block)?);
         parts.push(Part::Text(format!("{FUNCTION_CLOSE}\n{CALL_CLOSE}")));
         Ok(parts)
     })?;

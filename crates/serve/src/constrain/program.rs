@@ -18,13 +18,21 @@
 //!   has to guess at. Only a choice that is the last part of its list carries
 //!   a continuation per option (a tool call's arguments differ by the tool);
 //!   every other choice returns to the parts after it.
-//! - A free string takes any token of its class ([`Class`]) while it fits the
-//!   length limit, and ends on a token whose text is a non-empty prefix of the
-//!   forced text that can follow it: a token `",` ends a string and takes the
-//!   `,` after it. The rest of that text is tokenised canonically from where
-//!   the end token stopped. A number takes the tokens of a JSON number's
+//! - A free JSON string takes any token of its class ([`Class`]) while it fits
+//!   the length limit, and ends on a token whose text is a non-empty prefix of
+//!   the forced text that can follow it: a token `",` ends a string and takes
+//!   the `,` after it. The rest of that text is tokenised canonically from
+//!   where the end token stopped. A number takes the tokens of a JSON number's
 //!   characters while they still spell the front of one, and ends the same
 //!   way once they spell a whole one.
+//! - A raw value takes any text that spells none of its format's tags, and
+//!   ends on the token that completes its close ([`RawTags`]); the rest of
+//!   that token's text goes into the text after the close as an end token's
+//!   does. The value's step holds its close, so the forced text after it
+//!   starts past the close. The tag before a raw value is forced without its
+//!   last token, and the value's first token writes that token's text and
+//!   may run on into the value, as the model's own tokenization joins a tag
+//!   and the text after it (`">/`, `"><`); a special last token is forced.
 //! - A fork ([`Part::Any`], [`Part::List`]) takes the text on each side of it
 //!   into each of its options, so every option is tokenised whole. The walk
 //!   then follows every option whose ids the tokens taken so far match (its
@@ -55,6 +63,7 @@ use std::cell::Cell;
 use std::sync::{Arc, Mutex};
 
 use super::Refusal;
+use super::raw::{Ends, RawTags, Run};
 use super::vocab::{Class, Vocab};
 use crate::api::relock;
 use crate::engine::{Sampler, Tokenizer};
@@ -72,9 +81,9 @@ pub(crate) enum Style {
     /// tag begins with one and would end the markup's value, or open a call,
     /// inside the string.
     JsonInMarkup,
-    /// Raw text that ends at the text after it: the body takes no token that
-    /// holds that text's first byte.
-    Raw,
+    /// Raw text that its format's scan reads up to its close: the body takes
+    /// any text that spells none of the format's tags ([`Ends`]).
+    Raw(Ends),
 }
 
 impl Style {
@@ -89,7 +98,7 @@ impl Style {
     pub(crate) fn nested(self) -> Style {
         match self {
             Style::Json => Style::Json,
-            Style::JsonInMarkup | Style::Raw => Style::JsonInMarkup,
+            Style::JsonInMarkup | Style::Raw(_) => Style::JsonInMarkup,
         }
     }
 }
@@ -221,8 +230,22 @@ struct Node {
 
 #[derive(Debug)]
 struct FreeStep {
-    class: Class,
+    body: Body,
     max: Option<usize>,
+}
+
+/// What a free string's body may hold.
+#[derive(Debug)]
+enum Body {
+    /// A JSON string's: the tokens of its class.
+    Json(Class),
+    /// A raw value's: the automaton of its format's tags, and the text of the
+    /// tag before it that the value's first token writes (`None` where the
+    /// tag is forced whole).
+    Raw {
+        tags: Arc<RawTags>,
+        lead: Option<Box<str>>,
+    },
 }
 
 impl FreeStep {
@@ -317,17 +340,29 @@ pub(super) fn compile_in(parts: &[Part], env: &Env<'_>, reached: bool) -> Result
     let mut steps = Vec::new();
     let mut reach = reached;
     let mut pre = String::new();
+    // The bytes of the next text a raw value's step holds as its close.
+    let mut cut = 0;
+    // The end of the tag before a raw value that the value writes.
+    let mut lead = None;
     let mut i = 0;
     while i < parts.len() {
         let part = &parts[i];
         i += 1;
         match part {
             Part::Text(t) if matches!(parts.get(i), Some(Part::Any(_) | Part::List { .. })) => {
-                pre.clone_from(t);
+                pre = t[std::mem::take(&mut cut)..].to_owned();
             }
             Part::Text(t) => {
-                steps.push(Step::Forced(forced(t, reach, env)?));
-                reach = false;
+                let mut t = &t[std::mem::take(&mut cut)..];
+                if raw_next(&parts, i) {
+                    let (head, l) = heal(t, env)?;
+                    t = head;
+                    lead = l;
+                }
+                if !t.is_empty() {
+                    steps.push(Step::Forced(forced(t, reach, env)?));
+                    reach = false;
+                }
             }
             Part::Pick(alts) => {
                 if alts.iter().any(|a| !a.then.is_empty()) && i != parts.len() {
@@ -339,7 +374,9 @@ pub(super) fn compile_in(parts: &[Part], env: &Env<'_>, reached: bool) -> Result
                 reach = false;
             }
             Part::Free { max, style } => {
-                steps.push(Step::Free(free_step(*max, *style, parts.get(i), env)?));
+                let (step, close) = free_step(*max, *style, parts.get(i), lead.take(), env)?;
+                steps.push(Step::Free(step));
+                cut = close;
                 reach = true;
             }
             Part::Num { integer } => {
@@ -362,19 +399,55 @@ pub(super) fn compile_in(parts: &[Part], env: &Env<'_>, reached: bool) -> Result
                 reach = true;
             }
             Part::Any(_) | Part::List { .. } => {
-                let post = match parts.get(i) {
+                let mut post = match parts.get(i) {
                     Some(Part::Text(t)) => {
                         i += 1;
                         t.as_str()
                     }
                     _ => "",
                 };
+                if raw_next(&parts, i) {
+                    let (head, l) = heal(post, env)?;
+                    post = head;
+                    lead = l;
+                }
                 steps.push(fork(part, &std::mem::take(&mut pre), post, env)?);
                 reach = true;
             }
         }
     }
     Ok(Program { steps })
+}
+
+/// Whether the part at `i` is a raw value.
+fn raw_next(parts: &[Part], i: usize) -> bool {
+    matches!(
+        parts.get(i),
+        Some(Part::Free {
+            style: Style::Raw(_),
+            ..
+        })
+    )
+}
+
+/// `text`, the tag before a raw value, split where the value's first token
+/// takes over: the text forced, and the text of its last token, which the
+/// value writes (`None` when that token is special, which no other token
+/// spells, or a split character).
+fn heal<'t>(text: &'t str, env: &Env<'_>) -> Result<(&'t str, Option<String>), Refusal> {
+    let ids = env.encode(text)?;
+    let Some(&last) = ids.last() else {
+        return Ok((text, None));
+    };
+    let piece = env.vocab.piece(last);
+    if env.tok.is_special(last)
+        || piece.is_empty()
+        || piece.contains(char::REPLACEMENT_CHARACTER)
+        || !text.ends_with(piece)
+    {
+        return Ok((text, None));
+    }
+    Ok((&text[..text.len() - piece.len()], Some(piece.to_owned())))
 }
 
 /// A forced text's step; `reached` adds the rest after each character
@@ -534,16 +607,18 @@ fn trie(alts: &[Alt], env: &Env<'_>) -> Result<Trie, Refusal> {
     Ok(Trie { nodes, subs })
 }
 
-/// A free string's step. `next` is the part after it: a raw string's class
-/// depends on the first byte of that text, which must be there; a JSON
-/// string's text after it, when it is in the same list, opens with its
-/// closing quote.
+/// A free string's step, and the bytes of the text after it the step holds.
+/// `next` is the part after it: a JSON string's text after it, when it is in
+/// the same list, opens with its closing quote; a raw value's begins with its
+/// close, which the value's step holds. `lead` is the end of the tag before a
+/// raw value that the value's first token writes.
 fn free_step(
     max: Option<usize>,
     style: Style,
     next: Option<&Part>,
+    lead: Option<String>,
     env: &Env<'_>,
-) -> Result<FreeStep, Refusal> {
+) -> Result<(FreeStep, usize), Refusal> {
     let tail = match next {
         Some(Part::Text(t)) => Some(t.as_str()),
         _ => None,
@@ -561,19 +636,28 @@ fn free_step(
                 env.vocab.json_class_in_markup()
             }
         }
-        Style::Raw => {
-            let Some(tail) = tail else {
-                return Err(refuse(
-                    "internal: a raw string is not followed by forced text".to_owned(),
-                ));
-            };
-            let first = tail.as_bytes()[0];
-            if !first.is_ascii() {
-                return Err(outside(format!(
-                    "a raw value ends at {tail:?}, whose first character is not ASCII"
+        Style::Raw(ends) => {
+            if !tail.is_some_and(|t| t.starts_with(ends.close)) {
+                return Err(refuse(format!(
+                    "internal: a raw value is not followed by its close {:?}",
+                    ends.close
                 )));
             }
-            env.vocab.raw_class(first)
+            let tags = env.vocab.raw_tags(ends, env.tok)?;
+            if let Some(m) = max
+                && tags.need(0) > m
+            {
+                return Err(outside(format!(
+                    "a raw value of at most {m} characters cannot end at {:?} with this \
+                     vocabulary",
+                    ends.close
+                )));
+            }
+            let body = Body::Raw {
+                tags,
+                lead: lead.map(String::into_boxed_str),
+            };
+            return Ok((FreeStep { body, max }, ends.close.len()));
         }
     };
     if let Some(tail) = tail
@@ -584,7 +668,13 @@ fn free_step(
              could never end"
         )));
     }
-    Ok(FreeStep { class, max })
+    Ok((
+        FreeStep {
+            body: Body::Json(class),
+            max,
+        },
+        0,
+    ))
 }
 
 /// Any JSON object of at least one member, its strings in `style`: the
@@ -909,9 +999,16 @@ enum Ctx {
     Free {
         prog: Arc<Program>,
         step: usize,
+        /// Its characters so far; a raw value's without the tail its
+        /// automaton holds as the start of a tag.
         chars: usize,
-        /// The ids that end it, ascending, read once it is picked from.
+        /// The ids that end it, ascending, read once it is picked from; a raw
+        /// value's for the automaton's state they were read at.
         ends: Option<Arc<[u32]>>,
+        /// A raw value's automaton state ([`RawTags::run`]).
+        state: usize,
+        /// The bytes of a raw value's lead written so far.
+        led: usize,
     },
     Num {
         prog: Arc<Program>,
@@ -967,13 +1064,15 @@ impl Head {
 
     /// The head's place inside its step, beside its frames: the context's
     /// program and step are always the last frame's, one step back.
-    fn mark(&self) -> (u8, usize) {
+    fn mark(&self) -> (u8, usize, usize, usize) {
         match &self.ctx {
-            Ctx::Idle => (0, 0),
-            Ctx::Done => (1, 0),
-            Ctx::Trie { node, .. } => (2, *node),
-            Ctx::Free { chars, .. } => (3, *chars),
-            Ctx::Num { at, .. } => (4, *at as usize),
+            Ctx::Idle => (0, 0, 0, 0),
+            Ctx::Done => (1, 0, 0, 0),
+            Ctx::Trie { node, .. } => (2, *node, 0, 0),
+            Ctx::Free {
+                chars, state, led, ..
+            } => (3, *chars, *state, *led),
+            Ctx::Num { at, .. } => (4, *at as usize, 0, 0),
         }
     }
 
@@ -986,6 +1085,15 @@ impl Head {
                 .iter()
                 .zip(&o.frames)
                 .all(|(a, b)| a.at == b.at && Arc::ptr_eq(&a.prog, &b.prog))
+    }
+}
+
+/// The free string's step at `step` of `prog`, where a free string's context
+/// stands.
+fn free_of(prog: &Program, step: usize) -> &FreeStep {
+    match &prog.steps[step] {
+        Step::Free(f) => f,
+        other => unreachable!("a free string's context stands on {other:?}"),
     }
 }
 
@@ -1217,6 +1325,8 @@ impl Walk {
                     step,
                     chars: 0,
                     ends: None,
+                    state: 0,
+                    led: 0,
                 },
                 _ => Ctx::Num {
                     prog,
@@ -1342,11 +1452,111 @@ impl Walk {
             if !wants {
                 continue;
             }
-            let read = self.ends_of(h);
+            let read = match &h.ctx {
+                Ctx::Free {
+                    prog, step, state, ..
+                } => match &free_of(prog, *step).body {
+                    Body::Raw { tags, .. } => self.raw_ends(h, tags, *state),
+                    Body::Json(_) => self.ends_of(h),
+                },
+                _ => self.ends_of(h),
+            };
             if let Ctx::Free { ends, .. } | Ctx::Num { ends, .. } = &mut self.heads[i].ctx {
                 *ends = Some(read);
             }
         }
+    }
+
+    /// The ids that complete a raw value's close at `state` and whose text
+    /// after the close the text after the value takes, ascending.
+    fn raw_ends(&self, h: &Head, tags: &RawTags, state: usize) -> Arc<[u32]> {
+        let after = h.after();
+        let mut out = Vec::new();
+        let mut ids: Vec<u32> = tags
+            .tokens(state, &self.vocab)
+            .1
+            .iter()
+            .filter(|&&(id, at)| {
+                out.clear();
+                self.eat(after.clone(), &self.vocab.piece(id)[at..], id, &mut out);
+                !out.is_empty()
+            })
+            .map(|&(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids.into()
+    }
+
+    /// The heads `h`, inside the raw value of `f`, leads to once it takes
+    /// `text`, the text of `id` past the lead, into `out`: the value goes on,
+    /// or it ends where `text` completes its close and the rest of `text` is
+    /// the text after it's. Its characters must fit the value's limit.
+    fn raw_into(&self, mut h: Head, f: &FreeStep, text: &str, id: u32, out: &mut Vec<Head>) {
+        let Ctx::Free {
+            prog,
+            step,
+            chars,
+            ends,
+            state,
+            ..
+        } = std::mem::replace(&mut h.ctx, Ctx::Idle)
+        else {
+            return;
+        };
+        let Body::Raw { tags, lead } = &f.body else {
+            return;
+        };
+        let held = chars + tags.pending(state);
+        let fits = |n: usize| f.max.is_none_or(|m| n <= m);
+        match tags.run(state, text) {
+            Run::Value(next) => {
+                let chars = held + text.chars().count() - tags.pending(next);
+                if fits(chars.saturating_add(tags.need(next))) {
+                    h.ctx = Ctx::Free {
+                        prog,
+                        step,
+                        chars,
+                        ends: ends.filter(|_| next == state),
+                        state: next,
+                        led: lead.as_deref().map_or(0, str::len),
+                    };
+                    push_new(out, h);
+                }
+            }
+            Run::Close(at) => {
+                let value = held + text[..at].chars().count() - tags.close().chars().count();
+                if fits(value) {
+                    self.eat(h.after(), &text[at..], id, out);
+                }
+            }
+            Run::Refused => {}
+        }
+    }
+
+    /// The ids a raw value whose lead `rest` is still to be written allows:
+    /// a piece of the lead, or a token that writes the rest of it and goes
+    /// on into the value.
+    fn leading(&self, h: &Head, f: &FreeStep, rest: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.vocab
+            .starting_with(rest.as_bytes()[0])
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let piece = self.vocab.piece(id);
+                if !self.vocab.is_text(id) {
+                    return false;
+                }
+                match piece.strip_prefix(rest) {
+                    Some(text) => {
+                        out.clear();
+                        self.raw_into(h.clone(), f, text, id, &mut out);
+                        !out.is_empty()
+                    }
+                    None => rest.starts_with(piece),
+                }
+            })
+            .collect()
     }
 
     /// The ids `h` allows, of a row of `n`.
@@ -1366,20 +1576,42 @@ impl Walk {
                 step,
                 chars,
                 ends: e,
+                state,
+                led,
             } => {
-                let Step::Free(f) = &prog.steps[*step] else {
-                    return Box::new(std::iter::empty());
-                };
+                let f = free_of(prog, *step);
                 let room = f.room(*chars);
-                let n = if room > 0 {
-                    n.min(f.class.n_vocab())
-                } else {
-                    0
-                };
-                let class = (0..n)
-                    .filter_map(|i| u32::try_from(i).ok())
-                    .filter(move |&id| f.class.fits(id, room));
-                Box::new(class.chain(ends(e)))
+                match &f.body {
+                    Body::Json(class) => {
+                        let n = if room > 0 { n.min(class.n_vocab()) } else { 0 };
+                        let class = (0..n)
+                            .filter_map(|i| u32::try_from(i).ok())
+                            .filter(move |&id| class.fits(id, room));
+                        Box::new(class.chain(ends(e)))
+                    }
+                    Body::Raw { tags, lead } => {
+                        if let Some(rest) = lead.as_deref().map(|l| &l[*led..])
+                            && !rest.is_empty()
+                        {
+                            return Box::new(self.leading(h, f, rest).into_iter());
+                        }
+                        let ok = tags.tokens(*state, &self.vocab).0;
+                        let exit = tags.exit(*state).map(|x| x.0);
+                        // Under a limit, each token is held to it: its
+                        // characters depend on the tag it leaves pending.
+                        let fits = move |id: u32| {
+                            f.max.is_none() || {
+                                let mut out = Vec::new();
+                                self.raw_into(h.clone(), f, self.vocab.piece(id), id, &mut out);
+                                !out.is_empty()
+                            }
+                        };
+                        let value = (0..n.min(self.vocab.n_vocab()))
+                            .filter_map(|i| u32::try_from(i).ok())
+                            .filter(move |&id| ok.has(id));
+                        Box::new(value.chain(ends(e)).filter(move |&id| fits(id)).chain(exit))
+                    }
+                }
             }
             Ctx::Num {
                 prog,
@@ -1451,20 +1683,69 @@ impl Walk {
                 step,
                 chars,
                 ends: e,
+                state,
+                led,
             } => {
-                let Step::Free(f) = &prog.steps[step] else {
-                    return;
-                };
-                if ends(&e) {
-                    self.eat(h, self.vocab.piece(id), id, out);
-                } else if f.class.fits(id, f.room(chars)) {
-                    h.ctx = Ctx::Free {
-                        prog: Arc::clone(&prog),
-                        step,
-                        chars: chars + f.class.len_of(id),
-                        ends: e,
-                    };
-                    push_new(out, h);
+                let f = free_of(&prog, step);
+                match &f.body {
+                    Body::Json(class) => {
+                        if ends(&e) {
+                            self.eat(h, self.vocab.piece(id), id, out);
+                        } else if class.fits(id, f.room(chars)) {
+                            h.ctx = Ctx::Free {
+                                prog: Arc::clone(&prog),
+                                step,
+                                chars: chars + class.len_of(id),
+                                ends: e,
+                                state,
+                                led,
+                            };
+                            push_new(out, h);
+                        }
+                    }
+                    Body::Raw { tags, lead } => {
+                        if let Some((exit, rest)) = tags.exit(state)
+                            && *exit == id
+                            && lead.as_deref().is_none_or(|l| led == l.len())
+                        {
+                            let mut k = h.after();
+                            k.forced = rest.iter().rev().copied().collect();
+                            push_new(out, k);
+                            return;
+                        }
+                        if !self.vocab.is_text(id) {
+                            return;
+                        }
+                        let piece = self.vocab.piece(id);
+                        let rest = lead.as_deref().map_or("", |l| &l[led..]);
+                        let text = if rest.is_empty() {
+                            piece
+                        } else if let Some(text) = piece.strip_prefix(rest) {
+                            text
+                        } else {
+                            if rest.starts_with(piece) {
+                                h.ctx = Ctx::Free {
+                                    prog: Arc::clone(&prog),
+                                    step,
+                                    chars,
+                                    ends: e,
+                                    state,
+                                    led: led + piece.len(),
+                                };
+                                push_new(out, h);
+                            }
+                            return;
+                        };
+                        h.ctx = Ctx::Free {
+                            prog: Arc::clone(&prog),
+                            step,
+                            chars,
+                            ends: e,
+                            state,
+                            led,
+                        };
+                        self.raw_into(h, f, text, id, out);
+                    }
                 }
             }
             Ctx::Num {
@@ -1732,10 +2013,7 @@ impl Walk {
             Ctx::Free {
                 prog, step, chars, ..
             } => {
-                let room = match &prog.steps[*step] {
-                    Step::Free(f) => f.room(*chars),
-                    _ => 0,
-                };
+                let room = free_of(prog, *step).room(*chars);
                 let id = picked.ok_or_else(|| {
                     self.stuck(if room == 0 {
                         "a free string reached its length limit and no end token is allowed"

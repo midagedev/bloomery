@@ -52,8 +52,8 @@ use serde_json::Value;
 
 use crate::callstream::{Args, Reading, find_from, held, read_value};
 use crate::constrain::{
-    Arg, Call, CallMode, Fun, Part, Refusal, Style, call, is_text, object_parameters, outside,
-    value,
+    Arg, Call, CallMode, Ends, Fun, Order, Part, Refusal, Style, call, is_text, object_parameters,
+    outside, value,
 };
 use crate::dsml::{Scanned, ToolCall};
 use crate::engine::Tokenizer;
@@ -890,13 +890,18 @@ pub(crate) fn call_parts(
             "{}{}{}{}",
             m.key_open, a.key, m.key_close, m.value_open
         ))];
-        parts.extend(value(&a.schema, Style::Raw, &a.path)?);
+        // The scan cuts the call at its close before it reads a value.
+        let ends = Ends {
+            close: m.value_close,
+            never: std::slice::from_ref(&m.call_close),
+        };
+        parts.extend(value(&a.schema, Style::Raw(ends), &a.path)?);
         parts.push(Part::Text(format!("{}{}", m.value_close, m.line())));
         Ok(parts)
     };
     let name = |name: &str| format!("{name}{}", m.line());
     let one = |f: &Fun<'_>| {
-        let mut parts = object_parameters(&f.args, &block)?;
+        let mut parts = object_parameters(&f.args, Order::Schema, &block)?;
         parts.push(Part::Text(m.call_close.to_owned()));
         Ok(parts)
     };

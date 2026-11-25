@@ -262,7 +262,7 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
         }
         Some(v) => unreachable!("valid::schema passed {path}'s type {v}"),
     };
-    if style == Style::Raw {
+    if matches!(style, Style::Raw(_)) {
         raw_literals_hold_no_tag(o, path)?;
     }
     if let Some(c) = o.get("const") {
@@ -300,7 +300,7 @@ pub(crate) fn value(node: &Value, style: Style, path: &str) -> Result<Vec<Part>,
                     Part::Free { max, style },
                     Part::Text("\"".to_owned()),
                 ],
-                Style::Raw => vec![Part::Free { max, style }],
+                Style::Raw(_) => vec![Part::Free { max, style }],
             })
         }
         Some("boolean") => {
@@ -350,7 +350,7 @@ fn any_of(alts: &Value, style: Style, path: &str) -> Result<Vec<Part>, Refusal> 
         .as_array()
         .filter(|a| !a.is_empty())
         .expect("valid::schema passed an anyOf that is a non-empty array");
-    if style == Style::Raw && list.iter().any(is_text) {
+    if matches!(style, Style::Raw(_)) && list.iter().any(is_text) {
         return Err(outside(
             &here,
             "an anyOf with a text option is not supported by this server in a chat format's \
@@ -679,23 +679,57 @@ fn object_of(args: &[Arg<'_>], inner: Style) -> Result<Vec<Part>, Refusal> {
     Ok(parts)
 }
 
-/// One tool's parameters in a chat format's markup: the `required` ones, in
-/// the schema's order, each written, then the optional ones in order, each
-/// of which may be left out — the object rule ([`object_of`]) where `block`
-/// spells one parameter, a run that carries its own framing so any two are
-/// neighbours apart. [`any_start`] takes over where no parameter is
-/// required and the format writes something of its own for a call that
-/// writes none (a DSML invoke's empty line).
+/// The order a chat format's template writes a call's arguments in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Order {
+    /// As the call holds them: the object rule's order is the program's, the
+    /// `required` ones in the schema's order, then the optional ones in
+    /// order.
+    Schema,
+    /// By key, code point by code point, as a template that sorts them
+    /// writes every call the model sees.
+    Sorted,
+}
+
+/// One tool's parameters in a chat format's markup, `block` spelling one
+/// parameter, a run that carries its own framing so any two are neighbours
+/// apart. In [`Order::Schema`], the `required` ones, in the schema's order,
+/// each written, then the optional ones in order, each of which may be left
+/// out — the object rule ([`object_of`]); in [`Order::Sorted`], every
+/// parameter in key order, each optional one left out or written in its
+/// place. [`any_start`] takes over where no parameter is required and the
+/// format writes something of its own for a call that writes none (a DSML
+/// invoke's empty line).
 pub(crate) fn object_parameters(
     args: &[Arg<'_>],
+    order: Order,
     block: &impl Fn(&Arg<'_>) -> Result<Vec<Part>, Refusal>,
 ) -> Result<Vec<Part>, Refusal> {
     let mut parts = Vec::new();
-    for a in args.iter().filter(|a| a.required) {
-        parts.extend(block(a)?);
-    }
-    for a in args.iter().filter(|a| !a.required) {
-        parts.push(Part::Any(vec![Vec::new(), block(a)?]));
+    let mut each = |a: &Arg<'_>| -> Result<(), Refusal> {
+        if a.required {
+            parts.extend(block(a)?);
+        } else {
+            parts.push(Part::Any(vec![Vec::new(), block(a)?]));
+        }
+        Ok(())
+    };
+    match order {
+        Order::Schema => {
+            for a in args.iter().filter(|a| a.required) {
+                each(a)?;
+            }
+            for a in args.iter().filter(|a| !a.required) {
+                each(a)?;
+            }
+        }
+        Order::Sorted => {
+            let mut sorted: Vec<&Arg<'_>> = args.iter().collect();
+            sorted.sort_by(|a, b| a.key.cmp(b.key));
+            for a in sorted {
+                each(a)?;
+            }
+        }
     }
     Ok(parts)
 }

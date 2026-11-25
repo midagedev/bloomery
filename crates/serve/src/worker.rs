@@ -690,10 +690,17 @@ fn req_tag(name: &ReqName) -> String {
 }
 
 /// The finish line, the one stderr line a request's end prints: its prompt
-/// and generated phases, its stop cause, and where its context stands.
+/// and generated phases, its stop cause, where its context stands, and, for
+/// a request that followed a program (a forced or watched tool call, a JSON
+/// reply), the arm it took.
 fn finish_line(name: &ReqName, t: &Timings, cause: &str) -> String {
+    let arm = match &t.jump {
+        Some(j) if j.arm => "; constrained jump",
+        Some(_) => "; constrained step",
+        None => "",
+    };
     format!(
-        "bloomery-serve: request {}: prompt {}; generated {}; stop {cause}; ctx {}/{}",
+        "bloomery-serve: request {}: prompt {}; generated {}; stop {cause}; ctx {}/{}{arm}",
         req_tag(name),
         phase(t.prompt_n, t.prompt_ms, Some(t.cache_n)),
         phase(t.predicted_n, t.predicted_ms, None),
@@ -1841,7 +1848,7 @@ mod tests {
 
     use super::{Acted, Action, ReqName, Shared, finish_line, progress_line, serve};
     use crate::api::{End, EngineFailure, relock};
-    use crate::genloop::{Slot, StopKind, Timings, cause_word};
+    use crate::genloop::{Jump, Slot, StopKind, Timings, cause_word};
     use crate::sched::{Board, FifoPicker, Refusal, Reserve};
     use crate::{MockEngine, sampling};
 
@@ -2002,6 +2009,24 @@ mod tests {
             "bloomery-serve: request 8 /v1/messages: prompt 0 ids (0 reused) in 0.00 s, - ids/s; \
              generated 0 ids in 0.00 s, - ids/s; stop error; ctx 0/64"
         );
+        // A request that follows a program names the arm it took.
+        for (arm, word) in [(true, "jump"), (false, "step")] {
+            let held = Timings {
+                jump: Some(Jump {
+                    arm,
+                    ..Jump::default()
+                }),
+                ..none.clone()
+            };
+            assert_eq!(
+                finish_line(&of_one, &held, "eos"),
+                format!(
+                    "bloomery-serve: request 8 /v1/messages: prompt 0 ids (0 reused) in 0.00 s, \
+                     - ids/s; generated 0 ids in 0.00 s, - ids/s; stop eos; ctx 0/64; \
+                     constrained {word}"
+                )
+            );
+        }
     }
 
     /// The stop cause words: the generation's own stop, and the two ways a

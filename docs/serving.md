@@ -466,6 +466,9 @@ A key file line can narrow its key with fields after it, separated by whitespace
 **One stderr line a request.** When a generation request ends, the server prints:
 `bloomery-serve: request <task id> <endpoint path>: prompt <N> ids (<C> reused) in <S> s, <R> ids/s; generated <G> ids
 in <S> s, <R> ids/s; stop <reason>; ctx <n_past>/<n_ctx>`. `<reason>` is `eos`, `stop`, `length`, `cancel` or `error`.
+A request that followed a program (a forced or watched tool call, a JSON `response_format`) ends the line with
+`; constrained jump` or `; constrained step`, the arm it took; one that followed none (no tools, or tools the watch
+does not serve) has no suffix.
 A request that generates for more than 30 s prints a shorter `generating` line every 30 s. A request of several choices
 prints one line a choice.
 
