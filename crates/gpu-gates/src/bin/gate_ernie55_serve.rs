@@ -14,10 +14,12 @@
 //! The clauses are the shared ones (`shared/serve_gate.rs`): the seat refuses a second slot, loads
 //! the folder at the context it was asked for (the `load` record names arch `ernie5_5`, one slot,
 //! the folder's layers and that context), answers a chat turn, and runs the prefix clause
-//! `live_slot_keeps_the_prefix` at its own cut's fact: an HCA layer's window ring takes no
-//! position back (`app::arch::ernie55`'s `Batch::cut`), so a request that shares less than the
-//! slot holds re-feeds its prompt from an empty model ([`serve_gate::Cut::WhereItStands`]). The
-//! reasoning split and the turn end read what the model writes, which the fixture cut does not
+//! `live_slot_keeps_the_prefix` at its own cut's fact: the body takes a checkpoint of the
+//! window rings and the compressor state at each prompt call's start and end
+//! (`app::arch::ernie55`'s `Batch::cut`), so a request that extends the last prompt keeps all of
+//! it and answers as the same request on an empty slot does ([`serve_gate::Cut::Checkpoint`]; the
+//! first reply is long enough to wrap both rings, so a restore that leaves one out answers
+//! differently). The reasoning split and the turn end read what the model writes, which the fixture cut does not
 //! write; they are the real folder's (`Tag::FileBound`), with the think span and the turn end as
 //! the model's vocabulary spells them.
 //!
@@ -71,9 +73,9 @@ mod gate {
             think: Some(["<ernie:think>", "</ernie:think>"]),
             turn_end: Some(TURN_END),
             ctx: CTX,
-            // The window rings take no position back: a cut keeps the position the model stands
-            // at, or nothing (`app::arch::ernie55`'s `Batch::cut`).
-            cut: serve_gate::Cut::WhereItStands,
+            // A cut keeps the newest checkpoint at or below the shared prefix: the body takes one
+            // at each prompt call's start and end (`app::arch::ernie55`'s `Batch::cut`).
+            cut: serve_gate::Cut::Checkpoint,
         };
         let dir = serve_gate::dir_of(&c)?;
         std::fs::create_dir_all(&dir)?;

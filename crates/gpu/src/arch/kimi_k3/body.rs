@@ -31,6 +31,7 @@ use crate::arch::gated_mla::{self as mla, MlaBufs, MlaSites};
 use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::arch::routed_ffn::{self as ffn, Ffn, FfnKernels, FfnScratch, Glu};
 use crate::attn_res::{AttnResArgs, AttnResKernels, MAX_VECS};
+use crate::checkpoint::{Checkpoints, Marked};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
@@ -72,6 +73,7 @@ use model::arch::kimi_k3::place::PlanInputs;
 use model::placement::Plan;
 use placed::{Open, Placed};
 use runtime::layer::hosted;
+use runtime::seqstate::{Kept, Take};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -87,6 +89,12 @@ pub(super) mod rows;
 const WHAT: &str = "kimi_k3::Body::load";
 const STEP: &str = "kimi_k3::Body::enqueue_chain";
 const OPEN: &str = "kimi_k3 GpuModel::open";
+
+/// The spacing of a prompt call's inner checkpoints: none. A call takes a checkpoint at its start
+/// and at its end ([`Checkpoints::marks`]), so the sequence holds the two newest points
+/// ([`Price::budget`](runtime::seqstate::Price::budget) of a ledger with no spacing: two slots,
+/// whatever the context). A request that extends the last call's prompt returns to its end.
+pub const CHECKPOINT_EVERY: u32 = 0;
 
 /// The types the dense layer's projections run: the trunk's Q4_K, Q5_K, Q6_K and Q8_0, each a
 /// launch of the common dense site. The table's BF16 (`gguf::arch::kimi_k3`) is not here: the
@@ -681,6 +689,10 @@ pub struct Body {
     /// The position the stores stand at: the next step's.
     held: u32,
     ctx: usize,
+    /// The delta layers' state and conv rings on the host at chosen positions ([`copied`]): what
+    /// a cut goes back to. The latent layers' caches are rows by position and are no store of a
+    /// checkpoint.
+    ckpt: Checkpoints,
     /// The books of the host K/V's growth ([`HostGrowBook`]), on a placed load whose plan keeps
     /// host experts to yield to it; the host tier's residency yields them.
     host_grow: Option<HostGrowBook>,
@@ -1121,6 +1133,8 @@ impl Body {
         s.mla.sel = selects
             .then(|| index::Sel::new(stream, &hp, md.row(), ctx))
             .transpose()?;
+        let lens: Vec<usize> = copied(&mut layers).iter().map(|b| b.len()).collect();
+        let ckpt = Checkpoints::sequence(gpu.context(), lens, ctx, CHECKPOINT_EVERY)?;
         Ok(Body {
             placed,
             host_head: None,
@@ -1139,6 +1153,7 @@ impl Body {
             layers,
             acts,
             ctx,
+            ckpt,
             hp,
             host_grow: None,
         })
@@ -1729,6 +1744,114 @@ impl Body {
         }
         self.fit(at, m)
     }
+
+    /// What a cut to at most `n` positions of a model standing at `pos` keeps, and why: every
+    /// position, the empty model, or the nearest checkpoint at or below `n`. After a call that
+    /// failed part-way the stores hold other positions than `pos`, so only a checkpoint is kept.
+    #[must_use]
+    pub fn kept(&self, n: u32, pos: u32) -> Kept {
+        if self.held == pos {
+            self.ckpt.kept(n, pos)
+        } else {
+            self.ckpt.kept(n.min(pos), self.held)
+        }
+    }
+
+    /// The checkpoints: their positions, their slots, what they have done.
+    #[must_use]
+    pub fn checkpoints(&self) -> &Checkpoints {
+        &self.ckpt
+    }
+
+    /// A checkpoint at `pos`, the position the model stands at, after any waiting cut: every delta
+    /// layer's state and conv ring copied to a host slot, or nothing where one stands. Refused by
+    /// name when the stores hold other positions. Waits for the copies.
+    pub fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
+        self.held_at(pos)?;
+        self.apply_cut(gpu.stream())?;
+        let Body { layers, ckpt, .. } = self;
+        let mut stores = copied(layers);
+        ckpt.take(gpu.stream(), pos, &mut stores)
+    }
+
+    /// The waiting cut carried out: each delta layer's state and ring from the checkpoint's slot,
+    /// or zeroed for the empty model, and every lane's stamp on the position the cut went to
+    /// (the delta step reads the stamp as the position the lane stands at). Nothing, and no
+    /// allocation, when no cut waits. Waits for the copies; the first device call after a cut
+    /// runs it ([`ChainBody::refresh`], a pass of rows).
+    pub(super) fn apply_cut(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if !self.ckpt.pending() {
+            return Ok(());
+        }
+        let Body {
+            layers, ckpt, held, ..
+        } = self;
+        let mut stores = copied(layers);
+        ckpt.apply(stream, &mut stores)?;
+        for layer in layers.iter_mut() {
+            if let Mixer::Kda { store, .. } = &mut layer.mixer {
+                store.restamp_at(stream, 0, *held)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A cut to `pos`: nothing at the position the stores stand at; the empty model at 0; else the
+    /// checkpoint at `pos`, copied back at the next device call. Any other position is refused by
+    /// name ([`Body::kept`] says what a cut keeps).
+    pub fn cut(&mut self, pos: u32) -> Result<(), GpuError> {
+        self.ckpt.cut(pos, self.held)?;
+        self.held = pos;
+        Ok(())
+    }
+
+    /// Refused by name unless the stores hold `pos` positions: a pass that failed part-way left
+    /// the stores between positions, so a checkpoint of them would hold a state no position has.
+    fn held_at(&self, pos: u32) -> Result<(), GpuError> {
+        if self.held == pos {
+            return Ok(());
+        }
+        Err(GpuError::shape(
+            WHAT,
+            format!(
+                "a checkpoint at position {pos} on stores that hold {} (a call failed part-way: \
+                 cut back to a checkpoint or reset first)",
+                if self.held == u32::MAX {
+                    "no position".to_string()
+                } else {
+                    format!("{} positions", self.held)
+                }
+            ),
+        ))
+    }
+}
+
+impl Marked for Body {
+    fn marks(&self, from: u32, to: u32) -> Vec<u32> {
+        self.ckpt.marks(from, to)
+    }
+
+    fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
+        Body::checkpoint(self, gpu, pos)
+    }
+}
+
+/// The stores a checkpoint copies: each delta layer's state, then its conv ring, in layer order.
+/// The order is the same on every call, so a slot holds each store at its index. The latent
+/// layers' caches are rows by position, and each store's stamp is the position the cut went to
+/// ([`Body::apply_cut`]), so neither is copied.
+fn copied(layers: &mut [Layer]) -> Vec<&mut DeviceBuffer<f32>> {
+    layers
+        .iter_mut()
+        .filter_map(|layer| match &mut layer.mixer {
+            Mixer::Kda { store, .. } => Some(&mut **store),
+            Mixer::Mla { .. } => None,
+        })
+        .flat_map(|store| {
+            let RecStore { state, ring, .. } = store;
+            [state, ring]
+        })
+        .collect()
 }
 
 /// The rooms [`fit_rooms`] runs: every latent layer's, the residency machine the one that frees
@@ -1812,10 +1935,10 @@ impl ChainBody for Body {
         Ok(DecodeInput { token, pos })
     }
 
-    /// The token and the position: two copies, and on a load that selects the count words of the
-    /// position ([`index::Sel::words`]), one more, after the rooms are fitted through the
-    /// position ([`Body::fit`]). Refused by name, before any, off the position the stores stand
-    /// at.
+    /// A waiting cut carried out, then the token and the position: two copies, and on a load that
+    /// selects the count words of the position ([`index::Sel::words`]), one more, after the rooms
+    /// are fitted through the position ([`Body::fit`]). Refused by name, before any, off the
+    /// position the stores stand at.
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         if input.pos != self.held {
             return Err(GpuError::shape(
@@ -1827,6 +1950,7 @@ impl ChainBody for Body {
                 ),
             ));
         }
+        self.apply_cut(stream)?;
         self.fit(input.pos as usize, 1)?;
         match self.placed.as_mut() {
             None => {
@@ -1856,9 +1980,9 @@ impl ChainBody for Body {
     }
 
     /// Every delta store back to a fresh one in place (a captured chain keeps their addresses,
-    /// [`state::clear_store`]), and every room's pages given back (the addresses stay). The
-    /// latent caches' contents need nothing: no row at or past the live count is read, and every
-    /// row below it is written by its own step first.
+    /// [`state::clear_store`]), every room's pages given back (the addresses stay) and every
+    /// checkpoint dropped. The latent caches' contents need nothing: no row at or past the live
+    /// count is read, and every row below it is written by its own step first.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
         let stream = gpu.stream();
         for layer in &mut self.layers {
@@ -1873,6 +1997,7 @@ impl ChainBody for Body {
             p.reset(stream)?;
         }
         self.held = 0;
+        self.ckpt.clear();
         Ok(())
     }
 

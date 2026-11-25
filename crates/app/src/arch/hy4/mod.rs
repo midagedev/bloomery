@@ -5,12 +5,15 @@
 //! prompt pass) under the session's residency word. A load with the pass runs a prompt as passes
 //! of its rows ([`prompt_placed`], one residency pass), the host's experts read once a pass; one
 //! without it steps the ids one at a time ([`GpuModel::step`] over the slice). Either way the head's argmax after the last id is the
-//! call's. A window layer's ring and the engram history hold the
-//! position they stand at alone, so a cut keeps every held position or nothing. Each resident
-//! sequence owns its stores and its engram history ([`ResidentSequences`]).
+//! call's. A window layer's ring, a sparse layer's index ring and the engram history hold the
+//! position they stand at alone, so a cut keeps every held position, the empty model, or a
+//! checkpoint: each prompt call takes one at its start and at its end ([`Body::kept`]), which a
+//! request that extends the last prompt returns to. Each resident sequence owns its stores, its
+//! engram history and its checkpoints ([`ResidentSequences`]).
 
 use std::num::NonZeroUsize;
 
+use bloomery_gpu::checkpoint::prompt_marked;
 use bloomery_gpu::folder::Model;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::swap::Residency;
@@ -21,8 +24,10 @@ use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::hy4::place::PlanInputs;
 use model::placement::Plan;
+use runtime::seqstate::Kept;
 
-use super::{Batch, ResidentSequences};
+use super::{Batch, ResidentSequences, cut_checkpointed};
+use crate::Keep;
 
 const WHAT: &str = "hy4 session";
 
@@ -81,27 +86,34 @@ impl Batch for Body {
         Ok(false)
     }
 
-    /// The ids from the model's position: as placed passes when the load has one
-    /// ([`prompt_placed`]: the call one residency pass, 0 rows kept), else stepped, each step
-    /// owning its residency pass, so no outer
-    /// [`prompt_pass`](bloomery_gpu::host::served::prompt_pass) wraps the ids.
+    /// The ids from the model's position, and the call's checkpoints ([`prompt_marked`]): as
+    /// placed passes when the load has one ([`prompt_placed`]: the call one residency pass, 0 rows
+    /// kept), else stepped, each step owning its residency pass, so no outer
+    /// [`prompt_pass`](bloomery_gpu::host::served::prompt_pass) wraps the ids. An image prompt
+    /// takes no checkpoint.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        if m.body("hy4::Batch::prompt")?.pass_rows().is_none() {
-            return m.step(ids);
-        }
-        prompt_placed(m, ids)
+        prompt_marked(m, ids, |m, seg| {
+            if m.body("hy4::Batch::prompt")?.pass_rows().is_none() {
+                return m.step(seg);
+            }
+            prompt_placed(m, seg)
+        })
     }
 
-    /// The window rings and the engram history hold the position they stand at alone: a cut
-    /// keeps that position, or nothing.
+    /// [`Body::kept`]: every position, the empty model, or the nearest checkpoint at or below
+    /// `n`.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
-        crate::keep_where_it_stands(m, n)
+        <Body as Keep>::kept(m, n).at
     }
 
-    /// Back to empty at 0 (a reset), or the position the model stands at (nothing to take back);
-    /// any other cut is refused by name, since the body takes no position back.
+    /// [`Body::kept`].
+    fn kept(m: &GpuModel<Body>, n: u32) -> Kept {
+        m.body(WHAT)
+            .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n, m.pos()))
+    }
+
+    /// [`cut_checkpointed`]: the checkpoints are the only positions a cut takes back.
     fn cut(m: &mut GpuModel<Body>, n: u32) -> Result<(), GpuError> {
-        let why = "the window rings and the engram history take no position back";
-        crate::cut_where_it_stands(m, n, (WHAT, why))
+        cut_checkpointed(m, n)
     }
 }

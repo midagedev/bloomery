@@ -23,7 +23,8 @@
 //!   `short` is fed once, which gives the machine a usage; every routed layer's card set is then
 //!   reseeded (`SwapMachine::reseed`) to the experts that prompt picked first and the highest ids
 //!   after, so the card takes experts the plan left on the host into slots below its card count,
-//!   never the slot of their own id; `short`'s reference clauses run again over that layout.
+//!   never the slot of their own id; `short`'s reference clauses run again over that layout, and
+//!   then `xstream_admit_matches_off`.
 //!
 //! For each set and arm, against the writer's rows at the prompt's last positions:
 //!
@@ -58,6 +59,39 @@
 //!   expert the card reads from a slot other than its id's, so the reference clauses that follow
 //!   are not a pass over the plan's own layout; what the MXFP4 card slot path does with such an
 //!   expert is what they hold to [`L_OUT_BAND`] and the rest.
+//! - `residency_unset_serves` (`card`, `hosted-mid`): the unset residency word as the seats resolve
+//!   it (`bloomery_levers::residency_unset` over `residency::at_plan`, the body's `UNHOSTED_POOL`)
+//!   on each arm's plan. The `hosted-mid` plan hosts experts, so its serving word is
+//!   [`RESIDENCY_SERVING`] with why `place`, the word [`RESIDENT`] runs; beside a fixed placement
+//!   and beside the step feed it is `off`. The `card` plan holds every expert, which leaves the
+//!   machine none to move onto the card: `off`, why `no_host_experts`.
+//! - `residency_started` (`hosted`, `hosted-mid`): the `hosted-mid` load runs a residency machine
+//!   and holds a source with parts for every routed layer, each layer's seed the plan's card
+//!   experts less the spare slots, in id order; the `hosted` load (opened `Residency::Off`) runs
+//!   no machine.
+//! - `residency_passes`, `residency_c1`, `residency_c7` (`hosted-mid`, run first on the plan's own
+//!   seed before the reseed moves it; `short`'s prompt then [`HIST_STEPS`] greedy steps, each
+//!   history begun by [`Session::clear`], the seat's own call):
+//!   the history's boundaries end, in order, no pass, the prompt call (one pass, 0 rows kept) and
+//!   each step (1 row kept; the last step's own boundary is made ahead of its readback), so the
+//!   count is `HIST_STEPS + 2` [derived]; the history twice gives the same ids, last logits row
+//!   (bit for bit), boundaries and landed flips, and at least one flip lands (the measured term:
+//!   the rule plans every 4 kept rows, makes at most one flip a layer in flight, so at most one
+//!   a routed layer a plan, 2 x HIST_STEPS / 4 = 96 for the cut's two routed layers); the clear
+//!   after it hands back a reset report of diff 0 and no dropped host byte, every seed layer's
+//!   live set its seed. The clear is the session's, so a seat that did not clear the machine
+//!   fails here, which a direct `residency_reset` would not show.
+//! - `xstream_admit_matches_off` (`hosted-mid`): one id fed [`SKEW_IDS`] times (so every row of a
+//!   unit routes the same experts and the pick's counts pass its floor on any router) as a prompt
+//!   and [`GRAPH_STEPS`] steps with the prompt stream `off`, then again with it `admit` and the
+//!   `off` run's ids fed back: the admit call picked and admitted at least one expert (or the
+//!   clause proves nothing), the `off` call picked none, every logits row of the `admit` run is
+//!   within [`LOGITS_BAND`] of the `off` run's and its argmax is the `off` run's wherever the
+//!   `off` row's margin is [`MARGIN_FLOOR`] or more. The experts the pick moved are computed on
+//!   the card where the host computed them, so the runs differ by the two tiers' rounding of the
+//!   same experts, each of which the reference clauses hold to the writer within the bands above;
+//!   [`LOGITS_BAND`] is used here as an unmeasured upper bound, and the clause's line prints the
+//!   worst row's value.
 //! - `reset_is_fresh` (the card arm and `hosted`, before the arm's first reset): `long` as the
 //!   open's first prompt and again after a reset give the same token, taps, logits and selection
 //!   bit for bit, the bits a fresh process writes, which the mixers' reset and the body's reset
@@ -73,6 +107,10 @@
 //!   mode (the chain captured once from the reset model, before any token, as a session's open
 //!   captures it, and replayed at every position) give the eager chain's ids and last logits row
 //!   bit for bit.
+//! - `cut_restores_the_checkpoint`: on the card arm, `short`'s prompt as a call, [`CUT_STEPS`]
+//!   greedy steps, a rollback to the prompt's end and the prompt's ids again give the argmax and
+//!   last logits row bit for bit of the same two calls from a reset: the HCA window and compressor
+//!   rings come back from the checkpoint the first call ended with.
 //!
 //! Before the card loads, a set absent from the box, dumped from another cut or writer, or
 //! unfinished ends the gate by name. A step that raises the fault word ends the gate by name.
@@ -109,14 +147,26 @@ mod gate_card;
 mod folder;
 
 #[cfg(feature = "ernie55")]
+#[allow(
+    dead_code,
+    reason = "the residency clauses serve several gates; each takes the helpers it reads"
+)]
+#[path = "shared/residency_clauses.rs"]
+mod residency_clauses;
+
+#[cfg(feature = "ernie55")]
 mod gate {
+    use crate::residency_clauses::{c1_clause_with, c7_clause, passes_clause};
     use crate::{folder, gate_card};
+    use app::Session;
     use bloomery_gpu::GpuModel;
     use bloomery_gpu::folder::Model;
-    use bloomery_gpu::host::HybridStats;
+    use bloomery_gpu::host::placed::PlacedHost;
     use bloomery_gpu::host::served::TierBody;
     use bloomery_gpu::host::slots::HOST;
-    use bloomery_gpu::host::swap::{CardTable, Residency};
+    use bloomery_gpu::host::swap::{CardTable, PassReport, Residency, SwapSource};
+    use bloomery_gpu::host::xstream::{XMode, XStreamBody};
+    use bloomery_gpu::host::{HybridStats, PassKind};
     use bloomery_gpu::model::StepMode;
     use bloomery_gpu_ernie55::{Body, PASS_ROWS, TapRows};
     use bloomery_gpu_gates::generate::Residence;
@@ -124,12 +174,15 @@ mod gate {
         GreedyRow, MARGIN_FLOOR, compare_forced, read_greedy, std_normal_cdf,
     };
     use bloomery_gpu_gates::rel::rel;
+    use bloomery_gpu_gates::residency;
     use bloomery_gpu_gates::tier::{self, Tag, Tier};
     use bloomery_gpu_gates::{
         GateError, Layout, RefManifest, RowKind, bits_equal, checks_failed, ref_ints,
         ref_tensor_logical_in, verdict,
     };
-    use bloomery_levers::HostCfg;
+    use bloomery_levers::{
+        HostCfg, RESIDENCY_SERVING, ResidencyAt, ResidencyPick, ResidencyWhy, residency_unset,
+    };
     use gguf::Split;
     use model::arch::ernie55::place::PlanInputs;
     use model::placement::PlanLevers;
@@ -172,6 +225,14 @@ mod gate {
 
     /// The greedy steps `graph_is_eager` takes after the prompt.
     const GRAPH_STEPS: usize = 8;
+    /// The steps `cut_restores_the_checkpoint` takes past its checkpoint: more than a window ring
+    /// (128) and a compressor block (128) hold.
+    const CUT_STEPS: usize = 144;
+
+    /// The ids `xstream_admit_matches_off` feeds: one id repeated for two units of [`PASS_ROWS`]
+    /// rows, so every row of a unit routes the same experts and the unit's count of each is the
+    /// unit's rows, past the admit floor (`ADMIT_FLOOR`, 32) on any router.
+    const SKEW_IDS: usize = 2 * PASS_ROWS;
 
     /// The reference clauses of an arm: four a set, and `long`'s selection.
     const FX_ARM: usize = 4 * SETS.len() + 1;
@@ -189,6 +250,10 @@ mod gate {
         pinned: 0,
         spares: 1,
     };
+
+    /// The greedy steps of a residency history: 48 planning intervals of the rule, which plans
+    /// every 4 kept rows (the length of the V4.1 and Mistral Large 4 histories).
+    const HIST_STEPS: usize = 192;
 
     /// The argument that names the hosted arm's file, the cut's GGUF.
     const HOSTED_GGUF: &str = "--hosted-gguf";
@@ -284,10 +349,22 @@ mod gate {
         })
     }
 
-    /// An arm: its name and the model it opened.
+    /// What an arm's plan says of its residency: the unset word as the seats resolve it
+    /// (`bloomery_levers::residency_unset` over `residency::at_plan` with the body's
+    /// `UNHOSTED_POOL`) at a serving placement, at a fixed one and beside the step feed, and the
+    /// plan's card experts a layer.
+    struct Planned {
+        serving: ResidencyPick,
+        fixed: ResidencyPick,
+        steps: ResidencyPick,
+        n_l: Vec<u64>,
+    }
+
+    /// An arm: its name, the model it opened and what its plan says of the residency.
     struct Arm {
         name: &'static str,
         m: GpuModel<Body>,
+        planned: Planned,
     }
 
     /// The hosted arm's file: the value of [`HOSTED_GGUF`], the gate's one argument.
@@ -340,6 +417,25 @@ mod gate {
         let machine = workstation::plan_on(gate_card::room()?, hp.n_layer);
         let plan = Body::plan(&inputs, &machine, CTX as u64, &levers)?;
         let hosts = Body::plan_hosts(&plan, &inputs);
+        let unset = |serving_place: bool, prefill_steps: bool| {
+            residency::at_plan(
+                <Body as bloomery_gpu::model::ChainBody>::UNHOSTED_POOL,
+                &plan,
+                0,
+                residency_unset(ResidencyAt {
+                    serving_place,
+                    check_finite: false,
+                    route_trace: false,
+                    prefill_steps,
+                }),
+            )
+        };
+        let planned = Planned {
+            serving: unset(true, false)?,
+            fixed: unset(false, false)?,
+            steps: unset(true, true)?,
+            n_l: plan.n_l.iter().copied().collect(),
+        };
         let host = HostCfg {
             populate: residency != Residency::Off,
             ..HOST_CFG
@@ -351,7 +447,7 @@ mod gate {
             host,
             (Some(PASS_ROWS), residency),
         )?;
-        Ok((Arm { name, m }, hosts))
+        Ok((Arm { name, m, planned }, hosts))
     }
 
     /// `ids` from the model's position: the pass where the load has one, else one id a step.
@@ -875,18 +971,328 @@ mod gate {
         Ok(ok)
     }
 
+    /// The body's host tier on `m`: the placed host a load with experts on the host holds.
+    fn host_of(m: &mut GpuModel<Body>) -> Result<&mut PlacedHost, GateError> {
+        let (_, _, body) = m.body_parts(NAME)?;
+        <Body as bloomery_gpu::model::ChainBody>::host(body)
+            .ok_or_else(|| GateError::from(format!("{NAME}: the load has no host tier")))
+    }
+
+    /// Clause `residency_unset_serves`: the unset word on the `hosted-mid` arm's plan, which hosts
+    /// experts, is the serving word with why `place` and the word [`RESIDENT`] runs, and beside a
+    /// fixed placement and the step feed it is `off`; on the `card` arm's plan, which holds every
+    /// expert and leaves the machine none to move onto the card, it is `off` with why
+    /// `no_host_experts`.
+    fn unset_serves(card: &Planned, hosted: &Planned) -> Result<bool, GateError> {
+        const CLAUSE: &str = "residency_unset_serves";
+        if !tier::run_clause(CLAUSE, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let want = |word: &'static str, why: ResidencyWhy| ResidencyPick { word, why };
+        let serving = hosted.serving == want(RESIDENCY_SERVING, ResidencyWhy::Place)
+            && Residency::parse(hosted.serving.word)? == RESIDENT;
+        let off = hosted.fixed == want("off", ResidencyWhy::FixedPlace)
+            && hosted.steps == want("off", ResidencyWhy::PrefillSteps);
+        let whole = card.serving == want("off", ResidencyWhy::NoHostExperts);
+        let pass = serving && off && whole;
+        println!(
+            "{CLAUSE}: the hosted plan's serving word {} ({}) is the arm's {serving}, beside a fixed \
+             placement {} ({}) and the step feed {} ({}) {off}; the whole-card plan's {} ({}) {whole} {}",
+            hosted.serving.word,
+            hosted.serving.why.name(),
+            hosted.fixed.word,
+            hosted.fixed.why.name(),
+            hosted.steps.word,
+            hosted.steps.why.name(),
+            card.serving.word,
+            card.serving.why.name(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Clause `residency_started` on the `hosted` arm, opened `Residency::Off`: no machine.
+    fn started_off(arm: &Arm) -> Result<bool, GateError> {
+        let clause = format!("residency_started arm={}", arm.name);
+        if !tier::run_clause(&clause, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let machine = arm.m.body(NAME)?.hybrid().swap().is_some();
+        println!(
+            "{clause}: the off load runs a machine {machine} (want none) {}",
+            verdict(!machine)
+        );
+        Ok(!machine)
+    }
+
+    /// Clause `residency_started` on the `hosted-mid` arm: the load runs a machine over its routed
+    /// layers and holds a source with parts for every layer the plan gives a card expert, and each
+    /// layer's seed is the plan's card experts less the word's spare slots, in id order.
+    fn started_mid(arm: &mut Arm) -> Result<bool, GateError> {
+        let clause = format!("residency_started arm={}", arm.name);
+        if !tier::run_clause(&clause, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let Residency::Mid { spares, .. } = RESIDENT else {
+            return Err(format!("{NAME}: the arm's word {RESIDENT:?} is off").into());
+        };
+        let layers = arm.m.body(NAME)?.hybrid().slots().layers();
+        let (sourced, with_parts, bare) = {
+            let host = host_of(&mut arm.m)?;
+            match host.shell.residency_source() {
+                Some(source) => {
+                    let mut bare = Vec::new();
+                    let mut with_parts = 0usize;
+                    for l in layers.clone() {
+                        if source.part_bytes(l).is_empty() {
+                            if arm.planned.n_l.get(l).copied().unwrap_or(0) > 0 {
+                                bare.push(l);
+                            }
+                        } else {
+                            with_parts += 1;
+                        }
+                    }
+                    (true, with_parts, bare)
+                }
+                None => (false, 0, Vec::new()),
+            }
+        };
+        let machine = arm.m.body(NAME)?.hybrid().swap();
+        let mut seeds_ok = machine.is_some();
+        if let Some(machine) = machine {
+            for l in layers.clone() {
+                let held = arm.planned.n_l.get(l).copied().unwrap_or(0);
+                let want: Vec<u32> =
+                    (0..u32::try_from(held.saturating_sub(spares as u64))?).collect();
+                seeds_ok &= machine.seed(l)? == want;
+            }
+        }
+        let pass = sourced && with_parts > 0 && bare.is_empty() && seeds_ok;
+        println!(
+            "{clause}: the mid load runs a machine and holds a source {sourced}, with parts for \
+             {with_parts} of its {} routed layers (card experts and no part: {bare:?}), each seed \
+             the plan's card experts less {spares} spare(s) in id order {seeds_ok} {}",
+            layers.len(),
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// One history of the `hosted-mid` session: the ids it decoded, its last logits row, the
+    /// residency boundaries it ended (each pass's kind and kept rows) and the flips that landed
+    /// at them.
+    struct Hist {
+        tokens: Vec<u32>,
+        logits: Vec<f32>,
+        passes: Vec<(PassKind, usize)>,
+        landed: usize,
+    }
+
+    /// The residency boundaries' reports of `m` since the last take, each with the kind of the
+    /// pass it ended.
+    fn take_passes(m: &mut GpuModel<Body>) -> Result<Vec<(PassKind, PassReport)>, GateError> {
+        Ok(host_of(m)?.shell.take_residency_passes())
+    }
+
+    /// The history of `ids` from a clear (the model's reset and the residency's seed,
+    /// [`Session::clear`]): the prompt as the pass, then [`HIST_STEPS`] greedy steps.
+    fn history(s: &mut Session<Body>, ids: &[u32]) -> Result<Hist, GateError> {
+        s.clear()?;
+        let _ = take_passes(s.model_mut())?;
+        let mut next = feed(s.model_mut(), ids)?;
+        let mut tokens = vec![next];
+        for _ in 0..HIST_STEPS {
+            next = s.model_mut().step(&[next])?;
+            tokens.push(next);
+        }
+        let logits = s.model().logits()?;
+        let ended = take_passes(s.model_mut())?;
+        Ok(Hist {
+            tokens,
+            logits,
+            passes: ended.iter().map(|&(k, r)| (k, r.kept)).collect(),
+            landed: ended.iter().map(|(_, r)| r.landed).sum(),
+        })
+    }
+
+    /// Clauses `residency_passes`, `residency_c1` and `residency_c7` on the `hosted-mid` model
+    /// `m` as the open left it (the plan's own seed), driven through a [`Session`] over it: `s`'s
+    /// prompt and [`HIST_STEPS`] greedy steps twice, each from [`Session::clear`], then one clear
+    /// more whose reset report is the clause `residency_c7`'s. The clear leaves the machine at its
+    /// seed, and the model is handed back for the clauses that reseed it.
+    fn history_clauses(m: GpuModel<Body>, s: &Set) -> Result<(bool, GpuModel<Body>), GateError> {
+        let mut session = Session::from_model(m, u32::try_from(CTX)?);
+        session.model_mut().set_mode(StepMode::Eager);
+        host_of(session.model_mut())?
+            .shell
+            .log_residency(HIST_STEPS + 2);
+        let first = history(&mut session, &s.prompt)?;
+        let second = history(&mut session, &s.prompt)?;
+        let mut ok = true;
+        if tier::run_clause("residency_passes", Tag::SelfConsistency)? {
+            ok &= passes_clause(&first.passes, HIST_STEPS);
+        }
+        if tier::run_clause("residency_c1", Tag::SelfConsistency)? {
+            let same = first.tokens == second.tokens
+                && first.passes == second.passes
+                && first.landed == second.landed
+                && bits_equal(&first.logits, &second.logits);
+            ok &= c1_clause_with(first.tokens.len(), first.landed, same, true);
+        }
+        session.clear()?;
+        let report = session
+            .take_cleared()
+            .ok_or("the session's clear made no residency reset")?;
+        if tier::run_clause("residency_c7", Tag::SelfConsistency)? {
+            let body = session.model().body(NAME)?;
+            let machine = body
+                .hybrid()
+                .swap()
+                .ok_or("the load runs no residency machine")?;
+            let seeds = crate::residency_clauses::seeds(machine, body.hybrid().slots().layers())?;
+            ok &= c7_clause(&report, machine, &seeds);
+        }
+        Ok((ok, session.into_model()))
+    }
+
+    /// What `xstream_admit_matches_off` reads of one run: the argmax and the logits row after the
+    /// prompt and after each step, and the picks the prompt call made with the experts they
+    /// admitted.
+    struct StreamRun {
+        tokens: Vec<u32>,
+        rows: Vec<Vec<f32>>,
+        picks: usize,
+        admitted: usize,
+    }
+
+    /// `ids` as a prompt from a reset with the prompt stream at `mode`, then [`GRAPH_STEPS`] steps
+    /// fed the ids `forced` names, or each step's own greedy id where `forced` is `None`.
+    fn stream_run(
+        arm: &mut Arm,
+        mode: XMode,
+        ids: &[u32],
+        forced: Option<&[u32]>,
+    ) -> Result<StreamRun, GateError> {
+        {
+            let (gpu, _, body) = arm.m.body_parts(NAME)?;
+            body.set_xstream(gpu, mode)?;
+        }
+        arm.m.reset()?;
+        let mut tokens = vec![feed(&mut arm.m, ids)?];
+        let mut rows = vec![arm.m.logits()?];
+        let (records, _) = arm.m.body_parts(NAME)?.2.take_stream_records();
+        let admitted: usize = records.iter().map(|(_, pick)| pick.admitted).sum();
+        while tokens.len() <= GRAPH_STEPS {
+            let at = tokens.len() - 1;
+            let id = forced.map_or(tokens[at], |f| f[at]);
+            tokens.push(arm.m.step(&[id])?);
+            rows.push(arm.m.logits()?);
+        }
+        Ok(StreamRun {
+            tokens,
+            rows,
+            picks: records.len(),
+            admitted,
+        })
+    }
+
+    /// A logits row's largest value less its second largest.
+    fn margin(row: &[f32]) -> f32 {
+        let (mut first, mut second) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for &v in row {
+            if v > first {
+                second = first;
+                first = v;
+            } else if v > second {
+                second = v;
+            }
+        }
+        first - second
+    }
+
+    /// Clause `xstream_admit_matches_off` of the arm that runs a residency over a plan that hosts
+    /// experts: a prompt of [`SKEW_IDS`] copies of `s`'s last id and [`GRAPH_STEPS`] steps with the
+    /// prompt stream `off` and then `admit`, the `admit` run fed the `off` run's ids. The premise
+    /// that keeps it from proving nothing: the `admit` call picked and admitted an expert. The
+    /// `off` call picked none; the logits rows are within [`LOGITS_BAND`] of the `off` run's
+    /// (the moved experts are computed on the card in place of the host: the tiers' rounding of
+    /// the same experts, each held to the writer within the bands above, so the band is an
+    /// unmeasured upper bound; the line prints the worst row's value) and the argmaxes are the
+    /// `off` run's wherever its margin is [`MARGIN_FLOOR`] or more. The arm's stream is `off`
+    /// again after.
+    fn xstream_admit_matches_off(arm: &mut Arm, s: &Set) -> Result<bool, GateError> {
+        let clause = format!("xstream_admit_matches_off set={} arm={}", s.name, arm.name);
+        if !tier::run_clause(&clause, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        let id = *s.prompt.last().ok_or("the set holds no prompt")?;
+        let ids = vec![id; SKEW_IDS];
+        let off = stream_run(arm, XMode::Off, &ids, None)?;
+        let on = stream_run(arm, XMode::Admit, &ids, Some(&off.tokens[..GRAPH_STEPS]));
+        {
+            let (gpu, _, body) = arm.m.body_parts(NAME)?;
+            body.set_xstream(gpu, XMode::Off)?;
+        }
+        let on = on?;
+        let worst = on
+            .rows
+            .iter()
+            .zip(&off.rows)
+            .map(|(a, b)| rel(a, b))
+            .fold(0.0f64, f64::max);
+        let flips: Vec<usize> = on
+            .tokens
+            .iter()
+            .zip(&off.tokens)
+            .zip(&off.rows)
+            .enumerate()
+            .filter(|(_, ((a, b), row))| a != b && margin(row) >= MARGIN_FLOOR)
+            .map(|(i, _)| i)
+            .collect();
+        let admitted = tier::premise(
+            "xstream_admit_matches_off: the admit call admitted an expert (the skewed prompt's counts)",
+            Tag::SelfConsistency,
+            on.picks > 0 && on.admitted > 0,
+        )?;
+        let pass = admitted
+            && off.picks == 0
+            && off.admitted == 0
+            && worst <= LOGITS_BAND
+            && flips.is_empty();
+        println!(
+            "xstream_admit_matches_off set={} arm={} ids={SKEW_IDS} steps={GRAPH_STEPS} \
+             admit_picks={} admitted={} off_picks={} worst_rel={worst:.3e} band={LOGITS_BAND:.1e} \
+             argmax_flips_at_margin={flips:?} {}",
+            s.name,
+            arm.name,
+            on.picks,
+            on.admitted,
+            off.picks,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
     /// The `hosted-mid` arm: the hosted file opened under [`RESIDENT`] (`opened`: whether clause
-    /// `opens_the_fixture` runs), its clauses on `s`, closed.
-    fn resident_arm(gguf: &Path, s: &Set, opened: bool) -> Result<bool, GateError> {
+    /// `opens_the_fixture` runs; `card` the card arm, whose plan the unset word is also read
+    /// on), its residency clauses and its clauses on `s`, closed.
+    fn resident_arm(gguf: &Path, card: &Arm, s: &Set, opened: bool) -> Result<bool, GateError> {
         let (mut arm, hosts) = open_arm("hosted-mid", true, Some(gguf), RESIDENT)?;
         let mut ok = if opened {
             opens(&arm, hosts, true)?
         } else {
             true
         };
+        ok &= unset_serves(&card.planned, &arm.planned)?;
+        ok &= started_mid(&mut arm)?;
+        // The histories run on the plan's own seed, before the reseed below moves it.
+        let (held, m) = history_clauses(arm.m, s)?;
+        arm.m = m;
+        ok &= held;
         let (gpu, _, body) = arm.m.body_parts(NAME)?;
         body.arm_taps(gpu, TAP_ROWS)?;
         ok &= resident_clauses(&mut arm, s)?;
+        ok &= xstream_admit_matches_off(&mut arm, s)?;
         Ok(ok)
     }
 
@@ -921,6 +1327,45 @@ mod gate {
             s.name,
             eager.0,
             graph.0,
+            verdict(pass)
+        );
+        Ok(pass)
+    }
+
+    /// Clause `cut_restores_the_checkpoint`: `s`'s prompt as a call (its end a checkpoint),
+    /// [`CUT_STEPS`] greedy steps (past a whole window ring and a compressor block, so every
+    /// slot of both rings is overwritten), a rollback to the prompt's end, then the prompt's
+    /// ids again as a second call, give the argmax and the last logits row bit for bit of the
+    /// same two calls from a reset with no steps between them. The two runs make the same calls
+    /// at the same positions, so only the restored rings can differ.
+    fn cut_restores(m: &mut GpuModel<Body>, s: &Set) -> Result<bool, GateError> {
+        const CLAUSE: &str = "cut_restores_the_checkpoint";
+        if !tier::run_clause(CLAUSE, Tag::SelfConsistency)? {
+            return Ok(true);
+        }
+        if m.body(NAME)?.pass_rows().is_none() {
+            return Err(format!("{NAME}: {CLAUSE} needs a load with a prompt pass").into());
+        }
+        m.set_mode(StepMode::Eager);
+        let at = u32::try_from(s.prompt.len())?;
+        m.reset()?;
+        let mut next = feed(m, &s.prompt)?;
+        for _ in 0..CUT_STEPS {
+            next = m.step(&[next])?;
+        }
+        m.rollback(at)?;
+        let cut_id = feed(m, &s.prompt)?;
+        let cut_row = m.logits()?;
+        m.reset()?;
+        let _ = feed(m, &s.prompt)?;
+        let fresh_id = feed(m, &s.prompt)?;
+        let fresh_row = m.logits()?;
+        let same_bits = bits_equal(&cut_row, &fresh_row);
+        let pass = cut_id == fresh_id && same_bits;
+        println!(
+            "{CLAUSE} set={} at={at} steps={CUT_STEPS} ids cut={cut_id} fresh={fresh_id} \
+             logits_same_bits={same_bits} {}",
+            s.name,
             verdict(pass)
         );
         Ok(pass)
@@ -979,6 +1424,9 @@ mod gate {
                 return Err(checks_failed());
             }
         }
+        if let Some((arm, _)) = &hosted {
+            ok &= started_off(arm)?;
+        }
         let named = |name: &str| {
             sets.iter()
                 .find(|s| s.name == name)
@@ -1004,7 +1452,7 @@ mod gate {
         // The hosted arm closes before its file opens again under the residency.
         drop(hosted);
         if let Some(path) = &gguf {
-            ok &= resident_arm(path, short, opened)?;
+            ok &= resident_arm(path, &card, short, opened)?;
         }
         tier::expect_fixture_oracle(
             NAME,
@@ -1015,6 +1463,7 @@ mod gate {
             },
         )?;
         ok &= graph_is_eager(&mut card.m, &sets[0])?;
+        ok &= cut_restores(&mut card.m, &sets[0])?;
         println!("{}", tier::tally_line());
         if !ok {
             return Err(checks_failed());
@@ -1025,7 +1474,11 @@ mod gate {
              selection within {SEL_SWAPS} swaps, the logits before and after MultiMax within \
              {LOGITS_BAND:.1e}, the teacher-forced argmax within the pin; a reset model writes \
              a fresh open's bits and holds its caches cleared; experts promoted into other slots are read within the same \
-             bands; the graph is the eager chain"
+             bands; the graph is the eager chain; the unset residency word is the serving word on \
+             the hosted plan (off on the whole-card plan, beside a fixed placement and the step \
+             feed), the mid load runs a machine seeded by its plan, its history's boundaries end \
+             none, the prompt call and each step, the history repeats bit for bit with flips \
+             landing, and a session's clear restores the seed"
         );
         Ok(())
     }

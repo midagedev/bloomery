@@ -76,14 +76,15 @@
 //! words do not hold is refused by name. The step allocates nothing and
 //! synchronizes nothing; the prompt form neither.
 //!
-//! Not this module's: restoring the window ring after a rollback. A ring of
-//! `window` rows holds each position's row until `window` positions later, so
-//! a rollback of `d` tokens loses the `d − 1` rows the rejected positions
-//! overwrote; a draft that rolls back needs a per-position shadow to restore
-//! from, as V4.1's step has. The compressed rows need none: a position's
-//! visible blocks are a prefix of the rows, and the compressor's ring holds
-//! one block's residues, which the rejected positions of the same block do not
-//! collide with.
+//! A rollback is the body's, over the stores [`HcaState::copied`] lends to the
+//! common checkpoints. A ring of `window` rows holds each position's row until
+//! `window` positions later, and the compressor's rings hold one block's
+//! residues until the next block overwrites them, so positions past the one a
+//! rollback returns to would leave neither state at it: a checkpoint of the
+//! three stores copies them at its position, and a cut goes only to one. The
+//! compressed rows are no store of a checkpoint: a position's visible blocks
+//! are a prefix of the rows, and a block the rejected positions completed is
+//! written again when the positions after the cut complete it.
 
 use bloomery_gpu::compress::{CompGeom, CompressKernels, PoolArgs, StepInts};
 use bloomery_gpu::gemm::Gemm32Kernels;
@@ -600,6 +601,19 @@ impl HcaLayer {
     }
 }
 
+/// The f32s of the three stores a checkpoint of one HCA layer copies, in order: the window ring
+/// (its `window` latent rows of f16, lent as the words of its bytes), the compressor's ring of
+/// projections and its ring of scores (`ratio` latent rows of f32 each): what [`HcaState::copied`]
+/// lends and what one checkpoint takes of a layer, `4 · (window · LATENT / 2 + 2 · ratio · LATENT)`
+/// bytes. The compressed rows are not here: they are cut by position.
+#[must_use]
+pub fn copied_lens(window: usize, ratio: usize) -> [usize; 3] {
+    [window * LATENT / 2, ratio * LATENT, ratio * LATENT]
+}
+
+// The window ring's f16 rows are lent as f32 words.
+const _: () = assert!(LATENT.is_multiple_of(2));
+
 /// One layer's caches for one sequence: the window ring, the compressed rows
 /// and the compressor's state.
 struct HcaCache {
@@ -823,6 +837,20 @@ impl HcaState {
         }
         self.run = None;
         Ok(())
+    }
+
+    /// The stores a checkpoint copies, each HCA layer's three in layer order ([`copied_lens`]):
+    /// the window ring lent as the f32 words of its bytes, then the compressor's two rings. The
+    /// order is the same on every call, so a slot holds each store at its index.
+    pub fn copied(&mut self) -> Result<Vec<WindowMut<'_, f32>>, GpuError> {
+        let lens = copied_lens(self.d.window, self.d.ratio);
+        let mut out = Vec::with_capacity(3 * self.caches.iter().flatten().count());
+        for c in self.caches.iter_mut().flatten() {
+            out.push(WindowMut::<f32>::of_mut(c.ring.buf_mut(), 0, lens[0])?);
+            out.push(WindowMut::<f32>::of_mut(&mut c.ring_kv, 0, lens[1])?);
+            out.push(WindowMut::<f32>::of_mut(&mut c.ring_score, 0, lens[2])?);
+        }
+        Ok(out)
     }
 
     /// The FNV-1a 64 of every cache's bits, read back (synchronizes `stream`).

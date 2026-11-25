@@ -1166,12 +1166,12 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
         kind: Kind::Words(&["off", "admit", "split"]),
         default: Unset::Means(
             "Qwen3.8 (`generate_qwen3moe`, `bloomery-serve-qwen38`), and the Muse Spark, \
-             MiniMax-M3.1, Mistral Large 4 and Hy4-flash seats (`bloomery-serve`, MiniMax-M3.1's \
-             and Mistral Large 4's gates): `split` under `--place a` with a residency (`admit` when \
-             the ring has no room or cannot hold the stack layout), `admit` under `--place bp` \
-             with one, `off` everywhere else",
+             MiniMax-M3.1, Mistral Large 4, Hy4-flash and ERNIE 5.5 seats (`bloomery-serve`, \
+             MiniMax-M3.1's and Mistral Large 4's gates): `split` under `--place a` with a \
+             residency (`admit` when the ring has no room or cannot hold the stack layout, which \
+             is ERNIE 5.5's every time), `admit` under `--place bp` with one, `off` everywhere else",
         ),
-        doc: "Qwen3.8, Muse Spark, MiniMax-M3.1, Mistral Large 4 and Hy4-flash prompt calls fed by ubatches or passes under adaptive residency \
+        doc: "Qwen3.8, Muse Spark, MiniMax-M3.1, Mistral Large 4, Hy4-flash and ERNIE 5.5 prompt calls fed by ubatches or passes under adaptive residency \
               (`BLOOMERY_RESIDENCY=mid-…`): what each card layer's walk moves before its card \
               route. `admit` moves the residency's pool toward the ubatch's hottest host experts \
               (`host::swap` call mode, a count of at least the walk's floor), and the call's picks \
@@ -1197,8 +1197,10 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
               forms, the file's blocks or NVFP4 planes (staged from a checkpoint folder's parts), \
               and runs the streamed slots there beside the card's stacks; a MiniMax-M3.1 or \
               Mistral Large 4 load (the gates' seats, `Body::set_xstream`) takes it through the \
-              common prompt walk, and a Hy4-flash load through its placed prompt pass (a load that \
-              runs its prompt stepped streams nothing: `split` set there is refused by name). \
+              common prompt walk, and a Hy4-flash or ERNIE 5.5 load through its placed prompt pass \
+              (a load that runs its prompt stepped streams nothing: `split` set there is refused by \
+              name, ERNIE 5.5's `admit` too; ERNIE 5.5's MXFP4 experts have no route GEMM entry, \
+              so its `split` is refused by name even with the pass and unset runs `admit`). \
               Mistral Large 4 is the lever's host streaming (`admit`, V4.1's \
               `BLOOMERY_HOSTSTREAM` under another name) and its expert stream (`split`). Beside an \
               expert tier card (`--place bp`) the Muse Spark, MiniMax-M3.1 and Mistral Large 4 \

@@ -6,14 +6,17 @@
 //! its rows ([`GpuModel::prompt_placed`]), past a K3.1 file's indexer top-k too (each row's latent
 //! layers attend the rows the indexer picks for it); one without the pass steps the ids one at a
 //! time ([`GpuModel::step`] over the slice, [`Batch::prompt`]). Either way each id is a decode
-//! step's bits and the head's argmax after the last is the call's. A delta layer's state holds the
-//! position it stands at alone, so a cut keeps every held position or nothing; the latent layers'
-//! caches are per position and ask nothing of it. The body serves one sequence. It lives in the
-//! gpu crate's own kimi_k3 arch, so it needs no feature.
+//! step's bits and the head's argmax after the last is the call's. A delta layer's state and conv
+//! ring hold the position they stand at alone, so a cut keeps every held position, the empty model,
+//! or a checkpoint: each prompt call takes one at its start and at its end ([`Body::kept`]), which
+//! a request that extends the last prompt returns to; the latent layers' caches are per position
+//! and ask nothing of it. The body serves one sequence. It lives in the gpu crate's own kimi_k3
+//! arch, so it needs no feature.
 
 use std::num::NonZeroUsize;
 
 use bloomery_gpu::arch::kimi_k3::Body;
+use bloomery_gpu::checkpoint::prompt_marked;
 use bloomery_gpu::folder::Model;
 use bloomery_gpu::head::Head;
 use bloomery_gpu::host::swap::Residency;
@@ -23,8 +26,10 @@ use bloomery_levers::HostCfg;
 use gguf::Split;
 use model::arch::kimi_k3::place::PlanInputs;
 use model::placement::Plan;
+use runtime::seqstate::Kept;
 
-use super::{Batch, SingleSequence};
+use super::{Batch, SingleSequence, cut_checkpointed};
+use crate::Keep;
 
 const WHAT: &str = "kimi_k3 session";
 
@@ -87,29 +92,36 @@ impl Batch for Body {
         Ok(false)
     }
 
-    /// The ids from the model's position: as placed passes when the load has one
-    /// ([`GpuModel::prompt_placed`]: the call one residency pass, 0 rows kept), on a K3.1 file
-    /// past its indexer's top-k too (every pass row selects as the step at its position does),
-    /// else stepped, each step owning its residency pass (its boundary, its kept row, the next
-    /// boundary ahead), so no outer [`prompt_pass`](bloomery_gpu::host::served::prompt_pass)
-    /// wraps the ids: a host tier's open-call state refuses a boundary inside an open call.
+    /// The ids from the model's position, and the call's checkpoints ([`prompt_marked`]): as
+    /// placed passes when the load has one ([`GpuModel::prompt_placed`]: the call one residency
+    /// pass, 0 rows kept), on a K3.1 file past its indexer's top-k too (every pass row selects as
+    /// the step at its position does), else stepped, each step owning its residency pass (its
+    /// boundary, its kept row, the next boundary ahead), so no outer
+    /// [`prompt_pass`](bloomery_gpu::host::served::prompt_pass) wraps the ids: a host tier's
+    /// open-call state refuses a boundary inside an open call.
     fn prompt(m: &mut GpuModel<Body>, ids: &[u32]) -> Result<u32, GpuError> {
-        if m.body("kimi_k3::Batch::prompt")?.pass_shape().is_none() {
-            return m.step(ids);
-        }
-        m.prompt_placed(ids)
+        prompt_marked(m, ids, |m, seg| {
+            if m.body("kimi_k3::Batch::prompt")?.pass_shape().is_none() {
+                return m.step(seg);
+            }
+            m.prompt_placed(seg)
+        })
     }
 
-    /// The delta layers' state holds the position it stands at alone: a cut keeps that position,
-    /// or nothing.
+    /// [`Body::kept`]: every position, the empty model, or the nearest checkpoint at or below
+    /// `n`.
     fn keepable(m: &GpuModel<Body>, n: u32) -> u32 {
-        crate::keep_where_it_stands(m, n)
+        <Body as Keep>::kept(m, n).at
     }
 
-    /// Back to empty at 0 (a reset), or the position the model stands at (nothing to take back);
-    /// any other cut is refused by name, since the body takes no position back.
+    /// [`Body::kept`].
+    fn kept(m: &GpuModel<Body>, n: u32) -> Kept {
+        m.body(WHAT)
+            .map_or_else(|_| Kept::rule(n, m.pos(), 0), |b| b.kept(n, m.pos()))
+    }
+
+    /// [`cut_checkpointed`]: the checkpoints are the only positions a cut takes back.
     fn cut(m: &mut GpuModel<Body>, n: u32) -> Result<(), GpuError> {
-        let why = "the delta layers' state takes no position back";
-        crate::cut_where_it_stands(m, n, (WHAT, why))
+        cut_checkpointed(m, n)
     }
 }

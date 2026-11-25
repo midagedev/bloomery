@@ -1081,8 +1081,9 @@ fn walk_pass(
 /// [`PromptStream::end`](bloomery_gpu::host::prompt_stream::PromptStream::end): a call that continues a sequence holding decode heat returns each layer to
 /// the set it started with, a call at position 0 keeps its placement; nothing while the lever is
 /// off). Refused by name: no ids, a load made without the pass, a position the stores do not stand
-/// at; a call that fails part-way leaves the stores to a reset. The call's own error first: a
-/// stream end refused after a failed call is its echo.
+/// at; a call that fails part-way leaves the stores to a reset. A waiting cut is carried out
+/// first ([`crate::Body::cut`]). The call's own error first: a stream end refused after a failed
+/// call is its echo.
 pub fn prompt_placed(
     model: &mut GpuModel<crate::body::Body>,
     ids: &[u32],
@@ -1116,6 +1117,7 @@ fn placed_call(
         body.stream_begin(gpu.stream(), ids.len(), start)?
     };
     let r = model.run_rows(ids.len(), call, |gpu, w, body, head, pos| {
+        body.apply_cut(gpu.stream())?;
         if pos != body.held {
             return Err(GpuError::shape(
                 call,

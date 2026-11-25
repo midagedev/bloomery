@@ -14,9 +14,11 @@
 //! The clauses are the shared ones (`shared/serve_gate.rs`): the seat refuses a second slot, loads
 //! the file at the context it was asked for, answers a chat turn and ends its turn at the model's
 //! own end token, and runs the prefix clause `live_slot_keeps_the_prefix` at its own cut's fact:
-//! the delta layers' state takes no position back (`app::arch::kimi_k3`'s `Batch::cut`), so a
-//! request that shares less than the slot holds re-feeds its prompt from an empty model and the
-//! clause holds it to the counting rule alone ([`serve_gate::Cut::WhereItStands`]). K3's
+//! the body takes a checkpoint of the delta layers' state and conv rings at each prompt call's
+//! start and end (`app::arch::kimi_k3`'s `Batch::cut`), so a request that extends the last
+//! prompt keeps all of it and answers as the same request on an empty slot does
+//! ([`serve_gate::Cut::Checkpoint`]; the first reply is long enough to wrap the conv ring, so a
+//! restore that leaves a store or its stamp out answers differently or faults). K3's
 //! description names the reply's sections (`kimi_k3::spec::REASONING`): the seat hands the server the
 //! think span's and the response section's tags, so the reasoning-split clause holds the message
 //! to a reasoning of its own and a content with neither the span's close nor the response's open
@@ -403,9 +405,9 @@ mod gate {
             think: Some(["<|close|>think<|sep|>", "<|open|>response<|sep|>"]),
             turn_end: Some(TURN_END),
             ctx: CTX,
-            // The delta layers' state takes no position back: a cut keeps the position the model
-            // stands at, or nothing (`app::arch::kimi_k3`'s `Batch::cut`).
-            cut: serve_gate::Cut::WhereItStands,
+            // A cut keeps the newest checkpoint at or below the shared prefix: the body takes one
+            // at each prompt call's start and end (`app::arch::kimi_k3`'s `Batch::cut`).
+            cut: serve_gate::Cut::Checkpoint,
         };
         let dir = serve_gate::dir_of(&c)?;
         std::fs::create_dir_all(&dir)?;

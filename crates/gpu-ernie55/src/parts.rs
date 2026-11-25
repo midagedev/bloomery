@@ -284,6 +284,11 @@ impl Mixer for HcaMixer {
         self.st.digest(stream)
     }
 
+    /// Every HCA layer's window ring and compressor rings ([`HcaState::copied`]).
+    fn copied(&mut self) -> Result<Vec<WindowMut<'_, f32>>, GpuError> {
+        self.st.copied()
+    }
+
     /// The state's bytes (its caches, staging, words and scratch) and the layers' folded head
     /// mixes.
     fn bytes(&self) -> usize {
@@ -746,23 +751,27 @@ impl RoutedFfn for Routed {
         self.bufs.lat()
     }
 
-    fn enqueue_shadow_rows(
+    fn enqueue_shared_rows(
         &mut self,
         cx: Cx<'_>,
         l: usize,
         m: usize,
         x: &DeviceBuffer<f32>,
+    ) -> Result<(), GpuError> {
+        let g = sites(cx, &self.k, (self.hidden, self.eps));
+        self.moe
+            .enqueue_shared_rows((cx.gpu, cx.w, &g, &self.k.gemm), &mut self.bufs, l, m, x)
+    }
+
+    fn enqueue_card_rows(
+        &mut self,
+        cx: Cx<'_>,
+        l: usize,
+        m: usize,
         sel_n_card: (&DeviceBuffer<u32>, usize),
     ) -> Result<bool, GpuError> {
-        let g = sites(cx, &self.k, (self.hidden, self.eps));
-        self.moe.enqueue_shadow_rows(
-            (cx.gpu, cx.w, &g, &self.k.gemm),
-            &mut self.bufs,
-            l,
-            m,
-            x,
-            sel_n_card,
-        )
+        self.moe
+            .enqueue_card_rows((cx.gpu, cx.w), &mut self.bufs, l, m, sel_n_card)
     }
 
     fn enqueue_back_rows(

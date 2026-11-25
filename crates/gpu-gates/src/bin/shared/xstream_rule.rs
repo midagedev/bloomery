@@ -1,7 +1,7 @@
 //! The expert stream rule a load runs: `BLOOMERY_XSTREAM` set or unset by
 //! one rule ([`xstream_rule`]), over any body that implements
 //! [`XStreamBody`] — for `generate_qwen3moe` and the Qwen3.8, MiniMax, Muse
-//! Spark, Mistral Large 4 and Hy4-flash serve seats, each including this file; the MiniMax
+//! Spark, Mistral Large 4, Hy4-flash and ERNIE 5.5 serve seats, each including this file; the MiniMax
 //! gates' seat asks its [`plans_ring`]. It lives beside the
 //! bins, not in the lib, because it drives a load's body, whose own guards
 //! the trait carries.

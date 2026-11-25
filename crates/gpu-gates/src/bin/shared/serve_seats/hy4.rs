@@ -11,9 +11,11 @@
 //!                    [--api-key KEY] [--api-key-file FNAME]
 //!                    [--mmproj FILE [--image-min-tokens N] [--image-max-tokens N]]
 //!
-//! What this file holds is what Hy4-flash's architecture forces. A window layer's ring and the
-//! engram history hold the position they stand at alone, so a request shares a prefix with its
-//! slot only where the sequence stands (`app::arch::hy4`). The body runs the common residency
+//! What this file holds is what Hy4-flash's architecture forces. A window layer's ring, a sparse
+//! layer's index ring and the engram history hold the position they stand at alone, so the body
+//! takes a checkpoint of them at each prompt call's start and end, and a request shares a prefix
+//! with its slot up to the newest checkpoint at or below it (`app::arch::hy4`). The body runs the
+//! common residency
 //! machine under the seat's word (unset, the serving word on a serving placement, which the plan
 //! keeps, moves or turns `off`), and it hangs no expert tier card ([`TierRule::UNTIERED`], the
 //! default). Each resident sequence owns

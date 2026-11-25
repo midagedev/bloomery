@@ -209,11 +209,12 @@ impl Rows for Body {
     /// The head's rows are independent: one read of `output` for the pass.
     const HEADS: RowHeads = RowHeads::One;
 
-    /// The pass's ids and positions staged, the verify opened on the lane
-    /// word ([`Lanes::open`]), the taps planned at its rows. Refused by name
-    /// off the position the stores stand at, while a verify waits, and on a
+    /// A waiting cut carried out, the pass's ids and positions staged, the
+    /// verify opened on the lane word ([`Lanes::open`]), the taps planned at
+    /// its rows. Refused by name off the position the stores stand at, while a verify waits, and on a
     /// load of one lane ([`GpuModel::open_verifying`] holds the lanes).
     fn plan_rows(&mut self, stream: &CudaStream, tokens: &[u32], pos: u32) -> Result<(), GpuError> {
+        self.apply_cut(stream)?;
         let r = &mut self.rows;
         r.stands_at(pos, "a verify")?;
         r.lanes.open(Pass::Verify, pos, tokens.len())?;
@@ -255,12 +256,11 @@ impl Rows for Body {
 }
 
 impl Rollback for Body {
-    /// Without the card only the position the stores stand at, nothing
-    /// waiting: a commit moves the lane word on the card
-    /// ([`Rollback::rollback_on`]).
+    /// Without the card only the position the stores stand at or a checkpoint ([`Body::cut`]),
+    /// nothing waiting: a commit moves the lane word on the card ([`Rollback::rollback_on`]).
     fn rollback(&mut self, pos: u32) -> Result<(), GpuError> {
         let r = &self.rows;
-        if r.lanes.waiting().is_some() || pos != r.held {
+        if r.lanes.waiting().is_some() {
             return Err(GpuError::shape(
                 WHAT,
                 format!(
@@ -270,14 +270,15 @@ impl Rollback for Body {
                 ),
             ));
         }
-        Ok(())
+        self.cut(pos)
     }
 
     /// The verify waiting kept to `pos`: its first `pos − pos0` rows, 1 to
     /// its rows ([`Lanes::commit`], which copies the lane word when it
     /// moves). With nothing waiting, the position the stores stand at takes
-    /// nothing back; any other is refused by name: an RDA state holds its
-    /// position alone, so a cut keeps it or nothing (a reset).
+    /// nothing back, and any other is a cut ([`Body::cut`]): a position where a
+    /// checkpoint stands, refused by name at any other (an RDA state holds its
+    /// position alone), its card work waiting for the next device call.
     fn rollback_on(&mut self, gpu: &Gpu, pos: u32) -> Result<(), GpuError> {
         let r = &mut self.rows;
         match r.lanes.waiting() {
@@ -293,15 +294,7 @@ impl Rollback for Body {
                 r.held = r.lanes.commit(gpu.stream(), keep as usize)?;
                 Ok(())
             }
-            None if pos == r.held => Ok(()),
-            None => Err(GpuError::shape(
-                WHAT,
-                format!(
-                    "back to position {pos} from {}: an RDA state holds its position alone (a \
-                     cut keeps it or resets)",
-                    r.held
-                ),
-            )),
+            None => self.cut(pos),
         }
     }
 }
@@ -329,6 +322,7 @@ impl Body {
         let n = ids.len();
         self.rows.stands_at(pos, "a prompt call")?;
         self.rows.lanes.open(Pass::InPlace, pos, n)?;
+        self.apply_cut(stream)?;
         if tapped.is_some() && self.rows.taps.is_none() {
             return Err(GpuError::state(WHAT, "taps set (set_draft_taps)"));
         }

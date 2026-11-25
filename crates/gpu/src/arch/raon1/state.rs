@@ -192,8 +192,7 @@ impl Lanes {
         self.book.count as usize
     }
 
-    /// The lane the word holds.
-    #[cfg(test)]
+    /// The lane the word holds: the one lane a position's state is in.
     pub(crate) fn committed(&self) -> u32 {
         self.book.committed
     }

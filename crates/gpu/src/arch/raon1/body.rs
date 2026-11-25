@@ -30,6 +30,7 @@ use crate::arch::hybrid::{Acts, DecodeInput, GqaCx, Site};
 use crate::arch::routed_ffn::{
     self as ffn, Ffn, FfnKernels, FfnRows, FfnScratch, Glu, Routed, RoutedShape,
 };
+use crate::checkpoint::{Checkpoints, Marked};
 use crate::elem::EmbedRowsArgs;
 use crate::flash_gqa::FlashGqaKernels;
 use crate::gemm::Gemm32Kernels;
@@ -41,7 +42,7 @@ use crate::linear::{HEAD, LinearKernels};
 use crate::model::{ChainBody, GpuModel, NoHost, block_count};
 use crate::recur::RecStore;
 use crate::site::{self, KGemvKernels, SiteTy};
-use crate::tensor::Window;
+use crate::tensor::{Window, WindowMut};
 use crate::weights::{DevWeight, Weights};
 use crate::{DeviceTensor, Gpu, GpuError};
 use cuda_core::{CudaStream, DeviceBuffer};
@@ -53,10 +54,18 @@ use model::arch::raon1::hparams::{Hparams, Kind};
 use model::arch::raon1::names::{self, Sub};
 use model::placement::CardFormat;
 use model::placement::kernels;
+use runtime::seqstate::{Kept, Take};
 use std::ops::Range;
 
 const WHAT: &str = "raon1::Body::load";
 const STEP: &str = "raon1::Body::enqueue_chain";
+
+/// The spacing of a prompt call's inner checkpoints: none. A call takes a checkpoint at its start
+/// and at its end ([`Checkpoints::marks`]), so the sequence holds the two newest points
+/// ([`Price::budget`](runtime::seqstate::Price::budget) of a ledger with no spacing: two slots,
+/// whatever the context), and a call is one walk of its ids, which a block draft's tapped window
+/// is read over. A request that extends the last call's prompt returns to its end.
+pub const CHECKPOINT_EVERY: u32 = 0;
 
 /// The types a dense or shared-expert projection may have.
 const FFN_TYPES: &[SiteTy] = &[
@@ -479,6 +488,10 @@ pub struct Body {
     /// The token once a stream, rewritten by every refresh.
     ids: [u32; STREAMS],
     ctx: usize,
+    /// The RDA layers' committed lane of state and conv ring on the host at chosen positions
+    /// ([`copied`]): what a cut goes back to. The latent layers' caches are rows by position and
+    /// are no store of a checkpoint.
+    ckpt: Checkpoints,
 }
 
 impl GpuModel<Body> {
@@ -731,6 +744,8 @@ impl Body {
         let stage = rda::stage_len(&kda)
             .max(gated_mla::stage_len(&mla))
             .max(ffn::stage_len(ff.0.max(ff.1)));
+        let lens: Vec<usize> = copied(&mut layers, 0)?.iter().map(|w| w.len()).collect();
+        let ckpt = Checkpoints::sequence(gpu.context(), lens, ctx, CHECKPOINT_EVERY)?;
         Ok(Body {
             k: Kernels::load(gpu, &mla)?,
             s: Scratch::new(stream, &hp, (&kda, &mla), ctx, 1)?,
@@ -753,8 +768,105 @@ impl Body {
             acts,
             ids: [0; STREAMS],
             ctx,
+            ckpt,
             hp,
         })
+    }
+
+    /// What a cut to at most `n` positions of a model standing at `pos` keeps, and why: every
+    /// position, the empty model, or the nearest checkpoint at or below `n`. After a call that
+    /// failed part-way the stores hold other positions than `pos`, so only a checkpoint is kept.
+    #[must_use]
+    pub fn kept(&self, n: u32, pos: u32) -> Kept {
+        let held = self.rows.held;
+        if held == pos {
+            self.ckpt.kept(n, pos)
+        } else {
+            self.ckpt.kept(n.min(pos), held)
+        }
+    }
+
+    /// The checkpoints: their positions, their slots, what they have done.
+    #[must_use]
+    pub fn checkpoints(&self) -> &Checkpoints {
+        &self.ckpt
+    }
+
+    /// A checkpoint at `pos`, the position the model stands at, after any waiting cut: every RDA
+    /// layer's committed lane of state and its conv ring copied to a host slot, or nothing where
+    /// one stands. Refused by name while a verify waits and when the stores hold other positions.
+    /// Waits for the copies.
+    pub fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
+        self.held_at(pos)?;
+        self.apply_cut(gpu.stream())?;
+        let lane = self.rows.lanes.committed();
+        let Body { layers, ckpt, .. } = self;
+        let mut lent = copied(layers, lane)?;
+        let mut stores: Vec<&mut DeviceBuffer<f32>> = lent.iter_mut().map(|w| &mut **w).collect();
+        ckpt.take(gpu.stream(), pos, &mut stores)
+    }
+
+    /// The waiting cut carried out: each store from its checkpoint's slot into the committed
+    /// lane, or zeroed for the empty model, and the lane's stamp on the position the cut went to
+    /// (the delta step reads the stamp as the position the lane stands at; every other lane was
+    /// never written). Nothing, and no allocation, when no cut waits. Waits for the copies; the
+    /// first device call after a cut runs it ([`ChainBody::refresh`], a pass of rows, a prompt
+    /// call).
+    pub(super) fn apply_cut(&mut self, stream: &CudaStream) -> Result<(), GpuError> {
+        if !self.ckpt.pending() {
+            return Ok(());
+        }
+        let (lane, at) = (self.rows.lanes.committed(), self.rows.held);
+        let Body { layers, ckpt, .. } = self;
+        {
+            let mut lent = copied(layers, lane)?;
+            let mut stores: Vec<&mut DeviceBuffer<f32>> =
+                lent.iter_mut().map(|w| &mut **w).collect();
+            ckpt.apply(stream, &mut stores)?;
+        }
+        for layer in layers.iter_mut() {
+            if let Mixer::Rda { store, .. } = &mut layer.mixer {
+                store.restamp_at(stream, lane, at)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A cut to `pos`: nothing at the position the stores stand at; the empty model at 0; else the
+    /// checkpoint at `pos`, copied back at the next device call. Any other position is refused by
+    /// name ([`Body::kept`] says what a cut keeps). Not while a verify waits for its commit.
+    pub fn cut(&mut self, pos: u32) -> Result<(), GpuError> {
+        if self.rows.lanes.waiting().is_some() {
+            return Err(GpuError::shape(
+                WHAT,
+                format!("a cut to position {pos} while a verify waits for its commit"),
+            ));
+        }
+        self.ckpt.cut(pos, self.rows.held)?;
+        self.rows.held = pos;
+        Ok(())
+    }
+
+    /// Refused by name unless the stores hold `pos` positions and no verify waits: a call that
+    /// failed part-way left the stores between positions, so a checkpoint of them would hold a
+    /// state no position has.
+    fn held_at(&self, pos: u32) -> Result<(), GpuError> {
+        let held = self.rows.held;
+        if held == pos && self.rows.lanes.waiting().is_none() {
+            return Ok(());
+        }
+        Err(GpuError::shape(
+            WHAT,
+            format!(
+                "a checkpoint at position {pos} on stores that hold {held} positions{} (a call \
+                 failed part-way: cut back to a checkpoint or reset first)",
+                if self.rows.lanes.waiting().is_some() {
+                    " with a verify waiting for its commit"
+                } else {
+                    ""
+                }
+            ),
+        ))
     }
 
     /// Device bytes the body holds past the weights and the stores.
@@ -1131,11 +1243,13 @@ impl ChainBody for Body {
         Ok(DecodeInput { token, pos })
     }
 
-    /// The token once a stream and the position: two copies. Refused by
-    /// name, before either, while a verify waits for its commit or off the
-    /// position the stores stand at ([`RowState::step_at`]).
+    /// A waiting cut carried out, then the token once a stream and the
+    /// position: two copies. Refused by name, before any, while a verify
+    /// waits for its commit or off the position the stores stand at
+    /// ([`RowState::step_at`]).
     fn refresh(&mut self, stream: &CudaStream, input: &DecodeInput) -> Result<(), GpuError> {
         self.rows.step_at(input.pos)?;
+        self.apply_cut(stream)?;
         self.ids = [input.token; STREAMS];
         self.step_in.ids.copy_from_host(stream, &self.ids)?;
         self.step_in.pos0.copy_from_host(stream, &[input.pos])?;
@@ -1148,8 +1262,8 @@ impl ChainBody for Body {
     }
 
     /// Every RDA store back to a fresh one in place (a captured chain keeps
-    /// their addresses, [`state::clear_store`]), the lane word at lane 0 and
-    /// any verify waiting dropped. The latent caches need nothing: no row at
+    /// their addresses, [`state::clear_store`]), the lane word at lane 0, any
+    /// verify waiting dropped and every checkpoint dropped. The latent caches need nothing: no row at
     /// or past the live count is read, and every row below it is written by
     /// its own walk first.
     fn reset(&mut self, gpu: &Gpu) -> Result<(), GpuError> {
@@ -1159,6 +1273,7 @@ impl ChainBody for Body {
                 state::clear_store(stream, store)?;
             }
         }
+        self.ckpt.clear();
         self.rows.reset(stream)
     }
 
@@ -1179,6 +1294,38 @@ impl ChainBody for Body {
     fn host(&mut self) -> Option<&mut NoHost> {
         None
     }
+}
+
+impl Marked for Body {
+    fn marks(&self, from: u32, to: u32) -> Vec<u32> {
+        self.ckpt.marks(from, to)
+    }
+
+    fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError> {
+        Body::checkpoint(self, gpu, pos)
+    }
+}
+
+/// The stores a checkpoint copies, each RDA layer's lane `lane` of the state (the committed one:
+/// the lanes are lane-major, so it is one window), then its conv ring, in layer order. The order
+/// is the same on every call, so a slot holds each store at its index; the lane may differ
+/// between a take and its restore, since a position's state is the same in any lane. A lane the
+/// store does not hold is refused by name.
+fn copied(layers: &mut [Layer], lane: u32) -> Result<Vec<WindowMut<'_, f32>>, GpuError> {
+    let mut out = Vec::new();
+    for layer in layers {
+        if let Mixer::Rda { store, .. } = &mut layer.mixer {
+            let RecStore {
+                state, ring, lanes, ..
+            } = &mut **store;
+            let each = state.len() / *lanes;
+            let at = lane as usize * each * size_of::<f32>();
+            out.push(WindowMut::<f32>::of_mut(state, at, each)?);
+            let n = ring.len();
+            out.push(WindowMut::<f32>::of_mut(ring, 0, n)?);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

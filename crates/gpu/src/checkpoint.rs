@@ -49,8 +49,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, PinnedHostBuffer, sys};
 use runtime::seqstate::{self, Cut, Kept, Ledger, Price, Stats, Take, Why};
 
-use crate::GpuError;
 use crate::graph::cu;
+use crate::model::ChainBody;
+use crate::{Gpu, GpuError, GpuModel};
 
 const WHAT: &str = "checkpoint";
 
@@ -802,6 +803,55 @@ impl Checkpoints {
         }
         Ok(())
     }
+}
+
+/// A body whose prompt call takes the checkpoints its marks name ([`prompt_marked`]): the two
+/// hooks the common marks loop reads, over the body's own [`Checkpoints`] and the stores it
+/// copies.
+pub trait Marked: ChainBody {
+    /// The positions a prompt call from `from` to `to` takes a checkpoint at
+    /// ([`Checkpoints::marks`] of the body's checkpoints).
+    fn marks(&self, from: u32, to: u32) -> Vec<u32>;
+
+    /// A checkpoint at `pos`, the position the stores stand at, after any waiting cut; nothing
+    /// where one stands. Refused by name when the stores hold another position.
+    fn checkpoint(&mut self, gpu: &Gpu, pos: u32) -> Result<Take, GpuError>;
+}
+
+/// The prompt `ids` from the model's position through `feed`, and the checkpoints the call's
+/// marks name: `feed` runs the ids from one mark to the next (the whole call when a mark is its
+/// end alone) and returns the argmax after its last id, and a checkpoint is taken after each
+/// segment has returned, so a segment that faulted leaves none. The call's start is a mark when
+/// the model holds any position there, so a prompt that resumes at a checkpoint finds it kept.
+/// Refused by name: no id, ids past `u32`, a call whose marks read no token.
+pub fn prompt_marked<B: Marked>(
+    model: &mut GpuModel<B>,
+    ids: &[u32],
+    mut feed: impl FnMut(&mut GpuModel<B>, &[u32]) -> Result<u32, GpuError>,
+) -> Result<u32, GpuError> {
+    const CALL: &str = "checkpoint::prompt_marked";
+    if ids.is_empty() {
+        return Err(GpuError::shape(CALL, "a prompt of no id"));
+    }
+    let from = model.pos();
+    let to = u32::try_from(ids.len())
+        .ok()
+        .and_then(|n| from.checked_add(n))
+        .ok_or_else(|| GpuError::shape(CALL, "ids past u32"))?;
+    let marks = model.body(CALL)?.marks(from, to);
+    let mut token = None;
+    let mut at = from;
+    for mark in marks {
+        if mark > at {
+            let seg = &ids[(at - from) as usize..(mark - from) as usize];
+            token = Some(feed(model, seg)?);
+            at = mark;
+        }
+        let pos = model.pos();
+        let (gpu, _, body) = model.body_parts(CALL)?;
+        body.checkpoint(gpu, pos)?;
+    }
+    token.ok_or_else(|| GpuError::shape(CALL, "a prompt that read no token"))
 }
 
 impl Drop for Checkpoints {

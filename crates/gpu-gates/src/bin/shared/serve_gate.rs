@@ -81,6 +81,14 @@ pub enum Cut {
     /// it, and from an empty model where none is held — so a shorter shared
     /// prefix is kept only as a whole continuation of what the slot holds.
     WhereItStands,
+    /// The body keeps a shared prefix shorter than what the slot holds only at a checkpoint a
+    /// prompt call took (its start and its end), so a request that extends the last prompt keeps
+    /// the call's end (the prompt but its last id, which the server steps), and answers as the
+    /// same request on an empty slot does. The first request's reply is `CHECKPOINT_REPLY`
+    /// tokens, long enough that the positions the cut takes back wrap every ring of the state (a
+    /// window of 128 positions, a compressor's block of 128), and the requests after it ask
+    /// `CHECKPOINT_AFTER`: a restore that leaves one ring out answers differently.
+    Checkpoint,
 }
 
 /// The tokens the chat request asks for at most, and the reasoning tokens the
@@ -149,6 +157,17 @@ const PREFIX: &str = "live_slot_keeps_the_prefix";
 
 /// The tokens each request of the prefix clause asks for at most.
 const PREFIX_TOKENS: u64 = 8;
+
+/// The tokens the first request of [`Cut::Checkpoint`]'s prefix clause asks for: past the 128
+/// positions a window ring and a compressor's block hold, so the positions a cut takes back
+/// overwrite every row of both.
+const CHECKPOINT_REPLY: u64 = 144;
+
+/// The tokens the requests that follow it ask for at most: more than the 128 positions a window
+/// ring and a compressor's block hold, so the positions after the restored one pass the next
+/// block's end and read the compressed row the restored residues built, and a state a restore
+/// got wrong shows in the ids.
+const CHECKPOINT_AFTER: u64 = 160;
 
 /// The question the prefix clause's first prompt asks after [`PREFIX_TEXT`].
 const Q1: &str = "Which page did the clerk open first?";
@@ -631,17 +650,17 @@ struct Asked {
     tokens: Vec<u32>,
 }
 
-/// [`Asked`] of one request: `ids` at [`PREFIX_TOKENS`] tokens, temperature 0,
+/// [`Asked`] of one request: `ids` at `tokens` tokens at most, temperature 0,
 /// the prompt cache `cache` asks the server to keep the prefix the prompt
 /// shares with the slot.
 fn asked(
     url: &dyn Fn(&str) -> String,
     dir: &Path,
     name: &str,
-    ids: &[u32],
+    (ids, tokens): (&[u32], u64),
     cache: bool,
 ) -> Result<Asked, GateError> {
-    let (st, text) = completion_raw(url, ids, usize::try_from(PREFIX_TOKENS)?, cache)?;
+    let (st, text) = completion_raw(url, ids, usize::try_from(tokens)?, cache)?;
     std::fs::write(dir.join(format!("{name}.json")), &text)?;
     let v = json_of("/completion", st, &text)?;
     let timings = &v["timings"];
@@ -688,6 +707,15 @@ fn common(a: &[u32], b: &[u32]) -> usize {
 /// hold runs only where the server's `residency lever` record says `off`
 /// (`lever`): on a server the machine serves, the placement follows the
 /// history of requests, and one line names the record and skips the hold.
+/// A body that keeps a checkpoint ([`Cut::Checkpoint`]) runs a second shape of
+/// the clause: the first request asks [`CHECKPOINT_REPLY`] tokens, so the
+/// positions the cut takes back wrap every ring of the state, the second
+/// prompt extends the first and keeps its call's end (the prompt but its last
+/// id, which the server steps), and the same second prompt on the cache-off
+/// run answers the same ids; the shorter third prompt
+/// is asked after it, keeps no more than it shares (no checkpoint stands at
+/// or below the shared prefix, so the model starts over) and answers the ids
+/// of its cache-off run.
 /// FAIL-first: a seat whose keep query grants nothing (`Seat::keep` answering
 /// 0) keeps none of the shared prefix, the second and third holds are red and
 /// the clause is red; a server that reuses the slot for the cache-off request
@@ -699,18 +727,24 @@ fn live_slot_keeps_the_prefix(
     dir: &Path,
     lever: &str,
 ) -> Result<bool, GateError> {
+    let checkpointed = matches!(c.cut, Cut::Checkpoint);
+    let (reply, after) = if checkpointed {
+        (CHECKPOINT_REPLY, CHECKPOINT_AFTER)
+    } else {
+        (PREFIX_TOKENS, PREFIX_TOKENS)
+    };
     let p1 = format!("{PREFIX_TEXT} {Q1}");
     let ids1 = tokenized(url, &p1)?;
-    if u64::try_from(ids1.len()).unwrap_or(u64::MAX) + PREFIX_TOKENS >= c.ctx / 2 {
+    if u64::try_from(ids1.len()).unwrap_or(u64::MAX) + reply >= c.ctx / 2 {
         return Err(format!(
-            "the prefix clause's first prompt holds {} ids and asks {PREFIX_TOKENS} more, past \
+            "the prefix clause's first prompt holds {} ids and asks {reply} more, past \
              half of the {} positions the server serves",
             ids1.len(),
             c.ctx
         )
         .into());
     }
-    let first = asked(url, dir, "prefix_first", &ids1, true)?;
+    let first = asked(url, dir, "prefix_first", (&ids1, reply), true)?;
     let n1 = first.whole;
     println!(
         "prefix first: {} ids, kept {}, {} tokens; the answer {} chars",
@@ -719,6 +753,16 @@ fn live_slot_keeps_the_prefix(
         first.tokens.len(),
         first.content.trim().len()
     );
+    // A cut that takes back fewer positions than a ring holds restores nothing of it: the reply
+    // must have wrapped the window and the compressor's block (`Cut::Checkpoint`).
+    let wrapped = !checkpointed || first.tokens.len() >= 128;
+    if !wrapped {
+        println!(
+            "prefix first: the reply is {} tokens, short of the 128 that wrap a window ring and \
+             a compressor's block: the restore below would be held to nothing",
+            first.tokens.len()
+        );
+    }
     let answer = first.content.trim().to_owned();
     let p2 = if answer.is_empty() {
         format!("{PREFIX_TEXT} {Q1} {Q2}")
@@ -726,7 +770,7 @@ fn live_slot_keeps_the_prefix(
         format!("{PREFIX_TEXT} {Q1} {answer} {Q2}")
     };
     let ids2 = tokenized(url, &p2)?;
-    if matches!(c.cut, Cut::EveryPosition) && common(&ids1, &ids2) < n1 as usize {
+    if matches!(c.cut, Cut::EveryPosition | Cut::Checkpoint) && common(&ids1, &ids2) < n1 as usize {
         return Err(format!(
             "the first answer's text re-tokenizes into a seam inside the first prompt: the \
              second prompt shares {} of the first's {n1} ids, and the clause needs a question \
@@ -735,23 +779,31 @@ fn live_slot_keeps_the_prefix(
         )
         .into());
     }
-    let second = asked(url, dir, "prefix_extended", &ids2, true)?;
+    let second = asked(url, dir, "prefix_extended", (&ids2, after), true)?;
     let counted = second.whole == ids2.len() as u64;
-    let kept = second.cache_n >= n1;
+    // The server runs a prompt's last id as a step of its own (`Engine::prefill_next`), so a
+    // prompt call ends, and a checkpoint stands, one id short of the prompt.
+    let least = if checkpointed {
+        n1.saturating_sub(1)
+    } else {
+        n1
+    };
+    let kept = second.cache_n >= least;
     println!(
-        "prefix extended: {} ids; kept {} (at least the first prompt's {n1} {}), counted {}",
+        "prefix extended: {} ids; kept {} (at least {least} of the first prompt's {n1}: {}), \
+         counted {}",
         ids2.len(),
         second.cache_n,
         if kept { "holds" } else { "FAIL" },
         counted
     );
-    let mut holds = counted && (!matches!(c.cut, Cut::EveryPosition) || kept);
+    let mut holds = counted && wrapped && (matches!(c.cut, Cut::WhereItStands) || kept);
     match c.cut {
         Cut::EveryPosition => {
             let p3 = format!("{PREFIX_TEXT} {Q3}");
             let ids3 = tokenized(url, &p3)?;
             let share = common(&ids1, &ids3);
-            let third = asked(url, dir, "prefix_shorter", &ids3, true)?;
+            let third = asked(url, dir, "prefix_shorter", (&ids3, after), true)?;
             let exact = third.cache_n == share as u64;
             println!(
                 "prefix shorter: {} ids share {} with the first prompt and kept {} (want {}); \
@@ -764,13 +816,60 @@ fn live_slot_keeps_the_prefix(
             );
             holds &= exact;
             if lever == "off" {
-                let fresh = asked(url, dir, "prefix_shorter_fresh", &ids3, false)?;
+                let fresh = asked(url, dir, "prefix_shorter_fresh", (&ids3, after), false)?;
                 let same = fresh.cache_n == 0 && fresh.content == third.content;
                 println!(
                     "prefix same answer: the cache-off run kept {} (want 0) and wrote the same \
                      text {}",
                     fresh.cache_n,
                     fresh.content == third.content
+                );
+                holds &= same;
+            } else {
+                println!(
+                    "prefix same answer: skipped, the server's residency lever record is \
+                     {lever:?}, not off"
+                );
+            }
+        }
+        Cut::Checkpoint => {
+            // A prompt that shares less than any checkpoint holds starts the model over, and the
+            // checkpoints above the cut go with it.
+            let p3 = format!("{PREFIX_TEXT} {Q3}");
+            let ids3 = tokenized(url, &p3)?;
+            let share = common(&ids1, &ids3);
+            let third = asked(url, dir, "prefix_shorter", (&ids3, after), true)?;
+            let within = third.cache_n <= share as u64;
+            let answered = !second.tokens.is_empty() && !third.tokens.is_empty();
+            println!(
+                "prefix shorter: {} ids share {} with the first prompt and kept {} (at most {}); \
+                 {} tokens",
+                ids3.len(),
+                share,
+                third.cache_n,
+                share,
+                third.tokens.len()
+            );
+            holds &= within && answered;
+            // The extended request restored a checkpoint and fed the rest; the same request on an
+            // empty slot feeds every id. Both are one arithmetic on the same rows, so the ids are
+            // equal where the residency leaves the experts where the plan put them.
+            if lever == "off" {
+                let fresh = asked(url, dir, "prefix_extended_fresh", (&ids2, after), false)?;
+                let fresh3 = asked(url, dir, "prefix_shorter_fresh", (&ids3, after), false)?;
+                let same = fresh.cache_n == 0
+                    && fresh.tokens == second.tokens
+                    && fresh3.cache_n == 0
+                    && fresh3.tokens == third.tokens;
+                println!(
+                    "prefix same answer: the cache-off runs kept {} and {} (want 0) and wrote \
+                     the same ids: {} (extended, {} ids) and {} (shorter, {} ids)",
+                    fresh.cache_n,
+                    fresh3.cache_n,
+                    fresh.tokens == second.tokens,
+                    second.tokens.len(),
+                    fresh3.tokens == third.tokens,
+                    third.tokens.len()
                 );
                 holds &= same;
             } else {
