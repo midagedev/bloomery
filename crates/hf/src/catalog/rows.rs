@@ -404,16 +404,29 @@ pub(super) static MODELS: &[Model] = &[
         aliases: &["ernie55"],
         seat: "ernie55",
         arch: "ernie5_5",
-        rows: &[Row {
-            variant: "fp8-mxfp4",
-            kind: Kind::Folder,
-            repo: "baidu/ERNIE-5.5-Flash-Preview",
-            revision: "ace1100dcde7bf4eb06add6ae11ce4f43a11ddfe",
-            format: Format::Fp8Mxfp4,
-            bytes: Some(165_882_599_176),
-            status: Status::Unverified {
-                why: "the ernie55 seat has not served this folder on a card; revision and the tensors' data bytes (the safetensors headers not counted) from tools/fixture-cuts/ernie55.json",
+        rows: &[
+            Row {
+                variant: "F8M4",
+                kind: Kind::Gguf,
+                repo: "midagedev/ERNIE-5.5-Flash-Preview-GGUF",
+                revision: "fa6330082b8d786502cabbdd7b95cdafa26e298b",
+                format: Format::Fp8Mxfp4,
+                bytes: Some(155_077_929_376),
+                status: Status::Verified {
+                    evidence: "the 0.3.17 release sitting and its real-file looks served this file; bloomery-quantize's lossless repack of the folder row below (docs/quantize.md); revision and size from the upload",
+                },
             },
-        }],
+            Row {
+                variant: "fp8-mxfp4",
+                kind: Kind::Folder,
+                repo: "baidu/ERNIE-5.5-Flash-Preview",
+                revision: "ace1100dcde7bf4eb06add6ae11ce4f43a11ddfe",
+                format: Format::Fp8Mxfp4,
+                bytes: Some(165_882_599_176),
+                status: Status::Unverified {
+                    why: "the ernie55 seat has not served this folder on a card; revision and the tensors' data bytes (the safetensors headers not counted) from tools/fixture-cuts/ernie55.json",
+                },
+            },
+        ],
     },
 ];
