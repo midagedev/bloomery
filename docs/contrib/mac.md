@@ -15,9 +15,9 @@ from a runner in `tools/ref/`, and none runs on a Mac. The only speed numbers ar
 `[derived]`.
 
 **What changed since this map was written.** Parts A to F are the map and design of 2026-10-21 (main `8d74220bb`, with
-the M2.0 measurements of the same day) and keep that date. The Metal backend has landed since. Section 1 says what runs
-on Metal today, at main `d916e20ac`; where a later part says something does not exist yet, section 1 and the status line
-at the head of that part win. The user-facing steps (install, build, serve, flags, numbers) are in
+the M2.0 measurements of the same day) and keep that date. The Metal backend has landed since. Section 1's weight and
+planning checks were last checked against main `759512396`. Where a later part says something does not exist yet,
+section 1 and the status line at the head of that part win. The user-facing steps (install, build, serve, flags, numbers) are in
 [`../mac.md`](../mac.md).
 
 Related documents: [`dgx-spark.md`](dgx-spark.md) (the port map this one is modelled on; its Appendix A is the P0 site
@@ -26,7 +26,7 @@ map for aarch64 Linux), [`../research/tierengine.md`](../research/tierengine.md)
 
 ## 1. Where the port stands
 
-| Phase (issue #593) | Done when | State (main `d916e20ac`) | Left |
+| Phase (issue #593) | Done when | State and evidence | Left |
 |---|---|---|---|
 | **M0** native host build | the host chain builds and tests on aarch64-apple-darwin; every Linux-only site is behind one platform module; on x86 Linux nothing moved (`just ptx-scan` equal) | `crates/os` (`bloomery-os`) holds the Linux-only libc calls of the host chain beside their macOS bodies or a named `OsError::Unsupported`, and `threads`, `gguf`, `engram` and `model` call it (`cd40ceac9`, `000a5d52d`, 2026-10-21); `cd40ceac9`'s message records `tools/mac-check.sh test` at 16 crates, 1577 passed, 0 failed. The census in Part A (14 of 21 crates built; 1477 passed, 0 failed, 210 ignored in 52 test binaries; 45 compile errors at 38 source lines in 10 files) is of the tree before it | a fresh count; this page did not rerun it `[unverified]` |
 | **M1** CPU path | NEON for `qdot`; the CPU engine behind `serve::Engine` | 2026-10-21, not rechecked here: `qdot` has a scalar mirror for every kernel, so it builds off x86 once `threads` builds; a NEON form of the two generic kernels was prototyped and is bit-identical to the scalar mirror on 2400 rows (Part B); no CPU engine implements `serve::Engine` | off the critical path to a fast Metal decode (Part E) |
@@ -38,10 +38,14 @@ gives the reasons).
 
 ### 1.1 What runs on Metal today
 
-At a build after v0.3.9 two architectures run on Metal, `qwen35moe` and `qwen3moe`. The open takes mat-vec weights of type Q4_K, Q6_K or
-MLX's affine 4-bit (`MLX_A4`), the embedding as Q4_K or `MLX_A4` and the head as Q6_K or `MLX_A4`
-(`crates/metal/src/arch/qwen3moe/arena.rs:333,617,624`). Any other type at those sites is refused by name, with the
-tensor's name. The gate verifies the MLX 4-bit path on the 4-layer fixture splits of Qwen3.6-35B-A3B and
+The `qwen35moe` and `qwen3moe` architectures run on Metal in builds after v0.3.9. Their file checks use the
+weight families in [`Quant::ALL`](../../crates/metal/src/kernels/matvec.rs): `Q4_K`, `Q6_K`, `Q8_0`, `Q5_K`,
+`MLX_A4`, `MLX_A8`, `MLX_A4H`, `MLX_A8H` and `F32`. The dense mat-vec sites use `Quant::dense`, which excludes
+`F32`. The delta projections `ssm_alpha` and `ssm_beta` also admit `F32` through the segmented mat-vec path.
+The embedding and head-norm sites admit the dense types except `Q6_K` (`Quant::embeds` and `Quant::headnorms`).
+The output head admits the dense types except `Q4_K` (`Quant::heads`).
+The [file checks](../../crates/metal/src/arch/qwen3moe/check.rs) name the tensor when refusing a type at one of
+these sites. The gate verifies the MLX 4-bit path on the 4-layer fixture splits of Qwen3.6-35B-A3B and
 Qwen3-30B-A3B: their logits at positions 0 to 3 match mlx-lm's in f32 within 0.01. It opens no full folder. A full
 folder opens with the same code path. A GGUF file of these types runs, unverified.
 
@@ -56,7 +60,7 @@ folder opens with the same code path. A GGUF file of these types runs, unverifie
 | Qwen3-30B-A3B-Instruct-2507, Q4_K_M | runs, unverified, text only (`qwen3moe`: attention layers only, no shared expert). The e2e gate's qwen3moe row opens the MLX split | PR #856: the fixture row; on an M1 Pro (32 GB) the real file's prompt pass and stepped run give the same 32 greedy ids |
 | Qwen3-Coder-30B-A3B-Instruct, MLX 4-bit folder (`--hf mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit`) | verified, text only, on a build after 0.3.10, on Qwen3-30B-A3B's 4-layer fixture split: it has those shapes (`qwen3moe`), and the gate does not open its folder (the folder names no BOS and adds none) | PR #886: on an M1 Pro (32 GB), `generate_metal --hf` at `6a05f2cf6` opened the folder from the hub cache (all 13 files' hashes checked) and wrote sensible Python; a `bloomery-serve-metal --hf` chat answered with a correct `is_prime`. The tool-call PR: a `get_weather` request returned `tool_calls` with `{"city":"Seoul"}`, and the tool's result came back as the answer |
 
-The refused file is the next to open; the design is [`../research/metal-all-models.md`](../research/metal-all-models.md) (PR #802).
+The design for supporting more weight formats is in [`../research/metal-all-models.md`](../research/metal-all-models.md) (PR #802).
 
 The one rate in PR #805's comment: an Apple M1 Pro with 32 GB, macOS 27.0.1, `generate_metal --prompt "The capital of
 France is" -n 32`, greedy, with a download running on the same Mac. MiniCPM-V and Ornith each decoded at 43.4 tok/s.
@@ -67,21 +71,23 @@ That is a development-loop number, not a measurement of the engine: the Mac has 
 
 `generate_metal --plan [--ctx C]` reads only the file's header and tensor table and loads no weights. It prints every
 refusal the open would raise, not only the first, then the bytes the open would allocate, the device's working set and
-the host's free memory. It exits 0 when the header's checks pass, 3 when it is refused and 64 when the header cannot be read; exit 0 does
-not prove the load fits the device or the host at run time. The data section may be truncated: a 24 MB cut of a Hub file is enough. In PR #806 the open's checks move into one pure
-function over the header and tensor table, and the open stops at the first refusal with the text it had before.
+the host's free memory. It exits 0 when the checks pass, 3 when the plan refuses the file and 64 when the header
+cannot be read. An exit of 0 does not prove the load fits at run time. The data section may be truncated if the header and
+tensor table are intact. The plan and the open share the header and tensor-table checks in
+[`check`](../../crates/metal/src/arch/qwen3moe/check.rs). For these loaders the plan uses `check_room` to add the
+device room check after the file checks pass. The open reports the first file refusal through `checked_or_first`
+and checks room before allocating weights.
 
-PR #806's evidence, on the lead's M1 Pro (32 GB), with `--plan` on 24 MB header cuts of Hub files: the MiniCPM-V and
-Ornith Q4_K_M files print `plan: opens`; Qwen3.6 `UD-Q4_K_XL` prints `plan: refused, 350 items`; Qwen3-30B-A3B is
-refused at the architecture.
+In PR #806's original check on an M1 Pro (32 GB), `--plan` on 24 MB header cuts reported that the MiniCPM-V and
+Ornith Q4_K_M files opened, counted 350 refusals for Qwen3.6 `UD-Q4_K_XL`, and refused Qwen3-30B-A3B at the
+architecture. See the table above for the later support of both files.
 
 ### 1.3 The Metal toolchain, and which kernel path is tested
 
-`crates/metal/build.rs` runs `xcrun -sdk macosx metal --version` (`build.rs:184-191`). If it answers, the build compiles
-the kernels into a metallib and the runtime loads that. If it does not, the build embeds the kernels' source and the
-runtime compiles it when the device opens (`crates/metal/src/library.rs:199-215`). The tensor-op GEMMs that a GPU with
-matrix units takes (Metal 4; the M5 in [`../mac.md`](../mac.md)) are compiled from source at the open on both paths
-(`library.rs:207-214`).
+[`metal_toolchain`](../../crates/metal/build.rs) runs `xcrun -sdk macosx metal --version`. When that probe succeeds,
+the build packages a metallib for each registered instance. At device open, [`Library::compile`](../../crates/metal/src/library.rs)
+uses the embedded metallib when present for the instance and otherwise compiles the source. On a GPU with matrix units
+(Metal 4), it compiles the tensor-op GEMMs from source on either path.
 
 One maintainer Mac has the Metal Toolchain; the others have none (`xcrun -sdk macosx metal --version` prints
 `error: cannot execute tool 'metal' due to missing Metal Toolchain`). The metallib path builds on the Mac that has it.
