@@ -633,6 +633,8 @@ pub(super) struct StepStats {
     pub(super) go_early: u64,
     pub(super) go_early_first: u64,
     pub(super) host_slots: u64,
+    /// Routed slots a one-column service left unrun under the top-k cut ([`StepPort::cut`]).
+    pub(super) cut_slots: u64,
     pub(super) host_w2: f64,
     pub(super) leg_ns: u64,
     pub(super) parks_in_service: u64,
@@ -691,6 +693,10 @@ pub struct StepPort {
     pair_row0: Option<usize>,
     row0_ids: Vec<u32>,
     pub(super) stats: StepStats,
+    /// The top-k cut of a decode step (`BLOOMERY_ROUTE_TOPK`): the first `cut` of a one-column
+    /// service's routed slots run, the rest are skipped before they are read or counted (the
+    /// card's router weighed them 0, `route_dial`). `None`: every slot, the model's own rule.
+    pub(super) cut: Option<usize>,
     /// The route trace, when one is attached: each one-row step's routed
     /// ids, recorded before the service's signal and written after it.
     pub(super) trace: Option<RouteTrace>,
@@ -816,6 +822,7 @@ impl StepPort {
             pair_row0: None,
             row0_ids: Vec::with_capacity(h.n_used),
             stats: StepStats::default(),
+            cut: None,
             trace: None,
             tally: super::swap::Tally::off(),
             window: None,
@@ -1105,7 +1112,8 @@ impl StepPort {
         if let Some(ours) = self.ids.get_mut(layer) {
             ours.clear();
         }
-        for s in 0..h.n_used {
+        let live = self.cut.map_or(h.n_used, |c| c.min(h.n_used));
+        for s in 0..live {
             let (Some(id), Some(wb)) = (
                 payload_word(page, image_off, h.ids + s, words),
                 payload_word(page, image_off, h.weights + s, words),
@@ -1226,6 +1234,7 @@ impl StepPort {
         }
         let s = &mut self.stats;
         s.host_slots += self.list.len() as u64;
+        s.cut_slots += (h.n_used - live) as u64;
         s.host_w2 += if w2_all > 0.0 { w2_host / w2_all } else { 0.0 };
         if chain == Chain::Pair {
             self.count_pair_overlap(layer, row);

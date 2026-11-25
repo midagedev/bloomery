@@ -58,6 +58,11 @@
 //! same rule at six and V4.1's `combine_elem`; 5, 7 and 9 slots refused by
 //! name with nothing launched. The `_8` entries, the handoff's among them,
 //! and the handoff's `_10` compile with no local depot.
+//!
+//! The router dials' launches (`route_dial_cases`, before the layers, synthetic inputs):
+//! the resident bonus's biased selection bias and the top-k cut's weights against the host
+//! rules of `runtime::routedial`, bit for bit; at a large λ every pick is a resident expert, and
+//! a cut of k' leaves k' weighed picks.
 
 #[cfg(feature = "deepseek41")]
 fn main() -> std::process::ExitCode {
@@ -989,6 +994,148 @@ mod gate {
         Ok(ok)
     }
 
+    /// The router dials' launches (`BLOOMERY_ROUTE_RESIDENT_BONUS`, `BLOOMERY_ROUTE_TOPK`) on a
+    /// synthetic router of the file's shape (384 experts, six slots), against the host rules of
+    /// `runtime::routedial` bit for bit, the router's own scores read back from the device:
+    /// - **bonus**: the router run on the biased selection bias (`route_resident_bias` over a
+    ///   synthetic map row with a dozen stage-card slots) picks the host rule's six ids at λ in
+    ///   {0.5, 2, above the whole spread}, weighs them by their unbiased scores as the unbiased
+    ///   run's weight rule does, and at the large λ every pick is a resident expert (twelve
+    ///   residents, six picks);
+    /// - **cut**: `route_cut_weights` on the plain router's output keeps its ids, renormalizes
+    ///   the first k' slots as `runtime::routedial::cut_weights` does and leaves the later weights
+    ///   exactly 0, for k' in {1, 3, 4, 5}: k' picks carry a weight.
+    fn route_dial_cases(gpu: &Gpu) -> Result<bool, GateError> {
+        use bloomery_gpu::route_dial::RouteDialKernels;
+        use runtime::routedial::{biased_picks, cut_weights};
+        const K: usize = 64;
+        const SCALE: f32 = 1.5;
+        let stream = gpu.stream();
+        let router = RouterKernels::load(gpu.context())?;
+        let dial = RouteDialKernels::load(gpu.context())?;
+        let w: Vec<f32> = activations(K, N_EXPERT, 0xD1A1_0001)
+            .into_iter()
+            .map(|v| v * 0.125)
+            .collect();
+        let w = DeviceTensor::upload(stream, &w, N_EXPERT, K)?;
+        let x = DeviceBuffer::from_host(stream, &activations(K, 1, 0xD1A1_0002))?;
+        let base = DeviceBuffer::from_host(stream, &[0.0f32; N_EXPERT])?;
+        let fault = gpu.layer_sink(0)?;
+        // A map row: every 31st expert holds a card slot, the rest are the host's.
+        let resident: Vec<bool> = (0..N_EXPERT).map(|e| e % 31 == 0).collect();
+        let map_row: Vec<u32> = resident
+            .iter()
+            .scan(0u32, |slot, &r| {
+                Some(if r {
+                    *slot += 1;
+                    *slot - 1
+                } else {
+                    HOST
+                })
+            })
+            .collect();
+        let map = DeviceBuffer::from_host(stream, &map_row)?;
+        let mut ok = true;
+
+        let mut plain = RouterOut::new(stream)?;
+        router.enqueue_router(stream, &w, &x, &base, SCALE, &mut plain, fault)?;
+        let scores = plain.probs.to_host_vec(stream)?;
+        let ids0 = plain.ids.to_host_vec(stream)?;
+        let w0 = plain.weights.to_host_vec(stream)?;
+        stream.synchronize()?;
+        let zero = vec![0.0f32; N_EXPERT];
+        let host_plain = biased_picks(&scores, &zero, &resident, 0.0, N_USED);
+        let plain_ok = host_plain == ids0[..N_USED];
+        ok &= plain_ok;
+        println!(
+            "route dials plain router: host rule picks the device's ids: {}",
+            verdict(plain_ok)
+        );
+
+        let (lo, hi) = scores
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), &v| (l.min(v), h.max(v)));
+        let big = hi - lo + 1.0;
+        for lambda in [0.5f32, 2.0, big] {
+            let mut bias = DeviceBuffer::from_host(stream, &zero)?;
+            dial.enqueue_resident_bias(stream, (&base, &map, 0), lambda, &mut bias)?;
+            let mut out = RouterOut::new(stream)?;
+            router.enqueue_router(stream, &w, &x, &bias, SCALE, &mut out, fault)?;
+            let (ids, wts) = (
+                out.ids.to_host_vec(stream)?,
+                out.weights.to_host_vec(stream)?,
+            );
+            stream.synchronize()?;
+            let want = biased_picks(&scores, &zero, &resident, lambda, N_USED);
+            let picks: Vec<f32> = want.iter().map(|&e| scores[e as usize]).collect();
+            let want_w = cut_weights(&picks, N_USED, SCALE, false);
+            let ids_ok = ids[..N_USED] == want[..];
+            let w_ok = bits_equal(&wts[..N_USED], &want_w);
+            let residents = ids[..N_USED]
+                .iter()
+                .filter(|&&e| resident[e as usize])
+                .count();
+            let all_resident = lambda < big || residents == N_USED;
+            let pass = ids_ok && w_ok && all_resident;
+            ok &= pass;
+            println!(
+                "route dials bonus λ {lambda}: ids {} weights (unbiased scores) {} residents {residents}/{N_USED}: {}",
+                verdict(ids_ok),
+                verdict(w_ok),
+                verdict(pass)
+            );
+        }
+        for cut in [1usize, 3, 4, 5] {
+            let mut out = RouterOut::new(stream)?;
+            router.enqueue_router(stream, &w, &x, &base, SCALE, &mut out, fault)?;
+            dial.enqueue_cut(
+                stream,
+                (&out.ids, &out.probs),
+                (N_EXPERT, N_USED, cut),
+                (SCALE, false),
+                fault,
+                &mut out.weights,
+            )?;
+            let (ids, wts) = (
+                out.ids.to_host_vec(stream)?,
+                out.weights.to_host_vec(stream)?,
+            );
+            stream.synchronize()?;
+            let picks: Vec<f32> = ids0[..N_USED].iter().map(|&e| scores[e as usize]).collect();
+            let want_w = cut_weights(&picks, cut, SCALE, false);
+            let ids_ok = ids[..N_USED] == ids0[..N_USED];
+            let w_ok = bits_equal(&wts[..N_USED], &want_w);
+            let weighed = wts[..N_USED].iter().filter(|&&v| v != 0.0).count();
+            let tail_zero = wts[cut..N_USED].iter().all(|v| v.to_bits() == 0);
+            let pass = ids_ok && w_ok && weighed == cut && tail_zero && w0.len() >= N_USED;
+            ok &= pass;
+            println!(
+                "route dials cut {cut}: ids kept {} weights {} weighed {weighed} tail zero {tail_zero}: {}",
+                verdict(ids_ok),
+                verdict(w_ok),
+                verdict(pass)
+            );
+        }
+        // A cut past the slot count is refused by name and launches nothing.
+        let mut out = RouterOut::new(stream)?;
+        let refused = dial
+            .enqueue_cut(
+                stream,
+                (&out.ids, &out.probs),
+                (N_EXPERT, N_USED, N_USED + 1),
+                (SCALE, false),
+                fault,
+                &mut out.weights,
+            )
+            .is_err();
+        ok &= refused;
+        println!(
+            "route dials cut past the slots refused: {}",
+            verdict(refused)
+        );
+        Ok(ok)
+    }
+
     // ---------------------------------------------------------- driver
 
     #[derive(Default)]
@@ -1100,6 +1247,7 @@ mod gate {
             "ds41_ffn_handoff_10",
         ])?);
         tally.add(join8_cases(&gpu)?);
+        tally.add(route_dial_cases(&gpu)?);
         let stage = map.stage_view();
         for l in 0..hp.n_layer {
             let w = layer_weights(stream, &split, l)?;

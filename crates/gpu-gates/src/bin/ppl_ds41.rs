@@ -81,7 +81,7 @@ mod tool {
     use bloomery_levers::{
         CARD_BUDGET, CARD_DONTNEED, CED, ENGRAM_HELPER, EXPERT_RANK, HOST_LANES, HOST_LOCK,
         HOST_POPULATE, HOSTSTREAM, Levers, PIN_MAIN, PREFILL, PREFILL_CUT, PREFILL_GROUP, R8,
-        RESIDENCY, ResidencyAt, ResidencyPick,
+        RESIDENCY, ROUTE_RESIDENT_BONUS, ROUTE_TOPK, ResidencyAt, ResidencyPick,
     };
     use gguf::Split;
     use model::arch::deepseek41::hparams::Hparams;
@@ -118,6 +118,8 @@ mod tool {
         R8,
         RESIDENCY,
         HOSTSTREAM,
+        ROUTE_RESIDENT_BONUS,
+        ROUTE_TOPK,
     ];
 
     /// What the open prints of itself: the plan record, the churn pool's and the host need beside it, and whether

@@ -1,0 +1,14 @@
+# The router dials on DeepSeek V4.1 Flash bq3km, one RTX 5090 32 GB, an overnight experiment (branch rdial, never landed as is):
+# BLOOMERY_ROUTE_RESIDENT_BONUS adds λ to the selection value of an expert in a card slot, BLOOMERY_ROUTE_TOPK weighs the first k'
+# of the router's 6 picks. Decode is bound by reading host experts: t = t0 + c·H, H the host picks a token. With the step
+# 85 % host-bound [an assumption], k' = 4 leaves H ≈ 0.67 H0: 1 / (0.15 + 0.85 · 0.67) = 1.39; this card takes +20..45 %.
+kind: ab
+question: how much faster does V4.1 decode at depth 512 when the router weighs 4 of its 6 picks?
+term: decode tok/s gain, BLOOMERY_ROUTE_TOPK=4 against unset, same binary, depth 512 (prose:512), RTX 5090 32 GB
+unit: %
+predict: 20..45
+rounds: 3
+condition: one lease, the 5090 alone, depth-gpu-ds41 with per-arm levers, 3 rounds, arm order rotated
+decide-in: the dial is worth its quality sweep (KLD and paired evals at each setting)
+decide-below: under 20 %: the step is less host-bound than assumed; read the step stats before more dials
+decide-above: beyond 45 %: check the census (picks that ran) before crediting the cut

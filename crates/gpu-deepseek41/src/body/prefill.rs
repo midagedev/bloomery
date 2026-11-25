@@ -3437,6 +3437,7 @@ mod tests {
             },
             residency: Residency::Off,
             hoststream: false,
+            route: bloomery_gpu::route_dial::RouteDials::OFF,
         }
     }
 

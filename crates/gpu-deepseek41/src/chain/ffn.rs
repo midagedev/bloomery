@@ -92,6 +92,7 @@ use bloomery_gpu::kquant::act::Act;
 use bloomery_gpu::kquant::sel::SelDown;
 use bloomery_gpu::q4k_sel::QuantSel;
 use bloomery_gpu::quant_sel::QuantSelKernels;
+use bloomery_gpu::route_dial::{Beside, RouteDialKernels, RouteDials};
 use bloomery_gpu::weights::{DevWeight, Weights};
 use bloomery_gpu::{DeviceTensor, FaultSink, Gpu, GpuError, Q8Act, launch_u32};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, LaunchConfig1D};
@@ -1232,6 +1233,19 @@ pub struct FfnPiece {
     routes: RouteSet,
     /// HC_PRE's reduction scratch, which its own launches consume.
     hc_scratch: HcPreScratch,
+    /// The router dials of the decode step's front ([`FfnPiece::set_route_dials`]); `None`
+    /// routes as the file says, with no launch of the dials'.
+    dials: Option<DialState>,
+}
+
+/// A load's router dials, resolved ([`FfnPiece::set_route_dials`]).
+struct DialState {
+    kernels: RouteDialKernels,
+    /// λ and the biased selection bias the router reads in place of the file's, one layer's at a
+    /// time (the launches are in stream order on the engine stream, so the rows share it).
+    bonus: Option<(f32, DeviceBuffer<f32>)>,
+    /// The first `cut` of the router's slots run; `None` the model's own count.
+    cut: Option<usize>,
 }
 
 impl FfnPiece {
@@ -1358,7 +1372,40 @@ impl FfnPiece {
             leg: None,
             routes,
             hc_scratch: HcPreScratch::new(stream, HC_STREAMS * n_embd)?,
+            dials: None,
         })
+    }
+
+    /// The router dials of the decode step's front (`BLOOMERY_ROUTE_RESIDENT_BONUS`,
+    /// `BLOOMERY_ROUTE_TOPK`; [`RouteDials`]): the front's router reads a selection bias with
+    /// the bonus on the experts the layer's stage-card slot map holds, and a cut renormalizes
+    /// the router's first k' slots and weighs the rest 0. Refused by name above the model's `k`
+    /// and beside what `beside` says. Returns the cut as a slot count (`None`: the model's own
+    /// `k`), which the host tier needs as well (`HostTier::set_route_cut`). Dials all off leave
+    /// the piece as it was: no launch, the file's bias. Load-time only.
+    pub fn set_route_dials(
+        &mut self,
+        gpu: &Gpu,
+        dials: RouteDials,
+        beside: Beside,
+    ) -> Result<Option<usize>, GpuError> {
+        let cut = dials.check(N_USED, beside)?;
+        if dials.bonus().is_none() && cut.is_none() {
+            self.dials = None;
+            return Ok(None);
+        }
+        let bonus = dials
+            .bonus()
+            .map(|lambda| {
+                Ok::<_, GpuError>((lambda, DeviceBuffer::zeroed(gpu.stream(), self.n_expert)?))
+            })
+            .transpose()?;
+        self.dials = Some(DialState {
+            kernels: RouteDialKernels::load(gpu.context())?,
+            bonus,
+            cut,
+        });
+        Ok(cut)
     }
 
     /// The activation forms the piece's layers read beside the f32 rows,
@@ -1410,7 +1457,10 @@ impl FfnPiece {
     pub fn launches(&self, layer: usize) -> Option<usize> {
         self.cfg_of(layer).map(|c| {
             let base = if c.n_card > 0 { 10 } else { 7 };
-            base + usize::from(c.sh_down_q8_1) + 2 * usize::from(c.sh_rows)
+            let dials = self.dials.as_ref().map_or(0, |d| {
+                usize::from(d.bonus.is_some()) + usize::from(d.cut.is_some())
+            });
+            base + usize::from(c.sh_down_q8_1) + 2 * usize::from(c.sh_rows) + dials
         })
     }
 
@@ -1421,6 +1471,11 @@ impl FfnPiece {
         self.rows.iter().map(FfnRow::device_bytes).sum::<usize>()
             + hc_pre_scratch_bytes(&self.hc_scratch)
             + self.routes.bytes()
+            + self
+                .dials
+                .as_ref()
+                .and_then(|d| d.bonus.as_ref())
+                .map_or(0, |(_, b)| b.num_bytes())
     }
 
     /// Device bytes of one row's buffers.
@@ -1826,15 +1881,45 @@ impl FfnPiece {
             hybrid.boundary_mut().normed_mut(),
             fault,
         )?;
+        // The dials' launches, when on: the layer's biased selection bias before the router and
+        // the cut of its weights after it. Off, the router reads the file's bias as it did.
+        let bias = match self.dials.as_mut() {
+            Some(DialState {
+                kernels,
+                bonus: Some((lambda, scratch)),
+                ..
+            }) => {
+                let row_off = self.cfg[layer - self.layers.start].row_off;
+                kernels.enqueue_resident_bias(
+                    stream,
+                    (lw.bias, io.slots.buf(), row_off),
+                    *lambda,
+                    scratch,
+                )?;
+                &*scratch
+            }
+            _ => lw.bias,
+        };
         self.router.enqueue_router(
             stream,
             lw.router,
             hybrid.boundary().normed(),
-            lw.bias,
+            bias,
             self.scale,
             &mut r.rout,
             fault,
-        )
+        )?;
+        if let Some((d, cut)) = self.dials.as_ref().and_then(|d| d.cut.map(|cut| (d, cut))) {
+            d.kernels.enqueue_cut(
+                stream,
+                (&r.rout.ids, &r.rout.probs),
+                (self.n_expert, N_USED, cut),
+                (self.scale, false),
+                fault,
+                &mut r.rout.weights,
+            )?;
+        }
+        Ok(())
     }
 
     /// The piece's own work in the shadow of the host's leg, on row `row`'s

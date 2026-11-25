@@ -114,7 +114,9 @@ impl TierCensus {
     ) -> TierCensus {
         let step_cols = stats.served - stats.cols_served + stats.cols_cols;
         let cols = step_cols + stats.batch_cols;
-        let picks = cols * n_used as u64;
+        // A decode step under the top-k cut left `cut_slots` of its routed slots unrun: they
+        // were not picks the services made.
+        let picks = (cols * n_used as u64).saturating_sub(stats.cut_slots);
         TierCensus {
             tokens: cols / (layers.max(1) as u64),
             picks,

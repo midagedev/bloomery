@@ -34,7 +34,8 @@ mod registry;
 use registry::REGISTRY;
 pub use registry::{
     AUTOTUNE, ELASTIC, INK2_DENSE, INK2_LOOPCD, INK2_LOOPCD_MAX, INK2_LOOPCD_PLACES,
-    INK2_LOOPCD_REF, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, REPLAY_POISON, SCHEMAJUMP,
+    INK2_LOOPCD_REF, INK2_PASSES, INK2_PASSES_MAX, PREPARE_Q8, REPLAY_POISON, ROUTE_RESIDENT_BONUS,
+    ROUTE_RESIDENT_BONUS_MAX, ROUTE_RESIDENT_BONUS_PLACES, ROUTE_TOPK, ROUTE_TOPK_MAX, SCHEMAJUMP,
     SPLIT_WALK, XSTREAM,
 };
 pub use registry::{
@@ -1755,6 +1756,23 @@ impl Levers {
     pub fn ink2_loopcd_ref(&self) -> u32 {
         let n = Levers::defaulted(INK2_LOOPCD_REF, self.count(INK2_LOOPCD_REF));
         u32::try_from(n).unwrap_or_else(|_| panic!("{INK2_LOOPCD_REF}={n} past u32"))
+    }
+
+    /// `BLOOMERY_ROUTE_RESIDENT_BONUS`: λ, the bonus a routed decode step adds to the selection
+    /// value of an expert on the stage card, the row's value in units of its last place over that
+    /// unit; `None` unset or 0, the rule off.
+    #[must_use]
+    pub fn route_resident_bonus(&self) -> Option<f32> {
+        let units = self.count(ROUTE_RESIDENT_BONUS)?;
+        (units != 0).then(|| units as f32 / 10f32.powi(ROUTE_RESIDENT_BONUS_PLACES as i32))
+    }
+
+    /// `BLOOMERY_ROUTE_TOPK`: k', the experts a routed decode step runs; `None` unset, the model's
+    /// own k. A load refuses a count above its model's k by name.
+    #[must_use]
+    pub fn route_topk(&self) -> Option<usize> {
+        self.count(ROUTE_TOPK)
+            .map(|n| Levers::usize_of(ROUTE_TOPK, n))
     }
 
     /// `BLOOMERY_REPLAY_POISON`: a capture gate runs its replay-poison

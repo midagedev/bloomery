@@ -66,6 +66,17 @@ pub const AUTOTUNE: &str = "BLOOMERY_AUTOTUNE";
 pub const INK2_DENSE: &str = "BLOOMERY_INK2_DENSE";
 pub const INK2_PASSES: &str = "BLOOMERY_INK2_PASSES";
 pub const REPLAY_POISON: &str = "BLOOMERY_REPLAY_POISON";
+pub const ROUTE_RESIDENT_BONUS: &str = "BLOOMERY_ROUTE_RESIDENT_BONUS";
+pub const ROUTE_TOPK: &str = "BLOOMERY_ROUTE_TOPK";
+
+/// The digits `BLOOMERY_ROUTE_RESIDENT_BONUS` takes past its point, and its largest value in units
+/// of the last place: 100.
+pub const ROUTE_RESIDENT_BONUS_PLACES: u32 = 3;
+pub const ROUTE_RESIDENT_BONUS_MAX: u64 = 100_000;
+
+/// The largest `BLOOMERY_ROUTE_TOPK`: the widest routed pick of any family (Kimi K3 and Hy4-flash
+/// pick 16). A load refuses a count above its own model's `k` by name.
+pub const ROUTE_TOPK_MAX: u64 = 16;
 
 /// The largest `BLOOMERY_INK2_PASSES`: the passes the variable-loop checkpoint was trained on, and
 /// the range a fixed loop takes (no tensor of the loop is indexed by pass).
@@ -1650,6 +1661,67 @@ pub(crate) static REGISTRY: &[LeverSpec] = &[
                     item: "set_loopcd",
                 },
             },
+        },
+    },
+    LeverSpec {
+        name: ROUTE_RESIDENT_BONUS,
+        class: Class::A,
+        kind: Kind::Decimal {
+            places: ROUTE_RESIDENT_BONUS_PLACES,
+            min: 0,
+            max: ROUTE_RESIDENT_BONUS_MAX,
+        },
+        default: Unset::Is("0"),
+        doc: "Routed MoE decode on a load that keeps a hot subset of experts on the card \
+              (DeepSeek V4.1's step and pair rows today): a bias toward the experts that are on \
+              the stage card at that moment. The rule, per routed layer and decode step: the \
+              router's selection value of expert `e` is `score[e] + (file_bias[e] + λ · r[e])`, \
+              `r[e] = 1` when the layer's stage-card slot map holds `e` in a card slot and 0 \
+              otherwise (an expert on a tier card or on the host is 0), and the top-k is taken \
+              over those values with the router's own tie rule. The bonus steers the choice \
+              only: the picked experts' gate weights are computed from their unbiased scores, \
+              renormalized over the picked set, exactly as the model's rule does without it. \
+              The bonus is on the selection value (score plus bias), not on the logit; V4.1's \
+              score is √softplus, a non-negative number near 0 to a few, so λ of 1 outweighs most \
+              of the spread. The map is read on the device each step, so a residency flip \
+              (`BLOOMERY_RESIDENCY`) is seen by the next step's router, in a captured graph too. \
+              One launch a routed layer a step (n_expert f32 written), on the step and pair \
+              rows only: the prompt pass, `BLOOMERY_PREFILL=steps` feeds excepted (those are \
+              decode steps and take the bonus), keeps the file's bias. Refused by name beside \
+              `BLOOMERY_DRAFT` and a draft's verify (its rows would pick without the bonus) and \
+              on a router that selects by probability alone (softmax: ERNIE 5.5 and its kind). \
+              An accuracy lever, opt-in: the picks leave the trained router's, more with λ. \
+              Unset and 0: no launch, today's bias buffer and bits. A decimal of at most 3 \
+              places, 0 to 100.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
+        },
+    },
+    LeverSpec {
+        name: ROUTE_TOPK,
+        class: Class::A,
+        kind: Kind::Count {
+            min: 1,
+            max: ROUTE_TOPK_MAX,
+            trim: false,
+        },
+        default: Unset::Means("the model's own k"),
+        doc: "Routed MoE decode: the number of experts a decode step runs, k' of the model's k \
+              (DeepSeek V4.1: 6). The step's router still ranks its k picks (the rank order is \
+              fixed); the first k' of them run and the rest do not: their gate weights are \
+              zero, the host leg skips them (no read, no heat in the residency counts, no host \
+              pick in the census) and the card sum adds nothing for them. The k' weights are \
+              renormalized as the model's rule does for its own k: `score / (Σ_{j<k'} score_j \
+              + guard) · scale`, the sum in f64 in slot order, narrowed to f32. The prompt \
+              pass keeps the model's k (it is a batch pass, `route_rows`); decode, step and \
+              pair rows take k'. The census's `picks` count the picks that ran, so \
+              `card` and `file` keep adding up. Refused by name above the model's own k, \
+              beside `BLOOMERY_DRAFT`, and on a load with an expert tier card. Unset and k' \
+              equal to the model's k: no launch and today's bits. An accuracy lever, opt-in.",
+        site: Site::Parsed {
+            left: &[],
+            phase: Phase::Load,
         },
     },
     LeverSpec {

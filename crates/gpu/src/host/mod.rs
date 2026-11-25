@@ -315,6 +315,9 @@ pub struct HybridStats {
     pub go_early_first: u64,
     /// Host slots computed, summed over services.
     pub host_slots: u64,
+    /// Routed slots the step services left unrun under the top-k cut
+    /// ([`HostTier::set_route_cut`]), summed: not picks, not card, not host.
+    pub cut_slots: u64,
     /// The host's share of each service's routed weight squared,
     /// `Σ_host w² / Σ_all w²`, summed over services.
     pub host_w2: f64,
@@ -3035,6 +3038,7 @@ impl<H: HostExperts> HostTier<H> {
             go_early: s.go_early,
             go_early_first: s.go_early_first,
             host_slots: s.host_slots,
+            cut_slots: s.cut_slots,
             host_w2: s.host_w2,
             leg_ns: s.leg_ns,
             parks_in_service: s.parks_in_service,
@@ -3078,6 +3082,15 @@ impl<H: HostExperts> HostTier<H> {
                 .map_or((0, 0), swap::SwapMachine::moved_bytes),
             &threads::pool().stats(),
         ))
+    }
+
+    /// The top-k cut of a decode step's one-column services (`BLOOMERY_ROUTE_TOPK`, k'): the
+    /// first `cut` routed slots run, the later ones are not read, not counted by the residency
+    /// rule and not in the census's picks. `None` runs every slot. The card's router must weigh
+    /// the later slots 0 (`route_dial::RouteDialKernels::enqueue_cut`); the caller that sets
+    /// both is the load's one owner of the dial. Columns and prompt batches serve every slot.
+    pub fn set_route_cut(&mut self, cut: Option<usize>) {
+        self.step.cut = cut;
     }
 
     /// The host experts, for a caller that prepares their scratch ahead of a

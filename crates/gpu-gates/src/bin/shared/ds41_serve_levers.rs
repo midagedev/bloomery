@@ -5,7 +5,8 @@
 use bloomery_levers::{
     CARD_BUDGET, CARD_DONTNEED, CED, DRAFT, ENGRAM_HELPER, EXPERT_RANK, HOST_LANES, HOST_LOCK,
     HOST_POPULATE, HOSTSTREAM, KV_FLOOR, KV_HOST, MTP_WIDTH, PIN_MAIN, PREFILL, PREFILL_CUT,
-    PREFILL_GROUP, R8, RESIDENCY, ROUTE_TRACE, SCHEMAJUMP, SCREEN, STEP_STATS,
+    PREFILL_GROUP, R8, RESIDENCY, ROUTE_RESIDENT_BONUS, ROUTE_TOPK, ROUTE_TRACE, SCHEMAJUMP,
+    SCREEN, STEP_STATS,
 };
 
 /// Besides the pool's two: how a prompt is fed, and the batched feed's CED
@@ -17,7 +18,8 @@ use bloomery_levers::{
 /// this engine also keeps the step rows' engram fill statistics; the width
 /// a drafted window verifies; the start screen; how a structured-output
 /// request's fixed runs are fed; the DSpark draft's card, read in place
-/// where the draft opens (its file, `BLOOMERY_DSPARK_MODEL`, is no lever).
+/// where the draft opens (its file, `BLOOMERY_DSPARK_MODEL`, is no lever); the router dials of a
+/// decode step (`BLOOMERY_ROUTE_RESIDENT_BONUS`, `BLOOMERY_ROUTE_TOPK`).
 pub const ACTS_ON: &[&str] = &[
     CED,
     PREFILL,
@@ -42,6 +44,8 @@ pub const ACTS_ON: &[&str] = &[
     STEP_STATS,
     SCREEN,
     SCHEMAJUMP,
+    ROUTE_RESIDENT_BONUS,
+    ROUTE_TOPK,
     bloomery_gpu_gates::llama_place::DRAFT_CARD,
 ];
 

@@ -561,6 +561,8 @@ fn accessors_read_their_rows() {
     assert!(!unset.replay_poison());
     assert_eq!(unset.ink2_loopcd(), None);
     assert_eq!(unset.ink2_loopcd_ref(), 1);
+    assert_eq!(unset.route_resident_bonus(), None);
+    assert_eq!(unset.route_topk(), None);
     assert_eq!(
         unset.host(),
         HostCfg {
@@ -615,6 +617,8 @@ fn accessors_read_their_rows() {
             (REPLAY_POISON, "1"),
             (INK2_LOOPCD, "0.2"),
             (INK2_LOOPCD_REF, "2"),
+            (ROUTE_RESIDENT_BONUS, "1.5"),
+            (ROUTE_TOPK, "4"),
         ]),
         Scope::Every,
     )
@@ -675,6 +679,11 @@ fn accessors_read_their_rows() {
     assert!(set.replay_poison());
     assert_eq!(set.ink2_loopcd().map(f32::to_bits), Some(0.2f32.to_bits()));
     assert_eq!(set.ink2_loopcd_ref(), 2);
+    assert_eq!(
+        set.route_resident_bonus().map(f32::to_bits),
+        Some(1.5f32.to_bits())
+    );
+    assert_eq!(set.route_topk(), Some(4));
     assert_eq!(
         set.host(),
         HostCfg {
@@ -746,6 +755,8 @@ fn accessors_read_their_rows() {
             INK2_PASSES,
             INK2_LOOPCD,
             INK2_LOOPCD_REF,
+            ROUTE_RESIDENT_BONUS,
+            ROUTE_TOPK,
             REPLAY_POISON
         ]
     );
@@ -3560,5 +3571,55 @@ fn launch_queues_default_keep_refuse() {
         assert_eq!(r.value, bad);
         let line = r.to_string();
         assert!(line.contains("0.25x, 0.5x, 2x, 4x"), "{line}");
+    }
+}
+
+/// `BLOOMERY_ROUTE_RESIDENT_BONUS` is off unset and at 0; a decimal of at most three places from
+/// 0 to 100 reads as the `f32` nearest that decimal; anything else is refused by name.
+/// `BLOOMERY_ROUTE_TOPK` takes 1 to 16 and refuses the rest by name.
+#[test]
+fn route_dials_take_their_ranges_and_refuse_the_rest() {
+    let bonus = |pairs: &[(&str, &str)]| {
+        read(&env(pairs), Scope::Every).map(|l| l.route_resident_bonus().map(f32::to_bits))
+    };
+    assert_eq!(bonus(&[]).unwrap(), None);
+    for zero in ["0", "0.0", "0.000"] {
+        assert_eq!(
+            bonus(&[(ROUTE_RESIDENT_BONUS, zero)]).unwrap(),
+            None,
+            "{zero}"
+        );
+    }
+    for (word, want) in [
+        ("0.5", 0.5f32),
+        ("1", 1.0),
+        ("2", 2.0),
+        ("4", 4.0),
+        ("100", 100.0),
+    ] {
+        assert_eq!(
+            bonus(&[(ROUTE_RESIDENT_BONUS, word)]).unwrap(),
+            Some(want.to_bits()),
+            "{word}"
+        );
+    }
+    for bad in [
+        "", "-1", "+1", ".5", "0.", "0.0005", "100.001", "101", "big",
+    ] {
+        let Err(e) = bonus(&[(ROUTE_RESIDENT_BONUS, bad)]) else {
+            panic!("{bad:?} is no bonus the row takes and must be refused");
+        };
+        assert!(e.to_string().contains(ROUTE_RESIDENT_BONUS), "{e}");
+    }
+    let topk = |pairs: &[(&str, &str)]| read(&env(pairs), Scope::Every).map(|l| l.route_topk());
+    assert_eq!(topk(&[]).unwrap(), None);
+    for k in 1..=16usize {
+        assert_eq!(topk(&[(ROUTE_TOPK, &k.to_string())]).unwrap(), Some(k));
+    }
+    for bad in ["", "0", "17", "-1", "two"] {
+        let Err(e) = topk(&[(ROUTE_TOPK, bad)]) else {
+            panic!("{bad:?} is no count the row takes and must be refused");
+        };
+        assert!(e.to_string().contains(ROUTE_TOPK), "{e}");
     }
 }

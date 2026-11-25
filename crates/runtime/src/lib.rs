@@ -36,6 +36,7 @@ pub mod msa;
 pub mod mtp;
 pub mod prompt;
 pub mod qsa;
+pub mod routedial;
 pub mod savemap;
 pub mod sched;
 pub mod selector;

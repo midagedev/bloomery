@@ -92,6 +92,7 @@ use bloomery_gpu::hybrid::{
     Boundary, BoundaryShape, Chain, HostResidency, Hybrid, SlotMap, refuse_expert_tiers,
 };
 use bloomery_gpu::model::{ChainBody, HostServed, Resident, Rollback, Rows};
+use bloomery_gpu::route_dial::{Beside, RouteDials};
 use bloomery_gpu::weights::Weights;
 use bloomery_gpu::{
     CardKeep, DeviceTensor, FreedBytes, Gpu, GpuError, GpuModel, HostGrowBook, HostGrowStats,
@@ -208,6 +209,9 @@ pub struct BodyLevers {
     /// A prompt call streams its hottest host experts into the residency's
     /// pool (`BLOOMERY_HOSTSTREAM`, [`prefill`]); only under a residency.
     pub hoststream: bool,
+    /// The router dials of the decode step's front (`BLOOMERY_ROUTE_RESIDENT_BONUS`,
+    /// `BLOOMERY_ROUTE_TOPK`): off is the model's own routing, bit for bit.
+    pub route: RouteDials,
 }
 
 impl BodyLevers {
@@ -315,7 +319,17 @@ impl OpenCfg {
             host: levers.host(),
             residency,
             hoststream,
+            route: RouteDials::from_levers(levers),
         };
+        if body.route.any() && levers.draft().is_some_and(|w| w != "off") {
+            return Err(GpuError::Shape {
+                what: "BLOOMERY_ROUTE_RESIDENT_BONUS / BLOOMERY_ROUTE_TOPK",
+                detail: "beside BLOOMERY_DRAFT: a draft's verify rows pick without the dials, so \
+                         the two paths would route one token differently; use BLOOMERY_DRAFT=off \
+                         or unset the dials"
+                    .to_string(),
+            });
+        }
         body.check()?;
         Ok(OpenCfg {
             body,
@@ -494,6 +508,14 @@ fn rank_levers(levers: BodyLevers) -> Result<BodyLevers, GpuError> {
         prefill: PrefillMode::Steps,
         ..levers
     };
+    if levers.route.any() {
+        return Err(GpuError::Shape {
+            what: "BLOOMERY_ROUTE_RESIDENT_BONUS / BLOOMERY_ROUTE_TOPK",
+            detail: "a tensor-parallel rank holds every expert on its card and routes through \
+                     no slot map; unset the dials"
+                .to_string(),
+        });
+    }
     levers.check()?;
     Ok(levers)
 }
@@ -3442,6 +3464,17 @@ impl Body {
         let mut hybrid = Hybrid::new(boundary, map, host, layers.len())?;
         hybrid.watch_fault(gpu.fault_word())?;
         let tier = tiers(gpu, &mut hybrid)?;
+        // The router dials, resolved against what the load hangs beside the stage card.
+        let cut = ffn.set_route_dials(
+            gpu,
+            cfg.route,
+            Beside {
+                draft: false,
+                tier: tier.is_some(),
+                softmax: false,
+            },
+        )?;
+        hybrid.set_route_cut(cut);
         let ced = ced::Ced::new(&CedLayer::table(hp), seq.ring_rows(), cfg.ced);
 
         let mut body = Body {
@@ -4061,6 +4094,7 @@ mod tests {
             },
             residency: Residency::Off,
             hoststream: false,
+            route: RouteDials::OFF,
         };
         assert_eq!(
             rank_levers(off).expect("no residency").prefill,
